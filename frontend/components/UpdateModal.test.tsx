@@ -22,6 +22,7 @@ const originalCheck = api.checkUpdate;
 const originalGetSettings = api.getSettings;
 const originalStatus = api.getUpdateStatus;
 const originalApply = api.applyUpdate;
+const originalNotes = api.getUpdateNotes;
 const globals = new Map<string, PropertyDescriptor | undefined>();
 let root: Root | undefined;
 let container: HTMLElement;
@@ -121,6 +122,7 @@ afterEach(async () => {
 	container.remove();
 	api.getUpdateStatus = originalStatus;
 	api.applyUpdate = originalApply;
+	api.getUpdateNotes = originalNotes;
 	api.checkUpdate = originalCheck;
 	api.getSettings = originalGetSettings;
 	for (const [key, descriptor] of globals) {
@@ -276,6 +278,108 @@ function successfulCheck() {
 		},
 	};
 }
+
+describe("UpdateModal deferred release notes", () => {
+	function recommendation() {
+		return {
+			...successfulCheck(),
+			releaseInfo: {
+				...successfulCheck().releaseInfo,
+				notesDeferred: true,
+				notesAvailable: true,
+				sourceIdentity: originalIdentity.sourceIdentity,
+				sha512: originalIdentity.sha512,
+				files: [{ url: "unused", size: 1024, sha512: originalIdentity.sha512 }],
+			},
+		};
+	}
+	function setup() {
+		client.setQueryData(["auth", "me"], { id: "admin", role: "admin" });
+		const check = recommendation();
+		api.checkUpdate = async () => check;
+		return check;
+	}
+	test("badge checks do not fetch notes; opening requests the exact identity", async () => {
+		const check = setup();
+		const requests: unknown[] = [];
+		api.getUpdateNotes = async (identity) => {
+			requests.push(identity);
+			return { notes: "Lazy verified notes" };
+		};
+		await renderBadge();
+		expect(requests).toHaveLength(0);
+		await openBadge();
+		expect(requests).toEqual([
+			{
+				version: check.releaseInfo.version,
+				sha512: check.releaseInfo.sha512,
+				sourceIdentity: check.releaseInfo.sourceIdentity,
+			},
+		]);
+		expect(document.body.textContent).toContain("Lazy verified notes");
+	});
+	test("legacy or mismatched prepared artifacts never request new source notes", async () => {
+		const check = setup();
+		ready = true;
+		check.releaseInfo.sha512 = "different-hash";
+		let calls = 0;
+		api.getUpdateNotes = async () => {
+			calls++;
+			return { notes: "Wrong notes" };
+		};
+		await renderBadge();
+		await openBadge();
+		expect(calls).toBe(0);
+		expect(document.body.textContent).not.toContain("Wrong notes");
+		expect(findButton(common.updateSchedule)).toBeDefined();
+	});
+	test("notes failure does not block verified download", async () => {
+		setup();
+		api.getUpdateNotes = async () => {
+			throw new Error("Notes unavailable");
+		};
+		await renderBadge();
+		await openBadge();
+		expect(document.body.textContent).toContain(common.updateNotesUnavailable);
+		expect(findButton(common.download)).toBeDefined();
+		expect(findButton(common.download)?.disabled).toBe(false);
+	});
+	test.each([
+		"source",
+		"preparedId",
+	])("a %s change cancels old notes and discards a late success", async (change) => {
+		setup();
+		ready = change === "preparedId";
+		let resolve: ((value: { notes: string }) => void) | undefined;
+		let signal: AbortSignal | undefined;
+		api.getUpdateNotes = (_identity, cancellation) => {
+			signal = cancellation;
+			return new Promise((done) => {
+				resolve = done;
+			});
+		};
+		await renderBadge();
+		await openBadge();
+		expect(signal).toBeDefined();
+		if (change === "source") await changeSavedSource();
+		else {
+			await act(async () =>
+				client.setQueryData(["update-status", "1.1.0"], {
+					ready: true,
+					version: "1.1.0",
+					canAutoRestart: true,
+					preparedIdentity: { ...originalIdentity, id: "replacement" },
+					instructions: { manual: false, message: "ready" },
+				}),
+			);
+			await settle();
+		}
+		expect(signal?.aborted).toBe(true);
+		await act(async () => resolve?.({ notes: "Stale late notes" }));
+		await settle();
+		expect(document.body.textContent).not.toContain("Stale late notes");
+	});
+});
 
 describe("UpdateModal saved source changes", () => {
 	test.each([

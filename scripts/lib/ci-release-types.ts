@@ -1,6 +1,8 @@
+import { OFFICIAL_GITHUB_REPOSITORY } from "../../shared/github-repository";
 import type { BinaryMetadata } from "./binary-metadata";
 
-export const CI_RELEASE_REPOSITORY = "NarraFork/NarraFork";
+/** Compatibility default only; live CI derives identity from validated GITHUB_REPOSITORY. */
+export const CI_RELEASE_REPOSITORY = OFFICIAL_GITHUB_REPOSITORY;
 export const CI_RELEASE_WORKFLOW = ".github/workflows/release.yml";
 export const CI_RELEASE_BUN = "1.4.2";
 export const CI_RELEASE_TARGETS = [
@@ -81,6 +83,8 @@ export interface CiReleaseBaseline {
 export interface CiReleasePlan {
 	schemaVersion: 1;
 	repository: string;
+	/** Absent only in legacy main-branch bundles. */
+	defaultBranch?: string;
 	tag: string;
 	version: string;
 	commit: string;
@@ -94,6 +98,8 @@ export interface CiReleasePlan {
 }
 export interface CiReleaseSmokeResult {
 	schemaVersion: 1;
+	/** Verified by querying fresh settings from the actual downloaded binary. */
+	repository?: string;
 	target: string;
 	commit: string;
 	version: string;

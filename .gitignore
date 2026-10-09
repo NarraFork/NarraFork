@@ -51,6 +51,9 @@ scripts/lib/*
 !scripts/lib/ci-release-*.ts
 !scripts/lib/ci-build-*.ts
 !scripts/lib/github-release-baseline.ts
+!scripts/lib/github-release-summary.ts
+!scripts/lib/build-repository.ts
+!scripts/lib/update-index*.ts
 .ci-release/
 # Imported by scripts/release.ts and tests/scripts/stable-baseline-patch*.test.ts, so it has
 # to be in the repo or both the release script and `bun test` break in a fresh clone.

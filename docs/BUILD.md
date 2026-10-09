@@ -65,6 +65,12 @@ bun scripts/build-cross-platform.ts --platform=linux
 bun scripts/build-cross-platform.ts --platform=linux-arm64
 ```
 
+### fork 的默认更新仓库
+
+构建时按显式 `NF_BUILD_GITHUB_REPOSITORY=owner/repo`、可信 Actions 仓库、源码 GitHub origin 的顺序确定仓库，无法推导时才使用官方默认值。Actions 中显式值必须等于当前仓库；本地 `release.ts --target=github --github-repository=owner/repo` 会自动传递该构建身份。
+
+该身份同时嵌入前后端和 binary sidecar。运行时不会依据 cwd、用户项目 origin 或运行环境自动切源；新安装采用构建默认值，已有显式保存的来源保持不变。fork 必须自行构建，不能让上游二进制自动变成 fork 包。严格 Release CI 还会交叉核对 bundle、sidecar、smoke 及新安装 settings 的仓库身份。
+
 ## 交叉编译说明
 
 ### 从 Linux x86 构建 macOS 版本

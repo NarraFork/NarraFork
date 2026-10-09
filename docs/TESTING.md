@@ -91,5 +91,6 @@ bun server/index.ts --no-auto-resume
 - `release.yml` 默认手动 build-only，先运行同样的静态检查、build/typecheck 和完整四分片，再对八个平台构建最终二进制并进行原生 smoke。后端测试没有被二进制 smoke 替代。
 - smoke 不在源码开发目录运行应用，不依赖项目 node_modules；独立 HOME/数据库、loopback 端口、`--no-auto-resume`。必须真实完成启动、前端、数据库、watcher 和 PTY 检查，才能产生成功 `smoke.json`。失败日志可保留，但不能代替成功结果。
 - 发布恢复依赖源 run 的逐项成功 job 与精确 artifact digest，并重新核对 bundle 内容。仅“有 artifact”或“有 JUnit”都不是成功证明。构建失败、smoke 失败、取消、必需 job 跳过不能发布。
-- 新测试入口为 `tests/scripts/release-ci-*.test.ts` 和 `tests/scripts/ci-build-*.test.ts`。本地 fixture/mock 测试不证明托管 runner 原生二进制可运行；上线前仍需完整的 `publish=false` 运行。所有测试子集均加 `--isolate`。
+- 测试入口包括 `tests/scripts/release-ci-*.test.ts`、`tests/scripts/ci-build-*.test.ts`、`tests/scripts/build-repository.test.ts`、`tests/scripts/github-release-summary.test.ts`、`tests/scripts/update-index.test.ts`、`shared/update-index.test.ts` 和 `server/services/__tests__/github-update-index.test.ts`。覆盖 fork 身份、概要预算、原子索引/CAS、404 唯一回退、缓存取消与延迟说明；repair 必须证明无 build/Release 资产写入。所有子集均加 `--isolate`。
+- 本地 fixture/mock 不证明托管 runner 原生二进制可运行，也不证明 GitHub 已写入索引。上线前仍需完整的 `publish=false` 验收；真正发布成功还要求 index commit/generation 读回确认。旧全仓测试报告只属于其源码清单，不能作为新索引实现的验收证据。
 - 原生 smoke 不证明 x64-baseline 已在无 AVX2 CPU 验证，也不包含 macOS Developer ID/公证或 Windows Authenticode。默认 CI 的 opt-in 数据库/专用镜像边界保持不变。

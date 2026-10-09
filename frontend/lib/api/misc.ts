@@ -1150,6 +1150,19 @@ export const miscApi = {
 		}),
 
 	// Update
+	getUpdateNotes: (
+		identity: {
+			version: string;
+			sha512: string;
+			sourceIdentity: import("@shared/update-identity").UpdateSourceIdentity;
+		},
+		signal?: AbortSignal,
+	) =>
+		request<{ notes: string | Record<string, string> | null }>("/update/notes", {
+			method: "POST",
+			body: JSON.stringify(identity),
+			signal,
+		}),
 	checkUpdate: () =>
 		request<{
 			updateAvailable: boolean;
@@ -1161,6 +1174,8 @@ export const miscApi = {
 			errorCode?: string;
 			retryAfter?: number;
 			latestVersion?: string;
+			notesDeferred?: boolean;
+			notesAvailable?: boolean;
 			releaseInfo?: {
 				sourceIdentity?: import("@shared/update-identity").UpdateSourceIdentity;
 				source?: "github" | "update-server";
@@ -1168,6 +1183,8 @@ export const miscApi = {
 				version: string;
 				releaseDate: string;
 				releaseNotes?: string | Record<string, string>;
+				notesDeferred?: boolean;
+				notesAvailable?: boolean;
 				path: string;
 				sha512: string;
 				files: Array<{ url: string; size: number; sha512: string }>;

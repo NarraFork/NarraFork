@@ -1,22 +1,16 @@
 import { createHash } from "node:crypto";
+import {
+	isValidGitHubRepository,
+	OFFICIAL_GITHUB_REPOSITORY,
+} from "../../shared/github-repository";
 import { MAX_RELEASE_BINARY_BYTES, RELEASE_SHA512_RE } from "../../shared/release-patch";
 import { compareReleaseVersions, isValidReleaseVersion } from "../../shared/release-version";
 import type { BinaryMetadata } from "./binary-metadata";
 import { CI_METADATA_LIMIT, CI_TEXT_LIMIT, runCiGh } from "./ci-release-io";
-import {
-	CI_RELEASE_REPOSITORY,
-	CI_RELEASE_TARGETS,
-	type CiReleaseBaseline,
-	type CiReleasePlan,
-} from "./ci-release-types";
+import { CI_RELEASE_TARGETS, type CiReleaseBaseline, type CiReleasePlan } from "./ci-release-types";
 import { type GhRunner, releaseChannel } from "./github-release";
+import { type GitHubReleaseSummary, listGitHubReleaseSummaries } from "./github-release-summary";
 
-interface RemoteRelease {
-	id: number;
-	tag_name: string;
-	draft: boolean;
-	prerelease: boolean;
-}
 interface RemoteAsset {
 	id: number;
 	name: string;
@@ -34,7 +28,14 @@ function positive(value: unknown): value is number {
 
 export function validateBaselineMetadata(
 	value: unknown,
-	expected: { version: string; platform: string; name: string; size: number; commit?: string },
+	expected: {
+		version: string;
+		platform: string;
+		name: string;
+		size: number;
+		commit?: string;
+		repository?: string;
+	},
 ): BinaryMetadata {
 	if (!value || typeof value !== "object" || Array.isArray(value))
 		throw new Error("Invalid binary metadata");
@@ -42,6 +43,9 @@ export function validateBaselineMetadata(
 	const target = CI_RELEASE_TARGETS.find((entry) => entry.platform === expected.platform);
 	if (
 		!target ||
+		(meta.repository !== undefined && !isValidGitHubRepository(meta.repository)) ||
+		(expected.repository !== undefined &&
+			(meta.repository ?? OFFICIAL_GITHUB_REPOSITORY) !== expected.repository) ||
 		meta.version !== expected.version ||
 		meta.platform !== expected.platform ||
 		meta.name !== expected.name ||
@@ -85,46 +89,48 @@ export async function selectGitHubBaselines(
 	options: SelectGitHubBaselinesOptions = {},
 ): Promise<CiReleaseBaseline[]> {
 	if (
-		plan.repository !== CI_RELEASE_REPOSITORY ||
+		!isValidGitHubRepository(plan.repository) ||
 		!isValidReleaseVersion(plan.version) ||
 		plan.channel !== releaseChannel(plan.version)
 	)
 		throw new Error("Invalid baseline release plan");
 	const run = options.run ?? runCiGh;
-	const releases = await listPages<RemoteRelease>(
-		run,
-		`repos/${plan.repository}/releases`,
-		options.signal,
-	);
+	options.signal?.throwIfAborted();
+	const releases = await listGitHubReleaseSummaries(async (args) => {
+		options.signal?.throwIfAborted();
+		const result = await run(args);
+		options.signal?.throwIfAborted();
+		return result;
+	}, plan.repository);
 	const ids = new Set<number>();
 	const versions = new Set<string>();
-	const candidates: RemoteRelease[] = [];
+	const candidates: GitHubReleaseSummary[] = [];
 	for (const release of releases) {
 		if (
 			!release ||
 			!positive(release.id) ||
-			typeof release.tag_name !== "string" ||
+			typeof release.tagName !== "string" ||
 			typeof release.draft !== "boolean" ||
 			typeof release.prerelease !== "boolean" ||
 			ids.has(release.id)
 		)
 			throw new Error("Invalid/duplicate GitHub release identity");
 		ids.add(release.id);
-		if (release.draft || !release.tag_name.startsWith("v")) continue;
-		const version = release.tag_name.slice(1);
+		if (release.draft || !release.tagName.startsWith("v")) continue;
+		const version = release.tagName.slice(1);
 		if (!isValidReleaseVersion(version) || compareReleaseVersions(version, plan.version) >= 0)
 			continue;
 		if (versions.has(version)) throw new Error("Duplicate baseline release version");
 		versions.add(version);
 		candidates.push(release);
 	}
-	candidates.sort((a, b) => compareReleaseVersions(b.tag_name.slice(1), a.tag_name.slice(1)));
+	candidates.sort((a, b) => compareReleaseVersions(b.tagName.slice(1), a.tagName.slice(1)));
 	const nearest = new Set<string>();
 	const stable = new Set<string>();
 	const result: CiReleaseBaseline[] = [];
 	for (const release of candidates) {
 		options.signal?.throwIfAborted();
-		const version = release.tag_name.slice(1);
+		const version = release.tagName.slice(1);
 		const isStable = releaseChannel(version) === "stable" && !release.prerelease;
 		const needed = CI_RELEASE_TARGETS.filter(
 			({ platform }) =>
@@ -137,6 +143,8 @@ export async function selectGitHubBaselines(
 			options.signal,
 		);
 		if (assets.length > 200) throw new Error("Baseline release asset limit exceeded");
+		if (assets.length !== release.assetCount)
+			throw new Error("Baseline release asset count changed or truncated");
 		const assetMap = new Map<string, RemoteAsset>();
 		const assetIds = new Set<number>();
 		for (const asset of assets) {

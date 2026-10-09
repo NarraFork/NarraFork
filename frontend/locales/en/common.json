@@ -1,4 +1,6 @@
 {
+	"updateNotesLoading": "Loading release notes…",
+	"updateNotesUnavailable": "Release notes are unavailable. You can still download or apply the verified update.",
 	"dataDirectorySecurity": {
 		"check": "Check data directory permissions",
 		"handle": "Resolve",

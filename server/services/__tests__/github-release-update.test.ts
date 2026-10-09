@@ -117,6 +117,8 @@ function patchGithub(
 	const calls: string[] = [];
 	const fetcher: GithubFetch = async (url) => {
 		calls.push(url);
+		if (url.startsWith("https://raw.githubusercontent.com/"))
+			return new Response(null, { status: 404 });
 		if (url.startsWith("https://api.github.com/"))
 			return Response.json(items.map((item) => item.release));
 		const patch = patches.find((item) => item.step.metaUrl === url);
@@ -131,6 +133,8 @@ function mockGithub(fixtures: ReturnType<typeof fixture>[]) {
 	const calls: string[] = [];
 	const fetcher: GithubFetch = async (url) => {
 		calls.push(url);
+		if (url.startsWith("https://raw.githubusercontent.com/"))
+			return new Response(null, { status: 404 });
 		if (url.startsWith("https://api.github.com/"))
 			return Response.json(fixtures.map((f) => f.release));
 		const selected = fixtures.find((f) => f.release.assets[1]?.browser_download_url === url);
@@ -261,6 +265,8 @@ describe("GitHub release selection", () => {
 		const calls: string[] = [];
 		const updater = new GithubReleaseUpdater(async (url) => {
 			calls.push(url);
+			if (url.startsWith("https://raw.githubusercontent.com/"))
+				return new Response(null, { status: 404 });
 			return new Response("x".repeat(2 * 1024 * 1024 + 1));
 		});
 		expect(
@@ -274,6 +280,8 @@ describe("GitHub release selection", () => {
 		const calls: string[] = [];
 		const updater = new GithubReleaseUpdater(async (url) => {
 			calls.push(url);
+			if (url.startsWith("https://raw.githubusercontent.com/"))
+				return new Response(null, { status: 404 });
 			if (url.endsWith("page=1"))
 				return Response.json([], { headers: { link: '<https://evil.example>; rel="next"' } });
 			if (url.endsWith("page=2")) return Response.json([item.release]);
@@ -284,7 +292,9 @@ describe("GitHub release selection", () => {
 	});
 	test("page ceiling cannot falsely report that no update exists", async () => {
 		let count = 0;
-		const updater = new GithubReleaseUpdater(async () => {
+		const updater = new GithubReleaseUpdater(async (url) => {
+			if (url.startsWith("https://raw.githubusercontent.com/"))
+				return new Response(null, { status: 404 });
 			count++;
 			return Response.json([], { headers: { link: '<next>; rel="next"' } });
 		});
@@ -319,17 +329,19 @@ describe("GitHub request cache and limits", () => {
 	test("shares concurrent checks and caches by source identity", async () => {
 		const { updater, calls } = mockGithub([fixture()]);
 		await Promise.all([updater.check(input), updater.check(input)]);
-		expect(calls.length).toBe(2);
+		expect(calls.length).toBe(3);
 		await updater.check(input);
-		expect(calls.length).toBe(2);
+		expect(calls.length).toBe(3);
 		await updater.check({ ...input, channel: "beta" });
-		expect(calls.length).toBe(4);
+		expect(calls.length).toBe(6);
 	});
 	test("forced checks use ETag but re-fetch sidecar metadata", async () => {
 		const item = fixture();
 		let listCalls = 0;
 		let sidecarCalls = 0;
 		const updater = new GithubReleaseUpdater(async (url, init) => {
+			if (url.startsWith("https://raw.githubusercontent.com/"))
+				return new Response(null, { status: 404 });
 			if (url.startsWith("https://api.github.com/")) {
 				listCalls++;
 				if (listCalls === 1)
@@ -699,7 +711,7 @@ describe("GitHub optional release patches", () => {
 			).toBe("full");
 		}
 	});
-	test("patch probe body timeout and overall check deadline retain full update", async () => {
+	test("patch-only timeout retains full update but the whole check deadline does not", async () => {
 		for (const budgets of [
 			{ patchTimeoutMs: 20, checkTimeoutMs: 1000 },
 			{ patchTimeoutMs: 1000, checkTimeoutMs: 20 },
@@ -722,9 +734,14 @@ describe("GitHub optional release patches", () => {
 				budgets,
 			);
 			const result = await updater.check(input);
-			expect(result.strategy).toBe("full");
-			expect(result.updateAvailable).toBe(true);
-			expect(result.errorCode).toBeUndefined();
+			if (budgets.checkTimeoutMs === 20) {
+				expect(result.updateAvailable).toBe(false);
+				expect(result.errorCode).toBe("TIMEOUT");
+			} else {
+				expect(result.strategy).toBe("full");
+				expect(result.updateAvailable).toBe(true);
+				expect(result.errorCode).toBeUndefined();
+			}
 		}
 	});
 	test("hung optional metadata headers cannot erase a verified full recommendation", async () => {
@@ -769,6 +786,8 @@ describe("GitHub optional release patches", () => {
 		addPatch(item);
 		let patchRequests = 0;
 		const updater = new GithubReleaseUpdater(async (url) => {
+			if (url.startsWith("https://raw.githubusercontent.com/"))
+				return new Response(null, { status: 404 });
 			if (url.startsWith("https://api.github.com/")) {
 				const page = Number(new URL(url).searchParams.get("page"));
 				const json = JSON.stringify(page === 5 ? [item.release] : []);

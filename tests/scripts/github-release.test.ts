@@ -300,6 +300,102 @@ function fakeGitHub(options: GitHubReleaseOptions) {
 	return server;
 }
 
+describe("read-only repair after beta promotion", () => {
+	test("accepts remote stable announcement without writes; normal publication still rejects it", async () => {
+		const { options } = fixture("1.2.1");
+		const gh = fakeGitHub(options);
+		await publishGitHubRelease({ ...options, run: gh.run });
+		const release = gh.release;
+		if (!release) throw new Error("Missing fixture release");
+		expect(release.prerelease).toBe(true);
+		release.prerelease = false;
+		gh.calls.length = 0;
+		await expect(
+			publishGitHubRelease({ ...options, run: gh.run, requireAlreadyPublished: true }),
+		).resolves.toMatchObject({ alreadyPublished: true, dryRun: false });
+		expect(gh.calls.length).toBeGreaterThan(0);
+		expect(
+			gh.calls.every(
+				(args) => args[0] === "api" && !args.includes("--method") && !args.includes("-X"),
+			),
+		).toBe(true);
+		expect(release.prerelease).toBe(false);
+		gh.calls.length = 0;
+		await expect(publishGitHubRelease({ ...options, run: gh.run })).rejects.toThrow(
+			"channel/notes mismatch",
+		);
+		expect(gh.calls.every((args) => args[0] === "api")).toBe(true);
+	});
+	for (const mutation of [
+		"notes",
+		"missing",
+		"extra",
+		"size",
+		"digest",
+		"commit",
+		"draft",
+	] as const) {
+		test(`promoted repair still rejects ${mutation} without mutation`, async () => {
+			const { options } = fixture("1.2.1");
+			const gh = fakeGitHub(options);
+			await publishGitHubRelease({ ...options, run: gh.run });
+			const release = gh.release;
+			if (!release) throw new Error("Missing fixture release");
+			release.prerelease = false;
+			if (mutation === "notes") release.body += "changed";
+			if (mutation === "missing") release.assets.pop();
+			if (mutation === "extra")
+				release.assets.push({ name: "foreign", size: 1, state: "uploaded" });
+			if (mutation === "size") release.assets[0].size++;
+			if (mutation === "digest") release.assets[0].digest = `sha256:${"0".repeat(64)}`;
+			if (mutation === "commit") gh.tagCommit = "b".repeat(40);
+			if (mutation === "draft") release.draft = true;
+			gh.calls.length = 0;
+			await expect(
+				publishGitHubRelease({ ...options, run: gh.run, requireAlreadyPublished: true }),
+			).rejects.toThrow();
+			expect(gh.calls.every((args) => args[0] === "api")).toBe(true);
+		});
+	}
+	for (const mutation of ["channel", "notes", "digest"] as const) {
+		test(`rejects promoted ${mutation} changing during second readback`, async () => {
+			const { options } = fixture("1.2.1");
+			const gh = fakeGitHub(options);
+			await publishGitHubRelease({ ...options, run: gh.run });
+			const release = gh.release;
+			if (!release) throw new Error("Missing fixture release");
+			release.prerelease = false;
+			gh.calls.length = 0;
+			let reads = 0;
+			await expect(
+				publishGitHubRelease({
+					...options,
+					requireAlreadyPublished: true,
+					run: (args) => {
+						if (args[1].includes("/releases/tags/") && ++reads === 2) {
+							if (mutation === "channel") release.prerelease = true;
+							if (mutation === "notes") release.body += "changed";
+							if (mutation === "digest") release.assets[0].digest = `sha256:${"0".repeat(64)}`;
+						}
+						return gh.run(args);
+					},
+				}),
+			).rejects.toThrow();
+			expect(reads).toBe(2);
+			expect(gh.calls.every((args) => args[0] === "api")).toBe(true);
+		});
+	}
+	test("missing public release never becomes a newly created draft", async () => {
+		const { options } = fixture("1.2.1");
+		const gh = fakeGitHub(options);
+		await expect(
+			publishGitHubRelease({ ...options, run: gh.run, requireAlreadyPublished: true }),
+		).rejects.toThrow("already-public");
+		expect(gh.calls.every((args) => args[0] === "api")).toBe(true);
+		expect(gh.release).toBeNull();
+	});
+});
+
 describe("GitHub release assets and lifecycle", () => {
 	test.each([
 		"01.2.0",
@@ -895,7 +991,8 @@ globalThis.fetch = async () => { throw new Error("FORBIDDEN_LEGACY_BASELINE_FETC
 		});
 		const output = `${github.stdout.toString()}${github.stderr.toString()}`;
 		expect(github.exitCode).not.toBe(0);
-		expect(output).toContain("No valid release platforms selected");
+		// Index preparation validates the selected platform set before publisher staging.
+		expect(output).toContain("Invalid platform count");
 		expect(output).not.toContain("Update server token not found");
 		expect(output).not.toContain("baseline verification");
 		const legacy = Bun.spawnSync(args, {

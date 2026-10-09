@@ -1,4 +1,8 @@
-import { type PreparedUpdateIdentity, sameUpdateSourceIdentity } from "@shared/update-identity";
+import {
+	type PreparedUpdateIdentity,
+	sameUpdateSourceIdentity,
+	updateSourceIdentityKey,
+} from "@shared/update-identity";
 import { type QueryClient, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import i18n from "i18next";
 import { useCallback, useEffect, useRef, useState } from "react";
@@ -15,6 +19,38 @@ type UpdateReleaseInfo = NonNullable<Awaited<ReturnType<typeof api.checkUpdate>>
 
 import { useCurrentUser } from "./useAuth";
 import { useUpdateCapability } from "./usePlatform";
+
+/** A disabled/changed selection gets a different key, cancelling and hiding stale notes. */
+export function useUpdateNotes(
+	release: UpdateReleaseInfo | undefined,
+	enabled: boolean,
+	preparedId?: string,
+) {
+	const identity =
+		enabled &&
+		release?.notesDeferred &&
+		release.notesAvailable &&
+		release.sourceIdentity?.source === "github"
+			? { version: release.version, sha512: release.sha512, sourceIdentity: release.sourceIdentity }
+			: null;
+	return useQuery({
+		queryKey: [
+			"update-notes",
+			identity ? updateSourceIdentityKey(identity.sourceIdentity) : null,
+			identity?.version,
+			identity?.sha512,
+			preparedId,
+		],
+		queryFn: ({ signal }) => {
+			if (!identity) throw new Error("No selected release notes identity");
+			return api.getUpdateNotes(identity, signal);
+		},
+		enabled: !!identity,
+		staleTime: 5 * 60_000,
+		gcTime: 5 * 60_000,
+		retry: false,
+	});
+}
 
 const MAX_SSE_BUFFER_CHARS = 64_000;
 

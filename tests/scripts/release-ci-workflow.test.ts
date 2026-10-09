@@ -70,6 +70,9 @@ function gateEnv(restore: boolean, publish: boolean): NodeJS.ProcessEnv {
 		ASSEMBLE_RESULT: restore ? "skipped" : "success",
 		RESTORE_RESULT: restore ? "success" : "skipped",
 		PUBLISH_RESULT: publish ? "success" : "skipped",
+		INDEX_ONLY: "false",
+		INDEX_COMMIT: publish ? "a".repeat(40) : "",
+		INDEX_GENERATION: publish ? "1" : "",
 	};
 }
 
@@ -79,6 +82,10 @@ describe("release workflow safety", () => {
 			"scripts/ci-release.ts",
 			"scripts/smoke-release-binary.ts",
 			"scripts/lib/github-release-baseline.ts",
+			"scripts/lib/github-release-summary.ts",
+			"scripts/lib/build-repository.ts",
+			"scripts/lib/update-index.ts",
+			"scripts/lib/update-index-github.ts",
 			...new Bun.Glob("scripts/lib/ci-{release,build}-*.ts").scanSync({ cwd: root }),
 		];
 		const result = spawnSync("git", ["check-ignore", "--no-index", "--", ...paths], {
@@ -99,6 +106,7 @@ describe("release workflow safety", () => {
 			default: false,
 		});
 		expect(Object.keys(release.on.workflow_dispatch?.inputs ?? {}).sort()).toEqual([
+			"index_only",
 			"publish",
 			"source_run_id",
 			"tag",
@@ -203,7 +211,11 @@ describe("release workflow safety", () => {
 				if (step.uses?.startsWith("actions/download-artifact@"))
 					expect(step.with?.["merge-multiple"]).toBeUndefined();
 			}
-		expect(release.jobs.restore?.steps?.at(-1)?.run).toContain("control.js restore");
+		expect(
+			release.jobs.restore?.steps?.find(
+				(step) => step.name === "Verify original bundle or prepare read-only index repair",
+			)?.run,
+		).toContain("control.js restore");
 		expect(release.jobs.publish?.steps?.at(-1)?.run).toContain("control.js publish");
 		expect(release.jobs.publish?.if).toContain("!cancelled()");
 		expect(release.jobs.gate?.if).toBe(expression("always()"));
@@ -211,6 +223,18 @@ describe("release workflow safety", () => {
 });
 
 describe("release mode gate behavior", () => {
+	test("a public release is not green until its verified index receipt exists", () => {
+		const env = gateEnv(false, true);
+		for (const key of ["INDEX_COMMIT", "INDEX_GENERATION"])
+			for (const value of [undefined, "", "invalid", "0"]) {
+				expect(() => assertReleaseGate({ ...env, [key]: value })).toThrow();
+			}
+	});
+	test("index-only recovery has no build and still requires protected publication evidence", () => {
+		expect(() => assertReleaseGate({ ...gateEnv(true, false), INDEX_ONLY: "true" })).not.toThrow();
+		expect(() => assertReleaseGate({ ...gateEnv(true, true), INDEX_ONLY: "true" })).not.toThrow();
+		expect(() => assertReleaseGate({ ...gateEnv(false, false), INDEX_ONLY: "true" })).toThrow();
+	});
 	for (const restore of [false, true])
 		for (const publish of [false, true]) {
 			test(`only accepts required successes and deliberately skipped jobs (${restore}, ${publish})`, () => {

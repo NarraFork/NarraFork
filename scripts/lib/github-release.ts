@@ -4,7 +4,10 @@ import { createReadStream } from "node:fs";
 import { copyFile, lstat, mkdtemp, opendir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { isValidGitHubRepository } from "../../server/lib/settings/update-source";
+import {
+	isValidGitHubRepository,
+	OFFICIAL_GITHUB_REPOSITORY,
+} from "../../shared/github-repository";
 import {
 	MAX_RELEASE_BINARY_BYTES,
 	MAX_RELEASE_PATCH_BYTES,
@@ -22,7 +25,7 @@ const MAX_PATCH_PAIRS = 64;
 const MAX_DIST_ENTRIES = 4096;
 export const GH_TIMEOUT_MS = 300_000;
 export const GH_MAX_OUTPUT_BYTES = 1024 * 1024;
-export const DEFAULT_GITHUB_REPOSITORY = "NarraFork/NarraFork";
+export const DEFAULT_GITHUB_REPOSITORY = OFFICIAL_GITHUB_REPOSITORY;
 
 export type GhRunner = (args: string[]) => string | Promise<string>;
 
@@ -90,6 +93,10 @@ export interface GitHubReleaseOptions {
 	dryRun?: boolean;
 	/** CI opt-in; local publishing keeps its existing behavior. */
 	preventStableLatestRollback?: boolean;
+	/** New fork releases must not silently ship an upstream-default binary. */
+	requireBuildRepository?: boolean;
+	/** Recovery mode may verify an already-public release, never create/upload/publish one. */
+	requireAlreadyPublished?: boolean;
 	run?: GhRunner;
 }
 
@@ -244,6 +251,16 @@ async function stageAssets(options: GitHubReleaseOptions, directory: string): Pr
 		const metadataName = `${name}.metadata.json`;
 		const raw = await readText(join(options.distDir, metadataName), MAX_METADATA_BYTES);
 		const metadata = JSON.parse(raw) as BinaryMetadata;
+		const expectedRepository = options.repository ?? DEFAULT_GITHUB_REPOSITORY;
+		if (
+			(metadata.repository !== undefined &&
+				(!isValidGitHubRepository(metadata.repository) ||
+					metadata.repository.toLowerCase() !== expectedRepository.toLowerCase())) ||
+			(options.requireBuildRepository &&
+				metadata.repository === undefined &&
+				expectedRepository.toLowerCase() !== OFFICIAL_GITHUB_REPOSITORY.toLowerCase())
+		)
+			throw new Error(`Binary build repository does not match release target: ${metadataName}`);
 		const target = `bun-${platform.replace(/^win-/, "windows-")}`;
 		if (
 			metadata.name !== name ||
@@ -491,7 +508,7 @@ export async function publishGitHubRelease(
 	const tag = `v${options.version}`;
 	const body = githubReleaseBody(options.changelog);
 	if (Buffer.byteLength(body) > MAX_TEXT_BYTES) throw new Error("Release notes exceed size limit");
-	const prerelease = releaseChannel(options.version) === "beta";
+	let prerelease = releaseChannel(options.version) === "beta";
 	const directory = await mkdtemp(join(tmpdir(), "narrafork-github-release-"));
 	try {
 		const assets = await stageAssets(options, directory);
@@ -500,6 +517,11 @@ export async function publishGitHubRelease(
 		// Require an explicitly pushed tag rather than silently using GitHub's default branch.
 		await verifyRemoteTag(run, repository, tag, options.commit);
 		let release = await getRelease(run, repository, tag);
+		if (options.requireAlreadyPublished && (!release || release.draft))
+			throw new Error("Index repair requires an already-public release");
+		// Read-only repair follows an explicit remote promotion, but freezes that
+		// announcement state for all subsequent checks and never mutates assets.
+		if (options.requireAlreadyPublished && release) prerelease = release.prerelease;
 		if (options.preventStableLatestRollback && !prerelease && (!release || release.draft)) {
 			await assertStableLatestDoesNotRegress(run, repository, options.version);
 		}

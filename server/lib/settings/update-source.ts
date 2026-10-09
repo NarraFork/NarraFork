@@ -1,8 +1,13 @@
 import { z } from "zod";
+import { BUILD_GITHUB_REPOSITORY } from "../../../shared/build-repository";
+import { isValidGitHubRepository } from "../../../shared/github-repository";
+
+export { isValidGitHubRepository } from "../../../shared/github-repository";
+
 import { isTrustedUpdateServerUrl } from "../update-server-url";
 import type { NarraForkSettings } from "./types";
 
-export const DEFAULT_GITHUB_REPOSITORY = "NarraFork/NarraFork";
+export const DEFAULT_GITHUB_REPOSITORY = BUILD_GITHUB_REPOSITORY;
 export const LEGACY_UPDATE_SERVER_URL = "https://narrafork-update.b.domexie.cn";
 export const DEFAULT_UPDATE_SETTINGS = {
 	source: "github",
@@ -13,22 +18,6 @@ export const DEFAULT_UPDATE_SETTINGS = {
 	checkIntervalMinutes: 60,
 	autoDownload: false,
 } satisfies NonNullable<NarraForkSettings["update"]>;
-
-/** Only an owner/repo slug, never a URL, hostname, or traversal path. */
-export function isValidGitHubRepository(value: unknown): value is string {
-	if (typeof value !== "string" || value.length > 140 || value.includes("..")) return false;
-	const parts = value.split("/");
-	if (parts.length !== 2) return false;
-	const [owner, repo] = parts;
-	return (
-		owner.length <= 39 &&
-		/^[a-zA-Z0-9]+(?:-[a-zA-Z0-9]+)*$/.test(owner) &&
-		repo.length >= 1 &&
-		repo.length <= 100 &&
-		repo !== "." &&
-		/^[a-zA-Z0-9_.-]+$/.test(repo)
-	);
-}
 
 /** Shared by the settings PATCH route and isolated validation tests. */
 export const updateSourceSettingsSchema = z

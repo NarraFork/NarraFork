@@ -27,7 +27,7 @@ function plan(version = "2.0.0"): Omit<CiReleasePlan, "baselines"> {
 		runAttempt: 1,
 	};
 }
-function fixture() {
+function fixture(repository = "NarraFork/NarraFork") {
 	let nextId = 1;
 	const releases: { id: number; tag_name: string; draft: boolean; prerelease: boolean }[] = [];
 	const assets = new Map<number, { id: number; name: string; size: number; state: string }[]>();
@@ -48,6 +48,7 @@ function fixture() {
 				platformId: target.platform,
 				target: `bun-${target.target}`,
 				commit: "b".repeat(40),
+				repository,
 				buildDate: "2026-10-08T00:00:00.000Z",
 			});
 			const raw = formatMetadataJson(meta);
@@ -67,7 +68,25 @@ function fixture() {
 	const run: GhRunner = (args) => {
 		calls.push(args);
 		const endpoint = args[1] ?? "";
-		if (/\/releases\?/.test(endpoint)) return JSON.stringify(releases);
+		if (endpoint === "graphql")
+			return JSON.stringify({
+				data: {
+					repository: {
+						nameWithOwner: repository,
+						releases: {
+							nodes: releases.map((r) => ({
+								databaseId: r.id,
+								tagName: r.tag_name,
+								isDraft: r.draft,
+								isPrerelease: r.prerelease,
+								publishedAt: null,
+								releaseAssets: { totalCount: assets.get(r.id)?.length ?? 0 },
+							})),
+							pageInfo: { hasNextPage: false, endCursor: null },
+						},
+					},
+				},
+			});
 		const list = /\/releases\/(\d+)\/assets\?/.exec(endpoint);
 		if (list) return JSON.stringify(assets.get(Number(list[1])));
 		const content = /\/releases\/assets\/(\d+)$/.exec(endpoint);
@@ -78,6 +97,28 @@ function fixture() {
 }
 
 describe("CI GitHub baseline selection", () => {
+	test("fork baseline paths and metadata stay within the selected repository", async () => {
+		const repository = "Example/Custom";
+		const f = fixture(repository);
+		f.release("1.0.0");
+		const selected = await selectGitHubBaselines({ ...plan(), repository }, { run: f.run });
+		expect(selected).toHaveLength(8);
+		expect(selected.every((base) => base.metadata.repository === repository)).toBe(true);
+		expect(
+			f.calls.every((args) => args[1] === "graphql" || args[1].startsWith(`repos/${repository}/`)),
+		).toBe(true);
+		const sidecar = f.assets.get(1)?.[1];
+		if (!sidecar) throw new Error("fixture");
+		const meta = JSON.parse(f.contents.get(sidecar.id) ?? "{}");
+		delete meta.repository;
+		const raw = JSON.stringify(meta);
+		f.contents.set(sidecar.id, raw);
+		sidecar.size = Buffer.byteLength(raw);
+		// Legacy baseline bytes are safe after hash validation; only new strict builds require repo.
+		await expect(
+			selectGitHubBaselines({ ...plan(), repository }, { run: f.run }),
+		).resolves.toHaveLength(8);
+	});
 	test("first release is legitimately full-only", async () => {
 		const f = fixture();
 		expect(await selectGitHubBaselines(plan(), { run: f.run })).toEqual([]);
@@ -135,14 +176,24 @@ describe("CI GitHub baseline selection", () => {
 			selectGitHubBaselines(plan(), {
 				run: () => {
 					calls++;
-					return JSON.stringify(
-						Array.from({ length: 100 }, (_, i) => ({
-							id: calls * 100 + i,
-							tag_name: `v1.${i}.0`,
-							draft: false,
-							prerelease: false,
-						})),
-					);
+					return JSON.stringify({
+						data: {
+							repository: {
+								nameWithOwner: "NarraFork/NarraFork",
+								releases: {
+									nodes: Array.from({ length: 100 }, (_, i) => ({
+										databaseId: calls * 100 + i,
+										tagName: `v1.${i}.0`,
+										isDraft: false,
+										isPrerelease: false,
+										publishedAt: null,
+										releaseAssets: { totalCount: 0 },
+									})),
+									pageInfo: { hasNextPage: true, endCursor: String(calls) },
+								},
+							},
+						},
+					});
 				},
 			}),
 		).rejects.toThrow("pagination limit");
@@ -172,6 +223,32 @@ describe("CI GitHub baseline selection", () => {
 		).rejects.toThrow("pagination limit");
 		expect(assets).toBe(10);
 	});
+	test("summary asset count detects a truncated short assets page", async () => {
+		const f = fixture();
+		f.release("1.0.0");
+		await expect(
+			selectGitHubBaselines(plan(), {
+				run: (args) => {
+					if (args[1].includes("/1/assets?")) return "[]";
+					return f.run(args);
+				},
+			}),
+		).rejects.toThrow("count changed or truncated");
+	});
+	test("cancellation interrupts between summary pages", async () => {
+		const f = fixture();
+		const controller = new AbortController();
+		await expect(
+			selectGitHubBaselines(plan(), {
+				signal: controller.signal,
+				run: (args) => {
+					controller.abort();
+					return f.run(args);
+				},
+			}),
+		).rejects.toThrow();
+		expect(f.calls).toHaveLength(1);
+	});
 	test("missing sidecar is corrupt rather than a missing platform", async () => {
 		const f = fixture();
 		const id = f.release("1.0.0");
@@ -193,7 +270,7 @@ describe("CI GitHub baseline selection", () => {
 		if (!first) throw new Error("fixture");
 		f.releases.push(first);
 		await expect(selectGitHubBaselines(plan(), { run: f.run })).rejects.toThrow(
-			"duplicate GitHub release",
+			"Duplicate GitHub release",
 		);
 	});
 	test("rejects bad metadata identity and bounded metadata size", async () => {
@@ -218,7 +295,7 @@ describe("CI GitHub baseline selection", () => {
 			selectGitHubBaselines(plan(), { run: f.run, signal: AbortSignal.abort() }),
 		).rejects.toThrow();
 		await expect(
-			selectGitHubBaselines({ ...plan(), repository: "other/repo" }, { run: f.run }),
+			selectGitHubBaselines({ ...plan(), repository: "../repo" }, { run: f.run }),
 		).rejects.toThrow("Invalid baseline release plan");
 		expect(f.calls).toHaveLength(0);
 	});

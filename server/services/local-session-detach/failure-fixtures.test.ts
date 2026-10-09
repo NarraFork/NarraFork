@@ -1338,23 +1338,32 @@ describe("bounded uncertain fixture effects", () => {
 	});
 	test("total deadline expires across individually short effect stages", async () => {
 		const h = harness();
-		const ports: FixturePorts = {
-			...h.ports,
-			async installRuntime() {
-				h.calls.push("install");
-				await new Promise((done) => setTimeout(done, 50));
-			},
-			async verifyRuntime() {
-				h.calls.push("verify");
-				await new Promise((done) => setTimeout(done, 50));
-			},
-		};
-		const result = await h.apply({ ports, effectMilliseconds: 80 });
-		expect(result.status).toBe("recovery-required");
-		expect(result.reason).toBe("EFFECT_TIMEOUT:verify");
-		expect(h.protection()).toBe(true);
-		expect(h.calls).not.toContain("publish");
-		expect(h.calls).not.toContain("release");
+		let elapsed = 0;
+		const clock = spyOn(performance, "now").mockImplementation(() => elapsed);
+		try {
+			const ports: FixturePorts = {
+				...h.ports,
+				async installRuntime() {
+					h.calls.push("install");
+					elapsed += 50;
+				},
+				async verifyRuntime() {
+					h.calls.push("verify");
+					elapsed += 50;
+				},
+			};
+			// Keep wall-clock scheduling and intervening evidence checks out of this
+			// test: each effect consumes <80ms, but their shared budget is exceeded.
+			const result = await h.apply({ ports, effectMilliseconds: 80 });
+			expect(h.calls).toContain("verify");
+			expect(result.status).toBe("recovery-required");
+			expect(result.reason).toBe("EFFECT_TIMEOUT:verify");
+			expect(h.protection()).toBe(true);
+			expect(h.calls).not.toContain("publish");
+			expect(h.calls).not.toContain("release");
+		} finally {
+			clock.mockRestore();
+		}
 	}, 1000);
 	test("resolving an awaited effect rechecks changed lease and refuses stale compensation", async () => {
 		const h = harness();

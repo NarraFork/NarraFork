@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { createReadStream, lstatSync, readFileSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
+import { isValidGitHubRepository } from "../../shared/github-repository";
 import {
 	type BinaryMetadata,
 	type ComputeMetadataInput,
@@ -108,6 +109,7 @@ export async function computeCiBinaryMetadata(
 	input: ComputeMetadataInput,
 ): Promise<BinaryMetadata> {
 	if (!/^[0-9a-f]{40}$/.test(input.commit)) throw new Error("Missing full build commit");
+	if (!isValidGitHubRepository(input.repository)) throw new Error("Missing build repository");
 	const before = lstatSync(path);
 	if (!before.isFile() || before.size <= 0 || before.size > 1024 * 1024 * 1024) {
 		throw new Error(`Invalid release binary: ${path}`);
@@ -146,6 +148,7 @@ export async function computeCiBinaryMetadata(
 		target: input.target,
 		version: input.version,
 		commit: input.commit,
+		repository: input.repository,
 		buildDate: input.buildDate,
 		size,
 		sha256: sha256.digest("hex"),
@@ -161,6 +164,7 @@ export function validateCiMetadata(
 		target: string;
 		version: string;
 		commit: string;
+		repository: string;
 	},
 ): asserts metadata is BinaryMetadata {
 	if (
@@ -170,6 +174,8 @@ export function validateCiMetadata(
 		metadata.target !== expected.target ||
 		metadata.version !== expected.version ||
 		metadata.commit !== expected.commit ||
+		!isValidGitHubRepository(expected.repository) ||
+		metadata.repository !== expected.repository ||
 		!/^[0-9a-f]{40}$/.test(metadata.commit) ||
 		!Number.isSafeInteger(metadata.size) ||
 		metadata.size <= 0 ||
@@ -190,6 +196,7 @@ export async function verifyCiSidecar(
 		target: string;
 		version: string;
 		commit: string;
+		repository: string;
 	},
 ): Promise<BinaryMetadata> {
 	const sidecar = `${path}.metadata.json`;

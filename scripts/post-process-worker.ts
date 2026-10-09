@@ -24,10 +24,19 @@ interface WorkerInput {
 	root: string;
 	version: string;
 	commit: string;
+	repository: string;
 	releaseCi?: boolean;
 }
 
-const { platform, distDir, root, version, commit, releaseCi = false } = workerData as WorkerInput;
+const {
+	platform,
+	distDir,
+	root,
+	version,
+	commit,
+	repository,
+	releaseCi = false,
+} = workerData as WorkerInput;
 
 if (!parentPort) throw new Error("Post-processing must run inside a worker");
 const port = parentPort;
@@ -167,6 +176,7 @@ const metadataInput = {
 	platformId: platform.platformId,
 	target: platform.target,
 	commit,
+	repository,
 	buildDate,
 };
 const strictMetadata = releaseCi

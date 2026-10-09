@@ -5,12 +5,14 @@ import { join } from "node:path";
 import type { GithubPatchStep } from "../../../shared/release-patch";
 import { settings } from "../../lib/settings";
 import { APP_VERSION } from "../../lib/version";
+import { githubReleaseUpdater } from "../github-release-update";
 import { resetUpdateCoordinationForTests, scheduleUpdate } from "../update-coordinator";
 import {
 	checkForUpdate,
 	downloadUpdate,
 	getCurrentUpdateSourceIdentity,
 	getUpdateDirectory,
+	getUpdateNotes,
 	getUpdateStatus,
 	isUpdateSourceCurrent,
 	type ReleaseInfo,
@@ -99,6 +101,9 @@ function installFetch(handler: (url: string) => Response | Promise<Response>) {
 		async (...args: Parameters<typeof fetch>) => {
 			const url = String(args[0]);
 			requested.push(url);
+			// Legacy fixtures explicitly advertise that the new metadata branch is absent.
+			if (url.startsWith("https://raw.githubusercontent.com/"))
+				return new Response(null, { status: 404 });
 			return handler(url);
 		},
 		{ preconnect: originalFetch.preconnect },
@@ -111,6 +116,45 @@ beforeEach(() => {
 afterEach(() => {
 	globalThis.fetch = originalFetch;
 	resetUpdateCoordinationForTests();
+});
+
+describe("release notes source snapshots", () => {
+	test("mismatched old prepared source makes no notes request", async () => {
+		selectGithub();
+		const sourceIdentity = getCurrentUpdateSourceIdentity();
+		if (!sourceIdentity || sourceIdentity.source !== "github") throw new Error("Expected GitHub");
+		await expect(
+			getUpdateNotes({
+				version,
+				sha512,
+				sourceIdentity: { ...sourceIdentity, repository: "old/repo" },
+			}),
+		).rejects.toThrow("source changed");
+		expect(requested).toHaveLength(0);
+	});
+	test.each([
+		"repository",
+		"channel",
+		"source",
+	])("a %s change during notes read discards the result", async (field) => {
+		const update = selectGithub();
+		const sourceIdentity = getCurrentUpdateSourceIdentity();
+		if (!sourceIdentity) throw new Error("Expected source");
+		const original = githubReleaseUpdater.getNotes;
+		try {
+			githubReleaseUpdater.getNotes = async () => {
+				if (field === "repository") update.githubRepository = "changed/repo";
+				else if (field === "channel") update.channel = "beta";
+				else update.source = "update-server";
+				return { notes: "Must never reach the old artifact" };
+			};
+			await expect(getUpdateNotes({ version, sha512, sourceIdentity })).rejects.toThrow(
+				"source changed",
+			);
+		} finally {
+			githubReleaseUpdater.getNotes = original;
+		}
+	});
 });
 
 describe("selected update source integration", () => {
@@ -200,7 +244,7 @@ describe("selected update source integration", () => {
 		if (!downloaded.updatePath) throw new Error("No prepared binary");
 		expect(readFileSync(downloaded.updatePath)).toEqual(payload);
 		expect((await getUpdateStatus(version)).ready).toBe(true);
-		expect(requested).toHaveLength(3);
+		expect(requested).toHaveLength(4);
 		expect(requested.some((url) => url.includes("/api/v2/"))).toBe(false);
 	});
 	test("GitHub delta without a compiled base falls back to GitHub full, ignoring legacy descriptors", async () => {
@@ -399,7 +443,8 @@ describe("selected update source integration", () => {
 		installFetch(() => new Response(null, { status: 404 }));
 		const result = await checkForUpdate({ force: true });
 		expect(result.errorCode).toBe("REPOSITORY_UNAVAILABLE");
-		expect(requested).toHaveLength(1);
-		expect(requested[0]).toContain("api.github.com");
+		expect(requested).toHaveLength(2);
+		expect(requested[0]).toContain("raw.githubusercontent.com");
+		expect(requested[1]).toContain("api.github.com");
 	});
 });

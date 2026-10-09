@@ -35,7 +35,12 @@ const platform = {
 	platformId: "linux-x64",
 	name: "narrafork-1.2.3-linux-x64",
 };
-const identity = { ...platform, version: "1.2.3", commit: "a".repeat(40) };
+const identity = {
+	...platform,
+	version: "1.2.3",
+	commit: "a".repeat(40),
+	repository: "Fork/Custom",
+};
 const input = { ...identity, buildDate: "2026-10-08T00:00:00.000Z" };
 
 async function worker(
@@ -50,6 +55,7 @@ async function worker(
 				root: process.cwd(),
 				version: identity.version,
 				commit: identity.commit,
+				repository: identity.repository,
 				releaseCi,
 			},
 		});
@@ -137,6 +143,8 @@ describe("strict CI builds fail closed without compiling or publishing", () => {
 		validateCiMetadata(metadata, identity);
 		for (const changes of [
 			{ commit: "a123456" },
+			{ repository: undefined },
+			{ repository: "NarraFork/NarraFork" },
 			{ target: "bun-windows-arm64" },
 			{ platform: "win-x64" },
 			{ version: "1.2.2" },

@@ -31,6 +31,7 @@ import {
 	type UpdateDownloadResult,
 	useUpdateApply,
 	useUpdateDownload,
+	useUpdateNotes,
 } from "../hooks/useUpdateCheck";
 import { useUpdateScheduleStatus } from "../hooks/useUpdateSchedule";
 import { api } from "../lib/api";
@@ -38,6 +39,7 @@ import { normalizeLanguage } from "../lib/i18n";
 import { formatLocaleDate } from "../lib/intl-format";
 import { clearPwaCache, waitForUpdatedServerAndReload } from "../lib/pwa";
 import {
+	DEFAULT_GITHUB_REPOSITORY,
 	sameUpdateSource,
 	settingsSourceIdentity,
 	updateCheckErrorKey,
@@ -84,6 +86,8 @@ export interface UpdateModalData {
 		version: string;
 		releaseDate: string;
 		releaseNotes?: string | Record<string, string>;
+		notesDeferred?: boolean;
+		notesAvailable?: boolean;
 		path: string;
 		sha512: string;
 		files: Array<{ url: string; size: number; sha512: string }>;
@@ -182,7 +186,7 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 			(!!releaseInfo &&
 				!sameUpdateSource(releaseInfo, {
 					source: savedSettings.update?.source ?? "github",
-					repository: savedSettings.update?.githubRepository ?? "NarraFork/NarraFork",
+					repository: savedSettings.update?.githubRepository ?? DEFAULT_GITHUB_REPOSITORY,
 					sourceIdentity: releaseInfo.sourceIdentity
 						? (settingsSourceIdentity(savedSettings.update, releaseInfo.sourceIdentity.platform) ??
 							undefined)
@@ -429,6 +433,11 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 		!!selectedIdentity &&
 		!!preparedStatus?.preparedIdentity &&
 		selectedIdentity.id !== preparedStatus.preparedIdentity.id;
+	const deferredNotes = useUpdateNotes(
+		releaseInfo,
+		opened && showRecommendation && !preparedChanged,
+		preparedStatus?.preparedIdentity?.id ?? selectedIdentity?.id,
+	);
 	const displayedVersion = effectiveResult?.version ?? targetVersion;
 
 	const preparedBinaryPath =
@@ -631,12 +640,23 @@ export function UpdateModal({ opened, onClose, data }: UpdateModalProps) {
 								</Stack>
 							) : (
 								(() => {
-									const notes = resolveNotes(releaseNotes, i18n.language);
+									const notes = resolveNotes(
+										releaseInfo?.notesDeferred
+											? (deferredNotes.data?.notes ?? undefined)
+											: (releaseNotes ?? releaseInfo?.releaseNotes),
+										i18n.language,
+									);
 									return notes ? (
 										<MarkdownContent text={notes} />
 									) : (
 										<Text size="sm" c="dimmed" fs="italic">
-											{t("updateNoNotes")}
+											{t(
+												deferredNotes.isFetching
+													? "updateNotesLoading"
+													: deferredNotes.isError
+														? "updateNotesUnavailable"
+														: "updateNoNotes",
+											)}
 										</Text>
 									);
 								})()

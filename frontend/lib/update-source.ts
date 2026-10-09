@@ -1,3 +1,4 @@
+import { BUILD_GITHUB_REPOSITORY as DEFAULT_GITHUB_REPOSITORY } from "@shared/build-repository";
 import {
 	parseUpdateSourceIdentity,
 	sameUpdateSourceIdentity,
@@ -14,7 +15,7 @@ export interface UpdateSourceSettings {
 	channel?: "stable" | "beta";
 }
 
-export const DEFAULT_GITHUB_REPOSITORY = "NarraFork/NarraFork";
+export { BUILD_GITHUB_REPOSITORY as DEFAULT_GITHUB_REPOSITORY } from "@shared/build-repository";
 
 const LEGACY_UPDATE_SERVER_URL = "https://narrafork-update.b.domexie.cn";
 

@@ -28,6 +28,7 @@ import {
 	requirePublishedBaseline,
 } from "../server/lib/release-baseline";
 import { isValidReleaseVersion } from "../shared/release-version";
+import { resolveBuildGitHubRepository } from "./lib/build-repository";
 import {
 	DEFAULT_GITHUB_REPOSITORY,
 	publishGitHubRelease,
@@ -39,6 +40,8 @@ import {
 	formatStableBaselineSummary,
 	resolvePlatformSuffixes,
 } from "./lib/stable-baseline-patch";
+import { prepareUpdateIndexRelease } from "./lib/update-index";
+import { preparePublishedUpdateIndexRelease, publishUpdateIndex } from "./lib/update-index-github";
 
 const ROOT = join(import.meta.dir, "..");
 const PKG_PATH = join(ROOT, "package.json");
@@ -57,7 +60,13 @@ if (deprecatedOverwriteArg) {
 const version = args.find((a) => !a.startsWith("--"));
 const dryRun = args.includes("--dry-run");
 const skipBuild = args.includes("--skip-build");
-const uploadOnly = args.includes("--upload-only");
+const indexOnly = args.includes("--index-only");
+const publishIndex = args.includes("--publish-index");
+if (publishIndex && (!indexOnly || dryRun)) {
+	console.error("--publish-index requires --index-only and cannot be combined with --dry-run");
+	process.exit(1);
+}
+const uploadOnly = args.includes("--upload-only") || indexOnly;
 const changelogArg = args
 	.find((a) => a.startsWith("--changelog="))
 	?.split("=")
@@ -78,7 +87,11 @@ const target =
 	args.find((a) => a.startsWith("--target="))?.slice("--target=".length) ?? "update-server";
 const githubRepository =
 	args.find((a) => a.startsWith("--github-repository="))?.slice("--github-repository=".length) ??
-	DEFAULT_GITHUB_REPOSITORY;
+	(target === "github" ? resolveBuildGitHubRepository({ root: ROOT }) : DEFAULT_GITHUB_REPOSITORY);
+if (indexOnly && target !== "github") {
+	console.error("--index-only requires --target=github");
+	process.exit(1);
+}
 if (target !== "github" && target !== "update-server") {
 	console.error("Invalid release target; expected github or update-server");
 	process.exit(1);
@@ -107,7 +120,9 @@ if (!version) {
 	console.error("");
 	console.error("Options:");
 	console.error("  --target=<target>     update-server (default) or github");
-	console.error("  --github-repository=<owner/repo>  Default: NarraFork/NarraFork");
+	console.error("  --github-repository=<owner/repo>  Default: CI repository or GitHub origin");
+	console.error("  --index-only           Read-only online repair preview; no dist/build required");
+	console.error("  --publish-index        With --index-only, explicitly write the metadata branch");
 	console.error("  --changelog=<file>    JSON file with localized release notes");
 	console.error("  --platform=<target>   Build and upload only this platform (e.g. windows-x64)");
 	console.error("  --patch-from=<v,...>  Upload direct patches for the listed base versions");
@@ -385,7 +400,7 @@ if (!uploadOnly && !dryRun) {
 }
 
 // GitHub release operations must run in the primary checkout, never an isolated worktree.
-if (target === "github" && !dryRun) {
+if (target === "github" && !dryRun && (!indexOnly || publishIndex)) {
 	const gitDirectories = execFileSync(
 		"git",
 		["rev-parse", "--path-format=absolute", "--git-dir", "--git-common-dir"],
@@ -467,6 +482,10 @@ if (!skipBuild && !uploadOnly) {
 	try {
 		execFileSync("bun", buildArgs, {
 			cwd: ROOT,
+			env:
+				target === "github"
+					? { ...process.env, NF_BUILD_GITHUB_REPOSITORY: githubRepository }
+					: process.env,
 			stdio: "inherit",
 			timeout: 600_000,
 		});
@@ -513,29 +532,58 @@ if (!uploadOnly && !dryRun) {
 // ── Step 5: Upload ──────────────────────────────────────────────────────────
 
 if (target === "github") {
+	let publicReleaseConfirmed = false;
 	try {
 		const commit =
 			resolveGitCommit(ROOT, `refs/tags/v${version}`) ??
-			(dryRun ? resolveGitCommit(ROOT, "HEAD") : null);
+			(dryRun && !indexOnly ? resolveGitCommit(ROOT, "HEAD") : null);
 		if (!commit) throw new Error(`Missing local release tag v${version}`);
-		const result = await publishGitHubRelease({
+		if (indexOnly) {
+			const prepared = await preparePublishedUpdateIndexRelease({
+				repository: githubRepository,
+				version,
+				commit,
+				changelog,
+			});
+			publicReleaseConfirmed = true;
+			if (!publishIndex) {
+				console.log(JSON.stringify(prepared, null, 2));
+				console.log(
+					"Read-only index repair preview complete; use --publish-index to write the metadata branch. No local dist is required and no Release/ref was changed.",
+				);
+				process.exit(0);
+			}
+			const receipt = await publishUpdateIndex({ repository: githubRepository, ...prepared });
+			console.log(
+				`GitHub update index repaired at ${receipt.commit} (generation ${receipt.generation}); Release assets unchanged`,
+			);
+			process.exit(0);
+		}
+		const options = {
 			distDir: DIST_DIR,
 			version,
 			repository: githubRepository,
 			platformSuffixes: resolvePlatformSuffixes(platformArg),
 			commit,
 			changelog,
-			dryRun,
-		});
+			requireBuildRepository: true,
+		};
+		const prepared = await prepareUpdateIndexRelease(options);
+		const result = await publishGitHubRelease({ ...options, dryRun });
+		if (!dryRun) {
+			publicReleaseConfirmed = true;
+			const receipt = await publishUpdateIndex({ repository: githubRepository, ...prepared });
+			console.log(`GitHub update index: ${receipt.commit} (generation ${receipt.generation})`);
+		}
 		console.log(
 			result.dryRun
-				? `Dry run complete — validated ${result.assets.length} GitHub assets; no GitHub calls made`
+				? `Dry run complete — validated ${result.assets.length} GitHub assets and bounded update-index record; no GitHub calls made`
 				: `GitHub release v${version}: ${result.alreadyPublished ? "already published and verified" : "published"}`,
 		);
 		process.exit(0);
 	} catch (error) {
 		console.error(
-			`GitHub release failed (any draft is retained): ${error instanceof Error ? error.message : String(error)}`,
+			`${publicReleaseConfirmed ? "PUBLISHED_NOT_INDEXED: Release is public; repair its index without rebuilding" : "GitHub release failed (any draft is retained)"}: ${error instanceof Error ? error.message : String(error)}`,
 		);
 		process.exit(1);
 	}

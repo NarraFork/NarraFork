@@ -1,4 +1,6 @@
 {
+	"updateNotesLoading": "正在加载更新说明…",
+	"updateNotesUnavailable": "更新说明暂不可用，不影响下载或应用已校验的更新。",
 	"dataDirectorySecurity": {
 		"check": "检查数据目录权限",
 		"handle": "处理",

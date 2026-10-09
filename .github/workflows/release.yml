@@ -4,11 +4,16 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing release tag reachable from main (vX.Y.Z)
+        description: Existing release tag reachable from the default branch (vX.Y.Z)
         required: true
         type: string
       publish:
         description: Publish after verification and release Environment approval
+        required: true
+        type: boolean
+        default: false
+      index_only:
+        description: Repair the index of an already-public release without building or publishing assets
         required: true
         type: boolean
         default: false
@@ -41,6 +46,9 @@ jobs:
     outputs:
       commit: ${{ steps.plan.outputs.commit }}
       version: ${{ steps.plan.outputs.version }}
+      repository: ${{ steps.plan.outputs.repository }}
+      default-branch: ${{ steps.plan.outputs.default-branch }}
+      index-only: ${{ steps.plan.outputs.index-only }}
       matrix: ${{ steps.plan.outputs.matrix }}
       restore-mode: ${{ steps.plan.outputs.restore-mode }}
       source-run-id: ${{ steps.plan.outputs.source-run-id }}
@@ -50,10 +58,12 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           WORKFLOW_REF: ${{ github.ref }}
           REPOSITORY: ${{ github.repository }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           test "$EVENT_NAME" = workflow_dispatch
-          test "$WORKFLOW_REF" = refs/heads/main
-          test "$REPOSITORY" = NarraFork/NarraFork
+          test -n "$DEFAULT_BRANCH"
+          test "$WORKFLOW_REF" = "refs/heads/$DEFAULT_BRANCH"
+          [[ "$REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]]
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
@@ -71,9 +81,10 @@ jobs:
           RELEASE_TAG: ${{ inputs.tag }}
           PUBLISH_REQUESTED: ${{ inputs.publish }}
           SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          INDEX_ONLY: ${{ inputs.index_only }}
         run: >-
           bun scripts/ci-release.ts preflight --tag="$RELEASE_TAG"
-          --publish="$PUBLISH_REQUESTED" --source-run-id="$SOURCE_RUN_ID"
+          --publish="$PUBLISH_REQUESTED" --source-run-id="$SOURCE_RUN_ID" --index-only="$INDEX_ONLY"
           --plan=.ci-release/control/plan.json
       - name: Bundle trusted control code for jobs without dependency installation
         run: bun build scripts/ci-release.ts --target=bun --outfile=.ci-release/control/control.js
@@ -120,6 +131,7 @@ jobs:
         env:
           TARGET: ${{ matrix.target }}
           SOURCE_COMMIT: ${{ needs.preflight.outputs.commit }}
+          NF_BUILD_GITHUB_REPOSITORY: ${{ needs.preflight.outputs.repository }}
         run: |
           test "$(git rev-parse HEAD)" = "$SOURCE_COMMIT"
           bun scripts/build-cross-platform.ts --platform="$TARGET" --skip-frontend --release-ci
@@ -158,10 +170,11 @@ jobs:
           BINARY: ${{ matrix.binary }}
           SOURCE_COMMIT: ${{ needs.preflight.outputs.commit }}
           RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
+          RELEASE_REPOSITORY: ${{ needs.preflight.outputs.repository }}
         run: >-
           bun scripts/smoke-release-binary.ts --target="$TARGET"
           --binary=".ci-release/platform/$BINARY" --metadata=".ci-release/platform/$BINARY.metadata.json"
-          --commit="$SOURCE_COMMIT" --version="$RELEASE_VERSION" --output=.ci-release/smoke/smoke.json
+          --commit="$SOURCE_COMMIT" --version="$RELEASE_VERSION" --repository="$RELEASE_REPOSITORY" --output=.ci-release/smoke/smoke.json
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: ${{ always() }}
         with:
@@ -223,6 +236,14 @@ jobs:
           test -n "$ARTIFACT_DIGEST"
           printf 'Bundle artifact: %s; digest: %s\n' "$ARTIFACT_ID" "$ARTIFACT_DIGEST" >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Upload bounded index preview
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-index-preview-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .ci-release/index-preview/
+          if-no-files-found: error
+          retention-days: 30
+
   restore:
     name: Verify original release bundle
     needs: [preflight]
@@ -245,14 +266,26 @@ jobs:
         with:
           name: release-control-${{ github.run_id }}-${{ github.run_attempt }}
           path: .ci-release/control/
-      - name: Verify original run, exact artifact digest and full bundle
+      - name: Verify original bundle or prepare read-only index repair
         env:
           GH_TOKEN: ${{ github.token }}
           SOURCE_RUN_ID: ${{ needs.preflight.outputs.source-run-id }}
           RELEASE_TAG: ${{ inputs.tag }}
-        run: >-
-          bun .ci-release/control/control.js restore --source-run-id="$SOURCE_RUN_ID"
-          --tag="$RELEASE_TAG" --bundle-dir=.ci-release/restored
+          INDEX_ONLY: ${{ inputs.index_only }}
+        run: |
+          if [[ "$INDEX_ONLY" == true ]]; then
+            bun .ci-release/control/control.js index --plan=.ci-release/control/plan.json --source-run-id="$SOURCE_RUN_ID" --bundle-dir=.ci-release/restored --publish=false
+          else
+            bun .ci-release/control/control.js restore --source-run-id="$SOURCE_RUN_ID" --tag="$RELEASE_TAG" --bundle-dir=.ci-release/restored
+          fi
+      - name: Upload repair preview
+        if: ${{ inputs.index_only }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-index-preview-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .ci-release/index-preview/
+          if-no-files-found: error
+          retention-days: 30
 
   publish:
     name: Publish verified release
@@ -265,6 +298,9 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     environment: release
+    outputs:
+      index-commit: ${{ steps.publish.outputs.index-commit }}
+      index-generation: ${{ steps.publish.outputs.index-generation }}
     permissions:
       contents: write
       actions: read
@@ -281,15 +317,20 @@ jobs:
         with:
           name: release-control-${{ github.run_id }}-${{ github.run_attempt }}
           path: .ci-release/control/
-      - name: Revalidate original bundle and publish without rebuilding
+      - name: Publish verified release and index, or repair only the index
+        id: publish
         env:
           GH_TOKEN: ${{ github.token }}
           PUBLISH_REQUESTED: ${{ inputs.publish }}
           SOURCE_RUN_ID: ${{ needs.preflight.outputs.source-run-id }}
           RELEASE_TAG: ${{ inputs.tag }}
-        run: >-
-          bun .ci-release/control/control.js publish --source-run-id="$SOURCE_RUN_ID"
-          --tag="$RELEASE_TAG" --bundle-dir=.ci-release/publish-bundle
+          INDEX_ONLY: ${{ inputs.index_only }}
+        run: |
+          if [[ "$INDEX_ONLY" == true ]]; then
+            bun .ci-release/control/control.js index --plan=.ci-release/control/plan.json --source-run-id="$SOURCE_RUN_ID" --bundle-dir=.ci-release/publish-bundle --publish=true
+          else
+            bun .ci-release/control/control.js publish --source-run-id="$SOURCE_RUN_ID" --tag="$RELEASE_TAG" --bundle-dir=.ci-release/publish-bundle
+          fi
 
   gate:
     name: Release Gate
@@ -320,4 +361,7 @@ jobs:
           ASSEMBLE_RESULT: ${{ needs.assemble.result }}
           RESTORE_RESULT: ${{ needs.restore.result }}
           PUBLISH_RESULT: ${{ needs.publish.result }}
+          INDEX_ONLY: ${{ inputs.index_only }}
+          INDEX_COMMIT: ${{ needs.publish.outputs.index-commit }}
+          INDEX_GENERATION: ${{ needs.publish.outputs.index-generation }}
         run: bun .ci-release/control/control.js gate

@@ -39,7 +39,7 @@ function contents(value: unknown) {
 		content: bytes.toString("base64"),
 	};
 }
-function fixture() {
+function fixture(repository = CI_RELEASE_REPOSITORY, defaultBranch = "main") {
 	const calls: string[][] = [];
 	const state = {
 		calls,
@@ -57,18 +57,33 @@ function fixture() {
 			],
 			deployment_branch_policy: { protected_branches: false, custom_branch_policies: true },
 		},
-		branches: [{ name: "main", type: "branch" }],
+		branches: [{ name: defaultBranch, type: "branch" }],
 		async run(args: string[]) {
 			calls.push(args);
 			expect(args[0]).toBe("api");
-			const path = args[1].replace(`repos/${CI_RELEASE_REPOSITORY}/`, "");
+			if (args[1] === `repos/${repository}`)
+				return JSON.stringify({ full_name: repository, default_branch: defaultBranch });
+			if (args[1] === "graphql") {
+				return JSON.stringify({
+					data: {
+						repository: {
+							nameWithOwner: repository,
+							releases: {
+								nodes: state.releases,
+								pageInfo: { hasNextPage: false, endCursor: null },
+							},
+						},
+					},
+				});
+			}
+			const path = args[1].replace(`repos/${repository}/`, "");
 			if (path === "git/ref/tags/v1.2.0")
 				return JSON.stringify({
 					object: { type: state.annotated ? "tag" : "commit", sha: state.tag },
 				});
 			if (path.startsWith("git/tags/"))
 				return JSON.stringify({ object: { type: "commit", sha: state.tag } });
-			if (path === "git/ref/heads/main")
+			if (path === `git/ref/heads/${encodeURIComponent(defaultBranch)}`)
 				return JSON.stringify({ object: { type: "commit", sha: main } });
 			if (path.startsWith("compare/"))
 				return JSON.stringify({
@@ -100,6 +115,47 @@ function options(state: ReturnType<typeof fixture>) {
 }
 
 describe("CI release plan trust boundary", () => {
+	test("fork dispatch pins API default branch and refuses official plans", async () => {
+		const repository = "Example/Custom";
+		const defaultBranch = "release/trunk";
+		const state = fixture(repository, defaultBranch);
+		const forkEnv = {
+			...env,
+			GITHUB_REPOSITORY: repository,
+			GITHUB_REF: `refs/heads/${defaultBranch}`,
+			GITHUB_WORKFLOW_REF: `${repository}/${CI_RELEASE_WORKFLOW}@refs/heads/${defaultBranch}`,
+		};
+		const opts = { ...options(state), env: forkEnv, publish: true };
+		const plan = await createCiReleasePlan(opts);
+		expect(plan).toMatchObject({ repository, defaultBranch });
+		expect(
+			state.calls.every(
+				(args) => args[1] === "graphql" || args[1].startsWith(`repos/${repository}`),
+			),
+		).toBe(true);
+		await revalidateCiReleasePlan(plan, opts);
+		await expect(
+			revalidateCiReleasePlan({ ...plan, repository: CI_RELEASE_REPOSITORY }, opts),
+		).rejects.toThrow("repository/default branch");
+		await expect(
+			revalidateCiReleasePlan({ ...plan, defaultBranch: undefined }, opts),
+		).rejects.toThrow("repository/default branch");
+		state.branches = [{ name: "main", type: "branch" }];
+		await expect(createCiReleasePlan(opts)).rejects.toThrow("environment");
+	});
+	test("matching refs cannot override repository API default branch", async () => {
+		const state = fixture();
+		await expect(
+			createCiReleasePlan({
+				...options(state),
+				env: {
+					...env,
+					GITHUB_REF: "refs/heads/other",
+					GITHUB_WORKFLOW_REF: `${CI_RELEASE_REPOSITORY}/${CI_RELEASE_WORKFLOW}@refs/heads/other`,
+				},
+			}),
+		).rejects.toThrow("default branch");
+	});
 	test("pins target and workflow separately; dry run needs no environment", async () => {
 		const state = fixture();
 		const plan = await createCiReleasePlan(options(state));
@@ -179,12 +235,45 @@ describe("CI release plan trust boundary", () => {
 	test("existing draft assets or public release require original bundle", async () => {
 		for (const draft of [true, false]) {
 			const state = fixture();
-			state.releases = [{ id: 1, tag_name: "v1.2.0", draft, assets: draft ? [{}] : [] }];
+			state.releases = [
+				{
+					databaseId: 1,
+					tagName: "v1.2.0",
+					isDraft: draft,
+					isPrerelease: false,
+					publishedAt: null,
+					releaseAssets: { totalCount: draft ? 1 : 0 },
+				},
+			];
 			await expect(createCiReleasePlan(options(state))).rejects.toThrow("source_run_id");
 			await expect(
 				createCiReleasePlan({ ...options(state), sourceRunId: 122 }),
 			).resolves.toMatchObject({ commit });
 		}
+	});
+	test("index-only requires existing published assets, without demanding a rebuild bundle", async () => {
+		const state = fixture();
+		const opts = { ...options(state), indexOnly: true };
+		await expect(createCiReleasePlan(opts)).rejects.toThrow("Index-only");
+		const release = {
+			databaseId: 1,
+			tagName: "v1.2.0",
+			isDraft: true,
+			isPrerelease: false,
+			publishedAt: null,
+			releaseAssets: { totalCount: 18 },
+		};
+		state.releases = [release];
+		await expect(createCiReleasePlan(opts)).rejects.toThrow("Index-only");
+		release.isDraft = false;
+		await expect(createCiReleasePlan(opts)).resolves.toMatchObject({
+			repository: CI_RELEASE_REPOSITORY,
+		});
+		await expect(createCiReleasePlan({ ...opts, sourceRunId: 122 })).resolves.toMatchObject({
+			commit,
+		});
+		release.releaseAssets.totalCount = 0;
+		await expect(createCiReleasePlan(opts)).rejects.toThrow("Index-only");
 	});
 	test("publish requires reviewers and exact main-only policy", async () => {
 		const state = fixture();
@@ -222,7 +311,7 @@ describe("CI release plan trust boundary", () => {
 		await expect(createCiReleasePlan({ ...options(state), publish: true, run })).rejects.toThrow(
 			"404",
 		);
-		expect(state.calls.every((args) => args.length === 2)).toBe(true);
+		expect(state.calls.every((args) => args.length === 2 || args[1] === "graphql")).toBe(true);
 	});
 	test("publication rechecks moved tag and lost main ancestry", async () => {
 		const state = fixture();
@@ -236,7 +325,7 @@ describe("CI release plan trust boundary", () => {
 	test("plan rejects extra fields and provenance/version mutation", async () => {
 		const plan = await createCiReleasePlan(options(fixture()));
 		for (const patch of [
-			{ repository: "fork/repo" },
+			{ repository: "../repo" },
 			{ commit: "abc" },
 			{ commit: `${commit}\n` },
 			{ tag: "v1.3.0" },

@@ -2,6 +2,8 @@ import { execSync } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 
+export { BUILD_GITHUB_REPOSITORY } from "../../shared/build-repository";
+
 let version = "0.0.0";
 let commitHash = "";
 let platform = "";

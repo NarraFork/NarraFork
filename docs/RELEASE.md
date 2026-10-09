@@ -20,12 +20,12 @@
 
 ## GitHub 主程序发布与旧更新服务器桥接
 
-- **客户端默认来源是 GitHub**（仓库 `NarraFork/NarraFork`，须由仓库所有者在上线前公开）；设置页可二选一使用 GitHub Release 或自部署更新服务器，不自动跨源回退。**发布脚本默认仍是 `update-server`**，不因客户端默认来源改变而自动切换。
+- **客户端默认来源是 GitHub**：官方包默认 `NarraFork/NarraFork`；fork 自行构建的包默认采用构建时注入的仓库。新安装无需填写仓库，已有显式保存的来源（包括官方仓库）不被覆盖。上游已发布二进制不会在运行时识别用户的 fork、cwd 或项目 origin。仓库须公开才能匿名分发；设置页仍可选择自部署更新服务器，不自动跨源回退。**发布脚本默认仍是 `update-server`**。
 - **旧配置迁移**：已有显式来源优先；旧自定义服务器地址或非默认 product 保留 `update-server`；未配置、空地址或原内置官方地址且默认 product 迁移为 GitHub。切换来源保留另一种来源的配置，检查使用已保存配置。rg/zstd/executor 仍读取保留的工具服务器地址。
 - **检测与下载**：stable 排除 draft/prerelease，beta 同时考虑 stable 与 prerelease，按语义版本排序；精确匹配平台（包括 x64-baseline），校验 sidecar 中的 SHA512 和大小。检测失败、限流、无 Release 和平台缺失不会显示为“已经最新”；元数据单请求 10 秒、检测总预算 30 秒，最多 5 页，每页 100 条。完整二进制流式下载最大 1 GiB、最长 15 分钟，可取消；下载前重新检查可信元数据，源/仓库或版本改变要求重新检测。
 - **配置与准备包身份**：检测开始时冻结生效的来源、仓库或服务器/product、channel、platform；下载前及写入准备记录前再次核对。变化要求重新检测，不能把旧通道/产品的结果下载成新配置的包。保存来源设置不删除旧准备包或取消已有调度；界面按来源、版本、SHA512 和大小匹配推荐，旧元数据缺来源时明确显示“未知来源”，不从当前设置反推。
 - **应用 API**：`GET /api/update/status` 的 `preparedIdentity.id` 绑定已验证文件及其来源；`POST /api/update/apply` 必须提交该 `preparedId`（可同时提交 `version`）。缺失或过期选择器返回 409，不再仅凭版本号选择文件。旧包仍可通过查询所得的选择器显式应用；已进入调度的准备包不能被另一次下载替换。选择器不是授权令牌，接口仍要求管理员权限。
-- `--target=github|update-server` 选择发布目标；GitHub 仓库可用 `--github-repository=owner/repo` 覆盖，默认 `NarraFork/NarraFork`。GitHub 认证使用已登录的 `gh` / `GH_TOKEN`；GitHub 路径不会读取旧更新服务器令牌或查询其基线。
+- `--target=github|update-server` 选择发布目标；GitHub 仓库可用 `--github-repository=owner/repo` 指定，否则优先采用可信 Actions 仓库或 GitHub origin，无法推导时才回退官方仓库。Actions 中显式仓库必须与当前仓库一致；同一身份注入前后端、sidecar 和 smoke。GitHub 认证使用已登录的 `gh` / `GH_TOKEN`；GitHub 路径不会读取旧更新服务器令牌或查询其基线。
 - **真实发布只能在主仓库工作区原地执行**，不能使用隔离 worktree。GitHub 路径额外检查这一点；本工作区只能开发代码和做模拟测试，不得真实发布。
 - GitHub 使用**完整主程序二进制 + 可选 zstd patch 对**；缺少 patch 时仍可发布并全量升级。旧更新服务器继续支持原有增量升级。helper / executor 仍走原有分发，不迁移到主程序 GitHub Release。
 - 每个选定平台必须有 `dist/narrafork-<version>-<suffix>`（Windows 带 `.exe`）、同名 `.metadata.json`，以及版本化 `narrafork-<version>-SHA256SUMS`、`narrafork-<version>-checksums.txt`。缺少任何必需文件、size/hash 不一致、版本/平台/target/commit provenance 不符都会失败。sha256 为十六进制，sha512 为 base64，与构建的 binary-metadata schema 一致。
@@ -33,7 +33,7 @@
 - GitHub 的 `v<version>` tag 必须已存在，且解析出的 commit 与本地 tag 一致（支持 annotated tag）；脚本不会自动 push，也不会从 GitHub 默认分支偷偷创建 tag。仍保留 bump → build → tag 的原顺序；初次本地构建/tag 后若缺远端 tag，脚本安全失败，显式 push 后用 `--upload-only` 重试。
 - 发布顺序为 **create draft → upload → 验证完整资产集合及 hash → 最后 publish**。失败保留 draft；重试可复用完全一致的已有资产，绝不 `--clobber`。已公开版本只有 tag/commit、通道、双语 changelog 和全部必需资产一致时才视作成功，不能替换或补传公开版本。tag 查询未找到时，通过认证后的 Release 列表寻找 draft，再按 ID 读取；最多扫描 10 页、每页 100 条，无法完整排除既有 draft 时安全失败，不盲目创建。
 - 版本严格匹配 `x.y.0` 时为 stable，其他版本为 beta；beta 映射为 GitHub prerelease，不标记 latest。双语 changelog 写入 Release body。
-- `--dry-run` 不进行任何 GitHub 调用；仍构建并验证本地产物，不 commit/tag/upload/publish。可加 `--upload-only --dry-run` 只验证已有构建。
+- 普通发布的 `--dry-run` 不进行任何 GitHub 调用；仍构建并验证本地产物和有界索引记录，不 commit/tag/upload/publish。可加 `--upload-only --dry-run` 只验证已有构建。`--index-only` 是独立的只读在线修复预览：读取已公开 Release，不依赖本地 dist，不 build/upload/publish；只有额外指定 `--publish-index` 才更新元数据分支，不能与 `--dry-run` 同用。
 
 公开仓库应**先发布 GitHub，再桥接旧更新服务器**，确保新客户端默认来源有版本可用。示例（版本、平台按实际替换）：
 
@@ -55,9 +55,9 @@ bun scripts/release.ts 0.6.1 --target=github --platform=windows-x64 --upload-onl
 
 ## GitHub Release CI
 
-`.github/workflows/release.yml` 是主程序专用入口，仅支持从本仓库 `main` 手动触发。先把版本号和双语 `changelogs/v<version>.json` 提交到 main，再由维护者显式创建和推送 tag。CI 不 bump、commit、tag 或 push，不改变本地发布脚本默认的旧更新服务器目标。
+`.github/workflows/release.yml` 是主程序专用入口，仅支持从当前仓库的真实默认分支手动触发（不再硬编码上游仓库或 main）。先把版本号和双语 `changelogs/v<version>.json` 提交到默认分支，再由维护者显式创建和推送 tag。CI 不修改源码分支、版本或 tag；仅受保护 publisher 可为生成的索引创建元数据分支提交。不改变本地发布脚本默认的旧更新服务器目标。
 
-输入为 `tag`、默认 `false` 的 `publish`、可选 `source_run_id`。默认流程只构建验收，不创建 draft，也不公开 Release：
+输入为 `tag`、默认 `false` 的 `publish`、可选 `source_run_id`、默认 `false` 的 `index_only`。默认流程只构建验收并保存索引预览，不创建 draft，也不公开 Release：
 
 ```text
 preflight（固定 tag SHA、版本、changelog、基线）
@@ -66,6 +66,7 @@ preflight（固定 tag SHA、版本、changelog、基线）
   → 基线 patch、统一 checksum、离线 publisher 校验 → 不可变 bundle
   → publish=true 时等待 release Environment 审批
   → 再验 tag 与 bundle → draft → 上传 → 远端完整校验 → publish
+  → 原子提交 narrafork-updates 索引与 notes → 读回确认 commit/generation
 ```
 
 ### 平台与严格构建
@@ -76,7 +77,7 @@ Linux/Windows 三种 target（x64、x64-baseline、arm64）在 Ubuntu 24.04 交�
 
 ### 启用与发布
 
-维护者必须先创建 `release` Environment，配置 required reviewers 和仅允许 `main` 的分支规则。预检不能确认保护规则时会失败；workflow 不自动创建无保护环境。允许维护者自审以适配单维护者仓库。仅 publish job 获得 `contents: write`；其余 job 不持有发布写权限，publisher 不安装依赖、不执行 bundle 内程序。
+维护者（包括 fork 所有者）必须启用 Actions，并先创建 `release` Environment，配置 required reviewers 和仅允许真实默认分支的规则。预检不能确认保护规则时失败；workflow 不自动创建无保护环境。允许维护者自审以适配单维护者仓库。仅 publish job 获得 `contents: write`；其余 job 不持有发布写权限，publisher 不安装依赖、不执行 bundle 内程序。组织策略须允许该 job 写当前仓库；fork 的“零配置”指无需填写仓库身份，不绕过这些平台审批。元数据分支不能同时是仓库默认分支。
 
 示例（以下命令会触发远端任务，应由维护者按实际版本明确执行）：
 
@@ -96,9 +97,34 @@ gh workflow run release.yml --ref main -f tag=v0.9.0 -F publish=true -f source_r
 
 bundle artifact 命名为 `release-bundle-<runId>-<runAttempt>`，保留 30 天，包含 `manifest.json` 和 `dist/`。CI manifest 记录控制 workflow SHA、目标 SHA、工具链、基线、每文件 hash/size 与八平台 smoke 结果；它不是公开 Release 的额外资产。
 
-失败恢复请**新建一次 dispatch，传原始构建的 `source_run_id`**，不要依赖 Re-run failed jobs 混合不同 attempt 的 artifact。恢复会验证原 run 的仓库、main workflow、逐项 job 结果、精确 artifact ID/digest 和完整文件内容；源 run 的发布步骤失败不妨碍恢复已验收的 bundle。恢复不重新编译、签名、选基线或生成 checksum。artifact 过期、证据不完整或内容不一致即失败，不自动重编替代。失败 draft 保留；公开版本不可覆盖、补传或删除。
+失败恢复请**新建一次 dispatch，传原始构建的 `source_run_id`**，不要依赖 Re-run failed jobs 混合不同 attempt 的 artifact。恢复会验证原 run 的仓库、默认分支 workflow、逐项 job 结果、精确 artifact ID/digest 和完整文件内容；源 run 的发布步骤失败不妨碍恢复已验收的 bundle。恢复不重新编译、签名、选基线或生成 checksum。artifact 过期、证据不完整或内容不一致即失败，不自动重编替代。失败 draft 保留；公开版本不可覆盖、补传或删除。
 
 旧更新服务器桥接、executor/helper 分发、自动版本准备、自动推送与签名证书管理不在此 workflow 范围。上线报告必须区分本地测试、在线 `publish=false` 验收和真实发布，不能把模拟测试称为在线发布成功。
+
+## 有界更新索引与修复
+
+- 固定入口是同仓库 `narrafork-updates` 分支的 `update-index-v1.json`，无需 Pages、token 或额外服务。首次 publisher 自动创建只含元数据的 orphan branch；不要预先创建没有有效索引的同名分支，否则视为损坏并拒写。
+- v1 最多 32 个版本、每版 8 个平台和 64 对 patch；索引限 256 KiB、单版本记录 96 KiB、sidecar 64 KiB、外置 notes 1 MiB。stable/beta 当前目标必须保留；旧非目标超预算时裁剪，目标自身不合法或超预算则失败。
+- 首次部署通过 GraphQL 概要定位已有 stable/beta 目标并验证必要旧资产，不能用本次较旧发布遮蔽已有高版本。CI 概要查询不读取 Release body/assets 大字段，保持 10×100 条、每次 30 秒及 1 MiB 输出预算。旧匿名 REST 兼容路径的分页边界不变。
+- 发布器使用 Git Data API 写 blobs/tree/单个 commit，再非 force 更新固定 ref。CAS 冲突最多重读合并三次；保留其他文件，拒绝覆盖损坏索引，不执行分支代码。已公告的二进制、sidecar 和 patch 身份不能改写；首次 full-only 历史记录可单调补入后来核验的既有 patch。
+- 客户端先读索引，只有 **404** 回退旧 Release API；损坏、错仓库、未知 schema、超限、超时或鉴权失败均明确报错。ETag 缓存有界且按仓库隔离。目标 sidecar 与索引的大小、SHA256/SHA512、版本、平台和 commit 必须匹配；窗口外无法形成安全 patch 路径时仍用同来源 full。
+- 说明按内容寻址路径单独保存，Modal 打开且推荐匹配所选包时才读取。管理员 notes API 只接受来源身份、版本和目标 hash，不接受任意 URL；切源/换包后的迟到结果丢弃，说明失败不阻止已验证二进制。
+- Release 与索引不是跨系统事务。公开后索引失败会报告 `PUBLISHED_NOT_INDEXED` 并让门禁失败，不撤销 Release、不重建、不覆盖公开资产。修复成功必须取得并读回核验 index commit/generation。
+
+CI 修复用 `index_only=true`，默认 `publish=false` 仅生成预览，不跑构建；可指定原始 `source_run_id` 校验 bundle，也可直接核验已公开资产。确认后用 `publish=true` 经相同 Environment 审批提交索引。示例中的 `main` 替换为实际默认分支：
+
+```bash
+# 只读在线预览；不是公开发布成功
+gh workflow run release.yml --ref main -f tag=v0.9.0 -F index_only=true -F publish=false
+# 经审批修复，不修改公开 Release 资产
+gh workflow run release.yml --ref main -f tag=v0.9.0 -F index_only=true -F publish=true
+# 本地 CLI 同样先只读验证公开资产，不需要 dist
+bun scripts/release.ts 0.9.0 --target=github --index-only
+# 确认后在主仓库执行，显式授权索引写入
+bun scripts/release.ts 0.9.0 --target=github --index-only --publish-index
+```
+
+显式把 GitHub beta 晋升 stable 后，须运行索引修复才更新客户端通道指针；修复采用远端已批准状态，不重新编译。仅修改 GitHub `latest` 不等于索引已更新。内容寻址 notes 不自动垃圾回收，旧索引引用不会被新发布覆盖。
 
 ## GitHub / CI 的增量资产约定
 

@@ -42,6 +42,7 @@ import {
 	scheduleOperatorShutdown,
 } from "../lib/server-restart";
 import { settings } from "../lib/settings";
+import { DEFAULT_GITHUB_REPOSITORY } from "../lib/settings/update-source";
 import { isTrustedUpdateServerUrl } from "../lib/update-server-url";
 import { APP_VERSION, BUILD_PLATFORM } from "../lib/version";
 import { applyZstdPatchToFile, type ZstdPatchMeta } from "../lib/zstd-patch";
@@ -52,7 +53,9 @@ import {
 import {
 	downloadGithubBinaryToFile,
 	downloadGithubPatchToFile,
+	GithubUpdateError,
 	githubReleaseUpdater,
+	type UpdateNotesRequest,
 } from "./github-release-update";
 import { toolContinuationService } from "./tool-continuation-service";
 import {
@@ -162,6 +165,8 @@ export interface ReleaseInfo {
 	version: string;
 	releaseDate: string;
 	releaseNotes?: string | Record<string, string>;
+	notesDeferred?: boolean;
+	notesAvailable?: boolean;
 	path: string;
 	sha512: string;
 	files: Array<{
@@ -202,6 +207,8 @@ export interface UpdateCheckResult {
 	currentVersion: string;
 	latestVersion?: string;
 	releaseInfo?: ReleaseInfo;
+	notesDeferred?: boolean;
+	notesAvailable?: boolean;
 	/** Actual download size based on chosen strategy */
 	downloadSize?: number;
 	totalSize?: number;
@@ -760,7 +767,7 @@ export async function checkForUpdate(
 		const startedAt = Date.now();
 		result = await githubReleaseUpdater.check(
 			{
-				repository: settings.update?.githubRepository ?? "NarraFork/NarraFork",
+				repository: settings.update?.githubRepository ?? DEFAULT_GITHUB_REPOSITORY,
 				channel: sourceIdentity.channel,
 				platform: sourceIdentity.platform,
 				currentVersion: APP_VERSION,
@@ -784,6 +791,24 @@ export async function checkForUpdate(
 	};
 }
 
+/** Notes are optional, but must never cross a configuration or artifact identity boundary. */
+export async function getUpdateNotes(request: UpdateNotesRequest, signal?: AbortSignal) {
+	const captured = getCurrentUpdateSourceIdentity();
+	if (captured?.source !== "github" || !sameUpdateSourceIdentity(request.sourceIdentity, captured))
+		throw new GithubUpdateError("UPDATE_SOURCE_CHANGED", "Update source changed; check again");
+	const result = await githubReleaseUpdater.getNotes(
+		{ ...request, sourceIdentity: captured },
+		signal,
+	);
+	if (!sameUpdateSourceIdentity(captured, getCurrentUpdateSourceIdentity()))
+		throw new GithubUpdateError(
+			"UPDATE_SOURCE_CHANGED",
+			"Update source changed while loading notes",
+		);
+	signal?.throwIfAborted();
+	return result;
+}
+
 export function getCurrentUpdateSourceIdentity(): UpdateSourceIdentity | null {
 	const common = { channel: settings.update?.channel ?? "stable", platform: getPlatform() };
 	return parseUpdateSourceIdentity(
@@ -791,7 +816,7 @@ export function getCurrentUpdateSourceIdentity(): UpdateSourceIdentity | null {
 			? {
 					...common,
 					source: "github",
-					repository: settings.update?.githubRepository ?? "NarraFork/NarraFork",
+					repository: settings.update?.githubRepository ?? DEFAULT_GITHUB_REPOSITORY,
 				}
 			: {
 					...common,

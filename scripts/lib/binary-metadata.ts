@@ -25,6 +25,8 @@ export interface BinaryMetadata {
 	version: string;
 	/** Short git commit hash, or empty string when unavailable. */
 	commit: string;
+	/** Build repository; absent in legacy official sidecars. */
+	repository?: string;
 	/** ISO-8601 build timestamp. */
 	buildDate: string;
 	/** File size in bytes. */
@@ -40,6 +42,8 @@ export interface ComputeMetadataInput {
 	platformId: string;
 	target: string;
 	commit: string;
+	/** Build repository; absent in legacy official sidecars. */
+	repository?: string;
 	buildDate: string;
 }
 
@@ -72,6 +76,7 @@ export function computeBinaryMetadataFromBuffer(
 		target: input.target,
 		version: input.version,
 		commit: input.commit,
+		...(input.repository === undefined ? {} : { repository: input.repository }),
 		buildDate: input.buildDate,
 		size: buf.length,
 		sha256,

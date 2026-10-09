@@ -12,12 +12,12 @@ import {
 	ciApiList,
 	ciGhRunner,
 	parseCiId,
+	resolveCiDispatch,
 	revalidateCiReleasePlan,
-	validateCiDispatch,
 	validateCiReleasePlan,
 	validateCiReleaseTag,
 } from "./ci-release-plan";
-import { CI_RELEASE_REPOSITORY, CI_RELEASE_TARGETS, CI_RELEASE_WORKFLOW } from "./ci-release-types";
+import { CI_RELEASE_TARGETS, CI_RELEASE_WORKFLOW } from "./ci-release-types";
 import type { GhRunner } from "./github-release";
 
 export const MAX_RELEASE_BUNDLE_BYTES = 24 * 1024 ** 3;
@@ -28,14 +28,14 @@ const sha = z
 	.length(40)
 	.regex(/^[a-f0-9]{40}$/);
 const id = z.number().int().positive().max(Number.MAX_SAFE_INTEGER);
-const repository = z.object({ id, full_name: z.literal(CI_RELEASE_REPOSITORY) });
+const repository = z.object({ id, full_name: z.string() });
 const sourceSchema = z.object({
 	id,
 	run_attempt: id,
 	workflow_id: id,
 	path: z.literal(CI_RELEASE_WORKFLOW),
 	event: z.literal("workflow_dispatch"),
-	head_branch: z.literal("main"),
+	head_branch: z.string(),
 	head_sha: sha,
 	status: z.enum(["completed", "in_progress"]),
 	repository,
@@ -51,7 +51,7 @@ const artifactSchema = z.object({
 		id,
 		repository_id: id,
 		head_repository_id: id,
-		head_branch: z.literal("main"),
+		head_branch: z.string(),
 		head_sha: sha,
 	}),
 });
@@ -115,6 +115,7 @@ with zipfile.ZipFile(archive) as bundle:
 
 async function downloadArchive(
 	artifact: z.infer<typeof artifactSchema>,
+	repository: string,
 	path: string,
 	env: NodeJS.ProcessEnv,
 	fetcher: typeof fetch,
@@ -126,7 +127,7 @@ async function downloadArchive(
 		AbortSignal.timeout(RESTORE_TIMEOUT_MS),
 		...(cancel ? [cancel] : []),
 	]);
-	let url = `https://api.github.com/repos/${CI_RELEASE_REPOSITORY}/actions/artifacts/${artifact.id}/zip`;
+	let url = `https://api.github.com/repos/${repository}/actions/artifacts/${artifact.id}/zip`;
 	let response: Response | undefined;
 	for (let redirects = 0; redirects <= 3; redirects++) {
 		response = await fetcher(url, {
@@ -209,12 +210,16 @@ export interface RestoreCiReleaseBundleOptions {
 export async function restoreCiReleaseBundle(options: RestoreCiReleaseBundleOptions) {
 	validateCiReleaseTag(options.tag);
 	const env = options.env ?? process.env;
-	const dispatch = validateCiDispatch(env);
 	const sourceRunId = parseCiId(options.sourceRunId);
 	const run = options.run ?? ciGhRunner(env);
-	const source = sourceSchema.parse(await ciApi(run, `actions/runs/${sourceRunId}`));
+	const dispatch = await resolveCiDispatch(run, env);
+	const { repository, defaultBranch } = dispatch;
+	const source = sourceSchema.parse(await ciApi(run, `actions/runs/${sourceRunId}`, repository));
 	if (
 		source.id !== sourceRunId ||
+		source.repository.full_name !== repository ||
+		source.head_repository.full_name !== repository ||
+		source.head_branch !== defaultBranch ||
 		source.repository.id !== source.head_repository.id ||
 		(source.status !== "completed" &&
 			(sourceRunId !== dispatch.runId || source.run_attempt !== dispatch.runAttempt))
@@ -223,9 +228,9 @@ export async function restoreCiReleaseBundle(options: RestoreCiReleaseBundleOpti
 	}
 	const workflow = z
 		.object({ id, path: z.literal(CI_RELEASE_WORKFLOW), state: z.literal("active") })
-		.parse(await ciApi(run, `actions/workflows/${source.workflow_id}`));
+		.parse(await ciApi(run, `actions/workflows/${source.workflow_id}`, repository));
 	if (workflow.id !== source.workflow_id) throw new Error("Source workflow ID mismatch");
-	await assertCiMainAncestor(run, source.head_sha);
+	await assertCiMainAncestor(run, source.head_sha, repository, defaultBranch);
 	const jobs = z
 		.array(
 			z.object({
@@ -243,6 +248,7 @@ export async function restoreCiReleaseBundle(options: RestoreCiReleaseBundleOpti
 				run,
 				`actions/runs/${sourceRunId}/attempts/${source.run_attempt}/jobs`,
 				"jobs",
+				repository,
 			),
 		);
 	const jobIds = new Set<number>();
@@ -268,7 +274,12 @@ export async function restoreCiReleaseBundle(options: RestoreCiReleaseBundleOpti
 		}
 	}
 	const name = `release-bundle-${sourceRunId}-${source.run_attempt}`;
-	const artifacts = await ciApiList(run, `actions/runs/${sourceRunId}/artifacts`, "artifacts");
+	const artifacts = await ciApiList(
+		run,
+		`actions/runs/${sourceRunId}/artifacts`,
+		"artifacts",
+		repository,
+	);
 	const matches = artifacts.filter(
 		(value) =>
 			typeof value === "object" && value !== null && "name" in value && value.name === name,
@@ -276,7 +287,9 @@ export async function restoreCiReleaseBundle(options: RestoreCiReleaseBundleOpti
 	if (matches.length !== 1)
 		throw new Error("Exact source bundle artifact missing or duplicated; cannot rebuild");
 	const listed = artifactSchema.parse(matches[0]);
-	const artifact = artifactSchema.parse(await ciApi(run, `actions/artifacts/${listed.id}`));
+	const artifact = artifactSchema.parse(
+		await ciApi(run, `actions/artifacts/${listed.id}`, repository),
+	);
 	if (
 		artifact.id !== listed.id ||
 		artifact.name !== name ||
@@ -285,7 +298,8 @@ export async function restoreCiReleaseBundle(options: RestoreCiReleaseBundleOpti
 		artifact.workflow_run.id !== sourceRunId ||
 		artifact.workflow_run.repository_id !== source.repository.id ||
 		artifact.workflow_run.head_repository_id !== source.repository.id ||
-		artifact.workflow_run.head_sha !== source.head_sha
+		artifact.workflow_run.head_sha !== source.head_sha ||
+		artifact.workflow_run.head_branch !== defaultBranch
 	)
 		throw new Error("Artifact API provenance mismatch");
 	// Never overwrite or merge a prior directory. Temporary extraction is an owned sibling.
@@ -307,7 +321,14 @@ export async function restoreCiReleaseBundle(options: RestoreCiReleaseBundleOpti
 	const archive = join(temporary, "bundle.zip");
 	const extracted = join(temporary, "extracted");
 	try {
-		await downloadArchive(artifact, archive, env, options.fetch ?? fetch, options.signal);
+		await downloadArchive(
+			artifact,
+			repository,
+			archive,
+			env,
+			options.fetch ?? fetch,
+			options.signal,
+		);
 		await mkdir(extracted);
 		await promisify(execFile)(
 			"python3",
@@ -321,6 +342,8 @@ export async function restoreCiReleaseBundle(options: RestoreCiReleaseBundleOpti
 		const manifestValue = JSON.parse(await readReleaseText(join(extracted, "manifest.json")));
 		const plan = validateCiReleasePlan(manifestValue.plan);
 		if (
+			plan.repository !== repository ||
+			(plan.defaultBranch ?? "main") !== defaultBranch ||
 			plan.runId !== sourceRunId ||
 			plan.runAttempt !== source.run_attempt ||
 			plan.workflowCommit !== source.head_sha ||

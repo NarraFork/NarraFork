@@ -13,6 +13,7 @@ import { Worker } from "node:worker_threads";
 import { buildLicenseManifestFromDisk } from "../server/lib/licenses/manifest";
 import type { LocalizedValue } from "../shared/i18n-locales";
 import type { BinaryMetadata } from "./lib/binary-metadata";
+import { resolveBuildGitHubRepository } from "./lib/build-repository";
 import { validatePtyDependency } from "./lib/ci-build-native";
 import {
 	runCiBuildCommand,
@@ -24,6 +25,9 @@ import {
 import { formatLatestYmlFiles, type LatestYmlEntry } from "./lib/latest-yml";
 
 const ROOT = join(import.meta.dir, "..");
+const BUILD_REPOSITORY = resolveBuildGitHubRepository({ root: ROOT });
+// The child Vite build must use exactly the backend's frozen build identity.
+process.env.NF_BUILD_GITHUB_REPOSITORY = BUILD_REPOSITORY;
 const pkg = JSON.parse(readFileSync(join(ROOT, "package.json"), "utf-8"));
 const VERSION: string = pkg.version ?? "0.0.0";
 const FRONTEND_DIR = join(ROOT, "dist", "frontend");
@@ -410,6 +414,7 @@ for (const platform of selectedPlatforms) {
 export const buildVersion = ${JSON.stringify(VERSION)};
 export const buildCommit = ${JSON.stringify(commitHash)};
 export const buildPlatform = ${JSON.stringify(platform.platformId)};
+export const buildRepository = ${JSON.stringify(BUILD_REPOSITORY)};
 `,
 	);
 
@@ -436,6 +441,7 @@ export const buildPlatform = ${JSON.stringify(platform.platformId)};
 		// Private archive scans/copies/imports must remain off-thread in released binaries.
 		"./server/services/project-archive/legacy-sync-worker.ts",
 		"./server/services/project-archive/legacy-import-worker.ts",
+		`--define=__NARRAFORK_BUILD_REPOSITORY__=${JSON.stringify(BUILD_REPOSITORY)}`,
 		"--compile",
 		"--minify",
 		"--target",
@@ -477,6 +483,7 @@ function runPostProcessWorker(platform: (typeof selectedPlatforms)[number]): Pro
 				root: ROOT,
 				version: VERSION,
 				commit: commitHash,
+				repository: BUILD_REPOSITORY,
 				releaseCi,
 			},
 		});
@@ -499,6 +506,7 @@ function runPostProcessWorker(platform: (typeof selectedPlatforms)[number]): Pro
 								...platform,
 								version: VERSION,
 								commit: commitHash,
+								repository: BUILD_REPOSITORY,
 							});
 						} catch (error) {
 							reject(error);
@@ -541,6 +549,7 @@ if (releaseCi) {
 			...platform,
 			version: VERSION,
 			commit: commitHash,
+			repository: BUILD_REPOSITORY,
 		});
 		const reported = results[index].metadata;
 		if (

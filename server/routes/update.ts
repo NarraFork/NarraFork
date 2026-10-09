@@ -3,6 +3,7 @@
  */
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
+import { isValidReleaseVersion } from "../../shared/release-version";
 import {
 	parseUpdateSourceIdentity,
 	sameUpdateSourceIdentity,
@@ -10,6 +11,7 @@ import {
 } from "../../shared/update-identity";
 import { APP_VERSION } from "../lib/version";
 import { requireAdmin, requireAuth } from "../middleware/auth";
+import { GithubUpdateError } from "../services/github-release-update";
 import {
 	applyUpdate,
 	cancelPreparedUpdate,
@@ -18,6 +20,7 @@ import {
 	downloadUpdate,
 	getUpdateDirectory,
 	getUpdateInstructions,
+	getUpdateNotes,
 	getUpdateStatus,
 	isUpdateSourceCurrent,
 	shutdownForManualUpdate,
@@ -89,6 +92,40 @@ async function readDownloadRequest(request: Request): Promise<Record<string, unk
 updateRoutes.get("/check", requireAuth, requireAdmin, async (c) => {
 	const result = await checkForUpdate();
 	return c.json(result);
+});
+
+/** Optional notes accept identity only, never an arbitrary metadata URL. */
+updateRoutes.post("/notes", requireAuth, requireAdmin, async (c) => {
+	try {
+		const body = await readDownloadRequest(c.req.raw);
+		const identity = parseUpdateSourceIdentity(body?.sourceIdentity);
+		if (
+			!body ||
+			Object.keys(body).some((key) => !["version", "sha512", "sourceIdentity"].includes(key)) ||
+			!identity ||
+			identity.source !== "github" ||
+			typeof body.version !== "string" ||
+			!isValidReleaseVersion(body.version) ||
+			typeof body.sha512 !== "string" ||
+			!/^[A-Za-z0-9+/]{86}==$/.test(body.sha512)
+		)
+			return c.json({ error: "Invalid release notes identity" }, 400);
+		return c.json(
+			await getUpdateNotes(
+				{ version: body.version, sha512: body.sha512, sourceIdentity: identity },
+				c.req.raw.signal,
+			),
+		);
+	} catch (error) {
+		if (error instanceof DownloadRequestError)
+			return c.json({ error: error.message }, error.status);
+		if (error instanceof GithubUpdateError)
+			return c.json(
+				{ error: error.message, errorCode: error.code },
+				error.code.startsWith("UPDATE_") ? 409 : 503,
+			);
+		return c.json({ error: "Release notes are unavailable" }, 503);
+	}
 });
 
 /**

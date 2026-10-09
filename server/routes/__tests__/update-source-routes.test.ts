@@ -8,6 +8,7 @@ let checks: Array<{ force?: boolean } | undefined> = [];
 let downloads: ReleaseInfo[] = [];
 let checkResult: UpdateCheckResult;
 let currentSource = true;
+let notesRequests: unknown[] = [];
 const requireAuth: MiddlewareHandler = async (c, next) => {
 	if (!role) return c.json({ error: "Unauthenticated" }, 401);
 	await next();
@@ -18,6 +19,10 @@ const requireAdmin: MiddlewareHandler = async (c, next) => {
 };
 mock.module("../../middleware/auth", () => ({ requireAuth, requireAdmin }));
 mock.module("../../services/update-service", () => ({
+	getUpdateNotes: async (identity: unknown) => {
+		notesRequests.push(identity);
+		return { notes: "Verified notes" };
+	},
 	isUpdateSourceCurrent: () => currentSource,
 	checkForUpdate: async (options?: { force?: boolean }) => {
 		checks.push(options);
@@ -67,6 +72,7 @@ const post = (body: unknown) =>
 beforeEach(() => {
 	role = "admin";
 	currentSource = true;
+	notesRequests = [];
 	checks = [];
 	downloads = [];
 	checkResult = {
@@ -77,6 +83,40 @@ beforeEach(() => {
 		updateAvailable: true,
 		releaseInfo: structuredClone(release),
 	};
+});
+
+describe("notes administrator identity boundary", () => {
+	const notes = (body: unknown) =>
+		app.request("/update/notes", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify(body),
+		});
+	const identity = () => ({ version: release.version, sha512: trustedHash, sourceIdentity });
+	test("only an administrator can fetch notes", async () => {
+		for (const [user, status] of [
+			["", 401],
+			["user", 403],
+		] as const) {
+			role = user;
+			expect((await notes(identity())).status).toBe(status);
+		}
+		expect(notesRequests).toHaveLength(0);
+	});
+	test("accepts only version, hash and source identity", async () => {
+		expect((await notes(identity())).status).toBe(200);
+		expect(notesRequests).toEqual([identity()]);
+		for (const body of [
+			{ ...identity(), url: "https://evil.example/notes" },
+			{ ...identity(), sha512: "bad" },
+			{ ...identity(), sourceIdentity: null },
+			{ ...identity(), version: "../../bad" },
+		])
+			expect((await notes(body)).status).toBe(400);
+		expect(notesRequests).toHaveLength(1);
+		expect(checks).toHaveLength(0);
+		expect(downloads).toHaveLength(0);
+	});
 });
 
 describe("update source download boundary", () => {

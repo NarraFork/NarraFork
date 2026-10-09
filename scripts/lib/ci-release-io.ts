@@ -4,6 +4,7 @@ import { constants, createWriteStream } from "node:fs";
 import { lstat, open, rm } from "node:fs/promises";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
+import { isValidGitHubRepository } from "../../shared/github-repository";
 import { MAX_RELEASE_BINARY_BYTES } from "../../shared/release-patch";
 import type { GhRunner } from "./github-release";
 
@@ -107,7 +108,7 @@ export type ReleaseAssetDownloader = (options: DownloadReleaseAssetOptions) => P
 /** gh follows GitHub's authenticated asset redirects; bytes never accumulate on the JS heap. */
 export const downloadReleaseAsset: ReleaseAssetDownloader = async (options) => {
 	if (
-		options.repository !== "NarraFork/NarraFork" ||
+		!isValidGitHubRepository(options.repository) ||
 		!Number.isSafeInteger(options.assetId) ||
 		options.assetId <= 0 ||
 		!Number.isSafeInteger(options.size) ||

@@ -7,6 +7,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { setTimeout as delay } from "node:timers/promises";
 import { stripVTControlCharacters } from "node:util";
+import { isValidGitHubRepository } from "../shared/github-repository";
 import type { BinaryMetadata } from "./lib/binary-metadata";
 import { copyReleaseFile, hashReleaseFile, readReleaseText } from "./lib/ci-release-io";
 import {
@@ -17,6 +18,7 @@ import {
 import { CI_RELEASE_TARGETS, type CiReleaseSmokeResult } from "./lib/ci-release-types";
 
 export interface SmokeOptions {
+	repository?: string;
 	target: string;
 	binary: string;
 	metadata: string;
@@ -38,6 +40,13 @@ export function parseSmokeArgs(args: readonly string[]): SmokeOptions {
 		output: "",
 	};
 	for (const arg of args) {
+		if (arg.startsWith("--repository=")) {
+			const repository = arg.slice("--repository=".length);
+			if (values.repository !== undefined || !isValidGitHubRepository(repository))
+				throw new Error("Invalid or duplicate smoke repository");
+			values.repository = repository;
+			continue;
+		}
 		const match = /^--([a-z]+)=(.+)$/.exec(arg);
 		const key = keys.find((key) => key === match?.[1]);
 		const value = match?.[2];
@@ -123,7 +132,10 @@ export function validateSmokeMetadata(
 		!options.commit.startsWith(metadata.commit) ||
 		metadata.size !== hash.size ||
 		metadata.sha256 !== hash.sha256 ||
-		metadata.sha512 !== hash.sha512
+		metadata.sha512 !== hash.sha512 ||
+		(metadata.repository !== undefined && !isValidGitHubRepository(metadata.repository)) ||
+		(options.repository !== undefined &&
+			metadata.repository?.toLowerCase() !== options.repository.toLowerCase())
 	) {
 		throw new Error("Release metadata does not match binary/target/version/commit");
 	}
@@ -538,7 +550,8 @@ export async function smokeReleaseBinary(
 		}
 		const before = await hashReleaseFile(binary, MAX_BINARY, scope.signal);
 		const metadataText = await readReleaseText(resolve(options.metadata), MAX_MESSAGE);
-		validateSmokeMetadata(JSON.parse(metadataText), options, before);
+		const metadata = validateSmokeMetadata(JSON.parse(metadataText), options, before);
+		const repository = options.repository ?? metadata.repository;
 		const executable = join(cwd, basename(binary));
 		await copyReleaseFile(binary, executable, MAX_BINARY, scope.signal);
 		if (process.platform !== "win32") await chmod(executable, 0o700);
@@ -582,6 +595,20 @@ export async function smokeReleaseBinary(
 			).text,
 		) as { token?: string };
 		if (!registration.token) throw new Error("Isolated bootstrap registration did not issue token");
+		if (repository) {
+			const actual = JSON.parse(
+				(
+					await request(origin, "/api/settings", scope, {
+						headers: { Authorization: `Bearer ${registration.token}` },
+					})
+				).text,
+			) as { update?: { source?: string; githubRepository?: string } };
+			if (
+				actual.update?.source !== "github" ||
+				actual.update.githubRepository?.toLowerCase() !== repository.toLowerCase()
+			)
+				throw new Error("Compiled default update repository does not match the release repository");
+		}
 		assertMigratedDatabase(join(env.NARRAFORK_HOME, "narrafork.db"), username);
 		await watcher(executable, root, scope);
 		await pty(origin, registration.token, scope);
@@ -601,6 +628,7 @@ export async function smokeReleaseBinary(
 			throw new Error("Metadata changed during smoke");
 		result = {
 			schemaVersion: 1,
+			...(repository ? { repository } : {}),
 			target: options.target,
 			commit: options.commit,
 			version: options.version,

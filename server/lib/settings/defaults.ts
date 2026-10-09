@@ -978,7 +978,7 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		valid: '"github" | "update-server"',
 	},
 	"update.githubRepository": {
-		desc: "GitHub 更新仓库，格式为 owner/repo，默认 NarraFork/NarraFork。切换来源时保留。",
+		desc: "GitHub 更新仓库，格式为 owner/repo，默认使用构建仓库。切换来源时保留。",
 		type: "string",
 		valid: "owner 最长 39 字符，repo 最长 100 字符；不接受 URL 或 .. 路径",
 	},

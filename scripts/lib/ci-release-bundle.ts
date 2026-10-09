@@ -5,6 +5,10 @@ import { isDeepStrictEqual } from "node:util";
 import { z } from "zod";
 import { applyZstdPatchToFile, generateZstdPatchToFile } from "../../server/lib/zstd-patch";
 import {
+	isValidGitHubRepository,
+	OFFICIAL_GITHUB_REPOSITORY,
+} from "../../shared/github-repository";
+import {
 	MAX_RELEASE_BINARY_BYTES,
 	MAX_RELEASE_PATCH_BYTES,
 	validateReleasePatchMetadata,
@@ -39,6 +43,7 @@ const sizeSchema = z.number().int().positive().max(MAX_RELEASE_BINARY_BYTES);
 const smokeSchema = z
 	.object({
 		schemaVersion: z.literal(1),
+		repository: z.string().refine(isValidGitHubRepository).optional(),
 		target: z.string(),
 		commit: z.string().regex(/^[a-f0-9]{40}$/),
 		version: z.string(),
@@ -177,6 +182,8 @@ function validateSmoke(
 		smoke.target !== target.target ||
 		smoke.commit !== plan.commit ||
 		smoke.version !== plan.version ||
+		((binary.repository !== undefined || plan.defaultBranch !== undefined) &&
+			smoke.repository?.toLowerCase() !== plan.repository.toLowerCase()) ||
 		(target.target.startsWith("darwin-") && smoke.checks.signature !== true)
 	)
 		throw new Error(`Smoke identity/signature mismatch: ${target.target}`);
@@ -201,6 +208,14 @@ async function readBinary(
 		commit: plan.commit,
 	});
 	assertIdentity(identity, metadata, name);
+	if (plan.defaultBranch !== undefined && metadata.repository === undefined)
+		throw new Error(`Missing strict build repository provenance: ${name}`);
+	const buildRepository = metadata.repository ?? OFFICIAL_GITHUB_REPOSITORY;
+	if (
+		!isValidGitHubRepository(buildRepository) ||
+		buildRepository.toLowerCase() !== plan.repository.toLowerCase()
+	)
+		throw new Error(`Binary build repository mismatch: ${name}`);
 	return metadata;
 }
 

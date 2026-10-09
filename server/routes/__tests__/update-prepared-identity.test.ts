@@ -29,6 +29,7 @@ const requireAdmin: MiddlewareHandler = async (c, next) => {
 };
 mock.module("../../middleware/auth", () => ({ requireAuth, requireAdmin }));
 mock.module("../../services/update-service", () => ({
+	getUpdateNotes: async () => ({ notes: null }),
 	applyUpdate: async (options: { targetVersion?: string; preparedId?: string }) => {
 		applies.push(options);
 		return applyResult;

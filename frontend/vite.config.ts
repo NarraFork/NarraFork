@@ -6,6 +6,7 @@ import react from "@vitejs/plugin-react";
 import { bundledLanguagesAlias, bundledLanguagesInfo } from "shiki";
 import { defineConfig, type Plugin } from "vite";
 import { VitePWA } from "vite-plugin-pwa";
+import { resolveBuildGitHubRepository } from "../scripts/lib/build-repository";
 import { injectSpaBaseHref } from "../server/lib/spa-base-href";
 import {
 	assertAppShellJavaScriptIsPrecached,
@@ -515,6 +516,9 @@ export default defineConfig(({ mode, command }) => {
 			plugins: () => [shikiLanguageAliases(false)],
 		},
 		define: {
+			__NARRAFORK_BUILD_REPOSITORY__: JSON.stringify(
+				resolveBuildGitHubRepository({ root: resolve(__dirname, "..") }),
+			),
 			// Inject dev ports whenever running the dev server (regardless of mode)
 			// so that WS URL rewriting works in start:dev (production mode + vite serve)
 			__DEV_VITE_PORT__: isServe ? JSON.stringify(vitePort) : "undefined",

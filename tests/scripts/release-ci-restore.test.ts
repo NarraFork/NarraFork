@@ -71,7 +71,9 @@ function contents(value: unknown) {
 		content: bytes.toString("base64"),
 	});
 }
-function fixture() {
+function fixture(releasePlan: CiReleasePlan = plan) {
+	const repositoryName = releasePlan.repository;
+	const defaultBranch = releasePlan.defaultBranch ?? "main";
 	const root = mkdtempSync(join(tmpdir(), "narrafork-ci-restore-"));
 	roots.push(root);
 	const bundle = join(root, "input");
@@ -80,22 +82,26 @@ function fixture() {
 	const entries = new Map<string, Buffer>();
 	const smoke: CiReleaseManifest["smoke"] = [];
 	const metadata = CI_RELEASE_TARGETS.map((target) => {
-		const name = `narrafork-${plan.version}-${target.suffix}`;
+		const name = `narrafork-${releasePlan.version}-${target.suffix}`;
 		const bytes = Buffer.from(`binary:${target.target}`);
 		const meta = computeBinaryMetadataFromBuffer(name, bytes, {
-			version: plan.version,
+			version: releasePlan.version,
 			platformId: target.platform,
 			target: `bun-${target.target}`,
 			commit: commit.slice(0, 12),
+			...(releasePlan.repository === CI_RELEASE_REPOSITORY
+				? {}
+				: { repository: releasePlan.repository }),
 			buildDate: "2026-10-08T00:00:00.000Z",
 		});
 		entries.set(name, bytes);
 		entries.set(`${name}.metadata.json`, Buffer.from(formatMetadataJson(meta)));
 		smoke.push({
 			schemaVersion: 1,
+			...(meta.repository ? { repository: meta.repository } : {}),
 			target: target.target,
 			commit,
-			version: plan.version,
+			version: releasePlan.version,
 			size: meta.size,
 			sha256: meta.sha256,
 			sha512: meta.sha512,
@@ -110,15 +116,18 @@ function fixture() {
 		});
 		return meta;
 	});
-	entries.set(`narrafork-${plan.version}-SHA256SUMS`, Buffer.from(formatSha256Sums(metadata)));
 	entries.set(
-		`narrafork-${plan.version}-checksums.txt`,
-		Buffer.from(formatChecksumsReport(plan.version, metadata)),
+		`narrafork-${releasePlan.version}-SHA256SUMS`,
+		Buffer.from(formatSha256Sums(metadata)),
+	);
+	entries.set(
+		`narrafork-${releasePlan.version}-checksums.txt`,
+		Buffer.from(formatChecksumsReport(releasePlan.version, metadata)),
 	);
 	for (const [name, bytes] of entries) writeFileSync(join(bundle, "dist", name), bytes);
 	const manifest: CiReleaseManifest = {
 		schemaVersion: 1,
-		plan: structuredClone(plan),
+		plan: structuredClone(releasePlan),
 		smoke,
 		files: [...entries].map(([name, bytes]) => ({
 			name,
@@ -128,7 +137,7 @@ function fixture() {
 		})),
 	};
 	const archivePath = join(root, "bundle.zip");
-	const repository = { id: 55, full_name: CI_RELEASE_REPOSITORY };
+	const repository = { id: 55, full_name: repositoryName };
 	const state = {
 		root,
 		bundle,
@@ -142,7 +151,7 @@ function fixture() {
 			workflow_id: 77,
 			path: CI_RELEASE_WORKFLOW,
 			event: "workflow_dispatch",
-			head_branch: "main",
+			head_branch: defaultBranch,
 			head_sha: workflowCommit,
 			status: "completed",
 			conclusion: "failure",
@@ -168,7 +177,7 @@ function fixture() {
 				id: 101,
 				repository_id: 55,
 				head_repository_id: 55,
-				head_branch: "main",
+				head_branch: defaultBranch,
 				head_sha: workflowCommit,
 			},
 		},
@@ -194,7 +203,9 @@ function fixture() {
 		},
 		async run(args: string[]) {
 			state.calls.push(args);
-			const path = args[1].replace(`repos/${CI_RELEASE_REPOSITORY}/`, "");
+			if (args[1] === `repos/${repositoryName}`)
+				return JSON.stringify({ full_name: repositoryName, default_branch: defaultBranch });
+			const path = args[1].replace(`repos/${repositoryName}/`, "");
 			if (path === "actions/runs/101") return JSON.stringify(state.source);
 			if (path === "actions/workflows/77")
 				return JSON.stringify({ id: 77, path: state.workflowPath, state: "active" });
@@ -210,15 +221,16 @@ function fixture() {
 							: [state.artifact],
 				});
 			if (path === "actions/artifacts/900") return JSON.stringify(state.artifact);
-			if (path === "git/ref/heads/main")
+			if (path === `git/ref/heads/${encodeURIComponent(defaultBranch)}`)
 				return JSON.stringify({ object: { type: "commit", sha: workflowCommit } });
 			if (path.startsWith("compare/"))
 				return JSON.stringify({ status: "ahead", merge_base_commit: { sha: path.slice(8, 48) } });
 			if (path === "git/ref/tags/v1.2.0")
 				return JSON.stringify({ object: { type: "commit", sha: commit } });
 			if (path === `contents/package.json?ref=${commit}`)
-				return contents({ version: plan.version, packageManager: `bun@${CI_RELEASE_BUN}` });
-			if (path === `contents/changelogs/v1.2.0.json?ref=${commit}`) return contents(plan.changelog);
+				return contents({ version: releasePlan.version, packageManager: `bun@${CI_RELEASE_BUN}` });
+			if (path === `contents/changelogs/v1.2.0.json?ref=${commit}`)
+				return contents(releasePlan.changelog);
 			if (path === `contents/scripts/lib/ci-release-types.ts?ref=${commit}`)
 				return JSON.stringify({ type: "file", size: 100 });
 			throw new Error(`Unexpected API: ${path}`);
@@ -247,6 +259,48 @@ function options(state: ReturnType<typeof fixture>) {
 }
 
 describe("CI immutable release bundle restoration", () => {
+	test("fork restore uses the same repository/default branch through artifact download", async () => {
+		const repository = "Example/Custom";
+		const defaultBranch = "trunk";
+		const state = fixture({ ...plan, repository, defaultBranch });
+		const forkEnv = {
+			...env,
+			GITHUB_REPOSITORY: repository,
+			GITHUB_REF: `refs/heads/${defaultBranch}`,
+			GITHUB_WORKFLOW_REF: `${repository}/${CI_RELEASE_WORKFLOW}@refs/heads/${defaultBranch}`,
+		};
+		let downloadUrl = "";
+		const restored = await restoreCiReleaseBundle({
+			...options(state),
+			env: forkEnv,
+			fetch: (async (url: string | URL | Request, init?: RequestInit) => {
+				downloadUrl = String(url);
+				return state.fetch(url, init);
+			}) as typeof fetch,
+		});
+		expect(restored.plan).toMatchObject({ repository, defaultBranch });
+		expect(downloadUrl).toBe(
+			`https://api.github.com/repos/${repository}/actions/artifacts/900/zip`,
+		);
+		expect(state.calls.every((args) => args[1].startsWith(`repos/${repository}`))).toBe(true);
+	});
+	test("a legacy official bundle cannot be restored under a fork dispatch", async () => {
+		const repository = "Example/Custom";
+		const state = fixture({ ...plan, repository, defaultBranch: "main" });
+		state.manifest.plan.repository = CI_RELEASE_REPOSITORY;
+		delete state.manifest.plan.defaultBranch;
+		state.repack();
+		await expect(
+			restoreCiReleaseBundle({
+				...options(state),
+				env: {
+					...env,
+					GITHUB_REPOSITORY: repository,
+					GITHUB_WORKFLOW_REF: `${repository}/${CI_RELEASE_WORKFLOW}@refs/heads/main`,
+				},
+			}),
+		).rejects.toThrow("source run provenance");
+	});
 	test("accepts successful source evidence despite failed publication and preserves bytes", async () => {
 		const state = fixture();
 		const restored = await restoreCiReleaseBundle(options(state));
@@ -275,6 +329,8 @@ describe("CI immutable release bundle restoration", () => {
 	for (const change of [
 		{ event: "pull_request" },
 		{ head_branch: "fork" },
+		{ repository: { id: 55, full_name: "Other/Repo" } },
+		{ head_repository: { id: 55, full_name: "Other/Repo" } },
 		{ path: ".github/workflows/fake.yml" },
 		{ id: 999 },
 		{ status: "in_progress" },

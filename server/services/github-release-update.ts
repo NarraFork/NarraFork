@@ -13,6 +13,16 @@ import {
 	compareReleaseVersions as compareSemanticVersions,
 	isValidReleaseVersion as validSemver,
 } from "../../shared/release-version";
+import { parseUpdateSourceIdentity, type UpdateSourceIdentity } from "../../shared/update-identity";
+import { parseUpdateIndex, parseUpdateNotes } from "../../shared/update-index";
+import {
+	MAX_UPDATE_INDEX_BYTES,
+	MAX_UPDATE_NOTES_BYTES,
+	UPDATE_INDEX_BRANCH,
+	UPDATE_INDEX_FILE,
+	type UpdateIndexAsset,
+	type UpdateIndexV1,
+} from "../../shared/update-index-types";
 import { logger } from "../lib/logger";
 import { isValidGitHubRepository } from "../lib/settings/update-source";
 import { planGithubReleasePatches } from "./github-release-patch-planner";
@@ -165,7 +175,7 @@ async function readBoundedJson(
 	maxBytes: number,
 	signal: AbortSignal,
 	consumeBytes?: (bytes: number) => void,
-): Promise<{ value: unknown; bytes: number }> {
+): Promise<{ value: unknown; bytes: number; sha256: string }> {
 	if (!response.body) throw new GithubUpdateError("INVALID_METADATA", "Missing metadata body");
 	const reader = response.body.getReader();
 	const chunks: Uint8Array[] = [];
@@ -184,7 +194,12 @@ async function readBoundedJson(
 			chunks.push(value);
 		}
 		try {
-			return { value: JSON.parse(Buffer.concat(chunks, bytes).toString("utf8")), bytes };
+			const raw = Buffer.concat(chunks, bytes);
+			return {
+				value: JSON.parse(raw.toString("utf8")),
+				bytes,
+				sha256: createHash("sha256").update(raw).digest("hex"),
+			};
 		} catch {
 			throw new GithubUpdateError("INVALID_METADATA", "Invalid metadata JSON");
 		}
@@ -394,6 +409,39 @@ function discoverPatchAssets(
 		.slice(0, MAX_RELEASE_PATCH_METADATA);
 }
 
+/** Construct release URLs locally; the public index never supplies arbitrary URLs. */
+function indexReleases(index: UpdateIndexV1, platform: string, repository: string): unknown[] {
+	return index.releases.map((release) => {
+		const asset = (item: UpdateIndexAsset) => ({
+			name: item.name,
+			size: item.size,
+			digest: `sha256:${item.sha256}`,
+			state: "uploaded",
+			browser_download_url: `https://github.com/${repository}/releases/download/${encodeURIComponent(release.tag)}/${encodeURIComponent(item.name)}`,
+		});
+		const file = release.files.find((item) => item.platform === platform);
+		return {
+			tag_name: release.tag,
+			draft: false,
+			prerelease: release.prerelease,
+			published_at: release.publishedAt,
+			assets: file
+				? [
+						asset(file),
+						asset(file.metadata),
+						...file.patches.flatMap((patch) => [asset(patch), asset(patch.metadata)]),
+					]
+				: [],
+		};
+	});
+}
+
+export interface UpdateNotesRequest {
+	version: string;
+	sha512: string;
+	sourceIdentity: UpdateSourceIdentity;
+}
+
 /** Instance-scoped bounded caches; production shares one instance across all administrators. */
 export class GithubReleaseUpdater {
 	private readonly checks = new Map<string, { until: number; result: UpdateCheckResult }>();
@@ -401,6 +449,11 @@ export class GithubReleaseUpdater {
 	private readonly jsonCache = new Map<
 		string,
 		{ etag: string; value: unknown; bytes: number; next: boolean }
+	>();
+	// Four validated catalogs occupy at most 1 MiB; no caller receives mutable cached objects.
+	private readonly indexCache = new Map<
+		string,
+		{ etag: string; index: UpdateIndexV1; bytes: number }
 	>();
 	private cooldownUntil = 0;
 	private generation = 0;
@@ -416,7 +469,12 @@ export class GithubReleaseUpdater {
 		} = {},
 	) {}
 
-	check(input: CheckInput, options: { force?: boolean } = {}): Promise<UpdateCheckResult> {
+	check(
+		input: CheckInput,
+		options: { force?: boolean; signal?: AbortSignal } = {},
+	): Promise<UpdateCheckResult> {
+		// A cancellable caller cannot own (or cancel) another administrator's shared check.
+		if (options.signal) return this.performCheck(input, options.signal);
 		const key = JSON.stringify([
 			input.repository.toLowerCase(),
 			input.channel,
@@ -447,6 +505,122 @@ export class GithubReleaseUpdater {
 			.finally(() => this.inFlight.delete(flightKey));
 		this.inFlight.set(flightKey, result);
 		return result;
+	}
+
+	private async fetchRaw(
+		repository: string,
+		path: string,
+		signal: AbortSignal,
+		etag?: string,
+	): Promise<Response> {
+		if (!isGithubUpdateRepository(repository))
+			throw new GithubUpdateError("INVALID_CONFIGURATION", "Invalid GitHub repository");
+		const url = `https://raw.githubusercontent.com/${repository}/${UPDATE_INDEX_BRANCH}/${path}`;
+		// No token and no redirects: even another raw repository is a different authority.
+		const response = await abortable(
+			this.fetcher(url, {
+				signal,
+				redirect: "error",
+				headers: etag ? { "If-None-Match": etag } : {},
+			}),
+			signal,
+		);
+		if (response.redirected || (response.url && response.url !== url)) {
+			await abortable(response.body?.cancel() ?? Promise.resolve(), signal).catch(() => {});
+			throw new GithubUpdateError("INVALID_METADATA", "Untrusted metadata redirect");
+		}
+		return response;
+	}
+
+	private async readIndex(
+		repository: string,
+		deadline: AbortSignal,
+	): Promise<{ index: UpdateIndexV1; bytes: number } | null> {
+		const key = repository.toLowerCase();
+		const cached = this.indexCache.get(key);
+		const signal = AbortSignal.any([
+			deadline,
+			AbortSignal.timeout(this.budgets.requestTimeoutMs ?? 10_000),
+		]);
+		const response = await this.fetchRaw(repository, UPDATE_INDEX_FILE, signal, cached?.etag);
+		try {
+			if (response.status === 404) {
+				this.indexCache.delete(key);
+				return null;
+			}
+			this.checkResponse(response);
+			if (response.status === 304) {
+				if (
+					!cached ||
+					(response.headers.has("etag") && response.headers.get("etag") !== cached.etag)
+				)
+					throw new GithubUpdateError("INVALID_METADATA", "Unexpected index 304 response");
+				return { index: structuredClone(cached.index), bytes: cached.bytes };
+			}
+			const json = await readBoundedJson(response, MAX_UPDATE_INDEX_BYTES, signal);
+			let index: UpdateIndexV1;
+			try {
+				index = parseUpdateIndex(json.value, repository);
+			} catch {
+				throw new GithubUpdateError("INVALID_METADATA", "Invalid GitHub update index");
+			}
+			const etag = response.headers.get("etag");
+			this.indexCache.delete(key);
+			if (etag && etag.length <= 1024) {
+				if (this.indexCache.size >= 4)
+					this.indexCache.delete(this.indexCache.keys().next().value ?? "");
+				this.indexCache.set(key, { index: structuredClone(index), bytes: json.bytes, etag });
+			}
+			return { index, bytes: json.bytes };
+		} finally {
+			await abortable(response.body?.cancel() ?? Promise.resolve(), signal).catch(() => {});
+		}
+	}
+
+	async getNotes(
+		request: UpdateNotesRequest,
+		cancellation?: AbortSignal,
+	): Promise<{ notes: string | Record<string, string> | null }> {
+		const identity = parseUpdateSourceIdentity(request.sourceIdentity);
+		if (
+			identity?.source !== "github" ||
+			!validSemver(request.version) ||
+			!SHA512_RE.test(request.sha512)
+		)
+			throw new GithubUpdateError("INVALID_METADATA", "Invalid release notes identity");
+		const signal = AbortSignal.any([
+			AbortSignal.timeout(this.budgets.requestTimeoutMs ?? 10_000),
+			...(cancellation ? [cancellation] : []),
+		]);
+		const data = await this.readIndex(identity.repository, signal);
+		const release = data?.index.releases.find((item) => item.version === request.version);
+		const binary = release?.files.find((item) => item.platform === identity.platform);
+		if (
+			!release ||
+			!binary ||
+			binary.sha512 !== request.sha512 ||
+			(identity.channel === "stable" && release.prerelease)
+		)
+			throw new GithubUpdateError(
+				"UPDATE_ARTIFACT_CHANGED",
+				"Release notes artifact is no longer available",
+			);
+		if (!release.notes) return { notes: null };
+		const descriptor = release.notes;
+		const response = await this.fetchRaw(identity.repository, descriptor.path, signal);
+		try {
+			this.checkResponse(response);
+			const json = await readBoundedJson(response, MAX_UPDATE_NOTES_BYTES, signal);
+			if (json.bytes !== descriptor.size || json.sha256 !== descriptor.sha256)
+				throw new GithubUpdateError("INVALID_METADATA", "Release notes checksum mismatch");
+			try {
+				return { notes: parseUpdateNotes(json.value, identity.repository, request.version).notes };
+			} catch {
+				throw new GithubUpdateError("INVALID_METADATA", "Invalid release notes document");
+			}
+		} finally {
+			await abortable(response.body?.cancel() ?? Promise.resolve(), signal).catch(() => {});
+		}
 	}
 
 	private checkResponse(response: Response): void {
@@ -493,6 +667,7 @@ export class GithubReleaseUpdater {
 		sha512: string,
 		deadline: AbortSignal,
 		usedBytes: number,
+		index?: UpdateIndexV1,
 	): Promise<GithubPatchStep[] | undefined> {
 		const controller = new AbortController();
 		const signal = AbortSignal.any([
@@ -520,13 +695,24 @@ export class GithubReleaseUpdater {
 						response = await fetchGithubAsset(item.metadata.url, signal, this.fetcher);
 						this.checkResponse(response);
 						const json = await readBoundedJson(response, 64 * 1024, signal, consumeBytes);
-						if (json.bytes !== item.metadata.size) throw new Error("Patch sidecar size mismatch");
+						if (
+							json.bytes !== item.metadata.size ||
+							(item.metadata.sha256 && item.metadata.sha256 !== json.sha256)
+						)
+							throw new Error("Patch sidecar size or checksum mismatch");
+						const indexedBinary = index?.releases
+							.find((release) => release.version === item.version)
+							?.files.find((file) => file.platform === input.platform);
+						const indexedPatch = indexedBinary?.patches.find(
+							(patch) => patch.name === item.patch.name,
+						);
 						const meta = validateReleasePatchMetadata(json.value, {
-							fromVersion: item.fromVersion,
+							fromVersion: indexedPatch?.fromVersion ?? item.fromVersion,
 							toVersion: item.version,
 							patchSize: item.patch.size,
 							newFileSize: item.binary.size,
-							newFileSha512: item.version === candidate.version ? sha512 : undefined,
+							newFileSha512:
+								indexedBinary?.sha512 ?? (item.version === candidate.version ? sha512 : undefined),
 						});
 						if (
 							meta.mode !== "patch-from" &&
@@ -571,15 +757,22 @@ export class GithubReleaseUpdater {
 		}
 	}
 
-	private async performCheck(input: CheckInput): Promise<UpdateCheckResult> {
+	private async performCheck(
+		input: CheckInput,
+		cancellation?: AbortSignal,
+	): Promise<UpdateCheckResult> {
 		const base: UpdateCheckResult = {
 			updateAvailable: false,
 			currentVersion: input.currentVersion,
 			source: "github",
 			repository: input.repository,
 		};
-		const deadline = AbortSignal.timeout(this.budgets.checkTimeoutMs ?? 30_000);
+		const deadline = AbortSignal.any([
+			AbortSignal.timeout(this.budgets.checkTimeoutMs ?? 30_000),
+			...(cancellation ? [cancellation] : []),
+		]);
 		try {
+			deadline.throwIfAborted();
 			if (!isGithubUpdateRepository(input.repository))
 				throw new GithubUpdateError("INVALID_CONFIGURATION", "Invalid GitHub repository");
 			if (this.cooldownUntil > this.now())
@@ -588,9 +781,13 @@ export class GithubReleaseUpdater {
 					"GitHub update requests are cooling down",
 					Math.ceil((this.cooldownUntil - this.now()) / 1000),
 				);
-			const releases: unknown[] = [];
-			let totalBytes = 0;
-			for (let page = 1; page <= MAX_PAGES; page++) {
+			const catalog = await this.readIndex(input.repository, deadline);
+			const index = catalog?.index;
+			const releases: unknown[] = index
+				? indexReleases(index, input.platform, input.repository)
+				: [];
+			let totalBytes = catalog?.bytes ?? 0;
+			for (let page = 1; !index && page <= MAX_PAGES; page++) {
 				const url = `https://api.github.com/repos/${input.repository}/releases?per_page=100&page=${page}`;
 				const cached = this.jsonCache.get(url);
 				const signal = AbortSignal.any([
@@ -642,7 +839,18 @@ export class GithubReleaseUpdater {
 				if (page === MAX_PAGES)
 					throw new GithubUpdateError("SCAN_LIMIT_REACHED", "GitHub release scan limit reached");
 			}
-			const candidate = selectCandidate(releases, input);
+			const indexedRelease = index?.releases.find(
+				(release) => release.version === index.channels[input.channel],
+			);
+			const indexedBinary = indexedRelease?.files.find((file) => file.platform === input.platform);
+			const candidate = selectCandidate(
+				index
+					? releases.filter(
+							(release) => isRecord(release) && release.tag_name === indexedRelease?.tag,
+						)
+					: releases,
+				input,
+			);
 			if (!candidate)
 				return {
 					...base,
@@ -662,6 +870,7 @@ export class GithubReleaseUpdater {
 				const json = await readBoundedJson(response, 64 * 1024, metadataSignal);
 				if (
 					json.bytes !== candidate.metadata.size ||
+					(indexedBinary && json.sha256 !== indexedBinary.metadata.sha256) ||
 					totalBytes + json.bytes > MAX_TOTAL_JSON_BYTES
 				) {
 					throw new GithubUpdateError(
@@ -683,7 +892,13 @@ export class GithubReleaseUpdater {
 				typeof metadata.sha512 !== "string" ||
 				!SHA512_RE.test(metadata.sha512) ||
 				typeof metadata.sha256 !== "string" ||
-				!/^[a-f0-9]{64}$/.test(metadata.sha256)
+				!/^[a-f0-9]{64}$/.test(metadata.sha256) ||
+				(indexedBinary &&
+					(metadata.sha256 !== indexedBinary.sha256 ||
+						metadata.sha512 !== indexedBinary.sha512 ||
+						typeof metadata.commit !== "string" ||
+						!/^[a-f0-9]{7,40}$/.test(metadata.commit) ||
+						!indexedRelease?.commit.startsWith(metadata.commit)))
 			) {
 				throw new GithubUpdateError(
 					"INVALID_METADATA",
@@ -697,11 +912,15 @@ export class GithubReleaseUpdater {
 				metadata.sha512,
 				deadline,
 				totalBytes,
+				index,
 			);
+			deadline.throwIfAborted();
 			return {
 				...base,
 				updateAvailable: true,
 				latestVersion: candidate.version,
+				notesDeferred: !!index,
+				notesAvailable: !!indexedRelease?.notes,
 				strategy: patchChain ? "zstd" : "full",
 				downloadSize: patchChain
 					? patchChain.reduce((bytes, step) => bytes + step.patchSize, 0)
@@ -719,6 +938,8 @@ export class GithubReleaseUpdater {
 					version: candidate.version,
 					releaseDate: candidate.releaseDate,
 					releaseNotes: candidate.releaseNotes,
+					notesDeferred: !!index,
+					notesAvailable: !!indexedRelease?.notes,
 					path: candidate.binary.name,
 					sha512: metadata.sha512,
 					files: [
@@ -736,10 +957,12 @@ export class GithubReleaseUpdater {
 				error instanceof GithubUpdateError
 					? error
 					: new GithubUpdateError(
-							deadline.aborted ||
-								(error instanceof Error && ["TimeoutError", "AbortError"].includes(error.name))
-								? "TIMEOUT"
-								: "NETWORK_ERROR",
+							cancellation?.aborted
+								? "CANCELLED"
+								: deadline.aborted ||
+										(error instanceof Error && ["TimeoutError", "AbortError"].includes(error.name))
+									? "TIMEOUT"
+									: "NETWORK_ERROR",
 							"GitHub update check failed",
 						);
 			return {
