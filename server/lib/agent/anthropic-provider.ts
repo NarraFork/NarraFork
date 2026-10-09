@@ -60,6 +60,7 @@ import { sanitizeHeaders } from "./request-dump";
 import { parseJsonResponseWithBody } from "./response-body";
 import { ToolInputStream, toolInputStreamFor } from "./tool-input-stream";
 import { resolveToolJsonSchema } from "./tool-registry";
+import { flattenTopLevelUnion } from "./tool-schema-compat";
 import {
 	type AgentToolUse,
 	ApiError,
@@ -1497,7 +1498,7 @@ export class AnthropicProvider implements ProviderAdapter {
 				description: tool.description,
 				input_schema: {
 					$schema: "https://json-schema.org/draft/2020-12/schema",
-					...resolveToolJsonSchema(tool),
+					...flattenTopLevelUnion(resolveToolJsonSchema(tool)),
 				},
 			}),
 		);
