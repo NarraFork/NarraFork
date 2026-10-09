@@ -218,6 +218,143 @@ describe("large editor objects and real durable pipeline", () => {
 			await new Response(await service.content(actor, doc.docId, doc.versionHandle)).text(),
 		).toBe("before\n中文🙂\n");
 	});
+	const signatures = [
+		["utf-8", Buffer.from([0xef, 0xbb, 0xbf])],
+		["utf-16le", Buffer.from([0xff, 0xfe])],
+		["utf-16be", Buffer.from([0xfe, 0xff])],
+	] as const;
+	for (const [encoding, bom] of [["utf-8", Buffer.alloc(0)], ...signatures] as const) {
+		test(`${encoding} saves preserve the original BOM choice (${bom.byteLength})`, async () => {
+			await writeFile(target, Buffer.concat([bom, iconv.encode("before\r\n", encoding)]));
+			const doc = await create();
+			expect(doc.encoding).toBe(encoding);
+			expect(doc.baseHash).toBe(hash("before\r\n"));
+			let baseHash = doc.baseHash;
+			for (const [input, output] of [
+				["after\n", "after\r\n"],
+				["again\n\uFEFFbody\n", "again\r\n\uFEFFbody\r\n"],
+			]) {
+				const id = await upload(doc, input, baseHash);
+				const saved = await service.commit(actor, doc.docId, id, {});
+				const expected = Buffer.concat([bom, iconv.encode(output, encoding)]);
+				expect(await readFile(target)).toEqual(expected);
+				expect(saved).toMatchObject({
+					status: "saved",
+					hash: hash(output),
+					bytes: expected.byteLength,
+				});
+				if (saved.status !== "saved") throw new Error("Expected settled save");
+				expect(await service.commit(actor, doc.docId, id, {})).toEqual(saved);
+				expect(
+					JSON.parse(
+						await readFile(join(root, "transfers", `ed-${saved.operationId}.json`), "utf8"),
+					),
+				).toMatchObject({
+					hash: hash(output),
+					rawDigest: createHash("sha256").update(expected).digest("hex"),
+					bytes: expected.byteLength,
+				});
+				baseHash = saved.hash;
+			}
+			expect(dispatches).toBe(2);
+		});
+	}
+	for (const [encoding, bom] of signatures) {
+		test(`${encoding} BOM is retained when saving an empty document`, async () => {
+			await writeFile(target, Buffer.concat([bom, iconv.encode("before\r\n", encoding)]));
+			const doc = await create();
+			const id = await upload(doc, "");
+			const saved = await service.commit(actor, doc.docId, id, {});
+			expect(await readFile(target)).toEqual(bom);
+			expect(saved).toMatchObject({ status: "saved", hash: hash(""), bytes: bom.byteLength });
+		});
+		test(`${encoding} saves do not restore a deleted file's BOM`, async () => {
+			await writeFile(target, Buffer.concat([bom, iconv.encode("before\r\n", encoding)]));
+			const doc = await create();
+			await unlink(target);
+			const id = await upload(doc, "after\n", null);
+			const saved = await service.commit(actor, doc.docId, id, {});
+			const expected = Buffer.from(iconv.encode("after\n", encoding));
+			expect(await readFile(target)).toEqual(expected);
+			expect(saved).toMatchObject({
+				status: "saved",
+				hash: hash("after\n"),
+				bytes: expected.byteLength,
+			});
+		});
+		test(`${encoding} BOM counts toward the final 20 MiB limit`, async () => {
+			await writeFile(target, Buffer.concat([bom, iconv.encode("before", encoding)]));
+			const doc = await create();
+			const text = "a".repeat(
+				(EDITOR_FILE_MAX_BYTES - bom.byteLength) / iconv.encode("a", encoding).byteLength,
+			);
+			const id = await upload(doc, text);
+			const saved = await service.commit(actor, doc.docId, id, {});
+			const before = await readFile(target);
+			expect(before.byteLength).toBe(EDITOR_FILE_MAX_BYTES);
+			expect(before.subarray(0, bom.byteLength)).toEqual(bom);
+			expect(iconv.decode(before.subarray(bom.byteLength), encoding)).toBe(text);
+			expect(saved).toMatchObject({
+				status: "saved",
+				hash: hash(text),
+				bytes: EDITOR_FILE_MAX_BYTES,
+			});
+			if (saved.status !== "saved") throw new Error("Expected settled save");
+			const oversized = await upload(doc, `${text}a`, saved.hash);
+			const error = await failure(() => service.commit(actor, doc.docId, oversized, {}));
+			expect(error.message).toContain("20 MiB");
+			expect(dispatches).toBe(1);
+			expect(operations()).toHaveLength(1);
+			expect((await readFile(target)).equals(before)).toBe(true);
+		}, 30_000);
+	}
+	test("worker does not infer a signature from a mismatched or generic encoding", async () => {
+		const jobs = new EditorDocumentJobs();
+		const uploadPath = join(root, "encoding-controls");
+		await writeFile(uploadPath, "after\n");
+		for (const [encoding, before] of [
+			["utf-8", Buffer.from([0xff, 0xfe])],
+			["utf-16le", Buffer.from([0xef, 0xbb, 0xbf, 0x01])],
+			["utf-16be", Buffer.from([0xff, 0xfe])],
+			["utf-16", Buffer.concat([Buffer.from([0xfe, 0xff]), iconv.encode("before\n", "utf-16be")])],
+		] as const) {
+			const result = await jobs.run(actor.userId, {
+				action: "prepare",
+				before,
+				uploadPath,
+				conflictPath: join(root, `encoding-control-${encoding}`),
+				baseHash: hash(iconv.decode(before, encoding)),
+				encoding,
+				digest: hash("after\n"),
+			});
+			expect(result.kind).toBe("prepared");
+			if (result.kind !== "prepared") throw new Error("Expected preparation");
+			expect(Buffer.from(result.nextBytes)).toEqual(Buffer.from(iconv.encode("after\n", encoding)));
+			expect(result.hash).toBe(hash("after\n"));
+		}
+	});
+	test("worker preserves leading U+FEFF content separately from a file's BOM", async () => {
+		const jobs = new EditorDocumentJobs();
+		const uploadPath = join(root, "leading-content-bom");
+		await writeFile(uploadPath, "\uFEFF\uFEFFafter\n");
+		for (const [encoding, bom] of signatures) {
+			const result = await jobs.run(actor.userId, {
+				action: "prepare",
+				before: Buffer.concat([bom, iconv.encode("before\n", encoding)]),
+				uploadPath,
+				conflictPath: join(root, `leading-content-${encoding}`),
+				baseHash: hash("before\n"),
+				encoding,
+				digest: hash("\uFEFF\uFEFFafter\n"),
+			});
+			expect(result.kind).toBe("prepared");
+			if (result.kind !== "prepared") throw new Error("Expected preparation");
+			expect(Buffer.from(result.nextBytes)).toEqual(
+				Buffer.concat([bom, iconv.encode("\uFEFFafter\n", encoding)]),
+			);
+			expect(result.hash).toBe(hash("\uFEFFafter\n"));
+		}
+	});
 	test("sealed PUT cannot overwrite, commit is idempotent and writes durable human evidence", async () => {
 		const doc = await create(),
 			id = await upload(doc, "after\n中文🙂\n");
@@ -438,6 +575,7 @@ describe("large editor objects and real durable pipeline", () => {
 		expect(error.data.currentHash).toBeNull();
 		const retry = await upload(doc, "mine", null);
 		expect((await service.commit(actor, doc.docId, retry, {})).status).toBe("saved");
+		expect(await readFile(target)).toEqual(Buffer.from("mine"));
 	});
 	test("concurrent duplicate commit gets the same operation and DELETE pins dispatched data", async () => {
 		const entered = deferred(),
@@ -565,7 +703,7 @@ describe("large editor objects and real durable pipeline", () => {
 	}, 30_000);
 	test("UTF-16 source and GBK conversion preserve decoded hash and original EOL", async () => {
 		const jobs = new EditorDocumentJobs();
-		for (const encoding of ["utf-16le", "gbk"]) {
+		for (const encoding of ["utf-16le", "utf-16be", "gbk"]) {
 			const previous = "中文测试\r\n正文\r\n";
 			const bytes = iconv.encode(previous, encoding);
 			const uploaded = Buffer.from("修改\n正文\n");
@@ -584,6 +722,9 @@ describe("large editor objects and real durable pipeline", () => {
 			if (result.kind === "prepared") {
 				expect(iconv.decode(Buffer.from(result.nextBytes), encoding)).toBe("修改\r\n正文\r\n");
 				expect(result.hash).toBe(hash("修改\r\n正文\r\n"));
+				expect(Buffer.from(result.nextBytes)).toEqual(
+					Buffer.from(iconv.encode("修改\r\n正文\r\n", encoding)),
+				);
 			}
 		}
 		await writeFile(
