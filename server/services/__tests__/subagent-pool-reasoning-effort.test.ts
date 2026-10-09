@@ -323,13 +323,15 @@ if (process.env[CHILD_ENV] !== "1") {
 					general: { [MODEL]: "high", [nextModel]: "none" },
 				};
 				const child = await run("medium", background, null);
-				expect(child.model).toBe(FOLLOW_PARENT_MODEL);
+				expect(child.model).toBe(MODEL);
 				expect(child.reasoningEffort).toBe("high");
 				expect(creationInputs[0]).toMatchObject({
-					model: FOLLOW_PARENT_MODEL,
+					model: MODEL,
 					reasoningEffort: "high",
 				});
 				expect(configs.at(-1)).toMatchObject({ model: MODEL, reasoningEffort: "high" });
+				// Legacy children (or an explicit manual selection) can still follow the parent.
+				await narratorService.updateModel(child.id, FOLLOW_PARENT_MODEL);
 				await narratorService.updateModel(PARENT, nextModel);
 				const continued = await startContinuedSubagent({
 					subagentId: child.id,
@@ -350,7 +352,7 @@ if (process.env[CHILD_ENV] !== "1") {
 				);
 				expect(starts).toHaveLength(2);
 				expect(starts[0]?.event).toMatchObject({
-					model: FOLLOW_PARENT_MODEL,
+					model: MODEL,
 					reasoningEffort: "high",
 				});
 				expect(starts.at(-1)?.event).toMatchObject({

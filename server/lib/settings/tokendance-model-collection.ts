@@ -1,0 +1,85 @@
+import type { NarraForkSettings } from "./types";
+
+/** Fixed snapshot of the current supported catalog, not a future-model allowlist. */
+export const TOKENDANCE_COLLECTED_MODEL_IDS = [
+	"glm-4.7",
+	"glm-5",
+	"qwen3-max",
+	"deepseek-v3.2",
+	"minimax-m2.5",
+	"kimi-k2.5",
+	"minimax-m2.7",
+	"glm-4.5-air",
+	"ling-3.1-flash",
+	"glm-4.6v",
+	"step-3.5-flash",
+	"seed-2.0-pro",
+	"seed-2.0-lite",
+	"seed-2.0-mini",
+	"glm-5v-turbo",
+	"qwen3.6-max-preview",
+	"glm-5.1",
+	"qwen3-vl-plus",
+	"kimi-k2.6",
+	"qwen3.5-plus",
+	"qwen3.5-flash",
+	"deepseek-v4-pro",
+	"qwen3.6-plus",
+	"mimo-v2.5-pro",
+	"unifuncs-s3",
+	"unifuncs-u3",
+	"mimo-v2.5",
+	"mimo-v2.5-tts",
+	"mimo-v2.5-tts-voicedesign",
+	"mimo-v2.5-tts-voiceclone",
+	"qwen3.7-plus",
+	"qwen3.7-max",
+	"step-3.7-flash",
+	"unifuncs-u3-pro",
+	"unifuncs-s3-pro",
+	"hy3-preview",
+	"kimi-k2.7-code",
+	"glm-5.2",
+	"seed-evolving",
+	"seed-2.1-turbo",
+	"minimax-m3",
+	"seed-2.1-pro",
+	"qwen3.8-max",
+	"longcat-2.0",
+	"hy3",
+	"cogevol-interactive-0828",
+	"qwen3.5-35b-a3b",
+	"qwen3-30b-a3b-instruct-2507",
+	"deepseek-v4-flash",
+	"deepseek-v4-flash-0731",
+	"dots-3-note-preview",
+	"seed-2.0-code",
+	"ling-3.0-flash",
+	"hy4-preview",
+	"qwen3.8-max-0902",
+	"spark-x2.5-1.7b",
+	"spark-x2.5-4b",
+	"cogevol-slide-0828",
+	"cogevol-base",
+	"glm-5.3-flashx",
+	"qwen3.5-ocr",
+	"step-5-preview",
+	"mimo-v2.6-ultraspeed",
+	"deepseek-v4-pro-0813",
+	"mimo-v2.6-pro",
+	"mimo-v2.6-flash",
+] as const;
+
+/** Seed the existing unified visibility setting once; later edits are authoritative. */
+export function initializeTokenDanceModelCollection(settings: NarraForkSettings): boolean {
+	const connection = settings.tokendance;
+	if (!connection?.apiKey || connection.modelCollectionInitialized) return false;
+	settings.agent.hiddenModels = [
+		...new Set([
+			...(settings.agent.hiddenModels ?? []),
+			...TOKENDANCE_COLLECTED_MODEL_IDS.map((id) => `tokendance:${id}`),
+		]),
+	];
+	connection.modelCollectionInitialized = true;
+	return true;
+}

@@ -1,6 +1,12 @@
 import { parseTokenDanceRecoveryAction, type TokenDanceRecoveryAction } from "@shared/tokendance";
 
 export const TOKENDANCE_RECOVERY_EVENT = "narrafork:tokendance-recovery";
+export const TOKENDANCE_RECHARGE_EVENT = "narrafork:tokendance-recharge";
+
+/** Opens confirmation UI only; it never creates or pays an order. */
+export function openTokenDanceRecharge(target: EventTarget = window): void {
+	target.dispatchEvent(new Event(TOKENDANCE_RECHARGE_EVENT));
+}
 
 export interface TokenDanceRecoveryDetail {
 	action: TokenDanceRecoveryAction;

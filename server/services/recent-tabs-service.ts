@@ -823,24 +823,39 @@ function diffOperations(
 	before: PersistedRecentTab[],
 	after: PersistedRecentTab[],
 ): RecentTabsOperation[] {
-	const beforeByKey = new Map(before.map((tab, index) => [tabKey(tab), { tab, index }]));
+	const beforeByKey = new Map(before.map((tab) => [tabKey(tab), tab]));
 	const afterKeys = new Set(after.map(tabKey));
 	const operations: RecentTabsOperation[] = [];
 	for (const tab of before) {
 		const key = tabKey(tab);
 		if (!afterKeys.has(key)) operations.push({ type: "remove", key });
 	}
-	for (let index = 0; index < after.length; index++) {
-		const tab = after[index];
-		const key = tabKey(tab);
-		const previous = beforeByKey.get(key);
-		const anchors = operationAnchors(after, index);
-		if (!previous || JSON.stringify(previous.tab) !== JSON.stringify(tab)) {
-			operations.push({ type: "upsert", key, tab, ...anchors });
-			continue;
+	// Each section is a separate paginated client window. Cross-section neighbors
+	// cannot position a row in that window, even when every page is loaded.
+	for (const section of ["projects", "work"] as const) {
+		const sectionTabs = after.filter((tab) => tabSection(tab.type) === section);
+		const currentKeys = before
+			.filter((tab) => tabSection(tab.type) === section && afterKeys.has(tabKey(tab)))
+			.map(tabKey);
+		for (let index = 0; index < sectionTabs.length; index++) {
+			const tab = sectionTabs[index];
+			const key = tabKey(tab);
+			const previous = beforeByKey.get(key);
+			const anchors = operationAnchors(sectionTabs, index);
+			if (!previous || JSON.stringify(previous) !== JSON.stringify(tab)) {
+				operations.push({ type: "upsert", key, tab, ...anchors });
+			} else if (currentKeys[index] !== key) {
+				operations.push({ type: "move", key, ...anchors });
+			}
+			// Compare with the order AFTER earlier operations, not the original list:
+			// moving a block's head also displaces neighbors whose old predecessor did
+			// not change. Omitting those moves makes replay diverge from persisted order.
+			if (currentKeys[index] !== key) {
+				const previousIndex = currentKeys.indexOf(key);
+				if (previousIndex >= 0) currentKeys.splice(previousIndex, 1);
+				currentKeys.splice(index, 0, key);
+			}
 		}
-		const previousKey = previous.index > 0 ? tabKey(before[previous.index - 1]) : null;
-		if (previousKey !== anchors.afterKey) operations.push({ type: "move", key, ...anchors });
 	}
 	return operations;
 }

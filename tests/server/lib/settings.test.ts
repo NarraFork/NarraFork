@@ -14,6 +14,67 @@ import {
 	stripObsoleteSettingsKeys,
 } from "../../../server/lib/settings";
 
+describe("TokenDance collection persistence", () => {
+	it("initializes legacy connections once and preserves manual choices across save and reload", () => {
+		const path = resolve(getNarraforkHome(), "settings.json");
+		const original = readFileSync(path, "utf8");
+		const snapshot = structuredClone(liveSettings);
+		try {
+			const raw = getDefaults();
+			raw.tokendance = { apiKey: "collection-test-key", disabled: false, generation: 4 };
+			raw.agent.hiddenModels = [];
+			raw.agent.modelContextWindows = { "tokendance:glm-5": 64000 };
+			writeFileSync(path, JSON.stringify(raw));
+			const loaded = reloadSettings();
+			expect(loaded.tokendance?.modelCollectionInitialized).toBe(true);
+			expect(loaded.agent.hiddenModels).toHaveLength(66);
+			expect(loaded.agent.hiddenModels).not.toContain("tokendance:kimi-k3");
+			expect(loaded.agent.hiddenModels).toContain("tokendance:glm-5");
+			expect(loaded.agent.modelContextWindows?.["tokendance:glm-5"]).toBe(64000);
+			const edited = structuredClone(loaded);
+			edited.agent.hiddenModels = edited.agent.hiddenModels?.filter(
+				(id) => id !== "tokendance:glm-5",
+			);
+			edited.agent.hiddenModels?.push("tokendance:kimi-k3");
+			if (!edited.tokendance) throw new Error("Expected connected TokenDance settings");
+			edited.tokendance.models = [
+				{
+					id: "future-new-model",
+					name: "Future",
+					context_length: 64000,
+					supported_protocols: ["openai:responses"],
+				},
+			];
+			saveSettings(edited);
+			const again = reloadSettings();
+			expect(again.agent.hiddenModels).not.toContain("tokendance:glm-5");
+			expect(again.agent.hiddenModels).toContain("tokendance:kimi-k3");
+			expect(again.agent.hiddenModels).not.toContain("tokendance:future-new-model");
+			expect(again.agent.modelContextWindows?.["tokendance:glm-5"]).toBe(64000);
+			expect(JSON.parse(readFileSync(path, "utf8")).tokendance.modelCollectionInitialized).toBe(
+				true,
+			);
+		} finally {
+			saveSettings(snapshot);
+			writeFileSync(path, original);
+		}
+	});
+
+	it("first connection save initializes visibility without waiting for a catalog refresh", () => {
+		const snapshot = structuredClone(liveSettings);
+		try {
+			const fresh = getDefaults();
+			fresh.tokendance = { apiKey: "collection-test-key", disabled: false, generation: 1 };
+			saveSettings(fresh);
+			expect(liveSettings.tokendance?.modelCollectionInitialized).toBe(true);
+			expect(liveSettings.agent.hiddenModels).toContain("tokendance:glm-5");
+			expect(liveSettings.agent.hiddenModels).not.toContain("tokendance:glm-5.3");
+		} finally {
+			saveSettings(snapshot);
+		}
+	});
+});
+
 describe("MCP server IDs from raw settings", () => {
 	it("repairs missing, non-string, empty and duplicate IDs without losing configurations", () => {
 		const settings = getDefaults();

@@ -42,6 +42,8 @@ export interface TokenDancePublicConnection {
 	name: string;
 	disabled: boolean;
 	generation: number;
+	/** Process identity for billing retries; not an account credential. */
+	billingInstance?: string;
 	models: TokenDanceCatalogModel[];
 	recoveryAction?: TokenDanceRecoveryAction;
 }
@@ -69,4 +71,46 @@ export interface TokenDanceOAuthComplete {
 export interface TokenDanceDraftRestore {
 	draftSnapshot?: TokenDanceDraftSnapshot;
 	status: "pending" | "completed" | "failed" | "cancelled";
+}
+
+/** Monetary values stay integer micro-CNY (1 CNY = 1,000,000 units). */
+export interface TokenDanceBalance {
+	generation: number;
+	credits: number | null;
+	creditsUsed: number | null;
+	balance: number | null;
+	updatedAt: number | null;
+	loading: boolean;
+	hasError: boolean;
+	recoveryAction?: TokenDanceRecoveryAction;
+}
+
+export type TokenDancePaymentStatus =
+	| "pending"
+	| "paid"
+	| "failed"
+	| "closed"
+	| "refunded"
+	| "expired";
+
+/** Sanitized payment data only; upstream status URL and API Key are server-only. */
+export interface TokenDancePaymentSession {
+	id: string;
+	generation: number;
+	amount: number;
+	status: TokenDancePaymentStatus;
+	paymentUrl: string;
+	alipayUrl?: string;
+	createdAt: number;
+	expiresAt: number;
+	paidAt?: number;
+}
+
+export interface TokenDancePaymentCreate {
+	amount: number;
+	generation: number;
+	/** Reject retries made against another server process after receipt state was lost. */
+	billingInstance: string;
+	/** Stable across retries of one user-confirmed order, never an API credential. */
+	requestId: string;
 }

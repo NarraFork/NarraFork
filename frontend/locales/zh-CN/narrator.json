@@ -1,4 +1,9 @@
 {
+	"tokendanceBalance": "余额 ¥{{balance}}",
+	"tokendanceBalanceUnknown": "余额暂不可用",
+	"tokendanceBalanceDetails": "累计充值 ¥{{credits}}\n已消耗 ¥{{used}}\n剩余 ¥{{balance}}",
+	"tokendanceBalanceStale": "余额可能已过期，请刷新",
+	"tokendanceAdminRechargeRequired": "余额不足，请联系管理员充值",
 	"you": "你",
 	"largeFile": {
 		"size": "文件大小：{{size}}（{{bytes}} 字节）",

@@ -645,6 +645,11 @@ Result preview: {preview}`,
 	"sidecar.emptyResult": {
 		en: "(empty)",
 	},
+	"sidecar.noActiveBackgroundTasks": {
+		en: "[System] There are currently no other active task-type background tasks for this session (background services are excluded); process the completed results and continue any remaining work now instead of ending the turn merely to wait for background tasks.",
+		"zh-CN":
+			"[系统] 当前会话已无其他进行中的任务型后台任务（不含后台服务）；请立即处理已完成的结果并推进剩余工作，不要仅为等待后台任务而结束本轮。",
+	},
 
 	// messages — was: formatParentInboundMessage (parent-inbound-queue.ts) and the
 	// inline team formatter in subagent-executor.ts.

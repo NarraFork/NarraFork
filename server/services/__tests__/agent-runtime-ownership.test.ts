@@ -1,8 +1,15 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "node:events";
 import { eq } from "drizzle-orm";
+import { z } from "zod/v4";
 import { cleanDb, getTestDb } from "../../../tests/setup";
-import { narrators } from "../../db/schema";
+import {
+	fileChangeExecutionSegments,
+	narratorMessageRefs,
+	narratorMessages,
+	narrators,
+	narratorToolCalls,
+} from "../../db/schema";
 import type { ProviderAdapter } from "../../lib/agent/provider";
 import {
 	consumeSearchExecutionTurn,
@@ -192,14 +199,246 @@ describe("publication release respects the runtime inbox wake decision", () => {
 						run.releasePublication?.();
 					}
 				}
-				// The release schedules its dynamic import without awaiting the wake.
-				await new Promise((resolve) => setImmediate(resolve));
+				// Release schedules async backend resolution before waking the inbox. Wait
+				// for that boundary, not one event-loop tick that can leak into the next test.
+				if (allowInboxWake) {
+					await waitUntil(() => wake.mock.calls.some(([id]) => id === CHILD));
+				} else {
+					await new Promise((resolve) => setImmediate(resolve));
+				}
 				expect(getExecutionOwner(CHILD)).toBeUndefined();
 				expect(wake.mock.calls.filter(([id]) => id === CHILD)).toHaveLength(allowInboxWake ? 1 : 0);
 			});
 		}
 	}
 });
+
+describe("continued subagents remain checkpointable during maintenance", () => {
+	const TOOL = "__ContinuedSubagentOrdinaryTest";
+	const coordinator = import("../update-coordinator");
+
+	afterEach(async () => {
+		(await import("../../lib/agent/tool-registry")).toolRegistry.unregister(TOOL);
+		(await coordinator).resetUpdateCoordinationForTests();
+	});
+
+	for (const entry of ["continue", "Send"] as const) {
+		for (const timing of ["paused-before-dispatch", "already-executing"] as const) {
+			test(`${entry}: ${timing} preserves ordinary drain and exactly-once dispatch`, async () => {
+				const update = await coordinator;
+				const { executeTool } = await import("../../lib/agent/tool-executor");
+				const { toolRegistry } = await import("../../lib/agent/tool-registry");
+				const runner = await import("../subagent-runner");
+				const { sendSubagentMessage } = await import("../agent-communication");
+				const entered = Promise.withResolvers<void>();
+				const releaseTool = Promise.withResolvers<void>();
+				const loopFinished = Promise.withResolvers<void>();
+				let executions = 0;
+				let run: Awaited<ReturnType<typeof startContinuedSubagent>> | undefined;
+				spyOn(runner, "startContinuedSubagent").mockImplementation(async (input) => {
+					expect(input.resumableUpdateLease).toBeUndefined();
+					expect(input.updateExecutionLease).toBeUndefined();
+					run = await startContinuedSubagent(input);
+					return run;
+				});
+				toolRegistry.register({
+					name: TOOL,
+					description: "Controlled ordinary tool inside a real continued runner",
+					parameters: z.object({}),
+					execute: async () => {
+						executions++;
+						entered.resolve();
+						await releaseTool.promise;
+						return { output: "ordinary tool finished" };
+					},
+				});
+				// Only model execution and tool receipt callbacks are simulated. The runner,
+				// Send mailbox, tool admission, continuation storage, and update gate are real.
+				const execute = spyOn(passExecutor, "executeAgentLoop").mockImplementation(
+					async ({ config }) => {
+						const now = new Date().toISOString();
+						const toolUse = { toolUseId: "continued-ordinary", name: TOOL, input: {} };
+						const binding = { toolCallId: "continued-tool-row", attempt: 1 };
+						await db.insert(narratorMessages).values({
+							id: "continued-assistant-message",
+							narratorId: CHILD,
+							role: "assistant",
+							contentJson: [],
+							createdAt: now,
+						});
+						await db.insert(narratorToolCalls).values({
+							id: binding.toolCallId,
+							narratorId: CHILD,
+							messageId: "continued-assistant-message",
+							toolUseId: toolUse.toolUseId,
+							toolName: TOOL,
+							inputJson: {},
+							createdAt: now,
+						});
+						if (timing === "paused-before-dispatch") {
+							update.scheduleUpdate("continued-run-test");
+							update.beginQuiescingTools();
+						}
+						const result = await executeTool(toolUse, {
+							narratorId: CHILD,
+							conversationId: config.conversationId,
+							model: config.model,
+							provider: config.provider,
+							cwd: config.cwd,
+							signal: config.signal,
+							permissionHandler: async () => ({ behavior: "allow" }),
+							requireToolCallBinding: true,
+							toolExecutionBindings: new WeakMap([[toolUse, binding]]),
+							onToolExecutionStarting: async (_toolUseId, receipt) => receipt,
+							onToolExecutionFinalAuthorization: async () => ({ assertStillCurrent() {} }),
+						});
+						loopFinished.resolve();
+						return {
+							finalText: result.output,
+							hasError: result.isError ?? false,
+							shouldUpdateTitle: false,
+							completedAssistantTurn: true,
+							completedNaturally: true,
+						};
+					},
+				);
+				await db
+					.update(narrators)
+					.set({ subagentOriginKind: "standalone" })
+					.where(eq(narrators.id, CHILD));
+				try {
+					if (entry === "Send") {
+						const now = new Date().toISOString();
+						await db.insert(narratorMessages).values({
+							id: "sender-message",
+							narratorId: ROOT,
+							role: "assistant",
+							contentJson: [],
+							createdAt: now,
+						});
+						await db.insert(narratorMessageRefs).values({
+							id: "sender-ref",
+							narratorId: ROOT,
+							messageId: "sender-message",
+							seq: 1,
+						});
+						await db.insert(narratorToolCalls).values({
+							id: "sender-tool",
+							narratorId: ROOT,
+							messageId: "sender-message",
+							toolUseId: "send-continuation",
+							toolName: "Send",
+							executionAttempt: 1,
+							executionIdentityVersion: 1,
+							status: "running",
+							createdAt: now,
+						});
+						await db.insert(fileChangeExecutionSegments).values({
+							id: "sender-segment",
+							narratorId: ROOT,
+							sourceToolCallId: "sender-tool",
+							sourceExecutionAttempt: 1,
+							createdAt: now,
+						});
+						await db
+							.update(narratorToolCalls)
+							.set({ executionSegmentId: "sender-segment" })
+							.where(eq(narratorToolCalls.id, "sender-tool"));
+						const sent = await sendSubagentMessage({
+							toolCallBinding: {
+								toolCallId: "sender-tool",
+								attempt: 1,
+								executionSegmentId: "sender-segment",
+							},
+							callerNarratorId: ROOT,
+							id: CHILD,
+							message: "Continue with an ordinary tool",
+							toolUseId: "send-continuation",
+							signal: new AbortController().signal,
+							locale: "en",
+						});
+						expect(run, sent).toBeDefined();
+					} else {
+						run = await runner.startContinuedSubagent({
+							subagentId: CHILD,
+							parentNarratorId: ROOT,
+							toolUseId: "continue-origin",
+							prompt: "Continue with an ordinary tool",
+							locale: "en",
+							signal: new AbortController().signal,
+							initialHistory: [],
+							initialTrailingToolResults: [],
+							skipConclusionDelivery: true,
+						});
+					}
+					expect(run).toBeDefined();
+					if (timing === "paused-before-dispatch") {
+						await waitUntil(() => update.getUpdateCoordinationStatus().pausedToolCount === 1);
+						expect(executions).toBe(0);
+						expect(update.getUpdateCoordinationStatus()).toMatchObject({
+							pendingOrdinaryExecutionCount: 0,
+							resumableExecutionCount: 1,
+						});
+						const { toolContinuationService } = await import("../tool-continuation-service");
+						const epoch = update.getUpdateCoordinationStatus().updateEpoch;
+						expect(epoch).toBeString();
+						expect(await toolContinuationService.listByEpoch(epoch ?? "")).toContainEqual(
+							expect.objectContaining({
+								toolCallId: "continued-tool-row",
+								narratorId: CHILD,
+								kind: "deferred_tool",
+								state: "paused",
+							}),
+						);
+						await update.waitForOrdinaryToolDrain();
+						// Cancelling maintenance reopens the gate; the pending tool runs once.
+						update.cancelScheduledUpdate("continued-run-test cancellation");
+						update.failScheduledUpdate("continued-run-test cancellation", { cancelled: true });
+						await entered.promise;
+						expect(executions).toBe(1);
+					} else {
+						await entered.promise;
+						update.scheduleUpdate("continued-run-test");
+						update.beginQuiescingTools();
+						expect(update.getUpdateCoordinationStatus()).toMatchObject({
+							pendingOrdinaryExecutionCount: 1,
+							resumableExecutionCount: 1,
+						});
+						let drained = false;
+						const drain = update.waitForOrdinaryToolDrain().then(() => {
+							drained = true;
+						});
+						await new Promise((resolve) => setImmediate(resolve));
+						expect(drained).toBe(false);
+						releaseTool.resolve();
+						await drain;
+						expect(drained).toBe(true);
+						update.cancelScheduledUpdate("continued-run-test cancellation");
+						update.failScheduledUpdate("continued-run-test cancellation", { cancelled: true });
+					}
+					releaseTool.resolve();
+					await loopFinished.promise;
+					await run?.terminalCompletion;
+					expect(executions).toBe(1);
+					expect(execute).toHaveBeenCalledTimes(1);
+					expect(update.getUpdateCoordinationStatus().resumableExecutionCount).toBe(0);
+				} finally {
+					releaseTool.resolve();
+					if (update.isUpdateScheduled()) update.failScheduledUpdate("continued-run-test cleanup");
+					await run?.terminalCompletion;
+				}
+			});
+		}
+	}
+});
+
+async function waitUntil(predicate: () => boolean) {
+	const deadline = Date.now() + 2_000;
+	while (!predicate()) {
+		if (Date.now() >= deadline) throw new Error("Timed out waiting for subagent runtime boundary");
+		await new Promise((resolve) => setTimeout(resolve, 1));
+	}
+}
 
 describe("shared execution owner through real entry adapters", () => {
 	for (const first of ["primary", "subagent"] as const) {

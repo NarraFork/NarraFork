@@ -55,6 +55,7 @@ import {
 import { resolveInjectedDevices } from "../lib/device-injection-trait";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { hotSafe } from "../lib/hot-safe";
+import { t } from "../lib/i18n";
 import { InjectionCadence } from "../lib/injection-cadence";
 import { logger } from "../lib/logger";
 import { getBlockedSkills, getDisabledToolSet } from "../lib/narrator-custom-traits";
@@ -2118,6 +2119,16 @@ export async function deliverPendingInjection(
 		id: string,
 		options: import("./narrator-injection").DeliverInjectionOptions,
 	) => deliverInboxInjection(id, options, entry.mailboxClaim);
+	const withBackgroundCompletionHint = async (content: string, status: string) => {
+		if (status !== "completed") return content;
+		// Read at delivery time, not publication time: other work may have finished
+		// or started while this notice was waiting in the mailbox. Services do not
+		// keep task work pending; use the same effective-state count as the task panel.
+		const { activeWorkCount } = await backgroundTaskService.countActiveKindsByParent(narratorId);
+		return activeWorkCount === 0
+			? `${content}\n\n${t("sidecar.noActiveBackgroundTasks", locale)}`
+			: content;
+	};
 	const claim = entry.mailboxClaim;
 	// The refs port decides the dialect. PostgreSQL: `deliverInboxInjection` drives the
 	// queue's own materialize section (message + ref + mailbox flip in one transaction),
@@ -2169,7 +2180,10 @@ export async function deliverPendingInjection(
 			);
 			// Completion is useful at either boundary only when it includes the result.
 			// Keep the bounded snapshot in the injected history, not just the UI sidecar.
-			const content = formatBackgroundCompletionNotifications([task], { includeResult: true });
+			const content = await withBackgroundCompletionHint(
+				formatBackgroundCompletionNotifications([task], { includeResult: true }),
+				task.status,
+			);
 			const { turnText } = await deliverInjection(narratorId, {
 				...placement,
 				content,
@@ -2194,11 +2208,13 @@ export async function deliverPendingInjection(
 			];
 			// `sideCarBodyWithText` renders the model-facing text from the SAME body in one
 			// call, which is what keeps the two projections from drifting apart.
-			const { body, content } = sideCarBodyWithText(
+			const projected = sideCarBodyWithText(
 				"bg_bash",
 				{ kind: "tasksDone", flavor: "bash", items },
 				locale,
 			);
+			const body = projected.body;
+			const content = await withBackgroundCompletionHint(projected.content, bashTask.status);
 			const { turnText } = await deliverInjection(narratorId, {
 				...placement,
 				content,

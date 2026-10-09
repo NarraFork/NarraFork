@@ -83,6 +83,7 @@ import {
 } from "../../hooks/usePlatform";
 import { useSpecTasks } from "../../hooks/useSpec";
 import { useNarratorTerminals } from "../../hooks/useTerminals";
+import { useTokenDanceBalance } from "../../hooks/useTokenDanceBalance";
 import { useUpdateUserPreferences, useUserPreferences } from "../../hooks/useUserPreferences";
 import {
 	useUpdateExecutionDevice,
@@ -105,6 +106,7 @@ import {
 	SAFE_AREA_DRAWER_BODY_STYLE,
 	safeAreaDrawerBodyHeight,
 } from "../../lib/safe-area";
+import { openTokenDanceRecharge } from "../../lib/tokendance-recovery";
 import { Z } from "../../lib/z-index";
 import { useConfirmDialog } from "../common/confirm-dialog-context";
 import { SelectionPopover } from "../common/SelectionPopover";
@@ -177,6 +179,7 @@ import {
 	isKimiProviderBaseUrl,
 } from "./model/kimi-usage-format";
 import { NugRechargeDialog } from "./model/NugRechargeDialog";
+import { tokenDanceQuotaView } from "./model/tokendance-quota-format";
 import { useNarratorQuota } from "./model/use-narrator-quota";
 import { useNugQuota } from "./model/use-nug-quota";
 import { NarratorInteractionArea } from "./NarratorInteractionArea";
@@ -662,6 +665,21 @@ function NarratorPanelBody({
 	// derived provider info). Kept lifted here because the derived info feeds the
 	// shared `useNarratorPanelWS` below and the payment-required recharge logic.
 	const nugProviderInfo = useNugQuota(resolvedModel, settingsData?.nugProviders);
+	const tokenDanceConnection = settingsData?.tokendance;
+	const tokenDanceGeneration =
+		resolvedModel?.startsWith("tokendance:") &&
+		tokenDanceConnection?.connected &&
+		!tokenDanceConnection.disabled &&
+		Number.isSafeInteger(tokenDanceConnection.generation)
+			? (tokenDanceConnection.generation as number)
+			: undefined;
+	const tokenDanceBalanceQuery = useTokenDanceBalance(tokenDanceGeneration);
+	const tokenDanceQuota = tokenDanceQuotaView(
+		tokenDanceBalanceQuery.data,
+		tokenDanceGeneration,
+		currentUser?.role === "admin",
+		t,
+	);
 
 	// Kimi (kimi.com / kimi.ai) usage quotas — server keeps one global cache per
 	// provider; GET triggers a stale-while-revalidate refresh upstream. The query
@@ -3365,12 +3383,21 @@ function NarratorPanelBody({
 								onSetAsSummaryModel: handleSetSummaryModel,
 							},
 							quota: {
-								balance: quotaBalance,
-								detailsText: quotaDetailsText,
-								hasDetailsPopover: hasQuotaDetailsPopover,
+								balance: tokenDanceQuota?.balance ?? quotaBalance,
+								detailsText: tokenDanceQuota?.detailsText ?? quotaDetailsText,
+								hasDetailsPopover: tokenDanceQuota?.hasDetailsPopover ?? hasQuotaDetailsPopover,
 								shouldShowNugRechargeButton,
 								shouldShowNugRechargeInQuotaDetails,
 								onOpenNugRecharge: openNugRecharge,
+								...(tokenDanceQuota
+									? {
+											recharge: {
+												showButton: tokenDanceQuota.showRechargeButton,
+												showInDetails: tokenDanceQuota.showRechargeInDetails,
+												onOpen: openTokenDanceRecharge,
+											},
+										}
+									: {}),
 							},
 							relaxedPlan: {
 								enabled: relaxedPlanEnabled,

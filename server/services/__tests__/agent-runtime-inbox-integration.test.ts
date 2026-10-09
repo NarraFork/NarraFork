@@ -2,6 +2,7 @@ import { afterAll, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import {
+	backgroundTasks,
 	fileChangeExecutionSegments,
 	narratorBufferedMessages,
 	narratorMessageRefs,
@@ -628,6 +629,115 @@ test("real parent after-tools notice callback is the adoption boundary, includin
 	expect(state(row.id)?.adoptedAt).not.toBeNull();
 	expect(state(row.id)?.adoptedRevision).toBe(1);
 });
+
+for (const kind of ["bg_agent", "bg_bash"] as const) {
+	for (const mode of ["busy", "idle"] as const) {
+		test(`${kind} ${mode} completion hints only when task work is exhausted`, async () => {
+			const { t } = await import("../../lib/i18n");
+			const hint = t("sidecar.noActiveBackgroundTasks", "en");
+			const entry = {
+				kind,
+				task: {
+					id: "finished",
+					type: "bash" as const,
+					alias: "finished",
+					title: "Finished work",
+					status: "completed",
+					result: "saved result",
+					resultPreview: "saved result",
+					outputPreview: "saved result",
+				},
+			};
+			const deliver = (locale: "en" | "zh-CN" = "en") =>
+				deliverPendingInjection("parent", locale, mode, "none", entry);
+			const seed = (id: string, parentNarratorId: string, backgroundKind: "task" | "service") =>
+				db
+					.insert(backgroundTasks)
+					.values({
+						id,
+						parentNarratorId,
+						backgroundKind,
+						type: "bash",
+						status: "running",
+						startedAt: time,
+						createdAt: time,
+						updatedAt: time,
+					})
+					.run();
+
+			// A different session's task and this session's long-lived service do not block it.
+			db.insert(narrators)
+				.values({ id: "unrelated", variant: "primary", createdAt: time, updatedAt: time })
+				.run();
+			seed("other-task", "unrelated", "task");
+			seed("dev-server", "parent", "service");
+			expect((await deliver())?.endsWith(hint)).toBe(true);
+			expect(
+				(await deliver("zh-CN"))?.endsWith(t("sidecar.noActiveBackgroundTasks", "zh-CN")),
+			).toBe(true);
+			const persisted = db
+				.select()
+				.from(narratorMessages)
+				.where(eq(narratorMessages.narratorId, "parent"))
+				.all();
+			expect(persisted.some((row) => row.contentText?.endsWith(hint))).toBe(true);
+
+			seed("remaining-task", "parent", "task");
+			expect(await deliver()).not.toContain(hint);
+			db.update(backgroundTasks)
+				.set({ status: "completed" })
+				.where(eq(backgroundTasks.id, "remaining-task"))
+				.run();
+			expect((await deliver())?.endsWith(hint)).toBe(true);
+			// A still-running subagent blocks the hint too, including legacy agents without task rows.
+			db.update(narrators)
+				.set({ status: "working", isBackground: true, backgroundStatus: "running" })
+				.where(eq(narrators.id, "child"))
+				.run();
+			expect(await deliver()).not.toContain(hint);
+			db.update(narrators)
+				.set({ status: "idle", backgroundStatus: "completed" })
+				.where(eq(narrators.id, "child"))
+				.run();
+			expect((await deliver())?.endsWith(hint)).toBe(true);
+			// Taken-over agents remain outstanding even when parked idle and their
+			// historical task row is terminal. Cover legacy and registered agents.
+			for (const registered of [false, true]) {
+				if (registered) {
+					db.insert(backgroundTasks)
+						.values({
+							id: "child-task",
+							parentNarratorId: "parent",
+							type: "agent",
+							subagentNarratorId: "child",
+							status: "completed",
+							startedAt: time,
+							createdAt: time,
+							updatedAt: time,
+						})
+						.run();
+				}
+				for (const status of ["idle", "working", "waiting"] as const) {
+					db.update(narrators)
+						.set({ status, isBackground: false, substatus: JSON.stringify(["taken_over"]) })
+						.where(eq(narrators.id, "child"))
+						.run();
+					expect(await deliver()).not.toContain(hint);
+				}
+				// Releasing takeover and returning the result finally exhausts the work.
+				db.update(narrators)
+					.set({ status: "idle", substatus: "[]", backgroundStatus: "completed" })
+					.where(eq(narrators.id, "child"))
+					.run();
+				expect((await deliver())?.endsWith(hint)).toBe(true);
+			}
+			for (const status of ["started", "running", "failed", "cancelled", "timeout"]) {
+				entry.task.status = status;
+				expect(await deliver()).not.toContain(hint);
+			}
+		});
+	}
+}
 
 test("immutable bounded notice snapshot ignores later edits and never parses oversized originals", async () => {
 	const store = createPublicationOutbox(db);

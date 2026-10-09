@@ -3,8 +3,10 @@ import { createInstance } from "i18next";
 import { parseHTML } from "linkedom";
 import { act } from "react";
 import type { Root } from "react-dom/client";
+import { ApiError } from "../../lib/api";
 import settingsEn from "../../locales/en/settings.json";
 import settingsZhCn from "../../locales/zh-CN/settings.json";
+import { TokenDanceAddContext } from "./provider-add-context";
 import type { AddProviderDraft } from "./provider-add-draft";
 import { PROVIDER_PRESETS } from "./provider-presets";
 
@@ -197,6 +199,64 @@ async function submit() {
 }
 
 describe("AddProviderPage interactions", () => {
+	for (const [error, key] of [
+		[new ApiError("secret request body", 404), "loginBackendUnavailable"],
+		[new ApiError("secret request body", 400), "loginStartFailed"],
+		[new ApiError("secret request body", 401), "loginStartFailed"],
+		[new ApiError("secret request body", 502), "loginStartFailed"],
+		[
+			new ApiError("secret request body", 400, { code: "TOKENDANCE_CALLBACK_INVALID" }),
+			"loginCallbackInvalid",
+		],
+		[
+			new ApiError("secret request body", 409, { code: "TOKENDANCE_PREFIX_CONFLICT" }),
+			"prefixConflict",
+		],
+		[new Error("secret request body"), "loginStartClientFailed"],
+	] as const) {
+		for (const language of ["en", "zh-CN"] as const) {
+			test(`TokenDance start failure is actionable and redacted (${language}, ${key}, ${error instanceof ApiError ? error.status : "client"})`, async () => {
+				await act(async () => {
+					await i18n.changeLanguage(language);
+				});
+				let calls = 0;
+				await act(async () => {
+					root?.render(
+						<I18nextProvider i18n={i18n}>
+							<MantineProvider env="test">
+								<TokenDanceAddContext
+									value={{
+										login: async () => {
+											calls++;
+											throw error;
+										},
+									}}
+								>
+									<AddProviderPage onClose={() => closeCount++} onAdd={addHandler} />
+								</TokenDanceAddContext>
+							</MantineProvider>
+						</I18nextProvider>,
+					);
+				});
+				await click(preset("TokenDance"));
+				await click(button("tokendance.login"));
+				const alert = container.querySelector('[role="alert"]');
+				expect(alert?.textContent).toContain(
+					i18n.t(`tokendance.${key}`, {
+						status: error instanceof ApiError ? error.status : undefined,
+					}),
+				);
+				expect(alert?.textContent).not.toContain(i18n.t("tokendance.loginFailed"));
+				expect(container.textContent).not.toContain("secret request body");
+				expect(calls).toBe(1);
+				expect(button("tokendance.login").disabled).toBe(false);
+				expect(closeCount).toBe(0);
+				expect(added).toEqual([]);
+				await click(button("tokendance.login"));
+				expect(calls).toBe(2);
+			});
+		}
+	}
 	test("a save rejection keeps the form and key available for a successful retry", async () => {
 		await click(preset("OpenAI"));
 		await type("addProviderApiKey", "retained-on-error");

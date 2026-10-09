@@ -130,7 +130,7 @@ if (process.env[CHILD_ENV] !== "1") {
 		settings.agent.defaultModel = A;
 		settings.agent.defaultReasoningEffort = "low";
 		settings.agent.subagentModels = { explore: "", plan: "", search: "", review: "" };
-		settings.agent.subagentAllowedModels = { explore: [A, B, C], plan: [], general: [A, B, C] };
+		settings.agent.subagentAllowedModels = { explore: [], plan: [], general: [] };
 		settings.agent.subagentModelReasoningEfforts = {};
 		const now = new Date().toISOString();
 		await db.insert(narrators).values({
@@ -324,7 +324,7 @@ if (process.env[CHILD_ENV] !== "1") {
 
 		test("parent outside the pool falls back legally, stores inheritance, then follows a newly allowed parent", async () => {
 			settings.agent.subagentAllowedModels.general = [A];
-			const child = await spawn();
+			const child = await create();
 			await narratorService.updateModel(PARENT, B);
 			settings.agent.subagentAllowedModels.general = [C];
 			await drive(child.id);
@@ -334,31 +334,64 @@ if (process.env[CHILD_ENV] !== "1") {
 				model: C,
 				inheritance: { source: "pool-fallback", model: C, parentModel: B, poolKey: "general" },
 			});
-			const second = await spawn();
+			const second = await create();
+			await drive(second.id);
 			await assertRun(second.id, C);
 			settings.agent.subagentAllowedModels.general = [C, B];
 			await drive(second.id);
 			await assertRun(second.id, B);
 		});
 
-		test("fallback skips the global default and uses the pool's first entry", async () => {
-			// Global default A is in the pool, but it is not what the pool author chose first.
+		for (const background of [false, true]) {
+			for (const poolSource of ["settings", "traits"] as const) {
+				test(`${background ? "background" : "foreground"}: ${poolSource} pool's first entry beats an allowed parent and type preference`, async () => {
+					settings.agent.subagentModels.explore = B;
+					if (poolSource === "settings") {
+						settings.agent.subagentAllowedModels.explore = [C, A, B];
+					} else {
+						const traits = upsertEncodedTrait([], SUBAGENT_MODEL_RESTRICTION_TRAIT_PREFIX, {
+							version: 1,
+							pools: {
+								explore: [{ model: C, reasoningEffort: "max" }, { model: A }, { model: B }],
+							},
+						});
+						await db.update(narrators).set({ traits }).where(eq(narrators.id, PARENT));
+					}
+					const child = await spawn({ subagentType: "explore", background });
+					await assertRun(child.id, C, C);
+					if (poolSource === "traits") {
+						expect(configs.at(-1)?.reasoningEffort).toBe("max");
+					}
+					await narratorService.updateModel(PARENT, B);
+					await drive(child.id, "resume");
+					await assertRun(child.id, C, C);
+					const explicit = await spawn({ subagentType: "explore", background, model: A });
+					await assertRun(explicit.id, A, A);
+					await expect(
+						spawn({ subagentType: "explore", model: "anthropic:not-allowed" }),
+					).rejects.toThrow("No candidate model");
+				});
+			}
+		}
+
+		test("pool default skips a disallowed parent and global default without an inheritance warning", async () => {
 			settings.agent.subagentAllowedModels.general = [C, A];
 			await narratorService.updateModel(PARENT, B);
 			const child = await spawn();
-			await assertRun(child.id, C);
-			const resolved = await resolveSubagentModelForRun(await narratorService.getById(child.id));
-			expect(resolved.inheritance).toEqual({
-				source: "pool-fallback",
+			await assertRun(child.id, C, C);
+			expect(await resolveSubagentModelForRun(await narratorService.getById(child.id))).toEqual({
+				modelRef: C,
 				model: C,
-				parentModel: B,
-				poolKey: "general",
 			});
 		});
 
-		test("follow result is reported to the card and fallback is explained to the parent", async () => {
-			const { getRecentSubagentModelInheritance } = await import("../subagent-model");
-			const followed = await spawn();
+		test("legacy follow result is reported to the card and fallback is explained to the parent", async () => {
+			const { getRecentSubagentModelInheritance, formatSubagentModelFallbackNote } = await import(
+				"../subagent-model"
+			);
+			settings.agent.subagentAllowedModels.general = [A, B];
+			const followed = await create();
+			await drive(followed.id);
 			const start = broadcasts.filter(({ event }) => event.type === "subagent_started").at(-1);
 			expect(start?.event.modelInheritance).toEqual({
 				source: "parent",
@@ -367,19 +400,11 @@ if (process.env[CHILD_ENV] !== "1") {
 				poolKey: "general",
 			});
 			expect(getRecentSubagentModelInheritance(followed.id)?.source).toBe("parent");
-
 			settings.agent.subagentAllowedModels.general = [C];
-			const output = await runSubagent({
-				parentNarratorId: PARENT,
-				toolUseId: TOOL,
-				subagentType: "general",
-				prompt: "Return without using tools.",
-				cwd: process.env.HOME as string,
-				signal: new AbortController().signal,
-				locale: "en",
-			});
-			expect(output).toContain(`the parent model "${A}" is not in the allowed "general"`);
-			expect(output).toContain(`ran on "${C}" instead`);
+			await drive(followed.id);
+			const note = formatSubagentModelFallbackNote(getRecentSubagentModelInheritance(followed.id));
+			expect(note).toContain(`the parent model "${A}" is not in the allowed "general"`);
+			expect(note).toContain(`ran on "${C}" instead`);
 		});
 
 		test("reasoning effort: pool tier > child override > parent override > default", async () => {
@@ -423,14 +448,14 @@ if (process.env[CHILD_ENV] !== "1") {
 			expect(configs.at(-1)).toMatchObject({ narratorId: pinned.id, reasoningEffort: "high" });
 		});
 
-		test("a rejected type preference does not pin a fallback child", async () => {
+		test("a rejected type preference uses and pins the pool default", async () => {
 			settings.agent.subagentModels.explore = C;
 			settings.agent.subagentAllowedModels.explore = [A, B];
 			const child = await spawn({ subagentType: "explore" });
-			await assertRun(child.id, A);
+			await assertRun(child.id, A, A);
 			await narratorService.updateModel(PARENT, B);
 			await drive(child.id);
-			await assertRun(child.id, B);
+			await assertRun(child.id, A, A);
 		});
 
 		test("a later type preference does not replace a following child's parent", async () => {

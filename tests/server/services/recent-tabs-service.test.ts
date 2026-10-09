@@ -24,6 +24,7 @@ mock.module("../../../server/websocket/narrator-ws", () => ({
 }));
 
 const recentTabs = await import("../../../server/services/recent-tabs-service");
+const { reduceRecentTabsOperations } = await import("../../../frontend/hooks/useRecentTabs");
 
 const NOW = "2026-07-19T00:00:00.000Z";
 
@@ -201,6 +202,91 @@ describe("recent-tabs revisions and deltas", () => {
 			makeTab("n-2", { title: "Revisited", lastVisitedAt: 99_999 }),
 		);
 		expect(storedKeys()).toEqual(["narrator:n-1", "narrator:n-2"]);
+	});
+
+	it("anchors metadata deltas within the tab's own section", async () => {
+		seedLegacyTabs([
+			makeTab("n-1"),
+			makeTab("p-1", { type: "project" }),
+			makeTab("n-2"),
+			makeTab("p-2", { type: "project" }),
+			makeTab("n-3"),
+		]);
+		await recentTabs.ensureMigrated("user-1");
+
+		const result = await recentTabs.upsertRecentTab("user-1", makeTab("n-2", { title: "Renamed" }));
+
+		expect(result.operations).toEqual([
+			{
+				type: "upsert",
+				key: "narrator:n-2",
+				tab: makeTab("n-2", { title: "Renamed" }),
+				beforeKey: "narrator:n-3",
+				afterKey: "narrator:n-1",
+			},
+		]);
+	});
+
+	it("marks the first row of a section with a null predecessor", async () => {
+		seedLegacyTabs([makeTab("p-1", { type: "project" }), makeTab("n-1"), makeTab("n-2")]);
+		await recentTabs.ensureMigrated("user-1");
+
+		const result = await recentTabs.upsertRecentTab("user-1", makeTab("n-1", { title: "Renamed" }));
+
+		expect(result.operations).toHaveLength(1);
+		expect(result.operations[0]).toMatchObject({
+			key: "narrator:n-1",
+			beforeKey: "narrator:n-2",
+			afterKey: null,
+		});
+	});
+
+	it("includes displaced block members when constructing sequential moves", async () => {
+		seedLegacyTabs([makeTab("a"), makeTab("b"), makeTab("c"), makeTab("d")]);
+		await recentTabs.ensureMigrated("user-1");
+
+		const result = await recentTabs.restoreRecentTabs("user-1", {
+			tabs: [makeTab("c"), makeTab("d"), makeTab("a"), makeTab("b")],
+		});
+
+		expect(storedKeys()).toEqual(["narrator:c", "narrator:d", "narrator:a", "narrator:b"]);
+		expect(result.operations).toEqual([
+			{ type: "move", key: "narrator:c", beforeKey: "narrator:d", afterKey: null },
+			{ type: "move", key: "narrator:d", beforeKey: "narrator:a", afterKey: "narrator:c" },
+		]);
+	});
+
+	it("replays server deltas to the persisted order across mixed-section workspace permutations", async () => {
+		const blocks = [
+			[makeTab("p-1", { type: "project" })],
+			[makeTab("n-1")],
+			[makeTab("ws-1", { type: "workspace" }), makeTab("child-1", { workspaceId: "ws-1" })],
+			[makeTab("ws-2", { type: "workspace" }), makeTab("child-2", { workspaceId: "ws-2" })],
+		];
+		function permutations<T>(items: T[]): T[][] {
+			if (items.length === 0) return [[]];
+			return items.flatMap((item, index) =>
+				permutations(items.filter((_, otherIndex) => index !== otherIndex)).map((rest) => [
+					item,
+					...rest,
+				]),
+			);
+		}
+		seedLegacyTabs(blocks.flat());
+		await recentTabs.ensureMigrated("user-1");
+
+		for (const order of permutations(blocks)) {
+			const before = await recentTabs.listAllRecentTabs("user-1");
+			const result = await recentTabs.restoreRecentTabs("user-1", { tabs: order.flat() });
+			const persisted = await recentTabs.listAllRecentTabs("user-1");
+			for (const section of ["projects", "work"] as const) {
+				const belongs = (tab: PersistedRecentTab) =>
+					(tab.type === "project") === (section === "projects");
+				expect(
+					reduceRecentTabsOperations(before.filter(belongs), section, result.operations),
+				).toEqual(persisted.filter(belongs));
+			}
+		}
 	});
 
 	it("atomically batch-upserts a workspace header and children with one revision", async () => {
@@ -796,6 +882,7 @@ describe("recent-tabs workspace member anchored moves", () => {
 				it(`moves ${source} ${position} ${anchor} without changing membership`, async () => {
 					await seedWorkspace();
 					const membership = storedMembership();
+					const before = await recentTabs.listAllRecentTabs("user-1");
 					const expectedMembers = memberIds.filter((id) => id !== source);
 					const target = expectedMembers.indexOf(anchor) + (position === "after" ? 1 : 0);
 					expectedMembers.splice(target, 0, source);
@@ -815,6 +902,15 @@ describe("recent-tabs workspace member anchored moves", () => {
 						"narrator:n-tail",
 					]);
 					expect(storedMembership()).toEqual(membership);
+					expect(
+						reduceRecentTabsOperations(
+							before.filter((tab) => tab.type !== "project"),
+							"work",
+							result.operations,
+						),
+					).toEqual(
+						(await recentTabs.listAllRecentTabs("user-1")).filter((tab) => tab.type !== "project"),
+					);
 					const changed = expectedMembers.some((id, index) => id !== memberIds[index]);
 					expect(result.changed).toBe(changed);
 				});

@@ -24,6 +24,9 @@ import { TOKENDANCE_FLOW_MARKER, tokenDanceDraftSnapshot } from "./tokendance-fl
 // Application/settings shells are minimal fixtures, not the production auth layout.
 const undoDom: Array<() => void> = [];
 const animationFrames = new Set<ReturnType<typeof setTimeout>>();
+const windowTimeouts = new Set<ReturnType<typeof setTimeout>>();
+const nativeSetTimeout = globalThis.setTimeout;
+const nativeClearTimeout = globalThis.clearTimeout;
 function installDom() {
 	const { window } = parseHTML("<!doctype html><html><head></head><body></body></html>");
 	function patch(object: object, key: string, value: unknown) {
@@ -33,6 +36,24 @@ function installDom() {
 			old ? Object.defineProperty(object, key, old) : Reflect.deleteProperty(object, key),
 		);
 	}
+	// Mantine transitions also use window timers after their animation frames.
+	// Own both so an unmount/remount cannot leave callbacks using removed globals.
+	patch(window, "setTimeout", ((
+		callback: (...args: unknown[]) => void,
+		delay?: number,
+		...args: unknown[]
+	) => {
+		const id = nativeSetTimeout(() => {
+			windowTimeouts.delete(id);
+			callback(...args);
+		}, delay);
+		windowTimeouts.add(id);
+		return id;
+	}) as typeof setTimeout);
+	patch(window, "clearTimeout", ((id: ReturnType<typeof setTimeout>) => {
+		windowTimeouts.delete(id);
+		nativeClearTimeout(id);
+	}) as typeof clearTimeout);
 	patch(window.document, "oninput", null);
 	patch(window.document, "fonts", { addEventListener() {}, removeEventListener() {} });
 	patch(window.HTMLElement.prototype, "scrollIntoView", () => {});
@@ -111,6 +132,8 @@ function restoreDom() {
 	// Drain every fixture-owned frame before removing the browser globals.
 	for (const id of animationFrames) clearTimeout(id);
 	animationFrames.clear();
+	for (const id of windowTimeouts) nativeClearTimeout(id);
+	windowTimeouts.clear();
 	for (const undo of undoDom.splice(0).reverse()) undo();
 }
 installDom();
@@ -126,6 +149,10 @@ const nugSection = await import("./NUGProvidersSection");
 const { api, ApiError } = await import("../../lib/api");
 const { Route: parentFileRoute } = await import("../../routes/settings/providers");
 const { Route: addFileRoute } = await import("../../routes/settings/providers.add");
+const { Route: callbackFileRoute } = await import(
+	"../../routes/settings/providers.tokendance.callback"
+);
+const tokenDanceFlow = await import("./tokendance-flow");
 restoreDom();
 
 const initialSettings = {
@@ -210,8 +237,13 @@ function makeRouter(href: string) {
 		path: "add",
 		component: addFileRoute.options.component,
 	});
+	const callback = createRoute({
+		getParentRoute: () => providers,
+		path: "tokendance/callback",
+		component: callbackFileRoute.options.component,
+	});
 	return createRouter({
-		routeTree: app.addChildren([settings.addChildren([providers.addChildren([add])])]),
+		routeTree: app.addChildren([settings.addChildren([providers.addChildren([add, callback])])]),
 		history: createMemoryHistory({ initialEntries: [href] }),
 		defaultPendingMinMs: 0,
 	});
@@ -874,6 +906,71 @@ describe("provider add nested route", () => {
 		expect(saveCalls).toBe(0);
 	});
 
+	test("successful TokenDance callback opens its detail with unified hide/show model controls", async () => {
+		serverSettings = {
+			...clone(initialSettings),
+			agent: { hiddenModels: ["existing:keep"], disabledProviders: [] },
+			tokendance: {
+				connected: true,
+				name: "TokenDance fresh",
+				disabled: false,
+				generation: 1,
+				models: [
+					{
+						id: "raw:model",
+						name: "Platform model",
+						context_length: 64000,
+						supported_protocols: ["openai:responses"],
+					},
+					{
+						id: "second",
+						name: "Second model",
+						context_length: 32000,
+						supported_protocols: ["anthropic:messages"],
+					},
+				],
+			},
+		};
+		queryClient.setQueryData(["admin", "settings"], serverSettings);
+		const complete = spyOn(tokenDanceFlow, "completeTokenDanceCallback").mockResolvedValue(true);
+		restorers.push(() => complete.mockRestore());
+		await mount("/settings/providers/tokendance/callback");
+		await act(async () => {
+			await new Promise((resolve) => setTimeout(resolve, 30));
+		});
+		expect(router.state.location.pathname).toBe("/settings/providers");
+		expect(router.state.location.search).toMatchObject({ provider: "tokendance" });
+		expect(container.textContent).toContain("tokendance:raw:model");
+		expect(container.textContent).toContain("Platform model");
+		const modelRow = () =>
+			[...container.querySelectorAll("p")].find(
+				(node) => node.textContent === "tokendance:raw:model",
+			)?.parentElement;
+		expect(modelRow()?.querySelector("input")?.value).toContain("64");
+		// The unified row contains NumberInput controls and model testing; its last button toggles visibility.
+		const rowButtons = modelRow()?.querySelectorAll<HTMLButtonElement>("button");
+		const visibility = rowButtons?.item(rowButtons.length - 1);
+		if (!visibility) throw new Error("Missing unified visibility control");
+		await click(visibility);
+		expect(modelRow()?.style.opacity).toBe("0.5");
+		await click(button("unsavedSave"));
+		expect((savedPayloads.at(-1)?.agent as { hiddenModels: string[] }).hiddenModels).toEqual(
+			expect.arrayContaining(["existing:keep", "tokendance:raw:model"]),
+		);
+		const list = modelRow()?.parentElement;
+		const batch = list?.querySelector<HTMLButtonElement>("button");
+		if (!batch) throw new Error("Missing unified batch visibility control");
+		await click(batch);
+		await click(button("unsavedSave"));
+		expect((savedPayloads.at(-1)?.agent as { hiddenModels: string[] }).hiddenModels).toEqual(
+			expect.arrayContaining(["existing:keep", "tokendance:raw:model", "tokendance:second"]),
+		);
+		await click(batch);
+		await click(button("unsavedSave"));
+		expect((savedPayloads.at(-1)?.agent as { hiddenModels: string[] }).hiddenModels).toEqual([
+			"existing:keep",
+		]);
+	});
 	test("successful TokenDance refresh clears transient recovery action at the same generation", async () => {
 		serverSettings = {
 			...clone(initialSettings),

@@ -1039,6 +1039,12 @@ async function _runInBackground(
 	if (ctx.updateExecutionLease && !updateLeaseTransferred) {
 		throw new Error("Background Bash could not transfer its update execution lease");
 	}
+	let updateLeaseReleased = false;
+	const releaseUpdateLease = () => {
+		if (!updateLeaseTransferred || updateLeaseReleased) return;
+		updateLeaseReleased = true;
+		ctx.updateExecutionLease?.release();
+	};
 
 	// Fire-and-forget: spawn the process and collect output asynchronously
 	(async () => {
@@ -1116,6 +1122,12 @@ async function _runInBackground(
 				}
 			}, WATCHDOG_INTERVAL_MS);
 
+			// Services are intentionally long-lived: drain their startup handoff, not their
+			// entire lifetime. The durable task and cancellation/output/exit monitoring now
+			// exist, so maintenance may proceed without marking the service completed or
+			// stopping it. Finite tasks still hold the lease through result persistence.
+			if (backgroundKind === "service") releaseUpdateLease();
+
 			let resolvedExitCode: number | null;
 			try {
 				resolvedExitCode = await handle.exited;
@@ -1177,7 +1189,7 @@ async function _runInBackground(
 				await backgroundTaskService.markFailed(taskId, error);
 			}
 		} finally {
-			if (updateLeaseTransferred) ctx.updateExecutionLease?.release();
+			releaseUpdateLease();
 		}
 	})();
 

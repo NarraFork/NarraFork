@@ -57,6 +57,7 @@ await i18n.init({
 				tokendanceRecoveryQuota: "Wait for the quota to reset or authorize a new key.",
 				tokendanceRecoveryAdminRequired: "Contact your administrator.",
 				tokendanceRecoveryOpenWebsite: "Open TokenDance",
+				tokendanceRechargeTitle: "Top up TokenDance",
 				tokendanceRecoveryManage: "Manage connection",
 				tokendanceRecoveryDismiss: "Later",
 			},
@@ -67,12 +68,14 @@ let root: Root;
 let container: HTMLElement;
 let managed = 0;
 let closed = 0;
+let recharged = 0;
 beforeEach(() => {
 	container = document.createElement("div");
 	document.body.appendChild(container);
 	root = createRoot(container);
 	managed = 0;
 	closed = 0;
+	recharged = 0;
 });
 afterEach(async () => {
 	await act(() => root.unmount());
@@ -94,6 +97,7 @@ async function render(action: TokenDanceRecoveryAction, admin = true) {
 						admin={admin}
 						onManage={() => managed++}
 						onClose={() => closed++}
+						onRecharge={() => recharged++}
 					/>
 				</MantineProvider>
 			</I18nextProvider>,
@@ -124,11 +128,12 @@ describe("TokenDance recovery UI", () => {
 			expect(errorsZhCn[key]).toBeTruthy();
 		}
 	});
-	it("offers a fixed official top-up link without initiating payment or authorization", async () => {
+	it("opens confirmation UI only on explicit recharge click", async () => {
 		await render("top_up_balance");
-		const link = container.querySelector("a");
-		expect(link?.getAttribute("href")).toBe("https://tokendance.space/");
-		expect(link?.getAttribute("rel")).toBe("noopener noreferrer");
+		expect(container.querySelector("a")).toBeNull();
+		expect(recharged).toBe(0);
+		await act(() => button("Top up TokenDance").click());
+		expect(recharged).toBe(1);
 		expect(container.textContent).toContain("This key remains valid.");
 		expect(managed).toBe(0);
 		expect(closed).toBe(0);

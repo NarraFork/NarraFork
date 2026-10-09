@@ -1,5 +1,7 @@
 # NarraFork
 
+简体中文 · [English](README_EN.md)
+
 **多人协作 多模型协作 多设备流转 的高效Durable Harness**
 
 NarraFork 是一个自托管的 AI 编程协作工作台。部署在自己的电脑或服务器上，你（和你的团队）在浏览器里组织 AI 会话、操作代码与终端、管理 Agent 的上下文和权限。

@@ -1,4 +1,11 @@
-import { afterAll, describe, expect, mock, test } from "bun:test";
+import { afterAll, describe, expect, mock, spyOn, test } from "bun:test";
+import {
+	getUpdateCoordinationStatus,
+	resetUpdateCoordinationForTests,
+	scheduleUpdate,
+	tryAcquireFinalUpdateExecution,
+	waitForBackgroundBashDrain,
+} from "@server/services/update-coordinator";
 
 import type { ExecHandle, ExecutionBackend } from "../../execution/backend";
 import { localBackend } from "../../execution/local-backend";
@@ -387,6 +394,7 @@ describe("Bash background kinds", () => {
 		const controller = new AbortController();
 		const ctx = makeCtx("parent");
 		ctx.signal = controller.signal;
+		const release = mock(() => {});
 		ctx.updateExecutionLease = {
 			kind: "background_bash",
 			setNarratorId() {},
@@ -394,7 +402,7 @@ describe("Bash background kinds", () => {
 				controller.abort();
 				return true;
 			},
-			release() {},
+			release,
 		};
 		await bashTool.execute(
 			{ command: "true", run_in_background: true, background_kind: "service" },
@@ -403,6 +411,7 @@ describe("Bash background kinds", () => {
 		const task = [...tasks.values()][0];
 		expect(task.status).toBe("cancelled");
 		expect(task.error).toBeUndefined();
+		expect(release).toHaveBeenCalledTimes(1);
 	});
 	test("remote service uses shared metadata and cancellation beats an exit-zero callback", async () => {
 		seed();
@@ -457,6 +466,168 @@ describe("Bash background kinds", () => {
 		while (task.status === "running" && Date.now() < deadline) await Bun.sleep(1);
 		expect(task.status).toBe("cancelled");
 		expect(task.error).toBeUndefined();
+	});
+
+	test.each([
+		"task",
+		"service",
+	] as const)("maintenance drains %s startup but only waits for finite task completion", async (backgroundKind) => {
+		seed();
+		resetUpdateCoordinationForTests();
+		const startup = Promise.withResolvers<ExecHandle>();
+		const spawnRequested = Promise.withResolvers<void>();
+		const monitored = Promise.withResolvers<void>();
+		const exit = Promise.withResolvers<number>();
+		const released = Promise.withResolvers<void>();
+		const completionEntered = Promise.withResolvers<void>();
+		const persistCompletion = Promise.withResolvers<void>();
+		const markCompleted = fakeBackgroundTaskService.markCompleted;
+		const completionSpy =
+			backgroundKind === "task"
+				? spyOn(fakeBackgroundTaskService, "markCompleted").mockImplementation(async (id) => {
+						completionEntered.resolve();
+						await persistCompletion.promise;
+						await markCompleted(id);
+					})
+				: undefined;
+		const handle: ExecHandle = {
+			exited: exit.promise,
+			onData() {
+				monitored.resolve();
+			},
+			isExited: () => false,
+			kill: mock(async () => exit.resolve(0)),
+		};
+		const backend: ExecutionBackend = Object.assign(Object.create(localBackend), {
+			kind: "remote",
+			deviceId: "remote-fixture",
+			defaultCwd: "/workspace",
+			execCommand: async () => {
+				spawnRequested.resolve();
+				return startup.promise;
+			},
+		});
+		const ctx = makeCtx("parent");
+		ctx.resolveBackend = () => backend;
+		ctx.executionTarget = {
+			deviceId: "remote-fixture",
+			backendKind: "remote",
+			cwd: "/workspace",
+			pathFlavor: backend.pathFlavor,
+			runtimeGeneration: backend.runtimeGeneration,
+			selectionSource: "explicit",
+		};
+		const lease = tryAcquireFinalUpdateExecution("background_bash", "parent");
+		expect(lease).not.toBeNull();
+		const release = mock(() => {
+			lease?.release();
+			released.resolve();
+		});
+		ctx.updateExecutionLease = {
+			kind: "background_bash",
+			setNarratorId() {},
+			transfer: () => true,
+			release,
+		};
+		try {
+			await bashTool.execute(
+				{ command: "fixture", run_in_background: true, background_kind: backgroundKind },
+				ctx,
+			);
+			await spawnRequested.promise;
+			const task = [...tasks.values()][0];
+			scheduleUpdate(undefined, "system_shutdown");
+			let drained = false;
+			const drain = waitForBackgroundBashDrain().then(() => {
+				drained = true;
+			});
+			await Promise.resolve();
+			expect(drained).toBe(false);
+			expect(getUpdateCoordinationStatus().pendingBackgroundBashCount).toBe(1);
+			expect(release).not.toHaveBeenCalled();
+
+			startup.resolve(handle);
+			await monitored.promise;
+			expect(killHandlers.has(task.id)).toBe(true);
+			if (backgroundKind === "service") {
+				await drain;
+				expect(getUpdateCoordinationStatus().pendingBackgroundBashCount).toBe(0);
+				expect(release).toHaveBeenCalledTimes(1);
+			} else {
+				expect(drained).toBe(false);
+				expect(getUpdateCoordinationStatus().pendingBackgroundBashCount).toBe(1);
+				expect(release).not.toHaveBeenCalled();
+			}
+			expect(task.status).toBe("running");
+			expect(handle.kill).not.toHaveBeenCalled();
+
+			exit.resolve(0);
+			if (backgroundKind === "task") {
+				await completionEntered.promise;
+				expect(drained).toBe(false);
+				expect(getUpdateCoordinationStatus().pendingBackgroundBashCount).toBe(1);
+				expect(release).not.toHaveBeenCalled();
+				persistCompletion.resolve();
+			}
+			await drain;
+			await released.promise;
+			// Service release precedes exit, so allow the durable terminal callback to settle.
+			const deadline = Date.now() + 2_000;
+			while (task.status === "running" && Date.now() < deadline) await Bun.sleep(1);
+			expect(task.status).toBe(backgroundKind === "service" ? "failed" : "completed");
+			expect(release).toHaveBeenCalledTimes(1);
+		} finally {
+			startup.resolve(handle);
+			exit.resolve(0);
+			persistCompletion.resolve();
+			await released.promise;
+			completionSpy?.mockRestore();
+			resetUpdateCoordinationForTests();
+		}
+	});
+
+	test("failed service startup persists failure and releases the drain lease once", async () => {
+		seed();
+		resetUpdateCoordinationForTests();
+		const startup = Promise.withResolvers<ExecHandle>();
+		const released = Promise.withResolvers<void>();
+		const backend: ExecutionBackend = Object.assign(Object.create(localBackend), {
+			kind: "remote",
+			deviceId: "remote-fixture",
+			defaultCwd: "/workspace",
+			execCommand: () => startup.promise,
+		});
+		const ctx = makeCtx("parent");
+		ctx.resolveBackend = () => backend;
+		const lease = tryAcquireFinalUpdateExecution("background_bash", "parent");
+		const release = mock(() => {
+			lease?.release();
+			released.resolve();
+		});
+		ctx.updateExecutionLease = {
+			kind: "background_bash",
+			setNarratorId() {},
+			transfer: () => true,
+			release,
+		};
+		try {
+			await bashTool.execute(
+				{ command: "fixture", run_in_background: true, background_kind: "service" },
+				ctx,
+			);
+			scheduleUpdate(undefined, "system_shutdown");
+			expect(getUpdateCoordinationStatus().pendingBackgroundBashCount).toBe(1);
+			startup.reject(new Error("fixture spawn failure"));
+			await released.promise;
+			await waitForBackgroundBashDrain();
+			expect([...tasks.values()][0]).toMatchObject({
+				status: "failed",
+				error: expect.stringContaining("fixture spawn failure"),
+			});
+			expect(release).toHaveBeenCalledTimes(1);
+		} finally {
+			resetUpdateCoordinationForTests();
+		}
 	});
 
 	test("schema defaults commands to task, but preserves stop without a kind", () => {

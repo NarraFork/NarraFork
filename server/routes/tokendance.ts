@@ -7,8 +7,12 @@ import { requireAdmin, requireSessionAuth } from "../middleware/auth";
 import {
 	cancelTokenDanceOAuth,
 	completeTokenDanceOAuth,
+	createTokenDancePaymentSession,
 	deleteTokenDanceConnection,
+	getTokenDanceBalance,
 	getTokenDanceConnection,
+	getTokenDancePaymentSession,
+	refreshTokenDanceBalance,
 	refreshTokenDanceModels,
 	restoreTokenDanceDraft,
 	setTokenDanceDisabled,
@@ -19,6 +23,14 @@ import {
 export const tokendanceRoutes = new Hono();
 tokendanceRoutes.onError((error, c) => {
 	if (!(error instanceof AppError)) throw error;
+	if (c.req.path.endsWith("/oauth/start") || c.req.path.endsWith("/oauth/complete")) {
+		// Deliberately exclude messages, bodies, queries, headers, and credentials.
+		console.warn("[TokenDance] OAuth request rejected", {
+			stage: c.req.path.endsWith("/oauth/start") ? "start" : "complete",
+			status: error.statusCode,
+			code: error.code,
+		});
+	}
 	const action = parseTokenDanceRecoveryAction(
 		(error as AppError & { extra?: { recoveryAction?: unknown } }).extra?.recoveryAction,
 	);
@@ -30,7 +42,28 @@ tokendanceRoutes.onError((error, c) => {
 });
 // Explicit session gate remains necessary when this router is mounted independently.
 // External OAuth admin principals must never reach credential management.
-tokendanceRoutes.use("*", requireSessionAuth, requireAdmin);
+tokendanceRoutes.use("*", requireSessionAuth);
+// Register the ordinary-user summary before the administrator gate.
+tokendanceRoutes.get("/balance", (c) => c.json(getTokenDanceBalance()));
+tokendanceRoutes.use("*", requireAdmin);
+tokendanceRoutes.post("/balance/refresh", async (c) => c.json(await refreshTokenDanceBalance()));
+tokendanceRoutes.post("/payment/sessions", async (c) => {
+	const input = await body(
+		c.req.raw,
+		z
+			.object({
+				amount: z.number().int().min(1).max(100000),
+				generation: z.number().int().min(0).max(Number.MAX_SAFE_INTEGER),
+				requestId: z.string().regex(/^[A-Za-z0-9_-]{16,128}$/),
+				billingInstance: z.string().regex(/^[a-f0-9]{32}$/),
+			})
+			.strict(),
+	);
+	return c.json({ session: await createTokenDancePaymentSession(c.get("user").sub, input) });
+});
+tokendanceRoutes.get("/payment/sessions/:id", async (c) =>
+	c.json({ session: await getTokenDancePaymentSession(c.get("user").sub, c.req.param("id")) }),
+);
 const flowSchema = z.object({ flowId: z.string().regex(/^[A-Za-z0-9_-]{43}$/) }).strict();
 const completeSchema = flowSchema.extend({
 	code: z
@@ -75,7 +108,12 @@ async function body<T>(request: Request, schema: z.ZodType<T>): Promise<T> {
 }
 tokendanceRoutes.post("/oauth/start", async (c) => {
 	const input = await body(c.req.raw, startSchema);
-	const callback = validateTokenDanceCallback(input.callbackUrl, c.req.url, c.req.header("Origin"));
+	const callback = validateTokenDanceCallback(
+		input.callbackUrl,
+		c.req.url,
+		c.req.header("Origin"),
+		c.req.header("Sec-Fetch-Site"),
+	);
 	return c.json(startTokenDanceOAuth(c.get("user").sub, callback, input.draftSnapshot));
 });
 tokendanceRoutes.post("/oauth/complete", async (c) => {

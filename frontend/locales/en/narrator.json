@@ -1,4 +1,9 @@
 {
+	"tokendanceBalance": "Balance ¥{{balance}}",
+	"tokendanceBalanceUnknown": "Balance temporarily unavailable",
+	"tokendanceBalanceDetails": "Total credited ¥{{credits}}\nConsumed ¥{{used}}\nRemaining ¥{{balance}}",
+	"tokendanceBalanceStale": "Balance may be outdated; please refresh",
+	"tokendanceAdminRechargeRequired": "Insufficient balance; contact your administrator to recharge",
 	"you": "You",
 	"largeFile": {
 		"size": "File size: {{size}} ({{bytes}} bytes)",

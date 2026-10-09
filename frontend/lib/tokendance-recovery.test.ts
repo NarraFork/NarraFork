@@ -2,6 +2,8 @@ import { describe, expect, it } from "bun:test";
 import {
 	dispatchTokenDanceRecovery,
 	getTokenDanceRecoveryDetail,
+	openTokenDanceRecharge,
+	TOKENDANCE_RECHARGE_EVENT,
 	TOKENDANCE_RECOVERY_EVENT,
 } from "./tokendance-recovery";
 
@@ -12,6 +14,16 @@ const error = (action: unknown, provider = "tokendance") => ({
 });
 
 describe("TokenDance recovery notifications", () => {
+	it("dispatches recharge intent without credentials or payment data", () => {
+		const target = new EventTarget();
+		let count = 0;
+		target.addEventListener(TOKENDANCE_RECHARGE_EVENT, (event) => {
+			expect((event as CustomEvent).detail).toBeUndefined();
+			count++;
+		});
+		openTokenDanceRecharge(target);
+		expect(count).toBe(1);
+	});
 	it.each([
 		"top_up_balance",
 		"reauthorize_api_key",

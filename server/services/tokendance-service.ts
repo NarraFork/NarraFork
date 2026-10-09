@@ -4,11 +4,14 @@ import {
 	selectTokenDanceProtocol,
 	TOKENDANCE_APP_URL,
 	TOKENDANCE_ORIGIN,
+	type TokenDanceBalance,
 	type TokenDanceCatalogModel,
 	type TokenDanceDraftRestore,
 	type TokenDanceDraftSnapshot,
 	type TokenDanceOAuthComplete,
 	type TokenDanceOAuthStart,
+	type TokenDancePaymentCreate,
+	type TokenDancePaymentSession,
 	type TokenDancePublicConnection,
 	type TokenDanceRecoveryAction,
 } from "@shared/tokendance";
@@ -27,6 +30,31 @@ registerTokenDanceRuntime({
 	getTokenDanceCatalogModels,
 });
 
+const billingInstance = randomBytes(16).toString("hex");
+const BALANCE_TTL = 30_000;
+const PAYMENT_TTL = 24 * 60 * 60_000;
+const PAYMENT_FINAL_QUERY_GRACE = 10 * 60_000;
+interface BalanceCache {
+	generation: number;
+	value: TokenDanceBalance;
+	attemptedAt: number;
+	task?: Promise<TokenDanceBalance>;
+}
+interface PaymentEntry {
+	owner: string;
+	generation: number;
+	amount: number;
+	retireAt: number;
+	task?: Promise<TokenDancePaymentSession>;
+	session?: TokenDancePaymentSession;
+	poll?: Promise<void>;
+	polledAt: number;
+	finalChecked?: boolean;
+	finalError?: boolean;
+}
+let balanceCache: BalanceCache | undefined;
+// Includes failed/uncertain creates: retrying the same confirmed request never POSTs twice.
+const payments = new Map<string, PaymentEntry>();
 const TTL = 10 * 60_000;
 const MAX_SNAPSHOT = 1024 * 1024;
 const MAX_SNAPSHOTS = 8 * MAX_SNAPSHOT;
@@ -136,6 +164,11 @@ function generation(): number {
 	return settings.tokendance?.generation ?? 0;
 }
 function cleanup(): void {
+	for (const [key, entry] of payments) {
+		if (entry.retireAt <= Date.now()) {
+			payments.delete(key);
+		}
+	}
 	for (const [id, flow] of flows) {
 		if (flow.expiresAt <= Date.now()) {
 			flow.controller?.abort();
@@ -173,6 +206,7 @@ export function getTokenDanceConnection(): TokenDancePublicConnection {
 	return {
 		connected: !!settings.tokendance?.apiKey,
 		name: "TokenDance",
+		billingInstance,
 		disabled: settings.tokendance?.disabled ?? false,
 		generation: generation(),
 		models: getTokenDanceCatalogModels(),
@@ -315,17 +349,22 @@ export function validateTokenDanceCallback(
 	callbackUrl: string,
 	requestUrl: string,
 	origin?: string,
+	fetchSite?: string,
 ): URL {
 	let callback: URL;
 	try {
 		callback = new URL(callbackUrl);
 	} catch {
-		throw fail("Invalid callback URL");
+		throw new AppError("Invalid callback URL", 400, "TOKENDANCE_CALLBACK_INVALID");
 	}
 	const self = new URL(requestUrl);
 	const selfOrigin = self.origin;
 	const configured = normalizeConfiguredOrigins(settings.server.allowedOrigins);
 	const caller = origin ?? selfOrigin;
+	// Browser-generated Fetch Metadata survives proxies that rewrite Host. Web pages
+	// cannot set Sec-* headers; non-browser callers still require an admin session.
+	// Never accept same-site/cross-site/none or infer trust from forwarded headers.
+	const browserSameOrigin = !!origin && fetchSite === "same-origin";
 	// A TLS-terminating proxy may preserve the public Host while using HTTP upstream.
 	// Permit only this same-authority upgrade; never infer hosts from forwarded headers.
 	let tlsUpgrade = false;
@@ -345,10 +384,16 @@ export function validateTokenDanceCallback(
 		callback.search ||
 		callback.hash ||
 		callback.origin !== caller ||
-		(!tlsUpgrade && !resolveAllowedCorsOrigin(caller, { selfOrigin, configured })) ||
+		(!browserSameOrigin &&
+			!tlsUpgrade &&
+			!resolveAllowedCorsOrigin(caller, { selfOrigin, configured })) ||
 		!callback.pathname.endsWith("/settings/providers/tokendance/callback")
 	) {
-		throw fail("Callback must be the first-party TokenDance settings callback");
+		throw new AppError(
+			"Callback must be the first-party TokenDance settings callback",
+			400,
+			"TOKENDANCE_CALLBACK_INVALID",
+		);
 	}
 	return callback;
 }
@@ -461,6 +506,7 @@ export async function completeTokenDanceOAuth(
 			assertNoPrefixConflict();
 			const latest = structuredClone(settings);
 			latest.tokendance = {
+				modelCollectionInitialized: latest.tokendance?.modelCollectionInitialized,
 				apiKey: key,
 				disabled: false,
 				generation: generation() + 1,
@@ -528,7 +574,7 @@ export async function refreshTokenDanceModels(
 			assertGeneration(config.generation);
 			if (controller.signal.aborted) throw fail("TokenDance request cancelled", 409);
 			const latest = structuredClone(settings);
-			latest.tokendance = { ...config, models: next };
+			latest.tokendance = { ...latest.tokendance, ...config, models: next };
 			saveSettings(latest);
 		});
 		models = next;
@@ -541,6 +587,7 @@ export async function refreshTokenDanceModels(
 	}
 }
 function invalidateRequests(): void {
+	invalidateBilling();
 	for (const controller of requests) controller.abort();
 	requests.clear();
 	for (const flow of flows.values()) {
@@ -564,6 +611,356 @@ export async function setTokenDanceDisabled(
 		return getTokenDanceConnection();
 	});
 }
+function invalidateBilling(): void {
+	balanceCache = undefined;
+	for (const entry of payments.values()) {
+		if (entry.session?.status === "pending") entry.session.status = "closed";
+	}
+}
+function billingConfig() {
+	const config = getTokenDanceRuntimeConfig();
+	if (!config || config.disabled) throw fail("TokenDance is not connected or is disabled", 409);
+	return config;
+}
+async function billingRequest(
+	path: string,
+	config: NonNullable<ReturnType<typeof getTokenDanceRuntimeConfig>>,
+	body?: unknown,
+) {
+	const controller = new AbortController();
+	const unregister = registerTokenDanceRequest(controller, config.generation);
+	const startedAt = performance.now();
+	const operation =
+		path === "/portal/api/v1/user/balance"
+			? "balance"
+			: body === undefined
+				? "payment_status"
+				: "payment_create";
+	try {
+		const response = await boundedJson(
+			`${TOKENDANCE_ORIGIN}${path}`,
+			{
+				method: body === undefined ? "GET" : "POST",
+				headers: {
+					Authorization: `Bearer ${config.apiKey}`,
+					"X-App-URL": TOKENDANCE_APP_URL,
+					"Content-Type": "application/json",
+				},
+				...(body === undefined ? {} : { body: JSON.stringify(body) }),
+			},
+			64 * 1024,
+			controller,
+		);
+		assertTokenDanceConnection(config.generation);
+		if (controller.signal.aborted) throw fail("TokenDance request cancelled", 409);
+		if (!response.ok) {
+			setTokenDanceRecoveryAction(response.action, config.generation);
+			throw fail("TokenDance billing request failed", 502, response.action);
+		}
+		return response.body;
+	} finally {
+		unregister();
+		const elapsedMs = Math.round(performance.now() - startedAt);
+		if (elapsedMs >= 2000)
+			console.warn("[TokenDance] Slow billing operation", {
+				operation,
+				elapsedMs,
+				generation: config.generation,
+			});
+	}
+}
+function currentBalanceCache(): BalanceCache {
+	if (!balanceCache || balanceCache.generation !== generation()) {
+		balanceCache = {
+			generation: generation(),
+			attemptedAt: -Infinity,
+			value: {
+				generation: generation(),
+				credits: null,
+				creditsUsed: null,
+				balance: null,
+				updatedAt: null,
+				loading: false,
+				hasError: false,
+			},
+		};
+	}
+	return balanceCache;
+}
+function balanceSummary(cache: BalanceCache): TokenDanceBalance {
+	return { ...cache.value, loading: !!cache.task, ...(recoveryAction ? { recoveryAction } : {}) };
+}
+/** Stale-while-revalidate: never waits on the upstream in ordinary user requests. */
+export function getTokenDanceBalance(): TokenDanceBalance {
+	const cache = currentBalanceCache();
+	if (
+		getTokenDanceRuntimeConfig() &&
+		!settings.tokendance?.disabled &&
+		Date.now() - cache.attemptedAt >= BALANCE_TTL
+	) {
+		void refreshTokenDanceBalance(false).catch(() => {});
+	}
+	return balanceSummary(cache);
+}
+export async function refreshTokenDanceBalance(force = true): Promise<TokenDanceBalance> {
+	const config = billingConfig();
+	const cache = currentBalanceCache();
+	if (cache.task) return cache.task;
+	if (!force && Date.now() - cache.attemptedAt < BALANCE_TTL) return balanceSummary(cache);
+	cache.attemptedAt = Date.now();
+	let task: Promise<TokenDanceBalance> | undefined;
+	task = (async () => {
+		try {
+			const value = record(
+				record(await billingRequest("/portal/api/v1/user/balance", config))?.balance,
+			);
+			if (
+				!value ||
+				![value.credits, value.credits_used, value.balance].every(Number.isSafeInteger) ||
+				(value.credits as number) < 0 ||
+				(value.credits_used as number) < 0 ||
+				(value.credits as number) - (value.credits_used as number) !== value.balance
+			)
+				throw fail("Invalid TokenDance balance", 502);
+			if (balanceCache !== cache) throw fail("TokenDance connection changed", 409);
+			cache.value = {
+				generation: config.generation,
+				credits: value.credits as number,
+				creditsUsed: value.credits_used as number,
+				balance: value.balance as number,
+				updatedAt: Date.now(),
+				loading: false,
+				hasError: false,
+			};
+		} catch {
+			if (balanceCache === cache) cache.value.hasError = true;
+		} finally {
+			if (balanceCache === cache && cache.task === task) cache.task = undefined;
+		}
+		return balanceSummary(cache);
+	})();
+	cache.task = task;
+	return task;
+}
+function safePaymentString(value: unknown, key: string): value is string {
+	if (typeof value !== "string" || value.length > 4096 || value.includes(key)) return false;
+	try {
+		return !decodeURIComponent(value).includes(key);
+	} catch {
+		return false;
+	}
+}
+function paymentPath(id: string): string {
+	return `/portal/api/v1/payment/sessions/${id}`;
+}
+function parsePayment(value: unknown, entry: PaymentEntry, key: string): TokenDancePaymentSession {
+	const raw = record(record(value)?.session);
+	if (
+		!raw ||
+		!safePaymentString(raw.id, key) ||
+		!/^[A-Za-z0-9_-]{1,128}$/.test(raw.id) ||
+		raw.amount !== entry.amount ||
+		!["pending", "paid", "failed", "closed", "refunded", "expired"].includes(String(raw.status))
+	)
+		throw fail("Invalid TokenDance payment session", 502);
+	if (entry.session && raw.id !== entry.session.id)
+		throw fail("Invalid TokenDance payment session", 502);
+	const time = (value: unknown): number => {
+		if (
+			!Number.isSafeInteger(value) ||
+			(value as number) < 1_577_836_800 ||
+			(value as number) > 4_102_444_800
+		)
+			throw fail("Invalid TokenDance payment timestamp", 502);
+		return (value as number) * 1000;
+	};
+	const createdAt = time(raw.created_at),
+		expiresAt = time(raw.expired_at);
+	if (
+		createdAt > Date.now() + 60_000 ||
+		expiresAt <= createdAt ||
+		expiresAt - createdAt > PAYMENT_TTL ||
+		expiresAt > Date.now() + PAYMENT_TTL + 60_000
+	)
+		throw fail("Invalid TokenDance payment expiry", 502);
+	if (
+		!safePaymentString(raw.status_url, key) ||
+		raw.status_url !== `${TOKENDANCE_ORIGIN}${paymentPath(raw.id)}`
+	)
+		throw fail("Invalid TokenDance payment status URL", 502);
+	if (!safePaymentString(raw.payment_url, key)) throw fail("Invalid TokenDance payment URL", 502);
+	let payment: URL;
+	try {
+		payment = new URL(raw.payment_url);
+	} catch {
+		throw fail("Invalid TokenDance payment URL", 502);
+	}
+	if (payment.protocol !== "https:" || payment.username || payment.password)
+		throw fail("Invalid TokenDance payment URL", 502);
+	let alipayUrl: string | undefined;
+	if (raw.alipay_url !== undefined) {
+		if (!safePaymentString(raw.alipay_url, key)) throw fail("Invalid TokenDance Alipay URL", 502);
+		let alipay: URL;
+		try {
+			alipay = new URL(raw.alipay_url);
+		} catch {
+			throw fail("Invalid TokenDance Alipay URL", 502);
+		}
+		if (
+			alipay.protocol !== "alipays:" ||
+			alipay.hostname !== "platformapi" ||
+			alipay.pathname !== "/startapp" ||
+			alipay.username ||
+			alipay.password ||
+			alipay.hash ||
+			alipay.port
+		)
+			throw fail("Invalid TokenDance Alipay URL", 502);
+		alipayUrl = raw.alipay_url;
+	}
+	const paidAt = raw.paid_at === undefined || raw.paid_at === null ? undefined : time(raw.paid_at);
+	if (paidAt !== undefined && (paidAt < createdAt || paidAt > Date.now() + 60_000))
+		throw fail("Invalid TokenDance paid timestamp", 502);
+	return {
+		id: raw.id,
+		generation: entry.generation,
+		amount: entry.amount,
+		status: raw.status as TokenDancePaymentSession["status"],
+		paymentUrl: raw.payment_url,
+		...(alipayUrl ? { alipayUrl } : {}),
+		createdAt,
+		expiresAt,
+		...(paidAt === undefined ? {} : { paidAt }),
+	};
+}
+function paymentUnconfirmed(): AppError {
+	return new AppError(
+		"TokenDance payment expired without confirmation; check the platform if paid",
+		502,
+		"TOKENDANCE_PAYMENT_EXPIRED_UNCONFIRMED",
+	);
+}
+function refreshBalanceAfterPayment(expected: number): void {
+	assertTokenDanceConnection(expected);
+	if (recoveryAction === "top_up_balance") recoveryAction = undefined;
+	// Start immediately under the confirmed generation; existing request/cache identity
+	// guards discard late results after another payment or a connection change.
+	balanceCache = undefined;
+	void refreshTokenDanceBalance().catch(() => {});
+}
+async function pollPayment(entry: PaymentEntry): Promise<void> {
+	if (entry.poll) return entry.poll;
+	const session = entry.session;
+	if (session?.status !== "pending" || entry.generation !== generation()) return;
+	const finalCheck = Date.now() >= session.expiresAt;
+	if (entry.finalChecked) {
+		if (entry.finalError) throw paymentUnconfirmed();
+		return;
+	}
+	if (!finalCheck && Date.now() - entry.polledAt < 3000) return;
+	// Claim synchronously: concurrent and later GETs cannot replay the final query.
+	if (finalCheck) entry.finalChecked = true;
+	entry.polledAt = Date.now();
+	const task = (async () => {
+		try {
+			const config = billingConfig();
+			const next = parsePayment(
+				await billingRequest(paymentPath(session.id), config),
+				entry,
+				config.apiKey,
+			);
+			assertTokenDanceConnection(entry.generation);
+			if (finalCheck && next.status === "pending") next.status = "expired";
+			entry.session = next;
+			if (next.status === "paid") refreshBalanceAfterPayment(entry.generation);
+		} catch (error) {
+			if (finalCheck) {
+				entry.finalError = true;
+				throw paymentUnconfirmed();
+			}
+			throw error;
+		} finally {
+			entry.poll = undefined;
+		}
+	})();
+	entry.poll = task;
+	return task;
+}
+export async function createTokenDancePaymentSession(
+	owner: string,
+	input: TokenDancePaymentCreate,
+): Promise<TokenDancePaymentSession> {
+	if (
+		!Number.isInteger(input.amount) ||
+		input.amount < 1 ||
+		input.amount > 100000 ||
+		!Number.isSafeInteger(input.generation) ||
+		!/^[A-Za-z0-9_-]{16,128}$/.test(input.requestId)
+	)
+		throw fail("Invalid TokenDance payment request");
+	if (input.billingInstance !== billingInstance)
+		throw fail("TokenDance billing instance changed; reopen payment dialog", 409);
+	const config = billingConfig();
+	assertTokenDanceConnection(input.generation);
+	cleanup();
+	const requestKey = JSON.stringify([owner, input.generation, input.requestId]);
+	const prior = payments.get(requestKey);
+	if (prior) {
+		if (prior.amount !== input.amount) throw fail("TokenDance payment request conflicts", 409);
+		const priorSession = prior.session ?? (await prior.task);
+		if (!priorSession) throw fail("TokenDance payment request unavailable", 409);
+		return structuredClone(priorSession);
+	}
+	if (
+		payments.size >= 100 ||
+		[...payments.values()].filter((entry) => entry.owner === owner).length >= 10
+	)
+		throw fail("Too many TokenDance payment requests", 429);
+	const entry: PaymentEntry = {
+		owner,
+		generation: input.generation,
+		amount: input.amount,
+		retireAt: Date.now() + PAYMENT_TTL,
+		polledAt: Date.now(),
+	};
+	payments.set(requestKey, entry);
+	entry.task = (async () => {
+		const value = await billingRequest("/portal/api/v1/payment/sessions", config, {
+			amount: input.amount,
+		});
+		const session = parsePayment(value, entry, config.apiKey);
+		assertTokenDanceConnection(entry.generation);
+		entry.session = session;
+		// Only confirmed creates gain expiry-based retention. Uncertain creates retain
+		// their original bounded deduplication TTL and still consume the request budget.
+		entry.retireAt = Math.max(entry.retireAt, session.expiresAt + PAYMENT_FINAL_QUERY_GRACE);
+		if (session.status === "paid") refreshBalanceAfterPayment(entry.generation);
+		return session;
+	})();
+	return structuredClone(await entry.task);
+}
+export async function getTokenDancePaymentSession(
+	owner: string,
+	id: string,
+): Promise<TokenDancePaymentSession> {
+	cleanup();
+	const entry = [...payments.values()].find(
+		(entry) =>
+			entry.owner === owner && entry.session?.id === id && entry.generation === generation(),
+	);
+	if (!entry) throw fail("TokenDance payment session not found", 404);
+	assertTokenDanceConnection(entry.generation);
+	await pollPayment(entry).catch((error) => {
+		if (entry.finalError) throw error;
+	});
+	// A joined pre-deadline request is not the one final post-deadline check.
+	if (entry.session?.status === "pending" && Date.now() >= entry.session.expiresAt) {
+		await pollPayment(entry);
+	}
+	if (!entry.session) throw fail("TokenDance payment session not found", 404);
+	return structuredClone(entry.session);
+}
+
 export async function deleteTokenDanceConnection(): Promise<void> {
 	await settingsUpdateLock.acquire("settings", async () => {
 		const latest = structuredClone(settings);

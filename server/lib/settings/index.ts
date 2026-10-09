@@ -36,6 +36,7 @@ import { normalizeSearchSettings } from "../search/settings";
 import { normalizeCustomApiProviderSettings } from "./custom-api-providers";
 import { DEFAULTS } from "./defaults";
 import { _bindSettings } from "./provider";
+import { initializeTokenDanceModelCollection } from "./tokendance-model-collection";
 import type { NarraForkSettings } from "./types";
 import { normalizeUpdateSourceSettings } from "./update-source";
 
@@ -481,6 +482,7 @@ function loadSettingsFromDisk(): NarraForkSettings {
 		if (prov.prefix) activePrefixes.add(prov.prefix);
 	}
 	for (const b of ["codex"]) activePrefixes.add(b);
+	if (merged.tokendance?.apiKey) activePrefixes.add("tokendance");
 
 	if (purgeStaleAgentModelRefs(merged, (prefix) => !activePrefixes.has(prefix))) {
 		needsSave = true;
@@ -501,6 +503,8 @@ function loadSettingsFromDisk(): NarraForkSettings {
 	if (normalizeSearchSettings(merged, raw)) {
 		needsSave = true;
 	}
+
+	if (initializeTokenDanceModelCollection(merged)) needsSave = true;
 
 	if (needsSave) saveSettings(merged);
 
@@ -799,6 +803,7 @@ export function saveSettings(newSettings: NarraForkSettings): void {
 	normalizeSettingsProxyUrls(newSettings);
 	normalizeSearchSettings(newSettings);
 	normalizeMcpServerIds(newSettings);
+	initializeTokenDanceModelCollection(newSettings);
 	reconcileLegacyWindowSettings(newSettings);
 	mkdirSync(narraforkDir, { recursive: true, mode: 0o700 });
 	if (process.platform !== "win32") chmodSync(narraforkDir, 0o700);

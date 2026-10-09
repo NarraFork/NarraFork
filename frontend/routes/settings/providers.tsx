@@ -1077,6 +1077,12 @@ function SettingsProvidersPage() {
 					{selectedProvider === "tokendance" && tokenDance?.connected ? (
 						<TokenDanceSection
 							connection={tokenDance}
+							hiddenModels={state.hiddenModels}
+							onToggleHidden={dispatchers.toggleHidden}
+							onBatchToggleHidden={dispatchers.batchToggleHidden}
+							modelContextWindows={state.modelContextWindows}
+							onContextWindowChange={dispatchers.handleContextWindowChange}
+							onTestModel={setTestingModel}
 							onLogin={() => tokenDanceLogin()}
 							onChanged={refreshTokenDanceSettings}
 							onDeleted={() => setSelectedProvider(null)}

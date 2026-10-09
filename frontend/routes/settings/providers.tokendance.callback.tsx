@@ -34,7 +34,12 @@ function TokenDanceCallbackPage() {
 		let active = true;
 		void completeTokenDanceCallback().then((ok) => {
 			if (!active || cancelRef.current) return;
-			if (ok) void navigate({ to: "/settings/providers", replace: true });
+			if (ok)
+				void navigate({
+					to: "/settings/providers",
+					search: { provider: "tokendance" },
+					replace: true,
+				});
 			else setFailed(true);
 		});
 		return () => {

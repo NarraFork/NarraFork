@@ -500,6 +500,8 @@ export interface TokenDanceSettings {
 	generation: number;
 	/** Bounded last successful catalog; available after service restart. */
 	models?: TokenDanceCatalogModel[];
+	/** Initial fixed model collection was applied; manual visibility choices now win. */
+	modelCollectionInitialized?: boolean;
 }
 
 export interface NarraForkSettings {

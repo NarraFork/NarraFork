@@ -314,15 +314,21 @@ export function AddProviderPage({
 											showConfig,
 										})
 										.catch((cause) => {
-											if (mountedRef.current)
-												setSubmitError(
-													t(
-														cause instanceof ApiError &&
-															cause.data?.code === "TOKENDANCE_PREFIX_CONFLICT"
-															? "tokendance.prefixConflict"
-															: "tokendance.loginFailed",
-													),
-												);
+											if (!mountedRef.current) return;
+											// Never render raw errors: they may contain unsaved credentials or URLs.
+											if (!(cause instanceof ApiError)) {
+												setSubmitError(t("tokendance.loginStartClientFailed"));
+												return;
+											}
+											const key =
+												cause.data?.code === "TOKENDANCE_PREFIX_CONFLICT"
+													? "tokendance.prefixConflict"
+													: cause.data?.code === "TOKENDANCE_CALLBACK_INVALID"
+														? "tokendance.loginCallbackInvalid"
+														: cause.status === 404
+															? "tokendance.loginBackendUnavailable"
+															: "tokendance.loginStartFailed";
+											setSubmitError(t(key, { status: cause.status }));
 										})
 										.finally(() => {
 											submittingRef.current = false;

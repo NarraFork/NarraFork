@@ -482,31 +482,49 @@ function applyOperation(tabs: RecentTab[], operation: RecentTabsOperation): Rece
 		}
 		return tabs.filter((tab) => tabKey(tab) !== operation.key);
 	}
+
+	const previous = tabs.find((tab) => tabKey(tab) === operation.key);
+	const hasAnchor = (key: string) =>
+		tabs.some(
+			(tab) =>
+				tabKey(tab) === key &&
+				tabKey(tab) !== operation.key &&
+				!(previous?.type === "workspace" && tab.workspaceId === previous.id),
+		);
+	// The server emits operations in final order and detects moves by predecessor.
+	// Prefer that already-positioned predecessor: the successor may not have moved
+	// yet, may be outside the loaded window, or may belong to the moved workspace.
+	let target: RecentTabMoveTarget | null = null;
+	if (operation.afterKey === null) target = { toIndex: 0 };
+	else if (hasAnchor(operation.afterKey)) target = { afterKey: operation.afterKey };
+	else if (operation.beforeKey && hasAnchor(operation.beforeKey)) {
+		target = { beforeKey: operation.beforeKey };
+	}
+	if (!target) {
+		// Neither neighbor is loaded: this row belongs outside the visible prefix.
+		// Never invent a top position for an off-page metadata update. A loaded row
+		// moving out of the window is removed so the caller can backfill the page.
+		if (!previous) return tabs;
+		return tabs.filter(
+			(tab) =>
+				tabKey(tab) !== operation.key &&
+				!(previous.type === "workspace" && tab.workspaceId === previous.id),
+		);
+	}
 	if (operation.type === "move") {
-		if (operation.beforeKey) {
-			return applyRecentTabMove(tabs, operation.key, { beforeKey: operation.beforeKey });
-		}
-		if (operation.afterKey) {
-			return applyRecentTabMove(tabs, operation.key, { afterKey: operation.afterKey });
-		}
-		return tabs;
+		return applyRecentTabMove(tabs, operation.key, target);
 	}
 
 	// Deltas only carry persisted columns, so an upsert for an already-rendered tab must
 	// keep its live runtime fields (status colour, terminal count, viewers, container badge).
 	// Otherwise every revisit blanks the row until the next runtime poll lands.
-	const nextTab = mergeRecentTabRuntime(
-		operation.tab,
-		tabs.find((tab) => tabKey(tab) === operation.key),
-	);
+	const nextTab = mergeRecentTabRuntime(operation.tab, previous);
 	const withoutCurrent = tabs.filter((tab) => tabKey(tab) !== operation.key);
-	let insertAt = getPinnedSectionEndIndex(withoutCurrent);
-	if (operation.beforeKey) {
-		const index = withoutCurrent.findIndex((tab) => tabKey(tab) === operation.beforeKey);
-		if (index >= 0) insertAt = index;
-	} else if (operation.afterKey) {
-		const index = withoutCurrent.findIndex((tab) => tabKey(tab) === operation.afterKey);
-		if (index >= 0) insertAt = index + 1;
+	let insertAt = 0;
+	if ("afterKey" in target) {
+		insertAt = withoutCurrent.findIndex((tab) => tabKey(tab) === target.afterKey) + 1;
+	} else if ("beforeKey" in target) {
+		insertAt = withoutCurrent.findIndex((tab) => tabKey(tab) === target.beforeKey);
 	}
 	withoutCurrent.splice(insertAt, 0, nextTab);
 	regroupTabs(withoutCurrent);
@@ -561,9 +579,9 @@ const NO_DELTA_FOLLOW_UP: RecentTabsDeltaApplyResult = { gaps: [], backfill: [] 
  * the mutation response and the WS delta each carry that revision, and every
  * status change during the turn produces another one.
  *
- * A removal is the exception: `replaceLoadedTabs` shrinks the window to the rows
- * that are left, so when the server still has more rows the window is one short
- * until it is refilled.
+ * A removal can shrink a window that still has more server rows, so it needs
+ * backfilling. A move into the window from an unloaded page also needs a fetch:
+ * move operations carry anchors but no tab payload to populate the missing row.
  */
 export function applyRecentTabsDelta(
 	qc: QueryClient,
@@ -599,7 +617,16 @@ export function applyRecentTabsDelta(
 		const previousTabs = flattenPages(data);
 		const nextTabs = reduceRecentTabsOperations(previousTabs, section, relevant);
 		qc.setQueryData(key, replaceLoadedTabs(data, nextTabs, delta.revision));
-		if (nextTabs.length < previousTabs.length && data.pages.at(-1)?.hasMore) {
+		const nextKeys = new Set(nextTabs.map(tabKey));
+		const missingMovedTab = relevant.some(
+			(operation) =>
+				operation.type === "move" &&
+				!nextKeys.has(operation.key) &&
+				(operation.afterKey === null ||
+					nextKeys.has(operation.afterKey) ||
+					(operation.beforeKey !== null && nextKeys.has(operation.beforeKey))),
+		);
+		if (missingMovedTab || (nextTabs.length < previousTabs.length && data.pages.at(-1)?.hasMore)) {
 			backfill.push(section);
 		}
 	}
