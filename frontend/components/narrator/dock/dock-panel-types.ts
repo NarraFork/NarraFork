@@ -6,6 +6,7 @@
  * dock). New code should prefer `PanelKind` / `AnyPanelParams` directly.
  */
 
+import type { IDockviewPanel } from "dockview-react";
 import type { PluginDockPanelParams } from "../../plugins/protocol";
 import {
 	type FilePanelParams,
@@ -114,6 +115,50 @@ export function fileDockPanelId(
 	fileNarratorId?: string,
 ): string {
 	return `ndock-file-${filePanelIdentity(filePath, deviceId, toolEdit, fileNarratorId)}`;
+}
+
+/** Lossless resource key; an unknown host remains distinct from an explicit reader. */
+export function filePanelResourceKey(
+	params: Pick<FilePanelParams, "filePath" | "deviceId" | "toolEdit" | "fileNarratorId">,
+	hostNarratorId?: string,
+): string {
+	return JSON.stringify([
+		params.deviceId ?? "local",
+		params.filePath,
+		params.toolEdit
+			? ["history", toolEditReferenceKey(params.toolEdit)]
+			: ["live", params.fileNarratorId ?? hostNarratorId ?? null],
+	]);
+}
+
+/** Match complete file identity before allocating a collision-free legacy id. */
+export function resolveFilePanel(
+	panels: readonly IDockviewPanel[],
+	request: FilePanelParams & { hostNarratorId: string },
+	canonicalId: string,
+	surface: "focus" | "workspace",
+	preferredId = canonicalId,
+): { id: string; existing?: IDockviewPanel } {
+	const existing = panels.find((panel) => {
+		const current = panel.params as FilePanelParams | undefined;
+		if (current?.panelType !== "file") return false;
+		// Only this owner's canonical legacy id can repair a missing workspace host.
+		const host =
+			current.hostNarratorId ?? (panel.id === canonicalId ? request.hostNarratorId : undefined);
+		if (surface === "workspace" && host !== request.hostNarratorId) return false;
+		// Focus panels take their host from the live provider, including old layouts.
+		return (
+			filePanelResourceKey(current, request.hostNarratorId) ===
+			filePanelResourceKey(request, request.hostNarratorId)
+		);
+	});
+	if (existing) return { id: existing.id, existing };
+
+	const occupied = new Set(panels.map((panel) => panel.id));
+	if (!occupied.has(preferredId)) return { id: preferredId };
+	let id = canonicalId;
+	for (let suffix = 1; occupied.has(id); suffix++) id = `${canonicalId}-${suffix}`;
+	return { id };
 }
 
 /**

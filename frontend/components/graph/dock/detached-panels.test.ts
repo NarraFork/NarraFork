@@ -1,5 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import type { SerializedDockview } from "dockview-react";
+import { fileDockPanelId } from "../../narrator/dock/dock-panel-types";
+import { filePanelResourceId } from "../../narrator/panels/panel-kind";
 import { DETACHABLE_PANEL_KINDS, isDetachablePanelKind, isMultiInstanceKind } from "./detachable";
 import {
 	addDetachedNode,
@@ -51,6 +53,82 @@ function pending(over: Partial<DetachedNode> = {}): DetachedNode {
 function mounted(over: Partial<DetachedNode> = {}): DetachedNode {
 	return { id: "n1", x: 10, y: 20, w: 480, h: 360, layout: layout(), ...over };
 }
+
+describe("collision-safe detached persistence", () => {
+	test.each([
+		["implicit", "/repo/collide-1f7f9218.txt", "/repo/collide-08c374cf.txt"],
+		["explicit", "/repo/pending-a8981753.txt", "/repo/pending-c4d2a637.txt"],
+		["history", "/repo/pending-0000398b.txt", "/repo/pending-000488b8.txt"],
+	] as const)("keeps both colliding paths for %s files", (mode, first, second) => {
+		const toolEdit =
+			mode === "history"
+				? { narratorId: "origin", toolUseId: "edit", executionAttempt: 2 }
+				: undefined;
+		const entries = [first, second].map((filePath) =>
+			makePanelEntry(
+				"file",
+				filePanelResourceId(
+					filePath,
+					"local",
+					false,
+					toolEdit,
+					mode === "explicit" ? "child" : undefined,
+				),
+			),
+		);
+		const restored = parseDetachedNodes(
+			serializeDetachedNodes([pending({ pendingPanels: entries })]),
+		);
+		expect(restored[0].pendingPanels).toHaveLength(2);
+		expect(restored[0].pendingPanels?.map((panel) => panel.filePath)).toEqual(
+			entries.map((panel) => panel.filePath),
+		);
+	});
+
+	test("distinguishes unknown implicit hosts and explicit readers while deduplicating exact history", () => {
+		const filePath = "/a.ts";
+		const toolEdit = { narratorId: "origin", toolUseId: "edit", executionAttempt: 2 };
+		const implicit = makePanelEntry("file", filePath);
+		const explicit = makePanelEntry(
+			"file",
+			filePanelResourceId(filePath, "local", false, undefined, "host"),
+		);
+		const history = makePanelEntry("file", filePanelResourceId(filePath, "local", false, toolEdit));
+		const sameHistory = makePanelEntry(
+			"file",
+			filePanelResourceId(
+				filePath,
+				"local",
+				true,
+				{ executionAttempt: 2, toolUseId: "edit", narratorId: "origin" },
+				"child",
+			),
+			{ largeFileConfirmed: true },
+		);
+		const nextHistory = makePanelEntry(
+			"file",
+			filePanelResourceId(filePath, "local", false, { ...toolEdit, executionAttempt: 3 }),
+		);
+		const restored = parseDetachedNodes(
+			serializeDetachedNodes([
+				pending({ pendingPanels: [implicit, explicit, history, sameHistory, nextHistory] }),
+			]),
+		);
+		expect(restored[0].pendingPanels).toHaveLength(4);
+		expect(restored[0].pendingPanels?.[0]).not.toHaveProperty("fileNarratorId");
+		expect(restored[0].pendingPanels?.[1].fileNarratorId).toBe("host");
+	});
+
+	test("preserves actual canonical and suffixed Dockview ids in v3 layouts", () => {
+		const canonical = fileDockPanelId("/repo/collide-1f7f9218.txt");
+		const actualIds = [canonical, `${canonical}-4`, "restored-arbitrary-file"];
+		const nodes = [mounted({ layout: layout(actualIds) })];
+		expect(parseDetachedNodes(serializeDetachedNodes(nodes))).toEqual(nodes);
+		expect(
+			Object.keys(parseDetachedNodes(serializeDetachedNodes(nodes))[0].layout?.panels ?? {}),
+		).toEqual(actualIds);
+	});
+});
 
 describe("device-scoped pending file panels", () => {
 	test("round-trips panel consent without changing detached deduplication identity", () => {

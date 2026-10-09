@@ -11,6 +11,12 @@ import { parseHTML } from "linkedom";
 import { act, type ReactNode, useEffect, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import type { PluginContributionPick } from "../../plugins/PluginContributionPicker";
+import { fileDockPanelId, NARRATOR_DOCK_COMPONENT } from "../dock/dock-panel-types";
+import {
+	type NarratorDockContextValue,
+	NarratorDockProvider,
+	useNarratorDockContext,
+} from "../dock/NarratorDockContext";
 import { DEFAULT_DIRECTOR_STATE, serializeWorkspaceLayout } from "./dockview-layout";
 import { PANEL_COMPONENT, type WorkspacePanelParams } from "./panel-types";
 import {
@@ -272,6 +278,41 @@ async function mountWorkspace(count = 2, registry?: IDockviewReactProps["compone
 	expect(api.panels).toHaveLength(count);
 }
 
+async function mountFocus() {
+	const captured: { dock: NarratorDockContextValue | null } = { dock: null };
+	function FocusSurface() {
+		captured.dock = useNarratorDockContext();
+		return (
+			<DockviewReact
+				defaultRenderer="always"
+				components={Object.fromEntries(
+					Object.values(NARRATOR_DOCK_COMPONENT).map((name) => [name, ResourceWrapper]),
+				)}
+				onReady={(event) => {
+					api = event.api;
+					if (!captured.dock) throw new Error("missing focus dock context");
+					captured.dock.apiRef.current = api;
+					api.layout(1200, 800);
+					api.addPanel({
+						id: "ndock-chat",
+						component: "chat",
+						params: { panelType: "chat", narratorId: "n0" },
+					});
+				}}
+			/>
+		);
+	}
+	await change(() =>
+		root.render(
+			<NarratorDockProvider narratorId="n0">
+				<FocusSurface />
+			</NarratorDockProvider>,
+		),
+	);
+	if (!captured.dock?.openFilePanel) throw new Error("missing focus file opener");
+	return captured.dock;
+}
+
 function gridSizes() {
 	return api.groups
 		.filter((group) => group.api.location.type === "grid")
@@ -322,6 +363,8 @@ function serializedLayout(): SerializedDockview {
 }
 
 describe("real workspace Dockview resource lifecycle", () => {
+	const firstCollisionPath = "/repo/collide-1f7f9218.txt";
+	const secondCollisionPath = "/repo/collide-08c374cf.txt";
 	test.each([
 		2, 3,
 	])("first open with %s narrator groups floats without resizing the grid or premature native-event pin", async (count) => {
@@ -367,6 +410,295 @@ describe("real workspace Dockview resource lifecycle", () => {
 		expect(reveals).toBe(0);
 		for (let index = 0; index < count; index++)
 			expect(api.getPanel(`n${index}`)?.api.isVisible).toBe(true);
+	});
+
+	test.each([
+		["non-colliding", "/repo/a.ts", "/repo/b.ts"],
+		// These distinct, equal-length paths collide in the legacy panel-id hash.
+		["hash-colliding", "/repo/collide-1f7f9218.txt", "/repo/collide-08c374cf.txt"],
+	])("opening %s files preserves both resources and the first instance", async (_kind, firstPath, secondPath) => {
+		await mountWorkspace();
+		await change(() => store.openFilePanel("n0", firstPath));
+		const first = requiredPanel(workspaceFilePanelId("n0", firstPath));
+		const firstParams = first.params;
+		const firstNode = content(first.id);
+		const firstInstance = firstNode.getAttribute("data-instance");
+
+		await change(() => store.openFilePanel("n0", secondPath));
+		const files = api.panels.filter((panel) => panel.params?.panelType === "file");
+		const second = files.find((panel) => panel.params?.filePath === secondPath);
+		expect({
+			filePanelCount: files.length,
+			firstFilePath: first.params?.filePath,
+			firstParamsUnchanged: first.params === firstParams,
+			activeFilePath: api.activePanel?.params?.filePath,
+		}).toEqual({
+			filePanelCount: 2,
+			firstFilePath: firstPath,
+			firstParamsUnchanged: true,
+			activeFilePath: secondPath,
+		});
+		expect(api.getPanel(first.id)).toBe(first);
+		expect(content(first.id)).toBe(firstNode);
+		expect(content(first.id).getAttribute("data-instance")).toBe(firstInstance);
+		expect(mounts.get(first.id)).toBe(1);
+		expect(cleanups.get(first.id) ?? 0).toBe(0);
+		expect(second).toBeDefined();
+		expect(api.activePanel).toBe(second);
+	});
+
+	test.each([
+		"workspace",
+		"focus",
+	] as const)("%s file opener retains colliding panels and reuses each on repeated navigation", async (surface) => {
+		const focus = surface === "focus" ? await mountFocus() : null;
+		if (!focus) await mountWorkspace();
+		const open = (path: string) =>
+			focus ? focus.openFilePanel?.(path) : store.openFilePanel("n0", path);
+		await change(() => open(firstCollisionPath));
+		const first = api.activePanel;
+		if (!first) throw new Error("missing first file");
+		const firstParams = first.params;
+		const firstNode = content(first.id);
+		await change(() => open(secondCollisionPath));
+		const second = api.activePanel;
+		expect(second === first).toBe(false);
+		expect(first.params).toBe(firstParams);
+		expect(content(first.id)).toBe(firstNode);
+		for (const [path, panel] of [
+			[firstCollisionPath, first],
+			[secondCollisionPath, second],
+		] as const) {
+			await change(() => open(path));
+			expect(api.activePanel).toBe(panel);
+			expect(api.panels.filter((item) => item.params?.panelType === "file")).toHaveLength(2);
+		}
+		expect(content(first.id)).toBe(firstNode);
+		expect(mounts.get(first.id)).toBe(1);
+	});
+
+	test.each([
+		"legacy",
+		"suffix",
+		"arbitrary",
+	] as const)("workspace file opener reuses a matching %s panel before allocating an id", async (kind) => {
+		await mountWorkspace();
+		const canonical = workspaceFilePanelId("n0", firstCollisionPath);
+		const id = kind === "legacy" ? canonical : kind === "suffix" ? `${canonical}-7` : "saved-file";
+		await change(() =>
+			api.addPanel({
+				id,
+				component: PANEL_COMPONENT.file,
+				params: {
+					panelType: "file",
+					filePath: firstCollisionPath,
+					...(kind === "legacy" ? {} : { hostNarratorId: "n0", fileNarratorId: "n0" }),
+				},
+			}),
+		);
+		const existing = requiredPanel(id);
+		const node = content(id);
+		await change(() => store.openFilePanel("n0", firstCollisionPath));
+		expect(api.activePanel === existing).toBe(true);
+		expect(api.panels.filter((item) => item.params?.panelType === "file")).toHaveLength(1);
+		expect(existing.params?.hostNarratorId).toBe("n0");
+		expect(existing.params?.deviceId).toBe("local");
+		expect(content(id)).toBe(node);
+	});
+
+	test.each([
+		"foreign-hostless",
+		"colliding-hostless",
+		"non-file",
+	] as const)("workspace file opener preserves an occupied %s legacy id", async (kind) => {
+		await mountWorkspace();
+		const id = workspaceFilePanelId(kind === "foreign-hostless" ? "n1" : "n0", firstCollisionPath);
+		const original =
+			kind === "non-file"
+				? { panelType: "knowledge", hostNarratorId: "n0", entryId: "entry", scope: "global" }
+				: { panelType: "file", filePath: firstCollisionPath };
+		await change(() =>
+			api.addPanel({
+				id,
+				component: kind === "non-file" ? PANEL_COMPONENT.knowledge : PANEL_COMPONENT.file,
+				params: original,
+			}),
+		);
+
+		const occupied = requiredPanel(id);
+		const params = occupied.params;
+		const path = kind === "foreign-hostless" ? firstCollisionPath : secondCollisionPath;
+		await change(() => store.openFilePanel("n0", path));
+		expect(occupied.params === params).toBe(true);
+		expect(api.activePanel).not.toBe(occupied);
+		expect(api.activePanel?.params).toMatchObject({
+			panelType: "file",
+			hostNarratorId: "n0",
+			filePath: path,
+		});
+	});
+
+	test.each([
+		"legacy",
+		"stale-host",
+		"arbitrary",
+	] as const)("focus file opener reuses a restored %s panel in the current context", async (kind) => {
+		const focus = await mountFocus();
+		const id = kind === "arbitrary" ? "saved-focus-file" : fileDockPanelId(firstCollisionPath);
+		await change(() =>
+			api.addPanel({
+				id,
+				component: "file",
+				params: {
+					panelType: "file",
+					filePath: firstCollisionPath,
+					...(kind === "stale-host" ? { hostNarratorId: "previous-owner" } : {}),
+				},
+			}),
+		);
+		const existing = requiredPanel(id);
+		await change(() => focus.openFilePanel?.(firstCollisionPath));
+		expect(api.activePanel === existing).toBe(true);
+		expect(existing.params?.hostNarratorId).toBe("n0");
+		expect(api.panels.filter((panel) => panel.params?.panelType === "file")).toHaveLength(1);
+	});
+
+	test.each([
+		["device", { deviceId: "" }],
+		["authority", { fileNarratorId: "" }],
+	] as const)("workspace file opener keeps empty %s distinct from defaults", async (_name, identity) => {
+		await mountWorkspace();
+		const id = workspaceFilePanelId("n0", firstCollisionPath);
+		await change(() =>
+			api.addPanel({
+				id,
+				component: PANEL_COMPONENT.file,
+				params: {
+					panelType: "file",
+					hostNarratorId: "n0",
+					filePath: firstCollisionPath,
+					...identity,
+				},
+			}),
+		);
+		const existing = requiredPanel(id);
+		const params = existing.params;
+		await change(() => store.openFilePanel("n0", firstCollisionPath));
+		expect(existing.params === params).toBe(true);
+		expect(api.activePanel === existing).toBe(false);
+		expect(api.panels.filter((panel) => panel.params?.panelType === "file")).toHaveLength(2);
+	});
+
+	test("restoring a colliding temporary file preserves durable params and the actual active preview id", async () => {
+		await mountWorkspace();
+		await change(() => store.openFilePanel("n0", secondCollisionPath));
+		const captured = store.captureTemporaryResources();
+		await change(() => api.fromJSON(serializedLayout()));
+		await change(() =>
+			api.addPanel({
+				id: captured[0].id,
+				component: PANEL_COMPONENT.file,
+				params: { panelType: "file", hostNarratorId: "n0", filePath: firstCollisionPath },
+			}),
+		);
+		const durable = requiredPanel(captured[0].id);
+		const params = durable.params;
+		const node = content(durable.id);
+		await change(() => store.restoreTemporaryResources(captured));
+		const restored = api.panels.find((panel) => panel.params?.filePath === secondCollisionPath);
+		expect(restored).toBeDefined();
+		if (!restored) throw new Error("missing restored file");
+		expect(durable.params).toBe(params);
+		expect(content(durable.id)).toBe(node);
+		expect(restored).not.toBe(durable);
+		expect(api.activePanel).toBe(restored);
+		expect(store.isActivePreview(restored.id)).toBe(true);
+		expect(store.isTemporary(durable.id)).toBe(false);
+		await change(() => store.restoreTemporaryResources(captured));
+		expect(api.panels.filter((panel) => panel.params?.panelType === "file")).toHaveLength(2);
+		expect(api.activePanel).toBe(restored);
+	});
+
+	test.each([
+		{ capturedReference: true, capturedConfirmation: true },
+		{ capturedReference: false, capturedConfirmation: false },
+		{ capturedReference: true, capturedConfirmation: false },
+		{ capturedReference: false, capturedConfirmation: true },
+	])("layout rebuild merges sticky file flags into a reused durable panel: %j", async ({
+		capturedReference,
+		capturedConfirmation,
+	}) => {
+		await mountWorkspace();
+		const filePath = "/repo/shared.ts";
+		await change(() =>
+			store.openFilePanel("n0", filePath, "Captured", {
+				deviceId: "remote",
+				fileNarratorId: "reader",
+				selection: selection(3),
+				referenceOrigin: capturedReference,
+			}),
+		);
+		const preview = api.activePanel;
+		if (!preview) throw new Error("missing temporary file");
+		await change(() => preview.api.updateParameters({ largeFileConfirmed: capturedConfirmation }));
+		const captured = store.captureTemporaryResources();
+		const durableId = "saved-file-with-another-id";
+		await change(() =>
+			api.addPanel({
+				id: durableId,
+				component: PANEL_COMPONENT.file,
+				title: "Durable title",
+				params: {
+					panelType: "file",
+					hostNarratorId: "n0",
+					filePath,
+					deviceId: "remote",
+					fileNarratorId: "reader",
+					fileName: "Durable",
+					selection: selection(8),
+					highlightRequestId: "durable-highlight",
+					referenceOrigin: !capturedReference,
+					largeFileConfirmed: !capturedConfirmation,
+				},
+			}),
+		);
+		const saved = serializedLayout();
+		await change(() => api.fromJSON(saved));
+		expect(api.getPanel(preview.id)).toBeUndefined();
+		expect(store.getTemporaryPanelIds().size).toBe(0);
+		const durable = requiredPanel(durableId);
+		const params = { ...durable.params };
+		const node = content(durableId);
+		await change(() => requiredPanel("n1").api.setActive());
+		for (let attempt = 0; attempt < 2; attempt++) {
+			await change(() => store.restoreTemporaryResources(captured));
+			expect(requiredPanel(durableId)).toBe(durable);
+			expect(content(durableId)).toBe(node);
+			expect(durable.params).toEqual({
+				...params,
+				referenceOrigin: true,
+				largeFileConfirmed: true,
+			});
+			expect(durable.api.title).toBe("Durable title");
+			expect(api.getPanel(preview.id)).toBeUndefined();
+			expect(api.panels.filter((panel) => panel.params?.panelType === "file")).toHaveLength(1);
+			expect(store.isTemporary(durableId)).toBe(false);
+			expect(store.isActivePreview(durableId)).toBe(false);
+			expect(api.activePanel).toBe(requiredPanel("n1"));
+		}
+	});
+
+	test("restoring a temporary file retains its free captured suffix", async () => {
+		await mountWorkspace();
+		await change(() => store.openFilePanel("n0", secondCollisionPath));
+		const captured = store.captureTemporaryResources();
+		// A previously colliding layout may restore only its suffixed resource.
+		captured[0].id += "-7";
+		await change(() => api.fromJSON(serializedLayout()));
+		await change(() => store.restoreTemporaryResources(captured));
+		expect(api.activePanel).toBe(requiredPanel(captured[0].id));
+		expect(store.isActivePreview(captured[0].id)).toBe(true);
+		expect(api.activePanel?.params?.filePath).toBe(secondCollisionPath);
 	});
 
 	test("center pin preserves panel, React instance and grid dimensions; repeat open focuses the same resource", async () => {

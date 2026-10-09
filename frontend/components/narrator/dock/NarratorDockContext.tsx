@@ -53,6 +53,7 @@ import {
 	NARRATOR_DOCK_COMPONENT,
 	type NarratorDockPanelParams,
 	type NarratorToolPanelType,
+	resolveFilePanel,
 	subagentDockPanelId,
 } from "./dock-panel-types";
 
@@ -470,14 +471,22 @@ export function NarratorDockProvider({
 				selection: options.selection,
 				highlightRequestId: options.highlightRequestId ?? nextHighlightRequestId(),
 			};
-			const id = fileDockPanelId(filePath, deviceId, options.toolEdit, fileNarratorId);
-			const existing = api.getPanel(id);
+			const identity: FilePanelParams & { hostNarratorId: string } = {
+				panelType: "file",
+				hostNarratorId: narratorId,
+				filePath,
+				...navigation,
+			};
+			const { id, existing } = resolveFilePanel(
+				api.panels,
+				identity,
+				fileDockPanelId(filePath, deviceId, options.toolEdit, fileNarratorId),
+				"focus",
+			);
 			if (existing) {
 				// Layouts written before file editing carried no host identity. Repair the
 				// live panel when it is reopened so the edit action appears immediately and
-				// the corrected params are available to later drags / persistence. Guard the
-				// cast: corrupt persisted params are replaced wholesale — falling through to
-				// addPanel would throw on the duplicate id.
+				// the corrected params are available to later drags / persistence.
 				const current = existing.params as FilePanelParams | undefined;
 				existing.api.updateParameters({
 					...current,
