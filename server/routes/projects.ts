@@ -645,6 +645,7 @@ projectRoutes.delete("/:id", async (c) => {
 				})
 				.where(eq(remoteDevices.projectId, id));
 			await db.delete(projects).where(eq(projects.id, id));
+			projectDbManager.close(id);
 			removeTabFromAllUsers("project", id).catch((err) => {
 				logger.warn("Failed to remove project tab from users", {
 					projectId: id,
