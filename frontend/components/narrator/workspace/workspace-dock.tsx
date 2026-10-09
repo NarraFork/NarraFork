@@ -429,7 +429,7 @@ export class WorkspaceDockStore {
 			let id = resource.id;
 			const params = resource.params as FilePanelParams | undefined;
 			if (params?.panelType === "file") {
-				id = resolveFilePanel(
+				const resolved = resolveFilePanel(
 					api.panels,
 					{ ...params, hostNarratorId: resource.origin.hostNarratorId },
 					workspaceFilePanelId(
@@ -441,7 +441,18 @@ export class WorkspaceDockStore {
 					),
 					"workspace",
 					resource.id,
-				).id;
+				);
+				id = resolved.id;
+				if (resolved.existing) {
+					const existingParams = resolved.existing.params as FilePanelParams;
+					resolved.existing.api.updateParameters({
+						...existingParams,
+						referenceOrigin:
+							existingParams.referenceOrigin === true || params.referenceOrigin === true,
+						largeFileConfirmed:
+							existingParams.largeFileConfirmed === true || params.largeFileConfirmed === true,
+					});
+				}
 			}
 			this.openResource(
 				resource.origin.hostNarratorId,

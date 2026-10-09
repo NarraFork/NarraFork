@@ -619,6 +619,75 @@ describe("real workspace Dockview resource lifecycle", () => {
 		expect(api.activePanel).toBe(restored);
 	});
 
+	test.each([
+		{ capturedReference: true, capturedConfirmation: true },
+		{ capturedReference: false, capturedConfirmation: false },
+		{ capturedReference: true, capturedConfirmation: false },
+		{ capturedReference: false, capturedConfirmation: true },
+	])("layout rebuild merges sticky file flags into a reused durable panel: %j", async ({
+		capturedReference,
+		capturedConfirmation,
+	}) => {
+		await mountWorkspace();
+		const filePath = "/repo/shared.ts";
+		await change(() =>
+			store.openFilePanel("n0", filePath, "Captured", {
+				deviceId: "remote",
+				fileNarratorId: "reader",
+				selection: selection(3),
+				referenceOrigin: capturedReference,
+			}),
+		);
+		const preview = api.activePanel;
+		if (!preview) throw new Error("missing temporary file");
+		await change(() => preview.api.updateParameters({ largeFileConfirmed: capturedConfirmation }));
+		const captured = store.captureTemporaryResources();
+		const durableId = "saved-file-with-another-id";
+		await change(() =>
+			api.addPanel({
+				id: durableId,
+				component: PANEL_COMPONENT.file,
+				title: "Durable title",
+				params: {
+					panelType: "file",
+					hostNarratorId: "n0",
+					filePath,
+					deviceId: "remote",
+					fileNarratorId: "reader",
+					fileName: "Durable",
+					selection: selection(8),
+					highlightRequestId: "durable-highlight",
+					referenceOrigin: !capturedReference,
+					largeFileConfirmed: !capturedConfirmation,
+				},
+			}),
+		);
+		const saved = serializedLayout();
+		await change(() => api.fromJSON(saved));
+		expect(api.getPanel(preview.id)).toBeUndefined();
+		expect(store.getTemporaryPanelIds().size).toBe(0);
+		const durable = requiredPanel(durableId);
+		const params = { ...durable.params };
+		const node = content(durableId);
+		await change(() => requiredPanel("n1").api.setActive());
+		for (let attempt = 0; attempt < 2; attempt++) {
+			await change(() => store.restoreTemporaryResources(captured));
+			expect(requiredPanel(durableId)).toBe(durable);
+			expect(content(durableId)).toBe(node);
+			expect(durable.params).toEqual({
+				...params,
+				referenceOrigin: true,
+				largeFileConfirmed: true,
+			});
+			expect(durable.api.title).toBe("Durable title");
+			expect(api.getPanel(preview.id)).toBeUndefined();
+			expect(api.panels.filter((panel) => panel.params?.panelType === "file")).toHaveLength(1);
+			expect(store.isTemporary(durableId)).toBe(false);
+			expect(store.isActivePreview(durableId)).toBe(false);
+			expect(api.activePanel).toBe(requiredPanel("n1"));
+		}
+	});
+
 	test("restoring a temporary file retains its free captured suffix", async () => {
 		await mountWorkspace();
 		await change(() => store.openFilePanel("n0", secondCollisionPath));
