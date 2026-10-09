@@ -1,7 +1,16 @@
 import { z } from "zod/v4";
 
 const workspaceKey = z.string().min(1).max(256);
-export const worktreeListSchema = z.object({ workspaceKey }).strict();
+export const worktreeListQuerySchema = z
+	.object({
+		limit: z.coerce.number().int().min(1).max(100).default(20),
+		cursor: z.string().min(1).max(512).optional(),
+		sort: z.enum(["lastCommitAt", "createdAt", "name"]).default("lastCommitAt"),
+		order: z.enum(["asc", "desc"]).default("desc"),
+		search: z.string().trim().max(512).default(""),
+	})
+	.strict();
+export const worktreeListSchema = worktreeListQuerySchema.extend({ workspaceKey });
 export const worktreeCreateSchema = z
 	.object({
 		expectedRevision: z.number().int().nonnegative(),

@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -26,6 +26,10 @@ import {
 	NarratorWorktreeService,
 	parseLegacyWorktreePorcelain,
 	parseWorktreePorcelain,
+	WORKTREE_LIST_CACHE_MAX_BYTES,
+	WORKTREE_LIST_CACHE_MAX_SNAPSHOTS,
+	WORKTREE_LIST_CACHE_TTL_MS,
+	WORKTREE_LIST_MAX_ENTRIES,
 	WORKTREE_MAX_ENTRIES,
 	WORKTREE_MAX_OUTPUT_BYTES,
 	type WorktreeServicePorts,
@@ -553,6 +557,385 @@ describe("legacy Git worktree compatibility", () => {
 	});
 });
 
+describe("bounded worktree snapshot pagination", () => {
+	function inventory(count: number, padding = "") {
+		const calls: string[][] = [];
+		const rows = Array.from({ length: count }, (_, index) => {
+			const name = `branch-${String(index).padStart(4, "0")}`;
+			return {
+				name,
+				path: `${source}/${padding}${name}`,
+				head: (index + 1).toString(16).padStart(40, "0"),
+				time: 1700000000 + index,
+			};
+		});
+		ports.runGit = async (_target, args) => {
+			calls.push(args);
+			const stdout =
+				args[0] === "show"
+					? args
+							.slice(4, -1)
+							.map((head) => {
+								const row = rows.find((row) => row.head === head);
+								return row ? `${head} ${row.time}\n` : "";
+							})
+							.join("")
+					: rows
+							.map(
+								(row) =>
+									`worktree ${row.path}\0HEAD ${row.head}\0branch refs/heads/${row.name}\0\0`,
+							)
+							.join("");
+			return { exitCode: 0, stderr: "", stdout };
+		};
+		ports.statDirectory = async (path) => ({
+			birthtimeMs: (rows.findIndex((row) => row.path === path) + 1) * 1000,
+			isDirectory: () => true,
+		});
+		return { rows, calls };
+	}
+
+	test("default 20 newest entries and every subsequent page cover more than 128 without re-enumeration", async () => {
+		const { rows, calls } = inventory(257);
+		let page = await service.list("actor", "narrator", { workspaceKey: "workspace" }, signal());
+		expect(page.entries).toHaveLength(20);
+		expect(page.entries[0]?.branch).toBe("refs/heads/branch-0256");
+		expect(page.truncated).toBe(false);
+		const all = [...page.entries];
+		const firstCalls = calls.length;
+		while (page.nextCursor) {
+			page = await service.list(
+				"actor",
+				"narrator",
+				{ workspaceKey: "workspace", cursor: page.nextCursor },
+				signal(),
+			);
+			all.push(...page.entries);
+		}
+		expect(all.map((row) => row.path)).toEqual(rows.toReversed().map((row) => row.path));
+		expect(new Set(all.map((row) => row.path)).size).toBe(257);
+		expect(page.hasMore).toBe(false);
+		expect(page.nextCursor).toBeNull();
+		expect(calls).toHaveLength(firstCalls);
+		expect(calls.filter((args) => args[0] === "show").map((args) => args.length - 5)).toEqual([
+			128, 128, 1,
+		]);
+		expect(authorizations).toHaveLength(13);
+	});
+
+	test("legacy listing independently verifies more than 128 registrations before paging", async () => {
+		const { rows } = inventory(140);
+		for (let index = 0; index < rows.length; index++) {
+			const admin = join(source, ".git", "worktrees", `linked-${index}`);
+			await mkdir(admin, { recursive: true });
+			await writeFile(join(admin, "gitdir"), `${rows[index]?.path}/.git\n`);
+		}
+		const run = ports.runGit;
+		ports.runGit = async (workspace, args, abort, writing) => {
+			if (!run) throw new Error("Missing fixture runner");
+			if (args[0] !== "worktree") return run(workspace, args, abort, writing);
+			if (args.includes("-z")) return unsupportedZ;
+			const result = await run(workspace, args, abort, writing);
+			return {
+				...result,
+				stdout: `worktree ${source}\nHEAD ${rows[0]?.head}\nbranch refs/heads/main\n\n${result.stdout.replaceAll("\0", "\n")}`,
+			};
+		};
+		let page = await service.list("actor", "narrator", { workspaceKey: "workspace" }, signal());
+		expect(page.entries).toHaveLength(20);
+		expect(page.truncated).toBe(false);
+		let total = page.entries.length;
+		while (page.nextCursor) {
+			page = await service.list(
+				"actor",
+				"narrator",
+				{ workspaceKey: "workspace", cursor: page.nextCursor },
+				signal(),
+			);
+			total += page.entries.length;
+		}
+		expect(total).toBe(141);
+	});
+
+	test("listing output budget exceeds mutation budget but still reports byte truncation", async () => {
+		const { rows } = inventory(80, "x".repeat(3000));
+		const page = await service.list(
+			"actor",
+			"narrator",
+			{ workspaceKey: "workspace", limit: 100 },
+			signal(),
+		);
+		expect(page.entries).toHaveLength(rows.length);
+		expect(page.truncated).toBe(false);
+		inventory(1400, "x".repeat(3500));
+		const limited = await service.list(
+			"actor",
+			"narrator",
+			{ workspaceKey: "workspace" },
+			signal(),
+		);
+		expect(limited.truncated).toBe(true);
+		expect(limited.entries).toHaveLength(20);
+		// Paging metadata must precede bulky rows in tool JSON, whose tail may be clipped.
+		expect(Object.keys(limited).slice(0, 5)).toEqual([
+			"repositoryKey",
+			"hasMore",
+			"nextCursor",
+			"truncated",
+			"entries",
+		]);
+		expect(JSON.stringify(limited).slice(0, 256)).toContain(limited.nextCursor ?? "missing cursor");
+	});
+
+	test("globally sorts and filters branch names and paths before paging", async () => {
+		inventory(160);
+		for (const sort of ["lastCommitAt", "createdAt", "name"] as const) {
+			for (const order of ["asc", "desc"] as const) {
+				const page = await service.list(
+					"actor",
+					"narrator",
+					{ workspaceKey: "workspace", sort, order, search: "BRANCH-01", limit: 7 },
+					signal(),
+				);
+				expect(page.entries).toHaveLength(7);
+				expect(page.entries[0]?.branch).toBe(
+					order === "asc" ? "refs/heads/branch-0100" : "refs/heads/branch-0159",
+				);
+				expect(page.hasMore).toBe(true);
+			}
+		}
+		const paths = await service.list(
+			"actor",
+			"narrator",
+			{ workspaceKey: "workspace", search: source, limit: 100 },
+			signal(),
+		);
+		expect(paths.entries).toHaveLength(100);
+		const empty = await service.list(
+			"actor",
+			"narrator",
+			{ workspaceKey: "workspace", search: "no-match" },
+			signal(),
+		);
+		expect(empty.entries).toEqual([]);
+		expect(empty.nextCursor).toBeNull();
+		expect(empty.hasMore).toBe(false);
+	});
+
+	test("unknown times stay last in either direction and equal times tie by name then path", async () => {
+		const head = "a".repeat(40);
+		const paths = ["/repo/z", "/repo/b", "/repo/a", "/repo/unknown"];
+		ports.runGit = async (_target, args) => ({
+			exitCode: 0,
+			stderr: "",
+			stdout:
+				args[0] === "show"
+					? `${head} 1700000000\n`
+					: paths
+							.map(
+								(path, index) =>
+									`worktree ${path}\0${index === 3 ? "" : `HEAD ${head}\0`}branch refs/heads/${index === 0 ? "same" : index === 1 ? "same" : index === 2 ? "first" : "unknown"}\0\0`,
+							)
+							.join(""),
+		});
+		ports.statDirectory = async (path) => ({
+			birthtimeMs: path.endsWith("unknown") ? 0 : 1234,
+			isDirectory: () => true,
+		});
+		for (const sort of ["lastCommitAt", "createdAt"] as const) {
+			for (const order of ["asc", "desc"] as const) {
+				const page = await service.list(
+					"actor",
+					"narrator",
+					{ workspaceKey: "workspace", sort, order },
+					signal(),
+				);
+				expect(page.entries.map((row) => row.path)).toEqual([
+					"/repo/a",
+					"/repo/b",
+					"/repo/z",
+					"/repo/unknown",
+				]);
+			}
+		}
+	});
+
+	test("snapshot is immutable to returned rows and subsequent inventory changes", async () => {
+		const { calls } = inventory(45);
+		const page = await service.list("actor", "narrator", { workspaceKey: "workspace" }, signal());
+		if (page.entries[0]) page.entries[0].path = "mutated";
+		const before = calls.length;
+		ports.runGit = async () => {
+			throw new Error("must not enumerate again");
+		};
+		const next = await service.list(
+			"actor",
+			"narrator",
+			{ workspaceKey: "workspace", cursor: page.nextCursor },
+			signal(),
+		);
+		expect(next.entries[0]?.branch).toBe("refs/heads/branch-0024");
+		expect(calls).toHaveLength(before);
+	});
+
+	test("rejects forged cursors and actor, repository, narrator and query mismatches", async () => {
+		inventory(40);
+		const page = await service.list("actor", "narrator", { workspaceKey: "workspace" }, signal());
+		const request = { workspaceKey: "workspace", cursor: page.nextCursor };
+		for (const query of [{ sort: "name" }, { order: "asc" }, { search: "x" }]) {
+			await expect(
+				service.list("actor", "narrator", { ...request, ...query }, signal()),
+			).rejects.toMatchObject({ code: "WORKTREE_CURSOR_MISMATCH" });
+		}
+		await expect(service.list("other", "narrator", request, signal())).rejects.toMatchObject({
+			code: "WORKTREE_CURSOR_MISMATCH",
+		});
+		await expect(service.list("actor", "other", request, signal())).rejects.toMatchObject({
+			code: "WORKTREE_CURSOR_MISMATCH",
+		});
+		target.workspace.repositoryKey = "other";
+		await expect(service.list("actor", "narrator", request, signal())).rejects.toMatchObject({
+			code: "WORKTREE_CURSOR_MISMATCH",
+		});
+		target.workspace.repositoryKey = "repository";
+		target.workspace.workspaceKey = "other";
+		await expect(
+			service.list("actor", "narrator", { ...request, workspaceKey: "other" }, signal()),
+		).rejects.toMatchObject({ code: "WORKTREE_CURSOR_MISMATCH" });
+		target.workspace.workspaceKey = "workspace";
+		for (const cursor of ["bogus", page.nextCursor?.replace(":20:", ":21:")]) {
+			await expect(
+				service.list("actor", "narrator", { ...request, cursor }, signal()),
+			).rejects.toMatchObject({ code: "WORKTREE_CURSOR_INVALID" });
+		}
+	});
+
+	test("reauthorizes cached pages and refuses revoked permissions without Git reads", async () => {
+		const { calls } = inventory(40);
+		const page = await service.list("actor", "narrator", { workspaceKey: "workspace" }, signal());
+		const count = calls.length;
+		ports.authorize = async () => {
+			throw new AppError("Denied", 403, "DENIED");
+		};
+		await expect(
+			service.list(
+				"actor",
+				"narrator",
+				{ workspaceKey: "workspace", cursor: page.nextCursor },
+				signal(),
+			),
+		).rejects.toMatchObject({ code: "DENIED" });
+		expect(calls).toHaveLength(count);
+	});
+
+	test("expires snapshots with explicit code and bounds cache capacity", async () => {
+		const { calls } = inventory(40);
+		const page = await service.list("actor", "narrator", { workspaceKey: "workspace" }, signal());
+		const before = calls.length;
+		const now = Date.now();
+		const clock = spyOn(Date, "now").mockReturnValue(now + WORKTREE_LIST_CACHE_TTL_MS + 1);
+		try {
+			await expect(
+				service.list(
+					"actor",
+					"narrator",
+					{ workspaceKey: "workspace", cursor: page.nextCursor },
+					signal(),
+				),
+			).rejects.toMatchObject({ code: "WORKTREE_CURSOR_EXPIRED" });
+			expect(calls).toHaveLength(before);
+		} finally {
+			clock.mockRestore();
+		}
+		const first = await service.list("actor", "narrator", { workspaceKey: "workspace" }, signal());
+		for (let index = 0; index < WORKTREE_LIST_CACHE_MAX_SNAPSHOTS; index++)
+			await service.list("actor", "narrator", { workspaceKey: "workspace" }, signal());
+		await expect(
+			service.list(
+				"actor",
+				"narrator",
+				{ workspaceKey: "workspace", cursor: first.nextCursor },
+				signal(),
+			),
+		).rejects.toMatchObject({ code: "WORKTREE_CURSOR_EXPIRED" });
+	});
+
+	test("bounds total retained bytes independently of snapshot count", async () => {
+		inventory(1000, "x".repeat(3500));
+		const first = await service.list("actor", "narrator", { workspaceKey: "workspace" }, signal());
+		const pages = Math.ceil(WORKTREE_LIST_CACHE_MAX_BYTES / 3_500_000);
+		for (let index = 0; index < pages; index++)
+			await service.list("actor", "narrator", { workspaceKey: "workspace" }, signal());
+		await expect(
+			service.list(
+				"actor",
+				"narrator",
+				{ workspaceKey: "workspace", cursor: first.nextCursor },
+				signal(),
+			),
+		).rejects.toMatchObject({ code: "WORKTREE_CURSOR_EXPIRED" });
+	});
+
+	test("listing cap is explicit and mutation inventory still fails closed at 128", async () => {
+		inventory(WORKTREE_LIST_MAX_ENTRIES + 1);
+		const page = await service.list(
+			"actor",
+			"narrator",
+			{ workspaceKey: "workspace", limit: 100 },
+			signal(),
+		);
+		expect(page.entries).toHaveLength(100);
+		expect(page.truncated).toBe(true);
+		const parsed = parseWorktreePorcelain(
+			Array.from({ length: 130 }, (_, index) => `worktree /repo/${index}\0\0`).join(""),
+		);
+		expect(parsed.entries).toHaveLength(128);
+		expect(parsed.truncated).toBe(true);
+	});
+
+	test("metadata deadline cancels pending Git, bounds stat concurrency and launches no next batch", async () => {
+		inventory(260);
+		const run = ports.runGit;
+		let showCalls = 0;
+		let statCalls = 0;
+		let gitSignal: AbortSignal | undefined;
+		ports.metadataTimeoutMs = 10;
+		ports.runGit = async (workspace, args, abort, writing) => {
+			if (!run) throw new Error("Missing fixture runner");
+			if (args[0] !== "show") return run(workspace, args, abort, writing);
+			showCalls++;
+			gitSignal = abort;
+			return new Promise(() => {});
+		};
+		ports.statDirectory = async () => {
+			statCalls++;
+			return new Promise(() => {});
+		};
+		const page = await service.list("actor", "narrator", { workspaceKey: "workspace" }, signal());
+		expect(page.entries).toHaveLength(20);
+		expect(
+			page.entries.every((entry) => entry.createdAt === null && entry.lastCommitAt === null),
+		).toBe(true);
+		expect(showCalls).toBe(1);
+		expect(statCalls).toBe(4);
+		expect(gitSignal?.aborted).toBe(true);
+	});
+
+	test("cancellation releases caller while a Git adapter is pending and launches no metadata", async () => {
+		const controller = new AbortController();
+		let calls = 0;
+		ports.runGit = async () => {
+			calls++;
+			controller.abort(new Error("cancelled read"));
+			return new Promise(() => {});
+		};
+		await expect(
+			service.list("actor", "narrator", { workspaceKey: "workspace" }, controller.signal),
+		).rejects.toThrow("cancelled read");
+		expect(calls).toBe(1);
+	});
+});
+
 describe("local worktree list/create fixtures", () => {
 	test("lists without write authorization and explicitly disables unsupported capabilities", async () => {
 		target.workspace.capabilities.write = false;
@@ -593,14 +976,11 @@ describe("local worktree list/create fixtures", () => {
 		const result = await service.list("actor", "narrator", { workspaceKey: "workspace" }, signal());
 		const shows = calls.filter((args) => args[0] === "show");
 		expect(shows).toHaveLength(1);
-		expect(shows[0]).toEqual([
-			"show",
-			"--no-walk",
-			"--no-patch",
-			"--format=%H %ct",
-			...new Set(result.entries.map((entry) => entry.head ?? "")),
-			"--",
-		]);
+		expect(shows[0]?.slice(0, 4)).toEqual(["show", "--no-walk", "--no-patch", "--format=%H %ct"]);
+		expect(shows[0]?.slice(4, -1).sort()).toEqual(
+			[...new Set(result.entries.map((entry) => entry.head ?? ""))].sort(),
+		);
+		expect(shows[0]?.at(-1)).toBe("--");
 		expect(result.entries.find((entry) => entry.path === detached)?.detached).toBe(true);
 		for (const entry of result.entries) {
 			expect(entry.lastCommitAt).toBe(
@@ -640,8 +1020,8 @@ describe("local worktree list/create fixtures", () => {
 		expect(calls[1]?.slice(4, -1)).toEqual([head, missing]);
 		expect(result.entries.map((entry) => [entry.createdAt, entry.lastCommitAt])).toEqual([
 			[1234, 1700000000000],
-			[null, null],
 			[null, 1700000000000],
+			[null, null],
 		]);
 	});
 

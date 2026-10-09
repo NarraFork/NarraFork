@@ -44,7 +44,17 @@ export interface WorktreePrepareResult {
 	worktreeName: string;
 	destinationPath: string;
 }
+export interface WorktreeListQuery {
+	limit?: number;
+	cursor?: string;
+	sort?: "lastCommitAt" | "createdAt" | "name";
+	order?: "asc" | "desc";
+	search?: string;
+}
 export interface WorktreeListResult {
+	/** Omitted only by older hosts; new list responses always include pagination. */
+	nextCursor?: string | null;
+	hasMore?: boolean;
 	repositoryKey: string | null;
 	entries: WorktreeEntry[];
 	truncated: boolean;

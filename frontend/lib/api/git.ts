@@ -3,6 +3,7 @@ import type { GitWorkspace } from "@shared/git-workspace";
 import type {
 	WorktreeCreateRequest,
 	WorktreeCreateResult,
+	WorktreeListQuery,
 	WorktreeListResult,
 	WorktreePrepareRequest,
 	WorktreePrepareResult,
@@ -77,11 +78,21 @@ function gitRequest<T>(path: string, options: RequestInit = {}): Promise<T> {
 
 // Reads are cancellable by React Query; writes are never retried automatically.
 export const gitApi = {
-	listNarratorWorktrees: (id: string, workspaceKey: string, signal?: AbortSignal) =>
-		gitRequest<WorktreeListResult>(
-			`/narrators/${encodeURIComponent(id)}/git/worktrees?workspaceKey=${encodeURIComponent(workspaceKey)}`,
+	listNarratorWorktrees: (
+		id: string,
+		workspaceKey: string,
+		signal?: AbortSignal,
+		query: WorktreeListQuery = {},
+	) => {
+		const params = new URLSearchParams({ workspaceKey });
+		for (const [key, value] of Object.entries(query)) {
+			if (value !== undefined) params.set(key, String(value));
+		}
+		return gitRequest<WorktreeListResult>(
+			`/narrators/${encodeURIComponent(id)}/git/worktrees?${params}`,
 			{ signal },
-		),
+		);
+	},
 	prepareNarratorWorktree: (id: string, input: WorktreePrepareRequest) =>
 		gitRequest<WorktreePrepareResult>(
 			`/narrators/${encodeURIComponent(id)}/git/worktrees/prepare`,

@@ -109,6 +109,8 @@
 		"uncommittedStay": "Uncommitted changes stay in the original directory. They are not moved to the new worktree.",
 		"createSwitch": "Create and switch",
 		"retry": "Retry",
+		"loadMore": "Load more worktrees",
+		"retryMore": "Retry loading more worktrees",
 		"retrySwitch": "Retry switching only",
 		"inspectExisting": "Check existing worktrees",
 		"verify": "Verify result / refresh",

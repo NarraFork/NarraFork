@@ -109,6 +109,8 @@
 		"uncommittedStay": "未提交修改保留在原目录，不会搬到新 worktree。",
 		"createSwitch": "创建并切换",
 		"retry": "重试",
+		"loadMore": "加载更多 worktree",
+		"retryMore": "重试加载更多 worktree",
 		"retrySwitch": "仅重试切换",
 		"inspectExisting": "检查已有 worktree",
 		"verify": "核实结果 / 刷新",

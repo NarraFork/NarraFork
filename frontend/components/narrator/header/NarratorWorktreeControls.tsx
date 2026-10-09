@@ -23,18 +23,13 @@ import {
 	Tooltip,
 } from "@mantine/core";
 import { IconGitFork, IconSwitchHorizontal } from "@tabler/icons-react";
-import { useQuery } from "@tanstack/react-query";
+import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
 import { nanoid } from "nanoid";
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { DirectoryPicker } from "../../common/DirectoryPicker";
 import { type WorktreeDraft, WorktreeFlow, type WorktreeFlowState } from "./worktree-flow";
-import {
-	filterSortWorktrees,
-	type WorktreeSort,
-	worktreeDirectoryLabel,
-	worktreeLabel,
-} from "./worktree-list-view";
+import { type WorktreeSort, worktreeDirectoryLabel, worktreeLabel } from "./worktree-list-view";
 import {
 	draftFingerprint,
 	RECEIPT_SCOPE_LIMIT,
@@ -265,21 +260,135 @@ function ScopedWorktreeControls({
 	const [search, setSearch] = useState("");
 	const [sort, setSort] = useState<WorktreeSort>("lastCommitAt");
 	const [descending, setDescending] = useState(true);
-	const worktrees = useQuery({
-		queryKey: ["narratorWorktrees", narratorId, context?.git?.workspaceKey],
-		queryFn: ({ signal }) =>
-			api.listNarratorWorktrees(narratorId, context?.git?.workspaceKey ?? "", signal),
+	const [debouncedSearch, setDebouncedSearch] = useState("");
+	useEffect(() => {
+		const timer = setTimeout(() => setDebouncedSearch(search.trim()), 300);
+		return () => clearTimeout(timer);
+	}, [search]);
+	const queryClient = useQueryClient();
+	const listQuery = useMemo(
+		() =>
+			({
+				limit: 20,
+				search: debouncedSearch,
+				sort,
+				order: descending ? "desc" : "asc",
+			}) as const,
+		[debouncedSearch, sort, descending],
+	);
+	// Revisiting old conditions must not restore/refetch their entire cached cursor chain.
+	const listScope = useMemo(
+		() => ({
+			narratorId,
+			workspaceKey: context?.git?.workspaceKey,
+			query: listQuery,
+			generation: nanoid(),
+		}),
+		[narratorId, context?.git?.workspaceKey, listQuery],
+	);
+	const listKey = useMemo(
+		() => [
+			"narratorWorktrees",
+			listScope.narratorId,
+			listScope.workspaceKey,
+			listScope.query,
+			listScope.generation,
+		],
+		[listScope],
+	);
+	const worktrees = useInfiniteQuery({
+		queryKey: listKey,
+		initialPageParam: undefined as string | undefined,
+		queryFn: ({ signal, pageParam }) =>
+			api.listNarratorWorktrees(narratorId, context?.git?.workspaceKey ?? "", signal, {
+				...listQuery,
+				cursor: pageParam,
+			}),
+		getNextPageParam: (page) => (page.hasMore ? (page.nextCursor ?? undefined) : undefined),
 		enabled: canList,
+		gcTime: 0, // Inactive generations have no reuse value; release their accumulated pages.
 		retry: false,
 		staleTime: 5_000,
 		refetchOnWindowFocus: false,
 	});
-	const visibleEntries = filterSortWorktrees(
-		worktrees.data?.entries ?? [],
+	const firstPage = worktrees.data?.pages[0];
+	const visibleEntries = [
+		...new Map(
+			(worktrees.data?.pages.flatMap((page) => page.entries) ?? []).map((entry) => [
+				entry.path,
+				entry,
+			]),
+		).values(),
+	];
+	const cursorExpired =
+		worktrees.error instanceof ApiError && worktrees.error.data?.code === "WORKTREE_CURSOR_EXPIRED";
+	useEffect(() => {
+		if (cursorExpired) {
+			// Reset the entire chain: refetching old pageParams would reuse expired cursors.
+			void queryClient.resetQueries({ queryKey: listKey, exact: true });
+		}
+	}, [cursorExpired, queryClient, listKey]);
+	const [viewport, setViewport] = useState<HTMLDivElement | null>(null);
+	const sentinel = useRef<HTMLDivElement>(null);
+	useEffect(() => {
+		const target = sentinel.current;
+		if (
+			!menuOpened ||
+			!viewport ||
+			!target ||
+			!worktrees.data ||
+			!worktrees.hasNextPage ||
+			worktrees.isFetching ||
+			worktrees.isFetchNextPageError ||
+			search.trim() !== debouncedSearch
+		)
+			return;
+		let disposed = false;
+		let requesting = false;
+		const load = () => {
+			if (disposed || requesting) return;
+			requesting = true;
+			// Query-level cancelRefetch:false also coalesces manual and observer requests.
+			void worktrees.fetchNextPage({ cancelRefetch: false }).finally(() => {
+				requesting = false;
+			});
+		};
+		const check = () => {
+			const root = viewport.getBoundingClientRect();
+			const item = target.getBoundingClientRect();
+			if (root.height > 0 && item.top <= root.bottom + 80 && item.bottom >= root.top) load();
+		};
+		const observer =
+			typeof IntersectionObserver === "undefined"
+				? undefined
+				: new IntersectionObserver(
+						(entries) => {
+							if (entries.some((entry) => entry.isIntersecting)) load();
+						},
+						{ root: viewport, rootMargin: "80px" },
+					);
+		observer?.observe(target);
+		const resize = typeof ResizeObserver === "undefined" ? undefined : new ResizeObserver(check);
+		resize?.observe(viewport);
+		viewport.addEventListener("scroll", check);
+		check(); // Also drain pages when the initial list does not fill the viewport.
+		return () => {
+			disposed = true;
+			observer?.disconnect();
+			resize?.disconnect();
+			viewport.removeEventListener("scroll", check);
+		};
+	}, [
+		menuOpened,
+		viewport,
+		worktrees.hasNextPage,
+		worktrees.isFetching,
+		worktrees.isFetchNextPageError,
+		worktrees.fetchNextPage,
+		worktrees.data,
 		search,
-		sort,
-		descending,
-	);
+		debouncedSearch,
+	]);
 	const formatTime = (timestamp: number | null | undefined) =>
 		timestamp == null || !Number.isFinite(timestamp)
 			? t("worktree.unknownTime")
@@ -288,14 +397,14 @@ function ScopedWorktreeControls({
 	const canCreate =
 		canSwitch &&
 		canList &&
-		worktrees.data?.capabilities.create === true &&
+		firstPage?.capabilities.create === true &&
 		!pendingLimit &&
 		!storageError;
 	const createDisabledReason = storageError
 		? t(storageError)
 		: pendingLimit
 			? t("worktree.pendingLimit")
-			: (worktrees.data?.capabilities.reason ?? worktrees.error?.message ?? disabledReason);
+			: (firstPage?.capabilities.reason ?? worktrees.error?.message ?? disabledReason);
 	const startForm = () => {
 		// Keep a successful receipt and failed-switch retry even when the dialog is reopened.
 		if (state.step === "done") {
@@ -334,7 +443,9 @@ function ScopedWorktreeControls({
 						onClick={() => {
 							setSearch("");
 							setMenuOpened(true);
-							if (canList) void worktrees.refetch();
+							// Reopening refreshes from page one, never replaying all saved cursors.
+							if (canList && debouncedSearch === "" && !worktrees.isFetching && !cursorExpired)
+								void queryClient.resetQueries({ queryKey: listKey, exact: true });
 						}}
 					>
 						<IconSwitchHorizontal size={15} />
@@ -453,12 +564,12 @@ function ScopedWorktreeControls({
 							</Button>
 						)}
 						{worktrees.isPending && canList && <Loader size="xs" />}
-						{worktrees.error && (
+						{worktrees.error && !worktrees.isFetchNextPageError && (
 							<Button variant="subtle" onClick={() => void worktrees.refetch()}>
 								{t("worktree.retry")}: {worktrees.error.message}
 							</Button>
 						)}
-						<ScrollArea.Autosize mah="45vh" type="auto">
+						<ScrollArea.Autosize mah="45vh" type="auto" viewportRef={setViewport}>
 							<Stack gap={4}>
 								{visibleEntries.map((entry) => (
 									<Button
@@ -517,6 +628,26 @@ function ScopedWorktreeControls({
 										)}
 									</Button>
 								))}
+								<div ref={sentinel} data-worktree-sentinel style={{ minHeight: 1 }} />
+								{worktrees.isFetchingNextPage && <Loader size="xs" />}
+								{worktrees.isFetchNextPageError && !cursorExpired && (
+									<Button
+										variant="subtle"
+										disabled={worktrees.isFetching}
+										onClick={() => void worktrees.fetchNextPage({ cancelRefetch: false })}
+									>
+										{t("worktree.retryMore")}: {worktrees.error?.message}
+									</Button>
+								)}
+								{worktrees.hasNextPage && !worktrees.isFetchNextPageError && (
+									<Button
+										variant="subtle"
+										disabled={worktrees.isFetching}
+										onClick={() => void worktrees.fetchNextPage({ cancelRefetch: false })}
+									>
+										{t("worktree.loadMore")}
+									</Button>
+								)}
 								{!worktrees.isPending && !worktrees.error && visibleEntries.length === 0 && (
 									<Text size="sm" c="dimmed">
 										{t(search.trim() ? "worktree.noMatches" : "worktree.emptyList")}
@@ -524,9 +655,7 @@ function ScopedWorktreeControls({
 								)}
 							</Stack>
 						</ScrollArea.Autosize>
-						{worktrees.data?.truncated && (
-							<Alert color="yellow">{t("worktree.listTruncated")}</Alert>
-						)}
+						{firstPage?.truncated && <Alert color="yellow">{t("worktree.listTruncated")}</Alert>}
 						{switchError && <Alert color="red">{switchError}</Alert>}
 					</Stack>
 				</Modal>

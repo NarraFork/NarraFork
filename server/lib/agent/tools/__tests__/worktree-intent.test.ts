@@ -1,7 +1,10 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import type { WorktreeCreateResult, WorktreeListResult } from "@shared/narrator-worktrees";
 import { AppError } from "../../../errors";
-import type { WorktreeCreateRequest } from "../../../validators/narrator-worktrees";
+import {
+	type WorktreeCreateRequest,
+	worktreeListSchema,
+} from "../../../validators/narrator-worktrees";
 import { resolveToolJsonSchema } from "../../tool-registry";
 import type { ToolContext, ToolDefinition } from "../../types";
 import { createAgentWorktreeTools, worktreeTool } from "../worktree";
@@ -107,6 +110,21 @@ const execute = async (name: string, input: Record<string, unknown>, context = c
 };
 
 describe("intent-only worktree tools", () => {
+	test("HTTP list query supplies defaults and coerces bounded page sizes", () => {
+		expect(worktreeListSchema.parse({ workspaceKey: "workspace" })).toEqual({
+			workspaceKey: "workspace",
+			limit: 20,
+			sort: "lastCommitAt",
+			order: "desc",
+			search: "",
+		});
+		expect(worktreeListSchema.parse({ workspaceKey: "workspace", limit: "100" }).limit).toBe(100);
+		for (const limit of ["", "0", "101", "2.5", "NaN"]) {
+			expect(worktreeListSchema.safeParse({ workspaceKey: "workspace", limit }).success).toBe(
+				false,
+			);
+		}
+	});
 	test("advertises four flat schemas with honest required fields and bounds", () => {
 		expect([...tools.keys()]).toEqual([
 			"ListWorktrees",
@@ -153,6 +171,25 @@ describe("intent-only worktree tools", () => {
 		}
 		expect(listInputs).toEqual([{ workspaceKey: "workspace" }, { workspaceKey: "workspace" }]);
 		expect(requests).toHaveLength(0);
+	});
+
+	test("list forwards bounded pagination/search/sort without compatibility fields", async () => {
+		const query = { limit: 30, cursor: "snapshot:20", sort: "name", order: "asc", search: " fix " };
+		const output = await execute("ListWorktrees", { ...query, confirm: true });
+		expect(output.isError).toBeUndefined();
+		expect(listInputs).toEqual([{ ...query, search: "fix", workspaceKey: "workspace" }]);
+		for (const invalid of [
+			{ limit: 0 },
+			{ limit: 101 },
+			{ limit: "20" },
+			{ sort: "head" },
+			{ order: "up" },
+			{ cursor: "" },
+			{ search: "x".repeat(513) },
+		]) {
+			expect((await execute("ListWorktrees", invalid)).isError).toBe(true);
+		}
+		expect(listInputs).toHaveLength(1);
 	});
 
 	test("binds frozen host context and supplies HEAD without exposing platform tokens", async () => {

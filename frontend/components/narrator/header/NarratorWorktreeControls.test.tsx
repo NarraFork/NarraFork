@@ -55,7 +55,7 @@ const prepare = mock(async (_id: string, _input: unknown) => ({
 	worktreeName: "named",
 	destinationPath: "/wt/named",
 }));
-const created = (path = "/wt/named"): WorktreeCreateResult => ({
+const created = (path = "/wt/named"): WorktreeCreateResult & { worktree: WorktreeEntry } => ({
 	outcome: "created",
 	worktree: {
 		path,
@@ -98,12 +98,32 @@ mock.module("@frontend/lib/api", () => ({
 }));
 let listEntries: WorktreeEntry[] = [];
 const refetch = mock(async () => {});
+const fetchNextPage = mock(async () => {});
+const resetQueries = mock(async () => {});
+let extraPages: WorktreeEntry[][] = [];
+let nextPageError: Error | null = null;
+let hasNextPage = false;
+let observedQuery: { search: string; sort: string; order: string };
 mock.module("@tanstack/react-query", () => ({
-	useQuery: () => ({
-		data: { entries: listEntries, capabilities: { create: true } },
-		isPending: false,
-		refetch,
-	}),
+	useQueryClient: () => ({ resetQueries }),
+	useInfiniteQuery: (options: { queryKey: unknown[] }) => {
+		observedQuery = options.queryKey[3] as typeof observedQuery;
+		return {
+			data: {
+				pages: [
+					{ entries: listEntries, capabilities: { create: true } },
+					...extraPages.map((entries) => ({ entries })),
+				],
+			},
+			isPending: false,
+			isFetching: false,
+			isFetchNextPageError: !!nextPageError,
+			error: nextPageError,
+			hasNextPage,
+			fetchNextPage,
+			refetch,
+		};
+	},
 }));
 mock.module("react-i18next", () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
 type Children = { children?: ReactNode };
@@ -132,7 +152,14 @@ mock.module("@mantine/core", () => {
 		Tooltip: Wrapper,
 		Menu,
 		Badge: Wrapper,
-		ScrollArea: { Autosize: Wrapper },
+		ScrollArea: {
+			Autosize: ({
+				children,
+				viewportRef,
+			}: Children & { viewportRef: (node: HTMLDivElement | null) => void }) => (
+				<div ref={viewportRef}>{children}</div>
+			),
+		},
 		Select: ({
 			label,
 			value,
@@ -264,6 +291,11 @@ async function submit() {
 beforeEach(async () => {
 	activeContext = context;
 	listEntries = [];
+	extraPages = [];
+	nextPageError = null;
+	hasNextPage = false;
+	fetchNextPage.mockClear();
+	resetQueries.mockClear();
 	refetch.mockClear();
 	activeUser = { id: "u1" };
 	storage.clear();
@@ -291,7 +323,7 @@ afterAll(() => {
 	}
 });
 
-test("switch dialog refreshes, searches, sorts and closes after a successful switch", async () => {
+test("switch dialog sends debounced search/sort to the server and closes after switching", async () => {
 	listEntries = [
 		{
 			...created("/repo/older").worktree,
@@ -307,19 +339,23 @@ test("switch dialog refreshes, searches, sorts and closes after a successful swi
 		},
 	] as WorktreeEntry[];
 	await click("worktree.switch");
-	expect(refetch).toHaveBeenCalledTimes(1);
+	expect(refetch).not.toHaveBeenCalled();
 	const paths = () =>
 		[...container.querySelectorAll("[data-worktree-path]")].map((node) =>
 			node.getAttribute("data-worktree-path"),
 		);
-	expect(paths()).toEqual(["/repo/newer", "/repo/older"]);
-	await click("worktree.descending");
+	// Server order is preserved, not sorted again within each page.
 	expect(paths()).toEqual(["/repo/older", "/repo/newer"]);
+	expect(observedQuery).toMatchObject({ sort: "lastCommitAt", order: "desc" });
+	await click("worktree.descending");
+	expect(observedQuery.order).toBe("asc");
 	await input("worktree.search", "NEWER");
-	expect(paths()).toEqual(["/repo/newer"]);
+	expect(observedQuery.search).toBe("");
 	await input("worktree.search", "not-there");
-	expect(paths()).toEqual([]);
-	expect(container.textContent).toContain("worktree.noMatches");
+	await act(async () => {
+		await new Promise((resolve) => setTimeout(resolve, 320));
+	});
+	expect(observedQuery.search).toBe("not-there");
 	await input("worktree.search", "");
 	await act(async () => {
 		const select = container.querySelector("select");
@@ -338,6 +374,69 @@ test("switch dialog refreshes, searches, sorts and closes after a successful swi
 		target: { cwd: "/repo/newer", deviceId: "local" },
 	});
 	expect(container.querySelector("[data-modal]")).toBeNull();
+});
+
+test("pages are deduplicated by path and failed continuation can be retried", async () => {
+	listEntries = [created("/repo/one").worktree];
+	extraPages = [[created("/repo/one").worktree, created("/repo/two").worktree]];
+	hasNextPage = true;
+	nextPageError = new Error("network down");
+	await click("worktree.switch");
+	expect(container.querySelectorAll("[data-worktree-path]")).toHaveLength(2);
+	await click("worktree.retryMore: network down");
+	expect(fetchNextPage).toHaveBeenCalledTimes(1);
+});
+
+test("scroll observer uses the inner viewport and drains short pages without duplicate requests", async () => {
+	const originalObserver = Object.getOwnPropertyDescriptor(globalThis, "IntersectionObserver");
+	const roots: Element[] = [];
+	Object.defineProperty(globalThis, "IntersectionObserver", {
+		configurable: true,
+		value: class {
+			constructor(
+				private callback: (entries: { isIntersecting: boolean }[]) => void,
+				options: { root: Element },
+			) {
+				roots.push(options.root);
+			}
+			observe() {
+				// An intersecting sentinel in a short page needs no user scroll.
+				this.callback([{ isIntersecting: true }]);
+				this.callback([{ isIntersecting: true }]);
+			}
+			disconnect() {}
+		},
+	});
+	try {
+		listEntries = [created("/repo/short").worktree];
+		hasNextPage = true;
+		await click("worktree.switch");
+		expect(fetchNextPage).toHaveBeenCalledTimes(1);
+		const viewport = container.querySelector("[data-worktree-sentinel]")?.parentElement
+			?.parentElement;
+		if (!viewport) throw new Error("Missing scroll viewport");
+		expect(roots[0]).toBe(viewport);
+		// A subsequent short page is observed again, rather than requiring a new scroll event.
+		extraPages = [[created("/repo/next").worktree]];
+		await act(async () => {
+			root.render(<NarratorWorktreeControls narratorId="n" />);
+			await flush();
+		});
+		expect(fetchNextPage).toHaveBeenCalledTimes(2);
+	} finally {
+		if (originalObserver)
+			Object.defineProperty(globalThis, "IntersectionObserver", originalObserver);
+		else Reflect.deleteProperty(globalThis, "IntersectionObserver");
+	}
+});
+
+test("expired continuation resets the entire cursor chain", async () => {
+	const error = new FakeApiError("expired", 409);
+	Object.assign(error, { data: { code: "WORKTREE_CURSOR_EXPIRED" } });
+	nextPageError = error;
+	await click("worktree.switch");
+	expect(resetQueries).toHaveBeenCalledWith(expect.objectContaining({ exact: true }));
+	expect(fetchNextPage).not.toHaveBeenCalled();
 });
 
 test("switch dialog shows an empty state", async () => {

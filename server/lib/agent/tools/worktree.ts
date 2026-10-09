@@ -8,6 +8,36 @@ import { worktreeCreateSchema, worktreeListSchema } from "../../validators/narra
 import { ensureNonEmptySchema, zodToJsonSchema } from "../tool-registry";
 import type { ToolContext, ToolDefinition } from "../types";
 
+const listParameters = z.strictObject({
+	limit: z
+		.number()
+		.int()
+		.min(1)
+		.max(100)
+		.optional()
+		.describe("Page size; defaults to 20, maximum 100."),
+	cursor: z
+		.string()
+		.min(1)
+		.max(512)
+		.optional()
+		.describe("Use nextCursor from the previous page with the same search and sorting."),
+	sort: z
+		.enum(["lastCommitAt", "createdAt", "name"])
+		.optional()
+		.describe("Sort field; defaults to lastCommitAt. Unknown times are placed last."),
+	order: z.enum(["asc", "desc"]).optional().describe("Sort direction; defaults to desc."),
+	search: z
+		.string()
+		.trim()
+		.max(512)
+		.optional()
+		.describe("Search all worktree branch names and paths, not just the current page."),
+	confirm: z
+		.literal(true)
+		.optional()
+		.describe("Compatibility parameter: pass true if required by the provider."),
+});
 export const worktreeToolSchema = z.discriminatedUnion("action", [
 	worktreeListSchema.extend({ action: z.literal("list") }),
 	worktreeCreateSchema.safeExtend({ action: z.literal("create") }),
@@ -37,6 +67,11 @@ export function createWorktreeTool<Principal>(
 		rawJsonSchema: zodToJsonSchema(
 			z.object({
 				...worktreeCreateSchema.shape,
+				limit: listParameters.shape.limit,
+				cursor: listParameters.shape.cursor,
+				sort: listParameters.shape.sort,
+				order: listParameters.shape.order,
+				search: listParameters.shape.search,
 				action: z.enum(["list", "create"]),
 				expectedRevision: worktreeCreateSchema.shape.expectedRevision
 					.optional()
@@ -124,12 +159,6 @@ const destinationPath = z
 	.describe(
 		"Absolute normalized destination inside the current repository root. Its non-symlink parent must exist; destination must not exist.",
 	);
-const listParameters = z.strictObject({
-	confirm: z
-		.literal(true)
-		.optional()
-		.describe("Compatibility parameter: pass true if required by the provider."),
-});
 export const createWorktreeParameters = z.strictObject({
 	branchName,
 	destinationPath,
@@ -191,7 +220,7 @@ export function createAgentWorktreeTools<Principal>(
 			name: "ListWorktrees",
 			parameters: listParameters,
 			description:
-				"List linked Git worktrees for the current local repository. Read-only; does not create or switch directories.",
+				"List linked Git worktrees for the current local repository. Defaults to 20 entries sorted by last commit time descending. Supports sorting, search and cursor pagination; pass nextCursor to read more. Read-only; does not create or switch directories.",
 		},
 		{
 			name: "CreateWorktree",
@@ -255,10 +284,11 @@ export function createAgentWorktreeTools<Principal>(
 					const principal = await principalOf(ctx);
 					if (name === "ListWorktrees") {
 						enteredService = true;
+						const { confirm: _confirm, ...query } = listParameters.parse(input.data);
 						const result = await service.list(
 							principal,
 							ctx.narratorId,
-							{ workspaceKey: workspace.git.workspaceKey },
+							{ ...query, workspaceKey: workspace.git.workspaceKey },
 							ctx.signal,
 						);
 						return {

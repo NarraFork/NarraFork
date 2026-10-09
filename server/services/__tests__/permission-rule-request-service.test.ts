@@ -296,8 +296,12 @@ test("real provider formatters preserve flat worktree parameters and required fi
 		defaultModel: "fixture",
 	};
 	const definitions = [
-		// Compatibility-only no-op placeholder is advertised for providers requiring parameters.
-		{ name: "ListWorktrees", required: ["confirm"], properties: ["confirm"] },
+		// Query fields stay optional; only the compatibility placeholder is required.
+		{
+			name: "ListWorktrees",
+			required: ["confirm"],
+			properties: ["limit", "cursor", "sort", "order", "search", "confirm"],
+		},
 		{
 			name: "CreateWorktree",
 			required: ["branchName", "destinationPath"],
