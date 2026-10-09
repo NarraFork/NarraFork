@@ -1405,9 +1405,17 @@ export async function runAgentLoopUnlocked(
 				maxTransientRetries: getMaxTransientRetries(),
 				silentToolCallThreshold: getSilentToolCallThreshold(),
 				maxToolCallsPerResponse: settings.agent.maxToolCallsPerResponse,
+				// Deliberately does NOT abort the narrator's signal. The loop has already
+				// cancelled its own stream (`toolAbort`/`attemptAbort` in
+				// `registerResponseTool`), and aborting the session signal here reaches
+				// anything else riding on it — above all a DangerReflection that is
+				// mid-flight. That reflection is a safety decision: killing it leaves the
+				// intercepted tool call pending forever, and the model simply re-triggers
+				// it on the next turn, which is how "a tool call looks stuck" repeats.
+				// `toolCallLimitExceeded` alone is enough — the run is finalized and the
+				// loop breaks before any retry, continuation or buffered-message replay.
 				onToolCallLimitExceeded: () => {
 					toolCallLimitExceeded = true;
-					active.abortController.abort();
 				},
 				pipelineUnusedToolCallThreshold: getPipelineUnusedToolCallThreshold(),
 				retryBackoffCeilMs: getRetryBackoffCeilMs(),
@@ -2446,6 +2454,14 @@ export async function runAgentLoopUnlocked(
 					await narratorService.updateStatus(narratorId, "working");
 					runState.input.text = continueText;
 					runState.input.images = undefined;
+					// The continuation starts a fresh pass, so a cut-in message queued while this
+					// one ran needs its boundary back — the same reason the permission-feedback,
+					// review-guard and injection-drain branches below re-arm. Without it the
+					// resume prompt replaces the user's message as this pass's input, the next
+					// pass's `shouldStop()` sees no soft stop left to honour, and the message
+					// waits until the whole retry budget is spent — minutes of the session
+					// looking frozen while "please continue" is exchanged with the model.
+					rearmCutInSoftStopBeforeContinuing(active);
 					continue;
 				}
 			}
