@@ -1063,7 +1063,7 @@ export async function runAgentLoopUnlocked(
 							resetActiveUpstreamSession(narratorId);
 							broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
 							active._planApprovedContinue = "compact";
-							active.abortController.abort();
+							active.abortController.abort(new Error("Plan approved; restarting after compact"));
 						}
 					} else {
 						// Non-compact: abort the current agent loop and persist a user
@@ -1071,7 +1071,7 @@ export async function runAgentLoopUnlocked(
 						// "plan approved, begin execution" prompt — this prevents the
 						// model from ignoring the tool result and asking the user again.
 						active._planApprovedContinue = "continue";
-						active.abortController.abort();
+						active.abortController.abort(new Error("Plan approved; restarting to execute"));
 					}
 				},
 				onClearCompactSummary: async () => {
@@ -3333,7 +3333,7 @@ export async function runAgentLoopUnlocked(
 			if (activeNarrators.get(narratorId) === active) activeNarrators.delete(narratorId);
 			planModeAskedOnce.delete(narratorId);
 			clearStreamingSnapshot(narratorId);
-			active.abortController.abort();
+			active.abortController.abort(new Error("Turn finished; closing the run"));
 			active.events.emit("event", { type: "done", data: null });
 			active.events.removeAllListeners();
 

@@ -1094,7 +1094,7 @@ async function createNarrator(
 ): Promise<ActiveNarrator> {
 	const existing = activeNarrators.get(narratorId);
 	if (existing) {
-		existing.abortController.abort();
+		existing.abortController.abort(new Error("Narrator session replaced by a new activation"));
 		existing._preparedPlanModes?.clear();
 		activeNarrators.delete(narratorId);
 		planModeAskedOnce.delete(narratorId);
@@ -5226,7 +5226,7 @@ function disposeInactiveNarratorSession(narratorId: string, active: ActiveNarrat
 	activeNarrators.delete(narratorId);
 	planModeAskedOnce.delete(narratorId);
 	clearStreamingSnapshot(narratorId);
-	active.abortController.abort();
+	active.abortController.abort(new Error("Narrator session went inactive"));
 	active.events.emit("event", { type: "done", data: null });
 	active.events.removeAllListeners();
 	for (const [key, permission] of pendingPermissions) {
@@ -7202,7 +7202,7 @@ export function interruptNarrator(narratorId: string): boolean {
 	const active = activeNarrators.get(narratorId);
 	const recovery = interruptPlannedUpdateRecovery(narratorId);
 	if (!active && !recovery.interrupted) return false;
-	active?.abortController.abort();
+	active?.abortController.abort(new Error("Narrator interrupted by user"));
 	// Stopping this narrator cancels the Agent tool calls of its current turn, and the
 	// subagents those calls own must stop with them. The fan-out is what settles their
 	// DB/UI state; membership is decided inside, per aborted tool call, so a subagent the
@@ -7235,7 +7235,7 @@ export function closeNarrator(narratorId: string): void {
 	if (!active) return;
 	active.alive = false;
 	if (active._gitTrackTimer) clearTimeout(active._gitTrackTimer);
-	active.abortController.abort();
+	active.abortController.abort(new Error("Narrator closed"));
 	clearStreamingSnapshot(narratorId);
 	cleanupOrphanedToolCalls(narratorId, active.locale).catch((err) => {
 		logger.error("Failed to clean up orphaned tool calls on close", {

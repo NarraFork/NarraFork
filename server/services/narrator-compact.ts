@@ -1288,7 +1288,7 @@ async function doRunCustomCompact({
 			// the subagent's own signal is managed by executeSubagent).
 			const active = activeNarrators.get(narratorId);
 			if (active?.alive) {
-				active.abortController.abort();
+				active.abortController.abort(new Error("Compacting narrator history; restarting the turn"));
 			}
 		}
 		await setCompactingSubstatus(narratorId, failureMode, false).catch((err) => {
