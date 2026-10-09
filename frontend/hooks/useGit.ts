@@ -424,7 +424,11 @@ export function useGitWorkspace(narratorId: string | null | undefined, revision?
 	return {
 		...query,
 		data,
-		layoutReady: !narratorId || !!data || query.isError,
+		// A denial completes discovery even when blockGitSummary removes its seed.
+		// Keep Git facts hidden, but do not leave the whole chat behind a skeleton
+		// while the seeded query is success/idle and has no recovery poll.
+		layoutReady:
+			!narratorId || !!data || query.isError || denied || query.data?.state === "access_denied",
 	};
 }
 
