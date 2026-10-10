@@ -16,10 +16,12 @@ import {
 	NarratorListLocalSearchSummary,
 } from "../../components/narrator/list/NarratorListControls";
 import {
+	applyNarratorListEvent,
 	buildNarratorListQueryOptions,
 	filterNarratorsByLocalQuery,
 	getNarratorListState,
 	type NarratorListSearchParams,
+	type NarratorsInfiniteData,
 	normalizeNarratorListSearchPatch,
 	parseBool,
 	useNarratorInfiniteScroll,
@@ -39,14 +41,6 @@ const CreateNarratorModal = lazy(() =>
 
 interface NarratorSearchParams extends NarratorListSearchParams {
 	create?: boolean;
-}
-
-interface NarratorsInfiniteData {
-	pages: Array<{
-		items: NarratorListItem[];
-		[key: string]: unknown;
-	}>;
-	[key: string]: unknown;
 }
 
 export const Route = createFileRoute("/narrators/")({
@@ -121,27 +115,9 @@ function NarratorsPage() {
 			qc.invalidateQueries({ queryKey: ["narrators"] });
 			return;
 		}
-		qc.setQueryData<NarratorsInfiniteData>(["narrators", "paginated", queryOptions], (old) => {
-			if (!old?.pages) return old;
-			let changed = false;
-			const pages = old.pages.map((page) => ({
-				...page,
-				items: page.items.map((item) => {
-					if (item.id !== narratorId) return item;
-					changed = true;
-					return {
-						...item,
-						...(event.status !== undefined ? { status: event.status } : {}),
-						...(event.substatus !== undefined ? { substatus: event.substatus } : {}),
-						...(event.title !== undefined ? { title: event.title } : {}),
-						...(event.permissionMode !== undefined ? { permissionMode: event.permissionMode } : {}),
-						...(event.viewers !== undefined ? { viewers: event.viewers } : {}),
-						updatedAt: new Date().toISOString(),
-					};
-				}),
-			}));
-			return changed ? { ...old, pages } : old;
-		});
+		qc.setQueryData<NarratorsInfiniteData>(["narrators", "paginated", queryOptions], (old) =>
+			applyNarratorListEvent(old, narratorId, event),
+		);
 	});
 
 	// Infinite scroll sentinel
