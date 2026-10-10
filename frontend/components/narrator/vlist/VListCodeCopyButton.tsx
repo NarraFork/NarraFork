@@ -24,10 +24,11 @@
 
 import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import { TOUCH_POINTER_MEDIA_QUERY, useMatchMedia } from "@frontend/lib/use-match-media";
-import { ActionIcon, CopyButton, Tooltip } from "@mantine/core";
+import { ActionIcon, Tooltip } from "@mantine/core";
 import { IconCheck, IconCopy } from "@tabler/icons-react";
 import type { CSSProperties } from "react";
 import { useTranslation } from "react-i18next";
+import { CopyButton } from "../../common/CopyButton";
 import { useRenderInteractive } from "../lod/RenderLodCtx";
 import { MESSAGE_SELECTION_IGNORE_ATTR } from "../message/MessageSelectionCtx";
 import { type CodeCopyPlacement, VIEW_ACTION_BAR_GAP } from "./vlist-content-view-float";

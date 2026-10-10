@@ -1,7 +1,8 @@
-import { ActionIcon, Code, CopyButton, Text, Tooltip } from "@mantine/core";
+import { ActionIcon, Code, Text, Tooltip } from "@mantine/core";
 import { IconCopy } from "@tabler/icons-react";
 import { type CSSProperties, lazy, memo, type ReactNode, Suspense } from "react";
 import { useTranslation } from "react-i18next";
+import { CopyButton } from "../../common/CopyButton";
 import { extractText } from "./MarkdownContent";
 import classes from "./MarkdownContent.module.css";
 

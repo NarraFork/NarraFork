@@ -10,6 +10,7 @@ import {
 	useComputedColorScheme,
 } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
+import { notifications } from "@mantine/notifications";
 import { IconClipboard, IconKeyboard } from "@tabler/icons-react";
 import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
@@ -799,15 +800,33 @@ export const TerminalPanel = forwardRef<TerminalPanelHandle, TerminalPanelProps>
 		}, []);
 
 		const handlePasteFromClipboard = useCallback(() => {
-			navigator.clipboard
-				.readText()
-				.then((text) => {
-					if (text) write(text);
-				})
-				.catch(() => {});
+			const failPaste = () => {
+				notifications.show({
+					color: "yellow",
+					message: t("pasteFromClipboardUnavailable"),
+				});
+			};
+			// Plain HTTP cannot read the clipboard; keyboard paste still works via the
+			// terminal's native paste event and does not need the Clipboard API.
+			if (
+				typeof navigator === "undefined" ||
+				typeof navigator.clipboard?.readText !== "function" ||
+				(typeof window !== "undefined" && window.isSecureContext === false)
+			) {
+				failPaste();
+			} else {
+				navigator.clipboard
+					.readText()
+					.then((text) => {
+						if (text) write(text);
+					})
+					.catch(() => {
+						failPaste();
+					});
+			}
 			setPastePopover(null);
 			termRef.current?.focus();
-		}, [write]);
+		}, [write, t]);
 
 		const handleSendCtrlV = useCallback(() => {
 			write("\x16");

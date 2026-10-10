@@ -29,7 +29,9 @@ let touchPointerMatches = false;
 
 mock.module("@mantine/hooks", () => ({
 	useMediaQuery: () => isMobileViewport,
-	useClipboard: () => ({ copy: () => {}, copied: false, reset: () => {} }),
+}));
+mock.module("@frontend/hooks/useClipboard", () => ({
+	useClipboard: () => ({ copy: () => {}, copied: false, reset: () => {}, error: null }),
 }));
 // Empty resources preserve key-based assertions without replacing a shared module export.
 const testI18n = i18next.createInstance();

@@ -1,5 +1,5 @@
+import { copyTextToClipboard } from "@frontend/lib/clipboard";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { copyTextToClipboard } from "../lib/clipboard";
 
 export interface UseClipboardInput {
 	timeout?: number;

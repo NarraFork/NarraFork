@@ -1,3 +1,4 @@
+import { useClipboard } from "@frontend/hooks/useClipboard";
 import {
 	ActionIcon,
 	Alert,
@@ -12,7 +13,6 @@ import {
 	Text,
 	Tooltip,
 } from "@mantine/core";
-import { useClipboard } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import {
 	FILE_REFERENCE_READ_TIMEOUT_MS,

@@ -23,7 +23,7 @@ import {
 	SAFE_AREA_FULLSCREEN_MODAL_HEADER_STYLE,
 	safeAreaFullscreenModalBodyStyle,
 } from "@frontend/lib/safe-area";
-import { ActionIcon, CopyButton, Modal, Tooltip } from "@mantine/core";
+import { ActionIcon, Modal, Tooltip } from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
 import {
 	IconCode,
@@ -37,6 +37,7 @@ import { useRouter } from "@tanstack/react-router";
 import { type CSSProperties, useCallback, useEffect, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { APP_HISTORY_SENTINEL, pushHistorySentinel } from "../../../lib/history-state";
+import { CopyButton } from "../../common/CopyButton";
 import { DocumentCopyButton } from "../content/DocumentCopyButton";
 import { clampViewText, isMarkdownTarget, VListViewBody } from "./vlist-content-view-body";
 import type { VListViewTarget } from "./vlist-content-view-target";

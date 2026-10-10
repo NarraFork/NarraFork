@@ -2,7 +2,6 @@ import {
 	ActionIcon,
 	Badge,
 	Box,
-	CopyButton,
 	Group,
 	Loader,
 	Modal,
@@ -18,7 +17,9 @@ import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useToolCallDetail } from "../../../hooks/useNarrator";
 import type { ExecutionTargetIdentity } from "../../../lib/api/types";
+import { copyTextToClipboard } from "../../../lib/clipboard";
 import { formatDurationText, formatFullLocaleDateTime } from "../../../lib/format";
+import { CopyButton } from "../../common/CopyButton";
 import { ContentViewer } from "../content/ContentViewer";
 import {
 	PermissionRuleReceiptDetails,
@@ -224,7 +225,7 @@ function LazyCopyJsonIconButton({ value, label }: { value: unknown; label: strin
 				onClick={async () => {
 					const text = stringifyJson(value);
 					if (!text) return;
-					await navigator.clipboard.writeText(text);
+					await copyTextToClipboard(text);
 					setCopied(true);
 					setTimeout(() => setCopied(false), 1500);
 				}}

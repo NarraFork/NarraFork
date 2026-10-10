@@ -42,7 +42,6 @@ import {
 	Badge,
 	Box,
 	Button,
-	CopyButton,
 	Divider,
 	Group,
 	NumberInput,
@@ -88,6 +87,7 @@ import "../vlist-markdown.css";
 import { useShikiTokens } from "@frontend/hooks/useShikiTokens";
 import { fragmentTextStyle, letterSpacingForFont } from "@shared/pretext-layout/fragment-style";
 import { resolveToolCallTiming } from "@shared/tool-display-duration";
+import { CopyButton } from "../../../common/CopyButton";
 import { DocumentCodeBody } from "../../content/DocumentCodeBody";
 import { DocumentSourceStatus } from "../../content/DocumentSourceStatus";
 import { queueDocumentFind } from "../../content/document-find-intent";

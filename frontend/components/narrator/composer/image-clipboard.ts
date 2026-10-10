@@ -51,11 +51,21 @@ function getSavedPathPreviewSource(savedPath?: string | null): string | null {
 	return `${apiUrl("/fs/preview")}?path=${encodeURIComponent(path)}`;
 }
 
-function clipboardItemSupports(type: string): boolean {
-	const clipboardItemCtor = ClipboardItem as unknown as {
-		supports?: (type: string) => boolean;
-	};
-	return clipboardItemCtor.supports ? clipboardItemCtor.supports(type) : type === "image/png";
+const capabilityErrors = new WeakSet<object>();
+
+export class ImageClipboardUnavailableError extends Error {
+	constructor() {
+		super("Image clipboard is not supported");
+		this.name = "ImageClipboardUnavailableError";
+		capabilityErrors.add(this);
+	}
+}
+
+/** Match only our capability guard, not permission errors or cross-realm Error prototypes. */
+export function isImageClipboardUnavailableError(
+	error: unknown,
+): error is ImageClipboardUnavailableError {
+	return typeof error === "object" && error !== null && capabilityErrors.has(error);
 }
 
 function assertBlobSafe(blob: Blob): void {
@@ -116,20 +126,34 @@ async function imageBlobToPng(blob: Blob): Promise<Blob> {
 	}
 }
 
+/** Binary image copy needs ClipboardItem; plain HTTP and old browsers cannot fall back to execCommand. */
+export function canUseImageClipboard(): boolean {
+	return (
+		typeof navigator !== "undefined" &&
+		typeof navigator.clipboard?.write === "function" &&
+		typeof ClipboardItem !== "undefined" &&
+		(typeof window === "undefined" || window.isSecureContext !== false)
+	);
+}
+
 export async function copyGeneratedImageToClipboard(
 	options: CopyGeneratedImageOptions,
 ): Promise<void> {
-	if (!navigator.clipboard?.write || typeof ClipboardItem === "undefined") {
-		throw new Error("Image clipboard is not supported");
+	if (!canUseImageClipboard()) {
+		throw new ImageClipboardUnavailableError();
 	}
 
-	const imageBlob = await fetchImageBlob(options);
-	const clipboardBlob =
-		imageBlob.type && clipboardItemSupports(imageBlob.type)
-			? imageBlob
-			: await imageBlobToPng(imageBlob);
-	assertBlobSafe(clipboardBlob);
-	await navigator.clipboard.write([
-		new ClipboardItem({ [clipboardBlob.type || "image/png"]: clipboardBlob }),
+	const clipboardBlob = fetchImageBlob(options).then(async (imageBlob) => {
+		const png = imageBlob.type === "image/png" ? imageBlob : await imageBlobToPng(imageBlob);
+		assertBlobSafe(png);
+		return png;
+	});
+	// write/ClipboardItem must run before any await to preserve Safari's user activation.
+	// The browser consumes the original promise; also handle its rejection if write
+	// or the constructor fails before consuming it (e.g. permission was denied).
+	void clipboardBlob.catch(() => {});
+	await Promise.all([
+		navigator.clipboard.write([new ClipboardItem({ "image/png": clipboardBlob })]),
+		clipboardBlob,
 	]);
 }

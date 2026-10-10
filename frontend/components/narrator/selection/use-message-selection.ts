@@ -2,6 +2,7 @@ import { notifications } from "@mantine/notifications";
 import type { useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { ApiError, api } from "../../../lib/api";
+import { copyTextToClipboard } from "../../../lib/clipboard";
 import { handleRegistry } from "../content/ContentViewer";
 import {
 	BLOCK_ID_ATTR,
@@ -324,7 +325,7 @@ export function useMessageSelection(options: UseMessageSelectionOptions) {
 		}
 		if (!selectedText.text) return;
 		try {
-			await navigator.clipboard.writeText(selectedText.text);
+			await copyTextToClipboard(selectedText.text);
 			notifications.show({
 				message: selectedText.truncated
 					? t("batchCopyTruncated", { count: selectedBlockIds.size })

@@ -1,4 +1,4 @@
-import { ActionIcon, Box, CopyButton, Group, Menu, Modal, Tooltip } from "@mantine/core";
+import { ActionIcon, Box, Group, Menu, Modal, Tooltip } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import type { DiffDocument } from "@shared/pretext-layout/diff-core";
 import {
@@ -36,6 +36,7 @@ import {
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { useSwipeMenu } from "../../../hooks/useSwipeMenu";
+import { copyTextToClipboard } from "../../../lib/clipboard";
 import { APP_HISTORY_SENTINEL, pushHistorySentinel } from "../../../lib/history-state";
 import {
 	SAFE_AREA_FULLSCREEN_MODAL_CONTENT_STYLE,
@@ -43,6 +44,7 @@ import {
 	safeAreaFullscreenModalBodyStyle,
 } from "../../../lib/safe-area";
 import { Z } from "../../../lib/z-index";
+import { CopyButton } from "../../common/CopyButton";
 import { CompactMenuSub } from "../compact/CompactMenuSub";
 import {
 	FileReferenceScopeProvider,
@@ -740,7 +742,7 @@ export const ContentViewer = memo(
 										<Menu.Item
 											leftSection={<IconCopy size={14} />}
 											onClick={() => {
-												navigator.clipboard.writeText(copyContent);
+												void copyTextToClipboard(copyContent);
 												swipe.closeSwipe();
 											}}
 										>
@@ -946,7 +948,7 @@ export const ContentViewer = memo(
 							</Menu.Item>
 							<Menu.Item
 								leftSection={<IconCopy size={14} />}
-								onClick={() => navigator.clipboard.writeText(copyContent)}
+								onClick={() => void copyTextToClipboard(copyContent)}
 							>
 								{t("copy")}
 							</Menu.Item>

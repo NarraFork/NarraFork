@@ -1,5 +1,5 @@
+import { useClipboard } from "@frontend/hooks/useClipboard";
 import type { ReactNode } from "react";
-import { useClipboard } from "../../hooks/useClipboard";
 
 export interface CopyButtonProps {
 	children: (payload: { copied: boolean; copy: () => void }) => ReactNode;

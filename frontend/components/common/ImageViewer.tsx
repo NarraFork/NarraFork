@@ -12,6 +12,7 @@ import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
 import { copyImageSourceToClipboard, downloadImageSource } from "../../lib/image-actions";
 import { Z } from "../../lib/z-index";
+import { isImageClipboardUnavailableError } from "../narrator/composer/image-clipboard";
 import type { ImageViewerOptions } from "./image-viewer-context";
 import { PANZOOM_TOOLTIP_Z, PanZoomStage } from "./PanZoomStage";
 
@@ -53,10 +54,28 @@ export function ImageViewer({
 		try {
 			await copyImageSourceToClipboard({ imageSrc: options.src, savedPath: options.savedPath });
 			notifications.show({ color: "teal", message: t("imageViewer_copySuccess") });
-		} catch {
-			notifications.show({ color: "red", message: t("imageViewer_copyFailed") });
+		} catch (error) {
+			if (!isImageClipboardUnavailableError(error)) {
+				notifications.show({ color: "red", message: t("imageViewer_copyFailed") });
+				return;
+			}
+			// Only unavailable binary clipboard capability may degrade to download.
+			try {
+				await downloadImageSource({
+					imageSrc: options.src,
+					savedPath: options.savedPath,
+					filename: deriveFilename(options),
+					allowUnverifiedDirectFallback: false,
+				});
+				notifications.show({
+					color: "yellow",
+					message: t("imageViewer_copyUnavailableDownloaded"),
+				});
+			} catch {
+				notifications.show({ color: "red", message: t("imageViewer_copyFailed") });
+			}
 		}
-	}, [options.src, options.savedPath, t]);
+	}, [options, t]);
 
 	const handleDownload = useCallback(async () => {
 		try {

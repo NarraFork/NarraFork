@@ -6,7 +6,6 @@ import {
 	Badge,
 	Box,
 	Button,
-	CopyButton,
 	Group,
 	Loader,
 	Paper,
@@ -35,6 +34,7 @@ import { useGitCommitDetail, useGitCommitDiff } from "../../hooks/useGit";
 import type { ApiError } from "../../lib/api";
 import { type GitTarget, gitBasePath, gitTargetKey } from "../../lib/api/git";
 import { formatRelativeTime } from "../../lib/format";
+import { CopyButton } from "../common/CopyButton";
 import classes from "./GitCommitPreview.module.css";
 import { GitPatchView } from "./GitPatchView";
 

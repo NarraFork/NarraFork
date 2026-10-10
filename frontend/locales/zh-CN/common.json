@@ -758,6 +758,7 @@
 	"imageViewer_close": "关闭",
 	"imageViewer_fullscreen": "全屏",
 	"imageViewer_copySuccess": "图片已复制到剪贴板",
+	"imageViewer_copyUnavailableDownloaded": "当前环境无法写入剪贴板，已改为下载图片",
 	"imageViewer_copyFailed": "复制图片失败",
 	"imageViewer_downloadFailed": "下载图片失败"
 }

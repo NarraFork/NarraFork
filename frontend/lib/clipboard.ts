@@ -34,7 +34,9 @@ function copyTextWithSelection(text: string): void {
 	}
 
 	const activeElement =
-		document.activeElement instanceof HTMLElement ? document.activeElement : null;
+		typeof HTMLElement !== "undefined" && document.activeElement instanceof HTMLElement
+			? document.activeElement
+			: null;
 	const activeSelectionElement =
 		activeElement instanceof HTMLInputElement || activeElement instanceof HTMLTextAreaElement
 			? activeElement

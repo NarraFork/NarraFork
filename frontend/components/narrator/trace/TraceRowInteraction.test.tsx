@@ -59,11 +59,13 @@ mock.module("@frontend/hooks/usePlatform", () => ({
 }));
 mock.module("@mantine/hooks", () => ({
 	useMediaQuery: () => false,
-	useClipboard: () => ({ copy: clipboardCopyMock, copied: false, reset: () => {} }),
 	useDisclosure: (initial = false) => [
 		initial,
 		{ open: () => {}, close: () => {}, toggle: () => {} },
 	],
+}));
+mock.module("@frontend/hooks/useClipboard", () => ({
+	useClipboard: () => ({ copy: clipboardCopyMock, copied: false, reset: () => {}, error: null }),
 }));
 mock.module("react-i18next", () => ({
 	useTranslation: () => ({ t: (key: string) => key }),

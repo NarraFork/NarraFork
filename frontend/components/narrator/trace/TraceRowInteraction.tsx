@@ -29,13 +29,14 @@
  * element); this one wraps a single row inside a trace.
  */
 
+import { useClipboard } from "@frontend/hooks/useClipboard";
 import { usePlatform } from "@frontend/hooks/usePlatform";
 import { useSwipeMenu } from "@frontend/hooks/useSwipeMenu";
 import type { ToolCallDetailRef } from "@frontend/lib/api/narrators";
 import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import { Z } from "@frontend/lib/z-index";
 import { Box, Menu } from "@mantine/core";
-import { useClipboard, useMediaQuery } from "@mantine/hooks";
+import { useMediaQuery } from "@mantine/hooks";
 import {
 	IconArrowBackUp,
 	IconCheck,
@@ -53,6 +54,7 @@ import {
 import { lazy, type ReactNode, Suspense, useCallback, useState } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
+import { copyTextToClipboard } from "../../../lib/clipboard";
 import { CompactMenuSub } from "../compact/CompactMenuSub";
 import { useRenderInteractive } from "../lod/RenderLodCtx";
 import type { MessageContextMenuActions } from "../message/MessageContextMenuCtx";
@@ -370,7 +372,7 @@ export function TraceRowInteraction({
 				<Menu.Item
 					leftSection={<IconCopy size={14} />}
 					onClick={() => {
-						navigator.clipboard.writeText(copyText);
+						void copyTextToClipboard(copyText);
 						swipe.closeSwipe();
 					}}
 				>

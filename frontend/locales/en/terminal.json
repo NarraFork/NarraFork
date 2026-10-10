@@ -20,6 +20,7 @@
 	"disconnected": "Disconnected",
 	"terminalOf": "Terminal · {{name}}",
 	"pasteContent": "Paste",
+	"pasteFromClipboardUnavailable": "Cannot read the clipboard here. Use Ctrl+V (system paste) instead.",
 	"sendCtrlV": "Send Ctrl+V",
 	"terminalUnsupported": "Terminal runtime is not available in this backend/runtime."
 }

@@ -1,4 +1,4 @@
-import { ActionIcon, Anchor, Code, Collapse, CopyButton, Group, Stack, Text } from "@mantine/core";
+import { ActionIcon, Anchor, Code, Collapse, Group, Stack, Text } from "@mantine/core";
 import { IconCheck, IconCopy } from "@tabler/icons-react";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -7,6 +7,7 @@ import {
 	describeApiError,
 	hasDistinctRawMessage,
 } from "../../lib/api-error";
+import { CopyButton } from "./CopyButton";
 
 export interface ErrorDetailProps {
 	error: unknown;

@@ -21,7 +21,7 @@
  */
 
 import { Z } from "@frontend/lib/z-index";
-import { ActionIcon, Box, CopyButton, Group, Tooltip } from "@mantine/core";
+import { ActionIcon, Box, Group, Tooltip } from "@mantine/core";
 import {
 	IconArrowBarToUp,
 	IconArrowsMaximize,
@@ -34,6 +34,7 @@ import {
 import type { CSSProperties } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
+import { CopyButton } from "../../common/CopyButton";
 import { DocumentCopyButton } from "../content/DocumentCopyButton";
 import { MESSAGE_SELECTION_IGNORE_ATTR } from "../message/MessageSelectionCtx";
 import { isMarkdownTarget } from "./vlist-content-view-body";

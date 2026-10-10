@@ -1,9 +1,10 @@
 /** Deferred menus, navigation and inspector state; the shell owns the first gesture. */
+
+import { useClipboard } from "@frontend/hooks/useClipboard";
 import { usePlatform } from "@frontend/hooks/usePlatform";
 import type { useSwipeMenu } from "@frontend/hooks/useSwipeMenu";
 import { Z } from "@frontend/lib/z-index";
 import { Box, Menu } from "@mantine/core";
-import { useClipboard } from "@mantine/hooks";
 import {
 	IconArrowBackUp,
 	IconArrowsMaximize,
@@ -25,6 +26,7 @@ import {
 import { lazy, Suspense, useState } from "react";
 import { createPortal } from "react-dom";
 import { useTranslation } from "react-i18next";
+import { copyTextToClipboard } from "../../../lib/clipboard";
 import { CompactMenuSub } from "../compact/CompactMenuSub";
 import { useToolEditNavigation } from "../useToolEditNavigation";
 import type { VListRowInteractionProps } from "./VListRowInteraction";
@@ -222,7 +224,7 @@ export function VListRowInteractionControls({
 				<Menu.Item
 					leftSection={<IconCopy size={14} />}
 					onClick={() => {
-						navigator.clipboard.writeText(copyText);
+						void copyTextToClipboard(copyText);
 						swipe.closeSwipe();
 					}}
 				>

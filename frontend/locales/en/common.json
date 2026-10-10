@@ -758,6 +758,7 @@
 	"imageViewer_close": "Close",
 	"imageViewer_fullscreen": "Fullscreen",
 	"imageViewer_copySuccess": "Image copied to clipboard",
+	"imageViewer_copyUnavailableDownloaded": "Clipboard is unavailable in this environment; image downloaded instead",
 	"imageViewer_copyFailed": "Failed to copy image",
 	"imageViewer_downloadFailed": "Failed to download image"
 }

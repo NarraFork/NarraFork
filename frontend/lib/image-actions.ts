@@ -57,7 +57,11 @@ function canDownloadDirectly(source: string): boolean {
  * and cross-origin images can still preserve the requested filename.
  */
 export async function downloadImageSource(
-	source: ImageActionSource & { filename?: string | null },
+	source: ImageActionSource & {
+		filename?: string | null;
+		/** Disable unverified cross-origin links, whose download attribute may be ignored. */
+		allowUnverifiedDirectFallback?: boolean;
+	},
 ): Promise<void> {
 	const requested = source.filename?.split(/[\\/]/).pop()?.trim() || "image";
 	const direct = source.imageSrc?.trim();
@@ -80,8 +84,9 @@ export async function downloadImageSource(
 			setTimeout(() => URL.revokeObjectURL(objectUrl), 10_000);
 		}
 	} catch (err) {
-		// Fallback: direct link download for cross-origin sources that block fetch.
-		if (direct) {
+		// Legacy explicit-download fallback may navigate for cross-origin URLs.
+		// Automatic copy degradation must opt out instead of claiming a download.
+		if (direct && source.allowUnverifiedDirectFallback !== false) {
 			triggerDownload(direct, ensureExtension(requested, "image/png"));
 			return;
 		}

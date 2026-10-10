@@ -11,9 +11,10 @@
  * fetches a raw tool dump. This one takes plain text the caller already holds.
  */
 
-import { ActionIcon, CopyButton, Group, Modal, ScrollArea, Text, Tooltip } from "@mantine/core";
+import { ActionIcon, Group, Modal, ScrollArea, Text, Tooltip } from "@mantine/core";
 import { IconCheck, IconCopy } from "@tabler/icons-react";
 import { useTranslation } from "react-i18next";
+import { CopyButton } from "../../common/CopyButton";
 
 export interface ContentInspectorProps {
 	opened: boolean;

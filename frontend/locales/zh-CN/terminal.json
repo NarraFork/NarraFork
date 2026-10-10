@@ -20,6 +20,7 @@
 	"disconnected": "连接断开",
 	"terminalOf": "终端 · {{name}}",
 	"pasteContent": "粘贴",
+	"pasteFromClipboardUnavailable": "此处无法读取剪贴板，请改用系统粘贴快捷键 Ctrl+V。",
 	"sendCtrlV": "发送 Ctrl+V",
 	"terminalUnsupported": "当前后端/运行时不支持交互式终端。"
 }

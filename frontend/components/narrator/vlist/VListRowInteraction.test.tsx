@@ -68,11 +68,9 @@ mock.module("@mantine/hooks", () => ({
 		if (args[0] === MOBILE_VIEWPORT_MEDIA_QUERY) mediaQueryValues.push(matches);
 		return matches;
 	},
-	useClipboard: () => ({ copy: clipboardCopyMock, copied: false, reset: () => {} }),
-	useDisclosure: (initial = false) => [
-		initial,
-		{ open: () => {}, close: () => {}, toggle: () => {} },
-	],
+}));
+mock.module("@frontend/hooks/useClipboard", () => ({
+	useClipboard: () => ({ copy: clipboardCopyMock, copied: false, reset: () => {}, error: null }),
 }));
 mock.module("react-i18next", () => ({
 	useTranslation: () => ({ t: translateMock }),

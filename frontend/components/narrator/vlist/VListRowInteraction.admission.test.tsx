@@ -35,7 +35,8 @@ const selection = {
 	deselectBlock,
 };
 
-mock.module("@mantine/hooks", () => ({ ...realHooks, useClipboard: clipboardHook }));
+mock.module("@mantine/hooks", () => realHooks);
+mock.module("@frontend/hooks/useClipboard", () => ({ useClipboard: clipboardHook }));
 mock.module("react-i18next", () => ({ ...realI18n, useTranslation: translations }));
 mock.module("@frontend/hooks/usePlatform", () => ({ ...realPlatform, usePlatform: platformHook }));
 mock.module("../message/MessageSelectionCtx", () => ({
