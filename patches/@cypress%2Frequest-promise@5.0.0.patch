@@ -1,0 +1,28 @@
+diff --git a/lib/rp.js b/lib/rp.js
+index a2f68056d46cc709f48c34dfc54052c4a9fc942c..b69d90331b5a8794b56f3c7bcafcc088f098c54a 100644
+--- a/lib/rp.js
++++ b/lib/rp.js
+@@ -1,18 +1,14 @@
+ 'use strict';
+ 
+ var Bluebird = require('bluebird').getNewLibraryCopy(),
+-    configure = require('request-promise-core/configure/request2'),
+-    stealthyRequire = require('stealthy-require');
++    configure = require('request-promise-core/configure/request2');
+ 
+ try {
+ 
+-    // Load Request freshly - so that users can require an unaltered request instance!
+-    var request = stealthyRequire(require.cache, function () {
+-        return require('@cypress/request');
+-    },
+-    function () {
+-        require('tough-cookie');
+-    }, module);
++    // NarraFork patch: stealthy-require empties and refills require.cache. Under Bun that cache
++    // is the shared module registry, so emptying it evicts already-loaded ESM modules and the
++    // next dynamic import re-evaluates the whole server graph as a second copy. Plain require.
++    var request = require('@cypress/request');
+ 
+ } catch (err) {
+     /* istanbul ignore next */
