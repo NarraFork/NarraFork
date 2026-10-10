@@ -47,6 +47,11 @@ export interface ActiveNarrator {
 	_modelRefreshVersion?: number;
 	_modelRefreshPending?: Promise<void>;
 	_modelRefreshError?: unknown;
+	/**
+	 * 切模型后按新模型重估上下文占用的收尾（只用于告警，不阻塞切换）。
+	 * 保留最后一次的 Promise：测试与诊断可以 await 它，确认告警已经落定。
+	 */
+	_contextSwitchGuardPending?: Promise<void>;
 	/** Fixed effort mandated by the inherited model's selected pool entry. */
 	_inheritedReasoningEffort?: ReasoningEffort;
 	/** Parent's own override for a `__parent__` child; ranks below the child's override. */

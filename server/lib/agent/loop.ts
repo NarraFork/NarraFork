@@ -39,12 +39,24 @@ import {
 } from "../search/execution-scope";
 import { shouldUseNativeSearch, usesSideRequestNativeSearch } from "../search/native";
 import { hasUsableFunctionSearchChannelFor } from "../search/router";
-import { getModelContextWindow, settings, usesStatefulModel } from "../settings";
+import {
+	getModelContextWindow,
+	getModelMaxCompletionTokens,
+	settings,
+	usesStatefulModel,
+} from "../settings";
 import { sideCarBodyWithText } from "../sidecar-templates";
 import { StreamStaleError } from "../stream-timeout";
 import { abortableSleep } from "./abortable-sleep";
 import { analyzeShellCommand } from "./bash-analyze";
 import { CODEX_REBUILD_HISTORY_RETRY_CODE, isCodexRebuildHistoryRetryError } from "./codex-errors";
+import { createContextCalibrationProbe } from "./context-calibration";
+import {
+	estimatePayloadTokens,
+	evaluateContextPreflight,
+	formatContextPreflightMessage,
+	isContextPreflightEnabled,
+} from "./context-preflight";
 import { diagnosticsFromError, normalizeApiRequestDiagnostics } from "./error-diagnostics";
 import {
 	classifyInvalidState,
@@ -3779,6 +3791,9 @@ async function* agentLoopInMetadataSnapshot(
 			let requestRawContextWindow: number | undefined;
 			let inputCharacters: ContextInputCharacters | null = null;
 			let inputComposition: ContextCharCache | null = null;
+			// 按模型校准"字符→token"比值的采样探针：一次 loop 调用一个，天然隔离并发叙述者；
+			// 同一调用内 attempt 串行，所以"发送前 begin → 结束 flush"能可靠配对同一次请求。
+			const contextCalibrationProbe = createContextCalibrationProbe();
 			let contextSnapshot: ContextUsageSnapshot | undefined;
 			function snapshotContext(
 				source: ContextUsageSnapshot["source"],
@@ -3963,6 +3978,9 @@ async function* agentLoopInMetadataSnapshot(
 
 			function* finishRequest(errorMessage?: string): Generator<AgentEvent> {
 				streamExecutionOpen = false;
+				// 本轮请求（成功、失败、中断都算）到此为止：只有拿到 usage 的轮次才会留下校准样本，
+				// 没有 usage 的失败请求直接丢弃，绝不污染某模型的实测比。
+				contextCalibrationProbe.flush();
 				if (!requestStarted) return;
 				// Retract the live tool cards this request published but never completed.
 				//
@@ -4611,6 +4629,46 @@ async function* agentLoopInMetadataSnapshot(
 					});
 					const toolSnapshot = requestToolSnapshots.get(config);
 					if (toolSnapshot) requestToolSnapshots.set(toolConfig, toolSnapshot);
+					// 发送前上下文预检：请求此刻已完全组装（content/history/tools 都是最终形态），
+					// 但还没交给 provider。估算就确定装不下的请求不发，直接产出
+					// context_length_exceeded，让既有的溢出恢复链（紧急压缩 + retry_compacted）接管。
+					// 放在 search 作用域检查之前：一个根本不发出去的请求不该消耗搜索执行轮次。
+					//
+					// 首轮带图时整段跳过：图片是 `provider.chat` 的独立参数，不进 content/history，
+					// 因此下面的分片覆盖不到它。而图片的 token 数按分辨率折算、与 base64 长度不成
+					// 比例——把它当字符算会高估一两个数量级（1MiB 图的 base64 约 1.4M 字符，真实
+					// 约一千多 token），不折算又会低估。宁可不估：这一轮交给既有的错误分类与恢复链
+					// 兜底，也不要凭一个必然失准的数字拦掉用户刚发的图。
+					const carriesImages = isFirstTurn && !!images?.length;
+					if (isContextPreflightEnabled() && !carriesImages) {
+						const verdict = evaluateContextPreflight({
+							contextWindow:
+								requestRawContextWindow ?? getModelContextWindow(effectiveModel, effectiveProvider),
+							maxOutputTokens: getModelMaxCompletionTokens(effectiveModel, effectiveProvider),
+							// 传模型名：该模型有实测比值时按它换算字符→token，否则回退全局系数。
+							estimate: estimatePayloadTokens(
+								[content, questionInput.history, questionInput.toolResults, tools],
+								{ model: effectiveModel },
+							),
+						});
+						if (verdict.exceeded) {
+							const message = formatContextPreflightMessage(verdict, {
+								provider: effectiveProvider,
+								model: effectiveModel,
+							});
+							logger.warn("Context preflight blocked an oversized request before sending", {
+								narratorId: config.narratorId,
+								provider: effectiveProvider,
+								model: effectiveModel,
+								estimatedTokens: verdict.estimatedTokens,
+								usableTokens: verdict.usableTokens,
+								contextWindow: verdict.contextWindow,
+								partial: verdict.partial,
+							});
+							yield { type: "context_length_exceeded", message };
+							return;
+						}
+					}
 					if (searchScope) {
 						if (!matchesSearchExecutionScope(effectiveProvider, effectiveModel)) {
 							yield {
@@ -4643,6 +4701,12 @@ async function* agentLoopInMetadataSnapshot(
 						onRequestStart: markRequestStarted,
 						onInputCharacters: async (counts) => {
 							inputCharacters = validInputCharacters(counts);
+							// 校准采样：记下这一轮 wire 的字符数，等本轮的 promptTokens 到达后配对。
+							contextCalibrationProbe.begin(
+								effectiveProvider,
+								effectiveModel,
+								inputCharacters?.totalChars ?? null,
+							);
 							try {
 								inputComposition =
 									(await config.freezeContextComposition?.(
@@ -5288,6 +5352,8 @@ async function* agentLoopInMetadataSnapshot(
 						// Convert OpenAI/Anthropic usage to context_usage percentage
 						if (parsed.usage && parsed.usage.promptTokens != null) {
 							receivedUsage = true;
+							// 校准配对：本轮请求的 promptTokens（同一轮可能上报多次，探针取最大值）。
+							contextCalibrationProbe.observe(parsed.usage.promptTokens);
 							const previousUsage = requestUsage as ApiRequestEndEvent["usage"];
 							// Merge partial counters without letting prompt/input placeholders
 							// erase known counts. Output and cache counters update independently.

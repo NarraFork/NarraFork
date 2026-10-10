@@ -351,6 +351,7 @@ import {
 	runCustomCompact,
 	triggerMidTurnCompact,
 } from "./narrator-compact";
+import { warnIfModelSwitchExceedsContextWindow } from "./narrator-model-switch-guard";
 import { handlePermission, resolvePermissionOrDangerReflection } from "./narrator-permission";
 import {
 	narratorPersistence,
@@ -7773,6 +7774,28 @@ export function updateNarratorModel(narratorId: string, model: string): void {
 			status: active._loopRunning ? "pending" : "updated",
 			applyAt: active._loopRunning ? "next_model_request" : "next_request",
 		});
+		// 切模型换掉的是"分母"：上下文占用率是按旧模型的窗口算出来的，切完既不重估
+		// 也不触发压缩，用户可能毫不知情地把一条装不下的请求发出去。真实事故：同一份
+		// body（UTF-8 3,077,644 字节）在 hy4 上记 638,848 token，切到 deepseek 的分词器
+		// 变成 1,080,519，直接超过它的 1,048,576 上限，请求被拒。
+		//
+		// 这里按新模型重估一次并告警。刻意做成不阻塞的旁路：只提醒，不阻止切换、也不
+		// 自动压缩——切换是用户的主动操作，该被告知后果而不是被拦住。
+		active._contextSwitchGuardPending = warnIfModelSwitchExceedsContextWindow({
+			narratorId,
+			model: active.model,
+			provider: active.provider,
+			locale: active.locale,
+		})
+			.catch((error) => {
+				logger.warn("Failed to reassess context usage after model switch", {
+					narratorId,
+					model: active.model,
+					error: String(error),
+				});
+			})
+			// 返回值（是否真的告警）只给调用方自己记录用，字段本身只承载"落定"。
+			.then(() => {});
 	} else if (
 		model !== FOLLOW_PARENT_MODEL &&
 		updateActiveSubagentModel(narratorId, resolveEffectiveModel(model))
