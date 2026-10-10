@@ -28,6 +28,7 @@ import { prepareOAuthUserHardDeletion } from "../services/oauth-runtime-revocati
 import { purgeProjectGrantsForUser } from "../services/project-membership";
 import { registrationCodeService } from "../services/registration-code-service";
 import { terminalService } from "../services/terminal-service";
+import { releaseUserForeignKeys } from "../services/user-deletion";
 import { worktreeWatcher } from "../services/worktree-watcher";
 import { ProcessSnapshot } from "../terminal/dtach-service";
 import { getExternalNarratorConnectionSnapshot } from "../websocket/oauth-connection-registry";
@@ -244,7 +245,12 @@ adminRoutes.delete("/users/:id", async (c) => {
 	}
 
 	await prepareOAuthUserHardDeletion(id);
-	const [deleted] = await db.delete(users).where(eq(users.id, id)).returning();
+	// 没有级联的外键必须先释放，否则删除会以 FOREIGN KEY constraint failed 失败；
+	// 两步放在同一个同步事务里，避免清理成功而删除失败留下的半成品。
+	const deleted = db.transaction((tx) => {
+		releaseUserForeignKeys(tx, id);
+		return tx.delete(users).where(eq(users.id, id)).returning().all();
+	})[0];
 	if (!deleted) throw new AppError("User not found", 404, "NOT_FOUND");
 	// Drop the existence cache immediately; otherwise the deleted user's token
 	// keeps passing (and renewing) for the rest of the cache window.
