@@ -10,14 +10,17 @@ import { reserveDiagnostic } from "./diagnostic-admission";
 import type { BrowserMemoryJob } from "./memory-job";
 import { waitForMemory } from "./memory-job";
 import { MemoryProfileError, PROFILE_LIMITS } from "./memory-profile-constants";
-import type {
-	MemoryProfileArtifact,
-	MemoryProfileConfig,
-	MemoryProfileMode,
-	MemoryProfileRequest,
-	MemoryProfileView,
-	MemoryProfileWorkerCommand,
-	MemoryProfileWorkerReply,
+import {
+	MEMORY_PROFILE_TRACE_CATEGORIES,
+	type MemoryProfileArtifact,
+	type MemoryProfileConfig,
+	type MemoryProfileFailureDiagnostic,
+	type MemoryProfileMode,
+	type MemoryProfileRequest,
+	type MemoryProfileView,
+	type MemoryProfileWorkerCommand,
+	type MemoryProfileWorkerReply,
+	profileDiagnosticBrowserVersion,
 } from "./memory-profile-types";
 import type { BrowserSession } from "./session";
 import { acquireTraceLease, type TraceLease } from "./tracing-lease";
@@ -96,6 +99,7 @@ const STAGES = new Set([
 	"target",
 	"allocation",
 	"trace",
+	"trace_capability",
 	"recording",
 	"navigation",
 	"bytes",
@@ -110,6 +114,28 @@ const STAGES = new Set([
 	"cancelled",
 ]);
 const safeStage = (stage: string) => (STAGES.has(stage) ? stage : "worker");
+function safeFailureDiagnostic(
+	stage: string,
+	value: unknown,
+): MemoryProfileFailureDiagnostic | undefined {
+	if (stage !== "trace_capability" || !value || typeof value !== "object") return;
+	const diagnostic = value as Record<string, unknown>;
+	if (
+		diagnostic.diagnosticStage !== "trace_capability" ||
+		!Array.isArray(diagnostic.missingCategories) ||
+		diagnostic.missingCategories.length > MEMORY_PROFILE_TRACE_CATEGORIES.length
+	)
+		return;
+	const missingCategories = MEMORY_PROFILE_TRACE_CATEGORIES.filter((category) =>
+		(diagnostic.missingCategories as unknown[]).includes(category),
+	);
+	if (missingCategories.length === 0) return;
+	return {
+		diagnosticStage: "trace_capability",
+		browserVersion: profileDiagnosticBrowserVersion(diagnostic.browserVersion),
+		missingCategories,
+	};
+}
 const CDP_DISCONNECTED = (CDPSessionEvent as typeof CDPSessionEvent & { Disconnected: symbol })
 	.Disconnected;
 
@@ -542,7 +568,9 @@ export function createMemoryProfiler(deps: ProfilerDependencies = {}) {
 			done();
 			if (!startSettled) {
 				startSettled = true;
-				startFailed(new MemoryProfileError(safeStage(stage ?? "worker")));
+				const error = new MemoryProfileError(safeStage(stage ?? "worker"));
+				if (handle.view.diagnostic) error.cause = handle.view.diagnostic;
+				startFailed(error);
 			}
 		}
 		function message(message: MemoryProfileWorkerReply) {
@@ -620,9 +648,13 @@ export function createMemoryProfiler(deps: ProfilerDependencies = {}) {
 				case "result":
 					void finish("completed", undefined, message);
 					break;
-				case "failed":
-					void finish("failed", safeStage(message.stage));
+				case "failed": {
+					const stage = safeStage(message.stage);
+					const diagnostic = safeFailureDiagnostic(stage, message.diagnostic);
+					if (diagnostic) handle.view.diagnostic = diagnostic;
+					void finish("failed", stage);
 					break;
+				}
 				case "cancelled":
 					void finish("cancelled", "cancelled");
 					break;

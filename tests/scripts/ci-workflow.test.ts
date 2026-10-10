@@ -182,6 +182,41 @@ describe("generic CI workflow", () => {
 		}
 	});
 
+	test("every auxiliary root typecheck prepares generated routes and extension types first", () => {
+		let checked = 0;
+		for (const name of [
+			"remote-executor.yml",
+			"file-revert-cross-platform.yml",
+			"plugin-platform-acceptance.yml",
+		]) {
+			const auxiliary = Bun.YAML.parse(
+				readFileSync(join(repository, ".github/workflows", name), "utf8"),
+			) as Workflow;
+			for (const [id, value] of Object.entries(auxiliary.jobs)) {
+				const typecheck = value.steps.findIndex(
+					(entry) => entry.run?.trim() === "bunx tsgo --noEmit",
+				);
+				if (typecheck < 0) continue;
+				checked++;
+				const before = value.steps.slice(0, typecheck);
+				const install = before.findIndex(
+					(entry) => entry.run?.trim() === "bun install --frozen-lockfile",
+				);
+				const build = before.findIndex((entry) => entry.run?.trim() === "bun run build");
+				const extension = before.findIndex(
+					(entry) => entry.run?.trim() === "bun install --cwd vscode-extension --frozen-lockfile",
+				);
+				expect(install, `${name}:${id} installs root dependencies`).toBeGreaterThanOrEqual(0);
+				expect(build, `${name}:${id} generates routes after installation`).toBeGreaterThan(install);
+				expect(extension, `${name}:${id} installs extension types`).toBeGreaterThan(install);
+				for (const entry of [before[build], before[extension]]) {
+					expect(entry.if).toBeUndefined();
+					expect(entry["continue-on-error"]).not.toBe(true);
+				}
+			}
+		}
+		expect(checked).toBe(4);
+	});
 	test("enforces migration assets, whole-repository lint and translation checks", () => {
 		for (const run of [
 			"bun scripts/check-sqlite-migration-assets.ts",

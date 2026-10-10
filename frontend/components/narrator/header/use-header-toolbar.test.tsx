@@ -3,6 +3,11 @@ import { parseHTML } from "linkedom";
 import { act, type ReactElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import * as layoutHooks from "../../../hooks/useNarratorToolbarLayout";
+import { PluginContributionOptions } from "../../plugins/PluginContributionPicker";
+import {
+	type PluginUiHostSurface,
+	PluginUiSurfaceProvider,
+} from "../../plugins/PluginUiSurfaceContext";
 import { PathRulesPopover } from "../interaction/PathRulesPopover";
 import { narratorToolbarItem } from "./narrator-toolbar-items";
 import {
@@ -88,8 +93,20 @@ afterEach(async () => {
 	originals.clear();
 });
 
-async function render(props = options()) {
-	await act(async () => root.render(<Probe {...props} />));
+async function render(props = options(), surface?: PluginUiHostSurface) {
+	await act(async () =>
+		root.render(
+			surface ? (
+				<PluginUiSurfaceProvider
+					hostContext={{ surface, workspaceId: "workspace-a", narratorId: props.narratorId }}
+				>
+					<Probe {...props} />
+				</PluginUiSurfaceProvider>
+			) : (
+				<Probe {...props} />
+			),
+		),
+	);
 }
 
 function overlay() {
@@ -100,6 +117,41 @@ function overlay() {
 }
 
 describe("panel toolbar controller", () => {
+	test("overflow plugin options track live surface transitions instead of a stale callback", async () => {
+		const props = options();
+		const close = mock(() => {});
+		for (const surface of ["workspace", "director", "focus", "graph"] as const) {
+			await render(props, surface);
+			const element = controller.renderToolbarInlineOptions("plugins", close) as ReactElement<{
+				surface: PluginUiHostSurface;
+				onPick: (pick: {
+					pluginId: string;
+					contributionId: string;
+					title: string;
+					version: string;
+					hash: string;
+				}) => void;
+			}>;
+			expect(element.type).toBe(PluginContributionOptions);
+			expect(element.props.surface).toBe(surface);
+			const pick = {
+				pluginId: "fixture",
+				contributionId: "view",
+				title: "View",
+				version: "1.0.0",
+				hash: "a".repeat(64),
+			};
+			element.props.onPick(pick);
+			expect(close).toHaveBeenCalled();
+			expect(props.openPluginPanel).toHaveBeenLastCalledWith(pick);
+		}
+		await render(props);
+		expect(
+			(controller.renderToolbarInlineOptions("plugins", close) as ReactElement<{ surface: string }>)
+				.props.surface,
+		).toBe("focus");
+	});
+
 	test("does not own width capacity state", async () => {
 		await render();
 		// Title width is pretext-measured in the title slot; this controller only

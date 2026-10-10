@@ -38,6 +38,8 @@ class FakeSession extends EventEmitter implements ProfileSession {
 	fail = new Set<string>();
 	errors = new Map<string, Error>();
 	traceConfirmed = true;
+	browserVersion = "Chrome/146.0.7680.31";
+	categories = ["devtools.timeline", "v8", "disabled-by-default-v8.gc", "blink.user_timing"];
 	traceLoss = false;
 	malformedProfile = false;
 	heapDelay = 0;
@@ -59,11 +61,9 @@ class FakeSession extends EventEmitter implements ProfileSession {
 			case "Page.getFrameTree":
 				return { frameTree: { frame: { id: "root-frame", loaderId: "initial-document" } } };
 			case "Browser.getVersion":
-				return { product: "Chrome/146.0.7680.31" };
+				return { product: this.browserVersion };
 			case "Tracing.getCategories":
-				return {
-					categories: ["devtools.timeline", "v8", "disabled-by-default-v8.gc", "blink.user_timing"],
-				};
+				return { categories: this.categories };
 			case "Runtime.evaluate": {
 				const marker = (params?.expression as string).match(/performance\.mark\(("[^"]+")\)/);
 				if (marker) this.markers.push(JSON.parse(marker[1]));
@@ -184,6 +184,60 @@ function result(replies: MemoryProfileWorkerReply[]) {
 }
 
 describe("isolated memory profile recorder", () => {
+	for (const missing of [
+		"devtools.timeline",
+		"v8",
+		"disabled-by-default-v8.gc",
+		"blink.user_timing",
+	] as const) {
+		test(`missing category ${missing} fails before tracing starts and releases its socket`, async () => {
+			const f = await fixture();
+			f.session.categories = f.session.categories.filter((category) => category !== missing);
+			await f.recorder.command({ kind: "start", request: f.request });
+			expect(f.replies).toEqual([
+				{
+					kind: "failed",
+					profileId: f.request.profileId,
+					stage: "trace_capability",
+					traceStopped: true,
+					diagnostic: {
+						diagnosticStage: "trace_capability",
+						browserVersion: "Chrome/146.0.7680.31",
+						missingCategories: [missing],
+					},
+				},
+			]);
+			expect(f.session.count("Tracing.start")).toBe(0);
+			expect(f.session.count("Tracing.end")).toBe(0);
+			expect(f.session.count("HeapProfiler.startSampling")).toBe(0);
+			expect(f.session.detached).toBe(true);
+			expect(f.disconnected()).toBe(true);
+			expect(await readdir(f.dir)).toEqual([]);
+		});
+	}
+
+	test("capability diagnostics list every missing category and reject private browser text", async () => {
+		const f = await fixture();
+		f.session.categories = ["devtools.timeline", "ws://CATEGORY-PRIVATE-CANARY"];
+		f.session.browserVersion = `Chrome/154.0.8037.97 token=${"PRIVATE-CANARY".repeat(100)}`;
+		await f.recorder.command({ kind: "start", request: f.request });
+		expect(f.replies).toEqual([
+			{
+				kind: "failed",
+				profileId: f.request.profileId,
+				stage: "trace_capability",
+				traceStopped: true,
+				diagnostic: {
+					diagnosticStage: "trace_capability",
+					browserVersion: "unavailable",
+					missingCategories: ["v8", "disabled-by-default-v8.gc", "blink.user_timing"],
+				},
+			},
+		]);
+		expect(JSON.stringify(f.replies)).not.toContain("PRIVATE-CANARY");
+		expect(Buffer.byteLength(JSON.stringify(f.replies))).toBeLessThan(512);
+	});
+
 	test("exact-target start ACK, manual stop, markers, private raw deletion and valid 0600 artifacts", async () => {
 		const f = await fixture();
 		const task = f.recorder.command({ kind: "start", request: f.request });

@@ -54,7 +54,57 @@ onPanelDragMove(() => normalDragMoves++);
 onPanelDragEnd((state) => {
 	if (state) normalDragDrops++;
 });
-const escapeDecisions: { closed: boolean; prevented: boolean; target: string | null }[] = [];
+const escapeDecisions: {
+	closed: boolean;
+	prevented: boolean;
+	target: string | null;
+	focused: boolean;
+	opener: string | null;
+}[] = [];
+
+/** Deterministically expose Dockview's pre-first-paint attachment state. */
+export function holdLayoutFrames() {
+	const request = window.requestAnimationFrame;
+	const cancel = window.cancelAnimationFrame;
+	const pending = new Map<number, FrameRequestCallback>();
+	let nextId = -1;
+	window.requestAnimationFrame = (callback) => {
+		if (pending.size >= 100) throw new Error("Fixture layout callback budget exceeded");
+		const id = nextId--;
+		pending.set(id, callback);
+		return id;
+	};
+	window.cancelAnimationFrame = (id) => {
+		if (!pending.delete(id)) cancel.call(window, id);
+	};
+	releaseLayoutFrames = () => {
+		window.requestAnimationFrame = request;
+		window.cancelAnimationFrame = cancel;
+		for (const callback of pending.values()) request.call(window, callback);
+		pending.clear();
+	};
+}
+export let releaseLayoutFrames = () => {};
+
+export function resourceFocus(id: string) {
+	const pin = document.querySelector<HTMLButtonElement>(`[data-workspace-resource-pin="${id}"]`);
+	if (!pin) throw new Error("Missing resource pin");
+	const rect = pin.getBoundingClientRect();
+	const panel = apiRef.current?.getPanel(id);
+	return {
+		focused: document.activeElement === pin,
+		activeTag: document.activeElement?.tagName,
+		activeOpener: document.activeElement?.getAttribute("data-open"),
+		disabled: pin.disabled,
+		visible: pin.checkVisibility({ checkVisibilityCSS: true }),
+		visibility: getComputedStyle(pin).visibility,
+		width: rect.width,
+		height: rect.height,
+		panelVisible: panel?.api.isVisible,
+		floating: panel?.api.location.type === "floating",
+		contentContains: panel?.view.content.element.contains(pin),
+	};
+}
 
 const client = new QueryClient({
 	defaultOptions: { queries: { retry: false, staleTime: Infinity, gcTime: Infinity } },
@@ -259,10 +309,13 @@ function Harness() {
 			// React editors may preventDefault after this listener has run.
 			queueMicrotask(() => {
 				escapeDecisions.push({
+					focused: event.target === document.activeElement,
 					closed: store.closeFocusedTemporaryResource(event),
 					prevented: event.defaultPrevented,
 					target: event.target instanceof Element ? event.target.getAttribute("data-editor") : null,
+					opener: event.target instanceof Element ? event.target.getAttribute("data-open") : null,
 				});
+				if (escapeDecisions.length > 40) escapeDecisions.shift();
 			});
 		};
 		root.addEventListener("keydown", onEscape);

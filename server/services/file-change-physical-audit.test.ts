@@ -1,5 +1,14 @@
 import { Database } from "bun:sqlite";
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import {
+	afterAll,
+	afterEach,
+	beforeAll,
+	beforeEach,
+	describe,
+	expect,
+	spyOn,
+	test,
+} from "bun:test";
 import { randomUUID } from "node:crypto";
 import { chmodSync, renameSync, symlinkSync, utimesSync } from "node:fs";
 import {
@@ -125,6 +134,107 @@ async function put(bytes: Uint8Array | string): Promise<FileChangeBlobRef> {
 	const value = typeof bytes === "string" ? Buffer.from(bytes) : bytes;
 	return store.putBytes(value, { expectedSize: value.byteLength });
 }
+// Pause only this real audit worker after its start snapshot and first reservation
+// page. IPC progress is advisory, not an awaited write barrier: without this gate
+// the end snapshot can race the writer's SQLite lock (busy_timeout stays zero).
+// The preload wraps process.send, not hashing, metadata, budgets or summaries.
+async function auditDuringMetadataMutation(
+	mutate: () => void | Promise<void>,
+	budget: FileChangePhysicalAuditOptions["budget"],
+): Promise<FileChangePhysicalAuditSummary> {
+	const preload = join(sandbox, "metadata-barrier.ts");
+	await writeFile(
+		preload,
+		`import { readFileSync } from "node:fs";
+const send = process.send.bind(process);
+let paused = false;
+process.send = (message) => {
+	const data = typeof message === "string" ? JSON.parse(message) : undefined;
+	send(message);
+	if (!paused && data?.type === "progress" && data.value.phase === "reservations") {
+		paused = true;
+		if (readFileSync(0, "utf8") !== "release") throw new Error("Unreleased test metadata barrier");
+	}
+};
+`,
+		{ mode: 0o600 },
+	);
+	const realSpawn = Bun.spawn;
+	let worker: Bun.Subprocess<"pipe", "ignore", "ignore"> | undefined;
+	// Adapt Bun's overloaded API only for runWorker's verified (command, options)
+	// call. The returned process is real; no IPC result or metadata is fabricated.
+	const spawnWithBarrier = ((command: string[], config?: Parameters<typeof Bun.spawn>[1]) => {
+		if (!command[1]?.endsWith("/file-change-physical-audit-worker.ts"))
+			throw new Error("Metadata barrier must only wrap its own audit worker");
+		worker = realSpawn<"pipe", "ignore", "ignore">(
+			[command[0], "--preload", preload, ...command.slice(1)],
+			{
+				...config,
+				stdio: ["pipe", "ignore", "ignore"],
+				stdin: "pipe",
+				stdout: "ignore",
+				stderr: "ignore",
+			},
+		);
+		return worker;
+	}) as typeof Bun.spawn;
+	const spawn = spyOn(Bun, "spawn").mockImplementation(spawnWithBarrier);
+	let released = false;
+	const release = () => {
+		if (!worker || released) return;
+		released = true;
+		worker.stdin.write("release");
+		worker.stdin.end();
+	};
+	const controller = new AbortController();
+	let mutation: Promise<void> | undefined;
+	let mutationError: unknown;
+	let catalogRowsAtMutation: number | undefined;
+	let readBytesAtMutation: number | undefined;
+	let running: Promise<FileChangePhysicalAuditSummary> | undefined;
+	try {
+		running = auditFileChangePhysical(
+			await options({
+				budget,
+				signal: controller.signal,
+				onProgress(progress) {
+					if (mutation || progress.phase !== "reservations") return;
+					catalogRowsAtMutation = progress.catalogRows;
+					readBytesAtMutation = progress.readBytes;
+					mutation = Promise.resolve()
+						.then(mutate)
+						.catch((error) => {
+							mutationError = error;
+							controller.abort();
+						})
+						.finally(release);
+				},
+			}),
+		);
+		const summary = await running;
+		await mutation;
+		if (mutationError) throw mutationError;
+		expect(mutation).toBeDefined();
+		expect(catalogRowsAtMutation).toBe(0);
+		expect(readBytesAtMutation).toBe(0);
+		expect(summary.start?.generation).toBe(generation);
+		expect(summary.start?.pendingReservations).toBe("none_observed");
+		expect(summary.end).toBeDefined();
+		expect(summary.end).not.toBeNull();
+		expect(codes(summary)).not.toContain("sqlite_busy");
+		expect(codes(summary)).not.toContain("deadline");
+		return summary;
+	} finally {
+		release();
+		controller.abort();
+		try {
+			await running;
+		} finally {
+			spawn.mockRestore();
+		}
+	}
+}
+
 function pathFor(ref: FileChangeBlobRef): string {
 	return join(blobRoot, "sha256", ref.digest.slice(0, 2), ref.digest);
 }
@@ -552,20 +662,17 @@ describe("physical audit: budgets, concurrency and cancellation", () => {
 	test("same-generation concurrent DB writes and zero-byte reservations are not quiescence", async () => {
 		await put(Buffer.alloc(1024 * 1024, 19));
 		let changed = false;
-		const summary = await auditFileChangePhysical(
-			await options({
-				budget: { chunkBytes: 1024 },
-				onProgress() {
-					if (changed) return;
-					changed = true;
-					catalog.reserve({
-						expectedGeneration: generation,
-						ownerEpoch: "late-writer",
-						expectedSize: 0,
-						signal: new AbortController().signal,
-					});
-				},
-			}),
+		const summary = await auditDuringMetadataMutation(
+			() => {
+				changed = true;
+				catalog.reserve({
+					expectedGeneration: generation,
+					ownerEpoch: "late-writer",
+					expectedSize: 0,
+					signal: new AbortController().signal,
+				});
+			},
+			{ chunkBytes: 1024 },
 		);
 		expect(changed).toBe(true);
 		expect(summary.full).toBe(false);
@@ -702,18 +809,18 @@ describe("physical audit: budgets, concurrency and cancellation", () => {
 	test("new real publication while scanning cannot produce full even in the same generation", async () => {
 		await put(Buffer.alloc(2 * 1024 * 1024, 71));
 		let publication: Promise<FileChangeBlobRef> | undefined;
-		const summary = await auditFileChangePhysical(
-			await options({
-				budget: { chunkBytes: 512 },
-				onProgress() {
-					publication ??= put("published-during-scan");
-				},
-			}),
+		const summary = await auditDuringMetadataMutation(
+			async () => {
+				publication = put("published-during-scan");
+				await publication;
+			},
+			{ chunkBytes: 512 },
 		);
 		const ref = await publication;
 		expect(ref).toBeDefined();
 		expect(summary.full).toBe(false);
 		expect(summary.start?.generation).toBe(summary.end?.generation);
+		expect(summary.start?.dataVersion).not.toBe(summary.end?.dataVersion);
 		expect(
 			codes(summary).some((code) =>
 				["scan_changed", "shard_changed", "concurrent_publication"].includes(code),

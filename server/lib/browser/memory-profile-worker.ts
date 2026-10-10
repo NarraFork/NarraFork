@@ -16,13 +16,16 @@ import {
 	writeProfileJson,
 } from "./memory-profile-io";
 import { MemoryProfileTransport } from "./memory-profile-transport";
-import type {
-	HeapTrendPoint,
-	MemoryProfileArtifact,
-	MemoryProfileRequest,
-	MemoryProfileSummary,
-	MemoryProfileWorkerCommand,
-	MemoryProfileWorkerReply,
+import {
+	type HeapTrendPoint,
+	MEMORY_PROFILE_TRACE_CATEGORIES,
+	type MemoryProfileArtifact,
+	type MemoryProfileFailureDiagnostic,
+	type MemoryProfileRequest,
+	type MemoryProfileSummary,
+	type MemoryProfileWorkerCommand,
+	type MemoryProfileWorkerReply,
+	profileDiagnosticBrowserVersion,
 } from "./memory-profile-types";
 import { definiteTraceStartRejection } from "./tracing-lease";
 
@@ -146,6 +149,7 @@ export class MemoryProfileRecorder {
 	private startedAt = "";
 	private startedClock = 0;
 	private browserVersion = "unavailable";
+	private failureDiagnostic?: MemoryProfileFailureDiagnostic;
 	private readonly heapTrend: HeapTrendPoint[] = [];
 	private readonly warnings: string[] = [];
 	private readonly listeners: Array<[string | symbol, Listener]> = [];
@@ -274,13 +278,14 @@ export class MemoryProfileRecorder {
 		this.warn("Allocation sampling and renderer GC event semantics vary by browser version.");
 		if (opts.config.mode !== "allocation") {
 			const { categories } = await this.send<{ categories: string[] }>("Tracing.getCategories");
-			const required = [
-				"devtools.timeline",
-				"v8",
-				"disabled-by-default-v8.gc",
-				"blink.user_timing",
-			];
-			if (required.some((category) => !categories.includes(category))) {
+			const required = [...MEMORY_PROFILE_TRACE_CATEGORIES];
+			const missingCategories = required.filter((category) => !categories.includes(category));
+			if (missingCategories.length > 0) {
+				this.failureDiagnostic = {
+					diagnosticStage: "trace_capability",
+					browserVersion: profileDiagnosticBrowserVersion(this.browserVersion),
+					missingCategories,
+				};
 				throw new MemoryProfileError("trace_capability");
 			}
 			checkProfileAbort(signal);
@@ -664,6 +669,9 @@ export class MemoryProfileRecorder {
 					profileId: opts.profileId,
 					stage: failedStage,
 					traceStopped: this.traceStopped,
+					...(!cancelled && failedStage === "trace_capability" && this.failureDiagnostic
+						? { diagnostic: this.failureDiagnostic }
+						: {}),
 				});
 			}
 		}

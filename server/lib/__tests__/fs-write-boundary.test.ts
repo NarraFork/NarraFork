@@ -8,15 +8,74 @@
  */
 
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import {
+	chmodSync,
+	mkdirSync,
+	mkdtempSync,
+	readFileSync,
+	realpathSync,
+	rmSync,
+	symlinkSync,
+	writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { checkWriteBoundary } from "../fs-write-boundary";
+import { checkWriteBoundary, type WriteBoundaryDecision } from "../fs-write-boundary";
 import { getNarraforkHome } from "../narrafork-home";
 
 let root: string;
 let worktree: string;
 let outside: string;
+
+/** Bun caches homedir(): isolate HOME before a child starts, not in the test process. */
+async function credentialLinkDecision(
+	fixture: "existing" | "missing-file" | "dangling",
+): Promise<WriteBoundaryDecision> {
+	const home = mkdtempSync(join(root, "credential-home-"));
+	const moduleUrl = new URL("../fs-write-boundary.ts", import.meta.url).href;
+	const source = `
+		import { strict as assert } from "node:assert";
+		import { mkdirSync, symlinkSync, writeFileSync } from "node:fs";
+		import { homedir } from "node:os";
+		import { join, resolve } from "node:path";
+		import { checkWriteBoundary } from ${JSON.stringify(moduleUrl)};
+		const home = homedir();
+		assert.equal(resolve(home), resolve(process.env.FS_BOUNDARY_TEST_HOME));
+		const worktree = join(home, "worktree");
+		mkdirSync(worktree);
+		const ssh = join(home, ".ssh");
+		const fixture = ${JSON.stringify(fixture)};
+		if (fixture !== "dangling") mkdirSync(ssh);
+		if (fixture === "existing") writeFileSync(join(ssh, "authorized_keys"), "fixture only");
+		const link = join(worktree, "keys");
+		symlinkSync(ssh, link, process.platform === "win32" ? "junction" : "dir");
+		console.log(JSON.stringify(checkWriteBoundary(join(link, "authorized_keys"), [worktree])));
+	`;
+	try {
+		const child = Bun.spawn([process.execPath, "--eval", source], {
+			env: {
+				...process.env,
+				HOME: home,
+				USERPROFILE: home,
+				NARRAFORK_HOME: join(home, ".narrafork"),
+				FS_BOUNDARY_TEST_HOME: home,
+			},
+			stdout: "pipe",
+			stderr: "pipe",
+			timeout: 10_000,
+		});
+		const [stdout, stderr, exitCode] = await Promise.all([
+			new Response(child.stdout).text(),
+			new Response(child.stderr).text(),
+			child.exited,
+		]);
+		expect(stderr).toBe("");
+		expect(exitCode).toBe(0);
+		return JSON.parse(stdout) as WriteBoundaryDecision;
+	} finally {
+		rmSync(home, { recursive: true, force: true });
+	}
+}
 
 beforeAll(() => {
 	root = mkdtempSync(join(tmpdir(), "nf-write-boundary-"));
@@ -49,6 +108,34 @@ describe("paths inside the allowed root", () => {
 		const decision = checkWriteBoundary(join(worktree, "fresh", "deep", "x.ts"), [worktree]);
 
 		expect(decision.allowed).toBe(true);
+	});
+
+	test("writes a permitted new file through an ordinary existing parent", () => {
+		const candidate = join(worktree, "src", "written-new.ts");
+		const decision = checkWriteBoundary(candidate, [worktree]);
+
+		expect(decision.allowed).toBe(true);
+		expect(decision.physicalPath).toBe(join(realpathSync(join(worktree, "src")), "written-new.ts"));
+		writeFileSync(decision.physicalPath ?? "", "permitted fixture\n");
+		expect(readFileSync(candidate, "utf8")).toBe("permitted fixture\n");
+	});
+
+	test("writes a permitted new file through an internal directory link", () => {
+		const link = join(worktree, "internal-dir");
+		symlinkSync(join(worktree, "src"), link, process.platform === "win32" ? "junction" : "dir");
+		try {
+			const candidate = join(link, "written-via-link.ts");
+			const decision = checkWriteBoundary(candidate, [worktree]);
+
+			expect(decision.allowed).toBe(true);
+			expect(decision.physicalPath).toBe(
+				join(realpathSync(join(worktree, "src")), "written-via-link.ts"),
+			);
+			writeFileSync(decision.physicalPath ?? "", "permitted link fixture\n");
+			expect(readFileSync(candidate, "utf8")).toBe("permitted link fixture\n");
+		} finally {
+			rmSync(link, { force: true });
+		}
 	});
 
 	test("reports the physical path it would write", () => {
@@ -125,6 +212,75 @@ describe("symlink escapes", () => {
 		}
 	});
 
+	test("refuses a dangling file link instead of treating it as a new file", () => {
+		const link = join(worktree, "dangling.txt");
+		symlinkSync(join(worktree, "src", "missing-target.txt"), link);
+		try {
+			const decision = checkWriteBoundary(link, [worktree]);
+
+			expect(decision.allowed).toBe(false);
+			expect(decision.reason).toBe("unresolvable");
+			expect(decision.confirmable).toBeUndefined();
+			expect(decision.physicalPath).toBeUndefined();
+		} finally {
+			rmSync(link, { force: true });
+		}
+	});
+
+	test("refuses missing descendants of a dangling directory link", () => {
+		const link = join(worktree, "dangling-dir");
+		symlinkSync(
+			join(outside, "missing-dir"),
+			link,
+			process.platform === "win32" ? "junction" : "dir",
+		);
+		try {
+			const decision = checkWriteBoundary(join(link, "deep", "new.txt"), [worktree]);
+
+			expect(decision.allowed).toBe(false);
+			expect(decision.reason).toBe("unresolvable");
+			expect(decision.confirmable).toBeUndefined();
+			expect(decision.physicalPath).toBeUndefined();
+		} finally {
+			rmSync(link, { force: true });
+		}
+	});
+
+	test("refuses a symlink loop and its missing descendants", () => {
+		const first = join(worktree, "loop-first");
+		const second = join(worktree, "loop-second");
+		symlinkSync(second, first, process.platform === "win32" ? "junction" : "dir");
+		symlinkSync(first, second, process.platform === "win32" ? "junction" : "dir");
+		try {
+			for (const candidate of [first, join(first, "deep", "new.txt")]) {
+				const decision = checkWriteBoundary(candidate, [worktree]);
+
+				expect(decision.allowed).toBe(false);
+				expect(decision.reason).toBe("unresolvable");
+				expect(decision.confirmable).toBeUndefined();
+				expect(decision.physicalPath).toBeUndefined();
+			}
+		} finally {
+			rmSync(first, { force: true });
+			rmSync(second, { force: true });
+		}
+	});
+
+	test("a dangling link outside roots is not confirmable", () => {
+		const link = join(outside, "dangling.txt");
+		symlinkSync(join(outside, "missing-target.txt"), link);
+		try {
+			const decision = checkWriteBoundary(link, [worktree]);
+
+			expect(decision.allowed).toBe(false);
+			expect(decision.reason).toBe("unresolvable");
+			expect(decision.confirmable).toBeUndefined();
+			expect(decision.physicalPath).toBeUndefined();
+		} finally {
+			rmSync(link, { force: true });
+		}
+	});
+
 	test("allows a symlink that stays inside the root", () => {
 		// The user's own arrangement within their workspace must keep working.
 		const link = join(worktree, "alias.ts");
@@ -166,20 +322,31 @@ describe("multiple allowed roots", () => {
 });
 
 describe("credential paths are refused even inside an allowed root", () => {
-	test("refuses a link that resolves into a third-party credential store", () => {
-		// The allow-list is not a licence to write anywhere inside the root: a link landing
-		// in `~/.ssh` is refused by WHERE IT LANDS.
-		const link = join(worktree, "keys");
-		symlinkSync(join(homedir(), ".ssh"), link);
-		try {
-			const decision = checkWriteBoundary(join(link, "authorized_keys"), [worktree]);
+	test("refuses a link that resolves into a third-party credential store", async () => {
+		// Existing credential directory, missing file; never consult the real ~/.ssh.
+		const decision = await credentialLinkDecision("missing-file");
 
-			expect(decision.allowed).toBe(false);
-			// Either refusal is correct here; both are boundary violations.
-			expect(["secret-path", "escapes-via-symlink"]).toContain(decision.reason ?? "");
-		} finally {
-			rmSync(link, { force: true });
-		}
+		expect(decision.allowed).toBe(false);
+		// Either refusal is correct here; both are boundary violations.
+		expect(["secret-path", "escapes-via-symlink"]).toContain(decision.reason ?? "");
+		expect(decision.confirmable).toBeUndefined();
+	});
+
+	test("refuses a link to an existing credential fixture", async () => {
+		const decision = await credentialLinkDecision("existing");
+
+		expect(decision.allowed).toBe(false);
+		expect(decision.reason).toBe("secret-path");
+		expect(decision.confirmable).toBeUndefined();
+	});
+
+	test("refuses a dangling link to a missing credential directory", async () => {
+		const decision = await credentialLinkDecision("dangling");
+
+		expect(decision.allowed).toBe(false);
+		expect(decision.reason).toBe("unresolvable");
+		expect(decision.confirmable).toBeUndefined();
+		expect(decision.physicalPath).toBeUndefined();
 	});
 
 	test("refuses the platform settings file when its directory is an allowed root", () => {
@@ -329,6 +496,40 @@ describe("the git directory is refused inside an allowed root", () => {
 		expect(checkWriteBoundary(join(worktree, "git", "notes.md"), [worktree]).allowed).toBe(true);
 		expect(checkWriteBoundary(join(worktree, "src", "github.ts"), [worktree]).allowed).toBe(true);
 	});
+});
+
+describe("unresolvable filesystem entries", () => {
+	test("refuses descendants of an ordinary file (ENOTDIR)", () => {
+		const decision = checkWriteBoundary(join(worktree, "src", "a.ts", "new.txt"), [worktree]);
+
+		expect(decision.allowed).toBe(false);
+		expect(decision.reason).toBe("unresolvable");
+		expect(decision.confirmable).toBeUndefined();
+	});
+
+	test.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+		"refuses an inaccessible ancestor (EACCES)",
+		() => {
+			const locked = join(worktree, "locked");
+			mkdirSync(locked);
+			writeFileSync(join(locked, "existing.txt"), "fixture only");
+			chmodSync(locked, 0);
+			try {
+				for (const name of ["existing.txt", "new.txt"]) {
+					const candidate = join(locked, name);
+					expect(() => realpathSync(candidate)).toThrow();
+					const decision = checkWriteBoundary(candidate, [worktree]);
+
+					expect(decision.allowed).toBe(false);
+					expect(decision.reason).toBe("unresolvable");
+					expect(decision.confirmable).toBeUndefined();
+				}
+			} finally {
+				chmodSync(locked, 0o700);
+				rmSync(locked, { recursive: true, force: true });
+			}
+		},
+	);
 });
 
 describe("malformed input", () => {

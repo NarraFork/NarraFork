@@ -1,10 +1,7 @@
-import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
 import { lstat, mkdir, mkdtemp, open, realpath, rename, rm, statfs } from "node:fs/promises";
 import { basename, dirname, join, resolve } from "node:path";
-import { promisify } from "node:util";
 import { z } from "zod";
-import { updateServerChildEnvironment } from "../../shared/update-server-child-env";
 import { verifyReleaseBundle } from "./ci-release-bundle";
 import { readReleaseText } from "./ci-release-io";
 import {
@@ -19,6 +16,7 @@ import {
 	validateCiReleaseTag,
 } from "./ci-release-plan";
 import { CI_RELEASE_TARGETS, CI_RELEASE_WORKFLOW } from "./ci-release-types";
+import { runBridgeProcess } from "./ci-update-server-bridge-restore";
 import type { GhRunner } from "./github-release";
 
 export const MAX_RELEASE_BUNDLE_BYTES = 24 * 1024 ** 3;
@@ -331,14 +329,16 @@ export async function restoreCiReleaseBundle(options: RestoreCiReleaseBundleOpti
 			options.signal,
 		);
 		await mkdir(extracted);
-		await promisify(execFile)(
+		// execFile's abort callback can precede close. Keep extraction files owned until
+		// our child is reaped and both bounded output readers have closed, even on abort.
+		await runBridgeProcess(
 			"python3",
 			["-I", "-c", EXTRACT_BUNDLE, archive, extracted, String(MAX_RELEASE_BUNDLE_BYTES)],
 			{
-				timeout: RESTORE_TIMEOUT_MS,
-				maxBuffer: 1024 * 1024,
+				timeoutMs: RESTORE_TIMEOUT_MS,
+				maximumOutputBytes: 1024 * 1024,
 				signal: options.signal,
-				env: updateServerChildEnvironment(env),
+				environment: env,
 			},
 		);
 		const manifestValue = JSON.parse(await readReleaseText(join(extracted, "manifest.json")));

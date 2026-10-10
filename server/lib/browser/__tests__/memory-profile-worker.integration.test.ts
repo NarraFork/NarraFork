@@ -72,7 +72,9 @@ function workerRecorder(request: MemoryProfileRequest) {
 		if (reply.kind === "result" || reply.kind === "cancelled" || reply.kind === "failed") {
 			if (!replies.some((item) => item.kind === "recording"))
 				rejectStart(
-					new Error(`Start failed at ${reply.kind === "result" ? "result" : reply.stage}`),
+					new Error(`Start failed at ${reply.kind === "result" ? "result" : reply.stage}`, {
+						cause: reply.kind === "failed" ? reply.diagnostic : undefined,
+					}),
 				);
 			terminal(reply);
 		}

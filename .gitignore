@@ -123,6 +123,10 @@ drizzle-postgres/meta/_generation_pending.json
 # tests/scripts/test-database-regression.test.ts. Its `artifacts/` reports are separate.
 !scripts/test-database-regression.ts
 !scripts/validate-plugin-release.ts
+# Required inputs for the plugin platform acceptance workflow.
+!scripts/drill-plugin-rollback.ts
+!scripts/smoke-plugin-ui.ts
+!scripts/smoke-narrator-dock.ts
 # Imported by tests/scripts/build-plugin.test.ts, so it has to be in the repo or
 # `bun test` fails on a missing module in a fresh clone.
 !scripts/build-plugin.ts

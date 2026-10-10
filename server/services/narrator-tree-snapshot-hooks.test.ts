@@ -418,20 +418,31 @@ describe("unfinished tool lifecycles", () => {
 		// never runs. This is the leak.
 		await recordTreeSnapshotBefore(neighbour, neighbourId, "threw-mid-write", ["target.txt"]);
 		abandonTreeSnapshot(neighbour, neighbourId, "threw-mid-write");
+		const sealedAt = peekClaim(repo, "threw-mid-write")?.to;
+		if (sealedAt == null) throw new Error("Abandoned claim must be sealed");
 
-		// A shell command starting afterwards genuinely writes that file, and must keep
-		// it: without the seal the abandoned claim still overlaps and subtracts it.
-		const { toolUseId } = await seedToolCall(narratorId, "Bash", 1);
-		await recordTreeSnapshotBefore(session, narratorId, toolUseId, null);
-		writeFileSync(join(repo, "target.txt"), "written-by-shell\n");
-		const result = await recordTreeSnapshotAfter(session, narratorId, toolUseId);
+		// Equal-ms endpoints conservatively overlap. This case needs a strictly
+		// later shell window, not a race against the clock's millisecond resolution.
+		const realNow = Date.now;
+		const clock = spyOn(Date, "now").mockImplementation(() => Math.max(realNow(), sealedAt + 1));
+		try {
+			// A shell command starting afterwards genuinely writes that file, and must keep
+			// it: without the seal the abandoned claim still overlaps and subtracts it.
+			const { toolUseId } = await seedToolCall(narratorId, "Bash", 1);
+			await recordTreeSnapshotBefore(session, narratorId, toolUseId, null);
+			expect(peekClaim(repo, toolUseId)?.from).toBeGreaterThan(sealedAt);
+			writeFileSync(join(repo, "target.txt"), "written-by-shell\n");
+			const result = await recordTreeSnapshotAfter(session, narratorId, toolUseId);
 
-		expect(result.changedFiles).toEqual(["target.txt"]);
-		const row = await db.query.narratorToolCalls.findFirst({
-			where: eq(narratorToolCalls.toolUseId, toolUseId),
-			columns: { ownedPathsJson: true },
-		});
-		expect(row?.ownedPathsJson).toEqual(["target.txt"]);
+			expect(result.changedFiles).toEqual(["target.txt"]);
+			const row = await db.query.narratorToolCalls.findFirst({
+				where: eq(narratorToolCalls.toolUseId, toolUseId),
+				columns: { ownedPathsJson: true },
+			});
+			expect(row?.ownedPathsJson).toEqual(["target.txt"]);
+		} finally {
+			clock.mockRestore();
+		}
 	});
 
 	test("an abandoned call still shadows a neighbour inside the span it occupied", async () => {

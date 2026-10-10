@@ -173,6 +173,12 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
+      - name: Build frontend
+        run: bun run build
+
+      - name: Install VS Code extension type dependencies
+        run: bun install --cwd vscode-extension --frozen-lockfile
+
       - name: Check TypeScript
         run: bunx tsgo --noEmit
 
@@ -204,6 +210,3 @@ jobs:
           tests/update-server-tools-route.test.ts
           tests/executor-bootstrap-e2e.test.ts
           frontend/lib/device-config.test.ts
-
-      - name: Build frontend
-        run: bun run build

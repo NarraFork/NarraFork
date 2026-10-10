@@ -166,6 +166,18 @@ jobs:
               timeout: 15000,
             });
             try {
+              const client = await browser.target().createCDPSession();
+              try {
+                const version = await client.send("Browser.getVersion");
+                const { categories } = await client.send("Tracing.getCategories");
+                const required = ["devtools.timeline", "v8", "disabled-by-default-v8.gc", "blink.user_timing"];
+                console.log(JSON.stringify({
+                  chromeProduct: /^(?:Chrome|HeadlessChrome|Chromium)\/\d{1,4}(?:\.\d{1,6}){1,3}$/.test(version.product) ? version.product : "unavailable",
+                  memoryProfileCategories: required.map(category => ({ category, available: categories.includes(category) })),
+                }));
+              } finally {
+                await client.detach();
+              }
               const page = await browser.newPage();
               await page.goto("data:text/html,<title>CI Chrome probe</title>");
               if (await page.title() !== "CI Chrome probe") throw new Error("Chrome probe failed");

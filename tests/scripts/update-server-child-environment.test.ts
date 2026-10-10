@@ -563,6 +563,101 @@ async function restoreFixture(f: Awaited<ReturnType<typeof sandbox>>) {
 	};
 }
 
+async function assertCancelledExtractor(mode: "slow-close" | "ignore-term" | "shutdown") {
+	const f = await sandbox();
+	const options = await restoreFixture(f);
+	const marker = join(f.root, "python-started");
+	const stoppedMarker = join(f.root, "python-stopped");
+	const callerFile = join(f.root, "caller-data");
+	await writeFile(callerFile, "preserve");
+	options.env.FIXTURE_MARKER = marker;
+	options.env.FIXTURE_STOPPED = stoppedMarker;
+	await f.shim(
+		"python3",
+		`import signal,time
+owned=os.path.join(sys.argv[-2],'owned-extraction')
+with open(owned,'w') as output: output.write('temporary')
+def terminate(signum,frame):
+ time.sleep(0.2)
+ sys.stderr.write('controlled delayed shutdown diagnostics\\n'); sys.stderr.flush()
+ sys.exit(0)
+signal.signal(signal.SIGTERM,${mode === "slow-close" ? "terminate" : "signal.SIG_IGN"})
+# A bounded self-exit also cleans up the fixture when testing the broken implementation.
+signal.signal(signal.SIGALRM,lambda *_: sys.exit(0))
+signal.setitimer(signal.ITIMER_REAL,0.75)
+with open(e['FIXTURE_MARKER']+'.tmp','w') as output: output.write(str(os.getpid()))
+os.replace(e['FIXTURE_MARKER']+'.tmp',e['FIXTURE_MARKER'])
+try:
+ signal.pause()
+finally:
+ with open(e['FIXTURE_STOPPED']+'.tmp','w') as output:
+  output.write(json.dumps({'pid':os.getpid(),'ownedExists':os.path.exists(owned)}))
+ os.replace(e['FIXTURE_STOPPED']+'.tmp',e['FIXTURE_STOPPED'])`,
+	);
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	let watcher: ReturnType<typeof watch> | undefined;
+	let notifyStopped: () => void = () => {};
+	const stopped = new Promise<void>((resolve) => {
+		notifyStopped = resolve;
+	});
+	const ready = new Promise<void>((resolve, reject) => {
+		watcher = watch(f.root, (_event, name) => {
+			if (name === "python-started") resolve();
+			if (name === "python-stopped") notifyStopped();
+		});
+		timer = setTimeout(() => reject(new Error("Fixture Python extractor did not start")), 2000);
+	});
+	const parent = new AbortController();
+	const task = restoreCiReleaseBundle({ ...options, signal: parent.signal }).then(
+		() => undefined,
+		(error: unknown) => error,
+	);
+	let confirmedStopped = false;
+	try {
+		await ready;
+		if (timer) clearTimeout(timer);
+		const pid = Number(await readFile(marker, "utf8"));
+		const reason = mode === "shutdown" ? "fixture shutdown" : "fixture cancellation";
+		parent.abort(new Error(reason));
+		const error = await task;
+		expect(error).toBeInstanceOf(Error);
+		expect(String(error)).toContain(reason);
+		expect(String(error)).not.toContain(sentinel);
+		expect(() => process.kill(pid, 0)).toThrow();
+		confirmedStopped = true;
+		expect((await readdir(f.root)).some((name) => name.startsWith(".restored-restore-"))).toBe(
+			false,
+		);
+		expect(await readdir(f.root)).not.toContain("restored");
+		expect(await readFile(callerFile, "utf8")).toBe("preserve");
+		expect(await f.assertChildren()).toHaveLength(1);
+	} finally {
+		parent.abort();
+		if (timer) clearTimeout(timer);
+		await task;
+		if (!confirmedStopped && (await Bun.file(marker).exists())) {
+			// Await this exact fixture's bounded self-exit, never kill or poll an arbitrary PID.
+			try {
+				await Promise.race([
+					stopped,
+					new Promise<void>((_resolve, reject) => {
+						timer = setTimeout(() => reject(new Error("Fixture self-exit did not finish")), 2000);
+					}),
+				]);
+				console.info(
+					"Python self-exit after restore settled:",
+					await readFile(stoppedMarker, "utf8"),
+				);
+			} finally {
+				if (timer) clearTimeout(timer);
+				watcher?.close();
+			}
+		} else {
+			watcher?.close();
+		}
+	}
+}
+
 describe("source ZIP restore uses only filtered explicitly supplied environment", () => {
 	test("real Python extractor restores full bundle without inheriting publisher credentials", async () => {
 		const f = await sandbox();
@@ -646,6 +741,70 @@ describe("source ZIP restore uses only filtered explicitly supplied environment"
 			if (timer) clearTimeout(timer);
 			await task;
 		}
+	});
+
+	for (const mode of ["slow-close", "ignore-term", "shutdown"] as const) {
+		test(`${mode}: cancellation awaits owned Python and closed diagnostics before cleanup`, async () => {
+			await assertCancelledExtractor(mode);
+		});
+	}
+
+	for (const mode of ["stderr-failure", "stderr-overflow", "stdout-overflow"] as const) {
+		test(`${mode}: bounded readers finish and reap only the owned extractor`, async () => {
+			const f = await sandbox();
+			const options = await restoreFixture(f);
+			const marker = join(f.root, "python-started");
+			const callerFile = join(f.root, "caller-data");
+			await writeFile(callerFile, "preserve");
+			options.env.FIXTURE_MARKER = marker;
+			await f.shim(
+				"python3",
+				`import signal
+signal.signal(signal.SIGTERM,signal.SIG_IGN)
+signal.signal(signal.SIGALRM,lambda *_: sys.exit(0))
+signal.setitimer(signal.ITIMER_REAL,0.75)
+with open(e['FIXTURE_MARKER'],'w') as output: output.write(str(os.getpid()))
+with open(os.path.join(sys.argv[-2],'owned-extraction'),'w') as output: output.write('temporary')
+sys.stderr.write('gh: Not Found (HTTP 404)\\n'+e['GH_TOKEN']+'\\n'); sys.stderr.flush()
+${mode === "stderr-failure" ? "sys.exit(7)" : `sys.${mode === "stderr-overflow" ? "stderr" : "stdout"}.buffer.write(b'x'*(1024*1024+1)); sys.${mode === "stderr-overflow" ? "stderr" : "stdout"}.flush()\nsignal.pause()`}`,
+			);
+			const error = await restoreCiReleaseBundle(options).then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+			expect(error).toBeInstanceOf(Error);
+			expect(String(error)).toContain(
+				mode === "stderr-failure" ? "subprocess failed" : "output exceeds limit",
+			);
+			// A Python diagnostic cannot fabricate gh's structured HTTP status or expose credentials.
+			expect(String(error)).not.toContain("HTTP 404");
+			expect(String(error)).not.toContain(ghAuthentication);
+			expect(String(error)).not.toContain(sentinel);
+			const pid = Number(await readFile(marker, "utf8"));
+			expect(() => process.kill(pid, 0)).toThrow();
+			expect((await readdir(f.root)).some((name) => name.startsWith(".restored-restore-"))).toBe(
+				false,
+			);
+			expect(await readdir(f.root)).not.toContain("restored");
+			expect(await readFile(callerFile, "utf8")).toBe("preserve");
+			expect(await f.assertChildren()).toHaveLength(1);
+		});
+	}
+
+	test("spawn failure closes readers and removes only the owned temporary directory", async () => {
+		const f = await sandbox();
+		const options = await restoreFixture(f);
+		const callerFile = join(f.root, "caller-data");
+		await writeFile(callerFile, "preserve");
+		await rm(join(f.bin, "python3"));
+		options.env.PATH = f.bin;
+		await expect(restoreCiReleaseBundle(options)).rejects.toThrow("subprocess failed");
+		expect((await readdir(f.root)).some((name) => name.startsWith(".restored-restore-"))).toBe(
+			false,
+		);
+		expect(await readdir(f.root)).not.toContain("restored");
+		expect(await readFile(callerFile, "utf8")).toBe("preserve");
+		expect(await Bun.file(f.log).exists()).toBe(false);
 	});
 });
 

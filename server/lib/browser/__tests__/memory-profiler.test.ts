@@ -9,6 +9,7 @@ import { createShare, getShare, revokeShareRegistry } from "../../shares";
 import { reserveDiagnostic } from "../diagnostic-admission";
 import { cancelMemoryJob } from "../memory-job";
 import type {
+	MemoryProfileFailureDiagnostic,
 	MemoryProfileRequest,
 	MemoryProfileSummary,
 	MemoryProfileWorkerCommand,
@@ -415,6 +416,134 @@ describe("memory profile supervisor", () => {
 			await f.dispose();
 		}
 	});
+	test("trace capability startup retains its diagnostic stage instead of generic worker", async () => {
+		const worker = new FakeWorker();
+		worker.record = false;
+		const post = worker.postMessage.bind(worker);
+		worker.postMessage = (command) => {
+			post(command);
+			if (command.kind === "start")
+				queueMicrotask(() =>
+					worker.reply({
+						kind: "failed",
+						profileId: command.request.profileId,
+						stage: "trace_capability",
+						traceStopped: true,
+						diagnostic: {
+							diagnosticStage: "trace_capability",
+							browserVersion: "Chrome/154.0.8037.97",
+							missingCategories: ["disabled-by-default-v8.gc"],
+						},
+					}),
+				);
+		};
+		const f = await fixture({ worker });
+		try {
+			const pending = f.api.startMemoryProfile(f.session);
+			await expect(pending).rejects.toThrow("(trace_capability)");
+			const diagnostic = {
+				diagnosticStage: "trace_capability",
+				browserVersion: "Chrome/154.0.8037.97",
+				missingCategories: ["disabled-by-default-v8.gc"],
+			};
+			await expect(pending).rejects.toMatchObject({ cause: diagnostic });
+			expect(statusMemoryProfile(f.session)).toMatchObject({
+				state: "failed",
+				stage: "trace_capability",
+				diagnostic,
+			});
+			expect(f.counts().confirmed).toBe(1);
+			expect(f.counts().uncertain).toBe(0);
+		} finally {
+			await f.dispose();
+		}
+	});
+
+	for (const scenario of [
+		{
+			name: "filters private version, categories and extra fields",
+			stage: "trace_capability",
+			diagnostic: {
+				diagnosticStage: "trace_capability",
+				browserVersion: "ws://PRIVATE-CANARY/target?token=PRIVATE-CANARY",
+				missingCategories: ["blink.user_timing", "PRIVATE-CANARY", "blink.user_timing"],
+				targetId: "PRIVATE-CANARY",
+				path: "/private/PRIVATE-CANARY",
+			},
+			expected: {
+				diagnosticStage: "trace_capability",
+				browserVersion: "unavailable",
+				missingCategories: ["blink.user_timing"],
+			} satisfies MemoryProfileFailureDiagnostic,
+		},
+		{
+			name: "drops diagnostic for an untrusted stage",
+			stage: "ws://PRIVATE-CANARY",
+			diagnostic: {
+				diagnosticStage: "trace_capability",
+				browserVersion: "Chrome/154.0.8037.97",
+				missingCategories: ["v8"],
+			},
+			expected: undefined,
+		},
+		{
+			name: "drops diagnostic with an untrusted discriminator",
+			stage: "trace_capability",
+			diagnostic: {
+				diagnosticStage: "PRIVATE-CANARY",
+				browserVersion: "Chrome/154.0.8037.97",
+				missingCategories: ["v8"],
+			},
+			expected: undefined,
+		},
+		{
+			name: "rejects category lists beyond the four-item budget",
+			stage: "trace_capability",
+			diagnostic: {
+				diagnosticStage: "trace_capability",
+				browserVersion: "Chrome/154.0.8037.97",
+				missingCategories: ["v8", "v8", "v8", "v8", "v8"],
+			},
+			expected: undefined,
+		},
+	]) {
+		test(`failure diagnostic ${scenario.name}`, async () => {
+			const worker = new FakeWorker();
+			worker.record = false;
+			const post = worker.postMessage.bind(worker);
+			worker.postMessage = (command) => {
+				post(command);
+				if (command.kind === "start")
+					queueMicrotask(() =>
+						worker.reply({
+							kind: "failed",
+							profileId: command.request.profileId,
+							stage: scenario.stage,
+							traceStopped: true,
+							diagnostic: scenario.diagnostic,
+						} as unknown as MemoryProfileWorkerReply),
+					);
+			};
+			const f = await fixture({ worker });
+			try {
+				const error = await f.api.startMemoryProfile(f.session).catch((error: unknown) => error);
+				const view = statusMemoryProfile(f.session);
+				expect(view.state).toBe("failed");
+				expect(view.stage).toBe(
+					scenario.stage === "trace_capability" ? "trace_capability" : "worker",
+				);
+				expect(view.diagnostic).toEqual(scenario.expected);
+				expect((error as Error).cause).toEqual(scenario.expected);
+				expect(JSON.stringify({ view, errorCause: (error as Error).cause })).not.toContain(
+					"PRIVATE-CANARY",
+				);
+				expect(f.counts().confirmed).toBe(1);
+			} finally {
+				await f.dispose();
+			}
+		});
+	}
+
 	test("worker error and malicious stage become generic failure, never raw endpoint text", async () => {
 		for (const error of [true, false]) {
 			const f = await fixture();

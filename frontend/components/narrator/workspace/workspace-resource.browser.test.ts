@@ -831,6 +831,74 @@ browserTest(
 
 for (const director of [false, true]) {
 	browserTest(
+		`${director ? "Director" : "Grid"} pin focus waits for Dockview's first layout, not DOM attachment`,
+		async () => {
+			await withFixture(async (page) => {
+				const id = await idFor(page, "terminal");
+				if (director) {
+					await page.click("[data-director-toggle]");
+					await page.waitForSelector("[data-director-overlay]");
+				}
+				const opener = `[data-open="${director ? "director" : "grid"}-terminal"]`;
+				await page.click(opener);
+				await page.waitForSelector(titleSelector(id));
+				await settle(page);
+				await page.focus(bodySelector(id));
+				await page.keyboard.press("Escape");
+				await settle(page);
+				expect((await state(page)).temporary).toEqual([]);
+				// Reopening creates a new overlay, hidden until its first RAF.
+				// Hold that frame rather than relying on machine speed to reproduce it.
+				await page.evaluate(() => (window as unknown as FixtureWindow).fixture.holdLayoutFrames());
+				await page.click(opener);
+				await page.waitForSelector(titleSelector(id));
+				await page.focus(pinSelector(id));
+				const beforeLayout = await page.evaluate(
+					(value) => (window as unknown as FixtureWindow).fixture.resourceFocus(value),
+					id,
+				);
+				expect(beforeLayout).toMatchObject({
+					focused: false,
+					activeTag: "BUTTON",
+					activeOpener: `${director ? "director" : "grid"}-terminal`,
+					disabled: false,
+					visible: false,
+					visibility: "hidden",
+					panelVisible: true,
+					floating: true,
+					contentContains: true,
+				});
+				await page.keyboard.press("Escape");
+				const beforeKey = await state(page);
+				expect(beforeKey.temporary).toEqual([id]);
+				expect(beforeKey.escapeDecisions.at(-1)).toMatchObject({
+					closed: false,
+					prevented: false,
+					focused: true,
+					opener: `${director ? "director" : "grid"}-terminal`,
+				});
+				await page.evaluate(() =>
+					(window as unknown as FixtureWindow).fixture.releaseLayoutFrames(),
+				);
+				await settle(page);
+				await page.focus(pinSelector(id));
+				const afterLayout = await page.evaluate(
+					(value) => (window as unknown as FixtureWindow).fixture.resourceFocus(value),
+					id,
+				);
+				expect(afterLayout).toMatchObject({ focused: true, disabled: false, visible: true });
+				expect(afterLayout.width).toBeGreaterThan(0);
+				expect(afterLayout.height).toBeGreaterThan(0);
+				await page.keyboard.press("Escape");
+				await settle(page);
+				const afterKey = await state(page);
+				expect(afterKey.temporary).toEqual([]);
+				expect(afterKey.escapeDecisions.at(-1)).toMatchObject({ closed: true, prevented: false });
+			});
+		},
+		30_000,
+	);
+	browserTest(
 		`${director ? "Director" : "Grid"} native Escape: body/header close, editors/consumed/outer/fixed targets stay open`,
 		async () => {
 			await withFixture(async (page) => {
@@ -913,7 +981,16 @@ for (const director of [false, true]) {
 				// handler: dismissal must come from the same native ancestor listener.
 				await page.click(opener);
 				await page.waitForSelector(titleSelector(id));
+				// Attachment is not focus readiness: Dockview's overlay is hidden
+				// until its RAF position is applied (covered deterministically above).
+				await settle(page);
 				await page.focus(pinSelector(id));
+				expect(
+					await page.evaluate(
+						(value) => (window as unknown as FixtureWindow).fixture.resourceFocus(value),
+						id,
+					),
+				).toMatchObject({ focused: true, disabled: false, visible: true });
 				await page.keyboard.press("Escape");
 				await settle(page);
 				const titleClosed = await state(page);

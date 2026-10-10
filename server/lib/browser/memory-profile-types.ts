@@ -1,6 +1,26 @@
 import type { AllocationSummary } from "./allocation-summary";
 import type { GcSummary } from "./gc-trace-summary";
 
+export const MEMORY_PROFILE_TRACE_CATEGORIES = [
+	"devtools.timeline",
+	"v8",
+	"disabled-by-default-v8.gc",
+	"blink.user_timing",
+] as const;
+export interface MemoryProfileFailureDiagnostic {
+	diagnosticStage: "trace_capability";
+	browserVersion: string;
+	missingCategories: (typeof MEMORY_PROFILE_TRACE_CATEGORIES)[number][];
+}
+
+/** Protocol product only: never carry arbitrary browser/worker text into a diagnostic. */
+export function profileDiagnosticBrowserVersion(value: unknown): string {
+	return typeof value === "string" &&
+		/^(?:Chrome|HeadlessChrome|Chromium)\/\d{1,4}(?:\.\d{1,6}){1,3}$/.test(value)
+		? value
+		: "unavailable";
+}
+
 export type MemoryProfileMode = "allocation" | "gc" | "both";
 export type MemoryProfileState =
 	| "idle"
@@ -75,7 +95,13 @@ export type MemoryProfileWorkerReply =
 			artifacts: MemoryProfileArtifact[];
 			traceStopped: boolean;
 	  }
-	| { kind: "failed" | "cancelled"; profileId: string; stage: string; traceStopped: boolean };
+	| {
+			kind: "failed" | "cancelled";
+			profileId: string;
+			stage: string;
+			traceStopped: boolean;
+			diagnostic?: MemoryProfileFailureDiagnostic;
+	  };
 export type MemoryProfileWorkerCommand =
 	| { kind: "start"; request: MemoryProfileRequest }
 	| { kind: "stop" | "cancel"; profileId: string };
@@ -88,6 +114,7 @@ export interface MemoryProfileView {
 	elapsedMs?: number;
 	browserVersion?: string;
 	stage?: string;
+	diagnostic?: MemoryProfileFailureDiagnostic;
 	warnings?: string[];
 	summary?: MemoryProfileSummary;
 	artifacts?: Array<MemoryProfileArtifact & { shareId: string; shareUrl: string; path: string }>;

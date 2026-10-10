@@ -1,5 +1,6 @@
 import { ActionIcon, Indicator, Menu, Tooltip } from "@mantine/core";
 import { PluginContributionPicker } from "../../plugins/PluginContributionPicker";
+import { usePluginUiSurface } from "../../plugins/PluginUiSurfaceContext";
 import { PathRulesPopover } from "../interaction/PathRulesPopover";
 import { NarratorLodMenu } from "../lod/NarratorLodMenu";
 import { ExecutionDeviceMenu } from "../model/ExecutionDeviceMenu";
@@ -42,6 +43,7 @@ export function NarratorToolbarItem({
 	t,
 	mode = "inline",
 }: NarratorToolbarItemProps) {
+	const hostSurface = usePluginUiSurface()?.hostContext.surface ?? "focus";
 	const Icon = def.icon;
 	const title = t(def.labelKey, { ns: def.namespace ?? "narrator" });
 	const label =
@@ -98,7 +100,7 @@ export function NarratorToolbarItem({
 		return (
 			<PluginContributionPicker
 				onPick={inlineControls.openPluginPanel}
-				surface="focus"
+				surface={hostSurface}
 				trigger={
 					<Tooltip label={label}>
 						<ActionIcon size="sm" variant="subtle" color="gray" aria-label={label}>

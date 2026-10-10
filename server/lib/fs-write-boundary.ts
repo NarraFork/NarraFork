@@ -47,7 +47,7 @@
  * containment test happily permitted it. See {@link namesGitDirectory}.
  */
 
-import { realpathSync } from "node:fs";
+import { lstatSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve, sep } from "node:path";
 import { isSecretPlatformPath, isSecretUserPath } from "./fs-secret-paths";
@@ -99,13 +99,17 @@ function isContained(root: string, candidate: string): boolean {
  *
  * The file need not exist — saving may create it — so `realpathSync` cannot be called on
  * it directly. The deepest existing ANCESTOR is resolved and the missing tail
- * re-appended. Sound rather than approximate: the tail's segments do not exist, so none
- * can be a symlink, and `resolve()` has already collapsed every `..`.
+ * re-appended, but only after BOTH realpath and lstat report ENOENT for each tail entry.
+ * lstat does not follow the final link: an existing dangling symlink (including a
+ * Windows junction) is not a missing ordinary entry, even when realpath reports ENOENT.
+ * Missing descendants are checked again while ascending, so an unresolved ancestor
+ * link cannot be hidden by its missing children. `resolve()` has collapsed every `..`.
  *
  * An existing candidate is resolved itself, which is the case that matters most: a
  * symlinked FILE is followed by `writeFile`.
  *
- * Returns null when nothing resolves, which callers must treat as "not provably
+ * Returns null for an unresolved existing entry or any error other than ENOENT
+ * (including ELOOP, EACCES and ENOTDIR). Callers must treat this as "not provably
  * contained" rather than as containment.
  */
 function physicalPath(candidate: string): string | null {
@@ -115,7 +119,16 @@ function physicalPath(candidate: string): string | null {
 	for (;;) {
 		try {
 			return join(realpathSync(current), ...tail);
-		} catch {
+		} catch (error) {
+			if ((error as NodeJS.ErrnoException)?.code !== "ENOENT") return null;
+			try {
+				// realpath's ENOENT may name a dangling link, not an absent entry.
+				// An existing entry that cannot be resolved is never safe to re-append.
+				lstatSync(current);
+				return null;
+			} catch (lookupError) {
+				if ((lookupError as NodeJS.ErrnoException)?.code !== "ENOENT") return null;
+			}
 			const parent = dirname(current);
 			if (parent === current) return null;
 			tail.unshift(basename(current));
