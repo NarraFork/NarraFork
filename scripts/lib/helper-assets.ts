@@ -1,6 +1,7 @@
 /** Bounded, hash-pinned local helper acquisition; never publishes assets. */
 import { createHash, randomUUID } from "node:crypto";
 import { createReadStream, createWriteStream, existsSync, renameSync, unlinkSync } from "node:fs";
+import { lstat } from "node:fs/promises";
 import { join } from "node:path";
 import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
@@ -9,8 +10,17 @@ const MAX_DOWNLOAD_BYTES = 128 * 1024 * 1024;
 const DOWNLOAD_TIMEOUT_MS = 5 * 60_000;
 
 export async function sha256(path: string): Promise<string> {
+	const stat = await lstat(path);
+	if (!stat.isFile() || stat.size < 1 || stat.size > MAX_DOWNLOAD_BYTES)
+		throw new Error("Invalid cached helper size/type");
 	const hash = createHash("sha256");
-	for await (const chunk of createReadStream(path)) hash.update(chunk);
+	let size = 0;
+	for await (const chunk of createReadStream(path)) {
+		size += chunk.length;
+		if (size > MAX_DOWNLOAD_BYTES) throw new Error("Cached helper exceeds size limit");
+		hash.update(chunk);
+	}
+	if (size !== stat.size) throw new Error("Cached helper changed while reading");
 	return hash.digest("hex");
 }
 
@@ -20,6 +30,7 @@ export async function downloadHelperAsset(
 	url: string,
 	expected: string,
 	sshHost?: string,
+	env?: NodeJS.ProcessEnv,
 ) {
 	const source = new URL(url);
 	if (
@@ -53,6 +64,7 @@ export async function downloadHelperAsset(
 			stdout: "pipe",
 			stderr: "inherit",
 			stdin: "ignore",
+			env,
 		},
 	);
 	const timer = setTimeout(() => proc.kill(), DOWNLOAD_TIMEOUT_MS);

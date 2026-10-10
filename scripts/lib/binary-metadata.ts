@@ -13,6 +13,10 @@
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { basename } from "node:path";
+import {
+	type HelperDistributionDependencies,
+	parseHelperDistributionDependencies,
+} from "../../shared/helper-distribution";
 
 export interface BinaryMetadata {
 	/** Binary filename (basename), e.g. "narrafork-0.5.0-linux-x64". */
@@ -27,6 +31,8 @@ export interface BinaryMetadata {
 	commit: string;
 	/** Build repository; absent in legacy official sidecars. */
 	repository?: string;
+	/** Absent in legacy builds; binds this binary's immutable helper/executor selection. */
+	helperDistribution?: HelperDistributionDependencies;
 	/** ISO-8601 build timestamp. */
 	buildDate: string;
 	/** File size in bytes. */
@@ -44,6 +50,8 @@ export interface ComputeMetadataInput {
 	commit: string;
 	/** Build repository; absent in legacy official sidecars. */
 	repository?: string;
+	/** Absent in legacy builds; binds this binary's immutable helper/executor selection. */
+	helperDistribution?: HelperDistributionDependencies;
 	buildDate: string;
 }
 
@@ -77,6 +85,14 @@ export function computeBinaryMetadataFromBuffer(
 		version: input.version,
 		commit: input.commit,
 		...(input.repository === undefined ? {} : { repository: input.repository }),
+		...(input.helperDistribution === undefined
+			? {}
+			: {
+					helperDistribution: parseHelperDistributionDependencies(
+						input.helperDistribution,
+						input.version,
+					),
+				}),
 		buildDate: input.buildDate,
 		size: buf.length,
 		sha256,

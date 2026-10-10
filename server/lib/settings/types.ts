@@ -1004,6 +1004,8 @@ export interface NarraForkSettings {
 	mcpServers?: McpServerConfig[];
 	/** Update source and download configuration. */
 	update?: {
+		/** Updates, release notes and helper downloads. Absent/default inherits the global proxy. */
+		proxy?: ProxyOverride;
 		/** Update source. Optional for legacy settings and mocks; defaults to GitHub. */
 		source?: "github" | "update-server";
 		/** GitHub repository slug (owner/repo), not a URL. */

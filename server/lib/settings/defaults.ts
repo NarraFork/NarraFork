@@ -979,6 +979,16 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	},
 
 	// ── update ──────────────────────────────────────────────────────────
+	"update.proxy.mode": {
+		desc: "软件更新、版本说明及 rg/zstd/远程执行器清单与二进制请求的代理策略。缺省或 default 继承全局 proxy；不改变更新来源或 TLS 校验。",
+		type: "string",
+		valid: '"default" | "direct" | "system" | "custom"',
+	},
+	"update.proxy.url": {
+		desc: "更新代理地址，仅 custom 模式必填。支持 HTTP/HTTPS，host:port 自动补 http://；不支持 SOCKS。",
+		type: "string",
+		valid: "有效 HTTP/HTTPS URL，最长 500 字符",
+	},
 	"update.source": {
 		desc: '更新来源。默认 "github" 使用 GitHub Release；"update-server" 使用自定义更新服务器。',
 		type: "string",

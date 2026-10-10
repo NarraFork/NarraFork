@@ -1,6 +1,10 @@
 import { existsSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import { BRAND_ICON_COLOR_PATTERN, BRAND_NAME_MAX_LENGTH } from "@shared/branding";
+import {
+	proxyOverrideSchema,
+	proxyUrlSchema as webFetchProxyUrlSchema,
+} from "@shared/proxy-settings";
 import { stripErrorDisplayPrefix } from "@shared/retry-rule-keyword";
 import { Hono } from "hono";
 import { z } from "zod";
@@ -49,7 +53,6 @@ import {
 	type NarraForkSettings,
 	normalizeCustomApiProvider,
 	normalizeCustomApiProviderSettings,
-	normalizeProxyUrl,
 	purgeStaleAgentModelRefs,
 	saveSettings,
 	settings,
@@ -108,36 +111,6 @@ const modelOptionSchema = z.object({
 });
 
 const dangerReflectionLevelSchema = z.enum(["off", "light", "standard", "strict"]);
-
-const webFetchProxyUrlSchema = z.preprocess(
-	(value) => {
-		if (typeof value !== "string") return value;
-		const trimmed = value.trim();
-		if (!trimmed) return undefined;
-		return normalizeProxyUrl(trimmed) ?? trimmed;
-	},
-	z
-		.string()
-		.regex(/^https?:\/\//)
-		.optional(),
-);
-
-/** Per-location proxy override: default (inherit global) / direct / system / custom. */
-const proxyOverrideSchema = z
-	.object({
-		mode: z.enum(["default", "direct", "system", "custom"]),
-		url: webFetchProxyUrlSchema,
-	})
-	.superRefine((value, ctx) => {
-		if (value.mode === "custom" && !value.url) {
-			ctx.addIssue({
-				code: "custom",
-				path: ["url"],
-				message: "Custom proxy mode requires a valid HTTP or HTTPS URL",
-			});
-		}
-	})
-	.optional();
 
 // Accepts the current 4 protocols plus the 4 removed legacy values; inbound
 // payloads are normalized (legacy → current) before persistence/derivation.

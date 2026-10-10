@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
-import { copyFile, lstat, mkdtemp, opendir, rm, writeFile } from "node:fs/promises";
+import { copyFile, lstat, mkdtemp, opendir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -9,12 +9,17 @@ import {
 	OFFICIAL_GITHUB_REPOSITORY,
 } from "../../shared/github-repository";
 import {
+	type HelperDistributionDependencies,
+	parseHelperDistributionDependencies,
+} from "../../shared/helper-distribution";
+import {
 	MAX_RELEASE_BINARY_BYTES,
 	MAX_RELEASE_PATCH_BYTES,
 	parseReleasePatchName,
 	validateReleasePatchMetadata,
 } from "../../shared/release-patch";
 import { compareReleaseVersions, isValidReleaseVersion } from "../../shared/release-version";
+import { updateServerChildEnvironment } from "../../shared/update-server-child-env";
 import { type BinaryMetadata, formatChecksumsReport, formatSha256Sums } from "./binary-metadata";
 
 const MAX_BINARY_BYTES = MAX_RELEASE_BINARY_BYTES;
@@ -37,7 +42,7 @@ export const runGh: GhRunner = (args) => {
 			timeout: GH_TIMEOUT_MS,
 			maxBuffer: GH_MAX_OUTPUT_BYTES,
 			stdio: ["ignore", "pipe", "pipe"],
-			env: { ...process.env, GH_HOST: "github.com", GH_PROMPT_DISABLED: "1" },
+			env: { ...updateServerChildEnvironment(), GH_HOST: "github.com", GH_PROMPT_DISABLED: "1" },
 		});
 	} catch (error) {
 		const detail = error as { stderr?: string | Buffer; message?: string };
@@ -513,7 +518,29 @@ export async function publishGitHubRelease(
 	try {
 		const assets = await stageAssets(options, directory);
 		const names = assets.map((asset) => asset.name);
+		const declarations: Array<HelperDistributionDependencies | undefined> = [];
+		for (const asset of assets.filter((entry) => entry.name.endsWith(".metadata.json"))) {
+			const sidecar = JSON.parse(await readFile(asset.path, "utf8"));
+			declarations.push(
+				sidecar.helperDistribution === undefined
+					? undefined
+					: parseHelperDistributionDependencies(sidecar.helperDistribution, options.version),
+			);
+		}
+		const dependencies = declarations[0];
+		if (declarations.some((entry) => JSON.stringify(entry) !== JSON.stringify(dependencies)))
+			throw new Error("Inconsistent release helper dependencies across platforms");
 		if (options.dryRun) return { dryRun: true, alreadyPublished: false, assets: names };
+		if (dependencies && !options.requireAlreadyPublished) {
+			const { verifyPublishedHelperDependencies } = await import("./helper-release");
+			await verifyPublishedHelperDependencies({
+				repository,
+				helpersTag: dependencies.helpers.tag,
+				executorVersion: dependencies.executor.version,
+				protocolVersion: dependencies.executor.protocolVersion,
+				run,
+			});
+		}
 		// Require an explicitly pushed tag rather than silently using GitHub's default branch.
 		await verifyRemoteTag(run, repository, tag, options.commit);
 		let release = await getRelease(run, repository, tag);

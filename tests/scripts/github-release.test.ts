@@ -27,6 +27,7 @@ import {
 	releaseChannel,
 	validateGitHubRepository,
 } from "../../scripts/lib/github-release";
+import { createHelperDistributionDependencies } from "../../shared/helper-distribution";
 import { MAX_RELEASE_PATCH_BYTES, type ReleasePatchMetadata } from "../../shared/release-patch";
 
 const roots: string[] = [];
@@ -1002,5 +1003,67 @@ globalThis.fetch = async () => { throw new Error("FORBIDDEN_LEGACY_BASELINE_FETC
 			stderr: "pipe",
 		});
 		expect(legacy.stderr.toString()).toContain("Update server token not found");
+	});
+});
+
+describe("declared GitHub helper dependencies", () => {
+	function declare(data: ReturnType<typeof fixture>) {
+		for (const meta of data.metadata) {
+			meta.helperDistribution = createHelperDistributionDependencies(data.options.version);
+			writeFileSync(join(data.root, `${meta.name}.metadata.json`), formatMetadataJson(meta));
+		}
+	}
+	test("offline preview validates new declarations without checking remote helper releases", async () => {
+		const data = fixture();
+		declare(data);
+		const gh = fakeGitHub(data.options);
+		await publishGitHubRelease({ ...data.options, dryRun: true, run: gh.run });
+		expect(gh.calls).toEqual([]);
+	});
+	test("missing published helpers prevents any main Release mutation", async () => {
+		const data = fixture();
+		declare(data);
+		const calls: string[][] = [];
+		await expect(
+			publishGitHubRelease({
+				...data.options,
+				run: async (args) => {
+					calls.push(args);
+					throw new Error("HTTP 404: required helper Release is unavailable");
+				},
+			}),
+		).rejects.toThrow("404");
+		expect(calls.length).toBeGreaterThan(0);
+		expect(
+			calls.every((args) => args[0] === "api" && !args.includes("POST") && !args.includes("PATCH")),
+		).toBe(true);
+		expect(calls.some((args) => args[1]?.includes("helpers-v1.0.0"))).toBe(true);
+	});
+	test("mixed new and legacy platform declarations cannot bypass readiness", async () => {
+		const data = fixture("1.2.0", "all-platforms");
+		declare(data);
+		delete data.metadata[0]!.helperDistribution;
+		writeFileSync(
+			join(data.root, `${data.metadata[0]!.name}.metadata.json`),
+			formatMetadataJson(data.metadata[0]!),
+		);
+		const gh = fakeGitHub(data.options);
+		await expect(publishGitHubRelease({ ...data.options, run: gh.run })).rejects.toThrow(
+			"Inconsistent",
+		);
+		expect(gh.calls).toEqual([]);
+	});
+	test("dependency versions cannot be invented by a sidecar", async () => {
+		const data = fixture();
+		declare(data);
+		const meta = data.metadata[0]!;
+		const dependencies = createHelperDistributionDependencies("9.0.0");
+		writeFileSync(
+			join(data.root, `${meta.name}.metadata.json`),
+			JSON.stringify({ ...meta, helperDistribution: dependencies }),
+		);
+		const gh = fakeGitHub(data.options);
+		await expect(publishGitHubRelease({ ...data.options, run: gh.run })).rejects.toThrow();
+		expect(gh.calls).toEqual([]);
 	});
 });

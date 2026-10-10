@@ -11,6 +11,7 @@ import { homedir } from "node:os";
 import { join, relative } from "node:path";
 import { parentPort, workerData } from "node:worker_threads";
 import { generateZstdPatch } from "../server/lib/zstd-patch";
+import { createHelperDistributionDependencies } from "../shared/helper-distribution";
 import {
 	type BinaryMetadata,
 	computeBinaryMetadata,
@@ -177,6 +178,7 @@ const metadataInput = {
 	target: platform.target,
 	commit,
 	repository,
+	helperDistribution: createHelperDistributionDependencies(version),
 	buildDate,
 };
 const strictMetadata = releaseCi

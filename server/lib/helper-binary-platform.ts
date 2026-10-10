@@ -26,6 +26,8 @@ export function getCliHelperSpec(
 	if (platform === "win32") {
 		const toolName = `${tool}-${arch === "arm64" ? "win-arm64" : "win64"}.exe`;
 		return {
+			tool,
+			platform: `windows-${arch}`,
 			toolName,
 			// Never reuse historical rg.exe / zstd.exe (which may contain x64).
 			cachedName: arch === "arm64" ? toolName : `${tool}.exe`,
@@ -34,9 +36,11 @@ export function getCliHelperSpec(
 			...(CLI_HELPER_SHA256[toolName] ? { expectedSha256: CLI_HELPER_SHA256[toolName] } : {}),
 		};
 	}
-	if (platform === "linux" || (platform === "darwin" && tool === "rg")) {
+	if (platform === "linux" || platform === "darwin") {
 		const toolName = `${tool}-${platform}-${arch}`;
 		return {
+			tool,
+			platform: `${platform}-${arch}`,
 			toolName,
 			cachedName: tool,
 			displayName,

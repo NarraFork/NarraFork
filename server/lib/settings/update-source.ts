@@ -1,3 +1,4 @@
+import { proxyOverrideSchema } from "@shared/proxy-settings";
 import { z } from "zod";
 import { BUILD_GITHUB_REPOSITORY } from "../../../shared/build-repository";
 import { isValidGitHubRepository } from "../../../shared/github-repository";
@@ -22,6 +23,7 @@ export const DEFAULT_UPDATE_SETTINGS = {
 /** Shared by the settings PATCH route and isolated validation tests. */
 export const updateSourceSettingsSchema = z
 	.object({
+		proxy: proxyOverrideSchema,
 		source: z.enum(["github", "update-server"]).optional(),
 		githubRepository: z
 			.string()

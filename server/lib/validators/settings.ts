@@ -1,6 +1,7 @@
 import { PERSISTED_NARRATOR_TOOLBAR_IDS } from "@shared/narrator-toolbar";
 import { PERSISTED_NAV_IDS } from "@shared/nav-layout";
 import { TYPOGRAPHY_RANGE } from "@shared/pretext-layout/typography";
+import { proxyOverrideSchema } from "@shared/proxy-settings";
 import {
 	RECENT_TABS_LIVE_LIMIT,
 	RECENT_TABS_PAGE_SIZE,
@@ -73,14 +74,6 @@ export const modelCardSchema = z.object({
 	/** Tombstone marking a builtin card the user deleted. */
 	deleted: z.boolean().optional(),
 });
-
-/** Per-location proxy override: default (inherit global) / direct / system / custom. */
-const proxyOverrideSchema = z
-	.object({
-		mode: z.enum(["default", "direct", "system", "custom"]),
-		url: z.string().max(500).optional(),
-	})
-	.optional();
 
 // === Gateway per-user configuration ===
 

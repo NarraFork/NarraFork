@@ -1,5 +1,9 @@
 import { describe, expect, test } from "bun:test";
-import { EXECUTOR_PLATFORMS, type ExecutorPlatform } from "@shared/remote-executor";
+import {
+	EXECUTOR_PLATFORMS,
+	type ExecutorPlatform,
+	executorPublishedFilename,
+} from "@shared/remote-executor";
 import { ValidationError } from "../errors";
 import {
 	buildExecutorInstallOneLiner,
@@ -8,6 +12,7 @@ import {
 	powershellSingleQuote,
 	shellSingleQuote,
 } from "../executor-install-script";
+import { APP_VERSION } from "../version";
 
 const SHA256 = "a".repeat(64);
 const TICKET = "b".repeat(64);
@@ -23,9 +28,9 @@ function input(overrides: Partial<ExecutorInstallScriptInput> = {}): ExecutorIns
 		deviceName: "Build Server",
 		connectionMode: "reverse",
 		disableShell: false,
-		artifactFilename: "narrafork-executor-0.5.24-linux-amd64",
+		artifactFilename: executorPublishedFilename(APP_VERSION, platform),
 		expectedSha256: SHA256,
-		executorVersion: "0.5.24",
+		executorVersion: APP_VERSION,
 		ticket: TICKET,
 		...overrides,
 	};
@@ -246,6 +251,17 @@ describe("the one-line install command", () => {
 });
 
 describe("integrity verification", () => {
+	test("rejects version, protocol and published artifact mismatches before rendering", () => {
+		expect(() => buildExecutorInstallScript(input({ executorVersion: "0.0.1" }))).toThrow(
+			"version/protocol/artifact",
+		);
+		expect(() => buildExecutorInstallScript(input({ executorProtocolVersion: 2 }))).toThrow(
+			"version/protocol/artifact",
+		);
+		expect(() =>
+			buildExecutorInstallScript(input({ artifactFilename: "narrafork-executor-unrelated" })),
+		).toThrow("version/protocol/artifact");
+	});
 	test("every script verifies the published digest before installing", () => {
 		for (const platform of EXECUTOR_PLATFORMS) {
 			const { script } = buildExecutorInstallScript(input({ platform }));

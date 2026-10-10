@@ -1,4 +1,6 @@
-const URL_PROTOCOL_RE = /^[a-z][a-z0-9+.-]*:\/\//i;
+import { normalizeProxyUrl } from "@shared/proxy-settings";
+
+export { normalizeProxyUrl } from "@shared/proxy-settings";
 
 export type OutboundProxyMode = "system" | "direct" | "custom";
 
@@ -7,18 +9,6 @@ export interface OutboundProxySummary {
 	url: string;
 	/** True when the policy actively routes through a proxy (system or custom). */
 	configured: boolean;
-}
-
-export function normalizeProxyUrl(value: string | null | undefined): string | undefined {
-	const trimmed = value?.trim();
-	if (!trimmed) return undefined;
-	const normalized = URL_PROTOCOL_RE.test(trimmed) ? trimmed : `http://${trimmed}`;
-	try {
-		const protocol = new URL(normalized).protocol;
-		return protocol === "http:" || protocol === "https:" ? normalized : undefined;
-	} catch {
-		return undefined;
-	}
 }
 
 function normalizeOutboundProxyMode(value: unknown): OutboundProxyMode {
@@ -45,6 +35,11 @@ export type ProxyOverrideMode = "default" | "direct" | "system" | "custom";
 export interface ProxyOverride {
 	mode: ProxyOverrideMode;
 	url?: string;
+}
+
+/** Update and helper downloads share one override; never patch source/identity fields. */
+export function buildUpdateProxyPatch(next?: ProxyOverride) {
+	return { update: { proxy: next ?? { mode: "default" as const } } };
 }
 
 /** Minimal settings patch; explicit default survives JSON and clears old overrides. */

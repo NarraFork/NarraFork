@@ -14,12 +14,22 @@
  *    regardless of who owns the device.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import {
+	EXECUTOR_MANIFEST_FILENAME,
+	EXECUTOR_PLATFORMS,
+	executorPublishedFilename,
+} from "@shared/remote-executor";
 import { inArray } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../../db";
 import { projects, remoteDevices } from "../../db/schema";
+import { DEVICE_PROTOCOL_VERSION } from "../../lib/agent/execution/rpc-types";
 import { buildAppErrorResponse } from "../../lib/app-error-response";
+import { resetExecutorManifestCache } from "../../lib/executor-binaries";
+import { redeemExecutorTicket, resetExecutorTickets } from "../../lib/executor-bootstrap-ticket";
 import { generateId } from "../../lib/id";
+import { settings } from "../../lib/settings";
+import { APP_VERSION } from "../../lib/version";
 import { deviceRoutes } from "../devices";
 
 const OWNER = "user-owner";
@@ -28,6 +38,10 @@ const ADMIN = "user-admin";
 
 const created: string[] = [];
 const createdProjects: string[] = [];
+const originalFetch = globalThis.fetch;
+const FIXTURE_REPOSITORY = "fixture/device-authorization";
+const MANIFEST_URL = `https://github.com/${FIXTURE_REPOSITORY}/releases/download/executor-v${APP_VERSION}/${EXECUTOR_MANIFEST_FILENAME}`;
+const fetchCalls: string[] = [];
 
 /** A real project row: project-scoped devices are validated against it. */
 async function makeProject(): Promise<string> {
@@ -87,9 +101,22 @@ async function makeDevice(
 beforeEach(() => {
 	created.length = 0;
 	createdProjects.length = 0;
+	fetchCalls.length = 0;
+	resetExecutorManifestCache();
+	resetExecutorTickets();
+	// Preload isolates HOME/settings, not transport. Never let an authorization
+	// fixture reach GitHub (the manifest's 10s deadline exceeds Bun's 5s test limit).
+	globalThis.fetch = (async (input: RequestInfo | URL) => {
+		const url = input instanceof Request ? input.url : String(input);
+		fetchCalls.push(url);
+		throw new Error("Unexpected network request in device authorization fixture");
+	}) as unknown as typeof fetch;
 });
 
 afterEach(async () => {
+	globalThis.fetch = originalFetch;
+	resetExecutorManifestCache();
+	resetExecutorTickets();
 	if (created.length > 0) {
 		await db.delete(remoteDevices).where(inArray(remoteDevices.id, created));
 	}
@@ -168,16 +195,74 @@ describe("managing one's own device", () => {
 	test("the registrar may generate an install script", async () => {
 		// Without this, registering a device would be useless to a non-admin: the
 		// script only enrolls a machine they already control.
+		const update = settings.update;
+		if (!update) throw new Error("Test preload must initialize update settings");
+		expect(update.source).toBe("github");
+		settings.update = {
+			...update,
+			source: "github",
+			githubRepository: FIXTURE_REPOSITORY,
+			proxy: { mode: "direct" },
+		};
+		globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+			const url = input instanceof Request ? input.url : String(input);
+			fetchCalls.push(url);
+			if (url !== MANIFEST_URL) throw new Error("Unexpected install-script fixture URL");
+			expect(init?.redirect).toBe("manual");
+			expect(init?.signal).toBeInstanceOf(AbortSignal);
+			expect(new Headers(init?.headers).has("authorization")).toBe(false);
+			return Response.json({
+				schemaVersion: 1,
+				repository: FIXTURE_REPOSITORY,
+				tag: `executor-v${APP_VERSION}`,
+				commit: "b".repeat(40),
+				manifest: {
+					version: APP_VERSION,
+					protocolVersion: DEVICE_PROTOCOL_VERSION,
+					releasedAt: "2026-01-01T00:00:00Z",
+					platforms: Object.fromEntries(
+						EXECUTOR_PLATFORMS.map((platform) => [
+							platform,
+							{
+								filename: executorPublishedFilename(APP_VERSION, platform),
+								size: 256,
+								sha256: "a".repeat(64),
+							},
+						]),
+					),
+				},
+				licenses: [{ name: "LICENSE.txt", size: 1, sha256: "c".repeat(64) }],
+			});
+		}) as unknown as typeof fetch;
 		const id = await makeDevice(OWNER);
 		const res = await appAs(OWNER, "user").request(`/api/devices/${id}/install-script`, {
 			method: "POST",
 			headers: { "content-type": "application/json" },
 			body: JSON.stringify({ platform: "linux-amd64", mode: "user" }),
 		});
-		// 200 when a release is published, 400 when none is — either way, not a
-		// permission failure.
-		expect(res.status).not.toBe(403);
-		expect(res.status).not.toBe(404);
+		expect(res.status).toBe(200);
+		const result = await res.json();
+		expect(result.executorVersion).toBe(APP_VERSION);
+		expect(result.platform).toBe("linux-amd64");
+		expect(result.script).toContain(`EXPECTED_SHA256='${"a".repeat(64)}'`);
+		const ticket = new URL(result.scriptUrl).searchParams.get("ticket");
+		const redemption = redeemExecutorTicket(ticket, "linux-amd64", "binary");
+		expect(redemption.ok).toBe(true);
+		expect(redemption.deviceId).toBe(id);
+		expect(redemption.artifact).toEqual({
+			source: { source: "github", repository: FIXTURE_REPOSITORY },
+			tag: `executor-v${APP_VERSION}`,
+			version: APP_VERSION,
+			protocolVersion: DEVICE_PROTOCOL_VERSION,
+			platform: "linux-amd64",
+			filename: executorPublishedFilename(APP_VERSION, "linux-amd64"),
+			size: 256,
+			sha256: "a".repeat(64),
+		});
+		expect(redeemExecutorTicket(ticket, "linux-amd64", "script").script?.body).toBe(result.script);
+		// Generation and ticket redemption fetch only metadata, never the binary
+		// or a mutable /latest release; the installer is not executed by this test.
+		expect(fetchCalls).toEqual([MANIFEST_URL]);
 	});
 
 	test("the registrar may not promote their own device to global", async () => {

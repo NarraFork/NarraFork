@@ -1,5 +1,5 @@
 import { Database, type SQLQueryBindings } from "bun:sqlite";
-import { afterEach, beforeEach, describe, expect, setSystemTime, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, setSystemTime, spyOn, test } from "bun:test";
 import * as schema from "@server/db/schema";
 import { FILE_CHANGE_LIMITS } from "@shared/file-change-protocol";
 import { is } from "drizzle-orm";
@@ -945,17 +945,70 @@ describe("read-only blob retention inventory", () => {
 		assertNoAuthority(failed);
 	});
 
-	test("blocking connection settings and outer transactions are rejected without changing them", async () => {
-		sqlite.exec("PRAGMA busy_timeout = 5000");
-		await expect(readPage()).rejects.toMatchObject({ code: "connection_not_supported" });
-		expect(sqlite.query("PRAGMA busy_timeout").get()).toEqual({ timeout: 5000 });
-		sqlite.exec("PRAGMA busy_timeout = 0; PRAGMA foreign_keys = OFF;");
-		await expect(readPage()).rejects.toMatchObject({ code: "connection_not_supported" });
-		sqlite.exec("PRAGMA foreign_keys = ON; BEGIN;");
+	test("a deadline before the first read does not inspect or change connection settings", async () => {
+		let elapsed = 0;
+		const clock = spyOn(performance, "now").mockImplementation(() => elapsed);
 		try {
-			await expect(readPage()).rejects.toMatchObject({ code: "root_connection_required" });
+			expect(sqlite.inTransaction).toBe(false);
+			sqlite.exec("PRAGMA foreign_keys = OFF");
+			expect(sqlite.query("PRAGMA foreign_keys").get()).toEqual({ foreign_keys: 0 });
+			const pending = readPage();
+			// listPage yields before checking the deadline and reading either PRAGMA.
+			elapsed = LIMITS.maximumDurationMs + 1;
+			const page = await pending;
+			expect(page.status).toBe("budget_exceeded");
+			expect(page.issues).toContainEqual({ code: "budget_exceeded", stage: "time" });
+			expect(page.metrics.queries).toBe(0);
+			expect(queries).toHaveLength(0);
+			expect(page.catalogWindowExhausted).toBe(false);
+			expect(sqlite.inTransaction).toBe(false);
+			expect(sqlite.query("PRAGMA foreign_keys").get()).toEqual({ foreign_keys: 0 });
+			expect(sqlite.query("PRAGMA busy_timeout").get()).toEqual({ timeout: 0 });
+			assertNoAuthority(page);
 		} finally {
-			sqlite.exec("ROLLBACK");
+			clock.mockRestore();
+		}
+	});
+
+	test("blocking connection settings and outer transactions are rejected without changing them", async () => {
+		// Exercise the real connection guards independently of scheduling delay at
+		// listPage's initial yield. Deadline behavior is covered separately above.
+		const clock = spyOn(performance, "now").mockReturnValue(0);
+		try {
+			expect(sqlite.inTransaction).toBe(false);
+			expect(sqlite.query("PRAGMA foreign_keys").get()).toEqual({ foreign_keys: 1 });
+			sqlite.exec("PRAGMA busy_timeout = 5000");
+			expect(sqlite.query("PRAGMA busy_timeout").get()).toEqual({ timeout: 5000 });
+			await expect(readPage()).rejects.toMatchObject({ code: "connection_not_supported" });
+			expect(sqlite.query("PRAGMA busy_timeout").get()).toEqual({ timeout: 5000 });
+			expect(sqlite.inTransaction).toBe(false);
+			sqlite.exec("PRAGMA busy_timeout = 0; PRAGMA foreign_keys = OFF;");
+			expect(sqlite.query("PRAGMA busy_timeout").get()).toEqual({ timeout: 0 });
+			expect(sqlite.query("PRAGMA foreign_keys").get()).toEqual({ foreign_keys: 0 });
+			await expect(readPage()).rejects.toMatchObject({ code: "connection_not_supported" });
+			expect(sqlite.query("PRAGMA foreign_keys").get()).toEqual({ foreign_keys: 0 });
+			expect(sqlite.query("PRAGMA busy_timeout").get()).toEqual({ timeout: 0 });
+			expect(sqlite.inTransaction).toBe(false);
+			sqlite.exec("PRAGMA foreign_keys = ON;");
+			expect(sqlite.query("PRAGMA foreign_keys").get()).toEqual({ foreign_keys: 1 });
+			sqlite.exec("BEGIN;");
+			try {
+				expect(sqlite.inTransaction).toBe(true);
+				// SQLite ignores FK toggles inside a transaction; verify actual state,
+				// rather than accidentally testing the FK-off guard a second time.
+				sqlite.exec("PRAGMA foreign_keys = OFF;");
+				expect(sqlite.query("PRAGMA foreign_keys").get()).toEqual({ foreign_keys: 1 });
+				await expect(readPage()).rejects.toMatchObject({ code: "root_connection_required" });
+				expect(sqlite.inTransaction).toBe(true);
+				expect(sqlite.query("PRAGMA foreign_keys").get()).toEqual({ foreign_keys: 1 });
+				expect(sqlite.query("PRAGMA busy_timeout").get()).toEqual({ timeout: 0 });
+			} finally {
+				sqlite.exec("ROLLBACK");
+			}
+			expect(sqlite.inTransaction).toBe(false);
+			expect(sqlite.query("PRAGMA foreign_keys").get()).toEqual({ foreign_keys: 1 });
+		} finally {
+			clock.mockRestore();
 		}
 	});
 });

@@ -22,6 +22,21 @@ on:
         required: false
         type: string
         default: ""
+      mirror_only:
+        description: Retry only the legacy mirror from an original sealed bridge (requires publish)
+        required: true
+        type: boolean
+        default: false
+      bridge_run_id:
+        description: Original publisher run containing the immutable bridge artifact (may differ from source_run_id)
+        required: false
+        type: string
+        default: ""
+      bridge_run_attempt:
+        description: Original bridge attempt if that publisher run has been rerun
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
@@ -82,9 +97,13 @@ jobs:
           PUBLISH_REQUESTED: ${{ inputs.publish }}
           SOURCE_RUN_ID: ${{ inputs.source_run_id }}
           INDEX_ONLY: ${{ inputs.index_only }}
+          MIRROR_ONLY: ${{ inputs.mirror_only }}
+          BRIDGE_RUN_ID: ${{ inputs.bridge_run_id }}
+          BRIDGE_RUN_ATTEMPT: ${{ inputs.bridge_run_attempt }}
         run: >-
           bun scripts/ci-release.ts preflight --tag="$RELEASE_TAG"
           --publish="$PUBLISH_REQUESTED" --source-run-id="$SOURCE_RUN_ID" --index-only="$INDEX_ONLY"
+          --mirror-only="$MIRROR_ONLY" --bridge-run-id="$BRIDGE_RUN_ID" --bridge-run-attempt="$BRIDGE_RUN_ATTEMPT"
           --plan=.ci-release/control/plan.json
       - name: Bundle trusted control code for jobs without dependency installation
         run: bun build scripts/ci-release.ts --target=bun --outfile=.ci-release/control/control.js
@@ -298,13 +317,24 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     environment: release
+    # Distinct from both workflow-level groups: no nested-lock deadlock.
+    concurrency:
+      group: update-server-publish
+      cancel-in-progress: false
+    env:
+      NF_UPDATE_SERVER: ${{ vars.NF_UPDATE_SERVER }}
+      NF_UPDATE_TOKEN: ${{ secrets.NF_UPDATE_TOKEN }}
     outputs:
+      mirror-required: ${{ steps.prepare-bridge.outputs.mirror-required || steps.mirror.outputs.mirror-required }}
+      mirror-status: ${{ steps.publish.outputs.mirror-status || steps.mirror.outputs.mirror-status }}
       index-commit: ${{ steps.publish.outputs.index-commit }}
       index-generation: ${{ steps.publish.outputs.index-generation }}
     permissions:
       contents: write
       actions: read
     steps:
+      - name: Freeze one publication deadline with cleanup reserve
+        run: printf 'NF_RELEASE_DEADLINE_MS=%s\n' "$(( $(date +%s) * 1000 + 25 * 60 * 1000 ))" >> "$GITHUB_ENV"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
@@ -317,7 +347,33 @@ jobs:
         with:
           name: release-control-${{ github.run_id }}-${{ github.run_attempt }}
           path: .ci-release/control/
+      - name: Prepare patch tool after approval
+        if: ${{ !inputs.index_only && !inputs.mirror_only }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes zstd
+      - name: Prepare immutable update server bridge
+        id: prepare-bridge
+        if: ${{ !inputs.index_only && !inputs.mirror_only }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLISH_REQUESTED: ${{ inputs.publish }}
+          SOURCE_RUN_ID: ${{ needs.preflight.outputs.source-run-id }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: >-
+          bun .ci-release/control/control.js prepare-bridge --source-run-id="$SOURCE_RUN_ID"
+          --tag="$RELEASE_TAG" --bundle-dir=.ci-release/prepare-bundle --bridge-dir=.ci-release/bridge
+      - name: Seal immutable update server bridge artifact
+        id: bridge-artifact
+        if: ${{ steps.prepare-bridge.outputs.mirror-required == 'true' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: update-server-bridge-main-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .ci-release/bridge/
+          if-no-files-found: error
+          retention-days: 30
       - name: Publish verified release and index, or repair only the index
+        if: ${{ !inputs.mirror_only }}
         id: publish
         env:
           GH_TOKEN: ${{ github.token }}
@@ -325,12 +381,39 @@ jobs:
           SOURCE_RUN_ID: ${{ needs.preflight.outputs.source-run-id }}
           RELEASE_TAG: ${{ inputs.tag }}
           INDEX_ONLY: ${{ inputs.index_only }}
+          BRIDGE_ARTIFACT_ID: ${{ steps.bridge-artifact.outputs.artifact-id }}
+          BRIDGE_ARTIFACT_DIGEST: ${{ steps.bridge-artifact.outputs.artifact-digest }}
         run: |
           if [[ "$INDEX_ONLY" == true ]]; then
             bun .ci-release/control/control.js index --plan=.ci-release/control/plan.json --source-run-id="$SOURCE_RUN_ID" --bundle-dir=.ci-release/publish-bundle --publish=true
           else
-            bun .ci-release/control/control.js publish --source-run-id="$SOURCE_RUN_ID" --tag="$RELEASE_TAG" --bundle-dir=.ci-release/publish-bundle
+            bun .ci-release/control/control.js publish --source-run-id="$SOURCE_RUN_ID" --tag="$RELEASE_TAG" --bundle-dir=.ci-release/publish-bundle --bridge-dir=.ci-release/publish-bridge --bridge-artifact-id="$BRIDGE_ARTIFACT_ID" --bridge-artifact-digest="$BRIDGE_ARTIFACT_DIGEST"
           fi
+      - name: Mirror accepted bytes and verify legacy publication
+        id: mirror
+        if: ${{ inputs.mirror_only }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLISH_REQUESTED: ${{ inputs.publish }}
+          SOURCE_RUN_ID: ${{ needs.preflight.outputs.source-run-id }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          BRIDGE_RUN_ID: ${{ inputs.bridge_run_id || github.run_id }}
+          BRIDGE_RUN_ATTEMPT: ${{ inputs.bridge_run_attempt }}
+          MIRROR_ONLY: ${{ inputs.mirror_only }}
+        run: >-
+          bun .ci-release/control/control.js mirror --source-run-id="$SOURCE_RUN_ID" --tag="$RELEASE_TAG"
+          --bundle-dir=.ci-release/mirror-bundle --bridge-dir=.ci-release/mirror-bridge
+          --bridge-run-id="$BRIDGE_RUN_ID" --bridge-run-attempt="$BRIDGE_RUN_ATTEMPT" --mirror-only="$MIRROR_ONLY"
+      - name: Preserve partial publication receipts
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: update-server-main-receipts-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            .ci-release/publish-bridge/receipt-main-mirror.json
+            .ci-release/mirror-bridge/receipt-main-mirror.json
+          if-no-files-found: ignore
+          retention-days: 30
 
   gate:
     name: Release Gate
@@ -364,4 +447,7 @@ jobs:
           INDEX_ONLY: ${{ inputs.index_only }}
           INDEX_COMMIT: ${{ needs.publish.outputs.index-commit }}
           INDEX_GENERATION: ${{ needs.publish.outputs.index-generation }}
+          MIRROR_ONLY: ${{ inputs.mirror_only }}
+          MIRROR_REQUIRED: ${{ needs.publish.outputs.mirror-required }}
+          MIRROR_STATUS: ${{ needs.publish.outputs.mirror-status }}
         run: bun .ci-release/control/control.js gate

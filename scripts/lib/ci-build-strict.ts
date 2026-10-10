@@ -3,6 +3,10 @@ import { createReadStream, lstatSync, readFileSync, writeFileSync } from "node:f
 import { basename, join } from "node:path";
 import { isValidGitHubRepository } from "../../shared/github-repository";
 import {
+	type HelperDistributionDependencies,
+	parseHelperDistributionDependencies,
+} from "../../shared/helper-distribution";
+import {
 	type BinaryMetadata,
 	type ComputeMetadataInput,
 	formatChecksumsReport,
@@ -149,6 +153,14 @@ export async function computeCiBinaryMetadata(
 		version: input.version,
 		commit: input.commit,
 		repository: input.repository,
+		...(input.helperDistribution === undefined
+			? {}
+			: {
+					helperDistribution: parseHelperDistributionDependencies(
+						input.helperDistribution,
+						input.version,
+					),
+				}),
 		buildDate: input.buildDate,
 		size,
 		sha256: sha256.digest("hex"),
@@ -165,6 +177,7 @@ export function validateCiMetadata(
 		version: string;
 		commit: string;
 		repository: string;
+		helperDistribution?: HelperDistributionDependencies;
 	},
 ): asserts metadata is BinaryMetadata {
 	if (
@@ -186,6 +199,18 @@ export function validateCiMetadata(
 	) {
 		throw new Error(`Invalid or missing Release CI metadata: ${expected.name}`);
 	}
+	const dependencies =
+		metadata.helperDistribution === undefined
+			? undefined
+			: parseHelperDistributionDependencies(metadata.helperDistribution, expected.version);
+	if (
+		expected.helperDistribution !== undefined &&
+		JSON.stringify(dependencies) !==
+			JSON.stringify(
+				parseHelperDistributionDependencies(expected.helperDistribution, expected.version),
+			)
+	)
+		throw new Error(`Release helper dependencies mismatch: ${expected.name}`);
 }
 
 export async function verifyCiSidecar(
@@ -197,6 +222,7 @@ export async function verifyCiSidecar(
 		version: string;
 		commit: string;
 		repository: string;
+		helperDistribution?: HelperDistributionDependencies;
 	},
 ): Promise<BinaryMetadata> {
 	const sidecar = `${path}.metadata.json`;

@@ -30,11 +30,21 @@ import {
 } from "../../shared/update-identity";
 import { db } from "../db";
 import { narratorToolCalls } from "../db/schema";
-import { downloadHelperBinary, getCachedHelperBinaryPath } from "../lib/helper-binaries";
+import { downloadHelperBinary } from "../lib/helper-binaries";
 import { getCliHelperSpec, isNativeCliHelper } from "../lib/helper-binary-platform";
+import {
+	createDistributionContext,
+	type DistributionContext,
+} from "../lib/helper-distribution-runtime";
 import { logger } from "../lib/logger";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import { envWithAmbientProxy } from "../lib/net/proxy-env";
+import {
+	createUpdateFetchContext,
+	fetchUpdateWithTimeout,
+	readUpdateJson,
+	type UpdateFetchContext,
+} from "../lib/net/update-fetch";
 import {
 	beginGracefulRestartSession,
 	cancelGracefulRestartSession,
@@ -114,45 +124,20 @@ async function zstdCliResponds(binary: string, signal?: AbortSignal): Promise<bo
 	}
 }
 
-/**
- * Find or download the zstd CLI binary.
- * - Checks system PATH first.
- * - Falls back to a NarraFork-managed helper binary cached under ~/.narrafork/bin.
- * Returns the path to zstd binary, or null if unavailable.
- *
- * Nothing here installs software. A package-manager install (the former macOS
- * `brew install zstd`) can block for minutes and has no business running inside an HTTP
- * request; the client surfaces an install hint instead when this returns null.
- *
- * When `forceDownload` is true (explicit user retry), the recent-failure cache
- * is bypassed so a previous network timeout does not short-circuit the attempt.
- * GitHub passes `allowDownload=false`: only PATH / the existing local cache may be used,
- * and a missing CLI triggers a GitHub full download, never an old-server helper request.
- */
+/** Resolve system zstd first, then prepare a verified helper from the frozen effective source. */
 async function getZstdCliPath(
 	forceDownload = false,
 	allowDownload = true,
 	signal?: AbortSignal,
+	context?: DistributionContext,
 ): Promise<string | null> {
-	// Resolving first lets ARM64 reject an emulated x64 PATH executable.
+	signal?.throwIfAborted();
 	const system = Bun.which("zstd");
 	if (system && isNativeCliHelper(system) && (await zstdCliResponds(system, signal))) return system;
-
-	if (process.platform === "darwin") {
-		// No prebuilt helper binary is published for macOS, and installing one from a request
-		// handler is not acceptable. The client shows the `brew install zstd` hint.
-		return null;
-	}
-
 	const spec = getCliHelperSpec("zstd");
 	if (!spec) return null;
-	if (!allowDownload) {
-		const cached = getCachedHelperBinaryPath(spec.cachedName, spec.windowsArch);
-		return cached && isNativeCliHelper(cached) && (await zstdCliResponds(cached, signal))
-			? cached
-			: null;
-	}
-	return downloadHelperBinary(spec, { bypassFailureCache: forceDownload });
+	if (!allowDownload) return null;
+	return downloadHelperBinary(spec, { bypassFailureCache: forceDownload, signal, context });
 }
 
 export interface ReleaseInfo {
@@ -316,27 +301,11 @@ function isPathInsideDirectory(childPath: string, parentPath: string): boolean {
 	return relativePath === "" || (!relativePath.startsWith("..") && !isAbsolute(relativePath));
 }
 
-/**
- * Fetch with a hard deadline.
- *
- * Every update-server request needs one: without it a hung server keeps the SSE stream and
- * the whole download call pending forever, and the client-side cancel only aborts the
- * client's own fetch.
- */
 async function fetchWithTimeout(
 	url: string,
-	options: { timeoutMs: number; signal?: AbortSignal },
+	options: { timeoutMs: number; signal?: AbortSignal; transport?: UpdateFetchContext },
 ): Promise<Response> {
-	const controller = new AbortController();
-	const timer = setTimeout(() => controller.abort(), Math.max(1, options.timeoutMs));
-	const onAbort = () => controller.abort();
-	options.signal?.addEventListener("abort", onAbort, { once: true });
-	try {
-		return await fetch(url, { signal: controller.signal });
-	} finally {
-		clearTimeout(timer);
-		options.signal?.removeEventListener("abort", onAbort);
-	}
+	return fetchUpdateWithTimeout(url, options);
 }
 
 /**
@@ -663,12 +632,17 @@ async function checkChannel(
 	product: string,
 	channel: string,
 	platform: string,
+	transport: UpdateFetchContext,
 ): Promise<UpdateCheckResult> {
 	const checkUrl = `${serverUrl}/api/v2/products/${product}/releases/latest?channel=${channel}&platform=${platform}&version=${APP_VERSION}`;
 	logger.debug("Checking for updates", { url: checkUrl, channel });
 
-	const response = await fetchWithTimeout(checkUrl, { timeoutMs: METADATA_FETCH_TIMEOUT_MS });
+	const response = await fetchWithTimeout(checkUrl, {
+		timeoutMs: METADATA_FETCH_TIMEOUT_MS,
+		transport,
+	});
 	if (!response.ok) {
+		void response.body?.cancel().catch(() => {});
 		logger.warn("Update check failed", { status: response.status, channel });
 		return {
 			updateAvailable: false,
@@ -678,7 +652,7 @@ async function checkChannel(
 		};
 	}
 
-	const data = (await response.json()) as V2CheckResponse;
+	const data = (await readUpdateJson(response)) as V2CheckResponse;
 
 	if (!data.updateAvailable || !data.version || !data.file) {
 		return {
@@ -751,7 +725,7 @@ async function checkChannel(
 
 /** Capture source policy before any asynchronous detection; cached results stay immutable. */
 export async function checkForUpdate(
-	options: { force?: boolean } = {},
+	options: { force?: boolean; transport?: UpdateFetchContext } = {},
 ): Promise<UpdateCheckResult> {
 	const identity = getCurrentUpdateSourceIdentity();
 	if (!identity)
@@ -782,7 +756,10 @@ export async function checkForUpdate(
 			});
 		}
 	} else {
-		result = { ...(await checkForServerUpdate(sourceIdentity)), source: "update-server" };
+		result = {
+			...(await checkForServerUpdate(sourceIdentity, options.transport)),
+			source: "update-server",
+		};
 	}
 	return {
 		...result,
@@ -846,6 +823,7 @@ export function isUpdateSourceCurrent(releaseInfo: ReleaseInfo): boolean {
 
 async function checkForServerUpdate(
 	sourceIdentity: Extract<UpdateSourceIdentity, { source: "update-server" }>,
+	transport?: UpdateFetchContext,
 ): Promise<UpdateCheckResult> {
 	const { serverUrl } = sourceIdentity;
 	if (!serverUrl) {
@@ -860,11 +838,12 @@ async function checkForServerUpdate(
 	const { channel, platform, product } = sourceIdentity;
 
 	try {
+		const context = transport ?? createUpdateFetchContext();
 		if (channel === "beta") {
 			// Check both channels in parallel
 			const [betaResult, stableResult] = await Promise.all([
-				checkChannel(serverUrl, product, "beta", platform),
-				checkChannel(serverUrl, product, "stable", platform),
+				checkChannel(serverUrl, product, "beta", platform, context),
+				checkChannel(serverUrl, product, "stable", platform, context),
 			]);
 
 			// Pick the higher version between the two channels
@@ -878,7 +857,7 @@ async function checkForServerUpdate(
 			return betaResult.errorCode ? betaResult : stableResult.errorCode ? stableResult : betaResult;
 		}
 
-		return await checkChannel(serverUrl, product, channel, platform);
+		return await checkChannel(serverUrl, product, channel, platform, context);
 	} catch (err) {
 		logger.error("Update check error", { error: String(err) });
 		return {
@@ -900,6 +879,8 @@ interface PatchApplicationContext {
 	declaredPatchSize: number;
 	forceDownload: boolean;
 	signal?: AbortSignal;
+	transport: UpdateFetchContext;
+	helperContext: DistributionContext;
 	onProgress?: (progress: UpdateProgress) => void;
 	progressBase: number;
 	progressSpan: number;
@@ -915,15 +896,18 @@ class ZstdCliMissingError extends Error {
 async function fetchPatchMeta(
 	metaUrl: string,
 	signal: AbortSignal | undefined,
+	transport: UpdateFetchContext,
 ): Promise<ZstdPatchMeta> {
 	const metaResp = await fetchWithTimeout(metaUrl, {
 		timeoutMs: METADATA_FETCH_TIMEOUT_MS,
 		signal,
+		transport,
 	});
 	if (!metaResp.ok) {
+		void metaResp.body?.cancel().catch(() => {});
 		throw new Error(`Failed to fetch patch meta: ${metaResp.status}`);
 	}
-	return (await metaResp.json()) as ZstdPatchMeta;
+	return (await readUpdateJson(metaResp, 64 * 1024)) as ZstdPatchMeta;
 }
 
 /**
@@ -947,8 +931,10 @@ async function downloadAndApplyPatchStep(context: PatchApplicationContext): Prom
 		const patchResp = await fetchWithTimeout(context.stepUrl, {
 			timeoutMs: PAYLOAD_FETCH_TIMEOUT_MS,
 			signal: context.signal,
+			transport: context.transport,
 		});
 		if (!patchResp.ok) {
+			void patchResp.body?.cancel().catch(() => {});
 			throw new Error(`Failed to fetch patch: ${patchResp.status}`);
 		}
 		// Trust the smaller of the two announced sizes, with slack for header/framing drift.
@@ -974,7 +960,12 @@ async function downloadAndApplyPatchStep(context: PatchApplicationContext): Prom
 
 		let zstdCliPath: string | undefined;
 		if (meta.mode === "patch-from") {
-			const cli = await getZstdCliPath(context.forceDownload);
+			const cli = await getZstdCliPath(
+				context.forceDownload,
+				true,
+				context.signal,
+				context.helperContext,
+			);
 			if (!cli) throw new ZstdCliMissingError();
 			zstdCliPath = cli;
 		}
@@ -1096,6 +1087,8 @@ export async function downloadUpdate(
 	};
 	try {
 		signal?.throwIfAborted();
+		const transport = createUpdateFetchContext();
+		const helperContext = createDistributionContext(sourceIdentity, undefined, transport);
 		emitProgress({
 			phase: "downloading",
 			bytesDownloaded: 0,
@@ -1122,9 +1115,15 @@ export async function downloadUpdate(
 					},
 				},
 				{
-					downloadPatch: downloadGithubPatchToFile,
-					downloadFull: downloadGithubBinaryToFile,
-					resolveZstd: (patchSignal) => getZstdCliPath(false, false, patchSignal),
+					downloadPatch: (step, path, downloadOptions) =>
+						downloadGithubPatchToFile(step, path, { ...downloadOptions, fetcher: transport.fetch }),
+					downloadFull: (release, path, downloadOptions) =>
+						downloadGithubBinaryToFile(release, path, {
+							...downloadOptions,
+							fetcher: transport.fetch,
+						}),
+					resolveZstd: (patchSignal) =>
+						getZstdCliPath(forceDownload, true, patchSignal, helperContext),
 					onFallback: (error) =>
 						logger.warn("GitHub delta unavailable; downloading GitHub full binary", {
 							source: "github",
@@ -1151,7 +1150,7 @@ export async function downloadUpdate(
 			if (zstdMetaUrl && zstdPatchUrl) {
 				try {
 					// Check the base version before spending a payload download on an unusable patch.
-					const meta = await fetchPatchMeta(zstdMetaUrl, signal);
+					const meta = await fetchPatchMeta(zstdMetaUrl, signal, transport);
 					if (meta.fromVersion !== APP_VERSION) {
 						logger.debug("Zstd patch version mismatch", {
 							patchFrom: meta.fromVersion,
@@ -1166,6 +1165,8 @@ export async function downloadUpdate(
 							declaredPatchSize: meta.patchSize,
 							forceDownload,
 							signal,
+							transport,
+							helperContext,
 							onProgress,
 							progressBase: 0,
 							progressSpan: 100,
@@ -1194,7 +1195,7 @@ export async function downloadUpdate(
 						const step = chain[i];
 						const isLast = i === chain.length - 1;
 						const outputPath = isLast ? tempPath : intermediatePaths[i % 2];
-						const meta = await fetchPatchMeta(step.metaUrl, signal);
+						const meta = await fetchPatchMeta(step.metaUrl, signal, transport);
 						await downloadAndApplyPatchStep({
 							sourcePath,
 							outputPath,
@@ -1203,6 +1204,8 @@ export async function downloadUpdate(
 							declaredPatchSize: step.patchSize,
 							forceDownload,
 							signal,
+							transport,
+							helperContext,
 							onProgress,
 							progressBase: (i / chain.length) * 100,
 							progressSpan: (1 / chain.length) * 100,

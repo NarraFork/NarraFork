@@ -1,7 +1,8 @@
 import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { downloadHelperBinary, getCachedHelperBinaryPath } from "./helper-binaries";
+import { downloadHelperBinary, getVerifiedCachedHelperBinaryPath } from "./helper-binaries";
 import { getCliHelperSpec, isNativeCliHelper } from "./helper-binary-platform";
+import { createDistributionContext, withDeadline } from "./helper-distribution-runtime";
 import { logger } from "./logger";
 import { IS_WINDOWS } from "./platform";
 
@@ -46,14 +47,15 @@ function getRipgrepHelperSpec() {
 	return getCliHelperSpec("rg");
 }
 
-function findCachedRg(): string | null {
-	const spec = getRipgrepHelperSpec();
-	const cached = spec ? getCachedHelperBinaryPath(spec.cachedName, spec.windowsArch) : null;
-	return cached && verifyRg(cached) ? cached : null;
+// Managed binaries require asynchronous digest verification before execution.
+function findCachedRg(): null {
+	return null;
 }
 
 /** Resolve the ripgrep binary path synchronously, without downloading. */
 export function findRgSync(): string | null {
+	const pathCandidate = Bun.which("rg");
+	if (pathCandidate && isNativeCliHelper(pathCandidate)) return pathCandidate;
 	if (IS_WINDOWS) {
 		// 1. Static well-known paths (scoop, chocolatey, cargo, Program Files).
 		const winPaths = [
@@ -95,24 +97,31 @@ export function findRgSync(): string | null {
 }
 
 let resolvedRgPath = findRgSync();
-let preparePromise: Promise<string | null> | null = null;
 
 /** Whether ripgrep is already available without an async download attempt. */
 export const isRgAvailable = resolvedRgPath !== null;
 
-function verifyRg(path: string): boolean {
+async function verifyRg(path: string, signal?: AbortSignal): Promise<boolean> {
+	signal?.throwIfAborted();
 	try {
-		const result = Bun.spawnSync([path, "--version"], {
-			stdout: "pipe",
-			stderr: "pipe",
+		const result = Bun.spawn([path, "--version"], {
+			stdout: "ignore",
+			stderr: "ignore",
+			timeout: 5_000,
+			killSignal: "SIGKILL",
+			signal,
 		});
-		return result.exitCode === 0;
+		const exitCode = await result.exited;
+		signal?.throwIfAborted();
+		return exitCode === 0;
 	} catch {
+		signal?.throwIfAborted();
 		return false;
 	}
 }
 
-async function prepareRipgrep(): Promise<string | null> {
+async function prepareRipgrep(signal?: AbortSignal): Promise<string | null> {
+	signal?.throwIfAborted();
 	const current = findRgSync();
 	if (current) {
 		resolvedRgPath = current;
@@ -121,25 +130,45 @@ async function prepareRipgrep(): Promise<string | null> {
 
 	const spec = getRipgrepHelperSpec();
 	if (!spec) return null;
-	const allowUnsignedDownload = process.env.NARRAFORK_ALLOW_UNSIGNED_HELPER_DOWNLOADS === "1";
-	if (!spec.expectedSha256 && !allowUnsignedDownload) return null;
-
-	const downloaded = await downloadHelperBinary(spec, {
-		useCache: false,
-		allowUnsignedDownload,
-	});
-	if (!downloaded) return null;
-	if (!verifyRg(downloaded)) {
-		logger.warn("Prepared ripgrep binary failed version check", { path: downloaded });
-		return null;
+	// Cache lookup, download and the final probe are one operation: never recapture
+	// a newly selected server/proxy when the old source's cache lookup returns null.
+	const context = createDistributionContext();
+	const deadline = withDeadline(signal, 60_000);
+	const stillCurrent = () => {
+		deadline.signal.throwIfAborted();
+		return context.isCurrent();
+	};
+	try {
+		const cached = await getVerifiedCachedHelperBinaryPath(spec, {
+			context,
+			signal: deadline.signal,
+		});
+		if (!stillCurrent()) return null;
+		if (cached && (await verifyRg(cached, deadline.signal))) {
+			return stillCurrent() ? cached : null;
+		}
+		if (!stillCurrent()) return null;
+		const allowUnsignedDownload = process.env.NARRAFORK_ALLOW_UNSIGNED_HELPER_DOWNLOADS === "1";
+		const downloaded = await downloadHelperBinary(spec, {
+			context,
+			signal: deadline.signal,
+			useCache: false,
+			allowUnsignedDownload,
+		});
+		if (!stillCurrent() || !downloaded) return null;
+		if (!(await verifyRg(downloaded, deadline.signal))) {
+			logger.warn("Prepared ripgrep binary failed version check", { path: downloaded });
+			return null;
+		}
+		return stillCurrent() ? downloaded : null;
+	} finally {
+		deadline.dispose();
 	}
-
-	resolvedRgPath = downloaded;
-	return downloaded;
 }
 
 /** Resolve ripgrep, optionally downloading a NarraFork-managed helper binary when explicitly enabled. */
-export async function resolveRgPath(): Promise<string | null> {
+export async function resolveRgPath(signal?: AbortSignal): Promise<string | null> {
+	signal?.throwIfAborted();
 	if (resolvedRgPath && existsSync(resolvedRgPath)) return resolvedRgPath;
 
 	const current = findRgSync();
@@ -148,12 +177,7 @@ export async function resolveRgPath(): Promise<string | null> {
 		return current;
 	}
 
-	preparePromise ??= prepareRipgrep();
-	try {
-		return await preparePromise;
-	} finally {
-		preparePromise = null;
-	}
+	return prepareRipgrep(signal);
 }
 
 export function getRgVersionSync(path = findRgSync()): string | undefined {
@@ -162,6 +186,9 @@ export function getRgVersionSync(path = findRgSync()): string | undefined {
 		const result = Bun.spawnSync([path, "--version"], {
 			stdout: "pipe",
 			stderr: "pipe",
+			timeout: 1_000,
+			killSignal: "SIGKILL",
+			maxBuffer: 32 * 1024,
 		});
 		if (result.exitCode !== 0) return undefined;
 		const out = new TextDecoder().decode(result.stdout).trim();

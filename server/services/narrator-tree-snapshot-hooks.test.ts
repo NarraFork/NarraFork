@@ -25,6 +25,7 @@ import {
 	type TreeSnapshotSession,
 } from "./narrator-tree-snapshot-hooks";
 import { worktreeTreeSnapshot } from "./worktree-tree-snapshot";
+import { peekClaim } from "./worktree-write-claims";
 
 const createdNarrators: string[] = [];
 const tempDirs: string[] = [];
@@ -475,17 +476,30 @@ describe("unfinished tool lifecycles", () => {
 		await recordTreeSnapshotBefore(other, otherId, "still-running", ["two.txt"]);
 
 		abandonSessionTreeSnapshots(aborted, abortedId);
+		const sealedAt = peekClaim(repo, "edit-a")?.to;
+		if (sealedAt == null) throw new Error("Aborted claim must be sealed");
+		expect(peekClaim(repo, "edit-b")?.to).toBe(sealedAt);
+		expect(peekClaim(repo, "still-running")?.to).toBeNull();
 
-		const { toolUseId } = await seedToolCall(shellId, "Bash", 1);
-		await recordTreeSnapshotBefore(shell, shellId, toolUseId, null);
-		writeFileSync(join(repo, "one.txt"), "shell-wrote-this\n");
-		writeFileSync(join(repo, "two.txt"), "shell-wrote-this\n");
-		const result = await recordTreeSnapshotAfter(shell, shellId, toolUseId);
+		// The registry conservatively includes equal-millisecond endpoints. This case
+		// requires a strictly later window, not a race against the wall clock's granularity.
+		const realNow = Date.now;
+		const clock = spyOn(Date, "now").mockImplementation(() => Math.max(realNow(), sealedAt + 1));
+		try {
+			const { toolUseId } = await seedToolCall(shellId, "Bash", 1);
+			await recordTreeSnapshotBefore(shell, shellId, toolUseId, null);
+			expect(peekClaim(repo, toolUseId)?.from).toBeGreaterThan(sealedAt);
+			writeFileSync(join(repo, "one.txt"), "shell-wrote-this\n");
+			writeFileSync(join(repo, "two.txt"), "shell-wrote-this\n");
+			const result = await recordTreeSnapshotAfter(shell, shellId, toolUseId);
 
-		// `one.txt` survives (its claim was sealed before the shell window opened);
-		// `two.txt` is still claimed by the narrator that is actually running.
-		expect(result.workspaceDelta.sort()).toEqual(["one.txt", "two.txt"]);
-		expect(result.changedFiles).toEqual(["one.txt"]);
+			// `one.txt` survives (its claim was sealed before the shell window opened);
+			// `two.txt` is still claimed by the narrator that is actually running.
+			expect(result.workspaceDelta.sort()).toEqual(["one.txt", "two.txt"]);
+			expect(result.changedFiles).toEqual(["one.txt"]);
+		} finally {
+			clock.mockRestore();
+		}
 	});
 
 	test("abandoning drops the staged boundary and the cached hash", async () => {

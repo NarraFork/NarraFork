@@ -9,6 +9,15 @@ import {
 	HELPER_BIN_DIR,
 } from "../helper-binaries";
 import { getCliHelperSpec, isNativeCliHelper } from "../helper-binary-platform";
+import { settings } from "../settings";
+
+const originalUpdate = settings.update ?? {
+	serverUrl: "https://legacy.example",
+	product: "narrafork",
+	channel: "stable" as const,
+	checkIntervalMinutes: 60,
+	autoDownload: false,
+};
 
 function pe(machine: number): Buffer {
 	const bytes = Buffer.alloc(256);
@@ -21,10 +30,12 @@ function pe(machine: number): Buffer {
 
 const originalFetch = globalThis.fetch;
 beforeEach(() => {
+	settings.update = { ...originalUpdate, source: "update-server", proxy: { mode: "direct" } };
 	rmSync(HELPER_BIN_DIR, { recursive: true, force: true });
 	mkdirSync(HELPER_BIN_DIR, { recursive: true });
 });
 afterEach(() => {
+	settings.update = originalUpdate;
 	globalThis.fetch = originalFetch;
 	rmSync(HELPER_BIN_DIR, { recursive: true, force: true });
 });
@@ -46,9 +57,9 @@ describe("native helper platform selection", () => {
 			expect(getCliHelperSpec(tool, "linux", "arm64")?.cachedName).toBe(tool);
 		});
 	}
-	test("macOS rg remains supported, macOS zstd is not invented", () => {
+	test("macOS rg and zstd use catalog native filenames", () => {
 		expect(getCliHelperSpec("rg", "darwin", "arm64")?.toolName).toBe("rg-darwin-arm64");
-		expect(getCliHelperSpec("zstd", "darwin", "arm64")).toBeNull();
+		expect(getCliHelperSpec("zstd", "darwin", "arm64")?.toolName).toBe("zstd-darwin-arm64");
 	});
 	test("unsupported CPU/OS never defaults to an x64 binary", () => {
 		expect(getCliHelperSpec("rg", "win32", "ia32")).toBeNull();
@@ -116,7 +127,8 @@ describe("helper download architecture validation", () => {
 		if (!spec) throw new Error("Missing spec");
 		spec.expectedSha256 = createHash("sha256").update(pe(0xaa64)).digest("hex");
 		const path = await downloadHelperBinary(spec, { bypassFailureCache: true });
-		expect(path).toBe(join(HELPER_BIN_DIR, spec.cachedName));
+		expect(path?.startsWith(join(HELPER_BIN_DIR, "distribution"))).toBe(true);
+		expect(path).toEndWith(".exe");
 		expect(calls[0]).toEndWith("/api/v2/tools/zstd-win-arm64.exe");
 		expect(await downloadHelperBinary(spec)).toBe(path);
 		expect(calls.length).toBe(1);

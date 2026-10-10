@@ -8,6 +8,14 @@ NarraFork 的项目原创源代码和配套材料（除另有明确许可声明�
 
 第三方依赖、运行时、二进制、复制或 vendored 的代码仍按各自许可证分发，本项目的许可证和 CLA 不覆盖或变更其权利。本页以下内容及 `/licenses` 页面仍用于第三方许可披露。未来如整体变更许可证，必须逐项核验贡献和第三方材料的授权，不能仅修改包元数据或 `LICENSE` 文件。
 
+## GitHub 辅助 Release 披露
+
+`helpers-v<catalog>` 和 `executor-v<version>` 是独立分发产物，也必须携带真实许可正文。辅助 manifest 记录许可文件名称、size 和 SHA256，publisher 核对必需附件及远端资产完整集合；只上传裸可执行文件不能算完整发布。rg/PCRE2、zstd、musl、LLVM compiler-rt/MinGW，以及 executor 的 Go 标准库/模块沿用 `licenses/extra/` 已有正文及选定许可分支。`entries.json` 的分发方式同步标记 GitHub 辅助 Release与旧 tools 兼容路径，不另写或改写第三方许可正文。
+
+Linux GCC 构建另保守披露运行库与启动代码；`gcc-runtime.txt` 由固定 GCC 14.2.0 上游 commit 的 COPYING3 与 COPYING.RUNTIME 逐字材料组成，附在 helpers Release 并以 size/SHA256 校验，不改 zstd 原有 BSD 分支。许可原文不凭记忆重写。
+
+新 helper 平台或构建 recipe 引入额外静态链接组件时，仍须补登记和真实许可材料，不能认为共享主程序 `/licenses` 页面已经覆盖独立下载资产。
+
 ## 第三方披露范围与实现
 
 页面覆盖**所有随发布产物分发的第三方组件**（当前约 1280 条），而非仅 `package.json` 里的直接依赖。分组依据是"是否随产物分发"，不是 `dependencies` / `devDependencies` 的位置：

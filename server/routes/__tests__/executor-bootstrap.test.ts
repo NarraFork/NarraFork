@@ -2,26 +2,54 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import type { ExecutorPlatform } from "@shared/remote-executor";
 import { EXECUTOR_MANIFEST_FILENAME, type ExecutorManifest } from "@shared/remote-executor";
 import { Hono } from "hono";
 import { buildAppErrorResponse } from "../../lib/app-error-response";
-import { resetExecutorManifestCache } from "../../lib/executor-binaries";
-import { issueExecutorTicket, resetExecutorTickets } from "../../lib/executor-bootstrap-ticket";
+import { freezeExecutorArtifact, resetExecutorManifestCache } from "../../lib/executor-binaries";
+import {
+	type IssueExecutorTicketOptions,
+	issueExecutorTicket as issueRawTicket,
+	resetExecutorTickets,
+} from "../../lib/executor-bootstrap-ticket";
+import { settings } from "../../lib/settings";
+import { APP_VERSION } from "../../lib/version";
+
+function issueExecutorTicket(platform: ExecutorPlatform, options: IssueExecutorTicketOptions = {}) {
+	return issueRawTicket(platform, {
+		...(platform === "linux-amd64"
+			? { artifact: freezeExecutorArtifact(manifest(), platform) }
+			: {}),
+		...options,
+	});
+}
+
 import { HELPER_BIN_DIR } from "../../lib/helper-binaries";
 import { executorBootstrapRoutes, resetExecutorBootstrapRateLimit } from "../executor-bootstrap";
 
 const originalFetch = globalThis.fetch;
-const BINARY = Buffer.from("linux-amd64-executor-payload");
+const ORIGINAL_UPDATE = settings.update ?? {
+	serverUrl: "https://legacy.example",
+	product: "narrafork",
+	channel: "stable" as const,
+	checkIntervalMinutes: 60,
+	autoDownload: false,
+};
+const BINARY = Buffer.alloc(256);
+BINARY.writeUInt32BE(0x7f454c46, 0);
+BINARY[4] = 2;
+BINARY[5] = 1;
+BINARY.writeUInt16LE(62, 18);
 const SHA256 = createHash("sha256").update(BINARY).digest("hex");
 
 function manifest(): ExecutorManifest {
 	return {
-		version: "0.5.24",
+		version: APP_VERSION,
 		protocolVersion: 1,
 		releasedAt: "2026-08-15T00:00:00.000Z",
 		platforms: {
 			"linux-amd64": {
-				filename: "narrafork-executor-0.5.24-linux-amd64",
+				filename: `narrafork-executor-${APP_VERSION}-linux-amd64`,
 				size: BINARY.byteLength,
 				sha256: SHA256,
 			},
@@ -38,7 +66,7 @@ function mockUpdateServer(): void {
 				headers: { "content-type": "application/json" },
 			});
 		}
-		if (url.endsWith("narrafork-executor-0.5.24-linux-amd64")) {
+		if (url.endsWith(`narrafork-executor-${APP_VERSION}-linux-amd64`)) {
 			return new Response(new Blob([Uint8Array.from(BINARY)]), { status: 200 });
 		}
 		return new Response("not found", { status: 404 });
@@ -57,6 +85,12 @@ function app(): Hono {
 }
 
 beforeEach(() => {
+	settings.update = {
+		...ORIGINAL_UPDATE,
+		source: "update-server",
+		serverUrl: "https://legacy.example",
+		proxy: { mode: "direct" },
+	};
 	resetExecutorManifestCache();
 	resetExecutorTickets();
 	resetExecutorBootstrapRateLimit();
@@ -66,6 +100,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+	settings.update = ORIGINAL_UPDATE;
 	globalThis.fetch = originalFetch;
 	resetExecutorManifestCache();
 	resetExecutorTickets();
@@ -80,7 +115,7 @@ describe("GET /api/executor/download/:platform", () => {
 			`/api/executor/download/linux-amd64?ticket=${ticket.ticket}`,
 		);
 		expect(response.status).toBe(200);
-		expect(response.headers.get("x-executor-version")).toBe("0.5.24");
+		expect(response.headers.get("x-executor-version")).toBe(APP_VERSION);
 		expect(response.headers.get("x-executor-sha256")).toBe(SHA256);
 		expect(response.headers.get("cache-control")).toBe("no-store");
 		expect(new Uint8Array(await response.arrayBuffer())).toEqual(new Uint8Array(BINARY));
@@ -149,21 +184,24 @@ describe("GET /api/executor/download/:platform", () => {
 		).toBe(200);
 	});
 
-	test("reports 503 when the release does not cover the requested platform", async () => {
+	test("reports 503 for an old ticket without an immutable artifact binding", async () => {
 		const ticket = issueExecutorTicket("windows-arm64");
 		const response = await app().request(
 			`/api/executor/download/windows-arm64?ticket=${ticket.ticket}`,
 		);
 		expect(response.status).toBe(503);
 		expect(((await response.json()) as { error: string }).error).toMatch(
-			/does not publish a build/,
+			/no bound executor artifact/,
 		);
 	});
 
 	test("refuses to serve a binary whose bytes do not match the manifest", async () => {
 		// Pre-seed the cache with a tampered file; the digest check must reject it and
 		// the honest re-download must also fail because the mock serves bad bytes.
-		writeFileSync(join(HELPER_BIN_DIR, "narrafork-executor-0.5.24-linux-amd64"), "tampered");
+		writeFileSync(
+			join(HELPER_BIN_DIR, `narrafork-executor-${APP_VERSION}-linux-amd64`),
+			"tampered",
+		);
 		globalThis.fetch = (async (input: RequestInfo | URL) => {
 			const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url;
 			if (url.endsWith(EXECUTOR_MANIFEST_FILENAME)) {

@@ -20,7 +20,7 @@
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import {
 	EXECUTOR_MANIFEST_FILENAME,
 	EXECUTOR_PLATFORMS,
@@ -46,6 +46,57 @@ const VERSION_RE = /^\d+\.\d+\.\d+(?:-[A-Za-z0-9._-]+)?$/;
 const MAX_ARTIFACT_BYTES = 64 * 1024 * 1024;
 
 const args = process.argv.slice(2);
+if (args.filter((arg) => arg.startsWith("--target=")).length > 1)
+	throw new Error("Duplicate --target option");
+const target =
+	args.find((arg) => arg.startsWith("--target="))?.slice("--target=".length) ?? "server";
+if (target !== "server" && target !== "github") throw new Error("Expected --target=server|github");
+if (target === "github") {
+	// GitHub publication consumes the exact native-smoked workflow bundle, never
+	// the legacy dist directory. Dry-run does not query or write any remote.
+	const { parseHelperReleaseArguments, runHelperReleaseController } = await import(
+		"./release-helpers"
+	);
+	const githubArgs = args.filter((arg) => arg.startsWith("--") && !arg.startsWith("--target="));
+	const optionNames = githubArgs.map((arg) => arg.split("=")[0]);
+	if (new Set(optionNames).size !== optionNames.length)
+		throw new Error("Duplicate GitHub executor option");
+	const positional = args.filter((arg) => !arg.startsWith("--"));
+	if (positional.length > 1 || (positional[0] !== undefined && !VERSION_RE.test(positional[0])))
+		throw new Error("Expected at most one valid executor version");
+	if (
+		githubArgs.some(
+			(arg) =>
+				!["--dry-run", "--upload-only"].includes(arg) &&
+				!["--plan=", "--output=", "--root="].some((prefix) => arg.startsWith(prefix)),
+		)
+	)
+		throw new Error(
+			"GitHub executor publication accepts only a complete native-smoked bundle; no --platform or legacy upload options",
+		);
+	if (
+		!githubArgs.some((arg) => arg.startsWith("--plan=")) ||
+		!githubArgs.some((arg) => arg.startsWith("--output="))
+	)
+		throw new Error(
+			"GitHub executor release requires --plan=<immutable plan.json> and --output=<bundle-dir>",
+		);
+	const forwarded = [
+		args.includes("--dry-run") ? "preview" : "publish",
+		...githubArgs.filter((arg) => arg !== "--dry-run" && arg !== "--upload-only"),
+	];
+	const parsed = parseHelperReleaseArguments(forwarded);
+	const { readHelperReleasePlan } = await import("./lib/helper-release-control");
+	const githubRoot = resolve(parsed.options.get("root") ?? ".");
+	const planPath = resolve(githubRoot, parsed.options.get("plan") as string);
+	const plan = await readHelperReleasePlan(planPath);
+	if (plan.kind !== "executor") throw new Error("Expected executor release plan");
+	const requestedVersion = args.find((arg) => !arg.startsWith("--"));
+	if (requestedVersion && requestedVersion !== plan.version)
+		throw new Error("Executor version does not match the immutable bundle plan");
+	await runHelperReleaseController(forwarded);
+	process.exit(0);
+}
 const version = args.find((a) => !a.startsWith("--")) ?? readPackageVersion();
 const dryRun = args.includes("--dry-run");
 const uploadOnly = args.includes("--upload-only");
@@ -166,7 +217,7 @@ async function putTool(filename: string, body: Uint8Array, contentType: string):
 			"Content-Type": contentType,
 			"Content-Length": String(body.byteLength),
 		},
-		body,
+		body: new Uint8Array(body).buffer,
 	});
 	const text = await response.text();
 	if (!response.ok) {

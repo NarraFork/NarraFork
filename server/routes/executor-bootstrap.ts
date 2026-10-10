@@ -191,7 +191,14 @@ executorBootstrapRoutes.get("/download/:platform", async (c) => {
 	}
 
 	try {
-		const artifact = await ensureExecutorBinary(platform);
+		if (!redemption.artifact)
+			throw new ExecutorDistributionError(
+				"Install ticket has no bound executor artifact; generate a new command",
+			);
+		const artifact = await ensureExecutorBinary(platform, {
+			binding: redemption.artifact,
+			signal: c.req.raw.signal,
+		});
 		const file = Bun.file(artifact.path);
 		if (!(await file.exists())) {
 			throw new ExecutorDistributionError("Executor binary disappeared from the local cache");

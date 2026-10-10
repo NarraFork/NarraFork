@@ -85,6 +85,13 @@ bun server/index.ts --no-auto-resume
 
 如果在工作区内建立临时干净检出，先完成外层全仓测试，副本存在期间只从副本根目录运行测试，清理本次创建的副本后再运行外层测试，避免递归发现重复测试。存量检查/测试失败必须记录并修复，不能靠自动重试、缩小扫描范围或跳过断言把门禁染绿。
 
+## 更新代理与辅助分发回归
+
+- 更新代理覆盖复用 `default/direct/system/custom`，测试必须实际检查传输选项、逐跳 NO_PROXY、非法配置不直连、代理变化立即重试、响应体 deadline 和父取消；不能只断言 UI 有一个字段。`sourceIdentity`、preparedId 和已调度 epoch 在代理变化后保持不变。
+- helper tests 使用 fixture/mock 或测试专属 loopback，不访问真实 GitHub工具或个人更新服务器。覆盖 manifest 64KiB、binary32MiB、流式无限 body、size/hash/架构、缓存来源/tag/摘要隔离、同次准备切源迟到、并发取消及临时文件清理。版本探测只能执行已核验托管工具，或用户管理的 PATH 工具；不能用自动安装掩盖缺资产。
+- executor tests 验证票据冻结精确来源/版本/协议/平台/digest，下载不刷新 manifest；安装脚本不携带代理凭据。独立 helpers-release 默认 build-only、publisher 经 Environment、公开不可变，主发布就绪检查只读取新产物自身的依赖声明，旧 bundle 不编造依赖。
+- 定向入口包括 `server/lib/net/__tests__/update-fetch.test.ts`、`shared/helper-distribution.test.ts`、`server/lib/__tests__/helper-distribution-runtime.test.ts`、`server/services/__tests__/update-helper-transport.test.ts` 和 `tests/scripts/helper-release*.test.ts`。全部加 `--isolate`；本地模拟不等于六平台托管 runner native smoke，更不等于辅助资产已公开上线。
+
 ## Release CI 与默认 CI 的区别
 
 - `ci.yml` 同时支持 `workflow_call`。发布调用传入固定的完整 commit SHA，三类源任务使用相同 SHA；普通 PR 仍检查 GitHub 提供的 merge SHA，不因为发布复用而改为 PR head。两种调用并发组隔离。

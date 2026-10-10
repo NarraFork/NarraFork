@@ -71,6 +71,12 @@ bun scripts/build-cross-platform.ts --platform=linux-arm64
 
 该身份同时嵌入前后端和 binary sidecar。运行时不会依据 cwd、用户项目 origin 或运行环境自动切源；新安装采用构建默认值，已有显式保存的来源保持不变。fork 必须自行构建，不能让上游二进制自动变成 fork 包。严格 Release CI 还会交叉核对 bundle、sidecar、smoke 及新安装 settings 的仓库身份。
 
+### 辅助分发依赖
+
+新构建在生成的 build-info 和 sidecar 中声明 `helperDistribution`：固定 helpers catalog/tag，加应用版本对应的 executor tag/protocol。严格构建和八平台 bundle 核对同一声明；旧无声明产物保持兼容。构建与 dry-run 不要求远端已经有辅助 Release，真正主程序发布前才做只读就绪检查。
+
+辅助工具通过独立 `.github/workflows/helpers-release.yml` 构建并原生 smoke，不加入主程序资产。rg/zstd 各覆盖六平台；Linux zstd 使用固定 Alpine 镜像摘要及源码摘要的 musl 静态 recipe，Windows ARM64 复用固定 llvm-mingw recipe，macOS 原生构建。不要恢复 `Alpine latest`、未经摘要校验的 musl.cc 工具链或 `-march=native`。发布细节、许可附件和显式触发步骤见 [RELEASE.md](RELEASE.md)。
+
 ## 交叉编译说明
 
 ### 从 Linux x86 构建 macOS 版本

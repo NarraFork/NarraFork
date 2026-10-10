@@ -6,6 +6,7 @@ import { Transform } from "node:stream";
 import { pipeline } from "node:stream/promises";
 import { isValidGitHubRepository } from "../../shared/github-repository";
 import { MAX_RELEASE_BINARY_BYTES } from "../../shared/release-patch";
+import { updateServerChildEnvironment } from "../../shared/update-server-child-env";
 import type { GhRunner } from "./github-release";
 
 export const CI_TEXT_LIMIT = 1024 * 1024;
@@ -21,7 +22,7 @@ export const runCiGh: GhRunner = (args) =>
 		timeout: 30_000,
 		maxBuffer: CI_TEXT_LIMIT,
 		stdio: ["ignore", "pipe", "pipe"],
-		env: { ...process.env, GH_HOST: "github.com", GH_PROMPT_DISABLED: "1" },
+		env: { ...updateServerChildEnvironment(), GH_HOST: "github.com", GH_PROMPT_DISABLED: "1" },
 	});
 
 async function openReleaseStream(path: string, signal?: AbortSignal) {
@@ -131,7 +132,7 @@ export const downloadReleaseAsset: ReleaseAssetDownloader = async (options) => {
 		],
 		{
 			stdio: ["ignore", "pipe", "pipe"],
-			env: { ...process.env, GH_HOST: "github.com", GH_PROMPT_DISABLED: "1" },
+			env: { ...updateServerChildEnvironment(), GH_HOST: "github.com", GH_PROMPT_DISABLED: "1" },
 		},
 	);
 	let diagnostic = "";

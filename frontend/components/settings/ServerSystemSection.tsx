@@ -13,6 +13,7 @@ import {
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { IconAlertTriangle, IconRefresh, IconSearch } from "@tabler/icons-react";
+import { Link } from "@tanstack/react-router";
 import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { AUTO_LAN_HOST } from "../../../shared/server-host";
@@ -61,7 +62,7 @@ export interface ServerSystemSectionProps {
 	setTlsPassphrase: (v: string) => void;
 	tlsCaFile: string;
 	setTlsCaFile: (v: string) => void;
-	// Main-program update source (helper/executor keep their existing tool service).
+	// Update source. Network proxy is managed through the shared settings/proxy page.
 	updateSource: UpdateSource;
 	setUpdateSource: (v: UpdateSource) => void;
 	updateGithubRepository: string;
@@ -273,6 +274,9 @@ export function ServerSystemSection({
 			<Text size="xs" c="dimmed">
 				{t("updateSourceDesc")}
 			</Text>
+			<Button component={Link} to="/settings/proxy" variant="subtle" size="xs">
+				{t("updateProxySettingsLink")}
+			</Button>
 			<SegmentedControl
 				value={updateSource}
 				onChange={(v) => setUpdateSource(v as UpdateSource)}

@@ -4,6 +4,7 @@ import { lstat, mkdir, mkdtemp, open, realpath, rename, rm, statfs } from "node:
 import { basename, dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { z } from "zod";
+import { updateServerChildEnvironment } from "../../shared/update-server-child-env";
 import { verifyReleaseBundle } from "./ci-release-bundle";
 import { readReleaseText } from "./ci-release-io";
 import {
@@ -337,6 +338,7 @@ export async function restoreCiReleaseBundle(options: RestoreCiReleaseBundleOpti
 				timeout: RESTORE_TIMEOUT_MS,
 				maxBuffer: 1024 * 1024,
 				signal: options.signal,
+				env: updateServerChildEnvironment(env),
 			},
 		);
 		const manifestValue = JSON.parse(await readReleaseText(join(extracted, "manifest.json")));

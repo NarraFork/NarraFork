@@ -126,4 +126,6 @@ export interface CiReleaseManifest {
 	plan: CiReleasePlan;
 	files: CiReleaseFile[];
 	smoke: CiReleaseSmokeResult[];
+	/** Optional for legacy bundles; exactly matches all eight sidecars when declared. */
+	helperDistribution?: BinaryMetadata["helperDistribution"];
 }

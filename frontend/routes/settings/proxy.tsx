@@ -23,6 +23,7 @@ import { useCurrentUser } from "../../hooks/useAuth";
 import { api } from "../../lib/api";
 import { miscApi } from "../../lib/api/misc";
 import {
+	buildUpdateProxyPatch,
 	buildWebToolProxyPatch,
 	normalizeProxyUrl,
 	type OutboundProxyMode,
@@ -62,6 +63,7 @@ function ProxyManagementPage() {
 
 			<AiProviderOverrides />
 			<WebToolOverrides />
+			<UpdateOverrides />
 			<GatewayOverrides />
 			<HookOverrides />
 		</Stack>
@@ -164,6 +166,7 @@ function OutboundProxyCard() {
 						<List.Item>{t("proxyScopeWebFetch")}</List.Item>
 						<List.Item>{t("proxyScopeImGateway")}</List.Item>
 						<List.Item>{t("proxyScopeHooks")}</List.Item>
+						<List.Item>{t("proxyScopeUpdates")}</List.Item>
 						<List.Item>{t("proxyScopeImWsLimit")}</List.Item>
 						<List.Item>{t("proxyScopeLoopbackExempt")}</List.Item>
 					</List>
@@ -394,6 +397,59 @@ function WebToolOverrides() {
 					/>
 					<Text size="xs" c="dimmed">
 						{t("proxyBrowserNewSessionsNote")}
+					</Text>
+				</Stack>
+			)}
+		</GroupCard>
+	);
+}
+
+// ---------------------------------------------------------------------------
+// Software updates and helper downloads (one shared settings override)
+// ---------------------------------------------------------------------------
+
+function UpdateOverrides() {
+	const { t } = useTranslation("settings");
+	const qc = useQueryClient();
+	const {
+		data: settingsData,
+		isLoading,
+		isError,
+	} = useQuery({
+		queryKey: ["admin", "settings"],
+		queryFn: api.getSettings,
+		gcTime: PROXY_SETTINGS_QUERY_GC_TIME_MS,
+	});
+	const update = (settingsData as { update?: { proxy?: ProxyOverride } } | undefined)?.update;
+	const saveMut = useMutation({
+		mutationFn: (next: ProxyOverride | undefined) =>
+			api.updateSettings(buildUpdateProxyPatch(next)),
+		onSuccess: () => {
+			qc.invalidateQueries({ queryKey: ["admin", "settings"] });
+			notifications.show({ message: t("proxySaved"), color: "green" });
+		},
+		onError: (error) => {
+			notifications.show({
+				message: t("proxySaveFailed", { error: error.message }),
+				color: "red",
+			});
+		},
+	});
+
+	return (
+		<GroupCard title={t("proxyGroupUpdates")} loading={isLoading} empty={false}>
+			{isError ? (
+				<Alert color="red">{t("proxyLoadFailed")}</Alert>
+			) : (
+				<Stack gap="sm">
+					<OverrideRow
+						name={t("proxyGroupUpdates")}
+						value={update?.proxy}
+						disabled={saveMut.isPending}
+						onChange={(next) => saveMut.mutate(next)}
+					/>
+					<Text size="xs" c="dimmed">
+						{t("proxyUpdatesDesc")}
 					</Text>
 				</Stack>
 			)}

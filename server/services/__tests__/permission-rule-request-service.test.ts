@@ -764,12 +764,22 @@ async function start(identity: Awaited<ReturnType<typeof seed>>, input: Record<s
 	);
 }
 describe("permission request tool schema compatibility", () => {
-	test("exports an object root without dropping discriminated union constraints", () => {
+	test("exports a flat provider schema while retaining discriminated runtime validation", () => {
 		const original = zodToJsonSchema(service.requestPermissionRuleSchema);
 		const exported = resolveToolJsonSchema(requestPermissionRuleTool);
 		expect(exported.type).toBe("object");
-		expect(exported).toEqual({ ...original, type: "object" });
-		expect(exported.anyOf).toHaveLength(4);
+		expect(exported.anyOf).toBeUndefined();
+		expect(exported.oneOf).toBeUndefined();
+		expect(exported.allOf).toBeUndefined();
+		expect(exported.required).toEqual(["ruleType", "reason"]);
+		const properties = exported.properties as Record<string, unknown>;
+		expect(properties.ruleType).toMatchObject({
+			type: "string",
+			enum: ["directoryWhitelist", "directoryBlacklist", "commandWhitelist", "commandBlacklist"],
+		});
+		expect(properties.scope).toMatchObject({ enum: ["narrator"] });
+		expect(original.anyOf).toHaveLength(4);
+		expect(requestPermissionRuleTool.parameters).toBe(service.requestPermissionRuleSchema);
 	});
 
 	test("runtime validation still accepts all four rule types and rejects unsafe inputs", () => {

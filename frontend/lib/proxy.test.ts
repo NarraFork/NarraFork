@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
 	buildProxyOverride,
+	buildUpdateProxyPatch,
 	buildWebToolProxyPatch,
 	commitProxyUrlDraft,
 	normalizeProxyUrl,
@@ -8,6 +9,30 @@ import {
 } from "./proxy";
 
 describe("proxy helpers", () => {
+	test("update patches survive JSON and never include source or unrelated settings", () => {
+		for (const mode of ["default", "direct", "system", "custom"] as const) {
+			const proxy = mode === "custom" ? { mode, url: "https://proxy.example:8443" } : { mode };
+			expect(JSON.parse(JSON.stringify(buildUpdateProxyPatch(proxy)))).toEqual({
+				update: { proxy },
+			});
+		}
+		expect(JSON.parse(JSON.stringify(buildUpdateProxyPatch()))).toEqual({
+			update: { proxy: { mode: "default" } },
+		});
+	});
+
+	test("rejects malformed HTTP-looking proxy URLs as local drafts", () => {
+		for (const url of [
+			"http://",
+			"http://host:invalid",
+			"https://[bad",
+			"http://a b",
+			"http://a\nb",
+		]) {
+			expect(normalizeProxyUrl(url)).toBeUndefined();
+			expect(buildProxyOverride("custom", url)).toBeNull();
+		}
+	});
 	test("web tool patches retain explicit inheritance through JSON without unrelated settings", () => {
 		expect(JSON.parse(JSON.stringify(buildWebToolProxyPatch("webFetch")))).toEqual({
 			agent: { webFetchPolicy: { proxy: { mode: "default" } } },

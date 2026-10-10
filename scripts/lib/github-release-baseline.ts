@@ -3,6 +3,7 @@ import {
 	isValidGitHubRepository,
 	OFFICIAL_GITHUB_REPOSITORY,
 } from "../../shared/github-repository";
+import { parseHelperDistributionDependencies } from "../../shared/helper-distribution";
 import { MAX_RELEASE_BINARY_BYTES, RELEASE_SHA512_RE } from "../../shared/release-patch";
 import { compareReleaseVersions, isValidReleaseVersion } from "../../shared/release-version";
 import type { BinaryMetadata } from "./binary-metadata";
@@ -64,6 +65,8 @@ export function validateBaselineMetadata(
 		!RELEASE_SHA512_RE.test(meta.sha512)
 	)
 		throw new Error(`Invalid binary metadata/provenance: ${expected.name}`);
+	if (meta.helperDistribution !== undefined)
+		parseHelperDistributionDependencies(meta.helperDistribution, expected.version);
 	return meta;
 }
 

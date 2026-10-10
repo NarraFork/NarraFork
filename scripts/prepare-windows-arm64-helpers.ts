@@ -7,14 +7,14 @@
  * Outputs: dist/helpers/windows-arm64/{rg,zstd}-win-arm64.exe and upstream notices.
  */
 import { copyFileSync, mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { isWindowsPeFile } from "../shared/windows-pe";
 import { downloadHelperAsset, runHelperCommand, sha256 } from "./lib/helper-assets";
 import { windowsArm64ZstdCommand } from "./lib/zstd-windows-arm64";
 import { prepareRipgrepHelpers } from "./prepare-ripgrep-helpers";
 
 const ROOT = join(import.meta.dir, "..");
-const OUT = join(ROOT, "dist", "helpers", "windows-arm64");
+const DEFAULT_OUT = join(ROOT, "dist", "helpers", "windows-arm64");
 const ZSTD_VERSION = "1.5.7";
 const LLVM_VERSION = "20250613";
 const ZSTD_ARCHIVE = `zstd-${ZSTD_VERSION}.tar.gz`;
@@ -23,6 +23,9 @@ const LLVM_ARCHIVE = `${LLVM_DIR}.tar.xz`;
 
 async function main() {
 	const args = process.argv.slice(2);
+	const OUT = resolve(
+		args.findLast((arg) => arg.startsWith("--output="))?.slice("--output=".length) ?? DEFAULT_OUT,
+	);
 	const sshHost = args.find((arg) => arg.startsWith("--ssh-host="))?.slice("--ssh-host=".length);
 	mkdirSync(OUT, { recursive: true });
 	await prepareRipgrepHelpers(OUT, "win-arm64", sshHost);

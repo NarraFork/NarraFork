@@ -4,7 +4,9 @@ import { dirname, join, resolve } from "node:path";
 import { setImmediate } from "node:timers/promises";
 import { mergeUpdateIndex } from "../shared/update-index";
 import { UPDATE_INDEX_FILE, type UpdateIndexRelease } from "../shared/update-index-types";
+import { updateServerChildEnvironment } from "../shared/update-server-child-env";
 import { assembleReleaseBundle, verifyReleaseBundle } from "./lib/ci-release-bundle";
+import { hashReleaseFile } from "./lib/ci-release-io";
 import {
 	createCiReleasePlan,
 	revalidateCiReleasePlan,
@@ -12,16 +14,58 @@ import {
 } from "./lib/ci-release-plan";
 import { restoreCiReleaseBundle } from "./lib/ci-release-restore";
 import { CI_RELEASE_TARGETS, type CiReleasePlan } from "./lib/ci-release-types";
+import {
+	assertBridgeMode,
+	type BridgeIdentity,
+	ciBridgeDeadlineSignal,
+	createBridgeGhRunner,
+	hasMirrorFailureReceipt,
+	restoreUpdateServerBridgeArtifact,
+	writeBridgeEnvelope,
+} from "./lib/ci-update-server-bridge-restore";
 import { publishGitHubRelease, runGh } from "./lib/github-release";
 import { selectGitHubBaselines } from "./lib/github-release-baseline";
 import { prepareUpdateIndexRelease } from "./lib/update-index";
 import { preparePublishedUpdateIndexRelease, publishUpdateIndex } from "./lib/update-index-github";
+import { resolveUpdateServerBridgeConfig } from "./lib/update-server-bridge-http";
+import {
+	MirrorPublicationError,
+	prepareUpdateServerMainMirror,
+	publishUpdateServerMainMirror,
+	restorePreparedMainMirror,
+} from "./lib/update-server-main-mirror";
 
 const FLAGS: Record<string, readonly string[]> = {
-	preflight: ["tag", "publish", "source-run-id", "plan", "index-only"],
+	preflight: [
+		"tag",
+		"publish",
+		"source-run-id",
+		"plan",
+		"index-only",
+		"mirror-only",
+		"bridge-run-id",
+		"bridge-run-attempt",
+	],
 	assemble: ["plan", "platforms-dir", "smoke-dir", "bundle-dir", "preview-dir"],
 	restore: ["tag", "source-run-id", "bundle-dir"],
-	publish: ["tag", "source-run-id", "bundle-dir"],
+	"prepare-bridge": ["tag", "source-run-id", "bundle-dir", "bridge-dir"],
+	publish: [
+		"tag",
+		"source-run-id",
+		"bundle-dir",
+		"bridge-dir",
+		"bridge-artifact-id",
+		"bridge-artifact-digest",
+	],
+	mirror: [
+		"tag",
+		"source-run-id",
+		"bundle-dir",
+		"bridge-dir",
+		"bridge-run-id",
+		"bridge-run-attempt",
+		"mirror-only",
+	],
 	index: ["plan", "source-run-id", "bundle-dir", "publish", "preview-dir"],
 	gate: [],
 };
@@ -79,8 +123,25 @@ export function assertReleaseGate(env: NodeJS.ProcessEnv) {
 		throw new Error("Invalid index repair mode");
 	if (env.INDEX_ONLY === "true" && !restoring)
 		throw new Error("Index repair cannot run build jobs");
+	if (env.MIRROR_ONLY !== undefined && !["true", "false"].includes(env.MIRROR_ONLY))
+		throw new Error("Invalid mirror-only mode");
+	if (env.MIRROR_REQUIRED !== undefined && !["", "true", "false"].includes(env.MIRROR_REQUIRED))
+		throw new Error("Invalid mirror requirement");
+	if (
+		env.MIRROR_ONLY === "true" &&
+		(!restoring || env.PUBLISH_REQUESTED !== "true" || env.INDEX_ONLY === "true")
+	)
+		throw new Error("Invalid mirror-only gate mode");
+	if (env.MIRROR_REQUIRED === "true" && env.MIRROR_STATUS !== "MIRRORED")
+		throw new Error("Configured update server mirror did not succeed");
+	if (
+		env.MIRROR_ONLY === "true" &&
+		(env.MIRROR_REQUIRED !== "true" || env.MIRROR_STATUS !== "MIRRORED")
+	)
+		throw new Error("Mirror-only requires a verified mirror receipt");
 	if (
 		env.PUBLISH_REQUESTED === "true" &&
+		env.MIRROR_ONLY !== "true" &&
 		(!/^[a-f0-9]{40}$/.test(env.INDEX_COMMIT ?? "") ||
 			!/^[1-9]\d*$/.test(env.INDEX_GENERATION ?? ""))
 	)
@@ -137,6 +198,7 @@ export function assertPrimaryReleaseCheckout(root: string) {
 			encoding: "utf8",
 			timeout: 10_000,
 			maxBuffer: 16 * 1024,
+			env: updateServerChildEnvironment(),
 		},
 	)
 		.trim()
@@ -189,12 +251,18 @@ export async function runCiRelease(argv: string[]) {
 	const { command, values } = parseCiReleaseArgs(argv);
 	const root = process.cwd();
 	const abort = new AbortController();
+	const signal = ["prepare-bridge", "publish", "mirror"].includes(command)
+		? ciBridgeDeadlineSignal(process.env, abort.signal)
+		: abort.signal;
 	const cancel = () => abort.abort(new Error("CI release cancelled"));
 	process.once("SIGINT", cancel);
 	process.once("SIGTERM", cancel);
+	const gh = ["prepare-bridge", "publish", "mirror"].includes(command)
+		? createBridgeGhRunner(signal)
+		: runGh;
 	const run = async (args: string[]) => {
-		await setImmediate(undefined, { signal: abort.signal });
-		return runGh(args);
+		await setImmediate(undefined, { signal });
+		return gh(args);
 	};
 	try {
 		if (command === "gate") {
@@ -209,6 +277,15 @@ export async function runCiRelease(argv: string[]) {
 			const indexOnly = values["index-only"] ?? "false";
 			if (!["true", "false"].includes(publish) || !["true", "false"].includes(indexOnly))
 				throw new Error("publish/index-only must be true or false");
+			const mirrorOnly = values["mirror-only"] ?? "false";
+			assertBridgeMode({
+				publish,
+				indexOnly,
+				mirrorOnly,
+				sourceRunId: values["source-run-id"],
+				bridgeRunId: values["bridge-run-id"],
+			});
+			if (values["bridge-run-attempt"]) positiveId(values["bridge-run-attempt"]);
 			const sourceRunId = values["source-run-id"] ? positiveId(values["source-run-id"]) : undefined;
 			const plan = await createCiReleasePlan({
 				root,
@@ -218,7 +295,7 @@ export async function runCiRelease(argv: string[]) {
 				indexOnly: indexOnly === "true",
 			});
 			if (!sourceRunId && indexOnly === "false")
-				plan.baselines = await selectGitHubBaselines(plan, { signal: abort.signal });
+				plan.baselines = await selectGitHubBaselines(plan, { signal: signal });
 			validateCiReleasePlan(plan);
 			const path = resolve(required(values, "plan"));
 			await mkdir(dirname(path), { recursive: true });
@@ -254,7 +331,7 @@ export async function runCiRelease(argv: string[]) {
 				platformsDir,
 				smokeDir,
 				bundleDir,
-				signal: abort.signal,
+				signal: signal,
 			});
 			const prepared = await prepareUpdateIndexRelease(
 				githubOptions(plan, join(bundleDir, "dist")),
@@ -288,7 +365,7 @@ export async function runCiRelease(argv: string[]) {
 					tag: plan.tag,
 					root,
 					destination,
-					signal: abort.signal,
+					signal: signal,
 				});
 				const manifest = await verifyReleaseBundle(destination, restored.plan);
 				if (
@@ -307,7 +384,7 @@ export async function runCiRelease(argv: string[]) {
 				commit: plan.commit,
 				changelog: { ...plan.changelog },
 				run,
-				signal: abort.signal,
+				signal: signal,
 			});
 			if (shouldPublish === "false") {
 				await writeIndexPreview(
@@ -320,33 +397,73 @@ export async function runCiRelease(argv: string[]) {
 				);
 				return;
 			}
-			await revalidateCiReleasePlan(plan, { root, publish: true });
+			await revalidateCiReleasePlan(plan, { root, publish: true, run });
 			const receipt = await publishUpdateIndex({
 				repository: plan.repository,
 				...prepared,
 				run,
-				signal: abort.signal,
+				signal: signal,
 			});
 			await output({
 				"index-commit": receipt.commit,
 				"index-generation": String(receipt.generation),
+				"publication-status": "INDEXED",
 			});
 			await summary(
 				`Update index repaired: ${receipt.commit}, generation ${receipt.generation}. Existing Release assets were not changed.`,
 			);
 			return;
 		}
+		// Configuration is explicit and fail-closed before the first GitHub mutator.
+		// Preview/build/index commands never resolve personal update-server credentials.
+		const bridgeCommand =
+			command === "prepare-bridge" || command === "publish" || command === "mirror";
+		const config = bridgeCommand ? resolveUpdateServerBridgeConfig(process.env) : undefined;
+		if (bridgeCommand && process.env.PUBLISH_REQUESTED !== "true")
+			throw new Error("Bridge publication requires publish=true");
+		if (command === "mirror" && !config)
+			throw new Error("Mirror retry requires explicit update-server configuration");
+		if (command === "prepare-bridge" && !config) {
+			// The unchanged publisher will restore/verify the source once. There is no
+			// bridge to prepare, upload or restore in GitHub-only mode.
+			positiveId(required(values, "source-run-id"));
+			required(values, "tag");
+			await output({ "mirror-required": "false", "publication-status": "BUILD_COMPLETE" });
+			await summary(
+				"BUILD_COMPLETE: GitHub-only publication; no legacy server requests or credentials fallback.",
+			);
+			return;
+		}
 		const sourceRunId = positiveId(required(values, "source-run-id"));
 		const tag = required(values, "tag");
 		const destination = resolve(required(values, "bundle-dir"));
+		// Each entry restores immutable Actions bytes with original source-job proof.
+		// A caller-selected local manifest cannot replace the trusted source artifact.
 		const restored = await restoreCiReleaseBundle({
 			sourceRunId,
 			tag,
 			root,
 			destination,
-			signal: abort.signal,
+			signal,
+			run,
 		});
 		const manifest = await verifyReleaseBundle(destination, restored.plan);
+		if (manifest.plan.tag !== tag || manifest.plan.runId !== sourceRunId)
+			throw new Error("Original bundle run/tag mismatch");
+		const bridgeIdentity: BridgeIdentity = {
+			kind: "main",
+			repository: manifest.plan.repository,
+			defaultBranch: manifest.plan.defaultBranch ?? "main",
+			tag,
+			version: manifest.plan.version,
+			commit: manifest.plan.commit,
+			sourceRunId,
+			sourceRunAttempt: manifest.plan.runAttempt,
+			serverUrl: config?.serverUrl ?? "",
+			manifestSha256: (
+				await hashReleaseFile(join(destination, "manifest.json"), 1024 * 1024, signal)
+			).sha256,
+		};
 		if (command === "restore") {
 			await revalidateCiReleasePlan(manifest.plan, { root, publish: false });
 			await output({
@@ -361,9 +478,104 @@ export async function runCiRelease(argv: string[]) {
 		if (process.env.PUBLISH_REQUESTED !== "true")
 			throw new Error("Publication requires an explicit publish request");
 		assertPrimaryReleaseCheckout(root);
-		await revalidateCiReleasePlan(manifest.plan, { root, publish: true });
-		abort.signal.throwIfAborted();
+		await revalidateCiReleasePlan(manifest.plan, { root, publish: true, run });
+		signal.throwIfAborted();
 		const options = githubOptions(manifest.plan, join(destination, "dist"));
+		if (command === "prepare-bridge") {
+			await output({ "mirror-required": String(!!config), "publication-status": "BUILD_COMPLETE" });
+			if (!config) {
+				await summary(
+					"BUILD_COMPLETE: GitHub-only publication; no legacy server requests or credentials fallback.",
+				);
+				return;
+			}
+			const bridgeDir = resolve(required(values, "bridge-dir"));
+			const bridge = await prepareUpdateServerMainMirror({
+				manifest,
+				bundleDir: destination,
+				bridgeDir,
+				config,
+				signal: signal,
+				run,
+			});
+			await writeBridgeEnvelope(bridgeDir, bridgeIdentity, bridge.sealSha256);
+			await summary(
+				`BUILD_COMPLETE: all legacy patches verified; upload immutable bridge artifact before GitHub writes. source_run_id=${sourceRunId}, bridge_run_id=${process.env.GITHUB_RUN_ID}.`,
+			);
+			return;
+		}
+		let mirrorAccepted: (() => Promise<void>) | undefined;
+		if (config) {
+			const bridgeRunId =
+				command === "mirror"
+					? positiveId(required(values, "bridge-run-id"))
+					: positiveId(process.env.GITHUB_RUN_ID ?? "");
+			const bridgeDir = resolve(required(values, "bridge-dir"));
+			const bridgeArtifact = await restoreUpdateServerBridgeArtifact({
+				identity: bridgeIdentity,
+				bridgeRunId,
+				destination: bridgeDir,
+				bridgeRunAttempt: values["bridge-run-attempt"]
+					? positiveId(values["bridge-run-attempt"])
+					: undefined,
+				signal: signal,
+				run,
+				...(command === "publish"
+					? {
+							uploadedArtifactId: required(values, "bridge-artifact-id"),
+							uploadedArtifactDigest: required(values, "bridge-artifact-digest"),
+						}
+					: {}),
+			});
+			const bridge = await restorePreparedMainMirror({
+				manifest,
+				bundleDir: destination,
+				bridgeDir,
+				config,
+				sealSha256: bridgeArtifact.envelope.sealSha256,
+				signal: signal,
+			});
+			mirrorAccepted = async () => {
+				try {
+					await publishUpdateServerMainMirror(bridge, config, { signal: signal });
+					await output({
+						"mirror-required": "true",
+						"mirror-status": "MIRRORED",
+						"publication-status": "MIRRORED",
+					});
+					await summary(
+						`MIRRORED: ${tag}; original source_run_id=${sourceRunId}, bridge_run_id=${bridgeRunId}, bridge_run_attempt=${bridgeArtifact.envelope.bridgeRunAttempt}. Mirror phase selected no new baseline.`,
+					);
+				} catch (error) {
+					await output({ "mirror-status": "PUBLISHED_NOT_MIRRORED" });
+					const partialReceipt = await hasMirrorFailureReceipt(
+						join(bridgeDir, "receipt-main-mirror.json"),
+						"partial",
+					);
+					const retained = `Original source_run_id=${sourceRunId}, bridge_run_id=${bridgeRunId}, bridge_run_attempt=${bridgeArtifact.envelope.bridgeRunAttempt}; immutable bridge retained; partial receipt ${partialReceipt ? "retained" : "unavailable"}.`;
+					if (
+						error instanceof MirrorPublicationError &&
+						error.receipt.failureCode === "BASELINE_ADVANCED"
+					) {
+						await summary(
+							`PUBLISHED_NOT_MIRRORED: BASELINE_ADVANCED: ${tag} bridge is obsolete because the legacy baseline advanced. Same-artifact retry cannot fix it; do not reselect a newer basis or regenerate this sealed bridge. Explicit maintainer intervention or a new release/full migration is required. ${retained}`,
+						);
+					} else {
+						await summary(
+							`PUBLISHED_NOT_MIRRORED: ${tag}. Retry publish=true mirror_only=true source_run_id=${sourceRunId} bridge_run_id=${bridgeRunId} bridge_run_attempt=${bridgeArtifact.envelope.bridgeRunAttempt}. ${retained}`,
+						);
+					}
+					throw error;
+				}
+			};
+			if (command === "mirror") {
+				// Independent retries prove the Release is public, without any mutator.
+				await publishGitHubRelease({ ...options, requireAlreadyPublished: true, run });
+				await mirrorAccepted();
+				return;
+			}
+		}
+		await output({ "mirror-required": String(!!config) });
 		// Validate the bounded record before making the Release public.
 		const prepared = await prepareUpdateIndexRelease(options);
 		const result = await publishGitHubRelease({
@@ -371,16 +583,18 @@ export async function runCiRelease(argv: string[]) {
 			preventStableLatestRollback: true,
 			run,
 		});
+		await output({ "publication-status": "PUBLISHED" });
 		try {
 			const receipt = await publishUpdateIndex({
 				repository: manifest.plan.repository,
 				...prepared,
 				run,
-				signal: abort.signal,
+				signal: signal,
 			});
 			await output({
 				"index-commit": receipt.commit,
 				"index-generation": String(receipt.generation),
+				"publication-status": "INDEXED",
 			});
 			await summary(
 				`Release ${tag}: ${result.alreadyPublished ? "already published and verified" : "published and verified"}; index ${receipt.commit} generation ${receipt.generation}. Original artifact: ${restored.artifactId}.`,
@@ -391,6 +605,9 @@ export async function runCiRelease(argv: string[]) {
 			);
 			throw error;
 		}
+		// Normal publishing mirrors the already-restored, trusted Prepared object.
+		// Only mirror-only retries independently download the original bridge again.
+		await mirrorAccepted?.();
 	} finally {
 		process.removeListener("SIGINT", cancel);
 		process.removeListener("SIGTERM", cancel);

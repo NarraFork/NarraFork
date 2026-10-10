@@ -2,7 +2,7 @@ import { listExecutorPlatformInfo } from "@shared/remote-executor";
 import { type Context, Hono } from "hono";
 import { DEVICE_PROTOCOL_VERSION } from "../lib/agent/execution/rpc-types";
 import { ForbiddenError, NotFoundError, ValidationError } from "../lib/errors";
-import { getExecutorManifest } from "../lib/executor-binaries";
+import { freezeExecutorArtifact, getExecutorManifest } from "../lib/executor-binaries";
 import { attachExecutorTicketScript, issueExecutorTicket } from "../lib/executor-bootstrap-ticket";
 import {
 	enrollmentRefusalMessage,
@@ -259,10 +259,10 @@ deviceRoutes.post("/:id/install-script", async (c) => {
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	const { platform, mode, disableShell, serverBaseUrl, tokenDelivery } = parsed.data;
 
-	const manifest = await getExecutorManifest();
+	const manifest = await getExecutorManifest({ signal: c.req.raw.signal });
 	if (!manifest) {
 		throw new ValidationError(
-			"No published executor release is available. Check the update server URL in settings.",
+			"No compatible executor release is available. Check the selected update source in settings.",
 		);
 	}
 	const artifact = manifest.platforms[platform];
@@ -271,6 +271,7 @@ deviceRoutes.post("/:id/install-script", async (c) => {
 			`Executor v${manifest.version} does not publish a build for ${platform}`,
 		);
 	}
+	const artifactBinding = freezeExecutorArtifact(manifest, platform);
 
 	/*
 	 * Which URL the target machine should use, in order of trustworthiness:
@@ -331,6 +332,8 @@ deviceRoutes.post("/:id/install-script", async (c) => {
 	 * Broken by minting the ticket first and attaching the rendered body after.
 	 */
 	const ticket = issueExecutorTicket(platform, {
+		artifact: artifactBinding,
+		signal: c.req.raw.signal,
 		deviceId: device.id,
 		deviceSlug: device.slug,
 		// Structural, not cosmetic: a prompt-mode ticket must be unable to hand out a
@@ -349,6 +352,7 @@ deviceRoutes.post("/:id/install-script", async (c) => {
 		artifactFilename: artifact.filename,
 		expectedSha256: artifact.sha256,
 		executorVersion: manifest.version,
+		executorProtocolVersion: manifest.protocolVersion,
 		ticket: ticket.ticket,
 		tokenDelivery,
 		caCertPem,

@@ -3,7 +3,14 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { z } from "zod";
 import { DEFAULTS, SETTING_DOCS } from "../settings/defaults";
-import { deepMerge, getDefaults, narraforkDir, reloadSettings } from "../settings/index";
+import {
+	deepMerge,
+	getDefaults,
+	narraforkDir,
+	normalizeSettingsProxyUrls,
+	reloadSettings,
+	saveSettings,
+} from "../settings/index";
 import type { NarraForkSettings } from "../settings/types";
 import {
 	DEFAULT_GITHUB_REPOSITORY,
@@ -160,6 +167,103 @@ describe("update source settings", () => {
 			const normalized = normalize(next);
 			expect(normalized.update).toEqual(next.update);
 			expect(normalized.needsSave).toBe(false);
+		}
+	});
+});
+
+describe("update proxy settings", () => {
+	test("supports four independent modes and requires valid custom HTTP(S) URLs", () => {
+		for (const mode of ["default", "direct", "system"] as const) {
+			const patch = { update: { proxy: { mode } } };
+			expect(updateSettingsSchema.parse(patch)).toEqual(patch);
+		}
+		for (const url of ["proxy.example:8080", " https://user:secret@proxy.example:8443 "]) {
+			const parsed = updateSettingsSchema.parse({ update: { proxy: { mode: "custom", url } } });
+			expect(parsed.update?.proxy?.url).toBe(
+				url.trim().startsWith("https:") ? url.trim() : `http://${url}`,
+			);
+		}
+		for (const url of [
+			undefined,
+			null,
+			"",
+			"http://",
+			"http://host:invalid",
+			"https://[bad",
+			"http://a\nb",
+			"not a proxy",
+			"socks5://host:1080",
+			"a".repeat(501),
+		]) {
+			expect(
+				updateSettingsSchema.safeParse({ update: { proxy: { mode: "custom", url } } }).success,
+			).toBe(false);
+		}
+	});
+
+	test("proxy-only patches preserve update identity, global proxy and TokenDance configuration", () => {
+		const current = deepMerge(getDefaults(), {
+			proxy: { mode: "custom", url: "http://global.example:8080" },
+			tokendance: { apiKey: "keep-token", baseUrl: "https://gateway.example" },
+			update: {
+				...DEFAULT_UPDATE_SETTINGS,
+				githubRepository: "fork/releases",
+				product: "private",
+				channel: "beta",
+				proxy: { mode: "custom", url: "http://old.example:8080" },
+			},
+		});
+		const patch = updateSettingsSchema.parse(
+			JSON.parse(JSON.stringify({ update: { proxy: { mode: "default" } } })),
+		);
+		const next = deepMerge(current, patch);
+		if (!current.update) throw new Error("Expected update settings");
+		expect(normalizeSettingsProxyUrls(next)).toBe(true);
+		expect(next.update).toEqual({ ...current.update, proxy: { mode: "default" } });
+		expect(next.proxy).toEqual(current.proxy);
+		expect(next.tokendance).toEqual(current.tokendance);
+		expect(SETTING_DOCS["update.proxy.mode"]).toBeDefined();
+		expect(SETTING_DOCS["update.proxy.url"]).toBeDefined();
+	});
+
+	test("loading normalizes update proxy without deleting unsupported persisted URLs", () => {
+		for (const url of [
+			" proxy.example:8080 ",
+			"socks5://proxy.example:1080",
+			"http://host:invalid",
+		]) {
+			const current = deepMerge(getDefaults(), { update: { proxy: { mode: "custom", url } } });
+			normalizeSettingsProxyUrls(current);
+			expect(current.update?.proxy).toEqual({
+				mode: "custom",
+				url: url.startsWith(" ") ? "http://proxy.example:8080" : url,
+			});
+		}
+	});
+
+	test("isolated save/reload retains explicit inheritance without disturbing other fields", () => {
+		expect(process.env.NARRAFORK_TEST).toBe("1");
+		expect(narraforkDir).toBe(resolve(process.env.NARRAFORK_HOME ?? ""));
+		const settingsPath = resolve(narraforkDir, "settings.json");
+		const original = readFileSync(settingsPath, "utf-8");
+		try {
+			const current = getDefaults();
+			if (!current.update) throw new Error("Expected update defaults");
+			current.update.proxy = { mode: "custom", url: "proxy.example:8080" };
+			saveSettings(current);
+			expect(reloadSettings().update?.proxy).toEqual({
+				mode: "custom",
+				url: "http://proxy.example:8080",
+			});
+			const next = deepMerge(
+				reloadSettings(),
+				updateSettingsSchema.parse({ update: { proxy: { mode: "default" } } }),
+			);
+			saveSettings(next);
+			expect(reloadSettings().update).toEqual({ ...current.update, proxy: { mode: "default" } });
+		} finally {
+			writeFileSync(settingsPath, original);
+			reloadSettings();
 		}
 	});
 });

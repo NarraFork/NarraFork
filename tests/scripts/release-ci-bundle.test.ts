@@ -25,13 +25,14 @@ import {
 	type CiReleasePlan,
 	type CiReleaseSmokeResult,
 } from "../../scripts/lib/ci-release-types";
+import { createHelperDistributionDependencies } from "../../shared/helper-distribution";
 
 const roots: string[] = [];
 afterEach(async () => {
 	await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
-async function fixture() {
+async function fixture(declareHelpers = false) {
 	const root = await mkdtemp(join(tmpdir(), "nf-ci-bundle-test-"));
 	roots.push(root);
 	const plan: CiReleasePlan = {
@@ -64,6 +65,9 @@ async function fixture() {
 			target: `bun-${target.target}`,
 			commit: plan.commit.slice(0, 12),
 			buildDate: "2026-10-08T00:00:00.000Z",
+			...(declareHelpers
+				? { helperDistribution: createHelperDistributionDependencies(plan.version) }
+				: {}),
 		});
 		await writeFile(join(directory, name), bytes);
 		await writeFile(join(directory, `${name}.metadata.json`), formatMetadataJson(metadata));
@@ -486,5 +490,37 @@ describe("immutable eight-platform CI bundle", () => {
 		await writeFile(path, JSON.stringify(meta));
 		await refreshFileRecord(f, name);
 		await expect(verifyReleaseBundle(f.options.bundleDir)).rejects.toThrow("baseline identity");
+	});
+});
+
+describe("immutable helper dependencies in release bundles", () => {
+	test("all eight new sidecars seal and restore the same declaration without network readiness", async () => {
+		const f = await fixture(true);
+		const sealed = await assembleReleaseBundle(f.options);
+		expect(sealed.helperDistribution).toEqual(createHelperDistributionDependencies(f.plan.version));
+		expect((await verifyReleaseBundle(f.options.bundleDir)).helperDistribution).toEqual(
+			sealed.helperDistribution,
+		);
+	});
+	test("legacy bundles do not invent dependencies from the current control code", async () => {
+		const f = await fixture();
+		expect((await assembleReleaseBundle(f.options)).helperDistribution).toBeUndefined();
+		expect((await verifyReleaseBundle(f.options.bundleDir)).helperDistribution).toBeUndefined();
+	});
+	test("one missing platform declaration cannot silently create a legacy bundle", async () => {
+		const f = await fixture(true);
+		const path = join(f.options.platformsDir, "linux-x64", `${f.name}.metadata.json`);
+		const metadata = JSON.parse(await readFile(path, "utf8"));
+		delete metadata.helperDistribution;
+		await writeFile(path, JSON.stringify(metadata));
+		await expect(assembleReleaseBundle(f.options)).rejects.toThrow("Inconsistent");
+	});
+	test("removing the sealed dependency record is detected during restore", async () => {
+		const f = await fixture(true);
+		await assembleReleaseBundle(f.options);
+		await changeManifest(f, (manifest) => {
+			delete manifest.helperDistribution;
+		});
+		await expect(verifyReleaseBundle(f.options.bundleDir)).rejects.toThrow("declaration mismatch");
 	});
 });

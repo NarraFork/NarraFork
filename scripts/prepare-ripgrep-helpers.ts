@@ -5,7 +5,17 @@
  */
 import { closeSync, copyFileSync, mkdirSync, openSync, readSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { getCliHelperSpec } from "../server/lib/helper-binary-platform";
+import { getHelperAssetName, type HelperPlatform } from "../shared/helper-distribution";
+
+export const RIPGREP_BINARY_SHA256: Record<string, string> = {
+	"rg-linux-x64": "ebeaf56f8a25e102e9419933423738b3a2a613a444fd749d695e15eba53f71f2",
+	"rg-linux-arm64": "968cabe8efed72fd8fd482cb76b6084fcb695fc5293af7fb62296b02f487fb69",
+	"rg-darwin-x64": "3bafa7e6ee51ba3ac4ed065883484a309be09b26ea6dad561ae4049bfe049c50",
+	"rg-darwin-arm64": "4fdf1d8365af224bc70e3c1490d8461d859c37cc70e739a11e987af0215f3e94",
+	"rg-win64.exe": "decdd4992f3f1b9a5ef9898f1b40ab16886d579d6516b4efd3d5eaa19364e408",
+	"rg-win-arm64.exe": "f7799d737b520e00b10dfa72def23904fe66fb03315636a7b78549845ee9609c",
+};
+
 import { isWindowsPeFile } from "../shared/windows-pe";
 import { downloadHelperAsset, runHelperCommand, sha256 } from "./lib/helper-assets";
 
@@ -118,19 +128,21 @@ export async function prepareRipgrepHelpers(out: string, platformKey?: string, s
 				`${dir}/COPYING`,
 			]);
 		}
-		const spec = getCliHelperSpec("rg", asset.platform, asset.arch);
-		if (!spec) throw new Error(`Unsupported helper platform: ${asset.key}`);
-		const binary = join(out, spec.toolName);
+		const toolName = getHelperAssetName(
+			"rg",
+			asset.key.replace(/^win-/, "windows-") as HelperPlatform,
+		);
+		const binary = join(out, toolName);
 		copyFileSync(join(out, dir, asset.platform === "win32" ? "rg.exe" : "rg"), binary);
 		if (!verifyRipgrepArchitecture(binary, asset.platform, asset.arch))
 			throw new Error(`Native architecture mismatch: ${binary}`);
 		const digest = await sha256(binary);
-		if (spec.expectedSha256 && digest !== spec.expectedSha256)
+		if (digest !== RIPGREP_BINARY_SHA256[toolName])
 			throw new Error(`Runtime digest mismatch: ${binary}`);
 		copyFileSync(join(out, dir, "LICENSE-MIT"), join(out, "ripgrep-LICENSE-MIT.txt"));
 		console.log(`Verified ${asset.key}: ${binary} sha256=${digest}`);
 		records.push({
-			filename: spec.toolName,
+			filename: toolName,
 			platform: asset.key,
 			version: RIPGREP_VERSION,
 			sha256: digest,

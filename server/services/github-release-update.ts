@@ -24,6 +24,11 @@ import {
 	type UpdateIndexV1,
 } from "../../shared/update-index-types";
 import { logger } from "../lib/logger";
+import {
+	createUpdateFetchContext,
+	type UpdateFetchContext,
+	updateFetch,
+} from "../lib/net/update-fetch";
 import { isValidGitHubRepository } from "../lib/settings/update-source";
 import { planGithubReleasePatches } from "./github-release-patch-planner";
 import type { ReleaseInfo, UpdateCheckResult } from "./update-service";
@@ -144,7 +149,7 @@ export function validateGithubAssetUrl(
 export async function fetchGithubAsset(
 	url: string,
 	signal: AbortSignal,
-	fetcher: GithubFetch = (input, init) => fetch(input, init),
+	fetcher: GithubFetch = createUpdateFetchContext().fetch,
 ): Promise<Response> {
 	let current = url;
 	for (let redirects = 0; redirects <= 5; redirects++) {
@@ -455,12 +460,12 @@ export class GithubReleaseUpdater {
 		string,
 		{ etag: string; index: UpdateIndexV1; bytes: number }
 	>();
-	private cooldownUntil = 0;
+	private readonly cooldowns = new Map<string, number>();
 	private generation = 0;
 	private readonly latestGenerations = new Map<string, number>();
 
 	constructor(
-		private readonly fetcher: GithubFetch = (url, init) => fetch(url, init),
+		private readonly fetcher: GithubFetch = updateFetch,
 		private readonly now: () => number = Date.now,
 		private readonly budgets: {
 			requestTimeoutMs?: number;
@@ -471,30 +476,43 @@ export class GithubReleaseUpdater {
 
 	check(
 		input: CheckInput,
-		options: { force?: boolean; signal?: AbortSignal } = {},
+		options: { force?: boolean; signal?: AbortSignal; transport?: UpdateFetchContext } = {},
 	): Promise<UpdateCheckResult> {
-		// A cancellable caller cannot own (or cancel) another administrator's shared check.
-		if (options.signal) return this.performCheck(input, options.signal);
+		let transport: UpdateFetchContext;
+		try {
+			transport = options.transport ?? createUpdateFetchContext();
+		} catch {
+			return Promise.resolve({
+				updateAvailable: false,
+				currentVersion: input.currentVersion,
+				source: "github",
+				repository: input.repository,
+				errorCode: "INVALID_CONFIGURATION",
+				error: "The update proxy configuration is invalid",
+			});
+		}
+		// A cancellable caller cannot own another administrator's shared check.
+		if (options.signal) return this.performCheck(input, options.signal, transport);
 		const key = JSON.stringify([
 			input.repository.toLowerCase(),
 			input.channel,
 			input.platform,
 			input.currentVersion,
+			transport.key,
 		]);
 		const cached = this.checks.get(key);
 		if (!options.force && cached && cached.until > this.now())
 			return Promise.resolve(cached.result);
-		const active = this.inFlight.get(`${key}:${options.force === true}`);
-		if (active) return active;
 		const flightKey = `${key}:${options.force === true}`;
+		const active = this.inFlight.get(flightKey);
+		if (active) return active;
 		const generation = ++this.generation;
 		if (this.latestGenerations.size >= 32)
 			this.latestGenerations.delete(this.latestGenerations.keys().next().value ?? "");
 		this.latestGenerations.set(key, generation);
-		const result = this.performCheck(input)
+		const result = this.performCheck(input, undefined, transport)
 			.then((value) => {
-				// A slower pre-download check must not overwrite a newer forced result.
-				if (this.latestGenerations.get(key) !== generation) return value;
+				if (this.latestGenerations.get(key) !== generation || !transport.isCurrent()) return value;
 				if (this.checks.size >= 32) this.checks.delete(this.checks.keys().next().value ?? "");
 				this.checks.set(key, {
 					until: this.now() + (value.errorCode ? 30_000 : CACHE_MS),
@@ -512,13 +530,14 @@ export class GithubReleaseUpdater {
 		path: string,
 		signal: AbortSignal,
 		etag?: string,
+		fetcher: GithubFetch = this.fetcher,
 	): Promise<Response> {
 		if (!isGithubUpdateRepository(repository))
 			throw new GithubUpdateError("INVALID_CONFIGURATION", "Invalid GitHub repository");
 		const url = `https://raw.githubusercontent.com/${repository}/${UPDATE_INDEX_BRANCH}/${path}`;
 		// No token and no redirects: even another raw repository is a different authority.
 		const response = await abortable(
-			this.fetcher(url, {
+			fetcher(url, {
 				signal,
 				redirect: "error",
 				headers: etag ? { "If-None-Match": etag } : {},
@@ -535,6 +554,8 @@ export class GithubReleaseUpdater {
 	private async readIndex(
 		repository: string,
 		deadline: AbortSignal,
+		fetcher: GithubFetch,
+		transportKey: string,
 	): Promise<{ index: UpdateIndexV1; bytes: number } | null> {
 		const key = repository.toLowerCase();
 		const cached = this.indexCache.get(key);
@@ -542,13 +563,19 @@ export class GithubReleaseUpdater {
 			deadline,
 			AbortSignal.timeout(this.budgets.requestTimeoutMs ?? 10_000),
 		]);
-		const response = await this.fetchRaw(repository, UPDATE_INDEX_FILE, signal, cached?.etag);
+		const response = await this.fetchRaw(
+			repository,
+			UPDATE_INDEX_FILE,
+			signal,
+			cached?.etag,
+			fetcher,
+		);
 		try {
 			if (response.status === 404) {
 				this.indexCache.delete(key);
 				return null;
 			}
-			this.checkResponse(response);
+			this.checkResponse(response, transportKey);
 			if (response.status === 304) {
 				if (
 					!cached ||
@@ -592,7 +619,10 @@ export class GithubReleaseUpdater {
 			AbortSignal.timeout(this.budgets.requestTimeoutMs ?? 10_000),
 			...(cancellation ? [cancellation] : []),
 		]);
-		const data = await this.readIndex(identity.repository, signal);
+		const transport = createUpdateFetchContext();
+		const transportKey = transport.key;
+		const fetcher = this.fetcher === updateFetch ? transport.fetch : this.fetcher;
+		const data = await this.readIndex(identity.repository, signal, fetcher, transportKey);
 		const release = data?.index.releases.find((item) => item.version === request.version);
 		const binary = release?.files.find((item) => item.platform === identity.platform);
 		if (
@@ -607,9 +637,15 @@ export class GithubReleaseUpdater {
 			);
 		if (!release.notes) return { notes: null };
 		const descriptor = release.notes;
-		const response = await this.fetchRaw(identity.repository, descriptor.path, signal);
+		const response = await this.fetchRaw(
+			identity.repository,
+			descriptor.path,
+			signal,
+			undefined,
+			fetcher,
+		);
 		try {
-			this.checkResponse(response);
+			this.checkResponse(response, transportKey);
 			const json = await readBoundedJson(response, MAX_UPDATE_NOTES_BYTES, signal);
 			if (json.bytes !== descriptor.size || json.sha256 !== descriptor.sha256)
 				throw new GithubUpdateError("INVALID_METADATA", "Release notes checksum mismatch");
@@ -623,7 +659,7 @@ export class GithubReleaseUpdater {
 		}
 	}
 
-	private checkResponse(response: Response): void {
+	private checkResponse(response: Response, transportKey: string): void {
 		if (response.ok || response.status === 304) return;
 		if (response.status === 403 || response.status === 429) {
 			const retry = Number(response.headers.get("retry-after") ?? 0);
@@ -643,7 +679,9 @@ export class GithubReleaseUpdater {
 							: 0,
 					),
 				);
-				this.cooldownUntil = this.now() + seconds * 1000;
+				if (this.cooldowns.size >= 32)
+					this.cooldowns.delete(this.cooldowns.keys().next().value ?? "");
+				this.cooldowns.set(transportKey, this.now() + seconds * 1000);
 				throw new GithubUpdateError(
 					"RATE_LIMITED",
 					"GitHub update requests are rate limited",
@@ -667,6 +705,8 @@ export class GithubReleaseUpdater {
 		sha512: string,
 		deadline: AbortSignal,
 		usedBytes: number,
+		fetcher: GithubFetch,
+		transportKey: string,
 		index?: UpdateIndexV1,
 	): Promise<GithubPatchStep[] | undefined> {
 		const controller = new AbortController();
@@ -692,8 +732,8 @@ export class GithubReleaseUpdater {
 					if (!item || usedBytes + item.metadata.size > MAX_TOTAL_JSON_BYTES) continue;
 					let response: Response | undefined;
 					try {
-						response = await fetchGithubAsset(item.metadata.url, signal, this.fetcher);
-						this.checkResponse(response);
+						response = await fetchGithubAsset(item.metadata.url, signal, fetcher);
+						this.checkResponse(response, transportKey);
 						const json = await readBoundedJson(response, 64 * 1024, signal, consumeBytes);
 						if (
 							json.bytes !== item.metadata.size ||
@@ -760,7 +800,10 @@ export class GithubReleaseUpdater {
 	private async performCheck(
 		input: CheckInput,
 		cancellation?: AbortSignal,
+		transport: UpdateFetchContext = createUpdateFetchContext(),
 	): Promise<UpdateCheckResult> {
+		const transportKey = transport.key;
+		const fetcher = this.fetcher === updateFetch ? transport.fetch : this.fetcher;
 		const base: UpdateCheckResult = {
 			updateAvailable: false,
 			currentVersion: input.currentVersion,
@@ -775,13 +818,14 @@ export class GithubReleaseUpdater {
 			deadline.throwIfAborted();
 			if (!isGithubUpdateRepository(input.repository))
 				throw new GithubUpdateError("INVALID_CONFIGURATION", "Invalid GitHub repository");
-			if (this.cooldownUntil > this.now())
+			const cooldownUntil = this.cooldowns.get(transportKey) ?? 0;
+			if (cooldownUntil > this.now())
 				throw new GithubUpdateError(
 					"RATE_LIMITED",
 					"GitHub update requests are cooling down",
-					Math.ceil((this.cooldownUntil - this.now()) / 1000),
+					Math.ceil((cooldownUntil - this.now()) / 1000),
 				);
-			const catalog = await this.readIndex(input.repository, deadline);
+			const catalog = await this.readIndex(input.repository, deadline, fetcher, transportKey);
 			const index = catalog?.index;
 			const releases: unknown[] = index
 				? indexReleases(index, input.platform, input.repository)
@@ -795,7 +839,7 @@ export class GithubReleaseUpdater {
 					AbortSignal.timeout(this.budgets.requestTimeoutMs ?? 10_000),
 				]);
 				const response = await abortable(
-					this.fetcher(url, {
+					fetcher(url, {
 						signal,
 						redirect: "error",
 						headers: {
@@ -808,7 +852,7 @@ export class GithubReleaseUpdater {
 				);
 				let data: { value: unknown; bytes: number; next: boolean };
 				try {
-					this.checkResponse(response);
+					this.checkResponse(response, transportKey);
 					if (response.status === 304) {
 						if (!cached) throw new GithubUpdateError("INVALID_METADATA", "Unexpected 304 response");
 						data = cached;
@@ -863,10 +907,10 @@ export class GithubReleaseUpdater {
 				deadline,
 				AbortSignal.timeout(this.budgets.requestTimeoutMs ?? 10_000),
 			]);
-			const response = await fetchGithubAsset(candidate.metadata.url, metadataSignal, this.fetcher);
+			const response = await fetchGithubAsset(candidate.metadata.url, metadataSignal, fetcher);
 			let metadata: unknown;
 			try {
-				this.checkResponse(response);
+				this.checkResponse(response, transportKey);
 				const json = await readBoundedJson(response, 64 * 1024, metadataSignal);
 				if (
 					json.bytes !== candidate.metadata.size ||
@@ -912,6 +956,8 @@ export class GithubReleaseUpdater {
 				metadata.sha512,
 				deadline,
 				totalBytes,
+				fetcher,
+				transportKey,
 				index,
 			);
 			deadline.throwIfAborted();

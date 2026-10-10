@@ -2,9 +2,17 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { getCliHelperSpec } from "../../../server/lib/helper-binary-platform";
+import { getHelperAssetName, type HelperPlatform } from "../../../shared/helper-distribution";
 import { RIPGREP_ASSETS, verifyRipgrepArchitecture } from "../../prepare-ripgrep-helpers";
 import { downloadHelperAsset, sha256 } from "../helper-assets";
+import {
+	assertHelperToolVersion,
+	helperBuildEnvironment,
+	helperContainerProxyArgs,
+	prepareZstdHelper,
+	ZSTD_LINUX_IMAGE,
+	ZSTD_SOURCE_SHA256,
+} from "../helper-build";
 import { windowsArm64ZstdCommand } from "../zstd-windows-arm64";
 
 const dir = mkdtempSync(join(tmpdir(), "nf-helper-assets-"));
@@ -22,7 +30,9 @@ describe("ripgrep release acquisition coverage", () => {
 		]);
 		expect(
 			new Set(
-				RIPGREP_ASSETS.map((asset) => getCliHelperSpec("rg", asset.platform, asset.arch)?.toolName),
+				RIPGREP_ASSETS.map((asset) =>
+					getHelperAssetName("rg", asset.key.replace(/^win-/, "windows-") as HelperPlatform),
+				),
 			).size,
 		).toBe(6);
 		for (const asset of RIPGREP_ASSETS) expect(asset.sha256).toMatch(/^[a-f0-9]{64}$/);
@@ -85,56 +95,66 @@ describe("repeatable native zstd cross-build", () => {
 	});
 });
 
-describe("Linux zstd build isolation", () => {
-	function runBuild(target: "x64" | "arm64", overrides: Record<string, string> = {}) {
-		const root = mkdtempSync(join(dir, "linux-build-"));
-		const bin = join(root, "bin");
-		mkdirSync(bin);
-		mkdirSync(join(root, "scripts"));
-		const script = join(root, "scripts", "build-zstd-static.sh");
-		writeFileSync(script, readFileSync(new URL("../../build-zstd-static.sh", import.meta.url)));
-		const stub = (name: string, body: string) =>
-			writeFileSync(join(bin, name), `#!/bin/sh\n${body}\n`, { mode: 0o755 });
-		stub("podman", 'printf "%s\\0" "$@" > "$NF_PODMAN_ARGS"');
-		for (const name of ["ls", "apk", "curl", "tar", "make", "chmod", "aarch64-linux-musl-gcc"])
-			stub(name, "exit 0");
-		stub("nproc", "printf '1\\n'");
-		stub("file", 'printf "%s\\n" "$NF_TEST_ELF"');
-		stub("cp", 'printf "%s\\n" "$@" > "$NF_COPIED"');
-		const env: Record<string, string | undefined> = { ...process.env };
-		for (const name of [
-			"http_proxy",
-			"https_proxy",
-			"HTTP_PROXY",
-			"HTTPS_PROXY",
-			"no_proxy",
-			"NO_PROXY",
-			"ZSTD_BUILD_PROXY",
-		])
-			delete env[name];
-		Object.assign(env, {
-			PATH: `${bin}:${process.env.PATH}`,
-			NF_PODMAN_ARGS: join(root, "podman-args"),
-			NF_COPIED: join(root, "copied"),
-			...overrides,
-		});
-		const result = Bun.spawnSync(["bash", script, target], { env, timeout: 5_000 });
-		expect(result.exitCode).toBe(0);
-		const args = readFileSync(join(root, "podman-args"), "utf8").split("\0").slice(0, -1);
-		return { root, env, args };
-	}
+describe("native helper version output", () => {
+	test("accepts ripgrep's plain version and zstd's v-prefixed native version", () => {
+		assertHelperToolVersion("rg", "ripgrep 15.1.0\nfeatures:+pcre2\n");
+		assertHelperToolVersion("zstd", "*** Zstandard CLI (64-bit) v1.5.7, by Yann Collet ***\n");
+		expect(() => assertHelperToolVersion("rg", "ripgrep 14.1.1\n")).toThrow();
+		expect(() =>
+			assertHelperToolVersion("zstd", "*** Zstandard CLI (64-bit) v1.5.6, by Yann Collet ***\n"),
+		).toThrow();
+	});
+});
 
-	test("both Linux targets pin the compiler container to amd64 without a private proxy", () => {
+describe("Linux zstd build isolation", () => {
+	async function runBuild(target: "x64" | "arm64", binaryArch: "x64" | "arm64" = target) {
+		const root = mkdtempSync(join(dir, "linux-build-"));
+		const cache = join(root, "cache");
+		const output = join(root, "output");
+		const commands: string[][] = [];
+		const acquired: string[] = [];
+		const operation = prepareZstdHelper(`linux-${target}`, cache, output, {
+			download: async (_out, _name, url, expected) => {
+				acquired.push(url, expected);
+				return "fixture-archive";
+			},
+			run: async (_cwd, command) => {
+				commands.push(command);
+				if (command[0] !== "podman" && command[0] !== "docker") return;
+				const programs = join(cache, "zstd-1.5.7", "programs");
+				mkdirSync(programs, { recursive: true });
+				const header = Buffer.alloc(32);
+				header.writeUInt32LE(0x464c457f, 0);
+				header[4] = 2;
+				header[5] = 1;
+				header.writeUInt16LE(binaryArch === "arm64" ? 183 : 62, 18);
+				writeFileSync(join(programs, "zstd"), header);
+			},
+		});
+		return { operation, output, commands, acquired };
+	}
+	test("both native Linux targets use a fixed image/source/toolchain instead of unverified cross packages", async () => {
 		for (const target of ["x64", "arm64"] as const) {
-			const { args } = runBuild(target);
-			expect(args[args.indexOf("--platform") + 1]).toBe("linux/amd64");
-			expect(args.some((arg) => /^(http|https)_proxy=|^(HTTP|HTTPS)_PROXY=/.test(arg))).toBe(false);
-			expect(args.join(" ")).not.toContain("10.126.126.111");
+			const build = await runBuild(target);
+			await build.operation;
+			const args = build.commands.find(
+				(command) => command[0] === "podman" || command[0] === "docker",
+			) as string[];
+			expect(args[args.indexOf("--platform") + 1]).toBe(
+				target === "x64" ? "linux/amd64" : "linux/arm64",
+			);
+			expect(args).toContain(ZSTD_LINUX_IMAGE);
+			expect(args.join(" ")).toContain("gcc=14.2.0-r6");
+			expect(args.join(" ")).not.toContain("musl.cc");
+			expect(args.join(" ")).not.toContain("-march=native");
+			expect(build.acquired).toEqual([
+				"https://github.com/facebook/zstd/releases/download/v1.5.7/zstd-1.5.7.tar.gz",
+				ZSTD_SOURCE_SHA256,
+			]);
 		}
 	});
-
 	test("inherits per-protocol proxies and bypass settings from the caller", () => {
-		const { args } = runBuild("x64", {
+		const args = helperContainerProxyArgs({
 			http_proxy: "http://caller:8080",
 			HTTPS_PROXY: "http://secure:8443",
 			NO_PROXY: "localhost,.internal",
@@ -143,45 +163,30 @@ describe("Linux zstd build isolation", () => {
 		expect(args).toContain("HTTPS_PROXY=http://secure:8443");
 		expect(args).toContain("NO_PROXY=localhost,.internal");
 	});
-
-	test("explicit proxy override accepts a URL or an empty direct-connection value", () => {
+	test("explicit proxy override applies to source acquisition and compiler containers, including empty direct", () => {
 		for (const value of ["http://override:9000", ""]) {
-			const { args } = runBuild("x64", {
-				http_proxy: "http://caller:8080",
-				ZSTD_BUILD_PROXY: value,
-			});
+			const env = { http_proxy: "http://caller:8080", ZSTD_BUILD_PROXY: value };
+			const args = helperContainerProxyArgs(env);
+			const downloadEnv = helperBuildEnvironment(env);
 			for (const name of ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY"]) {
-				const values = args.filter((arg) => arg.startsWith(`${name}=`));
-				expect(values.at(-1)).toBe(`${name}=${value}`);
+				expect(args).toContain(`${name}=${value}`);
+				expect(downloadEnv[name]).toBe(value);
 			}
+		}
+		expect(helperContainerProxyArgs({})).toEqual([]);
+	});
+	test("rejects wrong-architecture ELF before copying a labelled artifact", async () => {
+		for (const target of ["x64", "arm64"] as const) {
+			const build = await runBuild(target, target === "x64" ? "arm64" : "x64");
+			await expect(build.operation).rejects.toThrow("architecture mismatch");
+			expect(() => readFileSync(join(build.output, `zstd-linux-${target}`))).toThrow();
 		}
 	});
-
-	test("rejects wrong-architecture ELF before copying a labelled artifact", () => {
-		for (const target of ["x64", "arm64"] as const) {
-			const { root, env, args } = runBuild(target);
-			const programs = join(root, "zstd-1.5.7", "programs");
-			mkdirSync(programs, { recursive: true });
-			writeFileSync(join(programs, "zstd"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
-			const command = args[args.indexOf("-c") + 1];
-			for (const arch of ["x86-64", "ARM aarch64"]) {
-				rmSync(join(root, "copied"), { force: true });
-				const result = Bun.spawnSync(["sh", "-c", command], {
-					cwd: root,
-					env: { ...env, NF_TEST_ELF: `ELF 64-bit LSB executable, ${arch}, statically linked` },
-					timeout: 5_000,
-				});
-				const valid = arch === (target === "x64" ? "x86-64" : "ARM aarch64");
-				expect(result.exitCode).toBe(valid ? 0 : 1);
-				if (valid) {
-					expect(readFileSync(join(root, "copied"), "utf8")).toContain(
-						`/output/zstd-linux-${target}`,
-					);
-				} else {
-					expect(() => readFileSync(join(root, "copied"))).toThrow();
-				}
-			}
-		}
+	test("shell entry delegates into isolated output/cache and never writes vendor/dist", () => {
+		const script = readFileSync(new URL("../../build-zstd-static.sh", import.meta.url), "utf8");
+		expect(script).toContain("prepare-helper-assets.ts");
+		expect(script).toContain(".helper-release/local");
+		expect(script).not.toContain("vendor/zstd");
 	});
 });
 

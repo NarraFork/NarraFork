@@ -54,6 +54,10 @@ scripts/lib/*
 !scripts/lib/github-release-summary.ts
 !scripts/lib/build-repository.ts
 !scripts/lib/update-index*.ts
+# Protected CI update-server bridge and immutable mirror restoration.
+!scripts/lib/update-server-bridge-*.ts
+!scripts/lib/update-server-*-mirror.ts
+!scripts/lib/ci-update-server-bridge-*.ts
 .ci-release/
 # Imported by scripts/release.ts and tests/scripts/stable-baseline-patch*.test.ts, so it has
 # to be in the repo or both the release script and `bun test` break in a fresh clone.
@@ -67,6 +71,13 @@ scripts/lib/*
 !scripts/prepare-ripgrep-helpers.ts
 !scripts/build-zstd-static.sh
 !scripts/lib/helper-assets.ts
+!scripts/prepare-helper-assets.ts
+!scripts/release-helpers.ts
+!scripts/lib/helper-build.ts
+!scripts/lib/helper-artifact.ts
+!scripts/lib/helper-release.ts
+!scripts/lib/helper-release-control.ts
+.helper-release/
 !scripts/lib/zstd-windows-arm64.ts
 !scripts/lib/executor-manifest.ts
 !scripts/lib/__tests__/

@@ -30,9 +30,12 @@ import { X509Certificate } from "node:crypto";
 import {
 	type ExecutorPlatform,
 	executorInstalledFilename,
+	executorPublishedFilename,
 	getExecutorPlatformInfo,
 } from "@shared/remote-executor";
+import { DEVICE_PROTOCOL_VERSION } from "./agent/execution/rpc-types";
 import { ValidationError } from "./errors";
+import { APP_VERSION } from "./version";
 
 export type ExecutorInstallMode = "system" | "user";
 
@@ -65,6 +68,7 @@ export interface ExecutorInstallScriptInput {
 	/** Lowercase hex SHA-256 the script verifies before installing. */
 	expectedSha256: string;
 	executorVersion: string;
+	executorProtocolVersion?: number;
 	/**
 	 * Enrollment ticket. Authorizes the binary fetch, and — only when the ticket
 	 * was issued with token delivery enabled — the key exchange.
@@ -310,6 +314,15 @@ interface ResolvedInput extends ExecutorInstallScriptInput {
 }
 
 function resolvePaths(input: ExecutorInstallScriptInput): ResolvedInput {
+	if (
+		input.executorVersion !== APP_VERSION ||
+		(input.executorProtocolVersion ?? DEVICE_PROTOCOL_VERSION) !== DEVICE_PROTOCOL_VERSION ||
+		input.artifactFilename !== executorPublishedFilename(input.executorVersion, input.platform)
+	) {
+		throw new ValidationError(
+			"Executor version/protocol/artifact does not match this NarraFork build",
+		);
+	}
 	const info = getExecutorPlatformInfo(input.platform);
 	const serverBaseUrl = validateUrl("Server URL", input.serverBaseUrl, ["http:", "https:"]);
 	const deviceWsUrl = validateUrl("Device WebSocket URL", input.deviceWsUrl, ["ws:", "wss:"]);

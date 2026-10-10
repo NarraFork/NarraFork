@@ -11,6 +11,7 @@ import { createHash } from "node:crypto";
 import { createReadStream } from "node:fs";
 import { open, readFile, writeFile } from "node:fs/promises";
 import { zstdDecompress, zstdDecompressSync } from "node:zlib";
+import { updateServerChildEnvironment } from "../../shared/update-server-child-env";
 
 /** Default block size: 64KB (same as electron-builder) */
 export const DEFAULT_BLOCK_SIZE = 64 * 1024;
@@ -202,7 +203,7 @@ function tryZstdCliPatchFrom(oldBuf: Buffer, newBuf: Buffer, level: number): Buf
 				"--force",
 				"--long=31",
 			],
-			{ stdout: "pipe", stderr: "pipe" },
+			{ stdout: "pipe", stderr: "pipe", env: updateServerChildEnvironment() },
 		);
 
 		if (result.exitCode !== 0) {
@@ -405,7 +406,12 @@ async function runZstdCliDecompress(options: ApplyZstdPatchToFileOptions): Promi
 				"--long=31",
 				"--memory=2048MB",
 			],
-			{ stdin: "ignore", stdout: "pipe", stderr: "pipe" },
+			{
+				stdin: "ignore",
+				stdout: "pipe",
+				stderr: "pipe",
+				env: updateServerChildEnvironment(),
+			},
 		);
 		deadline.addEventListener("abort", onAbort, { once: true });
 		const stderr = readCappedStream(proc.stderr).catch(() => new Uint8Array());
@@ -473,7 +479,12 @@ async function runZstdCli(
 	const timeoutMs = Math.max(1, options.timeoutMs ?? DEFAULT_CLI_TIMEOUT_MS);
 	options.signal?.throwIfAborted();
 
-	const proc = Bun.spawn(command, { stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+	const proc = Bun.spawn(command, {
+		stdin: "ignore",
+		stdout: "pipe",
+		stderr: "pipe",
+		env: updateServerChildEnvironment(),
+	});
 
 	let timedOut = false;
 	const timer = setTimeout(() => {
@@ -622,7 +633,7 @@ function applyZstdCliPatch(
 	try {
 		const result = Bun.spawnSync(
 			[zstdBin, "-d", `--patch-from=${oldPath}`, patchPath, "-o", outPath, "--force", "--long=31"],
-			{ stdout: "pipe", stderr: "pipe" },
+			{ stdout: "pipe", stderr: "pipe", env: updateServerChildEnvironment() },
 		);
 
 		if (result.exitCode !== 0) {

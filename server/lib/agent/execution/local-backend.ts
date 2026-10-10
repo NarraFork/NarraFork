@@ -587,7 +587,9 @@ export class LocalBackend implements ExecutionBackend {
 	}
 
 	async grep(params: GrepParams): Promise<GrepResult> {
-		const rgPath = await resolveRgPath();
+		params.signal?.throwIfAborted();
+		const rgPath = await resolveRgPath(params.signal);
+		params.signal?.throwIfAborted();
 		if (rgPath) {
 			const rgArgs = buildRipgrepArgv(rgPath, params);
 			return this.runSearchProcess(rgArgs, params, { usedFallback: false });

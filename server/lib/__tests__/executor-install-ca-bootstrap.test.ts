@@ -3,13 +3,14 @@ import { createHash } from "node:crypto";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readdir, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { EXECUTOR_PLATFORMS } from "@shared/remote-executor";
+import { EXECUTOR_PLATFORMS, executorPublishedFilename } from "@shared/remote-executor";
 import { generate } from "selfsigned";
 import {
 	buildExecutorInstallOneLiner,
 	buildExecutorInstallScript,
 	type ExecutorInstallScriptInput,
 } from "../executor-install-script";
+import { APP_VERSION } from "../version";
 
 // Bootstrap and a sandboxed installer prefix execute; service setup is never run.
 // Fixtures and HOME/TMPDIR stay under this test directory; no real device or service is touched.
@@ -164,9 +165,9 @@ function input(overrides: Partial<ExecutorInstallScriptInput> = {}): ExecutorIns
 		deviceName: "CA bootstrap fixture",
 		connectionMode: "reverse",
 		disableShell: false,
-		artifactFilename: "narrafork-executor-fixture",
+		artifactFilename: executorPublishedFilename(APP_VERSION, overrides.platform ?? "linux-amd64"),
 		expectedSha256: "a".repeat(64),
-		executorVersion: "0.0.0",
+		executorVersion: APP_VERSION,
 		ticket: TICKET,
 		tokenDelivery: "enroll",
 		caCertPem: trusted.cert,

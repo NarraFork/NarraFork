@@ -21,6 +21,9 @@ import {
 
 const originalFetch = globalThis.fetch;
 let requested: string[] = [];
+let requestOptions: (RequestInit & { proxy?: string })[] = [];
+const originalProxy = structuredClone(settings.proxy);
+const originalUpdate = structuredClone(settings.update);
 const version = `${Number(APP_VERSION.split(".")[0]) + 1}.0.0`;
 const payload = Buffer.from("integration test binary (never executed)");
 const sha512 = createHash("sha512").update(payload).digest("base64");
@@ -101,6 +104,7 @@ function installFetch(handler: (url: string) => Response | Promise<Response>) {
 		async (...args: Parameters<typeof fetch>) => {
 			const url = String(args[0]);
 			requested.push(url);
+			requestOptions.push(args[1] ?? {});
 			// Legacy fixtures explicitly advertise that the new metadata branch is absent.
 			if (url.startsWith("https://raw.githubusercontent.com/"))
 				return new Response(null, { status: 404 });
@@ -111,10 +115,13 @@ function installFetch(handler: (url: string) => Response | Promise<Response>) {
 }
 beforeEach(() => {
 	requested = [];
+	requestOptions = [];
 	resetUpdateCoordinationForTests();
 });
 afterEach(() => {
 	globalThis.fetch = originalFetch;
+	settings.proxy = structuredClone(originalProxy);
+	settings.update = structuredClone(originalUpdate);
 	resetUpdateCoordinationForTests();
 });
 
@@ -158,6 +165,44 @@ describe("release notes source snapshots", () => {
 });
 
 describe("selected update source integration", () => {
+	test.each([
+		undefined,
+		{ mode: "default" as const },
+	])("legacy update detection inherits global proxy with override %j and proxy edits preserve provenance", async (proxy) => {
+		const serverUrl = "https://updates.proxy-fixture.example";
+		settings.proxy = { mode: "custom", url: "http://global.proxy-fixture.example:8080" };
+		settings.update = {
+			source: "update-server",
+			serverUrl,
+			product: "private-product",
+			channel: "stable",
+			checkIntervalMinutes: 60,
+			autoDownload: false,
+			proxy,
+		};
+		const identity = getCurrentUpdateSourceIdentity();
+		installFetch((url) => {
+			expect(url).toContain(`${serverUrl}/api/v2/products/private-product/releases/latest`);
+			return Response.json({
+				updateAvailable: true,
+				version,
+				releaseDate: "2026-10-06",
+				file: { filename, size: payload.length, sha512 },
+			});
+		});
+		const checked = await checkForUpdate({ force: true });
+		expect(checked.releaseInfo?.sourceIdentity).toEqual(identity ?? undefined);
+		expect(requestOptions[0]?.proxy).toBe("http://global.proxy-fixture.example:8080/");
+		if (!checked.releaseInfo) throw new Error("Expected legacy update descriptor");
+		settings.update.proxy = { mode: "custom", url: "http://dedicated.proxy-fixture.example:3128" };
+		const after = await checkForUpdate({ force: true });
+		expect(requestOptions[1]?.proxy).toBe("http://dedicated.proxy-fixture.example:3128/");
+		expect(after.releaseInfo?.sourceIdentity).toEqual(identity ?? undefined);
+		expect(getCurrentUpdateSourceIdentity()).toEqual(identity);
+		expect(isUpdateSourceCurrent(checked.releaseInfo)).toBe(true);
+		expect(requested.every((url) => url.startsWith(serverUrl))).toBe(true);
+	});
+
 	test("beta-to-stable change during forced GitHub detection refuses the captured result", async () => {
 		const update = selectGithub();
 		update.channel = "beta";

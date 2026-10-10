@@ -8,10 +8,12 @@ import { APP_VERSION } from "../../lib/version";
 import {
 	getUpdateCoordinationStatus,
 	resetUpdateCoordinationForTests,
+	scheduleUpdate,
 } from "../update-coordinator";
 import {
 	__resetVerifiedDigestCacheForTests,
 	applyUpdate,
+	getCurrentUpdateSourceIdentity,
 	getUpdateDirectory,
 	getUpdateStatus,
 } from "../update-service";
@@ -20,6 +22,7 @@ const updateDir = getUpdateDirectory();
 const metadataPath = join(updateDir, "placed-update.json");
 const version = "77.0.0";
 const originalSettings = structuredClone(settings.update);
+const originalProxy = structuredClone(settings.proxy);
 const source: UpdateSourceIdentity = {
 	source: "github",
 	repository: "fixture/original",
@@ -85,12 +88,54 @@ beforeEach(() => {
 afterEach(() => {
 	assertIsolatedUpdateDirectory();
 	settings.update = structuredClone(originalSettings);
+	settings.proxy = structuredClone(originalProxy);
 	resetUpdateCoordinationForTests();
 	__resetVerifiedDigestCacheForTests();
 	rmSync(updateDir, { recursive: true, force: true });
 });
 
 describe("verified prepared update identity", () => {
+	test.each([
+		"github",
+		"update-server",
+	] as const)("%s proxy-only edits preserve source identity, prepared selector and scheduled operation", async (selectedSource) => {
+		settings.proxy = { mode: "custom", url: "http://global.fixture.example:8080" };
+		settings.update = {
+			...originalSettings,
+			source: selectedSource,
+			githubRepository: "fixture/original",
+			serverUrl: "https://updates.fixture.example",
+			product: "narrafork",
+			channel: "stable",
+			checkIntervalMinutes: 60,
+			autoDownload: false,
+			proxy: { mode: "default" },
+		};
+		const sourceIdentity = getCurrentUpdateSourceIdentity();
+		if (!sourceIdentity) throw new Error("Expected selected source identity");
+		writePrepared({ sourceIdentity });
+		const prepared = await preparedIdentity();
+		const metadata = readFileSync(metadataPath, "utf8");
+		const scheduled = scheduleUpdate(version);
+		for (const proxy of [
+			{ mode: "direct" as const },
+			{ mode: "system" as const },
+			{ mode: "custom" as const, url: "http://user:secret@dedicated.fixture.example:3128" },
+			{ mode: "default" as const },
+		]) {
+			settings.update.proxy = proxy;
+			settings.proxy = { mode: "custom", url: "http://changed-global.fixture.example:8081" };
+			expect(getCurrentUpdateSourceIdentity()).toEqual(sourceIdentity);
+			expect(await preparedIdentity()).toEqual(prepared);
+			expect(readFileSync(metadataPath, "utf8")).toBe(metadata);
+			expect(getUpdateCoordinationStatus()).toMatchObject({
+				scheduled: true,
+				updateEpoch: scheduled.updateEpoch,
+				targetVersion: version,
+			});
+		}
+	});
+
 	test("ready status returns a stable identity bound to verified metadata", async () => {
 		const info = writePrepared();
 		const identity = await preparedIdentity();

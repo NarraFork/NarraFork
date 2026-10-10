@@ -11,30 +11,64 @@
  * only the executor's connection attempt on a remote machine ever revealed it.
  */
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { EXECUTOR_MANIFEST_FILENAME, executorPublishedFilename } from "@shared/remote-executor";
 import { inArray } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../../db";
 import { remoteDevices } from "../../db/schema";
 import { buildAppErrorResponse } from "../../lib/app-error-response";
-import { getExecutorManifest } from "../../lib/executor-binaries";
+import { getExecutorManifest, resetExecutorManifestCache } from "../../lib/executor-binaries";
+import { APP_VERSION } from "../../lib/version";
+
+const originalFetch = globalThis.fetch;
+const originalUpdate = settings.update ?? {
+	serverUrl: "https://legacy.example",
+	product: "narrafork",
+	channel: "stable" as const,
+	checkIntervalMinutes: 60,
+	autoDownload: false,
+};
+
 import { resetExecutorTickets } from "../../lib/executor-bootstrap-ticket";
 import { generateId } from "../../lib/id";
 import { settings } from "../../lib/settings";
 import { deviceRoutes } from "../devices";
 
 const created: string[] = [];
-let manifestAvailable = false;
 let originalAllowPlaintext: boolean | undefined;
 
 beforeEach(async () => {
 	resetExecutorTickets();
 	originalAllowPlaintext = settings.devices?.allowPlaintextEnrollmentOnPrivateNetwork;
-	// These tests describe URL composition, not release plumbing. Without a published
-	// executor the endpoint legitimately refuses, so skip rather than assert nonsense.
-	manifestAvailable = !!(await getExecutorManifest())?.platforms["linux-amd64"];
+	settings.update = {
+		...originalUpdate,
+		source: "update-server",
+		serverUrl: "https://fixture.example",
+		proxy: { mode: "direct" },
+	};
+	resetExecutorManifestCache();
+	globalThis.fetch = (async (url: RequestInfo | URL) =>
+		String(url).endsWith(EXECUTOR_MANIFEST_FILENAME)
+			? Response.json({
+					version: APP_VERSION,
+					protocolVersion: 1,
+					releasedAt: "2026-01-01T00:00:00Z",
+					platforms: {
+						"linux-amd64": {
+							filename: executorPublishedFilename(APP_VERSION, "linux-amd64"),
+							size: 256,
+							sha256: "a".repeat(64),
+						},
+					},
+				})
+			: new Response(null, { status: 404 })) as typeof fetch;
+	expect((await getExecutorManifest())?.platforms["linux-amd64"]).toBeTruthy();
 });
 
 afterEach(async () => {
+	globalThis.fetch = originalFetch;
+	settings.update = originalUpdate;
+	resetExecutorManifestCache();
 	if (settings.devices) {
 		settings.devices.allowPlaintextEnrollmentOnPrivateNetwork = originalAllowPlaintext;
 	}
@@ -102,8 +136,13 @@ async function generate(deviceId: string, options: GenerateOptions = {}) {
 }
 
 describe("server URL composition", () => {
+	test("an unsupported release platform stays a client validation error", async () => {
+		const id = await makeDevice();
+		const response = await generate(id, { body: { platform: "windows-arm64" } });
+		expect(response.status).toBe(400);
+		expect((await response.json()).error).toContain("does not publish a build");
+	});
 	test("an explicit base URL is what lands in the command", async () => {
-		if (!manifestAvailable) return;
 		const id = await makeDevice();
 		const response = await generate(id, {
 			body: { serverBaseUrl: "https://nf.example.com" },
@@ -121,7 +160,6 @@ describe("server URL composition", () => {
 	});
 
 	test("the forwarded public origin is used behind a trusted proxy", async () => {
-		if (!manifestAvailable) return;
 		const id = await makeDevice();
 		const response = await generate(id, {
 			// Exactly the deployment that produced the original bug: nginx forwards to
@@ -138,7 +176,6 @@ describe("server URL composition", () => {
 	});
 
 	test("a trailing slash does not produce a doubled path separator", async () => {
-		if (!manifestAvailable) return;
 		const id = await makeDevice();
 		const result = await (
 			await generate(id, { body: { serverBaseUrl: "https://nf.example.com/" } })
@@ -149,7 +186,6 @@ describe("server URL composition", () => {
 
 describe("the one-liner shape", () => {
 	test("unix commands use command substitution, not a pipe into sh", async () => {
-		if (!manifestAvailable) return;
 		/*
 		 * A pipe puts the script on stdin; system-mode installs run sudo, which then
 		 * falls back to /dev/tty and fails wherever there is no controlling terminal.
@@ -166,7 +202,6 @@ describe("the one-liner shape", () => {
 
 describe("token delivery gating", () => {
 	test("enroll is the default", async () => {
-		if (!manifestAvailable) return;
 		const id = await makeDevice();
 		const result = await (
 			await generate(id, { body: { serverBaseUrl: "https://nf.example.com" } })
@@ -176,7 +211,6 @@ describe("token delivery gating", () => {
 	});
 
 	test("enroll over plaintext http on a public host is refused with a remedy", async () => {
-		if (!manifestAvailable) return;
 		// Refused while the operator is still in the UI, where https, the setting, or
 		// manual entry are all actionable — rather than mid-install on the target.
 		const id = await makeDevice();
@@ -188,7 +222,6 @@ describe("token delivery gating", () => {
 	});
 
 	test("prompt delivery works over plaintext http, since it carries no key", async () => {
-		if (!manifestAvailable) return;
 		const id = await makeDevice();
 		const response = await generate(id, {
 			body: { serverBaseUrl: "http://nf.example.com", tokenDelivery: "prompt" },
@@ -201,7 +234,6 @@ describe("token delivery gating", () => {
 	});
 
 	test("enroll over plaintext http on a private network follows the setting", async () => {
-		if (!manifestAvailable) return;
 		const id = await makeDevice();
 		if (settings.devices) {
 			settings.devices.allowPlaintextEnrollmentOnPrivateNetwork = false;
@@ -229,7 +261,6 @@ describe("token delivery gating", () => {
 
 describe("the generated command is self-serving", () => {
 	test("the script URL it advertises actually returns the script", async () => {
-		if (!manifestAvailable) return;
 		// The endpoint mints a ticket and attaches the rendered body to it. If that
 		// attachment were missed, the command would 403 on the target machine while the
 		// UI looked perfectly fine.

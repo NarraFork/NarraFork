@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process";
 import { z } from "zod";
 import { isValidGitHubRepository } from "../../shared/github-repository";
 import { compareReleaseVersions, isValidReleaseVersion } from "../../shared/release-version";
+import { updateServerChildEnvironment } from "../../shared/update-server-child-env";
 import {
 	CI_RELEASE_BUN,
 	CI_RELEASE_REPOSITORY,
@@ -101,7 +102,11 @@ export function ciGhRunner(env: NodeJS.ProcessEnv = process.env): GhRunner {
 				timeout: CI_API_TIMEOUT_MS,
 				maxBuffer: CI_API_MAX_BYTES,
 				stdio: ["ignore", "pipe", "pipe"],
-				env: { ...env, GH_HOST: "github.com", GH_PROMPT_DISABLED: "1" },
+				env: {
+					...updateServerChildEnvironment(env),
+					GH_HOST: "github.com",
+					GH_PROMPT_DISABLED: "1",
+				},
 			});
 		} catch (error) {
 			const detail = error as { stderr?: string | Buffer; message?: string };

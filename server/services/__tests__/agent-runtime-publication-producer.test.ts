@@ -380,7 +380,36 @@ describe("real task producers use publication outbox", () => {
 	});
 
 	test("quota rejection happens before creating a new task or consuming arrival sequence", async () => {
-		for (let i = 0; i < L.publicationRecipientSlots; i++) await startBash(`reserved-${i}`);
+		// Build the quota fixture through the real reservation primitive in one transaction.
+		// Repeating unrelated list broadcasts 1,000 times made setup consume the test deadline.
+		const startedAt = new Date().toISOString();
+		db.transaction((tx) => {
+			for (let i = 0; i < L.publicationRecipientSlots - 1; i++) {
+				const id = `reserved-${i}`;
+				const run = publisher.newBashRun(id, "parent");
+				publisher.reserve(run, tx);
+				tx.insert(backgroundTasks)
+					.values({
+						id,
+						parentNarratorId: "parent",
+						logicalRunId: run.logicalRunId,
+						type: "bash",
+						status: "running",
+						command: "true",
+						startedAt,
+						createdAt: startedAt,
+						updatedAt: startedAt,
+					})
+					.run();
+			}
+		});
+		await startBash("reserved-last");
+		expect(db.select({ id: backgroundTasks.id }).from(backgroundTasks).all()).toHaveLength(
+			L.publicationRecipientSlots,
+		);
+		expect(
+			db.select({ id: runtimePublicationOutbox.id }).from(runtimePublicationOutbox).all(),
+		).toHaveLength(L.publicationRecipientSlots);
 		expect(
 			db
 				.select({ inboxSequence: narrators.inboxSequence })
@@ -390,5 +419,18 @@ describe("real task producers use publication outbox", () => {
 		).toBe(0);
 		await expect(startBash("rejected")).rejects.toThrow("publication capacity");
 		expect(await tasks.getById("rejected")).toBeNull();
+		expect(db.select({ id: backgroundTasks.id }).from(backgroundTasks).all()).toHaveLength(
+			L.publicationRecipientSlots,
+		);
+		expect(
+			db.select({ id: runtimePublicationOutbox.id }).from(runtimePublicationOutbox).all(),
+		).toHaveLength(L.publicationRecipientSlots);
+		expect(
+			db
+				.select({ inboxSequence: narrators.inboxSequence })
+				.from(narrators)
+				.where(eq(narrators.id, "parent"))
+				.get()?.inboxSequence,
+		).toBe(0);
 	});
 });

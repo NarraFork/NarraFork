@@ -87,7 +87,11 @@ const unrelated = mock((..._args: unknown[]) => {
 
 // Only side effects and remote trust seams are mocked. The controller, argument parser,
 // plan-file read, mergeUpdateIndex, writeIndexPreview and filesystem writes stay real.
+const originalPlan = await import("../../scripts/lib/ci-release-plan");
+const originalGithub = await import("../../scripts/lib/github-release");
+const originalBaselines = await import("../../scripts/lib/github-release-baseline");
 mock.module("../../scripts/lib/ci-release-plan", () => ({
+	...originalPlan,
 	validateCiReleasePlan: (value: CiReleasePlan) => value,
 	revalidateCiReleasePlan: revalidate,
 	createCiReleasePlan: unrelated,
@@ -98,10 +102,12 @@ mock.module("../../scripts/lib/ci-release-bundle", () => ({
 	assembleReleaseBundle: unrelated,
 }));
 mock.module("../../scripts/lib/github-release", () => ({
+	...originalGithub,
 	publishGitHubRelease: verifyPublished,
 	runGh: remote,
 }));
 mock.module("../../scripts/lib/github-release-baseline", () => ({
+	...originalBaselines,
 	selectGitHubBaselines: unrelated,
 }));
 mock.module("../../scripts/lib/update-index", () => ({ prepareUpdateIndexRelease: localPrepare }));

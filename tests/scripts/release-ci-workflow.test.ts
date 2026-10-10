@@ -106,7 +106,10 @@ describe("release workflow safety", () => {
 			default: false,
 		});
 		expect(Object.keys(release.on.workflow_dispatch?.inputs ?? {}).sort()).toEqual([
+			"bridge_run_attempt",
+			"bridge_run_id",
 			"index_only",
+			"mirror_only",
 			"publish",
 			"source_run_id",
 			"tag",
@@ -206,7 +209,9 @@ describe("release workflow safety", () => {
 						`${expression("github.run_id")}-${expression("github.run_attempt")}`,
 					);
 					expect(step.with?.overwrite).toBeUndefined();
-					expect(step.with?.["if-no-files-found"]).toBe("error");
+					expect(step.with?.["if-no-files-found"]).toBe(
+						step.name === "Preserve partial publication receipts" ? "ignore" : "error",
+					);
 				}
 				if (step.uses?.startsWith("actions/download-artifact@"))
 					expect(step.with?.["merge-multiple"]).toBeUndefined();
@@ -216,7 +221,11 @@ describe("release workflow safety", () => {
 				(step) => step.name === "Verify original bundle or prepare read-only index repair",
 			)?.run,
 		).toContain("control.js restore");
-		expect(release.jobs.publish?.steps?.at(-1)?.run).toContain("control.js publish");
+		expect(
+			release.jobs.publish?.steps?.find(
+				(step) => step.name === "Publish verified release and index, or repair only the index",
+			)?.run,
+		).toContain("control.js publish");
 		expect(release.jobs.publish?.if).toContain("!cancelled()");
 		expect(release.jobs.gate?.if).toBe(expression("always()"));
 	});

@@ -44,6 +44,10 @@
  */
 import { randomBytes, timingSafeEqual } from "node:crypto";
 import type { ExecutorPlatform } from "@shared/remote-executor";
+import { helperSourceIdentity } from "../../shared/helper-distribution";
+import { ValidationError } from "./errors";
+import type { ExecutorArtifactBinding } from "./executor-binaries";
+import { captureHelperSource } from "./helper-distribution-runtime";
 import { logger } from "./logger";
 
 /**
@@ -83,6 +87,7 @@ export interface ExecutorTicketUse {
 }
 
 interface TicketRecord {
+	artifact: ExecutorArtifactBinding | null;
 	/** Hex ticket value. Stored so lookups can compare in constant time. */
 	value: string;
 	platform: ExecutorPlatform;
@@ -106,6 +111,9 @@ interface TicketRecord {
 const tickets = new Map<string, TicketRecord>();
 
 export interface IssueExecutorTicketOptions {
+	artifact?: ExecutorArtifactBinding;
+	/** Cancel only new issuance, never redemption of an already frozen ticket. */
+	signal?: AbortSignal;
 	deviceId?: string | null;
 	deviceSlug?: string | null;
 	/** Defaults to false: a ticket only yields a token when asked to. */
@@ -131,6 +139,7 @@ export type ExecutorTicketRejection =
 	| "purpose_exhausted";
 
 export interface ExecutorTicketRedemption {
+	artifact?: ExecutorArtifactBinding | null;
 	ok: boolean;
 	reason?: ExecutorTicketRejection;
 	deviceId?: string | null;
@@ -168,6 +177,15 @@ export function issueExecutorTicket(
 	platform: ExecutorPlatform,
 	options: IssueExecutorTicketOptions = {},
 ): IssuedExecutorTicket {
+	options.signal?.throwIfAborted();
+	if (
+		options.artifact &&
+		helperSourceIdentity(options.artifact.source) !== helperSourceIdentity(captureHelperSource())
+	) {
+		throw new ValidationError(
+			"Executor distribution source changed; generate a new install command",
+		);
+	}
 	const now = options.now ?? Date.now();
 	pruneExpired(now);
 	if (tickets.size >= MAX_LIVE_TICKETS) {
@@ -185,7 +203,15 @@ export function issueExecutorTicket(
 	}
 
 	const value = randomBytes(TICKET_BYTES).toString("hex");
+	if (options.artifact && options.artifact.platform !== platform)
+		throw new Error("Executor ticket artifact platform mismatch");
 	const record: TicketRecord = {
+		artifact: options.artifact
+			? Object.freeze({
+					...options.artifact,
+					source: Object.freeze({ ...options.artifact.source }),
+				})
+			: null,
 		value,
 		platform,
 		deviceId: options.deviceId ?? null,
@@ -320,6 +346,7 @@ export function redeemExecutorTicket(
 	});
 	return {
 		ok: true,
+		artifact: purpose === "binary" ? record.artifact : null,
 		deviceId: record.deviceId,
 		deviceSlug: record.deviceSlug,
 		script:

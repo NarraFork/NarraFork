@@ -19,7 +19,7 @@
 		"author": "Meta Platforms, Inc. and affiliates",
 		"repository": "https://github.com/facebook/zstd",
 		"textFile": "zstd.txt",
-		"distributedVia": "Linux static helpers at vendor/zstd/zstd-linux-{x64,arm64}; native Windows ARM64 zstd-win-arm64.exe at dist/helpers/windows-arm64/, built from the same upstream source by scripts/prepare-windows-arm64-helpers.ts for delta updates."
+		"distributedVia": "Six raw CLI helpers in the independent same-repository helpers-v1.0.0 GitHub Release, built from SHA-256-pinned zstd 1.5.7 source; Linux uses a digest-pinned Alpine musl image, macOS native Xcode 26.0.1, and Windows the fixed llvm-mingw 20250613 recipe. Build-only output stays in .helper-release/, while the separately authorized legacy update-server tools route remains supported."
 	},
 	{
 		"name": "ripgrep",
@@ -30,7 +30,7 @@
 		"author": "Andrew Gallant",
 		"repository": "https://github.com/BurntSushi/ripgrep",
 		"textFile": "ripgrep.txt",
-		"distributedVia": "Six native CLI helpers for Linux/macOS/Windows x64 and ARM64 prepared by scripts/prepare-ripgrep-helpers.ts under dist/helpers/ripgrep/, for separately authorized distribution via the update server tools endpoint."
+		"distributedVia": "Six raw native Linux/macOS/Windows x64 and ARM64 CLI helpers mirrored from official fixed archives and extracted-binary SHA-256 values into the independent same-repository helpers-v1.0.0 GitHub Release. Linux ARM64 requires glibc, not Alpine/Termux. MIT and PCRE2 notices are attached to that release; the legacy update-server tools endpoint remains separately supported."
 	},
 	{
 		"name": "PCRE2 (ripgrep helpers)",
@@ -49,7 +49,7 @@
 		"author": "LLVM Project contributors",
 		"repository": "https://github.com/llvm/llvm-project",
 		"textFile": "llvm-compiler-rt.txt",
-		"distributedVia": "Compiler builtins statically linked into zstd-win-arm64.exe by the pinned llvm-mingw 20250613 cross-toolchain.",
+		"distributedVia": "Compiler builtins statically linked into zstd-win64.exe and zstd-win-arm64.exe by the pinned llvm-mingw 20250613 cross-toolchain; its existing verbatim license text is attached to helpers-v1.0.0.",
 		"note": "The verbatim LICENSE.TXT from the verified llvm-mingw archive includes LLVM's full license and exceptions; the compiler executable itself is build-only, not distributed."
 	},
 	{
@@ -59,26 +59,36 @@
 		"author": "MinGW-w64 project and runtime contributors",
 		"repository": "https://github.com/mingw-w64/mingw-w64",
 		"textFile": "mingw-w64-runtime.txt",
-		"distributedVia": "Statically linked into native zstd-win-arm64.exe; Windows UCRT system DLLs are not redistributed.",
+		"distributedVia": "Statically linked into native zstd-win64.exe and zstd-win-arm64.exe, with the complete existing runtime notices attached to helpers-v1.0.0; Windows UCRT system DLLs are not redistributed.",
 		"note": "Mixed runtime licenses: the complete upstream COPYING.MinGW-w64-runtime.txt notices are reproduced verbatim rather than reduced to a guessed SPDX identifier."
 	},
 	{
 		"name": "musl libc",
-		"version": "bundled with Alpine build image",
+		"version": "1.2.5-r12 (Alpine 3.22.1 digest-pinned build image)",
 		"license": "MIT",
 		"author": "Rich Felker, et al.",
 		"repository": "https://musl.libc.org/",
 		"textFile": "musl.txt",
-		"distributedVia": "Statically linked into the vendor/zstd binaries (compiled in an Alpine container with `-static`)."
+		"distributedVia": "Statically linked into zstd-linux-x64 and zstd-linux-arm64 in helpers-v1.0.0, using the fixed Alpine image digest and exact musl package version with -static; its existing verbatim MIT notice is attached to that release."
+	},
+	{
+		"name": "GCC runtime and startup code (Linux zstd helpers)",
+		"version": "14.2.0 (Alpine gcc 14.2.0-r6)",
+		"license": "GPL-3.0-or-later WITH GCC-exception-3.1",
+		"author": "Free Software Foundation, Inc. and GCC contributors",
+		"repository": "https://gcc.gnu.org/",
+		"textFile": "gcc-runtime.txt",
+		"distributedVia": "Conservative coverage of GCC runtime/startup code selected when the pinned GNU compiler statically links zstd-linux-x64 and zstd-linux-arm64; gcc-runtime.txt is required in the independent helpers-v1.0.0 Release. The compiler executable is build-only, not redistributed.",
+		"note": "Verbatim COPYING3 followed by COPYING.RUNTIME from GCC releases/gcc-14.2.0 commit 04696df09633baf97cdbbdd6e9929b9d472161d3 in the official gcc-mirror/gcc mirror. libgcc/crtstuff.c explicitly grants the GCC Runtime Library Exception 3.1. This runtime disclosure does not change zstd's separately selected BSD-3-Clause branch. Exact linked symbols remain subject to native build/link-map verification."
 	},
 	{
 		"name": "Go standard library",
-		"version": "1.24+",
+		"version": "1.24.13 (auxiliary release workflow pin)",
 		"license": "BSD-3-Clause",
 		"author": "The Go Authors",
 		"repository": "https://github.com/golang/go",
 		"textFile": "go-stdlib.txt",
-		"distributedVia": "Compiled into the remote executor binaries in remote-executor/dist/, which server/lib/executor-binaries.ts serves to user devices."
+		"distributedVia": "Compiled into the six raw remote executor binaries published under independent executor-v<application-version> GitHub Releases, served to devices after protocol/version/source verification. Go standard-library and dependency license texts are attached to each executor release; legacy update-server tools distribution remains supported."
 	},
 	{
 		"name": "github.com/bmatcuk/doublestar/v4",
