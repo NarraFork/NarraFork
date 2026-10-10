@@ -35,7 +35,13 @@ import {
 	type GlobalQuestion,
 } from "./GlobalQuestionInbox";
 
-const { buildAsyncQuestionNode } = await import("../vlist/vlist-permission-bridge");
+const { buildAsyncQuestionNode, usePermissionSlots } = await import(
+	"../vlist/vlist-permission-bridge"
+);
+const { buildToolMetaIndex } = await import("../vlist/vlist-tool-meta");
+
+import type { AsyncQuestionSlot, NarratorMsg } from "../narrator-panel-types";
+import type { VListItem } from "../vlist/vlist-pipeline";
 
 const questions = [{ id: "notes", header: "Notes?", options: [] }];
 const deferredQuestion: GlobalQuestion = {
@@ -186,6 +192,75 @@ function button(label: string) {
 	expect(found).toBeDefined();
 	return found as HTMLButtonElement;
 }
+
+test("live Await question hosts one directly submittable menu using tool-call input", async () => {
+	const detail = spyOn(api, "getAsyncQuestionDetail").mockResolvedValue({
+		question: deferredQuestion,
+		supplements: [],
+		nextCursor: null,
+		canAct: true,
+	});
+	const answer = spyOn(api, "answerAsyncQuestion").mockResolvedValue({
+		ok: true,
+		question: { ...deferredQuestion, status: "answered" },
+	});
+	writeSession("ask-draft", deferredQuestion.toolCallId, draft);
+	const tools = buildToolMetaIndex([
+		{
+			seq: 9,
+			contentJson: [{ type: "tool_use", id: "wait", name: "Await", input: {} }],
+			toolCalls: [
+				{
+					toolUseId: "wait",
+					toolName: "Await",
+					status: "running",
+					inputJson: { type: "question", id: deferredQuestion.id },
+				},
+			],
+		} as unknown as NarratorMsg,
+	]);
+	const asyncQuestions = new Map([
+		[
+			deferredQuestion.toolUseId as string,
+			{
+				id: deferredQuestion.id,
+				question: deferredQuestion,
+				questions,
+				onSubmit: () => {},
+				onDismiss: () => {},
+			} satisfies AsyncQuestionSlot,
+		],
+	]);
+	const renderItems = [deferredQuestion.toolUseId, "wait"].map((id) => ({
+		spec: { kind: "tool-call", key: `tool-${id}` },
+	})) as VListItem[];
+	function Harness() {
+		const slots = usePermissionSlots({ renderItems, tools, asyncQuestions });
+		return (
+			<>
+				<div data-ask>{slots.get(`tool-${deferredQuestion.toolUseId}`)}</div>
+				<div data-await>{slots.get("tool-wait")}</div>
+			</>
+		);
+	}
+	try {
+		await render(<Harness />);
+		for (let n = 0; n < 3; n++)
+			await act(async () => {
+				await new Promise((resolve) => setTimeout(resolve, 0));
+			});
+		expect(container.querySelector("[data-ask] textarea")).toBeNull();
+		expect(container.querySelector("[data-await] textarea")).not.toBeNull();
+		expect(container.querySelectorAll("textarea")).toHaveLength(1);
+		await act(async () => button("submitAnswer").click());
+		expect(answer).toHaveBeenCalledWith("n1", deferredQuestion.id, {
+			answers: { notes: "Keep this unfinished answer" },
+		});
+	} finally {
+		detail.mockRestore();
+		answer.mockRestore();
+	}
+});
 
 test("async read-only detail maps colliding headers by canonical question ID", async () => {
 	const detail = spyOn(api, "getAsyncQuestionDetail").mockResolvedValue({

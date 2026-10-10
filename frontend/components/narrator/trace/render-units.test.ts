@@ -555,6 +555,31 @@ describe("groupRenderUnits (L1/L2 unified activity fold)", () => {
 		}
 	});
 
+	test("active question Await keeps its answer card outside the low-LOD trace", () => {
+		for (const status of ["running", "executing", "success"]) {
+			for (const type of ["question", "agent", "bash"]) {
+				const wait = toolMessage("wait-message", "wait", "");
+				wait.contentJson = [{ type: "tool_use", id: "wait", name: "Await", input: {} }];
+				const call = wait.toolCalls?.[0];
+				if (!call) throw new Error("Missing fixture tool call");
+				wait.toolCalls = [{ ...call, toolName: "Await", status, inputJson: { type, id: "q1" } }];
+				const units = groupRenderUnits(
+					segmentMessages([
+						toolMessage("before", "before", ""),
+						wait,
+						toolMessage("after", "after", ""),
+					]),
+					true,
+				);
+				const kept = units.filter((unit) => unit.kind === "segment");
+				expect(kept.length).toBe(type === "question" && status !== "success" ? 1 : 0);
+				if (kept[0]?.kind === "segment" && kept[0].seg.kind === "tool-run") {
+					expect(kept[0].seg.items.map((item) => item.tc.toolUseId)).toEqual(["wait"]);
+				}
+			}
+		}
+	});
+
 	test("keepToolUseIds keeps ONE call out of the fold, neighbours still fold", () => {
 		// Three tool segments: only the middle call's tool-use id is in the keep set.
 		// It must stay a plain segment (its card renders in full) while the two

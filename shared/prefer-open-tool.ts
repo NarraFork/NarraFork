@@ -14,8 +14,22 @@
 const PREFER_OPEN_TOOL_NAMES = new Set(["AskUserQuestion", "ExitPlanMode"]);
 
 /** True when a tool call should default-open at every LOD (still collapsible). */
-export function isPreferOpenTool(tool: { toolName: string }): boolean {
-	return PREFER_OPEN_TOOL_NAMES.has(tool.toolName);
+export function isPreferOpenTool(tool: {
+	toolName: string;
+	status?: string | null;
+	inputJson?: unknown;
+}): boolean {
+	if (PREFER_OPEN_TOOL_NAMES.has(tool.toolName)) return true;
+	// A question wait is an answer surface, not an ordinary task-status card.
+	const input = tool.inputJson;
+	return (
+		tool.toolName === "Await" &&
+		(tool.status === "running" || tool.status === "executing") &&
+		typeof input === "object" &&
+		input !== null &&
+		"type" in input &&
+		input.type === "question"
+	);
 }
 
 /** Category-level twin for measure inputs that carry `category` instead of the name. */

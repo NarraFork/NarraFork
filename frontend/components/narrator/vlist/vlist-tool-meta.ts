@@ -231,7 +231,11 @@ export function deriveToolMeta(block: ContentBlock): VListToolMeta | null {
 	const toolUseId = nonEmpty(record.id) ?? nonEmpty(record.toolUseId);
 	if (toolUseId) meta.toolUseId = toolUseId;
 	if (isRunningForegroundBash(toolName, inputRecord, status, metadata)) meta.isRunningBash = true;
-	if (toolName === "Await" && inputRecord.type === "question" && status === "running") {
+	if (
+		toolName === "Await" &&
+		inputRecord.type === "question" &&
+		(status === "running" || status === "executing")
+	) {
 		meta.awaitQuestionId = nonEmpty(inputRecord.id);
 		const seq = record.seq ?? record.messageSeq;
 		if (typeof seq === "number" && Number.isFinite(seq)) meta.awaitQuestionSeq = seq;
@@ -274,12 +278,23 @@ export function buildToolMetaIndex(messages: readonly NarratorMsg[]): Map<string
 	const index = new Map<string, VListToolMeta>();
 	for (const msg of messages) {
 		if (!Array.isArray(msg?.contentJson)) continue;
+		const calls = new Map(msg.toolCalls?.map((call) => [call.toolUseId, call]));
 		for (const raw of msg.contentJson as ContentBlock[]) {
 			if (!raw || typeof raw !== "object" || raw.type !== "tool_use") continue;
 			const toolUseId = typeof raw.id === "string" ? raw.id : undefined;
 			if (!toolUseId) continue;
+			const call = calls.get(toolUseId);
 			const meta = deriveToolMeta({
 				...raw,
+				// Streaming blocks may still carry empty input and no lifecycle status.
+				// The matching tool-call record is the authoritative live projection.
+				...(call
+					? {
+							name: call.toolName,
+							input: call.inputJson ?? raw.input,
+							status: call.status,
+						}
+					: {}),
 				seq: typeof raw.seq === "number" ? raw.seq : msg.seq,
 			} as ContentBlock);
 			if (meta) index.set(toolUseId, meta);
