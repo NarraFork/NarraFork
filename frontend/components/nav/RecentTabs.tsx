@@ -6,11 +6,7 @@ import {
 	type RecentTabRow,
 } from "@frontend/hooks/recent-tab-directory-groups";
 import { canRevealFromBrowser } from "@frontend/lib/local-origin";
-import {
-	getEffectiveNarratorDisplay,
-	type StatusShape,
-	statusRegistry,
-} from "@frontend/lib/status-registry";
+import { statusRegistry } from "@frontend/lib/status-registry";
 import { Z } from "@frontend/lib/z-index";
 import {
 	ActionIcon,
@@ -36,23 +32,18 @@ import {
 	IconArrowUp,
 	IconBox,
 	IconBrain,
-	IconCheck,
 	IconClock,
 	IconColumns,
 	IconCopy,
-	IconExclamationMark,
 	IconFolder,
 	IconFolderPlus,
 	IconGitBranch,
-	IconMessageCircle,
-	IconMessageCircleFilled,
 	IconPencil,
 	IconPin,
 	IconPinnedOff,
 	IconPlus,
 	IconRobot,
 	IconServer,
-	IconShield,
 	IconSubtask,
 	IconTerminal2,
 	IconWindowMaximize,
@@ -76,7 +67,6 @@ import {
 	bumpRecentTabRuntimeVersions,
 	clampRecentTabText,
 	collectRecentTabsDeltaFrame,
-	isRecentTabBackgroundActive,
 	normalizeRecentTabViewers,
 	pruneRecentTabsRuntimeVersions,
 	type RecentTab,
@@ -105,7 +95,8 @@ import { LeftTruncatedPathText } from "../common/TruncatedPath";
 import type { CreateNarratorResult } from "../narrator/CreateNarratorModal";
 import { UserAvatar } from "../UserAvatar";
 import { PANEL_WINDOW_FEATURES, recentTabWindowHref } from "../window/panel-window";
-import { RecentTabBackgroundBubble } from "./RecentTabBackgroundBubble";
+import { NarratorStatusIcon } from "./NarratorStatusIcon";
+import { getNarratorStatusIconColor, isFilledNarratorStatus } from "./narrator-status-icon-logic";
 import { RecentTabDirectoryRow, type RecentTabDirectoryRowProps } from "./RecentTabDirectoryRow";
 import { RecentTabDropIndicator } from "./RecentTabDropIndicator";
 import type { RecentTabDropTarget } from "./recent-tab-drop-target";
@@ -135,95 +126,6 @@ const CreateNarratorModal = React.lazy(() =>
 );
 
 const mantineVar = (color: string) => `var(--mantine-color-${color}-6)`;
-
-function getRecentTabDisplaySubstatus(tab: RecentTab): string[] | undefined {
-	// Reasoning has its own corner marker in RecentTabs; don't let it override
-	// higher-level session states such as planning for the base icon color.
-	return tab.substatus?.includes("reasoning")
-		? tab.substatus.filter((tag) => tag !== "reasoning")
-		: tab.substatus;
-}
-
-function getRecentTabIconColor(tab: RecentTab): string | undefined {
-	const substatus = getRecentTabDisplaySubstatus(tab);
-	if (!tab.status && !substatus?.length) return undefined;
-	return statusRegistry.accentVar(getEffectiveNarratorDisplay(tab.status ?? "idle", substatus), 6);
-}
-
-/**
- * The state shape for a tab, or undefined when it has none.
- *
- * Derived from the registry rather than re-enumerated here, so a state that gains a
- * shape tomorrow is picked up automatically — the same contract `isFilledRecentTabStatus`
- * follows for `solidAccent`.
- */
-function getRecentTabShape(tab: RecentTab): StatusShape | undefined {
-	return getEffectiveNarratorDisplay(tab.status ?? "idle", getRecentTabDisplaySubstatus(tab)).shape;
-}
-
-/**
- * Tabler glyph per shape, drawn OVER the centre of the tab's own icon.
- *
- * ⚠️ Not a corner badge. These started as 11px corner dots holding a 7px glyph — the
- * same treatment the draft / reasoning / scheduled markers use — and at that size a
- * shield and an exclamation mark were simply not legible. A shape that cannot be
- * recognised carries no information, so it defeats the whole reason shape was introduced
- * (the palette having no distinguishable hue left; see `StatusShape`).
- *
- * Overlaying the centre buys roughly 2× the glyph size. It works for every tab type,
- * which a composed icon would not: Tabler ships `IconMessageCircleCheck` and
- * `…Exclamation`, but nothing for a shield, and no composed variants at all for the
- * git-branch / robot / users icons the other tab types use.
- */
-const SHAPE_MARKERS: Record<StatusShape, { Icon: typeof IconCheck }> = {
-	check: { Icon: IconCheck },
-	shield: { Icon: IconShield },
-	alert: { Icon: IconExclamationMark },
-};
-
-/**
- * How much of the host icon the knocked-out glyph occupies.
- *
- * Sized by what the host can hold, not by taste. The tabs render at 14–16px, so a glyph
- * kept "inside" the icon at ~58% came out around 8px — no better than the 7px corner badge
- * it replaced, which was rejected for being unreadable. At 0.62 it lands at 9–10px and a
- * shield is distinguishable from an exclamation mark, while still leaving a rim of the
- * bubble's colour so the hue keeps doing its grouping job.
- */
-const SHAPE_GLYPH_RATIO = 0.62;
-
-/**
- * Nudge, as a fraction of icon size, from the icon's geometric centre to the visual centre
- * of the message bubble's round body.
- *
- * Tabler's message-circle is not a centred disc: its body occupies roughly x/y 2.3–20 of
- * the 24-unit viewBox and the remaining bottom strip is the tail. Centring the glyph on the
- * box therefore pushes it down-right and it reads as misaligned. ~4% of the size back along
- * both axes puts it on the body.
- */
-const SHAPE_INK_OFFSET = 0.04;
-
-function isFilledRecentTabStatus(tab: RecentTab): boolean {
-	const display = getEffectiveNarratorDisplay(
-		tab.status ?? "idle",
-		getRecentTabDisplaySubstatus(tab),
-	);
-	// Hollow vs filled is this surface's "idle vs occupied" signal, so a state
-	// that owns a solid accent (e.g. waiting for a model) must fill too —
-	// otherwise it stays a hollow dot next to idle's hollow dot regardless of hue.
-	if (display.solidAccent) return true;
-	// A state that draws a SHAPE must fill too, for a hard reason rather than a stylistic
-	// one: `ShapeOverlay` knocks its glyph out in white, expecting a solid bubble of the
-	// state's colour behind it. On a hollow outline that white glyph would sit on the page
-	// background and disappear entirely.
-	if (display.shape) return true;
-	return (
-		tab.status === "working" ||
-		!!tab.substatus?.includes("planning") ||
-		!!tab.substatus?.includes("error") ||
-		!!tab.substatus?.includes("unread")
-	);
-}
 
 const CONTAINER_STATUS_I18N: Record<string, string> = {
 	running: "containerRunning",
@@ -1436,6 +1338,22 @@ function TabIcon({
 	iconColor?: string;
 	filledStatus: boolean;
 }) {
+	// The narrator bubble is shared verbatim with the narrator list page — see
+	// `NarratorStatusIcon`. It owns its corner markers and the centre shape overlay.
+	if (tab.type === "narrator") {
+		return (
+			<NarratorStatusIcon
+				size={size}
+				status={tab.status}
+				substatus={tab.substatus}
+				activeBackgroundWorkCount={tab.activeBackgroundWorkCount}
+				activeBackgroundTaskCount={tab.activeBackgroundTaskCount}
+				hasDraft={tab.hasDraft}
+				isScheduled={tab.isScheduled}
+			/>
+		);
+	}
+
 	let icon: React.ReactNode;
 	if (tab.type === "project") icon = <IconFolder size={size} />;
 	else if (tab.type === "workspace") icon = <IconColumns size={size} />;
@@ -1443,39 +1361,19 @@ function TabIcon({
 		icon = (
 			<IconGitBranch size={size} color={iconColor} fill={filledStatus ? "currentColor" : "none"} />
 		);
-	} else if (tab.type === "subagent") icon = <IconRobot size={size} color={iconColor} />;
-	else {
-		// Hollow = idle, filled = something happened. A narrator whose FOREGROUND is
-		// idle while background tasks still run gets a diagonally half-filled bubble:
-		// the outline keeps the foreground state, the filled half (working blue) says
-		// the work has not actually stopped.
-		const backgroundActive = isRecentTabBackgroundActive(tab, filledStatus);
-		icon = backgroundActive ? (
-			<RecentTabBackgroundBubble size={size} color={iconColor} foregroundFilled={filledStatus} />
-		) : filledStatus ? (
-			<IconMessageCircleFilled size={size} color={iconColor} />
-		) : (
-			<IconMessageCircle size={size} color={iconColor} />
-		);
-	}
+	} else icon = <IconRobot size={size} color={iconColor} />;
 
-	const canShowMarker =
-		tab.type === "chapter" || tab.type === "narrator" || tab.type === "subagent";
+	// Corner markers remain for chapter / subagent rows. The centre state SHAPE
+	// (tick / shield / alert) does not: it is knocked out in white and needs the
+	// narrator bubble's solid body behind it — the git-branch and robot glyphs are
+	// Tabler OUTLINE icons (stroke only, no closed shape), so a white glyph there
+	// would land on the page background and disappear. `IconGitBranch`'s `fill`
+	// only tints its three small nodes, which is not a body either.
+	const canShowMarker = tab.type === "chapter" || tab.type === "subagent";
 	const showDraft = !!tab.hasDraft && canShowMarker;
 	const showReasoning = !!tab.substatus?.includes("reasoning") && canShowMarker;
 	const showScheduled = !!tab.isScheduled && canShowMarker;
-	// The state SHAPE (tick / shield / alert), knocked out of the middle of the icon. The
-	// palette had no hue left to distinguish these states (see `StatusShape`), so shape
-	// carries the difference instead.
-	//
-	// Restricted to the narrator bubble, and only once it is filled, because the glyph is
-	// white and supplies no body of its own — it needs solid colour behind it. The chapter
-	// and subagent icons are Tabler OUTLINE glyphs (git-branch, robot: stroke only, no
-	// closed shape), so a white glyph there would land on the page background and disappear.
-	// `IconGitBranch`'s `fill` only tints its three small nodes, which is not a body either.
-	const canShowShape = tab.type === "narrator" && filledStatus;
-	const shape = canShowShape ? getRecentTabShape(tab) : undefined;
-	if (!showDraft && !showReasoning && !showScheduled && !shape) return icon;
+	if (!showDraft && !showReasoning && !showScheduled) return icon;
 
 	return (
 		<Box component="span" pos="relative" style={{ display: "inline-flex", lineHeight: 0 }}>
@@ -1546,63 +1444,6 @@ function TabIcon({
 					<IconPencil size={7} stroke={2.5} />
 				</Box>
 			)}
-			{/* State shape, centred OVER the tab icon rather than tucked into a corner —
-			    see SHAPE_MARKERS on why a corner badge was too small to read. The three
-			    corner markers stay where they are; this one owns the middle.
-
-			    `needsBacking` is false only for the narrator bubble, the one tab type whose
-			    icon is a genuinely FILLED shape the white glyph can be cut out of. */}
-			{shape && <ShapeOverlay shape={shape} size={size} />}
-		</Box>
-	);
-}
-
-/**
- * The state shape, knocked out in WHITE from the middle of the tab's filled bubble.
- *
- * ── WHY THERE IS NO BACKGROUND HERE ───────────────────────────────────────────
- * Two earlier attempts went wrong in opposite directions, and both are worth recording
- * because the pull toward each is still there:
- *
- *  1. A 7px badge in the corner. Too small to tell a shield from an exclamation mark.
- *  2. A filled disc the full size of the icon. This one looked worse: the bubble's ink only
- *     covers about three quarters of its box (the rest is the tail and padding), so a
- *     full-size disc buried the bubble AND spilled past its edge — a blob stuck onto the
- *     tab rather than a symbol inside it. It also appeared off-centre, because the box
- *     centre is not the bubble's centre.
- *
- * What works is to add no body at all. The bubble is already solid in the state's colour
- * (`isFilledRecentTabStatus` guarantees it for any state carrying a shape), so the glyph is
- * cut out of the colour that is already there. Nothing to align, nothing to cover.
- *
- * `pointerEvents: none` because the whole icon is one click target; the glyph must not
- * become a dead spot in the middle of it.
- */
-function ShapeOverlay({ shape, size }: { shape: StatusShape; size: number }) {
-	const { Icon } = SHAPE_MARKERS[shape];
-	return (
-		<Box
-			component="span"
-			data-tab-shape={shape}
-			style={{
-				position: "absolute",
-				// Centre on the bubble's INK, not on the icon's box. Tabler's message-circle
-				// draws its round body in the upper-left of the viewBox and spends the bottom
-				// strip on the tail, so box-centre sits low and right of where the eye reads
-				// the centre. `SHAPE_INK_OFFSET` walks it back onto the body.
-				left: `calc(50% - ${(size * SHAPE_INK_OFFSET).toFixed(2)}px)`,
-				top: `calc(50% - ${(size * SHAPE_INK_OFFSET).toFixed(2)}px)`,
-				transform: "translate(-50%, -50%)",
-				display: "inline-flex",
-				// No disc of its own. The host bubble is already filled with the state's
-				// colour, so the glyph is knocked out OF it. Painting another circle here
-				// covered the bubble entirely and spilled past its ink, which read as a blob
-				// stuck on the tab rather than as a symbol inside it.
-				color: "var(--mantine-color-white)",
-				pointerEvents: "none",
-			}}
-		>
-			<Icon size={Math.round(size * SHAPE_GLYPH_RATIO)} stroke={3} />
 		</Box>
 	);
 }
@@ -1624,8 +1465,8 @@ function WorkspaceChildTab({
 		tab.type === "chapter" && tab.narratorId
 			? `/narrators/${tab.narratorId}`
 			: `/narrators/${tab.id}`;
-	const iconColor = getRecentTabIconColor(tab);
-	const filledStatus = isFilledRecentTabStatus(tab);
+	const iconColor = getNarratorStatusIconColor(tab);
+	const filledStatus = isFilledNarratorStatus(tab);
 
 	return (
 		<NavLink
@@ -1685,8 +1526,8 @@ const DraggableWorkspaceChildTab = React.memo(function DraggableWorkspaceChildTa
 					<TabIcon
 						tab={tab}
 						size={14}
-						iconColor={getRecentTabIconColor(tab)}
-						filledStatus={isFilledRecentTabStatus(tab)}
+						iconColor={getNarratorStatusIconColor(tab)}
+						filledStatus={isFilledNarratorStatus(tab)}
 					/>
 				}
 				onClick={() => {
@@ -1763,8 +1604,8 @@ function DragOverlayWorkspaceItem({
 /** Rendered in DragOverlay while a non-workspace tab is being dragged. */
 function DragOverlayTabItem({ tab, active }: { tab: RecentTab; active: boolean }) {
 	const { t } = useTranslation("common");
-	const iconColor = getRecentTabIconColor(tab);
-	const filledStatus = isFilledRecentTabStatus(tab);
+	const iconColor = getNarratorStatusIconColor(tab);
+	const filledStatus = isFilledNarratorStatus(tab);
 
 	return (
 		<div style={{ overflow: "hidden" }}>
@@ -1878,8 +1719,8 @@ function TabItemBody({
 				: tab.type === "workspace"
 					? `/narrators/workspace/${tab.id}`
 					: `/narrators/${tab.id}`;
-	const iconColor = getRecentTabIconColor(tab);
-	const filledStatus = isFilledRecentTabStatus(tab);
+	const iconColor = getNarratorStatusIconColor(tab);
+	const filledStatus = isFilledNarratorStatus(tab);
 
 	const handlePrefetch = useCallback(() => onPrefetch?.(tab), [onPrefetch, tab]);
 

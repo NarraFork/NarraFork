@@ -29,8 +29,23 @@ export interface RecentTab extends PersistedRecentTab {
 export const RECENT_TAB_TEXT_MAX_CHARS = 1_000;
 const RECENT_TAB_VIEWERS_MAX = 20;
 
+/**
+ * Structural subset of `RecentTab` that background-activity detection reads.
+ * Widened from `RecentTab` so the narrator list page (whose items are not tabs)
+ * can run the same decision through `NarratorStatusIcon`.
+ */
+export interface RecentTabBackgroundSource {
+	status?: string | null;
+	substatus?: string[] | null;
+	activeBackgroundWorkCount?: number | null;
+	activeBackgroundTaskCount?: number | null;
+}
+
 /** Idle foreground + background work: half blue, with a hollow or unread-green base. */
-export function isRecentTabBackgroundActive(tab: RecentTab, filledStatus: boolean): boolean {
+export function isRecentTabBackgroundActive(
+	tab: RecentTabBackgroundSource,
+	filledStatus: boolean,
+): boolean {
 	if ((tab.activeBackgroundWorkCount ?? tab.activeBackgroundTaskCount ?? 0) <= 0) return false;
 	if (!filledStatus) return true;
 	// Unread fills the foreground half, but must not hide ongoing background work.

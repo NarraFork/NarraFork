@@ -227,6 +227,28 @@ describe("ordinary entry points and retained legacy sessions", () => {
 		expect(archived).toContain('href="/narrators/old-session"');
 		expect(sideEffect).not.toHaveBeenCalled();
 	});
+	test.each([
+		["model_unavailable", "status.narratorModelUnavailable"],
+		["quota_exhausted", "status.narratorQuotaExhausted"],
+	])("list status %s retains a distinct accessible label on desktop and mobile", (substatus, label) => {
+		const html = render(
+			<NarratorListCard
+				variant="active"
+				narrator={{
+					id: "status-session",
+					title: "Status session",
+					status: "waiting",
+					substatus: [substatus],
+					createdAt: "2026-01-01T00:00:00Z",
+				}}
+				localQuery=""
+				defaultModelValue="model"
+				onOpen={() => {}}
+				onArchive={() => {}}
+			/>,
+		);
+		expect(html.split(`aria-label="${label}"`).length - 1).toBe(2);
+	});
 	test("detail routes do not duplicate header compatibility entry or eagerly import legacy settings", () => {
 		const entry = readFileSync(
 			new URL("./NarratorCompatibilityEntry.tsx", import.meta.url),

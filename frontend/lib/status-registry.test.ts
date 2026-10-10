@@ -314,14 +314,14 @@ describe("status shapes separate states colour no longer can", () => {
 	});
 
 	test("the sidebar derives its shape from the registry", async () => {
-		// Same contract as `isFilledRecentTabStatus`: derived, not re-enumerated, so a
+		// Same contract as `isFilledNarratorStatus`: derived, not re-enumerated, so a
 		// state that gains a shape tomorrow is picked up without touching this component.
 		const source = await Bun.file(
-			new URL("../components/nav/RecentTabs.tsx", import.meta.url),
+			new URL("../components/nav/narrator-status-icon-logic.ts", import.meta.url),
 		).text();
 		const body = source.slice(
-			source.indexOf("function getRecentTabShape"),
-			source.indexOf("const SHAPE_MARKERS"),
+			source.indexOf("function getNarratorStatusShape"),
+			source.indexOf("function isFilledNarratorStatus"),
 		);
 		expect(body).toContain("getEffectiveNarratorDisplay");
 		expect(body).toContain(".shape");
@@ -330,12 +330,13 @@ describe("status shapes separate states colour no longer can", () => {
 	/**
 	 * Guards the size floor. Two attempts landed on an illegible glyph by different routes:
 	 * first a 7px corner badge, then a glyph scaled to sit "inside" the icon at ~58%, which
-	 * on a 14px host is 8px — the same problem again. The hosts render at 14–16px, so the
-	 * ratio has to be generous or the shape cannot be read at all.
+	 * on a 14px host is 8px — the same problem again. The hosts render at 14–20px
+	 * (sidebar rows 14–16, narrator list cards 18–20), so the ratio has to be
+	 * generous or the shape cannot be read at all.
 	 */
 	test("the knocked-out glyph is big enough to identify", async () => {
 		const source = await Bun.file(
-			new URL("../components/nav/RecentTabs.tsx", import.meta.url),
+			new URL("../components/nav/NarratorStatusIcon.tsx", import.meta.url),
 		).text();
 		const ratio = source.match(/const SHAPE_GLYPH_RATIO = ([\d.]+)/);
 		expect(ratio).not.toBeNull();
@@ -356,7 +357,7 @@ describe("status shapes separate states colour no longer can", () => {
 	 */
 	test("the shape is knocked out of the bubble rather than painted over it", async () => {
 		const source = await Bun.file(
-			new URL("../components/nav/RecentTabs.tsx", import.meta.url),
+			new URL("../components/nav/NarratorStatusIcon.tsx", import.meta.url),
 		).text();
 		// Both delimiters are asserted to EXIST before slicing. `indexOf` returns -1 for a
 		// missing needle, and `slice(start, -1)` silently yields a near-empty or reversed
@@ -364,7 +365,7 @@ describe("status shapes separate states colour no longer can", () => {
 		// (`isTabActive` used to be the end delimiter and has since moved to
 		// `recent-tabs-logic.ts`, which is exactly how this trap gets sprung.)
 		const start = source.indexOf("function ShapeOverlay");
-		const end = source.indexOf("function WorkspaceChildTab");
+		const end = source.indexOf("export interface NarratorStatusIconProps");
 		expect(start).toBeGreaterThan(-1);
 		expect(end).toBeGreaterThan(start);
 		const overlay = source.slice(start, end);
@@ -374,8 +375,11 @@ describe("status shapes separate states colour no longer can", () => {
 		expect(overlay).not.toContain("borderRadius");
 		// The whole icon is one click target; the glyph must not become a dead spot.
 		expect(overlay).toContain('pointerEvents: "none"');
-		// And it is gated to the one host that is genuinely filled.
-		expect(source).toContain('const canShowShape = tab.type === "narrator" && filledStatus');
+		// And it is gated to a genuinely filled host: the component renders the shape
+		// only when the bubble is filled, and it is only used for narrator icons
+		// (`TabIcon` delegates the narrator branch; the chapter/subagent glyphs are
+		// outline strokes the white knockout would vanish against).
+		expect(source).toContain("filledStatus ? getNarratorStatusShape(props) : undefined");
 	});
 
 	/**
@@ -442,14 +446,11 @@ describe("the Pixi theme bridge tracks the registry accent shade", () => {
  * helper to test it directly would still not distinguish the two implementations.
  */
 describe("the sidebar fill decision consults solidAccent", () => {
-	test("isFilledRecentTabStatus reads the registry flag", async () => {
+	test("isFilledNarratorStatus reads the registry flag", async () => {
 		const source = await Bun.file(
-			new URL("../components/nav/RecentTabs.tsx", import.meta.url),
+			new URL("../components/nav/narrator-status-icon-logic.ts", import.meta.url),
 		).text();
-		const body = source.slice(
-			source.indexOf("function isFilledRecentTabStatus"),
-			source.indexOf("const CONTAINER_STATUS_I18N"),
-		);
+		const body = source.slice(source.indexOf("function isFilledNarratorStatus"));
 		expect(body).toContain("solidAccent");
 		expect(body).toContain("getEffectiveNarratorDisplay");
 	});

@@ -638,6 +638,73 @@ test("notification pending panel reuses decision form, draft recovery and keyboa
 	await assertIsolated(button(navEn.notificationTabActivity));
 });
 
+test("notification question stays editable and submits during a background authority refresh", async () => {
+	const child = item("live-question", {
+		source: "question",
+		kind: "async_question",
+		toolName: "AskUserQuestion",
+		blocking: false,
+	});
+	const value = question(child);
+	value.questions[0].options = [
+		{ header: "Option A", description: "First choice" },
+		{ header: "Option B", description: "Second choice" },
+	];
+	listPage = { items: [child], nextCursor: null };
+	details.set(child.id, { item: child, question: value });
+	writeSession("ask-draft", child.toolCallId, draft);
+	track(
+		spyOn(api, "listNotifications").mockResolvedValue({ items: [], nextCursor: null, asOf: 123 }),
+	);
+	await render(<NotificationCenterDrawer opened initialTab="attention" onClose={() => {}} />);
+	await click("Review decision", row(child.id));
+	const input = row(child.id).querySelector("textarea");
+	const fieldset = row(child.id).querySelector("fieldset");
+	expect(input?.value).toBe("Keep this answer");
+	let finishRefresh: (detail: HumanAttentionDetail) => void = () => {};
+	track(
+		spyOn(api, "getHumanAttentionDetail").mockImplementation(
+			() =>
+				new Promise((resolve) => {
+					finishRefresh = resolve;
+				}),
+		),
+	);
+	await act(async () => {
+		void qc.invalidateQueries({ queryKey: ["human-attention"] });
+	});
+	await settle();
+	expect(qc.isFetching({ queryKey: ["human-attention", "detail", child.id] })).toBe(1);
+	expect(fieldset?.hasAttribute("disabled")).toBe(false);
+	expect(row(child.id).querySelector("textarea")).toBe(input);
+	expect(input?.value).toBe("Keep this answer");
+	let finishAnswer: () => void = () => {};
+	const answer = track(
+		spyOn(api, "answerAsyncQuestion").mockImplementation(
+			() =>
+				new Promise((resolve) => {
+					finishAnswer = () => resolve({ ok: true, question: value });
+				}),
+		),
+	);
+	await click(narratorEn.submitAnswer, row(child.id));
+	expect(answer).toHaveBeenCalledWith(child.narratorId, child.requestId, {
+		answers: { notes: "Keep this answer" },
+	});
+	// An actual submission still locks the form; a background read never does.
+	expect(fieldset?.hasAttribute("disabled")).toBe(true);
+	await act(async () => finishRefresh({ item: child, question: value }));
+	await settle();
+	expect(row(child.id).querySelector("textarea")).toBe(input);
+	await act(async () => {
+		finishAnswer();
+	});
+	await settle();
+	await act(async () => finishRefresh({ item: child, question: value }));
+	await settle();
+	expect(fieldset?.hasAttribute("disabled")).toBe(false);
+});
+
 test("notification tab switches retain the expanded plan editor and unsubmitted draft", async () => {
 	const plan = item("tab-plan", { toolName: "ExitPlanMode", kind: "plan_approval" });
 	addPermission(plan, { plan: "Original plan" });

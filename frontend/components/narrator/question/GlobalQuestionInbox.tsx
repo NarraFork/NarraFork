@@ -906,7 +906,7 @@ function HumanAttentionForm({ item: summary }: { item: HumanAttentionItem }) {
 			actionLock.current ||
 			!summary.canAct ||
 			!item.canAct ||
-			query.isFetching ||
+			query.isError ||
 			query.data?.tooLarge
 		)
 			return;
@@ -983,7 +983,9 @@ function HumanAttentionForm({ item: summary }: { item: HumanAttentionItem }) {
 			)}
 			<Box
 				component="fieldset"
-				disabled={mutation.isPending || query.isFetching}
+				// Background WS reconciliation must not disable inputs: browsers blur a focused
+				// textarea when its fieldset becomes disabled. The endpoint validates authority.
+				disabled={mutation.isPending}
 				style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }}
 				onClickCapture={captureDrafts}
 				onKeyDownCapture={captureDrafts}
