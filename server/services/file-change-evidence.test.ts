@@ -676,6 +676,43 @@ describe("explicit no-dispatch file-tool evidence", () => {
 });
 
 describe("durable scope and operation identity", () => {
+	test("Bash path coordination never claims historical root verification", () => {
+		const input = {
+			sourceInstanceId: source,
+			deviceId: "local",
+			workspaceInstanceId: "bash-coordination:v1:bucket",
+			canonicalRoot: "/repo",
+			pathFlavor: "posix" as const,
+		};
+		const bucket = service.prepareBashCoordinationScope(input);
+		expect(bucket.id).not.toBe(scope.id);
+		expect(bucket.status).toBe("active");
+		expect(bucket.rootIdentityJson).toBeNull();
+		expect(new FileChangeEvidenceService(db).prepareBashCoordinationScope(input).id).toBe(
+			bucket.id,
+		);
+		expect(() =>
+			service.recordScopeVerification({
+				scopeId: bucket.id,
+				canonicalRoot: "/repo",
+				rootIdentity: { object: "invented-continuity" },
+			}),
+		).toThrow("not historical identity");
+		expect(service.getScope(bucket.id)?.rootIdentityJson).toBeNull();
+		const operation = service.beginOperation(operationInput());
+		const original = scope;
+		scope = bucket;
+		expect(() => service.prepareEffects(operation.id, [effectInput()])).toThrow("not verified");
+		scope = original;
+		expect(() =>
+			service.prepareBashCoordinationScope({ ...input, workspaceInstanceId: "strong-instance" }),
+		).toThrow("separate scope namespace");
+		for (const status of ["needs_verification", "retired"] as const) {
+			db.update(fileChangeScopes).set({ status }).where(eq(fileChangeScopes.id, bucket.id)).run();
+			expect(service.prepareBashCoordinationScope(input).status).toBe(status);
+		}
+	});
+
 	test("scopes default unverified and preparing effects do not enable execution", async () => {
 		expect(scope.status).toBe("needs_verification");
 		const operation = service.beginOperation(operationInput());

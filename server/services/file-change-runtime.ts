@@ -935,15 +935,66 @@ export class LocalFileChangeRuntime {
 		const source = await this.workspaceSource();
 		// Bash consumes no blobs. Do not acquire or repair the global cache here:
 		// unrelated file-history IO must never delay process dispatch.
-		const { scope, root } = await this.prepareWorkspaceScope(source, backend, cwd, signal);
+		const { scope, root, identityUnavailable } = await this.prepareBashScope(
+			source,
+			backend,
+			cwd,
+			signal,
+		);
 		signal.throwIfAborted();
-		const token = this.coordinator.registerActivity({ scope, runtime: frozenRuntime });
+		const input = { scope, runtime: frozenRuntime };
+		const token = identityUnavailable
+			? this.coordinator.registerIdentityUnavailableActivity(input)
+			: this.coordinator.registerActivity(input);
 		return Object.freeze({
 			cwd: root,
 			scope,
 			token,
 			end: (outcome: "finished" | "unknown") => this.coordinator.endActivity(token, outcome),
 		});
+	}
+
+	/** Birthtime is unavailable on some Android/PRoot and other mounts. A shell
+	 * still needs physical-path coordination, not invented historical continuity. */
+	private async prepareBashScope(
+		namespace: Pick<Namespace, "sourceInstanceId">,
+		backend: ExecutionBackend,
+		cwd: string,
+		signal: AbortSignal,
+	) {
+		if (backend.pathFlavor !== "posix" && backend.pathFlavor !== "windows")
+			throw new Error("Local Bash requires a filesystem path grammar");
+		try {
+			return {
+				...(await this.prepareWorkspaceScope(namespace, backend, cwd, signal)),
+				identityUnavailable: false,
+			};
+		} catch (error) {
+			if (!(error instanceof LocalObjectIdentityUnavailableError)) throw error;
+			// Resolve and validate again rather than treating every failed admission
+			// as a filesystem capability failure. No missing-directory/symlink bypass.
+			const { canonicalPath: root } = await backend.resolvePathIdentity(cwd, { signal });
+			signal.throwIfAborted();
+			const stat = await lstat(root, { bigint: true });
+			if (!stat.isDirectory() || stat.isSymbolicLink())
+				throw new LocalFileValidationError("Canonical workspace root is not a directory");
+			const scope = this.evidence.prepareBashCoordinationScope({
+				sourceInstanceId: namespace.sourceInstanceId,
+				deviceId: LOCAL_DEVICE_ID,
+				workspaceInstanceId: `bash-coordination:v1:${hash([
+					namespace.sourceInstanceId,
+					backend.pathFlavor,
+					root,
+				])}`,
+				canonicalRoot: root,
+				pathFlavor: backend.pathFlavor,
+			});
+			// Do not recordScopeVerification: this bucket is never a root incarnation.
+			logger.warn("Bash workspace has no strong object identity; using path-only coordination", {
+				reason: error.message,
+			});
+			return { scope, root, identityUnavailable: true };
+		}
 	}
 
 	/** One scope resolver for actual local Write/Edit/editor targets and Bash cwd.
@@ -2037,24 +2088,10 @@ export async function registerLocalBashActivity(
 	}
 	if (backend.deviceId !== LOCAL_DEVICE_ID)
 		throw new Error("Local Bash requires the local device identity");
-	// Local rollback runs on POSIX and Windows, so local Bash on both must be
-	// visible to the coordinator: an unregistered shell could write concurrently
-	// with a rollback lease and have its changes silently overwritten.
-	try {
-		return await (await currentRuntime()).registerBashActivity({ ...request, target });
-	} catch (error) {
-		// EXCEPTION, Windows only: a workspace on a volume without object identities
-		// (FAT/exFAT, some network shares) can never hold rollback evidence, so no
-		// lease can cover it and there is nothing for this shell to race. Refusing
-		// the shell there would make Bash unusable on such volumes for no protection.
-		// POSIX always provides identities, so a failure there stays fail-closed.
-		if (backend.pathFlavor !== "windows" || !(error instanceof LocalObjectIdentityUnavailableError))
-			throw error;
-		logger.warn("Bash workspace has no object identity; running without rollback coordination", {
-			reason: error.message,
-		});
-		return undefined;
-	}
+	// All local shells remain visible to the coordinator, including filesystems
+	// without birthtime. Identity-unavailable admission is handled inside the
+	// runtime with a separate path-only bucket and the same physical barriers.
+	return (await currentRuntime()).registerBashActivity({ ...request, target });
 }
 
 async function currentRuntime(): Promise<LocalFileChangeRuntime> {

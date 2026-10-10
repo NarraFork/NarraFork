@@ -541,6 +541,74 @@ export class WorkspaceWriteCoordinator {
 	}
 
 	/**
+	 * Admit Bash activity without strong object identity using physical barriers,
+	 * not historical scope identity. No verification or history is created here.
+	 * Conservatively reject even live ordinary writes; registerActivity retains
+	 * its existing observation semantics for callers with strong identity.
+	 */
+	registerIdentityUnavailableActivity(
+		input: Pick<WorkspaceWriteRequest, "scope" | "runtime">,
+	): WorkspaceActivityToken {
+		const scope = copyScope(input.scope);
+		this.requireRuntime(scope.deviceId, input.runtime);
+		const row = this.requireScope(this.db, scope);
+		if (row.status === "retired") throw fail("scope_inactive", "Scope is retired");
+		if (!scope.workspaceInstanceId.startsWith("bash-coordination:v1:")) {
+			throw fail(
+				"scope_identity_mismatch",
+				"Identity-unavailable activity requires a Bash coordination scope",
+			);
+		}
+		// Keep large root identity JSON out of the hot scope projection and JS.
+		const identity = this.db
+			.select({ unavailable: sql<number>`${scopes.rootIdentityJson} IS NULL` })
+			.from(scopes)
+			.where(eq(scopes.id, scope.id))
+			.get();
+		if (identity?.unavailable !== 1) {
+			throw fail(
+				"scope_identity_mismatch",
+				"A Bash coordination scope must not carry strong root identity",
+			);
+		}
+		this.requireNoQuarantine(this.db, scope);
+		// Legacy/incomplete metadata can retain mutations without a lease row or
+		// activeLeaseId. Bound the device-index prefix inventory BEFORE filtering
+		// counts: a count predicate has no index and could scan unlimited zero rows.
+		const inventory = this.db
+			.select({
+				id: scopes.id,
+				deviceId: scopes.deviceId,
+				pathFlavor: scopes.pathFlavor,
+				canonicalRoot: scopes.canonicalRoot,
+				activeMutationCount: scopes.activeMutationCount,
+			})
+			.from(scopes)
+			.where(eq(scopes.deviceId, scope.deviceId))
+			.limit(WORKSPACE_WRITE_COORDINATOR_LIMITS.verificationScopes + 1)
+			.all();
+		if (inventory.length > WORKSPACE_WRITE_COORDINATOR_LIMITS.verificationScopes) {
+			throw fail("verification_backlog", "Mutation scope inventory exceeds the admission budget");
+		}
+		const ranges = freezeWorkspaceRanges(scope);
+		for (const blocker of inventory) {
+			assertInteger(blocker.activeMutationCount, "active mutation count");
+			if (
+				blocker.activeMutationCount !== 0 &&
+				workspaceRangesIntersect(scope, ranges, blocker, [
+					{ kind: "subtree", canonicalPath: blocker.canonicalRoot },
+				])
+			) {
+				throw fail(
+					"needs_verification",
+					`An overlapping physical scope has unfinished mutations: ${blocker.id}`,
+				);
+			}
+		}
+		return this.registerActivity({ scope, runtime: input.runtime });
+	}
+
+	/**
 	 * Register BEFORE starting a long Bash/unknown writer; end only when it has
 	 * really stopped (including delegated work). This is observation, not a write
 	 * permission or a long-held write lock. A strict rollback rejects intersecting registration.
@@ -858,6 +926,7 @@ export class WorkspaceWriteCoordinator {
 				: undefined;
 		const initialRootVerification =
 			!lease &&
+			!current.workspaceInstanceId.startsWith("bash-coordination:v1:") &&
 			current.status === "needs_verification" &&
 			rootIdentity === null &&
 			current.activeLeaseId === null &&

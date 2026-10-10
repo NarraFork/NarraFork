@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:
 import { spawnSync } from "node:child_process";
 import {
 	chmod,
+	lstat,
 	mkdir,
 	mkdtemp,
 	readFile,
@@ -14,6 +15,7 @@ import {
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { testEnvironment } from "../../../../../tests/preload";
 import { cleanDb, getTestDb } from "../../../../../tests/setup";
@@ -163,9 +165,8 @@ if (migrationScenario) {
 	const { writeTool } = await import("../write");
 	const { localBackend } = await import("../../execution/local-backend");
 	const { windowsPathSemantics } = await import("../../execution/path-semantics");
-	const { LocalFileValidationError, LocalObjectIdentityUnavailableError } = await import(
-		"@server/services/file-change-local-io"
-	);
+	const localIo = await import("@server/services/file-change-local-io");
+	const { LocalFileValidationError, LocalObjectIdentityUnavailableError } = localIo;
 	const {
 		LocalFileChangeRuntime: Runtime,
 		withLocalFileChangeRuntime,
@@ -403,6 +404,16 @@ await Bun.write("bash.txt", "finished");`;
 		};
 		gates.push(gate);
 		return gate;
+	}
+	function withoutWorkspaceBirthtime(roots = [workspace]) {
+		const directoryIdentity = localIo.localDirectoryIdentity;
+		// Module-local capability seam only: real FS, backend, private-root identity,
+		// directory validation, and actual process dispatch remain untouched.
+		return spyOn(localIo, "localDirectoryIdentity").mockImplementation(async (path) => {
+			if (!roots.includes(path)) return directoryIdentity(path);
+			const stat = await lstat(path, { bigint: true });
+			return localIo.localObjectIdentity(Object.assign(Object.create(stat), { birthtimeNs: 0n }));
+		});
 	}
 	async function taskId() {
 		const task = db.select().from(schema.backgroundTasks).limit(1).get();
@@ -1049,6 +1060,129 @@ await Bun.write("bash.txt", "finished");`;
 			});
 		}
 
+		test("missing workspace birthtime dispatches real Bash with stable path-only coordination", async () => {
+			const strongScope = await scopeFromWrite();
+			expect(strongScope.rootIdentityJson).not.toBeNull();
+			const identities = withoutWorkspaceBirthtime();
+			const registration = spyOn(runtime.coordinator, "registerIdentityUnavailableActivity");
+			const gate = program();
+			const running = run(gate.command);
+			await gate.ready.promise;
+			expect(dispatched).toHaveLength(1);
+			expect(runtime.coordinator.capture(strongScope).active.uncoordinatedActivities).toBe(1);
+			await blocked(strongScope);
+			const coordinationScope = registration.mock.calls[0]?.[0].scope;
+			if (!coordinationScope) throw new Error("Path-only registration was not reached");
+			expect(coordinationScope.id).not.toBe(strongScope.id);
+			expect(coordinationScope.workspaceInstanceId).toStartWith("bash-coordination:v1:");
+			gate.release.resolve();
+			expect((await running).isError).not.toBe(true);
+			await finished();
+			expect(runtime.coordinator.capture(strongScope).active.uncoordinatedActivities).toBe(0);
+			expect(await rollback(strongScope)).toBe("granted");
+			for (const command of ["printf first > bash.txt", "printf second > bash.txt"]) {
+				expect((await run(command)).isError).not.toBe(true);
+				await finished();
+			}
+			expect(await readFile(join(workspace, "bash.txt"), "utf8")).toBe("second");
+			expect(dispatched).toHaveLength(3);
+			expect(registration).toHaveBeenCalledTimes(3);
+			for (const [input] of registration.mock.calls) {
+				expect(input.scope.id).toBe(coordinationScope.id);
+			}
+			const scopes = db.select().from(schema.fileChangeScopes).all();
+			expect(scopes).toHaveLength(2);
+			expect(scopes.find((row) => row.id === coordinationScope.id)).toMatchObject({
+				status: "active",
+				rootIdentityJson: null,
+				canonicalRoot: workspace,
+			});
+			// Only the pre-existing real Write has history or receipts. Shell mutations
+			// must not turn the path-only bucket into reversible evidence.
+			expect(db.select().from(schema.fileChangeOperations).all()).toHaveLength(1);
+			expect(
+				db
+					.select()
+					.from(schema.fileChangeEffects)
+					.all()
+					.filter((row) => row.scopeId === coordinationScope.id),
+			).toHaveLength(0);
+			expect(db.select().from(schema.snapshotCaptures).all()).toHaveLength(0);
+			expect(await localIo.localDirectoryIdentity(privateRoot)).toBeString();
+			expect(identities.mock.calls.some(([path]) => path === privateRoot)).toBe(true);
+		});
+
+		for (const relation of ["same", "child", "parent"] as const) {
+			test(`missing birthtime ${relation} cwd cannot spawn during concurrent rollback`, async () => {
+				const child = join(workspace, "nested");
+				await mkdir(child);
+				const scope = await scopeFromWrite(relation === "parent" ? child : workspace);
+				const cwd = relation === "child" ? child : workspace;
+				withoutWorkspaceBirthtime([cwd]);
+				const entered = deferred();
+				const release = deferred();
+				const rollingBack = runtime.coordinator.withRollbackMany(
+					{ scopes: [{ scope, runtime: runtimeBinding }] },
+					async () => {
+						entered.resolve();
+						await release.promise;
+					},
+				);
+				try {
+					await entered.promise;
+					const refused = await run("printf bad > bash.txt", context(cwd));
+					expect(refused.isError).toBe(true);
+					expect(refused.output).toContain("needs verification");
+					expect(dispatched).toHaveLength(0);
+				} finally {
+					release.resolve();
+					await rollingBack;
+				}
+			});
+
+			for (const barrier of ["status", "lease", "mutation"] as const) {
+				test(`missing birthtime ${relation} cwd rejects unresolved durable scope ${barrier}`, async () => {
+					const child = join(workspace, "nested");
+					await mkdir(child);
+					const scope = await scopeFromWrite(relation === "parent" ? child : workspace);
+					const cwd = relation === "child" ? child : workspace;
+					withoutWorkspaceBirthtime([cwd]);
+					db.update(schema.fileChangeScopes)
+						.set(
+							barrier === "status"
+								? { status: "needs_verification" }
+								: barrier === "lease"
+									? { activeLeaseId: "unfinished-lease", activeLeaseEpoch: "previous-owner" }
+									: { activeMutationCount: 1 },
+						)
+						.where(eq(schema.fileChangeScopes.id, scope.id))
+						.run();
+					const refused = await run("printf bad > bash.txt", context(cwd));
+					expect(refused.isError).toBe(true);
+					expect(dispatched).toHaveLength(0);
+					expect(await readFile(join(scope.canonicalRoot, "bash.txt"), "utf8")).toBe("before");
+				});
+			}
+		}
+
+		for (const failure of ["validation", "permission"] as const) {
+			test(`workspace identity ${failure} failure still prevents real shell dispatch`, async () => {
+				const directoryIdentity = localIo.localDirectoryIdentity;
+				spyOn(localIo, "localDirectoryIdentity").mockImplementation(async (path) => {
+					if (path !== workspace) return directoryIdentity(path);
+					throw failure === "validation"
+						? new LocalFileValidationError("Canonical workspace root is not a directory")
+						: Object.assign(new Error("workspace permission denied"), { code: "EACCES" });
+				});
+				const registration = spyOn(runtime.coordinator, "registerIdentityUnavailableActivity");
+				const refused = await run("printf bad > bash.txt");
+				expect(refused.isError).toBe(true);
+				expect(dispatched).toHaveLength(0);
+				expect(registration).not.toHaveBeenCalled();
+				expect(db.select().from(schema.fileChangeScopes).all()).toHaveLength(0);
+			});
+		}
+
 		test("blob permission/catalog failures do not prevent shell dispatch", async () => {
 			const namespace = await runtime.initialize();
 			await chmod(join(privateRoot, "file-change-blobs"), 0o755);
@@ -1109,20 +1243,19 @@ await Bun.write("bash.txt", "finished");`;
 				execCommand,
 			});
 
-		test("a Windows volume without object identities runs Bash uncoordinated", async () => {
-			// FAT/exFAT and some shares report no dev/ino/birthtime: such a workspace can
-			// never hold rollback evidence, so there is no lease for the shell to race.
+		test("Windows never dispatches after an uncoordinated identity admission error", async () => {
+			// Capability fallback belongs inside runtime coordination, never outside admission.
 			spyOn(runtime, "registerBashActivity").mockImplementation(async () => {
 				throw new LocalObjectIdentityUnavailableError("no object identity");
 			});
 			const execCommand = mock(async () => complete());
 			backend = windowsBackend(execCommand);
-			expect((await run("windows-command", context("C:\\workspace"))).isError).not.toBe(true);
-			expect(execCommand).toHaveBeenCalledTimes(1);
+			expect((await run("windows-command", context("C:\\workspace"))).isError).toBe(true);
+			expect(execCommand).not.toHaveBeenCalled();
 		});
 
 		test("other Windows admission validation failures still fail closed", async () => {
-			// Only "the volume has no identities" is exempt; a real mismatch is not.
+			// No outer admission error, including a real mismatch, permits dispatch.
 			spyOn(runtime, "registerBashActivity").mockImplementation(async () => {
 				throw new LocalFileValidationError("Canonical workspace root is not a directory");
 			});
@@ -1132,7 +1265,7 @@ await Bun.write("bash.txt", "finished");`;
 			expect(execCommand).not.toHaveBeenCalled();
 		});
 
-		test("POSIX never degrades on a missing object identity", async () => {
+		test("POSIX never dispatches after an uncoordinated identity admission error", async () => {
 			spyOn(runtime, "registerBashActivity").mockImplementation(async () => {
 				throw new LocalObjectIdentityUnavailableError("no object identity");
 			});

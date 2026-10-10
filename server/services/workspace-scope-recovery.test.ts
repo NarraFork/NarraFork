@@ -23,6 +23,7 @@ import {
 	workspaceWriteLeases,
 } from "../db/schema";
 import { generateId } from "../lib/id";
+import { observeWorkspaceProcess } from "../lib/workspace-process-identity";
 import { FILE_CHANGE_BLOB_BUDGET_ID } from "./file-change-blob-catalog";
 import {
 	type BeginFileChangeOperation,
@@ -31,6 +32,7 @@ import {
 	type PrepareFileChangeEffect,
 } from "./file-change-evidence";
 import { createFileChangeIdentity } from "./file-change-identity";
+import * as localIo from "./file-change-local-io";
 import { fileChangeLocalIo } from "./file-change-local-io";
 import * as ownerAuthority from "./workspace-execution-owner";
 import { createWorkspaceScopeRecovery } from "./workspace-scope-recovery";
@@ -651,6 +653,287 @@ describe("workspace barrier recovery", () => {
 		});
 		const after = await recovery.listWorkspaceBarriers();
 		expect(after.items.map((item) => item.scope.id)).not.toContain(scope.id);
+	});
+});
+
+describe("path-only Bash activity barrier recovery", () => {
+	let maintenanceInput:
+		| { scopeId: string; adminUserId: string; maintenanceToken: string }
+		| undefined;
+	beforeEach(() => {
+		maintenanceInput = undefined;
+	});
+	async function beginBucketMaintenance() {
+		const permit = await recovery.beginWorkspaceMaintenance({
+			scopeId: scope.id,
+			adminUserId: USER_ID,
+			acknowledgeWritersStopped: true,
+			operatorReason: "Old instance and all external writers stopped; inspect path-only activity",
+		});
+		maintenanceInput = {
+			scopeId: scope.id,
+			adminUserId: USER_ID,
+			maintenanceToken: permit.maintenanceToken,
+		};
+		return recovery.observeWorkspaceMaintenance(maintenanceInput);
+	}
+	function pathOnlyBucket() {
+		// Replace the unused historical fixture so its unverified root does not
+		// independently block this physical workspace's activity recovery.
+		db.delete(fileChangeScopes).where(eq(fileChangeScopes.id, scope.id)).run();
+		scope = service.prepareBashCoordinationScope({
+			sourceInstanceId: source,
+			deviceId: "local",
+			workspaceInstanceId: `bash-coordination:v1:${generateId()}`,
+			pathFlavor: "posix",
+			canonicalRoot: root,
+		});
+		expect(scope.status).toBe("active");
+		expect(scope.rootIdentityJson).toBeNull();
+		return coordinator.registerActivity({ scope, runtime: binding });
+	}
+
+	async function confirmBucket(confirmationToken: string, acknowledgeInspected = true) {
+		if (maintenanceInput)
+			return recovery.commitWorkspaceMaintenance({
+				...maintenanceInput,
+				confirmationToken,
+				acknowledgements: [],
+				acknowledgeInspected,
+			});
+		return recovery.recoverWorkspaceBarrier({
+			scopeId: scope.id,
+			recoveredByUserId: USER_ID,
+			confirmationToken,
+			acknowledgements: [],
+			acknowledgeInspected,
+		});
+	}
+
+	test("unknown path-only activity is inspected and recovered without strong birthtime or receipts", async () => {
+		const activity = pathOnlyBucket();
+		coordinator.endActivity(activity, "unknown");
+		expect(scopeRow()?.status).toBe("needs_verification");
+		const identity = spyOn(localIo, "localDirectoryIdentity").mockRejectedValue(
+			new Error("Filesystem object birthtime is unavailable"),
+		);
+		const verification = spyOn(service, "recordScopeVerification");
+		try {
+			const page = await recovery.listWorkspaceBarriers();
+			expect(page.items.find((item) => item.scope.id === scope.id)).toMatchObject({
+				kind: "quarantined",
+				executionEnded: false,
+				maintenanceRequired: true,
+			});
+			await expect(recovery.observeWorkspaceBarrier(scope.id)).rejects.toMatchObject({
+				statusCode: 409,
+			});
+			await expect(confirmBucket("not-confirmed")).rejects.toMatchObject({ statusCode: 409 });
+			const preview = await beginBucketMaintenance();
+			expect(preview.observations).toEqual([]);
+			expect(preview.rangeObservations).toEqual([
+				expect.objectContaining({ canonicalPath: root, actualKind: "directory" }),
+			]);
+			expect(await confirmBucket(preview.confirmationToken)).toMatchObject({
+				recovered: "barrier_cleared",
+				settledEffectCount: 0,
+				remaining: { rootVerificationRequired: false, leaseBarrier: false },
+			});
+			expect(scopeRow()).toMatchObject({ status: "active", rootIdentityJson: null });
+			expect(identity).not.toHaveBeenCalled();
+			expect(verification).not.toHaveBeenCalled();
+			expect(auditRows()).toHaveLength(1);
+			expect(auditRows()[0]?.effectDecisionsJson).toEqual([]);
+			expect(
+				db.select().from(fileChangeEffects).where(eq(fileChangeEffects.scopeId, scope.id)).all(),
+			).toEqual([]);
+			expect(
+				db
+					.select()
+					.from(fileChangeOperations)
+					.where(eq(fileChangeOperations.sourceInstanceId, source))
+					.all(),
+			).toEqual([]);
+		} finally {
+			identity.mockRestore();
+			verification.mockRestore();
+		}
+	});
+
+	test("registered owners and a cold coordinator epoch recover path-only unknown activity only through exclusive maintenance", async () => {
+		const observation = await observeWorkspaceProcess(process.pid);
+		if (observation.kind !== "present") throw new Error("Fixture process identity is unavailable");
+		const oldEpoch = coordinator.ownerEpoch();
+		db.insert(workspaceExecutionOwners)
+			.values({
+				ownerEpoch: oldEpoch,
+				identityJson: observation.identity,
+				createdAt: new Date(clock).toISOString(),
+			})
+			.run();
+		const identity = spyOn(localIo, "localDirectoryIdentity").mockRejectedValue(
+			new Error("Filesystem object birthtime is unavailable"),
+		);
+		let newEpoch: string | undefined;
+		try {
+			coordinator.endActivity(pathOnlyBucket(), "unknown");
+			expect(scopeRow()).toMatchObject({
+				status: "needs_verification",
+				rootIdentityJson: null,
+				activeLeaseId: null,
+				activeLeaseEpoch: null,
+			});
+			coordinator = new WorkspaceWriteCoordinator({
+				db,
+				state: createWorkspaceWriteCoordinatorState(),
+				readRuntime: () => binding,
+			});
+			newEpoch = coordinator.ownerEpoch();
+			expect(newEpoch).not.toBe(oldEpoch);
+			db.insert(workspaceExecutionOwners)
+				.values({
+					ownerEpoch: newEpoch,
+					identityJson: observation.identity,
+					createdAt: new Date(clock).toISOString(),
+				})
+				.run();
+			let authority = false;
+			recovery = createWorkspaceScopeRecovery({
+				database: db,
+				getRuntime: async () => ({ coordinator, evidence: service }),
+				assertMaintenanceAuthority: () => {
+					if (!authority) throw new Error("Exclusive instance lock unavailable");
+				},
+				now: () => clock,
+			});
+			await expect(recovery.observeWorkspaceBarrier(scope.id)).rejects.toMatchObject({
+				statusCode: 409,
+			});
+			await expect(confirmBucket("not-confirmed")).rejects.toMatchObject({ statusCode: 409 });
+			await expect(beginBucketMaintenance()).rejects.toMatchObject({
+				code: "MAINTENANCE_AUTHORITY_REQUIRED",
+			});
+			authority = true;
+			await expect(
+				recovery.beginWorkspaceMaintenance({
+					scopeId: scope.id,
+					adminUserId: USER_ID,
+					acknowledgeWritersStopped: false,
+					operatorReason: "Not yet confirmed stopped",
+				}),
+			).rejects.toMatchObject({ code: "ACK_REQUIRED" });
+			const preview = await beginBucketMaintenance();
+			if (!maintenanceInput) throw new Error("Missing maintenance capability");
+			authority = false;
+			await expect(confirmBucket(preview.confirmationToken)).rejects.toMatchObject({
+				code: "MAINTENANCE_AUTHORITY_REQUIRED",
+			});
+			expect(scopeRow()?.status).toBe("needs_verification");
+			expect(auditRows()).toEqual([]);
+			authority = true;
+			expect(await confirmBucket(preview.confirmationToken)).toMatchObject({
+				recovered: "barrier_cleared",
+				settledEffectCount: 0,
+			});
+			expect(scopeRow()).toMatchObject({ status: "active", rootIdentityJson: null });
+			expect(auditRows()[0]).toMatchObject({
+				resolutionAuthority: "administrator_attested",
+				maintenanceEvidenceJson: {
+					oldOwnerEpoch: null,
+					maintenanceAuthority: "exclusive_instance_lock",
+				},
+				effectDecisionsJson: [],
+			});
+			expect(identity).not.toHaveBeenCalled();
+			expect(
+				db
+					.select()
+					.from(workspaceWriteLeases)
+					.where(eq(workspaceWriteLeases.scopeId, scope.id))
+					.all(),
+			).toEqual([]);
+		} finally {
+			identity.mockRestore();
+			db.delete(workspaceExecutionOwners)
+				.where(
+					inArray(workspaceExecutionOwners.ownerEpoch, [oldEpoch, ...(newEpoch ? [newEpoch] : [])]),
+				)
+				.run();
+		}
+	});
+
+	test("historical unverified roots still fail closed when strong birthtime is unavailable", async () => {
+		const identity = spyOn(localIo, "localDirectoryIdentity").mockRejectedValue(
+			new Error("Filesystem object birthtime is unavailable"),
+		);
+		try {
+			await expect(recovery.observeWorkspaceBarrier(scope.id)).rejects.toThrow(
+				"Filesystem object birthtime is unavailable",
+			);
+			await expect(confirmBucket("not-confirmed")).rejects.toThrow(
+				"Filesystem object birthtime is unavailable",
+			);
+			expect(identity).toHaveBeenCalledTimes(2);
+			expect(scopeRow()).toMatchObject({ status: "needs_verification", rootIdentityJson: null });
+			expect(auditRows()).toEqual([]);
+		} finally {
+			identity.mockRestore();
+		}
+	});
+
+	test("live path-only activity cannot be observed or recovered", async () => {
+		const activity = pathOnlyBucket();
+		try {
+			await expect(recovery.observeWorkspaceBarrier(scope.id)).rejects.toMatchObject({
+				statusCode: 409,
+			});
+			await expect(confirmBucket("not-confirmed")).rejects.toMatchObject({ statusCode: 409 });
+			await expect(beginBucketMaintenance()).rejects.toMatchObject({ statusCode: 409 });
+			expect(scopeRow()).toMatchObject({ status: "active", rootIdentityJson: null });
+			expect(auditRows()).toEqual([]);
+		} finally {
+			coordinator.endActivity(activity, "unknown");
+		}
+	});
+
+	test("unknown path-only recovery still requires matching confirmation and explicit inspection", async () => {
+		coordinator.endActivity(pathOnlyBucket(), "unknown");
+		const preview = await beginBucketMaintenance();
+		await expect(confirmBucket("not-confirmed")).rejects.toMatchObject({
+			code: "OBSERVATION_CHANGED",
+		});
+		await expect(confirmBucket(preview.confirmationToken, false)).rejects.toMatchObject({
+			code: "ACK_REQUIRED",
+		});
+		expect(scopeRow()).toMatchObject({ status: "needs_verification", rootIdentityJson: null });
+		expect(auditRows()).toEqual([]);
+		if (!maintenanceInput) throw new Error("Missing maintenance capability");
+		await recovery.cancelWorkspaceMaintenance(maintenanceInput);
+	});
+
+	test("failed path-only recovery rolls back audit and retains its barrier without root evidence", async () => {
+		coordinator.endActivity(pathOnlyBucket(), "unknown");
+		const preview = await beginBucketMaintenance();
+		const before = scopeRow();
+		db.$client.run(
+			`CREATE TEMP TRIGGER fail_bucket_recovery BEFORE UPDATE OF status ON file_change_scopes WHEN NEW.id = '${scope.id}' AND NEW.status = 'active' BEGIN SELECT RAISE(ABORT, 'injected bucket recovery failure'); END`,
+		);
+		try {
+			await expect(confirmBucket(preview.confirmationToken)).rejects.toThrow(
+				"injected bucket recovery failure",
+			);
+		} finally {
+			db.$client.run("DROP TRIGGER fail_bucket_recovery");
+		}
+		expect(scopeRow()).toEqual(before);
+		expect(scopeRow()?.rootIdentityJson).toBeNull();
+		expect(auditRows()).toEqual([]);
+		if (!maintenanceInput) throw new Error("Missing maintenance capability");
+		const retry = await recovery.observeWorkspaceMaintenance(maintenanceInput);
+		expect(await confirmBucket(retry.confirmationToken)).toMatchObject({
+			recovered: "barrier_cleared",
+		});
+		expect(scopeRow()?.rootIdentityJson).toBeNull();
 	});
 });
 

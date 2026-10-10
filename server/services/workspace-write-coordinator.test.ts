@@ -663,6 +663,270 @@ describe("bounded admission, cancellation and explicit nesting", () => {
 	});
 });
 
+describe("identity-unavailable activity admission", () => {
+	function coordinationScope(canonicalRoot = scope.canonicalRoot) {
+		return addScope({
+			sourceInstanceId: "coordination-only-source",
+			workspaceInstanceId: `bash-coordination:v1:${++serial}`,
+			canonicalRoot,
+		});
+	}
+
+	test("validates runtime and scope before registration without changing identity", () => {
+		const target = coordinationScope();
+		const before = row(target);
+		expectCode(
+			() =>
+				coordinator.registerIdentityUnavailableActivity(
+					request(target, {
+						runtime: { ...runtime, runtimeGeneration: runtime.runtimeGeneration + 1 },
+					}),
+				),
+			"runtime_mismatch",
+		);
+		expectCode(
+			() => coordinator.registerIdentityUnavailableActivity(request({ ...target, id: "missing" })),
+			"scope_not_found",
+		);
+		update({ status: "retired" }, target);
+		expectCode(
+			() => coordinator.registerIdentityUnavailableActivity(request(target)),
+			"scope_inactive",
+		);
+		update({ status: "active" }, target);
+		const activity = coordinator.registerIdentityUnavailableActivity(request(target));
+		coordinator.endActivity(activity);
+		expect(row(target)).toEqual(before);
+		expect(db.select().from(durableLeases).all()).toHaveLength(0);
+	});
+
+	for (const relation of ["same", "parent", "child"] as const) {
+		function targetScope() {
+			return coordinationScope(
+				relation === "parent"
+					? "/workspace"
+					: relation === "child"
+						? `${scope.canonicalRoot}/child`
+						: scope.canonicalRoot,
+			);
+		}
+
+		test(`${relation} physical activity excludes old strong-scope rollback until finished`, async () => {
+			const target = targetScope();
+			const activity = coordinator.registerIdentityUnavailableActivity(request(target));
+			await expect(coordinator.withRollback(request(), () => undefined)).rejects.toThrow(
+				errorCode("uncoordinated_activity"),
+			);
+			coordinator.endActivity(activity);
+			await coordinator.withRollback(request(), () => undefined);
+		});
+
+		for (const policy of ["strict", "observe"] as const) {
+			test(`${relation} physical activity cannot overlap live ${policy} rollback`, async () => {
+				const target = targetScope();
+				const held = await hold(scope, "rollback", coordinator, { activityPolicy: policy });
+				expectCode(
+					() => coordinator.registerIdentityUnavailableActivity(request(target)),
+					"needs_verification",
+				);
+				expect(held.lease.overlappedUncoordinatedActivity).toBe(false);
+				held.release();
+				await held.done;
+			});
+		}
+
+		for (const barrier of [
+			"needs_verification",
+			"quarantined",
+			"restart",
+			"orphan-mutation",
+		] as const) {
+			test(`${relation} physical activity respects durable ${barrier} across source identities`, async () => {
+				const target = targetScope();
+				if (barrier === "needs_verification") update({ status: "needs_verification" });
+				if (barrier === "quarantined") {
+					await coordinator.withWrite(request(), (lease) => lease.markUncertain());
+					expectQuarantined();
+				}
+				if (barrier === "restart") {
+					update({ activeLeaseId: "old-lease", activeLeaseEpoch: "old-epoch" });
+				}
+				if (barrier === "orphan-mutation") update({ activeMutationCount: 1 });
+				const fresh = makeCoordinator({ state: createWorkspaceWriteCoordinatorState() });
+				expectCode(
+					() => fresh.registerIdentityUnavailableActivity(request(target)),
+					"needs_verification",
+				);
+				expect(row(target)).toMatchObject({
+					status: "active",
+					rootIdentityJson: null,
+					fencingToken: 0,
+				});
+				expect(fresh.capture(target).active.uncoordinatedActivities).toBe(0);
+			});
+		}
+
+		test(`${relation} physical activity cannot bypass a live recovery reservation`, () => {
+			const target = targetScope();
+			update({ status: "needs_verification", rootIdentityJson: null });
+			const reservation = coordinator.reserveRecovery({ scope });
+			expectCode(
+				() => coordinator.registerIdentityUnavailableActivity(request(target)),
+				"needs_verification",
+			);
+			reservation.complete((tx) => {
+				tx.update(scopes)
+					.set({ status: "active", rootIdentityJson: { device: "verified" } })
+					.where(eq(scopes.id, scope.id))
+					.run();
+			});
+			const activity = coordinator.registerIdentityUnavailableActivity(request(target));
+			coordinator.endActivity(activity);
+		});
+	}
+
+	test("unknown activity persists a barrier without inventing strong identity", async () => {
+		const target = coordinationScope(`${scope.canonicalRoot}/child`);
+		const activity = coordinator.registerIdentityUnavailableActivity(request(target));
+		coordinator.endActivity(activity, "unknown");
+		expect(row(target)).toMatchObject({ status: "needs_verification", rootIdentityJson: null });
+		expect(state.activities.size).toBe(0);
+		const fresh = makeCoordinator({ state: createWorkspaceWriteCoordinatorState() });
+		const alias = coordinationScope();
+		expectCode(
+			() => fresh.registerIdentityUnavailableActivity(request(alias)),
+			"needs_verification",
+		);
+		await expect(fresh.withRollback(request(), () => undefined)).rejects.toThrow(
+			errorCode("needs_verification"),
+		);
+		expect(db.select().from(durableLeases).all()).toHaveLength(0);
+	});
+
+	test("same-epoch unknown coordination activity requires maintenance without invented owner proof", () => {
+		const target = addScope({
+			deviceId: "local",
+			workspaceInstanceId: "bash-coordination:v1:same-recovery",
+		});
+		const activity = coordinator.registerIdentityUnavailableActivity(request(target));
+		coordinator.endActivity(activity, "unknown");
+		expect(row(target)).toMatchObject({
+			status: "needs_verification",
+			rootIdentityJson: null,
+			activeLeaseId: null,
+			activeLeaseEpoch: null,
+		});
+		expectCode(() => coordinator.reserveRecovery({ scope: target }), "recovery_conflict");
+		let authorityChecks = 0;
+		const reservation = coordinator.reserveMaintenance({ scope: target }, () => {
+			authorityChecks++;
+		});
+		expect(reservation.initialRootVerification).toBe(false);
+		expect(reservation.executionEnded).toBe(false);
+		reservation.complete(() => undefined);
+		expect(row(target)).toMatchObject({
+			status: "active",
+			rootIdentityJson: null,
+			activeLeaseEpoch: null,
+		});
+		expect(authorityChecks).toBeGreaterThan(1);
+		const next = coordinator.registerIdentityUnavailableActivity(request(target));
+		coordinator.endActivity(next);
+	});
+
+	test("cold-epoch unknown coordination activity requires maintenance authority", () => {
+		const target = addScope({
+			deviceId: "local",
+			workspaceInstanceId: "bash-coordination:v1:cold-recovery",
+		});
+		const activity = coordinator.registerIdentityUnavailableActivity(request(target));
+		coordinator.endActivity(activity, "unknown");
+		const fresh = makeCoordinator({ state: createWorkspaceWriteCoordinatorState() });
+		expectCode(() => fresh.reserveRecovery({ scope: target }), "recovery_conflict");
+		let authorityChecks = 0;
+		const reservation = fresh.reserveMaintenance({ scope: target }, () => {
+			authorityChecks++;
+		});
+		expect(reservation.initialRootVerification).toBe(false);
+		expect(reservation.executionEnded).toBe(false);
+		reservation.complete(() => undefined);
+		expect(authorityChecks).toBeGreaterThan(1);
+		expect(row(target)).toMatchObject({
+			status: "active",
+			rootIdentityJson: null,
+			activeLeaseEpoch: null,
+		});
+		const next = fresh.registerIdentityUnavailableActivity(request(target));
+		fresh.endActivity(next);
+	});
+
+	test("only degraded admission rejects live ordinary writes; original observation still taints them", async () => {
+		const target = coordinationScope();
+		const held = await hold();
+		expectCode(
+			() => coordinator.registerIdentityUnavailableActivity(request(target)),
+			"needs_verification",
+		);
+		const activity = coordinator.registerActivity(request(target));
+		expect(held.lease.overlappedUncoordinatedActivity).toBe(true);
+		coordinator.endActivity(activity);
+		held.release();
+		await held.done;
+	});
+
+	test("original registration remains observational for unverified scope", () => {
+		const target = coordinationScope();
+		update({ status: "needs_verification" }, target);
+		expectCode(
+			() => coordinator.registerIdentityUnavailableActivity(request(target)),
+			"needs_verification",
+		);
+		const activity = coordinator.registerActivity(request(target));
+		coordinator.endActivity(activity);
+		expect(row(target)?.status).toBe("needs_verification");
+	});
+
+	test("rejects trusted scopes and coordination scopes carrying strong root identity", () => {
+		expectCode(
+			() => coordinator.registerIdentityUnavailableActivity(request()),
+			"scope_identity_mismatch",
+		);
+		const target = coordinationScope();
+		update({ rootIdentityJson: { device: "strong-object" } }, target);
+		expectCode(
+			() => coordinator.registerIdentityUnavailableActivity(request(target)),
+			"scope_identity_mismatch",
+		);
+		expect(state.activities.size).toBe(0);
+	});
+
+	test("orphan mutation inventory is bounded before count filtering", () => {
+		const target = coordinationScope();
+		for (let index = 0; index < WORKSPACE_WRITE_COORDINATOR_LIMITS.verificationScopes; index++) {
+			addScope({ canonicalRoot: `/unrelated/${index}` });
+		}
+		queries.length = 0;
+		expectCode(
+			() => coordinator.registerIdentityUnavailableActivity(request(target)),
+			"verification_backlog",
+		);
+		expect(
+			queries.some(
+				(query) => query.includes('"active_mutation_count"') && query.includes("limit ?"),
+			),
+		).toBe(true);
+		expect(state.activities.size).toBe(0);
+	});
+
+	test("non-overlapping and other-device orphan mutations do not deny admission", () => {
+		const target = coordinationScope();
+		addScope({ canonicalRoot: "/unrelated", activeMutationCount: 1 });
+		addScope({ deviceId: "another-device", activeMutationCount: 1 });
+		const activity = coordinator.registerIdentityUnavailableActivity(request(target));
+		coordinator.endActivity(activity);
+	});
+});
+
 describe("uncoordinated activity windows and conservative capture", () => {
 	test("long activity does not own a write lock, but refuses overlapping rollback", async () => {
 		const child = addScope({ canonicalRoot: `${scope.canonicalRoot}/child` });

@@ -190,7 +190,22 @@ export class FileChangeEvidenceService {
 		return this.database.transaction(work);
 	}
 
+	/** A path coordination bucket, NOT a verified workspace incarnation. Never
+	 * promotes an existing recovery barrier or supplies a root object identity. */
+	prepareBashCoordinationScope(input: PrepareFileChangeScope): FileChangeScopeRecord {
+		if (!input.workspaceInstanceId.startsWith("bash-coordination:v1:"))
+			throw fail("INVALID_INPUT", "Bash coordination requires a separate scope namespace");
+		return this.prepareScopeRecord(input, true);
+	}
+
 	prepareScope(input: PrepareFileChangeScope): FileChangeScopeRecord {
+		return this.prepareScopeRecord(input, false);
+	}
+
+	private prepareScopeRecord(
+		input: PrepareFileChangeScope,
+		coordinationOnly: boolean,
+	): FileChangeScopeRecord {
 		const values = normalizeScope(input);
 		return this.transaction((tx) => {
 			const existing = tx
@@ -224,7 +239,7 @@ export class FileChangeEvidenceService {
 			const row = {
 				...values,
 				id: input.id ?? generateId(),
-				status: "needs_verification" as const,
+				status: coordinationOnly ? ("active" as const) : ("needs_verification" as const),
 				createdAt: timestamp,
 				updatedAt: timestamp,
 			};
@@ -256,6 +271,8 @@ export class FileChangeEvidenceService {
 			throw fail("DURABILITY_BOUNDARY", "Recovery requires an active coordinator transaction");
 		const verify = (tx: Executor) => {
 			const scope = requireScope(tx, input.scopeId);
+			if (scope.workspaceInstanceId.startsWith("bash-coordination:v1:"))
+				throw fail("TARGET_UNVERIFIED", "A Bash coordination bucket is not historical identity");
 			if (
 				scope.activeLeaseId !== null ||
 				scope.activeMutationCount > 0 ||
@@ -1758,7 +1775,11 @@ function assertEffectScope(
 	requireVerified: boolean,
 ) {
 	const scope = requireScope(tx, identity.scopeId);
-	if (scope.status === "retired" || (requireVerified && scope.status !== "active"))
+	if (
+		scope.status === "retired" ||
+		scope.workspaceInstanceId.startsWith("bash-coordination:v1:") ||
+		(requireVerified && scope.status !== "active")
+	)
 		throw fail("TARGET_UNVERIFIED", "The workspace scope is not verified for execution");
 	if (
 		scope.sourceInstanceId !== operation.sourceInstanceId ||

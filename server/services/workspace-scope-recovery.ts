@@ -178,6 +178,11 @@ function effectSummary(effect: RecoveryEffect): WorkspaceBarrierEffectSummary {
 	};
 }
 function barrierKind(row: ScopeRow): WorkspaceBarrier["kind"] {
+	// Path-only Bash buckets never carry historical root identity. Their unknown
+	// activity barriers require human inspection, not initial root verification.
+	// Classification grants no end-of-execution proof: the coordinator still
+	// requires exclusive maintenance for a bucket with no recorded owner evidence.
+	if (row.workspaceInstanceId.startsWith("bash-coordination:v1:")) return "quarantined";
 	// A previously verified root with no lease may represent unknown activity.
 	return row.status === "needs_verification" &&
 		row.activeLeaseId === null &&
