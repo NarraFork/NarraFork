@@ -16,6 +16,7 @@
  */
 import { withPgRetry } from "@server/db/pg-retry";
 import { userPreferences, users } from "@server/db/postgres-schema";
+import { ValidationError } from "@server/lib/errors";
 import { eq, sql } from "drizzle-orm";
 import type { BunSQLDatabase } from "drizzle-orm/bun-sql";
 import type { AccountRole } from "../registration/account-store";
@@ -57,15 +58,14 @@ export function createPostgresAuthSessionStore(db: BunSQLDatabase): AuthSessionS
 		},
 
 		async updateProfile(
-			userId: string,
+			_userId: string,
 			update: { gitUsername?: string | null; gitEmail?: string | null },
 		): Promise<void> {
-			await withPgRetry(
-				async () => {
-					await db.update(users).set(update).where(eq(users.id, userId));
-				},
-				{ label: "authSession.updateProfile" },
-			);
+			// Git identity storage/resolution is not wired to PostgreSQL yet. Do not
+			// acknowledge a legacy-column write that cannot change commit attribution.
+			if (update.gitUsername !== undefined || update.gitEmail !== undefined) {
+				throw new ValidationError("Git identities are not supported on the PostgreSQL backend yet");
+			}
 		},
 
 		async setAvatarImage(userId: string, imageId: string | null): Promise<void> {

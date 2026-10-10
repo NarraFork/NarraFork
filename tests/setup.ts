@@ -72,6 +72,24 @@ export function getTestDb() {
 	sqlite.run("PRAGMA foreign_keys = OFF");
 	applyMigrations(sqlite);
 	ensureColumns(sqlite);
+	// PR6's identity tables have no generated migration yet. Only add in-memory
+	// fixtures here; production databases and migration files are never changed.
+	sqlite.run(`
+		CREATE TABLE IF NOT EXISTS user_git_identities (
+			id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			name TEXT NOT NULL, email TEXT NOT NULL, is_default INTEGER NOT NULL DEFAULT 0,
+			created_at TEXT NOT NULL
+		);
+		CREATE INDEX IF NOT EXISTS idx_user_git_identities_user ON user_git_identities(user_id, created_at);
+		CREATE TABLE IF NOT EXISTS narrator_git_identity_bindings (
+			id TEXT PRIMARY KEY, narrator_id TEXT NOT NULL REFERENCES narrators(id) ON DELETE CASCADE,
+			user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+			identity_id TEXT NOT NULL REFERENCES user_git_identities(id) ON DELETE CASCADE,
+			updated_at TEXT NOT NULL
+		);
+		CREATE UNIQUE INDEX IF NOT EXISTS idx_narrator_git_identity_unique ON narrator_git_identity_bindings(narrator_id, user_id);
+		CREATE INDEX IF NOT EXISTS idx_narrator_git_identity_user ON narrator_git_identity_bindings(user_id);
+	`);
 	sqlite.run("PRAGMA foreign_keys = ON");
 	const db = drizzle({ client: sqlite, schema: { ...schema, ...relations } });
 	return { db, sqlite };

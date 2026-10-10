@@ -123,6 +123,7 @@ import {
 	shouldRenderAdvancedSubsection,
 } from "./details-panel-sections";
 import { NarratorAccessPanel } from "./NarratorAccessPanel";
+import { NarratorGitIdentitySelect } from "./NarratorGitIdentitySelect";
 
 export interface NarratorDetailsPanelProps {
 	opened: boolean;
@@ -1307,8 +1308,9 @@ function NarratorDetailsContent({
 				<DetailsPanelSection
 					id="session"
 					title={t("details.session")}
-					searchableText={sessionSearchableText}
+					searchableText={[...sessionSearchableText, t("details.gitIdentity")]}
 				>
+					<NarratorGitIdentitySelect narratorId={narratorId} />
 					<DetailRow
 						label={t("details.model")}
 						value={

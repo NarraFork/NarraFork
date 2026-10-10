@@ -207,6 +207,14 @@ function revealItem() {
 	);
 }
 
+describe("tab git identity entry removed", () => {
+	it("does not offer identity selection on a narrator tab", async () => {
+		await mountTab({ params: { panelType: "narrator", narratorId: "n1" } });
+		const items = Array.from(document.querySelectorAll("[role=menuitem]"));
+		expect(items.some((item) => item.textContent?.includes("Git commit identity"))).toBe(false);
+	});
+});
+
 describe("plugin tab window context", () => {
 	const plugin = {
 		panelType: "plugin",

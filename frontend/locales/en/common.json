@@ -33,6 +33,7 @@
 		"right": "Close tabs to the right",
 		"auxiliary": "Close auxiliary tabs (keep all narrators)"
 	},
+	"loading": "Loading…",
 	"scrollbar": {
 		"vertical": "Vertical scrollbar",
 		"horizontal": "Horizontal scrollbar"

@@ -33,6 +33,7 @@
 		"right": "关闭右侧",
 		"auxiliary": "关闭辅助（保留所有叙述者）"
 	},
+	"loading": "加载中…",
 	"scrollbar": {
 		"vertical": "垂直滚动条",
 		"horizontal": "水平滚动条"

@@ -80,6 +80,28 @@ export const updateProfileSchema = z.object({
 	gitEmail: z.string().email().max(254).optional().or(z.literal("")),
 });
 
+// === Git commit identities ===
+// A user keeps several named identities and picks, per narrator, which one their
+// own turns commit under. The service layer re-applies these rules (it is the
+// last gate before git), so the two must stay in step.
+
+const gitIdentityNameSchema = z.string().trim().min(1).max(100);
+const gitIdentityEmailSchema = z.string().trim().email().max(254);
+
+export const createGitIdentitySchema = z.object({
+	name: gitIdentityNameSchema,
+	email: gitIdentityEmailSchema,
+});
+
+export const updateGitIdentitySchema = z
+	.object({
+		name: gitIdentityNameSchema.optional(),
+		email: gitIdentityEmailSchema.optional(),
+		/** Only promotion is offered; "no default" is not a state the service allows. */
+		isDefault: z.literal(true).optional(),
+	})
+	.refine((value) => Object.keys(value).length > 0, { message: "Nothing to update" });
+
 // === Multi-factor authentication ===
 
 /** A 6-digit TOTP code (whitespace tolerated by the verifier). */

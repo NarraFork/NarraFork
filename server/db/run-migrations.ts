@@ -1570,6 +1570,7 @@ export async function runMigrations(sqlite: Database): Promise<{
 		"inherit_project_gate",
 	);
 	const hadAclGrantsTable = tableExists(sqlite, "acl_grants");
+	const hadUserGitIdentitiesTable = tableExists(sqlite, "user_git_identities");
 
 	const resolved = await resolveMigrationsFolder();
 	try {
@@ -1604,6 +1605,9 @@ export async function runMigrations(sqlite: Database): Promise<{
 		backfillSubagentAclRoot(sqlite);
 		if (!hadAclGrantsTable) {
 			migrateGrantsToUnifiedAcl(sqlite);
+		}
+		if (!hadUserGitIdentitiesTable) {
+			backfillUserGitIdentities(sqlite);
 		}
 		return { source: resolved.source, folder: resolved.folder };
 	} finally {
@@ -2012,6 +2016,41 @@ function migrateGrantsToUnifiedAcl(sqlite: Database): void {
 		// the legacy tables authoritative, and the domain layers still read them until
 		// their own cut-over step. Logged loudly because it needs attention.
 		logger.error("unified ACL grant migration failed (non-fatal)", { error: String(err) });
+	}
+}
+
+/**
+ * Move the legacy single git identity (`users.git_username`/`git_email`) into the
+ * multi-identity table, as each user's first and therefore default identity.
+ *
+ * Runs only on the upgrade that introduces `user_git_identities` (gated on the
+ * pre-migration snapshot), and is idempotent besides: the `NOT EXISTS` guard
+ * means a user who already has an identity keeps it, so a second run cannot
+ * duplicate or overwrite anything. The legacy columns stay put — they are simply
+ * no longer read as an identity source — which keeps this additive.
+ */
+function backfillUserGitIdentities(sqlite: Database): void {
+	try {
+		const result = sqlite
+			.prepare(
+				`INSERT INTO user_git_identities (id, user_id, name, email, is_default, created_at)
+				 SELECT lower(hex(randomblob(16))), u.id, trim(u.git_username), trim(u.git_email), 1, ?
+				 FROM users u
+				 WHERE u.git_username IS NOT NULL AND trim(u.git_username) <> ''
+				   AND u.git_email IS NOT NULL AND trim(u.git_email) <> ''
+				   AND instr(u.git_username, '<') = 0 AND instr(u.git_username, '>') = 0
+				   AND instr(u.git_email, '<') = 0 AND instr(u.git_email, '>') = 0
+				   AND NOT EXISTS (SELECT 1 FROM user_git_identities i WHERE i.user_id = u.id)`,
+			)
+			.run(new Date().toISOString());
+		if (result.changes > 0) {
+			logger.info("Backfilled git identities from the legacy profile columns", {
+				count: result.changes,
+			});
+		}
+	} catch (err) {
+		// Non-fatal: never block startup on an optional backfill.
+		logger.warn("git identity backfill failed (non-fatal)", { error: String(err) });
 	}
 }
 

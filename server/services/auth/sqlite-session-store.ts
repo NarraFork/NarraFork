@@ -1,9 +1,10 @@
 /**
  * SQLite implementation of `AuthSessionStore`.
  *
- * Every operation is a single statement or a strictly synchronous section — there is no
- * multi-statement atomic unit in this port (the only write, `bumpTokenVersion`, is one
- * atomic increment statement). The `async` keywords shape the boundary Promise; no
+ * Every operation is a single statement or a strictly synchronous section. Legacy
+ * profile identity updates delegate to one synchronous transaction, while
+ * `bumpTokenVersion` remains one atomic increment statement. The `async` keywords
+ * shape the boundary Promise; no
  * `await` ever sits between a BEGIN and a COMMIT here, which is the property
  * `server/db/transaction-atomicity-contract.test.ts` exists to gate.
  *
@@ -15,6 +16,7 @@
 import { db } from "@server/db";
 import { userPreferences, users } from "@server/db/schema";
 import { eq, sql } from "drizzle-orm";
+import { updateLegacyGitIdentityProfile } from "../git-identities";
 import type { AccountRole } from "../registration/account-store";
 import type {
 	AuthSessionStore,
@@ -41,7 +43,7 @@ export const sqliteAuthSessionStore: AuthSessionStore = {
 		userId: string,
 		update: { gitUsername?: string | null; gitEmail?: string | null },
 	): Promise<void> {
-		await db.update(users).set(update).where(eq(users.id, userId));
+		await updateLegacyGitIdentityProfile(userId, update);
 	},
 
 	async setAvatarImage(userId: string, imageId: string | null): Promise<void> {

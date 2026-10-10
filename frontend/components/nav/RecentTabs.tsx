@@ -2310,7 +2310,7 @@ function TabContextMenu({
 								<Text size="sm">{t("revealInExplorer")}</Text>
 							</Group>
 						</UnstyledButton>
-					)}
+					)}{" "}
 					{canNewNarratorHere && (
 						<UnstyledButton px="xs" py={4} onClick={onNewNarratorHere} style={{ borderRadius: 4 }}>
 							<Group gap={8} wrap="nowrap">

@@ -199,6 +199,7 @@ import {
 	rollbackToBlockSchema,
 	segmentCompactSchema,
 	sendMessageSchema,
+	setNarratorGitIdentitySchema,
 	subagentRecoverySchema,
 	suggestAnswersSchema,
 	updateBlacklistCmdSchema,
@@ -269,6 +270,11 @@ import {
 	rebuildDeviceFileState,
 	rebuildDeviceFileStatesExcluding,
 } from "../services/file-state-rebuild";
+import {
+	getNarratorGitIdentityPick,
+	listUserGitIdentities,
+	setNarratorGitIdentityPick,
+} from "../services/git-identities";
 import { gitService } from "../services/git-service";
 import { getStatusSummaryCached } from "../services/git-status-cache";
 import {
@@ -4818,6 +4824,28 @@ narratorRoutes.patch("/:id/default-device", async (c) => {
 			userId: c.get("user").sub,
 		}),
 	);
+});
+
+// Which of MY git identities this narrator commits under. Personal by design:
+// several people driving one narrator each keep their own pick, so both routes
+// act on the caller's row only — another user's pick is never returned, and its
+// identity id is not selectable from here.
+narratorRoutes.get("/:id/git-identity", async (c) => {
+	const userId = c.get("user").sub;
+	const narratorId = c.req.param("id");
+	const [identities, selectedId] = await Promise.all([
+		listUserGitIdentities(userId),
+		getNarratorGitIdentityPick(userId, narratorId),
+	]);
+	return c.json({ identities, selectedId });
+});
+
+narratorRoutes.put("/:id/git-identity", async (c) => {
+	const parsed = setNarratorGitIdentitySchema.safeParse(await c.req.json());
+	if (!parsed.success) throw new ValidationError(parsed.error.message);
+	const userId = c.get("user").sub;
+	await setNarratorGitIdentityPick(userId, c.req.param("id"), parsed.data.identityId);
+	return c.json({ ok: true });
 });
 
 // Update model
