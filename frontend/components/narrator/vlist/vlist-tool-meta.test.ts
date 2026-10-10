@@ -63,17 +63,48 @@ describe("foreground Bash detachment", () => {
 
 describe("active question waits", () => {
 	it("exposes only running question waits, not completed or other waits", () => {
-		for (const status of ["running", "success", "fail", "cancelled", "pending", undefined]) {
+		for (const status of [
+			"running",
+			"executing",
+			"success",
+			"fail",
+			"cancelled",
+			"pending",
+			undefined,
+		]) {
 			const meta = deriveToolMeta(
 				toolBlock({ name: "Await", status, input: { type: "question", id: "q1" } }),
 			);
-			expect(meta?.awaitQuestionId).toBe(status === "running" ? "q1" : undefined);
+			expect(meta?.awaitQuestionId).toBe(
+				status === "running" || status === "executing" ? "q1" : undefined,
+			);
 		}
 		expect(
 			deriveToolMeta(
 				toolBlock({ name: "Await", status: "running", input: { type: "bash", id: "q1" } }),
 			)?.awaitQuestionId,
 		).toBeUndefined();
+	});
+
+	it("matches live tool-call input and stops hosting when the record completes", () => {
+		const message = msg([toolBlock({ name: "Await", input: {} })], "live", 17);
+		for (const status of ["running", "executing", "success"]) {
+			const live = {
+				...message,
+				toolCalls: [
+					{
+						toolUseId: "tu-1",
+						toolName: "Await",
+						status,
+						inputJson: { type: "question", id: "q-live" },
+					},
+				],
+			} as unknown as NarratorMsg;
+			const meta = buildToolMetaIndex([live]).get("tu-1");
+			if (status === "success") expect(meta?.awaitQuestionId).toBeUndefined();
+			else expect(meta).toMatchObject({ awaitQuestionId: "q-live", awaitQuestionSeq: 17 });
+		}
+		expect(message.contentJson).toEqual([toolBlock({ name: "Await", input: {} })]);
 	});
 
 	it("carries the owning message seq so concurrent waits can pick the newest", () => {
