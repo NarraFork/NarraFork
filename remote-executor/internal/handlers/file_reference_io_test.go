@@ -145,7 +145,7 @@ func TestProtectedReadRechecksCanonicalIdentityAfterReading(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("Windows may deny renaming an open file")
 	}
-	root := t.TempDir()
+	root := canonicalFixturePath(t, t.TempDir())
 	path := filepath.Join(root, "file.txt")
 	if err := os.WriteFile(path, []byte("original"), 0600); err != nil {
 		t.Fatal(err)
@@ -171,7 +171,7 @@ func TestProtectedReadRechecksCanonicalIdentityAfterReading(t *testing.T) {
 }
 
 func TestBoundedOffsetRead(t *testing.T) {
-	root := t.TempDir()
+	root := canonicalFixturePath(t, t.TempDir())
 	path := filepath.Join(root, "range.txt")
 	if err := os.WriteFile(path, []byte("0123456789"), 0600); err != nil {
 		t.Fatal(err)
@@ -199,7 +199,7 @@ func TestBoundedOffsetRead(t *testing.T) {
 }
 
 func TestProtectedReadPreservesResultShapeAndHonorsDeadline(t *testing.T) {
-	root := t.TempDir()
+	root := canonicalFixturePath(t, t.TempDir())
 	path := filepath.Join(root, "file.txt")
 	if err := os.WriteFile(path, []byte("saved"), 0600); err != nil {
 		t.Fatal(err)

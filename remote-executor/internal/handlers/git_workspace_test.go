@@ -4,19 +4,20 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/narrafork/remote-executor/internal/testgit"
 )
 
 func gitTestRun(t *testing.T, cwd string, args ...string) string {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd := testgit.CommandContext(ctx, args...)
 	cmd.Dir = cwd
 	cmd.Env = gitWorkspaceEnv(map[string]any{"GIT_AUTHOR_NAME": "Fixture", "GIT_AUTHOR_EMAIL": "fixture@example.test", "GIT_COMMITTER_NAME": "Fixture", "GIT_COMMITTER_EMAIL": "fixture@example.test"})
 	out, err := cmd.CombinedOutput()
@@ -32,7 +33,7 @@ func gitTestIdentity() map[string]any {
 
 func newGitFixture(t *testing.T) (string, *Handlers) {
 	t.Helper()
-	root := t.TempDir()
+	root := canonicalFixturePath(t, t.TempDir())
 	gitTestRun(t, root, "init", "-b", "main")
 	return root, NewWithOptions(NewPathGuard([]string{root}), gitWorkspaceMaxBytes, true)
 }
@@ -411,7 +412,7 @@ func TestGitWorkspaceDisableShellReadFilters(t *testing.T) {
 }
 
 func TestGitWorkspaceDisableShellLinkedWorktreeHooks(t *testing.T) {
-	parent := t.TempDir()
+	parent := canonicalFixturePath(t, t.TempDir())
 	root := filepath.Join(parent, "repo")
 	if err := os.Mkdir(root, 0700); err != nil {
 		t.Fatal(err)
@@ -504,7 +505,7 @@ func TestGitWorkspaceUnavailableStatesAndNestedRepository(t *testing.T) {
 }
 
 func TestGitWorkspaceSubmodule(t *testing.T) {
-	parent := t.TempDir()
+	parent := canonicalFixturePath(t, t.TempDir())
 	source := filepath.Join(parent, "source")
 	root := filepath.Join(parent, "root")
 	for _, path := range []string{source, root} {
@@ -549,7 +550,7 @@ func TestGitWorkspaceSubmodule(t *testing.T) {
 }
 
 func TestGitWorkspaceWorktreeAndDetached(t *testing.T) {
-	parent := t.TempDir()
+	parent := canonicalFixturePath(t, t.TempDir())
 	root := filepath.Join(parent, "repo")
 	if err := os.Mkdir(root, 0700); err != nil {
 		t.Fatal(err)

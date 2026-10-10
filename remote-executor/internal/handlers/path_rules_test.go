@@ -147,7 +147,9 @@ func TestDenyOnlyListStillRefusesUnlistedPaths(t *testing.T) {
 // Dropping an unresolvable deny would widen access, so it must be retained and
 // reported. An unresolvable allow may be dropped: that only narrows access.
 func TestUnresolvableDenyIsKeptAndReported(t *testing.T) {
-	base := t.TempDir()
+	// Keep the existing ancestor's identity canonical: the intended negative
+	// case is a missing deny leaf, not an unrelated alias in the temp root.
+	base := canonicalFixturePath(t, t.TempDir())
 	root := mustDir(t, base, "root")
 	missing := filepath.Join(root, "not-created-yet")
 

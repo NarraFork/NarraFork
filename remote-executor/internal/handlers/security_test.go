@@ -45,7 +45,7 @@ func TestRequiredPathParamRejectsNulBytes(t *testing.T) {
 }
 
 func TestPathGuardBoundariesRelativeAndMultipleRoots(t *testing.T) {
-	base := t.TempDir()
+	base := canonicalFixturePath(t, t.TempDir())
 	root := filepath.Join(base, "root")
 	root2 := filepath.Join(base, "root2")
 	if err := os.MkdirAll(root, 0o755); err != nil {
@@ -118,7 +118,7 @@ func TestPathGuardInvalidConfiguredRootFailsClosed(t *testing.T) {
 }
 
 func TestPathGuardCanonicalizesSymlinkRoot(t *testing.T) {
-	base := t.TempDir()
+	base := canonicalFixturePath(t, t.TempDir())
 	realRoot := filepath.Join(base, "real")
 	linkedRoot := filepath.Join(base, "linked")
 	if err := os.MkdirAll(realRoot, 0o755); err != nil {
@@ -144,7 +144,7 @@ func TestPathGuardCanonicalizesSymlinkRoot(t *testing.T) {
 }
 
 func TestFsStatReturnsCanonicalResolvedPath(t *testing.T) {
-	base := t.TempDir()
+	base := canonicalFixturePath(t, t.TempDir())
 	root := filepath.Join(base, "root")
 	realDir := filepath.Join(root, "real")
 	if err := os.MkdirAll(realDir, 0o755); err != nil {
@@ -176,7 +176,7 @@ func TestFsStatReturnsCanonicalResolvedPath(t *testing.T) {
 }
 
 func TestFsStatReturnsCanonicalCreatePathWhenMissing(t *testing.T) {
-	base := t.TempDir()
+	base := canonicalFixturePath(t, t.TempDir())
 	realRoot := filepath.Join(base, "real")
 	linkedRoot := filepath.Join(base, "linked")
 	if err := os.MkdirAll(realRoot, 0o755); err != nil {
@@ -202,7 +202,7 @@ func TestFsStatReturnsCanonicalCreatePathWhenMissing(t *testing.T) {
 
 func TestFsReadAtomicallyVerifiesExpectedResolvedPath(t *testing.T) {
 	t.Run("stable identity reads the authorized file", func(t *testing.T) {
-		root := t.TempDir()
+		root := canonicalFixturePath(t, t.TempDir())
 		target := filepath.Join(root, "plan.md")
 		if err := os.WriteFile(target, []byte("# stable plan"), 0o644); err != nil {
 			t.Fatal(err)
@@ -350,7 +350,7 @@ func TestFsWriteVerifiesExpectedResolvedPath(t *testing.T) {
 }
 
 func TestPathGuardRejectsEscapingSymlinksAndAllowsInternalSymlinks(t *testing.T) {
-	base := t.TempDir()
+	base := canonicalFixturePath(t, t.TempDir())
 	root := filepath.Join(base, "root")
 	inside := filepath.Join(root, "inside")
 	outside := filepath.Join(base, "outside")
@@ -378,7 +378,7 @@ func TestPathGuardRejectsEscapingSymlinksAndAllowsInternalSymlinks(t *testing.T)
 	if err := os.WriteFile(insideFile, []byte("inside"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if got, err := guard.CheckExisting(filepath.Join(root, "inside-link", "existing.txt")); err != nil || !samePath(got, insideFile) {
+	if got, err := guard.CheckExisting(filepath.Join(root, "inside-link", "existing.txt")); err != nil || !samePath(got, canonicalFixturePath(t, insideFile)) {
 		t.Fatalf("internal symlink rejected: got=%q err=%v", got, err)
 	}
 
@@ -643,7 +643,7 @@ func TestPathGuardRejectsEscapingWindowsJunctions(t *testing.T) {
 	}
 
 	insideFile := filepath.Join(inside, "safe.txt")
-	if got, err := guard.CheckExisting(filepath.Join(root, "inside-junction", "safe.txt")); err != nil || !samePath(got, insideFile) {
+	if got, err := guard.CheckExisting(filepath.Join(root, "inside-junction", "safe.txt")); err != nil || !samePath(got, canonicalFixturePath(t, insideFile)) {
 		t.Fatalf("internal junction rejected: got=%q err=%v", got, err)
 	}
 

@@ -7,29 +7,22 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/narrafork/remote-executor/internal/rpc"
+	"github.com/narrafork/remote-executor/internal/testgit"
 )
 
 func prepareSlowGitCommit(t *testing.T) (string, string, map[string]any) {
 	t.Helper()
-	root := t.TempDir()
-	for _, args := range [][]string{{"init", "-b", "main", root}} {
-		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
-			t.Fatalf("init: %v %s", err, out)
-		}
-	}
+	root := canonicalGitRoot(t)
+	transportFixtureGit(t, "init", "-b", "main", root)
 	if err := os.WriteFile(filepath.Join(root, "file.txt"), []byte("initial\n"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	add := exec.Command("git", "-C", root, "add", "file.txt")
-	if out, err := add.CombinedOutput(); err != nil {
-		t.Fatalf("add: %v %s", err, out)
-	}
+	transportFixtureGit(t, "-C", root, "add", "file.txt")
 	pidPath := filepath.Join(root, "hook.pid")
 	hook := fmt.Sprintf("#!/bin/sh\nprintf '%%s' $$ > %s\nsleep 60\n", shellQuote(pidPath))
 	if err := os.WriteFile(filepath.Join(root, ".git", "hooks", "pre-commit"), []byte(hook), 0700); err != nil {
@@ -44,7 +37,9 @@ func prepareSlowGitCommit(t *testing.T) (string, string, map[string]any) {
 
 func assertGitUnborn(t *testing.T, root string) {
 	t.Helper()
-	if err := exec.Command("git", "-C", root, "rev-parse", "--verify", "--quiet", "HEAD").Run(); err == nil {
+	ctx, stop := context.WithTimeout(context.Background(), 5*time.Second)
+	defer stop()
+	if err := testgit.CommandContext(ctx, "-C", root, "rev-parse", "--verify", "--quiet", "HEAD").Run(); err == nil {
 		t.Fatal("cancelled remote write created a commit")
 	}
 }

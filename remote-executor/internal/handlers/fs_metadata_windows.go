@@ -193,6 +193,12 @@ func (m *windowsConditionalMetadata) matches(f *os.File) error {
 	return nil
 }
 
+// FILE_STREAM_INFO requires an 8-byte-aligned buffer. Keep the caller-owned
+// uint64 backing and byte view at the same fixed 64 KiB budget.
+func windowsStreamInfoBytes(backing *[65536 / 8]uint64) []byte {
+	return unsafe.Slice((*byte)(unsafe.Pointer(&backing[0])), 65536)
+}
+
 func validateWindowsConditionalFile(f *os.File) error {
 	h := windows.Handle(f.Fd())
 	var info windows.ByHandleFileInformation
@@ -223,7 +229,8 @@ func validateWindowsConditionalFile(f *os.File) error {
 		return fmt.Errorf("conditional replacement requires local NTFS")
 	}
 	// Fixed budget: refuse rather than allocate indefinitely for hostile streams.
-	var streams [65536]byte
+	var backing [65536 / 8]uint64
+	streams := windowsStreamInfoBytes(&backing)
 	if err := windows.GetFileInformationByHandleEx(h, windows.FileStreamInfo, &streams[0], uint32(len(streams))); err != nil {
 		return fmt.Errorf("enumerate file streams: %w", err)
 	}

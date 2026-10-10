@@ -65,11 +65,8 @@ func startGitBinaryExecutor(t *testing.T, serverURL, root string) context.Cancel
 // round trip with an isolated loopback server and disposable repository. No DB,
 // production device, shell RPC, or local-backend substitution is involved.
 func TestGitWorkspaceRemoteLifecycle(t *testing.T) {
-	root := t.TempDir()
-	cmd := exec.Command("git", "init", "-b", "main", root)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("init: %v %s", err, out)
-	}
+	root := canonicalGitRoot(t)
+	transportFixtureGit(t, "init", "-b", "main", root)
 	srv, ts := newTestServer(t)
 	defer srv.Close()
 	cancel := startGitBinaryExecutor(t, srv.URL, root)
@@ -206,9 +203,7 @@ func TestGitWorkspaceRemoteLifecycle(t *testing.T) {
 		t.Fatalf("remote status did not return a complete bounded prefix: %v", boundedStatus)
 	}
 	bare := filepath.Join(root, "bare.git")
-	if out, err := exec.Command("git", "init", "--bare", bare).CombinedOutput(); err != nil {
-		t.Fatalf("init bare: %v %s", err, out)
-	}
+	transportFixtureGit(t, "init", "--bare", bare)
 	bareResult, _, err := ts.call(ctx, "bare-probe", "git.workspace", map[string]any{"cwd": bare, "operation": "probe"})
 	if err != nil || !bareResult.OK {
 		t.Fatalf("remote bare probe failed: %v %+v", err, bareResult)
@@ -224,5 +219,20 @@ func TestGitWorkspaceRemoteLifecycle(t *testing.T) {
 	res, _, err = ts.call(ctx, "outside", "git.workspace", map[string]any{"cwd": filepath.Dir(root), "operation": "probe"})
 	if err != nil || !res.OK || res.Result.(map[string]any)["state"] != "access_denied" {
 		t.Fatalf("remote root refusal: %v %+v", err, res)
+	}
+	// The real production CLI must still see and refuse executable config in
+	// its disposable repository; the hermetic PATH must not bypass guards.
+	transportFixtureGit(t, "-C", root, "config", "filter.fixture.clean", "cat")
+	res, _, err = ts.call(ctx, "local-filter", "git.workspace", map[string]any{"cwd": root, "expectedRoot": root, "operation": "status"})
+	if err != nil || res.OK || !strings.Contains(res.Error, "filters") {
+		t.Fatalf("real CLI local filter refusal: %v %+v", err, res)
+	}
+	transportFixtureGit(t, "-C", root, "config", "--unset", "filter.fixture.clean")
+	if err := os.WriteFile(filepath.Join(root, ".git", "hooks", "pre-commit"), []byte("#!/bin/sh\nexit 0\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	res, _, err = ts.call(ctx, "local-hook", "git.workspace", map[string]any{"cwd": root, "expectedRoot": root, "operation": "stage", "all": true})
+	if err != nil || res.OK || !strings.Contains(res.Error, "pre-commit hook") {
+		t.Fatalf("real CLI local hook refusal: %v %+v", err, res)
 	}
 }

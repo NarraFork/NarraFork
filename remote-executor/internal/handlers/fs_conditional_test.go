@@ -15,7 +15,14 @@ func conditionalParams(path string, before any, after string) map[string]any {
 	if text, ok := before.(string); ok {
 		expected = base64.StdEncoding.EncodeToString([]byte(text))
 	}
-	return map[string]any{"path": path, "expectedResolvedPath": path, "expectedDataB64": expected, "dataB64": base64.StdEncoding.EncodeToString([]byte(after))}
+	// Match the identity returned by the real guard, including aliases in an
+	// existing ancestor when the leaf has not been created yet. Explicit
+	// identity-conflict tests still overwrite this positive expectation.
+	resolved, err := NewPathGuard(nil).CheckCreate(path)
+	if err != nil {
+		panic("resolve conditional fixture identity: " + err.Error())
+	}
+	return map[string]any{"path": path, "expectedResolvedPath": resolved, "expectedDataB64": expected, "dataB64": base64.StdEncoding.EncodeToString([]byte(after))}
 }
 
 func TestConditionalWriteConflictAndCreate(t *testing.T) {

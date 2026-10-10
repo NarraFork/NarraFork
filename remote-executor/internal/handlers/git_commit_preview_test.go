@@ -7,13 +7,14 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
 	"time"
 	"unicode/utf8"
+
+	"github.com/narrafork/remote-executor/internal/testgit"
 )
 
 // Fixture subprocesses are bounded independently of the API deadline; loaded
@@ -27,7 +28,7 @@ func commitTestInput(t *testing.T, root, input string, args ...string) string {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd := testgit.CommandContext(ctx, args...)
 	cmd.Dir, cmd.Env = root, gitWorkspaceEnv(gitTestIdentity())
 	cmd.Stdin = strings.NewReader(input)
 	out, err := cmd.CombinedOutput()
@@ -510,7 +511,7 @@ func TestGitCommitPreviewAuthorizationCancellationAndMissingCommit(t *testing.T)
 	if _, err := commitTestRequest(denied, root, map[string]any{"operation": "commitDetail", "commit": sha}); err == nil {
 		t.Fatal("preview widened a grant with denied holes")
 	}
-	linked := filepath.Join(t.TempDir(), "linked")
+	linked := filepath.Join(canonicalFixturePath(t, t.TempDir()), "linked")
 	commitTestGit(t, root, "worktree", "add", "--detach", linked, sha)
 	onlyLinked := NewWithOptions(NewPathGuard([]string{linked}), gitWorkspaceMaxBytes, true)
 	if _, err := commitTestRequest(onlyLinked, linked, map[string]any{"operation": "commitDetail", "commit": sha}); err == nil {
