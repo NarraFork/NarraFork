@@ -382,9 +382,62 @@ export interface EventHandlerContext {
  * Optional hooks for main-narrator-specific behavior.
  * Subagents simply don't provide these.
  */
+/**
+ * A persistence barrier failed: the event cannot be recovered without operator
+ * attention, so the loop stops rather than continuing past a broken checkpoint.
+ *
+ * The underlying cause is folded into `message` here, not left only on
+ * `Error.cause`. Everything downstream — the narrator's `errorMessage`, the
+ * WebSocket `narrator_error`, and the `narrator_error` emitted on the narrator
+ * event stream — surfaces `String(err)`, and `String()` renders `message` only,
+ * so a cause parked on `options.cause` never reaches the reader who has to act
+ * on it. Duplicating it into the message is what makes "Tool result could not be
+ * persisted" actionable instead of a dead end.
+ *
+ * This class is thrown BY the executor that consumes the agent loop (see
+ * `narrator-executor`), so it never becomes one of the loop's own
+ * `yield { type: "error" }` events — those carry provider/API failures.
+ */
+/**
+ * Cap on the cause text folded into the message.
+ *
+ * The folded message is published: it lands in the narrator's `errorMessage`
+ * column (an unbounded `text` with no clamp on the write path) and goes out over
+ * the WebSocket. A PostgreSQL driver failure is rendered by drizzle as
+ * `Failed query: <full SQL>\nparams: [...]`, so an uncapped fold would put
+ * complete statements and their parameter values in front of every reader.
+ * 1 KiB keeps the diagnosis actionable while cutting that off; same order of
+ * magnitude as `EXPORT_TOOL_ERROR_LIMIT` in `narrator-export`.
+ */
+const MAX_CAUSE_CHARS = 1_000;
+
+/** Render an arbitrary cause as text, never throwing on hostile input. */
+function causeToText(cause: unknown): string {
+	if (cause instanceof Error) return cause.message;
+	if (typeof cause === "string") return cause;
+	if (cause == null) return "";
+	// `String()` throws on a null-prototype object ("No default value"). This runs
+	// inside a catch block, so letting it throw would replace the persistence
+	// diagnosis with a TypeError and hide the real failure.
+	try {
+		return String(cause);
+	} catch {
+		return "";
+	}
+}
+
 export class CriticalEventPersistenceError extends Error {
 	constructor(message: string, options?: ErrorOptions) {
-		super(message, options);
+		let causeText = causeToText(options?.cause);
+		if (causeText.length > MAX_CAUSE_CHARS) {
+			causeText = `${causeText.slice(0, MAX_CAUSE_CHARS)}…(truncated ${
+				causeText.length - MAX_CAUSE_CHARS
+			} chars)`;
+		}
+		// Only append when it adds something: a cause may be an empty string, and
+		// repeating the message verbatim reads as noise.
+		const detail = causeText && !message.includes(causeText) ? `: ${causeText}` : "";
+		super(detail ? `${message}${detail}` : message, options);
 		this.name = "CriticalEventPersistenceError";
 	}
 }
