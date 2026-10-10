@@ -136,3 +136,43 @@ html[data-nf-wco] .nf-wco-window-strip {
 html[data-nf-wco] :is(.nf-top-banner, .nf-notifications-safe-area, .nf-overlay-layer) {
 	-webkit-app-region: no-drag;
 }
+
+/*
+ * Viewport-filling overlays own their usable viewport, not AppShell's padding.
+ * Move their inner layout below the title-bar strip and shorten it exactly once.
+ * The backdrop still covers the entire window. Both controls sides use the same
+ * vertical reservation; ordinary (including centered) Modals are left untouched.
+ * Shrinking Drawer inner also keeps bottom drawers bottom-anchored, while its
+ * percentage-based content/body heights inherit the reduced available space.
+ */
+html[data-nf-wco] .nf-modal-layer[data-full-screen] .nf-modal-inner,
+html[data-nf-wco] .nf-drawer-inner {
+	top: var(--nf-wco-strip-height);
+	bottom: auto;
+	height: calc(var(--app-viewport-bottom, 100dvh) - var(--nf-wco-strip-height));
+	max-height: calc(var(--app-viewport-bottom, 100dvh) - var(--nf-wco-strip-height));
+}
+
+/*
+ * Fullscreen viewers often provide inline viewport heights (safe-area.ts).
+ * Override only those heights: content derives from the shortened inner, and
+ * existing flex layouts, header padding and mobile safe-area insets stay intact.
+ */
+html[data-nf-wco] .nf-modal-layer[data-full-screen] .nf-modal-content {
+	/* biome-ignore lint/complexity/noImportantStyles: override viewer inline viewport height only in WCO fullscreen mode */
+	height: 100% !important;
+	/* biome-ignore lint/complexity/noImportantStyles: override viewer inline viewport max-height only in WCO fullscreen mode */
+	max-height: 100% !important;
+}
+
+/* Hand-rolled fullscreen image/diagram stages share the same reservation. */
+html[data-nf-wco] [data-panzoom-mode="fullscreen"] {
+	box-sizing: border-box;
+	padding-top: var(--nf-wco-strip-height);
+	-webkit-app-region: no-drag;
+}
+
+html[data-nf-wco] [data-panzoom-mode="fullscreen"] > .nf-panzoom-toolbar {
+	/* biome-ignore lint/complexity/noImportantStyles: override the shared stage toolbar's inline top without changing embedded layout */
+	top: var(--nf-wco-strip-height) !important;
+}

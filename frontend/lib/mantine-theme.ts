@@ -70,8 +70,16 @@ export const mantineTheme = createTheme({
 		 * one is open nothing can drag anyway — clicking the dimmed strip must reach
 		 * the overlay's click-to-dismiss); menus/popovers mark just the dropdown.
 		 */
-		Modal: { classNames: { root: "nf-overlay-layer" } },
-		Drawer: { classNames: { root: "nf-overlay-layer" } },
+		Modal: {
+			classNames: {
+				root: "nf-overlay-layer nf-modal-layer",
+				inner: "nf-modal-inner",
+				content: "nf-modal-content",
+			},
+		},
+		Drawer: {
+			classNames: { root: "nf-overlay-layer", inner: "nf-drawer-inner" },
+		},
 		Menu: { classNames: { dropdown: "nf-overlay-layer" } },
 		Popover: { classNames: { dropdown: "nf-overlay-layer" } },
 		HoverCard: { classNames: { dropdown: "nf-overlay-layer" } },

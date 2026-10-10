@@ -360,6 +360,7 @@ export function PanZoomStage({
 		>
 			{/* Toolbar */}
 			<Group
+				className="nf-panzoom-toolbar"
 				gap={4}
 				px="md"
 				py="xs"
