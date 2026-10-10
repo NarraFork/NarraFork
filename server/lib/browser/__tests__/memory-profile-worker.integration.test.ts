@@ -141,6 +141,43 @@ describe("memory profile worker with exclusively owned Chrome", () => {
 					).toBe(true);
 					expect(reply.summary.gc?.scope?.threadName).toBe("CrRendererMain");
 					expect(reply.summary.gc?.minorCount ?? 0).toBeGreaterThan(0);
+					const gc = reply.summary.gc;
+					expect(Object.keys(gc ?? {}).sort()).toEqual(
+						[
+							"status",
+							"warnings",
+							"scope",
+							"durationMs",
+							"minorCount",
+							"majorCount",
+							"observedCount",
+							"nestedCount",
+							"duplicateCount",
+							"gcWallTimeMs",
+							"gcWallTimeRatio",
+							"frequencyPerSecond",
+							"longestMs",
+							"p50Ms",
+							"p95Ms",
+							"intervalMs",
+							"topEvents",
+						].sort(),
+					);
+					expect(gc?.durationMs ?? 0).toBeGreaterThan(0);
+					expect(gc?.gcWallTimeMs ?? 0).toBeGreaterThan(0);
+					expect(gc?.frequencyPerSecond ?? 0).toBeGreaterThan(0);
+					expect(
+						gc?.topEvents.some(
+							(event) =>
+								event.name === "MinorGC" &&
+								Number.isFinite(event.durationMs) &&
+								event.durationMs >= 0 &&
+								typeof event.heapBeforeBytes === "number" &&
+								Number.isFinite(event.heapBeforeBytes) &&
+								typeof event.heapAfterBytes === "number" &&
+								Number.isFinite(event.heapAfterBytes),
+						),
+					).toBe(true);
 					expect(reply.artifacts).toHaveLength(3);
 					expect(Buffer.byteLength(JSON.stringify(reply.summary))).toBeLessThan(
 						PROFILE_LIMITS.summaryBytes,

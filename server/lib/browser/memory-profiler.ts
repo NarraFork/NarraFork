@@ -129,7 +129,9 @@ function safeFailureDiagnostic(
 	const missingCategories = MEMORY_PROFILE_TRACE_CATEGORIES.filter((category) =>
 		(diagnostic.missingCategories as unknown[]).includes(category),
 	);
-	if (missingCategories.length === 0) return;
+	// A real startup rejection can occur even when no categories were missing.
+	// Only an explicitly empty list is trusted; unknown-only lists still drop.
+	if (missingCategories.length === 0 && diagnostic.missingCategories.length !== 0) return;
 	return {
 		diagnosticStage: "trace_capability",
 		browserVersion: profileDiagnosticBrowserVersion(diagnostic.browserVersion),

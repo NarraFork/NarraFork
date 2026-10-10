@@ -40,6 +40,7 @@ class FakeSession extends EventEmitter implements ProfileSession {
 	traceConfirmed = true;
 	browserVersion = "Chrome/146.0.7680.31";
 	categories = ["devtools.timeline", "v8", "disabled-by-default-v8.gc", "blink.user_timing"];
+	categoryResult?: unknown;
 	traceLoss = false;
 	malformedProfile = false;
 	heapDelay = 0;
@@ -63,7 +64,7 @@ class FakeSession extends EventEmitter implements ProfileSession {
 			case "Browser.getVersion":
 				return { product: this.browserVersion };
 			case "Tracing.getCategories":
-				return { categories: this.categories };
+				return this.categoryResult ?? { categories: this.categories };
 			case "Runtime.evaluate": {
 				const marker = (params?.expression as string).match(/performance\.mark\(("[^"]+")\)/);
 				if (marker) this.markers.push(JSON.parse(marker[1]));
@@ -190,9 +191,92 @@ describe("isolated memory profile recorder", () => {
 		"disabled-by-default-v8.gc",
 		"blink.user_timing",
 	] as const) {
-		test(`missing category ${missing} fails before tracing starts and releases its socket`, async () => {
+		test(`missing category ${missing} is advisory when original trace request provides full GC evidence`, async () => {
 			const f = await fixture();
 			f.session.categories = f.session.categories.filter((category) => category !== missing);
+			const task = f.recorder.command({ kind: "start", request: f.request });
+			f.recorder.command({ kind: "stop", profileId: f.request.profileId });
+			await task;
+			const completed = result(f.replies);
+			expect(f.replies.map((reply) => reply.kind)).toEqual(["recording", "finalizing", "result"]);
+			expect(completed.traceStopped).toBe(true);
+			expect(completed.summary.gc).toMatchObject({
+				status: "ok",
+				scope: { threadName: "CrRendererMain" },
+				minorCount: 1,
+				majorCount: 0,
+				topEvents: [
+					{ name: "MinorGC", durationMs: 0.05, heapBeforeBytes: 100, heapAfterBytes: 20 },
+				],
+			});
+			expect(completed.summary.allocation?.status).toBe("ok");
+			expect(f.session.calls.find((call) => call.method === "Tracing.start")?.params).toMatchObject(
+				{
+					traceConfig: {
+						includedCategories: [
+							"devtools.timeline",
+							"v8",
+							"disabled-by-default-v8.gc",
+							"blink.user_timing",
+						],
+					},
+				},
+			);
+			expect(f.session.count("Tracing.start")).toBe(1);
+			expect(f.session.count("Tracing.end")).toBe(1);
+			expect(f.session.count("HeapProfiler.startSampling")).toBe(1);
+			expect(f.session.detached).toBe(true);
+			expect(f.disconnected()).toBe(true);
+		});
+	}
+
+	for (const enumeration of ["empty", "malformed", "unavailable"] as const) {
+		test(`${enumeration} category enumeration still requires actual protocol and complete parsed evidence`, async () => {
+			const f = await fixture();
+			if (enumeration === "empty") f.session.categories = [];
+			if (enumeration === "malformed")
+				f.session.categoryResult = { categories: { token: "PRIVATE-CANARY" } };
+			if (enumeration === "unavailable")
+				f.session.errors.set("Tracing.getCategories", new Error("ws://PRIVATE-CANARY"));
+			const task = f.recorder.command({ kind: "start", request: f.request });
+			f.recorder.command({ kind: "stop", profileId: f.request.profileId });
+			await task;
+			const completed = result(f.replies);
+			expect(completed.traceStopped).toBe(true);
+			expect(completed.summary.gc).toMatchObject({
+				status: "ok",
+				scope: { threadName: "CrRendererMain" },
+				minorCount: 1,
+				topEvents: [
+					{ name: "MinorGC", durationMs: 0.05, heapBeforeBytes: 100, heapAfterBytes: 20 },
+				],
+			});
+			expect(completed.summary.allocation?.status).toBe("ok");
+			expect(f.session.calls.find((call) => call.method === "Tracing.start")?.params).toMatchObject(
+				{
+					traceConfig: {
+						includedCategories: [
+							"devtools.timeline",
+							"v8",
+							"disabled-by-default-v8.gc",
+							"blink.user_timing",
+						],
+					},
+				},
+			);
+			expect(JSON.stringify(f.replies)).not.toContain("PRIVATE-CANARY");
+		});
+		test(`${enumeration} category enumeration never hides a real trace protocol rejection`, async () => {
+			const f = await fixture();
+			if (enumeration === "empty") f.session.categories = [];
+			if (enumeration === "malformed")
+				f.session.categoryResult = { categories: { token: "PRIVATE-CANARY" } };
+			if (enumeration === "unavailable")
+				f.session.errors.set("Tracing.getCategories", new Error("ws://PRIVATE-CANARY"));
+			f.session.errors.set(
+				"Tracing.start",
+				new Error("Protocol error (Tracing.start): Method not found"),
+			);
 			await f.recorder.command({ kind: "start", request: f.request });
 			expect(f.replies).toEqual([
 				{
@@ -203,16 +287,18 @@ describe("isolated memory profile recorder", () => {
 					diagnostic: {
 						diagnosticStage: "trace_capability",
 						browserVersion: "Chrome/146.0.7680.31",
-						missingCategories: [missing],
+						missingCategories:
+							enumeration === "empty"
+								? ["devtools.timeline", "v8", "disabled-by-default-v8.gc", "blink.user_timing"]
+								: [],
 					},
 				},
 			]);
-			expect(f.session.count("Tracing.start")).toBe(0);
+			expect(f.session.count("Tracing.start")).toBe(1);
 			expect(f.session.count("Tracing.end")).toBe(0);
 			expect(f.session.count("HeapProfiler.startSampling")).toBe(0);
-			expect(f.session.detached).toBe(true);
-			expect(f.disconnected()).toBe(true);
 			expect(await readdir(f.dir)).toEqual([]);
+			expect(JSON.stringify(f.replies)).not.toContain("PRIVATE-CANARY");
 		});
 	}
 
@@ -220,6 +306,10 @@ describe("isolated memory profile recorder", () => {
 		const f = await fixture();
 		f.session.categories = ["devtools.timeline", "ws://CATEGORY-PRIVATE-CANARY"];
 		f.session.browserVersion = `Chrome/154.0.8037.97 token=${"PRIVATE-CANARY".repeat(100)}`;
+		f.session.errors.set(
+			"Tracing.start",
+			new Error("Protocol error (Tracing.start): Method not found"),
+		);
 		await f.recorder.command({ kind: "start", request: f.request });
 		expect(f.replies).toEqual([
 			{
@@ -384,7 +474,17 @@ describe("isolated memory profile recorder", () => {
 			f.session.errors.set("Tracing.start", new Error(message));
 			await f.recorder.command({ kind: "start", request: f.request });
 			expect(f.replies).toEqual([
-				{ kind: "failed", profileId: f.request.profileId, stage: "start", traceStopped: true },
+				{
+					kind: "failed",
+					profileId: f.request.profileId,
+					stage: "trace_capability",
+					traceStopped: true,
+					diagnostic: {
+						diagnosticStage: "trace_capability",
+						browserVersion: "Chrome/146.0.7680.31",
+						missingCategories: [],
+					},
+				},
 			]);
 			expect(f.session.count("Tracing.start")).toBe(1);
 			expect(f.session.count("Tracing.end")).toBe(0);
@@ -405,7 +505,17 @@ describe("isolated memory profile recorder", () => {
 			f.session.errors.set("Tracing.start", new Error(message));
 			await f.recorder.command({ kind: "start", request: f.request });
 			expect(f.replies).toEqual([
-				{ kind: "failed", profileId: f.request.profileId, stage: "start", traceStopped: false },
+				{
+					kind: "failed",
+					profileId: f.request.profileId,
+					stage: "trace_capability",
+					traceStopped: false,
+					diagnostic: {
+						diagnosticStage: "trace_capability",
+						browserVersion: "Chrome/146.0.7680.31",
+						missingCategories: [],
+					},
+				},
 			]);
 			expect(f.session.count("Tracing.start")).toBe(1);
 			expect(f.session.count("Tracing.end")).toBe(0);

@@ -477,6 +477,30 @@ describe("memory profile supervisor", () => {
 			} satisfies MemoryProfileFailureDiagnostic,
 		},
 		{
+			name: "retains explicit empty categories for an actual tracing startup failure",
+			stage: "trace_capability",
+			diagnostic: {
+				diagnosticStage: "trace_capability",
+				browserVersion: "Chrome/154.0.8037.97",
+				missingCategories: [],
+			},
+			expected: {
+				diagnosticStage: "trace_capability",
+				browserVersion: "Chrome/154.0.8037.97",
+				missingCategories: [],
+			} satisfies MemoryProfileFailureDiagnostic,
+		},
+		{
+			name: "drops unknown-only category lists rather than turning them into trusted empty lists",
+			stage: "trace_capability",
+			diagnostic: {
+				diagnosticStage: "trace_capability",
+				browserVersion: "Chrome/154.0.8037.97",
+				missingCategories: ["PRIVATE-CANARY"],
+			},
+			expected: undefined,
+		},
+		{
 			name: "drops diagnostic for an untrusted stage",
 			stage: "ws://PRIVATE-CANARY",
 			diagnostic: {
