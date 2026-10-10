@@ -45,7 +45,7 @@ describe("off-dock file viewer fallback", () => {
 			"const useInternalViewer = !dockOpenFilePanel && !isWorkspacePreview;",
 		);
 		expect(VIEWER_HOOK).toMatch(
-			/if \(useInternalViewer\)[\s\S]*?setInternalFileViewerTarget\(null\);[\s\S]*?setInternalFileViewerPath\(filePath\);/,
+			/if \(useInternalViewer\)[\s\S]*?setInternalFileViewerPath\(filePath\);/,
 		);
 	});
 
@@ -70,8 +70,14 @@ describe("off-dock file viewer fallback", () => {
 	it("renders the same viewer body the dock's file panel renders", () => {
 		// Two viewers would drift; the drawer is only a different HOST for the same
 		// content.
-		expect(PANEL).toContain('import("./file-viewer/FileViewerContent")');
-		expect(PANEL).toMatch(/<FileViewerContent\s+key=\{internalFileViewerPath\}/);
+		const dock = readFileSync(join(import.meta.dir, "dock", "panels.tsx"), "utf8");
+		expect(PANEL).toContain('import("./file-panel/FilePanelContent")');
+		expect(dock).toContain('import("../file-panel/FilePanelContent")');
+		expect(PANEL).toContain("<FilePanelContent");
+		expect(dock).toContain("<FilePanelContent");
+		expect(PANEL).toContain("onDirtyChange={onFileEditorDirtyChange}");
+		expect(PANEL).toContain("canExitFileEditor,");
+		expect(PANEL).not.toContain("legacyViewer");
 		expect(PANEL).toContain("referenceOrigin={!!internalFileViewerTarget}");
 		expect(PANEL).toContain("selection={internalFileViewerTarget?.selection}");
 	});

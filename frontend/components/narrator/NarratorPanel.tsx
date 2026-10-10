@@ -130,8 +130,6 @@ import {
 	DEFAULT_CONTEXT_THRESHOLDS_DRAFT,
 } from "./context-management/types";
 import { useNarratorDockContext } from "./dock/NarratorDockContext";
-import { getFilePreviewType } from "./file-panel/FilePreviewModal";
-import { LargeFileGate } from "./file-panel/LargeFileGate";
 import { HeaderToolbar } from "./header/HeaderToolbar";
 import { showHeaderLeadingChrome } from "./header/header-leading-chrome";
 import { HEADER_LEADING_GAP_PX, headerTitleLayoutWidth } from "./header/header-title-width";
@@ -197,6 +195,7 @@ import {
 	RevertActionConfirmModal,
 	SetGlobalModelModal,
 } from "./panels/memoized-dialogs";
+import { filePanelBaseName } from "./panels/panel-kind";
 import { compactProgressLabel } from "./progress-label";
 import { SwipeAnchorOverlay } from "./scroll/SwipeAnchorOverlay";
 import { resolveSelectionOverlayBlockId } from "./scroll/selection-anchor-overlay";
@@ -223,12 +222,10 @@ const NarratorDetailsPanel = lazy(() =>
 const SpecPanel = lazy(() =>
 	import("./spec/SpecPanel").then((module) => ({ default: module.SpecPanel })),
 );
-// Body of the read-only file viewer. Shared with the `file` dock panel — the
-// drawer below is just the off-dock (mobile) host for the same content, so both
-// surfaces show the same viewer instead of the drawer growing its own.
-const FileViewerContent = lazy(() =>
-	import("./file-viewer/FileViewerContent").then((module) => ({
-		default: module.FileViewerContent,
+// The drawer and dock use the same editor / binary-preview entry.
+const FilePanelContent = lazy(() =>
+	import("./file-panel/FilePanelContent").then((module) => ({
+		default: module.FilePanelContent,
 	})),
 );
 
@@ -1837,12 +1834,18 @@ function NarratorPanelBody({
 	const {
 		internalFileViewerPath,
 		setInternalFileViewerPath,
+		onFileEditorDirtyChange,
+		canExitFileEditor,
 		internalFileViewerTarget,
 		handleOpenFilePanel,
 		handleOpenReferencedFile,
 		canOpenReferencedFile,
 	} = useInternalFileViewer({ narratorId, isWorkspacePreview, t });
-	useMobileDrawerHistory(!!internalFileViewerPath, () => setInternalFileViewerPath(null));
+	useMobileDrawerHistory(
+		!!internalFileViewerPath,
+		() => setInternalFileViewerPath(null),
+		canExitFileEditor,
+	);
 	const [localFileSelection, setLocalFileSelection] = useState<FileReferenceEditorSelection | null>(
 		null,
 	);
@@ -3552,13 +3555,8 @@ function NarratorPanelBody({
 							onClose={() => setInternalFileViewerPath(null)}
 							position="right"
 							size={isMobileViewport ? "100%" : 600}
-							// The viewer body already shows the base name; the title carries the
-							// full path so the drawer adds information rather than repeating it.
-							//
-							// `TruncatedPath` rather than `truncate`: it ellipsizes from the LEFT,
-							// so a deep path keeps the filename — the part that identifies the file —
-							// visible instead of clipping it and leaving only directories.
-							title={<TruncatedPath path={internalFileViewerPath} fw={600} />}
+							// The shared toolbar displays the full path; the host title names the file.
+							title={<TruncatedPath path={filePanelBaseName(internalFileViewerPath)} fw={600} />}
 							closeButtonProps={{ size: "sm" }}
 							styles={{
 								header: SAFE_AREA_DEFAULT_DRAWER_HEADER_STYLE,
@@ -3584,26 +3582,17 @@ function NarratorPanelBody({
 									</Center>
 								}
 							>
-								<LargeFileGate
+								<FilePanelContent
+									filePath={internalFileViewerPath}
 									narratorId={narratorId}
 									deviceId={internalFileViewerTarget?.deviceId ?? "local"}
 									referenceOrigin={!!internalFileViewerTarget}
-									legacyViewer
-									filePath={internalFileViewerPath}
-									enabled={getFilePreviewType(internalFileViewerPath) === "text"}
+									selection={internalFileViewerTarget?.selection}
+									navigationRequestId={internalFileViewerTarget?.highlightRequestId}
+									onOpenFileTarget={handleOpenReferencedFile}
+									onDirtyChange={onFileEditorDirtyChange}
 									persistenceKey={`narrafork:large-file-drawer:${narratorId}`}
-								>
-									<FileViewerContent
-										key={internalFileViewerPath}
-										filePath={internalFileViewerPath}
-										narratorId={narratorId}
-										deviceId={internalFileViewerTarget?.deviceId ?? "local"}
-										referenceOrigin={!!internalFileViewerTarget}
-										selection={internalFileViewerTarget?.selection}
-										highlightRequestId={internalFileViewerTarget?.highlightRequestId}
-										onOpenFileTarget={handleOpenReferencedFile}
-									/>
-								</LargeFileGate>
+								/>
 							</Suspense>
 						</Drawer>
 					)}

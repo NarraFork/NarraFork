@@ -129,8 +129,11 @@ describe("focus file panel editing ownership", () => {
 
 		expect(body).toContain("dock?.narratorId ?? props.params.hostNarratorId");
 		expect(body).toContain("props.api.updateParameters({ ...props.params, hostNarratorId })");
-		expect(body).toContain('getFilePreviewType(filePath ?? "") === "text"');
-		expect(body).toContain(") : isText ? (");
+		const shared = await Bun.file(
+			new URL("../file-panel/FilePanelContent.tsx", import.meta.url),
+		).text();
+		expect(shared).toContain('getFilePreviewType(filePath) === "text"');
+		expect(body).toContain("<FilePanelContent");
 		expect(body).toContain("narratorId={fileNarratorId}");
 		expect(body).toContain("referenceOrigin={referenceOrigin}");
 		expect(body).toContain("navigationRequestId={highlightRequestId}");
@@ -623,8 +626,9 @@ describe("historical file panels", () => {
 		expect(body).toContain("reference={toolEdit}");
 		expect(body).toContain("key={toolEditReferenceKey(toolEdit)}");
 		expect(body).toMatch(/toolEdit \? `.* · Edit`/);
-		expect(body.indexOf("<ToolEditFileViewer")).toBeLessThan(body.indexOf("<FileEditorContent"));
-		expect(body).toContain(") : isText ? (");
+		expect(body).toContain("<FilePanelContent");
+		expect(body.indexOf("<ToolEditFileViewer")).toBeLessThan(body.indexOf("<FilePanelContent"));
+		expect(body).toMatch(/\) : \(\s*<FilePanelContent/);
 		expect(body).toMatch(
 			/filePanelResourceId\(\s*filePath,\s*deviceId,\s*referenceOrigin,\s*toolEdit,\s*props.params.fileNarratorId,/,
 		);

@@ -413,10 +413,10 @@ export function FileViewerContent({
 
 	const header = (
 		<Group gap={6} px="xs" py={4} wrap="nowrap" style={{ flexShrink: 0 }}>
-			{/* The name is the ONLY flexible item here (see HEADER_FLEXIBLE_STYLE); the
-			    full path is on hover, since the basename alone is what gets clipped. */}
+			{/* Keep the directory prefix visible when the full path is clipped;
+			    the dock tab already displays the basename. */}
 			<TruncatedText
-				text={fileName}
+				text={filePath}
 				tooltipLabel={filePath}
 				size="xs"
 				fw={600}

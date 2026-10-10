@@ -9,9 +9,11 @@ import { act, StrictMode, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { renderToString } from "react-dom/server";
 import { I18nextProvider } from "react-i18next";
+import * as viewport from "../../../hooks/useMobileViewport";
 import { ApiError, api } from "../../../lib/api";
 import { editorDocumentApi } from "../../../lib/api/editor-documents";
 import { fileReferenceApi } from "../../../lib/api/file-references";
+import * as fileDownload from "../../../lib/file-download";
 import en from "../../../locales/en/narrator.json";
 import { createDetachedPanelDockValue } from "../../graph/dock/detached-panel-context";
 import {
@@ -564,6 +566,11 @@ for (const surface of ["focus", "workspace"] as const)
 					</I18nextProvider>,
 				),
 			);
+			// The shared entry adds one lazy boundary; flush its resolved import before
+			// asserting the actual child-authorized editor session was opened.
+			await act(async () => {
+				await import("../file-panel/FilePanelContent");
+			});
 			expect(create).toHaveBeenCalledWith(
 				"child",
 				{ deviceId: "local", path: filePath, origin: "reference" },
@@ -708,6 +715,85 @@ test("reference CRLF loads clean with raw hash/encoding, preserving source narra
 	});
 	expect(await upload.mock.calls[0]?.[3].text()).toBe("a\nchanged\n");
 	expectClean("saved-byte-hash");
+});
+
+test("editor toolbar shows the full path and truncates its right end", async () => {
+	await mount();
+	const path = host.querySelector<HTMLElement>(`[title="${source.target.path}"]`);
+	expect(path?.textContent).toBe(source.target.path);
+	expect(path?.getAttribute("data-truncate")).toBe("end");
+	expect(path?.style.minWidth).toBe("0");
+	expect(path?.style.flex).toBe("1");
+});
+
+test("mobile toolbar puts the path on its own row and keeps all actions scrollable", async () => {
+	const mobileViewport = spyOn(viewport, "useMobileViewport").mockReturnValue(true);
+	restores.push(() => mobileViewport.mockRestore());
+	await mount({ referenceOrigin: false });
+	const path = host.querySelector<HTMLElement>(`[title="${source.target.path}"]`);
+	expect(path?.parentElement?.style.flexBasis).toBe("100%");
+	const actions = iconButton("copy").parentElement;
+	expect(actions?.style.width).toBe("max-content");
+	expect(actions?.parentElement?.style.overflowX).toBe("auto");
+	for (const icon of [
+		"download",
+		"device-floppy",
+		"arrow-back-up",
+		"arrow-forward-up",
+		"search",
+		"text-wrap",
+		"refresh",
+	])
+		expect(iconButton(icon)).not.toBeNull();
+});
+
+test("typing publishes the exit guard before React commits the updated toolbar", async () => {
+	const model = await mount();
+	await act(async () => {
+		model.edit("new unsaved draft");
+		expect(dirty.mock.calls.at(-1)?.[0]).toBe(true);
+	});
+});
+
+test("editor toolbar copies the complete file path with feedback", async () => {
+	const writeText = mock(async (_text: string) => {});
+	const previous = Object.getOwnPropertyDescriptor(navigator, "clipboard");
+	Object.defineProperty(navigator, "clipboard", {
+		configurable: true,
+		value: { writeText },
+	});
+	restores.push(() => {
+		if (previous) Object.defineProperty(navigator, "clipboard", previous);
+		else Reflect.deleteProperty(navigator, "clipboard");
+	});
+	await mount();
+	await click(iconButton("copy"));
+	expect(writeText.mock.calls).toEqual([[source.target.path]]);
+	expect(host.querySelector(".tabler-icon-check")).not.toBeNull();
+});
+
+test("editor downloads disk bytes without saving or changing the unsaved draft", async () => {
+	const blob = new Blob(["complete disk bytes"]);
+	const download = spyOn(api, "fsDownload").mockResolvedValue({ blob, fileName: "served.txt" });
+	const saveBlob = spyOn(fileDownload, "saveBlobAsFile").mockImplementation(() => {});
+	restores.push(
+		() => download.mockRestore(),
+		() => saveBlob.mockRestore(),
+	);
+	const model = await mount({ referenceOrigin: false });
+	await edit(model, "unsaved draft");
+	await click(iconButton("download"));
+	expect(download.mock.calls).toEqual([[source.target.path]]);
+	expect(saveBlob.mock.calls).toEqual([[blob, "served.txt"]]);
+	expect(model.getValue()).toBe("unsaved draft");
+	expect(commit).not.toHaveBeenCalled();
+	expect(dirty.mock.calls.at(-1)?.[0]).toBe(true);
+});
+
+test("scoped editor keeps path copying but does not expose broad local downloads", async () => {
+	await mount();
+	expect(iconButton("copy")).not.toBeNull();
+	expect(host.querySelector(".tabler-icon-download")).toBeNull();
 });
 
 test("local legacy-origin narrator files still use the authorized large-file session", async () => {

@@ -12,6 +12,8 @@ import {
 	Text,
 	Tooltip,
 } from "@mantine/core";
+import { useClipboard } from "@mantine/hooks";
+import { notifications } from "@mantine/notifications";
 import {
 	FILE_REFERENCE_READ_TIMEOUT_MS,
 	type FileReferenceEditorSelection,
@@ -21,7 +23,10 @@ import {
 	IconAlertTriangle,
 	IconArrowBackUp,
 	IconArrowForwardUp,
+	IconCheck,
+	IconCopy,
 	IconDeviceFloppy,
+	IconDownload,
 	IconRefresh,
 	IconSearch,
 	IconTextWrap,
@@ -37,6 +42,8 @@ import {
 	useState,
 } from "react";
 import { useTranslation } from "react-i18next";
+import { useMobileViewport } from "../../../hooks/useMobileViewport";
+import { api } from "../../../lib/api";
 import { request } from "../../../lib/api/client";
 import { fileReferenceApi } from "../../../lib/api/file-references";
 import { saveBlobAsFile } from "../../../lib/file-download";
@@ -139,6 +146,10 @@ function FileEditorDocument({
 	onDirtyChange,
 }: FileEditorContentProps) {
 	const { t } = useTranslation("narrator");
+	const isMobileViewport = useMobileViewport();
+	const onDirtyChangeRef = useRef(onDirtyChange);
+	onDirtyChangeRef.current = onDirtyChange;
+	const publishedExitBlocked = useRef(false);
 	const tRef = useRef(t);
 	tRef.current = t;
 	const scope = useFileReferenceScope();
@@ -162,6 +173,25 @@ function FileEditorDocument({
 	const [lineWrapping, setLineWrapping] = useState(false);
 	const [searchOpen, setSearchOpen] = useState(false);
 	const readOnly = deviceId !== "local" || !narratorId;
+	const clipboard = useClipboard({ timeout: 1500 });
+	const [downloading, setDownloading] = useState(false);
+	const download = async () => {
+		// Match the viewer: scoped/remote files must never use the broad local reader.
+		if (referenceOrigin || deviceId !== "local" || downloading) return;
+		setDownloading(true);
+		try {
+			const { blob, fileName } = await api.fsDownload(filePath);
+			saveBlobAsFile(blob, fileName ?? filePanelBaseName(filePath));
+		} catch (error) {
+			notifications.show({
+				color: "red",
+				title: tRef.current("fileViewer.downloadFailed"),
+				message: error instanceof Error ? error.message : String(error),
+			});
+		} finally {
+			setDownloading(false);
+		}
+	};
 	const modes = useMemo(() => availableModes(filePath), [filePath]);
 	// The remembered default mode applies only where it makes sense for this file
 	// (resolveInitialMode); "设为默认" writes the current mode back to the same key.
@@ -249,7 +279,16 @@ function FileEditorDocument({
 						length: model.getValueLength(),
 					};
 				},
-				onChange: setState,
+				onChange: (next) => {
+					// Publish before React commits: a close/navigation in the same turn as
+					// typing or starting a save must already see the exit guard.
+					const blocked = sessionExitBlocked(next);
+					if (publishedExitBlocked.current !== blocked) {
+						publishedExitBlocked.current = blocked;
+						onDirtyChangeRef.current?.(blocked);
+					}
+					setState(next);
+				},
 				...(readOnly
 					? {
 							readOnlySource: async (signal: AbortSignal) => {
@@ -715,10 +754,27 @@ function FileEditorDocument({
 				}
 			}}
 		>
-			<Group justify="space-between" gap="xs" px="xs" py={6} wrap="nowrap">
-				<Group gap={6} wrap="nowrap" style={{ minWidth: 0, flex: 1 }}>
-					<Text size="xs" c="dimmed" truncate title={filePath}>
-						{filePanelBaseName(filePath)}
+			<Group
+				justify="space-between"
+				gap="xs"
+				px="xs"
+				py={6}
+				wrap={isMobileViewport ? "wrap" : "nowrap"}
+				style={{ flexShrink: 0 }}
+			>
+				<Group
+					gap={6}
+					wrap="nowrap"
+					style={{ minWidth: 0, flex: 1, flexBasis: isMobileViewport ? "100%" : undefined }}
+				>
+					<Text
+						size="xs"
+						c="dimmed"
+						truncate="end"
+						title={filePath}
+						style={{ minWidth: 0, flex: 1 }}
+					>
+						{filePath}
 					</Text>
 					{readOnly && (
 						<Badge size="xs" color="gray">
@@ -736,80 +792,107 @@ function FileEditorDocument({
 						</Text>
 					)}
 				</Group>
-				<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
-					<Tooltip label={`${t("fileEditor.undo")} (Ctrl/Cmd+Z)`} openDelay={200}>
-						<ActionIcon
-							variant="subtle"
-							size="sm"
-							aria-label={t("fileEditor.undo")}
-							disabled={readOnly || state.loading || !editorActive || !history?.canUndo}
-							onClick={() => editorRef.current?.undo()}
-						>
-							<IconArrowBackUp size={14} />
-						</ActionIcon>
-					</Tooltip>
-					<Tooltip label={`${t("fileEditor.redo")} (Ctrl/Cmd+Shift+Z)`} openDelay={200}>
-						<ActionIcon
-							variant="subtle"
-							size="sm"
-							aria-label={t("fileEditor.redo")}
-							disabled={readOnly || state.loading || !editorActive || !history?.canRedo}
-							onClick={() => editorRef.current?.redo()}
-						>
-							<IconArrowForwardUp size={14} />
-						</ActionIcon>
-					</Tooltip>
-					<Tooltip label={`${t("fileEditor.search")} (Ctrl/Cmd+F)`} openDelay={200}>
-						<ActionIcon
-							variant="subtle"
-							size="sm"
-							aria-label={t("fileEditor.search")}
-							onClick={openSearch}
-						>
-							<IconSearch size={14} />
-						</ActionIcon>
-					</Tooltip>
-					<Tooltip label={t("fileEditor.wrap")} openDelay={200}>
-						<ActionIcon
-							variant={lineWrapping ? "light" : "subtle"}
-							size="sm"
-							aria-label={t("fileEditor.wrap")}
-							aria-pressed={lineWrapping}
-							disabled={!editorActive || history?.longLine}
-							onClick={() => setLineWrapping((old) => !old)}
-						>
-							<IconTextWrap size={14} />
-						</ActionIcon>
-					</Tooltip>
-					<Tooltip label={t("fileEditor.reload")} openDelay={200}>
-						<ActionIcon
-							variant="subtle"
-							color="gray"
-							size="sm"
-							aria-label={t("fileEditor.reload")}
-							onClick={load}
-							loading={state.loading}
-							disabled={state.phase !== "idle" || state.loading}
-						>
-							<IconRefresh size={14} />
-						</ActionIcon>
-					</Tooltip>
-					{!readOnly && (
-						<Tooltip label={`${t("fileEditor.save")} (Ctrl/Cmd+S)`} openDelay={200}>
+				<Box style={{ maxWidth: "100%", overflowX: "auto", flexShrink: 0 }}>
+					<Group gap={4} wrap="nowrap" style={{ width: "max-content" }}>
+						<Tooltip label={t("contextMenu_copyFilePath")} openDelay={200}>
 							<ActionIcon
-								variant={dirty ? "filled" : "subtle"}
-								color={dirty ? "green" : "gray"}
+								variant="subtle"
+								color="gray"
 								size="sm"
-								aria-label={t("fileEditor.save")}
-								onClick={handleSave}
-								loading={saving}
-								disabled={!editor || !sessionCanSave(state)}
+								aria-label={t("contextMenu_copyFilePath")}
+								onClick={() => clipboard.copy(filePath)}
 							>
-								<IconDeviceFloppy size={14} />
+								{clipboard.copied ? <IconCheck size={14} /> : <IconCopy size={14} />}
 							</ActionIcon>
 						</Tooltip>
-					)}
-				</Group>
+						{!referenceOrigin && deviceId === "local" && (
+							<Tooltip label={t("fileViewer.download")} openDelay={200}>
+								<ActionIcon
+									variant="subtle"
+									color="gray"
+									size="sm"
+									aria-label={t("fileViewer.download")}
+									loading={downloading}
+									onClick={() => void download()}
+								>
+									<IconDownload size={14} />
+								</ActionIcon>
+							</Tooltip>
+						)}
+						<Tooltip label={`${t("fileEditor.undo")} (Ctrl/Cmd+Z)`} openDelay={200}>
+							<ActionIcon
+								variant="subtle"
+								size="sm"
+								aria-label={t("fileEditor.undo")}
+								disabled={readOnly || state.loading || !editorActive || !history?.canUndo}
+								onClick={() => editorRef.current?.undo()}
+							>
+								<IconArrowBackUp size={14} />
+							</ActionIcon>
+						</Tooltip>
+						<Tooltip label={`${t("fileEditor.redo")} (Ctrl/Cmd+Shift+Z)`} openDelay={200}>
+							<ActionIcon
+								variant="subtle"
+								size="sm"
+								aria-label={t("fileEditor.redo")}
+								disabled={readOnly || state.loading || !editorActive || !history?.canRedo}
+								onClick={() => editorRef.current?.redo()}
+							>
+								<IconArrowForwardUp size={14} />
+							</ActionIcon>
+						</Tooltip>
+						<Tooltip label={`${t("fileEditor.search")} (Ctrl/Cmd+F)`} openDelay={200}>
+							<ActionIcon
+								variant="subtle"
+								size="sm"
+								aria-label={t("fileEditor.search")}
+								onClick={openSearch}
+							>
+								<IconSearch size={14} />
+							</ActionIcon>
+						</Tooltip>
+						<Tooltip label={t("fileEditor.wrap")} openDelay={200}>
+							<ActionIcon
+								variant={lineWrapping ? "light" : "subtle"}
+								size="sm"
+								aria-label={t("fileEditor.wrap")}
+								aria-pressed={lineWrapping}
+								disabled={!editorActive || history?.longLine}
+								onClick={() => setLineWrapping((old) => !old)}
+							>
+								<IconTextWrap size={14} />
+							</ActionIcon>
+						</Tooltip>
+						<Tooltip label={t("fileEditor.reload")} openDelay={200}>
+							<ActionIcon
+								variant="subtle"
+								color="gray"
+								size="sm"
+								aria-label={t("fileEditor.reload")}
+								onClick={load}
+								loading={state.loading}
+								disabled={state.phase !== "idle" || state.loading}
+							>
+								<IconRefresh size={14} />
+							</ActionIcon>
+						</Tooltip>
+						{!readOnly && (
+							<Tooltip label={`${t("fileEditor.save")} (Ctrl/Cmd+S)`} openDelay={200}>
+								<ActionIcon
+									variant={dirty ? "filled" : "subtle"}
+									color={dirty ? "green" : "gray"}
+									size="sm"
+									aria-label={t("fileEditor.save")}
+									onClick={handleSave}
+									loading={saving}
+									disabled={!editor || !sessionCanSave(state)}
+								>
+									<IconDeviceFloppy size={14} />
+								</ActionIcon>
+							</Tooltip>
+						)}
+					</Group>
+				</Box>
 			</Group>
 			{deviceId !== "local" && (
 				<Text size="xs" c="dimmed" px="xs">
@@ -834,7 +917,7 @@ function FileEditorDocument({
 				</Text>
 			)}
 			{modes.length > 1 && (
-				<Group gap={8} px="xs" pb={6} wrap="nowrap" style={{ flexShrink: 0 }}>
+				<Group gap={8} px="xs" pb={6} wrap="nowrap" style={{ flexShrink: 0, overflowX: "auto" }}>
 					<SegmentedControl
 						size="xs"
 						value={mode}

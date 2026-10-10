@@ -39,10 +39,12 @@ describe("internal file viewer drawer header", () => {
 		expect(DRAWER).toContain('title: { minWidth: 0, flex: 1, overflow: "hidden" }');
 	});
 
-	// A right-clipped path keeps the directories and drops the filename — the one part
-	// that says which file this is. TruncatedPath ellipsizes from the left instead.
-	it("clips the path from the left so the filename stays visible", () => {
-		expect(DRAWER).toContain("<TruncatedPath path={internalFileViewerPath}");
+	// The shared toolbar now displays the full path, so the host title identifies
+	// the file without repeating its directories. Long basenames can still shrink.
+	it("shows only the filename above the shared full-path toolbar", () => {
+		expect(DRAWER).toContain("<TruncatedPath path={filePanelBaseName(internalFileViewerPath)}");
+		expect(DRAWER).toContain("<FilePanelContent");
+		expect(DRAWER).toContain("filePath={internalFileViewerPath}");
 	});
 
 	it("no longer right-truncates the raw path in a plain Text", () => {

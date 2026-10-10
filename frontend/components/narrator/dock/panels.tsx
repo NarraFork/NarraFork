@@ -42,13 +42,11 @@ import { useUserPreferences } from "../../../hooks/useUserPreferences";
 import { NARRATOR_STATUS_COLORS } from "../../../lib/constants";
 import type { PluginDockPanelProps } from "../../plugins/types";
 import { FileReferenceScopeProvider } from "../composer/FileReferenceScope";
-import { getFilePreviewType } from "../file-panel/FilePreviewModal";
 import {
 	FilePanelNavigationProvider,
 	type FilePanelOpener,
 	useFilePanelSourceOpener,
 } from "../file-panel/file-panel-navigation";
-import { LargeFileGate } from "../file-panel/LargeFileGate";
 import { usePanelHeaderControls } from "../panels/panel-header-controls";
 import {
 	type FilePanelParams,
@@ -95,15 +93,12 @@ const GitPanel = lazy(() =>
 const FileTreePanel = lazy(() =>
 	import("../file-tree/FileTreePanel").then((m) => ({ default: m.FileTreePanel })),
 );
-// Lazy so sessions without an open text file do not load the editor module graph.
-const FileEditorContent = lazy(() =>
-	import("../file-editor/FileEditorContent").then((m) => ({ default: m.FileEditorContent })),
+// Both dock and drawer defer the same editor / binary-preview entry.
+const FilePanelContent = lazy(() =>
+	import("../file-panel/FilePanelContent").then((m) => ({ default: m.FilePanelContent })),
 );
 const ToolEditFileViewer = lazy(() =>
 	import("../tool-call/ToolEditFileViewer").then((m) => ({ default: m.ToolEditFileViewer })),
-);
-const FileViewerContent = lazy(() =>
-	import("../file-viewer/FileViewerContent").then((m) => ({ default: m.FileViewerContent })),
 );
 const KnowledgeEntryPanelContent = lazy(() =>
 	import("../knowledge/KnowledgeEntryPanelContent").then((m) => ({
@@ -984,8 +979,6 @@ export function FileDockPanel(props: IDockviewPanelProps<FilePanelParams>) {
 		[props.api, props.containerApi, canExit],
 	);
 	const displayTitle = toolEdit ? `${title} · Edit` : editorDirty ? `${title} *` : title;
-	// Text always uses CodeMirror; the editor itself enforces write capability.
-	const isText = getFilePreviewType(filePath ?? "") === "text";
 
 	useLayoutEffect(() => {
 		if (!hostNarratorId || props.params.hostNarratorId === hostNarratorId) return;
@@ -1049,35 +1042,18 @@ export function FileDockPanel(props: IDockviewPanelProps<FilePanelParams>) {
 							filePath={filePath}
 							navigationRequestId={highlightRequestId}
 						/>
-					) : isText ? (
-						<LargeFileGate
-							narratorId={fileNarratorId}
-							deviceId={deviceId}
-							referenceOrigin={referenceOrigin}
-							filePath={filePath}
-							confirmed={props.params.largeFileConfirmed}
-							onConfirm={() => props.api.updateParameters({ largeFileConfirmed: true })}
-						>
-							<FileEditorContent
-								key={`edit:${fileNarratorId}:${deviceId}:${filePath}`}
-								filePath={filePath}
-								narratorId={fileNarratorId}
-								deviceId={deviceId}
-								referenceOrigin={referenceOrigin}
-								selection={selection}
-								navigationRequestId={highlightRequestId}
-								onDirtyChange={onDirtyChange}
-							/>
-						</LargeFileGate>
 					) : (
-						<FileViewerContent
-							key={`${fileNarratorId}:${deviceId}:${filePath}`}
+						<FilePanelContent
 							filePath={filePath}
 							narratorId={fileNarratorId}
 							deviceId={deviceId}
 							referenceOrigin={referenceOrigin}
 							selection={selection}
-							highlightRequestId={highlightRequestId}
+							navigationRequestId={highlightRequestId}
+							onDirtyChange={onDirtyChange}
+							onOpenFileTarget={openFilePanel ? openFileTarget : undefined}
+							confirmed={props.params.largeFileConfirmed}
+							onConfirm={() => props.api.updateParameters({ largeFileConfirmed: true })}
 						/>
 					)}
 				</LazyPanelBoundary>

@@ -292,7 +292,7 @@ async function runReactLinkSentinelScenario(closeDuringLinkClick: boolean) {
 	return result;
 }
 
-async function runMobileDrawerHookScenario() {
+async function runMobileDrawerHookScenario(guarded = false) {
 	const dom = installReactDom();
 	const browser = new BrowserHistoryHarness("/");
 	const cleanupWindow = installGlobals({ window: browser.window });
@@ -304,13 +304,20 @@ async function runMobileDrawerHookScenario() {
 	})) as unknown as typeof browser.window.matchMedia;
 	const history = createBrowserHistory({ window: browser.window });
 	let closeCount = 0;
+	let blocked = guarded;
 
 	function DrawerLayout() {
 		const [opened, setOpened] = useState(true);
-		useMobileDrawerHistory(opened, () => {
-			closeCount++;
-			setOpened(false);
-		});
+		useMobileDrawerHistory(
+			opened,
+			() => {
+				closeCount++;
+				if (blocked) return false;
+				setOpened(false);
+				return true;
+			},
+			guarded ? () => !blocked : undefined,
+		);
 		return <span data-drawer-opened={opened ? "true" : "false"} />;
 	}
 
@@ -327,27 +334,51 @@ async function runMobileDrawerHookScenario() {
 	const container = dom.document.createElement("div") as HTMLDivElement;
 	dom.document.body.appendChild(container);
 	const reactRoot = createRoot(container);
-
-	await router.load();
-	await act(async () => {
-		reactRoot.render(<RouterProvider router={router} />);
-		await flushHistoryWork();
-	});
-	expect(browser.entries).toHaveLength(2);
-	expect(container.querySelector("[data-drawer-opened='true']")).not.toBeNull();
-
-	await act(async () => {
-		history.back();
-		await flushHistoryWork();
-	});
-	expect(closeCount).toBe(1);
-	expect(container.querySelector("[data-drawer-opened='true']")).toBeNull();
-	expect(router.state.location.pathname).toBe("/");
-	await act(async () => reactRoot.unmount());
-	history.destroy();
-	container.remove();
-	cleanupWindow();
-	dom.cleanup();
+	try {
+		await router.load();
+		await act(async () => {
+			reactRoot.render(<RouterProvider router={router} />);
+			await flushHistoryWork();
+		});
+		expect(browser.entries).toHaveLength(2);
+		expect(container.querySelector("[data-drawer-opened='true']")).not.toBeNull();
+		if (guarded) {
+			for (let attempt = 0; attempt < 3; attempt++) {
+				await act(async () => {
+					history.back();
+					await flushHistoryWork();
+				});
+				expect(closeCount).toBe(attempt + 1);
+				expect(container.querySelector("[data-drawer-opened='true']")).not.toBeNull();
+				expect(history.location.state.mobileNav).toBe(true);
+				expectCompleteTanStackMetadata(history.location.state, 1);
+				expect(browser.entries).toHaveLength(2);
+			}
+			for (const action of ["push", "replace"] as const) {
+				await act(async () => {
+					history[action]("/elsewhere");
+					await flushHistoryWork();
+				});
+				expect(history.location.pathname).toBe("/");
+				expect(history.location.state.mobileNav).toBe(true);
+				expect(container.querySelector("[data-drawer-opened='true']")).not.toBeNull();
+			}
+			blocked = false;
+		}
+		await act(async () => {
+			history.back();
+			await flushHistoryWork();
+		});
+		expect(closeCount).toBe(guarded ? 4 : 1);
+		expect(container.querySelector("[data-drawer-opened='true']")).toBeNull();
+		expect(router.state.location.pathname).toBe("/");
+	} finally {
+		await act(async () => reactRoot.unmount());
+		history.destroy();
+		container.remove();
+		cleanupWindow();
+		dom.cleanup();
+	}
 }
 
 describe("app-owned history entry state", () => {
@@ -689,6 +720,10 @@ describe("mobile Back sentinel entries", () => {
 
 	test("the mobile drawer hook closes the drawer before route navigation", async () => {
 		await runMobileDrawerHookScenario();
+	});
+
+	test("a dirty drawer survives repeated real Back and blocks route replay until saved", async () => {
+		await runMobileDrawerHookScenario(true);
 	});
 
 	test("a real React Link onClick cleanup race cannot consume the sentinel twice", async () => {
