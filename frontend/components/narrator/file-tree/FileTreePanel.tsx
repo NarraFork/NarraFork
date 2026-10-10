@@ -13,7 +13,7 @@
  */
 
 import { Center, Text } from "@mantine/core";
-import { useCallback, useMemo, useRef } from "react";
+import { useCallback, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useFileTreeStatus } from "../../../hooks/useNarrator";
 import { useNarratorWS } from "../../../hooks/useNarratorWS";
@@ -26,12 +26,37 @@ export interface FileTreePanelProps {
 	narratorId: string;
 	/** Open a file in the read-only viewer panel. */
 	onOpenFile: (absolutePath: string, fileName: string) => void;
-	/** Include dotfiles. */
+	/**
+	 * Initial dotfile visibility. Defaults to true.
+	 *
+	 * 默认为 true —— 文件树是叙述者查看/打开项目文件的入口, 隐藏 `.env`、
+	 * `.gitignore`、`.config/` 这些恰恰是最常被讨论的文件, 会让用户在树里
+	 * "找不到"一个明明存在的路径。
+	 *
+	 * 这只是**初始值**: 面板工具栏的可见性开关会接管后续变化, 所以宿主无需
+	 * 为此接线就能得到可用行为。想跨挂载保留用户选择的宿主, 接
+	 * `onShowHiddenChange` 并把结果回传给这个 prop 即可, 不必自己渲染开关。
+	 */
 	showHidden?: boolean;
+	/** Reports the user's visibility toggle, for hosts that want to persist it. */
+	onShowHiddenChange?: (showHidden: boolean) => void;
 }
 
-export function FileTreePanel({ narratorId, onOpenFile, showHidden = false }: FileTreePanelProps) {
+export function FileTreePanel({
+	narratorId,
+	onOpenFile,
+	showHidden: initialShowHidden = true,
+	onShowHiddenChange,
+}: FileTreePanelProps) {
 	const { t } = useTranslation("narrator");
+	const [showHidden, setShowHidden] = useState(initialShowHidden);
+	const toggleShowHidden = useCallback(() => {
+		setShowHidden((previous) => {
+			const next = !previous;
+			onShowHiddenChange?.(next);
+			return next;
+		});
+	}, [onShowHiddenChange]);
 	const contextQuery = useWorkspaceContext(narratorId);
 	const context = contextQuery.data;
 	const root = context?.deviceId === "local" ? context.cwd.trim() : "";
@@ -108,6 +133,7 @@ export function FileTreePanel({ narratorId, onOpenFile, showHidden = false }: Fi
 			contextKey={treeIdentity}
 			root={root}
 			showHidden={showHidden}
+			onToggleShowHidden={toggleShowHidden}
 			lineStats={lineStats}
 			lineStatsTruncated={fileTreeStatus?.truncated === true}
 			onRefreshLineStats={refreshLineStats}

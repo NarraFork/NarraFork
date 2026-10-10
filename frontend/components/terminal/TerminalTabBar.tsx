@@ -8,6 +8,7 @@ import {
 } from "@dnd-kit/core";
 import { horizontalListSortingStrategy, SortableContext, useSortable } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
+import { restrictToHorizontalAxis } from "@frontend/lib/dnd-modifiers";
 import {
 	ActionIcon,
 	Button,
@@ -252,7 +253,12 @@ export function TerminalTabBar({
 					scrollbarWidth: "none",
 				}}
 			>
-				<DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
+				<DndContext
+					sensors={sensors}
+					collisionDetection={closestCenter}
+					modifiers={[restrictToHorizontalAxis]}
+					onDragEnd={handleDragEnd}
+				>
 					<SortableContext items={tabs.map((t) => t.id)} strategy={horizontalListSortingStrategy}>
 						{tabs.map((tab) => (
 							<SortableTab

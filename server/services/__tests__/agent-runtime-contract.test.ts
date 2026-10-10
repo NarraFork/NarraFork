@@ -148,6 +148,81 @@ for (const scenario of runtimeContractScenarios) {
 	});
 }
 
+describe("CriticalEventPersistenceError surfaces its cause", () => {
+	// The narrator's `errorMessage`, the WebSocket `narrator_error` and the
+	// `narrator_error` on the narrator event stream all render `String(err)`, which
+	// prints `message` and nothing else. A cause parked on `Error.cause` is therefore
+	// invisible to the reader who has to decide whether to retry — which is the whole
+	// point of stopping the loop instead of warning and continuing.
+	//
+	// Scope note: these assert the CONSTRUCTOR contract. That the folded message then
+	// reaches the reader is the job of the executor/orchestrator seams, which this
+	// file does not drive.
+	test("includes the underlying cause in the message", () => {
+		const cause = new Error("SQLITE_BUSY: database is locked");
+		const error = new CriticalEventPersistenceError("Tool result could not be persisted", {
+			cause,
+		});
+		expect(error.message).toBe(
+			"Tool result could not be persisted: SQLITE_BUSY: database is locked",
+		);
+		// The cause stays reachable structurally too; the message duplication is
+		// additive, not a replacement.
+		expect((error.cause as Error).message).toBe(cause.message);
+	});
+
+	test("handles a cause that is a plain string", () => {
+		const error = new CriticalEventPersistenceError("Write source exceeds final content", {
+			cause: "length went backwards",
+		});
+		expect(error.message).toBe("Write source exceeds final content: length went backwards");
+	});
+
+	test("leaves the message alone when there is no cause", () => {
+		const error = new CriticalEventPersistenceError(
+			"Detached tool result has no execution receipt",
+		);
+		expect(error.message).toBe("Detached tool result has no execution receipt");
+	});
+
+	test("does not repeat a message the cause already contains", () => {
+		const error = new CriticalEventPersistenceError("Tool result could not be persisted", {
+			cause: new Error("Tool result could not be persisted"),
+		});
+		expect(error.message).toBe("Tool result could not be persisted");
+	});
+
+	test("survives a cause that cannot be stringified", () => {
+		// `String()` throws "No default value" on a null-prototype object. This
+		// constructor runs inside the executor's catch block, so throwing here would
+		// replace the persistence diagnosis with a TypeError and hide the real failure
+		// — the reader must still get the barrier message.
+		const cause = Object.create(null) as object;
+		const error = new CriticalEventPersistenceError("Tool result could not be persisted", {
+			cause,
+		});
+		expect(error.message).toBe("Tool result could not be persisted");
+	});
+
+	test("caps a huge cause instead of publishing it whole", () => {
+		// The folded message is persisted to `narrators.error_message` (an unbounded
+		// `text`) and broadcast over the WebSocket. A PostgreSQL failure renders as
+		// `Failed query: <full SQL>\nparams: [...]`, so an uncapped fold would surface
+		// complete statements and their parameter values to every reader.
+		const cause = new Error(`Failed query: UPDATE t SET x = ?\nparams: ${"p".repeat(5_000)}`);
+		const error = new CriticalEventPersistenceError(
+			"Assistant content persistence barrier failed",
+			{
+				cause,
+			},
+		);
+		// Bound is the cap plus the fixed prefix/suffix, not the original size.
+		expect(error.message.length).toBeLessThan(1_200);
+		expect(error.message).toContain("truncated 4");
+		expect(error.message).toContain("Failed query: UPDATE t SET x = ?");
+	});
+});
+
 describe("runtime contract fixture controls", () => {
 	test("clock honors deadline ordering, cancellation and nested scheduling without global timers", () => {
 		const clock = createContractClock();

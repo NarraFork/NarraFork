@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
 import { includesSearch, normalizeSearchText } from "../../../lib/search-utils";
+import type { NarratorListItem, NarratorListViewer } from "./NarratorListCard";
 
 export interface NarratorListSearchParams {
 	sortBy?: string;
@@ -138,4 +139,98 @@ export function useNarratorInfiniteScroll({
 		return () => observer.disconnect();
 	}, [disabled, hasNextPage, isFetchingNextPage, fetchNextPage]);
 	return sentinelRef;
+}
+
+/** The slice of a paginated narrators cache this reducer reads and writes. */
+export interface NarratorsInfiniteData {
+	pages: Array<{
+		items: NarratorListItem[];
+		[key: string]: unknown;
+	}>;
+	[key: string]: unknown;
+}
+
+/**
+ * Minimal shape of the list WS event this reducer consumes.
+ *
+ * Structural rather than `NarratorListWSEvent` itself, because that type lives in
+ * the WS hook while this reducer is the part worth unit-testing on its own.
+ */
+export interface NarratorListUpdateEvent {
+	status?: string;
+	substatus?: string[];
+	title?: string;
+	permissionMode?: string;
+	viewers?: NarratorListViewer[];
+}
+
+/**
+ * Row shape this reducer patches.
+ *
+ * Deliberately looser than `NarratorListItem`: a patch writes `updatedAt`, which
+ * the card type does not declare, and typing the row as `NarratorListItem` would
+ * reject its own output. The real rows are `NarratorListItem` with those extras.
+ */
+type MutableRow = NarratorListItem & Record<string, unknown>;
+
+/**
+ * Apply one narrator list WS event to the paginated cache.
+ *
+ * Two behaviours are load-bearing:
+ *
+ * 1. **Archiving removes the row rather than setting `status: "archived"`.** The
+ *    paginated query already excludes archived narrators, so writing the status
+ *    back would be undone by the next `invalidateQueries` — the refetch returns a
+ *    list without the row, and a status-only patch leaves an archived narrator
+ *    sitting in the active list.
+ * 2. **Pages are re-shaped, never dropped.** An infinite query's `pages` and
+ *    `pageParams` must stay the same length and index-aligned, so removing a row
+ *    empties its page's `items` instead of deleting the page; the paginator skips
+ *    empty pages on its own. Deleting one would misalign `pageParams` and corrupt
+ *    the next `fetchNextPage` cursor.
+ *
+ * Returns the original object when nothing matched, so React Query sees the same
+ * reference and skips notifying subscribers.
+ */
+export function applyNarratorListEvent(
+	old: NarratorsInfiniteData | undefined,
+	narratorId: string,
+	event: NarratorListUpdateEvent,
+): NarratorsInfiniteData | undefined {
+	if (!old?.pages) return old;
+
+	if (event.status === "archived") {
+		let removed = false;
+		const pages = old.pages.map((page) => {
+			const items = page.items.filter((item) => {
+				if (item.id === narratorId) {
+					removed = true;
+					return false;
+				}
+				return true;
+			});
+			return items.length === page.items.length ? page : { ...page, items };
+		});
+		return removed ? { ...old, pages } : old;
+	}
+
+	let changed = false;
+	const pages = old.pages.map((page) => ({
+		...page,
+		items: page.items.map((item) => {
+			if (item.id !== narratorId) return item;
+			changed = true;
+			const row = item as MutableRow;
+			return {
+				...row,
+				...(event.status !== undefined ? { status: event.status } : {}),
+				...(event.substatus !== undefined ? { substatus: event.substatus } : {}),
+				...(event.title !== undefined ? { title: event.title } : {}),
+				...(event.permissionMode !== undefined ? { permissionMode: event.permissionMode } : {}),
+				...(event.viewers !== undefined ? { viewers: event.viewers } : {}),
+				updatedAt: new Date().toISOString(),
+			};
+		}),
+	}));
+	return changed ? { ...old, pages } : old;
 }

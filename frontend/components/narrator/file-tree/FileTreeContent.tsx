@@ -29,6 +29,7 @@ import {
 	IconAlertTriangle,
 	IconChevronDown,
 	IconChevronRight,
+	IconEye,
 	IconEyeOff,
 	IconRefresh,
 } from "@tabler/icons-react";
@@ -62,6 +63,8 @@ export interface FileTreeContentProps {
 	/** Frozen device/revision/context identity supplied by the narrator-bound host. */
 	contextKey?: string;
 	showHidden: boolean;
+	/** Toggle dotfile visibility from the panel toolbar. Omit to render no toggle. */
+	onToggleShowHidden?: () => void;
 	/** File figures plus pre-aggregated directory figures, keyed by tree-relative path. */
 	lineStats?: ReadonlyMap<string, TreeLineStats>;
 	/** Git returned only a bounded prefix, so directory totals are lower bounds. */
@@ -114,6 +117,7 @@ export function FileTreeContent({
 	root,
 	contextKey,
 	showHidden,
+	onToggleShowHidden,
 	lineStats,
 	lineStatsTruncated = false,
 	onRefreshLineStats,
@@ -221,6 +225,22 @@ export function FileTreeContent({
 	return (
 		<Box style={{ height: "100%", overflow: "auto" }} p="xs">
 			<Group justify="flex-end" gap={4} mb={4}>
+				{onToggleShowHidden && (
+					<Tooltip
+						label={t(showHidden ? "fileTree.hideHidden" : "fileTree.showHidden")}
+						openDelay={200}
+					>
+						<ActionIcon
+							variant="subtle"
+							color={showHidden ? "indigo" : "gray"}
+							size="sm"
+							onClick={onToggleShowHidden}
+							aria-pressed={showHidden}
+						>
+							{showHidden ? <IconEye size={14} /> : <IconEyeOff size={14} />}
+						</ActionIcon>
+					</Tooltip>
+				)}
 				<Tooltip label={t("fileTree.refresh")} openDelay={200}>
 					<ActionIcon variant="subtle" color="gray" size="sm" onClick={refreshAll}>
 						<IconRefresh size={14} />

@@ -8,6 +8,7 @@ import {
 } from "@dnd-kit/core";
 import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
+import { restrictToVerticalAxis } from "@frontend/lib/dnd-modifiers";
 import {
 	ActionIcon,
 	Badge,
@@ -117,7 +118,12 @@ export const ModelOverviewTab = React.memo(function ModelOverviewTab({
 		<Stack gap="md">
 			{/* ── Provider control rows ── */}
 			<Paper withBorder p="xs">
-				<DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
+				<DndContext
+					sensors={sensors}
+					collisionDetection={closestCenter}
+					modifiers={[restrictToVerticalAxis]}
+					onDragEnd={handleDragEnd}
+				>
 					<SortableContext
 						items={sortedGroups.map((g) => g.prefix)}
 						strategy={verticalListSortingStrategy}

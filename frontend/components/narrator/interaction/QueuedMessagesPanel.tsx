@@ -8,6 +8,7 @@ import {
 	useSensors,
 } from "@dnd-kit/core";
 import { SortableContext, verticalListSortingStrategy } from "@dnd-kit/sortable";
+import { restrictToVerticalAxis } from "@frontend/lib/dnd-modifiers";
 import { ActionIcon, Button, Group, Menu, Stack, Text } from "@mantine/core";
 import { IconChevronDown, IconChevronUp, IconDotsVertical } from "@tabler/icons-react";
 import { useTranslation } from "react-i18next";
@@ -174,6 +175,7 @@ export function QueuedMessagesPanel(props: QueuedMessagesPanelProps) {
 					<DndContext
 						sensors={sensors}
 						collisionDetection={closestCenter}
+						modifiers={[restrictToVerticalAxis]}
 						onDragEnd={props.handleDragEndQueued}
 					>
 						<SortableContext items={ordinaryIds} strategy={verticalListSortingStrategy}>
