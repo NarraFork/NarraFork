@@ -26,6 +26,14 @@ const {
 } = await import("../git-identities");
 const { invalidateGitIdentityCache, resolveGitIdentityForTurn, resolveGitIdentityForUser } =
 	await import("../../lib/git-identity");
+const { sqliteAuthSessionStore: profileStore } = await import("../auth/sqlite-session-store");
+const { updateProfileSchema } = await import("../../lib/validators/auth");
+
+// The actual PATCH parser, store and identity resolver, without opening the server database.
+async function patchProfile(userId: string, body: unknown) {
+	const parsed = updateProfileSchema.parse(body);
+	await profileStore.updateProfile(userId, parsed);
+}
 
 let alice: string;
 let bob: string;
@@ -69,6 +77,156 @@ beforeEach(async () => {
 afterAll(() => {
 	invalidateGitIdentityCache();
 	sqlite.close();
+});
+
+describe("legacy profile compatibility", () => {
+	test("first settings and edits change resolution immediately, including cached null", async () => {
+		expect(await resolveGitIdentityForUser(alice)).toBeNull();
+		await patchProfile(alice, { gitUsername: "Alice", gitEmail: "a@e.com" });
+		expect(await resolveGitIdentityForUser(alice)).toEqual({ name: "Alice", email: "a@e.com" });
+		const [first] = await listUserGitIdentities(alice);
+		await patchProfile(alice, { gitUsername: "Alice updated", gitEmail: "new@e.com" });
+		expect(await resolveGitIdentityForUser(alice)).toEqual({
+			name: "Alice updated",
+			email: "new@e.com",
+		});
+		expect((await listUserGitIdentities(alice))[0].id).toBe(first.id);
+		expect(await profileStore.findSessionProfile(alice)).toMatchObject({
+			gitUsername: "Alice updated",
+			gitEmail: "new@e.com",
+		});
+	});
+
+	test("initial partial fields stay inactive until both halves are set", async () => {
+		await patchProfile(alice, { gitUsername: "Alice" });
+		expect(await resolveGitIdentityForUser(alice)).toBeNull();
+		expect(await listUserGitIdentities(alice)).toEqual([]);
+		await patchProfile(alice, { gitEmail: "a@e.com" });
+		expect(await resolveGitIdentityForUser(alice)).toEqual({ name: "Alice", email: "a@e.com" });
+	});
+
+	test("single-side changes preserve the current default, not stale legacy fields", async () => {
+		await patchProfile(alice, { gitUsername: "Old", gitEmail: "old@e.com" });
+		const current = await createUserGitIdentity(alice, { name: "Work", email: "work@e.com" });
+		await updateUserGitIdentity(alice, current.id, { isDefault: true });
+		await patchProfile(alice, { gitUsername: "New Work" });
+		expect(await resolveGitIdentityForUser(alice)).toEqual({
+			name: "New Work",
+			email: "work@e.com",
+		});
+		await patchProfile(alice, { gitEmail: "newwork@e.com" });
+		expect(await resolveGitIdentityForUser(alice)).toEqual({
+			name: "New Work",
+			email: "newwork@e.com",
+		});
+		expect((await listUserGitIdentities(alice)).find((row) => row.id !== current.id)).toMatchObject(
+			{
+				name: "Old",
+				email: "old@e.com",
+				isDefault: false,
+			},
+		);
+	});
+
+	for (const clear of [{ gitUsername: "" }, { gitEmail: "" }, { gitUsername: "", gitEmail: "" }]) {
+		test(`clearing ${Object.keys(clear).join("/")} disables a single identity and its pick`, async () => {
+			await patchProfile(alice, { gitUsername: "Alice", gitEmail: "a@e.com" });
+			const [identity] = await listUserGitIdentities(alice);
+			await setNarratorGitIdentityPick(alice, narratorId, identity.id);
+			expect(await resolveGitIdentityForTurn(narratorId, alice)).not.toBeNull();
+			await patchProfile(alice, clear);
+			expect(await resolveGitIdentityForUser(alice)).toBeNull();
+			expect(await resolveGitIdentityForTurn(narratorId, alice)).toBeNull();
+			expect(await getNarratorGitIdentityPick(alice, narratorId)).toBeNull();
+			expect(await listUserGitIdentities(alice)).toEqual([]);
+			for (const key of Object.keys(clear)) {
+				expect(
+					(await profileStore.findSessionProfile(alice))?.[key as keyof typeof clear],
+				).toBeNull();
+			}
+		});
+	}
+
+	test("a cleared half can be restored without losing the omitted half", async () => {
+		await patchProfile(alice, { gitUsername: "Alice", gitEmail: "a@e.com" });
+		await patchProfile(alice, { gitEmail: "" });
+		await patchProfile(alice, { gitEmail: "restored@e.com" });
+		expect(await resolveGitIdentityForUser(alice)).toEqual({
+			name: "Alice",
+			email: "restored@e.com",
+		});
+	});
+
+	test("multi-identity clears reject atomically instead of silently selecting a survivor", async () => {
+		await patchProfile(alice, { gitUsername: "Alice", gitEmail: "a@e.com" });
+		await createUserGitIdentity(alice, { name: "Work", email: "work@e.com" });
+		const before = await listUserGitIdentities(alice);
+		const profile = await profileStore.findSessionProfile(alice);
+		for (const body of [{ gitUsername: "" }, { gitEmail: "" }, { gitUsername: "", gitEmail: "" }]) {
+			await expect(patchProfile(alice, body)).rejects.toThrow("multiple identities");
+			expect(await listUserGitIdentities(alice)).toEqual(before);
+			expect(await profileStore.findSessionProfile(alice)).toEqual(profile);
+			expect(await resolveGitIdentityForUser(alice)).toEqual({ name: "Alice", email: "a@e.com" });
+		}
+	});
+
+	test("profile edits and clears never change another user's rows or cached resolution", async () => {
+		await patchProfile(bob, { gitUsername: "Bob", gitEmail: "b@e.com" });
+		const before = await listUserGitIdentities(bob);
+		expect(await resolveGitIdentityForUser(bob)).toEqual({ name: "Bob", email: "b@e.com" });
+		await patchProfile(alice, { gitUsername: "Alice", gitEmail: "a@e.com" });
+		await patchProfile(alice, { gitEmail: "new@e.com" });
+		await patchProfile(alice, { gitUsername: "", gitEmail: "" });
+		expect(await listUserGitIdentities(bob)).toEqual(before);
+		expect(await resolveGitIdentityForUser(bob)).toEqual({ name: "Bob", email: "b@e.com" });
+		expect(await profileStore.findSessionProfile(bob)).toMatchObject({
+			gitUsername: "Bob",
+			gitEmail: "b@e.com",
+		});
+	});
+
+	test("PostgreSQL rejects unsupported legacy writes before accessing a database", async () => {
+		const { createPostgresAuthSessionStore } = await import("../auth/postgres-session-store");
+		const unavailable = new Proxy(
+			{},
+			{
+				get: () => {
+					throw new Error("Database must not be accessed");
+				},
+			},
+		);
+		const pg = createPostgresAuthSessionStore(
+			unavailable as Parameters<typeof createPostgresAuthSessionStore>[0],
+		);
+		await expect(pg.updateProfile(alice, { gitUsername: "Alice" })).rejects.toThrow(
+			"not supported",
+		);
+		await expect(pg.updateProfile(alice, { gitEmail: null })).rejects.toThrow("not supported");
+		await pg.updateProfile(alice, {});
+	});
+
+	test("invalid characters are refused without touching the profile or default", async () => {
+		await patchProfile(alice, { gitUsername: "Alice", gitEmail: "a@e.com" });
+		await expect(patchProfile(alice, { gitUsername: "Bad<Name" })).rejects.toThrow();
+		expect(await resolveGitIdentityForUser(alice)).toEqual({ name: "Alice", email: "a@e.com" });
+		expect(await profileStore.findSessionProfile(alice)).toMatchObject({ gitUsername: "Alice" });
+	});
+
+	test("a profile write failure rolls back the identity update too", async () => {
+		await patchProfile(alice, { gitUsername: "Alice", gitEmail: "a@e.com" });
+		sqlite.run(
+			"CREATE TRIGGER fail_legacy_profile BEFORE UPDATE OF git_username ON users BEGIN SELECT RAISE(ABORT, 'profile write failed'); END",
+		);
+		try {
+			await expect(patchProfile(alice, { gitUsername: "New" })).rejects.toThrow(
+				"profile write failed",
+			);
+			expect((await listUserGitIdentities(alice))[0].name).toBe("Alice");
+			expect(await profileStore.findSessionProfile(alice)).toMatchObject({ gitUsername: "Alice" });
+		} finally {
+			sqlite.run("DROP TRIGGER fail_legacy_profile");
+		}
+	});
 });
 
 describe("identity CRUD", () => {

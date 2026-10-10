@@ -14,7 +14,6 @@ import {
 	openPanelInWindow,
 	pluginPanelWindowHostContext,
 } from "../window/panel-window";
-import { NarratorGitIdentityMenu } from "./NarratorGitIdentityMenu";
 import { closeSurfaceTabs, getTabCloseTargets, type TabCloseAction } from "./tab-close";
 
 const actions: TabCloseAction[] = ["all", "left", "right", "auxiliary"];
@@ -47,19 +46,6 @@ export function fileTabRevealDirectory(
 	while (end > rootLength && normalized[end - 1] === "/") end--;
 	const slash = normalized.lastIndexOf("/", end - 1);
 	return slash < rootLength ? normalized.slice(0, rootLength) : normalized.slice(0, slash);
-}
-
-/**
- * The narrator a dock panel stands for, or null when it is not a narrator panel.
- *
- * Only `panelType: "narrator"` counts. Tool and subagent panels carry a narrator
- * id too, but they are not the narrator's own surface, and the tab menu acts on
- * the narrator the tab is showing.
- */
-export function narratorPanelTabId(params: IDockviewPanelHeaderProps["params"]): string | null {
-	const value = params as { panelType?: unknown; narratorId?: unknown } | undefined;
-	if (value?.panelType !== "narrator") return null;
-	return typeof value.narratorId === "string" && value.narratorId ? value.narratorId : null;
 }
 
 /** Cache by renderer, not registry identity, so parent rerenders never remount tabs. */
@@ -98,7 +84,6 @@ export function withSurfaceTabMenu(Tab: FunctionComponent<IDockviewPanelHeaderPr
 			}
 		}
 		const canOpenInWindow = windowDescriptor !== null;
-		const narratorId = narratorPanelTabId(props.params);
 		const [position, setPosition] = useState<{ x: number; y: number } | null>(null);
 		return (
 			// The wrapper leaves ordinary click, middle-click and drag handling to the tab.
@@ -171,12 +156,6 @@ export function withSurfaceTabMenu(Tab: FunctionComponent<IDockviewPanelHeaderPr
 									>
 										{t("dockTabs.revealInExplorer")}
 									</Menu.Item>
-									<Menu.Divider />
-								</>
-							)}
-							{narratorId && (
-								<>
-									<NarratorGitIdentityMenu narratorId={narratorId} />
 									<Menu.Divider />
 								</>
 							)}

@@ -124,7 +124,6 @@ import {
 	isTabActive,
 	SWIPE_THRESHOLD,
 } from "./recent-tabs-logic";
-import { TabGitIdentityMenu } from "./TabGitIdentityMenu";
 import { useRecentTabExternalDrop } from "./useRecentTabExternalDrop";
 import { useRecentTabsDrag } from "./useRecentTabsDrag";
 
@@ -1343,7 +1342,6 @@ export function RecentTabList({
 								) === 0
 							}
 							isWorkspace={ctxMenu.tab.type === "workspace"}
-							gitIdentityNarratorId={ctxMenu.tab.type === "narrator" ? ctxMenu.tab.id : null}
 							t={t}
 						/>
 					)}
@@ -2339,8 +2337,6 @@ interface TabContextMenuProps {
 	canArchive: boolean;
 	isFirst: boolean;
 	isWorkspace: boolean;
-	/** The narrator this tab stands for, when the per-narrator git identity pick applies. */
-	gitIdentityNarratorId: string | null;
 	t: (key: string) => string;
 }
 
@@ -2366,7 +2362,6 @@ function TabContextMenu({
 	canArchive,
 	isFirst,
 	isWorkspace,
-	gitIdentityNarratorId,
 	t,
 }: TabContextMenuProps) {
 	return (
@@ -2446,9 +2441,6 @@ function TabContextMenu({
 								<Text size="sm">{t("archive")}</Text>
 							</Group>
 						</UnstyledButton>
-					)}
-					{gitIdentityNarratorId && (
-						<TabGitIdentityMenu narratorId={gitIdentityNarratorId} onClose={onClose} />
 					)}
 					{canReveal && (
 						<UnstyledButton px="xs" py={4} onClick={onReveal} style={{ borderRadius: 4 }}>

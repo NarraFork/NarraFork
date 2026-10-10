@@ -14,7 +14,7 @@
  */
 
 import { db } from "@server/db";
-import { narratorGitIdentityBindings, userGitIdentities } from "@server/db/schema";
+import { narratorGitIdentityBindings, userGitIdentities, users } from "@server/db/schema";
 import { NotFoundError, ValidationError } from "@server/lib/errors";
 import {
 	invalidateGitIdentityCache,
@@ -63,6 +63,75 @@ function validatePart(value: string, label: string, maxChars: number): string {
 
 const validateName = (value: string) => validatePart(value, "username", MAX_NAME_CHARS);
 const validateEmail = (value: string) => validatePart(value, "email", MAX_EMAIL_CHARS);
+
+/**
+ * Compatibility for PATCH /auth/me's original single-identity fields.
+ * Keep the old columns and the effective default in one synchronous transaction.
+ * An omitted half comes from the current default, not a stale legacy column.
+ * Clearing with multiple identities is ambiguous: deleting/promoting would silently
+ * select a different author, so require the explicit identity API in that case.
+ */
+export async function updateLegacyGitIdentityProfile(
+	userId: string,
+	input: { gitUsername?: string | null; gitEmail?: string | null },
+): Promise<void> {
+	if (input.gitUsername === undefined && input.gitEmail === undefined) return;
+	const normalize = (value: string | null, validate: (part: string) => string) =>
+		value === null || !value.trim() ? null : validate(value);
+	const suppliedName =
+		input.gitUsername === undefined ? undefined : normalize(input.gitUsername, validateName);
+	const suppliedEmail =
+		input.gitEmail === undefined ? undefined : normalize(input.gitEmail, validateEmail);
+	db.transaction((tx) => {
+		const profile = tx
+			.select({ name: users.gitUsername, email: users.gitEmail })
+			.from(users)
+			.where(eq(users.id, userId))
+			.get();
+		if (!profile) throw new NotFoundError("User", userId);
+		// Two rows suffice to detect ambiguous clears; never load an unbounded list.
+		const identities = tx
+			.select()
+			.from(userGitIdentities)
+			.where(eq(userGitIdentities.userId, userId))
+			.orderBy(
+				desc(userGitIdentities.isDefault),
+				asc(userGitIdentities.createdAt),
+				asc(userGitIdentities.id),
+			)
+			.limit(2)
+			.all();
+		const current = identities[0];
+		const name = suppliedName === undefined ? (current?.name ?? profile.name) : suppliedName;
+		const email = suppliedEmail === undefined ? (current?.email ?? profile.email) : suppliedEmail;
+		if (!name || !email) {
+			if (identities.length > 1) {
+				throw new ValidationError(
+					"Cannot clear the legacy Git profile with multiple identities; manage /auth/git-identities explicitly",
+				);
+			}
+			if (current) {
+				tx.delete(userGitIdentities)
+					.where(and(eq(userGitIdentities.id, current.id), eq(userGitIdentities.userId, userId)))
+					.run();
+			}
+		} else {
+			const identity = { name: validateName(name), email: validateEmail(email) };
+			if (current) {
+				tx.update(userGitIdentities)
+					.set(identity)
+					.where(and(eq(userGitIdentities.id, current.id), eq(userGitIdentities.userId, userId)))
+					.run();
+			} else {
+				tx.insert(userGitIdentities)
+					.values({ id: generateId(), userId, ...identity, isDefault: true, createdAt: nowIso() })
+					.run();
+			}
+		}
+		tx.update(users).set({ gitUsername: name, gitEmail: email }).where(eq(users.id, userId)).run();
+	});
+	invalidateGitIdentityCache(userId);
+}
 
 /** A user's identities, default first and then oldest first. */
 export async function listUserGitIdentities(userId: string): Promise<GitIdentityRecord[]> {
