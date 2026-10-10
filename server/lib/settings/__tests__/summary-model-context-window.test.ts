@@ -15,7 +15,9 @@ import {
 	DEFAULT_CONTEXT_WINDOW,
 	getModelContextWindow,
 	getSummaryModelContextWindow,
+	getSummaryModelContextWindowDetail,
 	parseModelId,
+	resolveModelContextWindow,
 	settings,
 } from "../index";
 
@@ -93,5 +95,65 @@ describe("getSummaryModelContextWindow", () => {
 		settings.agent.defaultModel = "";
 		expect(() => getSummaryModelContextWindow()).not.toThrow();
 		expect(getSummaryModelContextWindow()).toBe(DEFAULT_CONTEXT_WINDOW);
+	});
+});
+
+describe("getSummaryModelContextWindowDetail", () => {
+	let original: {
+		defaultModel: string;
+		summaryModel: string;
+		modelContextWindows: Record<string, number>;
+	};
+
+	beforeEach(() => {
+		original = {
+			defaultModel: settings.agent.defaultModel,
+			summaryModel: settings.agent.summaryModel,
+			modelContextWindows: settings.agent.modelContextWindows ?? {},
+		};
+		settings.agent.defaultModel = DEFAULT_MODEL;
+	});
+
+	afterEach(() => {
+		settings.agent.defaultModel = original.defaultModel;
+		settings.agent.summaryModel = original.summaryModel;
+		settings.agent.modelContextWindows = original.modelContextWindows;
+	});
+
+	test("reports the same window as getSummaryModelContextWindow", () => {
+		settings.agent.summaryModel = SUMMARY_MODEL;
+		const detail = getSummaryModelContextWindowDetail();
+		expect(detail.contextWindow).toBe(getSummaryModelContextWindow());
+		const parsed = parseModelId(SUMMARY_MODEL);
+		expect(detail.source).toBe(
+			resolveModelContextWindow(parsed.model, parsed.provider ?? "anthropic").source,
+		);
+	});
+
+	test("a user-filled window is reported as source=user", () => {
+		const parsed = parseModelId(SUMMARY_MODEL);
+		const key = `anthropic:${parsed.model}`;
+		settings.agent.summaryModel = SUMMARY_MODEL;
+		// The catalog overlay keeps its own local-binding layer and would otherwise
+		// shadow `modelContextWindows` inside tests that mutate settings in place.
+		const originalCatalog = settings.agent.modelCatalog;
+		settings.agent.modelCatalog = undefined;
+		try {
+			settings.agent.modelContextWindows = { [key]: 50_000 };
+			const detail = getSummaryModelContextWindowDetail();
+			expect(detail.contextWindow).toBe(50_000);
+			expect(detail.source).toBe("user");
+		} finally {
+			settings.agent.modelCatalog = originalCatalog;
+		}
+	});
+
+	test("when nothing resolves the source is fallback", () => {
+		settings.agent.summaryModel = "";
+		settings.agent.defaultModel = "";
+		settings.agent.modelContextWindows = {};
+		const detail = getSummaryModelContextWindowDetail();
+		expect(detail.contextWindow).toBe(DEFAULT_CONTEXT_WINDOW);
+		expect(detail.source).toBe("fallback");
 	});
 });

@@ -1194,6 +1194,21 @@ export const DEFAULT_AUTO_COMPACT_KEEP_PAIRS = 2;
  * configured" to the generate call that actually needs one.
  */
 export function getSummaryModelContextWindow(modelOverride?: string): number {
+	return getSummaryModelContextWindowDetail(modelOverride).contextWindow;
+}
+
+/**
+ * Resolve the summary model's context window WITH its provenance, so compact can
+ * tell "user filled this in" apart from "nothing matched, using the tier default".
+ *
+ * Compact packing must be more conservative on `fallback`: a custom model with an
+ * empty window would otherwise be packed as if it had `DEFAULT_CONTEXT_WINDOW`
+ * and the summary request hangs with zero streamed chars until the stall watchdog.
+ */
+export function getSummaryModelContextWindowDetail(modelOverride?: string): {
+	contextWindow: number;
+	source: ModelContextWindowSource;
+} {
 	const configured = s().agent.summaryModel?.trim();
 	const summaryRef =
 		!configured || isFollowSummaryModelValue(configured) ? FOLLOW_DEFAULT_MODEL : configured;
@@ -1204,11 +1219,14 @@ export function getSummaryModelContextWindow(modelOverride?: string): number {
 	// A broken/empty aggregation falls back to the default model, mirroring
 	// `resolveEffectiveModel` / `resolveConfiguredSummaryModel`.
 	if (isMetaModelReference(concrete)) concrete = resolveMetaModelForLookup(FOLLOW_DEFAULT_MODEL);
-	if (!concrete || isMetaModelReference(concrete)) return DEFAULT_CONTEXT_WINDOW;
+	if (!concrete || isMetaModelReference(concrete)) {
+		return { contextWindow: DEFAULT_CONTEXT_WINDOW, source: "fallback" };
+	}
 
 	const parsed = parseModelId(concrete);
 	const prov = parsed.provider ?? "anthropic";
-	return getModelContextWindow(parsed.model, prov) ?? DEFAULT_CONTEXT_WINDOW;
+	const resolved = resolveModelContextWindow(parsed.model, prov);
+	return { contextWindow: resolved.contextWindow, source: resolved.source };
 }
 
 export function getContextThresholds(model: string, provider: string): { compactStart: number } {

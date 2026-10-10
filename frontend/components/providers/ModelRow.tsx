@@ -15,6 +15,11 @@ export interface ModelRowProps {
 	showContextWindow?: boolean;
 }
 
+/** Below this the save layer rejects the value outright. */
+export const CONTEXT_WINDOW_MIN = 256;
+/** Below this (but still saveable) the UI shows a non-blocking warning. */
+export const CONTEXT_WINDOW_WARN_BELOW = 4_096;
+
 export const ModelRow = React.memo(function ModelRow({
 	modelValue,
 	modelLabel,
@@ -26,6 +31,10 @@ export const ModelRow = React.memo(function ModelRow({
 	showContextWindow = true,
 }: ModelRowProps) {
 	const { t } = useTranslation("settings");
+	const showSmallWindowWarning =
+		typeof contextWindow === "number" &&
+		contextWindow >= CONTEXT_WINDOW_MIN &&
+		contextWindow < CONTEXT_WINDOW_WARN_BELOW;
 
 	return (
 		<Group gap="xs" wrap="wrap" style={isHidden ? { opacity: 0.5 } : undefined}>
@@ -36,16 +45,22 @@ export const ModelRow = React.memo(function ModelRow({
 				{modelLabel}
 			</Text>
 			{showContextWindow && (
-				<NumberInput
-					placeholder={t("contextWindowPlaceholder")}
-					value={contextWindow || ""}
-					onChange={(v) => onContextWindowChange(typeof v === "number" ? v : null)}
-					min={1}
-					step={1000}
-					suffix={` ${t("contextWindowSuffix")}`}
-					w={180}
-					size="xs"
-				/>
+				<Tooltip
+					label={showSmallWindowWarning ? t("contextWindowTooSmallWarning") : ""}
+					disabled={!showSmallWindowWarning}
+				>
+					<NumberInput
+						placeholder={t("contextWindowPlaceholder")}
+						value={contextWindow || ""}
+						onChange={(v) => onContextWindowChange(typeof v === "number" ? v : null)}
+						min={CONTEXT_WINDOW_MIN}
+						step={1000}
+						suffix={` ${t("contextWindowSuffix")}`}
+						w={180}
+						size="xs"
+						error={showSmallWindowWarning}
+					/>
+				</Tooltip>
 			)}
 			{onTestModel && (
 				<Tooltip label={t("modelTestBtn")}>

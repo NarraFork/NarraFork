@@ -19,6 +19,7 @@ import type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
 import type { ToolProgressPayload } from "@shared/tool-progress";
 import type { ApiRequestDiagnostics } from "../lib/agent/types";
 import type { PublicCodexQuotaOverview } from "../lib/codex-manager";
+import type { ModelContextWindowSource } from "../lib/settings";
 import type { GitStatusSummary } from "../services/git-service";
 import type { BufferMessageSummary } from "../services/narrator-buffer";
 
@@ -522,6 +523,12 @@ export type NarratorServerMessage =
 			retryCount?: number;
 			/** Message of the error that triggered the retry (paired with retryCount). */
 			retryError?: string;
+			/**
+			 * Where the summary model's context window came from. `fallback` means
+			 * nothing user/catalog/provider configured a window, so packing used the
+			 * tier default — worth telling the user when compact fails or stalls.
+			 */
+			contextWindowSource?: ModelContextWindowSource;
 	  }
 	| {
 			type: "compact_done";
@@ -545,6 +552,8 @@ export type NarratorServerMessage =
 			mode?: "blocking" | "background";
 			/** Why the compact failed (also persisted on the failed marker message). */
 			error?: string;
+			/** Provenance of the summary model's context window (see compact_progress). */
+			contextWindowSource?: ModelContextWindowSource;
 			/** COW compact retry replacement identity, when this is a retry. */
 			oldMessageId?: string;
 			replacedMessageId?: string;

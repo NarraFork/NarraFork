@@ -354,6 +354,7 @@
 	"compactThinking": "思考中",
 	"compactThinkingChars": "{{count}} 字符",
 	"compactRetrying": "重试第 {{count}} 次",
+	"compactContextWindowFallback": "未配置上下文窗口",
 	"contextAskOutputChars": "{{count}} 字符",
 	"contextAskQuestions": "{{count}} 个问题",
 	"workspaceCreate": "创建工作树",

@@ -11,7 +11,13 @@ import { AppError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { parseSubstatus } from "../lib/narrator-utils";
 import type { Locale } from "../lib/prompt-i18n";
-import { getAutoCompactKeepPairs, resolveDefaultReasoningEffort, settings } from "../lib/settings";
+import {
+	getAutoCompactKeepPairs,
+	getSummaryModelContextWindowDetail,
+	type ModelContextWindowSource,
+	resolveDefaultReasoningEffort,
+	settings,
+} from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import {
 	appendLiveCompactDelta,
@@ -90,6 +96,8 @@ interface CompactProgressReporter {
 	finish: () => void;
 	/** Close the on-demand text stream after the final marker state is persisted. */
 	close: (status: "compacted" | "failed") => void;
+	/** True once any thinking/output delta arrived — used to enrich stall failures. */
+	hasStreamedContent: () => boolean;
 }
 
 /**
@@ -105,6 +113,31 @@ function formatDuration(ms: number): string {
 	const minutes = ms / 60_000;
 	const rendered = Number.isInteger(minutes) ? String(minutes) : minutes.toFixed(1);
 	return `${rendered} minutes`;
+}
+
+const CONTEXT_WINDOW_HINT =
+	" Check that the summary model's context window is set to its real value in Settings → Models.";
+
+/**
+ * When a compact dies having never streamed a single char, the cause is usually
+ * a mis-packed request (wrong/missing summary-model context window), not a slow
+ * model. Append an actionable hint so the user is not left staring at
+ * "no progress for 5 minutes" with no next step.
+ */
+function enrichCompactFailureMessage(
+	message: string,
+	info: {
+		hasStreamedContent: boolean;
+		timedOut: boolean;
+		contextWindowSource?: ModelContextWindowSource;
+	},
+): string {
+	if (info.hasStreamedContent) return message;
+	if (!info.timedOut && info.contextWindowSource !== "fallback") return message;
+	if (message.includes("context window")) return message;
+	const separator =
+		message.endsWith(".") || message.endsWith("!") || message.endsWith("?") ? "" : ".";
+	return `${message}${separator}${CONTEXT_WINDOW_HINT}`;
 }
 
 export interface CompactWatchdog {
@@ -266,6 +299,7 @@ export function createCompactProgressReporter(options: {
 	reasoningEffort?: string;
 	startedAt?: string;
 	isSegment?: boolean;
+	contextWindowSource?: ModelContextWindowSource;
 	/**
 	 * Called on every non-empty delta, BEFORE throttling. The stall watchdog uses
 	 * this as its liveness signal, so it must not be tied to the throttled
@@ -277,6 +311,9 @@ export function createCompactProgressReporter(options: {
 	// The retry broadcast carries the CURRENT counts, so the reporter mirrors the
 	// last published snapshot (the throttled accumulator does not expose one).
 	let lastSnapshot: ProgressSnapshot = { phase: "thinking", thinkingChars: 0, outputChars: 0 };
+	const contextWindowSourceFields = options.contextWindowSource
+		? { contextWindowSource: options.contextWindowSource }
+		: {};
 	startLiveCompactProgress(options.messageId, {
 		model: options.model ?? "",
 		...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
@@ -296,6 +333,7 @@ export function createCompactProgressReporter(options: {
 			...(options.reasoningEffort ? { reasoningEffort: options.reasoningEffort } : {}),
 			...(options.startedAt ? { startedAt: options.startedAt } : {}),
 			...(options.isSegment ? { isSegment: true } : {}),
+			...contextWindowSourceFields,
 		});
 	}, COMPACT_PROGRESS_THROTTLE_MS);
 	const reportRetry = (retryCount: number, error: string) => {
@@ -308,6 +346,7 @@ export function createCompactProgressReporter(options: {
 			outputChars: lastSnapshot.outputChars,
 			mode: options.mode,
 			...(options.isSegment ? { isSegment: true } : {}),
+			...contextWindowSourceFields,
 			retryCount,
 			retryError: error,
 		});
@@ -343,6 +382,7 @@ export function createCompactProgressReporter(options: {
 		onReasoningDelta: addThinking,
 		reportRetry,
 		finish: () => reporter.finish(),
+		hasStreamedContent: () => thinkingChars > 0 || outputChars > 0,
 		close: (status: "compacted" | "failed") => {
 			if (closed) return;
 			closed = true;
@@ -1020,17 +1060,24 @@ async function doRunCustomCompact({
 		columns: { variant: true },
 	});
 	const isSubagent = narrator?.variant ? narrator.variant.startsWith("subagent") : false;
-	const compactProgress = createCompactProgressReporter({
-		narratorId,
-		messageId: compactingMsg.id,
-		mode,
-		model: selectedModel,
-		reasoningEffort: resolveDefaultReasoningEffort(undefined, selectedModel),
-		startedAt: "createdAt" in compactingMsg ? compactingMsg.createdAt : new Date().toISOString(),
-		...(hooks?.beat ? { onActivity: hooks.beat } : {}),
-	});
+	let contextWindowSource: ModelContextWindowSource | undefined;
+	let compactProgress: CompactProgressReporter | undefined;
 
 	try {
+		// Metadata validation can throw after the running marker was persisted.
+		// Keep it inside the same failure cleanup as the summary request, without
+		// inventing a fallback provenance when resolution itself failed.
+		contextWindowSource = getSummaryModelContextWindowDetail(selectedModel).source;
+		compactProgress = createCompactProgressReporter({
+			narratorId,
+			messageId: compactingMsg.id,
+			mode,
+			model: selectedModel,
+			reasoningEffort: resolveDefaultReasoningEffort(undefined, selectedModel),
+			startedAt: "createdAt" in compactingMsg ? compactingMsg.createdAt : new Date().toISOString(),
+			contextWindowSource,
+			...(hooks?.beat ? { onActivity: hooks.beat } : {}),
+		});
 		// Counts every scheduled retry across BOTH retry layers (summaryGenerate's
 		// internal backoff chain and the whole-chunk retry in narrator-context), so
 		// the UI's "retrying (N)" ordinal never resets or goes backwards mid-run.
@@ -1048,7 +1095,7 @@ async function doRunCustomCompact({
 			hooks?.beat,
 			(info) => {
 				retryCount += 1;
-				compactProgress.reportRetry(retryCount, info.error);
+				compactProgress?.reportRetry(retryCount, info.error);
 			},
 			options?.userId,
 		);
@@ -1141,13 +1188,18 @@ async function doRunCustomCompact({
 		compactProgress.close("compacted");
 		return true;
 	} catch (err) {
-		compactProgress.finish();
+		compactProgress?.finish();
 		// A watchdog abort arrives as an AbortError but is NOT a cancellation: nobody
 		// asked for it, the context was not compacted, and a blocking run must not
 		// continue its turn believing the context shrank. Report the timeout reason
 		// instead of "Aborted" and fall through to the failure path below.
 		const watchdogTimeout = isCompactAbortError(err) ? (hooks?.timeoutReason?.() ?? null) : null;
-		const errorMsg = watchdogTimeout ?? (err instanceof Error ? err.message : String(err));
+		const rawErrorMsg = watchdogTimeout ?? (err instanceof Error ? err.message : String(err));
+		const errorMsg = enrichCompactFailureMessage(rawErrorMsg, {
+			hasStreamedContent: compactProgress?.hasStreamedContent() ?? false,
+			timedOut: !!watchdogTimeout,
+			contextWindowSource,
+		});
 
 		// Cancelled by the user — silently roll back the in-progress compact:
 		// remove the placeholder marker, reset context state, and clear the
@@ -1236,7 +1288,7 @@ async function doRunCustomCompact({
 					...replacementFields,
 				});
 			}
-			compactProgress.close("failed");
+			compactProgress?.close("failed");
 			throw err;
 		}
 
@@ -1303,10 +1355,11 @@ async function doRunCustomCompact({
 			messageId: compactingMsg.id,
 			mode: failureMode,
 			error: errorMsg,
+			contextWindowSource,
 			...replacementFields,
 		};
 		broadcastToNarrator(narratorId, compactFailedEvent);
-		compactProgress.close("failed");
+		compactProgress?.close("failed");
 		throw err;
 	} finally {
 		await setCompactingSubstatus(
@@ -1422,18 +1475,22 @@ async function doRunSegmentCompact({
 		hiddenMessageIds,
 	});
 	broadcastToNarrator(narratorId, { type: "compacting", narratorId, mode: "blocking" });
-	const compactProgress = createCompactProgressReporter({
-		narratorId,
-		messageId: markerMsg.id,
-		mode: "blocking",
-		model: settings.agent.summaryModel,
-		reasoningEffort: resolveDefaultReasoningEffort(undefined, settings.agent.summaryModel),
-		startedAt: "createdAt" in markerMsg ? markerMsg.createdAt : new Date().toISOString(),
-		isSegment: true,
-		...(hooks?.beat ? { onActivity: hooks.beat } : {}),
-	});
+	let contextWindowSource: ModelContextWindowSource | undefined;
+	let compactProgress: CompactProgressReporter | undefined;
 
 	try {
+		contextWindowSource = getSummaryModelContextWindowDetail(settings.agent.summaryModel).source;
+		compactProgress = createCompactProgressReporter({
+			narratorId,
+			messageId: markerMsg.id,
+			mode: "blocking",
+			model: settings.agent.summaryModel,
+			reasoningEffort: resolveDefaultReasoningEffort(undefined, settings.agent.summaryModel),
+			startedAt: "createdAt" in markerMsg ? markerMsg.createdAt : new Date().toISOString(),
+			isSegment: true,
+			contextWindowSource,
+			...(hooks?.beat ? { onActivity: hooks.beat } : {}),
+		});
 		const messages = await narratorService.getMessagesForSegmentCompact(narratorId, messageIds);
 
 		if (messages.length === 0) {
@@ -1463,7 +1520,7 @@ async function doRunSegmentCompact({
 			hooks?.beat,
 			(info) => {
 				segmentRetryCount += 1;
-				compactProgress.reportRetry(segmentRetryCount, info.error);
+				compactProgress?.reportRetry(segmentRetryCount, info.error);
 			},
 			userId,
 		);
@@ -1509,11 +1566,16 @@ async function doRunSegmentCompact({
 		compactProgress.close("compacted");
 		return true;
 	} catch (err) {
-		compactProgress.finish();
+		compactProgress?.finish();
 		// A watchdog abort is a bare "Aborted" AbortError, which tells the user
 		// nothing about why their segment summary failed. Record the timeout reason.
 		const watchdogTimeout = isCompactAbortError(err) ? (hooks?.timeoutReason?.() ?? null) : null;
-		const errorMsg = watchdogTimeout ?? (err instanceof Error ? err.message : String(err));
+		const rawErrorMsg = watchdogTimeout ?? (err instanceof Error ? err.message : String(err));
+		const errorMsg = enrichCompactFailureMessage(rawErrorMsg, {
+			hasStreamedContent: compactProgress?.hasStreamedContent() ?? false,
+			timedOut: !!watchdogTimeout,
+			contextWindowSource,
+		});
 		logger.error("Segment compact failed", {
 			narratorId,
 			messageId: markerMsg.id,
@@ -1551,8 +1613,9 @@ async function doRunSegmentCompact({
 			messageId: markerMsg.id,
 			mode: "blocking",
 			error: errorMsg,
+			contextWindowSource,
 		});
-		compactProgress.close("failed");
+		compactProgress?.close("failed");
 		throw err;
 	}
 }

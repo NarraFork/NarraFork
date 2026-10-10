@@ -4,7 +4,14 @@
  * behaviour around a phase switch.
  */
 
-import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { eq } from "drizzle-orm";
+import { cleanDb, getTestDb } from "../../../tests/setup";
+import { narratorMessages, narrators } from "../../db/schema";
+
+const { db, sqlite } = getTestDb();
+const realDbModule = { ...(await import("../../db")) };
+mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
 const realNarratorWs = { ...(await import("../../websocket/narrator-ws")) };
 
@@ -17,7 +24,17 @@ mock.module("../../websocket/narrator-ws", () => ({
 	},
 }));
 
-const { createCompactProgressReporter } = await import("../narrator-compact");
+const {
+	cancelCompact,
+	createCompactProgressReporter,
+	isCompactInProgress,
+	retryFailedCompact,
+	runCustomCompact,
+	runSegmentCompact,
+} = await import("../narrator-compact");
+const { narratorService } = await import("../narrator-service");
+const { narratorContext } = await import("../narrator-context");
+const { settings, getSummaryModelContextWindowDetail } = await import("../../lib/settings");
 
 const settle = () => new Promise((resolve) => setTimeout(resolve, 200));
 
@@ -36,6 +53,8 @@ beforeEach(() => {
 
 afterAll(() => {
 	mock.module("../../websocket/narrator-ws", () => realNarratorWs);
+	mock.module("../../db", () => realDbModule);
+	sqlite.close();
 	mock.restore();
 });
 
@@ -151,5 +170,126 @@ describe("compact progress reporter", () => {
 			retryCount: 2,
 			retryError: "rate limit exceeded",
 		});
+	});
+});
+
+describe("compact metadata lookup failure cleanup", () => {
+	const narratorId = "n-metadata";
+	const validModel = "anthropic:claude-haiku-4-5";
+	const originalSummaryModel = settings.agent.summaryModel;
+	const originalCatalog = settings.agent.modelCatalog;
+
+	beforeEach(() => {
+		cleanDb(sqlite);
+		const now = new Date().toISOString();
+		db.insert(narrators)
+			.values({
+				id: narratorId,
+				type: "primary",
+				inheritMode: "fresh",
+				createdAt: now,
+				updatedAt: now,
+			})
+			.run();
+		db.insert(narratorMessages)
+			.values({
+				id: "m-metadata",
+				narratorId,
+				role: "user",
+				contentText: "Keep this history",
+				contentJson: [{ type: "text", text: "Keep this history" }],
+				createdAt: now,
+			})
+			.run();
+		sqlite.run(
+			"INSERT INTO narrator_message_refs (id, narrator_id, message_id, seq) VALUES ('r-metadata', ?, 'm-metadata', 0)",
+			[narratorId],
+		);
+		// Exercise the real catalog query's empty upstream ID validation, not a
+		// fake provider failure or a replacement metadata resolver.
+		settings.agent.modelCatalog = {
+			schemaVersion: 1,
+			migrationVersion: 1,
+			local: { revision: 1, models: [] },
+			autoApply: false,
+			pinnedVersion: null,
+		};
+		settings.agent.summaryModel = "anthropic:";
+	});
+
+	afterEach(() => {
+		settings.agent.summaryModel = originalSummaryModel;
+		settings.agent.modelCatalog = originalCatalog;
+		mock.restore();
+	});
+
+	async function assertSettledFailure(isSegment: boolean) {
+		const markers = await db.query.narratorMessages.findMany({
+			where: eq(narratorMessages.narratorId, narratorId),
+		});
+		const marker = markers.find((message) => message.id !== "m-metadata");
+		expect(marker).toBeDefined();
+		const blocks = Array.isArray(marker?.contentJson) ? marker.contentJson : [];
+		const detail = isSegment
+			? (blocks[0] as { status: string; error?: string })
+			: await narratorService.getCompactSummary(narratorId, marker?.id ?? "");
+		expect(detail).toMatchObject({ status: "failed" });
+		expect(detail?.error).toContain("upstreamModelId");
+		const row = await narratorService.getById(narratorId);
+		expect(String(row.substatus)).not.toContain("compacting");
+		const failed = broadcasts.find((event) => event.type === "compact_failed");
+		expect(failed).toMatchObject({ messageId: marker?.id, error: detail?.error });
+		// There is no genuine provenance when lookup failed: do not invent fallback.
+		expect(failed?.contextWindowSource).toBeUndefined();
+		expect(isCompactInProgress(narratorId)).toBe(false);
+		expect(cancelCompact(narratorId)).toBe(false);
+		if (!isSegment) expect(row.errorMessage).toContain("Compact failed");
+		return marker?.id ?? "";
+	}
+
+	test("history and failed-marker retry both settle a genuine catalog lookup throw", async () => {
+		expect(() => getSummaryModelContextWindowDetail("anthropic:")).toThrow("upstreamModelId");
+		const generate = spyOn(narratorContext, "generateCompactSummary").mockResolvedValue({
+			summary: "Retained history summary",
+		});
+		await expect(runCustomCompact(narratorId, "en")).rejects.toThrow("upstreamModelId");
+		const markerId = await assertSettledFailure(false);
+		expect(generate).not.toHaveBeenCalled();
+
+		broadcasts = [];
+		const invalidRetry = await retryFailedCompact(narratorId, "en", markerId, "anthropic:");
+		await expect(invalidRetry.promise).rejects.toThrow("upstreamModelId");
+		await assertSettledFailure(false);
+		expect(generate).not.toHaveBeenCalled();
+
+		broadcasts = [];
+		const retry = await retryFailedCompact(narratorId, "en", markerId, validModel, "compact-user");
+		await expect(retry.promise).resolves.toBe(true);
+		expect(generate.mock.calls[0]?.[4]).toBe(validModel);
+		expect(generate.mock.calls[0]?.[9]).toBe("compact-user");
+		expect(await narratorService.getCompactSummary(narratorId, retry.messageId)).toMatchObject({
+			status: "compacted",
+		});
+		expect(broadcasts.some((event) => event.type === "compact_done")).toBe(true);
+		expect(isCompactInProgress(narratorId)).toBe(false);
+	});
+
+	test("segment metadata failure clears its marker and permits the next segment run", async () => {
+		const generate = spyOn(narratorContext, "generateCompactSummary").mockResolvedValue({
+			summary: "Retained segment summary",
+		});
+		await expect(runSegmentCompact(narratorId, "en", ["m-metadata"])).rejects.toThrow(
+			"upstreamModelId",
+		);
+		const markerId = await assertSettledFailure(true);
+		expect(generate).not.toHaveBeenCalled();
+		// Restore the segment's original visibility through its normal undo API.
+		await narratorService.deleteSegmentCompact(narratorId, markerId);
+		settings.agent.summaryModel = validModel;
+		broadcasts = [];
+		await runSegmentCompact(narratorId, "en", ["m-metadata"], "compact-user");
+		expect(generate.mock.calls[0]?.[9]).toBe("compact-user");
+		expect(broadcasts.some((event) => event.type === "compact_done")).toBe(true);
+		expect(isCompactInProgress(narratorId)).toBe(false);
 	});
 });

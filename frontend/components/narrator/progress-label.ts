@@ -27,17 +27,23 @@ type Translate = (key: string, options?: Record<string, unknown>) => string;
  */
 export function compactProgressLabel(
 	t: Translate,
-	progress: (ProgressSnapshot & { retryCount?: number }) | null,
+	progress: (ProgressSnapshot & { retryCount?: number; contextWindowSource?: string }) | null,
 ): string {
 	if (progress?.retryCount && progress.retryCount > 0) {
 		return t("compactRetrying", { count: progress.retryCount });
 	}
-	if (!progress || progress.phase === "output") {
-		return t("compactOutputChars", { count: progress?.outputChars ?? 0 });
+	const base =
+		!progress || progress.phase === "output"
+			? t("compactOutputChars", { count: progress?.outputChars ?? 0 })
+			: (() => {
+					const thinking = t("compactThinking");
+					if (!shouldShowThinkingChars(progress.thinkingChars)) return thinking;
+					return `${thinking} · ${t("compactThinkingChars", { count: progress.thinkingChars })}`;
+				})();
+	if (progress?.contextWindowSource === "fallback") {
+		return `${base} · ${t("compactContextWindowFallback")}`;
 	}
-	const thinking = t("compactThinking");
-	if (!shouldShowThinkingChars(progress.thinkingChars)) return thinking;
-	return `${thinking} · ${t("compactThinkingChars", { count: progress.thinkingChars })}`;
+	return base;
 }
 
 /** The same fragment for a running reflection gate. */

@@ -1,4 +1,10 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import * as agent from "../../lib/agent";
+import { estimateTokens } from "../../lib/agent/estimate-tokens";
+import * as prompts from "../../lib/prompt-i18n";
+import { settings } from "../../lib/settings";
+import { narratorService } from "../narrator-service";
+import * as specReminder from "../spec-reminder";
 
 const { narratorContext } = await import("../narrator-context");
 
@@ -119,5 +125,183 @@ describe("narrator compact summary", () => {
 		expect(summaryCalls).toEqual([2, 1, 1]);
 		expect(result.summary).toContain("PART_ONE");
 		expect(result.summary).toContain("PART_TWO");
+	});
+});
+
+describe("compact context-window budget guard", () => {
+	test("a window that leaves no content budget fails fast with a context-window hint", async () => {
+		const { settings } = await import("../../lib/settings");
+		const { narratorService } = await import("../narrator-service");
+		const originalGetById = narratorService.getById;
+		const originalHistory = narratorService.getModelHistorySinceLastCompact;
+		try {
+			narratorService.getById = (async () => ({ id: "n-budget", contextSummary: "" })) as never;
+			narratorService.getModelHistorySinceLastCompact = (async () => [
+				{
+					id: "m1",
+					role: "user" as const,
+					contentText: "hello world",
+					contentJson: null,
+					toolCalls: null,
+				},
+			]) as never;
+
+			const originalDefault = settings.agent.defaultModel;
+			const originalSummary = settings.agent.summaryModel;
+			const originalWindows = settings.agent.modelContextWindows;
+			const originalCatalog = settings.agent.modelCatalog;
+			// 512 * 0.8 = 409 token budget — below the real fixed prompt overhead.
+			// Catalog overlay must be off or it
+			// shadows the in-place modelContextWindows override.
+			settings.agent.defaultModel = "anthropic:claude-haiku-4-5";
+			settings.agent.summaryModel = "anthropic:claude-haiku-4-5";
+			settings.agent.modelCatalog = undefined;
+			settings.agent.modelContextWindows = { "anthropic:claude-haiku-4-5": 512 };
+
+			try {
+				await expect(narratorContext.generateCompactSummary("n-budget", "en")).rejects.toThrow(
+					/context window/i,
+				);
+			} finally {
+				settings.agent.defaultModel = originalDefault;
+				settings.agent.summaryModel = originalSummary;
+				settings.agent.modelContextWindows = originalWindows;
+				settings.agent.modelCatalog = originalCatalog;
+			}
+		} finally {
+			narratorService.getById = originalGetById;
+			narratorService.getModelHistorySinceLastCompact = originalHistory;
+		}
+	});
+});
+
+describe("compact small positive budgets use actual request capacity", () => {
+	const model = "anthropic:claude-haiku-4-5";
+	const originalSummary = settings.agent.summaryModel;
+	const originalWindows = settings.agent.modelContextWindows;
+	const originalCatalog = settings.agent.modelCatalog;
+	let previousSummary = "";
+	let specContext = "";
+	const message = { id: "small", role: "user" as const, contentText: "Keep the evidence" };
+	let generate: ReturnType<typeof spyOn<typeof agent, "summaryGenerate">>;
+	let getNarrator: ReturnType<typeof spyOn<typeof narratorService, "getById">>;
+	let prompt: ReturnType<typeof spyOn<typeof prompts, "getPrompt">>;
+	let toolHint: ReturnType<typeof spyOn<typeof prompts, "getToolMessage">>;
+	let spec: ReturnType<typeof spyOn<typeof specReminder, "buildSpecCompactContext">>;
+
+	beforeEach(() => {
+		previousSummary = "";
+		specContext = "";
+		settings.agent.summaryModel = model;
+		settings.agent.modelCatalog = undefined;
+		settings.agent.modelContextWindows = { [model]: 1_200 };
+		getNarrator = spyOn(narratorService, "getById").mockImplementation((async () => ({
+			id: "n-small",
+			contextSummary: previousSummary,
+		})) as never);
+		prompt = spyOn(prompts, "getPrompt").mockReturnValue("Compact instructions");
+		toolHint = spyOn(prompts, "getToolMessage").mockReturnValue("");
+		spec = spyOn(specReminder, "buildSpecCompactContext").mockImplementation(
+			async () => specContext,
+		);
+		generate = spyOn(agent, "summaryGenerate").mockResolvedValue({ text: "Retained summary" });
+	});
+
+	afterEach(() => {
+		generate.mockRestore();
+		getNarrator.mockRestore();
+		prompt.mockRestore();
+		toolHint.mockRestore();
+		spec.mockRestore();
+		settings.agent.summaryModel = originalSummary;
+		settings.agent.modelContextWindows = originalWindows;
+		settings.agent.modelCatalog = originalCatalog;
+	});
+
+	function assertRequestFits(window = 1_200) {
+		expect(generate).toHaveBeenCalledTimes(1);
+		const [userText, systemText] = generate.mock.calls[0];
+		expect(systemText).toBeString();
+		expect(estimateTokens(userText) + estimateTokens(systemText ?? "")).toBeLessThanOrEqual(
+			Math.floor(window * 0.8),
+		);
+	}
+
+	test("a positive content budget below 1000 can fit a small conversation", async () => {
+		const result = await narratorContext.generateCompactSummary("n-small", "en", [message]);
+		expect(result).toMatchObject({ summary: "Retained summary", contextWindowSource: "user" });
+		assertRequestFits();
+		expect(generate.mock.calls[0][0]).toContain("Keep the evidence");
+	});
+
+	test("previous summary and spec overhead are retained within the same small window", async () => {
+		previousSummary = `PREVIOUS ${"x".repeat(600)}`;
+		specContext = `LATEST SPEC ${"y".repeat(600)}`;
+		await narratorContext.generateCompactSummary("n-small", "en", [message]);
+		assertRequestFits();
+		expect(generate.mock.calls[0][0]).toContain(previousSummary);
+		expect(generate.mock.calls[0][1]).toContain(specContext);
+	});
+
+	test("a positive budget still rejects an unsplittable entry that cannot fit", async () => {
+		settings.agent.modelContextWindows = { [model]: 250 };
+		const oversized = { ...message, contentText: "evidence".repeat(100) };
+		await expect(
+			narratorContext.generateCompactSummary("n-small", "en", [oversized]),
+		).rejects.toThrow("maximum context length");
+		expect(generate).not.toHaveBeenCalled();
+	});
+
+	test("fixed overhead that cannot fit fails with its context-window hint", async () => {
+		settings.agent.modelContextWindows = { [model]: 1 };
+		await expect(
+			narratorContext.generateCompactSummary("n-small", "en", [message]),
+		).rejects.toThrow(/context window/i);
+		expect(generate).not.toHaveBeenCalled();
+	});
+
+	test("filtered empty entries do not require an arbitrary minimum budget", async () => {
+		const result = await narratorContext.generateCompactSummary("n-small", "en", [
+			{ ...message, contentText: "" },
+		]);
+		expect(result.summary).toBe("No conversation history.");
+		expect(generate).not.toHaveBeenCalled();
+	});
+
+	test("no entries with a previous summary can still fit and preserve that summary", async () => {
+		previousSummary = "PREVIOUS EVIDENCE";
+		await narratorContext.generateCompactSummary("n-small", "en", []);
+		assertRequestFits();
+		expect(generate.mock.calls[0][0]).toContain(previousSummary);
+	});
+
+	test("cancellation takes priority over an impossible budget or empty history", async () => {
+		settings.agent.modelContextWindows = { [model]: 1 };
+		const controller = new AbortController();
+		controller.abort();
+		for (const entries of [[message], []]) {
+			await expect(
+				narratorContext.generateCompactSummary("n-small", "en", entries, controller.signal),
+			).rejects.toMatchObject({ name: "AbortError" });
+		}
+		expect(generate).not.toHaveBeenCalled();
+	});
+
+	test("a growing cascade summary cannot turn nonpositive capacity into a provider request", async () => {
+		generate.mockResolvedValue({ text: "x".repeat(2_000) });
+		const entries = [{ message, text: "Keep evidence" }];
+		await expect(
+			narratorContext._summarizeChunkSequence(
+				"n-small",
+				[entries, entries],
+				"",
+				"system",
+				"suffix",
+				10,
+				200,
+				0,
+			),
+		).rejects.toThrow("maximum context length");
+		expect(generate).toHaveBeenCalledTimes(1);
 	});
 });

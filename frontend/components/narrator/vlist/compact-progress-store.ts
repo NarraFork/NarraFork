@@ -6,6 +6,11 @@ export interface CompactProgressSnapshot {
 	thinkingChars: number;
 	outputChars: number;
 	retryCount: number;
+	/**
+	 * Provenance of the summary model's context window. `fallback` means packing
+	 * used the tier default — surface a "fill in the window" hint to the user.
+	 */
+	contextWindowSource?: string;
 }
 
 export interface CompactProgressLabels {
@@ -31,7 +36,8 @@ function sameSnapshot(a: CompactProgressSnapshot | undefined, b: CompactProgress
 		a?.phase === b.phase &&
 		a?.thinkingChars === b.thinkingChars &&
 		a?.outputChars === b.outputChars &&
-		a?.retryCount === b.retryCount
+		a?.retryCount === b.retryCount &&
+		a?.contextWindowSource === b.contextWindowSource
 	);
 }
 
@@ -49,6 +55,7 @@ function toSnapshot(progress: CompactProgressSnapshot): CompactProgressSnapshot 
 		thinkingChars: progress.thinkingChars,
 		outputChars: progress.outputChars,
 		retryCount: progress.retryCount ?? 0,
+		...(progress.contextWindowSource ? { contextWindowSource: progress.contextWindowSource } : {}),
 	};
 }
 

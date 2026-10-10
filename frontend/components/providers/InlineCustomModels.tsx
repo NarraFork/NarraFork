@@ -94,7 +94,7 @@ export const InlineCustomModels = React.memo(function InlineCustomModels({
 							placeholder={t("contextWindowPlaceholder")}
 							value={modelContextWindows[m.value] || ""}
 							onChange={(v) => onContextWindowChange(m.value, typeof v === "number" ? v : null)}
-							min={1}
+							min={256}
 							step={1000}
 							suffix={` ${t("contextWindowSuffix")}`}
 							w={180}

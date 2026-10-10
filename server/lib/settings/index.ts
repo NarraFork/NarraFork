@@ -90,6 +90,7 @@ export {
 	getReasoningEffortBlocklist,
 	getSubagentVisibleModels,
 	getSummaryModelContextWindow,
+	getSummaryModelContextWindowDetail,
 	getVisibleModels,
 	hasConfiguredGeminiProvider,
 	hasConfiguredNugProvider,

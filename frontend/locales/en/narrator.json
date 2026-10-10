@@ -354,6 +354,7 @@
 	"compactThinking": "thinking",
 	"compactThinkingChars": "{{count}} chars",
 	"compactRetrying": "retry #{{count}}",
+	"compactContextWindowFallback": "no context window configured",
 	"contextAskOutputChars": "{{count}} chars",
 	"contextAskQuestions": "{{count}} questions",
 	"workspaceCreate": "Create worktree",

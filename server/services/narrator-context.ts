@@ -7,7 +7,10 @@ import { estimateTokens } from "../lib/agent/estimate-tokens";
 import { projectMessageSenderText, type SenderMessage } from "../lib/agent/sender-projection";
 import { logger } from "../lib/logger";
 import { getPrompt, getToolMessage, type Locale } from "../lib/prompt-i18n";
-import { getSummaryModelContextWindow } from "../lib/settings/provider";
+import {
+	getSummaryModelContextWindowDetail,
+	type ModelContextWindowSource,
+} from "../lib/settings/provider";
 import { narratorService } from "./narrator-service";
 import { buildSpecCompactContext } from "./spec-reminder";
 
@@ -27,6 +30,14 @@ const IN_FLIGHT_STATUSES = new Set(["initializing", "pending", "running"]);
  * Leaves 20% headroom for the model's output and safety margin.
  */
 const COMPACT_TARGET_RATIO = 0.8;
+/**
+ * Extra shrink factor when the summary model's context window is only the tier
+ * fallback (nothing user/catalog/provider configured). Packing as if a custom
+ * model had `DEFAULT_CONTEXT_WINDOW` produced one oversized request that hung
+ * with zero streamed chars until the stall watchdog — a wrong window must not
+ * look like "compact made no progress".
+ */
+const COMPACT_FALLBACK_BUDGET_RATIO = 0.5;
 
 // ── Message → text conversion ─────────────────────────────────────────────────
 
@@ -254,7 +265,12 @@ export const narratorContext = {
 		onProgress?: CompactSummaryProgressHandler,
 		onRetryScheduled?: CompactSummaryRetryHandler,
 		userId?: string | null,
-	): Promise<{ summary: string; contextPercent?: number }> {
+	): Promise<{
+		summary: string;
+		contextPercent?: number;
+		contextWindowSource?: ModelContextWindowSource;
+	}> {
+		if (signal?.aborted) throw new DOMException("Compact summary aborted", "AbortError");
 		const messages =
 			providedMessages ?? (await narratorService.getModelHistorySinceLastCompact(narratorId));
 
@@ -289,8 +305,13 @@ export const narratorContext = {
 			.filter(Boolean)
 			.join("\n\n");
 
-		const summaryCtxWindow = getSummaryModelContextWindow(modelOverride);
-		const tokenBudget = Math.floor(summaryCtxWindow * COMPACT_TARGET_RATIO);
+		const { contextWindow: summaryCtxWindow, source: contextWindowSource } =
+			getSummaryModelContextWindowDetail(modelOverride);
+		const budgetRatio =
+			contextWindowSource === "fallback"
+				? COMPACT_TARGET_RATIO * COMPACT_FALLBACK_BUDGET_RATIO
+				: COMPACT_TARGET_RATIO;
+		const tokenBudget = Math.floor(summaryCtxWindow * budgetRatio);
 
 		// Fixed tokens that are always present (system prompt + wrapper).
 		// The previous-summary prefix is variable per chunk, computed below.
@@ -306,6 +327,18 @@ export const narratorContext = {
 			: 0;
 		const contentBudget = tokenBudget - baseFixedTokens - previousSummaryTokens;
 
+		if (signal?.aborted) throw new DOMException("Compact summary aborted", "AbortError");
+		// Reject impossible overhead, not small requests that genuinely fit. The
+		// chunk-level strict check still rejects oversized entries and accounts for
+		// each actual rolling summary; splitting never discards conversation evidence.
+		if (contentBudget < 0 || (contentBudget === 0 && totalTokens > 0)) {
+			throw new Error(
+				`Compact cannot fit the conversation: summary model context window ${summaryCtxWindow} ` +
+					`(source: ${contextWindowSource}) leaves only ${contentBudget} tokens after fixed overhead. ` +
+					"Set the summary model's context window in Settings → Models to its real value.",
+			);
+		}
+
 		const chunks =
 			totalTokens <= contentBudget
 				? [cloneCompactEntries(entries)]
@@ -317,11 +350,24 @@ export const narratorContext = {
 				totalEntries: entries.length,
 				totalTokens,
 				summaryModelCtx: summaryCtxWindow,
+				contextWindowSource,
+				tokenBudget,
 				chunks: chunks.length,
 			});
 		}
+		if (contextWindowSource === "fallback") {
+			logger.warn(
+				"Compact packing used the fallback context window; fill in the summary model's real window",
+				{
+					narratorId,
+					model: modelOverride,
+					summaryModelCtx: summaryCtxWindow,
+					tokenBudget,
+				},
+			);
+		}
 
-		return this._summarizeChunkSequence(
+		const result = await this._summarizeChunkSequence(
 			narratorId,
 			chunks,
 			previousSummary,
@@ -338,6 +384,7 @@ export const narratorContext = {
 			onRetryScheduled,
 			userId,
 		);
+		return { ...result, contextWindowSource };
 	},
 
 	async _summarizeChunkSequence(
