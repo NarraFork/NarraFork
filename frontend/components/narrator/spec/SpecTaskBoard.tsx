@@ -14,6 +14,7 @@ import {
 	verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
+import { restrictToVerticalAxis } from "@frontend/lib/dnd-modifiers";
 import {
 	ActionIcon,
 	Badge,
@@ -321,7 +322,12 @@ function StatusColumn({
 					{tasks.length}
 				</Badge>
 			</Group>
-			<DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
+			<DndContext
+				sensors={sensors}
+				collisionDetection={closestCenter}
+				modifiers={[restrictToVerticalAxis]}
+				onDragEnd={handleDragEnd}
+			>
 				<SortableContext
 					items={tasks.map(({ index }) => String(index))}
 					strategy={verticalListSortingStrategy}

@@ -13,6 +13,7 @@ import {
 	verticalListSortingStrategy,
 } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
+import { restrictToVerticalAxis } from "@frontend/lib/dnd-modifiers";
 import { ActionIcon, Badge, Group, Menu, Text, Tooltip } from "@mantine/core";
 import { IconDots, IconGripVertical } from "@tabler/icons-react";
 import { useNavigate } from "@tanstack/react-router";
@@ -199,7 +200,12 @@ export function NavOverflowMenu({ entries, onSaveLayout, navCollapsed }: NavOver
 				</Tooltip>
 			</Menu.Target>
 			<Menu.Dropdown>
-				<DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
+				<DndContext
+					sensors={sensors}
+					collisionDetection={closestCenter}
+					modifiers={[restrictToVerticalAxis]}
+					onDragEnd={handleDragEnd}
+				>
 					<SortableContext items={flatIds} strategy={verticalListSortingStrategy}>
 						<Text size="xs" c="dimmed" fw={600} px={8} py={4}>
 							{t("navSectionVisible")}

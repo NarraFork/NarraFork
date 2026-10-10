@@ -8,6 +8,7 @@ import {
 } from "@dnd-kit/core";
 import { SortableContext, useSortable, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { CSS } from "@dnd-kit/utilities";
+import { restrictToVerticalAxis } from "@frontend/lib/dnd-modifiers";
 import {
 	ActionIcon,
 	Badge,
@@ -131,7 +132,12 @@ function MemberPriorityList({
 			<Text size={size === "xs" ? "xs" : "sm"} fw={500} mb={4}>
 				{t("aggMemberOrder")}
 			</Text>
-			<DndContext sensors={sensors} collisionDetection={closestCenter} onDragEnd={handleDragEnd}>
+			<DndContext
+				sensors={sensors}
+				collisionDetection={closestCenter}
+				modifiers={[restrictToVerticalAxis]}
+				onDragEnd={handleDragEnd}
+			>
 				<SortableContext items={models} strategy={verticalListSortingStrategy}>
 					<Stack gap={4}>
 						{models.map((value, idx) => (
