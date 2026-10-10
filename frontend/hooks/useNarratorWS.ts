@@ -782,6 +782,20 @@ export interface NarratorWSCallbacks {
 		snippet?: string;
 	}) => void;
 	onModelChanged?: (model: string) => void;
+	/**
+	 * 切模型之后，按新模型重估的历史占用逼近/超过了新模型的窗口。
+	 * 切换本身已经成功——这一帧只用来提示后果。
+	 */
+	onContextWindowWarning?: (info: {
+		model: string;
+		provider: string;
+		promptTokens: number;
+		contextWindow: number;
+		/** 估算占用率（百分比，可能大于 100）。 */
+		percent: number;
+		/** 服务端给的英文回退文案；界面应优先用自己的语言重排上面的数字。 */
+		message: string;
+	}) => void;
 	/** Follow/fallback decision of a `__parent__` subagent, from its runtime resolution. */
 	onModelInheritanceChanged?: (inheritance: SubagentModelInheritance) => void;
 	/** Return true when a structural reconcile is pending; messageVersion stays deferred until it succeeds. */
@@ -1588,6 +1602,18 @@ export function useNarratorWS(
 					case "model_changed":
 						if (data.model) {
 							callbackOwner.callbacks.onModelChanged?.(data.model as string);
+						}
+						break;
+					case "context_window_warning":
+						if (typeof data.promptTokens === "number" && typeof data.contextWindow === "number") {
+							callbackOwner.callbacks.onContextWindowWarning?.({
+								model: data.model as string,
+								provider: data.provider as string,
+								promptTokens: data.promptTokens,
+								contextWindow: data.contextWindow,
+								percent: typeof data.percent === "number" ? data.percent : 0,
+								message: typeof data.message === "string" ? data.message : "",
+							});
 						}
 						break;
 					case "model_settings_changed":

@@ -1431,6 +1431,21 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 					autoClose: 8000,
 				});
 			},
+			onContextWindowWarning: (info) => {
+				// 切换已经成功——这条只讲后果：按新模型重估的占用装不下它的窗口，
+				// 下一条请求可能被拒。数字由服务端给出，文案在这里本地化。
+				notifications.show({
+					title: t("contextWindowWarningTitle"),
+					message: t("contextWindowWarningMessage", {
+						model: info.model,
+						promptTokens: info.promptTokens.toLocaleString(),
+						contextWindow: info.contextWindow.toLocaleString(),
+						percent: Math.round(info.percent),
+					}),
+					color: "orange",
+					autoClose: 12000,
+				});
+			},
 			onNarratorWarning: (info) => {
 				// Localize via the structured diagnostics so a retry toast explains the
 				// actual cause instead of echoing the provider's raw English text.

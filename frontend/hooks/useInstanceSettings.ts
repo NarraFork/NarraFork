@@ -102,6 +102,8 @@ export interface InstanceSettingsState {
 	};
 	autoCompactKeepPairs: number;
 	queueDuringCompaction: boolean;
+	contextPreflightEnabled: boolean;
+	contextCalibrationEnabled: boolean;
 	agentDefaultReasoningEffort: string;
 	/** Models excluded from receiving a reasoning-effort hint. */
 	reasoningEffortBlocklist: Array<{ pattern: string; enabled?: boolean }>;
@@ -214,6 +216,8 @@ function makeDefaults(): InstanceSettingsState {
 		contextThresholds: cloneDefaultContextThresholds(),
 		autoCompactKeepPairs: 2,
 		queueDuringCompaction: true,
+		contextPreflightEnabled: true,
+		contextCalibrationEnabled: true,
 		agentDefaultReasoningEffort: "",
 		reasoningEffortBlocklist: [],
 		globalWhitelistDirs: [],
@@ -336,6 +340,8 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 				contextThresholds: settings.agent?.contextThresholds ?? cloneDefaultContextThresholds(),
 				autoCompactKeepPairs: settings.agent?.autoCompactKeepPairs ?? 2,
 				queueDuringCompaction: settings.agent?.queueDuringCompaction ?? true,
+				contextPreflightEnabled: settings.agent?.contextPreflightEnabled ?? true,
+				contextCalibrationEnabled: settings.agent?.contextCalibrationEnabled ?? true,
 				agentDefaultReasoningEffort: settings.agent?.defaultReasoningEffort ?? "",
 				reasoningEffortBlocklist: settings.agent?.reasoningEffortBlocklist ?? [],
 				globalWhitelistDirs: normalizeSharedRules<DirectoryWhitelistRuleInput>(
@@ -480,6 +486,8 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 					contextThresholds: state.contextThresholds,
 					autoCompactKeepPairs: state.autoCompactKeepPairs,
 					queueDuringCompaction: state.queueDuringCompaction,
+					contextPreflightEnabled: state.contextPreflightEnabled,
+					contextCalibrationEnabled: state.contextCalibrationEnabled,
 					whitelistDirs: state.globalWhitelistDirs,
 					blacklistDirs: state.globalBlacklistDirs,
 					commandWhitelist: state.globalCommandWhitelist,

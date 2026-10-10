@@ -997,6 +997,30 @@ export type NarratorServerMessage =
 			}>;
 	  }
 	| { type: "model_changed"; narratorId: string; model: string }
+	/**
+	 * 切模型后按新模型重估的历史占用逼近/超过了新模型的窗口。
+	 *
+	 * 这是**告知**，不是失败：切换本身已经照常完成，服务端既不自动压缩也不回退。
+	 * 之所以要单独发一帧：占用率是按旧模型的窗口算的百分比，换掉分母后旧百分比失
+	 * 真，界面上的进度条会显示一个安全的数字，而实际下一轮请求可能直接被拒。
+	 * 带上数字而不是一句话，客户端才能把它排成"估算 52.5 万 / 窗口 27.2 万"。
+	 */
+	| {
+			type: "context_window_warning";
+			narratorId: string;
+			model: string;
+			provider: string;
+			/** 按新模型重建历史后的估算占用。 */
+			promptTokens: number;
+			contextWindow: number;
+			/** 估算占用率（百分比，可能大于 100）。 */
+			percent: number;
+			/**
+			 * 非本地化回退文案（英文）。界面按自己的语言用上面的数字重排，
+			 * 这个字段是给日志、IM 转发和没有本地化实现的客户端兜底的。
+			 */
+			message: string;
+	  }
 	| { type: "streaming_reset"; narratorId: string; parentToolUseId?: string }
 	/**
 	 * Live tool cards that will never complete, because the attempt that streamed

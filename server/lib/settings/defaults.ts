@@ -115,6 +115,8 @@ export const DEFAULTS: NarraForkSettings = {
 		firstTokenTimeoutMs: 300_000,
 		autoCompactKeepPairs: 2,
 		queueDuringCompaction: true,
+		contextPreflightEnabled: true,
+		contextCalibrationEnabled: true,
 		contextThresholds: cloneDefaultContextThresholds(),
 	},
 	chapters: {
@@ -764,6 +766,16 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	"agent.autoCompactKeepPairs": {
 		desc: "自动压缩时在压缩摘要之后保留的最近 user/assistant 对话轮数。",
 		type: "number",
+	},
+	"agent.contextPreflightEnabled": {
+		desc: "发送前是否做上下文预检：请求组装完成后、真正发出之前先估算整份输入（当前消息 + 历史 + 工具定义）的大小，若已超过模型可用预算（窗口减去输出预留），就不发出这次请求，直接触发既有的上下文溢出恢复（紧急压缩后重试）。默认 true；关闭后所有请求都会发给提供商，只有在被拒绝之后才会发现超长。",
+		type: "boolean",
+		valid: "true / false，默认 true",
+	},
+	"agent.contextCalibrationEnabled": {
+		desc: "发送前预检是否按目标模型自己实测的'字符→token'比值换算，而不是用全局经验系数（ASCII 0.5 / CJK 0.85）。比值来自本进程自己的流量：请求发出前的 wire 字符数与同一次响应上报的 promptTokens 配对，每个模型保留一个滑动窗口，取 75% 分位数（偏向上侧，宁可高估）作为该模型的密度（样本不足 5 条时视为无数据，回退全局系数）。同一份内容在不同模型上的 token 数能差 1.69 倍，单一全局系数无法既拦住稠密模型上的超长请求、又不误伤稀疏模型上的正常长会话。默认 true；关闭后停止采集、预检忽略已学样本并回退全局系数（磁盘上已学到的样本保留，重新开启即可继续用）。",
+		type: "boolean",
+		valid: "true / false，默认 true",
 	},
 	"agent.queueDuringCompaction": {
 		desc: "叙述者正在进行上下文压缩时，新发送的用户消息是否排队等压缩完成后再执行。开启时消息进入队列（可编辑、可取消），压缩结束后自动开始该轮次；关闭时立即发送，与压缩并发。无论开关如何，用户都可以在发送菜单中选择插队立即执行。",

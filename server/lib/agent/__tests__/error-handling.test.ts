@@ -459,6 +459,77 @@ describe("agent error handling", () => {
 			}),
 		).toBe(true);
 	});
+
+	test("recognizes prompt_too_long when the gateway also reports an English type", () => {
+		// 真实事故形态：中继返回 {"error":{"code":"prompt_too_long","type":"invalid_request_error"}}。
+		// 归一化时 reason 被 type 抢占，真正的原因码只留在 diagnostics.code 里；
+		// 而 ProviderInvalidStateError 没有 error 对象字段，nested 回退永远拿不到它。
+		const err = new ProviderInvalidStateError(
+			"invalid_request_error",
+			"OpenAI API error 400: 请求提示词超出模型上限：内容过长，请精简或新建任务",
+			{
+				diagnostics: {
+					schema: "narrafork.error-diagnostics.v1",
+					source: "provider",
+					phase: "http_error",
+					reason: "invalid_request_error",
+					errorType: "invalid_request_error",
+					message: "OpenAI API error 400: 请求提示词超出模型上限：内容过长，请精简或新建任务",
+					code: "prompt_too_long",
+					statusCode: 400,
+				},
+			},
+		);
+		// 判成溢出才会走紧急压缩 + 重试；漏判则把中继原文照抄给用户。
+		expect(isContextWindowExceededError(err)).toBe(true);
+	});
+
+	test("recognizes a localized prompt-too-long message from a Chinese gateway", () => {
+		expect(
+			isContextWindowExceededError(
+				new Error("OpenAI API error 400: 请求提示词超出模型上限：内容过长，请精简或新建任务"),
+			),
+		).toBe(true);
+	});
+
+	test("recognizes the numeric-code gateway envelope with a prompt-is-too-long msg", () => {
+		// 上游第二种形态：数字业务码 + msg 字段 + extError 里再套一层英文 type/code。
+		// code 是数字会被 reason 扫描跳过，判定必须靠 msg 里的英文表述兜住。
+		const err = new ProviderInvalidStateError(
+			"invalid_request_error",
+			"prompt is too long: 1080519 tokens > 1048576 maximum",
+			{
+				diagnostics: {
+					schema: "narrafork.error-diagnostics.v1",
+					source: "gateway",
+					phase: "http_error",
+					reason: "invalid_request_error",
+					errorType: "invalid_request_error",
+					message: "prompt is too long: 1080519 tokens > 1048576 maximum",
+					code: 11115,
+					statusCode: 400,
+				},
+			},
+		);
+		expect(isContextWindowExceededError(err)).toBe(true);
+	});
+
+	test("does not treat an unrelated numeric gateway code as context overflow", () => {
+		// 反向保护：数字码本身不构成溢出证据，别把别的业务错误一并吞进来。
+		const err = new ProviderInvalidStateError("invalid_request_error", "invalid parameter: temperature", {
+			diagnostics: {
+				schema: "narrafork.error-diagnostics.v1",
+				source: "gateway",
+				phase: "http_error",
+				reason: "invalid_request_error",
+				errorType: "invalid_request_error",
+				message: "invalid parameter: temperature",
+				code: 11115,
+				statusCode: 400,
+			},
+		});
+		expect(isContextWindowExceededError(err)).toBe(false);
+	});
 });
 
 describe("unified invalidState classification", () => {

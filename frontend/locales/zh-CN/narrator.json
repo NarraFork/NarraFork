@@ -1124,6 +1124,8 @@
 	"compactSuccess": "压缩完成",
 	"segmentCompactSuccess": "区段压缩完成",
 	"compactSuccessDesc": "上下文使用率已降至 {{percent}}%",
+	"contextWindowWarningTitle": "上下文可能超出新模型窗口",
+	"contextWindowWarningMessage": "已切换到 {{model}}，但重建后的历史估算为 {{promptTokens}} tokens，占其 {{contextWindow}} 窗口的 {{percent}}%。下一条请求可能因超长被拒，建议先压缩上下文。",
 	"dismiss": "忽略",
 	"segmentCompactConfirm": "压缩选中的 {{count}} 条消息？原始消息将被隐藏并替换为摘要。",
 	"viewSubagentSession": "查看会话",

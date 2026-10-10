@@ -1125,6 +1125,8 @@
 	"compactSuccess": "Compact completed",
 	"segmentCompactSuccess": "Segment compact completed",
 	"compactSuccessDesc": "Context usage now at {{percent}}%",
+	"contextWindowWarningTitle": "Context may exceed the new model's window",
+	"contextWindowWarningMessage": "Switched to {{model}}, but the rebuilt history is estimated at {{promptTokens}} tokens — {{percent}}% of its {{contextWindow}} token window. The next request may be rejected as too long; compact the context first.",
 	"dismiss": "Dismiss",
 	"segmentCompactConfirm": "Compact {{count}} selected message(s)? The original messages will be hidden and replaced with a summary.",
 	"viewSubagentSession": "View session",
