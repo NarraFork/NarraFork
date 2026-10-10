@@ -150,5 +150,8 @@
 	"trustedDependencies": [
 		"@parcel/watcher",
 		"tree-sitter-bash"
-	]
+	],
+	"patchedDependencies": {
+		"@cypress/request-promise@5.0.0": "patches/@cypress%2Frequest-promise@5.0.0.patch"
+	}
 }
