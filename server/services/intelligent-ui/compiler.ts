@@ -1,5 +1,7 @@
 import parserSource from "@babel/parser" with { type: "text" };
+import { PLUGIN_UI_SHARED_MODULES } from "@frontend/plugin-runtime/contract";
 import { INTELLIGENT_UI_FILE_LIMITS as LIMITS } from "@shared/intelligent-ui-files";
+import { INTELLIGENT_UI_KIT_GLOBAL, INTELLIGENT_UI_KIT_MODULE } from "@shared/intelligent-ui-kit";
 import { type SourceFile, uiError } from "./files";
 
 // Inline source is embedded by Bun --compile. The worker has no filesystem module
@@ -7,11 +9,12 @@ import { type SourceFile, uiError } from "./files";
 const COMPILER_SOURCE =
 	`const parser = (() => { const exports = {}; ${parserSource as unknown as string}\nreturn exports; })();\n` +
 	String.raw`
-const shared = {react:'React', 'react/jsx-runtime':'JsxRuntime', 'react-dom/client':'ReactDOMClient', '@mantine/core':'MantineCore', '@mantine/hooks':'MantineHooks'};
 const images = {png:'image/png',jpg:'image/jpeg',jpeg:'image/jpeg',gif:'image/gif',webp:'image/webp',svg:'image/svg+xml',avif:'image/avif',ico:'image/x-icon'};
 self.onmessage = async ({data}) => {
  try {
   const files = new Map(data.files.map(f => [f.path, f.bytes]));
+  // specifier -> {expression, exports}: globals the preview shell has already loaded.
+  const shared = data.modules;
   const decoder = new TextDecoder('utf-8', {fatal:true});
   const validateScript = (source,ext,filename) => {
    const plugins=['deprecatedImportAssert'];
@@ -47,7 +50,7 @@ self.onmessage = async ({data}) => {
    if (path === '__nf_entry__' && !importer) return {path:'__nf_entry__',namespace:'ui'};
    if (Object.hasOwn(shared,path)) return {path:path+'.mjs',namespace:'runtime'};
    if (importer?.endsWith('.css') && !path.startsWith('.') && !/^(?:[a-zA-Z][\w+.-]*:|\/)/.test(path)) path='./'+path;
-   if (!path.startsWith('./') && !path.startsWith('../')) throw new Error('Unsupported import: '+path+'; use a relative file or a built-in React/Mantine package');
+   if (!path.startsWith('./') && !path.startsWith('../')) throw new Error('Unsupported import: '+path+'; use a relative file or one of: '+Object.keys(shared).join(', '));
    if (path.includes('\\') || /[?#\x00]/.test(path)) throw new Error('Invalid UI import path: '+path);
    const base = importer === '__nf_entry__' ? '' : importer.slice(0,importer.lastIndexOf('/')+1);
    const candidate = normalize(base+path);
@@ -71,7 +74,7 @@ self.onmessage = async ({data}) => {
    plugins:[{name:'authorized-memory-only',setup(build){
     build.onResolve({filter:/.*/}, args=>resolve(args.path,args.importer,args.kind));
     build.onLoad({filter:/.*/,namespace:'runtime'}, ({path})=>({
-     loader:'js', contents:'const shared = globalThis.__nfPluginRuntime['+JSON.stringify(shared[path.slice(0,-4)])+'];\n'+data.sharedExports[shared[path.slice(0,-4)]].map((name,index)=>'const e'+index+' = shared['+JSON.stringify(name)+']; export {e'+index+' as '+name+'};').join('\n')
+     loader:'js', contents:'const shared = '+shared[path.slice(0,-4)].expression+';\n'+shared[path.slice(0,-4)].exports.map((name,index)=>'const e'+index+' = shared['+JSON.stringify(name)+']; export {e'+index+' as '+name+'};').join('\n')
     }));
     build.onLoad({filter:/.*/,namespace:'ui-image'}, ({path})=>{ const file=path.slice(0,-4); const ext=file.split('.').pop().toLowerCase(); return {loader:'js',contents:'export default '+JSON.stringify('data:'+images[ext]+';base64,'+Buffer.from(files.get(file)).toString('base64'))+';'}; });
     build.onLoad({filter:/.*/,namespace:'ui-css'}, ({path})=>({loader:'css',contents:decoder.decode(files.get(path))}));
@@ -126,10 +129,58 @@ function builtinExports(): Promise<Record<string, string[]>> {
 	);
 	return exportsPromise;
 }
+/** Capitalised exports of the built-in Mantine runtime: the tags inline UI may use without a kit. */
+export async function builtinComponentNames(): Promise<string[]> {
+	return ((await builtinExports()).MantineCore ?? []).filter((name) => /^[A-Z]/.test(name));
+}
+
+/** A module the bundle does not contain: it reads a global the preview shell loaded first. */
+interface SharedModule {
+	expression: string;
+	exports: string[];
+}
+
+/**
+ * Which bare imports a preview may use. Without a project kit that is React plus
+ * NarraFork's Mantine; with one it is the kit's own React (a second copy would break
+ * hooks) plus the `kit` module exporting the project's components.
+ */
+async function sharedModules(kit?: {
+	components: string[];
+}): Promise<Record<string, SharedModule>> {
+	const exports = await builtinExports();
+	if (!kit) {
+		return Object.fromEntries(
+			Object.entries(PLUGIN_UI_SHARED_MODULES).map(([specifier, name]) => [
+				specifier,
+				{
+					expression: `globalThis.__nfPluginRuntime[${JSON.stringify(name)}]`,
+					exports: exports[name] ?? [],
+				},
+			]),
+		);
+	}
+	const global = `globalThis.${INTELLIGENT_UI_KIT_GLOBAL}`;
+	return {
+		react: { expression: `${global}.React`, exports: exports.React ?? [] },
+		"react/jsx-runtime": { expression: `${global}.JsxRuntime`, exports: exports.JsxRuntime ?? [] },
+		"react-dom/client": {
+			expression: `${global}.ReactDOMClient`,
+			exports: exports.ReactDOMClient ?? [],
+		},
+		[INTELLIGENT_UI_KIT_MODULE]: {
+			expression: `${global}.components`,
+			// Names come from a workspace file; only identifiers may become export bindings.
+			exports: kit.components.filter((name) => /^[A-Za-z_$][\w$]*$/.test(name)),
+		},
+	};
+}
+
 let active = 0;
 export async function compilePreview(
 	files: SourceFile[],
 	signal: AbortSignal,
+	kit?: { components: string[] },
 ): Promise<{ js: string; css: string }> {
 	signal.throwIfAborted();
 	if (
@@ -144,7 +195,7 @@ export async function compilePreview(
 	let worker: Worker | undefined;
 	const started = Date.now();
 	try {
-		const sharedExports = await builtinExports();
+		const modules = await sharedModules(kit);
 		signal.throwIfAborted();
 		return await new Promise((resolve, reject) => {
 			worker = new Worker(url);
@@ -181,7 +232,7 @@ export async function compilePreview(
 				abort();
 				return;
 			}
-			worker.postMessage({ files, sharedExports, maxOutputBytes: LIMITS.outputBytes });
+			worker.postMessage({ files, modules, maxOutputBytes: LIMITS.outputBytes });
 		});
 	} finally {
 		worker?.terminate();

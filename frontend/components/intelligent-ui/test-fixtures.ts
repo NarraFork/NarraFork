@@ -33,3 +33,16 @@ export function previewResult(label = "Current file"): IntelligentUiPreview {
     })();`,
 	};
 }
+
+/**
+ * Environment for a browser launched from a test. The test preload points HOME and
+ * USERPROFILE at a throwaway directory, and on Windows a browser will not start against a
+ * profile root that is not the OS user's. HOMEDRIVE/HOMEPATH are the one description of
+ * the real home the preload leaves alone, for every file in a run and not just the first.
+ */
+export function browserLaunchEnvironment(): Record<string, string | undefined> {
+	const { HOMEDRIVE, HOMEPATH } = process.env;
+	if (process.platform !== "win32" || !HOMEDRIVE || !HOMEPATH) return { ...process.env };
+	const home = `${HOMEDRIVE}${HOMEPATH}`;
+	return { ...process.env, HOME: home, USERPROFILE: home };
+}

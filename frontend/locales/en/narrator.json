@@ -11,7 +11,29 @@
 		"renderFailed": "Unable to render this preview. Fix the source files and refresh.",
 		"untrustedPreview": "Preview code and input may be sent out through external navigation. Do not preview files containing secrets or enter passwords or tokens.",
 		"navigationStopped": "The preview navigated away and has been closed. A navigation request may already have been sent.",
-		"historyUnavailable": "Current files · history rollback unavailable"
+		"historyUnavailable": "Current files · history rollback unavailable",
+		"streaming": "Generating {{title}}…",
+		"expand": "Expand",
+		"sendFailed": "Could not send the message",
+		"linkConfirm": "Open {{url}}?",
+		"linkOpen": "Open",
+		"cancel": "Cancel",
+		"kit": {
+			"title": "Component kit",
+			"buildPrompt": "No component kit for this project yet. Let the agent build one from your component library?",
+			"updatePrompt": "The component kit is out of date. Let the agent update it?",
+			"confirm": "Confirm",
+			"dismiss": "Not now",
+			"approved": "Confirmed. The agent will build it at a suitable point.",
+			"failed": "Could not update the request. Try again.",
+			"state": {
+				"builtin": "Using the built-in components",
+				"unbuilt": "The project kit has not been built",
+				"stale": "The project kit is out of date",
+				"ready": "Using the project's components",
+				"invalid": "kit.json is invalid"
+			}
+		}
 	},
 	"you": "You",
 	"largeFile": {

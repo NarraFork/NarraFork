@@ -150,7 +150,7 @@ test("shell safely embeds JS/CSS with no host credentials and restricted resourc
 	expect(html).toContain("default-src 'none'");
 	expect(html).toContain("connect-src 'none'");
 	expect(html).toContain("MantineCore.v8CssVariablesResolver");
-	expect(html).toContain("theme: runtime.theme");
+	expect(html).toContain("theme: builtin.theme");
 	expect(html).toContain("event.source !== parent");
 	expect(html).not.toContain("private-login-token");
 	expect(html).not.toContain("narrafork:ui-connect");

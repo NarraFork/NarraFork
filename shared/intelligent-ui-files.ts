@@ -22,6 +22,8 @@ export interface IntelligentUiPreview {
 	directory: string;
 	entry: string;
 	files: string[];
+	/** Set when the build targets the project's component kit instead of the built-in runtime. */
+	kit?: { hash: string };
 }
 
 export const INTELLIGENT_UI_FILE_LIMITS = Object.freeze({

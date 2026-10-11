@@ -3,9 +3,11 @@ import {
 	type IntelligentUiPreview,
 	readIntelligentUiFileReference,
 } from "@shared/intelligent-ui-files";
+import type { IntelligentUiKitBundle } from "@shared/intelligent-ui-kit";
 import { INTELLIGENT_UI_TOOL_NAME } from "@shared/intelligent-ui-tool-policy";
 import { type Context, Hono } from "hono";
 import { AppError } from "../lib/errors";
+import type { KitOverview } from "../services/intelligent-ui/kit-service";
 
 export interface IntelligentUiRouteDependencies {
 	authorize(c: Context, narratorId: string): Promise<string>;
@@ -25,6 +27,16 @@ export interface IntelligentUiRouteDependencies {
 		reference: IntelligentUiFileReference,
 		signal: AbortSignal,
 	): Promise<IntelligentUiPreview>;
+	kit: {
+		overview(narratorId: string, userId: string, signal: AbortSignal): Promise<KitOverview>;
+		bundle(
+			narratorId: string,
+			userId: string,
+			signal: AbortSignal,
+		): Promise<IntelligentUiKitBundle>;
+		approve(narratorId: string, userId: string, requestId: string): Promise<KitOverview>;
+		dismiss(narratorId: string, requestId: string): Promise<{ dismissed: boolean }>;
+	};
 }
 const defaults: IntelligentUiRouteDependencies = {
 	async authorize(c, narratorId) {
@@ -47,6 +59,24 @@ const defaults: IntelligentUiRouteDependencies = {
 	async preview(...args) {
 		const { buildIntelligentUiPreview } = await import("../services/intelligent-ui/preview");
 		return buildIntelligentUiPreview(...args);
+	},
+	kit: {
+		async overview(...args) {
+			const { kitService } = await import("../services/intelligent-ui/kit-service");
+			return kitService.overview(...args);
+		},
+		async bundle(...args) {
+			const { kitService } = await import("../services/intelligent-ui/kit-service");
+			return kitService.bundle(...args);
+		},
+		async approve(...args) {
+			const { kitService } = await import("../services/intelligent-ui/kit-service");
+			return kitService.approve(...args);
+		},
+		async dismiss(...args) {
+			const { kitService } = await import("../services/intelligent-ui/kit-service");
+			return kitService.dismiss(...args);
+		},
 	},
 };
 
@@ -111,6 +141,42 @@ export function createIntelligentUiRoutes(overrides: Partial<IntelligentUiRouteD
 		if ((await deps.authorize(c, narratorId)) !== userId)
 			throw new AppError("Preview principal changed", 403, "UI_PRIVATE_FILES");
 		return c.json(preview);
+	});
+	// Component kit: state for the chat UI, the built bundle, and the user's confirmation
+	// of a build. Same audience as previews: the files are the workspace's own.
+	app.get("/:id/intelligent-ui/kit", async (c) => {
+		c.header("Cache-Control", "no-store");
+		const narratorId = c.req.param("id");
+		const userId = await deps.authorize(c, narratorId);
+		return c.json(await deps.kit.overview(narratorId, userId, c.req.raw.signal));
+	});
+	app.get("/:id/intelligent-ui/kit/bundle", async (c) => {
+		c.header("Cache-Control", "no-store");
+		c.header("X-Content-Type-Options", "nosniff");
+		const narratorId = c.req.param("id");
+		const userId = await deps.authorize(c, narratorId);
+		const bundle = await deps.kit.bundle(narratorId, userId, c.req.raw.signal);
+		if ((await deps.authorize(c, narratorId)) !== userId)
+			throw new AppError("Kit principal changed", 403, "UI_PRIVATE_FILES");
+		return c.json(bundle);
+	});
+	const requestId = async (c: Context): Promise<string> => {
+		const body: unknown = await c.req.json().catch(() => null);
+		const id =
+			body && typeof body === "object" ? (body as { requestId?: unknown }).requestId : null;
+		if (typeof id !== "string" || id.length === 0 || id.length > 64)
+			throw new AppError("requestId is required", 400, "UI_KIT_REQUEST_REQUIRED");
+		return id;
+	};
+	app.post("/:id/intelligent-ui/kit/approve", async (c) => {
+		const narratorId = c.req.param("id");
+		const userId = await deps.authorize(c, narratorId);
+		return c.json(await deps.kit.approve(narratorId, userId, await requestId(c)));
+	});
+	app.post("/:id/intelligent-ui/kit/dismiss", async (c) => {
+		const narratorId = c.req.param("id");
+		await deps.authorize(c, narratorId);
+		return c.json(await deps.kit.dismiss(narratorId, await requestId(c)));
 	});
 	return app;
 }

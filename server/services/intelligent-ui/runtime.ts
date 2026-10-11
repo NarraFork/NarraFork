@@ -16,6 +16,7 @@ import {
 	type IntelligentUiFileReference,
 } from "@shared/intelligent-ui-files";
 import { checkedIdentity, uiError, validateDirectory, workspaceKey, workspaceRoot } from "./files";
+import { executeKitAction, type KitToolEnvironment, kitNoticeFor } from "./kit-runtime";
 
 const TEMPLATE = `import { useState } from "react";
 import { Button, Stack, Text, Title } from "@mantine/core";
@@ -143,6 +144,16 @@ export async function executeIntelligentUiTool(
 		ctx.assertFinalExecutionPermission?.();
 	};
 	await check();
+	const kitEnvironment: KitToolEnvironment = {
+		ctx,
+		backend,
+		workspace,
+		check,
+		authorizeRead: (path) => deps.authorizeRead(ctx, backend, path),
+		authorizeWrite: (path) => deps.authorizeWrite(ctx, backend, path),
+	};
+	if (input.action === "render" || input.action === "kit_status" || input.action === "kit_build")
+		return executeKitAction(input, kitEnvironment);
 	let directory: string;
 	let fileMetadata: ToolResult["metadata"];
 	if (input.action === "show") {
@@ -239,6 +250,9 @@ export async function executeIntelligentUiTool(
 		await deps.track(ctx, backend, entry, Boolean(recorded));
 	}
 	await check();
+	// Which kit the preview will compile against, and whether the user is being asked
+	// to build one. Advisory: a kit problem must never fail a file preview.
+	const kitNotice = await kitNoticeFor(kitEnvironment);
 	const reference: IntelligentUiFileReference = {
 		version: 1,
 		toolUseId,
@@ -256,6 +270,10 @@ export async function executeIntelligentUiTool(
 				? `Created ${directory}/App.tsx. Edit it using ordinary file tools, then show this directory.${fileMetadata?.fileChangeHistoryUnavailable ? " Remote file-change journal is unavailable; this creation cannot be reverted through message history." : ""}`
 				: `Preview: ${directory}/App.tsx`,
 		title: reference.title,
-		metadata: { ...fileMetadata, intelligentUi: reference },
+		metadata: {
+			...fileMetadata,
+			intelligentUi: reference,
+			...(kitNotice ? { intelligentUiKit: kitNotice } : {}),
+		},
 	};
 }

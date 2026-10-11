@@ -6,6 +6,7 @@ import { LocalBackend } from "@server/lib/agent/execution/local-backend";
 import { compilePreview } from "@server/services/intelligent-ui/compiler";
 import { collectSources } from "@server/services/intelligent-ui/files";
 import puppeteer, { type Page } from "puppeteer-core";
+import { browserLaunchEnvironment } from "./test-fixtures";
 
 function appSource(label: string): string {
 	return `import React, { useState } from "react";
@@ -66,12 +67,12 @@ browserTest(
 	async () => {
 		const [fixture, runtime] = await Promise.all([
 			Bun.build({
-				entrypoints: [new URL("./preview.browser.fixture.tsx", import.meta.url).pathname],
+				entrypoints: [join(import.meta.dir, "preview.browser.fixture.tsx")],
 				target: "browser",
 				define: { "process.env.NODE_ENV": '"production"' },
 			}),
 			Bun.build({
-				entrypoints: [new URL("../../plugin-runtime/vendor.ts", import.meta.url).pathname],
+				entrypoints: [join(import.meta.dir, "../../plugin-runtime/vendor.ts")],
 				target: "browser",
 				format: "iife",
 				minify: true,
@@ -163,7 +164,8 @@ browserTest(
 			browser = await puppeteer.launch({
 				executablePath: process.env.BROWSER_EXECUTABLE,
 				headless: true,
-				args: ["--no-sandbox"],
+				args: ["--no-sandbox", "--no-first-run"],
+				env: browserLaunchEnvironment(),
 				timeout: 15000,
 			});
 			const page = await browser.newPage();

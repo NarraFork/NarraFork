@@ -1963,6 +1963,17 @@ export function RenderToolBody({
 				file={model.file}
 				publicSummary={model.publicSummary}
 				historyUnavailable={model.historyUnavailable}
+				inline={
+					model.text === undefined
+						? undefined
+						: {
+								source: model.text,
+								live: model.live === true,
+								title: model.title,
+								runtime: model.runtime,
+							}
+				}
+				kit={model.kit}
 				height={height}
 			/>
 		);

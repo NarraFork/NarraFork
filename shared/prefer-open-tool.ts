@@ -11,7 +11,9 @@
  * default. Measure's category twin therefore stays `"ask"` only — the adapter
  * stamps `preferOpen` from the tool NAME.
  */
-const PREFER_OPEN_TOOL_NAMES = new Set(["AskUserQuestion", "ExitPlanMode"]);
+// IntelligentUI: its body IS the answer (UI drawn in the conversation) or a kit build the
+// reader is asked to confirm; folded to a header it would be neither seen nor confirmed.
+const PREFER_OPEN_TOOL_NAMES = new Set(["AskUserQuestion", "ExitPlanMode", "IntelligentUI"]);
 
 /** True when a tool call should default-open at every LOD (still collapsible). */
 export function isPreferOpenTool(tool: { toolName: string }): boolean {

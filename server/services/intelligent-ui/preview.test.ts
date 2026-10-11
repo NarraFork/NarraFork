@@ -42,6 +42,7 @@ async function fixture() {
 		backend: () => backend,
 		authorize: async (_n, _u, _d, path) => path,
 		compile: async (files) => ({ js: new TextDecoder().decode(files[0].bytes), css: "" }),
+		kit: async () => null,
 	};
 	return { root, directory, workspace, reference, backend, deps };
 }

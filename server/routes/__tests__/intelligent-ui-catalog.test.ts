@@ -37,6 +37,12 @@ function fixture(overrides: Partial<IntelligentUiRouteDependencies> = {}) {
 				files: ["App.tsx"],
 			};
 		},
+		kit: {
+			overview: async () => ({ status: { state: "builtin", components: [] }, request: null }),
+			bundle: async () => ({ js: "", css: "", hash: "h", components: [], hasSetup: false }),
+			approve: async () => ({ status: { state: "builtin", components: [] }, request: null }),
+			dismiss: async () => ({ dismissed: true }),
+		},
 		...overrides,
 	};
 	return { app: createIntelligentUiRoutes(deps), seen };

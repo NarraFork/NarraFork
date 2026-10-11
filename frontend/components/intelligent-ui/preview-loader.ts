@@ -1,53 +1,16 @@
 import { authorizedFetch, clearTokenOnSessionFailure } from "@frontend/lib/api/client";
-import { assetUrl } from "@frontend/lib/base-path";
-import {
-	PLUGIN_UI_RUNTIME_CSS_URL,
-	PLUGIN_UI_RUNTIME_JS_URL,
-} from "@frontend/plugin-runtime/paths";
 import {
 	INTELLIGENT_UI_FILE_LIMITS,
 	type IntelligentUiFileReference,
 	type IntelligentUiPreview,
 } from "@shared/intelligent-ui-files";
+import { boundedText, loadBuiltinRuntime, loadUiRuntime } from "./kit-client";
 
 export interface PreviewBundle extends IntelligentUiPreview {
 	runtimeJs: string;
 	runtimeCss: string;
-}
-
-/** Bound network reads before collecting text, including static runtime assets. */
-async function boundedText(response: Response, maxBytes: number): Promise<string> {
-	if (Number(response.headers.get("content-length")) > maxBytes) {
-		await response.body?.cancel();
-		throw new Error("Preview response exceeds its size limit");
-	}
-	const reader = response.body?.getReader();
-	if (!reader) throw new Error("Empty preview response");
-	const decoder = new TextDecoder();
-	let bytes = 0;
-	let text = "";
-	try {
-		while (true) {
-			const { done, value } = await reader.read();
-			if (done) break;
-			bytes += value.byteLength;
-			if (bytes > maxBytes) throw new Error("Preview response exceeds its size limit");
-			text += decoder.decode(value, { stream: true });
-		}
-		return text + decoder.decode();
-	} finally {
-		await reader.cancel().catch(() => {});
-		reader.releaseLock();
-	}
-}
-
-async function runtimeAsset(path: string, signal: AbortSignal): Promise<string> {
-	const response = await fetch(assetUrl(path), { signal, credentials: "omit", redirect: "error" });
-	if (!response.ok) {
-		await response.body?.cancel();
-		throw new Error(`Shared UI runtime unavailable (${response.status})`);
-	}
-	return boundedText(response, 8 * 1024 * 1024);
+	/** The runtime is the project's component kit, which the build was compiled against. */
+	kitRuntime: boolean;
 }
 
 export async function loadIntelligentUiPreview(
@@ -90,9 +53,16 @@ export async function loadIntelligentUiPreview(
 	)
 		throw new Error("Invalid preview build response");
 	signal.throwIfAborted();
-	const [runtimeJs, runtimeCss] = await Promise.all([
-		runtimeAsset(PLUGIN_UI_RUNTIME_JS_URL, signal),
-		runtimeAsset(PLUGIN_UI_RUNTIME_CSS_URL, signal),
-	]);
-	return { ...preview, runtimeJs, runtimeCss };
+	// The server compiled against whichever runtime the workspace serves; load that one.
+	const runtime = preview.kit
+		? await loadUiRuntime(narratorId, signal)
+		: await loadBuiltinRuntime(signal);
+	if (preview.kit && !runtime.kit)
+		throw new Error("The component kit this preview was built against is unavailable");
+	return {
+		...preview,
+		runtimeJs: runtime.runtimeJs,
+		runtimeCss: runtime.runtimeCss,
+		kitRuntime: runtime.kit,
+	};
 }

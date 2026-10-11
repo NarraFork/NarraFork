@@ -69,7 +69,9 @@ function PreviewFrame({
 	const loadProbe = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 	const [navigated, setNavigated] = useState(false);
 	// Theme changes update only tokens/provider state, never recreate the user's open UI.
-	const [srcDoc] = useState(() => createPreviewShell(bundle, readPreviewTheme(), failureMessage));
+	const [srcDoc] = useState(() =>
+		createPreviewShell(bundle, readPreviewTheme(), failureMessage, { kit: bundle.kitRuntime }),
+	);
 	const sendTheme = () =>
 		frame.current?.contentWindow?.postMessage(
 			{ type: "narrafork:preview-theme", theme: readPreviewTheme() },

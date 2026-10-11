@@ -8,6 +8,7 @@ import {
 import type { WorkspaceContext } from "@shared/workspace-context";
 import { compilePreview } from "./compiler";
 import { assertReferenceWorkspace, collectSources, uiError, validateDirectory } from "./files";
+import { readKit } from "./kit";
 
 export interface PreviewDependencies {
 	workspace(narratorId: string): Promise<WorkspaceContext>;
@@ -20,6 +21,13 @@ export interface PreviewDependencies {
 		signal: AbortSignal,
 	): Promise<string>;
 	compile: typeof compilePreview;
+	/** The project kit this workspace serves, if any: previews compile against it. */
+	kit(
+		backend: ExecutionBackend,
+		workspace: WorkspaceContext,
+		authorize: (path: string, signal: AbortSignal) => Promise<string>,
+		signal: AbortSignal,
+	): Promise<{ hash: string; components: string[] } | null>;
 }
 const defaults: PreviewDependencies = {
 	async workspace(narratorId) {
@@ -41,6 +49,10 @@ const defaults: PreviewDependencies = {
 		return target.path;
 	},
 	compile: compilePreview,
+	async kit(backend, workspace, authorize, signal) {
+		const { status } = await readKit(backend, workspace, authorize, signal);
+		return status.hash ? { hash: status.hash, components: status.components } : null;
+	},
 };
 
 let activePreviews = 0;
@@ -94,7 +106,14 @@ export async function buildIntelligentUiPreview(
 						deps.authorize(narratorId, userId, reference.deviceId, path, readSignal),
 					signal,
 				);
-				const result = await deps.compile(sources, signal);
+				const kit = await deps.kit(
+					backend,
+					workspace,
+					(path, readSignal) =>
+						deps.authorize(narratorId, userId, reference.deviceId, path, readSignal),
+					signal,
+				);
+				const result = await deps.compile(sources, signal, kit ?? undefined);
 				signal.throwIfAborted();
 				const current = await deps.workspace(narratorId);
 				assertReferenceWorkspace(reference, current, backend);
@@ -130,6 +149,7 @@ export async function buildIntelligentUiPreview(
 					directory,
 					entry: reference.entry,
 					files: sources.map((source) => source.path),
+					...(kit ? { kit: { hash: kit.hash } } : {}),
 				};
 				if (Buffer.byteLength(JSON.stringify(preview)) > LIMITS.outputBytes)
 					throw uiError("UI preview JSON exceeds the 4 MiB output limit", 413);

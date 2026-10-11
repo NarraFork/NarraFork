@@ -11,7 +11,29 @@
 		"renderFailed": "无法渲染此预览，请修复源码文件后刷新。",
 		"untrustedPreview": "预览代码及输入内容可能通过外部导航外传。请勿预览含秘密的文件或输入密码、令牌。",
 		"navigationStopped": "预览已跳转并被关闭；导航请求可能已经发出。",
-		"historyUnavailable": "当前文件 · 此创建无法随消息回退"
+		"historyUnavailable": "当前文件 · 此创建无法随消息回退",
+		"streaming": "正在生成 {{title}}…",
+		"expand": "放大",
+		"sendFailed": "消息发送失败",
+		"linkConfirm": "打开 {{url}}？",
+		"linkOpen": "打开",
+		"cancel": "取消",
+		"kit": {
+			"title": "组件包",
+			"buildPrompt": "此项目还没有组件包。让 Agent 根据你的组件库构建一个？",
+			"updatePrompt": "组件包已过期。让 Agent 更新它？",
+			"confirm": "确认",
+			"dismiss": "暂不",
+			"approved": "已确认，Agent 会在合适的时机构建。",
+			"failed": "操作失败，请重试。",
+			"state": {
+				"builtin": "正在使用内置组件",
+				"unbuilt": "项目组件包尚未构建",
+				"stale": "项目组件包已过期",
+				"ready": "正在使用项目自己的组件",
+				"invalid": "kit.json 无效"
+			}
+		}
 	},
 	"you": "你",
 	"largeFile": {
