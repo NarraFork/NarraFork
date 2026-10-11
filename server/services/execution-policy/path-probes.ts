@@ -1,3 +1,4 @@
+import { targetPathSemantics } from "@server/lib/agent/execution/path-semantics";
 import { settings } from "@server/lib/settings";
 import type { ExecutionTargetContext } from "./types";
 
@@ -29,7 +30,9 @@ export async function resolveCanonicalPaths(
 		// Use the existing target lexical grammar, not host paths or inferred symlink
 		// equivalence. Every distinct lexical identity still needs a backend probe.
 		const absolute = context.paths.resolve(context.target.cwd, path);
-		const key = context.paths.identityKey(absolute);
+		// Never deduplicate case variants from a cached native key: the directory's
+		// case mode or incarnation may have changed since that observation.
+		const key = targetPathSemantics(context.paths.flavor).identityKey(absolute);
 		let index = byIdentity.get(key);
 		if (index === undefined) {
 			index = unique.length;
@@ -51,6 +54,8 @@ export async function resolveCanonicalPaths(
 			if (index >= unique.length) return;
 			try {
 				const identity = await context.backend.resolvePathIdentity(unique[index], {
+					baseCwd: context.target.cwd,
+					operation: "create",
 					signal: batch.signal,
 				});
 				if (identity.runtimeGeneration !== context.target.runtimeGeneration) {
@@ -67,6 +72,19 @@ export async function resolveCanonicalPaths(
 		}
 	}
 	try {
+		if (context.target.nativeRootDescriptor) {
+			// Exact revalidation of the original selected cwd is independent of
+			// grants for absolute resources/rules elsewhere on this device.
+			const root = await context.backend.resolvePathIdentity(context.target.cwd, {
+				baseCwd: context.target.cwd,
+				operation: "existing",
+				expectedNativeDescriptor: context.target.nativeRootDescriptor,
+				signal: batch.signal,
+			});
+			if (root.runtimeGeneration !== context.target.runtimeGeneration) {
+				throw new Error(`${generationLabel} original root generation drifted.`);
+			}
+		}
 		await Promise.all(Array.from({ length: Math.min(concurrency, unique.length) }, () => worker()));
 		batch.signal.throwIfAborted();
 		return indexes.map((index) => canonical[index]);

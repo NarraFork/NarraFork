@@ -45,6 +45,8 @@ func (d *Dispatcher) Dispatch(
 	stream handlers.StreamFunc,
 ) (any, error) {
 	switch method {
+	case "history.metadataPreauthorize", "history.metadataCapture":
+		return d.h.WindowsMetadataFirstCapture(ctx, method, params)
 	case "history.open", "history.capture", "history.captureTree", "history.objectStage", "history.objectRead", "history.mutate",
 		"history.status", "history.restore", "history.finalize", "history.compensate", "history.inspect":
 		return d.h.History(ctx, method, params)
@@ -62,6 +64,8 @@ func (d *Dispatcher) Dispatch(
 		return map[string]any{"ok": true}, nil
 	case "fs.stat":
 		return d.h.FsStat(params)
+	case "fs.path.resolve.v2":
+		return d.h.FsResolvePathV2(ctx, params)
 	case "fs.exists":
 		return d.h.FsExists(params)
 	case "fs.read":

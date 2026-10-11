@@ -9,23 +9,9 @@ import (
 )
 
 func quarantineHistoryOriginal(file *os.File, destination string) error {
-	opened, err := openConditionalWindowsFile(file.Name(), windows.DELETE|windows.FILE_READ_ATTRIBUTES|windows.READ_CONTROL)
-	if err != nil {
-		return err
-	}
-	defer opened.Close()
-	original, err := file.Stat()
-	if err != nil {
-		return err
-	}
-	current, err := opened.Stat()
-	if err != nil {
-		return err
-	}
-	if !os.SameFile(original, current) {
-		return errConditionalMetadataChanged
-	}
-	return renameConditionalHandle(opened, destination)
+	// file was opened once with ordinary DELETE authorization by OpenMutation.
+	// Renaming this exact handle avoids self-sharing conflicts and path reclaim.
+	return renameConditionalHandle(file, destination)
 }
 func publishHistoryNoReplace(source, destination string) error {
 	// Move by an identity-bound DELETE handle; FileRenameInfo.ReplaceIfExists stays

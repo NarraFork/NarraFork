@@ -10,6 +10,8 @@ export interface WorkspaceContext {
 	cwd: string;
 	pathFlavor: "posix" | "windows";
 	contextKey: string;
+	/** Original v2 root evidence; legacy bindings cannot synthesize it from a new observation. */
+	nativeRootDescriptor?: import("./target-native-path").NativePathDescriptorV2;
 	contextProjectId?: string;
 	git?: { workspaceKey: string; repositoryKey: string; rootPath: string };
 	/** Runtime state is presentation only; it is never an authorization grant. */

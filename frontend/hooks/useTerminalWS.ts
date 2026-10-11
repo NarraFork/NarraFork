@@ -14,10 +14,28 @@ import { removeWSStatus, setWSStatus } from "../lib/ws-status";
 
 // === Types ===
 
+export interface TerminalLifecycle {
+	state: "starting" | "ready" | "closing" | "exited" | "unknown";
+	code: number | null;
+}
+
+export function parseTerminalLifecycle(msg: Record<string, unknown>): TerminalLifecycle | null {
+	const state = msg.state;
+	if (state === "exited") {
+		return typeof msg.code === "number" && Number.isInteger(msg.code) && msg.code >= 0
+			? { state, code: msg.code }
+			: { state: "unknown", code: null };
+	}
+	if (state === "starting" || state === "ready" || state === "closing" || state === "unknown")
+		return { state, code: null };
+	return null;
+}
+
 interface TerminalWSCallbacks {
 	onOutput?: (data: string) => void;
 	onScrollback?: (data: string, dims: { cols: number; rows: number }) => void;
 	onExit?: (code: number) => void;
+	onLifecycle?: (lifecycle: TerminalLifecycle) => void;
 	onError?: (message: string) => void;
 	onRequestResize?: () => void;
 	onBufferState?: (state: { mouseTracking: boolean; cursorVisible: boolean }) => void;
@@ -63,6 +81,7 @@ const VISIBILITY_RECONNECT_THRESHOLD_MS = 30_000;
 class TerminalWSManager {
 	private ws: WebSocket | null = null;
 	private listeners = new Map<string, Set<Listener>>();
+	private terminalStates = new Map<string, TerminalLifecycle>();
 	private reconnectAttempts = 0;
 	private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
 	private pingTimeoutTimer: ReturnType<typeof setTimeout> | undefined;
@@ -295,6 +314,15 @@ class TerminalWSManager {
 		if (!terminalId) return;
 		const listeners = this.listeners.get(terminalId);
 		if (!listeners) return;
+		const lifecycle =
+			type === "lifecycle"
+				? parseTerminalLifecycle(msg)
+				: type === "killed"
+					? { state: "closing" as const, code: null }
+					: type === "exit"
+						? parseTerminalLifecycle({ state: "exited", code: msg.code })
+						: null;
+		if (lifecycle) this.terminalStates.set(terminalId, lifecycle);
 
 		for (const listener of listeners) {
 			const { callbacks } = listener;
@@ -309,7 +337,19 @@ class TerminalWSManager {
 					});
 					break;
 				case "exit":
-					callbacks.onExit?.(msg.code as number);
+					if (typeof msg.code === "number" && Number.isInteger(msg.code) && msg.code >= 0) {
+						callbacks.onExit?.(msg.code);
+						callbacks.onLifecycle?.({ state: "exited", code: msg.code });
+					} else callbacks.onLifecycle?.({ state: "unknown", code: null });
+					break;
+				case "lifecycle": {
+					const lifecycle = parseTerminalLifecycle(msg);
+					if (lifecycle) callbacks.onLifecycle?.(lifecycle);
+					break;
+				}
+				case "killed":
+					// Legacy ACK means close requested, not a process exit.
+					callbacks.onLifecycle?.({ state: "closing", code: null });
 					break;
 				case "error":
 					callbacks.onError?.(terminalDiagnosticMessage(msg));
@@ -344,6 +384,7 @@ class TerminalWSManager {
 			set?.delete(listener);
 			if (set?.size === 0) {
 				this.listeners.delete(terminalId);
+				this.terminalStates.delete(terminalId);
 				if (this._connected) {
 					this.send({ type: "unsubscribe", terminalIds: [terminalId] });
 				}
@@ -353,7 +394,19 @@ class TerminalWSManager {
 	}
 
 	sendInput(terminalId: string, data: string) {
-		this.send({ type: "input", terminalId, data });
+		const state = this.terminalStates.get(terminalId)?.state;
+		if (state === "closing" || state === "unknown" || state === "exited") return;
+		// Preserve surrogate pairs/UTF-8 while keeping each WS input <=64KiB.
+		const encoded = new TextEncoder().encode(data);
+		const decoder = new TextDecoder();
+		for (let offset = 0; offset < encoded.byteLength; offset += 64 * 1024 - 4) {
+			const part = decoder.decode(encoded.subarray(offset, offset + 64 * 1024 - 4), {
+				stream: true,
+			});
+			if (part) this.send({ type: "input", terminalId, data: part });
+		}
+		const tail = decoder.decode();
+		if (tail) this.send({ type: "input", terminalId, data: tail });
 	}
 
 	sendResize(terminalId: string, cols: number, rows: number) {
@@ -447,6 +500,7 @@ export function useTerminalWS(terminalId: string | undefined, callbacks: Termina
 				onOutput: (data) => callbacksRef.current.onOutput?.(data),
 				onScrollback: (data, dims) => callbacksRef.current.onScrollback?.(data, dims),
 				onExit: (code) => callbacksRef.current.onExit?.(code),
+				onLifecycle: (lifecycle) => callbacksRef.current.onLifecycle?.(lifecycle),
 				onError: (msg) => callbacksRef.current.onError?.(msg),
 				onRequestResize: () => callbacksRef.current.onRequestResize?.(),
 				onBufferState: (state) => callbacksRef.current.onBufferState?.(state),

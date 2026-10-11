@@ -23,6 +23,7 @@
 	"narratorNotFound": "Narrator not found",
 	"workingDirectory": "Working Directory",
 	"workingDirectoryHint": "Leave empty to use home directory",
+	"remoteWorkingDirectoryHint": "Choose a working directory on the remote device. Windows sessions do not use the executor's startup directory automatically.",
 	"workingDirectoryPlaceholder": "/path/to/directory",
 	"model": "Model",
 	"modelHint": "\"Follow default\" will always use the default model from settings",

@@ -3,7 +3,9 @@
 package handlers
 
 import (
+	"context"
 	"os/exec"
+	"time"
 )
 
 // configureProcAttr is a no-op on Windows (no POSIX process groups). Tree-kill
@@ -16,7 +18,11 @@ func killProcessGroup(cmd *exec.Cmd) {
 		return
 	}
 	pid := cmd.Process.Pid
-	_ = exec.Command("taskkill", "/T", "/F", "/PID", itoa(pid)).Run()
+	// Non-PTY legacy exec only. Native ConPTY uses its parent's Job Object,
+	// never PID-based taskkill as lifecycle evidence.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = exec.CommandContext(ctx, "taskkill.exe", "/T", "/F", "/PID", itoa(pid)).Run()
 	_ = cmd.Process.Kill()
 }
 

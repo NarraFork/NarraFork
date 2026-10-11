@@ -244,6 +244,7 @@ export const readTool: ToolDefinition = {
 					const { bytes, truncated, totalSize } = await backend.readFileBytes(ioPath, {
 						maxBytes: MAX_IMAGE_BYTES,
 						expectedResolvedPath: canonicalPath,
+						expectedNativeDescriptor: ctx.executionTarget?.nativeDescriptor,
 						signal: ctx.signal,
 					});
 					if (truncated) {
@@ -348,6 +349,7 @@ export const readTool: ToolDefinition = {
 			const { bytes } = await backend.readFileBytes(ioPath, {
 				maxBytes: FULL_READ_STREAM_THRESHOLD_BYTES,
 				expectedResolvedPath: canonicalPath,
+				expectedNativeDescriptor: ctx.executionTarget?.nativeDescriptor,
 				signal: ctx.signal,
 			});
 			const { text } = decodeFileBytes(bytes);

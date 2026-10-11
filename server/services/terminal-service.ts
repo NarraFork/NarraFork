@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { readdir } from "node:fs/promises";
+import { nativePathEquals } from "@shared/target-native-path";
 import type { WorkspaceContext } from "@shared/workspace-context";
 import { and, eq, isNull } from "drizzle-orm";
 import { db } from "../db";
@@ -26,7 +27,14 @@ import {
 import type { TerminalRuntime, TerminalSpawnOptions } from "../terminal/runtime";
 import { spawnBunTerminal } from "../terminal/runtime-bun";
 import { spawnPortablePty } from "../terminal/runtime-pty";
-import { REMOTE_PTY_READY_FEATURE, spawnRemotePty } from "../terminal/runtime-remote";
+import {
+	REMOTE_PTY_BOUNDED_IO_FEATURE,
+	REMOTE_PTY_CONPTY_FEATURE,
+	REMOTE_PTY_LIFECYCLE_FEATURE,
+	REMOTE_PTY_READY_FEATURE,
+	type RemoteTerminalRuntime,
+	spawnRemotePty,
+} from "../terminal/runtime-remote";
 import { sendToTerminal } from "../websocket/terminal-ws";
 import { getConnectedDeviceHello, isDeviceOnline } from "./device-connection-service";
 import {
@@ -255,9 +263,37 @@ interface ActiveTerminal {
 	terminalId: string;
 	buffer: BufferManager;
 	useDtach: boolean;
+	closing?: boolean;
 }
 
 const activeTerminals = new Map<string, ActiveTerminal>();
+
+function lifecycleFor(terminal: {
+	id: string;
+	status: string;
+	exitCode: number | null;
+	deviceId?: string | null;
+}) {
+	const active = activeTerminals.get(terminal.id);
+	return {
+		state: active?.closing
+			? ("closing" as const)
+			: terminal.status === "running" &&
+					(!terminal.deviceId || terminal.deviceId === "local" || active)
+				? ("ready" as const)
+				: terminal.exitCode === null
+					? ("unknown" as const)
+					: ("exited" as const),
+		code: terminal.exitCode,
+	};
+}
+function broadcastExit(terminalId: string, code: number | null) {
+	if (typeof code === "number" && Number.isInteger(code)) {
+		sendToTerminal(terminalId, { type: "exit", terminalId, code });
+	} else {
+		sendToTerminal(terminalId, { type: "lifecycle", terminalId, state: "unknown", code: null });
+	}
+}
 
 /**
  * Mark a terminal as exited in DB and emit the lifecycle event.
@@ -334,8 +370,8 @@ function monitorAttachProcess(
 		await active.buffer.dispose();
 		activeTerminals.delete(terminalId);
 		runtime.close();
-		await markTerminalExited(terminalId, code ?? 0, narratorId, chapterId);
-		sendToTerminal(terminalId, { type: "exit", terminalId, code: code ?? 0 });
+		await markTerminalExited(terminalId, code, narratorId, chapterId);
+		broadcastExit(terminalId, code);
 		logger.info("Terminal exited", { terminalId, code });
 	});
 }
@@ -476,6 +512,8 @@ export const terminalService = {
 			projectId = frozenWorkspace.contextProjectId ?? projectId;
 		}
 		let remoteShell: string | null = null;
+		let remoteWindows = false;
+		let remoteRequiredFeatures = [REMOTE_PTY_READY_FEATURE];
 		if (deviceId) {
 			if (!opts.principal)
 				throw new AppError(
@@ -499,13 +537,17 @@ export const terminalService = {
 				);
 			}
 			const platformOs = hello?.platform.os ?? device.platformOs;
-			if (platformOs === "windows") {
-				throw new DeviceScopeError(
-					"Remote interactive terminals are not supported on Windows devices yet",
-					"DEVICE_PLATFORM_UNSUPPORTED",
-				);
+			remoteWindows = platformOs === "windows";
+			if (remoteWindows) {
+				remoteRequiredFeatures = [
+					REMOTE_PTY_READY_FEATURE,
+					REMOTE_PTY_CONPTY_FEATURE,
+					REMOTE_PTY_LIFECYCLE_FEATURE,
+					REMOTE_PTY_BOUNDED_IO_FEATURE,
+					"fs.path.resolve.v2",
+				];
 			}
-			if (!deviceHasFeature(capabilities, REMOTE_PTY_READY_FEATURE)) {
+			if (remoteRequiredFeatures.some((feature) => !deviceHasFeature(capabilities, feature))) {
 				throw new DeviceScopeError(
 					`Remote device "${deviceId}" requires an executor upgrade for interactive terminals (${REMOTE_PTY_READY_FEATURE})`,
 					"DEVICE_EXECUTOR_UPGRADE_REQUIRED",
@@ -513,13 +555,29 @@ export const terminalService = {
 			}
 			if (!frozenWorkspace || requested !== frozenWorkspace.deviceId)
 				cwd = hello?.defaultCwd || device.defaultCwd || "";
-			remoteShell = hello?.platform.shellPath || device.shellPath || "/bin/sh";
+			remoteShell =
+				hello?.platform.shellPath ||
+				device.shellPath ||
+				(remoteWindows ? "powershell.exe" : "/bin/sh");
 		}
 
 		const backend = resolveBackend({ requested: deviceId ?? "local" });
 		if (!cwd || !backend.paths.isAbsolute(cwd))
 			throw new ValidationError("Terminal target has no absolute working directory");
-		const identity = await backend.resolvePathIdentity(cwd, { timeoutMs: 10_000 });
+		const boundNativeRoot =
+			remoteWindows && frozenWorkspace?.deviceId === requested
+				? frozenWorkspace.nativeRootDescriptor
+				: undefined;
+		if (remoteWindows && frozenWorkspace?.deviceId === requested && !boundNativeRoot) {
+			throw new DeviceScopeError(
+				"Bound Windows workspace lacks its original native directory proof",
+				"DEVICE_EXECUTOR_UPGRADE_REQUIRED",
+			);
+		}
+		const identity = await backend.resolvePathIdentity(cwd, {
+			timeoutMs: 10_000,
+			...(boundNativeRoot ? { expectedNativeDescriptor: boundNativeRoot } : {}),
+		});
 		if (!identity.exists)
 			throw new AppError(
 				"Terminal target directory is unavailable",
@@ -532,6 +590,22 @@ export const terminalService = {
 				!backend.paths.equals(identity.canonicalPath, cwd))
 		)
 			throw new AppError("Terminal workspace identity changed", 409, "WORKSPACE_CONTEXT_STALE");
+		if (
+			boundNativeRoot &&
+			(!identity.nativeDescriptor || !nativePathEquals(boundNativeRoot, identity.nativeDescriptor))
+		) {
+			throw new AppError(
+				"Original terminal directory incarnation changed",
+				409,
+				"WORKSPACE_CONTEXT_STALE",
+			);
+		}
+		if (remoteWindows && !identity.nativeDescriptor) {
+			throw new DeviceScopeError(
+				"Native Windows terminal requires an original directory identity",
+				"DEVICE_EXECUTOR_UPGRADE_REQUIRED",
+			);
+		}
 		// A temporary cross-device/default endpoint is canonicalized once; it cannot
 		// reinterpret the resident binding or follow a replaced resident directory.
 		cwd = identity.canonicalPath;
@@ -551,6 +625,9 @@ export const terminalService = {
 						cwd,
 						lexicalPath: cwd,
 						canonicalPath: cwd,
+						...(identity.nativeDescriptor
+							? { nativeDescriptor: boundNativeRoot ?? identity.nativeDescriptor }
+							: {}),
 						pathFlavor: backend.paths.flavor,
 						runtimeGeneration: backend.runtimeGeneration,
 						selectionSource: "session_default",
@@ -583,7 +660,7 @@ export const terminalService = {
 							.update(
 								JSON.stringify([
 									backend.deviceId,
-									backend.paths.identityKey(cwd),
+									identity.nativeDescriptor?.pathSlotKey ?? backend.paths.identityKey(cwd),
 									backend.runtimeGeneration,
 									opts.principal?.userId,
 									projectId,
@@ -593,6 +670,9 @@ export const terminalService = {
 						deviceId: backend.deviceId,
 						cwd,
 						pathFlavor: backend.paths.flavor === "windows" ? "windows" : "posix",
+						...(identity.nativeDescriptor
+							? { nativeRootDescriptor: structuredClone(identity.nativeDescriptor) }
+							: {}),
 						...(projectId ? { contextProjectId: projectId } : {}),
 						capabilities: { switchDirectory: false },
 						terminalOrigin: { version: 1 as const, runtimeGeneration: backend.runtimeGeneration },
@@ -605,12 +685,15 @@ export const terminalService = {
 							pathFlavor:
 								backend.paths.flavor === "windows" ? ("windows" as const) : ("posix" as const),
 							git: undefined,
+							nativeRootDescriptor: identity.nativeDescriptor
+								? structuredClone(identity.nativeDescriptor)
+								: undefined,
 							contextKey: createHash("sha256")
 								.update(
 									JSON.stringify([
 										frozenWorkspace.contextKey,
 										backend.deviceId,
-										backend.paths.identityKey(cwd),
+										identity.nativeDescriptor?.pathSlotKey ?? backend.paths.identityKey(cwd),
 									]),
 								)
 								.digest("hex"),
@@ -659,6 +742,9 @@ export const terminalService = {
 					baseCwd: cwd,
 					lexicalPath: cwd,
 					canonicalPath: cwd,
+					...(identity.nativeDescriptor
+						? { nativeDescriptor: structuredClone(boundNativeRoot ?? identity.nativeDescriptor) }
+						: {}),
 					pathFlavor: backend.paths.flavor,
 					runtimeGeneration: backend.runtimeGeneration,
 					selectionSource: "session_default",
@@ -733,23 +819,41 @@ export const terminalService = {
 				runtime = spawnRemotePty(
 					deviceId,
 					{
-						cmd: [remoteShell, "-l"],
+						// Native Windows selects interactive PowerShell in the executor;
+						// never send Unix login arguments or a Unix history path.
+						cmd: remoteWindows ? [] : [remoteShell, "-l"],
 						cwd,
-						env: {
-							HISTFILE: "/dev/null",
-							TERM: "xterm-256color",
-						},
+						env: remoteWindows
+							? { TERM: "xterm-256color" }
+							: { HISTFILE: "/dev/null", TERM: "xterm-256color" },
 						cols,
 						rows,
 						onData: (data) => onData(id, buffer, data),
 					},
 					{
+						requireLifecycleEvidence: remoteWindows,
+						expectedNativeDescriptor: remoteWindows
+							? structuredClone(boundNativeRoot ?? identity.nativeDescriptor)
+							: undefined,
+						onFailure: (error) =>
+							sendToTerminal(id, {
+								type: "error",
+								terminalId: id,
+								message: error.message.slice(0, 1024),
+								code: "REMOTE_PTY_IO_FAILED",
+							}),
+						beforeInput: async () => {
+							if (!opts.principal)
+								throw new AppError("Terminal input actor missing", 403, "TERMINAL_ACTOR_REQUIRED");
+							const principal = await terminalCreationAuthority(opts, projectId);
+							await this.authorizeTargetAccess(id, principal, "write");
+						},
 						sendRpc: (device, method, params, options) => {
 							if (method === "pty.open") dispatched = true;
 							return sendRpc(device, method, params, {
 								...options,
 								expectedConnectionGeneration: backend.runtimeGeneration,
-								requiredFeatures: [REMOTE_PTY_READY_FEATURE],
+								requiredFeatures: remoteRequiredFeatures,
 							});
 						},
 					},
@@ -880,7 +984,7 @@ export const terminalService = {
 					activeTerminals.delete(id);
 					runtime.close();
 					await markTerminalExited(id, code ?? null, narratorId ?? null, chapterId ?? null);
-					sendToTerminal(id, { type: "exit", terminalId: id, code: code ?? 0 });
+					broadcastExit(id, code);
 					logger.info("Terminal exited", { terminalId: id, code });
 				})
 				.catch((error) =>
@@ -894,7 +998,7 @@ export const terminalService = {
 			narratorId: narratorId ?? null,
 			chapterId: chapterId ?? null,
 		});
-		return terminal;
+		return { ...terminal, lifecycle: lifecycleFor(terminal) };
 	},
 
 	/** Authorize the terminal's ORIGINAL endpoint, never the narrator's current workspace. */
@@ -936,6 +1040,9 @@ export const terminalService = {
 						cwd: terminal.cwd,
 						lexicalPath: terminal.cwd,
 						canonicalPath: terminal.cwd,
+						...(terminal.workspaceContext?.nativeRootDescriptor
+							? { nativeDescriptor: terminal.workspaceContext.nativeRootDescriptor }
+							: {}),
 						pathFlavor: backend.paths.flavor,
 						runtimeGeneration: backend.runtimeGeneration,
 						selectionSource: "explicit",
@@ -957,6 +1064,32 @@ export const terminalService = {
 				await terminalDeviceAuthority(terminal.deviceId, projectId, principal, need);
 		}
 		return terminal;
+	},
+
+	writeAuthorized(terminalId: string, data: string, authority: () => Promise<unknown>) {
+		const active = activeTerminals.get(terminalId);
+		if (!active || active.closing) return;
+		if ("writeAuthorized" in active.runtime) {
+			(active.runtime as RemoteTerminalRuntime).writeAuthorized(data, authority);
+		} else {
+			active.runtime.write(data);
+		}
+	},
+
+	resizeAuthorized(
+		terminalId: string,
+		cols: number,
+		rows: number,
+		authority: () => Promise<unknown>,
+	) {
+		const active = activeTerminals.get(terminalId);
+		if (!active || active.closing) return;
+		if ("resizeAuthorized" in active.runtime) {
+			(active.runtime as RemoteTerminalRuntime).resizeAuthorized(cols, rows, authority);
+			void active.buffer.resize(cols, rows);
+		} else {
+			this.resize(terminalId, cols, rows);
+		}
 	},
 
 	write(terminalId: string, data: string) {
@@ -989,27 +1122,49 @@ export const terminalService = {
 		const terminal = await this.getById(terminalId);
 		const active = activeTerminals.get(terminalId);
 		if (active) {
-			await active.buffer.dispose(true);
-			if (active.useDtach) {
-				await dtachService.killSession(terminalId);
-			}
+			if (active.closing) return;
+			active.closing = true;
+			sendToTerminal(terminalId, { type: "lifecycle", terminalId, state: "closing", code: null });
+			if (active.useDtach) await dtachService.killSession(terminalId);
+			// Retain the original runtime and observer until REAL exit/unknown.
+			// In particular do not abort pty.open or broadcast a synthetic -1.
 			active.runtime.kill();
-			active.runtime.close();
-			activeTerminals.delete(terminalId);
-		} else if (await dtachService.isAvailable()) {
-			// Terminal might be detached (no active entry) but dtach session alive
-			if (await dtachService.isSocketAlive(terminalId)) {
-				await dtachService.killSession(terminalId);
-			}
-			// Clean up buffer file
+			logger.info("Terminal close requested", { terminalId });
+			return;
+		}
+		if (terminal.deviceId && terminal.deviceId !== "local") {
+			if (terminal.status === "exited" && terminal.exitCode !== null) return;
+			throw new AppError(
+				"Original remote terminal process cannot be confirmed",
+				409,
+				"TERMINAL_PROCESS_UNCONFIRMED",
+			);
+		}
+		if (await dtachService.isAvailable()) {
+			if (await dtachService.isSocketAlive(terminalId)) await dtachService.killSession(terminalId);
 			const buf = new BufferManager(terminalId);
 			await buf.deleteFromDisk();
 		}
+		// Detached cleanup has no original process wait handle: keep that honest.
+		await markTerminalExited(terminalId, null, terminal.narratorId, terminal.chapterId);
+		broadcastExit(terminalId, null);
+	},
 
-		await markTerminalExited(terminalId, -1, terminal.narratorId, terminal.chapterId);
-
-		sendToTerminal(terminalId, { type: "exit", terminalId, code: -1 });
-		logger.info("Terminal killed", { terminalId });
+	/** A bounded wait on the ORIGINAL runtime; null never authorizes deleting unknown provenance. */
+	async waitForExit(terminalId: string): Promise<number | null> {
+		const active = activeTerminals.get(terminalId);
+		if (!active) return (await this.getById(terminalId)).exitCode;
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		try {
+			return await Promise.race([
+				active.runtime.exited,
+				new Promise<null>((resolve) => {
+					timer = setTimeout(() => resolve(null), 10_000);
+				}),
+			]);
+		} finally {
+			if (timer) clearTimeout(timer);
+		}
 	},
 
 	async rename(terminalId: string, name: string) {
@@ -1027,25 +1182,27 @@ export const terminalService = {
 		});
 		if (!terminal) throw new NotFoundError("Terminal", id);
 		assertLegacyRuntimeOwner(terminal);
-		return terminal;
+		return { ...terminal, lifecycle: lifecycleFor(terminal) };
 	},
 
 	async listByChapter(chapterId: string) {
-		return db.query.terminals.findMany({
+		const rows = await db.query.terminals.findMany({
 			where: and(eq(terminals.chapterId, chapterId), isNull(terminals.worktreeResourceId)),
 			columns: TERMINAL_METADATA_COLUMNS,
 			limit: TERMINAL_METADATA_LIST_LIMIT,
 			orderBy: (table, { desc }) => [desc(table.createdAt), desc(table.id)],
 		});
+		return rows.map((terminal) => ({ ...terminal, lifecycle: lifecycleFor(terminal) }));
 	},
 
 	async listByNarrator(narratorId: string) {
-		return db.query.terminals.findMany({
+		const rows = await db.query.terminals.findMany({
 			where: and(eq(terminals.narratorId, narratorId), isNull(terminals.worktreeResourceId)),
 			columns: TERMINAL_METADATA_COLUMNS,
 			limit: TERMINAL_METADATA_LIST_LIMIT,
 			orderBy: (table, { desc }) => [desc(table.createdAt), desc(table.id)],
 		});
+		return rows.map((terminal) => ({ ...terminal, lifecycle: lifecycleFor(terminal) }));
 	},
 
 	/** List all terminals (admin use) */
@@ -1115,9 +1272,16 @@ export const terminalService = {
 
 		const terminal = await db.query.terminals.findFirst({
 			where: eq(terminals.id, terminalId),
-			columns: { id: true, status: true, dtachSocket: true, worktreeResourceId: true },
+			columns: {
+				id: true,
+				status: true,
+				dtachSocket: true,
+				worktreeResourceId: true,
+				deviceId: true,
+			},
 		});
 		if (!terminal || terminal.status !== "running" || !terminal.dtachSocket) return;
+		if (terminal.deviceId && terminal.deviceId !== "local") return;
 		if (terminal.worktreeResourceId != null) return;
 
 		await this.reattach(terminalId);
@@ -1138,6 +1302,7 @@ export const terminalService = {
 		});
 		if (!terminal) return false;
 		assertLegacyRuntimeOwner(terminal);
+		if (terminal.deviceId && terminal.deviceId !== "local") return false;
 		if (activeTerminals.has(terminalId)) return true; // already attached
 		if (!(await dtachService.isAvailable())) return false;
 		if (!(await dtachService.isSocketAlive(terminalId))) return false;

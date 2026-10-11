@@ -227,12 +227,56 @@ async function resolveEndpoint(
 	const runtimeGeneration = backend.runtimeGeneration;
 	let lexicalPath: string | undefined;
 	let canonicalPath: string | undefined;
+	let nativeDescriptor = previous?.target.nativeDescriptor;
+	let nativeRootDescriptor = previous?.target.nativeRootDescriptor;
+	if (request.pathFlavor !== "spec" && backend.supportsNativePathV2 === true) {
+		const workspace =
+			config.workspaceContext?.deviceId === backend.deviceId ? config.workspaceContext : undefined;
+		if (workspace) {
+			if (!workspace.nativeRootDescriptor) {
+				throw new Error(
+					"NATIVE_WORKSPACE_ROOT_PROOF_REQUIRED: explicitly initialize the selected workspace",
+				);
+			}
+			// Validate the original base independently. Authorized absolute resources
+			// and explicit workdirs are NOT forced under the current workspace prefix.
+			await backend.resolvePathIdentity(workspace.cwd, {
+				baseCwd: workspace.cwd,
+				operation: "existing",
+				expectedNativeDescriptor: workspace.nativeRootDescriptor,
+			});
+		}
+		const expectedRoot =
+			nativeRootDescriptor ??
+			(workspace && semantics.equals(workspace.cwd, cwd)
+				? workspace.nativeRootDescriptor
+				: undefined);
+		const root = await backend.resolvePathIdentity(cwd, {
+			baseCwd,
+			operation: "existing",
+			...(expectedRoot ? { expectedNativeDescriptor: expectedRoot } : {}),
+		});
+		if (
+			!root.exists ||
+			!root.nativeDescriptor?.object ||
+			root.runtimeGeneration !== runtimeGeneration ||
+			backend.runtimeGeneration !== runtimeGeneration
+		) {
+			throw new Error(
+				"NATIVE_EXECUTION_ROOT_STALE: original working-directory proof is unavailable",
+			);
+		}
+		nativeRootDescriptor = root.nativeDescriptor;
+	}
 	if (request.path) {
 		lexicalPath = semantics.resolve(cwd, request.path);
 		if (request.pathFlavor === "spec") {
 			canonicalPath = lexicalPath;
 		} else {
-			const identity = await backend.resolvePathIdentity(lexicalPath);
+			const identity = await backend.resolvePathIdentity(lexicalPath, {
+				baseCwd: cwd,
+				...(nativeDescriptor ? { expectedNativeDescriptor: nativeDescriptor } : {}),
+			});
 			if (
 				identity.runtimeGeneration !== runtimeGeneration ||
 				backend.runtimeGeneration !== runtimeGeneration
@@ -243,6 +287,7 @@ async function resolveEndpoint(
 			}
 			lexicalPath = identity.lexicalPath;
 			canonicalPath = identity.canonicalPath;
+			nativeDescriptor = identity.nativeDescriptor;
 		}
 	}
 	const target: ToolExecutionTarget = Object.freeze({
@@ -253,6 +298,8 @@ async function resolveEndpoint(
 		pathFlavor: semantics.flavor,
 		...(lexicalPath ? { lexicalPath, resolvedFilePath: lexicalPath } : {}),
 		...(canonicalPath ? { canonicalPath } : {}),
+		...(nativeDescriptor ? { nativeDescriptor } : {}),
+		...(nativeRootDescriptor ? { nativeRootDescriptor } : {}),
 		runtimeGeneration,
 		selectionSource:
 			previous?.target.selectionSource ?? deviceSelectionSource(requested, sessionDefault),

@@ -1,4 +1,12 @@
 import { posix, win32 } from "node:path";
+import {
+	isFullyQualifiedWindowsPath,
+	type NativePathDescriptorV2,
+	nativePathContains,
+	nativePathDenyContains,
+	nativePathEquals,
+	resolveWindowsPath,
+} from "@shared/target-native-path";
 
 /** Path grammar used by an execution target, independent of the NarraFork host OS. */
 export type PathFlavor = "posix" | "windows" | "spec";
@@ -11,6 +19,9 @@ export type PathFlavor = "posix" | "windows" | "spec";
  */
 export interface TargetPathSemantics {
 	readonly flavor: PathFlavor;
+	/** Present only on a native authorization view, never on lexical helpers. */
+	readonly nativeProofRequired?: boolean;
+	nativeDescriptor?(path: string): NativePathDescriptorV2 | undefined;
 	isAbsolute(path: string): boolean;
 	normalize(path: string): string;
 	resolve(base: string, path: string): string;
@@ -20,22 +31,29 @@ export interface TargetPathSemantics {
 	relative(from: string, to: string): string;
 	equals(left: string, right: string): boolean;
 	contains(parent: string, child: string): boolean;
+	/** Conservative deny matching; this must never be used to grant access. */
+	containsDenied?(parent: string, child: string): boolean;
 	/** Stable key for snapshots, policy caches, and path identity comparisons. */
 	identityKey(path: string): string;
 }
 
 function createNodePathSemantics(flavor: "posix" | "windows"): TargetPathSemantics {
 	const pathImpl = flavor === "windows" ? win32 : posix;
-	const normalize = (path: string): string => pathImpl.normalize(path);
-	const identityKey = (path: string): string => {
-		const normalized = normalize(path);
-		return flavor === "windows" ? normalized.toLowerCase() : normalized;
+	const normalize = (path: string): string => {
+		const normalized = pathImpl.normalize(path);
+		// Drive letters are grammar, component case is native filesystem information.
+		return flavor === "windows"
+			? normalized.replace(/^(?:\\\\\?\\)?[a-z]:/iu, (drive) => drive.toUpperCase())
+			: normalized;
 	};
+	const identityKey = normalize;
 	return Object.freeze({
 		flavor,
-		isAbsolute: (path: string) => pathImpl.isAbsolute(path),
+		isAbsolute: (path: string) =>
+			flavor === "windows" ? isFullyQualifiedWindowsPath(path) : pathImpl.isAbsolute(path),
 		normalize,
 		resolve(base: string, path: string): string {
+			if (flavor === "windows") return normalize(resolveWindowsPath(base, path));
 			if (pathImpl.isAbsolute(path)) return normalize(path);
 			return pathImpl.isAbsolute(base)
 				? pathImpl.resolve(base, path)
@@ -47,8 +65,12 @@ function createNodePathSemantics(flavor: "posix" | "windows"): TargetPathSemanti
 		relative: (from: string, to: string) => pathImpl.relative(normalize(from), normalize(to)),
 		equals: (left: string, right: string) => identityKey(left) === identityKey(right),
 		contains(parent: string, child: string): boolean {
-			const np = flavor === "windows" ? normalize(parent).toLowerCase() : normalize(parent);
-			const nc = flavor === "windows" ? normalize(child).toLowerCase() : normalize(child);
+			const np = normalize(parent);
+			const nc = normalize(child);
+			if (flavor === "windows") {
+				const prefix = np.endsWith("\\") ? np : `${np}\\`;
+				return nc === np || nc.startsWith(prefix);
+			}
 			const relative = pathImpl.relative(np, nc);
 			return relative === "" || (!relative.startsWith("..") && !pathImpl.isAbsolute(relative));
 		},
@@ -100,6 +122,37 @@ export const specPathSemantics: TargetPathSemantics = Object.freeze({
 
 export const posixPathSemantics = createNodePathSemantics("posix");
 export const windowsPathSemantics = createNodePathSemantics("windows");
+
+/** Native authorization view. Missing native proofs cannot become Windows grants. */
+export function withNativePathDescriptors(
+	paths: TargetPathSemantics,
+	lookup: (path: string) => NativePathDescriptorV2 | undefined,
+): TargetPathSemantics {
+	if (paths.flavor !== "windows") return paths;
+	return Object.freeze({
+		...paths,
+		nativeProofRequired: true,
+		nativeDescriptor: lookup,
+		containsDenied(parent: string, child: string): boolean {
+			const a = lookup(parent);
+			const b = lookup(child);
+			return !!a && !!b && nativePathDenyContains(a, b);
+		},
+		contains(parent: string, child: string): boolean {
+			const a = lookup(parent);
+			const b = lookup(child);
+			return !!a && !!b && nativePathContains(a, b);
+		},
+		equals(left: string, right: string): boolean {
+			const a = lookup(left);
+			const b = lookup(right);
+			return !!a && !!b && nativePathEquals(a, b);
+		},
+		identityKey(path: string): string {
+			return lookup(path)?.pathSlotKey ?? paths.identityKey(path);
+		},
+	});
+}
 
 /** Stable singleton semantics for a requested target path flavor. */
 export function targetPathSemantics(flavor: PathFlavor): TargetPathSemantics {

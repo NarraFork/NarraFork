@@ -6,12 +6,12 @@ import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
 import type { VNetClientMessage } from "../lib/vnet/types";
-import type { VerifiedPublicShare } from "../services/public-narrator-share-service";
 import {
 	type DeviceWSData,
 	getDeviceConnections,
 	handleDeviceWS,
 } from "../services/device-connection-service";
+import type { VerifiedPublicShare } from "../services/public-narrator-share-service";
 import {
 	handleExternalNarratorWS,
 	rejectOversizedExternalNarratorFrame,
@@ -557,7 +557,7 @@ export const wsHandlers = {
 			if (typeof parsed !== "object" || parsed === null || !("type" in parsed)) {
 				logger.warn("Invalid WebSocket message: missing type field", {
 					channel,
-					text: text.slice(0, 200),
+					...(channel === "device" ? {} : { text: text.slice(0, 200) }),
 				});
 				try {
 					ws.send(
@@ -573,7 +573,10 @@ export const wsHandlers = {
 				return;
 			}
 		} catch {
-			logger.warn("Invalid WebSocket JSON", { channel, text: text.slice(0, 200) });
+			logger.warn("Invalid WebSocket JSON", {
+				channel,
+				...(channel === "device" ? {} : { text: text.slice(0, 200) }),
+			});
 			try {
 				ws.send(
 					JSON.stringify(
@@ -645,7 +648,7 @@ export const wsHandlers = {
 			);
 		} else if (channel === "device") {
 			trackWebSocketHandler(
-				handleDeviceWS.message(ws as ServerWebSocket<WSData & { channel: "device" }>, parsed),
+				handleDeviceWS.message(ws as ServerWebSocket<WSData & { channel: "device" }>, parsed, text),
 				(err) => logger.warn("Device WS message handler error", { error: String(err) }),
 			);
 		}

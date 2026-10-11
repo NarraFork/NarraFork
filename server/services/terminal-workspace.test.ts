@@ -1,10 +1,15 @@
 import { beforeEach, describe, expect, mock, test } from "bun:test";
+import type { NativePathDescriptorV2 } from "@shared/target-native-path";
 import type { WorkspaceContext } from "@shared/workspace-context";
-import { posixPathSemantics } from "../lib/agent/execution/path-semantics";
+import { posixPathSemantics, windowsPathSemantics } from "../lib/agent/execution/path-semantics";
 import { compileExecutionPolicy } from "./execution-policy/compiler";
 import type { ExecutionTargetContext } from "./execution-policy/types";
 
 let context: WorkspaceContext;
+let platformOs: "linux" | "windows" = "linux";
+let nativeIdentity: NativePathDescriptorV2 | undefined;
+let lastExpectedNativeRoot: NativePathDescriptorV2 | undefined;
+let missingFeature: string | undefined;
 let online = true;
 let authorized = true;
 let denied = false;
@@ -31,7 +36,7 @@ mock.module("./remote-tree-snapshot-hooks", () => ({
 	finishRemoteActivity: finishActivity,
 }));
 const write = mock((_data: string) => {});
-const remotePty = mock((_device: string, _options: unknown) => ({
+const remotePty = mock((_device: string, _options: unknown, _dependencies?: unknown) => ({
 	write,
 	resize: () => {},
 	kill: () => {},
@@ -132,14 +137,21 @@ mock.module("../lib/agent/execution/registry", () => ({
 	resolveBackend: () => ({
 		kind: "remote",
 		deviceId: "remote",
-		paths: posixPathSemantics,
+		paths: platformOs === "windows" ? windowsPathSemantics : posixPathSemantics,
 		runtimeGeneration: 2,
-		resolvePathIdentity: async (path: string) => ({
-			canonicalPath: path === "/remote/default-decoy" ? (canonicalDefault ?? path) : path,
-			lexicalPath: path,
-			exists: true,
-			runtimeGeneration: 2,
-		}),
+		resolvePathIdentity: async (
+			path: string,
+			options?: { expectedNativeDescriptor?: NativePathDescriptorV2 },
+		) => {
+			lastExpectedNativeRoot = options?.expectedNativeDescriptor;
+			return {
+				canonicalPath: path === "/remote/default-decoy" ? (canonicalDefault ?? path) : path,
+				lexicalPath: path,
+				exists: true,
+				runtimeGeneration: 2,
+				...(nativeIdentity ? { nativeDescriptor: nativeIdentity } : {}),
+			};
+		},
 	}),
 }));
 mock.module("../lib/agent/execution/path-resolve", () => ({
@@ -148,14 +160,17 @@ mock.module("../lib/agent/execution/path-resolve", () => ({
 mock.module("./device-connection-service", () => ({
 	isDeviceOnline: () => online,
 	getConnectedDeviceHello: () => ({
-		defaultCwd: "/remote/default-decoy",
+		defaultCwd: platformOs === "windows" ? "C:\\chosen" : "/remote/default-decoy",
 		capabilities: { pty: true },
-		platform: { os: "linux", shellPath: "/bin/sh" },
+		platform: {
+			os: platformOs,
+			shellPath: platformOs === "windows" ? "powershell.exe" : "/bin/sh",
+		},
 	}),
 }));
 mock.module("./device-service", () => ({
 	DeviceScopeError: class extends Error {},
-	deviceHasFeature: () => true,
+	deviceHasFeature: (_capabilities: unknown, feature: string) => feature !== missingFeature,
 	isDeviceAuthorized: () => authorized,
 	requireAuthorizedDeviceForProject: async () => ({
 		capabilities: { pty: true },
@@ -166,6 +181,9 @@ mock.module("./device-service", () => ({
 mock.module("../lib/agent/tools/terminal", () => ({ resetCursorForTerminal: () => {} }));
 mock.module("../terminal/runtime-remote", () => ({
 	REMOTE_PTY_READY_FEATURE: "pty.ready.v1",
+	REMOTE_PTY_CONPTY_FEATURE: "pty.conpty.v1",
+	REMOTE_PTY_LIFECYCLE_FEATURE: "pty.lifecycle-evidence.v1",
+	REMOTE_PTY_BOUNDED_IO_FEATURE: "pty.bounded-io.v1",
 	spawnRemotePty: remotePty,
 }));
 mock.module("../terminal/runtime-bun", () => ({ spawnBunTerminal: localPty }));
@@ -186,6 +204,10 @@ mock.module("../websocket/terminal-ws", () => ({ sendToTerminal: () => {} }));
 const { terminalService } = await import("./terminal-service");
 const principal = { userId: "actor", isAdmin: false };
 beforeEach(() => {
+	platformOs = "linux";
+	nativeIdentity = undefined;
+	lastExpectedNativeRoot = undefined;
+	missingFeature = undefined;
 	context = {
 		revision: 8,
 		contextKey: "chosen-1",
@@ -211,7 +233,104 @@ beforeEach(() => {
 	registerTerminalActivity.mockClear();
 	finishActivity.mockClear();
 });
+function windowsRootProof(fileId = "directory-1"): NativePathDescriptorV2 {
+	const root = {
+		canonicalPath: "C:\\",
+		object: { volumeId: "volume-1", fileId: "root-1", creationTime: "1" },
+		caseSensitive: false,
+	};
+	return {
+		version: 2,
+		platform: "windows",
+		volumeId: "volume-1",
+		pathSlotKey: "native:C:chosen",
+		componentKeys: ["C:", "chosen"],
+		ancestors: [root],
+		parent: root,
+		missingSuffix: [],
+		object: { volumeId: "volume-1", fileId, creationTime: "2" },
+		caseSensitive: false,
+	};
+}
+function selectWindowsRoot() {
+	platformOs = "windows";
+	nativeIdentity = windowsRootProof();
+	context = {
+		...context,
+		cwd: "C:\\chosen",
+		pathFlavor: "windows",
+		nativeRootDescriptor: structuredClone(nativeIdentity),
+	};
+}
+
 describe("terminal frozen workspace creation", () => {
+	test("native Windows dispatch freezes the ORIGINAL root and never uses Unix interactive flags", async () => {
+		selectWindowsRoot();
+		const original = structuredClone(context.nativeRootDescriptor);
+		const terminal = await terminalService.create({
+			narratorId: "n",
+			expectedRevision: 8,
+			contextKey: "chosen-1",
+			principal,
+		});
+		expect(lastExpectedNativeRoot).toEqual(original);
+		expect(remotePty.mock.calls[0][1]).toMatchObject({
+			cmd: [],
+			cwd: "C:\\chosen",
+			env: { TERM: "xterm-256color" },
+		});
+		expect(
+			(remotePty.mock.calls[0][1] as { env: Record<string, string> }).env.HISTFILE,
+		).toBeUndefined();
+		expect(remotePty.mock.calls[0][2]).toMatchObject({
+			requireLifecycleEvidence: true,
+			expectedNativeDescriptor: original,
+		});
+		expect(terminal.workspaceContext?.nativeRootDescriptor).toEqual(original);
+		expect(localPty).not.toHaveBeenCalled();
+	});
+	test("native root replacement refuses before row, writer claim or shell dispatch", async () => {
+		selectWindowsRoot();
+		nativeIdentity = windowsRootProof("external-replacement");
+		await expect(
+			terminalService.create({
+				narratorId: "n",
+				expectedRevision: 8,
+				contextKey: "chosen-1",
+				principal,
+			}),
+		).rejects.toThrow("incarnation changed");
+		expect(records).toHaveLength(0);
+		expect(registerActivity).not.toHaveBeenCalled();
+		expect(remotePty).not.toHaveBeenCalled();
+		expect(localPty).not.toHaveBeenCalled();
+	});
+	test("Windows legacy capability or missing original proof cannot silently dispatch/fallback", async () => {
+		selectWindowsRoot();
+		missingFeature = "pty.lifecycle-evidence.v1";
+		await expect(
+			terminalService.create({
+				narratorId: "n",
+				expectedRevision: 8,
+				contextKey: "chosen-1",
+				principal,
+			}),
+		).rejects.toThrow("upgrade");
+		missingFeature = undefined;
+		context.nativeRootDescriptor = undefined;
+		await expect(
+			terminalService.create({
+				narratorId: "n",
+				expectedRevision: 8,
+				contextKey: "chosen-1",
+				principal,
+			}),
+		).rejects.toThrow("original native directory proof");
+		expect(records).toHaveLength(0);
+		expect(registerActivity).not.toHaveBeenCalled();
+		expect(remotePty).not.toHaveBeenCalled();
+		expect(localPty).not.toHaveBeenCalled();
+	});
 	test("standalone remote origin metadata is persisted before native spawn and frozen after ready", async () => {
 		remotePty.mockImplementationOnce(() => {
 			expect(records[0]).toMatchObject({

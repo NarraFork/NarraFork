@@ -9,7 +9,7 @@ import { settings } from "@server/lib/settings";
 import { resolveStandaloneNarratorCwd } from "@server/services/standalone-narrator-cwd";
 import type { WorkspaceContext } from "@shared/workspace-context";
 import type { ToolContext } from "../types";
-import type { ExecutionBackend } from "./backend";
+import type { ExecutionBackend, FileMetadataOptions, PathIdentity } from "./backend";
 
 export type { PathFlavor, TargetPathSemantics } from "./path-semantics";
 export {
@@ -67,6 +67,9 @@ export function toolExecutionCwd(
 		if (ctx.executionTarget.deviceId !== backend.deviceId) {
 			throw new Error("Tool backend does not match its frozen execution target.");
 		}
+		if (!backend.paths.isAbsolute(ctx.executionTarget.cwd)) {
+			throw new Error("Frozen execution target cwd must be fully qualified on its device.");
+		}
 		return ctx.executionTarget.cwd;
 	}
 	return toolBaseCwd(backend, ctx.cwd, ctx.workspaceContext);
@@ -79,6 +82,18 @@ export function resolveBackendPath(
 	inputPath: string,
 ): string {
 	return backend.paths.resolve(base, inputPath);
+}
+
+/** Freeze target grammar first, then obtain the executor's original native proof. */
+export async function resolveNativeBackendPath(
+	backend: ExecutionBackend,
+	baseCwd: string,
+	inputPath: string,
+	options: FileMetadataOptions = {},
+): Promise<PathIdentity> {
+	// Fail drive ambiguity/device/ADS before dispatch, with no implicit cwd fallback.
+	backend.paths.resolve(baseCwd, inputPath);
+	return backend.resolvePathIdentity(inputPath, { ...options, baseCwd });
 }
 
 /** Return a directory name using the target backend's lexical grammar. */

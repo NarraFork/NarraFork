@@ -1,13 +1,13 @@
 package handlers
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
-	"runtime"
-	"strings"
+	"time"
 )
 
 // RuleAction selects whether a matching PathRule permits or refuses a path.
@@ -27,6 +27,8 @@ type PathRule struct {
 type resolvedRule struct {
 	action RuleAction
 	root   string
+	// Original native root incarnation, never reconstructed from a replacement root.
+	nativeRoot *NativePathDescriptorV2
 	// unresolved marks a rule whose path could not be canonicalized (typically it
 	// does not exist yet). Kept only for deny rules: dropping a deny would silently
 	// widen access, while dropping an allow only ever narrows it.
@@ -98,9 +100,17 @@ func NewPathGuardWithRules(rules []PathRule) *PathGuard {
 			}
 			continue
 		}
+		nativeRoot, nativeErr := captureNativeGuardRoot(filepath.Clean(resolved))
+		if nativeErr != nil {
+			if rule.Action == RuleDeny {
+				guard.rules = append(guard.rules, resolvedRule{action: RuleDeny, root: abs, unresolved: true})
+			}
+			continue
+		}
 		guard.rules = append(guard.rules, resolvedRule{
-			action: rule.Action,
-			root:   filepath.Clean(resolved),
+			action:     rule.Action,
+			root:       filepath.Clean(resolved),
+			nativeRoot: nativeRoot,
 		})
 	}
 	return guard
@@ -145,8 +155,21 @@ func (g *PathGuard) ExcludePrivateDirectories(paths ...string) error {
 }
 
 func (g *PathGuard) checkPrivate(path string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return g.checkPrivateContext(ctx, path)
+}
+
+func (g *PathGuard) checkPrivateContext(ctx context.Context, path string) error {
 	for _, private := range g.privatePaths {
-		if pathWithin(private, path) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		within, err := nativeDenyPathWithinContext(ctx, private, path)
+		if err != nil {
+			return fmt.Errorf("private path containment unavailable: %w", err)
+		}
+		if within {
 			return fmt.Errorf("executor private state is excluded from structured IO")
 		}
 	}
@@ -174,18 +197,27 @@ func (g *PathGuard) UnresolvedDenyRules() []string {
 // (including junctions) in an existing path, then verifies that the resulting
 // path remains within an allowed root.
 func (g *PathGuard) CheckExisting(path string) (string, error) {
+	return g.CheckExistingContext(context.Background(), path)
+}
+
+func (g *PathGuard) CheckExistingContext(parent context.Context, path string) (string, error) {
+	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	abs, err := absolutePath(path)
 	if err != nil {
 		return "", err
 	}
-	if err := g.checkPrivate(abs); err != nil {
+	if err := g.checkPrivateContext(ctx, abs); err != nil {
 		return "", err
 	}
 	resolved, err := filepath.EvalSymlinks(abs)
 	if err != nil {
 		return "", fmt.Errorf("resolve path %q: %w", abs, err)
 	}
-	return g.checkResolved(filepath.Clean(resolved))
+	return g.checkResolvedContext(ctx, filepath.Clean(resolved), "create")
 }
 
 // CheckCreate validates a path that may not exist yet. It resolves the nearest
@@ -193,16 +225,25 @@ func (g *PathGuard) CheckExisting(path string) (string, error) {
 // inside an allowed root, then rebuilds the missing suffix below the ancestor's
 // canonical path.
 func (g *PathGuard) CheckCreate(path string) (string, error) {
+	return g.CheckCreateContext(context.Background(), path)
+}
+
+func (g *PathGuard) CheckCreateContext(parent context.Context, path string) (string, error) {
+	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	abs, err := absolutePath(path)
 	if err != nil {
 		return "", err
 	}
-	if err := g.checkPrivate(abs); err != nil {
+	if err := g.checkPrivateContext(ctx, abs); err != nil {
 		return "", err
 	}
 
 	if resolved, evalErr := filepath.EvalSymlinks(abs); evalErr == nil {
-		return g.checkResolved(filepath.Clean(resolved))
+		return g.checkResolvedContext(ctx, filepath.Clean(resolved), "create")
 	} else if !errors.Is(evalErr, fs.ErrNotExist) {
 		return "", fmt.Errorf("resolve path %q: %w", abs, evalErr)
 	}
@@ -215,14 +256,14 @@ func (g *PathGuard) CheckCreate(path string) (string, error) {
 			if resolveErr != nil {
 				return "", fmt.Errorf("resolve path ancestor %q: %w", ancestor, resolveErr)
 			}
-			resolved, resolveErr = g.checkResolved(filepath.Clean(resolved))
+			resolved, resolveErr = g.checkResolvedContext(ctx, filepath.Clean(resolved), "create")
 			if resolveErr != nil {
 				return "", resolveErr
 			}
 			for i := len(missing) - 1; i >= 0; i-- {
 				resolved = filepath.Join(resolved, missing[i])
 			}
-			return g.checkResolved(filepath.Clean(resolved))
+			return g.checkResolvedContext(ctx, filepath.Clean(resolved), "create")
 		} else if !errors.Is(statErr, fs.ErrNotExist) {
 			return "", fmt.Errorf("inspect path ancestor %q: %w", ancestor, statErr)
 		}
@@ -240,18 +281,27 @@ func (g *PathGuard) CheckCreate(path string) (string, error) {
 // following a final symlink. The parent is canonicalized and checked first, so a
 // swapped symlink is unlinked rather than deleting its target.
 func (g *PathGuard) CheckRemove(path string) (string, error) {
+	return g.CheckRemoveContext(context.Background(), path)
+}
+
+func (g *PathGuard) CheckRemoveContext(parent context.Context, path string) (string, error) {
+	ctx, cancel := context.WithTimeout(parent, 10*time.Second)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
 	abs, err := absolutePath(path)
 	if err != nil {
 		return "", err
 	}
-	if err := g.checkPrivate(abs); err != nil {
+	if err := g.checkPrivateContext(ctx, abs); err != nil {
 		return "", err
 	}
-	parent, err := g.CheckExisting(filepath.Dir(abs))
+	parentPath, err := g.CheckExistingContext(ctx, filepath.Dir(abs))
 	if err != nil {
 		return "", err
 	}
-	return g.checkResolved(filepath.Clean(filepath.Join(parent, filepath.Base(abs))))
+	return g.checkResolvedContext(ctx, filepath.Clean(filepath.Join(parentPath, filepath.Base(abs))), "remove")
 }
 
 // Check retains the original API and applies the stricter existing-path check.
@@ -260,7 +310,20 @@ func (g *PathGuard) Check(path string) (string, error) {
 }
 
 func (g *PathGuard) checkResolved(path string) (string, error) {
-	if err := g.checkPrivate(path); err != nil {
+	return g.checkResolvedOperation(path, "create")
+}
+
+func (g *PathGuard) checkResolvedOperation(path, operation string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	return g.checkResolvedContext(ctx, path, operation)
+}
+
+func (g *PathGuard) checkResolvedContext(ctx context.Context, path, operation string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if err := g.checkPrivateContext(ctx, path); err != nil {
 		return "", err
 	}
 	if !g.restricted {
@@ -268,7 +331,11 @@ func (g *PathGuard) checkResolved(path string) (string, error) {
 	}
 	// Last match wins, so scan backwards and stop at the first containing rule.
 	for i := len(g.rules) - 1; i >= 0; i-- {
-		if !pathWithin(g.rules[i].root, path) {
+		within, err := nativeGuardRuleContains(ctx, g.rules[i], path, operation)
+		if err != nil {
+			return "", fmt.Errorf("native path policy proof unavailable: %w", err)
+		}
+		if !within {
 			continue
 		}
 		if g.rules[i].action == RuleDeny {
@@ -280,6 +347,9 @@ func (g *PathGuard) checkResolved(path string) (string, error) {
 }
 
 func absolutePath(path string) (string, error) {
+	if err := validateNativeAbsolutePath(path); err != nil {
+		return "", err
+	}
 	abs, err := filepath.Abs(path)
 	if err != nil {
 		return "", fmt.Errorf("invalid path: %w", err)
@@ -288,25 +358,11 @@ func absolutePath(path string) (string, error) {
 }
 
 func pathWithin(root, path string) bool {
-	comparisonRoot := filepath.Clean(root)
-	comparisonPath := filepath.Clean(path)
-	if runtime.GOOS == "windows" {
-		comparisonRoot = strings.ToLower(comparisonRoot)
-		comparisonPath = strings.ToLower(comparisonPath)
-	}
-	rel, err := filepath.Rel(comparisonRoot, comparisonPath)
-	if err != nil || filepath.IsAbs(rel) {
-		return false
-	}
-	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
+	within, err := nativePathWithin(root, path)
+	return err == nil && within
 }
 
-func samePath(left, right string) bool {
-	if runtime.GOOS == "windows" {
-		return strings.EqualFold(filepath.Clean(left), filepath.Clean(right))
-	}
-	return filepath.Clean(left) == filepath.Clean(right)
-}
+func samePath(left, right string) bool { return nativeSamePath(left, right) }
 
 // Unrestricted reports whether the operator supplied no allow roots.
 func (g *PathGuard) Unrestricted() bool {

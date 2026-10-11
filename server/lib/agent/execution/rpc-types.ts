@@ -109,6 +109,13 @@ export interface DeviceHelloAckFrame {
 	error?: string;
 	/** Server-assigned session id (for logging/correlation). */
 	sessionId?: string;
+	/** Additive metadata control identity, separate from the legacy logging sessionId. */
+	windowsMetadataSession?: {
+		version: 1;
+		connectionId: string;
+		sessionId: string;
+		runtimeGeneration: number;
+	};
 	/** Effective limits the executor must honour. */
 	limits?: {
 		maxRpcBytes: number;
@@ -119,6 +126,7 @@ export interface DeviceHelloAckFrame {
 // ── RPC methods ──────────────────────────────────────────────────────────────
 
 export type RpcMethod =
+	| import("@shared/windows-first-capture").WindowsFirstCaptureMethod
 	| import("@shared/workspace-attachment-protocol").WorkspaceAttachmentRpcMethod
 	| import("@shared/remote-history-protocol").RemoteHistoryRpcMethod
 	| "system.ping"
@@ -127,6 +135,7 @@ export type RpcMethod =
 	| "share.readChunk"
 	| "share.release"
 	| "fs.stat"
+	| "fs.path.resolve.v2"
 	| "fs.read"
 	| "fs.write"
 	| "fs.writeConditional"
@@ -158,6 +167,8 @@ export interface RpcRequestFrame {
 	id: string;
 	method: RpcMethod;
 	params: Record<string, unknown>;
+	/** Correlation only; valid solely for the two negotiated first-capture methods. */
+	windowsFirstCaptureOrigin?: import("@shared/windows-first-capture").WindowsFirstCaptureOrigin;
 }
 
 /** Streaming chunk for long-running methods (exec output). Base64 for bytes. */
@@ -386,12 +397,19 @@ export interface PtyOpenParams {
 	ptyId: string;
 	cmd: string[];
 	cwd: string;
+	/** Frozen native cwd evidence from the authorized original target. */
+	expectedNativeDescriptor?: import("@shared/target-native-path").NativePathDescriptorV2;
 	cols: number;
 	rows: number;
 	env?: Record<string, string>;
 }
 export interface PtyOpenResult {
 	exitCode: number | null;
+	/** Additive pty.lifecycle-evidence.v1; absent is legacy/unknown, never positive proof. */
+	processExitObserved?: boolean;
+	treeStopped?: boolean;
+	cleanupComplete?: boolean;
+	reason?: "exited" | "killed" | "cancelled" | "startup_failed" | "io_failed" | "unknown";
 }
 
 export interface PtyWriteParams {

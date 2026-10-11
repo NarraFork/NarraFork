@@ -13,6 +13,29 @@ afterEach(() => {
 });
 
 describe("target path semantics", () => {
+	test("freezes Windows drive-relative paths without borrowing the controller cwd", () => {
+		expect(() => windowsPathSemantics.resolve("D:\\work", "C:foo")).toThrow(
+			"AMBIGUOUS_DRIVE_RELATIVE",
+		);
+		expect(windowsPathSemantics.resolve("D:\\work", "D:foo")).toBe("D:\\work\\foo");
+		expect(windowsPathSemantics.resolve("D:\\work", "\\foo")).toBe("D:\\foo");
+		expect(windowsPathSemantics.resolve("D:\\work", "Unicode 空格\\文件.txt")).toBe(
+			"D:\\work\\Unicode 空格\\文件.txt",
+		);
+	});
+
+	test("requires fully qualified Windows bases and rejects unsafe namespaces", () => {
+		expect(windowsPathSemantics.isAbsolute("\\foo")).toBe(false);
+		for (const path of [
+			"C:\\file:stream",
+			"C:\\NUL.txt",
+			"\\\\.\\pipe\\x",
+			"\\\\?\\GLOBALROOT\\Device\\x",
+		]) {
+			expect(() => windowsPathSemantics.resolve("D:\\work", path)).toThrow();
+		}
+		expect(() => windowsPathSemantics.resolve("D:work", "foo")).toThrow();
+	});
 	test("keeps POSIX backslashes literal", () => {
 		expect(posixPathSemantics.resolve("/work/project", "a\\b")).toBe("/work/project/a\\b");
 		expect(posixPathSemantics.equals("/work/a\\b", "/work/a/b")).toBe(false);
@@ -23,27 +46,27 @@ describe("target path semantics", () => {
 		expect(posixPathSemantics.extname("/work/project/file.ts")).toBe(".ts");
 	});
 
-	test("uses Windows drive, separator, and case rules on any host", () => {
+	test("uses Windows drive and separator grammar without inventing native case rules", () => {
 		expect(windowsPathSemantics.resolve("C:\\Work\\Project", "..\\Plan.md")).toBe(
 			"C:\\Work\\Plan.md",
 		);
-		expect(windowsPathSemantics.equals("C:\\Work\\Plan.md", "c:/work/plan.md")).toBe(true);
+		expect(windowsPathSemantics.equals("C:\\Work\\Plan.md", "c:/work/plan.md")).toBe(false);
+		expect(windowsPathSemantics.equals("C:\\Work\\Plan.md", "c:/Work/Plan.md")).toBe(true);
 		expect(windowsPathSemantics.dirname("C:\\Work\\Plan.md")).toBe("C:\\Work");
-		expect(windowsPathSemantics.contains("C:\\Work", "c:/work/src/file.ts")).toBe(true);
+		expect(windowsPathSemantics.contains("C:\\Work", "c:/work/src/file.ts")).toBe(false);
 		expect(windowsPathSemantics.contains("C:\\Work", "C:\\Workspace\\file.ts")).toBe(false);
-		expect(windowsPathSemantics.identityKey("C:\\Work\\Plan.md")).toBe(
+		expect(windowsPathSemantics.identityKey("C:\\Work\\Plan.md")).not.toBe(
 			windowsPathSemantics.identityKey("c:/work/plan.md"),
 		);
 	});
 
-	test("Windows contains() is case-insensitive", () => {
-		// Parent and child differ only in case — must return true
-		expect(windowsPathSemantics.contains("C:\\Data", "c:\\data\\file.ts")).toBe(true);
+	test("Windows lexical contains() does not grant unproven case aliases", () => {
+		expect(windowsPathSemantics.contains("C:\\Data", "c:\\data\\file.ts")).toBe(false);
 		expect(windowsPathSemantics.contains("c:\\users\\admin", "C:\\Users\\Admin\\doc.md")).toBe(
-			true,
+			false,
 		);
 		// Mixed separators with case differences
-		expect(windowsPathSemantics.contains("D:/Projects", "d:\\projects\\src\\main.ts")).toBe(true);
+		expect(windowsPathSemantics.contains("D:/Projects", "d:\\projects\\src\\main.ts")).toBe(false);
 		// Not contained despite shared prefix
 		expect(windowsPathSemantics.contains("C:\\Data", "C:\\DataStore\\file.ts")).toBe(false);
 		// POSIX must remain case-sensitive

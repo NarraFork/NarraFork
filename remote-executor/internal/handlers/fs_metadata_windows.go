@@ -223,7 +223,7 @@ func validateWindowsConditionalFile(f *os.File) error {
 		return fmt.Errorf("conditional replacement requires local NTFS")
 	}
 	// Fixed budget: refuse rather than allocate indefinitely for hostile streams.
-	var streams [65536]byte
+	streams := newConditionalStreamInfoBuffer()
 	if err := windows.GetFileInformationByHandleEx(h, windows.FileStreamInfo, &streams[0], uint32(len(streams))); err != nil {
 		return fmt.Errorf("enumerate file streams: %w", err)
 	}

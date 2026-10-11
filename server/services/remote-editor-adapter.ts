@@ -18,6 +18,7 @@ import {
 	type FileChangeCompletion,
 } from "./file-change-runtime";
 import type { RemoteFileChangeRuntime } from "./remote-file-change-runtime";
+import { preflightWindowsEditorMetadata } from "./windows-editor-metadata-preflight";
 
 type Request = EditorFileChangeRequest<{ hash: string; bytes: number }>;
 type Completion = FileChangeCompletion<{ hash: string; bytes: number }>;
@@ -69,8 +70,81 @@ export function createRemoteEditorAdapter(
 ): RemoteEditorAdapter {
 	return {
 		async source(actor, binding, temporaryPath, signal) {
+			binding = Object.freeze({ ...binding });
 			const endpoint = await deps.resolve(actor, binding, "read", signal);
 			assertEndpoint(endpoint, binding);
+			if (endpoint.runtime.backend.pathFlavor === "windows") {
+				const { getRemoteWorkspaceHistoryRuntime } = await import(
+					"./remote-workspace-history-runtime"
+				);
+				const registry = await getRemoteWorkspaceHistoryRuntime();
+				await preflightWindowsEditorMetadata({
+					registry,
+					userId: actor.userId,
+					phase: "source",
+					signal,
+					assertCurrent: () => {
+						assertEndpoint(endpoint, binding);
+						const original = endpoint.runtime.history.binding;
+						const live = registry.options.backend(endpoint.identity.deviceId);
+						const scope = registry.evidence.getScope(endpoint.identity.scopeId);
+						if (
+							binding.runtimeGeneration === undefined ||
+							live.runtimeGeneration !== binding.runtimeGeneration ||
+							!scope ||
+							scope.status !== "active" ||
+							scope.activeLeaseId ||
+							scope.activeMutationCount ||
+							scope.sourceInstanceId !== original.sourceInstanceId ||
+							scope.workspaceInstanceId !== original.workspaceInstanceId ||
+							scope.canonicalRoot !== original.root ||
+							scope.rootIdentityJson?.object !== original.rootIdentity ||
+							scope.fencingToken !== original.fence
+						)
+							throw new EditorDocumentError(
+								"EDITOR_IDENTITY_CHANGED",
+								"Original editor source/runtime/fence changed",
+								403,
+							);
+					},
+					async authorize(bounded) {
+						const fresh = await actor.authorize(
+							{ path: binding.lexicalPath, deviceId: binding.deviceId, origin: "reference" },
+							"read",
+						);
+						if (!sameEditorBinding(fresh, binding))
+							throw new EditorDocumentError(
+								"EDITOR_IDENTITY_CHANGED",
+								"Original editor binding changed",
+								403,
+							);
+						if (!binding.deviceId || binding.runtimeGeneration === undefined)
+							throw new EditorDocumentError(
+								"EDITOR_IDENTITY_CHANGED",
+								"Original Windows editor generation is missing",
+								403,
+							);
+						await registry.options.authorize(
+							{
+								userId: actor.userId,
+								narratorId: actor.narratorId,
+								projectId: binding.projectId,
+								kind: "human",
+							},
+							{
+								deviceId: binding.deviceId,
+								cwd: binding.cwd,
+								lexicalPath: binding.lexicalPath,
+								canonicalPath: binding.canonicalPath,
+								runtimeGeneration: binding.runtimeGeneration,
+								rootIdentity: binding.rootIdentity,
+							},
+							"read",
+							bounded,
+						);
+					},
+				});
+			}
 			const before = await endpoint.runtime.observe(endpoint.identity, signal);
 			if (!before.bytes)
 				throw new EditorDocumentError("EDITOR_SOURCE_MISSING", "Remote source is absent", 404);
@@ -102,6 +176,7 @@ export function createRemoteEditorAdapter(
 			}
 		},
 		async execute(actor, binding, request) {
+			binding = Object.freeze({ ...binding });
 			const endpoint = await deps.resolve(actor, binding, "write", request.signal);
 			assertEndpoint(endpoint, binding);
 			const digest = createHash("sha256")

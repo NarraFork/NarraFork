@@ -18,6 +18,12 @@ export interface TerminalWSData {
 export type TerminalServerMessage =
 	| { type: "output"; terminalId: string; data: string }
 	| { type: "exit"; terminalId: string; code: number }
+	| {
+			type: "lifecycle";
+			terminalId: string;
+			state: "ready" | "closing" | "exited" | "unknown";
+			code: number | null;
+	  }
 	| { type: "error"; terminalId: string; message: string; code?: string }
 	| { type: "requestResize"; terminalId: string }
 	| { type: "scrollback"; terminalId: string; data: string; cols: number; rows: number }
@@ -100,6 +106,24 @@ async function principalFor(ws: TerminalWS): Promise<NarratorPrincipal> {
 }
 async function authorize(ws: TerminalWS, terminalId: string, need: "read" | "write") {
 	return terminalService.authorizeTargetAccess(terminalId, await principalFor(ws), need);
+}
+function inputAuthority(ws: TerminalWS, id: string, token: object | undefined) {
+	return async () => {
+		const current = () =>
+			!closedSockets.has(ws) &&
+			ws.data.subscribedTerminals.has(id) &&
+			intents.get(ws)?.get(id) === token;
+		if (!current())
+			throw new AppError(
+				"Terminal input binding is no longer active",
+				403,
+				"TERMINAL_INPUT_REVOKED",
+			);
+		const terminal = await authorize(ws, id, "write"); // Refresh THIS actor, never the creator.
+		if (!current())
+			throw new AppError("Terminal input binding changed", 403, "TERMINAL_INPUT_REVOKED");
+		return terminal;
+	};
 }
 function intentMap(ws: TerminalWS): Map<string, object> {
 	let value = intents.get(ws);
@@ -188,7 +212,11 @@ async function subscribeToTerminal(ws: TerminalWS, terminalId: string): Promise<
 		if (!current()) return;
 		// Reattachment may launch a PTY. Read-only observers can view already-live terminals,
 		// but must never cause a shell side effect through a subscribe/read request.
-		if (terminal.status === "running" && !terminalService.isAttached(terminalId)) {
+		if (
+			terminal.status === "running" &&
+			!terminalService.isAttached(terminalId) &&
+			(!terminal.deviceId || terminal.deviceId === "local")
+		) {
 			await authorize(ws, terminalId, "write");
 			if (!current()) return;
 			await terminalService.ensureAttached(terminalId);
@@ -201,6 +229,9 @@ async function subscribeToTerminal(ws: TerminalWS, terminalId: string): Promise<
 		if (scrollback) send(ws, { type: "scrollback", terminalId, ...scrollback });
 		const state = terminalService.getBufferState(terminalId);
 		if (state) send(ws, { type: "bufferState", terminalId, ...state });
+		const latest = await authorize(ws, terminalId, "read");
+		if (current() && latest.lifecycle)
+			send(ws, { type: "lifecycle", terminalId, ...latest.lifecycle });
 	} catch (cause) {
 		if (map.get(terminalId) === token) removeSubscription(ws, terminalId);
 		throw cause;
@@ -247,21 +278,34 @@ export const handleTerminalWS = {
 				}
 				case "input": {
 					if (!ws.data.subscribedTerminals.has(msg.terminalId)) break;
-					await authorize(ws, msg.terminalId, "write");
+					if (Buffer.byteLength(msg.data) > 64 * 1024)
+						throw new AppError("Terminal input exceeds 64KiB", 400, "TERMINAL_INPUT_LIMIT");
+					const authority = inputAuthority(
+						ws,
+						msg.terminalId,
+						intents.get(ws)?.get(msg.terminalId),
+					);
+					await authority();
 					if (closedSockets.has(ws) || !ws.data.subscribedTerminals.has(msg.terminalId)) break;
 					if (lastActiveClient.get(msg.terminalId) !== ws) {
 						lastActiveClient.set(msg.terminalId, ws);
 						send(ws, { type: "requestResize", terminalId: msg.terminalId });
 					}
-					terminalService.write(msg.terminalId, msg.data);
+					terminalService.writeAuthorized(msg.terminalId, msg.data, authority);
 					break;
 				}
 				case "resize": {
 					if (!ws.data.subscribedTerminals.has(msg.terminalId)) break;
-					await authorize(ws, msg.terminalId, "write");
+					const authority = inputAuthority(
+						ws,
+						msg.terminalId,
+						intents.get(ws)?.get(msg.terminalId),
+					);
+					await authority();
 					if (closedSockets.has(ws) || !ws.data.subscribedTerminals.has(msg.terminalId)) break;
 					const active = lastActiveClient.get(msg.terminalId);
-					if (!active || active === ws) terminalService.resize(msg.terminalId, msg.cols, msg.rows);
+					if (!active || active === ws)
+						terminalService.resizeAuthorized(msg.terminalId, msg.cols, msg.rows, authority);
 					break;
 				}
 				case "create": {

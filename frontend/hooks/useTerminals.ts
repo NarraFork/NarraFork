@@ -80,6 +80,7 @@ export function useCreateTerminal(chapterId: string) {
 			}
 			return api.createTerminal({ chapterId, ...data });
 		},
+		retry: false, // Reconnecting or a lost create reply must not spawn another shell.
 		onSuccess: (terminal) => {
 			appendTerminalToCache(qc, queryKey, terminal);
 			qc.invalidateQueries({ queryKey });

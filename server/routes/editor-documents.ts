@@ -15,7 +15,7 @@ import {
 	createEditorDocumentSchema,
 	createEditorUploadSchema,
 } from "../lib/validators/editor-documents";
-import { remoteRecoveryProvenance } from "../middleware/remote-recovery-provenance";
+import { remoteEditorSessionProvenance } from "../middleware/remote-recovery-provenance";
 import {
 	editorRuntimeUnavailable,
 	getEditorDocumentService,
@@ -174,8 +174,8 @@ export function createEditorDocumentRoutes(
 		await requireNarratorAccess(c, c.req.param("id") ?? "", "read");
 	};
 	const base = "/:id/editor-documents";
-	routes.use(base, remoteRecoveryProvenance);
-	routes.use(`${base}/*`, remoteRecoveryProvenance);
+	routes.use(base, remoteEditorSessionProvenance);
+	routes.use(`${base}/*`, remoteEditorSessionProvenance);
 	routes.use(`${base}/*`, async (c, next) => {
 		await protect(c);
 		await next();

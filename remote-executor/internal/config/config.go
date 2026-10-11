@@ -70,7 +70,8 @@ type Config struct {
 	// hole out of an allow and a later allow can re-open an exception inside it.
 	// Empty means unrestricted. Mutually exclusive with AllowRoots.
 	PathRules []PathRule `json:"pathRules"`
-	// DefaultCwd is reported to the server at handshake.
+	// DefaultCwd is reported to the server at handshake. On Windows, an unset
+	// value stays empty rather than inheriting a service startup directory.
 	DefaultCwd string `json:"defaultCwd"`
 	// StateDir holds private history/worktree journals, never a user repository.
 	StateDir string `json:"stateDir"`
@@ -94,6 +95,8 @@ type Config struct {
 	// DisableShell blocks the general exec.start and pty.open command surfaces.
 	// Git and filesystem capabilities remain available; this is not an OS sandbox.
 	DisableShell bool `json:"disableShell"`
+	// Public administrator enrollment PATH only, never key/session material.
+	WindowsFirstCaptureEnrollmentFile string `json:"windowsFirstCaptureEnrollmentFile"`
 }
 
 func Load() (*Config, error) {
@@ -118,6 +121,7 @@ func Load() (*Config, error) {
 	tlsCert := fs.String("tls-cert", "", "Path to TLS certificate PEM file (required unless listen uses a loopback IP literal)")
 	tlsKey := fs.String("tls-key", "", "Path to TLS private key PEM file (required unless listen uses a loopback IP literal)")
 	disableShell := fs.Bool("disable-shell", false, "Disable exec.start and pty.open (git/fs remain; not an OS sandbox)")
+	firstCaptureEnrollment := fs.String("windows-first-capture-enrollment-file", "", "Administrator-protected canonical v2 public enrollment file (no keys; no automatic helper startup)")
 	if err := fs.Parse(os.Args[1:]); err != nil {
 		return nil, err
 	}
@@ -185,6 +189,9 @@ func Load() (*Config, error) {
 	}
 	if v := os.Getenv("NARRAFORK_EXECUTOR_TLS_KEY"); v != "" {
 		cfg.TLSKey = v
+	}
+	if v := os.Getenv("NARRAFORK_WINDOWS_FIRST_CAPTURE_ENROLLMENT"); v != "" {
+		cfg.WindowsFirstCaptureEnrollmentFile = v
 	}
 	if value, set, boolErr := environmentBool("NARRAFORK_EXECUTOR_DISABLE_SHELL"); boolErr != nil {
 		return nil, boolErr
@@ -258,6 +265,9 @@ func Load() (*Config, error) {
 	if explicitFlags["disable-shell"] {
 		cfg.DisableShell = *disableShell
 	}
+	if explicitFlags["windows-first-capture-enrollment-file"] {
+		cfg.WindowsFirstCaptureEnrollmentFile = *firstCaptureEnrollment
+	}
 	flagChoice, flagChoiceSet, err := selectTokenSource(
 		"command line",
 		*token,
@@ -294,11 +304,7 @@ func Load() (*Config, error) {
 	if !filepath.IsAbs(cfg.StateDir) {
 		return nil, fmt.Errorf("stateDir must be absolute")
 	}
-	if cfg.DefaultCwd == "" {
-		if wd, err := os.Getwd(); err == nil {
-			cfg.DefaultCwd = wd
-		}
-	}
+	cfg.DefaultCwd = resolveDefaultCwd(cfg.DefaultCwd, runtime.GOOS, os.Getwd)
 	if cfg.ReconnectMaxSeconds <= 0 {
 		cfg.ReconnectMaxSeconds = 30
 	}
@@ -307,6 +313,19 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	return cfg, nil
+}
+
+// resolveDefaultCwd never promotes a Windows process startup directory into a
+// workspace. A service may start in system32 without an operator choosing it.
+// Other platforms retain their existing process-directory default.
+func resolveDefaultCwd(configured, platform string, getwd func() (string, error)) string {
+	if configured != "" || platform == "windows" {
+		return configured
+	}
+	if wd, err := getwd(); err == nil {
+		return wd
+	}
+	return ""
 }
 
 func resolveConfigPath(base, path string) string {

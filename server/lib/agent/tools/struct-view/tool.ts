@@ -236,6 +236,7 @@ export const structViewTool: ToolDefinition = {
 			const read = await backend.readFileBytes(ioPath, {
 				maxBytes: MAX_FILE_BYTES,
 				...(canonicalPath ? { expectedResolvedPath: canonicalPath } : {}),
+				expectedNativeDescriptor: ctx.executionTarget?.nativeDescriptor,
 				signal: ctx.signal,
 			});
 			truncatedRead = read.truncated;

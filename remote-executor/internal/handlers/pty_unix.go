@@ -28,11 +28,7 @@ func (h *Handlers) PtyOpen(ctx context.Context, params map[string]any, onStream 
 	}
 	cmdArgs := stringSliceParam(params, "cmd")
 	if len(cmdArgs) == 0 {
-		shell, args := loginShell("")
-		cmdArgs = append([]string{shell}, args...)
-		// Drop the trailing "-c ''" from loginShell — for a PTY we want an
-		// interactive login shell, not a one-shot command.
-		cmdArgs = []string{shell, "-l"}
+		cmdArgs = interactiveShell()
 	}
 	cols := uint16(intParam(params, "cols", 80))
 	rows := uint16(intParam(params, "rows", 24))

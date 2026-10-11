@@ -91,6 +91,27 @@ export async function createExecutionTargetContext(input: {
 	}
 
 	const partialContext = { paths };
+	if (paths.flavor === "windows" && backend.supportsNativePathV2 === true) {
+		if (
+			!sourceTarget.nativeRootDescriptor?.object ||
+			typeof sourceTarget.nativeRootDescriptor.caseSensitive !== "boolean"
+		) {
+			throw new Error("Original native execution-directory proof required");
+		}
+		const root = await backend.resolvePathIdentity(sourceTarget.cwd, {
+			baseCwd: sourceTarget.cwd,
+			operation: "existing",
+			expectedNativeDescriptor: sourceTarget.nativeRootDescriptor,
+		});
+		if (
+			!root.exists ||
+			!root.nativeDescriptor ||
+			root.runtimeGeneration !== runtimeGeneration ||
+			backendRuntimeGeneration(backend) !== runtimeGeneration
+		) {
+			throw new Error("Original native execution directory changed");
+		}
+	}
 	let lexicalPath = sourceTarget.lexicalPath;
 	let canonicalPath = sourceTarget.canonicalPath;
 	const identityCandidate = pathIdentityCandidate(sourceTarget);
@@ -111,7 +132,15 @@ export async function createExecutionTargetContext(input: {
 				lexicalPath = paths.normalize(sourceTarget.lexicalPath);
 				canonicalPath = paths.normalize(sourceTarget.canonicalPath);
 			} else {
-				const identity = await backend.resolvePathIdentity(identityCandidate);
+				if (backend.supportsNativePathV2 === true && !sourceTarget.nativeDescriptor) {
+					throw new Error("Original native execution-target proof required");
+				}
+				const identity = await backend.resolvePathIdentity(identityCandidate, {
+					baseCwd: sourceTarget.cwd,
+					...(sourceTarget.nativeDescriptor
+						? { expectedNativeDescriptor: sourceTarget.nativeDescriptor }
+						: {}),
+				});
 				if (identity.runtimeGeneration !== runtimeGeneration) {
 					throw new Error(
 						`Execution path identity generation drifted: expected ${runtimeGeneration}, ` +
@@ -156,6 +185,10 @@ export async function createExecutionTargetContext(input: {
 		...(canonicalPath !== undefined ? { canonicalPath: paths.normalize(canonicalPath) } : {}),
 		...(sourceTarget.resolvedFilePath !== undefined
 			? { resolvedFilePath: sourceTarget.resolvedFilePath }
+			: {}),
+		...(sourceTarget.nativeDescriptor ? { nativeDescriptor: sourceTarget.nativeDescriptor } : {}),
+		...(sourceTarget.nativeRootDescriptor
+			? { nativeRootDescriptor: sourceTarget.nativeRootDescriptor }
 			: {}),
 		runtimeGeneration,
 		selectionSource: sourceTarget.selectionSource,

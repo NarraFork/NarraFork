@@ -217,6 +217,7 @@ export const writeTool: ToolDefinition = {
 				if (stat) {
 					const { bytes } = await readCompleteFileBytes(backend, ioPath, {
 						expectedResolvedPath: canonicalPath,
+						expectedNativeDescriptor: ctx.executionTarget?.nativeDescriptor,
 					});
 					const decoded = decodeFileBytes(bytes);
 					existingContent = decoded.text;
@@ -246,7 +247,10 @@ export const writeTool: ToolDefinition = {
 				await backend.writeFileBytes(
 					resolvedPath,
 					encodeFileBytes(applyLineEnding(normalizedContent, lineEnding), existingEncoding),
-					{ expectedResolvedPath: canonicalPath },
+					{
+						expectedResolvedPath: canonicalPath,
+						expectedNativeDescriptor: ctx.executionTarget?.nativeDescriptor,
+					},
 				);
 				// `existingContent` is null exactly when the file did not exist, which is
 				// the distinction the client cannot make: a Write's input carries only the

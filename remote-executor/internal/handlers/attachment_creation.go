@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/narrafork/remote-executor/internal/history"
+	"github.com/narrafork/remote-executor/internal/windowsbackup"
 )
 
 const attachmentBytes int64 = 100 << 20
@@ -367,13 +368,17 @@ func (h *Handlers) WorkspaceAttachment(parent context.Context, method string, pa
 		if err := h.ensureAttachmentParents(parentPath, record.Intent.Binding.Root); err != nil {
 			return nil, err
 		}
+		evidence, releaseParent, err := h.pinAttachmentPublicationParent(ctx, parentPath, record.Intent.Binding.Root, digest)
+		if err != nil {
+			return record.Status, err
+		}
+		defer releaseParent()
 		temp, err := os.CreateTemp(parentPath, ".nf-attachment-")
 		if err != nil {
 			return nil, err
 		}
 		tempInfo, _ := temp.Stat()
-		defer temp.Close()
-		defer removeConditionalTemporary(temp.Name(), tempInfo)
+		defer func() { _ = temp.Close(); _ = removeConditionalTemporary(temp.Name(), tempInfo) }()
 		source, err := os.Open(partPath)
 		if err != nil {
 			return nil, err
@@ -400,7 +405,25 @@ func (h *Handlers) WorkspaceAttachment(parent context.Context, method string, pa
 		if err := temp.Sync(); err != nil {
 			return nil, err
 		}
-		temp.Close()
+		// Complete capability and the prepared object's metadata must be known
+		// before publication. Missing audit rights is a predictable preflight
+		// refusal, not a reason to leave a publicly visible unproved attachment.
+		preparedFile, err := h.prepareAttachmentPublication(ctx, temp, tempInfo, target, evidence)
+		if err != nil {
+			return record.Status, err
+		}
+		defer preparedFile.Close()
+		preparedMetadata, err := captureHistoryMetadata(ctx, preparedFile)
+		if err != nil {
+			return record.Status, fmt.Errorf("attachment metadata preflight not ready: %w", err)
+		}
+		if err := validateAttachmentPrepared(ctx, preparedMetadata, evidence); err != nil {
+			return record.Status, err
+		}
+		record.Metadata = preparedMetadata
+		if err := saveAttachment(recordPath, record); err != nil {
+			return record.Status, err
+		}
 		record.Status.State = "unknown"
 		record.Status.Reason = "exclusive publication dispatched"
 		if err := saveAttachment(recordPath, record); err != nil {
@@ -409,12 +432,17 @@ func (h *Handlers) WorkspaceAttachment(parent context.Context, method string, pa
 		if err := h.history.ValidateBindingSnapshot(record.Intent.Binding, false); err != nil {
 			return record.Status, err
 		}
-		if err := publishHistoryNoReplace(temp.Name(), target); err != nil {
-			record.Status.State = "conflict"
-			saveAttachment(recordPath, record)
-			return record.Status, nil
+		if err := ctx.Err(); err != nil {
+			return record.Status, err
 		}
-		actual, err := os.Open(target)
+		if err := publishAttachmentPrepared(preparedFile, target); err != nil {
+			// A publication primitive can fail after its native dispatch. Do not
+			// turn a possible side effect into a rejected/conflict receipt.
+			record.Status.Reason = "publication result unknown; prepared proof retained"
+			_ = saveAttachment(recordPath, record)
+			return record.Status, err
+		}
+		actual, err := windowsbackup.OpenObservation(target)
 		if err != nil {
 			return record.Status, err
 		}
@@ -429,6 +457,15 @@ func (h *Handlers) WorkspaceAttachment(parent context.Context, method string, pa
 		}
 		metadata, err := captureHistoryMetadata(ctx, actual)
 		if err != nil {
+			return record.Status, err
+		}
+		if err := verifyAttachmentPrepared(ctx, preparedMetadata, metadata, evidence); err != nil {
+			return record.Status, fmt.Errorf("published prepared metadata changed; unknown retained: %w", err)
+		}
+		if err := ctx.Err(); err != nil {
+			return record.Status, err
+		}
+		if err := h.history.ValidateBindingSnapshot(record.Intent.Binding, false); err != nil {
 			return record.Status, err
 		}
 		incarnation, err := history.FileIncarnation(target)
@@ -491,7 +528,7 @@ func (h *Handlers) WorkspaceAttachment(parent context.Context, method string, pa
 		if err := h.history.ValidateBindingSnapshot(intent.Binding, false); err != nil {
 			return nil, err
 		}
-		file, err := os.Open(target)
+		file, err := windowsbackup.OpenMutation(target)
 		if err != nil {
 			return nil, err
 		}
@@ -528,7 +565,7 @@ func (h *Handlers) WorkspaceAttachment(parent context.Context, method string, pa
 			}
 			return cleanupResult("unknown", reason), nil
 		}
-		movedFile, err := os.Open(quarantine)
+		movedFile, err := windowsbackup.OpenObservation(quarantine)
 		if err != nil {
 			return unknownAfterMove("quarantine unreadable; retained")
 		}

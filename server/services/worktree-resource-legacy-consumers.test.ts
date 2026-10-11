@@ -147,6 +147,9 @@ mock.module("../terminal/runtime-bun", () => ({ spawnBunTerminal: pty }));
 mock.module("../terminal/runtime-pty", () => ({ spawnPortablePty: pty }));
 mock.module("../terminal/runtime-remote", () => ({
 	REMOTE_PTY_READY_FEATURE: "pty",
+	REMOTE_PTY_CONPTY_FEATURE: "pty.conpty.v1",
+	REMOTE_PTY_LIFECYCLE_FEATURE: "pty.lifecycle-evidence.v1",
+	REMOTE_PTY_BOUNDED_IO_FEATURE: "pty.bounded-io.v1",
 	spawnRemotePty: pty,
 }));
 const restore = mock(async () => {});

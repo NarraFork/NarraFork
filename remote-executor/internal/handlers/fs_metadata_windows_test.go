@@ -6,10 +6,51 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
+
+func TestWindowsConditionalStreamInfoAlignmentAndADSRefusal(t *testing.T) {
+	root := nativePathFixture(t)
+	path := filepath.Join(root, "stream-alignment.txt")
+	if err := os.WriteFile(path, []byte("ordinary single unnamed stream"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	file, err := openConditionalWindowsFile(path, windows.GENERIC_READ|windows.READ_CONTROL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	aligned := newConditionalStreamInfoBuffer()
+	if uintptr(unsafe.Pointer(&aligned[0]))%8 != 0 {
+		t.Fatal("production query buffer is not aligned")
+	}
+	if err := windows.GetFileInformationByHandleEx(windows.Handle(file.Fd()), windows.FileStreamInfo, &aligned[0], uint32(len(aligned))); err != nil {
+		t.Fatal("aligned native stream enumeration failed", err)
+	}
+	// Diagnostic only: some OS implementations may tolerate a misaligned buffer.
+	// The production call always satisfies the documented ABI, without retrying
+	// any denied/error query or dropping streams from the preservation contract.
+	misaligned := newConditionalStreamInfoBuffer()[1:]
+	misalignedErr := windows.GetFileInformationByHandleEx(windows.Handle(file.Fd()), windows.FileStreamInfo, &misaligned[0], uint32(len(misaligned)))
+	t.Logf("native stream query aligned=success misalignedAlignment=%d misalignedError=%v", uintptr(unsafe.Pointer(&misaligned[0]))%8, misalignedErr)
+	if err := validateWindowsConditionalFile(file); err != nil {
+		t.Fatal("ordinary stream matrix rejected", err)
+	}
+	if err := os.WriteFile(path+":hidden", []byte("must not be silently lost"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateWindowsConditionalFile(file); err == nil || !strings.Contains(err.Error(), "does not support alternate data streams") {
+		t.Fatal("ADS was not rejected by the parsed stream matrix", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || string(data) != "ordinary single unnamed stream" {
+		t.Fatal("stream preflight mutated content", err)
+	}
+}
 
 func TestWindowsDACLStatesAndACEOrder(t *testing.T) {
 	type fingerprint struct {

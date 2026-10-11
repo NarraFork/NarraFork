@@ -1,0 +1,15 @@
+{
+	"purpose": "unit_test_only_not_native",
+	"publicKey": "658QufSbZovSbvsjp24omWTyPB6FOeU4gFmJ5nIy1O4",
+	"signature": "EzoMkkIsU9VFFuYh6bhUe38V2stc7PdNIlDc5blU4ifOq04vwmVD4O8LStA0rDQ2V_x94cmyYCIHBYoQk8ahDw",
+	"canonicalPayload": "{\"action\":\"capture_exact\",\"actorSubjectKey\":\"human:test-user\",\"budgetClass\":\"metadata\",\"captureProofId\":null,\"challengeNonce\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\",\"connectionId\":\"connection-test\",\"deviceId\":\"device-test\",\"executorSourceId\":\"executor-test\",\"expectedCurrentContentHash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"expectedCurrentMetadataHash\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"expiresAt\":1700000030000,\"fence\":42,\"helperInstanceId\":\"helper-test\",\"issuedAt\":1700000000000,\"issuer\":\"control-test-issuer\",\"keyEpoch\":1,\"leaseId\":\"lease-test\",\"narratorId\":\"narrator-test\",\"nonce\":\"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB\",\"operationId\":\"operation-test\",\"originRefHash\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"parent\":{\"creationTime\":\"133700000000000000\",\"fileId\":\"root-id\",\"pathKey\":\"C:\\\\工作区\",\"volumeId\":\"volume-c\"},\"preparedObjectId\":null,\"projectId\":\"project-test\",\"recoveryOriginal\":null,\"requestDigest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"root\":{\"creationTime\":\"133700000000000000\",\"fileId\":\"root-id\",\"pathKey\":\"C:\\\\工作区\",\"volumeId\":\"volume-c\"},\"runtimeGeneration\":7,\"scopeId\":\"scope-test\",\"serviceId\":\"control-test-service\",\"sessionId\":\"session-test\",\"target\":{\"creationTime\":\"133700000000000000\",\"fileId\":\"0123456789abcdef0123456789abcdef\",\"pathKey\":\"C:\\\\工作区\\\\original.txt\",\"volumeId\":\"volume-c\"},\"version\":1}",
+	"proof": {
+		"version": 1,
+		"helperInstanceId": "helper-test",
+		"keyEpoch": 1,
+		"recordId": "record-test",
+		"recordNonce": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC",
+		"recordDigest": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+		"signature": "sTIur1Rb6Vl3GxNJXNzd-GkqtFI1Vocsx5YFN6w-6C2LMM4ndfYFUeQkGJUpjDV-i1tA5yJBShs5RTH041_2CQ"
+	}
+}

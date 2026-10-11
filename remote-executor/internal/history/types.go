@@ -69,11 +69,14 @@ type Object struct {
 }
 
 type State struct {
-	Incarnation string  `json:"incarnation,omitempty"`
-	Metadata    *Object `json:"metadata,omitempty"`
-	Kind        string  `json:"kind"`
-	Object      *Object `json:"object,omitempty"`
-	Mode        uint32  `json:"mode,omitempty"`
+	// Exact restorable v2 matrix digest, generated only from a verified helper
+	// original record. This is never standalone IO authority or a no-dispatch proof.
+	NativeMetadataFingerprint string  `json:"nativeMetadataFingerprint,omitempty"`
+	Incarnation               string  `json:"incarnation,omitempty"`
+	Metadata                  *Object `json:"metadata,omitempty"`
+	Kind                      string  `json:"kind"`
+	Object                    *Object `json:"object,omitempty"`
+	Mode                      uint32  `json:"mode,omitempty"`
 }
 
 type Change struct {

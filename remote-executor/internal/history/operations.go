@@ -10,8 +10,11 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"time"
+
+	"github.com/narrafork/remote-executor/internal/windowsbackup"
 )
 
 func (m *Manager) fault(phase string) error {
@@ -26,6 +29,7 @@ func boundedContext(ctx context.Context, duration time.Duration) (context.Contex
 }
 
 func (m *Manager) observe(ctx context.Context, b Binding, relative string, historical ...bool) (State, error) {
+	ctx = m.NativeMetadataContext(ctx, b)
 	validate := m.validate
 	if len(historical) > 0 && historical[0] {
 		validate = m.validateHistorical
@@ -60,7 +64,7 @@ func (m *Manager) observe(ctx context.Context, b Binding, relative string, histo
 	if info.Size() > BlobBytes {
 		return State{}, fmt.Errorf("too_large")
 	}
-	f, err := os.Open(path)
+	f, err := windowsbackup.OpenObservation(path)
 	if err != nil {
 		return State{}, err
 	}
@@ -119,7 +123,14 @@ func (m *Manager) observe(ctx context.Context, b Binding, relative string, histo
 		if err != nil {
 			return State{}, err
 		}
-		if !bytes.Equal(rechecked, metadata) {
+		equal := bytes.Equal(rechecked, metadata)
+		if runtime.GOOS == "windows" {
+			equal, err = windowsbackup.EquivalentMetadata(ctx, metadata, rechecked)
+			if err != nil {
+				return State{}, err
+			}
+		}
+		if !equal {
 			return State{}, fmt.Errorf("metadata_changed")
 		}
 	}
@@ -138,7 +149,14 @@ func (m *Manager) observe(ctx context.Context, b Binding, relative string, histo
 	if err != nil || checkedIncarnation != incarnation {
 		return State{}, fmt.Errorf("content_changed")
 	}
-	return State{Kind: "regular", Object: object, Mode: uint32(info.Mode().Perm()), Metadata: metadataObject, Incarnation: incarnation}, nil
+	fingerprint := ""
+	if runtime.GOOS == "windows" && metadata != nil {
+		fingerprint, err = windowsbackup.ValidatedFingerprint(ctx, metadata)
+		if err != nil {
+			return State{}, err
+		}
+	}
+	return State{Kind: "regular", Object: object, Mode: uint32(info.Mode().Perm()), Metadata: metadataObject, Incarnation: incarnation, NativeMetadataFingerprint: fingerprint}, nil
 }
 
 func stateEqual(a, b State) bool {
@@ -281,6 +299,7 @@ func (m *Manager) Mutate(ctx context.Context, req Request, kind string) (*Receip
 }
 
 func (m *Manager) mutate(ctx context.Context, req Request, kind, ignorePending string) (*Receipt, error) {
+	ctx = m.NativeMetadataContext(ctx, req.Binding)
 	r, exists, err := m.prepareRequest(req, kind)
 	if err != nil || exists {
 		return r, err
@@ -513,6 +532,16 @@ func (m *Manager) nativeRequest(ctx context.Context, b Binding, effect Effect) (
 		return NativeApplyRequest{}, err
 	}
 	request := NativeApplyRequest{Path: path, Before: effect.Before, Desired: effect.Intended, PrivateRecoveryDirectory: filepath.Join(m.dir, "recovery")}
+	if m.recoveryDirectory != nil {
+		recovery, err := m.recoveryDirectory(ctx, b, path)
+		if err != nil {
+			return NativeApplyRequest{}, err
+		}
+		if !filepath.IsAbs(recovery) || within(b.Root, recovery) {
+			return NativeApplyRequest{}, fmt.Errorf("private volume vault must be outside workspace")
+		}
+		request.PrivateRecoveryDirectory = recovery
+	}
 	for _, entry := range []struct {
 		object *Object
 		bytes  *[]byte

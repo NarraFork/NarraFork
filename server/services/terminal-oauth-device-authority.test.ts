@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import type { WorkspaceContext } from "@shared/workspace-context";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
@@ -132,6 +132,9 @@ mock.module("./device-connection-service", () => ({
 }));
 mock.module("../terminal/runtime-remote", () => ({
 	REMOTE_PTY_READY_FEATURE: "pty.ready.v1",
+	REMOTE_PTY_CONPTY_FEATURE: "pty.conpty.v1",
+	REMOTE_PTY_LIFECYCLE_FEATURE: "pty.lifecycle-evidence.v1",
+	REMOTE_PTY_BOUNDED_IO_FEATURE: "pty.bounded-io.v1",
 	spawnRemotePty: nativePty,
 }));
 mock.module("../terminal/runtime-bun", () => ({ spawnBunTerminal: hostPty }));
@@ -149,6 +152,9 @@ mock.module("../terminal/buffer-manager", () => ({
 		startPeriodicFlush() {}
 		async dispose() {}
 		async resize() {}
+		async loadFromDisk() {
+			return true;
+		}
 		getContents = readBuffer;
 		getState() {
 			return { mouseTracking: false, cursorVisible: true };
@@ -388,7 +394,7 @@ describe("live OAuth-owned device Terminal ceiling through production HTTP/WS", 
 		expect(registerTerminalActivity).not.toHaveBeenCalled();
 		expect(nativePty).not.toHaveBeenCalled();
 	});
-	test("readOnly subscribe cannot reattach a detached terminal or read its buffer", async () => {
+	test("readOnly subscribe only reads existing remote scrollback and never reattaches or fabricates readiness", async () => {
 		const id = generateId();
 		await db.insert(schema.terminals).values({
 			id,
@@ -401,17 +407,32 @@ describe("live OAuth-owned device Terminal ceiling through production HTTP/WS", 
 		});
 		await setLevel("readOnly");
 		const s = socket();
-		await handleTerminalWS.message(s.ws, { type: "subscribe", terminalIds: [id] });
-		expect(s.ws.data.subscribedTerminals.has(id)).toBe(false);
-		expect(s.frames).toContainEqual(
-			expect.objectContaining({
-				type: "error",
-				code: "DEVICE_SCOPE_FORBIDDEN",
-			}),
-		);
-		expect(readBuffer).not.toHaveBeenCalled();
-		expect(nativePty).not.toHaveBeenCalled();
-		expect(hostPty).not.toHaveBeenCalled();
+		const attach = spyOn(terminalService, "ensureAttached");
+		try {
+			await handleTerminalWS.message(s.ws, { type: "subscribe", terminalIds: [id] });
+			expect(s.ws.data.subscribedTerminals.has(id)).toBe(true);
+			expect(s.frames).toContainEqual(
+				expect.objectContaining({ type: "scrollback", data: "original scrollback" }),
+			);
+			expect(s.frames).toContainEqual(
+				expect.objectContaining({ type: "lifecycle", state: "unknown", code: null }),
+			);
+			expect(s.frames.some((frame) => frame.type === "exit")).toBe(false);
+			expect(attach).not.toHaveBeenCalled();
+			expect(nativePty).not.toHaveBeenCalled();
+			expect(hostPty).not.toHaveBeenCalled();
+			await handleTerminalWS.message(s.ws, {
+				type: "input",
+				terminalId: id,
+				data: "echo forbidden\r",
+			});
+			expect(write).not.toHaveBeenCalled();
+			expect(s.frames).toContainEqual(
+				expect.objectContaining({ type: "error", code: "DEVICE_SCOPE_FORBIDDEN" }),
+			);
+		} finally {
+			attach.mockRestore();
+		}
 	});
 	test("live user role/narrator ACL still deny a former owner despite a stale admin session", async () => {
 		const terminal = await create();

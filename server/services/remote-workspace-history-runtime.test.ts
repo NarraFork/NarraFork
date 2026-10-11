@@ -12,8 +12,10 @@ import type {
 	RemoteHistoryReceipt,
 	RemoteHistoryState,
 } from "@shared/remote-history-protocol";
+import { SESSION_VERSION_CLAIM } from "@shared/session-auth";
 import { and, eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
+import { Hono } from "hono";
 import { sqlite as isolatedTemplate } from "../db";
 import * as relations from "../db/relations";
 import * as schema from "../db/schema";
@@ -24,6 +26,12 @@ import { editTool } from "../lib/agent/tools/edit";
 import { structSedTool } from "../lib/agent/tools/struct-sed/tool";
 import { writeTool } from "../lib/agent/tools/write";
 import type { ToolContext } from "../lib/agent/types";
+import type { AuthPrincipal } from "../middleware/auth";
+import {
+	remoteEditorSessionProvenance,
+	remoteRecoveryProvenance,
+} from "../middleware/remote-recovery-provenance";
+import { EditorDocumentJobs } from "./editor-document-jobs";
 import { LocalFileChangeRuntime } from "./file-change-runtime";
 import { createRemoteEditorAdapter } from "./remote-editor-adapter";
 import {
@@ -45,6 +53,7 @@ import {
 import { RevertHistoryCommitService } from "./revert-history-commit";
 import { type RevertPlannerAccess, RevertPlannerService } from "./revert-planner-service";
 import { RevertTransactionService } from "./revert-transaction-service";
+import * as windowsEditorPreflight from "./windows-editor-metadata-preflight";
 import { createWorkspaceWriteCoordinatorState } from "./workspace-write-coordinator";
 
 const hash = (value: string | Uint8Array) => createHash("sha256").update(value).digest("hex");
@@ -484,6 +493,7 @@ beforeEach(async () => {
 		auditRuntime,
 		backend: () => native.backend,
 		metadataStore: new SQLiteRemoteHistoryMetadataStore(db),
+		coordinatorState: createWorkspaceWriteCoordinatorState(),
 		async authorize(actor, target, _need, signal) {
 			signal.throwIfAborted();
 			checks++;
@@ -938,6 +948,490 @@ test("human editor adapter factory composes real runtime with durable owned effe
 		.get();
 	expect(attribution?.userId).toBe("alice");
 	expect(attribution?.narratorId).toBeNull();
+});
+
+function windowsEditorHttp(
+	authentication: "session" | "oauth" | "legacy" = "session",
+	jobs = new EditorDocumentJobs(),
+) {
+	native.setPathFlavor("windows");
+	const binding = {
+		deviceId: "remote-device",
+		cwd: "C:\\repo",
+		projectId: null,
+		lexicalPath: "C:\\repo\\a.txt",
+		canonicalPath: "C:\\repo\\a.txt",
+		outsideRoots: false,
+		runtimeGeneration: 7,
+		rootIdentity: "physical-root",
+	};
+	const application = new Hono();
+	application.use("*", async (c, next) => {
+		const seconds = Math.floor(Date.now() / 1000);
+		const user = {
+			sub: "alice",
+			role: "user" as const,
+			iat: seconds,
+			exp: seconds + 3600,
+			[SESSION_VERSION_CLAIM]: 0,
+		};
+		const auth: AuthPrincipal =
+			authentication === "oauth"
+				? {
+						type: "oauth",
+						user,
+						oauth: {
+							tokenId: "original-token",
+							clientId: "client",
+							oauthClientId: "client",
+							grantId: "grant",
+							refreshFamilyId: "family",
+							expiresAt: new Date(Date.now() + 3600000).toISOString(),
+							scopes: ["narrators:write"],
+						},
+					}
+				: { type: "session", user };
+		if (authentication !== "legacy") c.set("auth", auth);
+		c.set("user", user);
+		await next();
+	});
+	application.use(
+		"*",
+		authentication === "legacy" ? remoteRecoveryProvenance : remoteEditorSessionProvenance,
+	);
+	application.post("/:kind", async (c) =>
+		jobs.withIo(
+			c.get("user").sub,
+			() =>
+				withRemoteWorkspaceHistoryRuntime(registry, async () => {
+					const adapter = createProductionRemoteEditorAdapter();
+					const actor = {
+						userId: c.get("user").sub,
+						narratorId: "narrator",
+						authorize: async () => binding,
+					};
+					try {
+						if (c.req.param("kind") === "source")
+							await adapter.source(
+								actor,
+								binding,
+								join(directory, "must-not-create-source"),
+								c.req.raw.signal,
+							);
+						else
+							await adapter.execute(actor, binding, {
+								requestId: "windows-http-save",
+								userId: "alice",
+								narratorId: "narrator",
+								cwd: binding.cwd,
+								lexicalPath: binding.lexicalPath,
+								canonicalPath: binding.canonicalPath,
+								input: { contentDigest: hash("new\n") },
+								signal: c.req.raw.signal,
+								authorize: async () => {},
+								construct: () => ({
+									nextBytes: Buffer.from("new\n"),
+									lineStats: null,
+									result: { hash: hash("new\n"), bytes: 4 },
+								}),
+							});
+						return c.json({ allowed: true });
+					} catch (error) {
+						return c.json({
+							allowed: false,
+							message: error instanceof Error ? error.message : "failure",
+							code: (error as { code?: string }).code ?? "internal",
+						});
+					}
+				}),
+			c.req.raw.signal,
+		),
+	);
+	return application;
+}
+
+test("actual queued Windows save preparing provenance belongs to B, not A's live session", async () => {
+	const jobs = new EditorDocumentJobs();
+	let release: () => void = () => {},
+		started: () => void = () => {},
+		submitted: () => void = () => {};
+	const gate = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	const occupying = new Promise<void>((resolve) => {
+		started = resolve;
+	});
+	const queued = new Promise<void>((resolve) => {
+		submitted = resolve;
+	});
+	const originalWithIo = jobs.withIo.bind(jobs);
+	let entries = 0;
+	const observeQueue = spyOn(jobs, "withIo").mockImplementation(
+		<T>(user: string, body: (bounded: AbortSignal) => Promise<T>, external?: AbortSignal) => {
+			const pending = originalWithIo(user, body, external);
+			if (++entries === 2) submitted();
+			return pending;
+		},
+	);
+	const aExpiry = Math.floor(Date.now() / 1000) + 7200;
+	const first = new Hono();
+	first.use("*", async (c, next) => {
+		const auth: AuthPrincipal = {
+			type: "session",
+			user: {
+				sub: "alice",
+				role: "user",
+				iat: Math.floor(Date.now() / 1000),
+				exp: aExpiry,
+				[SESSION_VERSION_CLAIM]: 0,
+			},
+		};
+		c.set("auth", auth);
+		c.set("user", auth.user);
+		await next();
+	});
+	first.use("*", remoteEditorSessionProvenance);
+	first.post("/hold", async (c) => {
+		await jobs.withIo("alice", async () => {
+			started();
+			await gate;
+		});
+		return c.json({ okay: true });
+	});
+	try {
+		const firstRequest = first.request("/hold", { method: "POST" });
+		await occupying;
+		const second = windowsEditorHttp("session", jobs).request("/save", { method: "POST" });
+		await queued;
+		release();
+		const [a, b] = await Promise.all([firstRequest, second]);
+		expect(a.status).toBe(200);
+		expect(await b.json()).toHaveProperty("code", "EDITOR_WINDOWS_METADATA_NOT_READY");
+		const operation = db.select().from(schema.fileChangeOperations).get();
+		if (!operation) throw new Error("B preparing provenance missing");
+		const persisted = operation.actorJson as typeof operation.actorJson & {
+			recoveryAuth?: { expiresAtSeconds: number };
+		};
+		expect(persisted.recoveryAuth?.expiresAtSeconds).toBeLessThan(aExpiry - 3000);
+		expect(persisted.recoveryAuth?.expiresAtSeconds).toBeGreaterThan(Math.floor(Date.now() / 1000));
+		expect(operation?.sourceId).toBe("windows-http-save");
+		expect(native.calls).not.toContain("inspect");
+		expect(native.calls).not.toContain("mutate");
+	} finally {
+		release();
+		observeQueue.mockRestore();
+	}
+});
+
+test("Windows HTTP save has new preparing and held lease before fixed preflight; no metadata calls", async () => {
+	const application = windowsEditorHttp();
+	let checked = false;
+	const originalPreflight = windowsEditorPreflight.preflightWindowsEditorMetadata;
+	const observer = spyOn(
+		windowsEditorPreflight,
+		"preflightWindowsEditorMetadata",
+	).mockImplementation(async (input) => {
+		const rows = db
+			.select()
+			.from(schema.fileChangeOperations)
+			.where(eq(schema.fileChangeOperations.sourceId, "windows-http-save"))
+			.all();
+		expect(rows).toHaveLength(1);
+		const operation = rows[0];
+		expect(operation.id).not.toBe(operation.sourceId);
+		expect(operation.settlement).toBe("preparing");
+		expect(operation.preparedEffectCount).toBe(0);
+		expect(operation.actorJson.subjectKey).toBe("human:alice");
+		expect(operation.actorJson).not.toHaveProperty("credentialRef");
+		const leases = db
+			.select()
+			.from(schema.workspaceWriteLeases)
+			.where(eq(schema.workspaceWriteLeases.status, "executing"))
+			.limit(2)
+			.all();
+		expect(leases).toHaveLength(1);
+		const lease = leases[0];
+		if (!operation.executionBindingJson) throw new Error("Original execution binding missing");
+		expect(lease.fencingToken).toBe(operation.executionBindingJson.fencingToken);
+		expect(lease.runtimeEpoch).toBe(operation.executionBindingJson.runtimeEpoch);
+		expect(registry.evidence.getScope(lease.scopeId)?.activeLeaseId).toBe(lease.leaseId);
+		expect(registry.evidence.getScope(lease.scopeId)?.sourceInstanceId).toBe(
+			operation.sourceInstanceId,
+		);
+		expect(db.select().from(schema.fileChangeEffects).all()).toHaveLength(0);
+		checked = true;
+		return originalPreflight(input);
+	});
+	try {
+		const response = await application.request("/save", { method: "POST" });
+		expect(await response.json()).toHaveProperty("code", "EDITOR_WINDOWS_METADATA_NOT_READY");
+		expect(checked).toBe(true);
+		const operation = db.select().from(schema.fileChangeOperations).get();
+		expect(operation?.settlement).toBe("settled");
+		expect(operation?.effectOutcome).toBe("no_change");
+		expect(operation?.preparedEffectCount).toBe(0);
+		expect(operation?.reason).toBe("no_dispatch:validation_rejected");
+		expect(
+			native.calls.filter((kind) =>
+				["inspect", "objectStage", "mutate", "restore", "compensate"].includes(kind),
+			),
+		).toHaveLength(0);
+		expect(native.plainWrites).toBe(0);
+		expect(
+			db
+				.select()
+				.from(schema.workspaceWriteLeases)
+				.all()
+				.every((lease) => lease.status === "settled"),
+		).toBe(true);
+		expect(Buffer.from(native.files.get("a.txt") as Uint8Array).toString()).toBe("old\n");
+	} finally {
+		observer.mockRestore();
+	}
+});
+
+test("Windows readonly HTTP source denies before inspect and creates no write intent or lease", async () => {
+	const response = await windowsEditorHttp().request("/source", { method: "POST" });
+	expect(await response.json()).toHaveProperty("code", "EDITOR_WINDOWS_METADATA_NOT_READY");
+	expect(native.calls).not.toContain("inspect");
+	expect(native.calls).not.toContain("objectRead");
+	expect(db.select().from(schema.fileChangeOperations).all()).toHaveLength(0);
+	expect(db.select().from(schema.workspaceWriteLeases).all()).toHaveLength(0);
+	expect(native.plainWrites).toBe(0);
+});
+
+for (const authentication of ["legacy", "oauth"] as const)
+	test(`Windows ${authentication} editor cannot borrow a HTTP session origin`, async () => {
+		const application = windowsEditorHttp(authentication);
+		for (const kind of ["source", "save"] as const) {
+			const response = await application.request(`/${kind}`, { method: "POST" });
+			expect(await response.json()).toHaveProperty(
+				"code",
+				authentication === "oauth"
+					? "EDITOR_SESSION_ORIGIN_UNSUPPORTED"
+					: "EDITOR_SESSION_ORIGIN_MISSING",
+			);
+		}
+		expect(db.select().from(schema.fileChangeOperations).all()).toHaveLength(0);
+		expect(native.calls).not.toContain("inspect");
+		expect(native.calls).not.toContain("mutate");
+		expect(native.plainWrites).toBe(0);
+	});
+
+test("retry of old Windows editor attempt never closes it or dispatches again", async () => {
+	const application = windowsEditorHttp();
+	await application.request("/save", { method: "POST" });
+	const operation = db.select().from(schema.fileChangeOperations).get();
+	if (!operation) throw new Error("New preparation missing");
+	db.update(schema.fileChangeOperations)
+		.set({
+			settlement: "reconcile_required",
+			executionOutcome: "running",
+			reason: "original-unknown",
+		})
+		.where(eq(schema.fileChangeOperations.id, operation.id))
+		.run();
+	const before = registry.evidence.getOperation(operation.id);
+	const response = await application.request("/save", { method: "POST" });
+	expect(await response.json()).toHaveProperty("allowed", false);
+	expect(registry.evidence.getOperation(operation.id)).toEqual(before);
+	expect(native.calls).not.toContain("inspect");
+	expect(native.calls).not.toContain("mutate");
+	expect(db.select().from(schema.fileChangeOperations).all()).toHaveLength(1);
+});
+
+test("Windows session revoked after preparing closes only the new unattempted intent", async () => {
+	const application = windowsEditorHttp();
+	const original = windowsEditorPreflight.preflightWindowsEditorMetadata;
+	const revoke = spyOn(windowsEditorPreflight, "preflightWindowsEditorMetadata").mockImplementation(
+		async (input) => {
+			db.update(schema.users).set({ tokenVersion: 1 }).where(eq(schema.users.id, "alice")).run();
+			return original(input);
+		},
+	);
+	try {
+		const response = await application.request("/save", { method: "POST" });
+		expect(await response.json()).toHaveProperty("code", "EDITOR_SESSION_ORIGIN_REVOKED");
+		expect(db.select().from(schema.fileChangeOperations).get()?.settlement).toBe("settled");
+		expect(db.select().from(schema.fileChangeEffects).all()).toHaveLength(0);
+		expect(native.calls).not.toContain("inspect");
+		expect(native.calls).not.toContain("mutate");
+	} finally {
+		revoke.mockRestore();
+	}
+});
+
+test("Windows generation changes after preparing cannot close or dispatch the original intent", async () => {
+	const application = windowsEditorHttp();
+	const original = windowsEditorPreflight.preflightWindowsEditorMetadata;
+	const change = spyOn(windowsEditorPreflight, "preflightWindowsEditorMetadata").mockImplementation(
+		async (input) => {
+			native.setGeneration(8);
+			return original(input);
+		},
+	);
+	try {
+		const response = await application.request("/save", { method: "POST" });
+		expect(await response.json()).toHaveProperty("allowed", false);
+		expect(db.select().from(schema.fileChangeOperations).get()?.settlement).toBe("preparing");
+		expect(
+			db
+				.select()
+				.from(schema.workspaceWriteLeases)
+				.all()
+				.some((lease) => lease.status === "quarantined"),
+		).toBe(true);
+		expect(native.calls).not.toContain("inspect");
+		expect(native.calls).not.toContain("mutate");
+	} finally {
+		change.mockRestore();
+	}
+});
+
+test("Windows real scope fence changes after preparing preserve the original barrier", async () => {
+	const application = windowsEditorHttp();
+	const original = windowsEditorPreflight.preflightWindowsEditorMetadata;
+	const change = spyOn(windowsEditorPreflight, "preflightWindowsEditorMetadata").mockImplementation(
+		async (input) => {
+			const scope = db
+				.select({ id: schema.fileChangeScopes.id, fence: schema.fileChangeScopes.fencingToken })
+				.from(schema.fileChangeScopes)
+				.limit(1)
+				.get();
+			if (!scope) throw new Error("Original scope missing");
+			db.update(schema.fileChangeScopes)
+				.set({ fencingToken: scope.fence + 1 })
+				.where(eq(schema.fileChangeScopes.id, scope.id))
+				.run();
+			return original(input);
+		},
+	);
+	try {
+		const response = await application.request("/save", { method: "POST" });
+		expect(await response.json()).toHaveProperty("allowed", false);
+		expect(db.select().from(schema.fileChangeOperations).get()?.settlement).toBe("preparing");
+		const leases = db.select().from(schema.workspaceWriteLeases).all();
+		expect(leases).toHaveLength(1);
+		const retained = leases[0];
+		expect(["executing", "quarantined"]).toContain(retained.status);
+		expect(registry.evidence.getScope(retained.scopeId)?.activeLeaseId).toBe(retained.leaseId);
+		expect(native.calls).not.toContain("inspect");
+		expect(native.calls).not.toContain("mutate");
+	} finally {
+		change.mockRestore();
+	}
+});
+
+for (const defect of ["missing-row", "owner-epoch", "active-lease", "source"] as const)
+	test(`Windows original durable ${defect} failure cannot settle preparing`, async () => {
+		const application = windowsEditorHttp();
+		const original = windowsEditorPreflight.preflightWindowsEditorMetadata;
+		let actualLeaseId = "";
+		let actualScopeId = "";
+		const change = spyOn(
+			windowsEditorPreflight,
+			"preflightWindowsEditorMetadata",
+		).mockImplementation(async (input) => {
+			const held = db
+				.select()
+				.from(schema.workspaceWriteLeases)
+				.where(eq(schema.workspaceWriteLeases.status, "executing"))
+				.get();
+			if (!held) throw new Error("Held lease missing before fault");
+			actualLeaseId = held.leaseId;
+			actualScopeId = held.scopeId;
+			if (defect === "missing-row")
+				db.delete(schema.workspaceWriteLeases)
+					.where(eq(schema.workspaceWriteLeases.leaseId, held.leaseId))
+					.run();
+			if (defect === "owner-epoch")
+				db.update(schema.workspaceWriteLeases)
+					.set({ ownerEpoch: "foreign-owner" })
+					.where(eq(schema.workspaceWriteLeases.leaseId, held.leaseId))
+					.run();
+			if (defect === "active-lease")
+				db.update(schema.fileChangeScopes)
+					.set({ activeLeaseId: "other-lease" })
+					.where(eq(schema.fileChangeScopes.id, held.scopeId))
+					.run();
+			if (defect === "source")
+				db.update(schema.fileChangeScopes)
+					.set({ sourceInstanceId: "foreign-source" })
+					.where(eq(schema.fileChangeScopes.id, held.scopeId))
+					.run();
+			return original(input);
+		});
+		try {
+			const response = await application.request("/save", { method: "POST" });
+			expect(await response.json()).toHaveProperty("allowed", false);
+			expect(db.select().from(schema.fileChangeOperations).get()?.settlement).toBe("preparing");
+			const retainedScope = registry.evidence.getScope(actualScopeId);
+			expect(retainedScope?.activeLeaseId).toBe(
+				defect === "active-lease" ? "other-lease" : actualLeaseId,
+			);
+			expect(native.calls).not.toContain("inspect");
+			expect(native.calls).not.toContain("mutate");
+			expect(native.plainWrites).toBe(0);
+		} finally {
+			change.mockRestore();
+		}
+	});
+
+test("changed Windows preparation state cannot be closed by a no-native preflight error", async () => {
+	const application = windowsEditorHttp();
+	const original = windowsEditorPreflight.preflightWindowsEditorMetadata;
+	const change = spyOn(windowsEditorPreflight, "preflightWindowsEditorMetadata").mockImplementation(
+		async (input) => {
+			db.update(schema.fileChangeOperations).set({ settlement: "reconcile_required" }).run();
+			return original(input);
+		},
+	);
+	try {
+		const response = await application.request("/save", { method: "POST" });
+		expect(await response.json()).toHaveProperty("allowed", false);
+		expect(db.select().from(schema.fileChangeOperations).get()?.settlement).toBe(
+			"reconcile_required",
+		);
+		expect(
+			db
+				.select()
+				.from(schema.workspaceWriteLeases)
+				.all()
+				.some((lease) => lease.status === "quarantined"),
+		).toBe(true);
+		expect(native.calls).not.toContain("inspect");
+		expect(native.calls).not.toContain("mutate");
+	} finally {
+		change.mockRestore();
+	}
+});
+
+test("Windows preparation settlement failure retains the new intent and barrier", async () => {
+	const application = windowsEditorHttp();
+	const failure = spyOn(registry.evidence, "finishPreparationWithoutDispatch").mockImplementation(
+		() => {
+			throw new Error("Injected preparation settlement failure");
+		},
+	);
+	try {
+		const response = await application.request("/save", { method: "POST" });
+		expect(await response.json()).toHaveProperty(
+			"message",
+			"Injected preparation settlement failure",
+		);
+		expect(db.select().from(schema.fileChangeOperations).get()?.settlement).toBe("preparing");
+		expect(
+			db
+				.select()
+				.from(schema.workspaceWriteLeases)
+				.all()
+				.some((lease) => lease.status === "quarantined"),
+		).toBe(true);
+		expect(native.calls).not.toContain("inspect");
+		expect(native.calls).not.toContain("mutate");
+	} finally {
+		failure.mockRestore();
+	}
 });
 
 async function preparedRemoteHistoryDelete(twoFiles = false) {

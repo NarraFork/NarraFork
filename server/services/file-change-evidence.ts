@@ -702,6 +702,21 @@ export class FileChangeEvidenceService {
 	}
 
 	beginOperation(input: BeginFileChangeOperation): FileChangeOperationRecord {
+		return this.beginPreparingOperation(input, false);
+	}
+
+	/** Root-committed NEW single-file preparation. Success owns only this new intent,
+	 * not native dispatch; an existing source tuple can never become cleanup ownership. */
+	beginNewPreparingOperation(input: BeginFileChangeOperation): FileChangeOperationRecord {
+		if (input.expectedEffectCount !== 1)
+			throw fail("INVALID_INPUT", "New pre-observation preparation requires exactly one effect");
+		return this.beginPreparingOperation(input, true);
+	}
+
+	private beginPreparingOperation(
+		input: BeginFileChangeOperation,
+		onlyNew: boolean,
+	): FileChangeOperationRecord {
 		const values = normalizeOperation(input);
 		return this.transaction((tx) => {
 			const existing = tx
@@ -717,6 +732,11 @@ export class FileChangeEvidenceService {
 				)
 				.get();
 			if (existing) {
+				if (onlyNew)
+					throw fail(
+						"REQUEST_CONFLICT",
+						"Original source attempt already exists; no new preparation ownership",
+					);
 				for (const key of Object.keys(values) as (keyof typeof values)[]) {
 					if (!jsonEqual(existing[key], values[key])) {
 						throw fail(

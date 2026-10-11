@@ -821,6 +821,149 @@ describe("explicit no-dispatch file-tool evidence", () => {
 	});
 });
 
+describe("root-only new pre-observation preparation", () => {
+	test("new API inserts one preparing row and rejects an exact duplicate without altering it", () => {
+		const input = operationInput();
+		const created = service.beginNewPreparingOperation(input);
+		expect(created.settlement).toBe("preparing");
+		expect(created.executionOutcome).toBe("running");
+		expect(created.preparedEffectCount).toBe(0);
+		expect(created.sourceId).toBe(input.sourceId);
+		expect(created.id).not.toBe(input.sourceId);
+		const beforeClock = sqlite
+			.query<{ value: number }, []>("SELECT last_seq AS value FROM file_history_clock WHERE id=1")
+			.get()?.value;
+		expect(() => service.beginNewPreparingOperation(input)).toThrow("already exists");
+		expect(service.getOperation(created.id)).toEqual(created);
+		expect(
+			sqlite
+				.query<{ value: number }, []>("SELECT last_seq AS value FROM file_history_clock WHERE id=1")
+				.get()?.value,
+		).toBe(beforeClock);
+		expect(service.beginOperation(input).id).toBe(created.id);
+	});
+	test("existing unknown attempt cannot be reclaimed by the new API", () => {
+		const input = operationInput();
+		const created = service.beginOperation(input);
+		db.update(fileChangeOperations)
+			.set({ settlement: "reconcile_required" })
+			.where(eq(fileChangeOperations.id, created.id))
+			.run();
+		const original = service.getOperation(created.id);
+		expect(() => service.beginNewPreparingOperation(input)).toThrow("already exists");
+		expect(service.getOperation(created.id)).toEqual(original);
+	});
+	for (const settlement of ["applying", "settled"] as const)
+		test(`existing ${settlement} tuple is never a new preparation`, () => {
+			const input = operationInput();
+			const created = service.beginOperation(input);
+			db.update(fileChangeOperations)
+				.set({ settlement })
+				.where(eq(fileChangeOperations.id, created.id))
+				.run();
+			const original = service.getOperation(created.id);
+			const priorClock = sqlite.query("SELECT * FROM file_history_clock WHERE id=1").get();
+			expect(() => service.beginNewPreparingOperation(input)).toThrow("already exists");
+			expect(service.getOperation(created.id)).toEqual(original);
+			expect(sqlite.query("SELECT * FROM file_history_clock WHERE id=1").get()).toEqual(priorClock);
+		});
+	for (const changed of ["actor", "digest", "binding"] as const)
+		test(`existing tuple with changed ${changed} cannot be replaced`, () => {
+			const input = operationInput();
+			const created = service.beginOperation(input);
+			const updated = {
+				...input,
+				...(changed === "actor"
+					? { actor: { ...input.actor, label: "different requester label" } }
+					: {}),
+				...(changed === "digest" ? { requestDigest: hash("different request") } : {}),
+				...(changed === "binding"
+					? {
+							executionBinding: {
+								...input.executionBinding,
+								fencingToken: input.executionBinding.fencingToken + 1,
+							},
+						}
+					: {}),
+			};
+			const priorClock = sqlite.query("SELECT * FROM file_history_clock WHERE id=1").get();
+			expect(() => service.beginNewPreparingOperation(updated)).toThrow("already exists");
+			expect(service.getOperation(created.id)).toEqual(created);
+			expect(sqlite.query("SELECT * FROM file_history_clock WHERE id=1").get()).toEqual(priorClock);
+		});
+	test("new preparation insert failure rolls back its row and journal clock", () => {
+		const input = operationInput({ sourceId: "failed-new-preparation" });
+		const clockBefore = sqlite.query("SELECT * FROM file_history_clock WHERE id=1").get();
+		sqlite.exec(
+			"CREATE TEMP TRIGGER failed_new_editor BEFORE INSERT ON file_change_operations WHEN NEW.source_id='failed-new-preparation' BEGIN SELECT RAISE(ABORT, 'injected new preparation failure'); END",
+		);
+		try {
+			expect(() => service.beginNewPreparingOperation(input)).toThrow(
+				"injected new preparation failure",
+			);
+			expect(sqlite.query("SELECT * FROM file_history_clock WHERE id=1").get()).toEqual(
+				clockBefore,
+			);
+			expect(
+				db
+					.select({ id: fileChangeOperations.id })
+					.from(fileChangeOperations)
+					.where(eq(fileChangeOperations.sourceId, input.sourceId))
+					.all(),
+			).toHaveLength(0);
+		} finally {
+			sqlite.exec("DROP TRIGGER failed_new_editor");
+		}
+	});
+	test("root COMMIT failure cannot return cleanup ownership or leave a clock increment", () => {
+		const input = operationInput({ sourceId: "new-commit-failure" });
+		const priorClock = sqlite.query("SELECT * FROM file_history_clock WHERE id=1").get();
+		sqlite.exec(
+			"CREATE TABLE new_editor_commit_guard (id TEXT PRIMARY KEY, user_id TEXT REFERENCES users(id))",
+		);
+		sqlite.exec(
+			"CREATE TEMP TRIGGER new_editor_commit_fault AFTER INSERT ON file_change_operations WHEN NEW.source_id='new-commit-failure' BEGIN INSERT INTO new_editor_commit_guard VALUES('invalid', 'missing-user'); END",
+		);
+		sqlite.exec("PRAGMA defer_foreign_keys=ON");
+		try {
+			expect(() => service.beginNewPreparingOperation(input)).toThrow();
+			expect(sqlite.inTransaction).toBe(false);
+			expect(sqlite.query("SELECT * FROM file_history_clock WHERE id=1").get()).toEqual(priorClock);
+			expect(
+				db
+					.select()
+					.from(fileChangeOperations)
+					.where(eq(fileChangeOperations.sourceId, input.sourceId))
+					.all(),
+			).toHaveLength(0);
+		} finally {
+			sqlite.exec(
+				"DROP TRIGGER new_editor_commit_fault; DROP TABLE new_editor_commit_guard; PRAGMA defer_foreign_keys=OFF",
+			);
+		}
+	});
+	test("new API rejects zero/widened effects, ambient root and same-connection savepoints", () => {
+		for (const expectedEffectCount of [0, 2])
+			expect(() =>
+				service.beginNewPreparingOperation(operationInput({ expectedEffectCount })),
+			).toThrow("exactly one");
+		const input = operationInput();
+		expect(() => db.transaction(() => service.beginNewPreparingOperation(input))).toThrow(
+			"ambient transaction",
+		);
+		expect(() =>
+			db.transaction((tx) => tx.transaction(() => service.beginNewPreparingOperation(input))),
+		).toThrow("ambient transaction");
+		expect(
+			db
+				.select({ id: fileChangeOperations.id })
+				.from(fileChangeOperations)
+				.where(eq(fileChangeOperations.sourceId, input.sourceId))
+				.all(),
+		).toHaveLength(0);
+	});
+});
+
 describe("durable scope and operation identity", () => {
 	test("scopes default unverified and preparing effects do not enable execution", async () => {
 		expect(scope.status).toBe("needs_verification");

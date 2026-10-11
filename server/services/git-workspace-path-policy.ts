@@ -9,12 +9,27 @@ export function gitPathPolicyAllows(
 	need: "read" | "write",
 ): boolean {
 	const paths = context.paths;
+	if (paths.nativeProofRequired) {
+		for (const path of [
+			root,
+			...[...policy.directoryBlacklist, ...policy.directoryWhitelist]
+				.filter((rule) => rule.enabled && rule.pathFlavor === paths.flavor)
+				.map((rule) => rule.path),
+		]) {
+			if (!paths.nativeDescriptor?.(path))
+				throw new Error(
+					"NATIVE_PATH_CAPABILITY_NOT_READY: Git tree policy lacks an original native root/rule proof",
+				);
+		}
+	}
+	const denyContains = (parent: string, child: string) =>
+		paths.containsDenied?.(parent, child) ?? paths.contains(parent, child);
 	if (
 		policy.directoryBlacklist.some(
 			(rule) =>
 				rule.enabled &&
 				(rule.denyLevel === "denyAll" || need === "write") &&
-				(paths.contains(root, rule.path) || paths.contains(rule.path, root)),
+				(paths.contains(root, rule.path) || denyContains(rule.path, root)),
 		)
 	)
 		return false;

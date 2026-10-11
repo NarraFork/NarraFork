@@ -24,9 +24,20 @@ import (
 	"github.com/narrafork/remote-executor/internal/history"
 	"github.com/narrafork/remote-executor/internal/rpc"
 	"github.com/narrafork/remote-executor/internal/transport"
+	"github.com/narrafork/remote-executor/internal/winpty"
 )
 
 func main() {
+	// Internal worker isolation must run before SCM, config, credential reads or transport.
+	if handled, code := winpty.RunWorker(os.Args[1:]); handled {
+		os.Exit(code)
+	}
+	if handled, err := runFirstCaptureHelperMode(context.Background(), os.Args[1:]); handled {
+		if err != nil {
+			log.Fatal("Windows capture-only helper configuration/startup unavailable")
+		}
+		return
+	}
 	if len(os.Args) == 2 && (os.Args[1] == "--version" || os.Args[1] == "version") {
 		fmt.Printf("narrafork-executor %s\n", buildinfo.String())
 		return
@@ -85,6 +96,12 @@ func run(ctx context.Context, ready func()) error {
 	}
 
 	h := handlers.NewWithOptions(guard, 10*1024*1024, cfg.DisableShell)
+	firstCleanup, firstErr := h.ConfigureWindowsFirstCapture(ctx, cfg.WindowsFirstCaptureEnrollmentFile)
+	if firstErr != nil {
+		log.Printf("Windows first-capture primitive unavailable: administrator enrollment/configuration not ready")
+	} else {
+		defer firstCleanup()
+	}
 	historyManager, err := history.New(filepath.Join(cfg.StateDir, "history"), func(path string, create bool) (string, error) {
 		if create {
 			return guard.CheckCreate(path)
@@ -130,13 +147,29 @@ func run(ctx context.Context, ready func()) error {
 			rpc.FeatureHistoryV1,
 			rpc.FeatureHistoryCaptureTreeV1,
 			rpc.FeatureHistoryObjectStageV1,
-			rpc.FeatureHistoryNativeMetadataV1,
 			rpc.FeatureWorkspaceAttachmentV1,
 			rpc.FeatureGitWorktreeV1,
 			rpc.FeatureShareArchiveV1,
 			"transfer.upload-content-identity.v1",
-			"pty.ready-stream.v1",
 		},
+	}
+	// API presence is not per-root/full-metadata readiness. Windows v2 metadata
+	// is advertised only after its configured proof channel validates, never from OS alone.
+	if runtime.GOOS != "windows" {
+		caps.Features = append(caps.Features, rpc.FeatureHistoryNativeMetadataV1)
+	} else {
+		// Implementation support only. Missing admin material remains ErrNotReady;
+		// no editor/source/vault/metadata-v2/defaultFull readiness is advertised.
+		caps.Features = append(caps.Features, rpc.FeatureWindowsFirstCaptureV1)
+	}
+	if handlers.NativePathV2APIReady() {
+		caps.Features = append(caps.Features, rpc.FeatureFsPathResolveV2)
+	}
+	if caps.Pty {
+		caps.Features = append(caps.Features, "pty.ready-stream.v1")
+		if runtime.GOOS == "windows" {
+			caps.Features = append(caps.Features, rpc.FeaturePtyConptyV1, rpc.FeaturePtyLifecycleEvidenceV1, rpc.FeaturePtyBoundedIOV1)
+		}
 	}
 
 	// Signal handling belongs to the console path only. Under the SCM, shutdown

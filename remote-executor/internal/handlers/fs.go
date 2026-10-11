@@ -84,6 +84,9 @@ func (h *Handlers) openReadFile(params map[string]any) (*os.File, string, error)
 	if err != nil {
 		return nil, "", err
 	}
+	if err := h.ValidateExpectedNativeDescriptor(context.Background(), params, resolvedPath, "existing"); err != nil {
+		return nil, "", err
+	}
 
 	expectedPath := stringParam(params, "expectedResolvedPath")
 	if expectedPath != "" {
@@ -108,6 +111,10 @@ func (h *Handlers) openReadFile(params map[string]any) (*os.File, string, error)
 	}
 	f, err := os.OpenFile(resolvedPath, flags, 0)
 	if err != nil {
+		return nil, "", err
+	}
+	if err := h.ValidateNativeOpenedFileV2(context.Background(), params, resolvedPath, f); err != nil {
+		f.Close()
 		return nil, "", err
 	}
 	if expectedPath == "" {
@@ -294,6 +301,9 @@ func (h *Handlers) FsWriteContext(ctx context.Context, params map[string]any) (a
 	if err != nil {
 		return nil, err
 	}
+	if err := h.ValidateExpectedNativeDescriptor(ctx, params, path, "create"); err != nil {
+		return nil, err
+	}
 	expectedPath := stringParam(params, "expectedResolvedPath")
 	if expectedPath != "" {
 		expectedPath, err = absolutePath(expectedPath)
@@ -323,6 +333,12 @@ func (h *Handlers) FsWriteContext(ctx context.Context, params map[string]any) (a
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if handled, err := h.WriteNativeGuardedV2(ctx, params, path, data); handled {
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{}, nil
 	}
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
@@ -400,6 +416,14 @@ func (h *Handlers) FsWriteConditional(ctx context.Context, params map[string]any
 	if !samePath(path, expectedPath) {
 		return map[string]any{"applied": false, "conflict": true}, nil
 	}
+	if expectedMissing {
+		releaseParent, err := h.PinConditionalMissingParentV2(ctx, params, path)
+		if err != nil {
+			return nil, err
+		}
+		// Registered before temp cleanup: hold through publication and cleanup.
+		defer releaseParent()
+	}
 	var originalMetadata conditionalMetadata
 	var originalInfo os.FileInfo
 	conflict := func() (bool, os.FileMode, error) {
@@ -415,6 +439,12 @@ func (h *Handlers) FsWriteConditional(ctx context.Context, params map[string]any
 		}
 		f, _, err := h.openReadFile(params)
 		if errors.Is(err, os.ErrNotExist) {
+			if expectedMissing {
+				if err := h.ValidateExpectedNativeDescriptor(ctx, params, resolved, "create"); err != nil {
+					return false, 0, err
+				}
+				// CheckCreate above and original missing evidence must both hold.
+			}
 			return !expectedMissing || originalInfo != nil, 0o644, nil
 		}
 		if err != nil {
@@ -548,6 +578,9 @@ func (h *Handlers) FsRemoveContext(ctx context.Context, params map[string]any) (
 	if err != nil {
 		return nil, err
 	}
+	if err := h.ValidateExpectedNativeDescriptor(ctx, params, path, "remove"); err != nil {
+		return nil, err
+	}
 	info, err := os.Lstat(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -560,6 +593,12 @@ func (h *Handlers) FsRemoveContext(ctx context.Context, params map[string]any) (
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
+	}
+	if handled, err := h.RemoveNativeGuardedV2(ctx, params, path); handled {
+		if err != nil {
+			return nil, err
+		}
+		return map[string]any{}, nil
 	}
 	if err := os.Remove(path); err != nil {
 		return nil, err

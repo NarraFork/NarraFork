@@ -57,6 +57,10 @@ export class EditorDocumentJobs {
 		if (external?.aborted) return Promise.reject(external.reason);
 		if (this.queue.length >= 8)
 			return Promise.reject(new AppError("Editor IO queue is full", 429, "EDITOR_BUSY"));
+		// Capture ALL submitting request ALS stores (editor origin, recovery provenance,
+		// etc.), not only this queue's permit. Pump may run in another task's finally.
+		// Snapshot preserves references; it neither remints nor extends their live scope.
+		const submitContext = AsyncLocalStorage.snapshot();
 		return new Promise<T>((resolve, reject) => {
 			const controller = new AbortController();
 			const timer = setTimeout(() => entry.cancel(), EDITOR_IO_TIMEOUT_MS);
@@ -79,18 +83,20 @@ export class EditorDocumentJobs {
 				},
 				start: () => {
 					this.active.add(userId);
-					void this.context.run({ userId, signal }, async () => {
-						try {
-							signal.throwIfAborted();
-							resolve(await body(signal));
-						} catch (error) {
-							reject(error);
-						} finally {
-							finish();
-							this.active.delete(userId);
-							this.pump();
-						}
-					});
+					void submitContext(() =>
+						this.context.run({ userId, signal }, async () => {
+							try {
+								signal.throwIfAborted();
+								resolve(await body(signal));
+							} catch (error) {
+								reject(error);
+							} finally {
+								finish();
+								this.active.delete(userId);
+								this.pump();
+							}
+						}),
+					);
 				},
 			};
 			external?.addEventListener("abort", entry.cancel, { once: true });

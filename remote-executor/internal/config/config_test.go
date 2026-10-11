@@ -1,6 +1,8 @@
 package config
 
 import (
+	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -606,5 +608,103 @@ func TestDisableShellFlag(t *testing.T) {
 	}
 	if !cfg.DisableShell {
 		t.Error("DisableShell should be true")
+	}
+}
+
+func TestResolveDefaultCwd(t *testing.T) {
+	for _, tc := range []struct {
+		name, configured, platform, processCwd, want string
+		getwdFails                                   bool
+		wantCalls                                    int
+	}{
+		{name: "windows_unset_system32", platform: "windows", processCwd: `C:\WINDOWS\system32`, want: "", wantCalls: 0},
+		{name: "windows_unset_project", platform: "windows", processCwd: `D:\projects\unselected`, want: "", wantCalls: 0},
+		{name: "windows_explicit", configured: `D:\projects\实际项目`, platform: "windows", want: `D:\projects\实际项目`, wantCalls: 0},
+		{name: "linux_unset", platform: "linux", processCwd: "/projects/repo", want: "/projects/repo", wantCalls: 1},
+		{name: "darwin_unset", platform: "darwin", processCwd: "/projects/repo", want: "/projects/repo", wantCalls: 1},
+		{name: "linux_explicit", configured: "/selected", platform: "linux", processCwd: "/unselected", want: "/selected", wantCalls: 0},
+		{name: "getwd_failure", platform: "linux", processCwd: "/must-not-use", getwdFails: true, want: "", wantCalls: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			got := resolveDefaultCwd(tc.configured, tc.platform, func() (string, error) {
+				calls++
+				if tc.getwdFails {
+					return tc.processCwd, errors.New("cwd unavailable")
+				}
+				return tc.processCwd, nil
+			})
+			if got != tc.want || calls != tc.wantCalls {
+				t.Fatalf("cwd=%q getwdCalls=%d, want %q/%d", got, calls, tc.want, tc.wantCalls)
+			}
+		})
+	}
+}
+
+func TestLoadDefaultCwdByPlatform(t *testing.T) {
+	for _, explicit := range []bool{false, true} {
+		name := "unset"
+		if explicit {
+			name = "explicit"
+		}
+		t.Run(name, func(t *testing.T) {
+			originalArgs := os.Args
+			t.Cleanup(func() { os.Args = originalArgs })
+			os.Args = []string{"narrafork-executor", "--listen", "127.0.0.1:0", "--device", "cwd-test", "--token", "unit-cwd-token"}
+			want := ""
+			if explicit {
+				want = t.TempDir()
+				os.Args = append(os.Args, "--cwd", want)
+			} else if runtime.GOOS != "windows" {
+				var err error
+				want, err = os.Getwd()
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+			cfg, err := Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.DefaultCwd != want {
+				t.Fatalf("platform=%s configured=%t cwd=%q, want %q", runtime.GOOS, explicit, cfg.DefaultCwd, want)
+			}
+			t.Logf("platform=%s configured=%t hasDefaultCwd=%t", runtime.GOOS, explicit, cfg.DefaultCwd != "")
+		})
+	}
+}
+
+func TestLoadConfiguredCwdPreservesFileAndFlagPrecedence(t *testing.T) {
+	for _, override := range []bool{false, true} {
+		name := "config_file"
+		if override {
+			name = "flag_overrides_file"
+		}
+		t.Run(name, func(t *testing.T) {
+			configured := t.TempDir()
+			data, err := json.Marshal(map[string]string{"defaultCwd": configured})
+			if err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(t.TempDir(), "cwd-config.json")
+			if err := os.WriteFile(path, data, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			originalArgs := os.Args
+			t.Cleanup(func() { os.Args = originalArgs })
+			os.Args = []string{"narrafork-executor", "--listen", "127.0.0.1:0", "--device", "cwd-test", "--token", "unit-cwd-token", "--config", path}
+			want := configured
+			if override {
+				want = t.TempDir()
+				os.Args = append(os.Args, "--cwd", want)
+			}
+			cfg, err := Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.DefaultCwd != want {
+				t.Fatalf("cwd=%q, want %q", cfg.DefaultCwd, want)
+			}
+		})
 	}
 }

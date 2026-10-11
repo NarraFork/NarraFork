@@ -1,6 +1,7 @@
 import type { MiddlewareHandler } from "hono";
 import {
 	captureRemoteRecoveryAuthProvenance,
+	withRemoteEditorHttpSessionOrigin,
 	withRemoteRecoveryAuthProvenance,
 } from "../services/remote-history-recovery-auth";
 
@@ -13,3 +14,7 @@ export const remoteRecoveryProvenance: MiddlewareHandler = async (c, next) => {
 	if (!auth || (auth.type !== "session" && auth.type !== "oauth")) return next();
 	return withRemoteRecoveryAuthProvenance(captureRemoteRecoveryAuthProvenance(auth), next);
 };
+/** Only editor HTTP handlers receive this request-local session currency. Revert,
+ * agent and attachment routes keep their existing provenance without an editor ref. */
+export const remoteEditorSessionProvenance: MiddlewareHandler = (c, next) =>
+	withRemoteEditorHttpSessionOrigin(c, async () => remoteRecoveryProvenance(c, next));

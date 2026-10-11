@@ -5,6 +5,10 @@ export const FEATURE_REMOTE_HISTORY_V1 = "history.v1";
 export const FEATURE_REMOTE_HISTORY_CAPTURE_TREE_V1 = "history.capture-tree.v1";
 export const FEATURE_REMOTE_HISTORY_OBJECT_STAGE_V1 = "history.object-stage.v1";
 export const FEATURE_REMOTE_HISTORY_NATIVE_METADATA_V1 = "history.native-metadata.v1";
+/** Exact, helper-issued Windows metadata; legacy partial evidence is never upgraded. */
+export const FEATURE_REMOTE_HISTORY_NATIVE_METADATA_V2 = "history.native-metadata.v2";
+/** Identity-bound original objects are isolated in a private vault on their source volume. */
+export const FEATURE_REMOTE_HISTORY_VOLUME_VAULT_V1 = "history.volume-vault.v1";
 export const REMOTE_HISTORY_METADATA_TIMEOUT_MS = 10_000;
 export const REMOTE_HISTORY_OPERATION_TIMEOUT_MS = 120_000;
 
@@ -35,6 +39,8 @@ export type RemoteHistoryState =
 			object: RemoteHistoryObject;
 			mode: number;
 			metadata?: RemoteHistoryObject;
+			/** Exact v2 metadata semantics from a verified helper record, never standalone authority. */
+			nativeMetadataFingerprint?: string;
 			incarnation?: string;
 	  };
 

@@ -52,6 +52,12 @@ type connectionState struct {
 	cancelMu  sync.Mutex
 	cancels   map[string]*requestCancel
 	closeOnce sync.Once
+
+	metadataSession   *rpc.WindowsMetadataSession
+	metadataMu        sync.Mutex
+	metadataPending   map[string]*metadataPending
+	metadataAdmission chan struct{}
+	metadataWorkers   chan struct{}
 }
 
 type requestCancel struct {
@@ -106,11 +112,14 @@ func (c *Client) newConnectionState(parent context.Context, conn *websocket.Conn
 	h := c.dispatcher.Handlers().ConnectionScoped()
 	dispatcher := rpc.NewDispatcher(h)
 	state := &connectionState{
-		conn:       conn,
-		ctx:        ctx,
-		cancel:     cancel,
-		dispatcher: dispatcher,
-		cancels:    make(map[string]*requestCancel),
+		conn:              conn,
+		ctx:               ctx,
+		cancel:            cancel,
+		dispatcher:        dispatcher,
+		cancels:           make(map[string]*requestCancel),
+		metadataPending:   make(map[string]*metadataPending),
+		metadataAdmission: make(chan struct{}, metadataControlQueue),
+		metadataWorkers:   make(chan struct{}, metadataControlWorkers),
 	}
 	state.transfers = handlers.NewTransfersWithContext(ctx, h, state)
 	dispatcher.SetTransfers(state.transfers)
@@ -448,6 +457,9 @@ func (c *Client) awaitHelloAck(ctx context.Context, state *connectionState) (rpc
 			if !ack.OK {
 				return rpc.HelloAckFrame{}, fmt.Errorf("handshake rejected: %s", ack.Error)
 			}
+			if err := state.installMetadataSession(ack.WindowsMetadataSession); err != nil {
+				return rpc.HelloAckFrame{}, err
+			}
 			return ack, nil
 		case "ping":
 			if err := state.writeJSON(ctx, map[string]string{"type": "pong"}); err != nil {
@@ -494,9 +506,17 @@ func (s *connectionState) serveAuthenticated() error {
 				log.Printf("bad rpc frame: %v", err)
 				continue
 			}
+			if firstCaptureMethod(req.Method) || req.WindowsFirstCaptureOrigin != nil {
+				if err := decodeFirstCaptureFrame(data, &req); err != nil {
+					_ = s.writeJSON(s.ctx, rpc.ResultFrame{Type: "rpc_result", ID: req.ID, OK: false, Error: "WINDOWS_FIRST_CAPTURE_REQUEST_INVALID"})
+					continue
+				}
+			}
 			// Register before reading the next frame: an immediately following
 			// rpc_cancel must find this request even if its worker has not run.
 			s.handleRequest(req)
+		case "windows_metadata_callback_result":
+			s.handleMetadataResult(data)
 		case "rpc_cancel":
 			var cf rpc.CancelFrame
 			if err := json.Unmarshal(data, &cf); err == nil {
@@ -518,6 +538,12 @@ func (s *connectionState) handleRequest(req rpc.RequestFrame) {
 		return
 	}
 	if previous := s.cancels[req.ID]; previous != nil {
+		if firstCaptureMethod(req.Method) {
+			s.cancelMu.Unlock()
+			cancel()
+			_ = s.writeJSON(s.ctx, rpc.ResultFrame{Type: "rpc_result", ID: req.ID, OK: false, Error: "WINDOWS_FIRST_CAPTURE_DUPLICATE_RPC"})
+			return
+		}
 		previous.cancel()
 	}
 	s.cancels[req.ID] = entry
@@ -550,7 +576,15 @@ func (s *connectionState) runRequest(reqCtx context.Context, req rpc.RequestFram
 		})
 	}
 
-	result, err := s.dispatcher.Dispatch(reqCtx, req.Method, req.Params, stream)
+	metadataCtx := s.metadataRequestContext(reqCtx, req.ID, entry)
+	firstCtx, firstErr := s.firstCaptureRequestContext(metadataCtx, req, entry)
+	var result any
+	var err error
+	if firstErr != nil {
+		err = firstErr
+	} else {
+		result, err = s.dispatcher.Dispatch(firstCtx, req.Method, req.Params, stream)
+	}
 	if reqCtx.Err() != nil {
 		return
 	}
@@ -598,6 +632,9 @@ func (s *connectionState) close() {
 		s.authenticated.Store(false)
 		s.cancel()
 		s.cancelAllRequests()
+		if s.metadataSession != nil {
+			_ = s.dispatcher.Handlers().DisconnectWindowsFirstCapture(s.metadataSession.ConnectionID)
+		}
 		s.transfers.Close()
 		s.conn.CloseNow()
 	})

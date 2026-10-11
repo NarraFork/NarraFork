@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { canonicalWindowsIoJson } from "@shared/windows-io-authority";
 import { eq } from "drizzle-orm";
 import { db } from "../../db";
 import {
@@ -31,6 +32,7 @@ import type { OAuthClientPolicy } from "../../lib/oauth-client-policy";
 import {
 	getDeviceConnectionDiagnostics,
 	getDeviceConnectionGeneration,
+	getDeviceMetadataSession,
 	handleDeviceWS,
 	isDeviceOnline,
 	sendRpc,
@@ -781,6 +783,11 @@ describe("remote backend connection binding", () => {
 		await waitFor(upgraded.ready, "upgraded executor handshake");
 		const upgradedGeneration = getDeviceConnectionGeneration(deviceId);
 		if (upgradedGeneration === null) throw new Error("missing upgraded connection generation");
+		const originalMetadataSession = getDeviceMetadataSession(deviceId);
+		expect(originalMetadataSession?.runtimeGeneration).toBe(upgradedGeneration);
+		expect(originalMetadataSession?.connectionId).not.toBe(deviceId);
+		expect(originalMetadataSession?.sessionId).not.toBe(deviceId);
+		expect(Object.isFrozen(originalMetadataSession)).toBe(true);
 		const backend = createRemoteBackend(deviceId, {
 			connectionGeneration: upgradedGeneration,
 			platform: { os: "linux", arch: "x64" },
@@ -817,6 +824,12 @@ describe("remote backend connection binding", () => {
 		const legacyGeneration = getDeviceConnectionGeneration(deviceId);
 		if (legacyGeneration === null) throw new Error("missing legacy connection generation");
 		expect(legacyGeneration).not.toBe(upgradedGeneration);
+		const replacementMetadataSession = getDeviceMetadataSession(deviceId);
+		expect(replacementMetadataSession?.runtimeGeneration).toBe(legacyGeneration);
+		expect(replacementMetadataSession?.connectionId).not.toBe(
+			originalMetadataSession?.connectionId,
+		);
+		expect(replacementMetadataSession?.sessionId).not.toBe(originalMetadataSession?.sessionId);
 
 		await expect(
 			backend.readFileBytes(planPath, {
@@ -1062,5 +1075,52 @@ describe("remote backend connection binding", () => {
 				expectedResolvedPath: fileStat.resolvedPath,
 			}),
 		).rejects.toThrow(/resolved path mismatch/i);
+	});
+	test("authenticated device identity cannot obtain a metadata ticket without server admission", async () => {
+		const token = "rdev_ts_metadata_no_admission";
+		const deviceId = generateId();
+		const deviceRef = `direct-${deviceId.slice(0, 8)}`;
+		const executor = startAuthenticatedFakeExecutor({
+			token,
+			deviceRef,
+			onRpc(ws, frame) {
+				const session = getDeviceMetadataSession(deviceId);
+				if (!session) throw new Error("Actual controller metadata session missing");
+				const native = {
+					volumeId: "test-volume",
+					fileId: "a".repeat(32),
+					creationTime: "1",
+					pathKey: "test-slot",
+				};
+				ws.send(
+					canonicalWindowsIoJson({
+						type: "windows_metadata_callback",
+						version: 1,
+						outerRpcId: frame.id,
+						stepId: "capture-step",
+						nonce: "A".repeat(43),
+						action: "capture_exact",
+						helperChallenge: {
+							helperInstanceId: "test-helper",
+							keyEpoch: 1,
+							challengeNonce: `${"B".repeat(42)}A`,
+							connectionId: session.connectionId,
+							sessionId: session.sessionId,
+							runtimeGeneration: session.runtimeGeneration,
+							signature: Buffer.alloc(64).toString("base64url"),
+						},
+						descriptors: { root: native, parent: native, target: native },
+						proofIds: { captureProofId: null, preparedObjectId: null },
+						expectedCurrent: { metadataHash: null, contentHash: null },
+					}),
+				);
+			},
+		});
+		await insertDirectDevice({ deviceId, deviceRef, token, directUrl: executor.url });
+		startDirectDial(deviceId, executor.url);
+		await waitFor(executor.ready, "metadata callback executor handshake");
+		await expect(sendRpc(deviceId, "history.inspect", {}, { timeoutMs: 1000 })).rejects.toThrow(
+			/metadata authorization failed.*reconciliation/i,
+		);
 	});
 });

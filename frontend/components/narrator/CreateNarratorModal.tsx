@@ -229,12 +229,16 @@ export function CreateNarratorModal({
 	// Safety net: detach any dangling listeners if the modal unmounts mid-drag.
 	useEffect(() => () => resizeCleanupRef.current?.(), []);
 
-	// Callers may keep this modal mounted across opens (or swap the target directory
-	// while it is closed), so adopt `initialCwd` on every open rather than only at mount.
+	const cwdInitializationRef = useRef<{ deviceId: string; cwd: string } | null>(null);
+	// Reset both target and directory on each open. Passive effects in this frame
+	// still see the previous target; prefill must wait for this pair to be installed.
 	useEffect(() => {
 		if (opened) {
+			const nextCwd = initialCwd ?? "";
+			cwdInitializationRef.current = { deviceId: initialDeviceId, cwd: nextCwd };
+			prefilledForOpenRef.current = false;
 			setDeviceId(initialDeviceId);
-			if (initialCwd) setCwd(initialCwd);
+			setCwd(nextCwd);
 		}
 	}, [opened, initialCwd, initialDeviceId]);
 
@@ -248,6 +252,16 @@ export function CreateNarratorModal({
 	// render or two late and a fires-once-on-open effect would miss it permanently.
 	const prefilledForOpenRef = useRef(false);
 	useEffect(() => {
+		if (!opened) {
+			prefilledForOpenRef.current = false;
+			cwdInitializationRef.current = null;
+			return;
+		}
+		const initialization = cwdInitializationRef.current;
+		if (initialization) {
+			if (deviceId !== initialization.deviceId || cwd !== initialization.cwd) return;
+			cwdInitializationRef.current = null;
+		}
 		if (deviceId !== "local") return;
 		const decision = resolveCwdPrefill({
 			opened,
@@ -454,12 +468,19 @@ export function CreateNarratorModal({
 				]}
 				onChange={(value) => {
 					const next = value ?? "local";
+					if (next === deviceId) return;
+					const nextDevice = devices?.find((device) => device.id === next);
+					cwdInitializationRef.current = null;
 					setDeviceId(next);
 					prefilledForOpenRef.current = true;
+					// Older Windows executors may report their service startup directory.
+					// A device default is not a user-selected Windows workspace.
 					setCwd(
 						next === "local"
 							? defaultProjectDir
-							: (devices?.find((device) => device.id === next)?.defaultCwd ?? ""),
+							: nextDevice?.platformOs === "windows"
+								? ""
+								: (nextDevice?.defaultCwd ?? ""),
 					);
 				}}
 			/>
@@ -470,11 +491,15 @@ export function CreateNarratorModal({
 					deviceId={deviceId}
 					deviceLabel={devices?.find((device) => device.id === deviceId)?.name}
 					label={t("workingDirectory")}
-					description={t("workingDirectoryHint")}
+					description={t(
+						deviceId === "local" ? "workingDirectoryHint" : "remoteWorkingDirectoryHint",
+					)}
 					placeholder={
 						(deviceId === "local"
 							? defaultProjectDir
-							: devices?.find((device) => device.id === deviceId)?.defaultCwd) || undefined
+							: devices?.find((device) => device.id === deviceId)?.platformOs === "windows"
+								? undefined
+								: devices?.find((device) => device.id === deviceId)?.defaultCwd) || undefined
 					}
 					leftSection={<IconFolder size={16} />}
 					value={cwd}

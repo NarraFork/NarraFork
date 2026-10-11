@@ -4,6 +4,7 @@
 package handlers
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -17,9 +18,19 @@ import (
 // to the server. channel is "stdout" or "stderr".
 type StreamFunc func(channel string, chunk []byte)
 
+// ptyController is platform-neutral: Windows sessions own a Job/worker rather
+// than a POSIX fd. Existing Unix state remains untouched for compatibility.
+type ptyController interface {
+	Write([]byte) error
+	Resize(int16, int16) error
+	Close(string)
+}
+
 type ptySession struct {
-	ptmx *os.File
-	cmd  *exec.Cmd
+	ptmx   *os.File
+	cmd    *exec.Cmd
+	native ptyController
+	cancel func() // Windows pending spawn cancellation; nil for legacy Unix.
 }
 
 // Handlers holds executor state (path guard + limits). PTY sessions are scoped
@@ -34,6 +45,7 @@ type Handlers struct {
 	shareStateDir    string
 	shareRegistry    *shareArchiveRegistry
 	attachments      *attachmentRegistry
+	firstCapture     WindowsFirstCaptureExecutor
 
 	ptyMu       sync.Mutex
 	ptySessions map[string]*ptySession
@@ -66,6 +78,7 @@ func (h *Handlers) ConnectionScoped() *Handlers {
 	connection.shareStateDir = h.shareStateDir
 	connection.shareRegistry = h.shareRegistry
 	connection.attachments = h.attachments
+	connection.firstCapture = h.firstCapture
 	return connection
 }
 
@@ -80,22 +93,34 @@ func requiredPathParam(params map[string]any, key string) (string, error) {
 	return raw, nil
 }
 
-// guardedExistingPath validates a path that must already exist.
 func (h *Handlers) guardedExistingPath(params map[string]any, key string) (string, error) {
 	raw, err := requiredPathParam(params, key)
 	if err != nil {
 		return "", err
 	}
-	return h.guard.CheckExisting(raw)
+	path, err := h.guard.CheckExisting(raw)
+	if err != nil {
+		return "", err
+	}
+	if err := h.ValidateExpectedNativeDescriptor(context.Background(), params, path, "existing"); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
-// guardedCreatePath validates a path that may be created by the operation.
 func (h *Handlers) guardedCreatePath(params map[string]any, key string) (string, error) {
 	raw, err := requiredPathParam(params, key)
 	if err != nil {
 		return "", err
 	}
-	return h.guard.CheckCreate(raw)
+	path, err := h.guard.CheckCreate(raw)
+	if err != nil {
+		return "", err
+	}
+	if err := h.ValidateExpectedNativeDescriptor(context.Background(), params, path, "create"); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 func stringParam(params map[string]any, key string) string {

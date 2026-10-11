@@ -16,6 +16,17 @@ import {
 	type RemoteHistoryOperations,
 } from "@shared/remote-history-protocol";
 import {
+	NATIVE_PATH_RESOLVE_FEATURE,
+	type NativePathDescriptorV2,
+} from "@shared/target-native-path";
+import {
+	WINDOWS_FIRST_CAPTURE_FEATURE,
+	WINDOWS_FIRST_CAPTURE_LIMITS,
+	type WindowsFirstCaptureMethod,
+	type WindowsMetadataCaptureParams,
+	type WindowsMetadataPreauthorizeParams,
+} from "@shared/windows-first-capture";
+import {
 	FEATURE_WORKSPACE_ATTACHMENT_V1,
 	WORKSPACE_ATTACHMENT_CHUNK_BYTES,
 	WORKSPACE_ATTACHMENT_METADATA_TIMEOUT_MS,
@@ -58,7 +69,12 @@ import {
 	type GitWorktreeRequest,
 	type GitWorktreeResult,
 } from "../lib/agent/execution/git-worktree-rpc";
-import { platformPathFlavor, targetPathSemantics } from "../lib/agent/execution/path-semantics";
+import { parseNativePathResolution } from "../lib/agent/execution/native-path-rpc";
+import {
+	platformPathFlavor,
+	targetPathSemantics,
+	withNativePathDescriptors,
+} from "../lib/agent/execution/path-semantics";
 import type {
 	ExecStartResult,
 	FsExistsResult,
@@ -94,6 +110,7 @@ import {
 	type SendRpcOptions,
 	sendRpc,
 } from "./device-connection-service";
+import { currentMetadataAdmission } from "./windows-metadata-admission";
 
 function toBase64(bytes: Uint8Array): string {
 	return Buffer.from(bytes).toString("base64");
@@ -209,6 +226,11 @@ export class RemoteBackend implements ExecutionBackend {
 	readonly supportsFsReadAtomicResolvedPath: boolean;
 	/** Whether fs.write can verify a previously authorized canonical create/existing identity. */
 	readonly supportsFsWriteAtomicResolvedPath: boolean;
+	private readonly nativePaths = new Map<
+		string,
+		{ descriptor: NativePathDescriptorV2; bytes: number }
+	>();
+	private nativePathBytes = 0;
 
 	constructor(deviceId: string, options: RemoteBackendOptions) {
 		this.deviceId = deviceId;
@@ -217,7 +239,15 @@ export class RemoteBackend implements ExecutionBackend {
 		this.connectionGeneration = options.connectionGeneration;
 		this.runtimeGeneration = options.connectionGeneration;
 		this.pathFlavor = platformPathFlavor(options.platform?.os);
-		this.paths = targetPathSemantics(this.pathFlavor);
+		const lexicalPaths = targetPathSemantics(this.pathFlavor);
+		this.paths =
+			this.pathFlavor === "windows" &&
+			hasDeviceProtocolFeature(deviceId, NATIVE_PATH_RESOLVE_FEATURE)
+				? withNativePathDescriptors(
+						lexicalPaths,
+						(path) => this.nativePaths.get(lexicalPaths.normalize(path))?.descriptor,
+					)
+				: lexicalPaths;
 		this.supportsFsStatResolvedPath = options.supportsFsStatResolvedPath ?? false;
 		this.supportsFsReadAtomicResolvedPath = options.supportsFsReadAtomicResolvedPath ?? false;
 		this.supportsFsWriteAtomicResolvedPath = options.supportsFsWriteAtomicResolvedPath ?? false;
@@ -238,25 +268,99 @@ export class RemoteBackend implements ExecutionBackend {
 	): Promise<unknown> {
 		return sendRpc(this.deviceId, method, params, {
 			...opts,
+			windowsMetadataAdmission: opts.windowsMetadataAdmission ?? currentMetadataAdmission(),
 			expectedConnectionGeneration: this.connectionGeneration,
 		});
 	}
 
 	private async statPath(path: string, opts?: FileMetadataOptions): Promise<FsStatResult> {
+		const native =
+			this.pathFlavor === "windows" &&
+			hasDeviceProtocolFeature(this.deviceId, NATIVE_PATH_RESOLVE_FEATURE);
+		let expectedNativeDescriptor = opts?.expectedNativeDescriptor;
+		if (native && !expectedNativeDescriptor) {
+			// This is a fresh metadata observation, not a replacement for frozen authority.
+			const observation = await this.resolvePathIdentity(path, opts);
+			expectedNativeDescriptor = observation.nativeDescriptor;
+		}
 		return (await this.rpc(
 			"fs.stat",
-			{ path },
+			{ path, ...(expectedNativeDescriptor ? { expectedNativeDescriptor } : {}) },
 			{
-				...opts,
-				...(this.supportsFsStatResolvedPath
-					? { requiredFeatures: [FS_STAT_RESOLVED_PATH_FEATURE] }
-					: {}),
+				signal: opts?.signal,
+				timeoutMs: opts?.timeoutMs,
+				requiredFeatures: [
+					...(this.supportsFsStatResolvedPath ? [FS_STAT_RESOLVED_PATH_FEATURE] : []),
+					...(expectedNativeDescriptor ? [NATIVE_PATH_RESOLVE_FEATURE] : []),
+				],
 			},
 		)) as FsStatResult;
 	}
 
+	get supportsNativePathV2(): boolean {
+		return (
+			this.pathFlavor === "windows" &&
+			hasDeviceProtocolFeature(this.deviceId, NATIVE_PATH_RESOLVE_FEATURE)
+		);
+	}
 	async resolvePathIdentity(path: string, opts?: FileMetadataOptions): Promise<PathIdentity> {
-		const lexicalPath = this.paths.resolve(this.defaultCwd ?? "", path);
+		let baseCwd = opts?.baseCwd ?? this.defaultCwd ?? "";
+		const lexicalPaths = targetPathSemantics(this.pathFlavor);
+		const lexicalPath = lexicalPaths.resolve(baseCwd, path);
+		if (this.pathFlavor === "windows" && !baseCwd && lexicalPaths.isAbsolute(path)) {
+			// The native protocol requires a frozen base even for absolute inputs.
+			// Derive only its lexical parent from the explicit target, not a device
+			// startup directory or host cwd; this is not an authorization root.
+			const parent = lexicalPaths.dirname(lexicalPath);
+			// Node's dirname can step above an extended UNC share root. In that
+			// root-only case the explicit fully qualified target is its own base.
+			baseCwd = lexicalPaths.isAbsolute(parent) ? parent : lexicalPath;
+		}
+		if (
+			this.pathFlavor === "windows" &&
+			hasDeviceProtocolFeature(this.deviceId, NATIVE_PATH_RESOLVE_FEATURE)
+		) {
+			const wire = await this.rpc(
+				"fs.path.resolve.v2",
+				{
+					inputPath: path,
+					baseCwd,
+					operation: opts?.operation ?? "create",
+					...(opts?.expectedNativeDescriptor
+						? { expectedDescriptor: opts.expectedNativeDescriptor }
+						: {}),
+					...(opts?.expectedRootDescriptor
+						? { expectedRootDescriptor: opts.expectedRootDescriptor }
+						: {}),
+				},
+				{ ...opts, requiredFeatures: [NATIVE_PATH_RESOLVE_FEATURE] },
+			);
+			const resolved = parseNativePathResolution(wire);
+			if (lexicalPaths.normalize(resolved.lexicalPath) !== lexicalPaths.normalize(lexicalPath))
+				throw new Error("Native path resolver changed the frozen target lexical slot");
+			for (const key of [resolved.lexicalPath, resolved.canonicalPath]) {
+				const normalized = lexicalPaths.normalize(key);
+				const old = this.nativePaths.get(normalized);
+				if (old) this.nativePathBytes -= old.bytes;
+				this.nativePaths.delete(normalized);
+				const bytes = Buffer.byteLength(JSON.stringify(resolved.nativeDescriptor), "utf8");
+				this.nativePaths.set(normalized, { descriptor: resolved.nativeDescriptor, bytes });
+				this.nativePathBytes += bytes;
+			}
+			while (this.nativePaths.size > 256 || this.nativePathBytes > 4 * 1024 * 1024) {
+				const oldest = this.nativePaths.entries().next().value;
+				if (!oldest) break;
+				this.nativePaths.delete(oldest[0]);
+				this.nativePathBytes -= oldest[1].bytes;
+			}
+			return {
+				lexicalPath: resolved.lexicalPath,
+				canonicalPath: resolved.canonicalPath,
+				exists: resolved.exists,
+				runtimeGeneration: this.runtimeGeneration,
+				nativeDescriptor: resolved.nativeDescriptor,
+			};
+		}
 		const result = await this.statPath(lexicalPath, opts);
 		if (this.supportsFsStatResolvedPath && !result.resolvedPath) {
 			throw new Error(
@@ -288,11 +392,35 @@ export class RemoteBackend implements ExecutionBackend {
 	}
 
 	async fileExists(path: string): Promise<boolean> {
+		if (
+			this.pathFlavor === "windows" &&
+			hasDeviceProtocolFeature(this.deviceId, NATIVE_PATH_RESOLVE_FEATURE)
+		) {
+			return (await this.resolvePathIdentity(path)).exists;
+		}
 		const res = (await this.rpc("fs.exists", { path })) as FsExistsResult;
 		return res.exists;
 	}
 
+	private nativeExpected(
+		path: string,
+		explicit?: NativePathDescriptorV2,
+	): NativePathDescriptorV2 | undefined {
+		if (
+			this.pathFlavor !== "windows" ||
+			!hasDeviceProtocolFeature(this.deviceId, NATIVE_PATH_RESOLVE_FEATURE)
+		) {
+			if (explicit) throw new Error("Executor cannot validate native path v2 evidence");
+			return undefined;
+		}
+		const key = targetPathSemantics(this.pathFlavor).normalize(path);
+		const descriptor = explicit ?? this.nativePaths.get(key)?.descriptor;
+		if (!descriptor)
+			throw new Error("NATIVE_PATH_IDENTITY_REQUIRED: resolve and authorize the target before IO");
+		return descriptor;
+	}
 	async readFileBytes(path: string, opts?: ReadBytesOptions): Promise<ReadBytesResult> {
+		const expectedNativeDescriptor = this.nativeExpected(path, opts?.expectedNativeDescriptor);
 		const expectedResolvedPath = opts?.expectedResolvedPath;
 		if (expectedResolvedPath && !this.supportsFsReadAtomicResolvedPath) {
 			throw new Error(`Remote device ${this.deviceId} does not support atomic resolved-path reads`);
@@ -304,11 +432,13 @@ export class RemoteBackend implements ExecutionBackend {
 				maxBytes: opts?.maxBytes ?? this.maxBytes,
 				timeoutMs: opts?.timeoutMs,
 				...(expectedResolvedPath ? { expectedResolvedPath } : {}),
+				...(expectedNativeDescriptor ? { expectedNativeDescriptor } : {}),
 			},
 			{
 				signal: opts?.signal,
 				timeoutMs: opts?.timeoutMs,
 				requiredFeatures: [
+					...(expectedNativeDescriptor ? [NATIVE_PATH_RESOLVE_FEATURE] : []),
 					...(expectedResolvedPath ? [FS_READ_ATOMIC_RESOLVED_PATH_FEATURE] : []),
 					...(opts?.timeoutMs !== undefined ? [FEATURE_FS_READ_BOUNDED_V1] : []),
 				],
@@ -334,6 +464,7 @@ export class RemoteBackend implements ExecutionBackend {
 	}
 
 	async writeFileBytes(path: string, bytes: Uint8Array, opts?: WriteBytesOptions): Promise<void> {
+		const expectedNativeDescriptor = this.nativeExpected(path, opts?.expectedNativeDescriptor);
 		const expectedResolvedPath = opts?.expectedResolvedPath;
 		if (expectedResolvedPath && !this.supportsFsWriteAtomicResolvedPath) {
 			throw new Error(
@@ -346,8 +477,14 @@ export class RemoteBackend implements ExecutionBackend {
 				path,
 				dataB64: toBase64(bytes),
 				...(expectedResolvedPath ? { expectedResolvedPath } : {}),
+				...(expectedNativeDescriptor ? { expectedNativeDescriptor } : {}),
 			},
-			expectedResolvedPath ? { requiredFeatures: [FS_WRITE_ATOMIC_RESOLVED_PATH_FEATURE] } : {},
+			{
+				requiredFeatures: [
+					...(expectedResolvedPath ? [FS_WRITE_ATOMIC_RESOLVED_PATH_FEATURE] : []),
+					...(expectedNativeDescriptor ? [NATIVE_PATH_RESOLVE_FEATURE] : []),
+				],
+			},
 		);
 	}
 
@@ -365,6 +502,7 @@ export class RemoteBackend implements ExecutionBackend {
 			throw new Error("Conditional write exceeds the 2000000-byte file limit");
 		}
 		opts.signal?.throwIfAborted();
+		const expectedNativeDescriptor = this.nativeExpected(path, opts.expectedNativeDescriptor);
 		try {
 			const result = (await this.rpc(
 				"fs.writeConditional",
@@ -373,12 +511,16 @@ export class RemoteBackend implements ExecutionBackend {
 					dataB64: toBase64(bytes),
 					expectedDataB64: opts.expectedBytes === null ? null : toBase64(opts.expectedBytes),
 					expectedResolvedPath: opts.expectedResolvedPath,
+					...(expectedNativeDescriptor ? { expectedNativeDescriptor } : {}),
 					timeoutMs: Math.min(opts.timeoutMs ?? 30_000, 30_000),
 				},
 				{
 					signal: opts.signal,
 					timeoutMs: Math.min(opts.timeoutMs ?? 30_000, 30_000),
-					requiredFeatures: [FEATURE_FS_CONDITIONAL_WRITE_V1],
+					requiredFeatures: [
+						FEATURE_FS_CONDITIONAL_WRITE_V1,
+						...(expectedNativeDescriptor ? [NATIVE_PATH_RESOLVE_FEATURE] : []),
+					],
 				},
 			)) as { applied: boolean; conflict?: boolean };
 			if (result.conflict)
@@ -534,6 +676,30 @@ export class RemoteBackend implements ExecutionBackend {
 			{ ...request },
 			{ signal, timeoutMs, requiredFeatures: [FEATURE_WORKSPACE_ATTACHMENT_V1] },
 		)) as WorkspaceAttachmentOperations[K]["result"];
+	}
+
+	/** Protocol existence only; does NOT imply configured capture/editor/FullReady. */
+	get supportsWindowsFirstCapture(): boolean {
+		return hasDeviceProtocolFeature(this.deviceId, WINDOWS_FIRST_CAPTURE_FEATURE);
+	}
+	async windowsFirstCapture(
+		method: WindowsFirstCaptureMethod,
+		params: WindowsMetadataPreauthorizeParams | WindowsMetadataCaptureParams,
+		options: NonNullable<SendRpcOptions["windowsFirstCapture"]>,
+		control: Pick<SendRpcOptions, "signal" | "windowsMetadataAdmission"> = {},
+	): Promise<unknown> {
+		if (!this.supportsWindowsFirstCapture)
+			throw new Error("Executor upgrade required: windows.metadata.first-capture.v1");
+		return this.rpc(
+			method,
+			{ ...params },
+			{
+				...control,
+				windowsFirstCapture: options,
+				timeoutMs: WINDOWS_FIRST_CAPTURE_LIMITS.rpcTimeoutMs,
+				requiredFeatures: [WINDOWS_FIRST_CAPTURE_FEATURE],
+			},
+		);
 	}
 
 	get supportsShareArchive(): boolean {

@@ -89,6 +89,7 @@ function sameRefusalState(a: RemoteHistoryState, b: RemoteHistoryState): boolean
 	return (
 		a.mode === b.mode &&
 		a.incarnation === b.incarnation &&
+		a.nativeMetadataFingerprint === b.nativeMetadataFingerprint &&
 		object(a.object, b.object) &&
 		object(a.metadata, b.metadata)
 	);

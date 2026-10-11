@@ -1,6 +1,7 @@
 package history
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -15,6 +16,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/narrafork/remote-executor/internal/windowsbackup"
 )
 
 type Guard func(path string, create bool) (string, error)
@@ -44,6 +47,7 @@ func (m *Manager) ValidateBinding(ctx context.Context, b Binding, historical boo
 
 type Manager struct {
 	mu             sync.Mutex
+	configMu       sync.RWMutex
 	objectMu       sync.Mutex
 	captureQueue   chan struct{}
 	captureSlots   chan struct{}
@@ -65,6 +69,10 @@ type Manager struct {
 	closed         bool
 	privateEntries int
 	nativeIO       NativeMutationIO
+	// Administrator-provisioned per-volume private recovery roots. Nil keeps the
+	// original Unix adapter behavior; Windows v2 must explicitly configure this.
+	recoveryDirectory func(context.Context, Binding, string) (string, error)
+	metadataChannel   windowsbackup.MetadataChannel
 }
 
 type scopeRecord struct {
@@ -233,6 +241,95 @@ func (m *Manager) SetNativeMutationIO(adapter NativeMutationIO) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.nativeIO = adapter
+}
+
+// SetRecoveryDirectoryResolver is installed during trusted startup, before
+// capability publication. Resolver must only return a configured, identity-pinned
+// private root on the actual target volume, never auto-create a workspace vault.
+func (m *Manager) SetRecoveryDirectoryResolver(resolve func(context.Context, Binding, string) (string, error)) {
+	m.configMu.Lock()
+	defer m.configMu.Unlock()
+	m.recoveryDirectory = resolve
+}
+
+// NativeMetadataContext gives EA/ADS an immutable, scoped CAS in the existing
+// private namespace. Legacy object IDs, origin paths and hash inputs are untouched.
+func (m *Manager) SetMetadataChannel(channel windowsbackup.MetadataChannel) {
+	m.configMu.Lock()
+	defer m.configMu.Unlock()
+	m.metadataChannel = channel
+}
+func (m *Manager) NativeMetadataContext(ctx context.Context, binding Binding) context.Context {
+	m.configMu.RLock()
+	channel := m.metadataChannel
+	m.configMu.RUnlock()
+	if channel != nil {
+		ctx = windowsbackup.WithMetadataChannel(ctx, channel)
+	}
+	return windowsbackup.WithBlobs(ctx, nativeMetadataBlobs{manager: m, binding: binding})
+}
+
+type nativeMetadataBlobs struct {
+	manager *Manager
+	binding Binding
+}
+
+func (s nativeMetadataBlobs) Put(ctx context.Context, data []byte) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if len(data) > windowsbackup.StreamBytes {
+		return "", fmt.Errorf("native stream budget")
+	}
+	m := s.manager
+	m.objectMu.Lock()
+	defer m.objectMu.Unlock()
+	if err := m.validateHistorical(s.binding); err != nil {
+		return "", err
+	}
+	digest := hash(data)
+	path := m.objectPath(s.binding, "native-stream-"+digest)
+	previous, err := readPrivate(path, BlobBytes)
+	if err == nil {
+		if !bytes.Equal(previous, data) {
+			return "", fmt.Errorf("native CAS conflict")
+		}
+		return digest, nil
+	}
+	if !os.IsNotExist(err) {
+		return "", err
+	}
+	if m.privateEntries >= 200000 {
+		return "", fmt.Errorf("private entry quota")
+	}
+	if err := m.admission(int64(len(data))); err != nil {
+		return "", err
+	}
+	if err := writePrivate(path, data); err != nil {
+		return "", err
+	}
+	m.bytes += int64(len(data))
+	m.privateEntries++
+	return digest, nil
+}
+func (s nativeMetadataBlobs) Get(ctx context.Context, digest string, size int64) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !validDigest(digest) || size < 0 || size > windowsbackup.StreamBytes {
+		return nil, fmt.Errorf("native stream descriptor")
+	}
+	if err := s.manager.validateHistorical(s.binding); err != nil {
+		return nil, err
+	}
+	data, err := readPrivate(s.manager.objectPath(s.binding, "native-stream-"+digest), size)
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) != size || hash(data) != digest {
+		return nil, fmt.Errorf("native stream integrity")
+	}
+	return data, nil
 }
 
 // Admission is bounded and cancellable even while another capture owns the store.

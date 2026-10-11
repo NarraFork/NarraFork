@@ -18,12 +18,17 @@ const Wrapper = ({ children }: { children?: ReactNode }) => <div>{children}</div
 const create = mock((_input: Record<string, unknown>, _options?: unknown) => {});
 let settingsResolve: ((value: unknown) => void) | undefined;
 let settingsResult: Promise<unknown>;
+let remoteDevice = {
+	id: "remote",
+	name: "Remote",
+	status: "online",
+	platformOs: "linux",
+	defaultCwd: "/device-default",
+};
 mock.module("../../lib/api", () => ({
 	api: {
 		getSettings: () => settingsResult,
-		listDevices: async () => [
-			{ id: "remote", name: "Remote", status: "online", defaultCwd: "/device-default" },
-		],
+		listDevices: async () => [remoteDevice],
 	},
 }));
 mock.module("../../hooks/useModels", () => ({ useAllModels: () => ({ groupedModels: [] }) }));
@@ -41,13 +46,19 @@ mock.module("../common/DirectoryPicker", () => ({
 		value,
 		onChange,
 		deviceId,
+		placeholder,
+		description,
 	}: {
 		value: string;
 		onChange: (value: string) => void;
 		deviceId: string;
+		placeholder?: string;
+		description?: string;
 	}) => (
 		<input
 			data-directory-device={deviceId}
+			data-directory-hint={description}
+			placeholder={placeholder}
 			value={value}
 			onInput={(event) => onChange(event.currentTarget.value)}
 		/>
@@ -135,6 +146,13 @@ async function flush() {
 }
 beforeEach(() => {
 	create.mockClear();
+	remoteDevice = {
+		id: "remote",
+		name: "Remote",
+		status: "online",
+		platformOs: "linux",
+		defaultCwd: "/device-default",
+	};
 	settingsResult = new Promise((resolve) => {
 		settingsResolve = resolve;
 	});
@@ -154,11 +172,16 @@ afterAll(() => {
 		else Reflect.deleteProperty(globalThis, key);
 	}
 });
-async function mount() {
+async function mount(initialCwd?: string, initialDeviceId?: string, opened = true) {
 	await act(async () => {
 		root.render(
 			<QueryClientProvider client={client}>
-				<CreateNarratorModal opened onClose={() => {}} />
+				<CreateNarratorModal
+					opened={opened}
+					onClose={() => {}}
+					initialCwd={initialCwd}
+					initialDeviceId={initialDeviceId}
+				/>
 			</QueryClientProvider>,
 		);
 	});
@@ -211,4 +234,124 @@ test("empty remote cwd cannot accidentally submit legacy local creation", async 
 	});
 	await submit();
 	expect(create).not.toHaveBeenCalled();
+});
+
+for (const reportedCwd of ["C:\\WINDOWS\\system32", "D:\\configured-project", ""]) {
+	test(`Windows reported default ${JSON.stringify(reportedCwd)} never selects a workspace`, async () => {
+		remoteDevice = { ...remoteDevice, platformOs: "windows", defaultCwd: reportedCwd };
+		await mount();
+		await selectRemote();
+		const field = container.querySelector<HTMLInputElement>('[data-directory-device="remote"]');
+		if (!field) throw new Error("Windows directory field missing");
+		expect(field.value).toBe("");
+		expect(field.getAttribute("placeholder")).toBeNull();
+		expect(field.getAttribute("data-directory-hint")).toBe("remoteWorkingDirectoryHint");
+		await submit();
+		expect(create).not.toHaveBeenCalled();
+	});
+}
+
+test("Windows manual project selection survives late local settings and submits only the chosen target", async () => {
+	remoteDevice = { ...remoteDevice, platformOs: "windows", defaultCwd: "C:\\WINDOWS\\system32" };
+	await mount();
+	await selectRemote();
+	await act(async () => {
+		const field = container.querySelector<HTMLInputElement>('[data-directory-device="remote"]');
+		if (!field) throw new Error("Windows directory field missing");
+		field.value = "D:\\projects\\实际项目";
+		field.dispatchEvent(new window.Event("input", { bubbles: true }));
+		settingsResolve?.({ paths: { defaultProjectDir: "/host/default" } });
+		await flush();
+	});
+	await submit();
+	expect(create.mock.calls[0]?.[0].workspaceTarget).toEqual({
+		deviceId: "remote",
+		cwd: "D:\\projects\\实际项目",
+	});
+	expect(create.mock.calls[0]?.[0]).not.toHaveProperty("cwd");
+});
+
+test("an explicit Windows entry-point directory is preserved even when its device is selected again", async () => {
+	remoteDevice = { ...remoteDevice, platformOs: "windows", defaultCwd: "C:\\WINDOWS\\system32" };
+	await mount("D:\\chosen-project", "remote");
+	await selectRemote();
+	await submit();
+	expect(create.mock.calls[0]?.[0].workspaceTarget).toEqual({
+		deviceId: "remote",
+		cwd: "D:\\chosen-project",
+	});
+});
+
+test("Linux remote default directory retains its existing prefill behavior", async () => {
+	await mount();
+	await selectRemote();
+	const field = container.querySelector<HTMLInputElement>('[data-directory-device="remote"]');
+	expect(field?.value).toBe("/device-default");
+	await submit();
+	expect(create.mock.calls[0]?.[0].workspaceTarget).toEqual({
+		deviceId: "remote",
+		cwd: "/device-default",
+	});
+});
+
+test("reopening a mounted local modal as Windows never borrows same-frame host cwd prefill", async () => {
+	remoteDevice = { ...remoteDevice, platformOs: "windows", defaultCwd: "" };
+	await mount();
+	await act(async () => {
+		settingsResolve?.({ paths: { defaultProjectDir: "/host/default" } });
+		await flush();
+	});
+	const localField = container.querySelector<HTMLInputElement>('[data-directory-device="local"]');
+	if (!localField) throw new Error("local directory field missing");
+	expect(localField.value).toBe("/host/default");
+	await act(async () => {
+		localField.value = "";
+		localField.dispatchEvent(new window.Event("input", { bubbles: true }));
+		await flush();
+	});
+	await mount(undefined, "remote", false);
+	await mount(undefined, "remote");
+	const remoteField = container.querySelector<HTMLInputElement>('[data-directory-device="remote"]');
+	if (!remoteField) throw new Error("Windows directory field missing after reopening");
+	expect(remoteField.value).toBe("");
+	await submit();
+	expect(create).not.toHaveBeenCalled();
+});
+
+test("reopening as local resets the previous Windows selection before local defaults arrive", async () => {
+	remoteDevice = { ...remoteDevice, platformOs: "windows", defaultCwd: "" };
+	await mount("D:\\previous-project", "remote");
+	await mount(undefined, "local", false);
+	await mount(undefined, "local");
+	let field = container.querySelector<HTMLInputElement>('[data-directory-device="local"]');
+	expect(field?.value).toBe("");
+	await act(async () => {
+		settingsResolve?.({ paths: { defaultProjectDir: "/host/current-project" } });
+		await flush();
+	});
+	field = container.querySelector<HTMLInputElement>('[data-directory-device="local"]');
+	expect(field?.value).toBe("/host/current-project");
+	await submit();
+	expect(create.mock.calls[0]?.[0].workspaceTarget).toEqual({
+		deviceId: "local",
+		cwd: "/host/current-project",
+	});
+});
+
+test("reopening an existing Windows modal adopts the new explicit entry-point directory", async () => {
+	remoteDevice = { ...remoteDevice, platformOs: "windows", defaultCwd: "C:\\WINDOWS\\system32" };
+	await mount("D:\\previous-project", "remote");
+	await mount(undefined, "remote", false);
+	await mount("E:\\new-explicit-project", "remote");
+	await act(async () => {
+		settingsResolve?.({ paths: { defaultProjectDir: "/host/default" } });
+		await flush();
+	});
+	const field = container.querySelector<HTMLInputElement>('[data-directory-device="remote"]');
+	expect(field?.value).toBe("E:\\new-explicit-project");
+	await submit();
+	expect(create.mock.calls[0]?.[0].workspaceTarget).toEqual({
+		deviceId: "remote",
+		cwd: "E:\\new-explicit-project",
+	});
 });

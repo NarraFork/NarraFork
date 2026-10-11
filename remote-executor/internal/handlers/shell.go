@@ -20,12 +20,29 @@ func loginShell(command string) (string, []string) {
 	return shell, []string{"-c", command}
 }
 
+// interactiveShell intentionally does not reuse non-interactive PowerShell flags
+// or Unix login options on Windows. Explicit caller cmd[] remains supported.
+func interactiveShell() []string {
+	if runtime.GOOS == "windows" {
+		return []string{"powershell.exe", "-NoLogo", "-NoProfile"}
+	}
+	shell, _ := loginShell("")
+	return []string{shell, "-l"}
+}
+
 // commandEnv builds the environment for an exec. In fresh mode it keeps a
 // minimal set; otherwise it inherits the executor process env. Extra overrides
 // from params.env are applied last.
 func commandEnv(freshEnv bool, params map[string]any) []string {
 	var env []string
-	if freshEnv {
+	if freshEnv && runtime.GOOS == "windows" {
+		// Keep only the Windows bootstrap variables, not Unix-only login state.
+		for _, key := range []string{"SystemRoot", "SystemDrive", "PATH", "PATHEXT", "TEMP", "TMP", "USERPROFILE"} {
+			if value, ok := os.LookupEnv(key); ok {
+				env = append(env, key+"="+value)
+			}
+		}
+	} else if freshEnv {
 		env = []string{
 			"HOME=" + os.Getenv("HOME"),
 			"PATH=" + os.Getenv("PATH"),

@@ -8,6 +8,18 @@
  *
  * Pinned to globalThis via hotSafe so hot reloads don't orphan live sockets.
  */
+import { randomUUID } from "node:crypto";
+import {
+	validateWindowsFirstCaptureRpc,
+	WINDOWS_FIRST_CAPTURE_FEATURE,
+	WINDOWS_FIRST_CAPTURE_LIMITS,
+	WINDOWS_FIRST_CAPTURE_METHODS,
+	type WindowsFirstCaptureOrigin,
+	type WindowsFirstCaptureOriginSeed,
+	windowsFirstCaptureOriginSchema,
+} from "@shared/windows-first-capture";
+import { canonicalWindowsIoJson } from "@shared/windows-io-authority";
+import { parseWindowsMetadataCallback } from "@shared/windows-metadata-callback";
 import type { ServerWebSocket } from "bun";
 import { and, eq, isNull } from "drizzle-orm";
 import { db } from "../db";
@@ -24,6 +36,7 @@ import { setRemoteBackendResolver } from "../lib/agent/execution/registry";
 import type {
 	DeviceAuthInitFrame,
 	DeviceAuthProofFrame,
+	DeviceHelloAckFrame,
 	DeviceHelloFrame,
 	RpcMethod,
 	RpcResultFrame,
@@ -47,6 +60,10 @@ import {
 	verifyDeviceToken,
 } from "./device-service";
 import { resolveOAuthDeviceRuntimeAuthorization } from "./oauth-device-runtime-policy";
+import {
+	createWindowsMetadataCallbackController,
+	type WindowsMetadataAdmission,
+} from "./windows-metadata-admission";
 
 export interface DeviceWSData {
 	connectedAt: number;
@@ -86,6 +103,14 @@ interface PendingRpc {
 	method?: RpcMethod;
 	startedAt?: number;
 	timeoutMs?: number;
+	/** Server-held, never serialized into params or learned from device claims. */
+	windowsMetadataAdmission?: WindowsMetadataAdmission;
+	metadataControl?: AbortController;
+	firstCapture?: {
+		context: WindowsFirstCapturePendingContext;
+		verifyResult: NonNullable<SendRpcOptions["windowsFirstCapture"]>["verifyResult"];
+		verifying: boolean;
+	};
 }
 
 interface DeviceConnection {
@@ -98,6 +123,8 @@ interface DeviceConnection {
 	connectedAt: number;
 	/** Monotonic identity for this authenticated transport generation. */
 	generation?: number;
+	/** Never reconstructed for a legacy/hot-reload connection. */
+	windowsMetadataSession?: NonNullable<DeviceHelloAckFrame["windowsMetadataSession"]>;
 	hello?: DeviceHelloFrame;
 	lastRpcLimitLogAt?: number;
 }
@@ -151,6 +178,17 @@ export function hasDeviceProtocolFeature(deviceId: string, feature: string): boo
 export function getDeviceConnectionGeneration(deviceId: string): number | null {
 	const conn = connections.get(deviceId);
 	return conn ? ensureConnectionGeneration(conn) : null;
+}
+
+/** Actual authenticated metadata control identity; missing legacy material stays missing. */
+export function getDeviceMetadataSession(
+	deviceId: string,
+): Readonly<NonNullable<DeviceHelloAckFrame["windowsMetadataSession"]>> | null {
+	const conn = connections.get(deviceId);
+	const session = conn?.windowsMetadataSession;
+	if (!conn || !session || session.runtimeGeneration !== ensureConnectionGeneration(conn))
+		return null;
+	return Object.freeze({ ...session });
 }
 
 /** Copy a Uint8Array view into a standalone ArrayBuffer (satisfies WS.send typing). */
@@ -246,7 +284,21 @@ export async function getSessionDevices(
 
 // ── RPC ──────────────────────────────────────────────────────────────────────
 
+export interface WindowsFirstCapturePendingContext {
+	readonly origin: Readonly<WindowsFirstCaptureOrigin>;
+	readonly signal: AbortSignal;
+	isPending(): boolean;
+}
 export interface SendRpcOptions {
+	/** Server-only origin/verification hooks for exactly the two new methods. */
+	windowsFirstCapture?: {
+		origin: WindowsFirstCaptureOriginSeed;
+		onAllocated?(context: WindowsFirstCapturePendingContext): void;
+		onDispatch?(): void;
+		verifyResult(result: unknown, context: WindowsFirstCapturePendingContext): Promise<unknown>;
+	};
+	/** Original server admission only; never sent in RPC JSON. */
+	windowsMetadataAdmission?: WindowsMetadataAdmission;
 	timeoutMs?: number;
 	signal?: AbortSignal;
 	/** Called for each streaming chunk (exec output). */
@@ -343,6 +395,30 @@ export function sendRpc(
 		return Promise.reject(new DeviceOfflineError(deviceId));
 	}
 	const connectionGeneration = ensureConnectionGeneration(conn);
+	const firstCaptureMethod = WINDOWS_FIRST_CAPTURE_METHODS.some(
+		(candidate) => candidate === method,
+	);
+	if (
+		firstCaptureMethod !== Boolean(opts.windowsFirstCapture) ||
+		"windowsFirstCaptureOrigin" in params
+	)
+		return Promise.reject(new Error("First-capture origin is server-only and method-scoped"));
+	if (opts.windowsFirstCapture) {
+		const session = conn.windowsMetadataSession;
+		const origin = opts.windowsFirstCapture.origin;
+		if (
+			!deviceHasFeature(conn.hello?.capabilities, WINDOWS_FIRST_CAPTURE_FEATURE) ||
+			!session ||
+			origin.deviceId !== deviceId ||
+			origin.connectionId !== session.connectionId ||
+			origin.sessionId !== session.sessionId ||
+			origin.runtimeGeneration !== connectionGeneration ||
+			opts.longLived
+		)
+			return Promise.reject(
+				new Error("First-capture protocol/session is not available on this original connection"),
+			);
+	}
 	if (
 		opts.expectedConnectionGeneration !== undefined &&
 		opts.expectedConnectionGeneration !== connectionGeneration
@@ -409,6 +485,23 @@ export function sendRpc(
 	}
 
 	const id = `rpc_${conn.rpcSeq++}`;
+	let firstCaptureOrigin: WindowsFirstCaptureOrigin | undefined;
+	if (opts.windowsFirstCapture) {
+		try {
+			firstCaptureOrigin = windowsFirstCaptureOriginSchema.parse({
+				...opts.windowsFirstCapture.origin,
+				outerRpcId: id,
+			});
+			validateWindowsFirstCaptureRpc(
+				method as import("@shared/windows-first-capture").WindowsFirstCaptureMethod,
+				id,
+				firstCaptureOrigin,
+				params,
+			);
+		} catch (error) {
+			return Promise.reject(error);
+		}
+	}
 	// An explicit per-call deadline that is already spent (<= 0, e.g. a remaining
 	// budget) must fail fast, not silently become the 120s default.
 	if (
@@ -424,12 +517,14 @@ export function sendRpc(
 	const configuredTimeout = opts.timeoutMs ?? settings.devices?.rpcTimeoutMs;
 	// Never let NaN/Infinity or timer overflow silently turn a deadline into an
 	// unbounded wait (or a 1ms timeout). Long-lived calls opt out explicitly below.
-	const timeoutMs =
+	let timeoutMs =
 		typeof configuredTimeout === "number" &&
 		Number.isFinite(configuredTimeout) &&
 		configuredTimeout > 0
 			? Math.min(2_147_483_647, Math.max(1, Math.floor(configuredTimeout)))
 			: 120_000;
+	if (firstCaptureOrigin)
+		timeoutMs = Math.min(timeoutMs, WINDOWS_FIRST_CAPTURE_LIMITS.rpcTimeoutMs);
 
 	return new Promise<unknown>((resolve, reject) => {
 		// Long-lived RPCs (PTY sessions) have no timeout — they end on kill/abort
@@ -451,8 +546,31 @@ export function sendRpc(
 			method,
 			startedAt: Date.now(),
 			timeoutMs: opts.longLived ? undefined : timeoutMs,
+			windowsMetadataAdmission: opts.windowsMetadataAdmission,
+			metadataControl:
+				opts.windowsMetadataAdmission || firstCaptureOrigin ? new AbortController() : undefined,
 		};
 		conn.pending.set(id, pending);
+		if (firstCaptureOrigin && opts.windowsFirstCapture && pending.metadataControl) {
+			const origin = Object.freeze(firstCaptureOrigin);
+			const context: WindowsFirstCapturePendingContext = Object.freeze({
+				origin,
+				signal: opts.signal
+					? AbortSignal.any([opts.signal, pending.metadataControl.signal])
+					: pending.metadataControl.signal,
+				isPending: () =>
+					connections.get(deviceId) === conn &&
+					conn.pending.get(id) === pending &&
+					conn.windowsMetadataSession?.connectionId === origin.connectionId &&
+					conn.windowsMetadataSession.sessionId === origin.sessionId &&
+					ensureConnectionGeneration(conn) === origin.runtimeGeneration,
+			});
+			pending.firstCapture = {
+				context,
+				verifyResult: opts.windowsFirstCapture.verifyResult,
+				verifying: false,
+			};
+		}
 		if (opts.longLived) conn.longLivedCount++;
 
 		if (opts.signal) {
@@ -472,7 +590,20 @@ export function sendRpc(
 		}
 
 		try {
-			conn.transport.send(JSON.stringify({ type: "rpc", id, method, params }));
+			if (pending.firstCapture)
+				opts.windowsFirstCapture?.onAllocated?.(pending.firstCapture.context);
+			if (pending.firstCapture?.context.signal.aborted)
+				throw new Error("Original first-capture request cancelled before send");
+			if (firstCaptureOrigin) opts.windowsFirstCapture?.onDispatch?.();
+			conn.transport.send(
+				JSON.stringify({
+					type: "rpc",
+					id,
+					method,
+					params,
+					...(firstCaptureOrigin ? { windowsFirstCaptureOrigin: firstCaptureOrigin } : {}),
+				}),
+			);
 		} catch (err) {
 			cleanupPending(conn, id);
 			reject(err instanceof Error ? err : new Error(String(err)));
@@ -484,6 +615,7 @@ function cleanupPending(conn: DeviceConnection, id: string): PendingRpc | undefi
 	const pending = conn.pending.get(id);
 	if (!pending) return undefined;
 	conn.pending.delete(id);
+	pending.metadataControl?.abort(new Error("Original metadata RPC is no longer pending"));
 	if (pending.timer) clearTimeout(pending.timer);
 	pending.timer = null;
 	pending.removeAbortListener?.();
@@ -510,6 +642,65 @@ function sendCancel(conn: DeviceConnection, id: string): void {
 
 // ── Shared frame processing (transport-agnostic) ────────────────────────────────
 
+const metadataCallbacks = createWindowsMetadataCallbackController();
+
+async function handleWindowsMetadataCallback(conn: DeviceConnection, raw: string): Promise<void> {
+	let callback: ReturnType<typeof parseWindowsMetadataCallback>;
+	try {
+		callback = parseWindowsMetadataCallback(raw);
+	} catch {
+		// No reconstructed JSON, claimed actor or malformed correlation can authorize a ticket.
+		return;
+	}
+	const pending = conn.pending.get(callback.outerRpcId);
+	if (!pending) return;
+	const isPending = () =>
+		connections.get(conn.deviceId) === conn && conn.pending.get(callback.outerRpcId) === pending;
+	try {
+		if (
+			!pending.windowsMetadataAdmission ||
+			!pending.metadataControl ||
+			!conn.windowsMetadataSession
+		) {
+			throw new Error("Windows metadata original authority is unavailable");
+		}
+		const result = await metadataCallbacks.handle(
+			raw,
+			{
+				outerRpcId: callback.outerRpcId,
+				windowsMetadataAdmission: pending.windowsMetadataAdmission,
+				isPending,
+				liveConnection: () => {
+					const session = conn.windowsMetadataSession;
+					return isPending() && session
+						? {
+								deviceId: conn.deviceId,
+								connectionId: session.connectionId,
+								sessionId: session.sessionId,
+								runtimeGeneration: ensureConnectionGeneration(conn),
+							}
+						: null;
+				},
+			},
+			pending.metadataControl.signal,
+		);
+		if (!isPending()) return;
+		const buffered = conn.transport.bufferedAmount?.();
+		if (typeof buffered !== "number" || !Number.isFinite(buffered) || buffered > 1024 * 1024)
+			throw new Error("Metadata control response backpressure is unavailable or exceeded");
+		conn.transport.send(canonicalWindowsIoJson(result));
+	} catch {
+		if (!isPending()) return;
+		const original = cleanupPending(conn, callback.outerRpcId);
+		sendCancel(conn, callback.outerRpcId);
+		// A preceding native step may have dispatched. Never brand this as no-dispatch.
+		original?.reject(
+			new Error(
+				"Windows metadata authorization failed; original operation outcome requires reconciliation",
+			),
+		);
+	}
+}
 /**
  * Handle a decoded frame from an authenticated connection. Returns false when
  * the frame required authentication but the device wasn't registered (caller
@@ -519,11 +710,16 @@ function processAuthenticatedFrame(
 	deviceId: string,
 	transport: DeviceTransport,
 	frame: { type?: string },
+	rawText?: string,
 ): void {
 	const conn = connections.get(deviceId);
 	// A replaced socket may still deliver buffered frames. Never route those into
 	// the current connection's pending map, whose RPC ids restart from zero.
 	if (!conn || conn.transport !== transport) return;
+	if (frame.type === "windows_metadata_callback") {
+		if (rawText !== undefined) void handleWindowsMetadataCallback(conn, rawText);
+		return;
+	}
 	if (frame.type === "rpc_stream") {
 		handleRpcStream(conn, frame as unknown as RpcStreamFrame);
 	} else if (frame.type === "rpc_result") {
@@ -590,6 +786,12 @@ async function registerConnection(
 		}
 	}
 
+	const windowsMetadataSession = Object.freeze({
+		version: 1 as const,
+		connectionId: randomUUID(),
+		sessionId: randomUUID(),
+		runtimeGeneration: generation,
+	});
 	connections.set(row.id, {
 		transport,
 		deviceId: row.id,
@@ -598,12 +800,13 @@ async function registerConnection(
 		rpcSeq: 0,
 		connectedAt: Date.now(),
 		generation,
+		windowsMetadataSession,
 		hello,
 	});
 
 	// Queue hello_ack before the first async yield after publishing the
 	// connection, so the executor never observes an RPC before its ack.
-	sendHelloAck(transport, true, undefined, row.id);
+	sendHelloAck(transport, true, undefined, row.id, windowsMetadataSession);
 	await markOnline(row.id, hello);
 	logger.info("Device authenticated", {
 		deviceId: row.id,
@@ -652,7 +855,7 @@ export const handleDeviceWS = {
 		logger.debug("Device WS opened (awaiting hello)");
 	},
 
-	async message(ws: DeviceWS, raw: unknown) {
+	async message(ws: DeviceWS, raw: unknown, rawText?: string) {
 		const frame = raw as { type?: string };
 		if (!frame || typeof frame.type !== "string") return;
 
@@ -695,7 +898,7 @@ export const handleDeviceWS = {
 			return;
 		}
 
-		processAuthenticatedFrame(ws.data.deviceId, wsTransport(ws), frame);
+		processAuthenticatedFrame(ws.data.deviceId, wsTransport(ws), frame, rawText);
 	},
 
 	/** Binary WebSocket message (transfer chunk frames). */
@@ -758,6 +961,7 @@ function sendHelloAck(
 	ok: boolean,
 	error?: string,
 	deviceId?: string,
+	windowsMetadataSession?: DeviceHelloAckFrame["windowsMetadataSession"],
 ): void {
 	try {
 		transport.send(
@@ -766,6 +970,7 @@ function sendHelloAck(
 				ok,
 				error,
 				sessionId: deviceId,
+				...(ok && windowsMetadataSession ? { windowsMetadataSession } : {}),
 				limits: ok
 					? {
 							maxRpcBytes: settings.devices?.maxRpcBytes ?? 10 * 1024 * 1024,
@@ -795,6 +1000,31 @@ function handleRpcStream(conn: DeviceConnection, frame: RpcStreamFrame): void {
 function handleRpcResult(conn: DeviceConnection, frame: RpcResultFrame): void {
 	const pending = conn.pending.get(frame.id);
 	if (!pending) return;
+	if (frame.ok && pending.firstCapture) {
+		const first = pending.firstCapture;
+		if (first.verifying || !first.context.isPending()) return;
+		first.verifying = true;
+		void (async () => {
+			try {
+				first.context.signal.throwIfAborted();
+				const verified = await first.verifyResult(frame.result, first.context);
+				first.context.signal.throwIfAborted();
+				if (!first.context.isPending()) return;
+				cleanupPending(conn, frame.id);
+				pending.resolve(verified);
+			} catch {
+				if (!first.context.isPending()) return;
+				cleanupPending(conn, frame.id);
+				sendCancel(conn, frame.id);
+				pending.reject(
+					new Error(
+						"First-capture completion is unproven; original outcome requires reconciliation",
+					),
+				);
+			}
+		})();
+		return;
+	}
 	cleanupPending(conn, frame.id);
 	if (frame.ok) {
 		pending.resolve(frame.result);
@@ -1324,8 +1554,9 @@ async function handleDirectMessage(
 	}
 
 	let frame: { type?: string };
+	let text: string;
 	try {
-		const text = typeof raw === "string" ? raw : new TextDecoder().decode(raw as ArrayBuffer);
+		text = typeof raw === "string" ? raw : new TextDecoder().decode(raw as ArrayBuffer);
 		frame = JSON.parse(text);
 	} catch {
 		transport.close(1002, "invalid JSON frame");
@@ -1352,7 +1583,7 @@ async function handleDirectMessage(
 			transport.close(1002, "duplicate handshake frame");
 			return;
 		}
-		processAuthenticatedFrame(state.deviceId, transport, frame);
+		processAuthenticatedFrame(state.deviceId, transport, frame, text);
 		return;
 	}
 

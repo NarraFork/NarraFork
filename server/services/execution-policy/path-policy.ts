@@ -15,12 +15,35 @@ function matchingPathRules<T extends DirectoryWhitelistRule | DirectoryBlacklist
 	path: string,
 	paths: TargetPathSemantics,
 	rules: readonly T[],
+	denying = false,
 ): T[] {
 	if (paths.flavor === "spec") return [];
 	const normalized = paths.normalize(path);
+	if (paths.nativeProofRequired) {
+		if (!paths.nativeDescriptor?.(path)) {
+			throw new Error(
+				"NATIVE_PATH_CAPABILITY_NOT_READY: requested path lacks its original native proof",
+			);
+		}
+		for (const rule of rules) {
+			if (
+				rule.enabled &&
+				rule.pathFlavor === paths.flavor &&
+				!paths.nativeDescriptor?.(rule.path)
+			) {
+				throw new Error(
+					"NATIVE_PATH_CAPABILITY_NOT_READY: directory rule lacks its original native proof",
+				);
+			}
+		}
+	}
 	return rules.filter(
 		(rule) =>
-			rule.enabled && rule.pathFlavor === paths.flavor && paths.contains(rule.path, normalized),
+			rule.enabled &&
+			rule.pathFlavor === paths.flavor &&
+			(denying && paths.containsDenied
+				? paths.containsDenied(rule.path, normalized)
+				: paths.contains(rule.path, normalized)),
 	);
 }
 
@@ -31,7 +54,7 @@ export function evaluatePathPolicy(input: {
 	whitelist: readonly DirectoryWhitelistRule[];
 	blacklist: readonly DirectoryBlacklistRule[];
 }): PathPolicyDecision {
-	const denied = matchingPathRules(input.path, input.paths, input.blacklist).find(
+	const denied = matchingPathRules(input.path, input.paths, input.blacklist, true).find(
 		(rule) => rule.denyLevel === "denyAll" || input.operation !== "read",
 	);
 	if (denied) return { decision: "deny", rule: denied };

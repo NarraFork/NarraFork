@@ -23,6 +23,7 @@
 	"narratorNotFound": "叙述者未找到",
 	"workingDirectory": "工作目录",
 	"workingDirectoryHint": "留空则使用主目录",
+	"remoteWorkingDirectoryHint": "请选择远端设备上的工作目录；Windows 会话不会自动使用执行器的启动目录。",
 	"workingDirectoryPlaceholder": "/path/to/directory",
 	"model": "模型",
 	"modelHint": "\"跟随默认\"会始终使用设置中的默认模型",

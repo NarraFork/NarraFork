@@ -249,6 +249,10 @@ export interface ToolExecutionTarget {
 	canonicalPath?: string;
 	/** Backend runtime generation that produced the canonical identity. */
 	runtimeGeneration?: number;
+	/** Original native evidence frozen during authorization, not refreshed from a same-name target. */
+	nativeDescriptor?: import("@shared/target-native-path").NativePathDescriptorV2;
+	/** Original effective cwd directory proof, separate from a file's target identity. */
+	nativeRootDescriptor?: import("@shared/target-native-path").NativePathDescriptorV2;
 	/**
 	 * Compatibility alias for legacy persistence and callers. New code should use
 	 * canonicalPath when available, then lexicalPath.

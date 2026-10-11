@@ -59,6 +59,10 @@ import {
 	RemoteHistoryService,
 } from "./remote-history-service";
 import {
+	checkWindowsEditorSession,
+	preflightWindowsEditorMetadata,
+} from "./windows-editor-metadata-preflight";
+import {
 	type WorkspaceRuntimeBinding,
 	WorkspaceWriteCoordinator,
 	type WorkspaceWriteLease,
@@ -955,11 +959,108 @@ export class RemoteWorkspaceHistoryRuntime {
 				this.assertScope(scope, binding);
 				const history = this.history(guarded, binding);
 				const remote = new RemoteFileChangeRuntime(history, guarded);
-				const namespace = await this.auditNamespace(input.signal);
+				const windowsEditor = guarded.pathFlavor === "windows" && actor.kind === "human";
+				let namespace = windowsEditor ? undefined : await this.auditNamespace(input.signal);
 				let operation: ReturnType<FileChangeEvidenceService["beginOperation"]> | undefined;
 				let effect: FileChangeEffectRecord | undefined;
 				let lineStats: { added: number; removed: number } | null | undefined;
+				// Local flow facts only: admission/preparing is never native dispatch proof.
+				let newWindowsPreparation = false;
+				let metadataAttempted = false;
+				let windowsLeaseCheck: (() => void) | undefined;
 				try {
+					if (windowsEditor) {
+						lease.assertCurrent();
+						const leaseId = lease.leaseId;
+						const columns = {
+							leaseId: workspaceWriteLeases.leaseId,
+							scopeId: workspaceWriteLeases.scopeId,
+							deviceId: workspaceWriteLeases.deviceId,
+							ownerEpoch: workspaceWriteLeases.ownerEpoch,
+							runtimeEpoch: workspaceWriteLeases.runtimeEpoch,
+							runtimeGeneration: workspaceWriteLeases.runtimeGeneration,
+							fencingToken: workspaceWriteLeases.fencingToken,
+							scopeRevision: workspaceWriteLeases.scopeRevision,
+							status: workspaceWriteLeases.status,
+						};
+						const held = this.options.db
+							.select(columns)
+							.from(workspaceWriteLeases)
+							.where(eq(workspaceWriteLeases.leaseId, leaseId))
+							.get();
+						if (
+							!held ||
+							held.status !== "executing" ||
+							held.scopeId !== lease.scope.id ||
+							held.deviceId !== target.deviceId ||
+							held.runtimeEpoch !== lease.executionBinding.runtimeEpoch ||
+							held.runtimeGeneration !== lease.executionBinding.runtimeGeneration ||
+							held.fencingToken !== lease.executionBinding.fencingToken ||
+							held.scopeRevision !== lease.scopeRevision
+						)
+							throw new Error("Original Windows editor durable lease is unavailable");
+						const pinned = Object.freeze({ ...held });
+						windowsLeaseCheck = () => {
+							this.backend(target);
+							lease.assertCurrent();
+							this.assertScope(scope, binding);
+							const row = this.options.db
+								.select(columns)
+								.from(workspaceWriteLeases)
+								.where(eq(workspaceWriteLeases.leaseId, leaseId))
+								.get();
+							const liveScope = this.evidence.getScope(pinned.scopeId);
+							if (
+								!row ||
+								row.status !== "executing" ||
+								row.leaseId !== pinned.leaseId ||
+								row.scopeId !== pinned.scopeId ||
+								row.deviceId !== pinned.deviceId ||
+								row.ownerEpoch !== pinned.ownerEpoch ||
+								row.runtimeEpoch !== pinned.runtimeEpoch ||
+								row.runtimeGeneration !== pinned.runtimeGeneration ||
+								row.fencingToken !== pinned.fencingToken ||
+								row.scopeRevision !== pinned.scopeRevision ||
+								!liveScope ||
+								liveScope.status !== "active" ||
+								liveScope.activeLeaseId !== leaseId ||
+								liveScope.revision !== pinned.scopeRevision ||
+								liveScope.sourceInstanceId !== scope.sourceInstanceId ||
+								liveScope.workspaceInstanceId !== scope.workspaceInstanceId ||
+								liveScope.canonicalRoot !== scope.canonicalRoot ||
+								liveScope.rootIdentityJson?.object !== binding.rootIdentity ||
+								liveScope.fencingToken !== pinned.fencingToken
+							)
+								throw new Error("Original Windows editor source/scope/lease/fence changed");
+						};
+						const check = {
+							registry: this,
+							userId: actor.userId,
+							phase: "save" as const,
+							signal: input.signal,
+							assertCurrent: windowsLeaseCheck,
+							authorize: async (bounded: AbortSignal) => {
+								await input.authorize();
+								bounded.throwIfAborted();
+								await this.options.authorize(actor, target, "write", bounded);
+							},
+						};
+						const origin = await checkWindowsEditorSession(check);
+						lease.assertCurrent();
+						const context = this.operationInput(
+							actor,
+							input.operationId,
+							input.requestDigest,
+							lease,
+						);
+						// Root transaction either inserts this intent or rejects every old source
+						// tuple. Never infer creation from counters or claim an existing preparing row.
+						operation = this.evidence.beginNewPreparingOperation(context);
+						newWindowsPreparation = true;
+						await preflightWindowsEditorMetadata({ ...check, origin, correlationId: operation.id });
+						namespace = await this.auditNamespace(input.signal);
+						metadataAttempted = true;
+					}
 					return await remote.execute({
 						...input,
 						identity,
@@ -970,6 +1071,8 @@ export class RemoteWorkspaceHistoryRuntime {
 							lineStats = (constructed as { lineStats?: { added: number; removed: number } | null })
 								.lineStats;
 							const beforeState = remoteHistoryFileState(before.state);
+							if (!namespace)
+								throw new Error("Audit namespace unavailable after metadata preflight");
 							await this.importState(namespace, beforeState, before.bytes, input.signal);
 							const afterRef = await namespace.store.putBytes(constructed.nextBytes, {
 								signal: input.signal,
@@ -1052,6 +1155,8 @@ export class RemoteWorkspaceHistoryRuntime {
 								change.after.kind === "regular"
 									? await history.readObject(change.after.object, cleanup)
 									: null;
+							if (!namespace)
+								throw new Error("Audit namespace unavailable for original operation commit");
 							await this.importState(namespace, after, bytes, cleanup);
 							const fixedOperation = operation;
 							const fixedEffect = effect;
@@ -1087,6 +1192,31 @@ export class RemoteWorkspaceHistoryRuntime {
 						},
 					});
 				} catch (error) {
+					if (windowsEditor && newWindowsPreparation && operation && !metadataAttempted) {
+						try {
+							if (!windowsLeaseCheck)
+								throw new Error("Original Windows lease assertion is missing");
+							windowsLeaseCheck();
+							const current = this.evidence.getOperation(operation.id);
+							if (
+								!current ||
+								current.settlement !== "preparing" ||
+								current.preparedEffectCount !== 0 ||
+								lease.pendingMutationCount !== 0 ||
+								effect !== undefined
+							)
+								throw new Error("Original Windows preparation cannot be proven non-dispatched");
+							this.evidence.finishPreparationWithoutDispatch(operation.id, {
+								targetDispatched: false,
+								reason: input.signal.aborted ? "cancelled_before_dispatch" : "validation_rejected",
+							});
+							windowsLeaseCheck();
+						} catch (settlementError) {
+							lease.markUncertain();
+							throw settlementError;
+						}
+						throw error;
+					}
 					if (operation && effect && isRemoteHistoryNoDispatchError(error)) {
 						try {
 							const receipt = error.receipt;
@@ -1338,6 +1468,8 @@ export async function authorizeRemoteHistoryTarget(
 	target: Readonly<RemoteHistoryTarget>,
 	need: "read" | "write",
 	signal: AbortSignal,
+	/** Server-only strict lookup window; never a request/DTO permission flag. */
+	freshPolicy = false,
 ) {
 	const [{ db }, schema, acl, projectAcl, devices, oauth, deviceOAuth, policy] = await Promise.all([
 		import("../db"),
@@ -1400,7 +1532,10 @@ export async function authorizeRemoteHistoryTarget(
 		if (need === "write" ? level !== "readWrite" : level === "denied")
 			throw new Error("Remote history exceeds device OAuth ceiling");
 	}
-	const compiled = await policy.executionPolicyEngine.compile(
+	const compiled = await (freshPolicy
+		? new policy.ExecutionPolicyEngine()
+		: policy.executionPolicyEngine
+	).compile(
 		actor.narratorId,
 		{
 			backend,

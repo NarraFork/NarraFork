@@ -99,6 +99,8 @@ export interface PathIdentity {
 	exists: boolean;
 	/** Backend runtime generation that produced this identity. */
 	runtimeGeneration: number;
+	/** fs.path.resolve.v2 native slot/ancestor proof; absent never grants v2 authority. */
+	nativeDescriptor?: import("@shared/target-native-path").NativePathDescriptorV2;
 }
 
 /** A directory entry returned by listDir. */
@@ -146,6 +148,8 @@ export interface ReadBytesOptions {
 	 * backends may require a negotiated atomic-read capability.
 	 */
 	expectedResolvedPath?: string;
+	/** fs.path.resolve.v2 proof must be revalidated against the actual opened handle. */
+	expectedNativeDescriptor?: import("@shared/target-native-path").NativePathDescriptorV2;
 	/** Abort signal to cancel a long read. */
 	signal?: AbortSignal;
 	/** Require a bounded cancellable read on remote executors (fs.read.bounded.v1). */
@@ -156,11 +160,13 @@ export interface ReadBytesOptions {
 export interface WriteBytesOptions {
 	/** Canonical create/existing path authorized before the write. */
 	expectedResolvedPath?: string;
+	expectedNativeDescriptor?: import("@shared/target-native-path").NativePathDescriptorV2;
 }
 
 export interface ConditionalWriteBytesOptions {
 	expectedBytes: Uint8Array | null;
 	expectedResolvedPath: string;
+	expectedNativeDescriptor?: import("@shared/target-native-path").NativePathDescriptorV2;
 	signal?: AbortSignal;
 	timeoutMs?: number;
 }
@@ -195,6 +201,12 @@ export async function readCompleteFileBytes(
 export interface FileMetadataOptions {
 	signal?: AbortSignal;
 	timeoutMs?: number;
+	/** Explicit target cwd for resolution, never the controller process cwd. */
+	baseCwd?: string;
+	operation?: import("@shared/target-native-path").NativePathOperation;
+	expectedNativeDescriptor?: import("@shared/target-native-path").NativePathDescriptorV2;
+	/** Original root incarnation/containment proof, distinct from the target descriptor. */
+	expectedRootDescriptor?: import("@shared/target-native-path").NativePathDescriptorV2;
 }
 
 /** Array-compatible search results; old tool callers may ignore the optional marker. */
@@ -320,6 +332,8 @@ export interface GitDiffParams {
  */
 export interface ExecutionBackend {
 	/** Additive private-history data plane; never falls back to plain fs.write. */
+	/** Native resolver API presence; never full metadata or root authorization. */
+	readonly supportsNativePathV2?: boolean;
 	readonly supportsRemoteHistory?: boolean;
 	readonly supportsRemoteTreeCapture?: boolean;
 	readonly supportsRemoteObjectStage?: boolean;

@@ -10,6 +10,7 @@ import { getSettingsRevision, settings } from "@server/lib/settings";
 import { canonicalizeShellAnalysisPaths } from "../../narrator-permission";
 import { ExecutionPolicyEngine } from "../engine";
 import { normalizeExecutionPolicyRuleSet } from "../normalize";
+import { resolveCanonicalPaths } from "../path-probes";
 import type { LoadedExecutionPolicy } from "../repository";
 import type { ExecutionTargetContext, LegacyExecutionPolicyRuleSet } from "../types";
 
@@ -182,6 +183,60 @@ describe("permission probes respect the effective device RPC cap", () => {
 });
 
 describe("Bash permission canonical path probes", () => {
+	test("a readonly native probe freezes relative paths to its selected Windows drive", async () => {
+		const probes = new PathProbes(true);
+		const original = context(probes, "windows");
+		const ctx = { ...original, target: { ...original.target, cwd: "D:\\work" } };
+		await expect(resolveCanonicalPaths(["C:foo"], ctx, "read-only regression")).rejects.toThrow(
+			"AMBIGUOUS_DRIVE_RELATIVE",
+		);
+		expect(probes.calls).toHaveLength(0);
+		await resolveCanonicalPaths(["D:foo", "\\foo", "Work", "work"], ctx, "read-only regression");
+		expect(probes.calls.map((call) => call.path)).toEqual([
+			"D:\\work\\foo",
+			"D:\\foo",
+			"D:\\work\\Work",
+			"D:\\work\\work",
+		]);
+	});
+
+	test("revalidates the original cwd separately without restricting external resource roots", async () => {
+		const probes = new PathProbes(true);
+		const original = context(probes, "windows");
+		const ancestor = {
+			canonicalPath: "D:\\",
+			object: { volumeId: "volume", fileId: "1".padStart(32, "0"), creationTime: "1" },
+			caseSensitive: false,
+		};
+		const root: NonNullable<ExecutionTargetContext["target"]["nativeRootDescriptor"]> = {
+			version: 2,
+			platform: "windows",
+			pathSlotKey: "2".padStart(64, "0"),
+			componentKeys: ["root", "WORK"],
+			volumeId: "volume",
+			ancestors: [ancestor],
+			parent: ancestor,
+			missingSuffix: [],
+			object: { ...ancestor.object, fileId: "2".padStart(32, "0") },
+			caseSensitive: false,
+		};
+		const ctx = {
+			...original,
+			target: { ...original.target, cwd: "D:\\work", nativeRootDescriptor: root },
+		};
+		const optionsSeen: FileMetadataOptions[] = [];
+		ctx.backend.resolvePathIdentity = (path, options) => {
+			optionsSeen.push(options ?? {});
+			return probes.resolve(path, options);
+		};
+		await resolveCanonicalPaths(["C:\\global-resource"], ctx, "root regression");
+		expect(probes.calls.map((call) => call.path)).toEqual(["D:\\work", "C:\\global-resource"]);
+		expect(optionsSeen[0].expectedNativeDescriptor).toBe(root);
+		expect(optionsSeen[0].operation).toBe("existing");
+		expect(optionsSeen[1].expectedRootDescriptor).toBeUndefined();
+		expect(probes.peak).toBe(1);
+	});
+
 	test("bounds a real analysis batch larger than the device's 16 slots", async () => {
 		const probes = new PathProbes(true);
 		const original = analysis();
@@ -194,14 +249,14 @@ describe("Bash permission canonical path probes", () => {
 		expect(original.filePaths).toBe(inputs);
 	});
 
-	test("deduplicates probes before dispatch, using target Windows identity", async () => {
+	test("deduplicates only exact lexical Windows paths, never unproven case variants", async () => {
 		const probes = new PathProbes(true);
 		const result = await canonicalizeShellAnalysisPaths(
 			analysis(["C:\\workspace\\file", "c:/workspace/./FILE", "C:\\workspace\\file"]),
 			context(probes, "windows"),
 		);
-		expect(probes.calls).toHaveLength(1);
-		expect(result.filePaths).toHaveLength(1);
+		expect(probes.calls).toHaveLength(2);
+		expect(result.filePaths).toHaveLength(2);
 	});
 
 	test("preserves POSIX case and leaves symlink identity to the backend after target normalization", async () => {

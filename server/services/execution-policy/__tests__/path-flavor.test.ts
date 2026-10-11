@@ -9,7 +9,10 @@ describe("execution policy path flavor", () => {
 		expect(detectPathFlavor("/var/lib/app")).toBe("posix");
 		expect(normalizePathKey("/var/lib/app/", "posix")).toBe("/var/lib/app");
 		expect(detectPathFlavor("C:\\Work\\Repo")).toBe("windows");
-		expect(normalizePathKey("C:\\Work\\Repo\\", "windows")).toBe("c:/work/repo");
+		expect(normalizePathKey("C:\\Work\\Repo\\", "windows")).toBe("C:/Work/Repo");
+		expect(normalizePathKey("C:\\Work", "windows")).not.toBe(
+			normalizePathKey("C:\\work", "windows"),
+		);
 	});
 
 	test("does not compare paths across different flavors", () => {

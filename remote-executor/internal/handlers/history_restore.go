@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 
 	"github.com/narrafork/remote-executor/internal/history"
+	"github.com/narrafork/remote-executor/internal/windowsbackup"
 )
 
 // preflightHistoryNative performs read-only, target-specific validation. Checking
@@ -29,7 +30,7 @@ func (h *Handlers) preflightHistoryNative(ctx context.Context, request history.N
 		return err
 	}
 	if request.Before.Kind == "regular" {
-		file, err := os.Open(request.Path)
+		file, err := windowsbackup.OpenMutation(request.Path)
 		if err != nil {
 			return err
 		}
@@ -85,7 +86,7 @@ func (h *Handlers) applyHistoryNative(ctx context.Context, request history.Nativ
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	current, err := os.Open(request.Path)
+	current, err := windowsbackup.OpenMutation(request.Path)
 	if request.Before.Kind == "absent" {
 		if err == nil {
 			current.Close()
@@ -207,7 +208,7 @@ func (h *Handlers) applyHistoryNative(ctx context.Context, request history.Nativ
 		if err := quarantineHistoryOriginal(current, filepath.Join(recovery, "original")); err != nil {
 			return err
 		}
-		moved, err := os.Open(filepath.Join(recovery, "original"))
+		moved, err := windowsbackup.OpenObservation(filepath.Join(recovery, "original"))
 		if err != nil {
 			return err
 		}

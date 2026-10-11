@@ -91,6 +91,7 @@ import usageHistoryRoutes from "./routes/usage-history";
 import { userPreferencesRoutes } from "./routes/user-preferences";
 import { vnetRoutes } from "./routes/vnet";
 import { volumeSnapshotRoutes } from "./routes/volume-snapshots";
+import { windowsFirstCaptureRoutes } from "./routes/windows-first-capture";
 import { workspaceRoutes } from "./routes/workspaces";
 import { narratorWorktreeService } from "./services/narrator-worktree-runtime";
 
@@ -366,6 +367,7 @@ app.route("/api/chapter-edges", chapterEdgeRoutes);
 app.route("/api/chat", chatRoutes);
 app.route("/api/narrators", publicNarratorShareManagementRoutes);
 app.route("/api/narrators", editorDocumentRoutes);
+app.route("/api/narrators", windowsFirstCaptureRoutes);
 // Worktree paths must precede the generic Git router's workspace middleware.
 app.route(
 	"/api/narrators",

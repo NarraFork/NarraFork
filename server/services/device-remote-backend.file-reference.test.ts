@@ -15,6 +15,7 @@ let currentGeneration = 7;
 let hang = false;
 let conditionalResult = { applied: true };
 let conditionalError = null;
+let nativeReply = null;
 mock.module(${JSON.stringify(settingsPath)}, () => ({ settings: { devices: { maxRpcBytes: 1048576, rpcTimeoutMs: 10000 } } }));
 mock.module(${JSON.stringify(connectionPath)}, () => ({
   hasDeviceProtocolFeature: (_id, feature) => features.has(feature),
@@ -30,7 +31,9 @@ mock.module(${JSON.stringify(connectionPath)}, () => ({
     }
     if (method === "glob") return { matches: ["file.ts"], truncated: true };
     if (method === "fs.stat") return { exists: true, isFile: true, isDirectory: false, size: 2, resolvedPath: "/work/file.ts" };
-    if (method === "fs.read") return { dataB64: "b2s=", totalSize: 2, truncated: false, resolvedPath: "/work/file.ts" };
+    if (method === "fs.read") return { dataB64: "b2s=", totalSize: 2, truncated: false, resolvedPath: params.expectedResolvedPath ?? "/work/file.ts" };
+    if (method === "fs.write") return {};
+    if (method === "fs.path.resolve.v2" && nativeReply) return structuredClone(nativeReply);
     throw new Error("Unexpected RPC " + method);
   }
 }));
@@ -80,6 +83,39 @@ await assert.rejects(backend.conditionalWriteFileBytes("/work/file.ts", Buffer.f
 });
 conditionalError = null;
 await assert.rejects(backend.conditionalWriteFileBytes("/work/file.ts", new Uint8Array(2000001), writeOpts), /limit/);
+
+// Windows v2 observations cannot replace a caller's original object evidence.
+features.add("fs.path.resolve.v2");
+features.add("fs.write.atomic-resolved-path.v1");
+const winPath = "C:\\\\work\\\\file.ts";
+const parent = { canonicalPath: "C:\\\\work", object: { volumeId: "volume-c", fileId: "a".repeat(32), creationTime: "41" }, caseSensitive: false };
+nativeReply = {
+  lexicalPath: winPath, canonicalPath: winPath, exists: true, inputKind: "drive-absolute",
+  nativeDescriptor: {
+    version: 2, platform: "windows", pathSlotKey: "e".repeat(64), componentKeys: ["WORK", "FILE.TS"],
+    volumeId: "volume-c", ancestors: [parent], parent, missingSuffix: [],
+    object: { volumeId: "volume-c", fileId: "b".repeat(32), creationTime: "42" }
+  }
+};
+const win = new RemoteBackend("WinDevice", { connectionGeneration: 7, defaultCwd: parent.canonicalPath, platform: {os: "windows", arch: "x64"}, supportsFsReadAtomicResolvedPath: true, supportsFsWriteAtomicResolvedPath: true });
+let count = calls.length;
+await assert.rejects(win.readFileBytes(winPath), /NATIVE_PATH_IDENTITY_REQUIRED/);
+assert.equal(calls.length, count, "missing original evidence must fail before byte IO");
+const original = await win.resolvePathIdentity(winPath);
+assert.equal(Object.isFrozen(original.nativeDescriptor), true);
+nativeReply.nativeDescriptor.object.fileId = "c".repeat(32);
+await win.resolvePathIdentity(winPath); // later observation occupies the cache
+await win.readFileBytes(winPath, {expectedResolvedPath: winPath, expectedNativeDescriptor: original.nativeDescriptor});
+sent = calls.at(-1);
+assert.equal(sent.params.expectedNativeDescriptor.object.fileId, "b".repeat(32));
+assert.ok(sent.opts.requiredFeatures.includes("fs.path.resolve.v2"));
+await win.writeFileBytes(winPath, Buffer.from("next"), {expectedResolvedPath: winPath, expectedNativeDescriptor: original.nativeDescriptor});
+assert.equal(calls.at(-1).params.expectedNativeDescriptor.object.fileId, "b".repeat(32));
+await win.conditionalWriteFileBytes(winPath, Buffer.from("next"), {expectedBytes: Buffer.from("ok"), expectedResolvedPath: winPath, expectedNativeDescriptor: original.nativeDescriptor});
+assert.equal(calls.at(-1).params.expectedNativeDescriptor.object.fileId, "b".repeat(32));
+features.delete("fs.path.resolve.v2"); count = calls.length;
+await assert.rejects(win.readFileBytes(winPath, {expectedNativeDescriptor: original.nativeDescriptor}), /cannot validate native path v2/);
+assert.equal(calls.length, count, "native evidence cannot downgrade to legacy byte IO");
 hang = true;
 const pending = backend.glob("**/*", {cwd: "/work", timeoutMs: 1500, signal: abort.signal});
 abort.abort(new Error("cancel scan")); await assert.rejects(pending, /cancel scan/);

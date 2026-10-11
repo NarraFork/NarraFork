@@ -283,7 +283,10 @@ export async function prepareWorkspaceContext(
 	if (!backend.paths.isAbsolute(target.cwd))
 		throw new ValidationError("cwd must be an absolute target path");
 	const identity = await backend.resolvePathIdentity(target.cwd, { timeoutMs: 10_000 });
-	const info = await backend.statFile(identity.canonicalPath, { timeoutMs: 10_000 });
+	const info = await backend.statFile(identity.canonicalPath, {
+		timeoutMs: 10_000,
+		expectedNativeDescriptor: identity.nativeDescriptor,
+	});
 	if (!identity.exists || !info?.isDirectory)
 		throw new ValidationError("Remote working directory does not exist or is not accessible");
 	if (info.resolvedPath && !backend.paths.equals(info.resolvedPath, identity.canonicalPath))
@@ -323,6 +326,7 @@ export async function prepareWorkspaceContext(
 		cwd,
 		pathFlavor: backend.paths.flavor === "windows" ? "windows" : "posix",
 		contextProjectId,
+		...(identity.nativeDescriptor ? { nativeRootDescriptor: identity.nativeDescriptor } : {}),
 		git,
 		availability: "ready",
 		contextKey: createHash("sha256")

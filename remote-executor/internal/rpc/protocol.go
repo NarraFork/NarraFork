@@ -6,10 +6,14 @@ package rpc
 import (
 	"encoding/json"
 
+	"github.com/narrafork/remote-executor/internal/windowsbackup"
 	"github.com/narrafork/remote-executor/internal/wire"
 )
 
 const ProtocolVersion = 1
+
+// Protocol implementation only, never deployment/full-metadata readiness.
+const FeatureWindowsFirstCaptureV1 = windowsbackup.FirstCaptureFeature
 
 // FeatureHistoryV1 covers source-qualified sparse capture, durable intent,
 // conditional target IO, paged inspection and proven-effect compensation.
@@ -17,6 +21,12 @@ const FeatureHistoryV1 = "history.v1"
 const FeatureHistoryCaptureTreeV1 = "history.capture-tree.v1"
 const FeatureHistoryObjectStageV1 = "history.object-stage.v1"
 const FeatureHistoryNativeMetadataV1 = "history.native-metadata.v1"
+const FeatureHistoryNativeMetadataV2 = "history.native-metadata.v2"
+const FeatureHistoryVolumeVaultV1 = "history.volume-vault.v1"
+const FeatureFsPathResolveV2 = "fs.path.resolve.v2"
+const FeaturePtyConptyV1 = "pty.conpty.v1"
+const FeaturePtyLifecycleEvidenceV1 = "pty.lifecycle-evidence.v1"
+const FeaturePtyBoundedIOV1 = "pty.bounded-io.v1"
 const FeatureWorkspaceAttachmentV1 = "workspace.attachment.v1"
 
 // Advertised only after private worktree journaling is configured.
@@ -187,11 +197,21 @@ type HelloFrame struct {
 }
 
 type HelloAckFrame struct {
-	Type      string  `json:"type"` // "hello_ack"
-	OK        bool    `json:"ok"`
-	Error     string  `json:"error,omitempty"`
-	SessionID string  `json:"sessionId,omitempty"`
-	Limits    *Limits `json:"limits,omitempty"`
+	Type                   string                  `json:"type"` // "hello_ack"
+	OK                     bool                    `json:"ok"`
+	Error                  string                  `json:"error,omitempty"`
+	SessionID              string                  `json:"sessionId,omitempty"`
+	Limits                 *Limits                 `json:"limits,omitempty"`
+	WindowsMetadataSession *WindowsMetadataSession `json:"windowsMetadataSession,omitempty"`
+}
+
+// WindowsMetadataSession is controller-created per authenticated connection.
+// It is correlation evidence, not actor authority or a helper enrollment grant.
+type WindowsMetadataSession struct {
+	Version           int    `json:"version"`
+	ConnectionID      string `json:"connectionId"`
+	SessionID         string `json:"sessionId"`
+	RuntimeGeneration uint64 `json:"runtimeGeneration"`
 }
 
 type Limits struct {
@@ -202,10 +222,11 @@ type Limits struct {
 // ── RPC frames ────────────────────────────────────────────────────────────────
 
 type RequestFrame struct {
-	Type   string         `json:"type"` // "rpc"
-	ID     string         `json:"id"`
-	Method string         `json:"method"`
-	Params map[string]any `json:"params"`
+	Type                      string                            `json:"type"` // "rpc"
+	ID                        string                            `json:"id"`
+	Method                    string                            `json:"method"`
+	Params                    map[string]any                    `json:"params"`
+	WindowsFirstCaptureOrigin *windowsbackup.FirstCaptureOrigin `json:"windowsFirstCaptureOrigin,omitempty"`
 }
 
 type StreamFrame struct {

@@ -450,6 +450,7 @@ export const structSedTool: ToolDefinition = {
 				const read = await backend.readFileBytes(ioPath, {
 					maxBytes: MAX_FILE_BYTES,
 					...(canonicalPath ? { expectedResolvedPath: canonicalPath } : {}),
+					expectedNativeDescriptor: ctx.executionTarget?.nativeDescriptor,
 					signal: ctx.signal,
 				});
 				if (read.truncated) {
@@ -753,6 +754,7 @@ export const structSedTool: ToolDefinition = {
 				await backend.conditionalWriteFileBytes(ioPath, nextBytes, {
 					expectedBytes: originalBytes,
 					expectedResolvedPath: ioPath,
+					expectedNativeDescriptor: ctx.executionTarget?.nativeDescriptor,
 					signal: ctx.signal,
 					timeoutMs: 30_000,
 				});

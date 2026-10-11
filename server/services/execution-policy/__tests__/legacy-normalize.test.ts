@@ -23,7 +23,7 @@ describe("legacy execution policy normalization", () => {
 	test("normalizes legacy narrator device scopes and canonical storage fields", () => {
 		const rules = normalizeExecutionPolicyRuleSet(
 			{
-				blacklistDirs: [{ path: "C:\\Secret", deviceScope: "local" }],
+				blacklistDirs: [{ path: "C:\\Secret", pathKey: "c:/secret", deviceScope: "local" }],
 				commandWhitelist: [
 					{ pattern: "git status", targetKind: "device", targetValue: "device-a" },
 				],
@@ -33,7 +33,8 @@ describe("legacy execution policy normalization", () => {
 		expect(rules.directoryBlacklist[0]).toMatchObject({
 			selector: { kind: "host" },
 			pathFlavor: "windows",
-			pathKey: "c:/secret",
+			path: "C:\\Secret",
+			pathKey: "C:/Secret",
 		});
 		expect(rules.commandWhitelist[0].selector).toEqual({
 			kind: "device",

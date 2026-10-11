@@ -46,9 +46,14 @@ export function normalizeDirectoryWhitelistRule(
 		...baseRule(entry, source),
 		ruleType: "directoryWhitelist",
 		...path,
-		pathKey: entry.pathKey?.trim()
-			? normalizePathKey(entry.pathKey, path.pathFlavor)
-			: path.pathKey,
+		// Legacy Windows pathKey was globally folded; rebuild from the original
+		// rule spelling, never treat the persisted lowercase key as native proof.
+		pathKey:
+			path.pathFlavor === "windows"
+				? path.pathKey
+				: entry.pathKey
+					? normalizePathKey(entry.pathKey, path.pathFlavor)
+					: path.pathKey,
 		accessLevel: entry.accessLevel ?? "readOnly",
 	};
 }
@@ -62,9 +67,14 @@ export function normalizeDirectoryBlacklistRule(
 		...baseRule(entry, source),
 		ruleType: "directoryBlacklist",
 		...path,
-		pathKey: entry.pathKey?.trim()
-			? normalizePathKey(entry.pathKey, path.pathFlavor)
-			: path.pathKey,
+		// Legacy Windows pathKey was globally folded; rebuild from the original
+		// rule spelling, never treat the persisted lowercase key as native proof.
+		pathKey:
+			path.pathFlavor === "windows"
+				? path.pathKey
+				: entry.pathKey
+					? normalizePathKey(entry.pathKey, path.pathFlavor)
+					: path.pathKey,
 		denyLevel: entry.denyLevel ?? "denyAll",
 	};
 }

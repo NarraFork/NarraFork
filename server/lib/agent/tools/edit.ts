@@ -705,6 +705,7 @@ export const editTool: ToolDefinition = {
 					? (
 							await readCompleteFileBytes(backend, ioPath, {
 								expectedResolvedPath: canonicalPath,
+								expectedNativeDescriptor: ctx.executionTarget?.nativeDescriptor,
 							})
 						).bytes
 					: null;
@@ -735,7 +736,10 @@ export const editTool: ToolDefinition = {
 							applyLineEnding(normalizeLineEndings(new_string), overwriteEnding),
 							decoded.encoding,
 						),
-						{ expectedResolvedPath: canonicalPath },
+						{
+							expectedResolvedPath: canonicalPath,
+							expectedNativeDescriptor: ctx.executionTarget?.nativeDescriptor,
+						},
 					);
 					// This mode OVERWRITES an existing file as readily as it creates a new
 					// one, so the previous content (when there was any) is the baseline. A
@@ -771,7 +775,10 @@ export const editTool: ToolDefinition = {
 				await backend.writeFileBytes(
 					resolvedPath,
 					encodeFileBytes(applyLineEnding(result.content, lineEnding), encoding),
-					{ expectedResolvedPath: canonicalPath },
+					{
+						expectedResolvedPath: canonicalPath,
+						expectedNativeDescriptor: ctx.executionTarget?.nativeDescriptor,
+					},
 				);
 				// Diffed against the text actually matched (not the model's `old_string`) and
 				// scaled by the replacement count — see `ReplaceResult.matchedText` /

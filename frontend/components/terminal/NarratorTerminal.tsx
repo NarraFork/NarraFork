@@ -10,7 +10,11 @@ import {
 	useRenameTerminal,
 } from "../../hooks/useTerminals";
 import { useTerminalViewState } from "../../hooks/useTerminalViewState";
-import { getTerminalWSManager } from "../../hooks/useTerminalWS";
+import {
+	getTerminalWSManager,
+	type TerminalLifecycle,
+	useTerminalWS,
+} from "../../hooks/useTerminalWS";
 import { useWorkspaceContext } from "../../hooks/useWorkspaceContext";
 import { LayoutSelector, type TerminalLayout } from "./LayoutSelector";
 import { TerminalGrid } from "./TerminalGrid";
@@ -83,10 +87,38 @@ export function NarratorTerminal({
 	const terminalUnsupportedReason =
 		targetTerminal?.reason ?? terminalCapability.reason ?? t("terminalUnsupported");
 
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	const runningTerminals = (terminals ?? []).filter((t: any) => t.status === "running");
+	const runningTerminals = (terminals ?? []).filter(
+		(terminal) =>
+			terminal.status === "running" ||
+			(terminal.deviceId &&
+				terminal.deviceId !== "local" &&
+				terminal.lifecycle?.state === "unknown"),
+	);
 	const layout = (viewState.data?.layout ?? "single") as TerminalLayout;
 	const [activeId, setActiveId] = useState<string | null>(viewState.data?.activeTabId ?? null);
+	const [lifecycleUpdates, setLifecycleUpdates] = useState<Record<string, TerminalLifecycle>>({});
+	const { disconnected } = useTerminalWS(activeId ?? undefined, {
+		onLifecycle: (lifecycle) => {
+			if (activeId) setLifecycleUpdates((previous) => ({ ...previous, [activeId]: lifecycle }));
+		},
+	});
+	const activeTerminal = (terminals ?? []).find((terminal) => terminal.id === activeId);
+	const activeLifecycle: TerminalLifecycle | undefined = activeId
+		? disconnected
+			? { state: "unknown", code: null }
+			: (lifecycleUpdates[activeId] ?? activeTerminal?.lifecycle)
+		: undefined;
+	const lifecycleLabel = createTerminal.isPending
+		? t("lifecycleStarting")
+		: activeLifecycle?.state === "closing"
+			? t("lifecycleClosing")
+			: activeLifecycle?.state === "unknown"
+				? t("lifecycleUnknown")
+				: activeLifecycle?.state === "exited"
+					? t("lifecycleExited", { code: activeLifecycle.code })
+					: activeLifecycle?.state === "ready"
+						? t("lifecycleReady")
+						: null;
 
 	// Derive tabs from running terminals, sorted by saved order
 	const savedOrder = getSavedOrder(viewState.data?.panelAssignments);
@@ -106,13 +138,22 @@ export function NarratorTerminal({
 	const writeRef = useRef(onWriteRef);
 	writeRef.current = onWriteRef;
 	useEffect(() => {
-		if (runningTerminals.length > 0) {
-			const termId = runningTerminals[0].id;
+		const writable = runningTerminals.find((terminal) => {
+			const state = lifecycleUpdates[terminal.id]?.state ?? terminal.lifecycle?.state;
+			return (
+				terminal.status === "running" &&
+				state !== "closing" &&
+				state !== "unknown" &&
+				state !== "exited"
+			);
+		});
+		if (writable) {
+			const termId = writable.id;
 			writeRef.current?.((text: string) => getTerminalWSManager().sendInput(termId, text));
 		} else {
 			writeRef.current?.(null);
 		}
-	}, [runningTerminals]);
+	}, [runningTerminals, lifecycleUpdates]);
 
 	useEffect(() => {
 		return () => writeRef.current?.(null);
@@ -217,7 +258,11 @@ export function NarratorTerminal({
 					</Text>
 				)}
 				<Text size="sm" c="dimmed">
-					{terminalSupported ? t("noTerminals") : terminalUnsupportedReason}
+					{createTerminal.isPending
+						? t("lifecycleStarting")
+						: terminalSupported
+							? t("noTerminals")
+							: terminalUnsupportedReason}
 				</Text>
 				<Tooltip label={terminalSupported ? t("newTerminal") : terminalUnsupportedReason}>
 					<ActionIcon
@@ -265,6 +310,21 @@ export function NarratorTerminal({
 					<LayoutSelector value={layout} onChange={handleLayoutChange} />
 				</Box>
 			</Group>
+			{lifecycleLabel && (
+				<Text
+					role="status"
+					size="xs"
+					c={activeLifecycle?.state === "unknown" ? "yellow" : "dimmed"}
+					px={4}
+				>
+					{lifecycleLabel}
+				</Text>
+			)}
+			{deleteTerminal.error && (
+				<Text size="xs" c="yellow" px={4}>
+					{deleteTerminal.error.message}
+				</Text>
+			)}
 			{createTerminal.error && (
 				<Text size="xs" c="red" px={4}>
 					{createTerminal.error.message}

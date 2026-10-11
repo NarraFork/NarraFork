@@ -889,6 +889,61 @@ parentPort.postMessage({ type: "editor-worker-ready", version: 1 });`,
 		await Promise.all([a, b, ...queued]);
 		expect(peak).toBe(2);
 	});
+	test("queued cancellation removes only that task and nested IO retains its original permit", async () => {
+		const jobs = new EditorDocumentJobs();
+		const release = deferred();
+		const entered = deferred();
+		let queuedRan = false;
+		const running = jobs.withIo("same-user", async (admitted) => {
+			await jobs.withIo("same-user", async (nested) => {
+				expect(nested).toBe(admitted);
+			});
+			entered.resolve();
+			await release.promise;
+		});
+		await entered.promise;
+		const cancelled = new AbortController();
+		const pending = jobs.withIo(
+			"same-user",
+			async () => {
+				queuedRan = true;
+			},
+			cancelled.signal,
+		);
+		cancelled.abort();
+		await expect(pending).rejects.toThrow("cancelled");
+		release.resolve();
+		await running;
+		await jobs.withIo("same-user", async () => {});
+		expect(queuedRan).toBe(false);
+	});
+	test("running IO cancellation is awaited to completion rather than releasing its permit early", async () => {
+		const jobs = new EditorDocumentJobs();
+		const release = deferred(),
+			entered = deferred();
+		const controller = new AbortController();
+		let nextRan = false;
+		const running = jobs.withIo(
+			"same-user",
+			async (admitted) => {
+				entered.resolve();
+				await release.promise;
+				expect(admitted.aborted).toBe(true);
+			},
+			controller.signal,
+		);
+		await entered.promise;
+		const next = jobs.withIo("same-user", async () => {
+			nextRan = true;
+		});
+		controller.abort();
+		await Promise.resolve();
+		expect(nextRan).toBe(false);
+		release.resolve();
+		await running;
+		await next;
+		expect(nextRan).toBe(true);
+	});
 	test("oversize or malformed recovery metadata is rejected before unbounded parsing", async () => {
 		const jobs = new EditorDocumentJobs(),
 			folder = join(root, "recovery-check");

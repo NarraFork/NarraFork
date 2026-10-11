@@ -35,6 +35,11 @@ analyze2/
 *.heapsnapshot
 script/
 scripts/*
+# Keep the isolated Windows IO signing broker reproducible without tracking its state or keys.
+!scripts/windows-io-signing-broker/
+scripts/windows-io-signing-broker/*
+!scripts/windows-io-signing-broker/*.go
+!scripts/windows-io-signing-broker/go.mod
 !scripts/lib/
 scripts/lib/*
 !scripts/lib/latest-yml.ts

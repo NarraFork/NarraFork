@@ -23,11 +23,12 @@ import { AppError } from "../lib/errors";
 import { eventBus, type NarraForkEvent } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import * as deviceConnections from "./device-connection-service";
+import { RemoteBackend } from "./device-remote-backend";
 import { executionPolicyEngine } from "./execution-policy/engine";
 import { applySessionDefaultDevice } from "./narrator-session";
 import { type ActiveNarrator, activeNarrators } from "./narrator-session-state";
 import { permissionPolicyChanges } from "./permission-rule-service";
-import { workspaceContextService } from "./workspace-context-service";
+import { prepareWorkspaceContext, workspaceContextService } from "./workspace-context-service";
 
 // Test preload gives this real SQLite DB a temporary, process-isolated home.
 const { db } = await import("../db");
@@ -912,3 +913,112 @@ describe("history-only HTTP actions after a workspace switch", () => {
 		await assertFiles(f);
 	});
 });
+
+for (const nativeV2 of [false, true]) {
+	test(`real Windows backend without default cwd prepares an explicit workspace (${nativeV2 ? "native v2" : "legacy"})`, async () => {
+		const deviceId = "win-no-default";
+		const selectedCwd = "D:\\repo";
+		const backend = new RemoteBackend(deviceId, {
+			connectionGeneration: 7,
+			platform: { os: "windows", arch: "amd64" },
+			defaultCwd: "",
+			supportsFsStatResolvedPath: true,
+		});
+		const parent = {
+			canonicalPath: "D:\\",
+			object: { volumeId: "volume-d", fileId: "a".repeat(32), creationTime: "1" },
+			caseSensitive: false,
+		};
+		const descriptor = {
+			version: 2 as const,
+			platform: "windows" as const,
+			pathSlotKey: "e".repeat(64),
+			componentKeys: ["REPO"],
+			volumeId: "volume-d",
+			ancestors: [parent],
+			parent,
+			missingSuffix: [],
+			object: { volumeId: "volume-d", fileId: "b".repeat(32), creationTime: "2" },
+			caseSensitive: false,
+		};
+		const deviceSpy = spyOn(deviceConnections, "getSessionDevices").mockImplementation(
+			async (_project, actor) =>
+				actor === owner
+					? [
+							{
+								id: deviceId,
+								name: "Windows",
+								slug: deviceId,
+								scope: "global",
+								online: true,
+								defaultCwd: "",
+							},
+						]
+					: [],
+		);
+		const featureSpy = spyOn(deviceConnections, "hasDeviceProtocolFeature").mockImplementation(
+			(target, feature) => target === deviceId && nativeV2 && feature === "fs.path.resolve.v2",
+		);
+		const rpcSpy = spyOn(deviceConnections, "sendRpc").mockImplementation(
+			async (target, method, params, options) => {
+				expect(target).toBe(deviceId);
+				expect(options?.expectedConnectionGeneration).toBe(7);
+				if (method === "fs.path.resolve.v2") {
+					expect(params.inputPath).toBe(selectedCwd);
+					expect(backend.paths.isAbsolute(params.baseCwd as string)).toBe(true);
+					return {
+						lexicalPath: selectedCwd,
+						canonicalPath: selectedCwd,
+						exists: true,
+						inputKind: "drive-absolute",
+						nativeDescriptor: descriptor,
+					};
+				}
+				if (method === "fs.exists") {
+					expect(params.path).toBe(selectedCwd);
+					return { exists: true };
+				}
+				if (method !== "fs.stat") throw new Error(`Unexpected remote RPC: ${method}`);
+				expect(params.path).toBe(selectedCwd);
+				return {
+					exists: true,
+					isDirectory: true,
+					isFile: false,
+					size: 0,
+					resolvedPath: selectedCwd,
+				};
+			},
+		);
+		setRemoteBackendResolver((target) => (target === deviceId ? backend : null));
+		restorers.push(() => {
+			rpcSpy.mockRestore();
+			featureSpy.mockRestore();
+			deviceSpy.mockRestore();
+			setRemoteBackendResolver(null);
+		});
+		const context = await prepareWorkspaceContext({ deviceId, cwd: selectedCwd }, 1, undefined, {
+			userId: owner,
+		});
+		expect(context).toMatchObject({
+			deviceId,
+			cwd: selectedCwd,
+			pathFlavor: "windows",
+			revision: 1,
+			availability: "ready",
+		});
+		expect(context.nativeRootDescriptor).toEqual(nativeV2 ? descriptor : undefined);
+		expect(await backend.fileExists(selectedCwd)).toBe(true);
+		expect(await backend.statFile(selectedCwd)).toMatchObject({ isDirectory: true });
+		const calls = rpcSpy.mock.calls.length;
+		await expect(backend.resolvePathIdentity("relative-directory")).rejects.toThrow(
+			"baseCwd must be fully qualified",
+		);
+		expect(rpcSpy.mock.calls.length).toBe(calls);
+		await expect(
+			prepareWorkspaceContext({ deviceId, cwd: "relative-directory" }, 1, undefined, {
+				userId: owner,
+			}),
+		).rejects.toMatchObject({ code: "VALIDATION_ERROR" });
+		expect(rpcSpy.mock.calls.length).toBe(calls);
+	});
+}
