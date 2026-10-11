@@ -164,29 +164,57 @@ describe("exclusive creation binds a canonical directory handle", () => {
 		},
 	);
 
-	test("rejects unsupported platforms instead of a full-path fallback", async () => {
+	test("platforms without a bound parent stay exclusive by full pathname", async () => {
 		for (const platform of ["win32", "darwin", "freebsd"] as const) {
-			let calls = 0;
+			const seen: Array<[string, string, number?]> = [];
+			const exists = Object.assign(new Error("exists"), { code: "EEXIST" });
 			const io = createExclusiveLocalIo(
 				{
-					async open() {
-						calls++;
-						throw new Error("must not open");
+					async open(path, flags) {
+						seen.push(["open", path, flags]);
+						throw exists;
 					},
-					async mkdir() {
-						calls++;
-						throw new Error("must not create");
+					async mkdir(path) {
+						seen.push(["mkdir", path]);
+						if (path.endsWith("taken")) throw exists;
 					},
 				},
 				platform,
 			);
-			await expect(io.mkdir("/work/new", exclusiveCreateOptions().signal)).rejects.toThrow(
-				"remote executor",
-			);
-			await expect(
-				io.write("/work/new", Buffer.from("x"), exclusiveCreateOptions().signal),
-			).rejects.toThrow("remote executor");
-			expect(calls).toBe(0);
+			const { signal } = exclusiveCreateOptions();
+			expect(await io.mkdir("/work/new", signal)).toBe(true);
+			// EEXIST is a collision: never reported as success, never a recursive create.
+			expect(await io.mkdir("/work/taken", signal)).toBe(false);
+			// An existing file is refused, not truncated.
+			await expect(io.write("/work/file", Buffer.from("x"), signal)).rejects.toThrow("exists");
+			expect(seen.map(([call, path]) => [call, path])).toEqual([
+				["mkdir", "/work/new"],
+				["mkdir", "/work/taken"],
+				["open", "/work/file"],
+			]);
+			// The only open is O_CREAT|O_EXCL on the target itself: no procfs traversal.
+			const flags = seen[2]?.[2] ?? 0;
+			expect(flags & constants.O_EXCL).toBe(constants.O_EXCL);
+			expect(flags & constants.O_CREAT).toBe(constants.O_CREAT);
+		}
+	});
+
+	test.skipIf(linux)("this platform really creates once and refuses the second time", async () => {
+		const root = await realpath(await mkdtemp(join(tmpdir(), "nf-exclusive-")));
+		try {
+			const io = createExclusiveLocalIo();
+			const { signal } = exclusiveCreateOptions();
+			const directory = join(root, "ui");
+			expect(await io.mkdir(directory, signal)).toBe(true);
+			expect(await io.mkdir(directory, signal)).toBe(false);
+			// A missing parent is an error, not something to create on the way.
+			await expect(io.mkdir(join(root, "a", "b"), signal)).rejects.toThrow();
+			const file = join(directory, "App.tsx");
+			await io.write(file, Buffer.from("first"), signal);
+			await expect(io.write(file, Buffer.from("second"), signal)).rejects.toThrow();
+			expect(await readFile(file, "utf8")).toBe("first");
+		} finally {
+			await rm(root, { recursive: true, force: true });
 		}
 	});
 

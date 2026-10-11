@@ -87,10 +87,18 @@ beforeEach(async () => {
 afterEach(async () => {
 	for (const restore of restores.splice(0).reverse()) restore();
 	sqlite.close();
-	await rm(root, { recursive: true, force: true });
+	// Windows releases the journal databases' file handles asynchronously, so removing
+	// the temporary root can still see them as busy. Leaking a temp directory there is
+	// not what these tests are about; a locked file anywhere else still fails.
+	await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }).catch(
+		(error: NodeJS.ErrnoException) => {
+			if (process.platform !== "win32" || (error.code !== "EBUSY" && error.code !== "EPERM"))
+				throw error;
+		},
+	);
 });
 
-async function call(input: IntelligentUiInput) {
+async function call(input: Extract<IntelligentUiInput, { action: "create" | "show" }>) {
 	const path =
 		input.action === "create" ? join(workspace, ".narrafork/intelligent_ui") : input.path;
 	const resolved = await localBackend.resolvePathIdentity(path);

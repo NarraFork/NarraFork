@@ -56,12 +56,13 @@ export function createExclusiveLocalIo(
 	): Promise<T> {
 		validateExclusiveCreateInput(path);
 		signal.throwIfAborted();
-		// Node/Bun have no portable openat/mkdirat API. Never replace this with a
-		// full pathname or a post-create check: either can already write outside.
+		// Node/Bun have no portable openat/mkdirat API, so only Linux can bind the parent
+		// directory through procfs. Other platforms create by full pathname. That is still
+		// exclusive (EEXIST never overwrites and never creates parents), but a parent
+		// swapped for a link between the caller's canonicalization and this call is not
+		// detected here: an accepted trade for creation working at all on Windows/macOS.
 		if (platform !== "linux" || !constants.O_DIRECTORY || !constants.O_NOFOLLOW)
-			throw new Error(
-				"Secure exclusive creation requires Linux procfs locally; use a bound-parent capable remote executor on this platform",
-			);
+			return mutate(path);
 		if (!posix.isAbsolute(path) || posix.normalize(path) !== path || path === "/")
 			throw new Error("Exclusive creation requires a canonical absolute non-root path");
 		const parts = path.slice(1).split("/");

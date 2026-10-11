@@ -1558,9 +1558,14 @@ export class LocalFileChangeRuntime {
 												namespace,
 												{
 													bytes: prepared.nextBytes,
+													// The intended mode has to be one the platform can report
+													// back, or the write can never be verified. Windows has no
+													// owner-only bit: a new file there always stats as 0o666.
 													mode:
 														before.mode ??
-														(request.exclusiveCreate ? 0o600 : 0o666) & ~process.umask(),
+														(request.exclusiveCreate && process.platform !== "win32"
+															? 0o600
+															: 0o666) & ~process.umask(),
 													identity: null,
 												},
 												signal,
