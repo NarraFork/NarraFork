@@ -4,7 +4,9 @@ import { containerInstances, narrators, terminals } from "../db/schema";
 import { CONTAINER_STATUS_PRIORITY } from "../lib/constants";
 import { parseSubstatus } from "../lib/narrator-utils";
 import { broadcastToUser, getNarratorPresenceBatch } from "../websocket/narrator-ws";
+import { resolveNarratorListPrincipal } from "./narrator-acl";
 import { getNarratorIdsWithDraft } from "./narrator-draft-service";
+import { resolveTabNarratorVisibility } from "./recent-tabs-service";
 
 // ── Tab helpers ────────────────────────────────────────────────────────────
 
@@ -42,6 +44,29 @@ export async function enrichTabs(
 	const narratorIds = tabs.map(getTabNarratorId).filter((id): id is string => !!id);
 
 	if (narratorIds.length > 0) {
+		// The same readability + visibility resolution the paginated sidebar path uses, so a
+		// narrator cannot show up here and be missing there (or vice versa). Dropping is done
+		// on this list in place: it is the legacy whole-list view, not a paged one, so there
+		// is no cursor to keep consistent.
+		const principal = await resolveNarratorListPrincipal(userId);
+		const { known, readable, visibility } = await resolveTabNarratorVisibility(
+			narratorIds,
+			principal,
+		);
+		for (let i = tabs.length - 1; i >= 0; i -= 1) {
+			const tab = tabs[i];
+			const nId = getTabNarratorId(tab);
+			if (!nId) continue;
+			// A vanished narrator stays (the pre-existing dead-tab case); an existing but
+			// unreadable one goes.
+			if (known.has(nId) && !readable.has(nId)) {
+				tabs.splice(i, 1);
+				continue;
+			}
+			const tier = visibility.get(nId);
+			if (tier) tab.visibility = tier;
+		}
+
 		// Narrator status + current user's private draft markers
 		const [rows, draftNarratorIds] = await Promise.all([
 			db

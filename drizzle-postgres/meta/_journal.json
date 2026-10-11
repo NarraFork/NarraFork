@@ -99,6 +99,13 @@
 			"when": 1791962003435,
 			"tag": "0013_spec-tab-layout",
 			"breakpoints": true
+		},
+		{
+			"idx": 14,
+			"version": "7",
+			"when": 1791962003436,
+			"tag": "0014_narrator_visibility_preferences",
+			"breakpoints": true
 		}
-  ]
+	]
 }

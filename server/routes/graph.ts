@@ -6,6 +6,7 @@ import { ValidationError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { parseSubstatus } from "../lib/narrator-utils";
 import { projectPrincipalOf, requireProjectAccess } from "../lib/project-access";
+import { narratorListPrincipalOf } from "../lib/narrator-access";
 import { updateGraphPositionsSchema } from "../lib/validators";
 import { commitSyncService } from "../services/commit-sync-service";
 import { gitService } from "../services/git-service";
@@ -332,7 +333,10 @@ graphRoutes.get("/:id/graph", async (c) => {
 	const auxiliary = await projectReadAdapter().getGraphAuxiliaryData(
 		projectId,
 		chapterIds,
-		projectPrincipalOf(c),
+		// The LIST principal, not the plain project one: this call returns narrator badges, so
+		// an admin who hid other people's private narrators must not see them reappear here.
+		// Project visibility is unaffected — the project predicates ignore the extra field.
+		await narratorListPrincipalOf(c),
 	);
 	const allNarrators = auxiliary.narrators;
 	const allContainers = auxiliary.containers;

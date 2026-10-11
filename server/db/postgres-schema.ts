@@ -1186,6 +1186,7 @@ export const userPreferences = pgTable("user_preferences", {
 	recentTabs: text("recent_tabs").notNull().default("[]"),
 	addSubagentToRecentTabs: boolean("add_subagent_to_recent_tabs").notNull().default(true),
 	recentTabsGroupMode: text("recent_tabs_group_mode").notNull().default("flat"),
+	showAllNarrators: boolean("show_all_narrators").notNull().default(false),
 	notifyOnDone: boolean("notify_on_done").notNull().default(true),
 	notifyOnWaiting: boolean("notify_on_waiting").notNull().default(true),
 	notifyPwaEnabled: boolean("notify_pwa_enabled").notNull().default(false),
@@ -3768,7 +3769,7 @@ export const notifications = pgTable(
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
   "tableCount": 119,
-  "columnCount": 1689,
+  "columnCount": 1690,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -10921,6 +10922,18 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false,
           "defaultValue": "\"flat\"",
           "defaultExpression": "\"flat\""
+        },
+        {
+          "property": "showAllNarrators",
+          "name": "show_all_narrators",
+          "kind": "integer",
+          "mode": "boolean",
+          "pgType": "boolean",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "false",
+          "defaultExpression": "false"
         },
         {
           "property": "notifyOnDone",

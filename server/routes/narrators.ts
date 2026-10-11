@@ -102,6 +102,7 @@ import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import {
 	getAuthorizedNarrator,
+	narratorListPrincipalOf,
 	narratorPrincipalOf,
 	requireAccessToNarratorRow,
 	requireNarratorAccess,
@@ -955,7 +956,7 @@ narratorRoutes.get("/", async (c) => {
 		// undefined for admins, which `and(...)` treats as no extra restriction.
 		const conditions = [
 			eq(narrators.variant, "primary"),
-			narratorReadableWhere(narratorPrincipalOf(c)),
+			narratorReadableWhere(await narratorListPrincipalOf(c)),
 		];
 
 		if (status === "archived") {
@@ -1195,7 +1196,7 @@ narratorRoutes.get("/", async (c) => {
 	// corrupt hasMore/totalCount.
 	const list = await filterReadableNarrators(
 		await narratorService.listByChapter(chapterId),
-		narratorPrincipalOf(c),
+		await narratorListPrincipalOf(c),
 	);
 	const narratorIds = list.map((narrator) => narrator.id);
 	const draftNarratorIds = await getNarratorIdsWithDraft(userId, narratorIds);
@@ -1415,7 +1416,7 @@ narratorRoutes.get("/named", async (c) => {
 	// fine here; the paginated list endpoint pushes the same predicate into SQL.
 	const named = await filterReadableNarrators(
 		await narratorService.listNamed(),
-		narratorPrincipalOf(c),
+		await narratorListPrincipalOf(c),
 	);
 	const draftNarratorIds = await getNarratorIdsWithDraft(
 		c.get("user").sub,
@@ -1440,7 +1441,7 @@ narratorRoutes.get("/named", async (c) => {
  * a question is readable exactly when its narrator is.
  */
 narratorRoutes.get("/questions/all", async (c) => {
-	const items = await listAllOpenAsyncQuestionsForPrincipal(narratorPrincipalOf(c));
+	const items = await listAllOpenAsyncQuestionsForPrincipal(await narratorListPrincipalOf(c));
 	return c.json({
 		items,
 		openCount: items.length,
@@ -1468,7 +1469,7 @@ narratorRoutes.get("/human-attention", async (c) => {
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	c.header("Cache-Control", "no-store");
 	return c.json(
-		await listHumanAttentionForPrincipal(narratorPrincipalOf(c), {
+		await listHumanAttentionForPrincipal(await narratorListPrincipalOf(c), {
 			...parsed.data,
 			signal: c.req.raw.signal,
 		}),

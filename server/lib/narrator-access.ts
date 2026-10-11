@@ -16,6 +16,7 @@ import {
 	type NarratorAccessNeed,
 	type NarratorAclRow,
 	type NarratorPrincipal,
+	resolveNarratorListPrincipal,
 } from "../services/narrator-acl";
 import type { JwtPayload } from "./auth";
 import { NotFoundError } from "./errors";
@@ -34,6 +35,29 @@ export function narratorPrincipalOf(c: Context): NarratorPrincipal {
 	// a 500 that says nothing about the real problem, or worse, granting access.
 	if (!user?.sub) return { userId: "", isAdmin: false };
 	return { userId: user.sub, isAdmin: user.role === "admin" };
+}
+
+/**
+ * The principal for LIST queries, which additionally carries the admin's
+ * `showAllNarrators` preference.
+ *
+ * Separate from {@link narratorPrincipalOf} rather than folded into it for two reasons:
+ * that function is synchronous and called from roughly twenty-five places (including every
+ * row-level access check), so making it async would touch every one of them for no gain;
+ * and the preference is meaningless outside listing — access decisions must NOT consult it,
+ * or an admin who hides other people's private narrators would also lose the ability to open
+ * one to manage its grants.
+ *
+ * Defaults to `false` when the admin has no preferences row, matching the column default and
+ * `DEFAULTS` in `routes/user-preferences.ts`. Non-admins are returned untouched (no read),
+ * since the predicates never consult the flag for them.
+ */
+export async function narratorListPrincipalOf(c: Context): Promise<NarratorPrincipal> {
+	const principal = narratorPrincipalOf(c);
+	if (!principal.isAdmin) return principal;
+	// Delegates to the service-level resolver so the context and user-id callers cannot
+	// drift on what the preference defaults to.
+	return resolveNarratorListPrincipal(principal.userId);
 }
 
 /**

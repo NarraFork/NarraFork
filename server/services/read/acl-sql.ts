@@ -171,3 +171,39 @@ export function narratorReadableText(narratorAlias: string): string {
 			and ${narratorJudgedReadableText("jn")}
 	)`;
 }
+
+/**
+ * The clause an admin who opted out of other people's private narrators uses instead:
+ * "the judged row is not somebody else's private narrator".
+ *
+ * Deliberately NOT `not mine`: an ownerless private narrator is one only admins can manage,
+ * so hiding it from them would orphan it. The `is not null` is the whole difference. A
+ * private narrator explicitly granted to this admin stays visible, because being shared is
+ * the point of a grant.
+ *
+ * Mirrors `narratorUnlistedPrivateSqlFragment`; `acl-sql-parity.test.ts` asserts that.
+ * Every `?` is the requesting user id.
+ */
+export function narratorUnlistedPrivateText(narratorAlias: string): string {
+	return `not exists (
+		select 1 from narrators jn
+		where jn.id = case
+				when ${narratorAlias}.type = 'subagent' then ${narratorAlias}.acl_root_narrator_id
+				else ${narratorAlias}.id
+			end
+			and (
+				jn.visibility = 'private'
+				and jn.owner_user_id is not null
+				and jn.owner_user_id <> ?
+				and not exists (
+					select 1 from acl_grants g
+					where g.scope_type = 'narrator'
+						and g.scope_id = jn.id
+						and g.capability in ('read','write')
+						and g.domain_kind is null
+						and g.principal_type = 'user'
+						and g.principal_id = ?
+				)
+			)
+	)`;
+}

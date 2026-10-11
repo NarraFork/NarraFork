@@ -35,6 +35,15 @@ export type ProjectAccessNeed = "read" | "write" | "manage";
 export interface ProjectPrincipal {
 	userId: string;
 	isAdmin: boolean;
+	/**
+	 * Admin-only narrator LISTING preference, carried here because the project read adapters
+	 * return narrators (canvas badges) and must narrow them identically to the narrator list.
+	 *
+	 * `undefined` ≡ true, i.e. today's "an admin sees everything". It says nothing about
+	 * PROJECT access — the project predicates never read it — so a caller may pass either
+	 * principal shape without changing project visibility.
+	 */
+	showAllNarrators?: boolean;
 }
 
 /** The project columns access decisions are made from — nothing else is read. */

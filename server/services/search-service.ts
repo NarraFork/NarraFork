@@ -42,8 +42,12 @@ interface SearchOptions {
 	 * The searching user, so narrator and message hits are limited to what they may
 	 * read. Required rather than optional: an omitted principal used to mean "see
 	 * everything", and a caller that simply forgot would silently reopen the leak.
+	 *
+	 * `showAllNarrators` narrows an admin's narrator/message hits to exclude other
+	 * people's private narrators; omitted means "see all", which is what an admin got
+	 * before the preference existed.
 	 */
-	principal: { userId: string; isAdmin: boolean };
+	principal: { userId: string; isAdmin: boolean; showAllNarrators?: boolean };
 }
 
 export interface NarratorMessageSearchResult {

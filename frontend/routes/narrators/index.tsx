@@ -9,6 +9,7 @@ import {
 	NarratorListCard,
 	type NarratorListItem,
 } from "../../components/narrator/list/NarratorListCard";
+import { NarratorAccessSettingsModal } from "../../components/narrator/NarratorAccessSettingsModal";
 import {
 	NarratorListControls,
 	NarratorListExtraFiltersButton,
@@ -97,6 +98,10 @@ function NarratorsPage() {
 	const { t } = useTranslation("narrators");
 	const { t: tn } = useTranslation("narrator");
 	const [confirmArchiveId, setConfirmArchiveId] = useState<string | null>(null);
+	const [accessSettingsNarratorId, setAccessSettingsNarratorId] = useState<string | null>(null);
+	const handleOpenAccessSettings = useCallback((narratorId: string) => {
+		setAccessSettingsNarratorId(narratorId);
+	}, []);
 	const [navigatingId, setNavigatingId] = useState<string | null>(null);
 	const qc = useQueryClient();
 	const requireSetup = useSetupWizardGuard();
@@ -246,6 +251,7 @@ function NarratorsPage() {
 							dimmed={!!navigatingId && navigatingId !== narrator.id}
 							onOpen={handleNarratorClick}
 							onArchive={setConfirmArchiveId}
+							onAccessSettings={handleOpenAccessSettings}
 						/>
 					))}
 					{!localQuery.trim() && <div ref={sentinelRef} style={{ height: 1 }} />}
@@ -308,6 +314,12 @@ function NarratorsPage() {
 					</Group>
 				</Stack>
 			</Modal>
+			<NarratorAccessSettingsModal
+				narratorId={accessSettingsNarratorId}
+				narratorTitle={narrators.find((n) => n.id === accessSettingsNarratorId)?.title ?? null}
+				opened={!!accessSettingsNarratorId}
+				onClose={() => setAccessSettingsNarratorId(null)}
+			/>
 		</Stack>
 	);
 }

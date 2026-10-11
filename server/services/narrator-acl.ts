@@ -46,7 +46,7 @@
 import { type NarratorWriteAudience, widestWriteAudienceFor } from "@shared/narrator-access";
 import { and, eq, type SQL, sql } from "drizzle-orm";
 import { db } from "../db";
-import { aclGrants, narrators } from "../db/schema";
+import { aclGrants, narrators, userPreferences, users } from "../db/schema";
 import { NotFoundError } from "../lib/errors";
 import type { AclPrincipal } from "./acl/acl-core";
 import { resolveCaps } from "./acl/acl-core";
@@ -64,6 +64,20 @@ export type NarratorAccessNeed = "read" | "write";
 export interface NarratorPrincipal {
 	userId: string;
 	isAdmin: boolean;
+	/**
+	 * Admin-only LISTING preference: whether this admin's narrator lists include
+	 * narrators other people set to `private`.
+	 *
+	 * `undefined` means "not asked", and is treated as `true` so every existing
+	 * caller keeps today's behaviour (an admin sees everything). Only the list
+	 * predicates read it, and only when `isAdmin` is true.
+	 *
+	 * This is a DISPLAY filter, not an access rule. `canReadNarrator` deliberately
+	 * ignores it and still admits every admin unconditionally: opening a narrator is
+	 * how an admin manages its grants, so hiding one from a list must not make it
+	 * unreachable by direct link. Do not fold this into the row-level checks.
+	 */
+	showAllNarrators?: boolean;
 }
 
 /**
@@ -511,6 +525,95 @@ function judgedReadableSql(jn: string): string {
 const JUDGED_READABLE_PARAM_COUNT = (judgedReadableSql("jn").match(/\?/g) ?? []).length;
 
 /**
+ * The addendum an admin with `showAllNarrators: false` subtracts from their lists:
+ * "this narrator is private, belongs to somebody else, and was never shared with me".
+ *
+ * Ownerless private narrators are deliberately KEPT: an unowned narrator is one only
+ * admins can manage (see `owner_user_id` in the schema), so hiding it from the only
+ * people who can act on it would orphan it rather than protect anyone. The exclusion is
+ * therefore `owned by someone other than me`, not `not mine` — the difference is exactly
+ * the `is not null` below.
+ *
+ * An explicit grant keeps a private narrator visible: being shared with the admin is the
+ * whole point of a grant, so a rule that hid it would make granting to an admin useless.
+ * `capability in ('read','write')` mirrors {@link judgedReadableSql} — a write grant
+ * implies read, and reusing both values keeps this from disagreeing with the row check.
+ *
+ * Judged on the ACL root (the caller supplies `jn`), so a subagent inherits its main
+ * session's visibility and the list cannot disagree with `canReadNarrator`.
+ *
+ * Consumes two `?`, both the requesting user id.
+ */
+function judgedUnlistedPrivateSql(jn: string): string {
+	return `(
+		${jn}.visibility = 'private'
+		and ${jn}.owner_user_id is not null
+		and ${jn}.owner_user_id <> ?
+		and not exists (
+			select 1 from acl_grants g
+			where g.scope_type = 'narrator'
+				and g.scope_id = ${jn}.id
+				and g.capability in ('read','write')
+				and g.domain_kind is null
+				and g.principal_type = 'user'
+				and g.principal_id = ?
+		)
+	)`;
+}
+
+/** How many `?` {@link judgedUnlistedPrivateSql} binds. Derived, never hard-coded. */
+const JUDGED_UNLISTED_PRIVATE_PARAM_COUNT = (
+	judgedUnlistedPrivateSql("jn").match(/\?/g) ?? []
+).length;
+
+/**
+ * Which narrator-visibility clause a list query needs.
+ *
+ * `none` — no restriction (a full-view admin, and the historical behaviour).
+ * `readable` — the ordinary per-user readability rule.
+ * `adminHidden` — an admin who opted out of seeing other people's private narrators.
+ *
+ * One function so the REST, RSC and search surfaces cannot classify the same principal
+ * differently; a second implementation is how "appears in one list, missing from another"
+ * bugs start.
+ */
+export type NarratorListGate = "none" | "readable" | "adminHidden";
+
+export function narratorListGateFor(principal: {
+	isAdmin: boolean;
+	showAllNarrators?: boolean;
+}): NarratorListGate {
+	if (!principal.isAdmin) return "readable";
+	return principal.showAllNarrators === false ? "adminHidden" : "none";
+}
+
+/**
+ * Build the list principal for a user id, reading the LIVE role and preference.
+ *
+ * The service-level counterpart of `narratorListPrincipalOf` in `lib/narrator-access.ts`,
+ * for callers that have a user id instead of a Hono context (recent tabs, background
+ * fan-out). Both exist so that "which narrators does this user's list show" is answered in
+ * one place; a second caller-side rule is how two lists start disagreeing.
+ *
+ * An unknown user still resolves (to a non-admin with no preference) rather than throwing:
+ * every caller here is already past its own authentication, and the predicates fail closed
+ * for a non-admin, so a missing row narrows the view instead of widening it.
+ */
+export async function resolveNarratorListPrincipal(userId: string): Promise<NarratorPrincipal> {
+	const user = await db.query.users.findFirst({
+		where: eq(users.id, userId),
+		columns: { role: true },
+	});
+	const isAdmin = user?.role === "admin";
+	if (!isAdmin) return { userId, isAdmin: false };
+	const pref = await db.query.userPreferences.findFirst({
+		where: eq(userPreferences.userId, userId),
+		columns: { showAllNarrators: true },
+	});
+	return { userId, isAdmin: true, showAllNarrators: pref?.showAllNarrators ?? false };
+}
+
+/**
  * How the judged row is selected, shared by both predicates.
  *
  * A subagent is judged on its root, a primary narrator on itself, and wrapping this
@@ -566,7 +669,23 @@ function bindUserId(text: string, userId: string): SQL {
  * prepare.
  */
 export function narratorReadableWhere(principal: NarratorPrincipal) {
-	if (principal.isAdmin) return undefined;
+	if (principal.isAdmin) {
+		// A full-view admin gets no clause at all — the historical behaviour, and what
+		// `undefined` composes to under `and(...)`.
+		if (principal.showAllNarrators !== false) return undefined;
+		// Opted out: subtract other people's private narrators. Expressed as `not exists`
+		// over the judged row so it stays a single correlated clause (a join would
+		// duplicate rows and corrupt `LIMIT n + 1` / `COUNT(*)` the same way the
+		// readability clause would).
+		return sql`not exists (
+			select 1 from narrators jn
+			where jn.id = case
+					when ${narrators.type} = 'subagent' then ${narrators.aclRootNarratorId}
+					else ${narrators.id}
+				end
+				and ${bindUserId(judgedUnlistedPrivateSql("jn"), principal.userId)}
+		)`;
+	}
 	return sql`exists (
 		select 1 from narrators jn
 		where jn.id = case
@@ -575,6 +694,35 @@ export function narratorReadableWhere(principal: NarratorPrincipal) {
 			end
 			and ${bindUserId(judgedReadableSql("jn"), principal.userId)}
 	)`;
+}
+
+/**
+ * The admin-opt-out clause as raw SQL text, for the search paths that prepare statements
+ * instead of building Drizzle conditions.
+ *
+ * The counterpart of {@link narratorUnlistedPrivateSqlFragment}'s parent rule: admins with
+ * the preference off need a clause, where non-admins need the readability one. Keeping both
+ * as fragments built from the same `judged*` text is what lets `acl-sql.ts` mirror them and
+ * the parity test assert it.
+ *
+ * Every `?` is the requesting user id; bind
+ * {@link narratorUnlistedPrivateSqlParamCount} of them.
+ */
+export function narratorUnlistedPrivateSqlFragment(narratorAlias: string): { sql: string } {
+	return {
+		sql: `NOT EXISTS (
+			SELECT 1 FROM narrators jn
+			WHERE ${judgedRowJoinSql(narratorAlias)}
+				AND ${judgedUnlistedPrivateSql("jn")}
+		)`,
+	};
+}
+
+/**
+ * How many `?` {@link narratorUnlistedPrivateSqlFragment} binds, all of them the user id.
+ */
+export function narratorUnlistedPrivateSqlParamCount(): number {
+	return JUDGED_UNLISTED_PRIVATE_PARAM_COUNT;
 }
 
 /**
@@ -639,7 +787,11 @@ export async function filterReadableNarrators<T extends NarratorAclRow>(
 	rows: T[],
 	principal: NarratorPrincipal,
 ): Promise<T[]> {
-	if (principal.isAdmin) return rows;
+	// Only a FULL-VIEW admin skips the query. An admin who opted out of other people's
+	// private narrators must go through the same predicate as everyone else, or this
+	// filter would disagree with `narratorReadableWhere` on the very rows it exists to
+	// hide.
+	if (principal.isAdmin && principal.showAllNarrators !== false) return rows;
 	if (rows.length === 0) return rows;
 
 	const readableIds = new Set<string>();

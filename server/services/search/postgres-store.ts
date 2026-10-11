@@ -36,7 +36,12 @@
 
 import type { PgExecutor } from "../../db/pg-fts";
 import { AppError, ValidationError } from "../../lib/errors";
-import { narratorReadableSqlFragment } from "../narrator-acl";
+import {
+	type NarratorListGate,
+	narratorListGateFor,
+	narratorReadableSqlFragment,
+	narratorUnlistedPrivateSqlFragment,
+} from "../narrator-acl";
 import { projectReadableSqlFragment } from "../project-acl";
 import type { SearchStore } from "./port";
 import {
@@ -87,7 +92,21 @@ type Row = Record<string, unknown>;
  * PostgreSQL.
  */
 const NARRATOR_GATE_SQL = narratorReadableSqlFragment(false, "n")?.sql ?? "1 = 1";
+// Third mode: an admin who opted out of other people's private narrators. Its own clause
+// because the preference is per user and cannot live in the viewer-less fragment above.
+const NARRATOR_UNLISTED_PRIVATE_SQL = narratorUnlistedPrivateSqlFragment("n").sql;
 const PROJECT_GATE_SQL = projectReadableSqlFragment(false, "p")?.sql ?? "1 = 1";
+
+/**
+ * The narrator-visibility fragment for a gate mode.
+ *
+ * Chapters are not routed through here: the preference governs narrators, and chapters have
+ * no per-user visibility, so chapter search keeps the plain admin/not-admin split.
+ */
+function narratorGateFragment(gate: NarratorListGate): string | null {
+	if (gate === "none") return null;
+	return gate === "adminHidden" ? NARRATOR_UNLISTED_PRIVATE_SQL : NARRATOR_GATE_SQL;
+}
 
 /** Splice a `?`-style fragment into the query, binding the user id once per placeholder. */
 function gateClause(fragment: string, userId: string, params: Params): string {
@@ -422,9 +441,8 @@ export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 
 		async searchMessages(query: EntitySearchQuery): Promise<MessageSearchRow[]> {
 			const params = new Params();
-			const gate = query.viewer.isAdmin
-				? ""
-				: `AND ${gateClause(NARRATOR_GATE_SQL, query.viewer.userId, params)}`;
+			const fragment = narratorGateFragment(narratorListGateFor(query.viewer));
+			const gate = fragment ? `AND ${gateClause(fragment, query.viewer.userId, params)}` : "";
 			let rows: Row[];
 			if (query.strategy === "index") {
 				const where = phraseClause(["f.content_text"], query.text, params);
@@ -473,9 +491,8 @@ export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 
 		async searchNarrators(query: EntitySearchQuery): Promise<NarratorSearchRow[]> {
 			const params = new Params();
-			const gate = query.viewer.isAdmin
-				? ""
-				: `AND ${gateClause(NARRATOR_GATE_SQL, query.viewer.userId, params)}`;
+			const fragment = narratorGateFragment(narratorListGateFor(query.viewer));
+			const gate = fragment ? `AND ${gateClause(fragment, query.viewer.userId, params)}` : "";
 			let rows: Row[];
 			if (query.strategy === "index") {
 				const where = phraseClause(["f.title"], query.text, params);

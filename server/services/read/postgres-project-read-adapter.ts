@@ -9,7 +9,12 @@ import {
 	projects,
 } from "../../db/postgres-schema";
 import type { ProjectPrincipal } from "../project-acl";
-import { bindPlaceholders, narratorReadableText, projectReadableText } from "./acl-sql";
+import {
+	bindPlaceholders,
+	narratorReadableText,
+	narratorUnlistedPrivateText,
+	projectReadableText,
+} from "./acl-sql";
 import {
 	chunkIds,
 	type GraphNarratorRow,
@@ -135,7 +140,16 @@ export class PostgresProjectReadAdapter implements ProjectReadAdapter {
 	 */
 	private narratorReadable(principal: ProjectPrincipal) {
 		if (!isReadablePrincipal(principal)) return sql`false`;
-		if (principal.isAdmin) return undefined;
+		if (principal.isAdmin) {
+			// An admin who opted out of other people's private narrators gets the subtracting
+			// clause instead of "no restriction", so a canvas badge cannot appear for a session
+			// the admin's own narrator list withholds. Uses the MIRROR from `acl-sql` rather
+			// than `narrator-acl`, which would pull the SQLite bootstrap into a backend-neutral
+			// module (see this module's header and `port-purity.test.ts`).
+			return principal.showAllNarrators === false
+				? bindPlaceholders(narratorUnlistedPrivateText("narrators"), principal.userId)
+				: undefined;
+		}
 		return bindPlaceholders(narratorReadableText("narrators"), principal.userId);
 	}
 

@@ -112,6 +112,14 @@
 			"prevId": "f67d16c4-9059-4dd3-bbb0-ea3d60c5c898",
 			"version": "7",
 			"snapshotDigest": "63e497e8370b6a5ed83be0502b59972779d492fa377d465d96db1863daa56b83"
+		},
+		{
+			"idx": 14,
+			"tag": "0014_narrator_visibility_preferences",
+			"id": "22bab3f5-384a-47cc-b441-2ce0499c2865",
+			"prevId": "6b0f116c-6200-4566-8228-0887c535abaa",
+			"version": "7",
+			"snapshotDigest": "a4a34e7074ffdf91c3b8536684e19d0532997c8574675c81cfb56ea869a9789f"
 		}
 	]
 }

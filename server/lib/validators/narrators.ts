@@ -104,6 +104,14 @@ export const createNarratorSchema = z.object({
 	//   "setup"     → Setup Assistant (installs missing system dependencies): preinstalls
 	//                 Terminal and a setup-assistant system prompt.
 	kind: z.enum(["knowledge", "setup"]).optional(),
+	// Who may see the new narrator. OMITTED means "derive it": standalone → private,
+	// chapter-bound → project (`resolveNarratorAudiences`). Sending "private" is how a caller
+	// asks for a private session explicitly, which is the point of offering it here at all.
+	//
+	// Both are validated against the shared nesting rule (write ⊆ read) downstream, so an
+	// impossible pair is refused rather than silently clamped.
+	visibility: z.enum(["private", "project", "public"]).optional(),
+	writeAudience: z.enum(["owner", "project", "public"]).optional(),
 });
 
 /**
