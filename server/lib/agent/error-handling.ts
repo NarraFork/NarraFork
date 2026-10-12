@@ -213,6 +213,9 @@ const CONTEXT_OVERFLOW_PATTERNS = [
 	"exceeds the maximum number of tokens",
 	"input token count exceeds",
 	"maximum number of tokens allowed",
+	// 中文网关（本仓库实测的中继）会直接本地化报错，只靠英文模式会整条漏判。
+	// 只取这一句完整表述：单说 “内容过长” 会连普通错误一起判成溢出。
+	"请求提示词超出模型上限",
 ];
 
 /**
@@ -675,6 +678,15 @@ export function isContextWindowExceededError(err: unknown): boolean {
 		obj.reason,
 		obj.code,
 		diagnostics?.reason,
+		// 归一化时 reason 会被上游的 type（如 invalid_request_error）抢占，真正的原因码
+		// 只留在 diagnostics.code 里；而 ProviderInvalidStateError 没有 error 对象字段，
+		// 下面那组 nested 回退拿不到它。漏读这里会把 prompt_too_long 判成普通错误。
+		//
+		// 位置有意排在 diagnostics.reason 之后：本循环先命中的条目定结论，而 reason 与
+		// code 冲突时以 reason 为准（例如 reason=max_tokens 的完成限制必须优先返回 false，
+		// 不能被同一报文里残留的 prompt_too_long 翻成溢出）。数字型 code 由下面的
+		// `typeof reason !== "string"` 跳过，不参与判定。
+		diagnostics?.code,
 		nested?.reason,
 		nested?.code,
 		nested?.type,

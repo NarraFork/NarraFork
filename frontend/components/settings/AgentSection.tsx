@@ -143,6 +143,10 @@ export interface AgentSectionProps {
 	setAutoCompactKeepPairs: (v: number) => void;
 	queueDuringCompaction: boolean;
 	setQueueDuringCompaction: (v: boolean) => void;
+	contextPreflightEnabled: boolean;
+	setContextPreflightEnabled: (v: boolean) => void;
+	contextCalibrationEnabled: boolean;
+	setContextCalibrationEnabled: (v: boolean) => void;
 	globalWhitelistDirs: DirectoryWhitelistRuleInput[];
 	setGlobalWhitelistDirs: (v: DirectoryWhitelistRuleInput[]) => void;
 	globalBlacklistDirs: DirectoryBlacklistRuleInput[];
@@ -590,6 +594,18 @@ export function AgentSection(props: AgentSectionProps) {
 				description={t("queueDuringCompactionDesc")}
 				checked={props.queueDuringCompaction}
 				onChange={(e) => props.setQueueDuringCompaction(e.currentTarget.checked)}
+			/>
+			<Switch
+				label={t("contextPreflightEnabled")}
+				description={t("contextPreflightEnabledDesc")}
+				checked={props.contextPreflightEnabled}
+				onChange={(e) => props.setContextPreflightEnabled(e.currentTarget.checked)}
+			/>
+			<Switch
+				label={t("contextCalibrationEnabled")}
+				description={t("contextCalibrationEnabledDesc")}
+				checked={props.contextCalibrationEnabled}
+				onChange={(e) => props.setContextCalibrationEnabled(e.currentTarget.checked)}
 			/>
 			<Text size="sm" fw={500} mt={4}>
 				{t("contextThresholdsStandard")}

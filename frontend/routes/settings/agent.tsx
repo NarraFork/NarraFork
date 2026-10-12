@@ -103,6 +103,10 @@ function SettingsAgentPage() {
 				setAutoCompactKeepPairs={is.setAutoCompactKeepPairs}
 				queueDuringCompaction={is.queueDuringCompaction}
 				setQueueDuringCompaction={is.setQueueDuringCompaction}
+				contextPreflightEnabled={is.contextPreflightEnabled}
+				setContextPreflightEnabled={is.setContextPreflightEnabled}
+				contextCalibrationEnabled={is.contextCalibrationEnabled}
+				setContextCalibrationEnabled={is.setContextCalibrationEnabled}
 				globalWhitelistDirs={is.globalWhitelistDirs}
 				setGlobalWhitelistDirs={is.setGlobalWhitelistDirs}
 				globalBlacklistDirs={is.globalBlacklistDirs}

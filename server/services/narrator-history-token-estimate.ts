@@ -60,10 +60,16 @@ async function resolvePromptCwd(narrator: {
  * prompt injection path as the main agent loop, then applies the existing
  * lightweight token estimator. It is a temporary display value until the next
  * provider response returns real usage.
+ *
+ * `modelOverride`（已解析的具体模型，例如会话刚切到的 `active.model`）用于"按另
+ * 一个模型重算"：切模型的瞬间库里的行可能已经换成新值，但这一次要看的是新模型的
+ * 窗口下同一份历史是否还装得下。省略时沿用叙述者行上的模型（含 `__parent__`
+ * 跟随解析）。
  */
 export async function estimateNarratorBuildHistoryTokens(
 	narratorId: string,
 	locale: Locale,
+	modelOverride?: string,
 ): Promise<NarratorHistoryTokenEstimate> {
 	const narrator = await narratorService.getById(narratorId);
 	const rawMessages = await narratorService.getModelHistorySinceLastCompact(narratorId);
@@ -72,8 +78,10 @@ export async function estimateNarratorBuildHistoryTokens(
 		? rawMessages.map((message) => ({ ...message, parentToolUseId: null }))
 		: rawMessages;
 
-	const effectiveModel =
-		narrator.model === FOLLOW_PARENT_MODEL
+	const requestedOverride = modelOverride?.trim();
+	const effectiveModel = requestedOverride
+		? resolveEffectiveModel(requestedOverride, resolveProvider(requestedOverride))
+		: narrator.model === FOLLOW_PARENT_MODEL
 			? (await resolveSubagentModelForRun(narrator, narrator.ownerUserId)).model
 			: resolveEffectiveModel(narrator.model, resolveProvider(narrator.model ?? undefined));
 	const resolved = resolveProviderAndModel(effectiveModel, resolveProvider(effectiveModel));

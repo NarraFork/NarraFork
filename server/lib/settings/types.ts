@@ -868,6 +868,31 @@ export interface NarraForkSettings {
 		 * with the compact. Either way, an explicit `priority` send cuts in.
 		 */
 		queueDuringCompaction?: boolean;
+		/**
+		 * Whether the agent loop runs a send-time context preflight: after the request is
+		 * fully assembled and before it is handed to the provider, estimate the whole input
+		 * (`content` + `history` + `tools`) and, when it already exceeds the model's usable
+		 * budget (window − output reserve), skip the send and report
+		 * `context_length_exceeded` so the existing overflow recovery compacts and retries.
+		 * Default true; off = every request goes to the provider and oversize is only
+		 * discovered from the provider's rejection.
+		 */
+		contextPreflightEnabled?: boolean;
+		/**
+		 * Whether the send-time preflight converts characters to tokens with the
+		 * target model's own measured ratio instead of the global heuristic.
+		 *
+		 * The ratio is learned from this process's own traffic: the wire character
+		 * count taken before a request is sent is paired with the `promptTokens`
+		 * that same response reports, and a sliding window per model keeps the
+		 * 75th percentile (biased upward: overestimating only compacts early,
+		 * underestimating gets the request rejected) density. Same content can differ by 1.69x
+		 * between models, so a single global coefficient cannot both catch an
+		 * oversize request on a dense tokenizer and avoid hard-compacting a sparse
+		 * one. Default true; off = sampling stops, persisted samples are ignored,
+		 * and the preflight falls back to the global estimate.
+		 */
+		contextCalibrationEnabled?: boolean;
 	};
 	chapters: {
 		maxActiveWorktrees: number;

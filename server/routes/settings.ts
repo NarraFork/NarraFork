@@ -491,6 +491,10 @@ export const updateSettingsSchema = z
 					.optional(),
 				autoCompactKeepPairs: z.number().int().min(1).max(25).optional(),
 				queueDuringCompaction: z.boolean().optional(),
+				// 发送前预检与它的按模型校准开关。缺了这两项，PATCH 的 schema 会把前端传来的键
+				// 当作未知字段丢掉，界面上的开关永远存不下去（`agent` 是 z.object 默认 strip）。
+				contextPreflightEnabled: z.boolean().optional(),
+				contextCalibrationEnabled: z.boolean().optional(),
 				browserProxy: proxyOverrideSchema,
 				notificationPolicy: z.object({ allowSend: z.boolean().optional() }).optional(),
 				webFetchPolicy: z
