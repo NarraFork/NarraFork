@@ -4,6 +4,7 @@ import { eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
 import { activeDatabaseBackend, db } from "../db";
+import { projectDbManager } from "../lib/project-db";
 import {
 	chapters,
 	containerInstances,
