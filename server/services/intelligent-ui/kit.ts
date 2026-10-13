@@ -8,6 +8,7 @@ import {
 	INTELLIGENT_UI_KIT_LEGACY_BUNDLE,
 	INTELLIGENT_UI_KIT_MANIFEST,
 	INTELLIGENT_UI_KIT_META,
+	INTELLIGENT_UI_KIT_STAGING,
 	INTELLIGENT_UI_KIT_VITE_CONFIG,
 	type IntelligentUiKitBundle,
 	type IntelligentUiKitManifest,
@@ -19,7 +20,7 @@ import {
 	renderIntelligentUiKitViteConfig,
 } from "@shared/intelligent-ui-kit";
 import type { WorkspaceContext } from "@shared/workspace-context";
-import { type AuthorizeFile, uiError, workspaceRoot } from "./files";
+import { type AuthorizeFile, uiError, workspaceKey, workspaceRoot } from "./files";
 import {
 	type KitSignedFields,
 	kitFileSha256,
@@ -45,6 +46,8 @@ export interface KitLocation {
  */
 interface KitMeta {
 	version: 1;
+	/** Workspace this signature was made for. A copy into another workspace does not match. */
+	workspace: string;
 	fingerprint: string;
 	hash: string;
 	builtAt: string;
@@ -80,9 +83,11 @@ export interface KitSnapshot {
 const LOCKFILES = ["bun.lock", "bun.lockb", "pnpm-lock.yaml", "yarn.lock", "package-lock.json"];
 const SETUP_EXTENSIONS = ["", ".tsx", ".ts", ".jsx", ".js"];
 const BUNDLE_JS = /^kit-[0-9a-f]{12}\.js$/;
-// `style.css` is what Vite before 6 calls a library's stylesheet.
+// `style.css` is what Vite before 6 calls a library's stylesheet. It is accepted in a
+// signature so an older record still parses; a new build publishes `kit-<generation>.css`.
 const BUNDLE_CSS = /^(?:kit-[0-9a-f]{12}|kit|style)\.css$/;
-const OWN_ARTIFACT = /^kit(?:-[0-9a-f]{12})?\.(?:js|css)$/;
+const LEFTOVER = /^(?:kit(?:-[0-9a-f]{12})?\.(?:js|css)|style\.css)$/;
+const WORKSPACE_KEY = /^[^\0/\\]{1,128}$/;
 
 export async function locateKit(
 	backend: ExecutionBackend,
@@ -206,6 +211,8 @@ function parseMeta(bytes: Uint8Array | null): KitMeta | undefined {
 		const css = raw.css === undefined ? null : raw.css;
 		if (
 			raw.version !== 1 ||
+			typeof raw.workspace !== "string" ||
+			!WORKSPACE_KEY.test(raw.workspace) ||
 			typeof raw.fingerprint !== "string" ||
 			typeof raw.hash !== "string" ||
 			raw.hash.length > 64 ||
@@ -228,6 +235,7 @@ function parseMeta(bytes: Uint8Array | null): KitMeta | undefined {
 			return undefined;
 		return {
 			version: 1,
+			workspace: raw.workspace,
 			fingerprint: raw.fingerprint,
 			hash: raw.hash,
 			builtAt: raw.builtAt,
@@ -284,13 +292,16 @@ async function readSignedMeta(
 	location: KitLocation,
 	authorize: AuthorizeFile,
 	signal: AbortSignal,
+	boundWorkspace: string,
 ): Promise<KitMeta | undefined> {
 	const meta = parseMeta(
 		await readServedFile(backend, location.metaPath, 64 * 1024, authorize, signal),
 	);
 	if (!meta) return undefined;
 	const signed = await verifyKitFields(meta, meta.signature);
-	if (!signed) return undefined;
+	// The signature names its workspace. Another workspace's copy verifies under this
+	// host's key and still must not be served here.
+	if (!signed || meta.workspace !== boundWorkspace) return undefined;
 	const named = async (name: string, maxBytes: number) => {
 		const stat = await backend.statFile(backend.paths.resolve(location.distDir, name), {
 			signal,
@@ -313,8 +324,9 @@ async function readServedBundle(
 	location: KitLocation,
 	authorize: AuthorizeFile,
 	signal: AbortSignal,
+	boundWorkspace: string,
 ): Promise<ServedKit | undefined> {
-	const meta = await readSignedMeta(backend, location, authorize, signal);
+	const meta = await readSignedMeta(backend, location, authorize, signal, boundWorkspace);
 	if (!meta) return undefined;
 	const file = (name: string, maxBytes: number) =>
 		readServedFile(
@@ -342,7 +354,13 @@ export async function readKit(
 	const location = await locateKit(backend, workspace, signal);
 	const manifestBytes = await readManifest(backend, location, authorize, signal);
 	if (!manifestBytes) return { location, status: { state: "builtin", components: [] } };
-	const served = await readSignedMeta(backend, location, authorize, signal);
+	const served = await readSignedMeta(
+		backend,
+		location,
+		authorize,
+		signal,
+		workspaceKey(workspace),
+	);
 	const built = served
 		? { components: served.components, hash: served.hash, builtAt: served.builtAt }
 		: { components: [] };
@@ -385,7 +403,13 @@ export async function readKitBundle(
 	signal: AbortSignal,
 ): Promise<IntelligentUiKitBundle> {
 	const location = await locateKit(backend, workspace, signal);
-	const served = await readServedBundle(backend, location, authorize, signal);
+	const served = await readServedBundle(
+		backend,
+		location,
+		authorize,
+		signal,
+		workspaceKey(workspace),
+	);
 	if (!served) throw uiError("This workspace has no built component kit", 404);
 	// Exactly the bytes the signature was checked against, not a second read.
 	const { meta, js, css } = served;
@@ -482,43 +506,90 @@ async function execBuild(
 }
 
 /**
- * Whatever sits where this build is about to write, so that a file the build did not
- * write (one the agent put there) is never taken for its output.
- *
- * Normally that is the leftover of a failed attempt with the same name. It is removed
- * first, so a retry producing the same bytes still counts; only a file that survives the
- * removal is remembered and compared.
+ * Drop whatever is already in the staging directory. A file that survives the removal
+ * is remembered, so a later build cannot sign bytes it did not write.
  */
-async function priorBundle(
+async function clearStaging(
 	backend: ExecutionBackend,
-	path: string,
+	stagingDir: string,
 	authorize: AuthorizeFile,
 	signal: AbortSignal,
-): Promise<{ size: number; sha256: string } | null> {
-	const stat = () => backend.statFile(path, { signal, timeoutMs: 15_000 });
-	if (!(await stat())?.isFile) return null;
-	await backend.removeFile(path).catch(() => {});
-	const left = await stat();
-	if (!left?.isFile) return null;
-	const bytes = await readServedFile(backend, path, LIMITS.bundleJsBytes, authorize, signal);
-	// Over the limit: no bundle the build is allowed to produce can match it.
-	return { size: bytes?.length ?? left.size, sha256: bytes ? kitFileSha256(bytes) : "" };
+): Promise<Map<string, { size: number; sha256: string }>> {
+	const survivors = new Map<string, { size: number; sha256: string }>();
+	let entries: Awaited<ReturnType<ExecutionBackend["listDir"]>>;
+	try {
+		entries = await backend.listDir(stagingDir);
+	} catch {
+		return survivors;
+	}
+	for (const entry of entries) {
+		if (entry.isDirectory) continue;
+		const path = backend.paths.resolve(stagingDir, entry.name);
+		await backend.removeFile(path).catch(() => {});
+		signal.throwIfAborted();
+		const left = await backend.statFile(path, { signal, timeoutMs: 15_000 });
+		if (!left?.isFile) continue;
+		const bytes = await readServedFile(
+			backend,
+			path,
+			Math.max(LIMITS.bundleJsBytes, LIMITS.bundleCssBytes),
+			authorize,
+			signal,
+		);
+		survivors.set(entry.name, {
+			size: bytes?.length ?? left.size,
+			sha256: bytes ? kitFileSha256(bytes) : "",
+		});
+	}
+	return survivors;
+}
+
+function keptFromBefore(
+	survivors: Map<string, { size: number; sha256: string }>,
+	name: string,
+	bytes: Uint8Array,
+): boolean {
+	const prior = survivors.get(name);
+	if (!prior) return false;
+	// Unreadable leftover: nothing this build is allowed to produce can be told from it.
+	if (!prior.sha256) return true;
+	return prior.size === bytes.length && prior.sha256 === kitFileSha256(bytes);
 }
 
 /**
  * Generate the entry and Vite config from kit.json, run the project's own Vite once,
  * and record what it produced under the host's signature.
  *
- * The new bundle is written beside the one being served, under a name no earlier build
- * used, and becomes current only when its metadata is written. A build that fails, times
- * out or is cancelled therefore leaves the kit the workspace was using exactly as it was.
+ * Vite writes into `.staging`, which is emptied first and is not served. `dist/` is
+ * updated only after that output has been copied under a new name and the metadata
+ * naming it has been signed. A build that fails, times out or is cancelled therefore
+ * leaves the kit the workspace was using exactly as it was, stylesheet included.
+ *
+ * The single-build lock is held from before the generation is chosen until that
+ * metadata is written, so a second build cannot delete or reuse the files of the first.
  */
 export async function buildKit(
 	backend: ExecutionBackend,
 	workspace: WorkspaceContext,
 	options: KitBuildOptions,
 ): Promise<KitBuildResult> {
+	if (activeBuilds >= 1)
+		throw uiError("Another component kit build is running; retry shortly", 429);
+	activeBuilds++;
+	try {
+		return await buildKitLocked(backend, workspace, options);
+	} finally {
+		activeBuilds--;
+	}
+}
+
+async function buildKitLocked(
+	backend: ExecutionBackend,
+	workspace: WorkspaceContext,
+	options: KitBuildOptions,
+): Promise<KitBuildResult> {
 	const { authorize, signal } = options;
+	const boundWorkspace = workspaceKey(workspace);
 	const location = await locateKit(backend, workspace, signal);
 	const manifestBytes = await readManifest(backend, location, authorize, signal);
 	if (!manifestBytes)
@@ -549,7 +620,7 @@ export async function buildKit(
 				403,
 			);
 	}
-	const previous = await readSignedMeta(backend, location, authorize, signal);
+	const previous = await readSignedMeta(backend, location, authorize, signal, boundWorkspace);
 	const print = await fingerprint(backend, location, manifest, manifestBytes, authorize, signal);
 	const generation = (previous?.generation ?? 0) + 1;
 	// Same inputs and same generation give the same name, so a retry after a failed
@@ -558,7 +629,9 @@ export async function buildKit(
 	const name = intelligentUiKitBundleName(sha256(print, String(generation)));
 	if (!INTELLIGENT_UI_KIT_BUNDLE_NAME.test(name)) throw uiError("Invalid kit bundle name", 500);
 	const bundleFile = `${name}.js`;
-	const bundlePath = backend.paths.resolve(location.distDir, bundleFile);
+	const cssFile = `${name}.css`;
+	const stagingDir = backend.paths.resolve(location.kitDir, INTELLIGENT_UI_KIT_STAGING);
+	const bundlePath = backend.paths.resolve(stagingDir, bundleFile);
 	const bundle = `${INTELLIGENT_UI_KIT_DIST}/${bundleFile}`;
 	const entryPath = backend.paths.resolve(location.kitDir, INTELLIGENT_UI_KIT_ENTRY);
 	const configPath = backend.paths.resolve(location.kitDir, INTELLIGENT_UI_KIT_VITE_CONFIG);
@@ -575,33 +648,30 @@ export async function buildKit(
 	}
 	const lockfile = await findLockfile(backend, [projectRoot, location.root], signal);
 	const command = buildCommand(lockfile?.name, relative(projectRoot, configPath));
-	const unchanged = async (log: string): Promise<KitBuildResult> => ({
-		ok: false,
-		log: log.trim(),
-		command,
-		bundle,
-		manifest,
-		status: (await readKit(backend, workspace, authorize, signal)).status,
-	});
-	// The one way to a signed meta: this call ran the build, it succeeded, and the bundle
-	// at the computed path is what that run wrote.
-	let log = "";
-	let prior: Awaited<ReturnType<typeof priorBundle>>;
-	if (activeBuilds >= 1)
-		throw uiError("Another component kit build is running; retry shortly", 429);
-	activeBuilds++;
-	try {
-		await options.authorizeWrite(location.distDir);
-		prior = await priorBundle(backend, bundlePath, authorize, signal);
-		const request: KitBuildRun = { command, cwd: projectRoot, bundlePath, signal };
-		const run = options.runCommand
-			? await options.runCommand(request)
-			: await execBuild(backend, request);
-		log = run.log.slice(-LIMITS.buildLogBytes).trim();
-		if (run.code !== 0) return unchanged(log);
-	} finally {
-		activeBuilds--;
-	}
+	const unchanged = async (log: string): Promise<KitBuildResult> => {
+		await clearStaging(backend, stagingDir, authorize, signal).catch(() => {});
+		return {
+			ok: false,
+			log: log.trim(),
+			command,
+			bundle,
+			manifest,
+			status: (await readKit(backend, workspace, authorize, signal)).status,
+		};
+	};
+	// The one way to a signed meta: this call ran the build, it succeeded, and the
+	// bytes copied out of staging are what that run wrote. dist/ is not a source.
+	await options.authorizeWrite(stagingDir);
+	await options.authorizeWrite(location.distDir);
+	await backend.mkdirp(stagingDir);
+	await backend.mkdirp(location.distDir);
+	const survivors = await clearStaging(backend, stagingDir, authorize, signal);
+	const request: KitBuildRun = { command, cwd: projectRoot, bundlePath, signal };
+	const run = options.runCommand
+		? await options.runCommand(request)
+		: await execBuild(backend, request);
+	const log = run.log.slice(-LIMITS.buildLogBytes).trim();
+	if (run.code !== 0) return unchanged(log);
 	const built = await backend.statFile(bundlePath, { signal, timeoutMs: 15_000 });
 	if (!built?.isFile || built.size === 0)
 		return unchanged(`${log}\nThe build did not produce ${bundle}.`);
@@ -611,45 +681,68 @@ export async function buildKit(
 		);
 	const js = await readServedFile(backend, bundlePath, LIMITS.bundleJsBytes, authorize, signal);
 	if (!js?.length) return unchanged(`${log}\nThe build did not produce ${bundle}.`);
-	const jsSha256 = kitFileSha256(js);
-	if (prior && prior.size === js.length && prior.sha256 === jsSha256)
+	if (keptFromBefore(survivors, bundleFile, js))
 		return unchanged(
 			`${log}\nThe build did not produce ${bundle}: the file there was not written by this build.`,
 		);
-	const files = (await backend.listDir(location.distDir))
-		.filter((entry) => !entry.isDirectory)
-		.map((entry) => entry.name);
+	let stagedNames: string[] = [];
+	try {
+		stagedNames = (await backend.listDir(stagingDir))
+			.filter((entry) => !entry.isDirectory)
+			.map((entry) => entry.name);
+	} catch {
+		stagedNames = [];
+	}
 	// Vite names the stylesheet after `cssFileName` (>= 6) or `style.css` (older).
-	const css = files.includes(`${name}.css`)
-		? `${name}.css`
-		: files.includes("style.css")
+	// Either way it is read from staging and published under this build's own name.
+	const cssSource = stagedNames.includes(cssFile)
+		? cssFile
+		: stagedNames.includes("style.css")
 			? "style.css"
 			: null;
-	const cssBytes = css
+	const cssBytes = cssSource
 		? await readServedFile(
 				backend,
-				backend.paths.resolve(location.distDir, css),
+				backend.paths.resolve(stagingDir, cssSource),
 				LIMITS.bundleCssBytes,
 				authorize,
 				signal,
 			)
 		: null;
-	if (css && !cssBytes)
+	if (cssSource && !cssBytes)
 		return unchanged(
-			`${log}\nThe stylesheet ${css} is missing or over its ${LIMITS.bundleCssBytes}-byte limit.`,
+			`${log}\nThe stylesheet ${cssSource} is missing or over its ${LIMITS.bundleCssBytes}-byte limit.`,
 		);
+	if (cssSource && cssBytes && keptFromBefore(survivors, cssSource, cssBytes))
+		return unchanged(
+			`${log}\nThe build did not produce ${bundle}: the stylesheet there was not written by this build.`,
+		);
+	const publishedCss = cssBytes ? cssFile : null;
+	await options.authorizeWrite(backend.paths.resolve(location.distDir, bundleFile));
+	await backend.writeFileBytes(backend.paths.resolve(location.distDir, bundleFile), js, {
+		signal,
+		timeoutMs: 30_000,
+	});
+	if (cssBytes && publishedCss) {
+		await options.authorizeWrite(backend.paths.resolve(location.distDir, publishedCss));
+		await backend.writeFileBytes(backend.paths.resolve(location.distDir, publishedCss), cssBytes, {
+			signal,
+			timeoutMs: 30_000,
+		});
+	}
 	const builtAt = new Date().toISOString();
 	const fields: KitSignedFields = {
 		version: 1,
+		workspace: boundWorkspace,
 		fingerprint: print,
 		hash: sha256(print, builtAt, String(js.length)).slice(0, 20),
 		builtAt,
 		components: manifest.components.map((component) => component.name),
 		hasSetup: manifest.setup !== undefined,
 		js: bundleFile,
-		css,
+		css: publishedCss,
 		generation,
-		jsSha256,
+		jsSha256: kitFileSha256(js),
 		cssSha256: cssBytes ? kitFileSha256(cssBytes) : "",
 	};
 	const meta: KitMeta = { ...fields, signature: await signKitFields(fields) };
@@ -662,10 +755,20 @@ export async function buildKit(
 			timeoutMs: 30_000,
 		},
 	);
+	await clearStaging(backend, stagingDir, authorize, signal).catch(() => {});
 	// Only now are earlier bundles garbage. Best effort: a leftover costs disk space, a
-	// failure here must not turn a finished build into an error.
-	for (const file of files) {
-		if (!OWN_ARTIFACT.test(file) || file === meta.js || file === meta.css) continue;
+	// failure here must not turn a finished build into an error. `style.css` is included
+	// so a Vite < 6 name left in dist/ cannot shadow a later build.
+	let published: string[] = [];
+	try {
+		published = (await backend.listDir(location.distDir))
+			.filter((entry) => !entry.isDirectory)
+			.map((entry) => entry.name);
+	} catch {
+		published = [];
+	}
+	for (const file of published) {
+		if (!LEFTOVER.test(file) || file === meta.js || file === meta.css) continue;
 		await backend.removeFile(backend.paths.resolve(location.distDir, file)).catch(() => {});
 	}
 	return {

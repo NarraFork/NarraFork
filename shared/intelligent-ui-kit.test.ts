@@ -110,8 +110,9 @@ describe("component kit manifest", () => {
 		expect(config).toContain('formats: ["iife"]');
 		expect(config).toContain('fileName: () => "kit-0123456789ab.js"');
 		expect(config).toContain('cssFileName: "kit-0123456789ab"');
-		// The directory holds the bundle in use until this build succeeds.
-		expect(config).toContain("emptyOutDir: false");
+		// Vite writes to a staging directory it may empty. The served dist/ is elsewhere.
+		expect(config).toContain('resolve(here, ".staging")');
+		expect(config).toContain("emptyOutDir: true");
 		expect(config).toContain("delete merged.build.rollupOptions;");
 		expect(config).toContain("delete merged.build.rolldownOptions;");
 		expect(config).toContain('"process.env.NODE_ENV": JSON.stringify("production")');

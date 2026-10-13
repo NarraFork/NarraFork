@@ -32,6 +32,7 @@ afterAll(async () => {
 
 const fields: KitSignedFields = {
 	version: 1,
+	workspace: "workspace",
 	fingerprint: "f".repeat(64),
 	hash: "0123456789abcdef0123",
 	builtAt: "2026-01-01T00:00:00.000Z",
@@ -49,6 +50,7 @@ describe("kit signature", () => {
 		const extra = { ...fields, signature: "x", other: 1 } as KitSignedFields;
 		expect(Object.keys(JSON.parse(canonicalKitBody(extra)))).toEqual([
 			"version",
+			"workspace",
 			"fingerprint",
 			"hash",
 			"builtAt",
@@ -75,6 +77,7 @@ describe("kit signature", () => {
 	test("any changed field fails verification", async () => {
 		const signature = await signKitFields(fields);
 		for (const tampered of [
+			{ ...fields, workspace: "other-workspace" },
 			{ ...fields, hash: "1123456789abcdef0123" },
 			{ ...fields, components: ["Button"] },
 			{ ...fields, hasSetup: false },

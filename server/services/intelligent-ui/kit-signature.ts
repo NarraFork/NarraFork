@@ -9,6 +9,7 @@ import { getNarraforkPath } from "@server/lib/narrafork-home";
  * Everything under the workspace, `kit.meta.json` included, can be written by the agent.
  * The key that signs the metadata lives in the NarraFork home instead, which the agent's
  * file tools do not reach, so a bundle is served only when the host itself recorded it.
+ * The signature also names the workspace, so a copy into another workspace does not verify.
  */
 const KEY_FILE = "intelligent-ui-kit-signing.key";
 const KEY_BYTES = 32;
@@ -17,6 +18,8 @@ const SIGNATURE = /^[0-9a-f]{64}$/;
 /** The signed fields of `kit.meta.json`, plus digests of the files it names. */
 export interface KitSignedFields {
 	version: 1;
+	/** `workspaceKey` of the workspace this build was approved for. */
+	workspace: string;
 	fingerprint: string;
 	hash: string;
 	builtAt: string;
@@ -88,6 +91,7 @@ export function kitFileSha256(bytes: Uint8Array): string {
 export function canonicalKitBody(fields: KitSignedFields): string {
 	return JSON.stringify({
 		version: 1,
+		workspace: fields.workspace,
 		fingerprint: fields.fingerprint,
 		hash: fields.hash,
 		builtAt: fields.builtAt,
