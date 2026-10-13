@@ -218,6 +218,12 @@ export function PanZoomStage({
 
 	const handlePointerDown = useCallback((e: React.PointerEvent) => {
 		if (e.button === 2) return; // right-click handled by context menu
+		// A portaled child (the viewer's own context menu) keeps this canvas as its
+		// React-tree parent, so its pointerdown still reaches this handler even though it is
+		// no DOM descendant. Capturing the pointer for it would retarget the rest of that
+		// gesture — including the click — to the canvas, and the menu item would look dead
+		// while the toolbar (which stops propagation itself) kept working.
+		if (!e.currentTarget.contains(e.target as Node)) return;
 		// A backdrop-click candidate must START on the empty backdrop (the canvas
 		// element itself, not the content) with a single pointer. A second pointer
 		// (pinch) later invalidates it.

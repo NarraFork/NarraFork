@@ -349,4 +349,38 @@ describe("ImageViewerProvider context menu", () => {
 		await act(async () => downloadItem?.dispatchEvent(new MouseEvent("click", { bubbles: true })));
 		expect(downloadImageMock).toHaveBeenCalledTimes(1);
 	});
+
+	/**
+	 * The menu is portaled to `document.body` but keeps the stage as its React-tree parent,
+	 * so a press on an item still reaches the stage's pointerdown handler. Capturing the
+	 * pointer there retargets the rest of the gesture — including the click — to the canvas,
+	 * which is exactly why the items looked dead while the toolbar kept working.
+	 */
+	test("pressing a menu item does not hand the pointer to the stage", async () => {
+		await openContextMenu();
+		// canvas (handlers) → transform wrapper → img
+		const canvas = document.body.querySelector("img")?.parentElement?.parentElement;
+		expect(canvas).not.toBeNull();
+		const capture = mock(() => {});
+		Object.defineProperty(canvas, "setPointerCapture", { value: capture, configurable: true });
+
+		// Control: a press on the image itself is a stage gesture and must still capture.
+		await act(async () =>
+			canvas?.dispatchEvent(new MouseEvent("pointerdown", { bubbles: true, button: 0 })),
+		);
+		expect(capture).toHaveBeenCalledTimes(1);
+
+		const copyItem = Array.from(document.body.querySelectorAll('[role="menuitem"]')).find(
+			(item) => item.textContent === "imageViewer_copy",
+		);
+		expect(copyItem).not.toBeUndefined();
+		await act(async () => {
+			for (const type of ["pointerdown", "mousedown", "mouseup", "click"]) {
+				copyItem?.dispatchEvent(new MouseEvent(type, { bubbles: true, button: 0 }));
+			}
+		});
+
+		expect(capture).toHaveBeenCalledTimes(1);
+		expect(copyImageMock).toHaveBeenCalledTimes(1);
+	});
 });
