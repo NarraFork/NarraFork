@@ -4,7 +4,6 @@ import { eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
 import { activeDatabaseBackend, db } from "../db";
-import { projectDbManager } from "../lib/project-db";
 import {
 	chapters,
 	containerInstances,
@@ -25,6 +24,7 @@ import { resolveUserGitIdentityEnv } from "../lib/git-identity";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getHome } from "../lib/platform";
+import { projectDbManager } from "../lib/project-db";
 import { projectPrincipalOf, requireProjectAccess } from "../lib/project-access";
 import {
 	createProjectSchema,
