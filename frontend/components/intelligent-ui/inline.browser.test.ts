@@ -297,12 +297,29 @@ browserTest(
 
 			// The reader's click is what sends it, once, as the user.
 			await clickButton(page, "Send");
+			// Posted before that request returns, so the next click is still inside the
+			// quiet period the first click started.
+			await frame.evaluate(() =>
+				parent.postMessage(
+					{ type: "narrafork:ui-action", action: "sendPrompt", value: "too soon" },
+					"*",
+				),
+			);
+			await page.waitForFunction(() =>
+				document.querySelector("#card")?.textContent?.includes("Send this to the chat? too soon"),
+			);
+			await clickButton(page, "Send");
 			for (let waited = 0; messages.length === 0 && waited < 40; waited++)
 				await new Promise((done) => setTimeout(done, 50));
 			expect(messages).toHaveLength(1);
 			expect(messages[0]?.body).toEqual({ message: "pwned" });
 			expect(messages[0]?.token).toBe("Bearer fixture-private-token");
-			expect(await cardText(page)).not.toContain("Send this to the chat?");
+			expect(await cardText(page)).toContain("too soon");
+			await new Promise((done) => setTimeout(done, 1100));
+			await clickButton(page, "Send");
+			for (let waited = 0; messages.length < 2 && waited < 40; waited++)
+				await new Promise((done) => setTimeout(done, 50));
+			expect(messages[1]?.body).toEqual({ message: "too soon" });
 
 			// Another forged prompt, declined: nothing more is sent.
 			await frame.evaluate(() =>
@@ -321,7 +338,8 @@ browserTest(
 				() => !document.querySelector("#card")?.textContent?.includes("Send this to the chat?"),
 			);
 			await new Promise((done) => setTimeout(done, 1200));
-			expect(messages).toHaveLength(1);
+			expect(messages).toHaveLength(2);
+			expect(messages[1]?.body).toEqual({ message: "too soon" });
 		});
 	},
 	120_000,

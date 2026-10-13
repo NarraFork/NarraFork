@@ -57,6 +57,11 @@ export function InlineRender({
 	// Set in the message handler, not after render: a second action in the same turn
 	// must not replace the text the reader is already being asked to confirm.
 	const confirming = useRef(false);
+	// Read at event time, not from the listener's closure. The iframe can post during
+	// commit, before the effect that binds the listener runs again, and that listener
+	// would otherwise still see the previous runtime and send a project-kit prompt.
+	const runtimeNow = useRef(runtime);
+	runtimeNow.current = runtime;
 	latest.current = { source, live };
 
 	useEffect(() => {
@@ -103,9 +108,9 @@ export function InlineRender({
 	}, [srcDoc]);
 
 	const send = useCallback(
-		(text: string) => {
+		(text: string): boolean => {
 			// One click is one message; a double click or a held key is not two.
-			if (Date.now() - lastSent.current < 1000) return;
+			if (Date.now() - lastSent.current < 1000) return false;
 			lastSent.current = Date.now();
 			setSendFailed(false);
 			void api.sendNarratorMessage(narratorId, text.slice(0, 2000)).catch(() => {
@@ -113,6 +118,7 @@ export function InlineRender({
 				lastSent.current = 0;
 				setSendFailed(true);
 			});
+			return true;
 		},
 		[narratorId],
 	);
@@ -167,7 +173,8 @@ export function InlineRender({
 				setNavigated(true);
 				return;
 			}
-			if (data?.type !== "narrafork:ui-action" || typeof data.value !== "string" || !runtime)
+			const current = runtimeNow.current;
+			if (data?.type !== "narrafork:ui-action" || typeof data.value !== "string" || !current)
 				return;
 			if (data.action === "openLink") {
 				// Never navigate on the frame's say-so: the reader sees the URL first.
@@ -183,7 +190,7 @@ export function InlineRender({
 			if (data.action !== "sendPrompt" || !text) return;
 			// The frame's gesture check guards markup, but a project kit's own code runs
 			// in that frame and can post this message itself: the reader confirms it.
-			if (runtime.kit) {
+			if (current.kit) {
 				if (confirming.current) return;
 				confirming.current = true;
 				setLink(null);
@@ -198,7 +205,7 @@ export function InlineRender({
 			window.removeEventListener("message", onMessage);
 			unsubscribe();
 		};
-	}, [srcDoc, runtime, onReady, sendTheme, send]);
+	}, [srcDoc, onReady, sendTheme, send]);
 
 	useEffect(() => {
 		if (!sendFailed) return;
@@ -235,9 +242,17 @@ export function InlineRender({
 		position: "absolute",
 		insetInline: 0,
 		bottom: 0,
-		height: 34,
+		minHeight: 34,
 		background: "var(--mantine-color-body)",
 		borderTop: "1px solid var(--mantine-color-default-border)",
+	} as const;
+	const confirmText = {
+		flex: 1,
+		minWidth: 0,
+		maxHeight: 96,
+		overflow: "auto",
+		whiteSpace: "pre-wrap",
+		overflowWrap: "anywhere",
 	} as const;
 	return (
 		<Box style={{ position: "relative", height }}>
@@ -255,7 +270,7 @@ export function InlineRender({
 			/>
 			{link ? (
 				<Group gap="xs" wrap="nowrap" px="xs" style={bar}>
-					<Text size="xs" truncate style={{ flex: 1, minWidth: 0 }} title={link}>
+					<Text size="xs" style={confirmText} title={link}>
 						{t("intelligentUi.linkConfirm", { url: link })}
 					</Text>
 					<Button
@@ -284,15 +299,17 @@ export function InlineRender({
 				</Group>
 			) : prompt ? (
 				<Group gap="xs" wrap="nowrap" px="xs" style={bar}>
-					<Text size="xs" truncate style={{ flex: 1, minWidth: 0 }} title={prompt}>
+					<Text size="xs" style={confirmText} title={prompt}>
 						{t("intelligentUi.promptConfirm", { text: prompt })}
 					</Text>
 					<Button
 						size="compact-xs"
 						onClick={() => {
+							// A click inside the quiet period leaves the bar up, so the
+							// reader can see that this text has not been sent yet.
+							if (!send(prompt)) return;
 							confirming.current = false;
 							setPrompt(null);
-							send(prompt);
 						}}
 					>
 						{t("intelligentUi.promptSend")}
