@@ -11,6 +11,11 @@ export const INTELLIGENT_UI_KIT_MANIFEST = "kit.json";
 export const INTELLIGENT_UI_KIT_ENTRY = "entry.generated.ts";
 export const INTELLIGENT_UI_KIT_VITE_CONFIG = "vite.kit.config.mjs";
 export const INTELLIGENT_UI_KIT_DIST = "dist";
+/**
+ * Where Vite writes. Emptied on every build, and not what the browser is served:
+ * `dist/` changes only after the host has signed a successful build.
+ */
+export const INTELLIGENT_UI_KIT_STAGING = ".staging";
 /** Bundle of a kit built before bundles were named after their inputs. */
 export const INTELLIGENT_UI_KIT_LEGACY_BUNDLE = "kit.js";
 export const INTELLIGENT_UI_KIT_META = "kit.meta.json";
@@ -242,9 +247,9 @@ export default async (env) => {
 		publicDir: false,
 		define: { "process.env.NODE_ENV": JSON.stringify("production") },
 		build: {
-			outDir: resolve(here, ${JSON.stringify(INTELLIGENT_UI_KIT_DIST)}),
-			// Never emptied: the bundle being served lives here until this build succeeds.
-			emptyOutDir: false,
+			outDir: resolve(here, ${JSON.stringify(INTELLIGENT_UI_KIT_STAGING)}),
+			// Emptied every build. The served files live in dist/ and are not this directory.
+			emptyOutDir: true,
 			copyPublicDir: false,
 			sourcemap: false,
 		},

@@ -1,17 +1,36 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { LocalBackend } from "@server/lib/agent/execution/local-backend";
 import { createIntelligentUiRoutes } from "@server/routes/intelligent-ui";
 import type { WorkspaceContext } from "@shared/workspace-context";
+import { buildKit } from "./kit";
 import { hasKitApproval, requestKitBuild, resetKitRequestsForTest } from "./kit-requests";
 import { createKitService } from "./kit-service";
+import { resetKitSigningKeyForTest } from "./kit-signature";
 
+const KIT = ".narrafork/intelligent_ui/kit";
 const roots: string[] = [];
 beforeEach(() => resetKitRequestsForTest());
 afterEach(async () => {
 	await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+});
+
+// Builds are signed with a key in the NarraFork home: keep it out of the developer's.
+const savedHome = process.env.NARRAFORK_HOME;
+let signingHome = "";
+beforeAll(async () => {
+	signingHome = await mkdtemp(join(tmpdir(), "nf-ui-kit-service-home-"));
+	process.env.NARRAFORK_HOME = signingHome;
+	resetKitSigningKeyForTest();
+});
+afterAll(async () => {
+	if (savedHome === undefined) delete process.env.NARRAFORK_HOME;
+	else process.env.NARRAFORK_HOME = savedHome;
+	resetKitSigningKeyForTest();
+	await rm(signingHome, { recursive: true, force: true });
 });
 
 async function fixture(files: Record<string, string> = {}) {
@@ -43,7 +62,7 @@ async function fixture(files: Record<string, string> = {}) {
 			notified.push({ narratorId, userId, text });
 		},
 	});
-	return { root, service, notified, authorized };
+	return { root, workspace, backend, service, notified, authorized };
 }
 const signal = () => new AbortController().signal;
 
@@ -98,12 +117,12 @@ describe("kit confirmation (the user's side)", () => {
 		expect(notified).toEqual([]);
 	});
 
-	test("the bundle is served only through the caller's file authorization", async () => {
-		const kit = ".narrafork/intelligent_ui/kit";
-		const { service, authorized } = await fixture({
-			[`${kit}/kit.json`]: JSON.stringify({ version: 1, components: [{ name: "A", from: "./a" }] }),
-			[`${kit}/dist/kit.js`]: "globalThis.__nfKit = {};",
-			[`${kit}/dist/kit.meta.json`]: JSON.stringify({
+	test("metadata the host did not sign is not served, legacy or not", async () => {
+		const { service, notified } = await fixture({
+			[`${KIT}/kit.json`]: JSON.stringify({ version: 1, components: [{ name: "A", from: "./a" }] }),
+			[`${KIT}/dist/kit.js`]: "globalThis.__nfKit = {};",
+			// Recorded before bundles were named after their inputs, and before signatures.
+			[`${KIT}/dist/kit.meta.json`]: JSON.stringify({
 				version: 1,
 				fingerprint: "old",
 				hash: "h1",
@@ -113,18 +132,44 @@ describe("kit confirmation (the user's side)", () => {
 				css: null,
 			}),
 		});
+		await expect(service.bundle("n", "actor", signal())).rejects.toMatchObject({
+			statusCode: 404,
+		});
+		expect((await service.overview("n", "actor", signal())).status).toEqual({
+			state: "unbuilt",
+			components: [],
+		});
+		expect(notified).toEqual([]);
+	});
+
+	test("a bundle the host built is served only through the caller's file authorization", async () => {
+		const { root, workspace, backend, service, authorized } = await fixture({
+			[`${KIT}/kit.json`]: JSON.stringify({ version: 1, components: [{ name: "A", from: "./a" }] }),
+		});
+		const built = await buildKit(backend, workspace, {
+			authorize: async (path) => path,
+			authorizeWrite: async () => {},
+			signal: signal(),
+			async runCommand({ bundlePath }) {
+				await mkdir(dirname(bundlePath), { recursive: true });
+				await writeFile(bundlePath, "globalThis.__nfKit = {};");
+				return { code: 0, log: "" };
+			},
+		});
+		expect(built.ok).toBe(true);
+		authorized.length = 0;
 		const bundle = await service.bundle("n", "actor", signal());
 		expect(bundle).toEqual({
 			js: "globalThis.__nfKit = {};",
 			css: "",
-			hash: "h1",
+			hash: built.status.hash as string,
 			components: ["A"],
 			hasSetup: false,
 		});
-		// Exactly the two files it serves from, each authorized before it is read. (A
-		// bundle recorded before bundles were named after their inputs is still served.)
+		// Exactly the two files it serves from, each authorized before it is read.
 		const read = authorized.map((path) => path.replaceAll("\\", "/").split("/").pop());
-		expect(read).toEqual(["kit.meta.json", "kit.js"]);
+		expect(read).toEqual(["kit.meta.json", built.bundle.replace("dist/", "")]);
+		expect(existsSync(join(root, KIT, built.bundle))).toBe(true);
 	});
 });
 

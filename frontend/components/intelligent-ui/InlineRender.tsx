@@ -45,6 +45,7 @@ export function InlineRender({
 	const [runtime, setRuntime] = useState<UiRuntime | null>(null);
 	const [error, setError] = useState<string | null>(null);
 	const [link, setLink] = useState<string | null>(null);
+	const [prompt, setPrompt] = useState<string | null>(null);
 	const [sendFailed, setSendFailed] = useState(false);
 	const [navigated, setNavigated] = useState(false);
 	const loads = useRef(0);
@@ -53,6 +54,14 @@ export function InlineRender({
 	const pending = useRef(0);
 	const lastSent = useRef(0);
 	const latest = useRef({ source, live });
+	// Set in the message handler, not after render: a second action in the same turn
+	// must not replace the text the reader is already being asked to confirm.
+	const confirming = useRef(false);
+	// Read at event time, not from the listener's closure. The iframe can post during
+	// commit, before the effect that binds the listener runs again, and that listener
+	// would otherwise still see the previous runtime and send a project-kit prompt.
+	const runtimeNow = useRef(runtime);
+	runtimeNow.current = runtime;
 	latest.current = { source, live };
 
 	useEffect(() => {
@@ -92,8 +101,27 @@ export function InlineRender({
 	useEffect(() => {
 		ready.current = false;
 		loads.current = 0;
+		confirming.current = false;
 		setNavigated(false);
+		setLink(null);
+		setPrompt(null);
 	}, [srcDoc]);
+
+	const send = useCallback(
+		(text: string): boolean => {
+			// One click is one message; a double click or a held key is not two.
+			if (Date.now() - lastSent.current < 1000) return false;
+			lastSent.current = Date.now();
+			setSendFailed(false);
+			void api.sendNarratorMessage(narratorId, text.slice(0, 2000)).catch(() => {
+				// The UI the reader was using stays; only the failed send is reported.
+				lastSent.current = 0;
+				setSendFailed(true);
+			});
+			return true;
+		},
+		[narratorId],
+	);
 
 	const post = useCallback(() => {
 		const target = frame.current?.contentWindow;
@@ -145,23 +173,31 @@ export function InlineRender({
 				setNavigated(true);
 				return;
 			}
-			if (data?.type !== "narrafork:ui-action" || typeof data.value !== "string") return;
+			const current = runtimeNow.current;
+			if (data?.type !== "narrafork:ui-action" || typeof data.value !== "string" || !current)
+				return;
 			if (data.action === "openLink") {
 				// Never navigate on the frame's say-so: the reader sees the URL first.
+				// A bar already on screen keeps its text until the reader answers it.
 				const url = httpUrl(data.value);
-				if (url) setLink(url);
+				if (!url || confirming.current) return;
+				confirming.current = true;
+				setPrompt(null);
+				setLink(url);
 				return;
 			}
 			const text = data.value.trim();
-			// One click is one message; a double click or a held key is not two.
-			if (data.action !== "sendPrompt" || !text || Date.now() - lastSent.current < 1000) return;
-			lastSent.current = Date.now();
-			setSendFailed(false);
-			void api.sendNarratorMessage(narratorId, text.slice(0, 2000)).catch(() => {
-				// The UI the reader was using stays; only the failed send is reported.
-				lastSent.current = 0;
-				setSendFailed(true);
-			});
+			if (data.action !== "sendPrompt" || !text) return;
+			// The frame's gesture check guards markup, but a project kit's own code runs
+			// in that frame and can post this message itself: the reader confirms it.
+			if (current.kit) {
+				if (confirming.current) return;
+				confirming.current = true;
+				setLink(null);
+				setPrompt(text.slice(0, 2000));
+				return;
+			}
+			send(text);
 		};
 		window.addEventListener("message", onMessage);
 		const unsubscribe = subscribeHostPresentation(sendTheme);
@@ -169,7 +205,7 @@ export function InlineRender({
 			window.removeEventListener("message", onMessage);
 			unsubscribe();
 		};
-	}, [srcDoc, narratorId, onReady, sendTheme]);
+	}, [srcDoc, onReady, sendTheme, send]);
 
 	useEffect(() => {
 		if (!sendFailed) return;
@@ -206,9 +242,17 @@ export function InlineRender({
 		position: "absolute",
 		insetInline: 0,
 		bottom: 0,
-		height: 34,
+		minHeight: 34,
 		background: "var(--mantine-color-body)",
 		borderTop: "1px solid var(--mantine-color-default-border)",
+	} as const;
+	const confirmText = {
+		flex: 1,
+		minWidth: 0,
+		maxHeight: 96,
+		overflow: "auto",
+		whiteSpace: "pre-wrap",
+		overflowWrap: "anywhere",
 	} as const;
 	return (
 		<Box style={{ position: "relative", height }}>
@@ -226,7 +270,7 @@ export function InlineRender({
 			/>
 			{link ? (
 				<Group gap="xs" wrap="nowrap" px="xs" style={bar}>
-					<Text size="xs" truncate style={{ flex: 1, minWidth: 0 }} title={link}>
+					<Text size="xs" style={confirmText} title={link}>
 						{t("intelligentUi.linkConfirm", { url: link })}
 					</Text>
 					<Button
@@ -235,11 +279,49 @@ export function InlineRender({
 						href={link}
 						target="_blank"
 						rel="noopener noreferrer"
-						onClick={() => setLink(null)}
+						onClick={() => {
+							confirming.current = false;
+							setLink(null);
+						}}
 					>
 						{t("intelligentUi.linkOpen")}
 					</Button>
-					<Button size="compact-xs" variant="subtle" onClick={() => setLink(null)}>
+					<Button
+						size="compact-xs"
+						variant="subtle"
+						onClick={() => {
+							confirming.current = false;
+							setLink(null);
+						}}
+					>
+						{t("intelligentUi.cancel")}
+					</Button>
+				</Group>
+			) : prompt ? (
+				<Group gap="xs" wrap="nowrap" px="xs" style={bar}>
+					<Text size="xs" style={confirmText} title={prompt}>
+						{t("intelligentUi.promptConfirm", { text: prompt })}
+					</Text>
+					<Button
+						size="compact-xs"
+						onClick={() => {
+							// A click inside the quiet period leaves the bar up, so the
+							// reader can see that this text has not been sent yet.
+							if (!send(prompt)) return;
+							confirming.current = false;
+							setPrompt(null);
+						}}
+					>
+						{t("intelligentUi.promptSend")}
+					</Button>
+					<Button
+						size="compact-xs"
+						variant="subtle"
+						onClick={() => {
+							confirming.current = false;
+							setPrompt(null);
+						}}
+					>
 						{t("intelligentUi.cancel")}
 					</Button>
 				</Group>

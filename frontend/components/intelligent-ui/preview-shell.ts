@@ -177,8 +177,10 @@ export function createPreviewShell(
         colorSchemeManager: { get: () => scheme, set: () => {}, subscribe: () => {}, unsubscribe: () => {}, clear: () => {} }
       }, props.children);
     }
-    // A host action is the reader's act, not the UI's. It is honoured only right after a
-    // real input event in this frame, so nothing that merely gets drawn can speak for them.
+    // A host action is the reader's act, not the UI's. Posting one only right after a real
+    // input event keeps markup that merely gets drawn from speaking for them; that holds in
+    // the built-in runtime. A project kit's code shares this frame and can post directly,
+    // so the host confirms its sendPrompt with the reader before it becomes a chat message.
     let lastGesture = -Infinity;
     for (const type of ["pointerdown", "keydown", "click"])
       document.addEventListener(type, event => { if (event.isTrusted) lastGesture = performance.now(); }, true);

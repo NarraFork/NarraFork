@@ -29,6 +29,8 @@ await i18n.init({
 					sendFailed: "Send failed",
 					linkConfirm: "Open {{url}}?",
 					linkOpen: "Open",
+					promptConfirm: "Send this to the chat? {{text}}",
+					promptSend: "Send",
 					cancel: "Cancel",
 					kit: {
 						title: "Component kit",

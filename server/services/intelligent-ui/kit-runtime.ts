@@ -11,7 +11,7 @@ import { findUnknownUiTags, parseUiMarkup, UI_MARKUP_LIMITS } from "@shared/inte
 import type { WorkspaceContext } from "@shared/workspace-context";
 import { builtinComponentNames } from "./compiler";
 import { type AuthorizeFile, uiError, workspaceKey } from "./files";
-import { buildKit, type KitSnapshot, readKit } from "./kit";
+import { buildKit, type KitBuildOptions, type KitSnapshot, readKit } from "./kit";
 import {
 	consumeKitApproval,
 	getKitRequest,
@@ -33,6 +33,8 @@ export interface KitToolEnvironment {
 	check(): Promise<void>;
 	authorizeRead(path: string): Promise<void>;
 	authorizeWrite(path: string): Promise<void>;
+	/** Test seam forwarded to `buildKit`. Never set from anything the agent controls. */
+	runCommand?: KitBuildOptions["runCommand"];
 }
 
 export const KIT_AUTHORING_GUIDE = `To make previews use THIS project's components instead of the built-in Mantine set:
@@ -47,6 +49,7 @@ export const KIT_AUTHORING_GUIDE = `To make previews use THIS project's componen
 
 const BUILD_PENDING =
 	"The component kit build is waiting for the user's confirmation, shown to them in the chat. Carry on with other work; you will be told when it is approved. Do not call kit_build again before then.";
+const PREBUILT_REFUSED = `Nothing was built or recorded. A prebuilt bundle cannot be registered as the component kit: NarraFork runs the project's Vite build itself and signs the result. Call IntelligentUI {action:"kit_build"} without skip_build; the user's approval still stands.`;
 
 function authorizer(env: KitToolEnvironment): AuthorizeFile {
 	return async (path) => {
@@ -223,10 +226,21 @@ async function build(
 			metadata: { intelligentUiKit: notice(before.status, request) },
 		};
 	}
+	// Accepted by the schema so a call in flight still parses, but a file the agent built
+	// is not something the host can vouch for. The approval is left for the real build.
+	if (input.skip_build === true) {
+		return {
+			isError: true,
+			output: PREBUILT_REFUSED,
+			metadata: {
+				intelligentUiKit: notice(before.status, getKitRequest(env.ctx.narratorId, key)),
+			},
+		};
+	}
 	const result = await buildKit(env.backend, env.workspace, {
 		authorize: authorizer(env),
 		signal: env.ctx.signal,
-		skipBuild: input.skip_build === true,
+		...(env.runCommand ? { runCommand: env.runCommand } : {}),
 		async authorizeWrite(path) {
 			await env.authorizeWrite(path);
 			await env.check();
@@ -236,7 +250,7 @@ async function build(
 		return {
 			isError: true,
 			// The approval is kept: fixing a manifest and retrying is one job, not two.
-			output: `Component kit build failed.\nCommand (run in the Vite root): ${result.command}\n\n${result.log.slice(-6000)}\n\nFix kit.json or setup.tsx and call kit_build again; the user's approval still stands. If this project needs a different build command, run it yourself against the generated ${INTELLIGENT_UI_KIT_DIRECTORY}/vite.kit.config.mjs (it writes ${INTELLIGENT_UI_KIT_DIRECTORY}/${result.bundle}), then call kit_build with skip_build:true. The kit that was in use before this attempt is untouched.`,
+			output: `Component kit build failed.\nCommand (NarraFork ran it in the Vite root): ${result.command}\n\n${result.log.slice(-6000)}\n\nFix kit.json, setup.tsx or the project's build setup and call kit_build again; the user's approval still stands. The kit that was in use before this attempt is untouched.`,
 			metadata: {
 				intelligentUiKit: notice(result.status, getKitRequest(env.ctx.narratorId, key)),
 			},
