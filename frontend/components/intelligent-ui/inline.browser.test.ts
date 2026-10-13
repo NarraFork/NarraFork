@@ -282,8 +282,17 @@ browserTest(
 			expect(await page.$eval('#card [title="pwned"]', (node) => node.textContent)).toBe(
 				"Send this to the chat? pwned",
 			);
-			// Shown, not sent.
+			// Shown, not sent. A later post keeps the text already on the bar.
+			await frame.evaluate(() =>
+				parent.postMessage(
+					{ type: "narrafork:ui-action", action: "sendPrompt", value: "swapped" },
+					"*",
+				),
+			);
 			await new Promise((done) => setTimeout(done, 300));
+			expect(await page.$eval('#card [title="pwned"]', (node) => node.textContent)).toBe(
+				"Send this to the chat? pwned",
+			);
 			expect(messages).toEqual([]);
 
 			// The reader's click is what sends it, once, as the user.

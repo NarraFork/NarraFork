@@ -54,6 +54,9 @@ export function InlineRender({
 	const pending = useRef(0);
 	const lastSent = useRef(0);
 	const latest = useRef({ source, live });
+	// Set in the message handler, not after render: a second action in the same turn
+	// must not replace the text the reader is already being asked to confirm.
+	const confirming = useRef(false);
 	latest.current = { source, live };
 
 	useEffect(() => {
@@ -93,7 +96,9 @@ export function InlineRender({
 	useEffect(() => {
 		ready.current = false;
 		loads.current = 0;
+		confirming.current = false;
 		setNavigated(false);
+		setLink(null);
 		setPrompt(null);
 	}, [srcDoc]);
 
@@ -166,11 +171,12 @@ export function InlineRender({
 				return;
 			if (data.action === "openLink") {
 				// Never navigate on the frame's say-so: the reader sees the URL first.
+				// A bar already on screen keeps its text until the reader answers it.
 				const url = httpUrl(data.value);
-				if (url) {
-					setPrompt(null);
-					setLink(url);
-				}
+				if (!url || confirming.current) return;
+				confirming.current = true;
+				setPrompt(null);
+				setLink(url);
 				return;
 			}
 			const text = data.value.trim();
@@ -178,6 +184,8 @@ export function InlineRender({
 			// The frame's gesture check guards markup, but a project kit's own code runs
 			// in that frame and can post this message itself: the reader confirms it.
 			if (runtime.kit) {
+				if (confirming.current) return;
+				confirming.current = true;
 				setLink(null);
 				setPrompt(text.slice(0, 2000));
 				return;
@@ -256,11 +264,21 @@ export function InlineRender({
 						href={link}
 						target="_blank"
 						rel="noopener noreferrer"
-						onClick={() => setLink(null)}
+						onClick={() => {
+							confirming.current = false;
+							setLink(null);
+						}}
 					>
 						{t("intelligentUi.linkOpen")}
 					</Button>
-					<Button size="compact-xs" variant="subtle" onClick={() => setLink(null)}>
+					<Button
+						size="compact-xs"
+						variant="subtle"
+						onClick={() => {
+							confirming.current = false;
+							setLink(null);
+						}}
+					>
 						{t("intelligentUi.cancel")}
 					</Button>
 				</Group>
@@ -272,13 +290,21 @@ export function InlineRender({
 					<Button
 						size="compact-xs"
 						onClick={() => {
+							confirming.current = false;
 							setPrompt(null);
 							send(prompt);
 						}}
 					>
 						{t("intelligentUi.promptSend")}
 					</Button>
-					<Button size="compact-xs" variant="subtle" onClick={() => setPrompt(null)}>
+					<Button
+						size="compact-xs"
+						variant="subtle"
+						onClick={() => {
+							confirming.current = false;
+							setPrompt(null);
+						}}
+					>
 						{t("intelligentUi.cancel")}
 					</Button>
 				</Group>
