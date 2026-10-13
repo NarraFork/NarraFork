@@ -22,6 +22,7 @@ export const intelligentUiParameters = z
 		path: z.string().min(1).max(4096).optional(),
 		title: z.string().min(1).max(80).optional(),
 		size: z.enum(["sm", "md", "lg"]).optional(),
+		// Retired: still parsed so a call already in flight is answered, never honoured.
 		skip_build: z.boolean().optional(),
 		source: z.string().min(1).max(UI_MARKUP_LIMITS.sourceChars).optional(),
 	})
@@ -46,7 +47,7 @@ export const intelligentUiParameters = z
 			ctx.addIssue({
 				code: "custom",
 				message:
-					"create takes only prefix; show takes only path; render takes source (+ title, size); kit_build takes only skip_build; kit_status takes nothing",
+					"create takes only prefix; show takes only path; render takes source (+ title, size); kit_build and kit_status take nothing",
 			});
 	});
 export type IntelligentUiInput =
@@ -64,7 +65,7 @@ render({title, size, source}) draws UI inline in the chat WHILE you write it. so
 
 kit_status() lists the kit's components with props and examples; call it before your first render in a workspace. With no project kit the built-in Mantine components are used.
 
-kit_build({skip_build?}) builds the project's component kit from ${INTELLIGENT_UI_DIRECTORY}/kit/kit.json using the project's own Vite. It only runs after the user confirms in the chat UI; the confirmation is requested for you. Never ask for it repeatedly.
+kit_build() builds the project's component kit from ${INTELLIGENT_UI_DIRECTORY}/kit/kit.json: once the user confirms in the chat UI, NarraFork runs the project's own Vite and records the result. The confirmation is requested for you; never ask for it repeatedly. A bundle you build yourself is never used.
 
 create({prefix}) / show({path}) are for a full interactive app instead of markup: create makes ${INTELLIGENT_UI_DIRECTORY}/<prefix>-<id>/App.tsx, you edit it with the normal file tools, then show the directory. App.tsx default-exports a React component; it may import relative files and, with a project kit, components from "kit" (otherwise react, @mantine/core and @mantine/hooks). No other packages, no host API.
 

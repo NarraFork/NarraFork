@@ -1,17 +1,33 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { LocalBackend } from "@server/lib/agent/execution/local-backend";
 import type { WorkspaceContext } from "@shared/workspace-context";
-import { buildKit, readKit, readKitBundle } from "./kit";
+import { buildKit, type KitBuildRun, readKit, readKitBundle } from "./kit";
+import { resetKitSigningKeyForTest } from "./kit-signature";
 
 const KIT = ".narrafork/intelligent_ui/kit";
 const REPO_MODULES = resolve(import.meta.dir, "../../../node_modules");
 const roots: string[] = [];
 afterEach(async () => {
 	await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+});
+
+// Builds are signed with a key in the NarraFork home: keep it out of the developer's.
+const savedHome = process.env.NARRAFORK_HOME;
+let signingHome = "";
+beforeAll(async () => {
+	signingHome = await mkdtemp(join(tmpdir(), "nf-ui-kit-home-"));
+	process.env.NARRAFORK_HOME = signingHome;
+	resetKitSigningKeyForTest();
+});
+afterAll(async () => {
+	if (savedHome === undefined) delete process.env.NARRAFORK_HOME;
+	else process.env.NARRAFORK_HOME = savedHome;
+	resetKitSigningKeyForTest();
+	await rm(signingHome, { recursive: true, force: true });
 });
 
 async function project(files: Record<string, string>) {
@@ -40,17 +56,29 @@ async function project(files: Record<string, string>) {
 	};
 	const read = () => readKit(backend, workspace, options.authorize, options.signal);
 	const bundle = () => readKitBundle(backend, workspace, options.authorize, options.signal);
-	/** Stand in for a build: put a bundle where `kit_build` says this build writes it. */
+	const runs: KitBuildRun[] = [];
+	/**
+	 * Stands in for Vite: while the build runs, writes `js` where the build says its bundle
+	 * goes (nothing when null), and `extra` files beside it.
+	 */
+	const vite =
+		(js: string | null, extra: Record<string, string> = {}, code = 0) =>
+		async (run: KitBuildRun) => {
+			runs.push(run);
+			await mkdir(dirname(run.bundlePath), { recursive: true });
+			if (js !== null) await writeFile(run.bundlePath, js);
+			for (const [name, content] of Object.entries(extra))
+				await writeFile(join(dirname(run.bundlePath), name), content);
+			return { code, log: `vite exited ${code}` };
+		};
+	const build = (runCommand: ReturnType<typeof vite>) =>
+		buildKit(backend, workspace, { ...options, runCommand });
 	const record = async (js: string, extra: Record<string, string> = {}) => {
-		const attempt = await buildKit(backend, workspace, { ...options, skipBuild: true });
-		if (attempt.ok) return attempt;
-		await mkdir(join(root, KIT, "dist"), { recursive: true });
-		await writeFile(join(root, KIT, attempt.bundle), js);
-		for (const [name, content] of Object.entries(extra))
-			await writeFile(join(root, KIT, "dist", name), content);
-		return buildKit(backend, workspace, { ...options, skipBuild: true });
+		const result = await build(vite(js, extra));
+		if (!result.ok) throw new Error(`build failed: ${result.log}`);
+		return result;
 	};
-	return { root, backend, workspace, options, written, read, bundle, record };
+	return { root, backend, workspace, options, written, runs, read, bundle, vite, build, record };
 }
 
 const manifest = (components: unknown[], extra: Record<string, unknown> = {}) =>
@@ -117,33 +145,64 @@ describe("component kit state", () => {
 		expect((await f.read()).status.reason).toContain("PascalCase");
 	});
 
-	test("skip_build records the bundle this build names and refuses to invent a missing one", async () => {
+	test("a build that exits 0 without writing its bundle records nothing", async () => {
 		const f = await project({ [`${KIT}/kit.json`]: manifest([{ name: "A", from: "./a" }]) });
-		const missing = await buildKit(f.backend, f.workspace, { ...f.options, skipBuild: true });
+		const missing = await f.build(f.vite(null));
 		expect(missing.ok).toBe(false);
 		expect(missing.bundle).toMatch(/^dist\/kit-[0-9a-f]{12}\.js$/);
 		expect(missing.log).toContain(`did not produce ${missing.bundle}`);
 		expect((await f.read()).status.state).toBe("unbuilt");
+		// The seam ran in place of the backend, in the Vite root, for this bundle path.
+		expect(f.runs).toHaveLength(1);
+		expect(f.runs[0]?.cwd).toBe(f.root);
+		expect(f.runs[0]?.bundlePath).toBe(join(f.root, KIT, missing.bundle));
 		// A bundle under any OTHER name is not this build's output.
-		await mkdir(join(f.root, KIT, "dist"), { recursive: true });
 		await writeFile(join(f.root, KIT, "dist/kit.js"), "stale");
-		expect((await buildKit(f.backend, f.workspace, { ...f.options, skipBuild: true })).ok).toBe(
-			false,
-		);
-		await writeFile(join(f.root, KIT, missing.bundle), "globalThis.__nfKit = {};");
-		await writeFile(join(f.root, KIT, "dist/style.css"), ".a{}");
+		expect((await f.build(f.vite(null))).ok).toBe(false);
+		// Writing it and failing is a failure.
+		expect((await f.build(f.vite("globalThis.__nfKit = {};", {}, 1))).ok).toBe(false);
+		expect((await f.read()).status.state).toBe("unbuilt");
+		await expect(f.bundle()).rejects.toThrow("no built component kit");
+	});
+
+	test("a file already at the bundle path that the build does not write is not adopted", async () => {
+		const f = await project({ [`${KIT}/kit.json`]: manifest([{ name: "A", from: "./a" }]) });
+		const { bundle } = await f.build(f.vite(null));
+		// The agent puts its own bundle exactly where this build looks.
+		await writeFile(join(f.root, KIT, bundle), "globalThis.__nfKit = { planted: true };");
+		const result = await f.build(f.vite(null));
+		expect(result.ok).toBe(false);
+		expect(result.bundle).toBe(bundle);
+		expect(result.log).toContain("did not produce");
+		expect((await f.read()).status).toEqual({ state: "unbuilt", components: [] });
+		await expect(f.bundle()).rejects.toThrow("no built component kit");
+		expect(existsSync(join(f.root, KIT, "dist/kit.meta.json"))).toBe(false);
+	});
+
+	test("what the build writes is signed, recorded and served", async () => {
+		const f = await project({ [`${KIT}/kit.json`]: manifest([{ name: "A", from: "./a" }]) });
+		const { bundle } = await f.build(f.vite(null));
+		await writeFile(join(f.root, KIT, "dist/kit.js"), "stale");
 		f.written.length = 0;
-		const recorded = await buildKit(f.backend, f.workspace, { ...f.options, skipBuild: true });
+		// An older Vite names the stylesheet style.css; it is still found.
+		const recorded = await f.build(f.vite("globalThis.__nfKit = {};", { "style.css": ".a{}" }));
 		expect(recorded.ok).toBe(true);
-		expect(recorded.bundle).toBe(missing.bundle);
+		expect(recorded.bundle).toBe(bundle);
 		expect(recorded.status).toMatchObject({ state: "ready", components: ["A"] });
-		// Every generated file went through the write authorization.
+		// Every file the build writes went through the write authorization.
 		expect(f.written.map((path) => path.replaceAll("\\", "/").split("/").pop())).toEqual([
 			"entry.generated.ts",
 			"vite.kit.config.mjs",
+			"dist",
 			"kit.meta.json",
 		]);
-		// An older Vite names the stylesheet style.css; it is still found.
+		const meta = JSON.parse(await readFile(join(f.root, KIT, "dist/kit.meta.json"), "utf8"));
+		expect(meta.signature).toMatch(/^[0-9a-f]{64}$/);
+		expect(meta.jsSha256).toBe(
+			new Bun.CryptoHasher("sha256").update("globalThis.__nfKit = {};").digest("hex"),
+		);
+		expect(meta.css).toBe("style.css");
+		expect((await f.read()).status).toMatchObject({ state: "ready", hash: recorded.status.hash });
 		expect(await f.bundle()).toMatchObject({
 			js: "globalThis.__nfKit = {};",
 			css: ".a{}",
@@ -152,6 +211,59 @@ describe("component kit state", () => {
 		});
 		// The bundle left over from before this scheme is garbage once a build commits.
 		expect(await dist(f.root)).not.toContain("kit.js");
+	});
+
+	test("a bundle or stylesheet changed after the build is not what gets served", async () => {
+		const f = await project({ [`${KIT}/kit.json`]: manifest([{ name: "A", from: "./a" }]) });
+		const built = await f.record("globalThis.__nfKit = {};", { "style.css": ".a{}" });
+		const js = join(f.root, KIT, built.bundle);
+		const original = await readFile(js);
+		const flipped = Buffer.from(original);
+		flipped[0] = (flipped[0] as number) ^ 1;
+		await writeFile(js, flipped);
+		// Status trusts the signature and does not re-read the bundle. Serving does.
+		expect((await f.read()).status.hash).toBe(built.status.hash as string);
+		await expect(f.bundle()).rejects.toThrow("no built component kit");
+		// Put back, it is the signed bundle again; the stylesheet is covered as well.
+		await writeFile(js, original);
+		expect((await f.bundle()).js).toBe("globalThis.__nfKit = {};");
+		await writeFile(join(f.root, KIT, "dist/style.css"), "body{background:url(//x)}");
+		await expect(f.bundle()).rejects.toThrow("no built component kit");
+	});
+
+	test("hand-written metadata is never served, whatever bundle it names", async () => {
+		const f = await project({
+			[`${KIT}/kit.json`]: manifest([{ name: "A", from: "./a" }]),
+			[`${KIT}/dist/kit.js`]: "globalThis.__nfKit = { planted: true };",
+			[`${KIT}/dist/kit-0123456789ab.js`]: "globalThis.__nfKit = { planted: true };",
+		});
+		const unsigned = {
+			version: 1,
+			fingerprint: "f",
+			hash: "h1",
+			builtAt: "2026-01-01T00:00:00.000Z",
+			components: ["A"],
+			hasSetup: false,
+			css: null,
+		};
+		const metaPath = join(f.root, KIT, "dist/kit.meta.json");
+		for (const meta of [
+			// Recorded before bundles were named after their inputs: means kit.js.
+			unsigned,
+			{ ...unsigned, js: "kit-0123456789ab.js", generation: 1 },
+			{
+				...unsigned,
+				js: "kit-0123456789ab.js",
+				generation: 1,
+				jsSha256: "0".repeat(64),
+				cssSha256: "",
+				signature: "0".repeat(64),
+			},
+		]) {
+			await writeFile(metaPath, JSON.stringify(meta));
+			expect((await f.read()).status).toEqual({ state: "unbuilt", components: [] });
+			await expect(f.bundle()).rejects.toThrow("no built component kit");
+		}
 	});
 
 	test("editing the manifest makes the kit stale while the built bundle keeps being served", async () => {
@@ -177,15 +289,13 @@ describe("component kit state", () => {
 		const f = await project({ [`${KIT}/kit.json`]: manifest([{ name: "A", from: "./a" }]) });
 		const first = await f.record("first");
 		// Same inputs, next build: a different file, so a failure cannot clobber `first`.
-		const attempt = await buildKit(f.backend, f.workspace, { ...f.options, skipBuild: true });
+		const attempt = await f.build(f.vite(null));
 		expect(attempt.ok).toBe(false);
 		expect(attempt.bundle).not.toBe(first.bundle);
 		expect(attempt.status).toMatchObject({ state: "ready", hash: first.status.hash });
 		expect((await f.bundle()).js).toBe("first");
 		// A retry of the failed attempt looks in the same place.
-		expect((await buildKit(f.backend, f.workspace, { ...f.options, skipBuild: true })).bundle).toBe(
-			attempt.bundle,
-		);
+		expect((await f.build(f.vite(null))).bundle).toBe(attempt.bundle);
 		const second = await f.record("second");
 		expect(second.ok).toBe(true);
 		expect(second.status.hash).not.toBe(first.status.hash);
@@ -222,13 +332,13 @@ describe("component kit state", () => {
 			[`${KIT}/kit.json`]: manifest([{ name: "A", from: "./a" }], { root: "apps/web" }),
 		});
 		// A missing directory inside the workspace is a build failure, not a traversal.
-		const result = await buildKit(f.backend, f.workspace, { ...f.options, skipBuild: true });
+		const result = await f.build(f.vite(null));
 		expect(result.ok).toBe(false);
 		await writeFile(
 			join(f.root, KIT, "kit.json"),
 			JSON.stringify({ version: 1, root: "../..", components: [{ name: "A", from: "./a" }] }),
 		);
-		await expect(buildKit(f.backend, f.workspace, f.options)).rejects.toThrow("root");
+		await expect(f.build(f.vite(null))).rejects.toThrow("root");
 		expect((await f.read()).status.state).toBe("invalid");
 	});
 
@@ -244,9 +354,7 @@ describe("component kit state", () => {
 		for (const extra of outside) {
 			await writeFile(join(f.root, KIT, "kit.json"), JSON.stringify({ version: 1, ...extra }));
 			f.written.length = 0;
-			await expect(
-				buildKit(f.backend, f.workspace, { ...f.options, skipBuild: true }),
-			).rejects.toThrow("outside the workspace");
+			await expect(f.build(f.vite(null))).rejects.toThrow("outside the workspace");
 			// Refused before anything is generated.
 			expect(f.written).toEqual([]);
 		}
@@ -262,7 +370,7 @@ describe("component kit state", () => {
 				{ styles: ["../../../src/app.css"], setup: "./setup.tsx" },
 			),
 		);
-		const result = await buildKit(f.backend, f.workspace, { ...f.options, skipBuild: true });
+		const result = await f.build(f.vite(null));
 		expect(result.log).toContain("did not produce");
 	});
 });
@@ -294,7 +402,12 @@ describe("component kit build (real Vite)", () => {
 			`bunx vite build --mode production --config "${KIT}/vite.kit.config.mjs"`,
 		);
 		expect(result.status).toMatchObject({ state: "ready", components: ["Button", "Card"] });
+		// What Vite wrote is signed, and only the signed bytes are served.
+		const meta = JSON.parse(await readFile(join(f.root, KIT, "dist/kit.meta.json"), "utf8"));
+		expect(meta.signature).toMatch(/^[0-9a-f]{64}$/);
+		expect(meta.cssSha256).toMatch(/^[0-9a-f]{64}$/);
 		const bundle = await f.bundle();
+		expect(bundle.hash).toBe(result.status.hash as string);
 		expect(bundle.hasSetup).toBe(true);
 		// Global stylesheet and component stylesheet both made it into the one CSS file.
 		expect(bundle.css).toContain("--brand");

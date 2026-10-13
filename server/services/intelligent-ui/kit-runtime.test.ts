@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -15,12 +15,28 @@ import {
 	resetKitRequestsForTest,
 } from "./kit-requests";
 import { executeKitAction, type KitToolEnvironment } from "./kit-runtime";
+import { resetKitSigningKeyForTest } from "./kit-signature";
 
 const KIT = ".narrafork/intelligent_ui/kit";
 const roots: string[] = [];
 beforeEach(() => resetKitRequestsForTest());
 afterEach(async () => {
 	await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
+});
+
+// Builds are signed with a key in the NarraFork home: keep it out of the developer's.
+const savedHome = process.env.NARRAFORK_HOME;
+let signingHome = "";
+beforeAll(async () => {
+	signingHome = await mkdtemp(join(tmpdir(), "nf-ui-kit-tool-home-"));
+	process.env.NARRAFORK_HOME = signingHome;
+	resetKitSigningKeyForTest();
+});
+afterAll(async () => {
+	if (savedHome === undefined) delete process.env.NARRAFORK_HOME;
+	else process.env.NARRAFORK_HOME = savedHome;
+	resetKitSigningKeyForTest();
+	await rm(signingHome, { recursive: true, force: true });
 });
 
 async function fixture(files: Record<string, string> = {}) {
@@ -54,21 +70,31 @@ async function fixture(files: Record<string, string> = {}) {
 }
 const notice = (result: { metadata?: Record<string, unknown> }) =>
 	readIntelligentUiKitNotice(result.metadata?.intelligentUiKit);
-/** The workspace-relative bundle path a failed build says it expects. */
+/** The workspace-relative bundle path a failed build says it did not produce. */
 function bundlePath(output: string): string {
-	const match = /\.narrafork\/intelligent_ui\/kit\/dist\/kit-[0-9a-f]{12}\.js/.exec(output);
+	const match = /dist\/kit-[0-9a-f]{12}\.js/.exec(output);
 	if (!match) throw new Error(`no bundle path in: ${output.slice(0, 200)}`);
-	return match[0];
+	return `${KIT}/${match[0]}`;
 }
-/** Ask, confirm as the user, and complete a build whose bundle the test supplies. */
+/** Stands in for Vite: counts its runs and writes `js` (unless null) while running. */
+function vite(js: string | null) {
+	const runs: string[] = [];
+	const runCommand: NonNullable<KitToolEnvironment["runCommand"]> = async ({ bundlePath }) => {
+		runs.push(bundlePath);
+		await mkdir(dirname(bundlePath), { recursive: true });
+		if (js !== null) await writeFile(bundlePath, js);
+		return { code: 0, log: "" };
+	};
+	return { runs, runCommand };
+}
+/** Ask, confirm as the user, and complete a build whose output the stand-in writes. */
 async function buildWithApproval(env: KitToolEnvironment) {
-	const asked = await executeKitAction({ action: "kit_build", skip_build: true }, env);
+	const asked = await executeKitAction({ action: "kit_build" }, env);
 	approveKitRequest("n", notice(asked)?.request?.id as string);
-	const failed = await executeKitAction({ action: "kit_build", skip_build: true }, env);
-	const root = env.workspace.cwd;
-	await mkdir(join(root, KIT, "dist"), { recursive: true });
-	await writeFile(join(root, bundlePath(failed.output)), "1");
-	const built = await executeKitAction({ action: "kit_build", skip_build: true }, env);
+	const built = await executeKitAction(
+		{ action: "kit_build" },
+		{ ...env, runCommand: vite("1").runCommand },
+	);
 	if (built.isError) throw new Error(built.output);
 }
 const KIT_JSON = JSON.stringify({ version: 1, components: [{ name: "Pill", from: "./Pill" }] });
@@ -204,24 +230,61 @@ describe("kit_build confirmation", () => {
 
 	test("after confirmation it builds once; a failure keeps the approval, a success spends it", async () => {
 		const { env, root } = await fixture({ [`${KIT}/kit.json`]: KIT_JSON });
+		// skip_build still parses, and before approval it only asks, as any kit_build does.
 		const asked = await executeKitAction({ action: "kit_build", skip_build: true }, env);
+		expect(asked.isError).toBeFalsy();
+		expect(asked.output).toContain("waiting for the user's confirmation");
 		approveKitRequest("n", notice(asked)?.request?.id as string);
-		// No bundle yet: the build "fails", and the agent may retry without re-asking.
-		const failed = await executeKitAction({ action: "kit_build", skip_build: true }, env);
+		// The build writes nothing: it fails, and the agent may retry without re-asking.
+		const empty = vite(null);
+		const failed = await executeKitAction(
+			{ action: "kit_build" },
+			{ ...env, runCommand: empty.runCommand },
+		);
+		expect(empty.runs).toHaveLength(1);
 		expect(failed.isError).toBe(true);
 		expect(failed.output).toContain("approval still stands");
+		// No route to a bundle the agent built itself is offered.
+		expect(failed.output).not.toContain("skip_build");
 		expect(getKitRequest("n", "workspace")?.state).toBe("approved");
-		// The failure names where a manual build has to put its bundle.
-		const bundle = bundlePath(failed.output);
-		await mkdir(join(root, KIT, "dist"), { recursive: true });
-		await writeFile(join(root, bundle), "1");
-		const built = await executeKitAction({ action: "kit_build", skip_build: true }, env);
+
+		// The agent puts a bundle where the build writes and asks for it to be recorded.
+		const planted = join(root, bundlePath(failed.output));
+		await writeFile(planted, "globalThis.__nfKit = { planted: true };");
+		const spy = vite("never");
+		const refused = await executeKitAction(
+			{ action: "kit_build", skip_build: true },
+			{ ...env, runCommand: spy.runCommand },
+		);
+		expect(refused.isError).toBe(true);
+		expect(refused.output).toContain("without skip_build");
+		expect(refused.output).toContain("signs the result");
+		expect(spy.runs).toEqual([]);
+		expect(getKitRequest("n", "workspace")?.state).toBe("approved");
+		expect(existsSync(join(root, KIT, "dist/kit.meta.json"))).toBe(false);
+		expect((await executeKitAction({ action: "kit_status" }, env)).output).toContain(
+			"Project component kit: unbuilt",
+		);
+		// Nor does a real build that leaves the planted file alone adopt it.
+		await writeFile(planted, "globalThis.__nfKit = { planted: true };");
+		const untouched = await executeKitAction(
+			{ action: "kit_build" },
+			{ ...env, runCommand: vite(null).runCommand },
+		);
+		expect(untouched.isError).toBe(true);
+		expect(notice(untouched)?.state).toBe("unbuilt");
+		expect(getKitRequest("n", "workspace")?.state).toBe("approved");
+
+		const built = await executeKitAction(
+			{ action: "kit_build" },
+			{ ...env, runCommand: vite("1").runCommand },
+		);
 		expect(built.isError).toBeFalsy();
 		expect(built.output).toContain("Built the component kit: 1 components");
 		expect(notice(built)).toEqual({ state: "ready" });
 		expect(getKitRequest("n", "workspace")).toBeNull();
 		// The next build is a new decision for the user.
-		const next = await executeKitAction({ action: "kit_build", skip_build: true }, env);
+		const next = await executeKitAction({ action: "kit_build" }, env);
 		expect(next.output).toContain("waiting for the user's confirmation");
 		expect(notice(next)?.request).toMatchObject({ kind: "update", state: "pending" });
 	});
