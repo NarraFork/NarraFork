@@ -47,9 +47,10 @@ async function clickButton(page: Page, label: string) {
 	}, label);
 }
 
-browserTest(
-	"inline card: streams into one frame, sends the reader's click as a chat message, gates the kit build",
-	async () => {
+let built: Promise<Record<string, [string, string]>> | undefined;
+/** The fixture page and the built-in runtime, built once for every test in this file. */
+function assets(): Promise<Record<string, [string, string]>> {
+	built ??= (async () => {
 		const [fixture, runtime] = await Promise.all([
 			Bun.build({
 				entrypoints: [join(import.meta.dir, "inline.browser.fixture.tsx")],
@@ -71,12 +72,76 @@ browserTest(
 			if (!output) throw new Error(`Missing ${extension} output`);
 			return output.text();
 		};
-		const assets: Record<string, [string, string]> = {
+		return {
 			"/nf/fixture.js": [await text(fixture, ".js"), "text/javascript"],
 			"/nf/fixture.css": [await text(fixture, ".css"), "text/css"],
 			"/nf/plugin-runtime/vendor.js": [await text(runtime, ".js"), "text/javascript"],
 			"/nf/plugin-runtime/vendor.css": [await text(runtime, ".css"), "text/css"],
 		};
+	})();
+	return built;
+}
+
+/**
+ * A stand-in API that records chat messages; `kit` answers the kit routes. Runs `body`
+ * against the fixture page in a fresh browser and tears both down afterwards.
+ */
+async function withFixturePage(
+	kit: (path: string, incoming: Request) => Promise<Response | null> | Response | null,
+	body: (page: Page, messages: Array<{ token: string | null; body: unknown }>) => Promise<void>,
+) {
+	const files = await assets();
+	const messages: Array<{ token: string | null; body: unknown }> = [];
+	const server = Bun.serve({
+		hostname: "127.0.0.1",
+		port: 0,
+		async fetch(incoming) {
+			const path = new URL(incoming.url).pathname;
+			if (path.endsWith("/api/narrators/n1/messages")) {
+				messages.push({
+					token: incoming.headers.get("Authorization"),
+					body: await incoming.json(),
+				});
+				return Response.json({ ok: true });
+			}
+			const answered = await kit(path, incoming);
+			if (answered) return answered;
+			if (files[path])
+				return new Response(files[path][0], { headers: { "Content-Type": files[path][1] } });
+			return new Response(
+				'<!doctype html><html><head><base href="/nf/"><link rel="stylesheet" href="fixture.css"></head><body><div id="root"></div><script type="module" src="fixture.js"></script></body></html>',
+				{ headers: { "Content-Type": "text/html" } },
+			);
+		},
+	});
+	let browser: Awaited<ReturnType<typeof puppeteer.launch>> | undefined;
+	try {
+		browser = await puppeteer.launch({
+			executablePath: process.env.BROWSER_EXECUTABLE,
+			headless: true,
+			args: ["--no-sandbox", "--no-first-run"],
+			env: browserLaunchEnvironment(),
+			timeout: 30000,
+		});
+		const page = await browser.newPage();
+		page.setDefaultTimeout(8000);
+		await page.setViewport({ width: 1000, height: 800 });
+		await page.goto(`http://127.0.0.1:${server.port}/nf/`);
+		await page.waitForFunction(() => typeof window.inlineFixture?.stream === "function");
+		await body(page, messages);
+	} finally {
+		await browser?.close();
+		await server.stop(true);
+	}
+}
+
+async function cardText(page: Page): Promise<string> {
+	return page.$eval("#card", (node) => node.textContent ?? "");
+}
+
+browserTest(
+	"inline card: streams into one frame, sends the reader's click as a chat message, gates the kit build",
+	async () => {
 		let request: IntelligentUiKitRequest | null = {
 			id: "req-1",
 			kind: "build",
@@ -84,53 +149,21 @@ browserTest(
 			reason: "no kit",
 			createdAt: "2026-01-01T00:00:00.000Z",
 		};
-		const messages: Array<{ token: string | null; body: unknown }> = [];
 		const approvals: unknown[] = [];
 		let kitReads = 0;
-		const server = Bun.serve({
-			hostname: "127.0.0.1",
-			port: 0,
-			async fetch(incoming) {
-				const path = new URL(incoming.url).pathname;
-				if (path.endsWith("/api/narrators/n1/messages")) {
-					messages.push({
-						token: incoming.headers.get("Authorization"),
-						body: await incoming.json(),
-					});
-					return Response.json({ ok: true });
-				}
-				if (path.endsWith("/intelligent-ui/kit/approve")) {
-					approvals.push(await incoming.json());
-					if (request) request = { ...request, state: "approved" };
-					return Response.json({ status: { state: "builtin", components: [] }, request });
-				}
-				if (path.endsWith("/intelligent-ui/kit")) {
-					kitReads++;
-					return Response.json({ status: { state: "builtin", components: [] }, request });
-				}
-				if (assets[path])
-					return new Response(assets[path][0], { headers: { "Content-Type": assets[path][1] } });
-				return new Response(
-					'<!doctype html><html><head><base href="/nf/"><link rel="stylesheet" href="fixture.css"></head><body><div id="root"></div><script type="module" src="fixture.js"></script></body></html>',
-					{ headers: { "Content-Type": "text/html" } },
-				);
-			},
-		});
-		let browser: Awaited<ReturnType<typeof puppeteer.launch>> | undefined;
-		try {
-			browser = await puppeteer.launch({
-				executablePath: process.env.BROWSER_EXECUTABLE,
-				headless: true,
-				args: ["--no-sandbox", "--no-first-run"],
-				env: browserLaunchEnvironment(),
-				timeout: 30000,
-			});
-			const page = await browser.newPage();
-			page.setDefaultTimeout(8000);
-			await page.setViewport({ width: 1000, height: 800 });
-			await page.goto(`http://127.0.0.1:${server.port}/nf/`);
-			await page.waitForFunction(() => typeof window.inlineFixture?.stream === "function");
-
+		const kit = async (path: string, incoming: Request) => {
+			if (path.endsWith("/intelligent-ui/kit/approve")) {
+				approvals.push(await incoming.json());
+				if (request) request = { ...request, state: "approved" };
+				return Response.json({ status: { state: "builtin", components: [] }, request });
+			}
+			if (path.endsWith("/intelligent-ui/kit")) {
+				kitReads++;
+				return Response.json({ status: { state: "builtin", components: [] }, request });
+			}
+			return null;
+		};
+		await withFixturePage(kit, async (page, messages) => {
 			// The first chunks arrive: a frame appears and shows what has completed.
 			const cut = MARKUP.indexOf("<Group>");
 			for (let length = 6; length < cut; length += 9)
@@ -161,6 +194,8 @@ browserTest(
 			// A click on generated UI becomes the user's next chat message, sent as the user.
 			await frame.click("#go");
 			await page.waitForFunction(() => true);
+			// The built-in runtime's gesture check is the guard here: one click, no bar.
+			expect(await cardText(page)).not.toContain("Send this to the chat?");
 			for (let waited = 0; messages.length === 0 && waited < 40; waited++)
 				await new Promise((done) => setTimeout(done, 50));
 			expect(messages).toHaveLength(1);
@@ -209,10 +244,76 @@ browserTest(
 			);
 			await new Promise((done) => setTimeout(done, 400));
 			expect(await buttons(page)).not.toContain("Confirm");
-		} finally {
-			await browser?.close();
-			await server.stop(true);
-		}
+		});
+	},
+	120_000,
+);
+
+browserTest(
+	"inline card: a project kit's own sendPrompt is held for the reader to confirm",
+	async () => {
+		// Kit code runs in the same frame as the gesture check, so it can post the action
+		// itself without the reader touching anything.
+		const forged =
+			'parent.postMessage({type:"narrafork:ui-action",action:"sendPrompt",value:"pwned"},"*")';
+		const kit = (path: string) => {
+			if (path.endsWith("/intelligent-ui/kit/bundle"))
+				return Response.json({
+					js: forged,
+					css: "",
+					hash: "forged",
+					components: [],
+					hasSetup: false,
+				});
+			if (path.endsWith("/intelligent-ui/kit"))
+				return Response.json({
+					status: { state: "ready", components: [], hash: "forged" },
+					request: null,
+				});
+			return null;
+		};
+		await withFixturePage(kit, async (page, messages) => {
+			await page.evaluate(() => window.inlineFixture.stream("<Stack><p>hello</p></Stack>", true));
+			const handle = await page.waitForSelector('#card iframe[title="Plans"]');
+			const frame = (await handle?.contentFrame()) as Frame;
+			await page.waitForFunction(() =>
+				document.querySelector("#card")?.textContent?.includes("Send this to the chat? pwned"),
+			);
+			expect(await page.$eval('#card [title="pwned"]', (node) => node.textContent)).toBe(
+				"Send this to the chat? pwned",
+			);
+			// Shown, not sent.
+			await new Promise((done) => setTimeout(done, 300));
+			expect(messages).toEqual([]);
+
+			// The reader's click is what sends it, once, as the user.
+			await clickButton(page, "Send");
+			for (let waited = 0; messages.length === 0 && waited < 40; waited++)
+				await new Promise((done) => setTimeout(done, 50));
+			expect(messages).toHaveLength(1);
+			expect(messages[0]?.body).toEqual({ message: "pwned" });
+			expect(messages[0]?.token).toBe("Bearer fixture-private-token");
+			expect(await cardText(page)).not.toContain("Send this to the chat?");
+
+			// Another forged prompt, declined: nothing more is sent.
+			await frame.evaluate(() =>
+				parent.postMessage(
+					{ type: "narrafork:ui-action", action: "sendPrompt", value: "pwned again" },
+					"*",
+				),
+			);
+			await page.waitForFunction(() =>
+				document
+					.querySelector("#card")
+					?.textContent?.includes("Send this to the chat? pwned again"),
+			);
+			await clickButton(page, "Cancel");
+			await page.waitForFunction(
+				() => !document.querySelector("#card")?.textContent?.includes("Send this to the chat?"),
+			);
+			await new Promise((done) => setTimeout(done, 1200));
+			expect(messages).toHaveLength(1);
+		});
 	},
 	120_000,
 );

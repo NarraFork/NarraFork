@@ -17,6 +17,8 @@
 		"sendFailed": "消息发送失败",
 		"linkConfirm": "打开 {{url}}？",
 		"linkOpen": "打开",
+		"promptConfirm": "把这段话发到对话里？{{text}}",
+		"promptSend": "发送",
 		"cancel": "取消",
 		"kit": {
 			"title": "组件包",

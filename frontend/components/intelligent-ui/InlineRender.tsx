@@ -45,6 +45,7 @@ export function InlineRender({
 	const [runtime, setRuntime] = useState<UiRuntime | null>(null);
 	const [error, setError] = useState<string | null>(null);
 	const [link, setLink] = useState<string | null>(null);
+	const [prompt, setPrompt] = useState<string | null>(null);
 	const [sendFailed, setSendFailed] = useState(false);
 	const [navigated, setNavigated] = useState(false);
 	const loads = useRef(0);
@@ -93,7 +94,23 @@ export function InlineRender({
 		ready.current = false;
 		loads.current = 0;
 		setNavigated(false);
+		setPrompt(null);
 	}, [srcDoc]);
+
+	const send = useCallback(
+		(text: string) => {
+			// One click is one message; a double click or a held key is not two.
+			if (Date.now() - lastSent.current < 1000) return;
+			lastSent.current = Date.now();
+			setSendFailed(false);
+			void api.sendNarratorMessage(narratorId, text.slice(0, 2000)).catch(() => {
+				// The UI the reader was using stays; only the failed send is reported.
+				lastSent.current = 0;
+				setSendFailed(true);
+			});
+		},
+		[narratorId],
+	);
 
 	const post = useCallback(() => {
 		const target = frame.current?.contentWindow;
@@ -145,23 +162,27 @@ export function InlineRender({
 				setNavigated(true);
 				return;
 			}
-			if (data?.type !== "narrafork:ui-action" || typeof data.value !== "string") return;
+			if (data?.type !== "narrafork:ui-action" || typeof data.value !== "string" || !runtime)
+				return;
 			if (data.action === "openLink") {
 				// Never navigate on the frame's say-so: the reader sees the URL first.
 				const url = httpUrl(data.value);
-				if (url) setLink(url);
+				if (url) {
+					setPrompt(null);
+					setLink(url);
+				}
 				return;
 			}
 			const text = data.value.trim();
-			// One click is one message; a double click or a held key is not two.
-			if (data.action !== "sendPrompt" || !text || Date.now() - lastSent.current < 1000) return;
-			lastSent.current = Date.now();
-			setSendFailed(false);
-			void api.sendNarratorMessage(narratorId, text.slice(0, 2000)).catch(() => {
-				// The UI the reader was using stays; only the failed send is reported.
-				lastSent.current = 0;
-				setSendFailed(true);
-			});
+			if (data.action !== "sendPrompt" || !text) return;
+			// The frame's gesture check guards markup, but a project kit's own code runs
+			// in that frame and can post this message itself: the reader confirms it.
+			if (runtime.kit) {
+				setLink(null);
+				setPrompt(text.slice(0, 2000));
+				return;
+			}
+			send(text);
 		};
 		window.addEventListener("message", onMessage);
 		const unsubscribe = subscribeHostPresentation(sendTheme);
@@ -169,7 +190,7 @@ export function InlineRender({
 			window.removeEventListener("message", onMessage);
 			unsubscribe();
 		};
-	}, [srcDoc, narratorId, onReady, sendTheme]);
+	}, [srcDoc, runtime, onReady, sendTheme, send]);
 
 	useEffect(() => {
 		if (!sendFailed) return;
@@ -240,6 +261,24 @@ export function InlineRender({
 						{t("intelligentUi.linkOpen")}
 					</Button>
 					<Button size="compact-xs" variant="subtle" onClick={() => setLink(null)}>
+						{t("intelligentUi.cancel")}
+					</Button>
+				</Group>
+			) : prompt ? (
+				<Group gap="xs" wrap="nowrap" px="xs" style={bar}>
+					<Text size="xs" truncate style={{ flex: 1, minWidth: 0 }} title={prompt}>
+						{t("intelligentUi.promptConfirm", { text: prompt })}
+					</Text>
+					<Button
+						size="compact-xs"
+						onClick={() => {
+							setPrompt(null);
+							send(prompt);
+						}}
+					>
+						{t("intelligentUi.promptSend")}
+					</Button>
+					<Button size="compact-xs" variant="subtle" onClick={() => setPrompt(null)}>
 						{t("intelligentUi.cancel")}
 					</Button>
 				</Group>
