@@ -243,8 +243,12 @@ fsRoutes.post("/reveal", async (c) => {
 
 	// Windows 上资源管理器不一定会把新窗口带到前台，出现后主动激活（见 win-foreground）。
 	if (IS_WINDOWS) {
-		const activated = await raiseExplorerWindowByTitle(basename(absPath));
-		logger.info("fs/reveal foreground activation", activated);
+		try {
+			const activated = await raiseExplorerWindowByTitle(basename(absPath));
+			logger.info("fs/reveal foreground activation", { result: activated });
+		} catch (error) {
+			logger.warn("fs/reveal foreground activation failed", { error: String(error) });
+		}
 	}
 
 	return c.json({ ok: true });
