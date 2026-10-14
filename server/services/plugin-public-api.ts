@@ -3382,6 +3382,18 @@ export function createCorePluginPublicApiAdapters(options: {
 							: { origin: "user", originLabel: `plugin:${input.pluginId}` },
 						signal: input.signal,
 					});
+					if (!sent.accepted) {
+						if (sent.state === "cancelled")
+							throw new PluginPublicApiError("CANCELLED", "Message admission was cancelled", {
+								commandStatus: "cancelled",
+							});
+						if (sent.receiptDisposition === "recipient_deleted")
+							throw new PluginPublicApiError("NOT_FOUND", "Message recipient was deleted");
+						if (sent.receiptDisposition === "superseded")
+							throw new PluginPublicApiError("CONFLICT", "Message receipt was superseded");
+						throw new PluginPublicApiError("INTERNAL_ERROR", "Message admission failed");
+					}
+					// A durable acceptance remains successful even if waking fails or the caller aborts.
 					return { messageId: sent.messageId };
 				} catch (error) {
 					if (input.signal.aborted)

@@ -1993,20 +1993,19 @@ async function deliverPendingInjectionsInOrder(
 	subagent?: { parentNarratorId: string; parentToolUseId: string },
 	active?: ActiveNarrator,
 	inputParts?: AgentInputPart[],
+	preservePrincipal = false,
 ): Promise<string | null> {
 	return withInboxOwner(narratorId, async () => {
 		await migrateLegacyParentInjections(narratorId);
 		const schedule = mode === "busy" ? "onNextTurn" : "none";
 		const parts: AgentInputPart[] = [];
-		const { pendingInjectionMailboxUserId, pendingInjectionUserId } = await import(
-			"./parent-injection-queue"
-		);
+		const { pendingInjectionMailboxUserId } = await import("./parent-injection-queue");
 		// A pass may adopt only one persisted actor. `undefined` means no row has been
 		// claimed yet; `null` is a real anonymous/system actor and must not be mixed with
-		// an attributed row. Busy passes inherit their frozen actor, while idle passes
-		// authorize the first claimed row and carry that actor into the new turn.
+		// an attributed row. Busy passes and pass-start history preparation inherit
+		// their frozen actor; only a new idle continuation may adopt the first row.
 		let batchUserId: string | null | undefined =
-			mode === "busy" ? (active?._currentUserId ?? undefined) : undefined;
+			mode === "busy" || preservePrincipal ? (active?._currentUserId ?? null) : undefined;
 		const candidateUserId = (candidate: InboxEligibleHead): string | null =>
 			pendingInjectionMailboxUserId(candidate);
 
@@ -2048,6 +2047,9 @@ async function deliverPendingInjectionsInOrder(
 			});
 			if (!row) break;
 			try {
+				// Freeze the actor for every claimed row, including native question receipts.
+				if (batchUserId === undefined) batchUserId = candidateUserId(row);
+				if (active && mode === "idle" && !preservePrincipal) active._currentUserId = batchUserId;
 				const questionAnswer = inboxMetadata<{ questionAnswer?: { messageId: string } }>(
 					row,
 				).questionAnswer;
@@ -2092,14 +2094,6 @@ async function deliverPendingInjectionsInOrder(
 					mailboxClaim: inboxClaim(row),
 					recipientMessageId: row.recipientMessageId ?? undefined,
 				};
-				const entryUser = pendingInjectionUserId(entry);
-				if (batchUserId === undefined) batchUserId = entryUser;
-				// Idle adoption is the authorization boundary for a new pass. Busy
-				// adoption keeps the run's frozen actor, so this assignment is a no-op
-				// unless the run started without an actor and the first row establishes one.
-				if (active && entryUser !== null && (mode === "idle" || active._currentUserId == null)) {
-					active._currentUserId = entryUser;
-				}
 				const text = await deliverPendingInjection(
 					narratorId,
 					locale,
@@ -2340,10 +2334,13 @@ export async function deliverPendingInjection(
  * `schedule: "none"` even though the point of this path IS to start a turn: the callers
  * run inside `continuationStartLock` and start the loop themselves once this returns, so
  * asking `deliverInjection` to wake would re-enter that same lock and deadlock.
+ * Pass-start history preparation must set `preservePrincipal` to retain the actor
+ * already selected by the run entry or the previous continuation boundary.
  */
 export async function drainAndPersistPendingInjections(
 	active: ActiveNarrator,
 	subagent?: { parentNarratorId: string; parentToolUseId: string },
+	options?: { preservePrincipal?: boolean },
 ): Promise<string | null> {
 	return deliverPendingInjectionsInOrder(
 		active.narratorId,
@@ -2353,6 +2350,8 @@ export async function drainAndPersistPendingInjections(
 		undefined,
 		subagent,
 		active,
+		undefined,
+		options?.preservePrincipal,
 	);
 }
 

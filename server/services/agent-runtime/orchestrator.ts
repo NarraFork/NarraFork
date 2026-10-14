@@ -593,10 +593,12 @@ export async function runAgentLoopUnlocked(
 			// Always use getModelHistorySinceLastCompact: if no compact marker exists it
 			// returns all messages; after a compact it only returns post-compact messages
 			// (old context is already in the summary injected via system prompt).
-			// Materialize queued receipts before building history. They then enter this
-			// request exactly once through normal history adoption (including subagents).
+			// Materialize queued receipts before building history without replacing the
+			// actor selected at run entry or the previous continuation boundary.
 			if (!active.abortController.signal.aborted)
-				await drainAndPersistPendingInjections(active, subagentPlacement);
+				await drainAndPersistPendingInjections(active, subagentPlacement, {
+					preservePrincipal: true,
+				});
 			const historyDeadline = Date.now() + 10_000;
 			const rawMessages = await narratorService.getModelHistorySinceLastCompact(
 				narratorId,

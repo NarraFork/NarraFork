@@ -31,7 +31,7 @@ function acceptedSendResult(overrides: Partial<SendResult> = {}): SendResult {
 		mailboxId: "mailbox-id",
 		bufferedAt: "2026-07-16T12:00:00.000Z",
 		state: "queued",
-		receiptDisposition: "accepted",
+		receiptDisposition: "active",
 		delivered: "buffered",
 		...overrides,
 	};
@@ -843,6 +843,37 @@ describe("createCorePluginPublicApiAdapters (core integration)", () => {
 			kind: "user", target: "subagent", busyPolicy: "queue", narratorId: "n-subagent",
 			message: "queued worker", priority: true, locale: "zh-CN", userId: null, signal: input.signal,
 		});
+	});
+
+	test.each([
+		{ state: "cancelled", receiptDisposition: "active", code: "CANCELLED" },
+		{ state: "failed", receiptDisposition: "active", code: "INTERNAL_ERROR" },
+		{ state: "queued", receiptDisposition: "recipient_deleted", code: "NOT_FOUND" },
+		{ state: "queued", receiptDisposition: "superseded", code: "CONFLICT" },
+	] as const)("primary command rejects unaccepted $state/$receiptDisposition receipts", async ({
+		state,
+		receiptDisposition,
+		code,
+	}) => {
+		const { adapter } = stewardHarness(async () =>
+			acceptedSendResult({
+				accepted: false,
+				state,
+				receiptDisposition,
+			}),
+		);
+		const { api } = buildApi({ adapters: { narratorCommands: adapter } });
+		const callContext = context();
+		const result = await api.command(
+			callContext,
+			createCommandRequest(callContext, "narrafork.narrator.send_message", {
+				narratorId: "n-worker",
+				message: "rejected",
+			}),
+		);
+		expect(result.status).toBe(code === "CANCELLED" ? "cancelled" : "failed");
+		expect(result.error?.code).toBe(code);
+		expect(result.data).toBeUndefined();
 	});
 
 	test("started subagent receipts expose the core history ID and started flag", async () => {

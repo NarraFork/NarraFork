@@ -183,6 +183,222 @@ function fixture(
 	};
 }
 
+describe("pass-start injection principal boundaries", () => {
+	async function queueAnswer(
+		narratorId: string,
+		messageId: string,
+		userId: string | null,
+		parentToolUseId?: string,
+	) {
+		const text = `Receipt ${messageId}`;
+		db.insert(narratorMessages)
+			.values({
+				id: messageId,
+				narratorId,
+				role: "user",
+				createdBy: "principal-a",
+				parentToolUseId,
+				contentText: text,
+				contentJson: [
+					{
+						type: "system_injection",
+						source: "async_question_answers",
+						modelText: text,
+						body: { kind: "asyncQuestionAnswers", answerMessageId: messageId },
+					},
+				],
+				createdAt: new Date().toISOString(),
+			})
+			.run();
+		const refs = db
+			.select()
+			.from(narratorMessageRefs)
+			.where(eq(narratorMessageRefs.narratorId, narratorId))
+			.all();
+		db.insert(narratorMessageRefs)
+			.values({
+				id: `${messageId}-ref`,
+				narratorId,
+				messageId,
+				seq: Math.max(0, ...refs.map((ref) => ref.seq)) + 1,
+			})
+			.run();
+		const { scheduleQuestionAnswerDelivery } = await import("../narrator-session");
+		// The fixture owns execution, so the real scheduler persists without waking a second loop.
+		expect(
+			await scheduleQuestionAnswerDelivery(narratorId, messageId, text, { version: 1, userId }),
+		).toEqual({ ready: true, started: false });
+		return text;
+	}
+
+	async function queueAgentMessage(narratorId: string, messageId: string, userId: string | null) {
+		const now = new Date().toISOString();
+		const sourceMessageId = `${messageId}-source`;
+		const toolCallId = `${messageId}-send`;
+		const toolUseId = `${messageId}-use`;
+		db.insert(narratorMessages)
+			.values({
+				id: sourceMessageId,
+				narratorId: "contract-parent",
+				role: "assistant",
+				contentJson: [],
+				createdAt: now,
+			})
+			.run();
+		db.insert(narratorToolCalls)
+			.values({
+				id: toolCallId,
+				narratorId: "contract-parent",
+				messageId: sourceMessageId,
+				toolUseId,
+				toolName: "Send",
+				status: "running",
+				executionAttempt: 1,
+				executionIdentityVersion: 1,
+				createdAt: now,
+			})
+			.run();
+		const text = `Receipt ${messageId}`;
+		const delivery = createAgentMessageDelivery(
+			narratorId,
+			{ id: "contract-parent", title: "Parent", label: "parent", type: "primary", isParent: true },
+			toolUseId,
+			text,
+			{ toolCallId, attempt: 1 },
+		);
+		delivery.recipientMessageId = messageId;
+		const { enqueueInboxAgent } = await import("../agent-runtime/inbox");
+		expect(
+			(await enqueueInboxAgent(delivery, text, { channel: "parent", createdBy: userId, userId }))
+				.status,
+		).toBe("accepted");
+	}
+
+	function queued(messageId: string) {
+		return db
+			.select()
+			.from(narratorBufferedMessages)
+			.where(eq(narratorBufferedMessages.recipientMessageId, messageId))
+			.get();
+	}
+
+	function modelInput(options: ExecuteLoopOptions) {
+		return `${options.userText}\n${JSON.stringify(options.history)}`;
+	}
+
+	for (const profile of profiles) {
+		for (const scenario of [
+			{ entry: "principal-a", receipt: "principal-b" },
+			{ entry: "principal-a", receipt: null },
+			{ entry: null, receipt: "principal-b" },
+		]) {
+			test(`${profile.kind}: pass-start preserves ${scenario.entry} before queued ${scenario.receipt} receipt`, async () => {
+				const messageId = "entry-other-principal";
+				const text = `Receipt ${messageId}`;
+				const h = fixture(profile, [
+					async (options) => {
+						expect(options.config.userId).toBe(scenario.entry);
+						// Native answers already have history refs; this contract observes their queue actor.
+						expect(queued(messageId)?.state).toBe("queued");
+						return finished;
+					},
+					async (options) => {
+						expect(options.config.userId).toBe(scenario.receipt);
+						expect(modelInput(options)).toContain(text);
+						expect(queued(messageId)?.state).toBe("materialized");
+						return finished;
+					},
+				]);
+				h.session._currentUserId = scenario.entry;
+				await queueAnswer(
+					h.session.narratorId,
+					messageId,
+					scenario.receipt,
+					profile.kind === "subagent" ? profile.parentToolUseId : undefined,
+				);
+				expect((await h.run()).hasError).toBe(false);
+				expect(h.calls).toHaveLength(2);
+				expect(queued(messageId)?.state).toBe("materialized");
+			});
+		}
+
+		test(`${profile.kind}: turn-end batches reach passes A then B then anonymous without skipping B`, async () => {
+			const principals = ["principal-a", "principal-b", null];
+			const messageIds = ["batch-b", "batch-anonymous"];
+			const snapshots: Array<{ userId: string | null | undefined; input: string }> = [];
+			const h = fixture(
+				profile,
+				principals.map((principal, pass) => async (options: ExecuteLoopOptions) => {
+					const input = modelInput(options);
+					snapshots.push({ userId: options.config.userId, input });
+					expect(options.config.userId).toBe(principal);
+					if (pass === 0) {
+						await queueAgentMessage(h.session.narratorId, messageIds[0], "principal-b");
+						await queueAgentMessage(h.session.narratorId, messageIds[1], null);
+					}
+					for (const [index, messageId] of messageIds.entries()) {
+						if (index < pass) expect(input).toContain(`Receipt ${messageId}`);
+						else {
+							expect(input).not.toContain(`Receipt ${messageId}`);
+							expect(queued(messageId)?.state).toBe("queued");
+						}
+					}
+					return finished;
+				}),
+			);
+			h.session._currentUserId = "principal-a";
+			expect((await h.run()).hasError).toBe(false);
+			expect(h.calls).toHaveLength(3);
+			expect(snapshots.map((snapshot) => snapshot.userId)).toEqual(principals);
+			for (const messageId of messageIds) expect(queued(messageId)?.state).toBe("materialized");
+		});
+	}
+
+	test("primary: pre-idle adoption starts B before the next anonymous batch", async () => {
+		const sessionService = await import("../narrator-session");
+		const messageIds = ["pre-idle-b", "pre-idle-anonymous"];
+		const h = fixture(profiles[0], [
+			async (options) => {
+				expect(options.config.userId).toBe("principal-a");
+				for (const messageId of messageIds)
+					expect(modelInput(options)).not.toContain(`Receipt ${messageId}`);
+				return finished;
+			},
+			async (options) => {
+				expect(options.config.userId).toBe("principal-b");
+				expect(modelInput(options)).toContain("Receipt pre-idle-b");
+				expect(modelInput(options)).not.toContain("Receipt pre-idle-anonymous");
+				expect(queued(messageIds[1])?.state).toBe("queued");
+				return finished;
+			},
+			async (options) => {
+				expect(options.config.userId).toBe(null);
+				for (const messageId of messageIds)
+					expect(modelInput(options)).toContain(`Receipt ${messageId}`);
+				return finished;
+			},
+		]);
+		h.session._currentUserId = "principal-a";
+		let enqueued = false;
+		const continuation = spyOn(sessionService, "maybeStartContinuation").mockImplementation(
+			async () => {
+				if (!enqueued) {
+					enqueued = true;
+					// This hook runs after the turn-end drain but before the final pre-idle drain.
+					await queueAgentMessage(h.session.narratorId, messageIds[0], "principal-b");
+					await queueAgentMessage(h.session.narratorId, messageIds[1], null);
+				}
+				return null;
+			},
+		);
+		expect((await h.run()).hasError).toBe(false);
+		expect(enqueued).toBe(true);
+		expect(continuation).toHaveBeenCalledTimes(2);
+		expect(h.calls).toHaveLength(3);
+		for (const messageId of messageIds) expect(queued(messageId)?.state).toBe("materialized");
+	});
+});
+
 describe("Bash Git command detection for status refresh", () => {
 	test("uses parsed command nodes instead of matching argument text", async () => {
 		expect(await isGitCommandToolResult("Bash", { command: "git status" }, "/tmp")).toBe(true);
