@@ -11,7 +11,11 @@ import type {
 } from "@shared/tool-edit-preview";
 import { type AnyColumn, and, eq, sql } from "drizzle-orm";
 import { db } from "../db";
-import { narratorToolCalls, worktreeTreeSnapshots } from "../db/schema";
+import {
+	legacyNarratorWorkspaceAdoptions,
+	narratorToolCalls,
+	worktreeTreeSnapshots,
+} from "../db/schema";
 import { logger } from "../lib/logger";
 import { FileChangeBlobStore, FileChangeBlobStoreError } from "./file-change-blob-store";
 import {
@@ -21,6 +25,8 @@ import {
 	type FileChangeScopeRecord,
 } from "./file-change-evidence";
 import { createFileChangeIdentity, fileChangeIdentityKey } from "./file-change-identity";
+import { getAuthorizedLegacyRetainedHistoryOrigin } from "./legacy-retained-history-origin";
+import type { NarratorPrincipal } from "./narrator-acl";
 import { worktreeTreeSnapshot } from "./worktree-tree-snapshot";
 
 const PREVIEW_TIMEOUT_MS = 5_000;
@@ -210,13 +216,30 @@ export async function readToolEditPreviewState(
 async function treePreview(
 	row: ToolRow,
 	signal: AbortSignal,
+	access?: { narratorId: string; principal: NarratorPrincipal },
 ): Promise<Pick<ToolEditPreview, "source" | "before" | "after">> {
 	const missing = {
 		source: "unavailable" as const,
 		before: unavailable("missing_evidence"),
 		after: unavailable("missing_evidence"),
 	};
-	const cwd = row.executionCwd;
+	let cwd = row.executionCwd;
+	if (access) {
+		const adoption = db
+			.select({ mode: legacyNarratorWorkspaceAdoptions.proofMode })
+			.from(legacyNarratorWorkspaceAdoptions)
+			.where(eq(legacyNarratorWorkspaceAdoptions.narratorId, access.narratorId))
+			.limit(1)
+			.get();
+		if (adoption?.mode === "retained") {
+			const origin = await getAuthorizedLegacyRetainedHistoryOrigin(
+				access.narratorId,
+				access.principal,
+			);
+			if (!origin || (cwd !== null && cwd !== origin.origin.workspacePath)) return missing;
+			cwd = origin.origin.workspacePath;
+		}
+	}
 	const filePath = row.resolvedFilePath;
 	// Frozen target only. Never infer a device/cwd from the narrator's current settings.
 	if (
@@ -269,6 +292,7 @@ async function treePreview(
 export async function getToolEditPreview(
 	row: ToolRow,
 	requestSignal?: AbortSignal,
+	access?: { narratorId: string; principal: NarratorPrincipal },
 ): Promise<ToolEditPreview> {
 	const started = performance.now();
 	const timeout = AbortSignal.timeout(PREVIEW_TIMEOUT_MS);
@@ -293,7 +317,8 @@ export async function getToolEditPreview(
 		if (row.executionPathFlavor === "spec" || row.resolvedFilePath?.startsWith("spec://"))
 			return reject("unsupported");
 		if (signal.aborted) return reject("cancelled");
-		if (!row.fileChangeOperationId) return { ...result, ...(await treePreview(row, signal)) };
+		if (!row.fileChangeOperationId)
+			return { ...result, ...(await treePreview(row, signal, access)) };
 		const evidence = new FileChangeEvidenceService(db);
 		const operation = evidence.getOperation(row.fileChangeOperationId);
 		if (!operation) return reject("missing_evidence");

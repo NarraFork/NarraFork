@@ -1,6 +1,6 @@
 {
-  "id": "392deb77-0f97-42e8-a021-b68bd6a75a2b",
-  "prevId": "c8907ecc-6d49-49f5-bd69-203edaa083fb",
+  "id": "65ed2b66-16a7-44f3-8fc5-078f61173dc8",
+  "prevId": "75c4cc95-e79a-498a-aa86-6bdabde6ce39",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -5394,6 +5394,27 @@
           "method": "btree",
           "with": {}
         },
+        "idx_fc_operation_project": {
+          "name": "idx_fc_operation_project",
+          "columns": [
+            {
+              "expression": "project_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
         "idx_fc_operation_actor": {
           "name": "idx_fc_operation_actor",
           "columns": [
@@ -6071,6 +6092,27 @@
               "asc": true,
               "nulls": "last"
             },
+            {
+              "expression": "device_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "canonical_root",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_fc_scope_physical_root": {
+          "name": "idx_fc_scope_physical_root",
+          "columns": [
             {
               "expression": "device_id",
               "isExpression": false,
@@ -10166,6 +10208,683 @@
       "checkConstraints": {},
       "isRLSEnabled": false
     },
+    "public.legacy_migration_artifact_claims": {
+      "name": "legacy_migration_artifact_claims",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "migration_project_id": {
+          "name": "migration_project_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "source_chapter_id": {
+          "name": "source_chapter_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "narrator_id": {
+          "name": "narrator_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "owner_user_id": {
+          "name": "owner_user_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "kind": {
+          "name": "kind",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "device_id": {
+          "name": "device_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "workspace_path": {
+          "name": "workspace_path",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "artifact_path": {
+          "name": "artifact_path",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "shadow_key": {
+          "name": "shadow_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "latest_snapshot_commit_sha": {
+          "name": "latest_snapshot_commit_sha",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "identity_json": {
+          "name": "identity_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "manifest_digest": {
+          "name": "manifest_digest",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "state": {
+          "name": "state",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'claimed'"
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {
+        "idx_legacy_artifact_workspace": {
+          "name": "idx_legacy_artifact_workspace",
+          "columns": [
+            {
+              "expression": "device_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "workspace_path",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "state",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_legacy_artifact_shadow_key": {
+          "name": "idx_legacy_artifact_shadow_key",
+          "columns": [
+            {
+              "expression": "shadow_key",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "state",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_legacy_artifact_path": {
+          "name": "idx_legacy_artifact_path",
+          "columns": [
+            {
+              "expression": "artifact_path",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "state",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_legacy_artifact_chapter": {
+          "name": "idx_legacy_artifact_chapter",
+          "columns": [
+            {
+              "expression": "source_chapter_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "state",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_legacy_artifact_narrator": {
+          "name": "idx_legacy_artifact_narrator",
+          "columns": [
+            {
+              "expression": "narrator_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_legacy_artifact_migration": {
+          "name": "idx_legacy_artifact_migration",
+          "columns": [
+            {
+              "expression": "migration_project_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "legacy_migration_artifact_claims_narrator_id_narrators_id_fk": {
+          "name": "legacy_migration_artifact_claims_narrator_id_narrators_id_fk",
+          "tableFrom": "legacy_migration_artifact_claims",
+          "tableTo": "narrators",
+          "columnsFrom": [
+            "narrator_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "set null",
+          "onUpdate": "no action"
+        },
+        "legacy_migration_artifact_claims_owner_user_id_users_id_fk": {
+          "name": "legacy_migration_artifact_claims_owner_user_id_users_id_fk",
+          "tableFrom": "legacy_migration_artifact_claims",
+          "tableTo": "users",
+          "columnsFrom": [
+            "owner_user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "set null",
+          "onUpdate": "no action"
+        },
+        "legacy_migration_artifact_claims_migration_projec_b28dec6be6_fk": {
+          "name": "legacy_migration_artifact_claims_migration_projec_b28dec6be6_fk",
+          "tableFrom": "legacy_migration_artifact_claims",
+          "tableTo": "legacy_project_migrations",
+          "columnsFrom": [
+            "migration_project_id"
+          ],
+          "columnsTo": [
+            "project_id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "legacy_migration_artifact_claims_source_chapter_i_11d67d91bb_fk": {
+          "name": "legacy_migration_artifact_claims_source_chapter_i_11d67d91bb_fk",
+          "tableFrom": "legacy_migration_artifact_claims",
+          "tableTo": "legacy_retained_chapter_metadata",
+          "columnsFrom": [
+            "source_chapter_id"
+          ],
+          "columnsTo": [
+            "source_chapter_id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.legacy_narrator_workspace_adoptions": {
+      "name": "legacy_narrator_workspace_adoptions",
+      "schema": "",
+      "columns": {
+        "narrator_id": {
+          "name": "narrator_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "migration_project_id": {
+          "name": "migration_project_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "previous_revision": {
+          "name": "previous_revision",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "adopted_revision": {
+          "name": "adopted_revision",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "device_id": {
+          "name": "device_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "cwd": {
+          "name": "cwd",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "context_key": {
+          "name": "context_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "history_digest": {
+          "name": "history_digest",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "proof_mode": {
+          "name": "proof_mode",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'empty'"
+        },
+        "origin_json": {
+          "name": "origin_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "workspace_key": {
+          "name": "workspace_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "repository_key": {
+          "name": "repository_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "directory_dev": {
+          "name": "directory_dev",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "directory_ino": {
+          "name": "directory_ino",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "git_directory_dev": {
+          "name": "git_directory_dev",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "git_directory_ino": {
+          "name": "git_directory_ino",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {
+        "idx_legacy_workspace_adoption_migration": {
+          "name": "idx_legacy_workspace_adoption_migration",
+          "columns": [
+            {
+              "expression": "migration_project_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "legacy_narrator_workspace_adoptions_narrator_id_narrators_id_fk": {
+          "name": "legacy_narrator_workspace_adoptions_narrator_id_narrators_id_fk",
+          "tableFrom": "legacy_narrator_workspace_adoptions",
+          "tableTo": "narrators",
+          "columnsFrom": [
+            "narrator_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        },
+        "legacy_narrator_workspace_adoptions_migration_pro_b906383793_fk": {
+          "name": "legacy_narrator_workspace_adoptions_migration_pro_b906383793_fk",
+          "tableFrom": "legacy_narrator_workspace_adoptions",
+          "tableTo": "legacy_project_migrations",
+          "columnsFrom": [
+            "migration_project_id"
+          ],
+          "columnsTo": [
+            "project_id"
+          ],
+          "onDelete": "cascade",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.legacy_project_migrations": {
+      "name": "legacy_project_migrations",
+      "schema": "",
+      "columns": {
+        "project_id": {
+          "name": "project_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "project_name": {
+          "name": "project_name",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "git_path": {
+          "name": "git_path",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "archive_path": {
+          "name": "archive_path",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "archive_identity_json": {
+          "name": "archive_identity_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "actor_user_id": {
+          "name": "actor_user_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "phase": {
+          "name": "phase",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "revision": {
+          "name": "revision",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "narrator_ids": {
+          "name": "narrator_ids",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "chapter_targets": {
+          "name": "chapter_targets",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {
+        "idx_legacy_migration_archive_path": {
+          "name": "idx_legacy_migration_archive_path",
+          "columns": [
+            {
+              "expression": "archive_path",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.legacy_project_sync_tombstones": {
+      "name": "legacy_project_sync_tombstones",
+      "schema": "",
+      "columns": {
+        "canonical_root": {
+          "name": "canonical_root",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "disabled_project_id": {
+          "name": "disabled_project_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "disabled_at": {
+          "name": "disabled_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {},
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.legacy_retained_chapter_metadata": {
+      "name": "legacy_retained_chapter_metadata",
+      "schema": "",
+      "columns": {
+        "source_chapter_id": {
+          "name": "source_chapter_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "migration_project_id": {
+          "name": "migration_project_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "metadata_json": {
+          "name": "metadata_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "manifest_digest": {
+          "name": "manifest_digest",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "legacy_retained_chapter_metadata_migration_projec_a2c4dbd682_fk": {
+          "name": "legacy_retained_chapter_metadata_migration_projec_a2c4dbd682_fk",
+          "tableFrom": "legacy_retained_chapter_metadata",
+          "tableTo": "legacy_project_migrations",
+          "columnsFrom": [
+            "migration_project_id"
+          ],
+          "columnsTo": [
+            "project_id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.legacy_retained_history_manifests": {
+      "name": "legacy_retained_history_manifests",
+      "schema": "",
+      "columns": {
+        "migration_project_id": {
+          "name": "migration_project_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "manifest_json": {
+          "name": "manifest_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "manifest_digest": {
+          "name": "manifest_digest",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {},
+      "foreignKeys": {
+        "legacy_retained_history_manifests_migration_proje_26801ed8ca_fk": {
+          "name": "legacy_retained_history_manifests_migration_proje_26801ed8ca_fk",
+          "tableFrom": "legacy_retained_history_manifests",
+          "tableTo": "legacy_project_migrations",
+          "columnsFrom": [
+            "migration_project_id"
+          ],
+          "columnsTo": [
+            "project_id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
     "public.merge_sessions": {
       "name": "merge_sessions",
       "schema": "",
@@ -14147,6 +14866,392 @@
       "checkConstraints": {},
       "isRLSEnabled": false
     },
+    "public.narrator_worktree_resource_claims": {
+      "name": "narrator_worktree_resource_claims",
+      "schema": "",
+      "columns": {
+        "id": {
+          "name": "id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "resource_id": {
+          "name": "resource_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "migration_project_id": {
+          "name": "migration_project_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "source_chapter_id": {
+          "name": "source_chapter_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "narrator_id": {
+          "name": "narrator_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "owner_user_id": {
+          "name": "owner_user_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "state": {
+          "name": "state",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'unresolved'"
+        },
+        "ownership_revision": {
+          "name": "ownership_revision",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "updated_at": {
+          "name": "updated_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {
+        "uq_worktree_resource_claim_user": {
+          "name": "uq_worktree_resource_claim_user",
+          "columns": [
+            {
+              "expression": "resource_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "narrator_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_worktree_resource_claim_migration": {
+          "name": "idx_worktree_resource_claim_migration",
+          "columns": [
+            {
+              "expression": "migration_project_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_worktree_resource_claim_chapter": {
+          "name": "idx_worktree_resource_claim_chapter",
+          "columns": [
+            {
+              "expression": "source_chapter_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_worktree_resource_claim_narrator": {
+          "name": "idx_worktree_resource_claim_narrator",
+          "columns": [
+            {
+              "expression": "narrator_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_worktree_resource_claim_owner": {
+          "name": "idx_worktree_resource_claim_owner",
+          "columns": [
+            {
+              "expression": "owner_user_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "narrator_worktree_resource_claims_narrator_id_narrators_id_fk": {
+          "name": "narrator_worktree_resource_claims_narrator_id_narrators_id_fk",
+          "tableFrom": "narrator_worktree_resource_claims",
+          "tableTo": "narrators",
+          "columnsFrom": [
+            "narrator_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "set null",
+          "onUpdate": "no action"
+        },
+        "narrator_worktree_resource_claims_owner_user_id_users_id_fk": {
+          "name": "narrator_worktree_resource_claims_owner_user_id_users_id_fk",
+          "tableFrom": "narrator_worktree_resource_claims",
+          "tableTo": "users",
+          "columnsFrom": [
+            "owner_user_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "set null",
+          "onUpdate": "no action"
+        },
+        "narrator_worktree_resource_claims_resource_id_nar_ae30272eb2_fk": {
+          "name": "narrator_worktree_resource_claims_resource_id_nar_ae30272eb2_fk",
+          "tableFrom": "narrator_worktree_resource_claims",
+          "tableTo": "narrator_worktree_resources",
+          "columnsFrom": [
+            "resource_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "narrator_worktree_resource_claims_migration_proje_6711728038_fk": {
+          "name": "narrator_worktree_resource_claims_migration_proje_6711728038_fk",
+          "tableFrom": "narrator_worktree_resource_claims",
+          "tableTo": "legacy_project_migrations",
+          "columnsFrom": [
+            "migration_project_id"
+          ],
+          "columnsTo": [
+            "project_id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "ck_worktree_resource_claim_revision": {
+          "name": "ck_worktree_resource_claim_revision",
+          "value": "\"ownership_revision\" >= 0"
+        }
+      },
+      "isRLSEnabled": false
+    },
+    "public.narrator_worktree_resource_origins": {
+      "name": "narrator_worktree_resource_origins",
+      "schema": "",
+      "columns": {
+        "resource_id": {
+          "name": "resource_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "migration_project_id": {
+          "name": "migration_project_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "source_chapter_id": {
+          "name": "source_chapter_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "device_id": {
+          "name": "device_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "common_directory_path": {
+          "name": "common_directory_path",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "git_admin_directory_path": {
+          "name": "git_admin_directory_path",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "evidence_json": {
+          "name": "evidence_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "evidence_digest": {
+          "name": "evidence_digest",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "created_at": {
+          "name": "created_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        }
+      },
+      "indexes": {
+        "idx_worktree_origin_migration": {
+          "name": "idx_worktree_origin_migration",
+          "columns": [
+            {
+              "expression": "migration_project_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_worktree_origin_chapter": {
+          "name": "idx_worktree_origin_chapter",
+          "columns": [
+            {
+              "expression": "source_chapter_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_worktree_origin_common": {
+          "name": "idx_worktree_origin_common",
+          "columns": [
+            {
+              "expression": "device_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "common_directory_path",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_worktree_origin_admin": {
+          "name": "idx_worktree_origin_admin",
+          "columns": [
+            {
+              "expression": "device_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "git_admin_directory_path",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "narrator_worktree_resource_origins_resource_id_na_2f08217b36_fk": {
+          "name": "narrator_worktree_resource_origins_resource_id_na_2f08217b36_fk",
+          "tableFrom": "narrator_worktree_resource_origins",
+          "tableTo": "narrator_worktree_resources",
+          "columnsFrom": [
+            "resource_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        },
+        "narrator_worktree_resource_origins_migration_proj_57b5eb2ac5_fk": {
+          "name": "narrator_worktree_resource_origins_migration_proj_57b5eb2ac5_fk",
+          "tableFrom": "narrator_worktree_resource_origins",
+          "tableTo": "legacy_project_migrations",
+          "columnsFrom": [
+            "migration_project_id"
+          ],
+          "columnsTo": [
+            "project_id"
+          ],
+          "onDelete": "restrict",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {
+        "ck_worktree_origin_evidence_bytes": {
+          "name": "ck_worktree_origin_evidence_bytes",
+          "value": "octet_length(\"evidence_json\") <= 16384"
+        }
+      },
+      "isRLSEnabled": false
+    },
     "public.narrator_worktree_resources": {
       "name": "narrator_worktree_resources",
       "schema": "",
@@ -17382,6 +18487,13 @@
           "primaryKey": false,
           "notNull": false
         },
+        "legacy_sync_disabled": {
+          "name": "legacy_sync_disabled",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
+        },
         "proxy_domain": {
           "name": "proxy_domain",
           "type": "text",
@@ -17421,7 +18533,50 @@
           "notNull": true
         }
       },
-      "indexes": {},
+      "indexes": {
+        "idx_projects_legacy_sync_disabled": {
+          "name": "idx_projects_legacy_sync_disabled",
+          "columns": [
+            {
+              "expression": "legacy_sync_disabled",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_projects_legacy_sync_path": {
+          "name": "idx_projects_legacy_sync_path",
+          "columns": [
+            {
+              "expression": "git_path",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "legacy_sync_disabled",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
       "foreignKeys": {
         "projects_owner_user_id_users_id_fk": {
           "name": "projects_owner_user_id_users_id_fk",
@@ -18119,6 +19274,27 @@
           "method": "btree",
           "with": {}
         },
+        "idx_revert_file_scope": {
+          "name": "idx_revert_file_scope",
+          "columns": [
+            {
+              "expression": "scope_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
         "idx_revert_file_before_blob": {
           "name": "idx_revert_file_before_blob",
           "columns": [
@@ -18459,6 +19635,27 @@
             },
             {
               "expression": "created_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            },
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_revert_operation_project": {
+          "name": "idx_revert_operation_project",
+          "columns": [
+            {
+              "expression": "project_id",
               "isExpression": false,
               "asc": true,
               "nulls": "last"

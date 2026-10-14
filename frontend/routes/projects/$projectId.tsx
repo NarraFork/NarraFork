@@ -1,6 +1,7 @@
 import { Alert, Button, Card, Group, Loader, Stack, Text, Title } from "@mantine/core";
 import { useInfiniteQuery } from "@tanstack/react-query";
 import { createFileRoute, Link } from "@tanstack/react-router";
+import { useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { LegacyResourceRecovery } from "../../components/project/LegacyResourceRecovery";
 import { ProjectCompatibilityPanel } from "../../components/project/ProjectCompatibilityPanel";
@@ -15,6 +16,17 @@ export const Route = createFileRoute("/projects/$projectId")({
 /** Legacy deep links stay meaningful without mounting or deleting the old canvas implementation. */
 function ProjectCompatibilityPage() {
 	const { projectId } = Route.useParams();
+	const [completedProjectId, setCompletedProjectId] = useState<string | null>(null);
+	const completed = useCallback(() => setCompletedProjectId(projectId), [projectId]);
+	return (
+		<Stack>
+			<ProjectCompatibilityPanel projectId={projectId} onCompleted={completed} />
+			{completedProjectId !== projectId && <LegacyProjectDetails projectId={projectId} />}
+		</Stack>
+	);
+}
+
+function LegacyProjectDetails({ projectId }: { projectId: string }) {
 	const { t } = useTranslation("projects");
 	const project = useProject(projectId);
 	const chapters = useChapters(project.data ? projectId : "");
@@ -34,7 +46,6 @@ function ProjectCompatibilityPage() {
 		<Stack>
 			<Title order={3}>{project.data.name}</Title>
 			<Alert>{t("compatibility.retirement")}</Alert>
-			<ProjectCompatibilityPanel projectId={projectId} />
 			<Title order={4}>{t("compatibility.sessions")}</Title>
 			{sessions.isLoading && <Loader size="sm" />}
 			{sessions.isError && <Alert color="red">{t("compatibility.sessionsUnavailable")}</Alert>}

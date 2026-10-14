@@ -11,6 +11,7 @@ import { activeDatabaseBackend, db } from "../db";
 import { narrators, narratorWorktreeResources } from "../db/schema";
 import { localPathSemantics } from "../lib/agent/execution/path-semantics";
 import { AppError } from "../lib/errors";
+import { createLegacyLinkedWorktreeClaimsReader } from "./legacy-linked-worktree-claims";
 import { withWorkspaceAdmission } from "./worktree-lifecycle-guard";
 
 /** Resources outlive sessions, owners and receipts. PostgreSQL has no adapter yet: closed. */
@@ -139,15 +140,17 @@ export async function readLegacyNarratorWorktreeProtection(
 
 /** Indexed existence lookup: LIMIT never makes an owned path look orphaned. All states protect. */
 export function isRegisteredNarratorWorktree(worktreePath: string): boolean {
-	return !!db
-		.select({ id: narratorWorktreeResources.id })
-		.from(narratorWorktreeResources)
-		.where(
-			and(
-				eq(narratorWorktreeResources.deviceId, "local"),
-				eq(narratorWorktreeResources.worktreePath, worktreePath),
-			),
-		)
-		.limit(1)
-		.get();
+	return (
+		!!db
+			.select({ id: narratorWorktreeResources.id })
+			.from(narratorWorktreeResources)
+			.where(
+				and(
+					eq(narratorWorktreeResources.deviceId, "local"),
+					eq(narratorWorktreeResources.worktreePath, worktreePath),
+				),
+			)
+			.limit(1)
+			.get() || createLegacyLinkedWorktreeClaimsReader(db).hasExactDependency("local", worktreePath)
+	);
 }

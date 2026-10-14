@@ -71,6 +71,7 @@ import { logger } from "../lib/logger";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import { normalizePathForComparison } from "../lib/platform-path";
 import { safeSpawn } from "../lib/spawn";
+import { hasLegacyMigrationArtifactClaim } from "./legacy-migration-artifact-claims";
 import { snapshotCaptureReceipts } from "./snapshot-capture-receipts";
 import { treeSnapshotPhysicalDir as shadowDir, treeSnapshotKey } from "./tree-snapshot-paths";
 
@@ -1237,6 +1238,10 @@ export function planTreeRevertSegments(pairs: TreeBoundaryPair[]): TreeRevertSeg
  */
 async function isShadowRepoClaimed(deviceId: string, worktreePath: string): Promise<boolean> {
 	const key = treeSnapshotKey(deviceId, worktreePath);
+	if (
+		await hasLegacyMigrationArtifactClaim({ deviceId, workspacePath: worktreePath, shadowKey: key })
+	)
+		return true;
 	try {
 		const claimed = await db.query.chapters.findFirst({
 			where: eq(chapters.snapshotShadowKey, key),
@@ -2380,24 +2385,20 @@ async function linkSnapshotUnlocked(
  * reference. A truncated write, a full disk or an interrupted `git init` therefore
  * cost a chapter its entire revert history.
  *
- * So the directory is only removed when there is demonstrably nothing to lose: no
- * objects and no refs. Otherwise `HEAD` is rewritten with what `git init` would have
- * produced, which is enough to make the repository usable again — and the result is
- * verified by asking git, so a directory broken in some *other* way is left in place
- * for a human instead of being silently deleted.
+ * Repair never removes a directory. Protected artifacts are left untouched; an
+ * unclaimed directory may have HEAD restored under the structural lock and lifecycle
+ * reservation. Git verifies the result; every failure retains the original data.
  *
  * Returns whether the repository is usable afterwards.
  */
 async function repairShadowHead(dir: string): Promise<boolean> {
-	if (!shadowDirHasContent(dir)) {
-		logger.warn("Removing an empty tree-snapshot repo (missing HEAD, no objects or refs)", {
-			dir,
-		});
-		try {
-			rmSync(dir, { recursive: true, force: true });
-		} catch {
-			// Nothing to salvage either way; the next sweep tries again.
-		}
+	// Missing HEAD is never deletion evidence (including unreadable/empty directories).
+	// A claimed or uncertain artifact is left untouched for an authorized recovery path.
+	if (await hasLegacyMigrationArtifactClaim({ artifactPath: dir })) return false;
+	try {
+		const identity = await lstat(dir);
+		if (!identity.isDirectory() || identity.isSymbolicLink()) return false;
+	} catch {
 		return false;
 	}
 	try {
@@ -2421,34 +2422,6 @@ async function repairShadowHead(dir: string): Promise<boolean> {
 	}
 	logger.warn("Restored a missing HEAD in a tree-snapshot repo that still holds objects", { dir });
 	return true;
-}
-
-/** Whether a shadow directory holds anything worth keeping: loose/packed objects, or refs. */
-function shadowDirHasContent(dir: string): boolean {
-	const hasEntries = (path: string): boolean => {
-		try {
-			return readdirSync(path).length > 0;
-		} catch {
-			return false;
-		}
-	};
-	// `objects/` always contains `info/` and `pack/` from `git init`, so emptiness has
-	// to be judged by looking inside rather than at the directory itself.
-	try {
-		for (const entry of readdirSync(resolve(dir, "objects"), { withFileTypes: true })) {
-			if (entry.name === "info") continue;
-			if (entry.name === "pack") {
-				if (hasEntries(resolve(dir, "objects", "pack"))) return true;
-				continue;
-			}
-			return true;
-		}
-	} catch {
-		// No objects directory at all.
-	}
-	// A ref whose objects are gone is still evidence the repo was in use, and the
-	// packed form lives in a file rather than under `refs/`.
-	return hasEntries(resolve(dir, "refs", "nf")) || existsSync(resolve(dir, "packed-refs"));
 }
 
 export const worktreeTreeSnapshot = {
@@ -3613,6 +3586,15 @@ export const worktreeTreeSnapshot = {
 	): Promise<boolean> {
 		const dir = shadowDir(deviceId, worktreePath);
 		try {
+			if (
+				await hasLegacyMigrationArtifactClaim({
+					deviceId,
+					workspacePath: worktreePath,
+					artifactPath: dir,
+					shadowKey: treeSnapshotKey(deviceId, worktreePath),
+				})
+			)
+				return false;
 			return await withProtectionReservation(
 				[
 					{ deviceId, path: worktreePath, shadowKey: treeSnapshotKey(deviceId, worktreePath) },
@@ -3621,6 +3603,15 @@ export const worktreeTreeSnapshot = {
 				"shadow destroy",
 				async () =>
 					acquireShadowStructural(dir, async () => {
+						if (
+							await hasLegacyMigrationArtifactClaim({
+								deviceId,
+								workspacePath: worktreePath,
+								artifactPath: dir,
+								shadowKey: treeSnapshotKey(deviceId, worktreePath),
+							})
+						)
+							return false;
 						if (!options?.force && (await isShadowRepoClaimed(deviceId, worktreePath))) {
 							logger.warn("Kept a tree-snapshot repo that a chapter still references", {
 								worktreePath,
@@ -3699,11 +3690,29 @@ export const worktreeTreeSnapshot = {
 		for (const entry of readdirSync(SHADOW_ROOT, { withFileTypes: true })) {
 			if (!entry.isDirectory()) continue;
 			const dir = resolve(SHADOW_ROOT, entry.name);
-			if (!existsSync(resolve(dir, "HEAD")) && !(await repairShadowHead(dir))) continue;
 			// Serialized against captures: `gc` rewrites the object store, and a
 			// concurrent `add -A`/`write-tree` in the same repo can fail or race with
 			// the repack.
 			await acquireShadowStructural(dir, async () => {
+				if (!existsSync(resolve(dir, "HEAD"))) {
+					try {
+						const repaired = await withProtectionReservation(
+							[{ deviceId: LOCAL_DEVICE_ID, path: dir }],
+							"shadow HEAD repair",
+							async () => {
+								const frozen = await revalidateLifecycleTarget(dir);
+								return repairShadowHead(frozen);
+							},
+						);
+						if (!repaired) return;
+					} catch (error) {
+						logger.warn("Could not safely repair shadow HEAD; retaining directory", {
+							dir,
+							error: String(error),
+						});
+						return;
+					}
+				}
 				// `--no-prune` is the load-bearing flag. Repacking is the point; deleting
 				// unreachable objects is not, because "unreachable" is the normal state of
 				// a snapshot recorded before the DAG existed, and the database is the real

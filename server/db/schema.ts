@@ -131,59 +131,282 @@ export const narratorWorktreeResources = sqliteTable(
 	],
 );
 
+/** Retained users of an adopted worktree; removing users never releases its namespace. */
+export const narratorWorktreeResourceClaims = sqliteTable(
+	"narrator_worktree_resource_claims",
+	{
+		id: text("id").primaryKey(),
+		resourceId: text("resource_id")
+			.notNull()
+			.references(() => narratorWorktreeResources.id, { onDelete: "restrict" }),
+		migrationProjectId: text("migration_project_id")
+			.notNull()
+			.references(() => legacyProjectMigrations.projectId, { onDelete: "restrict" }),
+		sourceChapterId: text("source_chapter_id").notNull(),
+		narratorId: text("narrator_id").references(() => narrators.id, { onDelete: "set null" }),
+		ownerUserId: text("owner_user_id").references(() => users.id, { onDelete: "set null" }),
+		state: text("state", { enum: ["claimed", "unresolved", "released"] })
+			.notNull()
+			.default("unresolved"),
+		ownershipRevision: integer("ownership_revision").notNull(),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("uq_worktree_resource_claim_user").on(table.resourceId, table.narratorId),
+		index("idx_worktree_resource_claim_migration").on(table.migrationProjectId),
+		index("idx_worktree_resource_claim_chapter").on(table.sourceChapterId),
+		index("idx_worktree_resource_claim_narrator").on(table.narratorId),
+		index("idx_worktree_resource_claim_owner").on(table.ownerUserId),
+		check("ck_worktree_resource_claim_revision", sql`${table.ownershipRevision} >= 0`),
+	],
+);
+
+/** Identity and common-dir dependencies outlive all narrator adoption records. */
+export const narratorWorktreeResourceOrigins = sqliteTable(
+	"narrator_worktree_resource_origins",
+	{
+		resourceId: text("resource_id")
+			.primaryKey()
+			.references(() => narratorWorktreeResources.id, { onDelete: "restrict" }),
+		migrationProjectId: text("migration_project_id")
+			.notNull()
+			.references(() => legacyProjectMigrations.projectId, { onDelete: "restrict" }),
+		sourceChapterId: text("source_chapter_id").notNull(),
+		deviceId: text("device_id").notNull(),
+		commonDirectoryPath: text("common_directory_path").notNull(),
+		gitAdminDirectoryPath: text("git_admin_directory_path").notNull(),
+		evidenceJson: text("evidence_json", { mode: "json" })
+			.$type<Record<string, unknown>>()
+			.notNull(),
+		evidenceDigest: text("evidence_digest").notNull(),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		index("idx_worktree_origin_migration").on(table.migrationProjectId),
+		index("idx_worktree_origin_chapter").on(table.sourceChapterId),
+		index("idx_worktree_origin_common").on(table.deviceId, table.commonDirectoryPath),
+		index("idx_worktree_origin_admin").on(table.deviceId, table.gitAdminDirectoryPath),
+		check(
+			"ck_worktree_origin_evidence_bytes",
+			sql`length(cast(${table.evidenceJson} as blob)) <= 16384`,
+		),
+	],
+);
+
 // === projects ===
-export const projects = sqliteTable("projects", {
-	id: text("id").primaryKey(),
-	name: text("name").notNull(),
-	description: text("description"),
-	status: text("status", { enum: ["active", "archived"] })
-		.notNull()
-		.default("active"),
-	flowMode: text("flow_mode", { enum: ["classic", "ruler"] })
-		.notNull()
-		.default("classic"),
-	gitPath: text("git_path"),
-	remoteUrl: text("remote_url"),
-	defaultBranch: text("default_branch").default("main"),
-	startupScript: text("startup_script"),
-	copyFiles: text("copy_files"),
-	chapterSettings: text("chapter_settings", { mode: "json" }),
-	proxyDomain: text("proxy_domain"),
-	/**
-	 * Project layer of the layered trait system, same encoding as
-	 * `narrators.traits` so one encode/decode implementation serves both.
-	 * Resolution order is user → project → narrator (see lib/trait-layers.ts).
-	 */
-	traits: text("traits", { mode: "json" }).$type<string[]>().notNull().default([]),
-	/**
-	 * The user who created the project, and the only non-admin principal that may
-	 * change its membership without holding an explicit `manage` grant.
-	 *
-	 * `set null` rather than cascade: deleting an account must never delete the
-	 * project (and, through it, every chapter, worktree and conversation). A null
-	 * owner is therefore a real, permanent state — it also covers every project that
-	 * predates project ACLs, which the migration marks `public`. Those are
-	 * admin-managed until someone is handed ownership.
-	 */
-	// biome-ignore lint/suspicious/noExplicitAny: forward reference to users
-	ownerUserId: text("owner_user_id").references((): any => users.id, { onDelete: "set null" }),
-	/**
-	 * Who may reach the project at all — the outermost gate in the ACL chain.
-	 *
-	 * - "private" — owner, admins, and principals holding an `acl_grants` row
-	 * - "public"  — every signed-in user. What the migration assigns to existing
-	 *               projects so an upgrade hides nothing.
-	 *
-	 * Passing this gate is necessary, never sufficient: a narrator or knowledge
-	 * entry inside a reachable project is still governed by its own ACL, which is
-	 * why a private session stays invisible to project members.
-	 */
-	visibility: text("visibility", { enum: ["private", "public"] })
-		.notNull()
-		.default("private"),
-	createdAt: text("created_at").notNull(),
-	updatedAt: text("updated_at").notNull(),
+export const projects = sqliteTable(
+	"projects",
+	{
+		id: text("id").primaryKey(),
+		name: text("name").notNull(),
+		description: text("description"),
+		status: text("status", { enum: ["active", "archived"] })
+			.notNull()
+			.default("active"),
+		flowMode: text("flow_mode", { enum: ["classic", "ruler"] })
+			.notNull()
+			.default("classic"),
+		gitPath: text("git_path"),
+		remoteUrl: text("remote_url"),
+		defaultBranch: text("default_branch").default("main"),
+		startupScript: text("startup_script"),
+		copyFiles: text("copy_files"),
+		chapterSettings: text("chapter_settings", { mode: "json" }),
+		/** One-way retirement gate for the legacy per-project backup projection. */
+		legacySyncDisabled: integer("legacy_sync_disabled", { mode: "boolean" })
+			.notNull()
+			.default(false),
+		proxyDomain: text("proxy_domain"),
+		/**
+		 * Project layer of the layered trait system, same encoding as
+		 * `narrators.traits` so one encode/decode implementation serves both.
+		 * Resolution order is user → project → narrator (see lib/trait-layers.ts).
+		 */
+		traits: text("traits", { mode: "json" }).$type<string[]>().notNull().default([]),
+		/**
+		 * The user who created the project, and the only non-admin principal that may
+		 * change its membership without holding an explicit `manage` grant.
+		 *
+		 * `set null` rather than cascade: deleting an account must never delete the
+		 * project (and, through it, every chapter, worktree and conversation). A null
+		 * owner is therefore a real, permanent state — it also covers every project that
+		 * predates project ACLs, which the migration marks `public`. Those are
+		 * admin-managed until someone is handed ownership.
+		 */
+		// biome-ignore lint/suspicious/noExplicitAny: forward reference to users
+		ownerUserId: text("owner_user_id").references((): any => users.id, { onDelete: "set null" }),
+		/**
+		 * Who may reach the project at all — the outermost gate in the ACL chain.
+		 *
+		 * - "private" — owner, admins, and principals holding an `acl_grants` row
+		 * - "public"  — every signed-in user. What the migration assigns to existing
+		 *               projects so an upgrade hides nothing.
+		 *
+		 * Passing this gate is necessary, never sufficient: a narrator or knowledge
+		 * entry inside a reachable project is still governed by its own ACL, which is
+		 * why a private session stays invisible to project members.
+		 */
+		visibility: text("visibility", { enum: ["private", "public"] })
+			.notNull()
+			.default("private"),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		index("idx_projects_legacy_sync_disabled").on(table.legacySyncDisabled, table.id),
+		index("idx_projects_legacy_sync_path").on(table.gitPath, table.legacySyncDisabled),
+	],
+);
+
+/** Retirement receipt survives project deletion; never cascade this recovery evidence. */
+export const legacyProjectMigrations = sqliteTable(
+	"legacy_project_migrations",
+	{
+		projectId: text("project_id").primaryKey(),
+		projectName: text("project_name").notNull(),
+		gitPath: text("git_path"),
+		/** Canonical archive directory identity retained as a permanent sync tombstone. */
+		archivePath: text("archive_path"),
+		/** Identity evidence for retryable cleanup; missing evidence never authorizes unlink. */
+		archiveIdentityJson: text("archive_identity_json", { mode: "json" }).$type<{
+			root: { dev: number; ino: number };
+			directory: { dev: number; ino: number } | null;
+			files: Record<string, { dev: number; ino: number } | null>;
+		}>(),
+		actorUserId: text("actor_user_id").notNull(),
+		phase: text("phase", { enum: ["cleanup_pending", "completed"] }).notNull(),
+		revision: text("revision").notNull(),
+		narratorIds: text("narrator_ids", { mode: "json" }).$type<string[]>().notNull(),
+		chapterTargets: text("chapter_targets", { mode: "json" })
+			.$type<Record<string, string[]>>()
+			.notNull(),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [index("idx_legacy_migration_archive_path").on(table.archivePath)],
+);
+
+/** Stopping sync outlives a project moving its gitPath or being deleted without migration. */
+export const legacyProjectSyncTombstones = sqliteTable("legacy_project_sync_tombstones", {
+	canonicalRoot: text("canonical_root").primaryKey(),
+	projectId: text("disabled_project_id").notNull(),
+	disabledAt: text("disabled_at").notNull(),
 });
+
+/** Identity-preserving retirement is not a directory switch: retain a bounded rollback bridge. */
+export const legacyNarratorWorkspaceAdoptions = sqliteTable(
+	"legacy_narrator_workspace_adoptions",
+	{
+		narratorId: text("narrator_id")
+			.primaryKey()
+			.references((): AnySQLiteColumn => narrators.id, { onDelete: "cascade" }),
+		migrationProjectId: text("migration_project_id")
+			.notNull()
+			.references(() => legacyProjectMigrations.projectId, { onDelete: "cascade" }),
+		previousRevision: integer("previous_revision").notNull(),
+		adoptedRevision: integer("adopted_revision").notNull(),
+		deviceId: text("device_id").notNull(),
+		cwd: text("cwd").notNull(),
+		contextKey: text("context_key").notNull(),
+		historyDigest: text("history_digest").notNull(),
+		proofMode: text("proof_mode", { enum: ["empty", "retained"] })
+			.notNull()
+			.default("empty"),
+		originJson: text("origin_json", { mode: "json" }).$type<{
+			version: 1;
+			origin: {
+				narratorId: string;
+				sourceChapterId: string | null;
+				deviceId: string;
+				workspacePath: string;
+				workspaceRevision: number;
+				workspaceContext: string | null;
+			};
+			shadowKey: string | null;
+			scopeIds: string[];
+			manifestDigest: string;
+			linkedWorktree?: {
+				resourceId: string;
+				evidenceDigest: string;
+				commonDirectoryPath: string;
+				gitAdminDirectoryPath: string;
+				ownershipRevision: number;
+			};
+		}>(),
+		workspaceKey: text("workspace_key"),
+		repositoryKey: text("repository_key"),
+		directoryDev: text("directory_dev").notNull(),
+		directoryIno: text("directory_ino").notNull(),
+		gitDirectoryDev: text("git_directory_dev"),
+		gitDirectoryIno: text("git_directory_ino"),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [index("idx_legacy_workspace_adoption_migration").on(table.migrationProjectId)],
+);
+
+/** Retained chapter provenance is not a live chapter; no FK back to the retired graph. */
+export const legacyRetainedChapterMetadata = sqliteTable("legacy_retained_chapter_metadata", {
+	sourceChapterId: text("source_chapter_id").primaryKey(),
+	migrationProjectId: text("migration_project_id")
+		.notNull()
+		.references(() => legacyProjectMigrations.projectId, { onDelete: "restrict" }),
+	metadataJson: text("metadata_json", { mode: "json" }).$type<Record<string, unknown>>().notNull(),
+	manifestDigest: text("manifest_digest").notNull(),
+	createdAt: text("created_at").notNull(),
+});
+
+/** One bounded manifest per receipt; never duplicate references/fingerprints into each chapter. */
+export const legacyRetainedHistoryManifests = sqliteTable("legacy_retained_history_manifests", {
+	migrationProjectId: text("migration_project_id")
+		.primaryKey()
+		.references(() => legacyProjectMigrations.projectId, { onDelete: "restrict" }),
+	manifestJson: text("manifest_json", { mode: "json" }).$type<Record<string, unknown>>().notNull(),
+	manifestDigest: text("manifest_digest").notNull(),
+	createdAt: text("created_at").notNull(),
+});
+
+/** Artifact claims survive owner deletion; unknown evidence stays protected, never becomes orphan. */
+export const legacyMigrationArtifactClaims = sqliteTable(
+	"legacy_migration_artifact_claims",
+	{
+		id: text("id").primaryKey(),
+		migrationProjectId: text("migration_project_id")
+			.notNull()
+			.references(() => legacyProjectMigrations.projectId, { onDelete: "restrict" }),
+		sourceChapterId: text("source_chapter_id")
+			.notNull()
+			.references(() => legacyRetainedChapterMetadata.sourceChapterId, { onDelete: "restrict" }),
+		narratorId: text("narrator_id").references((): AnySQLiteColumn => narrators.id, {
+			onDelete: "set null",
+		}),
+		ownerUserId: text("owner_user_id").references((): AnySQLiteColumn => users.id, {
+			onDelete: "set null",
+		}),
+		kind: text("kind", { enum: ["shadow", "ignored_archive"] }).notNull(),
+		deviceId: text("device_id").notNull(),
+		workspacePath: text("workspace_path").notNull(),
+		artifactPath: text("artifact_path").notNull(),
+		shadowKey: text("shadow_key"),
+		latestSnapshotCommitSha: text("latest_snapshot_commit_sha"),
+		identityJson: text("identity_json", { mode: "json" })
+			.$type<Record<string, unknown>>()
+			.notNull(),
+		manifestDigest: text("manifest_digest").notNull(),
+		state: text("state", { enum: ["claimed", "unknown", "released"] })
+			.notNull()
+			.default("claimed"),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		index("idx_legacy_artifact_workspace").on(table.deviceId, table.workspacePath, table.state),
+		index("idx_legacy_artifact_shadow_key").on(table.shadowKey, table.state),
+		index("idx_legacy_artifact_path").on(table.artifactPath, table.state),
+		index("idx_legacy_artifact_chapter").on(table.sourceChapterId, table.state),
+		index("idx_legacy_artifact_narrator").on(table.narratorId),
+		index("idx_legacy_artifact_migration").on(table.migrationProjectId),
+	],
+);
 
 // === skill_directory_caches ===
 export const skillDirectoryCaches = sqliteTable(
@@ -4048,6 +4271,7 @@ export const fileChangeScopes = sqliteTable(
 			table.workspaceInstanceId,
 		),
 		index("idx_fc_scope_root").on(table.sourceInstanceId, table.deviceId, table.canonicalRoot),
+		index("idx_fc_scope_physical_root").on(table.deviceId, table.canonicalRoot),
 		index("idx_fc_scope_status").on(table.status, table.updatedAt),
 		index("idx_fc_scope_active_lease").on(table.deviceId, table.activeLeaseId, table.canonicalRoot),
 	],
@@ -4327,6 +4551,7 @@ export const fileChangeOperations = sqliteTable(
 		index("idx_fc_operation_sequence").on(table.sourceInstanceId, table.journalSeq),
 		index("idx_fc_operation_segment").on(table.executionSegmentId, table.journalSeq),
 		index("idx_fc_operation_narrator").on(table.narratorId, table.startedAt, table.id),
+		index("idx_fc_operation_project").on(table.projectId, table.id),
 		index("idx_fc_operation_actor").on(table.actorSubjectKey, table.startedAt, table.id),
 		index("idx_fc_operation_pending").on(table.settlement, table.updatedAt, table.id),
 		index("idx_fc_operation_task").on(table.backgroundTaskId, table.attempt),
@@ -4498,6 +4723,7 @@ export const revertOperations = sqliteTable(
 			table.idempotencyKey,
 		),
 		index("idx_revert_operation_narrator").on(table.narratorId, table.createdAt, table.id),
+		index("idx_revert_operation_project").on(table.projectId, table.id),
 		index("idx_revert_operation_pending").on(table.status, table.updatedAt, table.id),
 		index("idx_revert_operation_owner_pending").on(
 			table.requestedBySubjectKey,
@@ -4576,6 +4802,7 @@ export const revertOperationFiles = sqliteTable(
 		uniqueIndex("idx_revert_file_apply").on(table.applyMutationId),
 		uniqueIndex("idx_revert_file_compensate").on(table.compensateMutationId),
 		index("idx_revert_file_pending").on(table.revertOperationId, table.status, table.sequence),
+		index("idx_revert_file_scope").on(table.scopeId, table.id),
 		index("idx_revert_file_before_blob").on(table.beforeBlobDigest),
 		index("idx_revert_file_desired_blob").on(table.desiredBlobDigest),
 		index("idx_revert_file_observed_blob").on(table.observedAfterBlobDigest),

@@ -104,25 +104,242 @@ export const narratorWorktreeResources = pgTable(
 	],
 );
 
-export const projects = pgTable("projects", {
-	id: text("id").primaryKey().notNull(),
-	name: text("name").notNull(),
-	description: text("description"),
-	status: text("status").notNull().default("active"),
-	flowMode: text("flow_mode").notNull().default("classic"),
-	gitPath: text("git_path"),
-	remoteUrl: text("remote_url"),
-	defaultBranch: text("default_branch").default("main"),
-	startupScript: text("startup_script"),
-	copyFiles: text("copy_files"),
-	chapterSettings: jsonText("chapter_settings"),
-	proxyDomain: text("proxy_domain"),
-	traits: jsonText("traits").notNull().default(sql.raw("'[]'::text")),
-	ownerUserId: text("owner_user_id").references((): PgColumn => users.id, { onDelete: "set null" }),
-	visibility: text("visibility").notNull().default("private"),
-	createdAt: text("created_at").notNull(),
-	updatedAt: text("updated_at").notNull(),
+export const narratorWorktreeResourceClaims = pgTable(
+	"narrator_worktree_resource_claims",
+	{
+		id: text("id").primaryKey().notNull(),
+		resourceId: text("resource_id").notNull(),
+		migrationProjectId: text("migration_project_id").notNull(),
+		sourceChapterId: text("source_chapter_id").notNull(),
+		narratorId: text("narrator_id").references((): PgColumn => narrators.id, {
+			onDelete: "set null",
+		}),
+		ownerUserId: text("owner_user_id").references((): PgColumn => users.id, {
+			onDelete: "set null",
+		}),
+		state: text("state").notNull().default("unresolved"),
+		ownershipRevision: integer("ownership_revision").notNull(),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("uq_worktree_resource_claim_user").on(table.resourceId, table.narratorId),
+		index("idx_worktree_resource_claim_migration").on(table.migrationProjectId),
+		index("idx_worktree_resource_claim_chapter").on(table.sourceChapterId),
+		index("idx_worktree_resource_claim_narrator").on(table.narratorId),
+		index("idx_worktree_resource_claim_owner").on(table.ownerUserId),
+		check("ck_worktree_resource_claim_revision", sql.raw('"ownership_revision" >= 0')),
+		foreignKey({
+			name: "narrator_worktree_resource_claims_resource_id_nar_ae30272eb2_fk",
+			columns: [table.resourceId],
+			foreignColumns: [narratorWorktreeResources.id],
+		}).onDelete("restrict"),
+		foreignKey({
+			name: "narrator_worktree_resource_claims_migration_proje_6711728038_fk",
+			columns: [table.migrationProjectId],
+			foreignColumns: [legacyProjectMigrations.projectId],
+		}).onDelete("restrict"),
+	],
+);
+
+export const narratorWorktreeResourceOrigins = pgTable(
+	"narrator_worktree_resource_origins",
+	{
+		resourceId: text("resource_id").primaryKey().notNull(),
+		migrationProjectId: text("migration_project_id").notNull(),
+		sourceChapterId: text("source_chapter_id").notNull(),
+		deviceId: text("device_id").notNull(),
+		commonDirectoryPath: text("common_directory_path").notNull(),
+		gitAdminDirectoryPath: text("git_admin_directory_path").notNull(),
+		evidenceJson: jsonText("evidence_json").notNull(),
+		evidenceDigest: text("evidence_digest").notNull(),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		index("idx_worktree_origin_migration").on(table.migrationProjectId),
+		index("idx_worktree_origin_chapter").on(table.sourceChapterId),
+		index("idx_worktree_origin_common").on(table.deviceId, table.commonDirectoryPath),
+		index("idx_worktree_origin_admin").on(table.deviceId, table.gitAdminDirectoryPath),
+		check("ck_worktree_origin_evidence_bytes", sql.raw('octet_length("evidence_json") <= 16384')),
+		foreignKey({
+			name: "narrator_worktree_resource_origins_resource_id_na_2f08217b36_fk",
+			columns: [table.resourceId],
+			foreignColumns: [narratorWorktreeResources.id],
+		}).onDelete("restrict"),
+		foreignKey({
+			name: "narrator_worktree_resource_origins_migration_proj_57b5eb2ac5_fk",
+			columns: [table.migrationProjectId],
+			foreignColumns: [legacyProjectMigrations.projectId],
+		}).onDelete("restrict"),
+	],
+);
+
+export const projects = pgTable(
+	"projects",
+	{
+		id: text("id").primaryKey().notNull(),
+		name: text("name").notNull(),
+		description: text("description"),
+		status: text("status").notNull().default("active"),
+		flowMode: text("flow_mode").notNull().default("classic"),
+		gitPath: text("git_path"),
+		remoteUrl: text("remote_url"),
+		defaultBranch: text("default_branch").default("main"),
+		startupScript: text("startup_script"),
+		copyFiles: text("copy_files"),
+		chapterSettings: jsonText("chapter_settings"),
+		legacySyncDisabled: boolean("legacy_sync_disabled").notNull().default(false),
+		proxyDomain: text("proxy_domain"),
+		traits: jsonText("traits").notNull().default(sql.raw("'[]'::text")),
+		ownerUserId: text("owner_user_id").references((): PgColumn => users.id, {
+			onDelete: "set null",
+		}),
+		visibility: text("visibility").notNull().default("private"),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		index("idx_projects_legacy_sync_disabled").on(table.legacySyncDisabled, table.id),
+		index("idx_projects_legacy_sync_path").on(table.gitPath, table.legacySyncDisabled),
+	],
+);
+
+export const legacyProjectMigrations = pgTable(
+	"legacy_project_migrations",
+	{
+		projectId: text("project_id").primaryKey().notNull(),
+		projectName: text("project_name").notNull(),
+		gitPath: text("git_path"),
+		archivePath: text("archive_path"),
+		archiveIdentityJson: jsonText("archive_identity_json"),
+		actorUserId: text("actor_user_id").notNull(),
+		phase: text("phase").notNull(),
+		revision: text("revision").notNull(),
+		narratorIds: jsonText("narrator_ids").notNull(),
+		chapterTargets: jsonText("chapter_targets").notNull(),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [index("idx_legacy_migration_archive_path").on(table.archivePath)],
+);
+
+export const legacyProjectSyncTombstones = pgTable("legacy_project_sync_tombstones", {
+	canonicalRoot: text("canonical_root").primaryKey().notNull(),
+	projectId: text("disabled_project_id").notNull(),
+	disabledAt: text("disabled_at").notNull(),
 });
+
+export const legacyNarratorWorkspaceAdoptions = pgTable(
+	"legacy_narrator_workspace_adoptions",
+	{
+		narratorId: text("narrator_id")
+			.primaryKey()
+			.notNull()
+			.references((): PgColumn => narrators.id, { onDelete: "cascade" }),
+		migrationProjectId: text("migration_project_id").notNull(),
+		previousRevision: integer("previous_revision").notNull(),
+		adoptedRevision: integer("adopted_revision").notNull(),
+		deviceId: text("device_id").notNull(),
+		cwd: text("cwd").notNull(),
+		contextKey: text("context_key").notNull(),
+		historyDigest: text("history_digest").notNull(),
+		proofMode: text("proof_mode").notNull().default("empty"),
+		originJson: jsonText("origin_json"),
+		workspaceKey: text("workspace_key"),
+		repositoryKey: text("repository_key"),
+		directoryDev: text("directory_dev").notNull(),
+		directoryIno: text("directory_ino").notNull(),
+		gitDirectoryDev: text("git_directory_dev"),
+		gitDirectoryIno: text("git_directory_ino"),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		index("idx_legacy_workspace_adoption_migration").on(table.migrationProjectId),
+		foreignKey({
+			name: "legacy_narrator_workspace_adoptions_migration_pro_b906383793_fk",
+			columns: [table.migrationProjectId],
+			foreignColumns: [legacyProjectMigrations.projectId],
+		}).onDelete("cascade"),
+	],
+);
+
+export const legacyRetainedChapterMetadata = pgTable(
+	"legacy_retained_chapter_metadata",
+	{
+		sourceChapterId: text("source_chapter_id").primaryKey().notNull(),
+		migrationProjectId: text("migration_project_id").notNull(),
+		metadataJson: jsonText("metadata_json").notNull(),
+		manifestDigest: text("manifest_digest").notNull(),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		foreignKey({
+			name: "legacy_retained_chapter_metadata_migration_projec_a2c4dbd682_fk",
+			columns: [table.migrationProjectId],
+			foreignColumns: [legacyProjectMigrations.projectId],
+		}).onDelete("restrict"),
+	],
+);
+
+export const legacyRetainedHistoryManifests = pgTable(
+	"legacy_retained_history_manifests",
+	{
+		migrationProjectId: text("migration_project_id").primaryKey().notNull(),
+		manifestJson: jsonText("manifest_json").notNull(),
+		manifestDigest: text("manifest_digest").notNull(),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		foreignKey({
+			name: "legacy_retained_history_manifests_migration_proje_26801ed8ca_fk",
+			columns: [table.migrationProjectId],
+			foreignColumns: [legacyProjectMigrations.projectId],
+		}).onDelete("restrict"),
+	],
+);
+
+export const legacyMigrationArtifactClaims = pgTable(
+	"legacy_migration_artifact_claims",
+	{
+		id: text("id").primaryKey().notNull(),
+		migrationProjectId: text("migration_project_id").notNull(),
+		sourceChapterId: text("source_chapter_id").notNull(),
+		narratorId: text("narrator_id").references((): PgColumn => narrators.id, {
+			onDelete: "set null",
+		}),
+		ownerUserId: text("owner_user_id").references((): PgColumn => users.id, {
+			onDelete: "set null",
+		}),
+		kind: text("kind").notNull(),
+		deviceId: text("device_id").notNull(),
+		workspacePath: text("workspace_path").notNull(),
+		artifactPath: text("artifact_path").notNull(),
+		shadowKey: text("shadow_key"),
+		latestSnapshotCommitSha: text("latest_snapshot_commit_sha"),
+		identityJson: jsonText("identity_json").notNull(),
+		manifestDigest: text("manifest_digest").notNull(),
+		state: text("state").notNull().default("claimed"),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		index("idx_legacy_artifact_workspace").on(table.deviceId, table.workspacePath, table.state),
+		index("idx_legacy_artifact_shadow_key").on(table.shadowKey, table.state),
+		index("idx_legacy_artifact_path").on(table.artifactPath, table.state),
+		index("idx_legacy_artifact_chapter").on(table.sourceChapterId, table.state),
+		index("idx_legacy_artifact_narrator").on(table.narratorId),
+		index("idx_legacy_artifact_migration").on(table.migrationProjectId),
+		foreignKey({
+			name: "legacy_migration_artifact_claims_migration_projec_b28dec6be6_fk",
+			columns: [table.migrationProjectId],
+			foreignColumns: [legacyProjectMigrations.projectId],
+		}).onDelete("restrict"),
+		foreignKey({
+			name: "legacy_migration_artifact_claims_source_chapter_i_11d67d91bb_fk",
+			columns: [table.sourceChapterId],
+			foreignColumns: [legacyRetainedChapterMetadata.sourceChapterId],
+		}).onDelete("restrict"),
+	],
+);
 
 export const skillDirectoryCaches = pgTable(
 	"skill_directory_caches",
@@ -2378,6 +2595,7 @@ export const fileChangeScopes = pgTable(
 			table.workspaceInstanceId,
 		),
 		index("idx_fc_scope_root").on(table.sourceInstanceId, table.deviceId, table.canonicalRoot),
+		index("idx_fc_scope_physical_root").on(table.deviceId, table.canonicalRoot),
 		index("idx_fc_scope_status").on(table.status, table.updatedAt),
 		index("idx_fc_scope_active_lease").on(table.deviceId, table.activeLeaseId, table.canonicalRoot),
 	],
@@ -2587,6 +2805,7 @@ export const fileChangeOperations = pgTable(
 		index("idx_fc_operation_sequence").on(table.sourceInstanceId, table.journalSeq),
 		index("idx_fc_operation_segment").on(table.executionSegmentId, table.journalSeq),
 		index("idx_fc_operation_narrator").on(table.narratorId, table.startedAt, table.id),
+		index("idx_fc_operation_project").on(table.projectId, table.id),
 		index("idx_fc_operation_actor").on(table.actorSubjectKey, table.startedAt, table.id),
 		index("idx_fc_operation_pending").on(table.settlement, table.updatedAt, table.id),
 		index("idx_fc_operation_task").on(table.backgroundTaskId, table.attempt),
@@ -2725,6 +2944,7 @@ export const revertOperations = pgTable(
 			table.idempotencyKey,
 		),
 		index("idx_revert_operation_narrator").on(table.narratorId, table.createdAt, table.id),
+		index("idx_revert_operation_project").on(table.projectId, table.id),
 		index("idx_revert_operation_pending").on(table.status, table.updatedAt, table.id),
 		index("idx_revert_operation_owner_pending").on(
 			table.requestedBySubjectKey,
@@ -2784,6 +3004,7 @@ export const revertOperationFiles = pgTable(
 		uniqueIndex("idx_revert_file_apply").on(table.applyMutationId),
 		uniqueIndex("idx_revert_file_compensate").on(table.compensateMutationId),
 		index("idx_revert_file_pending").on(table.revertOperationId, table.status, table.sequence),
+		index("idx_revert_file_scope").on(table.scopeId, table.id),
 		index("idx_revert_file_before_blob").on(table.beforeBlobDigest),
 		index("idx_revert_file_desired_blob").on(table.desiredBlobDigest),
 		index("idx_revert_file_observed_blob").on(table.observedAfterBlobDigest),
@@ -3719,8 +3940,8 @@ export const notifications = pgTable(
 );
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
-  "tableCount": 116,
-  "columnCount": 1672,
+  "tableCount": 124,
+  "columnCount": 1748,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -4167,6 +4388,328 @@ export const POSTGRES_SCHEMA_COVERAGE = {
       "primaryKeys": []
     },
     {
+      "exportName": "narratorWorktreeResourceClaims",
+      "name": "narrator_worktree_resource_claims",
+      "columns": [
+        {
+          "property": "id",
+          "name": "id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "resourceId",
+          "name": "resource_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "narratorWorktreeResources",
+            "column": "id",
+            "onDelete": "restrict",
+            "constraintName": "narrator_worktree_resource_claims_resource_id_nar_ae30272eb2_fk"
+          },
+          "emitAsTableConstraint": true
+        },
+        {
+          "property": "migrationProjectId",
+          "name": "migration_project_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "legacyProjectMigrations",
+            "column": "projectId",
+            "onDelete": "restrict",
+            "constraintName": "narrator_worktree_resource_claims_migration_proje_6711728038_fk"
+          },
+          "emitAsTableConstraint": true
+        },
+        {
+          "property": "sourceChapterId",
+          "name": "source_chapter_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "narratorId",
+          "name": "narrator_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "narrators",
+            "column": "id",
+            "onDelete": "set null",
+            "constraintName": "narrator_worktree_resource_claims_narrator_id_narrators_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "ownerUserId",
+          "name": "owner_user_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "users",
+            "column": "id",
+            "onDelete": "set null",
+            "constraintName": "narrator_worktree_resource_claims_owner_user_id_users_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "state",
+          "name": "state",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "\"unresolved\"",
+          "defaultExpression": "\"unresolved\""
+        },
+        {
+          "property": "ownershipRevision",
+          "name": "ownership_revision",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "updatedAt",
+          "name": "updated_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "uq_worktree_resource_claim_user",
+          "columns": [
+            "resourceId",
+            "narratorId"
+          ],
+          "unique": true
+        },
+        {
+          "name": "idx_worktree_resource_claim_migration",
+          "columns": [
+            "migrationProjectId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_worktree_resource_claim_chapter",
+          "columns": [
+            "sourceChapterId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_worktree_resource_claim_narrator",
+          "columns": [
+            "narratorId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_worktree_resource_claim_owner",
+          "columns": [
+            "ownerUserId"
+          ],
+          "unique": false
+        }
+      ],
+      "checks": [
+        "ck_worktree_resource_claim_revision"
+      ],
+      "checkDefinitions": [
+        {
+          "name": "ck_worktree_resource_claim_revision",
+          "expression": "\"ownership_revision\" >= 0"
+        }
+      ],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "narratorWorktreeResourceOrigins",
+      "name": "narrator_worktree_resource_origins",
+      "columns": [
+        {
+          "property": "resourceId",
+          "name": "resource_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false,
+          "references": {
+            "table": "narratorWorktreeResources",
+            "column": "id",
+            "onDelete": "restrict",
+            "constraintName": "narrator_worktree_resource_origins_resource_id_na_2f08217b36_fk"
+          },
+          "emitAsTableConstraint": true
+        },
+        {
+          "property": "migrationProjectId",
+          "name": "migration_project_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "legacyProjectMigrations",
+            "column": "projectId",
+            "onDelete": "restrict",
+            "constraintName": "narrator_worktree_resource_origins_migration_proj_57b5eb2ac5_fk"
+          },
+          "emitAsTableConstraint": true
+        },
+        {
+          "property": "sourceChapterId",
+          "name": "source_chapter_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "deviceId",
+          "name": "device_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "commonDirectoryPath",
+          "name": "common_directory_path",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "gitAdminDirectoryPath",
+          "name": "git_admin_directory_path",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "evidenceJson",
+          "name": "evidence_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "evidenceDigest",
+          "name": "evidence_digest",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_worktree_origin_migration",
+          "columns": [
+            "migrationProjectId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_worktree_origin_chapter",
+          "columns": [
+            "sourceChapterId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_worktree_origin_common",
+          "columns": [
+            "deviceId",
+            "commonDirectoryPath"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_worktree_origin_admin",
+          "columns": [
+            "deviceId",
+            "gitAdminDirectoryPath"
+          ],
+          "unique": false
+        }
+      ],
+      "checks": [
+        "ck_worktree_origin_evidence_bytes"
+      ],
+      "checkDefinitions": [
+        {
+          "name": "ck_worktree_origin_evidence_bytes",
+          "expression": "octet_length(\"evidence_json\") <= 16384"
+        }
+      ],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
       "exportName": "projects",
       "name": "projects",
       "columns": [
@@ -4277,6 +4820,18 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "property": "legacySyncDisabled",
+          "name": "legacy_sync_disabled",
+          "kind": "integer",
+          "mode": "boolean",
+          "pgType": "boolean",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "false",
+          "defaultExpression": "false"
+        },
+        {
           "property": "proxyDomain",
           "name": "proxy_domain",
           "kind": "text",
@@ -4343,7 +4898,731 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         }
       ],
+      "indexes": [
+        {
+          "name": "idx_projects_legacy_sync_disabled",
+          "columns": [
+            "legacySyncDisabled",
+            "id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_projects_legacy_sync_path",
+          "columns": [
+            "gitPath",
+            "legacySyncDisabled"
+          ],
+          "unique": false
+        }
+      ],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "legacyProjectMigrations",
+      "name": "legacy_project_migrations",
+      "columns": [
+        {
+          "property": "projectId",
+          "name": "project_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "projectName",
+          "name": "project_name",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "gitPath",
+          "name": "git_path",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "archivePath",
+          "name": "archive_path",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "archiveIdentityJson",
+          "name": "archive_identity_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "actorUserId",
+          "name": "actor_user_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "phase",
+          "name": "phase",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "revision",
+          "name": "revision",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "narratorIds",
+          "name": "narrator_ids",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "chapterTargets",
+          "name": "chapter_targets",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "updatedAt",
+          "name": "updated_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_legacy_migration_archive_path",
+          "columns": [
+            "archivePath"
+          ],
+          "unique": false
+        }
+      ],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "legacyProjectSyncTombstones",
+      "name": "legacy_project_sync_tombstones",
+      "columns": [
+        {
+          "property": "canonicalRoot",
+          "name": "canonical_root",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "projectId",
+          "name": "disabled_project_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "disabledAt",
+          "name": "disabled_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
       "indexes": [],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "legacyNarratorWorkspaceAdoptions",
+      "name": "legacy_narrator_workspace_adoptions",
+      "columns": [
+        {
+          "property": "narratorId",
+          "name": "narrator_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false,
+          "references": {
+            "table": "narrators",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "legacy_narrator_workspace_adoptions_narrator_id_narrators_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "migrationProjectId",
+          "name": "migration_project_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "legacyProjectMigrations",
+            "column": "projectId",
+            "onDelete": "cascade",
+            "constraintName": "legacy_narrator_workspace_adoptions_migration_pro_b906383793_fk"
+          },
+          "emitAsTableConstraint": true
+        },
+        {
+          "property": "previousRevision",
+          "name": "previous_revision",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "adoptedRevision",
+          "name": "adopted_revision",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "deviceId",
+          "name": "device_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "cwd",
+          "name": "cwd",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "contextKey",
+          "name": "context_key",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "historyDigest",
+          "name": "history_digest",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "proofMode",
+          "name": "proof_mode",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "\"empty\"",
+          "defaultExpression": "\"empty\""
+        },
+        {
+          "property": "originJson",
+          "name": "origin_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "workspaceKey",
+          "name": "workspace_key",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "repositoryKey",
+          "name": "repository_key",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "directoryDev",
+          "name": "directory_dev",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "directoryIno",
+          "name": "directory_ino",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "gitDirectoryDev",
+          "name": "git_directory_dev",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "gitDirectoryIno",
+          "name": "git_directory_ino",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_legacy_workspace_adoption_migration",
+          "columns": [
+            "migrationProjectId"
+          ],
+          "unique": false
+        }
+      ],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "legacyRetainedChapterMetadata",
+      "name": "legacy_retained_chapter_metadata",
+      "columns": [
+        {
+          "property": "sourceChapterId",
+          "name": "source_chapter_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "migrationProjectId",
+          "name": "migration_project_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "legacyProjectMigrations",
+            "column": "projectId",
+            "onDelete": "restrict",
+            "constraintName": "legacy_retained_chapter_metadata_migration_projec_a2c4dbd682_fk"
+          },
+          "emitAsTableConstraint": true
+        },
+        {
+          "property": "metadataJson",
+          "name": "metadata_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "manifestDigest",
+          "name": "manifest_digest",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "legacyRetainedHistoryManifests",
+      "name": "legacy_retained_history_manifests",
+      "columns": [
+        {
+          "property": "migrationProjectId",
+          "name": "migration_project_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false,
+          "references": {
+            "table": "legacyProjectMigrations",
+            "column": "projectId",
+            "onDelete": "restrict",
+            "constraintName": "legacy_retained_history_manifests_migration_proje_26801ed8ca_fk"
+          },
+          "emitAsTableConstraint": true
+        },
+        {
+          "property": "manifestJson",
+          "name": "manifest_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "manifestDigest",
+          "name": "manifest_digest",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "legacyMigrationArtifactClaims",
+      "name": "legacy_migration_artifact_claims",
+      "columns": [
+        {
+          "property": "id",
+          "name": "id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "migrationProjectId",
+          "name": "migration_project_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "legacyProjectMigrations",
+            "column": "projectId",
+            "onDelete": "restrict",
+            "constraintName": "legacy_migration_artifact_claims_migration_projec_b28dec6be6_fk"
+          },
+          "emitAsTableConstraint": true
+        },
+        {
+          "property": "sourceChapterId",
+          "name": "source_chapter_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "legacyRetainedChapterMetadata",
+            "column": "sourceChapterId",
+            "onDelete": "restrict",
+            "constraintName": "legacy_migration_artifact_claims_source_chapter_i_11d67d91bb_fk"
+          },
+          "emitAsTableConstraint": true
+        },
+        {
+          "property": "narratorId",
+          "name": "narrator_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "narrators",
+            "column": "id",
+            "onDelete": "set null",
+            "constraintName": "legacy_migration_artifact_claims_narrator_id_narrators_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "ownerUserId",
+          "name": "owner_user_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "users",
+            "column": "id",
+            "onDelete": "set null",
+            "constraintName": "legacy_migration_artifact_claims_owner_user_id_users_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "kind",
+          "name": "kind",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "deviceId",
+          "name": "device_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "workspacePath",
+          "name": "workspace_path",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "artifactPath",
+          "name": "artifact_path",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "shadowKey",
+          "name": "shadow_key",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "latestSnapshotCommitSha",
+          "name": "latest_snapshot_commit_sha",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "identityJson",
+          "name": "identity_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "manifestDigest",
+          "name": "manifest_digest",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "state",
+          "name": "state",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "\"claimed\"",
+          "defaultExpression": "\"claimed\""
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_legacy_artifact_workspace",
+          "columns": [
+            "deviceId",
+            "workspacePath",
+            "state"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_legacy_artifact_shadow_key",
+          "columns": [
+            "shadowKey",
+            "state"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_legacy_artifact_path",
+          "columns": [
+            "artifactPath",
+            "state"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_legacy_artifact_chapter",
+          "columns": [
+            "sourceChapterId",
+            "state"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_legacy_artifact_narrator",
+          "columns": [
+            "narratorId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_legacy_artifact_migration",
+          "columns": [
+            "migrationProjectId"
+          ],
+          "unique": false
+        }
+      ],
       "checks": [],
       "checkDefinitions": [],
       "foreignKeys": [],
@@ -18136,6 +19415,14 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "name": "idx_fc_scope_physical_root",
+          "columns": [
+            "deviceId",
+            "canonicalRoot"
+          ],
+          "unique": false
+        },
+        {
           "name": "idx_fc_scope_status",
           "columns": [
             "status",
@@ -19473,6 +20760,14 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "name": "idx_fc_operation_project",
+          "columns": [
+            "projectId",
+            "id"
+          ],
+          "unique": false
+        },
+        {
           "name": "idx_fc_operation_actor",
           "columns": [
             "actorSubjectKey",
@@ -20351,6 +21646,14 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "name": "idx_revert_operation_project",
+          "columns": [
+            "projectId",
+            "id"
+          ],
+          "unique": false
+        },
+        {
           "name": "idx_revert_operation_pending",
           "columns": [
             "status",
@@ -20682,6 +21985,14 @@ export const POSTGRES_SCHEMA_COVERAGE = {
             "revertOperationId",
             "status",
             "sequence"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_revert_file_scope",
+          "columns": [
+            "scopeId",
+            "id"
           ],
           "unique": false
         },

@@ -47,6 +47,11 @@ import { kimiRoutes } from "./routes/kimi";
 import { knowledgeRoutes } from "./routes/knowledge";
 import { knowledgePackRoutes } from "./routes/knowledge-packs";
 import { learningRoutes } from "./routes/learning";
+import { legacyMigrationArtifactRoutes } from "./routes/legacy-migration-artifacts";
+import {
+	legacyChapterMigrationRoutes,
+	legacyProjectMigrationRoutes,
+} from "./routes/legacy-project-migration";
 import licenseRoutes from "./routes/licenses";
 import { mcpRoutes } from "./routes/mcp";
 import { modelCardRoutes } from "./routes/model-cards";
@@ -434,6 +439,9 @@ app.route("/api/projects", graphRoutes);
 app.route("/api/projects", rulerRoutes);
 // Project DB backup/import routes
 app.route("/api/projects", projectDbRoutes);
+app.route("/api/projects", legacyProjectMigrationRoutes);
+app.route("/api/legacy-chapters", legacyChapterMigrationRoutes);
+app.route("/api/legacy-migration-artifacts", legacyMigrationArtifactRoutes);
 // Volume snapshot routes (nested under projects for list/create, standalone for single-item ops)
 app.route("/api/projects", volumeSnapshotRoutes);
 app.route("/api/volume-snapshots", volumeSnapshotRoutes);

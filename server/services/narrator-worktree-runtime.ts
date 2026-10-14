@@ -9,6 +9,7 @@ import { authorizeGitTargetForPrincipal } from "./git-workspace-access";
 import type { NarratorPrincipal } from "./narrator-acl";
 import { loadNarratorForAccess, resolveAclRootId } from "./narrator-acl";
 import { FileWorktreeJournal } from "./narrator-worktree-journal";
+import { authorizeNarratorLinkedWorktreeResource } from "./narrator-worktree-linked-authority";
 import { unknownWorktreeScope } from "./narrator-worktree-resource-store";
 import { narratorWorktreeResourceRegistry } from "./narrator-worktree-resources";
 import { NarratorWorktreeService } from "./narrator-worktree-service";
@@ -28,6 +29,7 @@ export const narratorWorktreeService = new NarratorWorktreeService<NarratorPrinc
 		const rootId = await resolveAclRootId(source);
 		if (!rootId) return { ...target, resourceScope: unknownWorktreeScope };
 		const root = await loadNarratorForAccess(rootId, principal, "read");
+		await authorizeNarratorLinkedWorktreeResource(principal, source, root, target, need, signal);
 		signal.throwIfAborted();
 		// Resolver contextProjectId is explicit provenance, not cwd/repository proximity.
 		return {

@@ -1,9 +1,16 @@
 import { Database } from "bun:sqlite";
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { projects } from "../db/schema";
+import {
+	isLegacyProjectSyncAllowed,
+	isLegacySyncBlocked,
+	legacySyncDisabledError,
+	legacySyncInFlight,
+} from "../services/project-db-sync-coordinator";
+import { hotSafe } from "./hot-safe";
 
 /**
  * Stamped into `PRAGMA user_version` and, as of today, read by nothing — schema drift is
@@ -388,8 +395,11 @@ class ProjectDbManager {
 	 * Returns null if the project has no gitPath or the path doesn't exist.
 	 */
 	async getDb(projectId: string): Promise<Database | null> {
+		if (!(await isLegacyProjectSyncAllowed(projectId)) || isLegacySyncBlocked(projectId))
+			return null;
 		const cached = this.cache.get(projectId);
 		if (cached) {
+			if (isLegacySyncBlocked(projectId, cached.gitPath)) return null;
 			cached.lastUsed = Date.now();
 			return cached.conn;
 		}
@@ -407,10 +417,17 @@ class ProjectDbManager {
 	 * Open a project database for a known gitPath (skips DB lookup).
 	 * Used during project creation when the project record already exists.
 	 */
-	openForGitPath(projectId: string, gitPath: string): Database {
+	async openForGitPath(projectId: string, gitPath: string): Promise<Database> {
+		if (
+			!(await isLegacyProjectSyncAllowed(projectId, gitPath)) ||
+			isLegacySyncBlocked(projectId, gitPath)
+		) {
+			throw legacySyncDisabledError();
+		}
 		// Check cache first
 		const cached = this.cache.get(projectId);
 		if (cached) {
+			if (isLegacySyncBlocked(projectId, cached.gitPath)) throw legacySyncDisabledError();
 			cached.lastUsed = Date.now();
 			return cached.conn;
 		}
@@ -425,6 +442,7 @@ class ProjectDbManager {
 
 	/** Close a specific project's connection. */
 	close(projectId: string): void {
+		if (legacySyncInFlight(projectId)) return;
 		const cached = this.cache.get(projectId);
 		if (cached) {
 			try {
@@ -438,18 +456,34 @@ class ProjectDbManager {
 		if (this.cache.size === 0) this.stopCleanupTimer();
 	}
 
+	/**
+	 * Called only after the coordinator drained every user of this archive path.
+	 * Retirement must not explicitly checkpoint/truncate a potentially large WAL on the HTTP
+	 * thread. SQLite's last-close cleanup can still do I/O; this is not a maintenance/vacuum API.
+	 */
+	closeLegacyArchive(projectId: string, gitPath: string | null): void {
+		const canonical = (path: string) => {
+			try {
+				return realpathSync(path);
+			} catch {
+				return resolve(path);
+			}
+		};
+		const path = gitPath ? canonical(gitPath) : null;
+		for (const [id, cached] of this.cache) {
+			if (id !== projectId && (!path || canonical(cached.gitPath) !== path)) continue;
+			if (legacySyncInFlight(id)) continue;
+			// Unlike ordinary cache eviction, retiring the backup does not request TRUNCATE.
+			cached.conn.close();
+			this.cache.delete(id);
+		}
+		if (this.cache.size === 0) this.stopCleanupTimer();
+	}
+
 	/** Close all connections (process exit). */
 	closeAll(): void {
-		for (const [, cached] of this.cache) {
-			try {
-				cached.conn.run("PRAGMA wal_checkpoint(TRUNCATE)");
-				cached.conn.close();
-			} catch {
-				// best-effort
-			}
-		}
-		this.cache.clear();
-		this.stopCleanupTimer();
+		for (const id of this.cache.keys()) this.close(id);
+		if (this.cache.size === 0) this.stopCleanupTimer();
 	}
 
 	/** Evict least-recently-used connections if over limit. */
@@ -498,4 +532,10 @@ class ProjectDbManager {
 	}
 }
 
-export const projectDbManager = new ProjectDbManager();
+export const projectDbManager = hotSafe(
+	"narrafork:project-db-manager",
+	() => new ProjectDbManager(),
+);
+
+/** Format-only fixtures without a main project record; never used by production sync. */
+export const __testing = { initProjectDb };

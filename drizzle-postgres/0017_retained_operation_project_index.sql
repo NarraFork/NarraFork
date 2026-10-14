@@ -1,0 +1,1 @@
+CREATE INDEX "idx_fc_operation_project" ON "file_change_operations" USING btree ("project_id","id");

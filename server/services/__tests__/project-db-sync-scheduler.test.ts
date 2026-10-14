@@ -13,6 +13,30 @@ afterEach(() => {
 });
 
 describe("createNarratorSyncScheduler", () => {
+	test("cancel project timers and dirty follow-ups without interrupting another project", async () => {
+		const held = { release: () => {} };
+		const runs: string[] = [];
+		scheduler = createNarratorSyncScheduler({
+			debounceMs: 5,
+			minIntervalMs: 0,
+			run: async (key) => {
+				runs.push(key);
+				if (key === "a:running")
+					await new Promise<void>((resolve) => {
+						held.release = resolve;
+					});
+			},
+		});
+		scheduler.schedule("a:running");
+		await sleep(15);
+		scheduler.schedule("a:running");
+		scheduler.schedule("a:pending");
+		scheduler.schedule("b:pending");
+		scheduler.cancelWhere((key) => key.startsWith("a:"));
+		held.release();
+		await sleep(25);
+		expect(runs).toEqual(["a:running", "b:pending"]);
+	});
 	test("events inside the debounce window coalesce into one run", async () => {
 		const runs: string[] = [];
 		scheduler = createNarratorSyncScheduler({

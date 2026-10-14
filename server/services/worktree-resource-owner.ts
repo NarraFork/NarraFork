@@ -1,4 +1,8 @@
 import type { narratorWorktreeResources } from "../db/schema";
+import {
+	isBoundLinkedWorktreeClaimant,
+	type LinkedWorktreeClaimSummary,
+} from "./legacy-linked-worktree-claims";
 
 export type WorktreeResourceRecord = Pick<
 	typeof narratorWorktreeResources.$inferSelect,
@@ -138,12 +142,20 @@ export interface WorktreeResourceAccessPorts {
 		resource: WorktreeResourceRecord,
 		signal: AbortSignal,
 	): Promise<CurrentResourceAuthority | null>;
+	/** Production linked adapters must read current durable origin + exact runtime-root claim.
+	 * Absence means legacy-only adapter, not evidence that an origin was released. */
+	loadLinkedClaimSummary?(
+		resource: WorktreeResourceRecord,
+		authority: CurrentResourceAuthority,
+		signal: AbortSignal,
+	): Promise<LinkedWorktreeClaimSummary>;
 }
 
 export function validateResourceAuthority(
 	resource: WorktreeResourceRecord,
 	auth: CurrentResourceAuthority | null,
 	need: "read" | "write",
+	linked?: LinkedWorktreeClaimSummary,
 ): void {
 	if (resource.state !== "ready") throw new WorktreeResourceError("RESOURCE_NOT_READY");
 	if (
@@ -172,14 +184,22 @@ export function validateResourceAuthority(
 		!["normal", "readonly"].includes(auth.workspaceMode)
 	)
 		throw new WorktreeResourceError("RESOURCE_CAPABILITY_UNSUPPORTED");
+	const hasLinkedEvidence = !!(linked?.origin || linked?.claim);
 	if (
-		auth.sourceNarratorId !== resource.ownerNarratorId ||
+		hasLinkedEvidence &&
+		(!linked || !isBoundLinkedWorktreeClaimant(resource, auth, linked, need))
+	)
+		throw new WorktreeResourceError("RESOURCE_ORIGIN_UNVERIFIED");
+	if (
+		(!hasLinkedEvidence && auth.sourceNarratorId !== resource.ownerNarratorId) ||
 		auth.scopeOwnerUserId !== resource.scopeOwnerUserId ||
 		auth.contextProjectId !== resource.scopeProjectId ||
 		auth.canonicalWorktreePath !== resource.worktreePath ||
 		auth.repositoryKey !== resource.repositoryKey
 	)
 		throw new WorktreeResourceError("RESOURCE_IDENTITY_MISMATCH");
+	// Durable linked origins never become ownerless resources after narrator deletion.
+	if (hasLinkedEvidence) return;
 	if (resource.ownerNarratorId !== null) {
 		if (
 			!auth.sessionNarratorId ||
@@ -237,7 +257,11 @@ export function createWorktreeResourceAccess(ports: WorktreeResourceAccessPorts)
 				throw new WorktreeResourceError("RESOURCE_REVISION_STALE");
 			const current = await ports.loadCurrentAuthority({ ...resource }, boundedSignal);
 			const authority = current ? { ...current } : null;
-			validateResourceAuthority(resource, authority, need);
+			const linked =
+				authority && ports.loadLinkedClaimSummary
+					? await ports.loadLinkedClaimSummary({ ...resource }, { ...authority }, boundedSignal)
+					: undefined;
+			validateResourceAuthority(resource, authority, need, linked);
 			if (!authority) throw new WorktreeResourceError("RESOURCE_ACCESS_DENIED");
 			if (boundedSignal.aborted) throw new WorktreeResourceError("RESOURCE_AUTH_CANCELLED");
 			return { resource, authority };

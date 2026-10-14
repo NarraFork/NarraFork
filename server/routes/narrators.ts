@@ -3581,7 +3581,10 @@ narratorRoutes.get("/:id/tool-calls/:toolUseId/file-edit-preview", async (c) => 
 		c.req.param("toolUseId"),
 		{ toolCallId: c.req.query("toolCallId"), messageId: c.req.query("messageId") },
 	);
-	const preview = await getToolEditPreview(row, c.req.raw.signal);
+	const preview = await getToolEditPreview(row, c.req.raw.signal, {
+		narratorId: c.req.param("id"),
+		principal: narratorPrincipalOf(c),
+	});
 	// Blob/git IO yields: a revoked narrator ACL or message ref must not leak a
 	// response that was authorized before that asynchronous read began.
 	await requireNarratorAccess(c, c.req.param("id"), "read");

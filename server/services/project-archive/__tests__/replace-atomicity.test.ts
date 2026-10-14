@@ -52,7 +52,11 @@ import {
 	projects,
 } from "@server/db/schema";
 import { generateId } from "@server/lib/id";
-import { getProjectDbPath, projectDbManager } from "@server/lib/project-db";
+import {
+	getProjectDbPath,
+	projectDbManager,
+	__testing as projectDbTesting,
+} from "@server/lib/project-db";
 import { fullSync } from "@server/services/project-db-sync";
 import { eq } from "drizzle-orm";
 import { ArchiveStagingLimitError, ArchiveStagingTable } from "../archive-writer";
@@ -73,12 +77,12 @@ import type { ArchiveTable } from "../manifest";
 import { projectArchiveMainStore } from "../store";
 
 const tempDirs: string[] = [];
-const openedArchives: string[] = [];
+const openedArchives: Database[] = [];
 const createdProjects: string[] = [];
 const createdNarrators: string[] = [];
 
 afterEach(async () => {
-	for (const id of openedArchives.splice(0)) projectDbManager.close(id);
+	for (const conn of openedArchives.splice(0)) conn.close();
 	for (const narratorId of createdNarrators.splice(0)) {
 		await db.delete(narratorMessageRefs).where(eq(narratorMessageRefs.narratorId, narratorId));
 		await db.delete(narratorMessages).where(eq(narratorMessages.narratorId, narratorId));
@@ -99,15 +103,15 @@ afterEach(async () => {
 /**
  * Create a real `project.db` through the real initializer and return its write handle.
  *
- * `openForGitPath` is used rather than `getDb` on purpose: it takes the path directly, so the
- * archive needs no `projects` row in the main database and these tests stay independent of it.
+ * Use the schema initializer directly: these format/atomicity fixtures are independent of
+ * project admission and deliberately have no main-database project record.
  */
 function createArchive(prefix: string): { conn: Database; gitPath: string } {
 	const gitPath = mkdtempSync(join(tmpdir(), prefix));
 	tempDirs.push(gitPath);
-	const key = `test-archive-${generateId()}`;
-	openedArchives.push(key);
-	return { conn: projectDbManager.openForGitPath(key, gitPath), gitPath };
+	const conn = projectDbTesting.initProjectDb(gitPath);
+	openedArchives.push(conn);
+	return { conn, gitPath };
 }
 
 /** Read a table through a SEPARATE read-only handle — what another machine would see. */

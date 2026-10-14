@@ -2,6 +2,7 @@
 	"legacyRoute": {
 		"denied": "You do not have access to this legacy resource. Sign in with an authorized account.",
 		"missing": "This legacy resource no longer exists.",
+		"migratedEmpty": "This chapter was migrated and its legacy metadata was removed. It had no retained session. Open the session list to continue; no new session or directory has been created.",
 		"error": "Could not load this legacy resource. Please try again later.",
 		"empty": "This resource has no primary session. Nothing has been created; its configuration remains available.",
 		"configuration": "Open compatibility configuration",

@@ -5216,6 +5216,41 @@ export type ReExecuteDeniedResult =
 	| { ok: true; shouldContinue?: boolean; errorMessage?: string }
 	| { ok: false; reason: ReExecuteDeniedReason };
 
+/** Migration-only cache eviction. The caller holds all lifecycle gates and rechecks resources. */
+export async function unloadIdleNarratorSessionForLegacyMigration(
+	narratorId: string,
+	active: ActiveNarrator,
+	stillIdle: () => boolean,
+): Promise<boolean> {
+	const { isLegacyMigrationRuntimeBusy } = await import("./legacy-migration-runtime");
+	const eligible = () =>
+		activeNarrators.get(narratorId) === active &&
+		isNarratorRevertAdmissionBlocked(narratorId) &&
+		!active._loopRunning &&
+		!isLegacyMigrationRuntimeBusy(narratorId) &&
+		stillIdle();
+	if (!eligible()) return false;
+	const expected = active._persistedConversationId ?? null;
+	const next = active.conversationId;
+	if (expected !== next) {
+		// Await the CAS: failures must leave the session intact, and compact wins are respected.
+		const applied = await narratorService.updateConversationId(narratorId, next, expected);
+		if (applied) active._persistedConversationId = next;
+	}
+	if (!eligible()) return false;
+	if (active._gitTrackTimer) clearTimeout(active._gitTrackTimer);
+	active._gitTrackTimer = undefined;
+	if (active._worktreePath) worktreeWatcher.unwatch(active._worktreePath, narratorId);
+	planModeAskedOnce.delete(narratorId);
+	clearStreamingSnapshot(narratorId);
+	active._bashBeforeStatus?.clear();
+	active._treeHashBefore?.clear();
+	active.events.removeAllListeners();
+	active.alive = false;
+	activeNarrators.delete(narratorId);
+	return true;
+}
+
 function disposeInactiveNarratorSession(narratorId: string, active: ActiveNarrator): void {
 	if (active._gitTrackTimer) clearTimeout(active._gitTrackTimer);
 	if (active._worktreePath) {

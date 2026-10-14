@@ -66,6 +66,8 @@ export function fixtureDatabase() {
 	};
 	for (const table of [
 		schema.narratorWorktreeResources,
+		schema.narratorWorktreeResourceClaims,
+		schema.narratorWorktreeResourceOrigins,
 		schema.terminals,
 		schema.containerInstances,
 		schema.portAllocations,

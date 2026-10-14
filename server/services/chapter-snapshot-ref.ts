@@ -18,6 +18,7 @@ import { chapters } from "../db/schema";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import { logger } from "../lib/logger";
 import { normalizePathForComparison } from "../lib/platform-path";
+import { advanceLegacyArtifactSnapshotPointer } from "./legacy-migration-artifact-claims";
 import { SNAPSHOT_HEAD_REF, treeSnapshotKey, worktreeTreeSnapshot } from "./worktree-tree-snapshot";
 
 /** Outcome of extending a lineage: the recorded tree and its snapshot commit. */
@@ -64,6 +65,14 @@ export async function advanceChapterSnapshot(
  * orphan sweep tell a dormant chapter's shadow repository from an abandoned one.
  */
 async function pointChaptersAt(worktreePath: string, commitSha: string): Promise<void> {
+	try {
+		await advanceLegacyArtifactSnapshotPointer(LOCAL_DEVICE_ID, worktreePath, commitSha);
+	} catch (error) {
+		logger.warn("Could not update retained artifact snapshot pointer", {
+			worktreePath,
+			error: String(error),
+		});
+	}
 	try {
 		// Matched against both the raw and the normalized spelling. `chapters.worktreePath`
 		// is stored as whoever created the chapter supplied it (the project's `gitPath` for

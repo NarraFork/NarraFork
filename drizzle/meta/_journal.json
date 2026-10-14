@@ -1366,6 +1366,76 @@
       "when": 1791509442557,
       "tag": "0194_tense_cerise",
       "breakpoints": true
+    },
+    {
+      "idx": 195,
+      "version": "6",
+      "when": 1791644866008,
+      "tag": "0195_chapter_retirement_migration",
+      "breakpoints": true
+    },
+    {
+      "idx": 196,
+      "version": "6",
+      "when": 1791645001834,
+      "tag": "0196_chapter_retirement_indexes",
+      "breakpoints": true
+    },
+    {
+      "idx": 197,
+      "version": "6",
+      "when": 1791645484155,
+      "tag": "0197_chapter_retirement_cleanup_identity",
+      "breakpoints": true
+    },
+    {
+      "idx": 198,
+      "version": "6",
+      "when": 1791656696555,
+      "tag": "0198_legacy_root_workspace_adoption",
+      "breakpoints": true
+    },
+    {
+      "idx": 199,
+      "version": "6",
+      "when": 1791681818947,
+      "tag": "0199_legacy_root_git_namespace",
+      "breakpoints": true
+    },
+    {
+      "idx": 200,
+      "version": "6",
+      "when": 1791683813882,
+      "tag": "0200_retained_legacy_artifact_claims",
+      "breakpoints": true
+    },
+    {
+      "idx": 201,
+      "version": "6",
+      "when": 1791687477014,
+      "tag": "0201_retained_history_origin_manifest",
+      "breakpoints": true
+    },
+    {
+      "idx": 202,
+      "version": "6",
+      "when": 1791691198603,
+      "tag": "0202_retained_operation_project_index",
+      "breakpoints": true
+    },
+    {
+      "idx": 203,
+      "version": "6",
+      "when": 1791691520670,
+      "tag": "0203_retained_revert_dependency_indexes",
+      "breakpoints": true
+    },
+    {
+      "idx": 204,
+      "version": "6",
+      "when": 1791696635907,
+      "tag": "0204_retained_linked_worktree_claims",
+      "breakpoints": true
     }
   ]
 }

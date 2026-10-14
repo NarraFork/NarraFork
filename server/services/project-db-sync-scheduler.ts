@@ -41,6 +41,8 @@ interface KeyState {
 export interface NarratorSyncScheduler {
 	/** Note that `key` changed; a run will follow. */
 	schedule(key: string): void;
+	/** Cancel pending and dirty follow-ups matching a stopped project. */
+	cancelWhere(predicate: (key: string) => boolean): void;
 	/** Cancel every pending timer (in-flight runs finish on their own). */
 	dispose(): void;
 	/** For tests and diagnostics. */
@@ -101,6 +103,15 @@ export function createNarratorSyncScheduler(
 			}
 			if (state.timer) return;
 			arm(key, state);
+		},
+		cancelWhere(predicate) {
+			for (const [key, state] of states) {
+				if (!predicate(key)) continue;
+				if (state.timer) clearTimeout(state.timer);
+				state.timer = null;
+				state.dirty = false;
+				if (!state.running) states.delete(key);
+			}
 		},
 		dispose() {
 			disposed = true;

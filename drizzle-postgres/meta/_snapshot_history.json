@@ -88,6 +88,78 @@
 			"prevId": "c8907ecc-6d49-49f5-bd69-203edaa083fb",
 			"version": "7",
 			"snapshotDigest": "0235572a6d339d78284b81387ca2f4c03ab59df6b9bc7fbfa8f3cce2b83d085d"
+		},
+		{
+			"idx": 11,
+			"tag": "0011_chapter_retirement_migration",
+			"id": "2b12e043-e4dc-41bf-b340-05f2c518b997",
+			"prevId": "392deb77-0f97-42e8-a021-b68bd6a75a2b",
+			"version": "7",
+			"snapshotDigest": "c0d7c3dedbf1a6c0e0c1567a0d6957fbb85774d7453bb68aeec20844ca23e47a"
+		},
+		{
+			"idx": 12,
+			"tag": "0012_chapter_retirement_cleanup_identity",
+			"id": "636b6c8c-bfee-44d2-806f-fc23182f6226",
+			"prevId": "2b12e043-e4dc-41bf-b340-05f2c518b997",
+			"version": "7",
+			"snapshotDigest": "0d0668b12a29234037e3cd173479ec684fa185a2e774caa6227eeac09a2b6bde"
+		},
+		{
+			"idx": 13,
+			"tag": "0013_legacy_root_workspace_adoption",
+			"id": "1004ed0e-9cce-4682-a771-810749bf73a9",
+			"prevId": "636b6c8c-bfee-44d2-806f-fc23182f6226",
+			"version": "7",
+			"snapshotDigest": "b0fd8e6e7130372b5303708771e0f199348b4c179bb474c674b6ee24175edbc7"
+		},
+		{
+			"idx": 14,
+			"tag": "0014_legacy_root_git_namespace",
+			"id": "16cdef61-033a-4362-91d4-f0a291d81cd3",
+			"prevId": "1004ed0e-9cce-4682-a771-810749bf73a9",
+			"version": "7",
+			"snapshotDigest": "899c838213e2211d2e5d322fb1cfaf8c688d28e5f639d64a4e07821869734488"
+		},
+		{
+			"idx": 15,
+			"tag": "0015_retained_legacy_artifact_claims",
+			"id": "2d19982e-ad23-4f80-af3c-6d2adbc1dca7",
+			"prevId": "16cdef61-033a-4362-91d4-f0a291d81cd3",
+			"version": "7",
+			"snapshotDigest": "994a94163a282018480c7f216e3948ae7a4b67c304486556ce45b087e02e9ccd"
+		},
+		{
+			"idx": 16,
+			"tag": "0016_retained_history_origin_manifest",
+			"id": "78cd7830-67ce-47d4-b9d8-007a26eb77c8",
+			"prevId": "2d19982e-ad23-4f80-af3c-6d2adbc1dca7",
+			"version": "7",
+			"snapshotDigest": "12f5b949cc035411b4583ac8e1a4c1a2c4d5defdc93279a3e6002376f8bd2eb1"
+		},
+		{
+			"idx": 17,
+			"tag": "0017_retained_operation_project_index",
+			"id": "6c516ec1-6c3a-4306-85be-5397402235fb",
+			"prevId": "78cd7830-67ce-47d4-b9d8-007a26eb77c8",
+			"version": "7",
+			"snapshotDigest": "a89e13dff29a6379787913a90a79874b3099a1727acf134739ebc4ee6d32226f"
+		},
+		{
+			"idx": 18,
+			"tag": "0018_retained_revert_dependency_indexes",
+			"id": "75c4cc95-e79a-498a-aa86-6bdabde6ce39",
+			"prevId": "6c516ec1-6c3a-4306-85be-5397402235fb",
+			"version": "7",
+			"snapshotDigest": "624cdad2844fe90a65737bedc97e99e57824f50c2bb50739a4a311c4456cf8ba"
+		},
+		{
+			"idx": 19,
+			"tag": "0019_retained_linked_worktree_claims",
+			"id": "65ed2b66-16a7-44f3-8fc5-078f61173dc8",
+			"prevId": "75c4cc95-e79a-498a-aa86-6bdabde6ce39",
+			"version": "7",
+			"snapshotDigest": "72009ab1d543e374aefdeac4a0e49aa664133e5b627adeb1161a9cc1997d711b"
 		}
 	]
 }

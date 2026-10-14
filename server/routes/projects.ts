@@ -231,7 +231,7 @@ projectRoutes.post("/", async (c) => {
 				}
 
 				try {
-					projectDbManager.openForGitPath(projectId, gitPath);
+					await projectDbManager.openForGitPath(projectId, gitPath);
 					await syncProject(projectId);
 					ensureGitignoreEntry(gitPath);
 					await gitService.commitGitignoreIfDirty(gitPath, gitIdentity);
@@ -318,7 +318,7 @@ projectRoutes.post("/", async (c) => {
 
 	// Initialize project backup DB + .gitignore
 	try {
-		projectDbManager.openForGitPath(projectId, gitPath);
+		await projectDbManager.openForGitPath(projectId, gitPath);
 		await syncProject(projectId);
 		ensureGitignoreEntry(gitPath);
 		await gitService.commitGitignoreIfDirty(gitPath, gitIdentity);

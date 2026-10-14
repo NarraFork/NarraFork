@@ -78,6 +78,69 @@
 			"when": 1791435301885,
 			"tag": "0010_background_bash_kind",
 			"breakpoints": true
+		},
+		{
+			"idx": 11,
+			"version": "7",
+			"when": 1791645051663,
+			"tag": "0011_chapter_retirement_migration",
+			"breakpoints": true
+		},
+		{
+			"idx": 12,
+			"version": "7",
+			"when": 1791645485790,
+			"tag": "0012_chapter_retirement_cleanup_identity",
+			"breakpoints": true
+		},
+		{
+			"idx": 13,
+			"version": "7",
+			"when": 1791656698204,
+			"tag": "0013_legacy_root_workspace_adoption",
+			"breakpoints": true
+		},
+		{
+			"idx": 14,
+			"version": "7",
+			"when": 1791681820572,
+			"tag": "0014_legacy_root_git_namespace",
+			"breakpoints": true
+		},
+		{
+			"idx": 15,
+			"version": "7",
+			"when": 1791683815534,
+			"tag": "0015_retained_legacy_artifact_claims",
+			"breakpoints": true
+		},
+		{
+			"idx": 16,
+			"version": "7",
+			"when": 1791687478632,
+			"tag": "0016_retained_history_origin_manifest",
+			"breakpoints": true
+		},
+		{
+			"idx": 17,
+			"version": "7",
+			"when": 1791691200220,
+			"tag": "0017_retained_operation_project_index",
+			"breakpoints": true
+		},
+		{
+			"idx": 18,
+			"version": "7",
+			"when": 1791691522312,
+			"tag": "0018_retained_revert_dependency_indexes",
+			"breakpoints": true
+		},
+		{
+			"idx": 19,
+			"version": "7",
+			"when": 1791696637570,
+			"tag": "0019_retained_linked_worktree_claims",
+			"breakpoints": true
 		}
   ]
 }

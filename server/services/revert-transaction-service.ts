@@ -163,6 +163,7 @@ export interface RevertTransactionOptions {
 
 type BoundFile = {
 	manifest: TransactionManifestFile;
+	sourceOperationIds: readonly string[];
 	fixed: RevertJournalFile;
 	scope: Scope;
 	objectIdentity: string | null;
@@ -426,11 +427,27 @@ export class RevertTransactionService {
 			bound(run.usedBytes, this.maxEvidenceBytes);
 			for (const ref of manifest.rawRefs) await this.readBlob(ref, run.signal);
 			const scopes = new Map<string, Scope>();
+			const selectedOperations = new Map<string, Set<string>>();
+			for (const effect of manifest.selection.effects) {
+				const key = `${effect.identity.scopeId}:${fileChangeIdentityKey(effect.identity)}`;
+				let operations = selectedOperations.get(key);
+				if (!operations) {
+					operations = new Set();
+					selectedOperations.set(key, operations);
+				}
+				operations.add(effect.operationId);
+			}
 			for (const file of manifest.files) {
+				const sourceOperationIds = Object.freeze([
+					...(selectedOperations.get(
+						`${file.identity.scopeId}:${fileChangeIdentityKey(file.identity)}`,
+					) ?? []),
+				]);
 				const fileAccess = {
 					principal: run.request.principal,
 					owner: run.ctx.owner,
 					identity: file.identity,
+					sourceOperationIds,
 					signal: run.signal,
 				};
 				await this.options.access.authorizeFile(fileAccess);
@@ -458,7 +475,7 @@ export class RevertTransactionService {
 				scopes.set(scope.id, scope);
 				const fixed = rows.find((row) => row.sequence === file.sequence);
 				if (!fixed) throw fail("INCOMPLETE_FILES");
-				run.files.push({ manifest: file, fixed, scope, objectIdentity: null });
+				run.files.push({ manifest: file, fixed, scope, sourceOperationIds, objectIdentity: null });
 			}
 			run.worktreePaths = [...new Set([...scopes.values()].map((scope) => scope.canonicalRoot))];
 			bound(scopes.size, WORKSPACE_WRITE_COORDINATOR_LIMITS.batchScopes);
@@ -773,6 +790,7 @@ export class RevertTransactionService {
 					principal: run.request.principal,
 					owner: (run.ctx as RevertJournalContext).owner,
 					identity: guard.identity,
+					sourceOperationIds: file.sourceOperationIds,
 					signal: guard.signal,
 				}),
 			assertCurrent: async (guard) => {
@@ -852,6 +870,7 @@ export class RevertTransactionService {
 			principal: run.request.principal,
 			owner: (run.ctx as RevertJournalContext).owner,
 			identity: file.manifest.identity,
+			sourceOperationIds: file.sourceOperationIds,
 			signal,
 		});
 		// Recheck the real target AFTER the last caller-owned authorization await.

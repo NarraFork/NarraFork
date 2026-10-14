@@ -32,7 +32,7 @@ import { eq } from "drizzle-orm";
 import type { BunSQLDatabase } from "drizzle-orm/bun-sql";
 import { createPostgresClient } from "../../../../server/db/postgres-client";
 import * as pgSchema from "../../../../server/db/postgres-schema";
-import { getProjectDbPath, projectDbManager } from "../../../../server/lib/project-db";
+import { getProjectDbPath, __testing as projectDbTesting } from "../../../../server/lib/project-db";
 import { ProjectArchiveFile } from "../../../../server/services/project-archive/archive-file";
 import { copyTable } from "../../../../server/services/project-archive/export-rows";
 import type {
@@ -173,7 +173,7 @@ async function seedPg(pgDb: BunSQLDatabase): Promise<void> {
 
 /** Write the archive file from the PG main database through the port's reads. */
 async function exportArchive(pgStore: PgStore, gitPath: string): Promise<void> {
-	const pdb = projectDbManager.openForGitPath(PROJECT_ID, gitPath);
+	const pdb = projectDbTesting.initProjectDb(gitPath);
 	const chapterIds = [FIXTURE.parentChapterId, FIXTURE.childChapterId];
 	const narratorIds = [FIXTURE.parentNarratorId, FIXTURE.childNarratorId];
 	await copyTable(pgStore, pdb, "projects", {
@@ -194,7 +194,7 @@ async function exportArchive(pgStore: PgStore, gitPath: string): Promise<void> {
 	await copyTable(pgStore, pdb, "narrator_message_refs", {
 		filter: { column: "narrator_id", values: narratorIds },
 	});
-	projectDbManager.close(PROJECT_ID);
+	pdb.close();
 }
 
 /** Read every table back out of the archive file, in import order. */

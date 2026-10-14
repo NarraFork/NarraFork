@@ -27,13 +27,11 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { generateId } from "@server/lib/id";
-import { getProjectDbPath, projectDbManager } from "@server/lib/project-db";
+import { getProjectDbPath, __testing as projectDbTesting } from "@server/lib/project-db";
 import { ARCHIVE_COLUMNS, ARCHIVE_TABLE_ORDER, type ArchiveTable } from "../manifest";
 import { projectArchiveMainStore } from "../store";
 
 const tempDirs: string[] = [];
-const openedProjects: string[] = [];
 
 /**
  * Columns added by `ensureProjectToolCallTargetColumns` in `server/services/project-db-sync.ts`
@@ -51,7 +49,6 @@ const LATE_PATCHED_COLUMNS: ReadonlySet<string> = new Set([
 ]);
 
 afterAll(() => {
-	for (const projectId of openedProjects.splice(0)) projectDbManager.close(projectId);
 	for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
@@ -64,9 +61,7 @@ afterAll(() => {
 function freshArchive(): { conn: Database; gitPath: string } {
 	const gitPath = mkdtempSync(join(tmpdir(), "nf-manifest-"));
 	tempDirs.push(gitPath);
-	const projectId = generateId();
-	openedProjects.push(projectId);
-	projectDbManager.openForGitPath(projectId, gitPath);
+	projectDbTesting.initProjectDb(gitPath).close();
 	// Reopened read-only rather than reusing the cached handle: this must observe the file as it
 	// exists on disk, which is what an importing machine sees.
 	return { conn: new Database(getProjectDbPath(gitPath), { readonly: true }), gitPath };

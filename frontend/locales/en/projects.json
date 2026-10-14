@@ -1,4 +1,33 @@
 {
+	"migration": {
+		"entry": "Legacy chapters need migration",
+		"result": "View migration result",
+		"title": "Chapter retirement migration assistant",
+		"manageRequired": "Project management permission is required for the full preview and migration. Contact a project manager.",
+		"scope": "Scope: {{chapters}} chapters and {{narrators}} narrators.",
+		"action": "Migrate all chapters and delete the storyline",
+		"disableSync": "Only stop standalone DB sync",
+		"syncDisabled": "Standalone DB sync disabled",
+		"preserve": "Keep: sessions and all history, repositories, Git branches and working directories. Working directories and container volumes will not be deleted.",
+		"remove": "Delete: legacy storyline/chapter metadata and the standalone project.db, WAL and SHM files; permanently stop sync. The main database is not deleted.",
+		"permissions": "The server must verify permissions, inherited configuration and resource adoption first. Unsupported cases block migration; permissions are not bypassed and running sessions are not forcibly stopped.",
+		"confirmTitle": "Explicit confirmation required",
+		"confirmMigration": "Convert all chapters in this project to ordinary narrators, keep session history and directories, and delete legacy metadata and the standalone database?",
+		"confirmDisable": "Permanently disable this project's standalone database sync? This does not migrate sessions or delete database files. Restarting will not restore sync.",
+		"confirm": "Confirm and execute",
+		"cancel": "Back",
+		"refresh": "Refresh preview",
+		"failed": "Operation failed. Review the reason and refresh the preview:",
+		"draining": "Sync admission is disabled; waiting for existing sync tasks to drain. Migration is not complete.",
+		"drainUnconfirmed": "Sync remains disabled, but drain completion could not be confirmed. Automatic polling stopped. Refresh the preview before continuing; no migration or deletion has been reported as complete.",
+		"retryCleanup": "Retry standalone database cleanup",
+		"openNarrator": "Open retained narrator {{id}}",
+		"phase": {
+			"blocked": "Migration is blocked. Resolve the reasons below; sync can be stopped independently.",
+			"cleanup_pending": "Session conversion finished, but standalone database cleanup is pending. Cleanup can be retried.",
+			"completed": "Migration and cleanup completed. Sessions, history, repositories and working directories were retained."
+		}
+	},
 	"compatibility": {
 		"title": "Compatibility settings",
 		"source": "Configuration source: {{name}} (existing project)",

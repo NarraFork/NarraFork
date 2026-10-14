@@ -61,6 +61,11 @@ mock.module("./ProjectAccessPanel", () => ({
 		<div data-access-source={projectId}>access</div>
 	),
 }));
+mock.module("./LegacyMigrationAssistant", () => ({
+	LegacyMigrationAssistant: ({ projectId }: { projectId: string }) => (
+		<div data-migration-project={projectId}>migration.entry</div>
+	),
+}));
 const { ProjectCompatibilityPanel } = await import("./ProjectCompatibilityPanel");
 const { LegacyResourceRecovery } = await import("./LegacyResourceRecovery");
 const { api } = await import("../../lib/api");
@@ -95,6 +100,7 @@ describe("compatibility settings shell", () => {
 	test("exposes original source, ACL, workspace, device and knowledge paths in read-only mode", () => {
 		const html = render(<ProjectCompatibilityPanel projectId="original" />);
 		expect(html).toContain("original-source");
+		expect(html).toContain('data-migration-project="original"');
 		expect(html).toContain('data-access-source="original"');
 		expect(html).toContain("compatibility.readOnly");
 		expect(html.match(/disabled=""/g)?.length).toBe(4);

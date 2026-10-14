@@ -3,7 +3,7 @@ import { createHash } from "node:crypto";
 import { constants } from "node:fs";
 import { lstat, open, opendir, readlink, realpath } from "node:fs/promises";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import { eq, gt, inArray, sql } from "drizzle-orm";
+import { and, eq, gt, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import { localPathSemantics } from "../lib/agent/execution/path-semantics";
 import { AppError } from "../lib/errors";
 import { hotSafe } from "../lib/hot-safe";
@@ -22,7 +22,7 @@ export interface LifecycleTarget {
 	scopeProjectId?: string | null;
 }
 export interface ResourceClaim extends LifecycleTarget {
-	kind: "registry" | "chapter" | "narrator" | "receipt";
+	kind: "registry" | "chapter" | "narrator" | "receipt" | "legacy_artifact";
 	id: string;
 	chapterId?: string | null;
 	state?: string;
@@ -325,7 +325,15 @@ export interface LifecycleGuardPorts {
 /** Small projections only; cursor pagination never converts a truncated scan to no owners. */
 async function readClaims(deadline: number, signal?: AbortSignal) {
 	const { db } = await import("../db");
-	const { chapters, narrators, narratorWorktreeResources } = await import("../db/schema");
+	const {
+		chapters,
+		narrators,
+		narratorWorktreeResources,
+		legacyMigrationArtifactClaims: artifacts,
+	} = await import("../db/schema");
+	const { readLinkedWorktreeProtection } = await import("./legacy-linked-worktree-claims");
+	const linked = await readLinkedWorktreeProtection(db, deadline, signal);
+	if (!linked.complete) throw new Error("Linked dependency inventory incomplete");
 	const claims: ResourceClaim[] = [];
 	let bytes = 0;
 	const append = (claim: ResourceClaim) => {
@@ -334,6 +342,7 @@ async function readClaims(deadline: number, signal?: AbortSignal) {
 			throw new Error("Inventory budget exceeded");
 		claims.push(claim);
 	};
+	for (const claim of linked.claims) append(claim);
 	let cursor: string | undefined;
 	for (let page = 0; page < 32; page++) {
 		const rows = db
@@ -470,6 +479,62 @@ async function readClaims(deadline: number, signal?: AbortSignal) {
 		}
 		if (rows.length <= PAGE) break;
 		if (page === 31) throw new Error("Narrator inventory truncated");
+		cursor = rows[PAGE - 1]?.id;
+		await new Promise<void>((done) => setTimeout(done, 0));
+	}
+	// Archived ownership has no release-scope exemption and survives narrator deletion.
+	cursor = undefined;
+	for (let page = 0; page < 32; page++) {
+		const rows = await db
+			.select({
+				id: artifacts.id,
+				deviceId: artifacts.deviceId,
+				workspacePath: artifacts.workspacePath,
+				artifactPath: artifacts.artifactPath,
+				shadowKey: artifacts.shadowKey,
+				state: artifacts.state,
+			})
+			.from(artifacts)
+			.where(
+				and(
+					or(
+						ne(artifacts.state, "released"),
+						isNull(artifacts.state),
+						isNull(artifacts.ownerUserId),
+					),
+					cursor ? gt(artifacts.id, cursor) : undefined,
+				),
+			)
+			.orderBy(artifacts.id)
+			.limit(PAGE + 1);
+		for (const row of rows.slice(0, PAGE)) {
+			if (
+				!row.deviceId ||
+				row.deviceId.length > 256 ||
+				row.deviceId.includes("\0") ||
+				[row.workspacePath, row.artifactPath].some(
+					(path) => !path || path.length > 4096 || path.includes("\0"),
+				)
+			)
+				throw new Error("Legacy artifact identity unavailable");
+			append({
+				kind: "legacy_artifact",
+				id: row.id,
+				deviceId: row.deviceId,
+				path: row.artifactPath,
+				...(row.shadowKey ? { shadowKey: row.shadowKey } : {}),
+				state: row.state,
+			});
+			append({
+				kind: "legacy_artifact",
+				id: row.id,
+				deviceId: row.deviceId,
+				path: row.workspacePath,
+				state: row.state,
+			});
+		}
+		if (rows.length <= PAGE) break;
+		if (page === 31) throw new Error("Artifact inventory truncated");
 		cursor = rows[PAGE - 1]?.id;
 		await new Promise<void>((done) => setTimeout(done, 0));
 	}

@@ -1,0 +1,2 @@
+CREATE INDEX "idx_revert_file_scope" ON "revert_operation_files" USING btree ("scope_id","id");--> statement-breakpoint
+CREATE INDEX "idx_revert_operation_project" ON "revert_operations" USING btree ("project_id","id");

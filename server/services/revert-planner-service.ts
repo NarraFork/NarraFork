@@ -66,6 +66,8 @@ export interface RevertPlannerFileAccess {
 	principal: NarratorPrincipal;
 	owner: RevertPlanOwner;
 	identity: FileChangeIdentity;
+	/** Actual operation PKs from the fixed validated selection; never caller authority. */
+	sourceOperationIds?: readonly string[];
 	signal: AbortSignal;
 }
 /** Actual authorized backend capability, NOT an unverified path or a subject label. */
@@ -301,7 +303,13 @@ export class RevertPlannerService {
 			const files: PreparedFile[] = [];
 			for (const [, effects] of [...groups].sort(([a], [b]) => a.localeCompare(b))) {
 				const identity = effects[0].identity;
-				const context = await this.target(fixed, owner, identity, work);
+				const context = await this.target(
+					fixed,
+					owner,
+					identity,
+					work,
+					effects.map((effect) => effect.operationId),
+				);
 				const observed = await this.current(context, work, FILE_CHANGE_LIMITS.blobBytes);
 				work.addRef(stateRef(observed.state));
 				if (observed.raw) {
@@ -475,7 +483,15 @@ export class RevertPlannerService {
 			if (freshOwner.projectId !== owner.projectId)
 				throw fail("STALE", "The authorized project context changed");
 			for (const file of files) {
-				const context = await this.target(fixed, owner, file.identity, work);
+				const context = await this.target(
+					fixed,
+					owner,
+					file.identity,
+					work,
+					(groups.get(fileChangeIdentityKey(file.identity)) ?? []).map(
+						(effect) => effect.operationId,
+					),
+				);
 				if (
 					file.executionBinding.deviceId !== context.target.executionBinding.deviceId ||
 					file.executionBinding.runtimeEpoch !== context.target.executionBinding.runtimeEpoch ||
@@ -595,8 +611,15 @@ export class RevertPlannerService {
 		owner: RevertPlanOwner,
 		identity: FileChangeIdentity,
 		work: Work,
+		sourceOperationIds: readonly string[],
 	): Promise<FileContext> {
-		const access = { principal: request.principal, owner, identity, signal: work.signal };
+		const access = {
+			principal: request.principal,
+			owner,
+			identity,
+			sourceOperationIds: Object.freeze([...new Set(sourceOperationIds)]),
+			signal: work.signal,
+		};
 		await work.wait(this.options.access.authorizeFile(access));
 		const resolved = await work.wait(this.options.access.resolveFile(access));
 		if (typeof resolved?.assertCurrent !== "function" || typeof resolved.readCurrent !== "function")

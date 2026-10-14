@@ -741,15 +741,14 @@ describe("shadow repository repair", () => {
 		expect(await worktreeTreeSnapshot.getRef(worktree, SNAPSHOT_HEAD_REF)).toBe(snap.commitSha);
 	});
 
-	test("still removes a directory with no objects and no refs", async () => {
-		// Nothing to lose here, so deleting is the correct outcome — the repair must not
-		// turn the sweep into a no-op that leaves junk accumulating forever.
+	test("retains a directory with no objects and no refs", async () => {
+		// Missing HEAD/empty listings are not deletion authority. Repair never removes data.
 		const empty = getNarraforkPath("tree-snapshots", `deadbeef${generateId().slice(0, 8)}`);
 		mkdirSync(join(empty, "objects", "pack"), { recursive: true });
 		mkdirSync(join(empty, "refs"), { recursive: true });
 		try {
 			await worktreeTreeSnapshot.gcAll();
-			expect(existsSync(empty)).toBe(false);
+			expect(existsSync(empty)).toBe(true);
 		} finally {
 			rmSync(empty, { recursive: true, force: true });
 		}

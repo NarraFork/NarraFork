@@ -76,7 +76,14 @@ import { exportLegacyProjectOnWorker } from "./project-archive/legacy-sync-job";
 import { PROJECT_ARCHIVE_LIMITS } from "./project-archive/limits";
 import type { ArchiveTable } from "./project-archive/manifest";
 import { projectArchiveMainStore as mainStore } from "./project-archive/store";
+import {
+	legacySyncDisabledError,
+	onLegacySyncDisabled,
+	trackedLegacyProjectSync,
+} from "./project-db-sync-coordinator";
 import { createNarratorSyncScheduler } from "./project-db-sync-scheduler";
+
+export { disableLegacyProjectSync } from "./project-db-sync-coordinator";
 
 // === Helpers ===
 
@@ -171,17 +178,80 @@ async function replaceById(
 	return rows[0] ?? 0;
 }
 
+// Every entry which holds a connection across awaits is registered until its final cleanup.
+export async function syncProject(projectId: string): Promise<void> {
+	await trackedLegacyProjectSync(projectId, () => syncProjectImpl(projectId));
+}
+async function syncChapter(chapterId: string): Promise<void> {
+	const projectId = await projectIdForChapter(chapterId);
+	if (projectId) await trackedLegacyProjectSync(projectId, () => syncChapterImpl(chapterId));
+}
+async function syncChapterEdgesForProject(projectId: string): Promise<void> {
+	await trackedLegacyProjectSync(projectId, () => syncChapterEdgesForProjectImpl(projectId));
+}
+async function syncChapterCommits(chapterId: string, control: ExportControl = {}): Promise<void> {
+	const projectId = await projectIdForChapter(chapterId);
+	if (projectId)
+		await trackedLegacyProjectSync(projectId, (signal) =>
+			syncChapterCommitsImpl(chapterId, {
+				...control,
+				signal: control.signal ? AbortSignal.any([signal, control.signal]) : signal,
+			}),
+		);
+}
+async function syncNarratorMessagesIntoProject(
+	narratorId: string,
+	projectId: string,
+): Promise<NarratorMessageSyncStats | null> {
+	return (
+		(await trackedLegacyProjectSync(projectId, () =>
+			syncNarratorMessagesIntoProjectImpl(narratorId, projectId),
+		)) ?? null
+	);
+}
+async function syncExplorationGroups(
+	projectId: string,
+	control: ExportControl = {},
+): Promise<number> {
+	return (
+		(await trackedLegacyProjectSync(projectId, () =>
+			syncExplorationGroupsImpl(projectId, control),
+		)) ?? 0
+	);
+}
+async function syncMergeSessions(projectId: string, control: ExportControl = {}): Promise<void> {
+	await trackedLegacyProjectSync(projectId, () => syncMergeSessionsImpl(projectId, control));
+}
+async function deleteChapterFromProjectDb(chapterId: string, projectId: string): Promise<void> {
+	await trackedLegacyProjectSync(projectId, () =>
+		deleteChapterFromProjectDbImpl(chapterId, projectId),
+	);
+}
+export async function fullSync(
+	projectId: string,
+	options: FullSyncOptions = {},
+): Promise<{ tables: Record<string, number> }> {
+	const result = await trackedLegacyProjectSync(projectId, (signal) =>
+		fullSyncImpl(projectId, {
+			...options,
+			signal: options.signal ? AbortSignal.any([signal, options.signal]) : signal,
+		}),
+	);
+	if (!result) throw legacySyncDisabledError();
+	return result;
+}
+
 // === Sync functions ===
 
 /** Sync a single project record. */
-export async function syncProject(projectId: string): Promise<void> {
+async function syncProjectImpl(projectId: string): Promise<void> {
 	const pdb = await getProjectDb(projectId);
 	if (!pdb) return;
 	await copyById(pdb, "projects", "id", [projectId]);
 }
 
 /** Sync a single chapter record. */
-async function syncChapter(chapterId: string): Promise<void> {
+async function syncChapterImpl(chapterId: string): Promise<void> {
 	const projectId = await projectIdForChapter(chapterId);
 	if (!projectId) return;
 	const pdb = await getProjectDb(projectId);
@@ -190,7 +260,7 @@ async function syncChapter(chapterId: string): Promise<void> {
 }
 
 /** Sync chapter edges for a project (delete-then-insert to handle removals). */
-async function syncChapterEdgesForProject(projectId: string): Promise<void> {
+async function syncChapterEdgesForProjectImpl(projectId: string): Promise<void> {
 	const pdb = await getProjectDb(projectId);
 	if (!pdb) return;
 	await replaceById(
@@ -203,7 +273,10 @@ async function syncChapterEdgesForProject(projectId: string): Promise<void> {
 }
 
 /** Sync chapter commits for a single chapter (delete-then-insert). */
-async function syncChapterCommits(chapterId: string, control: ExportControl = {}): Promise<void> {
+async function syncChapterCommitsImpl(
+	chapterId: string,
+	control: ExportControl = {},
+): Promise<void> {
 	const projectId = await projectIdForChapter(chapterId);
 	if (!projectId) return;
 	const pdb = await getProjectDb(projectId);
@@ -221,8 +294,10 @@ async function syncChapterCommits(chapterId: string, control: ExportControl = {}
 /** Sync a single narrator record. */
 async function syncNarrator(narratorId: string): Promise<void> {
 	for (const projectId of await projectIdsForNarrator(narratorId)) {
-		const pdb = await getProjectDb(projectId);
-		if (pdb) await copyById(pdb, "narrators", "id", [narratorId]);
+		await trackedLegacyProjectSync(projectId, async () => {
+			const pdb = await getProjectDb(projectId);
+			if (pdb) await copyById(pdb, "narrators", "id", [narratorId]);
+		});
 	}
 }
 
@@ -249,7 +324,7 @@ async function syncNarratorMessages(narratorId: string): Promise<NarratorMessage
 	return stats;
 }
 
-async function syncNarratorMessagesIntoProject(
+async function syncNarratorMessagesIntoProjectImpl(
 	narratorId: string,
 	projectId: string,
 ): Promise<NarratorMessageSyncStats | null> {
@@ -326,7 +401,7 @@ async function syncNarratorMessagesIntoProject(
 }
 
 /** Sync exploration groups for a project (delete-then-insert). */
-async function syncExplorationGroups(
+async function syncExplorationGroupsImpl(
 	projectId: string,
 	control: ExportControl = {},
 ): Promise<number> {
@@ -343,7 +418,10 @@ async function syncExplorationGroups(
 }
 
 /** Sync merge sessions for a project (delete-then-insert via target chapter). */
-async function syncMergeSessions(projectId: string, control: ExportControl = {}): Promise<void> {
+async function syncMergeSessionsImpl(
+	projectId: string,
+	control: ExportControl = {},
+): Promise<void> {
 	const pdb = await getProjectDb(projectId);
 	if (!pdb) return;
 	const chapterRows = await db
@@ -431,7 +509,7 @@ function cleanupOrphanMessages(pdb: Database): void {
  * - cleanup: chapter still exists in main DB (status → abandoned), just sync it
  * - remove: chapter already deleted from main DB, purge from the archive
  */
-async function deleteChapterFromProjectDb(chapterId: string, projectId: string): Promise<void> {
+async function deleteChapterFromProjectDbImpl(chapterId: string, projectId: string): Promise<void> {
 	// If the chapter still exists in the main DB (cleanup scenario), just sync the updated status.
 	const row = await db.query.chapters.findFirst({
 		where: eq(chapters.id, chapterId),
@@ -538,7 +616,7 @@ export interface FullSyncOptions {
 }
 
 /** Full sync: export all project data from the main DB to the archive. */
-export async function fullSync(
+async function fullSyncImpl(
 	projectId: string,
 	options: FullSyncOptions = {},
 ): Promise<{ tables: Record<string, number> }> {
@@ -679,16 +757,23 @@ const MESSAGE_SYNC_MIN_INTERVAL_MS = 10_000;
 /** An event-driven narrator sync slower than this is logged with its sizes. */
 const SLOW_NARRATOR_SYNC_MS = 500;
 
-async function runNarratorSync(narratorId: string): Promise<void> {
+async function runNarratorSync(narratorId: string, onlyProjectId?: string): Promise<void> {
 	const startedAt = performance.now();
 	try {
-		await syncNarrator(narratorId);
+		if (onlyProjectId) {
+			await trackedLegacyProjectSync(onlyProjectId, async () => {
+				const pdb = await getProjectDb(onlyProjectId);
+				if (pdb) await copyById(pdb, "narrators", "id", [narratorId]);
+			});
+		} else await syncNarrator(narratorId);
 	} catch (err) {
 		logger.warn("Project DB narrator sync failed", { narratorId, error: String(err) });
 	}
 	let stats: NarratorMessageSyncStats | null = null;
 	try {
-		stats = await syncNarratorMessages(narratorId);
+		stats = onlyProjectId
+			? await syncNarratorMessagesIntoProject(narratorId, onlyProjectId)
+			: await syncNarratorMessages(narratorId);
 	} catch (err) {
 		logger.warn("Project DB message sync failed", { narratorId, error: String(err) });
 	}
@@ -701,14 +786,29 @@ async function runNarratorSync(narratorId: string): Promise<void> {
 const narratorSyncScheduler = createNarratorSyncScheduler({
 	debounceMs: MESSAGE_DEBOUNCE_MS,
 	minIntervalMs: MESSAGE_SYNC_MIN_INTERVAL_MS,
-	run: runNarratorSync,
+	run: async (key) => {
+		const [projectId, narratorId] = key.split(":");
+		await trackedLegacyProjectSync(projectId, () => runNarratorSync(narratorId, projectId));
+	},
 	onError: (narratorId, err) => {
 		logger.warn("Project DB narrator sync failed", { narratorId, error: String(err) });
 	},
 });
 
-function debouncedNarratorSync(narratorId: string): void {
-	narratorSyncScheduler.schedule(narratorId);
+onLegacySyncDisabled(
+	(projectId) => {
+		narratorSyncScheduler.cancelWhere((key) => key.startsWith(`${projectId}:`));
+	},
+	"project-db-sync:narrator-scheduler",
+	() => narratorSyncScheduler.dispose(),
+);
+
+async function debouncedNarratorSync(narratorId: string): Promise<void> {
+	for (const projectId of await projectIdsForNarrator(narratorId)) {
+		await trackedLegacyProjectSync(projectId, async () => {
+			narratorSyncScheduler.schedule(`${projectId}:${narratorId}`);
+		});
+	}
 }
 
 /** Internal entry points exposed for tests only. */
@@ -804,12 +904,12 @@ async function handleEvent(event: NarraForkEvent): Promise<void> {
 
 		// Narrator lifecycle — debounced
 		case "narrator:message": {
-			debouncedNarratorSync(event.narratorId);
+			await debouncedNarratorSync(event.narratorId);
 			break;
 		}
 		case "narrator:status_changed":
 		case "narrator:title_updated": {
-			debouncedNarratorSync(event.narratorId);
+			await debouncedNarratorSync(event.narratorId);
 			break;
 		}
 		case "narrator:forked": {

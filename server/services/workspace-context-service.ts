@@ -17,6 +17,7 @@ import { narraforkDir } from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { executionPolicyEngine } from "./execution-policy/engine";
 import { gitWorkspaceIdentity, probeLocalGitWorkspace } from "./git-workspace";
+import { canUseLegacyWorkspaceRollbackBridge } from "./legacy-workspace-rollback-bridge";
 import { resolveNarratorSessionCwd } from "./narrator-cwd";
 import {
 	type ActiveNarrator,
@@ -57,7 +58,7 @@ export async function withWorkspaceRepositoryLock<T>(
 /** M0 has no cross-directory restore engine: do not reinterpret old trees under the new cwd. */
 export async function assertWorkspaceHistoryRevertSupported(narratorId: string): Promise<void> {
 	const row = await loadWorkspaceRow(narratorId);
-	if (row.workspaceRevision > 0)
+	if (row.workspaceRevision > 0 && !(await canUseLegacyWorkspaceRollbackBridge(row)))
 		throw workspaceConflict(
 			"File rollback across a changed workspace context is unsupported (M0)",
 			"WORKSPACE_REVERT_UNSUPPORTED",

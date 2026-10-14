@@ -1,9 +1,10 @@
 import { Alert, Button, Card, Group, Loader, Stack, Text, Title } from "@mantine/core";
 import { Link } from "@tanstack/react-router";
-import { lazy, Suspense, useState } from "react";
+import { lazy, Suspense, useCallback, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useProjectAccess } from "../../hooks/useProjectAccess";
 import { useProject } from "../../hooks/useProjects";
+import { LegacyMigrationAssistant } from "./LegacyMigrationAssistant";
 import { ProjectAccessPanel } from "./ProjectAccessPanel";
 
 const ProjectSettingsModal = lazy(() =>
@@ -20,7 +21,27 @@ const ProjectCommandsModal = lazy(() =>
 );
 
 /** Reuses the original project storage and permission gate. No cwd-based project discovery. */
-export function ProjectCompatibilityPanel({ projectId }: { projectId: string }) {
+export function ProjectCompatibilityPanel({
+	projectId,
+	onCompleted,
+}: {
+	projectId: string;
+	onCompleted?: () => void;
+}) {
+	const [completedProjectId, setCompletedProjectId] = useState<string | null>(null);
+	const completed = useCallback(() => {
+		setCompletedProjectId(projectId);
+		onCompleted?.();
+	}, [projectId, onCompleted]);
+	return (
+		<Stack>
+			<LegacyMigrationAssistant projectId={projectId} onCompleted={completed} />
+			{completedProjectId !== projectId && <ProjectCompatibilitySettings projectId={projectId} />}
+		</Stack>
+	);
+}
+
+function ProjectCompatibilitySettings({ projectId }: { projectId: string }) {
 	const { t } = useTranslation("projects");
 	const project = useProject(projectId);
 	const access = useProjectAccess(projectId);

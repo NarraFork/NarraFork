@@ -16,6 +16,7 @@ import { ChapterForkModal } from "../../components/chapter/ChapterForkModal";
 import { clearHighlightCache } from "../../components/narrator/markdown/highlight-cache";
 import { serializeSeedEnvelope } from "../../components/narrator/panels/layout-envelope";
 import { twoNarratorWorkspaceSeed } from "../../components/narrator/workspace/dockview-layout";
+import { LegacyMigrationAssistant } from "../../components/project/LegacyMigrationAssistant";
 import { legacyRouteErrorKey } from "../../components/project/legacy-chapter-redirect";
 import { clearShikiTokenCache } from "../../lib/shiki-token-cache";
 
@@ -493,6 +494,7 @@ function NarratorDetailPage() {
 					isolation: "isolate",
 				}}
 			>
+				<LegacyMigrationAssistant projectId={projectId ?? parentProjectId} autoOpen />
 				<FocusChatHost
 					narratorId={narratorId}
 					isMobile={isMobile}

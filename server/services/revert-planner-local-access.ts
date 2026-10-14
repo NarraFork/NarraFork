@@ -10,6 +10,7 @@ import {
 import { and, eq, sql } from "drizzle-orm";
 import { db } from "../db";
 import {
+	legacyNarratorWorkspaceAdoptions,
 	narratorMessageRefs,
 	narratorMessages,
 	narrators,
@@ -32,6 +33,11 @@ import {
 	type LocalFileChangeRuntime,
 	localFileChangeRuntimeBinding,
 } from "./file-change-runtime";
+import {
+	areAuthorizedModernRetainedFileSources,
+	getAuthorizedLegacyRetainedHistoryOrigin,
+} from "./legacy-retained-history-origin";
+import { canUseLegacyWorkspaceRollbackBridge } from "./legacy-workspace-rollback-bridge";
 import { assertNarratorAccess, type NarratorAclRow, type NarratorPrincipal } from "./narrator-acl";
 import { resolveNarratorProjectId } from "./narrator-project";
 import type { ScopedRevertUnavailableReason } from "./narrator-scoped-revert";
@@ -117,6 +123,8 @@ export class RevertPlannerLocalAccess implements RevertPlannerAccess {
 				chapterId: narrators.chapterId,
 				contextProjectId: narrators.contextProjectId,
 				cwd: narrators.cwd,
+				workspaceRevision: narrators.workspaceRevision,
+				workspaceContext: narrators.workspaceContext,
 			})
 			.from(narrators)
 			.where(eq(narrators.id, narratorId))
@@ -166,6 +174,33 @@ export class RevertPlannerLocalAccess implements RevertPlannerAccess {
 		if (!owner.narratorId || owner.subjectKey !== `human:${principal.userId}`)
 			throw new NotFoundError("Revert plan", "owner");
 		const context = await this.narrator(principal, owner.narratorId, signal);
+		const adoption = db
+			.select({ mode: legacyNarratorWorkspaceAdoptions.proofMode })
+			.from(legacyNarratorWorkspaceAdoptions)
+			.where(eq(legacyNarratorWorkspaceAdoptions.narratorId, owner.narratorId))
+			.limit(1)
+			.get();
+		if (adoption?.mode === "retained") {
+			const origin = await getAuthorizedLegacyRetainedHistoryOrigin(owner.narratorId, principal);
+			if (!origin) throw stale("Retained history origin is unavailable");
+			if (
+				origin.scopeIds.includes(identity.scopeId) &&
+				!(await canUseLegacyWorkspaceRollbackBridge(context.row, principal))
+			) {
+				const modern =
+					input.sourceOperationIds &&
+					(await areAuthorizedModernRetainedFileSources(
+						owner.narratorId,
+						principal,
+						identity,
+						input.sourceOperationIds,
+						signal,
+					));
+				if (!modern) throw stale("Retained history workspace incarnation changed");
+			}
+			// A preserved scope ID is provenance only; normal scope coverage, source,
+			// lease fencing, namespace and current-file checks below remain mandatory.
+		}
 		if (context.projectId !== owner.projectId) throw stale("Narrator project changed");
 		// The recorded actual target, not the narrator's current default device, owns
 		// this evidence. Current cwd/write-boundary and live scope checks still apply.

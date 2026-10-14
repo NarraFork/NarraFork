@@ -2,18 +2,31 @@ import { existsSync } from "node:fs";
 import { resolve } from "node:path";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
-import { db } from "../db";
+import { activeDatabaseBackend, db } from "../db";
 import { projects } from "../db/schema";
-import { NotFoundError, ValidationError } from "../lib/errors";
+import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { narratorPrincipalOf } from "../lib/narrator-access";
 import { getHome } from "../lib/platform";
 import { requireProjectAccess } from "../lib/project-access";
 import { getProjectDbPath } from "../lib/project-db";
 import { importProjectSchema } from "../lib/validators";
-import { fullSync } from "../services/project-db-sync";
+import { disableLegacyProjectSync, fullSync } from "../services/project-db-sync";
 import { importProject } from "../services/project-import";
 
 export const projectDbRoutes = new Hono();
+
+/** One-way retirement of the legacy portable database sync. */
+projectDbRoutes.post("/:id/legacy-sync/disable", async (c) => {
+	if (activeDatabaseBackend !== "sqlite") {
+		throw new AppError(
+			"Legacy project sync retirement is only supported on SQLite",
+			503,
+			"LEGACY_PROJECT_SYNC_UNSUPPORTED",
+		);
+	}
+	await requireProjectAccess(c, c.req.param("id"), "manage");
+	return c.json(await disableLegacyProjectSync(c.req.param("id")));
+});
 
 /** POST /api/projects/:id/backup/sync — Trigger full sync to project DB. */
 projectDbRoutes.post("/:id/backup/sync", async (c) => {

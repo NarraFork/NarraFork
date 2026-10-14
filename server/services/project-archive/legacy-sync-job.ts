@@ -1,12 +1,43 @@
 import type { Worker } from "node:worker_threads";
 import { AppError } from "../../lib/errors";
+import { legacySyncDisabledError, trackedLegacyProjectSync } from "../project-db-sync-coordinator";
 import type { LegacySyncWorkerRequest } from "./legacy-sync-worker";
 import { PROJECT_ARCHIVE_LIMITS as LIMITS } from "./limits";
 import { startPrivateArchiveWorker } from "./worker-client";
 
+export async function exportLegacyProjectOnWorker(
+	request: Omit<LegacySyncWorkerRequest, "cancellation">,
+	signal: AbortSignal = new AbortController().signal,
+): Promise<{ tables: Record<string, number> }> {
+	const result = await trackedLegacyProjectSync(request.projectId, (stop) =>
+		exportLegacyProjectOnWorkerImpl(request, AbortSignal.any([signal, stop])),
+	);
+	if (!result) throw legacySyncDisabledError();
+	return result;
+}
+
+async function terminateWriter(worker: Worker): Promise<void> {
+	if (worker.threadId === -1) return;
+	let finishExit = () => {};
+	const exited = new Promise<void>((resolveExit) => {
+		finishExit = resolveExit;
+	});
+	worker.once("exit", finishExit);
+	try {
+		await worker.terminate();
+	} catch (error) {
+		// A failed terminate request is not proof that the writer stopped. Remain tracked
+		// until actual exit; disable may truthfully time out in the meantime.
+		await exited;
+		throw error;
+	} finally {
+		worker.removeListener("exit", finishExit);
+	}
+}
+
 let workers = 0;
 /** Fixed queue cap; only narrow metadata crosses the thread boundary. */
-export async function exportLegacyProjectOnWorker(
+async function exportLegacyProjectOnWorkerImpl(
 	request: Omit<LegacySyncWorkerRequest, "cancellation">,
 	signal: AbortSignal = new AbortController().signal,
 ): Promise<{ tables: Record<string, number> }> {
@@ -65,7 +96,10 @@ export async function exportLegacyProjectOnWorker(
 		clearTimeout(timeout);
 		clearTimeout(force);
 		signal.removeEventListener("abort", abort);
-		await activeWorker?.terminate();
-		workers--;
+		try {
+			if (activeWorker) await terminateWriter(activeWorker);
+		} finally {
+			workers--;
+		}
 	}
 }

@@ -28,6 +28,7 @@ import { contentJsonHasImageBlocks, getUploadsDir } from "../lib/uploads";
 import { dropRecentlyAttributed } from "./file-attribution-service";
 import { dropStatus } from "./git-status-cache";
 import { gitWorkspaceIdentity, probeLocalGitWorkspace } from "./git-workspace";
+import { hasLegacyMigrationArtifactClaim } from "./legacy-migration-artifact-claims";
 import { readWorktreeReceiptProtection } from "./narrator-worktree-journal";
 import {
 	isRegisteredNarratorWorktree,
@@ -969,29 +970,42 @@ export async function cleanupOrphanedIgnoredArchives(): Promise<{
 	let freedBytes = 0;
 	try {
 		const entries = await readdir(baseDir, { withFileTypes: true });
-		const liveChapterIds = new Set(
-			db
-				.select({ id: chapters.id })
-				.from(chapters)
-				.all()
-				.map((row) => row.id),
-		);
 		for (const entry of entries) {
 			if (!entry.isDirectory()) continue;
-			if (liveChapterIds.has(entry.name)) continue;
+			const chapterExists = () =>
+				!!db
+					.select({ id: chapters.id })
+					.from(chapters)
+					.where(eq(chapters.id, entry.name))
+					.limit(1)
+					.get();
+			if (chapterExists()) continue;
 			const dirPath = resolve(baseDir, entry.name);
+			const lookup = { deviceId: "local", artifactPath: dirPath, sourceChapterId: entry.name };
+			if (await hasLegacyMigrationArtifactClaim(lookup)) continue;
 			// Per directory, not around the loop: one unreadable or permission-denied
 			// archive must not stop the sweep, because everything after it would then stay
 			// on disk indefinitely while the caller was told the clean-up ran.
 			try {
-				const size = await dirSize(dirPath);
-				await rm(dirPath, { recursive: true, force: true });
-				removed++;
-				freedBytes += size;
-				logger.info("Removed an ignored-file archive with no chapter", {
-					chapterId: entry.name,
-					size,
-				});
+				await withProtectionReservation(
+					[{ deviceId: "local", path: dirPath }],
+					"ignored archive sweep",
+					async () => {
+						const size = await dirSize(dirPath);
+						if (chapterExists() || (await hasLegacyMigrationArtifactClaim(lookup))) return;
+						const frozen = await revalidateLifecycleTarget(dirPath);
+						const identity = await lstat(frozen);
+						if (!identity.isDirectory() || identity.isSymbolicLink()) return;
+						await rm(frozen, { recursive: true, force: true });
+						await confirmLifecyclePathRemoved(frozen);
+						removed++;
+						freedBytes += size;
+						logger.info("Removed an ignored-file archive with no chapter or retained claim", {
+							chapterId: entry.name,
+							size,
+						});
+					},
+				);
 			} catch (err) {
 				logger.warn("Could not remove an orphaned ignored-file archive", {
 					chapterId: entry.name,

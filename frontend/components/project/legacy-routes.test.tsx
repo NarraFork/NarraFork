@@ -15,6 +15,13 @@ let sessions: {
 	isError: boolean;
 	error?: unknown;
 };
+let mapping: {
+	data?: { narratorId: string | null; projectId: string };
+	isLoading: boolean;
+	isError: boolean;
+	error?: unknown;
+};
+let mappingEnabled: boolean | undefined;
 const navigate = mock(async (_target: unknown) => {});
 const create = mock(async () => {});
 const remove = mock(async () => {});
@@ -48,7 +55,11 @@ mock.module("@mantine/core", () => ({
 }));
 mock.module("react-i18next", () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
 mock.module("@tanstack/react-query", () => ({
-	useQuery: (options: { enabled?: boolean }) => {
+	useQuery: (options: { enabled?: boolean; queryKey: unknown[] }) => {
+		if (options.queryKey[0] === "legacy-chapter-target") {
+			mappingEnabled = options.enabled;
+			return mapping;
+		}
 		listEnabled = options.enabled;
 		return sessions;
 	},
@@ -77,6 +88,19 @@ mock.module("./ProjectCompatibilityPanel", () => ({
 		<div data-configuration-source={projectId}>original configuration</div>
 	),
 }));
+mock.module("./LegacyMigrationAssistant", () => ({
+	LegacyMigrationAssistant: ({
+		projectId,
+		autoOpen,
+	}: {
+		projectId: string;
+		autoOpen?: boolean;
+	}) => (
+		<div data-migration-project={projectId} data-migration-auto={autoOpen}>
+			migration.entry
+		</div>
+	),
+}));
 const { NarratorCompatibilityEntry } = await import("./NarratorCompatibilityEntry");
 const { Route } = await import("../../routes/chapters/$chapterId");
 const Page = Route.options.component as ComponentType;
@@ -91,6 +115,8 @@ beforeEach(() => {
 		isError: false,
 	};
 	sessions = { data: [], isLoading: false, isError: false };
+	mapping = { isLoading: false, isError: true, error: { status: 404 } };
+	mappingEnabled = undefined;
 	navigate.mockClear();
 	create.mockClear();
 	remove.mockClear();
@@ -157,6 +183,11 @@ describe("legacy route terminal states", () => {
 	test("empty primary session lists terminate loading and retain direct recovery", async () => {
 		await render();
 		expect(container.textContent).toContain("legacyRoute.empty");
+		expect(
+			container
+				.querySelector('[data-migration-project="old-project"]')
+				?.getAttribute("data-migration-auto"),
+		).toBe("true");
 		expect(container.querySelector("[data-loader]")).toBeNull();
 		expect(container.querySelector('[data-recovery="old-chapter"]')).not.toBeNull();
 		expect(navigate).not.toHaveBeenCalled();
@@ -174,6 +205,7 @@ describe("legacy route terminal states", () => {
 			`legacyRoute.${status === 401 || status === 403 ? "denied" : status === 404 ? "missing" : "error"}`,
 		);
 		expect(listEnabled).toBe(false);
+		expect(mappingEnabled).toBe(status === 404);
 		expect(navigate).not.toHaveBeenCalled();
 	});
 	test("session query failure has a terminal state instead of a perpetual loader", async () => {
@@ -196,6 +228,67 @@ describe("legacy route terminal states", () => {
 			hash: "msg-existing",
 			replace: true,
 		});
+	});
+	test("deleted chapter uses authorized mapping and preserves the original origin and hash", async () => {
+		chapter = { isError: true, isLoading: false, error: { status: 404 } };
+		mapping = {
+			isError: false,
+			isLoading: false,
+			data: { narratorId: "retained", projectId: "deleted-project" },
+		};
+		await render();
+		expect(mappingEnabled).toBe(true);
+		expect(navigate.mock.calls[0]?.[0]).toEqual({
+			to: "/narrators/$narratorId",
+			params: { narratorId: "retained" },
+			search: { from: "search" },
+			hash: "msg-existing",
+			replace: true,
+		});
+	});
+	test.each([
+		401, 403,
+	])("denied chapter %i never uses a cached migration target", async (status) => {
+		chapter = { isError: true, isLoading: false, error: { status } };
+		mapping = { isError: false, isLoading: false, data: { narratorId: "cached", projectId: "p" } };
+		await render();
+		expect(mappingEnabled).toBe(false);
+		expect(navigate).not.toHaveBeenCalled();
+		expect(container.textContent).toContain("legacyRoute.denied");
+	});
+	test("migrated empty chapter shows completion and sessions link without querying removed project", async () => {
+		chapter = { isError: true, isLoading: false, error: { status: 404 } };
+		mapping = {
+			isError: false,
+			isLoading: false,
+			data: { narratorId: null, projectId: "deleted-project" },
+		};
+		await render();
+		expect(container.textContent).toContain("legacyRoute.migratedEmpty");
+		expect(container.querySelector('a[href="/narrators"]')).not.toBeNull();
+		expect(container.querySelector("[data-migration-project]")).toBeNull();
+		expect(container.querySelector("[data-configuration-source]")).toBeNull();
+		expect(navigate).not.toHaveBeenCalled();
+	});
+	test("mapping lookup denial is terminal and cannot use stale cached target", async () => {
+		chapter = { isError: true, isLoading: false, error: { status: 404 } };
+		mapping = {
+			isError: true,
+			isLoading: false,
+			error: { status: 403 },
+			data: { narratorId: "cached", projectId: "p" },
+		};
+		await render();
+		expect(container.textContent).toContain("legacyRoute.denied");
+		expect(navigate).not.toHaveBeenCalled();
+		expect(container.querySelector("[data-loader]")).toBeNull();
+	});
+	test("pending mapping lookup has a bounded-query loading state", async () => {
+		chapter = { isError: true, isLoading: false, error: { status: 404 } };
+		mapping = { isError: false, isLoading: true };
+		await render();
+		expect(container.querySelector("[data-loader]")).not.toBeNull();
+		expect(navigate).not.toHaveBeenCalled();
 	});
 	test("only pending requests render a loader", async () => {
 		chapter = { isError: false, isLoading: true };
