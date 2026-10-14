@@ -59,6 +59,8 @@ function readTarget(value: unknown): CommunicationTarget {
 	)
 		result.receiptDisposition = raw.receiptDisposition;
 	// Consumption is a protocol field, never a projected preview or inferred message property.
+	if (typeof raw.injectionId === "string") result.injectionId = raw.injectionId;
+	if (typeof raw.injectionStatus === "string") result.injectionStatus = raw.injectionStatus;
 	if (typeof raw.injectionConsumedAt === "string")
 		result.injectionConsumedAt = raw.injectionConsumedAt;
 	if (typeof raw.awaited === "boolean") result.awaited = raw.awaited;

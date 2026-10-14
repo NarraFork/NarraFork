@@ -3689,6 +3689,7 @@ function buildCommunicationBubbleData(
 	const messageTruncated = sourceTruncated || preview.truncated;
 	const targets = resolveCommunicationTargets(metadata, asObject(item.tc)._sendDeliveryTargets);
 	const awaitReply =
+		item.tc.toolName !== "NarratorSend" &&
 		item.tc.toolName === "Send" &&
 		(typeof input.await === "boolean" ? input.await : metadata.await === true);
 	const deliveryState = deriveCommunicationState({

@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PluginStorage, PluginStorageError } from "@server/services/plugin-storage";
@@ -203,5 +203,78 @@ describe("PluginStorage", () => {
 		await expect(
 			storage.set({ pluginId: "com.other.plugin", scope: userScope, key: "x", value: 1 } as never),
 		).rejects.toBeInstanceOf(PluginStorageError);
+	});
+	test("host commit fences reject revocation and cancellation without changing durable state", async () => {
+		const root = await makeRoot();
+		const storage = new PluginStorage({ pluginId: "com.example.fenced", root });
+		const input = { scope: userScope, key: "binding", value: "original" };
+		await storage.set(input);
+		const before = await readFile(storage.storagePath, "utf8");
+		const controller = new AbortController();
+		await expect(
+			storage.set(
+				{ ...input, value: "cancelled" },
+				{
+					signal: controller.signal,
+					beforeCommit: async () => {
+						controller.abort();
+					},
+				},
+			),
+		).rejects.toMatchObject({ name: "AbortError" });
+		await expect(
+			storage.set(
+				{ ...input, value: "revoked" },
+				{
+					commitGuard: () => {
+						throw new Error("authority revoked");
+					},
+				},
+			),
+		).rejects.toThrow("authority revoked");
+		expect(await readFile(storage.storagePath, "utf8")).toBe(before);
+		expect((await storage.get({ scope: input.scope, key: input.key }))?.revision).toBe(1);
+		expect((await readdir(root)).filter((name) => name.endsWith(".tmp"))).toEqual([]);
+	});
+
+	test("host cancellation during the admitted rename returns the committed write", async () => {
+		const root = await makeRoot();
+		const controller = new AbortController();
+		const storage = new PluginStorage({
+			pluginId: "com.example.committed",
+			root,
+			renameFile: async (from, to) => {
+				await rename(from, to);
+				controller.abort();
+			},
+		});
+		const input = { scope: userScope, key: "binding", value: "committed" };
+		expect(await storage.set(input, { signal: controller.signal })).toMatchObject({
+			value: "committed",
+			revision: 1,
+		});
+		expect((await storage.get({ scope: input.scope, key: input.key }))?.value).toBe("committed");
+	});
+
+	test("host fences do not mutate ephemeral session entries when rejected", async () => {
+		const root = await makeRoot();
+		const storage = new PluginStorage({ pluginId: "com.example.session-fenced", root });
+		const input = {
+			scope: { type: "session" as const, id: "session-1" },
+			key: "value",
+			value: "original",
+		};
+		await storage.set(input);
+		await expect(
+			storage.set(
+				{ ...input, value: "revoked" },
+				{
+					beforeCommit: async () => {
+						throw new Error("authority revoked");
+					},
+				},
+			),
+		).rejects.toThrow("authority revoked");
+		expect(await storage.get({ scope: input.scope, key: input.key })).toMatchObject({ value: "original", revision: 1 });
 	});
 });

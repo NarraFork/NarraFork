@@ -279,7 +279,7 @@ export function projectPendingInjection(
 			fromId: delivery.sender.id,
 			fromTitle: delivery.sender.title ?? null,
 			fromLabel: delivery.sender.label,
-			fromType: delivery.sender.type ?? "general",
+			fromType: delivery.sender.type ?? (metadata.channel === "peer" ? "primary" : "general"),
 			fromToolUseId: delivery.fromToolUseId,
 			fromMessageId: metadata.fromMessageId,
 			text: row.text,
@@ -300,6 +300,22 @@ export function recordTaskNoticeUser(taskId: string, userId: string | null | und
 
 function peekTaskNoticeUser(taskId: string): string | null {
 	return taskNoticeUsers.get(taskId) ?? null;
+}
+
+/** Read actor attribution without materializing a mailbox row into its payload. */
+export function pendingInjectionMailboxUserId(
+	row: Pick<
+		import("./agent-runtime/runtime-queue-port").RuntimeMailboxRow,
+		"kind" | "metadataJson"
+	>,
+): string | null {
+	const metadata = inboxMetadata<{ userId?: string | null; taskId?: string }>(
+		row as import("./agent-runtime/runtime-queue-port").RuntimeMailboxRow,
+	);
+	return (
+		metadata.userId ??
+		(row.kind === "task_notice" && metadata.taskId ? peekTaskNoticeUser(metadata.taskId) : null)
+	);
 }
 
 /** Keep unattributed legacy/system entries null rather than charging the parent user. */

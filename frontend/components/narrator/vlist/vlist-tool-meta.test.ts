@@ -149,6 +149,27 @@ describe("active question waits", () => {
 	});
 });
 
+describe("NarratorSend navigation", () => {
+	it("reads the resolved recipient without creating a child narrator identity", () => {
+		const meta = deriveToolMeta(
+			toolBlock({
+				name: "NarratorSend",
+				input: { id: "peer", message: "hello" },
+				status: "success",
+				_metadata: {
+					kind: "send",
+					targets: [{ id: "peer", title: "Peer" }],
+					targetCount: 1,
+					doInterrupt: false,
+					await: false,
+				},
+			}),
+		);
+		expect(meta).toMatchObject({ toolName: "NarratorSend", sendTargetNarratorId: "peer" });
+		expect(meta?.subagentNarratorId).toBeUndefined();
+	});
+});
+
 describe("running Send navigation", () => {
 	it("reads the live resolution without output or lifecycle mutation", () => {
 		const block = toolBlock({

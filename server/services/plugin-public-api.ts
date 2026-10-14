@@ -1,4 +1,9 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import {
+	formatStewardOriginLabel,
+	parseStewardOriginLabel,
+	type StewardMessageProvenance,
+} from "@shared/message-origin";
 import { and, desc, eq, inArray, lt, or, type SQL } from "drizzle-orm";
 import { z } from "zod";
 import { chapters, narratorMessages, narrators } from "../db/schema";
@@ -18,7 +23,8 @@ import {
 	interruptNarrator as interruptNarratorSession,
 	readSpecTasksForPlugin as readSpecTasksForPluginSession,
 	sendMessage as sendNarratorMessage,
-	sendSubagentMessage as sendSubagentMessageToSession,
+	type NarratorMessageSendInput,
+	type NarratorMessageSendResult,
 	setSpecBehaviorFenceForPlugin as setSpecBehaviorFenceForPluginSession,
 	updateNarratorProfileForPlugin as updateNarratorProfileForPluginSession,
 	writeSpecForPlugin as writeSpecForPluginSession,
@@ -413,9 +419,16 @@ export interface CommandHandlerResponse<T extends JsonValue = JsonValue> {
 	diagnostics?: PublicDiagnostic[];
 }
 
+/** Host-only options never serialized in public command requests. */
+export interface HostCommandOptions {
+	signal?: AbortSignal;
+	stewardProvenance?: StewardMessageProvenance;
+}
+
 export interface CommandHandlerContext {
 	host: HostCallContext;
 	signal: AbortSignal;
+	stewardProvenance?: StewardMessageProvenance;
 	idempotencyKey?: string;
 	expectedVersion?: number;
 	authorization: Extract<GatewayAuthorizationDecision, { allowed: true }>;
@@ -1002,7 +1015,9 @@ async function runWithDeadline<T>(
 	deadlineAt: string,
 	timeoutMs: number,
 	now: () => Date,
+	externalSignal?: AbortSignal,
 ): Promise<T> {
+	if (externalSignal?.aborted) throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
 	const remaining = Date.parse(deadlineAt) - now().getTime();
 	const duration = Math.min(timeoutMs, remaining);
 	if (!Number.isFinite(duration) || duration <= 0) throw new DeadlineExceededError();
@@ -1014,10 +1029,21 @@ async function runWithDeadline<T>(
 			reject(new DeadlineExceededError());
 		}, duration);
 	});
+	let onAbort: (() => void) | undefined;
+	const cancelled = new Promise<never>((_, reject) => {
+		onAbort = () => {
+			const error = new PluginPublicApiError("CANCELLED", "Command was cancelled");
+			controller.abort(error);
+			reject(error);
+		};
+		externalSignal?.addEventListener("abort", onAbort, { once: true });
+		if (externalSignal?.aborted) onAbort();
+	});
 	try {
-		return await Promise.race([handler(controller.signal), timeout]);
+		return await Promise.race([handler(controller.signal), timeout, cancelled]);
 	} finally {
 		if (timer) clearTimeout(timer);
+		if (onAbort) externalSignal?.removeEventListener("abort", onAbort);
 	}
 }
 
@@ -1261,6 +1287,8 @@ export interface NarratorCommandAdapter {
 		message: string;
 		locale?: "en" | "zh-CN";
 		replyInUserLanguage?: boolean;
+		/** Trusted host-only envelope. The external send schema intentionally omits it. */
+		stewardProvenance?: StewardMessageProvenance;
 		pluginId: string;
 		context: HostCallContext;
 		signal: AbortSignal;
@@ -1729,6 +1757,20 @@ export class PluginPublicApi {
 		return this.executeCommand(rawContext, rawRequest);
 	}
 
+	/** Keep host delegation on the normal capability, deadline and audit command path. */
+	executeHostCommand(
+		context: HostCallContext,
+		request: CommandRequest,
+		options: HostCommandOptions = {},
+	): Promise<CommandResult> {
+		return this.executeCommand(context, request, {
+			signal: options.signal,
+			...(options.stewardProvenance
+				? { stewardProvenance: { ...options.stewardProvenance } }
+				: {}),
+		});
+	}
+
 	invokeQuery(context: HostCallContext, request: QueryRequest): Promise<QueryResult> {
 		return this.executeQuery(context, request);
 	}
@@ -1967,6 +2009,7 @@ export class PluginPublicApi {
 						message: input.message,
 						locale: input.locale,
 						replyInUserLanguage: input.replyInUserLanguage,
+						...(call.stewardProvenance ? { stewardProvenance: call.stewardProvenance } : {}),
 						pluginId: call.host.plugin.pluginId,
 						context: call.host,
 						signal: call.signal,
@@ -2418,7 +2461,7 @@ export class PluginPublicApi {
 		}
 	}
 
-	private async executeCommand(rawContext: unknown, rawRequest: unknown): Promise<CommandResult> {
+	private async executeCommand(rawContext: unknown, rawRequest: unknown, hostOptions: HostCommandOptions = {}): Promise<CommandResult> {
 		const startedAt = this.now().getTime();
 		let context: HostCallContext;
 		try {
@@ -2519,6 +2562,22 @@ export class PluginPublicApi {
 			resource = definition.resource?.(parsed.data, context);
 		}
 
+		if (hostOptions.stewardProvenance) {
+			try {
+				if (request.commandId !== "narrafork.narrator.send_message" || !isPlainObject(parsedInput) ||
+					context.scope.narratorId !== context.invocation.narratorId)
+					throw new PluginPublicApiError("PERMISSION_DENIED", "Steward host send requires source scope");
+				const provenance = validateStewardProvenance(
+					hostOptions.stewardProvenance, context, String(parsedInput.narratorId), context.plugin.pluginId,
+				);
+				hostOptions = { ...hostOptions, stewardProvenance: provenance };
+				context = { ...context, scope: { ...context.scope, narratorId: provenance.targetNarratorId } };
+			} catch (error) {
+				const result = this.commandErrorResult(request, definition!, error);
+				await this.audit(context, definition, resource, result, startedAt, request, false);
+				return result;
+			}
+		}
 		const authorization = await this.authorize(
 			context,
 			"command",
@@ -2588,7 +2647,7 @@ export class PluginPublicApi {
 		}
 
 		const execute = () =>
-			this.runCommandHandler(context, request, definition, parsedInput, authorization);
+			this.runCommandHandler(context, request, definition, parsedInput, authorization, hostOptions);
 		if (!request.idempotencyKey || definition.idempotency === "none") {
 			const result = await execute();
 			await this.audit(context, definition, resource, result, startedAt, request, false);
@@ -2639,6 +2698,7 @@ export class PluginPublicApi {
 		definition: AnyCommandDefinition,
 		input: unknown,
 		authorization: Extract<GatewayAuthorizationDecision, { allowed: true }>,
+		hostOptions: HostCommandOptions = {},
 	): Promise<CommandResult> {
 		try {
 			const response = await runWithDeadline(
@@ -2650,11 +2710,13 @@ export class PluginPublicApi {
 							idempotencyKey: request.idempotencyKey,
 							expectedVersion: request.expectedVersion,
 							authorization,
+							stewardProvenance: hostOptions.stewardProvenance,
 						}),
 					),
 				request.deadlineAt,
 				definition.timeoutMs ?? this.limits.commandTimeoutMs,
 				this.now,
+				hostOptions.signal,
 			);
 			const sanitized = sanitizePublicValue(response.data ?? {}, this.limits);
 			const diagnostics = normalizeDiagnostics(
@@ -3007,8 +3069,7 @@ type PluginManagerPublicMethods = Pick<PluginManager, "list" | "getStatus" | "en
 
 /** Narrow facade over narrator services so tests can inject a fake. */
 export type NarratorSessionFacade = {
-	sendMessage: typeof sendNarratorMessage;
-	sendSubagentMessage: typeof sendSubagentMessageToSession;
+	sendMessage(input: NarratorMessageSendInput): Promise<NarratorMessageSendResult>;
 	createNarrator: typeof createNarratorForPluginSession;
 	deleteNarrator: typeof deleteNarratorForPluginSession;
 	specTasksGet: typeof readSpecTasksForPluginSession;
@@ -3019,6 +3080,37 @@ export type NarratorSessionFacade = {
 	interruptNarrator: typeof interruptNarratorSession;
 	getById: typeof narratorService.getById;
 };
+
+/** Validate host provenance both at the gateway and immediately before the final send. */
+function validateStewardProvenance(
+	value: StewardMessageProvenance,
+	context: HostCallContext,
+	narratorId: string,
+	pluginId: string,
+): StewardMessageProvenance {
+	const provenance = parseStewardOriginLabel(formatStewardOriginLabel(value));
+	if (
+		!provenance ||
+		provenance.pluginId !== "steward-narrator" ||
+		provenance.pluginId !== pluginId ||
+		pluginId !== context.plugin.pluginId ||
+		context.invocation.kind !== "user" ||
+		!["internal", "command"].includes(context.invocation.source) ||
+		provenance.userId !== context.invocation.userId ||
+		provenance.contributionId !== context.plugin.contributionId ||
+		provenance.requestId !== context.requestId ||
+		provenance.correlationId !== context.correlationId ||
+		provenance.targetNarratorId !== narratorId ||
+		![provenance.stewardNarratorId, provenance.targetNarratorId].includes(context.scope.narratorId ?? "") ||
+		provenance.stewardNarratorId !== context.invocation.narratorId
+	) {
+		throw new PluginPublicApiError("PERMISSION_DENIED", "Steward provenance does not match host context");
+	}
+	if (!Number.isFinite(Date.parse(context.deadlineAt)) || Date.parse(context.deadlineAt) <= Date.now()) {
+		throw new PluginPublicApiError("TIMEOUT", "Steward invocation deadline has expired");
+	}
+	return provenance;
+}
 
 /** Map core narrator errors to stable public error codes. */
 function mapNarratorCommandError(error: unknown): PluginPublicApiError {
@@ -3062,7 +3154,6 @@ export function createCorePluginPublicApiAdapters(options: {
 	const { db, pluginManager } = options;
 	const session = options.narratorSession ?? {
 		sendMessage: sendNarratorMessage,
-		sendSubagentMessage: sendSubagentMessageToSession,
 		createNarrator: createNarratorForPluginSession,
 		deleteNarrator: deleteNarratorForPluginSession,
 		specTasksGet: readSpecTasksForPluginSession,
@@ -3264,20 +3355,37 @@ export function createCorePluginPublicApiAdapters(options: {
 				if (input.signal.aborted)
 					throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
 				try {
-					const sent = await session.sendMessage(
-						input.narratorId,
-						input.message,
-						undefined,
-						input.locale ?? "en",
-						input.replyInUserLanguage ?? false,
-						null,
-						null,
-						undefined,
-						null,
-						{ origin: "user", originLabel: `plugin:${input.pluginId}` },
-					);
-					return { messageId: sent.id };
+					if (input.pluginId !== input.context.plugin.pluginId) {
+						throw new PluginPublicApiError("PERMISSION_DENIED", "Plugin identity does not match");
+					}
+					// Snapshot before any await: a caller cannot mutate the trusted source mid-send.
+					const provenance = input.stewardProvenance
+						? validateStewardProvenance(input.stewardProvenance, input.context, input.narratorId, input.pluginId)
+						: undefined;
+					if (input.signal.aborted)
+						throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
+					const sent = await session.sendMessage({
+						kind: "user",
+						target: "primary",
+						busyPolicy: "reject",
+						narratorId: input.narratorId,
+						message: input.message,
+						locale: input.locale ?? "en",
+						replyInUserLanguage: input.replyInUserLanguage ?? false,
+						userId: input.context.invocation.userId ?? null,
+						origin: provenance
+							? {
+								origin: "assistant", originLabel: formatStewardOriginLabel(provenance),
+								delegationDeadlineAt: input.context.deadlineAt,
+								delegationHostContext: { ...input.context, scope: { ...input.context.scope, narratorId: provenance.stewardNarratorId } },
+							}
+							: { origin: "user", originLabel: `plugin:${input.pluginId}` },
+						signal: input.signal,
+					});
+					return { messageId: sent.messageId };
 				} catch (error) {
+					if (input.signal.aborted)
+						throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
 					throw mapNarratorCommandError(error);
 				}
 			},
@@ -3285,21 +3393,28 @@ export function createCorePluginPublicApiAdapters(options: {
 				if (input.signal.aborted)
 					throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
 				try {
-					const result = await session.sendSubagentMessage({
-						subagentId: input.narratorId,
+					const result = await session.sendMessage({
+						kind: "user",
+						target: "subagent",
+						busyPolicy: "queue",
+						narratorId: input.narratorId,
 						message: input.message,
 						priority: input.priority,
 						locale: input.locale,
-						createdBy: null,
+						userId: null,
 						signal: input.signal,
 					});
+					// The legacy buffered response exposes the mailbox ID, not the reserved history ID.
+					const messageId = result.delivered === "buffered" ? result.mailboxId : result.messageId;
 					return {
 						delivered: result.delivered,
-						...(result.messageId ? { messageId: result.messageId } : {}),
+						...(messageId ? { messageId } : {}),
 						...(result.bufferedAt ? { bufferedAt: result.bufferedAt } : {}),
 						...(typeof result.started === "boolean" ? { started: result.started } : {}),
 					};
 				} catch (error) {
+					if (input.signal.aborted)
+						throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
 					throw mapNarratorCommandError(error);
 				}
 			},

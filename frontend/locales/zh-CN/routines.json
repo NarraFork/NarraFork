@@ -238,6 +238,8 @@
 	"tpToolDescSkill": "在对话中调用技能。",
 	"tpToolDescAwait": "等待异步 agent 或 bash 任务。",
 	"tpToolDescSend": "向可访问的子代理发送消息。",
+	"tpToolDescNarratorList": "列出当前章节中的叙述者及其状态。",
+	"tpToolDescNarratorSend": "向当前章节中的单个叙述者发送非中断消息。",
 	"tpToolDescShareFile": "生成临时下载链接分享文件。",
 	"tpNotificationAllowSend": "预先授权 Notification 主动发送",
 	"tpNotificationAllowSendDesc": "默认关闭。管理员启用后，agent 可通过已启用的渠道向 user_id 或 username 精确指定的用户发送通知，无需逐次审批；只读与严格计划模式仍禁止发送。此开关不会启用渠道，也不会改变自动通知设置。",

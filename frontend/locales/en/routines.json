@@ -238,6 +238,8 @@
 	"tpToolDescSkill": "Invoke a skill within the conversation.",
 	"tpToolDescAwait": "Await an asynchronous agent or bash task.",
 	"tpToolDescSend": "Send messages to accessible subagents.",
+	"tpToolDescNarratorList": "List narrators in the current chapter and inspect their status.",
+	"tpToolDescNarratorSend": "Send a non-interrupting message to one narrator in the current chapter.",
 	"tpToolDescShareFile": "Share a file by generating a temporary download link.",
 	"tpNotificationAllowSend": "Pre-authorize Notification sends",
 	"tpNotificationAllowSendDesc": "Off by default. When enabled by an administrator, agents can send via enabled channels to the exact specified user_id or username without approval for each send. Read-only and strict plan modes still prohibit sending. This does not enable channels or change automatic notifications.",

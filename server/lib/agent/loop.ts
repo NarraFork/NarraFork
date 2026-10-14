@@ -532,6 +532,7 @@ const RELAXED_PLAN_READ_ONLY_TOOLS = new Set([
 	"Await",
 	"ShareFile",
 	"ContextAsk",
+	"NarratorList",
 	"LearningGuide",
 	"StartPipeline",
 	"ExtractPipeline",
@@ -652,6 +653,7 @@ const EAGER_EXECUTION_DISABLED_TOOLS = new Set([
 	// registered/running state. Defer them to the ordered post-stream tool phase.
 	"Await",
 	"Send",
+	"NarratorSend",
 	"Browser",
 	"Terminal",
 	"ShareFile",

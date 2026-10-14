@@ -1,9 +1,17 @@
 import { expect, test } from "bun:test";
 import {
+	isCommunicationTool,
 	knownSendDeliveryTargets,
 	mergeSendDeliveryTargetCount,
 	mergeSendDeliveryTargets,
 } from "./communication-tool";
+
+test("NarratorSend is communication without metadata and NarratorList is not", () => {
+	expect(
+		isCommunicationTool({ toolName: "NarratorSend", inputJson: { id: "peer", message: "hello" } }),
+	).toBe(true);
+	expect(isCommunicationTool({ toolName: "NarratorList" })).toBe(false);
+});
 
 test("stable receipt retains adopted revision while COW updates its address", () => {
 	const [target] = mergeSendDeliveryTargets(

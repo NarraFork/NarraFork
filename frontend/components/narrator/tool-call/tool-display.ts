@@ -112,7 +112,7 @@ function getStreamingFilePath(input: unknown): string {
 }
 const AGENT_TOOLS = new Set(["Agent", "Task"]);
 const AWAIT_TOOLS = new Set(["Await"]);
-const SEND_TOOLS = new Set(["Send"]);
+const SEND_TOOLS = new Set(["Send", "NarratorSend"]);
 const ASK_TOOLS = new Set(["AskUserQuestion"]);
 const PLAN_TOOLS = new Set(["EnterPlanMode", "ExitPlanMode"]);
 const PIPELINE_TOOLS = new Set(["StartPipeline", "ExtractPipeline", "EndPipeline"]);
@@ -646,7 +646,12 @@ export function getSummary(
 				Array.isArray(metadata?.targets) || targets.length
 					? targets.map(communicationTargetLabel)
 					: selectors.map((target) => formatAgentIdForDisplay(target));
-			const targetLabel = targetLabels.length > 0 ? targetLabels.join(", ") : "subagent";
+			const targetLabel =
+				targetLabels.length > 0
+					? targetLabels.join(", ")
+					: toolName === "NarratorSend"
+						? "narrator"
+						: "subagent";
 			const obj =
 				!isTruncated(input) && typeof input === "object" && input
 					? (input as Record<string, unknown>)
@@ -655,11 +660,14 @@ export function getSummary(
 				targets,
 				targetCount: metadata?.targetCount,
 				selectorCount: Array.isArray(metadata?.targets) ? 0 : selectors.length,
-				awaitReply: typeof obj?.await === "boolean" ? obj.await : metadata?.await === true,
+				awaitReply:
+					toolName !== "NarratorSend" &&
+					(typeof obj?.await === "boolean" ? obj.await : metadata?.await === true),
 				status: typeof metadata?.status === "string" ? metadata.status : undefined,
 			});
 			const flags = [formatCommunicationState(state, labels)];
-			if (obj?.doInterrupt || metadata?.doInterrupt) flags.push("interrupt");
+			if (toolName !== "NarratorSend" && (obj?.doInterrupt || metadata?.doInterrupt))
+				flags.push("interrupt");
 			return `to ${targetLabel} · ${flags.join(" · ")}`;
 		}
 		case "ask": {

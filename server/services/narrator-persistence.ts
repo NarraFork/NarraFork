@@ -923,6 +923,8 @@ export interface MessagePlacementOptions {
 	messageId?: string;
 	/** Claimed durable input; user_input does not require an agent delivery envelope. */
 	mailboxClaim?: MailboxClaim;
+	/** Host-only admission fence rerun before each retryable message transaction. */
+	beforeCommit?: () => Promise<void>;
 	/**
 	 * The `tool_use` id that owns this row — the Agent/Task call that spawned the
 	 * recipient subagent. Null/omitted writes a top-level row.
@@ -1175,6 +1177,7 @@ const sqliteNarratorPersistence = {
 		}
 		const msgWithSeq = await withDbRetry(
 			async () => {
+				await placement?.beforeCommit?.();
 				const id = placementMessageId(placement);
 				const now = new Date().toISOString();
 				return db.transaction((tx) => {

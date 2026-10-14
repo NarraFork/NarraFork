@@ -10,7 +10,7 @@ export function isParentSelector(selector: string): boolean {
 
 /** Communication is conversation content, never a foldable activity/tool row. */
 export function isCommunicationTool(tool: { toolName: string; inputJson?: unknown }): boolean {
-	if (tool.toolName === "Send") return true;
+	if (tool.toolName === "Send" || tool.toolName === "NarratorSend") return true;
 	if (tool.toolName !== "TeamStatus") return false;
 	const input = objectValue(tool.inputJson);
 	const settled = objectValue(input._streamingFields);
@@ -62,6 +62,8 @@ export interface SendDeliveryTarget {
 	revision?: number;
 	receiptDisposition?: "active" | "superseded" | "recipient_deleted";
 	title?: string | null;
+	injectionId?: string;
+	injectionStatus?: string;
 	injectionConsumedAt?: string;
 }
 
@@ -103,6 +105,14 @@ export function mergeSendDeliveryTargets(
 				: (prior?.title ?? target.title);
 		const preservePriorReceipt =
 			sameReceipt || legacyMatchesStable || (!receipt && !target.deliveryId);
+		const injectionId =
+			(typeof target.injectionId === "string" && target.injectionId.trim()
+				? target.injectionId
+				: undefined) ?? (preservePriorReceipt ? prior?.injectionId : undefined);
+		const injectionStatus =
+			(typeof target.injectionStatus === "string" && target.injectionStatus.trim()
+				? target.injectionStatus
+				: undefined) ?? (preservePriorReceipt ? prior?.injectionStatus : undefined);
 		const injectionConsumedAt =
 			(preservePriorReceipt ? prior?.injectionConsumedAt : undefined) ||
 			(receipt &&
@@ -137,6 +147,8 @@ export function mergeSendDeliveryTargets(
 				: {}),
 			...(deliveryMessageId ? { deliveryMessageId } : {}),
 			...(title !== undefined ? { title } : {}),
+			...(injectionId ? { injectionId } : {}),
+			...(injectionStatus ? { injectionStatus } : {}),
 			...(injectionConsumedAt ? { injectionConsumedAt } : {}),
 		});
 	}

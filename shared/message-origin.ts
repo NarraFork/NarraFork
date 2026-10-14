@@ -116,6 +116,79 @@ export interface MessageOriginOptions {
 	 * sent to the model.
 	 */
 	originLabel?: string | null;
+	/** Host-only admission expiry persisted in mailbox metadata, not provenance. */
+	delegationDeadlineAt?: string;
+	/** Private durable host identity snapshot, validated by server admission code. */
+	delegationHostContext?: unknown;
+}
+
+/** Host-generated delegation provenance, never accepted in public plugin input. */
+export interface StewardMessageProvenance {
+	userId: string;
+	pluginId: string;
+	contributionId: string;
+	requestId: string;
+	correlationId: string;
+	stewardNarratorId: string;
+	targetNarratorId: string;
+	bindingRevision: number;
+}
+
+const STEWARD_ORIGIN_PREFIX = "stewardDelegation:";
+const STEWARD_ID_FIELDS = [
+	"userId",
+	"pluginId",
+	"contributionId",
+	"requestId",
+	"correlationId",
+	"stewardNarratorId",
+	"targetNarratorId",
+] as const;
+
+/** Reuse the persisted origin_label column without inserting metadata into user text. */
+export function formatStewardOriginLabel(provenance: StewardMessageProvenance): string {
+	return `${STEWARD_ORIGIN_PREFIX}${JSON.stringify(provenance)}`;
+}
+
+export function parseStewardOriginLabel(
+	label: string | null | undefined,
+): StewardMessageProvenance | null {
+	if (!label?.startsWith(STEWARD_ORIGIN_PREFIX) || label.length > 4096) return null;
+	try {
+		const value = JSON.parse(label.slice(STEWARD_ORIGIN_PREFIX.length));
+		if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+		if (Object.keys(value).length !== STEWARD_ID_FIELDS.length + 1) return null;
+		for (const key of STEWARD_ID_FIELDS) {
+			if (
+				typeof value[key] !== "string" ||
+				!value[key] ||
+				value[key].length > 256 ||
+				value[key] !== value[key].trim() ||
+				/[\u0000-\u001f\u007f]/.test(value[key])
+			) return null;
+		}
+		if (value.pluginId !== "steward-narrator" || !Number.isSafeInteger(value.bindingRevision) || value.bindingRevision < 1) return null;
+		return value as StewardMessageProvenance;
+	} catch {
+		return null;
+	}
+}
+
+/** Only a machine-authored persisted row can assert a delegated source. */
+export function resolveStewardMessageProvenance(message: {
+	role: string;
+	origin?: string | null;
+	originLabel?: string | null;
+	createdBy?: string | null;
+	narratorId?: string;
+}): StewardMessageProvenance | null {
+	if (message.role !== "user" || message.origin !== "assistant") return null;
+	const source = parseStewardOriginLabel(message.originLabel);
+	return source &&
+		message.createdBy === source.userId &&
+		message.narratorId === source.targetNarratorId
+		? source
+		: null;
 }
 
 /**

@@ -1,4 +1,8 @@
-import { parseOriginLabel } from "@shared/message-origin";
+import {
+	parseOriginLabel,
+	resolveStewardMessageProvenance,
+	type StewardMessageProvenance,
+} from "@shared/message-origin";
 import { isNativeModelContextBlock, modelTextFromContentBlocks } from "@shared/native-injection";
 import type { DbMessage } from "./provider";
 
@@ -6,6 +10,9 @@ export interface MessageSender {
 	kind: "human" | "agent" | "system";
 	id?: string;
 	name?: string;
+	/** The original human delegated this turn to the named steward/plugin. */
+	delegatedUserName?: string;
+	stewardProvenance?: StewardMessageProvenance;
 }
 
 /** Structural input only: this module never resolves identities through a database. */
@@ -65,6 +72,15 @@ function systemSender(message: SenderMessage): MessageSender {
 export function resolveMessageSender(message: SenderMessage): MessageSender {
 	if (message.role === "assistant")
 		return sender("agent", message.narratorId, message.narrator?.title);
+	const provenance = resolveStewardMessageProvenance(message);
+	if (provenance) {
+		return {
+			kind: "agent",
+			id: provenance.stewardNarratorId,
+			...(known(message.creator?.username) ? { delegatedUserName: message.creator?.username } : {}),
+			stewardProvenance: provenance,
+		};
+	}
 	const items = inboundItems(message);
 	if (items.length) {
 		const identities = items.map(itemSender);
@@ -107,7 +123,21 @@ function attribute(value: string): string {
 		});
 }
 function marker(value: MessageSender): string {
-	return `<sender kind="${value.kind}"${known(value.id) ? ` id="${attribute(value.id as string)}"` : ""}${known(value.name) ? ` name="${attribute(value.name as string)}"` : ""} />`;
+	const provenance = value.stewardProvenance;
+	const delegation = provenance && value.kind === "agent"
+		? Object.entries({
+			delegated_user_id: provenance.userId,
+			...(value.delegatedUserName ? { delegated_user_name: value.delegatedUserName } : {}),
+			plugin_id: provenance.pluginId,
+			contribution_id: provenance.contributionId,
+			steward_narrator_id: provenance.stewardNarratorId,
+			target_narrator_id: provenance.targetNarratorId,
+			request_id: provenance.requestId,
+			correlation_id: provenance.correlationId,
+			binding_revision: String(provenance.bindingRevision),
+		}).map(([key, content]) => ` ${key}="${attribute(content)}"`).join("")
+		: "";
+	return `<sender kind="${value.kind}"${known(value.id) ? ` id="${attribute(value.id as string)}"` : ""}${known(value.name) ? ` name="${attribute(value.name as string)}"` : ""}${delegation} />`;
 }
 
 /** Deliberately no content sniffing: a user-written marker remains ordinary input. */

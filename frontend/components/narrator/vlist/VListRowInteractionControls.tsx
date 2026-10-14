@@ -108,6 +108,7 @@ export function VListRowInteractionControls({
 		: "";
 	const hasToolActions = !!(
 		toolActions?.onViewSubagentSession ||
+		toolActions?.onViewNarratorSession ||
 		toolActions?.onDetachSubagent ||
 		toolActions?.onDetachBash ||
 		toolActions?.onCancelBackgroundTask ||
@@ -123,11 +124,11 @@ export function VListRowInteractionControls({
 	const showToolMenuItems = showMenuItems && hasToolActions;
 	const toolMenuItemsNode = showToolMenuItems ? (
 		<>
-			{toolActions?.onViewSubagentSession && (
+			{(toolActions?.onViewSubagentSession || toolActions?.onViewNarratorSession) && (
 				<Menu.Item
 					leftSection={<IconEye size={14} />}
 					onClick={() => {
-						toolActions.onViewSubagentSession?.();
+						(toolActions.onViewNarratorSession ?? toolActions.onViewSubagentSession)?.();
 						swipe.closeSwipe();
 					}}
 				>

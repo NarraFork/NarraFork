@@ -263,6 +263,8 @@ describe("OAuth narrator runtime policy", () => {
 		expect(policy?.allowedTools.has("Bash")).toBe(true);
 		expect(policy?.allowedTools.has("Write")).toBe(true);
 		expect(policy?.allowedTools.has("Edit")).toBe(true);
+		expect(policy?.allowedTools.has("NarratorList")).toBe(false);
+		expect(policy?.allowedTools.has("NarratorSend")).toBe(false);
 	});
 
 	test("rejects obsolete v1 runtime snapshots", async () => {

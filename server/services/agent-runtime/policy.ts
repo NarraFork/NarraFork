@@ -47,6 +47,7 @@ const READ_TOOLS = Object.freeze([
 	"Question",
 	"ContextAsk",
 	"Send",
+	"NarratorList",
 ]);
 const GENERAL_TOOLS = Object.freeze([...READ_TOOLS, "Write", "Edit", "Skill"]);
 const SEARCH_TOOLS = Object.freeze([
@@ -149,6 +150,11 @@ export function isRuntimeToolAllowed(
 	mcpBehavior?: string | null,
 ): boolean {
 	const caps = policy.capabilities;
+	// Peer communication is never delegated by custom subagent tool allowlists.
+	if (toolName === "NarratorList" || toolName === "NarratorSend") {
+		if (policy.variant !== "primary") return false;
+		if (toolName === "NarratorSend" && policy.tools.readOnly) return false;
+	}
 	if (toolName === "Question") return caps.awaitOwnQuestion;
 	if (toolName === "AskUserQuestion" && caps.askUserQuestion === "disabled") return false;
 	if (["Agent", "Task", "ContinueTask", "ForkNarrator"].includes(toolName) && !caps.spawnAgent)

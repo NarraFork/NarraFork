@@ -334,6 +334,8 @@ export interface BufferedExecutionIntent {
 }
 
 export interface BufferedMessage {
+	/** Durable server-generated attribution, preserved through retries and recovery. */
+	origin?: import("@shared/message-origin").MessageOriginOptions;
 	queueMode?: import("@shared/buffer-queue-mode").BufferQueueMode;
 	executionIntent?: BufferedExecutionIntent;
 	id: string;

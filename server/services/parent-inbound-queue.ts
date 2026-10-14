@@ -73,6 +73,14 @@ function senderLabel(message: ParentInboundMessage, isZh: boolean): string {
 /** Format a single inbound message with a sender prefix for injection. */
 function formatParentInboundMessage(message: ParentInboundMessage, locale: Locale): string {
 	const isZh = locale === "zh-CN";
+	// Ordinary peer messages share this persistent injection consumer, not the
+	// parent/child relationship. The server-owned envelope supplies that identity.
+	if (message.delivery && !message.delivery.sender.type && !message.delivery.sender.isParent) {
+		const name = message.fromTitle?.trim() || message.fromLabel?.trim() || message.fromId;
+		return isZh
+			? `[来自叙述者"${name}"的消息]：\n${message.text}`
+			: `[Message from narrator "${name}"]:\n${message.text}`;
+	}
 	if (isZh) {
 		return `[来自${senderLabel(message, true)}的进展汇报]：\n${message.text}`;
 	}

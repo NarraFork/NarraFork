@@ -60,6 +60,7 @@ function invocationFromContext(context: ToolContext): InvocationPrincipal {
 		return {
 			kind: "user",
 			userId: context.userId,
+			...(validIdentifier(context.narratorId) ? { narratorId: context.narratorId } : {}),
 			userRole: "user",
 			source: "command",
 		};
@@ -190,7 +191,7 @@ export class PluginAgentToolBridge {
 		for (const descriptor of this.pluginToolRegistry.list()) {
 			// UI tools are intentionally not advertised to the backend Agent. Their UI host path is
 			// separate and exposing a permanently unavailable function would be misleading.
-			if (descriptor.execution !== "server") continue;
+			if (descriptor.execution !== "server" && descriptor.execution !== "host") continue;
 			const canonicalName = canonicalPluginToolName(descriptor.pluginId, descriptor.contributionId);
 			const previous = nextCanonicalToFullId.get(canonicalName);
 			if (previous && previous !== descriptor.fullId) {
@@ -310,6 +311,8 @@ export class PluginAgentToolBridge {
 		signal: AbortSignal,
 	): Promise<void> {
 		if (signal.aborted) throw new DOMException("Tool activation was cancelled", "AbortError");
+		// Host contributions use installation-bound broker bindings, not plugin server processes.
+		if (binding.descriptor.execution === "host") return;
 		if (this.runtimeActiveResolver && (await this.runtimeActiveResolver(binding.pluginId))) return;
 		if (!this.activationHandler) {
 			// Fail loud instead of silently continuing into an authorization that can

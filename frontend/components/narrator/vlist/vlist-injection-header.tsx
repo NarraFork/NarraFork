@@ -485,6 +485,8 @@ export function injectInjectionBubbleChrome(
 export interface InjectionNavigation {
 	/** Open a child session, optionally scrolled to one message. */
 	onOpenNarrator?: (narratorId: string, messageId?: string) => void;
+	/** Open an independent narrator session, without creating a subagent panel. */
+	onOpenNarratorSession?: (narratorId: string, messageId?: string) => void;
 	/** Open a knowledge-base entry (global or personal). */
 	onOpenKnowledge?: (entryId: string, scope: "global" | "personal") => void;
 	/** Open the Dynamic Spec panel with one file selected. */

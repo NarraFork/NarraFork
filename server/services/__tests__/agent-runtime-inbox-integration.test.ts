@@ -1040,6 +1040,61 @@ test("Await-revoked terminal claim is a benign empty projection and does not blo
 	});
 });
 
+test("peer mailbox batches actors at the frozen pass boundary", async () => {
+	const owner = required(tryClaimExecution("parent", "primary"));
+	try {
+		const active = {
+			narratorId: "parent",
+			locale: "en",
+			_currentUserId: "actor-a",
+			_todoReminderCompletedToolCount: 0,
+			_tasksReminderInterval: -1,
+			_fenceInterval: -1,
+		} as Parameters<typeof drainInjectionsIntoHistory>[0];
+		for (const [text, userId] of [
+			["A first", "actor-a"],
+			["A second", "actor-a"],
+			["B first", "actor-b"],
+		] as const) {
+			const message = delivery("parent", text);
+			await inbox.enqueueInboxAgent(message, message.text, { channel: "parent", userId });
+		}
+		const first = await drainInjectionsIntoHistory(active, "en");
+		expect(first.text).toContain("A first");
+		expect(first.text).toContain("A second");
+		expect(first.text).not.toContain("B first");
+		expect(
+			(await inbox.listInboxRows("parent")).filter((row) => row.state === "queued"),
+		).toHaveLength(1);
+
+		const session = await import("../narrator-session");
+		const second = await session.drainAndPersistPendingInjections(active);
+		expect(second).toContain("B first");
+		expect(active._currentUserId).toBe("actor-b");
+		expect((await inbox.listInboxRows("parent")).some((row) => row.state === "queued")).toBe(false);
+
+		for (const [text, userId] of [
+			["A idle", "actor-a"],
+			["B idle", "actor-b"],
+		] as const) {
+			const message = delivery("parent", text);
+			await inbox.enqueueInboxAgent(message, message.text, { channel: "parent", userId });
+		}
+		const idleA = await session.drainAndPersistPendingInjections(active);
+		expect(idleA).toContain("A idle");
+		expect(idleA).not.toContain("B idle");
+		expect(active._currentUserId).toBe("actor-a");
+		expect(
+			(await inbox.listInboxRows("parent")).filter((row) => row.state === "queued"),
+		).toHaveLength(1);
+		const idleB = await session.drainAndPersistPendingInjections(active);
+		expect(idleB).toContain("B idle");
+		expect(active._currentUserId).toBe("actor-b");
+	} finally {
+		owner.release();
+	}
+});
+
 test("late claim callback cannot materialize after shared owner replacement", async () => {
 	const d = delivery("parent");
 	await inbox.enqueueInboxAgent(d, d.text, { channel: "parent" });

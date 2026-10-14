@@ -227,6 +227,25 @@ describe("buildRowToolActions", () => {
 	 * A real child (Agent/Task) still wins: when both facts are present the row IS
 	 * a subagent card, and its own child is what "view session" should open.
 	 */
+	it("opens NarratorSend via the independent narrator callback, not the child handler", () => {
+		const sink: string[] = [];
+		const actions = buildRowToolActions(
+			{ toolName: "NarratorSend", sendTargetNarratorId: "peer" },
+			{ ...allHandlers(sink), onViewNarratorSession: (id) => sink.push(`narrator:${id}`) },
+		);
+		actions.onViewNarratorSession?.();
+		expect(sink).toEqual(["narrator:peer"]);
+		expect(actions.onViewSubagentSession).toBeUndefined();
+		expect(actions.onDetachSubagent).toBeUndefined();
+		expect(actions.onCancelBackgroundTask).toBeUndefined();
+		expect(
+			buildRowToolActions(
+				{ toolName: "NarratorSend", sendTargetNarratorId: "peer" },
+				allHandlers([]),
+			).onViewSubagentSession,
+		).toBeUndefined();
+	});
+
 	it("prefers a real child narrator over a Send target", () => {
 		const sink: string[] = [];
 		const actions = buildRowToolActions(

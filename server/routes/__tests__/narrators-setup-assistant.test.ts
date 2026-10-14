@@ -46,7 +46,7 @@ const dependencyFixture: ReturnType<typeof dependencyService.checkAll> = {
 };
 const checkAll = spyOn(dependencyService, "checkAll").mockReturnValue(dependencyFixture);
 const sendMessage = spyOn(session, "sendMessage").mockImplementation(
-	async (narratorId, prompt, _images, _locale, _replyInUserLanguage, _commandText, userId) => {
+	(async (narratorId: string, prompt: string, _images: unknown, _locale: unknown, _replyInUserLanguage: unknown, _commandText: string | null | undefined, userId: string | null | undefined) => {
 		const [message] = await db
 			.insert(narratorMessages)
 			.values({
@@ -59,7 +59,7 @@ const sendMessage = spyOn(session, "sendMessage").mockImplementation(
 			})
 			.returning();
 		return message;
-	},
+	}) as never,
 );
 const network = spyOn(globalThis, "fetch").mockImplementation(
 	Object.assign(

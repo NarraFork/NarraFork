@@ -19,6 +19,7 @@ const READ_ONLY_TOOLS = new Set([
 	"WebSearch",
 	"WebFetch",
 	"ContextAsk",
+	"NarratorList",
 	"TeamStatus",
 	"Await",
 	"Recall",

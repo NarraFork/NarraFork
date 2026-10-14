@@ -1,5 +1,6 @@
 import { beforeAll, describe, expect, it } from "bun:test";
 import { segmentMessages } from "../message/message-segments";
+import { getSummary, getCategory } from "../tool-call/tool-display";
 import type { NarratorMsg } from "../narrator-panel-types";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 import { VLIST_REGISTRY } from "./registry";
@@ -63,6 +64,47 @@ describe("communication bubbles", () => {
 		return bubble(inputJson, tc, ctx)
 			.data as import("@shared/pretext-layout/segment-adapter").CommunicationBubbleData;
 	}
+
+	it("NarratorSend reuses communication consumption state and retains its name", () => {
+		const inputJson = { id: "peer", message: "**hello peer**" };
+		expect(getCategory("NarratorSend", inputJson)).toBe("send");
+		expect(getCategory("NarratorList")).not.toBe("send");
+		expect(getSummary("NarratorSend", inputJson)).toContain("to peer");
+		const tc = {
+			toolName: "NarratorSend",
+			_metadata: {
+				kind: "send",
+				targetCount: 1,
+				doInterrupt: false,
+				await: false,
+				targets: [
+					{
+						id: "peer",
+						label: "Peer",
+						status: "sent",
+						deliveryMessageId: "receipt",
+						injectionConsumedAt: "2026-07-18T00:00:00.000Z",
+					},
+				],
+			},
+		};
+		const spec = bubble(inputJson, tc);
+		expect(spec.kind).toBe("communication-bubble");
+		expect(spec.data).toMatchObject({
+			toolName: "NarratorSend",
+			message: "**hello peer**",
+			awaitReply: false,
+			recipients: [
+				{
+					id: "peer",
+					deliveryMessageId: "receipt",
+					injectionConsumedAt: "2026-07-18T00:00:00.000Z",
+				},
+			],
+			deliveryState: { targetCount: 1, sentCount: 1, receivedCount: 1, awaitReply: false },
+		});
+		expect(bubble(inputJson, { toolName: "NarratorSend" }).kind).toBe("communication-bubble");
+	});
 
 	it.each([
 		1, 2, 3, 4, 5,

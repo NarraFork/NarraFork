@@ -352,7 +352,7 @@ const toolContributionSchema = contributionBaseSchema
 		title: textSchema(200),
 		description: textSchema(2_000).optional(),
 		inputSchema: jsonSchemaObject,
-		execution: z.enum(["server", "ui"]),
+		execution: z.enum(["server", "ui", "host"]),
 		allowBackground: z.boolean().default(false),
 	})
 	.strict();
@@ -362,7 +362,7 @@ const commandContributionSchema = contributionBaseSchema
 		title: textSchema(200),
 		description: textSchema(2_000).optional(),
 		inputSchema: jsonSchemaObject.optional(),
-		handler: z.enum(["server", "ui"]),
+		handler: z.enum(["server", "ui", "host"]),
 		when: z
 			.string()
 			.max(200)
@@ -1269,8 +1269,8 @@ function validateManifestCrossFields(
 		contributes: {
 			providers: unknown[];
 			searchProviders: unknown[];
-			tools: unknown[];
-			commands: unknown[];
+			tools: Array<{ execution: string }>;
+			commands: Array<{ handler: string }>;
 			events: unknown[];
 			views: unknown[];
 		};
@@ -1282,8 +1282,8 @@ function validateManifestCrossFields(
 		manifest.contributes.providers.length > 0 ||
 		// Search sources are served over `provider.search`, so they need a backend too.
 		manifest.contributes.searchProviders.length > 0 ||
-		manifest.contributes.tools.length > 0 ||
-		manifest.contributes.commands.length > 0 ||
+		manifest.contributes.tools.some((tool) => tool.execution !== "host") ||
+		manifest.contributes.commands.some((command) => command.handler !== "host") ||
 		manifest.contributes.events.length > 0;
 	if (hasServerContributions && !manifest.server) {
 		ctx.addIssue({
