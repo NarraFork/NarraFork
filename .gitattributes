@@ -1,2 +1,6 @@
 drizzle-postgres/meta/current_snapshot.json text eol=lf
 drizzle-postgres/*.sql text eol=lf
+examples/plugins/steward-narrator/*.json text eol=lf
+examples/plugins/steward-narrator/server/*.js text eol=lf
+examples/plugins/steward-narrator/ui/*.js text eol=lf
+examples/plugins/steward-narrator/ui/*.css text eol=lf
