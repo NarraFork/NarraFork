@@ -275,6 +275,9 @@ describe("PluginStorage", () => {
 				},
 			),
 		).rejects.toThrow("authority revoked");
-		expect(await storage.get({ scope: input.scope, key: input.key })).toMatchObject({ value: "original", revision: 1 });
+		expect(await storage.get({ scope: input.scope, key: input.key })).toMatchObject({
+			value: "original",
+			revision: 1,
+		});
 	});
 });

@@ -107,21 +107,21 @@ async function settle() {
 }
 
 describe("steward-narrator manifest and package", () => {
-	test("passes the authoritative manifest schema with server/ui contributions", () => {
+	test("passes the authoritative manifest schema with host-owned contributions and server handshake", () => {
 		const parsed = safeParseManifest(manifest);
 		if (!parsed.success) throw new Error(JSON.stringify(parsed.error.issues));
 		expect(parsed.data.pluginId).toBe("steward-narrator");
 		expect(parsed.data.server?.entry).toBe("server/index.js");
 		expect(parsed.data.engine.features).toEqual(["host_api.requests"]);
 		expect(parsed.data.contributes.tools).toHaveLength(1);
-		expect(parsed.data.contributes.tools[0].execution).toBe("server");
+		expect(parsed.data.contributes.tools[0].execution).toBe("host");
 		expect(parsed.data.contributes.tools[0].id).toBe("steward.send");
 		expect(parsed.data.contributes.tools[0].allowBackground).toBe(false);
 		expect(
 			parsed.data.contributes.commands.map((command) => [command.id, command.handler]),
 		).toEqual([
-			["steward.bind", "server"],
-			["steward.binding", "server"],
+			["steward.bind", "host"],
+			["steward.binding", "host"],
 			["steward.recipients", "host"],
 			["steward.panelSend", "host"],
 		]);
@@ -168,14 +168,14 @@ describe("steward-narrator manifest and package", () => {
 	test("fixed plugin package installs with approved source and content hashes", async () => {
 		const archive = join(packageRoot, "steward-narrator-0.2.0.nfplugin");
 		const sourceHash = createHash("sha256").update(readFileSync(archive)).digest("hex");
-		expect(sourceHash).toBe("06242b7dcbb549afe0bf8e18598b22cd08cd43ccde61cc949f919173fae136d8");
+		expect(sourceHash).toBe("5972879ec25d282de96a4715ebcf803e845b66dae6ccf3fce406e17f9dcf3991");
 		const storeRoot = mkdtempSync(join(tmpdir(), "steward-narrator-install-"));
 		try {
 			const installed = await new PluginPackageStore(storeRoot).install(archive);
 			expect(installed.pluginId).toBe("steward-narrator");
 			expect(installed.version).toBe("0.2.0");
 			expect(installed.hash).toBe(
-				"4bff64215cc7f1a971a2f5cbd1a0f275b3415b7fb3173e8ce9283819b43c3657",
+				"d5d8bc4590fc7d2eb844cea6b3fc6f7717546533e871df8a2bf3a103533efadf",
 			);
 			for (const name of [
 				"manifest.json",
@@ -209,27 +209,27 @@ describe("steward-narrator manifest and package", () => {
 			);
 			if (result.status !== 0) throw new Error(result.stderr || String(result.error));
 			const packed = JSON.parse(result.stdout)[0];
-				expect(packed.files.map((file: { path: string }) => file.path).sort()).toEqual([
-					"manifest.json",
-					"package.json",
-					"sbom.spdx.json",
-					"server/index.js",
-					"ui/panel.css",
-					"ui/panel.iife.js",
-				]);
+			expect(packed.files.map((file: { path: string }) => file.path).sort()).toEqual([
+				"manifest.json",
+				"package.json",
+				"sbom.spdx.json",
+				"server/index.js",
+				"ui/panel.css",
+				"ui/panel.iife.js",
+			]);
 			const archive = spawnSync("tar", ["-tzf", packed.filename], {
 				cwd: outputDirectory,
 				encoding: "utf8",
 			});
 			expect(archive.status).toBe(0);
-				expect(archive.stdout.trim().split(/\r?\n/).sort()).toEqual([
-					"package/manifest.json",
-					"package/package.json",
-					"package/sbom.spdx.json",
-					"package/server/index.js",
-					"package/ui/panel.css",
-					"package/ui/panel.iife.js",
-				]);
+			expect(archive.stdout.trim().split(/\r?\n/).sort()).toEqual([
+				"package/manifest.json",
+				"package/package.json",
+				"package/sbom.spdx.json",
+				"package/server/index.js",
+				"package/ui/panel.css",
+				"package/ui/panel.iife.js",
+			]);
 			const packedManifest = spawnSync("tar", ["-xOzf", packed.filename, "package/manifest.json"], {
 				cwd: outputDirectory,
 				encoding: "utf8",
@@ -299,7 +299,11 @@ describe("steward binding panel", () => {
 		expect(ui.get("steward-status").textContent).toBe("已绑定其他叙述者");
 		ui.get("steward-button-secondary").click();
 		await settle();
-		expect(ui.calls.filter((call) => call.commandId !== "steward.recipients").map((call) => call.commandId)).toEqual(["steward.binding", "steward.binding"]);
+		expect(
+			ui.calls
+				.filter((call) => call.commandId !== "steward.recipients")
+				.map((call) => call.commandId),
+		).toEqual(["steward.binding", "steward.binding"]);
 	});
 
 	test("host command failure is visible and recovers with refresh without retrying bind", async () => {

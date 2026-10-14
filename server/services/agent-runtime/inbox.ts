@@ -1,5 +1,4 @@
 import { formatOriginLabel, type MessageOriginOptions } from "@shared/message-origin";
-import { authorizeStewardMessage, guardStewardMessageCommit, isStewardMessage } from "../steward-message-admission";
 import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 import { db } from "../../db";
 import {
@@ -20,6 +19,11 @@ import { logger } from "../../lib/logger";
 import type { Locale } from "../../lib/prompt-i18n";
 import type { AgentMessageDelivery } from "../agent-message-delivery";
 import { getNarratorMessageRefsPort } from "../narrator-refs/store";
+import {
+	authorizeStewardMessage,
+	guardStewardMessageCommit,
+	isStewardMessage,
+} from "../steward-message-admission";
 import { createMailboxStore, mailboxDedupeKey } from "./mailbox";
 import { isAwaitedTerminalConsumption } from "./mailbox-shared";
 import type { MailboxClaim, MailboxInput, MailboxKind } from "./mailbox-types";
@@ -528,12 +532,26 @@ export async function withInboxOwner<T>(narratorId: string, work: () => Promise<
  * delivery is left untouched.
  */
 /** Revoke an exact delegated row rather than making rejected sends retryable. */
-export async function cancelInboxInput(narratorId: string, id: string, error: unknown): Promise<void> {
+export async function cancelInboxInput(
+	narratorId: string,
+	id: string,
+	error: unknown,
+): Promise<void> {
 	const port = getRuntimeQueuePort();
 	const current = port
 		? await port.mailbox.getById(id)
-		: db.select().from(mailbox).where(and(eq(mailbox.id, id), eq(mailbox.narratorId, narratorId))).get();
-	if (!current?.deliveryId || current.narratorId !== narratorId || current.state === "materialized" || current.state === "cancelled") return;
+		: db
+				.select()
+				.from(mailbox)
+				.where(and(eq(mailbox.id, id), eq(mailbox.narratorId, narratorId)))
+				.get();
+	if (
+		!current?.deliveryId ||
+		current.narratorId !== narratorId ||
+		current.state === "materialized" ||
+		current.state === "cancelled"
+	)
+		return;
 	if (current.state === "claimed") {
 		if (port) await port.mailbox.cancelClaim(inboxClaim(current), String(error));
 		else runtimeInbox.cancelClaim(inboxClaim(current), String(error));
@@ -952,7 +970,8 @@ export async function materializeClaimedInboxUserMessage(input: {
 	const placed = capturePlacedRef();
 	const materializer = createPgPlacedMessageMaterializer(message, { onPersist: placed.hook });
 	const row = await queue.mailbox.materialize(input.claim, async (tx, claimedRow) => {
-		const durableOrigin = inboxMetadata<{ origin?: MessageOriginOptions }>(claimedRow).origin ?? input.origin;
+		const durableOrigin =
+			inboxMetadata<{ origin?: MessageOriginOptions }>(claimedRow).origin ?? input.origin;
 		await authorizeStewardMessage(input.narratorId, input.createdBy, durableOrigin, input.signal);
 		input.signal?.throwIfAborted();
 		const binding = await materializer(tx, claimedRow);
@@ -1031,8 +1050,14 @@ export async function persistClaimedUserInput(input: {
 	const queue = getRuntimeQueuePort();
 	const durable = queue
 		? await queue.mailbox.getById(input.claim.id)
-		: db.select().from(mailbox).where(and(eq(mailbox.id, input.claim.id), eq(mailbox.narratorId, input.narratorId))).get();
-	const durableOrigin = durable ? inboxMetadata<{ origin?: MessageOriginOptions }>(durable).origin : undefined;
+		: db
+				.select()
+				.from(mailbox)
+				.where(and(eq(mailbox.id, input.claim.id), eq(mailbox.narratorId, input.narratorId)))
+				.get();
+	const durableOrigin = durable
+		? inboxMetadata<{ origin?: MessageOriginOptions }>(durable).origin
+		: undefined;
 	input.origin = durableOrigin ?? input.origin;
 	try {
 		await authorizeStewardMessage(input.narratorId, input.createdBy, input.origin, input.signal);
@@ -1073,26 +1098,30 @@ export async function persistClaimedUserInput(input: {
 		...(message.mailbox ? { mailbox: message.mailbox } : {}),
 	});
 	try {
-	if (getRuntimeQueuePort()) {
-		const materialized = await materializeClaimedInboxUserMessage(input);
-		return toClaimedUserInputMessage(materialized);
-	}
-	const { narratorService } = await import("../narrator-service");
-	const persisted = await narratorService.persistUserMessage(
-		input.narratorId,
-		input.text,
-		input.contentBlocks,
-		input.commandText,
-		input.createdBy,
-		input.origin,
-		{
-			mailboxClaim: input.claim,
-			beforeCommit: () => authorizeStewardMessage(input.narratorId, input.createdBy, input.origin, input.signal),
-			onPersist: () => { guardStewardMessageCommit(input.origin, input.signal); return undefined; },
-			...(input.parentToolUseId === undefined ? {} : { parentToolUseId: input.parentToolUseId }),
-		},
-	);
-	return toClaimedUserInputMessage(persisted);
+		if (getRuntimeQueuePort()) {
+			const materialized = await materializeClaimedInboxUserMessage(input);
+			return toClaimedUserInputMessage(materialized);
+		}
+		const { narratorService } = await import("../narrator-service");
+		const persisted = await narratorService.persistUserMessage(
+			input.narratorId,
+			input.text,
+			input.contentBlocks,
+			input.commandText,
+			input.createdBy,
+			input.origin,
+			{
+				mailboxClaim: input.claim,
+				beforeCommit: () =>
+					authorizeStewardMessage(input.narratorId, input.createdBy, input.origin, input.signal),
+				onPersist: () => {
+					guardStewardMessageCommit(input.origin, input.signal);
+					return undefined;
+				},
+				...(input.parentToolUseId === undefined ? {} : { parentToolUseId: input.parentToolUseId }),
+			},
+		);
+		return toClaimedUserInputMessage(persisted);
 	} catch (error) {
 		if (isStewardMessage(input.origin) || input.signal?.aborted)
 			await cancelInboxInput(input.narratorId, input.claim.id, error);

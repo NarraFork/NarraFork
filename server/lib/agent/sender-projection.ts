@@ -124,19 +124,22 @@ function attribute(value: string): string {
 }
 function marker(value: MessageSender): string {
 	const provenance = value.stewardProvenance;
-	const delegation = provenance && value.kind === "agent"
-		? Object.entries({
-			delegated_user_id: provenance.userId,
-			...(value.delegatedUserName ? { delegated_user_name: value.delegatedUserName } : {}),
-			plugin_id: provenance.pluginId,
-			contribution_id: provenance.contributionId,
-			steward_narrator_id: provenance.stewardNarratorId,
-			target_narrator_id: provenance.targetNarratorId,
-			request_id: provenance.requestId,
-			correlation_id: provenance.correlationId,
-			binding_revision: String(provenance.bindingRevision),
-		}).map(([key, content]) => ` ${key}="${attribute(content)}"`).join("")
-		: "";
+	const delegation =
+		provenance && value.kind === "agent"
+			? Object.entries({
+					delegated_user_id: provenance.userId,
+					...(value.delegatedUserName ? { delegated_user_name: value.delegatedUserName } : {}),
+					plugin_id: provenance.pluginId,
+					contribution_id: provenance.contributionId,
+					steward_narrator_id: provenance.stewardNarratorId,
+					target_narrator_id: provenance.targetNarratorId,
+					request_id: provenance.requestId,
+					correlation_id: provenance.correlationId,
+					binding_revision: String(provenance.bindingRevision),
+				})
+					.map(([key, content]) => ` ${key}="${attribute(content)}"`)
+					.join("")
+			: "";
 	return `<sender kind="${value.kind}"${known(value.id) ? ` id="${attribute(value.id as string)}"` : ""}${known(value.name) ? ` name="${attribute(value.name as string)}"` : ""}${delegation} />`;
 }
 

@@ -52,7 +52,7 @@
 					"required": ["targetNarratorId", "message"],
 					"additionalProperties": false
 				},
-				"execution": "server",
+				"execution": "host",
 				"allowBackground": false
 			}
 		],
@@ -60,13 +60,13 @@
 			{
 				"id": "steward.bind",
 				"title": "将当前叙述者设为管家",
-				"handler": "server",
+				"handler": "host",
 				"inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
 			},
 			{
 				"id": "steward.binding",
 				"title": "读取当前用户的管家绑定",
-				"handler": "server",
+				"handler": "host",
 				"inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
 			},
 			{

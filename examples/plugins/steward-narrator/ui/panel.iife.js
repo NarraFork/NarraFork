@@ -67,7 +67,11 @@
 	messageInput.disabled = true;
 	messageLabel.appendChild(messageInput);
 	composer.appendChild(messageLabel);
-	const sendButton = element("button", "steward-button steward-button-primary steward-send", "通过宿主安全发送");
+	const sendButton = element(
+		"button",
+		"steward-button steward-button-primary steward-send",
+		"通过宿主安全发送",
+	);
 	sendButton.type = "button";
 	sendButton.disabled = true;
 	composer.appendChild(sendButton);
@@ -86,11 +90,7 @@
 	);
 	root.appendChild(panel);
 
-	if (
-		!sdk ||
-		typeof sdk.commands?.execute !== "function" ||
-		typeof sdk.getContext !== "function"
-	) {
+	if (!sdk || typeof sdk.commands?.execute !== "function" || typeof sdk.getContext !== "function") {
 		status.textContent = "不可用";
 		status.dataset.state = "error";
 		detail.textContent = "请在 NarraFork 叙述者侧栏中打开此面板。";
@@ -207,17 +207,20 @@
 			cursor = page.nextCursor;
 		}
 		const options = recipients.map((row) => {
-			const title = typeof row.title === "string" && row.title.trim()
-				? row.title.trim()
-				: typeof row.handle === "string" && row.handle.trim()
-					? row.handle.trim()
-					: row.id;
+			const title =
+				typeof row.title === "string" && row.title.trim()
+					? row.title.trim()
+					: typeof row.handle === "string" && row.handle.trim()
+						? row.handle.trim()
+						: row.id;
 			const option = element("option", "", `${title} · ${row.id}`);
 			option.value = row.id;
 			return option;
 		});
 		recipientSelect.replaceChildren(recipientPlaceholder, ...options);
-		recipientPlaceholder.textContent = options.length ? "选择可访问的叙述者…" : "没有可访问的叙述者";
+		recipientPlaceholder.textContent = options.length
+			? "选择可访问的叙述者…"
+			: "没有可访问的叙述者";
 		recipientsReady = true;
 		recipientSelect.disabled = busy;
 	};

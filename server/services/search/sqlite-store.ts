@@ -93,8 +93,7 @@ const NARRATOR_GATE_PARAMS = (NARRATOR_GATE_SQL.match(/\?/g) ?? []).length;
 // its own clause so the statement cache can hold all three variants; the preference is a
 // per-user setting, so it cannot be folded into the viewer-less `false` fragment above.
 const NARRATOR_UNLISTED_PRIVATE_SQL = narratorUnlistedPrivateSqlFragment("n").sql;
-const NARRATOR_UNLISTED_PRIVATE_PARAMS =
-	(NARRATOR_UNLISTED_PRIVATE_SQL.match(/\?/g) ?? []).length;
+const NARRATOR_UNLISTED_PRIVATE_PARAMS = (NARRATOR_UNLISTED_PRIVATE_SQL.match(/\?/g) ?? []).length;
 const PROJECT_GATE_SQL = projectReadableSqlFragment(false, "p")?.sql ?? "1 = 1";
 const PROJECT_GATE_PARAMS = (PROJECT_GATE_SQL.match(/\?/g) ?? []).length;
 
@@ -194,15 +193,15 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 	}
 
 	function messageStmt(
-			strategy: "index" | "substring",
-			gate: NarratorListGate,
-			sort: EntitySearchQuery["sort"],
-		): QueryTemplate {
-			return cached(`messages:${strategy}:${sort ?? "relevance"}:${gate}`, () => {
-				const { sql: gateSql } = narratorGateClause(gate);
-				const gateClause = gateSql ? ` ${gateSql}` : "";
-				if (strategy === "index") {
-					return `SELECT ${MESSAGE_COLUMNS},
+		strategy: "index" | "substring",
+		gate: NarratorListGate,
+		sort: EntitySearchQuery["sort"],
+	): QueryTemplate {
+		return cached(`messages:${strategy}:${sort ?? "relevance"}:${gate}`, () => {
+			const { sql: gateSql } = narratorGateClause(gate);
+			const gateClause = gateSql ? ` ${gateSql}` : "";
+			if (strategy === "index") {
+				return `SELECT ${MESSAGE_COLUMNS},
 				  ${snippetCall("narrator_messages_fts", 0, GLOBAL_SNIPPET)} as snippet,
 				  rank as rank_score
 				 FROM narrator_messages_fts
@@ -212,8 +211,8 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 				 LEFT JOIN projects p ON p.id = c.project_id
 				 WHERE narrator_messages_fts MATCH ?${gateClause}
 				 ORDER BY ${sort === "time" ? "m.created_at DESC, m.id ASC" : "rank"} LIMIT ?`;
-				}
-				return `SELECT ${MESSAGE_COLUMNS},
+			}
+			return `SELECT ${MESSAGE_COLUMNS},
 				  substr(m.content_text, 1, ${PREVIEW_CHARS}) as snippet
 				 FROM narrator_messages m
 				 JOIN narrators n ON n.id = m.narrator_id
@@ -221,19 +220,19 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 				 LEFT JOIN projects p ON p.id = c.project_id
 				 WHERE m.content_text LIKE ?${gateClause}
 				 ${sort === "time" ? "ORDER BY m.created_at DESC, m.id ASC" : ""} LIMIT ?`;
-			});
-		}
+		});
+	}
 
 	function narratorStmt(
-			strategy: "index" | "substring",
-			gate: NarratorListGate,
-			sort: EntitySearchQuery["sort"],
-		): QueryTemplate {
-			return cached(`narrators:${strategy}:${sort ?? "relevance"}:${gate}`, () => {
-				const { sql: gateSql } = narratorGateClause(gate);
-				const gateClause = gateSql ? ` ${gateSql}` : "";
-				if (strategy === "index") {
-					return `SELECT ${NARRATOR_COLUMNS},
+		strategy: "index" | "substring",
+		gate: NarratorListGate,
+		sort: EntitySearchQuery["sort"],
+	): QueryTemplate {
+		return cached(`narrators:${strategy}:${sort ?? "relevance"}:${gate}`, () => {
+			const { sql: gateSql } = narratorGateClause(gate);
+			const gateClause = gateSql ? ` ${gateSql}` : "";
+			if (strategy === "index") {
+				return `SELECT ${NARRATOR_COLUMNS},
 				  ${snippetCall("narrators_fts", 0, GLOBAL_SNIPPET)} as snippet,
 				  rank as rank_score
 				 FROM narrators_fts
@@ -242,17 +241,17 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 				 LEFT JOIN projects p ON p.id = c.project_id
 				 WHERE narrators_fts MATCH ?${gateClause}
 				 ORDER BY ${sort === "time" ? "COALESCE(n.updated_at, n.created_at, n.last_message_at) DESC, n.id ASC" : "rank"} LIMIT ?`;
-				}
-				// No snippet column at all on this path: the caller falls back to the title, which is
-				// the only text this search matches against.
-				return `SELECT ${NARRATOR_COLUMNS}
+			}
+			// No snippet column at all on this path: the caller falls back to the title, which is
+			// the only text this search matches against.
+			return `SELECT ${NARRATOR_COLUMNS}
 				 FROM narrators n
 				 LEFT JOIN chapters c ON c.id = n.chapter_id
 				 LEFT JOIN projects p ON p.id = c.project_id
 				 WHERE n.title LIKE ?${gateClause}
 				 ${sort === "time" ? "ORDER BY COALESCE(n.updated_at, n.created_at, n.last_message_at) DESC, n.id ASC" : ""} LIMIT ?`;
-			});
-		}
+		});
+	}
 
 	// ─────────────────────────────────────────────────────────────────────────────
 	// Timeline search

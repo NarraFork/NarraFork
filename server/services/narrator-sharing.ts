@@ -24,7 +24,6 @@ import { aclGrants, narrators, users } from "../db/schema";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
-import { pruneUnreadableNarratorTabs } from "./recent-tabs-service";
 import {
 	broadcastToUser,
 	dropNarratorSubscriptionsForUnauthorizedUsers,
@@ -37,6 +36,7 @@ import {
 	type NarratorPrincipal,
 	resolveAclRootId,
 } from "./narrator-acl";
+import { pruneUnreadableNarratorTabs } from "./recent-tabs-service";
 
 export interface NarratorGrantView {
 	id: string;

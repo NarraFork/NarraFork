@@ -33,12 +33,12 @@ import { AppError, ValidationError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { parseSubstatus } from "../lib/narrator-utils";
+import { broadcastToUser } from "../websocket/narrator-ws";
 import {
 	filterReadableNarrators,
 	type NarratorPrincipal,
 	resolveNarratorListPrincipal,
 } from "./narrator-acl";
-import { broadcastToUser } from "../websocket/narrator-ws";
 
 const RECENT_TAB_TEXT_MAX_CHARS = 1_000;
 const UNDO_TTL_MS = 30_000;

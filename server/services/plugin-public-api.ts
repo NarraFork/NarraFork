@@ -21,10 +21,10 @@ import {
 	createNarratorForPlugin as createNarratorForPluginSession,
 	deleteNarratorForPlugin as deleteNarratorForPluginSession,
 	interruptNarrator as interruptNarratorSession,
-	readSpecTasksForPlugin as readSpecTasksForPluginSession,
-	sendMessage as sendNarratorMessage,
 	type NarratorMessageSendInput,
 	type NarratorMessageSendResult,
+	readSpecTasksForPlugin as readSpecTasksForPluginSession,
+	sendMessage as sendNarratorMessage,
 	setSpecBehaviorFenceForPlugin as setSpecBehaviorFenceForPluginSession,
 	updateNarratorProfileForPlugin as updateNarratorProfileForPluginSession,
 	writeSpecForPlugin as writeSpecForPluginSession,
@@ -1765,9 +1765,7 @@ export class PluginPublicApi {
 	): Promise<CommandResult> {
 		return this.executeCommand(context, request, {
 			signal: options.signal,
-			...(options.stewardProvenance
-				? { stewardProvenance: { ...options.stewardProvenance } }
-				: {}),
+			...(options.stewardProvenance ? { stewardProvenance: { ...options.stewardProvenance } } : {}),
 		});
 	}
 
@@ -2461,7 +2459,11 @@ export class PluginPublicApi {
 		}
 	}
 
-	private async executeCommand(rawContext: unknown, rawRequest: unknown, hostOptions: HostCommandOptions = {}): Promise<CommandResult> {
+	private async executeCommand(
+		rawContext: unknown,
+		rawRequest: unknown,
+		hostOptions: HostCommandOptions = {},
+	): Promise<CommandResult> {
 		const startedAt = this.now().getTime();
 		let context: HostCallContext;
 		try {
@@ -2564,14 +2566,26 @@ export class PluginPublicApi {
 
 		if (hostOptions.stewardProvenance) {
 			try {
-				if (request.commandId !== "narrafork.narrator.send_message" || !isPlainObject(parsedInput) ||
-					context.scope.narratorId !== context.invocation.narratorId)
-					throw new PluginPublicApiError("PERMISSION_DENIED", "Steward host send requires source scope");
+				if (
+					request.commandId !== "narrafork.narrator.send_message" ||
+					!isPlainObject(parsedInput) ||
+					context.scope.narratorId !== context.invocation.narratorId
+				)
+					throw new PluginPublicApiError(
+						"PERMISSION_DENIED",
+						"Steward host send requires source scope",
+					);
 				const provenance = validateStewardProvenance(
-					hostOptions.stewardProvenance, context, String(parsedInput.narratorId), context.plugin.pluginId,
+					hostOptions.stewardProvenance,
+					context,
+					String(parsedInput.narratorId),
+					context.plugin.pluginId,
 				);
 				hostOptions = { ...hostOptions, stewardProvenance: provenance };
-				context = { ...context, scope: { ...context.scope, narratorId: provenance.targetNarratorId } };
+				context = {
+					...context,
+					scope: { ...context.scope, narratorId: provenance.targetNarratorId },
+				};
 			} catch (error) {
 				const result = this.commandErrorResult(request, definition!, error);
 				await this.audit(context, definition, resource, result, startedAt, request, false);
@@ -3101,12 +3115,20 @@ function validateStewardProvenance(
 		provenance.requestId !== context.requestId ||
 		provenance.correlationId !== context.correlationId ||
 		provenance.targetNarratorId !== narratorId ||
-		![provenance.stewardNarratorId, provenance.targetNarratorId].includes(context.scope.narratorId ?? "") ||
+		![provenance.stewardNarratorId, provenance.targetNarratorId].includes(
+			context.scope.narratorId ?? "",
+		) ||
 		provenance.stewardNarratorId !== context.invocation.narratorId
 	) {
-		throw new PluginPublicApiError("PERMISSION_DENIED", "Steward provenance does not match host context");
+		throw new PluginPublicApiError(
+			"PERMISSION_DENIED",
+			"Steward provenance does not match host context",
+		);
 	}
-	if (!Number.isFinite(Date.parse(context.deadlineAt)) || Date.parse(context.deadlineAt) <= Date.now()) {
+	if (
+		!Number.isFinite(Date.parse(context.deadlineAt)) ||
+		Date.parse(context.deadlineAt) <= Date.now()
+	) {
 		throw new PluginPublicApiError("TIMEOUT", "Steward invocation deadline has expired");
 	}
 	return provenance;
@@ -3360,7 +3382,12 @@ export function createCorePluginPublicApiAdapters(options: {
 					}
 					// Snapshot before any await: a caller cannot mutate the trusted source mid-send.
 					const provenance = input.stewardProvenance
-						? validateStewardProvenance(input.stewardProvenance, input.context, input.narratorId, input.pluginId)
+						? validateStewardProvenance(
+								input.stewardProvenance,
+								input.context,
+								input.narratorId,
+								input.pluginId,
+							)
 						: undefined;
 					if (input.signal.aborted)
 						throw new PluginPublicApiError("CANCELLED", "Command was cancelled");
@@ -3375,10 +3402,14 @@ export function createCorePluginPublicApiAdapters(options: {
 						userId: input.context.invocation.userId ?? null,
 						origin: provenance
 							? {
-								origin: "assistant", originLabel: formatStewardOriginLabel(provenance),
-								delegationDeadlineAt: input.context.deadlineAt,
-								delegationHostContext: { ...input.context, scope: { ...input.context.scope, narratorId: provenance.stewardNarratorId } },
-							}
+									origin: "assistant",
+									originLabel: formatStewardOriginLabel(provenance),
+									delegationDeadlineAt: input.context.deadlineAt,
+									delegationHostContext: {
+										...input.context,
+										scope: { ...input.context.scope, narratorId: provenance.stewardNarratorId },
+									},
+								}
 							: { origin: "user", originLabel: `plugin:${input.pluginId}` },
 						signal: input.signal,
 					});

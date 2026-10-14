@@ -3,8 +3,8 @@ import { and, asc, eq, gt, isNull, ne, or, sql } from "drizzle-orm";
 import { db } from "../db";
 import { integrationResourceBindings, narrators, narratorToolCalls, users } from "../db/schema";
 import type { ToolCallBinding } from "../lib/agent/types";
-import type { Locale } from "../lib/prompt-i18n";
 import { isPlanModeTrait } from "../lib/narrator-utils";
+import type { Locale } from "../lib/prompt-i18n";
 import {
 	isRuntimeToolAllowed,
 	type RuntimePolicy,

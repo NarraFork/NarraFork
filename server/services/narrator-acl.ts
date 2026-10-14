@@ -562,9 +562,8 @@ function judgedUnlistedPrivateSql(jn: string): string {
 }
 
 /** How many `?` {@link judgedUnlistedPrivateSql} binds. Derived, never hard-coded. */
-const JUDGED_UNLISTED_PRIVATE_PARAM_COUNT = (
-	judgedUnlistedPrivateSql("jn").match(/\?/g) ?? []
-).length;
+const JUDGED_UNLISTED_PRIVATE_PARAM_COUNT = (judgedUnlistedPrivateSql("jn").match(/\?/g) ?? [])
+	.length;
 
 /**
  * Which narrator-visibility clause a list query needs.

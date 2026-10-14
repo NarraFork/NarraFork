@@ -1169,12 +1169,7 @@ export async function listAllOpenAsyncQuestionsForPrincipal(
 		//     the ONLY thing that narrows the result, because `canReadNarrator` admits every
 		//     admin by design. Without it the preference would silently not apply here.
 		// `undefined` for a full-view admin composes to "no extra restriction" under `and(...)`.
-		.where(
-			and(
-				eq(narratorQuestions.status, "open"),
-				narratorReadableWhere(principal),
-			),
-		)
+		.where(and(eq(narratorQuestions.status, "open"), narratorReadableWhere(principal)))
 		.orderBy(desc(narratorQuestions.createdAt), desc(narratorQuestions.id))
 		.limit(HARD_LIMIT);
 

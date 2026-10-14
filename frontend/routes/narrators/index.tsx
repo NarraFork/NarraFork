@@ -9,7 +9,6 @@ import {
 	NarratorListCard,
 	type NarratorListItem,
 } from "../../components/narrator/list/NarratorListCard";
-import { NarratorAccessSettingsModal } from "../../components/narrator/NarratorAccessSettingsModal";
 import {
 	NarratorListControls,
 	NarratorListExtraFiltersButton,
@@ -28,6 +27,7 @@ import {
 	useNarratorInfiniteScroll,
 	validateNarratorListSearch,
 } from "../../components/narrator/list/narrator-list-utils";
+import { NarratorAccessSettingsModal } from "../../components/narrator/NarratorAccessSettingsModal";
 import { useAllModels } from "../../hooks/useModels";
 import { useArchiveNarrator, useNarratorsPaginated } from "../../hooks/useNarrator";
 import { useNarratorsListWS } from "../../hooks/useNarratorWS";

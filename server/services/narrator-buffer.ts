@@ -30,7 +30,6 @@ import { generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getNarraforkPath } from "../lib/narrafork-home";
 import type { ImageRef } from "../lib/uploads";
-import { authorizeStewardMessage } from "./steward-message-admission";
 import { MAILBOX_LIMITS } from "./agent-runtime/limits";
 import { createMailboxStore } from "./agent-runtime/mailbox";
 import type { MailboxRow } from "./agent-runtime/mailbox-types";
@@ -49,6 +48,7 @@ import {
 	isNarratorRuntimeBusy,
 	type SavedBufferedFile,
 } from "./narrator-session-state";
+import { authorizeStewardMessage } from "./steward-message-admission";
 
 // REST text input is capped at 100k UTF-16 units; this also covers internal producers.
 const MAX_BUFFERED_PAYLOAD_BYTES = 2 * 1024 * 1024;

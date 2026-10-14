@@ -1,10 +1,10 @@
 import { Database } from "bun:sqlite";
 import { afterAll, afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
+import { formatStewardOriginLabel, parseStewardOriginLabel } from "@shared/message-origin";
 import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import { narratorMessageRefs, narratorMessages, narrators, users } from "../../db/schema";
 import { settings } from "../../lib/settings";
-import { formatStewardOriginLabel, parseStewardOriginLabel } from "@shared/message-origin";
 import type { RuntimeHistoryMessage } from "../agent-runtime/history";
 import { modelHistoryFixtureSql } from "../agent-runtime/model-history-fixture";
 import { readSqliteModelHistorySignature } from "../agent-runtime/model-history-revision";
@@ -67,15 +67,26 @@ afterAll(() => sqlite.close());
 
 test("steward delegation survives database persistence and model history projection", async () => {
 	const provenance = {
-		userId: "alice", pluginId: "steward-narrator", contributionId: "send",
-		requestId: "steward-request", correlationId: "steward-correlation",
-		stewardNarratorId: "sender", targetNarratorId: "primary", bindingRevision: 7,
+		userId: "alice",
+		pluginId: "steward-narrator",
+		contributionId: "send",
+		requestId: "steward-request",
+		correlationId: "steward-correlation",
+		stewardNarratorId: "sender",
+		targetNarratorId: "primary",
+		bindingRevision: 7,
 	};
 	const row = await narratorPersistence.persistUserMessage(
-		"primary", "original delegated bytes", undefined, null, "alice",
+		"primary",
+		"original delegated bytes",
+		undefined,
+		null,
+		"alice",
 		{ origin: "assistant", originLabel: formatStewardOriginLabel(provenance) },
 	);
-	const persisted = await db.query.narratorMessages.findFirst({ where: eq(narratorMessages.id, row.id) });
+	const persisted = await db.query.narratorMessages.findFirst({
+		where: eq(narratorMessages.id, row.id),
+	});
 	expect(persisted?.createdBy).toBe("alice");
 	expect(persisted?.origin).toBe("assistant");
 	expect(parseStewardOriginLabel(persisted?.originLabel)).toEqual(provenance);

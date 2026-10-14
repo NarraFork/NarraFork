@@ -1,6 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { NotFoundError, ValidationError } from "@server/lib/errors";
-import { parseStewardOriginLabel, type StewardMessageProvenance } from "@shared/message-origin";
 import {
 	type CapabilityAuthorizationDecision,
 	type CapabilityAuthorizationRequest,
@@ -14,6 +13,7 @@ import {
 	type PluginPublicApiAdapters,
 	PluginPublicApiError,
 } from "@server/services/plugin-public-api";
+import { parseStewardOriginLabel, type StewardMessageProvenance } from "@shared/message-origin";
 import { chapters, narratorMessages, narrators, projects } from "../../../server/db/schema";
 import { cleanDb, getTestDb } from "../../setup";
 
@@ -770,7 +770,9 @@ describe("createCorePluginPublicApiAdapters (core integration)", () => {
 	});
 
 	function stewardHarness(sendMessage: NarratorSessionFacade["sendMessage"]) {
-		const unused = async () => { throw new Error("unexpected facade call"); };
+		const unused = async () => {
+			throw new Error("unexpected facade call");
+		};
 		const adapter = createCorePluginPublicApiAdapters({
 			db,
 			pluginManager: { list: unused, getStatus: unused, enable: unused, disable: unused },
@@ -793,7 +795,10 @@ describe("createCorePluginPublicApiAdapters (core integration)", () => {
 				contributionId: "steward-send",
 			} as HostCallContext["plugin"],
 			invocation: {
-				kind: "user", userId: "user-1", source: "internal", narratorId: "n-steward",
+				kind: "user",
+				userId: "user-1",
+				source: "internal",
+				narratorId: "n-steward",
 			} as HostCallContext["invocation"],
 			scope: { narratorId: "n-steward" },
 		});
@@ -810,8 +815,12 @@ describe("createCorePluginPublicApiAdapters (core integration)", () => {
 		return {
 			adapter,
 			input: {
-				narratorId: "n-worker", message: "exact delegated bytes", pluginId: "steward-narrator",
-				stewardProvenance: provenance, context: callContext, signal: new AbortController().signal,
+				narratorId: "n-worker",
+				message: "exact delegated bytes",
+				pluginId: "steward-narrator",
+				stewardProvenance: provenance,
+				context: callContext,
+				signal: new AbortController().signal,
 			},
 		};
 	}
@@ -824,24 +833,43 @@ describe("createCorePluginPublicApiAdapters (core integration)", () => {
 		});
 		const { api } = buildApi({ adapters: { narratorCommands: adapter } });
 		const primaryContext = context();
-		const primary = await api.command(primaryContext, createCommandRequest(primaryContext,
-			"narrafork.narrator.send_message", { narratorId: "n-worker", message: "queued primary" }));
+		const primary = await api.command(
+			primaryContext,
+			createCommandRequest(primaryContext, "narrafork.narrator.send_message", {
+				narratorId: "n-worker",
+				message: "queued primary",
+			}),
+		);
 		expect(primary.status).toBe("succeeded");
 		expect(primary.data).toEqual({ accepted: true, messageId: "reserved-history-id" });
 		expect(primary.data).not.toHaveProperty("mailboxId");
 
 		const subagent = await adapter.sendSubagentMessage({
-			narratorId: "n-subagent", message: "queued worker", priority: true,
-			locale: "zh-CN", pluginId: input.pluginId, context: input.context, signal: input.signal,
+			narratorId: "n-subagent",
+			message: "queued worker",
+			priority: true,
+			locale: "zh-CN",
+			pluginId: input.pluginId,
+			context: input.context,
+			signal: input.signal,
 		});
 		expect(subagent).toEqual({
-			delivered: "buffered", messageId: "mailbox-id", bufferedAt: "2026-07-16T12:00:00.000Z",
+			delivered: "buffered",
+			messageId: "mailbox-id",
+			bufferedAt: "2026-07-16T12:00:00.000Z",
 		});
 		expect(sends).toHaveLength(2);
 		expect(sends[0]).toMatchObject({ kind: "user", target: "primary", busyPolicy: "reject" });
 		expect(sends[1]).toEqual({
-			kind: "user", target: "subagent", busyPolicy: "queue", narratorId: "n-subagent",
-			message: "queued worker", priority: true, locale: "zh-CN", userId: null, signal: input.signal,
+			kind: "user",
+			target: "subagent",
+			busyPolicy: "queue",
+			narratorId: "n-subagent",
+			message: "queued worker",
+			priority: true,
+			locale: "zh-CN",
+			userId: null,
+			signal: input.signal,
 		});
 	});
 
@@ -877,16 +905,25 @@ describe("createCorePluginPublicApiAdapters (core integration)", () => {
 	});
 
 	test("started subagent receipts expose the core history ID and started flag", async () => {
-		const { adapter, input } = stewardHarness(async () => acceptedSendResult({
-			delivered: "started", started: false, messageId: "real-history-id",
-		}));
+		const { adapter, input } = stewardHarness(async () =>
+			acceptedSendResult({
+				delivered: "started",
+				started: false,
+				messageId: "real-history-id",
+			}),
+		);
 		expect(await adapter.sendSubagentMessage(input)).toEqual({
-			delivered: "started", started: false, messageId: "real-history-id",
+			delivered: "started",
+			started: false,
+			messageId: "real-history-id",
 			bufferedAt: "2026-07-16T12:00:00.000Z",
 		});
 	});
 
-	test.each(["primary", "subagent"] as const)("cancelled %s commands never reach the facade", async (target) => {
+	test.each([
+		"primary",
+		"subagent",
+	] as const)("cancelled %s commands never reach the facade", async (target) => {
 		let sends = 0;
 		const { adapter, input } = stewardHarness(async () => {
 			sends += 1;
@@ -895,7 +932,8 @@ describe("createCorePluginPublicApiAdapters (core integration)", () => {
 		const controller = new AbortController();
 		input.signal = controller.signal;
 		controller.abort();
-		const send = target === "primary" ? adapter.sendMessage(input) : adapter.sendSubagentMessage(input);
+		const send =
+			target === "primary" ? adapter.sendMessage(input) : adapter.sendSubagentMessage(input);
 		await expect(send).rejects.toMatchObject({ code: "CANCELLED" });
 		expect(sends).toBe(0);
 	});
@@ -913,15 +951,24 @@ describe("createCorePluginPublicApiAdapters (core integration)", () => {
 		await expect(adapter.sendSubagentMessage(input)).rejects.toMatchObject({ code: "CANCELLED" });
 	});
 
-	test.each(["primary", "subagent"] as const)("%s accepted receipts survive cancellation after commit", async (target) => {
+	test.each([
+		"primary",
+		"subagent",
+	] as const)("%s accepted receipts survive cancellation after commit", async (target) => {
 		const controller = new AbortController();
 		const { adapter, input } = stewardHarness(async () => {
 			controller.abort();
 			return acceptedSendResult({ wakeError: "post-commit wake failed" });
 		});
 		input.signal = controller.signal;
-		const result = target === "primary" ? await adapter.sendMessage(input) : await adapter.sendSubagentMessage(input);
-		expect(result).toHaveProperty("messageId", target === "primary" ? "reserved-history-id" : "mailbox-id");
+		const result =
+			target === "primary"
+				? await adapter.sendMessage(input)
+				: await adapter.sendSubagentMessage(input);
+		expect(result).toHaveProperty(
+			"messageId",
+			target === "primary" ? "reserved-history-id" : "mailbox-id",
+		);
 	});
 
 	test("steward provenance is snapshotted before asynchronous sending", async () => {
@@ -937,7 +984,10 @@ describe("createCorePluginPublicApiAdapters (core integration)", () => {
 		await pending;
 		if (send?.kind !== "user") throw new Error("expected user input");
 		expect(parseStewardOriginLabel(send.origin?.originLabel)).toEqual(expected);
-		expect((send.origin?.delegationHostContext as { scope?: { narratorId?: string } } | undefined)?.scope?.narratorId).toBe("n-steward");
+		expect(
+			(send.origin?.delegationHostContext as { scope?: { narratorId?: string } } | undefined)?.scope
+				?.narratorId,
+		).toBe("n-steward");
 	});
 
 	test("steward delegation preserves the human, plugin and steward in trusted metadata", async () => {
@@ -959,8 +1009,13 @@ describe("createCorePluginPublicApiAdapters (core integration)", () => {
 	});
 
 	test.each([
-		"userId", "pluginId", "contributionId", "requestId", "correlationId",
-		"stewardNarratorId", "targetNarratorId",
+		"userId",
+		"pluginId",
+		"contributionId",
+		"requestId",
+		"correlationId",
+		"stewardNarratorId",
+		"targetNarratorId",
 	] as const)("rejects mismatched steward provenance %s before sending", async (field) => {
 		let sends = 0;
 		const { adapter, input } = stewardHarness(async () => {
@@ -988,13 +1043,17 @@ describe("createCorePluginPublicApiAdapters (core integration)", () => {
 	});
 
 	test("public send schema rejects third-party steward provenance", async () => {
-		const { input } = stewardHarness(async () => ({ id: "unused" } as never));
+		const { input } = stewardHarness(async () => ({ id: "unused" }) as never);
 		const { api, broker } = buildApi();
 		const ordinaryContext = context();
-		const result = await api.command(ordinaryContext, createCommandRequest(ordinaryContext,
-			"narrafork.narrator.send_message", {
-				narratorId: "n-worker", message: "hi", stewardProvenance: input.stewardProvenance,
-			}));
+		const result = await api.command(
+			ordinaryContext,
+			createCommandRequest(ordinaryContext, "narrafork.narrator.send_message", {
+				narratorId: "n-worker",
+				message: "hi",
+				stewardProvenance: input.stewardProvenance,
+			}),
+		);
 		expect(result.error?.code).toBe("INVALID_PARAMS");
 		expect(broker.calls).toHaveLength(0);
 	});

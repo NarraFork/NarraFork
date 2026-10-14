@@ -104,9 +104,8 @@ export function resolveUserBubbleName(
 	},
 	t: (key: string) => string,
 ): string {
-	const provenance = message.origin === "assistant"
-		? parseStewardOriginLabel(message.originLabel)
-		: null;
+	const provenance =
+		message.origin === "assistant" ? parseStewardOriginLabel(message.originLabel) : null;
 	if (provenance) {
 		return `${message.creator?.username ?? provenance.userId} · ${t("origin.source.agentMessage")}: ${provenance.stewardNarratorId}`;
 	}

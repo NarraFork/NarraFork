@@ -559,7 +559,9 @@ export function RecentTabList({
 	const [renameValue, setRenameValue] = useState("");
 	const [renaming, setRenaming] = useState(false);
 	const [archiveConfirmTab, setArchiveConfirmTab] = useState<{ id: string } | null>(null);
-	const [accessSettingsTab, setAccessSettingsTab] = useState<{ id: string; title: string } | null>(null);
+	const [accessSettingsTab, setAccessSettingsTab] = useState<{ id: string; title: string } | null>(
+		null,
+	);
 	const archiveNarrator = useArchiveNarrator();
 
 	// Workspace "add narrator" modal state
@@ -2072,7 +2074,14 @@ function TabIndicators({ tab, t }: TabIndicatorsProps) {
 	const hasBackgroundTasks = workCount > 0;
 	const isPrivate = tab.visibility === "private";
 
-	if (!hasViewers && !hasContainer && !hasTerminals && !hasBackgroundTasks && !serviceCount && !isPrivate)
+	if (
+		!hasViewers &&
+		!hasContainer &&
+		!hasTerminals &&
+		!hasBackgroundTasks &&
+		!serviceCount &&
+		!isPrivate
+	)
 		return null;
 
 	return (

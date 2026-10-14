@@ -66,6 +66,18 @@ async function fixture() {
 	const installed = await packageStore.install(archive);
 	expect(installed.hash).toBe(STEWARD_APPROVED_PACKAGE_HASH);
 	expect(installed.version).toBe(STEWARD_APPROVED_VERSION);
+	// The approved package must dispatch through the trusted host, not its legacy
+	// server implementation, which cannot write the host-owned binding key.
+	expect(installed.manifest.contributes.tools[0]).toMatchObject({
+		id: STEWARD_SEND_TOOL_ID,
+		execution: "host",
+	});
+	expect(installed.manifest.contributes.commands.map(({ id, handler }) => [id, handler])).toEqual([
+		["steward.bind", "host"],
+		["steward.binding", "host"],
+		["steward.recipients", "host"],
+		["steward.panelSend", "host"],
+	]);
 	const stateStore = new PluginStateStore({ root: join(root, "state") });
 	await stateStore.setState({
 		...createPluginStateRecord(STEWARD_PLUGIN_ID),

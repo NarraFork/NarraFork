@@ -164,10 +164,19 @@ export function parseStewardOriginLabel(
 				!value[key] ||
 				value[key].length > 256 ||
 				value[key] !== value[key].trim() ||
-				/[\u0000-\u001f\u007f]/.test(value[key])
-			) return null;
+				Array.from(value[key] as string).some((character) => {
+					const code = character.charCodeAt(0);
+					return code < 32 || code === 127;
+				})
+			)
+				return null;
 		}
-		if (value.pluginId !== "steward-narrator" || !Number.isSafeInteger(value.bindingRevision) || value.bindingRevision < 1) return null;
+		if (
+			value.pluginId !== "steward-narrator" ||
+			!Number.isSafeInteger(value.bindingRevision) ||
+			value.bindingRevision < 1
+		)
+			return null;
 		return value as StewardMessageProvenance;
 	} catch {
 		return null;

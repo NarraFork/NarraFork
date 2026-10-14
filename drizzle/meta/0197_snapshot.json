@@ -18267,6 +18267,14 @@
           "autoincrement": false,
           "default": "'flat'"
         },
+        "show_all_narrators": {
+          "name": "show_all_narrators",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": false
+        },
         "notify_on_done": {
           "name": "notify_on_done",
           "type": "integer",

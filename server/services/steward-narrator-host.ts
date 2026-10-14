@@ -1,9 +1,8 @@
 import { and, desc, eq, lt, or } from "drizzle-orm";
 import { db } from "../db";
 import { narrators, users } from "../db/schema";
-import { narratorReadableWhere } from "./narrator-acl";
 import { integrationAuditService } from "./integration-audit-service";
-import { canWriteNarrator, NARRATOR_ACL_COLUMNS } from "./narrator-acl";
+import { canWriteNarrator, NARRATOR_ACL_COLUMNS, narratorReadableWhere } from "./narrator-acl";
 import type {
 	CapabilityAuthorizationRequest,
 	CapabilityBroker,
@@ -19,10 +18,10 @@ import type { PluginToolRegistry } from "./plugin-tool-registry";
 import { setStewardMessageAuthorizer } from "./steward-message-admission";
 import {
 	STEWARD_BIND_COMMAND_ID,
-	STEWARD_PLUGIN_ID,
 	STEWARD_PANEL_SEND_COMMAND_ID,
-	STEWARD_RECIPIENTS_COMMAND_ID,
+	STEWARD_PLUGIN_ID,
 	STEWARD_READ_BINDING_COMMAND_ID,
+	STEWARD_RECIPIENTS_COMMAND_ID,
 	STEWARD_SEND_TOOL_ID,
 	type StewardAuditRecord,
 	StewardNarratorError,
@@ -32,9 +31,9 @@ import {
 
 export const STEWARD_APPROVED_VERSION = "0.2.0";
 export const STEWARD_APPROVED_SOURCE_HASH =
-	"06242b7dcbb549afe0bf8e18598b22cd08cd43ccde61cc949f919173fae136d8";
+	"5972879ec25d282de96a4715ebcf803e845b66dae6ccf3fce406e17f9dcf3991";
 export const STEWARD_APPROVED_PACKAGE_HASH =
-	"4bff64215cc7f1a971a2f5cbd1a0f275b3415b7fb3173e8ce9283819b43c3657";
+	"d5d8bc4590fc7d2eb844cea6b3fc6f7717546533e871df8a2bf3a103533efadf";
 export const STEWARD_HOST_RUNTIME_ID = "host.steward";
 const STEWARD_CAPABILITIES = [
 	"storage.read_self",
@@ -314,31 +313,50 @@ export function registerStewardHostContributions(options: StewardHostOptions): {
 				await requireLive(context.host);
 				const userId = context.host.invocation.userId;
 				if (!userId) throw new StewardNarratorError("USER_REQUIRED");
-				const request = input && typeof input === "object" && !Array.isArray(input)
-					? input as Record<string, unknown>
-					: {};
-				const limit = Number.isInteger(request.limit) ? Math.min(100, Math.max(1, request.limit as number)) : 100;
+				const request =
+					input && typeof input === "object" && !Array.isArray(input)
+						? (input as Record<string, unknown>)
+						: {};
+				const limit = Number.isInteger(request.limit)
+					? Math.min(100, Math.max(1, request.limit as number))
+					: 100;
 				let cursor: { updatedAt: string; id: string } | undefined;
 				if (request.cursor !== undefined) {
 					const value = request.cursor as Record<string, unknown>;
-					if (!value || typeof value !== "object" || typeof value.updatedAt !== "string" ||
-						!Number.isFinite(Date.parse(value.updatedAt)) || typeof value.id !== "string" || !value.id.trim())
+					if (
+						!value ||
+						typeof value !== "object" ||
+						typeof value.updatedAt !== "string" ||
+						!Number.isFinite(Date.parse(value.updatedAt)) ||
+						typeof value.id !== "string" ||
+						!value.id.trim()
+					)
 						throw new StewardNarratorError("INVALID_INPUT", 400);
 					cursor = { updatedAt: new Date(value.updatedAt).toISOString(), id: value.id };
 				}
 				const cursorPredicate = cursor
 					? or(
-						lt(narrators.updatedAt, cursor.updatedAt),
-						and(eq(narrators.updatedAt, cursor.updatedAt), lt(narrators.id, cursor.id)),
-					)
+							lt(narrators.updatedAt, cursor.updatedAt),
+							and(eq(narrators.updatedAt, cursor.updatedAt), lt(narrators.id, cursor.id)),
+						)
 					: undefined;
 				const rows = await db
-					.select({ id: narrators.id, title: narrators.title, handle: narrators.handle, updatedAt: narrators.updatedAt })
+					.select({
+						id: narrators.id,
+						title: narrators.title,
+						handle: narrators.handle,
+						updatedAt: narrators.updatedAt,
+					})
 					.from(narrators)
-					.where(and(
-						narratorReadableWhere({ userId, isAdmin: context.host.invocation.userRole === "admin" }),
-						cursorPredicate,
-					))
+					.where(
+						and(
+							narratorReadableWhere({
+								userId,
+								isAdmin: context.host.invocation.userRole === "admin",
+							}),
+							cursorPredicate,
+						),
+					)
 					.orderBy(desc(narrators.updatedAt), desc(narrators.id))
 					.limit(limit + 1);
 				const hasMore = rows.length > limit;
@@ -351,7 +369,7 @@ export function registerStewardHostContributions(options: StewardHostOptions): {
 				return {
 					output: {
 						items,
-					...(hasMore && last ? { nextCursor: { updatedAt: last.updatedAt, id: last.id } } : {}),
+						...(hasMore && last ? { nextCursor: { updatedAt: last.updatedAt, id: last.id } } : {}),
 					},
 				};
 			},

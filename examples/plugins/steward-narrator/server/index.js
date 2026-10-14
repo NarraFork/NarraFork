@@ -84,7 +84,10 @@ function contextFrom(params) {
 		throw new Error("用户范围与调用主体不一致");
 	if (scope?.narratorId !== undefined && scope.narratorId !== invocation.narratorId)
 		throw new Error("叙述者范围与调用主体不一致");
-	return { invocation, scope: { ...scope, userId: invocation.userId, narratorId: invocation.narratorId } };
+	return {
+		invocation,
+		scope: { ...scope, userId: invocation.userId, narratorId: invocation.narratorId },
+	};
 }
 function storageParams(context, extra = {}) {
 	return { scopeType: "user", scopeId: context.invocation.userId, ...extra };
@@ -92,14 +95,21 @@ function storageParams(context, extra = {}) {
 function parseBinding(value) {
 	if (value === null) return null;
 	const candidate = object(value);
-	if (!candidate || typeof candidate.stewardNarratorId !== "string" ||
-		typeof candidate.userId !== "string" || typeof candidate.boundAt !== "string" ||
-		!Number.isInteger(candidate.revision) || candidate.revision < 1)
+	if (
+		!candidate ||
+		typeof candidate.stewardNarratorId !== "string" ||
+		typeof candidate.userId !== "string" ||
+		typeof candidate.boundAt !== "string" ||
+		!Number.isInteger(candidate.revision) ||
+		candidate.revision < 1
+	)
 		throw new Error("绑定状态无效");
 	return candidate;
 }
 async function readBinding(context) {
-	const raw = hostResult(await hostRequest("storage.get", storageParams(context, { key: BINDING_KEY })));
+	const raw = hostResult(
+		await hostRequest("storage.get", storageParams(context, { key: BINDING_KEY })),
+	);
 	return parseBinding(raw?.value ?? raw);
 }
 async function bind(context) {
@@ -111,27 +121,41 @@ async function bind(context) {
 		boundAt: new Date().toISOString(),
 		revision: (previous?.revision || 0) + 1,
 	};
-	const stored = hostResult(await hostRequest("storage.set", storageParams(context, {
-		key: BINDING_KEY,
-		value: binding,
-		expectedRevision: previous?.revision || 0,
-	})));
+	const stored = hostResult(
+		await hostRequest(
+			"storage.set",
+			storageParams(context, {
+				key: BINDING_KEY,
+				value: binding,
+				expectedRevision: previous?.revision || 0,
+			}),
+		),
+	);
 	return stored?.value ?? binding;
 }
 async function sendMessage(context, input) {
 	const request = object(input);
-	if (!request || typeof request.targetNarratorId !== "string" ||
-		typeof request.message !== "string" || !request.message.trim() ||
-		request.message.length > MAX_MESSAGE_LENGTH)
+	if (
+		!request ||
+		typeof request.targetNarratorId !== "string" ||
+		typeof request.message !== "string" ||
+		!request.message.trim() ||
+		request.message.length > MAX_MESSAGE_LENGTH
+	)
 		throw new Error("steward.send 输入无效");
 	const binding = await readBinding(context);
-	if (!binding || binding.userId !== context.invocation.userId ||
-		binding.stewardNarratorId !== context.invocation.narratorId)
+	if (
+		!binding ||
+		binding.userId !== context.invocation.userId ||
+		binding.stewardNarratorId !== context.invocation.narratorId
+	)
 		throw new Error("当前叙述者不是当前用户绑定的管家");
-	const result = hostResult(await hostRequest("commands.execute", {
-		commandId: "narrafork.narrator.send_message",
-		input: { narratorId: request.targetNarratorId, message: request.message },
-	}));
+	const result = hostResult(
+		await hostRequest("commands.execute", {
+			commandId: "narrafork.narrator.send_message",
+			input: { narratorId: request.targetNarratorId, message: request.message },
+		}),
+	);
 	return result?.output ?? result;
 }
 async function invoke(id, params) {
@@ -141,7 +165,8 @@ async function invoke(id, params) {
 		const context = contextFrom(params);
 		if (contributionId === BIND_COMMAND) return respond(id, { output: await bind(context) });
 		if (contributionId === READ_COMMAND) return respond(id, { output: await readBinding(context) });
-		if (contributionId === SEND_TOOL) return respond(id, { output: JSON.stringify(await sendMessage(context, params.input)) });
+		if (contributionId === SEND_TOOL)
+			return respond(id, { output: JSON.stringify(await sendMessage(context, params.input)) });
 		return reject(id, -32602, "Unknown steward contribution", { code: "INVALID_PARAMS" });
 	} catch (error) {
 		reject(id, -32003, errorMessage(error), { code: "PERMISSION_DENIED" });
@@ -159,20 +184,33 @@ function handleMessage(message) {
 	if (!("id" in message) || typeof message.method !== "string") return;
 	if (message.method === "initialize") {
 		if (message.params?.protocol !== RPC_PROTOCOL || message.params?.pluginId !== PLUGIN_ID)
-			return reject(message.id, -32602, "initialize identity or protocol mismatch", { code: "INVALID_PARAMS" });
+			return reject(message.id, -32602, "initialize identity or protocol mismatch", {
+				code: "INVALID_PARAMS",
+			});
 		runtimeId = message.params.runtimeId;
 		generation = message.params.generation;
 		initialized = true;
 		return respond(message.id, { initialized: true, protocol: RPC_PROTOCOL });
 	}
 	if (message.method === "activate") {
-		if (!initialized) return reject(message.id, -32603, "Plugin must be initialized before activation");
+		if (!initialized)
+			return reject(message.id, -32603, "Plugin must be initialized before activation");
 		active = true;
 		return respond(message.id, { activated: true });
 	}
-	if (message.method === "health") return respond(message.id, { healthy: initialized && active, status: active ? "ready" : "inactive", runtimeId, generation });
-	if (message.method === "commands.invoke" || message.method === "tools.invoke") return void invoke(message.id, message.params);
-	if (message.method === "deactivate") { active = false; return respond(message.id, { deactivated: true }); }
+	if (message.method === "health")
+		return respond(message.id, {
+			healthy: initialized && active,
+			status: active ? "ready" : "inactive",
+			runtimeId,
+			generation,
+		});
+	if (message.method === "commands.invoke" || message.method === "tools.invoke")
+		return void invoke(message.id, message.params);
+	if (message.method === "deactivate") {
+		active = false;
+		return respond(message.id, { deactivated: true });
+	}
 	if (message.method === "shutdown") {
 		active = false;
 		initialized = false;
@@ -184,10 +222,19 @@ function parseFrames() {
 	while (buffer.byteLength) {
 		const delimiter = (() => {
 			for (let i = 0; i <= buffer.byteLength - 4; i += 1)
-				if (buffer[i] === 13 && buffer[i + 1] === 10 && buffer[i + 2] === 13 && buffer[i + 3] === 10) return i;
+				if (
+					buffer[i] === 13 &&
+					buffer[i + 1] === 10 &&
+					buffer[i + 2] === 13 &&
+					buffer[i + 3] === 10
+				)
+					return i;
 			return -1;
 		})();
-		if (delimiter < 0) { if (buffer.byteLength > MAX_HEADER_BYTES) throw new Error("RPC header exceeds limit"); return; }
+		if (delimiter < 0) {
+			if (buffer.byteLength > MAX_HEADER_BYTES) throw new Error("RPC header exceeds limit");
+			return;
+		}
 		const length = contentLength(decoder.decode(buffer.slice(0, delimiter)));
 		if (length > MAX_FRAME_BYTES) throw new Error("RPC frame exceeds limit");
 		const end = delimiter + 4 + length;
@@ -198,8 +245,24 @@ function parseFrames() {
 	}
 }
 process.stdin.on("data", (chunk) => {
-	try { buffer = append(buffer, new Uint8Array(chunk)); if (buffer.byteLength > MAX_HEADER_BYTES + MAX_FRAME_BYTES + 4) throw new Error("RPC input buffer exceeds limit"); parseFrames(); }
-	catch { process.exit(2); }
+	try {
+		buffer = append(buffer, new Uint8Array(chunk));
+		if (buffer.byteLength > MAX_HEADER_BYTES + MAX_FRAME_BYTES + 4)
+			throw new Error("RPC input buffer exceeds limit");
+		parseFrames();
+	} catch {
+		process.exit(2);
+	}
 });
 process.stdin.on("end", () => process.exit(0));
-send({ jsonrpc: "2.0", method: "hello", params: { pluginId: PLUGIN_ID, version: PLUGIN_VERSION, rpcProtocol: RPC_PROTOCOL, ...(PACKAGE_DIGEST ? { packageDigest: PACKAGE_DIGEST } : {}), features: ["host_api.requests"] } });
+send({
+	jsonrpc: "2.0",
+	method: "hello",
+	params: {
+		pluginId: PLUGIN_ID,
+		version: PLUGIN_VERSION,
+		rpcProtocol: RPC_PROTOCOL,
+		...(PACKAGE_DIGEST ? { packageDigest: PACKAGE_DIGEST } : {}),
+		features: ["host_api.requests"],
+	},
+});

@@ -1,7 +1,7 @@
 import { beforeAll, describe, expect, it } from "bun:test";
 import { segmentMessages } from "../message/message-segments";
-import { getSummary, getCategory } from "../tool-call/tool-display";
 import type { NarratorMsg } from "../narrator-panel-types";
+import { getCategory, getSummary } from "../tool-call/tool-display";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 import { VLIST_REGISTRY } from "./registry";
 import {

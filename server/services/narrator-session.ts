@@ -3,8 +3,6 @@ import { EventEmitter } from "node:events";
 import { isAbsolute } from "node:path";
 import { resolveBufferQueueMode } from "@shared/buffer-queue-mode";
 import type { MessageOriginOptions } from "@shared/message-origin";
-import type { SendDeliveryTarget } from "./send-delivery-resolution";
-import { authorizeStewardMessage, isStewardMessage } from "./steward-message-admission";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { isDanglingReasoningOnlyAssistantMessage } from "@shared/reasoning-content";
 import {
@@ -32,15 +30,17 @@ import {
 } from "../db/schema";
 import type { ReasoningEffort } from "../lib/agent";
 import { diagnosticsFromError } from "../lib/agent/error-diagnostics";
-import type { ToolCallBinding } from "../lib/agent/types";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
-import { projectInjectionSenderText, projectMessageSenderText } from "../lib/agent/sender-projection";
+import {
+	projectInjectionSenderText,
+	projectMessageSenderText,
+} from "../lib/agent/sender-projection";
 import {
 	clearBehaviorFenceEditGrant,
 	grantBehaviorFenceEdit,
 } from "../lib/agent/tools/behavior-fence-grant";
 import { OPTIONAL_TOOLS } from "../lib/agent/tools/index";
-import type { AgentInputPart } from "../lib/agent/types";
+import type { AgentInputPart, ToolCallBinding } from "../lib/agent/types";
 import { buildAttachedFilesHint } from "../lib/attached-files";
 import {
 	type BooleanOverride,
@@ -106,20 +106,21 @@ import { broadcastToNarrator } from "../websocket/narrator-ws";
 import {
 	type AgentMessageDelivery,
 	agentMessageDeliveryBody,
-	createAgentMessageDelivery,
 	consumeAgentMessageDelivery,
 	consumeMailboxDelivery,
+	createAgentMessageDelivery,
 	type MailboxDeliveryConsumption,
 } from "./agent-message-delivery";
 import { buildRuntimeHistory } from "./agent-runtime/history";
 import {
+	cancelInboxInput,
 	claimInboxHead,
-	enqueueInboxAgent,
 	deliverInboxInjection,
-	type InboxEligibleHead,
+	enqueueInboxAgent,
 	flushInboxPublicationBarrier,
 	hasInboxKind,
 	type InboxAgentMetadata,
+	type InboxEligibleHead,
 	inboxClaim,
 	inboxConsumption,
 	inboxMetadata,
@@ -127,7 +128,6 @@ import {
 	peekInbox,
 	persistClaimedUserInput,
 	releaseInboxClaim,
-	cancelInboxInput,
 	runtimeInbox,
 	wakeInboxIfEligible,
 	withInboxOwner,
@@ -184,11 +184,13 @@ import {
 	type PendingInjection,
 	projectPendingInjection,
 } from "./parent-injection-queue";
+import type { SendDeliveryTarget } from "./send-delivery-resolution";
 import { broadcastSpecChanged } from "./spec-broadcast";
 import { buildBehaviorFenceBody, buildSpecTaskDigestBody } from "./spec-reminder";
 import { compileSpecTasks, parseSpecTasksDocument } from "./spec-task-service";
 import { drainSpecUpdatesForNarrator } from "./spec-update-queue";
 import { specVfsService } from "./spec-vfs-service";
+import { authorizeStewardMessage, isStewardMessage } from "./steward-message-admission";
 import { readSubagentExecutionBoundary } from "./subagent-execution-boundary";
 import { appendSubagentFileChanges } from "./subagent-file-changes";
 import { agentResultTag, resolveAgentLabel } from "./subagent-label";
@@ -3607,13 +3609,25 @@ async function admitPrimaryUserMessage(
 		!busy && !options.queueOnly ? tryClaimExecution(narratorId, "tool-replay") : undefined;
 	try {
 		const accepted = await enqueueBufferedMessage(
-			narratorId, prompt, options.images, options.commandText, options.userId,
-			options.creator, options.textFiles, queueMode !== "turn" ? "front" : "back",
-			options.preBashCommand, options.fileReferences, "fifo", options.executionIntent,
-			queueMode, options.origin, options.signal,
+			narratorId,
+			prompt,
+			options.images,
+			options.commandText,
+			options.userId,
+			options.creator,
+			options.textFiles,
+			queueMode !== "turn" ? "front" : "back",
+			options.preBashCommand,
+			options.fileReferences,
+			"fifo",
+			options.executionIntent,
+			queueMode,
+			options.origin,
+			options.signal,
 		);
 		if (!accepted.ok) throw new ValidationError("Message queue is full");
-		const receipt = accepted.receipt ?? await readBufferedMessageAdmissionReceipt(narratorId, accepted.id);
+		const receipt =
+			accepted.receipt ?? (await readBufferedMessageAdmissionReceipt(narratorId, accepted.id));
 		if (!receipt) throw new ValidationError("Accepted user message receipt is unavailable");
 		return {
 			receipt,
@@ -3623,9 +3637,11 @@ async function admitPrimaryUserMessage(
 				let claimed: RuntimeMailboxRow | undefined;
 				try {
 					if (queueMode === "interrupt" && busy) {
-						if (getExecutionOwner(narratorId) === oldOwner &&
+						if (
+							getExecutionOwner(narratorId) === oldOwner &&
 							activeNarrators.get(narratorId)?.abortController === oldController &&
-							plannedUpdateRecoveryControls.get(narratorId) === oldRecovery)
+							plannedUpdateRecoveryControls.get(narratorId) === oldRecovery
+						)
 							interruptNarrator(narratorId);
 					} else if (queueMode === "tool" && busy) {
 						requestBufferedMessageSoftStop(narratorId);
@@ -3635,19 +3651,37 @@ async function admitPrimaryUserMessage(
 						const active = await ensureNarrator(narratorId, locale, options.replyInUserLanguage);
 						await flushInboxPublicationBarrier(narratorId);
 						await drainAndPersistPendingInjections(active);
-						const queuedCommand = options.executionIntent?.controlCommand ||
+						const queuedCommand =
+							options.executionIntent?.controlCommand ||
 							parseQueuedNewCommand(prompt, options.commandText) ||
 							parseQueuedGoalCommand(prompt, options.commandText);
-						claimed = queuedCommand ? undefined : await claimInboxHead(
-							narratorId, (row) => row.id === receipt.id && row.kind === "user_input",
-						);
+						claimed = queuedCommand
+							? undefined
+							: await claimInboxHead(
+									narratorId,
+									(row) => row.id === receipt.id && row.kind === "user_input",
+								);
 						if (claimed) {
 							const consumed = await feedMessage(
-								narratorId, prompt, options.images, locale, options.replyInUserLanguage,
-								options.commandText, options.userId, options.textFiles, options.preBashCommand,
-								{ ...turnTiming, bufferedDelivery: true, bufferedId: receipt.id,
-									bufferedRow: claimed, bufferedOwner: inputOwner },
-								options.origin, options.fileReferences, options.signal,
+								narratorId,
+								prompt,
+								options.images,
+								locale,
+								options.replyInUserLanguage,
+								options.commandText,
+								options.userId,
+								options.textFiles,
+								options.preBashCommand,
+								{
+									...turnTiming,
+									bufferedDelivery: true,
+									bufferedId: receipt.id,
+									bufferedRow: claimed,
+									bufferedOwner: inputOwner,
+								},
+								options.origin,
+								options.fileReferences,
+								options.signal,
 							);
 							// Set the durable outcome BEFORE notifications: a failed WS must not
 							// erase the synchronous history row that callers already own.
@@ -3657,15 +3691,18 @@ async function admitPrimaryUserMessage(
 							result.delivered = "started";
 							result.started = !consumed.postCommitError;
 							if (consumed.postCommitError) throw consumed.postCommitError;
-							if (!consumed.userBroadcasted) broadcastToNarrator(narratorId, {
-								type: "user_message", narratorId,
-								message: fileReferenceMessageForDisplay(consumed.userMsg),
-							});
+							if (!consumed.userBroadcasted)
+								broadcastToNarrator(narratorId, {
+									type: "user_message",
+									narratorId,
+									message: fileReferenceMessageForDisplay(consumed.userMsg),
+								});
 							return;
 						}
 					}
 					broadcastToNarrator(narratorId, {
-						type: "buffer_set", narratorId,
+						type: "buffer_set",
+						narratorId,
 						messages: toBufferSummary(await getBufferedMessagesAsync(narratorId)),
 					});
 				} catch (error) {
@@ -3677,16 +3714,21 @@ async function admitPrimaryUserMessage(
 							result.receiptDisposition = cancelled.receiptDisposition;
 							result.accepted = false;
 						}
-					} else if (claimed && !result.userMsg) await releaseInboxClaim(claimed, error).catch((releaseError) => {
-						logger.warn("Accepted user input claim release deferred", {
-							narratorId, messageId: receipt.id, error: String(releaseError),
+					} else if (claimed && !result.userMsg)
+						await releaseInboxClaim(claimed, error).catch((releaseError) => {
+							logger.warn("Accepted user input claim release deferred", {
+								narratorId,
+								messageId: receipt.id,
+								error: String(releaseError),
+							});
 						});
-					});
 					throw error;
 				}
 			},
-			wake: (result) => result.delivered === "buffered"
-				? wakeInboxIfEligible(narratorId, locale).then(() => {}) : Promise.resolve(),
+			wake: (result) =>
+				result.delivered === "buffered"
+					? wakeInboxIfEligible(narratorId, locale).then(() => {})
+					: Promise.resolve(),
 			backgroundWake: true,
 		};
 	} catch (error) {
@@ -3701,7 +3743,14 @@ export async function acceptUserMessage(
 	prompt: string,
 	options: UserMessageAdmissionOptions = {},
 ): Promise<UserMessageAdmissionResult> {
-	const result = await sendMessage({ ...options, kind: "user", narratorId, message: prompt, target: "primary", busyPolicy: "queue" });
+	const result = await sendMessage({
+		...options,
+		kind: "user",
+		narratorId,
+		message: prompt,
+		target: "primary",
+		busyPolicy: "queue",
+	});
 	return result.userMsg
 		? { buffered: false, userMsg: result.userMsg }
 		: { buffered: true, id: result.mailboxId, bufferedAt: result.bufferedAt };
@@ -3729,9 +3778,7 @@ export interface NarratorMessageSendAgentInput {
 	signal?: AbortSignal;
 }
 
-export type NarratorMessageSendInput =
-	| NarratorMessageSendUserInput
-	| NarratorMessageSendAgentInput;
+export type NarratorMessageSendInput = NarratorMessageSendUserInput | NarratorMessageSendAgentInput;
 
 export interface NarratorMessageSendResult {
 	accepted: boolean;
@@ -3760,9 +3807,15 @@ interface MessageSendAdmission {
 	release?: () => void;
 }
 
-async function admitAgentMessage(input: NarratorMessageSendAgentInput): Promise<MessageSendAdmission> {
+async function admitAgentMessage(
+	input: NarratorMessageSendAgentInput,
+): Promise<MessageSendAdmission> {
 	const delivery = createAgentMessageDelivery(
-		input.narratorId, input.sender, input.toolUseId, input.message, input.toolCallBinding,
+		input.narratorId,
+		input.sender,
+		input.toolUseId,
+		input.message,
+		input.toolCallBinding,
 	);
 	const body = agentMessageDeliveryBody(delivery);
 	const modelText = projectInjectionSenderText(input.message, "subagent_message", body);
@@ -3770,7 +3823,9 @@ async function admitAgentMessage(input: NarratorMessageSendAgentInput): Promise<
 	// enqueueInboxAgent validates the real persisted source/toolCall/attempt receipt
 	// in the backend's admission transaction; the trusted envelope is not a receipt.
 	const admitted = await enqueueInboxAgent(delivery, modelText, {
-		channel: "peer", createdBy: input.userId, userId: input.userId,
+		channel: "peer",
+		createdBy: input.userId,
+		userId: input.userId,
 	});
 	const row = admitted.delivery;
 	return {
@@ -3796,7 +3851,8 @@ async function admitSubagentUserMessage(
 	narrator: Awaited<ReturnType<typeof narratorService.getById>>,
 ): Promise<MessageSendAdmission> {
 	const { resumeSubagent, resolveSubagentOriginToolUseId } = await import("./subagent-resume");
-	const { applySubagentBufferedQueueModeControl, requestSubagentBufferedMessageSoftStop } = await import("./subagent-executor");
+	const { applySubagentBufferedQueueModeControl, requestSubagentBufferedMessageSoftStop } =
+		await import("./subagent-executor");
 	const neverStarted = !(await resolveSubagentOriginToolUseId(input.narratorId).catch(() => null));
 	const running = (narrator.status === "working" || narrator.status === "waiting") && !neverStarted;
 	const previousOwner = getExecutionOwner(input.narratorId);
@@ -3804,21 +3860,38 @@ async function admitSubagentUserMessage(
 	const queueMode = input.queueMode ?? (input.interrupt ? "interrupt" : undefined);
 	const priority = queueMode !== undefined ? queueMode !== "turn" : (input.priority ?? false);
 	const accepted = await enqueueBufferedMessage(
-		input.narratorId, input.message, input.images, input.commandText, input.userId,
-		input.creator, input.textFiles, priority ? "front" : "back", input.preBashCommand,
-		input.fileReferences, "fifo", input.executionIntent, queueMode, input.origin, input.signal,
+		input.narratorId,
+		input.message,
+		input.images,
+		input.commandText,
+		input.userId,
+		input.creator,
+		input.textFiles,
+		priority ? "front" : "back",
+		input.preBashCommand,
+		input.fileReferences,
+		"fifo",
+		input.executionIntent,
+		queueMode,
+		input.origin,
+		input.signal,
 	);
 	if (!accepted.ok) throw new ValidationError("Subagent message queue is full");
-	const receipt = accepted.receipt ?? await readBufferedMessageAdmissionReceipt(input.narratorId, accepted.id);
+	const receipt =
+		accepted.receipt ?? (await readBufferedMessageAdmissionReceipt(input.narratorId, accepted.id));
 	if (!receipt) throw new ValidationError("Accepted subagent message receipt is unavailable");
 	return {
 		receipt,
 		duplicate: accepted.duplicate ?? false,
 		dispatch: async () => {
-			if (running && getExecutionOwner(input.narratorId) === previousOwner &&
-				activeNarrators.get(input.narratorId) === previousActive) {
+			if (
+				running &&
+				getExecutionOwner(input.narratorId) === previousOwner &&
+				activeNarrators.get(input.narratorId) === previousActive
+			) {
 				if (queueMode !== undefined) {
-					if (queueMode !== "turn") applySubagentBufferedQueueModeControl(input.narratorId, queueMode, true, true);
+					if (queueMode !== "turn")
+						applySubagentBufferedQueueModeControl(input.narratorId, queueMode, true, true);
 				} else if (!isTakenOver(input.narratorId)) {
 					requestSubagentBufferedMessageSoftStop(input.narratorId);
 				}
@@ -3828,15 +3901,22 @@ async function admitSubagentUserMessage(
 			if (running) {
 				// The old runner normally wakes on finalization. Only close the race
 				// where it departed while staging, never start a competing runner.
-				if ((previousOwner || previousActive) && !getExecutionOwner(input.narratorId) &&
-					activeNarrators.get(input.narratorId) !== previousActive)
+				if (
+					(previousOwner || previousActive) &&
+					!getExecutionOwner(input.narratorId) &&
+					activeNarrators.get(input.narratorId) !== previousActive
+				)
 					await wakeInboxIfEligible(input.narratorId, input.locale ?? "en");
 				return;
 			}
 			const resumed = await resumeSubagent({
-				subagentId: input.narratorId, intent: "follow_up", actor: "parent_agent",
-				locale: input.locale ?? "en", createdBy: input.userId ?? null,
-				signal: input.signal, mailboxInput: true,
+				subagentId: input.narratorId,
+				intent: "follow_up",
+				actor: "parent_agent",
+				locale: input.locale ?? "en",
+				createdBy: input.userId ?? null,
+				signal: input.signal,
+				mailboxInput: true,
 			});
 			result.started = resumed.started;
 			result.resumedSuspendedRunner = resumed.resumedSuspendedRunner;
@@ -3855,9 +3935,13 @@ async function sendNamedMessage(
 	turnTiming?: { preserveTurnStart?: boolean; turnStartedAt?: string },
 ): Promise<NarratorMessageSendResult> {
 	input.signal?.throwIfAborted();
-	input = input.kind === "user" ? {
-		...input, fileReferences: freezeFileReferenceSnapshots(input.fileReferences),
-	} : { ...input, sender: { ...input.sender }, toolCallBinding: { ...input.toolCallBinding } };
+	input =
+		input.kind === "user"
+			? {
+					...input,
+					fileReferences: freezeFileReferenceSnapshots(input.fileReferences),
+				}
+			: { ...input, sender: { ...input.sender }, toolCallBinding: { ...input.toolCallBinding } };
 	const { result, admission } = await withNarratorStartAdmission(input.narratorId, async () => {
 		input.signal?.throwIfAborted();
 		let admission: MessageSendAdmission;
@@ -3868,16 +3952,23 @@ async function sendNamedMessage(
 			const subagent = isSubagentVariant(narrator.variant) || narrator.variant === "subagent";
 			if (input.target && (input.target === "subagent") !== subagent)
 				throw new ValidationError("Message target does not match narrator kind");
-			if (narrator.status === "archived") throw new ValidationError("Archived narrators cannot receive messages");
-			admission = subagent ? await admitSubagentUserMessage(input, narrator)
+			if (narrator.status === "archived")
+				throw new ValidationError("Archived narrators cannot receive messages");
+			admission = subagent
+				? await admitSubagentUserMessage(input, narrator)
 				: await admitPrimaryUserMessage(input.narratorId, input.message, input, turnTiming);
 		}
 		const row = admission.receipt;
-		const accepted = row.receiptDisposition === "active" && row.state !== "cancelled" && row.state !== "failed";
+		const accepted =
+			row.receiptDisposition === "active" && row.state !== "cancelled" && row.state !== "failed";
 		const result: NarratorMessageSendResult = {
-			accepted, duplicate: admission.duplicate,
-			mailboxId: row.id, messageId: row.currentMessageId ?? row.recipientMessageId ?? "",
-			bufferedAt: row.bufferedAt, state: row.state, receiptDisposition: row.receiptDisposition,
+			accepted,
+			duplicate: admission.duplicate,
+			mailboxId: row.id,
+			messageId: row.currentMessageId ?? row.recipientMessageId ?? "",
+			bufferedAt: row.bufferedAt,
+			state: row.state,
+			receiptDisposition: row.receiptDisposition,
 			delivered: row.state === "materialized" ? "started" : "buffered",
 			...(admission.target ? { target: admission.target } : {}),
 		};
@@ -3887,7 +3978,11 @@ async function sendNamedMessage(
 			// Acceptance is already durable: failed notification/materialization/dispatch
 			// is an advisory, never a reason to enqueue another copy or restore a draft.
 			result.wakeError = error instanceof Error ? error.message : String(error);
-			logger.warn("Accepted message dispatch deferred", { narratorId: input.narratorId, messageId: row.id, error: String(error) });
+			logger.warn("Accepted message dispatch deferred", {
+				narratorId: input.narratorId,
+				messageId: row.id,
+				error: String(error),
+			});
 		} finally {
 			admission.release?.();
 		}
@@ -3896,10 +3991,15 @@ async function sendNamedMessage(
 	// Wake/resume re-enters start admission. Never run or await it under the lock.
 	if (result.accepted && admission.wake) {
 		const wake = async () => {
-			try { await admission.wake?.(result); }
-			catch (error) {
+			try {
+				await admission.wake?.(result);
+			} catch (error) {
 				result.wakeError = error instanceof Error ? error.message : String(error);
-				logger.warn("Accepted message wake deferred", { narratorId: input.narratorId, messageId: result.mailboxId, error: String(error) });
+				logger.warn("Accepted message wake deferred", {
+					narratorId: input.narratorId,
+					messageId: result.mailboxId,
+					error: String(error),
+				});
 			}
 		};
 		if (admission.backgroundWake) void wake();
@@ -3914,7 +4014,9 @@ export interface NarratorAgentMessageSendResult extends NarratorMessageSendResul
 }
 
 /** Named user/agent entry point plus the legacy positional adapter. */
-export function sendMessage(input: NarratorMessageSendAgentInput): Promise<NarratorAgentMessageSendResult>;
+export function sendMessage(
+	input: NarratorMessageSendAgentInput,
+): Promise<NarratorAgentMessageSendResult>;
 export function sendMessage(input: NarratorMessageSendInput): Promise<NarratorMessageSendResult>;
 export function sendMessage(
 	narratorId: string,
@@ -3935,7 +4037,10 @@ export function sendMessage(
 	...args: unknown[]
 ): Promise<NarratorMessageSendResult | typeof narratorMessages.$inferSelect> {
 	if (typeof inputOrNarratorId !== "string") return sendNamedMessage(inputOrNarratorId);
-	return sendLegacyMessage(inputOrNarratorId, ...(args as Parameters<typeof sendLegacyMessage> extends [string, ...infer R] ? R : never));
+	return sendLegacyMessage(
+		inputOrNarratorId,
+		...(args as Parameters<typeof sendLegacyMessage> extends [string, ...infer R] ? R : never),
+	);
 }
 
 /**
@@ -3968,13 +4073,27 @@ async function sendLegacyMessage(
 	signal?: AbortSignal,
 ): Promise<typeof narratorMessages.$inferSelect> {
 	const result = await sendNamedMessage({
-		kind: "user", narratorId, message: prompt, target: "primary", busyPolicy: "reject",
-		images, locale, replyInUserLanguage, commandText, userId, textFiles,
-		preBashCommand, origin, fileReferences, signal,
+		kind: "user",
+		narratorId,
+		message: prompt,
+		target: "primary",
+		busyPolicy: "reject",
+		images,
+		locale,
+		replyInUserLanguage,
+		commandText,
+		userId,
+		textFiles,
+		preBashCommand,
+		origin,
+		fileReferences,
+		signal,
 	});
 	if (!result.userMsg) {
 		signal?.throwIfAborted();
-		throw new ValidationError(`Message accepted and queued (${result.mailboxId}); history is not yet materialized`);
+		throw new ValidationError(
+			`Message accepted and queued (${result.mailboxId}); history is not yet materialized`,
+		);
 	}
 	return result.userMsg;
 }
@@ -4011,9 +4130,15 @@ export async function sendSubagentMessage(
 	input: SendSubagentMessageInput,
 ): Promise<SendSubagentMessageResult> {
 	const result = await sendMessage({
-		kind: "user", narratorId: input.subagentId, message: input.message,
-		target: "subagent", userId: input.createdBy, priority: input.priority,
-		fileReferences: input.fileReferences, locale: input.locale, signal: input.signal,
+		kind: "user",
+		narratorId: input.subagentId,
+		message: input.message,
+		target: "subagent",
+		userId: input.createdBy,
+		priority: input.priority,
+		fileReferences: input.fileReferences,
+		locale: input.locale,
+		signal: input.signal,
 	});
 	return {
 		delivered: result.delivered,
@@ -5349,10 +5474,19 @@ async function continueNarratorUnlocked(
 	if (!shouldReplayToolResults && !trailingInjection) {
 		// No pending tool calls and no fresh injection — send a simple "continue" user message.
 		const continueText = getToolMessage("userContinue", locale);
-		await sendNamedMessage({
-			kind: "user", narratorId, message: continueText, locale, replyInUserLanguage,
-			commandText: null, userId, busyPolicy: "reject",
-		}, continueTiming);
+		await sendNamedMessage(
+			{
+				kind: "user",
+				narratorId,
+				message: continueText,
+				locale,
+				replyInUserLanguage,
+				commandText: null,
+				userId,
+				busyPolicy: "reject",
+			},
+			continueTiming,
+		);
 		return { ok: true };
 	}
 
@@ -7012,10 +7146,19 @@ export async function* startSession(
 	try {
 		active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
 		const accepted = await sendMessage({
-			kind: "user", narratorId, message: prompt, images, locale, replyInUserLanguage,
-			fileReferences, busyPolicy: "reject",
+			kind: "user",
+			narratorId,
+			message: prompt,
+			images,
+			locale,
+			replyInUserLanguage,
+			fileReferences,
+			busyPolicy: "reject",
 		});
-		if (!accepted.userMsg) throw new ValidationError(`Message accepted and queued (${accepted.mailboxId}); session dispatch is deferred`);
+		if (!accepted.userMsg)
+			throw new ValidationError(
+				`Message accepted and queued (${accepted.mailboxId}); session dispatch is deferred`,
+			);
 		userMsg = accepted.userMsg;
 	} catch (err) {
 		const errorMsg = err instanceof Error ? err.message : String(err);

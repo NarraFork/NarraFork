@@ -13,6 +13,8 @@ const folder = resolve(import.meta.dir, "../../drizzle-postgres");
 test("committed PostgreSQL history keeps exactly one full schema baseline", () => {
 	const metadata = readPgMetadata(folder);
 	expect(metadata.mode).toBe("baseline");
+	// History digests are pinned to the bytes Git stores, not Windows checkout CRLF.
+	expect(metadata.snapshotText).not.toContain("\r");
 	expect(metadata.legacySnapshots).toEqual([]);
 	expect(readdirSync(resolve(folder, "meta")).sort()).toEqual(
 		[CURRENT_SNAPSHOT, HISTORY_FILE, "_journal.json"].sort(),
