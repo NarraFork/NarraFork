@@ -5209,6 +5209,7 @@ export const PretextExactMessageList = memo(
 			const injectionNavigation = useMemo<InjectionNavigation>(
 				() => ({
 					onOpenNarrator: rowHandlers?.onViewSubagentSession,
+					onOpenNarratorSession: rowHandlers?.onViewNarratorSession,
 					onOpenKnowledge: rowHandlers?.onOpenKnowledgeEntry,
 					onOpenSpec: rowHandlers?.onOpenSpecFile,
 					onOpenChapter: rowHandlers?.onOpenChapter,
@@ -5216,6 +5217,7 @@ export const PretextExactMessageList = memo(
 				}),
 				[
 					rowHandlers?.onViewSubagentSession,
+					rowHandlers?.onViewNarratorSession,
 					rowHandlers?.onOpenKnowledgeEntry,
 					rowHandlers?.onOpenSpecFile,
 					rowHandlers?.onOpenChapter,

@@ -2,6 +2,8 @@ import { generateShortId } from "@server/lib/id";
 import { logger } from "@server/lib/logger";
 import {
 	getContributionFullId,
+	isContributionId,
+	isPluginId,
 	type Manifest,
 	safeParseManifest,
 } from "@server/lib/plugins/manifest";
@@ -89,7 +91,7 @@ export interface PluginToolDescriptor {
 	title: string;
 	description?: string;
 	inputSchema: Readonly<Record<string, unknown>>;
-	execution: "server" | "ui";
+	execution: "server" | "ui" | "host";
 	allowBackground: boolean;
 	status: PluginToolStatus;
 	unavailableReason?: string;
@@ -143,6 +145,22 @@ export type PluginToolHandler = (
 	context: PluginToolHandlerContext,
 ) => unknown | Promise<unknown>;
 
+/** Host-only registration: pin an installation and recheck its trusted package on every call. */
+export interface PluginHostHandlerRegistration {
+	principal: PluginPrincipal;
+	/** Must validate the current installed package digest/source and enabled installation state. */
+	isTrusted: () => boolean | Promise<boolean>;
+	resolvePrincipal?: () => PluginPrincipal | undefined | Promise<PluginPrincipal | undefined>;
+	capability?: Capability;
+	/** Trusted bootstrap templates may follow reinstall/enable generations; package trust stays mandatory. */
+	followInstallation?: boolean;
+}
+
+interface HostToolRegistration {
+	handler: PluginToolHandler;
+	options: PluginHostHandlerRegistration;
+}
+
 export interface PluginToolRuntime {
 	request(
 		method: string,
@@ -183,6 +201,8 @@ export interface PluginToolAuditEntry {
 	requestId?: string;
 	correlationId?: string;
 	principalKind?: InvocationPrincipal["kind"];
+	userId?: string;
+	narratorId?: string;
 	methodId: "tools.invoke";
 	capability: string;
 	outcome: PluginToolAuditOutcome;
@@ -622,6 +642,7 @@ function validateSchemaShape(
 	schema: Record<string, unknown>,
 	maxBytes: number,
 	maxDepth: number,
+	requireObject = true,
 ): Record<string, unknown> {
 	if (!jsonValueSchema.safeParse(schema).success) {
 		throw new PluginToolRegistryError("INVALID_PARAMS", "Tool schema must be restricted JSON");
@@ -682,13 +703,14 @@ function validateSchemaShape(
 	};
 	visit(root, 0, "");
 	const types = schemaTypes(root);
-	if (types && !types.includes("object")) {
+	if (requireObject && types && !types.includes("object")) {
 		throw new PluginToolRegistryError(
 			"INVALID_PARAMS",
 			"Tool input schema root must allow an object",
 		);
 	}
 	if (
+		requireObject &&
 		!types &&
 		!isRecord(root.properties) &&
 		!Array.isArray(root.anyOf) &&
@@ -722,6 +744,33 @@ function validateInput(input: unknown, schema: Record<string, unknown>): Record<
 		);
 	}
 	return clone(input) as Record<string, JsonValue>;
+}
+
+/** Shared strict JSON-schema validation for host command contributions (including scalar inputs). */
+export function validatePluginContributionInput(
+	input: unknown,
+	schema: Record<string, unknown>,
+): JsonValue {
+	const parsed = jsonValueSchema.safeParse(input);
+	if (!parsed.success)
+		throw new PluginToolRegistryError(
+			"INVALID_PARAMS",
+			"Contribution input must be restricted JSON",
+		);
+	const root = validateSchemaShape(
+		schema,
+		DEFAULT_MAX_SCHEMA_BYTES,
+		DEFAULT_MAX_SCHEMA_DEPTH,
+		false,
+	);
+	const issues: ValidationIssue[] = [];
+	validateAgainstSchema(parsed.data, root, root, "", issues, new Set());
+	if (issues.length > 0)
+		throw new PluginToolRegistryError(
+			"INVALID_PARAMS",
+			"Contribution input failed strict schema validation",
+		);
+	return clone(parsed.data);
 }
 
 function normalizeResult(value: unknown): PluginToolResult {
@@ -761,6 +810,7 @@ export class PluginToolRegistry {
 	private readonly now: () => Date;
 	private readonly entries = new Map<string, RegistryEntry>();
 	private readonly auditEntries: PluginToolAuditEntry[] = [];
+	private readonly hostHandlers = new Map<string, HostToolRegistration>();
 
 	constructor(options: PluginToolRegistryOptions) {
 		this.capabilityBroker = options.capabilityBroker;
@@ -796,6 +846,44 @@ export class PluginToolRegistry {
 		);
 		this.auditSink = options.auditSink;
 		this.now = options.now ?? (() => new Date());
+	}
+
+	/** Register only from trusted host bootstrap code, never from plugin RPC. */
+	registerHostHandler(
+		pluginId: string,
+		contributionId: string,
+		handler: PluginToolHandler,
+		options: PluginHostHandlerRegistration,
+	): () => void {
+		const principal = pluginPrincipalSchema.safeParse(options.principal);
+		if (
+			!isPluginId(pluginId) ||
+			!isContributionId(contributionId) ||
+			!principal.success ||
+			principal.data.pluginId !== pluginId ||
+			typeof options.isTrusted !== "function" ||
+			typeof handler !== "function"
+		) {
+			throw new PluginToolRegistryError("INVALID_PARAMS", "Invalid host handler registration");
+		}
+		const fullId = getContributionFullId(pluginId, contributionId);
+		if (this.hostHandlers.has(fullId)) {
+			throw new PluginToolRegistryError(
+				"CONFLICT",
+				`Host handler is already registered: ${fullId}`,
+			);
+		}
+		const registration: HostToolRegistration = {
+			handler,
+			options: Object.freeze({
+				...options,
+				principal: deepFreeze({ ...principal.data, contributionId }),
+			}),
+		};
+		this.hostHandlers.set(fullId, registration);
+		return () => {
+			if (this.hostHandlers.get(fullId) === registration) this.hostHandlers.delete(fullId);
+		};
 	}
 
 	registerManifest(
@@ -910,7 +998,12 @@ export class PluginToolRegistry {
 		const startedAt = this.now().getTime();
 		const entry = this.entries.get(fullId);
 		if (!entry) throw new PluginToolRegistryError("NOT_FOUND", `Unknown plugin tool: ${fullId}`);
-		const capability = this.capabilityForTool?.(entry.descriptor) ?? this.authorizationCapability;
+		const hostRegistration =
+			entry.descriptor.execution === "host" ? this.hostHandlers.get(fullId) : undefined;
+		const capability =
+			hostRegistration?.options.capability ??
+			this.capabilityForTool?.(entry.descriptor) ??
+			this.authorizationCapability;
 		let host: HostCallContext | undefined;
 		let requestBytes = 0;
 		let responseBytes = 0;
@@ -955,7 +1048,23 @@ export class PluginToolRegistry {
 			if (parsedPermission.data.behavior === "deny") {
 				throw new PluginToolRegistryError("PERMISSION_DENIED", "Core tool permission was denied");
 			}
-			const principal = await this.principalFor(entry);
+			if (entry.descriptor.execution === "host" && !hostRegistration) {
+				throw new PluginToolRegistryError(
+					"HOST_UNAVAILABLE",
+					"Host tool handler is not registered",
+				);
+			}
+			const hostDeadline = hostRegistration
+				? this.deadline(options, this.timeout(options.timeoutMs))
+				: undefined;
+			const principal =
+				hostDeadline !== undefined
+					? await this.waitForHostStage(
+							() => this.principalFor(entry, hostRegistration),
+							options.signal,
+							Date.parse(hostDeadline),
+						)
+					: await this.principalFor(entry);
 			const parsedScope = invocationScopeSchema.safeParse(
 				options.context?.scope ?? options.scope ?? {},
 			);
@@ -965,10 +1074,26 @@ export class PluginToolRegistry {
 					"Tool invocation scope is invalid",
 				);
 			}
-			const scope = clone(parsedScope.data);
+			if (
+				hostRegistration &&
+				((invocation.kind === "user" &&
+					parsedScope.data.userId !== undefined &&
+					parsedScope.data.userId !== invocation.userId) ||
+					(invocation.narratorId !== undefined &&
+						parsedScope.data.narratorId !== invocation.narratorId))
+			) {
+				throw new PluginToolRegistryError(
+					"PERMISSION_DENIED",
+					"Host tool invocation scope is inconsistent",
+				);
+			}
+			const scope = hostRegistration
+				? deepFreeze(clone(parsedScope.data))
+				: clone(parsedScope.data);
 			const timeoutMs = this.timeout(options.timeoutMs);
-			const deadlineAt = this.deadline(options, timeoutMs);
-			host = this.createContext(principal, invocation, scope, options, deadlineAt);
+			const deadlineAt = hostDeadline ?? this.deadline(options, timeoutMs);
+			const callContext = this.createContext(principal, invocation, scope, options, deadlineAt);
+			host = callContext;
 			if (options.target) {
 				const parsedTarget = toolTargetSchema.safeParse(options.target);
 				if (!parsedTarget.success) {
@@ -976,21 +1101,25 @@ export class PluginToolRegistry {
 				}
 				target = deepFreeze(clone(parsedTarget.data));
 			}
-			const authorization = await this.capabilityBroker.authorize({
-				context: host,
-				capability,
-				methodId: `tools.invoke:${entry.descriptor.fullId}`,
-				scope,
-				constraints: {
-					maxBytes: requestBytes,
-					...(target?.deviceId ? { resourceId: target.deviceId } : {}),
-				},
-				...(target?.kind === "device" && target.deviceId
-					? { resource: { type: "device" as const, id: target.deviceId } }
-					: {}),
-				requestBytes,
-				responseBytes: 0,
-			});
+			const authorize = () =>
+				this.capabilityBroker.authorize({
+					context: callContext,
+					capability,
+					methodId: `tools.invoke:${entry.descriptor.fullId}`,
+					scope,
+					constraints: {
+						maxBytes: requestBytes,
+						...(target?.deviceId ? { resourceId: target.deviceId } : {}),
+					},
+					...(target?.kind === "device" && target.deviceId
+						? { resource: { type: "device" as const, id: target.deviceId } }
+						: {}),
+					requestBytes,
+					responseBytes: 0,
+				});
+			const authorization = hostRegistration
+				? await this.waitForHostStage(authorize, options.signal, Date.parse(deadlineAt))
+				: await authorize();
 			if (!authorization.allowed) {
 				const denied = authorization.error;
 				logger.warn("plugin tool call denied by capability broker", {
@@ -1042,13 +1171,32 @@ export class PluginToolRegistry {
 					"Capability broker denied the plugin tool call",
 				);
 			}
+			if (hostRegistration) {
+				const current = await this.waitForHostStage(
+					() => this.principalFor(entry, hostRegistration),
+					options.signal,
+					Date.parse(deadlineAt),
+				);
+				if (JSON.stringify(current) !== JSON.stringify(principal)) {
+					throw new PluginToolRegistryError(
+						"PERMISSION_DENIED",
+						"Host installation changed during authorization",
+					);
+				}
+			}
+			if (
+				hostRegistration &&
+				(this.hostHandlers.get(fullId) !== hostRegistration || this.entries.get(fullId) !== entry)
+			) {
+				throw new PluginToolRegistryError("HOST_UNAVAILABLE", "Host handler binding was removed");
+			}
 			const result = await this.executeEntry(
 				entry,
 				parsedInput,
 				{
 					descriptor: copyDescriptor(entry.descriptor),
 					host,
-					invocation: clone(invocation),
+					invocation: hostRegistration ? host.invocation : clone(invocation),
 					scope,
 					target,
 					permission: deepFreeze({
@@ -1058,8 +1206,9 @@ export class PluginToolRegistry {
 					publicApi: this.publicApi,
 					signal: options.signal ?? new AbortController().signal,
 				},
-				timeoutMs,
+				hostRegistration ? Math.max(1, Date.parse(deadlineAt) - this.now().getTime()) : timeoutMs,
 				options.signal,
+				hostRegistration?.handler,
 			);
 			responseBytes = jsonBytes(result, "PROTOCOL_ERROR");
 			if (responseBytes > this.maxOutputBytes) {
@@ -1071,6 +1220,7 @@ export class PluginToolRegistry {
 			await this.audit({
 				entry,
 				host,
+				options,
 				capability,
 				outcome: "succeeded",
 				startedAt,
@@ -1083,6 +1233,7 @@ export class PluginToolRegistry {
 			await this.audit({
 				entry,
 				host,
+				options,
 				capability,
 				outcome: auditOutcome(error),
 				startedAt,
@@ -1166,12 +1317,16 @@ export class PluginToolRegistry {
 		baseContext: Omit<PluginToolHandlerContext, "signal"> & { signal: AbortSignal },
 		timeoutMs: number,
 		externalSignal?: AbortSignal,
+		hostHandler?: PluginToolHandler,
 	): Promise<PluginToolResult> {
 		const controller = new AbortController();
 		const forwardAbort = (): void => controller.abort(externalSignal?.reason ?? "caller-cancelled");
+		if (externalSignal?.aborted && entry.descriptor.execution === "host")
+			throw abortError(externalSignal.reason);
 		if (externalSignal?.aborted) forwardAbort();
 		else externalSignal?.addEventListener("abort", forwardAbort, { once: true });
-		const handler = entry.handler ?? this.defaultHandler;
+		const handler =
+			entry.descriptor.execution === "host" ? hostHandler : (entry.handler ?? this.defaultHandler);
 		const context: PluginToolHandlerContext = {
 			...baseContext,
 			signal: controller.signal,
@@ -1248,18 +1403,47 @@ export class PluginToolRegistry {
 		);
 	}
 
-	private async principalFor(entry: RegistryEntry): Promise<PluginPrincipal> {
-		const resolved = await this.resolvePrincipal?.(
-			entry.descriptor.pluginId,
-			entry.descriptor.contributionId,
-		);
-		const principal = resolved ?? entry.principal;
+	private async principalFor(
+		entry: RegistryEntry,
+		hostRegistration?: HostToolRegistration,
+	): Promise<PluginPrincipal> {
+		if (hostRegistration && !(await hostRegistration.options.isTrusted())) {
+			throw new PluginToolRegistryError(
+				"PERMISSION_DENIED",
+				"Installed host contribution is not trusted",
+			);
+		}
+		const resolved = hostRegistration?.options.resolvePrincipal
+			? await hostRegistration.options.resolvePrincipal()
+			: await this.resolvePrincipal?.(entry.descriptor.pluginId, entry.descriptor.contributionId);
+		// A host binding must come from current installation state, not a stale manifest principal.
+		const principal = hostRegistration ? resolved : (resolved ?? entry.principal);
 		const parsed = pluginPrincipalSchema.safeParse(principal);
 		if (!parsed.success || parsed.data.pluginId !== entry.descriptor.pluginId) {
 			throw new PluginToolRegistryError(
 				"CONTEXT_UNAVAILABLE",
 				"Plugin runtime principal is unavailable",
 			);
+		}
+		if (hostRegistration) {
+			const pinned = hostRegistration.options.principal;
+			if (
+				parsed.data.packageVersion !== entry.descriptor.version ||
+				parsed.data.packageVersion !== pinned.packageVersion ||
+				(!hostRegistration.options.followInstallation &&
+					parsed.data.installationId !== pinned.installationId) ||
+				parsed.data.runtimeId !== pinned.runtimeId ||
+				(!hostRegistration.options.followInstallation &&
+					parsed.data.runtimeGeneration !== pinned.runtimeGeneration) ||
+				(parsed.data.contributionId !== undefined &&
+					parsed.data.contributionId !== entry.descriptor.contributionId)
+			) {
+				throw new PluginToolRegistryError(
+					"PERMISSION_DENIED",
+					"Host contribution installation identity changed",
+				);
+			}
+			return { ...parsed.data, contributionId: entry.descriptor.contributionId };
 		}
 		return { ...parsed.data };
 	}
@@ -1276,16 +1460,50 @@ export class PluginToolRegistry {
 		const correlationId =
 			options.correlationId ?? options.context?.correlationId ?? `tool_corr_${generateShortId(16)}`;
 		if (this.capabilityBroker.withCallContext) {
-			return this.capabilityBroker.withCallContext({
-				plugin,
-				invocation,
-				scope,
-				requestId,
-				correlationId,
-				deadlineAt,
-			});
+			return deepFreeze(
+				clone(
+					this.capabilityBroker.withCallContext({
+						plugin,
+						invocation,
+						scope,
+						requestId,
+						correlationId,
+						deadlineAt,
+					}),
+				),
+			);
 		}
-		return { requestId, correlationId, deadlineAt, plugin, invocation, scope };
+		return deepFreeze(clone({ requestId, correlationId, deadlineAt, plugin, invocation, scope }));
+	}
+
+	private async waitForHostStage<T>(
+		operation: () => Promise<T>,
+		signal: AbortSignal | undefined,
+		deadline: number,
+	): Promise<T> {
+		if (signal?.aborted) throw abortError(signal.reason);
+		const remaining = deadline - this.now().getTime();
+		if (remaining <= 0)
+			throw new PluginToolRegistryError("TIMEOUT", "Host tool deadline has expired", true);
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		let onAbort: (() => void) | undefined;
+		const timeout = new Promise<never>((_, reject) => {
+			timer = setTimeout(
+				() =>
+					reject(new PluginToolRegistryError("TIMEOUT", "Host tool authorization timed out", true)),
+				remaining,
+			);
+		});
+		const cancelled = new Promise<never>((_, reject) => {
+			onAbort = () => reject(abortError(signal?.reason));
+			signal?.addEventListener("abort", onAbort, { once: true });
+		});
+		try {
+			return await Promise.race([Promise.resolve().then(operation), timeout, cancelled]);
+		} finally {
+			if (timer) clearTimeout(timer);
+			if (onAbort) signal?.removeEventListener("abort", onAbort);
+		}
 	}
 
 	private timeout(requested: number | undefined): number {
@@ -1319,6 +1537,7 @@ export class PluginToolRegistry {
 	private async audit(input: {
 		entry: RegistryEntry;
 		host?: HostCallContext;
+		options: PluginToolInvocationOptions;
 		capability: string;
 		outcome: PluginToolAuditOutcome;
 		startedAt: number;
@@ -1327,14 +1546,25 @@ export class PluginToolRegistry {
 		target?: Readonly<PluginToolTarget>;
 		errorCode?: string;
 	}): Promise<void> {
+		const invocation = invocationPrincipalSchema.safeParse(
+			input.options.context?.invocation ?? input.options.invocation,
+		);
 		const entry: PluginToolAuditEntry = {
 			pluginId: input.entry.descriptor.pluginId,
 			contributionId: input.entry.descriptor.contributionId,
 			fullId: input.entry.descriptor.fullId,
 			runtimeId: input.host?.plugin.runtimeId,
-			requestId: input.host?.requestId,
-			correlationId: input.host?.correlationId,
-			principalKind: input.host?.invocation.kind,
+			requestId:
+				input.host?.requestId ?? input.options.requestId ?? input.options.context?.requestId,
+			correlationId:
+				input.host?.correlationId ??
+				input.options.correlationId ??
+				input.options.context?.correlationId,
+			principalKind:
+				input.host?.invocation.kind ?? (invocation.success ? invocation.data.kind : undefined),
+			userId:
+				input.host?.invocation.userId ?? (invocation.success ? invocation.data.userId : undefined),
+			narratorId: input.host?.scope.narratorId,
 			methodId: "tools.invoke",
 			capability: input.capability,
 			outcome: input.outcome,

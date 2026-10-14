@@ -1,0 +1,19 @@
+{
+	"name": "@narrafork/steward-narrator",
+	"version": "0.2.0",
+	"private": true,
+	"description": "NarraFork server/ui steward narrator example",
+	"license": "Apache-2.0",
+	"files": [
+		"manifest.json",
+		"package.json",
+		"sbom.spdx.json",
+		"server/index.js",
+		"ui/panel.iife.js",
+		"ui/panel.css"
+	],
+	"scripts": {
+		"test": "bun test tests",
+		"pack": "npm pack --ignore-scripts"
+	}
+}

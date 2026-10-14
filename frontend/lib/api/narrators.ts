@@ -883,6 +883,14 @@ export const narratorsApi = {
 		makeNamed?: boolean;
 		handle?: string;
 		kind?: "knowledge" | "setup";
+		/**
+		 * Who may see the new session. Omitted means "server decides" (standalone → private,
+		 * chapter-bound → project), which is why the create dialog's default is to send
+		 * nothing rather than to send "private".
+		 */
+		visibility?: "private" | "project" | "public";
+		/** Who may drive it without an individual grant. Omitted means "server decides". */
+		writeAudience?: "owner" | "project" | "public";
 	}) => request<ApiEntity>("/narrators", { method: "POST", body: JSON.stringify(data) }),
 	/**
 	 * Spawn a Setup Assistant narrator that installs the missing system

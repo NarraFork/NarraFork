@@ -34,6 +34,11 @@ import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { parseSubstatus } from "../lib/narrator-utils";
 import { broadcastToUser } from "../websocket/narrator-ws";
+import {
+	filterReadableNarrators,
+	type NarratorPrincipal,
+	resolveNarratorListPrincipal,
+} from "./narrator-acl";
 
 const RECENT_TAB_TEXT_MAX_CHARS = 1_000;
 const UNDO_TTL_MS = 30_000;
@@ -1740,8 +1745,38 @@ export async function listPage(
 			}
 		}
 		const lastTopLevelRow = pageTopLevelRows.at(-1);
+		// Drop tabs whose narrator the holder may no longer read, and attach each remaining
+		// narrator's visibility so the sidebar can mark private ones.
+		//
+		// `pruneUnreadableNarratorTabs` normally removes these rows at the moment access
+		// changes; this filter is the safety net for a change that predates it (or a grant
+		// revoked while the process was down). It runs HERE, not in SQL, because
+		// `filterReadableNarrators` is the same predicate the narrator list uses and
+		// reimplementing it as a join is how the two surfaces drift apart.
+		//
+		// The cost is that a dropped row is not replaced, so a page can come back short while
+		// `hasMore` is true. The pagination contract still holds (the client keeps the cursor
+		// and continues), it is just a page that is occasionally thinner than requested —
+		// accepted because this path is a bounded list per user, not a hot scan.
+		const principal = await resolveNarratorListPrincipal(userId);
+		const tabVisibility = await resolveTabNarratorVisibility(
+			narratorIdsOfRows(pageRows),
+			principal,
+		);
+		const visibleRows = pageRows.filter((row) => {
+			const narratorId = narratorIdOfRow(row);
+			if (!narratorId) return true;
+			return !tabVisibility.known.has(narratorId) || tabVisibility.readable.has(narratorId);
+		});
+
 		return {
-			items: pageRows.map(rowToTab),
+			items: visibleRows.map((row) => {
+				const tab = rowToTab(row);
+				const narratorId = narratorIdOfRow(row);
+				const visibility = narratorId ? tabVisibility.visibility.get(narratorId) : undefined;
+				if (visibility) tab.visibility = visibility;
+				return tab;
+			}),
 			revision,
 			hasMore,
 			nextCursor:
@@ -1989,6 +2024,140 @@ export async function pruneUnreadableProjectTabs(userId: string, projectId: stri
 	}
 
 	for (const tab of doomed) await removeRecentTab(userId, tab.type, tab.id);
+}
+
+/**
+ * The narrator ids a tab points at, for the visibility join.
+ *
+ * Mirrors the service-local `getTabNarratorId` but works on the ROW shape, so the paginated
+ * path can collect ids before it materializes tabs.
+ */
+function narratorIdsOfRows(rows: RecentTabRow[]): string[] {
+	const ids: string[] = [];
+	for (const row of rows) {
+		const id = narratorIdOfRow(row);
+		if (id) ids.push(id);
+	}
+	return ids;
+}
+
+/** The narrator a row's visibility should be read from, mirroring `getTabNarratorId`. */
+function narratorIdOfRow(row: RecentTabRow): string | undefined {
+	if (row.type === "narrator" || row.type === "subagent") return row.entityId;
+	if (row.type === "chapter") return row.narratorId ?? undefined;
+	return undefined;
+}
+
+/**
+ * For a set of narrator ids, what the user may still read and each narrator's visibility.
+ *
+ * Shared by the paginated read path and the legacy `enrichTabs` so a narrator cannot appear
+ * in the sidebar under one code path and vanish under the other.
+ *
+ * `known` is separate from `readable` on purpose: a tab whose narrator row is GONE is
+ * neither, and must be KEPT. That is the pre-existing dead-tab case — `pruneUnreadableProjectTabs`
+ * documents the same decision — and deleting it here would turn a data-repair concern into an
+ * apparent ACL change. Only rows that exist and are no longer readable are dropped.
+ *
+ * `visibility` is attached for every KNOWN narrator, not just readable ones: the icon and the
+ * drop decision are separate questions, and the row is already in hand.
+ */
+export async function resolveTabNarratorVisibility(
+	narratorIds: string[],
+	principal: NarratorPrincipal,
+): Promise<{ known: Set<string>; readable: Set<string>; visibility: Map<string, string> }> {
+	const unique = [...new Set(narratorIds)];
+	const known = new Set<string>();
+	const readable = new Set<string>();
+	const visibility = new Map<string, string>();
+	if (unique.length === 0) return { known, readable, visibility };
+
+	const rows = await db
+		.select({
+			id: narrators.id,
+			ownerUserId: narrators.ownerUserId,
+			visibility: narrators.visibility,
+			writeAudience: narrators.writeAudience,
+			type: narrators.type,
+			aclRootNarratorId: narrators.aclRootNarratorId,
+			chapterId: narrators.chapterId,
+			contextProjectId: narrators.contextProjectId,
+		})
+		.from(narrators)
+		.where(inArray(narrators.id, unique));
+	for (const row of rows) {
+		known.add(row.id);
+		visibility.set(row.id, row.visibility);
+	}
+	// The same predicate the narrator list uses, so the sidebar and the list agree.
+	for (const row of await filterReadableNarrators([...rows], principal)) readable.add(row.id);
+	return { known, readable, visibility };
+}
+
+/**
+ * Drop recent tabs for a narrator the holder may no longer read, after its access changed.
+ *
+ * The narrator counterpart of {@link pruneUnreadableProjectTabs}, which already covers the
+ * project axis. Without this, making a session private (or revoking a grant) leaves every
+ * other holder staring at a tab that 404s when clicked. Called from the sharing mutations so
+ * the removal happens as part of the change rather than on the next read.
+ *
+ * Decided by `filterReadableNarrators` — i.e. by ACCESS, never by the admin listing
+ * preference. Only the `private`-tier narrowing plus `canReadNarrator` matter here, and a
+ * per-view flag must not destroy rows.
+ *
+ * CHAPTER tabs are deliberately excluded from the sweep (only `narrator`/`subagent` rows are
+ * enumerated and removed): a chapter tab's `entityId` is the chapter, and the chapter itself
+ * has no per-user ACL, so deleting it here would destroy a tab that still opens. Their
+ * association with a now-private narrator is handled at READ time by `listPage`, which hides
+ * the row without discarding it. The asymmetry is intentional: removal is for lost ACCESS,
+ * the read filter is for what a listing should show.
+ */
+export async function pruneUnreadableNarratorTabs(narratorId: string): Promise<void> {
+	// A subagent's access is decided by its root, so changing the ROOT's visibility must
+	// reach holders of the subagent's tab too. Enumerating the children first is what makes
+	// this complete; a sweep keyed only on `narratorId` would silently miss them.
+	const children = db
+		.select({ id: narrators.id })
+		.from(narrators)
+		.where(and(eq(narrators.type, "subagent"), eq(narrators.aclRootNarratorId, narratorId)))
+		.all();
+	const targetIds = [narratorId, ...children.map((child) => child.id)];
+
+	const holderIds = new Set<string>();
+	for (const id of targetIds) {
+		for (const tabType of ["narrator", "subagent"] as const) {
+			for (const userId of await getRecentTabUserIds(tabType, id)) holderIds.add(userId);
+		}
+	}
+
+	for (const userId of holderIds) {
+		const principal = await resolveNarratorListPrincipal(userId);
+		// Deletion must be decided by ACCESS alone. `showAllNarrators` is a display filter, so
+		// feeding it in here would delete an opted-out admin's rows for narrators that admin
+		// can still open, and flipping the preference back could never restore them. Forcing
+		// the full view turns this resolver into the access-only question it needs to be.
+		const accessPrincipal: NarratorPrincipal = { ...principal, showAllNarrators: true };
+		const rows = db
+			.select()
+			.from(userRecentTabs)
+			.where(eq(userRecentTabs.userId, userId))
+			.all()
+			.filter((row) => row.type === "narrator" || row.type === "subagent");
+		if (rows.length === 0) continue;
+
+		const { known, readable } = await resolveTabNarratorVisibility(
+			rows.map((row) => row.entityId),
+			accessPrincipal,
+		);
+		for (const row of rows) {
+			// A vanished narrator is the pre-existing dead-tab case, not this cleanup's
+			// business (see `pruneUnreadableProjectTabs` for the same reasoning).
+			if (!known.has(row.entityId)) continue;
+			if (readable.has(row.entityId)) continue;
+			await removeRecentTab(userId, row.type, row.entityId);
+		}
+	}
 }
 
 /** Remove an entity only from users selected by the authoritative membership index. */

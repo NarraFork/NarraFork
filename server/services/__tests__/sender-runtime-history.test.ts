@@ -1,5 +1,6 @@
 import { Database } from "bun:sqlite";
 import { afterAll, afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
+import { formatStewardOriginLabel, parseStewardOriginLabel } from "@shared/message-origin";
 import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import { narratorMessageRefs, narratorMessages, narrators, users } from "../../db/schema";
@@ -63,6 +64,43 @@ afterEach(() => {
 	settings.anthropicProviders = originalProviders;
 });
 afterAll(() => sqlite.close());
+
+test("steward delegation survives database persistence and model history projection", async () => {
+	const provenance = {
+		userId: "alice",
+		pluginId: "steward-narrator",
+		contributionId: "send",
+		requestId: "steward-request",
+		correlationId: "steward-correlation",
+		stewardNarratorId: "sender",
+		targetNarratorId: "primary",
+		bindingRevision: 7,
+	};
+	const row = await narratorPersistence.persistUserMessage(
+		"primary",
+		"original delegated bytes",
+		undefined,
+		null,
+		"alice",
+		{ origin: "assistant", originLabel: formatStewardOriginLabel(provenance) },
+	);
+	const persisted = await db.query.narratorMessages.findFirst({
+		where: eq(narratorMessages.id, row.id),
+	});
+	expect(persisted?.createdBy).toBe("alice");
+	expect(persisted?.origin).toBe("assistant");
+	expect(parseStewardOriginLabel(persisted?.originLabel)).toEqual(provenance);
+	expect(persisted?.contentText).toBe("original delegated bytes");
+	expect(JSON.stringify(persisted?.contentJson)).not.toContain("<sender");
+	const projected = projectMessageSenderForModel({ ...persisted!, creator: row.creator });
+	const text = JSON.stringify(projected.contentJson);
+	expect(text).toContain('kind=\\"agent\\"');
+	expect(text).toContain('delegated_user_id=\\"alice\\"');
+	expect(text).toContain('plugin_id=\\"steward-narrator\\"');
+	expect(text).toContain('steward_narrator_id=\\"sender\\"');
+	expect(text).toContain('binding_revision=\\"7\\"');
+	expect(text).not.toContain('kind=\\"human\\"');
+});
 
 function options(official = false, narratorId = "primary") {
 	return {

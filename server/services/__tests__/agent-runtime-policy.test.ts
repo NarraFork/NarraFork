@@ -46,6 +46,8 @@ const profiles: RuntimePolicyInput[] = [
 				"Task",
 				"ContinueTask",
 				"ForkNarrator",
+				"NarratorList",
+				"NarratorSend",
 				"EnterPlanMode",
 				"ExitPlanMode",
 				"Write",
@@ -81,6 +83,8 @@ describe("shared capability projections", () => {
 				"Task",
 				"ContinueTask",
 				"ForkNarrator",
+				"NarratorList",
+				"NarratorSend",
 				"EnterPlanMode",
 				"ExitPlanMode",
 			]) {

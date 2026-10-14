@@ -81,6 +81,8 @@ export const invocationPrincipalSchema = z
 		kind: z.enum(["user", "plugin_background", "system"]),
 		userId: identifierSchema.optional(),
 		userRole: z.enum(["admin", "user"]).optional(),
+		/** Authenticated source narrator, derived by the host rather than plugin input. */
+		narratorId: identifierSchema.optional(),
 		source: z.enum(["ui", "command", "event", "schedule", "provider", "internal"]),
 	})
 	.strict()
@@ -92,7 +94,10 @@ export const invocationPrincipalSchema = z
 				message: "user principal requires userId",
 			});
 		}
-		if (principal.kind !== "user" && (principal.userId || principal.userRole)) {
+		if (
+			principal.kind !== "user" &&
+			(principal.userId || principal.userRole || principal.narratorId)
+		) {
 			context.addIssue({
 				code: "custom",
 				path: ["userId"],

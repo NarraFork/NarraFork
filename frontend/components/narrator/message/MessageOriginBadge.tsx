@@ -20,6 +20,7 @@ import {
 	type MessageOriginSource,
 	normalizeMessageOrigin,
 	parseOriginLabel,
+	parseStewardOriginLabel,
 } from "@shared/message-origin";
 import {
 	IconApi,
@@ -72,6 +73,10 @@ export function useOriginTooltip(
 	const { t } = useTranslation("narrator");
 	const parsed = parseOriginLabel(originLabel);
 	const normalized = normalizeMessageOrigin(origin);
+	const provenance = normalized === "assistant" ? parseStewardOriginLabel(originLabel) : null;
+	if (provenance) {
+		return `${t("origin.source.agentMessage")} · user:${provenance.userId} · plugin:${provenance.pluginId} · steward:${provenance.stewardNarratorId} · target:${provenance.targetNarratorId} · contribution:${provenance.contributionId} · request:${provenance.requestId} · correlation:${provenance.correlationId} · binding:${provenance.bindingRevision}`;
+	}
 
 	if (parsed?.source) {
 		const sourceName = t(`origin.source.${parsed.source}`);
@@ -99,6 +104,11 @@ export function resolveUserBubbleName(
 	},
 	t: (key: string) => string,
 ): string {
+	const provenance =
+		message.origin === "assistant" ? parseStewardOriginLabel(message.originLabel) : null;
+	if (provenance) {
+		return `${message.creator?.username ?? provenance.userId} · ${t("origin.source.agentMessage")}: ${provenance.stewardNarratorId}`;
+	}
 	if (message.creator?.username) return message.creator.username;
 
 	const parsed = parseOriginLabel(message.originLabel);

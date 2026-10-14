@@ -320,6 +320,8 @@ export const settingsApi = {
 			narratorParagraphScalePercent: number;
 			addSubagentToRecentTabs: boolean;
 			recentTabsGroupMode: "flat" | "directory";
+			/** Admin-only narrator listing preference; meaningless for non-admins. */
+			showAllNarrators: boolean;
 			// Notification preferences
 			notifyOnDone: boolean;
 			notifyOnWaiting: boolean;
@@ -384,6 +386,12 @@ export const settingsApi = {
 		narratorParagraphScalePercent?: number;
 		addSubagentToRecentTabs?: boolean;
 		recentTabsGroupMode?: "flat" | "directory";
+		/**
+		 * Admin-only listing preference: include narrators other people set to `private`
+		 * in this admin's narrator lists. Stored per user, so it is a PATCH to
+		 * `/user-preferences` rather than an instance setting.
+		 */
+		showAllNarrators?: boolean;
 		// Notification preferences
 		notifyOnDone?: boolean;
 		notifyOnWaiting?: boolean;

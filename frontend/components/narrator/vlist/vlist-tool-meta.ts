@@ -181,7 +181,7 @@ export function deriveSendTargetNarratorId(
 	resolved?: unknown,
 ): string | undefined {
 	const isTeamSend = toolName === "TeamStatus" && asRecord(input).action === "send";
-	if (toolName !== "Send" && !isTeamSend) return undefined;
+	if (toolName !== "Send" && toolName !== "NarratorSend" && !isTeamSend) return undefined;
 	const targets = metadata.targets;
 	if (targets === undefined) return runningSendTargetNarratorId(input, resolved);
 	if (!Array.isArray(targets) || targets.length !== 1) return undefined;

@@ -27,6 +27,15 @@ import {
 // hand-copied expectation.
 const { buildSelectionIndex } = await import("../vlist/vlist-selection");
 
+test("NarratorSend target uses the resolved receipt metadata without child identity", () => {
+	const tc = {
+		toolName: "NarratorSend",
+		inputJson: { id: "peer", message: "hello" },
+		_metadata: { kind: "send", targets: [{ id: "peer" }] },
+	};
+	expect(traceRowSendTargetNarratorId(tc)).toBe("peer");
+});
+
 test("running Send trace uses resolved id but excludes parent and fanout", () => {
 	const tc = {
 		toolName: "Send",

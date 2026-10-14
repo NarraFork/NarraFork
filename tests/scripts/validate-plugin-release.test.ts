@@ -28,14 +28,15 @@ describe("plugin GA release validation", () => {
 		const summary = await validatePluginRelease(examplesRoot);
 		expect(summary.valid).toBe(true);
 		expect(summary.mode).toBe("static");
-		expect(summary.packageCount).toBe(9);
-		// 9 packages across the 6 os/arch combinations the release matrix supports.
-		expect(summary.matrixCombinationCount).toBe(54);
+		expect(summary.packageCount).toBe(10);
+		// 10 packages across the 6 os/arch combinations the release matrix supports.
+		expect(summary.matrixCombinationCount).toBe(60);
 		expect(summary.errors).toEqual([]);
 		// Discovery sorts by directory name, so this list is alphabetical.
 		expect(summary.packages.map((item) => item.kind)).toEqual([
 			"provider",
 			"sandbox-ui-panel",
+			"steward-narrator",
 			"theme-duo",
 			"theme-framed",
 			"theme-pop-art",
@@ -165,8 +166,9 @@ describe("plugin GA release validation", () => {
 			await cp(join(examplesRoot, "tool-command"), packageRoot, { recursive: true });
 			const entryPath = join(packageRoot, "server/index.js");
 			const entry = await readFile(entryPath, "utf8");
-			const digestField = "\t\t...(PACKAGE_DIGEST ? { packageDigest: PACKAGE_DIGEST } : {}),\n";
-			expect(entry).toContain(digestField);
+			const digestField =
+				/\t\t\.\.\.\(PACKAGE_DIGEST \? \{ packageDigest: PACKAGE_DIGEST \} : \{\}\),\r?\n/;
+			expect(entry).toMatch(digestField);
 			await writeFile(entryPath, entry.replace(digestField, ""));
 
 			const summary = await validatePluginRelease(root, {
@@ -188,7 +190,7 @@ describe("plugin GA release validation", () => {
 		expect(summary.valid).toBe(true);
 		expect(summary.mode).toBe("ga");
 		expect(summary.errors).toEqual([]);
-		expect(summary.packageCount).toBe(9);
+		expect(summary.packageCount).toBe(10);
 
 		const tool = summary.packages.find((item) => item.pluginId === "com.example.tool-command");
 		expect(tool?.runtime).toMatchObject({
@@ -208,8 +210,75 @@ describe("plugin GA release validation", () => {
 			},
 		});
 
+		const steward = summary.packages.find((item) => item.pluginId === "steward-narrator");
+		expect(steward?.runtime).toMatchObject({
+			status: "passed",
+			handshake: { hello: true, initialize: true, activate: true, health: true, generation: 1 },
+			hostTools: {
+				status: "requires-host-validation",
+				contributionIds: ["steward.send"],
+			},
+		});
+		// Offline server validation cannot claim authenticated host-tool execution.
+		expect(steward?.runtime.toolInvoke).toBeUndefined();
+
 		const ui = summary.packages.find((item) => item.pluginId === "com.example.sandbox-ui");
 		expect(ui?.runtime.status).toBe("skipped-no-server");
+	});
+
+	test.each([
+		{ capability: "storage.read_self" },
+		{ capability: "storage.write_self" },
+		{ capability: "command.narrator.send_message" },
+	])("denies undeclared steward host capability: $capability", async ({ capability }) => {
+		const root = await mkdtemp(join(tmpdir(), "narrafork-steward-permission-release-"));
+		try {
+			const packageRoot = join(root, "steward-narrator");
+			await cp(join(examplesRoot, "steward-narrator"), packageRoot, { recursive: true });
+			const path = join(packageRoot, "manifest.json");
+			const manifest = JSON.parse(await readFile(path, "utf8"));
+			manifest.permissions.host = manifest.permissions.host.filter(
+				(value: string) => value !== capability,
+			);
+			await writeFile(path, JSON.stringify(manifest));
+			const summary = await validatePluginRelease(root, { mode: "ga", runtimeTimeoutMs: 5_000 });
+			expect(summary.valid).toBe(false);
+			expect(summary.packages[0]?.runtime.status).toBe("failed");
+			expect(summary.errors.join("\n")).toContain(
+				`Steward host capability not declared: ${capability}`,
+			);
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
+	});
+
+	test.each([
+		{ id: "steward.send", kind: "tool" },
+		{ id: "steward.bind", kind: "command" },
+		{ id: "steward.binding", kind: "command" },
+	])("rejects a steward host contribution misdeclared as server: $id", async ({ id, kind }) => {
+		const root = await mkdtemp(join(tmpdir(), "narrafork-steward-contract-release-"));
+		try {
+			const packageRoot = join(root, "steward-narrator");
+			await cp(join(examplesRoot, "steward-narrator"), packageRoot, { recursive: true });
+			const path = join(packageRoot, "manifest.json");
+			const manifest = JSON.parse(await readFile(path, "utf8"));
+			if (kind === "tool") {
+				manifest.contributes.tools.find((item: { id: string }) => item.id === id).execution =
+					"server";
+			} else {
+				manifest.contributes.commands.find((item: { id: string }) => item.id === id).handler =
+					"server";
+			}
+			await writeFile(path, JSON.stringify(manifest));
+			const summary = await validatePluginRelease(root, { mode: "ga", runtimeTimeoutMs: 5_000 });
+			expect(summary.valid).toBe(false);
+			expect(summary.packages[0]?.runtime.status).toBe("failed");
+			expect(summary.packages[0]?.runtime.toolInvoke).toBeUndefined();
+			expect(summary.errors.join("\n")).toContain("Steward host contract requires");
+		} finally {
+			await rm(root, { recursive: true, force: true });
+		}
 	});
 
 	test("fails runtime validation within the bounded hello timeout", async () => {

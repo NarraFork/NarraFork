@@ -4,6 +4,7 @@ import { AsyncMutex } from "@server/lib/async-mutex";
 import { AppError, ValidationError } from "@server/lib/errors";
 import { generateShortId } from "@server/lib/id";
 import { resourceScopeSchema } from "@server/lib/integrations/resource-scope";
+import { logger } from "@server/lib/logger";
 import { getNarraforkPath } from "@server/lib/narrafork-home";
 import { pluginIdSchema } from "@server/lib/plugins/manifest";
 
@@ -142,6 +143,14 @@ export interface PluginStorageSetInput extends PluginStorageGetInput {
 	expectedRevision?: number;
 }
 
+/** Host-only commit controls; these are never part of a plugin storage RPC payload. */
+export interface PluginStorageCommitOptions {
+	signal?: AbortSignal;
+	beforeCommit?: () => void | Promise<void>;
+	/** Synchronous final fence immediately before the irreversible write is admitted. */
+	commitGuard?: () => void;
+}
+
 export interface PluginStorageDeleteInput extends PluginStorageGetInput {
 	expectedRevision?: number;
 }
@@ -235,7 +244,13 @@ function createLimits(overrides?: PluginStorageLimitsOptions): PluginStorageLimi
 }
 
 function clone<T>(value: T): T {
-	return structuredClone(value);
+	return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function assertStorageCommitLive(options?: PluginStorageCommitOptions): void {
+	if (options?.signal?.aborted) {
+		throw new DOMException("Plugin storage write was cancelled before commit", "AbortError");
+	}
 }
 
 function timestamp(now: () => Date): string {
@@ -694,7 +709,10 @@ export class PluginStorage {
 		});
 	}
 
-	async set(input: PluginStorageSetInput): Promise<PluginStorageEntry>;
+	async set(
+		input: PluginStorageSetInput,
+		commitOptions?: PluginStorageCommitOptions,
+	): Promise<PluginStorageEntry>;
 	async set(
 		scope: PluginStorageScopeInput,
 		key: string,
@@ -703,13 +721,16 @@ export class PluginStorage {
 	): Promise<PluginStorageEntry>;
 	async set(
 		inputOrScope: PluginStorageSetInput | PluginStorageScopeInput,
-		keyArgument?: string,
+		keyArgument?: string | PluginStorageCommitOptions,
 		valueArgument?: unknown,
 		expectedRevisionArgument?: number,
 	): Promise<PluginStorageEntry> {
+		const commitOptions =
+			typeof keyArgument === "object" ? Object.freeze({ ...keyArgument }) : undefined;
+		assertStorageCommitLive(commitOptions);
 		const input = this.normalizeSetInput(
 			inputOrScope,
-			keyArgument,
+			typeof keyArgument === "string" ? keyArgument : undefined,
 			valueArgument,
 			expectedRevisionArgument,
 		);
@@ -750,6 +771,7 @@ export class PluginStorage {
 		}
 		const expectedRevision = parseExpectedRevision(input.expectedRevision);
 		return this.withPluginLock(async () => {
+			assertStorageCommitLive(commitOptions);
 			const isSession = scope.type === "session";
 			let document: StorageFileDocument | undefined;
 			let entries: Record<string, StoredEntry>;
@@ -800,12 +822,17 @@ export class PluginStorage {
 				createdAt: previous?.createdAt ?? now,
 				updatedAt: now,
 			};
-			entries[input.key] = next;
 			if (document) {
 				const nextDocument = clone(document);
-				nextDocument.scopes[scopeKey(scope)] = entries;
+				nextDocument.scopes[scopeKey(scope)] = { ...entries, [input.key]: next };
 				nextDocument.updatedAt = now;
-				await this.writeDocumentLocked(nextDocument);
+				await this.writeDocumentLocked(nextDocument, commitOptions);
+			} else {
+				await commitOptions?.beforeCommit?.();
+				assertStorageCommitLive(commitOptions);
+				commitOptions?.commitGuard?.();
+				assertStorageCommitLive(commitOptions);
+				entries[input.key] = next;
 			}
 			return cloneStoredEntry(next, this.pluginId, scope);
 		});
@@ -1177,7 +1204,10 @@ export class PluginStorage {
 		}
 	}
 
-	private async writeDocumentLocked(document: StorageFileDocument): Promise<void> {
+	private async writeDocumentLocked(
+		document: StorageFileDocument,
+		commitOptions?: PluginStorageCommitOptions,
+	): Promise<void> {
 		const json = `${JSON.stringify(document, null, 2)}\n`;
 		if (Buffer.byteLength(json, "utf8") > this.limits.maxFileBytes) {
 			throw new PluginStorageError(
@@ -1200,8 +1230,23 @@ export class PluginStorage {
 			await handle.sync();
 			await handle.close();
 			handle = undefined;
+			assertStorageCommitLive(commitOptions);
+			await commitOptions?.beforeCommit?.();
+			assertStorageCommitLive(commitOptions);
+			commitOptions?.commitGuard?.();
+			assertStorageCommitLive(commitOptions);
+			// Starting the rename admits an irreversible commit. Cancellation after this point
+			// must not turn an already persisted host binding into a reported rejection.
 			await this.renameFile(temporaryPath, this.storagePath);
-			await chmod(this.storagePath, 0o600);
+			if (commitOptions) {
+				await chmod(this.storagePath, 0o600).catch(() => {
+					logger.warn("Plugin storage permissions refresh failed after committed host write", {
+						pluginId: this.pluginId,
+					});
+				});
+			} else {
+				await chmod(this.storagePath, 0o600);
+			}
 			let directory: Awaited<ReturnType<typeof open>> | undefined;
 			try {
 				directory = await open(this.root, "r");

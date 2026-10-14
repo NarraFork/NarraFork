@@ -190,6 +190,10 @@ export function CreateNarratorModal({
 	// Query resolved ⇒ we know the default (server merges agent defaults). Until
 	// then the switch is a placeholder and submit omits the field.
 	const planModeSettingsKnown = settings != null;
+	// "" means "let the server derive it" (standalone → private, chapter-bound → project).
+	// A concrete tier is only sent when the user picks one, so the existing default is
+	// untouched for anyone who ignores this control.
+	const [visibility, setVisibility] = useState<"" | "private" | "project" | "public">("");
 	const [makeNamed, setMakeNamed] = useState(false);
 	const [knowledgeSteward, setKnowledgeSteward] = useState(false);
 	// 提交身份只对当前用户生效（服务端按 用户 × 会话 保存），默认跟随本人默认身份。
@@ -361,6 +365,8 @@ export function CreateNarratorModal({
 				...(sendPlanMode ? { startInPlanMode } : {}),
 				...(makeNamed && handle.trim() ? { makeNamed: true, handle: handle.trim() } : {}),
 				...(knowledgeSteward ? { kind: "knowledge" as const } : {}),
+				// Only sent when the user picked a tier; "" leaves the server's own default.
+				...(visibility ? { visibility } : {}),
 			},
 			{
 				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -586,6 +592,19 @@ export function CreateNarratorModal({
 					) : null}
 				</>
 			)}
+			<Select
+				label={t("visibility")}
+				description={t("visibilityHint")}
+				data={[
+					{ value: "", label: t("visibilityDefault") },
+					{ value: "private", label: t("visibilityPrivate") },
+					{ value: "project", label: t("visibilityProject") },
+					{ value: "public", label: t("visibilityPublic") },
+				]}
+				value={visibility}
+				onChange={(v) => setVisibility((v ?? "") as "" | "private" | "project" | "public")}
+				comboboxProps={{ withinPortal: true, position: "bottom-start", zIndex: 320 }}
+			/>
 
 			<Checkbox
 				label={t("startInPlanMode")}

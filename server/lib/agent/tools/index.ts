@@ -25,6 +25,8 @@ import { knowledgeReviewTool } from "./knowledge-review";
 import { learningGuideTool } from "./learning-guide";
 import { mcpAdminTool } from "./mcp-admin";
 import { narraforkAdminTool } from "./narrafork-admin";
+import { narratorListTool } from "./narrator-list";
+import { narratorSendTool } from "./narrator-send";
 import { notificationTool } from "./notification";
 import { packActivateTool, packDeactivateTool, packListTool } from "./pack";
 import { extractPipelineTool, startPipelineTool } from "./pipeline";
@@ -137,6 +139,8 @@ const coreProvider: ToolProvider = {
 			awaitTool,
 			contextAskTool,
 			sendTool,
+			narratorListTool,
+			narratorSendTool,
 			teamStatusTool,
 			askUserQuestionTool,
 			questionTool,

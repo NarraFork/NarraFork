@@ -901,6 +901,7 @@ export const PLAN_MODE_ALLOWED_TOOLS = new Set([
 	"Agent",
 	"Await",
 	"Send",
+	"NarratorList",
 	"TeamStatus",
 	"AskUserQuestion",
 	"Question",

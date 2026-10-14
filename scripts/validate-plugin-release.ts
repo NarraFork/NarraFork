@@ -42,6 +42,10 @@ export interface PluginReleaseRuntimeEvidence {
 		contributionId: string;
 		outputBytes: number;
 	};
+	hostTools?: {
+		status: "requires-host-validation";
+		contributionIds: string[];
+	};
 	provider?: {
 		providerTypeId: string;
 		modelCount: number;
@@ -193,6 +197,34 @@ function outputByteLength(value: unknown): number {
 	return Buffer.byteLength(JSON.stringify(value) ?? "");
 }
 
+// These contributions are implemented by the authenticated host, not the plugin
+// process. Reject a misdeclared server route rather than fabricating host authority.
+function validateStewardHostContract(manifest: Manifest): void {
+	if (manifest.pluginId !== "steward-narrator") return;
+	const tool = manifest.contributes.tools.find((item) => item.id === "steward.send");
+	if (!tool || tool.execution !== "host" || tool.allowBackground !== false) {
+		throw new Error("Steward host contract requires a foreground host tool: steward.send");
+	}
+	for (const id of ["steward.bind", "steward.binding", "steward.recipients", "steward.panelSend"]) {
+		if (
+			!manifest.contributes.commands.some(
+				(command) => command.id === id && command.handler === "host",
+			)
+		) {
+			throw new Error(`Steward host contract requires a host command: ${id}`);
+		}
+	}
+	for (const capability of [
+		"storage.read_self",
+		"storage.write_self",
+		"command.narrator.send_message",
+	]) {
+		if (!manifest.permissions.host.includes(capability)) {
+			throw new Error(`Steward host capability not declared: ${capability}`);
+		}
+	}
+}
+
 async function boundedCleanup(runtime: PluginRuntime): Promise<void> {
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {
@@ -297,6 +329,14 @@ async function validateRuntime(
 				};
 
 				if (mode === "ga") {
+					validateStewardHostContract(manifest);
+					const hostTools = manifest.contributes.tools.filter((item) => item.execution === "host");
+					if (hostTools.length > 0) {
+						result.hostTools = {
+							status: "requires-host-validation",
+							contributionIds: hostTools.map((item) => item.id),
+						};
+					}
 					const tool = manifest.contributes.tools.find((item) => item.execution === "server");
 					if (tool) {
 						const response = await runtime.request(

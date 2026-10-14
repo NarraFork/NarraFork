@@ -2006,7 +2006,9 @@
 		"role_system": "系统",
 		"jumpUnavailable": "在画布上展开该章节的节点后即可跳转到消息。"
 	},
+	"privateNarrator": "私人叙述者：仅所有者与被授权者可访问",
 	"access": {
+		"settingsTitle": "叙述者设置",
 		"visibilityTitle": "谁可以看到这个会话",
 		"visibilityPrivate": "仅自己",
 		"visibilityProject": "项目内",

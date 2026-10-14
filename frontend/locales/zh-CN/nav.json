@@ -44,6 +44,7 @@
 	"copyCwdFailed": "复制工作目录失败",
 	"openInWindow": "在外部窗口打开",
 	"rename": "重命名",
+	"accessSettings": "修改叙述者设置",
 	"archive": "归档",
 	"totalOutputChars": "AI 输出总字符数",
 	"feedback": "反馈问题",

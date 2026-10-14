@@ -37,6 +37,7 @@ import {
 	type PluginHostDispatcherOptions,
 	type PluginHostResolverInput,
 } from "./plugin-host-dispatcher";
+import { isHostManagedPluginStorageKey } from "./plugin-host-storage-policy";
 import {
 	type PluginPermissionStore,
 	permissionGrantPayload,
@@ -1151,6 +1152,12 @@ export class PluginHostServices {
 	): Promise<JsonValue> {
 		const scope = storageScopeFromParams(params);
 		assertStorageScopeBound(scope, context);
+		if (isHostManagedPluginStorageKey(input.pluginId, params.key)) {
+			throw new PluginHostDispatcherError(
+				"PERMISSION_DENIED",
+				"Delegation state is managed by host commands",
+			);
+		}
 		return (await this.storageFor(input).set({
 			scope,
 			key: params.key,
@@ -1166,6 +1173,12 @@ export class PluginHostServices {
 	): Promise<JsonValue> {
 		const scope = storageScopeFromParams(params);
 		assertStorageScopeBound(scope, context);
+		if (isHostManagedPluginStorageKey(input.pluginId, params.key)) {
+			throw new PluginHostDispatcherError(
+				"PERMISSION_DENIED",
+				"Delegation state is managed by host commands",
+			);
+		}
 		return (await this.storageFor(input).delete({
 			scope,
 			key: params.key,

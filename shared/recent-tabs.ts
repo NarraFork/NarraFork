@@ -29,6 +29,12 @@ export interface PersistedRecentTab {
 	title: string;
 	subtitle?: string;
 	status?: string;
+	/**
+	 * The narrator's visibility tier, attached on read so the sidebar can mark a private
+	 * session. Not persisted: it is derived per request (and per viewer, since an admin's
+	 * listing preference decides which rows exist at all).
+	 */
+	visibility?: string;
 	lastVisitedAt: number;
 	pinned?: boolean;
 	isScheduled?: boolean;

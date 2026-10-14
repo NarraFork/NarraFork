@@ -719,7 +719,11 @@ export const ExactRow = memo(
 		// always accepted onOpenSession, but nothing supplied it — the button was
 		// inert. Bind it to the same action the row menu uses.
 		if (kind === "communication-bubble") {
-			const open = injectionNavigation?.onOpenNarrator;
+			const communicationData = extra.data as { toolName?: string } | undefined;
+			const open =
+				communicationData?.toolName === "NarratorSend"
+					? injectionNavigation?.onOpenNarratorSession
+					: injectionNavigation?.onOpenNarrator;
 			// Registry-projected data follows the measured identity: recipient changes
 			// re-key extractDataRevision, and language changes re-key labelsRevision.
 			// Comparing spec.data itself would repaint every row on every rebuild.

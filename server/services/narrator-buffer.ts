@@ -48,6 +48,7 @@ import {
 	isNarratorRuntimeBusy,
 	type SavedBufferedFile,
 } from "./narrator-session-state";
+import { authorizeStewardMessage } from "./steward-message-admission";
 
 // REST text input is capped at 100k UTF-16 units; this also covers internal producers.
 const MAX_BUFFERED_PAYLOAD_BYTES = 2 * 1024 * 1024;
@@ -292,6 +293,7 @@ function ensureStagingDirectory(id: string): string {
 	return dir;
 }
 interface StagingMetadata {
+	origin?: BufferedMessage["origin"];
 	queueMode?: BufferQueueMode;
 	executionIntent?: BufferedMessage["executionIntent"];
 	stagingId?: string;
@@ -457,6 +459,7 @@ export function projectMailboxUserMessage(row: RuntimeMailboxRow): BufferedMessa
 	const payload = json<{ path: string } | null>(row.payloadRefJson, null);
 	const metadata = json<StagingMetadata>(row.metadataJson, {});
 	return {
+		origin: metadata.origin,
 		executionIntent: metadata.executionIntent,
 		queueMode: resolveBufferQueueMode(metadata.queueMode, row.priority),
 		id: row.id,
@@ -608,7 +611,23 @@ export async function enqueueBufferedMessage(
 	frontOrder: "stack" | "fifo" = "stack",
 	executionIntent?: BufferedMessage["executionIntent"],
 	queueMode?: BufferQueueMode,
-): Promise<{ ok: boolean; bufferedAt: string; id: string; full?: boolean }> {
+	origin?: BufferedMessage["origin"],
+	signal?: AbortSignal,
+): Promise<{
+	ok: boolean;
+	bufferedAt: string;
+	id: string;
+	full?: boolean;
+	state?: RuntimeMailboxRow["state"];
+	receiptDisposition?: RuntimeMailboxRow["receiptDisposition"];
+	recipientMessageId?: string | null;
+	deliveryId?: string | null;
+	duplicate?: boolean;
+	/** Exact committed row; consumers must not reconstruct receipts from legacy SQLite reads. */
+	receipt?: RuntimeMailboxRow;
+}> {
+	signal?.throwIfAborted();
+	origin = origin ? JSON.parse(JSON.stringify(origin)) : undefined;
 	const stagingId = generateShortId();
 	const refs = freezeFileReferenceSnapshots(fileReferences);
 	images = images?.map((image) => ({ ...image }));
@@ -631,7 +650,7 @@ export async function enqueueBufferedMessage(
 			payloadRef = { storage: "buffered_file", path, byteSize: bytes, ownership: "mailbox" };
 		}
 		let fileReferencesJson = refs.length ? JSON.stringify(refs) : null;
-		const metadata: StagingMetadata = { stagingId, executionIntent, queueMode };
+		const metadata: StagingMetadata = { stagingId, executionIntent, queueMode, origin };
 		if (queueMode) frontOrder = queueMode === "interrupt" ? "stack" : "fifo";
 		if (commandText && Buffer.byteLength(commandText) > MAILBOX_LIMITS.metadataBytes / 8) {
 			metadata.commandTextPath = await writeStagingText(stagingId, "command", commandText);
@@ -670,6 +689,8 @@ export async function enqueueBufferedMessage(
 		};
 		// PostgreSQL: ONE named admission (seq computation + optional FIFO reorder + insert)
 		// commits atomically in the adapter. SQLite: the original synchronous segment below.
+		await authorizeStewardMessage(narratorId, createdBy, origin, signal);
+		signal?.throwIfAborted();
 		admissionStarted = true;
 		const result = port
 			? await port.mailbox.admitUserBuffered(input, { position, frontOrder })
@@ -743,7 +764,17 @@ export async function enqueueBufferedMessage(
 			discardUnownedStaging(stagingId);
 			return { ok: false, bufferedAt: "", id: "", full: true };
 		}
-		return { ok: true, bufferedAt: result.delivery.bufferedAt, id: result.delivery.id };
+		return {
+			ok: true,
+			bufferedAt: result.delivery.bufferedAt,
+			id: result.delivery.id,
+			state: result.delivery.state,
+			receiptDisposition: result.delivery.receiptDisposition,
+			recipientMessageId: result.delivery.recipientMessageId,
+			deliveryId: result.delivery.deliveryId,
+			duplicate: result.status === "duplicate",
+			receipt: result.delivery,
+		};
 	} catch (error) {
 		if (!admissionStarted) {
 			discardUnownedStaging(stagingId);
@@ -979,6 +1010,19 @@ export async function readBufferedMessageDeliveryReceipt(
 		)
 		.limit(1)
 		.get();
+}
+
+export async function readBufferedMessageAdmissionReceipt(
+	narratorId: string,
+	messageId: string,
+): Promise<RuntimeMailboxRow | undefined> {
+	const port = pgQueue();
+	if (port) {
+		const row = await port.mailbox.getById(messageId);
+		return row?.narratorId === narratorId && row.kind === "user_input" ? row : undefined;
+	}
+	const row = await rowByIdRuntime(messageId);
+	return row?.narratorId === narratorId && row.kind === "user_input" ? row : undefined;
 }
 
 /** Wait OUTSIDE mutation admission. A busy wake is not a delivery acknowledgement. */

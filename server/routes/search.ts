@@ -1,4 +1,5 @@
 import { Hono } from "hono";
+import { narratorListPrincipalOf } from "../lib/narrator-access";
 import { searchService, sortSearchResults } from "../services/search-service";
 
 export const searchRoutes = new Hono();
@@ -25,8 +26,9 @@ searchRoutes.get("/", async (c) => {
 	const limit = Math.max(1, Math.min(Number.isNaN(rawLimit) ? 50 : rawLimit, 100));
 	const sort = c.req.query("sort") === "time" ? "time" : "relevance";
 
-	const user = c.get("user");
-	const principal = { userId: user.sub, isAdmin: user.role === "admin" };
+	// The list principal, so an admin who hid other people's private narrators does not get
+	// them back through search. Chapter hits are unaffected (no per-user chapter ACL).
+	const principal = await narratorListPrincipalOf(c);
 	const query = q.trim();
 
 	const results = await searchService.search({

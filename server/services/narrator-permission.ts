@@ -797,6 +797,16 @@ export function resolvePermissionDecision(
 	const compiledPolicy = compiledPolicyForDecision(opts);
 	const context = executionContext ?? compiledPolicy.targetContext;
 	const effectiveMode = planMode ? (relaxedPlan ? (permMode ?? "default") : "readOnly") : permMode;
+	// A peer message can wake another autonomous runtime. It is not a read or a
+	// same-scope subagent Send, and plan/read-only ceilings cannot be approved away.
+	if (toolName === "NarratorSend") {
+		if (planMode || permMode === "readOnly" || reviewReadOnlyBash) {
+			if (meta) meta.blacklistReason = "NarratorSend is unavailable in plan or read-only mode.";
+			return "deny";
+		}
+		if (effectiveMode === "bypassPermissions") return "allow";
+		return effectiveMode === "dontAsk" ? "deny" : "ask";
+	}
 	if (isBashToolName(toolName) && bashAnalysis?.isCatastrophic) return "fatal";
 
 	const protectedPathReason = resolveProtectedPathDeny(
@@ -1256,6 +1266,7 @@ const READ_ONLY_TOOLS = [
 	"StructView",
 	"ShareFile",
 	"ContextAsk",
+	"NarratorList",
 	"Await",
 	"KnowledgeSearch",
 	"KnowledgeRead",

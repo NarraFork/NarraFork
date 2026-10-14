@@ -822,6 +822,8 @@ export function useCreateNarrator() {
 			makeNamed?: boolean;
 			handle?: string;
 			kind?: "knowledge";
+			visibility?: "private" | "project" | "public";
+			writeAudience?: "owner" | "project" | "public";
 		}) =>
 			// No fast-mode default is injected here: new narrators keep the "inherit"
 			// override and the server resolves it against the user's fastModeDefault

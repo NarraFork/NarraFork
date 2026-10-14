@@ -9,6 +9,7 @@ import {
 	narratorMessages,
 	narrators,
 	narratorToolCalls,
+	users,
 } from "../../db/schema";
 import { projectMessageSenderText } from "../../lib/agent/sender-projection";
 
@@ -1040,6 +1041,61 @@ test("Await-revoked terminal claim is a benign empty projection and does not blo
 	});
 });
 
+test("peer mailbox batches actors at the frozen pass boundary", async () => {
+	const owner = required(tryClaimExecution("parent", "primary"));
+	try {
+		const active = {
+			narratorId: "parent",
+			locale: "en",
+			_currentUserId: "actor-a",
+			_todoReminderCompletedToolCount: 0,
+			_tasksReminderInterval: -1,
+			_fenceInterval: -1,
+		} as Parameters<typeof drainInjectionsIntoHistory>[0];
+		for (const [text, userId] of [
+			["A first", "actor-a"],
+			["A second", "actor-a"],
+			["B first", "actor-b"],
+		] as const) {
+			const message = delivery("parent", text);
+			await inbox.enqueueInboxAgent(message, message.text, { channel: "parent", userId });
+		}
+		const first = await drainInjectionsIntoHistory(active, "en");
+		expect(first.text).toContain("A first");
+		expect(first.text).toContain("A second");
+		expect(first.text).not.toContain("B first");
+		expect(
+			(await inbox.listInboxRows("parent")).filter((row) => row.state === "queued"),
+		).toHaveLength(1);
+
+		const session = await import("../narrator-session");
+		const second = await session.drainAndPersistPendingInjections(active);
+		expect(second).toContain("B first");
+		expect(active._currentUserId).toBe("actor-b");
+		expect((await inbox.listInboxRows("parent")).some((row) => row.state === "queued")).toBe(false);
+
+		for (const [text, userId] of [
+			["A idle", "actor-a"],
+			["B idle", "actor-b"],
+		] as const) {
+			const message = delivery("parent", text);
+			await inbox.enqueueInboxAgent(message, message.text, { channel: "parent", userId });
+		}
+		const idleA = await session.drainAndPersistPendingInjections(active);
+		expect(idleA).toContain("A idle");
+		expect(idleA).not.toContain("B idle");
+		expect(active._currentUserId).toBe("actor-a");
+		expect(
+			(await inbox.listInboxRows("parent")).filter((row) => row.state === "queued"),
+		).toHaveLength(1);
+		const idleB = await session.drainAndPersistPendingInjections(active);
+		expect(idleB).toContain("B idle");
+		expect(active._currentUserId).toBe("actor-b");
+	} finally {
+		owner.release();
+	}
+});
+
 test("late claim callback cannot materialize after shared owner replacement", async () => {
 	const d = delivery("parent");
 	await inbox.enqueueInboxAgent(d, d.text, { channel: "parent" });
@@ -1077,4 +1133,149 @@ test("pre-prompt command stays queued at after-tools until a new pass can execut
 		expect(result).toBeNull();
 		expect(state(accepted.id)?.state).toBe("queued");
 	});
+});
+
+test("busy anonymous actor cannot adopt an attributed peer message", async () => {
+	const owner = required(tryClaimExecution("parent", "primary"));
+	try {
+		const active = {
+			narratorId: "parent",
+			locale: "en",
+			_currentUserId: null,
+			_todoReminderCompletedToolCount: 0,
+			_tasksReminderInterval: -1,
+			_fenceInterval: -1,
+		} as Parameters<typeof drainInjectionsIntoHistory>[0];
+		const message = delivery("parent", "B must wait");
+		await inbox.enqueueInboxAgent(message, message.text, { channel: "parent", userId: "actor-b" });
+		const drained = await drainInjectionsIntoHistory(active, "en");
+		expect(drained.text ?? "").not.toContain("B must wait");
+		expect(active._currentUserId).toBeNull();
+		expect(
+			(await inbox.listInboxRows("parent")).filter((row) => row.state === "queued"),
+		).toHaveLength(1);
+	} finally {
+		owner.release();
+	}
+});
+
+test("idle anonymous peer clears the previous actor and keeps the next actor queued", async () => {
+	const owner = required(tryClaimExecution("parent", "primary"));
+	try {
+		const active = {
+			narratorId: "parent",
+			locale: "en",
+			_currentUserId: "old-actor",
+		} as Parameters<typeof drainInjectionsIntoHistory>[0];
+		for (const [text, userId] of [
+			["anonymous first", null],
+			["B later", "actor-b"],
+		] as const) {
+			const message = delivery("parent", text);
+			await inbox.enqueueInboxAgent(message, message.text, { channel: "parent", userId });
+		}
+		const session = await import("../narrator-session");
+		const text = await session.drainAndPersistPendingInjections(active);
+		expect(text).toContain("anonymous first");
+		expect(text).not.toContain("B later");
+		expect(active._currentUserId).toBeNull();
+		expect(
+			(await inbox.listInboxRows("parent")).filter((row) => row.state === "queued"),
+		).toHaveLength(1);
+	} finally {
+		owner.release();
+	}
+});
+
+for (const executionUserId of ["actor-a", null]) {
+	test(`question receipt uses execution actor rather than answer author and freezes idle batch (${executionUserId ?? "anonymous"})`, async () => {
+		const owner = required(tryClaimExecution("parent", "primary"));
+		try {
+			const session = await import("../narrator-session");
+			const active = {
+				narratorId: "parent",
+				locale: "en",
+				_currentUserId: executionUserId,
+				_todoReminderCompletedToolCount: 0,
+				_tasksReminderInterval: -1,
+				_fenceInterval: -1,
+			} as Parameters<typeof drainInjectionsIntoHistory>[0];
+			db.insert(users)
+				.values({
+					id: "answer-author",
+					username: "answer-author",
+					passwordHash: "test",
+					createdAt: time,
+				})
+				.run();
+			const enqueueAnswer = async (id: string, text: string) => {
+				db.insert(narratorMessages)
+					.values({
+						id,
+						narratorId: "parent",
+						role: "user",
+						contentJson: [],
+						createdBy: "answer-author",
+						createdAt: time,
+					})
+					.run();
+				db.insert(narratorMessageRefs)
+					.values({ id: `ref-${id}`, narratorId: "parent", messageId: id, seq: ++serial })
+					.run();
+				await session.scheduleQuestionAnswerDelivery(
+					"parent",
+					id,
+					text,
+					{ version: 1, userId: executionUserId },
+					"en",
+				);
+			};
+			await enqueueAnswer("answer-busy", "busy native answer");
+			const following = delivery("parent", "same actor following");
+			await inbox.enqueueInboxAgent(following, following.text, {
+				channel: "parent",
+				userId: executionUserId,
+			});
+			const busy = await drainInjectionsIntoHistory(active, "en");
+			expect(busy.text).toContain("busy native answer");
+			expect(busy.text).toContain("same actor following");
+			expect<string | null>(active._currentUserId).toBe(executionUserId);
+			await enqueueAnswer("answer-idle", "idle native answer");
+			const next = delivery("parent", "different actor later");
+			await inbox.enqueueInboxAgent(next, next.text, { channel: "parent", userId: "actor-b" });
+			active._currentUserId = "old-actor";
+			const idle = await session.drainAndPersistPendingInjections(active);
+			expect(idle).toContain("idle native answer");
+			expect(idle).not.toContain("different actor later");
+			expect<string | null>(active._currentUserId).toBe(executionUserId);
+			expect(
+				(await inbox.listInboxRows("parent")).filter((row) => row.state === "queued"),
+			).toHaveLength(1);
+		} finally {
+			owner.release();
+		}
+	});
+}
+
+test("explicit anonymous task attribution does not inherit a cached task actor", async () => {
+	const { pendingInjectionMailboxUserId, pendingInjectionUserId, recordTaskNoticeUser } =
+		await import("../parent-injection-queue");
+	const taskId = `anonymous-task-${++serial}`;
+	recordTaskNoticeUser(taskId, "old-actor");
+	expect(
+		pendingInjectionMailboxUserId({
+			kind: "task_notice",
+			metadataJson: JSON.stringify({ taskId, userId: null }),
+		}),
+	).toBeNull();
+	expect(
+		pendingInjectionMailboxUserId({
+			kind: "task_notice",
+			metadataJson: JSON.stringify({ taskId }),
+		}),
+	).toBe("old-actor");
+	const entry = { kind: "bg_bash", task: { id: taskId, userId: null } } as Parameters<
+		typeof pendingInjectionUserId
+	>[0];
+	expect(pendingInjectionUserId(entry)).toBeNull();
 });

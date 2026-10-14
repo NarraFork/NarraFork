@@ -24,6 +24,7 @@ import {
 	type PluginPrincipal as PluginEventPrincipal,
 	pluginEventGateway,
 } from "./plugin-event-gateway";
+import { isHostManagedPluginStorageKey } from "./plugin-host-storage-policy";
 import {
 	createCommandRequest,
 	createQueryRequest,
@@ -138,6 +139,7 @@ export interface PluginCommandDispatcher {
 			idempotencyKey?: string;
 			signal?: AbortSignal;
 			timeoutMs?: number;
+			hostContext?: HostCallContext;
 		},
 	): Promise<{
 		output: JsonValue | undefined;
@@ -544,6 +546,7 @@ export class PluginUiHost {
 				userId: input.principalId,
 				userRole: input.userRole,
 				source: "ui",
+				...(input.session.scope?.narratorId ? { narratorId: input.session.scope.narratorId } : {}),
 			},
 			scope: { userId: input.principalId, ...(input.session.scope ?? {}) },
 		};
@@ -616,7 +619,12 @@ export class PluginUiHost {
 			this.pluginCommands?.has(parsed.data.commandId, session.pluginId)
 		) {
 			this.beginUncancellableCommit(fence);
-			return this.invokePluginCommand(parsed.data, session, signal ?? fence.controller.signal);
+			return this.invokePluginCommand(
+				parsed.data,
+				session,
+				signal ?? fence.controller.signal,
+				context,
+			);
 		}
 
 		if (!this.publicApi)
@@ -658,6 +666,7 @@ export class PluginUiHost {
 		request: { commandId: string; input?: JsonValue; idempotencyKey?: string },
 		session: PluginUiHostRequest["session"],
 		signal: AbortSignal,
+		hostContext: HostCallContext,
 	): Promise<JsonValue> {
 		if (!this.pluginCommands)
 			throw new PluginUiHostError("HOST_UNAVAILABLE", "Plugin command dispatch is unavailable");
@@ -667,7 +676,9 @@ export class PluginUiHost {
 				session.pluginId,
 				request.input,
 				{
-					requestId: session.sessionId,
+					requestId: hostContext.requestId,
+					correlationId: hostContext.correlationId,
+					hostContext,
 					...(request.idempotencyKey ? { idempotencyKey: request.idempotencyKey } : {}),
 					signal,
 				},
@@ -837,6 +848,15 @@ export class PluginUiHost {
 			throw new PluginUiHostError(
 				"PERMISSION_DENIED",
 				"Storage scope is outside the bound UI session",
+			);
+		}
+		if (
+			(method === "set" || method === "delete") &&
+			isHostManagedPluginStorageKey(context.plugin.pluginId, raw.key)
+		) {
+			throw new PluginUiHostError(
+				"PERMISSION_DENIED",
+				"Delegation state is managed by host commands",
 			);
 		}
 		const capability =

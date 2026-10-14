@@ -23,6 +23,7 @@ import {
 	PluginLifecycleRevokeCoordinator,
 } from "./plugin-lifecycle-revoke-coordinator";
 import { PluginMcpAdapter } from "./plugin-mcp-adapter";
+import { PluginPackageStore } from "./plugin-package-store";
 import { PluginPermissionStore } from "./plugin-permission-store";
 import {
 	createPluginProviderAdapterFactory,
@@ -71,6 +72,10 @@ import {
 	pluginUiSessionService as defaultPluginUiSessionService,
 	type PluginUiSessionService,
 } from "./plugin-ui-session";
+import {
+	registerStewardHostContributions,
+	type StewardHostDependencies,
+} from "./steward-narrator-host";
 
 export interface PluginPlatformServices {
 	runtimeSupervisor: RuntimeSupervisor;
@@ -110,6 +115,7 @@ export interface PluginPlatformServicesOptions {
 	capabilityBroker?: CapabilityBroker;
 	permissionStore?: PluginPermissionStore;
 	stateStore?: PluginStateStore;
+	packageStore?: PluginPackageStore;
 	queryRegistry?: QueryRegistry;
 	commandRegistry?: CommandRegistry;
 	publicApi?: PluginPublicApi;
@@ -134,6 +140,8 @@ export interface PluginPlatformServicesOptions {
 	toolBridge?: PluginAgentToolBridge;
 	contributionCoordinator?: PluginContributionCoordinator;
 	lifecycleRevokeCoordinator?: PluginLifecycleRevokeCoordinator;
+	/** Narrow resource/audit seams for isolated steward host integration tests. */
+	stewardDependencies?: StewardHostDependencies;
 }
 
 const PLUGIN_UI_PLATFORM_REMOVAL_LISTENER = Symbol.for(
@@ -537,6 +545,7 @@ export function createPluginPlatformServices(
 	const pluginCommandRegistry =
 		options.pluginCommandRegistry ??
 		new PluginCommandRegistry({
+			capabilityBroker,
 			resolveRuntime: (pluginId) => {
 				const runtime = runtimeSupervisor.get(pluginId);
 				return runtime && ["active", "degraded"].includes(runtime.state) ? runtime : undefined;
@@ -929,6 +938,17 @@ export function createPluginPlatformServices(
 		contributionCoordinator,
 		lifecycleRevokeCoordinator,
 	};
+	registerStewardHostContributions({
+		stateStore,
+		packageStore: options.packageStore ?? new PluginPackageStore({ root: stateStore.root }),
+		permissionStore,
+		capabilityBroker,
+		publicApi,
+		storageFactory,
+		toolRegistry,
+		pluginCommandRegistry,
+		dependencies: options.stewardDependencies,
+	});
 	return {
 		...services,
 		restorePlugin: (pluginId) => restorePluginAccess(services, pluginId),

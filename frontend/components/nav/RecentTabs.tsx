@@ -38,6 +38,7 @@ import {
 	IconFolder,
 	IconFolderPlus,
 	IconGitBranch,
+	IconLock,
 	IconPencil,
 	IconPin,
 	IconPinnedOff,
@@ -94,6 +95,7 @@ import {
 } from "../../lib/notification";
 import { LeftTruncatedPathText } from "../common/TruncatedPath";
 import type { CreateNarratorResult } from "../narrator/CreateNarratorModal";
+import { NarratorAccessSettingsModal } from "../narrator/NarratorAccessSettingsModal";
 import { UserAvatar } from "../UserAvatar";
 import { PANEL_WINDOW_FEATURES, recentTabWindowHref } from "../window/panel-window";
 import { NarratorStatusIcon } from "./NarratorStatusIcon";
@@ -557,6 +559,9 @@ export function RecentTabList({
 	const [renameValue, setRenameValue] = useState("");
 	const [renaming, setRenaming] = useState(false);
 	const [archiveConfirmTab, setArchiveConfirmTab] = useState<{ id: string } | null>(null);
+	const [accessSettingsTab, setAccessSettingsTab] = useState<{ id: string; title: string } | null>(
+		null,
+	);
 	const archiveNarrator = useArchiveNarrator();
 
 	// Workspace "add narrator" modal state
@@ -809,6 +814,15 @@ export function RecentTabList({
 	}, [ctxMenu]);
 
 	/** 打开重命名对话框 */
+	const handleAccessSettings = useCallback(() => {
+		if (!ctxMenu) return;
+		const { tab } = ctxMenu;
+		setCtxMenu(null);
+		if (tab.type === "narrator" || tab.type === "subagent") {
+			setAccessSettingsTab({ id: tab.id, title: tab.title });
+		}
+	}, [ctxMenu]);
+
 	const handleRename = useCallback(() => {
 		if (!ctxMenu) return;
 		const { tab } = ctxMenu;
@@ -1243,6 +1257,8 @@ export function RecentTabList({
 							canRename={ctxMenu.tab.type === "narrator"}
 							onArchive={handleArchive}
 							canArchive={ctxMenu.tab.type === "narrator"}
+							onAccessSettings={handleAccessSettings}
+							canAccessSettings={ctxMenu.tab.type === "narrator" || ctxMenu.tab.type === "subagent"}
 							isFirst={
 								topLevel.findIndex(
 									(t) => t.type === ctxMenu.tab.type && t.id === ctxMenu.tab.id,
@@ -1253,6 +1269,12 @@ export function RecentTabList({
 							t={t}
 						/>
 					)}
+					<NarratorAccessSettingsModal
+						narratorId={accessSettingsTab?.id ?? null}
+						narratorTitle={accessSettingsTab?.title}
+						opened={!!accessSettingsTab}
+						onClose={() => setAccessSettingsTab(null)}
+					/>
 					<Modal
 						opened={!!renameTab}
 						onClose={() => setRenameTab(null)}
@@ -2050,12 +2072,25 @@ function TabIndicators({ tab, t }: TabIndicatorsProps) {
 	const workCount = tab.activeBackgroundWorkCount ?? tab.activeBackgroundTaskCount ?? 0;
 	const serviceCount = tab.activeBackgroundServiceCount ?? 0;
 	const hasBackgroundTasks = workCount > 0;
+	const isPrivate = tab.visibility === "private";
 
-	if (!hasViewers && !hasContainer && !hasTerminals && !hasBackgroundTasks && !serviceCount)
+	if (
+		!hasViewers &&
+		!hasContainer &&
+		!hasTerminals &&
+		!hasBackgroundTasks &&
+		!serviceCount &&
+		!isPrivate
+	)
 		return null;
 
 	return (
 		<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
+			{isPrivate && (
+				<Tooltip label={t("privateNarrator")} withArrow position="right">
+					<IconLock size={11} style={{ opacity: 0.7 }} />
+				</Tooltip>
+			)}
 			{hasViewers && (
 				<ViewerAvatars
 					viewers={(tab.viewers ?? []) as RecentTabViewer[]}
@@ -2199,6 +2234,8 @@ interface TabContextMenuProps {
 	canRename: boolean;
 	onArchive: () => void;
 	canArchive: boolean;
+	onAccessSettings: () => void;
+	canAccessSettings: boolean;
 	isFirst: boolean;
 	isWorkspace: boolean;
 	/** The narrator this tab stands for, when the per-narrator git identity pick applies. */
@@ -2226,6 +2263,8 @@ function TabContextMenu({
 	canRename,
 	onArchive,
 	canArchive,
+	onAccessSettings,
+	canAccessSettings,
 	isFirst,
 	isWorkspace,
 	gitIdentityNarratorId,
@@ -2299,6 +2338,14 @@ function TabContextMenu({
 							<Group gap={8} wrap="nowrap">
 								<IconPencil size={14} />
 								<Text size="sm">{t("rename")}</Text>
+							</Group>
+						</UnstyledButton>
+					)}
+					{canAccessSettings && (
+						<UnstyledButton px="xs" py={4} onClick={onAccessSettings} style={{ borderRadius: 4 }}>
+							<Group gap={8} wrap="nowrap">
+								<IconLock size={14} />
+								<Text size="sm">{t("accessSettings")}</Text>
 							</Group>
 						</UnstyledButton>
 					)}

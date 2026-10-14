@@ -1,4 +1,5 @@
 import { afterAll, beforeEach, expect, mock, spyOn, test } from "bun:test";
+import { formatStewardOriginLabel, parseStewardOriginLabel } from "@shared/message-origin";
 import { asc, eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import { narratorBufferedMessages, narratorMessages, narrators, users } from "../../db/schema";
@@ -78,6 +79,10 @@ const { enqueueBufferedMessage, removeBufferedMessage, updateBufferedMessageMode
 	"../narrator-buffer"
 );
 const { narratorService } = await import("../narrator-service");
+const { authorizeStewardMessage, setStewardMessageAuthorizer } = await import(
+	"../steward-message-admission"
+);
+const { retryBufferedMessage, projectMailboxUserMessage } = await import("../narrator-buffer");
 const { getExecutionOwner, tryClaimExecution } = await import("../agent-runtime/ownership");
 
 const now = new Date().toISOString();
@@ -100,6 +105,46 @@ function seedNarrator(narratorId: string) {
 		.run();
 }
 
+function stewardOrigin(narratorId: string) {
+	const provenance = {
+		userId: "steward-user",
+		pluginId: "steward-narrator",
+		contributionId: "send",
+		requestId: "send-request",
+		correlationId: "send-correlation",
+		stewardNarratorId: "steward-source",
+		targetNarratorId: narratorId,
+		bindingRevision: 2,
+	};
+	const deadlineAt = new Date(Date.now() + 60_000).toISOString();
+	return {
+		origin: "assistant" as const,
+		originLabel: formatStewardOriginLabel(provenance),
+		delegationDeadlineAt: deadlineAt,
+		delegationHostContext: {
+			requestId: provenance.requestId,
+			correlationId: provenance.correlationId,
+			deadlineAt,
+			plugin: {
+				pluginId: provenance.pluginId,
+				contributionId: provenance.contributionId,
+				packageVersion: "1.0.0",
+				installationId: "install-1",
+				runtimeId: "runtime-1",
+				runtimeGeneration: 1,
+			},
+			invocation: {
+				kind: "user",
+				userId: provenance.userId,
+				userRole: "user",
+				source: "internal",
+				narratorId: provenance.stewardNarratorId,
+			},
+			scope: { narratorId: provenance.stewardNarratorId },
+		},
+	};
+}
+
 function enqueueCancelledNotice(narratorId: string, index: number) {
 	const store = createMailboxStore(db);
 	const result = store.enqueue({
@@ -120,7 +165,7 @@ function enqueueCancelledNotice(narratorId: string, index: number) {
 }
 
 async function waitForIdle(narratorId: string, expectedCalls = 1): Promise<void> {
-	const deadline = Date.now() + 3_000;
+	const deadline = Date.now() + 20_000;
 	while (Date.now() < deadline) {
 		const row = db
 			.select({ status: narrators.status })
@@ -143,6 +188,280 @@ beforeEach(() => {
 	cleanDb(sqlite);
 	providerCalls.length = 0;
 	beforeResponse = undefined;
+	setStewardMessageAuthorizer(async () => {});
+});
+
+test("steward authorizer disposal cannot remove a replacement host verifier", async () => {
+	const narratorId = "steward-dispose-identity";
+	const origin = stewardOrigin(narratorId);
+	const obsolete = setStewardMessageAuthorizer(async () => {
+		throw new Error("Disposed verifier used");
+	});
+	const replacement = mock(async () => {});
+	const dispose = setStewardMessageAuthorizer(replacement);
+	obsolete();
+	await authorizeStewardMessage(narratorId, "steward-user", origin);
+	expect(replacement).toHaveBeenCalledTimes(1);
+	dispose();
+	dispose();
+	await expect(authorizeStewardMessage(narratorId, "steward-user", origin)).rejects.toThrow(
+		"authorizer is unavailable",
+	);
+});
+
+test("steward send persists and broadcasts provenance while the provider sees delegated agent attribution", async () => {
+	const narratorId = "steward-send-recipient";
+	seedNarrator(narratorId);
+	db.insert(users)
+		.values({
+			id: "steward-user",
+			username: "Delegating user",
+			passwordHash: "unused",
+			createdAt: now,
+		})
+		.run();
+	const provenance = {
+		userId: "steward-user",
+		pluginId: "steward-narrator",
+		contributionId: "send",
+		requestId: "send-request",
+		correlationId: "send-correlation",
+		stewardNarratorId: "steward-source",
+		targetNarratorId: narratorId,
+		bindingRevision: 2,
+	};
+	const websocket = await import("../../websocket/narrator-ws");
+	const broadcast = spyOn(websocket, "broadcastToNarrator").mockImplementation(() => {});
+	try {
+		const row = await sendMessage(
+			narratorId,
+			"unchanged steward message",
+			undefined,
+			"en",
+			false,
+			null,
+			"steward-user",
+			undefined,
+			null,
+			stewardOrigin(narratorId),
+			undefined,
+			new AbortController().signal,
+		);
+		await waitForIdle(narratorId);
+		expect(row.createdBy).toBe("steward-user");
+		expect(row.origin).toBe("assistant");
+		expect(parseStewardOriginLabel(row.originLabel)).toEqual(provenance);
+		const event = broadcast.mock.calls
+			.map((call) => call[1])
+			.find((value) => value.type === "user_message");
+		expect(event).toMatchObject({
+			message: { createdBy: "steward-user", origin: "assistant", originLabel: row.originLabel },
+		});
+		expect(providerCalls[0]).toContain('<sender kind="agent" id="steward-source"');
+		expect(providerCalls[0]).toContain('delegated_user_id="steward-user"');
+		expect(providerCalls[0]).toContain('plugin_id="steward-narrator"');
+		expect(providerCalls[0]).toEndWith("\nunchanged steward message");
+	} finally {
+		broadcast.mockRestore();
+		closeNarrator(narratorId);
+	}
+});
+
+test("cancellation after mailbox admission prevents message commit and provider dispatch", async () => {
+	const narratorId = "steward-cancel-before-commit";
+	seedNarrator(narratorId);
+	const inbox = await import("../agent-runtime/inbox");
+	const originalClaim = inbox.claimInboxHead;
+	const controller = new AbortController();
+	const claim = spyOn(inbox, "claimInboxHead").mockImplementation(async (...args) => {
+		const row = await originalClaim(...args);
+		if (row?.kind === "user_input") controller.abort();
+		return row;
+	});
+	try {
+		db.insert(users)
+			.values({
+				id: "steward-user",
+				username: "Delegating user",
+				passwordHash: "unused",
+				createdAt: now,
+			})
+			.run();
+		await expect(
+			sendMessage(
+				narratorId,
+				"must not commit",
+				undefined,
+				"en",
+				false,
+				null,
+				"steward-user",
+				undefined,
+				null,
+				stewardOrigin(narratorId),
+				undefined,
+				controller.signal,
+			),
+		).rejects.toMatchObject({ name: "AbortError" });
+		const queued = db
+			.select()
+			.from(narratorBufferedMessages)
+			.where(eq(narratorBufferedMessages.narratorId, narratorId))
+			.all();
+		expect(queued).toHaveLength(1);
+		expect(queued[0].state).toBe("cancelled");
+		expect(await retryBufferedMessage(narratorId, queued[0].id)).toBe(false);
+		claim.mockRestore();
+		await resumeNextBufferedMessage(await ensureNarrator(narratorId, "en", false), "en");
+		expect(hasPendingBufferedWork(narratorId)).toBe(false);
+		expect(
+			db.select().from(narratorMessages).where(eq(narratorMessages.narratorId, narratorId)).all(),
+		).toHaveLength(0);
+		expect(providerCalls).toHaveLength(0);
+	} finally {
+		claim.mockRestore();
+		closeNarrator(narratorId);
+	}
+});
+
+test("steward cancellation inside admission authorization leaves no durable input", async () => {
+	const narratorId = "steward-cancel-admission";
+	seedNarrator(narratorId);
+	db.insert(users)
+		.values({
+			id: "steward-user",
+			username: "Delegating user",
+			passwordHash: "unused",
+			createdAt: now,
+		})
+		.run();
+	const controller = new AbortController();
+	setStewardMessageAuthorizer(async () => {
+		controller.abort();
+	});
+	try {
+		await expect(
+			sendMessage(
+				narratorId,
+				"never admitted",
+				undefined,
+				"en",
+				false,
+				null,
+				"steward-user",
+				undefined,
+				null,
+				stewardOrigin(narratorId),
+				undefined,
+				controller.signal,
+			),
+		).rejects.toMatchObject({ name: "AbortError" });
+		expect(
+			db
+				.select()
+				.from(narratorBufferedMessages)
+				.where(eq(narratorBufferedMessages.narratorId, narratorId))
+				.all(),
+		).toHaveLength(0);
+		expect(providerCalls).toHaveLength(0);
+	} finally {
+		closeNarrator(narratorId);
+	}
+});
+
+test.each([
+	"allowed",
+	"revoked",
+	"missing-verifier",
+	"expired",
+])("steward durable recovery keeps attribution and revalidates authorization (%s)", async (disposition) => {
+	const narratorId = `steward-recovery-${disposition}`;
+	seedNarrator(narratorId);
+	db.insert(users)
+		.values({
+			id: "steward-user",
+			username: "Delegating user",
+			passwordHash: "unused",
+			createdAt: now,
+		})
+		.run();
+	const origin = stewardOrigin(narratorId);
+	const admitted = await enqueueBufferedMessage(
+		narratorId,
+		"/goal delegated text stays text",
+		undefined,
+		null,
+		"steward-user",
+		undefined,
+		undefined,
+		"back",
+		null,
+		undefined,
+		"stack",
+		undefined,
+		undefined,
+		origin,
+	);
+	const accepted = db
+		.select()
+		.from(narratorBufferedMessages)
+		.where(eq(narratorBufferedMessages.id, admitted.id))
+		.get()!;
+	expect(projectMailboxUserMessage(accepted).origin).toEqual(origin);
+	const checks: unknown[] = [];
+	if (disposition === "missing-verifier") setStewardMessageAuthorizer(undefined);
+	else
+		setStewardMessageAuthorizer(async (provenance, context) => {
+			checks.push({ provenance, context });
+			if (disposition === "revoked")
+				throw new Error("Binding revision or runtime authorization revoked");
+		});
+	if (disposition === "expired") {
+		const metadata = JSON.parse(accepted.metadataJson!);
+		metadata.origin.delegationDeadlineAt = new Date(Date.now() - 1_000).toISOString();
+		metadata.origin.delegationHostContext.deadlineAt = metadata.origin.delegationDeadlineAt;
+		db.update(narratorBufferedMessages)
+			.set({ metadataJson: JSON.stringify(metadata) })
+			.where(eq(narratorBufferedMessages.id, admitted.id))
+			.run();
+	}
+	try {
+		const recovery = resumeNextBufferedMessage(await ensureNarrator(narratorId, "en", false), "en");
+		if (disposition === "allowed") {
+			await recovery;
+			await waitForIdle(narratorId);
+			const receipt = db
+				.select()
+				.from(narratorMessages)
+				.where(eq(narratorMessages.narratorId, narratorId))
+				.all()
+				.find((row) => row.role === "user")!;
+			expect(receipt.origin).toBe("assistant");
+			expect(parseStewardOriginLabel(receipt.originLabel)).toEqual(
+				parseStewardOriginLabel(origin.originLabel),
+			);
+			expect(receipt.createdBy).toBe("steward-user");
+			expect(providerCalls[0]).toContain('delegated_user_id="steward-user"');
+			expect(providerCalls[0]).toEndWith("\n/goal delegated text stays text");
+			expect(checks.length).toBeGreaterThan(0);
+		} else {
+			await expect(recovery).rejects.toThrow();
+			expect(
+				db
+					.select()
+					.from(narratorBufferedMessages)
+					.where(eq(narratorBufferedMessages.id, admitted.id))
+					.get()?.state,
+			).toBe("cancelled");
+			expect(await retryBufferedMessage(narratorId, admitted.id)).toBe(false);
+			expect(
+				db.select().from(narratorMessages).where(eq(narratorMessages.narratorId, narratorId)).all(),
+			).toHaveLength(0);
+			expect(providerCalls).toHaveLength(0);
+		}
+	} finally {
+		closeNarrator(narratorId);
+	}
 });
 
 test("consumes earlier cancelled task notices before sending a new idle user input", async () => {
@@ -752,6 +1071,165 @@ test.each([
 	} finally {
 		releasePreflight.resolve();
 		historyRead.mockRestore();
+		closeNarrator(narratorId);
+	}
+});
+test("named send shares durable user admission and reserves a distinct history id", async () => {
+	const narratorId = "unified-send-user-receipt";
+	seedNarrator(narratorId);
+	try {
+		const result = await sendMessage({ kind: "user", narratorId, message: "shared admission" });
+		expect(result.accepted).toBe(true);
+		expect(result.duplicate).toBe(false);
+		expect(result.messageId).not.toBe(result.mailboxId);
+		await waitForIdle(narratorId);
+		const mailbox = db
+			.select()
+			.from(narratorBufferedMessages)
+			.where(eq(narratorBufferedMessages.narratorId, narratorId))
+			.all();
+		const history = db
+			.select()
+			.from(narratorMessages)
+			.where(eq(narratorMessages.narratorId, narratorId))
+			.all()
+			.filter((row) => row.role === "user");
+		expect(mailbox).toHaveLength(1);
+		expect(mailbox[0].id).toBe(result.mailboxId);
+		expect(history).toHaveLength(1);
+		expect(history[0].id).toBe(result.messageId);
+	} finally {
+		closeNarrator(narratorId);
+	}
+});
+
+test("named queue policy and legacy busy rejection use the same admission lock", async () => {
+	const narratorId = "unified-send-busy-policy";
+	seedNarrator(narratorId);
+	const owner = await tryClaimExecution(narratorId, "primary");
+	if (!owner) throw new Error("fixture could not claim execution");
+	try {
+		await expect(
+			sendMessage({ kind: "user", narratorId, message: "reject", busyPolicy: "reject" }),
+		).rejects.toThrow();
+		await expect(sendMessage(narratorId, "legacy reject")).rejects.toThrow();
+		expect(db.select().from(narratorBufferedMessages).all()).toHaveLength(0);
+		const result = await sendMessage({
+			kind: "user",
+			narratorId,
+			message: "queue",
+			busyPolicy: "queue",
+		});
+		expect(result).toMatchObject({ accepted: true, delivered: "buffered", state: "queued" });
+		expect(db.select().from(narratorBufferedMessages).all()).toHaveLength(1);
+		expect(providerCalls).toHaveLength(0);
+	} finally {
+		owner.release();
+		closeNarrator(narratorId);
+	}
+});
+
+test("named admission keeps acceptance after a notification failure", async () => {
+	const narratorId = "unified-send-notification-failure";
+	seedNarrator(narratorId);
+	const websocket = await import("../../websocket/narrator-ws");
+	const broadcast = spyOn(websocket, "broadcastToNarrator").mockImplementation(() => {
+		throw new Error("notification unavailable");
+	});
+	const owner = await tryClaimExecution(narratorId, "primary");
+	if (!owner) throw new Error("fixture could not claim execution");
+	try {
+		const result = await sendMessage({
+			kind: "user",
+			narratorId,
+			message: "accepted despite WS",
+			busyPolicy: "queue",
+		});
+		expect(result.accepted).toBe(true);
+		expect(result.mailboxId).toBeTruthy();
+		expect(db.select().from(narratorBufferedMessages).all()).toHaveLength(1);
+	} finally {
+		broadcast.mockRestore();
+		owner.release();
+		closeNarrator(narratorId);
+	}
+});
+
+test("named user pre-cancellation cannot write or dispatch", async () => {
+	const narratorId = "unified-send-user-cancelled";
+	seedNarrator(narratorId);
+	const controller = new AbortController();
+	controller.abort();
+	try {
+		await expect(
+			sendMessage({ kind: "user", narratorId, message: "cancelled", signal: controller.signal }),
+		).rejects.toMatchObject({ name: "AbortError" });
+		expect(db.select().from(narratorBufferedMessages).all()).toHaveLength(0);
+		expect(providerCalls).toHaveLength(0);
+	} finally {
+		closeNarrator(narratorId);
+	}
+});
+
+test("named subagent send accepts once before mailbox-only resume and preserves queued receipt on failure", async () => {
+	const narratorId = "unified-send-subagent-resume";
+	const parentNarratorId = `${narratorId}-parent`;
+	seedNarrator(parentNarratorId);
+	seedNarrator(narratorId);
+	db.update(narrators)
+		.set({ type: "subagent", variant: "subagent:general", parentNarratorId })
+		.where(eq(narrators.id, narratorId))
+		.run();
+	const resumes = await import("../subagent-resume");
+	const origin = spyOn(resumes, "resolveSubagentOriginToolUseId").mockResolvedValue("agent-origin");
+	const resume = spyOn(resumes, "resumeSubagent").mockImplementation(async (input) => {
+		expect(input).toMatchObject({ subagentId: narratorId, mailboxInput: true });
+		expect(input.prompt).toBeUndefined();
+		expect(db.select().from(narratorBufferedMessages).all()).toHaveLength(1);
+		throw new Error("runner unavailable");
+	});
+	try {
+		const result = await sendMessage({
+			kind: "user",
+			target: "subagent",
+			narratorId,
+			message: "one copy",
+		});
+		expect(result).toMatchObject({ accepted: true, delivered: "buffered" });
+		expect(result.wakeError).toContain("runner unavailable");
+		expect(result.messageId).not.toBe(result.mailboxId);
+		expect(resume).toHaveBeenCalledTimes(1);
+		expect(db.select().from(narratorMessages).all()).toHaveLength(0);
+		expect(db.select().from(narratorBufferedMessages).all()).toHaveLength(1);
+		expect(providerCalls).toHaveLength(0);
+	} finally {
+		resume.mockRestore();
+		origin.mockRestore();
+		closeNarrator(narratorId);
+	}
+});
+
+test("running subagent pre-cancellation is checked by shared admission", async () => {
+	const narratorId = "unified-send-subagent-cancelled";
+	seedNarrator(narratorId);
+	db.update(narrators)
+		.set({ type: "subagent", variant: "subagent:general", status: "working" })
+		.where(eq(narrators.id, narratorId))
+		.run();
+	const controller = new AbortController();
+	controller.abort();
+	try {
+		await expect(
+			sendMessage({
+				kind: "user",
+				target: "subagent",
+				narratorId,
+				message: "never queued",
+				signal: controller.signal,
+			}),
+		).rejects.toMatchObject({ name: "AbortError" });
+		expect(db.select().from(narratorBufferedMessages).all()).toHaveLength(0);
+	} finally {
 		closeNarrator(narratorId);
 	}
 });

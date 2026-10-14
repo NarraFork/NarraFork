@@ -279,7 +279,7 @@ export function projectPendingInjection(
 			fromId: delivery.sender.id,
 			fromTitle: delivery.sender.title ?? null,
 			fromLabel: delivery.sender.label,
-			fromType: delivery.sender.type ?? "general",
+			fromType: delivery.sender.type ?? (metadata.channel === "peer" ? "primary" : "general"),
 			fromToolUseId: delivery.fromToolUseId,
 			fromMessageId: metadata.fromMessageId,
 			text: row.text,
@@ -302,11 +302,29 @@ function peekTaskNoticeUser(taskId: string): string | null {
 	return taskNoticeUsers.get(taskId) ?? null;
 }
 
+/** Read actor attribution without materializing a mailbox row into its payload. */
+export function pendingInjectionMailboxUserId(
+	row: Pick<
+		import("./agent-runtime/runtime-queue-port").RuntimeMailboxRow,
+		"kind" | "metadataJson"
+	>,
+): string | null {
+	const metadata = inboxMetadata<{
+		userId?: string | null;
+		taskId?: string;
+		questionAnswer?: { executionPrincipal?: { userId: string | null } };
+	}>(row as import("./agent-runtime/runtime-queue-port").RuntimeMailboxRow);
+	// Native answer receipts carry the execution actor, not the answer author.
+	if (metadata.questionAnswer) return metadata.questionAnswer.executionPrincipal?.userId ?? null;
+	if (metadata.userId !== undefined) return metadata.userId;
+	return row.kind === "task_notice" && metadata.taskId ? peekTaskNoticeUser(metadata.taskId) : null;
+}
+
 /** Keep unattributed legacy/system entries null rather than charging the parent user. */
 export function pendingInjectionUserId(entry: PendingInjection): string | null {
 	if (entry.kind === "subagent_message") return entry.message.userId ?? null;
 	const task = entry.task as { userId?: string | null; id: string };
-	return task.userId ?? peekTaskNoticeUser(task.id);
+	return task.userId === undefined ? peekTaskNoticeUser(task.id) : task.userId;
 }
 
 /**

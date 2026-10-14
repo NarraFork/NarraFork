@@ -14,6 +14,7 @@ import {
 	topLevelStreamingChunkToToolFields,
 } from "../narrator-message-helpers";
 import {
+	applyStreamingSendDelivery,
 	applyStreamingToolChunk,
 	applyStreamingToolCompleted,
 	applyStreamingToolExecuting,
@@ -25,6 +26,51 @@ import {
 	dropPersistedStreamingTools,
 	streamingToolChunks,
 } from "./streaming-tool-chunks";
+
+describe("NarratorSend receipt handoff", () => {
+	it("retains tool identity and enriches existing delivery with consumption", () => {
+		const store = createStreamingToolStore();
+		applyStreamingToolStarted(store, {
+			toolUseId: "peer-send",
+			toolName: "NarratorSend",
+			input: { id: "peer", message: "hello" },
+		});
+		const target = {
+			id: "peer",
+			deliveryMessageId: "receipt",
+			injectionId: "injection",
+			injectionStatus: "pending" as const,
+		};
+		expect(
+			applyStreamingSendDelivery(store, {
+				toolUseId: "peer-send",
+				targets: [target],
+				targetCount: 1,
+			}),
+		).toBe(true);
+		expect(store.get("peer-send")).toMatchObject({
+			toolName: "NarratorSend",
+			_sendDeliveryTargets: [target],
+		});
+		const consumed = {
+			...target,
+			injectionStatus: "consumed" as const,
+			injectionConsumedAt: "2026-07-18T00:00:00.000Z",
+		};
+		expect(applyStreamingSendDelivery(store, { toolUseId: "peer-send", targets: [consumed] })).toBe(
+			true,
+		);
+		expect(store.get("peer-send")).toMatchObject({
+			toolName: "NarratorSend",
+			_sendDeliveryTargets: [consumed],
+		});
+		const synthetic = buildTopLevelStreamingChunksMsg(streamingToolChunks(store), "n", null);
+		expect(resolveAllToolCallsFromMsg(synthetic!)[0]).toMatchObject({
+			toolName: "NarratorSend",
+			_sendDeliveryTargets: [consumed],
+		});
+	});
+});
 
 describe("Edit origin handoff", () => {
 	const input = {

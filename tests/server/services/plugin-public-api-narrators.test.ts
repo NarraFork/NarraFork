@@ -13,11 +13,29 @@ import {
 	type PluginPublicApiAdapters,
 	PluginPublicApiError,
 } from "@server/services/plugin-public-api";
+import { parseStewardOriginLabel, type StewardMessageProvenance } from "@shared/message-origin";
 import { chapters, narratorMessages, narrators, projects } from "../../../server/db/schema";
 import { cleanDb, getTestDb } from "../../setup";
 
 const CURSOR_SECRET = "public-api-narrator-test-cursor-secret-32-bytes";
 let requestSequence = 0;
+
+type SendInput = Parameters<NarratorSessionFacade["sendMessage"]>[0];
+type SendResult = Awaited<ReturnType<NarratorSessionFacade["sendMessage"]>>;
+
+function acceptedSendResult(overrides: Partial<SendResult> = {}): SendResult {
+	return {
+		accepted: true,
+		duplicate: false,
+		messageId: "reserved-history-id",
+		mailboxId: "mailbox-id",
+		bufferedAt: "2026-07-16T12:00:00.000Z",
+		state: "queued",
+		receiptDisposition: "active",
+		delivered: "buffered",
+		...overrides,
+	};
+}
 
 function context(
 	overrides: Partial<HostCallContext> & {
@@ -669,11 +687,9 @@ describe("createCorePluginPublicApiAdapters (core integration)", () => {
 			message: string;
 			originLabel: string | null;
 			locale: string;
+			createdBy: string | null;
 		}> = [];
 		const fakeSession: NarratorSessionFacade = {
-			async sendSubagentMessage() {
-				return { delivered: "buffered" } as never;
-			},
 			async createNarrator() {
 				return { narratorId: "n-new" } as never;
 			},
@@ -695,25 +711,19 @@ describe("createCorePluginPublicApiAdapters (core integration)", () => {
 			async specWrite() {
 				return { path: "tasks.json", uri: "spec://tasks.json", revisionId: null };
 			},
-			async sendMessage(
-				narratorId,
-				message,
-				_images,
-				locale,
-				_replyInUserLanguage,
-				_commandText,
-				_userId,
-				_textFiles,
-				_preBashCommand,
-				origin,
-			) {
+			async sendMessage(input) {
+				expect(input.kind).toBe("user");
+				if (input.kind !== "user") throw new Error("expected user input");
+				expect(input.target).toBe("primary");
+				expect(input.busyPolicy).toBe("reject");
 				sent.push({
-					narratorId,
-					message,
-					originLabel: origin?.originLabel ?? null,
-					locale: locale ?? "en",
+					narratorId: input.narratorId,
+					message: input.message,
+					originLabel: input.origin?.originLabel ?? null,
+					locale: input.locale ?? "en",
+					createdBy: input.userId ?? null,
 				});
-				return { id: "msg-1" } as never;
+				return acceptedSendResult({ messageId: "msg-1", delivered: "started" });
 			},
 			interruptNarrator() {
 				return false;
@@ -755,14 +765,326 @@ describe("createCorePluginPublicApiAdapters (core integration)", () => {
 			message: "please review chapter 3",
 			originLabel: "plugin:com.example.team",
 			locale: "zh-CN",
+			createdBy: "user-1",
 		});
+	});
+
+	function stewardHarness(sendMessage: NarratorSessionFacade["sendMessage"]) {
+		const unused = async () => {
+			throw new Error("unexpected facade call");
+		};
+		const adapter = createCorePluginPublicApiAdapters({
+			db,
+			pluginManager: { list: unused, getStatus: unused, enable: unused, disable: unused },
+			narratorSession: {
+				sendMessage,
+				createNarrator: unused,
+				deleteNarrator: unused,
+				specTasksGet: unused,
+				specTaskAdd: unused,
+				specBehaviorFenceUpdate: unused,
+				updateProfile: unused,
+				specWrite: unused,
+				interruptNarrator: () => false,
+				getById: unused,
+			},
+		}).narratorCommands!;
+		const callContext = context({
+			plugin: {
+				pluginId: "steward-narrator",
+				contributionId: "steward-send",
+			} as HostCallContext["plugin"],
+			invocation: {
+				kind: "user",
+				userId: "user-1",
+				source: "internal",
+				narratorId: "n-steward",
+			} as HostCallContext["invocation"],
+			scope: { narratorId: "n-steward" },
+		});
+		const provenance: StewardMessageProvenance = {
+			userId: "user-1",
+			pluginId: "steward-narrator",
+			contributionId: "steward-send",
+			requestId: callContext.requestId,
+			correlationId: callContext.correlationId,
+			stewardNarratorId: "n-steward",
+			targetNarratorId: "n-worker",
+			bindingRevision: 4,
+		};
+		return {
+			adapter,
+			input: {
+				narratorId: "n-worker",
+				message: "exact delegated bytes",
+				pluginId: "steward-narrator",
+				stewardProvenance: provenance,
+				context: callContext,
+				signal: new AbortController().signal,
+			},
+		};
+	}
+
+	test("primary and subagent commands share the named send facade and preserve queued IDs", async () => {
+		const sends: SendInput[] = [];
+		const { adapter, input } = stewardHarness(async (sendInput) => {
+			sends.push(sendInput);
+			return acceptedSendResult({ wakeError: "consumer is temporarily unavailable" });
+		});
+		const { api } = buildApi({ adapters: { narratorCommands: adapter } });
+		const primaryContext = context();
+		const primary = await api.command(
+			primaryContext,
+			createCommandRequest(primaryContext, "narrafork.narrator.send_message", {
+				narratorId: "n-worker",
+				message: "queued primary",
+			}),
+		);
+		expect(primary.status).toBe("succeeded");
+		expect(primary.data).toEqual({ accepted: true, messageId: "reserved-history-id" });
+		expect(primary.data).not.toHaveProperty("mailboxId");
+
+		const subagent = await adapter.sendSubagentMessage({
+			narratorId: "n-subagent",
+			message: "queued worker",
+			priority: true,
+			locale: "zh-CN",
+			pluginId: input.pluginId,
+			context: input.context,
+			signal: input.signal,
+		});
+		expect(subagent).toEqual({
+			delivered: "buffered",
+			messageId: "mailbox-id",
+			bufferedAt: "2026-07-16T12:00:00.000Z",
+		});
+		expect(sends).toHaveLength(2);
+		expect(sends[0]).toMatchObject({ kind: "user", target: "primary", busyPolicy: "reject" });
+		expect(sends[1]).toEqual({
+			kind: "user",
+			target: "subagent",
+			busyPolicy: "queue",
+			narratorId: "n-subagent",
+			message: "queued worker",
+			priority: true,
+			locale: "zh-CN",
+			userId: null,
+			signal: input.signal,
+		});
+	});
+
+	test.each([
+		{ state: "cancelled", receiptDisposition: "active", code: "CANCELLED" },
+		{ state: "failed", receiptDisposition: "active", code: "INTERNAL_ERROR" },
+		{ state: "queued", receiptDisposition: "recipient_deleted", code: "NOT_FOUND" },
+		{ state: "queued", receiptDisposition: "superseded", code: "CONFLICT" },
+	] as const)("primary command rejects unaccepted $state/$receiptDisposition receipts", async ({
+		state,
+		receiptDisposition,
+		code,
+	}) => {
+		const { adapter } = stewardHarness(async () =>
+			acceptedSendResult({
+				accepted: false,
+				state,
+				receiptDisposition,
+			}),
+		);
+		const { api } = buildApi({ adapters: { narratorCommands: adapter } });
+		const callContext = context();
+		const result = await api.command(
+			callContext,
+			createCommandRequest(callContext, "narrafork.narrator.send_message", {
+				narratorId: "n-worker",
+				message: "rejected",
+			}),
+		);
+		expect(result.status).toBe(code === "CANCELLED" ? "cancelled" : "failed");
+		expect(result.error?.code).toBe(code);
+		expect(result.data).toBeUndefined();
+	});
+
+	test("started subagent receipts expose the core history ID and started flag", async () => {
+		const { adapter, input } = stewardHarness(async () =>
+			acceptedSendResult({
+				delivered: "started",
+				started: false,
+				messageId: "real-history-id",
+			}),
+		);
+		expect(await adapter.sendSubagentMessage(input)).toEqual({
+			delivered: "started",
+			started: false,
+			messageId: "real-history-id",
+			bufferedAt: "2026-07-16T12:00:00.000Z",
+		});
+	});
+
+	test.each([
+		"primary",
+		"subagent",
+	] as const)("cancelled %s commands never reach the facade", async (target) => {
+		let sends = 0;
+		const { adapter, input } = stewardHarness(async () => {
+			sends += 1;
+			return acceptedSendResult();
+		});
+		const controller = new AbortController();
+		input.signal = controller.signal;
+		controller.abort();
+		const send =
+			target === "primary" ? adapter.sendMessage(input) : adapter.sendSubagentMessage(input);
+		await expect(send).rejects.toMatchObject({ code: "CANCELLED" });
+		expect(sends).toBe(0);
+	});
+
+	test("subagent cancellation during admission is passed through and mapped to CANCELLED", async () => {
+		const controller = new AbortController();
+		const { adapter, input } = stewardHarness(async (sendInput) => {
+			expect(sendInput.signal).toBe(controller.signal);
+			await Promise.resolve();
+			controller.abort();
+			sendInput.signal?.throwIfAborted();
+			return acceptedSendResult();
+		});
+		input.signal = controller.signal;
+		await expect(adapter.sendSubagentMessage(input)).rejects.toMatchObject({ code: "CANCELLED" });
+	});
+
+	test.each([
+		"primary",
+		"subagent",
+	] as const)("%s accepted receipts survive cancellation after commit", async (target) => {
+		const controller = new AbortController();
+		const { adapter, input } = stewardHarness(async () => {
+			controller.abort();
+			return acceptedSendResult({ wakeError: "post-commit wake failed" });
+		});
+		input.signal = controller.signal;
+		const result =
+			target === "primary"
+				? await adapter.sendMessage(input)
+				: await adapter.sendSubagentMessage(input);
+		expect(result).toHaveProperty(
+			"messageId",
+			target === "primary" ? "reserved-history-id" : "mailbox-id",
+		);
+	});
+
+	test("steward provenance is snapshotted before asynchronous sending", async () => {
+		let send: SendInput | undefined;
+		const { adapter, input } = stewardHarness(async (sendInput) => {
+			send = sendInput;
+			await Promise.resolve();
+			return acceptedSendResult();
+		});
+		const expected = structuredClone(input.stewardProvenance);
+		const pending = adapter.sendMessage(input);
+		input.stewardProvenance.userId = "mutated-after-admission";
+		await pending;
+		if (send?.kind !== "user") throw new Error("expected user input");
+		expect(parseStewardOriginLabel(send.origin?.originLabel)).toEqual(expected);
+		expect(
+			(send.origin?.delegationHostContext as { scope?: { narratorId?: string } } | undefined)?.scope
+				?.narratorId,
+		).toBe("n-steward");
+	});
+
+	test("steward delegation preserves the human, plugin and steward in trusted metadata", async () => {
+		const sends: Parameters<NarratorSessionFacade["sendMessage"]>[0][] = [];
+		const { adapter, input } = stewardHarness(async (sendInput) => {
+			sends.push(sendInput);
+			return acceptedSendResult({ messageId: "delegated-message" });
+		});
+		expect(await adapter.sendMessage(input)).toEqual({ messageId: "delegated-message" });
+		expect(sends).toHaveLength(1);
+		const send = sends[0]!;
+		expect(send.kind).toBe("user");
+		if (send.kind !== "user") throw new Error("expected user input");
+		expect(send.message).toBe("exact delegated bytes");
+		expect(send.userId).toBe("user-1");
+		expect(send.origin?.origin).toBe("assistant");
+		expect(parseStewardOriginLabel(send.origin?.originLabel)).toEqual(input.stewardProvenance);
+		expect(send.signal).toBe(input.signal);
+	});
+
+	test.each([
+		"userId",
+		"pluginId",
+		"contributionId",
+		"requestId",
+		"correlationId",
+		"stewardNarratorId",
+		"targetNarratorId",
+	] as const)("rejects mismatched steward provenance %s before sending", async (field) => {
+		let sends = 0;
+		const { adapter, input } = stewardHarness(async () => {
+			sends += 1;
+			return { id: "not-allowed" } as never;
+		});
+		input.stewardProvenance[field] = "other-identity";
+		await expect(adapter.sendMessage(input)).rejects.toMatchObject({ code: "PERMISSION_DENIED" });
+		expect(sends).toBe(0);
+	});
+
+	test("rejects missing host source narrator and malformed binding revision", async () => {
+		let sends = 0;
+		const { adapter, input } = stewardHarness(async () => {
+			sends += 1;
+			return { id: "not-allowed" } as never;
+		});
+		const sourceId = input.context.invocation.narratorId;
+		delete input.context.invocation.narratorId;
+		await expect(adapter.sendMessage(input)).rejects.toMatchObject({ code: "PERMISSION_DENIED" });
+		input.context.invocation.narratorId = sourceId;
+		input.stewardProvenance.bindingRevision = -1;
+		await expect(adapter.sendMessage(input)).rejects.toMatchObject({ code: "PERMISSION_DENIED" });
+		expect(sends).toBe(0);
+	});
+
+	test("public send schema rejects third-party steward provenance", async () => {
+		const { input } = stewardHarness(async () => ({ id: "unused" }) as never);
+		const { api, broker } = buildApi();
+		const ordinaryContext = context();
+		const result = await api.command(
+			ordinaryContext,
+			createCommandRequest(ordinaryContext, "narrafork.narrator.send_message", {
+				narratorId: "n-worker",
+				message: "hi",
+				stewardProvenance: input.stewardProvenance,
+			}),
+		);
+		expect(result.error?.code).toBe("INVALID_PARAMS");
+		expect(broker.calls).toHaveLength(0);
+	});
+
+	test("cancelled steward sends cannot reach the send facade", async () => {
+		let sends = 0;
+		const { adapter, input } = stewardHarness(async () => {
+			sends += 1;
+			return { id: "not-allowed" } as never;
+		});
+		const controller = new AbortController();
+		input.signal = controller.signal;
+		controller.abort();
+		await expect(adapter.sendMessage(input)).rejects.toMatchObject({ code: "CANCELLED" });
+		expect(sends).toBe(0);
+	});
+
+	test("send facade checks cancellation after async admission and reports CANCELLED", async () => {
+		const controller = new AbortController();
+		const { adapter, input } = stewardHarness(async (sendInput) => {
+			await Promise.resolve();
+			controller.abort();
+			sendInput.signal?.throwIfAborted();
+			return { id: "not-allowed" } as never;
+		});
+		input.signal = controller.signal;
+		await expect(adapter.sendMessage(input)).rejects.toMatchObject({ code: "CANCELLED" });
 	});
 
 	test("sendMessage maps a busy narrator to retryable CONFLICT", async () => {
 		const fakeSession: NarratorSessionFacade = {
-			async sendSubagentMessage() {
-				return { delivered: "buffered" } as never;
-			},
 			async createNarrator() {
 				return { narratorId: "n-new" } as never;
 			},
@@ -829,9 +1151,6 @@ describe("createCorePluginPublicApiAdapters (core integration)", () => {
 
 	test("sendMessage maps subagent rejection to INVALID_PARAMS", async () => {
 		const fakeSession: NarratorSessionFacade = {
-			async sendSubagentMessage() {
-				return { delivered: "buffered" } as never;
-			},
 			async createNarrator() {
 				return { narratorId: "n-new" } as never;
 			},
@@ -898,9 +1217,6 @@ describe("createCorePluginPublicApiAdapters (core integration)", () => {
 	test("interrupt resolves existence first and reports the outcome", async () => {
 		const interrupts: string[] = [];
 		const fakeSession: NarratorSessionFacade = {
-			async sendSubagentMessage() {
-				return { delivered: "buffered" } as never;
-			},
 			async createNarrator() {
 				return { narratorId: "n-new" } as never;
 			},
@@ -963,9 +1279,6 @@ describe("createCorePluginPublicApiAdapters (core integration)", () => {
 
 	test("interrupt maps an unknown narrator to NOT_FOUND", async () => {
 		const fakeSession: NarratorSessionFacade = {
-			async sendSubagentMessage() {
-				return { delivered: "buffered" } as never;
-			},
 			async createNarrator() {
 				return { narratorId: "n-new" } as never;
 			},

@@ -1,4 +1,4 @@
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { afterAll, beforeEach, describe, expect, test } from "bun:test";
 import type { Dirent } from "node:fs";
 import { readdir, readFile } from "node:fs/promises";
 import { join } from "node:path";
@@ -17,7 +17,7 @@ interface Frame {
 
 const originalAgent = settings.agent;
 
-beforeAll(() => {
+beforeEach(() => {
 	settings.agent = {
 		...settings.agent,
 		requestDumpRecordingEnabled: true,
@@ -35,6 +35,16 @@ afterAll(async () => {
 	] as Map<string, RequestRecorderClient> | undefined;
 	for (const client of clients?.values() ?? []) await client.close();
 });
+
+function completeFrames(content: string): Frame[] {
+	// The worker appends JSONL asynchronously; the last line may still be in flight.
+	// Only a newline commits a frame. Completed malformed lines must still fail.
+	return content
+		.split("\n")
+		.slice(0, -1)
+		.filter(Boolean)
+		.map((line) => JSON.parse(line) as Frame);
+}
 
 async function framesFor(requestId: string): Promise<Frame[]> {
 	const ring = join(getNarraforkHome(), REQUEST_RECORDING_DIR);
@@ -55,9 +65,7 @@ async function framesFor(requestId: string): Promise<Frame[]> {
 			continue;
 		}
 		for (const file of files) {
-			for (const line of (await readFile(join(chunks, file), "utf8")).split("\n")) {
-				if (!line) continue;
-				const frame = JSON.parse(line) as Frame;
+			for (const frame of completeFrames(await readFile(join(chunks, file), "utf8"))) {
 				if (frame.requestId === requestId) frames.push(frame);
 			}
 		}
@@ -81,6 +89,26 @@ async function waitForEnd(requestId: string, expected: number): Promise<Frame[]>
 }
 
 describe("二进制响应块录制", () => {
+	test("轮询只解析换行结尾的完整帧，下一次快照补齐半帧后不会丢帧", () => {
+		const frame: Frame = {
+			requestId: "partial-frame",
+			direction: "response",
+			packet: 1,
+			offset: 0,
+			data: "QQ==",
+		};
+		const line = JSON.stringify(frame);
+		for (let split = 0; split <= line.length; split++) {
+			expect(completeFrames(`${line}\n${line.slice(0, split)}`)).toEqual([frame]);
+		}
+		expect(completeFrames(`${line}\n${line}\n`)).toEqual([frame, frame]);
+		expect(completeFrames("")).toEqual([]);
+	});
+
+	test("换行结尾的损坏帧仍然报错，不吞掉录制损坏", () => {
+		expect(() => completeFrames('{"requestId":"broken\n')).toThrow(SyntaxError);
+	});
+
 	test("worker 就绪后每个二进制分块只写一帧（transfer 不得阻止 offset 前进）", async () => {
 		// Warm the worker so later postMessage calls transfer synchronously.
 		const warm = createRequestRecording({

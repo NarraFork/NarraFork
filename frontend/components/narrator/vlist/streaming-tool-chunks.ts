@@ -164,7 +164,8 @@ export function applyStreamingSendDelivery(
 		toolUseId: event.toolUseId,
 		inputCharsTotal: 0,
 		...existing,
-		toolName: existing?.toolName === "TeamStatus" ? "TeamStatus" : "Send",
+		// Receipt events do not rename the communication tool that owns the call.
+		toolName: existing && existing.toolName !== UNKNOWN_TOOL_NAME ? existing.toolName : "Send",
 		_sendDeliveryTargets: next,
 		...(targetCount !== undefined ? { _sendDeliveryTargetCount: targetCount } : {}),
 		...(event.toolCallBinding ? { _sendDeliveryBinding: event.toolCallBinding } : {}),

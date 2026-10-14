@@ -3,6 +3,7 @@ import {
 	IconArchive,
 	IconArchiveOff,
 	IconBox,
+	IconLock,
 	IconServer,
 	IconSubtask,
 	IconTerminal2,
@@ -82,12 +83,14 @@ export interface NarratorListItem {
 	runningContainerCount?: number | null;
 	chapter?: NarratorListChapter | null;
 	viewers?: NarratorListViewer[] | null;
+	visibility?: string | null;
 }
 
 interface BaseNarratorListCardProps {
 	narrator: NarratorListItem;
 	localQuery: string;
 	defaultModelValue: string;
+	onAccessSettings?: (narratorId: string) => void;
 }
 
 interface ActiveNarratorListCardProps extends BaseNarratorListCardProps {
@@ -375,6 +378,7 @@ function ActiveNarratorCard({
 	dimmed,
 	onOpen,
 	onArchive,
+	onAccessSettings,
 }: ActiveNarratorListCardProps) {
 	const { t } = useTranslation("narrators");
 
@@ -390,6 +394,11 @@ function ActiveNarratorCard({
 				WebkitTapHighlightColor: "transparent",
 			}}
 			onClick={() => onOpen(narrator.id)}
+			onContextMenu={(e: MouseEvent<HTMLDivElement>) => {
+				if (!onAccessSettings) return;
+				e.preventDefault();
+				onAccessSettings(narrator.id);
+			}}
 			onPointerDown={(e: PointerEvent<HTMLDivElement>) => {
 				e.currentTarget.style.transform = "scale(0.985)";
 			}}
@@ -409,6 +418,11 @@ function ActiveNarratorCard({
 						<NarratorDragHandle narrator={narrator}>
 							<NarratorListStatusIcon narrator={narrator} size={20} dragHint={t("dragToSidebar")} />
 						</NarratorDragHandle>
+						{narrator.visibility === "private" && (
+							<Tooltip label={t("privateNarrator")} withArrow>
+								<IconLock size={13} style={{ opacity: 0.7, flexShrink: 0 }} />
+							</Tooltip>
+						)}
 						<Text fw={500} truncate>
 							<NarratorTitle narrator={narrator} localQuery={localQuery} />
 						</Text>
@@ -500,6 +514,7 @@ function ArchivedNarratorCard({
 	deleteUnsupportedReason,
 	onUnarchive,
 	onDelete,
+	onAccessSettings,
 }: ArchivedNarratorListCardProps) {
 	const { t } = useTranslation("narrators");
 	const deleteTooltip = deleteSupported
@@ -511,7 +526,16 @@ function ArchivedNarratorCard({
 			params={{ narratorId: narrator.id }}
 			style={{ textDecoration: "none", color: "inherit" }}
 		>
-			<Card shadow="sm" padding="md" withBorder>
+			<Card
+				shadow="sm"
+				padding="md"
+				withBorder
+				onContextMenu={(e: MouseEvent<HTMLDivElement>) => {
+					if (!onAccessSettings) return;
+					e.preventDefault();
+					onAccessSettings(narrator.id);
+				}}
+			>
 				<Group justify="space-between" wrap="nowrap" align="flex-start">
 					<Stack gap={4} style={{ minWidth: 0, flex: 1 }}>
 						<Group gap="xs" wrap="nowrap">

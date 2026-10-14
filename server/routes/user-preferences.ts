@@ -61,6 +61,9 @@ const DEFAULTS = {
 	recentTabs: "[]",
 	addSubagentToRecentTabs: true,
 	recentTabsGroupMode: "flat" as const,
+	// Admin-only listing switch; false keeps other people's private narrators out of
+	// this admin's lists until they opt in.
+	showAllNarrators: false,
 	// Notification defaults
 	notifyOnDone: true,
 	notifyOnWaiting: true,
@@ -147,6 +150,7 @@ const INSERT_COLUMNS = [
 	"narrator_line_height_scale_percent",
 	"add_subagent_to_recent_tabs",
 	"recent_tabs_group_mode",
+	"show_all_narrators",
 	"notify_on_done",
 	"notify_on_waiting",
 	"notify_pwa_enabled",
@@ -413,6 +417,7 @@ userPreferencesRoutes.patch("/", async (c) => {
 		   narrator_line_height_scale_percent = COALESCE(?, narrator_line_height_scale_percent),
 		   add_subagent_to_recent_tabs = COALESCE(?, add_subagent_to_recent_tabs),
 		   recent_tabs_group_mode = COALESCE(?, recent_tabs_group_mode),
+		   show_all_narrators = COALESCE(?, show_all_narrators),
 		   notify_on_done = COALESCE(?, notify_on_done),
 		   notify_on_waiting = COALESCE(?, notify_on_waiting),
 		   notify_pwa_enabled = COALESCE(?, notify_pwa_enabled),
@@ -458,6 +463,7 @@ userPreferencesRoutes.patch("/", async (c) => {
 				d.narratorLineHeightScalePercent ?? DEFAULTS.narratorLineHeightScalePercent,
 				(d.addSubagentToRecentTabs ?? DEFAULTS.addSubagentToRecentTabs) ? 1 : 0,
 				d.recentTabsGroupMode ?? DEFAULTS.recentTabsGroupMode,
+				(d.showAllNarrators ?? DEFAULTS.showAllNarrators) ? 1 : 0,
 				(d.notifyOnDone ?? DEFAULTS.notifyOnDone) ? 1 : 0,
 				(d.notifyOnWaiting ?? DEFAULTS.notifyOnWaiting) ? 1 : 0,
 				(d.notifyPwaEnabled ?? DEFAULTS.notifyPwaEnabled) ? 1 : 0,
@@ -501,6 +507,7 @@ userPreferencesRoutes.patch("/", async (c) => {
 				d.narratorLineHeightScalePercent ?? null,
 				d.addSubagentToRecentTabs != null ? (d.addSubagentToRecentTabs ? 1 : 0) : null,
 				d.recentTabsGroupMode ?? null,
+				d.showAllNarrators != null ? (d.showAllNarrators ? 1 : 0) : null,
 				d.notifyOnDone != null ? (d.notifyOnDone ? 1 : 0) : null,
 				d.notifyOnWaiting != null ? (d.notifyOnWaiting ? 1 : 0) : null,
 				d.notifyPwaEnabled != null ? (d.notifyPwaEnabled ? 1 : 0) : null,

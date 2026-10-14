@@ -44,6 +44,7 @@
 	"copyCwdFailed": "Failed to copy working directory",
 	"openInWindow": "Open in window",
 	"rename": "Rename",
+	"accessSettings": "Narrator access settings",
 	"archive": "Archive",
 	"totalOutputChars": "Total AI output chars",
 	"feedback": "Feedback",

@@ -1,0 +1,193 @@
+:root {
+	color-scheme: light dark;
+	font-family: var(--nf-font, var(--mantine-font-family, sans-serif));
+	color: var(--nf-color-text, CanvasText);
+	background: var(--nf-color-body, Canvas);
+}
+
+* {
+	box-sizing: border-box;
+}
+body {
+	margin: 0;
+}
+
+.steward-panel {
+	width: 100%;
+	max-width: 480px;
+	padding: var(--nf-spacing, 16px);
+	font-size: 13px;
+	line-height: 1.65;
+}
+
+.steward-title {
+	margin: 0;
+	font-family: inherit;
+	font-size: 18px;
+	font-weight: 650;
+	letter-spacing: 0.02em;
+}
+
+.steward-intro {
+	margin: 4px 0 22px;
+	color: var(--nf-color-dimmed, GrayText);
+}
+
+.steward-summary {
+	padding: 16px;
+	border: 1px solid var(--nf-color-border, ButtonBorder);
+	border-radius: var(--nf-radius, 10px);
+	background: var(--nf-color-surface, Canvas);
+}
+
+.steward-status-row {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	flex-wrap: wrap;
+	gap: 8px;
+	margin-bottom: 20px;
+}
+
+.steward-label {
+	color: var(--nf-color-dimmed, GrayText);
+	font-size: 12px;
+}
+.steward-status {
+	font-size: 12px;
+	font-weight: 600;
+}
+.steward-status[data-state="bound"] {
+	color: var(--nf-color-success, var(--nf-color-text, CanvasText));
+}
+.steward-status[data-state="error"],
+.steward-feedback[data-state="error"] {
+	color: var(--nf-color-error, var(--nf-color-text, CanvasText));
+}
+
+.steward-binding-id {
+	display: block;
+	margin-top: 6px;
+	font-family: var(--nf-font-mono, monospace);
+	font-size: 13px;
+	overflow-wrap: anywhere;
+	user-select: text;
+}
+
+.steward-detail {
+	margin: 12px 0 0;
+	color: var(--nf-color-dimmed, GrayText);
+	font-size: 12px;
+}
+.steward-actions {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 8px;
+	margin-top: 18px;
+}
+.steward-composer {
+	margin-top: 20px;
+	padding: 16px;
+	border: 1px solid var(--nf-color-border, ButtonBorder);
+	border-radius: var(--nf-radius, 10px);
+	background: var(--nf-color-surface, Canvas);
+}
+.steward-composer-title {
+	margin: 0 0 14px;
+	font-size: 14px;
+	font-weight: 650;
+}
+.steward-field-label {
+	display: grid;
+	gap: 6px;
+	margin: 12px 0;
+	color: var(--nf-color-dimmed, GrayText);
+	font-size: 12px;
+}
+.steward-recipient,
+.steward-message {
+	width: 100%;
+	min-height: 38px;
+	padding: 8px 10px;
+	border: 1px solid var(--nf-color-border, ButtonBorder);
+	border-radius: var(--nf-radius, 10px);
+	color: var(--nf-color-text, CanvasText);
+	background: var(--nf-color-body, Canvas);
+	font: inherit;
+	font-size: 13px;
+}
+.steward-message {
+	min-height: 96px;
+	resize: vertical;
+}
+.steward-recipient:focus-visible,
+.steward-message:focus-visible {
+	outline: 2px solid var(--nf-color-primary, Highlight);
+	outline-offset: 2px;
+}
+.steward-recipient:disabled,
+.steward-message:disabled {
+	opacity: 0.6;
+}
+.steward-send {
+	width: 100%;
+	margin-top: 4px;
+}
+.steward-button {
+	min-height: 36px;
+	padding: 7px 12px;
+	border: 1px solid var(--nf-color-border, ButtonBorder);
+	border-radius: var(--nf-radius, 10px);
+	font: inherit;
+	font-weight: 600;
+	cursor: pointer;
+	transition: background-color 120ms ease;
+}
+
+.steward-button-primary {
+	flex: 1 1 190px;
+	color: var(--mantine-primary-color-contrast, HighlightText);
+	background: var(--nf-color-primary, Highlight);
+	border-color: transparent;
+}
+
+.steward-button-primary:hover:not(:disabled) {
+	background: var(--nf-color-primary-hover, Highlight);
+}
+.steward-button-secondary {
+	color: inherit;
+	background: var(--nf-color-surface, Canvas);
+}
+.steward-button-secondary:hover:not(:disabled) {
+	background: var(--mantine-color-default-hover, ButtonFace);
+}
+.steward-button:focus-visible {
+	outline: 2px solid var(--nf-color-primary, Highlight);
+	outline-offset: 3px;
+}
+.steward-button:disabled {
+	opacity: 0.5;
+	cursor: not-allowed;
+}
+.steward-feedback {
+	min-height: 22px;
+	margin: 9px 0 20px;
+	font-size: 12px;
+	overflow-wrap: anywhere;
+}
+.steward-feedback[data-state="pending"] {
+	color: var(--nf-color-dimmed, GrayText);
+}
+.steward-safety {
+	margin: 0;
+	padding-top: 16px;
+	border-top: 1px solid var(--nf-color-border, ButtonBorder);
+	color: var(--nf-color-dimmed, GrayText);
+	font-size: 12px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.steward-button {
+		transition: none;
+	}
+}

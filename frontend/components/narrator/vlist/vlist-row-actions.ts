@@ -80,6 +80,8 @@ export interface VListRowHandlers {
 	 * behaviour every existing caller already has.
 	 */
 	onViewSubagentSession?: (narratorId: string, messageId?: string) => void;
+	/** Open an independent NarratorSend recipient, not a child session. */
+	onViewNarratorSession?: (narratorId: string, messageId?: string) => void;
 	/**
 	 * Open a knowledge-base entry (an injection bubble reporting a knowledge hint).
 	 *
@@ -131,6 +133,7 @@ export function rowActionHandlerDependencies(
 		handlers?.onRollbackToBlock,
 		handlers?.onEditMessage,
 		handlers?.onViewSubagentSession,
+		handlers?.onViewNarratorSession,
 		handlers?.onDetachSubagent,
 		handlers?.onDetachBash,
 		handlers?.onCancelBackgroundTask,
@@ -151,6 +154,8 @@ export function rowActionHandlerDependencies(
 export interface VListRowToolActions {
 	/** "Open full session" / "View session" — the resolved child narrator id. */
 	onViewSubagentSession?: () => void;
+	/** View an independent narrator session without child lifecycle actions. */
+	onViewNarratorSession?: () => void;
 	/** "Detach to background". */
 	onDetachSubagent?: () => void;
 	/** "Detach to background" for a Bash tool call. */
@@ -195,7 +200,12 @@ export function buildRowToolActions(
 	// card knows its single addressee from the tool's own returned targets.
 	const sessionNarratorId =
 		meta.subagentNarratorId ?? meta.awaitAgentNarratorId ?? meta.sendTargetNarratorId;
-	if (sessionNarratorId && handlers.onViewSubagentSession) {
+	if (meta.toolName === "NarratorSend") {
+		if (meta.sendTargetNarratorId && handlers.onViewNarratorSession) {
+			const targetId = meta.sendTargetNarratorId;
+			actions.onViewNarratorSession = () => handlers.onViewNarratorSession?.(targetId);
+		}
+	} else if (sessionNarratorId && handlers.onViewSubagentSession) {
 		actions.onViewSubagentSession = () => handlers.onViewSubagentSession?.(sessionNarratorId);
 	}
 

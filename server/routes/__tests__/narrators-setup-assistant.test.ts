@@ -45,22 +45,28 @@ const dependencyFixture: ReturnType<typeof dependencyService.checkAll> = {
 	],
 };
 const checkAll = spyOn(dependencyService, "checkAll").mockReturnValue(dependencyFixture);
-const sendMessage = spyOn(session, "sendMessage").mockImplementation(
-	async (narratorId, prompt, _images, _locale, _replyInUserLanguage, _commandText, userId) => {
-		const [message] = await db
-			.insert(narratorMessages)
-			.values({
-				id: generateId(),
-				narratorId,
-				role: "user",
-				contentJson: [{ type: "text", text: prompt }],
-				createdBy: userId,
-				createdAt: new Date().toISOString(),
-			})
-			.returning();
-		return message;
-	},
-);
+const sendMessage = spyOn(session, "sendMessage").mockImplementation((async (
+	narratorId: string,
+	prompt: string,
+	_images: unknown,
+	_locale: unknown,
+	_replyInUserLanguage: unknown,
+	_commandText: string | null | undefined,
+	userId: string | null | undefined,
+) => {
+	const [message] = await db
+		.insert(narratorMessages)
+		.values({
+			id: generateId(),
+			narratorId,
+			role: "user",
+			contentJson: [{ type: "text", text: prompt }],
+			createdBy: userId,
+			createdAt: new Date().toISOString(),
+		})
+		.returning();
+	return message;
+}) as never);
 const network = spyOn(globalThis, "fetch").mockImplementation(
 	Object.assign(
 		async () => {

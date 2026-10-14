@@ -86,6 +86,31 @@ describe("resolveAllToolCallsFromMsg", () => {
 	});
 });
 
+describe("NarratorSend segment identity", () => {
+	test("stays a top-level communication run, never a child narrator card", () => {
+		const msg = {
+			id: "peer-message",
+			narratorId: "n",
+			parentToolUseId: null,
+			role: "assistant",
+			contentJson: [
+				{
+					type: "tool_use",
+					id: "peer-send",
+					name: "NarratorSend",
+					input: { id: "peer", message: "hello" },
+				},
+			],
+			toolCalls: [{ toolUseId: "peer-send", toolName: "NarratorSend", status: "success" }],
+			children: [],
+		} as unknown as NarratorMsg;
+		expect(segmentMessages([msg])[0]).toMatchObject({
+			kind: "tool-run",
+			items: [{ isSubagent: false, tc: { toolName: "NarratorSend" } }],
+		});
+	});
+});
+
 describe("segmentMessages", () => {
 	function toolMessage(messageId: string, toolUseId: string, reasoningText: string): NarratorMsg {
 		return {

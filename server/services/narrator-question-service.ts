@@ -73,6 +73,7 @@ import {
 import { coerceAskQuestions } from "./ask-user-question-coerce";
 import { customSubagentService } from "./custom-subagent-service";
 import { notifyHumanAttentionChanged } from "./human-attention-events";
+import { type NarratorPrincipal, narratorReadableWhere } from "./narrator-acl";
 import { type DeliverInjectionOptions, deliverInjection } from "./narrator-injection";
 
 /** One question as the tool defined it. Header + description only. */
@@ -1139,10 +1140,9 @@ export interface AsyncQuestionWithContext extends AsyncQuestionRecord {
  * question asked is exactly the shape that turns into "all requests hang". A user with
  * more than 200 waiting questions has a problem the inbox cannot solve anyway.
  */
-export async function listAllOpenAsyncQuestionsForPrincipal(principal: {
-	userId: string;
-	isAdmin: boolean;
-}): Promise<AsyncQuestionWithContext[]> {
+export async function listAllOpenAsyncQuestionsForPrincipal(
+	principal: NarratorPrincipal,
+): Promise<AsyncQuestionWithContext[]> {
 	const HARD_LIMIT = 200;
 	const rows = await db
 		.select({
@@ -1160,7 +1160,16 @@ export async function listAllOpenAsyncQuestionsForPrincipal(principal: {
 		})
 		.from(narratorQuestions)
 		.innerJoin(narrators, eq(narratorQuestions.narratorId, narrators.id))
-		.where(eq(narratorQuestions.status, "open"))
+		// The list predicate in SQL, in addition to the per-row check further down. The two
+		// are an INTERSECTION, and each is load-bearing for a different caller:
+		//   - for a non-admin the SQL clause is an optimization — the loop would drop the same
+		//     rows, and going through SQL first keeps the `HARD_LIMIT` window from being
+		//     consumed by rows that are about to be discarded;
+		//   - for an admin who opted out of other people's private narrators the SQL clause is
+		//     the ONLY thing that narrows the result, because `canReadNarrator` admits every
+		//     admin by design. Without it the preference would silently not apply here.
+		// `undefined` for a full-view admin composes to "no extra restriction" under `and(...)`.
+		.where(and(eq(narratorQuestions.status, "open"), narratorReadableWhere(principal)))
 		.orderBy(desc(narratorQuestions.createdAt), desc(narratorQuestions.id))
 		.limit(HARD_LIMIT);
 

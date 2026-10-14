@@ -226,7 +226,7 @@ export function runningSendTargetNarratorId(input: unknown, resolved: unknown): 
 
 export function traceRowSendTargetNarratorId(tc: TraceRowToolCallLike): string | undefined {
 	const isTeamSend = tc.toolName === "TeamStatus" && asRecord(tc.inputJson).action === "send";
-	if (tc.toolName !== "Send" && !isTeamSend) return undefined;
+	if (tc.toolName !== "Send" && tc.toolName !== "NarratorSend" && !isTeamSend) return undefined;
 	const metadata = asRecord(asRecord(tc.outputJson)._metadata ?? tc._metadata);
 	const targets = metadata.targets;
 	if (targets === undefined && tc.outputJson == null) {

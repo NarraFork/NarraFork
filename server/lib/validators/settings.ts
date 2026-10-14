@@ -202,6 +202,9 @@ export const updateUserPreferencesSchema = z.object({
 	treatAsLocalAccess: z.boolean().optional(),
 	addSubagentToRecentTabs: z.boolean().optional(),
 	recentTabsGroupMode: z.enum(["flat", "directory"]).optional(),
+	// Admin-only listing switch. Accepted from any caller but only ever consulted for
+	// admins by the list predicates, so a non-admin setting it changes nothing.
+	showAllNarrators: z.boolean().optional(),
 	// Notification preferences
 	notifyOnDone: z.boolean().optional(),
 	notifyOnWaiting: z.boolean().optional(),

@@ -1916,6 +1916,18 @@ function NarratorPanelBody({
 		],
 	);
 
+	// Independent narrator recipients must not be opened as child sessions.
+	const handleVlistViewNarratorSession = useCallback(
+		(targetNarratorId: string, messageId?: string) => {
+			navigate({
+				to: "/narrators/$narratorId",
+				params: { narratorId: targetNarratorId },
+				search: messageId ? { scrollTo: messageId } : undefined,
+			});
+		},
+		[navigate],
+	);
+
 	// Opening a child session prefers the host-provided handler (dock/workspace
 	// aware); standalone panels fall back to routing, like SubagentCard does.
 	const handleVlistViewSubagentSession = useCallback(
@@ -2067,6 +2079,7 @@ function NarratorPanelBody({
 			onEditAssistantMessage: handleEditAssistantMessage,
 			onRestoreAssistantMessage: handleRestoreAssistantMessage,
 			onViewSubagentSession: handleVlistViewSubagentSession,
+			onViewNarratorSession: handleVlistViewNarratorSession,
 			// Gated on provider capability, mirroring SubagentCard: an unsupported
 			// backend hides the item rather than failing on click.
 			onDetachSubagent: canDetachSubagentToBackground ? handleDetachSubagent : undefined,
@@ -2096,6 +2109,7 @@ function NarratorPanelBody({
 			handleEditAssistantMessage,
 			handleRestoreAssistantMessage,
 			handleVlistViewSubagentSession,
+			handleVlistViewNarratorSession,
 			canDetachSubagentToBackground,
 			handleDetachSubagent,
 			handleDetachBash,

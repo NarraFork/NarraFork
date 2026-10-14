@@ -19,6 +19,11 @@ import { logger } from "../../lib/logger";
 import type { Locale } from "../../lib/prompt-i18n";
 import type { AgentMessageDelivery } from "../agent-message-delivery";
 import { getNarratorMessageRefsPort } from "../narrator-refs/store";
+import {
+	authorizeStewardMessage,
+	guardStewardMessageCommit,
+	isStewardMessage,
+} from "../steward-message-admission";
 import { createMailboxStore, mailboxDedupeKey } from "./mailbox";
 import { isAwaitedTerminalConsumption } from "./mailbox-shared";
 import type { MailboxClaim, MailboxInput, MailboxKind } from "./mailbox-types";
@@ -46,7 +51,7 @@ export const runtimeInbox = new Proxy({} as ReturnType<typeof createMailboxStore
 export interface InboxAgentMetadata {
 	delivery: Omit<AgentMessageDelivery, "text">;
 	projection: { prefix: string; suffix: string };
-	channel: "buffer" | "parent" | "team";
+	channel: "buffer" | "parent" | "team" | "peer";
 	isBroadcast?: boolean;
 	fromMessageId?: string | null;
 	/** Initiating user for the producing pass; null/undefined means unattributed. */
@@ -526,6 +531,36 @@ export async function withInboxOwner<T>(narratorId: string, work: () => Promise<
  * `claimed`: the token guard re-reads the row first, so an already materialized/cancelled
  * delivery is left untouched.
  */
+/** Revoke an exact delegated row rather than making rejected sends retryable. */
+export async function cancelInboxInput(
+	narratorId: string,
+	id: string,
+	error: unknown,
+): Promise<void> {
+	const port = getRuntimeQueuePort();
+	const current = port
+		? await port.mailbox.getById(id)
+		: db
+				.select()
+				.from(mailbox)
+				.where(and(eq(mailbox.id, id), eq(mailbox.narratorId, narratorId)))
+				.get();
+	if (
+		!current?.deliveryId ||
+		current.narratorId !== narratorId ||
+		current.state === "materialized" ||
+		current.state === "cancelled"
+	)
+		return;
+	if (current.state === "claimed") {
+		if (port) await port.mailbox.cancelClaim(inboxClaim(current), String(error));
+		else runtimeInbox.cancelClaim(inboxClaim(current), String(error));
+	} else {
+		if (port) await port.mailbox.cancel(current.deliveryId, String(error));
+		else runtimeInbox.cancel(current.deliveryId, String(error));
+	}
+}
+
 export async function releaseInboxClaim(row: RuntimeMailboxRow, error: unknown): Promise<void> {
 	if (!row.deliveryId) return;
 	const port = getRuntimeQueuePort();
@@ -902,6 +937,7 @@ export async function materializeClaimedInboxUserMessage(input: {
 	commandText?: string | null;
 	createdBy?: string | null;
 	origin?: import("@shared/message-origin").MessageOriginOptions;
+	signal?: AbortSignal;
 	parentToolUseId?: string | null;
 }): Promise<MaterializedInboxUserMessage> {
 	const refsPort = getNarratorMessageRefsPort();
@@ -932,10 +968,18 @@ export async function materializeClaimedInboxUserMessage(input: {
 		createdAt,
 	};
 	const placed = capturePlacedRef();
-	const row = await queue.mailbox.materialize(
-		input.claim,
-		createPgPlacedMessageMaterializer(message, { onPersist: placed.hook }),
-	);
+	const materializer = createPgPlacedMessageMaterializer(message, { onPersist: placed.hook });
+	const row = await queue.mailbox.materialize(input.claim, async (tx, claimedRow) => {
+		const durableOrigin =
+			inboxMetadata<{ origin?: MessageOriginOptions }>(claimedRow).origin ?? input.origin;
+		await authorizeStewardMessage(input.narratorId, input.createdBy, durableOrigin, input.signal);
+		input.signal?.throwIfAborted();
+		const binding = await materializer(tx, claimedRow);
+		// Throw inside the transaction, never acknowledge CANCELLED after committing a row.
+		await authorizeStewardMessage(input.narratorId, input.createdBy, durableOrigin, input.signal);
+		input.signal?.throwIfAborted();
+		return binding;
+	});
 	if (placed.captured.refId === undefined || placed.captured.seq === undefined)
 		throw new Error("Mailbox materialize committed without a recipient ref");
 	let creator: MaterializedInboxUserMessage["creator"] = null;
@@ -1000,8 +1044,28 @@ export async function persistClaimedUserInput(input: {
 	commandText?: string | null;
 	createdBy?: string | null;
 	origin?: MessageOriginOptions;
+	signal?: AbortSignal;
 	parentToolUseId?: string | null;
 }): Promise<ClaimedUserInputMessage> {
+	const queue = getRuntimeQueuePort();
+	const durable = queue
+		? await queue.mailbox.getById(input.claim.id)
+		: db
+				.select()
+				.from(mailbox)
+				.where(and(eq(mailbox.id, input.claim.id), eq(mailbox.narratorId, input.narratorId)))
+				.get();
+	const durableOrigin = durable
+		? inboxMetadata<{ origin?: MessageOriginOptions }>(durable).origin
+		: undefined;
+	input.origin = durableOrigin ?? input.origin;
+	try {
+		await authorizeStewardMessage(input.narratorId, input.createdBy, input.origin, input.signal);
+	} catch (error) {
+		if (isStewardMessage(input.origin) || input.signal?.aborted)
+			await cancelInboxInput(input.narratorId, input.claim.id, error);
+		throw error;
+	}
 	const toClaimedUserInputMessage = (message: {
 		id: string;
 		narratorId: string;
@@ -1033,24 +1097,36 @@ export async function persistClaimedUserInput(input: {
 		creator: message.creator,
 		...(message.mailbox ? { mailbox: message.mailbox } : {}),
 	});
-	if (getRuntimeQueuePort()) {
-		const materialized = await materializeClaimedInboxUserMessage(input);
-		return toClaimedUserInputMessage(materialized);
+	try {
+		if (getRuntimeQueuePort()) {
+			const materialized = await materializeClaimedInboxUserMessage(input);
+			return toClaimedUserInputMessage(materialized);
+		}
+		const { narratorService } = await import("../narrator-service");
+		const persisted = await narratorService.persistUserMessage(
+			input.narratorId,
+			input.text,
+			input.contentBlocks,
+			input.commandText,
+			input.createdBy,
+			input.origin,
+			{
+				mailboxClaim: input.claim,
+				beforeCommit: () =>
+					authorizeStewardMessage(input.narratorId, input.createdBy, input.origin, input.signal),
+				onPersist: () => {
+					guardStewardMessageCommit(input.origin, input.signal);
+					return undefined;
+				},
+				...(input.parentToolUseId === undefined ? {} : { parentToolUseId: input.parentToolUseId }),
+			},
+		);
+		return toClaimedUserInputMessage(persisted);
+	} catch (error) {
+		if (isStewardMessage(input.origin) || input.signal?.aborted)
+			await cancelInboxInput(input.narratorId, input.claim.id, error);
+		throw error;
 	}
-	const { narratorService } = await import("../narrator-service");
-	const persisted = await narratorService.persistUserMessage(
-		input.narratorId,
-		input.text,
-		input.contentBlocks,
-		input.commandText,
-		input.createdBy,
-		input.origin,
-		{
-			mailboxClaim: input.claim,
-			...(input.parentToolUseId === undefined ? {} : { parentToolUseId: input.parentToolUseId }),
-		},
-	);
-	return toClaimedUserInputMessage(persisted);
 }
 
 const startupRecovery = hotSafe("narrafork.runtime-inbox-startup-recovery", () => ({

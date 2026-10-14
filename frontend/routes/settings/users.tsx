@@ -24,6 +24,7 @@ import { UserAclModal } from "../../components/knowledge/UserAclModal";
 import { CreateUserModal } from "../../components/settings/CreateUserModal";
 import { RegistrationCodesSection } from "../../components/settings/RegistrationCodesSection";
 import { useCurrentUser } from "../../hooks/useAuth";
+import { useUserPreferences } from "../../hooks/useUserPreferences";
 import { api } from "../../lib/api";
 import { formatLocaleDate } from "../../lib/intl-format";
 
@@ -68,6 +69,24 @@ function SettingsUsersPage() {
 	const updateAdminSettings = useMutation({
 		mutationFn: api.updateAdminSettings,
 		onSuccess: () => qc.invalidateQueries({ queryKey: ["admin", "settings"] }),
+	});
+
+	/**
+	 * The admin's narrator-listing preference (see `showAllNarrators` on `user_preferences`).
+	 *
+	 * A PERSONAL preference, not an instance setting, so it lives on `/user-preferences`
+	 * rather than `/admin/settings` — two admins may want different answers.
+	 */
+	const { data: prefs, isLoading: prefsLoading } = useUserPreferences();
+	const updateNarratorVisibility = useMutation({
+		mutationFn: api.updateUserPreferences,
+		onSuccess: () => {
+			// Every surface that lists narrators was filtered by the OLD value, so each one is
+			// stale after a flip — the sidebar's recent tabs included.
+			for (const key of [["narrators"], ["user-preferences"], ["dashboard"]]) {
+				qc.invalidateQueries({ queryKey: key });
+			}
+		},
 	});
 
 	const updateUser = useMutation({
@@ -125,6 +144,23 @@ function SettingsUsersPage() {
 			</Paper>
 
 			<RegistrationCodesSection />
+
+			{user?.role === "admin" ? (
+				<Paper withBorder p="md">
+					<Stack>
+						<Title order={4}>{t("narratorVisibilitySettings")}</Title>
+						<Switch
+							label={t("showAllNarrators")}
+							description={t("showAllNarratorsDescription")}
+							checked={prefs?.showAllNarrators === true}
+							disabled={prefsLoading || updateNarratorVisibility.isPending}
+							onChange={(e) =>
+								updateNarratorVisibility.mutate({ showAllNarrators: e.currentTarget.checked })
+							}
+						/>
+					</Stack>
+				</Paper>
+			) : null}
 
 			<Paper withBorder p="md">
 				<Stack>

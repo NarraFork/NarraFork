@@ -653,6 +653,17 @@ export class PluginPackageStore {
 		return safeJoin(this.paths.packages, pluginId, version, hash);
 	}
 
+	/** Host trust check: content digest is independent of the archive container bytes. */
+	async verifyPackageIntegrity(pluginId: string, version: string, hash: string): Promise<boolean> {
+		try {
+			const packageRoot = this.packagePath(pluginId, version, hash);
+			await assertNoSymlinkTree(packageRoot, this.limits);
+			return (await computePackageHash(packageRoot, this.limits)) === hash;
+		} catch {
+			return false;
+		}
+	}
+
 	async readCurrent(): Promise<CurrentPointerFile> {
 		return readPluginCurrentPointer(this.paths.root);
 	}

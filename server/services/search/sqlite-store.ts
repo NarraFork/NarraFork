@@ -35,7 +35,12 @@
  */
 
 import { ValidationError } from "../../lib/errors";
-import { narratorReadableSqlFragment } from "../narrator-acl";
+import {
+	type NarratorListGate,
+	narratorListGateFor,
+	narratorReadableSqlFragment,
+	narratorUnlistedPrivateSqlFragment,
+} from "../narrator-acl";
 import { projectReadableSqlFragment } from "../project-acl";
 import type { SearchStore } from "./port";
 import {
@@ -84,8 +89,29 @@ import {
  */
 const NARRATOR_GATE_SQL = narratorReadableSqlFragment(false, "n")?.sql ?? "1 = 1";
 const NARRATOR_GATE_PARAMS = (NARRATOR_GATE_SQL.match(/\?/g) ?? []).length;
+// The third mode: an admin who opted out of other people's private narrators. Prepared as
+// its own clause so the statement cache can hold all three variants; the preference is a
+// per-user setting, so it cannot be folded into the viewer-less `false` fragment above.
+const NARRATOR_UNLISTED_PRIVATE_SQL = narratorUnlistedPrivateSqlFragment("n").sql;
+const NARRATOR_UNLISTED_PRIVATE_PARAMS = (NARRATOR_UNLISTED_PRIVATE_SQL.match(/\?/g) ?? []).length;
 const PROJECT_GATE_SQL = projectReadableSqlFragment(false, "p")?.sql ?? "1 = 1";
 const PROJECT_GATE_PARAMS = (PROJECT_GATE_SQL.match(/\?/g) ?? []).length;
+
+/**
+ * The `AND <gate>` fragment for a narrator-bearing search, plus its bind count.
+ * Chapters are NOT passed through here: the preference is about narrators, and a chapter
+ * has no per-user visibility, so chapter search keeps the plain admin/not-admin split.
+ */
+function narratorGateClause(gate: NarratorListGate): { sql: string; params: number } {
+	if (gate === "none") return { sql: "", params: 0 };
+	if (gate === "adminHidden") {
+		return {
+			sql: `AND ${NARRATOR_UNLISTED_PRIVATE_SQL}`,
+			params: NARRATOR_UNLISTED_PRIVATE_PARAMS,
+		};
+	}
+	return { sql: `AND ${NARRATOR_GATE_SQL}`, params: NARRATOR_GATE_PARAMS };
+}
 
 /** The user id repeated once per placeholder in a gate clause. */
 function gateParams(userId: string, count: number): string[] {
@@ -168,60 +194,62 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 
 	function messageStmt(
 		strategy: "index" | "substring",
-		gated: boolean,
+		gate: NarratorListGate,
 		sort: EntitySearchQuery["sort"],
 	): QueryTemplate {
-		return cached(`messages:${strategy}:${sort ?? "relevance"}:${gated ? "gated" : "all"}`, () => {
-			const gate = gated ? `AND ${NARRATOR_GATE_SQL}` : "";
+		return cached(`messages:${strategy}:${sort ?? "relevance"}:${gate}`, () => {
+			const { sql: gateSql } = narratorGateClause(gate);
+			const gateClause = gateSql ? ` ${gateSql}` : "";
 			if (strategy === "index") {
 				return `SELECT ${MESSAGE_COLUMNS},
-			  ${snippetCall("narrator_messages_fts", 0, GLOBAL_SNIPPET)} as snippet,
-			  rank as rank_score
-			 FROM narrator_messages_fts
-			 JOIN narrator_messages m ON m.rowid = narrator_messages_fts.rowid
-			 JOIN narrators n ON n.id = m.narrator_id
-			 LEFT JOIN chapters c ON c.id = n.chapter_id
-			 LEFT JOIN projects p ON p.id = c.project_id
-			 WHERE narrator_messages_fts MATCH ? ${gate}
-			 ORDER BY ${sort === "time" ? "m.created_at DESC, m.id ASC" : "rank"} LIMIT ?`;
+				  ${snippetCall("narrator_messages_fts", 0, GLOBAL_SNIPPET)} as snippet,
+				  rank as rank_score
+				 FROM narrator_messages_fts
+				 JOIN narrator_messages m ON m.rowid = narrator_messages_fts.rowid
+				 JOIN narrators n ON n.id = m.narrator_id
+				 LEFT JOIN chapters c ON c.id = n.chapter_id
+				 LEFT JOIN projects p ON p.id = c.project_id
+				 WHERE narrator_messages_fts MATCH ?${gateClause}
+				 ORDER BY ${sort === "time" ? "m.created_at DESC, m.id ASC" : "rank"} LIMIT ?`;
 			}
 			return `SELECT ${MESSAGE_COLUMNS},
-			  substr(m.content_text, 1, ${PREVIEW_CHARS}) as snippet
-			 FROM narrator_messages m
-			 JOIN narrators n ON n.id = m.narrator_id
-			 LEFT JOIN chapters c ON c.id = n.chapter_id
-			 LEFT JOIN projects p ON p.id = c.project_id
-			 WHERE m.content_text LIKE ? ${gate}
-			 ${sort === "time" ? "ORDER BY m.created_at DESC, m.id ASC" : ""} LIMIT ?`;
+				  substr(m.content_text, 1, ${PREVIEW_CHARS}) as snippet
+				 FROM narrator_messages m
+				 JOIN narrators n ON n.id = m.narrator_id
+				 LEFT JOIN chapters c ON c.id = n.chapter_id
+				 LEFT JOIN projects p ON p.id = c.project_id
+				 WHERE m.content_text LIKE ?${gateClause}
+				 ${sort === "time" ? "ORDER BY m.created_at DESC, m.id ASC" : ""} LIMIT ?`;
 		});
 	}
 
 	function narratorStmt(
 		strategy: "index" | "substring",
-		gated: boolean,
+		gate: NarratorListGate,
 		sort: EntitySearchQuery["sort"],
 	): QueryTemplate {
-		return cached(`narrators:${strategy}:${sort ?? "relevance"}:${gated ? "gated" : "all"}`, () => {
-			const gate = gated ? `AND ${NARRATOR_GATE_SQL}` : "";
+		return cached(`narrators:${strategy}:${sort ?? "relevance"}:${gate}`, () => {
+			const { sql: gateSql } = narratorGateClause(gate);
+			const gateClause = gateSql ? ` ${gateSql}` : "";
 			if (strategy === "index") {
 				return `SELECT ${NARRATOR_COLUMNS},
-			  ${snippetCall("narrators_fts", 0, GLOBAL_SNIPPET)} as snippet,
-			  rank as rank_score
-			 FROM narrators_fts
-			 JOIN narrators n ON n.rowid = narrators_fts.rowid
-			 LEFT JOIN chapters c ON c.id = n.chapter_id
-			 LEFT JOIN projects p ON p.id = c.project_id
-			 WHERE narrators_fts MATCH ? ${gate}
-			 ORDER BY ${sort === "time" ? "COALESCE(n.updated_at, n.created_at, n.last_message_at) DESC, n.id ASC" : "rank"} LIMIT ?`;
+				  ${snippetCall("narrators_fts", 0, GLOBAL_SNIPPET)} as snippet,
+				  rank as rank_score
+				 FROM narrators_fts
+				 JOIN narrators n ON n.rowid = narrators_fts.rowid
+				 LEFT JOIN chapters c ON c.id = n.chapter_id
+				 LEFT JOIN projects p ON p.id = c.project_id
+				 WHERE narrators_fts MATCH ?${gateClause}
+				 ORDER BY ${sort === "time" ? "COALESCE(n.updated_at, n.created_at, n.last_message_at) DESC, n.id ASC" : "rank"} LIMIT ?`;
 			}
 			// No snippet column at all on this path: the caller falls back to the title, which is
 			// the only text this search matches against.
 			return `SELECT ${NARRATOR_COLUMNS}
-			 FROM narrators n
-			 LEFT JOIN chapters c ON c.id = n.chapter_id
-			 LEFT JOIN projects p ON p.id = c.project_id
-			 WHERE n.title LIKE ? ${gate}
-			 ${sort === "time" ? "ORDER BY COALESCE(n.updated_at, n.created_at, n.last_message_at) DESC, n.id ASC" : ""} LIMIT ?`;
+				 FROM narrators n
+				 LEFT JOIN chapters c ON c.id = n.chapter_id
+				 LEFT JOIN projects p ON p.id = c.project_id
+				 WHERE n.title LIKE ?${gateClause}
+				 ${sort === "time" ? "ORDER BY COALESCE(n.updated_at, n.created_at, n.last_message_at) DESC, n.id ASC" : ""} LIMIT ?`;
 		});
 	}
 
@@ -481,12 +509,13 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 		},
 
 		async searchMessages(query: EntitySearchQuery): Promise<MessageSearchRow[]> {
-			const gated = !query.viewer.isAdmin;
-			const stmt = messageStmt(query.strategy, gated, query.sort);
+			const gateMode = narratorListGateFor(query.viewer);
+			const stmt = messageStmt(query.strategy, gateMode, query.sort);
 			const options = { signal: query.signal, operation: "searchMessages" };
-			const gate = gated ? gateParams(query.viewer.userId, NARRATOR_GATE_PARAMS) : [];
+			const clause = narratorGateClause(gateMode);
+			const params = clause.params > 0 ? gateParams(query.viewer.userId, clause.params) : [];
 			const needle = query.strategy === "index" ? phraseExpr(query.text) : rawContains(query.text);
-			const rows: RawRow[] = await stmt.all(options, needle, ...gate, query.limit);
+			const rows: RawRow[] = await stmt.all(options, needle, ...params, query.limit);
 			return rows.map((row) => ({
 				id: row.id,
 				narratorId: row.narrator_id ?? null,
@@ -504,12 +533,13 @@ export function createSqliteSearchStore(execute: SearchQueryExecutor): SearchSto
 		},
 
 		async searchNarrators(query: EntitySearchQuery): Promise<NarratorSearchRow[]> {
-			const gated = !query.viewer.isAdmin;
-			const stmt = narratorStmt(query.strategy, gated, query.sort);
+			const gateMode = narratorListGateFor(query.viewer);
+			const stmt = narratorStmt(query.strategy, gateMode, query.sort);
 			const options = { signal: query.signal, operation: "searchNarrators" };
-			const gate = gated ? gateParams(query.viewer.userId, NARRATOR_GATE_PARAMS) : [];
+			const clause = narratorGateClause(gateMode);
+			const params = clause.params > 0 ? gateParams(query.viewer.userId, clause.params) : [];
 			const needle = query.strategy === "index" ? phraseExpr(query.text) : rawContains(query.text);
-			const rows: RawRow[] = await stmt.all(options, needle, ...gate, query.limit);
+			const rows: RawRow[] = await stmt.all(options, needle, ...params, query.limit);
 			return rows.map((row) => ({
 				id: row.id,
 				title: row.title ?? null,

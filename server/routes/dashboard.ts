@@ -9,7 +9,7 @@ import {
 	scheduledTasks,
 	terminals,
 } from "../db/schema";
-import { narratorPrincipalOf } from "../lib/narrator-access";
+import { narratorListPrincipalOf } from "../lib/narrator-access";
 import { projectPrincipalOf } from "../lib/project-access";
 import { narratorReadableWhere } from "../services/narrator-acl";
 import { narratorService } from "../services/narrator-service";
@@ -47,7 +47,7 @@ dashboardRoutes.get("/summary", async (c) => {
 	const narratorBaseCondition = and(
 		eq(narrators.variant, "primary"),
 		ne(narrators.status, "archived"),
-		narratorReadableWhere(narratorPrincipalOf(c)),
+		narratorReadableWhere(await narratorListPrincipalOf(c)),
 	);
 
 	const [workingResult] = await db

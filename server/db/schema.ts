@@ -2201,6 +2201,21 @@ export const userPreferences = sqliteTable("user_preferences", {
 	recentTabsGroupMode: text("recent_tabs_group_mode", { enum: ["flat", "directory"] })
 		.notNull()
 		.default("flat"),
+	/**
+	 * Admin-only LISTING switch: whether this admin's narrator lists include
+	 * narrators other people set to `private`.
+	 *
+	 * Defaults to false, so an admin sees their own private narrators plus
+	 * everyone's `project`/`public` ones, and must opt in to see the rest. This is
+	 * deliberately NOT an access rule: `canReadNarrator` still admits admins
+	 * unconditionally, because opening a narrator is how they manage its grants.
+	 * The flag only narrows what the list predicates SELECT, so a narrator hidden
+	 * from a list is still reachable by direct link.
+	 *
+	 * Meaningless for non-admins: the list predicates consult it only when
+	 * `isAdmin` is true, so a non-admin row cannot widen its own view by flipping it.
+	 */
+	showAllNarrators: integer("show_all_narrators", { mode: "boolean" }).notNull().default(false),
 	// Notification preferences
 	notifyOnDone: integer("notify_on_done", { mode: "boolean" }).notNull().default(true),
 	notifyOnWaiting: integer("notify_on_waiting", { mode: "boolean" }).notNull().default(true),

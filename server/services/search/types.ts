@@ -30,6 +30,15 @@
 export interface SearchViewer {
 	userId: string;
 	isAdmin: boolean;
+	/**
+	 * Admin-only listing preference: whether this admin's narrator/message hits include
+	 * narrators other people set to `private`.
+	 *
+	 * `undefined` ≡ `true`, i.e. today's behaviour where an admin sees everything. Only
+	 * consulted for admins, and only by the narrator/message gates — chapter search has no
+	 * per-user visibility to narrow.
+	 */
+	showAllNarrators?: boolean;
 }
 
 /**

@@ -36,6 +36,7 @@ import {
 	type NarratorPrincipal,
 	resolveAclRootId,
 } from "./narrator-acl";
+import { pruneUnreadableNarratorTabs } from "./recent-tabs-service";
 
 export interface NarratorGrantView {
 	id: string;
@@ -625,6 +626,20 @@ async function announceAccessChange(
 			logger.warn("Subagent subscription sweep hit its cap; some may lag one check", {
 				narratorId,
 				limit: SUBAGENT_SUBSCRIPTION_SWEEP_LIMIT,
+			});
+		}
+		// Recent tabs are persisted server-side, so a tightening would otherwise leave every
+		// other holder staring at a tab that 404s when clicked. Cosmetic like the project
+		// equivalent (`pruneProjectTabsFor`): the gate already refuses the resource, so a
+		// failure here must not roll back a completed change — hence the try/catch, which
+		// keeps it independent of the broadcast above.
+		try {
+			await pruneUnreadableNarratorTabs(narratorId);
+		} catch (err) {
+			logger.warn("Failed to prune recent tabs after narrator access change", {
+				narratorId,
+				reason,
+				error: String(err),
 			});
 		}
 	} catch (err) {

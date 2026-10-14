@@ -2009,7 +2009,9 @@
 		"role_system": "System",
 		"jumpUnavailable": "Expand this chapter's node on the canvas to jump to a message."
 	},
+	"privateNarrator": "Private session: only the owner and the people it is shared with",
 	"access": {
+		"settingsTitle": "Narrator settings",
 		"visibilityTitle": "Who can see this session",
 		"visibilityPrivate": "Only me",
 		"visibilityProject": "Project",

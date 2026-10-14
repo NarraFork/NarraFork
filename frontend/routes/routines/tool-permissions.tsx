@@ -61,6 +61,8 @@ const BUILTIN_TOOLS: ToolMeta[] = [
 	{ name: "Skill", descKey: "tpToolDescSkill", category: "always-allow" },
 	{ name: "Await", descKey: "tpToolDescAwait", category: "always-allow" },
 	{ name: "Send", descKey: "tpToolDescSend", category: "default" },
+	{ name: "NarratorList", descKey: "tpToolDescNarratorList", category: "read-only" },
+	{ name: "NarratorSend", descKey: "tpToolDescNarratorSend", category: "default" },
 	{ name: "ShareFile", descKey: "tpToolDescShareFile", category: "optional" },
 	{ name: "Notification", descKey: "tpToolDescNotification", category: "optional" },
 	{ name: "Terminal", descKey: "tpToolDescTerminal", category: "optional" },

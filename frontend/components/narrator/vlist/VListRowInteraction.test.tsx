@@ -396,6 +396,22 @@ describe("VListRowInteraction — Bash detachment", () => {
 	});
 });
 
+describe("VListRowInteraction — independent narrator recipients", () => {
+	test("the session menu uses NarratorSend's narrator handler and offers no lifecycle actions", async () => {
+		const seen: string[] = [];
+		await renderRow({
+			toolMeta: { toolName: "NarratorSend", sendTargetNarratorId: "peer" },
+			handlers: { ...ALL_HANDLERS, onViewNarratorSession: (id) => seen.push(id) },
+		});
+		expect(menuLabels()).toContain("viewSubagentSession");
+		expect(menuLabels()).not.toContain("detachToBackground");
+		expect(menuLabels()).not.toContain("backgroundTasks.cancel");
+		clickMenuItem("viewSubagentSession");
+		expect(seen).toEqual(["peer"]);
+		expect(closeSwipeMock).toHaveBeenCalled();
+	});
+});
+
 describe("VListRowInteraction — subagent card items", () => {
 	test("offers open-session and detach for a live foreground subagent", async () => {
 		await renderRow({

@@ -1,0 +1,135 @@
+{
+	"schemaVersion": 1,
+	"pluginId": "steward-narrator",
+	"version": "0.2.0",
+	"displayName": "管家叙述者",
+	"description": "将当前叙述者绑定为自己的管家，代发消息始终由宿主验证当前用户的访问权限。",
+	"publisher": { "id": "narrafork", "name": "NarraFork" },
+	"license": "Apache-2.0",
+	"engine": {
+		"runtime": "bun",
+		"runtimeVersion": ">=1.2 <2",
+		"hostApi": ">=1.0 <2",
+		"rpc": "narrafork.rpc/1",
+		"features": ["host_api.requests"],
+		"os": ["linux", "darwin", "win32"],
+		"arch": ["x64", "arm64"],
+		"runner": "local-process"
+	},
+	"server": {
+		"entry": "server/index.js",
+		"transport": "stdio",
+		"protocol": "narrafork.rpc/1",
+		"workingDirectory": "package"
+	},
+	"ui": {
+		"entry": "ui/panel.iife.js",
+		"format": "iife",
+		"style": "ui/panel.css",
+		"shell": "host-controlled"
+	},
+	"activationEvents": [
+		"onView:steward-panel",
+		"onCommand:steward.bind",
+		"onCommand:steward.binding",
+		"onCommand:steward.recipients",
+		"onCommand:steward.panelSend",
+		"onTool:steward.send"
+	],
+	"contributes": {
+		"providers": [],
+		"tools": [
+			{
+				"id": "steward.send",
+				"title": "管家代发消息",
+				"description": "代表当前用户向指定叙述者发送一条消息。仅绑定的管家可以使用；宿主每次验证绑定、用户归属与目标 ACL，并记录代发来源和审计。",
+				"inputSchema": {
+					"type": "object",
+					"properties": {
+						"targetNarratorId": { "type": "string", "minLength": 1, "maxLength": 128 },
+						"message": { "type": "string", "minLength": 1, "maxLength": 16000 }
+					},
+					"required": ["targetNarratorId", "message"],
+					"additionalProperties": false
+				},
+				"execution": "host",
+				"allowBackground": false
+			}
+		],
+		"commands": [
+			{
+				"id": "steward.bind",
+				"title": "将当前叙述者设为管家",
+				"handler": "host",
+				"inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
+			},
+			{
+				"id": "steward.binding",
+				"title": "读取当前用户的管家绑定",
+				"handler": "host",
+				"inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
+			},
+			{
+				"id": "steward.recipients",
+				"title": "列出当前用户可读叙述者",
+				"handler": "host",
+				"inputSchema": {
+					"type": "object",
+					"properties": {
+						"limit": { "type": "integer", "minimum": 1, "maximum": 100 },
+						"cursor": {
+							"type": "object",
+							"properties": {
+								"updatedAt": { "type": "string", "format": "date-time" },
+								"id": { "type": "string", "minLength": 1, "maxLength": 128 }
+							},
+							"required": ["updatedAt", "id"],
+							"additionalProperties": false
+						}
+					},
+					"additionalProperties": false
+				}
+			},
+			{
+				"id": "steward.panelSend",
+				"title": "由管家宿主安全发送消息",
+				"handler": "host",
+				"inputSchema": {
+					"type": "object",
+					"properties": {
+						"targetNarratorId": { "type": "string", "minLength": 1, "maxLength": 128 },
+						"message": { "type": "string", "minLength": 1, "maxLength": 16000 }
+					},
+					"required": ["targetNarratorId", "message"],
+					"additionalProperties": false
+				}
+			}
+		],
+		"events": [],
+		"views": [
+			{
+				"id": "steward-panel",
+				"title": "管家叙述者",
+				"entry": "ui/panel.iife.js",
+				"style": "ui/panel.css",
+				"surfaces": ["workspace"],
+				"scope": "narrator",
+				"instance": "singleton-per-narrator",
+				"defaultPosition": "side"
+			}
+		]
+	},
+	"permissions": {
+		"host": [
+			"ui.panel",
+			"storage.read_self",
+			"storage.write_self",
+			"command.narrator.send_message"
+		],
+		"network": { "mode": "none", "allow": [] },
+		"filesystem": { "package": "readOnly", "pluginData": "none", "workspace": "none" },
+		"process": { "spawn": "none" }
+	},
+	"secrets": [],
+	"dependencies": { "plugins": {}, "runtime": {} }
+}
