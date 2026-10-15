@@ -38,6 +38,7 @@ import { requireNarratorAccess } from "../lib/narrator-access";
 import { IS_LINUX, IS_MACOS, IS_WINDOWS } from "../lib/platform";
 import { settings } from "../lib/settings";
 import { fsWriteSchema } from "../lib/validators/fs";
+import { raiseExplorerWindowByTitle } from "../lib/win-foreground";
 import { readLegacyFilePanel } from "../services/editor-document-panel";
 import type { EditorActor } from "../services/editor-document-service";
 import { LocalFileValidationError } from "../services/file-change-local-io";
@@ -239,6 +240,16 @@ fsRoutes.post("/reveal", async (c) => {
 			resolve();
 		});
 	});
+
+	// Windows 上资源管理器不一定会把新窗口带到前台，出现后主动激活（见 win-foreground）。
+	if (IS_WINDOWS) {
+		try {
+			const activated = await raiseExplorerWindowByTitle(basename(absPath));
+			logger.info("fs/reveal foreground activation", { result: activated });
+		} catch (error) {
+			logger.warn("fs/reveal foreground activation failed", { error: String(error) });
+		}
+	}
 
 	return c.json({ ok: true });
 });
