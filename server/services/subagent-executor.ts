@@ -494,7 +494,11 @@ export const SUBAGENT_SILENT_DISCONNECT_ERROR = "Codex WebSocket silent disconne
 export function planSubagentInterruption(
 	result: Pick<
 		ExecuteLoopResult,
-		"interrupted" | "interruptedReason" | "shouldReplayInterruptedToolResultTurn"
+		| "interrupted"
+		| "interruptedReason"
+		| "shouldReplayInterruptedToolResultTurn"
+		| "hadToolUses"
+		| "finalText"
 	>,
 	previousRetries: number,
 ): SubagentInterruptionPlan {
