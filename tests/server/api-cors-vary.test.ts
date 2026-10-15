@@ -35,6 +35,13 @@ function buildApp(): Hono {
 	// Registered before `cors()` so it unwinds after it — the same order as `app.ts`.
 	app.use("/api/*", async (c, next) => {
 		await next();
+		if (
+			c.req.method === "OPTIONS" &&
+			c.req.header("Access-Control-Request-Private-Network") === "true" &&
+			c.res.headers.get("Access-Control-Allow-Origin")
+		) {
+			c.res.headers.set("Access-Control-Allow-Private-Network", "true");
+		}
 		const existing = c.res.headers.get("Vary") ?? "";
 		if (!/(^|,)\s*origin\s*(,|$)/i.test(existing)) {
 			c.res.headers.append("Vary", "Origin");
@@ -57,6 +64,7 @@ function buildApp(): Hono {
 				);
 			},
 			exposeHeaders: [SESSION_RENEWAL_HEADER],
+			maxAge: 600,
 		}),
 	);
 
@@ -115,5 +123,32 @@ describe("Vary: Origin", () => {
 		const fields = varyFields(response);
 		expect(fields.filter((field) => field === "origin")).toHaveLength(1);
 		expect(fields).toContain("access-control-request-headers");
+	});
+
+	test("allows a private-network preflight only for an origin that was already allowed", async () => {
+		const allowed = await app.request(`${SELF_ORIGIN}/api/health`, {
+			method: "OPTIONS",
+			headers: {
+				Origin: WEBVIEW_ORIGIN,
+				"Access-Control-Request-Method": "PATCH",
+				"Access-Control-Request-Headers": "authorization,content-type",
+				"Access-Control-Request-Private-Network": "true",
+			},
+		});
+		expect(allowed.status).toBe(204);
+		expect(allowed.headers.get("Access-Control-Allow-Origin")).toBe(WEBVIEW_ORIGIN);
+		expect(allowed.headers.get("Access-Control-Allow-Private-Network")).toBe("true");
+		expect(allowed.headers.get("Access-Control-Max-Age")).toBe("600");
+
+		const refused = await app.request(`${SELF_ORIGIN}/api/health`, {
+			method: "OPTIONS",
+			headers: {
+				Origin: "https://evil.example.com",
+				"Access-Control-Request-Method": "PATCH",
+				"Access-Control-Request-Private-Network": "true",
+			},
+		});
+		expect(refused.headers.get("Access-Control-Allow-Origin")).toBeNull();
+		expect(refused.headers.get("Access-Control-Allow-Private-Network")).toBeNull();
 	});
 });

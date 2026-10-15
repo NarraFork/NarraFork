@@ -398,6 +398,42 @@ describe("narrator foreground recovery", () => {
 		}
 	});
 
+	it("后台标签释放连接，回到前台才重连", async () => {
+		const harness = installBrowserHarness(true);
+		const manager = new NarratorWSManager({ ...FAST_TIMINGS, hiddenReleaseMs: 30 });
+
+		try {
+			manager.connect();
+			const firstSocket = FakeWebSocket.instances[0];
+			firstSocket.open();
+			expect(manager.connected).toBe(true);
+
+			harness.documentTarget.visibilityState = "hidden";
+			harness.documentTarget.dispatchEvent(new Event("visibilitychange"));
+			await Bun.sleep(10);
+			// A short hide still owns the socket. Alt-tab must not reconnect.
+			expect(firstSocket.readyState).toBe(FakeWebSocket.OPEN);
+			expect(FakeWebSocket.instances).toHaveLength(1);
+
+			await Bun.sleep(40);
+			expect(firstSocket.readyState).toBe(FakeWebSocket.CLOSED);
+			expect(FakeWebSocket.instances).toHaveLength(1);
+			expect(manager.connected).toBe(false);
+
+			// The close must not open a replacement while the tab stays hidden.
+			await Bun.sleep(20);
+			expect(FakeWebSocket.instances).toHaveLength(1);
+
+			harness.documentTarget.visibilityState = "visible";
+			harness.documentTarget.dispatchEvent(new Event("visibilitychange"));
+			await Bun.sleep(20);
+			expect(FakeWebSocket.instances).toHaveLength(2);
+		} finally {
+			manager.disconnect();
+			harness.restore();
+		}
+	});
+
 	it("离线时关闭半开连接并暂停重试，online 后立即恢复", () => {
 		const harness = installBrowserHarness(true);
 		const manager = new NarratorWSManager();

@@ -1216,6 +1216,7 @@
 	"pwaUpdating": "Updating...",
 	"unsavedSave": "Save Changes",
 	"unsavedDiscard": "Discard",
+	"saveRequestStalled": "The save stayed queued in this browser and never finished. Close other tabs of this site, then try again.",
 	"providersTitle": "AI Providers",
 	"providersTabPlatforms": "Platforms",
 	"providersTabCustom": "Custom Providers",

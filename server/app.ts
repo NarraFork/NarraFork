@@ -142,6 +142,19 @@ const SLOW_API_REQUEST_MS = 1_000;
  */
 app.use("/api/*", async (c, next) => {
 	await next();
+	// Chrome sends this on a private-network preflight and leaves the real
+	// request "Stalled" until the response allows it. Only an origin `cors()`
+	// already accepted gets the grant. This middleware is registered before
+	// `cors()` so the write happens after that middleware has set
+	// Access-Control-Allow-Origin; `cors()` does not call `next()` for OPTIONS,
+	// so a middleware registered after it never sees the preflight.
+	if (
+		c.req.method === "OPTIONS" &&
+		c.req.header("Access-Control-Request-Private-Network") === "true" &&
+		c.res.headers.get("Access-Control-Allow-Origin")
+	) {
+		c.res.headers.set("Access-Control-Allow-Private-Network", "true");
+	}
 	const existing = c.res.headers.get("Vary") ?? "";
 	if (!/(^|,)\s*origin\s*(,|$)/i.test(existing)) {
 		c.res.headers.append("Vary", "Origin");
@@ -185,6 +198,10 @@ app.use(
 			"X-Session-Warnings",
 			"X-Session-Path",
 		],
+		// A successful preflight is reusable. Without this, every settings PATCH
+		// sends a fresh OPTIONS, and that OPTIONS competes for the same six
+		// per-host connections as the request it is supposed to unblock.
+		maxAge: 600,
 	}),
 );
 

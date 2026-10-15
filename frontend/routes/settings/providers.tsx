@@ -67,6 +67,7 @@ import { api } from "../../lib/api";
 import type { ModelOption } from "../../lib/constants";
 import { replaceCurrentHistoryState } from "../../lib/history-entry";
 import { SAFE_AREA_INSET_BOTTOM } from "../../lib/safe-area";
+import { runSettingsSave } from "../../lib/settings-save";
 import { normalizeUrlProtocol } from "../../lib/url";
 
 export const Route = createFileRoute("/settings/providers")({
@@ -366,7 +367,8 @@ function SettingsProvidersPage() {
 
 	// ── Save / Discard ──
 	const updateMutation = useMutation({
-		mutationFn: api.updateSettings,
+		mutationFn: (data: Record<string, unknown>) =>
+			runSettingsSave((signal) => api.updateSettings(data, { signal }), t("saveRequestStalled")),
 		onSuccess: (data) => {
 			// Use setQueryData to synchronously update the cache instead of
 			// invalidateQueries which triggers cascading refetches across all
