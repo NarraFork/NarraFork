@@ -12,6 +12,7 @@
  */
 
 import { type Subprocess, spawn, spawnSync } from "bun";
+import { devAllBackendEnv } from "./lib/dev-app-url";
 
 const isWindows = process.platform === "win32";
 const isCold = process.argv.includes("--cold");
@@ -31,10 +32,7 @@ if (migrateCode !== 0) {
 const backendArgs = isCold
 	? ["bun", "server/index.ts"]
 	: ["bun", "run", "--hot", "server/index.ts"];
-const backendEnv = {
-	...process.env,
-	PORT: "7779",
-};
+const backendEnv = devAllBackendEnv(process.env);
 
 const backendProc = spawn(backendArgs, {
 	stdio: ["inherit", "inherit", "inherit"],

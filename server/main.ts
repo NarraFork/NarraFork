@@ -33,6 +33,7 @@ import { isTrustedProxyAddress, resolveClientIp } from "./lib/client-ip";
 import { getCodexManager } from "./lib/codex-manager";
 import { inspectApplicationDataDirectory } from "./lib/data-directory-security";
 import { shutdownDbWorkerPool } from "./lib/db-worker/pool";
+import { resolveAdvertisedAppUrl } from "./lib/dev-app-url";
 import { startEventLoopMonitor } from "./lib/event-loop-monitor";
 import { rebindHttpListener } from "./lib/http-listener-rebind";
 import { logger } from "./lib/logger";
@@ -1341,7 +1342,13 @@ async function openAsApp(url: string) {
 	const versionStr = GIT_COMMIT ? `v${APP_VERSION} (${GIT_COMMIT})` : `v${APP_VERSION}`;
 	const modeStr = isProd ? "production" : "development";
 	const proto = getProtocol();
-	const url = `${proto}://${currentHost === "0.0.0.0" ? "localhost" : currentHost}:${actualPort}`;
+	const listenUrl = `${proto}://${currentHost === "0.0.0.0" ? "localhost" : currentHost}:${actualPort}`;
+	// dev:all sets NARRAFORK_DEV_APP_URL to the Vite origin. This process is the API
+	// (7779); the banner and the browser open must send the user to the frontend.
+	const url = resolveAdvertisedAppUrl({
+		listenUrl,
+		devAppUrl: process.env.NARRAFORK_DEV_APP_URL,
+	});
 	console.log("");
 	console.log(`  \x1b[1m\x1b[38;5;105m⛏  NarraFork\x1b[0m ${versionStr}`);
 	console.log(`  \x1b[2m➜\x1b[0m  ${url}`);
