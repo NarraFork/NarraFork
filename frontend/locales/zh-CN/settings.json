@@ -1218,6 +1218,7 @@
 	"pwaUpdating": "更新中...",
 	"unsavedSave": "保存更改",
 	"unsavedDiscard": "放弃更改",
+	"saveRequestStalled": "保存请求停在这个浏览器的连接队列里，没有完成。请先关掉这个站点的其他标签页，再试一次。",
 	"providersTitle": "AI 供应商",
 	"providersTabPlatforms": "平台集成",
 	"providersTabCustom": "自定义供应商",

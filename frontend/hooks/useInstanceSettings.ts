@@ -22,6 +22,7 @@ import type {
 	DirectoryWhitelistRuleInput,
 } from "../lib/api/types";
 import { normalizeRuleTargetSelector } from "../lib/api/types";
+import { runSettingsSave } from "../lib/settings-save";
 import { DEFAULT_GITHUB_REPOSITORY, type UpdateSource } from "../lib/update-source";
 import { normalizeUrlProtocol } from "../lib/url";
 
@@ -261,7 +262,8 @@ export function useInstanceSettings(): UseInstanceSettingsReturn {
 	});
 	const qc = useQueryClient();
 	const updateSettings = useMutation({
-		mutationFn: api.updateSettings,
+		mutationFn: (data: Record<string, unknown>) =>
+			runSettingsSave((signal) => api.updateSettings(data, { signal }), t("saveRequestStalled")),
 		onSuccess: (data) => {
 			// Use setQueryData to synchronously update the cache instead of
 			// invalidateQueries which triggers cascading refetches.

@@ -8,6 +8,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getToken } from "../lib/api";
+import { HIDDEN_CONNECTION_RELEASE_MS, isDocumentHidden } from "../lib/browser-connection-budget";
 import { observePageLifecycle } from "../lib/page-lifecycle";
 import { buildWsUrl, safeCloseWs } from "../lib/ws";
 import { removeWSStatus, setWSStatus } from "../lib/ws-status";
@@ -74,6 +75,7 @@ class TerminalWSManager {
 	// --- Page lifecycle tracking ---
 	private _unobservePageLifecycle: (() => void) | null = null;
 	private _hiddenAt = 0;
+	private _hiddenReleaseTimer: ReturnType<typeof setTimeout> | undefined;
 
 	get connected() {
 		return this._connected;
@@ -87,6 +89,7 @@ class TerminalWSManager {
 		if (this.ws || this.disposed) return;
 
 		this._listenVisibility();
+		if (this._isDocumentHidden()) return;
 
 		const token = getToken();
 		if (!token) {
@@ -166,6 +169,7 @@ class TerminalWSManager {
 
 	private scheduleReconnect() {
 		if (this.disposed) return;
+		if (this._isDocumentHidden()) return;
 		if (this.reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
 			// Give up — server is likely down for good.
 			if (!this._disconnected) {
@@ -237,6 +241,7 @@ class TerminalWSManager {
 			// reads 0 and the threshold never triggers.
 			onHidden: () => {
 				if (!this._hiddenAt) this._hiddenAt = Date.now();
+				this._armHiddenConnectionRelease();
 			},
 			// Restored from the back/forward cache or resumed from a freeze: the socket
 			// is definitively gone even if it still reports OPEN. Reconnect
@@ -255,8 +260,32 @@ class TerminalWSManager {
 		this._unobservePageLifecycle = null;
 	}
 
+	private _isDocumentHidden(): boolean {
+		return typeof document !== "undefined" && isDocumentHidden(document.visibilityState);
+	}
+
+	private _armHiddenConnectionRelease(): void {
+		if (this._hiddenReleaseTimer !== undefined) return;
+		this._hiddenReleaseTimer = setTimeout(() => {
+			this._hiddenReleaseTimer = undefined;
+			if (this.disposed || !this._isDocumentHidden()) return;
+			clearTimeout(this.reconnectTimer);
+			this.reconnectTimer = undefined;
+			const ws = this.ws;
+			this.ws = null;
+			if (ws) safeCloseWs(ws);
+			this._connected = false;
+			this.notifyStatus();
+			this.syncGlobalStatus();
+		}, HIDDEN_CONNECTION_RELEASE_MS);
+	}
+
 	private _handleForeground(): void {
 		if (this.disposed) return;
+		if (!this._isDocumentHidden()) {
+			clearTimeout(this._hiddenReleaseTimer);
+			this._hiddenReleaseTimer = undefined;
+		}
 
 		const elapsed = this._hiddenAt ? Date.now() - this._hiddenAt : 0;
 		this._hiddenAt = 0;
@@ -402,6 +431,8 @@ class TerminalWSManager {
 
 	dispose() {
 		this.disposed = true;
+		clearTimeout(this._hiddenReleaseTimer);
+		this._hiddenReleaseTimer = undefined;
 		this.releaseConnection();
 		this.statusListeners.clear();
 	}

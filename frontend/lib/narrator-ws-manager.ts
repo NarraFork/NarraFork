@@ -17,6 +17,7 @@ import {
 	RECENT_TABS_WS_BATCH_SIZE,
 } from "@shared/recent-tabs";
 import { getToken } from "./api";
+import { HIDDEN_CONNECTION_RELEASE_MS, isDocumentHidden } from "./browser-connection-budget";
 import { observePageLifecycle } from "./page-lifecycle";
 import { dispatchTokenDanceRecovery } from "./tokendance-recovery";
 import { buildWsUrl, safeCloseWs } from "./ws";
@@ -396,11 +397,18 @@ export class NarratorWSManager {
 	 * Timings are injectable so tests can drive the recovery sequences without
 	 * waiting out the real coalesce/probe windows.
 	 */
-	constructor(opts?: { foregroundCoalesceMs?: number; syncProbeTimeoutMs?: number }) {
+	private hiddenReleaseMs: number;
+
+	constructor(opts?: {
+		foregroundCoalesceMs?: number;
+		syncProbeTimeoutMs?: number;
+		hiddenReleaseMs?: number;
+	}) {
 		this.foregroundRecovery = createNarratorForegroundRecoveryCoalescer(
 			opts?.foregroundCoalesceMs ?? FOREGROUND_RECOVERY_COALESCE_MS,
 		);
 		this.syncProbeTimeoutMs = opts?.syncProbeTimeoutMs ?? SYNC_PROBE_TIMEOUT_MS;
+		this.hiddenReleaseMs = opts?.hiddenReleaseMs ?? HIDDEN_CONNECTION_RELEASE_MS;
 	}
 
 	// --- Subscription ref-counting ---
@@ -485,10 +493,12 @@ export class NarratorWSManager {
 		this._unlistenNetwork();
 		clearTimeout(this.reconnectTimer);
 		clearTimeout(this.pingTimeoutTimer);
+		this._clearHiddenConnectionRelease();
 		this._clearSyncProbe();
 		this.foregroundRecovery.cancel();
 		this.reconnectTimer = undefined;
 		this.pingTimeoutTimer = undefined;
+		this._reconnectDeferredWhileHidden = false;
 		this._socketDiscarded = false;
 		this.pendingDispatchQueue = [];
 		this.dispatchScheduled = false;
@@ -1375,6 +1385,14 @@ export class NarratorWSManager {
 
 	private _doConnect(): void {
 		if (this.cancelled) return;
+		if (this._isDocumentHidden()) {
+			// A background tab must not open a replacement socket. That socket would
+			// take another of the six per-host connections and keep API calls stalled.
+			// Leave any current socket for the hide timer to release; closing it here
+			// would drop a connection that a short tab switch still needs.
+			this._reconnectDeferredWhileHidden = true;
+			return;
+		}
 		this.reconnectTimer = undefined;
 		this._clearSyncProbe();
 		// An error may have left the old socket without a close event. Retire it only
@@ -1579,6 +1597,10 @@ export class NarratorWSManager {
 
 	private _scheduleReconnect(): void {
 		if (this.cancelled || this.reconnectTimer !== undefined) return;
+		if (this._isDocumentHidden()) {
+			this._reconnectDeferredWhileHidden = true;
+			return;
+		}
 		if (this._isNetworkOffline()) {
 			this.networkOffline = true;
 			this._setConnected(false, false, true);
@@ -1765,6 +1787,12 @@ export class NarratorWSManager {
 
 	private _unobservePageLifecycle: (() => void) | null = null;
 	private _hiddenAt = 0;
+	private _hiddenReleaseTimer: ReturnType<typeof setTimeout> | undefined;
+	/**
+	 * The socket was closed, or a reconnect was skipped, because this tab is in
+	 * the background. Foreground recovery is what opens the next one.
+	 */
+	private _reconnectDeferredWhileHidden = false;
 	/** Set when the browser told us it discarded this page's connections. */
 	private _socketDiscarded = false;
 
@@ -1797,10 +1825,48 @@ export class NarratorWSManager {
 	 * for all subscribed narrators — this detects missed messages without
 	 * the overhead of a full reconnect.
 	 */
+	private _isDocumentHidden(): boolean {
+		return typeof document !== "undefined" && isDocumentHidden(document.visibilityState);
+	}
+
+	private _clearHiddenConnectionRelease(): void {
+		clearTimeout(this._hiddenReleaseTimer);
+		this._hiddenReleaseTimer = undefined;
+	}
+
+	private _armHiddenConnectionRelease(): void {
+		if (this._hiddenReleaseTimer !== undefined) return;
+		this._hiddenReleaseTimer = setTimeout(() => {
+			this._hiddenReleaseTimer = undefined;
+			if (this.cancelled || !this._isDocumentHidden()) return;
+			this._releaseConnectionWhileHidden();
+		}, this.hiddenReleaseMs);
+	}
+
+	/**
+	 * Drop the live socket without scheduling a replacement.
+	 *
+	 * `this.ws` is cleared first so the close handler's `this.ws !== ws` guard
+	 * ignores the close and cannot call `_scheduleReconnect`.
+	 */
+	private _releaseConnectionWhileHidden(): void {
+		this._reconnectDeferredWhileHidden = true;
+		clearTimeout(this.reconnectTimer);
+		this.reconnectTimer = undefined;
+		clearTimeout(this.pingTimeoutTimer);
+		this.pingTimeoutTimer = undefined;
+		this._clearSyncProbe();
+		const ws = this.ws;
+		this.ws = null;
+		if (ws) safeCloseWs(ws);
+		if (this._connected) this._setConnected(false, false);
+	}
+
 	private _handlePageHidden(info: { persisted: boolean }): void {
 		if (this.cancelled) return;
 		if (!this._hiddenAt) this._hiddenAt = Date.now();
 		this.foregroundRecovery.cancel();
+		this._armHiddenConnectionRelease();
 		if (!info.persisted) return;
 
 		// The page is entering the back/forward cache or being frozen: this socket
@@ -1829,6 +1895,7 @@ export class NarratorWSManager {
 
 	private _handleForeground(): void {
 		if (this.cancelled) return;
+		if (!this._isDocumentHidden()) this._clearHiddenConnectionRelease();
 
 		// `visibilitychange`, `focus`, `pageshow` and `resume` commonly fire together
 		// when a frozen tab resumes. Coalesce them so one foreground transition
@@ -1837,7 +1904,11 @@ export class NarratorWSManager {
 			if (this.cancelled) return;
 			// A discarded connection must be rebuilt regardless of what the document
 			// currently reports; the flag survives until it is consumed.
-			if (!this._socketDiscarded && document.visibilityState !== "visible") return;
+			if (!this._socketDiscarded && document.visibilityState !== "visible") {
+				if (this._isDocumentHidden()) this._armHiddenConnectionRelease();
+				return;
+			}
+			this._clearHiddenConnectionRelease();
 			this._recoverForeground();
 		});
 	}
@@ -1845,7 +1916,9 @@ export class NarratorWSManager {
 	private _recoverForeground(): void {
 		const elapsed = this._hiddenAt ? Date.now() - this._hiddenAt : 0;
 		this._hiddenAt = 0;
-		const socketDiscarded = this._socketDiscarded;
+		const deferredWhileHidden = this._reconnectDeferredWhileHidden;
+		this._reconnectDeferredWhileHidden = false;
+		const socketDiscarded = this._socketDiscarded || deferredWhileHidden;
 		this._socketDiscarded = false;
 		const socketState: NarratorForegroundSocketState = !this.ws
 			? "missing"
