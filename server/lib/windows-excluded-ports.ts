@@ -152,7 +152,7 @@ function runNetsh(): string | null {
 	try {
 		const result = Bun.spawnSync(
 			["netsh", "interface", "ipv4", "show", "excludedportrange", "protocol=tcp"],
-			{ stdout: "pipe", stderr: "ignore", timeout: NETSH_TIMEOUT_MS },
+			{ stdout: "pipe", stderr: "ignore", timeout: NETSH_TIMEOUT_MS, windowsHide: true },
 		);
 		// Also covers the timeout case: a killed child reports a null exit code.
 		if (result.exitCode !== 0) return null;

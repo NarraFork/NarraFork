@@ -27,7 +27,16 @@ const requireAdmin: MiddlewareHandler = async (c, next) => {
 	if (role !== "admin") return c.json({ error: "Forbidden" }, 403);
 	await next();
 };
-mock.module("../../middleware/auth", () => ({ requireAuth, requireAdmin }));
+const requireAdminOrManagerToken: MiddlewareHandler = async (c, next) => {
+	if (!role) return c.json({ error: "Unauthenticated" }, 401);
+	if (role !== "admin") return c.json({ error: "Forbidden" }, 403);
+	await next();
+};
+mock.module("../../middleware/auth", () => ({
+	requireAuth,
+	requireAdmin,
+	requireAdminOrManagerToken,
+}));
 mock.module("../../services/update-service", () => ({
 	getUpdateNotes: async () => ({ notes: null }),
 	applyUpdate: async (options: { targetVersion?: string; preparedId?: string }) => {
@@ -64,8 +73,10 @@ mock.module("../../services/update-service", () => ({
 	isUpdateSourceCurrent: () => true,
 	shutdownForManualUpdate: () => ({ success: false }),
 }));
-const { updateRoutes } = await import("../update");
-const app = new Hono().route("/update", updateRoutes);
+const { localPeerUpdateRoutes, updateRoutes } = await import("../update");
+const app = new Hono();
+app.route("/update", localPeerUpdateRoutes);
+app.route("/update", updateRoutes);
 const post = (body: unknown, headers?: Record<string, string>) =>
 	app.request("/update/apply", {
 		method: "POST",

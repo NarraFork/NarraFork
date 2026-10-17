@@ -144,12 +144,14 @@ export function recoverWithCli(dbPath: string): boolean {
 			execSync(`sqlite3 "${dbPath}" ".recover" > "${sqlDumpPath}"`, {
 				timeout: 60_000,
 				stdio: "pipe",
+				windowsHide: true,
 			});
 		} catch {
 			logger.warn("sqlite3 .recover failed, trying .dump");
 			execSync(`sqlite3 "${dbPath}" ".dump" > "${sqlDumpPath}"`, {
 				timeout: 60_000,
 				stdio: "pipe",
+				windowsHide: true,
 			});
 		}
 
@@ -201,7 +203,11 @@ export function recoverWithCli(dbPath: string): boolean {
 		writeFileSync(sqlDumpPath, filtered.join("\n"));
 
 		// Step 3: Import cleaned SQL into new DB
-		execSync(`sqlite3 "${recoveredPath}" < "${sqlDumpPath}"`, { timeout: 60_000, stdio: "pipe" });
+		execSync(`sqlite3 "${recoveredPath}" < "${sqlDumpPath}"`, {
+			timeout: 60_000,
+			stdio: "pipe",
+			windowsHide: true,
+		});
 
 		// Clean up dump file
 		if (existsSync(sqlDumpPath)) unlinkSync(sqlDumpPath);

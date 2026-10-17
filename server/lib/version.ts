@@ -28,6 +28,7 @@ if (existsSync(pkgPath)) {
 		commitHash = execSync("git rev-parse --short HEAD", {
 			encoding: "utf-8",
 			timeout: 5000,
+			windowsHide: true,
 		}).trim();
 	} catch {
 		// git not available

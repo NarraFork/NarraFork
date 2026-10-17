@@ -21,6 +21,7 @@ export async function runCommand(
 			cwd,
 			stdout: "pipe",
 			stderr: "pipe",
+			windowsHide: true,
 		});
 
 		let timedOut = false;

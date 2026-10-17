@@ -15,6 +15,7 @@ function tryGit(): string | null {
 		const result = Bun.spawnSync(["git", "--version"], {
 			stdout: "pipe",
 			stderr: "pipe",
+			windowsHide: true,
 		});
 		if (result.exitCode === 0) {
 			return new TextDecoder().decode(result.stdout).trim();

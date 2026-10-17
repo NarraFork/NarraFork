@@ -67,6 +67,7 @@ function readRegValue(key: string, valueName: string): string | null {
 		const result = Bun.spawnSync(["reg", "query", key, "/v", valueName], {
 			stdout: "pipe",
 			stderr: "pipe",
+			windowsHide: true,
 		});
 		if (result.exitCode !== 0) return null;
 		const output = new TextDecoder().decode(result.stdout);

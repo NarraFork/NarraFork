@@ -432,6 +432,7 @@ async function execStreaming(
 		cwd,
 		stdout: "pipe",
 		stderr: "pipe",
+		windowsHide: true,
 		// Image builds/pulls reach user-configured registries — keep their proxy.
 		env: envWithAmbientProxy(env),
 	});

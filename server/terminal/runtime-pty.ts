@@ -50,6 +50,7 @@ export function spawnPortablePty(opts: TerminalSpawnOptions): TerminalRuntime {
 				try {
 					Bun.spawnSync(["taskkill", "/T", "/F", "/PID", String(pty.pid)], {
 						stdio: ["ignore", "ignore", "ignore"],
+						windowsHide: true,
 					});
 				} catch {
 					/* best effort — process may already be gone */

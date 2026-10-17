@@ -15,11 +15,12 @@ import {
 	renewToken,
 	verifyToken,
 } from "../lib/auth";
+import { AppError, catalogError } from "../lib/errors";
+import { logger } from "../lib/logger";
 // The two remaining raw AppErrors below are deliberate: `INVALID_SCOPE` is a programming
 // error that never reaches a browser, and `INSUFFICIENT_SCOPE` is read by third-party
 // OAuth clients rather than rendered in the UI, so neither needs a localized wording.
-import { AppError, catalogError } from "../lib/errors";
-import { logger } from "../lib/logger";
+import { isManagerTokenAuthorized, MANAGER_TOKEN_ENV } from "../lib/manager-token";
 import { validateAccessToken } from "../lib/oauth-provider";
 import { authSessionStore } from "../services/auth/store";
 
@@ -390,6 +391,30 @@ export function assertAdmin(c: Context): void {
 }
 
 export async function requireAdmin(c: Context, next: Next) {
+	assertAdmin(c);
+	await next();
+}
+
+/**
+ * 管理员会话，或管理器面板持有的本机令牌。
+ *
+ * 面板是独立进程、没有用户 JWT。令牌由面板生成，只放进它拉起的服务进程的环境变量。
+ * 对端必须是回环 socket（`peerIp`，不是解析过转发头的 clientIp），并且 Bearer 与令牌一致。
+ * 终端里手动启动的服务没有这个环境变量，因此没有旁路。
+ */
+export async function requireAdminOrManagerToken(c: Context, next: Next) {
+	const env = c.env as { peerIp?: string } | undefined;
+	if (
+		isManagerTokenAuthorized({
+			peerIp: env?.peerIp,
+			authorization: c.req.header("authorization"),
+			expectedToken: process.env[MANAGER_TOKEN_ENV],
+		})
+	) {
+		await next();
+		return;
+	}
+	await authenticateRequest(c);
 	assertAdmin(c);
 	await next();
 }

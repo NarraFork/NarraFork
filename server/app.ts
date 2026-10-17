@@ -84,13 +84,13 @@ import { skillRoutes } from "./routes/skills";
 import { specRoutes } from "./routes/spec";
 import { handleSsoCallback, ssoRoutes } from "./routes/sso";
 import { storageRoutes } from "./routes/storage";
-import { systemLifecycleRoutes } from "./routes/system-lifecycle";
+import { managerLifecycleRoutes, systemLifecycleRoutes } from "./routes/system-lifecycle";
 import { terminalRoutes } from "./routes/terminals";
 import { tlsRoutes } from "./routes/tls";
 import { tokendanceRoutes } from "./routes/tokendance";
 import { traitLayerRoutes } from "./routes/trait-layers";
 import { tutorialRoutes } from "./routes/tutorial";
-import { updateRoutes } from "./routes/update";
+import { localPeerUpdateRoutes, updateRoutes } from "./routes/update";
 import { uploadRoutes } from "./routes/uploads";
 import usageHistoryRoutes from "./routes/usage-history";
 import { userPreferencesRoutes } from "./routes/user-preferences";
@@ -102,6 +102,8 @@ import { narratorWorktreeService } from "./services/narrator-worktree-runtime";
 export interface AppEnv {
 	Bindings: {
 		clientIp?: string;
+		/** TCP 对端，未经 X-Forwarded-For 改写。管理器令牌只认这个地址。 */
+		peerIp?: string;
 		trustedProxy?: boolean;
 	};
 }
@@ -321,6 +323,11 @@ app.route("/api/external/v1", externalV1Routes);
 
 // Anonymous sharing is a closed, Share-token-only prefix, never a login bypass.
 app.route("/api/public/narrator-shares", publicNarratorShareRoutes);
+
+// 管理器面板的更新与停止：凭本机回环 + 进程令牌，因此必须注册在全局会话认证之前。
+// Hono 按注册顺序匹配，挂载点晚于 requireSessionAuth 就永远轮不到这里。
+app.route("/api/update", localPeerUpdateRoutes);
+app.route("/api/system/lifecycle", managerLifecycleRoutes);
 
 // All ordinary routes below require a first-party session. OAuth access tokens
 // must opt into an explicitly mounted external route and can never fall through

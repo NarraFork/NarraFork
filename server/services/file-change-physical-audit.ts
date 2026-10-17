@@ -260,6 +260,7 @@ async function runWorker(job: Job): Promise<FileChangePhysicalAuditSummary> {
 					stdin: "ignore",
 					stdout: "ignore",
 					stderr: "ignore",
+					windowsHide: true,
 					ipc(message: unknown) {
 						// Private IPC carries bounded JSON, never stdout, raw bodies or dumped arguments.
 						if (

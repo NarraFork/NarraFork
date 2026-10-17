@@ -59,7 +59,7 @@ async function getProcessInfoBatch(pids: number[]): Promise<Map<number, Terminal
 					"-Command",
 					`Get-Process -Id ${pidList} -ErrorAction SilentlyContinue | ForEach-Object { "$($_.Id)|$($_.Parent.Id)|$($_.ProcessName)|$($_.WorkingSet64)|$($_.CPU)" }`,
 				],
-				{ stdout: "pipe", stderr: "ignore", stdin: "ignore" },
+				{ stdout: "pipe", stderr: "ignore", stdin: "ignore", windowsHide: true },
 			);
 			const output = await Promise.race([
 				proc.exited.then(async (code) => {
@@ -94,7 +94,7 @@ async function getProcessInfoBatch(pids: number[]): Promise<Map<number, Terminal
 		}
 		const proc = Bun.spawn(
 			["ps", "-o", "pid=,ppid=,comm=,stat=,rss=,%cpu=,etime=", "-p", pids.join(",")],
-			{ stdout: "pipe", stderr: "ignore", stdin: "ignore" },
+			{ stdout: "pipe", stderr: "ignore", stdin: "ignore", windowsHide: true },
 		);
 		const output = await Promise.race([
 			proc.exited.then(async (code) => {

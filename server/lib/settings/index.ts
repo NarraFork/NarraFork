@@ -35,6 +35,13 @@ import {
 } from "../narrator-audiences";
 import { normalizeLegacyPermissionMode, shouldMigrateLegacyPlanMode } from "../permission-modes";
 import { normalizeSearchSettings } from "../search/settings";
+import { withSettingsFileLock } from "../settings-file-lock";
+import {
+	type ManagerOwnedFields,
+	managerFieldsFromSettings,
+	preserveExternalManagerFields,
+	readManagerOwnedFields,
+} from "../settings-manager-fields";
 import { normalizeCustomApiProviderSettings } from "./custom-api-providers";
 import { DEFAULTS } from "./defaults";
 import { normalizeModelContextWindows } from "./model-context-windows";
@@ -542,6 +549,7 @@ function loadSettingsFromDisk(): NarraForkSettings {
 
 	if (initializeTokenDanceModelCollection(merged)) needsSave = true;
 
+	lastDiskManagerFields = managerFieldsFromSettings(merged);
 	if (needsSave) saveSettings(merged);
 
 	// Pricing lives in its own module so cost attribution does not have to pull in
@@ -685,6 +693,8 @@ export function purgeStaleAgentModelRefs(
 const _cache: { current: NarraForkSettings | null } = { current: null };
 
 let settingsRevision = 0;
+/** 上次从磁盘加载（或写回）时，管理器可能单独修改的那些字段。 */
+let lastDiskManagerFields: ManagerOwnedFields = {};
 const settingsChangeListeners = new Set<() => void>();
 
 /** Subscribe to persisted settings after the runtime singleton has been updated. */
@@ -826,16 +836,28 @@ export function saveSettings(newSettings: NarraForkSettings): void {
 	reconcileLegacyWindowSettings(newSettings);
 	mkdirSync(narraforkDir, { recursive: true, mode: 0o700 });
 	if (process.platform !== "win32") chmodSync(narraforkDir, 0o700);
-	const tempPath = `${settingsPath}.${process.pid}.${Date.now()}.tmp`;
-	try {
-		writeFileSync(tempPath, JSON.stringify(settingsWithRawModelCatalog(newSettings), null, 2), {
-			mode: 0o600,
-		});
-		renameSync(tempPath, settingsPath);
-	} catch (error) {
-		rmSync(tempPath, { force: true });
-		throw error;
-	}
+	withSettingsFileLock(narraforkDir, () => {
+		let disk: unknown = {};
+		if (existsSync(settingsPath)) {
+			try {
+				disk = JSON.parse(readFileSync(settingsPath, "utf-8"));
+			} catch {
+				disk = {};
+			}
+		}
+		preserveExternalManagerFields(newSettings, readManagerOwnedFields(disk), lastDiskManagerFields);
+		const tempPath = `${settingsPath}.${process.pid}.${Date.now()}.tmp`;
+		try {
+			writeFileSync(tempPath, JSON.stringify(settingsWithRawModelCatalog(newSettings), null, 2), {
+				mode: 0o600,
+			});
+			renameSync(tempPath, settingsPath);
+		} catch (error) {
+			rmSync(tempPath, { force: true });
+			throw error;
+		}
+		lastDiskManagerFields = managerFieldsFromSettings(newSettings);
+	});
 	markLegacyWindowSettingsSaved(newSettings);
 	settingsRevision++;
 

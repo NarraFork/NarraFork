@@ -31,6 +31,7 @@ async function runCommand(
 			stderr: "ignore",
 			stdin: "ignore",
 			env: opts?.env,
+			windowsHide: true,
 		});
 		const timeoutMs = opts?.timeout ?? 5000;
 		const result = await Promise.race([

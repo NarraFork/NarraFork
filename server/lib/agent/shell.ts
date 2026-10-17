@@ -25,7 +25,11 @@ export async function killTree(
 			await Bun.sleep(SIGKILL_DELAY_MS);
 			if (!opts?.exited?.()) {
 				try {
-					execSync(`taskkill /T /F /PID ${pid}`, { stdio: "ignore", timeout: 5000 });
+					execSync(`taskkill /T /F /PID ${pid}`, {
+						stdio: "ignore",
+						timeout: 5000,
+						windowsHide: true,
+					});
 				} catch {
 					/* best effort */
 				}
@@ -284,6 +288,7 @@ function findGitBashViaGitExecPath(existsSync: (p: string) => boolean): string |
 			encoding: "utf-8",
 			stdio: ["ignore", "pipe", "ignore"],
 			timeout: 3000,
+			windowsHide: true,
 		}).trim();
 		if (!execPath) return undefined;
 

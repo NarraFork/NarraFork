@@ -11,6 +11,8 @@ import {
 	PLUGIN_UI_RUNTIME_CSS_URL,
 	PLUGIN_UI_RUNTIME_JS_URL,
 } from "../frontend/plugin-runtime/paths";
+import { CHROMIUM_PATHS } from "../shared/browser-paths";
+import { urlHost } from "../shared/server-host";
 import { app } from "./app";
 import "./db"; // Ensure DB is initialized early
 import {
@@ -51,8 +53,12 @@ import {
 	registerOperatorShutdownHandler,
 	registerRuntimeAddressGetter,
 	registerServerRestart,
+	scheduleServerRestart,
 } from "./lib/server-restart";
-import { settings } from "./lib/settings";
+import { reloadSettings, settings } from "./lib/settings";
+import { startServerAddressWatcher } from "./lib/settings-address-watcher";
+import { startSettingsFileWatcher } from "./lib/settings-file-watcher";
+import { shellExecute } from "./lib/shell-exec";
 import { preservesRecoveryOnShutdown, ShutdownActivityTracker } from "./lib/shutdown-activity";
 import { injectSpaBaseHref, spaIndexHeaders } from "./lib/spa-base-href";
 import {
@@ -263,6 +269,8 @@ import { refreshWindowsPath } from "./lib/win-env";
 		const gitCheck = Bun.spawnSync(["git", "--version"], {
 			stdout: "pipe",
 			stderr: "pipe",
+			// GUI 模式（管理器托管的后端）下不隐藏会闪出控制台窗口。
+			windowsHide: true,
 		});
 		if (gitCheck.exitCode === 0) {
 			_gitAvailable = true;
@@ -280,6 +288,7 @@ import { refreshWindowsPath } from "./lib/win-env";
 				const retry = Bun.spawnSync(["git", "--version"], {
 					stdout: "pipe",
 					stderr: "pipe",
+					windowsHide: true,
 				});
 				if (retry.exitCode === 0) {
 					_gitAvailable = true;
@@ -582,7 +591,11 @@ function tryReclaimPort(targetPort: number): void {
 		// netstat -ano gives lines like:
 		//   TCP    0.0.0.0:7778           0.0.0.0:0              LISTENING       12345
 		//   TCP    [::]:7778              [::]:0                 LISTENING       12345
-		const result = Bun.spawnSync(["netstat", "-ano"], { stdout: "pipe", stderr: "ignore" });
+		const result = Bun.spawnSync(["netstat", "-ano"], {
+			stdout: "pipe",
+			stderr: "ignore",
+			windowsHide: true,
+		});
 		if (result.exitCode !== 0) return;
 		const output = new TextDecoder().decode(result.stdout);
 		const listeningPids = new Set<number>();
@@ -622,6 +635,7 @@ function killPortHolder(pid: number, port: number): void {
 	const directKill = Bun.spawnSync(["taskkill", "/T", "/F", "/PID", String(pid)], {
 		stdout: "pipe",
 		stderr: "pipe",
+		windowsHide: true,
 	});
 	const stderr = new TextDecoder().decode(directKill.stderr).toLowerCase();
 	if (directKill.exitCode === 0) {
@@ -648,7 +662,7 @@ function killPortHolder(pid: number, port: number): void {
 				"Caption,ProcessId",
 				"/FORMAT:CSV",
 			],
-			{ stdout: "pipe", stderr: "ignore" },
+			{ stdout: "pipe", stderr: "ignore", windowsHide: true },
 		);
 		const childOutput = new TextDecoder().decode(childQuery.stdout);
 		for (const line of childOutput.split("\n")) {
@@ -663,6 +677,8 @@ function killPortHolder(pid: number, port: number): void {
 			try {
 				Bun.spawnSync(["taskkill", "/F", "/PID", String(childPid)], {
 					stdio: ["ignore", "ignore", "ignore"],
+					// 隐藏控制台：进程清理在端口被占用时触发，正常请求路径下不应闪窗。
+					windowsHide: true,
 				});
 			} catch {
 				// best effort
@@ -673,7 +689,7 @@ function killPortHolder(pid: number, port: number): void {
 		// inherited the handle. Look up the parent first.
 		const parentQuery = Bun.spawnSync(
 			["wmic", "process", "where", `(ProcessId=${pid})`, "get", "ParentProcessId", "/FORMAT:CSV"],
-			{ stdout: "pipe", stderr: "ignore" },
+			{ stdout: "pipe", stderr: "ignore", windowsHide: true },
 		);
 		const parentOutput = new TextDecoder().decode(parentQuery.stdout);
 		for (const line of parentOutput.split("\n")) {
@@ -693,7 +709,7 @@ function killPortHolder(pid: number, port: number): void {
 					"Caption,ProcessId",
 					"/FORMAT:CSV",
 				],
-				{ stdout: "pipe", stderr: "ignore" },
+				{ stdout: "pipe", stderr: "ignore", windowsHide: true },
 			);
 			const siblingOutput = new TextDecoder().decode(siblingQuery.stdout);
 			for (const sLine of siblingOutput.split("\n")) {
@@ -708,6 +724,8 @@ function killPortHolder(pid: number, port: number): void {
 					try {
 						Bun.spawnSync(["taskkill", "/F", "/PID", String(sPid)], {
 							stdio: ["ignore", "ignore", "ignore"],
+							// 隐藏控制台：进程清理在端口被占用时触发，正常请求路径下不应闪窗。
+							windowsHide: true,
 						});
 					} catch {
 						// best effort
@@ -733,7 +751,7 @@ function getWindowsChildProcesses(parentPid: number): WindowsProcessInfo[] {
 				"Caption,CommandLine,ProcessId",
 				"/FORMAT:CSV",
 			],
-			{ stdout: "pipe", stderr: "ignore" },
+			{ stdout: "pipe", stderr: "ignore", windowsHide: true },
 		);
 		if (result.exitCode !== 0) return [];
 		return parseWmicProcessCsv(new TextDecoder().decode(result.stdout)).filter((proc) => {
@@ -780,6 +798,8 @@ function killOwnWindowsChildProcesses(): void {
 			);
 			Bun.spawnSync(["taskkill", "/T", "/F", "/PID", String(proc.pid)], {
 				stdio: ["ignore", "ignore", "ignore"],
+				// 隐藏控制台：进程清理在端口被占用时触发，正常请求路径下不应闪窗。
+				windowsHide: true,
 			});
 		} catch {
 			// best effort — process may already be gone
@@ -1109,6 +1129,7 @@ function startServer(listenPort: number, tlsCfg: typeof settings.server.tls) {
 				});
 				return app.fetch(req, {
 					clientIp,
+					peerIp,
 					trustedProxy: isTrustedProxyAddress(peerIp, trustedProxyCidrs),
 				});
 			});
@@ -1238,11 +1259,15 @@ if (portExplicit) {
 	}
 }
 
-logger.info(`NarraFork server running on ${getProtocol()}://${currentHost}:${actualPort}`, {
-	isProd,
-	isCompiledBinary,
-	metaUrl: import.meta.url,
-});
+logger.info(
+	`NarraFork server running on ${getProtocol()}://${urlHost(currentHost)}:${actualPort}`,
+	{
+		isProd,
+		isCompiledBinary,
+		metaUrl: import.meta.url,
+		listenHost: currentHost,
+	},
+);
 
 function runtimeAddress() {
 	return {
@@ -1279,18 +1304,40 @@ registerServerRestart((newHost: string, newPort: number, options) => {
 		options?.preserveResponse === true,
 	);
 	const address = runtimeAddress();
-	logger.info("Server listener rebound", address);
+	// 与启动时同一句式，管理器才能在热重绑后更新面板上的地址。
+	logger.info(
+		`NarraFork server running on ${address.protocol}://${urlHost(address.host)}:${address.port}`,
+		{ rebound: true, listenHost: address.host, port: address.port },
+	);
 	return address;
+});
+
+// settings.json 地址热重载：管理器面板或外部编辑直接写文件也能即时生效。
+// PATCH /api/settings 的保存路径同样写该文件，isCurrent 比对可避免双重重绑。
+startServerAddressWatcher({
+	isCurrent: (address) => address.host === configuredHost && address.port === actualPort,
+	onChanged: (address) => {
+		reloadSettings();
+		scheduleServerRestart(address.host, address.port);
+	},
+});
+
+// 其余配置（实例名、主题色、打开方式等）由管理器面板直接写文件，没有地址那样的重绑回路：
+// 文件变化时重载配置即可，运行时组件按需读取新值。地址变化由上面的监听单独处理。
+startSettingsFileWatcher(() => {
+	reloadSettings();
 });
 
 /** Open a URL in the user's default browser. */
 function openInBrowser(url: string) {
+	// Windows 走 ShellExecuteW：不经 cmd start，避免偶尔闪出的控制台窗口。
+	if (IS_WINDOWS) {
+		if (shellExecute(url)) return;
+	}
 	try {
-		if (IS_WINDOWS) {
-			Bun.spawn(["cmd", "/c", "start", url], { stdio: ["ignore", "ignore", "ignore"] });
-		} else if (IS_MACOS) {
+		if (IS_MACOS) {
 			Bun.spawn(["open", url], { stdio: ["ignore", "ignore", "ignore"] });
-		} else {
+		} else if (!IS_WINDOWS) {
 			Bun.spawn(["xdg-open", url], { stdio: ["ignore", "ignore", "ignore"] });
 		}
 	} catch {
@@ -1298,38 +1345,50 @@ function openInBrowser(url: string) {
 	}
 }
 
-/** Try to open the URL in Chromium's --app mode (frameless window); fall back to default browser. */
 async function openAsApp(url: string) {
-	const candidates: string[][] = IS_WINDOWS
-		? [
-				["cmd", "/c", "start", "", "msedge", `--app=${url}`],
-				["cmd", "/c", "start", "", "chrome", `--app=${url}`],
-			]
-		: IS_MACOS
-			? [
-					["open", "-a", "Google Chrome", url, "--args", `--app=${url}`],
-					["open", "-a", "Microsoft Edge", url, "--args", `--app=${url}`],
-					["open", "-a", "Chromium", url, "--args", `--app=${url}`],
-				]
-			: [
-					["google-chrome", `--app=${url}`],
-					["google-chrome-stable", `--app=${url}`],
-					["chromium", `--app=${url}`],
-					["chromium-browser", `--app=${url}`],
-					["microsoft-edge", `--app=${url}`],
-				];
-
-	for (const cmd of candidates) {
-		try {
-			const proc = Bun.spawn(cmd, { stdio: ["ignore", "ignore", "ignore"] });
-			// On Unix, check if the process exits immediately with an error
-			if (!IS_WINDOWS) {
-				// Give it a moment to fail (e.g. command not found)
-				const exited = proc.exited;
-				const timeout = new Promise<null>((r) => setTimeout(() => r(null), 300));
-				const result = await Promise.race([exited, timeout]);
-				if (result !== null && result !== 0) continue;
+	// Windows 上 Edge/Chrome 不在 PATH 里（Bun.which 找不到），按标准安装路径探测；
+	// 直接 spawn 绝对路径，避免经 cmd start 时参数被重新解析。
+	if (IS_WINDOWS) {
+		const browser = CHROMIUM_PATHS.find((path) => existsSync(path));
+		if (browser) {
+			try {
+				Bun.spawn([browser, `--app=${url}`], {
+					stdio: ["ignore", "ignore", "ignore"],
+					windowsHide: true,
+				});
+				return;
+			} catch {
+				// 落到默认浏览器兜底
 			}
+		}
+		openInBrowser(url);
+		return;
+	}
+
+	const candidates: { program: string; args: string[] }[] = IS_MACOS
+		? [
+				{ program: "open", args: ["-a", "Google Chrome", url, "--args", `--app=${url}`] },
+				{ program: "open", args: ["-a", "Microsoft Edge", url, "--args", `--app=${url}`] },
+				{ program: "open", args: ["-a", "Chromium", url, "--args", `--app=${url}`] },
+			]
+		: [
+				{ program: "google-chrome", args: [`--app=${url}`] },
+				{ program: "google-chrome-stable", args: [`--app=${url}`] },
+				{ program: "chromium", args: [`--app=${url}`] },
+				{ program: "chromium-browser", args: [`--app=${url}`] },
+				{ program: "microsoft-edge", args: [`--app=${url}`] },
+			];
+
+	for (const { program, args } of candidates) {
+		try {
+			const proc = Bun.spawn([program, ...args], {
+				stdio: ["ignore", "ignore", "ignore"],
+				windowsHide: true,
+			});
+			// Give it a moment to fail (e.g. command not found)
+			const timeout = new Promise<null>((r) => setTimeout(() => r(null), 300));
+			const result = await Promise.race([proc.exited, timeout]);
+			if (result !== null && result !== 0) continue;
 			return;
 		} catch {}
 	}
@@ -1343,7 +1402,7 @@ async function openAsApp(url: string) {
 	const versionStr = GIT_COMMIT ? `v${APP_VERSION} (${GIT_COMMIT})` : `v${APP_VERSION}`;
 	const modeStr = isProd ? "production" : "development";
 	const proto = getProtocol();
-	const listenUrl = `${proto}://${currentHost === "0.0.0.0" ? "localhost" : currentHost}:${actualPort}`;
+	const listenUrl = `${proto}://${urlHost(currentHost)}:${runtimeAddress().port}`;
 	// dev:all sets NARRAFORK_DEV_APP_URL to the Vite origin. This process is the API
 	// (7779); the banner and the browser open must send the user to the frontend.
 	const url = resolveAdvertisedAppUrl({
@@ -1356,11 +1415,15 @@ async function openAsApp(url: string) {
 	console.log(`  \x1b[2m➜\x1b[0m  mode: ${modeStr}`);
 	console.log("");
 
-	const openMode = settings.server.openBrowser;
-	if (openMode === "app") {
-		openAsApp(url);
-	} else if (openMode === "browser") {
-		openInBrowser(url);
+	// 由管理器面板托管的实例：前端窗口交给面板打开 —— 它会先聚焦已有窗口，
+	// 这里再开一次就会重复弹窗（同一份逻辑不该有两份实现）。
+	if (process.env.NARRAFORK_MANAGER_MANAGED !== "1") {
+		const openMode = settings.server.openBrowser;
+		if (openMode === "app") {
+			openAsApp(url);
+		} else if (openMode === "browser") {
+			openInBrowser(url);
+		}
 	}
 }
 

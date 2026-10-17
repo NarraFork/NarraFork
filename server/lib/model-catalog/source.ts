@@ -296,7 +296,7 @@ if (import.meta.main) {
 	const publishedAt = execFileSync(
 		"git",
 		["-C", directory, "log", "-1", "--format=%cI", "--", "."],
-		{ encoding: "utf8" },
+		{ encoding: "utf8", windowsHide: true },
 	).trim();
 	const catalog = catalogFromModelFiles(files, `bundled-${hash.digest("hex")}`, publishedAt);
 	writeFileSync(

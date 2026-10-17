@@ -48,6 +48,8 @@ const GENERATED_BUILD_INFO_FILE = join(ROOT, "server", "generated", "build-info.
 const GENERATED_CHANGELOG_FILE = join(ROOT, "server", "generated", "embedded-changelog.ts");
 const GENERATED_LICENSES_FILE = join(ROOT, "server", "generated", "embedded-licenses.ts");
 const DIST_DIR = join(ROOT, "dist");
+/** Windows 可执行文件图标：由 scripts/generate-windows-icon.ts 从品牌 PNG 生成。 */
+const WINDOWS_ICON_PATH = join(DIST_DIR, "narrafork.ico");
 
 // ============================================================================
 // Main build script
@@ -467,6 +469,14 @@ export const buildHelperDistribution = ${JSON.stringify(HELPER_DISTRIBUTION)};
 		"--asset-naming=[dir]/[name].[ext]",
 		// electron is referenced by puppeteer-core but never used in headless mode
 		"--external=electron",
+		// Windows：面板自带 UI，编译产物不该再弹控制台；图标由
+		// scripts/generate-windows-icon.ts 从品牌 PNG 生成，缺失时跳过而不是让编译失败。
+		...(platform.target.startsWith("bun-windows")
+			? [
+					"--windows-hide-console",
+					...(existsSync(WINDOWS_ICON_PATH) ? [`--windows-icon=${WINDOWS_ICON_PATH}`] : []),
+				]
+			: []),
 		"--outfile",
 		outfile,
 	]);

@@ -55,6 +55,7 @@ function command(
 		const child = spawn(path, ["--remote=false", ...args], {
 			env: hostEnvironment(),
 			stdio: ["ignore", "pipe", "pipe"],
+			windowsHide: true,
 		});
 		const chunks: Buffer[] = [];
 		let bytes = 0;
@@ -324,7 +325,11 @@ export function createPodmanDriver(options: {
 			imageId,
 			"/eval/bootstrap.mjs",
 		];
-		const child = spawn(path, args, { env: hostEnvironment(), stdio: ["pipe", "pipe", "pipe"] });
+		const child = spawn(path, args, {
+			env: hostEnvironment(),
+			stdio: ["pipe", "pipe", "pipe"],
+			windowsHide: true,
+		});
 		let exitCode: number | null = null;
 		let clientClosed = false;
 		let cleanup: Promise<CleanupReport> | undefined;

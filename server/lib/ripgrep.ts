@@ -110,6 +110,7 @@ async function verifyRg(path: string, signal?: AbortSignal): Promise<boolean> {
 			timeout: 5_000,
 			killSignal: "SIGKILL",
 			signal,
+			windowsHide: true,
 		});
 		const exitCode = await result.exited;
 		signal?.throwIfAborted();
@@ -189,6 +190,7 @@ export function getRgVersionSync(path = findRgSync()): string | undefined {
 			timeout: 1_000,
 			killSignal: "SIGKILL",
 			maxBuffer: 32 * 1024,
+			windowsHide: true,
 		});
 		if (result.exitCode !== 0) return undefined;
 		const out = new TextDecoder().decode(result.stdout).trim();

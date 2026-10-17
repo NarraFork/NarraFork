@@ -299,6 +299,7 @@ function executeCommandHook(
 			stdio: ["pipe", "pipe", "pipe"],
 			timeout: timeout * 1000,
 			cwd: input.cwd || undefined,
+			windowsHide: true,
 		});
 
 		// Cap captured output to avoid unbounded memory growth from chatty commands

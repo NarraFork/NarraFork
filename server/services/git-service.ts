@@ -1618,6 +1618,7 @@ export const gitService = {
 			stdin: "ignore",
 			stdout: "pipe",
 			stderr: "pipe",
+			windowsHide: true,
 			// git talks to the user's remotes, so it keeps the user's ambient proxy
 			// configuration rather than NarraFork's blanked one.
 			env: envWithAmbientProxy({

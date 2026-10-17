@@ -290,6 +290,7 @@ export class ParcelWorkerClient {
 				stdin: "pipe",
 				stdout: "pipe",
 				stderr: "pipe",
+				windowsHide: true,
 			});
 		} catch (error) {
 			this.readyWaiter = undefined;

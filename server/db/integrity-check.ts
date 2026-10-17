@@ -144,6 +144,8 @@ export async function runIntegrityProbe(
 			stdin: "ignore",
 			stdout: "pipe",
 			stderr: "pipe",
+			// GUI 模式（管理器面板托管的后端）下不隐藏会让 probe 子进程弹出控制台窗口。
+			windowsHide: true,
 			// The probe is another NarraFork process and re-runs
 			// `neutralizeAmbientProxyEnv()`; pass the real ambient proxy values so its
 			// snapshot matches ours rather than the blanked placeholders.

@@ -1010,7 +1010,8 @@ async function spawnWithTimeout(
 }
 
 function defaultSpawner(command: string[], options: RunnerSpawnOptions): RunnerProcess {
-	const process = Bun.spawn(command, options);
+	// windowsHide：插件进程从 GUI 后端派生，不隐藏会在 Windows 上闪出控制台窗口。
+	const process = Bun.spawn(command, { ...options, windowsHide: true });
 	let termination: Promise<void> | undefined;
 	return {
 		pid: process.pid,
@@ -1106,7 +1107,12 @@ async function waitForProcessGroupExit(pid: number, timeoutMs: number): Promise<
 async function runCleanupCommand(command: string[]): Promise<void> {
 	let cleanupProcess: ReturnType<typeof Bun.spawn> | undefined;
 	try {
-		cleanupProcess = Bun.spawn(command, { stdin: "ignore", stdout: "ignore", stderr: "ignore" });
+		cleanupProcess = Bun.spawn(command, {
+			stdin: "ignore",
+			stdout: "ignore",
+			stderr: "ignore",
+			windowsHide: true,
+		});
 		await promiseWithTimeout(cleanupProcess.exited, PROCESS_TREE_KILL_TIMEOUT_MS);
 	} catch {
 		cleanupProcess?.kill();

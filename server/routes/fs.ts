@@ -229,6 +229,9 @@ fsRoutes.post("/reveal", async (c) => {
 
 	// Wait only for launch, not for the desktop window to close. Handle ENOENT
 	// (e.g. missing xdg-utils) as an API error rather than an unhandled child error.
+	//
+	// 这里不能加 windowsHide：explorer / open / xdg-open 都是"拉起文件管理器窗口"，
+	// 隐藏窗口会让它表现为点了没反应（GUI 程序没有控制台可隐藏）。
 	await new Promise<void>((resolve, reject) => {
 		const child = spawn(cmd, args, { detached: true, stdio: "ignore" });
 		child.once("error", (error) => {
@@ -1240,7 +1243,7 @@ function resolveWindowsKnownFolder(key: string, _home: string): string | null {
 		try {
 			const result = execSync(
 				`powershell -NoProfile -Command "[Environment]::GetFolderPath('${specialFolder}')"`,
-				{ encoding: "utf-8", timeout: 3000 },
+				{ encoding: "utf-8", timeout: 3000, windowsHide: true },
 			).trim();
 			if (result && existsSync(result)) {
 				_winFolderCache[key] = result;
@@ -1257,7 +1260,8 @@ function resolveWindowsKnownFolder(key: string, _home: string): string | null {
 		try {
 			const result = execSync(
 				`powershell -NoProfile -Command "(New-Object -ComObject Shell.Application).NameSpace('shell:${key}').Self.Path"`,
-				{ encoding: "utf-8", timeout: 3000 },
+				// 隐藏控制台：PowerShell 会创建窗口，这里只是解析已知文件夹路径。
+				{ encoding: "utf-8", timeout: 3000, windowsHide: true },
 			).trim();
 			if (result && existsSync(result)) {
 				_winFolderCache[key] = result;

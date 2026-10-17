@@ -172,6 +172,7 @@ export class PodmanRunner implements PluginRunner {
 			process = Bun.spawn([this.binary, "info", "--format", "{{.Version}}"], {
 				stdout: "ignore",
 				stderr: "ignore",
+				windowsHide: true,
 			});
 			const exitCode = await promiseWithTimeout(process.exited, this.availabilityTimeoutMs);
 			return exitCode === 0;

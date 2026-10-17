@@ -140,6 +140,7 @@ export async function mergeFileChangeBytes(
 			{
 				cwd: directory,
 				stdin: "ignore",
+				windowsHide: true,
 				stdout: "pipe",
 				stderr: "pipe",
 				// Do not inherit GIT_DIR, GIT_CONFIG_PARAMETERS, filters or user configuration.

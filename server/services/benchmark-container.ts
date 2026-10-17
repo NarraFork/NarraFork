@@ -40,6 +40,7 @@ async function podman(args: string[], timeoutMs = 60_000): Promise<ExecResult> {
 	const proc = Bun.spawn([PODMAN, ...args], {
 		stdout: "pipe",
 		stderr: "pipe",
+		windowsHide: true,
 	});
 
 	const timer = setTimeout(() => {
@@ -153,6 +154,7 @@ export async function execScript(
 			stdin: new Blob([script]),
 			stdout: "pipe",
 			stderr: "pipe",
+			windowsHide: true,
 		},
 	);
 

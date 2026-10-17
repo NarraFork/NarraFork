@@ -93,7 +93,13 @@ const INSTALL_COMMANDS: Record<string, Record<string, string>> = {
 function winWhich(name: string): boolean {
 	if (Bun.which(name)) return true;
 	try {
-		const result = execSync(`where ${name}`, { encoding: "utf-8", stdio: "pipe", timeout: 5000 });
+		const result = execSync(`where ${name}`, {
+			encoding: "utf-8",
+			stdio: "pipe",
+			timeout: 5000,
+			// 服务端由隐藏窗口的父进程启动，缺这个每次依赖检测都会闪一下黑窗。
+			windowsHide: true,
+		});
 		return result.trim().length > 0;
 	} catch {
 		return false;
@@ -128,7 +134,13 @@ function detectPackageManager(): string | undefined {
 
 function execQuiet(cmd: string): string | null {
 	try {
-		return execSync(cmd, { encoding: "utf-8", stdio: "pipe", timeout: 5000 }).trim();
+		return execSync(cmd, {
+			encoding: "utf-8",
+			stdio: "pipe",
+			timeout: 5000,
+			// 同 winWhich：依赖检测在设置页加载时触发，必须隐藏控制台。
+			windowsHide: true,
+		}).trim();
 	} catch {
 		return null;
 	}
@@ -299,6 +311,7 @@ function needsUnavailableSudoPassword(cmd: string): boolean {
 				stdout: "ignore",
 				stderr: "ignore",
 				stdin: "ignore",
+				windowsHide: true,
 			});
 			passwordlessSudo = probe.exitCode === 0;
 		} catch {

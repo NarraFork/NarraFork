@@ -20,7 +20,7 @@
  */
 
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
@@ -130,13 +130,47 @@ const BUILD_TIMEOUT_MS = 60_000;
  * version than the one executing this code. `process.execPath` is that exact interpreter when
  * we are already under Bun, so prefer it and fall back through `Bun.which` to PATH.
  *
+ * Windows 特例：npm 全局安装的 bun 在 PATH 里是 `.cmd` shim，`spawn` 无法直接执行它
+ * （报 ENOENT），所以要对 shim 做解析，取出它内部指向的真实 `bun.exe`。
+ *
  * `Bun` is guarded because this module also runs inside Vite's rolldown worker, where the
  * global does not exist (see `runBunBuild`).
  */
+
+/** 从 npm 的 .cmd shim 内容里解析真实 exe 路径；shim 形如 "%dp0%\node_modules\...\bun.exe"。 */
+function resolveExeFromCmdShim(shimPath: string): string | null {
+	try {
+		const content = readFileSync(shimPath, "utf8");
+		const match = content.match(/"(%(?:~dp0|dp0)%?\\[^"]+\.exe)"/i);
+		if (!match) return null;
+		// %~dp0 / %dp0% 都指 shim 所在目录；替换后用 resolve 归一多余的分隔符。
+		return resolve(match[1].replace(/^%(?:~dp0|dp0)%?\\/i, `${dirname(shimPath)}\\`));
+	} catch {
+		return null;
+	}
+}
+
 function resolveBunExecutable(): string {
 	const execPath = process.execPath;
 	if (execPath && /(?:^|[\\/])bun(?:\.exe)?$/i.test(execPath)) return execPath;
 	const viaWhich = typeof Bun === "undefined" ? null : Bun.which("bun");
+	if (viaWhich && !/\.cmd$/i.test(viaWhich)) return viaWhich;
+	if (viaWhich) {
+		const fromShim = resolveExeFromCmdShim(viaWhich);
+		if (fromShim && existsSync(fromShim)) return fromShim;
+	}
+	// PATH 各目录里直接找 bun.exe；npm 全局布局下真实 exe 藏在 shim 同目录的
+	// node_modules/bun/bin 里（PATH 上只有 bun.cmd），一并推导。
+	if (process.platform === "win32") {
+		for (const dir of (process.env.PATH ?? "").split(";")) {
+			const clean = dir.trim();
+			if (!clean) continue;
+			const direct = join(clean, "bun.exe");
+			if (existsSync(direct)) return direct;
+			const nested = join(clean, "node_modules", "bun", "bin", "bun.exe");
+			if (existsSync(nested)) return nested;
+		}
+	}
 	return viaWhich ?? "bun";
 }
 

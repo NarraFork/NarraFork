@@ -57,6 +57,7 @@ function killAll() {
 					try {
 						spawnSync(["taskkill", "/T", "/F", "/PID", String(child.pid)], {
 							stdio: ["ignore", "ignore", "ignore"],
+							windowsHide: true,
 						});
 					} catch {
 						/* best effort */

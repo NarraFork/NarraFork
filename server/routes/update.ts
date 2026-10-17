@@ -10,7 +10,7 @@ import {
 	type UpdateSourceIdentity,
 } from "../../shared/update-identity";
 import { APP_VERSION } from "../lib/version";
-import { requireAdmin, requireAuth } from "../middleware/auth";
+import { requireAdmin, requireAdminOrManagerToken, requireAuth } from "../middleware/auth";
 import { GithubUpdateError } from "../services/github-release-update";
 import {
 	applyUpdate,
@@ -28,6 +28,14 @@ import {
 } from "../services/update-service";
 
 export const updateRoutes = new Hono();
+
+/**
+ * 管理器面板的更新端点。面板没有用户 JWT，凭本机回环加环境变量令牌调用。
+ *
+ * 必须挂载在全局会话认证之前 —— Hono 按注册顺序匹配，挂载点晚于 requireSessionAuth
+ * 就永远轮不到这里。其它来源仍要管理员会话。
+ */
+export const localPeerUpdateRoutes = new Hono();
 
 class DownloadRequestError extends Error {
 	constructor(
@@ -89,7 +97,7 @@ async function readDownloadRequest(request: Request): Promise<Record<string, unk
  * release metadata and download URLs. Every caller in the UI already sits behind the login gate,
  * and acting on the result (`/download`, `/apply`) is admin-only anyway.
  */
-updateRoutes.get("/check", requireAuth, requireAdmin, async (c) => {
+localPeerUpdateRoutes.get("/check", requireAdminOrManagerToken, async (c) => {
 	const result = await checkForUpdate();
 	return c.json(result);
 });
@@ -150,7 +158,7 @@ updateRoutes.get("/version", requireAuth, (c) => {
  * The frontend may send the version it expects, but all release metadata and
  * patch URLs are re-fetched from the configured update server.
  */
-updateRoutes.post("/download", requireAuth, requireAdmin, async (c) => {
+localPeerUpdateRoutes.post("/download", requireAdminOrManagerToken, async (c) => {
 	let requestedVersion: string | undefined;
 	let requestedSource: string | undefined;
 	let requestedRepository: string | undefined;
@@ -355,7 +363,7 @@ updateRoutes.get("/status", requireAuth, requireAdmin, async (c) => {
  * Schedule the downloaded update. The response returns immediately while the
  * server drains active Bash/subagent executions before starting the replacement.
  */
-updateRoutes.post("/apply", requireAuth, requireAdmin, async (c) => {
+localPeerUpdateRoutes.post("/apply", requireAdminOrManagerToken, async (c) => {
 	let targetVersion: string | undefined;
 	let preparedId: string | undefined;
 	try {

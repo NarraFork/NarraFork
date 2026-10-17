@@ -117,6 +117,7 @@ async function git(
 			GIT_NO_REPLACE_OBJECTS: "1",
 			LC_ALL: "C",
 		},
+		windowsHide: true,
 	});
 	let failure: string | undefined;
 	const stop = (reason: string) => {

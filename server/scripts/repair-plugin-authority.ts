@@ -80,7 +80,9 @@ function assertNoLiveInstance(home: string, forceUnlock: boolean): void {
 	try {
 		const lock = JSON.parse(readFileSync(lockPath, "utf8")) as { pid?: number };
 		if (!lock.pid) return;
-		const alive = Bun.spawnSync(["tasklist", "/FI", `PID eq ${lock.pid}`]).stdout.toString();
+		const alive = Bun.spawnSync(["tasklist", "/FI", `PID eq ${lock.pid}`], {
+			windowsHide: true,
+		}).stdout.toString();
 		const running = /narrafork|bun/i.test(alive) && alive.includes(String(lock.pid));
 		if (running) {
 			if (forceUnlock) {

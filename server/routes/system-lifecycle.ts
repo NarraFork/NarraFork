@@ -1,5 +1,6 @@
-import { Hono } from "hono";
-import { requireAdmin, requireAuth } from "../middleware/auth";
+import { type Context, Hono } from "hono";
+import { scheduleOperatorShutdown } from "../lib/server-restart";
+import { requireAdmin, requireAdminOrManagerToken, requireAuth } from "../middleware/auth";
 import { systemLifecycle } from "../services/system-lifecycle-service";
 
 export const systemLifecycleRoutes = new Hono();
@@ -19,9 +20,23 @@ systemLifecycleRoutes.post("/prepare", requireAdmin, (c) => {
 	const result = systemLifecycle.prepare();
 	return c.json(result, result.success ? 202 : 409);
 });
-systemLifecycleRoutes.post("/shutdown", requireAdmin, (c) => {
+function shutdownResponse(c: Context) {
 	const result = systemLifecycle.shutdown();
 	return c.json(result, result.success ? 202 : 409);
+}
+
+systemLifecycleRoutes.post("/shutdown", requireAdmin, (c) => shutdownResponse(c));
+
+/**
+ * 管理器面板的停止入口。与更新路由一样挂在全局会话认证之前。
+ * 本机回环加管理器令牌可以调用；其余请求仍要管理员会话。
+ */
+export const managerLifecycleRoutes = new Hono();
+managerLifecycleRoutes.post("/shutdown", requireAdminOrManagerToken, (c) => shutdownResponse(c));
+// 与 Ctrl+C 相同：reason=signal 走完整优雅退出，不走更新交接那条保留现场的准备流程。
+managerLifecycleRoutes.post("/signal", requireAdminOrManagerToken, (c) => {
+	const scheduled = scheduleOperatorShutdown({ reason: "signal" });
+	return c.json({ success: scheduled }, scheduled ? 202 : 409);
 });
 systemLifecycleRoutes.post("/cancel", requireAdmin, (c) => {
 	const result = systemLifecycle.cancel();

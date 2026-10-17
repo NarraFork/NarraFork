@@ -14,6 +14,7 @@
  */
 
 import { extname } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
 	DEFAULT_BRAND_ICON_COLOR,
 	normalizeBrandIconColor,
@@ -95,8 +96,10 @@ async function readSourceAsset(fileName: string): Promise<Uint8Array | null> {
 	}
 
 	candidates.push(
-		new URL(`../../../dist/frontend/${fileName}`, import.meta.url).pathname,
-		new URL(`../../../frontend/public/${fileName}`, import.meta.url).pathname,
+		// fileURLToPath 而不是 URL.pathname：后者在 Windows 上会给出 `/D:/...` 这种
+		// 带前导斜杠的无效路径，开发模式下素材会永远找不到。
+		fileURLToPath(new URL(`../../../dist/frontend/${fileName}`, import.meta.url)),
+		fileURLToPath(new URL(`../../../frontend/public/${fileName}`, import.meta.url)),
 	);
 
 	for (const candidate of candidates) {

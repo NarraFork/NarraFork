@@ -19,6 +19,7 @@ export function spawnBunTerminal(opts: TerminalSpawnOptions): TerminalRuntime {
 	const proc = Bun.spawn(opts.cmd, {
 		cwd: opts.cwd,
 		env: opts.env as Record<string, string>,
+		windowsHide: true,
 		terminal: pty,
 		// `detached` calls setsid() on POSIX, which is what actually gives the child
 		// a CONTROLLING terminal — not just a PTY on its stdio. Without it the child

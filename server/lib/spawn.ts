@@ -117,6 +117,7 @@ function getChildPids(pid: number): number[] {
 		const result = Bun.spawnSync(["pgrep", "-P", String(pid)], {
 			stdout: "pipe",
 			stderr: "ignore",
+			windowsHide: true,
 		});
 		if (result.exitCode !== 0) return [];
 		const text = new TextDecoder().decode(result.stdout);
@@ -158,6 +159,8 @@ export async function safeSpawn(opts: SafeSpawnOptions): Promise<SafeSpawnResult
 			env: opts.env,
 			stdout: "pipe",
 			stderr: "pipe",
+			// Windows 上不隐藏会让每个子进程弹出控制台窗口（GUI 模式运行的服务尤其明显）。
+			windowsHide: true,
 		});
 	} catch (err) {
 		// ENOENT means the executable was not found in PATH (e.g. git not installed)
@@ -194,6 +197,7 @@ export async function safeSpawn(opts: SafeSpawnOptions): Promise<SafeSpawnResult
 			try {
 				Bun.spawnSync(["taskkill", "/T", "/F", "/PID", String(proc.pid)], {
 					stdio: ["ignore", "ignore", "ignore"],
+					windowsHide: true,
 				});
 			} catch {
 				/* best effort */
