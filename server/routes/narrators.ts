@@ -3712,28 +3712,17 @@ narratorRoutes.get("/:id/pretext-document", async (c) => {
 				? expectedMessageVersion
 				: undefined,
 	});
-	// Read the message version AFTER the page, never concurrently.
+	// Do not re-read `messageVersion` here and reject on a mismatch.
 	//
-	// The page builder materializes a lazy fork's missing refs on demand
-	// (`ensureRefsCoverSeq`), and that backfill bumps `messageVersion`. Run in
-	// parallel, this query resolves BEFORE the backfill commits while the page
-	// carries the post-backfill version — so the equality check below failed
-	// deterministically on the first upward scroll past a fork boundary, the one
-	// place the backfill actually copies anything. Sequenced, both sides observe
-	// the same post-backfill version, and the check goes back to meaning what it
-	// says: another writer changed the narrator underneath us.
+	// The page builder already snapshotted the revision it read, and it retries
+	// when the top-level window moves. Streaming then bumps the counter on every
+	// block and tool completion. Requiring equality with the row AFTER hydration
+	// (and after this access re-check yields) discarded that coherent page and
+	// surfaced "document changed while the exact-layout page was being built"
+	// for a narrator that was simply still talking. The returned revision is the
+	// snapshot; sync catch-up covers anything newer. Lazy-ref backfill stays
+	// inside the builder, before that snapshot, so it cannot disagree with it.
 	await requireNarratorAccess(c, id, "read");
-	const narratorMeta = await db.query.narrators.findFirst({
-		where: eq(narrators.id, id),
-		columns: { messageVersion: true },
-	});
-	if (!narratorMeta) throw new NotFoundError("Narrator", id);
-	if (narratorMeta.messageVersion !== result.messageVersion)
-		throw new AppError(
-			"Narrator message version changed while the exact-layout page was being built",
-			409,
-			"PRETEXT_DOCUMENT_CHANGED",
-		);
 	return c.json(result);
 });
 
