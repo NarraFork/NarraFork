@@ -11,12 +11,39 @@ import (
 // (exec.start) receive a StreamFunc to push output; non-streaming methods
 // ignore it.
 type Dispatcher struct {
-	h         *handlers.Handlers
-	transfers *handlers.Transfers
+	h           *handlers.Handlers
+	transfers   *handlers.Transfers
+	editorReads *editorReads
 }
 
 func NewDispatcher(h *handlers.Handlers) *Dispatcher {
-	return &Dispatcher{h: h}
+	return &Dispatcher{h: h, editorReads: newEditorReads(h)}
+}
+
+// CloseEditorReads releases only this connection's read handles.
+func (d *Dispatcher) CloseEditorReads() { d.editorReads.close() }
+
+// DiscardEditorRead handles cancellation or transport failure after a read
+// returned but before its result was delivered to the consumer.
+func (d *Dispatcher) DiscardEditorRead(result any) {
+	var id string
+	switch read := result.(type) {
+	case EditorRawReadOpen:
+		id = read.ReadID
+	case EditorRawReadChunk:
+		id = read.ReadID
+	default:
+		return
+	}
+	d.editorReads.closeRead(EditorRawReadClose{ReadID: id, Abort: true})
+}
+
+// CancelEditorRead releases a pull cancelled before its handler could start.
+func (d *Dispatcher) CancelEditorRead(method string, params map[string]any) {
+	if method == "editor.read.chunk" {
+		id, _ := params["readId"].(string)
+		d.editorReads.closeRead(EditorRawReadClose{ReadID: id, Abort: true})
+	}
 }
 
 // SetTransfers wires the per-connection transfer manager (with its binary
@@ -47,6 +74,28 @@ func (d *Dispatcher) Dispatch(
 	switch method {
 	case "system.ping":
 		return map[string]any{"ok": true}, nil
+	case "editor.capabilities", "editor.stage.open", "editor.stage.append", "editor.stage.seal", "editor.stage.abort", "editor.apply", "editor.query":
+		return d.h.EditorDispatch(ctx, method, params)
+	case "editor.read.open":
+		var req EditorRawReadPreflight
+		if err := decodeEditorParams(params, &req); err != nil {
+			return nil, err
+		}
+		return d.editorReads.open(ctx, req)
+	case "editor.read.chunk":
+		var req EditorRawReadChunkRequest
+		if err := decodeEditorParams(params, &req); err != nil {
+			id, _ := params["readId"].(string)
+			d.editorReads.closeRead(EditorRawReadClose{ReadID: id, Abort: true})
+			return nil, err
+		}
+		return d.editorReads.chunk(ctx, req)
+	case "editor.read.close":
+		var req EditorRawReadClose
+		if err := decodeEditorParams(params, &req); err != nil {
+			return nil, err
+		}
+		return d.editorReads.closeRead(req)
 	case "fs.stat":
 		return d.h.FsStat(params)
 	case "fs.exists":

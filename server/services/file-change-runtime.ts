@@ -13,6 +13,7 @@ import {
 	fileChangeStatesEqual,
 } from "@shared/file-change-protocol";
 import { and, eq, isNull } from "drizzle-orm";
+import type { EditorApplyResult } from "../../shared/editor-provider-contracts";
 import type { db as applicationDb } from "../db";
 import {
 	fileAttributions,
@@ -32,6 +33,7 @@ import { hotSafe } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getNarraforkHome } from "../lib/narrafork-home";
+import type { EditorDurableOperation } from "./editor-remote-operation-store";
 import { applyLocalFileChange } from "./file-change-apply-result";
 import { FileChangeBlobCatalog, FileChangeBlobCatalogError } from "./file-change-blob-catalog";
 import {
@@ -139,6 +141,19 @@ export type PreparedLocalFileChange = PreparedFileChange<ToolResult>;
 
 /** A real authenticated HTTP request, never a synthetic narrator tool call. */
 export interface EditorFileChangeRequest<Result> {
+	resourceKey?: string;
+	workspaceRevision?: number;
+	/** Editor-only IO seam, selected by the trusted provider, never HTTP input. */
+	io?: FileChangeLocalIo;
+	/** Remote editor targets reuse this runtime's coordinator/evidence/blob namespace,
+	 * but never its local filesystem scope/footprint resolution. */
+	remote?: {
+		backend: ExecutionBackend;
+		runtime: WorkspaceRuntimeBinding;
+		currentRuntime(): WorkspaceRuntimeBinding | null;
+		rootIdentity: string;
+		assertParent(signal: AbortSignal): Promise<void>;
+	};
 	requestId: string;
 	userId: string;
 	/** Recording context only; the actor and human projection have no narrator id. */
@@ -151,6 +166,8 @@ export interface EditorFileChangeRequest<Result> {
 	input: Record<string, unknown>;
 	/** Reauthorize the SAME frozen target; cannot return a replacement path. */
 	authorize(): Promise<void>;
+	/** Receipt metadata ACL only; does not reopen the original file/root. */
+	authorizeReceipt?(): Promise<void>;
 	/** Pure construction from the raw before captured inside the shared lease. */
 	construct(
 		before: LocalFileObservation,
@@ -197,6 +214,8 @@ export class EditorFileChangeUncertainError extends Error {
 export type FileChangeToolName = "Write" | "Edit" | "StructSed";
 
 type BoundFileChange<Result> = {
+	io?: FileChangeLocalIo;
+	remote?: EditorFileChangeRequest<Result>["remote"];
 	backend: ExecutionBackend;
 	cwd: string;
 	lexicalPath: string;
@@ -226,6 +245,7 @@ type BoundFileChange<Result> = {
 	/** Called only at an explicit validation fence before lease/intent/IO admission. */
 	beforeIntentValidation?(): Promise<void>;
 	onDispatch?(): void;
+	onNotApplied?(): void;
 };
 
 export interface LocalFileChangeRequest {
@@ -284,9 +304,9 @@ type Namespace = {
 };
 
 /**
- * Local IO vertical slice only. Other writers, remote guarded RPC and revert are
- * NOT implemented by this service. The journal is the local durable receipt;
- * failed journal commits retain the coordinator quarantine, never replay IO.
+ * Local tools and editor-only local/remote providers share the evidence/lease domain.
+ * Remote editor scope/observation never touches the Host filesystem. Other remote
+ * tools and revert retain their own paths. Failed settlement keeps quarantine; never replay IO.
  */
 export class LocalFileChangeRuntime {
 	readonly evidence: FileChangeEvidenceService;
@@ -294,13 +314,19 @@ export class LocalFileChangeRuntime {
 	private readonly database: RuntimeDb;
 	private readonly readRuntime: (deviceId: string) => WorkspaceRuntimeBinding | null;
 	private readonly io: FileChangeLocalIo;
+	private readonly editorRuntimes = new Map<string, () => WorkspaceRuntimeBinding | null>();
 	private initialization?: Promise<Namespace>;
 	private readonly noDispatchObservations = new WeakSet<HostNoDispatchObservation>();
 
 	constructor(private readonly options: LocalFileChangeRuntimeOptions) {
 		if (!isAbsolute(options.privateRoot)) throw new Error("Private evidence root must be absolute");
 		this.database = options.db;
-		this.readRuntime = options.readRuntime ?? localFileChangeRuntimeBinding;
+		this.readRuntime =
+			options.readRuntime ??
+			((deviceId) =>
+				deviceId === LOCAL_DEVICE_ID
+					? localFileChangeRuntimeBinding(deviceId)
+					: (this.editorRuntimes.get(deviceId)?.() ?? null));
 		this.io = options.io ?? fileChangeLocalIo;
 		this.evidence = options.evidence ?? new FileChangeEvidenceService(options.db);
 		this.coordinator = new WorkspaceWriteCoordinator({
@@ -308,6 +334,95 @@ export class LocalFileChangeRuntime {
 			readRuntime: this.readRuntime,
 			state: options.coordinatorState,
 		});
+	}
+
+	/** Reconcile only a positively terminal engine receipt against its ORIGINAL intent.
+	 * No target read/write, current-hash inference, new runtime adoption, or rollback claim. */
+	settleEditorReceipt(record: EditorDurableOperation, result: EditorApplyResult): void {
+		const operation = this.evidence.getOperation(record.hostOperationId);
+		const effect = this.evidence.listEffects(record.hostOperationId, { limit: 2 }).items[0];
+		const verify = () => {
+			if (
+				!operation ||
+				!effect ||
+				!operation.executionBindingJson ||
+				operation.sourceKind !== "editor" ||
+				operation.sourceId !== record.operationId ||
+				operation.ownerUserId !== record.userId ||
+				operation.narratorId !== record.narratorId ||
+				operation.requestDigest !== record.requestDigest ||
+				effect.id !== record.effectId ||
+				effect.identityJson.deviceId !== record.deviceId ||
+				effect.identityJson.canonicalPath !== record.identity.canonicalPath ||
+				result.operationId !== record.operationId ||
+				!["committed", "rejected"].includes(result.outcome) ||
+				(result.outcome === "committed" &&
+					(result.rawDigest !== record.rawDigest ||
+						result.totalBytes !== record.bytes ||
+						effect.intendedAfterStateJson.kind !== "regular" ||
+						effect.intendedAfterStateJson.blob.digest !== result.rawDigest))
+			)
+				throw new Error("Editor receipt does not match its original owned intent");
+		};
+		verify();
+		if (!operation || !effect || !operation.executionBindingJson)
+			throw new Error("Editor intent unavailable");
+		const executionBinding = operation.executionBindingJson;
+		if (effect.settlement === "settled") {
+			if (
+				!effect.executionConfirmed ||
+				effect.executionReceiptJson?.outcome !==
+					(result.outcome === "committed" ? "applied" : "not_applied")
+			)
+				throw new Error("Editor terminal receipt contradicts the original settled evidence");
+			return;
+		}
+		const scope = this.evidence.getScope(effect.identityJson.scopeId);
+		if (!scope) throw new Error("Original editor scope unavailable");
+		this.coordinator.acknowledgeEditorReceipt(
+			{
+				leaseId: record.leaseId,
+				operationId: operation.id,
+				effectId: effect.id,
+				mutationId: effect.mutationId,
+			},
+			verify,
+		);
+		const reservation = this.coordinator.reserveRecovery({ scope, leaseId: record.leaseId });
+		try {
+			reservation.complete((tx) => {
+				verify();
+				this.evidence.settleEffect(
+					{
+						operationId: operation.id,
+						mutationId: effect.mutationId,
+						requestDigest: record.requestDigest,
+						receipt: {
+							receiptId: generateId(),
+							mutationId: effect.mutationId,
+							requestDigest: record.requestDigest,
+							executionBinding,
+							confirmed: true,
+							outcome: result.outcome === "committed" ? "applied" : "not_applied",
+							observedAfter:
+								result.outcome === "committed"
+									? effect.intendedAfterStateJson
+									: { kind: "unknown", reason: "result_unknown" },
+						},
+						attributionCeiling: "observed_ambiguous",
+					},
+					tx,
+				);
+				if (operation.executionOutcome === "running")
+					this.evidence.finishOperation(
+						operation.id,
+						result.outcome === "committed" ? "succeeded" : "failed",
+						tx,
+					);
+			});
+		} finally {
+			reservation.release();
+		}
 	}
 
 	/** Serialize cache IO across runtime instances, independently of workspace locks. */
@@ -872,13 +987,19 @@ export class LocalFileChangeRuntime {
 		request: EditorFileChangeRequest<Result>,
 	): Promise<FileChangeCompletion<Result>> {
 		request = Object.freeze({ ...request, input: snapshotFileToolInput(request.input) });
-		const runtime = this.readRuntime(LOCAL_DEVICE_ID);
+		const runtime = request.remote?.runtime ?? this.readRuntime(LOCAL_DEVICE_ID);
+		const backend = request.remote?.backend ?? localBackend;
+		if (request.remote) {
+			if (!this.editorRuntimes.has(backend.deviceId) && this.editorRuntimes.size >= 256)
+				throw new Error("Editor device runtime capacity exceeded");
+			this.editorRuntimes.set(backend.deviceId, request.remote.currentRuntime);
+		}
 		if (!runtime || !request.requestId || !request.userId || !request.narratorId)
 			throw new Error("Authenticated editor request and local runtime required");
 		if (
-			!isAbsolute(request.cwd) ||
-			!isAbsolute(request.lexicalPath) ||
-			!isAbsolute(request.canonicalPath)
+			!backend.paths.isAbsolute(request.cwd) ||
+			!backend.paths.isAbsolute(request.lexicalPath) ||
+			!backend.paths.isAbsolute(request.canonicalPath)
 		)
 			throw new LocalFileValidationError("Editor requires a frozen absolute target");
 		await request.authorize();
@@ -887,7 +1008,7 @@ export class LocalFileChangeRuntime {
 		try {
 			return await this.executeBound({
 				...request,
-				backend: localBackend,
+				backend,
 				runtime: Object.freeze({ ...runtime }),
 				sourceKind: "editor",
 				sourceId: request.requestId,
@@ -908,6 +1029,9 @@ export class LocalFileChangeRuntime {
 				},
 				onDispatch: () => {
 					dispatched = true;
+				},
+				onNotApplied: () => {
+					dispatched = false;
 				},
 			});
 		} catch (error) {
@@ -1137,7 +1261,7 @@ export class LocalFileChangeRuntime {
 					runtime: request.runtime,
 					signal,
 					ranges: footprint.ranges,
-					executionClass: "local_file_io",
+					executionClass: request.io ? "unknown" : "local_file_io",
 				},
 				(lease) => {
 					diagnostics.identify({ leaseId: lease.leaseId });
@@ -1372,11 +1496,37 @@ export class LocalFileChangeRuntime {
 			});
 		}
 	}
+	private prepareEditorRemoteScope(sourceInstanceId: string, request: BoundFileChange<unknown>) {
+		const remote = request.remote;
+		if (!remote || request.sourceKind !== "editor" || !request.io)
+			throw new Error("Remote writes require an editor provider");
+		const { backend } = remote;
+		const root = request.cwd,
+			rootIdentity = remote.rootIdentity;
+		const scope = this.evidence.prepareScope({
+			sourceInstanceId,
+			deviceId: backend.deviceId,
+			workspaceInstanceId: hash([sourceInstanceId, backend.deviceId, root, rootIdentity]),
+			canonicalRoot: root,
+			pathFlavor: backend.pathFlavor as "posix" | "windows",
+		});
+		if (scope.rootIdentityJson === null)
+			this.evidence.recordScopeVerification({
+				scopeId: scope.id,
+				canonicalRoot: root,
+				rootIdentity: { object: rootIdentity },
+			});
+		else if (scope.rootIdentityJson.object !== rootIdentity)
+			throw new Error("Remote root identity changed");
+		return { scope, root, rootIdentity };
+	}
+
 	private async executeBoundLocked<Result>(
 		request: BoundFileChange<Result>,
 	): Promise<FileChangeCompletion<Result>> {
 		const startedAt = performance.now();
 		const { backend, lexicalPath, canonicalPath } = request;
+		const io = request.io ?? this.io;
 		if (backend.pathFlavor !== "posix" && backend.pathFlavor !== "windows")
 			throw new Error("Local evidence requires a filesystem path grammar");
 		const operationBudget = AbortSignal.timeout(30_000);
@@ -1396,17 +1546,20 @@ export class LocalFileChangeRuntime {
 			if (!backend.paths.equals(path.canonicalPath, canonicalPath))
 				throw new LocalFileValidationError("Authorized canonical path changed before capture");
 			diagnostics.enter("prepare_scope");
-			const { scope, root, rootIdentity } = await this.prepareWorkspaceScope(
-				source,
-				backend,
-				request.cwd,
-				signal,
-				canonicalPath,
-			);
+			const { scope, root, rootIdentity } = request.remote
+				? this.prepareEditorRemoteScope(source.sourceInstanceId, request)
+				: await this.prepareWorkspaceScope(source, backend, request.cwd, signal, canonicalPath);
 			diagnostics.enter("capture_footprint");
-			const footprint = await captureLocalWriteFootprint(canonicalPath, signal);
+			if (request.remote) await request.remote.assertParent(signal);
+			const footprint = request.remote
+				? {
+						anchor: root,
+						anchorIdentity: rootIdentity,
+						ranges: [{ kind: "file" as const, canonicalPath }],
+					}
+				: await captureLocalWriteFootprint(canonicalPath, signal);
 			const identity = createFileChangeIdentity(scope, {
-				deviceId: LOCAL_DEVICE_ID,
+				deviceId: backend.deviceId,
 				pathFlavor: backend.pathFlavor,
 				canonicalPath,
 				lexicalPath,
@@ -1419,7 +1572,7 @@ export class LocalFileChangeRuntime {
 				canonicalPath,
 			]);
 			const historyTarget = {
-				deviceId: LOCAL_DEVICE_ID,
+				deviceId: backend.deviceId,
 				pathFlavor: backend.pathFlavor,
 				canonicalPath,
 			};
@@ -1434,7 +1587,7 @@ export class LocalFileChangeRuntime {
 					runtime: request.runtime,
 					signal,
 					ranges: footprint.ranges,
-					executionClass: "local_file_io",
+					executionClass: request.io ? "unknown" : "local_file_io",
 				},
 				// Fixed order: coordinator first, legacy mutex second. This preserves
 				// coordinator nesting rejection, rollback barriers and bounded admission.
@@ -1520,13 +1673,13 @@ export class LocalFileChangeRuntime {
 												throw error;
 											}
 											await request.assertBinding();
-											await assertLocalWriteFootprint(footprint);
+											if (!request.remote) await assertLocalWriteFootprint(footprint);
 											lease.assertCurrent(lease.executionBinding);
 											const actual = await backend.resolvePathIdentity(lexicalPath);
 											if (
 												!backend.paths.equals(actual.canonicalPath, canonicalPath) ||
 												actual.runtimeGeneration !== request.runtime.runtimeGeneration ||
-												(await localDirectoryIdentity(root)) !== rootIdentity
+												(!request.remote && (await localDirectoryIdentity(root)) !== rootIdentity)
 											)
 												throw new LocalFileValidationError("Frozen local target/root changed");
 											lease.assertCurrent(lease.executionBinding);
@@ -1537,7 +1690,7 @@ export class LocalFileChangeRuntime {
 										let prepared: PreparedFileChange<Result>;
 										try {
 											diagnostics.enter("read_before");
-											before = await this.io.read(canonicalPath, signal);
+											before = await io.read(canonicalPath, signal);
 											// Reading awaits IO too: do not return a conflict body after its ACL or
 											// canonical target changed while those bytes were being collected.
 											if (request.sourceKind === "editor") await assertTarget();
@@ -1666,8 +1819,31 @@ export class LocalFileChangeRuntime {
 										});
 										diagnostics.enter("apply_adapter");
 										const execution = await applyLocalFileChange(
-											this.io,
+											io,
 											{
+												editor:
+													request.sourceKind === "editor"
+														? {
+																sourceId: request.sourceId,
+																userId: request.userId as string,
+																narratorId: request.narratorId,
+																operationId: operation.id,
+																effectId: effect.id,
+																mutationId: effect.mutationId,
+																requestDigest,
+																leaseId: lease.leaseId,
+																preparedResult: prepared.result,
+																snapshotRevision: Number(request.input.snapshotRevision),
+																hashKind:
+																	request.input.hashKind === "raw-sha256"
+																		? "raw-sha256"
+																		: undefined,
+																executionBinding: lease.executionBinding,
+																scope,
+																before: beforeState,
+																intended: afterState,
+															}
+														: undefined,
 												backend,
 												lexicalPath,
 												canonicalPath,
@@ -1685,6 +1861,7 @@ export class LocalFileChangeRuntime {
 											!diagnostics.hasFailure(execution.result.error)
 										)
 											diagnostics.fail(execution.result.error);
+										if (execution.result.kind === "not_applied") request.onNotApplied?.();
 										const applied = execution.result.kind === "applied";
 										let ioError: unknown = execution.result.error;
 										let observed: LocalFileObservation | undefined;
@@ -1693,7 +1870,7 @@ export class LocalFileChangeRuntime {
 											diagnostics.enter("after_validate");
 											await assertTarget();
 											diagnostics.enter("after_read");
-											observed = await this.io.read(canonicalPath, AbortSignal.timeout(5_000));
+											observed = await io.read(canonicalPath, AbortSignal.timeout(5_000));
 										} catch (error) {
 											diagnostics.fail(error);
 											ioError ??= error;
@@ -1724,6 +1901,16 @@ export class LocalFileChangeRuntime {
 													AbortSignal.timeout(5_000),
 												);
 											}
+											// A committed helper reply does not make a failed Host observation
+											// immutable evidence. Leave it recoverable by the original query,
+											// just as for a lost reply; generic tool receipts remain unchanged.
+											const deferredEditorReceipt =
+												!!request.io &&
+												(execution.receiptOutcome === "unknown" ||
+													(applied && !fileChangeStatesEqual(afterState, observedAfter)));
+											if (deferredEditorReceipt) lease.markUncertain(true);
+											if (deferredEditorReceipt)
+												observedAfter = { kind: "unknown", reason: "result_unknown" };
 											const receipt: FileChangeExecutionReceipt = {
 												receiptId: generateId(),
 												mutationId: effect.mutationId,
@@ -1741,7 +1928,7 @@ export class LocalFileChangeRuntime {
 													const value = this.evidence.settleEffect(
 														{
 															...selector,
-															receipt,
+															receipt: deferredEditorReceipt ? null : receipt,
 															attributionCeiling,
 															linesAdded: prepared.lineStats?.added,
 															linesRemoved: prepared.lineStats?.removed,
@@ -1750,15 +1937,16 @@ export class LocalFileChangeRuntime {
 													);
 													// A lock retry may outlive cancellation. The receipt stays
 													// fixed, but sample the tool outcome at the successful commit.
-													this.evidence.finishOperation(
-														operation.id,
-														signal.aborted
-															? "interrupted"
-															: ioError || !verified
-																? "failed"
-																: "succeeded",
-														tx,
-													);
+													if (!deferredEditorReceipt)
+														this.evidence.finishOperation(
+															operation.id,
+															signal.aborted
+																? "interrupted"
+																: ioError || !verified
+																	? "failed"
+																	: "succeeded",
+															tx,
+														);
 													return {
 														outcome:
 															value.settlement === "settled" ? execution.leaseOutcome : "unknown",
@@ -1916,7 +2104,7 @@ export class LocalFileChangeRuntime {
 				.insert(fileAttributions)
 				.values({
 					id: generateId(),
-					deviceId: LOCAL_DEVICE_ID,
+					deviceId: scope.deviceId,
 					workspacePath: scope.canonicalRoot,
 					filePath: effect.identityJson.displayPath,
 					narratorId: request.sourceKind === "editor" ? null : request.narratorId,
@@ -2093,6 +2281,8 @@ export async function registerLocalBashActivity(
 	// runtime with a separate path-only bucket and the same physical barriers.
 	return (await currentRuntime()).registerBashActivity({ ...request, target });
 }
+
+export { currentRuntime as getCurrentLocalFileChangeRuntime };
 
 async function currentRuntime(): Promise<LocalFileChangeRuntime> {
 	return runtimeContext.getStore() ?? getDefaultLocalFileChangeRuntime();

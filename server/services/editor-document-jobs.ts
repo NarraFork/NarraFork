@@ -1,4 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
+import { constants } from "node:fs";
+import { lstat, open } from "node:fs/promises";
 import { Worker } from "node:worker_threads";
 import { EDITOR_IO_TIMEOUT_MS } from "../../shared/editor-document";
 import { AppError } from "../lib/errors";
@@ -44,6 +46,69 @@ export class EditorDocumentJobs {
 	private queue: Waiting[] = [];
 	private context = new AsyncLocalStorage<Permit>();
 	private resolvedWorkerSpecifier?: string;
+	private transfers = 0;
+	private transferBytes = 0;
+	private transferQueue: { bytes: number; start(): void }[] = [];
+	private pumpTransfers() {
+		while (this.transfers < 8) {
+			const index = this.transferQueue.findIndex(
+				(entry) => this.transferBytes + entry.bytes <= 128 * 1024 * 1024,
+			);
+			if (index < 0) return;
+			this.transferQueue.splice(index, 1)[0].start();
+		}
+	}
+	/** Independent from per-user IO: held until the response reaches EOF or is cancelled. */
+	acquireTransfer(
+		bytes: number,
+		external?: AbortSignal,
+	): Promise<{ signal: AbortSignal; release(): void }> {
+		if (external?.aborted) return Promise.reject(timeoutError());
+		if (!Number.isSafeInteger(bytes) || bytes < 0 || bytes > 64 * 1024 * 1024)
+			return Promise.reject(
+				new AppError("Invalid editor transfer size", 422, "EDITOR_INVALID_CONTENT"),
+			);
+		if (this.transferQueue.length >= 64)
+			return Promise.reject(new AppError("Editor transfer queue is full", 429, "EDITOR_BUSY"));
+		return new Promise((resolve, reject) => {
+			const controller = new AbortController();
+			let admitted = false;
+			let released = false;
+			const release = () => {
+				if (released) return;
+				released = true;
+				clearTimeout(timer);
+				external?.removeEventListener("abort", abort);
+				const index = this.transferQueue.indexOf(entry);
+				if (index >= 0) this.transferQueue.splice(index, 1);
+				if (admitted) {
+					this.transfers--;
+					this.transferBytes -= bytes;
+				}
+				this.pumpTransfers();
+			};
+			const abort = () => {
+				controller.abort(timeoutError());
+				if (!admitted) {
+					release();
+					reject(timeoutError());
+				}
+			};
+			const start = () => {
+				if (released) return;
+				admitted = true;
+				this.transfers++;
+				this.transferBytes += bytes;
+				resolve({ signal: controller.signal, release });
+			};
+			const entry = { bytes, start };
+			const timer = setTimeout(abort, EDITOR_IO_TIMEOUT_MS);
+			timer.unref();
+			external?.addEventListener("abort", abort, { once: true });
+			this.transferQueue.push(entry);
+			this.pumpTransfers();
+		});
+	}
 	/** Explicit specifiers are a trusted test seam, never taken from HTTP metadata. */
 	constructor(private readonly workerSpecifiers?: readonly string[]) {}
 	withIo<T>(
@@ -110,7 +175,31 @@ export class EditorDocumentJobs {
 		request: EditorWorkerRequest,
 		signal?: AbortSignal,
 	): Promise<EditorWorkerResult> {
-		return this.withIo(userId, (admitted) => this.worker(request, admitted), signal);
+		return this.withIo(
+			userId,
+			async (admitted) => {
+				if (request.action !== "raw-seal") return this.worker(request, admitted);
+				const entry = await lstat(request.path);
+				if (!entry.isFile() || entry.nlink !== 1)
+					throw new AppError(
+						"Raw stage is not private regular storage",
+						422,
+						"EDITOR_INVALID_CONTENT",
+					);
+				const file = await open(
+					request.path,
+					constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0),
+				);
+				try {
+					// Bun termination does not reliably close worker-owned FileHandles. Keep
+					// ownership here; workerAt joins exit before this close, even on cancellation.
+					return await this.worker({ ...request, fd: file.fd }, admitted);
+				} finally {
+					await file.close();
+				}
+			},
+			signal,
+		);
 	}
 	private async worker(
 		request: EditorWorkerRequest,
@@ -171,7 +260,7 @@ export class EditorDocumentJobs {
 						reject(new AppError("Editor worker did not become ready", 503, "EDITOR_WORKER_FAILED")),
 					WORKER_READY_TIMEOUT_MS,
 				);
-				let response: { result?: EditorWorkerResult; error?: string } | undefined;
+				let response: { result?: EditorWorkerResult; error?: string; code?: string } | undefined;
 				worker.once("error", reject);
 				worker.once("exit", (code) => {
 					exited = true;
@@ -181,7 +270,13 @@ export class EditorDocumentJobs {
 						);
 					else if (response.error || !response.result)
 						reject(
-							new AppError(response.error ?? "Editor worker failed", 422, "EDITOR_INVALID_CONTENT"),
+							new AppError(
+								response.error ?? "Editor worker failed",
+								response.code === "EDITOR_SOURCE_CHANGED" ? 409 : 422,
+								response.code === "EDITOR_SOURCE_CHANGED"
+									? response.code
+									: "EDITOR_INVALID_CONTENT",
+							),
 						);
 					else resolve(response.result);
 				});
@@ -192,6 +287,7 @@ export class EditorDocumentJobs {
 						version?: number;
 						result?: EditorWorkerResult;
 						error?: string;
+						code?: string;
 					}) => {
 						if (!ready) {
 							if (message.type !== "editor-worker-ready" || message.version !== 1) {

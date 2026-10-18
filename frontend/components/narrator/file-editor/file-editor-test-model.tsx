@@ -13,6 +13,16 @@ export class TestEditorModel {
 	selected: FileSelection | null = null;
 	navigation: FileSelection | undefined;
 	props: MonacoEditorProps;
+	disposed = false;
+	private listeners = new Set<(event: editor.IModelContentChangedEvent) => void>();
+	onDidChangeContent = (listener: (event: editor.IModelContentChangedEvent) => void) => {
+		this.listeners.add(listener);
+		return { dispose: () => this.listeners.delete(listener) };
+	};
+	dispose = () => {
+		this.disposed = true;
+		this.listeners.clear();
+	};
 	constructor(props: MonacoEditorProps) {
 		this.props = props;
 		this.text = props.initialValue.replace(/\r\n?/g, "\n");
@@ -20,6 +30,7 @@ export class TestEditorModel {
 	getVersionId = () => this.revision;
 	getAlternativeVersionId = () => this.alt;
 	getValueLength = () => this.text.length;
+	getLineCount = () => this.text.split("\n").length;
 	getValue = () => this.text;
 	createSnapshot = () => {
 		let text: string | null = this.text;
@@ -38,7 +49,7 @@ export class TestEditorModel {
 		this.redoEntries = [];
 		this.selected = null;
 		this.props.onSelectionChange?.(null, false);
-		this.publish();
+		this.publish(true);
 	};
 	edit(text: string) {
 		this.undoEntries.push({ text: this.text, alt: this.alt });
@@ -69,7 +80,9 @@ export class TestEditorModel {
 		this.revision++;
 		this.publish();
 	};
-	publish() {
+	publish(isFlush = false) {
+		for (const listener of this.listeners)
+			listener({ isFlush } as editor.IModelContentChangedEvent);
 		this.props.onDocumentChange?.({
 			revision: this.revision,
 			alternativeVersionId: this.alt,
@@ -89,7 +102,10 @@ export class TestEditorModel {
 export const mountedTestModels = new Map<string, TestEditorModel>();
 export function TestMonacoEditor(props: MonacoEditorProps) {
 	const ref = useRef<TestEditorModel | null>(null);
-	if (!ref.current) ref.current = new TestEditorModel(props);
+	if (!ref.current)
+		ref.current = props.model
+			? (props.model as unknown as TestEditorModel)
+			: new TestEditorModel(props);
 	const model = ref.current;
 	model.props = props;
 	useEffect(() => {

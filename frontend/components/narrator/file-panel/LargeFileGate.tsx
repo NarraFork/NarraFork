@@ -1,13 +1,17 @@
 import { Button, Center, Group, Loader, NumberInput, Stack, Text } from "@mantine/core";
+import { EDITOR_FILE_MAX_BYTES, type EditorReadMode } from "@shared/editor-document";
 import {
 	FILE_PANEL_PAGE_BYTES,
 	type FilePanelPage,
 	MAX_FILE_PANEL_BYTES,
 } from "@shared/file-reference";
-import { type ReactNode, useEffect, useState } from "react";
+import { type ReactNode, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { editorDocumentApi } from "../../../lib/api/editor-documents";
 import { type FilePanelReadOrigin, fileReferenceApi } from "../../../lib/api/file-references";
 import { formatLocaleNumber } from "../../../lib/intl-format";
+import { useEditorRecoveryHost } from "../file-editor/EditorRecoveryBoundary";
+import { useEditorPanelVisible } from "../narrator-panel-visibility";
 
 export const FILE_PANEL_AUTO_LOAD_BYTES = 1024 * 1024;
 
@@ -62,6 +66,8 @@ function LargeFileResource({
 	persistenceKey,
 }: Props) {
 	const { t, i18n } = useTranslation("narrator");
+	const visible = useEditorPanelVisible();
+	const successfulInfo = useRef("");
 	const [allowed, setAllowed] = useState(() => {
 		if (confirmed === true) return true;
 		try {
@@ -72,27 +78,88 @@ function LargeFileResource({
 	});
 	const origin: FilePanelReadOrigin =
 		!referenceOrigin && deviceId === "local" ? (legacyViewer ? "preview" : "legacy") : "reference";
-	const [info, setInfo] = useState<{ fileName: string; size: number } | null>(null);
+	const [info, setInfo] = useState<{
+		fileName: string;
+		size: number;
+		readMode?: EditorReadMode;
+		requestKey: string;
+	} | null>(null);
 	const [error, setError] = useState<string | null>(null);
 	const [retry, setRetry] = useState(0);
-	// biome-ignore lint/correctness/useExhaustiveDependencies: retry explicitly reissues the bounded request
+	const recovery = useEditorRecoveryHost({ narratorId, deviceId, filePath, referenceOrigin });
+	// Raw providers enforce their own complete-read/profile budgets. Keep the existing
+	// explicit large-file confirmation, but do not strand a safe 20 MiB editor in v1 pages.
+	const requestKey = JSON.stringify([
+		narratorId,
+		deviceId,
+		filePath,
+		origin,
+		retry,
+		recovery?.protocol,
+	]);
+	const rawEditor =
+		!legacyViewer &&
+		recovery?.protocol === "raw-v2" &&
+		recovery.readMode === "raw-v2" &&
+		info?.readMode === "raw-v2" &&
+		info.requestKey === requestKey &&
+		info.size <= EDITOR_FILE_MAX_BYTES;
+	const presentation = !narratorId
+		? "editor"
+		: error
+			? "blocked"
+			: !info
+				? "pending"
+				: filePanelLoadPolicy(info.size) === "auto" || (rawEditor && (allowed || confirmed))
+					? "editor"
+					: "blocked";
+	// This notification only coordinates cached recovery outside the gate. It never
+	// changes the size/read policy below or authorizes a current content load.
 	useEffect(() => {
-		if (!narratorId) return;
+		recovery?.gate(presentation, retry);
+	}, [recovery, presentation, retry]);
+	useEffect(() => {
+		if (!visible || !narratorId || successfulInfo.current === requestKey) return;
 		const controller = new AbortController();
 		// Revalidating a legacy-to-reference upgrade must not dispose a loaded draft.
 		// Resource identity changes already remount this component with empty metadata.
 		setError(null);
 		void fileReferenceApi
 			.info(narratorId, { deviceId, path: filePath }, controller.signal, origin)
-			.then((value) => {
-				if (!controller.signal.aborted) setInfo(value);
+			.then(async (value) => {
+				let readMode: EditorReadMode | undefined;
+				if (
+					!legacyViewer &&
+					recovery?.protocol === "raw-v2" &&
+					value.size > FILE_PANEL_AUTO_LOAD_BYTES
+				)
+					readMode = await editorDocumentApi.readMode(
+						narratorId,
+						{ path: filePath, deviceId, origin: referenceOrigin ? "reference" : "legacy" },
+						controller.signal,
+					);
+				if (!controller.signal.aborted) {
+					if (readMode) recovery?.setReadMode(readMode);
+					successfulInfo.current = requestKey;
+					setInfo({ ...value, readMode, requestKey });
+				}
 			})
 			.catch((reason: unknown) => {
 				if (!controller.signal.aborted)
 					setError(String(reason instanceof Error ? reason.message : reason));
 			});
 		return () => controller.abort();
-	}, [narratorId, deviceId, filePath, origin, retry]);
+	}, [
+		narratorId,
+		deviceId,
+		filePath,
+		origin,
+		visible,
+		recovery,
+		referenceOrigin,
+		requestKey,
+		legacyViewer,
+	]);
 
 	// Legacy unbound local previews retain their existing bounded reader.
 	if (!narratorId) return children;
@@ -114,7 +181,7 @@ function LargeFileResource({
 			</Center>
 		);
 	const policy = filePanelLoadPolicy(info.size);
-	if (policy === "auto") return children;
+	if (policy === "auto" || (rawEditor && (allowed || confirmed))) return children;
 	if (policy === "confirm" && (allowed || confirmed)) {
 		return (
 			<LargeFilePages
@@ -180,11 +247,13 @@ function LargeFilePages({
 	const [offset, setOffset] = useState(0);
 	const [previous, setPrevious] = useState<number[]>([]);
 	const [jump, setJump] = useState<string | number>(1);
+	const visible = useEditorPanelVisible();
 	const [page, setPage] = useState<FilePanelPage | null>(null);
 	const [error, setError] = useState<string | null>(null);
 	const [retry, setRetry] = useState(0);
 	// biome-ignore lint/correctness/useExhaustiveDependencies: retry explicitly reissues the bounded request
 	useEffect(() => {
+		if (!visible) return;
 		const controller = new AbortController();
 		setPage(null);
 		setError(null);
@@ -198,7 +267,7 @@ function LargeFilePages({
 					setError(reason instanceof Error ? reason.message : String(reason));
 			});
 		return () => controller.abort();
-	}, [narratorId, deviceId, filePath, offset, origin, retry]);
+	}, [narratorId, deviceId, filePath, offset, origin, retry, visible]);
 	const size = page?.size ?? info.size;
 	const pageCount = Math.max(1, Math.ceil(size / FILE_PANEL_PAGE_BYTES));
 	return (

@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 )
 
 // RuleAction selects whether a matching PathRule permits or refuses a path.
@@ -48,8 +49,91 @@ type resolvedRule struct {
 // names after validation. Use --disable-shell plus OS-level isolation when the
 // executor must run across a hard trust boundary.
 type PathGuard struct {
-	rules      []resolvedRule
-	restricted bool
+	rules        []resolvedRule
+	restricted   bool
+	privateMu    sync.RWMutex
+	privateRoots []string
+}
+
+var errExecutorPrivatePath = errors.New("executor private state is not accessible through structured filesystem operations")
+
+// These roots are executor-owned state, not operator-configurable allow/deny
+// rules. They stay denied even after a later broad allow or an unrestricted guard.
+// The engine supplies already canonical roots; raw requests are checked before
+// and after resolution so lexical paths and symlink/junction aliases are covered.
+func (g *PathGuard) protectPrivateRoot(root string) {
+	g.privateMu.Lock()
+	defer g.privateMu.Unlock()
+	for _, existing := range g.privateRoots {
+		if samePath(root, existing) {
+			return
+		}
+	}
+	g.privateRoots = append(g.privateRoots, filepath.Clean(root))
+}
+func (g *PathGuard) privatePath(path string) bool {
+	g.privateMu.RLock()
+	defer g.privateMu.RUnlock()
+	for _, root := range g.privateRoots {
+		if pathWithin(root, path) || runtime.GOOS == "windows" && strings.HasPrefix(strings.ToLower(filepath.Clean(path)), strings.ToLower(root)+":") {
+			return true
+		}
+	}
+	return false
+}
+func (g *PathGuard) privateRootsWithin(path string) []string {
+	g.privateMu.RLock()
+	defer g.privateMu.RUnlock()
+	var roots []string
+	for _, root := range g.privateRoots {
+		if pathWithin(path, root) {
+			roots = append(roots, root)
+		}
+	}
+	return roots
+}
+func (g *PathGuard) hasPrivateRoots() bool {
+	g.privateMu.RLock()
+	defer g.privateMu.RUnlock()
+	return len(g.privateRoots) > 0
+}
+
+// Legacy git.diff accepts file operands (including --no-index and --output).
+// Protect internal paths there too without treating revision names as FS grants.
+func (g *PathGuard) checkPrivateArgument(cwd, arg string) error {
+	if !g.hasPrivateRoots() {
+		return nil
+	}
+	values := []string{arg}
+	if _, value, ok := strings.Cut(arg, "="); ok {
+		values = append(values, value)
+	}
+	if strings.HasPrefix(arg, "-O") && len(arg) > 2 {
+		values = append(values, arg[2:])
+	}
+	for _, value := range values {
+		if value == "" {
+			continue
+		}
+		candidate := value
+		if !filepath.IsAbs(candidate) {
+			candidate = filepath.Join(cwd, candidate)
+		}
+		if g.privatePath(candidate) || len(g.privateRootsWithin(candidate)) > 0 {
+			return errExecutorPrivatePath
+		}
+		resolved, err := g.CheckCreate(candidate)
+		if errors.Is(err, errExecutorPrivatePath) {
+			return err
+		}
+		if err == nil && len(g.privateRootsWithin(resolved)) > 0 {
+			return errExecutorPrivatePath
+		}
+		if err != nil && filepath.IsAbs(value) {
+			return err
+		}
+	}
+	return nil
 }
 
 // NewPathGuard builds a guard from allow-only roots. Retained for callers (and
@@ -85,6 +169,7 @@ func NewPathGuardWithRules(rules []PathRule) *PathGuard {
 			continue
 		}
 		resolved, err := canonicalGuardPath(abs)
+
 		if err != nil {
 			if rule.Action == RuleDeny {
 				guard.rules = append(guard.rules, resolvedRule{
@@ -124,8 +209,16 @@ func (g *PathGuard) CheckExisting(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if g.privatePath(abs) {
+		return "", errExecutorPrivatePath
+	}
 	resolved, err := canonicalGuardPath(abs)
 	if err != nil {
+		if g.hasPrivateRoots() && errors.Is(err, fs.ErrNotExist) {
+			if _, createErr := g.CheckCreate(abs); errors.Is(createErr, errExecutorPrivatePath) {
+				return "", errExecutorPrivatePath
+			}
+		}
 		return "", fmt.Errorf("resolve path %q: %w", abs, err)
 	}
 	return g.checkResolved(filepath.Clean(resolved))
@@ -140,55 +233,83 @@ func (g *PathGuard) CheckCreate(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-
-	if resolved, evalErr := canonicalGuardPath(abs); evalErr == nil {
-		return g.checkResolved(filepath.Clean(resolved))
-	} else if !errors.Is(evalErr, fs.ErrNotExist) {
-		return "", fmt.Errorf("resolve path %q: %w", abs, evalErr)
+	if g.privatePath(abs) {
+		return "", errExecutorPrivatePath
 	}
+	resolved, ancestor, err := canonicalGuardCreatePath(abs)
+	if err != nil {
+		return "", err
+	}
+	// Keep the existing ancestor grant ceiling, then check the rebuilt target.
+	if _, err = g.checkResolved(ancestor); err != nil {
+		return "", err
+	}
+	return g.checkResolved(resolved)
+}
 
+// Shared by create validation AND private-root reservation. In particular a
+// missing Darwin suffix must inherit the native spelling of its nearest live
+// ancestor, not the caller's differently-cased spelling on an APFS CI volume.
+func canonicalGuardCreatePath(path string) (resolved, existingAncestor string, err error) {
+	abs, err := absolutePath(path)
+	if err != nil {
+		return "", "", err
+	}
+	if canonical, err := canonicalGuardPath(abs); err == nil {
+		return filepath.Clean(canonical), filepath.Clean(canonical), nil
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		return "", "", fmt.Errorf("resolve path %q: %w", abs, err)
+	}
 	ancestor := abs
 	missing := make([]string, 0, 4)
 	for {
 		if _, statErr := os.Lstat(ancestor); statErr == nil {
-			resolved, resolveErr := canonicalGuardPath(ancestor)
-			if resolveErr != nil {
-				return "", fmt.Errorf("resolve path ancestor %q: %w", ancestor, resolveErr)
+			canonical, err := canonicalGuardPath(ancestor)
+			if err != nil {
+				return "", "", fmt.Errorf("resolve path ancestor %q: %w", ancestor, err)
 			}
-			resolved, resolveErr = g.checkResolved(filepath.Clean(resolved))
-			if resolveErr != nil {
-				return "", resolveErr
-			}
+			parent := filepath.Clean(canonical)
+			resolved = parent
 			for i := len(missing) - 1; i >= 0; i-- {
 				resolved = filepath.Join(resolved, missing[i])
 			}
-			return filepath.Clean(resolved), nil
+			return filepath.Clean(resolved), parent, nil
 		} else if !errors.Is(statErr, fs.ErrNotExist) {
-			return "", fmt.Errorf("inspect path ancestor %q: %w", ancestor, statErr)
+			return "", "", fmt.Errorf("inspect path ancestor %q: %w", ancestor, statErr)
 		}
-
 		parent := filepath.Dir(ancestor)
 		if parent == ancestor {
-			return "", fmt.Errorf("path %q has no existing ancestor", abs)
+			return "", "", fmt.Errorf("path %q has no existing ancestor", abs)
 		}
 		missing = append(missing, filepath.Base(ancestor))
 		ancestor = parent
 	}
 }
 
-// CheckRemove validates the directory entry that will be removed without
-// following a final symlink. The parent is canonicalized and checked first, so a
-// swapped symlink is unlinked rather than deleting its target.
+// CheckRemove returns the directory entry to unlink, not a symlink's referent.
+// Native final spelling is consulted only for the non-overridable private policy;
+// ordinary links still unlink their own entry rather than deleting their target.
 func (g *PathGuard) CheckRemove(path string) (string, error) {
 	abs, err := absolutePath(path)
 	if err != nil {
 		return "", err
 	}
+	if g.privatePath(abs) {
+		return "", errExecutorPrivatePath
+	}
 	parent, err := g.CheckExisting(filepath.Dir(abs))
 	if err != nil {
 		return "", err
 	}
-	return g.checkResolved(filepath.Clean(filepath.Join(parent, filepath.Base(abs))))
+	entry := filepath.Clean(filepath.Join(parent, filepath.Base(abs)))
+	// Keep unlink-by-entry semantics, but consult native spelling for private
+	// final directories too (not just their parents on a Darwin CI volume).
+	if g.hasPrivateRoots() {
+		if canonical, err := canonicalGuardPath(entry); err == nil && g.privatePath(canonical) {
+			return "", errExecutorPrivatePath
+		}
+	}
+	return g.checkResolved(entry)
 }
 
 // Check retains the original API and applies the stricter existing-path check.
@@ -197,6 +318,9 @@ func (g *PathGuard) Check(path string) (string, error) {
 }
 
 func (g *PathGuard) checkResolved(path string) (string, error) {
+	if g.privatePath(path) {
+		return "", errExecutorPrivatePath
+	}
 	if !g.restricted {
 		return path, nil
 	}

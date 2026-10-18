@@ -2,6 +2,7 @@
 
 import { describe, expect, it } from "bun:test";
 import type { ContentBlock, NarratorMsg } from "../narrator-panel-types";
+import { resolveTraceRowIdentity, sameToolMeta } from "./vlist-exact-row-state";
 import { buildToolMetaIndex, deriveToolMeta, readSubagentIdTag } from "./vlist-tool-meta";
 
 function toolBlock(props: Record<string, unknown>): ContentBlock {
@@ -11,6 +12,88 @@ function toolBlock(props: Record<string, unknown>): ContentBlock {
 function msg(contentJson: ContentBlock[], id = "m1", seq = 1): NarratorMsg {
 	return { id, seq, role: "assistant", contentJson } as unknown as NarratorMsg;
 }
+
+describe("captured file identity projection", () => {
+	it("does not borrow execution context from another persisted attempt", () => {
+		const message = {
+			...msg([
+				toolBlock({
+					name: "Read",
+					input: { file_path: "a.txt" },
+					tcId: "original",
+					executionAttempt: 1,
+				}),
+			]),
+			narratorId: "child",
+			toolCalls: [
+				{
+					id: "retry",
+					executionAttempt: 2,
+					toolUseId: "tu-1",
+					executionDeviceId: "Remote",
+					executionCwd: "/wrong",
+				},
+			],
+		} as unknown as NarratorMsg;
+		expect(buildToolMetaIndex([message]).get("tu-1")?.fileTarget).toBeUndefined();
+	});
+	it("a retry cannot overwrite the original relative path under its frozen cwd", () => {
+		const message = {
+			...msg([
+				toolBlock({
+					name: "Read",
+					input: { file_path: "original.txt" },
+					tcId: "original",
+					executionAttempt: 1,
+					executionDeviceId: "Remote",
+					executionCwd: "/original",
+				}),
+			]),
+			narratorId: "child",
+			toolCalls: [
+				{
+					id: "retry",
+					executionAttempt: 2,
+					toolUseId: "tu-1",
+					toolName: "Read",
+					inputJson: { file_path: "wrong.txt" },
+				},
+			],
+		} as unknown as NarratorMsg;
+		expect(buildToolMetaIndex([message]).get("tu-1")?.fileTarget).toEqual({
+			deviceId: "Remote",
+			path: "/original/original.txt",
+		});
+	});
+	it("folded rows retain the same target/source and memoization observes identity changes", () => {
+		const fileTarget = { deviceId: "Remote", path: "/original/a.txt" };
+		const meta = {
+			toolName: "Read",
+			filePath: "a.txt",
+			fileTarget,
+			fileNarratorId: "child",
+			isFileTool: true,
+		};
+		const identity = resolveTraceRowIdentity(
+			{ identity: { messageId: "m", toolUseId: "tu-1", blockIndex: 0 } } as Parameters<
+				typeof resolveTraceRowIdentity
+			>[0],
+			{
+				byBlockId: new Map([["tc-tu-1", { blockId: "tc-tu-1", messageId: "m", blockIndex: 0 }]]),
+			} as Parameters<typeof resolveTraceRowIdentity>[1],
+			new Map([["tu-1", meta]]),
+		);
+		expect(identity?.tool).toMatchObject({ fileTarget, fileNarratorId: "child" });
+		expect(sameToolMeta(meta, { ...meta, fileTarget: { ...fileTarget } })).toBe(true);
+		expect(sameToolMeta(meta, { ...meta, fileTarget: { ...fileTarget, deviceId: "Other" } })).toBe(
+			false,
+		);
+		expect(sameToolMeta(meta, { ...meta, fileTarget: { ...fileTarget, path: "/new.txt" } })).toBe(
+			false,
+		);
+		expect(sameToolMeta(meta, { ...meta, fileNarratorId: "host" })).toBe(false);
+	});
+});
 
 describe("foreground Bash detachment", () => {
 	it("uses the exact tool id and only executing/running foreground commands", () => {

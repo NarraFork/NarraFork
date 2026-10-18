@@ -1,10 +1,15 @@
 import { type BigIntStats, constants } from "node:fs";
 import { lstat, mkdir, open } from "node:fs/promises";
 import { dirname } from "node:path";
-import { FILE_CHANGE_LIMITS } from "@shared/file-change-protocol";
+import {
+	FILE_CHANGE_LIMITS,
+	type FileChangeExecutionBinding,
+	type FileChangeState,
+} from "@shared/file-change-protocol";
 import type { ExecutionBackend } from "../lib/agent/execution/backend";
 import { guardDiskWrite } from "../lib/disk-safety";
 import type { FileChangeDiagnostics } from "./file-change-diagnostics";
+import type { FileChangeScopeIdentity } from "./file-change-identity";
 
 export interface LocalFileObservation {
 	bytes: Uint8Array | null;
@@ -90,10 +95,13 @@ export interface LocalFileSyscalls {
 async function readHandle(
 	file: LocalFileHandle,
 	signal?: AbortSignal,
+	maxBytes = FILE_CHANGE_LIMITS.blobBytes,
 ): Promise<LocalFileObservation> {
 	signal?.throwIfAborted();
 	const initial = await file.stat({ bigint: true });
 	regular(initial);
+	if (initial.size > BigInt(maxBytes))
+		throw new LocalFileValidationError("File exceeds the editor evidence byte budget");
 	const bytes = Buffer.alloc(Number(initial.size));
 	let offset = 0;
 	while (offset < bytes.length) {
@@ -116,7 +124,26 @@ async function readHandle(
 	return { bytes, mode: Number(final.mode & 0o7777n), identity: localObjectIdentity(final) };
 }
 
+export interface EditorFileApplyContext {
+	sourceId: string;
+	userId: string;
+	narratorId: string;
+	operationId: string;
+	effectId: string;
+	mutationId: string;
+	leaseId: string;
+	preparedResult: unknown;
+	snapshotRevision: number;
+	hashKind?: "raw-sha256";
+	requestDigest: string;
+	executionBinding: FileChangeExecutionBinding;
+	scope: FileChangeScopeIdentity;
+	before: FileChangeState;
+	intended: FileChangeState;
+}
 export interface LocalFileApplyInput {
+	/** Trusted editor-only adapter metadata; ordinary tools retain their native IO. */
+	editor?: EditorFileApplyContext;
 	backend: ExecutionBackend;
 	lexicalPath: string;
 	canonicalPath: string;
@@ -156,7 +183,7 @@ export type LocalFileApplyResult =
 	| { kind: "applied"; error: null; parentEffects: LocalFileParentEffects };
 
 export interface FileChangeLocalIo {
-	read(path: string, signal?: AbortSignal): Promise<LocalFileObservation>;
+	read(path: string, signal?: AbortSignal, maxBytes?: number): Promise<LocalFileObservation>;
 	/** Failures are returned, not swallowed. The caller must throw result.error. */
 	apply(input: LocalFileApplyInput): Promise<LocalFileApplyResult>;
 }
@@ -203,7 +230,7 @@ export function createFileChangeLocalIo(
 	syscalls: LocalFileSyscalls = { lstat, mkdir, open },
 ): FileChangeLocalIo {
 	return {
-		async read(path, signal) {
+		async read(path, signal, maxBytes) {
 			signal?.throwIfAborted();
 			let entry: BigIntStats;
 			try {
@@ -216,7 +243,7 @@ export function createFileChangeLocalIo(
 			const file = await syscalls.open(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0));
 			let observed: LocalFileObservation;
 			try {
-				observed = await readHandle(file, signal);
+				observed = await readHandle(file, signal, maxBytes);
 				const current = await syscalls.lstat(path, { bigint: true });
 				regular(current);
 				if (

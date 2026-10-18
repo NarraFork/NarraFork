@@ -1,7 +1,7 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { existsSync, rmSync } from "node:fs";
 import { extname, resolve } from "node:path";
-
+import { SESSION_VERSION_CLAIM } from "@shared/session-auth";
 import { eq } from "drizzle-orm";
 
 // Relative rather than `@frontend/*`: `bun build` (used for the compiled binary) does not
@@ -1074,6 +1074,7 @@ function startServer(listenPort: number, tlsCfg: typeof settings.server.tls) {
 					// when it lapses; the upgrade is the only place the token is verified.
 					const wsData = resolveWSData(url, userInfo, undefined, {
 						sessionExp: payload.exp,
+						sessionTokenVersion: payload[SESSION_VERSION_CLAIM] ?? 0,
 						sessionUserId: payload.sub,
 					});
 					if (!wsData) {

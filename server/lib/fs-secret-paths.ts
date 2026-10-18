@@ -32,7 +32,7 @@
  */
 
 import { realpathSync } from "node:fs";
-import { relative as relativePath, resolve } from "node:path";
+import { basename, dirname, relative as relativePath, resolve } from "node:path";
 import { isInsidePath } from "./platform-path";
 import { REQUEST_RECORDING_DIR, REQUEST_RECORDING_SAVED_DIR } from "./request-recorder-protocol";
 import { narraforkDir } from "./settings";
@@ -64,18 +64,34 @@ const PRIVATE_RECORDING_DIRS: readonly string[] = [
 /** Private protocol state must not be exposed or rewritten through generic file APIs.
  * Editor transfers include other users' immutable documents and durable recovery metadata;
  * recording directories contain private conversations across the whole instance. */
-const SECRET_HOME_DIRS: readonly string[] = ["editor-transfers", ...PRIVATE_RECORDING_DIRS];
+const SECRET_HOME_DIRS: readonly string[] = [
+	"editor-transfers",
+	"editor-native",
+	"editor-native-operations",
+	...PRIVATE_RECORDING_DIRS,
+];
 
 function physicalOrLexicalPath(path: string): string {
-	try {
-		return realpathSync(path);
-	} catch {
-		return resolve(path);
+	let current = resolve(path);
+	const suffix: string[] = [];
+	// A missing leaf must not hide an existing symlinked parent from a write/share guard.
+	for (let depth = 0; depth <= 128; depth++) {
+		try {
+			return resolve(realpathSync(current), ...suffix);
+		} catch {
+			const parent = dirname(current);
+			if (parent === current) break;
+			suffix.unshift(basename(current));
+			current = parent;
+		}
 	}
+	return resolve(path);
 }
 
 /** Also checks physical targets, so a symlink outside the home cannot bypass the recording ACL.
  * Sharing an ancestor directory must be refused too, because its archive includes private data. */
+// Historical name retained for share API callers; this covers all private
+// platform protocol directories, not only request recordings.
 export function isPrivateRequestRecordingPath(
 	absPath: string,
 	dir: string = narraforkDir,
@@ -83,9 +99,10 @@ export function isPrivateRequestRecordingPath(
 ): boolean {
 	const target = resolve(absPath);
 	const physicalTarget = physicalOrLexicalPath(target);
-	return PRIVATE_RECORDING_DIRS.some((name) => {
+	const physicalHome = physicalOrLexicalPath(dir);
+	return SECRET_HOME_DIRS.some((name) => {
 		const root = resolve(dir, name);
-		const physicalRoot = physicalOrLexicalPath(root);
+		const physicalRoot = physicalOrLexicalPath(resolve(physicalHome, name));
 		return (
 			isInsidePath(root, target) ||
 			isInsidePath(physicalRoot, physicalTarget) ||

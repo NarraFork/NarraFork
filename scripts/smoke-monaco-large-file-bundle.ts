@@ -1,6 +1,7 @@
 import { writeFile } from "node:fs/promises";
 import { extname, join } from "node:path";
 import { build } from "vite";
+import { editorCodecBuffer } from "../frontend/build/editor-codec-buffer";
 import { MiB } from "./smoke-monaco-large-file-data";
 
 export function fixtureHtml(base = "/") {
@@ -38,7 +39,8 @@ export async function buildFixtureBundle(
 		},
 		esbuild: { jsx: "automatic", jsxDev: false },
 		define: { "process.env.NODE_ENV": '"production"' },
-		worker: { format: "es" },
+		plugins: [editorCodecBuffer()],
+		worker: { format: "es", plugins: () => [editorCodecBuffer()] },
 		build: {
 			outDir: directory,
 			emptyOutDir: true,

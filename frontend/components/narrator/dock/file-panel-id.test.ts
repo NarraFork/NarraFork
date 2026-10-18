@@ -628,7 +628,9 @@ describe("historical file panels", () => {
 		expect(body).toMatch(/toolEdit \? `.* · Edit`/);
 		expect(body).toContain("<FilePanelContent");
 		expect(body.indexOf("<ToolEditFileViewer")).toBeLessThan(body.indexOf("<FilePanelContent"));
-		expect(body).toMatch(/\) : \(\s*<FilePanelContent/);
+		expect(body).toMatch(
+			/\) : \(\s*<DockviewNarratorPanelVisibilityProvider api=\{props.api\}>\s*<FilePanelContent/,
+		);
 		expect(body).toMatch(
 			/filePanelResourceId\(\s*filePath,\s*deviceId,\s*referenceOrigin,\s*toolEdit,\s*props.params.fileNarratorId,/,
 		);

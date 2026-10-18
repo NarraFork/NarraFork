@@ -27,9 +27,17 @@ export interface MonacoSearchPanelProps {
 	onClose: () => void;
 	readOnly: boolean;
 	onSave?: () => void | Promise<void>;
+	/** Only applied explicit navigation, never opening or automatic decoration. */
+	onNavigationIntent?: () => void;
 }
 
-export function MonacoSearchPanel({ editor, onClose, readOnly, onSave }: MonacoSearchPanelProps) {
+export function MonacoSearchPanel({
+	editor,
+	onClose,
+	readOnly,
+	onSave,
+	onNavigationIntent,
+}: MonacoSearchPanelProps) {
 	const { t } = useTranslation("narrator");
 	const phrases = t("fileEditor.searchPhrases", { returnObjects: true }) as Record<string, string>;
 	const label = (key: string) => phrases[key] ?? key;
@@ -172,6 +180,7 @@ export function MonacoSearchPanel({ editor, onClose, readOnly, onSave }: MonacoS
 				if (navigate && result.matches[0]) {
 					lastMatch.current = result.matches[0];
 					const target = range(result.matches[0]);
+					onNavigationIntent?.();
 					editor.setSelection(target);
 					editor.revealRangeInCenterIfOutsideViewport(target);
 				}
@@ -204,6 +213,7 @@ export function MonacoSearchPanel({ editor, onClose, readOnly, onSave }: MonacoS
 			const matches = await worker.selectAll(options, signal);
 			return () => {
 				if (!matches.length) return;
+				onNavigationIntent?.();
 				editor.setSelections(
 					matches.map((match) => {
 						const target = range(match);

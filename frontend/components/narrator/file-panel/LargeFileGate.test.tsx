@@ -6,8 +6,10 @@ import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider } from "react-i18next";
+import { editorDocumentApi } from "../../../lib/api/editor-documents";
 import { fileReferenceApi } from "../../../lib/api/file-references";
 import en from "../../../locales/en/narrator.json";
+import { EditorRecoveryBoundary } from "../file-editor/EditorRecoveryBoundary";
 import { filePanelLoadPolicy, filePanelSizeLabel, LargeFileGate } from "./LargeFileGate";
 
 const i18n = i18next.createInstance();
@@ -15,6 +17,7 @@ const globals = new Map<string, PropertyDescriptor | undefined>();
 let root: Root;
 let host: HTMLDivElement;
 let info: ReturnType<typeof spyOn<typeof fileReferenceApi, "info">>;
+let readMode: ReturnType<typeof spyOn<typeof editorDocumentApi, "readMode">>;
 let page: ReturnType<typeof spyOn<typeof fileReferenceApi, "page">>;
 const confirm = mock(() => {});
 const storage = new Map<string, string>();
@@ -57,6 +60,7 @@ beforeEach(async () => {
 		});
 	confirm.mockClear();
 	storage.clear();
+	readMode = spyOn(editorDocumentApi, "readMode").mockResolvedValue("raw-v2");
 	info = spyOn(fileReferenceApi, "info").mockImplementation(async (_narrator, target) => ({
 		target,
 		fileName: "large.txt",
@@ -79,6 +83,7 @@ afterEach(async () => {
 	await act(async () => root.unmount());
 	host.remove();
 	info.mockRestore();
+	readMode.mockRestore();
 	page.mockRestore();
 	for (const [key, value] of globals) {
 		if (value) Object.defineProperty(globalThis, key, value);
@@ -124,6 +129,55 @@ async function click(label: string) {
 	expect(button).toBeDefined();
 	await act(async () => button?.click());
 }
+
+test.each([
+	false,
+	true,
+])("confirmed raw editor reaches a complete 20 MiB load without enabling an unconfirmed large file (%s)", async (confirmed) => {
+	info.mockImplementation(async (_narrator, target) => ({
+		target,
+		fileName: "large.txt",
+		size: 20 * 1024 ** 2,
+	}));
+	await act(async () =>
+		root.render(
+			<MantineProvider>
+				<I18nextProvider i18n={i18n}>
+					<EditorRecoveryBoundary narratorId="n" filePath="/large.txt" rawProtocol>
+						<LargeFileGate narratorId="n" filePath="/large.txt" confirmed={confirmed}>
+							<div data-raw-editor />
+						</LargeFileGate>
+					</EditorRecoveryBoundary>
+				</I18nextProvider>
+			</MantineProvider>,
+		),
+	);
+	expect(!!host.querySelector("[data-raw-editor]")).toBe(confirmed);
+	expect(page).not.toHaveBeenCalled();
+});
+
+test.each([
+	"text-v1",
+	"bounded-preview",
+] as const)("raw preference does not admit a large complete editor for actual %s capability", async (mode) => {
+	readMode.mockResolvedValue(mode);
+	await act(async () =>
+		root.render(
+			<MantineProvider>
+				<I18nextProvider i18n={i18n}>
+					<EditorRecoveryBoundary narratorId="n" filePath="/large.txt">
+						<LargeFileGate narratorId="n" filePath="/large.txt" confirmed>
+							<div data-complete-editor />
+						</LargeFileGate>
+					</EditorRecoveryBoundary>
+				</I18nextProvider>
+			</MantineProvider>,
+		),
+	);
+	expect(host.querySelector("[data-complete-editor]")).toBeNull();
+	expect(host.querySelector("pre")?.textContent).toBe("page at 0");
+	expect(page).toHaveBeenCalledTimes(1);
+});
 
 test("local legacy and scoped origins keep different metadata and page authorizers", async () => {
 	await render({ confirmed: true });

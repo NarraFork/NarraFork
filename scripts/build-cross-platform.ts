@@ -437,6 +437,7 @@ export const buildHelperDistribution = ${JSON.stringify(HELPER_DISTRIBUTION)};
 		"./server/lib/db-worker/worker-entry.ts",
 		// Large editor IO/encoding runs off-thread in source and compiled builds alike.
 		"./server/services/editor-document-worker.ts",
+		"./server/services/editor-document-stream-worker.ts",
 		// Model history JSON decoding stays off-thread in compiled distributions too.
 		"./server/services/agent-runtime/model-history-worker.ts",
 		"./server/lib/browser/memory-snapshot-worker.ts",

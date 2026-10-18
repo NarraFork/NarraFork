@@ -59,8 +59,17 @@ beforeAll(async () => {
 	browser = await puppeteer.launch({
 		executablePath,
 		headless: true,
-		args: ["--no-sandbox"],
+		args: [
+			"--no-sandbox",
+			"--disable-dev-shm-usage",
+			"--disable-background-networking",
+			"--disable-component-update",
+			"--no-first-run",
+		],
 		timeout: 15_000,
+		// Fail individual CDP operations before Bun's per-test timeout kills the shared
+		// fixture browser, obscuring the original failure behind cascading target closures.
+		protocolTimeout: 15_000,
 	});
 }, 60_000);
 
@@ -96,6 +105,7 @@ async function withFixture(
 ) {
 	if (!browser || !server) throw new Error("Browser fixture not initialized");
 	const page = await browser.newPage();
+	page.setDefaultTimeout(10_000);
 	const errors: string[] = [];
 	const unexpectedRequests: string[] = [];
 	page.on("pageerror", (error) => errors.push(String(error)));

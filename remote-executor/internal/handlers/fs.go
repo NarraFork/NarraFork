@@ -40,25 +40,32 @@ func (h *Handlers) FsStat(params map[string]any) (any, error) {
 		return nil, err
 	}
 	info, err := os.Lstat(path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return map[string]any{
-				"exists":       false,
-				"isDirectory":  false,
-				"isFile":       false,
-				"size":         0,
-				"resolvedPath": path,
-			}, nil
-		}
+	if err != nil && !os.IsNotExist(err) {
 		return nil, err
 	}
-	return map[string]any{
-		"exists":       true,
-		"isDirectory":  info.IsDir(),
-		"isFile":       info.Mode().IsRegular(),
-		"size":         info.Size(),
-		"resolvedPath": path,
-	}, nil
+	result := map[string]any{"exists": false, "isDirectory": false, "isFile": false, "size": int64(0), "resolvedPath": path}
+	if err == nil {
+		result["exists"], result["isDirectory"], result["isFile"], result["size"] = true, info.IsDir(), info.Mode().IsRegular(), info.Size()
+	}
+	if boolParam(params, "editorIdentity") {
+		rootPath := stringParam(params, "editorRoot")
+		if rootPath == "" {
+			rootPath = path
+			if info == nil || !info.IsDir() {
+				rootPath = filepath.Dir(path)
+			}
+		}
+		root, identity, err := h.EditorRootIdentity(rootPath)
+		if err != nil {
+			return nil, err
+		}
+		result["canonicalRoot"], result["rootIdentity"], result["runtimeEpoch"] = root, identity, h.EditorEpoch()
+		result["mode"] = nil
+		if info != nil && info.Mode().IsRegular() {
+			result["mode"] = editorPermissionBits(info.Mode())
+		}
+	}
+	return result, nil
 }
 
 func (h *Handlers) FsExists(params map[string]any) (any, error) {
@@ -617,6 +624,9 @@ func (h *Handlers) FsList(params map[string]any) (any, error) {
 	entries := make([]map[string]any, 0, len(dirEntries))
 	probesLeft := maxSymlinkProbes
 	for _, e := range dirEntries {
+		if h.guard.privatePath(filepath.Join(path, e.Name())) {
+			continue
+		}
 		if e.Type()&os.ModeSymlink == 0 {
 			entries = append(entries, map[string]any{
 				"name":        e.Name(),

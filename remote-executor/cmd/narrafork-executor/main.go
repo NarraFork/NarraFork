@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"syscall"
 
@@ -25,6 +26,13 @@ import (
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "editor-stdio" {
+		if err := runEditorStdio(os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
 	if len(os.Args) == 2 && (os.Args[1] == "--version" || os.Args[1] == "version") {
 		fmt.Printf("narrafork-executor %s\n", buildinfo.String())
 		return
@@ -80,6 +88,23 @@ func run(ctx context.Context, ready func()) error {
 	}
 
 	h := handlers.NewWithOptions(guard, 10*1024*1024, cfg.DisableShell)
+	cache, editorErr := os.UserCacheDir()
+	if editorErr == nil {
+		editorErr = h.ReserveEditorPrivateRoot(filepath.Join(cache, "narrafork-executor-editor"))
+	}
+	if editorErr == nil {
+		editorErr = os.MkdirAll(cache, 0o700)
+	}
+	if editorErr == nil {
+		engine, err := handlers.NewEditorEngine(h, filepath.Join(cache, "narrafork-executor-editor"))
+		editorErr = err
+		if err == nil {
+			h.SetEditorEngine(engine)
+		}
+	}
+	if editorErr != nil {
+		log.Printf("editor durable writer unavailable (legacy tools remain enabled): %v", editorErr)
+	}
 	dispatcher := rpc.NewDispatcher(h)
 
 	platform := rpc.Platform{
@@ -105,6 +130,10 @@ func run(ctx context.Context, ready func()) error {
 			"transfer.upload-content-identity.v1",
 			"pty.ready-stream.v1",
 		},
+	}
+
+	if h.EditorEnabled() {
+		caps.Features = append(caps.Features, handlers.FeatureEditorDurableWriteV1)
 	}
 
 	// Signal handling belongs to the console path only. Under the SCM, shutdown

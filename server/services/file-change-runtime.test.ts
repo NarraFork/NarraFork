@@ -1306,10 +1306,17 @@ describe("fail closed before writes and after uncertain IO", () => {
 		const trace = result.metadata?.fileChangeDiagnostics as FileChangeDiagnosticSnapshot;
 		expect(result.isError).toBe(true);
 		expect(trace.failures).toEqual([{ stage: "after_read", name: "TimeoutError" }]);
+		// Editor helper receipts can defer to durable query. Generic tool IO still
+		// retains its actual positive apply receipt with the failed Host observation.
 		expect(effects()[0]).toMatchObject({
 			settlement: "reconcile_required",
-			executionReceiptJson: { outcome: "applied", confirmed: true },
+			executionReceiptJson: {
+				outcome: "applied",
+				confirmed: true,
+				observedAfter: { kind: "unknown", reason: "missing_after" },
+			},
 		});
+		expect(operations()[0].executionOutcome).toBe("failed");
 		expect(await readFile(path, "utf8")).toBe("new");
 	});
 

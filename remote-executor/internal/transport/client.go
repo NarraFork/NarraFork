@@ -535,6 +535,7 @@ func (s *connectionState) runRequest(reqCtx context.Context, req rpc.RequestFram
 		entry.cancel()
 	}()
 	if reqCtx.Err() != nil {
+		s.dispatcher.CancelEditorRead(req.Method, req.Params)
 		return
 	}
 
@@ -552,6 +553,7 @@ func (s *connectionState) runRequest(reqCtx context.Context, req rpc.RequestFram
 
 	result, err := s.dispatcher.Dispatch(reqCtx, req.Method, req.Params, stream)
 	if reqCtx.Err() != nil {
+		s.dispatcher.DiscardEditorRead(result)
 		return
 	}
 
@@ -563,8 +565,11 @@ func (s *connectionState) runRequest(reqCtx context.Context, req rpc.RequestFram
 		res.OK = true
 		res.Result = result
 	}
-	if writeErr := s.writeJSON(reqCtx, res); writeErr != nil && s.ctx.Err() == nil {
-		log.Printf("failed to send result for %s: %v", req.ID, writeErr)
+	if writeErr := s.writeJSON(reqCtx, res); writeErr != nil {
+		s.dispatcher.DiscardEditorRead(result)
+		if s.ctx.Err() == nil {
+			log.Printf("failed to send result for %s: %v", req.ID, writeErr)
+		}
 	}
 }
 
@@ -599,6 +604,7 @@ func (s *connectionState) close() {
 		s.cancel()
 		s.cancelAllRequests()
 		s.transfers.Close()
+		s.dispatcher.CloseEditorReads()
 		s.conn.CloseNow()
 	})
 }

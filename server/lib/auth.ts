@@ -10,6 +10,7 @@ import { registrationAccountStore as accountStore } from "../services/registrati
 import { authAttemptLimiter, fingerprintAuthIdentifier } from "./auth-attempt-limiter";
 import { randomAvatarColor } from "./avatar-colors";
 import { AppError, RateLimitError } from "./errors";
+import { eventBus } from "./event-bus";
 import { generateId } from "./id";
 import { logger } from "./logger";
 import { issueMfaToken } from "./mfa";
@@ -101,7 +102,9 @@ async function signSessionToken(
  * names no table, so a second backend implements the same capability.
  */
 export async function revokeUserSessions(userId: string): Promise<number> {
-	return await authSessionStore.bumpTokenVersion(userId);
+	const version = await authSessionStore.bumpTokenVersion(userId);
+	eventBus.emit({ type: "auth:changed", userId });
+	return version;
 }
 
 /**

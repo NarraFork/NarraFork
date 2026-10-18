@@ -6,9 +6,11 @@ import i18next from "i18next";
 import type { editor as Monaco } from "monaco-editor/editor/editor.api";
 import { createRoot } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
+import { editorDocumentRegistry } from "../frontend/components/narrator/file-editor/editor-document-registry";
 import { getEditorWorkerDiagnostics } from "../frontend/components/narrator/file-editor/editor-worker-client";
 import { FileEditorContent } from "../frontend/components/narrator/file-editor/FileEditorContent";
 import { loadMonaco } from "../frontend/components/narrator/file-editor/monaco-loader";
+import { FilePanelContent } from "../frontend/components/narrator/file-panel/FilePanelContent";
 import translations from "../frontend/locales/en/narrator.json";
 
 declare global {
@@ -17,6 +19,7 @@ declare global {
 			state(): {
 				ready: boolean;
 				dirty: boolean;
+				readOnly: boolean;
 				revision: number;
 				length: number;
 				lines: number;
@@ -24,12 +27,26 @@ declare global {
 				workers: ReturnType<typeof getEditorWorkerDiagnostics>;
 			};
 			fingerprint(): Promise<{ bytes: number; sha256: string }>;
+			retainedFingerprint(): Promise<{ bytes: number; sha256: string }>;
+			invalidateContext(): void;
+			reopen(): void;
 			commitResponse(index: number): {
 				status: number;
 				body: string | null;
 				error: string | null;
 			} | null;
 			focus(): void;
+			sharedState(): {
+				models: number;
+				views: number;
+				shared: boolean;
+				sameText: boolean;
+				selections: number[];
+				scrolls: number[];
+			};
+			prepareIndependentViews(): void;
+			focusSecondary(): void;
+			closeSecondary(): void;
 			dispose(): void;
 		};
 	}
@@ -37,7 +54,10 @@ declare global {
 
 const response = await fetch("/api/fixture/config", { signal: AbortSignal.timeout(10_000) });
 if (!response.ok) throw new Error(`Fixture config: ${response.status}`);
-const config: { path: string; narratorId: string } = await response.json();
+const config: { path: string; narratorId: string; hostGate?: boolean; deviceId?: string } =
+	await response.json();
+// The small-file scenario uses the actual ordinary host and unmodified metadata/size gate.
+const FilePane = config.hostGate ? FilePanelContent : FileEditorContent;
 // Observe actual browser fetch responses, not CDP's evictable response-body cache.
 // Only two small commit receipts are cloned; uploads and 20 MiB content are untouched.
 const nativeFetch = window.fetch;
@@ -107,32 +127,75 @@ await i18n.use(initReactI18next).init({
 });
 let editor: Monaco.IStandaloneCodeEditor | undefined;
 let dirty = false;
-const created = api.editor.onDidCreateEditor((view) => {
-	editor ??= view as Monaco.IStandaloneCodeEditor;
+const views = new Set<Monaco.IStandaloneCodeEditor>();
+const created = api.editor.onDidCreateEditor((instance) => {
+	const view = instance as Monaco.IStandaloneCodeEditor;
+	editor ??= view;
+	views.add(view);
+	view.onDidDispose(() => {
+		views.delete(view);
+		if (editor === view) editor = [...views][0];
+	});
 });
 const host = document.getElementById("root");
 if (!host) throw new Error("Missing fixture root");
 const root = createRoot(host);
-root.render(
-	<MantineProvider forceColorScheme="dark">
-		<I18nextProvider i18n={i18n}>
-			<FileEditorContent
-				filePath={config.path}
-				narratorId={config.narratorId}
-				referenceOrigin
-				onDirtyChange={(value) => {
-					dirty = value;
-				}}
-			/>
-		</I18nextProvider>
-	</MantineProvider>,
-);
+let documentGeneration = 0;
+// Read-only test observation; never used to construct a golden or perform disk writes.
+async function fingerprintModel(model: Monaco.ITextModel | null | undefined) {
+	if (!model) throw new Error("Model not ready");
+	const bytes = new TextEncoder().encode(model.getValue());
+	const digest = await crypto.subtle.digest("SHA-256", bytes);
+	return {
+		bytes: bytes.byteLength,
+		sha256: Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join(
+			"",
+		),
+	};
+}
+function renderViews(secondary = true) {
+	root.render(
+		<MantineProvider forceColorScheme="dark">
+			<I18nextProvider i18n={i18n}>
+				<div style={{ display: "flex", height: "100%" }}>
+					<div key="primary" style={{ width: "50%", height: "100%" }}>
+						<FilePane
+							rawProtocol={false}
+							key={documentGeneration}
+							filePath={config.path}
+							narratorId={config.narratorId}
+							deviceId={config.deviceId}
+							referenceOrigin
+							onDirtyChange={(value) => {
+								dirty = value;
+							}}
+						/>
+					</div>
+					{secondary && (
+						<div key="secondary" style={{ width: "50%", height: "100%" }}>
+							<FilePane
+								rawProtocol={false}
+								filePath={config.path}
+								narratorId={config.narratorId}
+								deviceId={config.deviceId}
+								referenceOrigin
+							/>
+						</div>
+					)}
+				</div>
+			</I18nextProvider>
+		</MantineProvider>,
+	);
+}
+// Remote acceptance exercises one ordinary file panel; local scenarios also test shared views.
+renderViews(!config.deviceId);
 window.__editorRealIo = {
 	state() {
 		const model = editor?.getModel();
 		return {
 			ready: !!model,
 			dirty,
+			readOnly: !!editor?.getRawOptions().readOnly,
 			revision: model?.getVersionId() ?? 0,
 			length: model?.getValueLength() ?? 0,
 			lines: model?.getLineCount() ?? 0,
@@ -140,21 +203,50 @@ window.__editorRealIo = {
 			workers: getEditorWorkerDiagnostics(),
 		};
 	},
-	async fingerprint() {
-		// Read-only observation after interaction, never a source for golden/disk writes.
-		const model = editor?.getModel();
-		if (!model) throw new Error("Model not ready");
-		const bytes = new TextEncoder().encode(model.getValue());
-		const digest = await crypto.subtle.digest("SHA-256", bytes);
-		return {
-			bytes: bytes.byteLength,
-			sha256: Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join(
-				"",
-			),
-		};
+	fingerprint() {
+		return fingerprintModel(editor?.getModel());
+	},
+	retainedFingerprint() {
+		return fingerprintModel(api.editor.getModels().find((model) => model !== editor?.getModel()));
+	},
+	invalidateContext() {
+		editorDocumentRegistry.invalidateNarrator(
+			config.narratorId,
+			translations["fileEditor.identityChanged"],
+		);
+	},
+	reopen() {
+		documentGeneration++;
+		renderViews(false);
 	},
 	commitResponse(index) {
 		return commitResponses[index] ?? null;
+	},
+	sharedState() {
+		const active = [...views];
+		return {
+			models: api.editor.getModels().length,
+			views: active.length,
+			shared: active.length === 2 && active[0].getModel() === active[1].getModel(),
+			sameText: active.every(
+				(view) => view.getModel()?.getLineContent(1) === editor?.getModel()?.getLineContent(1),
+			),
+			selections: active.map((view) => view.getPosition()?.lineNumber ?? 0),
+			scrolls: active.map((view) => view.getScrollTop()),
+		};
+	},
+	prepareIndependentViews() {
+		const active = [...views];
+		active[0]?.setPosition({ lineNumber: 1, column: 1 });
+		active[0]?.setScrollTop(0);
+		active[1]?.setPosition({ lineNumber: 40, column: 3 });
+		active[1]?.setScrollTop(700);
+	},
+	focusSecondary() {
+		[...views][1]?.focus();
+	},
+	closeSecondary() {
+		renderViews(false);
 	},
 	focus() {
 		editor?.focus();
@@ -164,5 +256,6 @@ window.__editorRealIo = {
 		for (const reader of receiptReaders) void reader.cancel().catch(() => {});
 		created.dispose();
 		root.unmount();
+		editorDocumentRegistry.shutdown();
 	},
 };

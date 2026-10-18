@@ -18,6 +18,7 @@ let conditionalError = null;
 mock.module(${JSON.stringify(settingsPath)}, () => ({ settings: { devices: { maxRpcBytes: 1048576, rpcTimeoutMs: 10000 } } }));
 mock.module(${JSON.stringify(connectionPath)}, () => ({
   hasDeviceProtocolFeature: (_id, feature) => features.has(feature),
+  getDeviceConnectionGeneration: () => currentGeneration,
   sendRpc: async (id, method, params, opts) => {
     calls.push({id, method, params, opts});
     assert.equal(opts.expectedConnectionGeneration, 7);

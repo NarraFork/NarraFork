@@ -19,6 +19,7 @@ import {
 	resolveHelperRestoreSource,
 	runHelperReleaseController,
 } from "../../scripts/release-helpers";
+import componentVersions from "../../shared/component-versions.json";
 import { HELPER_PLATFORMS } from "../../shared/helper-distribution";
 
 const commit = "a".repeat(40);
@@ -386,7 +387,7 @@ const stat = fs.statSync;
 const exec = child.execFileSync;
 const writes = [];
 const calls = [];
-const artifact = Buffer.from("executor version 0.9.1");
+const artifact = Buffer.from("executor version ${componentVersions.executor.version}");
 const isArtifact = (path) => /remote-executor[/\\\\]dist[/\\\\]narrafork-executor-linux-amd64$/.test(String(path));
 mock.module("node:fs", () => ({ ...fs,
  existsSync: (path) => isArtifact(path) || exists(path),
@@ -394,7 +395,7 @@ mock.module("node:fs", () => ({ ...fs,
  readFileSync: (path, ...args) => isArtifact(path) ? artifact : String(path).endsWith("protocol.go") ? "const ProtocolVersion = ${protocol}" : read(path, ...args),
  writeFileSync: (path, contents) => { writes.push({path: String(path), manifest: JSON.parse(contents)}); },
 }));
-mock.module("node:child_process", () => ({ ...child, execFileSync: (path, ...args) => isArtifact(path) ? "executor version 0.9.1" : exec(path, ...args) }));
+mock.module("node:child_process", () => ({ ...child, execFileSync: (path, ...args) => isArtifact(path) ? "executor version ${componentVersions.executor.version}" : exec(path, ...args) }));
 mock.module(${JSON.stringify(resolve("scripts/release-helpers.ts"))}, () => ({
  parseHelperReleaseArguments: () => ({options: new Map([["plan", "plan.json"], ["root", ${JSON.stringify(root)}]])}),
  runHelperReleaseController: async (args) => { calls.push(args); },
@@ -423,12 +424,16 @@ catch (error) { console.log(JSON.stringify({error: error.message, writes, calls}
 		const result = fixture(["--dry-run", "--upload-only", "--platform=linux-amd64"]);
 		expect(result.error).toBe("fixture exit 0");
 		expect(result.writes).toHaveLength(1);
-		expect(result.writes[0].manifest.version).toBe("0.9.1");
+		expect(result.writes[0].manifest.version).toBe(componentVersions.executor.version);
 		expect(result.writes[0].manifest.protocolVersion).toBe(1);
 		expect(result.calls).toHaveLength(0);
 	}, 20_000);
 	test("server target rejects explicit versions or source protocol inconsistent with config before writes", () => {
-		const wrongVersion = fixture(["0.9.2", "--dry-run", "--upload-only"]);
+		const wrongVersion = fixture([
+			`${componentVersions.executor.version}-wrong`,
+			"--dry-run",
+			"--upload-only",
+		]);
 		expect(wrongVersion.error).toContain("component-versions.json");
 		expect(wrongVersion.writes).toHaveLength(0);
 		const wrongProtocol = fixture(["--dry-run", "--upload-only", "--platform=linux-amd64"], 2);

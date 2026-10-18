@@ -11,6 +11,7 @@ import { isEmptyReasoningBlock } from "@shared/reasoning-content";
 import { appendStreamingTextPreview } from "../narrator-message-helpers";
 import type { ContentBlock, NarratorMsg, ToolCallRow } from "../narrator-panel-types";
 import type { ToolCallData } from "../tool-call/tool-call-data";
+import { toolExecutionFallback } from "../tool-call/tool-file-target";
 
 // ---------------------------------------------------------------------------
 // Legacy tool name mapping
@@ -128,6 +129,7 @@ export function resolveAllToolCallsFromMsg(msg: NarratorMsg): ToolCallData[] {
 				block.executionAttempt === matchingTc.executionAttempt)
 				? matchingTc
 				: undefined;
+		const executionTc = toolExecutionFallback(block, matchingTc);
 		const status = block.status ?? tc?.status ?? "running";
 		const createdAt = block.tcCreatedAt ?? matchingTc?.createdAt;
 		const persistedStartedAt = (matchingTc as (ToolCallRow & { startedAt?: unknown }) | undefined)
@@ -148,7 +150,7 @@ export function resolveAllToolCallsFromMsg(msg: NarratorMsg): ToolCallData[] {
 			id: block.tcId ?? tc?.id,
 			toolName: normalizeToolName(block.name ?? ""),
 			toolUseId: block.id,
-			inputJson: block.inputJson ?? tc?.inputJson ?? block.input,
+			inputJson: block.inputJson ?? (executionTc ? tc?.inputJson : undefined) ?? block.input,
 			outputJson: block.outputJson ?? tc?.outputJson,
 			status,
 			durationMs: block.durationMs ?? tc?.durationMs,
@@ -158,6 +160,11 @@ export function resolveAllToolCallsFromMsg(msg: NarratorMsg): ToolCallData[] {
 			executionStartedAt: block.executionStartedAt ?? matchingTc?.executionStartedAt,
 			completedAt: block.completedAt ?? matchingTc?.completedAt,
 			createdAt,
+			fileNarratorId: msg.narratorId,
+			executionDeviceId: block.executionDeviceId ?? executionTc?.executionDeviceId,
+			executionCwd: block.executionCwd ?? executionTc?.executionCwd,
+			resolvedFilePath: block.resolvedFilePath ?? executionTc?.resolvedFilePath,
+			executionTarget: block.executionTarget ?? executionTc?.executionTarget,
 			errorMessage: block.errorMessage ?? tc?.errorMessage,
 			permissionDenyMessage: block.permissionDenyMessage ?? tc?.permissionDenyMessage,
 			permissionDecisionReason: block.permissionDecisionReason ?? tc?.permissionDecisionReason,

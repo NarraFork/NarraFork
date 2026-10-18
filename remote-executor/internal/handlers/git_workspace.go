@@ -114,8 +114,12 @@ func validateGitIdentity(params map[string]any) (map[string]any, error) {
 // All operations are worktree-wide. A grant for a subdirectory or a guard with
 // denied holes cannot be widened into permission to manage the enclosing tree.
 func (h *Handlers) checkGitTree(root string) error {
-	if _, err := h.guard.CheckExisting(root); err != nil {
+	root, err := h.guard.CheckExisting(root)
+	if err != nil {
 		return err
+	}
+	if len(h.guard.privateRootsWithin(root)) > 0 {
+		return errExecutorPrivatePath
 	}
 	for _, rule := range h.guard.rules {
 		if rule.action == RuleDeny && pathWithin(root, rule.root) {

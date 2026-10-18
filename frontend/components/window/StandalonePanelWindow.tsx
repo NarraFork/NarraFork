@@ -24,8 +24,7 @@ import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import { FileReferenceScopeProvider } from "../narrator/composer/FileReferenceScope";
 import { NarratorDockContext } from "../narrator/dock/NarratorDockContext";
 import { SubagentSessionPanelContent } from "../narrator/dock/panels";
-import { getFilePreviewType } from "../narrator/file-panel/FilePreviewModal";
-import { LargeFileGate } from "../narrator/file-panel/LargeFileGate";
+import { FilePanelContent } from "../narrator/file-panel/FilePanelContent";
 import type { TerminalLeafConfig, WebviewLeafConfig } from "../narrator/split-tree";
 import {
 	type PluginUiSessionContext,
@@ -83,16 +82,6 @@ const FileTreePanel = lazy(() =>
 const KnowledgeEntryPanelContent = lazy(() =>
 	import("../narrator/knowledge/KnowledgeEntryPanelContent").then((m) => ({
 		default: m.KnowledgeEntryPanelContent,
-	})),
-);
-const FileEditorContent = lazy(() =>
-	import("../narrator/file-editor/FileEditorContent").then((m) => ({
-		default: m.FileEditorContent,
-	})),
-);
-const FileViewerContent = lazy(() =>
-	import("../narrator/file-viewer/FileViewerContent").then((m) => ({
-		default: m.FileViewerContent,
 	})),
 );
 const ToolEditFileViewer = lazy(() =>
@@ -404,37 +393,21 @@ function FileWindow({
 		[fileNarratorId],
 	);
 
-	const isText = getFilePreviewType(filePath) === "text";
 	return (
 		<FileReferenceScopeProvider value={scope}>
 			<PanelBoundary>
 				{toolEdit ? (
 					<ToolEditFileViewer key={filePath} reference={toolEdit} filePath={filePath} />
-				) : isText ? (
-					<LargeFileGate
-						narratorId={fileNarratorId}
-						deviceId={deviceId}
-						referenceOrigin={referenceOrigin}
-						filePath={filePath}
-						confirmed={largeFileConfirmed}
-						onConfirm={confirmLargeFile}
-					>
-						<FileEditorContent
-							key={`edit:${fileNarratorId}:${deviceId}:${filePath}`}
-							filePath={filePath}
-							narratorId={fileNarratorId}
-							deviceId={deviceId}
-							referenceOrigin={referenceOrigin}
-							onDirtyChange={setDirty}
-						/>
-					</LargeFileGate>
 				) : (
-					<FileViewerContent
+					<FilePanelContent
 						key={`${fileNarratorId}:${deviceId}:${filePath}`}
 						filePath={filePath}
 						narratorId={fileNarratorId}
 						deviceId={deviceId}
 						referenceOrigin={referenceOrigin}
+						onDirtyChange={setDirty}
+						confirmed={largeFileConfirmed}
+						onConfirm={confirmLargeFile}
 					/>
 				)}
 			</PanelBoundary>

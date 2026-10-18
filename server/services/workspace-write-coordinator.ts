@@ -165,7 +165,7 @@ export interface WorkspaceWriteLease {
 		body: (tx: WorkspaceRecoveryTransaction) => { outcome: WorkspaceMutationOutcome; value: T },
 	): T;
 	/** Irreversible within this lease. Only external recovery may clear the quarantine. */
-	markUncertain(): void;
+	markUncertain(externalExecutionMayContinue?: boolean): void;
 }
 
 export interface WorkspaceObservationRequest
@@ -214,6 +214,7 @@ interface LeaseRecord {
 	children: Set<Promise<unknown>>;
 	closing: boolean;
 	executionEnded: boolean;
+	externalExecutionPending?: boolean;
 	persistencePending: boolean;
 	lease: WorkspaceWriteLease;
 	/** Optional for records still executing from the pre-batch hot-safe scheduler. */
@@ -859,6 +860,48 @@ export class WorkspaceWriteCoordinator {
 			return true;
 		});
 	}
+	/** A verified editor engine terminal receipt proves THIS mutation has stopped;
+	 * host-process termination alone never proves an external helper/RPC ended. */
+	acknowledgeEditorReceipt(
+		input: {
+			leaseId: string;
+			operationId: string;
+			effectId: string;
+			mutationId: string;
+		},
+		verifyReceipt: () => void,
+	): void {
+		this.transaction((tx) => {
+			verifyReceipt();
+			const lease = tx
+				.select()
+				.from(durableLeases)
+				.where(eq(durableLeases.leaseId, input.leaseId))
+				.get();
+			if (
+				!lease ||
+				!["executing", "quarantined"].includes(lease.status) ||
+				lease.executionClass !== "unknown" ||
+				lease.mutationManifestJson.mutations.length !== 1
+			)
+				throw fail("recovery_conflict", "Not an external single-mutation editor lease");
+			const mutation = lease.mutationManifestJson.mutations[0];
+			if (
+				mutation.mutationId !== input.mutationId ||
+				mutation.operationId !== input.operationId ||
+				mutation.effectId !== input.effectId
+			)
+				throw fail("recovery_conflict", "Editor receipt does not match the durable lease manifest");
+			for (const record of this.state.leases.values())
+				if (record.leaseId === input.leaseId)
+					throw fail("recovery_conflict", "Editor execution is still registered");
+			tx.update(durableLeases)
+				.set({ executionEndedAt: lease.executionEndedAt ?? now(), updatedAt: now() })
+				.where(eq(durableLeases.leaseId, input.leaseId))
+				.run();
+		});
+	}
+
 	inspectRecovery(input: WorkspaceRecoveryRequest): WorkspaceRecoveryInfo {
 		return this.inspectRecoveryWithAuthority(input);
 	}
@@ -984,7 +1027,9 @@ export class WorkspaceWriteCoordinator {
 		}
 		const epoch = lease?.ownerEpoch ?? current.activeLeaseEpoch;
 		const executionEnded =
-			initialRootVerification || !!lease?.executionEndedAt || epoch === this.state.ownerEpoch;
+			initialRootVerification ||
+			!!lease?.executionEndedAt ||
+			(epoch === this.state.ownerEpoch && (!lease || lease.executionClass === "local_file_io"));
 		if (!executionEnded && !maintenanceAuthority)
 			throw new WorkspaceWriteCoordinatorError(
 				"recovery_conflict",
@@ -1737,9 +1782,10 @@ export class WorkspaceWriteCoordinator {
 				id: string,
 				body: (tx: WorkspaceRecoveryTransaction) => { outcome: WorkspaceMutationOutcome; value: T },
 			) => this.settleWith(record, id, body),
-			markUncertain: () => {
+			markUncertain: (externalExecutionMayContinue = false) => {
 				this.requireLive(record);
 				record.uncertain = true;
+				record.externalExecutionPending ||= externalExecutionMayContinue;
 				// Admission already durably guards this execution; do not conflate an
 				// unknown mutation with root/activity identity verification.
 				this.transaction((tx) => {
@@ -2111,7 +2157,7 @@ export class WorkspaceWriteCoordinator {
 					forceQuarantine || record.uncertain || pendingCount(record) > 0
 						? "quarantined"
 						: "settled",
-				executionEndedAt: timestamp,
+				executionEndedAt: record.externalExecutionPending ? null : timestamp,
 				updatedAt: timestamp,
 			})
 			.where(

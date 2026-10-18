@@ -27,6 +27,7 @@ type Handlers struct {
 	guard        *PathGuard
 	maxRpcBytes  int64
 	disableShell bool
+	editor       *EditorEngine
 
 	ptyMu       sync.Mutex
 	ptySessions map[string]*ptySession
@@ -53,7 +54,9 @@ func NewWithOptions(guard *PathGuard, maxRpcBytes int64, disableShell bool) *Han
 // ConnectionScoped returns a handler set with the same immutable configuration
 // and a fresh PTY registry for one transport connection.
 func (h *Handlers) ConnectionScoped() *Handlers {
-	return NewWithOptions(h.guard, h.maxRpcBytes, h.disableShell)
+	scoped := NewWithOptions(h.guard, h.maxRpcBytes, h.disableShell)
+	scoped.editor = h.editor
+	return scoped
 }
 
 func requiredPathParam(params map[string]any, key string) (string, error) {

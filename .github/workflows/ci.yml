@@ -132,7 +132,7 @@ jobs:
       - name: Install test system dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install --yes zstd podman git ripgrep
+          sudo apt-get install --yes zstd podman git ripgrep acl python3
           command -v zstd
           zstd --version
           command -v podman
@@ -185,6 +185,8 @@ jobs:
               await browser.close();
             }
           '
+      - name: Prepare controlled native editor fixture
+        run: bun scripts/build-editor-test-helper.ts
       - name: Verify test preload isolation
         run: bun test --isolate tests/preload-isolation.test.ts
       - name: Run repository tests

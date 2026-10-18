@@ -4,6 +4,7 @@ import { parseHTML } from "linkedom";
 import type { editor, IPosition, IRange } from "monaco-editor/editor/editor.api";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
+import { EDITOR_HIDE_DELAY_MS } from "../narrator-panel-visibility";
 import {
 	type MonacoDocumentStatus,
 	MonacoEditor,
@@ -82,6 +83,10 @@ class View {
 		this.model = model;
 	};
 	getSelection = () => this.selection;
+	saveViewState = () => ({ selection: { ...this.selection } });
+	restoreViewState = (state: { selection: IRange }) => {
+		this.selection = { ...state.selection };
+	};
 	setPosition = mock((p: IPosition) => {
 		this.selection = {
 			startLineNumber: p.lineNumber,
@@ -270,6 +275,149 @@ async function render(
 		);
 	});
 }
+
+test("external model is shared by independent views and never reset or disposed by view cleanup", async () => {
+	const shared = new Model("shared document");
+	const renderViews = async (left: boolean) =>
+		act(async () =>
+			root.render(
+				<MantineProvider forceColorScheme="dark">
+					{left && (
+						<MonacoEditor
+							key="left"
+							documentKey="shared"
+							filePath="a.ts"
+							initialValue="ignored"
+							model={shared as unknown as editor.ITextModel}
+						/>
+					)}
+					<MonacoEditor
+						key="right"
+						documentKey="shared"
+						filePath="a.ts"
+						initialValue="also ignored"
+						model={shared as unknown as editor.ITextModel}
+					/>
+				</MantineProvider>,
+			),
+		);
+	await renderViews(true);
+	expect(models).toHaveLength(0);
+	expect(views).toHaveLength(2);
+	expect(views[0].model).toBe(shared);
+	expect(views[1].model).toBe(shared);
+	views[0].setPosition({ lineNumber: 1, column: 2 });
+	views[1].setPosition({ lineNumber: 1, column: 4 });
+	expect(views[0].getSelection().startColumn).toBe(2);
+	expect(views[1].getSelection().startColumn).toBe(4);
+	await renderViews(false);
+	expect(views[0].disposed).toBe(true);
+	expect(views[1].disposed).toBe(false);
+	expect(shared.disposed).toBe(false);
+	expect(shared.setValue).not.toHaveBeenCalled();
+	await act(async () => root.render(null));
+	expect(shared.disposed).toBe(false);
+	expect(views[1].disposed).toBe(true);
+	shared.dispose();
+});
+
+function hideClock() {
+	const timers = new Map<ReturnType<typeof setTimeout>, () => void>();
+	const original = globalThis.setTimeout;
+	const cancel = globalThis.clearTimeout;
+	const schedule = spyOn(globalThis, "setTimeout").mockImplementation(((
+		callback: () => void,
+		ms?: number,
+	) => {
+		if (ms !== EDITOR_HIDE_DELAY_MS) return original(callback, ms);
+		const id = original(() => {}, 60_000);
+		timers.set(id, callback);
+		return id;
+	}) as typeof setTimeout);
+	const remove = spyOn(globalThis, "clearTimeout").mockImplementation(((
+		id: ReturnType<typeof setTimeout>,
+	) => {
+		timers.delete(id);
+		cancel(id);
+	}) as typeof clearTimeout);
+	return {
+		flush: async () =>
+			act(async () => {
+				for (const [id, callback] of [...timers]) {
+					timers.delete(id);
+					cancel(id);
+					callback();
+				}
+			}),
+		restore: () => {
+			for (const id of timers.keys()) cancel(id);
+			schedule.mockRestore();
+			remove.mockRestore();
+		},
+		pending: () => timers.size,
+	};
+}
+
+test("never-visible source creates no view/model/observer or delayed timer", async () => {
+	const clock = hideClock();
+	try {
+		await render({ visible: false });
+		expect(views).toHaveLength(0);
+		expect(models).toHaveLength(0);
+		expect(loadSpy).not.toHaveBeenCalled();
+		expect(clock.pending()).toBe(0);
+		await render({ visible: true });
+		expect(views).toHaveLength(1);
+	} finally {
+		clock.restore();
+	}
+});
+
+test("hidden grace releases view/listeners/RAF but preserves external model and independent view state", async () => {
+	const clock = hideClock();
+	const model = new Model("one\ntwo");
+	const props = { model: model as unknown as editor.ITextModel };
+	try {
+		await render(props);
+		views[0].setPosition({ lineNumber: 2, column: 2 });
+		await render({ ...props, visible: false });
+		expect(views[0].disposed).toBe(false);
+		expect(clock.pending()).toBe(1);
+		await clock.flush();
+		expect(views[0].disposed).toBe(true);
+		expect(model.disposed).toBe(false);
+		expect(model.changes.listeners.size).toBe(0);
+		expect(views[0].cursor.listeners.size).toBe(0);
+		expect(views[0].mouse.listeners.size).toBe(0);
+		expect(windowMouseUp).toBeNull();
+		expect(frames.size).toBe(0);
+		expect(handle).toBeNull();
+		await render({ ...props, visible: true });
+		expect(views).toHaveLength(2);
+		expect(views[1].model).toBe(model);
+		expect(views[1].selection.startLineNumber).toBe(2);
+		expect(views[1].selection.startColumn).toBe(2);
+		expect(model.setValue).not.toHaveBeenCalled();
+	} finally {
+		clock.restore();
+	}
+});
+
+test("rapid hide/show cancels deferred disposal instead of recreating its view", async () => {
+	const clock = hideClock();
+	try {
+		await render();
+		await render({ visible: false });
+		expect(clock.pending()).toBe(1);
+		await render({ visible: true });
+		expect(clock.pending()).toBe(0);
+		await clock.flush();
+		expect(views).toHaveLength(1);
+		expect(views[0].disposed).toBe(false);
+	} finally {
+		clock.restore();
+	}
+});
 
 test.each([
 	{

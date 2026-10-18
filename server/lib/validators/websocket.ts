@@ -25,6 +25,20 @@ const catchUpCursorSchema = z
 export const narratorWsMessageSchema = z.discriminatedUnion("type", [
 	z
 		.object({
+			type: z.literal("editor_file_subscribe"),
+			subscriptionId: z.string().min(1).max(128),
+			narratorId: z.string().min(1).max(128),
+			docId: z.string().uuid(),
+		})
+		.strict(),
+	z
+		.object({
+			type: z.literal("editor_file_unsubscribe"),
+			subscriptionId: z.string().min(1).max(128),
+		})
+		.strict(),
+	z
+		.object({
 			type: z.literal("git_workspace_subscribe"),
 			subscriptionId: z.string().min(1).max(128),
 			narratorId: z.string().min(1).max(128).optional(),

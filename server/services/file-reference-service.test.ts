@@ -4,6 +4,7 @@ import {
 	FILE_PANEL_PAGE_BYTES,
 	MAX_FILE_PANEL_BYTES,
 	MAX_FILE_REFERENCE_POSITION,
+	MAX_FILE_REFERENCE_SOURCE_BYTES,
 } from "@shared/file-reference";
 import { MAX_FILE_REFERENCE_IMAGE_BYTES } from "@shared/file-reference-image";
 import type {
@@ -975,6 +976,66 @@ describe("safe file capture and preview", () => {
 				]),
 			).rejects.toBeInstanceOf(AppError);
 			if (variant !== "generation") expect(f.reads).toHaveLength(0);
+		}
+	});
+	test("remote editor preview is complete-or-refused: low executors and oversize sources never yield partial text", async () => {
+		for (const windows of [false, true]) {
+			const f = fixture({ remote: true, windows });
+			const path = windows ? "C:\\work\\file.ts" : "/work/file.ts";
+			const preview = await f.service.previewFileReference("narrator", "visitor", {
+				deviceId: f.id,
+				path,
+			});
+			expect(preview).toMatchObject({
+				target: { deviceId: "DeviceCase", path },
+				content: "alpha\nbeta",
+			});
+			expect(f.reads.at(-1)?.opts).toMatchObject({
+				expectedResolvedPath: path,
+				maxBytes: MAX_FILE_REFERENCE_SOURCE_BYTES,
+			});
+		}
+		for (const variant of ["stat", "atomic", "bounded"] as const) {
+			const f = fixture({ remote: true });
+			if (variant === "stat") Reflect.set(f.backend, "supportsFsStatResolvedPath", false);
+			if (variant === "atomic") f.backend.supportsFsReadAtomicResolvedPath = false;
+			if (variant === "bounded") f.backend.supportsFsReadBounded = false;
+			await expect(
+				f.service.previewFileReference("narrator", "visitor", {
+					deviceId: f.id,
+					path: "/work/file.ts",
+				}),
+			).rejects.toMatchObject({ code: "FILE_REFERENCE_UNSUPPORTED", statusCode: 422 });
+			expect(f.reads).toHaveLength(0);
+		}
+		for (const variant of ["oversize", "truncated"] as const) {
+			const f = fixture({ remote: true });
+			const backendIds: string[] = [];
+			const getBackend = f.deps.getBackend.bind(f.deps);
+			f.deps.getBackend = (deviceId) => {
+				backendIds.push(deviceId);
+				return getBackend(deviceId);
+			};
+			if (variant === "oversize")
+				f.files.set("/work/file.ts", "x".repeat(MAX_FILE_REFERENCE_SOURCE_BYTES + 1));
+			// Stat reports a small file, but the executor's bounded read reports truncation.
+			else
+				f.setReadHook(async (_path, opts) => ({
+					bytes: new TextEncoder().encode("alpha"),
+					totalSize: 5,
+					truncated: true,
+					resolvedPath: opts?.expectedResolvedPath,
+				}));
+			await expect(
+				f.service.previewFileReference("narrator", "visitor", {
+					deviceId: f.id,
+					path: "/work/file.ts",
+				}),
+			).rejects.toMatchObject({ code: "FILE_REFERENCE_SOURCE_TOO_LARGE", statusCode: 413 });
+			expect(f.reads).toHaveLength(variant === "oversize" ? 0 : 1);
+			// Only the remote backend was ever requested: no host/local fallback.
+			expect(backendIds.length).toBeGreaterThan(0);
+			expect(new Set(backendIds)).toEqual(new Set(["DeviceCase"]));
 		}
 	});
 	test("Windows targets use remote grammar and preserve device ID case", async () => {

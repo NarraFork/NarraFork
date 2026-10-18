@@ -186,6 +186,7 @@ import { NarratorInteractionArea } from "./NarratorInteractionArea";
 import { NarratorMessageListSkeleton } from "./NarratorMessageListSkeleton";
 import { NarratorPanelSkeleton } from "./NarratorPanelSkeleton";
 import type { NarratorPanelProps } from "./narrator-panel-types";
+import { useNarratorPanelVisible } from "./narrator-panel-visibility";
 import {
 	createResponsiveNarratorPanel,
 	NarratorPanelCompactContext,
@@ -288,6 +289,7 @@ function NarratorPanelBody({
 	onToggleSpecPanel,
 }: Omit<NarratorPanelProps, "compact">) {
 	const navigate = useNavigate();
+	const fileDrawerVisible = useNarratorPanelVisible();
 	const { data: fetchedNarrator } = useNarrator(narratorId);
 	const preloadStateRef = useRef({ narratorId, detailReady: !!fetchedNarrator });
 	preloadStateRef.current = { narratorId, detailReady: !!fetchedNarrator };
@@ -3612,7 +3614,8 @@ function NarratorPanelBody({
 					    dock's `file` panel renders. */}
 					{internalFileViewerPath && (
 						<Drawer
-							opened
+							opened={fileDrawerVisible}
+							keepMounted
 							onClose={() => setInternalFileViewerPath(null)}
 							position="right"
 							size={isMobileViewport ? "100%" : 600}
@@ -3644,6 +3647,7 @@ function NarratorPanelBody({
 								}
 							>
 								<FilePanelContent
+									visible={fileDrawerVisible}
 									filePath={internalFileViewerPath}
 									narratorId={narratorId}
 									deviceId={internalFileViewerTarget?.deviceId ?? "local"}

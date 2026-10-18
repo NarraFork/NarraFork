@@ -25,11 +25,21 @@ export function triggerBlobDownload(url: string, filename: string): void {
  * The object URL is revoked on a timer rather than immediately: revoking in the
  * same tick can cancel a download the browser has not started reading yet.
  */
-export function saveBlobAsFile(blob: Blob, filename: string): void {
+export function saveBlobAsFile(blob: Blob, filename: string, onReleased?: () => void): void {
 	const objectUrl = URL.createObjectURL(blob);
+	const release = () => {
+		try {
+			URL.revokeObjectURL(objectUrl);
+		} finally {
+			onReleased?.();
+		}
+	};
+	let started = false;
 	try {
 		triggerBlobDownload(objectUrl, filename);
+		started = true;
 	} finally {
-		setTimeout(() => URL.revokeObjectURL(objectUrl), 10_000);
+		if (started) setTimeout(release, 10_000);
+		else release();
 	}
 }

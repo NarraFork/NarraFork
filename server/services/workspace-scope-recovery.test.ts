@@ -970,11 +970,11 @@ describe("atomic lease recovery", () => {
 		expect(auditRows()[0]?.workspaceLeaseId).toBe(leaseId);
 	});
 
-	test("same-epoch completed registry ownership is recoverable without an ended timestamp", async () => {
+	test("same-epoch completed local-file registry ownership is recoverable without an ended timestamp", async () => {
 		const { effect } = await dispatchedEffect("ended.txt", ABSENT, blobState(hash("x"), 1));
 		const leaseId = durableBarrier(effect);
 		db.update(workspaceWriteLeases)
-			.set({ executionEndedAt: null })
+			.set({ executionEndedAt: null, executionClass: "local_file_io" })
 			.where(eq(workspaceWriteLeases.leaseId, leaseId))
 			.run();
 		await confirmedLeaseRecovery(leaseId);

@@ -61,11 +61,11 @@ describe("pure helper distribution contract", () => {
 	});
 	test("default component selection is frozen and independent of application release versions", () => {
 		const pinned = createHelperDistributionDependencies();
-		expect(EXECUTOR_RELEASE_VERSION).toBe("0.9.1");
+		expect(EXECUTOR_RELEASE_VERSION).toBe("0.9.2");
 		expect(pinned.executor).toEqual({
-			version: "0.9.1",
+			version: "0.9.2",
 			protocolVersion: 1,
-			tag: "executor-v0.9.1",
+			tag: "executor-v0.9.2",
 		});
 		for (const appVersion of ["0.9.2", "0.9.3", "1.0.0"])
 			expect({
@@ -74,8 +74,8 @@ describe("pure helper distribution contract", () => {
 			}).toHaveProperty("helperDistribution", pinned);
 		expect(Object.isFrozen(COMPONENT_VERSIONS)).toBe(true);
 		expect(Object.isFrozen(COMPONENT_VERSIONS.executor)).toBe(true);
-		pinned.executor.version = "0.9.2";
-		expect(createHelperDistributionDependencies().executor.version).toBe("0.9.1");
+		pinned.executor.version = "0.9.3";
+		expect(createHelperDistributionDependencies().executor.version).toBe("0.9.2");
 	});
 	test("component configuration accepts an independent version and rejects ambiguous pins", () => {
 		expect(parseComponentVersions({ executor: { version: "0.9.1", protocolVersion: 1 } })).toEqual({

@@ -50,6 +50,16 @@ function toolCallRow(overrides: Record<string, unknown> = {}) {
 		outputJson: { _text: "hi" },
 		status: "success",
 		durationMs: 12,
+		executionDeviceId: "frozen-remote",
+		executionCwd: "/original/.worktrees/topic",
+		resolvedFilePath: "/original/.worktrees/topic/read.txt",
+		executionTarget: {
+			deviceId: "frozen-remote",
+			cwd: "/original/.worktrees/topic",
+			lexicalPath: "/original/.worktrees/topic/read.txt",
+		},
+		executionTargets: [{ deviceId: "frozen-remote", cwd: "/original/.worktrees/topic" }],
+		deviceSelectionSource: "session_default",
 		createdAt: "2026-07-23T00:00:00.000Z",
 		errorMessage: null,
 		...overrides,
@@ -101,6 +111,97 @@ describe("stripRedundantToolCallRows", () => {
 		}
 	});
 
+	test("reload DTO keeps the selected retry's execution identity, not stale block/output metadata", () => {
+		const message = messageWithTool({
+			narratorId: "actual-child",
+			contentJson: [
+				{
+					type: "tool_use",
+					id: "tu-1",
+					name: "Read",
+					input: { file_path: "old.txt" },
+					tcId: "old",
+					executionAttempt: 1,
+					executionDeviceId: "stale",
+					executionCwd: "/stale",
+					resolvedFilePath: "/stale/old.txt",
+					executionTarget: { deviceId: "stale", cwd: "/stale" },
+				},
+			],
+			toolCalls: [
+				toolCallRow({
+					id: "retry",
+					toolName: "Read",
+					executionAttempt: 2,
+					inputJson: { file_path: "read.txt" },
+					outputJson: { _metadata: { executionDeviceId: "forged", resolvedFilePath: "/forged" } },
+				}),
+				toolCallRow({
+					id: "old",
+					executionAttempt: 1,
+					executionDeviceId: "old",
+					executionCwd: "/old",
+				}),
+			],
+		});
+		const [dto] = JSON.parse(
+			JSON.stringify(stripRedundantToolCallRows(enrichToolUseBlocks([message]))),
+		);
+		expect(dto.toolCalls).toEqual([]);
+		expect(dto.narratorId).toBe("actual-child");
+		expect(dto.contentJson[0]).toMatchObject({
+			tcId: "retry",
+			executionAttempt: 2,
+			executionDeviceId: "frozen-remote",
+			executionCwd: "/original/.worktrees/topic",
+			resolvedFilePath: "/original/.worktrees/topic/read.txt",
+			executionTarget: { deviceId: "frozen-remote", cwd: "/original/.worktrees/topic" },
+		});
+	});
+
+	test("a retry without execution facts clears stale block context instead of inheriting it", () => {
+		const [dto] = JSON.parse(
+			JSON.stringify(
+				stripRedundantToolCallRows(
+					enrichToolUseBlocks([
+						messageWithTool({
+							contentJson: [
+								{
+									type: "tool_use",
+									id: "tu-1",
+									name: "Read",
+									executionTarget: { deviceId: "old", cwd: "/old" },
+									executionDeviceId: "old",
+									executionCwd: "/old",
+									resolvedFilePath: "/old/a.txt",
+								},
+							],
+							toolCalls: [
+								toolCallRow({
+									id: "retry",
+									executionAttempt: 2,
+									executionDeviceId: null,
+									executionCwd: null,
+									resolvedFilePath: null,
+									executionTarget: null,
+								}),
+							],
+						}),
+					]),
+				),
+			),
+		);
+		expect(dto.toolCalls).toEqual([]);
+		expect(dto.contentJson[0]).toMatchObject({
+			tcId: "retry",
+			executionAttempt: 2,
+			executionDeviceId: null,
+			executionCwd: null,
+			resolvedFilePath: null,
+			executionTarget: null,
+		});
+	});
+
 	test("recurses into child (subagent) message trees", () => {
 		const enriched = enrichToolUseBlocks([
 			messageWithTool({ children: [messageWithTool({ id: "m-child" })] }),
@@ -108,6 +209,26 @@ describe("stripRedundantToolCallRows", () => {
 		const stripped = stripRedundantToolCallRows(enriched);
 		expect(stripped[0].children[0].toolCalls).toEqual([]);
 		expect(stripped[0].children[0].contentJson[1].outputJson).toEqual({ _text: "hi" });
+	});
+
+	test("a tool-less parent still projects frozen facts in its child before row stripping", () => {
+		const [dto] = stripRedundantToolCallRows(
+			enrichToolUseBlocks([
+				{
+					id: "plain-parent",
+					contentJson: [],
+					toolCalls: [],
+					children: [messageWithTool({ narratorId: "actual-child" })],
+				},
+			]),
+		);
+		expect(dto.children[0].toolCalls).toEqual([]);
+		expect(dto.children[0].narratorId).toBe("actual-child");
+		expect(dto.children[0].contentJson[1]).toMatchObject({
+			executionDeviceId: "frozen-remote",
+			executionCwd: "/original/.worktrees/topic",
+			resolvedFilePath: "/original/.worktrees/topic/read.txt",
+		});
 	});
 
 	test("leaves a message with no tool rows untouched by reference", () => {

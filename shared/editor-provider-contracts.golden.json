@@ -1,0 +1,213 @@
+{
+	"capabilitiesNone": {
+		"boundedRead": false,
+		"v1Save": false,
+		"rawRead": false,
+		"stage": false,
+		"durableApply": false,
+		"durableQuery": false,
+		"watch": false
+	},
+	"capabilitiesLocalV1": {
+		"boundedRead": true,
+		"v1Save": true,
+		"rawRead": false,
+		"stage": false,
+		"durableApply": false,
+		"durableQuery": false,
+		"watch": false
+	},
+	"capabilitiesBoundedRead": {
+		"boundedRead": true,
+		"v1Save": false,
+		"rawRead": false,
+		"stage": false,
+		"durableApply": false,
+		"durableQuery": false,
+		"watch": false
+	},
+	"identityPosix": {
+		"deviceId": "Device-A",
+		"pathFlavor": "posix",
+		"canonicalPath": "/repo/pkg/file.ts",
+		"workspaceIdentity": "[\"/repo\",\"2049\",\"131\"]",
+		"runtimeEpoch": "epoch-a",
+		"runtimeGeneration": 42,
+		"fencingToken": 7
+	},
+	"rawReadPreflight": {
+		"resourceKey": "res-a",
+		"identity": {
+			"deviceId": "Device-W",
+			"pathFlavor": "windows",
+			"canonicalPath": "C:\\repo\\pkg\\file.ts",
+			"workspaceIdentity": "[\"C:\\\\repo\",\"0\",\"0\"]",
+			"runtimeEpoch": "epoch-w",
+			"runtimeGeneration": 3,
+			"fencingToken": 1
+		},
+		"maxBytes": 20971520,
+		"timeoutMs": 30000
+	},
+	"rawReadOpen": {
+		"readId": "read-1",
+		"sourceGeneration": "src-9",
+		"totalBytes": 0,
+		"rawDigest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+		"identity": {
+			"deviceId": "Device-A",
+			"pathFlavor": "posix",
+			"canonicalPath": "/repo/pkg/empty.txt",
+			"workspaceIdentity": "[\"/repo\",\"2049\",\"131\"]",
+			"runtimeEpoch": "epoch-a",
+			"runtimeGeneration": 42,
+			"fencingToken": 7
+		}
+	},
+	"rawReadChunkRequest": {
+		"readId": "read-1",
+		"offset": 65536,
+		"maxBytes": 65536,
+		"timeoutMs": 10000
+	},
+	"rawReadChunkEof": {
+		"readId": "read-1",
+		"sourceGeneration": "src-9",
+		"offset": 65536,
+		"bytes": 3,
+		"dataB64": "AAH/",
+		"eof": true
+	},
+	"rawReadClose": { "readId": "read-1", "abort": true },
+	"stageOpen": {
+		"namespace": "editor-ns-a",
+		"resourceKey": "res-a",
+		"maxBytes": 20971520,
+		"idleTimeoutMs": 10000
+	},
+	"stageHandle": { "stageId": "stage-1", "resourceKey": "res-a", "expiresAt": 1700000000000 },
+	"stageAppend": {
+		"namespace": "editor-ns-a",
+		"resourceKey": "res-a",
+		"stageId": "stage-1",
+		"seq": 0,
+		"offset": 0,
+		"bytes": 3,
+		"digest": "039058c6f2c0cb492c533b0a4d14ef77cc0f78abccced5287d84a1a2011cfb81",
+		"dataB64": "AQID"
+	},
+	"stageSeal": {
+		"namespace": "editor-ns-a",
+		"resourceKey": "res-a",
+		"stageId": "stage-1",
+		"totalBytes": 3,
+		"rawDigest": "039058c6f2c0cb492c533b0a4d14ef77cc0f78abccced5287d84a1a2011cfb81"
+	},
+	"stageAbort": {
+		"namespace": "editor-ns-a",
+		"resourceKey": "res-a",
+		"stageId": "stage-1",
+		"reason": "idle_timeout"
+	},
+	"applyCreate": {
+		"namespace": "editor-ns-a",
+		"resourceKey": "res-a",
+		"operationId": "op-1",
+		"requestDigest": "req-1",
+		"stageId": "stage-1",
+		"expectedRawHash": null,
+		"identity": {
+			"deviceId": "Device-A",
+			"pathFlavor": "posix",
+			"canonicalPath": "/repo/pkg/new.ts",
+			"workspaceIdentity": "[\"/repo\",\"2049\",\"131\"]",
+			"runtimeEpoch": "epoch-a",
+			"runtimeGeneration": 42,
+			"fencingToken": 7
+		},
+		"metadataPolicy": "reject"
+	},
+	"applyReplace": {
+		"namespace": "editor-ns-a",
+		"resourceKey": "res-a",
+		"operationId": "op-2",
+		"requestDigest": "req-2",
+		"stageId": "stage-2",
+		"expectedRawHash": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+		"identity": {
+			"deviceId": "Device-A",
+			"pathFlavor": "posix",
+			"canonicalPath": "/repo/pkg/file.ts",
+			"workspaceIdentity": "[\"/repo\",\"2049\",\"131\"]",
+			"runtimeEpoch": "epoch-a",
+			"runtimeGeneration": 42,
+			"fencingToken": 8
+		},
+		"metadataPolicy": "preserve"
+	},
+	"applyCommitted": {
+		"operationId": "op-2",
+		"outcome": "committed",
+		"rawDigest": "039058c6f2c0cb492c533b0a4d14ef77cc0f78abccced5287d84a1a2011cfb81",
+		"totalBytes": 3
+	},
+	"applyUncertain": {
+		"operationId": "op-3",
+		"outcome": "uncertain",
+		"rawDigest": null,
+		"totalBytes": null,
+		"error": { "code": "EDITOR_UNCERTAIN", "message": "dispatch reply lost" }
+	},
+	"queryRequest": {
+		"namespace": "editor-ns-a",
+		"resourceKey": "res-a",
+		"operationId": "op-2",
+		"requestDigest": "req-2",
+		"acknowledgeTerminal": true
+	},
+	"queryNotFound": { "operationId": "op-4", "outcome": "not_found", "result": null },
+	"queryCommitted": {
+		"operationId": "op-2",
+		"outcome": "committed",
+		"result": {
+			"operationId": "op-2",
+			"outcome": "committed",
+			"rawDigest": "039058c6f2c0cb492c533b0a4d14ef77cc0f78abccced5287d84a1a2011cfb81",
+			"totalBytes": 3
+		}
+	},
+	"watchOpen": { "resourceKey": "res-a" },
+	"watchHandle": { "subscriptionId": "sub-1", "resourceKey": "res-a", "generation": 5 },
+	"watchNotify": {
+		"subscriptionId": "sub-1",
+		"seq": 12,
+		"generation": 6,
+		"reason": "generation_reset"
+	},
+	"watchClose": { "subscriptionId": "sub-1" },
+	"enums": {
+		"pathFlavors": ["posix", "windows"],
+		"stageAbortReasons": ["cancel", "idle_timeout", "superseded"],
+		"metadataPolicies": ["preserve", "reject"],
+		"applyOutcomes": ["committed", "rejected", "uncertain"],
+		"queryOutcomes": ["committed", "rejected", "uncertain", "not_found", "proven_not_executed"],
+		"watchReasons": [
+			"content_changed",
+			"metadata_changed",
+			"deleted",
+			"replaced",
+			"generation_reset"
+		],
+		"errors": [
+			"EDITOR_IDENTITY_CHANGED",
+			"EDITOR_RUNTIME_CHANGED",
+			"EDITOR_FENCING_REJECTED",
+			"EDITOR_STAGE_DIGEST_MISMATCH",
+			"EDITOR_STAGE_SEAL_FAILED",
+			"EDITOR_APPLY_REJECTED",
+			"EDITOR_NOT_FOUND",
+			"EDITOR_UNCERTAIN",
+			"EDITOR_PROVIDER_UNSUPPORTED"
+		]
+	}
+}

@@ -5,6 +5,13 @@
  * Byte payloads cross the wire base64-encoded. Streaming exec output is bridged
  * from rpc_stream frames into the ExecHandle's onData callback.
  */
+
+import { EDITOR_FILE_MAX_BYTES, EDITOR_IO_TIMEOUT_MS } from "../../shared/editor-document";
+import type {
+	EditorRawReadChunk,
+	EditorRawReadOpen,
+	EditorResourceIdentity,
+} from "../../shared/editor-provider-contracts";
 import type {
 	ConditionalWriteBytesOptions,
 	DevicePlatform,
@@ -47,6 +54,8 @@ import type {
 	RpcMethod,
 } from "../lib/agent/execution/rpc-types";
 import {
+	FEATURE_EDITOR_DURABLE_WRITE_V1,
+	FEATURE_EDITOR_RAW_READ_V1,
 	FEATURE_FS_CONDITIONAL_WRITE_V1,
 	FEATURE_FS_READ_BOUNDED_V1,
 	FEATURE_FS_READ_OFFSET_V1,
@@ -55,13 +64,16 @@ import {
 	FS_STAT_RESOLVED_PATH_FEATURE,
 	FS_WRITE_ATOMIC_RESOLVED_PATH_FEATURE,
 } from "../lib/agent/execution/rpc-types";
+import { AppError } from "../lib/errors";
 import { pathsEqualForOS } from "../lib/platform-path";
 import { settings } from "../lib/settings";
 import {
+	getDeviceConnectionGeneration,
 	hasDeviceProtocolFeature,
 	type SendRpcOptions,
 	sendRpc,
 } from "./device-connection-service";
+import type { EditorRemoteRawSource } from "./editor-document-streams";
 
 function toBase64(bytes: Uint8Array): string {
 	return Buffer.from(bytes).toString("base64");
@@ -191,6 +203,170 @@ export class RemoteBackend implements ExecutionBackend {
 		this.supportsFsWriteAtomicResolvedPath = options.supportsFsWriteAtomicResolvedPath ?? false;
 	}
 
+	get supportsEditorDurableWrite() {
+		return (
+			getDeviceConnectionGeneration(this.deviceId) === this.connectionGeneration &&
+			hasDeviceProtocolFeature(this.deviceId, FEATURE_EDITOR_DURABLE_WRITE_V1)
+		);
+	}
+	editorWriteRpc() {
+		return {
+			call: async <T>(method: string, params: object, signal?: AbortSignal) => {
+				if (!this.supportsEditorDurableWrite)
+					throw new Error("Editor durable executor unavailable or reconnected");
+				return (await this.rpc(
+					method as RpcMethod,
+					{ ...params },
+					{
+						signal,
+						timeoutMs: EDITOR_IO_TIMEOUT_MS,
+						requiredFeatures: [FEATURE_EDITOR_DURABLE_WRITE_V1],
+					},
+				)) as T;
+			},
+			close: async () => {},
+		};
+	}
+	async editorObservation(
+		identity: EditorResourceIdentity,
+		resourceKey: string,
+		signal?: AbortSignal,
+	) {
+		const stat = await this.editorWriteRpc().call<FsStatResult>(
+			"fs.stat",
+			{
+				path: identity.canonicalPath,
+				editorIdentity: true,
+				editorRoot: this.defaultCwd,
+			},
+			signal,
+		);
+		if (!stat.exists) return { bytes: null, mode: null, identity: null };
+		if (!stat.isFile || !Number.isInteger(stat.mode))
+			throw new Error("Remote editor metadata unsupported");
+		const source = this.editorRawSource(identity, resourceKey);
+		const opened = await source.open(signal ?? AbortSignal.timeout(30_000));
+		try {
+			const bytes = new Uint8Array(opened.totalBytes);
+			let offset = 0;
+			for (;;) {
+				const chunk = await source.chunk(
+					{ readId: opened.readId, offset, maxBytes: 65536, timeoutMs: 10_000 },
+					signal ?? AbortSignal.timeout(10_000),
+				);
+				if (
+					chunk.offset !== offset ||
+					chunk.sourceGeneration !== opened.sourceGeneration ||
+					chunk.readId !== opened.readId ||
+					!Number.isSafeInteger(chunk.bytes) ||
+					chunk.bytes < 0 ||
+					chunk.bytes > 65536
+				)
+					throw new Error("Invalid remote editor observation");
+				const raw = Buffer.from(chunk.dataB64, "base64");
+				if (raw.length !== chunk.bytes || offset + raw.length > bytes.length)
+					throw new Error("Invalid remote editor observation bytes");
+				bytes.set(raw, offset);
+				offset += raw.length;
+				if (chunk.eof) {
+					if (offset !== bytes.length) throw new Error("Incomplete remote editor observation");
+					return { bytes, mode: stat.mode as number, identity: opened.sourceGeneration };
+				}
+				if (!raw.length) throw new Error("Empty remote editor observation chunk");
+			}
+		} finally {
+			await source.close({ readId: opened.readId, abort: true });
+		}
+	}
+	get supportsEditorRawRead() {
+		return hasDeviceProtocolFeature(this.deviceId, FEATURE_EDITOR_RAW_READ_V1);
+	}
+	async editorRootIdentity(signal?: AbortSignal) {
+		const result = (await this.rpc(
+			"fs.stat",
+			{ path: this.defaultCwd, editorIdentity: true },
+			{ signal, timeoutMs: 10_000, requiredFeatures: [FEATURE_EDITOR_RAW_READ_V1] },
+		)) as FsStatResult;
+		if (
+			!result.isDirectory ||
+			typeof result.canonicalRoot !== "string" ||
+			!result.canonicalRoot ||
+			result.canonicalRoot.length > 4096 ||
+			typeof result.rootIdentity !== "string" ||
+			!result.rootIdentity ||
+			result.rootIdentity.length > 8192 ||
+			typeof result.runtimeEpoch !== "string" ||
+			!result.runtimeEpoch ||
+			result.runtimeEpoch.length > 128
+		)
+			throw new Error("Remote editor root identity is unavailable");
+		return {
+			canonicalRoot: result.canonicalRoot,
+			rootIdentity: result.rootIdentity,
+			runtimeEpoch: result.runtimeEpoch,
+		};
+	}
+	editorRawSource(identity: EditorResourceIdentity, resourceKey: string): EditorRemoteRawSource {
+		return {
+			open: async (signal) => {
+				// Reuse the existing canonical stat for absence, rather than guessing from
+				// an executor's human-readable open error or probing the host filesystem.
+				if (!(await this.statFile(identity.canonicalPath, { signal, timeoutMs: 10_000 })))
+					throw new AppError("Remote editor source does not exist", 404, "ENOENT");
+				const result = (await this.rpc(
+					"editor.read.open",
+					{
+						resourceKey,
+						identity,
+						maxBytes: EDITOR_FILE_MAX_BYTES,
+						timeoutMs: EDITOR_IO_TIMEOUT_MS,
+					},
+					{
+						signal,
+						timeoutMs: EDITOR_IO_TIMEOUT_MS,
+						requiredFeatures: [FEATURE_EDITOR_RAW_READ_V1],
+					},
+				)) as EditorRawReadOpen;
+				if (
+					typeof result?.readId !== "string" ||
+					!result.readId ||
+					result.readId.length > 128 ||
+					typeof result.sourceGeneration !== "string" ||
+					!result.sourceGeneration ||
+					result.sourceGeneration.length > 128 ||
+					Object.keys(identity).some(
+						(key) =>
+							identity[key as keyof EditorResourceIdentity] !==
+							result.identity?.[key as keyof EditorResourceIdentity],
+					) ||
+					!Number.isSafeInteger(result.totalBytes) ||
+					result.totalBytes < 0 ||
+					result.totalBytes > EDITOR_FILE_MAX_BYTES ||
+					!/^[a-f0-9]{64}$/.test(result.rawDigest)
+				) {
+					if (result?.readId)
+						await this.rpc("editor.read.close", { readId: result.readId, abort: true }).catch(
+							() => {},
+						);
+					throw new Error("Remote editor source identity changed");
+				}
+				return result;
+			},
+			chunk: async (input, signal) =>
+				(await this.rpc(
+					"editor.read.chunk",
+					{ ...input },
+					{ signal, timeoutMs: input.timeoutMs, requiredFeatures: [FEATURE_EDITOR_RAW_READ_V1] },
+				)) as EditorRawReadChunk,
+			close: async (input) => {
+				await this.rpc(
+					"editor.read.close",
+					{ ...input },
+					{ timeoutMs: 10_000, requiredFeatures: [FEATURE_EDITOR_RAW_READ_V1] },
+				);
+			},
+		};
+	}
 	get supportsFsReadBounded(): boolean {
 		return hasDeviceProtocolFeature(this.deviceId, FEATURE_FS_READ_BOUNDED_V1);
 	}

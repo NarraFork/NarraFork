@@ -22,14 +22,22 @@ import { db } from "../db";
 import { fileChangeOperations, narrators, users } from "../db/schema";
 import { AppError } from "../lib/errors";
 import { generateId } from "../lib/id";
+import { queryEditorOperation } from "../services/editor-document-runtime";
 import { EditorDocumentService } from "../services/editor-document-service";
 import { LocalFileChangeRuntime } from "../services/file-change-runtime";
 import { createEditorDocumentRoutes } from "./editor-documents";
+import { remoteEditorFixture } from "./editor-remote-browser-acceptance";
+import { createFileReferenceRoutes } from "./narrator-file-references";
 
-const CHROME = "/home/fulcrum/.cache/puppeteer/chrome/linux-146.0.7680.31/chrome-linux64/chrome";
+const CHROME =
+	process.env.NF_TEST_CHROMIUM_PATH ??
+	process.env.PUPPETEER_EXECUTABLE_PATH ??
+	"/home/fulcrum/.cache/puppeteer/chrome/linux-146.0.7680.31/chrome-linux64/chrome";
 const MiB = 1024 * 1024;
 const PREFIX = "/* REAL_IO_SNAPSHOT */";
 const DURING_SAVE = "/* TYPED_DURING_SAVE */";
+const RETIRED_SNAPSHOT = "/* RETIRED_SNAPSHOT */";
+const RETAINED_LATER = "/* RETAINED_AFTER_DISPATCH */";
 const sha256 = (bytes: Uint8Array) => createHash("sha256").update(bytes).digest("hex");
 const fingerprint = (bytes: Uint8Array) => ({ bytes: bytes.byteLength, sha256: sha256(bytes) });
 function deferred() {
@@ -54,12 +62,12 @@ function sourceBytes() {
 	]);
 }
 
-if (!existsSync(CHROME))
-	console.info("SKIP editor real IO browser test: specified Chromium missing");
-
-test.skipIf(!existsSync(CHROME))(
-	"production bundle Chromium saves immutable 20 MiB snapshots through real routes and durable human IO",
-	async () => {
+// Browser availability is a prerequisite failure, never a skipped acceptance.
+const browserTest = test;
+browserTest.each([false, true, "cache", "draft", "remote"] as const)(
+	"production Chromium editor and actual FilePanelContent/gate IO (hostGate=%s)",
+	async (hostGate) => {
+		expect(existsSync(CHROME)).toBe(true);
 		expect(process.env.NARRAFORK_TEST).toBe("1");
 		expect(process.env.NARRAFORK_HOME).toBe(testEnvironment.narraforkHome);
 		expect(testEnvironment.narraforkHome).not.toBe(testEnvironment.realNarraforkHome);
@@ -73,6 +81,8 @@ test.skipIf(!existsSync(CHROME))(
 		const stopSampling = new AbortController();
 		const commitEntered = deferred();
 		const releaseCommit = deferred();
+		const retiredCommitPersisted = deferred();
+		const releaseRetiredResponse = deferred();
 		let root: string | undefined;
 		let bundleRoot: string | undefined;
 		let builder: Bun.Subprocess<"ignore", "pipe", "pipe"> | undefined;
@@ -80,6 +90,7 @@ test.skipIf(!existsSync(CHROME))(
 		let service: EditorDocumentService | undefined;
 		let backend: ReturnType<typeof Bun.serve> | undefined;
 		let browser: Browser | undefined;
+		let remote: ReturnType<typeof remoteEditorFixture> | undefined;
 		let sampler: Promise<void> | undefined;
 		let duringCommit = false;
 		let duringDurable = false;
@@ -111,16 +122,35 @@ test.skipIf(!existsSync(CHROME))(
 					await mkdir(workspace);
 					const path = join(workspace, "twenty-mib.ts");
 					const outside = join(root, "outside.ts");
-					const original = sourceBytes();
+					const original = hostGate
+						? Buffer.from(
+								Array.from(
+									{ length: 160 },
+									(_, line) => `// actual host line ${line} 中文🙂 ${"bounded ".repeat(8)}\n`,
+								).join(""),
+							)
+						: sourceBytes();
 					const firstGolden = Buffer.concat([Buffer.from(PREFIX), original]);
 					const finalGolden = Buffer.concat([Buffer.from(DURING_SAVE), firstGolden]);
-					expect(original.length).toBe(20 * MiB - 1024);
+					if (hostGate) expect(original.length).toBeLessThan(MiB);
+					else expect(original.length).toBe(20 * MiB - 1024);
 					expect(finalGolden.length).toBeLessThan(20 * MiB);
 					const originalText = original.toString("utf8");
 					const lines = originalText.split("\n");
 					expect(lines.length).toBeLessThanOrEqual(300_000);
 					expect(lines.every((line) => line.length <= 160)).toBe(true);
 					await writeFile(path, original);
+					if (hostGate === "cache") {
+						for (let index = 2; index <= 14; index++)
+							await writeFile(
+								join(workspace, `cache-${index}.txt`),
+								`cache file ${index}\n${originalText}`,
+							);
+						await writeFile(
+							join(workspace, "cache-markdown.md"),
+							`# Real preview fixture\n\n${Array.from({ length: 160 }, (_, index) => `## Preview section ${index}\n\n${"Long preview paragraph 中文 scroll retention. ".repeat(8)}\n\n`).join("")}`,
+						);
+					}
 					await writeFile(outside, "outside boundary sentinel\n");
 					const userId = generateId();
 					const intruderId = generateId();
@@ -144,27 +174,77 @@ test.skipIf(!existsSync(CHROME))(
 						db,
 						privateRoot: testEnvironment.narraforkHome,
 					});
-					const documents = new EditorDocumentService({
-						root: join(root, "transfers"),
-						execute: (request) => runtime.executeEditor(request),
-					});
+					const transferRoot = join(root, "transfers");
+					const makeDocuments = () =>
+						new EditorDocumentService({
+							root: transferRoot,
+							execute: (request) => runtime.executeEditor(request),
+							queryOperation: queryEditorOperation,
+						});
+					let documents = makeDocuments();
 					service = documents;
 					const app = new Hono();
+					let activeUser = userId;
 					app.use("*", async (c, next) => {
 						c.set("user", {
-							sub: c.req.header("x-fixture-user") === intruderId ? intruderId : userId,
+							sub: c.req.header("x-fixture-user") === intruderId ? intruderId : activeUser,
 							role: "user",
 							iat: 1,
 							exp: 9999999999,
 						});
 						await next();
 					});
-					let commits = 0;
+					let commits = 0,
+						dropNextReply = false,
+						denyReceiptQueries = false,
+						diskProbes = 0;
+					// Cache scenario: hold ONE chosen commit at a real-route barrier.
+					let holdCommit: { entered: () => void; release: Promise<void> } | undefined;
+					const cacheUploads: { baseHash: string | null; status: number }[] = [];
 					app.use("/api/narrators/*", async (c, next) => {
-						if (c.req.method === "POST" && c.req.path.endsWith("/commit")) {
+						if (c.req.path.endsWith("/disk-state")) diskProbes++;
+						if (hostGate === "cache" && c.req.method === "POST" && c.req.path.endsWith("/uploads"))
+							cacheUploads.push({
+								baseHash: ((await c.req.raw.clone().json()) as { baseHash: string | null })
+									.baseHash,
+								status: 0,
+							});
+						if (hostGate === "cache" && c.req.method === "POST" && c.req.path.endsWith("/commit")) {
 							commits++;
+							const hold = holdCommit;
+							holdCommit = undefined;
+							if (hold) {
+								hold.entered();
+								await bounded(hold.release);
+							}
+							await next();
+							const last = cacheUploads.at(-1);
+							if (last) last.status = c.res.status;
+							return;
+						}
+						if (denyReceiptQueries && c.req.path.includes("/editor-operations/"))
+							return c.json(
+								{ error: "Fixture receipt transport unavailable", code: "FIXTURE_RECEIPT_OFFLINE" },
+								503,
+							);
+						if (c.req.method === "POST" && c.req.path.endsWith("/commit")) {
+							const commitNumber = ++commits;
+							if (hostGate === "draft") {
+								await next();
+								if (dropNextReply && c.res.status === 200) {
+									dropNextReply = false;
+									c.res = new Response(
+										JSON.stringify({
+											error: "Fixture lost the commit reply",
+											code: "FIXTURE_COMMIT_RESPONSE_LOST",
+										}),
+										{ status: 503, headers: { "content-type": "application/json" } },
+									);
+								}
+								return;
+							}
 							duringCommit = true;
-							if (commits === 1) {
+							if (commitNumber === 1) {
 								// Timing barrier ONLY: the sealed upload, route, service and runtime stay real.
 								commitEntered.resolve();
 								await bounded(releaseCommit.promise);
@@ -172,17 +252,41 @@ test.skipIf(!existsSync(CHROME))(
 							duringDurable = true;
 							try {
 								await next();
+								if (commitNumber === 3) {
+									// Durable commit is complete; only its HTTP response is held.
+									retiredCommitPersisted.resolve();
+									await bounded(releaseRetiredResponse.promise);
+								}
 							} finally {
 								duringDurable = false;
 								duringCommit = false;
 							}
 						} else await next();
 					});
-					app.get("/api/fixture/config", (c) => c.json({ path, narratorId }));
+					if (hostGate === "remote")
+						remote = remoteEditorFixture({
+							path,
+							cwd: workspace,
+							hostCwd: root,
+							narratorId,
+							userId,
+						});
+					app.get("/api/fixture/config", (c) =>
+						c.json({
+							path: remote ? "twenty-mib.ts" : path,
+							narratorId,
+							hostGate,
+							deviceId: remote?.deviceId,
+						}),
+					);
 					app.get("/api/health", (c) => c.json({ ok: true, fixture: narratorId }));
 					app.route(
 						"/api/narrators",
 						createEditorDocumentRoutes(() => documents),
+					);
+					app.route(
+						"/api/narrators/:id/file-references",
+						createFileReferenceRoutes(remote?.service),
 					);
 					app.onError((error, c) =>
 						c.json(
@@ -195,8 +299,7 @@ test.skipIf(!existsSync(CHROME))(
 					// emit ../ paths. This unique, gitignored directory belongs only to this test.
 					bundleRoot = await mkdtemp(join(project, ".tmp-narrafork-home.editor-browser-bundle-"));
 					const manifestPath = join(bundleRoot, "manifest.json");
-					const htmlEntry =
-						'<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Isolated real IO</title><link rel="icon" href="data:,"></head><body style="margin:0"><div id="root" style="height:100vh"></div><script type="module" src="/scripts/smoke-editor-real-io-fixture.tsx"></script></body></html>';
+					const htmlEntry = `<!doctype html><html lang="en"><head><meta charset="utf-8"><title>Isolated real IO</title><link rel="icon" href="data:,"></head><body style="margin:0"><div id="root" style="height:100vh"></div><script type="module" src="/scripts/${hostGate === "cache" || hostGate === "draft" ? "smoke-editor-cache-fixture" : "smoke-editor-real-io-fixture"}.tsx"></script></body></html>`;
 					deadline.signal.throwIfAborted();
 					// A subprocess makes the production build cancellable. Promise.race around
 					// in-process Vite would keep writing after the deadline/finally cleanup.
@@ -300,6 +403,12 @@ await Bun.write(${JSON.stringify(manifestPath)}, manifest);`,
 					let workerCount = 0;
 					let contentResponses = 0;
 					let httpErrors = 0;
+					const httpErrorUrls: string[] = [];
+					let receiptQueries = 0;
+					let recoveryScopes = 0;
+					let documentCreates = 0;
+					let infoFailures = 0;
+					let metadataRequests = 0;
 					page.on("pageerror", (error) => note(String(error)));
 					page.on("console", (message) => {
 						// Network errors are counted separately, including exactly two intentional refusals.
@@ -312,6 +421,14 @@ await Bun.write(${JSON.stringify(manifestPath)}, manifest);`,
 					// Passive observation only. Request interception can deadlock module Workers.
 					page.on("request", (request) => {
 						requestCount++;
+						if (request.url().includes("/file-references/info?")) metadataRequests++;
+						if (request.url().includes("/editor-operations/")) receiptQueries++;
+						if (request.url().includes("/editor-documents/recovery-scope?")) recoveryScopes++;
+						if (
+							request.method() === "POST" &&
+							new URL(request.url()).pathname === `/api/narrators/${narratorId}/editor-documents`
+						)
+							documentCreates++;
 						if (/^https?:/.test(request.url()) && new URL(request.url()).origin !== origin)
 							offOriginCount++;
 					});
@@ -319,7 +436,15 @@ await Bun.write(${JSON.stringify(manifestPath)}, manifest);`,
 						workerCount++;
 					});
 					page.on("response", (response) => {
-						if (response.status() >= 400) httpErrors++;
+						if (response.status() >= 400) {
+							httpErrors++;
+							if (httpErrorUrls.length < 16)
+								httpErrorUrls.push(
+									`${response.status()} ${new URL(response.url()).pathname.replace(/[a-f0-9-]{36}/g, ":id")}`,
+								);
+						}
+						if (response.status() >= 400 && response.url().includes("/file-references/info?"))
+							infoFailures++;
 						if (response.url().includes("/content?version=") && response.status() === 200)
 							contentResponses++;
 					});
@@ -357,6 +482,96 @@ await Bun.write(${JSON.stringify(manifestPath)}, manifest);`,
 						}
 					});
 					await bounded(page.goto(origin, { waitUntil: "domcontentloaded", timeout: 30_000 }));
+					if (remote) {
+						await bounded(remote.accept(page, origin));
+						expect(documentCreates).toBe(0);
+						expect(commits).toBe(0);
+						expect(contentResponses).toBe(0);
+						expect(diagnostics).toEqual([]);
+						expect(offOriginCount).toBe(0);
+						return;
+					}
+					if (hostGate === "draft") {
+						const { editorDraftBrowserAcceptance } = await import(
+							"./editor-draft-browser-acceptance"
+						);
+						await bounded(
+							editorDraftBrowserAcceptance(page, {
+								path,
+								origin,
+								original: originalText,
+								downloadDirectory: join(root, "draft-downloads"),
+								writeDisk: (text) => writeFile(path, text),
+								readDisk: () => readFile(path, "utf8"),
+								removeDisk: () => rm(path),
+								revoke: (revoked) => {
+									activeUser = revoked ? intruderId : userId;
+								},
+								commits: () => commits,
+								loseNextReceipt: () => {
+									dropNextReply = true;
+									denyReceiptQueries = true;
+								},
+								restartService: async () => {
+									await documents.dispose();
+									documents = makeDocuments();
+									service = documents;
+									denyReceiptQueries = false;
+								},
+								changeContext: (changed) => {
+									db.update(narrators)
+										.set({ workspaceRevision: changed ? 1 : 0 })
+										.where(eq(narrators.id, narratorId))
+										.run();
+								},
+							}),
+						);
+						expect(diagnostics).toEqual([]);
+						expect(offOriginCount).toBe(0);
+						return;
+					}
+					if (hostGate === "cache") {
+						const { editorCacheBrowserAcceptance } = await import(
+							"./editor-cache-browser-acceptance"
+						);
+						await bounded(
+							editorCacheBrowserAcceptance(
+								page,
+								documents,
+								join(root, "transfers"),
+								() => ({
+									documentCreates,
+									contentResponses,
+									recoveryScopes,
+									metadataRequests,
+								}),
+								{
+									workspace,
+									uploads: () => [...cacheUploads],
+									diskProbes: () => diskProbes,
+									holdNextCommit: () => {
+										const entered = deferred();
+										const release = deferred();
+										holdCommit = { entered: entered.resolve, release: release.promise };
+										return { entered: entered.promise, release: release.resolve };
+									},
+									revoke: (revoked) => {
+										activeUser = revoked ? intruderId : userId;
+									},
+								},
+							),
+						);
+						expect(diagnostics).toEqual([]);
+						// The revoked probe and independent recovery proof both fail closed.
+						// Restoring an ACL cannot thaw the old copy; explicit reopen is fresh.
+						expect(httpErrorUrls).toEqual([
+							`404 /api/narrators/${narratorId}/editor-documents/:id/disk-state`,
+							`404 /api/narrators/${narratorId}/editor-documents/recovery-scope`,
+						]);
+						expect(httpErrors).toBe(2);
+						expect(offOriginCount).toBe(0);
+						return;
+					}
 					// waitForFunction holds a CDP call until ready, longer than the 15s
 					// protocol budget. Short observations preserve the page's 20s ready budget.
 					const readyBudgetMs = page.getDefaultTimeout();
@@ -416,7 +631,56 @@ await Bun.write(${JSON.stringify(manifestPath)}, manifest);`,
 							await page.keyboard.up("Control");
 						}
 					};
+					await page.waitForFunction(() => window.__editorRealIo.sharedState().views === 2);
+					await page.evaluate(() => window.__editorRealIo.prepareIndependentViews());
+					const shared = await page.evaluate(() => window.__editorRealIo.sharedState());
+					expect(shared).toMatchObject({
+						models: 1,
+						views: 2,
+						shared: true,
+						sameText: true,
+						selections: [1, 40],
+					});
+					expect(shared.scrolls[0]).toBe(0);
+					expect(shared.scrolls[1]).toBeGreaterThan(0);
 					await page.evaluate(() => window.__editorRealIo.focus());
+					await ctrl("Home");
+					await page.keyboard.type("/*SHARED_VIEW_PROBE*/");
+					await page.waitForFunction(() => window.__editorRealIo.state().dirty);
+					expect((await page.evaluate(() => window.__editorRealIo.sharedState())).sameText).toBe(
+						true,
+					);
+					await page.evaluate(() => window.__editorRealIo.focusSecondary());
+					await ctrl("z");
+					await page.waitForFunction(() => !window.__editorRealIo.state().dirty);
+					expect(await page.evaluate(() => window.__editorRealIo.fingerprint())).toEqual(
+						fingerprint(original),
+					);
+					await ctrl("y");
+					await page.waitForFunction(() => window.__editorRealIo.state().dirty);
+					await page.evaluate(() => window.__editorRealIo.closeSecondary());
+					await page.waitForFunction(() => window.__editorRealIo.sharedState().views === 1);
+					expect((await page.evaluate(() => window.__editorRealIo.sharedState())).models).toBe(1);
+					await page.evaluate(() => window.__editorRealIo.focus());
+					await ctrl("z");
+					await page.waitForFunction(() => !window.__editorRealIo.state().dirty);
+					expect(await page.evaluate(() => window.__editorRealIo.fingerprint())).toEqual(
+						fingerprint(original),
+					);
+					expect((documents as unknown as { sessions: Map<string, unknown> }).sessions.size).toBe(
+						1,
+					);
+					console.info(
+						"EDITOR_SHARED_VIEW_CHROMIUM",
+						JSON.stringify({
+							browser: await browser?.version(),
+							...shared,
+							afterCloseViews: 1,
+							liveDocuments: 1,
+							undoAcrossViews: true,
+							undoAfterClose: true,
+						}),
+					);
 					await ctrl("Home");
 					await page.keyboard.type(PREFIX);
 					await page.waitForFunction(() => window.__editorRealIo.state().dirty);
@@ -539,6 +803,7 @@ await Bun.write(${JSON.stringify(manifestPath)}, manifest);`,
 					console.info(
 						JSON.stringify({
 							test: "editor-real-io",
+							hostGate,
 							bundle: bundle.metadata,
 							identity: "synthetic (not production JWT coverage)",
 							sourceBytes: original.length,
@@ -553,6 +818,176 @@ await Bun.write(${JSON.stringify(manifestPath)}, manifest);`,
 							elapsedMs: Math.round(performance.now() - started),
 						}),
 					);
+					// A dispatched save succeeds durably, but its response arrives after the
+					// execution context changes. Reopening must expose the OLD attempt without
+					// installing its later edits into the freshly authorized document.
+					await page.evaluate(() => window.__editorRealIo.focus());
+					await ctrl("Home");
+					await page.keyboard.type(RETIRED_SNAPSHOT);
+					await page.waitForFunction(() => window.__editorRealIo.state().dirty);
+					await ctrl("s");
+					await ctrl("Home");
+					await page.keyboard.type(RETAINED_LATER);
+					await bounded(retiredCommitPersisted.promise);
+					const retiredDisk = Buffer.concat([Buffer.from(RETIRED_SNAPSHOT), finalGolden]);
+					const retiredDraft = Buffer.concat([Buffer.from(RETAINED_LATER), retiredDisk]);
+					expect((await readFile(path)).equals(retiredDisk)).toBe(true);
+					db.update(narrators)
+						.set({ workspaceRevision: 1 })
+						.where(eq(narrators.id, narratorId))
+						.run();
+					const scopesBeforeDeniedHost = recoveryScopes;
+					const createsBeforeDeniedHost = documentCreates;
+					const readsBeforeDeniedHost = contentResponses;
+					await rm(path); // Actual host info (or the direct editor create) must fail.
+					await page.evaluate(() => window.__editorRealIo.invalidateContext());
+					releaseRetiredResponse.resolve();
+					await page.waitForFunction(() => window.__editorRealIo.state().readOnly);
+					await page.evaluate(() => window.__editorRealIo.reopen());
+					await page.waitForFunction(
+						() =>
+							!!document.querySelector("[data-editor-retained-draft]") &&
+							!window.__editorRealIo.state().ready,
+					);
+					expect(await Bun.file(path).exists()).toBe(false);
+					expect(recoveryScopes).toBe(scopesBeforeDeniedHost + 2); // invalidation + independent gate reopen
+					const deniedHostCreates = documentCreates - createsBeforeDeniedHost;
+					const deniedHostReads = contentResponses - readsBeforeDeniedHost;
+					expect(infoFailures).toBe(hostGate ? 1 : 0);
+					expect(deniedHostCreates).toBe(hostGate ? 0 : 1);
+					expect(deniedHostReads).toBe(0);
+					expect(await page.evaluate(() => window.__editorRealIo.retainedFingerprint())).toEqual(
+						fingerprint(retiredDraft),
+					);
+					expect(receiptQueries).toBe(0);
+					const check = await page.$("[data-editor-retained-draft] button");
+					if (!check) throw new Error("Missing retained save recovery button");
+					await check.click();
+					await page.waitForFunction(
+						() =>
+							!!document.querySelector(
+								'[data-editor-retained-draft] [data-editor-retired-receipt="saved"]',
+							),
+					);
+					expect(receiptQueries).toBe(1);
+					expect(commits).toBe(3);
+					expect(await Bun.file(path).exists()).toBe(false);
+					expect(await page.evaluate(() => window.__editorRealIo.retainedFingerprint())).toEqual(
+						fingerprint(retiredDraft),
+					);
+					expect(await page.evaluate(() => window.__editorRealIo.sharedState().models)).toBe(1);
+					// Real user export, with Chrome downloads confined to this fixture's private root.
+					const downloads = join(root, "downloads");
+					await mkdir(downloads);
+					const downloadName = "twenty-mib.ts.retained-draft.utf8.txt";
+					const downloadSession = await browser.target().createCDPSession();
+					await downloadSession.send("Browser.setDownloadBehavior", {
+						behavior: "allow",
+						downloadPath: downloads,
+						eventsEnabled: true,
+					});
+					let finishDownload!: () => void;
+					let failDownload!: (error: Error) => void;
+					let downloadGuid = "";
+					const downloaded = new Promise<void>((resolve, reject) => {
+						finishDownload = resolve;
+						failDownload = reject;
+					});
+					downloadSession.on("Browser.downloadWillBegin", (event) => {
+						if (event.suggestedFilename === downloadName) downloadGuid = event.guid;
+					});
+					downloadSession.on("Browser.downloadProgress", (event) => {
+						if (event.guid !== downloadGuid) return;
+						if (event.state === "completed") finishDownload();
+						else if (event.state === "canceled")
+							failDownload(new Error("Retained draft download cancelled"));
+					});
+					const downloadTimeout = setTimeout(
+						() => failDownload(new Error("Retained draft download exceeded 10s")),
+						10_000,
+					);
+					try {
+						const exportDraft = await page.$("[data-editor-retained-draft] button");
+						if (!exportDraft) throw new Error("Missing retained draft export");
+						await exportDraft.click();
+						await bounded(downloaded);
+						const exportedPath = join(downloads, downloadName);
+						expect(Bun.file(exportedPath).size).toBe(retiredDraft.length);
+						expect((await readFile(exportedPath)).equals(retiredDraft)).toBe(true);
+					} finally {
+						clearTimeout(downloadTimeout);
+						await downloadSession.detach();
+					}
+					expect(await Bun.file(path).exists()).toBe(false);
+					expect(commits).toBe(3);
+					// Explicit external fixture restoration, NOT another editor apply. Now verify
+					// that a newly authorized model still cannot absorb the retained later draft.
+					await writeFile(path, retiredDisk);
+					await page.evaluate(() => {
+						const retry = [...document.querySelectorAll<HTMLButtonElement>("button")].find(
+							(button) =>
+								!button.closest("[data-editor-retained-draft]") && button.textContent === "Retry",
+						);
+						if (!retry) throw new Error("Missing current file retry");
+						retry.click();
+					});
+					await page.waitForFunction(
+						() =>
+							!!document.querySelector("[data-editor-retained-draft]") &&
+							window.__editorRealIo.state().ready &&
+							!window.__editorRealIo.state().dirty,
+					);
+					expect(await page.evaluate(() => window.__editorRealIo.fingerprint())).toEqual(
+						fingerprint(retiredDisk),
+					);
+					expect(await page.evaluate(() => window.__editorRealIo.retainedFingerprint())).toEqual(
+						fingerprint(retiredDraft),
+					);
+					expect(recoveryScopes).toBe(scopesBeforeDeniedHost + 3); // retry obtains one fresh owner proof
+					expect(httpErrors).toBe(3);
+					expect(await page.evaluate(() => window.__editorRealIo.sharedState().models)).toBe(2);
+					page.once("dialog", (dialog) => void dialog.accept());
+					await page.evaluate(() => {
+						const discard = [
+							...document.querySelectorAll<HTMLButtonElement>(
+								"[data-editor-retained-draft] button",
+							),
+						].find((button) => button.textContent === "Discard retained draft");
+						if (!discard || discard.disabled)
+							throw new Error("Missing enabled explicit draft discard");
+						discard.click();
+					});
+					await page.waitForFunction(
+						() =>
+							!document.querySelector("[data-editor-retained-draft]") &&
+							window.__editorRealIo.sharedState().models === 1,
+					);
+					expect(await page.evaluate(() => window.__editorRealIo.fingerprint())).toEqual(
+						fingerprint(retiredDisk),
+					);
+					expect(commits).toBe(3);
+					expect(diagnostics).toEqual([]);
+					console.info(
+						"EDITOR_RETIRED_RECEIPT_CHROMIUM",
+						JSON.stringify({
+							receiptQueries,
+							recoveryScopes,
+							commits,
+							hostGate,
+							infoFailures,
+							currentEditorCreatesOnInfoFailure: hostGate ? deniedHostCreates : null,
+							currentFullReadsOnInfoFailure: hostGate ? deniedHostReads : null,
+							currentCreateFailedWhileDeleted: !hostGate,
+							exportedDraftBytes: retiredDraft.length,
+							externalFixtureRestore: true,
+							modelsBeforeDiscard: 2,
+							modelsAfterDiscard: 1,
+							currentClean: true,
+							retainedDraftUnchanged: true,
+							currentDocumentUnchanged: true,
+							noReapply: true,
+						}),
+					);
 					await page.evaluate(() => window.__editorRealIo.dispose());
 				})(),
 			);
@@ -564,6 +999,7 @@ await Bun.write(${JSON.stringify(manifestPath)}, manifest);`,
 			deadline.abort(new Error("Fixture teardown"));
 			stopSampling.abort();
 			releaseCommit.resolve();
+			releaseRetiredResponse.resolve();
 			const cleanupErrors: string[] = [];
 			const cleanup = async (name: string, action: () => Promise<unknown>) => {
 				let timer: ReturnType<typeof setTimeout> | undefined;
@@ -603,6 +1039,7 @@ await Bun.write(${JSON.stringify(manifestPath)}, manifest);`,
 				}),
 				cleanup("Bun server and streams", async () => backend?.stop(true)),
 			]);
+			remote?.restore();
 			await cleanup("document service", async () => service?.dispose());
 			await Promise.all([
 				cleanup("temporary fixture", async () => {

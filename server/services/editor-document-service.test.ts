@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { createHash, randomUUID } from "node:crypto";
 import { constants } from "node:fs";
 import {
@@ -9,6 +9,7 @@ import {
 	open,
 	readdir,
 	readFile,
+	rename,
 	rm,
 	symlink,
 	unlink,
@@ -20,6 +21,7 @@ import { eq } from "drizzle-orm";
 import iconv from "iconv-lite";
 import {
 	EDITOR_FILE_MAX_BYTES,
+	EDITOR_METADATA_MAX_BYTES,
 	EDITOR_SESSION_IDLE_MS,
 	EDITOR_TRANSFER_MAX_BYTES,
 	type EditorDocumentDescriptor,
@@ -39,7 +41,11 @@ import {
 	EditorDocumentError,
 	EditorDocumentService,
 } from "./editor-document-service";
-import type { EditorWorkerRequest } from "./editor-document-worker";
+import type {
+	EditorVersionMetadata,
+	EditorWorkerRequest,
+	EditorWorkerResult,
+} from "./editor-document-worker";
 import { type FileChangeLocalIo, fileChangeLocalIo } from "./file-change-local-io";
 import { LocalFileChangeRuntime } from "./file-change-runtime";
 
@@ -137,6 +143,122 @@ function deferred() {
 	return { resolve, promise };
 }
 
+test("raw open final authorization and DELETE settle without leaking the closing session quota", async () => {
+	const doc = await service.create(actor, {
+		path: target,
+		deviceId: "local",
+		origin: "legacy",
+		protocol: "raw-v2",
+	});
+	const entered = deferred(),
+		resume = deferred();
+	const authorize = actor.authorize.bind(actor);
+	let calls = 0;
+	const pause = spyOn(actor, "authorize").mockImplementation(async (...args) => {
+		const binding = await authorize(...args);
+		if (++calls === 2) {
+			entered.resolve();
+			await resume.promise;
+		}
+		return binding;
+	});
+	const opening = service.rawOpen(actor, doc.docId, doc.versionHandle).catch((error) => error);
+	try {
+		await entered.promise;
+		expect(await service.remove(actor, doc.docId)).toEqual({ status: "released" });
+		resume.resolve();
+		expect(await opening).toBeInstanceOf(EditorDocumentError);
+		expect((Reflect.get(service, "sessions") as Map<string, unknown>).size).toBe(0);
+		expect(
+			(Reflect.get(service, "userSessions") as Map<string, number>).get(actor.userId) ?? 0,
+		).toBe(0);
+		expect(service.streams.diagnostics.active).toBe(0);
+	} finally {
+		resume.resolve();
+		await opening;
+		pause.mockRestore();
+	}
+});
+
+test.each([
+	"before",
+	"second-frame",
+] as const)("remote assembled body reauthorizes current access %s publication and returns its window on denial", async (when) => {
+	const bytes = Buffer.alloc(64 * 1024, 65);
+	await writeFile(target, bytes);
+	const digest = createHash("sha256").update(bytes).digest("hex");
+	const original = actor.authorize.bind(actor);
+	let revoked = false,
+		body = false,
+		bodyFrames = 0,
+		checks = 0;
+	const closes: boolean[] = [];
+	actor.authorize = async (...args) => {
+		checks++;
+		if (revoked) throw new EditorDocumentError("FORBIDDEN", "Current device access revoked", 403);
+		return {
+			...(await original(...args)),
+			deviceId: "peer",
+			workspaceIdentity: "root",
+			runtimeEpoch: "epoch",
+			runtimeGeneration: 1,
+			rawSource: {
+				open: async () => ({
+					readId: "peer-read",
+					sourceGeneration: "generation",
+					totalBytes: bytes.length,
+					rawDigest: digest,
+					identity: {
+						deviceId: "peer",
+						pathFlavor: "posix" as const,
+						canonicalPath: target,
+						workspaceIdentity: "root",
+						runtimeEpoch: "epoch",
+						runtimeGeneration: 1,
+						fencingToken: 1,
+					},
+				}),
+				chunk: async (input) => {
+					expect(input.maxBytes).toBeLessThanOrEqual(16384);
+					if (body && ++bodyFrames === 2 && when === "second-frame") revoked = true;
+					const part = bytes.subarray(input.offset, input.offset + input.maxBytes);
+					return {
+						readId: input.readId,
+						sourceGeneration: "generation",
+						offset: input.offset,
+						bytes: part.length,
+						dataB64: part.toString("base64"),
+						eof: input.offset + part.length === bytes.length,
+					};
+				},
+				close: async (input) => {
+					if (body) closes.push(input.abort);
+				},
+			},
+		};
+	};
+	const doc = await service.create(actor, {
+		path: target,
+		deviceId: "peer",
+		origin: "reference",
+		protocol: "raw-v2",
+	});
+	const opened = await service.rawOpen(actor, doc.docId, doc.versionHandle);
+	body = true;
+	checks = 0;
+	if (when === "before") revoked = true;
+	await expect(service.rawChunk(actor, doc.docId, opened.readId, 0, 65536)).rejects.toMatchObject({
+		code: "FORBIDDEN",
+		statusCode: 403,
+	});
+	expect(bodyFrames).toBe(when === "before" ? 0 : 2);
+	expect(checks).toBe(when === "before" ? 1 : 2);
+	expect(closes).toEqual([true]);
+	expect(service.streams.diagnostics.active).toBe(0);
+	expect(service.streams.diagnostics.windowBytes).toBe(0);
+	expect(dispatches).toBe(0);
+});
+
 async function createFifo(path: string) {
 	const command = Bun.spawn(["mkfifo", path], {
 		stdin: "ignore",
@@ -168,6 +290,30 @@ async function expectFastFifoRejection(
 }
 
 describe("large editor objects and real durable pipeline", () => {
+	test("cached saved status reauthorizes its original device without opening a deleted target", async () => {
+		let revoked = false,
+			metadataChecks = 0;
+		actor.authorizeOperation = async (deviceId) => {
+			expect(deviceId).toBe("local");
+			metadataChecks++;
+			if (revoked) throw new EditorDocumentError("FORBIDDEN", "Device access revoked", 403);
+		};
+		const doc = await create(),
+			uploaded = await upload(doc, "saved\n");
+		const saved = await service.commit(actor, doc.docId, uploaded, {});
+		await rm(target);
+		actor.authorize = async () => {
+			throw new Error("Receipt query must not reopen the target");
+		};
+		expect((await service.operation(actor, saved.operationId)).status).toBe("saved");
+		revoked = true;
+		await expect(service.operation(actor, saved.operationId)).rejects.toMatchObject({
+			statusCode: 403,
+		});
+		expect(metadataChecks).toBe(2);
+		expect(dispatches).toBe(1);
+	});
+
 	test.skipIf(process.platform === "win32")(
 		"worker refuses a FIFO without waiting for a writer",
 		async () => {
@@ -178,9 +324,8 @@ describe("large editor objects and real durable pipeline", () => {
 				fifo,
 				() =>
 					jobs.run(actor.userId, {
-						action: "source",
+						action: "metadata",
 						sourcePath: fifo,
-						outputPath: join(root, "fifo-source-output"),
 					}),
 				"not regular",
 			);
@@ -196,27 +341,281 @@ describe("large editor objects and real durable pipeline", () => {
 		"version content refuses an internal object replaced with a FIFO",
 		async () => {
 			const doc = await create();
-			const versionPath = join(root, "transfers", (await bodies())[0]);
+			const versionPath = target;
 			await unlink(versionPath);
 			await createFifo(versionPath);
 			await expectFastFifoRejection(
 				versionPath,
 				() => service.content(actor, doc.docId, doc.versionHandle),
-				"expired",
+				"not regular",
 			);
 			expect(await service.remove(actor, doc.docId)).toEqual({ status: "released" });
 			expect(await bodies()).toHaveLength(0);
 		},
 		10_000,
 	);
-	test("source is immutable and hashes original decoded CRLF text", async () => {
+	test("startup cleanup handles more than 4096 orphan bodies from lightweight sessions", async () => {
+		const transfers = join(root, "transfers");
+		await mkdir(transfers, { mode: 0o700 });
+		for (let start = 0; start < 4097; start += 64)
+			await Promise.all(
+				Array.from({ length: Math.min(64, 4097 - start) }, () =>
+					writeFile(join(transfers, `ed-${randomUUID()}`), "x"),
+				),
+			);
+		await create();
+		expect(await readdir(transfers)).toEqual([]);
+	}, 15_000);
+	test("source metadata has no body object and revalidates decoded CRLF text", async () => {
 		const doc = await create();
 		expect(doc.baseHash).toBe(hash("before\r\n中文🙂\r\n"));
 		expect(doc.eol).toBe("CRLF");
-		await writeFile(target, "external");
+		expect(await bodies()).toHaveLength(0);
+		for (let i = 0; i < 2; i++)
+			expect(
+				await new Response(await service.content(actor, doc.docId, doc.versionHandle)).text(),
+			).toBe("before\n中文🙂\n");
+		await writeFile(target, "beforz\r\n中文🙂\r\n");
+		await expect(service.content(actor, doc.docId, doc.versionHandle)).rejects.toMatchObject({
+			code: "EDITOR_SOURCE_CHANGED",
+			statusCode: 409,
+		});
+		expect(await bodies()).toHaveLength(0);
+	});
+	for (const change of ["revoked", "cwd"] as const) {
+		test(`source content reauthorizes after waiting for IO when access is ${change}`, async () => {
+			const doc = await create();
+			const jobs = Reflect.get(service, "jobs") as EditorDocumentJobs;
+			const entered = deferred();
+			const resume = deferred();
+			const original = jobs.run.bind(jobs);
+			const run = spyOn(jobs, "run").mockImplementation(async (user, request, signal) => {
+				if (request.action === "content") {
+					entered.resolve();
+					await resume.promise;
+				}
+				return original(user, request, signal);
+			});
+			const pending = service.content(actor, doc.docId, doc.versionHandle);
+			try {
+				await entered.promise;
+				const authorize = actor.authorize.bind(actor);
+				actor.authorize = async (input, need) => {
+					if (change === "revoked")
+						throw new EditorDocumentError("FORBIDDEN", "Access revoked", 403);
+					return { ...(await authorize(input, need)), cwd: join(root, "different") };
+				};
+				resume.resolve();
+				await expect(pending).rejects.toMatchObject({
+					statusCode: 403,
+					code: change === "revoked" ? "FORBIDDEN" : "EDITOR_IDENTITY_CHANGED",
+				});
+				expect(Reflect.get(jobs, "transfers")).toBe(0);
+				expect(Reflect.get(jobs, "transferBytes")).toBe(0);
+				const sessions = Reflect.get(service, "sessions") as Map<string, { pins: number }>;
+				expect(sessions.get(doc.docId)?.pins).toBe(0);
+			} finally {
+				resume.resolve();
+				await pending.catch(() => {});
+				run.mockRestore();
+			}
+		});
+	}
+	for (const change of ["revision", "root"] as const)
+		test(`queued commit rejects ${change} changes after its initial binding check with zero dispatch`, async () => {
+			const workspace = join(root, "execution");
+			await mkdir(workspace);
+			target = join(workspace, "file.txt");
+			const originalBytes = "same baseline\r\n";
+			await writeFile(target, originalBytes);
+			let revision = 1;
+			actor.authorize = async () => {
+				const stat = await lstat(workspace, { bigint: true });
+				return {
+					cwd: workspace,
+					projectId: null,
+					lexicalPath: target,
+					canonicalPath: target,
+					outsideRoots: false,
+					contextKey: `revision-${revision}`,
+					workspaceIdentity: `${stat.dev}:${stat.ino}`,
+					pathFlavor: "posix",
+				};
+			};
+			const doc = await create();
+			const uploadId = await upload(doc, "must not write\n");
+			const jobs = Reflect.get(service, "jobs") as EditorDocumentJobs;
+			const entered = deferred();
+			const resume = deferred();
+			const queued = deferred();
+			const holding = jobs.withIo(actor.userId, async () => {
+				entered.resolve();
+				await resume.promise;
+			});
+			await entered.promise;
+			const withIo = jobs.withIo.bind(jobs);
+			const admission = spyOn(jobs, "withIo").mockImplementation((user, body, signal) => {
+				const result = withIo(user, body, signal);
+				queued.resolve();
+				return result;
+			});
+			const pending = service.commit(actor, doc.docId, uploadId, {}).catch((error) => error);
+			try {
+				await queued.promise;
+				expect((Reflect.get(jobs, "queue") as unknown[]).length).toBe(1);
+				if (change === "revision") revision++;
+				else {
+					await rename(workspace, `${workspace}-old`);
+					await mkdir(workspace);
+					await writeFile(target, originalBytes);
+				}
+				resume.resolve();
+				await holding;
+				expect(await pending).toMatchObject({ code: "EDITOR_IDENTITY_CHANGED", statusCode: 403 });
+				expect(dispatches).toBe(0);
+				expect(operations()).toHaveLength(0);
+				expect(await readFile(target, "utf8")).toBe(originalBytes);
+			} finally {
+				resume.resolve();
+				await holding;
+				await pending;
+				admission.mockRestore();
+			}
+		});
+	test("content validates every metadata field, not only hash or byte length", async () => {
+		const jobs = new EditorDocumentJobs();
+		const opened = await jobs.run(actor.userId, { action: "metadata", sourcePath: target });
+		if (opened.kind !== "source") throw new Error("Unexpected source result");
+		const changes: Partial<EditorVersionMetadata>[] = [
+			{ baseHash: hash("other") },
+			{ encoding: "utf-16le" },
+			{ eol: "LF" },
+			{ sourceBytes: opened.metadata.sourceBytes + 1 },
+			{ utf8Bytes: opened.metadata.utf8Bytes + 1 },
+		];
+		for (const change of changes)
+			await expect(
+				jobs.run(actor.userId, {
+					action: "content",
+					sourcePath: target,
+					metadata: { ...opened.metadata, ...change },
+				}),
+			).rejects.toMatchObject({ code: "EDITOR_SOURCE_CHANGED", statusCode: 409 });
+	});
+	for (const change of ["encoding", "eol", "deleted", "symlink"] as const) {
+		test(`source content rejects ${change} changes after metadata capture`, async () => {
+			const doc = await create();
+			if (change === "encoding")
+				await writeFile(target, iconv.encode("before\r\n中文🙂\r\n", "utf-16le"));
+			if (change === "eol") await writeFile(target, "before\n中文🙂\n");
+			if (change === "deleted" || change === "symlink") await unlink(target);
+			if (change === "symlink") {
+				const replacement = join(root, "replacement");
+				await writeFile(replacement, "before\r\n中文🙂\r\n");
+				await symlink(replacement, target);
+			}
+			await expect(service.content(actor, doc.docId, doc.versionHandle)).rejects.toThrow();
+			expect(await bodies()).toHaveLength(0);
+			await service.remove(actor, doc.docId);
+		});
+	}
+	test("source stream pulls 64 KiB and holds its pin until EOF, abort or cancel", async () => {
+		await writeFile(target, "x".repeat(150_000));
+		const doc = await create();
+		const controller = new AbortController();
+		const stream = await service.content(actor, doc.docId, doc.versionHandle, controller.signal);
+		const reader = stream.getReader();
+		const first = await reader.read();
+		expect(first.value?.byteLength).toBe(64 * 1024);
+		expect(await service.remove(actor, doc.docId)).toEqual({ status: "released" });
+		expect((Reflect.get(service, "sessions") as Map<string, unknown>).size).toBe(0);
+		expect(Reflect.get(Reflect.get(service, "jobs"), "transfers")).toBe(0);
+		controller.abort();
+		await expect(reader.read()).rejects.toThrow("cancelled");
+		await service.sweep(Date.now() + EDITOR_SESSION_IDLE_MS + 1);
+		expect((Reflect.get(service, "sessions") as Map<string, unknown>).size).toBe(0);
+		const reopened = await create();
+		const cancelled = await service.content(actor, reopened.docId, reopened.versionHandle);
+		await cancelled.cancel();
+		await cancelled.cancel();
 		expect(
-			await new Response(await service.content(actor, doc.docId, doc.versionHandle)).text(),
-		).toBe("before\n中文🙂\n");
+			await new Response(
+				await service.content(actor, reopened.docId, reopened.versionHandle),
+			).text(),
+		).toBe("x".repeat(150_000));
+	});
+	test("worker content failure releases source admission and session pin", async () => {
+		const doc = await create();
+		await writeFile(target, "changed");
+		for (let i = 0; i < 10; i++)
+			await expect(service.content(actor, doc.docId, doc.versionHandle)).rejects.toMatchObject({
+				code: "EDITOR_SOURCE_CHANGED",
+			});
+		const jobs = Reflect.get(service, "jobs") as EditorDocumentJobs;
+		expect(Reflect.get(jobs, "transfers")).toBe(0);
+		expect(Reflect.get(jobs, "transferBytes")).toBe(0);
+		await service.remove(actor, doc.docId);
+		expect((Reflect.get(service, "sessions") as Map<string, unknown>).size).toBe(0);
+	});
+	test("dispose cancels unconsumed source streams and returns their permit", async () => {
+		const doc = await create();
+		const stream = await service.content(actor, doc.docId, doc.versionHandle);
+		await service.dispose();
+		await expect(new Response(stream).text()).rejects.toThrow("cancelled");
+		const jobs = Reflect.get(service, "jobs") as EditorDocumentJobs;
+		expect(Reflect.get(jobs, "transfers")).toBe(0);
+		expect(Reflect.get(jobs, "transferBytes")).toBe(0);
+		expect((Reflect.get(service, "sessions") as Map<string, unknown>).size).toBe(0);
+	});
+	test("unread source response expires and releases memory, pins and permits", async () => {
+		const jobs = new EditorDocumentJobs();
+		const metadata: EditorVersionMetadata = {
+			baseHash: hash("x"),
+			encoding: "utf-8",
+			eol: "LF",
+			sourceBytes: 1,
+			utf8Bytes: 1,
+		};
+		const run = spyOn(jobs, "run").mockImplementation(
+			async (_user, request): Promise<EditorWorkerResult> => {
+				if (request.action === "cleanup") return { kind: "cleaned", operations: [] };
+				if (request.action === "metadata") return { kind: "source", metadata };
+				if (request.action === "content") return { kind: "content", bytes: new Uint8Array([120]) };
+				throw new Error("Unexpected action");
+			},
+		);
+		await service.dispose();
+		service = new EditorDocumentService({
+			root: join(root, "transfers"),
+			jobs,
+			execute: (request) => runtime.executeEditor(request),
+		});
+		const doc = await create();
+		let deadline!: () => void;
+		const original = globalThis.setTimeout;
+		const timers = spyOn(globalThis, "setTimeout").mockImplementation(((
+			callback: () => void,
+			delay?: number,
+		) => {
+			if (delay === 30_000) {
+				deadline = callback;
+				return original(() => {}, 60_000);
+			}
+			return original(callback, delay);
+		}) as typeof setTimeout);
+		try {
+			const stream = await service.content(actor, doc.docId, doc.versionHandle);
+			expect(timers).toHaveBeenCalled();
+			deadline();
+			await expect(new Response(stream).text()).rejects.toThrow("timed out");
+			await service.remove(actor, doc.docId);
+			expect(Reflect.get(jobs, "transfers")).toBe(0);
+			expect(Reflect.get(jobs, "transferBytes")).toBe(0);
+			expect((Reflect.get(service, "sessions") as Map<string, unknown>).size).toBe(0);
+		} finally {
+			timers.mockRestore();
+			run.mockRestore();
+		}
 	});
 	const signatures = [
 		["utf-8", Buffer.from([0xef, 0xbb, 0xbf])],
@@ -379,7 +778,7 @@ describe("large editor objects and real durable pipeline", () => {
 			executionOutcome: "succeeded",
 		});
 		expect((await service.operation(actor, result.operationId)).status).toBe("saved");
-		expect((await bodies()).length).toBe(1);
+		expect((await bodies()).length).toBe(0);
 	});
 	test("corrupt existing blob retries editor preparation and saves exactly once", async () => {
 		await service.dispose();
@@ -431,7 +830,7 @@ describe("large editor objects and real durable pipeline", () => {
 		});
 		expect(await service.commit(actor, doc.docId, id, {})).toEqual(saved);
 		expect(dispatches).toBe(1);
-		expect(await bodies()).toHaveLength(1);
+		expect(await bodies()).toHaveLength(0);
 	});
 	test("different recovery content prevents editor dispatch and is never overwritten", async () => {
 		const doc = await create();
@@ -456,7 +855,7 @@ describe("large editor objects and real durable pipeline", () => {
 		expect(operations()).toHaveLength(0);
 		expect(await readFile(target, "utf8")).toBe("before\r\n中文🙂\r\n");
 		expect(await readFile(path, "utf8")).toBe(original);
-		expect(await bodies()).toHaveLength(1);
+		expect(await bodies()).toHaveLength(0);
 	});
 	test("worker reuses only identical recovery content and preserves its original timestamp", async () => {
 		const jobs = new EditorDocumentJobs();
@@ -593,7 +992,7 @@ describe("large editor objects and real durable pipeline", () => {
 		const repeated = await service.commit(actor, doc.docId, id, {});
 		expect(repeated.status).toBe("committing");
 		expect(await service.remove(actor, doc.docId)).toEqual({ status: "committing" });
-		expect((await bodies()).length).toBe(2);
+		expect((await bodies()).length).toBe(1);
 		release.resolve();
 		const saved = await pending;
 		expect(saved.operationId).toBe(repeated.operationId);
@@ -622,7 +1021,7 @@ describe("large editor objects and real durable pipeline", () => {
 				undefined,
 			),
 		).rejects.toThrow();
-		expect(await bodies()).toHaveLength(1);
+		expect(await bodies()).toHaveLength(0);
 		expect(dispatches).toBe(0);
 	});
 	test("same baseHash saves do not overwrite a previously saved version", async () => {
@@ -651,11 +1050,75 @@ describe("large editor objects and real durable pipeline", () => {
 		).toBe(410);
 		expect(await bodies()).toHaveLength(0);
 	});
-	test("eight sessions and reservation quota are enforced before creating objects", async () => {
+	test("failed metadata creation rolls back incremental session accounting", async () => {
+		await unlink(target);
+		await expect(create()).rejects.toThrow();
+		expect((Reflect.get(service, "sessions") as Map<string, unknown>).size).toBe(0);
+		expect((Reflect.get(service, "userSessions") as Map<string, number>).size).toBe(0);
+		expect(Reflect.get(service, "totalBytes")).toBe(0);
+		await writeFile(target, "valid");
+		const doc = await create();
+		await service.remove(actor, doc.docId);
+		expect((Reflect.get(service, "userSessions") as Map<string, number>).size).toBe(0);
+	});
+	test("receipt ownership survives session release and expires exactly once", async () => {
+		const doc = await create();
+		const id = await upload(doc, "mine");
+		await service.commit(actor, doc.docId, id, {});
+		await service.remove(actor, doc.docId);
+		expect(Reflect.get(service, "totalBytes")).toBe(EDITOR_METADATA_MAX_BYTES);
+		expect((Reflect.get(service, "userOperations") as Map<string, number>).get(actor.userId)).toBe(
+			1,
+		);
+		const now = Date.now() + EDITOR_SESSION_IDLE_MS + 1;
+		await service.sweep(now);
+		await service.sweep(now);
+		expect(Reflect.get(service, "totalBytes")).toBe(0);
+		expect((Reflect.get(service, "userBytes") as Map<string, number>).size).toBe(0);
+		expect((Reflect.get(service, "userOperations") as Map<string, number>).size).toBe(0);
+	});
+	test("sweep is single-flight and yields between lightweight session batches", async () => {
+		const jobs = new EditorDocumentJobs();
+		const metadata: EditorVersionMetadata = {
+			baseHash: hash("x"),
+			encoding: "utf-8",
+			eol: "LF",
+			sourceBytes: 1,
+			utf8Bytes: 1,
+		};
+		const run = spyOn(jobs, "run").mockImplementation(
+			async (_user, request): Promise<EditorWorkerResult> => {
+				if (request.action === "cleanup") return { kind: "cleaned", operations: [] };
+				if (request.action === "metadata") return { kind: "source", metadata };
+				throw new Error("Unexpected action");
+			},
+		);
+		await service.dispose();
+		service = new EditorDocumentService({
+			root: join(root, "transfers"),
+			jobs,
+			execute: (request) => runtime.executeEditor(request),
+		});
+		try {
+			for (let i = 0; i < 130; i++) await create();
+			let yielded = false;
+			setImmediate(() => {
+				yielded = true;
+			});
+			const sweep = service.sweep(Date.now() + EDITOR_SESSION_IDLE_MS + 1);
+			expect(service.sweep()).toBe(sweep);
+			await sweep;
+			expect(yielded).toBe(true);
+			expect((Reflect.get(service, "sessions") as Map<string, unknown>).size).toBe(0);
+			expect((Reflect.get(service, "userSessions") as Map<string, number>).size).toBe(0);
+		} finally {
+			run.mockRestore();
+		}
+	});
+	test("source sessions consume no disk reservation; upload quota remains bounded", async () => {
 		const docs: EditorDocumentDescriptor[] = [];
-		for (let i = 0; i < 8; i++) docs.push(await create());
-		expect((await failure(create)).code).toBe("EDITOR_QUOTA_EXCEEDED");
-		for (const doc of docs.slice(0, 7))
+		for (let i = 0; i < 9; i++) docs.push(await create());
+		for (const doc of docs.slice(0, 8))
 			await service.createUpload(actor, doc.docId, {
 				baseHash: doc.baseHash,
 				encoding: doc.encoding,
@@ -664,40 +1127,37 @@ describe("large editor objects and real durable pipeline", () => {
 		expect(
 			(
 				await failure(() =>
-					service.createUpload(actor, docs[7].docId, {
-						baseHash: docs[7].baseHash,
-						encoding: docs[7].encoding,
+					service.createUpload(actor, docs[8].docId, {
+						baseHash: docs[8].baseHash,
+						encoding: docs[8].encoding,
 						snapshotRevision: 1,
 					}),
 				)
 			).code,
 		).toBe("EDITOR_QUOTA_EXCEEDED");
-		expect(await bodies()).toHaveLength(8);
+		expect(await bodies()).toHaveLength(0);
 	});
 	test("worker accepts exactly 20 MiB and rejects source +1 byte and symlinks", async () => {
 		const jobs = new EditorDocumentJobs();
 		await writeFile(target, new Uint8Array(EDITOR_FILE_MAX_BYTES).fill(97));
 		const result = await jobs.run(actor.userId, {
-			action: "source",
+			action: "metadata",
 			sourcePath: target,
-			outputPath: join(root, "exact"),
 		});
 		expect(result.kind).toBe("source");
 		await writeFile(target, new Uint8Array(EDITOR_FILE_MAX_BYTES + 1).fill(97));
 		await expect(
 			jobs.run(actor.userId, {
-				action: "source",
+				action: "metadata",
 				sourcePath: target,
-				outputPath: join(root, "oversize"),
 			}),
 		).rejects.toThrow("budget");
 		const link = join(root, "link");
 		await symlink(target, link);
 		await expect(
 			jobs.run(actor.userId, {
-				action: "source",
+				action: "metadata",
 				sourcePath: link,
-				outputPath: join(root, "symlink"),
 			}),
 		).rejects.toThrow("Symbolic");
 	}, 30_000);
@@ -777,12 +1237,32 @@ describe("large editor objects and real durable pipeline", () => {
 			"download",
 		);
 		expect((await service.uploadStatus(actor, doc.docId, retry)).state).toBe("sealed");
-		expect(await bodies()).toHaveLength(3);
+		expect(await bodies()).toHaveLength(2);
 		await stream.cancel();
 		expect((await failure(() => service.commit(actor, doc.docId, retry, {}))).code).toBe(
 			"STALE_WRITE",
 		);
-		expect(await bodies()).toHaveLength(2);
+		expect(await bodies()).toHaveLength(1);
+	});
+	test("remove cancels an unread conflict stream and frees FD, readers and permit", async () => {
+		const doc = await create();
+		const id = await upload(doc, "mine");
+		await writeFile(target, "external");
+		const stale = await failure(() => service.commit(actor, doc.docId, id, {}));
+		const stream = await service.content(
+			actor,
+			doc.docId,
+			stale.data.conflictVersionHandle as string,
+		);
+		const jobs = Reflect.get(service, "jobs") as EditorDocumentJobs;
+		expect(Reflect.get(jobs, "transfers")).toBe(1);
+		expect(Reflect.get(jobs, "transferBytes")).toBe(64 * 1024);
+		await service.remove(actor, doc.docId);
+		await expect(new Response(stream).text()).rejects.toThrow("cancelled");
+		expect(Reflect.get(jobs, "transfers")).toBe(0);
+		expect(Reflect.get(jobs, "transferBytes")).toBe(0);
+		expect((Reflect.get(service, "sessions") as Map<string, unknown>).size).toBe(0);
+		expect(await bodies()).toHaveLength(0);
 	});
 	test("new downloads cannot enter the old version while its unlink is pending", async () => {
 		const doc = await create(),
@@ -836,7 +1316,7 @@ describe("large editor objects and real durable pipeline", () => {
 				await service.content(actor, doc.docId, second.data.conflictVersionHandle as string),
 			).text(),
 		).toBe("external two");
-		expect(reserved()).toBe(doc.utf8Bytes + Buffer.byteLength("external two"));
+		expect(reserved()).toBe(Buffer.byteLength("external two"));
 		expect(dispatches).toBe(0);
 	}, 30_000);
 	test("failed conflict unlink stays retired and charged until a later successful removal", async () => {
@@ -864,12 +1344,12 @@ describe("large editor objects and real durable pipeline", () => {
 		const reserved = () =>
 			(Reflect.get(service, "sessions") as ReadonlyMap<string, { reserved: number }>).get(doc.docId)
 				?.reserved ?? 0;
-		expect(reserved()).toBe(doc.utf8Bytes + Buffer.byteLength("external one"));
+		expect(reserved()).toBe(Buffer.byteLength("external one"));
 		unlinkVersion = unlink;
 		const next = await upload(doc, "mine", first.data.currentHash as string);
 		const second = await failure(() => service.commit(actor, doc.docId, next, {}));
 		expect(second.code).toBe("STALE_WRITE");
-		expect(reserved()).toBe(doc.utf8Bytes + Buffer.byteLength("external two"));
+		expect(reserved()).toBe(Buffer.byteLength("external two"));
 		expect(dispatches).toBe(0);
 	}, 30_000);
 	test("GBK cannot silently replace an inserted emoji", async () => {
@@ -978,14 +1458,20 @@ describe("large editor objects and real durable pipeline", () => {
 			pathToFileURL(join(root, "not-an-editor-worker.ts")).href,
 			new URL("./editor-document-worker.ts", import.meta.url).href,
 		]);
-		const outputPath = join(root, "probe-output");
 		const result = await jobs.run(actor.userId, {
-			action: "source",
+			action: "metadata",
 			sourcePath: target,
-			outputPath,
 		});
 		expect(result.kind).toBe("source");
-		expect(await readFile(outputPath, "utf8")).toBe("before\n中文🙂\n");
+		if (result.kind !== "source") throw new Error("Unexpected metadata result");
+		const content = await jobs.run(actor.userId, {
+			action: "content",
+			sourcePath: target,
+			metadata: result.metadata,
+		});
+		expect(content.kind).toBe("content");
+		if (content.kind !== "content") throw new Error("Unexpected content result");
+		expect(new TextDecoder().decode(content.bytes)).toBe("before\n中文🙂\n");
 	});
 	test("a ready worker error never retries a potentially side-effecting job", async () => {
 		const fixture = join(root, "ready-failure.ts"),
@@ -1007,6 +1493,44 @@ parentPort.postMessage({ type: "editor-worker-ready", version: 1 });`,
 			"deliberate-ready-failure",
 		);
 		expect(await readFile(marker, "utf8")).toBe("x");
+	});
+	test("source transfer admission enforces 128 MiB, eight active, 64 queued and idempotent release", async () => {
+		const jobs = new EditorDocumentJobs();
+		const a = await jobs.acquireTransfer(64 * 1024 * 1024);
+		const b = await jobs.acquireTransfer(64 * 1024 * 1024);
+		let thirdAdmitted = false;
+		const third = jobs.acquireTransfer(1).then((permit) => {
+			thirdAdmitted = true;
+			return permit;
+		});
+		await Promise.resolve();
+		expect(thirdAdmitted).toBe(false);
+		a.release();
+		a.release();
+		const c = await third;
+		expect(Reflect.get(jobs, "transferBytes")).toBe(64 * 1024 * 1024 + 1);
+		b.release();
+		c.release();
+		const active = await Promise.all(Array.from({ length: 8 }, () => jobs.acquireTransfer(1)));
+		const controller = new AbortController();
+		const queued = Array.from({ length: 64 }, () => jobs.acquireTransfer(1, controller.signal));
+		const failures = Promise.all(queued.map((value) => value.catch((error) => error)));
+		await expect(jobs.acquireTransfer(1)).rejects.toMatchObject({ code: "EDITOR_BUSY" });
+		controller.abort();
+		expect((await failures).every((error) => error.code === "EDITOR_TIMEOUT")).toBe(true);
+		for (const permit of active) permit.release();
+		expect(Reflect.get(jobs, "transfers")).toBe(0);
+		expect(Reflect.get(jobs, "transferBytes")).toBe(0);
+		expect(Reflect.get(jobs, "transferQueue")).toHaveLength(0);
+	});
+	test("source transfer permit is independent of inherited IO admission", async () => {
+		const jobs = new EditorDocumentJobs();
+		await jobs.withIo(actor.userId, async () => {
+			const permit = await jobs.acquireTransfer(1);
+			await jobs.withIo(actor.userId, async () => {});
+			permit.release();
+		});
+		expect(Reflect.get(jobs, "transfers")).toBe(0);
 	});
 	test("IO admission bounds complete commits to two globally and one per user", async () => {
 		const jobs = new EditorDocumentJobs(),
@@ -1082,7 +1606,63 @@ parentPort.postMessage({ type: "editor-worker-ready", version: 1 });`,
 		await mkdir(join(root, "transfers"), { mode: 0o700 });
 		await writeFile(join(root, "transfers", "ed-1234-abcd"), "orphan");
 		await create();
-		expect(await bodies()).toHaveLength(1);
+		expect(await bodies()).toHaveLength(0);
+	});
+	test("disk-state reports an unchanged baseline without creating a session or body", async () => {
+		const doc = await create();
+		const before = (service as unknown as { sessions: Map<string, unknown> }).sessions.size;
+		const bodiesBefore = (await bodies()).length;
+		const state = await service.diskState(actor, doc.docId);
+		expect(state).toEqual({
+			exists: true,
+			baseHash: doc.baseHash,
+			encoding: doc.encoding,
+			eol: doc.eol,
+			sourceBytes: doc.sourceBytes,
+			utf8Bytes: doc.utf8Bytes,
+		});
+		expect((service as unknown as { sessions: Map<string, unknown> }).sessions.size).toBe(before);
+		expect((await bodies()).length).toBe(bodiesBefore);
+	});
+	test("disk-state reports an external change with the v1 text hash and leaves the baseline", async () => {
+		const doc = await create();
+		await writeFile(target, "external edit\n");
+		const state = await service.diskState(actor, doc.docId);
+		expect(state.exists).toBe(true);
+		if (!state.exists) throw new Error("unreachable");
+		expect(state.baseHash).toBe(hash("external edit\n"));
+		expect(state.baseHash).not.toBe(doc.baseHash);
+		// The saved session baseline still guards uploads against the original version.
+		const uploadId = await upload(doc, "mine\n");
+		const conflict = await failure(() => service.commit(actor, doc.docId, uploadId, {}));
+		expect(conflict.code).toBe("STALE_WRITE");
+	});
+	test("disk-state reports deletion without failing or exposing a path", async () => {
+		const doc = await create();
+		await rm(target);
+		expect(await service.diskState(actor, doc.docId)).toEqual({ exists: false });
+	});
+	test("disk-state reauthorizes after IO: a changed binding cannot publish the observation", async () => {
+		const doc = await create();
+		let calls = 0;
+		const original = actor.authorize;
+		actor.authorize = async (input, need) => {
+			calls++;
+			const binding = await original.call(actor, input, need);
+			// First call (before IO) matches; the post-IO reauthorization sees a new workspace.
+			return calls >= 2 ? { ...binding, contextKey: "rebound" } : binding;
+		};
+		const error = await failure(() => service.diskState(actor, doc.docId));
+		expect(error.code).toBe("EDITOR_IDENTITY_CHANGED");
+		actor.authorize = original;
+	});
+	test("disk-state for an unknown or other user's document is indistinguishable from expired", async () => {
+		const doc = await create();
+		const other: EditorActor = { ...actor, userId: generateId() };
+		const error = await failure(() => service.diskState(other, doc.docId));
+		expect(error.statusCode).toBe(410);
+		const missing = await failure(() => service.diskState(actor, randomUUID()));
+		expect(missing.statusCode).toBe(410);
 	});
 });
 

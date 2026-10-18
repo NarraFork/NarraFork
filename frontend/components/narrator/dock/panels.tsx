@@ -47,6 +47,7 @@ import {
 	type FilePanelOpener,
 	useFilePanelSourceOpener,
 } from "../file-panel/file-panel-navigation";
+import { DockviewNarratorPanelVisibilityProvider } from "../narrator-panel-visibility";
 import { usePanelHeaderControls } from "../panels/panel-header-controls";
 import {
 	type FilePanelParams,
@@ -1043,18 +1044,20 @@ export function FileDockPanel(props: IDockviewPanelProps<FilePanelParams>) {
 							navigationRequestId={highlightRequestId}
 						/>
 					) : (
-						<FilePanelContent
-							filePath={filePath}
-							narratorId={fileNarratorId}
-							deviceId={deviceId}
-							referenceOrigin={referenceOrigin}
-							selection={selection}
-							navigationRequestId={highlightRequestId}
-							onDirtyChange={onDirtyChange}
-							onOpenFileTarget={openFilePanel ? openFileTarget : undefined}
-							confirmed={props.params.largeFileConfirmed}
-							onConfirm={() => props.api.updateParameters({ largeFileConfirmed: true })}
-						/>
+						<DockviewNarratorPanelVisibilityProvider api={props.api}>
+							<FilePanelContent
+								filePath={filePath}
+								narratorId={fileNarratorId}
+								deviceId={deviceId}
+								referenceOrigin={referenceOrigin}
+								selection={selection}
+								navigationRequestId={highlightRequestId}
+								onDirtyChange={onDirtyChange}
+								onOpenFileTarget={openFilePanel ? openFileTarget : undefined}
+								confirmed={props.params.largeFileConfirmed}
+								onConfirm={() => props.api.updateParameters({ largeFileConfirmed: true })}
+							/>
+						</DockviewNarratorPanelVisibilityProvider>
 					)}
 				</LazyPanelBoundary>
 			</FileReferenceScopeProvider>

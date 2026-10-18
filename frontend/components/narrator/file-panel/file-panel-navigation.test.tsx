@@ -138,7 +138,8 @@ describe("isolated child file navigation", () => {
 		expect(focus).toMatch(
 			/<NarratorDockContext.Provider value=\{null\}>\s*<FilePanelNavigationProvider value=\{onOpenFilePanel\}>/,
 		);
-		expect(panel).toContain("const dockOpenFilePanel = useFilePanelNavigation();");
+		expect(panel).toContain("const navigation = useFilePanelNavigationReceiver();");
+		expect(panel).toContain("const dockOpenFilePanel = navigation.openFilePanel;");
 		expect(panel).toContain("const useInternalViewer = !dockOpenFilePanel && !isWorkspacePreview;");
 		expect(panel).toContain("fileReferenceApi.resolve(narratorId, [target], controller.signal)");
 	});

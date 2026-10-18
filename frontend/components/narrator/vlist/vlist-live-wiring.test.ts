@@ -621,7 +621,11 @@ describe("live event → patch field mapping", () => {
 		const { awaitAgentResolvedPatch } = await import("./vlist-live-events");
 		const { deriveToolMeta } = await import("./vlist-tool-meta");
 		const doc = toolDoc("tu-1", "running");
-		Object.assign(block(doc), { name: "Send", input: { id: "worker", await: true } });
+		const input = { id: "worker", await: true };
+		Object.assign(block(doc), { name: "Send", input, inputJson: input });
+		const stored = doc[0].toolCalls?.[0];
+		if (!stored) throw new Error("Missing stored Send fixture");
+		Object.assign(stored, { toolName: "Send", inputJson: input });
 		const result = awaitAgentResolvedPatch({ toolUseId: "tu-1", subagentNarratorId: "sub-live" })(
 			doc,
 		);

@@ -19,6 +19,7 @@ import {
 // error that never reaches a browser, and `INSUFFICIENT_SCOPE` is read by third-party
 // OAuth clients rather than rendered in the UI, so neither needs a localized wording.
 import { AppError, catalogError } from "../lib/errors";
+import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
 import { validateAccessToken } from "../lib/oauth-provider";
 import { authSessionStore } from "../services/auth/store";
@@ -88,6 +89,7 @@ function getVerifiedUser(userId: string): VerifiedUser | undefined {
  * access for a credential that was supposed to be dead).
  */
 export function invalidateUserCache(userId?: string) {
+	eventBus.emit({ type: "auth:changed", ...(userId ? { userId } : {}) });
 	if (userId) {
 		verifiedUsers.delete(userId);
 	} else {

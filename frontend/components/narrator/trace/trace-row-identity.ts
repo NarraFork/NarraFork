@@ -19,11 +19,13 @@
  * `reasoningRunIdentityIndices`.
  */
 
+import type { FileTarget } from "@shared/file-reference";
 import { groupReasoningRuns } from "@shared/pretext-layout/reasoning-segments";
 import { extractField } from "@shared/pretext-layout/tool-detail";
 import { makeMessageBlockSelectionId } from "../message/MessageSelectionCtx";
 import type { ContentBlock } from "../narrator-panel-types";
 import { isRunningForegroundBash } from "../tool-call/tool-display";
+import { type ToolFileExecution, toolFileTarget } from "../tool-call/tool-file-target";
 
 /** Tools whose input carries a file path worth offering in the row menu. */
 const FILE_TOOLS = new Set(["Read", "Write", "Edit"]);
@@ -49,7 +51,9 @@ export interface TraceRowToolMeta {
 	toolUseId?: string;
 	/** File-oriented tools: the input file path (copy path / view file). */
 	filePath?: string;
-	/** Read tool → the file can be previewed inline (modal). */
+	fileTarget?: FileTarget;
+	fileNarratorId?: string;
+	/** Read tool → offers the authorized file viewer action. */
 	isReadTool?: boolean;
 	/**
 	 * Any file-oriented tool (Read / Write / Edit) with a path → the file can be
@@ -117,7 +121,8 @@ export interface TraceRowIdentity {
 }
 
 /** The minimal tool-call shape this module reads (matches ToolCallData). */
-export interface TraceRowToolCallLike {
+export interface TraceRowToolCallLike extends ToolFileExecution {
+	fileNarratorId?: string;
 	toolName: string;
 	toolUseId?: string;
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic tool JSON
@@ -272,6 +277,11 @@ export function traceRowToolMeta(tc: TraceRowToolCallLike): TraceRowToolMeta {
 		const filePath = readFilePath(tc.inputJson);
 		if (filePath) {
 			meta.filePath = filePath;
+			const target = toolFileTarget(tc, filePath);
+			if (target) {
+				meta.fileTarget = target;
+				meta.fileNarratorId = tc.fileNarratorId;
+			}
 			meta.isFileTool = true;
 			if (tc.toolName === "Read") meta.isReadTool = true;
 		}

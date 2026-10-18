@@ -22,7 +22,14 @@ mock.module("@tanstack/react-router", () => ({ ...router, useNavigate: () => nav
 const recentTabs = await import("../../hooks/useRecentTabs");
 mock.module("../../hooks/useRecentTabs", () => ({ ...recentTabs, addSubagentRecentTab: recent }));
 mock.module("../../lib/narrator-ws-manager", () => ({
-	narratorWSManager: { connect() {}, disconnect() {} },
+	narratorWSManager: {
+		connect() {},
+		disconnect() {},
+		addListener() {
+			return {};
+		},
+		removeListener() {},
+	},
 }));
 mock.module("../StandaloneWindowLayout", () => ({ useStandaloneWindowTitle() {} }));
 function ChatProbe(props: NarratorPanelProps) {

@@ -363,6 +363,18 @@ describe("credential paths are refused even inside an allowed root", () => {
 		expect(decision.reason).toBe("secret-path");
 	});
 
+	test.each([
+		"editor-transfers",
+		"editor-native",
+		"editor-native-operations",
+	])("refuses private %s even inside an explicit writable root", (directory) => {
+		const home = getNarraforkHome(),
+			decision = checkWriteBoundary(join(home, directory, "missing.json"), [home]);
+		expect(decision.allowed).toBe(false);
+		expect(decision.reason).toBe("secret-path");
+		expect(decision.confirmable).toBeUndefined();
+	});
+
 	test("refuses the database even inside an allowed root", () => {
 		const platformHome = getNarraforkHome();
 		const decision = checkWriteBoundary(join(platformHome, "narrafork.db"), [platformHome]);

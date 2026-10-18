@@ -15,13 +15,17 @@
  * mounts synchronously; i18n returns raw keys so assertions are label-stable.
  */
 
-import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { fileReferenceApi } from "@frontend/lib/api/file-references";
 import { MantineProvider } from "@mantine/core";
 import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import type { ToolCallDetailRef } from "../../../lib/api/narrators";
 import { NarratorDockContext, type NarratorDockContextValue } from "../dock/NarratorDockContext";
+import { resolveAllToolCallsFromMsg } from "../message/message-segments";
+import type { NarratorMsg } from "../narrator-panel-types";
+import { traceRowToolMeta } from "./trace-row-identity";
 
 const realReactI18nextModule = { ...(await import("react-i18next")) };
 const realUsePlatformModule = { ...(await import("@frontend/hooks/usePlatform")) };
@@ -278,10 +282,156 @@ describe("TraceRowInteraction — tool-call inspector gating", () => {
 	});
 });
 
+test("folded Read menu retains structured execution path and actual child authority", async () => {
+	const target = { deviceId: "WindowsRemote", path: "C:/原目录/报告 空格.txt" };
+	const resolve = spyOn(fileReferenceApi, "resolve").mockResolvedValue({ targets: [target] });
+	try {
+		const open = mock((..._args: unknown[]) => {});
+		const [call] = resolveAllToolCallsFromMsg({
+			id: "m",
+			narratorId: "child",
+			contentJson: [
+				{
+					type: "tool_use",
+					id: "read",
+					name: "Read",
+					status: "success",
+					tcId: "tc",
+					input: { file_path: "报告 空格.txt" },
+				},
+			],
+			toolCalls: [
+				{
+					id: "tc",
+					toolUseId: "read",
+					executionTarget: {
+						deviceId: target.deviceId,
+						cwd: "C:/原目录",
+						lexicalPath: target.path,
+					},
+				},
+			],
+		} as unknown as NarratorMsg);
+		if (!call) throw new Error("missing tool call");
+		await renderRow({
+			narratorId: "new-host",
+			tool: traceRowToolMeta(call),
+			dock: {
+				narratorId: "another-host",
+				openFilePanel: open,
+			} as unknown as NarratorDockContextValue,
+		});
+		await act(async () => clickMenuItem("contextMenu_openFilePanel"));
+		expect(resolve).toHaveBeenCalledWith("child", [target], expect.any(AbortSignal));
+		expect(open).toHaveBeenCalledWith(
+			target.path,
+			undefined,
+			expect.objectContaining({
+				deviceId: target.deviceId,
+				fileNarratorId: "child",
+				referenceOrigin: true,
+			}),
+		);
+	} finally {
+		resolve.mockRestore();
+	}
+});
+
+test("an enriched historical Read without row/attempt identity cannot borrow a retry's execution facts", async () => {
+	const [call] = resolveAllToolCallsFromMsg({
+		id: "m",
+		narratorId: "child",
+		contentJson: [
+			{
+				type: "tool_use",
+				id: "read",
+				name: "Read",
+				status: "success",
+				input: { file_path: "read.txt" },
+			},
+		],
+		toolCalls: [
+			{
+				id: "retry",
+				toolUseId: "read",
+				executionAttempt: 2,
+				executionDeviceId: "wrong",
+				executionCwd: "/wrong",
+			},
+		],
+	} as unknown as NarratorMsg);
+	if (!call) throw new Error("missing historical call");
+	const open = mock((..._args: unknown[]) => {});
+	await renderRow({
+		narratorId: "host",
+		tool: traceRowToolMeta(call),
+		dock: { openFilePanel: open } as unknown as NarratorDockContextValue,
+	});
+	expect(menuLabels()).not.toContain("contextMenu_openFilePanel");
+	expect(menuLabels()).toContain("fileReferences.missingContext");
+	expect(open).not.toHaveBeenCalled();
+});
+
+test("an un-enriched Read cannot borrow a retry's relative input under the original execution cwd", async () => {
+	const target = { deviceId: "Remote", path: "/original/original.txt" };
+	const resolve = spyOn(fileReferenceApi, "resolve").mockResolvedValue({ targets: [target] });
+	try {
+		const open = mock((..._args: unknown[]) => {});
+		const [call] = resolveAllToolCallsFromMsg({
+			id: "m",
+			narratorId: "child",
+			contentJson: [
+				{
+					type: "tool_use",
+					id: "read",
+					name: "Read",
+					tcId: "original",
+					executionAttempt: 1,
+					input: { file_path: "original.txt" },
+					executionDeviceId: "Remote",
+					executionCwd: "/original",
+				},
+			],
+			toolCalls: [
+				{
+					id: "retry",
+					toolUseId: "read",
+					executionAttempt: 2,
+					inputJson: { file_path: "retry.txt" },
+					status: "success",
+				},
+			],
+		} as unknown as NarratorMsg);
+		if (!call) throw new Error("missing original call");
+		await renderRow({
+			narratorId: "host",
+			tool: traceRowToolMeta(call),
+			dock: { openFilePanel: open } as unknown as NarratorDockContextValue,
+		});
+		await act(async () => clickMenuItem("contextMenu_openFilePanel"));
+		expect(resolve).toHaveBeenCalledWith("child", [target], expect.any(AbortSignal));
+		expect(open).toHaveBeenCalledWith(
+			target.path,
+			undefined,
+			expect.objectContaining({ deviceId: "Remote", fileNarratorId: "child" }),
+		);
+	} finally {
+		resolve.mockRestore();
+	}
+});
+
 describe("TraceRowInteraction — file items gating", () => {
 	test("offers copy-path and view-file for a Read tool with a path", async () => {
 		await renderRow({
-			tool: { toolName: "Read", toolUseId: "tu-1", filePath: "/a/b.ts", isReadTool: true },
+			tool: {
+				toolName: "Read",
+				toolUseId: "tu-1",
+				filePath: "/a/b.ts",
+				isReadTool: true,
+				fileTarget: { deviceId: "local", path: "/a/b.ts" },
+				fileNarratorId: "reader",
+			},
+			dock: { openFilePanel: () => {} } as unknown as NarratorDockContextValue,
 		});
 		const labels = menuLabels();
 		expect(labels).toContain("contextMenu_copyFilePath");

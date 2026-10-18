@@ -104,6 +104,45 @@ describe("private request recording directories", () => {
 	});
 });
 
+describe("private editor protocol state", () => {
+	test.each([
+		"editor-transfers",
+		"editor-native",
+		"editor-native-operations",
+	])("protects %s contents, roots, ancestors and physical aliases", (name) => {
+		const temporary = mkdtempSync(join(tmpdir(), "nf-private-editor-path-"));
+		const home = join(temporary, "platform"),
+			root = join(home, name);
+		mkdirSync(root, { recursive: true });
+		const file = join(root, "operation.json");
+		writeFileSync(file, "private");
+		const fileLink = join(temporary, "file-alias"),
+			dirLink = join(temporary, "dir-alias"),
+			homeLink = join(temporary, "home-alias");
+		try {
+			symlinkSync(file, fileLink, "file");
+			symlinkSync(root, dirLink, "dir");
+			symlinkSync(home, homeLink, "dir");
+			for (const path of [
+				root,
+				file,
+				fileLink,
+				dirLink,
+				join(dirLink, "operation.json"),
+				join(homeLink, name, "missing.json"),
+			])
+				expect(isSecretPlatformPath(path, home)).toBe(true);
+			expect(isSecretPlatformPath(file, homeLink)).toBe(true);
+			expect(isPrivateRequestRecordingPath(root, home, true)).toBe(true);
+			expect(isPrivateRequestRecordingPath(homeLink, home, true)).toBe(true);
+			expect(isSecretPlatformPath(join(temporary, name, "ordinary.json"), home)).toBe(false);
+			expect(isSecretPlatformPath(join(home, `${name}-ordinary`, "file.json"), home)).toBe(false);
+		} finally {
+			rmSync(temporary, { recursive: true, force: true });
+		}
+	});
+});
+
 describe("platform files the viewer must keep opening", () => {
 	test.each([
 		["malformed-request-dumps/dump.json", "a request dump the viewer links to"],

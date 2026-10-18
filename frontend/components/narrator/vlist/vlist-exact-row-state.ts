@@ -276,6 +276,9 @@ export function resolveTraceRowIdentity(
 			toolUseId,
 			...(meta?.isRunningBash ? { isRunningBash: true } : {}),
 			...(meta?.filePath ? { filePath: meta.filePath } : {}),
+			...(meta?.fileTarget
+				? { fileTarget: meta.fileTarget, fileNarratorId: meta.fileNarratorId }
+				: {}),
 			...(meta?.isReadTool ? { isReadTool: true } : {}),
 			// Gates "open in panel". Broader than isReadTool (any Read/Write/Edit with
 			// a path), and NOT implied by `filePath`: dropping it here is what silently
@@ -461,6 +464,9 @@ export function sameToolMeta(a: VListToolMeta | undefined, b: VListToolMeta | un
 		a.toolUseId === b.toolUseId &&
 		a.isRunningBash === b.isRunningBash &&
 		a.filePath === b.filePath &&
+		a.fileTarget?.path === b.fileTarget?.path &&
+		a.fileTarget?.deviceId === b.fileTarget?.deviceId &&
+		a.fileNarratorId === b.fileNarratorId &&
 		a.isFileTool === b.isFileTool &&
 		a.isReadTool === b.isReadTool &&
 		a.subagentNarratorId === b.subagentNarratorId &&

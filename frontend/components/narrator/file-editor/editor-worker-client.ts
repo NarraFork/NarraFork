@@ -51,6 +51,51 @@ export function captureEditorSnapshot(model: editor.ITextModel): EditorTextSnaps
 	});
 }
 
+/** A baseline snapshot is single-pass. Keep only its lazily consumed immutable chunks
+ * so cancelled hash jobs can restart from offset zero without recapturing a dirty model.
+ * No text is read until a consumer asks, and a successful hash releases this owner. */
+export class EditorSnapshotReplay {
+	private source: EditorTextSnapshot | null;
+	private chunks: string[] = [];
+	private consumed = 0;
+	private version: Pick<EditorTextSnapshot, "revision" | "alternativeVersionId" | "length">;
+	constructor(source: EditorTextSnapshot) {
+		if (!Number.isSafeInteger(source.length) || source.length < 0 || source.length > L.textLength)
+			throw new Error("EDITOR_TEXT_LIMIT");
+		this.source = source;
+		this.version = {
+			revision: source.revision,
+			alternativeVersionId: source.alternativeVersionId,
+			length: source.length,
+		};
+	}
+	get estimatedBytes() {
+		return this.version.length * 2 + this.chunks.length * 24 + 128;
+	}
+	snapshot(): EditorTextSnapshot {
+		let cursor = 0;
+		return Object.freeze({
+			...this.version,
+			read: () => {
+				if (cursor < this.chunks.length) return this.chunks[cursor++];
+				if (!this.source) return null;
+				const chunk = this.source.read();
+				if (chunk === null) {
+					if (this.consumed !== this.version.length) throw new Error("EDITOR_SNAPSHOT_LENGTH");
+					this.source = null;
+					return null;
+				}
+				if (!chunk.length || this.consumed + chunk.length > this.version.length)
+					throw new Error("EDITOR_SNAPSHOT_LENGTH");
+				this.consumed += chunk.length;
+				this.chunks.push(chunk);
+				cursor++;
+				return chunk;
+			},
+		});
+	}
+}
+
 const aborted = () => new DOMException("Operation cancelled", "AbortError");
 interface Slot {
 	worker: Worker | null;

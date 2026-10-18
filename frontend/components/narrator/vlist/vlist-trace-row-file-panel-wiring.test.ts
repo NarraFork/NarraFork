@@ -26,6 +26,10 @@ const SHELL = shellSource();
 const TRACE_ROW = readFileSync(join(DIR, "..", "trace", "TraceRowInteraction.tsx"), "utf8");
 const TOOL_META = readFileSync(join(DIR, "vlist-tool-meta.ts"), "utf8");
 const TRACE_BINDINGS = readFileSync(join(DIR, "useVListTraceBindings.tsx"), "utf8");
+const FILE_NAVIGATION = readFileSync(
+	join(DIR, "..", "tool-call", "useToolFileNavigation.ts"),
+	"utf8",
+);
 
 /** The body of the shell's `resolveTraceRowIdentity`. */
 function resolveIdentityBody(): string {
@@ -80,14 +84,21 @@ describe("folded trace row: file-panel handler wiring", () => {
 		}
 	});
 
-	it("allows edit navigation or a file tool with a path and panel handler", () => {
-		// An exact Edit preview owns its own opener. The current-file fallback still
-		// requires all three facts: neither a path nor a handler alone is sufficient.
+	it("allows edit navigation or delegates to the authorized source-narrator file opener", () => {
+		// The path, source narrator and receiving capability now belong to the shared
+		// navigation hook. Guard that real boundary, not the retired host-path fallback.
 		const condition = TRACE_ROW.match(/const canOpenFilePanel\s*=\s*([^;]+);/)?.[1];
 		expect(condition?.replace(/\s+/g, " ").trim()).toBe(
-			"!!editNavigation.open || !!(filePath && tool?.isFileTool && onOpenFilePanel)",
+			"!!editNavigation.open || !!(tool?.isFileTool && openToolFile)",
 		);
+		expect(TRACE_ROW).toContain("useToolFileNavigation(tool?.fileTarget, tool?.fileNarratorId)");
+		expect(FILE_NAVIGATION.replace(/\s+/g, " ")).toContain(
+			"target && fileNarratorId && (navigation.openFilePanel || (scope.narratorId === fileNarratorId && scope.openFile))",
+		);
+		expect(FILE_NAVIGATION).toContain("source.fileNarratorId,");
+		expect(FILE_NAVIGATION).toContain("[source.target],");
+		expect(FILE_NAVIGATION).toContain("if (!isCurrent() || !targets[0]) return;");
 		expect(TRACE_ROW).toContain("if (editNavigation.open) editNavigation.open();");
-		expect(TRACE_ROW).toContain("else if (filePath) onOpenFilePanel?.(filePath);");
+		expect(TRACE_ROW).toContain("else void openToolFile?.();");
 	});
 });

@@ -4,9 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
+	"fmt"
 	"os"
 	"os/exec"
+	"path"
+	"path/filepath"
+	"runtime"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -27,6 +32,8 @@ type grepParams struct {
 	afterContext    *int
 	maxBytes        int64
 	timeoutMs       int64
+	privateGlobs    []string
+	privateState    bool
 }
 
 // Grep runs a content search, preferring ripgrep. When rg is not on PATH it
@@ -39,8 +46,14 @@ func (h *Handlers) Grep(params map[string]any) (any, error) {
 		return nil, err
 	}
 
-	// Prefer ripgrep.
+	gp.privateState = h.guard.hasPrivateRoots()
+	// Prefer ripgrep. Anchored exclusions are relative to its actual cwd, not
+	// a basename: an ordinary sibling with the same directory name stays visible.
 	if rgPath, lookErr := exec.LookPath("rg"); lookErr == nil {
+		gp.privateGlobs, err = h.privateSearchGlobs(gp)
+		if err != nil {
+			return nil, err
+		}
 		argv := buildRipgrepArgv(rgPath, gp)
 		return runSearch(argv, gp, false), nil
 	}
@@ -62,8 +75,28 @@ func (h *Handlers) Grep(params map[string]any) (any, error) {
 	if info, statErr := os.Stat(gp.searchPath); statErr == nil {
 		isDir = info.IsDir()
 	}
-	argv := buildGrepFallbackArgv(grepPath, gp, isDir)
-	res := runSearch(argv, gp, true)
+	var res map[string]any
+	if isDir && gp.privateState {
+		// grep implementations disagree on recursive symlink/exclude semantics.
+		// Reuse the bounded guarded Glob walk and pass only approved files, never
+		// a recursive directory or a basename-wide exclusion to the fallback.
+		argv, truncated, remaining, err := h.privateFallbackFiles(grepPath, gp)
+		if err != nil {
+			return nil, err
+		}
+		if len(argv) == 0 {
+			res = map[string]any{"stdoutB64": "", "stderr": "", "exitCode": 1, "timedOut": false, "usedFallback": true, "truncatedByBytes": truncated}
+		} else {
+			gp.timeoutMs = remaining
+			res = runSearch(argv, gp, true)
+		}
+		if truncated {
+			res["truncatedByBytes"] = true
+			res["truncatedByFiles"] = true
+		}
+	} else {
+		res = runSearch(buildGrepFallbackArgv(grepPath, gp, isDir), gp, true)
+	}
 	// GNU grep -c prints `path:0` for every scanned file, whereas rg -c only
 	// lists files with matches. Strip zero-count lines to align output.
 	if gp.outputMode == "count" {
@@ -74,6 +107,84 @@ func (h *Handlers) Grep(params map[string]any) (any, error) {
 		}
 	}
 	return res, nil
+}
+
+func (h *Handlers) privateSearchGlobs(gp grepParams) ([]string, error) {
+	root := gp.searchPath
+	if root == "" {
+		root = gp.cwd
+	}
+	var globs []string
+	escape := strings.NewReplacer("\\", "\\\\", "[", "\\[", "]", "\\]", "{", "\\{", "}", "\\}", "*", "\\*", "?", "\\?")
+	for _, private := range h.guard.privateRootsWithin(root) {
+		// rg cannot faithfully anchor a ../ exclusion above its cwd. Refuse
+		// only that overlapping scope, never pretend an unsafe search was filtered.
+		if !pathWithin(gp.cwd, private) {
+			return nil, errExecutorPrivatePath
+		}
+		rel, err := filepath.Rel(gp.cwd, private)
+		if err != nil {
+			return nil, err
+		}
+		literal := escape.Replace(filepath.ToSlash(rel))
+		globs = append(globs, "!/"+literal, "!/"+literal+"/**")
+	}
+	return globs, nil
+}
+
+func (h *Handlers) privateFallbackFiles(binary string, gp grepParams) ([]string, bool, int64, error) {
+	started := time.Now()
+	root := gp.searchPath
+	if root == "" {
+		root = gp.cwd
+	}
+	budget := int64(128 * 1024)
+	if h.maxRpcBytes < budget {
+		budget = h.maxRpcBytes
+	}
+	result, err := h.GlobContext(context.Background(), map[string]any{"cwd": root, "pattern": "**", "dot": true, "maxResults": 10000, "maxBytes": budget, "timeoutMs": gp.timeoutMs})
+	if err != nil {
+		return nil, false, 0, err
+	}
+	manifest := result.(map[string]any)
+	truncated := manifest["truncated"].(bool)
+	argv := buildGrepFallbackArgv(binary, gp, false)
+	argv = append([]string{binary, "-H"}, argv[1:len(argv)-1]...) // preserve directory-search filename output even for one approved file
+	used := 0
+	for _, arg := range argv {
+		used += len(arg) + 1
+	}
+	count := 0
+	for _, rel := range manifest["matches"].([]string) {
+		if gp.glob != "" {
+			matched, err := path.Match(gp.glob, filepath.Base(rel))
+			if err != nil {
+				return nil, false, 0, err
+			}
+			if !matched {
+				continue
+			}
+		}
+		file, err := h.guard.CheckExisting(filepath.Join(root, filepath.FromSlash(rel)))
+		if err != nil {
+			continue
+		}
+		if int64(used+len(file)+1) > budget {
+			truncated = true
+			break
+		}
+		argv = append(argv, file)
+		used += len(file) + 1
+		count++
+	}
+	remaining := gp.timeoutMs - time.Since(started).Milliseconds()
+	if remaining <= 0 {
+		return nil, false, 0, fmt.Errorf("guarded search deadline exceeded")
+	}
+	if count == 0 {
+		return nil, truncated, remaining, nil
+	}
+	return argv, truncated, remaining, nil
 }
 
 func (h *Handlers) decodeGrepParams(params map[string]any) (grepParams, error) {
@@ -159,6 +270,16 @@ func buildRipgrepArgv(rgPath string, gp grepParams) []string {
 	}
 	if gp.glob != "" {
 		args = append(args, "--glob", gp.glob)
+	}
+	if gp.privateState {
+		args = append(args, "--no-follow")
+	}
+	for _, glob := range gp.privateGlobs {
+		flag := "--glob"
+		if runtime.GOOS == "windows" {
+			flag = "--iglob"
+		}
+		args = append(args, flag, glob)
 	}
 	args = append(args, "--regexp", gp.pattern, gp.searchPath)
 	return args

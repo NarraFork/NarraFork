@@ -1983,7 +1983,9 @@ export function truncateToolIO(tree: any[], maxLen = DEFAULT_TOOL_IO_BUDGET): an
 // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 export function enrichToolUseBlocks(tree: any[]): any[] {
 	return tree.map((msg) => {
-		if (!msg.toolCalls?.length || !Array.isArray(msg.contentJson)) return msg;
+		if (!msg.toolCalls?.length || !Array.isArray(msg.contentJson)) {
+			return msg.children?.length ? { ...msg, children: enrichToolUseBlocks(msg.children) } : msg;
+		}
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		const tcMap = new Map<string, any>(
 			latestToolCallAttempts(msg.toolCalls).map((tc) => [tc.toolUseId, tc]),
@@ -2009,6 +2011,14 @@ export function enrichToolUseBlocks(tree: any[]): any[] {
 				streamCompletedAt: tc.streamCompletedAt,
 				permissionStartedAt: tc.permissionStartedAt,
 				executionStartedAt: tc.executionStartedAt,
+				// Exact-history pages drop toolCalls after enrichment. Copy only this
+				// selected attempt's frozen facts, overwriting any stale block snapshot.
+				executionDeviceId: tc.executionDeviceId,
+				executionCwd: tc.executionCwd,
+				resolvedFilePath: tc.resolvedFilePath,
+				executionTarget: tc.executionTarget,
+				executionTargets: tc.executionTargets,
+				deviceSelectionSource: tc.deviceSelectionSource,
 				completedAt: tc.completedAt,
 				errorMessage: tc.errorMessage,
 				permissionDecisionReason: tc.permissionDecisionReason,

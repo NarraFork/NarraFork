@@ -129,7 +129,7 @@ afterEach(async () => {
 	}
 	originals.clear();
 });
-async function mount(readOnly = false) {
+async function mount(readOnly = false, onNavigationIntent?: () => void) {
 	await act(async () =>
 		root.render(
 			<I18nextProvider i18n={i18n}>
@@ -139,6 +139,7 @@ async function mount(readOnly = false) {
 						onClose={closed}
 						readOnly={readOnly}
 						onSave={saved}
+						onNavigationIntent={onNavigationIntent}
 					/>
 				</MantineProvider>
 			</I18nextProvider>,
@@ -182,6 +183,37 @@ test("Mantine fields, Enter/ShiftEnter navigation, initial offset zero and Escap
 	await key("search", "Escape");
 	expect(closed).toHaveBeenCalledTimes(1);
 	expect(focused).toHaveBeenCalledTimes(1);
+});
+
+test("only applied Enter/Next navigation publishes intent before selection/reveal, not opening or decoration", async () => {
+	const order: string[] = [];
+	instance.setSelection = () => {
+		order.push("selection");
+	};
+	instance.revealRangeInCenterIfOutsideViewport = () => {
+		order.push("reveal");
+	};
+	await mount(false, () => {
+		order.push("intent");
+	});
+	expect(order).toEqual([]);
+	await change("search", "abc");
+	await act(async () => {
+		await new Promise((resolve) => setTimeout(resolve, 180));
+	});
+	expect(search).toHaveBeenCalledTimes(1);
+	expect(order).toEqual([]);
+	await key("search", "Enter");
+	expect(order).toEqual(["intent", "selection", "reveal"]);
+	const next = host.querySelector('button[aria-label="next"]');
+	if (!next) throw new Error("Missing next search action");
+	await act(async () => {
+		next.dispatchEvent(new Event("click", { bubbles: true }));
+	});
+	expect(order).toEqual(["intent", "selection", "reveal", "intent", "selection", "reveal"]);
+	search.mockResolvedValueOnce({ matches: [], count: 0, more: false });
+	await key("search", "Enter");
+	expect(order).toHaveLength(6);
 });
 
 test("immediate Enter owns navigation beyond the automatic search debounce", async () => {
@@ -244,7 +276,8 @@ test("replacement is one undo transaction; composition Enter never replaces", as
 });
 
 test("invalid expressions are visible and late-query results never move selection", async () => {
-	await mount();
+	const navigated = mock(() => {});
+	await mount(false, navigated);
 	search.mockRejectedValueOnce(new Error("EDITOR_INVALID_REGEX"));
 	await change("search", "[");
 	await key("search", "Enter");
@@ -267,4 +300,5 @@ test("invalid expressions are visible and late-query results never move selectio
 	await change("search", "xyz");
 	await act(async () => resolve?.({ matches: [{ offset: 0, length: 3 }], count: 1, more: false }));
 	expect(selected).not.toHaveBeenCalled();
+	expect(navigated).not.toHaveBeenCalled();
 });

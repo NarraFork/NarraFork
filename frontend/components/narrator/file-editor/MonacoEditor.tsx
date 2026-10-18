@@ -3,7 +3,12 @@ import type { FileSelection } from "@shared/file-reference";
 import type { editor } from "monaco-editor/editor/editor.api";
 import { type Ref, useEffect, useImperativeHandle, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useEditorPanelVisible, useRetainedEditorView } from "../narrator-panel-visibility";
 import { createEditorLocalId } from "./editor-local-id";
+
+let liveViews = 0;
+export const getEditorViewDiagnostics = () => ({ views: liveViews });
+
 import { MonacoSearchPanel } from "./MonacoSearchPanel";
 import {
 	loadMonacoLanguage,
@@ -47,6 +52,8 @@ export interface MonacoDocumentStatus extends MonacoLanguageStatus {
 export interface MonacoEditorProps {
 	ref?: Ref<MonacoEditorHandle>;
 	initialValue: string;
+	/** Externally owned document: disposing this view must never dispose or reset it. */
+	model?: editor.ITextModel;
 	documentKey: string;
 	filePath: string;
 	onReady?: (handle: MonacoEditorHandle | null) => void;
@@ -56,10 +63,14 @@ export interface MonacoEditorProps {
 	onSave?: () => void;
 	onError?: (error: Error) => void;
 	readOnly?: boolean;
+	/** Synchronous content-event guard; React props may not have rendered yet. */
+	isFormatProtected?: () => boolean;
+	forcePlaintext?: boolean;
 	selection?: FileSelection;
 	navigationRequestId?: string;
 	lineWrapping?: boolean;
 	visible?: boolean;
+	viewState?: { current: editor.ICodeEditorViewState | null };
 }
 
 interface Runtime {
@@ -97,7 +108,14 @@ function updateTheme(api: MonacoAPI, host: HTMLElement, dark: boolean): void {
 
 /** Monaco owns the only mutable document. Props are explicit loads, never controlled input echoes. */
 export function MonacoEditor(props: MonacoEditorProps) {
-	const { ref, documentKey } = props;
+	const { ref, documentKey, model: externalModel } = props;
+	const visible = useEditorPanelVisible(props.visible);
+	const retained = useRetainedEditorView(visible);
+	const ownViewState = useRef<editor.ICodeEditorViewState | null>(null);
+	const viewState = props.viewState ?? ownViewState;
+	const savedNavigation = useRef({ documentKey, request: "" });
+	const visibility = useRef(visible);
+	visibility.current = visible;
 	const { t } = useTranslation("narrator");
 	const [longLineDocumentKey, setLongLineDocumentKey] = useState<string | null>(null);
 	const [fullLongLineDocumentKey, setFullLongLineDocumentKey] = useState<string | null>(null);
@@ -120,13 +138,13 @@ export function MonacoEditor(props: MonacoEditorProps) {
 		getEditor: () => runtime.current?.view ?? null,
 		getModel: () => runtime.current?.model ?? null,
 		undo: () => {
-			if (!latest.current.readOnly) {
+			if (!latest.current.readOnly && !latest.current.isFormatProtected?.()) {
 				runtime.current?.view.trigger("toolbar", "undo", null);
 				runtime.current?.view.focus();
 			}
 		},
 		redo: () => {
-			if (!latest.current.readOnly) {
+			if (!latest.current.readOnly && !latest.current.isFormatProtected?.()) {
 				runtime.current?.view.trigger("toolbar", "redo", null);
 				runtime.current?.view.focus();
 			}
@@ -137,7 +155,11 @@ export function MonacoEditor(props: MonacoEditorProps) {
 
 	useEffect(() => {
 		const host = hostRef.current;
-		if (!host) return;
+		if (!host || !retained) return;
+		if (savedNavigation.current.documentKey !== documentKey) {
+			savedNavigation.current = { documentKey, request: "" };
+			viewState.current = null;
+		}
 		let cancelled = false;
 		let dispose: (() => void) | undefined;
 		// Full rendering is an opt-in for this model lifetime, not a preference for another file.
@@ -147,7 +169,9 @@ export function MonacoEditor(props: MonacoEditorProps) {
 		void (async () => {
 			const api = await loadMonaco();
 			const initialLanguagePath = latest.current.filePath;
-			let languageStatus = await loadMonacoLanguage(api, initialLanguagePath);
+			let languageStatus = latest.current.forcePlaintext
+				? resolveMonacoLanguage("file.txt")
+				: await loadMonacoLanguage(api, initialLanguagePath);
 			if (cancelled) return;
 			const initial = latest.current;
 			// This order is critical. createModel consults the standalone configuration service.
@@ -160,25 +184,36 @@ export function MonacoEditor(props: MonacoEditorProps) {
 				theme: "narrafork",
 				ariaLabel: initial.filePath,
 			});
-			dispose = () => view.dispose();
+			liveViews++;
+			let viewDisposed = false;
+			const disposeView = () => {
+				if (viewDisposed) return;
+				viewDisposed = true;
+				liveViews--;
+				viewState.current = view.saveViewState?.() ?? null;
+				view.dispose();
+			};
+			dispose = disposeView;
 			const uri = api.Uri.from({
 				scheme: "narrafork-editor",
 				authority: "document",
 				path: `/${encodeURIComponent(documentKey)}/${encodeURIComponent(initial.filePath)}`,
 				query: createEditorLocalId(),
 			});
-			const model = api.editor.createModel(initial.initialValue, languageStatus.language, uri);
+			const model =
+				externalModel ?? api.editor.createModel(initial.initialValue, languageStatus.language, uri);
 			dispose = () => {
-				view.dispose();
-				model.dispose();
+				disposeView();
+				if (!externalModel) model.dispose();
 			};
 			const longLines = new MonacoLongLineTracker(model);
 			if (longLines.hasLongLine) view.updateOptions({ wordWrap: "off" });
 			view.setModel(model);
+			if (viewState.current) view.restoreViewState?.(viewState.current);
 			const navigation = new MonacoNavigationHighlight(view);
 			let loadedValue = initial.initialValue;
 			let loadedPath = initialLanguagePath;
-			let lastNavigation = "";
+			let lastNavigation = savedNavigation.current.request;
 			let loadRevision = 0;
 			let languageRequest = 0;
 			let readyCallback = initial.onReady;
@@ -207,7 +242,7 @@ export function MonacoEditor(props: MonacoEditorProps) {
 				if (frame) return;
 				frame = requestAnimationFrame(() => {
 					frame = 0;
-					if (cancelled || latest.current.visible === false || !monacoHostVisible(host)) return;
+					if (cancelled || !visibility.current || !monacoHostVisible(host)) return;
 					if (width !== host.clientWidth || height !== host.clientHeight) {
 						width = host.clientWidth;
 						height = host.clientHeight;
@@ -238,11 +273,11 @@ export function MonacoEditor(props: MonacoEditorProps) {
 					readyCallback = next.onReady;
 					readyCallback?.(handle);
 				}
-				if (loadedValue !== next.initialValue) {
+				if (!externalModel && loadedValue !== next.initialValue) {
 					loadedValue = next.initialValue;
 					model.setValue(next.initialValue);
 				}
-				if (loadedPath !== next.filePath) {
+				if (loadedPath !== next.filePath && !next.forcePlaintext) {
 					loadedPath = next.filePath;
 					const request = ++languageRequest;
 					languageStatus = resolveMonacoLanguage(loadedPath);
@@ -262,8 +297,8 @@ export function MonacoEditor(props: MonacoEditorProps) {
 					lastTheme = darkRef.current;
 					updateTheme(api, host, lastTheme);
 				}
-				if (readOnly !== !!next.readOnly) {
-					readOnly = !!next.readOnly;
+				if (readOnly !== (!!next.readOnly || !!next.isFormatProtected?.())) {
+					readOnly = !!next.readOnly || !!next.isFormatProtected?.();
 					view.updateOptions({ readOnly });
 					emit();
 				}
@@ -283,6 +318,7 @@ export function MonacoEditor(props: MonacoEditorProps) {
 					: "";
 				if (lastNavigation !== request) {
 					lastNavigation = request;
+					savedNavigation.current.request = request;
 					if (next.selection) {
 						const range = monacoFileSelectionRange(model, next.selection);
 						navigation.set(range);
@@ -364,6 +400,10 @@ export function MonacoEditor(props: MonacoEditorProps) {
 					});
 				}),
 				model.onDidChangeContent((event) => {
+					if (latest.current.isFormatProtected?.()) {
+						readOnly = true;
+						view.updateOptions({ readOnly: true });
+					}
 					if (event.isFlush) {
 						loadRevision++;
 						// Also support explicit reloads performed through the public model handle.
@@ -425,8 +465,8 @@ export function MonacoEditor(props: MonacoEditorProps) {
 				blurSubscription?.dispose();
 				navigation.dispose();
 				runtime.current = null;
-				view.dispose();
-				model.dispose();
+				disposeView();
+				if (!externalModel) model.dispose();
 				readyCallback?.(null);
 			};
 			runtime.current = { api, view, model, sync };
@@ -445,16 +485,22 @@ export function MonacoEditor(props: MonacoEditorProps) {
 			cancelled = true;
 			dispose?.();
 		};
-	}, [documentKey, handle]);
+	}, [documentKey, handle, externalModel, retained, viewState]);
 
 	// No props are lifecycle dependencies: theme, preview and callback changes retain the model.
 	useEffect(() => {
 		runtime.current?.sync();
 	});
 	useEffect(() => {
-		if (internalSearch && (internalSearch.documentKey !== documentKey || props.onSearchRequested))
+		if (
+			internalSearch &&
+			(!visible ||
+				!retained ||
+				internalSearch.documentKey !== documentKey ||
+				props.onSearchRequested)
+		)
 			setInternalSearch(null);
-	}, [internalSearch, documentKey, props.onSearchRequested]);
+	}, [internalSearch, documentKey, props.onSearchRequested, visible, retained]);
 	return (
 		<Box
 			style={{

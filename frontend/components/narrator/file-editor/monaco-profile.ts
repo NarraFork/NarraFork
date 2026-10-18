@@ -2,6 +2,19 @@ import type { editor } from "monaco-editor/editor/editor.api";
 
 export const MONACO_LONG_LINE_LIMIT = 10_000;
 export const MONACO_LARGE_DOCUMENT_LENGTH = 1024 * 1024;
+export function editorRawProfile(profile: {
+	textLength: number;
+	lineCount: number;
+	maxLineLength: number;
+}) {
+	return {
+		paged: profile.lineCount > 1_000_000,
+		plaintext:
+			profile.textLength >= MONACO_LARGE_DOCUMENT_LENGTH ||
+			profile.lineCount >= 100_000 ||
+			profile.maxLineLength > MONACO_LONG_LINE_LIMIT,
+	};
+}
 
 /** Model construction reads these settings from the already-created standalone editor. */
 export function monacoEditorOptions(

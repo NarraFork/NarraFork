@@ -12,20 +12,35 @@
  * and i18n records menu construction while returning label-stable raw keys.
  */
 
-import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { fileReferenceApi } from "@frontend/lib/api/file-references";
 import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import { MantineProvider } from "@mantine/core";
+import { notifications } from "@mantine/notifications";
 import { parseHTML } from "linkedom";
-import { act } from "react";
+import { act, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import type { ToolCallDetailRef } from "../../../lib/api/narrators";
+import {
+	FileReferenceScopeProvider,
+	type FileReferenceScopeValue,
+} from "../composer/FileReferenceScope";
 import { NarratorDockContext, type NarratorDockContextValue } from "../dock/NarratorDockContext";
+import { useInternalFileViewer } from "../interaction/use-internal-file-viewer";
+import type { NarratorMsg } from "../narrator-panel-types";
+import { buildToolMetaIndex } from "./vlist-tool-meta";
 
 const realMantineHooksModule = { ...(await import("@mantine/hooks")) };
 const realSwipeMenuModule = { ...(await import("@frontend/hooks/useSwipeMenu")) };
 const realReactI18nextModule = { ...(await import("react-i18next")) };
 const realUsePlatformModule = { ...(await import("@frontend/hooks/usePlatform")) };
 const realMessageSelectionModule = { ...(await import("../message/MessageSelectionCtx")) };
+// Same cycle boundary as the service projection suite; use the actual history projection.
+const realNarratorWsModule = { ...(await import("@server/websocket/narrator-ws")) };
+mock.module("@server/websocket/narrator-ws", () => ({ broadcastToNarrator: () => {} }));
+const { enrichToolUseBlocks, stripRedundantToolCallRows, stripProviderMetadata } = await import(
+	"@server/services/narrator-messages"
+);
 
 const closeSwipeMock = mock(() => {});
 const clipboardCopyMock = mock((_value: string) => {});
@@ -156,6 +171,9 @@ function installDom() {
 }
 
 interface RenderOpts {
+	actualOffDock?: boolean;
+	hideRow?: boolean;
+	fileScope?: FileReferenceScopeValue;
 	dock?: NarratorDockContextValue;
 	toolDetailRef?: ToolCallDetailRef & { toolUseId?: string };
 	toolMeta?: VListToolMeta;
@@ -169,6 +187,28 @@ interface RenderOpts {
 	onOpenFullscreen?: () => void;
 }
 
+function TestFileScope({ opts, children }: { opts: RenderOpts; children: ReactNode }) {
+	const viewer = useInternalFileViewer({
+		narratorId: opts.fileScope?.narratorId ?? opts.narratorId ?? "child",
+		isWorkspacePreview: false,
+		t: translateMock,
+	});
+	return (
+		<FileReferenceScopeProvider
+			value={
+				opts.actualOffDock
+					? { narratorId: opts.narratorId ?? "child", openFile: viewer.handleOpenReferencedFile }
+					: (opts.fileScope ?? {})
+			}
+		>
+			{children}
+			{opts.actualOffDock && (
+				<output data-offdock-path>{viewer.internalFileViewerPath ?? "closed"}</output>
+			)}
+		</FileReferenceScopeProvider>
+	);
+}
+
 async function renderRow(opts: RenderOpts = {}) {
 	const toolActions = opts.toolMeta
 		? buildRowToolActions(opts.toolMeta, opts.handlers ?? {})
@@ -177,22 +217,26 @@ async function renderRow(opts: RenderOpts = {}) {
 		root?.render(
 			<MantineProvider>
 				<NarratorDockContext.Provider value={opts.dock ?? null}>
-					<VListRowInteraction
-						blockId="sa-tu_1"
-						messageId="m1"
-						blockIndex={0}
-						copyText={opts.copyText}
-						actions={opts.actions ?? { messageId: "m1" }}
-						narratorId={opts.narratorId}
-						toolUseId={opts.toolUseId}
-						toolDetailRef={opts.toolDetailRef}
-						toolMeta={opts.toolMeta}
-						toolActions={toolActions}
-						onViewOriginal={opts.onViewOriginal}
-						onOpenFullscreen={opts.onOpenFullscreen}
-					>
-						<div>row body</div>
-					</VListRowInteraction>
+					<TestFileScope opts={opts}>
+						{!opts.hideRow && (
+							<VListRowInteraction
+								blockId="sa-tu_1"
+								messageId="m1"
+								blockIndex={0}
+								copyText={opts.copyText}
+								actions={opts.actions ?? { messageId: "m1" }}
+								narratorId={opts.narratorId}
+								toolUseId={opts.toolUseId}
+								toolDetailRef={opts.toolDetailRef}
+								toolMeta={opts.toolMeta}
+								toolActions={toolActions}
+								onViewOriginal={opts.onViewOriginal}
+								onOpenFullscreen={opts.onOpenFullscreen}
+							>
+								<div>row body</div>
+							</VListRowInteraction>
+						)}
+					</TestFileScope>
 				</NarratorDockContext.Provider>
 			</MantineProvider>,
 		);
@@ -257,6 +301,7 @@ afterAll(() => {
 	mock.module("react-i18next", () => realReactI18nextModule);
 	mock.module("@frontend/hooks/usePlatform", () => realUsePlatformModule);
 	mock.module("../message/MessageSelectionCtx", () => realMessageSelectionModule);
+	mock.module("@server/websocket/narrator-ws", () => realNarratorWsModule);
 	mock.restore();
 });
 
@@ -517,7 +562,16 @@ describe("VListRowInteraction — tool card items", () => {
 	});
 
 	test("offers copy-file-path for any file tool, view-file only for Read", async () => {
-		await renderRow({ toolMeta: { toolName: "Read", filePath: "/a/b.ts", isReadTool: true } });
+		await renderRow({
+			toolMeta: {
+				toolName: "Read",
+				filePath: "/a/b.ts",
+				isReadTool: true,
+				fileTarget: { deviceId: "local", path: "/a/b.ts" },
+				fileNarratorId: "reader",
+			},
+			dock: { openFilePanel: () => {} } as unknown as NarratorDockContextValue,
+		});
 		let labels = menuLabels();
 		expect(labels).toContain("contextMenu_copyFilePath");
 		expect(labels).toContain("contextMenu_viewFile");
@@ -555,6 +609,564 @@ describe("VListRowInteraction — tool card items", () => {
  * output) and one item cannot say which — those controls live on each body's own
  * hover action bar, where the target is unambiguous.
  */
+describe("Read execution target — real row menu", () => {
+	const cwd = "/home/ysc/projects/ops-service/.worktrees/logs-lod-redesign";
+	const relative = "frontend/.test-build/logs-browser/tree-desktop.png";
+	const cases = [
+		{ path: `${cwd}/${relative}`, cwd, expected: `${cwd}/${relative}`, deviceId: "local" },
+		{ path: relative, cwd, expected: `${cwd}/${relative}`, deviceId: "LinuxRemote" },
+		{
+			path: "文档/空 格.txt",
+			cwd: "D:\\项目\\worktree",
+			expected: "D:/项目/worktree/文档/空 格.txt",
+			deviceId: "WindowsRemote",
+		},
+	];
+	for (const item of cases) {
+		test(`opens captured ${item.deviceId} image/text target as child, never host cwd`, async () => {
+			const target = { deviceId: item.deviceId, path: item.expected };
+			const resolve = spyOn(fileReferenceApi, "resolve").mockResolvedValue({ targets: [target] });
+			try {
+				const onOpenFileTarget = mock((..._args: unknown[]) => {});
+				const legacyOpen = mock((_path: string) => {});
+				const message = {
+					id: "read-message",
+					narratorId: "actual-child",
+					contentJson: [
+						{
+							type: "tool_use",
+							name: "Read",
+							id: "read-1",
+							input: { file_path: item.path, device: "wrong-current-default" },
+						},
+					],
+					toolCalls: [
+						{
+							toolUseId: "read-1",
+							toolName: "Read",
+							inputJson: { file_path: item.path },
+							status: "success",
+							executionDeviceId: item.deviceId,
+							executionCwd: item.cwd,
+						},
+					],
+				} as unknown as NarratorMsg;
+				const [historyDto] = JSON.parse(
+					JSON.stringify(stripRedundantToolCallRows(enrichToolUseBlocks([message]))),
+				);
+				expect(historyDto.toolCalls).toEqual([]);
+				await renderRow({
+					narratorId: "host-after-cwd-change",
+					toolUseId: "read-1",
+					toolMeta: buildToolMetaIndex([historyDto]).get("read-1"),
+					handlers: { onOpenFilePanel: legacyOpen },
+					dock: {
+						narratorId: "host-after-device-change",
+						openFilePanel: onOpenFileTarget,
+					} as unknown as NarratorDockContextValue,
+				});
+				await act(async () => clickMenuItem("contextMenu_openFilePanel"));
+				expect(resolve).toHaveBeenCalledWith("actual-child", [target], expect.any(AbortSignal));
+				expect(onOpenFileTarget).toHaveBeenCalledWith(
+					item.expected,
+					undefined,
+					expect.objectContaining({
+						deviceId: item.deviceId,
+						fileNarratorId: "actual-child",
+						referenceOrigin: true,
+					}),
+				);
+				expect(legacyOpen).not.toHaveBeenCalled();
+			} finally {
+				resolve.mockRestore();
+			}
+		});
+	}
+
+	test("reload history DTO after real server enrichment/stripping opens the selected Read retry as its child", async () => {
+		const target = { deviceId: "history-remote", path: `${cwd}/${relative}` };
+		const resolve = spyOn(fileReferenceApi, "resolve").mockResolvedValue({ targets: [target] });
+		try {
+			const onOpenFileTarget = mock((..._args: unknown[]) => {});
+			const [dto] = JSON.parse(
+				JSON.stringify(
+					stripProviderMetadata(
+						stripRedundantToolCallRows(
+							enrichToolUseBlocks([
+								{
+									id: "history",
+									narratorId: "actual-history-child",
+									children: [],
+									contentJson: [
+										{
+											type: "tool_use",
+											name: "Read",
+											id: "history-read",
+											input: { file_path: "old.txt" },
+											executionAttempt: 1,
+											tcId: "old",
+											executionDeviceId: "stale",
+											executionCwd: "/stale",
+											resolvedFilePath: "/stale/old.txt",
+											executionTarget: { deviceId: "stale", cwd: "/stale" },
+										},
+									],
+									toolCalls: [
+										{
+											id: "retry",
+											toolUseId: "history-read",
+											toolName: "Read",
+											status: "success",
+											executionAttempt: 2,
+											inputJson: { file_path: relative },
+											executionDeviceId: target.deviceId,
+											executionCwd: cwd,
+											executionTarget: { deviceId: target.deviceId, cwd },
+										},
+										{
+											id: "old",
+											toolUseId: "history-read",
+											toolName: "Read",
+											status: "error",
+											executionAttempt: 1,
+											inputJson: { file_path: "old.txt" },
+											executionDeviceId: "old-device",
+											executionCwd: "/old",
+										},
+									],
+								},
+							]),
+						),
+					),
+				),
+			);
+			expect(dto.toolCalls).toEqual([]);
+			await renderRow({
+				narratorId: "current-host",
+				toolMeta: buildToolMetaIndex([dto]).get("history-read"),
+				dock: {
+					narratorId: "current-host",
+					openFilePanel: onOpenFileTarget,
+				} as unknown as NarratorDockContextValue,
+			});
+			await act(async () => clickMenuItem("contextMenu_openFilePanel"));
+			expect(resolve).toHaveBeenCalledWith(
+				"actual-history-child",
+				[target],
+				expect.any(AbortSignal),
+			);
+			expect(onOpenFileTarget).toHaveBeenCalledWith(
+				target.path,
+				undefined,
+				expect.objectContaining({
+					deviceId: target.deviceId,
+					fileNarratorId: "actual-history-child",
+					referenceOrigin: true,
+				}),
+			);
+		} finally {
+			resolve.mockRestore();
+		}
+	});
+
+	test("later cwd/default-device changes cannot rebind an existing Read menu", async () => {
+		const target = { deviceId: "original-remote", path: `${cwd}/${relative}` };
+		const resolve = spyOn(fileReferenceApi, "resolve").mockResolvedValue({ targets: [target] });
+		try {
+			const onOpenFileTarget = mock((..._args: unknown[]) => {});
+			const options: RenderOpts = {
+				narratorId: "child",
+				toolMeta: {
+					toolName: "Read",
+					filePath: relative,
+					isFileTool: true,
+					isReadTool: true,
+					fileTarget: target,
+					fileNarratorId: "child",
+				},
+				dock: { openFilePanel: onOpenFileTarget } as unknown as NarratorDockContextValue,
+			};
+			await renderRow({
+				...options,
+				fileScope: { narratorId: "child", context: { deviceId: target.deviceId, cwd } },
+			});
+			await renderRow({
+				...options,
+				fileScope: { narratorId: "child", context: { deviceId: "local", cwd: "/home/ysc/桌面" } },
+			});
+			await act(async () => clickMenuItem("contextMenu_openFilePanel"));
+			expect(resolve).toHaveBeenCalledWith("child", [target], expect.any(AbortSignal));
+			expect(onOpenFileTarget).toHaveBeenCalledWith(
+				target.path,
+				undefined,
+				expect.objectContaining({
+					deviceId: target.deviceId,
+					fileNarratorId: "child",
+					referenceOrigin: true,
+				}),
+			);
+		} finally {
+			resolve.mockRestore();
+		}
+	});
+
+	test("off-dock opens through the existing target capability only for the actual source narrator", async () => {
+		const target = { deviceId: "Remote", path: "/original/read.txt" };
+		const onOpenFileTarget = mock((_target: typeof target) => {});
+		const options: RenderOpts = {
+			narratorId: "child",
+			toolMeta: {
+				toolName: "Read",
+				filePath: "read.txt",
+				isFileTool: true,
+				isReadTool: true,
+				fileTarget: target,
+				fileNarratorId: "child",
+			},
+		};
+		await renderRow({
+			...options,
+			fileScope: {
+				narratorId: "child",
+				openFile: onOpenFileTarget,
+				context: { deviceId: "today", cwd: "/today" },
+			},
+		});
+		await act(async () => clickMenuItem("contextMenu_openFilePanel"));
+		expect(onOpenFileTarget).toHaveBeenCalledWith(
+			target,
+			expect.objectContaining({ signal: expect.any(AbortSignal), isCurrent: expect.any(Function) }),
+		);
+		onOpenFileTarget.mockClear();
+		await renderRow({ ...options, fileScope: { narratorId: "host", openFile: onOpenFileTarget } });
+		expect(menuLabels()).not.toContain("contextMenu_openFilePanel");
+		expect(onOpenFileTarget).not.toHaveBeenCalled();
+	});
+
+	test("denied resolution cannot open the panel or fall back to the legacy path", async () => {
+		const target = { deviceId: "Remote", path: "/private/.env" };
+		const resolve = spyOn(fileReferenceApi, "resolve").mockRejectedValue(new Error("Forbidden"));
+		const notify = spyOn(notifications, "show").mockReturnValue("denied");
+		try {
+			const onOpenFileTarget = mock((..._args: unknown[]) => {});
+			const legacyOpen = mock((_path: string) => {});
+			await renderRow({
+				narratorId: "host",
+				toolMeta: {
+					toolName: "Read",
+					filePath: target.path,
+					fileTarget: target,
+					fileNarratorId: "child",
+					isFileTool: true,
+					isReadTool: true,
+				},
+				handlers: { onOpenFilePanel: legacyOpen },
+				dock: { openFilePanel: onOpenFileTarget } as unknown as NarratorDockContextValue,
+			});
+			await act(async () => clickMenuItem("contextMenu_openFilePanel"));
+			expect(resolve).toHaveBeenCalledWith("child", [target], expect.any(AbortSignal));
+			expect(onOpenFileTarget).not.toHaveBeenCalled();
+			expect(legacyOpen).not.toHaveBeenCalled();
+			expect(notify).toHaveBeenCalledWith(expect.objectContaining({ message: "Forbidden" }));
+		} finally {
+			resolve.mockRestore();
+			notify.mockRestore();
+		}
+	});
+
+	test("UNC input remains copyable but is never joined to a current local directory", async () => {
+		const path = "\\\\server\\share\\中文 空格.png";
+		const message = {
+			id: "m",
+			narratorId: "child",
+			contentJson: [
+				{
+					type: "tool_use",
+					name: "Read",
+					id: "unc",
+					input: { file_path: path },
+					executionDeviceId: "WindowsRemote",
+					executionCwd: "C:/original",
+				},
+			],
+		} as unknown as NarratorMsg;
+		await renderRow({
+			narratorId: "host",
+			toolMeta: buildToolMetaIndex([message]).get("unc"),
+			handlers: {
+				onOpenFilePanel: () => {
+					throw new Error("unsafe fallback");
+				},
+			},
+		});
+		expect(menuLabels()).not.toContain("contextMenu_openFilePanel");
+		expect(menuLabels()).toContain("fileReferences.missingContext");
+		clickMenuItem("contextMenu_copyFilePath");
+		expect(clipboardCopyMock).toHaveBeenCalledWith(path);
+	});
+
+	test("unknown historical execution identity never inherits current host defaults", async () => {
+		const legacyOpen = mock((_path: string) => {});
+		await renderRow({
+			narratorId: "today",
+			toolMeta: { toolName: "Read", filePath: relative, isFileTool: true, isReadTool: true },
+			handlers: { onOpenFilePanel: legacyOpen },
+		});
+		expect(menuLabels()).not.toContain("contextMenu_openFilePanel");
+		expect(menuLabels()).not.toContain("contextMenu_viewFile");
+		expect(menuLabels()).toContain("fileReferences.missingContext");
+		expect(legacyOpen).not.toHaveBeenCalled();
+	});
+});
+
+describe("Read pending navigation lifetime", () => {
+	const target = { deviceId: "Remote", path: "/original/read.txt" };
+	const toolMeta: VListToolMeta = {
+		toolName: "Read",
+		isReadTool: true,
+		isFileTool: true,
+		filePath: "read.txt",
+		fileTarget: target,
+		fileNarratorId: "child",
+	};
+	function deferred() {
+		let accept!: (value: { targets: (typeof target)[] }) => void;
+		let reject!: (error: Error) => void;
+		const promise = new Promise<{ targets: (typeof target)[] }>((resolve, fail) => {
+			accept = resolve;
+			reject = fail;
+		});
+		return { promise, accept, reject };
+	}
+	for (const kind of [
+		"host",
+		"opener",
+		"surface",
+		"capability-revoke",
+		"target",
+		"source",
+		"row-unmount",
+	] as const) {
+		test(`cancels pending dock Read when ${kind} changes`, async () => {
+			const pending = deferred();
+			const resolve = spyOn(fileReferenceApi, "resolve").mockReturnValue(pending.promise);
+			try {
+				const oldOpen = mock((..._args: unknown[]) => {});
+				const newOpen = mock((..._args: unknown[]) => {});
+				const surface = { current: {} };
+				const opts: RenderOpts = {
+					narratorId: "child",
+					toolMeta,
+					dock: {
+						...(kind === "opener" ? {} : { narratorId: "host-A" }),
+						...(kind === "surface" ? { apiRef: surface } : {}),
+						openFilePanel: oldOpen,
+					} as unknown as NarratorDockContextValue,
+				};
+				await renderRow(opts);
+				await act(async () => clickMenuItem("contextMenu_openFilePanel"));
+				const signal = resolve.mock.calls[0]?.[2];
+				if (kind === "surface") surface.current = {};
+				await renderRow({
+					...opts,
+					...(kind === "capability-revoke"
+						? { dock: { narratorId: "host-A" } as unknown as NarratorDockContextValue }
+						: {}),
+					...(kind === "host"
+						? {
+								dock: {
+									narratorId: "host-B",
+									openFilePanel: newOpen,
+								} as unknown as NarratorDockContextValue,
+							}
+						: {}),
+					...(kind === "opener"
+						? { dock: { openFilePanel: newOpen } as unknown as NarratorDockContextValue }
+						: {}),
+					...(kind === "target"
+						? { toolMeta: { ...toolMeta, fileTarget: { ...target, path: "/new.txt" } } }
+						: {}),
+					...(kind === "source"
+						? { toolMeta: { ...toolMeta, fileNarratorId: "other-child" } }
+						: {}),
+					...(kind === "row-unmount" ? { hideRow: true } : {}),
+				});
+				await act(async () => {
+					pending.accept({ targets: [target] });
+				});
+				expect(signal?.aborted).toBe(true);
+				expect(oldOpen).not.toHaveBeenCalled();
+				expect(newOpen).not.toHaveBeenCalled();
+			} finally {
+				resolve.mockRestore();
+			}
+		});
+	}
+	test("an imperative receiving surface replacement cannot publish into the new host without a row rerender", async () => {
+		const pending = deferred();
+		const resolve = spyOn(fileReferenceApi, "resolve").mockReturnValue(pending.promise);
+		try {
+			const open = mock((..._args: unknown[]) => {});
+			const apiRef = { current: {} };
+			await renderRow({
+				narratorId: "child",
+				toolMeta,
+				dock: {
+					narratorId: "host",
+					apiRef,
+					openFilePanel: open,
+				} as unknown as NarratorDockContextValue,
+			});
+			await act(async () => clickMenuItem("contextMenu_openFilePanel"));
+			const signal = resolve.mock.calls[0]?.[2];
+			apiRef.current = {};
+			await act(async () => {
+				pending.accept({ targets: [target] });
+			});
+			expect(signal?.aborted).toBe(true);
+			expect(open).not.toHaveBeenCalled();
+		} finally {
+			resolve.mockRestore();
+		}
+	});
+	test("same-host callback reconstruction keeps the request and opens only through the latest callback", async () => {
+		const pending = deferred();
+		const resolve = spyOn(fileReferenceApi, "resolve").mockReturnValue(pending.promise);
+		try {
+			const oldOpen = mock((..._args: unknown[]) => {});
+			const newOpen = mock((..._args: unknown[]) => {});
+			await renderRow({
+				narratorId: "child",
+				toolMeta,
+				dock: {
+					narratorId: "same-host",
+					openFilePanel: oldOpen,
+				} as unknown as NarratorDockContextValue,
+			});
+			await act(async () => clickMenuItem("contextMenu_openFilePanel"));
+			const signal = resolve.mock.calls[0]?.[2];
+			await renderRow({
+				narratorId: "child",
+				toolMeta: { ...toolMeta, fileTarget: { ...target } },
+				dock: {
+					narratorId: "same-host",
+					openFilePanel: newOpen,
+				} as unknown as NarratorDockContextValue,
+			});
+			await act(async () => {
+				pending.accept({ targets: [target] });
+			});
+			expect(signal?.aborted).toBe(false);
+			expect(oldOpen).not.toHaveBeenCalled();
+			expect(newOpen).toHaveBeenCalledTimes(1);
+		} finally {
+			resolve.mockRestore();
+		}
+	});
+	test("normal off-dock rerender and equivalent target reconstruction preserve pending navigation", async () => {
+		const pending = deferred();
+		const resolve = spyOn(fileReferenceApi, "resolve").mockReturnValue(pending.promise);
+		try {
+			const opts: RenderOpts = { narratorId: "child", toolMeta, actualOffDock: true };
+			await renderRow(opts);
+			await act(async () => clickMenuItem("contextMenu_openFilePanel"));
+			const signal = resolve.mock.calls[0]?.[2];
+			await renderRow({ ...opts, toolMeta: { ...toolMeta, fileTarget: { ...target } } });
+			await act(async () => {
+				pending.accept({ targets: [target] });
+			});
+			expect(signal?.aborted).toBe(false);
+			expect(document.querySelector("[data-offdock-path]")?.textContent).toBe(target.path);
+		} finally {
+			resolve.mockRestore();
+		}
+	});
+	test("unmounting an off-dock row cancels the real drawer opener before its late resolve", async () => {
+		const pending = deferred();
+		const resolve = spyOn(fileReferenceApi, "resolve").mockReturnValue(pending.promise);
+		try {
+			const opts: RenderOpts = { narratorId: "child", toolMeta, actualOffDock: true };
+			await renderRow(opts);
+			await act(async () => clickMenuItem("contextMenu_openFilePanel"));
+			const signal = resolve.mock.calls[0]?.[2];
+			await renderRow({ ...opts, hideRow: true });
+			await act(async () => {
+				pending.accept({ targets: [target] });
+			});
+			expect(signal?.aborted).toBe(true);
+			expect(document.querySelector("[data-offdock-path]")?.textContent).toBe("closed");
+		} finally {
+			resolve.mockRestore();
+		}
+	});
+	for (const changed of ["target", "source"] as const) {
+		test(`off-dock ${changed} replacement cancels the initiating row before drawer publication`, async () => {
+			const pending = deferred();
+			const resolve = spyOn(fileReferenceApi, "resolve").mockReturnValue(pending.promise);
+			try {
+				const opts: RenderOpts = { narratorId: "child", toolMeta, actualOffDock: true };
+				await renderRow(opts);
+				await act(async () => clickMenuItem("contextMenu_openFilePanel"));
+				const signal = resolve.mock.calls[0]?.[2];
+				await renderRow({
+					...opts,
+					toolMeta: {
+						...toolMeta,
+						...(changed === "target"
+							? { fileTarget: { ...target, path: "/other.txt" } }
+							: { fileNarratorId: "other-child" }),
+					},
+				});
+				await act(async () => {
+					pending.accept({ targets: [target] });
+				});
+				expect(signal?.aborted).toBe(true);
+				expect(document.querySelector("[data-offdock-path]")?.textContent).toBe("closed");
+			} finally {
+				resolve.mockRestore();
+			}
+		});
+	}
+	for (const actualOffDock of [false, true]) {
+		test(`late errors never overwrite a newer request (off-dock=${actualOffDock})`, async () => {
+			const pending = deferred();
+			const resolve = spyOn(fileReferenceApi, "resolve")
+				.mockReturnValueOnce(pending.promise)
+				.mockImplementation(async (_narrator, targets) => ({ targets }));
+			const notify = spyOn(notifications, "show").mockReturnValue("notification");
+			try {
+				const open = mock((..._args: unknown[]) => {});
+				const opts: RenderOpts = {
+					narratorId: "child",
+					toolMeta,
+					actualOffDock,
+					...(!actualOffDock
+						? {
+								dock: {
+									narratorId: "host",
+									openFilePanel: open,
+								} as unknown as NarratorDockContextValue,
+							}
+						: {}),
+				};
+				await renderRow(opts);
+				await act(async () => clickMenuItem("contextMenu_openFilePanel"));
+				await act(async () => clickMenuItem("contextMenu_openFilePanel"));
+				await act(async () => {
+					pending.reject(new Error("stale denied"));
+				});
+				expect(notify).not.toHaveBeenCalled();
+				if (actualOffDock)
+					expect(document.querySelector("[data-offdock-path]")?.textContent).toBe(target.path);
+				else expect(open).toHaveBeenCalledTimes(1);
+			} finally {
+				resolve.mockRestore();
+				notify.mockRestore();
+			}
+		});
+	}
+});
+
 describe("VListRowInteraction — fullscreen viewer", () => {
 	test("offers fullscreen only when the row has a readable body", async () => {
 		await renderRow({ copyText: "hello" });

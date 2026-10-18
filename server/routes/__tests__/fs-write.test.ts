@@ -443,14 +443,19 @@ describe("the write allow-list", () => {
 		expect(json.code).toBe("NEEDS_CONFIRMATION");
 	});
 
-	test("confirmOutsideRoots cannot override a secret-path refusal", async () => {
+	test.each([
+		"settings.json",
+		"editor-transfers/private.json",
+		"editor-native/operation.op.json",
+		"editor-native-operations/operation.json",
+	])("confirmOutsideRoots cannot override a private-path refusal: %s", async (relative) => {
 		// If the boundary code ran the outside-roots check before the secret check,
 		// this flag would let a user "confirm" overwriting the JWT secret.
 		//
 		// Uses narraforkDir rather than process.env.NARRAFORK_HOME: the secret-path
 		// checker reads `narraforkDir` which is frozen at settings module load time
 		// (before the test redirects the env var), so the test must use the same value.
-		const target = join(narraforkDir, "settings.json");
+		const target = join(narraforkDir, relative);
 		const { status, json } = await save({
 			path: target,
 			content: "pwned\n",

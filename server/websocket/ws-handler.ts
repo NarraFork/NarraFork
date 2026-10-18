@@ -46,6 +46,7 @@ import { getVNetConnections, handleVNetWS, type VNetWSData } from "./vnet-ws";
 export interface SessionWSAuth {
 	/** `exp` (unix seconds) of the session JWT presented at upgrade. */
 	sessionExp?: number;
+	sessionTokenVersion?: number;
 	/** `sub` of that token, for logging when the connection is dropped. */
 	sessionUserId?: string;
 }
@@ -155,6 +156,7 @@ export function resolveWSData(
 			userRole: userInfo?.role,
 			...(publicShare ? { publicShare } : {}),
 			sessionExp: sessionAuth?.sessionExp,
+			sessionTokenVersion: sessionAuth?.sessionTokenVersion,
 			sessionUserId: sessionAuth?.sessionUserId,
 		};
 	}
@@ -165,6 +167,7 @@ export function resolveWSData(
 			lastPongAt: Date.now(),
 			subscribedTerminals: new Set(),
 			sessionExp: sessionAuth?.sessionExp,
+			sessionTokenVersion: sessionAuth?.sessionTokenVersion,
 			sessionUserId: sessionAuth?.sessionUserId,
 		};
 	}

@@ -7,11 +7,19 @@ import type {
 } from "@shared/file-reference";
 import { type ReactNode, useContext, useMemo } from "react";
 
+export interface FileNavigationOptions {
+	/** The initiating row/capability can disappear while authorization is in flight. */
+	signal?: AbortSignal;
+	/** Check at asynchronous boundaries and immediately before publishing an open/error. */
+	isCurrent?: () => boolean;
+}
+
 export interface FileReferenceScopeValue {
 	narratorId?: string;
 	/** null explicitly disables inferred relative paths in historical content. */
 	context?: FileReferenceContext | null;
-	openFile?: (target: FileTarget) => void;
+	/** Async implementations must honor cancellation before publishing navigation. */
+	openFile?: (target: FileTarget, options?: FileNavigationOptions) => void;
 	addReference?: (reference: FileReference) => void;
 	selection?: FileReferenceEditorSelection | null;
 	setSelection?: (selection: FileReferenceEditorSelection | null) => void;

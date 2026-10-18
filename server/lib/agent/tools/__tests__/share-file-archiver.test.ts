@@ -62,7 +62,13 @@ describe("runArchiver", () => {
 });
 
 const sourceRoot = mkdtempSync(join(tmpdir(), "nf-share-recording-privacy-"));
-const recordingRoots = ["request-recordings", "saved-request-recordings"].map((name) => {
+const recordingRoots = [
+	"request-recordings",
+	"saved-request-recordings",
+	"editor-transfers",
+	"editor-native",
+	"editor-native-operations",
+].map((name) => {
 	const directory = join(narraforkDir, name, "share-privacy-test");
 	mkdirSync(directory, { recursive: true });
 	writeFileSync(join(directory, "request.json"), "private-recording-marker");
@@ -87,7 +93,7 @@ afterAll(() => {
 
 describe("ShareFile cannot publish private request recordings", () => {
 	test.each([
-		0, 1,
+		0, 1, 2, 3, 4,
 	])("refuses private directory %s, files, compression and multi-file archives", async (index) => {
 		const directory = recordingRoots[index];
 		const file = join(directory, "request.json");

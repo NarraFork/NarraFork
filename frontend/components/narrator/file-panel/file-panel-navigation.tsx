@@ -9,9 +9,20 @@ const FilePanelNavigationContext = createContext<FilePanelOpener | undefined>(un
 export const FilePanelNavigationProvider = FilePanelNavigationContext.Provider;
 
 export function useFilePanelNavigation(): FilePanelOpener | undefined {
+	return useFilePanelNavigationReceiver().openFilePanel;
+}
+
+/** A known dock stays the same receiver when React reconstructs its callback.
+ * Isolated capability-only hosts have no dock identity: replacing the capability
+ * is therefore a receiver change, never permission to invoke the old callback.
+ */
+export function useFilePanelNavigationReceiver() {
 	const explicit = useContext(FilePanelNavigationContext);
 	const dock = useNarratorDockContext();
-	return explicit ?? dock?.openFilePanel;
+	const openFilePanel = explicit ?? dock?.openFilePanel;
+	const getReceiver = () =>
+		explicit ?? dock?.apiRef?.current ?? dock?.apiRef ?? dock?.narratorId ?? openFilePanel;
+	return { openFilePanel, receiver: getReceiver(), getReceiver };
 }
 
 /** Carry the source session's file authority separately from the receiving layout host. */

@@ -144,6 +144,12 @@ func (h *Handlers) TransferStat(params map[string]any) (any, error) {
 		if err != nil {
 			return nil // skip unreadable entries
 		}
+		if _, guardErr := h.guard.CheckExisting(p); guardErr != nil {
+			if fi.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
 		if fi.IsDir() {
 			return nil
 		}

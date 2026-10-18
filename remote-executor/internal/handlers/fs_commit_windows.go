@@ -248,6 +248,12 @@ func verifyWindowsCommitted(f *os.File, replacementInfo os.FileInfo, metadata co
 // Once the native call begins, cancellation cannot interrupt state inspection
 // or compensation. Errors carrying backup/recovery paths are not retry-safe.
 func commitConditionalReplacement(ctx context.Context, target, tmpPath string, originalInfo os.FileInfo, metadata conditionalMetadata, next []byte) error {
+	return commitConditionalReplacementBudget(ctx, target, tmpPath, originalInfo, metadata, next, 2000000)
+}
+
+// Editor uses its separately bounded 20MiB native recovery budget; the legacy
+// conditional RPC and its original-content ceiling remain exactly 2,000,000.
+func commitConditionalReplacementBudget(ctx context.Context, target, tmpPath string, originalInfo os.FileInfo, metadata conditionalMetadata, next []byte, recoveryLimit int64) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -297,11 +303,11 @@ func commitConditionalReplacement(ctx context.Context, target, tmpPath string, o
 	if err := metadata.matches(original); err != nil {
 		return err
 	}
-	oldContent, err := io.ReadAll(io.LimitReader(original, 2000001))
+	oldContent, err := io.ReadAll(io.LimitReader(original, recoveryLimit+1))
 	if err != nil {
 		return err
 	}
-	if len(oldContent) > 2000000 {
+	if int64(len(oldContent)) > recoveryLimit {
 		return fmt.Errorf("original exceeds conditional replacement budget")
 	}
 	recoveryDirectory, recoveryDirHandle, err := newWindowsRecoveryDirectory(target)
