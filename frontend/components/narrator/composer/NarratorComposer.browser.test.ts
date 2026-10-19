@@ -684,6 +684,89 @@ test("arrow keys recall history from the first or last wrapped line, not from th
 		await close(page);
 	}
 }, 15000);
+test("boundary arrows keep the caret when history does not replace the text", async () => {
+	const page = await open();
+	try {
+		await loadDocument(page, textDocument("only one line"));
+		const start = await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.placeCaretAt("only one line", 0),
+		);
+		await settle(page);
+		await page.keyboard.press("ArrowDown");
+		await settle(page);
+		const afterDown = await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.caretProbe(),
+		);
+		expect(afterDown.text).toBe("only one line");
+		expect(afterDown.head).toBe(start.head);
+
+		const middle = await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.placeCaretAt("only one line", 4),
+		);
+		await settle(page);
+		await page.keyboard.press("ArrowUp");
+		await settle(page);
+		const afterUp = await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.caretProbe(),
+		);
+		expect(afterUp.text).toBe("only one line");
+		expect(afterUp.head).toBe(middle.head);
+
+		await loadDocument(page, linesDocument(["line1", "line2", "line3"]));
+		const lastLine = await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.placeCaretAt("line3", 0),
+		);
+		await settle(page);
+		await page.keyboard.press("ArrowDown");
+		await settle(page);
+		const stayed = await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.caretProbe(),
+		);
+		expect(stayed.text).toBe("line1\nline2\nline3");
+		expect(stayed.head).toBe(lastLine.head);
+	} finally {
+		await close(page);
+	}
+}, 15000);
+test("recalling a tall history entry scrolls its final caret into view", async () => {
+	const page = await open();
+	try {
+		const history = linesDocument(Array.from({ length: 16 }, (_, index) => `H${index + 1}`));
+		const historyText = history.paragraphs[0].children
+			.map((node) => (node.type === "text" ? node.text : "\n"))
+			.join("");
+		await page.evaluate(
+			(doc) => (window as unknown as FixtureWindow).fixture.remember(doc),
+			history,
+		);
+		await loadDocument(page, textDocument("draft"));
+		await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.placeCaretAt("draft", 0),
+		);
+		await settle(page);
+		await page.keyboard.press("ArrowUp");
+		await page.waitForFunction(
+			(expected) => (window as unknown as FixtureWindow).fixture.snapshot().text === expected,
+			{},
+			historyText,
+		);
+		await settle(page);
+		await settle(page);
+		const visible = await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.scrollProbe(),
+		);
+		expect(visible.text).toBe(historyText);
+		expect(visible.scrollHeight).toBeGreaterThan(visible.clientHeight + 8);
+		expect(visible.caretBottom).toBeLessThanOrEqual(visible.boxBottom + 2);
+		expect(visible.caretTop).toBeGreaterThanOrEqual(visible.boxTop - 2);
+		await page.keyboard.press("ArrowDown");
+		await page.waitForFunction(
+			() => (window as unknown as FixtureWindow).fixture.snapshot().text === "draft",
+		);
+	} finally {
+		await close(page);
+	}
+}, 15000);
 test("Down exits input history even when the recalled message has missing attachments", async () => {
 	const page = await open();
 	try {

@@ -65,11 +65,6 @@ export interface InlineComposerSelection {
 	empty?: boolean;
 	type?: "text" | "node" | "all";
 }
-/** Document positions of the browser caret, read from the DOM rather than editor state. */
-export interface InlineComposerCaret {
-	anchor: number;
-	head: number;
-}
 export interface InlineComposerTextContext {
 	text: string;
 	start: number;
@@ -91,12 +86,12 @@ export interface InlineComposerEditorHandle {
 	insertFiles(files: File[]): void;
 	getSelection(): InlineComposerSelection;
 	/**
-	 * Browser caret mapped through the current DOM. Editor state lags arrow keys until
-	 * `selectionchange`, so line-vs-history decisions must not read `state.selection`.
+	 * Collapsed caret on the first visual line (`up`) or the last (`down`), including soft wraps.
+	 * Read before the key's default action; editor state lags that action until selectionchange.
 	 */
-	readLiveCaret(): InlineComposerCaret | null;
-	/** Collapsed caret still on `before`'s visual line, including soft wraps and boundary jitter. */
-	caretStayedOnLine(before: InlineComposerCaret | null): boolean;
+	isCaretOnVerticalEdge(direction: "up" | "down"): boolean;
+	/** Put the caret at the end and scroll it into the composer viewport. */
+	revealCaretAtEnd(): void;
 	/** The caret's contiguous text run; atoms, hard breaks and paragraphs are boundaries. */
 	getTextContext(): InlineComposerTextContext | null;
 	captureSelectionBookmark(): InlineComposerSelectionBookmark;
@@ -806,38 +801,35 @@ export const InlineComposerEditor = forwardRef<
 		editor.view.dom.setAttribute("data-placeholder", props.placeholder ?? "");
 		editor.view.dom.setAttribute("aria-disabled", String(!!props.disabled));
 	}, [editor, props.placeholder, props.disabled, t]);
-	const readLiveCaret = (): InlineComposerCaret | null => {
-		if (!editor || editor.isDestroyed) return null;
-		const view = editor.view;
-		const selection = view.dom.ownerDocument.getSelection();
-		if (!selection?.anchorNode || !selection.focusNode || selection.rangeCount === 0) return null;
-		if (!view.dom.contains(selection.anchorNode) || !view.dom.contains(selection.focusNode))
-			return null;
+	const isCaretOnVerticalEdge = (direction: "up" | "down") => {
+		if (!editor || editor.isDestroyed || editor.view.dom.getClientRects().length === 0)
+			return false;
+		const selection = editor.state.selection;
+		if (!selection.empty || !(selection instanceof TextSelection)) return false;
 		try {
-			return {
-				anchor: view.posAtDOM(selection.anchorNode, selection.anchorOffset),
-				head: view.posAtDOM(selection.focusNode, selection.focusOffset),
-			};
+			const edge =
+				direction === "up"
+					? TextSelection.atStart(editor.state.doc).from
+					: TextSelection.atEnd(editor.state.doc).from;
+			const caret = editor.view.coordsAtPos(selection.head);
+			const boundary = editor.view.coordsAtPos(edge);
+			if (caret.bottom <= caret.top || boundary.bottom <= boundary.top) return false;
+			const lineHeight =
+				Number.parseFloat(getComputedStyle(editor.view.dom).lineHeight) ||
+				boundary.bottom - boundary.top;
+			return Math.abs(caret.top - boundary.top) < Math.max(4, lineHeight / 2);
 		} catch {
-			return null;
+			return false;
 		}
 	};
-	const caretStayedOnLine = (before: InlineComposerCaret | null) => {
-		const after = readLiveCaret();
-		if (!before || !after || before.anchor !== before.head || after.anchor !== after.head)
-			return false;
-		if (before.head === after.head) return true;
-		if (!editor || editor.isDestroyed) return false;
-		try {
-			const from = editor.view.coordsAtPos(before.head);
-			const to = editor.view.coordsAtPos(after.head);
-			const lineHeight =
-				Number.parseFloat(getComputedStyle(editor.view.dom).lineHeight) || to.bottom - to.top || 24;
-			// A boundary press can nudge the DOM caret onto a trailing break without leaving the line.
-			return Math.abs(from.top - to.top) < Math.max(4, lineHeight / 2);
-		} catch {
-			return false;
-		}
+	const revealCaretAtEnd = () => {
+		if (!editor || editor.isDestroyed) return;
+		editor.view.dispatch(
+			editor.state.tr
+				.setSelection(TextSelection.atEnd(editor.state.doc))
+				.scrollIntoView()
+				.setMeta("addToHistory", false),
+		);
 	};
 	useImperativeHandle(ref, () => ({
 		focus: () => {
@@ -870,8 +862,8 @@ export const InlineComposerEditor = forwardRef<
 		},
 		getSelection: () =>
 			editor ? selectionOf(editor.state.doc, editor.state.selection) : { start: 0, end: 0 },
-		readLiveCaret,
-		caretStayedOnLine,
+		isCaretOnVerticalEdge,
+		revealCaretAtEnd,
 		getTextContext: () => {
 			if (!editor || editor.isDestroyed) return null;
 			const { selection, doc } = editor.state;

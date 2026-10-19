@@ -1560,10 +1560,11 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				}
 				return;
 			}
-			// Up/down follow visual lines, including soft wraps. History runs only when that
-			// press leaves the caret on the same line (start of the text going up, end going
-			// down). Editor state still has the pre-key caret until selectionchange, which can
-			// land after this frame and make every ArrowUp look like the boundary.
+			// Up/down follow visual lines, including soft wraps. History runs only from the
+			// first line upward or the last line downward. Prevent that press before the
+			// browser handles it: contenteditable otherwise jumps to the end of the last line
+			// when history does not replace the text. Editor state is still the pre-key caret
+			// here; selectionchange applies the browser move later.
 			if (
 				(e.key === "ArrowUp" || e.key === "ArrowDown") &&
 				!e.shiftKey &&
@@ -1571,27 +1572,23 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				!e.metaKey &&
 				(!documentRef.current.assets.length || inputHistory.isBrowsing)
 			) {
-				const before = editorRef.current?.readLiveCaret() ?? null;
 				const direction = e.key === "ArrowUp" ? "up" : "down";
-				const recallIfCaretStayed = () => {
-					if (!editorRef.current?.caretStayedOnLine(before)) return;
-					const result = inputHistory.navigateEntry(
-						direction,
-						inputRef.current,
-						inputStateRef.current.fileReferences,
-						readPersistableDocument(inputStateRef.current.composerDocument),
-					);
-					if (result) {
-						restoreRemoteInput(result.text, result.fileReferences, result.composerDocument);
-						syncAttachedFiles(documentRef.current);
-						requestAnimationFrame(() =>
-							editorRef.current?.setSelection(Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER),
-						);
-					}
-				};
-				const frame = editorRef.current?.getElement()?.ownerDocument.defaultView;
-				if (frame) frame.requestAnimationFrame(recallIfCaretStayed);
-				else requestAnimationFrame(recallIfCaretStayed);
+				if (!editorRef.current?.isCaretOnVerticalEdge(direction)) return;
+				e.preventDefault();
+				const result = inputHistory.navigateEntry(
+					direction,
+					inputRef.current,
+					inputStateRef.current.fileReferences,
+					readPersistableDocument(inputStateRef.current.composerDocument),
+				);
+				if (!result) return;
+				restoreRemoteInput(result.text, result.fileReferences, result.composerDocument);
+				syncAttachedFiles(documentRef.current);
+				// Layout measures on the next frame; scroll once that height is committed.
+				const reveal = () => editorRef.current?.revealCaretAtEnd();
+				const win = editorRef.current?.getElement()?.ownerDocument.defaultView;
+				if (win) win.requestAnimationFrame(() => win.requestAnimationFrame(reveal));
+				else requestAnimationFrame(() => requestAnimationFrame(reveal));
 			}
 		};
 
