@@ -605,7 +605,7 @@
 	"queueMode_turn": "完成后继续",
 	"queueMode_turn_desc": "等待当前任务完成，再开始这条独立请求",
 	"queueMode_tool": "即时引导",
-	"queueMode_tool_desc": "在下一个安全边界补充到当前任务，不中止正在运行的工具",
+	"queueMode_tool_desc": "在下一个安全边界补充到当前任务，不打断正在输出的文本、思考和正在运行的工具",
 	"queueMode_interrupt": "紧急引导",
 	"queueMode_interrupt_desc": "中止正在运行的工具，立即将引导补充到当前任务；已产生的改动不会回滚",
 	"sendKeySettings": "快捷键设置",

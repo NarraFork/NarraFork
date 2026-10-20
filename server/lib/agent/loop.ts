@@ -504,6 +504,18 @@ function hasPersistableStreamContent(parsed: ParsedStreamEvent): boolean {
 }
 
 /**
+ * Whether this event starts a tool call the stream has not announced yet: the block boundary
+ * where live guidance may end a response without cutting text or reasoning. An event that also
+ * carries text/reasoning is never a cut point, so no model prose is dropped with it.
+ */
+function opensNewToolCall(parsed: ParsedStreamEvent, known: ReadonlyMap<string, unknown>): boolean {
+	if (parsed.text || parsed.reasoning || parsed.redactedThinking) return false;
+	const chunkId = parsed.toolUseChunk?.toolUseId;
+	if (chunkId && !known.has(chunkId)) return true;
+	return parsed.toolUses?.some((tu) => !known.has(tu.toolUseId)) ?? false;
+}
+
+/**
  * Any parsed provider event proves that the upstream response stream is alive.
  *
  * This is deliberately broader than isMeaningfulStreamEvent(): Anthropic's
@@ -4428,13 +4440,25 @@ async function* agentLoopInMetadataSnapshot(
 				let updateReasoningInterrupted = false;
 				const updateReasoningStop = new Error("Reasoning paused for graceful restart");
 				const guidanceStop = new Error("Stopped for immediate guidance");
+				// Live guidance must not truncate output the user is reading. Until this attempt
+				// has streamed content, cancelling loses nothing; afterwards the response is cut
+				// only where a new tool call starts, so every text/reasoning block before it is
+				// complete. Urgent guidance keeps cancelling immediately.
+				let attemptStreamedContent = false;
+				const guidanceCutsNow = () =>
+					config.urgentGuidanceSignal?.aborted === true || !attemptStreamedContent;
 				const onGuidanceAbort = () => {
 					observeSoftStopForTurn();
 					streamExecutionOpen = false;
-					attemptAbort.abort(guidanceStop);
+					if (guidanceCutsNow()) attemptAbort.abort(guidanceStop);
 				};
+				// Urgent guidance can follow live guidance whose combined signal already fired.
+				const onUrgentGuidanceAbort = () => attemptAbort.abort(guidanceStop);
 				if (guidanceSignal?.aborted) onGuidanceAbort();
 				else guidanceSignal?.addEventListener("abort", onGuidanceAbort, { once: true });
+				config.urgentGuidanceSignal?.addEventListener("abort", onUrgentGuidanceAbort, {
+					once: true,
+				});
 				const configuredToolLimit = config.maxToolCallsPerResponse ?? 32;
 				const toolCallLimit = Number.isFinite(configuredToolLimit)
 					? Math.min(128, Math.max(1, Math.floor(configuredToolLimit)))
@@ -4636,7 +4660,15 @@ async function* agentLoopInMetadataSnapshot(
 						) {
 							responseActivity.setReasoningAbort(null);
 						}
-						if (guidanceSignal?.aborted) throw guidanceStop;
+						if (
+							guidanceSignal?.aborted &&
+							(guidanceCutsNow() || opensNewToolCall(parsed, toolOrderIdentities))
+						) {
+							attemptAbort.abort(guidanceStop);
+							throw guidanceStop;
+						}
+						if (parsed.redactedThinking || hasPersistableStreamContent(parsed))
+							attemptStreamedContent = true;
 						throwIfUserAborted();
 						// Stop dispatch before yielding/awaiting error publication. A finishing
 						// tool must not release more queued work while failure handling runs.
@@ -6236,6 +6268,7 @@ async function* agentLoopInMetadataSnapshot(
 					clearStreamIdleTimer();
 					config.signal.removeEventListener("abort", onParentAbort);
 					guidanceSignal?.removeEventListener("abort", onGuidanceAbort);
+					config.urgentGuidanceSignal?.removeEventListener("abort", onUrgentGuidanceAbort);
 					startFirstTokenTimerForAttempt = undefined;
 				}
 

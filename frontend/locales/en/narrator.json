@@ -605,7 +605,7 @@
 	"queueMode_turn": "Continue after completion",
 	"queueMode_turn_desc": "Wait for the current task to finish, then start this independent request",
 	"queueMode_tool": "Live guidance",
-	"queueMode_tool_desc": "Add guidance to the current task at the next safe boundary without stopping running tools",
+	"queueMode_tool_desc": "Add guidance to the current task at the next safe boundary without cutting off text, reasoning, or running tools",
 	"queueMode_interrupt": "Urgent guidance",
 	"queueMode_interrupt_desc": "Stop running tools and immediately guide the current task; existing changes are not rolled back",
 	"sendKeySettings": "Keyboard shortcuts",

@@ -270,8 +270,8 @@ Retry with complete, valid JSON containing all required parameters. If a large i
 			"工具参数无效或缺失，未执行。请提供完整、有效的 JSON 及全部必填参数后重试。这不一定是输出或 token 上限导致；必要时将大输入拆分为更小的调用。",
 	},
 	"tool.skippedForSoftStop": {
-		en: "Tool not executed because queued user feedback requested a safe stop after the previous tool.",
-		"zh-CN": "因排队中的用户反馈要求在上一个工具后安全停止，此工具未执行。",
+		en: "Tool not executed: queued user input asked to stop at a safe point before this call started.",
+		"zh-CN": "排队中的用户输入要求在安全点停止，此工具在开始前被跳过，未执行。",
 	},
 	"tool.interruptionContinue": {
 		en: "Your previous response was cut off by the completion token limit. Please continue from where you left off.",

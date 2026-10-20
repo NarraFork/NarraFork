@@ -222,17 +222,45 @@ describe("event-driven immediate guidance", () => {
 		});
 	}
 
-	for (const phase of ["before-first-token", "text", "reasoning", "tool-input"] as const) {
-		test(`cancels a silent provider during ${phase} without retry or whole-run abort`, async () => {
+	test("cancels a provider that has not streamed anything without retry or whole-run abort", async () => {
+		const guidance = new AbortController();
+		const parent = new AbortController();
+		script = async function* (params) {
+			queueMicrotask(() => guidance.abort());
+			await waitForAbort(params.signal);
+		};
+		const events = await run({
+			guidanceSignal: guidance.signal,
+			signal: parent.signal,
+			maxTransientRetries: 10,
+		});
+		expect(attempts).toBe(1);
+		expect(parent.signal.aborted).toBe(false);
+		expect(started).toEqual([]);
+		expectSuccess(events);
+		expect(events.at(-1)?.type).toBe("turn_complete");
+		expect(events.filter((e) => e.type === "assistant_message")).toEqual([]);
+	});
+
+	for (const phase of ["text", "reasoning", "tool-input"] as const) {
+		test(`lets the ${phase} block finish and cuts at the next tool call`, async () => {
 			const guidance = new AbortController();
 			const parent = new AbortController();
+			let providerSignal: AbortSignal | undefined;
 			script = async function* (params) {
+				providerSignal = params.signal;
 				if (phase === "text") yield { text: "partial answer" };
 				if (phase === "reasoning") yield { reasoning: "partial thought", reasoningOutputIndex: 0 };
 				if (phase === "tool-input")
 					yield { toolUseChunk: { toolUseId: "partial", name: "Read", input: '{"value":"' } };
-				queueMicrotask(() => guidance.abort());
-				await waitForAbort(params.signal);
+				guidance.abort();
+				await nextTick();
+				expect(params.signal.aborted).toBe(false);
+				if (phase === "text") yield { text: ", completed" };
+				if (phase === "reasoning") yield { reasoning: " completed", reasoningOutputIndex: 0 };
+				if (phase === "tool-input") yield { toolUses: [tool("Read", "partial", 0)] };
+				yield { toolUses: [tool("Write", "cut", 1)] };
+				throw new Error("Stream continued past the guidance cut point");
 			};
 			const events = await run({
 				guidanceSignal: guidance.signal,
@@ -240,22 +268,73 @@ describe("event-driven immediate guidance", () => {
 				maxTransientRetries: 10,
 			});
 			expect(attempts).toBe(1);
+			expect(providerSignal?.aborted).toBe(true);
 			expect(parent.signal.aborted).toBe(false);
 			expect(started).toEqual([]);
 			expectSuccess(events);
 			expect(events.at(-1)?.type).toBe("turn_complete");
-			if (phase === "before-first-token")
-				expect(events.filter((e) => e.type === "assistant_message")).toEqual([]);
+			const message = events.find((e) => e.type === "assistant_message");
+			expect(
+				message?.type === "assistant_message" && message.toolUses.map((t) => t.toolUseId),
+			).toEqual(phase === "tool-input" ? ["partial"] : []);
+			expect(events.some((e) => e.type === "tool_result" && e.toolUseId === "cut")).toBe(false);
 			if (phase === "text")
-				expect(
-					events.some((e) => e.type === "assistant_message" && e.text === "partial answer"),
-				).toBe(true);
+				expect(message?.type === "assistant_message" && message.text).toBe(
+					"partial answer, completed",
+				);
 			if (phase === "reasoning")
 				expect(
-					events.some((e) => e.type === "block_complete" && e.block.type === "reasoning"),
+					events.some(
+						(e) =>
+							e.type === "block_complete" &&
+							e.block.type === "reasoning" &&
+							JSON.stringify(e.block).includes("partial thought completed"),
+					),
 				).toBe(true);
+			if (phase === "tool-input")
+				expect(
+					events.find((e) => e.type === "tool_result" && e.toolUseId === "partial"),
+				).toMatchObject({ metadata: { skippedForSoftStop: true } });
 		});
 	}
+
+	test("a response that ends on its own after guidance keeps all of its output", async () => {
+		const guidance = new AbortController();
+		script = async function* () {
+			yield { text: "first half" };
+			guidance.abort();
+			await nextTick();
+			yield { text: " and second half" };
+		};
+		const events = await run({ guidanceSignal: guidance.signal });
+		expect(attempts).toBe(1);
+		expectSuccess(events);
+		expect(events.find((e) => e.type === "assistant_message")).toMatchObject({
+			text: "first half and second half",
+		});
+		expect(events.at(-1)?.type).toBe("turn_complete");
+	});
+
+	test("urgent guidance after live guidance still cancels a stalled stream", async () => {
+		const guidance = new AbortController();
+		const urgent = new AbortController();
+		script = async function* (params) {
+			yield { text: "partial" };
+			guidance.abort();
+			await nextTick();
+			expect(params.signal.aborted).toBe(false);
+			queueMicrotask(() => urgent.abort());
+			await waitForAbort(params.signal);
+		};
+		const events = await run({
+			guidanceSignal: guidance.signal,
+			urgentGuidanceSignal: urgent.signal,
+		});
+		expect(attempts).toBe(1);
+		expectSuccess(events);
+		expect(events.find((e) => e.type === "assistant_message")).toMatchObject({ text: "partial" });
+		expect(events.at(-1)?.type).toBe("turn_complete");
+	});
 
 	test("preserves running parallel signals and drains every result exactly once", async () => {
 		const guidance = new AbortController();
@@ -271,6 +350,7 @@ describe("event-driven immediate guidance", () => {
 			expect(toolSignals.get("b")?.aborted).toBe(false);
 			a.release();
 			b.release();
+			yield { toolUses: [tool("Write", "cut", 9)] };
 			await waitForAbort(params.signal);
 		};
 		const events = await run({ guidanceSignal: guidance.signal });
@@ -294,6 +374,7 @@ describe("event-driven immediate guidance", () => {
 			yield { toolUses: [tool("Read", "permission", 0)] };
 			await permissionEntered.promise;
 			guidance.abort();
+			yield { toolUses: [tool("Write", "cut", 9)] };
 			await waitForAbort(params.signal);
 		};
 		const events = await run({
@@ -322,6 +403,7 @@ describe("event-driven immediate guidance", () => {
 			await beforeEntered.promise;
 			guidance.abort();
 			releaseBefore.resolve();
+			yield { toolUses: [tool("Write", "cut", 9)] };
 			await waitForAbort(params.signal);
 		};
 		const events = await run({
@@ -357,6 +439,7 @@ describe("event-driven immediate guidance", () => {
 			await a.started;
 			guidance.abort();
 			a.release();
+			yield { toolUses: [tool("Write", "cut", 9)] };
 			await waitForAbort(params.signal);
 		};
 		try {
@@ -389,6 +472,7 @@ describe("event-driven immediate guidance", () => {
 				if (mode === "urgent-post-stream") return;
 				if (mode === "urgent") urgent.abort();
 				else guidance.abort();
+				yield { toolUses: [tool("Write", "cut", 9)] };
 				await waitForAbort(params.signal);
 			};
 			try {
