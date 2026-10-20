@@ -1151,10 +1151,14 @@ async function sendListStateSnapshot(ws: NarratorWS, narratorIds: string[]): Pro
 								activeBackgroundServiceCount: freshCounts.activeServiceCount,
 							}
 						: {}),
-					// Snapshot replay of the done-transition flag (see sendStatusSnapshot):
-					// derive from the same fresh, flushed occupancy read so the client
-					// makes the same sound/PWA suppression decision as for the live event.
-					...(freshCounts &&
+					// Snapshot replay of the done-transition flag (see sendStatusSnapshot).
+					// The flag comes from the flushed wake-work read above. It must not
+					// depend on the badge counts being fresh: a list-version bump during
+					// this read correctly drops the counts (a newer count frame wins),
+					// but nothing else carries the suppression flag. Dropping it here
+					// makes a resubscribe play sound/PWA for a done that is still waiting
+					// on wake-capable background work.
+					...(counts &&
 					wakeWorkActiveIds.has(id) &&
 					item.status === "idle" &&
 					item.substatus?.includes("unread")

@@ -1,4 +1,4 @@
-import { afterAll, afterEach, describe, expect, it, mock } from "bun:test";
+import { afterAll, afterEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { eq } from "drizzle-orm";
 import {
 	NARRATOR_WS_MAX_SUBSCRIPTIONS_PER_CONNECTION,
@@ -817,5 +817,53 @@ describe("narrator WebSocket backgroundWorkActive snapshot flag", () => {
 			activeBackgroundWorkCount: 1,
 		});
 		expect(item).not.toHaveProperty("backgroundWorkActive");
+	});
+
+	it("keeps the suppression flag when badge counts go stale during the snapshot read", async () => {
+		await seedNarrators();
+		seedUnreadNarrator("narrator-unread-stale-counts");
+		await seedRunningTask("snapshot-flag-stale", "narrator-unread-stale-counts", "task");
+
+		const realGet = backgroundTaskService.getListVersion.bind(backgroundTaskService);
+		const realCount =
+			backgroundTaskService.countActiveKindsByParentBatch.bind(backgroundTaskService);
+		let bumped = false;
+		const versionSpy = spyOn(backgroundTaskService, "getListVersion").mockImplementation(
+			(id: string) => {
+				const current = realGet(id);
+				// versionsAtRead runs before the count flush returns. A bump after that
+				// flush is what a count frame published during the read looks like.
+				return bumped ? current + 1 : current;
+			},
+		);
+		const countSpy = spyOn(
+			backgroundTaskService,
+			"countActiveKindsByParentBatch",
+		).mockImplementation(async (ids: string[]) => {
+			const counts = await realCount(ids);
+			bumped = true;
+			return counts;
+		});
+		try {
+			const { ws, sent } = openFakeWs();
+			await handleNarratorWS.message(ws, {
+				type: "subscribe",
+				kind: "list",
+				narratorIds: ["narrator-unread-stale-counts"],
+			});
+
+			const item = (sent[0]?.items as Record<string, unknown>[])[0];
+			expect(item).toMatchObject({
+				narratorId: "narrator-unread-stale-counts",
+				status: "idle",
+				substatus: ["unread"],
+				backgroundWorkActive: true,
+			});
+			// Stale badge numbers are omitted so the live count frame wins.
+			expect(item).not.toHaveProperty("activeBackgroundWorkCount");
+		} finally {
+			versionSpy.mockRestore();
+			countSpy.mockRestore();
+		}
 	});
 });

@@ -1,12 +1,13 @@
 /**
  * Done-transition background-work flag on `narrator:attention` / `status_change`.
  *
- * When a turn finishes (idle + unread) while NON-SERVICE background work is
- * still running (background bash tasks, background subagents, transfers), the
- * attention event and the WS status_change broadcast carry
- * `backgroundWorkActive: true` so notification channels (IM webhooks, recent-tab
- * IM pings, sound, PWA) can suppress the ping while hooks still observe the
- * event. A pure service must NOT suppress; neither does an empty background.
+ * When a turn finishes (idle + unread) while wake-capable background work is
+ * still running (background bash tasks, background subagents), the attention
+ * event and the WS status_change broadcast carry `backgroundWorkActive: true`
+ * so notification channels (IM webhooks, recent-tab IM pings, sound, PWA) can
+ * suppress the ping while hooks still observe the event. A pure service must
+ * NOT suppress, and neither must a transfer: its terminal commit skips
+ * publication, so nothing would re-raise a swallowed done.
  */
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";

@@ -44,8 +44,9 @@ export interface NarratorListStateSnapshotItem {
 	activeBackgroundServiceCount?: number;
 	/**
 	 * Present when this snapshot shows a done-state (idle + unread) whose
-	 * non-service background work is still running — the client marks unread but
-	 * suppresses the sound/PWA notification, mirroring the live status_change flag.
+	 * wake-capable background work is still running (bash tasks / subagents —
+	 * never transfers or services). The client marks unread but suppresses the
+	 * sound/PWA notification, mirroring the live status_change flag.
 	 */
 	backgroundWorkActive?: boolean;
 }

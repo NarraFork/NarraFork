@@ -252,6 +252,55 @@ describe("background occupancy coordinator", () => {
 		});
 	});
 
+	test("a finished agent projection kept alive by a transfer does not swallow the parent", async () => {
+		const { source, store } = fixture();
+		// The agent session already published its terminal wake. The row stays
+		// indexed only because the child is still occupied — here, by a transfer
+		// that will never publish. Counting it would suppress the parent's done
+		// with no later turn to re-raise it.
+		source.tasks.set(
+			"agent-done",
+			task("agent-done", "root", {
+				type: "agent",
+				status: "completed",
+				subagentNarratorId: "child",
+			}),
+		);
+		source.tasks.set("xfer", task("xfer", "child", { type: "transfer" }));
+		await store.start();
+
+		expect(store.countActiveWakeWork("root")).toBe(0);
+		expect(store.countActiveWakeWork("child")).toBe(0);
+		// The badge still shows the retained projection as work on the parent.
+		expect(store.snapshot(["root"]).counts.get("root")?.activeWorkCount).toBe(1);
+	});
+
+	test("a running subagent still counts while its only child task is a transfer", async () => {
+		const { source, store } = fixture();
+		source.tasks.set(
+			"agent-task",
+			task("agent-task", "root", { type: "agent", subagentNarratorId: "child" }),
+		);
+		source.tasks.set("xfer", task("xfer", "child", { type: "transfer" }));
+		await store.start();
+
+		expect(store.countActiveWakeWork("root")).toBe(1);
+		expect(store.countActiveWakeWork("child")).toBe(0);
+	});
+
+	test("a legacy narrator occupied only by a transfer does not count as wake-work", async () => {
+		const { source, store } = fixture();
+		source.narrators.set(
+			"legacy-bg",
+			narrator("legacy-bg", "root", { isBackground: true, status: "idle" }),
+		);
+		source.tasks.set("xfer", task("xfer", "legacy-bg", { type: "transfer" }));
+		await store.start();
+
+		expect(store.countActiveWakeWork("root")).toBe(0);
+		expect(store.snapshot(["root"]).counts.get("root")?.activeWorkCount).toBeGreaterThan(0);
+	});
+
 	test("dirty events arriving during shadow rebuild are replayed before publish", async () => {
 		const { source, store } = fixture();
 		source.tasks.set("work", task("work", "leaf"));
