@@ -50,8 +50,8 @@ const LATE_PATCHED_COLUMNS: ReadonlySet<string> = new Set([
 	"narrator_tool_calls.execution_targets_json",
 ]);
 
-afterAll(() => {
-	for (const projectId of openedProjects.splice(0)) projectDbManager.close(projectId);
+afterAll(async () => {
+	for (const projectId of openedProjects.splice(0)) await projectDbManager.close(projectId);
 	for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
 });
 
@@ -61,12 +61,12 @@ afterAll(() => {
  * `openForGitPath` is what `projects.ts` calls when a project is created, so this exercises the
  * same DDL and the same schema patches a real user's file gets — not a copy of them.
  */
-function freshArchive(): { conn: Database; gitPath: string } {
+async function freshArchive(): Promise<{ conn: Database; gitPath: string }> {
 	const gitPath = mkdtempSync(join(tmpdir(), "nf-manifest-"));
 	tempDirs.push(gitPath);
 	const projectId = generateId();
 	openedProjects.push(projectId);
-	projectDbManager.openForGitPath(projectId, gitPath);
+	await projectDbManager.openForGitPath(projectId, gitPath);
 	// Reopened read-only rather than reusing the cached handle: this must observe the file as it
 	// exists on disk, which is what an importing machine sees.
 	return { conn: new Database(getProjectDbPath(gitPath), { readonly: true }), gitPath };
@@ -78,9 +78,9 @@ function fileColumns(conn: Database, table: string): string[] {
 	);
 }
 
-describe("the manifest matches a real archive file", () => {
-	test("every manifest table exists in a freshly created archive", () => {
-		const { conn } = freshArchive();
+describe("the manifest matches a real archive file", async () => {
+	test("every manifest table exists in a freshly created archive", async () => {
+		const { conn } = await freshArchive();
 		try {
 			const tables = new Set(
 				(
@@ -98,8 +98,8 @@ describe("the manifest matches a real archive file", () => {
 		}
 	});
 
-	test("every manifest column exists once both patch sites have run", () => {
-		const { conn } = freshArchive();
+	test("every manifest column exists once both patch sites have run", async () => {
+		const { conn } = await freshArchive();
 		try {
 			const missing: string[] = [];
 			for (const table of ARCHIVE_TABLE_ORDER) {
@@ -119,7 +119,7 @@ describe("the manifest matches a real archive file", () => {
 		}
 	});
 
-	test("the late-patched columns are exactly the ones the sync layer adds", () => {
+	test("the late-patched columns are exactly the ones the sync layer adds", async () => {
 		// The archive schema is patched in TWO places, and this pins which columns come from
 		// which, because the split is easy to misread as an omission:
 		//
@@ -134,7 +134,7 @@ describe("the manifest matches a real archive file", () => {
 		// why the runtime intersection exists. Harmless, but it must be asserted rather than
 		// assumed: if the sync layer ever stopped patching, these columns would silently vanish
 		// from newly written archives and the manifest would keep claiming them.
-		const { conn } = freshArchive();
+		const { conn } = await freshArchive();
 		try {
 			const absent = new Set<string>();
 			for (const table of ARCHIVE_TABLE_ORDER) {
@@ -149,8 +149,8 @@ describe("the manifest matches a real archive file", () => {
 		}
 	});
 
-	test("no archive column is missing from the manifest", () => {
-		const { conn } = freshArchive();
+	test("no archive column is missing from the manifest", async () => {
+		const { conn } = await freshArchive();
 		try {
 			const unlisted: string[] = [];
 			for (const table of ARCHIVE_TABLE_ORDER) {
@@ -171,8 +171,8 @@ describe("the manifest matches a real archive file", () => {
 		}
 	});
 
-	test("the manifest's column ORDER matches the file's, so a diff reads as a diff", () => {
-		const { conn } = freshArchive();
+	test("the manifest's column ORDER matches the file's, so a diff reads as a diff", async () => {
+		const { conn } = await freshArchive();
 		try {
 			for (const table of ARCHIVE_TABLE_ORDER) {
 				// Kept in DDL order deliberately (see the manifest header). This is not a
@@ -195,7 +195,7 @@ describe("the manifest matches a real archive file", () => {
 	});
 });
 
-describe("the manifest against the current main schema", () => {
+describe("the manifest against the current main schema", async () => {
 	test("the main database can supply every manifest column", async () => {
 		const unsupported: string[] = [];
 		for (const table of ARCHIVE_TABLE_ORDER) {
@@ -235,7 +235,7 @@ describe("the manifest against the current main schema", () => {
 	});
 });
 
-describe("reads are bounded", () => {
+describe("reads are bounded", async () => {
 	test("a page request is clamped and reports whether more remain", async () => {
 		// The contract's paging promise, exercised against the real main database. An empty table
 		// is the honest case here — the assertion is about the SHAPE (never unbounded, cursor

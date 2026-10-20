@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 /**
  * Deliver a UI spec edit to a working narrator as a cut-in user message.
  *
@@ -101,10 +102,12 @@ export function formatSpecEditInterjection(update: PendingSpecUpdate, locale: Lo
 async function resolveCreator(userId: string | null): Promise<BufferCreator | null> {
 	if (!userId) return null;
 	try {
-		const user = await db.query.users.findFirst({
-			where: eq(users.id, userId),
-			columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
-		});
+		const user = await readQuery(
+			db.query.users.findFirst({
+				where: eq(users.id, userId),
+				columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
+			}),
+		);
 		return user ?? null;
 	} catch (err) {
 		// Attribution is cosmetic; never block delivery on it.
@@ -124,11 +127,11 @@ async function resolveCreator(userId: string | null): Promise<BufferCreator | nu
  * `routes/narrators.ts`). Skipping it would leave the interjected message
  * invisible in the narrator panel until a manual refresh.
  */
-function broadcastBufferSnapshot(narratorId: string): void {
+async function broadcastBufferSnapshot(narratorId: string): Promise<void> {
 	broadcastToNarrator(narratorId, {
 		type: "buffer_set",
 		narratorId,
-		messages: toBufferSummary(getBufferedMessages(narratorId)),
+		messages: toBufferSummary(await getBufferedMessages(narratorId)),
 	});
 }
 
@@ -156,10 +159,10 @@ export async function interjectSpecEditAsUserMessage(
 	// Rewrite the previous cut-in when it is still queued, so rapid saves collapse
 	// into one message at its original position rather than stacking in reverse.
 	const trackedId = specEditInterjectIds.get(narratorId);
-	if (trackedId && getBufferedMessages(narratorId).some((msg) => msg.id === trackedId)) {
+	if (trackedId && (await getBufferedMessages(narratorId)).some((msg) => msg.id === trackedId)) {
 		if (await updateBufferedMessage(narratorId, trackedId, text)) {
 			requestBufferedMessageSoftStop(narratorId);
-			broadcastBufferSnapshot(narratorId);
+			await broadcastBufferSnapshot(narratorId);
 			return { delivered: "interjected" };
 		}
 	}
@@ -185,6 +188,6 @@ export async function interjectSpecEditAsUserMessage(
 
 	specEditInterjectIds.set(narratorId, result.id);
 	requestBufferedMessageSoftStop(narratorId);
-	broadcastBufferSnapshot(narratorId);
+	await broadcastBufferSnapshot(narratorId);
 	return { delivered: "interjected" };
 }

@@ -1,4 +1,5 @@
 import { describe, expect, spyOn, test } from "bun:test";
+import { logger } from "../lib/logger";
 import type { GitStatusSummary } from "./git-service";
 import {
 	GitStatusQueryCoordinator,
@@ -30,6 +31,83 @@ function deferred<T>() {
 const turn = () => new Promise<void>((resolve) => setImmediate(resolve));
 
 describe("Git status query coordination", () => {
+	test("slow diagnostics separate queue and loader wall time without changing shared results", async () => {
+		const c = new GitStatusQueryCoordinator({ concurrency: 1, queued: 8, timeoutMs: 30_000 });
+		let now = 0;
+		const clock = spyOn(performance, "now").mockImplementation(() => now);
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		const first = deferred<GitStatusSummary>();
+		const second = deferred<GitStatusSummary>();
+		try {
+			const a = c.query("a", () => first.promise);
+			await turn();
+			now = 100;
+			const b = c.query("b", () => second.promise);
+			const shared = c.query("b", () => Promise.reject(new Error("must share")));
+			now = 1200;
+			first.resolve(summary());
+			await a;
+			await turn();
+			now = 1600;
+			second.resolve(summary("second"));
+			expect(await b).toBe(await shared);
+			expect(warn.mock.calls[1]?.[1]).toMatchObject({
+				elapsedMs: 1500,
+				queueMs: 1100,
+				loaderMs: 400,
+				source: "miss",
+				readers: 2,
+				peakReaders: 2,
+				shared: true,
+				runningAtStart: 1,
+				trailing: false,
+				outcome: "success",
+			});
+			await c.query("b", () => Promise.reject(new Error("must cache")));
+			expect(warn).toHaveBeenCalledTimes(2);
+		} finally {
+			c.clear();
+			clock.mockRestore();
+			warn.mockRestore();
+		}
+	});
+
+	test("slow errors and queued cancellation preserve rejection and zero loader time", async () => {
+		const c = new GitStatusQueryCoordinator({ concurrency: 1, queued: 8, timeoutMs: 30_000 });
+		let now = 0;
+		const clock = spyOn(performance, "now").mockImplementation(() => now);
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		const pending = deferred<GitStatusSummary>();
+		try {
+			const error = new Error("failure");
+			const active = c.query("active", () => pending.promise);
+			const rejected = active.catch((reason) => reason);
+			await turn();
+			const controller = new AbortController();
+			const queued = c.query("queued", async () => summary(), { signal: controller.signal });
+			const cancelled = queued.catch((reason) => reason);
+			now = 1500;
+			controller.abort(error);
+			expect(await cancelled).toBe(error);
+			expect(warn.mock.calls[0]?.[1]).toMatchObject({
+				queueMs: 1500,
+				loaderMs: 0,
+				outcome: "cancelled",
+			});
+			pending.reject(error);
+			expect(await rejected).toBe(error);
+			await turn();
+			expect(warn.mock.calls[1]?.[1]).toMatchObject({
+				queueMs: 0,
+				loaderMs: 1500,
+				outcome: "error",
+			});
+		} finally {
+			c.clear();
+			clock.mockRestore();
+			warn.mockRestore();
+		}
+	});
 	test("ten readers share one fresh query and staggered reads reuse the default 3s result", async () => {
 		const c = new GitStatusQueryCoordinator();
 		const clock = spyOn(Date, "now");

@@ -6,6 +6,7 @@ import type { NarratorServerMessage } from "../websocket/narrator-ws-types";
 import type { ApiRequestDiagnostics } from "./agent/types";
 import type { PublicCodexQuotaOverview } from "./codex-manager";
 import { logger } from "./logger";
+import { waitForShutdownWork } from "./shutdown-activity";
 
 // === Event type definitions ===
 
@@ -535,8 +536,37 @@ type EventOfType<T extends NarraForkEventType> = Extract<NarraForkEvent, { type:
 
 type EventHandler<T extends NarraForkEventType> = (event: EventOfType<T>) => void;
 
-class NarraForkEventBus {
+export class NarraForkEventBus {
 	private emitter = new EventEmitter();
+	private pending = new Set<Promise<void>>();
+	private shuttingDown = false;
+	private failureCount = 0;
+	private firstError: unknown;
+
+	beginShutdown(): void {
+		this.shuttingDown = true;
+	}
+
+	getShutdownState(): { pending: number; failureCount: number; firstError: unknown } {
+		return {
+			pending: this.pending.size,
+			failureCount: this.failureCount,
+			firstError: this.firstError,
+		};
+	}
+
+	async drainForShutdown(signal: AbortSignal): Promise<void> {
+		signal.throwIfAborted();
+		while (this.pending.size > 0) {
+			await waitForShutdownWork(Promise.all([...this.pending]), signal);
+			signal.throwIfAborted();
+		}
+	}
+
+	private recordFailure(error: unknown): void {
+		if (!this.shuttingDown) return;
+		if (this.failureCount++ === 0) this.firstError = error;
+	}
 
 	constructor() {
 		// Allow many listeners (multiple WS clients + logger)
@@ -561,15 +591,22 @@ class NarraForkEventBus {
 					// If a listener returns a Promise, catch its errors to prevent
 					// unhandled rejections (without changing emit's sync semantics)
 					if (result && typeof (result as Promise<void>).catch === "function") {
-						(result as Promise<void>).catch((err) => {
-							logger.error("Async event listener error", {
-								eventType: event.type,
-								listenedEvent: eventName,
-								error: err instanceof Error ? err.message : String(err),
+						const work = Promise.resolve(result)
+							.catch((err) => {
+								this.recordFailure(err);
+								logger.error("Async event listener error", {
+									eventType: event.type,
+									listenedEvent: eventName,
+									error: err instanceof Error ? err.message : String(err),
+								});
+							})
+							.finally(() => {
+								this.pending.delete(work);
 							});
-						});
+						this.pending.add(work);
 					}
 				} catch (err) {
+					this.recordFailure(err);
 					logger.error("Event listener threw an error", {
 						eventType: event.type,
 						listenedEvent: eventName,

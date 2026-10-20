@@ -126,7 +126,8 @@ export function assertBashActivityProtectionReady(): void {
  * Called during graceful shutdown to prevent ghost processes holding ports
  * (especially on Windows where child processes can outlive the parent).
  */
-export async function killAllBashProcesses(): Promise<void> {
+export function cancelAllBashProcessesForShutdown(): void {
+	backgroundTaskService.freezeForShutdown();
 	// Kill foreground bash processes
 	const entries = [...runningBashProcesses.entries()];
 	for (const [id, entry] of entries) {
@@ -134,13 +135,18 @@ export async function killAllBashProcesses(): Promise<void> {
 			clearTimeout(entry.timer);
 			entry.setTimedOut();
 			entry.kill();
-		} catch {
-			// best effort — process may already be gone
+		} catch (error) {
+			backgroundTaskService.reportShutdownFailure(error);
 		}
 		runningBashProcesses.delete(id);
 	}
-	// Kill background bash tasks via the service
-	await backgroundTaskService.killAll();
+	// Send background cancellation in the same turn, before waiting for any tail.
+	backgroundTaskService.cancelAllForShutdown();
+}
+
+export async function killAllBashProcesses(signal?: AbortSignal): Promise<void> {
+	cancelAllBashProcessesForShutdown();
+	await backgroundTaskService.drainForShutdown(signal);
 }
 
 /**
@@ -222,6 +228,7 @@ async function prepareBashExecution(
 			// The coordinator retains its recovery hold on persistence failure.
 			// Never retry an uncertain outcome as "finished" or let a detached
 			// callback's rejection discard the only lifecycle observer.
+			backgroundTaskService.reportShutdownFailure(error);
 			logger.warn("Bash workspace activity settlement requires recovery", {
 				scopeId: activity.scope.id,
 				outcome,
@@ -231,6 +238,7 @@ async function prepareBashExecution(
 	};
 	return {
 		async start(signal) {
+			backgroundTaskService.assertExecutionAdmission();
 			if (started) throw new Error("Bash execution was already dispatched");
 			started = true;
 			let handle: ExecHandle;
@@ -250,9 +258,12 @@ async function prepareBashExecution(
 				end("finished");
 				throw error;
 			}
-			void (handle.whenSettled ?? handle.exited).then(
-				() => end("finished"),
-				() => end("unknown"),
+			backgroundTaskService.trackBashLifecycle(
+				(handle.whenSettled ?? handle.exited).then(
+					() => end("finished"),
+					() => end("unknown"),
+				),
+				() => !handle.isExited(),
 			);
 			return handle;
 		},
@@ -429,6 +440,7 @@ export const bashTool: ToolDefinition = {
 			.overwrite((input) => ({ ...input, background_kind: input.background_kind ?? "task" })),
 	),
 	async execute(args, ctx): Promise<ToolResult> {
+		backgroundTaskService.assertExecutionAdmission();
 		ctx = {
 			...ctx,
 			executionTarget: ctx.executionTarget && Object.freeze({ ...ctx.executionTarget }),
@@ -561,6 +573,7 @@ export const bashTool: ToolDefinition = {
 			const detachedResult = new Promise<ToolResult>((resolve) => {
 				resolveDetached = resolve;
 			});
+			let foregroundHandle: ExecHandle | undefined;
 			const runForeground = async (): Promise<ToolResult> => {
 				// Backends may retain start(signal) until actual process settlement.
 				// Give them an execution-owned signal and only forward foreground aborts
@@ -572,6 +585,7 @@ export const bashTool: ToolDefinition = {
 				let handle: ExecHandle;
 				try {
 					handle = await execution.start(processAbort.signal);
+					foregroundHandle = handle;
 				} catch (error) {
 					ctx.signal.removeEventListener("abort", forwardAbort);
 					throw error;
@@ -732,7 +746,9 @@ export const bashTool: ToolDefinition = {
 						liveEmitTimer = null;
 						pendingLiveEmit = false;
 						backgroundTaskService.registerAbortController(taskId, processAbort);
-						backgroundTaskService.registerKillHandler(taskId, () => void kill());
+						backgroundTaskService.registerKillHandler(taskId, () =>
+							backgroundTaskService.trackBashLifecycle(kill()),
+						);
 						if (output) backgroundTaskService.appendOutput(taskId, output);
 						resolveDetached({
 							output:
@@ -762,7 +778,7 @@ export const bashTool: ToolDefinition = {
 						timeoutMs: timeoutMs ?? DEFAULT_TIMEOUT_MS,
 						narratorId: ctx.narratorId,
 						detach,
-						kill: () => void kill(),
+						kill: () => backgroundTaskService.trackBashLifecycle(kill()),
 						setTimedOut: () => {
 							timedOut = true;
 						},
@@ -919,6 +935,10 @@ export const bashTool: ToolDefinition = {
 				// Release after terminal output/status publication, just like Bash
 				// started in background mode, not immediately upon process exit.
 				.finally(() => releaseDetachedLease?.());
+			backgroundTaskService.trackBashLifecycle(
+				lifecycle,
+				() => foregroundHandle !== undefined && !foregroundHandle.isExited(),
+			);
 			return await Promise.race([lifecycle, detachedResult]);
 		} catch (err) {
 			return {
@@ -979,18 +999,23 @@ async function _runInBackground(
 		ctx.updateExecutionLease?.release();
 	};
 
-	// Fire-and-forget: spawn the process and collect output asynchronously
-	(async () => {
+	// The service owns the full collector and its final publication/release tail.
+	let backgroundHandle: ExecHandle | undefined;
+	const lifecycle = (async () => {
 		let timedOut = false;
+		let publishingTerminal = false;
 		try {
 			// Frozen backend/cwd/env and activity were captured before task creation.
 			// Do not resolve a second backend after the tool/HTTP request has returned.
 			ctx.signal.throwIfAborted();
 			const handle = await execution.start(bgAbort.signal);
+			backgroundHandle = handle;
 			let outputBytes = 0;
 			let outputTruncated = false;
 			const killFn = () => handle.kill();
-			backgroundTaskService.registerKillHandler(taskId, () => void killFn());
+			backgroundTaskService.registerKillHandler(taskId, () =>
+				backgroundTaskService.trackBashLifecycle(killFn()),
+			);
 
 			const bgDecoder = createStreamDecoder();
 			const appendOutput = (raw: Uint8Array) => {
@@ -1092,6 +1117,7 @@ async function _runInBackground(
 			const output = backgroundTaskService.getOutputBuffer(taskId) ?? "";
 			const finalOutput = exitCode !== 0 ? `${output}\n[exit code: ${exitCode}]` : output;
 
+			publishingTerminal = true;
 			if (bgAbort.signal.aborted || backgroundTaskService.isCancellationRequested(taskId)) {
 				await backgroundTaskService.markCancelled(taskId);
 			} else if (timedOut) {
@@ -1108,6 +1134,7 @@ async function _runInBackground(
 				await backgroundTaskService.markFailed(taskId, finalOutput, exitCode);
 			}
 		} catch (err) {
+			if (publishingTerminal) backgroundTaskService.reportShutdownFailure(err);
 			const output = backgroundTaskService.getOutputBuffer(taskId) ?? "";
 			const error = `${output}\nError: ${err instanceof Error ? err.message : String(err)}`;
 			if (
@@ -1125,6 +1152,10 @@ async function _runInBackground(
 			releaseUpdateLease();
 		}
 	})();
+	backgroundTaskService.trackBashLifecycle(
+		lifecycle,
+		() => backgroundHandle !== undefined && !backgroundHandle.isExited(),
+	);
 
 	let output =
 		`<background_task_id>${alias}</background_task_id>\n\n` +

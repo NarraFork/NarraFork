@@ -879,7 +879,9 @@ describe("the run service owns the entire finalization", () => {
 			expect((await handle.terminal).hasError).toBe(true);
 			await new Promise((resolve) => setTimeout(resolve, 20));
 			// Not consumed by the failing run and not auto-woken past the failure.
-			expect(bufferModule.getBufferedMessages(CHILD).map((m) => m.text)).toEqual(["keep me"]);
+			expect((await bufferModule.getBufferedMessages(CHILD)).map((m) => m.text)).toEqual([
+				"keep me",
+			]);
 			expect(wake.mock.calls.filter(([id]) => id === CHILD)).toHaveLength(0);
 			expect(getExecutionOwner(CHILD)).toBeUndefined();
 		} finally {
@@ -895,10 +897,10 @@ describe("the run service owns the entire finalization", () => {
 		if (!current) throw new Error("expected successor");
 		const accepted = await bufferModule.enqueueBufferedMessage(CHILD, "keep me");
 		expect(accepted.ok).toBe(true);
-		const queued = bufferModule.getBufferedMessages(CHILD);
+		const queued = await bufferModule.getBufferedMessages(CHILD);
 		try {
 			expect(old.release()).toBe(false);
-			expect(bufferModule.getBufferedMessages(CHILD)).toEqual(queued);
+			expect(await bufferModule.getBufferedMessages(CHILD)).toEqual(queued);
 			expect(getExecutionOwner(CHILD)).toBe(current);
 		} finally {
 			await bufferModule.clearBufferedMessages(CHILD);

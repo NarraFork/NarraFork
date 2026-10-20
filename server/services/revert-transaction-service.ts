@@ -21,6 +21,7 @@
 import { createHash } from "node:crypto";
 import { lstat } from "node:fs/promises";
 import { setImmediate as yieldToEventLoop } from "node:timers/promises";
+import { readQueryFirst } from "@server/db/worker-read";
 import {
 	FILE_CHANGE_LIMITS,
 	type FileChangeBlobRef,
@@ -253,7 +254,7 @@ export class RevertTransactionService {
 				narratorId: request.narratorId,
 				signal,
 			});
-			const operation = this.journal.getOperation({
+			const operation = await this.journal.getOperation({
 				owner: {
 					subjectKey: `human:${request.principal.userId}`,
 					narratorId: request.narratorId,
@@ -278,11 +279,12 @@ export class RevertTransactionService {
 		// runtime may supply a new namespace object with the same durable binding.
 		const terminal = operation.status !== "prepared";
 		await this.namespace(signal, terminal);
-		const blob = this.db
-			.select({ size: fileChangeBlobs.sizeBytes, status: fileChangeBlobs.status })
-			.from(fileChangeBlobs)
-			.where(eq(fileChangeBlobs.digest, operation.selectorBlobDigest ?? ""))
-			.get();
+		const blob = await readQueryFirst(
+			this.db
+				.select({ size: fileChangeBlobs.sizeBytes, status: fileChangeBlobs.status })
+				.from(fileChangeBlobs)
+				.where(eq(fileChangeBlobs.digest, operation.selectorBlobDigest ?? "")),
+		);
 		if (!operation.selectorBlobDigest || blob?.status !== "ready")
 			throw fail("MANIFEST_UNAVAILABLE");
 		const ref: FileChangeBlobRef = {
@@ -325,9 +327,9 @@ export class RevertTransactionService {
 		this.active++;
 		const started = performance.now();
 		let responseTimer: ReturnType<typeof setTimeout> | undefined;
+		let responseRead: Promise<void> | undefined;
 		let stopResponse: () => void = () => {};
 		const body = this.run(run).finally(() => {
-			this.active--;
 			clearTimeout(deadline);
 			if (responseTimer) clearTimeout(responseTimer);
 			controller.signal.removeEventListener("abort", stopResponse);
@@ -337,20 +339,32 @@ export class RevertTransactionService {
 			stopResponse = () => {
 				responseTimer = setTimeout(() => {
 					if (!run.started) reject(fail("PREFLIGHT_CANCELLED"));
-					else resolve(this.outcome(run, this.safeOperation(run), true, "IO_OR_CLEANUP_PENDING"));
+					else {
+						responseRead = this.safeOperation(run).then((operation) => {
+							resolve(this.outcome(run, operation, true, "IO_OR_CLEANUP_PENDING"));
+						});
+						void responseRead.catch(reject);
+					}
 				}, this.cleanupMs);
 			};
 			controller.signal.addEventListener("abort", stopResponse, { once: true });
 			if (controller.signal.aborted) stopResponse();
 			body.then(resolve, reject);
 		});
+		// Clearing a timer cannot stop a read its callback already dispatched. Keep
+		// that read in the real lifetime without delaying the bounded response.
+		const settled = body
+			.finally(() => responseRead)
+			.finally(() => {
+				this.active--;
+			});
 		// Both capabilities are observed here, while their original rejection remains visible.
-		void body.then(
+		void settled.then(
 			(result) => this.report(started, run.files.length, result.status),
 			() => this.report(started, run.files.length, "refused"),
 		);
 		void limited.catch(() => {});
-		return { result: limited, whenSettled: body };
+		return { result: limited, whenSettled: settled };
 	}
 
 	private async run(run: Run): Promise<RevertTransactionOutcome> {
@@ -373,7 +387,7 @@ export class RevertTransactionService {
 				planId: run.request.planId,
 				planHash: run.request.planHash,
 			};
-			const operation = this.journal.getOperation(run.ctx);
+			const operation = await this.journal.getOperation(run.ctx);
 			if (
 				operation.scope !== "narrator" ||
 				!["revert", "history_delete", "rollback_to_block"].includes(operation.kind)
@@ -381,12 +395,12 @@ export class RevertTransactionService {
 				throw fail("UNSUPPORTED");
 			await this.verifyEntrypoint(run.request, operation, run.signal);
 			if (operation.status !== "prepared") return { outcome: this.outcome(run, operation) };
-			if (this.plans.getSummary(run.ctx.owner, operation.id).expired) throw fail("EXPIRED");
+			if ((await this.plans.getSummary(run.ctx.owner, operation.id)).expired) throw fail("EXPIRED");
 			await this.namespace(run.signal);
 			const rows: RevertJournalFile[] = [];
 			let cursor: string | undefined;
 			do {
-				const page = this.journal.listFiles(run.ctx, { cursor, limit: 32 });
+				const page = await this.journal.listFiles(run.ctx, { cursor, limit: 32 });
 				rows.push(...page.items);
 				bound(rows.length, FILE_CHANGE_LIMITS.revertFiles);
 				cursor = page.nextCursor ?? undefined;
@@ -400,11 +414,12 @@ export class RevertTransactionService {
 				operation.selectorBlobDigest,
 				operation.historyManifestBlobDigest,
 			]) {
-				const row = this.db
-					.select({ size: fileChangeBlobs.sizeBytes, status: fileChangeBlobs.status })
-					.from(fileChangeBlobs)
-					.where(eq(fileChangeBlobs.digest, digest ?? ""))
-					.get();
+				const row = await readQueryFirst(
+					this.db
+						.select({ size: fileChangeBlobs.sizeBytes, status: fileChangeBlobs.status })
+						.from(fileChangeBlobs)
+						.where(eq(fileChangeBlobs.digest, digest ?? "")),
+				);
 				if (!digest || row?.status !== "ready") throw fail("MANIFEST_UNAVAILABLE");
 				const ref: FileChangeBlobRef = { algorithm: "sha256", digest, sizeBytes: row.size };
 				raw.push({ ref, bytes: await this.readBlob(ref, run.signal) });
@@ -444,11 +459,12 @@ export class RevertTransactionService {
 					preview.identity.scopeId !== file.identity.scopeId
 				)
 					throw fail("PLAN_STALE");
-				const scope = this.db
-					.select()
-					.from(fileChangeScopes)
-					.where(eq(fileChangeScopes.id, file.identity.scopeId))
-					.get();
+				const scope = await readQueryFirst(
+					this.db
+						.select()
+						.from(fileChangeScopes)
+						.where(eq(fileChangeScopes.id, file.identity.scopeId)),
+				);
 				// The lease below owns CURRENT admission. A fence from the read-only
 				// preview is not a dependency on every other file in this workspace.
 				if (!scope || scope.status !== "active") throw fail("SCOPE_STALE");
@@ -480,10 +496,12 @@ export class RevertTransactionService {
 				// Waiting permits reset/expiry/journal changes, including for history-only
 				// plans. Revalidate before even observing a target or claiming execution.
 				await this.namespace(run.signal);
-				const current = this.journal.getOperation(run.ctx as RevertJournalContext);
+				const current = await this.journal.getOperation(run.ctx as RevertJournalContext);
 				await this.verifyEntrypoint(run.request, current, run.signal);
 				if (current.status !== "prepared") return this.outcome(run, current);
-				if (this.plans.getSummary((run.ctx as RevertJournalContext).owner, current.id).expired)
+				if (
+					(await this.plans.getSummary((run.ctx as RevertJournalContext).owner, current.id)).expired
+				)
 					throw fail("EXPIRED");
 				for (const file of run.files) {
 					const lease = this.lease(run, file);
@@ -570,7 +588,7 @@ export class RevertTransactionService {
 					});
 					return this.outcome(run, committed);
 				} catch (error) {
-					const live = this.safeOperation(run);
+					const live = await this.safeOperation(run);
 					if (live?.status === "committed") return this.outcome(run, live);
 					if (!run.started) {
 						if (live?.status === "prepared") throw error;
@@ -624,7 +642,12 @@ export class RevertTransactionService {
 				// A failed lease-release SQL write after commit cannot turn committed history
 				// into a reported preflight rejection or trigger compensation after release.
 				if (!run.started) throw error;
-				return this.outcome(run, this.safeOperation(run), false, "COORDINATOR_RECOVERY_REQUIRED");
+				return this.outcome(
+					run,
+					await this.safeOperation(run),
+					false,
+					"COORDINATOR_RECOVERY_REQUIRED",
+				);
 			}
 		}
 	}
@@ -702,7 +725,7 @@ export class RevertTransactionService {
 		const ctx = run.ctx as RevertJournalContext;
 		const signal = AbortSignal.timeout(this.cleanupMs);
 		try {
-			const operation = this.journal.getOperation(ctx);
+			const operation = await this.journal.getOperation(ctx);
 			if (operation.status === "committed") return this.outcome(run, operation);
 			this.journal.beginCompensation(ctx);
 			for (const file of [...run.files].reverse()) {
@@ -727,7 +750,7 @@ export class RevertTransactionService {
 			if (finished.status !== "compensated") this.quarantine(run);
 			return this.outcome(run, finished);
 		} catch {
-			const operation = this.safeOperation(run);
+			const operation = await this.safeOperation(run);
 			if (operation?.status !== "committed" && operation?.status !== "compensated")
 				this.quarantine(run);
 			return this.outcome(run, operation, false, "RECOVERY_REQUIRED");
@@ -794,7 +817,7 @@ export class RevertTransactionService {
 		claim: RevertJournalClaim,
 		phase: "apply" | "compensate",
 	) {
-		const operation = this.journal.getOperation(run.ctx as RevertJournalContext);
+		const operation = this.journal.getOperationForDispatch(run.ctx as RevertJournalContext);
 		if (operation.status !== (phase === "apply" ? "applying" : "compensating"))
 			throw fail("PHASE_STALE");
 		const row = this.db
@@ -821,7 +844,7 @@ export class RevertTransactionService {
 		)
 			throw fail("CLAIM_STALE");
 		const namespace = this.options.namespace;
-		const budget = namespace.catalog.getBudget();
+		const budget = namespace.catalog.getBudgetForDispatch();
 		if (
 			budget?.status !== "ready" ||
 			budget.generation !== namespace.generation ||
@@ -837,7 +860,7 @@ export class RevertTransactionService {
 				continue;
 			}
 			if (state.kind !== "regular" || state.blob.digest !== pin) throw fail("CLAIM_PIN_STALE");
-			const ready = namespace.catalog.getMetadata({
+			const ready = namespace.catalog.getMetadataForDispatch({
 				expectedGeneration: namespace.generation,
 				ref: state.blob,
 			});
@@ -857,11 +880,9 @@ export class RevertTransactionService {
 		// Recheck the real target AFTER the last caller-owned authorization await.
 		// An ACL callback cannot retarget a path and then let a cleanup read follow it.
 		const namespace = await this.namespace(signal);
-		const current = this.db
-			.select()
-			.from(fileChangeScopes)
-			.where(eq(fileChangeScopes.id, file.scope.id))
-			.get();
+		const current = await readQueryFirst(
+			this.db.select().from(fileChangeScopes).where(eq(fileChangeScopes.id, file.scope.id)),
+		);
 		if (
 			!current ||
 			current.status !== "active" ||
@@ -952,7 +973,7 @@ export class RevertTransactionService {
 	}
 	private async namespace(signal: AbortSignal, allowRecoveredNamespace = false) {
 		const namespace = await this.options.runtime.verifyNamespace(signal);
-		const budget = namespace.catalog.getBudget();
+		const budget = await namespace.catalog.getBudget();
 		if (
 			(allowRecoveredNamespace
 				? namespace.generation !== this.options.namespace.generation
@@ -971,7 +992,10 @@ export class RevertTransactionService {
 	) {
 		bound(ref.sizeBytes, FILE_CHANGE_LIMITS.blobBytes);
 		const namespace = await this.namespace(signal, allowRecoveredNamespace);
-		const row = namespace.catalog.getMetadata({ expectedGeneration: namespace.generation, ref });
+		const row = await namespace.catalog.getMetadata({
+			expectedGeneration: namespace.generation,
+			ref,
+		});
 		if (row?.status !== "ready" || row.sizeBytes !== ref.sizeBytes) throw fail("RAW_UNAVAILABLE");
 		const bytes = await namespace.store.readBytes(ref, {
 			signal,
@@ -1032,7 +1056,7 @@ export class RevertTransactionService {
 			expectedDigest: state.blob.digest,
 			expectedSize: state.blob.sizeBytes,
 		});
-		const ready = namespace.catalog.getMetadata({
+		const ready = await namespace.catalog.getMetadata({
 			expectedGeneration: namespace.generation,
 			ref: state.blob,
 		});
@@ -1051,9 +1075,9 @@ export class RevertTransactionService {
 		if (!lease) throw fail("MISSING_LEASE");
 		return lease;
 	}
-	private safeOperation(run: Run) {
+	private async safeOperation(run: Run) {
 		try {
-			return run.ctx ? this.journal.getOperation(run.ctx) : null;
+			return run.ctx ? await this.journal.getOperation(run.ctx) : null;
 		} catch {
 			return null;
 		}

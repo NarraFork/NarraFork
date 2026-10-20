@@ -479,13 +479,13 @@ describe("personal keyword injection", () => {
 			source: "user_message",
 			hits,
 		});
-		const already = knowledgeService.listInjectedEntryIds(narratorId, -1);
+		const already = await knowledgeService.listInjectedEntryIds(narratorId, -1);
 		expect([...already]).toEqual([`personal:${draft.id}`]);
 		expect(await resolveInjections(userId, keyword, { already })).toEqual([]);
 		expect(
 			(
 				await resolveInjections(userId, keyword, {
-					already: knowledgeService.listInjectedEntryIds(narratorId, 1),
+					already: await knowledgeService.listInjectedEntryIds(narratorId, 1),
 				})
 			).length,
 		).toBe(1);
@@ -556,7 +556,7 @@ describe("persistent injection de-dup ledger", () => {
 		const now = new Date().toISOString();
 		await db.insert(narrators).values({ id: narratorId, createdAt: now, updatedAt: now });
 
-		const firstAlready = knowledgeService.listInjectedEntryIds(narratorId, -1);
+		const firstAlready = await knowledgeService.listInjectedEntryIds(narratorId, -1);
 		const first = await resolveInjections(userId, `need ${kw}`, {
 			collectionId,
 			already: firstAlready,
@@ -569,7 +569,7 @@ describe("persistent injection de-dup ledger", () => {
 			hits: first,
 		});
 
-		const rebuiltAlready = knowledgeService.listInjectedEntryIds(narratorId, -1);
+		const rebuiltAlready = await knowledgeService.listInjectedEntryIds(narratorId, -1);
 		expect(rebuiltAlready.has(`global:${entry.id}`)).toBe(true);
 		const second = await resolveInjections(userId, `need ${kw}`, {
 			collectionId,
@@ -577,7 +577,7 @@ describe("persistent injection de-dup ledger", () => {
 		});
 		expect(second.some((h) => h.entryId === entry.id)).toBe(false);
 
-		const nextCycleAlready = knowledgeService.listInjectedEntryIds(narratorId, 100);
+		const nextCycleAlready = await knowledgeService.listInjectedEntryIds(narratorId, 100);
 		const afterCompact = await resolveInjections(userId, `need ${kw}`, {
 			collectionId,
 			already: nextCycleAlready,

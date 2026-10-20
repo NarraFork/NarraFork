@@ -1,3 +1,4 @@
+import { readQuery } from "../db/worker-read";
 /**
  * narrator-export.ts — stream a narrator's transcript out as Markdown or JSON.
  *
@@ -349,14 +350,17 @@ async function buildRefScope(narratorId: string, scope: NarratorExportScope) {
  * module scope). One indexed `LIMIT 1` lookup is not worth that coupling.
  */
 async function loadLatestCompactSeq(narratorId: string): Promise<number | null> {
-	const rows = await db
-		.select({ seq: narratorMessageRefs.seq })
-		.from(narratorMessageRefs)
-		.where(
-			and(eq(narratorMessageRefs.narratorId, narratorId), eq(narratorMessageRefs.isCompact, 1)),
-		)
-		.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-		.limit(1);
+	const rows = await readQuery(
+		db
+			.select({ seq: narratorMessageRefs.seq })
+			.from(narratorMessageRefs)
+			.where(
+				and(eq(narratorMessageRefs.narratorId, narratorId), eq(narratorMessageRefs.isCompact, 1)),
+			)
+			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+			.limit(1),
+		{ site: "narrator-export.loadLatestCompactSeq" },
+	);
 	return rows[0]?.seq ?? null;
 }
 
@@ -384,12 +388,15 @@ async function hasHistoryBelow(
 	const conditions = [scopeClause, sql`${narratorMessageRefs.seq} < ${boundarySeq}`];
 	const own = ownTurnSql(ownPlacement);
 	if (own) conditions.push(own);
-	const rows = await db
-		.select({ seq: narratorMessageRefs.seq })
-		.from(narratorMessageRefs)
-		.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-		.where(and(...conditions))
-		.limit(1);
+	const rows = await readQuery(
+		db
+			.select({ seq: narratorMessageRefs.seq })
+			.from(narratorMessageRefs)
+			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+			.where(and(...conditions))
+			.limit(1),
+		{ site: "narrator-export.hasHistoryBelow" },
+	);
 	return rows.length > 0;
 }
 
@@ -429,19 +436,22 @@ async function loadRefPage(
 		conditions.push(gt(narratorMessageRefs.seq, latestCompactSeq));
 	}
 
-	const rows = await db
-		.select({
-			refId: narratorMessageRefs.id,
-			messageId: narratorMessageRefs.messageId,
-			seq: narratorMessageRefs.seq,
-			isCompact: narratorMessageRefs.isCompact,
-			segmentCompactId: narratorMessageRefs.segmentCompactId,
-		})
-		.from(narratorMessageRefs)
-		.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-		.where(and(...conditions))
-		.orderBy(narratorMessageRefs.seq, narratorMessageRefs.id)
-		.limit(EXPORT_PAGE_REFS);
+	const rows = await readQuery(
+		db
+			.select({
+				refId: narratorMessageRefs.id,
+				messageId: narratorMessageRefs.messageId,
+				seq: narratorMessageRefs.seq,
+				isCompact: narratorMessageRefs.isCompact,
+				segmentCompactId: narratorMessageRefs.segmentCompactId,
+			})
+			.from(narratorMessageRefs)
+			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+			.where(and(...conditions))
+			.orderBy(narratorMessageRefs.seq, narratorMessageRefs.id)
+			.limit(EXPORT_PAGE_REFS),
+		{ site: "narrator-export.loadRefPage" },
+	);
 
 	return rows.map((row) => ({
 		refId: row.refId,
@@ -473,10 +483,13 @@ export async function resolveTranscriptScope(
 	narratorId: string,
 	scope: NarratorExportScope,
 ): Promise<TranscriptScope> {
-	const row = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: RUNTIME_SOURCE_COLUMNS,
-	});
+	const row = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: RUNTIME_SOURCE_COLUMNS,
+		}),
+		{ site: "narrator-export.resolveTranscriptScope" },
+	);
 	const ownTurnPlacement = row ? ownTurnPlacementOf(row) : null;
 	const clause = await buildRefScope(narratorId, scope);
 	const latestCompactSeq = scope === "visible" ? await loadLatestCompactSeq(narratorId) : null;
@@ -592,10 +605,13 @@ const MESSAGE_COLUMNS = {
 
 async function loadMessages(messageIds: string[]): Promise<Map<string, ExportMessageRow>> {
 	if (messageIds.length === 0) return new Map();
-	const rows = await db
-		.select(MESSAGE_COLUMNS)
-		.from(narratorMessages)
-		.where(inArray(narratorMessages.id, messageIds));
+	const rows = await readQuery(
+		db
+			.select(MESSAGE_COLUMNS)
+			.from(narratorMessages)
+			.where(inArray(narratorMessages.id, messageIds)),
+		{ site: "narrator-export.loadMessages" },
+	);
 	return new Map(rows.map((row) => [row.id, row as ExportMessageRow]));
 }
 
@@ -663,7 +679,7 @@ async function loadToolCallMeta(messageIds: string[]) {
 		.where(inArray(narratorToolCalls.messageId, messageIds))
 		.as("ranked_tool_calls");
 
-	return (
+	return readQuery(
 		db
 			.select()
 			.from(ranked)
@@ -671,7 +687,8 @@ async function loadToolCallMeta(messageIds: string[]) {
 			// Raw SQL because `rank` is a window-function alias on the subquery, not a
 			// column reference drizzle's typed `orderBy` will accept.
 			.orderBy(sql`${ranked.rank}, ${ranked.createdAt}, ${ranked.id}`)
-			.limit(EXPORT_TOOL_CALLS_PER_PAGE)
+			.limit(EXPORT_TOOL_CALLS_PER_PAGE),
+		{ site: "narrator-export.loadToolCallMeta" },
 	);
 }
 
@@ -732,21 +749,24 @@ async function loadToolCalls(
 	const allowed = includeToolIO ? selectToolBodyIds(meta) : new Set<string>();
 	const bodies = new Map<string, { input: string | null; output: string | null }>();
 	if (allowed.size > 0) {
-		const bodyRows = await db
-			.select({
-				id: narratorToolCalls.id,
-				input: sql<
-					string | null
-				>`substr(CAST(${narratorToolCalls.inputJson} AS TEXT), 1, ${EXPORT_TOOL_FIELD_LIMIT})`,
-				output: sql<
-					string | null
-				>`substr(CAST(${narratorToolCalls.outputJson} AS TEXT), 1, ${EXPORT_TOOL_FIELD_LIMIT})`,
-			})
-			.from(narratorToolCalls)
-			// Keyed by primary key, and the key set is what the budget just approved,
-			// so this select cannot return more than the budget's worth of characters.
-			.where(inArray(narratorToolCalls.id, [...allowed]))
-			.limit(allowed.size);
+		const bodyRows = await readQuery(
+			db
+				.select({
+					id: narratorToolCalls.id,
+					input: sql<
+						string | null
+					>`substr(CAST(${narratorToolCalls.inputJson} AS TEXT), 1, ${EXPORT_TOOL_FIELD_LIMIT})`,
+					output: sql<
+						string | null
+					>`substr(CAST(${narratorToolCalls.outputJson} AS TEXT), 1, ${EXPORT_TOOL_FIELD_LIMIT})`,
+				})
+				.from(narratorToolCalls)
+				// Keyed by primary key, and the key set is what the budget just approved,
+				// so this select cannot return more than the budget's worth of characters.
+				.where(inArray(narratorToolCalls.id, [...allowed]))
+				.limit(allowed.size),
+			{ site: "narrator-export.loadToolCalls" },
+		);
 		for (const row of bodyRows) bodies.set(row.id, { input: row.input, output: row.output });
 	}
 
@@ -811,23 +831,26 @@ const CHILD_MESSAGE_COLUMNS = {
  */
 async function loadChildMessages(toolUseIds: string[]): Promise<ExportMessageRow[]> {
 	if (toolUseIds.length === 0) return [];
-	const rows = await db
-		.select({
-			...CHILD_MESSAGE_COLUMNS,
-			contentJsonText: sql<
-				string | null
-			>`substr(CAST(${narratorMessages.contentJson} AS TEXT), 1, ${EXPORT_CHILD_CONTENT_LIMIT})`,
-			contentTextExcerpt: sql<
-				string | null
-			>`substr(${narratorMessages.contentText}, 1, ${EXPORT_CHILD_CONTENT_LIMIT})`,
-			contentJsonBytes: sql<number>`length(COALESCE(CAST(${narratorMessages.contentJson} AS TEXT), ''))`,
-			contentTextBytes: sql<number>`length(COALESCE(${narratorMessages.contentText}, ''))`,
-		})
-		.from(narratorMessages)
-		.where(inArray(narratorMessages.parentToolUseId, toolUseIds))
-		.orderBy(narratorMessages.createdAt)
-		// One over the cap: enough to know more exist without reading them all.
-		.limit(EXPORT_CHILD_MESSAGES_PER_PAGE + 1);
+	const rows = await readQuery(
+		db
+			.select({
+				...CHILD_MESSAGE_COLUMNS,
+				contentJsonText: sql<
+					string | null
+				>`substr(CAST(${narratorMessages.contentJson} AS TEXT), 1, ${EXPORT_CHILD_CONTENT_LIMIT})`,
+				contentTextExcerpt: sql<
+					string | null
+				>`substr(${narratorMessages.contentText}, 1, ${EXPORT_CHILD_CONTENT_LIMIT})`,
+				contentJsonBytes: sql<number>`length(COALESCE(CAST(${narratorMessages.contentJson} AS TEXT), ''))`,
+				contentTextBytes: sql<number>`length(COALESCE(${narratorMessages.contentText}, ''))`,
+			})
+			.from(narratorMessages)
+			.where(inArray(narratorMessages.parentToolUseId, toolUseIds))
+			.orderBy(narratorMessages.createdAt)
+			// One over the cap: enough to know more exist without reading them all.
+			.limit(EXPORT_CHILD_MESSAGES_PER_PAGE + 1),
+		{ site: "narrator-export.loadChildMessages" },
+	);
 
 	return rows.map((row) => {
 		const { contentJsonText, contentTextExcerpt, contentJsonBytes, contentTextBytes, ...rest } =
@@ -976,16 +999,19 @@ async function projectExportMessages(
 	const maxIdentities = 4096;
 	let count = 0;
 	for (let start = 0; start < ids.length; start += 128) {
-		const identities = await db
-			.select({ messageId: narratorToolCalls.messageId, toolUseId: narratorToolCalls.toolUseId })
-			.from(narratorToolCalls)
-			.where(
-				and(
-					inArray(narratorToolCalls.messageId, ids.slice(start, start + 128)),
-					eq(narratorToolCalls.toolName, GEN_UI_TOOL_NAME),
-				),
-			)
-			.limit(maxIdentities - count + 1);
+		const identities = await readQuery(
+			db
+				.select({ messageId: narratorToolCalls.messageId, toolUseId: narratorToolCalls.toolUseId })
+				.from(narratorToolCalls)
+				.where(
+					and(
+						inArray(narratorToolCalls.messageId, ids.slice(start, start + 128)),
+						eq(narratorToolCalls.toolName, GEN_UI_TOOL_NAME),
+					),
+				)
+				.limit(maxIdentities - count + 1),
+			{ site: "narrator-export.projectExportMessages" },
+		);
 		count += identities.length;
 		if (count > maxIdentities) throw new Error("Export private-tool identity limit exceeded");
 		for (const identity of identities) {
@@ -1488,20 +1514,23 @@ export interface NarratorExportHeader {
 async function loadHeader(
 	narratorId: string,
 ): Promise<NarratorExportHeader & { isSubagent: boolean }> {
-	const row = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: {
-			id: true,
-			title: true,
-			status: true,
-			variant: true,
-			model: true,
-			cwd: true,
-			chapterId: true,
-			parentNarratorId: true,
-			createdAt: true,
-		},
-	});
+	const row = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: {
+				id: true,
+				title: true,
+				status: true,
+				variant: true,
+				model: true,
+				cwd: true,
+				chapterId: true,
+				parentNarratorId: true,
+				createdAt: true,
+			},
+		}),
+		{ site: "narrator-export.loadHeader" },
+	);
 	if (!row) throw new Error(`Narrator not found: ${narratorId}`);
 	return {
 		id: row.id,

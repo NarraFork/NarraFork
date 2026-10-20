@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 /**
  * Project access control — the outermost gate of the ACL chain.
  *
@@ -159,7 +160,7 @@ export async function loadProjectForAccess(
 	principal: ProjectPrincipal,
 	need: ProjectAccessNeed,
 ) {
-	const row = await db.query.projects.findFirst({ where: eq(projects.id, projectId) });
+	const row = await readQuery(db.query.projects.findFirst({ where: eq(projects.id, projectId) }));
 	if (!row) throw new NotFoundError("Project", projectId);
 	await assertProjectAccess(row, principal, need);
 	return row;
@@ -177,10 +178,12 @@ export async function assertChapterProjectAccess(
 	principal: ProjectPrincipal,
 	need: ProjectAccessNeed,
 ): Promise<{ projectId: string }> {
-	const chapter = await db.query.chapters.findFirst({
-		where: eq(chapters.id, chapterId),
-		columns: { projectId: true },
-	});
+	const chapter = await readQuery(
+		db.query.chapters.findFirst({
+			where: eq(chapters.id, chapterId),
+			columns: { projectId: true },
+		}),
+	);
 	if (!chapter?.projectId) throw new NotFoundError("Chapter", chapterId);
 	await loadProjectForAccess(chapter.projectId, principal, need);
 	return { projectId: chapter.projectId };
@@ -203,10 +206,12 @@ export async function resolveProjectGate(
 ): Promise<{ read: boolean; write: boolean }> {
 	if (!projectId) return { read: true, write: true };
 	if (principal.isAdmin) return { read: true, write: true };
-	const row = await db.query.projects.findFirst({
-		where: eq(projects.id, projectId),
-		columns: { id: true, ownerUserId: true, visibility: true },
-	});
+	const row = await readQuery(
+		db.query.projects.findFirst({
+			where: eq(projects.id, projectId),
+			columns: { id: true, ownerUserId: true, visibility: true },
+		}),
+	);
 	// A dangling project reference fails closed: the chain claimed a gate exists, and
 	// we cannot show it was passed.
 	if (!row) return { read: false, write: false };

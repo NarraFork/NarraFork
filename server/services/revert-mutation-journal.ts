@@ -1,8 +1,22 @@
+import {
+	assertRevision,
+	canonical,
+	catalogRef,
+	equal,
+	fail,
+	integer,
+	metadata,
+	requireOperation,
+	selectFiles,
+	sha256,
+} from "./revert-journal-read";
+
+export { RevertMutationJournalError } from "./revert-journal-read";
+
 import type { Database } from "bun:sqlite";
 import { createHash } from "node:crypto";
 import { setImmediate as yieldToEventLoop } from "node:timers/promises";
 import {
-	FILE_CHANGE_EVIDENCE_VERSION,
 	FILE_CHANGE_LIMITS,
 	type FileChangeBlobRef,
 	type FileChangeExecutionBinding,
@@ -15,19 +29,22 @@ import { and, asc, eq, sql } from "drizzle-orm";
 import type { BunSQLiteDatabase } from "drizzle-orm/bun-sqlite";
 import {
 	fileChangeBlobs as blobs,
-	fileChangeStorageBudgets as budgets,
 	revertOperationFiles as files,
 	revertOperations as operations,
 	fileChangeScopes as scopes,
 } from "../db/schema";
-import { AppError } from "../lib/errors";
-import { FILE_CHANGE_BLOB_BUDGET_ID } from "./file-change-blob-catalog";
+import { readQuery, readTransactionTask } from "../db/worker-read";
 import {
 	createFileChangeIdentity,
 	fileChangeExecutionBindingMatches,
 	fileChangeIdentityKey,
 } from "./file-change-identity";
 import { normalizeLocalIoEvidence } from "./file-change-local-io-evidence";
+import {
+	type RevertJournalReadTask,
+	readJournalManifests,
+	readRevertJournalTask,
+} from "./revert-journal-read-task";
 import {
 	type RevertPlanFileMetadata,
 	type RevertPlanManifestProof,
@@ -108,13 +125,6 @@ type Scan = {
 	allCompensated: boolean;
 };
 
-export class RevertMutationJournalError extends AppError {
-	constructor(code: string, message: string) {
-		super(message, 409, `REVERT_JOURNAL_${code}`);
-		this.name = "RevertMutationJournalError";
-	}
-}
-
 /**
  * Internal metadata journal: no target IO, blob-body reads, authorization, history
  * enumeration, broadcasts, automatic recovery or unrevert. Caller supplies REAL
@@ -169,23 +179,14 @@ export class RevertMutationJournal {
 		return new Date(Math.max(now, previous ? Date.parse(previous) + 1 : now)).toISOString();
 	}
 
-	private namespace(tx: RevertJournalTransaction) {
-		const row = tx
-			.select({ status: budgets.status, namespaceKey: budgets.namespaceKey })
-			.from(budgets)
-			.where(eq(budgets.id, FILE_CHANGE_BLOB_BUDGET_ID))
-			.get();
-		if (row?.status !== "ready" || row.namespaceKey !== this.namespaceKey)
-			throw fail("CATALOG_UNVERIFIED", "The physical evidence namespace must be ready");
-	}
-
 	private manifests(tx: RevertJournalTransaction, operation: RevertJournalOperation) {
-		this.namespace(tx);
-		return [
-			operation.planBlobDigest,
-			operation.selectorBlobDigest,
-			operation.historyManifestBlobDigest,
-		].reduce((sum, value) => sum + catalogRef(tx, value).sizeBytes, 0);
+		return readJournalManifests(tx, operation, this.namespaceKey);
+	}
+	private async readTask<T>(task: RevertJournalReadTask, signal?: AbortSignal): Promise<T> {
+		this.assertRoot();
+		return readTransactionTask<T>(this.db, task, () => readRevertJournalTask(this.db, task) as T, {
+			signal,
+		});
 	}
 
 	/** A real prepared plan and its original complete proof are mandatory, including zero files. */
@@ -196,7 +197,11 @@ export class RevertMutationJournal {
 	): Promise<{ operation: RevertJournalOperation; started: boolean }> {
 		const context = normalizeContext(ctx);
 		this.assertRoot();
-		const original = requireOperation(this.db, context);
+		const original = await this.readTask<RevertJournalOperation>({
+			kind: "revertJournalReadV1",
+			action: "operation",
+			context,
+		});
 		if (original.status === "applying") return { operation: original, started: false };
 		if (original.status !== "prepared" || !original.coverageComplete)
 			throw fail("INVALID_TRANSITION", "A complete prepared plan is required");
@@ -347,7 +352,11 @@ export class RevertMutationJournal {
 		text(fileId);
 		const receipt = normalizeReceipt(input);
 		this.assertRoot();
-		const original = requireOperation(this.db, context);
+		const original = await this.readTask<RevertJournalOperation>({
+			kind: "revertJournalReadV1",
+			action: "operation",
+			context,
+		});
 		const originalFile = requireFile(this.db, original, fileId);
 		const prior = readJournal(originalFile)[phase];
 		assertBoundReceipt(originalFile, prior, receipt, phase);
@@ -564,20 +573,33 @@ export class RevertMutationJournal {
 		});
 	}
 
-	getOperation(ctx: RevertJournalContext): RevertJournalOperation {
+	async getOperation(ctx: RevertJournalContext): Promise<RevertJournalOperation> {
+		return this.readTask<RevertJournalOperation>({
+			kind: "revertJournalReadV1",
+			action: "operation",
+			context: normalizeContext(ctx),
+		});
+	}
+	/** Same-turn final dispatch validation on the journal's owning connection. */
+	getOperationForDispatch(ctx: RevertJournalContext): RevertJournalOperation {
 		return requireOperation(this.db, normalizeContext(ctx));
 	}
 
-	listFiles(
+	async listFiles(
 		ctx: RevertJournalContext,
 		options: { cursor?: string; limit?: number } = {},
-	): RevertJournalPage<RevertJournalFile, string> {
+	): Promise<RevertJournalPage<RevertJournalFile, string>> {
 		const context = normalizeContext(ctx);
-		requireOperation(this.db, context);
 		const limit = pageLimit(options.limit);
 		if (options.cursor !== undefined) sha256(options.cursor);
 		return page(
-			selectFiles(this.db, context.planId, options.cursor, limit + 1),
+			await this.readTask<RevertJournalFile[]>({
+				kind: "revertJournalReadV1",
+				action: "files",
+				context,
+				cursor: options.cursor,
+				limit: limit + 1,
+			}),
 			limit,
 			(row) => row.fileKey,
 		);
@@ -586,7 +608,7 @@ export class RevertMutationJournal {
 	/** Owner/context-bound single-state inventory; query each state during recovery.
 	 * The compound owner/context/status index and tuple cursor avoid scanning terminal
 	 * history or another project to fill a page. TTL never hides unfinished records. */
-	listPending(
+	async listPending(
 		owner: RevertPlanOwner,
 		options: {
 			status: RevertJournalPendingStatus;
@@ -605,23 +627,24 @@ export class RevertMutationJournal {
 			text(cursor.id);
 			text(cursor.updatedAt);
 		}
-		const rows = this.db
-			.select()
-			.from(operations)
-			.where(
-				and(
-					eq(operations.requestedBySubjectKey, owner.subjectKey),
-					sql`${operations.narratorId} IS ${owner.narratorId}`,
-					sql`${operations.projectId} IS ${owner.projectId}`,
-					eq(operations.status, options.status),
-					cursor
-						? sql`(${operations.updatedAt}, ${operations.id}) > (${cursor.updatedAt}, ${cursor.id})`
-						: undefined,
-				),
-			)
-			.orderBy(asc(operations.updatedAt), asc(operations.id))
-			.limit(limit + 1)
-			.all();
+		const rows = await readQuery(
+			this.db
+				.select()
+				.from(operations)
+				.where(
+					and(
+						eq(operations.requestedBySubjectKey, owner.subjectKey),
+						sql`${operations.narratorId} IS ${owner.narratorId}`,
+						sql`${operations.projectId} IS ${owner.projectId}`,
+						eq(operations.status, options.status),
+						cursor
+							? sql`(${operations.updatedAt}, ${operations.id}) > (${cursor.updatedAt}, ${cursor.id})`
+							: undefined,
+					),
+				)
+				.orderBy(asc(operations.updatedAt), asc(operations.id))
+				.limit(limit + 1),
+		);
 		return page(rows, limit, (row) => ({ updatedAt: row.updatedAt, id: row.id }));
 	}
 
@@ -657,7 +680,11 @@ export class RevertMutationJournal {
 	 * otherwise proven by a complete scan (which also runs every full-set integrity check).
 	 */
 	private async runningTotals(context: RevertJournalContext): Promise<RunningTotals> {
-		const live = requireOperation(this.db, context);
+		const live = await this.readTask<RevertJournalOperation>({
+			kind: "revertJournalReadV1",
+			action: "operation",
+			context,
+		});
 		const cached = this.totals.get(live);
 		if (cached) return cached;
 		const scan = await this.scan(context);
@@ -666,10 +693,16 @@ export class RevertMutationJournal {
 
 	private async scan(context: RevertJournalContext, signal?: AbortSignal): Promise<Scan> {
 		this.assertRoot();
-		const original = requireOperation(this.db, context);
+		const { operation: original, bytes } = await this.readTask<{
+			operation: RevertJournalOperation;
+			bytes: number;
+		}>(
+			{ kind: "revertJournalReadV1", action: "start", context, namespaceKey: this.namespaceKey },
+			signal,
+		);
 		const result: Scan = {
 			operation: original,
-			bytes: this.manifests(this.db, original),
+			bytes,
 			count: 0,
 			applied: 0,
 			allAppliedVerified: true,
@@ -680,11 +713,17 @@ export class RevertMutationJournal {
 		let cursor: string | undefined;
 		for (;;) {
 			signal?.throwIfAborted();
-			const rows = this.transaction((tx) => {
-				assertRevision(original, requireOperation(tx, context));
-				this.namespace(tx);
-				return selectFiles(tx, original.id, cursor, REVERT_JOURNAL_BATCH_ITEMS + 1);
-			});
+			const rows = await this.readTask<RevertJournalFile[]>(
+				{
+					kind: "revertJournalReadV1",
+					action: "page",
+					context,
+					original,
+					namespaceKey: this.namespaceKey,
+					cursor,
+				},
+				signal,
+			);
 			for (const row of rows.slice(0, REVERT_JOURNAL_BATCH_ITEMS)) {
 				assertFile(original, row);
 				if (sequences.has(row.sequence))
@@ -711,7 +750,23 @@ export class RevertMutationJournal {
 					row.observedAfterStateJson,
 					row.compensationAfterStateJson,
 				])
-					if (state) readyState(this.db, state);
+					if (state) {
+						const ref = stateRef(normalizeState(state));
+						if (
+							ref &&
+							!equal(
+								ref,
+								await this.readTask<FileChangeBlobRef>(
+									{ kind: "revertJournalReadV1", action: "catalog", context, digest: ref.digest },
+									signal,
+								),
+							)
+						)
+							throw fail(
+								"BLOB_NOT_READY",
+								"Raw evidence size does not match its ready catalog reference",
+							);
+					}
 				const journal = readJournal(row);
 				const apply = journal.apply?.receipt;
 				const compensate = journal.compensate?.receipt;
@@ -757,38 +812,7 @@ function normalizeOwner(owner: RevertPlanOwner) {
 	if (owner.narratorId !== null) text(owner.narratorId);
 	if (owner.projectId !== null) text(owner.projectId);
 }
-function requireOperation(
-	tx: RevertJournalTransaction,
-	ctx: RevertJournalContext,
-): RevertJournalOperation {
-	const row = tx
-		.select()
-		.from(operations)
-		.where(
-			and(
-				eq(operations.id, ctx.planId),
-				eq(operations.requestedBySubjectKey, ctx.owner.subjectKey),
-				sql`${operations.narratorId} IS ${ctx.owner.narratorId}`,
-				sql`${operations.projectId} IS ${ctx.owner.projectId}`,
-			),
-		)
-		.get();
-	if (!row) throw fail("NOT_FOUND", "Plan not found in the authorized owning context");
-	metadata(row);
-	if (
-		row.protocolVersion !== FILE_CHANGE_EVIDENCE_VERSION ||
-		!row.coverageComplete ||
-		row.expectedMessageVersion === null ||
-		!row.planBlobDigest ||
-		!row.selectorBlobDigest ||
-		!row.historyManifestBlobDigest
-	)
-		throw fail("LEGACY_UNVERIFIED", "A complete v2 prepared plan is required");
-	if (row.planHash !== ctx.planHash) throw fail("REQUEST_CONFLICT", "The fixed plan hash changed");
-	integer(row.fileCount, 0, FILE_CHANGE_LIMITS.revertFiles);
-	integer(row.appliedFileCount, 0, row.fileCount);
-	return row;
-}
+
 function requireFile(
 	tx: RevertJournalTransaction,
 	operation: RevertJournalOperation,
@@ -838,10 +862,6 @@ class RunningTotalsCache {
 	}
 }
 
-function assertRevision(before: RevertJournalOperation, after: RevertJournalOperation) {
-	if (!equal(before, after))
-		throw fail("CONCURRENT_CHANGE", "The journal changed during a bounded page yield");
-}
 function assertFile(operation: RevertJournalOperation, row: RevertJournalFile) {
 	metadata(row);
 	integer(row.sequence, 0, operation.fileCount - 1);
@@ -1183,18 +1203,7 @@ function fileBytes(file: RevertJournalFile) {
 			bytes += stateRef(state)?.sizeBytes ?? 0;
 	return bytes;
 }
-function catalogRef(tx: RevertJournalTransaction, digestValue: string | null): FileChangeBlobRef {
-	if (digestValue === null) throw fail("LEGACY_UNVERIFIED", "A manifest reference is missing");
-	sha256(digestValue);
-	const row = tx
-		.select({ digest: blobs.digest, sizeBytes: blobs.sizeBytes, status: blobs.status })
-		.from(blobs)
-		.where(eq(blobs.digest, digestValue))
-		.get();
-	if (!row || row.status !== "ready") throw fail("BLOB_NOT_READY", "A raw object is not ready");
-	integer(row.sizeBytes, 0, FILE_CHANGE_LIMITS.blobBytes);
-	return { algorithm: "sha256", digest: row.digest, sizeBytes: row.sizeBytes };
-}
+
 function assertPinnedReady(tx: RevertJournalTransaction, planId: string) {
 	// Scoped indexed EXISTS over at most 1000 admitted files, fetching no row bodies.
 	// Rechecks catalog changes across page yields immediately before the transition.
@@ -1230,22 +1239,7 @@ function phaseId(file: RevertJournalFile, phase: Phase) {
 function phaseDigest(file: RevertJournalFile, phase: Phase) {
 	return phase === "apply" ? file.applyRequestDigest : file.compensateRequestDigest;
 }
-function selectFiles(
-	tx: RevertJournalTransaction,
-	id: string,
-	cursor: string | undefined,
-	limit: number,
-) {
-	return tx
-		.select()
-		.from(files)
-		.where(
-			and(eq(files.revertOperationId, id), cursor ? sql`${files.fileKey} > ${cursor}` : undefined),
-		)
-		.orderBy(asc(files.fileKey))
-		.limit(limit)
-		.all();
-}
+
 function page<T, C>(rows: T[], limit: number, cursor: (row: T) => C): RevertJournalPage<T, C> {
 	const items: T[] = [];
 	let bytes = 1024;
@@ -1266,10 +1260,7 @@ function pageLimit(value: number = FILE_CHANGE_LIMITS.historyPageItems) {
 	integer(value, 1, FILE_CHANGE_LIMITS.historyPageItems);
 	return value;
 }
-function metadata(value: unknown) {
-	if (Buffer.byteLength(JSON.stringify(value)) > FILE_CHANGE_LIMITS.metadataBytes)
-		throw fail("METADATA_BUDGET", "Metadata exceeds the shared 8KiB row budget");
-}
+
 function evidenceBudget(value: number) {
 	integer(value, 0, FILE_CHANGE_LIMITS.operationEvidenceBytes);
 }
@@ -1277,14 +1268,7 @@ function text(value: string) {
 	if (typeof value !== "string" || !value || value.includes("\0") || Buffer.byteLength(value) > 256)
 		throw fail("INVALID_INPUT", "Invalid bounded identifier");
 }
-function sha256(value: string) {
-	if (typeof value !== "string" || value.length !== 64 || !/^[a-f0-9]{64}$/.test(value))
-		throw fail("INVALID_INPUT", "Invalid SHA-256 digest");
-}
-function integer(value: number, min = 0, max = Number.MAX_SAFE_INTEGER) {
-	if (!Number.isSafeInteger(value) || value < min || value > max)
-		throw fail("BUDGET_OR_INPUT", "Value exceeds its finite budget");
-}
+
 function keys(value: object, allowed: string[]) {
 	if (
 		!value ||
@@ -1294,23 +1278,9 @@ function keys(value: object, allowed: string[]) {
 	)
 		throw fail("INVALID_INPUT", "Only declared bounded metadata fields are accepted");
 }
-function canonical(value: unknown): string {
-	if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
-	if (value && typeof value === "object")
-		return `{${Object.entries(value)
-			.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
-			.map(([key, item]) => `${JSON.stringify(key)}:${canonical(item)}`)
-			.join(",")}}`;
-	return JSON.stringify(value);
-}
+
 function digest(value: unknown) {
 	return createHash("sha256").update(canonical(value)).digest("hex");
-}
-function equal(a: unknown, b: unknown) {
-	return canonical(a) === canonical(b);
-}
-function fail(code: string, message: string) {
-	return new RevertMutationJournalError(code, message);
 }
 
 /**

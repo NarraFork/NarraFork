@@ -1,5 +1,6 @@
 /** Device-aware, compensating snapshot rollback helpers used before history deletion. */
 import { resolve as nodeResolve } from "node:path";
+import { readQuery } from "@server/db/worker-read";
 import type { FileChangeEvidenceUncertaintyWarning } from "@shared/file-change-protocol";
 import { and, asc, eq, gte, inArray } from "drizzle-orm";
 import { db } from "../db";
@@ -209,27 +210,33 @@ export function assertSnapshotRevertComplete(result: RevertResult): void {
  * directory is not a workspace, and rolling files back there would be destructive.
  */
 export async function resolveNarratorCwd(narratorId: string): Promise<string | null> {
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { chapterId: true, cwd: true, contextProjectId: true },
-	});
+	const narrator = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { chapterId: true, cwd: true, contextProjectId: true },
+		}),
+	);
 	if (!narrator) return null;
 
 	// An explicit cwd is the session's highest-priority source, so it wins here too.
 	if (narrator.cwd) return narrator.cwd;
 
 	if (narrator.chapterId) {
-		const chapter = await db.query.chapters.findFirst({
-			where: eq(chapters.id, narrator.chapterId),
-			columns: { worktreePath: true, projectId: true },
-		});
+		const chapter = await readQuery(
+			db.query.chapters.findFirst({
+				where: eq(chapters.id, narrator.chapterId),
+				columns: { worktreePath: true, projectId: true },
+			}),
+		);
 		if (chapter?.worktreePath) return chapter.worktreePath;
 		// Chapter dormant: the session falls back to the project repo, so we must too.
 		if (chapter?.projectId) {
-			const project = await db.query.projects.findFirst({
-				where: eq(projects.id, chapter.projectId),
-				columns: { gitPath: true },
-			});
+			const project = await readQuery(
+				db.query.projects.findFirst({
+					where: eq(projects.id, chapter.projectId),
+					columns: { gitPath: true },
+				}),
+			);
 			if (project?.gitPath) return project.gitPath;
 		}
 		return null;
@@ -237,10 +244,12 @@ export async function resolveNarratorCwd(narratorId: string): Promise<string | n
 
 	// Standalone narrator scoped to a project: the session runs in the project repo.
 	if (narrator.contextProjectId) {
-		const project = await db.query.projects.findFirst({
-			where: eq(projects.id, narrator.contextProjectId),
-			columns: { gitPath: true },
-		});
+		const project = await readQuery(
+			db.query.projects.findFirst({
+				where: eq(projects.id, narrator.contextProjectId),
+				columns: { gitPath: true },
+			}),
+		);
 		if (project?.gitPath) return project.gitPath;
 	}
 	return null;
@@ -614,25 +623,27 @@ export async function revertPatchesForMessages(
 	messageIds: string[],
 ): Promise<RevertResult> {
 	if (messageIds.length === 0) return EMPTY_RESULT;
-	const toolCalls = await db.query.narratorToolCalls.findMany({
-		where: and(
-			eq(narratorToolCalls.narratorId, narratorId),
-			inArray(narratorToolCalls.messageId, messageIds),
-			eq(narratorToolCalls.status, "success"),
-		),
-		columns: {
-			toolUseId: true,
-			toolName: true,
-			inputJson: true,
-			executionDeviceId: true,
-			executionCwd: true,
-			executionPathFlavor: true,
-			resolvedFilePath: true,
-			canonicalFilePath: true,
-			runtimeGeneration: true,
-			executionTargetsJson: true,
-		},
-	});
+	const toolCalls = await readQuery(
+		db.query.narratorToolCalls.findMany({
+			where: and(
+				eq(narratorToolCalls.narratorId, narratorId),
+				inArray(narratorToolCalls.messageId, messageIds),
+				eq(narratorToolCalls.status, "success"),
+			),
+			columns: {
+				toolUseId: true,
+				toolName: true,
+				inputJson: true,
+				executionDeviceId: true,
+				executionCwd: true,
+				executionPathFlavor: true,
+				resolvedFilePath: true,
+				canonicalFilePath: true,
+				runtimeGeneration: true,
+				executionTargetsJson: true,
+			},
+		}),
+	);
 	const result = await revertToolCalls(
 		narratorId,
 		toolCalls,
@@ -659,25 +670,27 @@ export async function revertPatchForToolUses(
 	toolUseIds: string[],
 ): Promise<RevertResult> {
 	if (toolUseIds.length === 0) return EMPTY_RESULT;
-	const toolCalls = await db.query.narratorToolCalls.findMany({
-		where: and(
-			eq(narratorToolCalls.narratorId, narratorId),
-			inArray(narratorToolCalls.toolUseId, toolUseIds),
-			eq(narratorToolCalls.status, "success"),
-		),
-		columns: {
-			toolUseId: true,
-			toolName: true,
-			inputJson: true,
-			executionDeviceId: true,
-			executionCwd: true,
-			executionPathFlavor: true,
-			resolvedFilePath: true,
-			canonicalFilePath: true,
-			runtimeGeneration: true,
-			executionTargetsJson: true,
-		},
-	});
+	const toolCalls = await readQuery(
+		db.query.narratorToolCalls.findMany({
+			where: and(
+				eq(narratorToolCalls.narratorId, narratorId),
+				inArray(narratorToolCalls.toolUseId, toolUseIds),
+				eq(narratorToolCalls.status, "success"),
+			),
+			columns: {
+				toolUseId: true,
+				toolName: true,
+				inputJson: true,
+				executionDeviceId: true,
+				executionCwd: true,
+				executionPathFlavor: true,
+				resolvedFilePath: true,
+				canonicalFilePath: true,
+				runtimeGeneration: true,
+				executionTargetsJson: true,
+			},
+		}),
+	);
 	const result = await revertToolCalls(
 		narratorId,
 		toolCalls,
@@ -842,13 +855,15 @@ export async function revertToToolCallTree(
 	narratorId: string,
 	toolUseId: string,
 ): Promise<RevertResult | null> {
-	const toolCall = await db.query.narratorToolCalls.findFirst({
-		where: and(
-			eq(narratorToolCalls.narratorId, narratorId),
-			eq(narratorToolCalls.toolUseId, toolUseId),
-		),
-		columns: { treeHashBefore: true, createdAt: true },
-	});
+	const toolCall = await readQuery(
+		db.query.narratorToolCalls.findFirst({
+			where: and(
+				eq(narratorToolCalls.narratorId, narratorId),
+				eq(narratorToolCalls.toolUseId, toolUseId),
+			),
+			columns: { treeHashBefore: true, createdAt: true },
+		}),
+	);
 	if (!toolCall?.treeHashBefore)
 		return unavailableSnapshotRevert("no_boundaries: no verified tool snapshot is available.");
 	// The tool's own start time bounds the window this rollback undoes.
@@ -860,10 +875,12 @@ export async function revertToMessageTree(
 	narratorId: string,
 	messageId: string,
 ): Promise<RevertResult | null> {
-	const message = await db.query.narratorMessages.findFirst({
-		where: eq(narratorMessages.id, messageId),
-		columns: { treeHashAfter: true },
-	});
+	const message = await readQuery(
+		db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, messageId),
+			columns: { treeHashAfter: true },
+		}),
+	);
 	if (!message?.treeHashAfter)
 		return unavailableSnapshotRevert("no_boundaries: no verified message snapshot is available.");
 	return revertWorkspaceToTree(narratorId, message.treeHashAfter);
@@ -903,28 +920,30 @@ async function resolveMessagesTreeBoundary(
 	messageIds: string[],
 ): Promise<TreeBoundary | null> {
 	if (messageIds.length === 0) return null;
-	const [earliest] = await db
-		.select({
-			treeHashBefore: narratorToolCalls.treeHashBefore,
-			createdAt: narratorToolCalls.createdAt,
-		})
-		.from(narratorToolCalls)
-		.innerJoin(
-			narratorMessageRefs,
-			and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessageRefs.messageId, narratorToolCalls.messageId),
-			),
-		)
-		.where(
-			and(
-				eq(narratorToolCalls.narratorId, narratorId),
-				eq(narratorToolCalls.status, "success"),
-				inArray(narratorToolCalls.messageId, messageIds),
-			),
-		)
-		.orderBy(asc(narratorMessageRefs.seq), asc(narratorToolCalls.createdAt))
-		.limit(1);
+	const [earliest] = await readQuery(
+		db
+			.select({
+				treeHashBefore: narratorToolCalls.treeHashBefore,
+				createdAt: narratorToolCalls.createdAt,
+			})
+			.from(narratorToolCalls)
+			.innerJoin(
+				narratorMessageRefs,
+				and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					eq(narratorMessageRefs.messageId, narratorToolCalls.messageId),
+				),
+			)
+			.where(
+				and(
+					eq(narratorToolCalls.narratorId, narratorId),
+					eq(narratorToolCalls.status, "success"),
+					inArray(narratorToolCalls.messageId, messageIds),
+				),
+			)
+			.orderBy(asc(narratorMessageRefs.seq), asc(narratorToolCalls.createdAt))
+			.limit(1),
+	);
 	return earliest?.treeHashBefore
 		? { treeHash: earliest.treeHashBefore, startedAt: earliest.createdAt }
 		: null;
@@ -935,28 +954,30 @@ async function resolveSeqTreeBoundary(
 	narratorId: string,
 	minSeq: number,
 ): Promise<TreeBoundary | null> {
-	const [earliest] = await db
-		.select({
-			treeHashBefore: narratorToolCalls.treeHashBefore,
-			createdAt: narratorToolCalls.createdAt,
-		})
-		.from(narratorToolCalls)
-		.innerJoin(
-			narratorMessageRefs,
-			and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessageRefs.messageId, narratorToolCalls.messageId),
-			),
-		)
-		.where(
-			and(
-				eq(narratorToolCalls.narratorId, narratorId),
-				eq(narratorToolCalls.status, "success"),
-				gte(narratorMessageRefs.seq, minSeq),
-			),
-		)
-		.orderBy(asc(narratorMessageRefs.seq), asc(narratorToolCalls.createdAt))
-		.limit(1);
+	const [earliest] = await readQuery(
+		db
+			.select({
+				treeHashBefore: narratorToolCalls.treeHashBefore,
+				createdAt: narratorToolCalls.createdAt,
+			})
+			.from(narratorToolCalls)
+			.innerJoin(
+				narratorMessageRefs,
+				and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					eq(narratorMessageRefs.messageId, narratorToolCalls.messageId),
+				),
+			)
+			.where(
+				and(
+					eq(narratorToolCalls.narratorId, narratorId),
+					eq(narratorToolCalls.status, "success"),
+					gte(narratorMessageRefs.seq, minSeq),
+				),
+			)
+			.orderBy(asc(narratorMessageRefs.seq), asc(narratorToolCalls.createdAt))
+			.limit(1),
+	);
 	return earliest?.treeHashBefore
 		? { treeHash: earliest.treeHashBefore, startedAt: earliest.createdAt }
 		: null;

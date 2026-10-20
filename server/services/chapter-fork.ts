@@ -1,5 +1,6 @@
 import { mkdirSync } from "node:fs";
 import { dirname, isAbsolute, relative, resolve } from "node:path";
+import { readQuery } from "@server/db/worker-read";
 import type { ForkWorktreeSource } from "@shared/chapter-fork";
 import { and, desc, eq, isNotNull, lte, sql } from "drizzle-orm";
 import { db } from "../db";
@@ -118,23 +119,29 @@ async function resolveForkPointMessage(
 ): Promise<{ id: string; messageUuid: string | null } | null> {
 	const resolved = await (async () => {
 		if (input.forkAtMessageId) {
-			const byId = await db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, input.forkAtMessageId),
-				columns: { id: true, messageUuid: true, parentToolUseId: true },
-			});
+			const byId = await readQuery(
+				db.query.narratorMessages.findFirst({
+					where: eq(narratorMessages.id, input.forkAtMessageId),
+					columns: { id: true, messageUuid: true, parentToolUseId: true },
+				}),
+			);
 			if (!byId) throw new ValidationError("Fork message not found");
 			return byId;
 		}
 		if (input.forkAtMessageUuid) {
-			const byUuid = await db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.messageUuid, input.forkAtMessageUuid),
-				columns: { id: true, messageUuid: true, parentToolUseId: true },
-			});
+			const byUuid = await readQuery(
+				db.query.narratorMessages.findFirst({
+					where: eq(narratorMessages.messageUuid, input.forkAtMessageUuid),
+					columns: { id: true, messageUuid: true, parentToolUseId: true },
+				}),
+			);
 			if (byUuid) return byUuid;
-			const byId = await db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, input.forkAtMessageUuid),
-				columns: { id: true, messageUuid: true, parentToolUseId: true },
-			});
+			const byId = await readQuery(
+				db.query.narratorMessages.findFirst({
+					where: eq(narratorMessages.id, input.forkAtMessageUuid),
+					columns: { id: true, messageUuid: true, parentToolUseId: true },
+				}),
+			);
 			if (!byId) throw new ValidationError("Fork message not found");
 			return byId;
 		}
@@ -150,10 +157,12 @@ async function resolveForkPointMessage(
 		);
 	}
 
-	const primaryNarrator = await db.query.narrators.findFirst({
-		where: and(eq(narrators.chapterId, chapterId), eq(narrators.variant, "primary")),
-		columns: { id: true },
-	});
+	const primaryNarrator = await readQuery(
+		db.query.narrators.findFirst({
+			where: and(eq(narrators.chapterId, chapterId), eq(narrators.variant, "primary")),
+			columns: { id: true },
+		}),
+	);
 	if (!primaryNarrator) {
 		throw new ValidationError(
 			"This chapter has no primary narrator, so a message cannot be used as a fork point.",
@@ -165,13 +174,15 @@ async function resolveForkPointMessage(
 	await ensureRefsCoverMessage(primaryNarrator.id, resolved.id).catch(() => {
 		// A backfill failure is reported by the membership check below.
 	});
-	const ref = await db.query.narratorMessageRefs.findFirst({
-		where: and(
-			eq(narratorMessageRefs.narratorId, primaryNarrator.id),
-			eq(narratorMessageRefs.messageId, resolved.id),
-		),
-		columns: { seq: true },
-	});
+	const ref = await readQuery(
+		db.query.narratorMessageRefs.findFirst({
+			where: and(
+				eq(narratorMessageRefs.narratorId, primaryNarrator.id),
+				eq(narratorMessageRefs.messageId, resolved.id),
+			),
+			columns: { seq: true },
+		}),
+	);
 	if (!ref) {
 		throw new ValidationError(
 			"That message does not belong to this chapter's conversation, so it cannot be used " +
@@ -188,9 +199,11 @@ export const chapterFork = {
 	 * Creates a new branch + worktree from the parent's current state.
 	 */
 	async fork(parentChapterId: string, input: ForkChapterInput) {
-		const parent = await db.query.chapters.findFirst({
-			where: eq(chapters.id, parentChapterId),
-		});
+		const parent = await readQuery(
+			db.query.chapters.findFirst({
+				where: eq(chapters.id, parentChapterId),
+			}),
+		);
 		if (!parent) throw new NotFoundError("Chapter", parentChapterId);
 		// A dormant parent is forkable; a merged or abandoned one is not.
 		//
@@ -231,9 +244,11 @@ export const chapterFork = {
 			);
 		}
 
-		const project = await db.query.projects.findFirst({
-			where: eq(projects.id, parent.projectId),
-		});
+		const project = await readQuery(
+			db.query.projects.findFirst({
+				where: eq(projects.id, parent.projectId),
+			}),
+		);
 		if (!project?.gitPath) throw new ValidationError("Project has no git repository configured");
 		const gitPath = project.gitPath;
 		return withChapterCreation(project.id, gitPath, async () => {
@@ -587,10 +602,12 @@ export const chapterFork = {
 							// If it becomes worth fixing, do it with the constraint.
 							//
 							// Find all chapters already anchored to this commit to avoid overlap
-							const existing = await db
-								.select({ crossOffset: chapters.crossOffset })
-								.from(chapters)
-								.where(eq(chapters.anchorCommitSha, commitSha));
+							const existing = await readQuery(
+								db
+									.select({ crossOffset: chapters.crossOffset })
+									.from(chapters)
+									.where(eq(chapters.anchorCommitSha, commitSha)),
+							);
 							const occupied = new Set(
 								existing.map((r) => Math.round((r.crossOffset ?? 0) / NODE_CROSS_SIZE)),
 							);
@@ -682,12 +699,14 @@ export const chapterFork = {
 						}
 
 						// Step 4: Fork the chapter's primary narrator
-						const primaryNarrator = await db.query.narrators.findFirst({
-							where: and(
-								eq(narrators.chapterId, parentChapterId),
-								eq(narrators.variant, "primary"),
-							),
-						});
+						const primaryNarrator = await readQuery(
+							db.query.narrators.findFirst({
+								where: and(
+									eq(narrators.chapterId, parentChapterId),
+									eq(narrators.variant, "primary"),
+								),
+							}),
+						);
 						if (primaryNarrator) {
 							const forked = await narratorService.forkNarrator(primaryNarrator.id, null, {
 								title,
@@ -843,18 +862,22 @@ export const chapterFork = {
 		};
 
 		// Find the primary narrator for this chapter
-		const primaryNarrator = await db.query.narrators.findFirst({
-			where: and(eq(narrators.chapterId, chapterId), eq(narrators.variant, "primary")),
-		});
+		const primaryNarrator = await readQuery(
+			db.query.narrators.findFirst({
+				where: and(eq(narrators.chapterId, chapterId), eq(narrators.variant, "primary")),
+			}),
+		);
 		if (!primaryNarrator) {
 			logger.warn("No primary narrator found for commit resolution, using HEAD", { chapterId });
 			return chapterTip();
 		}
 
-		const targetMsg = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, messageId),
-			columns: { id: true, commitSha: true },
-		});
+		const targetMsg = await readQuery(
+			db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, messageId),
+				columns: { id: true, commitSha: true },
+			}),
+		);
 		if (!targetMsg) {
 			logger.warn("Fork message not found, using HEAD", { messageId });
 			return chapterTip();
@@ -866,33 +889,37 @@ export const chapterFork = {
 		}
 
 		// Find the target message's seq in the narrator's refs
-		const targetRef = await db.query.narratorMessageRefs.findFirst({
-			where: and(
-				eq(narratorMessageRefs.narratorId, primaryNarrator.id),
-				eq(narratorMessageRefs.messageId, targetMsg.id),
-			),
-		});
+		const targetRef = await readQuery(
+			db.query.narratorMessageRefs.findFirst({
+				where: and(
+					eq(narratorMessageRefs.narratorId, primaryNarrator.id),
+					eq(narratorMessageRefs.messageId, targetMsg.id),
+				),
+			}),
+		);
 		if (!targetRef) {
 			logger.warn("Fork message not in narrator refs, using HEAD", { messageId });
 			return chapterTip();
 		}
 
 		// Walk backwards from the target message to find the nearest commitSha
-		const rows = await db
-			.select({
-				commitSha: narratorMessages.commitSha,
-			})
-			.from(narratorMessageRefs)
-			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, primaryNarrator.id),
-					sql`${narratorMessageRefs.seq} <= ${targetRef.seq}`,
-					isNotNull(narratorMessages.commitSha),
-				),
-			)
-			.orderBy(desc(narratorMessageRefs.seq))
-			.limit(1);
+		const rows = await readQuery(
+			db
+				.select({
+					commitSha: narratorMessages.commitSha,
+				})
+				.from(narratorMessageRefs)
+				.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, primaryNarrator.id),
+						sql`${narratorMessageRefs.seq} <= ${targetRef.seq}`,
+						isNotNull(narratorMessages.commitSha),
+					),
+				)
+				.orderBy(desc(narratorMessageRefs.seq))
+				.limit(1),
+		);
 
 		if (rows.length > 0 && rows[0].commitSha) {
 			return rows[0].commitSha;
@@ -1010,37 +1037,43 @@ export const chapterFork = {
 		chapterId: string,
 		messageId: string,
 	): Promise<{ treeHash: string; commitSha: string | null } | null> {
-		const primaryNarrator = await db.query.narrators.findFirst({
-			where: and(eq(narrators.chapterId, chapterId), eq(narrators.variant, "primary")),
-			columns: { id: true },
-		});
+		const primaryNarrator = await readQuery(
+			db.query.narrators.findFirst({
+				where: and(eq(narrators.chapterId, chapterId), eq(narrators.variant, "primary")),
+				columns: { id: true },
+			}),
+		);
 		if (!primaryNarrator) return null;
 
-		const targetRef = await db.query.narratorMessageRefs.findFirst({
-			where: and(
-				eq(narratorMessageRefs.narratorId, primaryNarrator.id),
-				eq(narratorMessageRefs.messageId, messageId),
-			),
-			columns: { seq: true },
-		});
+		const targetRef = await readQuery(
+			db.query.narratorMessageRefs.findFirst({
+				where: and(
+					eq(narratorMessageRefs.narratorId, primaryNarrator.id),
+					eq(narratorMessageRefs.messageId, messageId),
+				),
+				columns: { seq: true },
+			}),
+		);
 		if (!targetRef) return null;
 
-		const [row] = await db
-			.select({
-				treeHashAfter: narratorMessages.treeHashAfter,
-				snapshotCommitSha: narratorMessages.snapshotCommitSha,
-			})
-			.from(narratorMessageRefs)
-			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, primaryNarrator.id),
-					lte(narratorMessageRefs.seq, targetRef.seq),
-					isNotNull(narratorMessages.treeHashAfter),
-				),
-			)
-			.orderBy(desc(narratorMessageRefs.seq))
-			.limit(1);
+		const [row] = await readQuery(
+			db
+				.select({
+					treeHashAfter: narratorMessages.treeHashAfter,
+					snapshotCommitSha: narratorMessages.snapshotCommitSha,
+				})
+				.from(narratorMessageRefs)
+				.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, primaryNarrator.id),
+						lte(narratorMessageRefs.seq, targetRef.seq),
+						isNotNull(narratorMessages.treeHashAfter),
+					),
+				)
+				.orderBy(desc(narratorMessageRefs.seq))
+				.limit(1),
+		);
 
 		if (!row?.treeHashAfter) return null;
 		return { treeHash: row.treeHashAfter, commitSha: row.snapshotCommitSha ?? null };
@@ -1057,23 +1090,29 @@ export const chapterFork = {
 		chapterId: string,
 		messageId: string,
 	): Promise<Map<string, string | null>> {
-		const primaryNarrator = await db.query.narrators.findFirst({
-			where: and(eq(narrators.chapterId, chapterId), eq(narrators.variant, "primary")),
-		});
+		const primaryNarrator = await readQuery(
+			db.query.narrators.findFirst({
+				where: and(eq(narrators.chapterId, chapterId), eq(narrators.variant, "primary")),
+			}),
+		);
 		if (!primaryNarrator) return new Map();
 
-		const targetMsg = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, messageId),
-			columns: { id: true },
-		});
+		const targetMsg = await readQuery(
+			db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, messageId),
+				columns: { id: true },
+			}),
+		);
 		if (!targetMsg) return new Map();
 
-		const targetRef = await db.query.narratorMessageRefs.findFirst({
-			where: and(
-				eq(narratorMessageRefs.narratorId, primaryNarrator.id),
-				eq(narratorMessageRefs.messageId, targetMsg.id),
-			),
-		});
+		const targetRef = await readQuery(
+			db.query.narratorMessageRefs.findFirst({
+				where: and(
+					eq(narratorMessageRefs.narratorId, primaryNarrator.id),
+					eq(narratorMessageRefs.messageId, targetMsg.id),
+				),
+			}),
+		);
 		if (!targetRef) return new Map();
 
 		return rebuildFileStatesAtMessage(primaryNarrator.id, targetMsg.id);

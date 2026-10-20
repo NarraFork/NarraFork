@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 import { FOLLOW_PARENT_MODEL, type SubagentModelInheritance } from "@shared/model-inheritance";
 import type { ReasoningEffort } from "@shared/reasoning-effort";
 import { isSubagentReasoningEffort } from "@shared/subagent-model-policy";
@@ -93,17 +94,19 @@ export async function resolveSubagentModelInheritance(
 	if (!sourceId) {
 		throw new ValidationError("Following a model requires a registered source narrator");
 	}
-	const source = await db.query.narrators.findFirst({
-		where: eq(narrators.id, sourceId),
-		columns: {
-			...RUNTIME_SOURCE_COLUMNS,
-			model: true,
-			reasoningEffort: true,
-			traits: true,
-			chapterId: true,
-			contextProjectId: true,
-		},
-	});
+	const source = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, sourceId),
+			columns: {
+				...RUNTIME_SOURCE_COLUMNS,
+				model: true,
+				reasoningEffort: true,
+				traits: true,
+				chapterId: true,
+				contextProjectId: true,
+			},
+		}),
+	);
 	if (!source || source.model === FOLLOW_PARENT_MODEL) {
 		throw new ValidationError("Cannot resolve the source narrator's model");
 	}

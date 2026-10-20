@@ -2,9 +2,11 @@ import { logger } from "../logger";
 import { envWithAmbientProxy } from "../net/proxy-env";
 import type { IFileChange } from "./types";
 import {
+	WATCHER_STAGES,
 	WATCHER_WORKER_FLAG,
 	type WatcherParentMessage,
 	type WatcherWorkerMessage,
+	type WorkerStageMessage,
 } from "./worker-protocol";
 
 export interface WorkerSubscription {
@@ -125,6 +127,13 @@ export function asWorkerStdinSink(stdin: unknown): WorkerStdinSink | undefined {
 
 interface PendingRequest {
 	description: string;
+	watchId?: string;
+	started: number;
+	parentSendStartMs?: number;
+	parentFlushEndMs?: number;
+	stages: Partial<Record<WorkerStageMessage["stage"], WorkerStageMessage>>;
+	lastStage?: WorkerStageMessage;
+	lastStageReceived?: number;
 	resolve: (message: WatcherWorkerMessage) => void;
 	reject: (error: Error) => void;
 	timer: ReturnType<typeof setTimeout>;
@@ -151,6 +160,11 @@ export class ParcelWorkerClient {
 	private shuttingDown = false;
 	private restartAttempts = 0;
 	private disabledReason: string | undefined;
+	private workerStarted = 0;
+	private workerReadyMs: number | undefined;
+	private diagnosticWindow = 0;
+	private diagnosticCount = 0;
+	private suppressedDiagnostics = 0;
 
 	constructor(
 		private readonly onEvents: (rootPath: string, events: IFileChange[]) => void,
@@ -230,7 +244,12 @@ export class ParcelWorkerClient {
 		description: string,
 	): Promise<WatcherWorkerMessage> {
 		const requestId = message.requestId;
-		const pending = this.createPending(requestId, timeoutMs, description);
+		const pending = this.createPending(
+			requestId,
+			timeoutMs,
+			description,
+			"id" in message ? message.id.slice(0, 256) : undefined,
+		);
 
 		try {
 			await this.send(message);
@@ -275,6 +294,8 @@ export class ParcelWorkerClient {
 	private async startWorker(): Promise<void> {
 		const command = buildWorkerCommand();
 		this.shuttingDown = false;
+		this.workerStarted = performance.now();
+		this.workerReadyMs = undefined;
 
 		const readyPromise = new Promise<void>((resolve, reject) => {
 			const timer = setTimeout(() => {
@@ -388,7 +409,11 @@ export class ParcelWorkerClient {
 		}
 
 		switch (message.type) {
+			case "stage":
+				this.recordStage(message);
+				break;
 			case "ready":
+				this.workerReadyMs = Math.round(performance.now() - this.workerStarted);
 				this.resolveReady();
 				logger.debug("[ParcelWatcher] worker reported ready", {
 					pid: message.pid,
@@ -410,7 +435,9 @@ export class ParcelWorkerClient {
 			}
 			case "error":
 				if (message.requestId) {
-					this.rejectPending(message.requestId, new Error(message.error));
+					const error = new Error(message.error);
+					if (typeof message.errorName === "string") error.name = message.errorName.slice(0, 80);
+					this.rejectPending(message.requestId, error);
 				} else {
 					logger.warn("[ParcelWatcher] worker error", {
 						id: message.id,
@@ -424,17 +451,132 @@ export class ParcelWorkerClient {
 		}
 	}
 
+	private recordStage(message: WorkerStageMessage): void {
+		const pending = this.pending.get(message.requestId);
+		if (
+			!pending ||
+			typeof message.watchId !== "string" ||
+			message.watchId !== pending.watchId ||
+			!WATCHER_STAGES.includes(message.stage) ||
+			Object.hasOwn(pending.stages, message.stage)
+		)
+			return;
+		const numbers = [
+			message.workerElapsedMs,
+			message.workerStageDurationMs,
+			message.activeWatches,
+			message.starting,
+			message.stopping,
+		];
+		if (numbers.some((value) => !Number.isSafeInteger(value) || value < 0)) return;
+		// Copy only the fixed schema, never arbitrary fields received from stdout.
+		const stage: WorkerStageMessage = {
+			type: "stage",
+			requestId: message.requestId,
+			watchId: message.watchId,
+			stage: message.stage,
+			workerElapsedMs: message.workerElapsedMs,
+			workerStageDurationMs: message.workerStageDurationMs,
+			activeWatches: message.activeWatches,
+			starting: message.starting,
+			stopping: message.stopping,
+			errorName: typeof message.errorName === "string" ? message.errorName.slice(0, 80) : undefined,
+			errorMessage:
+				typeof message.errorMessage === "string" ? message.errorMessage.slice(0, 256) : undefined,
+		};
+		pending.stages[stage.stage] = stage;
+		pending.lastStage = stage;
+		pending.lastStageReceived = performance.now();
+	}
+
+	private reportRequest(
+		requestId: string,
+		pending: PendingRequest,
+		outcome: "ack" | "timeout" | "error" | "cancelled",
+		error?: Error,
+	): void {
+		try {
+			const now = performance.now();
+			const failed = outcome !== "ack" || !!pending.stages.unsubscribe_error;
+			// Bound persistent diagnostics during repeated failures (including cancellation storms).
+			if (now - this.diagnosticWindow >= 60_000) {
+				this.diagnosticWindow = now;
+				this.diagnosticCount = 0;
+			}
+			if (failed && this.diagnosticCount >= 10) {
+				this.suppressedDiagnostics = Math.min(
+					this.suppressedDiagnostics + 1,
+					Number.MAX_SAFE_INTEGER,
+				);
+				return;
+			}
+			if (failed) this.diagnosticCount++;
+			const stages = Object.values(pending.stages).map((stage) => ({
+				stage: stage.stage,
+				workerElapsedMs: stage.workerElapsedMs,
+				workerStageDurationMs: stage.workerStageDurationMs,
+				activeWatches: stage.activeWatches,
+				starting: stage.starting,
+				stopping: stage.stopping,
+				errorName: stage.errorName,
+				errorMessage: stage.errorMessage,
+			}));
+			logger[failed ? "warn" : "debug"]("[ParcelWatcher] request lifecycle", {
+				requestId: requestId.slice(0, 80),
+				watchId: pending.watchId,
+				outcome,
+				errorName: error?.name.slice(0, 80),
+				errorMessage: error?.message.slice(0, 256),
+				parentElapsedMs: Math.round(now - pending.started),
+				parentSendStartMs: pending.parentSendStartMs ?? null,
+				parentFlushEndMs: pending.parentFlushEndMs ?? null,
+				parentAckReceivedMs: outcome === "ack" ? Math.round(now - pending.started) : null,
+				workerReadyMs: this.workerReadyMs ?? null,
+				workerPid: this.proc?.pid ?? null,
+				workerState: this.shuttingDown
+					? "shutting_down"
+					: !this.proc
+						? "absent"
+						: this.workerReadyMs === undefined
+							? "starting"
+							: "ready",
+				lastWorkerStage: pending.lastStage?.stage ?? null,
+				// Worker elapsed/duration and parent elapsed/age have independent clock origins.
+				parentLastStageAgeMs:
+					pending.lastStageReceived === undefined
+						? null
+						: Math.round(now - pending.lastStageReceived),
+				stages,
+				suppressedDiagnostics: this.suppressedDiagnostics,
+			});
+			if (failed) this.suppressedDiagnostics = 0;
+		} catch {
+			// Logging failures must not hide the original ACK/error or prevent cleanup.
+		}
+	}
+
 	private createPending(
 		requestId: string,
 		timeoutMs: number,
 		description: string,
+		watchId?: string,
 	): Promise<WatcherWorkerMessage> {
 		const promise = new Promise<WatcherWorkerMessage>((resolve, reject) => {
 			const timer = setTimeout(() => {
+				const entry = this.pending.get(requestId);
+				if (entry) this.reportRequest(requestId, entry, "timeout");
 				this.pending.delete(requestId);
 				reject(new Error(`${description} timed out after ${timeoutMs}ms`));
 			}, timeoutMs);
-			this.pending.set(requestId, { description, resolve, reject, timer });
+			this.pending.set(requestId, {
+				description,
+				watchId,
+				resolve,
+				reject,
+				timer,
+				started: performance.now(),
+				stages: {},
+			});
 		});
 		// Mark handled immediately: abort/shutdown/timeout may reject before the
 		// caller awaits (send failed first). Callers still observe the rejection
@@ -449,6 +591,7 @@ export class ParcelWorkerClient {
 		if (!pending) return;
 		this.pending.delete(requestId);
 		clearTimeout(pending.timer);
+		this.reportRequest(requestId, pending, "ack");
 		pending.resolve(message);
 	}
 
@@ -457,12 +600,14 @@ export class ParcelWorkerClient {
 		if (!pending) return;
 		this.pending.delete(requestId);
 		clearTimeout(pending.timer);
+		this.reportRequest(requestId, pending, "error", error);
 		pending.reject(error);
 	}
 
 	private clearAllPending(error: Error): void {
 		for (const [requestId, pending] of this.pending) {
 			clearTimeout(pending.timer);
+			this.reportRequest(requestId, pending, "cancelled", error);
 			pending.reject(error);
 			this.pending.delete(requestId);
 		}
@@ -499,9 +644,12 @@ export class ParcelWorkerClient {
 		const next = this.writeQueue
 			.catch(() => {})
 			.then(async () => {
+				const pending = "requestId" in message ? this.pending.get(message.requestId) : undefined;
+				if (pending) pending.parentSendStartMs = Math.round(performance.now() - pending.started);
 				const stdin = this.getFileSink();
 				if (!stdin) throw new Error("watcher worker stdin is not available");
 				await writeFileSinkCommand(stdin, data);
+				if (pending) pending.parentFlushEndMs = Math.round(performance.now() - pending.started);
 			});
 		this.writeQueue = next;
 		return next;

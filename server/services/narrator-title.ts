@@ -1,6 +1,7 @@
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import { chapters, narrators } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { summaryGenerateWithHistory } from "../lib/agent";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
@@ -8,6 +9,7 @@ import { getPrompt, type Locale } from "../lib/prompt-i18n";
 import { settings } from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { narratorService } from "./narrator-service";
+import { recordNarratorShutdownFailure, withNarratorWorkAdmission } from "./narrator-session-state";
 
 /**
  * Persist a generated title to DB and broadcast. Isolated so both quick and
@@ -24,6 +26,7 @@ export async function persistTitle(narratorId: string, title: string): Promise<b
 
 		return true;
 	} catch (err) {
+		recordNarratorShutdownFailure(err);
 		logger.error("Failed to persist title after retries", {
 			narratorId,
 			title,
@@ -39,17 +42,23 @@ export async function persistTitle(narratorId: string, title: string): Promise<b
  */
 async function syncTitleToChapter(narratorId: string, title: string): Promise<void> {
 	try {
-		const narrator = await db.query.narrators.findFirst({
-			where: eq(narrators.id, narratorId),
-			columns: { chapterId: true, type: true },
-		});
+		const narrator = await readQuery(
+			db.query.narrators.findFirst({
+				where: eq(narrators.id, narratorId),
+				columns: { chapterId: true, type: true },
+			}),
+			{ site: "narrator-title.syncTitleToChapter" },
+		);
 		if (!narrator?.chapterId || narrator.type !== "primary") return;
 
 		// Skip if chapter title is already identical
-		const chapter = await db.query.chapters.findFirst({
-			where: eq(chapters.id, narrator.chapterId),
-			columns: { title: true },
-		});
+		const chapter = await readQuery(
+			db.query.chapters.findFirst({
+				where: eq(chapters.id, narrator.chapterId),
+				columns: { title: true },
+			}),
+			{ site: "narrator-title.syncTitleToChapter" },
+		);
 		if (chapter?.title === title) return;
 
 		const now = new Date().toISOString();
@@ -58,6 +67,7 @@ async function syncTitleToChapter(narratorId: string, title: string): Promise<vo
 			.set({ title, updatedAt: now })
 			.where(eq(chapters.id, narrator.chapterId));
 	} catch (err) {
+		recordNarratorShutdownFailure(err);
 		logger.warn("Failed to sync title to chapter (non-fatal)", {
 			narratorId,
 			title,
@@ -72,10 +82,13 @@ async function syncTitleToChapter(narratorId: string, title: string): Promise<vo
  */
 export async function syncTitleToNarrator(chapterId: string, title: string): Promise<void> {
 	try {
-		const primaryNarrator = await db.query.narrators.findFirst({
-			where: and(eq(narrators.chapterId, chapterId), eq(narrators.variant, "primary")),
-			columns: { id: true, title: true },
-		});
+		const primaryNarrator = await readQuery(
+			db.query.narrators.findFirst({
+				where: and(eq(narrators.chapterId, chapterId), eq(narrators.variant, "primary")),
+				columns: { id: true, title: true },
+			}),
+			{ site: "narrator-title.syncTitleToNarrator" },
+		);
 		if (!primaryNarrator) return;
 		if (primaryNarrator.title === title) return; // already in sync
 
@@ -196,12 +209,21 @@ export async function generateTitle(
 	});
 
 	const TITLE_TIMEOUT_MS = 30_000;
-	const titlePromise = summaryGenerateWithHistory(
-		titlePrompt.replace(/<conversation>\s*$/, "").trim(),
-		`<conversation>\n${conversationText}\n</conversation>`,
-		locale,
-		{ narratorId, userId, kind: "title" },
+	const titleOutcome = withNarratorWorkAdmission(narratorId, () =>
+		summaryGenerateWithHistory(
+			titlePrompt.replace(/<conversation>\s*$/, "").trim(),
+			`<conversation>\n${conversationText}\n</conversation>`,
+			locale,
+			{ narratorId, userId, kind: "title" },
+		).then(
+			(title) => ({ title }),
+			(error: unknown) => ({ error }),
+		),
 	);
+	const titlePromise = titleOutcome.then((outcome) => {
+		if ("error" in outcome) throw outcome.error;
+		return outcome.title;
+	});
 
 	let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
 	const timeoutPromise = new Promise<never>((_, reject) => {
@@ -273,10 +295,21 @@ export function buildQuickTitleSource(userMessage: string): string {
  * Generate a quick title from just the user message (before AI replies).
  * Fire-and-forget — errors are logged, not thrown.
  */
-export async function generateQuickTitle(
+export function generateQuickTitle(
 	narratorId: string,
 	userMessage: string,
 	locale: Locale = "en",
+	userId?: string | null,
+): Promise<void> {
+	return withNarratorWorkAdmission(narratorId, () =>
+		generateQuickTitleUnlocked(narratorId, userMessage, locale, userId),
+	);
+}
+
+async function generateQuickTitleUnlocked(
+	narratorId: string,
+	userMessage: string,
+	locale: Locale,
 	userId?: string | null,
 ): Promise<void> {
 	try {
@@ -290,12 +323,22 @@ export async function generateQuickTitle(
 		});
 
 		const TITLE_TIMEOUT_MS = 30_000;
-		const titlePromise = summaryGenerateWithHistory(
-			titlePrompt.replace(/<user_message>\s*$/, "").trim(),
-			`<user_message>\n${truncated}\n</user_message>`,
-			locale,
-			{ narratorId, userId, kind: "title" },
+		// The response/usage tail remains owned even if the UI title deadline wins.
+		const titleOutcome = withNarratorWorkAdmission(narratorId, () =>
+			summaryGenerateWithHistory(
+				titlePrompt.replace(/<user_message>\s*$/, "").trim(),
+				`<user_message>\n${truncated}\n</user_message>`,
+				locale,
+				{ narratorId, userId, kind: "title" },
+			).then(
+				(title) => ({ title }),
+				(error: unknown) => ({ error }),
+			),
 		);
+		const titlePromise = titleOutcome.then((outcome) => {
+			if ("error" in outcome) throw outcome.error;
+			return outcome.title;
+		});
 
 		let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
 		const timeoutPromise = new Promise<never>((_, reject) => {

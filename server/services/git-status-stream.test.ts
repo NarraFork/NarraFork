@@ -104,6 +104,10 @@ describe("bounded status runner", () => {
 		const result = await readGitStatusStream("repo", new AbortController().signal);
 		expect(result.budgetReason).toBeUndefined();
 		expect(result.parser.totalFiles).toBe(1);
+		expect(result.diagnostics.parsedBytes).toBe(8);
+		expect(result.diagnostics.maxBytes).toBe(GIT_STATUS_MAX_BYTES);
+		expect(result.diagnostics.parseMs).toBeGreaterThanOrEqual(0);
+		expect(result.diagnostics.wallMs).toBeGreaterThanOrEqual(0);
 	});
 
 	test("intentional byte stop returns only complete records even with nonzero exit", async () => {

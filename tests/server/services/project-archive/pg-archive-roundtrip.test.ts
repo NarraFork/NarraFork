@@ -173,7 +173,7 @@ async function seedPg(pgDb: BunSQLDatabase): Promise<void> {
 
 /** Write the archive file from the PG main database through the port's reads. */
 async function exportArchive(pgStore: PgStore, gitPath: string): Promise<void> {
-	const pdb = projectDbManager.openForGitPath(PROJECT_ID, gitPath);
+	const pdb = await projectDbManager.openForGitPath(PROJECT_ID, gitPath);
 	const chapterIds = [FIXTURE.parentChapterId, FIXTURE.childChapterId];
 	const narratorIds = [FIXTURE.parentNarratorId, FIXTURE.childNarratorId];
 	await copyTable(pgStore, pdb, "projects", {
@@ -194,7 +194,7 @@ async function exportArchive(pgStore: PgStore, gitPath: string): Promise<void> {
 	await copyTable(pgStore, pdb, "narrator_message_refs", {
 		filter: { column: "narrator_id", values: narratorIds },
 	});
-	projectDbManager.close(PROJECT_ID);
+	await projectDbManager.close(PROJECT_ID);
 }
 
 /** Read every table back out of the archive file, in import order. */
@@ -203,12 +203,12 @@ async function batchesFromArchive(gitPath: string): Promise<ArchiveBatch[]> {
 	try {
 		const batches: ArchiveBatch[] = [];
 		for (const table of ARCHIVE_TABLE_ORDER) {
-			const columns = archive.columnsFor(table);
+			const columns = await archive.columnsFor(table);
 			if (columns.length === 0) continue;
 			const rows: ArchiveRow[] = [];
 			let after: string | null = null;
 			for (;;) {
-				const result = archive.readTable(table, columns, { limit: 500, after });
+				const result = await archive.readTable(table, columns, { limit: 500, after });
 				rows.push(...result.rows);
 				if (result.nextCursor === null) break;
 				after = result.nextCursor;
@@ -217,7 +217,7 @@ async function batchesFromArchive(gitPath: string): Promise<ArchiveBatch[]> {
 		}
 		return batches;
 	} finally {
-		archive.close();
+		await archive.close();
 	}
 }
 

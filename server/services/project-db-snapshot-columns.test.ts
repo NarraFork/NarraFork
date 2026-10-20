@@ -25,7 +25,7 @@ const createdProjects: string[] = [];
 
 afterEach(async () => {
 	for (const projectId of createdProjects.splice(0)) {
-		projectDbManager.close(projectId);
+		await projectDbManager.close(projectId);
 		await db.delete(chapters).where(eq(chapters.projectId, projectId));
 		await db.delete(projects).where(eq(projects.id, projectId));
 	}
@@ -103,7 +103,7 @@ describe("project database snapshot columns", () => {
 			pdb.run(
 				"UPDATE narrators SET prune_enabled=1,prune_boundary_message_id='obsolete',pruned_percent=75",
 			);
-			projectDbManager.close(projectId);
+			await projectDbManager.close(projectId);
 			await db.delete(narrators).where(eq(narrators.id, narratorId));
 			await db.delete(chapters).where(eq(chapters.projectId, projectId));
 			await db.delete(projects).where(eq(projects.id, projectId));

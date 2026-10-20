@@ -1,3 +1,4 @@
+import { readQuery, readQueryFirst } from "@server/db/worker-read";
 /**
  * IM Gateway core.
  *
@@ -72,11 +73,9 @@ import type {
  * account on the mapping) rather than reusing this one.
  */
 export async function resolveGatewayAppUserId(): Promise<string | null> {
-	const allUsers = await db
-		.select({ id: users.id, role: users.role })
-		.from(users)
-		.orderBy(users.createdAt)
-		.limit(5);
+	const allUsers = await readQuery(
+		db.select({ id: users.id, role: users.role }).from(users).orderBy(users.createdAt).limit(5),
+	);
 	if (allUsers.length === 0) return null;
 	if (allUsers.length === 1) return allUsers[0].id;
 	// Multi-user: prefer admin
@@ -480,13 +479,15 @@ class Gateway {
 		const now = new Date().toISOString();
 
 		// Look up existing mapping
-		const existing = await db.query.gatewaySessionMappings.findFirst({
-			where: and(
-				eq(gatewaySessionMappings.platform, msg.platform),
-				eq(gatewaySessionMappings.chatId, msg.chatId),
-				eq(gatewaySessionMappings.userId, msg.userId),
-			),
-		});
+		const existing = await readQuery(
+			db.query.gatewaySessionMappings.findFirst({
+				where: and(
+					eq(gatewaySessionMappings.platform, msg.platform),
+					eq(gatewaySessionMappings.chatId, msg.chatId),
+					eq(gatewaySessionMappings.userId, msg.userId),
+				),
+			}),
+		);
 
 		if (existing) {
 			// Check session idle timeout
@@ -627,10 +628,12 @@ class Gateway {
 
 		// Validate project exists if specified
 		if (projectId) {
-			const project = await db.query.projects.findFirst({
-				where: eq(projects.id, projectId),
-				columns: { id: true },
-			});
+			const project = await readQuery(
+				db.query.projects.findFirst({
+					where: eq(projects.id, projectId),
+					columns: { id: true },
+				}),
+			);
 			if (!project) {
 				logger.warn(`[gateway] Default project ${projectId} not found, creating unbound narrator`);
 			}
@@ -1106,26 +1109,28 @@ class Gateway {
 		if (!adapter) return;
 
 		// Get the latest assistant message from DB via message refs
-		const latestRef = await db
-			.select({ messageId: narratorMessageRefs.messageId })
-			.from(narratorMessageRefs)
-			.where(eq(narratorMessageRefs.narratorId, narratorId))
-			.orderBy(desc(narratorMessageRefs.seq))
-			.limit(1)
-			.get();
+		const latestRef = await readQueryFirst(
+			db
+				.select({ messageId: narratorMessageRefs.messageId })
+				.from(narratorMessageRefs)
+				.where(eq(narratorMessageRefs.narratorId, narratorId))
+				.orderBy(desc(narratorMessageRefs.seq))
+				.limit(1),
+		);
 
 		if (!latestRef) return;
 
-		const msg = await db
-			.select({
-				contentText: narratorMessages.contentText,
-				role: narratorMessages.role,
-			})
-			.from(narratorMessages)
-			.where(
-				and(eq(narratorMessages.id, latestRef.messageId), eq(narratorMessages.role, "assistant")),
-			)
-			.get();
+		const msg = await readQueryFirst(
+			db
+				.select({
+					contentText: narratorMessages.contentText,
+					role: narratorMessages.role,
+				})
+				.from(narratorMessages)
+				.where(
+					and(eq(narratorMessages.id, latestRef.messageId), eq(narratorMessages.role, "assistant")),
+				),
+		);
 
 		if (!msg?.contentText) return;
 
@@ -1139,9 +1144,11 @@ class Gateway {
 	}
 
 	private async findMappingByNarrator(narratorId: string) {
-		return db.query.gatewaySessionMappings.findFirst({
-			where: eq(gatewaySessionMappings.narratorId, narratorId),
-		});
+		return readQuery(
+			db.query.gatewaySessionMappings.findFirst({
+				where: eq(gatewaySessionMappings.narratorId, narratorId),
+			}),
+		);
 	}
 
 	// -----------------------------------------------------------------------
@@ -1170,31 +1177,35 @@ class Gateway {
 		}> = [];
 		for (let offset = 0; offset < relevantUserIds.length; offset += 500) {
 			mappings.push(
-				...(await db
-					.select({
-						platform: gatewaySessionMappings.platform,
-						chatId: gatewaySessionMappings.chatId,
-						narratorId: gatewaySessionMappings.narratorId,
-						appUserId: gatewaySessionMappings.appUserId,
-					})
-					.from(gatewaySessionMappings)
-					.where(
-						and(
-							ne(gatewaySessionMappings.narratorId, narratorId),
-							inArray(
-								gatewaySessionMappings.appUserId,
-								relevantUserIds.slice(offset, offset + 500),
+				...(await readQuery(
+					db
+						.select({
+							platform: gatewaySessionMappings.platform,
+							chatId: gatewaySessionMappings.chatId,
+							narratorId: gatewaySessionMappings.narratorId,
+							appUserId: gatewaySessionMappings.appUserId,
+						})
+						.from(gatewaySessionMappings)
+						.where(
+							and(
+								ne(gatewaySessionMappings.narratorId, narratorId),
+								inArray(
+									gatewaySessionMappings.appUserId,
+									relevantUserIds.slice(offset, offset + 500),
+								),
 							),
 						),
-					)),
+				)),
 			);
 		}
 		if (mappings.length === 0) return;
 
-		const narrator = await db.query.narrators.findFirst({
-			where: eq(narrators.id, narratorId),
-			columns: { id: true, title: true },
-		});
+		const narrator = await readQuery(
+			db.query.narrators.findFirst({
+				where: eq(narrators.id, narratorId),
+				columns: { id: true, title: true },
+			}),
+		);
 		if (!narrator) return;
 
 		const shortId = narratorId.slice(0, 8);
@@ -1232,14 +1243,16 @@ class Gateway {
 		let locale: Locale = "en";
 		try {
 			// Try to find appUserId from existing mapping
-			const mapping = await db.query.gatewaySessionMappings.findFirst({
-				where: and(
-					eq(gatewaySessionMappings.platform, msg.platform),
-					eq(gatewaySessionMappings.chatId, msg.chatId),
-					eq(gatewaySessionMappings.userId, msg.userId),
-				),
-				columns: { appUserId: true },
-			});
+			const mapping = await readQuery(
+				db.query.gatewaySessionMappings.findFirst({
+					where: and(
+						eq(gatewaySessionMappings.platform, msg.platform),
+						eq(gatewaySessionMappings.chatId, msg.chatId),
+						eq(gatewaySessionMappings.userId, msg.userId),
+					),
+					columns: { appUserId: true },
+				}),
+			);
 
 			const appUserId = mapping?.appUserId ?? (await this.resolveAppUserId());
 			if (appUserId) {
@@ -1308,13 +1321,15 @@ class Gateway {
 			}
 
 			case "/model": {
-				const mapping = await db.query.gatewaySessionMappings.findFirst({
-					where: and(
-						eq(gatewaySessionMappings.platform, msg.platform),
-						eq(gatewaySessionMappings.chatId, msg.chatId),
-						eq(gatewaySessionMappings.userId, msg.userId),
-					),
-				});
+				const mapping = await readQuery(
+					db.query.gatewaySessionMappings.findFirst({
+						where: and(
+							eq(gatewaySessionMappings.platform, msg.platform),
+							eq(gatewaySessionMappings.chatId, msg.chatId),
+							eq(gatewaySessionMappings.userId, msg.userId),
+						),
+					}),
+				);
 
 				if (!mapping) {
 					await adapter.send(msg.chatId, t("gateway.noActiveSession", locale));
@@ -1323,10 +1338,12 @@ class Gateway {
 
 				if (!command.args) {
 					// Show current model
-					const narrator = await db.query.narrators.findFirst({
-						where: eq(narrators.id, mapping.narratorId),
-						columns: { model: true },
-					});
+					const narrator = await readQuery(
+						db.query.narrators.findFirst({
+							where: eq(narrators.id, mapping.narratorId),
+							columns: { model: true },
+						}),
+					);
 					await adapter.send(
 						msg.chatId,
 						t("gateway.currentModel", locale, { model: narrator?.model ?? "default" }),
@@ -1344,26 +1361,30 @@ class Gateway {
 			}
 
 			case "/status": {
-				const mapping = await db.query.gatewaySessionMappings.findFirst({
-					where: and(
-						eq(gatewaySessionMappings.platform, msg.platform),
-						eq(gatewaySessionMappings.chatId, msg.chatId),
-						eq(gatewaySessionMappings.userId, msg.userId),
-					),
-				});
+				const mapping = await readQuery(
+					db.query.gatewaySessionMappings.findFirst({
+						where: and(
+							eq(gatewaySessionMappings.platform, msg.platform),
+							eq(gatewaySessionMappings.chatId, msg.chatId),
+							eq(gatewaySessionMappings.userId, msg.userId),
+						),
+					}),
+				);
 				if (!mapping) {
 					await adapter.send(msg.chatId, t("gateway.noActiveSession", locale));
 				} else {
-					const narrator = await db.query.narrators.findFirst({
-						where: eq(narrators.id, mapping.narratorId),
-						columns: {
-							id: true,
-							status: true,
-							model: true,
-							messageCount: true,
-							totalCostUsd: true,
-						},
-					});
+					const narrator = await readQuery(
+						db.query.narrators.findFirst({
+							where: eq(narrators.id, mapping.narratorId),
+							columns: {
+								id: true,
+								status: true,
+								model: true,
+								messageCount: true,
+								totalCostUsd: true,
+							},
+						}),
+					);
 					const lines = [
 						t("gateway.sessionStatusHeader", locale),
 						t("gateway.statusNarrator", locale, {
@@ -1388,13 +1409,15 @@ class Gateway {
 			}
 
 			case "/stop": {
-				const mapping = await db.query.gatewaySessionMappings.findFirst({
-					where: and(
-						eq(gatewaySessionMappings.platform, msg.platform),
-						eq(gatewaySessionMappings.chatId, msg.chatId),
-						eq(gatewaySessionMappings.userId, msg.userId),
-					),
-				});
+				const mapping = await readQuery(
+					db.query.gatewaySessionMappings.findFirst({
+						where: and(
+							eq(gatewaySessionMappings.platform, msg.platform),
+							eq(gatewaySessionMappings.chatId, msg.chatId),
+							eq(gatewaySessionMappings.userId, msg.userId),
+						),
+					}),
+				);
 				if (mapping) {
 					// Clean up stream consumer
 					this.cleanupStreamConsumer(mapping.narratorId);
@@ -1424,13 +1447,15 @@ class Gateway {
 			}
 
 			case "/approve": {
-				const mapping = await db.query.gatewaySessionMappings.findFirst({
-					where: and(
-						eq(gatewaySessionMappings.platform, msg.platform),
-						eq(gatewaySessionMappings.chatId, msg.chatId),
-						eq(gatewaySessionMappings.userId, msg.userId),
-					),
-				});
+				const mapping = await readQuery(
+					db.query.gatewaySessionMappings.findFirst({
+						where: and(
+							eq(gatewaySessionMappings.platform, msg.platform),
+							eq(gatewaySessionMappings.chatId, msg.chatId),
+							eq(gatewaySessionMappings.userId, msg.userId),
+						),
+					}),
+				);
 				if (!mapping) {
 					await adapter.send(msg.chatId, t("gateway.noActiveSession", locale));
 					break;
@@ -1447,13 +1472,15 @@ class Gateway {
 			}
 
 			case "/deny": {
-				const mapping = await db.query.gatewaySessionMappings.findFirst({
-					where: and(
-						eq(gatewaySessionMappings.platform, msg.platform),
-						eq(gatewaySessionMappings.chatId, msg.chatId),
-						eq(gatewaySessionMappings.userId, msg.userId),
-					),
-				});
+				const mapping = await readQuery(
+					db.query.gatewaySessionMappings.findFirst({
+						where: and(
+							eq(gatewaySessionMappings.platform, msg.platform),
+							eq(gatewaySessionMappings.chatId, msg.chatId),
+							eq(gatewaySessionMappings.userId, msg.userId),
+						),
+					}),
+				);
 				if (!mapping) {
 					await adapter.send(msg.chatId, t("gateway.noActiveSession", locale));
 					break;
@@ -1508,13 +1535,15 @@ class Gateway {
 		locale: Locale,
 	): Promise<void> {
 		// Get the current mapping to find appUserId and active narrator
-		const mapping = await db.query.gatewaySessionMappings.findFirst({
-			where: and(
-				eq(gatewaySessionMappings.platform, msg.platform),
-				eq(gatewaySessionMappings.chatId, msg.chatId),
-				eq(gatewaySessionMappings.userId, msg.userId),
-			),
-		});
+		const mapping = await readQuery(
+			db.query.gatewaySessionMappings.findFirst({
+				where: and(
+					eq(gatewaySessionMappings.platform, msg.platform),
+					eq(gatewaySessionMappings.chatId, msg.chatId),
+					eq(gatewaySessionMappings.userId, msg.userId),
+				),
+			}),
+		);
 		const activeNarratorId = mapping?.narratorId ?? null;
 		const appUserId = mapping?.appUserId ?? (await this.resolveAppUserId());
 
@@ -1542,10 +1571,12 @@ class Gateway {
 		// Batch-fetch narrator statuses
 		const statusMap = new Map<string, string>();
 		if (narratorIds.length > 0) {
-			const rows = await db
-				.select({ id: narrators.id, status: narrators.status })
-				.from(narrators)
-				.where(inArray(narrators.id, narratorIds));
+			const rows = await readQuery(
+				db
+					.select({ id: narrators.id, status: narrators.status })
+					.from(narrators)
+					.where(inArray(narrators.id, narratorIds)),
+			);
 			for (const r of rows) statusMap.set(r.id, r.status);
 		}
 
@@ -1703,19 +1734,23 @@ class Gateway {
 			| undefined;
 
 		// Try exact match first
-		narrator = await db.query.narrators.findFirst({
-			where: eq(narrators.id, trimmed),
-			columns: { id: true, title: true, status: true, model: true, chapterId: true },
-		});
+		narrator = await readQuery(
+			db.query.narrators.findFirst({
+				where: eq(narrators.id, trimmed),
+				columns: { id: true, title: true, status: true, model: true, chapterId: true },
+			}),
+		);
 
 		// If not found, try prefix match (LIKE)
 		if (!narrator && trimmed.length >= 4) {
 			// Escape LIKE wildcards to prevent matching unintended rows
 			const escaped = trimmed.replace(/[%_]/g, "\\$&");
-			narrator = await db.query.narrators.findFirst({
-				where: like(narrators.id, `${escaped}%`),
-				columns: { id: true, title: true, status: true, model: true, chapterId: true },
-			});
+			narrator = await readQuery(
+				db.query.narrators.findFirst({
+					where: like(narrators.id, `${escaped}%`),
+					columns: { id: true, title: true, status: true, model: true, chapterId: true },
+				}),
+			);
 		}
 
 		if (!narrator) {
@@ -1727,10 +1762,12 @@ class Gateway {
 		// switching to narrators that belong to that project (via chapter).
 		const defaultProjectId = this.config?.defaultProjectId;
 		if (defaultProjectId && narrator.chapterId) {
-			const chapter = await db.query.chapters.findFirst({
-				where: eq(chapters.id, narrator.chapterId),
-				columns: { projectId: true },
-			});
+			const chapter = await readQuery(
+				db.query.chapters.findFirst({
+					where: eq(chapters.id, narrator.chapterId),
+					columns: { projectId: true },
+				}),
+			);
 			if (chapter && chapter.projectId !== defaultProjectId) {
 				await adapter.send(msg.chatId, t("gateway.narratorWrongProject", locale));
 				return;
@@ -1739,13 +1776,15 @@ class Gateway {
 
 		// Find or create the session mapping
 		const now = new Date().toISOString();
-		const existing = await db.query.gatewaySessionMappings.findFirst({
-			where: and(
-				eq(gatewaySessionMappings.platform, msg.platform),
-				eq(gatewaySessionMappings.chatId, msg.chatId),
-				eq(gatewaySessionMappings.userId, msg.userId),
-			),
-		});
+		const existing = await readQuery(
+			db.query.gatewaySessionMappings.findFirst({
+				where: and(
+					eq(gatewaySessionMappings.platform, msg.platform),
+					eq(gatewaySessionMappings.chatId, msg.chatId),
+					eq(gatewaySessionMappings.userId, msg.userId),
+				),
+			}),
+		);
 
 		if (existing) {
 			// Clean up stream consumer for old narrator

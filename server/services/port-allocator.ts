@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 import { and, eq, gt, gte, isNull, lte } from "drizzle-orm";
 import { db } from "../db";
 import { portAllocations } from "../db/schema";
@@ -42,18 +43,20 @@ export const portAllocator = {
 		for (let page = 0; ; page++) {
 			if (performance.now() > deadline || page >= 512)
 				throw new AppError("Port allocation scan budget exceeded", 503);
-			const allocated = await db
-				.select({ port: portAllocations.port })
-				.from(portAllocations)
-				.where(
-					and(
-						gte(portAllocations.port, portRangeStart),
-						lte(portAllocations.port, portRangeEnd),
-						cursor === undefined ? undefined : gt(portAllocations.port, cursor),
-					),
-				)
-				.orderBy(portAllocations.port)
-				.limit(129);
+			const allocated = await readQuery(
+				db
+					.select({ port: portAllocations.port })
+					.from(portAllocations)
+					.where(
+						and(
+							gte(portAllocations.port, portRangeStart),
+							lte(portAllocations.port, portRangeEnd),
+							cursor === undefined ? undefined : gt(portAllocations.port, cursor),
+						),
+					)
+					.orderBy(portAllocations.port)
+					.limit(129),
+			);
 			for (const row of allocated.slice(0, 128)) usedPorts.add(row.port);
 			if (allocated.length <= 128) break;
 			cursor = allocated[127]?.port;
@@ -135,11 +138,13 @@ export const portAllocator = {
 
 	/** List all port allocations for a chapter. */
 	async listByChapter(chapterId: string) {
-		return db.query.portAllocations.findMany({
-			where: and(
-				eq(portAllocations.chapterId, chapterId),
-				isNull(portAllocations.worktreeResourceId),
-			),
-		});
+		return readQuery(
+			db.query.portAllocations.findMany({
+				where: and(
+					eq(portAllocations.chapterId, chapterId),
+					isNull(portAllocations.worktreeResourceId),
+				),
+			}),
+		);
 	},
 };

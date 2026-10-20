@@ -487,19 +487,16 @@ describe("origin-bound derived history cleanup", () => {
 		]);
 		const origin = addAgentCall(narratorId, selected, "many-children");
 		const child = addChild(cwd, narratorId, origin);
-		db.transaction((tx) => {
-			for (let index = 0; index < 5_001; index++)
-				tx.insert(narratorMessages)
-					.values({
-						id: generateId(),
-						narratorId: child,
-						parentToolUseId: "many-children",
-						role: "assistant",
-						contentJson: [],
-						createdAt: now,
-					})
-					.run();
-		});
+		const insertChild = sqlite.prepare(`INSERT INTO narrator_messages
+			(id, narrator_id, parent_tool_use_id, role, content_json, created_at)
+			VALUES (?, ?, 'many-children', 'assistant', '[]', ?)`);
+		try {
+			db.transaction(() => {
+				for (let index = 0; index < 5_001; index++) insertChild.run(generateId(), child, now);
+			});
+		} finally {
+			insertChild.finalize();
+		}
 		await expect(
 			narratorService.deleteMessage(narratorId, selected, { skipRevert: true }),
 		).rejects.toThrow(/safety budget/);
@@ -511,17 +508,22 @@ describe("origin-bound derived history cleanup", () => {
 	test("an oversized caller ref range is rejected before loading message bodies", async () => {
 		const { narratorId } = fixture();
 		const boundary = addMessage(narratorId, [{ type: "text", text: "boundary" }], 0);
-		db.transaction((tx) => {
-			for (let index = 0; index < 5_001; index++) {
-				const id = generateId();
-				tx.insert(narratorMessages)
-					.values({ id, narratorId, role: "assistant", contentJson: [], createdAt: now })
-					.run();
-				tx.insert(narratorMessageRefs)
-					.values({ id: generateId(), narratorId, messageId: id, seq: index + 1 })
-					.run();
-			}
-		});
+		const insertMessage = sqlite.prepare(`INSERT INTO narrator_messages
+			(id, narrator_id, role, content_json, created_at) VALUES (?, ?, 'assistant', '[]', ?)`);
+		const insertRef = sqlite.prepare(`INSERT INTO narrator_message_refs
+			(id, narrator_id, message_id, seq) VALUES (?, ?, ?, ?)`);
+		try {
+			db.transaction(() => {
+				for (let index = 0; index < 5_001; index++) {
+					const id = generateId();
+					insertMessage.run(id, narratorId, now);
+					insertRef.run(generateId(), narratorId, id, index + 1);
+				}
+			});
+		} finally {
+			insertMessage.finalize();
+			insertRef.finalize();
+		}
 		await expect(
 			narratorService.deleteMessagesAfter(narratorId, boundary, { skipRevert: true }),
 		).rejects.toThrow(/safety budget/);

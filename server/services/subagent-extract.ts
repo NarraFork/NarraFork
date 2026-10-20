@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 /**
  * Extract a subagent session into an independent primary narrator.
  *
@@ -66,10 +67,12 @@ async function resolveExtractAudiences(source: {
 	let visibility: Visibility = "private";
 	let writeAudience: WriteAudience = "owner";
 	if (source.parentNarratorId) {
-		const parent = await db.query.narrators.findFirst({
-			where: eq(narrators.id, source.parentNarratorId),
-			columns: { visibility: true, writeAudience: true },
-		});
+		const parent = await readQuery(
+			db.query.narrators.findFirst({
+				where: eq(narrators.id, source.parentNarratorId),
+				columns: { visibility: true, writeAudience: true },
+			}),
+		);
 		if (parent?.visibility) visibility = parent.visibility as Visibility;
 		if (parent?.writeAudience) writeAudience = parent.writeAudience as WriteAudience;
 	}
@@ -92,9 +95,11 @@ export async function extractSubagentToPrimary(
 	sourceId: string,
 	opts?: ExtractSubagentToPrimaryOpts,
 ) {
-	const source = await db.query.narrators.findFirst({
-		where: eq(narrators.id, sourceId),
-	});
+	const source = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, sourceId),
+		}),
+	);
 
 	if (!source) {
 		throw new ValidationError("Subagent not found");
@@ -110,14 +115,16 @@ export async function extractSubagentToPrimary(
 	const subagentType = source.subagentType ?? null;
 	const maxFull = opts?.maxFullMessages ?? EXTRACT_FULL_MAX_MESSAGES;
 
-	const sourceRefs = await db
-		.select({
-			messageId: narratorMessageRefs.messageId,
-			seq: narratorMessageRefs.seq,
-		})
-		.from(narratorMessageRefs)
-		.where(eq(narratorMessageRefs.narratorId, sourceId))
-		.orderBy(asc(narratorMessageRefs.seq));
+	const sourceRefs = await readQuery(
+		db
+			.select({
+				messageId: narratorMessageRefs.messageId,
+				seq: narratorMessageRefs.seq,
+			})
+			.from(narratorMessageRefs)
+			.where(eq(narratorMessageRefs.narratorId, sourceId))
+			.orderBy(asc(narratorMessageRefs.seq)),
+	);
 
 	let inheritMode = opts?.inheritMode ?? "full";
 	if (inheritMode === "full" && sourceRefs.length > maxFull) {
@@ -143,10 +150,9 @@ export async function extractSubagentToPrimary(
 		const byId = new Map<string, typeof narratorMessages.$inferSelect>();
 		for (let i = 0; i < sourceRefs.length; i += CHUNK) {
 			const chunk = sourceRefs.slice(i, i + CHUNK).map((row) => row.messageId);
-			const rows = await db
-				.select()
-				.from(narratorMessages)
-				.where(inArray(narratorMessages.id, chunk));
+			const rows = await readQuery(
+				db.select().from(narratorMessages).where(inArray(narratorMessages.id, chunk)),
+			);
 			for (const msg of rows) byId.set(msg.id, msg);
 		}
 		for (const row of sourceRefs) {

@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 import { type BooleanOverride, normalizeBooleanOverride } from "./boolean-override";
 
 /**
@@ -63,10 +64,12 @@ function loadUserPreferenceQueryDependencies() {
 export async function getUserFastModeDefault(userId: string | null | undefined): Promise<boolean> {
 	if (!userId) return false;
 	const { db, eq, userPreferences } = await loadUserPreferenceQueryDependencies();
-	const pref = await db.query.userPreferences.findFirst({
-		where: eq(userPreferences.userId, userId),
-		columns: { fastModeDefault: true },
-	});
+	const pref = await readQuery(
+		db.query.userPreferences.findFirst({
+			where: eq(userPreferences.userId, userId),
+			columns: { fastModeDefault: true },
+		}),
+	);
 	return pref?.fastModeDefault ?? false;
 }
 

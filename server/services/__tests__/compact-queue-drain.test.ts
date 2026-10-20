@@ -113,7 +113,7 @@ describe("queue admission during compaction", () => {
 			const result = await pushBufferedMessage(NARRATOR_ID, "typed while compacting");
 
 			expect(result.ok).toBe(true);
-			expect(getBufferedMessages(NARRATOR_ID).map((m) => m.text)).toEqual([
+			expect((await getBufferedMessages(NARRATOR_ID)).map((m) => m.text)).toEqual([
 				"typed while compacting",
 			]);
 		} finally {
@@ -133,7 +133,7 @@ describe("queue admission during compaction", () => {
 		expect(result.ok).toBe(false);
 		expect(result.full).toBeUndefined();
 		// The message queued while the compact was live is untouched by the refusal.
-		expect(getBufferedMessages(NARRATOR_ID).map((m) => m.text)).toEqual(["during"]);
+		expect((await getBufferedMessages(NARRATOR_ID)).map((m) => m.text)).toEqual(["during"]);
 	});
 
 	test("a compact on ANOTHER narrator does not admit this one", async () => {

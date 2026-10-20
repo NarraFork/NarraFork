@@ -55,16 +55,46 @@ export interface WorkerLogMessage {
 	data?: Record<string, unknown>;
 }
 
+export const WATCHER_STAGES = [
+	"received",
+	"canonicalize_end",
+	"binding_start",
+	"binding_end",
+	"subscribe_start",
+	"subscribe_end",
+	"unsubscribe_start",
+	"unsubscribe_end",
+	"unsubscribe_error",
+	// Emitted immediately before the ACK write; not proof of pipe flush or parent receipt.
+	"ack_send",
+] as const;
+
+export interface WorkerStageMessage {
+	type: "stage";
+	requestId: string;
+	watchId: string;
+	stage: (typeof WATCHER_STAGES)[number];
+	workerElapsedMs: number;
+	workerStageDurationMs: number;
+	activeWatches: number;
+	starting: number;
+	stopping: number;
+	errorName?: string;
+	errorMessage?: string;
+}
+
 export interface WorkerErrorMessage {
 	type: "error";
 	requestId?: string;
 	id?: string;
 	error: string;
+	errorName?: string;
 	fatal?: boolean;
 }
 
 export type WatcherWorkerMessage =
 	| ReadyMessage
+	| WorkerStageMessage
 	| AckMessage
 	| EventsMessage
 	| WorkerLogMessage

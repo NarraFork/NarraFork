@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 /**
  * Importing a project from its portable `project.db` archive.
  *
@@ -109,7 +110,7 @@ async function collectBatches(
 
 	for (const table of ARCHIVE_TABLE_ORDER) {
 		const supported = new Set(await projectArchiveMainStore.supportedColumns(table));
-		const columns = archive.columnsFor(table).filter((column) => supported.has(column));
+		const columns = (await archive.columnsFor(table)).filter((column) => supported.has(column));
 		counts[table] = 0;
 		if (columns.length === 0) continue;
 
@@ -133,7 +134,7 @@ async function collectBatches(
 
 		let after: string | null = null;
 		for (;;) {
-			const page = archive.readTable(table, columns, {
+			const page = await archive.readTable(table, columns, {
 				limit: limits.maxBatchRows,
 				after,
 				maxRowSerializedBytes: limits.maxRowSerializedBytes,
@@ -252,7 +253,7 @@ export async function importProject(
 	const archive = ProjectArchiveFile.open(gitPath);
 
 	try {
-		const projectPage = archive.readTable("projects", archive.columnsFor("projects"), {
+		const projectPage = await archive.readTable("projects", await archive.columnsFor("projects"), {
 			limit: 1,
 			maxRowSerializedBytes: limits.maxRowSerializedBytes,
 			maxBatchSerializedBytes: limits.maxBatchSerializedBytes,
@@ -264,10 +265,12 @@ export async function importProject(
 		const projectId = projectRow.id as string;
 		const projectName = projectRow.name as string;
 
-		const existing = await db.query.projects.findFirst({
-			where: eq(projects.id, projectId),
-			columns: { id: true, gitPath: true },
-		});
+		const existing = await readQuery(
+			db.query.projects.findFirst({
+				where: eq(projects.id, projectId),
+				columns: { id: true, gitPath: true },
+			}),
+		);
 
 		if (existing) {
 			logger.info("Project already exists in main DB, skipping import", {
@@ -311,6 +314,6 @@ export async function importProject(
 		logger.info("Project imported from backup", { projectId, projectName, gitPath, counts });
 		return { projectId, projectName, tables: counts, skipped: false };
 	} finally {
-		archive.close();
+		await archive.close();
 	}
 }

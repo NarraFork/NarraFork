@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 import { eq } from "drizzle-orm";
 import { AsyncMutex, narratorTraitsLock } from "../lib/async-mutex";
 
@@ -161,10 +162,12 @@ export async function persistSubagentAlias(
 ): Promise<void> {
 	const { db, narrators } = await loadAliasDb();
 	await narratorTraitsLock.acquire(subagentId, async () => {
-		const row = await db.query.narrators.findFirst({
-			where: eq(narrators.id, subagentId),
-			columns: { parentNarratorId: true, traits: true },
-		});
+		const row = await readQuery(
+			db.query.narrators.findFirst({
+				where: eq(narrators.id, subagentId),
+				columns: { parentNarratorId: true, traits: true },
+			}),
+		);
 		if (!row || row.parentNarratorId !== parentNarratorId) return;
 
 		const currentTraits = Array.isArray(row.traits)
@@ -187,20 +190,24 @@ async function getExistingSubagentAlias(
 	subagentId: string,
 ): Promise<string | undefined> {
 	const { db, backgroundTasks, narrators } = await loadAliasDb();
-	const row = await db.query.narrators.findFirst({
-		where: eq(narrators.id, subagentId),
-		columns: { parentNarratorId: true, traits: true },
-	});
+	const row = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, subagentId),
+			columns: { parentNarratorId: true, traits: true },
+		}),
+	);
 	if (!row || row.parentNarratorId !== parentNarratorId) return;
 	const persisted = getPersistedSubagentAliases(row.traits)[0];
 	if (persisted) return persisted;
 
 	// Agent task rows share their subagent's id. Keep this a bounded PK lookup,
 	// and do not adopt an alias from a different task type or team.
-	const task = await db.query.backgroundTasks.findFirst({
-		where: eq(backgroundTasks.id, subagentId),
-		columns: { type: true, parentNarratorId: true, subagentNarratorId: true, alias: true },
-	});
+	const task = await readQuery(
+		db.query.backgroundTasks.findFirst({
+			where: eq(backgroundTasks.id, subagentId),
+			columns: { type: true, parentNarratorId: true, subagentNarratorId: true, alias: true },
+		}),
+	);
 	if (
 		task?.type === "agent" &&
 		task.parentNarratorId === parentNarratorId &&
@@ -215,14 +222,18 @@ async function getPersistedTakenAliases(
 	excludeSubagentId: string,
 ): Promise<Set<string>> {
 	const { db, backgroundTasks, narrators } = await loadAliasDb();
-	const siblings = await db.query.narrators.findMany({
-		where: eq(narrators.parentNarratorId, parentNarratorId),
-		columns: { id: true, title: true, traits: true },
-	});
-	const tasks = await db.query.backgroundTasks.findMany({
-		where: eq(backgroundTasks.parentNarratorId, parentNarratorId),
-		columns: { id: true, alias: true, subagentNarratorId: true },
-	});
+	const siblings = await readQuery(
+		db.query.narrators.findMany({
+			where: eq(narrators.parentNarratorId, parentNarratorId),
+			columns: { id: true, title: true, traits: true },
+		}),
+	);
+	const tasks = await readQuery(
+		db.query.backgroundTasks.findMany({
+			where: eq(backgroundTasks.parentNarratorId, parentNarratorId),
+			columns: { id: true, alias: true, subagentNarratorId: true },
+		}),
+	);
 	const taken = new Set<string>();
 	for (const sibling of siblings) {
 		if (sibling.id === excludeSubagentId) continue;

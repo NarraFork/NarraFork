@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 import {
 	assertRuntimeCanAskQuestion,
 	runtimePolicyForContext,
@@ -362,20 +363,22 @@ async function submitAsyncQuestions(
 		// The DB row id is the idempotency anchor and the tool only knows its tool_use
 		// id, so resolve one from the other — the same lookup `exit-plan-reflection`
 		// does for its own persistence.
-		const call = await db.query.narratorToolCalls.findFirst({
-			where: and(
-				eq(narratorToolCalls.narratorId, ctx.narratorId),
-				eq(narratorToolCalls.toolUseId, toolUseId),
-				eq(narratorToolCalls.toolName, "AskUserQuestion"),
-				...(ctx.toolCallBinding
-					? [
-							eq(narratorToolCalls.id, ctx.toolCallBinding.toolCallId),
-							eq(narratorToolCalls.executionAttempt, ctx.toolCallBinding.attempt),
-						]
-					: []),
-			),
-			columns: { id: true, inputJson: true, permissionDecidedBy: true },
-		});
+		const call = await readQuery(
+			db.query.narratorToolCalls.findFirst({
+				where: and(
+					eq(narratorToolCalls.narratorId, ctx.narratorId),
+					eq(narratorToolCalls.toolUseId, toolUseId),
+					eq(narratorToolCalls.toolName, "AskUserQuestion"),
+					...(ctx.toolCallBinding
+						? [
+								eq(narratorToolCalls.id, ctx.toolCallBinding.toolCallId),
+								eq(narratorToolCalls.executionAttempt, ctx.toolCallBinding.attempt),
+							]
+						: []),
+				),
+				columns: { id: true, inputJson: true, permissionDecidedBy: true },
+			}),
+		);
 		if (!call) {
 			return "Could not submit asynchronously (tool call not found). Ask again without `async` if you need an answer.";
 		}

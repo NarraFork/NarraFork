@@ -1,7 +1,7 @@
 {
 	"name": "narrafork",
 	"type": "module",
-	"version": "0.9.4",
+	"version": "0.9.5-fix.5",
 	"private": true,
 	"license": "MPL-2.0",
 	"packageManager": "bun@1.4.3",

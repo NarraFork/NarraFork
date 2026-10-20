@@ -3,6 +3,7 @@ import type { FileReference } from "@shared/file-reference";
 import { and, eq, inArray, isNotNull, ne, or, sql } from "drizzle-orm";
 import { db } from "../db";
 import { narratorDrafts } from "../db/schema";
+import { readQuery, readQueryFirst } from "../db/worker-read";
 import { copyFileReference } from "../lib/agent/file-reference-projection";
 import { narratorDraftLock } from "../lib/async-mutex";
 import {
@@ -164,11 +165,13 @@ export async function getNarratorDraft(
 	userId: string,
 	narratorId: string,
 ): Promise<NarratorDraftState> {
-	const row = await db
-		.select(draftColumns)
-		.from(narratorDrafts)
-		.where(and(eq(narratorDrafts.userId, userId), eq(narratorDrafts.narratorId, narratorId)))
-		.get();
+	const row = await readQueryFirst(
+		db
+			.select(draftColumns)
+			.from(narratorDrafts)
+			.where(and(eq(narratorDrafts.userId, userId), eq(narratorDrafts.narratorId, narratorId))),
+		{ site: "narrator-draft-service.getNarratorDraft" },
+	);
 	return rowToDraftState(row, userId);
 }
 
@@ -177,16 +180,18 @@ export async function getNarratorDraftMetadata(
 	userId: string,
 	narratorId: string,
 ): Promise<Pick<NarratorDraftState, "hasDraft" | "revision" | "updatedAt">> {
-	const row = await db
-		.select({
-			hasDraft: sql<number>`CASE WHEN length(trim(${narratorDrafts.text})) > 0 OR
+	const row = await readQueryFirst(
+		db
+			.select({
+				hasDraft: sql<number>`CASE WHEN length(trim(${narratorDrafts.text})) > 0 OR
 			(${narratorDrafts.fileReferencesJson} IS NOT NULL AND ${narratorDrafts.fileReferencesJson} <> '[]') OR ${narratorDrafts.composerDocument} IS NOT NULL THEN 1 ELSE 0 END`,
-			revision: narratorDrafts.revision,
-			updatedAt: narratorDrafts.updatedAt,
-		})
-		.from(narratorDrafts)
-		.where(and(eq(narratorDrafts.userId, userId), eq(narratorDrafts.narratorId, narratorId)))
-		.get();
+				revision: narratorDrafts.revision,
+				updatedAt: narratorDrafts.updatedAt,
+			})
+			.from(narratorDrafts)
+			.where(and(eq(narratorDrafts.userId, userId), eq(narratorDrafts.narratorId, narratorId))),
+		{ site: "narrator-draft-service.getNarratorDraftMetadata" },
+	);
 	return {
 		hasDraft: !!row?.hasDraft,
 		revision: row?.revision ?? 0,
@@ -214,11 +219,13 @@ export async function updateNarratorDraft(
 	// Capture metadata before awaiting the lock: text and references are one value.
 	const suppliedReferences = fileReferences?.map(copyFileReference);
 	return narratorDraftLock.acquire(`${userId.length}:${userId}:${narratorId}`, async () => {
-		const previous = await db
-			.select(draftColumns)
-			.from(narratorDrafts)
-			.where(and(eq(narratorDrafts.userId, userId), eq(narratorDrafts.narratorId, narratorId)))
-			.get();
+		const previous = await readQueryFirst(
+			db
+				.select(draftColumns)
+				.from(narratorDrafts)
+				.where(and(eq(narratorDrafts.userId, userId), eq(narratorDrafts.narratorId, narratorId))),
+			{ site: "narrator-draft-service.query" },
+		);
 		const current = rowToDraftState(previous, userId);
 
 		const now = new Date().toISOString();
@@ -345,17 +352,19 @@ function draftPresent() {
 }
 
 export async function narratorHasDraft(userId: string, narratorId: string): Promise<boolean> {
-	const row = await db
-		.select({ narratorId: narratorDrafts.narratorId })
-		.from(narratorDrafts)
-		.where(
-			and(
-				eq(narratorDrafts.userId, userId),
-				eq(narratorDrafts.narratorId, narratorId),
-				draftPresent(),
+	const row = await readQueryFirst(
+		db
+			.select({ narratorId: narratorDrafts.narratorId })
+			.from(narratorDrafts)
+			.where(
+				and(
+					eq(narratorDrafts.userId, userId),
+					eq(narratorDrafts.narratorId, narratorId),
+					draftPresent(),
+				),
 			),
-		)
-		.get();
+		{ site: "narrator-draft-service.narratorHasDraft" },
+	);
 	return !!row;
 }
 
@@ -364,15 +373,18 @@ export async function getNarratorIdsWithDraft(
 	narratorIds: string[],
 ): Promise<Set<string>> {
 	if (narratorIds.length === 0) return new Set();
-	const rows = await db
-		.select({ narratorId: narratorDrafts.narratorId })
-		.from(narratorDrafts)
-		.where(
-			and(
-				eq(narratorDrafts.userId, userId),
-				inArray(narratorDrafts.narratorId, narratorIds),
-				draftPresent(),
+	const rows = await readQuery(
+		db
+			.select({ narratorId: narratorDrafts.narratorId })
+			.from(narratorDrafts)
+			.where(
+				and(
+					eq(narratorDrafts.userId, userId),
+					inArray(narratorDrafts.narratorId, narratorIds),
+					draftPresent(),
+				),
 			),
-		);
+		{ site: "narrator-draft-service.getNarratorIdsWithDraft" },
+	);
 	return new Set(rows.map((row) => row.narratorId));
 }

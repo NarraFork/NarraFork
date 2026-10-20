@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 import { and, eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../db";
@@ -271,10 +272,12 @@ graphRoutes.get("/:id/graph", async (c) => {
 							const newCount = await commitSyncService.syncChapterCommits(ch.id);
 							if (newCount > 0 || liveHead !== ch.headCommitSha) {
 								// Re-read updated values from DB
-								const updated = await db.query.chapters.findFirst({
-									where: eq(chapters.id, ch.id),
-									columns: { commitCount: true, headCommitSha: true },
-								});
+								const updated = await readQuery(
+									db.query.chapters.findFirst({
+										where: eq(chapters.id, ch.id),
+										columns: { commitCount: true, headCommitSha: true },
+									}),
+								);
 								if (updated) {
 									ch.commitCount = updated.commitCount;
 									ch.headCommitSha = updated.headCommitSha;
@@ -420,10 +423,12 @@ graphRoutes.patch("/:id/graph/positions", async (c) => {
 	// Validate all chapterIds belong to this project
 	const chapterIds = parsed.data.positions.map((p) => p.chapterId);
 	if (chapterIds.length > 0) {
-		const owned = await db
-			.select({ id: chapters.id })
-			.from(chapters)
-			.where(and(inArray(chapters.id, chapterIds), eq(chapters.projectId, projectId)));
+		const owned = await readQuery(
+			db
+				.select({ id: chapters.id })
+				.from(chapters)
+				.where(and(inArray(chapters.id, chapterIds), eq(chapters.projectId, projectId))),
+		);
 		const ownedIds = new Set(owned.map((r) => r.id));
 		const invalid = chapterIds.filter((id) => !ownedIds.has(id));
 		if (invalid.length > 0) {

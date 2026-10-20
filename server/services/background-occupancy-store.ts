@@ -1,8 +1,11 @@
 import { backgroundTasks, narrators } from "@server/db/schema";
 import { hotSafe } from "@server/lib/hot-safe";
 import { logger } from "@server/lib/logger";
+import { waitForShutdownWork } from "@server/lib/shutdown-activity";
 import { and, asc, eq, gt, inArray, or, sql } from "drizzle-orm";
 import type { BunSQLiteDatabase } from "drizzle-orm/bun-sqlite";
+import { readQuery } from "../db/worker-read";
+import { withSqlDiagnosticSite } from "../lib/sql-execution-diagnostics";
 import {
 	BackgroundOccupancyIndex,
 	isOccupancyNarratorSeed,
@@ -63,63 +66,75 @@ export function createDatabaseBackgroundOccupancySource(
 ): BackgroundOccupancySource {
 	return {
 		async scanNarrators(after, limit) {
-			const db = await readDatabase();
-			return db
-				.select(narratorColumns)
-				.from(narrators)
-				.where(after === null ? undefined : gt(narrators.id, after))
-				.orderBy(asc(narrators.id))
-				.limit(limit)
-				.all();
+			return withSqlDiagnosticSite("background-occupancy.scanNarrators", async () => {
+				const db = await readDatabase();
+				return await readQuery(
+					db
+						.select(narratorColumns)
+						.from(narrators)
+						.where(after === null ? undefined : gt(narrators.id, after))
+						.orderBy(asc(narrators.id))
+						.limit(limit),
+					{ site: "background-occupancy-store.read" },
+				);
+			});
 		},
 		async scanTasks(after, limit) {
 			const db = await readDatabase();
-			return db
-				.select(taskColumns)
-				.from(backgroundTasks)
-				.where(after === null ? undefined : gt(backgroundTasks.id, after))
-				.orderBy(asc(backgroundTasks.id))
-				.limit(limit)
-				.all();
+			return await readQuery(
+				db
+					.select(taskColumns)
+					.from(backgroundTasks)
+					.where(after === null ? undefined : gt(backgroundTasks.id, after))
+					.orderBy(asc(backgroundTasks.id))
+					.limit(limit),
+				{ site: "background-occupancy-store.scanTasks" },
+			);
 		},
 		async getNarrators(ids) {
 			const db = await readDatabase();
-			return db
-				.select(narratorColumns)
-				.from(narrators)
-				.where(inArray(narrators.id, ids))
-				.limit(PAGE_SIZE)
-				.all();
+			return await readQuery(
+				db
+					.select(narratorColumns)
+					.from(narrators)
+					.where(inArray(narrators.id, ids))
+					.limit(PAGE_SIZE),
+				{ site: "background-occupancy-store.getNarrators" },
+			);
 		},
 		async getTasks(ids) {
 			const db = await readDatabase();
-			return db
-				.select(taskColumns)
-				.from(backgroundTasks)
-				.where(inArray(backgroundTasks.id, ids))
-				.limit(PAGE_SIZE)
-				.all();
+			return await readQuery(
+				db
+					.select(taskColumns)
+					.from(backgroundTasks)
+					.where(inArray(backgroundTasks.id, ids))
+					.limit(PAGE_SIZE),
+				{ site: "background-occupancy-store.getTasks" },
+			);
 		},
 		async getProjections(childId, after, limit) {
 			const db = await readDatabase();
-			return db
-				.select(taskColumns)
-				.from(backgroundTasks)
-				.where(
-					and(
-						or(
-							eq(backgroundTasks.id, childId),
-							and(
-								eq(backgroundTasks.type, "agent"),
-								eq(backgroundTasks.subagentNarratorId, childId),
+			return await readQuery(
+				db
+					.select(taskColumns)
+					.from(backgroundTasks)
+					.where(
+						and(
+							or(
+								eq(backgroundTasks.id, childId),
+								and(
+									eq(backgroundTasks.type, "agent"),
+									eq(backgroundTasks.subagentNarratorId, childId),
+								),
 							),
+							after === null ? undefined : gt(backgroundTasks.id, after),
 						),
-						after === null ? undefined : gt(backgroundTasks.id, after),
-					),
-				)
-				.orderBy(asc(backgroundTasks.id))
-				.limit(limit)
-				.all();
+					)
+					.orderBy(asc(backgroundTasks.id))
+					.limit(limit),
+				{ site: "background-occupancy-store.getProjections" },
+			);
 		},
 	};
 }
@@ -148,14 +163,50 @@ export class BackgroundOccupancyStore {
 	private runtimeLive = new Set<string>();
 	/** Old owners must survive failed reads even after source rows were replaced. */
 	private pendingAffected = new Set<string>();
-	private subscribers = new Map<string, (parentIds: readonly string[]) => void>();
+	private subscribers = new Map<string, (parentIds: readonly string[]) => void | Promise<void>>();
+	private pending = new Set<Promise<void>>();
+	private shuttingDown = false;
+	private stopped = false;
+	private failureCount = 0;
+	private firstError: unknown;
+
+	beginShutdown(): void {
+		this.shuttingDown = true;
+	}
+
+	getShutdownState(): { pending: number; failureCount: number; firstError: unknown } {
+		return {
+			pending: this.pending.size,
+			failureCount: this.failureCount,
+			firstError: this.firstError,
+		};
+	}
+
+	/** Unlike flush, includes notifications; never starts a cold historical scan. */
+	async drainForShutdown(signal: AbortSignal): Promise<void> {
+		signal.throwIfAborted();
+		while (this.pending.size > 0) {
+			await waitForShutdownWork(Promise.all([...this.pending]), signal);
+			signal.throwIfAborted();
+		}
+	}
+
+	/** Freeze scheduling only after final producers and notifications have drained. */
+	stop(): void {
+		this.stopped = true;
+	}
+
+	private recordFailure(error: unknown): void {
+		if (!this.shuttingDown) return;
+		if (this.failureCount++ === 0) this.firstError = error;
+	}
 
 	constructor(
 		private readonly source: BackgroundOccupancySource = databaseBackgroundOccupancySource,
 	) {}
 
 	/** Keyed replacement survives hot-reload without accumulating callbacks. */
-	subscribe(key: string, listener: (parentIds: readonly string[]) => void): void {
+	subscribe(key: string, listener: (parentIds: readonly string[]) => void | Promise<void>): void {
 		this.subscribers.set(key, listener);
 	}
 
@@ -164,6 +215,7 @@ export class BackgroundOccupancyStore {
 	}
 
 	ensureReady(): Promise<void> {
+		if (this.stopped) return Promise.reject(new Error("Background occupancy store is stopped"));
 		if (this.worker) return this.worker;
 		if (this.ready && !this.failure) return Promise.resolve();
 		return this.launch(!this.ready);
@@ -180,24 +232,25 @@ export class BackgroundOccupancyStore {
 	}
 
 	refreshTask(id: string): void {
-		if (!id) return;
+		if (this.stopped || !id) return;
 		this.dirtyTasks.add(id);
 		this.schedule();
 	}
 
 	refreshNarrator(id: string): void {
-		if (!id) return;
+		if (this.stopped || !id) return;
 		this.dirtyNarrators.add(id);
 		this.schedule();
 	}
 
 	refreshNarrators(ids: readonly string[]): void {
+		if (this.stopped) return;
 		for (const id of ids) if (id) this.dirtyNarrators.add(id);
 		this.schedule();
 	}
 
 	setRuntimeLive(id: string, live: boolean): void {
-		if (!id) return;
+		if (this.stopped || !id) return;
 		if (live) this.runtimeLive.add(id);
 		else this.runtimeLive.delete(id);
 		this.refreshNarrator(id);
@@ -205,6 +258,7 @@ export class BackgroundOccupancyStore {
 
 	/** Must be called after the delete/reparent transaction has committed. */
 	removeNarrators(ids: readonly string[]): void {
+		if (this.stopped) return;
 		for (const id of ids) {
 			this.removedNarrators.add(id);
 			this.runtimeLive.delete(id);
@@ -223,6 +277,10 @@ export class BackgroundOccupancyStore {
 		this.removedNarrators.clear();
 		this.runtimeLive.clear();
 		this.pendingAffected = new Set();
+		this.stopped = false;
+		this.shuttingDown = false;
+		this.failureCount = 0;
+		this.firstError = undefined;
 	}
 
 	snapshot(ids: readonly string[]): OccupancySnapshot {
@@ -265,41 +323,62 @@ export class BackgroundOccupancyStore {
 
 	private schedule(): void {
 		// Startup is explicit. Pre-start events stay queued for shadow replay.
-		if (this.ready && !this.worker) this.launch(false);
+		if (!this.stopped && this.ready && !this.worker) this.launch(false);
 	}
 
 	private launch(initial: boolean): Promise<void> {
 		const generation = this.generation;
 		const work = this.maintain(initial, generation).then((parentIds) => {
-			if (parentIds.length === 0) return;
-			// Run after publication AND worker settlement. A listener may call
-			// flush(), so neither invoke it inline nor await its returned promise.
-			setImmediate(() => {
-				if (generation !== this.generation) return;
-				for (const [key, listener] of this.subscribers) {
-					const failed = (error: unknown) =>
-						logger.error("Background occupancy subscriber failed", { key, error: String(error) });
+			if (parentIds.length === 0 || this.stopped) return;
+			// Notifications are owned separately from the maintenance worker:
+			// subscriber -> flush must never wait for the subscriber itself.
+			const notification = new Promise<void>((resolve) => {
+				setImmediate(() => {
 					try {
-						void Promise.resolve(listener(parentIds)).catch(failed);
-					} catch (error) {
-						failed(error);
+						if (generation !== this.generation || this.stopped) return;
+						for (const [key, listener] of this.subscribers) {
+							const failed = (error: unknown) => {
+								this.recordFailure(error);
+								logger.error("Background occupancy subscriber failed", {
+									key,
+									error: String(error),
+								});
+							};
+							try {
+								const subscriber = Promise.resolve(listener(parentIds))
+									.catch(failed)
+									.finally(() => {
+										this.pending.delete(subscriber);
+									});
+								this.pending.add(subscriber);
+							} catch (error) {
+								failed(error);
+							}
+						}
+					} finally {
+						this.pending.delete(notification);
+						resolve();
 					}
-				}
+				});
 			});
+			this.pending.add(notification);
 		});
 		this.worker = work;
-		void work
+		const maintenance = work
 			.catch((error: unknown) => {
 				if (generation !== this.generation) return;
+				this.recordFailure(error);
 				this.failure = error;
 				logger.error("Background occupancy maintenance failed", { error: String(error) });
 			})
 			.finally(() => {
+				this.pending.delete(maintenance);
 				if (this.worker === work) {
 					this.worker = null;
-					if (!this.failure && this.ready && this.hasDirty()) this.launch(false);
+					if (!this.stopped && !this.failure && this.ready && this.hasDirty()) this.launch(false);
 				}
 			});
+		this.pending.add(maintenance);
 		return work;
 	}
 
@@ -510,6 +589,7 @@ export class BackgroundOccupancyStore {
 		while (frontier.length > 0) {
 			const next = new Set<string>();
 			const checked: string[] = [];
+			const withoutProjection = new Set<string>();
 			const missing = new Set<string>();
 			for (let offset = 0; offset < frontier.length; offset += PAGE_SIZE) {
 				const batch = frontier.slice(offset, offset + PAGE_SIZE).filter((id) => !visited.has(id));
@@ -526,6 +606,7 @@ export class BackgroundOccupancyStore {
 				for (const id of batch) if (!found.has(id) && !removed.has(id)) missing.add(id);
 				for (const row of rows) {
 					remember(row.id);
+					if (row.hasProjection === false) withoutProjection.add(row.id);
 					target.upsertNarrator(row);
 					if (row.type === "subagent" && row.parentNarratorId && !visited.has(row.parentNarratorId))
 						next.add(row.parentNarratorId);
@@ -556,6 +637,9 @@ export class BackgroundOccupancyStore {
 					if (old) remember(old.parentNarratorId);
 					target.deleteTask(taskId);
 				}
+				// The bounded narrator read already checked projection existence. A
+				// concurrent insertion is replayed through the drained dirty sets.
+				if (withoutProjection.has(id)) continue;
 				await this.scan(
 					`projections:${id}`,
 					generation,

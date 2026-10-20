@@ -1,13 +1,20 @@
+import type { Database } from "bun:sqlite";
 import {
 	fileChangeBlobs as blobs,
 	fileChangeStorageBudgets as budgets,
 	fileChangeBlobReservations as reservations,
 } from "@server/db/schema";
 import { generateId } from "@server/lib/id";
-import { FILE_CHANGE_LIMITS, type FileChangeBlobRef } from "@shared/file-change-protocol";
-import { and, asc, eq, inArray, sql } from "drizzle-orm";
+import {
+	FILE_CHANGE_BLOB_BUDGET_ID,
+	FILE_CHANGE_LIMITS,
+	type FileChangeBlobRef,
+} from "@shared/file-change-protocol";
+import { and, eq, inArray, sql } from "drizzle-orm";
 import type { BunSQLiteDatabase } from "drizzle-orm/bun-sqlite";
 import type { SQLiteTransactionConfig } from "drizzle-orm/sqlite-core";
+import { readQueryFirst, readTransactionTask } from "../db/worker-read";
+import { readFileChangeBlobCatalog } from "./file-change-blob-catalog-read";
 import type {
 	FileChangeBlobAdmission,
 	FileChangeBlobLease,
@@ -15,12 +22,14 @@ import type {
 } from "./file-change-blob-store";
 
 /** A database has ONE physical blob namespace, not one quota per project/user. */
-export const FILE_CHANGE_BLOB_BUDGET_ID = "file-change-blobs";
+export { FILE_CHANGE_BLOB_BUDGET_ID } from "@shared/file-change-protocol";
+
 const MAX_KEY_LENGTH = 256;
 const DIGEST_PATTERN = /^[a-f0-9]{64}$/;
 type QueryDb = Pick<BunSQLiteDatabase, "select" | "insert" | "update" | "get">;
 
 export type FileChangeBlobCatalogDb = QueryDb & {
+	$client: Database;
 	transaction<T>(work: (tx: QueryDb) => T, config?: SQLiteTransactionConfig): T;
 };
 export type FileChangeBlobBudgetMetadata = Readonly<typeof budgets.$inferSelect>;
@@ -110,7 +119,18 @@ export class FileChangeBlobCatalog {
 	}
 
 	/** Bounded metadata only; null means initialization has not happened. */
-	getBudget(): FileChangeBlobBudgetMetadata | null {
+	async getBudget(): Promise<FileChangeBlobBudgetMetadata | null> {
+		const row = await readQueryFirst(
+			this.db.select().from(budgets).where(eq(budgets.id, FILE_CHANGE_BLOB_BUDGET_ID)),
+			{ site: "file-change-blob-catalog.getBudget" },
+		);
+		if (!row) return null;
+		this.checkBudget(row);
+		return Object.freeze(row);
+	}
+
+	/** Same-turn dispatch fence only: callers must not yield between this check and dispatch. */
+	getBudgetForDispatch(): FileChangeBlobBudgetMetadata | null {
 		const row = this.db
 			.select()
 			.from(budgets)
@@ -119,6 +139,21 @@ export class FileChangeBlobCatalog {
 		if (!row) return null;
 		this.checkBudget(row);
 		return Object.freeze(row);
+	}
+
+	/** Same-turn dispatch fence; ordinary metadata consumers use getMetadata(). */
+	getMetadataForDispatch(input: {
+		expectedGeneration: number;
+		ref: FileChangeBlobRef;
+	}): FileChangeBlobMetadata | null {
+		const ref = validateRef(input.ref);
+		return this.transaction((tx) => {
+			this.requireAccess(tx, { expectedGeneration: input.expectedGeneration, mode: "writer" });
+			const row = tx.select().from(blobs).where(eq(blobs.digest, ref.digest)).get();
+			if (!row) return null;
+			checkBlob(row, ref);
+			return Object.freeze(row);
+		});
 	}
 
 	/** null explicitly means a new namespace. Reinitialization retains ALL counters. */
@@ -342,27 +377,37 @@ export class FileChangeBlobCatalog {
 	}
 
 	/** Metadata only. A catalog ready row alone never proves a body currently exists. */
-	getMetadata(input: {
+	async getMetadata(input: {
 		expectedGeneration: number;
 		ref: FileChangeBlobRef;
-	}): FileChangeBlobMetadata | null {
+	}): Promise<FileChangeBlobMetadata | null> {
 		const ref = validateRef(input.ref);
-		return this.transaction((tx) => {
-			this.requireAccess(tx, { expectedGeneration: input.expectedGeneration, mode: "writer" });
-			const row = tx.select().from(blobs).where(eq(blobs.digest, ref.digest)).get();
-			if (!row) return null;
-			checkBlob(row, ref);
-			return Object.freeze(row);
-		});
+		assertNumber(input.expectedGeneration, "generation");
+		const task = { kind: "fileChangeBlobCatalogV1", mode: "metadata", digest: ref.digest } as const;
+		const { budget, blob: row } = await readTransactionTask(
+			this.db,
+			task,
+			() => readFileChangeBlobCatalog(this.db, task),
+			{ site: "file-change-blob-catalog.getMetadata" },
+		);
+		this.checkReadBudget(budget, input.expectedGeneration);
+		if (budget?.status !== "ready")
+			throw fail("namespace_unverified", "Blob namespace is not verified for this operation");
+		if (!row) return null;
+		checkBlob(row, ref);
+		return Object.freeze(row);
 	}
 
 	/** One status per page uses (budget_id,status,created_at,id), never TTL reclamation. */
-	listReservations(input: {
+	async listReservations(input: {
 		expectedGeneration: number;
 		status: "reserved" | "reconcile_required";
 		limit?: number;
 		after?: ReservationCursor;
-	}): { items: FileChangeBlobReservationMetadata[]; nextCursor: ReservationCursor | null } {
+	}): Promise<{
+		items: FileChangeBlobReservationMetadata[];
+		nextCursor: ReservationCursor | null;
+	}> {
 		const limit = input.limit ?? FILE_CHANGE_LIMITS.historyPageItems;
 		assertNumber(limit, "limit", FILE_CHANGE_LIMITS.historyPageItems);
 		if (!limit || !["reserved", "reconcile_required"].includes(input.status))
@@ -376,24 +421,21 @@ export class FileChangeBlobCatalog {
 			)
 				throw fail("invalid_input", "Invalid reservation time cursor");
 		}
-		const rows = this.transaction((tx) => {
-			const current = this.requireBudget(tx, input.expectedGeneration);
-			return tx
-				.select()
-				.from(reservations)
-				.where(
-					and(
-						eq(reservations.budgetId, current.id),
-						eq(reservations.status, input.status),
-						input.after
-							? sql`(${reservations.createdAt}, ${reservations.id}) > (${input.after.createdAt}, ${input.after.id})`
-							: undefined,
-					),
-				)
-				.orderBy(asc(reservations.createdAt), asc(reservations.id))
-				.limit(limit + 1)
-				.all();
-		});
+		assertNumber(input.expectedGeneration, "generation");
+		const task = {
+			kind: "fileChangeBlobCatalogV1",
+			mode: "reservations",
+			status: input.status,
+			limit,
+			after: input.after,
+		} as const;
+		const { budget, reservations: rows } = await readTransactionTask(
+			this.db,
+			task,
+			() => readFileChangeBlobCatalog(this.db, task),
+			{ site: "file-change-blob-catalog.listReservations" },
+		);
+		this.checkReadBudget(budget, input.expectedGeneration);
 		const hasMore = rows.length > limit;
 		const items = rows.slice(0, limit).map((row) => Object.freeze(row));
 		const last = items[items.length - 1];
@@ -629,6 +671,15 @@ export class FileChangeBlobCatalog {
 		if (row.status !== (access.mode === "writer" ? "ready" : "reconciling"))
 			throw fail("namespace_unverified", "Blob namespace is not verified for this operation");
 		return row;
+	}
+
+	private checkReadBudget(
+		row: typeof budgets.$inferSelect | undefined,
+		expectedGeneration: number,
+	): void {
+		if (!row) throw fail("namespace_unverified", "Blob namespace has not been initialized");
+		this.checkBudget(row);
+		if (row.generation !== expectedGeneration) throw generationMismatch();
 	}
 
 	private checkBudget(row: typeof budgets.$inferSelect): void {

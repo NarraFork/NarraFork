@@ -240,7 +240,10 @@ beforeEach(async () => {
 		blobStore: namespace.store,
 		blobCatalog: namespace.catalog,
 		generation: namespace.generation,
-		planOptions: { namespaceKey: namespace.catalog.getBudget()?.namespaceKey ?? "missing", now },
+		planOptions: {
+			namespaceKey: (await namespace.catalog.getBudget())?.namespaceKey ?? "missing",
+			now,
+		},
 		onSlow: () => {},
 	};
 	service = new RevertPlannerService(db, options);
@@ -443,7 +446,7 @@ describe("real tool evidence -> complete prepared preview", () => {
 		expect(result.plan.status).toBe("prepared");
 		expect(result.plan.coverageComplete).toBe(true);
 		expect(result.plan.expectedFileCount).toBe(1);
-		const file = plans.listFiles(owner, result.plan.id).items[0];
+		const file = (await plans.listFiles(owner, result.plan.id)).items[0];
 		expect(await bytes(file.expectedStateJson)).toEqual(disk);
 		expect((await bytes(file.desiredStateJson)).toString()).toBe(original.replace("H0", "H2"));
 		expect(await readFile(path)).toEqual(disk);
@@ -483,7 +486,7 @@ describe("real tool evidence -> complete prepared preview", () => {
 		const disk = await readFile(path);
 		const before = historySnapshot();
 		const result = await prepare();
-		const file = plans.listFiles(owner, result.plan.id).items[0];
+		const file = (await plans.listFiles(owner, result.plan.id)).items[0];
 		expect((await bytes(file.desiredStateJson)).equals(original)).toBe(true);
 		expect(await readFile(path)).toEqual(disk);
 		expect(historySnapshot()).toBe(before);
@@ -559,7 +562,7 @@ describe("real tool evidence -> complete prepared preview", () => {
 		let cursor: RevertPlanFileCursor | undefined;
 		const sequences: number[] = [];
 		for (;;) {
-			const page = plans.listFiles(owner, result.plan.id, { limit: 7, cursor });
+			const page = await plans.listFiles(owner, result.plan.id, { limit: 7, cursor });
 			for (const file of page.items) {
 				sequences.push(file.sequence);
 				expect((await bytes(file.desiredStateJson)).toString()).toStartWith("original");

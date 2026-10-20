@@ -1,3 +1,4 @@
+import { readQuery } from "../db/worker-read";
 /**
  * Content-addressed worktree snapshots.
  *
@@ -1363,10 +1364,12 @@ export function planTreeRevertSegments(pairs: TreeBoundaryPair[]): TreeRevertSeg
 async function isShadowRepoClaimed(deviceId: string, worktreePath: string): Promise<boolean> {
 	const key = treeSnapshotKey(deviceId, worktreePath);
 	try {
-		const claimed = await db.query.chapters.findFirst({
-			where: eq(chapters.snapshotShadowKey, key),
-			columns: { id: true },
-		});
+		const claimed = await readQuery(
+			db.query.chapters.findFirst({
+				where: eq(chapters.snapshotShadowKey, key),
+				columns: { id: true },
+			}),
+		);
 		if (claimed != null) return true;
 		// `snapshotShadowKey` is only written once something advances the lineage, so a
 		// chapter that has never run a file-mutating tool has it NULL and would be read
@@ -1380,10 +1383,12 @@ async function isShadowRepoClaimed(deviceId: string, worktreePath: string): Prom
 		// question should not turn on which spelling a row happens to hold.
 		const normalized = normalizePathForComparison(worktreePath);
 		const candidates = normalized === worktreePath ? [worktreePath] : [worktreePath, normalized];
-		const byPath = await db.query.chapters.findFirst({
-			where: inArray(chapters.worktreePath, candidates),
-			columns: { id: true },
-		});
+		const byPath = await readQuery(
+			db.query.chapters.findFirst({
+				where: inArray(chapters.worktreePath, candidates),
+				columns: { id: true },
+			}),
+		);
 		return byPath != null;
 	} catch (error) {
 		logger.warn("Could not verify tree-snapshot ownership; keeping the repository", {

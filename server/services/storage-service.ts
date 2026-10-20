@@ -2,6 +2,7 @@ import type { Dirent } from "node:fs";
 import { existsSync } from "node:fs";
 import { lstat, opendir, readdir, realpath, rm, stat } from "node:fs/promises";
 import { resolve } from "node:path";
+import { readQuery, readQueryFirst } from "@server/db/worker-read";
 import {
 	STORAGE_CATEGORY_KEYS,
 	STORAGE_CATEGORY_PROGRESS_MESSAGE,
@@ -426,11 +427,7 @@ async function scanDormantIgnored(
 			// One bounded query rather than a lookup per directory: the id set is
 			// human-scale (one entry per chapter that has ever gone dormant).
 			const liveChapterIds = new Set(
-				db
-					.select({ id: chapters.id })
-					.from(chapters)
-					.all()
-					.map((row) => row.id),
+				(await readQuery(db.select({ id: chapters.id }).from(chapters))).map((row) => row.id),
 			);
 			orphanCount = dirs.filter((dir) => !liveChapterIds.has(dir.name)).length;
 		}
@@ -452,10 +449,9 @@ async function scanWorktrees(options: CategoryScanOptions = {}): Promise<Storage
 	const projectList: Array<{ name: string; sizeBytes: number; worktreeCount: number }> = [];
 
 	try {
-		const allProjects = db
-			.select({ id: projects.id, name: projects.name, gitPath: projects.gitPath })
-			.from(projects)
-			.all();
+		const allProjects = await readQuery(
+			db.select({ id: projects.id, name: projects.name, gitPath: projects.gitPath }).from(projects),
+		);
 
 		for (const proj of allProjects) {
 			if (!proj.gitPath) continue;
@@ -819,20 +815,22 @@ export async function cleanupOrphanedUploads(): Promise<{ removed: number; freed
 	if (!existsSync(uploadsDir)) return { removed: 0, freedBytes: 0 };
 
 	const entries = await readdir(uploadsDir, { withFileTypes: true });
-	const narratorIds = db
-		.select({ id: narrators.id })
-		.from(narrators)
-		.all()
-		.map((n) => n.id);
+	const narratorIds = (await readQuery(db.select({ id: narrators.id }).from(narrators))).map(
+		(n) => n.id,
+	);
 	// Only messages that contain an image block can pin an upload dir. Pre-filter
 	// with a substring match on content_json (a superset of contentJsonHasImageBlocks,
 	// which requires the literal `"type":"image"`) so we avoid loading every
 	// message's content_json into memory. The exact check below stays authoritative.
-	const uploadMessageOwners = db
-		.select({ narratorId: narratorMessages.narratorId, contentJson: narratorMessages.contentJson })
-		.from(narratorMessages)
-		.where(sql`${narratorMessages.contentJson} LIKE '%"type":"image"%'`)
-		.all();
+	const uploadMessageOwners = await readQuery(
+		db
+			.select({
+				narratorId: narratorMessages.narratorId,
+				contentJson: narratorMessages.contentJson,
+			})
+			.from(narratorMessages)
+			.where(sql`${narratorMessages.contentJson} LIKE '%"type":"image"%'`),
+	);
 	const preservedOwnerIds = buildReferencedUploadOwnerIds(narratorIds, uploadMessageOwners);
 
 	let removed = 0;
@@ -890,17 +888,18 @@ export async function cleanupOrphanedChatAttachments(): Promise<{
 	// whatever is left over is collected by the next run.
 	const DRAFT_SWEEP_LIMIT = 500;
 	const cutoff = new Date(Date.now() - CHAT_DRAFT_ATTACHMENT_TTL_MS).toISOString();
-	const staleDrafts = db
-		.select({
-			id: chatAttachments.id,
-			roomId: chatAttachments.roomId,
-			storedName: chatAttachments.storedName,
-			sizeBytes: chatAttachments.sizeBytes,
-		})
-		.from(chatAttachments)
-		.where(sql`${chatAttachments.messageId} IS NULL AND ${chatAttachments.createdAt} < ${cutoff}`)
-		.limit(DRAFT_SWEEP_LIMIT)
-		.all();
+	const staleDrafts = await readQuery(
+		db
+			.select({
+				id: chatAttachments.id,
+				roomId: chatAttachments.roomId,
+				storedName: chatAttachments.storedName,
+				sizeBytes: chatAttachments.sizeBytes,
+			})
+			.from(chatAttachments)
+			.where(sql`${chatAttachments.messageId} IS NULL AND ${chatAttachments.createdAt} < ${cutoff}`)
+			.limit(DRAFT_SWEEP_LIMIT),
+	);
 	if (staleDrafts.length > 0) {
 		db.delete(chatAttachments)
 			.where(
@@ -918,11 +917,7 @@ export async function cleanupOrphanedChatAttachments(): Promise<{
 
 	// (2) + (3) Reconcile the directories on disk against the rooms and rows.
 	const liveRoomIds = new Set(
-		db
-			.select({ id: chatRooms.id })
-			.from(chatRooms)
-			.all()
-			.map((r) => r.id),
+		(await readQuery(db.select({ id: chatRooms.id }).from(chatRooms))).map((r) => r.id),
 	);
 	let entries: Dirent[];
 	try {
@@ -949,12 +944,14 @@ export async function cleanupOrphanedChatAttachments(): Promise<{
 		// One room's rows: bounded by that room's attachment count and served by the
 		// `(room_id, claimed_at)` index.
 		const known = new Set(
-			db
-				.select({ storedName: chatAttachments.storedName })
-				.from(chatAttachments)
-				.where(eq(chatAttachments.roomId, roomId))
-				.all()
-				.map((row) => row.storedName),
+			(
+				await readQuery(
+					db
+						.select({ storedName: chatAttachments.storedName })
+						.from(chatAttachments)
+						.where(eq(chatAttachments.roomId, roomId)),
+				)
+			).map((row) => row.storedName),
 		);
 		for (const storedName of listStoredChatAttachmentNames(roomId)) {
 			if (known.has(storedName)) continue;
@@ -1001,11 +998,7 @@ export async function cleanupOrphanedIgnoredArchives(): Promise<{
 	try {
 		const entries = await readdir(baseDir, { withFileTypes: true });
 		const liveChapterIds = new Set(
-			db
-				.select({ id: chapters.id })
-				.from(chapters)
-				.all()
-				.map((row) => row.id),
+			(await readQuery(db.select({ id: chapters.id }).from(chapters))).map((row) => row.id),
 		);
 		for (const entry of entries) {
 			if (!entry.isDirectory()) continue;
@@ -1067,12 +1060,13 @@ export async function cleanupOrphanedWorktrees(): Promise<{
 
 	try {
 		// Caps bound work, not ownership: unvisited projects are simply left untouched.
-		const allProjects = db
-			.select({ id: projects.id, gitPath: projects.gitPath })
-			.from(projects)
-			.orderBy(projects.id)
-			.limit(64)
-			.all();
+		const allProjects = await readQuery(
+			db
+				.select({ id: projects.id, gitPath: projects.gitPath })
+				.from(projects)
+				.orderBy(projects.id)
+				.limit(64),
+		);
 		const deadline = performance.now() + 30_000;
 		const gitEnv = {
 			...process.env,
@@ -1133,13 +1127,14 @@ export async function cleanupOrphanedWorktrees(): Promise<{
 							if (performance.now() > deadline) break;
 							// ALL resource states survive narrator deletion. Errors (e.g. an unmigrated
 							// registry) abort the repo sweep, rather than making ownership disappear.
-							if (isRegisteredNarratorWorktree(fullPath)) continue;
-							const chapter = db
-								.select({ id: chapters.id })
-								.from(chapters)
-								.where(eq(chapters.worktreePath, fullPath))
-								.limit(1)
-								.get();
+							if (await isRegisteredNarratorWorktree(fullPath)) continue;
+							const chapter = await readQueryFirst(
+								db
+									.select({ id: chapters.id })
+									.from(chapters)
+									.where(eq(chapters.worktreePath, fullPath))
+									.limit(1),
+							);
 							if (chapter) continue;
 							// The final reservation below checks receipt and legacy cwd references
 							// for this target; do not rescan every session once per repository.
@@ -1158,12 +1153,13 @@ export async function cleanupOrphanedWorktrees(): Promise<{
 							)
 								continue;
 							if (
-								db
-									.select({ id: chapters.id })
-									.from(chapters)
-									.where(eq(chapters.branch, `chapter/${leaf}`))
-									.limit(1)
-									.get()
+								await readQueryFirst(
+									db
+										.select({ id: chapters.id })
+										.from(chapters)
+										.where(eq(chapters.branch, `chapter/${leaf}`))
+										.limit(1),
+								)
 							)
 								continue;
 							if ((await realpath(fullPath)) !== fullPath) continue;

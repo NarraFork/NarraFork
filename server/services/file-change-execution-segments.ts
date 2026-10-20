@@ -1,5 +1,6 @@
 import type { db as applicationDb } from "@server/db";
 import { fileChangeExecutionSegments, narratorToolCalls } from "@server/db/schema";
+import { readQuery } from "@server/db/worker-read";
 import { generateId } from "@server/lib/id";
 import { and, eq, inArray } from "drizzle-orm";
 
@@ -27,11 +28,14 @@ function text(value: string, name: string) {
 
 export function createFileChangeExecutionSegmentsService(db: SegmentDb) {
 	async function get(id: string) {
-		const rows = await db
-			.select()
-			.from(fileChangeExecutionSegments)
-			.where(eq(fileChangeExecutionSegments.id, id))
-			.limit(1);
+		const rows = await readQuery(
+			db
+				.select()
+				.from(fileChangeExecutionSegments)
+				.where(eq(fileChangeExecutionSegments.id, id))
+				.limit(1),
+			{ site: "file-change-execution-segments.get" },
+		);
 		return rows[0] as Segment | undefined;
 	}
 	async function create(input: CreateSegmentInput): Promise<Segment> {
@@ -64,28 +68,37 @@ export function createFileChangeExecutionSegmentsService(db: SegmentDb) {
 		if (input.parentSegmentId && !(await get(input.parentSegmentId)))
 			throw new Error("parent segment not found");
 		const existing = hasTool
-			? await db
-					.select()
-					.from(fileChangeExecutionSegments)
-					.where(
-						and(
-							eq(fileChangeExecutionSegments.narratorId, input.narratorId),
-							eq(fileChangeExecutionSegments.sourceToolCallId, sourceToolCallId ?? ""),
-							eq(fileChangeExecutionSegments.sourceExecutionAttempt, sourceExecutionAttempt ?? -1),
-						),
-					)
-					.limit(1)
-			: input.sourceInputId
-				? await db
+			? await readQuery(
+					db
 						.select()
 						.from(fileChangeExecutionSegments)
 						.where(
 							and(
 								eq(fileChangeExecutionSegments.narratorId, input.narratorId),
-								eq(fileChangeExecutionSegments.sourceInputId, input.sourceInputId),
+								eq(fileChangeExecutionSegments.sourceToolCallId, sourceToolCallId ?? ""),
+								eq(
+									fileChangeExecutionSegments.sourceExecutionAttempt,
+									sourceExecutionAttempt ?? -1,
+								),
 							),
 						)
-						.limit(1)
+						.limit(1),
+					{ site: "file-change-execution-segments.create.lookup" },
+				)
+			: input.sourceInputId
+				? await readQuery(
+						db
+							.select()
+							.from(fileChangeExecutionSegments)
+							.where(
+								and(
+									eq(fileChangeExecutionSegments.narratorId, input.narratorId),
+									eq(fileChangeExecutionSegments.sourceInputId, input.sourceInputId),
+								),
+							)
+							.limit(1),
+						{ site: "file-change-execution-segments.create.lookup" },
+					)
 				: [];
 		if (existing[0]) {
 			if (existing[0].parentSegmentId !== (input.parentSegmentId ?? null))
@@ -106,10 +119,13 @@ export function createFileChangeExecutionSegmentsService(db: SegmentDb) {
 	}
 	async function collect(toolCallIds: string[], limit = MAX_RESULTS): Promise<SegmentCollection> {
 		const cap = Math.min(Math.max(1, limit), MAX_RESULTS);
-		const calls = await db
-			.select({ id: narratorToolCalls.id, segmentId: narratorToolCalls.executionSegmentId })
-			.from(narratorToolCalls)
-			.where(inArray(narratorToolCalls.id, toolCallIds));
+		const calls = await readQuery(
+			db
+				.select({ id: narratorToolCalls.id, segmentId: narratorToolCalls.executionSegmentId })
+				.from(narratorToolCalls)
+				.where(inArray(narratorToolCalls.id, toolCallIds)),
+			{ site: "file-change-execution-segments.collect" },
+		);
 		const found = new Set(calls.map((x) => x.id));
 		const missingToolCallIds = toolCallIds.filter((id) => !found.has(id));
 		const ids = new Set<string>();
@@ -120,11 +136,14 @@ export function createFileChangeExecutionSegmentsService(db: SegmentDb) {
 			if (!id) break;
 			if (ids.has(id)) continue;
 			ids.add(id);
-			const children = await db
-				.select({ id: fileChangeExecutionSegments.id })
-				.from(fileChangeExecutionSegments)
-				.where(eq(fileChangeExecutionSegments.parentSegmentId, id))
-				.limit(cap + 1);
+			const children = await readQuery(
+				db
+					.select({ id: fileChangeExecutionSegments.id })
+					.from(fileChangeExecutionSegments)
+					.where(eq(fileChangeExecutionSegments.parentSegmentId, id))
+					.limit(cap + 1),
+				{ site: "file-change-execution-segments.children" },
+			);
 			queue.push(...children.map((x) => x.id));
 		}
 		return { segmentIds: [...ids].slice(0, cap), missingToolCallIds, hasMore: queue.length > 0 };
@@ -138,11 +157,14 @@ export function createFileChangeExecutionSegmentsService(db: SegmentDb) {
 		while (queue.length && ids.size < cap) {
 			const parent = queue.shift();
 			if (!parent) break;
-			const rows = await db
-				.select({ id: fileChangeExecutionSegments.id })
-				.from(fileChangeExecutionSegments)
-				.where(eq(fileChangeExecutionSegments.parentSegmentId, parent))
-				.limit(cap + 1);
+			const rows = await readQuery(
+				db
+					.select({ id: fileChangeExecutionSegments.id })
+					.from(fileChangeExecutionSegments)
+					.where(eq(fileChangeExecutionSegments.parentSegmentId, parent))
+					.limit(cap + 1),
+				{ site: "file-change-execution-segments.children" },
+			);
 			for (const r of rows) {
 				if (!ids.has(r.id)) {
 					ids.add(r.id);

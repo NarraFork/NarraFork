@@ -34,8 +34,9 @@ import { verifyToken } from "./lib/auth";
 import { isTrustedProxyAddress, resolveClientIp } from "./lib/client-ip";
 import { getCodexManager } from "./lib/codex-manager";
 import { inspectApplicationDataDirectory } from "./lib/data-directory-security";
-import { shutdownDbWorkerPool } from "./lib/db-worker/pool";
+import { drainDbWorkerPool, shutdownDbWorkerPool } from "./lib/db-worker/pool";
 import { resolveAdvertisedAppUrl } from "./lib/dev-app-url";
+import { eventBus } from "./lib/event-bus";
 import { startEventLoopMonitor } from "./lib/event-loop-monitor";
 import { rebindHttpListener } from "./lib/http-listener-rebind";
 import { logger } from "./lib/logger";
@@ -59,7 +60,14 @@ import { reloadSettings, settings } from "./lib/settings";
 import { startServerAddressWatcher } from "./lib/settings-address-watcher";
 import { startSettingsFileWatcher } from "./lib/settings-file-watcher";
 import { shellExecute } from "./lib/shell-exec";
-import { preservesRecoveryOnShutdown, ShutdownActivityTracker } from "./lib/shutdown-activity";
+import {
+	drainShutdownEffects,
+	preservesRecoveryOnShutdown,
+	runShutdownDatabaseTail,
+	shutdownStep as runShutdownStep,
+	ShutdownActivityTracker,
+	waitForShutdownWork,
+} from "./lib/shutdown-activity";
 import { injectSpaBaseHref, spaIndexHeaders } from "./lib/spa-base-href";
 import {
 	buildHealthPayload,
@@ -92,10 +100,13 @@ import { ensureAllRecentTabsMigrated } from "./services/recent-tabs-service";
 // Parse --wsl=true|false CLI flag (default: false — WSL disallowed)
 initWslFlag();
 
+import { drainPendingInboxWakes } from "./services/agent-runtime/inbox";
 import {
 	backgroundOccupancyInitializer,
 	withBackgroundOccupancyInitialization,
 } from "./services/background-occupancy-startup";
+import { backgroundOccupancyStore } from "./services/background-occupancy-store";
+import { backgroundTaskService } from "./services/background-task-service";
 import { chapterBatchMerge } from "./services/chapter-batch-merge";
 import { chapterCleanup } from "./services/chapter-cleanup";
 import {
@@ -105,11 +116,21 @@ import {
 } from "./services/container-proxy";
 import { ensureRootlessEnv } from "./services/container-service";
 import {
+	beginRecoveryCardShutdown,
+	drainRecoveryCardsForShutdown,
+	getRecoveryCardShutdownState,
+} from "./services/narrator-persistence";
+import {
+	abortNarratorExecutionsForShutdown,
 	failUnownedStartupRecovery,
 	recoverOnStartup as recoverNarrators,
 	recoverPendingQuestionAnswerDeliveries,
 	restorePendingModelOverrides,
 } from "./services/narrator-session";
+import {
+	drainNarratorAdmissionWork,
+	freezeNarratorAdmissionForShutdown,
+} from "./services/narrator-session-state";
 import "./services/notification-service"; // Register notification event listeners
 import {
 	startNotificationCenterMaintenance,
@@ -117,7 +138,7 @@ import {
 } from "./services/notification-center-maintenance";
 import { initNotificationFanout, stopNotificationFanout } from "./services/notification-fanout";
 import "./services/attention-hook-bridge"; // Bridge attention events into the hook system
-import { killAllBashProcesses } from "./lib/agent/tools/bash";
+import { cancelAllBashProcessesForShutdown } from "./lib/agent/tools/bash";
 import { initChatNotify } from "./services/chat-notify";
 import { initContainerEventHandler } from "./services/container-event-handler";
 import { initDeviceConnectionService } from "./services/device-connection-service";
@@ -847,13 +868,17 @@ const activeHttpRequests = new Map<number, Promise<Response | undefined>>();
 let nextHttpRequestId = 0;
 let acceptingHttpRequests = true;
 
-async function waitForHttpRequestDrain(excludedRequestId?: number): Promise<void> {
+async function waitForHttpRequestDrain(
+	signal: AbortSignal,
+	excludedRequestId?: number,
+): Promise<void> {
 	while (true) {
+		signal.throwIfAborted();
 		const pending = [...activeHttpRequests.entries()]
 			.filter(([requestId]) => requestId !== excludedRequestId)
 			.map(([, request]) => request);
 		if (pending.length === 0) return;
-		await Promise.allSettled(pending);
+		await waitForShutdownWork(Promise.allSettled(pending), signal);
 	}
 }
 
@@ -1837,32 +1862,12 @@ let killWindowsProcessTreeOnExit = true;
 async function shutdownStep(
 	tracker: ShutdownActivityTracker,
 	label: string,
-	fn: () => unknown,
+	fn: (signal: AbortSignal) => unknown,
 	timeoutMs = 4000,
 ): Promise<"ok" | "timeout" | "failed"> {
-	let timer: ReturnType<typeof setTimeout> | undefined;
-	try {
-		const timeout = new Promise<"timeout">((resolve) => {
-			timer = setTimeout(() => resolve("timeout"), timeoutMs);
-		});
-		const result = await Promise.race([
-			Promise.resolve()
-				.then(fn)
-				.then(() => "ok" as const)
-				.catch((err) => {
-					logger.warn(`Shutdown step failed: ${label}`, { error: String(err) });
-					return "failed" as const;
-				}),
-			timeout,
-		]);
-		if (result === "timeout") {
-			logger.warn(`Shutdown step timed out: ${label}`, { timeoutMs });
-		}
-		tracker.recordStep(label, result);
-		return result;
-	} finally {
-		if (timer) clearTimeout(timer);
-	}
+	return runShutdownStep(tracker, label, fn, timeoutMs, (outcome, error) => {
+		logger.warn(`Shutdown step ${outcome}: ${label}`, { timeoutMs, error: String(error ?? "") });
+	});
 }
 
 async function performGracefulShutdown(
@@ -1895,6 +1900,11 @@ async function performGracefulShutdown(
 		// steps below are what guarantee later teardown cannot race a handler that writes to SQLite
 		// after the clean marker.
 		acceptingHttpRequests = false;
+		freezeNarratorAdmissionForShutdown();
+		backgroundTaskService.freezeForShutdown();
+		eventBus.beginShutdown();
+		beginRecoveryCardShutdown();
+		backgroundOccupancyStore.beginShutdown();
 		if (options.reason === "signal") {
 			await shutdownStep(tracker, "restartRecovery.prepare", prepareSignalRestartRecovery, 5_000);
 		}
@@ -1904,6 +1914,13 @@ async function performGracefulShutdown(
 			stopWorkspaceStartupReconciliation,
 			5_000,
 		);
+		getCodexManager().stopUsageRefreshScheduler();
+		stopScheduledTaskScheduler();
+		chapterCleanup.clearAllTimers();
+		worktreeWatcher.shutdown();
+		// Snapshot/fences above must precede abort: final tool results retain their original owner.
+		abortNarratorExecutionsForShutdown();
+		if (!options.skipBashProcessKill) cancelAllBashProcessesForShutdown();
 		const shutdownRequestId = httpRequestContext.getStore();
 		closeAllConnections();
 		// A short budget is honest here: stopHttpListener() is synchronous by design
@@ -1918,69 +1935,116 @@ async function performGracefulShutdown(
 		const httpDrainOutcome = await shutdownStep(
 			tracker,
 			"httpHandlers.drain",
-			() => waitForHttpRequestDrain(shutdownRequestId),
+			(signal) => waitForHttpRequestDrain(signal, shutdownRequestId),
 			10_000,
 		);
 		const wsDrainOutcome = await shutdownStep(
 			tracker,
 			"websocketHandlers.drain",
-			waitForWebSocketActivityDrain,
+			(signal) => waitForWebSocketActivityDrain(signal),
 			10_000,
 		);
 		if (serverStopOutcome === "ok" && httpDrainOutcome === "ok" && wsDrainOutcome === "ok") {
 			tracker.markDrainComplete();
 		}
 
-		getCodexManager().stopUsageRefreshScheduler();
-		stopScheduledTaskScheduler();
 		await shutdownStep(tracker, "notificationFanout.stop", stopNotificationFanout);
 		await shutdownStep(tracker, "notificationMaintenance.stop", stopNotificationCenterMaintenance);
-		await shutdownStep(tracker, "containerProxy.stop", () => stopContainerProxy());
-		await shutdownStep(tracker, "terminalService.shutdownAll", () => terminalService.shutdownAll());
-		if (!options.skipBashProcessKill) {
-			await shutdownStep(tracker, "killAllBashProcesses", () => killAllBashProcesses());
-		}
-		chapterCleanup.clearAllTimers();
-		worktreeWatcher.shutdown();
-		projectDbManager.closeAll();
-		// The background integrity probe is a separate PROCESS holding a read-only handle on the
-		// database for up to 10 minutes. Left running it becomes an orphan: it keeps scanning while a
-		// replacement process may swap the database file (startup recovery) or rewrite it (admin
-		// VACUUM), and its verdict has no parent to report to.
-		await shutdownStep(tracker, "integrityProbe.cancel", () => cancelBackgroundIntegrityCheck());
-		// Read workers hold their own read-only SQLite connections; terminate them before the clean
-		// marker is written so no thread is still touching the database afterwards.
-		await shutdownStep(tracker, "privateArchiveWorkers.shutdown", shutdownPrivateArchiveWorkers);
-		await shutdownStep(tracker, "dbWorkerPool.shutdown", () => shutdownDbWorkerPool());
-		// PostgreSQL: stop accepting new operations and close the client, in drain order — after
-		// HTTP/WS handlers have drained, before the lock release below. A no-op on the SQLite
-		// backend, so the SQLite teardown sequence is neither extended nor bypassed.
-		await shutdownStep(tracker, "postgresRuntime.close", () => closePostgresRuntime());
-		await shutdownStep(tracker, "vnetUdpRendezvous.stop", () => stopVNetUdpRendezvous());
-		await shutdownStep(tracker, "pluginManager.shutdown", () => pluginManager.shutdown());
-		unregisterExternalProviderResolver();
-		await shutdownStep(tracker, "mcpManager.shutdown", () => mcpManager.shutdown());
-		// Checkpoint-backed update/system shutdown: persist active browser sessions and flip the
-		// pool into preserve-on-close mode so browserPool.close disconnects (keeps Chrome alive)
-		// for recovery. A normal shutdown skips this and closes the browser as usual.
-		if (preservesRecoveryOnShutdown(options.reason)) {
-			await shutdownStep(tracker, "browserSessions.persistForUpdate", () =>
-				import("./services/browser-session-recovery").then(({ persistBrowserSessionsForUpdate }) =>
-					persistBrowserSessionsForUpdate(),
-				),
+		const drainEffects = (signal: AbortSignal) =>
+			drainShutdownEffects(
+				[
+					{ drain: (s) => eventBus.drainForShutdown(s), state: () => eventBus.getShutdownState() },
+					{ drain: drainRecoveryCardsForShutdown, state: getRecoveryCardShutdownState },
+					{
+						drain: (s) => backgroundOccupancyInitializer.drainForShutdown(s),
+						state: () => backgroundOccupancyInitializer.getShutdownState(),
+					},
+					{
+						drain: (s) => backgroundOccupancyStore.drainForShutdown(s),
+						state: () => backgroundOccupancyStore.getShutdownState(),
+					},
+				],
+				signal,
 			);
-		}
-		// Close browser pool if it was started. When preserve mode was set above, this disconnects
-		// from Chrome (leaving it running for the replacement process) rather than closing it.
-		await shutdownStep(tracker, "browserPool.close", () =>
-			import("./lib/browser/pool").then(({ closeBrowser }) => closeBrowser()),
-		);
-		// Close Codex WebSocket session cache — active outbound WS
-		// connections keep the event loop alive and delay exit.
-		await shutdownStep(tracker, "codexWebSocket.clear", () =>
-			import("./lib/agent/codex-websocket").then(({ clearCodexResponsesWebSocketSessions }) =>
-				clearCodexResponsesWebSocketSessions(),
-			),
+		await runShutdownDatabaseTail(
+			tracker,
+			{
+				drainProducers: async (signal) => {
+					const results = await Promise.allSettled([
+						drainPendingInboxWakes(signal),
+						drainNarratorAdmissionWork(signal),
+						backgroundTaskService.drainForShutdown(signal, {
+							preserveRunning: options.skipBashProcessKill,
+						}),
+					]);
+					const failed = results.find((result) => result.status === "rejected");
+					if (failed?.status === "rejected") {
+						logger.warn("Shutdown producers did not settle", {
+							preservingBashProcesses: !!options.skipBashProcessKill,
+							backgroundTasks: backgroundTaskService.getShutdownState(),
+							error: String(failed.reason),
+						});
+						throw failed.reason;
+					}
+					// A wake can report its failure after the concurrent admission drain became empty.
+					await drainNarratorAdmissionWork(signal);
+				},
+				drainEffects,
+				teardown: async () => {
+					await shutdownStep(tracker, "containerProxy.stop", () => stopContainerProxy());
+					await shutdownStep(tracker, "terminalService.shutdownAll", (signal) =>
+						terminalService.shutdownAll(signal),
+					);
+
+					// The background integrity probe is a separate PROCESS holding a read-only handle on the
+					// database for up to 10 minutes. Left running it becomes an orphan: it keeps scanning while a
+					// replacement process may swap the database file (startup recovery) or rewrite it (admin
+					// VACUUM), and its verdict has no parent to report to.
+					await shutdownStep(tracker, "integrityProbe.cancel", () =>
+						cancelBackgroundIntegrityCheck(),
+					);
+					await shutdownStep(
+						tracker,
+						"privateArchiveWorkers.shutdown",
+						shutdownPrivateArchiveWorkers,
+					);
+					// Plugin state stores and browser recovery persistence still require database access here.
+					await shutdownStep(tracker, "vnetUdpRendezvous.stop", () => stopVNetUdpRendezvous());
+					await shutdownStep(tracker, "pluginManager.shutdown", () => pluginManager.shutdown());
+					unregisterExternalProviderResolver();
+					await shutdownStep(tracker, "mcpManager.shutdown", () => mcpManager.shutdown());
+					// Checkpoint-backed update/system shutdown: persist active browser sessions and flip the
+					// pool into preserve-on-close mode so browserPool.close disconnects (keeps Chrome alive)
+					// for recovery. A normal shutdown skips this and closes the browser as usual.
+					if (preservesRecoveryOnShutdown(options.reason)) {
+						await shutdownStep(tracker, "browserSessions.persistForUpdate", () =>
+							import("./services/browser-session-recovery").then(
+								({ persistBrowserSessionsForUpdate }) => persistBrowserSessionsForUpdate(),
+							),
+						);
+					}
+					// Close browser pool if it was started. When preserve mode was set above, this disconnects
+					// from Chrome (leaving it running for the replacement process) rather than closing it.
+					await shutdownStep(tracker, "browserPool.close", () =>
+						import("./lib/browser/pool").then(({ closeBrowser }) => closeBrowser()),
+					);
+					// Close Codex WebSocket session cache — active outbound WS
+					// connections keep the event loop alive and delay exit.
+					await shutdownStep(tracker, "codexWebSocket.clear", () =>
+						import("./lib/agent/codex-websocket").then(({ clearCodexResponsesWebSocketSessions }) =>
+							clearCodexResponsesWebSocketSessions(),
+						),
+					);
+				},
+				closeProjects: () => {
+					backgroundOccupancyStore.stop();
+					return projectDbManager.closeAll();
+				},
+				drainReadPool: drainDbWorkerPool,
+				forceReadPool: shutdownDbWorkerPool,
+				closeDatabase: closePostgresRuntime,
+			},
+			shutdownStep,
 		);
 		if (!options.skipWindowsProcessTreeKill) {
 			killOwnWindowsChildProcesses();

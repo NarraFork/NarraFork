@@ -1,13 +1,24 @@
-import { afterEach, expect, test } from "bun:test";
+import { afterEach, expect, spyOn, test } from "bun:test";
+import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { eq, inArray } from "drizzle-orm";
-import { narrators, users } from "../db/schema";
+import { fileAttributions, narrators, users } from "../db/schema";
+import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
+import { localPathSemantics } from "../lib/agent/execution/path-semantics";
 import { generateId } from "../lib/id";
+import { safeSpawn } from "../lib/spawn";
 import { type AttributionActor, EXTERNAL_ACTOR } from "./attribution-actors";
-import { redactGitActors, redactGitModificationView } from "./git-workspace-attribution";
+import { type GitWorkspaceTarget, normalizeWorkspacePath } from "./git-workspace";
+import {
+	collectGitAttributionScopes,
+	redactGitActors,
+	redactGitModificationView,
+} from "./git-workspace-attribution";
 import { canReadNarrator, canWriteNarrator } from "./narrator-acl";
 import type { WorkspaceModificationView } from "./workspace-modification-view";
 
-const { db } = await import("../db");
+const { db, sqlite } = await import("../db");
 const createdNarrators: string[] = [];
 const createdUsers: string[] = [];
 const changedAt = "2026-01-01T00:00:00.000Z";
@@ -84,6 +95,56 @@ afterEach(async () => {
 	if (createdNarrators.length)
 		await db.delete(narrators).where(inArray(narrators.id, createdNarrators.splice(0)));
 	if (createdUsers.length) await db.delete(users).where(inArray(users.id, createdUsers.splice(0)));
+});
+
+test("scope discovery reads the file-backed adapter through workers before selecting the first row", async () => {
+	expect(sqlite.filename).not.toBe(":memory:");
+	const root = await mkdtemp(join(tmpdir(), "attribution-scopes-"));
+	const cwd = join(root, "known");
+	const discovered = join(root, "discovered");
+	const ids = [generateId(), generateId()];
+	const originalTest = process.env.NARRAFORK_TEST;
+	try {
+		await mkdir(cwd);
+		await mkdir(discovered);
+		const initialized = await safeSpawn({ cmd: ["git", "init", root], timeout: 5_000 });
+		expect(initialized.exitCode).toBe(0);
+		await db.insert(fileAttributions).values(
+			ids.map((id) => ({
+				id,
+				deviceId: LOCAL_DEVICE_ID,
+				workspacePath: normalizeWorkspacePath(discovered),
+				filePath: "fixture.txt",
+				action: "external" as const,
+				changedAt,
+			})),
+		);
+		const target = {
+			workspace: { rootPath: root, cwd, deviceId: LOCAL_DEVICE_ID },
+			backend: { kind: "local", paths: localPathSemantics },
+		} as GitWorkspaceTarget;
+		// Production mode must reject identity-less promises rather than use the test fallback.
+		delete process.env.NARRAFORK_TEST;
+		const prepare = spyOn(sqlite, "prepare");
+		try {
+			const result = await collectGitAttributionScopes(target);
+			expect(result).toEqual({
+				scopes: [
+					{ workspacePath: normalizeWorkspacePath(cwd), prefix: "known" },
+					{ workspacePath: normalizeWorkspacePath(discovered), prefix: "discovered" },
+				],
+				truncated: false,
+			});
+			expect(prepare).not.toHaveBeenCalled();
+		} finally {
+			prepare.mockRestore();
+		}
+	} finally {
+		if (originalTest === undefined) delete process.env.NARRAFORK_TEST;
+		else process.env.NARRAFORK_TEST = originalTest;
+		await db.delete(fileAttributions).where(inArray(fileAttributions.id, ids));
+		await rm(root, { recursive: true, force: true });
+	}
 });
 
 test("nested event actors match timeline and summaries without mutating observations", () => {

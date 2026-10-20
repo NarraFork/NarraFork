@@ -3,6 +3,7 @@ import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
 import { db } from "../db";
 import { users } from "../db/schema";
+import { readQueryFirst } from "../db/worker-read";
 import {
 	inspectApplicationDataDirectory,
 	publicDataDirectoryStatus,
@@ -22,16 +23,19 @@ dataDirectorySecurityRoutes.use("*", async (c, next) => {
 	await next();
 });
 
-function isCurrentAdmin(userId: string): boolean {
+async function isCurrentAdmin(userId: string): Promise<boolean> {
 	// Privileged filesystem changes must not trust a role retained in an older JWT.
-	return (
-		db.select({ role: users.role }).from(users).where(eq(users.id, userId)).get()?.role === "admin"
+	const user = await readQueryFirst(
+		db.select({ role: users.role }).from(users).where(eq(users.id, userId)),
 	);
+	return user?.role === "admin";
 }
 
 dataDirectorySecurityRoutes.get("/", async (c) => {
 	const status = await inspectApplicationDataDirectory(getNarraforkHome());
-	return c.json(isCurrentAdmin(c.get("user").sub) ? status : publicDataDirectoryStatus(status));
+	return c.json(
+		(await isCurrentAdmin(c.get("user").sub)) ? status : publicDataDirectoryStatus(status),
+	);
 });
 
 dataDirectorySecurityRoutes.post(
@@ -55,12 +59,12 @@ dataDirectorySecurityRoutes.post(
 			throw new ValidationError(
 				"Explicit repair confirmation is required; no path overrides are accepted",
 			);
-		const authorize = () => {
-			if (!isCurrentAdmin(c.get("user").sub)) throw new ForbiddenError();
+		const authorize = async () => {
+			if (!(await isCurrentAdmin(c.get("user").sub))) throw new ForbiddenError();
 		};
-		authorize();
+		await authorize();
 		const status = await repairApplicationDataDirectory(getNarraforkHome(), authorize);
-		authorize(); // Do not leak filesystem diagnostics after a concurrent role downgrade.
+		await authorize(); // Do not leak filesystem diagnostics after a concurrent role downgrade.
 		return c.json(status);
 	},
 );

@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import { fileChangeExecutionSegments, narrators, narratorToolCalls } from "../db/schema";
@@ -16,23 +17,27 @@ export async function resolveSubagentExecutionSegment(
 	const runId =
 		logicalRunId === undefined
 			? (
-					await db.query.narrators.findFirst({
-						where: eq(narrators.id, childNarratorId),
-						columns: { logicalRunId: true },
-					})
+					await readQuery(
+						db.query.narrators.findFirst({
+							where: eq(narrators.id, childNarratorId),
+							columns: { logicalRunId: true },
+						}),
+					)
 				)?.logicalRunId
 			: logicalRunId;
 	if (!runId) return null;
-	const [segment] = await db
-		.select()
-		.from(fileChangeExecutionSegments)
-		.where(
-			and(
-				eq(fileChangeExecutionSegments.narratorId, childNarratorId),
-				eq(fileChangeExecutionSegments.sourceInputId, runSource(runId)),
-			),
-		)
-		.limit(1);
+	const [segment] = await readQuery(
+		db
+			.select()
+			.from(fileChangeExecutionSegments)
+			.where(
+				and(
+					eq(fileChangeExecutionSegments.narratorId, childNarratorId),
+					eq(fileChangeExecutionSegments.sourceInputId, runSource(runId)),
+				),
+			)
+			.limit(1),
+	);
 	return segment ?? null;
 }
 
@@ -58,24 +63,28 @@ async function readVerifiedSubagentExecutionBoundary(
 ): Promise<SubagentExecutionBoundary | null> {
 	const segment = await resolveSubagentExecutionSegment(childNarratorId, logicalRunId);
 	if (!segment?.parentSegmentId) return null;
-	const [parent] = await db
-		.select()
-		.from(fileChangeExecutionSegments)
-		.where(eq(fileChangeExecutionSegments.id, segment.parentSegmentId))
-		.limit(1);
+	const [parent] = await readQuery(
+		db
+			.select()
+			.from(fileChangeExecutionSegments)
+			.where(eq(fileChangeExecutionSegments.id, segment.parentSegmentId))
+			.limit(1),
+	);
 	if (!parent?.sourceToolCallId || parent.sourceExecutionAttempt === null) return null;
-	const [call] = await db
-		.select({ id: narratorToolCalls.id })
-		.from(narratorToolCalls)
-		.where(
-			and(
-				eq(narratorToolCalls.id, parent.sourceToolCallId),
-				eq(narratorToolCalls.executionAttempt, parent.sourceExecutionAttempt),
-				eq(narratorToolCalls.executionIdentityVersion, 1),
-				eq(narratorToolCalls.executionSegmentId, parent.id),
-			),
-		)
-		.limit(1);
+	const [call] = await readQuery(
+		db
+			.select({ id: narratorToolCalls.id })
+			.from(narratorToolCalls)
+			.where(
+				and(
+					eq(narratorToolCalls.id, parent.sourceToolCallId),
+					eq(narratorToolCalls.executionAttempt, parent.sourceExecutionAttempt),
+					eq(narratorToolCalls.executionIdentityVersion, 1),
+					eq(narratorToolCalls.executionSegmentId, parent.id),
+				),
+			)
+			.limit(1),
+	);
 	return call
 		? {
 				sourceToolCallId: parent.sourceToolCallId,
@@ -107,21 +116,23 @@ export async function establishSubagentExecutionSegment(input: {
 			input.binding,
 		);
 		{
-			const [verified] = await db
-				.select({ executionSegmentId: narratorToolCalls.executionSegmentId })
-				.from(narratorToolCalls)
-				.where(
-					and(
-						eq(narratorToolCalls.id, input.binding.toolCallId),
-						eq(narratorToolCalls.narratorId, bindingNarratorId),
-						eq(narratorToolCalls.executionAttempt, input.binding.attempt),
-						eq(narratorToolCalls.executionIdentityVersion, 1),
-						input.binding.executionSegmentId
-							? eq(narratorToolCalls.executionSegmentId, input.binding.executionSegmentId)
-							: undefined,
-					),
-				)
-				.limit(1);
+			const [verified] = await readQuery(
+				db
+					.select({ executionSegmentId: narratorToolCalls.executionSegmentId })
+					.from(narratorToolCalls)
+					.where(
+						and(
+							eq(narratorToolCalls.id, input.binding.toolCallId),
+							eq(narratorToolCalls.narratorId, bindingNarratorId),
+							eq(narratorToolCalls.executionAttempt, input.binding.attempt),
+							eq(narratorToolCalls.executionIdentityVersion, 1),
+							input.binding.executionSegmentId
+								? eq(narratorToolCalls.executionSegmentId, input.binding.executionSegmentId)
+								: undefined,
+						),
+					)
+					.limit(1),
+			);
 			if (!verified && input.binding.executionSegmentId)
 				throw new Error("Subagent execution segment binding is not verified");
 			parentSegmentId = verified?.executionSegmentId ?? null;

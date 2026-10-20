@@ -116,11 +116,11 @@ beforeEach(() => {
 	narrator("other", "bob");
 	const traced = new Proxy(sqlite, {
 		get(target, key) {
-			if (key === "query")
+			if (key === "query" || key === "prepare")
 				return (...args: Parameters<Database["query"]>) => {
 					if (queries.length < 20_000) queries.push(args[0]);
 					beforeQuery?.(args[0]);
-					return Reflect.apply(target.query, target, args);
+					return Reflect.apply(target[key], target, args);
 				};
 			const value = Reflect.get(target, key, target);
 			return typeof value === "function" ? value.bind(target) : value;
@@ -455,6 +455,38 @@ describe("stable block boundary and COW history manifest", () => {
 		expect(result.history.messages[0].action).toBe("unlink");
 		expect(result.history.budget.messageRefChanges).toBe(1);
 		expect(result.history.toolChanges[0].action).toBe("retain");
+	});
+	test("association batching completes a cursor page before later tables and preserves order", async () => {
+		const t = tool(1, "Read");
+		for (let i = 0; i < 65; i++)
+			sqlite.query("INSERT INTO chapter_commits VALUES(?,?)").run(`commit-${i}`, t.messageId);
+		sqlite.query("INSERT INTO spec_file_revisions VALUES('after-commits',?)").run(t.messageId);
+		const result = await collect();
+		expect(result.history.associations.map((row) => row.id)).toEqual([
+			...Array.from({ length: 65 }, (_, i) => `commit-${i}`),
+			"after-commits",
+		]);
+		const firstSpec = queries.findIndex(
+			(query) => query.startsWith("SELECT id AS id") && query.includes("FROM spec_file_revisions"),
+		);
+		expect(
+			queries
+				.slice(0, firstSpec)
+				.filter(
+					(query) => query.startsWith("SELECT id AS id") && query.includes("FROM chapter_commits"),
+				),
+		).toHaveLength(3);
+	});
+	test("a nonempty narrator association completes ACL before querying later tables", async () => {
+		const t = tool(1, "Read");
+		sqlite.query("UPDATE narrators SET fork_message_id=? WHERE id='other'").run(t.messageId);
+		const failure = await collect().catch((error: unknown) => error);
+		expect(failure).toMatchObject({ message: "ACL denied" });
+		expect(
+			queries.some(
+				(query) => query.startsWith("SELECT id AS id") && query.includes("FROM chapter_commits"),
+			),
+		).toBe(false);
 	});
 	test("potential cascades and SET NULL rows include question/continuation/spec/commit/API pointers", async () => {
 		const t = tool(1, "Read");

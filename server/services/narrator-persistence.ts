@@ -21,6 +21,7 @@ import {
 	narratorToolCalls,
 	users,
 } from "../db/schema";
+import { readDbAll, readQuery, readQueryFirst } from "../db/worker-read";
 import { isModelPlanReference } from "../lib/agent/strip-plan-body";
 import type {
 	ApiRequestDiagnostics,
@@ -52,6 +53,7 @@ import { parseSubstatus } from "../lib/narrator-utils";
 import { forcesRelaxedPlan, type PermissionMode } from "../lib/permission-modes";
 import { policyDependentsWhere, runDeliverToOf } from "../lib/runtime-source";
 import { settings } from "../lib/settings";
+import { waitForShutdownWork } from "../lib/shutdown-activity";
 import { dualBroadcastToNarrator } from "../websocket/narrator-dual-broadcast";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { createMailboxStore } from "./agent-runtime/mailbox";
@@ -78,6 +80,37 @@ import { assertSqliteNarratorOperation, getNarratorMessageRefsPort } from "./nar
 import { preserveTurnTimingSubstatus, transitionTurnTimingSubstatus } from "./narrator-turn-timing";
 
 const executionSegments = createFileChangeExecutionSegmentsService(db);
+
+// Own only the existing import -> recovery-card write tail. Status writes remain
+// non-blocking, and completed work is released immediately rather than retained.
+const pendingRecoveryCards = new Set<Promise<unknown>>();
+let recoveryCardShutdown = false;
+let recoveryCardFailureCount = 0;
+let recoveryCardFirstError: unknown;
+
+export function beginRecoveryCardShutdown(): void {
+	recoveryCardShutdown = true;
+}
+
+export function getRecoveryCardShutdownState(): {
+	pending: number;
+	failureCount: number;
+	firstError: unknown;
+} {
+	return {
+		pending: pendingRecoveryCards.size,
+		failureCount: recoveryCardFailureCount,
+		firstError: recoveryCardFirstError,
+	};
+}
+
+export async function drainRecoveryCardsForShutdown(signal: AbortSignal): Promise<void> {
+	signal.throwIfAborted();
+	while (pendingRecoveryCards.size > 0) {
+		await waitForShutdownWork(Promise.all([...pendingRecoveryCards]), signal);
+		signal.throwIfAborted();
+	}
+}
 
 // ── Internal helpers ───────────────────────────────────────────────────────
 
@@ -171,18 +204,21 @@ async function resolveToolCallWriteId(
 	toolUseId: string,
 	options: { toolCallId?: string; messageId?: string; narratorId?: string } = {},
 ): Promise<string | undefined> {
-	const rows = await db
-		.select({ id: narratorToolCalls.id })
-		.from(narratorToolCalls)
-		.where(
-			and(
-				eq(narratorToolCalls.toolUseId, toolUseId),
-				options.toolCallId ? eq(narratorToolCalls.id, options.toolCallId) : undefined,
-				options.messageId ? eq(narratorToolCalls.messageId, options.messageId) : undefined,
-				options.narratorId ? eq(narratorToolCalls.narratorId, options.narratorId) : undefined,
-			),
-		)
-		.limit(2);
+	const rows = await readQuery(
+		db
+			.select({ id: narratorToolCalls.id })
+			.from(narratorToolCalls)
+			.where(
+				and(
+					eq(narratorToolCalls.toolUseId, toolUseId),
+					options.toolCallId ? eq(narratorToolCalls.id, options.toolCallId) : undefined,
+					options.messageId ? eq(narratorToolCalls.messageId, options.messageId) : undefined,
+					options.narratorId ? eq(narratorToolCalls.narratorId, options.narratorId) : undefined,
+				),
+			)
+			.limit(2),
+		{ site: "narrator-persistence.resolveToolCallWriteId" },
+	);
 	if (rows.length > 1)
 		throw new ValidationError(
 			"An exact tool-call row id is required for repeated toolUseId values",
@@ -553,10 +589,13 @@ export async function bumpParentNarratorMessageVersion(
 	parentToolUseId?: string | null,
 ): Promise<void> {
 	if (!parentToolUseId) return;
-	const parentToolCall = await db.query.narratorToolCalls.findFirst({
-		where: eq(narratorToolCalls.toolUseId, parentToolUseId),
-		columns: { narratorId: true },
-	});
+	const parentToolCall = await readQuery(
+		db.query.narratorToolCalls.findFirst({
+			where: eq(narratorToolCalls.toolUseId, parentToolUseId),
+			columns: { narratorId: true },
+		}),
+		{ site: "narrator-persistence.bumpParentNarratorMessageVersion" },
+	);
 	if (!parentToolCall) return;
 	await bumpNarratorMessageVersions([parentToolCall.narratorId]);
 }
@@ -762,12 +801,14 @@ export async function recoverStaleCompactingMessages(
 	// Both modern and legacy compact blocks are represented in this tiny partial
 	// index. Never search historical message text (or fall back to doing so): a
 	// missing index is a schema error, not permission to scan the message table.
-	const upperBound = sqlite
-		.query<{ cursor: number }, []>(
-			`SELECT rowid AS cursor FROM narrator_messages INDEXED BY idx_messages_compact_pending
+	const upperBound = (
+		await readDbAll<{ cursor: number }>(
+			db,
+			sql`SELECT rowid AS cursor FROM narrator_messages INDEXED BY idx_messages_compact_pending
 			 WHERE compact_pending = 1 ORDER BY rowid DESC LIMIT 1`,
+			{ site: "narrator-persistence.recoverCompactUpperBound" },
 		)
-		.get()?.cursor;
+	)[0]?.cursor;
 	let selectionMs = performance.now() - startedAt;
 	let recoveryMs = 0;
 	let batches = 0;
@@ -783,17 +824,13 @@ export async function recoverStaleCompactingMessages(
 	// this invocation finite; it is not a snapshot or a durable recovery cursor.
 	while (upperBound !== undefined) {
 		const selectionStartedAt = performance.now();
-		const staleMessages = sqlite
-			.query<{ cursor: number; id: string }, number[]>(
-				`SELECT rowid AS cursor, id FROM narrator_messages INDEXED BY idx_messages_compact_pending
-				 WHERE compact_pending = 1 AND rowid <= ? ${cursor === undefined ? "" : "AND rowid > ?"}
-				 ORDER BY rowid LIMIT ?`,
-			)
-			.all(
-				...(cursor === undefined
-					? [upperBound, COMPACT_RECOVERY_PAGE_SIZE]
-					: [upperBound, cursor, COMPACT_RECOVERY_PAGE_SIZE]),
-			);
+		const staleMessages = await readDbAll<{ cursor: number; id: string }>(
+			db,
+			sql`SELECT rowid AS cursor, id FROM narrator_messages INDEXED BY idx_messages_compact_pending
+				 WHERE compact_pending = 1 AND rowid <= ${upperBound} ${cursor === undefined ? sql`` : sql`AND rowid > ${cursor}`}
+				 ORDER BY rowid LIMIT ${COMPACT_RECOVERY_PAGE_SIZE}`,
+			{ site: "narrator-persistence.recoverCompactPage" },
+		);
 		selectionMs += performance.now() - selectionStartedAt;
 		if (staleMessages.length === 0) break;
 		batches++;
@@ -999,16 +1036,32 @@ export interface MessagePlacementOptions {
 	onPersist?: (tx: DbTx, messageId: string, refId: string) => undefined;
 }
 
-function placementMessageId(placement?: MessagePlacementOptions): string {
-	if (placement?.messageId) return placement.messageId;
-	if (!placement?.mailboxClaim) return generateId();
-	const row = db
+function placementMessageIdQuery(database: Pick<DbTx, "select">, claimId: string) {
+	return database
 		.select({ messageId: narratorBufferedMessages.recipientMessageId })
 		.from(narratorBufferedMessages)
-		.where(eq(narratorBufferedMessages.id, placement.mailboxClaim.id))
-		.get();
+		.where(eq(narratorBufferedMessages.id, claimId));
+}
+
+function reservedPlacementMessageId(row: { messageId: string | null } | undefined): string {
 	if (!row?.messageId) throw new Error("Mailbox claim has no reserved recipient identity");
 	return row.messageId;
+}
+
+async function readPlacementMessageId(placement?: MessagePlacementOptions): Promise<string> {
+	if (placement?.messageId) return placement.messageId;
+	if (!placement?.mailboxClaim) return generateId();
+	return reservedPlacementMessageId(
+		await readQueryFirst(placementMessageIdQuery(db, placement.mailboxClaim.id), {
+			site: "narrator-persistence.placementMessageId",
+		}),
+	);
+}
+
+function placementMessageId(tx: DbTx, placement?: MessagePlacementOptions): string {
+	if (placement?.messageId) return placement.messageId;
+	if (!placement?.mailboxClaim) return generateId();
+	return reservedPlacementMessageId(placementMessageIdQuery(tx, placement.mailboxClaim.id).get());
 }
 
 function persistPlacement(
@@ -1243,7 +1296,7 @@ const sqliteNarratorPersistence = {
 		}
 		const msgWithSeq = await withDbRetry(
 			async () => {
-				const id = placementMessageId(placement);
+				const id = await readPlacementMessageId(placement);
 				const now = new Date().toISOString();
 				return db.transaction((tx) => {
 					const created = tx
@@ -1307,10 +1360,13 @@ const sqliteNarratorPersistence = {
 		// behaviour decision about the primary path, not part of opening this seam.
 		if (createdBy) {
 			try {
-				const user = await db.query.users.findFirst({
-					where: eq(users.id, createdBy),
-					columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
-				});
+				const user = await readQuery(
+					db.query.users.findFirst({
+						where: eq(users.id, createdBy),
+						columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
+					}),
+					{ site: "narrator-persistence.persistUserMessage" },
+				);
 				return { ...msgWithSeq, creator: user ?? null };
 			} catch (error) {
 				// Display enrichment cannot turn a committed input into a failed write.
@@ -1368,7 +1424,7 @@ const sqliteNarratorPersistence = {
 		const msg = await withDbRetry(
 			async () =>
 				db.transaction((tx) => {
-					const id = placementMessageId(placement);
+					const id = placementMessageId(tx, placement);
 					const now = new Date().toISOString();
 					const providedBlocks = contentBlocks ?? [];
 					const hasNativeModelContext = providedBlocks.some(isNativeModelContextBlock);
@@ -2307,27 +2363,36 @@ const sqliteNarratorPersistence = {
 		 */
 		const publishPartial = async () => {
 			const owner = existing.parentToolUseId
-				? await db.query.narrators.findFirst({
-						where: eq(narrators.id, narratorId),
-						columns: { parentNarratorId: true },
-					})
+				? await readQuery(
+						db.query.narrators.findFirst({
+							where: eq(narrators.id, narratorId),
+							columns: { parentNarratorId: true },
+						}),
+						{ site: "narrator-persistence.read" },
+					)
 				: undefined;
 			const broadcastTargetId = owner?.parentNarratorId ?? narratorId;
 			// The parent embeds this child's messages, so its reconnect version must
 			// change at the same boundary as the child's (never for the empty shell).
 			await bumpNarratorMessageVersions([narratorId, broadcastTargetId]);
-			const published = await db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, messageId),
-				with: { toolCalls: true },
-			});
+			const published = await readQuery(
+				db.query.narratorMessages.findFirst({
+					where: eq(narratorMessages.id, messageId),
+					with: { toolCalls: true },
+				}),
+				{ site: "narrator-persistence.read" },
+			);
 			if (!published) throw new NotFoundError("Assistant message", messageId);
-			const ref = await db.query.narratorMessageRefs.findFirst({
-				where: and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					eq(narratorMessageRefs.messageId, messageId),
-				),
-				columns: { seq: true },
-			});
+			const ref = await readQuery(
+				db.query.narratorMessageRefs.findFirst({
+					where: and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorMessageRefs.messageId, messageId),
+					),
+					columns: { seq: true },
+				}),
+				{ site: "narrator-persistence.read" },
+			);
 			const projected = enrichToolUseBlocks(truncateToolIO([{ ...published, seq: ref?.seq }]))[0];
 			if (!projected) throw new Error(`Cannot publish assistant message ${messageId}`);
 			dualBroadcastToNarrator(
@@ -2394,12 +2459,13 @@ const sqliteNarratorPersistence = {
 		translatedText: string,
 		expected?: { id?: string; text: string },
 	) {
-		const existing = db.query.narratorMessages
-			.findFirst({
+		const existing = await readQuery(
+			db.query.narratorMessages.findFirst({
 				where: eq(narratorMessages.id, messageId),
 				columns: { contentJson: true },
-			})
-			.sync();
+			}),
+			{ site: "narrator-persistence.patchReasoningTranslation" },
+		);
 		if (!existing) return false;
 
 		const content = Array.isArray(existing.contentJson) ? [...existing.contentJson] : [];
@@ -2588,10 +2654,13 @@ const sqliteNarratorPersistence = {
 	},
 
 	async updateRelaxedPlan(narratorId: string, relaxedPlan: boolean): Promise<boolean> {
-		const current = await db.query.narrators.findFirst({
-			where: eq(narrators.id, narratorId),
-			columns: { permissionMode: true },
-		});
+		const current = await readQuery(
+			db.query.narrators.findFirst({
+				where: eq(narrators.id, narratorId),
+				columns: { permissionMode: true },
+			}),
+			{ site: "narrator-persistence.updateRelaxedPlan" },
+		);
 		const effectiveRelaxedPlan = forcesRelaxedPlan(current?.permissionMode) ? true : relaxedPlan;
 		const now = new Date().toISOString();
 		await db
@@ -2677,10 +2746,13 @@ const sqliteNarratorPersistence = {
 		let broadcastTurnStartedAt: string | undefined = turnStartedAt;
 		const writeStatus = async () => {
 			if (requestedSubstatus !== undefined) {
-				const row = await db.query.narrators.findFirst({
-					where: eq(narrators.id, narratorId),
-					columns: { substatus: true, turnStartedAt: true, updatedAt: true },
-				});
+				const row = await readQuery(
+					db.query.narrators.findFirst({
+						where: eq(narrators.id, narratorId),
+						columns: { substatus: true, turnStartedAt: true, updatedAt: true },
+					}),
+					{ site: "narrator-persistence.read" },
+				);
 				if (broadcastTurnStartedAt === undefined) {
 					broadcastTurnStartedAt = row?.turnStartedAt ?? undefined;
 				}
@@ -2858,14 +2930,20 @@ const sqliteNarratorPersistence = {
 				// Offer to resume error subagents that the seamless "Continue" path
 				// cannot reach (background ones, or foreground ones from earlier
 				// turns). Fire-and-forget so a status write is never blocked by it.
-				void import("./narrator-subagent-recovery")
+				const recoveryCard = import("./narrator-subagent-recovery")
 					.then(({ persistSubagentRecoveryCard }) => persistSubagentRecoveryCard(narratorId))
 					.catch((e) => {
+						if (recoveryCardShutdown && recoveryCardFailureCount++ === 0)
+							recoveryCardFirstError = e;
 						logger.warn("Failed to persist subagent recovery card", {
 							narratorId,
 							error: String(e),
 						});
+					})
+					.finally(() => {
+						pendingRecoveryCards.delete(recoveryCard);
 					});
+				pendingRecoveryCards.add(recoveryCard);
 			}
 		}
 		broadcastToNarrator(narratorId, {
@@ -2905,10 +2983,13 @@ const sqliteNarratorPersistence = {
 		const placeholders = expected.map(() => "?").join(",");
 		const runCompareAndSet = async () => {
 			if (requestedSubstatus !== undefined) {
-				const row = await db.query.narrators.findFirst({
-					where: eq(narrators.id, narratorId),
-					columns: { substatus: true, turnStartedAt: true },
-				});
+				const row = await readQuery(
+					db.query.narrators.findFirst({
+						where: eq(narrators.id, narratorId),
+						columns: { substatus: true, turnStartedAt: true },
+					}),
+					{ site: "narrator-persistence.read" },
+				);
 				broadcastTurnStartedAt = row?.turnStartedAt ?? undefined;
 				const currentSubstatus = parseSubstatus(row?.substatus);
 				actualSubstatus = preserveBackgroundCompactingSubstatus(
@@ -2997,10 +3078,13 @@ const sqliteNarratorPersistence = {
 		options?: { preserveTiming?: boolean },
 	) {
 		await narratorSubstatusLock.acquire(narratorId, async () => {
-			const row = await db.query.narrators.findFirst({
-				where: eq(narrators.id, narratorId),
-				columns: { substatus: true },
-			});
+			const row = await readQuery(
+				db.query.narrators.findFirst({
+					where: eq(narrators.id, narratorId),
+					columns: { substatus: true },
+				}),
+				{ site: "narrator-persistence.read" },
+			);
 			const actualSubstatus =
 				options?.preserveTiming === false
 					? substatus
@@ -3023,10 +3107,13 @@ const sqliteNarratorPersistence = {
 	 */
 	async addSubstatus(narratorId: string, tag: string): Promise<string[]> {
 		return narratorSubstatusLock.acquire(narratorId, async () => {
-			const row = await db.query.narrators.findFirst({
-				where: eq(narrators.id, narratorId),
-				columns: { substatus: true },
-			});
+			const row = await readQuery(
+				db.query.narrators.findFirst({
+					where: eq(narrators.id, narratorId),
+					columns: { substatus: true },
+				}),
+				{ site: "narrator-persistence.read" },
+			);
 			const current = parseSubstatus(row?.substatus);
 			if (current.includes(tag)) return current;
 			const updated = [...current, tag];
@@ -3049,10 +3136,13 @@ const sqliteNarratorPersistence = {
 	 */
 	async removeSubstatus(narratorId: string, tag: string): Promise<string[]> {
 		return narratorSubstatusLock.acquire(narratorId, async () => {
-			const row = await db.query.narrators.findFirst({
-				where: eq(narrators.id, narratorId),
-				columns: { substatus: true },
-			});
+			const row = await readQuery(
+				db.query.narrators.findFirst({
+					where: eq(narrators.id, narratorId),
+					columns: { substatus: true },
+				}),
+				{ site: "narrator-persistence.read" },
+			);
 			const current = parseSubstatus(row?.substatus);
 			if (!current.includes(tag)) return current;
 			const updated = current.filter((t) => t !== tag);
@@ -3073,27 +3163,33 @@ const sqliteNarratorPersistence = {
 		toolUseId: string,
 		toolCallId: string,
 	): Promise<ToolCallBinding> {
-		const row = await db.query.narratorToolCalls.findFirst({
-			where: and(
-				eq(narratorToolCalls.id, toolCallId),
-				eq(narratorToolCalls.narratorId, narratorId),
-				eq(narratorToolCalls.messageId, messageId),
-				eq(narratorToolCalls.toolUseId, toolUseId),
-			),
-			columns: {
-				executionAttempt: true,
-				executionIdentityVersion: true,
-				executionOriginToolCallId: true,
-				executionSegmentId: true,
-			},
-		});
-		const ref = await db.query.narratorMessageRefs.findFirst({
-			where: and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessageRefs.messageId, messageId),
-			),
-			columns: { messageId: true },
-		});
+		const row = await readQuery(
+			db.query.narratorToolCalls.findFirst({
+				where: and(
+					eq(narratorToolCalls.id, toolCallId),
+					eq(narratorToolCalls.narratorId, narratorId),
+					eq(narratorToolCalls.messageId, messageId),
+					eq(narratorToolCalls.toolUseId, toolUseId),
+				),
+				columns: {
+					executionAttempt: true,
+					executionIdentityVersion: true,
+					executionOriginToolCallId: true,
+					executionSegmentId: true,
+				},
+			}),
+			{ site: "narrator-persistence.getToolCallBinding" },
+		);
+		const ref = await readQuery(
+			db.query.narratorMessageRefs.findFirst({
+				where: and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					eq(narratorMessageRefs.messageId, messageId),
+				),
+				columns: { messageId: true },
+			}),
+			{ site: "narrator-persistence.getToolCallBinding" },
+		);
 		if (
 			!row ||
 			!ref ||
@@ -3112,15 +3208,18 @@ const sqliteNarratorPersistence = {
 	},
 
 	async validateToolCallBinding(narratorId: string, toolUseId: string, binding: ToolCallBinding) {
-		const row = await db.query.narratorToolCalls.findFirst({
-			where: and(
-				eq(narratorToolCalls.id, binding.toolCallId),
-				eq(narratorToolCalls.narratorId, narratorId),
-				eq(narratorToolCalls.toolUseId, toolUseId),
-				eq(narratorToolCalls.executionAttempt, binding.attempt),
-			),
-			columns: { messageId: true },
-		});
+		const row = await readQuery(
+			db.query.narratorToolCalls.findFirst({
+				where: and(
+					eq(narratorToolCalls.id, binding.toolCallId),
+					eq(narratorToolCalls.narratorId, narratorId),
+					eq(narratorToolCalls.toolUseId, toolUseId),
+					eq(narratorToolCalls.executionAttempt, binding.attempt),
+				),
+				columns: { messageId: true },
+			}),
+			{ site: "narrator-persistence.validateToolCallBinding" },
+		);
 		if (!row)
 			throw new ValidationError("Tool execution binding is stale or belongs to another narrator");
 		const receipt = await this.getToolCallBinding(
@@ -3150,10 +3249,13 @@ const sqliteNarratorPersistence = {
 			parentToolUseId,
 			parentBinding,
 		);
-		const parent = await db.query.narratorToolCalls.findFirst({
-			where: eq(narratorToolCalls.id, parentBinding.toolCallId),
-			columns: { toolName: true, status: true },
-		});
+		const parent = await readQuery(
+			db.query.narratorToolCalls.findFirst({
+				where: eq(narratorToolCalls.id, parentBinding.toolCallId),
+				columns: { toolName: true, status: true },
+			}),
+			{ site: "narrator-persistence.createInternalRead" },
+		);
 		if (
 			parent?.toolName !== "Eval" ||
 			parent.status !== "running" ||
@@ -3265,10 +3367,13 @@ const sqliteNarratorPersistence = {
 		toolUseId: string,
 		expectedOriginToolCallId?: string,
 	) {
-		const child = await db.query.narrators.findFirst({
-			where: eq(narrators.id, subagentId),
-			columns: { runtimeRegistrationJson: true },
-		});
+		const child = await readQuery(
+			db.query.narrators.findFirst({
+				where: eq(narrators.id, subagentId),
+				columns: { runtimeRegistrationJson: true },
+			}),
+			{ site: "narrator-persistence.resolveSubagentConclusionReference" },
+		);
 		const deliverTo = child ? runDeliverToOf(child) : undefined;
 		if (
 			!deliverTo ||
@@ -3297,36 +3402,42 @@ const sqliteNarratorPersistence = {
 			throw new ValidationError("A conclusion requires its original tool-call row or message");
 		}
 		const original = reference.toolCallId
-			? await db.query.narratorToolCalls.findFirst({
-					where: eq(narratorToolCalls.id, reference.toolCallId),
-					columns: { toolUseId: true, executionOriginToolCallId: true },
-				})
+			? await readQuery(
+					db.query.narratorToolCalls.findFirst({
+						where: eq(narratorToolCalls.id, reference.toolCallId),
+						columns: { toolUseId: true, executionOriginToolCallId: true },
+					}),
+					{ site: "narrator-persistence.resolveToolCallConclusionReference" },
+				)
 			: undefined;
 		if (original && original.toolUseId !== toolUseId) {
 			throw new ValidationError("Conclusion tool-use identity does not match its original row");
 		}
 		const originId = original?.executionOriginToolCallId ?? reference.toolCallId;
-		const rows = await db
-			.select({ toolCallId: narratorToolCalls.id, messageId: narratorToolCalls.messageId })
-			.from(narratorToolCalls)
-			.innerJoin(
-				narratorMessageRefs,
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					eq(narratorMessageRefs.messageId, narratorToolCalls.messageId),
-				),
-			)
-			.where(
-				and(
-					eq(narratorToolCalls.narratorId, narratorId),
-					eq(narratorToolCalls.toolUseId, toolUseId),
-					reference.messageId ? eq(narratorToolCalls.messageId, reference.messageId) : undefined,
-					originId
-						? sql`(${narratorToolCalls.id} = ${reference.toolCallId} OR ${narratorToolCalls.executionOriginToolCallId} = ${originId})`
-						: undefined,
-				),
-			)
-			.limit(2);
+		const rows = await readQuery(
+			db
+				.select({ toolCallId: narratorToolCalls.id, messageId: narratorToolCalls.messageId })
+				.from(narratorToolCalls)
+				.innerJoin(
+					narratorMessageRefs,
+					and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorMessageRefs.messageId, narratorToolCalls.messageId),
+					),
+				)
+				.where(
+					and(
+						eq(narratorToolCalls.narratorId, narratorId),
+						eq(narratorToolCalls.toolUseId, toolUseId),
+						reference.messageId ? eq(narratorToolCalls.messageId, reference.messageId) : undefined,
+						originId
+							? sql`(${narratorToolCalls.id} = ${reference.toolCallId} OR ${narratorToolCalls.executionOriginToolCallId} = ${originId})`
+							: undefined,
+					),
+				)
+				.limit(2),
+			{ site: "narrator-persistence.resolveToolCallConclusionReference" },
+		);
 		if (rows.length !== 1) {
 			throw new ValidationError(
 				"Conclusion reference is missing or ambiguous in the parent's history",
@@ -3338,17 +3449,23 @@ const sqliteNarratorPersistence = {
 	/** Resume an unstarted attempt, or append a new attempt after isolating shared history. */
 	async prepareToolCallAttempt(narratorId: string, sourceToolCallId: string, resume = false) {
 		return toolAttemptCreationLock.acquire(narratorId, async () => {
-			const source = await db.query.narratorToolCalls.findFirst({
-				where: eq(narratorToolCalls.id, sourceToolCallId),
-			});
+			const source = await readQuery(
+				db.query.narratorToolCalls.findFirst({
+					where: eq(narratorToolCalls.id, sourceToolCallId),
+				}),
+				{ site: "narrator-persistence.read" },
+			);
 			if (!source) throw new NotFoundError("Tool call", sourceToolCallId);
-			const ref = await db.query.narratorMessageRefs.findFirst({
-				where: and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					eq(narratorMessageRefs.messageId, source.messageId),
-				),
-				columns: { messageId: true },
-			});
+			const ref = await readQuery(
+				db.query.narratorMessageRefs.findFirst({
+					where: and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorMessageRefs.messageId, source.messageId),
+					),
+					columns: { messageId: true },
+				}),
+				{ site: "narrator-persistence.read" },
+			);
 			if (!ref) throw new ValidationError("Tool call is not in this narrator's history");
 			const shared = await this.isMessageSharedByMultipleNarrators(source.messageId);
 			if (
@@ -3452,26 +3569,29 @@ const sqliteNarratorPersistence = {
 		const toolCallId =
 			binding?.toolCallId ?? (await resolveToolCallWriteId(toolUseId, { narratorId }));
 		if (!toolCallId) throw new NotFoundError("Tool call", toolUseId);
-		const existing = await db.query.narratorToolCalls.findFirst({
-			where: and(
-				eq(narratorToolCalls.id, toolCallId),
-				eq(narratorToolCalls.narratorId, narratorId),
-				eq(narratorToolCalls.toolUseId, toolUseId),
-			),
-			// Production callers always supply the receipt; legacy callers remain supported.
-			columns: {
-				id: true,
-				status: true,
-				executionDeviceId: true,
-				executionCwd: true,
-				executionPathFlavor: true,
-				resolvedFilePath: true,
-				canonicalFilePath: true,
-				runtimeGeneration: true,
-				executionTargetsJson: true,
-				deviceSelectionSource: true,
-			},
-		});
+		const existing = await readQuery(
+			db.query.narratorToolCalls.findFirst({
+				where: and(
+					eq(narratorToolCalls.id, toolCallId),
+					eq(narratorToolCalls.narratorId, narratorId),
+					eq(narratorToolCalls.toolUseId, toolUseId),
+				),
+				// Production callers always supply the receipt; legacy callers remain supported.
+				columns: {
+					id: true,
+					status: true,
+					executionDeviceId: true,
+					executionCwd: true,
+					executionPathFlavor: true,
+					resolvedFilePath: true,
+					canonicalFilePath: true,
+					runtimeGeneration: true,
+					executionTargetsJson: true,
+					deviceSelectionSource: true,
+				},
+			}),
+			{ site: "narrator-persistence.updateToolCallExecutionTarget" },
+		);
 		if (!existing) {
 			throw new NotFoundError("Tool call", toolUseId);
 		}
@@ -3573,14 +3693,17 @@ const sqliteNarratorPersistence = {
 		// `status` and `id` are taken from this same row rather than re-queried after the
 		// write: neither is touched by the target writer, and the main thread must not run
 		// two queries where one suffices.
-		const existing = await db.query.narratorToolCalls.findFirst({
-			where: and(
-				eq(narratorToolCalls.id, toolCallId),
-				eq(narratorToolCalls.narratorId, narratorId),
-				eq(narratorToolCalls.toolUseId, toolUseId),
-			),
-			columns: { id: true, status: true, executionTargetsJson: true },
-		});
+		const existing = await readQuery(
+			db.query.narratorToolCalls.findFirst({
+				where: and(
+					eq(narratorToolCalls.id, toolCallId),
+					eq(narratorToolCalls.narratorId, narratorId),
+					eq(narratorToolCalls.toolUseId, toolUseId),
+				),
+				columns: { id: true, status: true, executionTargetsJson: true },
+			}),
+			{ site: "narrator-persistence.updateToolCallExecutionPlan" },
+		);
 		if (!existing) throw new NotFoundError("Tool call", toolUseId);
 		// Compare the ROUTING the column describes, not its raw JSON.
 		//
@@ -3734,28 +3857,37 @@ const sqliteNarratorPersistence = {
 		];
 		if (expected) {
 			// Detached results must not infer a parent from a provider-local tool-use id.
-			const owner = await db.query.narrators.findFirst({
-				where: eq(narrators.id, expected.narratorId),
-				columns: { type: true, parentNarratorId: true },
-			});
+			const owner = await readQuery(
+				db.query.narrators.findFirst({
+					where: eq(narrators.id, expected.narratorId),
+					columns: { type: true, parentNarratorId: true },
+				}),
+				{ site: "narrator-persistence.updateToolCallResult" },
+			);
 			if (owner?.type === "subagent" && owner.parentNarratorId) {
 				affectedNarratorIds.push(owner.parentNarratorId);
 			}
 		} else if (affectedMessageIds.length > 0) {
-			const affectedMessages = await db.query.narratorMessages.findMany({
-				where: inArray(narratorMessages.id, affectedMessageIds),
-				columns: { parentToolUseId: true },
-			});
+			const affectedMessages = await readQuery(
+				db.query.narratorMessages.findMany({
+					where: inArray(narratorMessages.id, affectedMessageIds),
+					columns: { parentToolUseId: true },
+				}),
+				{ site: "narrator-persistence.updateToolCallResult" },
+			);
 			const parentToolUseIds = [
 				...new Set(
 					affectedMessages.map((msg) => msg.parentToolUseId).filter((id): id is string => !!id),
 				),
 			];
 			if (parentToolUseIds.length > 0) {
-				const parentToolCalls = await db.query.narratorToolCalls.findMany({
-					where: inArray(narratorToolCalls.toolUseId, parentToolUseIds),
-					columns: { narratorId: true },
-				});
+				const parentToolCalls = await readQuery(
+					db.query.narratorToolCalls.findMany({
+						where: inArray(narratorToolCalls.toolUseId, parentToolUseIds),
+						columns: { narratorId: true },
+					}),
+					{ site: "narrator-persistence.updateToolCallResult" },
+				);
 				affectedNarratorIds.push(...parentToolCalls.map((tc) => tc.narratorId));
 			}
 		}
@@ -3833,18 +3965,24 @@ const sqliteNarratorPersistence = {
 	},
 
 	async isMessageSharedByMultipleNarrators(messageId: string): Promise<boolean> {
-		const refs = await db
-			.select({ id: narratorMessageRefs.id })
-			.from(narratorMessageRefs)
-			.where(eq(narratorMessageRefs.messageId, messageId))
-			.limit(2);
+		const refs = await readQuery(
+			db
+				.select({ id: narratorMessageRefs.id })
+				.from(narratorMessageRefs)
+				.where(eq(narratorMessageRefs.messageId, messageId))
+				.limit(2),
+			{ site: "narrator-persistence.isMessageSharedByMultipleNarrators" },
+		);
 		return refs.length > 1;
 	},
 
 	async getToolCallByToolUseId(toolUseId: string) {
-		return db.query.narratorToolCalls.findFirst({
-			where: eq(narratorToolCalls.toolUseId, toolUseId),
-		});
+		return await readQuery(
+			db.query.narratorToolCalls.findFirst({
+				where: eq(narratorToolCalls.toolUseId, toolUseId),
+			}),
+			{ site: "narrator-persistence.getToolCallByToolUseId" },
+		);
 	},
 
 	async copyOnWriteMessage(
@@ -3853,20 +3991,26 @@ const sqliteNarratorPersistence = {
 		overrides?: Partial<typeof narratorMessages.$inferInsert>,
 		options: { preserveExecutionOwner?: boolean } = {},
 	): Promise<string> {
-		const ref = await db.query.narratorMessageRefs.findFirst({
-			where: and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessageRefs.messageId, messageId),
-			),
-		});
+		const ref = await readQuery(
+			db.query.narratorMessageRefs.findFirst({
+				where: and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					eq(narratorMessageRefs.messageId, messageId),
+				),
+			}),
+			{ site: "narrator-persistence.copyOnWriteMessage" },
+		);
 		if (!ref) throw new NotFoundError("Message", messageId);
 		const semanticEdit =
 			overrides != null &&
 			(Object.hasOwn(overrides, "contentJson") || Object.hasOwn(overrides, "contentText"));
 		if (semanticEdit && overrides) {
-			const original = await db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, messageId),
-			});
+			const original = await readQuery(
+				db.query.narratorMessages.findFirst({
+					where: eq(narratorMessages.id, messageId),
+				}),
+				{ site: "narrator-persistence.copyOnWriteMessage" },
+			);
 			if (!original) throw new NotFoundError("Message", messageId);
 			overrides = {
 				...overrides,
@@ -4026,10 +4170,13 @@ const sqliteNarratorPersistence = {
 		if (!exactId) return;
 		const condition = eq(narratorToolCalls.id, exactId);
 
-		const existing = await db.query.narratorToolCalls.findFirst({
-			where: condition,
-			columns: { messageId: true, toolName: true, inputJson: true, narratorId: true },
-		});
+		const existing = await readQuery(
+			db.query.narratorToolCalls.findFirst({
+				where: condition,
+				columns: { messageId: true, toolName: true, inputJson: true, narratorId: true },
+			}),
+			{ site: "narrator-persistence.overwriteToolCallInput" },
+		);
 		const effectiveInput = guardPersistedPlanBody(input, existing, toolUseId);
 
 		await db
@@ -4041,10 +4188,13 @@ const sqliteNarratorPersistence = {
 
 		// Question responses belong to the execution receipt, never the authored SDK call.
 		if (existing?.messageId && existing.toolName !== "AskUserQuestion") {
-			const msg = await db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, existing.messageId),
-				columns: { contentJson: true },
-			});
+			const msg = await readQuery(
+				db.query.narratorMessages.findFirst({
+					where: eq(narratorMessages.id, existing.messageId),
+					columns: { contentJson: true },
+				}),
+				{ site: "narrator-persistence.overwriteToolCallInput" },
+			);
 			if (msg?.contentJson && Array.isArray(msg.contentJson)) {
 				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 				const patched = (msg.contentJson as any[]).map((block: any) =>
@@ -4061,10 +4211,13 @@ const sqliteNarratorPersistence = {
 	},
 
 	async getToolCallPlanText(toolUseId: string): Promise<string | null> {
-		const tc = await db.query.narratorToolCalls.findFirst({
-			where: eq(narratorToolCalls.toolUseId, toolUseId),
-			columns: { inputJson: true },
-		});
+		const tc = await readQuery(
+			db.query.narratorToolCalls.findFirst({
+				where: eq(narratorToolCalls.toolUseId, toolUseId),
+				columns: { inputJson: true },
+			}),
+			{ site: "narrator-persistence.getToolCallPlanText" },
+		);
 		const plan = (tc?.inputJson as Record<string, unknown> | null)?.plan;
 		return typeof plan === "string" && plan.trim() ? plan : null;
 	},
@@ -4155,34 +4308,43 @@ const sqliteNarratorPersistence = {
 			return { refs, insertSeq };
 		});
 
-		const [msg] = await db.select().from(narratorMessages).where(eq(narratorMessages.id, id));
+		const [msg] = await readQuery(
+			db.select().from(narratorMessages).where(eq(narratorMessages.id, id)),
+			{ site: "narrator-persistence.persistSegmentCompactMarker" },
+		);
 
 		const hiddenMessageIds = refs.map((r) => r.messageId);
 		return { message: { ...msg, seq: insertSeq }, hiddenMessageIds };
 	},
 
 	async getMessagesForSegmentCompact(narratorId: string, messageIds: string[]) {
-		const refs = await db
-			.select({
-				messageId: narratorMessageRefs.messageId,
-				seq: narratorMessageRefs.seq,
-			})
-			.from(narratorMessageRefs)
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					inArray(narratorMessageRefs.messageId, messageIds),
-				),
-			)
-			.orderBy(narratorMessageRefs.seq);
+		const refs = await readQuery(
+			db
+				.select({
+					messageId: narratorMessageRefs.messageId,
+					seq: narratorMessageRefs.seq,
+				})
+				.from(narratorMessageRefs)
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						inArray(narratorMessageRefs.messageId, messageIds),
+					),
+				)
+				.orderBy(narratorMessageRefs.seq),
+			{ site: "narrator-persistence.getMessagesForSegmentCompact" },
+		);
 
 		if (refs.length === 0) return [];
 
 		const ids = refs.map((r) => r.messageId);
-		const messages = await db.query.narratorMessages.findMany({
-			where: inArray(narratorMessages.id, ids),
-			with: { toolCalls: true },
-		});
+		const messages = await readQuery(
+			db.query.narratorMessages.findMany({
+				where: inArray(narratorMessages.id, ids),
+				with: { toolCalls: true },
+			}),
+			{ site: "narrator-persistence.getMessagesForSegmentCompact" },
+		);
 
 		const seqMap = new Map(refs.map((r) => [r.messageId, r.seq]));
 		messages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
@@ -4199,15 +4361,18 @@ const sqliteNarratorPersistence = {
 		const now = new Date().toISOString();
 		const status = options?.status ?? "compacted";
 
-		const [countRow] = await db
-			.select({ cnt: sql<number>`count(*)` })
-			.from(narratorMessageRefs)
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					eq(narratorMessageRefs.segmentCompactId, messageId),
+		const [countRow] = await readQuery(
+			db
+				.select({ cnt: sql<number>`count(*)` })
+				.from(narratorMessageRefs)
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorMessageRefs.segmentCompactId, messageId),
+					),
 				),
-			);
+			{ site: "narrator-persistence.finalizeSegmentCompact" },
+		);
 		const messageCount = countRow?.cnt ?? 0;
 
 		const block: Record<string, unknown> = {
@@ -4274,27 +4439,33 @@ const sqliteNarratorPersistence = {
 	},
 
 	async getSegmentCompactHiddenMessages(narratorId: string, segmentCompactId: string) {
-		const refs = await db
-			.select({
-				messageId: narratorMessageRefs.messageId,
-				seq: narratorMessageRefs.seq,
-			})
-			.from(narratorMessageRefs)
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					eq(narratorMessageRefs.segmentCompactId, segmentCompactId),
-				),
-			)
-			.orderBy(narratorMessageRefs.seq);
+		const refs = await readQuery(
+			db
+				.select({
+					messageId: narratorMessageRefs.messageId,
+					seq: narratorMessageRefs.seq,
+				})
+				.from(narratorMessageRefs)
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorMessageRefs.segmentCompactId, segmentCompactId),
+					),
+				)
+				.orderBy(narratorMessageRefs.seq),
+			{ site: "narrator-persistence.getSegmentCompactHiddenMessages" },
+		);
 
 		if (refs.length === 0) return [];
 
 		const ids = refs.map((r) => r.messageId);
-		const messages = await db.query.narratorMessages.findMany({
-			where: inArray(narratorMessages.id, ids),
-			with: { toolCalls: true },
-		});
+		const messages = await readQuery(
+			db.query.narratorMessages.findMany({
+				where: inArray(narratorMessages.id, ids),
+				with: { toolCalls: true },
+			}),
+			{ site: "narrator-persistence.getSegmentCompactHiddenMessages" },
+		);
 
 		const seqMap = new Map(refs.map((r) => [r.messageId, r.seq]));
 		messages.sort((a, b) => (seqMap.get(a.id) ?? 0) - (seqMap.get(b.id) ?? 0));
@@ -4302,9 +4473,12 @@ const sqliteNarratorPersistence = {
 	},
 
 	async deleteSegmentCompact(narratorId: string, messageId: string) {
-		const msg = await db.query.narratorMessages.findFirst({
-			where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)),
-		});
+		const msg = await readQuery(
+			db.query.narratorMessages.findFirst({
+				where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)),
+			}),
+			{ site: "narrator-persistence.deleteSegmentCompact" },
+		);
 		if (!msg) throw new NotFoundError("Message", messageId);
 
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -4351,9 +4525,12 @@ const sqliteNarratorPersistence = {
 	},
 
 	async getSegmentCompactSummary(narratorId: string, messageId: string) {
-		const msg = await db.query.narratorMessages.findFirst({
-			where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)),
-		});
+		const msg = await readQuery(
+			db.query.narratorMessages.findFirst({
+				where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)),
+			}),
+			{ site: "narrator-persistence.getSegmentCompactSummary" },
+		);
 		if (!msg) throw new NotFoundError("Message", messageId);
 
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -4366,9 +4543,12 @@ const sqliteNarratorPersistence = {
 	},
 
 	async updateSegmentCompactSummary(narratorId: string, messageId: string, summary: string) {
-		const msg = await db.query.narratorMessages.findFirst({
-			where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)),
-		});
+		const msg = await readQuery(
+			db.query.narratorMessages.findFirst({
+				where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)),
+			}),
+			{ site: "narrator-persistence.updateSegmentCompactSummary" },
+		);
 		if (!msg) throw new NotFoundError("Message", messageId);
 
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure

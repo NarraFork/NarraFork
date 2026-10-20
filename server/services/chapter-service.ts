@@ -1,4 +1,5 @@
 import { resolve } from "node:path";
+import { readQuery } from "@server/db/worker-read";
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import {
@@ -109,9 +110,11 @@ export const chapterService = {
 	 * No worktree or branch is created; it uses the project's gitPath and defaultBranch directly.
 	 */
 	async createRootChapter(input: CreateRootChapterInput) {
-		const project = await db.query.projects.findFirst({
-			where: eq(projects.id, input.projectId),
-		});
+		const project = await readQuery(
+			db.query.projects.findFirst({
+				where: eq(projects.id, input.projectId),
+			}),
+		);
 		if (!project?.gitPath || resolve(project.gitPath) !== resolve(input.gitPath))
 			throw new ValidationError("Root chapter must use its project's repository");
 		const createRoot = async () => {
@@ -207,9 +210,11 @@ export const chapterService = {
 		const now = new Date().toISOString();
 		const id = generateId();
 
-		const project = await db.query.projects.findFirst({
-			where: eq(projects.id, input.projectId),
-		});
+		const project = await readQuery(
+			db.query.projects.findFirst({
+				where: eq(projects.id, input.projectId),
+			}),
+		);
 		if (!project) throw new NotFoundError("Project", input.projectId);
 		if (!project.gitPath) throw new ValidationError("Project has no git repository configured");
 
@@ -312,9 +317,11 @@ export const chapterService = {
 	},
 
 	async findById(id: string) {
-		const chapter = await db.query.chapters.findFirst({
-			where: eq(chapters.id, id),
-		});
+		const chapter = await readQuery(
+			db.query.chapters.findFirst({
+				where: eq(chapters.id, id),
+			}),
+		);
 		if (!chapter) throw new NotFoundError("Chapter", id);
 		return chapter;
 	},
@@ -343,14 +350,16 @@ export const chapterService = {
 			status && validStatuses.includes(status as ChapterStatus)
 				? and(eq(chapters.projectId, projectId), eq(chapters.status, status as ChapterStatus))
 				: eq(chapters.projectId, projectId);
-		return db.query.chapters.findMany({
-			where,
-			// Exclude the node dock layout and its detached-panel list: both are
-			// per-chapter blobs, and this listing returns every chapter in the project.
-			// They are read only by their own `/chapters/:id/...` endpoints.
-			columns: { dockLayoutJson: false, detachedPanelsJson: false },
-			orderBy: (chapters, { desc }) => [desc(chapters.updatedAt)],
-		});
+		return readQuery(
+			db.query.chapters.findMany({
+				where,
+				// Exclude the node dock layout and its detached-panel list: both are
+				// per-chapter blobs, and this listing returns every chapter in the project.
+				// They are read only by their own `/chapters/:id/...` endpoints.
+				columns: { dockLayoutJson: false, detachedPanelsJson: false },
+				orderBy: (chapters, { desc }) => [desc(chapters.updatedAt)],
+			}),
+		);
 	},
 
 	async update(
@@ -420,9 +429,11 @@ export const chapterService = {
 	 */
 	async removeForProjectDeletion(id: string, projectGitPath: string | null) {
 		return chapterLock.acquire(id, async () => {
-			const chapter = await db.query.chapters.findFirst({
-				where: eq(chapters.id, id),
-			});
+			const chapter = await readQuery(
+				db.query.chapters.findFirst({
+					where: eq(chapters.id, id),
+				}),
+			);
 			if (!chapter) return;
 
 			return withLegacyRetirement(
@@ -430,9 +441,11 @@ export const chapterService = {
 				"chapter delete for project",
 				async () => {
 					// Delete ALL narrators — no detach since the project is being removed
-					const chapterNarrators = await db.query.narrators.findMany({
-						where: eq(narrators.chapterId, id),
-					});
+					const chapterNarrators = await readQuery(
+						db.query.narrators.findMany({
+							where: eq(narrators.chapterId, id),
+						}),
+					);
 					for (const narrator of chapterNarrators) {
 						await narratorService.remove(narrator.id);
 					}
@@ -528,10 +541,12 @@ export const chapterService = {
 
 			const now = new Date().toISOString();
 			const project = chapter.worktreePath
-				? await db.query.projects.findFirst({
-						where: eq(projects.id, chapter.projectId),
-						columns: { gitPath: true },
-					})
+				? await readQuery(
+						db.query.projects.findFirst({
+							where: eq(projects.id, chapter.projectId),
+							columns: { gitPath: true },
+						}),
+					)
 				: null;
 
 			return withLegacyRetirement(
@@ -539,9 +554,11 @@ export const chapterService = {
 				"chapter delete",
 				async () => {
 					// Detach narrators and archive them (read-only, user can delete later)
-					const chapterNarrators = await db.query.narrators.findMany({
-						where: eq(narrators.chapterId, id),
-					});
+					const chapterNarrators = await readQuery(
+						db.query.narrators.findMany({
+							where: eq(narrators.chapterId, id),
+						}),
+					);
 					for (const narrator of chapterNarrators) {
 						interruptNarrator(narrator.id);
 					}
@@ -636,10 +653,12 @@ export const chapterService = {
 					// on disk for a chapter that no longer exists. The parent's own worktree path is
 					// needed to find the repository, so this runs before the row is gone.
 					if (chapter.parentChapterId) {
-						const parent = await db.query.chapters.findFirst({
-							where: eq(chapters.id, chapter.parentChapterId),
-							columns: { worktreePath: true },
-						});
+						const parent = await readQuery(
+							db.query.chapters.findFirst({
+								where: eq(chapters.id, chapter.parentChapterId),
+								columns: { worktreePath: true },
+							}),
+						);
 						if (parent?.worktreePath) {
 							await worktreeTreeSnapshot
 								.deleteRef(parent.worktreePath, snapshotIncomingRef(`fork-${id}`))

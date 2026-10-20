@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 import { and, count, eq, isNotNull, isNull, ne } from "drizzle-orm";
 import { db } from "../db";
 import {
@@ -72,14 +73,20 @@ function countValue(row: { value: number } | undefined): number {
 
 async function countConnectedApps(userId: string) {
 	const [activeRows, revokedRows] = await Promise.all([
-		db
-			.select({ value: count() })
-			.from(oauthGrants)
-			.where(and(eq(oauthGrants.userId, userId), isNull(oauthGrants.revokedAt))),
-		db
-			.select({ value: count() })
-			.from(oauthGrants)
-			.where(and(eq(oauthGrants.userId, userId), isNotNull(oauthGrants.revokedAt))),
+		readQuery(
+			db
+				.select({ value: count() })
+				.from(oauthGrants)
+				.where(and(eq(oauthGrants.userId, userId), isNull(oauthGrants.revokedAt))),
+			{ site: "server/services/integration-summary-service.read" },
+		),
+		readQuery(
+			db
+				.select({ value: count() })
+				.from(oauthGrants)
+				.where(and(eq(oauthGrants.userId, userId), isNotNull(oauthGrants.revokedAt))),
+			{ site: "server/services/integration-summary-service.read" },
+		),
 	]);
 	return {
 		active: countValue(activeRows[0]),
@@ -136,85 +143,123 @@ async function getAdminSummary() {
 		externalNarratorRows,
 	] = await Promise.all([
 		getPluginSummary(),
-		db.select({ value: count() }).from(oauthClients),
-		db.select({ value: count() }).from(oauthClients).where(isNull(oauthClients.revokedAt)),
-		db.select({ value: count() }).from(oauthClients).where(isNotNull(oauthClients.revokedAt)),
-		db.select({ value: count() }).from(remoteDevices).where(isNull(remoteDevices.revokedAt)),
-		db
-			.select({ value: count() })
-			.from(remoteDevices)
-			.where(and(isNull(remoteDevices.revokedAt), eq(remoteDevices.status, "online"))),
-		db
-			.select({ value: count() })
-			.from(remoteDevices)
-			.where(and(isNull(remoteDevices.revokedAt), eq(remoteDevices.status, "offline"))),
-		db
-			.select({ value: count() })
-			.from(integrationResourceBindings)
-			.where(
-				and(
-					eq(integrationResourceBindings.resourceType, "device"),
-					eq(integrationResourceBindings.sourceType, "oauth_client"),
-					ne(integrationResourceBindings.state, "deleted"),
+		readQuery(db.select({ value: count() }).from(oauthClients), {
+			site: "server/services/integration-summary-service.read",
+		}),
+		readQuery(
+			db.select({ value: count() }).from(oauthClients).where(isNull(oauthClients.revokedAt)),
+			{ site: "server/services/integration-summary-service.read" },
+		),
+		readQuery(
+			db.select({ value: count() }).from(oauthClients).where(isNotNull(oauthClients.revokedAt)),
+			{ site: "server/services/integration-summary-service.read" },
+		),
+		readQuery(
+			db.select({ value: count() }).from(remoteDevices).where(isNull(remoteDevices.revokedAt)),
+			{ site: "server/services/integration-summary-service.read" },
+		),
+		readQuery(
+			db
+				.select({ value: count() })
+				.from(remoteDevices)
+				.where(and(isNull(remoteDevices.revokedAt), eq(remoteDevices.status, "online"))),
+			{ site: "server/services/integration-summary-service.read" },
+		),
+		readQuery(
+			db
+				.select({ value: count() })
+				.from(remoteDevices)
+				.where(and(isNull(remoteDevices.revokedAt), eq(remoteDevices.status, "offline"))),
+			{ site: "server/services/integration-summary-service.read" },
+		),
+		readQuery(
+			db
+				.select({ value: count() })
+				.from(integrationResourceBindings)
+				.where(
+					and(
+						eq(integrationResourceBindings.resourceType, "device"),
+						eq(integrationResourceBindings.sourceType, "oauth_client"),
+						ne(integrationResourceBindings.state, "deleted"),
+					),
 				),
-			),
-		db
-			.select({ value: count() })
-			.from(integrationResourceBindings)
-			.where(
-				and(
-					eq(integrationResourceBindings.resourceType, "device"),
-					eq(integrationResourceBindings.sourceType, "oauth_client"),
-					eq(integrationResourceBindings.state, "orphaned"),
+			{ site: "server/services/integration-summary-service.read" },
+		),
+		readQuery(
+			db
+				.select({ value: count() })
+				.from(integrationResourceBindings)
+				.where(
+					and(
+						eq(integrationResourceBindings.resourceType, "device"),
+						eq(integrationResourceBindings.sourceType, "oauth_client"),
+						eq(integrationResourceBindings.state, "orphaned"),
+					),
 				),
-			),
-		db
-			.select({ value: count() })
-			.from(integrationResourceBindings)
-			.where(
-				and(
-					eq(integrationResourceBindings.sourceType, "oauth_client"),
-					eq(integrationResourceBindings.state, "active"),
+			{ site: "server/services/integration-summary-service.read" },
+		),
+		readQuery(
+			db
+				.select({ value: count() })
+				.from(integrationResourceBindings)
+				.where(
+					and(
+						eq(integrationResourceBindings.sourceType, "oauth_client"),
+						eq(integrationResourceBindings.state, "active"),
+					),
 				),
-			),
-		db
-			.select({ value: count() })
-			.from(integrationResourceBindings)
-			.where(
-				and(
-					eq(integrationResourceBindings.sourceType, "oauth_client"),
-					eq(integrationResourceBindings.state, "orphaned"),
+			{ site: "server/services/integration-summary-service.read" },
+		),
+		readQuery(
+			db
+				.select({ value: count() })
+				.from(integrationResourceBindings)
+				.where(
+					and(
+						eq(integrationResourceBindings.sourceType, "oauth_client"),
+						eq(integrationResourceBindings.state, "orphaned"),
+					),
 				),
-			),
-		db
-			.select({ value: count() })
-			.from(integrationResourceBindings)
-			.where(
-				and(
-					eq(integrationResourceBindings.sourceType, "oauth_client"),
-					eq(integrationResourceBindings.state, "revoked"),
+			{ site: "server/services/integration-summary-service.read" },
+		),
+		readQuery(
+			db
+				.select({ value: count() })
+				.from(integrationResourceBindings)
+				.where(
+					and(
+						eq(integrationResourceBindings.sourceType, "oauth_client"),
+						eq(integrationResourceBindings.state, "revoked"),
+					),
 				),
-			),
-		db
-			.select({ value: count() })
-			.from(integrationResourceBindings)
-			.where(
-				and(
-					eq(integrationResourceBindings.sourceType, "oauth_client"),
-					eq(integrationResourceBindings.resourceType, "device"),
-					ne(integrationResourceBindings.state, "deleted"),
+			{ site: "server/services/integration-summary-service.read" },
+		),
+		readQuery(
+			db
+				.select({ value: count() })
+				.from(integrationResourceBindings)
+				.where(
+					and(
+						eq(integrationResourceBindings.sourceType, "oauth_client"),
+						eq(integrationResourceBindings.resourceType, "device"),
+						ne(integrationResourceBindings.state, "deleted"),
+					),
 				),
-			),
-		db
-			.select({ value: count() })
-			.from(integrationResourceBindings)
-			.where(
-				and(
-					eq(integrationResourceBindings.sourceType, "oauth_client"),
-					eq(integrationResourceBindings.resourceType, "narrator"),
-					ne(integrationResourceBindings.state, "deleted"),
+			{ site: "server/services/integration-summary-service.read" },
+		),
+		readQuery(
+			db
+				.select({ value: count() })
+				.from(integrationResourceBindings)
+				.where(
+					and(
+						eq(integrationResourceBindings.sourceType, "oauth_client"),
+						eq(integrationResourceBindings.resourceType, "narrator"),
+						ne(integrationResourceBindings.state, "deleted"),
+					),
 				),
-			),
+			{ site: "server/services/integration-summary-service.read" },
+		),
 	]);
 
 	return {

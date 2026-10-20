@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { readQuery } from "@server/db/worker-read";
 import { and, eq, gt, ne, type SQL } from "drizzle-orm";
 import { db } from "../db";
 import { narrators } from "../db/schema";
@@ -191,20 +192,24 @@ export async function scanBrokenModelNarrators(
 		const where: SQL | undefined = lastId
 			? and(...baseConditions, gt(narrators.id, lastId))
 			: and(...baseConditions);
-		const rows = db
-			.select({
-				id: narrators.id,
-				title: narrators.title,
-				model: narrators.model,
-				pendingModelRestore: narrators.pendingModelRestore,
-				status: narrators.status,
-				chapterId: narrators.chapterId,
-			})
-			.from(narrators)
-			.where(where)
-			.orderBy(narrators.id)
-			.limit(SCAN_BATCH_SIZE)
-			.all();
+		const rows: Pick<
+			typeof narrators.$inferSelect,
+			"id" | "title" | "model" | "pendingModelRestore" | "status" | "chapterId"
+		>[] = await readQuery(
+			db
+				.select({
+					id: narrators.id,
+					title: narrators.title,
+					model: narrators.model,
+					pendingModelRestore: narrators.pendingModelRestore,
+					status: narrators.status,
+					chapterId: narrators.chapterId,
+				})
+				.from(narrators)
+				.where(where)
+				.orderBy(narrators.id)
+				.limit(SCAN_BATCH_SIZE),
+		);
 		if (rows.length === 0) break;
 		scanned += rows.length;
 

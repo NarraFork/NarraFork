@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 /**
  * WebAuthn / passkey challenge storage. Relying-party resolution lives in
  * lib/webauthn-rp.ts (pure logic) and is re-exported here for convenience.
@@ -41,9 +42,11 @@ export async function consumeChallenge(
 	challenge: string,
 	type: "registration" | "authentication",
 ): Promise<{ ok: boolean; userId: string | null }> {
-	const row = await db.query.webauthnChallenges.findFirst({
-		where: and(eq(webauthnChallenges.challenge, challenge), eq(webauthnChallenges.type, type)),
-	});
+	const row = await readQuery(
+		db.query.webauthnChallenges.findFirst({
+			where: and(eq(webauthnChallenges.challenge, challenge), eq(webauthnChallenges.type, type)),
+		}),
+	);
 	if (!row) return { ok: false, userId: null };
 	// Always delete — whether valid or expired — so it cannot be reused.
 	await db.delete(webauthnChallenges).where(eq(webauthnChallenges.id, row.id));

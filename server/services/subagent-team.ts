@@ -1,3 +1,4 @@
+import { readQuery, readQueryFirst } from "@server/db/worker-read";
 import { and, asc, eq, like, or } from "drizzle-orm";
 import { db } from "../db";
 import { narrators } from "../db/schema";
@@ -40,24 +41,25 @@ function getTeamFileChangesMap() {
 }
 
 /** Record an observation. Old callers remain readable, with UNKNOWN location. */
-export function recordTeamFileChange(
+export async function recordTeamFileChange(
 	parentNarratorId: string,
 	subagentId: string,
 	filePath: string,
 	location?: { deviceId: string | null; workspacePath: string | null },
-): void {
+): Promise<void> {
 	// parentNarratorId also records ordinary primary forks. Validate real identity
 	// with one small indexed read rather than treating provenance as team membership.
 	try {
-		const child = db
-			.select({
-				type: narrators.type,
-				variant: narrators.variant,
-				parentId: narrators.parentNarratorId,
-			})
-			.from(narrators)
-			.where(eq(narrators.id, subagentId))
-			.get();
+		const child = await readQueryFirst(
+			db
+				.select({
+					type: narrators.type,
+					variant: narrators.variant,
+					parentId: narrators.parentNarratorId,
+				})
+				.from(narrators)
+				.where(eq(narrators.id, subagentId)),
+		);
 		if (
 			!child ||
 			child.parentId !== parentNarratorId ||
@@ -128,18 +130,20 @@ export async function getPersistedTeamFileChanges(
 	if (targetNarratorId && observations.has(targetNarratorId))
 		result.set(targetNarratorId, observations.get(targetNarratorId) as Set<string>);
 	try {
-		const children = await db
-			.select({ id: narrators.id })
-			.from(narrators)
-			.where(
-				and(
-					eq(narrators.parentNarratorId, parentNarratorId),
-					targetNarratorId ? eq(narrators.id, targetNarratorId) : undefined,
-					or(eq(narrators.type, "subagent"), like(narrators.variant, "subagent:%")),
-				),
-			)
-			.orderBy(asc(narrators.id))
-			.limit(targetNarratorId ? 1 : MAX_SUBAGENT_QUERY_IDS + 1);
+		const children = await readQuery(
+			db
+				.select({ id: narrators.id })
+				.from(narrators)
+				.where(
+					and(
+						eq(narrators.parentNarratorId, parentNarratorId),
+						targetNarratorId ? eq(narrators.id, targetNarratorId) : undefined,
+						or(eq(narrators.type, "subagent"), like(narrators.variant, "subagent:%")),
+					),
+				)
+				.orderBy(asc(narrators.id))
+				.limit(targetNarratorId ? 1 : MAX_SUBAGENT_QUERY_IDS + 1),
+		);
 		const ids = children.slice(0, MAX_SUBAGENT_QUERY_IDS).map((child) => child.id);
 		if (!ids.length) return result;
 		const options = await getCurrentSubagentFileChangeOptions(ids, parentNarratorId);
@@ -213,11 +217,9 @@ export async function deliverTeamMessage(
 	// Recheck the agreed working/waiting definition at delivery: a candidate may
 	// have become idle after selection. No runtime-owner requirement is imposed.
 	if (message.isBroadcast) {
-		const target = await db
-			.select({ status: narrators.status })
-			.from(narrators)
-			.where(eq(narrators.id, targetId))
-			.get();
+		const target = await readQueryFirst(
+			db.select({ status: narrators.status }).from(narrators).where(eq(narrators.id, targetId)),
+		);
 		if (target?.status !== "working" && target?.status !== "waiting") return undefined;
 	}
 	// Reserve independently per recipient, even when the caller broadcasts one object.

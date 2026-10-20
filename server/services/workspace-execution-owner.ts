@@ -1,4 +1,5 @@
 import { workspaceExecutionOwners, workspaceWriteLeases } from "@server/db/schema";
+import { readQueryFirst } from "@server/db/worker-read";
 import {
 	getInstanceMaintenanceAuthority,
 	registerInstanceLockProcessIdentity,
@@ -36,15 +37,16 @@ type OwnerState = {
 };
 
 function createOwnerAuthority(deps: OwnerDependencies, state: OwnerState) {
-	function getWorkspaceOwnerRegistration(
+	async function getWorkspaceOwnerRegistration(
 		db: Pick<WorkspaceExecutionOwnerDb, "select">,
 		ownerEpoch: string,
-	): WorkspaceOwnerRegistration | undefined {
-		return db
-			.select()
-			.from(workspaceExecutionOwners)
-			.where(eq(workspaceExecutionOwners.ownerEpoch, ownerEpoch))
-			.get();
+	): Promise<WorkspaceOwnerRegistration | undefined> {
+		return readQueryFirst(
+			db
+				.select()
+				.from(workspaceExecutionOwners)
+				.where(eq(workspaceExecutionOwners.ownerEpoch, ownerEpoch)),
+		);
 	}
 
 	/** Once, at startup before admissions; never probe on Edit/Write admission. */
@@ -66,13 +68,14 @@ function createOwnerAuthority(deps: OwnerDependencies, state: OwnerState) {
 		// Install the promise before observation; concurrent calls and --hot reuse exactly one probe.
 		const promise = Promise.resolve().then(async () => {
 			if (
-				getWorkspaceOwnerRegistration(db, ownerEpoch) ||
-				db
-					.select({ id: workspaceWriteLeases.leaseId })
-					.from(workspaceWriteLeases)
-					.where(eq(workspaceWriteLeases.ownerEpoch, ownerEpoch))
-					.limit(1)
-					.get()
+				(await getWorkspaceOwnerRegistration(db, ownerEpoch)) ||
+				(await readQueryFirst(
+					db
+						.select({ id: workspaceWriteLeases.leaseId })
+						.from(workspaceWriteLeases)
+						.where(eq(workspaceWriteLeases.ownerEpoch, ownerEpoch))
+						.limit(1),
+				))
 			) {
 				throw new Error("Refusing to register a historical workspace owner epoch");
 			}
@@ -104,7 +107,7 @@ function createOwnerAuthority(deps: OwnerDependencies, state: OwnerState) {
 		db: Pick<WorkspaceExecutionOwnerDb, "select">,
 		ownerEpoch: string,
 	): Promise<WorkspaceOwnerEndedEvidence | null> {
-		const row = getWorkspaceOwnerRegistration(db, ownerEpoch);
+		const row = await getWorkspaceOwnerRegistration(db, ownerEpoch);
 		if (!row || !isWorkspaceProcessIdentity(row.identityJson)) return null;
 		const identity = row.identityJson;
 		const observed = await deps.observe(identity.pid).catch(() => ({ kind: "unknown" }) as const);

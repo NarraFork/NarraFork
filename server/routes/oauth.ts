@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 /**
  * OAuth 2.0 provider endpoints (RFC 6749 + RFC 7636 PKCE + RFC 8414 metadata).
  *
@@ -61,10 +62,12 @@ async function getSessionUser(c: Context): Promise<{ id: string; username: strin
 	if (!/^[\w-]+\.[\w-]+\.[\w-]+$/.test(token)) return null;
 	try {
 		const payload = await verifyToken(token);
-		const row = await db.query.users.findFirst({
-			where: eq(users.id, payload.sub),
-			columns: { id: true, username: true },
-		});
+		const row = await readQuery(
+			db.query.users.findFirst({
+				where: eq(users.id, payload.sub),
+				columns: { id: true, username: true },
+			}),
+		);
 		return row ?? null;
 	} catch {
 		return null;
@@ -159,13 +162,15 @@ async function validateAuthorizationRequest(
 }
 
 async function getActiveGrant(userId: string, oauthClientId: string) {
-	return db.query.oauthGrants.findFirst({
-		where: and(
-			eq(oauthGrants.userId, userId),
-			eq(oauthGrants.oauthClientId, oauthClientId),
-			isNull(oauthGrants.revokedAt),
-		),
-	});
+	return readQuery(
+		db.query.oauthGrants.findFirst({
+			where: and(
+				eq(oauthGrants.userId, userId),
+				eq(oauthGrants.oauthClientId, oauthClientId),
+				isNull(oauthGrants.revokedAt),
+			),
+		}),
+	);
 }
 
 function auditContext(c: Context): {
@@ -208,11 +213,13 @@ async function validateProjectIds(projectIds: unknown): Promise<string[]> {
 		);
 	}
 	if (normalized.length === 0) return normalized;
-	const rows = await db.query.projects.findMany({
-		where: inArray(projects.id, normalized),
-		columns: { id: true },
-		limit: MAX_OAUTH_PROJECTS,
-	});
+	const rows = await readQuery(
+		db.query.projects.findMany({
+			where: inArray(projects.id, normalized),
+			columns: { id: true },
+			limit: MAX_OAUTH_PROJECTS,
+		}),
+	);
 	const existing = new Set(rows.map((project) => project.id));
 	const missing = normalized.find((projectId) => !existing.has(projectId));
 	if (missing) throw new OAuthError("invalid_request", `Unknown project: ${missing}`);
@@ -290,12 +297,14 @@ oauthRoutes.get("/authorize", oauthRateLimit("authorize"), async (c) => {
 			: null;
 		const existingScopes = activeGrantView?.scopes ?? [];
 		const selectedProjectIds = activeGrantView?.projectIds ?? [];
-		const availableProjects = await db.query.projects.findMany({
-			where: eq(projects.status, "active"),
-			columns: { id: true, name: true },
-			orderBy: (table, { asc }) => [asc(table.name), asc(table.id)],
-			limit: MAX_OAUTH_PROJECTS,
-		});
+		const availableProjects = await readQuery(
+			db.query.projects.findMany({
+				where: eq(projects.status, "active"),
+				columns: { id: true, name: true },
+				orderBy: (table, { asc }) => [asc(table.name), asc(table.id)],
+				limit: MAX_OAUTH_PROJECTS,
+			}),
+		);
 
 		return c.json({
 			client: {

@@ -1,9 +1,13 @@
 import { Database, type SQLQueryBindings } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, setSystemTime, spyOn, test } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import * as schema from "@server/db/schema";
 import { FILE_CHANGE_LIMITS } from "@shared/file-change-protocol";
 import { is } from "drizzle-orm";
 import { getTableConfig, SQLiteTable } from "drizzle-orm/sqlite-core";
+import { closeDbWorkerConnections } from "../lib/db-worker/pool";
 import {
 	FileChangeRetentionInventory,
 	type FileChangeRetentionInventoryCursor,
@@ -139,6 +143,47 @@ beforeEach(() => {
 afterEach(() => {
 	sqlite.close();
 	setSystemTime();
+});
+
+test("file-backed retention reads execute in the worker and preserve metadata pages", async () => {
+	blob(1);
+	const expected = await readPage();
+	const root = await mkdtemp(join(tmpdir(), "retention-worker-"));
+	const path = join(root, "inventory.db");
+	const disk = new Database(path);
+	try {
+		disk.exec("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 0;");
+		disk.exec(DDL);
+		for (const table of ["file_change_storage_budgets", "file_change_blobs"]) {
+			for (const row of sqlite
+				.query<Record<string, SQLQueryBindings>, []>(`SELECT * FROM ${table}`)
+				.all()) {
+				const columns = Object.keys(row);
+				disk
+					.query(
+						`INSERT INTO ${table} (${columns.join(",")}) VALUES (${columns.map(() => "?").join(",")})`,
+					)
+					.run(...Object.values(row));
+			}
+		}
+		const reader = createInventory({ db: disk });
+		const mainQuery = spyOn(disk, "query").mockImplementation(() => {
+			throw new Error("Main-thread SQL is forbidden");
+		});
+		try {
+			const actual = await reader.listPage({ signal: new AbortController().signal });
+			expect(actual.items).toEqual(expected.items);
+			expect(actual.referenceRoots).toEqual(expected.referenceRoots);
+			expect(actual.status).toBe(expected.status);
+			expect(mainQuery).not.toHaveBeenCalled();
+		} finally {
+			mainQuery.mockRestore();
+		}
+	} finally {
+		await closeDbWorkerConnections(path);
+		disk.close();
+		await rm(root, { recursive: true, force: true });
+	}
 });
 
 function createInventory(overrides: Partial<FileChangeRetentionInventoryOptions> = {}) {

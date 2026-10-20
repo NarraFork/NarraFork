@@ -25,19 +25,23 @@ import {
 	scanDatabaseObjectStorage,
 	summarizeToolCallPayloads,
 } from "../../services/storage-scan-queries";
+import { AppError, ForbiddenError, NotFoundError, ValidationError } from "../errors";
 import { DisplayPageReadError } from "./display-page-protocol";
 import { runDisplayPageQuery } from "./display-page-query";
 import { runPostgresDisplayPageQuery } from "./postgres-display-page-query";
 import type {
 	DbWorkerInbound,
 	DbWorkerOutbound,
+	DbWorkerRequest,
 	StorageScanCleanupSummariesParams,
 	StorageScanCleanupSummariesResult,
 	StorageScanContextResult,
 	StorageScanTablesParams,
 	StorageScanTablesResult,
 } from "./protocol";
+import { readWorkerDomExceptionName } from "./protocol";
 import { runSearchQuery } from "./search-query";
+import { streamSelectRows } from "./select-rows";
 import { runUsageHistoryQuery } from "./usage-history-query";
 
 declare const self: Worker;
@@ -51,6 +55,8 @@ function getConnection(dbPath: string): Database {
 	const db = new Database(dbPath, { readonly: true });
 	// Match the main connection's read tuning. No write pragmas: this handle is read-only.
 	try {
+		db.run("PRAGMA query_only = ON");
+		db.run("PRAGMA foreign_keys = ON");
 		db.run("PRAGMA cache_size = -16000");
 		db.run("PRAGMA temp_store = MEMORY");
 		db.run("PRAGMA mmap_size = 268435456");
@@ -150,13 +156,130 @@ function runStorageScanCleanupSummaries(
 	};
 }
 
+async function executeReadTask(message: DbWorkerRequest, signal: AbortSignal): Promise<unknown> {
+	const { params, dbPath, requestId } = message;
+	switch (params.kind) {
+		case "revertSelectionReadV1":
+			return (
+				await import("../../services/revert-selection-read-task")
+			).executeRevertSelectionReadTask(getConnection(dbPath), params, signal, (rows, bytes) =>
+				sendChunk(requestId, rows, bytes),
+			);
+		case "databaseCleanupReadV1":
+			return (await import("../../services/database-cleanup-read")).executeDatabaseCleanupReadTask(
+				getConnection(dbPath),
+				params,
+			);
+		case "revertPlanReadV1":
+			return (await import("../../services/revert-plan-read-task")).executeRevertPlanReadTask(
+				getConnection(dbPath),
+				params,
+			);
+		case "revertJournalReadV1":
+			return (await import("../../services/revert-journal-read-task")).executeRevertJournalReadTask(
+				getConnection(dbPath),
+				params,
+			);
+		case "publication-terminal-result-v1":
+			return (
+				await import("../../services/agent-runtime/publication-result-read")
+			).runPublicationTerminalResultRead(getConnection(dbPath), params, signal);
+		case "fileChangeBlobCatalogV1":
+			return (
+				await import("../../services/file-change-blob-catalog-read")
+			).executeFileChangeBlobCatalogRead(getConnection(dbPath), params);
+		case "fileChangeRetentionInventoryV1":
+			return (
+				await import("../../services/file-change-retention-inventory")
+			).executeFileChangeRetentionInventoryRead(getConnection(dbPath), params, signal);
+		case "workspace-recovery-effects-v1":
+			return (await import("../../services/workspace-recovery-read")).runWorkspaceRecoveryRead(
+				getConnection(dbPath),
+				params,
+				signal,
+			);
+		case "projectArchiveReadV1":
+			return (
+				await import("../../services/project-archive/archive-file-reader")
+			).readProjectArchive(getConnection(dbPath), params);
+		case "worktree-lifecycle-read-v1":
+			return (await import("../../services/worktree-lifecycle-read")).runWorktreeLifecycleRead(
+				getConnection(dbPath),
+				params,
+				signal,
+			);
+		case "narrator-read-transaction-v1":
+			return (await import("../../services/narrator-read-transactions")).runNarratorReadTransaction(
+				getConnection(dbPath),
+				params,
+				signal,
+			);
+		case "git-current-diff-read-v1":
+		case "git-current-diff-validate-v1":
+			return (await import("../../services/git-current-diff-read")).runCurrentDiffRead(
+				getConnection(dbPath),
+				params,
+				signal,
+			);
+		case "selectRowsV1":
+			return streamSelectRows(getConnection(dbPath), params, signal, (rows, bytes) =>
+				sendChunk(requestId, rows, bytes),
+			);
+		case "displayPageMessagesPostgres":
+			return runPostgresDisplayPageQuery(
+				dbPath,
+				{ ...params, kind: "displayPageMessages" },
+				signal,
+			);
+		case "displayPageMessages":
+			return runDisplayPageQuery(getConnection(dbPath), params);
+		case "searchQuery":
+			return runSearchQuery(getConnection(dbPath), params);
+		case "usageHistoryQuery":
+			return runUsageHistoryQuery(getConnection(dbPath), params);
+		case "storageScanContext":
+			return runStorageScanContext(dbPath);
+		case "storageScanSerial":
+			return runStorageScanSerial(dbPath, requestId, params.mainBytes, signal);
+		case "storageScanCleanupSummaries":
+			return runStorageScanCleanupSummaries(dbPath, params);
+		case "storageScanTables":
+			return runStorageScanTables(dbPath, requestId, params, signal);
+		default: {
+			const _exhaustive: never = params;
+			throw new Error("Unknown database read task");
+		}
+	}
+}
+
 const activeTasks = new Map<string, AbortController>();
+const chunkAcknowledgements = new Map<string, () => void>();
+
+async function sendChunk(requestId: string, rows: unknown[], bytes: number): Promise<void> {
+	await new Promise<void>((resolve) => {
+		chunkAcknowledgements.set(requestId, resolve);
+		post({ type: "chunk", requestId, rows, bytes });
+	});
+}
 self.onmessage = async (event: MessageEvent<DbWorkerInbound>) => {
 	const message = event.data;
 	if (!message || typeof message !== "object") return;
 
+	if (message.type === "closeConnection") {
+		connections.get(message.dbPath)?.close();
+		connections.delete(message.dbPath);
+		post({ type: "connectionClosed", requestId: message.requestId });
+		return;
+	}
+	if (message.type === "chunkAck") {
+		chunkAcknowledgements.get(message.requestId)?.();
+		chunkAcknowledgements.delete(message.requestId);
+		return;
+	}
 	if (message.type === "cancel") {
 		activeTasks.get(message.requestId)?.abort();
+		chunkAcknowledgements.get(message.requestId)?.();
+		chunkAcknowledgements.delete(message.requestId);
 		return;
 	}
 	if (message.type === "shutdown") {
@@ -177,37 +300,7 @@ self.onmessage = async (event: MessageEvent<DbWorkerInbound>) => {
 	const controller = new AbortController();
 	activeTasks.set(message.requestId, controller);
 	try {
-		const params = message.params;
-		const result =
-			params.kind === "displayPageMessagesPostgres"
-				? await runPostgresDisplayPageQuery(
-						message.dbPath,
-						{ ...params, kind: "displayPageMessages" },
-						controller.signal,
-					)
-				: params.kind === "displayPageMessages"
-					? runDisplayPageQuery(getConnection(message.dbPath), params)
-					: params.kind === "searchQuery"
-						? runSearchQuery(getConnection(message.dbPath), params)
-						: params.kind === "usageHistoryQuery"
-							? runUsageHistoryQuery(getConnection(message.dbPath), params)
-							: params.kind === "storageScanContext"
-								? runStorageScanContext(message.dbPath)
-								: params.kind === "storageScanSerial"
-									? runStorageScanSerial(
-											message.dbPath,
-											message.requestId,
-											params.mainBytes,
-											controller.signal,
-										)
-									: params.kind === "storageScanCleanupSummaries"
-										? runStorageScanCleanupSummaries(message.dbPath, params)
-										: runStorageScanTables(
-												message.dbPath,
-												message.requestId,
-												params,
-												controller.signal,
-											);
+		const result = await executeReadTask(message, controller.signal);
 		post({
 			type: "result",
 			requestId: message.requestId,
@@ -221,6 +314,24 @@ self.onmessage = async (event: MessageEvent<DbWorkerInbound>) => {
 		post({
 			type: "error",
 			requestId: message.requestId,
+			domExceptionName: readWorkerDomExceptionName(err),
+			...(err instanceof AppError
+				? {
+						applicationError: {
+							name:
+								err instanceof NotFoundError
+									? "NotFoundError"
+									: err instanceof ForbiddenError
+										? "ForbiddenError"
+										: err instanceof ValidationError
+											? "ValidationError"
+											: "AppError",
+							statusCode: err.statusCode,
+							messageCode: err.messageCode,
+							messageParams: err.messageParams,
+						},
+					}
+				: {}),
 			message: unknownPgError
 				? "PostgreSQL read-only display worker failed"
 				: err instanceof Error

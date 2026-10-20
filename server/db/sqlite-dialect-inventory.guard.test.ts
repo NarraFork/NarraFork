@@ -384,8 +384,8 @@ const SQLITE_ONLY_MODULES: ReadonlyMap<string, string> = new Map([
 	],
 	["server/services/project-db-sync.ts", "writes the per-project SQLite file"],
 	[
-		"server/services/project-archive/archive-file.ts",
-		"opens a portable `project.db` archive read-only; the archive is SQLite whatever the main database is",
+		"server/services/project-archive/archive-file-reader.ts",
+		"reads a portable `project.db` through an injected read-only connection; the archive is SQLite whatever the main database is",
 	],
 	[
 		"server/services/project-archive/archive-writer.ts",
@@ -484,9 +484,9 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		"blobFn",
 	],
 	"server/db/schema.ts": ["drizzleDialect", "json1"],
-	// Recall's FTS5/rowid statements moved to `services/search/sqlite-store.ts`; what remains is
-	// the raw-handle access path for its non-search reads.
-	"server/lib/agent/tools/recall.ts": ["driver", "handle"],
+	"server/db/worker-read.ts": ["driver", "nativeClient"],
+	"server/db/sqlite-execution-diagnostics.ts": ["drizzleDialect"],
+	"server/lib/db-worker/select-rows.ts": ["driver"],
 	"server/lib/db-resilience.ts": ["driver", "sqliteCli", "pragma", "sqliteCatalog", "errorCode"],
 	"server/lib/db-worker/storage-scan-runner.ts": ["driver", "fts5"],
 	"server/lib/db-worker/worker-entry.ts": ["driver", "pragma"],
@@ -514,10 +514,22 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	// `pragma` and `errorCode` left this file for `backend/sqlite-maintenance.ts`. `vacuum` stays
 	// because the admin operation is still exposed from here (through the port), and the chain-
 	// end test below depends on that remaining true.
-	"server/services/database-cleanup-service.ts": ["handle", "connectionModule", "vacuum"],
+	"server/services/database-cleanup-service.ts": [
+		"handle",
+		"nativeClient",
+		"connectionModule",
+		"vacuum",
+	],
+	"server/services/database-cleanup-read.ts": ["driver"],
 	"server/services/execution-log-service.ts": ["json1"],
 	"server/services/external-resource-service.ts": ["json1", "errorCode"],
-	"server/services/file-change-blob-catalog.ts": ["drizzleDialect", "pragma"],
+	"server/services/file-change-blob-catalog.ts": [
+		"driver",
+		"nativeClient",
+		"drizzleDialect",
+		"pragma",
+	],
+	"server/services/file-change-blob-catalog-read.ts": ["driver", "drizzleDialect"],
 	"server/services/file-change-evidence.ts": ["nativeClient"],
 	"server/services/file-change-physical-audit-worker.ts": [
 		"driver",
@@ -538,9 +550,12 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		"glob",
 		"collate",
 	],
-	"server/services/git-current-diff-view.ts": ["rowid"],
+	"server/services/git-current-diff-view.ts": ["handle"],
+	"server/services/git-current-diff-read.ts": ["driver", "drizzleDialect", "rowid"],
 	"server/services/integration-authority-service.ts": ["errorCode"],
-	"server/services/narrator-messages.ts": ["handle", "json1", "glob"],
+	"server/services/narrator-messages.ts": ["handle", "json1"],
+	"server/services/narrator-read-transactions.ts": ["driver", "drizzleDialect", "glob"],
+	"server/services/narrator-read-tool-preview.ts": ["json1"],
 	"server/services/narrator-panel-state.ts": ["json1"],
 	"server/services/narrator-persistence.ts": ["handle", "rowid", "indexHint", "json1"],
 	"server/services/narrator-refs-backfill.ts": ["blobFn"],
@@ -554,8 +569,8 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	// `sqlite-main-store.ts` is the MAIN database behind `ProjectArchiveMainStore`, so a second
 	// backend replaces it. `store.ts` — the module that picks the implementation — has no
 	// capability of its own and correctly does not appear here.
-	"server/services/project-archive/archive-file.ts": ["driver", "pragma"],
-	"server/services/project-archive/archive-writer.ts": ["driver", "pragma", "insertOr"],
+	"server/services/project-archive/archive-file-reader.ts": ["driver", "pragma"],
+	"server/services/project-archive/archive-writer.ts": ["driver", "pragmaFn", "insertOr"],
 	"server/services/project-archive/export-rows.ts": ["driver"],
 	"server/services/project-archive/sqlite-main-store.ts": ["insertOr"],
 	"server/services/project-archive/worker-sqlite-store.ts": ["driver", "pragma"],
@@ -579,13 +594,11 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 		"pragma",
 		"json1",
 	],
-	"server/services/revert-plan-service.ts": [
-		"driver",
-		"nativeClient",
-		"drizzleDialect",
-		"pragma",
-		"json1",
-	],
+	"server/services/revert-plan-service.ts": ["driver", "nativeClient", "drizzleDialect", "pragma"],
+	"server/services/revert-plan-read.ts": ["drizzleDialect", "json1"],
+	"server/services/revert-plan-read-task.ts": ["driver", "drizzleDialect"],
+	"server/services/revert-journal-read-task.ts": ["driver", "drizzleDialect"],
+	"server/services/revert-selection-read-task.ts": ["driver"],
 	"server/services/revert-planner-local-access.ts": ["json1"],
 	"server/services/revert-planner-service.ts": ["nativeClient"],
 	"server/services/revert-selection-service.ts": [
@@ -615,7 +628,6 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/subagent-activity.ts": ["json1"],
 	"server/services/subagent-file-changes.ts": ["drizzleDialect"],
 	"server/services/tool-continuation-service.ts": ["json1"],
-	"server/services/tool-edit-preview.ts": ["json1"],
 	"server/services/workspace-modification-view.ts": ["rowid"],
 	"server/services/workspace-write-coordinator.ts": ["nativeClient", "drizzleDialect", "pragma"],
 	// New main-database read/write surfaces remain migration inventory, NOT permanent
@@ -650,7 +662,10 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/workspace-execution-owner.ts": ["nativeClient", "drizzleDialect"],
 	"server/services/workspace-metadata-retry.ts": ["errorCode"],
 	"server/services/workspace-write-lease-store.ts": ["json1"],
-	"server/services/worktree-lifecycle-guard.ts": ["json1"],
+	"server/services/worktree-lifecycle-guard.ts": ["handle"],
+	"server/services/worktree-lifecycle-read.ts": ["driver", "drizzleDialect", "json1"],
+	"server/services/workspace-recovery-read.ts": ["driver", "drizzleDialect"],
+	"server/services/agent-runtime/publication-result-read.ts": ["driver", "drizzleDialect"],
 	"server/services/worktree-resource-metadata-store.ts": ["drizzleDialect"],
 	"shared/subagent-tool-summary.ts": ["json1"],
 };
@@ -1217,7 +1232,7 @@ describe("SQLite dialect inventory guard", () => {
 		for (const file of [
 			"server/lib/project-db.ts",
 			"server/services/project-db-sync.ts",
-			"server/services/project-archive/archive-file.ts",
+			"server/services/project-archive/archive-file-reader.ts",
 			"server/services/project-archive/archive-writer.ts",
 			"server/services/project-archive/export-rows.ts",
 		]) {

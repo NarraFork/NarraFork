@@ -25,7 +25,7 @@ import type { ActiveNarrator } from "../narrator-session-state";
  * low-level model pass is scripted; caller/executor/orchestrator are never mocked.
  * Call snapshots are model-boundary fixture evidence, not proof of upstream processing.
  * Deliberately not covered here: real network/provider serialization, tool authorization,
- * transient backoff timing, detach ownership, or full runner publication transactions.
+ * transient backoff timing or full runner publication transactions.
  * Those remain separate integration contracts; custom fallback below checks visibility,
  * not permission enforcement. Each file is intended to run in its own Bun process.
  */
@@ -47,7 +47,12 @@ const {
 } = await import("../agent-runtime/ownership");
 type RunControl = import("../agent-runtime/ownership").RunControl;
 const { controlRun, startNarratorRun } = await import("../agent-runtime/run");
-const { activeNarrators } = await import("../narrator-session-state");
+const {
+	activeNarrators,
+	drainNarratorAdmissionWork,
+	getNarratorShutdownPendingCount,
+	withNarratorWorkAdmission,
+} = await import("../narrator-session-state");
 const { backgroundOccupancyStore } = await import("../background-occupancy-store");
 const { settings } = await import("../../lib/settings");
 const { createPublicationOutbox } = await import("../agent-runtime/publication-outbox");
@@ -717,6 +722,36 @@ describe("real shared orchestrator profile contract", () => {
 			expect((await h.run()).hasError).toBe(false);
 		});
 
+		test(`${profile.kind}: detached ownership outlives the loop admission lease`, async () => {
+			const tail = Promise.withResolvers<void>();
+			let tracked: Promise<void> | undefined;
+			const h = fixture(profile, [
+				async (options) => {
+					const track = options.config.trackDetachedToolResult;
+					if (!track) throw new Error("Missing detached owner callback");
+					tracked = track(tail.promise);
+					return finished;
+				},
+			]);
+			try {
+				await withNarratorWorkAdmission(h.session.narratorId, () => h.run());
+				expect(getNarratorShutdownPendingCount()).toBeGreaterThan(0);
+				let drained = false;
+				const drain = drainNarratorAdmissionWork(new AbortController().signal).then(() => {
+					drained = true;
+				});
+				await new Promise<void>((resolve) => setImmediate(resolve));
+				expect(drained).toBe(false);
+				tail.resolve();
+				await drain;
+				expect(drained).toBe(true);
+				expect(getNarratorShutdownPendingCount()).toBe(0);
+			} finally {
+				tail.resolve();
+				await tracked;
+			}
+		});
+
 		test(`${profile.kind}: production detached callback persists after the loop has returned`, async () => {
 			const h = fixture(profile, [finished]);
 			await h.run();
@@ -1029,7 +1064,7 @@ describe("real shared orchestrator profile contract", () => {
 					});
 					if (!accepted.buffered) throw new Error("expected queued input");
 					order.push("queued");
-					if (scenario.softStop) expect(options.config.shouldStop?.()).toBe(true);
+					if (scenario.softStop) expect(await options.config.shouldStop?.()).toBe(true);
 					const injection = await options.config.getAfterToolsInjections?.();
 					const text = typeof injection === "string" ? injection : injection?.text;
 					expect(text ?? "").not.toContain(feedback);
@@ -1112,7 +1147,7 @@ describe("real shared orchestrator profile contract", () => {
 				);
 				const accepted = (await enqueueInboxAgent(delivery, text, { createdBy: "principal-a" }))
 					.delivery;
-				expect(options.config.shouldStop?.()).toBe(false);
+				expect(await options.config.shouldStop?.()).toBe(false);
 				const packet = await options.config.getAfterToolsInjections?.();
 				if (!packet || typeof packet === "string") throw new Error("Missing after-tools packet");
 				expect(packet.text).toContain(text);

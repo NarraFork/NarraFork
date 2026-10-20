@@ -10,6 +10,7 @@ import type { ExecutionBackend } from "../lib/agent/execution/backend";
 import { guardDiskWrite } from "../lib/disk-safety";
 import type { FileChangeDiagnostics } from "./file-change-diagnostics";
 import type { FileChangeScopeIdentity } from "./file-change-identity";
+import { LocalFileValidationError, localObjectIdentity } from "./file-change-local-identity";
 
 export interface LocalFileObservation {
 	bytes: Uint8Array | null;
@@ -18,45 +19,12 @@ export interface LocalFileObservation {
 	identity: string | null;
 }
 
-export class LocalFileValidationError extends Error {
-	constructor(
-		message: string,
-		readonly toolOutput?: string,
-	) {
-		super(message);
-		this.name = "LocalFileValidationError";
-	}
-}
-
-/**
- * The VOLUME cannot identify objects at all (e.g. FAT/exFAT or some network shares
- * on Windows), as opposed to one object failing validation. Callers that only need
- * evidence as an optional extra can tell "nothing is recordable here" from a real
- * mismatch by this type. `name` stays "LocalFileValidationError": diagnostics
- * whitelist error names, and every existing handler treats it as that class.
- */
-export class LocalObjectIdentityUnavailableError extends LocalFileValidationError {}
-
-export function localObjectIdentity(stat: BigIntStats): string {
-	if (stat.ino === 0n && stat.dev === 0n)
-		throw new LocalObjectIdentityUnavailableError(
-			"Local filesystem does not expose an object identity",
-		);
-	// Without a creation timestamp, recycled dev/ino values cannot distinguish
-	// workspace incarnations. Do not invent continuity from mtime/ctime instead.
-	if (stat.birthtimeNs <= 0n)
-		throw new LocalObjectIdentityUnavailableError(
-			"Local filesystem does not expose a valid creation time",
-		);
-	return `${stat.dev}:${stat.ino}:${stat.birthtimeNs}`;
-}
-
-export async function localDirectoryIdentity(path: string): Promise<string> {
-	const stat = await lstat(path, { bigint: true });
-	if (!stat.isDirectory() || stat.isSymbolicLink())
-		throw new LocalFileValidationError("Canonical workspace root is not a directory");
-	return localObjectIdentity(stat);
-}
+export {
+	LocalFileValidationError,
+	LocalObjectIdentityUnavailableError,
+	localDirectoryIdentity,
+	localObjectIdentity,
+} from "./file-change-local-identity";
 
 function regular(stat: BigIntStats): void {
 	if (!stat.isFile() || stat.nlink !== 1n)

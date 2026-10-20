@@ -217,5 +217,5 @@ test("COW-restored Send navigates by stable delivery while retaining captured or
 		recipientRefId: exactRef?.id,
 	});
 	expect(result.targets[0]?.revision).toBe(1);
-	expect(store.list("recipient")).toHaveLength(1);
+	expect(await store.list("recipient")).toHaveLength(1);
 });

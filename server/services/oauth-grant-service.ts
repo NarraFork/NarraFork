@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 /**
  * Durable OAuth consent (grant) lifecycle.
  *
@@ -200,11 +201,14 @@ async function resolveClient(input: {
 	if (!input.clientId && !input.oauthClientId) {
 		throw new ValidationError("clientId or oauthClientId is required");
 	}
-	const row = await db.query.oauthClients.findFirst({
-		where: input.oauthClientId
-			? eq(oauthClients.id, input.oauthClientId)
-			: eq(oauthClients.clientId, input.clientId as string),
-	});
+	const row = await readQuery(
+		db.query.oauthClients.findFirst({
+			where: input.oauthClientId
+				? eq(oauthClients.id, input.oauthClientId)
+				: eq(oauthClients.clientId, input.clientId as string),
+		}),
+		{ site: "server/services/oauth-grant-service.read" },
+	);
 	if (!row) throw new NotFoundError("OAuth client", input.oauthClientId ?? input.clientId ?? "");
 	if (input.clientId && row.clientId !== input.clientId) {
 		throw new ValidationError("clientId does not match oauthClientId");
@@ -233,11 +237,14 @@ async function getProjectIds(grantId: string): Promise<string[]> {
 async function getRevokedGrantDisplayAccess(
 	row: typeof oauthGrants.$inferSelect,
 ): Promise<{ scopes: string[]; projectIds: string[] }> {
-	const approval = await db.query.oauthGrantEvents.findFirst({
-		where: and(eq(oauthGrantEvents.grantId, row.id), eq(oauthGrantEvents.eventType, "approved")),
-		orderBy: (table) => [desc(table.createdAt), desc(table.id)],
-		columns: { grantedScopes: true, projectIds: true },
-	});
+	const approval = await readQuery(
+		db.query.oauthGrantEvents.findFirst({
+			where: and(eq(oauthGrantEvents.grantId, row.id), eq(oauthGrantEvents.eventType, "approved")),
+			orderBy: (table) => [desc(table.createdAt), desc(table.id)],
+			columns: { grantedScopes: true, projectIds: true },
+		}),
+		{ site: "server/services/oauth-grant-service.read" },
+	);
 	if (approval) {
 		return {
 			scopes: uniqueStrings(approval.grantedScopes).sort(),
@@ -247,12 +254,15 @@ async function getRevokedGrantDisplayAccess(
 
 	// Pre-event grants retain their deprecated mirrors only for historical UI display.
 	// Authorization never consults this fallback.
-	const projectRows = await db.query.oauthGrantProjects.findMany({
-		where: eq(oauthGrantProjects.grantId, row.id),
-		columns: { projectId: true },
-		orderBy: [asc(oauthGrantProjects.projectId)],
-		limit: OAUTH_GRANT_MAX_PROJECTS,
-	});
+	const projectRows = await readQuery(
+		db.query.oauthGrantProjects.findMany({
+			where: eq(oauthGrantProjects.grantId, row.id),
+			columns: { projectId: true },
+			orderBy: [asc(oauthGrantProjects.projectId)],
+			limit: OAUTH_GRANT_MAX_PROJECTS,
+		}),
+		{ site: "server/services/oauth-grant-service.read" },
+	);
 	return {
 		scopes: uniqueStrings(row.scopes).sort(),
 		projectIds: uniqueStrings(projectRows.map((project) => project.projectId)).sort(),
@@ -261,10 +271,13 @@ async function getRevokedGrantDisplayAccess(
 
 async function toGrantView(row: typeof oauthGrants.$inferSelect): Promise<OAuthGrantView> {
 	const [client, authority, revokedDisplayAccess] = await Promise.all([
-		db.query.oauthClients.findFirst({
-			where: eq(oauthClients.id, row.oauthClientId),
-			columns: { clientId: true, name: true },
-		}),
+		readQuery(
+			db.query.oauthClients.findFirst({
+				where: eq(oauthClients.id, row.oauthClientId),
+				columns: { clientId: true, name: true },
+			}),
+			{ site: "server/services/oauth-grant-service.read" },
+		),
 		integrationAuthorityService.getSnapshot(row.id),
 		row.revokedAt ? getRevokedGrantDisplayAccess(row) : null,
 	]);
@@ -328,11 +341,14 @@ async function validateGrantInput(
 		);
 	}
 	if (projectIds.length > 0) {
-		const existing = await db.query.projects.findMany({
-			where: inArray(projects.id, projectIds),
-			columns: { id: true },
-			limit: OAUTH_GRANT_MAX_PROJECTS,
-		});
+		const existing = await readQuery(
+			db.query.projects.findMany({
+				where: inArray(projects.id, projectIds),
+				columns: { id: true },
+				limit: OAUTH_GRANT_MAX_PROJECTS,
+			}),
+			{ site: "server/services/oauth-grant-service.read" },
+		);
 		const existingIds = new Set(existing.map((project) => project.id));
 		const missing = projectIds.filter((projectId) => !existingIds.has(projectId));
 		if (missing.length > 0) {
@@ -451,26 +467,29 @@ export async function backfillOAuthGrantAuthorities(
 ): Promise<OAuthAuthorityBackfillResult> {
 	const limit = normalizeBackfillLimit(options.limit);
 	const cursor = options.cursor?.trim() || null;
-	const rows = await db
-		.select({
-			id: oauthGrants.id,
-			oauthClientId: oauthGrants.oauthClientId,
-			userId: oauthGrants.userId,
-			scopes: oauthGrants.scopes,
-			policyJson: oauthGrants.policyJson,
-			revokedAt: oauthGrants.revokedAt,
-		})
-		.from(oauthGrants)
-		.leftJoin(integrationAuthorities, eq(integrationAuthorities.id, oauthGrants.id))
-		.where(
-			and(
-				isNull(oauthGrants.revokedAt),
-				cursor ? gt(oauthGrants.id, cursor) : undefined,
-				or(isNull(integrationAuthorities.id), isNull(integrationAuthorities.sourceGrantId)),
-			),
-		)
-		.orderBy(asc(oauthGrants.id))
-		.limit(limit + 1);
+	const rows = await readQuery(
+		db
+			.select({
+				id: oauthGrants.id,
+				oauthClientId: oauthGrants.oauthClientId,
+				userId: oauthGrants.userId,
+				scopes: oauthGrants.scopes,
+				policyJson: oauthGrants.policyJson,
+				revokedAt: oauthGrants.revokedAt,
+			})
+			.from(oauthGrants)
+			.leftJoin(integrationAuthorities, eq(integrationAuthorities.id, oauthGrants.id))
+			.where(
+				and(
+					isNull(oauthGrants.revokedAt),
+					cursor ? gt(oauthGrants.id, cursor) : undefined,
+					or(isNull(integrationAuthorities.id), isNull(integrationAuthorities.sourceGrantId)),
+				),
+			)
+			.orderBy(asc(oauthGrants.id))
+			.limit(limit + 1),
+		{ site: "server/services/oauth-grant-service.read" },
+	);
 	const page = rows.slice(0, limit);
 	let created = 0;
 	let repaired = 0;
@@ -521,12 +540,15 @@ export async function backfillOAuthGrantAuthorities(
 					unknownScopeCount: unknownScopes.length,
 				});
 			}
-			const projectRows = await db.query.oauthGrantProjects.findMany({
-				where: eq(oauthGrantProjects.grantId, row.id),
-				columns: { projectId: true },
-				orderBy: [asc(oauthGrantProjects.projectId)],
-				limit: OAUTH_GRANT_MAX_PROJECTS + 1,
-			});
+			const projectRows = await readQuery(
+				db.query.oauthGrantProjects.findMany({
+					where: eq(oauthGrantProjects.grantId, row.id),
+					columns: { projectId: true },
+					orderBy: [asc(oauthGrantProjects.projectId)],
+					limit: OAUTH_GRANT_MAX_PROJECTS + 1,
+				}),
+				{ site: "server/services/oauth-grant-service.read" },
+			);
 			if (projectRows.length > OAUTH_GRANT_MAX_PROJECTS) {
 				logger.warn("Skipping oversized OAuth project mirror during authority backfill", {
 					grantId: row.id,
@@ -669,7 +691,10 @@ export async function recordOAuthGrantEvent(input: RecordOAuthGrantEventInput) {
 			: null;
 	let grant: typeof oauthGrants.$inferSelect | undefined;
 	if (input.grantId) {
-		grant = await db.query.oauthGrants.findFirst({ where: eq(oauthGrants.id, input.grantId) });
+		grant = await readQuery(
+			db.query.oauthGrants.findFirst({ where: eq(oauthGrants.id, input.grantId) }),
+			{ site: "server/services/oauth-grant-service.read" },
+		);
 		if (!grant) throw new NotFoundError("OAuth grant", input.grantId);
 		if (client && client.id !== grant.oauthClientId) {
 			throw new ValidationError("OAuth grant does not belong to the OAuth client");
@@ -868,7 +893,10 @@ async function createOAuthGrantInternal(
 		await propagateOAuthGrantRestriction({ grantId, removedScopes, removedProjectIds });
 	}
 
-	const saved = await db.query.oauthGrants.findFirst({ where: eq(oauthGrants.id, grantId) });
+	const saved = await readQuery(
+		db.query.oauthGrants.findFirst({ where: eq(oauthGrants.id, grantId) }),
+		{ site: "server/services/oauth-grant-service.read" },
+	);
 	if (!saved) throw new NotFoundError("OAuth grant", grantId);
 	return toGrantView(saved);
 }
@@ -880,9 +908,12 @@ export async function getUserOAuthGrant(
 	userId: string,
 	grantId: string,
 ): Promise<OAuthGrantView | null> {
-	const row = await db.query.oauthGrants.findFirst({
-		where: and(eq(oauthGrants.id, grantId), eq(oauthGrants.userId, userId)),
-	});
+	const row = await readQuery(
+		db.query.oauthGrants.findFirst({
+			where: and(eq(oauthGrants.id, grantId), eq(oauthGrants.userId, userId)),
+		}),
+		{ site: "server/services/oauth-grant-service.read" },
+	);
 	return row ? toGrantView(row) : null;
 }
 
@@ -909,11 +940,14 @@ export async function listUserOAuthGrants(
 			) as never,
 		);
 	}
-	const rows = await db.query.oauthGrants.findMany({
-		where: and(...conditions),
-		orderBy: (table) => [desc(table.createdAt), desc(table.id)],
-		limit: limit + 1,
-	});
+	const rows = await readQuery(
+		db.query.oauthGrants.findMany({
+			where: and(...conditions),
+			orderBy: (table) => [desc(table.createdAt), desc(table.id)],
+			limit: limit + 1,
+		}),
+		{ site: "server/services/oauth-grant-service.read" },
+	);
 	const hasMore = rows.length > limit;
 	const pageRows = hasMore ? rows.slice(0, limit) : rows;
 	return {
@@ -943,12 +977,15 @@ export async function listActiveUserOAuthGrantIds(
 			`OAuth grant id page limit must be between 1 and ${OAUTH_GRANT_MAX_PAGE_LIMIT}`,
 		);
 	}
-	const rows = await db.query.oauthGrants.findMany({
-		where: and(eq(oauthGrants.userId, userId), isNull(oauthGrants.revokedAt)),
-		columns: { id: true },
-		orderBy: (table) => [desc(table.createdAt), desc(table.id)],
-		limit: limit + 1,
-	});
+	const rows = await readQuery(
+		db.query.oauthGrants.findMany({
+			where: and(eq(oauthGrants.userId, userId), isNull(oauthGrants.revokedAt)),
+			columns: { id: true },
+			orderBy: (table) => [desc(table.createdAt), desc(table.id)],
+			limit: limit + 1,
+		}),
+		{ site: "server/services/oauth-grant-service.read" },
+	);
 	return {
 		ids: rows.slice(0, limit).map((row) => row.id),
 		hasMore: rows.length > limit,
@@ -957,7 +994,10 @@ export async function listActiveUserOAuthGrantIds(
 
 /** Return the project allow-list, enforcing user ownership when requested. */
 export async function getGrantProjectIds(grantId: string, userId?: string): Promise<string[]> {
-	const grant = await db.query.oauthGrants.findFirst({ where: eq(oauthGrants.id, grantId) });
+	const grant = await readQuery(
+		db.query.oauthGrants.findFirst({ where: eq(oauthGrants.id, grantId) }),
+		{ site: "server/services/oauth-grant-service.read" },
+	);
 	if (!grant || (userId !== undefined && grant.userId !== userId)) return [];
 	return getProjectIds(grantId);
 }
@@ -968,7 +1008,10 @@ export async function isOAuthGrantProjectAllowed(
 	projectId: string,
 	userId?: string,
 ): Promise<boolean> {
-	const grant = await db.query.oauthGrants.findFirst({ where: eq(oauthGrants.id, grantId) });
+	const grant = await readQuery(
+		db.query.oauthGrants.findFirst({ where: eq(oauthGrants.id, grantId) }),
+		{ site: "server/services/oauth-grant-service.read" },
+	);
 	if (!grant || grant.revokedAt || (userId !== undefined && grant.userId !== userId)) return false;
 	const allowed = await getProjectIds(grantId);
 	return allowed.includes(projectId);
@@ -1028,11 +1071,14 @@ export async function revokeOAuthGrantsForUser(
 			`OAuth grant revoke batch must contain between 1 and ${OAUTH_GRANT_MAX_PAGE_LIMIT} ids`,
 		);
 	}
-	const ownedRows = await db.query.oauthGrants.findMany({
-		where: and(eq(oauthGrants.userId, input.userId), inArray(oauthGrants.id, grantIds)),
-		columns: { id: true, revokedAt: true },
-		limit: OAUTH_GRANT_MAX_PAGE_LIMIT,
-	});
+	const ownedRows = await readQuery(
+		db.query.oauthGrants.findMany({
+			where: and(eq(oauthGrants.userId, input.userId), inArray(oauthGrants.id, grantIds)),
+			columns: { id: true, revokedAt: true },
+			limit: OAUTH_GRANT_MAX_PAGE_LIMIT,
+		}),
+		{ site: "server/services/oauth-grant-service.read" },
+	);
 	const ownedIds = new Set(ownedRows.map((row) => row.id));
 	const missingId = grantIds.find((grantId) => !ownedIds.has(grantId));
 	if (missingId) throw new NotFoundError("OAuth grant", missingId);
@@ -1118,9 +1164,12 @@ export async function revokeOAuthGrantsForUser(
 export async function revokeOAuthGrantForUser(
 	input: RevokeOAuthGrantInput,
 ): Promise<OAuthGrantView | null> {
-	const existing = await db.query.oauthGrants.findFirst({
-		where: and(eq(oauthGrants.id, input.grantId), eq(oauthGrants.userId, input.userId)),
-	});
+	const existing = await readQuery(
+		db.query.oauthGrants.findFirst({
+			where: and(eq(oauthGrants.id, input.grantId), eq(oauthGrants.userId, input.userId)),
+		}),
+		{ site: "server/services/oauth-grant-service.read" },
+	);
 	if (!existing) return null;
 	await revokeOAuthGrantsForUser({
 		grantIds: [input.grantId],
@@ -1129,9 +1178,12 @@ export async function revokeOAuthGrantForUser(
 		actorType: input.actorType,
 		actorUserId: input.actorUserId,
 	});
-	const current = await db.query.oauthGrants.findFirst({
-		where: and(eq(oauthGrants.id, input.grantId), eq(oauthGrants.userId, input.userId)),
-	});
+	const current = await readQuery(
+		db.query.oauthGrants.findFirst({
+			where: and(eq(oauthGrants.id, input.grantId), eq(oauthGrants.userId, input.userId)),
+		}),
+		{ site: "server/services/oauth-grant-service.read" },
+	);
 	return current ? toGrantView(current) : null;
 }
 

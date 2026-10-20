@@ -194,7 +194,7 @@ export async function copyTable(
 	table: ArchiveTable,
 	options: CopyOptions = {},
 ): Promise<CopyResult> {
-	const writer = tableWriter(conn, table);
+	const writer = await tableWriter(conn, table);
 	if (!writer) return { rows: 0 };
 	const rows = await eachPage(store, table, options.filter, options, (page) => {
 		writeRows(conn, writer, table, page);
@@ -252,7 +252,7 @@ export async function replaceTables(
 	try {
 		for (const scope of scopes) {
 			checkControl(control, scope.table);
-			const stage = stagingTable(conn, scope.table);
+			const stage = await stagingTable(conn, scope.table);
 			staged.push(stage);
 			if (!stage) {
 				// The file does not carry this table at all (an archive predating it). There is
@@ -320,10 +320,8 @@ async function eachPage(
 				total += result.rows.length;
 			}
 			if (result.nextCursor === null) break;
-			// Yield a MACROtask between pages. The SQLite store's `readRows` is async in signature
-			// only — it runs a synchronous query — so the `await` above resolves as a microtask and
-			// a long export would otherwise run every page in one uninterrupted turn, starving
-			// timers, HTTP, WebSocket and child-process I/O until it finished.
+			// Also yield between pages for in-memory or injected stores whose reads resolve
+			// immediately. File-backed SQLite reads already yield through the worker pool.
 			await yieldToEventLoop();
 			if (result.nextCursor === after) {
 				throw new Error(`Archive export of "${table}" stalled at cursor ${after}`);

@@ -1,3 +1,4 @@
+import { readQuery } from "../db/worker-read";
 /**
  * Which project a narrator belongs to — the single answer to that question.
  *
@@ -46,10 +47,13 @@ export async function resolveNarratorProjectId(
 	narrator: NarratorProjectRef,
 ): Promise<string | null> {
 	if (narrator.chapterId) {
-		const chapter = await db.query.chapters.findFirst({
-			where: eq(chapters.id, narrator.chapterId),
-			columns: { projectId: true },
-		});
+		const chapter = await readQuery(
+			db.query.chapters.findFirst({
+				where: eq(chapters.id, narrator.chapterId),
+				columns: { projectId: true },
+			}),
+			{ site: "narrator-project.resolveNarratorProjectId" },
+		);
 		return chapter?.projectId ?? null;
 	}
 	return narrator.contextProjectId ?? null;
@@ -63,10 +67,13 @@ export async function resolveNarratorProjectId(
  * not asserting existence.
  */
 export async function resolveProjectIdForNarratorId(narratorId: string): Promise<string | null> {
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { chapterId: true, contextProjectId: true },
-	});
+	const narrator = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { chapterId: true, contextProjectId: true },
+		}),
+		{ site: "narrator-project.resolveProjectIdForNarratorId" },
+	);
 	if (!narrator) return null;
 	return await resolveNarratorProjectId(narrator);
 }

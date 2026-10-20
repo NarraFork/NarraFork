@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 /**
  * Device connection manager.
  *
@@ -208,9 +209,11 @@ export async function getSessionDevices(
 	 */
 	actingUserId?: string | null,
 ): Promise<import("../lib/agent/execution/backend").DeviceSummary[]> {
-	const rows = await db.query.remoteDevices.findMany({
-		where: isNull(remoteDevices.revokedAt),
-	});
+	const rows = await readQuery(
+		db.query.remoteDevices.findMany({
+			where: isNull(remoteDevices.revokedAt),
+		}),
+	);
 	const summaries: import("../lib/agent/execution/backend").DeviceSummary[] = [];
 	for (const row of rows) {
 		if (!isDeviceAuthorized(row, { projectId, userId: actingUserId })) continue;
@@ -1049,9 +1052,11 @@ function persistedDiagnosticFields(
 export async function getDeviceConnectionDiagnostics(
 	deviceId: string,
 ): Promise<DeviceConnectionDiagnostics | null> {
-	const row = await db.query.remoteDevices.findFirst({
-		where: and(eq(remoteDevices.id, deviceId), isNull(remoteDevices.revokedAt)),
-	});
+	const row = await readQuery(
+		db.query.remoteDevices.findFirst({
+			where: and(eq(remoteDevices.id, deviceId), isNull(remoteDevices.revokedAt)),
+		}),
+	);
 	if (!row) return null;
 	const persisted = persistedDiagnosticFields(row);
 	const conn = connections.get(deviceId);
@@ -1115,9 +1120,11 @@ export async function getDeviceConnectionDiagnostics(
 export async function testDeviceConnection(
 	deviceId: string,
 ): Promise<DeviceConnectionTestResult | null> {
-	const row = await db.query.remoteDevices.findFirst({
-		where: and(eq(remoteDevices.id, deviceId), isNull(remoteDevices.revokedAt)),
-	});
+	const row = await readQuery(
+		db.query.remoteDevices.findFirst({
+			where: and(eq(remoteDevices.id, deviceId), isNull(remoteDevices.revokedAt)),
+		}),
+	);
 	if (!row) return null;
 	const startedAt = Date.now();
 	if (!connections.has(deviceId) && row.connectionMode === "direct" && row.directUrl) {
@@ -1500,9 +1507,11 @@ function handleDirectAuthProof(
 
 /** Fetch the configured, non-revoked direct device row for a dial. */
 async function getDeviceRowForDial(deviceId: string) {
-	const row = await db.query.remoteDevices.findFirst({
-		where: eq(remoteDevices.id, deviceId),
-	});
+	const row = await readQuery(
+		db.query.remoteDevices.findFirst({
+			where: eq(remoteDevices.id, deviceId),
+		}),
+	);
 	return row && !row.revokedAt && row.connectionMode === "direct" ? row : null;
 }
 
@@ -1511,9 +1520,11 @@ async function getDeviceRowForDial(deviceId: string) {
  * aren't yet dialing, and stop dials for devices that no longer qualify.
  */
 export async function reconcileDirectDials(): Promise<void> {
-	const rows = await db.query.remoteDevices.findMany({
-		where: isNull(remoteDevices.revokedAt),
-	});
+	const rows = await readQuery(
+		db.query.remoteDevices.findMany({
+			where: isNull(remoteDevices.revokedAt),
+		}),
+	);
 	const wanted = new Map<string, string>();
 	for (const row of rows) {
 		if (row.connectionMode === "direct" && row.directUrl) {

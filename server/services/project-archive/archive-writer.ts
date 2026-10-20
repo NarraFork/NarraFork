@@ -57,6 +57,7 @@
  * refuse and leave the previous contents intact.
  */
 import type { Database } from "bun:sqlite";
+import { readNativeRows } from "@server/db/worker-read";
 import { logger } from "@server/lib/logger";
 import type { ArchiveRow, ArchiveValue } from "./main-store";
 import { ARCHIVE_COLUMNS, type ArchiveTable } from "./manifest";
@@ -101,27 +102,27 @@ export class ArchiveTableWriter {
  * Returns null when the file has none of them — a table this archive does not carry, which the
  * caller skips rather than treating as an error.
  */
-export function tableWriter(conn: Database, table: ArchiveTable): ArchiveTableWriter | null {
-	const present = presentColumns(conn, table);
+export async function tableWriter(
+	conn: Database,
+	table: ArchiveTable,
+): Promise<ArchiveTableWriter | null> {
+	const present = await presentColumns(conn, table);
 	const columns = ARCHIVE_COLUMNS[table].filter((column) => present.has(column));
 	if (columns.length === 0) return null;
 	return new ArchiveTableWriter(conn, table, columns);
 }
 
 /** Columns `table` has in this file, per its own `PRAGMA table_info`. */
-export function presentColumns(conn: Database, table: string): ReadonlySet<string> {
-	try {
-		return new Set(
-			(
-				conn.prepare(`PRAGMA table_info(${quoteIdentifier(table)})`).all() as Array<{
-					name: string;
-				}>
-			).map((column) => column.name),
-		);
-	} catch {
-		// No such table. An archive predating a table is an ordinary shape, not a failure.
-		return new Set();
-	}
+export async function presentColumns(conn: Database, table: string): Promise<ReadonlySet<string>> {
+	// table_info already returns no rows for an absent legacy table. Worker failures
+	// must propagate rather than being mistaken for an archive without this table.
+	const columns = await readNativeRows<{ name: string }>(
+		conn,
+		"SELECT name FROM pragma_table_info(?)",
+		[table],
+		{ dbPath: conn.filename, site: "projectArchive.writerColumns" },
+	);
+	return new Set(columns.map((column) => column.name));
 }
 
 /**
@@ -333,8 +334,11 @@ export class ArchiveStagingTable {
  * Null means the file does not carry this table at all — the same answer {@link tableWriter}
  * gives, and the caller skips it the same way.
  */
-export function stagingTable(conn: Database, table: ArchiveTable): ArchiveStagingTable | null {
-	const present = presentColumns(conn, table);
+export async function stagingTable(
+	conn: Database,
+	table: ArchiveTable,
+): Promise<ArchiveStagingTable | null> {
+	const present = await presentColumns(conn, table);
 	const columns = ARCHIVE_COLUMNS[table].filter((column) => present.has(column));
 	if (columns.length === 0) return null;
 	return new ArchiveStagingTable(conn, table, columns);

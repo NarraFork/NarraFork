@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 /**
  * Per-user git commit identity.
  *
@@ -235,16 +236,18 @@ export async function resolveGitIdentityForTurn(
 /** The default row (see {@link resolveGitIdentityForUser} for what "default" means). */
 async function fetchDefaultIdentity(userId: string): Promise<GitIdentity | null> {
 	const { asc, db, desc, eq, userGitIdentities } = await loadIdentityQueryDependencies();
-	const rows = await db
-		.select({ name: userGitIdentities.name, email: userGitIdentities.email })
-		.from(userGitIdentities)
-		.where(eq(userGitIdentities.userId, userId))
-		.orderBy(
-			desc(userGitIdentities.isDefault),
-			asc(userGitIdentities.createdAt),
-			asc(userGitIdentities.id),
-		)
-		.limit(1);
+	const rows = await readQuery(
+		db
+			.select({ name: userGitIdentities.name, email: userGitIdentities.email })
+			.from(userGitIdentities)
+			.where(eq(userGitIdentities.userId, userId))
+			.orderBy(
+				desc(userGitIdentities.isDefault),
+				asc(userGitIdentities.createdAt),
+				asc(userGitIdentities.id),
+			)
+			.limit(1),
+	);
 	return toIdentity(rows[0]);
 }
 
@@ -255,17 +258,22 @@ async function fetchPickedIdentity(
 ): Promise<GitIdentity | null> {
 	const { and, db, eq, narratorGitIdentityBindings, userGitIdentities } =
 		await loadIdentityQueryDependencies();
-	const rows = await db
-		.select({ name: userGitIdentities.name, email: userGitIdentities.email })
-		.from(narratorGitIdentityBindings)
-		.innerJoin(userGitIdentities, eq(userGitIdentities.id, narratorGitIdentityBindings.identityId))
-		.where(
-			and(
-				eq(narratorGitIdentityBindings.narratorId, narratorId),
-				eq(narratorGitIdentityBindings.userId, userId),
-			),
-		)
-		.limit(1);
+	const rows = await readQuery(
+		db
+			.select({ name: userGitIdentities.name, email: userGitIdentities.email })
+			.from(narratorGitIdentityBindings)
+			.innerJoin(
+				userGitIdentities,
+				eq(userGitIdentities.id, narratorGitIdentityBindings.identityId),
+			)
+			.where(
+				and(
+					eq(narratorGitIdentityBindings.narratorId, narratorId),
+					eq(narratorGitIdentityBindings.userId, userId),
+				),
+			)
+			.limit(1),
+	);
 	return toIdentity(rows[0]);
 }
 
@@ -312,10 +320,12 @@ export async function resolveNarratorGitIdentityEnv(input: {
 async function resolveNarratorOwnerUserId(narratorId: string): Promise<string | null> {
 	try {
 		const { db, eq, narrators } = await loadIdentityQueryDependencies();
-		const row = await db.query.narrators.findFirst({
-			where: eq(narrators.id, narratorId),
-			columns: { ownerUserId: true },
-		});
+		const row = await readQuery(
+			db.query.narrators.findFirst({
+				where: eq(narrators.id, narratorId),
+				columns: { ownerUserId: true },
+			}),
+		);
 		return row?.ownerUserId ?? null;
 	} catch {
 		return null;

@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { lstat } from "node:fs/promises";
 import { isAbsolute } from "node:path";
 import { setImmediate as yieldToEventLoop } from "node:timers/promises";
+import { readQuery, readQueryFirst } from "@server/db/worker-read";
 import {
 	FILE_CHANGE_LIMITS,
 	type FileChangeRevertAction,
@@ -63,11 +64,12 @@ import { WorkspaceWriteCoordinatorError } from "./workspace-write-coordinator";
 export class RevertPlannerLocalAccess implements RevertPlannerAccess {
 	async authenticate(principal: NarratorPrincipal, signal: AbortSignal): Promise<void> {
 		signal.throwIfAborted();
-		const user = db
-			.select({ id: users.id, role: users.role })
-			.from(users)
-			.where(eq(users.id, principal.userId))
-			.get();
+		const user = await readQueryFirst(
+			db
+				.select({ id: users.id, role: users.role })
+				.from(users)
+				.where(eq(users.id, principal.userId)),
+		);
 		// requireSessionAuth verifies the JWT; this closes its cached-user/stale-role window.
 		if (
 			!user ||
@@ -106,21 +108,22 @@ export class RevertPlannerLocalAccess implements RevertPlannerAccess {
 
 	private async narrator(principal: NarratorPrincipal, narratorId: string, signal: AbortSignal) {
 		await this.authenticate(principal, signal);
-		const row = db
-			.select({
-				id: narrators.id,
-				ownerUserId: narrators.ownerUserId,
-				visibility: narrators.visibility,
-				writeAudience: narrators.writeAudience,
-				type: narrators.type,
-				aclRootNarratorId: narrators.aclRootNarratorId,
-				chapterId: narrators.chapterId,
-				contextProjectId: narrators.contextProjectId,
-				cwd: narrators.cwd,
-			})
-			.from(narrators)
-			.where(eq(narrators.id, narratorId))
-			.get();
+		const row = await readQueryFirst(
+			db
+				.select({
+					id: narrators.id,
+					ownerUserId: narrators.ownerUserId,
+					visibility: narrators.visibility,
+					writeAudience: narrators.writeAudience,
+					type: narrators.type,
+					aclRootNarratorId: narrators.aclRootNarratorId,
+					chapterId: narrators.chapterId,
+					contextProjectId: narrators.contextProjectId,
+					cwd: narrators.cwd,
+				})
+				.from(narrators)
+				.where(eq(narrators.id, narratorId)),
+		);
 		if (!row) throw new NotFoundError("Narrator", narratorId);
 		await assertNarratorAccess(row, principal, "write");
 		// A subagent row carries no chapter/project of its own; its project is the
@@ -130,14 +133,15 @@ export class RevertPlannerLocalAccess implements RevertPlannerAccess {
 			row.type === "subagent"
 				? await (async () => {
 						const rootId = await resolveNarratorAdmissionRoot(narratorId);
-						const root = db
-							.select({
-								chapterId: narrators.chapterId,
-								contextProjectId: narrators.contextProjectId,
-							})
-							.from(narrators)
-							.where(eq(narrators.id, rootId))
-							.get();
+						const root = await readQueryFirst(
+							db
+								.select({
+									chapterId: narrators.chapterId,
+									contextProjectId: narrators.contextProjectId,
+								})
+								.from(narrators)
+								.where(eq(narrators.id, rootId)),
+						);
 						if (!root) throw new NotFoundError("Narrator", rootId);
 						return root;
 					})()
@@ -145,15 +149,16 @@ export class RevertPlannerLocalAccess implements RevertPlannerAccess {
 		const projectId = await resolveNarratorProjectId(projectRow);
 		if (projectRow.chapterId && !projectId) throw new NotFoundError("Narrator project", narratorId);
 		if (projectId) {
-			const project = db
-				.select({
-					id: projects.id,
-					ownerUserId: projects.ownerUserId,
-					visibility: projects.visibility,
-				})
-				.from(projects)
-				.where(eq(projects.id, projectId))
-				.get();
+			const project = await readQueryFirst(
+				db
+					.select({
+						id: projects.id,
+						ownerUserId: projects.ownerUserId,
+						visibility: projects.visibility,
+					})
+					.from(projects)
+					.where(eq(projects.id, projectId)),
+			);
 			if (!project) throw new NotFoundError("Project", projectId);
 			await assertProjectAccess(project, principal, "write");
 		}
@@ -211,7 +216,7 @@ export class RevertPlannerLocalAccess implements RevertPlannerAccess {
 		const initialContext = await this.fileContext(input);
 		const { runtime, namespace } = await verifiedNamespace(input.signal);
 		const identity = Object.freeze({ ...input.identity });
-		const scope = runtime.evidence.getScope(identity.scopeId);
+		const scope = await runtime.evidence.getScope(identity.scopeId);
 		if (!scope) throw stale("Recorded scope is unavailable");
 		const initialRuntime = localFileChangeRuntimeBinding(LOCAL_DEVICE_ID);
 		if (!initialRuntime) throw stale("Local runtime is unavailable");
@@ -229,7 +234,7 @@ export class RevertPlannerLocalAccess implements RevertPlannerAccess {
 			const liveNamespace = await verifiedNamespace(signal);
 			if (liveNamespace.runtime !== runtime || liveNamespace.namespace !== namespace)
 				throw stale("Local runtime implementation or namespace changed");
-			const live = runtime.evidence.getScope(identity.scopeId);
+			const live = await runtime.evidence.getScope(identity.scopeId);
 			if (
 				!live ||
 				live.sourceInstanceId !== namespace.sourceInstanceId ||
@@ -378,7 +383,7 @@ let cached:
 async function services(signal: AbortSignal) {
 	const { runtime, namespace } = await verifiedNamespace(signal);
 	if (!cached || cached.runtime !== runtime || cached.namespace !== namespace) {
-		const namespaceKey = namespace.catalog.getBudget()?.namespaceKey;
+		const namespaceKey = (await namespace.catalog.getBudget())?.namespaceKey;
 		if (!namespaceKey) throw stale("Evidence namespace metadata is missing");
 		cached = {
 			runtime,
@@ -433,7 +438,7 @@ export async function getLocalRevertPlan(
 ) {
 	const owner = await access.owner(principal, narratorId, signal);
 	const { plans } = await services(signal);
-	const plan = plans.getSummary(owner, planId);
+	const plan = await plans.getSummary(owner, planId);
 	signal.throwIfAborted();
 	return { plan, executable: false as const };
 }
@@ -445,7 +450,7 @@ export async function listLocalRevertPlanFiles(
 ) {
 	const owner = await access.owner(principal, narratorId, options.signal);
 	const { plans } = await services(options.signal);
-	const page = plans.listFiles(owner, planId, options);
+	const page = await plans.listFiles(owner, planId, options);
 	// Stored paths are sensitive too. A preview created before file permission revocation
 	// must not leak target identities under the weaker GET/read-only narrator gate.
 	for (const item of page.items) {
@@ -479,11 +484,12 @@ export async function prepareLocalRevertAction(
 ) {
 	await access.owner(principal, narratorId, signal);
 	try {
-		const narrator = db
-			.select({ messageVersion: narrators.messageVersion })
-			.from(narrators)
-			.where(eq(narrators.id, narratorId))
-			.get();
+		const narrator = await readQueryFirst(
+			db
+				.select({ messageVersion: narrators.messageVersion })
+				.from(narrators)
+				.where(eq(narrators.id, narratorId)),
+		);
 		if (!narrator) throw new NotFoundError("Narrator", narratorId);
 		// Subagents are revert roots too: users work in them directly. Their selection
 		// covers only their own history (plus anything they delegated), and admission
@@ -500,16 +506,17 @@ export async function prepareLocalRevertAction(
 			kind = "revert";
 			if (input.messageId === "__all__") selector = { kind: "all" };
 			else {
-				const ref = db
-					.select({ seq: narratorMessageRefs.seq })
-					.from(narratorMessageRefs)
-					.where(
-						and(
-							eq(narratorMessageRefs.narratorId, narratorId),
-							eq(narratorMessageRefs.messageId, input.messageId),
+				const ref = await readQueryFirst(
+					db
+						.select({ seq: narratorMessageRefs.seq })
+						.from(narratorMessageRefs)
+						.where(
+							and(
+								eq(narratorMessageRefs.narratorId, narratorId),
+								eq(narratorMessageRefs.messageId, input.messageId),
+							),
 						),
-					)
-					.get();
+				);
 				if (!ref) throw new NotFoundError("Message", input.messageId);
 				selector = { kind: "from_seq", minSeq: ref.seq };
 			}
@@ -521,22 +528,23 @@ export async function prepareLocalRevertAction(
 			const body = sql`CASE WHEN octet_length(${narratorMessages.contentJson}) <= ${FILE_CHANGE_LIMITS.summaryBytes}
 				THEN CASE WHEN json_valid(${narratorMessages.contentJson}) THEN ${narratorMessages.contentJson} ELSE NULL END
 				ELSE NULL END`;
-			const message = db
-				.select({
-					role: narratorMessages.role,
-					blockCount: sql<number | null>`json_array_length(${body})`,
-					blockType: sql<string | null>`json_extract(${body}, ${`$[${index}].type`})`,
-					toolUseId: sql<string | null>`json_extract(${body}, ${`$[${index}].id`})`,
-				})
-				.from(narratorMessageRefs)
-				.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
-				.where(
-					and(
-						eq(narratorMessageRefs.narratorId, narratorId),
-						eq(narratorMessageRefs.messageId, input.messageId),
+			const message = await readQueryFirst(
+				db
+					.select({
+						role: narratorMessages.role,
+						blockCount: sql<number | null>`json_array_length(${body})`,
+						blockType: sql<string | null>`json_extract(${body}, ${`$[${index}].type`})`,
+						toolUseId: sql<string | null>`json_extract(${body}, ${`$[${index}].id`})`,
+					})
+					.from(narratorMessageRefs)
+					.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
+					.where(
+						and(
+							eq(narratorMessageRefs.narratorId, narratorId),
+							eq(narratorMessageRefs.messageId, input.messageId),
+						),
 					),
-				)
-				.get();
+			);
 			if (!message) throw new NotFoundError("Message", input.messageId);
 			if (message.blockCount === null)
 				throw new RevertPlannerError(
@@ -555,17 +563,18 @@ export async function prepareLocalRevertAction(
 			} else {
 				if (message.blockType !== "tool_use" || typeof message.toolUseId !== "string")
 					throw new ValidationError("The selected block is not a tool call");
-				const tools = db
-					.select({ id: narratorToolCalls.id })
-					.from(narratorToolCalls)
-					.where(
-						and(
-							eq(narratorToolCalls.messageId, input.messageId),
-							eq(narratorToolCalls.toolUseId, message.toolUseId),
-						),
-					)
-					.limit(2)
-					.all();
+				const tools = await readQuery(
+					db
+						.select({ id: narratorToolCalls.id })
+						.from(narratorToolCalls)
+						.where(
+							and(
+								eq(narratorToolCalls.messageId, input.messageId),
+								eq(narratorToolCalls.toolUseId, message.toolUseId),
+							),
+						)
+						.limit(2),
+				);
 				if (tools.length !== 1)
 					throw new RevertPlannerError(
 						"EVIDENCE_INCOMPLETE",
@@ -632,7 +641,7 @@ export async function prepareLocalRevertAction(
 		// advisory: they never widen the refused plan or soften the safety gate.
 		let blockers =
 			unavailable === "pending_operations" || unavailable === "incomplete_coverage"
-				? collectRevertBlockers(narratorId, code)
+				? await collectRevertBlockers(narratorId, code)
 				: undefined;
 		if (unavailable === "pending_operations" && (!blockers || blockers.length === 0)) {
 			// In-memory coordinator activity (write lease / registerActivity) has no
@@ -672,7 +681,7 @@ export async function applyLocalRevertPlan(
 	const owner = await access.owner(principal, narratorId, signal);
 	await assertLocalRevertPlatform();
 	const { plans, transactions } = await services(signal);
-	const plan = plans.getSummary(owner, planId);
+	const plan = await plans.getSummary(owner, planId);
 	if (plan.planHash !== input.planHash)
 		throw new RevertPlannerError("ACTION_MISMATCH", "Confirmed plan changed");
 	if (plan.status === "prepared" && plan.expired)
@@ -696,7 +705,7 @@ export async function applyLocalRevertPlan(
 			: () => {};
 	let execution: ReturnType<RevertTransactionService["execute"]>;
 	try {
-		const admissionPlan = plans.getSummary(owner, planId);
+		const admissionPlan = await plans.getSummary(owner, planId);
 		if (admissionPlan.status === "prepared" && admissionPlan.expired)
 			throw new RevertPlannerError("EXPIRED", "Confirmed plan expired; load a fresh preview");
 		execution = transactions.execute({ principal, narratorId, planId, ...input, signal });

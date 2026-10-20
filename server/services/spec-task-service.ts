@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { readQuery } from "@server/db/worker-read";
 import { and, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { specFileRevisions, specProtectedTasks } from "../db/schema";
@@ -147,9 +148,11 @@ export function compileSpecTasks(document: SpecTasksDocument): CompiledSpecTasks
 }
 
 async function listProtectedLocks(namespaceId: string): Promise<ProtectedTaskLock[]> {
-	const locks = await db.query.specProtectedTasks.findMany({
-		where: eq(specProtectedTasks.namespaceId, namespaceId),
-	});
+	const locks = await readQuery(
+		db.query.specProtectedTasks.findMany({
+			where: eq(specProtectedTasks.namespaceId, namespaceId),
+		}),
+	);
 	const firstRevisionIds = [
 		...new Set(
 			locks
@@ -160,10 +163,12 @@ async function listProtectedLocks(namespaceId: string): Promise<ProtectedTaskLoc
 	if (firstRevisionIds.length === 0) {
 		return locks.map((lock) => ({ ...lock, createdBy: "unknown" }));
 	}
-	const revisions = await db.query.specFileRevisions.findMany({
-		where: inArray(specFileRevisions.id, firstRevisionIds),
-		columns: { id: true, createdBy: true },
-	});
+	const revisions = await readQuery(
+		db.query.specFileRevisions.findMany({
+			where: inArray(specFileRevisions.id, firstRevisionIds),
+			columns: { id: true, createdBy: true },
+		}),
+	);
 	const createdByRevision = new Map<string, ProtectedTaskCreatedBy>(
 		revisions.map((revision) => [revision.id, revision.createdBy]),
 	);
@@ -242,12 +247,14 @@ async function syncProtectedLocks(
 	const protectedTasksInDoc = document.tasks.filter((task) => task.protected);
 	for (const task of protectedTasksInDoc) {
 		const hash = taskTextHash(task.text);
-		const existing = await db.query.specProtectedTasks.findFirst({
-			where: and(
-				eq(specProtectedTasks.namespaceId, namespaceId),
-				eq(specProtectedTasks.textHash, hash),
-			),
-		});
+		const existing = await readQuery(
+			db.query.specProtectedTasks.findFirst({
+				where: and(
+					eq(specProtectedTasks.namespaceId, namespaceId),
+					eq(specProtectedTasks.textHash, hash),
+				),
+			}),
+		);
 		if (!existing) {
 			await db.insert(specProtectedTasks).values({
 				id: generateId(),
@@ -275,12 +282,14 @@ async function syncProtectedLocks(
 	}
 
 	const hashesInDoc = protectedTasksInDoc.map((task) => taskTextHash(task.text));
-	const openLocks = await db.query.specProtectedTasks.findMany({
-		where: and(
-			eq(specProtectedTasks.namespaceId, namespaceId),
-			inArray(specProtectedTasks.status, ["todo", "doing", "blocked"]),
-		),
-	});
+	const openLocks = await readQuery(
+		db.query.specProtectedTasks.findMany({
+			where: and(
+				eq(specProtectedTasks.namespaceId, namespaceId),
+				inArray(specProtectedTasks.status, ["todo", "doing", "blocked"]),
+			),
+		}),
+	);
 	for (const lock of openLocks) {
 		if (hashesInDoc.includes(lock.textHash)) continue;
 		await db

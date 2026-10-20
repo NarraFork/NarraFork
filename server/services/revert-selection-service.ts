@@ -30,7 +30,7 @@ import {
 	hasSettledMeasuredFileEffect,
 	NON_OPERATION_ROLES,
 } from "@shared/file-change-protocol";
-import { AppError } from "../lib/errors";
+import { readNativeRows, readTransactionTask } from "../db/worker-read";
 import {
 	createFileChangeIdentity,
 	fileChangeExecutionBindingMatches,
@@ -38,8 +38,17 @@ import {
 } from "./file-change-identity";
 import type { FileChangeReversalEffect } from "./file-change-reversal";
 import type { NarratorAclRow, NarratorPrincipal } from "./narrator-acl";
+import {
+	type AssociationPageQuery,
+	type AssociationPageRow,
+	executeRevertSelectionReadTask,
+	REVERT_SELECTION_PAGE_ITEMS,
+	RevertSelectionError,
+	type RevertSelectionReadTask,
+	sourceRowsDigest,
+} from "./revert-selection-read-task";
 
-export const REVERT_SELECTION_PAGE_ITEMS = 32;
+export { REVERT_SELECTION_PAGE_ITEMS, RevertSelectionError } from "./revert-selection-read-task";
 /** Additional collector bounds, not a license to call a truncated selection complete. */
 export const REVERT_SELECTION_LIMITS = Object.freeze({
 	messageBytes: FILE_CHANGE_LIMITS.historyCowBytes,
@@ -226,6 +235,7 @@ interface BodySummary {
 interface ScopeState {
 	principal: NarratorPrincipal;
 	signal: AbortSignal;
+	deadlineAt: number;
 	/** Bounded source queries only; never a database-wide write counter. */
 	commitments: Map<string, { query: string; params: SQLQueryBindings[]; digest: string }>;
 	commitmentBytes: number;
@@ -294,6 +304,7 @@ export class RevertSelectionService {
 	async collect(request: RevertSelectionRequest): Promise<RevertSelectionResult> {
 		const started = performance.now();
 		const input = normalizeRequest(request);
+		const deadlineAt = Date.now() + this.timeoutMs;
 		const signal = AbortSignal.any([
 			...(request.signal ? [request.signal] : []),
 			AbortSignal.timeout(this.timeoutMs),
@@ -305,6 +316,7 @@ export class RevertSelectionService {
 		const state: ScopeState = {
 			principal: input.principal,
 			signal,
+			deadlineAt,
 			commitments: new Map(),
 			commitmentBytes: 0,
 			bodies: new Map(),
@@ -386,7 +398,9 @@ export class RevertSelectionService {
 				this.check(state); // worker shutdown was the final await
 				// Catch version/context changes even during ACL callbacks or worker shutdown.
 				for (const narratorId of state.narrators.keys())
-					this.one<NarratorRow>(state, `${NARRATOR_SELECT} WHERE id = ? LIMIT 1`, [narratorId]);
+					await this.one<NarratorRow>(state, `${NARRATOR_SELECT} WHERE id = ? LIMIT 1`, [
+						narratorId,
+					]);
 			}
 		}
 	}
@@ -402,57 +416,103 @@ export class RevertSelectionService {
 		state.signal.throwIfAborted();
 		this.root();
 	}
-	private rows<T>(
+	private async rows<T>(
 		state: ScopeState,
 		query: string,
 		params: SQLQueryBindings[],
 		commit = true,
-	): T[] {
+	): Promise<T[]> {
 		this.check(state);
 		state.queries++;
-		const rows = this.database.$client.query<T, SQLQueryBindings[]>(query).all(...params);
-		if (commit) {
-			const key = JSON.stringify([query, params]);
-			const digest = sourceRowsDigest(rows);
-			const old = state.commitments.get(key);
-			if (old && old.digest !== digest)
-				throw fail("STALE", "Selected source metadata changed during collection");
-			if (!old) {
-				state.commitmentBytes += Buffer.byteLength(key) + digest.length;
-				integer(
-					state.commitmentBytes,
-					0,
-					REVERT_SELECTION_LIMITS.manifestBytes,
-					"source commitments",
-				);
-				state.commitments.set(key, { query, params: [...params], digest });
-			}
-		}
+		const rows = await readNativeRows<T>(this.database.$client, query, params, {
+			signal: state.signal,
+		});
+		this.check(state);
+		if (commit) this.recordRows(state, query, params, rows);
 		return rows;
 	}
-	private one<T>(
+	private recordRows(
+		state: ScopeState,
+		query: string,
+		params: SQLQueryBindings[],
+		rows: unknown[],
+	) {
+		const key = JSON.stringify([query, params]);
+		const digest = sourceRowsDigest(rows);
+		const old = state.commitments.get(key);
+		if (old && old.digest !== digest)
+			throw fail("STALE", "Selected source metadata changed during collection");
+		if (!old) {
+			state.commitmentBytes += Buffer.byteLength(key) + digest.length;
+			integer(
+				state.commitmentBytes,
+				0,
+				REVERT_SELECTION_LIMITS.manifestBytes,
+				"source commitments",
+			);
+			state.commitments.set(key, { query, params: [...params], digest });
+		}
+	}
+	private async readTask<T>(
+		state: ScopeState,
+		task: RevertSelectionReadTask,
+		onChunk?: (rows: unknown[]) => void,
+	): Promise<T> {
+		this.check(state);
+		const result = await readTransactionTask<T>(
+			this.database,
+			task,
+			() =>
+				executeRevertSelectionReadTask(this.database.$client, task, state.signal, async (rows) => {
+					onChunk?.(rows);
+				}) as T | Promise<T>,
+			{ signal: state.signal, onChunk },
+		);
+		this.check(state);
+		return result;
+	}
+	private async one<T>(
 		state: ScopeState,
 		query: string,
 		params: SQLQueryBindings[],
 		commit = true,
-	): T | undefined {
-		return this.rows<T>(state, query, params, commit)[0];
+	): Promise<T | undefined> {
+		return (await this.rows<T>(state, query, params, commit))[0];
 	}
 	private async verifySources(state: ScopeState) {
 		// Reuse the original indexed/keyset SELECTs, including their empty/end pages:
 		// row insertion/removal, sharing, tool bindings and FK associations all matter.
 		// Raw bodies are rehashed off-thread, never included in main-thread row digests.
 		for (const { ref, digest } of state.bodies.values()) {
-			const content = this.readBody(state, ref);
+			const content = await this.readBody(state, ref);
 			const current = await state.worker.inspect(ref.id, content, true);
 			this.check(state);
 			if (current.digest !== digest) throw fail("STALE", "Selected message body changed");
 		}
-		let verified = 0;
-		for (const { query, params } of state.commitments.values()) {
-			this.rows(state, query, params);
-			if (++verified % REVERT_SELECTION_PAGE_ITEMS === 0) await this.pause(state);
+		let batch: RevertSelectionReadTask = {
+			kind: "revertSelectionReadV1",
+			action: "verify",
+			commitments: [],
+			deadlineAt: state.deadlineAt,
+		};
+		const verify = async () => {
+			const result = await this.readTask<{ checkedCount: number }>(state, batch);
+			state.queries += result.checkedCount;
+		};
+		for (const commitment of state.commitments.values()) {
+			batch.commitments.push(commitment);
+			if (batch.commitments.length === REVERT_SELECTION_PAGE_ITEMS) {
+				await verify();
+				await this.pause(state);
+				batch = {
+					kind: "revertSelectionReadV1",
+					action: "verify",
+					commitments: [],
+					deadlineAt: state.deadlineAt,
+				};
+			}
 		}
+		if (batch.commitments.length) await verify();
 		for (const narratorId of state.narrators.keys()) await this.authorize(state, narratorId, true);
 	}
 	private async pause(state: ScopeState) {
@@ -492,7 +552,7 @@ export class RevertSelectionService {
 	}
 
 	private async authorize(state: ScopeState, narratorId: string, recheck = false) {
-		const row = this.one<NarratorRow>(state, `${NARRATOR_SELECT} WHERE id = ? LIMIT 1`, [
+		const row = await this.one<NarratorRow>(state, `${NARRATOR_SELECT} WHERE id = ? LIMIT 1`, [
 			narratorId,
 		]);
 		if (!row) throw fail("NOT_FOUND", "Narrator not found");
@@ -523,8 +583,8 @@ export class RevertSelectionService {
 		}
 	}
 
-	private ref(state: ScopeState, narratorId: string, messageId: string): RefRow {
-		const ref = this.one<RefRow>(
+	private async ref(state: ScopeState, narratorId: string, messageId: string): Promise<RefRow> {
+		const ref = await this.one<RefRow>(
 			state,
 			`${REF_SELECT} WHERE r.narrator_id = ? AND r.message_id = ? LIMIT 1`,
 			[narratorId, messageId],
@@ -535,7 +595,7 @@ export class RevertSelectionService {
 	private async select(state: ScopeState, narratorId: string, selector: FileChangeRevertSelector) {
 		if (selector.kind === "messages") {
 			for (const id of selector.messageIds) {
-				await this.message(state, this.ref(state, narratorId, id));
+				await this.message(state, await this.ref(state, narratorId, id));
 				await this.pause(state);
 			}
 			return;
@@ -543,17 +603,19 @@ export class RevertSelectionService {
 		if (selector.kind === "tool_calls") {
 			const grouped = new Map<string, Set<string>>();
 			for (const id of selector.toolCallIds) {
-				const tool = this.one<RevertSelectionTool>(state, `${TOOL_SELECT} WHERE id = ? LIMIT 1`, [
-					id,
-				]);
+				const tool = await this.one<RevertSelectionTool>(
+					state,
+					`${TOOL_SELECT} WHERE id = ? LIMIT 1`,
+					[id],
+				);
 				if (!tool) throw fail("NOT_FOUND", "Selected tool-call PK is absent");
-				this.ref(state, narratorId, tool.messageId);
+				await this.ref(state, narratorId, tool.messageId);
 				const selected = grouped.get(tool.messageId) ?? new Set<string>();
 				selected.add(id);
 				grouped.set(tool.messageId, selected);
 			}
 			for (const [messageId, toolIds] of grouped) {
-				await this.message(state, this.ref(state, narratorId, messageId), { toolIds });
+				await this.message(state, await this.ref(state, narratorId, messageId), { toolIds });
 				await this.pause(state);
 			}
 			return;
@@ -561,11 +623,11 @@ export class RevertSelectionService {
 		let startSeq = selector.kind === "from_seq" ? selector.minSeq : -Number.MAX_SAFE_INTEGER;
 		let boundaryId: string | null = null;
 		if (selector.kind === "after_block") {
-			const boundary = this.ref(state, narratorId, selector.messageId);
+			const boundary = await this.ref(state, narratorId, selector.messageId);
 			startSeq = boundary.seq;
 			boundaryId = boundary.id;
 			// Same-seq siblings have no durable relative order: never silently pick an ID order.
-			const ties = this.one<{ id: string }>(
+			const ties = await this.one<{ id: string }>(
 				state,
 				"SELECT id FROM narrator_message_refs INDEXED BY idx_narrator_refs_seq WHERE narrator_id = ? AND seq = ? AND message_id != ? LIMIT 1",
 				[narratorId, startSeq, boundaryId],
@@ -576,7 +638,7 @@ export class RevertSelectionService {
 		}
 		let cursor = { seq: startSeq, rowid: 0 };
 		for (;;) {
-			const page = this.rows<RefRow>(
+			const page = await this.rows<RefRow>(
 				state,
 				`${REF_SELECT} WHERE r.narrator_id = ? AND (r.seq, r.rowid) >= (?, ?) ORDER BY r.seq, r.rowid LIMIT ?`,
 				[narratorId, cursor.seq, cursor.rowid, REVERT_SELECTION_PAGE_ITEMS + 1],
@@ -599,15 +661,15 @@ export class RevertSelectionService {
 			REVERT_SELECTION_LIMITS.inspectedBodyBytes,
 			"total body inspection bytes",
 		);
-		const summary = await state.worker.inspect(ref.id, this.readBody(state, ref));
+		const summary = await state.worker.inspect(ref.id, await this.readBody(state, ref));
 		this.check(state);
 		const old = state.bodies.get(ref.id);
 		if (old && old.digest !== summary.digest) throw fail("STALE", "Selected message body changed");
 		state.bodies.set(ref.id, { ref, digest: summary.digest });
 		return summary;
 	}
-	private readBody(state: ScopeState, ref: RefRow): string {
-		const content = this.one<{ body: string }>(
+	private async readBody(state: ScopeState, ref: RefRow): Promise<string> {
+		const content = await this.one<{ body: string }>(
 			state,
 			"SELECT content_json AS body FROM narrator_messages WHERE id = ? AND octet_length(content_json) = ? AND octet_length(content_json) <= ? LIMIT 1",
 			[ref.id, ref.contentBytes, REVERT_SELECTION_LIMITS.messageBytes],
@@ -668,11 +730,11 @@ export class RevertSelectionService {
 			removed.flatMap((block) => (block.toolUseId ? [block.toolUseId] : [])),
 		);
 		const full = removed.length === body.blocks.length;
-		const shared = !!this.one<{ id: string }>(
+		const shared = !!(await this.one<{ id: string }>(
 			state,
 			"SELECT id FROM narrator_message_refs INDEXED BY idx_narrator_refs_message WHERE message_id = ? AND narrator_id != ? LIMIT 1",
 			[ref.id, ref.narratorId],
-		);
+		));
 		if (!full && !removed.length) return;
 		this.reserve(state, full ? (shared ? 1 : 2) : shared ? 2 : 1, 0, full ? 0 : ref.copyBytes);
 		this.add(state, state.result.history.messages, {
@@ -740,7 +802,7 @@ export class RevertSelectionService {
 		const results: RevertSelectionTool[] = [];
 		let cursor = 0;
 		for (;;) {
-			const page = this.rows<RevertSelectionTool & { cursor: number }>(
+			const page = await this.rows<RevertSelectionTool & { cursor: number }>(
 				state,
 				`${TOOL_SELECT.replace("SELECT ", "SELECT rowid AS cursor, ")} INDEXED BY idx_toolcalls_message WHERE message_id = ? AND rowid > ? ORDER BY rowid LIMIT ?`,
 				[messageId, cursor, REVERT_SELECTION_PAGE_ITEMS + 1],
@@ -793,7 +855,7 @@ export class RevertSelectionService {
 		if (!["success", "fail"].includes(tool.status))
 			this.issue(state, { code: "TOOL_ACTIVE_OR_UNKNOWN", toolCallId: tool.id });
 		const origin = tool.executionOriginToolCallId ?? tool.id;
-		const task = this.one<{
+		const task = await this.one<{
 			id: string;
 			status: string;
 			type: string;
@@ -875,7 +937,7 @@ export class RevertSelectionService {
 		const result = new Map<string, Set<string>>();
 		const root = tool.executionSegmentId;
 		if (!root) return result;
-		const rows = this.rows<{ id: string; narratorId: string }>(
+		const rows = await this.rows<{ id: string; narratorId: string }>(
 			state,
 			`WITH RECURSIVE descendants(id, narrator_id) AS (
 				SELECT id, narrator_id FROM file_change_execution_segments WHERE parent_segment_id = ?
@@ -912,7 +974,7 @@ export class RevertSelectionService {
 		const grouped = new Map<string, string[]>();
 		let cursor = 0;
 		for (;;) {
-			const children = this.rows<{ id: string; origin: string | null; cursor: number }>(
+			const children = await this.rows<{ id: string; origin: string | null; cursor: number }>(
 				state,
 				"SELECT id, origin_tool_call_id AS origin, rowid AS cursor FROM narrators INDEXED BY idx_narrators_parent WHERE parent_narrator_id = ? AND type = 'subagent' AND rowid > ? ORDER BY rowid LIMIT ?",
 				[parentNarratorId, cursor, REVERT_SELECTION_PAGE_ITEMS + 1],
@@ -956,7 +1018,7 @@ export class RevertSelectionService {
 		allowed: Set<string>,
 	) {
 		// This legacy edge is only used as an ambiguity detector, NEVER as authority.
-		const rows = this.rows<{ id: string; narratorId: string }>(
+		const rows = await this.rows<{ id: string; narratorId: string }>(
 			state,
 			"SELECT id, narrator_id AS narratorId FROM narrator_messages INDEXED BY idx_messages_parent_tool_use_lookup WHERE parent_tool_use_id = ? LIMIT ?",
 			[tool.toolUseId, FILE_CHANGE_LIMITS.historyMessageRefChanges + 1],
@@ -975,7 +1037,7 @@ export class RevertSelectionService {
 	}
 
 	private async operation(state: ScopeState, tool: RevertSelectionTool) {
-		const operation = this.one<RevertSelectionOperation>(
+		const operation = await this.one<RevertSelectionOperation>(
 			state,
 			`${OPERATION_SELECT} WHERE id = ? LIMIT 1`,
 			[tool.fileChangeOperationId],
@@ -1026,7 +1088,7 @@ export class RevertSelectionService {
 		let cursor: { fileKey: string; phase: string } | null = null;
 		let effectCount = 0;
 		for (;;) {
-			const rows: EffectRow[] = this.rows<EffectRow>(
+			const rows: EffectRow[] = await this.rows<EffectRow>(
 				state,
 				`${EFFECT_SELECT} WHERE operation_id = ? ${cursor ? "AND (file_key, phase) > (?, ?)" : ""} ORDER BY file_key, phase LIMIT ?`,
 				[
@@ -1046,7 +1108,7 @@ export class RevertSelectionService {
 				);
 				const effect = decodeEffect(row, operation.attempt);
 				integer(effect.scopeRevision, 0, Number.MAX_SAFE_INTEGER, "scope revision");
-				const actualScope = this.one<{
+				const actualScope = await this.one<{
 					id: string;
 					sourceInstanceId: string;
 					deviceId: string;
@@ -1160,14 +1222,37 @@ export class RevertSelectionService {
 		specs: readonly AssociationSpec[],
 		targetId: string,
 	) {
-		for (const [table, column, index, idColumn = "id"] of specs) {
-			let cursor = 0;
-			for (;;) {
-				const rows = this.rows<{ id: string; cursor: number }>(
-					state,
-					`SELECT ${idColumn} AS id, rowid AS cursor FROM ${table} INDEXED BY ${index} WHERE ${column} = ? AND rowid > ? ORDER BY rowid LIMIT ?`,
-					[targetId, cursor, REVERT_SELECTION_PAGE_ITEMS + 1],
-				);
+		let specIndex = 0;
+		let cursor = 0;
+		while (specIndex < specs.length) {
+			const queries: AssociationPageQuery[] = specs
+				.slice(specIndex)
+				.map(([table, column, index, idColumn = "id"], offset) => ({
+					query: `SELECT ${idColumn} AS id, rowid AS cursor FROM ${table} INDEXED BY ${index} WHERE ${column} = ? AND rowid > ? ORDER BY rowid LIMIT ?`,
+					params: [targetId, offset === 0 ? cursor : 0, REVERT_SELECTION_PAGE_ITEMS + 1],
+					stopOnRows: table === "narrators",
+				}));
+			const pages: AssociationPageRow["row"][][] = queries.map(() => []);
+			const { pageCount } = await this.readTask<{ pageCount: number }>(
+				state,
+				{
+					kind: "revertSelectionReadV1",
+					action: "associationPages",
+					queries,
+					deadlineAt: state.deadlineAt,
+				},
+				(chunk) => {
+					this.check(state);
+					for (const item of chunk as AssociationPageRow[]) pages[item.pageIndex].push(item.row);
+				},
+			);
+			integer(pageCount, 1, queries.length, "association pages");
+			state.queries += pageCount;
+			// Only completed pages are read evidence; unexecuted slots are not empty commitments.
+			for (let pageIndex = 0; pageIndex < pageCount; pageIndex++) {
+				const [table, column] = specs[specIndex];
+				const rows = pages[pageIndex];
+				this.recordRows(state, queries[pageIndex].query, queries[pageIndex].params, rows);
 				for (const row of rows.slice(0, REVERT_SELECTION_PAGE_ITEMS)) {
 					if (table === "narrators" && !state.narrators.has(row.id))
 						await this.authorize(state, row.id);
@@ -1187,18 +1272,16 @@ export class RevertSelectionService {
 						targetId,
 					});
 				}
-				if (rows.length <= REVERT_SELECTION_PAGE_ITEMS) break;
-				cursor = rows[REVERT_SELECTION_PAGE_ITEMS - 1].cursor;
-				await this.pause(state);
+				if (rows.length <= REVERT_SELECTION_PAGE_ITEMS) {
+					specIndex++;
+					cursor = 0;
+				} else {
+					cursor = rows[REVERT_SELECTION_PAGE_ITEMS - 1].cursor;
+					await this.pause(state);
+				}
 			}
 		}
 	}
-}
-
-function sourceRowsDigest(rows: unknown[]): string {
-	const hash = createHash("sha256");
-	for (const row of rows) hash.update(JSON.stringify(row)).update("\n");
-	return hash.digest("hex");
 }
 
 const NARRATOR_SELECT = `SELECT id, owner_user_id AS ownerUserId, visibility, write_audience AS writeAudience, type,
@@ -1418,12 +1501,6 @@ function* manifestRows(result: RevertSelectionResult) {
 		result.issues,
 	])
 		for (const row of values) yield row;
-}
-export class RevertSelectionError extends AppError {
-	constructor(code: string, message: string) {
-		super(message, 409, `REVERT_SELECTION_${code}`);
-		this.name = "RevertSelectionError";
-	}
 }
 function fail(code: string, message: string) {
 	return new RevertSelectionError(code, message);

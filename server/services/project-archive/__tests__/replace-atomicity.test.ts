@@ -78,14 +78,14 @@ const createdProjects: string[] = [];
 const createdNarrators: string[] = [];
 
 afterEach(async () => {
-	for (const id of openedArchives.splice(0)) projectDbManager.close(id);
+	for (const id of openedArchives.splice(0)) await projectDbManager.close(id);
 	for (const narratorId of createdNarrators.splice(0)) {
 		await db.delete(narratorMessageRefs).where(eq(narratorMessageRefs.narratorId, narratorId));
 		await db.delete(narratorMessages).where(eq(narratorMessages.narratorId, narratorId));
 		await db.delete(narrators).where(eq(narrators.id, narratorId));
 	}
 	for (const projectId of createdProjects.splice(0)) {
-		projectDbManager.close(projectId);
+		await projectDbManager.close(projectId);
 		await db.delete(chapters).where(eq(chapters.projectId, projectId));
 		await db.delete(projects).where(eq(projects.id, projectId));
 	}
@@ -102,12 +102,12 @@ afterEach(async () => {
  * `openForGitPath` is used rather than `getDb` on purpose: it takes the path directly, so the
  * archive needs no `projects` row in the main database and these tests stay independent of it.
  */
-function createArchive(prefix: string): { conn: Database; gitPath: string } {
+async function createArchive(prefix: string): Promise<{ conn: Database; gitPath: string }> {
 	const gitPath = mkdtempSync(join(tmpdir(), prefix));
 	tempDirs.push(gitPath);
 	const key = `test-archive-${generateId()}`;
 	openedArchives.push(key);
-	return { conn: projectDbManager.openForGitPath(key, gitPath), gitPath };
+	return { conn: await projectDbManager.openForGitPath(key, gitPath), gitPath };
 }
 
 /** Read a table through a SEPARATE read-only handle — what another machine would see. */
@@ -283,7 +283,7 @@ function chapterScope(): ReplaceScope {
 
 describe("a successful multi-page replacement swaps the whole table", () => {
 	test("every new row lands and every stale row is gone", async () => {
-		const { conn, gitPath } = createArchive("nf-arc-replace-ok-");
+		const { conn, gitPath } = await createArchive("nf-arc-replace-ok-");
 		// Two rows that the main database no longer has. A replacement must remove them; an
 		// append would leave them behind, which is the difference this scope exists for.
 		seedChapters(conn, [
@@ -312,7 +312,7 @@ describe("a successful multi-page replacement swaps the whole table", () => {
 	});
 
 	test("a staged duplicate resolves last-write-wins, as a direct write would", async () => {
-		const { conn, gitPath } = createArchive("nf-arc-replace-dup-");
+		const { conn, gitPath } = await createArchive("nf-arc-replace-dup-");
 		// The archive's own `INSERT OR REPLACE` semantics: the LAST row written for a key wins.
 		// The load has to replay staging order to match, which is what `ORDER BY rowid` is for.
 		const stage = new ArchiveStagingTable(conn, "chapters", [
@@ -363,7 +363,7 @@ describe("a failed replacement leaves the previous contents whole", () => {
 	}
 
 	test("a second-page read failure aborts before anything is deleted", async () => {
-		const { conn, gitPath } = createArchive("nf-arc-replace-read-");
+		const { conn, gitPath } = await createArchive("nf-arc-replace-read-");
 		const previous = seedPrevious(conn);
 
 		const fresh = Array.from({ length: MULTI_PAGE }, (_, i) => chapterRow(PROJECT, i));
@@ -381,7 +381,7 @@ describe("a failed replacement leaves the previous contents whole", () => {
 	});
 
 	test("a row the archive rejects rolls the delete back with it", async () => {
-		const { conn, gitPath } = createArchive("nf-arc-replace-load-");
+		const { conn, gitPath } = await createArchive("nf-arc-replace-load-");
 		const previous = seedPrevious(conn);
 
 		// `chapters.title` is NOT NULL in the archive's DDL, so this row fails during the load —
@@ -402,7 +402,7 @@ describe("a failed replacement leaves the previous contents whole", () => {
 	});
 
 	test("an aborted export writes nothing", async () => {
-		const { conn, gitPath } = createArchive("nf-arc-replace-abort-");
+		const { conn, gitPath } = await createArchive("nf-arc-replace-abort-");
 		const previous = seedPrevious(conn);
 
 		const fresh = Array.from({ length: MULTI_PAGE }, (_, i) => chapterRow(PROJECT, i));
@@ -425,7 +425,7 @@ describe("a failed replacement leaves the previous contents whole", () => {
 	});
 
 	test("a deadline that has passed writes nothing", async () => {
-		const { conn, gitPath } = createArchive("nf-arc-replace-timeout-");
+		const { conn, gitPath } = await createArchive("nf-arc-replace-timeout-");
 		const previous = seedPrevious(conn);
 
 		const fresh = [chapterRow(PROJECT, 1)];
@@ -441,7 +441,7 @@ describe("a failed replacement leaves the previous contents whole", () => {
 	});
 
 	test("exceeding the staging ceiling refuses rather than half-replacing", async () => {
-		const { conn, gitPath } = createArchive("nf-arc-replace-limit-");
+		const { conn, gitPath } = await createArchive("nf-arc-replace-limit-");
 		const previous = seedPrevious(conn);
 
 		// A tiny ceiling stands in for a real one: the behavior under test is what happens when
@@ -506,7 +506,7 @@ describe("a multi-table replacement commits or rolls back as one", () => {
 	}
 
 	test("a failure in the second scope rolls back the first scope's delete", async () => {
-		const { conn, gitPath } = createArchive("nf-arc-replace-multi-");
+		const { conn, gitPath } = await createArchive("nf-arc-replace-multi-");
 		const previousChapters = [chapterRow(PROJECT, 600_001, { title: "still here" })];
 		seedChapters(conn, previousChapters);
 		const previousRefs = seedRefs(conn, "narrator-1", 3);
@@ -548,7 +548,7 @@ describe("a multi-table replacement commits or rolls back as one", () => {
 	});
 
 	test("all clears precede all loads, so one scope adds while another replaces", async () => {
-		const { conn, gitPath } = createArchive("nf-arc-replace-order-");
+		const { conn, gitPath } = await createArchive("nf-arc-replace-order-");
 		const previousRefs = seedRefs(conn, "narrator-1", 4);
 		// A ref belonging to a DIFFERENT narrator: the clear is scoped, so it must survive.
 		seedRefs(conn, "narrator-2", 1);
@@ -578,7 +578,7 @@ describe("a multi-table replacement commits or rolls back as one", () => {
 	});
 
 	test("a table absent from an older archive is skipped, not failed", async () => {
-		const { conn, gitPath } = createArchive("nf-arc-replace-missing-");
+		const { conn, gitPath } = await createArchive("nf-arc-replace-missing-");
 		const previousChapters = [chapterRow(PROJECT, 500_001, { title: "kept" })];
 		seedChapters(conn, previousChapters);
 		// An archive predating a table has neither the table nor its rows. The scope's DELETE

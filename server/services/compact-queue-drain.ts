@@ -34,7 +34,7 @@ import { getBufferedMessages } from "./narrator-buffer";
 async function resolveQueueOwnerLocale(
 	narratorId: string,
 ): Promise<{ locale: Locale; replyInUserLanguage: boolean }> {
-	const createdBy = getBufferedMessages(narratorId)?.[0]?.createdBy;
+	const createdBy = (await getBufferedMessages(narratorId))[0]?.createdBy;
 	if (!createdBy) return { locale: "en", replyInUserLanguage: false };
 	try {
 		const [locale, replyInUserLanguage] = await Promise.all([
@@ -55,13 +55,11 @@ async function resolveQueueOwnerLocale(
  * Start a turn for whatever the user queued while this narrator was compacting.
  *
  * Called from the compact lock's release path, so it covers success, failure,
- * cancellation and watchdog timeouts alike. A no-op when the queue is empty, which is
- * the overwhelmingly common case — the check is a map lookup, so it stays free for
- * every compact that nobody typed into.
+ * cancellation and watchdog timeouts alike. A no-op when the durable queue is empty.
  */
 export async function drainQueuedMessagesAfterCompact(narratorId: string): Promise<void> {
-	if ((getBufferedMessages(narratorId)?.length ?? 0) === 0) return;
 	try {
+		if ((await getBufferedMessages(narratorId)).length === 0) return;
 		const { locale, replyInUserLanguage } = await resolveQueueOwnerLocale(narratorId);
 		const { resumeBufferedMessagesIfIdle } = await import("./narrator-session");
 		await resumeBufferedMessagesIfIdle(narratorId, locale, replyInUserLanguage);

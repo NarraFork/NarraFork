@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { readQuery } from "@server/db/worker-read";
 import { eq, gt } from "drizzle-orm";
 import { db } from "../db";
 import { narrators } from "../db/schema";
@@ -49,17 +50,19 @@ export async function planProviderPrefixNarratorMigration(
 	let lastId: string | null = null;
 	let scanned = 0;
 	for (;;) {
-		const rows = db
-			.select({
-				id: narrators.id,
-				model: narrators.model,
-				pendingModelRestore: narrators.pendingModelRestore,
-			})
-			.from(narrators)
-			.where(lastId ? gt(narrators.id, lastId) : undefined)
-			.orderBy(narrators.id)
-			.limit(SCAN_BATCH_SIZE)
-			.all();
+		const rows: Pick<typeof narrators.$inferSelect, "id" | "model" | "pendingModelRestore">[] =
+			await readQuery(
+				db
+					.select({
+						id: narrators.id,
+						model: narrators.model,
+						pendingModelRestore: narrators.pendingModelRestore,
+					})
+					.from(narrators)
+					.where(lastId ? gt(narrators.id, lastId) : undefined)
+					.orderBy(narrators.id)
+					.limit(SCAN_BATCH_SIZE),
+			);
 		if (rows.length === 0) break;
 		scanned += rows.length;
 		if (scanned > MAX_SCANNED_NARRATORS) {

@@ -25,6 +25,7 @@ import { editTool } from "../../lib/agent/tools/edit";
 import { structSedTool } from "../../lib/agent/tools/struct-sed/tool";
 import { writeTool } from "../../lib/agent/tools/write";
 import type { ToolContext, ToolExecutionTarget } from "../../lib/agent/types";
+import { closeDbWorkerConnections } from "../../lib/db-worker/pool";
 import { generateId } from "../../lib/id";
 import { fileChangeLocalIo, localDirectoryIdentity } from "../file-change-local-io";
 import { waitForRetiredFileChangeCleanup } from "../file-change-namespace-reset";
@@ -286,7 +287,7 @@ export async function seedFixture(owner: FixtureLifetime) {
 		async resolveFile({ identity, signal }) {
 			signal.throwIfAborted();
 			if (identity.deviceId !== "local") throw new Error("No remote fallback");
-			const scope = runtime.evidence.getScope(identity.scopeId);
+			const scope = await runtime.evidence.getScope(identity.scopeId);
 			const binding = localFileChangeRuntimeBinding(identity.deviceId);
 			if (!scope || !binding) throw new Error("No scope/runtime");
 			const executionBinding = { deviceId: "local", ...binding, fencingToken: scope.fencingToken };
@@ -296,7 +297,7 @@ export async function seedFixture(owner: FixtureLifetime) {
 				scopeRevision: scope.revision,
 				async assertCurrent({ signal }) {
 					signal.throwIfAborted();
-					const live = runtime.evidence.getScope(scope.id);
+					const live = await runtime.evidence.getScope(scope.id);
 					if (
 						!live ||
 						live.activeLeaseId ||
@@ -331,7 +332,9 @@ export async function seedFixture(owner: FixtureLifetime) {
 			};
 		},
 	};
-	const planOptions = { namespaceKey: namespace.catalog.getBudget()?.namespaceKey ?? "missing" };
+	const planOptions = {
+		namespaceKey: (await namespace.catalog.getBudget())?.namespaceKey ?? "missing",
+	};
 	planner = new RevertPlannerService(db, {
 		access,
 		blobStore: namespace.store,
@@ -364,14 +367,18 @@ export async function closeFixture(closing: FixtureLifetime) {
 	expect(closing.holds.size).toBe(0);
 	expect(closing.work.size).toBe(0);
 	for (const restore of closing.restores.splice(0).reverse()) restore();
-	// Finalize Drizzle's prepared statements instead of deferring SQLite's native
-	// connection disposal to GC, which leaves fixture files locked on Windows.
-	closing.sqlite?.close(true);
-	// Windows may still report EBUSY/EPERM for a moment after the last handle closes (indexer,
-	// AV, a just-settled background read). Node retries those codes with linear backoff; the
-	// directory is still removed for real, and a persistent lock still fails the hook.
-	if (closing.root)
-		await fs.rm(closing.root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+	const dispose = async () => {
+		// Finalize Drizzle's prepared statements instead of deferring SQLite's native
+		// connection disposal to GC, which leaves fixture files locked on Windows.
+		closing.sqlite?.close(true);
+		// Windows may still report EBUSY/EPERM briefly after all handles close.
+		if (closing.root)
+			await fs.rm(closing.root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+	};
+	// Cancellation can settle a read before its retiring worker exits. Keep this
+	// database closed to new reads until its local handle and directory are gone.
+	if (closing.sqlite) await closeDbWorkerConnections(closing.sqlite.filename, dispose);
+	else await dispose();
 }
 export function checkNarrator(user: NarratorPrincipal, row: NarratorAclRow) {
 	if (!user.isAdmin && row.ownerUserId !== user.userId) throw new Error("Narrator denied");
@@ -530,7 +537,9 @@ export async function twoFiles() {
 		await write(path, "changed");
 	}
 	const plan = await prepare();
-	const ordered = plans.listFiles(owner, plan.id).items.sort((x, y) => x.sequence - y.sequence);
+	const ordered = (await plans.listFiles(owner, plan.id)).items.sort(
+		(x, y) => x.sequence - y.sequence,
+	);
 	return {
 		a: ordered[0].identityJson.canonicalPath,
 		b: ordered[1].identityJson.canonicalPath,

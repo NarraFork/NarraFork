@@ -9,6 +9,7 @@ export type {
 import { and, eq } from "drizzle-orm";
 import { activeDatabaseBackend, db } from "../db";
 import { narratorWorktreeResources } from "../db/schema";
+import { readQueryFirst } from "../db/worker-read";
 import { AppError } from "../lib/errors";
 import { withWorkspaceAdmission } from "./worktree-lifecycle-guard";
 
@@ -33,16 +34,17 @@ export const narratorWorktreeResourceRegistry = createWorktreeResourceRegistry(
 );
 
 /** Indexed existence lookup: LIMIT never makes an owned path look orphaned. All states protect. */
-export function isRegisteredNarratorWorktree(worktreePath: string): boolean {
-	return !!db
-		.select({ id: narratorWorktreeResources.id })
-		.from(narratorWorktreeResources)
-		.where(
-			and(
-				eq(narratorWorktreeResources.deviceId, "local"),
-				eq(narratorWorktreeResources.worktreePath, worktreePath),
-			),
-		)
-		.limit(1)
-		.get();
+export async function isRegisteredNarratorWorktree(worktreePath: string): Promise<boolean> {
+	return !!(await readQueryFirst(
+		db
+			.select({ id: narratorWorktreeResources.id })
+			.from(narratorWorktreeResources)
+			.where(
+				and(
+					eq(narratorWorktreeResources.deviceId, "local"),
+					eq(narratorWorktreeResources.worktreePath, worktreePath),
+				),
+			)
+			.limit(1),
+	));
 }

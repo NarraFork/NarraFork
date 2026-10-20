@@ -1,3 +1,4 @@
+import { readQuery, readQueryFirst } from "@server/db/worker-read";
 /**
  * Workspace membership: the authoritative answer to "which panels are in this
  * workspace".
@@ -131,21 +132,24 @@ function serializeConfig(config: unknown): string | null {
 
 /** Assert the workspace exists and belongs to this user, returning its row. */
 async function requireOwnedWorkspace(userId: string, workspaceId: string) {
-	const workspace = await db.query.workspaces.findFirst({
-		where: and(eq(workspaces.id, workspaceId), eq(workspaces.userId, userId)),
-	});
+	const workspace = await readQuery(
+		db.query.workspaces.findFirst({
+			where: and(eq(workspaces.id, workspaceId), eq(workspaces.userId, userId)),
+		}),
+	);
 	if (!workspace) throw new NotFoundError("Workspace", workspaceId);
 	return workspace;
 }
 
-function readPanelRows(workspaceId: string): WorkspacePanelRow[] {
-	return db
-		.select()
-		.from(workspacePanels)
-		.where(eq(workspacePanels.workspaceId, workspaceId))
-		.orderBy(asc(workspacePanels.sortOrder), asc(workspacePanels.id))
-		.limit(WORKSPACE_PANEL_MAX)
-		.all();
+async function readPanelRows(workspaceId: string): Promise<WorkspacePanelRow[]> {
+	return readQuery(
+		db
+			.select()
+			.from(workspacePanels)
+			.where(eq(workspacePanels.workspaceId, workspaceId))
+			.orderBy(asc(workspacePanels.sortOrder), asc(workspacePanels.id))
+			.limit(WORKSPACE_PANEL_MAX),
+	);
 }
 
 // ── Backfill ─────────────────────────────────────────────────────────────────
@@ -363,7 +367,7 @@ export async function listWorkspacePanels(
 	workspaceId: string,
 ): Promise<WorkspacePanel[]> {
 	const workspace = await requireOwnedWorkspace(userId, workspaceId);
-	let rows = readPanelRows(workspaceId);
+	let rows = await readPanelRows(workspaceId);
 	if (rows.length === 0) {
 		const now = new Date();
 		db.transaction((tx) => {
@@ -378,7 +382,7 @@ export async function listWorkspacePanels(
 			if (existing.length > 0) return;
 			backfillPanelsInTransaction(tx, userId, workspaceId, workspace.tree, now);
 		});
-		rows = readPanelRows(workspaceId);
+		rows = await readPanelRows(workspaceId);
 	}
 	return rows.filter(isMembershipRow).map(rowToPanel);
 }
@@ -471,11 +475,12 @@ export async function removeWorkspacePanel(
 	panelId: string,
 ): Promise<void> {
 	await requireOwnedWorkspace(userId, workspaceId);
-	const row = db
-		.select()
-		.from(workspacePanels)
-		.where(and(eq(workspacePanels.id, panelId), eq(workspacePanels.workspaceId, workspaceId)))
-		.get();
+	const row = await readQueryFirst(
+		db
+			.select()
+			.from(workspacePanels)
+			.where(and(eq(workspacePanels.id, panelId), eq(workspacePanels.workspaceId, workspaceId))),
+	);
 	if (!row) throw new NotFoundError("Workspace panel", panelId);
 
 	if (row.kind === "narrator" && row.narratorId) {
@@ -537,10 +542,12 @@ export async function saveWorkspaceLayout(
 		.returning({ layoutRevision: workspaces.layoutRevision });
 
 	if (updated.length === 0) {
-		const current = await db.query.workspaces.findFirst({
-			where: and(eq(workspaces.id, workspaceId), eq(workspaces.userId, userId)),
-			columns: { layoutRevision: true },
-		});
+		const current = await readQuery(
+			db.query.workspaces.findFirst({
+				where: and(eq(workspaces.id, workspaceId), eq(workspaces.userId, userId)),
+				columns: { layoutRevision: true },
+			}),
+		);
 		throw new WorkspaceLayoutConflictError(current?.layoutRevision ?? 0);
 	}
 	const layoutRevision = updated[0].layoutRevision;
@@ -560,11 +567,12 @@ export async function updateWorkspacePanelConfig(
 	config: unknown,
 ): Promise<WorkspacePanel> {
 	await requireOwnedWorkspace(userId, workspaceId);
-	const row = db
-		.select()
-		.from(workspacePanels)
-		.where(and(eq(workspacePanels.id, panelId), eq(workspacePanels.workspaceId, workspaceId)))
-		.get();
+	const row = await readQueryFirst(
+		db
+			.select()
+			.from(workspacePanels)
+			.where(and(eq(workspacePanels.id, panelId), eq(workspacePanels.workspaceId, workspaceId))),
+	);
 	if (!row) throw new NotFoundError("Workspace panel", panelId);
 	if (row.kind === "narrator") {
 		throw new ValidationError(

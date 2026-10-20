@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 import { eq } from "drizzle-orm";
 import { db } from "../../../db";
 import { users } from "../../../db/schema";
@@ -16,10 +17,12 @@ import type { ToolContext, ToolResult } from "../types";
 
 export async function isAdminUser(userId: string | null | undefined): Promise<boolean> {
 	if (!userId) return false;
-	const user = await db.query.users.findFirst({
-		where: eq(users.id, userId),
-		columns: { role: true },
-	});
+	const user = await readQuery(
+		db.query.users.findFirst({
+			where: eq(users.id, userId),
+			columns: { role: true },
+		}),
+	);
 	return user?.role === "admin";
 }
 

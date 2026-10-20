@@ -132,7 +132,7 @@ function restartReconciliation(): void {
 }
 
 describe("empty namespace reset admission", () => {
-	test("rebinds only an unverified empty catalog and fences old handles", () => {
+	test("rebinds only an unverified empty catalog and fences old handles", async () => {
 		ready(71);
 		const oldGeneration = generation;
 		generation = catalog.initializeNamespace({ expectedGeneration: generation }).generation;
@@ -149,7 +149,10 @@ describe("empty namespace reset admission", () => {
 			quotaBytes: 71,
 			status: "ready",
 		});
-		expectCode(() => catalog.getBudget(), "namespace_mismatch");
+		await expect(catalog.getBudget()).rejects.toMatchObject({
+			name: "FileChangeBlobCatalogError",
+			code: "namespace_mismatch",
+		});
 	});
 
 	test("never admits a reset until associated cache metadata is cleared", () => {
@@ -164,8 +167,8 @@ describe("empty namespace reset admission", () => {
 });
 
 describe("blob catalog namespace and admission", () => {
-	test("new and reinitialized namespaces are unverified; no implicit worker exists", () => {
-		expect(catalog.getBudget()).toBeNull();
+	test("new and reinitialized namespaces are unverified; no implicit worker exists", async () => {
+		expect(await catalog.getBudget()).toBeNull();
 		expectCode(() => reserve(), "namespace_unverified");
 		const initial = catalog.initializeNamespace({ expectedGeneration: null });
 		expect(initial).toMatchObject({
@@ -192,19 +195,21 @@ describe("blob catalog namespace and admission", () => {
 			reservedBytes: 0,
 			generation: generation + 1,
 		});
-		expectCode(
-			() => catalog.getMetadata({ expectedGeneration: restarted.generation, ref: refFor() }),
-			"namespace_unverified",
-		);
+		await expect(
+			catalog.getMetadata({ expectedGeneration: restarted.generation, ref: refFor() }),
+		).rejects.toMatchObject({ name: "FileChangeBlobCatalogError", code: "namespace_unverified" });
 		expectCode(() => reserve(), "generation_mismatch");
 		expect("readBytes" in catalog).toBe(false);
 		expect("delete" in catalog).toBe(false);
 	});
 
-	test("another namespace cannot get a second budget in the same database", () => {
+	test("another namespace cannot get a second budget in the same database", async () => {
 		ready();
 		const other = new FileChangeBlobCatalog({ db, namespaceKey: "another-store" });
-		expectCode(() => other.getBudget(), "namespace_mismatch");
+		await expect(other.getBudget()).rejects.toMatchObject({
+			name: "FileChangeBlobCatalogError",
+			code: "namespace_mismatch",
+		});
 		expectCode(
 			() => other.initializeNamespace({ expectedGeneration: generation }),
 			"namespace_mismatch",
@@ -249,25 +254,25 @@ describe("blob catalog namespace and admission", () => {
 		}
 		expect(attempts.filter((value) => value.status === "fulfilled")).toHaveLength(1);
 		expect(attempts.filter((value) => value.status === "rejected")).toHaveLength(1);
-		expect(catalog.getBudget()).toMatchObject({ usedBytes: 0, reservedBytes: 6 });
+		expect(await catalog.getBudget()).toMatchObject({ usedBytes: 0, reservedBytes: 6 });
 		expect(queries.some((query) => /\b(SUM|COUNT|GROUP BY)\b/i.test(query))).toBe(false);
 		const admitted = attempts[0];
 		if (admitted?.status !== "fulfilled") throw new Error("Expected first reservation");
 		await admitted.value.release(emptyRelease);
-		expect(catalog.getBudget()?.reservedBytes).toBe(0);
+		expect((await catalog.getBudget())?.reservedBytes).toBe(0);
 	});
 
-	test("reservation insertion and counter increment roll back together", () => {
+	test("reservation insertion and counter increment roll back together", async () => {
 		ready(10);
 		sqlite.exec(
 			`CREATE TRIGGER fail_counter BEFORE UPDATE OF reserved_bytes ON file_change_storage_budgets BEGIN SELECT RAISE(ABORT, 'counter-fault'); END;`,
 		);
 		expect(() => reserve(6)).toThrow();
-		expect(catalog.getBudget()?.reservedBytes).toBe(0);
+		expect((await catalog.getBudget())?.reservedBytes).toBe(0);
 		expect(db.select().from(reservations).all()).toHaveLength(0);
 	});
 
-	test("independent SQLite connections fail fast on locks and share atomic quota counters", () => {
+	test("independent SQLite connections fail fast on locks and share atomic quota counters", async () => {
 		const path = join(sandbox, "competing-catalog.db");
 		const first = connection(path);
 		extraConnections.push(first);
@@ -291,15 +296,15 @@ describe("blob catalog namespace and admission", () => {
 		} finally {
 			first.exec("ROLLBACK");
 		}
-		expect(b.getBudget()?.reservedBytes).toBe(0);
+		expect((await b.getBudget())?.reservedBytes).toBe(0);
 		const lease = b.reserve(request);
-		expect(a.getBudget()?.reservedBytes).toBe(6);
+		expect((await a.getBudget())?.reservedBytes).toBe(6);
 		expectCode(() => a.reserve(request), "quota_exceeded");
 		lease.release(emptyRelease);
-		expect(a.getBudget()?.reservedBytes).toBe(0);
+		expect((await a.getBudget())?.reservedBytes).toBe(0);
 	});
 
-	test("abort/invalid bounds reserve no bytes and release ignores the aborted signal", () => {
+	test("abort/invalid bounds reserve no bytes and release ignores the aborted signal", async () => {
 		ready();
 		const controller = new AbortController();
 		const admission = catalog.admission({
@@ -313,10 +318,10 @@ describe("blob catalog namespace and admission", () => {
 		expectCode(() => admission.reserve({ expectedSize: 3, signal: controller.signal }), "aborted");
 		for (const size of [-1, 0.1, Number.NaN, FILE_CHANGE_LIMITS.blobBytes + 1])
 			expectCode(() => reserve(size), "invalid_input");
-		expect(catalog.getBudget()?.reservedBytes).toBe(0);
+		expect((await catalog.getBudget())?.reservedBytes).toBe(0);
 	});
 
-	test("an over-quota verified namespace keeps existing evidence and refuses writes", () => {
+	test("an over-quota verified namespace keeps existing evidence and refuses writes", async () => {
 		catalog.initializeNamespace({ expectedGeneration: null, quotaBytes: 2 });
 		generation = catalog.beginReconciliation({ expectedGeneration: 0 }).generation;
 		catalog.reconcileBlob({
@@ -330,9 +335,9 @@ describe("blob catalog namespace and admission", () => {
 			verification,
 		});
 		expectCode(() => reserve(0), "quota_exceeded");
-		expect(catalog.getMetadata({ expectedGeneration: generation, ref: refFor() })?.status).toBe(
-			"ready",
-		);
+		expect(
+			(await catalog.getMetadata({ expectedGeneration: generation, ref: refFor() }))?.status,
+		).toBe("ready");
 	});
 
 	test("unsafe SQLite busy waits and missing foreign keys are refused without changing settings", () => {
@@ -345,7 +350,7 @@ describe("blob catalog namespace and admission", () => {
 });
 
 describe("durable exactly-once publication accounting", () => {
-	test("duplicate hashes charge once even if the deduplicating publisher releases first", () => {
+	test("duplicate hashes charge once even if the deduplicating publisher releases first", async () => {
 		ready();
 		const first = reserve();
 		const second = reserve();
@@ -354,7 +359,7 @@ describe("durable exactly-once publication accounting", () => {
 		first.release({ ref, published: true });
 		first.release({ ref, published: true });
 		second.release({ ref, published: false });
-		expect(catalog.getBudget()).toMatchObject({ usedBytes: 3, reservedBytes: 0 });
+		expect(await catalog.getBudget()).toMatchObject({ usedBytes: 3, reservedBytes: 0 });
 		expect(db.select().from(blobs).all()).toHaveLength(1);
 		expect(reservation(first)).toMatchObject({
 			status: "settled",
@@ -363,7 +368,7 @@ describe("durable exactly-once publication accounting", () => {
 			generation,
 		});
 		expect(reservation(second)).toMatchObject({ status: "settled", published: false });
-		expect(catalog.getMetadata({ expectedGeneration: generation, ref })).toMatchObject({
+		expect(await catalog.getMetadata({ expectedGeneration: generation, ref })).toMatchObject({
 			status: "ready",
 			sizeBytes: 3,
 			storageKey: `sha256/${ref.digest.slice(0, 2)}/${ref.digest}`,
@@ -375,13 +380,13 @@ describe("durable exactly-once publication accounting", () => {
 		);
 	});
 
-	test("failed publication refunds once and cannot later claim publication", () => {
+	test("failed publication refunds once and cannot later claim publication", async () => {
 		ready();
 		const lease = reserve();
 		lease.release(emptyRelease);
 		lease.release(emptyRelease);
 		catalog.retryRelease(lease, emptyRelease);
-		expect(catalog.getBudget()).toMatchObject({ usedBytes: 0, reservedBytes: 0 });
+		expect(await catalog.getBudget()).toMatchObject({ usedBytes: 0, reservedBytes: 0 });
 		expect(reservation(lease)).toMatchObject({
 			status: "settled",
 			blobDigest: null,
@@ -391,7 +396,7 @@ describe("durable exactly-once publication accounting", () => {
 		expect(db.select().from(blobs).all()).toHaveLength(0);
 	});
 
-	test("SQL failure after publication preserves staging and a durable result for retry", () => {
+	test("SQL failure after publication preserves staging and a durable result for retry", async () => {
 		ready();
 		const lease = reserve();
 		const result = { ref: refFor(), published: true };
@@ -403,20 +408,20 @@ describe("durable exactly-once publication accounting", () => {
 			published: true,
 			settledAt: null,
 		});
-		expect(catalog.getBudget()).toMatchObject({ usedBytes: 0, reservedBytes: 3 });
-		expect(catalog.getMetadata({ expectedGeneration: generation, ref: result.ref })?.status).toBe(
-			"staging",
-		);
+		expect(await catalog.getBudget()).toMatchObject({ usedBytes: 0, reservedBytes: 3 });
+		expect(
+			(await catalog.getMetadata({ expectedGeneration: generation, ref: result.ref }))?.status,
+		).toBe("staging");
 		sqlite.exec("DROP TRIGGER fail_settlement;");
 		lease.release(result);
 		lease.release(result);
-		expect(catalog.getBudget()).toMatchObject({ usedBytes: 3, reservedBytes: 0 });
-		expect(catalog.getMetadata({ expectedGeneration: generation, ref: result.ref })?.status).toBe(
-			"ready",
-		);
+		expect(await catalog.getBudget()).toMatchObject({ usedBytes: 3, reservedBytes: 0 });
+		expect(
+			(await catalog.getMetadata({ expectedGeneration: generation, ref: result.ref }))?.status,
+		).toBe("ready");
 	});
 
-	test("SQL failure before catalog insert keeps reservation; retry cannot double-spend", () => {
+	test("SQL failure before catalog insert keeps reservation; retry cannot double-spend", async () => {
 		ready();
 		const lease = reserve();
 		sqlite.exec(
@@ -429,13 +434,13 @@ describe("durable exactly-once publication accounting", () => {
 			published: null,
 		});
 		expect(db.select().from(blobs).all()).toHaveLength(0);
-		expect(catalog.getBudget()?.reservedBytes).toBe(3);
+		expect((await catalog.getBudget())?.reservedBytes).toBe(3);
 		sqlite.exec("DROP TRIGGER fail_blob;");
 		lease.release({ ref: refFor(), published: true });
-		expect(catalog.getBudget()).toMatchObject({ usedBytes: 3, reservedBytes: 0 });
+		expect(await catalog.getBudget()).toMatchObject({ usedBytes: 3, reservedBytes: 0 });
 	});
 
-	test("a failed recovery marker does not fake a refund or delete any reservation", () => {
+	test("a failed recovery marker does not fake a refund or delete any reservation", async () => {
 		ready();
 		const lease = reserve();
 		sqlite.exec(
@@ -443,10 +448,10 @@ describe("durable exactly-once publication accounting", () => {
 		);
 		expect(() => lease.release({ ref: refFor(), published: true })).toThrow(AggregateError);
 		expect(reservation(lease)).toMatchObject({ status: "reserved", published: null });
-		expect(catalog.getBudget()).toMatchObject({ usedBytes: 0, reservedBytes: 3 });
+		expect(await catalog.getBudget()).toMatchObject({ usedBytes: 0, reservedBytes: 3 });
 	});
 
-	test("a lost post-commit response is safe to replay", () => {
+	test("a lost post-commit response is safe to replay", async () => {
 		ready();
 		const lease = reserve();
 		const original = db.transaction.bind(db);
@@ -465,10 +470,10 @@ describe("durable exactly-once publication accounting", () => {
 		}
 		expect(reservation(lease)?.status).toBe("settled");
 		lease.release({ ref: refFor(), published: true });
-		expect(catalog.getBudget()).toMatchObject({ usedBytes: 3, reservedBytes: 0 });
+		expect(await catalog.getBudget()).toMatchObject({ usedBytes: 3, reservedBytes: 0 });
 	});
 
-	test("another publisher can complete a pending same-hash intent without double billing", () => {
+	test("another publisher can complete a pending same-hash intent without double billing", async () => {
 		ready();
 		const a = reserve();
 		const b = reserve();
@@ -476,17 +481,17 @@ describe("durable exactly-once publication accounting", () => {
 		expect(() => a.release({ ref: refFor(), published: true })).toThrow();
 		sqlite.exec("DROP TRIGGER fail_settlement;");
 		b.release({ ref: refFor(), published: false });
-		expect(catalog.getBudget()).toMatchObject({ usedBytes: 3, reservedBytes: 3 });
+		expect(await catalog.getBudget()).toMatchObject({ usedBytes: 3, reservedBytes: 3 });
 		a.release({ ref: refFor(), published: true });
-		expect(catalog.getBudget()).toMatchObject({ usedBytes: 3, reservedBytes: 0 });
+		expect(await catalog.getBudget()).toMatchObject({ usedBytes: 3, reservedBytes: 0 });
 	});
 
-	test("mismatched reference size, hash, and relative key retain the reservation", () => {
+	test("mismatched reference size, hash, and relative key retain the reservation", async () => {
 		ready();
 		const lease = reserve(4);
 		expectCode(() => lease.release({ ref: refFor(), published: true }), "size_mismatch");
 		expect(reservation(lease)?.status).toBe("reconcile_required");
-		expect(catalog.getBudget()?.reservedBytes).toBe(4);
+		expect((await catalog.getBudget())?.reservedBytes).toBe(4);
 		const good = reserve();
 		good.release({ ref: refFor(), published: true });
 		const hashMismatch = reserve(4);
@@ -500,10 +505,9 @@ describe("durable exactly-once publication accounting", () => {
 			.run();
 		const keyMismatch = reserve();
 		expectCode(() => keyMismatch.release({ ref: refFor(), published: false }), "catalog_mismatch");
-		expectCode(
-			() => catalog.getMetadata({ expectedGeneration: generation, ref: refFor() }),
-			"catalog_mismatch",
-		);
+		await expect(
+			catalog.getMetadata({ expectedGeneration: generation, ref: refFor() }),
+		).rejects.toMatchObject({ name: "FileChangeBlobCatalogError", code: "catalog_mismatch" });
 	});
 
 	test("strict refs reject invalid hashes, extra payloads, prototypes and accessors", () => {
@@ -535,7 +539,7 @@ describe("durable exactly-once publication accounting", () => {
 });
 
 describe("explicit maintenance and generation fencing", () => {
-	test("initialization and worker commits must use the exact current generation", () => {
+	test("initialization and worker commits must use the exact current generation", async () => {
 		ready();
 		expectCode(() => catalog.initializeNamespace({ expectedGeneration: 0 }), "generation_mismatch");
 		expectCode(() => catalog.beginReconciliation({ expectedGeneration: 0 }), "generation_mismatch");
@@ -558,10 +562,10 @@ describe("explicit maintenance and generation fencing", () => {
 				}),
 			"generation_mismatch",
 		);
-		expect(catalog.getBudget()?.status).toBe("reconciling");
+		expect((await catalog.getBudget())?.status).toBe("reconciling");
 	});
 
-	test("fencing preserves in-flight bytes and only terminal proof can resolve an old owner", () => {
+	test("fencing preserves in-flight bytes and only terminal proof can resolve an old owner", async () => {
 		ready();
 		const lease = reserve();
 		restartReconciliation();
@@ -606,18 +610,22 @@ describe("explicit maintenance and generation fencing", () => {
 			verifiedUsedBytes: 0,
 			verification,
 		});
-		expect(catalog.getBudget()).toMatchObject({ usedBytes: 0, reservedBytes: 0, status: "ready" });
+		expect(await catalog.getBudget()).toMatchObject({
+			usedBytes: 0,
+			reservedBytes: 0,
+			status: "ready",
+		});
 		expectCode(
 			() => catalog.retryRelease({ ...lease, generation }, emptyRelease),
 			"generation_mismatch",
 		);
 	});
 
-	test("zero-byte crash reservations also block completion and cannot be guessed away", () => {
+	test("zero-byte crash reservations also block completion and cannot be guessed away", async () => {
 		ready();
 		const lease = reserve(0);
 		restartReconciliation();
-		expect(catalog.getBudget()?.reservedBytes).toBe(0);
+		expect((await catalog.getBudget())?.reservedBytes).toBe(0);
 		expectCode(
 			() =>
 				catalog.completeReconciliation({
@@ -630,7 +638,7 @@ describe("explicit maintenance and generation fencing", () => {
 		expect(reservation(lease)?.status).toBe("reserved");
 	});
 
-	test("published unresolved reservations cannot be reconciled as unpublished failures", () => {
+	test("published unresolved reservations cannot be reconciled as unpublished failures", async () => {
 		ready();
 		const lease = reserve();
 		stopSettlement();
@@ -658,17 +666,20 @@ describe("explicit maintenance and generation fencing", () => {
 			verifiedUsedBytes: 3,
 			verification,
 		});
-		expect(catalog.getBudget()).toMatchObject({ usedBytes: 3, reservedBytes: 0, status: "ready" });
+		expect(await catalog.getBudget()).toMatchObject({
+			usedBytes: 3,
+			reservedBytes: 0,
+			status: "ready",
+		});
 	});
 
-	test("old ready/missing/expired metadata cannot bypass namespace verification or resurrect evidence", () => {
+	test("old ready/missing/expired metadata cannot bypass namespace verification or resurrect evidence", async () => {
 		ready();
 		reserve().release({ ref: refFor(), published: true });
 		restartReconciliation();
-		expectCode(
-			() => catalog.getMetadata({ expectedGeneration: generation, ref: refFor() }),
-			"namespace_unverified",
-		);
+		await expect(
+			catalog.getMetadata({ expectedGeneration: generation, ref: refFor() }),
+		).rejects.toMatchObject({ name: "FileChangeBlobCatalogError", code: "namespace_unverified" });
 		catalog.reconcileBlob({
 			expectedGeneration: generation,
 			ref: refFor(),
@@ -681,10 +692,10 @@ describe("explicit maintenance and generation fencing", () => {
 		});
 		const lease = reserve();
 		expectCode(() => lease.release({ ref: refFor(), published: true }), "reconciliation_required");
-		expect(catalog.getMetadata({ expectedGeneration: generation, ref: refFor() })?.status).toBe(
-			"missing",
-		);
-		expect(catalog.getBudget()?.reservedBytes).toBe(3);
+		expect(
+			(await catalog.getMetadata({ expectedGeneration: generation, ref: refFor() }))?.status,
+		).toBe("missing");
+		expect((await catalog.getBudget())?.reservedBytes).toBe(3);
 		db.update(blobs).set({ status: "expired" }).where(eq(blobs.digest, refFor().digest)).run();
 		restartReconciliation();
 		expect(
@@ -696,7 +707,7 @@ describe("explicit maintenance and generation fencing", () => {
 		).toBe("expired");
 	});
 
-	test("a counter mismatch is retained for investigation, never overwritten with zero", () => {
+	test("a counter mismatch is retained for investigation, never overwritten with zero", async () => {
 		ready();
 		db.update(budgets)
 			.set({ reservedBytes: 7 })
@@ -712,17 +723,17 @@ describe("explicit maintenance and generation fencing", () => {
 				}),
 			"reconciliation_required",
 		);
-		expect(catalog.getBudget()?.reservedBytes).toBe(7);
+		expect((await catalog.getBudget())?.reservedBytes).toBe(7);
 	});
 
-	test("bounded keyset pages preserve all old owners without TTL release", () => {
+	test("bounded keyset pages preserve all old owners without TTL release", async () => {
 		ready(1000);
 		const leases = Array.from({ length: 205 }, () => reserve(1, "dead-owner"));
 		db.update(reservations).set({ createdAt: "2000-01-01T00:00:00.000Z" }).run();
 		const seen = new Set<string>();
 		let cursor: { createdAt: string; id: string } | undefined;
 		for (let pageIndex = 0; pageIndex < 3; pageIndex++) {
-			const page = catalog.listReservations({
+			const page = await catalog.listReservations({
 				expectedGeneration: generation,
 				status: "reserved",
 				after: cursor,
@@ -733,16 +744,10 @@ describe("explicit maintenance and generation fencing", () => {
 		}
 		expect(cursor).toBeUndefined();
 		expect(seen.size).toBe(leases.length);
-		expect(catalog.getBudget()?.reservedBytes).toBe(205);
-		expectCode(
-			() =>
-				catalog.listReservations({
-					expectedGeneration: generation,
-					status: "reserved",
-					limit: 101,
-				}),
-			"invalid_input",
-		);
+		expect((await catalog.getBudget())?.reservedBytes).toBe(205);
+		await expect(
+			catalog.listReservations({ expectedGeneration: generation, status: "reserved", limit: 101 }),
+		).rejects.toMatchObject({ name: "FileChangeBlobCatalogError", code: "invalid_input" });
 		const query = queries.filter((value) => value.includes("order by")).at(-1);
 		expect(query).toContain(
 			'("file_change_blob_reservations"."created_at", "file_change_blob_reservations"."id") >',
@@ -758,7 +763,7 @@ describe("explicit maintenance and generation fencing", () => {
 		).toBe(false);
 	});
 
-	test("post-publication SQL failure survives a process-style reopen for explicit worker settlement", () => {
+	test("post-publication SQL failure survives a process-style reopen for explicit worker settlement", async () => {
 		const path = join(sandbox, "crashed-publication.db");
 		const first = connection(path);
 		first.exec(DDL);
@@ -782,7 +787,7 @@ describe("explicit maintenance and generation fencing", () => {
 		const b = new FileChangeBlobCatalog({ db: drizzle(reopened), namespaceKey });
 		const initialized = b.initializeNamespace({ expectedGeneration: 1 });
 		expect(initialized).toMatchObject({ usedBytes: 0, reservedBytes: 3, status: "unverified" });
-		const pending = b.listReservations({
+		const pending = await b.listReservations({
 			expectedGeneration: initialized.generation,
 			status: "reconcile_required",
 		});
@@ -805,14 +810,14 @@ describe("explicit maintenance and generation fencing", () => {
 			verifiedUsedBytes: 3,
 			verification,
 		});
-		expect(b.getBudget()).toMatchObject({ usedBytes: 3, reservedBytes: 0, status: "ready" });
+		expect(await b.getBudget()).toMatchObject({ usedBytes: 3, reservedBytes: 0, status: "ready" });
 		expectCode(
 			() => b.retryRelease(lease, { ref: refFor(), published: true }),
 			"generation_mismatch",
 		);
 	});
 
-	test("unfinished reservations survive close/reopen and startup does not clear them", () => {
+	test("unfinished reservations survive close/reopen and startup does not clear them", async () => {
 		const path = join(sandbox, "isolated-catalog.db");
 		const first = connection(path);
 		first.exec(DDL);
@@ -832,7 +837,7 @@ describe("explicit maintenance and generation fencing", () => {
 		const b = new FileChangeBlobCatalog({ db: drizzle(reopened), namespaceKey });
 		const initialized = b.initializeNamespace({ expectedGeneration: 1 });
 		expect(initialized).toMatchObject({ reservedBytes: 6, usedBytes: 0, status: "unverified" });
-		const rows = b.listReservations({
+		const rows = await b.listReservations({
 			expectedGeneration: initialized.generation,
 			status: "reserved",
 		});
@@ -864,10 +869,10 @@ describe("real low-level store integration in an isolated directory", () => {
 		);
 		expect(attempts.filter((value) => value.status === "fulfilled")).toHaveLength(1);
 		expect(attempts.filter((value) => value.status === "rejected")).toHaveLength(1);
-		expect(catalog.getBudget()).toMatchObject({ usedBytes: 6, reservedBytes: 0 });
+		expect(await catalog.getBudget()).toMatchObject({ usedBytes: 6, reservedBytes: 0 });
 		const small = Buffer.from("abc");
 		const ref = await physical.putBytes(small, { expectedSize: small.length });
-		expect(catalog.getBudget()?.usedBytes).toBe(9);
+		expect((await catalog.getBudget())?.usedBytes).toBe(9);
 		// Admission also budgets dedup's temporary bytes; it cannot assume a hash is present.
 		await expect(physical.putBytes(small, { expectedSize: small.length })).rejects.toMatchObject({
 			code: "quota_exceeded",
@@ -882,11 +887,11 @@ describe("real low-level store integration in an isolated directory", () => {
 		const first = await physical.putBytes(bytes, { expectedSize: bytes.length });
 		const duplicate = await physical.putBytes(bytes, { expectedSize: bytes.length });
 		expect(duplicate).toEqual(first);
-		expect(catalog.getBudget()).toMatchObject({ usedBytes: bytes.length, reservedBytes: 0 });
+		expect(await catalog.getBudget()).toMatchObject({ usedBytes: bytes.length, reservedBytes: 0 });
 		await expect(
 			physical.putBytes(bytes, { expectedSize: bytes.length, expectedDigest: "f".repeat(64) }),
 		).rejects.toMatchObject({ code: "hash_mismatch" });
-		expect(catalog.getBudget()).toMatchObject({ usedBytes: bytes.length, reservedBytes: 0 });
+		expect(await catalog.getBudget()).toMatchObject({ usedBytes: bytes.length, reservedBytes: 0 });
 	});
 
 	test("post-publication SQL failure leaves physical bytes plus a retryable reservation", async () => {
@@ -920,10 +925,10 @@ describe("real low-level store integration in an isolated directory", () => {
 			await readFile(join(sandbox, "blobs", "sha256", ref.digest.slice(0, 2), ref.digest)),
 		).toEqual(bytes);
 		expect(reservation(captured.lease)?.status).toBe("reconcile_required");
-		expect(catalog.getBudget()).toMatchObject({ usedBytes: 0, reservedBytes: bytes.length });
+		expect(await catalog.getBudget()).toMatchObject({ usedBytes: 0, reservedBytes: bytes.length });
 		sqlite.exec("DROP TRIGGER fail_settlement;");
 		captured.lease.release(captured.result);
-		expect(catalog.getBudget()).toMatchObject({ usedBytes: bytes.length, reservedBytes: 0 });
+		expect(await catalog.getBudget()).toMatchObject({ usedBytes: bytes.length, reservedBytes: 0 });
 		expect(await physical.readBytes(ref)).toEqual(new Uint8Array(bytes));
 	});
 });

@@ -9,9 +9,10 @@ import type {
 	ToolEditPreviewSide,
 	ToolEditPreviewUnavailableReason,
 } from "@shared/tool-edit-preview";
-import { type AnyColumn, and, eq, sql } from "drizzle-orm";
+import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import { narratorToolCalls, worktreeTreeSnapshots } from "../db/schema";
+import { readQueryFirst } from "../db/worker-read";
 import { logger } from "../lib/logger";
 import { FileChangeBlobStore, FileChangeBlobStoreError } from "./file-change-blob-store";
 import {
@@ -24,48 +25,21 @@ import { createFileChangeIdentity, fileChangeIdentityKey } from "./file-change-i
 import { worktreeTreeSnapshot } from "./worktree-tree-snapshot";
 
 const PREVIEW_TIMEOUT_MS = 5_000;
-const METADATA_BYTES = FILE_CHANGE_LIMITS.metadataBytes;
 
-function boundedText(column: AnyColumn) {
-	return sql<
-		string | null
-	>`CASE WHEN octet_length(${column}) <= ${METADATA_BYTES} THEN ${column} ELSE NULL END`;
-}
+import { toolEditPreviewColumns } from "./narrator-read-tool-preview";
 
-// Never load inputJson/outputJson: the model's edit strings are not historical evidence.
-// Location extraction is separately capped before SQLite attempts to parse JSON.
-export const toolEditPreviewColumns = {
-	id: narratorToolCalls.id,
-	narratorId: narratorToolCalls.narratorId,
-	messageId: narratorToolCalls.messageId,
-	toolUseId: narratorToolCalls.toolUseId,
-	toolName: narratorToolCalls.toolName,
-	executionIdentityVersion: narratorToolCalls.executionIdentityVersion,
-	executionOriginToolCallId: narratorToolCalls.executionOriginToolCallId,
-	executionAttempt: narratorToolCalls.executionAttempt,
-	fileChangeOperationId: narratorToolCalls.fileChangeOperationId,
-	executionDeviceId: boundedText(narratorToolCalls.executionDeviceId),
-	executionCwd: boundedText(narratorToolCalls.executionCwd),
-	executionPathFlavor: narratorToolCalls.executionPathFlavor,
-	resolvedFilePath: boundedText(narratorToolCalls.resolvedFilePath),
-	canonicalFilePath: boundedText(narratorToolCalls.canonicalFilePath),
-	runtimeGeneration: narratorToolCalls.runtimeGeneration,
-	treeHashBefore: boundedText(narratorToolCalls.treeHashBefore),
-	treeHashAfter: boundedText(narratorToolCalls.treeHashAfter),
-	locationJson: sql<string | null>`CASE
-		WHEN octet_length(${narratorToolCalls.outputJson}) <= ${64 * 1024}
-		THEN CASE WHEN json_valid(${narratorToolCalls.outputJson})
-			THEN json_extract(${narratorToolCalls.outputJson}, '$._metadata') END
-		END`,
-};
+export { toolEditPreviewColumns } from "./narrator-read-tool-preview";
 
-export type ToolEditPreviewMetadata = ReturnType<typeof readOrigin>;
+export type ToolEditPreviewMetadata = Awaited<ReturnType<typeof readOrigin>>;
 function readOrigin(id: string) {
-	return db
-		.select(toolEditPreviewColumns)
-		.from(narratorToolCalls)
-		.where(eq(narratorToolCalls.id, id))
-		.get();
+	return readQueryFirst(
+		db
+			.select(toolEditPreviewColumns)
+			.from(narratorToolCalls)
+			.where(eq(narratorToolCalls.id, id))
+			.limit(1),
+		{ site: "toolEditPreview.origin" },
+	);
 }
 type ToolRow = NonNullable<ToolEditPreviewMetadata>;
 
@@ -91,7 +65,10 @@ function locationOf(value: string | null): ToolEditPreview["location"] {
 	return undefined;
 }
 
-function operationMatches(row: ToolRow, operation: FileChangeOperationRecord): boolean {
+async function operationMatches(
+	row: ToolRow,
+	operation: FileChangeOperationRecord,
+): Promise<boolean> {
 	const originId = row.executionOriginToolCallId ?? row.id;
 	if (
 		row.executionIdentityVersion !== 1 ||
@@ -109,7 +86,7 @@ function operationMatches(row: ToolRow, operation: FileChangeOperationRecord): b
 	// COW retains the immutable original PK even after the original row is deleted.
 	// If it still exists, verify the whole frozen source binding, not just a SDK ID.
 	if (row.executionOriginToolCallId) {
-		const original = readOrigin(originId);
+		const original = await readOrigin(originId);
 		if (
 			original &&
 			(original.executionOriginToolCallId !== null ||
@@ -118,7 +95,7 @@ function operationMatches(row: ToolRow, operation: FileChangeOperationRecord): b
 				original.canonicalFilePath !== row.canonicalFilePath ||
 				original.resolvedFilePath !== row.resolvedFilePath ||
 				original.executionPathFlavor !== row.executionPathFlavor ||
-				!operationMatches(original, operation))
+				!(await operationMatches(original, operation)))
 		)
 			return false;
 	} else if (operation.narratorId !== row.narratorId) return false;
@@ -234,18 +211,20 @@ async function treePreview(
 	const root = resolve(cwd);
 	const side = async (hash: string | null): Promise<ToolEditPreviewSide> => {
 		if (!hash || !/^[a-f0-9]{40,64}$/.test(hash)) return unavailable("missing_evidence");
-		const recorded = db
-			.select({ id: worktreeTreeSnapshots.id })
-			.from(worktreeTreeSnapshots)
-			.where(
-				and(
-					eq(worktreeTreeSnapshots.deviceId, row.executionDeviceId as string),
-					eq(worktreeTreeSnapshots.worktreePath, root),
-					eq(worktreeTreeSnapshots.treeHash, hash),
-				),
-			)
-			.limit(1)
-			.get();
+		const recorded = await readQueryFirst(
+			db
+				.select({ id: worktreeTreeSnapshots.id })
+				.from(worktreeTreeSnapshots)
+				.where(
+					and(
+						eq(worktreeTreeSnapshots.deviceId, row.executionDeviceId as string),
+						eq(worktreeTreeSnapshots.worktreePath, root),
+						eq(worktreeTreeSnapshots.treeHash, hash),
+					),
+				)
+				.limit(1),
+			{ site: "toolEditPreview.treeEvidence", signal },
+		);
 		if (!recorded) return unavailable("missing_evidence");
 		return worktreeTreeSnapshot.readFilePreviewAtTree(
 			root,
@@ -295,16 +274,16 @@ export async function getToolEditPreview(
 		if (signal.aborted) return reject("cancelled");
 		if (!row.fileChangeOperationId) return { ...result, ...(await treePreview(row, signal)) };
 		const evidence = new FileChangeEvidenceService(db);
-		const operation = evidence.getOperation(row.fileChangeOperationId);
+		const operation = await evidence.getOperation(row.fileChangeOperationId);
 		if (!operation) return reject("missing_evidence");
-		if (!operationMatches(row, operation)) return reject("identity_unverified");
+		if (!(await operationMatches(row, operation))) return reject("identity_unverified");
 		// Edit/Write mutate one file. Fail closed rather than choosing the first effect
 		// or traversing an arbitrarily large operation (including compensation phases).
-		const page = evidence.listEffects(operation.id, { limit: 2 });
+		const page = await evidence.listEffects(operation.id, { limit: 2 });
 		if (page.hasMore || page.items.length > 1) return reject("ambiguous");
 		const effect = page.items[0];
 		if (!effect) return reject("missing_evidence");
-		if (!effectMatches(row, operation, effect, evidence.getScope(effect.scopeId))) {
+		if (!effectMatches(row, operation, effect, await evidence.getScope(effect.scopeId))) {
 			return reject("identity_unverified");
 		}
 		const blobs = new FileChangeBlobStore();

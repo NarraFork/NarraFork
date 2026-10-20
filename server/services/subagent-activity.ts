@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 import { desc, eq, sql } from "drizzle-orm";
 import { db } from "../db";
 import { narratorToolCalls } from "../db/schema";
@@ -168,42 +169,44 @@ export async function getRecentSubagentToolActivity(
 	limit = RECENT_ACTIVITY_LIMIT,
 ): Promise<SubagentToolActivity[]> {
 	const boundedLimit = Math.min(Math.max(Math.trunc(limit), 1), MAX_ACTIVITY_ROWS);
-	const rows = await db
-		.select({
-			toolName: narratorToolCalls.toolName,
-			status: narratorToolCalls.status,
-			createdAt: narratorToolCalls.createdAt,
-			streamStartedAt: narratorToolCalls.streamStartedAt,
-			permissionStartedAt: narratorToolCalls.permissionStartedAt,
-			executionStartedAt: narratorToolCalls.executionStartedAt,
-			completedAt: narratorToolCalls.completedAt,
-			description: boundedJsonText("$.description"),
-			filePath: boundedJsonText("$.file_path"),
-			path: boundedJsonText("$.path"),
-			pattern: boundedJsonText("$.pattern"),
-			query: boundedJsonText("$.query"),
-			url: boundedJsonText("$.url"),
-			mode: boundedJsonText("$.mode"),
-			action: boundedJsonText("$.action"),
-			targetId: boundedJsonText("$.id"),
-			targetName: boundedJsonText("$.name"),
-			awaitType: boundedJsonText("$.type"),
-			subagentType: boundedJsonText("$.subagent_type"),
-			skillName: boundedJsonText("$.skill"),
-			device: boundedJsonText("$.device"),
-			direction: boundedJsonText("$.direction"),
-			localPath: boundedJsonText("$.localPath"),
-			remotePath: boundedJsonText("$.remotePath"),
-			questionHeader: boundedJsonText("$.questions[0].header"),
-			resourceId: boundedJsonText("$.entryId"),
-			// ScheduledTask's create/update carry the human-readable name here. Bounded
-			// like every other field; the prompt body is never selected.
-			taskName: boundedJsonText("$.task.name"),
-		})
-		.from(narratorToolCalls)
-		.where(eq(narratorToolCalls.narratorId, narratorId))
-		.orderBy(desc(narratorToolCalls.createdAt))
-		.limit(boundedLimit);
+	const rows = await readQuery(
+		db
+			.select({
+				toolName: narratorToolCalls.toolName,
+				status: narratorToolCalls.status,
+				createdAt: narratorToolCalls.createdAt,
+				streamStartedAt: narratorToolCalls.streamStartedAt,
+				permissionStartedAt: narratorToolCalls.permissionStartedAt,
+				executionStartedAt: narratorToolCalls.executionStartedAt,
+				completedAt: narratorToolCalls.completedAt,
+				description: boundedJsonText("$.description"),
+				filePath: boundedJsonText("$.file_path"),
+				path: boundedJsonText("$.path"),
+				pattern: boundedJsonText("$.pattern"),
+				query: boundedJsonText("$.query"),
+				url: boundedJsonText("$.url"),
+				mode: boundedJsonText("$.mode"),
+				action: boundedJsonText("$.action"),
+				targetId: boundedJsonText("$.id"),
+				targetName: boundedJsonText("$.name"),
+				awaitType: boundedJsonText("$.type"),
+				subagentType: boundedJsonText("$.subagent_type"),
+				skillName: boundedJsonText("$.skill"),
+				device: boundedJsonText("$.device"),
+				direction: boundedJsonText("$.direction"),
+				localPath: boundedJsonText("$.localPath"),
+				remotePath: boundedJsonText("$.remotePath"),
+				questionHeader: boundedJsonText("$.questions[0].header"),
+				resourceId: boundedJsonText("$.entryId"),
+				// ScheduledTask's create/update carry the human-readable name here. Bounded
+				// like every other field; the prompt body is never selected.
+				taskName: boundedJsonText("$.task.name"),
+			})
+			.from(narratorToolCalls)
+			.where(eq(narratorToolCalls.narratorId, narratorId))
+			.orderBy(desc(narratorToolCalls.createdAt))
+			.limit(boundedLimit),
+	);
 
 	return rows.map((row) => ({
 		at: selectActivityTimestamp(row),

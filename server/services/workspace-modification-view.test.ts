@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -12,6 +12,8 @@ import {
 	users,
 } from "../db/schema";
 import { generateId } from "../lib/id";
+import { type DiagnosticRecord, RequestDiagnostics } from "../lib/request-diagnostics";
+import { sqlExecutionDiagnostics } from "../lib/sql-execution-diagnostics";
 import { recordAttribution, recordAttributions } from "./file-attribution-service";
 import { normalizeWorkspacePath } from "./git-workspace";
 import {
@@ -133,6 +135,58 @@ afterEach(async () => {
 });
 
 describe("unified workspace modification view", () => {
+	test("history query labels and read/map/sort phases preserve both projections", async () => {
+		const workspace = makeWorkspace("private-history-");
+		await record({
+			workspacePath: workspace,
+			filePath: "private-file.ts",
+			narratorId: null,
+			action: "external",
+		});
+		let clock = 0;
+		const records: DiagnosticRecord[] = [];
+		const diagnostics = new RequestDiagnostics(
+			(record) => records.push(record),
+			() => (clock += 100),
+		);
+		diagnostics.start();
+		const sites: string[] = [];
+		const original =
+			sqlExecutionDiagnostics.beginReadWorkerDiagnostic.bind(sqlExecutionDiagnostics);
+		const observe = spyOn(sqlExecutionDiagnostics, "beginReadWorkerDiagnostic").mockImplementation(
+			(site) => {
+				if (site) sites.push(site);
+				return original(site);
+			},
+		);
+		try {
+			for (const filePaths of [undefined, ["private-file.ts"]]) {
+				const options = { filePaths, projection: "byFile" as const };
+				const expected = await getWorkspaceModificationView(workspace, options);
+				expect(
+					await diagnostics.request(
+						"/api/narrators/private/git/modifications",
+						() => getWorkspaceModificationView(workspace, options),
+						() => ({ status: 200, cancelled: false }),
+					),
+				).toEqual(expected);
+				diagnostics.tick(clock + 1, 0);
+				clock += 10_000; // Preserve the existing per-route diagnostic rate limit.
+			}
+			expect(sites).toContain("modifications.history.workspace");
+			expect(sites).toContain("modifications.history.perPath");
+			expect(records).toHaveLength(2);
+			for (const record of records) {
+				expect(record.phases["modifications.history.read.await"].count).toBeGreaterThan(0);
+				expect(record.phases["modifications.history.mapFilter"].count).toBeGreaterThan(0);
+				expect(record.phases["modifications.history.sortFilter"].count).toBeGreaterThan(0);
+			}
+			expect(JSON.stringify({ records, sites })).not.toMatch(/private|SELECT/);
+		} finally {
+			observe.mockRestore();
+			diagnostics.stop();
+		}
+	});
 	test("aggregates every actor that touched the directory, not just one narrator", async () => {
 		const ws = makeWorkspace("nf-view-actors-");
 		const alice = await createNarrator("Alice", ws);

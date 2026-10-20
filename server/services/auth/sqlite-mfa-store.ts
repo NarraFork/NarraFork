@@ -16,6 +16,7 @@
  */
 import { db } from "@server/db";
 import { userMfaBackupCodes, userPasskeys, users, userTotp } from "@server/db/schema";
+import { readQuery } from "@server/db/worker-read";
 import { and, eq, isNull } from "drizzle-orm";
 import type {
 	AuthMfaStore,
@@ -86,19 +87,25 @@ function clearFactorsAtomically(tx: DbTransaction, userId: string): void {
 
 export const sqliteAuthMfaStore: AuthMfaStore = {
 	async findTotp(userId: string, status: TotpStatus): Promise<TotpEnrollment | null> {
-		const row = await db.query.userTotp.findFirst({
-			where: and(eq(userTotp.userId, userId), eq(userTotp.status, status)),
-			columns: { status: true, secret: true },
-		});
+		const row = await readQuery(
+			db.query.userTotp.findFirst({
+				where: and(eq(userTotp.userId, userId), eq(userTotp.status, status)),
+				columns: { status: true, secret: true },
+			}),
+			{ site: "server/services/auth/sqlite-mfa-store.read" },
+		);
 		if (!row) return null;
 		return { status: row.status === "active" ? "active" : "pending", secret: row.secret };
 	},
 
 	async findMfaEnabled(userId: string): Promise<boolean> {
-		const row = await db.query.users.findFirst({
-			where: eq(users.id, userId),
-			columns: { mfaEnabled: true },
-		});
+		const row = await readQuery(
+			db.query.users.findFirst({
+				where: eq(users.id, userId),
+				columns: { mfaEnabled: true },
+			}),
+			{ site: "server/services/auth/sqlite-mfa-store.read" },
+		);
 		return !!row?.mfaEnabled;
 	},
 
@@ -107,10 +114,13 @@ export const sqliteAuthMfaStore: AuthMfaStore = {
 	},
 
 	async hasAnyPasskey(userId: string): Promise<boolean> {
-		const row = await db.query.userPasskeys.findFirst({
-			where: eq(userPasskeys.userId, userId),
-			columns: { id: true },
-		});
+		const row = await readQuery(
+			db.query.userPasskeys.findFirst({
+				where: eq(userPasskeys.userId, userId),
+				columns: { id: true },
+			}),
+			{ site: "server/services/auth/sqlite-mfa-store.read" },
+		);
 		return !!row;
 	},
 
@@ -134,18 +144,24 @@ export const sqliteAuthMfaStore: AuthMfaStore = {
 	},
 
 	async countUnusedBackupCodes(userId: string): Promise<number> {
-		const rows = await db.query.userMfaBackupCodes.findMany({
-			where: and(eq(userMfaBackupCodes.userId, userId), isNull(userMfaBackupCodes.usedAt)),
-			columns: { id: true },
-		});
+		const rows = await readQuery(
+			db.query.userMfaBackupCodes.findMany({
+				where: and(eq(userMfaBackupCodes.userId, userId), isNull(userMfaBackupCodes.usedAt)),
+				columns: { id: true },
+			}),
+			{ site: "server/services/auth/sqlite-mfa-store.read" },
+		);
 		return rows.length;
 	},
 
 	async findUnusedBackupCodes(userId: string): Promise<StoredBackupCode[]> {
-		return await db.query.userMfaBackupCodes.findMany({
-			where: and(eq(userMfaBackupCodes.userId, userId), isNull(userMfaBackupCodes.usedAt)),
-			columns: { id: true, codeHash: true },
-		});
+		return await readQuery(
+			db.query.userMfaBackupCodes.findMany({
+				where: and(eq(userMfaBackupCodes.userId, userId), isNull(userMfaBackupCodes.usedAt)),
+				columns: { id: true, codeHash: true },
+			}),
+			{ site: "server/services/auth/sqlite-mfa-store.read" },
+		);
 	},
 
 	async markBackupCodeUsed(id: string, nowIso: string): Promise<boolean> {

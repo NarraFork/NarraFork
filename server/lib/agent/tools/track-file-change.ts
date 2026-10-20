@@ -33,7 +33,7 @@ export async function trackFileChange(
 		if (ctx.parentNarratorId) {
 			const { recordTeamFileChange } = await import("@server/services/narrator-subagent");
 			const remoteCwd = ctx.executionTarget?.cwd ?? backend.defaultCwd;
-			recordTeamFileChange(ctx.parentNarratorId, ctx.narratorId, filePath, {
+			await recordTeamFileChange(ctx.parentNarratorId, ctx.narratorId, filePath, {
 				deviceId: backend.deviceId,
 				workspacePath:
 					backend.kind === "local"

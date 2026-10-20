@@ -441,7 +441,7 @@ function settleGateWaiter(token: string, action: "resolve" | "abort"): void {
 	}
 	const error = new Error("Waiting for the update gate was aborted");
 	error.name = "AbortError";
-	waiter.reject(error);
+	waiter.reject(waiter.signal?.reason ?? error);
 }
 
 function openUpdateGate(): void {
@@ -940,7 +940,7 @@ export async function waitUntilUpdateGateOpens(signal?: AbortSignal): Promise<vo
 	if (signal?.aborted) {
 		const error = new Error("Waiting for the update gate was aborted");
 		error.name = "AbortError";
-		throw error;
+		throw signal.reason ?? error;
 	}
 
 	const token = generateToken("paused_tool");

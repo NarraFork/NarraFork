@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
 import { relative, resolve, sep } from "node:path";
+import { readQuery } from "@server/db/worker-read";
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import { knowledgePackActivations } from "../db/schema";
@@ -127,13 +128,15 @@ function inspectExtraction(destDir: string): { files: string[]; totalBytes: numb
 
 /** Find an active activation row for (narrator, pack), if any. */
 async function findActiveActivation(narratorId: string, packId: string) {
-	return db.query.knowledgePackActivations.findFirst({
-		where: and(
-			eq(knowledgePackActivations.narratorId, narratorId),
-			eq(knowledgePackActivations.packId, packId),
-			eq(knowledgePackActivations.status, "active"),
-		),
-	});
+	return readQuery(
+		db.query.knowledgePackActivations.findFirst({
+			where: and(
+				eq(knowledgePackActivations.narratorId, narratorId),
+				eq(knowledgePackActivations.packId, packId),
+				eq(knowledgePackActivations.status, "active"),
+			),
+		}),
+	);
 }
 
 /**
@@ -260,19 +263,23 @@ async function deactivate(narratorId: string, packId: string): Promise<{ release
 
 /** List a narrator's active activations (with pack name for display). */
 async function listActive(narratorId: string) {
-	const rows = await db.query.knowledgePackActivations.findMany({
-		where: and(
-			eq(knowledgePackActivations.narratorId, narratorId),
-			eq(knowledgePackActivations.status, "active"),
-		),
-		orderBy: (a, { desc: d }) => [d(a.createdAt)],
-	});
+	const rows = await readQuery(
+		db.query.knowledgePackActivations.findMany({
+			where: and(
+				eq(knowledgePackActivations.narratorId, narratorId),
+				eq(knowledgePackActivations.status, "active"),
+			),
+			orderBy: (a, { desc: d }) => [d(a.createdAt)],
+		}),
+	);
 	if (rows.length === 0) return [];
 	const packIds = [...new Set(rows.map((r) => r.packId))];
-	const packs = await db.query.knowledgePacks.findMany({
-		where: (p, { inArray }) => inArray(p.id, packIds),
-		columns: { id: true, name: true, slug: true },
-	});
+	const packs = await readQuery(
+		db.query.knowledgePacks.findMany({
+			where: (p, { inArray }) => inArray(p.id, packIds),
+			columns: { id: true, name: true, slug: true },
+		}),
+	);
 	const byId = new Map(packs.map((p) => [p.id, p]));
 	return rows.map((r) => ({
 		id: r.id,
@@ -285,12 +292,14 @@ async function listActive(narratorId: string) {
 
 /** Release ALL active activations for a narrator (called when the narrator is removed). */
 async function cleanupNarrator(narratorId: string): Promise<void> {
-	const rows = await db.query.knowledgePackActivations.findMany({
-		where: and(
-			eq(knowledgePackActivations.narratorId, narratorId),
-			eq(knowledgePackActivations.status, "active"),
-		),
-	});
+	const rows = await readQuery(
+		db.query.knowledgePackActivations.findMany({
+			where: and(
+				eq(knowledgePackActivations.narratorId, narratorId),
+				eq(knowledgePackActivations.status, "active"),
+			),
+		}),
+	);
 	for (const r of rows) {
 		await releaseActivation(r.id, r.whitelistDirId, r.extractDir);
 	}

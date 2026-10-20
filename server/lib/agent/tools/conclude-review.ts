@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 import { desc, eq } from "drizzle-orm";
 import { z } from "zod/v4";
 import { db } from "../../../db";
@@ -85,15 +86,17 @@ export const concludeReviewTool: ToolDefinition = {
 		}
 
 		// Verify this is a review chapter
-		const chapter = await db.query.chapters.findFirst({
-			where: eq(chapters.id, ctx.chapterId),
-			columns: {
-				id: true,
-				role: true,
-				reviewSourceChapterId: true,
-				reviewStatus: true,
-			},
-		});
+		const chapter = await readQuery(
+			db.query.chapters.findFirst({
+				where: eq(chapters.id, ctx.chapterId),
+				columns: {
+					id: true,
+					role: true,
+					reviewSourceChapterId: true,
+					reviewStatus: true,
+				},
+			}),
+		);
 
 		if (!chapter || chapter.role !== "review") {
 			return {

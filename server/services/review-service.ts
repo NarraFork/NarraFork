@@ -1,5 +1,6 @@
 import { mkdirSync, rmSync } from "node:fs";
 import { dirname, resolve } from "node:path";
+import { readQuery } from "@server/db/worker-read";
 import { formatOriginLabel } from "@shared/message-origin";
 import { and, desc, eq } from "drizzle-orm";
 import { db } from "../db";
@@ -63,9 +64,11 @@ export const reviewService = {
 	 * Forks at the source's HEAD, creates a fresh narrator with review-specific prompt.
 	 */
 	async createReview(sourceChapterId: string, input: CreateReviewInput = {}) {
-		const source = await db.query.chapters.findFirst({
-			where: eq(chapters.id, sourceChapterId),
-		});
+		const source = await readQuery(
+			db.query.chapters.findFirst({
+				where: eq(chapters.id, sourceChapterId),
+			}),
+		);
 		if (!source) throw new NotFoundError("Chapter", sourceChapterId);
 		// Dormant sources are reviewable for the same reason they are forkable: dormant
 		// only means the worktree was removed, and every worktree-dependent step here
@@ -78,9 +81,11 @@ export const reviewService = {
 			throw new ValidationError("Can only review active or dormant chapters");
 		}
 
-		const project = await db.query.projects.findFirst({
-			where: eq(projects.id, source.projectId),
-		});
+		const project = await readQuery(
+			db.query.projects.findFirst({
+				where: eq(projects.id, source.projectId),
+			}),
+		);
 		if (!project?.gitPath) throw new ValidationError("Project has no git repository configured");
 		const gitPath = project.gitPath;
 		return withChapterCreation(project.id, gitPath, async () => {
@@ -109,10 +114,12 @@ export const reviewService = {
 				crossOffset = input.crossOffset;
 			} else {
 				// Find first free slot at this anchor commit
-				const existing = await db
-					.select({ crossOffset: chapters.crossOffset })
-					.from(chapters)
-					.where(eq(chapters.anchorCommitSha, resolvedAnchor));
+				const existing = await readQuery(
+					db
+						.select({ crossOffset: chapters.crossOffset })
+						.from(chapters)
+						.where(eq(chapters.anchorCommitSha, resolvedAnchor)),
+				);
 				const occupied = new Set(
 					existing.map((r) => Math.round((r.crossOffset ?? 0) / NODE_CROSS_SIZE)),
 				);
@@ -387,9 +394,11 @@ export const reviewService = {
 	async checkAndResetGitState(
 		reviewChapterId: string,
 	): Promise<{ clean: boolean; message?: string }> {
-		const chapter = await db.query.chapters.findFirst({
-			where: eq(chapters.id, reviewChapterId),
-		});
+		const chapter = await readQuery(
+			db.query.chapters.findFirst({
+				where: eq(chapters.id, reviewChapterId),
+			}),
+		);
 		if (!chapter || chapter.role !== "review" || !chapter.worktreePath) {
 			return { clean: true };
 		}
@@ -487,9 +496,11 @@ export const reviewService = {
 	 * narrator torn down, so there is no consistent thing left to announce.
 	 */
 	async concludeReview(reviewChapterId: string) {
-		const chapter = await db.query.chapters.findFirst({
-			where: eq(chapters.id, reviewChapterId),
-		});
+		const chapter = await readQuery(
+			db.query.chapters.findFirst({
+				where: eq(chapters.id, reviewChapterId),
+			}),
+		);
 		if (!chapter || chapter.role !== "review") return;
 		if (chapter.reviewStatus !== "reviewing" && chapter.reviewStatus !== "concluded") return;
 		if (!chapter.reviewSourceChapterId) return;
@@ -518,10 +529,12 @@ export const reviewService = {
 	 * Returns null if no structured conclusion was submitted via ConcludeReview tool.
 	 */
 	async getConclusion(reviewChapterId: string) {
-		return db.query.reviewConclusions.findFirst({
-			where: eq(reviewConclusions.reviewChapterId, reviewChapterId),
-			orderBy: [desc(reviewConclusions.createdAt)],
-		});
+		return readQuery(
+			db.query.reviewConclusions.findFirst({
+				where: eq(reviewConclusions.reviewChapterId, reviewChapterId),
+				orderBy: [desc(reviewConclusions.createdAt)],
+			}),
+		);
 	},
 
 	/**
@@ -529,19 +542,23 @@ export const reviewService = {
 	 * Returns the most recent conclusion from any review of this source chapter.
 	 */
 	async getLatestConclusionForSource(sourceChapterId: string) {
-		return db.query.reviewConclusions.findFirst({
-			where: eq(reviewConclusions.sourceChapterId, sourceChapterId),
-			orderBy: [desc(reviewConclusions.createdAt)],
-		});
+		return readQuery(
+			db.query.reviewConclusions.findFirst({
+				where: eq(reviewConclusions.sourceChapterId, sourceChapterId),
+				orderBy: [desc(reviewConclusions.createdAt)],
+			}),
+		);
 	},
 
 	/**
 	 * Dismiss a review — clean up resources and mark as dismissed.
 	 */
 	async dismissReview(reviewChapterId: string) {
-		const chapter = await db.query.chapters.findFirst({
-			where: eq(chapters.id, reviewChapterId),
-		});
+		const chapter = await readQuery(
+			db.query.chapters.findFirst({
+				where: eq(chapters.id, reviewChapterId),
+			}),
+		);
 		if (!chapter || chapter.role !== "review") {
 			throw new ValidationError("Not a review chapter");
 		}
@@ -549,18 +566,22 @@ export const reviewService = {
 			throw new ValidationError("Cannot dismiss a converted review");
 		}
 
-		const project = await db.query.projects.findFirst({
-			where: eq(projects.id, chapter.projectId),
-		});
+		const project = await readQuery(
+			db.query.projects.findFirst({
+				where: eq(projects.id, chapter.projectId),
+			}),
+		);
 
 		return withLegacyRetirement(
 			[reviewChapterId],
 			"review dismiss",
 			async () => {
 				// Interrupt any running narrators before removing git resources
-				const chapterNarrators = await db.query.narrators.findMany({
-					where: eq(narrators.chapterId, reviewChapterId),
-				});
+				const chapterNarrators = await readQuery(
+					db.query.narrators.findMany({
+						where: eq(narrators.chapterId, reviewChapterId),
+					}),
+				);
 				for (const n of chapterNarrators) {
 					closeNarrator(n.id);
 				}
@@ -620,9 +641,11 @@ export const reviewService = {
 	 * The review chapter is cleaned up, and the narrator is re-parented.
 	 */
 	async convertToSubagent(reviewChapterId: string) {
-		const chapter = await db.query.chapters.findFirst({
-			where: eq(chapters.id, reviewChapterId),
-		});
+		const chapter = await readQuery(
+			db.query.chapters.findFirst({
+				where: eq(chapters.id, reviewChapterId),
+			}),
+		);
 		if (!chapter || chapter.role !== "review") {
 			throw new ValidationError("Not a review chapter");
 		}
@@ -634,36 +657,44 @@ export const reviewService = {
 		}
 
 		// Get review's primary narrator
-		const reviewNarrator = await db.query.narrators.findFirst({
-			where: and(eq(narrators.chapterId, reviewChapterId), eq(narrators.variant, "primary")),
-		});
+		const reviewNarrator = await readQuery(
+			db.query.narrators.findFirst({
+				where: and(eq(narrators.chapterId, reviewChapterId), eq(narrators.variant, "primary")),
+			}),
+		);
 		if (!reviewNarrator) throw new ValidationError("Review has no narrator");
 
 		// Get source chapter's primary narrator
-		const sourceNarrator = await db.query.narrators.findFirst({
-			where: and(
-				eq(narrators.chapterId, chapter.reviewSourceChapterId),
-				eq(narrators.variant, "primary"),
-			),
-		});
+		const sourceNarrator = await readQuery(
+			db.query.narrators.findFirst({
+				where: and(
+					eq(narrators.chapterId, chapter.reviewSourceChapterId),
+					eq(narrators.variant, "primary"),
+				),
+			}),
+		);
 		if (!sourceNarrator) throw new ValidationError("Source chapter has no narrator");
 
 		const now = new Date().toISOString();
 
 		const sourceChapterId = chapter.reviewSourceChapterId;
-		const project = await db.query.projects.findFirst({
-			where: eq(projects.id, chapter.projectId),
-		});
+		const project = await readQuery(
+			db.query.projects.findFirst({
+				where: eq(projects.id, chapter.projectId),
+			}),
+		);
 		return withLegacyRetirement(
 			[reviewChapterId],
 			"review convert",
 			async () => {
 				// Re-parent the review narrator as a subagent of the source narrator
 				// Also update cwd to source chapter's worktree since the review worktree will be removed
-				const sourceChapter = await db.query.chapters.findFirst({
-					where: eq(chapters.id, sourceChapterId),
-					columns: { worktreePath: true },
-				});
+				const sourceChapter = await readQuery(
+					db.query.chapters.findFirst({
+						where: eq(chapters.id, sourceChapterId),
+						columns: { worktreePath: true },
+					}),
+				);
 				// Conversion adds a ceiling; existing declarations must keep narrowing this row.
 				const reviewTraits = appendRuntimePolicyTrait(
 					reviewNarrator.traits,
@@ -758,9 +789,11 @@ export const reviewService = {
 	 * The review keeps its worktree and narrator, just changes role.
 	 */
 	async promoteToChapter(reviewChapterId: string) {
-		const chapter = await db.query.chapters.findFirst({
-			where: eq(chapters.id, reviewChapterId),
-		});
+		const chapter = await readQuery(
+			db.query.chapters.findFirst({
+				where: eq(chapters.id, reviewChapterId),
+			}),
+		);
 		if (!chapter || chapter.role !== "review") {
 			throw new ValidationError("Not a review chapter");
 		}
@@ -788,10 +821,12 @@ export const reviewService = {
 			.where(and(eq(chapterEdges.targetId, reviewChapterId), eq(chapterEdges.type, "review")));
 
 		// Sync in-memory narrator cache so the agent loop stops treating this as a review
-		const reviewNarrator = await db.query.narrators.findFirst({
-			where: and(eq(narrators.chapterId, reviewChapterId), eq(narrators.variant, "primary")),
-			columns: { id: true },
-		});
+		const reviewNarrator = await readQuery(
+			db.query.narrators.findFirst({
+				where: and(eq(narrators.chapterId, reviewChapterId), eq(narrators.variant, "primary")),
+				columns: { id: true },
+			}),
+		);
 		if (reviewNarrator) {
 			updateNarratorChapterRole(reviewNarrator.id, "branch");
 		}
@@ -804,9 +839,11 @@ export const reviewService = {
 
 		logger.info("Review promoted to chapter", { reviewChapterId });
 
-		return await db.query.chapters.findFirst({
-			where: eq(chapters.id, reviewChapterId),
-		});
+		return await readQuery(
+			db.query.chapters.findFirst({
+				where: eq(chapters.id, reviewChapterId),
+			}),
+		);
 	},
 
 	/**

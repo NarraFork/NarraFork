@@ -35,7 +35,11 @@ import {
 	parseNameStatusRecords,
 	requireCommitFile,
 } from "./git-commit-preview-parse";
-import { coordinateGitStatusQuery, getLocalGitStatusQueryKey } from "./git-status-query";
+import {
+	coordinateGitStatusQuery,
+	getGitStatusQueryScopeId,
+	getLocalGitStatusQueryKey,
+} from "./git-status-query";
 import { GIT_STATUS_TIMEOUT_MS, readGitStatusStream } from "./git-status-stream";
 import {
 	captureLifecycleContextPath,
@@ -1214,15 +1218,36 @@ export const gitService = {
 					AbortSignal.timeout(GIT_STATUS_TIMEOUT_MS),
 				]);
 				return withGitRequestContext(boundedSignal, async () => {
-					const startedAt = Date.now();
+					const startedAt = performance.now();
+					// Wall timings overlap for parallel commands; never sum them as CPU time.
+					const commandWallMs: Record<string, number> = {};
+					let activeCommands = 0;
+					let peakCommands = 0;
+					const timed = async <T>(name: string, run: () => Promise<T>): Promise<T> => {
+						const start = performance.now();
+						peakCommands = Math.max(peakCommands, ++activeCommands);
+						try {
+							return await run();
+						} finally {
+							activeCommands--;
+							commandWallMs[name] = Math.round(performance.now() - start);
+						}
+					};
 					// Freeze lifecycle cwd once for streaming and all metadata commands alike.
 					const cwd = await lifecycleCreationPath(worktreePath);
+					const lifecycleMs = Math.round(performance.now() - startedAt);
 					const metadataOptions = { timeout: GIT_STATUS_TIMEOUT_MS, maxOutputBytes: 4096 };
 					const queries = [
-						execRead(["rev-parse", "--show-prefix"], cwd, true, metadataOptions),
-						readGitStatusStream(cwd, boundedSignal),
-						execRead(["rev-parse", "--verify", "--quiet", "HEAD"], cwd, true, metadataOptions),
-						execRead(["symbolic-ref", "--quiet", "--short", "HEAD"], cwd, true, metadataOptions),
+						timed("prefix", () =>
+							execRead(["rev-parse", "--show-prefix"], cwd, true, metadataOptions),
+						),
+						timed("status", () => readGitStatusStream(cwd, boundedSignal)),
+						timed("head", () =>
+							execRead(["rev-parse", "--verify", "--quiet", "HEAD"], cwd, true, metadataOptions),
+						),
+						timed("branch", () =>
+							execRead(["symbolic-ref", "--quiet", "--short", "HEAD"], cwd, true, metadataOptions),
+						),
 					] as const;
 					const [prefix, status, head, branch] = await Promise.all(queries).catch(async (error) => {
 						// Keep the coordinator slot until every sibling process has exited.
@@ -1238,21 +1263,32 @@ export const gitService = {
 					const branchResult =
 						branch.exitCode === 0 && branch.stdout.trim()
 							? branch
-							: await execRead(["rev-parse", "--abbrev-ref", "HEAD"], cwd, true, metadataOptions);
+							: await timed("branchFallback", () =>
+									execRead(["rev-parse", "--abbrev-ref", "HEAD"], cwd, true, metadataOptions),
+								);
 					boundedSignal.throwIfAborted();
 					if (branchResult.exitCode !== 0 || branchResult.truncated)
 						throw new GitError("Git status branch metadata failed");
 					const { parser, budgetReason } = status;
+					const mappingStartedAt = performance.now();
 					const files = parser.files.map((entry) => ({
 						...entry,
 						path: stripGitPathPrefix(entry.path, prefix.stdout),
 						...(entry.oldPath ? { oldPath: stripGitPathPrefix(entry.oldPath, prefix.stdout) } : {}),
 					}));
 					const truncated = !!budgetReason || parser.totalFiles > files.length;
-					const elapsedMs = Date.now() - startedAt;
+					const mappingMs = Math.round((performance.now() - mappingStartedAt) * 100) / 100;
+					const elapsedMs = Math.round(performance.now() - startedAt);
 					if (elapsedMs > 1000)
 						logger.warn("Slow Git status query", {
+							scopeId: getGitStatusQueryScopeId(getLocalGitStatusQueryKey(worktreePath)),
 							elapsedMs,
+							lifecycleMs,
+							commandWallMs,
+							peakCommandTasks: peakCommands,
+							mappingMs,
+							stream: status.diagnostics,
+							metadataMaxOutputBytes: metadataOptions.maxOutputBytes,
 							scanned: parser.totalFiles,
 							returned: files.length,
 							truncationReason: budgetReason ?? (truncated ? "details" : "none"),

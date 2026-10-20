@@ -1,3 +1,4 @@
+import { readQuery } from "../db/worker-read";
 /**
  * Narrator access control.
  *
@@ -253,10 +254,13 @@ async function gateAndProjectFor(
 async function resolveJudgedRow(row: NarratorAclRow): Promise<NarratorAclRow | null> {
 	if (row.type !== "subagent") return row;
 	if (!row.aclRootNarratorId) return null;
-	const root = await db.query.narrators.findFirst({
-		where: eq(narrators.id, row.aclRootNarratorId),
-		columns: NARRATOR_ACL_COLUMNS,
-	});
+	const root = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, row.aclRootNarratorId),
+			columns: NARRATOR_ACL_COLUMNS,
+		}),
+		{ site: "narrator-acl.resolveJudgedRow" },
+	);
 	return root ?? null;
 }
 
@@ -402,7 +406,10 @@ export async function loadNarratorForAccess(
 	principal: NarratorPrincipal,
 	need: NarratorAccessNeed,
 ) {
-	const row = await db.query.narrators.findFirst({ where: eq(narrators.id, narratorId) });
+	const row = await readQuery(
+		db.query.narrators.findFirst({ where: eq(narrators.id, narratorId) }),
+		{ site: "narrator-acl.loadNarratorForAccess" },
+	);
 	if (!row) throw new NotFoundError("Narrator", narratorId);
 	await assertNarratorAccess(row, principal, need);
 	return row;
@@ -645,10 +652,13 @@ export async function filterReadableNarrators<T extends NarratorAclRow>(
 	const readableIds = new Set<string>();
 	for (let offset = 0; offset < rows.length; offset += READABLE_FILTER_CHUNK_SIZE) {
 		const ids = rows.slice(offset, offset + READABLE_FILTER_CHUNK_SIZE).map((row) => row.id);
-		const readable = await db
-			.select({ id: narrators.id })
-			.from(narrators)
-			.where(and(sql`${narrators.id} IN ${ids}`, narratorReadableWhere(principal)));
+		const readable = await readQuery(
+			db
+				.select({ id: narrators.id })
+				.from(narrators)
+				.where(and(sql`${narrators.id} IN ${ids}`, narratorReadableWhere(principal))),
+			{ site: "narrator-acl.filterReadableNarrators" },
+		);
 		for (const row of readable) readableIds.add(row.id);
 	}
 
@@ -702,7 +712,9 @@ export async function listNarratorAudience(
 				sql`${aclGrants.domainKind} is null`,
 			),
 		);
-	const grants = await (limit === undefined ? grantQuery : grantQuery.limit(limit));
+	const grants = await readQuery(limit === undefined ? grantQuery : grantQuery.limit(limit), {
+		site: "narrator-acl.listNarratorAudience",
+	});
 	const userIds = new Set<string>(judged.ownerUserId ? [judged.ownerUserId] : []);
 	for (const grant of grants) userIds.add(grant.principalId);
 	return { everyone: false, userIds: [...userIds].slice(0, limit) };

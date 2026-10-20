@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 import { and, eq, isNull } from "drizzle-orm";
 import { db } from "../db";
 import { terminalViewState } from "../db/schema";
@@ -19,9 +20,11 @@ export const terminalViewService = {
 			return null;
 		}
 
-		return db.query.terminalViewState.findFirst({
-			where: and(...conditions),
-		});
+		return readQuery(
+			db.query.terminalViewState.findFirst({
+				where: and(...conditions),
+			}),
+		);
 	},
 
 	async upsert(

@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 /**
  * Helper functions for prompt optimization with conversation context.
  */
@@ -46,11 +47,13 @@ export async function loadRecentMessages(
 	// Find the reference seq for the beforeMessageId (if provided)
 	let maxSeq: number | undefined;
 	if (beforeMessageId) {
-		const ref = await db.query.narratorMessageRefs.findFirst({
-			where: (refs, { and, eq }) =>
-				and(eq(refs.narratorId, narratorId), eq(refs.messageId, beforeMessageId)),
-			columns: { seq: true },
-		});
+		const ref = await readQuery(
+			db.query.narratorMessageRefs.findFirst({
+				where: (refs, { and, eq }) =>
+					and(eq(refs.narratorId, narratorId), eq(refs.messageId, beforeMessageId)),
+				columns: { seq: true },
+			}),
+		);
 		if (ref) {
 			maxSeq = ref.seq;
 		}
@@ -72,19 +75,21 @@ export async function loadRecentMessages(
 		.orderBy(desc(narratorMessageRefs.seq))
 		.limit(maxLimit);
 
-	const refs = await refsQuery;
+	const refs = await readQuery(refsQuery);
 	if (refs.length === 0) return [];
 
 	// Load the actual messages
 	const messageIds = refs.map((r) => r.messageId);
-	const messages = await db.query.narratorMessages.findMany({
-		where: (msgs, { inArray }) => inArray(msgs.id, messageIds),
-		columns: {
-			id: true,
-			role: true,
-			contentJson: true,
-		},
-	});
+	const messages = await readQuery(
+		db.query.narratorMessages.findMany({
+			where: (msgs, { inArray }) => inArray(msgs.id, messageIds),
+			columns: {
+				id: true,
+				role: true,
+				contentJson: true,
+			},
+		}),
+	);
 
 	// Build a map for ordering
 	const seqMap = new Map(refs.map((r) => [r.messageId, r.seq]));

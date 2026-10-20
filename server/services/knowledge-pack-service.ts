@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { knowledgeCollections, knowledgeEntries, knowledgePacks, projects } from "../db/schema";
@@ -63,13 +64,17 @@ async function resolvePackAcl(
 	pack: Pick<Pack, "id" | "entryId" | "classificationLevel" | "controlledTagsJson" | "ownerUserId">,
 ): Promise<{ aclEntry: AclEntry; aclCollection: AclCollection }> {
 	if (pack.entryId) {
-		const entry = await db.query.knowledgeEntries.findFirst({
-			where: eq(knowledgeEntries.id, pack.entryId),
-		});
+		const entry = await readQuery(
+			db.query.knowledgeEntries.findFirst({
+				where: eq(knowledgeEntries.id, pack.entryId),
+			}),
+		);
 		if (entry) {
-			const collection = await db.query.knowledgeCollections.findFirst({
-				where: eq(knowledgeCollections.id, entry.collectionId),
-			});
+			const collection = await readQuery(
+				db.query.knowledgeCollections.findFirst({
+					where: eq(knowledgeCollections.id, entry.collectionId),
+				}),
+			);
 			return {
 				aclEntry: {
 					id: entry.id,
@@ -122,9 +127,11 @@ async function canAccessPack(principal: Principal, pack: Pack): Promise<boolean>
  * miss OR no-access (never leak existence of packs the caller can't see).
  */
 async function loadAccessiblePack(packId: string, principal: Principal): Promise<Pack> {
-	const pack = await db.query.knowledgePacks.findFirst({
-		where: eq(knowledgePacks.id, packId),
-	});
+	const pack = await readQuery(
+		db.query.knowledgePacks.findFirst({
+			where: eq(knowledgePacks.id, packId),
+		}),
+	);
 	if (!pack) throw new NotFoundError("Knowledge pack", packId);
 	if (!(await canAccessPack(principal, pack))) {
 		throw new NotFoundError("Knowledge pack", packId);
@@ -156,21 +163,23 @@ async function listPacks(
 	opts: { projectId?: string; entryId?: string; limit?: number } = {},
 ) {
 	const limit = Math.min(opts.limit ?? LIST_DEFAULT_LIMIT, LIST_MAX_LIMIT);
-	const rows = await db.query.knowledgePacks.findMany({
-		where: (p, { and: a, eq: e, or, isNull }) => {
-			const conds = [e(p.status, "active" as const)];
-			if (opts.entryId) conds.push(e(p.entryId, opts.entryId));
-			// Project isolation: this project's packs + global (projectId null) ones.
-			if (opts.projectId) {
-				const scope = or(e(p.projectId, opts.projectId), isNull(p.projectId));
-				if (scope) conds.push(scope);
-			}
-			return a(...conds);
-		},
-		columns: PACK_LIST_COLUMNS,
-		orderBy: (p, { desc: d }) => [d(p.updatedAt)],
-		limit,
-	});
+	const rows = await readQuery(
+		db.query.knowledgePacks.findMany({
+			where: (p, { and: a, eq: e, or, isNull }) => {
+				const conds = [e(p.status, "active" as const)];
+				if (opts.entryId) conds.push(e(p.entryId, opts.entryId));
+				// Project isolation: this project's packs + global (projectId null) ones.
+				if (opts.projectId) {
+					const scope = or(e(p.projectId, opts.projectId), isNull(p.projectId));
+					if (scope) conds.push(scope);
+				}
+				return a(...conds);
+			},
+			columns: PACK_LIST_COLUMNS,
+			orderBy: (p, { desc: d }) => [d(p.updatedAt)],
+			limit,
+		}),
+	);
 	// ACL post-filter (canRead) — unreadable packs never surface or count.
 	const out: typeof rows = [];
 	for (const r of rows) {
@@ -198,15 +207,19 @@ interface CreatePackInput {
 
 async function createPack(input: CreatePackInput): Promise<Pack> {
 	if (input.projectId) {
-		const proj = await db.query.projects.findFirst({
-			where: eq(projects.id, input.projectId),
-		});
+		const proj = await readQuery(
+			db.query.projects.findFirst({
+				where: eq(projects.id, input.projectId),
+			}),
+		);
 		if (!proj) throw new ValidationError(`Project not found: ${input.projectId}`);
 	}
 	if (input.entryId) {
-		const entry = await db.query.knowledgeEntries.findFirst({
-			where: eq(knowledgeEntries.id, input.entryId),
-		});
+		const entry = await readQuery(
+			db.query.knowledgeEntries.findFirst({
+				where: eq(knowledgeEntries.id, input.entryId),
+			}),
+		);
 		if (!entry) throw new ValidationError(`Knowledge entry not found: ${input.entryId}`);
 	}
 
@@ -215,11 +228,13 @@ async function createPack(input: CreatePackInput): Promise<Pack> {
 
 	// Slug uniqueness within scope (a specific project, or the global projectId-null
 	// scope). Mirrors the (project_id, slug) unique index on the table.
-	const dup = await db.query.knowledgePacks.findFirst({
-		where: (p, { and: a, eq: e, isNull }) =>
-			a(e(p.slug, slug), input.projectId ? e(p.projectId, input.projectId) : isNull(p.projectId)),
-		columns: { id: true },
-	});
+	const dup = await readQuery(
+		db.query.knowledgePacks.findFirst({
+			where: (p, { and: a, eq: e, isNull }) =>
+				a(e(p.slug, slug), input.projectId ? e(p.projectId, input.projectId) : isNull(p.projectId)),
+			columns: { id: true },
+		}),
+	);
 	if (dup) {
 		throw new ValidationError(`Pack slug already exists in this scope: ${slug}`);
 	}
@@ -275,9 +290,11 @@ async function updatePackMeta(
 ): Promise<Pack> {
 	const pack = await assertCanManagePack(packId, principal);
 	if (input.entryId !== undefined && input.entryId !== null) {
-		const entry = await db.query.knowledgeEntries.findFirst({
-			where: eq(knowledgeEntries.id, input.entryId),
-		});
+		const entry = await readQuery(
+			db.query.knowledgeEntries.findFirst({
+				where: eq(knowledgeEntries.id, input.entryId),
+			}),
+		);
 		if (!entry) throw new ValidationError(`Knowledge entry not found: ${input.entryId}`);
 	}
 	const patch: Partial<Pack> = { updatedAt: nowIso() };

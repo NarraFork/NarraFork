@@ -29,6 +29,48 @@ class RetryClock {
 
 const ignoreFailure = () => {};
 
+test("stop drains an existing initialization and records its failure without retry", async () => {
+	let reject = (_error: Error) => {};
+	const pending = new Promise<void>((_resolve, fail) => {
+		reject = fail;
+	});
+	const clock = new RetryClock();
+	const initializer = new BackgroundOccupancyInitializer(
+		() => pending,
+		clock.schedule,
+		ignoreFailure,
+	);
+	const start = initializer.start();
+	await Promise.resolve();
+	initializer.stop();
+	const controller = new AbortController();
+	const drain = initializer.drainForShutdown(controller.signal);
+	controller.abort(new Error("deadline"));
+	await expect(drain).rejects.toThrow("deadline");
+	expect(initializer.getShutdownState().pending).toBe(1);
+	const error = new Error("initialization failed");
+	reject(error);
+	await start;
+	await initializer.drainForShutdown(new AbortController().signal);
+	expect(initializer.getShutdownState()).toEqual({
+		pending: 0,
+		failureCount: 1,
+		firstError: error,
+	});
+	expect(clock.pending.size).toBe(0);
+});
+
+test("stop before the queued initial scan does not launch it", async () => {
+	let calls = 0;
+	const initializer = new BackgroundOccupancyInitializer(async () => {
+		calls++;
+	});
+	const start = initializer.start();
+	initializer.stop();
+	await start;
+	expect(calls).toBe(0);
+});
+
 describe("explicit background occupancy initialization recovery", () => {
 	test("a transient cold read failure recovers without any request initiating a scan", async () => {
 		const clock = new RetryClock();

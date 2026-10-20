@@ -218,7 +218,7 @@ function access(): RevertPlannerAccess {
 				throw new Error("File denied");
 		},
 		async resolveFile({ identity }) {
-			const scope = runtime.evidence.getScope(identity.scopeId);
+			const scope = await runtime.evidence.getScope(identity.scopeId);
 			const binding = localFileChangeRuntimeBinding(identity.deviceId);
 			if (!scope || !binding) throw new Error("Unknown scope");
 			return {
@@ -227,7 +227,7 @@ function access(): RevertPlannerAccess {
 				scopeRevision: scope.revision,
 				async assertCurrent({ signal }) {
 					signal.throwIfAborted();
-					const live = runtime.evidence.getScope(scope.id);
+					const live = await runtime.evidence.getScope(scope.id);
 					if (
 						!live ||
 						live.status !== "active" ||
@@ -329,7 +329,7 @@ describe("GenUI ordinary file history", () => {
 		expect(selected.effects[0].before).toEqual({ kind: "absent" });
 		const namespace = await runtime.initialize();
 		const authorized = access();
-		const budget = namespace.catalog.getBudget();
+		const budget = await namespace.catalog.getBudget();
 		if (!budget) throw new Error("Missing file-history namespace budget");
 		const planOptions = { namespaceKey: budget.namespaceKey };
 		const planner = new RevertPlannerService(db, {

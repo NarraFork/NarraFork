@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 import { and, asc, eq, getTableColumns, gt, inArray, ne, or, sql } from "drizzle-orm";
 import { db } from "../../db";
 import { chapterEdges, chapters, containerInstances, narrators, projects } from "../../db/schema";
@@ -42,25 +43,27 @@ export class SqliteProjectReadAdapter implements ProjectReadAdapter {
 	async listProjects(principal: ProjectPrincipal, page: ReadPage = {}, status?: string) {
 		const limit = clampLimit(page.limit, READ_LIMITS.projectPage);
 		const cursor = decodeSortCursor("updatedAt", page.cursor);
-		const rows = await db.query.projects.findMany({
-			where: and(
-				isReadablePrincipal(principal) ? undefined : sql`0`,
-				status ? eq(projects.status, status as "active" | "archived") : undefined,
-				projectReadableWhere(principal),
-				cursor
-					? or(
-							// Descending order, so a continuation walks towards OLDER rows.
-							sql`${projects.updatedAt} < ${cursor.sort}`,
-							and(eq(projects.updatedAt, cursor.sort), gt(projects.id, cursor.id)),
-						)
-					: undefined,
-			),
-			// Most-recently-updated first — the order this endpoint has always had and what
-			// the dashboard's "recent projects" reading depends on. The id tiebreak is what
-			// makes the cursor safe when many rows share `updatedAt`.
-			orderBy: (p, { desc }) => [desc(p.updatedAt), asc(p.id)],
-			limit: limit + 1,
-		});
+		const rows = await readQuery(
+			db.query.projects.findMany({
+				where: and(
+					isReadablePrincipal(principal) ? undefined : sql`0`,
+					status ? eq(projects.status, status as "active" | "archived") : undefined,
+					projectReadableWhere(principal),
+					cursor
+						? or(
+								// Descending order, so a continuation walks towards OLDER rows.
+								sql`${projects.updatedAt} < ${cursor.sort}`,
+								and(eq(projects.updatedAt, cursor.sort), gt(projects.id, cursor.id)),
+							)
+						: undefined,
+				),
+				// Most-recently-updated first — the order this endpoint has always had and what
+				// the dashboard's "recent projects" reading depends on. The id tiebreak is what
+				// makes the cursor safe when many rows share `updatedAt`.
+				orderBy: (p, { desc }) => [desc(p.updatedAt), asc(p.id)],
+				limit: limit + 1,
+			}),
+		);
 		const pageRows = rows.slice(0, limit);
 		const last = pageRows.at(-1);
 		return {
@@ -72,33 +75,37 @@ export class SqliteProjectReadAdapter implements ProjectReadAdapter {
 
 	async getProject(id: string, principal: ProjectPrincipal) {
 		return (
-			(await db.query.projects.findFirst({
-				where: and(
-					isReadablePrincipal(principal) ? undefined : sql`0`,
-					eq(projects.id, id),
-					projectReadableWhere(principal),
-				),
-			})) ?? null
+			(await readQuery(
+				db.query.projects.findFirst({
+					where: and(
+						isReadablePrincipal(principal) ? undefined : sql`0`,
+						eq(projects.id, id),
+						projectReadableWhere(principal),
+					),
+				}),
+			)) ?? null
 		);
 	}
 
 	async anyProjectExists(): Promise<boolean> {
-		const row = await db.query.projects.findFirst({ columns: { id: true } });
+		const row = await readQuery(db.query.projects.findFirst({ columns: { id: true } }));
 		return !!row;
 	}
 
 	async getChapter(id: string, principal: ProjectPrincipal) {
-		const rows = await db
-			.select({ chapter: chapters })
-			.from(chapters)
-			.where(
-				and(
-					isReadablePrincipal(principal) ? undefined : sql`0`,
-					eq(chapters.id, id),
-					projectReadableWhereForColumn(principal, chapters.projectId),
-				),
-			)
-			.limit(1);
+		const rows = await readQuery(
+			db
+				.select({ chapter: chapters })
+				.from(chapters)
+				.where(
+					and(
+						isReadablePrincipal(principal) ? undefined : sql`0`,
+						eq(chapters.id, id),
+						projectReadableWhereForColumn(principal, chapters.projectId),
+					),
+				)
+				.limit(1),
+		);
 		return rows[0]?.chapter ?? null;
 	}
 
@@ -116,7 +123,7 @@ export class SqliteProjectReadAdapter implements ProjectReadAdapter {
 		cursor: { sort: string; id: string } | null,
 		status?: string,
 	) {
-		return (
+		return readQuery(
 			db
 				// Every chapter column EXCEPT the two per-chapter blobs: `dock_layout_json` and
 				// `detached_panels_json` are read by their own `/chapters/:id/...` endpoints, and a
@@ -140,7 +147,7 @@ export class SqliteProjectReadAdapter implements ProjectReadAdapter {
 					),
 				)
 				.orderBy(asc(chapters.createdAt), asc(chapters.id))
-				.limit(limit)
+				.limit(limit),
 		);
 	}
 
@@ -202,49 +209,51 @@ export class SqliteProjectReadAdapter implements ProjectReadAdapter {
 			const containerHeadroom = limit - containers.length;
 			if (containerHeadroom <= 0) truncated = true;
 			else {
-				const rows = await db
-					.select({ chapterId: containerInstances.chapterId })
-					.from(containerInstances)
-					// The project is reached THROUGH the chapter. This predicate used to be
-					// `projectReadableWhereForColumn(principal, containerInstances.chapterId)`, which
-					// compiles to `p.id = container_instances.chapter_id` — a project id compared
-					// against a chapter id, so the EXISTS never matched and every non-admin lost the
-					// container badge on every node. Admins were unaffected only because the helper
-					// returns `undefined` for them, which `and(...)` drops, which is why this never
-					// showed up in admin-run checks.
-					.innerJoin(chapters, eq(chapters.id, containerInstances.chapterId))
-					.where(
-						and(
-							inArray(containerInstances.chapterId, batch),
-							ne(containerInstances.status, "removed"),
-							// Chapters of another project reach nothing, even when named explicitly.
-							eq(chapters.projectId, projectId),
-							projectReadableWhereForColumn(principal, chapters.projectId),
-						),
-					)
-					.groupBy(containerInstances.chapterId)
-					.orderBy(asc(containerInstances.chapterId))
-					.limit(containerHeadroom + 1)
-					.all();
+				const rows = await readQuery(
+					db
+						.select({ chapterId: containerInstances.chapterId })
+						.from(containerInstances)
+						// The project is reached THROUGH the chapter. This predicate used to be
+						// `projectReadableWhereForColumn(principal, containerInstances.chapterId)`, which
+						// compiles to `p.id = container_instances.chapter_id` — a project id compared
+						// against a chapter id, so the EXISTS never matched and every non-admin lost the
+						// container badge on every node. Admins were unaffected only because the helper
+						// returns `undefined` for them, which `and(...)` drops, which is why this never
+						// showed up in admin-run checks.
+						.innerJoin(chapters, eq(chapters.id, containerInstances.chapterId))
+						.where(
+							and(
+								inArray(containerInstances.chapterId, batch),
+								ne(containerInstances.status, "removed"),
+								// Chapters of another project reach nothing, even when named explicitly.
+								eq(chapters.projectId, projectId),
+								projectReadableWhereForColumn(principal, chapters.projectId),
+							),
+						)
+						.groupBy(containerInstances.chapterId)
+						.orderBy(asc(containerInstances.chapterId))
+						.limit(containerHeadroom + 1),
+				);
 				collect(containers, rows, containerHeadroom);
 			}
 
 			const panelHeadroom = limit - detachedPanels.length;
 			if (panelHeadroom <= 0) truncated = true;
 			else {
-				const rows = await db
-					.select({ id: chapters.id, detachedPanelsJson: chapters.detachedPanelsJson })
-					.from(chapters)
-					.where(
-						and(
-							inArray(chapters.id, batch),
-							eq(chapters.projectId, projectId),
-							sql`${chapters.detachedPanelsJson} is not null`,
-						),
-					)
-					.orderBy(asc(chapters.id))
-					.limit(panelHeadroom + 1)
-					.all();
+				const rows = await readQuery(
+					db
+						.select({ id: chapters.id, detachedPanelsJson: chapters.detachedPanelsJson })
+						.from(chapters)
+						.where(
+							and(
+								inArray(chapters.id, batch),
+								eq(chapters.projectId, projectId),
+								sql`${chapters.detachedPanelsJson} is not null`,
+							),
+						)
+						.orderBy(asc(chapters.id))
+						.limit(panelHeadroom + 1),
+				);
 				collect(
 					detachedPanels,
 					rows.flatMap((row) =>
@@ -282,7 +291,7 @@ export class SqliteProjectReadAdapter implements ProjectReadAdapter {
 		principal: ProjectPrincipal,
 		limit: number,
 	) {
-		return (
+		return readQuery(
 			db
 				.select({
 					id: narrators.id,
@@ -306,8 +315,7 @@ export class SqliteProjectReadAdapter implements ProjectReadAdapter {
 				// rather than incidental so both backends agree, including about WHICH rows a
 				// truncated batch keeps.
 				.orderBy(asc(narrators.createdAt), asc(narrators.id))
-				.limit(limit)
-				.all()
+				.limit(limit),
 		);
 	}
 
@@ -319,44 +327,48 @@ export class SqliteProjectReadAdapter implements ProjectReadAdapter {
 		if (!visible) return { chapters: [], edges: [] };
 		const chapterLimit = READ_LIMITS.graphChapters;
 		const edgeLimit = READ_LIMITS.graphEdges;
-		const projectChapters = await db.query.chapters.findMany({
-			where: eq(chapters.projectId, projectId),
-			orderBy: (ch) => [asc(ch.createdAt), asc(ch.id)],
-			columns: {
-				id: true,
-				title: true,
-				status: true,
-				branch: true,
-				role: true,
-				color: true,
-				groupLabel: true,
-				explorationGroupId: true,
-				isRoot: true,
-				graphX: true,
-				graphY: true,
-				commitCount: true,
-				headCommitSha: true,
-				worktreePath: true,
-				panelExpanded: true,
-				panelWidth: true,
-				panelHeight: true,
-				reviewSourceChapterId: true,
-				reviewStatus: true,
-			},
-			// One row over the cap, so truncation is detected rather than inferred from
-			// `length === limit` (which is wrong for a project holding exactly `limit` rows).
-			limit: chapterLimit + 1,
-		});
+		const projectChapters = await readQuery(
+			db.query.chapters.findMany({
+				where: eq(chapters.projectId, projectId),
+				orderBy: (ch) => [asc(ch.createdAt), asc(ch.id)],
+				columns: {
+					id: true,
+					title: true,
+					status: true,
+					branch: true,
+					role: true,
+					color: true,
+					groupLabel: true,
+					explorationGroupId: true,
+					isRoot: true,
+					graphX: true,
+					graphY: true,
+					commitCount: true,
+					headCommitSha: true,
+					worktreePath: true,
+					panelExpanded: true,
+					panelWidth: true,
+					panelHeight: true,
+					reviewSourceChapterId: true,
+					reviewStatus: true,
+				},
+				// One row over the cap, so truncation is detected rather than inferred from
+				// `length === limit` (which is wrong for a project holding exactly `limit` rows).
+				limit: chapterLimit + 1,
+			}),
+		);
 		const truncatedChapters = projectChapters.length > chapterLimit;
 		const pageChapters = projectChapters.slice(0, chapterLimit);
 		const keptIds = new Set(pageChapters.map((ch) => ch.id));
-		const edgeRows = await db.query.chapterEdges.findMany({
-			where: eq(chapterEdges.projectId, projectId),
-			columns: { id: true, sourceId: true, targetId: true, type: true, metadata: true },
-			// Ordered so that WHICH edges a truncated graph keeps is the same on both backends.
-			orderBy: (edge) => [asc(edge.createdAt), asc(edge.id)],
-			limit: edgeLimit + 1,
-		});
+		const edgeRows = await readQuery(
+			db.query.chapterEdges.findMany({
+				where: eq(chapterEdges.projectId, projectId),
+				columns: { id: true, sourceId: true, targetId: true, type: true, metadata: true },
+				// Ordered so that WHICH edges a truncated graph keeps is the same on both backends.
+				orderBy: (edge) => [asc(edge.createdAt), asc(edge.id)],
+				limit: edgeLimit + 1,
+			}),
+		);
 		const truncatedEdges = edgeRows.length > edgeLimit;
 		// Edges whose endpoints were dropped are removed too: an edge pointing at a chapter
 		// that is not in the payload renders as a dangling connection on the canvas.

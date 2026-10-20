@@ -28,7 +28,7 @@
 import { Database } from "bun:sqlite";
 import { afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
+import { mkdtempSync, readFileSync, renameSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { db } from "@server/db";
@@ -71,7 +71,7 @@ afterEach(async () => {
 		createdNarrators.length = 0;
 	}
 	for (const projectId of createdProjects.splice(0)) {
-		projectDbManager.close(projectId);
+		await projectDbManager.close(projectId);
 		await db.delete(chapters).where(eq(chapters.projectId, projectId));
 		await db.delete(projects).where(eq(projects.id, projectId));
 	}
@@ -240,7 +240,7 @@ function withArchive<T>(gitPath: string, fn: (conn: Database) => T): T {
 
 /** Delete the project from the main database, leaving the archive on disk. */
 async function forgetProject(fixture: Fixture): Promise<void> {
-	projectDbManager.close(fixture.projectId);
+	await projectDbManager.close(fixture.projectId);
 	await db.delete(narratorToolCalls).where(eq(narratorToolCalls.narratorId, fixture.narratorId));
 	await db
 		.delete(narratorMessageRefs)
@@ -397,19 +397,50 @@ describe("export writes a real, self-describing SQLite file", () => {
 		});
 	});
 
+	test("closing an archive releases worker connections before replacing its file", async () => {
+		const dir = mkdtempSync(join(tmpdir(), "nf-arc-worker-replace-"));
+		tempDirs.push(dir);
+		const path = join(dir, "project.db");
+		const seed = (id: string) => {
+			const conn = new Database(path);
+			try {
+				conn.run("CREATE TABLE projects (id TEXT PRIMARY KEY, name TEXT)");
+				conn.run("INSERT INTO projects VALUES (?, ?)", [id, id]);
+			} finally {
+				conn.close();
+			}
+		};
+		seed("first-file");
+		const first = ProjectArchiveFile.openFile(path);
+		try {
+			expect((await first.readProjectRow())?.id).toBe("first-file");
+		} finally {
+			await first.close();
+		}
+		renameSync(path, join(dir, "previous.db"));
+		seed("replacement-file");
+		const replacement = ProjectArchiveFile.openFile(path);
+		try {
+			expect((await replacement.readProjectRow())?.id).toBe("replacement-file");
+			await expect(first.readProjectRow()).rejects.toThrow("Project archive is closed");
+		} finally {
+			await replacement.close();
+		}
+	});
+
 	test("archive pages report exact bytes and enforce row and batch byte ceilings", async () => {
 		const fixture = await createFixture("nf-arc-read-bounds-");
 		await fullSync(fixture.projectId);
 		const archive = ProjectArchiveFile.open(fixture.gitPath);
 		try {
-			const columns = archive.columnsFor("narrator_messages");
-			const one = archive.readTable("narrator_messages", columns, { limit: 1 });
+			const columns = await archive.columnsFor("narrator_messages");
+			const one = await archive.readTable("narrator_messages", columns, { limit: 1 });
 			expect(one.rows).toHaveLength(1);
 			expect(one.serializedBytes).toBe(Buffer.byteLength(JSON.stringify(one.rows), "utf8"));
 
 			const rowLimit = one.serializedBytes - 3;
 			try {
-				archive.readTable("narrator_messages", columns, {
+				await archive.readTable("narrator_messages", columns, {
 					limit: 1,
 					maxRowSerializedBytes: rowLimit,
 				});
@@ -421,7 +452,7 @@ describe("export writes a real, self-describing SQLite file", () => {
 			}
 
 			try {
-				archive.readTable("narrator_messages", columns, {
+				await archive.readTable("narrator_messages", columns, {
 					limit: 2,
 					maxBatchSerializedBytes: one.serializedBytes,
 				});
@@ -432,7 +463,7 @@ describe("export writes a real, self-describing SQLite file", () => {
 				expect((error as Error).message).toContain("serialized batch limit");
 			}
 		} finally {
-			archive.close();
+			await archive.close();
 		}
 	});
 });

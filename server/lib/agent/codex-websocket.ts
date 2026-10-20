@@ -1,4 +1,5 @@
 import type { Agent as HttpAgent, IncomingMessage } from "node:http";
+import { readQuery } from "@server/db/worker-read";
 import {
 	CYBER_POLICY_VIOLATION_CODE,
 	normalizePolicyViolationCode,
@@ -442,13 +443,15 @@ export function decidePrematureCodexReconnect(
 
 async function getLatestNarratorMessageCreatedAt(narratorId?: string): Promise<string | null> {
 	if (!narratorId) return null;
-	const rows = await db
-		.select({ createdAt: narratorMessages.createdAt })
-		.from(narratorMessageRefs)
-		.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-		.where(eq(narratorMessageRefs.narratorId, narratorId))
-		.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-		.limit(1);
+	const rows = await readQuery(
+		db
+			.select({ createdAt: narratorMessages.createdAt })
+			.from(narratorMessageRefs)
+			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+			.where(eq(narratorMessageRefs.narratorId, narratorId))
+			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+			.limit(1),
+	);
 	return rows[0]?.createdAt ?? null;
 }
 

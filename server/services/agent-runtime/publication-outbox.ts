@@ -8,6 +8,7 @@ import {
 	narratorToolContinuations,
 	runtimePublicationOutbox as outbox,
 } from "../../db/schema";
+import { readQuery } from "../../db/worker-read";
 import { hotSafe } from "../../lib/hot-safe";
 import { generateId } from "../../lib/id";
 import { MAILBOX_LIMITS as L } from "./limits";
@@ -19,8 +20,12 @@ import {
 	mailboxHasCapacity,
 } from "./mailbox";
 import { AWAITED_TERMINAL_CONSUMED_REASON } from "./mailbox-shared";
-import type { NoticeKind, RuntimeDb, RuntimeStoreDb, RuntimeTx } from "./mailbox-types";
-import { type AwaitedTerminalConsumeOptions, agentSourceResultRef } from "./publication-result";
+import type { NoticeKind, RuntimeDb, RuntimeTx } from "./mailbox-types";
+import {
+	type AwaitedTerminalConsumeOptions,
+	agentSourceResultRef,
+	publicationDedupeKey,
+} from "./publication-result";
 import { runAtomicWrite } from "./runtime-write";
 
 export type PublicationEvent = "started" | "completed" | "failed" | "timed_out" | "cancelled";
@@ -162,19 +167,8 @@ export interface PublicationIntent extends PublicationRun {
 	resultRef: string;
 	summary: string;
 }
-export function publicationDedupeKey(
-	run: PublicationRun,
-	eventKind: PublicationEvent | "terminal",
-) {
-	return JSON.stringify([
-		"publication",
-		run.producerKind,
-		run.taskId,
-		run.logicalRunId,
-		eventKind,
-		run.recipientId,
-	]);
-}
+export { publicationDedupeKey } from "./publication-result";
+
 function runWhere(run: PublicationRun) {
 	return and(
 		eq(outbox.producerKind, run.producerKind),
@@ -689,7 +683,7 @@ export function createPublicationOutbox(db: RuntimeDb, options: PublicationOutbo
 			.run();
 		return { status: "registered", run, eventKind: admission.eventKind };
 	}
-	function isAwaitedTerminal(run: PublicationRun, tx: RuntimeStoreDb = db): boolean {
+	function isAwaitedTerminal(run: PublicationRun, tx: RuntimeTx): boolean {
 		return !!tx
 			.select({ taskId: consumptions.taskId })
 			.from(consumptions)
@@ -1095,25 +1089,26 @@ export function createPublicationOutbox(db: RuntimeDb, options: PublicationOutbo
 		registerLegacyRunningRunSlots,
 		registerLegacyUnknownBashFailure,
 		registerLegacyCompletedRunSlots,
-		listPending(options: { afterId?: string; limit?: number } = {}, tx: RuntimeStoreDb = db) {
-			return tx
-				.select({
-					id: outbox.id,
-					recipientId: outbox.recipientId,
-					producerKind: outbox.producerKind,
-					logicalRunId: outbox.logicalRunId,
-					arrivalSeq: outbox.arrivalSeq,
-				})
-				.from(outbox)
-				.where(
-					and(
-						eq(outbox.state, "pending"),
-						options.afterId ? gt(outbox.id, options.afterId) : undefined,
-					),
-				)
-				.orderBy(asc(outbox.id))
-				.limit(Math.min(Math.max(options.limit ?? L.pageSize, 1), L.pageSize) + 1)
-				.all();
+		listPending(options: { afterId?: string; limit?: number } = {}) {
+			return readQuery(
+				db
+					.select({
+						id: outbox.id,
+						recipientId: outbox.recipientId,
+						producerKind: outbox.producerKind,
+						logicalRunId: outbox.logicalRunId,
+						arrivalSeq: outbox.arrivalSeq,
+					})
+					.from(outbox)
+					.where(
+						and(
+							eq(outbox.state, "pending"),
+							options.afterId ? gt(outbox.id, options.afterId) : undefined,
+						),
+					)
+					.orderBy(asc(outbox.id))
+					.limit(Math.min(Math.max(options.limit ?? L.pageSize, 1), L.pageSize) + 1),
+			);
 		},
 		/** Fail actual events, but preserve running tasks' reserved capacity until their result commits. */
 		failRecipient(recipientId: string, reason: string) {

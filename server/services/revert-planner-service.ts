@@ -21,6 +21,7 @@ import {
 	fileChangeStatesEqual,
 	type KnownFileChangeState,
 } from "@shared/file-change-protocol";
+import { readNativeRows } from "../db/worker-read";
 import { AppError } from "../lib/errors";
 import type { FileChangeBlobCatalog } from "./file-change-blob-catalog";
 import { type FileChangeBlobStore, FileChangeBlobStoreError } from "./file-change-blob-store";
@@ -224,7 +225,7 @@ export class RevertPlannerService {
 				const active = context();
 				await this.guard(active, active.work, input.signal);
 				const ref = await active.work.wait(options.blobStore.putBytes(bytes, input));
-				this.ready(ref);
+				await this.ready(ref);
 				return ref;
 			},
 			mergeOptions: {
@@ -255,7 +256,7 @@ export class RevertPlannerService {
 			const original = await encodeJson({ version: 1, owner, request: fixed }, work);
 			work.charge(original.ref.sizeBytes);
 			const requestDigest = original.ref.digest;
-			this.checkIdempotency(owner, fixed.idempotencyKey, requestDigest);
+			await this.checkIdempotency(owner, fixed.idempotencyKey, requestDigest);
 			const selected = await work.wait(this.selection.collect({ ...fixed, signal: work.signal }));
 			complete(selected);
 			const groups = new Map<string, FileChangeReversalEffect[]>();
@@ -314,7 +315,7 @@ export class RevertPlannerService {
 							expectedSize: ref.sizeBytes,
 						}),
 					);
-					this.ready(ref);
+					await this.ready(ref);
 				}
 				// Verify even intendedAfter / original receipt objects that a reverse shortcut
 				// would otherwise not need to read. A catalog row alone is not raw evidence.
@@ -568,15 +569,17 @@ export class RevertPlannerService {
 			projectId: context.projectId,
 		});
 	}
-	private checkIdempotency(owner: RevertPlanOwner, key: string, digest: string) {
-		const row = this.database.$client
-			.query<
-				{ id: string; requestDigest: string; narratorId: string | null; projectId: string | null },
-				[string, string]
-			>(
-				"SELECT id,request_digest AS requestDigest,narrator_id AS narratorId,project_id AS projectId FROM revert_operations WHERE requested_by_subject_key=? AND idempotency_key=? LIMIT 1",
-			)
-			.get(owner.subjectKey, key);
+	private async checkIdempotency(owner: RevertPlanOwner, key: string, digest: string) {
+		const [row] = await readNativeRows<{
+			id: string;
+			requestDigest: string;
+			narratorId: string | null;
+			projectId: string | null;
+		}>(
+			this.database.$client,
+			"SELECT id,request_digest AS requestDigest,narrator_id AS narratorId,project_id AS projectId FROM revert_operations WHERE requested_by_subject_key=? AND idempotency_key=? LIMIT 1",
+			[owner.subjectKey, key],
+		);
 		if (!row) return;
 		if (
 			row.requestDigest !== digest ||
@@ -584,7 +587,7 @@ export class RevertPlannerService {
 			row.projectId !== owner.projectId
 		)
 			throw fail("REQUEST_CONFLICT", "Idempotency key belongs to another complete request/context");
-		const summary = this.plans.getSummary(owner, row.id);
+		const summary = await this.plans.getSummary(owner, row.id);
 		if (summary.expired)
 			throw fail("EXPIRED", "The original preview expired; use a new request key");
 		if (summary.status !== "planned" && summary.status !== "prepared")
@@ -657,15 +660,15 @@ export class RevertPlannerService {
 		await this.guard(context, work);
 		return { state, raw };
 	}
-	private ready(ref: FileChangeBlobRef) {
-		const budget = this.options.blobCatalog.getBudget();
+	private async ready(ref: FileChangeBlobRef) {
+		const budget = await this.options.blobCatalog.getBudget();
 		if (
 			budget?.status !== "ready" ||
 			budget.generation !== this.options.generation ||
 			budget.namespaceKey !== this.options.planOptions.namespaceKey
 		)
 			throw fail("CATALOG_UNVERIFIED", "The physical evidence namespace changed or is not ready");
-		const row = this.options.blobCatalog.getMetadata({
+		const row = await this.options.blobCatalog.getMetadata({
 			expectedGeneration: this.options.generation,
 			ref,
 		});
@@ -674,11 +677,11 @@ export class RevertPlannerService {
 	}
 	private async readBlob(ref: FileChangeBlobRef, work: Work, signal = work.signal) {
 		work.process(ref.sizeBytes);
-		this.ready(ref);
+		await this.ready(ref);
 		const bytes = await work.wait(
 			this.options.blobStore.readBytes(ref, { signal, maxBytes: FILE_CHANGE_LIMITS.blobBytes }),
 		);
-		this.ready(ref);
+		await this.ready(ref);
 		return bytes;
 	}
 	private async publish(raw: Encoded, work: Work) {
@@ -693,7 +696,7 @@ export class RevertPlannerService {
 				{ signal: work.signal, expectedSize: raw.ref.sizeBytes, expectedDigest: raw.ref.digest },
 			),
 		);
-		this.ready(ref);
+		await this.ready(ref);
 		// putStream itself validates digest, fsyncs, publishes and rereads the original bytes.
 		if (ref.digest !== raw.ref.digest || ref.sizeBytes !== raw.ref.sizeBytes)
 			throw fail("BLOB_INTEGRITY", "The original manifest publication did not match");

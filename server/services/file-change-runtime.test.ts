@@ -1154,7 +1154,7 @@ describe("fail closed before writes and after uncertain IO", () => {
 		expect(apply).not.toHaveBeenCalled();
 		const namespace = await runtime.initialize();
 		db.update(schema.fileChangeStorageBudgets).set({ quotaBytes: 1024 }).run();
-		expect(namespace.catalog.getBudget()?.status).toBe("ready");
+		expect((await namespace.catalog.getBudget())?.status).toBe("ready");
 		sqlite.exec(
 			"CREATE TRIGGER fail_prepare BEFORE INSERT ON file_change_effects BEGIN SELECT RAISE(ABORT, 'prepare-fault'); END",
 		);
@@ -1599,7 +1599,7 @@ describe("application data directory compatibility", () => {
 			expect(db.select().from(schema.fileChangeStorageBudgets).get()).toBeUndefined();
 			await chmod(privateRoot, 0o775);
 			const ready = await runtime.initialize();
-			expect(ready.catalog.getBudget()?.status).toBe("ready");
+			expect((await ready.catalog.getBudget())?.status).toBe("ready");
 			expect((await runtime.initialize()).sourceInstanceId).toBe(ready.sourceInstanceId);
 		},
 	);
@@ -1769,7 +1769,7 @@ describe("application data directory compatibility", () => {
 	test("concurrent initialization resets a copied namespace once and invalidates old refs", async () => {
 		await write(join(workspace, "original.txt"), "original bytes");
 		const original = await runtime.initialize();
-		const budget = original.catalog.getBudget();
+		const budget = await original.catalog.getBudget();
 		const copied = join(root, "copied-private");
 		await cp(privateRoot, copied, { recursive: true });
 		runtime = makeRuntime({ privateRoot: copied });
@@ -1778,7 +1778,7 @@ describe("application data directory compatibility", () => {
 		await runtime.initialize().catch(() => {});
 		const recovered = await runtime.verifyNamespace();
 		expect(recovered.sourceInstanceId).toBe(original.sourceInstanceId);
-		const after = recovered.catalog.getBudget();
+		const after = await recovered.catalog.getBudget();
 		expect(after?.namespaceKey).not.toBe(budget?.namespaceKey);
 		expect(after?.generation).toBe((budget?.generation ?? 0) + 1);
 		expect(after?.status).toBe("ready");
@@ -1787,7 +1787,7 @@ describe("application data directory compatibility", () => {
 		expect(after?.quotaBytes).toBe(budget?.quotaBytes);
 		expect(db.select().from(schema.fileChangeBlobReservations).all()).toEqual([]);
 		expect(effects()).toHaveLength(1);
-		expect(() => original.catalog.getBudget()).toThrow();
+		await expect(original.catalog.getBudget()).rejects.toThrow();
 		expect(
 			(await write(join(workspace, "new.txt"), "new bytes")).metadata?.fileChangeEvidence,
 		).toBeDefined();
@@ -1808,7 +1808,7 @@ describe("application data directory compatibility", () => {
 		expect(result.metadata?.fileChangeEvidence).toBeDefined();
 		expect(await readFile(path, "utf8")).toBe("after");
 		expect(apply).toHaveBeenCalledTimes(1);
-		expect((await runtime.verifyNamespace()).catalog.getBudget()?.status).toBe("ready");
+		expect((await (await runtime.verifyNamespace()).catalog.getBudget())?.status).toBe("ready");
 		const old = effects()[0];
 		expect(old.observedAfterStateJson).toEqual({ kind: "unknown", reason: "expired" });
 		// Publishing the identical digest again must not resurrect the old reference.
@@ -1949,7 +1949,7 @@ describe("application data directory compatibility", () => {
 		expect(result.metadata?.fileChangeEvidence).toBeDefined();
 		expect(effects()[0].observedAfterStateJson).toEqual({ kind: "unknown", reason: "expired" });
 		expect(effects()[1].beforeStateJson.kind).toBe("regular");
-		expect((await runtime.verifyNamespace()).catalog.getBudget()?.status).toBe("ready");
+		expect((await (await runtime.verifyNamespace()).catalog.getBudget())?.status).toBe("ready");
 	});
 
 	test("concurrent first writes after directory removal share one reset and keep every receipt", async () => {
@@ -2037,11 +2037,11 @@ describe("application data directory compatibility", () => {
 		const path = join(workspace, "retain-identity.txt");
 		expect((await write(path, "before")).isError).not.toBe(true);
 		const first = await runtime.initialize();
-		const before = first.catalog.getBudget();
+		const before = await first.catalog.getBudget();
 		runtime = makeRuntime();
 		const fresh = await runtime.initialize();
 		expect(fresh.sourceInstanceId).toBe(first.sourceInstanceId);
-		expect(fresh.catalog.getBudget()).toEqual(before);
+		expect(await fresh.catalog.getBudget()).toEqual(before);
 		expect((await edit(path, "before", "after")).isError).not.toBe(true);
 		expect(effects()).toHaveLength(2);
 	});

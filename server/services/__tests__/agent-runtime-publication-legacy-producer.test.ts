@@ -106,7 +106,7 @@ test("real pre-upgrade live completion and unknown crash are grandfathered even 
 	);
 	expect(publisher.migrateLegacyTaskNotice("parent", oldEntry)).toBe("migrated");
 	expect(publisher.migrateLegacyTaskNotice("parent", oldEntry)).toBe("migrated");
-	publisher.flushRecipient("parent");
+	await publisher.flushRecipient("parent");
 	const notices = db
 		.select()
 		.from(narratorBufferedMessages)

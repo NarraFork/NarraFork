@@ -30,6 +30,7 @@ import {
 	terminalViewState,
 	users,
 } from "../db/schema";
+import { readQuery, readQueryFirst } from "../db/worker-read";
 import { localPathSemantics } from "../lib/agent/execution/path-semantics";
 import {
 	KNOWLEDGE_KIND_PRELOAD_TOOLS,
@@ -293,19 +294,22 @@ function annotateImageBlocksWithUploadOwner(contentJson: unknown, narratorId: st
 }
 
 async function hasSharedOwnedImageMessages(narratorId: string): Promise<boolean> {
-	const sharedOwnedMessages = await db
-		.select({ contentJson: narratorMessages.contentJson })
-		.from(narratorMessages)
-		.where(
-			and(
-				eq(narratorMessages.narratorId, narratorId),
-				sql`EXISTS (
+	const sharedOwnedMessages = await readQuery(
+		db
+			.select({ contentJson: narratorMessages.contentJson })
+			.from(narratorMessages)
+			.where(
+				and(
+					eq(narratorMessages.narratorId, narratorId),
+					sql`EXISTS (
 					SELECT 1 FROM narrator_message_refs nmr
 					WHERE nmr.message_id = ${narratorMessages.id}
 					AND nmr.narrator_id != ${narratorId}
 				)`,
+				),
 			),
-		);
+		{ site: "narrator-service.hasSharedOwnedImageMessages" },
+	);
 	return sharedOwnedMessages.some((row) => contentJsonHasImageBlocks(row.contentJson));
 }
 
@@ -500,10 +504,13 @@ export async function handleLoadToolCommand(
 			await narratorService.persistDisplayMessage(narratorId, adminOnlyMsg);
 			return { toolName: displayToolName, loaded: false, alreadyLoaded: false };
 		}
-		const user = await db.query.users.findFirst({
-			where: eq(users.id, userId),
-			columns: { role: true },
-		});
+		const user = await readQuery(
+			db.query.users.findFirst({
+				where: eq(users.id, userId),
+				columns: { role: true },
+			}),
+			{ site: "narrator-service.handleLoadToolCommand" },
+		);
 		if (!user || user.role !== "admin") {
 			await narratorService.persistDisplayMessage(narratorId, adminOnlyMsg);
 			return { toolName: displayToolName, loaded: false, alreadyLoaded: false };
@@ -1268,10 +1275,13 @@ async function forkTraits(
  * clear the source. Delegated children are deleted with the source before this runs.
  */
 async function freezePolicyDependents(sourceId: string): Promise<void> {
-	const dependents = await db.query.narrators.findMany({
-		where: eq(narrators.policySourceNarratorId, sourceId),
-		columns: { id: true },
-	});
+	const dependents = await readQuery(
+		db.query.narrators.findMany({
+			where: eq(narrators.policySourceNarratorId, sourceId),
+			columns: { id: true },
+		}),
+		{ site: "narrator-service.freezePolicyDependents" },
+	);
 	if (dependents.length === 0) return;
 	const { resolveNarratorCapabilities } = await import("./trait-layer-service");
 	const ceilings = parseRuntimePolicyTraits(
@@ -1279,10 +1289,13 @@ async function freezePolicyDependents(sourceId: string): Promise<void> {
 	);
 	for (const { id } of dependents) {
 		await narratorTraitsLock.acquire(id, async () => {
-			const row = await db.query.narrators.findFirst({
-				where: eq(narrators.id, id),
-				columns: { traits: true },
-			});
+			const row = await readQuery(
+				db.query.narrators.findFirst({
+					where: eq(narrators.id, id),
+					columns: { traits: true },
+				}),
+				{ site: "narrator-service.freezePolicyDependents.traits" },
+			);
 			const traits = ceilings.reduce<unknown>(appendRuntimePolicyTrait, row?.traits);
 			await db
 				.update(narrators)
@@ -1485,9 +1498,12 @@ export async function prepareNarratorCreation(
 	input: CreateNarratorInput,
 ): Promise<PreparedNarratorCreation> {
 	if (input.chapterId) {
-		const chapter = await db.query.chapters.findFirst({
-			where: eq(chapters.id, input.chapterId),
-		});
+		const chapter = await readQuery(
+			db.query.chapters.findFirst({
+				where: eq(chapters.id, input.chapterId),
+			}),
+			{ site: "narrator-service.prepareNarratorCreation" },
+		);
 		if (!chapter) throw new NotFoundError("Chapter", input.chapterId);
 		if (chapter.status !== "active") {
 			throw new ValidationError("Cannot create narrator for non-active chapter");
@@ -1496,9 +1512,12 @@ export async function prepareNarratorCreation(
 
 	const type = input.type ?? "primary";
 	if (type === "primary" && input.chapterId) {
-		const existing = await db.query.narrators.findFirst({
-			where: and(eq(narrators.chapterId, input.chapterId), eq(narrators.variant, "primary")),
-		});
+		const existing = await readQuery(
+			db.query.narrators.findFirst({
+				where: and(eq(narrators.chapterId, input.chapterId), eq(narrators.variant, "primary")),
+			}),
+			{ site: "narrator-service.prepareNarratorCreation" },
+		);
 		if (existing) {
 			throw new ValidationError("Chapter already has a primary narrator");
 		}
@@ -1667,22 +1686,26 @@ export async function narratorCreationWorkspaceTarget(
 	row: CreationWorkspace,
 ): Promise<LifecycleTarget[]> {
 	const chapter = row.chapterId
-		? db
-				.select({ path: chapters.worktreePath, projectId: chapters.projectId })
-				.from(chapters)
-				.where(eq(chapters.id, row.chapterId))
-				.limit(1)
-				.get()
+		? await readQueryFirst(
+				db
+					.select({ path: chapters.worktreePath, projectId: chapters.projectId })
+					.from(chapters)
+					.where(eq(chapters.id, row.chapterId))
+					.limit(1),
+				{ site: "narrator-service.narratorCreationWorkspaceTarget" },
+			)
 		: undefined;
 	const scopeProjectId =
 		chapter?.projectId ?? row.contextProjectId ?? row.workspaceContext?.contextProjectId ?? null;
 	const project = scopeProjectId
-		? db
-				.select({ path: projects.gitPath })
-				.from(projects)
-				.where(eq(projects.id, scopeProjectId))
-				.limit(1)
-				.get()
+		? await readQueryFirst(
+				db
+					.select({ path: projects.gitPath })
+					.from(projects)
+					.where(eq(projects.id, scopeProjectId))
+					.limit(1),
+				{ site: "narrator-service.narratorCreationWorkspaceTarget" },
+			)
 		: undefined;
 	const cwd = resolveNarratorSessionCwd(row.cwd, chapter?.path, project?.path, getHome());
 	const deviceId = !localPathSemantics.isAbsolute(cwd)
@@ -1783,17 +1806,20 @@ export const narratorService = {
 				);
 			}
 			if (input.originToolCallId != null) {
-				const origin = await db.query.narratorToolCalls.findFirst({
-					where: eq(narratorToolCalls.id, input.originToolCallId),
-					columns: {
-						narratorId: true,
-						toolUseId: true,
-						toolName: true,
-						status: true,
-						executionAttempt: true,
-						executionStartedAt: true,
-					},
-				});
+				const origin = await readQuery(
+					db.query.narratorToolCalls.findFirst({
+						where: eq(narratorToolCalls.id, input.originToolCallId),
+						columns: {
+							narratorId: true,
+							toolUseId: true,
+							toolName: true,
+							status: true,
+							executionAttempt: true,
+							executionStartedAt: true,
+						},
+					}),
+					{ site: "narrator-service.query" },
+				);
 				if (
 					!origin ||
 					origin.narratorId !== input.parentNarratorId ||
@@ -1960,26 +1986,30 @@ export const narratorService = {
 		const scope = and(teamMembersWhere(parentNarratorId), notInArray(narrators.id, [senderId]));
 		// Match the existing last-activity convention, not incidental title/settings edits.
 		const lastActivity = sql<string>`COALESCE(${narrators.lastMessageAt}, ${narrators.updatedAt}, ${narrators.createdAt})`;
-		const targets = await db
-			.select(columns)
-			.from(narrators)
-			.where(and(scope, inArray(narrators.status, ["working", "waiting"])))
-			.limit(TEAM_BROADCAST_MAX_TARGETS + 1)
-			.all();
-		const idle = await db
-			.select({ ...columns, lastActivityAt: lastActivity })
-			.from(narrators)
-			.where(
-				and(
-					scope,
-					eq(narrators.status, "idle"),
-					sql`${lastActivity} >= ${new Date(now - 60 * 60 * 1000).toISOString()}`,
-					sql`${lastActivity} <= ${new Date(now).toISOString()}`,
-				),
-			)
-			.orderBy(desc(lastActivity), desc(narrators.id))
-			.limit(TEAM_BROADCAST_RECENT_IDLE_LIMIT + 1)
-			.all();
+		const targets = await readQuery(
+			db
+				.select(columns)
+				.from(narrators)
+				.where(and(scope, inArray(narrators.status, ["working", "waiting"])))
+				.limit(TEAM_BROADCAST_MAX_TARGETS + 1),
+			{ site: "narrator-service.listSubagentsForBroadcast" },
+		);
+		const idle = await readQuery(
+			db
+				.select({ ...columns, lastActivityAt: lastActivity })
+				.from(narrators)
+				.where(
+					and(
+						scope,
+						eq(narrators.status, "idle"),
+						sql`${lastActivity} >= ${new Date(now - 60 * 60 * 1000).toISOString()}`,
+						sql`${lastActivity} <= ${new Date(now).toISOString()}`,
+					),
+				)
+				.orderBy(desc(lastActivity), desc(narrators.id))
+				.limit(TEAM_BROADCAST_RECENT_IDLE_LIMIT + 1),
+			{ site: "narrator-service.listSubagentsForBroadcast" },
+		);
 		return {
 			targets,
 			recentIdle: idle.slice(0, TEAM_BROADCAST_RECENT_IDLE_LIMIT),
@@ -1992,10 +2022,13 @@ export const narratorService = {
 	 * Display uses listSubagentsForTeamView; broadcast uses listSubagentsForBroadcast.
 	 */
 	async listTeamMembers(rootId: string) {
-		return db.query.narrators.findMany({
-			where: teamMembersWhere(rootId),
-			orderBy: (n, { asc }) => [asc(n.createdAt)],
-		});
+		return readQuery(
+			db.query.narrators.findMany({
+				where: teamMembersWhere(rootId),
+				orderBy: (n, { asc }) => [asc(n.createdAt)],
+			}),
+			{ site: "narrator-service.listTeamMembers" },
+		);
 	},
 
 	/**
@@ -2051,29 +2084,33 @@ export const narratorService = {
 		// reads as the ordinal of the first selected column.
 		const activeFirst = sql`CASE WHEN ${narrators.status} IN ('working','waiting') THEN 0 ELSE 1 END`;
 
-		const rows = await db
-			.select({
-				id: narrators.id,
-				title: narrators.title,
-				traits: narrators.traits,
-				variant: narrators.variant,
-				status: narrators.status,
-				createdAt: narrators.createdAt,
-			})
-			.from(narrators)
-			.where(where)
-			.orderBy(activeFirst, desc(narrators.createdAt), desc(narrators.id))
-			.limit(limit)
-			.all();
+		const rows = await readQuery(
+			db
+				.select({
+					id: narrators.id,
+					title: narrators.title,
+					traits: narrators.traits,
+					variant: narrators.variant,
+					status: narrators.status,
+					createdAt: narrators.createdAt,
+				})
+				.from(narrators)
+				.where(where)
+				.orderBy(activeFirst, desc(narrators.createdAt), desc(narrators.id))
+				.limit(limit),
+			{ site: "narrator-service.listSubagentsForTeamView" },
+		);
 
-		const remainder = await db
-			.select({ id: narrators.id })
-			.from(narrators)
-			.where(where)
-			.orderBy(activeFirst, desc(narrators.createdAt), desc(narrators.id))
-			.limit(TEAM_VIEW_OMITTED_COUNT_CAP + 1)
-			.offset(rows.length)
-			.all();
+		const remainder = await readQuery(
+			db
+				.select({ id: narrators.id })
+				.from(narrators)
+				.where(where)
+				.orderBy(activeFirst, desc(narrators.createdAt), desc(narrators.id))
+				.limit(TEAM_VIEW_OMITTED_COUNT_CAP + 1)
+				.offset(rows.length),
+			{ site: "narrator-service.listSubagentsForTeamView" },
+		);
 
 		return {
 			subagents: rows,
@@ -2201,9 +2238,12 @@ export const narratorService = {
 	 * caller can distinguish "exists but not yours" from "does not exist".
 	 */
 	async getById(id: string, acl?: { userId: string; isAdmin: boolean; need?: NarratorAccessNeed }) {
-		const narrator = await db.query.narrators.findFirst({
-			where: eq(narrators.id, id),
-		});
+		const narrator = await readQuery(
+			db.query.narrators.findFirst({
+				where: eq(narrators.id, id),
+			}),
+			{ site: "narrator-service.getById" },
+		);
 		if (!narrator) throw new NotFoundError("Narrator", id);
 		if (acl) {
 			await assertNarratorAccess(
@@ -2225,9 +2265,12 @@ export const narratorService = {
 	async getByHandle(handle: string) {
 		const folded = foldHandle(handle.trim());
 		if (!folded) return null;
-		const narrator = await db.query.narrators.findFirst({
-			where: eq(narrators.handleFold, folded),
-		});
+		const narrator = await readQuery(
+			db.query.narrators.findFirst({
+				where: eq(narrators.handleFold, folded),
+			}),
+			{ site: "narrator-service.getByHandle" },
+		);
 		return narrator ?? null;
 	},
 
@@ -2245,11 +2288,14 @@ export const narratorService = {
 
 	/** List all named narrators (traits include "named"), most recent first. */
 	async listNamed() {
-		const rows = await db.query.narrators.findMany({
-			columns: { runtimeRegistrationJson: false },
-			where: and(eq(narrators.type, "primary"), isNotNull(narrators.handle)),
-			orderBy: (n, { desc }) => [desc(n.lastMessageAt), desc(n.createdAt)],
-		});
+		const rows = await readQuery(
+			db.query.narrators.findMany({
+				columns: { runtimeRegistrationJson: false },
+				where: and(eq(narrators.type, "primary"), isNotNull(narrators.handle)),
+				orderBy: (n, { desc }) => [desc(n.lastMessageAt), desc(n.createdAt)],
+			}),
+			{ site: "narrator-service.listNamed" },
+		);
 		// Defensive: only return those actually flagged as named.
 		return rows.filter((n) => parseTraits(n.traits).includes("named"));
 	},
@@ -2294,18 +2340,24 @@ export const narratorService = {
 	},
 
 	async listByChapter(chapterId: string) {
-		return db.query.narrators.findMany({
-			columns: { runtimeRegistrationJson: false },
-			where: and(eq(narrators.chapterId, chapterId), eq(narrators.variant, "primary")),
-			orderBy: (n, { asc }) => [asc(n.createdAt)],
-		});
+		return readQuery(
+			db.query.narrators.findMany({
+				columns: { runtimeRegistrationJson: false },
+				where: and(eq(narrators.chapterId, chapterId), eq(narrators.variant, "primary")),
+				orderBy: (n, { asc }) => [asc(n.createdAt)],
+			}),
+			{ site: "narrator-service.listByChapter" },
+		);
 	},
 
 	async remove(narratorId: string) {
-		const children = await db.query.narrators.findMany({
-			where: eq(narrators.parentNarratorId, narratorId),
-			columns: { id: true, type: true, variant: true },
-		});
+		const children = await readQuery(
+			db.query.narrators.findMany({
+				where: eq(narrators.parentNarratorId, narratorId),
+				columns: { id: true, type: true, variant: true },
+			}),
+			{ site: "narrator-service.remove" },
+		);
 		// A primary fork is an independent history owner, not a disposable subagent.
 		// Preserve its shared history before severing the ancestry FK.
 		const survivingForks = children.filter(
@@ -2505,20 +2557,23 @@ export const narratorService = {
 				throw new ValidationError("Cannot fork from a subagent narrator");
 			}
 
-			const parentRefs = await db
-				.select({
-					messageId: narratorMessageRefs.messageId,
-					seq: narratorMessageRefs.seq,
-					isCompact: narratorMessageRefs.isCompact,
-				})
-				.from(narratorMessageRefs)
-				.where(
-					and(
-						eq(narratorMessageRefs.narratorId, parentNarratorId),
-						inArray(narratorMessageRefs.messageId, messageIds),
-					),
-				)
-				.orderBy(narratorMessageRefs.seq);
+			const parentRefs = await readQuery(
+				db
+					.select({
+						messageId: narratorMessageRefs.messageId,
+						seq: narratorMessageRefs.seq,
+						isCompact: narratorMessageRefs.isCompact,
+					})
+					.from(narratorMessageRefs)
+					.where(
+						and(
+							eq(narratorMessageRefs.narratorId, parentNarratorId),
+							inArray(narratorMessageRefs.messageId, messageIds),
+						),
+					)
+					.orderBy(narratorMessageRefs.seq),
+				{ site: "narrator-service.query" },
+			);
 
 			if (parentRefs.length === 0) {
 				throw new ValidationError("None of the specified messages belong to this narrator");
@@ -2729,17 +2784,23 @@ export const narratorService = {
 				if (directMessageId) {
 					requestedForkMessageId = directMessageId;
 				} else if (forkMessageUuid) {
-					const msg = await db.query.narratorMessages.findFirst({
-						where: eq(narratorMessages.messageUuid, forkMessageUuid),
-						columns: { id: true },
-					});
+					const msg = await readQuery(
+						db.query.narratorMessages.findFirst({
+							where: eq(narratorMessages.messageUuid, forkMessageUuid),
+							columns: { id: true },
+						}),
+						{ site: "narrator-service.query" },
+					);
 					if (msg) {
 						requestedForkMessageId = msg.id;
 					} else {
-						const byId = await db.query.narratorMessages.findFirst({
-							where: eq(narratorMessages.id, forkMessageUuid),
-							columns: { id: true },
-						});
+						const byId = await readQuery(
+							db.query.narratorMessages.findFirst({
+								where: eq(narratorMessages.id, forkMessageUuid),
+								columns: { id: true },
+							}),
+							{ site: "narrator-service.query" },
+						);
 						if (!byId) throw new ValidationError("Fork message not found");
 						requestedForkMessageId = byId.id;
 					}
@@ -3134,19 +3195,25 @@ export const narratorService = {
 	},
 
 	async getLatestMessageUuid(narratorId: string): Promise<string | null> {
-		const latestRef = await db
-			.select({ messageId: narratorMessageRefs.messageId })
-			.from(narratorMessageRefs)
-			.where(eq(narratorMessageRefs.narratorId, narratorId))
-			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-			.limit(1);
+		const latestRef = await readQuery(
+			db
+				.select({ messageId: narratorMessageRefs.messageId })
+				.from(narratorMessageRefs)
+				.where(eq(narratorMessageRefs.narratorId, narratorId))
+				.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+				.limit(1),
+			{ site: "narrator-service.getLatestMessageUuid" },
+		);
 
 		if (!latestRef.length) return null;
 
-		const msg = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, latestRef[0].messageId),
-			columns: { messageUuid: true },
-		});
+		const msg = await readQuery(
+			db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, latestRef[0].messageId),
+				columns: { messageUuid: true },
+			}),
+			{ site: "narrator-service.getLatestMessageUuid" },
+		);
 		return msg?.messageUuid ?? null;
 	},
 

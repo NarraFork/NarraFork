@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 /**
  * NarraFork narrator → InterchangeSession → Claude Code / Codex session files.
  *
@@ -390,21 +391,23 @@ function assistantMessages(
 async function loadTools(messageIds: string[]): Promise<Map<string, ToolRow[]>> {
 	const byMessage = new Map<string, ToolRow[]>();
 	if (messageIds.length === 0) return byMessage;
-	const rows = await db
-		.select({
-			messageId: narratorToolCalls.messageId,
-			toolUseId: narratorToolCalls.toolUseId,
-			toolName: narratorToolCalls.toolName,
-			inputJson: narratorToolCalls.inputJson,
-			outputJson: narratorToolCalls.outputJson,
-			status: narratorToolCalls.status,
-			errorMessage: narratorToolCalls.errorMessage,
-			completedAt: narratorToolCalls.completedAt,
-			createdAt: narratorToolCalls.createdAt,
-		})
-		.from(narratorToolCalls)
-		.where(inArray(narratorToolCalls.messageId, messageIds))
-		.orderBy(asc(narratorToolCalls.createdAt), asc(narratorToolCalls.id));
+	const rows = await readQuery(
+		db
+			.select({
+				messageId: narratorToolCalls.messageId,
+				toolUseId: narratorToolCalls.toolUseId,
+				toolName: narratorToolCalls.toolName,
+				inputJson: narratorToolCalls.inputJson,
+				outputJson: narratorToolCalls.outputJson,
+				status: narratorToolCalls.status,
+				errorMessage: narratorToolCalls.errorMessage,
+				completedAt: narratorToolCalls.completedAt,
+				createdAt: narratorToolCalls.createdAt,
+			})
+			.from(narratorToolCalls)
+			.where(inArray(narratorToolCalls.messageId, messageIds))
+			.orderBy(asc(narratorToolCalls.createdAt), asc(narratorToolCalls.id)),
+	);
 	for (const row of rows) {
 		if (!row.messageId) continue;
 		const list = byMessage.get(row.messageId);
@@ -445,10 +448,9 @@ async function readTopLevel(narratorId: string, ctx: ReadContext): Promise<Inter
 		if (page.refs.length === 0) continue;
 		const ids = page.refs.map((ref) => ref.messageId);
 		const compactIds = new Set(page.refs.filter((ref) => ref.isCompact).map((r) => r.messageId));
-		const loaded = await db
-			.select()
-			.from(narratorMessages)
-			.where(inArray(narratorMessages.id, ids));
+		const loaded = await readQuery(
+			db.select().from(narratorMessages).where(inArray(narratorMessages.id, ids)),
+		);
 		const byId = new Map(loaded.map((row) => [row.id, row]));
 		const ordered = ids.flatMap((id) => {
 			const row = byId.get(id);
@@ -468,25 +470,27 @@ async function readTopLevel(narratorId: string, ctx: ReadContext): Promise<Inter
 async function loadSubagents(
 	parentId: string,
 ): Promise<Array<{ id: string; toolUseId: string; variant: string; title: string | null }>> {
-	const rows = await db
-		.select({
-			id: narrators.id,
-			variant: narrators.variant,
-			subagentType: narrators.subagentType,
-			title: narrators.title,
-			toolUseId: narratorToolCalls.toolUseId,
-		})
-		.from(narrators)
-		.innerJoin(narratorToolCalls, eq(narratorToolCalls.id, narrators.originToolCallId))
-		.where(
-			and(
-				eq(narrators.parentNarratorId, parentId),
-				eq(narrators.type, "subagent"),
-				eq(narrators.subagentOriginKind, "tool"),
-			),
-		)
-		.orderBy(asc(narrators.createdAt), asc(narrators.id))
-		.limit(SESSION_EXPORT_MAX_SUBAGENTS + 1);
+	const rows = await readQuery(
+		db
+			.select({
+				id: narrators.id,
+				variant: narrators.variant,
+				subagentType: narrators.subagentType,
+				title: narrators.title,
+				toolUseId: narratorToolCalls.toolUseId,
+			})
+			.from(narrators)
+			.innerJoin(narratorToolCalls, eq(narratorToolCalls.id, narrators.originToolCallId))
+			.where(
+				and(
+					eq(narrators.parentNarratorId, parentId),
+					eq(narrators.type, "subagent"),
+					eq(narrators.subagentOriginKind, "tool"),
+				),
+			)
+			.orderBy(asc(narrators.createdAt), asc(narrators.id))
+			.limit(SESSION_EXPORT_MAX_SUBAGENTS + 1),
+	);
 	return rows.map((row) => ({
 		id: row.id,
 		toolUseId: row.toolUseId,
@@ -505,7 +509,9 @@ export async function narratorToInterchange(
 	narratorId: string,
 	signal?: AbortSignal,
 ): Promise<InterchangeSession> {
-	const narrator = await db.query.narrators.findFirst({ where: eq(narrators.id, narratorId) });
+	const narrator = await readQuery(
+		db.query.narrators.findFirst({ where: eq(narrators.id, narratorId) }),
+	);
 	if (!narrator) throw new NotFoundError("Narrator", narratorId);
 
 	const warnings = new WarningCollector();

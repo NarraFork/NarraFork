@@ -301,7 +301,7 @@ beforeAll(async () => {
 					bufferSoftStop: active?._bufferSoftStop,
 					guidancePending: active?._bufferGuidancePending,
 				},
-				pendingHead: getBufferedMessages(parent)[0]?.text ?? null,
+				pendingHead: (await getBufferedMessages(parent))[0]?.text ?? null,
 				queue: rows.map((row) => ({
 					text: row.text,
 					state: row.state,
@@ -316,9 +316,9 @@ beforeAll(async () => {
 			oldOwnerReleased: !owner?.isCurrent(),
 			selectedId: selected.id,
 			selectedState: rows.find((row) => row.id === selected.id)?.state,
-			selectedPending: getBufferedMessages(parent).some((row) => row.id === selected.id),
+			selectedPending: (await getBufferedMessages(parent)).some((row) => row.id === selected.id),
 			users,
-			queueOrder: getBufferedMessages(parent).map((row) => row.text),
+			queueOrder: (await getBufferedMessages(parent)).map((row) => row.text),
 		};
 	} finally {
 		closeNarrator(parent);
@@ -375,7 +375,7 @@ test("POST retry promotes selected failed urgent A ahead of newer urgent B befor
 	);
 	const newer = await queued("newer urgent B", narratorId);
 	await updateBufferedMessageMode(narratorId, newer.id, "interrupt");
-	expect(getBufferedMessages(narratorId).map((row) => row.text)).toEqual([
+	expect((await getBufferedMessages(narratorId)).map((row) => row.text)).toEqual([
 		"newer urgent B",
 		"retry selected urgent A",
 	]);
@@ -396,7 +396,7 @@ test("POST retry promotes selected failed urgent A ahead of newer urgent B befor
 			"retry A and B dispatched",
 		);
 		expect(calls.slice(callStart)).toEqual(["retry selected urgent A", "newer urgent B"]);
-		expect(getBufferedMessages(narratorId)).toHaveLength(0);
+		expect(await getBufferedMessages(narratorId)).toHaveLength(0);
 	} finally {
 		closeNarrator(narratorId);
 		await until(() => !getExecutionOwner(narratorId), "retry cleanup");
@@ -435,7 +435,7 @@ test("receipt timeout retains the urgent payload and staged attachment ownership
 	expect(after?.imagesJson).toBe(before?.imagesJson);
 	expect(after?.textFilePathsJson).toBe(before?.textFilePathsJson);
 	expect(after?.metadataJson).toBe(before?.metadataJson);
-	const projected = getBufferedMessages(parent).find((row) => row.id === input.id);
+	const projected = (await getBufferedMessages(parent)).find((row) => row.id === input.id);
 	expect(projected?.textFiles?.[0] && (await projected.textFiles[0].text())).toBe("keep me");
 });
 
@@ -543,7 +543,7 @@ test("taken-over child Await is interrupted without ending takeover or skipping 
 		const run = getRunControl(child);
 		expect(active).toBeDefined();
 		await queued("child older tool guidance", child);
-		applyBufferedQueueModeControl(child, "tool", true, true);
+		await applyBufferedQueueModeControl(child, "tool", true, true);
 		expect(toolSignal.aborted).toBe(false);
 		const selected = await queued("child selected urgent guidance", child);
 		const response = await actualRoutes.request(`/${child}/buffer/${selected.id}/mode`, {
@@ -574,7 +574,7 @@ test("taken-over child Await is interrupted without ending takeover or skipping 
 			"child selected urgent guidance",
 			"child older tool guidance",
 		]);
-		expect(getBufferedMessages(child)).toHaveLength(0);
+		expect(await getBufferedMessages(child)).toHaveLength(0);
 		// Releasing the hold ends the same run normally.
 		expect(await controlRun(child, { kind: "release" })).toBe(true);
 		const result = await handle.terminal;

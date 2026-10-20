@@ -162,7 +162,7 @@ describe("real task producers use publication outbox", () => {
 		expect(db.select().from(runtimePublicationOutbox).all()[0].logicalRunId).toBe(
 			task.logicalRunId,
 		);
-		expect(publisher.readAgentTerminalResult(old)).toEqual({ output: "OLD RESULT" });
+		expect(await publisher.readAgentTerminalResult(old)).toEqual({ output: "OLD RESULT" });
 	});
 
 	test("101st Bash completion is terminal while full mailbox retains its intent and immutable source", async () => {
@@ -170,7 +170,7 @@ describe("real task producers use publication outbox", () => {
 		await startBash("last");
 		expect(await tasks.markCompleted("last", "complete result")).toBe(true);
 		expect((await tasks.getById("last"))?.status).toBe("completed");
-		publisher.flushRecipient("parent");
+		await publisher.flushRecipient("parent");
 		expect(pending("bash")).toHaveLength(100);
 		const [intent] = db.select().from(runtimePublicationOutbox).all();
 		expect(intent.state).toBe("pending");
@@ -186,11 +186,11 @@ describe("real task producers use publication outbox", () => {
 		fill("bash");
 		await startBash("early");
 		await tasks.markCompleted("early", "earlier");
-		publisher.flushRecipient("parent");
+		await publisher.flushRecipient("parent");
 		mailbox.cancel(pending("bash")[0].deliveryId ?? "", "free one slot");
 		await startBash("late");
 		await tasks.markCompleted("late", "later");
-		publisher.flushRecipient("parent");
+		await publisher.flushRecipient("parent");
 		const fresh = pending("bash").filter((row) => row.metadataJson);
 		expect(fresh).toHaveLength(1);
 		expect(JSON.parse(fresh[0].metadataJson ?? "{}").taskId).toBe("early");
@@ -217,8 +217,8 @@ describe("real task producers use publication outbox", () => {
 		expect(db.select().from(narratorMessages).all()).toHaveLength(0);
 		expect(await tasks.markCompleted("atomic", "output")).toBe(true);
 		expect(await tasks.markCompleted("atomic", "MUST NOT REPLACE")).toBe(false);
-		publisher.flushRecipient("parent");
-		publisher.flushRecipient("parent");
+		await publisher.flushRecipient("parent");
+		await publisher.flushRecipient("parent");
 		expect(pending("bash")).toHaveLength(1);
 		expect((await tasks.getById("atomic"))?.output).toBe("output");
 		expect(db.select().from(narratorMessages).all()).toHaveLength(0);
@@ -233,7 +233,7 @@ describe("real task producers use publication outbox", () => {
 		if (status === "failed") await tasks.markFailed(status, "failure");
 		if (status === "timeout") await tasks.markTimedOut(status, "deadline");
 		if (status === "cancelled") await tasks.markCancelled(status);
-		publisher.flushRecipient("parent");
+		await publisher.flushRecipient("parent");
 		expect(JSON.parse(pending("bash")[0].metadataJson ?? "{}").eventKind).toBe(
 			status === "timeout" ? "timed_out" : status,
 		);
@@ -284,7 +284,7 @@ describe("real task producers use publication outbox", () => {
 		}).publication!;
 		expect(restored).toEqual(second);
 		await tasks.markCompleted("child", "second result");
-		publisher.flushRecipient("parent");
+		await publisher.flushRecipient("parent");
 		expect(pending("agent").map((row) => JSON.parse(row.metadataJson ?? "{}").eventKind)).toEqual([
 			"completed",
 			"started",
@@ -303,8 +303,8 @@ describe("real task producers use publication outbox", () => {
 		await startBash("recovered");
 		await tasks.markCompleted("recovered", "durable");
 		const restartedWorker = createRuntimePublicationService(db);
-		expect(restartedWorker.flushPage()).toBe(true);
-		expect(restartedWorker.flushPage()).toBe(false);
+		expect(await restartedWorker.flushPage()).toBe(true);
+		expect(await restartedWorker.flushPage()).toBe(false);
 		expect(pending("bash")).toHaveLength(1);
 		expect(db.select().from(backgroundTasks).all()).toHaveLength(1);
 		restartedWorker.stop();
@@ -390,7 +390,7 @@ describe("real task producers use publication outbox", () => {
 			.where(eq(backgroundTasks.id, "retained"))
 			.run();
 		expect(await tasks.cleanupCompleted(0)).toBe(0);
-		publisher.flushRecipient("parent");
+		await publisher.flushRecipient("parent");
 		expect(await tasks.cleanupCompleted(0)).toBe(0);
 		db.update(narratorBufferedMessages)
 			.set({ state: "materialized", adoptedAt: new Date().toISOString() })

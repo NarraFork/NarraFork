@@ -17,7 +17,7 @@
  *   4. CHANGES OUTSIDE THE PARENT'S WORKSPACE SURVIVE ITS REVERT, and must say so.
  */
 
-import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import {
 	fileAttributions,
@@ -30,6 +30,10 @@ import {
 	narrators,
 	narratorToolCalls,
 } from "../../db/schema";
+import * as workerRead from "../../db/worker-read";
+import { logger } from "../../lib/logger";
+import { sqlExecutionDiagnostics } from "../../lib/sql-execution-diagnostics";
+import type { SubagentFileChangeReadTiming } from "../subagent-file-changes";
 
 const { db, sqlite } = getTestDb();
 // The real module is captured and restored in `afterAll`: `mock.module` is
@@ -442,6 +446,98 @@ describe("getSubagentFileChanges — aggregation", () => {
 });
 
 describe("getFileChangesBySubagent — the card projection", () => {
+	test("records bounded stage results without changing reads or promise ordering", async () => {
+		await attribute({ narratorId: "sub-a", filePath: "private-file.ts", linesAdded: 3 });
+		const original = workerRead.readQuery;
+		const events: string[] = [];
+		const read = spyOn(workerRead, "readQuery").mockImplementation((...args) => {
+			events.push("read");
+			queueMicrotask(() => events.push("microtask"));
+			return original(...args);
+		});
+		try {
+			const expected = await getFileChangesBySubagent(["sub-a", "sub-a"]);
+			const expectedEvents = [...events];
+			events.length = 0;
+			const timing: SubagentFileChangeReadTiming = {};
+			const actual = await getFileChangesBySubagent(["sub-a", "sub-a"], {}, timing);
+			expect(actual).toEqual(expected);
+			expect(events).toEqual(expectedEvents);
+			expect(timing).toMatchObject({
+				childrenCount: 1,
+				scopesCount: 0,
+				legacyRows: 1,
+				resultOwners: 1,
+			});
+			for (const stage of [
+				"childrenMs",
+				"scopesMs",
+				"exactChangesMs",
+				"legacyAttributionMs",
+				"mappingSortMs",
+				"totalMs",
+			] as const) {
+				expect(timing[stage]).toBeGreaterThanOrEqual(0);
+			}
+			expect(timing.failedStage).toBeUndefined();
+			expect(JSON.stringify(timing)).not.toContain("private-file");
+			expect(JSON.stringify(timing)).not.toContain("sub-a");
+		} finally {
+			read.mockRestore();
+		}
+	});
+
+	test.each([
+		"childrenMs",
+		"scopesMs",
+		"exactChangesMs",
+		"legacyAttributionMs",
+	] as const)("retains best-effort error behavior in %s", async (failedStage) => {
+		const failedRead = failedStage === "childrenMs" ? 1 : 2;
+		const original = workerRead.readQuery;
+		let calls = 0;
+		const read = spyOn(workerRead, "readQuery").mockImplementation((...args) => {
+			if (++calls === failedRead) return Promise.reject(new Error("private diagnostic failure"));
+			return original(...args);
+		});
+		try {
+			const timing: SubagentFileChangeReadTiming = {};
+			const result = await getFileChangesBySubagent(
+				["sub-a"],
+				{
+					scopesBySubagent:
+						failedStage === "scopesMs"
+							? new Map([["sub-a", { sourceToolUseId: "private-tool-id" }]])
+							: undefined,
+					executionBoundariesBySubagent:
+						failedStage === "exactChangesMs"
+							? new Map([
+									[
+										"sub-a",
+										{
+											sourceToolCallId: "parent-call",
+											executionAttempt: 1,
+											executionIdentityVersion: 1,
+											executionSegmentId: "private-segment",
+										},
+									],
+								])
+							: undefined,
+				},
+				timing,
+			);
+			expect(result).toEqual(new Map());
+			expect(calls).toBe(failedRead);
+			expect(timing.failedStage).toBe(failedStage);
+			expect(timing.totalMs).toBeGreaterThanOrEqual(0);
+			expect(timing.resultOwners).toBe(0);
+			expect(timing.legacyRows).toBeUndefined();
+			expect(JSON.stringify(timing)).not.toContain("private diagnostic failure");
+		} finally {
+			read.mockRestore();
+		}
+	});
+
 	// This function and `getSubagentFileChanges` answer the same question for two
 	// audiences (a card, and text injected for the model). Where they disagree, the
 	// card is the wrong answer the user actually sees — so the tests here are mostly
@@ -510,6 +606,45 @@ describe("getFileChangesBySubagent — the card projection", () => {
 		// Distinct paths, not attribution rows.
 		expect(entry?.bashTouchedCount).toBe(2);
 		expect(entry?.files).toEqual([]);
+	});
+
+	test("exact diagnostics split reads and mapping with fixed sites and unchanged card results", async () => {
+		await exactEffect({
+			segmentId: "private-segment",
+			operationId: "private-operation",
+			linesAdded: 4,
+		});
+		await parentExecutionCall("private-segment");
+		const options = await getCurrentSubagentFileChangeOptions(["sub-a"]);
+		const expected = await getFileChangesBySubagent(["sub-a"], options);
+		const original = workerRead.readQuery;
+		const sites: string[] = [];
+		const read = spyOn(workerRead, "readQuery").mockImplementation((...args) => {
+			if (args[1]?.site) sites.push(args[1].site);
+			return original(...args);
+		});
+		try {
+			const timing: SubagentFileChangeReadTiming = {};
+			expect(await getFileChangesBySubagent(["sub-a"], options, timing)).toEqual(expected);
+			expect(sites).toEqual([
+				"subagent.exact.boundary",
+				"subagent.exact.segments",
+				"subagent.exact.segments",
+				"subagent.exact.operations",
+				"subagent.exact.effects",
+			]);
+			for (const stage of [
+				"exactBoundaryMs",
+				"exactSegmentsMs",
+				"exactOperationsReadMs",
+				"exactEffectsReadMs",
+				"exactMappingMs",
+			] as const)
+				expect(timing[stage]).toBeGreaterThanOrEqual(0);
+			expect(JSON.stringify({ timing, sites })).not.toMatch(/private-|sub-a|current.ts/);
+		} finally {
+			read.mockRestore();
+		}
 	});
 
 	test("uses only the current execution segment for exact v2 attribution", async () => {
@@ -734,8 +869,8 @@ describe("getFileChangesBySubagent — the card projection", () => {
 				await getCurrentSubagentFileChangeOptions(["sub-a"], "wrong-parent")
 			).executionBoundariesBySubagent?.get("sub-a"),
 		).toBeNull();
-		recordTeamFileChange(PARENT, "sub-a", "uncertain.ts");
-		recordTeamFileChange(PARENT, "sub-a", "src/current.ts", {
+		await recordTeamFileChange(PARENT, "sub-a", "uncertain.ts");
+		await recordTeamFileChange(PARENT, "sub-a", "src/current.ts", {
 			deviceId: "local",
 			workspacePath: WORKSPACE,
 		});
@@ -826,7 +961,31 @@ describe("getFileChangesBySubagent — the card projection", () => {
 			seq: 1,
 		});
 		const { narratorMessageQueries } = await import("../narrator-messages");
-		const page = await narratorMessageQueries.getPretextDocumentPage(PARENT);
+		let diagnosticClock = 0;
+		const diagnosticTimer = spyOn(performance, "now").mockImplementation(
+			() => (diagnosticClock += 300),
+		);
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		let correlation: ReturnType<typeof sqlExecutionDiagnostics.correlation> | undefined;
+		const page = await sqlExecutionDiagnostics.scope(
+			"request",
+			async () => {
+				correlation = sqlExecutionDiagnostics.correlation();
+				try {
+					const result = await narratorMessageQueries.getPretextDocumentPage(PARENT);
+					const slow = warn.mock.calls.find(
+						([message]) => message === "Slow narrator display page hydration",
+					);
+					expect(slow?.[1]).toMatchObject({ ...correlation, requestId: "message-page-request" });
+					expect(JSON.stringify(slow?.[1])).not.toContain("src/current.ts");
+					return result;
+				} finally {
+					diagnosticTimer.mockRestore();
+					warn.mockRestore();
+				}
+			},
+			"message-page-request",
+		);
 		const card = page.messages[0]?.contentJson.find(
 			(block: { type: string }) => block.type === "tool_use",
 		)?._subagentActivity;
@@ -1524,7 +1683,7 @@ describe("in-memory TeamStatus source and the DB aggregate agree", () => {
 			["remote-a", WORKSPACE],
 			["remote-a", OTHER_WORKSPACE],
 		]) {
-			recordTeamFileChange(PARENT, "sub-a", "same.ts", { deviceId, workspacePath });
+			await recordTeamFileChange(PARENT, "sub-a", "same.ts", { deviceId, workspacePath });
 			await attribute({
 				narratorId: "sub-a",
 				filePath: "same.ts",
@@ -1533,7 +1692,7 @@ describe("in-memory TeamStatus source and the DB aggregate agree", () => {
 				linesAdded: 1,
 			});
 		}
-		recordTeamFileChange(PARENT, "sub-a", "same.ts", {
+		await recordTeamFileChange(PARENT, "sub-a", "same.ts", {
 			deviceId: "local",
 			workspacePath: WORKSPACE,
 		});
@@ -1555,11 +1714,11 @@ describe("in-memory TeamStatus source and the DB aggregate agree", () => {
 		} = await import("../subagent-team");
 		clearTeamFileChanges(PARENT);
 		await makeNarrator("ordinary-fork", PARENT, WORKSPACE, { type: "primary", variant: "primary" });
-		recordTeamFileChange(PARENT, "ordinary-fork", "fork.ts", {
+		await recordTeamFileChange(PARENT, "ordinary-fork", "fork.ts", {
 			deviceId: "local",
 			workspacePath: WORKSPACE,
 		});
-		recordTeamFileChange(PARENT, "sub-a", "legacy.ts");
+		await recordTeamFileChange(PARENT, "sub-a", "legacy.ts");
 		expect(getTeamFileChanges(PARENT).has("ordinary-fork")).toBe(false);
 		expect(getTeamFileChangeEntries(PARENT).get("sub-a")?.[0]).toEqual({
 			deviceId: null,
@@ -1581,7 +1740,7 @@ describe("in-memory TeamStatus source and the DB aggregate agree", () => {
 
 		// One change, recorded the way `trackFileChange` records it: the in-memory team
 		// map AND an attribution row.
-		recordTeamFileChange(PARENT, "sub-a", "src/shared.ts", {
+		await recordTeamFileChange(PARENT, "sub-a", "src/shared.ts", {
 			deviceId: "local",
 			workspacePath: WORKSPACE,
 		});
@@ -1618,7 +1777,7 @@ describe("in-memory TeamStatus source and the DB aggregate agree", () => {
 		clearTeamFileChanges(PARENT);
 		clearTeamFileChanges("other-parent");
 
-		recordTeamFileChange("other-parent", "other-sub", "theirs.ts");
+		await recordTeamFileChange("other-parent", "other-sub", "theirs.ts");
 		expect(getTeamFileChanges(PARENT).size).toBe(0);
 		expect((await getSubagentFileChanges(PARENT)).totalFiles).toBe(0);
 

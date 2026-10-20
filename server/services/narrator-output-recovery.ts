@@ -1,6 +1,7 @@
 import { and, desc, eq } from "drizzle-orm";
 import { db } from "../db";
 import { narratorMessageRefs, narratorMessages } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { narratorPersistence } from "./narrator-persistence";
 
 function isTextualBlock(block: unknown): block is Record<string, unknown> {
@@ -47,10 +48,13 @@ export async function completeAssistantOutput(
 	narratorId: string,
 	messageId: string,
 ): Promise<string> {
-	const message = await db.query.narratorMessages.findFirst({
-		where: eq(narratorMessages.id, messageId),
-		columns: { contentJson: true },
-	});
+	const message = await readQuery(
+		db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, messageId),
+			columns: { contentJson: true },
+		}),
+		{ site: "narrator-output-recovery.completeAssistantOutput" },
+	);
 	const completed = completeOutputBlocks(message?.contentJson);
 	if (!completed) return messageId;
 	// The persistence method updates recipient refs, versions and character accounting too.
@@ -72,15 +76,18 @@ export async function completeAssistantOutput(
 export async function cleanupIncompleteNarratorOutput(
 	narratorId: string,
 ): Promise<{ messageId?: string; removedBlocks: number }> {
-	const [message] = await db
-		.select({ id: narratorMessages.id, contentJson: narratorMessages.contentJson })
-		.from(narratorMessageRefs)
-		.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-		.where(
-			and(eq(narratorMessageRefs.narratorId, narratorId), eq(narratorMessages.role, "assistant")),
-		)
-		.orderBy(desc(narratorMessageRefs.seq))
-		.limit(1);
+	const [message] = await readQuery(
+		db
+			.select({ id: narratorMessages.id, contentJson: narratorMessages.contentJson })
+			.from(narratorMessageRefs)
+			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+			.where(
+				and(eq(narratorMessageRefs.narratorId, narratorId), eq(narratorMessages.role, "assistant")),
+			)
+			.orderBy(desc(narratorMessageRefs.seq))
+			.limit(1),
+		{ site: "narrator-output-recovery.cleanupIncompleteNarratorOutput" },
+	);
 	if (!message) return { removedBlocks: 0 };
 	const retained = removeIncompleteOutputBlocks(message.contentJson);
 	if (!retained) return { messageId: message.id, removedBlocks: 0 };

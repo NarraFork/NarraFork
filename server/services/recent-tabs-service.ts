@@ -1,3 +1,4 @@
+import { readQuery, readQueryFirst } from "@server/db/worker-read";
 import {
 	type PersistedRecentTab,
 	RECENT_TABS_LEGACY_LIMIT,
@@ -176,23 +177,27 @@ export async function runExpiredRecentTabsWorkspaceCleanup(now = Date.now()): Pr
 		pendingWorkspaceCleanups.delete(cleanup.token);
 		const undo = undoByUser.get(cleanup.userId);
 		if (undo?.token === cleanup.token && undo.expiresAt <= now) undoByUser.delete(cleanup.userId);
-		const referencedRows = await db
-			.select({ id: userRecentTabs.entityId })
-			.from(userRecentTabs)
-			.where(
-				and(
-					eq(userRecentTabs.userId, cleanup.userId),
-					eq(userRecentTabs.type, "workspace"),
-					inArray(userRecentTabs.entityId, cleanup.workspaceIds),
+		const referencedRows = await readQuery(
+			db
+				.select({ id: userRecentTabs.entityId })
+				.from(userRecentTabs)
+				.where(
+					and(
+						eq(userRecentTabs.userId, cleanup.userId),
+						eq(userRecentTabs.type, "workspace"),
+						inArray(userRecentTabs.entityId, cleanup.workspaceIds),
+					),
 				),
-			);
+		);
 		const referenced = new Set(referencedRows.map((row) => row.id));
 		const orphanIds = cleanup.workspaceIds.filter((id) => !referenced.has(id));
 		if (orphanIds.length === 0) continue;
-		const existingRows = await db
-			.select({ id: workspaces.id })
-			.from(workspaces)
-			.where(and(eq(workspaces.userId, cleanup.userId), inArray(workspaces.id, orphanIds)));
+		const existingRows = await readQuery(
+			db
+				.select({ id: workspaces.id })
+				.from(workspaces)
+				.where(and(eq(workspaces.userId, cleanup.userId), inArray(workspaces.id, orphanIds))),
+		);
 		if (existingRows.length === 0) continue;
 		await db.delete(workspaces).where(
 			and(
@@ -467,23 +472,27 @@ function rowToTab(row: RecentTabRow): PersistedRecentTab {
  */
 const EXCLUDE_REMOVED_TAB_TYPES = ne(userRecentTabs.type, "group");
 
-function readRows(userId: string): RecentTabRow[] {
-	return db
-		.select()
-		.from(userRecentTabs)
-		.where(and(eq(userRecentTabs.userId, userId), EXCLUDE_REMOVED_TAB_TYPES))
-		.orderBy(asc(userRecentTabs.sortOrder), asc(userRecentTabs.tabKey))
-		.limit(RECENT_TABS_STORAGE_LIMIT + 1)
-		.all();
+async function readRows(userId: string): Promise<RecentTabRow[]> {
+	return readQuery(
+		db
+			.select()
+			.from(userRecentTabs)
+			.where(and(eq(userRecentTabs.userId, userId), EXCLUDE_REMOVED_TAB_TYPES))
+			.orderBy(asc(userRecentTabs.sortOrder), asc(userRecentTabs.tabKey))
+			.limit(RECENT_TABS_STORAGE_LIMIT + 1),
+	);
 }
 
-function readRevision(userId: string): number | null {
+async function readRevision(userId: string): Promise<number | null> {
 	return (
-		db
-			.select({ revision: userRecentTabsMeta.revision })
-			.from(userRecentTabsMeta)
-			.where(eq(userRecentTabsMeta.userId, userId))
-			.get()?.revision ?? null
+		(
+			await readQueryFirst(
+				db
+					.select({ revision: userRecentTabsMeta.revision })
+					.from(userRecentTabsMeta)
+					.where(eq(userRecentTabsMeta.userId, userId)),
+			)
+		)?.revision ?? null
 	);
 }
 
@@ -776,15 +785,16 @@ function applyPanelMembershipInTransaction(
 	tx.delete(workspacePanels).where(eq(workspacePanels.id, write.panelId)).run();
 }
 
-function ensureMigratedLocked(userId: string): number {
-	const existingRevision = readRevision(userId);
+async function ensureMigratedLocked(userId: string): Promise<number> {
+	const existingRevision = await readRevision(userId);
 	if (existingRevision != null) return existingRevision;
 
-	const legacy = db
-		.select({ recentTabs: userPreferences.recentTabs })
-		.from(userPreferences)
-		.where(eq(userPreferences.userId, userId))
-		.get();
+	const legacy = await readQueryFirst(
+		db
+			.select({ recentTabs: userPreferences.recentTabs })
+			.from(userPreferences)
+			.where(eq(userPreferences.userId, userId)),
+	);
 	const tabs = parseLegacyTabs(legacy?.recentTabs);
 	const now = new Date().toISOString();
 
@@ -800,7 +810,7 @@ function ensureMigratedLocked(userId: string): number {
 
 /** Lazily migrate one user's legacy JSON array into the authoritative row store. */
 export async function ensureMigrated(userId: string): Promise<number> {
-	return userPreferencesLock.acquire(userId, async () => ensureMigratedLocked(userId));
+	return userPreferencesLock.acquire(userId, async () => await ensureMigratedLocked(userId));
 }
 
 const MIGRATION_BATCH_SIZE = 100;
@@ -809,18 +819,20 @@ let ensureAllRecentTabsMigrationPromise: Promise<void> | undefined;
 async function runAllRecentTabsMigration(): Promise<void> {
 	let cursor: string | undefined;
 	while (true) {
-		const rows = await db
-			.select({ userId: userPreferences.userId })
-			.from(userPreferences)
-			.leftJoin(userRecentTabsMeta, eq(userRecentTabsMeta.userId, userPreferences.userId))
-			.where(
-				and(
-					isNull(userRecentTabsMeta.userId),
-					cursor ? gt(userPreferences.userId, cursor) : undefined,
-				),
-			)
-			.orderBy(asc(userPreferences.userId))
-			.limit(MIGRATION_BATCH_SIZE);
+		const rows = await readQuery(
+			db
+				.select({ userId: userPreferences.userId })
+				.from(userPreferences)
+				.leftJoin(userRecentTabsMeta, eq(userRecentTabsMeta.userId, userPreferences.userId))
+				.where(
+					and(
+						isNull(userRecentTabsMeta.userId),
+						cursor ? gt(userPreferences.userId, cursor) : undefined,
+					),
+				)
+				.orderBy(asc(userPreferences.userId))
+				.limit(MIGRATION_BATCH_SIZE),
+		);
 		if (rows.length === 0) break;
 		for (const row of rows) await ensureMigrated(row.userId);
 		cursor = rows.at(-1)?.userId;
@@ -830,12 +842,14 @@ async function runAllRecentTabsMigration(): Promise<void> {
 }
 
 async function migratePendingRecentTabsUsers(): Promise<void> {
-	const pending = await db
-		.select({ userId: userPreferences.userId })
-		.from(userPreferences)
-		.leftJoin(userRecentTabsMeta, eq(userRecentTabsMeta.userId, userPreferences.userId))
-		.where(isNull(userRecentTabsMeta.userId))
-		.limit(1);
+	const pending = await readQuery(
+		db
+			.select({ userId: userPreferences.userId })
+			.from(userPreferences)
+			.leftJoin(userRecentTabsMeta, eq(userRecentTabsMeta.userId, userPreferences.userId))
+			.where(isNull(userRecentTabsMeta.userId))
+			.limit(1),
+	);
 	if (pending.length > 0) await runAllRecentTabsMigration();
 }
 
@@ -1027,8 +1041,8 @@ async function mutate(
 	transform: (tabs: PersistedRecentTab[]) => MutationState | Promise<MutationState>,
 ): Promise<RecentTabsMutationResult> {
 	return userPreferencesLock.acquire(userId, async () => {
-		const baseRevision = ensureMigratedLocked(userId);
-		const oldRows = readRows(userId);
+		const baseRevision = await ensureMigratedLocked(userId);
+		const oldRows = await readRows(userId);
 		const before = oldRows.map(rowToTab);
 		const transformed = await transform(before.map(cloneTab));
 		const normalized = normalizeAndLimitTabs(transformed.tabs);
@@ -1183,8 +1197,8 @@ export async function upsertRecentTabsBatch(
 		throw new ValidationError(`Recent-tabs batch must contain 1-${RECENT_TABS_WS_BATCH_SIZE} tabs`);
 	}
 	return userPreferencesLock.acquire(userId, async () => {
-		const baseRevision = ensureMigratedLocked(userId);
-		const oldRows = readRows(userId);
+		const baseRevision = await ensureMigratedLocked(userId);
+		const oldRows = await readRows(userId);
 		const before = oldRows.map(rowToTab);
 		let after = before.map(cloneTab);
 		const orderedInputs = [
@@ -1241,8 +1255,8 @@ export async function applyWorkspaceMembershipProjection(
 	},
 ): Promise<RecentTabsMutationResult> {
 	return userPreferencesLock.acquire(userId, async () => {
-		const baseRevision = ensureMigratedLocked(userId);
-		const oldRows = readRows(userId);
+		const baseRevision = await ensureMigratedLocked(userId);
+		const oldRows = await readRows(userId);
 		const before = oldRows.map(rowToTab);
 		const after = before.map((tab) => {
 			if (getTabNarratorId(tab) !== input.narratorId) return cloneTab(tab);
@@ -1283,7 +1297,7 @@ export async function removeRecentTab(
 	// Chapter tabs carry a workspaceId only because their NARRATOR is a member —
 	// closing one must not evict the narrator's panel.
 	let removedMembership: { workspaceId: string; narratorId: string } | undefined;
-	const result = await mutate(userId, (tabs) => {
+	const result = await mutate(userId, async (tabs) => {
 		const key = `${type}:${id}`;
 		const index = tabs.findIndex((tab) => tabKey(tab) === key);
 		if (index < 0) return { tabs };
@@ -1309,16 +1323,17 @@ export async function removeRecentTab(
 				// can re-insert it — otherwise the restored tab would point at a
 				// workspace that no longer contains the narrator.
 				const undoPanelRow = undoTabs
-					? db
-							.select()
-							.from(workspacePanels)
-							.where(
-								and(
-									eq(workspacePanels.workspaceId, formerWorkspaceId),
-									eq(workspacePanels.narratorId, id),
+					? await readQueryFirst(
+							db
+								.select()
+								.from(workspacePanels)
+								.where(
+									and(
+										eq(workspacePanels.workspaceId, formerWorkspaceId),
+										eq(workspacePanels.narratorId, id),
+									),
 								),
-							)
-							.get()
+						)
 					: undefined;
 				return {
 					tabs,
@@ -1428,10 +1443,12 @@ export async function moveRecentTab(
 			const narratorIds = tabs.map(getTabNarratorId).filter((id): id is string => id !== undefined);
 			const statusByNarrator = new Map<string, string>();
 			if (narratorIds.length > 0) {
-				const rows = await db
-					.select({ id: narrators.id, status: narrators.status })
-					.from(narrators)
-					.where(inArray(narrators.id, narratorIds));
+				const rows = await readQuery(
+					db
+						.select({ id: narrators.id, status: narrators.status })
+						.from(narrators)
+						.where(inArray(narrators.id, narratorIds)),
+				);
 				for (const row of rows) statusByNarrator.set(row.id, row.status);
 			}
 			let firstIdle = -1;
@@ -1524,16 +1541,18 @@ export async function clearRecentTabs(
 	keepTabKey?: string,
 ): Promise<RecentTabsMutationResult> {
 	return userPreferencesLock.acquire(userId, async () => {
-		const baseRevision = ensureMigratedLocked(userId);
-		const oldRows = readRows(userId);
+		const baseRevision = await ensureMigratedLocked(userId);
+		const oldRows = await readRows(userId);
 		const before = oldRows.map(rowToTab);
 		const narratorIds = before.map(getTabNarratorId).filter((id): id is string => id !== undefined);
 		const activeNarrators = new Set<string>();
 		if (scope === "inactive_narrators" && narratorIds.length > 0) {
-			const rows = await db
-				.select({ id: narrators.id, status: narrators.status, substatus: narrators.substatus })
-				.from(narrators)
-				.where(inArray(narrators.id, narratorIds));
+			const rows = await readQuery(
+				db
+					.select({ id: narrators.id, status: narrators.status, substatus: narrators.substatus })
+					.from(narrators)
+					.where(inArray(narrators.id, narratorIds)),
+			);
 			for (const row of rows) {
 				const substatus = parseSubstatus(row.substatus);
 				if (
@@ -1591,7 +1610,7 @@ export async function restoreRecentTabs(
 				if (entry && entry.expiresAt < Date.now()) undoByUser.delete(userId);
 				throw new ValidationError("Recent-tabs undo token is invalid or expired");
 			}
-			const baseRevision = ensureMigratedLocked(userId);
+			const baseRevision = await ensureMigratedLocked(userId);
 			if (baseRevision !== entry.revision) {
 				undoByUser.delete(userId);
 				throw new AppError(
@@ -1600,7 +1619,7 @@ export async function restoreRecentTabs(
 					RECENT_TABS_UNDO_CONFLICT_CODE,
 				);
 			}
-			const oldRows = readRows(userId);
+			const oldRows = await readRows(userId);
 			const before = oldRows.map(rowToTab);
 			const after = normalizeAndLimitTabs(entry.tabs.map(cloneTab)).tabs;
 			// Re-insert the membership row the close cascaded away, in the same
@@ -1675,7 +1694,7 @@ export async function listPage(
 	limit = RECENT_TABS_PAGE_SIZE,
 ): Promise<RecentTabsPageResult> {
 	return userPreferencesLock.acquire(userId, async () => {
-		const revision = ensureMigratedLocked(userId);
+		const revision = await ensureMigratedLocked(userId);
 		const decoded = decodeCursor(cursor);
 		if (decoded && (decoded.s !== section || decoded.r !== revision)) {
 			throw new AppError(
@@ -1697,13 +1716,14 @@ export async function listPage(
 					and(eq(userRecentTabs.sortOrder, decoded.o), gt(userRecentTabs.tabKey, decoded.k)),
 				)
 			: undefined;
-		const topLevelRows = db
-			.select()
-			.from(userRecentTabs)
-			.where(cursorWhere ? and(baseWhere, cursorWhere) : baseWhere)
-			.orderBy(asc(userRecentTabs.sortOrder), asc(userRecentTabs.tabKey))
-			.limit(pageLimit + 1)
-			.all();
+		const topLevelRows = await readQuery(
+			db
+				.select()
+				.from(userRecentTabs)
+				.where(cursorWhere ? and(baseWhere, cursorWhere) : baseWhere)
+				.orderBy(asc(userRecentTabs.sortOrder), asc(userRecentTabs.tabKey))
+				.limit(pageLimit + 1),
+		);
 		const hasMore = topLevelRows.length > pageLimit;
 		const pageTopLevelRows = topLevelRows.slice(0, pageLimit);
 		const workspaceIds = pageTopLevelRows
@@ -1711,19 +1731,20 @@ export async function listPage(
 			.map((row) => row.entityId);
 		const children =
 			workspaceIds.length > 0
-				? db
-						.select()
-						.from(userRecentTabs)
-						.where(
-							and(
-								eq(userRecentTabs.userId, userId),
-								eq(userRecentTabs.section, section),
-								inArray(userRecentTabs.workspaceId, workspaceIds),
-							),
-						)
-						.orderBy(asc(userRecentTabs.sortOrder), asc(userRecentTabs.tabKey))
-						.limit(RECENT_TABS_STORAGE_LIMIT)
-						.all()
+				? await readQuery(
+						db
+							.select()
+							.from(userRecentTabs)
+							.where(
+								and(
+									eq(userRecentTabs.userId, userId),
+									eq(userRecentTabs.section, section),
+									inArray(userRecentTabs.workspaceId, workspaceIds),
+								),
+							)
+							.orderBy(asc(userRecentTabs.sortOrder), asc(userRecentTabs.tabKey))
+							.limit(RECENT_TABS_STORAGE_LIMIT),
+					)
 				: [];
 		const childrenByWorkspace = new Map<string, RecentTabRow[]>();
 		for (const child of children) {
@@ -1752,8 +1773,8 @@ export async function listPage(
 
 export async function listLegacyTabs(userId: string): Promise<PersistedRecentTab[]> {
 	return userPreferencesLock.acquire(userId, async () => {
-		ensureMigratedLocked(userId);
-		return readRows(userId).slice(0, RECENT_TABS_LEGACY_LIMIT).map(rowToTab);
+		await ensureMigratedLocked(userId);
+		return (await readRows(userId)).slice(0, RECENT_TABS_LEGACY_LIMIT).map(rowToTab);
 	});
 }
 
@@ -1763,9 +1784,9 @@ export async function listAllRecentTabs(
 	limit = RECENT_TABS_STORAGE_LIMIT,
 ): Promise<PersistedRecentTab[]> {
 	return userPreferencesLock.acquire(userId, async () => {
-		ensureMigratedLocked(userId);
+		await ensureMigratedLocked(userId);
 		const boundedLimit = Math.max(1, Math.min(limit, RECENT_TABS_STORAGE_LIMIT));
-		return readRows(userId).slice(0, boundedLimit).map(rowToTab);
+		return (await readRows(userId)).slice(0, boundedLimit).map(rowToTab);
 	});
 }
 
@@ -1778,12 +1799,14 @@ export async function getRuntimePatches(
 	}
 	const uniqueKeys = [...new Set(keys)];
 	const snapshot = await userPreferencesLock.acquire(userId, async () => {
-		const revision = ensureMigratedLocked(userId);
+		const revision = await ensureMigratedLocked(userId);
 		if (uniqueKeys.length === 0) return { revision, tabs: [] as PersistedRecentTab[] };
-		const rows = await db
-			.select()
-			.from(userRecentTabs)
-			.where(and(eq(userRecentTabs.userId, userId), inArray(userRecentTabs.tabKey, uniqueKeys)));
+		const rows = await readQuery(
+			db
+				.select()
+				.from(userRecentTabs)
+				.where(and(eq(userRecentTabs.userId, userId), inArray(userRecentTabs.tabKey, uniqueKeys))),
+		);
 		const byKey = new Map(rows.map((row) => [row.tabKey, rowToTab(row)]));
 		return {
 			revision,
@@ -1848,18 +1871,20 @@ export async function getRecentTabUserIds(type: RecentTabType, id: string): Prom
 	const userIds: string[] = [];
 	let cursor: string | undefined;
 	while (true) {
-		const rows = await db
-			.selectDistinct({ userId: userRecentTabs.userId })
-			.from(userRecentTabs)
-			.where(
-				and(
-					eq(userRecentTabs.type, type),
-					eq(userRecentTabs.entityId, id),
-					cursor ? gt(userRecentTabs.userId, cursor) : undefined,
-				),
-			)
-			.orderBy(asc(userRecentTabs.userId))
-			.limit(MIGRATION_BATCH_SIZE);
+		const rows = await readQuery(
+			db
+				.selectDistinct({ userId: userRecentTabs.userId })
+				.from(userRecentTabs)
+				.where(
+					and(
+						eq(userRecentTabs.type, type),
+						eq(userRecentTabs.entityId, id),
+						cursor ? gt(userRecentTabs.userId, cursor) : undefined,
+					),
+				)
+				.orderBy(asc(userRecentTabs.userId))
+				.limit(MIGRATION_BATCH_SIZE),
+		);
 		if (rows.length === 0) break;
 		userIds.push(...rows.map((row) => row.userId));
 		cursor = rows.at(-1)?.userId;
@@ -1877,17 +1902,19 @@ export async function getRecentTabUserIdsForNarrator(
 	const userIds: string[] = [];
 	let cursor: string | undefined;
 	while (userIds.length < limit) {
-		const rows = await db
-			.selectDistinct({ userId: userRecentTabs.userId })
-			.from(userRecentTabs)
-			.where(
-				and(
-					eq(userRecentTabs.representedNarratorId, narratorId),
-					cursor ? gt(userRecentTabs.userId, cursor) : undefined,
-				),
-			)
-			.orderBy(asc(userRecentTabs.userId))
-			.limit(Math.min(MIGRATION_BATCH_SIZE, limit - userIds.length));
+		const rows = await readQuery(
+			db
+				.selectDistinct({ userId: userRecentTabs.userId })
+				.from(userRecentTabs)
+				.where(
+					and(
+						eq(userRecentTabs.representedNarratorId, narratorId),
+						cursor ? gt(userRecentTabs.userId, cursor) : undefined,
+					),
+				)
+				.orderBy(asc(userRecentTabs.userId))
+				.limit(Math.min(MIGRATION_BATCH_SIZE, limit - userIds.length)),
+		);
 		if (rows.length === 0) break;
 		userIds.push(...rows.map((row) => row.userId));
 		cursor = rows.at(-1)?.userId;
@@ -1896,13 +1923,14 @@ export async function getRecentTabUserIdsForNarrator(
 	return userIds;
 }
 
-export function hasRecentTab(userId: string, key: string): boolean {
+export async function hasRecentTab(userId: string, key: string): Promise<boolean> {
 	return (
-		db
-			.select({ id: userRecentTabs.id })
-			.from(userRecentTabs)
-			.where(and(eq(userRecentTabs.userId, userId), eq(userRecentTabs.tabKey, key)))
-			.get() != null
+		(await readQueryFirst(
+			db
+				.select({ id: userRecentTabs.id })
+				.from(userRecentTabs)
+				.where(and(eq(userRecentTabs.userId, userId), eq(userRecentTabs.tabKey, key))),
+		)) != null
 	);
 }
 
@@ -1945,10 +1973,12 @@ export async function pruneUnreadableProjectTabs(userId: string, projectId: stri
 	const { resolveProjectGate } = await import("./project-acl");
 	const { resolveNarratorProjectId } = await import("./narrator-project");
 
-	const user = await db.query.users.findFirst({
-		where: eq(users.id, userId),
-		columns: { id: true, role: true },
-	});
+	const user = await readQuery(
+		db.query.users.findFirst({
+			where: eq(users.id, userId),
+			columns: { id: true, role: true },
+		}),
+	);
 	// No user row → nothing to prune (the cascade already removed their tabs).
 	if (!user) return;
 	const principal = { userId: user.id, isAdmin: user.role === "admin" };
@@ -1964,23 +1994,27 @@ export async function pruneUnreadableProjectTabs(userId: string, projectId: stri
 		return gate.read;
 	};
 
-	const rows = readRows(userId).map(rowToTab);
+	const rows = (await readRows(userId)).map(rowToTab);
 	const doomed: { type: RecentTabType; id: string }[] = [];
 	for (const tab of rows) {
 		let owningProject: string | null = null;
 		if (tab.type === "project") {
 			owningProject = tab.id;
 		} else if (tab.type === "chapter") {
-			const chapter = await db.query.chapters.findFirst({
-				where: eq(chapters.id, tab.id),
-				columns: { projectId: true },
-			});
+			const chapter = await readQuery(
+				db.query.chapters.findFirst({
+					where: eq(chapters.id, tab.id),
+					columns: { projectId: true },
+				}),
+			);
 			owningProject = chapter?.projectId ?? null;
 		} else if (tab.type === "narrator" || tab.type === "subagent") {
-			const narrator = await db.query.narrators.findFirst({
-				where: eq(narrators.id, tab.id),
-				columns: { chapterId: true, contextProjectId: true },
-			});
+			const narrator = await readQuery(
+				db.query.narrators.findFirst({
+					where: eq(narrators.id, tab.id),
+					columns: { chapterId: true, contextProjectId: true },
+				}),
+			);
 			owningProject = narrator ? await resolveNarratorProjectId(narrator) : null;
 		}
 		// `workspace` / `group` tabs are user-scoped containers, not project resources.

@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 /**
  * Container event handler — listens for `container:started` events and:
  * 1. Injects a system message with container access URLs into the chapter's primary narrator
@@ -28,32 +29,38 @@ interface ContainerAccessInfo {
 
 async function getContainerAccessInfo(chapterId: string): Promise<ContainerAccessInfo | null> {
 	const [instances, chapter] = await Promise.all([
-		db.query.containerInstances.findMany({
-			where: and(
-				eq(containerInstances.chapterId, chapterId),
-				eq(containerInstances.status, "running"),
-			),
-			columns: {
-				serviceName: true,
-				hostPort: true,
-				containerPort: true,
-				proxyLabel: true,
-			},
-		}),
-		db.query.chapters.findFirst({
-			where: eq(chapters.id, chapterId),
-			columns: { projectId: true },
-		}),
+		readQuery(
+			db.query.containerInstances.findMany({
+				where: and(
+					eq(containerInstances.chapterId, chapterId),
+					eq(containerInstances.status, "running"),
+				),
+				columns: {
+					serviceName: true,
+					hostPort: true,
+					containerPort: true,
+					proxyLabel: true,
+				},
+			}),
+		),
+		readQuery(
+			db.query.chapters.findFirst({
+				where: eq(chapters.id, chapterId),
+				columns: { projectId: true },
+			}),
+		),
 	]);
 	if (instances.length === 0) return null;
 
 	// Determine if proxy mode
 	if (!chapter) return null;
 
-	const project = await db.query.projects.findFirst({
-		where: eq(projects.id, chapter.projectId),
-		columns: { proxyDomain: true },
-	});
+	const project = await readQuery(
+		db.query.projects.findFirst({
+			where: eq(projects.id, chapter.projectId),
+			columns: { proxyDomain: true },
+		}),
+	);
 
 	const proxyEnabled = settings.containers.proxy?.enabled && !!project?.proxyDomain;
 	const proxyDomain = project?.proxyDomain ?? null;
@@ -106,10 +113,12 @@ export function initContainerEventHandler(): void {
 	eventBus.on("container:started", async (event) => {
 		try {
 			// 1. Find the chapter's primary narrator
-			const narrator = await db.query.narrators.findFirst({
-				where: and(eq(narrators.chapterId, event.chapterId), eq(narrators.variant, "primary")),
-				columns: { id: true },
-			});
+			const narrator = await readQuery(
+				db.query.narrators.findFirst({
+					where: and(eq(narrators.chapterId, event.chapterId), eq(narrators.variant, "primary")),
+					columns: { id: true },
+				}),
+			);
 			if (!narrator) {
 				logger.debug("No primary narrator for chapter, skipping container ready notification", {
 					chapterId: event.chapterId,

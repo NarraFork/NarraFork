@@ -22,6 +22,7 @@ import {
 	narratorToolCalls,
 	users,
 } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { AppError, ValidationError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { toolCallWithExecutionTargets } from "../lib/tool-execution-target-projection";
@@ -161,37 +162,43 @@ async function permissionPage(narratorId: string, rawCursor?: string) {
 				),
 			)
 		: undefined;
-	const metadata = await db
-		.select({
-			id: narratorToolCalls.id,
-			createdAt: narratorToolCalls.createdAt,
-			bytes: permissionBytes,
-		})
-		.from(narratorToolCalls)
-		.innerJoin(narratorMessages, eq(narratorMessages.id, narratorToolCalls.messageId))
-		.innerJoin(narrators, eq(narrators.id, narratorToolCalls.narratorId))
-		.where(and(scope, after))
-		.orderBy(asc(narratorToolCalls.createdAt), asc(narratorToolCalls.id))
-		.limit(NARRATOR_PANEL_PAGE_SIZE + 1);
+	const metadata = await readQuery(
+		db
+			.select({
+				id: narratorToolCalls.id,
+				createdAt: narratorToolCalls.createdAt,
+				bytes: permissionBytes,
+			})
+			.from(narratorToolCalls)
+			.innerJoin(narratorMessages, eq(narratorMessages.id, narratorToolCalls.messageId))
+			.innerJoin(narrators, eq(narrators.id, narratorToolCalls.narratorId))
+			.where(and(scope, after))
+			.orderBy(asc(narratorToolCalls.createdAt), asc(narratorToolCalls.id))
+			.limit(NARRATOR_PANEL_PAGE_SIZE + 1),
+		{ site: "narrator-panel-state.permissionPage" },
+	);
 	const selected = boundedPrefix(metadata);
 	const rows = selected.length
-		? await db
-				.select(permissionColumns)
-				.from(narratorToolCalls)
-				.innerJoin(narratorMessages, eq(narratorMessages.id, narratorToolCalls.messageId))
-				.innerJoin(narrators, eq(narrators.id, narratorToolCalls.narratorId))
-				.where(
-					and(
-						scope,
-						or(
-							...selected.map((row) =>
-								and(eq(narratorToolCalls.id, row.id), lte(permissionBytes, row.bytes)),
+		? await readQuery(
+				db
+					.select(permissionColumns)
+					.from(narratorToolCalls)
+					.innerJoin(narratorMessages, eq(narratorMessages.id, narratorToolCalls.messageId))
+					.innerJoin(narrators, eq(narrators.id, narratorToolCalls.narratorId))
+					.where(
+						and(
+							scope,
+							or(
+								...selected.map((row) =>
+									and(eq(narratorToolCalls.id, row.id), lte(permissionBytes, row.bytes)),
+								),
 							),
 						),
-					),
-				)
-				.orderBy(asc(narratorToolCalls.createdAt), asc(narratorToolCalls.id))
-				.limit(selected.length)
+					)
+					.orderBy(asc(narratorToolCalls.createdAt), asc(narratorToolCalls.id))
+					.limit(selected.length),
+				{ site: "narrator-panel-state.permissionPage" },
+			)
 		: [];
 	assertPageRows(selected, rows);
 	const items = rows.map((row) => {
@@ -243,20 +250,23 @@ async function bufferPage(narratorId: string, rawCursor?: string) {
 	);
 	// Normal queues hold at most 50 rows. A bounded metadata fingerprint rejects
 	// reordered/edited queues between pages rather than silently skipping items.
-	const identities = await db
-		.select({
-			id: mailbox.id,
-			seq: mailbox.seq,
-			arrivalSeq: mailbox.arrivalSeq,
-			priority: mailbox.priority,
-			state: mailbox.state,
-			revision: mailbox.currentRevision,
-			updatedAt: mailbox.updatedAt,
-		})
-		.from(mailbox)
-		.where(scope)
-		.orderBy(asc(mailbox.id))
-		.limit(1025);
+	const identities = await readQuery(
+		db
+			.select({
+				id: mailbox.id,
+				seq: mailbox.seq,
+				arrivalSeq: mailbox.arrivalSeq,
+				priority: mailbox.priority,
+				state: mailbox.state,
+				revision: mailbox.currentRevision,
+				updatedAt: mailbox.updatedAt,
+			})
+			.from(mailbox)
+			.where(scope)
+			.orderBy(asc(mailbox.id))
+			.limit(1025),
+		{ site: "narrator-panel-state.bufferPage" },
+	);
 	if (identities.length > 1024)
 		throw new AppError(
 			"Panel buffer metadata exceeds its budget.",
@@ -266,35 +276,43 @@ async function bufferPage(narratorId: string, rawCursor?: string) {
 	const fingerprint = createHash("sha256").update(JSON.stringify(identities)).digest("hex");
 	if (cursor && cursor.fingerprint !== fingerprint)
 		throw new AppError("Buffer queue changed; restart pagination.", 409, "PANEL_STATE_CHANGED");
-	const metadata = await db
-		.select({
-			id: mailbox.id,
-			priority: mailbox.priority,
-			seq: mailbox.seq,
-			arrivalSeq: mailbox.arrivalSeq,
-			bytes: bufferBytes,
-		})
-		.from(mailbox)
-		.where(and(scope, after))
-		.orderBy(desc(mailbox.priority), asc(mailbox.seq), asc(arrival), asc(mailbox.id))
-		.limit(NARRATOR_PANEL_PAGE_SIZE + 1);
+	const metadata = await readQuery(
+		db
+			.select({
+				id: mailbox.id,
+				priority: mailbox.priority,
+				seq: mailbox.seq,
+				arrivalSeq: mailbox.arrivalSeq,
+				bytes: bufferBytes,
+			})
+			.from(mailbox)
+			.where(and(scope, after))
+			.orderBy(desc(mailbox.priority), asc(mailbox.seq), asc(arrival), asc(mailbox.id))
+			.limit(NARRATOR_PANEL_PAGE_SIZE + 1),
+		{ site: "narrator-panel-state.bufferPage" },
+	);
 	const selected = boundedPrefix(metadata);
 	const rows = selected.length
-		? await db
-				.select({
-					...getTableColumns(mailbox),
-					commandText: sql<null>`NULL`,
-					bashCommand: sql<null>`NULL`,
-				})
-				.from(mailbox)
-				.where(
-					and(
-						scope,
-						or(...selected.map((row) => and(eq(mailbox.id, row.id), lte(bufferBytes, row.bytes)))),
-					),
-				)
-				.orderBy(desc(mailbox.priority), asc(mailbox.seq), asc(arrival), asc(mailbox.id))
-				.limit(selected.length)
+		? await readQuery(
+				db
+					.select({
+						...getTableColumns(mailbox),
+						commandText: sql<null>`NULL`,
+						bashCommand: sql<null>`NULL`,
+					})
+					.from(mailbox)
+					.where(
+						and(
+							scope,
+							or(
+								...selected.map((row) => and(eq(mailbox.id, row.id), lte(bufferBytes, row.bytes))),
+							),
+						),
+					)
+					.orderBy(desc(mailbox.priority), asc(mailbox.seq), asc(arrival), asc(mailbox.id))
+					.limit(selected.length),
+				{ site: "narrator-panel-state.bufferPage" },
+			)
 		: [];
 	assertPageRows(selected, rows);
 	const messages = rows.map(projectMailboxUserMessage);
@@ -306,16 +324,19 @@ async function bufferPage(narratorId: string, rawCursor?: string) {
 		),
 	];
 	const authors = authorIds.length
-		? await db
-				.select({
-					id: users.id,
-					username: users.username,
-					avatarColor: users.avatarColor,
-					avatarImageId: users.avatarImageId,
-				})
-				.from(users)
-				.where(inArray(users.id, authorIds))
-				.limit(authorIds.length)
+		? await readQuery(
+				db
+					.select({
+						id: users.id,
+						username: users.username,
+						avatarColor: users.avatarColor,
+						avatarImageId: users.avatarImageId,
+					})
+					.from(users)
+					.where(inArray(users.id, authorIds))
+					.limit(authorIds.length),
+				{ site: "narrator-panel-state.bufferPage" },
+			)
 		: [];
 	const byId = new Map(authors.map((author) => [author.id, author]));
 	for (const message of messages)

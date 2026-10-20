@@ -2593,7 +2593,7 @@ describe("live/durable coordinator checks and unchanged state", () => {
 			.set({ status: "running", inputJson: { description: "fixture activity" } })
 			.where(eq(schema.narratorToolCalls.id, call.toolCallId))
 			.run();
-		const named = collectRevertBlockers(narratorId).find(
+		const named = (await collectRevertBlockers(narratorId)).find(
 			(item) => item.toolCallId === call.toolCallId,
 		);
 		expect(named).toMatchObject({ kind: "running_tool", toolName: "Bash" });

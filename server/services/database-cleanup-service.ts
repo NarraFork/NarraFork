@@ -2,13 +2,9 @@ import { stat } from "node:fs/promises";
 import { databaseMaintenance, sqlite } from "@server/db";
 import { describeUnsupported, type ReusableSpaceReport } from "@server/db/backend";
 import { getDbPath } from "@server/db/connection";
+import { readNativeRows, readTransactionTask } from "@server/db/worker-read";
 import { AsyncMutex } from "@server/lib/async-mutex";
-import {
-	runEphemeralReadTask,
-	runReadTask,
-	shutdownDbWorkerPool,
-	WorkersUnavailableError,
-} from "@server/lib/db-worker/pool";
+import { shutdownDbWorkerPool } from "@server/lib/db-worker/pool";
 import type { StorageScanCleanupSummariesResult } from "@server/lib/db-worker/protocol";
 import {
 	type ParallelScanOutcome,
@@ -300,9 +296,9 @@ function normalizeNarratorCleanupRecord(row: Record<string, unknown>): NarratorC
 }
 
 async function loadCleanupNarratorContext(): Promise<CleanupNarratorContext> {
-	const narratorRows = sqlite
-		.prepare(
-			`SELECT
+	const narratorRows = (await readNativeRows(
+		sqlite,
+		`SELECT
 				id,
 				parent_narrator_id AS parentNarratorId,
 				chapter_id AS chapterId,
@@ -318,27 +314,35 @@ async function loadCleanupNarratorContext(): Promise<CleanupNarratorContext> {
 				COALESCE(is_background, 0) AS isBackground,
 				background_status AS backgroundStatus
 			 FROM narrators`,
-		)
-		.all() as Record<string, unknown>[];
-	const terminalRows = sqlite
-		.prepare(
-			`SELECT DISTINCT narrator_id AS narratorId
+		[],
+	)) as Record<string, unknown>[];
+	const terminalRows = (await readNativeRows(
+		sqlite,
+		`SELECT DISTINCT narrator_id AS narratorId
 			 FROM terminals
 			 WHERE status = 'running' AND narrator_id IS NOT NULL`,
-		)
-		.all() as Array<{ narratorId: string }>;
+		[],
+	)) as Array<{ narratorId: string }>;
 	return {
 		narrators: narratorRows.map(normalizeNarratorCleanupRecord),
 		runningTerminalIds: new Set(terminalRows.map((row) => row.narratorId)),
 	};
 }
 
-function collectSessionAggregateStats(narratorIds: string[]): SessionAggregateStats {
-	return collectSessionAggregateStatsOn(sqlite, narratorIds, SESSION_OWNED_TABLES);
+async function collectSessionAggregateStats(narratorIds: string[]): Promise<SessionAggregateStats> {
+	const task = {
+		kind: "databaseCleanupReadV1" as const,
+		action: "sessions" as const,
+		narratorIds,
+		relations: SESSION_OWNED_TABLES,
+	};
+	return readTransactionTask<SessionAggregateStats>({ $client: sqlite }, task, () =>
+		collectSessionAggregateStatsOn(sqlite, narratorIds, SESSION_OWNED_TABLES),
+	);
 }
 
-function estimateNarratorSampleApproxBytes(root: CleanupPlanRoot): number {
-	return collectSessionAggregateStats(root.deletedNarratorIds).approxBytes;
+async function estimateNarratorSampleApproxBytes(root: CleanupPlanRoot): Promise<number> {
+	return (await collectSessionAggregateStats(root.deletedNarratorIds)).approxBytes;
 }
 
 async function buildSessionPreview(
@@ -356,11 +360,9 @@ async function buildSessionPreview(
 		runningTerminalIds: cleanupContext.runningTerminalIds,
 	});
 	const allNarratorIds = [...new Set(plan.safeRoots.flatMap((root) => root.deletedNarratorIds))];
-	const aggregate = collectSessionAggregateStats(allNarratorIds);
+	const aggregate = await collectSessionAggregateStats(allNarratorIds);
 	const limitedRoots = plan.safeRoots.slice(0, Math.max(0, sampleLimit));
-	// Synchronous on purpose: these are bun:sqlite aggregates, so Promise.all would only have wrapped
-	// blocking calls in promises without buying any concurrency.
-	const sampleBytes = limitedRoots.map((root) => estimateNarratorSampleApproxBytes(root));
+	const sampleBytes = await Promise.all(limitedRoots.map(estimateNarratorSampleApproxBytes));
 	const samples: DatabaseCleanupNarratorSample[] = limitedRoots.map((root, index) => ({
 		type: "narrator",
 		id: root.rootNarratorId,
@@ -416,10 +418,19 @@ async function buildToolCallPayloadPreview(
 	sampleLimit = DEFAULT_PREVIEW_SAMPLE_LIMIT,
 ): Promise<DatabaseCleanupPreviewResult> {
 	const cutoffIso = getCutoffIso(olderThanDays);
-	const summary = summarizeToolCallPayloads(sqlite, cutoffIso);
-	const samples = sqlite
-		.prepare(
-			`SELECT
+	const payloadTask = {
+		kind: "databaseCleanupReadV1" as const,
+		action: "payloads" as const,
+		cutoffIso,
+	};
+	const summary = await readTransactionTask<ReturnType<typeof summarizeToolCallPayloads>>(
+		{ $client: sqlite },
+		payloadTask,
+		() => summarizeToolCallPayloads(sqlite, cutoffIso),
+	);
+	const samples = (await readNativeRows(
+		sqlite,
+		`SELECT
 			tc.id AS id,
 			tc.narrator_id AS narratorId,
 			n.title AS narratorTitle,
@@ -435,8 +446,8 @@ async function buildToolCallPayloadPreview(
 			 AND (tc.input_json IS NOT NULL OR tc.output_json IS NOT NULL)
 		 ORDER BY tc.created_at ASC
 		 LIMIT ?`,
-		)
-		.all(cutoffIso, Math.max(0, sampleLimit)) as Array<{
+		[cutoffIso, Math.max(0, sampleLimit)],
+	)) as Array<{
 		id: string;
 		narratorId: string | null;
 		narratorTitle: string | null;
@@ -600,8 +611,8 @@ function measureCleanupCandidatesOnConnection(
  * Cleanup-candidate byte totals.
  *
  * The plan (which sessions are eligible) is pure data and stays on the main thread. The
- * COUNT/SUM(length) aggregates run on a read worker. If no worker can start, the same queries
- * run here so the settings page still shows a number.
+ * COUNT/SUM(length) aggregates run on a read worker. Worker failures propagate rather than
+ * running a storage scan on the HTTP event loop.
  */
 async function measureCleanupCandidatesOffThread(
 	signal?: AbortSignal,
@@ -627,34 +638,13 @@ async function measureCleanupCandidatesOffThread(
 		relations: SESSION_OWNED_TABLES,
 		toolCallCutoffIso: getCutoffIso(DEFAULT_TOOL_CALL_PAYLOAD_DAYS),
 	};
-	const dbPath = getDbPath();
-	try {
-		const aggregates = await runReadTask<StorageScanCleanupSummariesResult>(dbPath, params, {
-			signal,
-		});
-		return cleanupSummariesFromAggregates(archivedPlan, stalePlan, aggregates);
-	} catch (err) {
-		if (signal?.aborted) throw err;
-		if (err instanceof WorkersUnavailableError && err.reason === "pool_shutdown") throw err;
-		try {
-			const aggregates = await runEphemeralReadTask<StorageScanCleanupSummariesResult>(
-				dbPath,
-				params,
-				{ signal },
-			);
-			return cleanupSummariesFromAggregates(archivedPlan, stalePlan, aggregates);
-		} catch (ephemeralErr) {
-			if (signal?.aborted) throw ephemeralErr;
-			logger.warn("Cleanup candidate scan fell back to the main thread", {
-				reason: ephemeralErr instanceof Error ? ephemeralErr.message : String(ephemeralErr),
-			});
-			return cleanupSummariesFromAggregates(
-				archivedPlan,
-				stalePlan,
-				measureCleanupCandidatesOnConnection(sqlite, archivedNarratorIds, staleNarratorIds),
-			);
-		}
-	}
+	const aggregates = await readTransactionTask<StorageScanCleanupSummariesResult>(
+		{ $client: sqlite },
+		params,
+		() => measureCleanupCandidatesOnConnection(sqlite, archivedNarratorIds, staleNarratorIds),
+		{ signal },
+	);
+	return cleanupSummariesFromAggregates(archivedPlan, stalePlan, aggregates);
 }
 
 export const databaseCleanupService = {

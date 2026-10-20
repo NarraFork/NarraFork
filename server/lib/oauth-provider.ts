@@ -11,6 +11,7 @@
  * returned to the caller exactly once.
  */
 import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
+import { readQuery } from "@server/db/worker-read";
 import { and, eq, gt, isNull, lt, or } from "drizzle-orm";
 import { db } from "../db";
 import {
@@ -111,9 +112,11 @@ export async function requireActiveClient(clientId: string): Promise<OAuthClient
 	if (!clientId) {
 		throw new OAuthError("invalid_request", "client_id is required");
 	}
-	const client = await db.query.oauthClients.findFirst({
-		where: eq(oauthClients.clientId, clientId),
-	});
+	const client = await readQuery(
+		db.query.oauthClients.findFirst({
+			where: eq(oauthClients.clientId, clientId),
+		}),
+	);
 	if (!client || client.revokedAt || !client.publicClient) {
 		throw new OAuthError("invalid_client", "Unknown, revoked, or unsupported client");
 	}
@@ -126,9 +129,11 @@ async function requireActiveClientReference(input: {
 }): Promise<OAuthClientRow> {
 	if (input.clientId) return requireActiveClient(input.clientId);
 	if (!input.oauthClientId) throw new OAuthError("invalid_request", "client_id is required");
-	const client = await db.query.oauthClients.findFirst({
-		where: eq(oauthClients.id, input.oauthClientId),
-	});
+	const client = await readQuery(
+		db.query.oauthClients.findFirst({
+			where: eq(oauthClients.id, input.oauthClientId),
+		}),
+	);
 	if (!client || client.revokedAt || !client.publicClient) {
 		throw new OAuthError("invalid_client", "Unknown, revoked, or unsupported client");
 	}
@@ -237,20 +242,24 @@ async function requireActiveGrantBinding(input: {
 	userId: string;
 }): Promise<ActiveGrantBinding> {
 	const [grant, authority] = await Promise.all([
-		db.query.oauthGrants.findFirst({
-			where: and(eq(oauthGrants.id, input.grantId), isNull(oauthGrants.revokedAt)),
-			columns: { id: true, oauthClientId: true, userId: true },
-		}),
-		db.query.integrationAuthorities.findFirst({
-			where: and(
-				eq(integrationAuthorities.id, input.grantId),
-				eq(integrationAuthorities.kind, "oauth_grant"),
-				eq(integrationAuthorities.integrationType, "oauth_client"),
-				eq(integrationAuthorities.integrationId, input.oauthClientId),
-				eq(integrationAuthorities.state, "active"),
-			),
-			columns: { id: true, ownerUserId: true, revision: true },
-		}),
+		readQuery(
+			db.query.oauthGrants.findFirst({
+				where: and(eq(oauthGrants.id, input.grantId), isNull(oauthGrants.revokedAt)),
+				columns: { id: true, oauthClientId: true, userId: true },
+			}),
+		),
+		readQuery(
+			db.query.integrationAuthorities.findFirst({
+				where: and(
+					eq(integrationAuthorities.id, input.grantId),
+					eq(integrationAuthorities.kind, "oauth_grant"),
+					eq(integrationAuthorities.integrationType, "oauth_client"),
+					eq(integrationAuthorities.integrationId, input.oauthClientId),
+					eq(integrationAuthorities.state, "active"),
+				),
+				columns: { id: true, ownerUserId: true, revision: true },
+			}),
+		),
 	]);
 	if (
 		!grant ||
@@ -262,18 +271,20 @@ async function requireActiveGrantBinding(input: {
 		throw new OAuthError("invalid_grant", "OAuth grant is invalid or revoked");
 	}
 	const now = new Date().toISOString();
-	const rows = await db.query.integrationCapabilityGrants.findMany({
-		where: and(
-			eq(integrationCapabilityGrants.authorityId, input.grantId),
-			isNull(integrationCapabilityGrants.revokedAt),
-			or(
-				isNull(integrationCapabilityGrants.expiresAt),
-				gt(integrationCapabilityGrants.expiresAt, now),
+	const rows = await readQuery(
+		db.query.integrationCapabilityGrants.findMany({
+			where: and(
+				eq(integrationCapabilityGrants.authorityId, input.grantId),
+				isNull(integrationCapabilityGrants.revokedAt),
+				or(
+					isNull(integrationCapabilityGrants.expiresAt),
+					gt(integrationCapabilityGrants.expiresAt, now),
+				),
 			),
-		),
-		columns: { capabilityId: true },
-		limit: 2_001,
-	});
+			columns: { capabilityId: true },
+			limit: 2_001,
+		}),
+	);
 	if (rows.length > 2_000) {
 		throw new OAuthError("invalid_grant", "OAuth grant capability limit was exceeded");
 	}
@@ -528,9 +539,11 @@ export async function exchangeCodeForToken(input: ExchangeCodeInput): Promise<OA
 	}
 
 	const codeHash = hashOAuthSecret(input.code);
-	const row = await db.query.oauthAuthorizationCodes.findFirst({
-		where: eq(oauthAuthorizationCodes.codeHash, codeHash),
-	});
+	const row = await readQuery(
+		db.query.oauthAuthorizationCodes.findFirst({
+			where: eq(oauthAuthorizationCodes.codeHash, codeHash),
+		}),
+	);
 	if (!row || row.consumedAt) {
 		throw new OAuthError("invalid_grant", "Authorization code is invalid or already used");
 	}
@@ -633,9 +646,11 @@ export async function refreshAccessToken(input: RefreshAccessTokenInput): Promis
 	}
 
 	const refreshHash = hashOAuthSecret(input.refreshToken);
-	const row = await db.query.oauthAccessTokens.findFirst({
-		where: eq(oauthAccessTokens.refreshTokenHash, refreshHash),
-	});
+	const row = await readQuery(
+		db.query.oauthAccessTokens.findFirst({
+			where: eq(oauthAccessTokens.refreshTokenHash, refreshHash),
+		}),
+	);
 	if (!row) {
 		throw new OAuthError("invalid_grant", "Refresh token is invalid or revoked");
 	}
@@ -647,9 +662,11 @@ export async function refreshAccessToken(input: RefreshAccessTokenInput): Promis
 		throw new OAuthError("invalid_grant", "Refresh token is invalid or revoked");
 	}
 	const familyId = row.refreshFamilyId ?? row.id;
-	const familyRoot = await db.query.oauthAccessTokens.findFirst({
-		where: eq(oauthAccessTokens.id, familyId),
-	});
+	const familyRoot = await readQuery(
+		db.query.oauthAccessTokens.findFirst({
+			where: eq(oauthAccessTokens.id, familyId),
+		}),
+	);
 	if (!familyRoot || familyRoot.refreshFamilyRevokedAt) {
 		throw new OAuthError("invalid_grant", "Refresh token family is revoked");
 	}
@@ -682,9 +699,11 @@ export async function refreshAccessToken(input: RefreshAccessTokenInput): Promis
 		.where(and(eq(oauthAccessTokens.id, row.id), isNull(oauthAccessTokens.revokedAt)))
 		.returning({ id: oauthAccessTokens.id });
 	if (!consumed) {
-		const raced = await db.query.oauthAccessTokens.findFirst({
-			where: eq(oauthAccessTokens.id, row.id),
-		});
+		const raced = await readQuery(
+			db.query.oauthAccessTokens.findFirst({
+				where: eq(oauthAccessTokens.id, row.id),
+			}),
+		);
 		if (raced) await revokeRefreshFamilyForReuse(raced);
 		throw new OAuthError("invalid_grant", "Refresh token reuse detected");
 	}
@@ -755,19 +774,23 @@ export async function revokeToken(tokenOrRefresh: string): Promise<void> {
 		refreshFamilyId: true,
 		revokedAt: true,
 	} as const;
-	const byAccess = await db.query.oauthAccessTokens.findFirst({
-		where: eq(oauthAccessTokens.tokenHash, hash),
-		columns,
-	});
+	const byAccess = await readQuery(
+		db.query.oauthAccessTokens.findFirst({
+			where: eq(oauthAccessTokens.tokenHash, hash),
+			columns,
+		}),
+	);
 	if (byAccess) {
 		await revokeTokenRow(byAccess, "access", now);
 		return;
 	}
 
-	const byRefresh = await db.query.oauthAccessTokens.findFirst({
-		where: eq(oauthAccessTokens.refreshTokenHash, hash),
-		columns,
-	});
+	const byRefresh = await readQuery(
+		db.query.oauthAccessTokens.findFirst({
+			where: eq(oauthAccessTokens.refreshTokenHash, hash),
+			columns,
+		}),
+	);
 	if (byRefresh) await revokeTokenRow(byRefresh, "refresh", now);
 }
 
@@ -790,10 +813,12 @@ async function validateAccessTokenRow(
 	if (!row || row.revokedAt) return null;
 	if (Date.parse(row.expiresAt) <= Date.now()) return null;
 	if (row.refreshFamilyId) {
-		const familyRoot = await db.query.oauthAccessTokens.findFirst({
-			where: eq(oauthAccessTokens.id, row.refreshFamilyId),
-			columns: { refreshFamilyRevokedAt: true, refreshFamilyExpiresAt: true },
-		});
+		const familyRoot = await readQuery(
+			db.query.oauthAccessTokens.findFirst({
+				where: eq(oauthAccessTokens.id, row.refreshFamilyId),
+				columns: { refreshFamilyRevokedAt: true, refreshFamilyExpiresAt: true },
+			}),
+		);
 		if (!familyRoot || familyRoot.refreshFamilyRevokedAt) return null;
 		if (
 			familyRoot.refreshFamilyExpiresAt &&
@@ -803,15 +828,17 @@ async function validateAccessTokenRow(
 		}
 	}
 
-	const activeClient = await db.query.oauthClients.findFirst({
-		where: and(
-			row.oauthClientId
-				? eq(oauthClients.id, row.oauthClientId)
-				: eq(oauthClients.clientId, row.clientId),
-			isNull(oauthClients.revokedAt),
-		),
-		columns: { id: true, clientId: true, scopes: true },
-	});
+	const activeClient = await readQuery(
+		db.query.oauthClients.findFirst({
+			where: and(
+				row.oauthClientId
+					? eq(oauthClients.id, row.oauthClientId)
+					: eq(oauthClients.clientId, row.clientId),
+				isNull(oauthClients.revokedAt),
+			),
+			columns: { id: true, clientId: true, scopes: true },
+		}),
+	);
 	if (!activeClient || activeClient.clientId !== row.clientId) return null;
 
 	let scopes = intersectScopes(row.scopes, activeClient.scopes);
@@ -852,9 +879,11 @@ async function validateAccessTokenRow(
 export async function validateAccessToken(token: string): Promise<ValidatedAccessToken | null> {
 	if (!token) return null;
 	return validateAccessTokenRow(
-		await db.query.oauthAccessTokens.findFirst({
-			where: eq(oauthAccessTokens.tokenHash, hashOAuthSecret(token)),
-		}),
+		await readQuery(
+			db.query.oauthAccessTokens.findFirst({
+				where: eq(oauthAccessTokens.tokenHash, hashOAuthSecret(token)),
+			}),
+		),
 		true,
 	);
 }
@@ -865,7 +894,9 @@ export async function validateAccessTokenById(
 ): Promise<ValidatedAccessToken | null> {
 	if (!tokenId) return null;
 	return validateAccessTokenRow(
-		await db.query.oauthAccessTokens.findFirst({ where: eq(oauthAccessTokens.id, tokenId) }),
+		await readQuery(
+			db.query.oauthAccessTokens.findFirst({ where: eq(oauthAccessTokens.id, tokenId) }),
+		),
 		false,
 	);
 }

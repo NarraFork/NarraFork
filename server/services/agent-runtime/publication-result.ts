@@ -1,3 +1,19 @@
+import type { PublicationEvent, PublicationRun } from "./publication-outbox";
+
+export function publicationDedupeKey(
+	run: PublicationRun,
+	eventKind: PublicationEvent | "terminal",
+) {
+	return JSON.stringify([
+		"publication",
+		run.producerKind,
+		run.taskId,
+		run.logicalRunId,
+		eventKind,
+		run.recipientId,
+	]);
+}
+
 /** Bounded, dialect-neutral parsing for Await's per-run result projection. */
 export type AgentTerminalEvent = "completed" | "failed" | "timed_out" | "cancelled";
 export interface AgentTerminalResult {

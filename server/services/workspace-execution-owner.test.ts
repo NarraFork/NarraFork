@@ -68,7 +68,7 @@ describe("immutable workspace execution owner", () => {
 		const reloaded = __testing.createAuthority(a.deps, a.state);
 		await reloaded.initializeWorkspaceExecutionOwner(drizzle(client), "new");
 		expect(a.probes()).toBe(1);
-		expect(a.getWorkspaceOwnerRegistration(db, "new")?.identityJson).toEqual(identity);
+		expect((await a.getWorkspaceOwnerRegistration(db, "new"))?.identityJson).toEqual(identity);
 		await expect(a.initializeWorkspaceExecutionOwner(db, "different")).rejects.toThrow(
 			"already initialized",
 		);
@@ -81,14 +81,16 @@ describe("immutable workspace execution owner", () => {
 			finish = resolve;
 		});
 		let registrations = 0;
+		const registrationStarted = Promise.withResolvers<void>();
 		const a = __testing.createAuthority({
 			pid: identity.pid,
 			now: () => "now",
 			observe: async () => ({ kind: "present", identity }),
 			registerLockIdentity: async (value) => {
 				registrations++;
+				registrationStarted.resolve();
 				expect(value).toEqual(identity);
-				expect(a.getWorkspaceOwnerRegistration(db, "new")?.identityJson).toEqual(identity);
+				expect((await a.getWorkspaceOwnerRegistration(db, "new"))?.identityJson).toEqual(identity);
 				await pending;
 			},
 		});
@@ -96,9 +98,7 @@ describe("immutable workspace execution owner", () => {
 		const started = a.initializeWorkspaceExecutionOwner(db, "new").then(() => {
 			completed = true;
 		});
-		await Promise.resolve();
-		await Promise.resolve();
-		await Promise.resolve();
+		await registrationStarted.promise;
 		expect(registrations).toBe(1);
 		expect(completed).toBe(false);
 		finish();
@@ -113,7 +113,7 @@ describe("immutable workspace execution owner", () => {
 		client.exec("INSERT INTO workspace_write_leases VALUES('lease', 'old')");
 		const a = authority();
 		await expect(a.initializeWorkspaceExecutionOwner(db, "old")).rejects.toThrow("historical");
-		expect(a.getWorkspaceOwnerRegistration(db, "old")).toBeUndefined();
+		expect(await a.getWorkspaceOwnerRegistration(db, "old")).toBeUndefined();
 		expect(a.probes()).toBe(0);
 	});
 
@@ -122,7 +122,7 @@ describe("immutable workspace execution owner", () => {
 		seed(db);
 		const a = authority();
 		await expect(a.initializeWorkspaceExecutionOwner(db, "old")).rejects.toThrow("historical");
-		expect(a.getWorkspaceOwnerRegistration(db, "old")?.identityJson).toEqual(identity);
+		expect((await a.getWorkspaceOwnerRegistration(db, "old"))?.identityJson).toEqual(identity);
 	});
 
 	it("retains unknown registration, without retry/backfill after probe improves", async () => {
@@ -132,7 +132,7 @@ describe("immutable workspace execution owner", () => {
 		a.set({ kind: "present", identity });
 		await a.initializeWorkspaceExecutionOwner(db, "new");
 		expect(a.probes()).toBe(1);
-		expect(a.getWorkspaceOwnerRegistration(db, "new")?.identityJson).toBeNull();
+		expect((await a.getWorkspaceOwnerRegistration(db, "new"))?.identityJson).toBeNull();
 		expect(await a.proveWorkspaceOwnerEnded(db, "new")).toBeNull();
 	});
 

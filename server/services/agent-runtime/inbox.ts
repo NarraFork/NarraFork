@@ -1,3 +1,4 @@
+import { readQuery, readQueryFirst } from "@server/db/worker-read";
 import { formatOriginLabel, type MessageOriginOptions } from "@shared/message-origin";
 import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 import { db } from "../../db";
@@ -18,8 +19,13 @@ import { hotSafe } from "../../lib/hot-safe";
 import { generateId } from "../../lib/id";
 import { logger } from "../../lib/logger";
 import type { Locale } from "../../lib/prompt-i18n";
+import { waitForShutdownWork } from "../../lib/shutdown-activity";
 import type { AgentMessageDelivery } from "../agent-message-delivery";
 import { getNarratorMessageRefsPort } from "../narrator-refs/store";
+import {
+	isNarratorAdmissionShuttingDown,
+	recordNarratorShutdownFailure,
+} from "../narrator-session-state";
 import { createMailboxStore, mailboxDedupeKey } from "./mailbox";
 import { isAwaitedTerminalConsumption } from "./mailbox-shared";
 import type { MailboxClaim, MailboxInput, MailboxKind } from "./mailbox-types";
@@ -66,14 +72,16 @@ export async function resolveInboxExecutionBinding(
 ): Promise<InboxExecutionBinding | null> {
 	if (!row.sourceNarratorId || !row.sourceToolCallId || row.sourceAttempt == null) return null;
 	try {
-		const source = await db.query.narratorToolCalls.findFirst({
-			where: and(
-				eq(narratorToolCalls.id, row.sourceToolCallId),
-				eq(narratorToolCalls.narratorId, row.sourceNarratorId),
-				eq(narratorToolCalls.executionAttempt, row.sourceAttempt),
-			),
-			columns: { messageId: true, toolUseId: true },
-		});
+		const source = await readQuery(
+			db.query.narratorToolCalls.findFirst({
+				where: and(
+					eq(narratorToolCalls.id, row.sourceToolCallId),
+					eq(narratorToolCalls.narratorId, row.sourceNarratorId),
+					eq(narratorToolCalls.executionAttempt, row.sourceAttempt),
+				),
+				columns: { messageId: true, toolUseId: true },
+			}),
+		);
 		if (!source) return null;
 		const { narratorPersistence } = await import("../narrator-persistence");
 		const binding = await narratorPersistence.getToolCallBinding(
@@ -340,72 +348,76 @@ export async function listInboxRows(
 ): Promise<RuntimeMailboxRow[]> {
 	const port = getRuntimeQueuePort();
 	if (port) return port.mailbox.listPending(narratorId, { kinds, includeFailed, limit: 100 });
-	return db
-		.select()
-		.from(mailbox)
-		.where(
-			and(
-				eq(mailbox.narratorId, narratorId),
-				inArray(mailbox.state, includeFailed ? ["queued", "failed"] : ["queued"]),
-				kinds ? inArray(mailbox.kind, kinds) : undefined,
-			),
-		)
-		.orderBy(
-			desc(mailbox.priority),
-			sql`CASE WHEN ${mailbox.kind} = 'user_input' THEN ${mailbox.seq} ELSE ${mailbox.arrivalSeq} END`,
-			asc(mailbox.arrivalSeq),
-		)
-		.limit(100)
-		.all();
+	return await readQuery(
+		db
+			.select()
+			.from(mailbox)
+			.where(
+				and(
+					eq(mailbox.narratorId, narratorId),
+					inArray(mailbox.state, includeFailed ? ["queued", "failed"] : ["queued"]),
+					kinds ? inArray(mailbox.kind, kinds) : undefined,
+				),
+			)
+			.orderBy(
+				desc(mailbox.priority),
+				sql`CASE WHEN ${mailbox.kind} = 'user_input' THEN ${mailbox.seq} ELSE ${mailbox.arrivalSeq} END`,
+				asc(mailbox.arrivalSeq),
+			)
+			.limit(100),
+	);
 }
 export async function peekInbox(narratorId: string): Promise<RuntimeMailboxRow | undefined> {
 	const port = getRuntimeQueuePort();
 	if (port) return port.mailbox.peekQueued(narratorId);
 	runtimeInbox.initializeLegacy(narratorId);
-	return db
-		.select()
-		.from(mailbox)
-		.where(and(eq(mailbox.narratorId, narratorId), eq(mailbox.state, "queued")))
-		.orderBy(
-			desc(mailbox.priority),
-			sql`CASE WHEN ${mailbox.kind} = 'user_input' THEN ${mailbox.seq} ELSE ${mailbox.arrivalSeq} END`,
-			asc(mailbox.arrivalSeq),
-		)
-		.limit(1)
-		.get();
+	return await readQueryFirst(
+		db
+			.select()
+			.from(mailbox)
+			.where(and(eq(mailbox.narratorId, narratorId), eq(mailbox.state, "queued")))
+			.orderBy(
+				desc(mailbox.priority),
+				sql`CASE WHEN ${mailbox.kind} = 'user_input' THEN ${mailbox.seq} ELSE ${mailbox.arrivalSeq} END`,
+				asc(mailbox.arrivalSeq),
+			)
+			.limit(1),
+	);
 }
 export async function hasInboxKind(narratorId: string, kinds: MailboxKind[]): Promise<boolean> {
 	const port = getRuntimeQueuePort();
 	if (port) return port.mailbox.hasQueuedKind(narratorId, kinds);
-	return !!db
-		.select({ id: mailbox.id })
-		.from(mailbox)
-		.where(
-			and(
-				eq(mailbox.narratorId, narratorId),
-				eq(mailbox.state, "queued"),
-				inArray(mailbox.kind, kinds),
-			),
-		)
-		.limit(1)
-		.get();
+	return !!(await readQueryFirst(
+		db
+			.select({ id: mailbox.id })
+			.from(mailbox)
+			.where(
+				and(
+					eq(mailbox.narratorId, narratorId),
+					eq(mailbox.state, "queued"),
+					inArray(mailbox.kind, kinds),
+				),
+			)
+			.limit(1),
+	));
 }
 /** Wake authority is separate from consumption: broadcasts remain visible to live runners. */
 export async function hasWakeEligibleInboxInput(narratorId: string): Promise<boolean> {
 	const port = getRuntimeQueuePort();
 	if (port) return port.mailbox.hasWakeEligibleInput(narratorId);
-	return !!db
-		.select({ id: mailbox.id })
-		.from(mailbox)
-		.where(
-			and(
-				eq(mailbox.narratorId, narratorId),
-				eq(mailbox.state, "queued"),
-				sql`(${mailbox.kind} = 'user_input' OR (${mailbox.kind} = 'agent_message' AND COALESCE(json_extract(${mailbox.metadataJson}, '$.isBroadcast'), 0) != 1))`,
-			),
-		)
-		.limit(1)
-		.get();
+	return !!(await readQueryFirst(
+		db
+			.select({ id: mailbox.id })
+			.from(mailbox)
+			.where(
+				and(
+					eq(mailbox.narratorId, narratorId),
+					eq(mailbox.state, "queued"),
+					sql`(${mailbox.kind} = 'user_input' OR (${mailbox.kind} = 'agent_message' AND COALESCE(json_extract(${mailbox.metadataJson}, '$.isBroadcast'), 0) != 1))`,
+				),
+			)
+			.limit(1),
+	));
 }
 /**
  * The eligible-head projection the claim predicate sees, widened to the dialect-neutral
@@ -425,25 +437,6 @@ export type InboxEligibleHead = Pick<
 	| "createdBy"
 	| "deliveryId"
 >;
-/**
- * Synchronous queue-presence re-check for loop-boundary callbacks (the agent loop's
- * `shouldStop` cannot await). SQLite-only by construction: the subagent loop is not
- * wired on PostgreSQL yet, and a sync callback could never perform the network read —
- * callers on the PG backend must answer from their in-memory flags instead.
- */
-export function hasQueuedInboxRowSync(narratorId: string): boolean {
-	if (getRuntimeQueuePort())
-		throw new Error(
-			"Synchronous inbox probes are SQLite-only; the PostgreSQL queue is honestly async",
-		);
-	runtimeInbox.initializeLegacy(narratorId);
-	return !!db
-		.select({ id: mailbox.id })
-		.from(mailbox)
-		.where(and(eq(mailbox.narratorId, narratorId), eq(mailbox.state, "queued")))
-		.limit(1)
-		.get();
-}
 /**
  * The predicate is checked against the global head, never used to skip a principal barrier.
  *
@@ -536,7 +529,7 @@ export async function releaseInboxClaim(row: RuntimeMailboxRow, error: unknown):
 			await port.mailbox.failClaim(inboxClaim(row), String(error));
 		return;
 	}
-	const current = runtimeInbox.getByDelivery(row.deliveryId);
+	const current = await runtimeInbox.getByDelivery(row.deliveryId);
 	if (current?.state === "claimed" && current.claimToken === row.claimToken)
 		runtimeInbox.failClaim(inboxClaim(row), String(error));
 }
@@ -554,16 +547,17 @@ async function readClaimCommittedState(
 > {
 	const port = getRuntimeQueuePort();
 	if (port) return port.mailbox.getStateById(claim.id, claim.narratorId);
-	return db
-		.select({
-			state: mailbox.state,
-			currentMessageId: mailbox.currentMessageId,
-			kind: mailbox.kind,
-			lastError: mailbox.lastError,
-		})
-		.from(mailbox)
-		.where(and(eq(mailbox.id, claim.id), eq(mailbox.narratorId, claim.narratorId)))
-		.get();
+	return await readQueryFirst(
+		db
+			.select({
+				state: mailbox.state,
+				currentMessageId: mailbox.currentMessageId,
+				kind: mailbox.kind,
+				lastError: mailbox.lastError,
+			})
+			.from(mailbox)
+			.where(and(eq(mailbox.id, claim.id), eq(mailbox.narratorId, claim.narratorId))),
+	);
 }
 
 async function inboxInjectionText(
@@ -579,10 +573,12 @@ async function inboxInjectionText(
 			const refs = getNarratorMessageRefsPort();
 			creator = refs
 				? await refs.creator(options.createdBy)
-				: ((await db.query.users.findFirst({
-						where: eq(users.id, options.createdBy),
-						columns: { username: true },
-					})) ?? null);
+				: ((await readQuery(
+						db.query.users.findFirst({
+							where: eq(users.id, options.createdBy),
+							columns: { username: true },
+						}),
+					)) ?? null);
 		} catch (error) {
 			logger.warn("Injection sender name unavailable", { narratorId, error: String(error) });
 		}
@@ -1109,15 +1105,30 @@ const pendingWakes = hotSafe(
 	"narrafork.runtime-inbox-wakes",
 	() => new Map<string, Promise<boolean>>(),
 );
+export function getPendingInboxWakeCount(): number {
+	return pendingWakes.size;
+}
+
+export async function drainPendingInboxWakes(signal: AbortSignal): Promise<void> {
+	while (pendingWakes.size > 0) {
+		await waitForShutdownWork(Promise.all([...pendingWakes.values()]), signal);
+	}
+	signal.throwIfAborted();
+}
+
 /** Coalesced control-plane wake; the only payload authority remains the mailbox table. */
 export function wakeInboxIfEligible(narratorId: string, locale: Locale = "en"): Promise<boolean> {
+	if (isNarratorAdmissionShuttingDown()) return Promise.resolve(false);
 	const pending = pendingWakes.get(narratorId);
 	if (pending) return pending;
 	const wake = Promise.resolve()
 		.then(async () => {
+			if (isNarratorAdmissionShuttingDown()) return false;
 			await flushInboxPublicationBarrier(narratorId);
+			if (isNarratorAdmissionShuttingDown()) return false;
 			// A held run keeps its owner while parked: queued input wakes that same run.
 			const { wakeHeldRun } = await import("./run");
+			if (isNarratorAdmissionShuttingDown()) return false;
 			if (wakeHeldRun(narratorId)) return true;
 			if (getExecutionOwner(narratorId)) return false;
 			const { isNarratorRuntimeBusy, compactLocks, isNarratorRevertAdmissionBlocked } =
@@ -1134,15 +1145,16 @@ export function wakeInboxIfEligible(narratorId: string, locale: Locale = "en"): 
 			const port = getRuntimeQueuePort();
 			const row = port
 				? await port.mailbox.readRecipientRoute(narratorId)
-				: db
-						.select({
-							variant: narrators.variant,
-							status: narrators.status,
-							lastStopReason: narrators.lastStopReason,
-						})
-						.from(narrators)
-						.where(eq(narrators.id, narratorId))
-						.get();
+				: await readQueryFirst(
+						db
+							.select({
+								variant: narrators.variant,
+								status: narrators.status,
+								lastStopReason: narrators.lastStopReason,
+							})
+							.from(narrators)
+							.where(eq(narrators.id, narratorId)),
+					);
 			if (!row || row.status === "archived") return false;
 			const pendingHead = await peekInbox(narratorId);
 			const hasExplicitUserInput = await hasInboxKind(narratorId, ["user_input"]);
@@ -1180,19 +1192,20 @@ export function wakeInboxIfEligible(narratorId: string, locale: Locale = "en"): 
 			if (!(await hasWakeEligibleInboxInput(narratorId))) {
 				const notice = port
 					? await port.mailbox.hasActionableTaskNotice(narratorId)
-					: !!db
-							.select({ id: mailbox.id })
-							.from(mailbox)
-							.where(
-								and(
-									eq(mailbox.narratorId, narratorId),
-									eq(mailbox.state, "queued"),
-									eq(mailbox.kind, "task_notice"),
-									sql`json_extract(${mailbox.metadataJson}, '$.eventKind') NOT IN ('started', 'cancelled')`,
-								),
-							)
-							.limit(1)
-							.get();
+					: !!(await readQueryFirst(
+							db
+								.select({ id: mailbox.id })
+								.from(mailbox)
+								.where(
+									and(
+										eq(mailbox.narratorId, narratorId),
+										eq(mailbox.state, "queued"),
+										eq(mailbox.kind, "task_notice"),
+										sql`json_extract(${mailbox.metadataJson}, '$.eventKind') NOT IN ('started', 'cancelled')`,
+									),
+								)
+								.limit(1),
+						));
 				if (!notice) return false;
 			}
 			const { startParentInboundContinuationIfPossible, resumeBufferedMessagesIfIdle } =
@@ -1206,6 +1219,7 @@ export function wakeInboxIfEligible(narratorId: string, locale: Locale = "en"): 
 			return (await startParentInboundContinuationIfPossible(narratorId, "en")).started;
 		})
 		.catch((error) => {
+			recordNarratorShutdownFailure(error);
 			logger.warn("Mailbox wake deferred", { narratorId, error: String(error) });
 			return false;
 		})

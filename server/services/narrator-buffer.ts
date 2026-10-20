@@ -22,6 +22,7 @@ import { and, asc, desc, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
 import { users as pgUsers } from "../db/postgres-schema";
 import { narratorBufferedMessages as mailbox, narrators, users } from "../db/schema";
+import { readQuery, readQueryFirst } from "../db/worker-read";
 import {
 	copyFileReference,
 	freezeFileReferenceSnapshots,
@@ -220,11 +221,11 @@ async function writeBufferedFile(path: string, value: File | string): Promise<vo
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	const write = Promise.resolve()
 		.then(() => Bun.write(path, value))
-		.finally(() => {
+		.finally(async () => {
 			release();
 			if (expired) {
-				deleteBufferedTextFile({ filename: basename(path), path, size: 0 });
-				cleanupBufferedTextFiles(basename(dirname(path)));
+				await deleteBufferedTextFile({ filename: basename(path), path, size: 0 });
+				await cleanupBufferedTextFiles(basename(dirname(path)));
 			}
 		});
 	try {
@@ -266,12 +267,14 @@ function ownedPath(path: string): boolean {
 function json<T>(value: string | null, fallback: T): T {
 	return value ? JSON.parse(value) : fallback;
 }
-function rowById(id: string): MailboxRow | undefined {
-	return db.select().from(mailbox).where(eq(mailbox.id, id)).get();
+async function rowById(id: string): Promise<MailboxRow | undefined> {
+	return readQueryFirst(db.select().from(mailbox).where(eq(mailbox.id, id)));
 }
-/** SQLite's synchronous ownership probe mirrors the bounded PostgreSQL adapter lookup. */
-function rowByStagingId(stagingId: string): MailboxRow | undefined {
-	const candidates = db.select().from(mailbox).where(eq(mailbox.kind, "user_input")).all();
+/** Ownership is read from the same durable mailbox used by the PostgreSQL adapter. */
+async function rowByStagingId(stagingId: string): Promise<MailboxRow | undefined> {
+	const candidates = await readQuery(
+		db.select().from(mailbox).where(eq(mailbox.kind, "user_input")),
+	);
 	return candidates.find(
 		(candidate) => json<{ stagingId?: string }>(candidate.metadataJson, {}).stagingId === stagingId,
 	);
@@ -360,14 +363,14 @@ export async function persistBufferedTextFiles(
 		}
 		return saved;
 	} catch (error) {
-		for (const file of saved) deleteBufferedTextFile(file);
+		for (const file of saved) await deleteBufferedTextFile(file);
 		throw error;
 	}
 }
 /** Only clean a known, unreferenced mailbox staging directory, never uploads/history. */
-export function cleanupBufferedTextFiles(id: string): void {
+export async function cleanupBufferedTextFiles(id: string): Promise<void> {
 	assertSqliteBufferRead("cleanupBufferedTextFiles");
-	const row = rowById(id) ?? rowByStagingId(id);
+	const row = (await rowById(id)) ?? (await rowByStagingId(id));
 	const stagingId = row
 		? (json<{ stagingId?: string }>(row.metadataJson, {}).stagingId ?? row.id)
 		: id;
@@ -392,7 +395,10 @@ export function cleanupBufferedTextFiles(id: string): void {
 		if (ownerId !== null && typeof ownerId !== "string") return;
 	}
 	if (stagingPending && !row) return;
-	const owner = ownerId ? rowById(ownerId) : undefined;
+	// Keep this ownership fence synchronous with deletion: a worker snapshot can become stale.
+	const owner = ownerId
+		? db.select().from(mailbox).where(eq(mailbox.id, ownerId)).get()
+		: undefined;
 	if (owner && ["queued", "claimed", "failed"].includes(owner.state)) return;
 	rmSync(path, { recursive: true, force: true });
 }
@@ -403,15 +409,15 @@ export async function cleanupBufferedTextFilesAsync(id: string): Promise<void> {
 		await cleanupStagingPg(port, id);
 		return;
 	}
-	cleanupBufferedTextFiles(id);
+	await cleanupBufferedTextFiles(id);
 }
-export function persistAdditionalBufferedTextFiles(
+export async function persistAdditionalBufferedTextFiles(
 	messageId: string,
 	files: File[],
 	reserved: Iterable<string>,
 ): Promise<SavedBufferedFile[]> {
 	assertSqliteBufferRead("persistAdditionalBufferedTextFiles");
-	const row = rowById(messageId);
+	const row = await rowById(messageId);
 	if (!row || row.kind !== "user_input" || !pending.includes(row.state as "queued" | "failed"))
 		throw new Error("Buffered message is no longer editable");
 	const id = json<{ stagingId?: string }>(row.metadataJson, {}).stagingId ?? row.id;
@@ -421,12 +427,12 @@ export function persistAdditionalBufferedTextFiles(
 	}
 	return persistBufferedTextFiles(id, files, reserved);
 }
-export function deleteBufferedTextFile(saved: SavedBufferedFile): void {
+export async function deleteBufferedTextFile(saved: SavedBufferedFile): Promise<void> {
 	assertSqliteBufferRead("deleteBufferedTextFile");
 	if (!ownedPath(saved.path)) return;
 	const marker = join(dirname(saved.path), STAGING_OWNER_FILE);
 	let ownerId: string | null = basename(dirname(saved.path));
-	if (!existsSync(marker) && !rowById(ownerId)) return;
+	if (!existsSync(marker) && !(await rowById(ownerId))) return;
 	if (existsSync(marker)) {
 		if (!ownedPath(marker) || statSync(marker).size > 1024) return;
 		try {
@@ -436,7 +442,10 @@ export function deleteBufferedTextFile(saved: SavedBufferedFile): void {
 		}
 		if (ownerId !== null && typeof ownerId !== "string") return;
 	}
-	const owner = ownerId ? rowById(ownerId) : undefined;
+	// Keep this ownership fence synchronous with deletion: a worker snapshot can become stale.
+	const owner = ownerId
+		? db.select().from(mailbox).where(eq(mailbox.id, ownerId)).get()
+		: undefined;
 	if (
 		owner &&
 		json<SavedBufferedFile[]>(owner.textFilePathsJson, []).some(
@@ -526,22 +535,24 @@ export function projectMailboxUserMessage(row: RuntimeMailboxRow): BufferedMessa
 			: {}),
 	};
 }
-export function getBufferedMessages(narratorId: string): BufferedMessage[] {
+export async function getBufferedMessages(narratorId: string): Promise<BufferedMessage[]> {
 	assertSqliteBufferRead("getBufferedMessages");
-	return db
-		.select()
-		.from(mailbox)
-		.where(
-			and(
-				eq(mailbox.narratorId, narratorId),
-				eq(mailbox.kind, "user_input"),
-				inArray(mailbox.state, pending),
-			),
+	return (
+		await readQuery(
+			db
+				.select()
+				.from(mailbox)
+				.where(
+					and(
+						eq(mailbox.narratorId, narratorId),
+						eq(mailbox.kind, "user_input"),
+						inArray(mailbox.state, pending),
+					),
+				)
+				.orderBy(desc(mailbox.priority), asc(mailbox.seq), asc(mailbox.arrivalSeq))
+				.limit(MAILBOX_LIMITS.userPending),
 		)
-		.orderBy(desc(mailbox.priority), asc(mailbox.seq), asc(mailbox.arrivalSeq))
-		.limit(MAILBOX_LIMITS.userPending)
-		.all()
-		.map(projectMailboxUserMessage);
+	).map(projectMailboxUserMessage);
 }
 
 /** Public user identity only; never read credentials or infer an author from a narrator owner. */
@@ -563,16 +574,18 @@ async function loadBufferCreators(createdBy: readonly string[]): Promise<BufferC
 			.where(inArray(pgUsers.id, ids))
 			.limit(ids.length);
 	}
-	return await db
-		.select({
-			id: users.id,
-			username: users.username,
-			avatarColor: users.avatarColor,
-			avatarImageId: users.avatarImageId,
-		})
-		.from(users)
-		.where(inArray(users.id, ids))
-		.limit(ids.length);
+	return await readQuery(
+		db
+			.select({
+				id: users.id,
+				username: users.username,
+				avatarColor: users.avatarColor,
+				avatarImageId: users.avatarImageId,
+			})
+			.from(users)
+			.where(inArray(users.id, ids))
+			.limit(ids.length),
+	);
 }
 
 /** Backend-neutral async projection used by production callers on both SQLite and PG. */
@@ -584,19 +597,20 @@ export async function getBufferedMessagesAsync(narratorId: string): Promise<Buff
 				includeFailed: true,
 				limit: MAILBOX_LIMITS.userPending,
 			})
-		: db
-				.select()
-				.from(mailbox)
-				.where(
-					and(
-						eq(mailbox.narratorId, narratorId),
-						eq(mailbox.kind, "user_input"),
-						inArray(mailbox.state, pending),
-					),
-				)
-				.orderBy(desc(mailbox.priority), asc(mailbox.seq), asc(mailbox.arrivalSeq))
-				.limit(MAILBOX_LIMITS.userPending)
-				.all();
+		: await readQuery(
+				db
+					.select()
+					.from(mailbox)
+					.where(
+						and(
+							eq(mailbox.narratorId, narratorId),
+							eq(mailbox.kind, "user_input"),
+							inArray(mailbox.state, pending),
+						),
+					)
+					.orderBy(desc(mailbox.priority), asc(mailbox.seq), asc(mailbox.arrivalSeq))
+					.limit(MAILBOX_LIMITS.userPending),
+			);
 	const messages = rows.map(projectMailboxUserMessage);
 	const missingAuthors = messages.flatMap((message) =>
 		!message.creator && message.createdBy ? [message.createdBy] : [],
@@ -821,7 +835,7 @@ export async function updateBufferedMessage(
 	opts: BufferedMessageAttachmentUpdate = {},
 ): Promise<boolean> {
 	const port = pgQueue();
-	const row = port ? await port.mailbox.getById(messageId) : rowById(messageId);
+	const row = port ? await port.mailbox.getById(messageId) : await rowById(messageId);
 	if (
 		!row ||
 		row.narratorId !== narratorId ||
@@ -1010,12 +1024,12 @@ export async function removeBufferedMessage(
 		return true;
 	}
 	store.initializeLegacy(narratorId);
-	const row = rowById(messageId);
+	const row = await rowById(messageId);
 	if (!row || row.narratorId !== narratorId || row.kind !== "user_input" || !row.deliveryId)
 		return false;
 	const id = json<{ stagingId?: string }>(row.metadataJson, {}).stagingId ?? row.id;
 	if (!store.cancel(row.deliveryId, "Removed by user")) return false;
-	cleanupBufferedTextFiles(id);
+	await cleanupBufferedTextFiles(id);
 	return true;
 }
 export const BUFFER_INTERRUPT_DELIVERY_TIMEOUT_MS = 5_000;
@@ -1026,23 +1040,24 @@ export async function readBufferedMessageDeliveryReceipt(
 ): Promise<RuntimeBufferedDeliveryReceipt | undefined> {
 	const port = pgQueue();
 	if (port) return port.mailbox.readUserBufferedDeliveryReceipt(narratorId, messageId);
-	return db
-		.select({
-			id: mailbox.id,
-			state: mailbox.state,
-			recipientMessageId: mailbox.recipientMessageId,
-			lastError: mailbox.lastError,
-		})
-		.from(mailbox)
-		.where(
-			and(
-				eq(mailbox.id, messageId),
-				eq(mailbox.narratorId, narratorId),
-				eq(mailbox.kind, "user_input"),
-			),
-		)
-		.limit(1)
-		.get();
+	return readQueryFirst(
+		db
+			.select({
+				id: mailbox.id,
+				state: mailbox.state,
+				recipientMessageId: mailbox.recipientMessageId,
+				lastError: mailbox.lastError,
+			})
+			.from(mailbox)
+			.where(
+				and(
+					eq(mailbox.id, messageId),
+					eq(mailbox.narratorId, narratorId),
+					eq(mailbox.kind, "user_input"),
+				),
+			)
+			.limit(1),
+	);
 }
 
 /** Wait OUTSIDE mutation admission. A busy wake is not a delivery acknowledgement. */
@@ -1205,18 +1220,19 @@ export async function clearBufferedMessages(narratorId: string): Promise<void> {
 		return;
 	}
 	store.initializeLegacy(narratorId);
-	const rows = db
-		.select()
-		.from(mailbox)
-		.where(
-			and(
-				eq(mailbox.narratorId, narratorId),
-				eq(mailbox.kind, "user_input"),
-				inArray(mailbox.state, pending),
-			),
-		)
-		.limit(MAILBOX_LIMITS.userPending)
-		.all();
+	const rows = await readQuery(
+		db
+			.select()
+			.from(mailbox)
+			.where(
+				and(
+					eq(mailbox.narratorId, narratorId),
+					eq(mailbox.kind, "user_input"),
+					inArray(mailbox.state, pending),
+				),
+			)
+			.limit(MAILBOX_LIMITS.userPending),
+	);
 	for (const row of rows) await removeBufferedMessage(narratorId, row.id);
 }
 /** Explicit user intent only. Missing staging remains failed instead of spinning a new run. */

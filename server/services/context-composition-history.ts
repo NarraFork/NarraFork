@@ -1,6 +1,7 @@
 import type { Database, SQLQueryBindings } from "bun:sqlite";
 import { type ContextSegment, safeCharacters } from "@shared/context-composition";
 import type { SQL } from "bun";
+import { readNativeRows } from "../db/worker-read";
 import { isTopLevelMessage, type OwnTurnPlacement } from "../lib/runtime-source";
 import { readContextSegments } from "./context-composition-projection";
 
@@ -15,10 +16,18 @@ export interface ContextQuery {
 export function sqliteContextQuery(database: Database): ContextQuery {
 	const query: ContextQuery = {
 		async get<T>(sql: string, bindings: readonly SQLQueryBindings[]) {
-			return (database.query(sql).get(...bindings) as T | null | undefined) ?? null;
+			return (
+				(
+					await readNativeRows<T>(database, sql, [...bindings], {
+						site: "context-composition.get",
+					})
+				)[0] ?? null
+			);
 		},
 		async all<T>(sql: string, bindings: readonly SQLQueryBindings[]) {
-			return database.query(sql).all(...bindings) as T[];
+			return readNativeRows<T>(database, sql, [...bindings], {
+				site: "context-composition.all",
+			});
 		},
 		async run(sql: string, bindings: readonly SQLQueryBindings[]) {
 			database.query(sql).run(...bindings);

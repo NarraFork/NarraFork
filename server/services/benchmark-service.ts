@@ -7,6 +7,7 @@ import { cpSync, existsSync, readdirSync, rmSync, statSync } from "node:fs";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { readQuery } from "@server/db/worker-read";
 import { eq } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import {
@@ -75,11 +76,11 @@ export async function createSuite(input: {
 }
 
 export async function listSuites() {
-	return db.select().from(benchmarkSuites).orderBy(benchmarkSuites.createdAt);
+	return readQuery(db.select().from(benchmarkSuites).orderBy(benchmarkSuites.createdAt));
 }
 
 export async function getSuite(id: string) {
-	return db.query.benchmarkSuites.findFirst({ where: eq(benchmarkSuites.id, id) });
+	return readQuery(db.query.benchmarkSuites.findFirst({ where: eq(benchmarkSuites.id, id) }));
 }
 
 // ── Run CRUD ────────────────────────────────────────────────────────
@@ -132,21 +133,25 @@ export async function createRun(input: {
 
 export async function listRuns(suiteId?: string) {
 	if (suiteId) {
-		return db
-			.select()
-			.from(benchmarkRuns)
-			.where(eq(benchmarkRuns.suiteId, suiteId))
-			.orderBy(benchmarkRuns.createdAt);
+		return readQuery(
+			db
+				.select()
+				.from(benchmarkRuns)
+				.where(eq(benchmarkRuns.suiteId, suiteId))
+				.orderBy(benchmarkRuns.createdAt),
+		);
 	}
-	return db.select().from(benchmarkRuns).orderBy(benchmarkRuns.createdAt);
+	return readQuery(db.select().from(benchmarkRuns).orderBy(benchmarkRuns.createdAt));
 }
 
 export async function getRun(id: string) {
-	return db.query.benchmarkRuns.findFirst({ where: eq(benchmarkRuns.id, id) });
+	return readQuery(db.query.benchmarkRuns.findFirst({ where: eq(benchmarkRuns.id, id) }));
 }
 
 export async function getRunResults(runId: string) {
-	return db.select().from(benchmarkTaskResults).where(eq(benchmarkTaskResults.runId, runId));
+	return readQuery(
+		db.select().from(benchmarkTaskResults).where(eq(benchmarkTaskResults.runId, runId)),
+	);
 }
 
 // ── Run execution ───────────────────────────────────────────────────
@@ -160,10 +165,12 @@ async function waitForNarratorIdle(
 	signal: AbortSignal,
 ): Promise<boolean> {
 	// Check current status first — may already be idle
-	const current = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { status: true },
-	});
+	const current = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { status: true },
+		}),
+	);
 	if (!current) return false;
 	if (current.status === "idle") return true;
 	if (signal.aborted) return false;
@@ -195,15 +202,13 @@ async function waitForNarratorIdle(
 
 /** Collect metrics from narrator messages and tool calls. */
 async function collectMetrics(narratorId: string) {
-	const messages = await db
-		.select()
-		.from(narratorMessages)
-		.where(eq(narratorMessages.narratorId, narratorId));
+	const messages = await readQuery(
+		db.select().from(narratorMessages).where(eq(narratorMessages.narratorId, narratorId)),
+	);
 
-	const toolCalls = await db
-		.select()
-		.from(narratorToolCalls)
-		.where(eq(narratorToolCalls.narratorId, narratorId));
+	const toolCalls = await readQuery(
+		db.select().from(narratorToolCalls).where(eq(narratorToolCalls.narratorId, narratorId)),
+	);
 
 	let tokensIn = 0;
 	let tokensOut = 0;
@@ -613,9 +618,11 @@ async function executeClaimedRun(run: BenchmarkRun): Promise<void> {
 			await executeTask(run, task, taskResult.id, abortController.signal);
 
 			// Refresh task result
-			const updated = await db.query.benchmarkTaskResults.findFirst({
-				where: eq(benchmarkTaskResults.id, taskResult.id),
-			});
+			const updated = await readQuery(
+				db.query.benchmarkTaskResults.findFirst({
+					where: eq(benchmarkTaskResults.id, taskResult.id),
+				}),
+			);
 
 			completedCount++;
 			if (updated?.status === "passed") passedCount++;

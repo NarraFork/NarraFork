@@ -20,14 +20,15 @@
  *   execution itself, and it is cancellable throughout. A caller therefore always settles, which is
  *   what makes the fallback below reachable.
  * - A crashed worker fails only its own in-flight task.
- * - If workers are unavailable for any reason, callers fall back to running the work inline on the
- *   main thread. Degraded performance is acceptable; a missing feature is not.
+ * - Unavailable workers reject the task. The runtime read bridge propagates that error; callers
+ *   retain their explicit domain error policy.
  * - Pool state is pinned to `globalThis` via hot-safe helpers so Bun `--hot` reloads reuse the
  *   existing workers instead of leaking a new set on every edit.
  */
 
 import { cpus } from "node:os";
 import { compiledWorkerSpecifiers } from "../compiled-worker";
+import { AppError, ForbiddenError, NotFoundError, ValidationError } from "../errors";
 import { hotOnce, hotSafe, hotTimerClear } from "../hot-safe";
 import { logger } from "../logger";
 import {
@@ -56,7 +57,29 @@ export class DbReadTaskTimeoutError extends Error {
 	}
 }
 
+export interface ReadTaskTiming {
+	/** Actual capacity-wait wall time, excluding worker acquisition/startup. */
+	queueWaitMs: number;
+	/** Worker acquisition/startup wall time, excluding capacity waits. */
+	acquireMs: number;
+}
+
+export interface ReadTaskCompletion {
+	elapsedMs: number;
+	queueWaitMs?: number;
+	acquireMs?: number;
+	workerActiveMs?: number;
+	workerAckWaitMs?: number;
+	workerDurationMs?: number;
+	rows?: number;
+	bytes?: number;
+	status: "ok" | "error" | "cancelled";
+	task: string;
+}
+
 export interface RunReadTaskOptions {
+	onChunk?: (rows: unknown[]) => void | Promise<void>;
+	onComplete?: (stats: ReadTaskCompletion) => void;
 	timeoutMs?: number;
 	signal?: AbortSignal;
 	/** Progress callback, invoked as the worker finishes individual tables. */
@@ -69,6 +92,10 @@ export interface RunReadTaskOptions {
 }
 
 interface PendingTask {
+	onChunk?: RunReadTaskOptions["onChunk"];
+	onMetrics?: (durationMs: number, rows: number, bytes: number) => void;
+	rows: number;
+	bytes: number;
 	requestId: string;
 	resolve: (value: unknown) => void;
 	reject: (error: Error) => void;
@@ -101,6 +128,7 @@ interface QueueWaiter {
 
 interface PooledWorker {
 	worker: Worker;
+	exited: Promise<void>;
 	readySignal: ReadySignal;
 	/** Set once a task's requestId is known; used by the idle reaper and crash accounting. */
 	busyWith: string | null;
@@ -160,6 +188,16 @@ function state(): PoolState {
 	}));
 }
 
+function lifecycleState() {
+	return hotSafe("narrafork.dbWorkerPool.lifecycle", () => ({
+		paused: false,
+		executions: new Map<Promise<unknown>, string>(),
+		retiring: new Set<Promise<void>>(),
+		closingPaths: new Map<string, Promise<unknown>>(),
+		drain: null as Promise<void> | null,
+	}));
+}
+
 /** Specifiers to try, most likely first. Dev has exactly one; compiled probes every layout. */
 function workerSpecifierCandidates(): string[] {
 	const s = state();
@@ -198,7 +236,7 @@ function workersDisabled(): string | null {
 function handleWorkerMessage(pooled: PooledWorker, message: DbWorkerOutbound): void {
 	const s = state();
 	if (!message || typeof message !== "object") return;
-	if (message.type === "ready") return; // handled by the ready promise
+	if (message.type === "ready" || message.type === "connectionClosed") return; // handled by lifecycle listeners
 
 	const pending = s.pending.get(message.requestId);
 	if (!pending) return;
@@ -212,6 +250,27 @@ function handleWorkerMessage(pooled: PooledWorker, message: DbWorkerOutbound): v
 		return;
 	}
 
+	if (message.type === "chunk") {
+		pending.rows += message.rows.length;
+		pending.bytes += message.bytes;
+		Promise.resolve()
+			.then(() => pending.onChunk?.(message.rows))
+			.then(() => new Promise<void>((resolve) => setImmediate(resolve)))
+			.then(() => {
+				if (s.pending.has(message.requestId))
+					pooled.worker.postMessage({ type: "chunkAck", requestId: message.requestId });
+			})
+			.catch((error) => {
+				clearTimeout(pending.timer);
+				s.pending.delete(message.requestId);
+				retireWorker(pooled, "result consumer failed");
+				pending.reject(error instanceof Error ? error : new Error(String(error)));
+			});
+		return;
+	}
+
+	if (message.type === "result")
+		pending.onMetrics?.(message.durationMs, pending.rows, pending.bytes);
 	clearTimeout(pending.timer);
 	s.pending.delete(message.requestId);
 	releaseWorker(pooled);
@@ -221,7 +280,19 @@ function handleWorkerMessage(pooled: PooledWorker, message: DbWorkerOutbound): v
 	} else if (message.type === "result") {
 		pending.resolve(message.result);
 	} else {
-		pending.reject(Object.assign(new Error(message.message), { code: message.code }));
+		const detail = message.applicationError;
+		const error = detail
+			? new AppError(message.message, detail.statusCode, message.code, detail)
+			: message.domExceptionName === "AbortError" || message.domExceptionName === "TimeoutError"
+				? new DOMException(message.message, message.domExceptionName)
+				: Object.assign(new Error(message.message), { code: message.code });
+		if (detail) {
+			const prototype = { AppError, ForbiddenError, NotFoundError, ValidationError }[
+				detail.name as "AppError"
+			]?.prototype;
+			if (prototype) Object.setPrototypeOf(error, prototype);
+		}
+		pending.reject(error);
 	}
 	drainQueue();
 }
@@ -233,11 +304,23 @@ function releaseWorker(pooled: PooledWorker): void {
 	pooled.idleSince = Date.now();
 }
 
+function workerExit(pooled: PooledWorker): Promise<void> {
+	// Existing workers can survive a development hot reload from the earlier pool shape.
+	pooled.exited ??= new Promise<void>((resolve) =>
+		pooled.worker.addEventListener("close", () => resolve(), { once: true }),
+	);
+	return pooled.exited;
+}
+
 /** Fail every task a dead worker was running, then drop it from the pool. */
 function retireWorker(pooled: PooledWorker, reason: string): void {
 	const s = state();
 	if (pooled.terminated) return;
 	pooled.terminated = true;
+	const retiring = lifecycleState().retiring;
+	const exited = workerExit(pooled);
+	retiring.add(exited);
+	void exited.then(() => retiring.delete(exited));
 	s.workers = s.workers.filter((candidate) => candidate !== pooled);
 	// A worker that dies before reporting ready must not leave a spawner waiting on its budget.
 	settleReady(pooled.readySignal, new Error(`database worker died (${reason})`));
@@ -307,8 +390,12 @@ function spawnWorkerFrom(specifier: string): PooledWorker {
 	// The global Worker accepts file: hrefs. node:worker_threads does not; those call sites
 	// pass workerEntryFromSpecifier instead.
 	const worker = new Worker(specifier);
+	const exited = new Promise<void>((resolve) =>
+		worker.addEventListener("close", () => resolve(), { once: true }),
+	);
 	const pooled: PooledWorker = {
 		worker,
+		exited,
 		busyWith: null,
 		claimed: false,
 		idleSince: Date.now(),
@@ -574,6 +661,8 @@ async function dispatch(
 	params: DbReadTaskParams,
 	options: RunReadTaskOptions,
 	deadlineAt: number,
+	onMetrics?: PendingTask["onMetrics"],
+	timing?: ReadTaskTiming,
 ): Promise<unknown> {
 	const s = state();
 
@@ -581,7 +670,9 @@ async function dispatch(
 	// retrying must not grow the stack or reset the deadline.
 	let pooled: PooledWorker | null = null;
 	while (!pooled) {
+		const acquireStarted = timing ? performance.now() : 0;
 		const outcome = await acquireWorker();
+		if (timing) timing.acquireMs += performance.now() - acquireStarted;
 		if (outcome.kind === "worker") {
 			pooled = outcome.worker;
 			break;
@@ -589,7 +680,12 @@ async function dispatch(
 		// Spawning failed: no live worker exists to ever trigger a drain, so queueing here would wait
 		// forever. Surface it and let the caller run its main-thread fallback.
 		if (outcome.kind === "spawn_failed") throw new WorkersUnavailableError(outcome.reason);
-		await waitForCapacity(deadlineAt, options.signal);
+		const queueStarted = timing ? performance.now() : 0;
+		try {
+			await waitForCapacity(deadlineAt, options.signal);
+		} finally {
+			if (timing) timing.queueWaitMs += performance.now() - queueStarted;
+		}
 	}
 	const worker = pooled;
 
@@ -655,6 +751,10 @@ async function dispatch(
 			reject: settleReject,
 			timer,
 			onProgress: options.onProgress,
+			onChunk: options.onChunk,
+			onMetrics,
+			rows: 0,
+			bytes: 0,
 		});
 
 		if (options.signal) {
@@ -704,17 +804,28 @@ export async function runEphemeralReadTask<T>(
 	params: DbReadTaskParams,
 	options: RunReadTaskOptions = {},
 ): Promise<T> {
-	const specifiers = workerSpecifierCandidates();
-	let lastError: Error | null = null;
-	for (const specifier of specifiers) {
-		try {
-			return await runEphemeralOnSpecifier<T>(specifier, dbPath, params, options);
-		} catch (err) {
-			if (options.signal?.aborted) throw err;
-			lastError = err instanceof Error ? err : new Error(String(err));
+	const lifecycle = lifecycleState();
+	if (lifecycle.paused || lifecycle.closingPaths.has(dbPath))
+		throw new WorkersUnavailableError("database_read_connections_closing");
+	const execution = (async () => {
+		const specifiers = workerSpecifierCandidates();
+		let lastError: Error | null = null;
+		for (const specifier of specifiers) {
+			try {
+				return await runEphemeralOnSpecifier<T>(specifier, dbPath, params, options);
+			} catch (err) {
+				if (options.signal?.aborted) throw err;
+				lastError = err instanceof Error ? err : new Error(String(err));
+			}
 		}
+		throw lastError ?? new WorkersUnavailableError("ephemeral_spawn_failed");
+	})();
+	lifecycle.executions.set(execution, dbPath);
+	try {
+		return await execution;
+	} finally {
+		lifecycle.executions.delete(execution);
 	}
-	throw lastError ?? new WorkersUnavailableError("ephemeral_spawn_failed");
 }
 
 function runEphemeralOnSpecifier<T>(
@@ -727,6 +838,9 @@ function runEphemeralOnSpecifier<T>(
 	const timeoutMs = options.timeoutMs ?? DEFAULT_TASK_TIMEOUT_MS;
 	return new Promise<T>((resolve, reject) => {
 		const worker = new Worker(specifier);
+		const exited = new Promise<void>((done) =>
+			worker.addEventListener("close", () => done(), { once: true }),
+		);
 		let settled = false;
 		let ready = false;
 		const finish = (error?: Error, result?: T) => {
@@ -739,8 +853,10 @@ function runEphemeralOnSpecifier<T>(
 			} catch {
 				// best effort
 			}
-			if (error) reject(error);
-			else resolve(result as T);
+			void exited.then(() => {
+				if (error) reject(error);
+				else resolve(result as T);
+			});
 		};
 		const onAbort = () => {
 			try {
@@ -787,12 +903,25 @@ function runEphemeralOnSpecifier<T>(
 				});
 				return;
 			}
+			if (message?.type === "chunk" && message.requestId === requestId) {
+				Promise.resolve()
+					.then(() => options.onChunk?.(message.rows))
+					.then(() => {
+						if (!settled) worker.postMessage({ type: "chunkAck", requestId });
+					})
+					.catch((error) => finish(error instanceof Error ? error : new Error(String(error))));
+				return;
+			}
 			if (message?.type === "result" && message.requestId === requestId) {
 				finish(undefined, message.result as T);
 				return;
 			}
 			if (message?.type === "error" && message.requestId === requestId) {
-				finish(new Error(message.message || "database worker failed"));
+				finish(
+					message.domExceptionName === "AbortError" || message.domExceptionName === "TimeoutError"
+						? new DOMException(message.message, message.domExceptionName)
+						: new Error(message.message || "database worker failed"),
+				);
 			}
 		};
 	});
@@ -801,8 +930,8 @@ function runEphemeralOnSpecifier<T>(
 /**
  * Run a read-only task in a worker.
  *
- * Throws {@link WorkersUnavailableError} when workers cannot be used; callers are expected to catch
- * that and run their main-thread fallback.
+ * Throws {@link WorkersUnavailableError} when workers cannot be used. Query consumers must
+ * preserve their domain error policy without implicitly re-running the read on the main thread.
  */
 export async function runReadTask<T>(
 	dbPath: string,
@@ -811,6 +940,9 @@ export async function runReadTask<T>(
 ): Promise<T> {
 	const disabled = workersDisabled();
 	if (disabled) throw new WorkersUnavailableError(disabled);
+	const lifecycle = lifecycleState();
+	if (lifecycle.paused || lifecycle.closingPaths.has(dbPath))
+		throw new WorkersUnavailableError("database_read_connections_closing");
 
 	const s = state();
 	const key = options.dedupeKey;
@@ -822,11 +954,129 @@ export async function runReadTask<T>(
 	// One absolute deadline for the whole attempt (queue wait + execution), fixed here so retries
 	// after a lost capacity race cannot silently extend it.
 	const deadlineAt = Date.now() + (options.timeoutMs ?? DEFAULT_TASK_TIMEOUT_MS);
-	const execution = dispatch(dbPath, params, options, deadlineAt).finally(() => {
-		if (key) s.inFlight.delete(key);
-	});
+	const startedAt = performance.now();
+	let metrics: Partial<ReadTaskCompletion> = {};
+	const timing =
+		params.kind === "selectRowsV1" && params.diagnosticTiming
+			? { queueWaitMs: 0, acquireMs: 0 }
+			: undefined;
+	const execution = dispatch(
+		dbPath,
+		params,
+		options,
+		deadlineAt,
+		(workerDurationMs, rows, bytes) => {
+			metrics = { workerDurationMs, ...(params.kind === "selectRowsV1" ? { rows, bytes } : {}) };
+		},
+		timing,
+	)
+		.then(
+			(result) => {
+				const selectTiming = timing
+					? (result as {
+							workerActiveMs?: number;
+							workerAckWaitMs?: number;
+						})
+					: undefined;
+				options.onComplete?.({
+					...metrics,
+					...(timing
+						? {
+								...timing,
+								workerActiveMs: selectTiming?.workerActiveMs,
+								workerAckWaitMs: selectTiming?.workerAckWaitMs,
+							}
+						: {}),
+					elapsedMs: performance.now() - startedAt,
+					status: "ok",
+					task: params.kind,
+				});
+				return result;
+			},
+			(error) => {
+				options.onComplete?.({
+					...metrics,
+					...timing,
+					elapsedMs: performance.now() - startedAt,
+					status: options.signal?.aborted ? "cancelled" : "error",
+					task: params.kind,
+				});
+				throw error;
+			},
+		)
+		.finally(() => {
+			if (key) s.inFlight.delete(key);
+			lifecycle.executions.delete(execution);
+		});
+	lifecycle.executions.set(execution, dbPath);
 	if (key) s.inFlight.set(key, execution);
 	return execution as Promise<T>;
+}
+
+/** Stop accepting reads, finish existing tasks, and await every cached read connection's exit. */
+export function drainDbWorkerPool(): Promise<void> {
+	const lifecycle = lifecycleState();
+	if (lifecycle.drain) return lifecycle.drain;
+	lifecycle.paused = true;
+	lifecycle.drain = (async () => {
+		await Promise.allSettled([...lifecycle.executions.keys()]);
+		hotTimerClear(REAPER_TIMER_KEY);
+		await Promise.all(
+			[...state().workers].map((pooled) => {
+				pooled.worker.postMessage({ type: "shutdown" });
+				return workerExit(pooled);
+			}),
+		);
+		await Promise.all([...lifecycle.retiring]);
+	})();
+	return lifecycle.drain;
+}
+
+/** Called only after a maintenance/replacement operation has completed. */
+export function resumeDbWorkerPool(): void {
+	const lifecycle = lifecycleState();
+	lifecycle.paused = false;
+	lifecycle.drain = null;
+}
+
+/** Close a database's cached readers before closing/replacing its owning connection. */
+export function closeDbWorkerConnections(
+	dbPath: string,
+	afterClose?: () => void | Promise<void>,
+): Promise<void> {
+	const lifecycle = lifecycleState();
+	const existing = lifecycle.closingPaths.get(dbPath);
+	if (existing) return existing as Promise<void>;
+	const closing = (async () => {
+		await Promise.allSettled(
+			[...lifecycle.executions].filter(([, path]) => path === dbPath).map(([task]) => task),
+		);
+		await Promise.all(
+			[...state().workers].map(
+				(pooled) =>
+					new Promise<void>((resolve) => {
+						if (pooled.terminated) return resolve();
+						const requestId = `close-${++state().requestCounter}`;
+						const cleanup = () => {
+							pooled.worker.removeEventListener("message", onMessage as EventListener);
+							pooled.worker.removeEventListener("close", cleanup);
+							resolve();
+						};
+						const onMessage = (event: MessageEvent<DbWorkerOutbound>) => {
+							if (event.data.type === "connectionClosed" && event.data.requestId === requestId)
+								cleanup();
+						};
+						pooled.worker.addEventListener("message", onMessage as EventListener);
+						pooled.worker.addEventListener("close", cleanup, { once: true });
+						pooled.worker.postMessage({ type: "closeConnection", requestId, dbPath });
+					}),
+			),
+		);
+		await Promise.all([...lifecycle.retiring]);
+		await afterClose?.();
+	})().finally(() => lifecycle.closingPaths.delete(dbPath));
+	lifecycle.closingPaths.set(dbPath, closing);
+	return closing;
 }
 
 /** Terminate all workers and clear pool state. Safe to call repeatedly. */
@@ -863,6 +1113,9 @@ export function shutdownDbWorkerPool(): void {
 export function resetDbWorkerPoolForTest(): void {
 	const s = state();
 	shutdownDbWorkerPool();
+	resumeDbWorkerPool();
+	lifecycleState().executions.clear();
+	lifecycleState().closingPaths.clear();
 	s.spawnFailures = 0;
 	s.disabledReason = null;
 	s.pendingSpawns = 0;

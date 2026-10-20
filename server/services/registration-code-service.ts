@@ -16,6 +16,7 @@
 import { createHash } from "node:crypto";
 import { db } from "@server/db";
 import { registrationCodes, users } from "@server/db/schema";
+import { readQuery } from "@server/db/worker-read";
 import { AppError } from "@server/lib/errors";
 import { generateId } from "@server/lib/id";
 import {
@@ -128,10 +129,13 @@ async function toSummaries(rows: SummaryRow[]): Promise<RegistrationCodeSummary[
 	}
 	const usernames = new Map<string, string>();
 	if (referencedIds.size > 0) {
-		const userRows = await db
-			.select({ id: users.id, username: users.username })
-			.from(users)
-			.where(inArray(users.id, [...referencedIds]));
+		const userRows = await readQuery(
+			db
+				.select({ id: users.id, username: users.username })
+				.from(users)
+				.where(inArray(users.id, [...referencedIds])),
+			{ site: "server/services/registration-code-service.read" },
+		);
 		for (const user of userRows) usernames.set(user.id, user.username);
 	}
 
@@ -177,10 +181,13 @@ export const registrationCodeService = {
 		};
 		await db.insert(registrationCodes).values(row);
 
-		const creator = await db.query.users.findFirst({
-			where: eq(users.id, input.createdByUserId),
-			columns: { username: true },
-		});
+		const creator = await readQuery(
+			db.query.users.findFirst({
+				where: eq(users.id, input.createdByUserId),
+				columns: { username: true },
+			}),
+			{ site: "server/services/registration-code-service.read" },
+		);
 
 		return {
 			code,
@@ -208,11 +215,14 @@ export const registrationCodeService = {
 	 * confirm a guessed code offline. There is no reason for it to leave the server.
 	 */
 	async listCodes(): Promise<RegistrationCodeSummary[]> {
-		const rows = await db
-			.select(SUMMARY_COLUMNS)
-			.from(registrationCodes)
-			.orderBy(desc(registrationCodes.createdAt))
-			.limit(LIST_LIMIT);
+		const rows = await readQuery(
+			db
+				.select(SUMMARY_COLUMNS)
+				.from(registrationCodes)
+				.orderBy(desc(registrationCodes.createdAt))
+				.limit(LIST_LIMIT),
+			{ site: "server/services/registration-code-service.read" },
+		);
 		return toSummaries(rows);
 	},
 
@@ -224,9 +234,12 @@ export const registrationCodeService = {
 	 * is the operation for that case.
 	 */
 	async revokeCode(id: string): Promise<RegistrationCodeSummary> {
-		const existing = await db.query.registrationCodes.findFirst({
-			where: eq(registrationCodes.id, id),
-		});
+		const existing = await readQuery(
+			db.query.registrationCodes.findFirst({
+				where: eq(registrationCodes.id, id),
+			}),
+			{ site: "server/services/registration-code-service.read" },
+		);
 		if (!existing) throw new AppError("Registration code not found", 404, "NOT_FOUND");
 		if (existing.usedAt) {
 			throw new AppError("This code has already been used", 409, "CODE_ALREADY_USED");
@@ -237,10 +250,10 @@ export const registrationCodeService = {
 				.set({ revokedAt: new Date().toISOString() })
 				.where(eq(registrationCodes.id, id));
 		}
-		const [row] = await db
-			.select(SUMMARY_COLUMNS)
-			.from(registrationCodes)
-			.where(eq(registrationCodes.id, id));
+		const [row] = await readQuery(
+			db.select(SUMMARY_COLUMNS).from(registrationCodes).where(eq(registrationCodes.id, id)),
+			{ site: "server/services/registration-code-service.read" },
+		);
 		if (!row) throw new AppError("Registration code not found", 404, "NOT_FOUND");
 		const [summary] = await toSummaries([row]);
 		return summary;

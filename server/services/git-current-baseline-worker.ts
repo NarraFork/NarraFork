@@ -5,7 +5,7 @@ import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { parentPort } from "node:worker_threads";
 import type { FileChangeBlobRef, FileChangeState } from "../../shared/file-change-protocol";
 import { FileChangeBlobStore } from "./file-change-blob-store";
-import { localDirectoryIdentity, localObjectIdentity } from "./file-change-local-io";
+import { localDirectoryIdentity, localObjectIdentity } from "./file-change-local-identity";
 
 /** Display budgets only. Exceeding one returns unknown, never partial hashes. */
 export const CURRENT_DIFF_FILE_BYTES = 4 * 1024 * 1024;

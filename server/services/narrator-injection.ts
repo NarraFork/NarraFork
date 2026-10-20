@@ -63,6 +63,7 @@ import type { SideCarBody } from "@shared/sidecar-body";
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import { narratorMessages } from "../db/schema";
+import { readQueryFirst } from "../db/worker-read";
 import { projectMessageSenderText } from "../lib/agent/sender-projection";
 import { logger } from "../lib/logger";
 import type { Locale } from "../lib/prompt-i18n";
@@ -284,16 +285,20 @@ async function deliverInjectionUnlocked(
 
 	const locale = options.locale ?? "en";
 	const existingRole = options.messageId
-		? db
-				.select({ role: narratorMessages.role })
-				.from(narratorMessages)
-				.where(
-					and(
-						eq(narratorMessages.id, options.messageId),
-						eq(narratorMessages.narratorId, narratorId),
-					),
+		? (
+				await readQueryFirst(
+					db
+						.select({ role: narratorMessages.role })
+						.from(narratorMessages)
+						.where(
+							and(
+								eq(narratorMessages.id, options.messageId),
+								eq(narratorMessages.narratorId, narratorId),
+							),
+						),
+					{ site: "narrator-injection.deliverInjection" },
 				)
-				.get()?.role
+			)?.role
 		: undefined;
 	const role =
 		options.role ?? (existingRole === "user" || existingRole === "sys" ? existingRole : "sys");

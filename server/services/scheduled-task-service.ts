@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 import { DEFAULT_LOCALE, type Locale } from "@shared/i18n-locales";
 import { formatOriginLabel } from "@shared/message-origin";
 import type { ScheduledTaskCleanupPolicy } from "@shared/scheduled-task-cleanup";
@@ -106,10 +107,12 @@ function now(): string {
 async function principalForTask(task: ScheduledTask): Promise<NarratorPrincipal> {
 	const userId = task.createdBy ?? "";
 	if (!userId) return { userId: "", isAdmin: false };
-	const user = await db.query.users.findFirst({
-		where: eq(users.id, userId),
-		columns: { role: true },
-	});
+	const user = await readQuery(
+		db.query.users.findFirst({
+			where: eq(users.id, userId),
+			columns: { role: true },
+		}),
+	);
 	return { userId, isAdmin: user?.role === "admin" };
 }
 
@@ -124,10 +127,12 @@ export const scheduledTaskService = {
 	async list(): Promise<{ tasks: ScheduledTask[]; truncated: boolean }> {
 		// `LIMIT n + 1` rather than a separate COUNT: one extra row answers "is there
 		// more" without a second scan of the table.
-		const rows = await db.query.scheduledTasks.findMany({
-			orderBy: (t) => [asc(t.createdAt)],
-			limit: LIST_MAX + 1,
-		});
+		const rows = await readQuery(
+			db.query.scheduledTasks.findMany({
+				orderBy: (t) => [asc(t.createdAt)],
+				limit: LIST_MAX + 1,
+			}),
+		);
 		if (rows.length > LIST_MAX) {
 			logger.warn("scheduled task list truncated", { limit: LIST_MAX });
 			return { tasks: rows.slice(0, LIST_MAX), truncated: true };
@@ -136,7 +141,7 @@ export const scheduledTaskService = {
 	},
 
 	async get(id: string): Promise<ScheduledTask | undefined> {
-		return db.query.scheduledTasks.findFirst({ where: eq(scheduledTasks.id, id) });
+		return readQuery(db.query.scheduledTasks.findFirst({ where: eq(scheduledTasks.id, id) }));
 	},
 
 	async create(input: CreateScheduledTaskInput): Promise<ScheduledTask> {
@@ -255,9 +260,14 @@ export const scheduledTaskService = {
 
 	/** Tasks that are enabled and due (nextRunAt <= now). */
 	async listDue(at: Date = new Date()): Promise<ScheduledTask[]> {
-		return db.query.scheduledTasks.findMany({
-			where: and(eq(scheduledTasks.enabled, true), lte(scheduledTasks.nextRunAt, at.toISOString())),
-		});
+		return readQuery(
+			db.query.scheduledTasks.findMany({
+				where: and(
+					eq(scheduledTasks.enabled, true),
+					lte(scheduledTasks.nextRunAt, at.toISOString()),
+				),
+			}),
+		);
 	},
 
 	/**
@@ -266,9 +276,11 @@ export const scheduledTaskService = {
 	 * avoid a thundering herd of catch-up runs at boot.
 	 */
 	async recoverOnStartup(): Promise<void> {
-		const tasks = await db.query.scheduledTasks.findMany({
-			where: eq(scheduledTasks.enabled, true),
-		});
+		const tasks = await readQuery(
+			db.query.scheduledTasks.findMany({
+				where: eq(scheduledTasks.enabled, true),
+			}),
+		);
 		const at = new Date();
 		for (const task of tasks) {
 			const next = nextCronRun(task.cronExpr, task.timezone, at);
@@ -410,11 +422,13 @@ export const scheduledTaskService = {
 		const where = opts.cursor
 			? and(eq(scheduledTaskRuns.taskId, taskId), lt(scheduledTaskRuns.createdAt, opts.cursor))
 			: eq(scheduledTaskRuns.taskId, taskId);
-		const rows = await db.query.scheduledTaskRuns.findMany({
-			where,
-			orderBy: (t) => [desc(t.createdAt)],
-			limit: limit + 1,
-		});
+		const rows = await readQuery(
+			db.query.scheduledTaskRuns.findMany({
+				where,
+				orderBy: (t) => [desc(t.createdAt)],
+				limit: limit + 1,
+			}),
+		);
 		const hasMore = rows.length > limit;
 		const runs = hasMore ? rows.slice(0, limit) : rows;
 		const nextCursor = hasMore ? (runs[runs.length - 1]?.createdAt ?? null) : null;
@@ -440,9 +454,11 @@ export const scheduledTaskService = {
 				return { status: "skipped", narratorId: null, error: "Missing chapterId" };
 			}
 			// Wake the chapter if dormant so the worktree exists.
-			const chapter = await db.query.chapters.findFirst({
-				where: (c, { eq: e }) => e(c.id, task.chapterId as string),
-			});
+			const chapter = await readQuery(
+				db.query.chapters.findFirst({
+					where: (c, { eq: e }) => e(c.id, task.chapterId as string),
+				}),
+			);
 			if (!chapter) {
 				return { status: "skipped", narratorId: null, error: "Chapter not found" };
 			}

@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 import { notifyHumanAttentionChanged } from "@server/services/human-attention-events";
 import type { ProgressSnapshot } from "@shared/progress-phase";
 import { z } from "zod/v4";
@@ -216,13 +217,15 @@ async function resolveTaskReflectionToolCallId(
 		const { and, eq } = await import("drizzle-orm");
 		const { db } = await import("@server/db");
 		const { narratorToolCalls } = await import("@server/db/schema");
-		const row = await db.query.narratorToolCalls.findFirst({
-			where: and(
-				eq(narratorToolCalls.narratorId, pending.narratorId),
-				eq(narratorToolCalls.toolUseId, pending.toolUseId),
-			),
-			columns: { id: true },
-		});
+		const row = await readQuery(
+			db.query.narratorToolCalls.findFirst({
+				where: and(
+					eq(narratorToolCalls.narratorId, pending.narratorId),
+					eq(narratorToolCalls.toolUseId, pending.toolUseId),
+				),
+				columns: { id: true },
+			}),
+		);
 		if (row?.id) {
 			pending.toolCallId = row.id;
 			return row.id;

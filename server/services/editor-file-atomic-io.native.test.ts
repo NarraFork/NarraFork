@@ -304,7 +304,7 @@ test("lost apply reply stays unknown until original executor proof; no second ap
 	fixture.forceQueryOutcome();
 	const runtime = await getDefaultLocalFileChangeRuntime(),
 		source = await runtime.verifyNamespace();
-	const operation = runtime.evidence.getEditorOperation(
+	const operation = await runtime.evidence.getEditorOperation(
 		source.sourceInstanceId,
 		saved.upload.operationId,
 	);

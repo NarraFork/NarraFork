@@ -5,6 +5,7 @@ import { resolveUserGitIdentityEnv } from "../lib/git-identity";
 import { logger } from "../lib/logger";
 import { narratorPrincipalOf, requireNarratorAccess } from "../lib/narrator-access";
 import { requireChapterAccess } from "../lib/project-access";
+import { diagnosticAwait, diagnosticGitScope } from "../lib/request-diagnostics";
 import {
 	gitCommitDiffQuerySchema,
 	gitCommitSchema,
@@ -31,12 +32,14 @@ import {
 } from "../services/git-management-service";
 import { withGitRequestContext } from "../services/git-service";
 import { getStatusSummaryCached } from "../services/git-status-cache";
+import { getGitStatusQueryScopeId, getLocalGitStatusQueryKey } from "../services/git-status-query";
 import { assertGitWorkspaceKey, type GitWorkspaceTarget } from "../services/git-workspace";
 import { authorizeGitTarget, requireReadyGitTarget } from "../services/git-workspace-access";
 import {
 	collectGitAttributionScopes,
 	redactGitModificationView,
 } from "../services/git-workspace-attribution";
+import { getRemoteGitStatusQueryKey } from "../services/remote-git-service";
 import {
 	withWorkspaceRepositoryLock,
 	workspaceContextService,
@@ -139,7 +142,18 @@ export function createGitRoutes(source: "chapter" | "narrator") {
 				: { narratorId: c.req.param("id") ?? "" };
 		if (c.req.method === "GET" && c.req.path.endsWith("/modifications") && c.req.raw.signal.aborted)
 			return cancelledModificationResponse(c, source);
-		const target = await authorizeGitTarget(c, origin, need);
+		// Authorization precedes the existing workspace elapsedMs window.
+		const target = await diagnosticAwait("git.authorize", () =>
+			authorizeGitTarget(c, origin, need),
+		);
+		if (target.workspace.rootPath && target.backend)
+			diagnosticGitScope(
+				getGitStatusQueryScopeId(
+					target.backend.kind === "remote"
+						? getRemoteGitStatusQueryKey(target.backend, target.workspace.rootPath)
+						: getLocalGitStatusQueryKey(target.workspace.rootPath),
+				),
+			);
 		if (!workspaceRequest) {
 			if (need === "write") {
 				// Hono caches parsed JSON: each handler still uses its existing Zod schema.
@@ -219,61 +233,80 @@ export function createGitRoutes(source: "chapter" | "narrator") {
 			),
 		),
 	);
-	routes.get(`${prefix}/modifications`, async (c) => {
-		const { target, path, git } = access(c);
-		const query = gitModificationsQuerySchema.parse(c.req.query());
-		if (query.narratorId && query.narratorId !== "external")
-			await requireNarratorAccess(c, query.narratorId, "read");
-		const cursor = modificationCursor(c);
-		const status = query.scope === "uncommitted" ? await git.getStatusSummary(path) : null;
-		const pathAliases = new Map<string, string>();
-		for (const file of status?.files ?? [])
-			if (file.oldPath) pathAliases.set(file.oldPath, file.path);
-		const directScopes = gitAttributionScopes(target, status?.files.map((file) => file.path) ?? []);
-		const discoveredScopes = await collectGitAttributionScopes(target, c.req.raw.signal);
-		const scopeMap = new Map(
-			[...directScopes.scopes, ...discoveredScopes.scopes].map((scope) => [
-				scope.workspacePath,
-				scope,
-			]),
-		);
-		const mergedScopes = [...scopeMap.values()];
-		const scopesTruncated =
-			directScopes.truncated ||
-			discoveredScopes.truncated ||
-			status?.truncated === true ||
-			mergedScopes.length > 32;
-		const view = await getWorkspaceModificationView(path, {
-			deviceId: target.workspace.deviceId,
-			additionalScopes: mergedScopes.slice(0, 32),
-			additionalScopesTruncated: scopesTruncated,
-			currentDiff: query.scope === "uncommitted",
-			signal: c.req.raw.signal,
-			cursor,
-			limit: query.limit,
-			since: query.since,
-			until: query.until,
-			narratorId: query.narratorId,
-			projection: query.projection,
-			...(status
-				? {
-						filePaths: [...status.files.map((file) => file.path), ...pathAliases.keys()],
-						pathAliases,
-					}
-				: {}),
-		});
-		if (scopesTruncated) {
-			view.hasMore = true;
-			view.completeness = {
-				...view.completeness,
-				fileHistoryComplete: false,
-				contributorsTruncated: true,
-				countsLowerBound: true,
-				warningScanComplete: false,
-			};
-		}
-		return c.json(await redactGitModificationView(view, narratorPrincipalOf(c)));
-	});
+	routes.get(`${prefix}/modifications`, (c) =>
+		diagnosticAwait("git.modifications", async () => {
+			const { target, path, git } = access(c);
+			const query = gitModificationsQuerySchema.parse(c.req.query());
+			const narratorId = query.narratorId;
+			if (narratorId && narratorId !== "external")
+				await diagnosticAwait("modifications.actor-access", () =>
+					requireNarratorAccess(c, narratorId, "read"),
+				);
+			const cursor = modificationCursor(c);
+			const status =
+				query.scope === "uncommitted"
+					? await diagnosticAwait("modifications.status", () => git.getStatusSummary(path))
+					: null;
+			const pathAliases = new Map<string, string>();
+			for (const file of status?.files ?? [])
+				if (file.oldPath) pathAliases.set(file.oldPath, file.path);
+			const directScopes = gitAttributionScopes(
+				target,
+				status?.files.map((file) => file.path) ?? [],
+			);
+			const discoveredScopes = await diagnosticAwait("modifications.scopes", () =>
+				collectGitAttributionScopes(target, c.req.raw.signal),
+			);
+			const scopeMap = new Map(
+				[...directScopes.scopes, ...discoveredScopes.scopes].map((scope) => [
+					scope.workspacePath,
+					scope,
+				]),
+			);
+			const mergedScopes = [...scopeMap.values()];
+			const scopesTruncated =
+				directScopes.truncated ||
+				discoveredScopes.truncated ||
+				status?.truncated === true ||
+				mergedScopes.length > 32;
+			const view = await diagnosticAwait("modifications.view", () =>
+				getWorkspaceModificationView(path, {
+					deviceId: target.workspace.deviceId,
+					additionalScopes: mergedScopes.slice(0, 32),
+					additionalScopesTruncated: scopesTruncated,
+					currentDiff: query.scope === "uncommitted",
+					signal: c.req.raw.signal,
+					cursor,
+					limit: query.limit,
+					since: query.since,
+					until: query.until,
+					narratorId: query.narratorId,
+					projection: query.projection,
+					...(status
+						? {
+								filePaths: [...status.files.map((file) => file.path), ...pathAliases.keys()],
+								pathAliases,
+							}
+						: {}),
+				}),
+			);
+			if (scopesTruncated) {
+				view.hasMore = true;
+				view.completeness = {
+					...view.completeness,
+					fileHistoryComplete: false,
+					contributorsTruncated: true,
+					countsLowerBound: true,
+					warningScanComplete: false,
+				};
+			}
+			return c.json(
+				await diagnosticAwait("modifications.redact", () =>
+					redactGitModificationView(view, narratorPrincipalOf(c)),
+				),
+			);
+		}),
+	);
 	for (const operation of ["stage", "unstage", "discard"] as const) {
 		routes.post(`${prefix}/${operation}`, async (c) => {
 			const { target, path, git } = access(c);

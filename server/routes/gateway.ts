@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 /**
  * Gateway management API routes.
  *
@@ -52,7 +53,7 @@ gatewayRoutes.post("/reload", async (c) => {
 // ---------------------------------------------------------------------------
 
 gatewayRoutes.get("/sessions", async (c) => {
-	const sessions = await db.select().from(gatewaySessionMappings).all();
+	const sessions = await readQuery(db.select().from(gatewaySessionMappings));
 	return c.json(sessions);
 });
 
@@ -107,13 +108,15 @@ export async function handleWebhookRequest(c: Context): Promise<Response> {
 	// Find or create session mapping, then forward to narrator
 	const now = new Date().toISOString();
 
-	const mapping = await db.query.gatewaySessionMappings.findFirst({
-		where: and(
-			eq(gatewaySessionMappings.platform, msg.platform),
-			eq(gatewaySessionMappings.chatId, msg.chatId),
-			eq(gatewaySessionMappings.userId, msg.userId),
-		),
-	});
+	const mapping = await readQuery(
+		db.query.gatewaySessionMappings.findFirst({
+			where: and(
+				eq(gatewaySessionMappings.platform, msg.platform),
+				eq(gatewaySessionMappings.chatId, msg.chatId),
+				eq(gatewaySessionMappings.userId, msg.userId),
+			),
+		}),
+	);
 
 	let narratorId: string;
 

@@ -49,14 +49,14 @@ describe("db read worker module boundary", () => {
 		expect(leaked).toEqual([]);
 	}, 60_000);
 
-	test("worker entry does not bundle drizzle or the schema", async () => {
+	test("connection-injected domain handlers do not initialize application settings", async () => {
 		const build = await Bun.build({ entrypoints: [WORKER_ENTRY], target: "bun" });
 		expect(build.success).toBe(true);
 		const bundled = await build.outputs[0].text();
-		// Pulling in the ORM/schema would mean the worker is one import away from the bootstrap and
-		// would also bloat every worker thread with the full table definitions.
-		expect(bundled).not.toContain("drizzle-orm");
-		expect(bundled).not.toContain("sqliteTable");
+		// Domain read transactions use the pure schema with their injected read-only connection.
+		// Application configuration and database lifecycle must remain main-thread composition.
+		expect(bundled).not.toContain("loadSettingsFromDisk");
+		expect(bundled).not.toContain("subscribeSettingsChanges");
 	}, 60_000);
 
 	test("the shared query module itself stays free of the db singleton", async () => {

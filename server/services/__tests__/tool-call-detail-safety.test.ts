@@ -11,6 +11,8 @@ import {
 	runtimePublicationOutbox,
 	users,
 } from "../../db/schema";
+import { readTransactionTask } from "../../db/worker-read";
+import * as readWorkerPool from "../../lib/db-worker/pool";
 import { AppError, NotFoundError } from "../../lib/errors";
 import { generateId } from "../../lib/id";
 import { delegationRegistration } from "../../lib/validators/runtime-registration";
@@ -19,6 +21,10 @@ import { getRunHold, setRunHold } from "../agent-runtime/ownership";
 import { runtimePublication } from "../agent-runtime/publication";
 import { controlRun } from "../agent-runtime/run";
 import { narratorPersistence } from "../narrator-persistence";
+import {
+	loadLatestSubagentToolCallsTx,
+	runNarratorReadTransaction,
+} from "../narrator-read-transactions";
 import { narratorService } from "../narrator-service";
 import * as subagentFileChanges from "../subagent-file-changes";
 
@@ -165,6 +171,134 @@ function forgedForeignTool() {
 	});
 	return { own, foreign, parent, secret };
 }
+
+describe("file-backed activity hydration batching", () => {
+	test("deduplicates owners and preserves malformed, large and typed input projection", async () => {
+		const owner = narrator();
+		const malformed = tool(owner.id, "malformed-summary");
+		const oversized = tool(owner.id, "oversized-summary", {
+			inputJson: { file_path: "hidden", content: "x".repeat(262_144) },
+		});
+		const typed = tool(owner.id, "typed-summary", {
+			inputJson: { file_path: "界".repeat(1000), id: 42, type: true, command: { nested: "value" } },
+		});
+		sqlite.run("UPDATE narrator_tool_calls SET input_json = ? WHERE id = ?", [
+			"{broken",
+			malformed.id,
+		]);
+		const rows = await readTransactionTask(
+			db,
+			{
+				kind: "narrator-read-transaction-v1",
+				operation: "latestSubagentToolCalls",
+				narratorId: owner.id,
+				ids: [owner.id, owner.id],
+			},
+			() => db.transaction((tx) => loadLatestSubagentToolCallsTx(tx, [owner.id, owner.id])),
+		);
+		expect(rows).toHaveLength(1);
+		expect(rows[0].rows.map((row) => row.toolCallId)).toEqual(
+			[malformed.id, oversized.id, typed.id].sort(),
+		);
+		const summaries = new Map(rows[0].rows.map((row) => [row.toolCallId, row.inputSummary]));
+		expect(summaries.get(malformed.id)).toBeNull();
+		expect(summaries.get(oversized.id)).toBeNull();
+		expect(JSON.parse(summaries.get(typed.id) as string)).toMatchObject({
+			file_path: "界".repeat(200),
+			id: "42",
+			type: "1",
+			command: '{"nested":"value"}',
+		});
+	});
+	test("empty inline hydration sends no refs RPC and all owners share one Top-K task", async () => {
+		expect(sqlite.filename).not.toBe(":memory:");
+		expect(sqlite.filename.startsWith(testEnvironment.narraforkHome)).toBe(true);
+		const own = narrator();
+		const expected = new Map<string, string[]>();
+		for (let ownerIndex = 0; ownerIndex < 3; ownerIndex++) {
+			const parent = tool(own.id, `batch-parent-${ownerIndex}`, { toolName: "Agent" });
+			db.update(narratorMessageRefs)
+				.set({ seq: ownerIndex + 1 })
+				.where(eq(narratorMessageRefs.messageId, parent.messageId))
+				.run();
+			const owner = child(own, parent);
+			const visible = [];
+			for (let index = 0; index < 5; index++) {
+				const row = tool(owner.id, `batch-child-${ownerIndex}-${index}`, {
+					parentToolUseId: parent.toolUseId,
+					inputJson: { file_path: "界".repeat(1000), content: "PRIVATE_BODY".repeat(1000) },
+				});
+				visible.push(row.id);
+			}
+			const hidden = tool(owner.id, `unreferenced-${ownerIndex}`);
+			removeRef(hidden.messageId, owner.id);
+			const checkpoint = tool(owner.id, `checkpoint-${ownerIndex}`);
+			db.update(narratorToolCalls)
+				.set({ isFileHistoryCheckpoint: true })
+				.where(eq(narratorToolCalls.id, checkpoint.id))
+				.run();
+			expected.set(owner.id, visible.sort().slice(-3));
+		}
+		const run = readWorkerPool.runReadTask;
+		const tasks: Parameters<typeof run>[1][] = [];
+		spyOn(readWorkerPool, "runReadTask").mockImplementation((...args) => {
+			tasks.push(args[1]);
+			return run(...args);
+		});
+		const page = await narratorService.getPretextDocumentPage(own.id, { limit: 20 });
+		const activityTasks = tasks.filter(
+			(task) =>
+				task.kind === "narrator-read-transaction-v1" &&
+				task.operation === "latestSubagentToolCalls",
+		);
+		expect(activityTasks).toHaveLength(1);
+		expect(activityTasks[0]).toMatchObject({ ids: [...expected.keys()] });
+		const refsTasks = tasks.filter(
+			(task) => task.kind === "narrator-read-transaction-v1" && task.operation === "aggregateRefs",
+		);
+		expect(refsTasks).toHaveLength(2);
+		for (const task of refsTasks)
+			expect(task).toMatchObject({ ids: expect.arrayContaining([expect.any(String)]) });
+		const serialized = JSON.stringify(page);
+		expect(serialized).not.toContain("PRIVATE_BODY");
+		// Traverse the actual public page without coupling to its block layout.
+		const activities: {
+			subagentNarratorId: string;
+			latestToolCalls: { toolCallId: string; inputSummary?: { file_path?: string } }[];
+		}[] = [];
+		function visit(value: unknown) {
+			if (!value || typeof value !== "object") return;
+			if ("subagentNarratorId" in value && "latestToolCalls" in value)
+				activities.push(value as (typeof activities)[number]);
+			for (const nested of Object.values(value)) visit(nested);
+		}
+		visit(page);
+		expect(activities).toHaveLength(3);
+		for (const activity of activities) {
+			expect(activity.latestToolCalls.map((row) => row.toolCallId)).toEqual(
+				expected.get(activity.subagentNarratorId) ?? [],
+			);
+			for (const row of activity.latestToolCalls)
+				expect(row.inputSummary?.file_path?.length).toBeLessThanOrEqual(200);
+		}
+	});
+
+	test("removing the caller ref during summary still revokes the batched response", async () => {
+		const own = narrator();
+		const parent = tool(own.id, "batch-revoked-parent", { toolName: "Agent" });
+		const owner = child(own, parent);
+		tool(owner.id, "batch-revoked-child", { parentToolUseId: parent.toolUseId });
+		const original = subagentFileChanges.getFileChangesBySubagent;
+		spyOn(subagentFileChanges, "getFileChangesBySubagent").mockImplementation(async (...args) => {
+			const result = await original(...args);
+			removeRef(parent.messageId, own.id);
+			return result;
+		});
+		await expect(
+			narratorService.getPretextDocumentPage(own.id, { limit: 20 }),
+		).rejects.toMatchObject({ code: "HISTORY_AGGREGATE_UNAVAILABLE" });
+	});
+});
 
 describe("outbound history aggregation respects narrator boundaries", () => {
 	for (const surface of ["page", "catch-up", "anchor"] as const) {
@@ -809,6 +943,17 @@ describe("tool detail unique selection and bounded payload reads", () => {
 		const detail = await narratorService.getToolCallDetail(own.id, allowed.toolUseId);
 		expect(detail.id).toBe(allowed.id);
 		expect(detail.inputJson).toEqual({ complete: "y".repeat(128 * 1024) });
+		expect(trace.payloadReads()).toHaveLength(0);
+		// Execute the registered worker body with this observable fixture connection:
+		// the end-to-end worker result stays identical and exactly one payload is loaded.
+		expect(
+			runNarratorReadTransaction(sqlite, {
+				kind: "narrator-read-transaction-v1",
+				operation: "toolDetail",
+				narratorId: own.id,
+				toolUseId: allowed.toolUseId,
+			}),
+		).toEqual(detail);
 		expect(trace.payloadReads()).toHaveLength(1);
 		expect(trace.payloadReads()[0]).toMatch(/where .*"id" = \?/);
 		expect(
@@ -830,13 +975,20 @@ describe("tool detail unique selection and bounded payload reads", () => {
 			narratorService.getToolCallDetail(own.id, allowed.toolUseId),
 		).rejects.toMatchObject({ code: "TOOL_CALL_DETAIL_SELECTION_REQUIRED" });
 		expect(trace.payloadReads()).toHaveLength(0);
+		const detail = await narratorService.getToolCallDetail(own.id, allowed.toolUseId, {
+			toolCallId: allowed.id,
+		});
+		expect(detail.id).toBe(allowed.id);
+		expect(trace.payloadReads()).toHaveLength(0);
 		expect(
-			(
-				await narratorService.getToolCallDetail(own.id, allowed.toolUseId, {
-					toolCallId: allowed.id,
-				})
-			).id,
-		).toBe(allowed.id);
+			runNarratorReadTransaction(sqlite, {
+				kind: "narrator-read-transaction-v1",
+				operation: "toolDetail",
+				narratorId: own.id,
+				toolUseId: allowed.toolUseId,
+				reference: { toolCallId: allowed.id },
+			}),
+		).toEqual(detail);
 		expect(trace.payloadReads()).toHaveLength(1);
 	});
 

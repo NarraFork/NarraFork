@@ -9,6 +9,7 @@ import {
 	narratorWhitelistDirs,
 	permissionRuleRequests,
 } from "@server/db/schema";
+import { readQuery, readQueryFirst } from "@server/db/worker-read";
 import type { ToolCallBinding } from "@server/lib/agent/types";
 import { AppError, ValidationError } from "@server/lib/errors";
 import { generateId } from "@server/lib/id";
@@ -139,8 +140,15 @@ const contextColumns = {
 	traits: narrators.traits,
 	oauthPolicySnapshotJson: narrators.oauthPolicySnapshotJson,
 };
-function loadIdentity(narratorId: string) {
-	const row = db.select(contextColumns).from(narrators).where(eq(narrators.id, narratorId)).get();
+function identityQuery(narratorId: string, store: Pick<typeof db, "select"> = db) {
+	return store.select(contextColumns).from(narrators).where(eq(narrators.id, narratorId));
+}
+function loadIdentity(narratorId: string, store: Pick<typeof db, "select">) {
+	return validateIdentity(identityQuery(narratorId, store).get());
+}
+function validateIdentity(
+	row: Pick<typeof narrators.$inferSelect, keyof typeof contextColumns> | undefined,
+) {
 	if (!row) throw new ValidationError("Narrator no longer exists");
 	if (row.oauthPolicySnapshotJson) {
 		throw new ValidationError(
@@ -160,7 +168,7 @@ async function liveRevision(
 	identity: PermissionRuleRequestIdentity,
 	context: ExecutionTargetContext,
 ) {
-	const narrator = loadIdentity(identity.narratorId);
+	const narrator = validateIdentity(await readQueryFirst(identityQuery(identity.narratorId)));
 	await assertMutablePolicyCeiling(identity);
 	const current = await createExecutionTargetContext({
 		backend: context.backend,
@@ -177,11 +185,11 @@ async function liveRevision(
 		}),
 	};
 }
-function assertBinding(
+function bindingQuery(
 	identity: PermissionRuleRequestIdentity,
 	store: Pick<typeof db, "select"> = db,
 ) {
-	const row = store
+	return store
 		.select({
 			id: narratorToolCalls.id,
 			attempt: narratorToolCalls.executionAttempt,
@@ -198,8 +206,18 @@ function assertBinding(
 				eq(narratorToolCalls.narratorId, identity.narratorId),
 				eq(narratorToolCalls.toolUseId, identity.toolUseId),
 			),
-		)
-		.get();
+		);
+}
+function assertBinding(identity: PermissionRuleRequestIdentity, store: Pick<typeof db, "select">) {
+	return validateBinding(identity, bindingQuery(identity, store).get());
+}
+async function assertBindingRead(identity: PermissionRuleRequestIdentity) {
+	return validateBinding(identity, await readQueryFirst(bindingQuery(identity)));
+}
+function validateBinding(
+	identity: PermissionRuleRequestIdentity,
+	row: ReturnType<ReturnType<typeof bindingQuery>["get"]>,
+) {
 	if (
 		!row ||
 		row.attempt !== identity.binding.attempt ||
@@ -215,7 +233,7 @@ export async function preparePermissionRuleRequest(
 	raw: unknown,
 	context: ExecutionTargetContext,
 ): Promise<PreparedPermissionRuleRequest> {
-	assertBinding(identity);
+	await assertBindingRead(identity);
 	const input = requestPermissionRuleSchema.parse(raw);
 	if (input.device && input.device !== context.target.deviceId)
 		throw new ValidationError("Device differs from frozen execution target");
@@ -270,11 +288,9 @@ export async function preparePermissionRuleRequest(
 		})
 		.onConflictDoNothing()
 		.run();
-	const stored = db
-		.select()
-		.from(permissionRuleRequests)
-		.where(eq(permissionRuleRequests.id, requestId))
-		.get();
+	const stored = await readQueryFirst(
+		db.select().from(permissionRuleRequests).where(eq(permissionRuleRequests.id, requestId)),
+	);
 	if (
 		!stored ||
 		stored.proposalHash !== proposalHash ||
@@ -454,7 +470,7 @@ export function terminatePermissionRuleRequest(terminal: PermissionRuleRequestTe
 }
 
 /** Bounded primary-key pages; the caller yields between pages during startup/expiry maintenance. */
-export function recoverPermissionRuleRequests(options: {
+export async function recoverPermissionRuleRequests(options: {
 	after?: string;
 	limit?: number;
 	reason: string;
@@ -463,20 +479,21 @@ export function recoverPermissionRuleRequests(options: {
 	const limit = Number.isFinite(options.limit)
 		? Math.max(1, Math.min(100, Math.trunc(options.limit as number)))
 		: 100;
-	const rows = db
-		.select({
-			id: permissionRuleRequests.id,
-			narratorId: permissionRuleRequests.narratorId,
-			toolCallId: permissionRuleRequests.toolCallId,
-			attempt: permissionRuleRequests.attempt,
-			status: permissionRuleRequests.status,
-			createdAt: permissionRuleRequests.createdAt,
-		})
-		.from(permissionRuleRequests)
-		.where(options.after ? gt(permissionRuleRequests.id, options.after) : undefined)
-		.orderBy(permissionRuleRequests.id)
-		.limit(limit)
-		.all();
+	const rows = await readQuery(
+		db
+			.select({
+				id: permissionRuleRequests.id,
+				narratorId: permissionRuleRequests.narratorId,
+				toolCallId: permissionRuleRequests.toolCallId,
+				attempt: permissionRuleRequests.attempt,
+				status: permissionRuleRequests.status,
+				createdAt: permissionRuleRequests.createdAt,
+			})
+			.from(permissionRuleRequests)
+			.where(options.after ? gt(permissionRuleRequests.id, options.after) : undefined)
+			.orderBy(permissionRuleRequests.id)
+			.limit(limit),
+	);
 	let terminated = 0;
 	for (const row of rows) {
 		if (
@@ -586,14 +603,15 @@ export async function validatePermissionRuleRequestApproval(
 	raw: unknown,
 	context: ExecutionTargetContext,
 ) {
-	const call = assertBinding(identity);
-	const row = db
-		.select()
-		.from(permissionRuleRequests)
-		.where(
-			eq(permissionRuleRequests.id, `${identity.binding.toolCallId}:${identity.binding.attempt}`),
-		)
-		.get();
+	const call = await assertBindingRead(identity);
+	const row = await readQueryFirst(
+		db
+			.select()
+			.from(permissionRuleRequests)
+			.where(
+				eq(permissionRuleRequests.id, `${identity.binding.toolCallId}:${identity.binding.attempt}`),
+			),
+	);
 	if (
 		!row ||
 		row.status !== "approved" ||
@@ -643,13 +661,11 @@ async function consumeBoundPermissionRuleRequest(
 	raw: unknown,
 	context: ExecutionTargetContext,
 ) {
-	assertBinding(identity);
+	await assertBindingRead(identity);
 	const requestId = `${identity.binding.toolCallId}:${identity.binding.attempt}`;
-	const row = db
-		.select()
-		.from(permissionRuleRequests)
-		.where(eq(permissionRuleRequests.id, requestId))
-		.get();
+	const row = await readQueryFirst(
+		db.select().from(permissionRuleRequests).where(eq(permissionRuleRequests.id, requestId)),
+	);
 	if (!row || row.narratorId !== identity.narratorId || row.toolUseId !== identity.toolUseId)
 		throw new PermissionRuleRequestError("Missing bound approval receipt");
 	const proposal = row.proposalJson as unknown as {
@@ -739,7 +755,7 @@ async function consumeBoundPermissionRuleRequest(
 		if (latest?.status !== "approved")
 			throw new PermissionRuleRequestError("Approval receipt already consumed");
 		const commitRevision = hash({
-			narrator: loadIdentity(identity.narratorId),
+			narrator: loadIdentity(identity.narratorId, tx),
 			target: executionTargetContextKey(context),
 			policy: executionPolicyRevision(executionPolicyRepository.loadNow(identity.narratorId, tx)),
 			settingsRevision: getSettingsRevision(),
@@ -829,7 +845,7 @@ export const permissionRuleRequestListQuerySchema = z.object({
 	cursor: z.string().max(200).optional(),
 	limit: z.coerce.number().int().min(1).max(100).default(50),
 });
-export function listPermissionRuleRequests(narratorId: string, query: unknown = {}) {
+export async function listPermissionRuleRequests(narratorId: string, query: unknown = {}) {
 	const { cursor, limit } = permissionRuleRequestListQuerySchema.parse(query);
 	const after = cursor
 		? z
@@ -837,38 +853,39 @@ export function listPermissionRuleRequests(narratorId: string, query: unknown = 
 				.strict()
 				.parse(JSON.parse(cursor))
 		: undefined;
-	const rows = db
-		.select({
-			id: permissionRuleRequests.id,
-			status: permissionRuleRequests.status,
-			reason: permissionRuleRequests.reason,
-			proposalHash: permissionRuleRequests.proposalHash,
-			deviceId: permissionRuleRequests.deviceId,
-			scope: permissionRuleRequests.scope,
-			ruleId: permissionRuleRequests.ruleId,
-			approvalSource: permissionRuleRequests.approvalSource,
-			approvalUserId: permissionRuleRequests.approvalUserId,
-			error: permissionRuleRequests.error,
-			createdAt: permissionRuleRequests.createdAt,
-		})
-		.from(permissionRuleRequests)
-		.where(
-			and(
-				eq(permissionRuleRequests.narratorId, narratorId),
-				after
-					? or(
-							lt(permissionRuleRequests.createdAt, after.createdAt),
-							and(
-								eq(permissionRuleRequests.createdAt, after.createdAt),
-								lt(permissionRuleRequests.id, after.id),
-							),
-						)
-					: undefined,
-			),
-		)
-		.orderBy(desc(permissionRuleRequests.createdAt), desc(permissionRuleRequests.id))
-		.limit(limit + 1)
-		.all();
+	const rows = await readQuery(
+		db
+			.select({
+				id: permissionRuleRequests.id,
+				status: permissionRuleRequests.status,
+				reason: permissionRuleRequests.reason,
+				proposalHash: permissionRuleRequests.proposalHash,
+				deviceId: permissionRuleRequests.deviceId,
+				scope: permissionRuleRequests.scope,
+				ruleId: permissionRuleRequests.ruleId,
+				approvalSource: permissionRuleRequests.approvalSource,
+				approvalUserId: permissionRuleRequests.approvalUserId,
+				error: permissionRuleRequests.error,
+				createdAt: permissionRuleRequests.createdAt,
+			})
+			.from(permissionRuleRequests)
+			.where(
+				and(
+					eq(permissionRuleRequests.narratorId, narratorId),
+					after
+						? or(
+								lt(permissionRuleRequests.createdAt, after.createdAt),
+								and(
+									eq(permissionRuleRequests.createdAt, after.createdAt),
+									lt(permissionRuleRequests.id, after.id),
+								),
+							)
+						: undefined,
+				),
+			)
+			.orderBy(desc(permissionRuleRequests.createdAt), desc(permissionRuleRequests.id))
+			.limit(limit + 1),
+	);
 	return {
 		items: rows.slice(0, limit),
 		nextCursor:

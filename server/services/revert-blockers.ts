@@ -1,3 +1,4 @@
+import { readQuery, readQueryFirst } from "@server/db/worker-read";
 /**
  * Read-only diagnostics for a refused file-revert preview.
  *
@@ -125,7 +126,10 @@ function workspaceRootSqlFilter(narratorCwd: string) {
  * When `code` names a planner/concurrency busy (not workspace activity), prefer
  * that single high-signal blocker over a noisy tool inventory.
  */
-export function collectRevertBlockers(narratorId: string, code?: string): RevertBlocker[] {
+export async function collectRevertBlockers(
+	narratorId: string,
+	code?: string,
+): Promise<RevertBlocker[]> {
 	const blockers: RevertBlocker[] = [];
 
 	if (code === "REVERT_PLANNER_BUSY" || /PLANNER_BUSY/.test(code ?? "")) {
@@ -136,40 +140,41 @@ export function collectRevertBlockers(narratorId: string, code?: string): Revert
 		return blockers;
 	}
 
-	const narratorCwd = db
-		.select({ cwd: narrators.cwd })
-		.from(narrators)
-		.where(eq(narrators.id, narratorId))
-		.get()?.cwd;
+	const narratorCwd = (
+		await readQueryFirst(
+			db.select({ cwd: narrators.cwd }).from(narrators).where(eq(narrators.id, narratorId)),
+		)
+	)?.cwd;
 
 	// Include other narrators sharing this workspace: a concurrent writer is
 	// exactly the ACTIVE_WRITER case users cannot see from their own timeline.
-	const runningTools = db
-		.select({
-			id: narratorToolCalls.id,
-			narratorId: narratorToolCalls.narratorId,
-			toolName: narratorToolCalls.toolName,
-			toolUseId: narratorToolCalls.toolUseId,
-			messageId: narratorToolCalls.messageId,
-			isBackground: narratorToolCalls.isBackground,
-			status: narratorToolCalls.status,
-			inputJson: narratorToolCalls.inputJson,
-		})
-		.from(narratorToolCalls)
-		.where(
-			and(
-				sql`${narratorToolCalls.status} IN ('initializing','pending','running')`,
-				narratorCwd
-					? or(
-							eq(narratorToolCalls.narratorId, narratorId),
-							eq(narratorToolCalls.executionCwd, narratorCwd),
-						)
-					: eq(narratorToolCalls.narratorId, narratorId),
-			),
-		)
-		.orderBy(asc(narratorToolCalls.createdAt), asc(narratorToolCalls.id))
-		.limit(LIMITS.runningTools)
-		.all();
+	const runningTools = await readQuery(
+		db
+			.select({
+				id: narratorToolCalls.id,
+				narratorId: narratorToolCalls.narratorId,
+				toolName: narratorToolCalls.toolName,
+				toolUseId: narratorToolCalls.toolUseId,
+				messageId: narratorToolCalls.messageId,
+				isBackground: narratorToolCalls.isBackground,
+				status: narratorToolCalls.status,
+				inputJson: narratorToolCalls.inputJson,
+			})
+			.from(narratorToolCalls)
+			.where(
+				and(
+					sql`${narratorToolCalls.status} IN ('initializing','pending','running')`,
+					narratorCwd
+						? or(
+								eq(narratorToolCalls.narratorId, narratorId),
+								eq(narratorToolCalls.executionCwd, narratorCwd),
+							)
+						: eq(narratorToolCalls.narratorId, narratorId),
+				),
+			)
+			.orderBy(asc(narratorToolCalls.createdAt), asc(narratorToolCalls.id))
+			.limit(LIMITS.runningTools),
+	);
 
 	for (const tool of runningTools) {
 		const foreign = tool.narratorId !== narratorId;
@@ -189,30 +194,31 @@ export function collectRevertBlockers(narratorId: string, code?: string): Revert
 		});
 	}
 
-	const unfinishedOps = db
-		.select({
-			id: fileChangeOperations.id,
-			toolCallId: fileChangeOperations.toolCallId,
-			toolUseId: fileChangeOperations.toolUseId,
-			settlement: fileChangeOperations.settlement,
-			executionOutcome: fileChangeOperations.executionOutcome,
-			reason: fileChangeOperations.reason,
-			sourceKind: fileChangeOperations.sourceKind,
-		})
-		.from(fileChangeOperations)
-		.where(
-			and(
-				eq(fileChangeOperations.narratorId, narratorId),
-				or(
-					ne(fileChangeOperations.settlement, "settled"),
-					sql`${fileChangeOperations.finishedAt} IS NULL`,
-					eq(fileChangeOperations.executionOutcome, "running"),
+	const unfinishedOps = await readQuery(
+		db
+			.select({
+				id: fileChangeOperations.id,
+				toolCallId: fileChangeOperations.toolCallId,
+				toolUseId: fileChangeOperations.toolUseId,
+				settlement: fileChangeOperations.settlement,
+				executionOutcome: fileChangeOperations.executionOutcome,
+				reason: fileChangeOperations.reason,
+				sourceKind: fileChangeOperations.sourceKind,
+			})
+			.from(fileChangeOperations)
+			.where(
+				and(
+					eq(fileChangeOperations.narratorId, narratorId),
+					or(
+						ne(fileChangeOperations.settlement, "settled"),
+						sql`${fileChangeOperations.finishedAt} IS NULL`,
+						eq(fileChangeOperations.executionOutcome, "running"),
+					),
 				),
-			),
-		)
-		.orderBy(asc(fileChangeOperations.updatedAt), asc(fileChangeOperations.id))
-		.limit(LIMITS.pendingOperations)
-		.all();
+			)
+			.orderBy(asc(fileChangeOperations.updatedAt), asc(fileChangeOperations.id))
+			.limit(LIMITS.pendingOperations),
+	);
 
 	for (const op of unfinishedOps) {
 		blockers.push({
@@ -228,34 +234,36 @@ export function collectRevertBlockers(narratorId: string, code?: string): Revert
 	// Prefer under-reporting over listing foreign workspaces: without a known cwd
 	// (or without a related scope root) there is no safe way to attribute a lease.
 	const leases = narratorCwd
-		? db
-				.select({
-					leaseId: workspaceWriteLeases.leaseId,
-					status: workspaceWriteLeases.status,
-					executionEndedAt: workspaceWriteLeases.executionEndedAt,
-					scopeId: workspaceWriteLeases.scopeId,
-					canonicalRoot: fileChangeScopes.canonicalRoot,
-					displayRoot: fileChangeScopes.displayRoot,
-					pathFlavor: fileChangeScopes.pathFlavor,
-				})
-				.from(workspaceWriteLeases)
-				.innerJoin(fileChangeScopes, eq(workspaceWriteLeases.scopeId, fileChangeScopes.id))
-				.where(
-					and(
-						or(
-							sql`${workspaceWriteLeases.status} IN ('executing','quarantined')`,
+		? (
+				await readQuery(
+					db
+						.select({
+							leaseId: workspaceWriteLeases.leaseId,
+							status: workspaceWriteLeases.status,
+							executionEndedAt: workspaceWriteLeases.executionEndedAt,
+							scopeId: workspaceWriteLeases.scopeId,
+							canonicalRoot: fileChangeScopes.canonicalRoot,
+							displayRoot: fileChangeScopes.displayRoot,
+							pathFlavor: fileChangeScopes.pathFlavor,
+						})
+						.from(workspaceWriteLeases)
+						.innerJoin(fileChangeScopes, eq(workspaceWriteLeases.scopeId, fileChangeScopes.id))
+						.where(
 							and(
-								sql`${workspaceWriteLeases.status} IN ('settled','recovered')`,
-								sql`${workspaceWriteLeases.executionEndedAt} IS NULL`,
+								or(
+									sql`${workspaceWriteLeases.status} IN ('executing','quarantined')`,
+									and(
+										sql`${workspaceWriteLeases.status} IN ('settled','recovered')`,
+										sql`${workspaceWriteLeases.executionEndedAt} IS NULL`,
+									),
+								),
+								workspaceRootSqlFilter(narratorCwd),
 							),
-						),
-						workspaceRootSqlFilter(narratorCwd),
-					),
+						)
+						.orderBy(asc(workspaceWriteLeases.updatedAt), asc(workspaceWriteLeases.leaseId))
+						.limit(LIMITS.writeLeases),
 				)
-				.orderBy(asc(workspaceWriteLeases.updatedAt), asc(workspaceWriteLeases.leaseId))
-				.limit(LIMITS.writeLeases)
-				.all()
-				.filter((lease) => isWorkspaceRelatedScope(narratorCwd, lease))
+			).filter((lease) => isWorkspaceRelatedScope(narratorCwd, lease))
 		: [];
 
 	for (const lease of leases) {
@@ -275,31 +283,33 @@ export function collectRevertBlockers(narratorId: string, code?: string): Revert
 	}
 
 	const busyScopes = narratorCwd
-		? db
-				.select({
-					id: fileChangeScopes.id,
-					status: fileChangeScopes.status,
-					activeLeaseId: fileChangeScopes.activeLeaseId,
-					activeMutationCount: fileChangeScopes.activeMutationCount,
-					canonicalRoot: fileChangeScopes.canonicalRoot,
-					displayRoot: fileChangeScopes.displayRoot,
-					pathFlavor: fileChangeScopes.pathFlavor,
-				})
-				.from(fileChangeScopes)
-				.where(
-					and(
-						or(
-							ne(fileChangeScopes.status, "active"),
-							isNotNull(fileChangeScopes.activeLeaseId),
-							sql`${fileChangeScopes.activeMutationCount} > 0`,
-						),
-						workspaceRootSqlFilter(narratorCwd),
-					),
+		? (
+				await readQuery(
+					db
+						.select({
+							id: fileChangeScopes.id,
+							status: fileChangeScopes.status,
+							activeLeaseId: fileChangeScopes.activeLeaseId,
+							activeMutationCount: fileChangeScopes.activeMutationCount,
+							canonicalRoot: fileChangeScopes.canonicalRoot,
+							displayRoot: fileChangeScopes.displayRoot,
+							pathFlavor: fileChangeScopes.pathFlavor,
+						})
+						.from(fileChangeScopes)
+						.where(
+							and(
+								or(
+									ne(fileChangeScopes.status, "active"),
+									isNotNull(fileChangeScopes.activeLeaseId),
+									sql`${fileChangeScopes.activeMutationCount} > 0`,
+								),
+								workspaceRootSqlFilter(narratorCwd),
+							),
+						)
+						.orderBy(asc(fileChangeScopes.updatedAt), asc(fileChangeScopes.id))
+						.limit(LIMITS.busyScopes),
 				)
-				.orderBy(asc(fileChangeScopes.updatedAt), asc(fileChangeScopes.id))
-				.limit(LIMITS.busyScopes)
-				.all()
-				.filter((scope) => isWorkspaceRelatedScope(narratorCwd, scope))
+			).filter((scope) => isWorkspaceRelatedScope(narratorCwd, scope))
 		: [];
 
 	for (const scope of busyScopes) {

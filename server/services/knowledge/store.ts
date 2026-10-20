@@ -121,8 +121,8 @@ export function setKnowledgeReadStore(store: KnowledgeReadStore | undefined): vo
 	knowledgeReadStore = store ?? initialKnowledgeReadStore;
 }
 
-/** The runtime injection callers still require synchronous results. Never route
- * those calls to SQLite after composition has selected a networked read store. */
+/** Legacy SQLite-specific accessor; its methods now return worker-backed promises.
+ * Never route these calls to SQLite after composition selected a networked read store. */
 export function synchronousKnowledgeInjectionReads(): typeof sqliteKnowledgeInjectionReads {
 	if (knowledgeReadStore !== sqliteKnowledgeReadStore) {
 		throw new Error(

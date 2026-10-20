@@ -146,7 +146,7 @@ async function waitForIdle(narratorId: string, expectedCalls = 1): Promise<void>
 			providerCalls.length === expectedCalls &&
 			row?.status === "idle" &&
 			!getExecutionOwner(narratorId) &&
-			!hasPendingBufferedWork(narratorId)
+			!(await hasPendingBufferedWork(narratorId))
 		)
 			return;
 		await Bun.sleep(10);
@@ -1097,10 +1097,10 @@ test.each([
 	}
 });
 
-test("gates the synchronous pending-work probe on PostgreSQL", () => {
+test("gates the SQLite pending-work probe on PostgreSQL", async () => {
 	bindRuntimeQueue({ backend: "postgres", queue: {} as RuntimeQueuePort });
 	try {
-		expect(() => hasPendingBufferedWork("mailbox-send-pg-gate")).toThrow(
+		await expect(hasPendingBufferedWork("mailbox-send-pg-gate")).rejects.toThrow(
 			"cannot inspect the PostgreSQL mailbox",
 		);
 	} finally {
@@ -1155,7 +1155,7 @@ test.each([
 		} else {
 			expect(await updateBufferedMessageMode(narratorId, accepted.id, "turn")).toBe(true);
 		}
-		clearBufferedMessageSoftStopIfIdle(narratorId, false);
+		await clearBufferedMessageSoftStopIfIdle(narratorId, false);
 		expect(providerCalls).toEqual([]);
 		releasePreflight.resolve();
 		await waitForIdle(narratorId, operation === "remove" ? 2 : 3);

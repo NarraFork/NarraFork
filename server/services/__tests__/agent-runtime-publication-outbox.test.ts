@@ -104,7 +104,7 @@ describe("transactional publication outbox", () => {
 			}),
 		).toThrow("event identity");
 	});
-	test("releaseUnusedRunSlots removes only matching reserved slots and participates in caller transaction", () => {
+	test("releaseUnusedRunSlots removes only matching reserved slots and participates in caller transaction", async () => {
 		reserve("release");
 		reserve("other");
 		publisher.commitIntent(intent("release", "started"));
@@ -122,7 +122,7 @@ describe("transactional publication outbox", () => {
 				.filter((row) => row.logicalRunId === "release"),
 		).toHaveLength(2);
 		expect(publisher.releaseUnusedRunSlots(run("release"))).toBe(1);
-		expect(publisher.listPending()).toHaveLength(1);
+		expect(await publisher.listPending()).toHaveLength(1);
 		expect(publisher.releaseUnusedRunSlots(run("release"))).toBe(0);
 		publisher.failRecipient("recipient", "gone");
 		expect(publisher.releaseUnusedRunSlots(run("release"))).toBe(0);
@@ -162,7 +162,7 @@ describe("transactional publication outbox", () => {
 			mailbox.claimBatch("recipient", { token: "t", epoch: "e" }).map((row) => row.kind),
 		).toEqual(["agent_message", "task_notice"]);
 	});
-	test("result+intent transaction failure leaves neither result nor event", () => {
+	test("result+intent transaction failure leaves neither result nor event", async () => {
 		reserve("atomic");
 		expect(() =>
 			db.transaction((tx) => {
@@ -177,7 +177,7 @@ describe("transactional publication outbox", () => {
 		expect(
 			db.select({ title: narrators.title, seq: narrators.inboxSequence }).from(narrators).get(),
 		).toEqual({ title: null, seq: 0 });
-		expect(publisher.listPending()).toHaveLength(0);
+		expect(await publisher.listPending()).toHaveLength(0);
 		db.transaction((tx) => {
 			tx.update(narrators)
 				.set({ title: "durable-result" })
@@ -185,9 +185,9 @@ describe("transactional publication outbox", () => {
 				.run();
 			publisher.commitIntent(intent("atomic"), tx);
 		});
-		expect(publisher.listPending()).toHaveLength(1);
+		expect(await publisher.listPending()).toHaveLength(1);
 	});
-	test("101st completion commits terminal result with a full inbox, then recovers without task rerun", () => {
+	test("101st completion commits terminal result with a full inbox, then recovers without task rerun", async () => {
 		fill();
 		reserve("blocked");
 		let taskExecutions = 1;
@@ -203,21 +203,21 @@ describe("transactional publication outbox", () => {
 			"terminal result",
 		);
 		const restarted = createPublicationOutbox(db);
-		expect(restarted.listPending()).toHaveLength(1);
-		mailbox.cancel(mailbox.list("recipient")[0]?.deliveryId as string, "free capacity");
+		expect(await restarted.listPending()).toHaveLength(1);
+		mailbox.cancel((await mailbox.list("recipient"))[0]?.deliveryId as string, "free capacity");
 		expect(restarted.transferNext("recipient", "agent").status).toBe("transferred");
 		expect(restarted.commitIntent(intent("blocked")).status).toBe("duplicate");
-		expect(restarted.listPending()).toHaveLength(0);
+		expect(await restarted.listPending()).toHaveLength(0);
 		expect(taskExecutions).toBe(1);
 		taskExecutions = 0;
 	});
-	test("earliest kind gets atomic capacity even when late publisher calls the fast path first", () => {
+	test("earliest kind gets atomic capacity even when late publisher calls the fast path first", async () => {
 		fill();
 		reserve("early");
 		reserve("late");
 		const early = publisher.commitIntent(intent("early"));
 		const late = publisher.commitIntent(intent("late"));
-		mailbox.cancel(mailbox.list("recipient")[0]?.deliveryId as string, "free one slot");
+		mailbox.cancel((await mailbox.list("recipient"))[0]?.deliveryId as string, "free one slot");
 		// A late notification cannot bypass the outbox through ordinary mailbox enqueue.
 		expect(
 			mailbox.enqueue({
@@ -232,7 +232,7 @@ describe("transactional publication outbox", () => {
 		const transferred = publisher.transferNext("recipient", "agent");
 		expect(transferred).toMatchObject({ status: "transferred", deliveryId: early.deliveryId });
 		expect(publisher.transferNext("recipient", "agent").status).toBe("full");
-		expect(mailbox.getByDelivery(late.deliveryId as string)).toBeUndefined();
+		expect(await mailbox.getByDelivery(late.deliveryId as string)).toBeUndefined();
 		expect(mailbox.claimBatch("recipient", { token: "t", epoch: "e" }).length).toBeGreaterThan(0);
 	});
 	test("pending early event blocks later ordinary input but does not block older in-box events", () => {
@@ -277,13 +277,13 @@ describe("transactional publication outbox", () => {
 		reserve(nextRun);
 		expect(publisher.commitIntent(intent(nextRun)).status).toBe("committed");
 	});
-	test("cancelled transferred delivery remains duplicate after lost confirmation", () => {
+	test("cancelled transferred delivery remains duplicate after lost confirmation", async () => {
 		reserve("receipt");
 		const result = publisher.commitIntent(intent("receipt"));
 		publisher.transferNext("recipient", "agent");
 		mailbox.cancel(result.deliveryId as string, "recipient discarded");
 		expect(publisher.commitIntent(intent("receipt")).status).toBe("duplicate");
-		expect(mailbox.getByDelivery(result.deliveryId as string)?.state).toBe("cancelled");
+		expect((await mailbox.getByDelivery(result.deliveryId as string))?.state).toBe("cancelled");
 		expect(db.select().from(narratorBufferedMessages).all()).toHaveLength(1);
 	});
 	test("recipient slot cap rejects new starts but reserved terminal still commits", () => {
@@ -294,7 +294,7 @@ describe("transactional publication outbox", () => {
 		expect(publisher.transferNext("recipient", "agent").status).toBe("transferred");
 		expect(publisher.reserveRunSlots(run("overflow")).status).toBe("reserved");
 	});
-	test("lost transfer acknowledgement and same-run reservation recovery cannot allocate new slots", () => {
+	test("lost transfer acknowledgement and same-run reservation recovery cannot allocate new slots", async () => {
 		reserve("delivered");
 		const committed = publisher.commitIntent(intent("delivered"));
 		expect(() =>
@@ -303,21 +303,21 @@ describe("transactional publication outbox", () => {
 				throw new Error("commit lost");
 			}),
 		).toThrow("commit lost");
-		expect(mailbox.getByDelivery(committed.deliveryId as string)).toBeUndefined();
-		expect(publisher.listPending()).toHaveLength(1);
+		expect(await mailbox.getByDelivery(committed.deliveryId as string)).toBeUndefined();
+		expect(await publisher.listPending()).toHaveLength(1);
 		publisher.transferNext("recipient", "agent");
 		const before = db.select().from(runtimePublicationOutbox).all().length;
 		reserve("delivered");
 		expect(db.select().from(runtimePublicationOutbox).all()).toHaveLength(before);
 	});
-	test("recipient deleted before terminal commit still records a permanent failed intent", () => {
+	test("recipient deleted before terminal commit still records a permanent failed intent", async () => {
 		reserve("deleted");
 		db.delete(narrators).where(eq(narrators.id, "recipient")).run();
 		expect(publisher.commitIntent(intent("deleted"))).toMatchObject({
 			status: "committed",
 			arrivalSeq: null,
 		});
-		expect(publisher.listPending()).toHaveLength(0);
+		expect(await publisher.listPending()).toHaveLength(0);
 		expect(
 			db
 				.select()
@@ -329,7 +329,7 @@ describe("transactional publication outbox", () => {
 	test.each([
 		false,
 		true,
-	])("failRecipient preserves terminal reservation and atomically commits source result (deleted=%s)", (deleted) => {
+	])("failRecipient preserves terminal reservation and atomically commits source result (deleted=%s)", async (deleted) => {
 		db.insert(narrators).values({ id: "source", createdAt: time, updatedAt: time }).run();
 		reserve("running");
 		publisher.commitIntent(intent("running", "started"));
@@ -370,7 +370,7 @@ describe("transactional publication outbox", () => {
 			lastError: "recipient permanently unavailable",
 		});
 		expect(publisher.commitIntent(intent("running")).status).toBe("duplicate");
-		expect(publisher.listPending()).toHaveLength(0);
+		expect(await publisher.listPending()).toHaveLength(0);
 	});
 	test("failRecipient marks reserved pages without repeatedly selecting the first page", () => {
 		for (let i = 0; i < L.pageSize + 1; i++) publisher.reserveRunSlots(run(`page-${i}`));
@@ -406,16 +406,16 @@ describe("transactional publication outbox", () => {
 			.all() as Array<{ detail: string }>;
 		expect(plan.some((row) => row.detail.includes("idx_nbm_quota"))).toBe(true);
 	});
-	test("outbox remains pointers only, bounded pages and permanent recipient failures are visible", () => {
+	test("outbox remains pointers only, bounded pages and permanent recipient failures are visible", async () => {
 		reserve("invalid");
 		expect(() =>
 			publisher.commitIntent({ ...intent("invalid"), summary: "x".repeat(L.publicationBytes) }),
 		).toThrow("Metadata");
-		expect(publisher.listPending()).toHaveLength(0);
+		expect(await publisher.listPending()).toHaveLength(0);
 		publisher.commitIntent(intent("invalid"));
 		db.delete(narrators).where(eq(narrators.id, "recipient")).run();
 		expect(publisher.transferNext("recipient", "agent").status).toBe("recipient_failed");
-		expect(publisher.listPending()).toHaveLength(0);
+		expect(await publisher.listPending()).toHaveLength(0);
 		expect(
 			db
 				.select()

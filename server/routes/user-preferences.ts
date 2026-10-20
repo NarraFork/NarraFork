@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 import { DEFAULT_TYPOGRAPHY } from "@shared/pretext-layout/typography";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
@@ -316,9 +317,11 @@ userPreferencesRoutes.get("/", async (c) => {
 		legacyTabs.map((tab) => ({ ...tab })) as Record<string, unknown>[],
 		userId,
 	);
-	const pref = await db.query.userPreferences.findFirst({
-		where: eq(userPreferences.userId, userId),
-	});
+	const pref = await readQuery(
+		db.query.userPreferences.findFirst({
+			where: eq(userPreferences.userId, userId),
+		}),
+	);
 	if (!pref) {
 		return c.json({
 			...DEFAULTS,
@@ -340,9 +343,11 @@ userPreferencesRoutes.patch("/", async (c) => {
 	const body = await c.req.json();
 
 	const updated = await userPreferencesLock.acquire(userId, async () => {
-		const existing = await db.query.userPreferences.findFirst({
-			where: eq(userPreferences.userId, userId),
-		});
+		const existing = await readQuery(
+			db.query.userPreferences.findFirst({
+				where: eq(userPreferences.userId, userId),
+			}),
+		);
 		const mergedBody = isRecord(body) ? { ...body } : body;
 		if (isRecord(mergedBody)) {
 			for (const field of TOP_LEVEL_SECRET_FIELDS) {
@@ -527,9 +532,11 @@ userPreferencesRoutes.patch("/", async (c) => {
 			],
 		);
 
-		return db.query.userPreferences.findFirst({
-			where: eq(userPreferences.userId, userId),
-		});
+		return readQuery(
+			db.query.userPreferences.findFirst({
+				where: eq(userPreferences.userId, userId),
+			}),
+		);
 	});
 	return c.json(updated ? serializeUserPreferences(updated) : updated);
 });
@@ -651,10 +658,12 @@ userPreferencesRoutes.patch("/graph-viewports", async (c) => {
 	const id = generateId();
 
 	await userPreferencesLock.acquire(userId, async () => {
-		const existing = await db.query.userPreferences.findFirst({
-			where: eq(userPreferences.userId, userId),
-			columns: { graphViewports: true },
-		});
+		const existing = await readQuery(
+			db.query.userPreferences.findFirst({
+				where: eq(userPreferences.userId, userId),
+				columns: { graphViewports: true },
+			}),
+		);
 
 		let viewports: Record<string, { x: number; y: number; zoom: number }> = {};
 		try {
@@ -707,10 +716,12 @@ userPreferencesRoutes.patch("/spec-tab-layout", async (c) => {
 	const id = generateId();
 
 	await userPreferencesLock.acquire(userId, async () => {
-		const existing = await db.query.userPreferences.findFirst({
-			where: eq(userPreferences.userId, userId),
-			columns: { specTabLayout: true },
-		});
+		const existing = await readQuery(
+			db.query.userPreferences.findFirst({
+				where: eq(userPreferences.userId, userId),
+				columns: { specTabLayout: true },
+			}),
+		);
 		const layouts = parseJsonObject(existing?.specTabLayout);
 		layouts[narratorId] = { order, pinned };
 		const specTabLayout = JSON.stringify(layouts);

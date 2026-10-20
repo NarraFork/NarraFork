@@ -1,4 +1,4 @@
-import { and, desc, eq, gt, inArray, isNull, ne, or, sql } from "drizzle-orm";
+import { and, desc, eq, gt, inArray, isNull, ne, or } from "drizzle-orm";
 import { db } from "../../db";
 import { resolveDatabaseBackendConfig } from "../../db/postgres-runtime";
 import {
@@ -10,6 +10,7 @@ import {
 	runtimeAwaitedTerminalConsumptions,
 	runtimePublicationOutbox,
 } from "../../db/schema";
+import { readQueryFirst, readTransactionTask } from "../../db/worker-read";
 import { ValidationError } from "../../lib/errors";
 import { hotSafe } from "../../lib/hot-safe";
 import { generateId } from "../../lib/id";
@@ -71,16 +72,13 @@ import {
 	publicationDedupeKey,
 } from "./publication-outbox";
 import {
-	AGENT_RESULT_JSON_MAX_BYTES,
-	AGENT_RESULT_OUTPUT_CHARS,
 	type AgentTerminalResult,
 	type AgentTerminalResultReadOptions,
 	type AwaitedTerminalConsumeOptions,
 	agentSourceResultRef,
-	decodeAgentTerminalSnapshot,
-	decodeRunAssistantProjection,
 	parseRunSourceBoundary,
 } from "./publication-result";
+import { readAgentTerminalResultSnapshot } from "./publication-result-read";
 import {
 	type RuntimeQueuePort,
 	requireRuntimeQueuePort,
@@ -149,6 +147,8 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	let retry = 0;
 	let stopped = false;
+	let flushing = false;
+	let scheduledDuringFlush = false;
 	let cursor: string | undefined;
 
 	function reserve(run: PublicationRun, tx: RuntimeTx, started = false) {
@@ -258,12 +258,41 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 		});
 	}
 
-	function getAgentRun(narratorId: string, recipientId: string, tx?: RuntimeTx): PublicationRun {
-		const row = (tx ?? database)
+	function getAgentRunInTransaction(
+		narratorId: string,
+		recipientId: string,
+		tx: RuntimeTx,
+	): PublicationRun {
+		const row = tx
 			.select({ logicalRunId: narrators.logicalRunId })
 			.from(narrators)
 			.where(eq(narrators.id, narratorId))
 			.get();
+		return resolveAgentRun(row, narratorId, recipientId, tx);
+	}
+
+	function getAgentRun(narratorId: string, recipientId: string, tx: RuntimeTx): PublicationRun;
+	function getAgentRun(narratorId: string, recipientId: string): Promise<PublicationRun>;
+	function getAgentRun(
+		narratorId: string,
+		recipientId: string,
+		tx?: RuntimeTx,
+	): PublicationRun | Promise<PublicationRun> {
+		if (tx) return getAgentRunInTransaction(narratorId, recipientId, tx);
+		return readQueryFirst(
+			database
+				.select({ logicalRunId: narrators.logicalRunId })
+				.from(narrators)
+				.where(eq(narrators.id, narratorId)),
+		).then((row) => resolveAgentRun(row, narratorId, recipientId));
+	}
+
+	function resolveAgentRun(
+		row: { logicalRunId: string | null } | undefined,
+		narratorId: string,
+		recipientId: string,
+		tx?: RuntimeTx,
+	): PublicationRun {
 		if (!row) throw new ValidationError("Agent has no registered publication source");
 		if (!row.logicalRunId)
 			return store.registerLegacyRunningRunSlots(
@@ -389,171 +418,15 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 		return `message-original:${messageId}`;
 	}
 
-	function readAssistantSource(run: PublicationRun, messageId: string): AgentTerminalResult | null {
-		const projection = database
-			.select({
-				plain: sql<
-					string | null
-				>`CASE WHEN ${narratorMessages.originalContentJson} IS NULL THEN substr(${narratorMessages.contentText}, 1, ${AGENT_RESULT_OUTPUT_CHARS + 1}) ELSE NULL END`,
-				json: sql<
-					string | null
-				>`CASE WHEN length(CAST(COALESCE(${narratorMessages.originalContentJson}, ${narratorMessages.contentJson}) AS BLOB)) <= ${AGENT_RESULT_JSON_MAX_BYTES} THEN COALESCE(${narratorMessages.originalContentJson}, ${narratorMessages.contentJson}) ELSE NULL END`,
-			})
-			.from(narratorMessages)
-			.where(
-				and(
-					eq(narratorMessages.id, messageId),
-					eq(narratorMessages.narratorId, run.taskId),
-					eq(narratorMessages.role, "assistant"),
-				),
-			)
-			.limit(1)
-			.get();
-		const result = projection
-			? decodeRunAssistantProjection(projection.plain, projection.json)
-			: null;
-		const sourceResultRef = agentSourceResultRef(`message:${messageId}`);
-		return result ? { ...result, ...(sourceResultRef ? { sourceResultRef } : {}) } : null;
-	}
-	/** Indexed, bounded and read-only: never resolves a run by guessing the actor's latest id. */
 	function readAgentTerminalResult(
 		run: PublicationRun,
 		options: AgentTerminalResultReadOptions = {},
-	): AgentTerminalResult | null {
-		if (run.producerKind !== "agent") return null;
-		const keys = (["completed", "failed", "timed_out", "cancelled"] as const).map((event) =>
-			publicationDedupeKey(run, event),
+	): Promise<AgentTerminalResult | null> {
+		return readTransactionTask(
+			database,
+			{ kind: "publication-terminal-result-v1", run, options },
+			() => database.transaction((tx) => readAgentTerminalResultSnapshot(tx, run, options)),
 		);
-		const intent = database
-			.select({
-				eventKind: runtimePublicationOutbox.eventKind,
-				state: runtimePublicationOutbox.state,
-				resultRef: runtimePublicationOutbox.resultRef,
-			})
-			.from(runtimePublicationOutbox)
-			.where(
-				and(
-					eq(runtimePublicationOutbox.producerKind, "agent"),
-					eq(runtimePublicationOutbox.taskId, run.taskId),
-					eq(runtimePublicationOutbox.logicalRunId, run.logicalRunId),
-					eq(runtimePublicationOutbox.recipientId, run.recipientId),
-					ne(runtimePublicationOutbox.eventKind, "started"),
-				),
-			)
-			.limit(1)
-			.get();
-		const terminalIntent =
-			!!intent && intent.state !== "reserved" && intent.eventKind !== "terminal";
-		const terminalDelivery = database
-			.select({ id: narratorBufferedMessages.id })
-			.from(narratorBufferedMessages)
-			.where(
-				and(
-					eq(narratorBufferedMessages.narratorId, run.recipientId),
-					eq(narratorBufferedMessages.kind, "task_notice"),
-					eq(narratorBufferedMessages.noticeKind, "agent"),
-					inArray(narratorBufferedMessages.dedupeKey, keys),
-				),
-			)
-			.limit(1)
-			.get();
-		const consumedReceipt = database
-			.select({
-				taskId: runtimeAwaitedTerminalConsumptions.taskId,
-				sourceResultRef: runtimeAwaitedTerminalConsumptions.sourceResultRef,
-			})
-			.from(runtimeAwaitedTerminalConsumptions)
-			.where(
-				and(
-					eq(runtimeAwaitedTerminalConsumptions.producerKind, "agent"),
-					eq(runtimeAwaitedTerminalConsumptions.taskId, run.taskId),
-					eq(runtimeAwaitedTerminalConsumptions.logicalRunId, run.logicalRunId),
-					eq(runtimeAwaitedTerminalConsumptions.recipientId, run.recipientId),
-				),
-			)
-			.limit(1)
-			.get();
-		if (terminalIntent || terminalDelivery || consumedReceipt) {
-			// JSON remains text in SQL: CASE prevents an edited/corrupt huge row from reaching JS.
-			const receipt = database
-				.select({
-					json: sql<
-						string | null
-					>`CASE WHEN length(CAST(COALESCE(${narratorMessages.originalContentJson}, ${narratorMessages.contentJson}) AS BLOB)) <= ${AGENT_RESULT_JSON_MAX_BYTES} THEN COALESCE(${narratorMessages.originalContentJson}, ${narratorMessages.contentJson}) ELSE NULL END`,
-				})
-				.from(narratorMessages)
-				.where(
-					and(
-						eq(narratorMessages.id, `publication-result:${run.logicalRunId}`),
-						eq(narratorMessages.narratorId, run.taskId),
-						eq(narratorMessages.role, "disp"),
-					),
-				)
-				.limit(1)
-				.get();
-			const result = decodeAgentTerminalSnapshot(
-				receipt?.json ?? null,
-				run.logicalRunId,
-				options.includeEventKind,
-			);
-			if (result)
-				return options.includeEventKind && terminalIntent
-					? {
-							...result,
-							eventKind: intent.eventKind as NonNullable<AgentTerminalResult["eventKind"]>,
-						}
-					: result;
-			const exactSource = agentSourceResultRef(consumedReceipt?.sourceResultRef);
-			return exactSource ? readAssistantSource(run, exactSource.slice(8)) : null;
-		}
-		// Only the live waiter's same-run transition observation can authorize deferred output.
-		// Ordinary idle lookup, a mismatched observation, or an old actor id must not do so.
-		if (
-			options.settledRunId !== run.logicalRunId ||
-			intent?.state !== "reserved" ||
-			intent.eventKind !== "terminal" ||
-			!intent.resultRef?.startsWith("source_after:")
-		)
-			return null;
-		const boundary = parseRunSourceBoundary(intent.resultRef);
-		if (boundary === null) return null;
-		const settledActor = () => {
-			const actor = database
-				.select({
-					logicalRunId: narrators.logicalRunId,
-					status: narrators.status,
-					parentNarratorId: narrators.parentNarratorId,
-				})
-				.from(narrators)
-				.where(eq(narrators.id, run.taskId))
-				.get();
-			return (
-				actor?.logicalRunId === run.logicalRunId &&
-				actor.status === "idle" &&
-				actor.parentNarratorId === run.recipientId
-			);
-		};
-		if (!settledActor()) return null;
-		const candidates = database
-			.select({
-				id: narratorMessages.id,
-				role: narratorMessages.role,
-				narratorId: narratorMessages.narratorId,
-			})
-			.from(narratorMessageRefs)
-			.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
-			.where(
-				and(eq(narratorMessageRefs.narratorId, run.taskId), gt(narratorMessageRefs.seq, boundary)),
-			)
-			.orderBy(desc(narratorMessageRefs.seq))
-			.limit(L.pageSize)
-			.all();
-		const assistant = candidates.find(
-			(row) => row.role === "assistant" && row.narratorId === run.taskId,
-		);
-		if (!assistant) return null;
-		const result = readAssistantSource(run, assistant.id);
-		return settledActor() ? result : null;
 	}
 
 	/** Source result mutation and intent are committed by the caller's SAME synchronous transaction. */
@@ -561,13 +434,15 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 		return store.commitIntent({ ...intent, summary: publicationSummary(intent.summary) }, tx);
 	}
 
-	function notifyTransfer(recipientId: string, deliveryId?: string) {
+	async function notifyTransfer(recipientId: string, deliveryId?: string, scheduled = false) {
 		if (!wake || !deliveryId) return;
-		const row = database
-			.select({ metadataJson: narratorBufferedMessages.metadataJson })
-			.from(narratorBufferedMessages)
-			.where(eq(narratorBufferedMessages.deliveryId, deliveryId))
-			.get();
+		const row = await readQueryFirst(
+			database
+				.select({ metadataJson: narratorBufferedMessages.metadataJson })
+				.from(narratorBufferedMessages)
+				.where(eq(narratorBufferedMessages.deliveryId, deliveryId)),
+		);
+		if (scheduled && stopped) return;
 		const event = row?.metadataJson
 			? (JSON.parse(row.metadataJson) as { eventKind?: string }).eventKind
 			: undefined;
@@ -583,30 +458,33 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 	}
 
 	/** All fast and retry paths grant the next vacancy to the earliest durable intent. */
-	function flushRecipient(recipientId: string): number {
+	async function flushRecipient(recipientId: string): Promise<number> {
 		let transferred = 0;
 		for (const kind of ["agent", "bash"] as const) {
 			for (let i = 0; i < L.pageSize / 2; i++) {
 				const result = store.transferNext(recipientId, kind);
 				if (result.status !== "transferred") break;
 				transferred++;
-				notifyTransfer(recipientId, result.deliveryId);
+				await notifyTransfer(recipientId, result.deliveryId);
 			}
 		}
 		return transferred;
 	}
 
 	/** One bounded page per turn. Full mailboxes release the worker immediately. */
-	function flushPage(): boolean {
-		const page = store.listPending({ afterId: cursor, limit: L.pageSize });
+	async function flushPage(scheduled = false): Promise<boolean> {
+		const page = await store.listPending({ afterId: cursor, limit: L.pageSize });
+		if (scheduled && stopped) return false;
 		const rows = page.slice(0, L.pageSize);
 		// At most one transfer per listed row: a page never expands to pageSize² work.
 		const full = new Set<string>();
 		for (const row of rows) {
+			if (scheduled && stopped) return false;
 			const key = `${row.recipientId}:${row.producerKind}`;
 			if (full.has(key)) continue;
 			const result = store.transferNext(row.recipientId, row.producerKind);
-			if (result.status === "transferred") notifyTransfer(row.recipientId, result.deliveryId);
+			if (result.status === "transferred")
+				await notifyTransfer(row.recipientId, result.deliveryId, scheduled);
 			else full.add(key);
 		}
 		cursor = page.length > L.pageSize ? rows.at(-1)?.id : undefined;
@@ -616,15 +494,26 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 	function schedule(reset = true) {
 		if (stopped) return;
 		if (reset) retry = 0;
+		if (flushing) {
+			scheduledDuringFlush = true;
+			return;
+		}
 		if (timer) return;
 		timer = setTimeout(
-			() => {
+			async () => {
 				timer = undefined;
+				flushing = true;
+				let again = false;
 				try {
-					if (flushPage() && retry++ < L.claimMaxAttempts) schedule(false);
+					again = (await flushPage(true)) && retry++ < L.claimMaxAttempts;
 				} catch (error) {
 					logger.warn("Runtime publication delivery deferred", { retry, error: String(error) });
-					if (retry++ < L.claimMaxAttempts) schedule(false);
+					again = retry++ < L.claimMaxAttempts;
+				} finally {
+					flushing = false;
+					const requested = scheduledDuringFlush;
+					scheduledDuringFlush = false;
+					if (again || requested) schedule(false);
 				}
 			},
 			retry ? Math.min(50 * 2 ** retry, 1000) : 0,
@@ -645,20 +534,15 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 		schedule,
 		consumeAwaitedTerminal: (run: PublicationRun, options?: AwaitedTerminalConsumeOptions) =>
 			store.consumeAwaitedTerminal(run, undefined, options),
-		hasPendingSource(run: PublicationRun) {
+		async hasPendingSource(run: PublicationRun) {
 			const keys = (
 				["started", "completed", "failed", "timed_out", "cancelled", "terminal"] as const
 			).map((event) => publicationDedupeKey(run, event));
-			if (
-				database
-					.select({ id: runtimePublicationOutbox.id })
-					.from(runtimePublicationOutbox)
-					.where(inArray(runtimePublicationOutbox.dedupeKey, keys))
-					.limit(1)
-					.get()
-			)
-				return true;
-			return !!database
+			const intents = database
+				.select({ id: runtimePublicationOutbox.id })
+				.from(runtimePublicationOutbox)
+				.where(inArray(runtimePublicationOutbox.dedupeKey, keys));
+			const deliveries = database
 				.select({ id: narratorBufferedMessages.id })
 				.from(narratorBufferedMessages)
 				.where(
@@ -671,9 +555,8 @@ export function createRuntimePublicationService(database: RuntimeDb) {
 							isNull(narratorBufferedMessages.adoptedAt),
 						),
 					),
-				)
-				.limit(1)
-				.get();
+				);
+			return !!(await readQueryFirst(intents.unionAll(deliveries).limit(1)));
 		},
 		newBashRun(taskId: string, recipientId: string): PublicationRun {
 			return { producerKind: "bash", taskId, recipientId, logicalRunId: generateId() };
@@ -1048,13 +931,14 @@ function createSqliteAsyncPublicationService(
 		releaseUnusedRunSlots: async (run) => Promise.resolve(legacy.store.releaseUnusedRunSlots(run)),
 		restartAgentTask: async (input) => {
 			const now = input.now;
-			const existing = db
-				.select({ logicalRunId: backgroundTasks.logicalRunId })
-				.from(backgroundTasks)
-				.where(eq(backgroundTasks.id, input.taskId))
-				.get();
+			const existing = await readQueryFirst(
+				db
+					.select({ logicalRunId: backgroundTasks.logicalRunId })
+					.from(backgroundTasks)
+					.where(eq(backgroundTasks.id, input.taskId)),
+			);
 			if (!existing) return undefined;
-			const run = legacy.getAgentRun(input.taskId, input.taskId);
+			const run = await legacy.getAgentRun(input.taskId, input.taskId);
 			return Promise.resolve(
 				runAtomicWrite(db, "publication.restartAgentTask", (tx) => {
 					const updated = tx
@@ -1195,11 +1079,15 @@ function createSqliteAsyncPublicationService(
 			);
 		},
 		readBackgroundTask: async (taskId) => {
-			const row = db.select().from(backgroundTasks).where(eq(backgroundTasks.id, taskId)).get();
+			const row = await readQueryFirst(
+				db.select().from(backgroundTasks).where(eq(backgroundTasks.id, taskId)),
+			);
 			return row ?? null;
 		},
 		readTaskDetail: async (taskId) => {
-			const row = db.select().from(backgroundTasks).where(eq(backgroundTasks.id, taskId)).get();
+			const row = await readQueryFirst(
+				db.select().from(backgroundTasks).where(eq(backgroundTasks.id, taskId)),
+			);
 			return (row as BackgroundTaskRecord) ?? null;
 		},
 		cancelTask: async (input) => {

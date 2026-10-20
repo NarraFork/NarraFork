@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 /**
  * SQLite implementation of `KnowledgeWriteStore`.
  *
@@ -946,9 +947,11 @@ export const sqliteKnowledgeWriteStore: KnowledgeWriteStore = {
 	},
 
 	async ensureSpecNamespace(input: EnsureSpecNamespaceWrite): Promise<SpecNamespaceRow> {
-		const existing = await db.query.specNamespaces.findFirst({
-			where: eq(specNamespaces.narratorId, input.narratorId),
-		});
+		const existing = await readQuery(
+			db.query.specNamespaces.findFirst({
+				where: eq(specNamespaces.narratorId, input.narratorId),
+			}),
+		);
 		if (existing) return existing;
 		try {
 			const [created] = await db
@@ -964,9 +967,11 @@ export const sqliteKnowledgeWriteStore: KnowledgeWriteStore = {
 		} catch (error) {
 			// Lost the create race: the winner's row is the answer, whatever the conflict
 			// was. Only a still-missing row means the failure was something else.
-			const raced = await db.query.specNamespaces.findFirst({
-				where: eq(specNamespaces.narratorId, input.narratorId),
-			});
+			const raced = await readQuery(
+				db.query.specNamespaces.findFirst({
+					where: eq(specNamespaces.narratorId, input.narratorId),
+				}),
+			);
 			if (raced) return raced;
 			throw error;
 		}

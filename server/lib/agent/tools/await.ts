@@ -367,7 +367,7 @@ export const awaitTool: ToolDefinition = {
 				);
 				const receiptReady =
 					!!result.record.answerMessageId &&
-					isQuestionAnswerDeliveryReady(ctx.narratorId, result.record.answerMessageId);
+					(await isQuestionAnswerDeliveryReady(ctx.narratorId, result.record.answerMessageId));
 				let output = formatQuestionResult(id, result.status, result.record, receiptReady);
 				if (result.status === "answered" && !receiptReady && result.record.answerMessageId) {
 					const { getQuestionAnswerFallbackText } = await import(

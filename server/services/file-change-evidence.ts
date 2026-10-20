@@ -26,6 +26,7 @@ import {
 	fileHistoryClock,
 	narratorToolCalls,
 } from "../db/schema";
+import { readQuery, readQueryFirst } from "../db/worker-read";
 import { targetPathSemantics } from "../lib/agent/execution/path-semantics";
 import { AppError } from "../lib/errors";
 import { generateId } from "../lib/id";
@@ -1288,71 +1289,84 @@ export class FileChangeEvidenceService {
 	}
 
 	/** Authorized owning-resource lookup, not authorization by identifier. */
-	getScope(scopeId: string): FileChangeScopeRecord | null {
+	async getScope(scopeId: string): Promise<FileChangeScopeRecord | null> {
 		assertString(scopeId, "scopeId");
 		return (
-			this.database.select().from(fileChangeScopes).where(eq(fileChangeScopes.id, scopeId)).get() ??
-			null
+			(await readQueryFirst(
+				this.database.select().from(fileChangeScopes).where(eq(fileChangeScopes.id, scopeId)),
+				{ site: "file-change-evidence.getScope" },
+			)) ?? null
 		);
 	}
 
-	getOperation(operationId: string): FileChangeOperationRecord | null {
+	async getOperation(operationId: string): Promise<FileChangeOperationRecord | null> {
 		assertString(operationId, "operationId");
 		return (
-			this.database
-				.select()
-				.from(fileChangeOperations)
-				.where(eq(fileChangeOperations.id, operationId))
-				.get() ?? null
+			(await readQueryFirst(
+				this.database
+					.select()
+					.from(fileChangeOperations)
+					.where(eq(fileChangeOperations.id, operationId)),
+				{ site: "file-change-evidence.getOperation" },
+			)) ?? null
 		);
 	}
 
 	/** Unique installation/editor/request/attempt lookup; never a journal scan. */
-	getEditorOperation(sourceInstanceId: string, sourceId: string): FileChangeOperationRecord | null {
+	async getEditorOperation(
+		sourceInstanceId: string,
+		sourceId: string,
+	): Promise<FileChangeOperationRecord | null> {
 		assertString(sourceInstanceId, "sourceInstanceId");
 		assertString(sourceId, "sourceId");
 		return (
-			this.database
-				.select()
-				.from(fileChangeOperations)
-				.where(
-					and(
-						eq(fileChangeOperations.sourceInstanceId, sourceInstanceId),
-						eq(fileChangeOperations.sourceKind, "editor"),
-						eq(fileChangeOperations.sourceId, sourceId),
-						eq(fileChangeOperations.attempt, 1),
+			(await readQueryFirst(
+				this.database
+					.select()
+					.from(fileChangeOperations)
+					.where(
+						and(
+							eq(fileChangeOperations.sourceInstanceId, sourceInstanceId),
+							eq(fileChangeOperations.sourceKind, "editor"),
+							eq(fileChangeOperations.sourceId, sourceId),
+							eq(fileChangeOperations.attempt, 1),
+						),
 					),
-				)
-				.get() ?? null
+				{ site: "file-change-evidence.getEditorOperation" },
+			)) ?? null
 		);
 	}
 
-	getEffect(operationId: string, mutationId: string): FileChangeEffectRecord | null {
+	async getEffect(operationId: string, mutationId: string): Promise<FileChangeEffectRecord | null> {
 		assertString(operationId, "operationId");
 		assertString(mutationId, "mutationId");
 		return (
-			this.database
-				.select()
-				.from(fileChangeEffects)
-				.where(
-					and(
-						eq(fileChangeEffects.operationId, operationId),
-						eq(fileChangeEffects.mutationId, mutationId),
+			(await readQueryFirst(
+				this.database
+					.select()
+					.from(fileChangeEffects)
+					.where(
+						and(
+							eq(fileChangeEffects.operationId, operationId),
+							eq(fileChangeEffects.mutationId, mutationId),
+						),
 					),
-				)
-				.get() ?? null
+				{ site: "file-change-evidence.getEffect" },
+			)) ?? null
 		);
 	}
 
-	listEffects(
+	async listEffects(
 		operationId: string,
 		options: { cursor?: FileChangeEffectCursor; limit?: number } = {},
-	): FileChangeEvidencePage<FileChangeEffectRecord, FileChangeEffectCursor> {
+	): Promise<FileChangeEvidencePage<FileChangeEffectRecord, FileChangeEffectCursor>> {
 		assertString(operationId, "operationId");
 		const limit = pageLimit(options.limit);
 		validateEffectCursor(options.cursor);
 		return boundedPage(
-			selectEffects(this.database, operationId, options.cursor, limit + 1),
+			await readQuery(selectEffectsQuery(this.database, operationId, options.cursor, limit + 1), {
+				site: "file-change-evidence.listEffects",
+			}),
 			limit,
 			effectCursor,
 		);
@@ -1365,7 +1379,7 @@ export class FileChangeEvidenceService {
 	 * Includes incomplete preparation, committed intent, applying, and unresolved receipts;
 	 * no lease expiry deletes a row or implies not_applied. Empty pages are not file evidence.
 	 */
-	listPendingOperations(options: {
+	async listPendingOperations(options: {
 		settlement: PendingSettlement;
 		cursor?: FileChangeOperationCursor;
 		limit?: number;
@@ -1382,42 +1396,44 @@ export class FileChangeEvidenceService {
 			assertString(options.cursor.updatedAt, "cursor timestamp", 64);
 		}
 		const c = options.cursor;
-		const rows = this.database
-			.select({
-				id: fileChangeOperations.id,
-				sourceInstanceId: fileChangeOperations.sourceInstanceId,
-				sourceKind: fileChangeOperations.sourceKind,
-				sourceId: fileChangeOperations.sourceId,
-				attempt: fileChangeOperations.attempt,
-				requestDigest: fileChangeOperations.requestDigest,
-				projectId: fileChangeOperations.projectId,
-				narratorId: fileChangeOperations.narratorId,
-				ownerUserId: fileChangeOperations.ownerUserId,
-				expectedEffectCount: fileChangeOperations.expectedEffectCount,
-				preparedEffectCount: fileChangeOperations.preparedEffectCount,
-				settledEffectCount: fileChangeOperations.settledEffectCount,
-				unresolvedEffectCount: fileChangeOperations.unresolvedEffectCount,
-				evidenceBytes: fileChangeOperations.evidenceBytes,
-				settlement: fileChangeOperations.settlement,
-				executionOutcome: fileChangeOperations.executionOutcome,
-				effectOutcome: fileChangeOperations.effectOutcome,
-				coverage: fileChangeOperations.coverage,
-				attributionGrade: fileChangeOperations.attributionGrade,
-				reason: fileChangeOperations.reason,
-				updatedAt: fileChangeOperations.updatedAt,
-			})
-			.from(fileChangeOperations)
-			.where(
-				and(
-					eq(fileChangeOperations.settlement, options.settlement),
-					c
-						? sql`(${fileChangeOperations.updatedAt}, ${fileChangeOperations.id}) > (${c.updatedAt}, ${c.id})`
-						: undefined,
-				),
-			)
-			.orderBy(asc(fileChangeOperations.updatedAt), asc(fileChangeOperations.id))
-			.limit(limit + 1)
-			.all();
+		const rows = await readQuery(
+			this.database
+				.select({
+					id: fileChangeOperations.id,
+					sourceInstanceId: fileChangeOperations.sourceInstanceId,
+					sourceKind: fileChangeOperations.sourceKind,
+					sourceId: fileChangeOperations.sourceId,
+					attempt: fileChangeOperations.attempt,
+					requestDigest: fileChangeOperations.requestDigest,
+					projectId: fileChangeOperations.projectId,
+					narratorId: fileChangeOperations.narratorId,
+					ownerUserId: fileChangeOperations.ownerUserId,
+					expectedEffectCount: fileChangeOperations.expectedEffectCount,
+					preparedEffectCount: fileChangeOperations.preparedEffectCount,
+					settledEffectCount: fileChangeOperations.settledEffectCount,
+					unresolvedEffectCount: fileChangeOperations.unresolvedEffectCount,
+					evidenceBytes: fileChangeOperations.evidenceBytes,
+					settlement: fileChangeOperations.settlement,
+					executionOutcome: fileChangeOperations.executionOutcome,
+					effectOutcome: fileChangeOperations.effectOutcome,
+					coverage: fileChangeOperations.coverage,
+					attributionGrade: fileChangeOperations.attributionGrade,
+					reason: fileChangeOperations.reason,
+					updatedAt: fileChangeOperations.updatedAt,
+				})
+				.from(fileChangeOperations)
+				.where(
+					and(
+						eq(fileChangeOperations.settlement, options.settlement),
+						c
+							? sql`(${fileChangeOperations.updatedAt}, ${fileChangeOperations.id}) > (${c.updatedAt}, ${c.id})`
+							: undefined,
+					),
+				)
+				.orderBy(asc(fileChangeOperations.updatedAt), asc(fileChangeOperations.id))
+				.limit(limit + 1),
+			{ site: "file-change-evidence.listPendingOperations" },
+		);
 		return boundedPage(rows, limit, (row) => ({ updatedAt: row.updatedAt, id: row.id }));
 	}
 }
@@ -1902,6 +1918,15 @@ function selectEffects(
 	cursor: FileChangeEffectCursor | undefined,
 	limit: number,
 ): FileChangeEffectRecord[] {
+	return selectEffectsQuery(tx, operationId, cursor, limit).all();
+}
+
+function selectEffectsQuery(
+	tx: Executor,
+	operationId: string,
+	cursor: FileChangeEffectCursor | undefined,
+	limit: number,
+) {
 	return tx
 		.select()
 		.from(fileChangeEffects)
@@ -1914,8 +1939,7 @@ function selectEffects(
 			),
 		)
 		.orderBy(asc(fileChangeEffects.fileKey), asc(fileChangeEffects.phase))
-		.limit(limit)
-		.all();
+		.limit(limit);
 }
 
 function boundedPage<T, C>(

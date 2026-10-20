@@ -23,6 +23,7 @@
  */
 import { db } from "@server/db";
 import { userPreferences, users } from "@server/db/schema";
+import { readQuery } from "@server/db/worker-read";
 import { generateId } from "@server/lib/id";
 import { registrationCodeService } from "@server/services/registration-code-service";
 import { count, eq } from "drizzle-orm";
@@ -98,15 +99,20 @@ function createAccountAtomically(
 
 export const sqliteRegistrationAccountStore: RegistrationAccountStore = {
 	async countAccounts(): Promise<number> {
-		const [row] = await db.select({ value: count() }).from(users);
+		const [row] = await readQuery(db.select({ value: count() }).from(users), {
+			site: "server/services/registration/sqlite-account-store.read",
+		});
 		return row?.value ?? 0;
 	},
 
 	async isUsernameTaken(username: string): Promise<boolean> {
-		const existing = await db.query.users.findFirst({
-			where: eq(users.username, username),
-			columns: { id: true },
-		});
+		const existing = await readQuery(
+			db.query.users.findFirst({
+				where: eq(users.username, username),
+				columns: { id: true },
+			}),
+			{ site: "server/services/registration/sqlite-account-store.read" },
+		);
 		return existing !== undefined;
 	},
 

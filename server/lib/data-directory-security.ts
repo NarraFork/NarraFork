@@ -235,7 +235,7 @@ const repairs = new Map<string, Promise<DataDirectorySecurityStatus>>();
 /** Caller must authorize and confirm. No arbitrary paths are accepted by the HTTP route. */
 export function repairApplicationDataDirectory(
 	path: string,
-	authorize?: () => void,
+	authorize?: () => void | Promise<void>,
 ): Promise<DataDirectorySecurityStatus> {
 	const canonical = resolve(path);
 	const existing = repairs.get(canonical);
@@ -249,7 +249,7 @@ export function repairApplicationDataDirectory(
 
 async function repairDirectory(
 	path: string,
-	authorize?: () => void,
+	authorize?: () => void | Promise<void>,
 ): Promise<DataDirectorySecurityStatus> {
 	let chain: DirectoryChain | undefined;
 	try {
@@ -280,7 +280,7 @@ async function repairDirectory(
 				throw new Error("Data directory ancestors changed; check again before repairing");
 			checkDeadline(deadline);
 			// Role/authorization may have changed while filesystem reads were pending.
-			authorize?.();
+			await authorize?.();
 			await handle.chmod(0o700);
 			logger.info("Repaired application data directory permissions", { path, mode: "0700" });
 		} finally {

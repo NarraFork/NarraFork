@@ -1,4 +1,5 @@
 import { resolve } from "node:path";
+import { readQuery } from "@server/db/worker-read";
 import { KIMI_QUOTA_EXHAUSTED } from "@shared/agent-protocol/quota-exhausted";
 import { bufferedRowMode, resolveBufferQueueMode } from "@shared/buffer-queue-mode";
 import { serializeCatalogErrorMessage } from "@shared/error-catalog";
@@ -171,11 +172,13 @@ import {
 } from "../narrator-session";
 import type { ActiveNarrator, BufferedMessage } from "../narrator-session-state";
 import {
+	abortLateNarratorControllerForShutdown,
 	activeNarrators,
 	clearActiveHistoryCompactPending,
 	clearPlanModePromptRebuild,
 	compactLocks,
 	hasPendingHistoryCompact,
+	isNarratorAdmissionShuttingDown,
 	isNarratorRevertAdmissionBlocked,
 	knowledgeInjectionCycleStates,
 	pendingFeedback,
@@ -186,8 +189,10 @@ import {
 	pendingPlanDiff,
 	planModeAskedOnce,
 	recordNarratorRuntimeModel,
+	recordNarratorShutdownFailure,
 	resetActiveUpstreamSession,
 	withNarratorMutationAdmission,
+	withNarratorWorkAdmission,
 } from "../narrator-session-state";
 import { clearAliasRegistry, clearTeamFileChanges } from "../narrator-subagent";
 import { generateAndSetTitle } from "../narrator-title";
@@ -509,6 +514,7 @@ export async function runAgentLoopUnlocked(
 				return "break";
 			}
 			active.abortController = new AbortController();
+			abortLateNarratorControllerForShutdown(active.abortController);
 			if (run.cancel.signal.aborted) active.abortController.abort(run.cancel.signal.reason);
 			active.alive = true;
 			active._interruptCleanupDone = false;
@@ -810,7 +816,7 @@ export async function runAgentLoopUnlocked(
 	});
 
 	try {
-		while (active.alive && owner.isCurrent()) {
+		while (active.alive && owner.isCurrent() && !isNarratorAdmissionShuttingDown()) {
 			// The run's own cancellation reaches whichever turn controller is current.
 			if (run?.cancel.signal.aborted && !active.abortController.signal.aborted)
 				active.abortController.abort(run.cancel.signal.reason);
@@ -819,7 +825,7 @@ export async function runAgentLoopUnlocked(
 			active._guidanceAbortController = new AbortController();
 			const passUrgentGuidance = new AbortController();
 			active._urgentGuidanceAbortController = passUrgentGuidance;
-			if (active._bufferSoftStop && hasPendingBufferedGuidance(narratorId)) {
+			if (active._bufferSoftStop && (await hasPendingBufferedGuidance(narratorId))) {
 				active._guidanceAbortController.abort(new Error("Immediate guidance requested"));
 			}
 			if (runState.pendingPrePromptBashCommand && !active.abortController.signal.aborted) {
@@ -1194,10 +1200,12 @@ export async function runAgentLoopUnlocked(
 						});
 						return { titleUpdate: false };
 					}
-					const n = await db.query.narrators.findFirst({
-						where: eq(narrators.id, narratorId),
-						columns: { title: true },
-					});
+					const n = await readQuery(
+						db.query.narrators.findFirst({
+							where: eq(narrators.id, narratorId),
+							columns: { title: true },
+						}),
+					);
 					// `messageCount` is the real message count, not a turn count, so it is
 					// already > 1 mid-first-turn. Ask the actual question instead.
 					const titleUpdate = !!(
@@ -1743,7 +1751,7 @@ export async function runAgentLoopUnlocked(
 				},
 				getQuestionModelReceipts: () =>
 					Array.from(active._questionAnswerModelReceipts ?? [], ([id, text]) => ({ id, text })),
-				onModelInputConsumed: (history, content, answerEventIds) => {
+				onModelInputConsumed: async (history, content, answerEventIds) => {
 					adoptedInput = { history, content };
 					lastModelInputWasMailbox =
 						afterToolsInput?.history === history && afterToolsInput.content === content
@@ -1753,7 +1761,10 @@ export async function runAgentLoopUnlocked(
 					// DB presence and Await completion are only candidates. The loop
 					// confirms the IDs actually supplied after projection/compaction.
 					active._questionAnswerAdoptedMessageIds = new Set(answerEventIds);
-					consumeQuestionAnswerModelReceipts(narratorId, active._questionAnswerAdoptedMessageIds);
+					await consumeQuestionAnswerModelReceipts(
+						narratorId,
+						active._questionAnswerAdoptedMessageIds,
+					);
 					for (const id of answerEventIds ?? [])
 						active._questionAnswerFallbackMessageIds?.delete(id);
 				},
@@ -1884,7 +1895,7 @@ export async function runAgentLoopUnlocked(
 						typeof payload.tool_name === "string" ? payload.tool_name : undefined,
 					);
 				},
-				shouldStop: () => {
+				shouldStop: async () => {
 					// Cancellation is irreversible even when the queued guidance has since
 					// been removed/downgraded. Record the actual pass interruption using
 					// its captured signals, independently of whether input remains. This
@@ -1893,10 +1904,14 @@ export async function runAgentLoopUnlocked(
 						active._bufferSoftStopTaken = true;
 					}
 					if (active._workspacePassInvalidated || active._workspaceInstallFailed) return true;
+					const pendingGuidance = active._bufferSoftStop
+						? await hasPendingBufferedGuidance(narratorId)
+						: false;
+					if (active._workspacePassInvalidated || active._workspaceInstallFailed) return true;
 					const decision = evaluateSoftStopRequest({
 						feedbackSoftStop: active._feedbackSoftStop,
 						bufferSoftStop: active._bufferSoftStop,
-						hasPendingBufferedWork: hasPendingBufferedGuidance(narratorId),
+						hasPendingBufferedWork: pendingGuidance,
 					});
 					active._feedbackSoftStop = decision.feedbackSoftStop;
 					active._bufferSoftStop = decision.bufferSoftStop;
@@ -1906,6 +1921,7 @@ export async function runAgentLoopUnlocked(
 				// Both primary and child loops can outlive the abort drain. Never reuse
 				// eventContext/hooks here: a new turn may already own their mutable state.
 				onDetachedToolResult: (event) => persistDetachedToolResult(narratorId, event),
+				trackDetachedToolResult: (work) => withNarratorWorkAdmission(narratorId, () => work),
 				// onEvent receives only side-channel events (tool_output, tool_progress)
 				// from executeTool — NOT yielded events like tool_result or assistant_message.
 				onEvent: (event) => {
@@ -2757,6 +2773,7 @@ export async function runAgentLoopUnlocked(
 				const isCompact = active._planApprovedContinue === "compact";
 				active._planApprovedContinue = undefined;
 				active.abortController = new AbortController();
+				abortLateNarratorControllerForShutdown(active.abortController);
 
 				if (isCompact) {
 					await narratorService.updateStats(narratorId, 0);
@@ -2873,7 +2890,7 @@ export async function runAgentLoopUnlocked(
 				runState.input.text = fb.feedbackText;
 				// Approving a permission with attached text starts a new pass here, so a
 				// cut-in message queued during the same tool call needs its boundary back.
-				rearmCutInSoftStopBeforeContinuing(active);
+				await rearmCutInSoftStopBeforeContinuing(active);
 				continue;
 			}
 
@@ -2905,7 +2922,7 @@ export async function runAgentLoopUnlocked(
 					runState.input.text = gitCheck.message;
 					// The guardrail notice starts a new pass, so keep a cut-in message's
 					// boundary alive instead of stranding it for the rest of the loop.
-					rearmCutInSoftStopBeforeContinuing(active);
+					await rearmCutInSoftStopBeforeContinuing(active);
 					continue;
 				}
 				// Git is clean and loop ended normally — conclude the review
@@ -2982,7 +2999,7 @@ export async function runAgentLoopUnlocked(
 				runState.input.images = undefined;
 				// This drain starts a fresh pass before the buffer consumer below is
 				// reached, which would strand a cut-in message for the rest of the loop.
-				rearmCutInSoftStopBeforeContinuing(active);
+				await rearmCutInSoftStopBeforeContinuing(active);
 				continue;
 			}
 
@@ -3113,6 +3130,7 @@ export async function runAgentLoopUnlocked(
 				{ label: "runAgentLoop.updateErrorStatus", maxRetries: 5 },
 			);
 		} catch (statusErr) {
+			recordNarratorShutdownFailure(statusErr);
 			logger.error("Failed to persist narrator error status", {
 				narratorId,
 				error: String(statusErr),
@@ -3144,6 +3162,7 @@ export async function runAgentLoopUnlocked(
 					logger.info("Cleared stale pipeline state after narrator loop", { narratorId });
 				}
 			} catch (err) {
+				recordNarratorShutdownFailure(err);
 				logger.warn("Failed to clear stale pipeline state after narrator loop", {
 					narratorId,
 					error: err instanceof Error ? err.message : String(err),
@@ -3200,10 +3219,12 @@ export async function runAgentLoopUnlocked(
 				});
 			} else {
 				try {
-					const fresh = await db.query.narrators.findFirst({
-						where: eq(narrators.id, narratorId),
-						columns: { pendingModelRestore: true },
-					});
+					const fresh = await readQuery(
+						db.query.narrators.findFirst({
+							where: eq(narrators.id, narratorId),
+							columns: { pendingModelRestore: true },
+						}),
+					);
 					if (fresh?.pendingModelRestore) {
 						const restoreModel = fresh.pendingModelRestore;
 						await db
@@ -3224,6 +3245,7 @@ export async function runAgentLoopUnlocked(
 						});
 					}
 				} catch (err) {
+					recordNarratorShutdownFailure(err);
 					logger.error("Failed to restore model after temporary override", {
 						narratorId,
 						error: String(err),
@@ -3341,10 +3363,12 @@ export async function runAgentLoopUnlocked(
 				);
 			} else {
 				try {
-					const leftover = await db.query.narrators.findFirst({
-						where: eq(narrators.id, narratorId),
-						columns: { substatus: true },
-					});
+					const leftover = await readQuery(
+						db.query.narrators.findFirst({
+							where: eq(narrators.id, narratorId),
+							columns: { substatus: true },
+						}),
+					);
 					const tags = parseSubstatus(leftover?.substatus);
 					if (tags.includes("reflecting") || tags.includes("reasoning")) {
 						await narratorService.updateSubstatus(
@@ -3353,6 +3377,7 @@ export async function runAgentLoopUnlocked(
 						);
 					}
 				} catch (err) {
+					recordNarratorShutdownFailure(err);
 					logger.warn("Failed to clear stale transient substatus after narrator loop", {
 						narratorId,
 						error: err instanceof Error ? err.message : String(err),
@@ -3361,7 +3386,9 @@ export async function runAgentLoopUnlocked(
 			}
 
 			if (shouldUpdateTitle) {
-				generateAndSetTitle(narratorId, locale).catch(() => {});
+				void withNarratorWorkAdmission(narratorId, () =>
+					generateAndSetTitle(narratorId, locale),
+				).catch(recordNarratorShutdownFailure);
 			}
 			active._provisionalTitle = undefined;
 
@@ -3387,6 +3414,7 @@ export async function runAgentLoopUnlocked(
 						},
 					]);
 				} catch (err) {
+					recordNarratorShutdownFailure(err);
 					logger.error("Failed to persist missing workdir recovery notice", {
 						narratorId,
 						error: String(err),

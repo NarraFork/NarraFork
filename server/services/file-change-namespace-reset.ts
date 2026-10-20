@@ -3,9 +3,10 @@ import { randomUUID } from "node:crypto";
 import { mkdir, opendir, rename, rmdir, unlink } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { setImmediate as yieldToEventLoop } from "node:timers/promises";
-import { eq, sql } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import type { db as applicationDb } from "../db";
 import { fileChangeStorageBudgets } from "../db/schema";
+import { readQueryFirst } from "../db/worker-read";
 import { hotSafe } from "../lib/hot-safe";
 import { logger } from "../lib/logger";
 import { FILE_CHANGE_BLOB_BUDGET_ID } from "./file-change-blob-catalog";
@@ -210,22 +211,31 @@ export async function resetFileChangeNamespace(input: {
 	assertBoundary(): Promise<void>;
 }): Promise<void> {
 	await input.assertBoundary();
-	const budget = input.db
-		.select()
-		.from(fileChangeStorageBudgets)
-		.where(eq(fileChangeStorageBudgets.id, FILE_CHANGE_BLOB_BUDGET_ID))
-		.get();
+	const budget = await readQueryFirst(
+		input.db
+			.select()
+			.from(fileChangeStorageBudgets)
+			.where(eq(fileChangeStorageBudgets.id, FILE_CHANGE_BLOB_BUDGET_ID)),
+		{ site: "file-change-namespace-reset.budget" },
+	);
 	if (!budget) throw new Error("Cannot reset a missing blob namespace budget");
 	if (!Number.isSafeInteger(budget.generation + 1)) throw new Error("Blob generation exhausted");
-	input.db
+	const reset = input.db
 		.update(fileChangeStorageBudgets)
 		.set({
 			status: "unverified",
 			generation: budget.generation + 1,
 			updatedAt: new Date().toISOString(),
 		})
-		.where(eq(fileChangeStorageBudgets.id, budget.id))
-		.run();
+		.where(
+			and(
+				eq(fileChangeStorageBudgets.id, budget.id),
+				eq(fileChangeStorageBudgets.generation, budget.generation),
+			),
+		)
+		.returning({ id: fileChangeStorageBudgets.id })
+		.get();
+	if (!reset) throw new Error("Blob namespace changed during reset admission");
 	const root = join(input.privateRoot, "file-change-blobs");
 	const retired = join(input.privateRoot, `file-change-blobs.retired-${randomUUID()}`);
 	try {

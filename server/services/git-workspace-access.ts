@@ -3,6 +3,7 @@ import { and, asc, eq, gt, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import type { Context } from "hono";
 import { db } from "../db";
 import { chapters, projects, remoteDevices } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { AppError } from "../lib/errors";
 import { isSecretPlatformPath, isSecretUserPath } from "../lib/fs-secret-paths";
 import { logger } from "../lib/logger";
@@ -116,57 +117,65 @@ async function relatedProjects(
 	type Project = Pick<typeof projects.$inferSelect, keyof typeof fields>;
 	const matches = new Map<string, Project>();
 	for await (const page of scan.pagesOf((cursor) =>
-		db
-			.select(fields)
-			.from(projects)
-			.where(
-				and(
-					foreignProject,
-					cursor ? gt(projects.id, cursor) : undefined,
-					or(
-						inArray(projects.gitPath, [...candidates]),
-						sql`${projects.gitPath} like ${escaped} escape '\\'`,
+		readQuery(
+			db
+				.select(fields)
+				.from(projects)
+				.where(
+					and(
+						foreignProject,
+						cursor ? gt(projects.id, cursor) : undefined,
+						or(
+							inArray(projects.gitPath, [...candidates]),
+							sql`${projects.gitPath} like ${escaped} escape '\\'`,
+						),
 					),
-				),
-			)
-			.orderBy(asc(projects.id))
-			.limit(ACCESS_PAGE_SIZE),
+				)
+				.orderBy(asc(projects.id))
+				.limit(ACCESS_PAGE_SIZE),
+		),
 	)) {
 		for (const row of page) matches.set(row.id, row);
 	}
 	for await (const page of scan.pagesOf((cursor) =>
-		db
-			.select({ id: chapters.id, projectId: chapters.projectId })
-			.from(chapters)
-			.where(
-				and(
-					cursor ? gt(chapters.id, cursor) : undefined,
-					inArray(chapters.worktreePath, [...candidates]),
-				),
-			)
-			.orderBy(asc(chapters.id))
-			.limit(ACCESS_PAGE_SIZE),
+		readQuery(
+			db
+				.select({ id: chapters.id, projectId: chapters.projectId })
+				.from(chapters)
+				.where(
+					and(
+						cursor ? gt(chapters.id, cursor) : undefined,
+						inArray(chapters.worktreePath, [...candidates]),
+					),
+				)
+				.orderBy(asc(chapters.id))
+				.limit(ACCESS_PAGE_SIZE),
+		),
 	)) {
 		const missing = [...new Set(page.map((row) => row.projectId))].filter((id) => !matches.has(id));
 		if (!missing.length) continue;
 		const rows = await scan.run(() =>
-			db
-				.select(fields)
-				.from(projects)
-				.where(and(foreignProject, inArray(projects.id, missing)))
-				.limit(ACCESS_PAGE_SIZE),
+			readQuery(
+				db
+					.select(fields)
+					.from(projects)
+					.where(and(foreignProject, inArray(projects.id, missing)))
+					.limit(ACCESS_PAGE_SIZE),
+			),
 		);
 		for (const row of rows) matches.set(row.id, row);
 	}
 	// Registered symlink aliases can occur anywhere in the project table.
 	const paths = target.backend.paths;
 	for await (const page of scan.pagesOf((cursor) =>
-		db
-			.select(fields)
-			.from(projects)
-			.where(and(foreignProject, cursor ? gt(projects.id, cursor) : undefined))
-			.orderBy(asc(projects.id))
-			.limit(ACCESS_PAGE_SIZE),
+		readQuery(
+			db
+				.select(fields)
+				.from(projects)
+				.where(and(foreignProject, cursor ? gt(projects.id, cursor) : undefined))
+				.orderBy(asc(projects.id))
+				.limit(ACCESS_PAGE_SIZE),
+		),
 	)) {
 		await scan.canonicalize(
 			page.filter((row) => !matches.has(row.id)),
@@ -222,9 +231,11 @@ export async function authorizeGitTargetForPrincipal(
 				}
 				const id = initial.workspace.deviceId;
 				if (id !== "local") {
-					const device = await db.query.remoteDevices.findFirst({
-						where: eq(remoteDevices.id, id),
-					});
+					const device = await readQuery(
+						db.query.remoteDevices.findFirst({
+							where: eq(remoteDevices.id, id),
+						}),
+					);
 					if (
 						!device ||
 						device.revokedAt ||

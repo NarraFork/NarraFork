@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 /**
  * Routine service — manages enabling/disabling built-in routines.
  *
@@ -287,10 +288,12 @@ export async function setToolRoutineModeForProject(
 ): Promise<void> {
 	requireToolRoutine(routineId);
 
-	const project = await db.query.projects.findFirst({
-		where: eq(projects.id, projectId),
-		columns: { id: true, chapterSettings: true },
-	});
+	const project = await readQuery(
+		db.query.projects.findFirst({
+			where: eq(projects.id, projectId),
+			columns: { id: true, chapterSettings: true },
+		}),
+	);
 	if (!project) throw new NotFoundError("Project", projectId);
 
 	const cs = parseChapterSettings(project.chapterSettings);
@@ -318,10 +321,12 @@ export async function enableRoutineForProject(routineId: string, projectId: stri
 		return;
 	}
 
-	const project = await db.query.projects.findFirst({
-		where: eq(projects.id, projectId),
-		columns: { id: true, gitPath: true, chapterSettings: true },
-	});
+	const project = await readQuery(
+		db.query.projects.findFirst({
+			where: eq(projects.id, projectId),
+			columns: { id: true, gitPath: true, chapterSettings: true },
+		}),
+	);
 	if (!project) throw new NotFoundError("Project", projectId);
 
 	// Update chapterSettings.routines
@@ -361,10 +366,12 @@ export async function disableRoutineForProject(
 		return;
 	}
 
-	const project = await db.query.projects.findFirst({
-		where: eq(projects.id, projectId),
-		columns: { id: true, gitPath: true, chapterSettings: true },
-	});
+	const project = await readQuery(
+		db.query.projects.findFirst({
+			where: eq(projects.id, projectId),
+			columns: { id: true, gitPath: true, chapterSettings: true },
+		}),
+	);
 	if (!project) throw new NotFoundError("Project", projectId);
 
 	// Update chapterSettings.routines
@@ -403,10 +410,12 @@ export async function resetRoutineForProject(routineId: string, projectId: strin
 		return;
 	}
 
-	const project = await db.query.projects.findFirst({
-		where: eq(projects.id, projectId),
-		columns: { id: true, gitPath: true, chapterSettings: true },
-	});
+	const project = await readQuery(
+		db.query.projects.findFirst({
+			where: eq(projects.id, projectId),
+			columns: { id: true, gitPath: true, chapterSettings: true },
+		}),
+	);
 	if (!project) throw new NotFoundError("Project", projectId);
 
 	const cs = parseChapterSettings(project.chapterSettings);
@@ -501,10 +510,12 @@ function buildCommandFromRoutine(routine: BuiltinRoutine): Command {
 }
 
 async function addGlobalCommand(routine: BuiltinRoutine, userId: string): Promise<void> {
-	const pref = await db.query.userPreferences.findFirst({
-		where: eq(userPreferences.userId, userId),
-		columns: { commands: true },
-	});
+	const pref = await readQuery(
+		db.query.userPreferences.findFirst({
+			where: eq(userPreferences.userId, userId),
+			columns: { commands: true },
+		}),
+	);
 
 	let cmds: Command[] = [];
 	if (pref?.commands) {
@@ -532,10 +543,12 @@ async function addGlobalCommand(routine: BuiltinRoutine, userId: string): Promis
 }
 
 async function removeGlobalCommand(routine: BuiltinRoutine, userId: string): Promise<void> {
-	const pref = await db.query.userPreferences.findFirst({
-		where: eq(userPreferences.userId, userId),
-		columns: { commands: true },
-	});
+	const pref = await readQuery(
+		db.query.userPreferences.findFirst({
+			where: eq(userPreferences.userId, userId),
+			columns: { commands: true },
+		}),
+	);
 	if (!pref?.commands) return;
 
 	let cmds: Command[] = [];

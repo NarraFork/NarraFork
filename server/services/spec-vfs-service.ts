@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { readQuery } from "@server/db/worker-read";
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import { specFileRevisions, specNamespaceFiles, type specNamespaces } from "../db/schema";
@@ -139,14 +140,21 @@ export async function ensureNamespace(
 }
 
 async function getCurrentFile(namespaceId: string, path: string) {
-	return db.query.specNamespaceFiles.findFirst({
-		where: and(eq(specNamespaceFiles.namespaceId, namespaceId), eq(specNamespaceFiles.path, path)),
-	});
+	return readQuery(
+		db.query.specNamespaceFiles.findFirst({
+			where: and(
+				eq(specNamespaceFiles.namespaceId, namespaceId),
+				eq(specNamespaceFiles.path, path),
+			),
+		}),
+	);
 }
 
 async function getRevision(revisionId: string | null | undefined) {
 	if (!revisionId) return null;
-	return db.query.specFileRevisions.findFirst({ where: eq(specFileRevisions.id, revisionId) });
+	return readQuery(
+		db.query.specFileRevisions.findFirst({ where: eq(specFileRevisions.id, revisionId) }),
+	);
 }
 
 /** Whether the assistant's Write/Edit tools are blocked for this path. */
@@ -307,12 +315,14 @@ export async function deleteSpecFile(narratorId: string, uri: string): Promise<v
 
 export async function listSpecFiles(narratorId: string): Promise<SpecResolvedFile[]> {
 	const namespace = await ensureNamespace(narratorId);
-	const rows = await db.query.specNamespaceFiles.findMany({
-		where: and(
-			eq(specNamespaceFiles.namespaceId, namespace.id),
-			eq(specNamespaceFiles.deleted, false),
-		),
-	});
+	const rows = await readQuery(
+		db.query.specNamespaceFiles.findMany({
+			where: and(
+				eq(specNamespaceFiles.namespaceId, namespace.id),
+				eq(specNamespaceFiles.deleted, false),
+			),
+		}),
+	);
 	const files: SpecResolvedFile[] = [];
 	const seen = new Set<string>();
 	for (const row of rows) {

@@ -11,6 +11,7 @@
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { fileAttributions, narrators } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -214,10 +215,12 @@ export async function recordAttribution(input: RecordAttributionInput): Promise<
 		// Resolve subagentType lazily if a narrator was given but type omitted.
 		let subagentType = input.subagentType ?? null;
 		if (input.narratorId && subagentType == null) {
-			const n = await db.query.narrators.findFirst({
-				where: eq(narrators.id, input.narratorId),
-				columns: { type: true, variant: true, subagentType: true },
-			});
+			const n = await readQuery(
+				db.query.narrators.findFirst({
+					where: eq(narrators.id, input.narratorId),
+					columns: { type: true, variant: true, subagentType: true },
+				}),
+			);
 			// Preserve the authoritative subtype on the event before a later FK deletion
 			// can remove the narrator row. Legacy type/subagentType may not be populated.
 			if (n?.variant.startsWith("subagent:")) {
@@ -276,10 +279,12 @@ export async function recordAttributions(
 		// Resolve subagentType once for the shared narrator.
 		let subagentType = base.subagentType ?? null;
 		if (base.narratorId && subagentType == null) {
-			const n = await db.query.narrators.findFirst({
-				where: eq(narrators.id, base.narratorId),
-				columns: { type: true, variant: true, subagentType: true },
-			});
+			const n = await readQuery(
+				db.query.narrators.findFirst({
+					where: eq(narrators.id, base.narratorId),
+					columns: { type: true, variant: true, subagentType: true },
+				}),
+			);
 			// Preserve the authoritative subtype on the event before a later FK deletion
 			// can remove the narrator row. Legacy type/subagentType may not be populated.
 			if (n?.variant.startsWith("subagent:")) {

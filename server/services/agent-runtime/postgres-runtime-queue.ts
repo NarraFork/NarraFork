@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 /**
  * agent-runtime/postgres-runtime-queue.ts — the PostgreSQL production adapter for the
  * runtime queue (mailbox + publication outbox atomic write sections).
@@ -1769,7 +1770,7 @@ export function createPostgresRuntimeQueue(
 		/** Single-row read for the buffered-message write paths. */
 		async getById(id: string): Promise<PgMailboxRow | undefined> {
 			pointer(id);
-			const rows = await db.select().from(mailbox).where(eq(mailbox.id, id));
+			const rows = await readQuery(db.select().from(mailbox).where(eq(mailbox.id, id)));
 			return rows[0];
 		},
 		/**

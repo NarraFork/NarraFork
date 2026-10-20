@@ -6,6 +6,7 @@ import {
 	narratorWhitelistCmds,
 	narratorWhitelistDirs,
 } from "@server/db/schema";
+import { readQuery } from "@server/db/worker-read";
 import { AppError, NotFoundError, ValidationError } from "@server/lib/errors";
 import { generateId } from "@server/lib/id";
 import { logger } from "@server/lib/logger";
@@ -153,22 +154,30 @@ class PermissionRuleService {
 
 	async listNarratorRules(narratorId: string): Promise<ExecutionPolicyRuleSet> {
 		const [whitelistDirs, blacklistDirs, commandWhitelist, commandBlacklist] = await Promise.all([
-			db
-				.select()
-				.from(narratorWhitelistDirs)
-				.where(eq(narratorWhitelistDirs.narratorId, narratorId)),
-			db
-				.select()
-				.from(narratorBlacklistDirs)
-				.where(eq(narratorBlacklistDirs.narratorId, narratorId)),
-			db
-				.select()
-				.from(narratorWhitelistCmds)
-				.where(eq(narratorWhitelistCmds.narratorId, narratorId)),
-			db
-				.select()
-				.from(narratorBlacklistCmds)
-				.where(eq(narratorBlacklistCmds.narratorId, narratorId)),
+			readQuery(
+				db
+					.select()
+					.from(narratorWhitelistDirs)
+					.where(eq(narratorWhitelistDirs.narratorId, narratorId)),
+			),
+			readQuery(
+				db
+					.select()
+					.from(narratorBlacklistDirs)
+					.where(eq(narratorBlacklistDirs.narratorId, narratorId)),
+			),
+			readQuery(
+				db
+					.select()
+					.from(narratorWhitelistCmds)
+					.where(eq(narratorWhitelistCmds.narratorId, narratorId)),
+			),
+			readQuery(
+				db
+					.select()
+					.from(narratorBlacklistCmds)
+					.where(eq(narratorBlacklistCmds.narratorId, narratorId)),
+			),
 		]);
 		return {
 			directoryWhitelist: whitelistDirs.map((row) =>

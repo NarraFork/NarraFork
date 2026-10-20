@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 import { and, eq, inArray, isNull } from "drizzle-orm";
 import { db } from "../db";
 import { narrators, oauthClients, remoteDevices } from "../db/schema";
@@ -153,15 +154,18 @@ export async function resolveOAuthNarratorRuntimePolicy(
 	narratorId: string,
 	expectedUserId?: string | null,
 ): Promise<OAuthNarratorRuntimePolicy | null> {
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: {
-			id: true,
-			oauthPolicySnapshotJson: true,
-			contextProjectId: true,
-			defaultDeviceId: true,
-		},
-	});
+	const narrator = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: {
+				id: true,
+				oauthPolicySnapshotJson: true,
+				contextProjectId: true,
+				defaultDeviceId: true,
+			},
+		}),
+		{ site: "server/services/oauth-narrator-runtime-policy.read" },
+	);
 	if (!narrator) throw new NotFoundError("Narrator", narratorId);
 	const provenance = await integrationResourceBindingService.get("narrator", narrator.id);
 	if (!provenance) {
@@ -212,12 +216,15 @@ export async function resolveOAuthNarratorRuntimePolicy(
 		throw runtimeForbidden("OAuth narrator trigger user does not own the authority");
 	}
 
-	const client = await db.query.oauthClients.findFirst({
-		where: and(
-			eq(oauthClients.id, authority.authority.integrationId),
-			isNull(oauthClients.revokedAt),
-		),
-	});
+	const client = await readQuery(
+		db.query.oauthClients.findFirst({
+			where: and(
+				eq(oauthClients.id, authority.authority.integrationId),
+				isNull(oauthClients.revokedAt),
+			),
+		}),
+		{ site: "server/services/oauth-narrator-runtime-policy.read" },
+	);
 	if (!client?.publicClient) throw runtimeForbidden("OAuth client is inactive");
 	// Grant ownership is the boundary: require the send_message capability on the
 	// authority (any scope) rather than a project-scoped grant.
@@ -235,10 +242,13 @@ export async function resolveOAuthNarratorRuntimePolicy(
 	);
 	if (!policy) throw runtimeForbidden("OAuth narrator policy intersection is empty");
 
-	const deviceRows = await db.query.remoteDevices.findMany({
-		where: and(inArray(remoteDevices.id, snapshot.deviceIds), isNull(remoteDevices.revokedAt)),
-		columns: { id: true, scope: true, projectId: true },
-	});
+	const deviceRows = await readQuery(
+		db.query.remoteDevices.findMany({
+			where: and(inArray(remoteDevices.id, snapshot.deviceIds), isNull(remoteDevices.revokedAt)),
+			columns: { id: true, scope: true, projectId: true },
+		}),
+		{ site: "server/services/oauth-narrator-runtime-policy.read" },
+	);
 	const devicesById = new Map(deviceRows.map((device) => [device.id, device]));
 	for (const deviceId of snapshot.deviceIds) {
 		const device = devicesById.get(deviceId);

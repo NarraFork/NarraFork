@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import {
@@ -301,6 +301,28 @@ describe("async question receipt runtime adoption", () => {
 		expect((await drainInjectionsIntoHistory(running, "en")).text).not.toContain(text);
 		expect(db.select().from(narratorMessages).all()).toHaveLength(1);
 	});
+	test("receipt adoption rechecks a reference removed after the worker read", async () => {
+		const text = persistAnswer();
+		await scheduleQuestionAnswerDelivery(narratorId, "answer", text, undefined);
+		const reader = await import("../../db/worker-read");
+		const read = reader.readQueryFirst;
+		let removed = false;
+		const race = spyOn(reader, "readQueryFirst").mockImplementation(async (query, options) => {
+			const result = await read(query, options);
+			if (options?.site === "narrator-session.deliverPendingInjectionsInOrder") {
+				db.delete(narratorMessageRefs).where(eq(narratorMessageRefs.messageId, "answer")).run();
+				removed = true;
+			}
+			return result;
+		});
+		try {
+			expect(await drainAndPersistPendingInjections(active())).toBeNull();
+			expect(removed).toBe(true);
+			expect(db.select().from(narratorBufferedMessages).get()?.state).toBe("queued");
+		} finally {
+			race.mockRestore();
+		}
+	});
 	test("Await drops answer bodies only after reliable receipt scheduling", async () => {
 		const { formatQuestionResult } = await import("../../lib/agent/tools/await");
 		const text = persistAnswer();
@@ -309,12 +331,12 @@ describe("async question receipt runtime adoption", () => {
 			answers: { choice: "sensitive answer" },
 			answerMessageId: "answer",
 		};
-		expect(isQuestionAnswerDeliveryReady(narratorId, "answer")).toBe(false);
+		expect(await isQuestionAnswerDeliveryReady(narratorId, "answer")).toBe(false);
 		expect(formatQuestionResult("question", "answered", record, false)).toContain(
 			"sensitive answer",
 		);
 		await scheduleQuestionAnswerDelivery(narratorId, "answer", text, undefined);
-		expect(isQuestionAnswerDeliveryReady(narratorId, "answer")).toBe(true);
+		expect(await isQuestionAnswerDeliveryReady(narratorId, "answer")).toBe(true);
 		expect(formatQuestionResult("question", "answered", record, false)).toContain(
 			"Question action=get",
 		);
@@ -329,7 +351,7 @@ describe("async question receipt runtime adoption", () => {
 			.set({ state: "materialized", adoptedAt: time, currentAdoptedAt: time })
 			.where(eq(narratorBufferedMessages.recipientMessageId, "answer"))
 			.run();
-		expect(isQuestionAnswerDeliveryReady(narratorId, "answer")).toBe(false);
+		expect(await isQuestionAnswerDeliveryReady(narratorId, "answer")).toBe(false);
 	});
 	test("deleting an answer through ordinary history mutation reopens its question and cancels delivery", async () => {
 		const question = await seedQuestion();
@@ -347,7 +369,9 @@ describe("async question receipt runtime adoption", () => {
 			.get();
 		expect(restored?.status).toBe("open");
 		expect(restored?.answerMessageId).toBeNull();
-		expect(isQuestionAnswerDeliveryReady(narratorId, answer.record.answerMessageId)).toBe(false);
+		expect(await isQuestionAnswerDeliveryReady(narratorId, answer.record.answerMessageId)).toBe(
+			false,
+		);
 	});
 	test("unlinking the original shared request withdraws it while a fork retains its background row", async () => {
 		const question = await seedQuestion();
@@ -424,7 +448,9 @@ describe("async question receipt runtime adoption", () => {
 			answers: { choice: "All except Redis" },
 		});
 		if (!answer.ok || !answer.record.answerMessageId) throw new Error("answer failed");
-		expect(isQuestionAnswerDeliveryReady(narratorId, answer.record.answerMessageId)).toBe(false);
+		expect(await isQuestionAnswerDeliveryReady(narratorId, answer.record.answerMessageId)).toBe(
+			false,
+		);
 		const result = await wait;
 		expect(result.output).toContain("Cache decision; continue local investigation while waiting.");
 		expect(result.output).toContain("Memory");
@@ -432,7 +458,9 @@ describe("async question receipt runtime adoption", () => {
 		expect(result.output).toContain("All except Redis");
 		expect(result.output).toContain("question_answer_fallback");
 		await drainInjectionsIntoHistory(running, "en");
-		expect(isQuestionAnswerDeliveryReady(narratorId, answer.record.answerMessageId)).toBe(true);
+		expect(await isQuestionAnswerDeliveryReady(narratorId, answer.record.answerMessageId)).toBe(
+			true,
+		);
 		const { projectQuestionFallbackToolResults } = await import("../agent-runtime/history");
 		const row = db
 			.select()

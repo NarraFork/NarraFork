@@ -1,6 +1,7 @@
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { activeDatabaseBackend } from "../db";
+import { readQuery } from "../db/worker-read";
 import { isAdminUser } from "../lib/agent/tools/admin-common";
 import type { ToolContext } from "../lib/agent/types";
 import { AppError } from "../lib/errors";
@@ -89,10 +90,12 @@ export const narratorWorktreeService = new NarratorWorktreeService<NarratorPrinc
 			import("../db"),
 			import("../db/schema"),
 		]);
-		const row = await db.query.narrators.findFirst({
-			where: eq(narrators.id, narratorId),
-			columns: { title: true },
-		});
+		const row = await readQuery(
+			db.query.narrators.findFirst({
+				where: eq(narrators.id, narratorId),
+				columns: { title: true },
+			}),
+		);
 		const result = await summaryGenerate(
 			(requirement ?? row?.title ?? "new worktree task").slice(0, 2000),
 			"Return only one short lowercase ASCII kebab-case Git branch slug (1-48 characters, letters/digits/hyphens), describing this task. No prefix, quotes, markdown or explanation.",

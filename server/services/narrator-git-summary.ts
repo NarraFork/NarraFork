@@ -2,6 +2,7 @@ import type { GitWorkspaceSummary } from "@shared/git-workspace";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { narrators } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { AppError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { authorizeGitTargetForPrincipal } from "./git-workspace-access";
@@ -24,10 +25,13 @@ export async function getNarratorGitSummary(
 			true,
 		);
 		// A switch completing during discovery must not label the old detail with new facts.
-		const current = await db.query.narrators.findFirst({
-			where: eq(narrators.id, id),
-			columns: { workspaceRevision: true },
-		});
+		const current = await readQuery(
+			db.query.narrators.findFirst({
+				where: eq(narrators.id, id),
+				columns: { workspaceRevision: true },
+			}),
+			{ site: "narrator-git-summary.getNarratorGitSummary" },
+		);
 		if (current?.workspaceRevision !== revision) return null;
 		return { workspace: target.workspace, branch: target.workspace.branch ?? null, revision };
 	} catch (error) {

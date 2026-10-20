@@ -1,6 +1,7 @@
 import { clearTimeout, setTimeout } from "node:timers";
 import { hotSafe } from "@server/lib/hot-safe";
 import { logger } from "@server/lib/logger";
+import { waitForShutdownWork } from "@server/lib/shutdown-activity";
 
 const INITIAL_RETRY_MS = 1_000;
 const MAX_RETRY_MS = 30_000;
@@ -21,6 +22,24 @@ export class BackgroundOccupancyInitializer {
 	private failures = 0;
 	private initialized = false;
 	private stopped = false;
+	private failureCount = 0;
+	private firstError: unknown;
+
+	getShutdownState(): { pending: number; failureCount: number; firstError: unknown } {
+		return {
+			pending: this.inFlight ? 1 : 0,
+			failureCount: this.failureCount,
+			firstError: this.firstError,
+		};
+	}
+
+	async drainForShutdown(signal: AbortSignal): Promise<void> {
+		signal.throwIfAborted();
+		while (this.inFlight) {
+			await waitForShutdownWork(this.inFlight, signal);
+			signal.throwIfAborted();
+		}
+	}
 
 	constructor(
 		private readonly initialize: () => Promise<void>,
@@ -47,14 +66,19 @@ export class BackgroundOccupancyInitializer {
 		// one timer and do not let repeated callers bypass its backoff.
 		if (this.cancelRetry) return Promise.resolve(false);
 		const work = Promise.resolve()
-			.then(() => this.initialize())
+			.then(() => {
+				if (!this.stopped) return this.initialize();
+			})
 			.then(() => {
 				if (this.stopped) return false;
 				this.initialized = true;
 				return true;
 			})
 			.catch((error: unknown) => {
-				if (this.stopped) return false;
+				if (this.stopped) {
+					if (this.failureCount++ === 0) this.firstError = error;
+					return false;
+				}
 				this.failures++;
 				const delayMs = Math.min(
 					INITIAL_RETRY_MS * 2 ** Math.min(this.failures - 1, 5),

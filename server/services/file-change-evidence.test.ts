@@ -191,7 +191,7 @@ function operationInput(
 	};
 }
 
-test("editor operation persists its original lease and full safe-integer remote snapshot revision", () => {
+test("editor operation persists its original lease and full safe-integer remote snapshot revision", async () => {
 	const input = operationInput({
 		sourceKind: "editor",
 		executionBinding: { ...binding, deviceId: "remote-fixture" },
@@ -199,7 +199,7 @@ test("editor operation persists its original lease and full safe-integer remote 
 		editorRawSnapshotRevision: Number.MAX_SAFE_INTEGER,
 	});
 	const recorded = service.beginOperation(input);
-	expect(service.getEditorOperation(source, input.sourceId)).toMatchObject({
+	expect(await service.getEditorOperation(source, input.sourceId)).toMatchObject({
 		id: recorded.id,
 		workspaceLeaseId: "original-lease",
 		editorRawSnapshotRevision: Number.MAX_SAFE_INTEGER,
@@ -307,20 +307,20 @@ describe("explicit atomic settlement transactions", () => {
 				throw new Error("lease manifest failed");
 			}),
 		).toThrow("lease manifest failed");
-		expect(service.getEffect(effect.operationId, effect.mutationId)).toMatchObject({
+		expect(await service.getEffect(effect.operationId, effect.mutationId)).toMatchObject({
 			settlement: "applying",
 			executionReceiptJson: null,
 		});
-		expect(service.getOperation(operation.id)?.executionOutcome).toBe("running");
+		expect((await service.getOperation(operation.id))?.executionOutcome).toBe("running");
 		db.transaction((tx) => {
 			service.settleEffect({ ...effectSelector(effect), receipt: receipt(effect) }, tx);
 			service.finishOperation(operation.id, "interrupted", tx);
 		});
-		expect(service.getEffect(effect.operationId, effect.mutationId)).toMatchObject({
+		expect(await service.getEffect(effect.operationId, effect.mutationId)).toMatchObject({
 			settlement: "settled",
 			executionConfirmed: true,
 		});
-		expect(service.getOperation(operation.id)?.executionOutcome).toBe("interrupted");
+		expect((await service.getOperation(operation.id))?.executionOutcome).toBe("interrupted");
 	});
 
 	test("explicit transaction must be active on the journal connection", async () => {
@@ -363,12 +363,12 @@ describe("explicit atomic settlement transactions", () => {
 		});
 		expect(service.beginOperation(input).id).toBe(operation.id);
 		if (effect) {
-			expect(service.getEffect(effect.operationId, effect.mutationId)).toMatchObject({
+			expect(await service.getEffect(effect.operationId, effect.mutationId)).toMatchObject({
 				settlement: "settled",
 				outcome: "no_change",
 				linesAdded: 0,
 			});
-			const settled = service.getEffect(effect.operationId, effect.mutationId);
+			const settled = await service.getEffect(effect.operationId, effect.mutationId);
 			if (!settled) throw new Error("Missing settled effect");
 			expect(hasConfirmedNoFileChange(sharedEffect(settled))).toBe(true);
 			expect(apply(effect).mayExecute).toBe(false);
@@ -458,7 +458,7 @@ function noDispatchInput(): BeginFileChangeOperation & { toolCallId: string; nar
 const NO_DISPATCH = { targetDispatched: false, reason: "validation_rejected" } as const;
 
 describe("explicit no-dispatch file-tool evidence", () => {
-	test("records zero effects and links only the bound row atomically without invented bytes", () => {
+	test("records zero effects and links only the bound row atomically without invented bytes", async () => {
 		const input = noDispatchInput();
 		const other = noDispatchInput();
 		const result = service.beginNoDispatchOperation(input, NO_DISPATCH);
@@ -486,7 +486,7 @@ describe("explicit no-dispatch file-tool evidence", () => {
 				.get()?.operationId;
 		expect(linked(input.toolCallId)).toBe(result.id);
 		expect(linked(other.toolCallId)).toBeNull();
-		expect(service.getScope(scope.id)?.status).toBe("needs_verification");
+		expect((await service.getScope(scope.id))?.status).toBe("needs_verification");
 		expect(() => service.prepareEffects(result.id, [effectInput()])).toThrow();
 	});
 
@@ -494,7 +494,7 @@ describe("explicit no-dispatch file-tool evidence", () => {
 		"Write",
 		"Edit",
 		"StructSed",
-	])("%s preview is succeeded with strictly zero effects", (toolName) => {
+	])("%s preview is succeeded with strictly zero effects", async (toolName) => {
 		const input = noDispatchInput();
 		db.update(narratorToolCalls)
 			.set({ toolName })
@@ -511,7 +511,7 @@ describe("explicit no-dispatch file-tool evidence", () => {
 			expectedEffectCount: 0,
 			evidenceBytes: 0,
 		});
-		expect(service.listEffects(operation.id).items).toHaveLength(0);
+		expect((await service.listEffects(operation.id)).items).toHaveLength(0);
 	});
 
 	test.each([
@@ -609,7 +609,7 @@ describe("explicit no-dispatch file-tool evidence", () => {
 		).toHaveLength(0);
 	});
 
-	test("identical proof remains idempotent after the tool result, conflicting proof stays rejected", () => {
+	test("identical proof remains idempotent after the tool result, conflicting proof stays rejected", async () => {
 		const input = noDispatchInput();
 		const result = service.beginNoDispatchOperation(input, NO_DISPATCH);
 		db.update(narratorToolCalls)
@@ -623,7 +623,7 @@ describe("explicit no-dispatch file-tool evidence", () => {
 				reason: "cancelled_before_dispatch",
 			}),
 		).toThrow("cannot become");
-		expect(service.getOperation(result.id)).toEqual(result);
+		expect(await service.getOperation(result.id)).toEqual(result);
 	});
 
 	test("zero effects do not require or promote the blob namespace", () => {
@@ -670,7 +670,7 @@ describe("explicit no-dispatch file-tool evidence", () => {
 		});
 	}
 
-	test("rejects dispatched/unknown proof, actor substitution and an existing ordinary intent", () => {
+	test("rejects dispatched/unknown proof, actor substitution and an existing ordinary intent", async () => {
 		const input = noDispatchInput();
 		expect(() =>
 			service.beginNoDispatchOperation(input, { ...NO_DISPATCH, targetDispatched: true as false }),
@@ -680,7 +680,7 @@ describe("explicit no-dispatch file-tool evidence", () => {
 		);
 		const existing = service.beginOperation(input);
 		expect(() => service.beginNoDispatchOperation(input, NO_DISPATCH)).toThrow("cannot become");
-		expect(service.getOperation(existing.id)).toEqual(existing);
+		expect(await service.getOperation(existing.id)).toEqual(existing);
 	});
 
 	test("failure linking the tool row rolls back the zero-effect evidence insertion", () => {
@@ -705,7 +705,7 @@ describe("explicit no-dispatch file-tool evidence", () => {
 });
 
 describe("durable scope and operation identity", () => {
-	test("Bash path coordination never claims historical root verification", () => {
+	test("Bash path coordination never claims historical root verification", async () => {
 		const input = {
 			sourceInstanceId: source,
 			deviceId: "local",
@@ -727,7 +727,7 @@ describe("durable scope and operation identity", () => {
 				rootIdentity: { object: "invented-continuity" },
 			}),
 		).toThrow("not historical identity");
-		expect(service.getScope(bucket.id)?.rootIdentityJson).toBeNull();
+		expect((await service.getScope(bucket.id))?.rootIdentityJson).toBeNull();
 		const operation = service.beginOperation(operationInput());
 		const original = scope;
 		scope = bucket;
@@ -749,7 +749,7 @@ describe("durable scope and operation identity", () => {
 		expect(effect?.observedAfterStateJson).toEqual(UNKNOWN);
 		expect(effect?.outcome).toBe("pending");
 		await expect(service.finalizePreparation(operation.id)).rejects.toThrow("not verified");
-		expect(service.getOperation(operation.id)?.settlement).toBe("preparing");
+		expect((await service.getOperation(operation.id))?.settlement).toBe("preparing");
 		if (effect) expect(() => apply(effect)).toThrow("intent must be durable");
 	});
 
@@ -785,16 +785,16 @@ describe("durable scope and operation identity", () => {
 		["an unsettled mutation", { activeMutationCount: 1 }],
 		["a previously verified scope awaiting recovery", { status: "needs_verification" }],
 	] as const) {
-		test(`root re-verification cannot clear ${name}`, () => {
+		test(`root re-verification cannot clear ${name}`, async () => {
 			activate();
 			db.update(fileChangeScopes).set(patch).where(eq(fileChangeScopes.id, scope.id)).run();
-			const before = service.getScope(scope.id);
+			const before = await service.getScope(scope.id);
 			expect(() => activate()).toThrow("require recovery");
-			expect(service.getScope(scope.id)).toEqual(before);
+			expect(await service.getScope(scope.id)).toEqual(before);
 		});
 	}
 
-	test("verification metadata must fit the complete scope row, not just the new fields", () => {
+	test("verification metadata must fit the complete scope row, not just the new fields", async () => {
 		const longRoot = `/${"r".repeat(2900)}`;
 		const largeScope = service.prepareScope({
 			sourceInstanceId: source,
@@ -813,8 +813,8 @@ describe("durable scope and operation identity", () => {
 				rootIdentity,
 			}),
 		).toThrow("row budget");
-		expect(service.getScope(largeScope.id)?.status).toBe("needs_verification");
-		expect(service.getScope(largeScope.id)?.rootIdentityJson).toBeNull();
+		expect((await service.getScope(largeScope.id))?.status).toBe("needs_verification");
+		expect((await service.getScope(largeScope.id))?.rootIdentityJson).toBeNull();
 	});
 
 	test("device and recreated workspace instances remain distinct", () => {
@@ -855,17 +855,17 @@ describe("durable scope and operation identity", () => {
 			.set({ requestDigest: null, expectedEffectCount: null })
 			.where(eq(fileChangeOperations.id, op.id))
 			.run();
-		expect(service.getOperation(op.id)?.requestDigest).toBeNull();
+		expect((await service.getOperation(op.id))?.requestDigest).toBeNull();
 		await expect(service.finalizePreparation(op.id)).rejects.toThrow("Pre-journal");
 		expect(() => service.prepareEffects(op.id, [effectInput()])).toThrow("Pre-journal");
 		expect(
-			service
-				.listPendingOperations({ settlement: "preparing" })
-				.items.some((item) => item.id === op.id),
+			(await service.listPendingOperations({ settlement: "preparing" })).items.some(
+				(item) => item.id === op.id,
+			),
 		).toBe(true);
 	});
 
-	test("raw body fields, null absence and oversized metadata are rejected", () => {
+	test("raw body fields, null absence and oversized metadata are rejected", async () => {
 		expect(() =>
 			service.beginOperation(operationInput({ actor: { ...actor, label: "x".repeat(513) } })),
 		).toThrow();
@@ -883,20 +883,20 @@ describe("durable scope and operation identity", () => {
 				effectInput(ABSENT, { kind: "directory" } as unknown as FileChangeState),
 			]),
 		).toThrow("Unsupported file object");
-		expect(service.listEffects(op.id).items).toHaveLength(0);
+		expect((await service.listEffects(op.id)).items).toHaveLength(0);
 	});
 });
 
 describe("bounded complete preparation", () => {
-	test("unknown before/intended cannot masquerade as absent or durable intent", () => {
+	test("unknown before/intended cannot masquerade as absent or durable intent", async () => {
 		const op = service.beginOperation(operationInput());
 		for (const input of [effectInput(UNKNOWN, ABSENT), effectInput(ABSENT, UNKNOWN)])
 			expect(() => service.prepareEffects(op.id, [input])).toThrow("known before");
-		expect(service.getOperation(op.id)?.preparedEffectCount).toBe(0);
-		expect(service.getOperation(op.id)?.effectOutcome).toBe("pending");
+		expect((await service.getOperation(op.id))?.preparedEffectCount).toBe(0);
+		expect((await service.getOperation(op.id))?.effectOutcome).toBe("pending");
 	});
 
-	test("ready catalog status, namespace and exact sizes are required", () => {
+	test("ready catalog status, namespace and exact sizes are required", async () => {
 		const op = service.beginOperation(operationInput());
 		for (const status of ["staging", "missing", "expired"] as const)
 			expect(() => service.prepareEffects(op.id, [effectInput(ABSENT, known(3, status))])).toThrow(
@@ -921,10 +921,10 @@ describe("bounded complete preparation", () => {
 		expect(() => service.prepareEffects(op.id, [effectInput(ABSENT, ready)])).toThrow(
 			"reconciliation must finish",
 		);
-		expect(service.getOperation(op.id)?.evidenceBytes).toBe(0);
+		expect((await service.getOperation(op.id))?.evidenceBytes).toBe(0);
 	});
 
-	test("effect retry is immutable and does not double-count references or bytes", () => {
+	test("effect retry is immutable and does not double-count references or bytes", async () => {
 		const op = service.beginOperation(operationInput());
 		const input = effectInput(known(4), known(5));
 		const [first] = service.prepareEffects(op.id, [input]);
@@ -938,8 +938,8 @@ describe("bounded complete preparation", () => {
 			expect(() => service.prepareEffects(op.id, [{ ...input, ...changes }])).toThrow(
 				"cannot change its prepared",
 			);
-		expect(service.getOperation(op.id)?.preparedEffectCount).toBe(1);
-		expect(service.getOperation(op.id)?.evidenceBytes).toBe(9);
+		expect((await service.getOperation(op.id))?.preparedEffectCount).toBe(1);
+		expect((await service.getOperation(op.id))?.evidenceBytes).toBe(9);
 	});
 
 	test("whole expected target count must exist before intent_durable", async () => {
@@ -952,7 +952,7 @@ describe("bounded complete preparation", () => {
 		expect((await service.finalizePreparation(op.id)).settlement).toBe("intent_durable");
 		expect(() => service.prepareEffects(op.id, [effectInput(ABSENT, ABSENT, "c")])).toThrow();
 		expect(
-			service.listEffects(op.id).items.every((row) => row.settlement === "intent_durable"),
+			(await service.listEffects(op.id)).items.every((row) => row.settlement === "intent_durable"),
 		).toBe(true);
 	});
 
@@ -966,17 +966,17 @@ describe("bounded complete preparation", () => {
 				Array.from({ length: 33 }, (_, i) => effectInput(ABSENT, ABSENT, String(i))),
 			),
 		).toThrow();
-		expect(service.listEffects(op.id).items).toHaveLength(0);
+		expect((await service.listEffects(op.id)).items).toHaveLength(0);
 		const large = known(FILE_CHANGE_LIMITS.blobBytes);
 		const four = Array.from({ length: 4 }, (_, i) => effectInput(large, large, String(i)));
 		service.prepareEffects(op.id, four);
-		expect(service.getOperation(op.id)?.evidenceBytes).toBe(
+		expect((await service.getOperation(op.id))?.evidenceBytes).toBe(
 			FILE_CHANGE_LIMITS.operationEvidenceBytes,
 		);
 		expect(() => service.prepareEffects(op.id, [effectInput(ABSENT, known(1), "over")])).toThrow(
 			"over-budget evidence bytes",
 		);
-		expect(service.getOperation(op.id)?.preparedEffectCount).toBe(4);
+		expect((await service.getOperation(op.id))?.preparedEffectCount).toBe(4);
 		const oversized = known(FILE_CHANGE_LIMITS.blobBytes + 1);
 		expect(() => service.prepareEffects(op.id, [effectInput(ABSENT, oversized, "huge")])).toThrow(
 			"blob size",
@@ -999,7 +999,7 @@ describe("bounded complete preparation", () => {
 		await expect(service.finalizePreparation(operation.id)).rejects.toThrow(
 			"complete intent is not durable",
 		);
-		expect(service.getOperation(operation.id)?.settlement).toBe("preparing");
+		expect((await service.getOperation(operation.id))?.settlement).toBe("preparing");
 	});
 
 	test("prepareOperation refuses duplicate fixed targets and mismatched count", async () => {
@@ -1033,7 +1033,7 @@ describe("bounded complete preparation", () => {
 		let count = 0;
 		let cursor: FileChangeEffectCursor | undefined;
 		do {
-			const page = service.listEffects(op.id, { cursor, limit: 100 });
+			const page = await service.listEffects(op.id, { cursor, limit: 100 });
 			count += page.items.length;
 			cursor = page.nextCursor ?? undefined;
 		} while (cursor);
@@ -1052,7 +1052,7 @@ describe("bounded complete preparation", () => {
 		expect(effects[0]?.identityJson.displayPath).toBe("a\\b");
 	});
 
-	test("wrong scope, external targets and stale scope revision are rejected", () => {
+	test("wrong scope, external targets and stale scope revision are rejected", async () => {
 		const op = service.beginOperation(operationInput());
 		const input = effectInput();
 		for (const changes of [
@@ -1061,7 +1061,7 @@ describe("bounded complete preparation", () => {
 			{ identity: { ...input.identity, canonicalPath: "/outside/a.txt" } },
 		])
 			expect(() => service.prepareEffects(op.id, [{ ...input, ...changes }])).toThrow();
-		expect(service.getOperation(op.id)?.preparedEffectCount).toBe(0);
+		expect((await service.getOperation(op.id))?.preparedEffectCount).toBe(0);
 	});
 });
 
@@ -1087,7 +1087,7 @@ describe("execution and receipt settlement", () => {
 				linesRemoved: null,
 			});
 			expect(hasSettledMeasuredFileEffect(sharedEffect(result))).toBe(false);
-			expect(service.getOperation(operation.id)?.unresolvedEffectCount).toBe(0);
+			expect((await service.getOperation(operation.id))?.unresolvedEffectCount).toBe(0);
 			expect(service.settleEffect(input)).toEqual(result);
 			expect(() => service.settleEffect({ ...input, attributionCeiling: "measured" })).toThrow(
 				"cannot be overwritten",
@@ -1221,9 +1221,9 @@ describe("execution and receipt settlement", () => {
 		expect(apply(effect).mayExecute).toBe(false);
 		expect(settled.outcome).toBe("changed");
 		expect(hasSettledMeasuredFileEffect(sharedEffect(settled))).toBe(true);
-		expect(service.getOperation(operation.id)?.settlement).toBe("applying");
+		expect((await service.getOperation(operation.id))?.settlement).toBe("applying");
 		expect(service.finishOperation(operation.id, "succeeded").settlement).toBe("settled");
-		expect(service.getOperation(operation.id)?.settledEffectCount).toBe(1);
+		expect((await service.getOperation(operation.id))?.settledEffectCount).toBe(1);
 	});
 
 	test("generation and fencing drift cannot authorize a new write", async () => {
@@ -1249,7 +1249,7 @@ describe("execution and receipt settlement", () => {
 			.where(eq(fileChangeBlobs.digest, effect.intendedAfterBlobDigest))
 			.run();
 		expect(() => apply(effect)).toThrow("ready catalog");
-		expect(service.getEffect(effect.operationId, effect.mutationId)?.settlement).toBe(
+		expect((await service.getEffect(effect.operationId, effect.mutationId))?.settlement).toBe(
 			"intent_durable",
 		);
 	});
@@ -1263,9 +1263,9 @@ describe("execution and receipt settlement", () => {
 		expect(service.finishOperation(operation.id, outcome).settlement).toBe("reconcile_required");
 		const result = settle(effect);
 		expect(result.outcome).toBe("changed");
-		expect(service.getOperation(operation.id)?.executionOutcome).toBe(outcome);
-		expect(service.getOperation(operation.id)?.effectOutcome).toBe("changed");
-		expect(service.getOperation(operation.id)?.settlement).toBe("settled");
+		expect((await service.getOperation(operation.id))?.executionOutcome).toBe(outcome);
+		expect((await service.getOperation(operation.id))?.effectOutcome).toBe("changed");
+		expect((await service.getOperation(operation.id))?.settlement).toBe("settled");
 	});
 
 	test("an unchanged hash without a receipt is not successful execution or no_change", async () => {
@@ -1286,9 +1286,9 @@ describe("execution and receipt settlement", () => {
 		const { operation, effect } = await readyEffect();
 		apply(effect);
 		settle(effect, null, effect.intendedAfterStateJson);
-		expect(service.getOperation(operation.id)?.unresolvedEffectCount).toBe(1);
+		expect((await service.getOperation(operation.id))?.unresolvedEffectCount).toBe(1);
 		settle(effect);
-		expect(service.getOperation(operation.id)?.unresolvedEffectCount).toBe(0);
+		expect((await service.getOperation(operation.id))?.unresolvedEffectCount).toBe(0);
 		expect(service.finishOperation(operation.id, "succeeded").settlement).toBe("settled");
 	});
 
@@ -1335,7 +1335,7 @@ describe("execution and receipt settlement", () => {
 		expect(result.outcome).toBe("unknown");
 		expect(result.attributionGrade).toBe("observed_ambiguous");
 		expect(result.settlement).toBe("reconcile_required");
-		expect(service.getOperation(operation.id)?.evidenceBytes).toBe(12);
+		expect((await service.getOperation(operation.id))?.evidenceBytes).toBe(12);
 	});
 
 	test("confirmed not_applied is no_change for the mutation, not ownership of external bytes", async () => {
@@ -1408,7 +1408,7 @@ describe("execution and receipt settlement", () => {
 		expect(() => settle(effect, null, effect.intendedAfterStateJson)).toThrow(
 			"cannot be overwritten",
 		);
-		expect(service.getEffect(effect.operationId, effect.mutationId)).toEqual(original);
+		expect(await service.getEffect(effect.operationId, effect.mutationId)).toEqual(original);
 	});
 
 	test("receipt observation mismatch, null after and contradictory repeated lines are rejected", async () => {
@@ -1430,7 +1430,7 @@ describe("execution and receipt settlement", () => {
 		settle(effect, null, ABSENT);
 		expect(() => settle(effect)).toThrow("previously recorded observation");
 		expect(
-			service.getEffect(effect.operationId, effect.mutationId)?.observedAfterStateJson,
+			(await service.getEffect(effect.operationId, effect.mutationId))?.observedAfterStateJson,
 		).toEqual(ABSENT);
 	});
 
@@ -1440,7 +1440,7 @@ describe("execution and receipt settlement", () => {
 			...operationInput({ expectedEffectCount: 2 }),
 			effects: [effectInput(), effectInput(ABSENT, ABSENT, "b")],
 		});
-		const effects = service.listEffects(op.id).items;
+		const effects = (await service.listEffects(op.id)).items;
 		for (const effect of effects) apply(effect);
 		const [first, second] = effects;
 		if (!first || !second) throw new Error("fixture");
@@ -1468,23 +1468,25 @@ describe("durable failures, crash inventory and bounded reads", () => {
 	test("ambient transactions cannot turn savepoint release into permission to write", async () => {
 		const { operation, effect } = await readyEffect();
 		expect(() => db.transaction(() => apply(effect))).toThrow("ambient transaction");
-		expect(service.getOperation(operation.id)?.settlement).toBe("intent_durable");
-		expect(service.getEffect(operation.id, effect.mutationId)?.settlement).toBe("intent_durable");
+		expect((await service.getOperation(operation.id))?.settlement).toBe("intent_durable");
+		expect((await service.getEffect(operation.id, effect.mutationId))?.settlement).toBe(
+			"intent_durable",
+		);
 		expect(() =>
 			db.transaction((tx) => new FileChangeEvidenceService(tx as unknown as typeof db)),
 		).toThrow("root SQLite connection");
 	});
 
-	test("DB failure rolls back effect insert and counters together", () => {
+	test("DB failure rolls back effect insert and counters together", async () => {
 		const op = service.beginOperation(operationInput({ expectedEffectCount: 2 }));
 		failSql(`OLD.id = '${op.id}' AND NEW.prepared_effect_count = 2`);
 		expect(() =>
 			service.prepareEffects(op.id, [effectInput(), effectInput(ABSENT, ABSENT, "b")]),
 		).toThrow();
-		expect(service.listEffects(op.id).items).toHaveLength(0);
-		expect(service.getOperation(op.id)?.preparedEffectCount).toBe(0);
-		expect(service.getOperation(op.id)?.evidenceBytes).toBe(0);
-		expect(service.getOperation(op.id)?.settlement).toBe("preparing");
+		expect((await service.listEffects(op.id)).items).toHaveLength(0);
+		expect((await service.getOperation(op.id))?.preparedEffectCount).toBe(0);
+		expect((await service.getOperation(op.id))?.evidenceBytes).toBe(0);
+		expect((await service.getOperation(op.id))?.settlement).toBe("preparing");
 	});
 
 	test("DB failure after a preparation page preserves the incomplete operation for restart", async () => {
@@ -1494,15 +1496,15 @@ describe("durable failures, crash inventory and bounded reads", () => {
 		const inputs = Array.from({ length: count }, (_, i) => effectInput(ABSENT, ABSENT, String(i)));
 		service.prepareEffects(op.id, inputs.slice(0, FILE_CHANGE_PREPARE_BATCH_ITEMS));
 		service.prepareEffects(op.id, inputs.slice(FILE_CHANGE_PREPARE_BATCH_ITEMS));
-		const last = service.listEffects(op.id).items.at(-1);
+		const last = (await service.listEffects(op.id)).items.at(-1);
 		if (!last) throw new Error("fixture");
 		failSql(`OLD.id = '${last.id}' AND NEW.settlement = 'intent_durable'`, "file_change_effects");
 		await expect(service.finalizePreparation(op.id)).rejects.toThrow();
-		const intermediate = service.listEffects(op.id).items;
+		const intermediate = (await service.listEffects(op.id)).items;
 		expect(intermediate.filter((row) => row.settlement === "intent_durable")).toHaveLength(
 			FILE_CHANGE_PREPARE_BATCH_ITEMS,
 		);
-		expect(service.getOperation(op.id)?.settlement).toBe("preparing");
+		expect((await service.getOperation(op.id))?.settlement).toBe("preparing");
 		const first = intermediate[0];
 		if (first) expect(() => apply(first)).toThrow();
 		sqlite.run("DROP TRIGGER evidence_test_failure");
@@ -1516,7 +1518,7 @@ describe("durable failures, crash inventory and bounded reads", () => {
 		const [effect] = service.prepareEffects(op.id, [effectInput()]);
 		failSql(`OLD.id = '${op.id}' AND NEW.settlement = 'intent_durable'`);
 		await expect(service.finalizePreparation(op.id)).rejects.toThrow();
-		expect(service.getOperation(op.id)?.settlement).toBe("preparing");
+		expect((await service.getOperation(op.id))?.settlement).toBe("preparing");
 		if (effect) expect(() => apply(effect)).toThrow();
 	});
 
@@ -1524,8 +1526,10 @@ describe("durable failures, crash inventory and bounded reads", () => {
 		const { operation, effect } = await readyEffect();
 		failSql(`OLD.id = '${effect.id}' AND NEW.settlement = 'applying'`, "file_change_effects");
 		expect(() => apply(effect)).toThrow();
-		expect(service.getOperation(operation.id)?.settlement).toBe("intent_durable");
-		expect(service.getEffect(operation.id, effect.mutationId)?.settlement).toBe("intent_durable");
+		expect((await service.getOperation(operation.id))?.settlement).toBe("intent_durable");
+		expect((await service.getEffect(operation.id, effect.mutationId))?.settlement).toBe(
+			"intent_durable",
+		);
 	});
 
 	test("DB failure after receipt insert leaves applying intent and permits receipt reconciliation only", async () => {
@@ -1533,11 +1537,11 @@ describe("durable failures, crash inventory and bounded reads", () => {
 		apply(effect);
 		failSql(`OLD.id = '${operation.id}' AND NEW.settled_effect_count = 1`);
 		expect(() => settle(effect)).toThrow();
-		const old = service.getEffect(operation.id, effect.mutationId);
+		const old = await service.getEffect(operation.id, effect.mutationId);
 		expect(old?.settlement).toBe("applying");
 		expect(old?.executionReceiptJson).toBeNull();
 		expect(old?.observedAfterStateJson).toEqual(UNKNOWN);
-		expect(service.getOperation(operation.id)?.settledEffectCount).toBe(0);
+		expect((await service.getOperation(operation.id))?.settledEffectCount).toBe(0);
 		sqlite.run("DROP TRIGGER evidence_test_failure");
 		service = new FileChangeEvidenceService(db);
 		expect(apply(effect).mayExecute).toBe(false);
@@ -1553,10 +1557,12 @@ describe("durable failures, crash inventory and bounded reads", () => {
 			`CREATE TRIGGER evidence_test_failure AFTER UPDATE ON file_change_effects WHEN NEW.id = '${effect.id}' AND NEW.settlement = 'settled' BEGIN UPDATE file_change_operations SET owner_user_id = 'missing-${generateId()}' WHERE id = '${operation.id}'; END`,
 		);
 		expect(() => settle(effect)).toThrow();
-		expect(service.getOperation(operation.id)?.settledEffectCount).toBe(0);
-		expect(service.getOperation(operation.id)?.ownerUserId).toBeNull();
-		expect(service.getEffect(operation.id, effect.mutationId)?.executionReceiptDigest).toBeNull();
-		expect(service.getEffect(operation.id, effect.mutationId)?.settlement).toBe("applying");
+		expect((await service.getOperation(operation.id))?.settledEffectCount).toBe(0);
+		expect((await service.getOperation(operation.id))?.ownerUserId).toBeNull();
+		expect(
+			(await service.getEffect(operation.id, effect.mutationId))?.executionReceiptDigest,
+		).toBeNull();
+		expect((await service.getEffect(operation.id, effect.mutationId))?.settlement).toBe("applying");
 		sqlite.run("DROP TRIGGER evidence_test_failure");
 		sqlite.run("PRAGMA defer_foreign_keys = OFF");
 		expect(settle(effect).settlement).toBe("settled");
@@ -1567,10 +1573,10 @@ describe("durable failures, crash inventory and bounded reads", () => {
 		apply(effect);
 		const bad = known(5, "missing");
 		expect(() => settle(effect, receipt(effect, { observedAfter: bad }))).toThrow("ready catalog");
-		expect(service.getEffect(operation.id, effect.mutationId)?.settlement).toBe("applying");
-		expect(service.getEffect(operation.id, effect.mutationId)?.observedAfterStateJson).toEqual(
-			UNKNOWN,
-		);
+		expect((await service.getEffect(operation.id, effect.mutationId))?.settlement).toBe("applying");
+		expect(
+			(await service.getEffect(operation.id, effect.mutationId))?.observedAfterStateJson,
+		).toEqual(UNKNOWN);
 	});
 
 	test("cancellation retains every already prepared effect and never starts IO", async () => {
@@ -1582,8 +1588,8 @@ describe("durable failures, crash inventory and bounded reads", () => {
 		await expect(service.finalizePreparation(op.id, { signal: controller.signal })).rejects.toThrow(
 			"cancelled",
 		);
-		expect(service.getOperation(op.id)?.settlement).toBe("preparing");
-		expect(service.listEffects(op.id).items).toHaveLength(1);
+		expect((await service.getOperation(op.id))?.settlement).toBe("preparing");
+		expect((await service.listEffects(op.id)).items).toHaveLength(1);
 	});
 
 	test("fresh service locates preparing, durable, applying and reconciliation crash states", async () => {
@@ -1601,17 +1607,17 @@ describe("durable failures, crash inventory and bounded reads", () => {
 			["applying", applying.operation.id],
 			["reconcile_required", unresolved.operation.id],
 		] as const) {
-			const items = service.listPendingOperations({ settlement }).items;
+			const items = (await service.listPendingOperations({ settlement })).items;
 			expect(items.some((item) => item.id === id)).toBe(true);
 		}
 		expect(
-			service.getEffect(applying.operation.id, applying.effect.mutationId)?.observedAfterStateJson
-				.kind,
+			(await service.getEffect(applying.operation.id, applying.effect.mutationId))
+				?.observedAfterStateJson.kind,
 		).toBe("unknown");
-		expect(service.getEffect(preparing.id, applying.effect.mutationId)).toBeNull();
+		expect(await service.getEffect(preparing.id, applying.effect.mutationId)).toBeNull();
 	});
 
-	test("pending cursors handle identical timestamps without offset scans or dropped rows", () => {
+	test("pending cursors handle identical timestamps without offset scans or dropped rows", async () => {
 		const sameTime = new FileChangeEvidenceService(db, () => "2026-09-07T00:00:00.000Z");
 		const ids = Array.from(
 			{ length: 5 },
@@ -1620,7 +1626,11 @@ describe("durable failures, crash inventory and bounded reads", () => {
 		const found: string[] = [];
 		let cursor: FileChangeOperationCursor | undefined;
 		do {
-			const page = sameTime.listPendingOperations({ settlement: "preparing", limit: 2, cursor });
+			const page = await sameTime.listPendingOperations({
+				settlement: "preparing",
+				limit: 2,
+				cursor,
+			});
 			found.push(...page.items.map((row) => row.id));
 			cursor = page.nextCursor ?? undefined;
 			for (const row of page.items) {
@@ -1629,8 +1639,10 @@ describe("durable failures, crash inventory and bounded reads", () => {
 			}
 		} while (cursor);
 		expect(found).toEqual(ids);
-		expect(() => service.listEffects(ids[0] ?? "missing", { limit: 101 })).toThrow();
-		expect(() => service.listPendingOperations({ settlement: "applying", limit: 0 })).toThrow();
+		await expect(service.listEffects(ids[0] ?? "missing", { limit: 101 })).rejects.toThrow();
+		await expect(
+			service.listPendingOperations({ settlement: "applying", limit: 0 }),
+		).rejects.toThrow();
 	});
 
 	test("metadata pages enforce byte budget and expose continuation rather than truncating completeness", async () => {
@@ -1641,14 +1653,14 @@ describe("durable failures, crash inventory and bounded reads", () => {
 				effectInput(ABSENT, ABSENT, `${"a".repeat(1100)}-${i}`),
 			),
 		});
-		const first = service.listEffects(op.id, { limit: 100 });
+		const first = await service.listEffects(op.id, { limit: 100 });
 		expect(first.hasMore).toBe(true);
 		expect(first.items.length).toBeLessThan(70);
 		expect(Buffer.byteLength(JSON.stringify(first))).toBeLessThanOrEqual(
 			FILE_CHANGE_LIMITS.summaryBytes,
 		);
 		if (!first.nextCursor) throw new Error("Missing cursor");
-		const second = service.listEffects(op.id, { limit: 100, cursor: first.nextCursor });
+		const second = await service.listEffects(op.id, { limit: 100, cursor: first.nextCursor });
 		expect(first.items.length + second.items.length).toBe(70);
 		expect(second.hasMore).toBe(false);
 	});

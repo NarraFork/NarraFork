@@ -15,6 +15,7 @@
  */
 import { db } from "@server/db";
 import { userPreferences, users } from "@server/db/schema";
+import { readQuery } from "@server/db/worker-read";
 import { eq, sql } from "drizzle-orm";
 import { updateLegacyGitIdentityProfile } from "../git-identities";
 import type { AccountRole } from "../registration/account-store";
@@ -32,10 +33,13 @@ function asRole(role: string): AccountRole {
 
 export const sqliteAuthSessionStore: AuthSessionStore = {
 	async findLoginCredential(username: string): Promise<LoginCredential | null> {
-		const row = await db.query.users.findFirst({
-			where: eq(users.username, username),
-			columns: { id: true, passwordHash: true, mfaEnabled: true },
-		});
+		const row = await readQuery(
+			db.query.users.findFirst({
+				where: eq(users.username, username),
+				columns: { id: true, passwordHash: true, mfaEnabled: true },
+			}),
+			{ site: "server/services/auth/sqlite-session-store.read" },
+		);
 		return row ?? null;
 	},
 
@@ -51,10 +55,13 @@ export const sqliteAuthSessionStore: AuthSessionStore = {
 	},
 
 	async findSessionState(userId: string): Promise<SessionState | null> {
-		const row = await db.query.users.findFirst({
-			where: eq(users.id, userId),
-			columns: { id: true, role: true, tokenVersion: true },
-		});
+		const row = await readQuery(
+			db.query.users.findFirst({
+				where: eq(users.id, userId),
+				columns: { id: true, role: true, tokenVersion: true },
+			}),
+			{ site: "server/services/auth/sqlite-session-store.read" },
+		);
 		if (!row) return null;
 		return { id: row.id, role: asRole(row.role), tokenVersion: row.tokenVersion };
 	},
@@ -62,33 +69,39 @@ export const sqliteAuthSessionStore: AuthSessionStore = {
 	async findSessionProfile(userId: string): Promise<SessionProfile | null> {
 		// One LEFT JOIN instead of the pre-port pair of findFirsts: the preferences row
 		// belongs to the account, and reading them together is the same observation.
-		const rows = await db
-			.select({
-				id: users.id,
-				username: users.username,
-				role: users.role,
-				avatarColor: users.avatarColor,
-				avatarImageId: users.avatarImageId,
-				gitUsername: users.gitUsername,
-				gitEmail: users.gitEmail,
-				createdAt: users.createdAt,
-				tokenVersion: users.tokenVersion,
-				language: userPreferences.language,
-			})
-			.from(users)
-			.leftJoin(userPreferences, eq(userPreferences.userId, users.id))
-			.where(eq(users.id, userId))
-			.limit(1);
+		const rows = await readQuery(
+			db
+				.select({
+					id: users.id,
+					username: users.username,
+					role: users.role,
+					avatarColor: users.avatarColor,
+					avatarImageId: users.avatarImageId,
+					gitUsername: users.gitUsername,
+					gitEmail: users.gitEmail,
+					createdAt: users.createdAt,
+					tokenVersion: users.tokenVersion,
+					language: userPreferences.language,
+				})
+				.from(users)
+				.leftJoin(userPreferences, eq(userPreferences.userId, users.id))
+				.where(eq(users.id, userId))
+				.limit(1),
+			{ site: "server/services/auth/sqlite-session-store.read" },
+		);
 		const row = rows[0];
 		if (!row) return null;
 		return { ...row, role: asRole(row.role) };
 	},
 
 	async findPasswordHash(userId: string): Promise<string | null> {
-		const row = await db.query.users.findFirst({
-			where: eq(users.id, userId),
-			columns: { passwordHash: true },
-		});
+		const row = await readQuery(
+			db.query.users.findFirst({
+				where: eq(users.id, userId),
+				columns: { passwordHash: true },
+			}),
+			{ site: "server/services/auth/sqlite-session-store.read" },
+		);
 		return row?.passwordHash ?? null;
 	},
 

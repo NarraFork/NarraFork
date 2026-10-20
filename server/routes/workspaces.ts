@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 import { WORKSPACE_PANEL_CONFIG_MAX_BYTES } from "@shared/workspace-panels";
 import { and, asc, desc, eq, gt, inArray, sql } from "drizzle-orm";
 import type { Context } from "hono";
@@ -116,19 +117,21 @@ async function readWorkspaceJson(c: Context): Promise<unknown> {
 // full layout is read only by `GET /workspaces/:id`.
 workspaceRoutes.get("/", async (c) => {
 	const userId = c.get("user").sub;
-	const rows = await db
-		.select({
-			id: workspaces.id,
-			userId: workspaces.userId,
-			title: workspaces.title,
-			treeBytes: sql<number>`length(cast(${workspaces.tree} as blob))`,
-			createdAt: workspaces.createdAt,
-			updatedAt: workspaces.updatedAt,
-		})
-		.from(workspaces)
-		.where(eq(workspaces.userId, userId))
-		.orderBy(desc(workspaces.updatedAt))
-		.limit(WORKSPACE_LIST_LIMIT);
+	const rows = await readQuery(
+		db
+			.select({
+				id: workspaces.id,
+				userId: workspaces.userId,
+				title: workspaces.title,
+				treeBytes: sql<number>`length(cast(${workspaces.tree} as blob))`,
+				createdAt: workspaces.createdAt,
+				updatedAt: workspaces.updatedAt,
+			})
+			.from(workspaces)
+			.where(eq(workspaces.userId, userId))
+			.orderBy(desc(workspaces.updatedAt))
+			.limit(WORKSPACE_LIST_LIMIT),
+	);
 	return c.json(rows);
 });
 
@@ -146,9 +149,11 @@ workspaceRoutes.get("/", async (c) => {
 workspaceRoutes.get("/:id", async (c) => {
 	const userId = c.get("user").sub;
 	const id = c.req.param("id");
-	const ws = await db.query.workspaces.findFirst({
-		where: and(eq(workspaces.id, id), eq(workspaces.userId, userId)),
-	});
+	const ws = await readQuery(
+		db.query.workspaces.findFirst({
+			where: and(eq(workspaces.id, id), eq(workspaces.userId, userId)),
+		}),
+	);
 	if (!ws) throw new NotFoundError("Workspace", id);
 	// Materialises membership on first read for a workspace that predates the table.
 	const panels = await listWorkspacePanels(userId, id);
@@ -259,9 +264,11 @@ workspaceRoutes.patch("/:id", workspaceWriteBodyLimit, async (c) => {
 	const parsed = updateWorkspaceSchema.safeParse(await readWorkspaceJson(c));
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 
-	const ws = await db.query.workspaces.findFirst({
-		where: and(eq(workspaces.id, id), eq(workspaces.userId, userId)),
-	});
+	const ws = await readQuery(
+		db.query.workspaces.findFirst({
+			where: and(eq(workspaces.id, id), eq(workspaces.userId, userId)),
+		}),
+	);
 	if (!ws) throw new NotFoundError("Workspace", id);
 
 	// Title only. The layout is written exclusively by `PUT /:id/layout`, which guards it
@@ -286,9 +293,11 @@ workspaceRoutes.delete("/:id", async (c) => {
 	const userId = c.get("user").sub;
 	const id = c.req.param("id");
 
-	const ws = await db.query.workspaces.findFirst({
-		where: and(eq(workspaces.id, id), eq(workspaces.userId, userId)),
-	});
+	const ws = await readQuery(
+		db.query.workspaces.findFirst({
+			where: and(eq(workspaces.id, id), eq(workspaces.userId, userId)),
+		}),
+	);
 	if (!ws) throw new NotFoundError("Workspace", id);
 
 	// Remove the authoritative header first so children are released and clients receive a delta.
@@ -296,10 +305,12 @@ workspaceRoutes.delete("/:id", async (c) => {
 	// Keep DELETE semantics for legacy/inconsistent rows that had no recent-tab header.
 	// `removeRecentTab` may already have deleted the row (announcing it in the
 	// process); announce only when THIS delete is the one that lands.
-	const remaining = await db.query.workspaces.findFirst({
-		where: eq(workspaces.id, id),
-		columns: { id: true },
-	});
+	const remaining = await readQuery(
+		db.query.workspaces.findFirst({
+			where: eq(workspaces.id, id),
+			columns: { id: true },
+		}),
+	);
 	if (remaining) {
 		await db.delete(workspaces).where(eq(workspaces.id, id));
 		// A device with this workspace still open navigates away on this signal; its
@@ -320,21 +331,24 @@ export async function dissolveOrphanWorkspaces(): Promise<number> {
 	let removed = 0;
 
 	while (true) {
-		const rows = await db
-			.select({ id: workspaces.id, userId: workspaces.userId })
-			.from(workspaces)
-			.where(cursor ? gt(workspaces.id, cursor) : undefined)
-			.orderBy(asc(workspaces.id))
-			.limit(batchSize);
+		const rows = await readQuery(
+			db
+				.select({ id: workspaces.id, userId: workspaces.userId })
+				.from(workspaces)
+				.where(cursor ? gt(workspaces.id, cursor) : undefined)
+				.orderBy(asc(workspaces.id))
+				.limit(batchSize),
+		);
 		if (rows.length === 0) break;
 		cursor = rows.at(-1)?.id;
 
 		for (const userId of new Set(rows.map((row) => row.userId))) {
 			await ensureMigrated(userId);
 		}
-		const orphanIds = rows
-			.filter((row) => !hasRecentTab(row.userId, `workspace:${row.id}`))
-			.map((row) => row.id);
+		const referenced = await Promise.all(
+			rows.map((row) => hasRecentTab(row.userId, `workspace:${row.id}`)),
+		);
+		const orphanIds = rows.filter((_, index) => !referenced[index]).map((row) => row.id);
 		if (orphanIds.length > 0) {
 			await db.delete(workspaces).where(inArray(workspaces.id, orphanIds));
 			removed += orphanIds.length;

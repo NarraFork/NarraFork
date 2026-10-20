@@ -1,4 +1,5 @@
 import { db } from "../db";
+import { readQuery } from "../db/worker-read";
 import { knowledgeService } from "./knowledge-service";
 import { searchStore } from "./search/backend";
 import { canUseIndex, sanitizeQuery } from "./search/query";
@@ -88,10 +89,13 @@ function scoreFromRank(rank: number | null, fallback: number): number {
 async function collectionNameMap(collectionIds: string[]): Promise<Map<string, string>> {
 	const ids = [...new Set(collectionIds.filter(Boolean))];
 	if (ids.length === 0) return new Map();
-	const rows = await db.query.knowledgeCollections.findMany({
-		where: (c, { inArray }) => inArray(c.id, ids),
-		columns: { id: true, name: true },
-	});
+	const rows = await readQuery(
+		db.query.knowledgeCollections.findMany({
+			where: (c, { inArray }) => inArray(c.id, ids),
+			columns: { id: true, name: true },
+		}),
+		{ site: "search.collectionNames" },
+	);
 	return new Map(rows.map((r) => [r.id, r.name]));
 }
 

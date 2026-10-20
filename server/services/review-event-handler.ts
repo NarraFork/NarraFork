@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 /**
  * Review event handler — writes a concluded review into the source chapter's history.
  *
@@ -90,22 +91,26 @@ export function initReviewEventHandler(): void {
 	eventBus.on("review:concluded", async (event) => {
 		try {
 			// 1. Fetch the latest conclusion for this review chapter
-			const conclusion = await db.query.reviewConclusions.findFirst({
-				where: eq(reviewConclusions.reviewChapterId, event.reviewChapterId),
-				orderBy: [desc(reviewConclusions.createdAt)],
-			});
+			const conclusion = await readQuery(
+				db.query.reviewConclusions.findFirst({
+					where: eq(reviewConclusions.reviewChapterId, event.reviewChapterId),
+					orderBy: [desc(reviewConclusions.createdAt)],
+				}),
+			);
 			if (!conclusion) {
 				// No structured conclusion yet (review concluded without ConcludeReview tool)
 				return;
 			}
 
 			// 2. Find the source chapter's primary narrator
-			const sourceNarrator = await db.query.narrators.findFirst({
-				where: and(
-					eq(narrators.chapterId, event.sourceChapterId),
-					eq(narrators.variant, "primary"),
-				),
-			});
+			const sourceNarrator = await readQuery(
+				db.query.narrators.findFirst({
+					where: and(
+						eq(narrators.chapterId, event.sourceChapterId),
+						eq(narrators.variant, "primary"),
+					),
+				}),
+			);
 			if (!sourceNarrator) {
 				logger.debug("No primary narrator for source chapter, skipping feedback injection", {
 					sourceChapterId: event.sourceChapterId,

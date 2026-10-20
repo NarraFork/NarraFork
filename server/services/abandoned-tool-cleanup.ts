@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 /**
  * Cleanup for tool-call rows that never reached execution.
  *
@@ -68,24 +69,26 @@ export async function cleanupAbandonedToolCalls(
 		options.livePendingToolCallIds ??
 		new Set([...pendingPermissions.keys()].filter((id) => typeof id === "string"));
 
-	const candidates = await db
-		.select({
-			id: narratorToolCalls.id,
-			narratorId: narratorToolCalls.narratorId,
-			toolName: narratorToolCalls.toolName,
-			status: narratorToolCalls.status,
-			createdAt: narratorToolCalls.createdAt,
-			executionStartedAt: narratorToolCalls.executionStartedAt,
-		})
-		.from(narratorToolCalls)
-		.where(
-			and(
-				inArray(narratorToolCalls.status, [...NON_TERMINAL_STATUSES]),
-				isNull(narratorToolCalls.executionStartedAt),
-				lt(narratorToolCalls.createdAt, cutoff),
-			),
-		)
-		.limit(5_000);
+	const candidates = await readQuery(
+		db
+			.select({
+				id: narratorToolCalls.id,
+				narratorId: narratorToolCalls.narratorId,
+				toolName: narratorToolCalls.toolName,
+				status: narratorToolCalls.status,
+				createdAt: narratorToolCalls.createdAt,
+				executionStartedAt: narratorToolCalls.executionStartedAt,
+			})
+			.from(narratorToolCalls)
+			.where(
+				and(
+					inArray(narratorToolCalls.status, [...NON_TERMINAL_STATUSES]),
+					isNull(narratorToolCalls.executionStartedAt),
+					lt(narratorToolCalls.createdAt, cutoff),
+				),
+			)
+			.limit(5_000),
+	);
 
 	let cleaned = 0;
 	let skippedLive = 0;

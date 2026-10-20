@@ -243,7 +243,7 @@ test("child list and summary never materialize the full staging document", async
 	await Bun.write(path, "must not parse this full document in a summary");
 	try {
 		for (const messages of [
-			getBufferedMessages("child"),
+			await getBufferedMessages("child"),
 			await getBufferedMessagesAsync("child"),
 		]) {
 			expect(toBufferSummary(messages)[0]?.hasComposerDocument).toBe(true);
@@ -566,7 +566,7 @@ test("explicit Send and user input behind a broadcast still authorize the correc
 test("broadcast arriving during the publication barrier cannot authorize a deferred wake", async () => {
 	const { runtimePublication } = await import("../agent-runtime/publication");
 	let publication: ReturnType<typeof inbox.enqueueInboxAgent> | undefined;
-	const flush = spyOn(runtimePublication, "flushRecipient").mockImplementation((id) => {
+	const flush = spyOn(runtimePublication, "flushRecipient").mockImplementation(async (id) => {
 		const d = delivery(id);
 		// SQLite admission commits synchronously; the facade wraps that result in a Promise.
 		publication = inbox.enqueueInboxAgent(d, d.text, { isBroadcast: true });
@@ -618,7 +618,7 @@ test("source receipt is mandatory; exact retry returns original navigation and n
 	const retry = { ...d, recipientMessageId: "discarded-new-id", text: "x".repeat(300_000) };
 	expect((await inbox.enqueueInboxAgent(retry, retry.text)).status).toBe("duplicate");
 	expect(retry.recipientMessageId).toBe(d.recipientMessageId);
-	expect(inbox.runtimeInbox.list("child")).toHaveLength(1);
+	expect(await inbox.runtimeInbox.list("child")).toHaveLength(1);
 	await expect(
 		inbox.enqueueInboxAgent({ ...d, senderToolCallBinding: undefined }, d.text),
 	).rejects.toThrow("receipt");
@@ -642,8 +642,8 @@ test("user barrier and editing are shared; agent messages cannot be edited throu
 		await inbox.claimInboxHead("child", (row) => row.kind === "agent_message"),
 	).toBeUndefined();
 	expect(await updateBufferedMessage("child", agentInput.id, "forged user")).toBe(false);
-	expect(getBufferedMessages("child").map((m) => m.id)).toEqual([user.id]);
-	clearBufferedMessages("child");
+	expect((await getBufferedMessages("child")).map((m) => m.id)).toEqual([user.id]);
+	await clearBufferedMessages("child");
 	expect(state(user.id)?.state).toBe("cancelled");
 	expect(state(agentInput.id)?.state).toBe("queued");
 	expect((await inbox.claimInboxHead("child", () => true))?.claimEpoch).toBe(owner?.epoch);

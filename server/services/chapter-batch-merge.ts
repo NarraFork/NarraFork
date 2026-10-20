@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 import { formatOriginLabel } from "@shared/message-origin";
 import { and, asc, eq, gt, inArray } from "drizzle-orm";
 import { db } from "../db";
@@ -361,9 +362,11 @@ export const chapterBatchMerge = {
 		if (!target) throw new NotFoundError("Chapter", targetChapterId);
 		if (!target.worktreePath) throw new ValidationError("Target chapter has no worktree");
 
-		let narrator = await db.query.narrators.findFirst({
-			where: and(eq(narrators.chapterId, targetChapterId), eq(narrators.variant, "primary")),
-		});
+		let narrator = await readQuery(
+			db.query.narrators.findFirst({
+				where: and(eq(narrators.chapterId, targetChapterId), eq(narrators.variant, "primary")),
+			}),
+		);
 		if (!narrator) {
 			narrator = await narratorService.create({
 				chapterId: targetChapterId,
@@ -401,9 +404,11 @@ export const chapterBatchMerge = {
 		// `processQueue` below stays fire-and-forget and never acquires this lock, so
 		// holding it here cannot deadlock against the resume path.
 		await mergeDecisionLock.acquire(mergeSessionId, async () => {
-			const session = await db.query.mergeSessions.findFirst({
-				where: eq(mergeSessions.id, mergeSessionId),
-			});
+			const session = await readQuery(
+				db.query.mergeSessions.findFirst({
+					where: eq(mergeSessions.id, mergeSessionId),
+				}),
+			);
 			if (!session) {
 				logger.warn("Merge decision for unknown session", { mergeSessionId });
 				return;
@@ -632,9 +637,11 @@ export const chapterBatchMerge = {
 
 	/** Get a merge session by ID. */
 	async getSession(mergeSessionId: string) {
-		return db.query.mergeSessions.findFirst({
-			where: eq(mergeSessions.id, mergeSessionId),
-		});
+		return readQuery(
+			db.query.mergeSessions.findFirst({
+				where: eq(mergeSessions.id, mergeSessionId),
+			}),
+		);
 	},
 
 	/**
@@ -660,23 +667,28 @@ export const chapterBatchMerge = {
 		let cleaned = 0;
 
 		for (;;) {
-			const batch = await db
-				.select({
-					id: mergeSessions.id,
-					targetChapterId: mergeSessions.targetChapterId,
-					status: mergeSessions.status,
-					preMergeTree: mergeSessions.preMergeTree,
-					conflictTree: mergeSessions.conflictTree,
-					preMergeTargetSha: mergeSessions.preMergeTargetSha,
-				})
-				.from(mergeSessions)
-				.where(
-					cursor
-						? and(inArray(mergeSessions.status, staleStatusList), gt(mergeSessions.id, cursor))
-						: inArray(mergeSessions.status, staleStatusList),
-				)
-				.orderBy(asc(mergeSessions.id))
-				.limit(STALE_MERGE_BATCH_LIMIT);
+			const batch: Pick<
+				typeof mergeSessions.$inferSelect,
+				"id" | "targetChapterId" | "status" | "preMergeTree" | "conflictTree" | "preMergeTargetSha"
+			>[] = await readQuery(
+				db
+					.select({
+						id: mergeSessions.id,
+						targetChapterId: mergeSessions.targetChapterId,
+						status: mergeSessions.status,
+						preMergeTree: mergeSessions.preMergeTree,
+						conflictTree: mergeSessions.conflictTree,
+						preMergeTargetSha: mergeSessions.preMergeTargetSha,
+					})
+					.from(mergeSessions)
+					.where(
+						cursor
+							? and(inArray(mergeSessions.status, staleStatusList), gt(mergeSessions.id, cursor))
+							: inArray(mergeSessions.status, staleStatusList),
+					)
+					.orderBy(asc(mergeSessions.id))
+					.limit(STALE_MERGE_BATCH_LIMIT),
+			);
 
 			if (batch.length === 0) break;
 			cursor = batch[batch.length - 1].id;

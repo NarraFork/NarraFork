@@ -1,4 +1,5 @@
 import { readdir } from "node:fs/promises";
+import { readQuery } from "@server/db/worker-read";
 import { and, eq, isNull } from "drizzle-orm";
 import { db } from "../db";
 import { chapters, narrators, terminals } from "../db/schema";
@@ -10,6 +11,7 @@ import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { envWithAmbientProxy } from "../lib/net/proxy-env";
 import { getHome, IS_WINDOWS } from "../lib/platform";
+import { waitForShutdownWork } from "../lib/shutdown-activity";
 import { BufferManager } from "../terminal/buffer-manager";
 import {
 	dtachService,
@@ -138,6 +140,30 @@ interface ActiveTerminal {
 }
 
 const activeTerminals = new Map<string, ActiveTerminal>();
+// Only running observer tails belong here, not the lifetime of a detached shell.
+const exitObservers = new Set<Promise<void>>();
+let shutdownStarted = false;
+let observerFailure: { error: unknown } | undefined;
+
+function observeTerminalExit(
+	runtime: TerminalRuntime,
+	onExit: (code: number | null) => Promise<void>,
+) {
+	void runtime.exited.then(
+		(code) => {
+			const work = onExit(code).catch((error: unknown) => {
+				if (shutdownStarted) observerFailure ??= { error };
+				logger.error("Terminal exit observer failed", { error: String(error) });
+			});
+			exitObservers.add(work);
+			void work.then(() => exitObservers.delete(work));
+		},
+		(error: unknown) => {
+			if (shutdownStarted) observerFailure ??= { error };
+			logger.error("Terminal exit observation failed", { error: String(error) });
+		},
+	);
+}
 
 /**
  * Mark a terminal as exited in DB and emit the lifecycle event.
@@ -160,10 +186,12 @@ async function markTerminalExited(
 	let nId = narratorId;
 	let cId = chapterId;
 	if (nId === undefined || cId === undefined) {
-		const row = await db.query.terminals.findFirst({
-			where: eq(terminals.id, terminalId),
-			columns: { narratorId: true, chapterId: true },
-		});
+		const row = await readQuery(
+			db.query.terminals.findFirst({
+				where: eq(terminals.id, terminalId),
+				columns: { narratorId: true, chapterId: true },
+			}),
+		);
 		if (row) {
 			if (nId === undefined) nId = row.narratorId;
 			if (cId === undefined) cId = row.chapterId;
@@ -197,13 +225,13 @@ function monitorAttachProcess(
 	narratorId?: string | null,
 	chapterId?: string | null,
 ) {
-	runtime.exited.then(async (code) => {
+	observeTerminalExit(runtime, async (code) => {
 		const active = activeTerminals.get(terminalId);
 		if (!active) return;
 
 		if (await dtachService.isSocketAlive(terminalId)) {
 			// Detached — save buffer, remove from active. Will re-attach on demand.
-			active.buffer.saveToDisk();
+			await active.buffer.saveToDisk();
 			active.runtime.close();
 			activeTerminals.delete(terminalId);
 			logger.info("dtach attach process exited, session still alive", { terminalId });
@@ -248,9 +276,11 @@ export const terminalService = {
 		}
 
 		if (chapterId) {
-			const chapter = await db.query.chapters.findFirst({
-				where: eq(chapters.id, chapterId),
-			});
+			const chapter = await readQuery(
+				db.query.chapters.findFirst({
+					where: eq(chapters.id, chapterId),
+				}),
+			);
 			if (!chapter) throw new NotFoundError("Chapter", chapterId);
 			if (!chapter.worktreePath) {
 				throw new ValidationError("Chapter has no worktree (dormant?)");
@@ -258,17 +288,21 @@ export const terminalService = {
 			projectId = chapter.projectId;
 			cwd = chapter.worktreePath;
 		} else if (narratorId) {
-			const narrator = await db.query.narrators.findFirst({
-				where: eq(narrators.id, narratorId),
-			});
+			const narrator = await readQuery(
+				db.query.narrators.findFirst({
+					where: eq(narrators.id, narratorId),
+				}),
+			);
 			if (!narrator) throw new NotFoundError("Narrator", narratorId);
 			if (!hasExplicitDevice && narrator.defaultDeviceId && narrator.defaultDeviceId !== "local") {
 				deviceId = narrator.defaultDeviceId;
 			}
 			if (narrator.chapterId) {
-				const chapter = await db.query.chapters.findFirst({
-					where: eq(chapters.id, narrator.chapterId),
-				});
+				const chapter = await readQuery(
+					db.query.chapters.findFirst({
+						where: eq(chapters.id, narrator.chapterId),
+					}),
+				);
 				projectId = chapter?.projectId ?? null;
 				logger.info("Terminal CWD resolution (chapter-bound narrator)", {
 					narratorId,
@@ -413,7 +447,7 @@ export const terminalService = {
 			monitorAttachProcess(id, runtime, narratorId ?? null, chapterId ?? null);
 		} else {
 			// Direct mode: process exit means the shell exited
-			runtime.exited.then(async (code) => {
+			observeTerminalExit(runtime, async (code) => {
 				const active = activeTerminals.get(id);
 				if (!active) return;
 				await active.buffer.dispose();
@@ -504,41 +538,51 @@ export const terminalService = {
 	},
 
 	async rename(terminalId: string, name: string) {
-		const terminal = await db.query.terminals.findFirst({
-			where: eq(terminals.id, terminalId),
-		});
+		const terminal = await readQuery(
+			db.query.terminals.findFirst({
+				where: eq(terminals.id, terminalId),
+			}),
+		);
 		if (!terminal) throw new NotFoundError("Terminal", terminalId);
 		assertLegacyRuntimeOwner(terminal);
 		await db.update(terminals).set({ name }).where(eq(terminals.id, terminalId));
 	},
 
 	async getById(id: string) {
-		const terminal = await db.query.terminals.findFirst({
-			where: eq(terminals.id, id),
-		});
+		const terminal = await readQuery(
+			db.query.terminals.findFirst({
+				where: eq(terminals.id, id),
+			}),
+		);
 		if (!terminal) throw new NotFoundError("Terminal", id);
 		assertLegacyRuntimeOwner(terminal);
 		return terminal;
 	},
 
 	async listByChapter(chapterId: string) {
-		return db.query.terminals.findMany({
-			where: and(eq(terminals.chapterId, chapterId), isNull(terminals.worktreeResourceId)),
-		});
+		return readQuery(
+			db.query.terminals.findMany({
+				where: and(eq(terminals.chapterId, chapterId), isNull(terminals.worktreeResourceId)),
+			}),
+		);
 	},
 
 	async listByNarrator(narratorId: string) {
-		return db.query.terminals.findMany({
-			where: and(eq(terminals.narratorId, narratorId), isNull(terminals.worktreeResourceId)),
-		});
+		return readQuery(
+			db.query.terminals.findMany({
+				where: and(eq(terminals.narratorId, narratorId), isNull(terminals.worktreeResourceId)),
+			}),
+		);
 	},
 
 	/** List all terminals (admin use) */
 	async listAll() {
-		return db.query.terminals.findMany({
-			where: isNull(terminals.worktreeResourceId),
-			orderBy: (t, { desc }) => [desc(t.createdAt)],
-		});
+		return readQuery(
+			db.query.terminals.findMany({
+				where: isNull(terminals.worktreeResourceId),
+				orderBy: (t, { desc }) => [desc(t.createdAt)],
+			}),
+		);
 	},
 
 	/** Find orphan dtach sockets — sockets on disk with no matching running terminal in DB */
@@ -553,10 +597,12 @@ export const terminalService = {
 				const match = file.match(/^terminal-(.+)\.sock$/);
 				if (!match) continue;
 				const terminalId = match[1];
-				const tracked = await db.query.terminals.findFirst({
-					where: eq(terminals.id, terminalId),
-					columns: { worktreeResourceId: true },
-				});
+				const tracked = await readQuery(
+					db.query.terminals.findFirst({
+						where: eq(terminals.id, terminalId),
+						columns: { worktreeResourceId: true },
+					}),
+				);
 				if (tracked?.worktreeResourceId != null) continue;
 				const socketPath = dtachService.getSocketPath(terminalId);
 				// Check if the socket is alive but terminal is not in activeTerminals
@@ -575,7 +621,9 @@ export const terminalService = {
 
 	/** Kill an orphan dtach socket that has no DB record */
 	async killOrphanSocket(terminalId: string) {
-		const existing = await db.query.terminals.findFirst({ where: eq(terminals.id, terminalId) });
+		const existing = await readQuery(
+			db.query.terminals.findFirst({ where: eq(terminals.id, terminalId) }),
+		);
 		if (existing) assertLegacyRuntimeOwner(existing);
 		await dtachService.killSession(terminalId);
 		// Clean up buffer file if any
@@ -598,10 +646,12 @@ export const terminalService = {
 		if (activeTerminals.has(terminalId)) return;
 		if (!(await dtachService.isAvailable())) return;
 
-		const terminal = await db.query.terminals.findFirst({
-			where: eq(terminals.id, terminalId),
-			columns: { id: true, status: true, dtachSocket: true, worktreeResourceId: true },
-		});
+		const terminal = await readQuery(
+			db.query.terminals.findFirst({
+				where: eq(terminals.id, terminalId),
+				columns: { id: true, status: true, dtachSocket: true, worktreeResourceId: true },
+			}),
+		);
 		if (!terminal || terminal.status !== "running" || !terminal.dtachSocket) return;
 		if (terminal.worktreeResourceId != null) return;
 
@@ -618,9 +668,11 @@ export const terminalService = {
 	 * Returns true if successfully re-attached.
 	 */
 	async reattach(terminalId: string): Promise<boolean> {
-		const terminal = await db.query.terminals.findFirst({
-			where: eq(terminals.id, terminalId),
-		});
+		const terminal = await readQuery(
+			db.query.terminals.findFirst({
+				where: eq(terminals.id, terminalId),
+			}),
+		);
 		if (!terminal) return false;
 		assertLegacyRuntimeOwner(terminal);
 		if (activeTerminals.has(terminalId)) return true; // already attached
@@ -662,7 +714,9 @@ export const terminalService = {
 	 * Creates a DB record and attaches. Returns the new terminal record.
 	 */
 	async reattachOrphan(terminalId: string): Promise<unknown> {
-		const existing = await db.query.terminals.findFirst({ where: eq(terminals.id, terminalId) });
+		const existing = await readQuery(
+			db.query.terminals.findFirst({ where: eq(terminals.id, terminalId) }),
+		);
 		if (existing) assertLegacyRuntimeOwner(existing);
 		if (!(await dtachService.isAvailable()) || !(await dtachService.isSocketAlive(terminalId))) {
 			throw new AppError("dtach socket not alive", 500);
@@ -695,7 +749,7 @@ export const terminalService = {
 		const success = await this.reattach(id);
 		if (!success) throw new AppError("Failed to reattach", 500);
 
-		return db.query.terminals.findFirst({ where: eq(terminals.id, id) });
+		return readQuery(db.query.terminals.findFirst({ where: eq(terminals.id, id) }));
 	},
 
 	async getScrollback(
@@ -731,9 +785,11 @@ export const terminalService = {
 	async recoverOnStartup() {
 		if (!(await dtachService.isAvailable())) {
 			// No dtach — just mark all running terminals as exited
-			const running = await db.query.terminals.findMany({
-				where: and(eq(terminals.status, "running"), isNull(terminals.worktreeResourceId)),
-			});
+			const running = await readQuery(
+				db.query.terminals.findMany({
+					where: and(eq(terminals.status, "running"), isNull(terminals.worktreeResourceId)),
+				}),
+			);
 			for (const terminal of running) {
 				if (terminal.worktreeResourceId != null) continue;
 				await markTerminalExited(terminal.id, null, terminal.narratorId, terminal.chapterId);
@@ -745,9 +801,11 @@ export const terminalService = {
 		}
 
 		// Phase 1: recover DB-tracked running terminals
-		const running = await db.query.terminals.findMany({
-			where: and(eq(terminals.status, "running"), isNull(terminals.worktreeResourceId)),
-		});
+		const running = await readQuery(
+			db.query.terminals.findMany({
+				where: and(eq(terminals.status, "running"), isNull(terminals.worktreeResourceId)),
+			}),
+		);
 
 		let recovered = 0;
 		let marked = 0;
@@ -804,9 +862,11 @@ export const terminalService = {
 				if (activeTerminals.has(terminalId)) continue;
 
 				// Resource rows are not legacy sockets, even if a stale file has the same ID.
-				const existing = await db.query.terminals.findFirst({
-					where: eq(terminals.id, terminalId),
-				});
+				const existing = await readQuery(
+					db.query.terminals.findFirst({
+						where: eq(terminals.id, terminalId),
+					}),
+				);
 				if (existing?.worktreeResourceId != null) continue;
 				if (!(await dtachService.isSocketAlive(terminalId))) continue;
 				if (existing && existing.status === "exited") {
@@ -868,9 +928,11 @@ export const terminalService = {
 
 	async _cleanupByField(field: "chapterId" | "narratorId", value: string) {
 		const col = field === "chapterId" ? terminals.chapterId : terminals.narratorId;
-		const matched = await db.query.terminals.findMany({
-			where: and(eq(col, value), isNull(terminals.worktreeResourceId)),
-		});
+		const matched = await readQuery(
+			db.query.terminals.findMany({
+				where: and(eq(col, value), isNull(terminals.worktreeResourceId)),
+			}),
+		);
 		for (const terminal of matched) {
 			if (terminal.worktreeResourceId != null) continue;
 			if (terminal.status === "running") {
@@ -890,7 +952,9 @@ export const terminalService = {
 	 * direct mode: the subprocess PID is the shell.
 	 */
 	async getShellPid(terminalId: string): Promise<number | null> {
-		const existing = await db.query.terminals.findFirst({ where: eq(terminals.id, terminalId) });
+		const existing = await readQuery(
+			db.query.terminals.findFirst({ where: eq(terminals.id, terminalId) }),
+		);
 		if (existing) assertLegacyRuntimeOwner(existing);
 		const active = activeTerminals.get(terminalId);
 		if (active) {
@@ -996,7 +1060,8 @@ export const terminalService = {
 	 * Graceful shutdown: detach from dtach sessions (keeping them alive)
 	 * and kill direct-mode terminals.
 	 */
-	async shutdownAll() {
+	async shutdownAll(signal?: AbortSignal) {
+		shutdownStarted = true;
 		const promises: Promise<void>[] = [];
 		for (const [id, active] of activeTerminals) {
 			promises.push(
@@ -1018,15 +1083,27 @@ export const terminalService = {
 				})(),
 			);
 		}
-		const results = await Promise.allSettled(promises);
-		const count = activeTerminals.size;
-		activeTerminals.clear();
-		if (count > 0) {
-			logger.info("Shutdown: detached/killed active terminals", { count });
+		const teardown = Promise.allSettled(promises).then((results) => {
+			const count = activeTerminals.size;
+			// Unregister dormant observers: their active lookup will now return early.
+			// Observers already past that lookup retain their independently tracked tail.
+			activeTerminals.clear();
+			if (count > 0) {
+				logger.info("Shutdown: detached/killed active terminals", { count });
+			}
+			return results;
+		});
+		if (signal) await waitForShutdownWork(teardown, signal);
+		const results = await teardown;
+		while (exitObservers.size > 0) {
+			const pending = Promise.all(exitObservers);
+			if (signal) await waitForShutdownWork(pending, signal);
+			else await pending;
 		}
 		const failures = results.flatMap((result) =>
 			result.status === "rejected" ? [result.reason] : [],
 		);
+		if (observerFailure) failures.push(observerFailure.error);
 		if (failures.length > 0) {
 			throw new AggregateError(failures, `Failed to shut down ${failures.length} terminal(s)`);
 		}

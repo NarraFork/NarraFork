@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 /**
  * Gateway configuration loader.
  *
@@ -37,20 +38,20 @@ function parseCommaSeparated(value: string | undefined): string[] | undefined {
 async function loadDbConfig(): Promise<Partial<GatewayConfig>> {
 	try {
 		// Find admin user (or first user)
-		const allUsers = await db
-			.select({ id: users.id, role: users.role })
-			.from(users)
-			.orderBy(users.createdAt)
-			.limit(5);
+		const allUsers = await readQuery(
+			db.select({ id: users.id, role: users.role }).from(users).orderBy(users.createdAt).limit(5),
+		);
 		if (allUsers.length === 0) return {};
 
 		const admin = allUsers.find((u) => u.role === "admin");
 		const userId = admin?.id ?? allUsers[0].id;
 
-		const pref = await db.query.userPreferences.findFirst({
-			where: eq(userPreferences.userId, userId),
-			columns: { gatewayConfig: true },
-		});
+		const pref = await readQuery(
+			db.query.userPreferences.findFirst({
+				where: eq(userPreferences.userId, userId),
+				columns: { gatewayConfig: true },
+			}),
+		);
 		if (!pref?.gatewayConfig) return {};
 
 		const parsed = JSON.parse(typeof pref.gatewayConfig === "string" ? pref.gatewayConfig : "{}");

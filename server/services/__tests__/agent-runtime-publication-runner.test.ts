@@ -453,7 +453,7 @@ describe("detached publication waits for the exact parent tool transaction", () 
 					});
 					if (deliver && !background) {
 						await entered.promise;
-						runtimePublication.flushRecipient(f.parent);
+						await runtimePublication.flushRecipient(f.parent);
 						expect(parentRows(f.parent)).toHaveLength(0);
 						expect(
 							db
@@ -467,7 +467,7 @@ describe("detached publication waits for the exact parent tool transaction", () 
 					}
 					gate.resolve();
 					await handle.terminal;
-					runtimePublication.flushRecipient(f.parent);
+					await runtimePublication.flushRecipient(f.parent);
 					const notices = parentRows(f.parent).filter((row) => row.kind === "task_notice");
 					expect(notices).toHaveLength(deliver ? 1 : 0);
 					if (background && !deliver) {

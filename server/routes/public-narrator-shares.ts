@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 import { isGenUiToolName } from "@shared/gen-ui-public";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
@@ -200,10 +201,12 @@ publicNarratorShareRoutes.get("/:shareId/pretext-document", async (c) => {
 	});
 	// The service guarantees the page's own revision consistency (see the narrator
 	// route's note); a second version comparison here only produced spurious 409s.
-	const narratorMeta = await db.query.narrators.findFirst({
-		where: eq(narrators.id, auth.narratorId),
-		columns: { id: true },
-	});
+	const narratorMeta = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, auth.narratorId),
+			columns: { id: true },
+		}),
+	);
 	if (!narratorMeta) throw unavailablePublicShare();
 	revalidatePublicShare(auth);
 	return c.json(projectPublicNarratorPayload(auth.narratorId, result));

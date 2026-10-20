@@ -64,6 +64,27 @@ async function seedTasks(
 	for (const row of values) backgroundOccupancyStore.refreshTask(row.id);
 }
 
+// Large graph fixtures keep their full row count without rebuilding a wide Drizzle INSERT per row.
+function seedTerminalLeaves(
+	parentId: string,
+	count: number,
+	createdAt: string,
+	isBackground = false,
+): void {
+	const ids = Array.from({ length: count }, (_, index) => `${parentId}-leaf-${index}`);
+	const insert = sqlite.prepare(`INSERT INTO narrators
+		(id, parent_narrator_id, type, variant, status, is_background, background_status, created_at, updated_at)
+		VALUES (?, ?, 'subagent', 'subagent:general', 'idle', ?, 'completed', ?, ?)`);
+	try {
+		db.transaction(() => {
+			for (const id of ids) insert.run(id, parentId, Number(isBackground), createdAt, createdAt);
+		});
+	} finally {
+		insert.finalize();
+	}
+	backgroundOccupancyStore.refreshNarrators(ids);
+}
+
 const {
 	backgroundTaskService,
 	BACKGROUND_TASK_LIST_EPOCH,
@@ -139,7 +160,7 @@ afterEach(async () => {
 	await flushDeltas();
 	cleanDb(sqlite);
 	// An emptied case cannot leave an outbox page cursor positioned in the next case.
-	runtimePublication.flushPage();
+	await runtimePublication.flushPage();
 });
 
 const PARENT = "list-parent";
@@ -327,7 +348,7 @@ describe("subagents remain discoverable without a background projection", () => 
 		const page = await backgroundTaskService.listPageByParent(PARENT);
 		expect(page.tasks.map((task) => task.id)).toEqual(["foreground-child"]);
 		expect(page.activeTasks?.map((task) => task.id)).toEqual(["foreground-child"]);
-		backgroundTaskService.notifyDerivedStatusChanged(PARENT, "foreground-child");
+		await backgroundTaskService.notifyDerivedStatusChanged(PARENT, "foreground-child");
 		await flushDeltas();
 		expect(listRowDeltas().at(-1)).toMatchObject({
 			activeCount: 1,
@@ -863,7 +884,7 @@ describe("derived status notification identity", () => {
 		for (const status of ["working", "idle"] as const) {
 			await db.update(narrators).set({ status }).where(eq(narrators.id, narratorId));
 			broadcasts.length = 0;
-			backgroundTaskService.notifyDerivedStatusChanged(PARENT, narratorId);
+			await backgroundTaskService.notifyDerivedStatusChanged(PARENT, narratorId);
 			await flushDeltas();
 			expect(listRowDeltas()).toHaveLength(1);
 			expect(listRowDeltas()[0]).toMatchObject({
@@ -901,7 +922,7 @@ describe("derived status notification identity", () => {
 		await flushDeltas();
 		for (const id of ["scoped-projection", "scoped-narrator", "scoped-bash"]) {
 			broadcasts.length = 0;
-			backgroundTaskService.notifyDerivedStatusChanged(otherParent, id);
+			await backgroundTaskService.notifyDerivedStatusChanged(otherParent, id);
 			await flushDeltas();
 			expect(listRowDeltas(otherParent)).toEqual([
 				expect.objectContaining({ narratorId: otherParent, removeIds: [id], activeCount: 0 }),
@@ -931,14 +952,14 @@ describe("derived status notification identity", () => {
 			["plain-legacy", "agent"],
 		] as const) {
 			broadcasts.length = 0;
-			backgroundTaskService.notifyDerivedStatusChanged(PARENT, id);
+			await backgroundTaskService.notifyDerivedStatusChanged(PARENT, id);
 			await flushDeltas();
 			expect(listRowDeltas()).toHaveLength(1);
 			expect(listRowDeltas()[0]?.upsert).toMatchObject({ id, type });
 			expect(listRowDeltas()[0]?.removeIds).toBeUndefined();
 		}
 		broadcasts.length = 0;
-		backgroundTaskService.notifyDerivedStatusChanged(PARENT, "missing-id");
+		await backgroundTaskService.notifyDerivedStatusChanged(PARENT, "missing-id");
 		await flushDeltas();
 		expect(listRowDeltas()).toHaveLength(1);
 		expect(listRowDeltas()[0]?.removeIds).toEqual(["missing-id"]);
@@ -1244,7 +1265,7 @@ describe("background task count frames", () => {
 			createdAt: now,
 			updatedAt: now,
 		});
-		backgroundTaskService.notifyDerivedStatusChanged("paused-child", "paused-descendant");
+		await backgroundTaskService.notifyDerivedStatusChanged("paused-child", "paused-descendant");
 		await flushDeltas();
 		expect(await backgroundTaskService.countActiveByParent(PARENT)).toBe(1);
 		expect((await backgroundTaskService.countActiveByParentBatch([PARENT])).get(PARENT)).toBe(1);
@@ -1259,21 +1280,7 @@ describe("background task count frames", () => {
 	test("thousands of terminal legacy leaves do not block a directly running task", async () => {
 		await seedParent();
 		const createdAt = "2020-01-01T00:00:00.000Z";
-		for (let offset = 0; offset < 4096; offset += 512) {
-			await seedNarrators(
-				Array.from({ length: 512 }, (_, index) => ({
-					id: `historical-leaf-${offset + index}`,
-					type: "subagent" as const,
-					variant: "subagent:general" as const,
-					parentNarratorId: PARENT,
-					status: "idle" as const,
-					isBackground: true,
-					backgroundStatus: "completed" as const,
-					createdAt,
-					updatedAt: createdAt,
-				})),
-			);
-		}
+		seedTerminalLeaves(PARENT, 4096, createdAt, true);
 		await backgroundTaskService.createBashTask({
 			id: "history-live-bash",
 			parentNarratorId: PARENT,
@@ -1306,20 +1313,7 @@ describe("background task count frames", () => {
 				updatedAt: now,
 			})),
 		);
-		for (const parentId of parentIds) {
-			await seedNarrators(
-				Array.from({ length: 201 }, (_, index) => ({
-					id: `${parentId}-leaf-${index}`,
-					parentNarratorId: parentId,
-					type: "subagent" as const,
-					variant: "subagent:general" as const,
-					status: "idle" as const,
-					backgroundStatus: "completed" as const,
-					createdAt: now,
-					updatedAt: now,
-				})),
-			);
-		}
+		for (const parentId of parentIds) seedTerminalLeaves(parentId, 201, now);
 		await seedTasks(
 			parentIds.map((parentNarratorId) => ({
 				id: `${parentNarratorId}-bash`,
@@ -1422,7 +1416,7 @@ describe("background task count frames", () => {
 			throw new Error("count unavailable");
 		};
 		try {
-			backgroundTaskService.notifyDerivedStatusChanged(PARENT, "count-error");
+			await backgroundTaskService.notifyDerivedStatusChanged(PARENT, "count-error");
 			await flushDeltas();
 			expect(broadcasts).toHaveLength(0);
 			expect(backgroundTaskService.getListVersion(PARENT)).toBe(version);
@@ -1678,7 +1672,7 @@ describe("background task list deltas", () => {
 		// What the resumed runner sees: the loop is live in this process while the row
 		// is terminal, which is exactly the state `applyLiveness` calls `continued`.
 		setRuntimeLive(subagentId, true);
-		backgroundTaskService.notifyDerivedStatusChanged(PARENT, subagentId);
+		await backgroundTaskService.notifyDerivedStatusChanged(PARENT, subagentId);
 		await flushDeltas();
 
 		const deltas = listRowDeltas();

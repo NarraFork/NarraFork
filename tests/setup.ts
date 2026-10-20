@@ -130,7 +130,9 @@ export function cleanDb(sqlite: Database) {
 		virtualNames.some((virtualName) => name.startsWith(`${virtualName}_`));
 
 	for (const { name, isVirtual } of allTables) {
-		if (isVirtual || isShadowTable(name)) continue;
+		// A file-backed fixture may be reopened by the next isolated test module. Its schema
+		// survives cleanup, so its migration ledger must survive as well.
+		if (name === "__drizzle_migrations" || isVirtual || isShadowTable(name)) continue;
 		sqlite.run(`DELETE FROM "${name}"`);
 	}
 	sqlite.run("PRAGMA foreign_keys = ON");

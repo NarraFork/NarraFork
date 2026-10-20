@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 /**
  * Project membership: the mutations behind the project access panel.
  *
@@ -72,7 +73,7 @@ function projectMemberScope(projectId: string) {
 }
 
 async function loadProject(projectId: string): Promise<ProjectRow> {
-	const row = await db.query.projects.findFirst({ where: eq(projects.id, projectId) });
+	const row = await readQuery(db.query.projects.findFirst({ where: eq(projects.id, projectId) }));
 	if (!row) throw new NotFoundError("Project", projectId);
 	return row;
 }
@@ -98,25 +99,29 @@ export async function getProjectAccess(
 	principal: ProjectPrincipal,
 ): Promise<ProjectAccessView> {
 	const row = await loadProject(projectId);
-	const grants = await db
-		.select({
-			grantId: aclGrants.id,
-			userId: aclGrants.principalId,
-			role: aclGrants.capability,
-			createdAt: aclGrants.createdAt,
-			username: users.username,
-			avatarColor: users.avatarColor,
-			avatarImageId: users.avatarImageId,
-		})
-		.from(aclGrants)
-		.leftJoin(users, eq(users.id, aclGrants.principalId))
-		.where(projectMemberScope(projectId));
+	const grants = await readQuery(
+		db
+			.select({
+				grantId: aclGrants.id,
+				userId: aclGrants.principalId,
+				role: aclGrants.capability,
+				createdAt: aclGrants.createdAt,
+				username: users.username,
+				avatarColor: users.avatarColor,
+				avatarImageId: users.avatarImageId,
+			})
+			.from(aclGrants)
+			.leftJoin(users, eq(users.id, aclGrants.principalId))
+			.where(projectMemberScope(projectId)),
+	);
 
 	const owner = row.ownerUserId
-		? ((await db.query.users.findFirst({
-				where: eq(users.id, row.ownerUserId),
-				columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
-			})) ?? null)
+		? ((await readQuery(
+				db.query.users.findFirst({
+					where: eq(users.id, row.ownerUserId),
+					columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
+				}),
+			)) ?? null)
 		: null;
 
 	// One row per (user, capability), so a user granted both read and write appears
@@ -217,14 +222,16 @@ export async function setProjectMembers(
 	// Preserve caller order while collapsing duplicates.
 	const wanted = [...new Set(userIds)];
 	const known = new Set(
-		(await db.select({ id: users.id }).from(users).where(inArray(users.id, wanted))).map(
+		(await readQuery(db.select({ id: users.id }).from(users).where(inArray(users.id, wanted)))).map(
 			(user) => user.id,
 		),
 	);
-	const held = await db
-		.select({ userId: aclGrants.principalId, role: aclGrants.capability, id: aclGrants.id })
-		.from(aclGrants)
-		.where(and(projectMemberScope(projectId), inArray(aclGrants.principalId, wanted)));
+	const held = await readQuery(
+		db
+			.select({ userId: aclGrants.principalId, role: aclGrants.capability, id: aclGrants.id })
+			.from(aclGrants)
+			.where(and(projectMemberScope(projectId), inArray(aclGrants.principalId, wanted))),
+	);
 	const heldByUser = new Map<string, { id: string; role: string }[]>();
 	for (const grant of held) {
 		const list = heldByUser.get(grant.userId) ?? [];
@@ -342,10 +349,12 @@ export async function transferProjectOwner(
 		throw new ValidationError("Only an administrator can leave a project without an owner");
 	}
 	if (newOwnerUserId !== null) {
-		const target = await db.query.users.findFirst({
-			where: eq(users.id, newOwnerUserId),
-			columns: { id: true },
-		});
+		const target = await readQuery(
+			db.query.users.findFirst({
+				where: eq(users.id, newOwnerUserId),
+				columns: { id: true },
+			}),
+		);
 		if (!target) throw new NotFoundError("User", newOwnerUserId);
 	}
 
@@ -420,26 +429,33 @@ async function usersWithTabsInProject(projectId: string): Promise<string[]> {
 	// dead tab. Bounded by the project's own chapters/narrators, and only the ids are
 	// read — no large fields.
 	const chapterIds = (
-		await db
-			.select({ id: chapters.id })
-			.from(chapters)
-			.where(eq(chapters.projectId, projectId))
-			.limit(TAB_SCAN_ENTITY_LIMIT)
+		await readQuery(
+			db
+				.select({ id: chapters.id })
+				.from(chapters)
+				.where(eq(chapters.projectId, projectId))
+				.limit(TAB_SCAN_ENTITY_LIMIT),
+		)
 	).map((row) => row.id);
 	for (const chapterId of chapterIds) {
 		for (const userId of await getRecentTabUserIds("chapter", chapterId)) found.add(userId);
 	}
 
 	const narratorIds = (
-		await db
-			.select({ id: narrators.id })
-			.from(narrators)
-			.where(
-				chapterIds.length > 0
-					? or(eq(narrators.contextProjectId, projectId), inArray(narrators.chapterId, chapterIds))
-					: eq(narrators.contextProjectId, projectId),
-			)
-			.limit(TAB_SCAN_ENTITY_LIMIT)
+		await readQuery(
+			db
+				.select({ id: narrators.id })
+				.from(narrators)
+				.where(
+					chapterIds.length > 0
+						? or(
+								eq(narrators.contextProjectId, projectId),
+								inArray(narrators.chapterId, chapterIds),
+							)
+						: eq(narrators.contextProjectId, projectId),
+				)
+				.limit(TAB_SCAN_ENTITY_LIMIT),
+		)
 	).map((row) => row.id);
 	for (const narratorId of narratorIds) {
 		for (const userId of await getRecentTabUserIds("narrator", narratorId)) found.add(userId);
@@ -490,10 +506,13 @@ async function announceProjectAccessChange(
 	// used the knowledge base stay quiet.
 	if (recipients.size === 0) return;
 	try {
-		const inheriting = await db.query.knowledgeCollections.findFirst({
-			where: (c, { and: a, eq: e }) => a(e(c.projectId, projectId), e(c.inheritProjectGate, true)),
-			columns: { id: true },
-		});
+		const inheriting = await readQuery(
+			db.query.knowledgeCollections.findFirst({
+				where: (c, { and: a, eq: e }) =>
+					a(e(c.projectId, projectId), e(c.inheritProjectGate, true)),
+				columns: { id: true },
+			}),
+		);
 		if (!inheriting) return;
 		eventBus.emit({
 			type: "knowledge:acl_changed",

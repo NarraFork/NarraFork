@@ -1,5 +1,6 @@
 import { existsSync, rmSync } from "node:fs";
 import { resolve } from "node:path";
+import { readQuery } from "@server/db/worker-read";
 import { eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
@@ -376,10 +377,12 @@ projectRoutes.patch("/:id", async (c) => {
 
 	const now = new Date().toISOString();
 
-	const existingProject = await db.query.projects.findFirst({
-		where: eq(projects.id, id),
-		columns: { proxyDomain: true, chapterSettings: true },
-	});
+	const existingProject = await readQuery(
+		db.query.projects.findFirst({
+			where: eq(projects.id, id),
+			columns: { proxyDomain: true, chapterSettings: true },
+		}),
+	);
 	if (!existingProject) throw new NotFoundError("Project", id);
 
 	// Merge chapterSettings with existing values instead of overwriting
@@ -434,11 +437,13 @@ projectRoutes.delete("/:id", async (c) => {
 		async () => {
 			await propagateOAuthProjectRemoval(id);
 
-			const projectChapters = await db.query.chapters.findMany({
-				where: eq(chapters.projectId, id),
-				// Loads every chapter in the project, so skip the per-node UI blobs.
-				columns: { dockLayoutJson: false, detachedPanelsJson: false },
-			});
+			const projectChapters = await readQuery(
+				db.query.chapters.findMany({
+					where: eq(chapters.projectId, id),
+					// Loads every chapter in the project, so skip the per-node UI blobs.
+					columns: { dockLayoutJson: false, detachedPanelsJson: false },
+				}),
+			);
 
 			// Remove non-root chapters first, then root chapters — full resource cleanup for all
 			const nonRoot = projectChapters.filter((ch) => !ch.isRoot);
@@ -484,10 +489,12 @@ projectRoutes.delete("/:id", async (c) => {
 			// Fallback cleanup: ensure all FK-dependent rows are gone even if
 			// removeForProjectDeletion partially failed for some chapters.
 			const remainingChapterIds = (
-				await db.query.chapters.findMany({
-					where: eq(chapters.projectId, id),
-					columns: { id: true },
-				})
+				await readQuery(
+					db.query.chapters.findMany({
+						where: eq(chapters.projectId, id),
+						columns: { id: true },
+					}),
+				)
 			).map((ch) => ch.id);
 
 			if (remainingChapterIds.length > 0) {
@@ -524,20 +531,24 @@ projectRoutes.delete("/:id", async (c) => {
 				}
 
 				const remainingNarratorIds = (
-					await db.query.narrators.findMany({
-						where: inArray(narrators.chapterId, remainingChapterIds),
-						columns: { id: true },
-					})
+					await readQuery(
+						db.query.narrators.findMany({
+							where: inArray(narrators.chapterId, remainingChapterIds),
+							columns: { id: true },
+						}),
+					)
 				).map((n) => n.id);
 
 				// Also collect standalone child narrators (subagents) whose parent belongs to this project
 				let allNarratorIds = [...remainingNarratorIds];
 				if (allNarratorIds.length > 0) {
 					const childNarrators = (
-						await db.query.narrators.findMany({
-							where: inArray(narrators.parentNarratorId, allNarratorIds),
-							columns: { id: true },
-						})
+						await readQuery(
+							db.query.narrators.findMany({
+								where: inArray(narrators.parentNarratorId, allNarratorIds),
+								columns: { id: true },
+							}),
+						)
 					).map((n) => n.id);
 					allNarratorIds = [...new Set([...allNarratorIds, ...childNarrators])];
 				}
@@ -617,7 +628,7 @@ projectRoutes.delete("/:id", async (c) => {
 				})
 				.where(eq(remoteDevices.projectId, id));
 			await db.delete(projects).where(eq(projects.id, id));
-			projectDbManager.close(id);
+			await projectDbManager.close(id);
 			removeTabFromAllUsers("project", id).catch((err) => {
 				logger.warn("Failed to remove project tab from users", {
 					projectId: id,

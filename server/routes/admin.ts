@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 import { normalizeLocale } from "@shared/i18n-locales";
 import { count, eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
@@ -38,16 +39,18 @@ export const adminRoutes = new Hono();
 adminRoutes.use("*", requireAuth, requireAdmin);
 
 adminRoutes.get("/users", async (c) => {
-	const allUsers = await db.query.users.findMany({
-		columns: {
-			id: true,
-			username: true,
-			role: true,
-			avatarColor: true,
-			avatarImageId: true,
-			createdAt: true,
-		},
-	});
+	const allUsers = await readQuery(
+		db.query.users.findMany({
+			columns: {
+				id: true,
+				username: true,
+				role: true,
+				avatarColor: true,
+				avatarImageId: true,
+				createdAt: true,
+			},
+		}),
+	);
 	return c.json(allUsers);
 });
 
@@ -63,10 +66,12 @@ adminRoutes.post("/users", async (c) => {
 	if (!parsed.success) throw new AppError(formatZodError(parsed.error), 400, "VALIDATION_ERROR");
 	const { username, password, role, language } = parsed.data;
 
-	const existing = await db.query.users.findFirst({
-		where: eq(users.username, username),
-		columns: { id: true },
-	});
+	const existing = await readQuery(
+		db.query.users.findFirst({
+			where: eq(users.username, username),
+			columns: { id: true },
+		}),
+	);
 	if (existing) throw new AppError("Username already taken", 409, "USERNAME_TAKEN");
 
 	// Hash outside the transaction: sync transactions cannot await.
@@ -132,16 +137,17 @@ adminRoutes.patch("/users/:id", async (c) => {
 	// Read the live role once: it decides both the last-administrator guard below and
 	// whether this request is a DEMOTION, which has to end the target's sessions.
 	const targetBefore = role
-		? await db.query.users.findFirst({ where: eq(users.id, id), columns: { role: true } })
+		? await readQuery(
+				db.query.users.findFirst({ where: eq(users.id, id), columns: { role: true } }),
+			)
 		: undefined;
 	const isDemotion = role === "user" && targetBefore?.role === "admin";
 
 	// Prevent demoting the last administrator
 	if (role === "user" && id !== caller.sub && targetBefore?.role === "admin") {
-		const [{ value: adminCount }] = await db
-			.select({ value: count() })
-			.from(users)
-			.where(eq(users.role, "admin"));
+		const [{ value: adminCount }] = await readQuery(
+			db.select({ value: count() }).from(users).where(eq(users.role, "admin")),
+		);
 		if (adminCount <= 1) {
 			throw new AppError("Cannot demote the last administrator", 400, "LAST_ADMIN");
 		}
@@ -154,9 +160,11 @@ adminRoutes.patch("/users/:id", async (c) => {
 	}
 
 	if (username) {
-		const existing = await db.query.users.findFirst({
-			where: eq(users.username, username),
-		});
+		const existing = await readQuery(
+			db.query.users.findFirst({
+				where: eq(users.username, username),
+			}),
+		);
 		if (existing && existing.id !== id) {
 			throw new AppError("Username already taken", 409, "USERNAME_TAKEN");
 		}
@@ -205,10 +213,12 @@ adminRoutes.patch("/users/:id", async (c) => {
  */
 adminRoutes.post("/users/:id/revoke-sessions", async (c) => {
 	const id = c.req.param("id");
-	const target = await db.query.users.findFirst({
-		where: eq(users.id, id),
-		columns: { id: true },
-	});
+	const target = await readQuery(
+		db.query.users.findFirst({
+			where: eq(users.id, id),
+			columns: { id: true },
+		}),
+	);
 	if (!target) throw new AppError("User not found", 404, "NOT_FOUND");
 	const tokenVersion = await revokeUserSessions(id);
 	invalidateUserCache(id);
@@ -229,16 +239,17 @@ adminRoutes.delete("/users/:id", async (c) => {
 	}
 
 	// Prevent deleting the last administrator
-	const target = await db.query.users.findFirst({
-		where: eq(users.id, id),
-		columns: { role: true },
-	});
+	const target = await readQuery(
+		db.query.users.findFirst({
+			where: eq(users.id, id),
+			columns: { role: true },
+		}),
+	);
 	if (!target) throw new AppError("User not found", 404, "NOT_FOUND");
 	if (target.role === "admin") {
-		const [{ value: adminCount }] = await db
-			.select({ value: count() })
-			.from(users)
-			.where(eq(users.role, "admin"));
+		const [{ value: adminCount }] = await readQuery(
+			db.select({ value: count() }).from(users).where(eq(users.role, "admin")),
+		);
 		if (adminCount <= 1) {
 			throw new AppError("Cannot delete the last administrator", 400, "LAST_ADMIN");
 		}
@@ -467,11 +478,13 @@ adminRoutes.get("/diagnostics", async (c) => {
 	const memUsage = process.memoryUsage();
 
 	// Active narrators (working/waiting status)
-	const narratorStatusCounts = await db
-		.select({ status: narrators.status, value: count() })
-		.from(narrators)
-		.where(inArray(narrators.status, ["working", "waiting"]))
-		.groupBy(narrators.status);
+	const narratorStatusCounts = await readQuery(
+		db
+			.select({ status: narrators.status, value: count() })
+			.from(narrators)
+			.where(inArray(narrators.status, ["working", "waiting"]))
+			.groupBy(narrators.status),
+	);
 	const narratorCountByStatus = new Map(narratorStatusCounts.map((row) => [row.status, row.value]));
 	const workingNarratorCount = narratorCountByStatus.get("working") ?? 0;
 	const waitingNarratorCount = narratorCountByStatus.get("waiting") ?? 0;

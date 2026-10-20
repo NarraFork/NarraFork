@@ -11,6 +11,7 @@
  * fallback after the coordinator's retry budget.
  */
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
+import { logger } from "../../logger";
 import { ParcelRecursiveWatcher } from "../parcel-watcher";
 import {
 	asWorkerStdinSink,
@@ -21,6 +22,7 @@ import {
 	type WorkerStdinSink,
 	writeFileSinkCommand,
 } from "../parcel-worker-client";
+import { WATCHER_STAGES } from "../worker-protocol";
 
 const timers = new Map<number, { callback: () => void; delay: number }>();
 const fakeProcs: FakeProc[] = [];
@@ -498,6 +500,226 @@ describe("pending ACK lifecycle", () => {
 		} finally {
 			spawn.mockRestore();
 			await client.shutdown().catch(() => {});
+		}
+	});
+});
+
+describe("bounded lifecycle diagnostics", () => {
+	for (const lastStage of ["subscribe_start", "ack_send"] as const) {
+		test(`timeout retains ${lastStage} without treating worker clocks as parent clocks`, async () => {
+			process.env.NARRAFORK_ENABLE_NATIVE_WATCHER = "1";
+			const { sink, proc, spawn } = spawnAndInstall();
+			const warn = spyOn(logger, "warn").mockImplementation(() => {});
+			const client = new ParcelWorkerClient(
+				() => {},
+				() => {},
+			);
+			try {
+				const request = client.watch("/tmp/nf-diagnostic", []);
+				request.catch(() => {});
+				await drainEventLoop();
+				const command = JSON.parse(new TextDecoder().decode(sink.writes[0]));
+				const stage = {
+					type: "stage",
+					requestId: command.requestId,
+					watchId: command.id,
+					stage: lastStage,
+					workerElapsedMs: 123,
+					workerStageDurationMs: 7,
+					activeWatches: 0,
+					starting: 1,
+					stopping: 1,
+				};
+				proc.emitLine(JSON.stringify(stage));
+				await drainEventLoop();
+				// Duplicate / invalid / mismatched observations cannot extend the deadline or grow state.
+				for (let i = 0; i < 100; i++) proc.emitLine(JSON.stringify(stage));
+				proc.emitLine(JSON.stringify({ ...stage, stage: "unknown", extra: "x".repeat(1000) }));
+				proc.emitLine(JSON.stringify({ ...stage, stage: "binding_end", watchId: "wrong" }));
+				proc.emitLine(JSON.stringify({ ...stage, stage: "binding_end", workerElapsedMs: -1 }));
+				await drainEventLoop();
+				expect(Array.from(timers.values(), (timer) => timer.delay)).toEqual([5000]);
+				await fireTimeout(5000);
+				await expect(request).rejects.toThrow("timed out after 5000ms");
+				const diagnostic = warn.mock.calls.find(([message]) =>
+					message.includes("request lifecycle"),
+				)?.[1];
+				expect(diagnostic).toMatchObject({
+					outcome: "timeout",
+					requestId: command.requestId,
+					watchId: command.id,
+					lastWorkerStage: lastStage,
+					workerPid: 4242,
+					workerState: "ready",
+					parentSendStartMs: expect.any(Number),
+					parentFlushEndMs: expect.any(Number),
+					workerReadyMs: expect.any(Number),
+					parentLastStageAgeMs: expect.any(Number),
+					parentAckReceivedMs: null,
+					stages: [
+						{
+							stage: lastStage,
+							workerElapsedMs: 123,
+							workerStageDurationMs: 7,
+							activeWatches: 0,
+							starting: 1,
+							stopping: 1,
+						},
+					],
+				});
+				expect(pendingMapOf(client).size).toBe(0);
+			} finally {
+				spawn.mockRestore();
+				warn.mockRestore();
+				await client.shutdown();
+			}
+		});
+	}
+
+	test("success, worker error, late ACK/stage and FS events keep diagnostics bounded", async () => {
+		process.env.NARRAFORK_ENABLE_NATIVE_WATCHER = "1";
+		const { sink, proc, spawn } = spawnAndInstall();
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		const debug = spyOn(logger, "debug").mockImplementation(() => {});
+		let eventCount = 0;
+		const client = new ParcelWorkerClient(
+			() => {
+				eventCount++;
+			},
+			() => {},
+		);
+		try {
+			for (let attempt = 0; attempt < 14; attempt++) {
+				const request = client.watch("/tmp/nf-diagnostic", []);
+				request.catch(() => {});
+				await drainEventLoop();
+				const command = JSON.parse(new TextDecoder().decode(sink.writes.at(-1)));
+				const stage = {
+					type: "stage",
+					requestId: command.requestId,
+					watchId: command.id,
+					stage: "received",
+					workerElapsedMs: 0,
+					workerStageDurationMs: 0,
+					activeWatches: 0,
+					starting: 1,
+					stopping: 0,
+				};
+				for (const name of WATCHER_STAGES) {
+					if (attempt === 0 && name === "unsubscribe_error") continue;
+					proc.emitLine(JSON.stringify({ ...stage, stage: name }));
+				}
+				proc.emitLine(
+					JSON.stringify(
+						attempt === 0
+							? { type: "watch_ack", requestId: command.requestId, id: command.id }
+							: {
+									type: "error",
+									requestId: command.requestId,
+									id: command.id,
+									error: "controlled subscribe failure",
+								},
+					),
+				);
+				await drainEventLoop();
+				if (attempt === 0) {
+					await request;
+					expect(warn.mock.calls).toHaveLength(0);
+					expect(debug.mock.calls.some(([message]) => message.includes("request lifecycle"))).toBe(
+						true,
+					);
+				} else await expect(request).rejects.toThrow("controlled subscribe failure");
+				proc.emitLine(JSON.stringify(stage));
+				proc.emitLine(
+					JSON.stringify({ type: "watch_ack", requestId: command.requestId, id: command.id }),
+				);
+				await drainEventLoop();
+				expect(pendingMapOf(client).size).toBe(0);
+			}
+			const countBeforeEvents = warn.mock.calls.length + debug.mock.calls.length;
+			for (let i = 0; i < 1000; i++)
+				proc.emitLine(JSON.stringify({ type: "events", id: "x", path: "x", events: [] }));
+			await drainEventLoop();
+			expect(eventCount).toBe(1000);
+			expect(warn.mock.calls.length + debug.mock.calls.length).toBe(countBeforeEvents);
+			const diagnostics = warn.mock.calls.filter(([message]) =>
+				message.includes("request lifecycle"),
+			);
+			expect(diagnostics).toHaveLength(10);
+			for (const [, data] of diagnostics) expect(JSON.stringify(data).length).toBeLessThan(4096);
+		} finally {
+			spawn.mockRestore();
+			warn.mockRestore();
+			debug.mockRestore();
+			await client.shutdown();
+		}
+	});
+
+	test("pending flush timeout records send start without claiming flush or worker receipt", async () => {
+		process.env.NARRAFORK_ENABLE_NATIVE_WATCHER = "1";
+		const { sink, spawn } = spawnAndInstall();
+		let release!: (value: number) => void;
+		const flush = new Promise<number>((resolve) => {
+			release = resolve;
+		});
+		sink.flush = () => flush;
+		const warn = spyOn(logger, "warn").mockImplementation(() => {});
+		const client = new ParcelWorkerClient(
+			() => {},
+			() => {},
+		);
+		try {
+			const request = client.watch("/tmp/nf-flush", []);
+			request.catch(() => {});
+			await drainEventLoop();
+			await fireTimeout(5000);
+			const diagnostic = warn.mock.calls.find(([message]) =>
+				message.includes("request lifecycle"),
+			)?.[1];
+			expect(diagnostic).toMatchObject({
+				outcome: "timeout",
+				parentSendStartMs: expect.any(Number),
+				parentFlushEndMs: null,
+				lastWorkerStage: null,
+				stages: [],
+			});
+			expect(pendingMapOf(client).size).toBe(0);
+			release(0);
+			await drainEventLoop();
+			await expect(request).rejects.toThrow("timed out");
+		} finally {
+			release(0);
+			spawn.mockRestore();
+			warn.mockRestore();
+			await client.shutdown();
+		}
+	});
+
+	test("diagnostic logger failure preserves the worker error and clears pending", async () => {
+		process.env.NARRAFORK_ENABLE_NATIVE_WATCHER = "1";
+		const { sink, proc, spawn } = spawnAndInstall();
+		const warn = spyOn(logger, "warn").mockImplementation(() => {
+			throw new Error("logger failed");
+		});
+		const client = new ParcelWorkerClient(
+			() => {},
+			() => {},
+		);
+		try {
+			const request = client.watch("/tmp/nf-diagnostic", []);
+			request.catch(() => {});
+			await drainEventLoop();
+			const command = JSON.parse(new TextDecoder().decode(sink.writes[0]));
+			proc.emitLine(
+				JSON.stringify({ type: "error", requestId: command.requestId, error: "original failure" }),
+			);
+			await drainEventLoop();
+			await expect(request).rejects.toThrow("original failure");
+			expect(pendingMapOf(client).size).toBe(0);
+		} finally {
+			spawn.mockRestore();
+			warn.mockRestore();
+			await client.shutdown();
 		}
 	});
 });

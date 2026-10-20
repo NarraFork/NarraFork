@@ -13,6 +13,7 @@
  * and the live {@link RunControl} on its owner record. A delegation is a caller that
  * registers those facts; any two sessions can be related the same way.
  */
+import { readQuery } from "@server/db/worker-read";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { and, eq } from "drizzle-orm";
 import { db } from "../../db";
@@ -38,7 +39,13 @@ import {
 import { broadcastToNarrator } from "../../websocket/narrator-ws";
 import { backgroundOccupancyStore } from "../background-occupancy-store";
 import type { ActiveNarrator } from "../narrator-session-state";
-import { withNarratorStartAdmission, withNarratorWorkAdmission } from "../narrator-session-state";
+import {
+	abortLateNarratorControllerForShutdown,
+	isNarratorAdmissionShuttingDown,
+	recordNarratorShutdownFailure,
+	withNarratorStartAdmission,
+	withNarratorWorkAdmission,
+} from "../narrator-session-state";
 import {
 	type ExecutionOwner,
 	getRunControl,
@@ -124,18 +131,20 @@ const session = (): Promise<Session> => import("../narrator-session");
 
 /** The session row a run start reads once: its registration and its runtime source. */
 async function readRunSource(narratorId: string) {
-	const row = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: {
-			...RUNTIME_SOURCE_COLUMNS,
-			title: true,
-			model: true,
-			reasoningEffort: true,
-			variant: true,
-			subagentType: true,
-			ownerUserId: true,
-		},
-	});
+	const row = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: {
+				...RUNTIME_SOURCE_COLUMNS,
+				title: true,
+				model: true,
+				reasoningEffort: true,
+				variant: true,
+				subagentType: true,
+				ownerUserId: true,
+			},
+		}),
+	);
 	if (!row) throw new AppError("Narrator not found", 404, "NOT_FOUND");
 	return row;
 }
@@ -186,10 +195,12 @@ async function prepareLogicalRun(
 
 async function settled(deliverTo: RunDeliverTo): Promise<boolean> {
 	if (!deliverTo.toolCallId) return false;
-	const call = await db.query.narratorToolCalls.findFirst({
-		where: eq(narratorToolCalls.id, deliverTo.toolCallId),
-		columns: { status: true },
-	});
+	const call = await readQuery(
+		db.query.narratorToolCalls.findFirst({
+			where: eq(narratorToolCalls.id, deliverTo.toolCallId),
+			columns: { status: true },
+		}),
+	);
 	return call?.status === "success" || call?.status === "fail";
 }
 
@@ -298,6 +309,7 @@ export async function startNarratorRun(req: StartNarratorRunRequest): Promise<Ru
 			...(req.foreground ? { waiter: settleForeground } : {}),
 		};
 		setRunControl(owner, run);
+		abortLateNarratorControllerForShutdown(run.cancel);
 		// The model and every preparation step run outside the short start mutex. A
 		// foreground caller not handed back by a detach receives the terminal itself.
 		const completion = withNarratorWorkAdmission(id, () => executeRun(req, owner, run)).then(
@@ -416,7 +428,8 @@ async function executeRun(
 		const onRunCancel = () => {
 			activeNarrators.get(id)?.abortController.abort(run.cancel.signal.reason);
 		};
-		run.cancel.signal.addEventListener("abort", onRunCancel, { once: true });
+		if (run.cancel.signal.aborted) onRunCancel();
+		else run.cancel.signal.addEventListener("abort", onRunCancel, { once: true });
 		removeCancelListener = () => run.cancel.signal.removeEventListener("abort", onRunCancel);
 		// Absolute deadline: recovery and detach never restart it.
 		if (run.deadlineAt) {
@@ -458,16 +471,18 @@ async function executeRun(
 				{ includeEventKind: true },
 			);
 			const checkpoint = !committed
-				? await db.query.narrators.findFirst({
-						where: and(eq(narrators.id, id), eq(narrators.logicalRunId, binding.logicalRunId)),
-						columns: {
-							backgroundResult: true,
-							backgroundCompletedAt: true,
-							backgroundStatus: true,
-							substatus: true,
-							errorMessage: true,
-						},
-					})
+				? await readQuery(
+						db.query.narrators.findFirst({
+							where: and(eq(narrators.id, id), eq(narrators.logicalRunId, binding.logicalRunId)),
+							columns: {
+								backgroundResult: true,
+								backgroundCompletedAt: true,
+								backgroundStatus: true,
+								substatus: true,
+								errorMessage: true,
+							},
+						}),
+					)
 				: undefined;
 			const pending =
 				checkpoint?.backgroundCompletedAt &&
@@ -583,12 +598,13 @@ async function executeRun(
 				publicationRun,
 				{ hasError: true, finalText: error instanceof Error ? error.message : String(error) },
 				req,
-			).catch((finalizeError) =>
+			).catch((finalizeError) => {
+				recordNarratorShutdownFailure(finalizeError);
 				logger.warn("Run finalization after failure failed", {
 					id,
 					error: String(finalizeError),
-				}),
-			);
+				});
+			});
 		throw error;
 	} finally {
 		if (deadlineTimer) clearTimeout(deadlineTimer);
@@ -596,7 +612,7 @@ async function executeRun(
 		removeCancelListener?.();
 		const { backgroundTaskService } = await import("../background-task-service");
 		backgroundTaskService.unregisterAbortController(id, run.cancel);
-		if (owner.release()) afterRunRelease(id, active, allowInboxWake);
+		if (owner.release()) await afterRunRelease(id, active, allowInboxWake);
 	}
 }
 
@@ -604,19 +620,30 @@ async function executeRun(
  * The owner just released: deliver what queued up behind the run. Failed or
  * runtime-paused runs keep their input for an explicit retry.
  */
-function afterRunRelease(id: string, active: ActiveNarrator | undefined, allowInboxWake: boolean) {
+async function afterRunRelease(
+	id: string,
+	active: ActiveNarrator | undefined,
+	allowInboxWake: boolean,
+): Promise<void> {
 	const resumeBuffered = active?._resumeBufferedAfterLoop === true;
 	if (active) active._resumeBufferedAfterLoop = false;
-	if (!allowInboxWake && !resumeBuffered) return;
-	void (async () => {
-		const [{ retryDeferredQuestionAnswerDeliveries }, { hasInboxKind, wakeInboxIfEligible }] =
-			await Promise.all([session(), import("./inbox")]);
-		if (allowInboxWake) await retryDeferredQuestionAnswerDeliveries(id, active?.locale ?? "en");
-		if (resumeBuffered || (await hasInboxKind(id, ["user_input", "agent_message", "task_notice"])))
-			await wakeInboxIfEligible(id, active?.locale ?? "en");
-	})().catch((error) =>
-		logger.warn("Inbox wake deferred after run release", { id, error: String(error) }),
-	);
+	if ((!allowInboxWake && !resumeBuffered) || isNarratorAdmissionShuttingDown()) return;
+	try {
+		await withNarratorWorkAdmission(id, async () => {
+			const [{ retryDeferredQuestionAnswerDeliveries }, { hasInboxKind, wakeInboxIfEligible }] =
+				await Promise.all([session(), import("./inbox")]);
+			if (isNarratorAdmissionShuttingDown()) return;
+			if (allowInboxWake) await retryDeferredQuestionAnswerDeliveries(id, active?.locale ?? "en");
+			if (
+				!isNarratorAdmissionShuttingDown() &&
+				(resumeBuffered || (await hasInboxKind(id, ["user_input", "agent_message", "task_notice"])))
+			)
+				await wakeInboxIfEligible(id, active?.locale ?? "en");
+		});
+	} catch (error) {
+		recordNarratorShutdownFailure(error);
+		logger.warn("Inbox wake deferred after run release", { id, error: String(error) });
+	}
 }
 
 /** Runs that deliver to a tool call, for checkpointing before a planned update. */
@@ -692,7 +719,11 @@ async function finishRun(
 	const timedOut = outcome.committedEvent ? outcome.committedEvent === "timed_out" : run.timedOut;
 	const cancelled = !timedOut && run.cancel.signal.aborted;
 	const hold = getRunHold(id);
-	const interrupted = !timedOut && (!!outcome.aborted || outcome.committedEvent === "cancelled");
+	const interrupted =
+		!timedOut &&
+		(outcome.committedEvent
+			? outcome.committedEvent === "cancelled"
+			: !!outcome.aborted || cancelled);
 	const hasError =
 		timedOut ||
 		(!interrupted &&
@@ -831,10 +862,12 @@ async function renderResult(
 			import("../subagent-label"),
 			import("../subagent-execution-boundary"),
 		]);
-	const turn = await db.query.narrators.findFirst({
-		where: eq(narrators.id, id),
-		columns: { turnStartedAt: true },
-	});
+	const turn = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, id),
+			columns: { turnStartedAt: true },
+		}),
+	);
 	return appendSubagentFileChanges(
 		{
 			parentNarratorId: deliverTo.narratorId,
@@ -1112,26 +1145,28 @@ export async function controlRun(narratorId: string, action: RunControlAction): 
 					finalizing: true,
 				};
 				setRunControl(owner, delivery);
-				return { owner, delivery, hold };
+				abortLateNarratorControllerForShutdown(delivery.cancel);
+				const completion = withNarratorWorkAdmission(narratorId, async () => {
+					try {
+						await deliverHeldResult(narratorId, hold, delivery);
+					} finally {
+						if (owner.release() && !isNarratorAdmissionShuttingDown()) {
+							// A failed delivery keeps the hold, not a veto on queued human input.
+							const { hasInboxKind } = await import("./inbox");
+							await afterRunRelease(
+								narratorId,
+								undefined,
+								!getRunHold(narratorId) || (await hasInboxKind(narratorId, ["user_input"])),
+							);
+						}
+					}
+				});
+				void completion.catch(() => {});
+				return { completion };
 			});
 			if (typeof claim === "boolean") return claim;
-			try {
-				await withNarratorWorkAdmission(narratorId, () =>
-					deliverHeldResult(narratorId, claim.hold, claim.delivery),
-				);
-				return true;
-			} finally {
-				if (claim.owner.release()) {
-					// A failed delivery keeps the hold, not a veto on human input that
-					// arrived while this bounded owner excluded its initial wake.
-					const { hasInboxKind } = await import("./inbox");
-					afterRunRelease(
-						narratorId,
-						undefined,
-						!getRunHold(narratorId) || (await hasInboxKind(narratorId, ["user_input"])),
-					);
-				}
-			}
+			await claim.completion;
+			return true;
 		}
 		case "stop": {
 			if (run?.wake) return false;
@@ -1197,10 +1232,12 @@ async function registerDetachedTask(
 	run: RunControl,
 	deliverTo: RunDeliverTo,
 ): Promise<string> {
-	const row = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { title: true, subagentType: true },
-	});
+	const row = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { title: true, subagentType: true },
+		}),
+	);
 	const [{ backgroundTaskService }, { registerAndPersistSubagentAlias }] = await Promise.all([
 		import("../background-task-service"),
 		import("../subagent-alias"),
@@ -1226,6 +1263,16 @@ async function registerDetachedTask(
 		`<background_task_id>${alias}</background_task_id>\n\n` +
 		`Subagent detached to background. Await({ type: "agent", id: "${alias}" })`
 	);
+}
+
+/** Cancel unified runs only after shutdown recovery preparation has completed. */
+export function cancelAllRunsForShutdown(reason: unknown): number {
+	const runs = listRuns();
+	for (const { run } of runs) {
+		run.cancel.abort(reason);
+		run.wake?.("cancel");
+	}
+	return runs.length;
 }
 
 /**
@@ -1296,10 +1343,12 @@ async function deliverHeldResult(
 	run: RunControl,
 ): Promise<void> {
 	const row = await readRunSource(narratorId);
-	const current = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { substatus: true, logicalRunId: true },
-	});
+	const current = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { substatus: true, logicalRunId: true },
+		}),
+	);
 	const registered = readRuntimeRegistrationColumn(row.runtimeRegistrationJson)?.run;
 	const prepared = registered
 		? {
@@ -1366,12 +1415,14 @@ export async function hydrateRunHolds(): Promise<Set<string>> {
 	// Bound rows scanned, not matches: a sparse hold must never cause a full-table
 	// synchronous scan in one request. Parse labels exactly (SQL LIKE treats _ as wildcard).
 	for (let after = ""; ; ) {
-		const rows = await db
-			.select({ id: narrators.id, substatus: narrators.substatus })
-			.from(narrators)
-			.where(gt(narrators.id, after))
-			.orderBy(asc(narrators.id))
-			.limit(PAGE);
+		const rows = await readQuery(
+			db
+				.select({ id: narrators.id, substatus: narrators.substatus })
+				.from(narrators)
+				.where(gt(narrators.id, after))
+				.orderBy(asc(narrators.id))
+				.limit(PAGE),
+		);
 		scanned += rows.length;
 		for (const row of rows) {
 			if (!parseSubstatus(row.substatus).includes("taken_over")) continue;

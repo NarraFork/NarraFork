@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 import { and, asc, eq, gt, inArray } from "drizzle-orm";
 import { db } from "../db";
 import {
@@ -33,10 +34,13 @@ export async function stopOAuthNarratorForAuthorizationLoss(
 	const binding = await integrationResourceBindingService.get("narrator", narratorId);
 	const grant =
 		binding?.sourceType === "oauth_client" && binding.authorityType === "oauth_grant"
-			? await db.query.oauthGrants.findFirst({
-					where: eq(oauthGrants.id, binding.authorityId),
-					columns: { id: true, userId: true, oauthClientId: true },
-				})
+			? await readQuery(
+					db.query.oauthGrants.findFirst({
+						where: eq(oauthGrants.id, binding.authorityId),
+						columns: { id: true, userId: true, oauthClientId: true },
+					}),
+					{ site: "server/services/oauth-runtime-revocation.read" },
+				)
 			: null;
 	await clearBufferedMessages(narratorId);
 	interruptManualBash(narratorId);
@@ -69,22 +73,25 @@ async function stopNarratorsByGrantPage(
 	let cursor: string | null = null;
 	let stopped = 0;
 	for (;;) {
-		const rows = await db
-			.select({ id: narrators.id })
-			.from(integrationResourceBindings)
-			.innerJoin(narrators, eq(narrators.id, integrationResourceBindings.resourceId))
-			.where(
-				and(
-					eq(integrationResourceBindings.resourceType, "narrator"),
-					eq(integrationResourceBindings.sourceType, "oauth_client"),
-					eq(integrationResourceBindings.authorityType, "oauth_grant"),
-					inArray(integrationResourceBindings.authorityId, [...grantIds]),
-					eq(integrationResourceBindings.state, "active"),
-					cursor ? gt(narrators.id, cursor) : undefined,
-				),
-			)
-			.orderBy(asc(narrators.id))
-			.limit(REVOCATION_PAGE_SIZE + 1);
+		const rows: { id: string }[] = await readQuery(
+			db
+				.select({ id: narrators.id })
+				.from(integrationResourceBindings)
+				.innerJoin(narrators, eq(narrators.id, integrationResourceBindings.resourceId))
+				.where(
+					and(
+						eq(integrationResourceBindings.resourceType, "narrator"),
+						eq(integrationResourceBindings.sourceType, "oauth_client"),
+						eq(integrationResourceBindings.authorityType, "oauth_grant"),
+						inArray(integrationResourceBindings.authorityId, [...grantIds]),
+						eq(integrationResourceBindings.state, "active"),
+						cursor ? gt(narrators.id, cursor) : undefined,
+					),
+				)
+				.orderBy(asc(narrators.id))
+				.limit(REVOCATION_PAGE_SIZE + 1),
+			{ site: "server/services/oauth-runtime-revocation.read" },
+		);
 		const page = rows.slice(0, REVOCATION_PAGE_SIZE);
 		for (const row of page) {
 			await stopOAuthNarratorForAuthorizationLoss(row.id, reason);
@@ -105,23 +112,26 @@ async function disconnectDevicesByGrantPage(
 	let cursor: string | null = null;
 	let disconnected = 0;
 	for (;;) {
-		const rows = await db
-			.select({ id: remoteDevices.id })
-			.from(integrationResourceBindings)
-			.innerJoin(remoteDevices, eq(remoteDevices.id, integrationResourceBindings.resourceId))
-			.where(
-				and(
-					eq(integrationResourceBindings.resourceType, "device"),
-					eq(integrationResourceBindings.sourceType, "oauth_client"),
-					eq(integrationResourceBindings.authorityType, "oauth_grant"),
-					inArray(integrationResourceBindings.authorityId, [...grantIds]),
-					eq(integrationResourceBindings.state, "active"),
-					projectIds ? inArray(remoteDevices.projectId, [...projectIds]) : undefined,
-					cursor ? gt(remoteDevices.id, cursor) : undefined,
-				),
-			)
-			.orderBy(asc(remoteDevices.id))
-			.limit(REVOCATION_PAGE_SIZE + 1);
+		const rows: { id: string }[] = await readQuery(
+			db
+				.select({ id: remoteDevices.id })
+				.from(integrationResourceBindings)
+				.innerJoin(remoteDevices, eq(remoteDevices.id, integrationResourceBindings.resourceId))
+				.where(
+					and(
+						eq(integrationResourceBindings.resourceType, "device"),
+						eq(integrationResourceBindings.sourceType, "oauth_client"),
+						eq(integrationResourceBindings.authorityType, "oauth_grant"),
+						inArray(integrationResourceBindings.authorityId, [...grantIds]),
+						eq(integrationResourceBindings.state, "active"),
+						projectIds ? inArray(remoteDevices.projectId, [...projectIds]) : undefined,
+						cursor ? gt(remoteDevices.id, cursor) : undefined,
+					),
+				)
+				.orderBy(asc(remoteDevices.id))
+				.limit(REVOCATION_PAGE_SIZE + 1),
+			{ site: "server/services/oauth-runtime-revocation.read" },
+		);
 		const page = rows.slice(0, REVOCATION_PAGE_SIZE);
 		for (const row of page) {
 			disconnectDevice(row.id, reason);
@@ -137,22 +147,25 @@ async function disconnectDevicesByProjectPage(projectId: string, reason: string)
 	let cursor: string | null = null;
 	let disconnected = 0;
 	for (;;) {
-		const rows = await db
-			.select({ id: remoteDevices.id })
-			.from(integrationResourceBindings)
-			.innerJoin(remoteDevices, eq(remoteDevices.id, integrationResourceBindings.resourceId))
-			.where(
-				and(
-					eq(integrationResourceBindings.resourceType, "device"),
-					eq(integrationResourceBindings.sourceType, "oauth_client"),
-					eq(integrationResourceBindings.authorityType, "oauth_grant"),
-					eq(integrationResourceBindings.state, "active"),
-					eq(remoteDevices.projectId, projectId),
-					cursor ? gt(remoteDevices.id, cursor) : undefined,
-				),
-			)
-			.orderBy(asc(remoteDevices.id))
-			.limit(REVOCATION_PAGE_SIZE + 1);
+		const rows: { id: string }[] = await readQuery(
+			db
+				.select({ id: remoteDevices.id })
+				.from(integrationResourceBindings)
+				.innerJoin(remoteDevices, eq(remoteDevices.id, integrationResourceBindings.resourceId))
+				.where(
+					and(
+						eq(integrationResourceBindings.resourceType, "device"),
+						eq(integrationResourceBindings.sourceType, "oauth_client"),
+						eq(integrationResourceBindings.authorityType, "oauth_grant"),
+						eq(integrationResourceBindings.state, "active"),
+						eq(remoteDevices.projectId, projectId),
+						cursor ? gt(remoteDevices.id, cursor) : undefined,
+					),
+				)
+				.orderBy(asc(remoteDevices.id))
+				.limit(REVOCATION_PAGE_SIZE + 1),
+			{ site: "server/services/oauth-runtime-revocation.read" },
+		);
 		const page = rows.slice(0, REVOCATION_PAGE_SIZE);
 		for (const row of page) {
 			disconnectDevice(row.id, reason);
@@ -207,12 +220,15 @@ export async function prepareOAuthUserHardDeletion(
 	let cursor: string | null = null;
 	let affected = 0;
 	for (;;) {
-		const rows = await db
-			.select({ id: oauthGrants.id })
-			.from(oauthGrants)
-			.where(and(eq(oauthGrants.userId, userId), cursor ? gt(oauthGrants.id, cursor) : undefined))
-			.orderBy(asc(oauthGrants.id))
-			.limit(REVOCATION_PAGE_SIZE + 1);
+		const rows: { id: string }[] = await readQuery(
+			db
+				.select({ id: oauthGrants.id })
+				.from(oauthGrants)
+				.where(and(eq(oauthGrants.userId, userId), cursor ? gt(oauthGrants.id, cursor) : undefined))
+				.orderBy(asc(oauthGrants.id))
+				.limit(REVOCATION_PAGE_SIZE + 1),
+			{ site: "server/services/oauth-runtime-revocation.read" },
+		);
 		const page = rows.slice(0, REVOCATION_PAGE_SIZE);
 		affected += await prepareOAuthGrantHardDeletion(
 			page.map((row) => row.id),
@@ -250,23 +266,26 @@ export async function propagateOAuthGrantRestriction(input: {
 	let cursor: string | null = null;
 	let stopped = 0;
 	for (;;) {
-		const rows = await db
-			.select({ id: narrators.id })
-			.from(integrationResourceBindings)
-			.innerJoin(narrators, eq(narrators.id, integrationResourceBindings.resourceId))
-			.where(
-				and(
-					eq(integrationResourceBindings.resourceType, "narrator"),
-					eq(integrationResourceBindings.sourceType, "oauth_client"),
-					eq(integrationResourceBindings.authorityType, "oauth_grant"),
-					eq(integrationResourceBindings.authorityId, input.grantId),
-					eq(integrationResourceBindings.state, "active"),
-					inArray(narrators.contextProjectId, projects),
-					cursor ? gt(narrators.id, cursor) : undefined,
-				),
-			)
-			.orderBy(asc(narrators.id))
-			.limit(REVOCATION_PAGE_SIZE + 1);
+		const rows: { id: string }[] = await readQuery(
+			db
+				.select({ id: narrators.id })
+				.from(integrationResourceBindings)
+				.innerJoin(narrators, eq(narrators.id, integrationResourceBindings.resourceId))
+				.where(
+					and(
+						eq(integrationResourceBindings.resourceType, "narrator"),
+						eq(integrationResourceBindings.sourceType, "oauth_client"),
+						eq(integrationResourceBindings.authorityType, "oauth_grant"),
+						eq(integrationResourceBindings.authorityId, input.grantId),
+						eq(integrationResourceBindings.state, "active"),
+						inArray(narrators.contextProjectId, projects),
+						cursor ? gt(narrators.id, cursor) : undefined,
+					),
+				)
+				.orderBy(asc(narrators.id))
+				.limit(REVOCATION_PAGE_SIZE + 1),
+			{ site: "server/services/oauth-runtime-revocation.read" },
+		);
 		const page = rows.slice(0, REVOCATION_PAGE_SIZE);
 		for (const row of page) {
 			await stopOAuthNarratorForAuthorizationLoss(row.id, "OAuth narrator project access removed");
@@ -285,19 +304,22 @@ export async function propagateOAuthClientRestriction(
 	let cursor: string | null = null;
 	let stopped = 0;
 	for (;;) {
-		const rows = await db
-			.select({ id: integrationAuthorities.id })
-			.from(integrationAuthorities)
-			.where(
-				and(
-					eq(integrationAuthorities.kind, "oauth_grant"),
-					eq(integrationAuthorities.integrationType, "oauth_client"),
-					eq(integrationAuthorities.integrationId, oauthClientId),
-					cursor ? gt(integrationAuthorities.id, cursor) : undefined,
-				),
-			)
-			.orderBy(asc(integrationAuthorities.id))
-			.limit(REVOCATION_PAGE_SIZE + 1);
+		const rows: { id: string }[] = await readQuery(
+			db
+				.select({ id: integrationAuthorities.id })
+				.from(integrationAuthorities)
+				.where(
+					and(
+						eq(integrationAuthorities.kind, "oauth_grant"),
+						eq(integrationAuthorities.integrationType, "oauth_client"),
+						eq(integrationAuthorities.integrationId, oauthClientId),
+						cursor ? gt(integrationAuthorities.id, cursor) : undefined,
+					),
+				)
+				.orderBy(asc(integrationAuthorities.id))
+				.limit(REVOCATION_PAGE_SIZE + 1),
+			{ site: "server/services/oauth-runtime-revocation.read" },
+		);
 		const page = rows.slice(0, REVOCATION_PAGE_SIZE);
 		const grantIds = page.map((row) => row.id);
 		for (const grantId of grantIds) {
@@ -316,22 +338,25 @@ export async function propagateOAuthProjectRemoval(projectId: string): Promise<n
 	let cursor: string | null = null;
 	let stopped = await disconnectDevicesByProjectPage(projectId, "OAuth device project deleted");
 	for (;;) {
-		const rows = await db
-			.select({ id: narrators.id })
-			.from(integrationResourceBindings)
-			.innerJoin(narrators, eq(narrators.id, integrationResourceBindings.resourceId))
-			.where(
-				and(
-					eq(integrationResourceBindings.resourceType, "narrator"),
-					eq(integrationResourceBindings.sourceType, "oauth_client"),
-					eq(integrationResourceBindings.authorityType, "oauth_grant"),
-					eq(integrationResourceBindings.state, "active"),
-					eq(narrators.contextProjectId, projectId),
-					cursor ? gt(narrators.id, cursor) : undefined,
-				),
-			)
-			.orderBy(asc(narrators.id))
-			.limit(REVOCATION_PAGE_SIZE + 1);
+		const rows: { id: string }[] = await readQuery(
+			db
+				.select({ id: narrators.id })
+				.from(integrationResourceBindings)
+				.innerJoin(narrators, eq(narrators.id, integrationResourceBindings.resourceId))
+				.where(
+					and(
+						eq(integrationResourceBindings.resourceType, "narrator"),
+						eq(integrationResourceBindings.sourceType, "oauth_client"),
+						eq(integrationResourceBindings.authorityType, "oauth_grant"),
+						eq(integrationResourceBindings.state, "active"),
+						eq(narrators.contextProjectId, projectId),
+						cursor ? gt(narrators.id, cursor) : undefined,
+					),
+				)
+				.orderBy(asc(narrators.id))
+				.limit(REVOCATION_PAGE_SIZE + 1),
+			{ site: "server/services/oauth-runtime-revocation.read" },
+		);
 		const page = rows.slice(0, REVOCATION_PAGE_SIZE);
 		for (const row of page) {
 			await stopOAuthNarratorForAuthorizationLoss(row.id, "OAuth narrator project deleted");

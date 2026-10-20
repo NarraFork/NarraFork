@@ -58,6 +58,7 @@ import {
 	narratorMessageRefs,
 	narrators,
 } from "../db/schema";
+import { readQuery, readSqlRows } from "../db/worker-read";
 import type { NarraForkEvent } from "../lib/event-bus";
 import { eventBus } from "../lib/event-bus";
 import { logger } from "../lib/logger";
@@ -82,19 +83,25 @@ import { createNarratorSyncScheduler } from "./project-db-sync-scheduler";
 
 /** Get the projectId for a chapter. */
 async function projectIdForChapter(chapterId: string): Promise<string | null> {
-	const row = await db.query.chapters.findFirst({
-		where: eq(chapters.id, chapterId),
-		columns: { projectId: true },
-	});
+	const row = await readQuery(
+		db.query.chapters.findFirst({
+			where: eq(chapters.id, chapterId),
+			columns: { projectId: true },
+		}),
+		{ site: "projectArchive.chapterProject" },
+	);
 	return row?.projectId ?? null;
 }
 
 /** Context affiliation is explicit; cwd is never an ownership heuristic. */
 async function projectIdsForNarrator(narratorId: string): Promise<string[]> {
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { chapterId: true, contextProjectId: true },
-	});
+	const narrator = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { chapterId: true, contextProjectId: true },
+		}),
+		{ site: "projectArchive.narratorProjects" },
+	);
 	if (!narrator) return [];
 	const chapterProject = narrator.chapterId ? await projectIdForChapter(narrator.chapterId) : null;
 	return [
@@ -269,11 +276,11 @@ async function syncNarratorMessagesIntoProject(
 	const syncedIds = new Set<string>();
 	let archivedAfter = "";
 	for (;;) {
-		const page = pdb
-			.prepare(
-				"SELECT id,message_id FROM narrator_message_refs WHERE narrator_id=? AND id>? ORDER BY id LIMIT 500",
-			)
-			.all(narratorId, archivedAfter) as { id: string; message_id: string }[];
+		const page = await readSqlRows<{ id: string; message_id: string }>(
+			"SELECT id,message_id FROM narrator_message_refs WHERE narrator_id=? AND id>? ORDER BY id LIMIT 500",
+			[narratorId, archivedAfter],
+			{ dbPath: pdb.filename, site: "projectArchive.syncedRefs" },
+		);
 		if (!page.length) break;
 		for (const ref of page) syncedIds.add(ref.message_id);
 		archivedAfter = page.at(-1)?.id ?? archivedAfter;
@@ -289,14 +296,20 @@ async function syncNarratorMessagesIntoProject(
 	const mainRefs: { id: string; messageId: string }[] = [];
 	let mainAfter = "";
 	for (;;) {
-		const page = await db
-			.select({ id: narratorMessageRefs.id, messageId: narratorMessageRefs.messageId })
-			.from(narratorMessageRefs)
-			.where(
-				and(eq(narratorMessageRefs.narratorId, narratorId), gt(narratorMessageRefs.id, mainAfter)),
-			)
-			.orderBy(narratorMessageRefs.id)
-			.limit(500);
+		const page = await readQuery(
+			db
+				.select({ id: narratorMessageRefs.id, messageId: narratorMessageRefs.messageId })
+				.from(narratorMessageRefs)
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						gt(narratorMessageRefs.id, mainAfter),
+					),
+				)
+				.orderBy(narratorMessageRefs.id)
+				.limit(500),
+			{ site: "projectArchive.mainRefs" },
+		);
 		if (!page.length) break;
 		mainRefs.push(...page);
 		mainAfter = page.at(-1)?.id ?? mainAfter;
@@ -346,10 +359,10 @@ async function syncExplorationGroups(
 async function syncMergeSessions(projectId: string, control: ExportControl = {}): Promise<void> {
 	const pdb = await getProjectDb(projectId);
 	if (!pdb) return;
-	const chapterRows = await db
-		.select({ id: chapters.id })
-		.from(chapters)
-		.where(eq(chapters.projectId, projectId));
+	const chapterRows = await readQuery(
+		db.select({ id: chapters.id }).from(chapters).where(eq(chapters.projectId, projectId)),
+		{ site: "projectArchive.chapterIds" },
+	);
 	if (chapterRows.length === 0) return;
 	const chapterIds = chapterRows.map((c) => c.id);
 	// Placeholders for the DELETE IN clause. chapterIds are nanoid strings from a DB query.
@@ -433,10 +446,13 @@ function cleanupOrphanMessages(pdb: Database): void {
  */
 async function deleteChapterFromProjectDb(chapterId: string, projectId: string): Promise<void> {
 	// If the chapter still exists in the main DB (cleanup scenario), just sync the updated status.
-	const row = await db.query.chapters.findFirst({
-		where: eq(chapters.id, chapterId),
-		columns: { id: true },
-	});
+	const row = await readQuery(
+		db.query.chapters.findFirst({
+			where: eq(chapters.id, chapterId),
+			columns: { id: true },
+		}),
+		{ site: "projectArchive.chapterExists" },
+	);
 	if (row) {
 		await syncChapter(chapterId);
 		return;
@@ -449,9 +465,11 @@ async function deleteChapterFromProjectDb(chapterId: string, projectId: string):
 	const narratorIds: string[] = [];
 	let after = "";
 	for (;;) {
-		const page = pdb
-			.prepare("SELECT id FROM narrators WHERE chapter_id = ? AND id > ? ORDER BY id LIMIT 500")
-			.all(chapterId, after) as { id: string }[];
+		const page = await readSqlRows<{ id: string }>(
+			"SELECT id FROM narrators WHERE chapter_id = ? AND id > ? ORDER BY id LIMIT 500",
+			[chapterId, after],
+			{ dbPath: pdb.filename, site: "projectArchive.chapterNarrators" },
+		);
 		if (!page.length) break;
 		for (const candidate of page) {
 			const live = await mainStore.readRows({
@@ -463,32 +481,32 @@ async function deleteChapterFromProjectDb(chapterId: string, projectId: string):
 				// The narrator survived detachment: keep its refs/messages and copy the new affiliation.
 				await copyById(pdb, "narrators", "id", [candidate.id]);
 			} else {
-				const shared = pdb
-					.prepare(
-						"SELECT 1 FROM narrator_messages m JOIN narrator_message_refs r ON r.message_id=m.id WHERE m.narrator_id=? AND r.narrator_id<>? LIMIT 1",
-					)
-					.get(candidate.id, candidate.id);
-				if (shared) {
-					pdb.run("UPDATE narrators SET chapter_id=NULL,status='archived' WHERE id=?", [
-						candidate.id,
-					]);
-					logger.warn("Retaining shared history author after chapter deletion", {
-						projectId,
-						narratorId: candidate.id,
-					});
-				} else narratorIds.push(candidate.id);
+				narratorIds.push(candidate.id);
 			}
 		}
 		after = page.at(-1)?.id ?? after;
 	}
 
 	const tx = pdb.transaction(() => {
-		if (narratorIds.length > 0) {
-			// narratorIds are nanoid strings from a DB query — safe for IN-clause interpolation
-			const ph = narratorIds.map(() => "?").join(",");
-			pdb.run(`DELETE FROM narrator_tool_calls WHERE narrator_id IN (${ph})`, narratorIds);
-			pdb.run(`DELETE FROM narrator_message_refs WHERE narrator_id IN (${ph})`, narratorIds);
-			pdb.run(`DELETE FROM narrators WHERE id IN (${ph})`, narratorIds);
+		// Recheck shared-history ownership in the existing write transaction: paging and
+		// source reads above yield, so another sync may have added references meanwhile.
+		for (const narratorId of narratorIds) {
+			const shared = pdb
+				.prepare(
+					"SELECT 1 FROM narrator_messages m JOIN narrator_message_refs r ON r.message_id=m.id WHERE m.narrator_id=? AND r.narrator_id<>? LIMIT 1",
+				)
+				.get(narratorId, narratorId);
+			if (shared) {
+				pdb.run("UPDATE narrators SET chapter_id=NULL,status='archived' WHERE id=?", [narratorId]);
+				logger.warn("Retaining shared history author after chapter deletion", {
+					projectId,
+					narratorId,
+				});
+			} else {
+				pdb.run("DELETE FROM narrator_tool_calls WHERE narrator_id=?", [narratorId]);
+				pdb.run("DELETE FROM narrator_message_refs WHERE narrator_id=?", [narratorId]);
+				pdb.run("DELETE FROM narrators WHERE id=?", [narratorId]);
+			}
 		}
 
 		pdb.run("DELETE FROM chapter_commits WHERE chapter_id = ?", [chapterId]);
@@ -577,10 +595,10 @@ export async function fullSync(
 	counts.projects = 1;
 
 	// 2. Chapters — replaced, so chapters removed from the main DB disappear here too.
-	const chapterRows = await db
-		.select({ id: chapters.id })
-		.from(chapters)
-		.where(eq(chapters.projectId, projectId));
+	const chapterRows = await readQuery(
+		db.select({ id: chapters.id }).from(chapters).where(eq(chapters.projectId, projectId)),
+		{ site: "projectArchive.chapterIds" },
+	);
 	const chapterIds = chapterRows.map((c) => c.id);
 	counts.chapters = await replaceById(
 		pdb,
@@ -637,11 +655,11 @@ export async function fullSync(
 	const narratorIds = [
 		...new Set([...contextNarrators, ...chapterNarrators].map((row) => String(row.id))),
 	];
-	const unknownLegacy = pdb
-		.prepare(
-			"SELECT id FROM narrators WHERE chapter_id IS NULL AND context_project_id IS NULL LIMIT 1",
-		)
-		.get();
+	const [unknownLegacy] = await readSqlRows(
+		"SELECT id FROM narrators WHERE chapter_id IS NULL AND context_project_id IS NULL LIMIT 1",
+		[],
+		{ dbPath: pdb.filename, site: "projectArchive.legacyNarrator" },
+	);
 	if (unknownLegacy)
 		logger.warn("Retaining project archive narrators with unknown legacy affiliation", {
 			projectId,
@@ -774,10 +792,13 @@ async function handleEvent(event: NarraForkEvent): Promise<void> {
 		case "exploration:chapter_added": {
 			// We need the projectId — get it from the group itself
 			const groupId = event.groupId;
-			const group = await db.query.explorationGroups.findFirst({
-				where: eq(explorationGroups.id, groupId),
-				columns: { projectId: true },
-			});
+			const group = await readQuery(
+				db.query.explorationGroups.findFirst({
+					where: eq(explorationGroups.id, groupId),
+					columns: { projectId: true },
+				}),
+				{ site: "projectArchive.groupProject" },
+			);
 			if (group) await syncExplorationGroups(group.projectId);
 			break;
 		}
@@ -791,10 +812,13 @@ async function handleEvent(event: NarraForkEvent): Promise<void> {
 		}
 		case "merge:cancelled": {
 			// merge:cancelled has no targetChapterId — look up via mergeSessionId
-			const session = await db.query.mergeSessions.findFirst({
-				where: eq(mergeSessions.id, event.mergeSessionId),
-				columns: { targetChapterId: true },
-			});
+			const session = await readQuery(
+				db.query.mergeSessions.findFirst({
+					where: eq(mergeSessions.id, event.mergeSessionId),
+					columns: { targetChapterId: true },
+				}),
+				{ site: "projectArchive.mergeTarget" },
+			);
 			if (session) {
 				const pid6 = await projectIdForChapter(session.targetChapterId);
 				if (pid6) await syncMergeSessions(pid6);

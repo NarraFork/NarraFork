@@ -4,6 +4,8 @@
  * No filesystem bytes, host-only storage paths, or provider payloads belong here.
  */
 export const FILE_CHANGE_EVIDENCE_VERSION = 2;
+/** One physical evidence namespace per database. */
+export const FILE_CHANGE_BLOB_BUDGET_ID = "file-change-blobs";
 
 export interface FileHistoryTarget {
 	deviceId: string;

@@ -726,15 +726,15 @@ test("real loader plus currentRevision adoption retain exact history identity an
 	});
 	const first = await buildRuntimeHistory(options());
 	expect(first.currentText).toBe('<sender kind="human" />\nedited current');
-	expect(store.getByDelivery(row.deliveryId as string)?.currentAdoptedAt).toBeNull();
+	expect((await store.getByDelivery(row.deliveryId as string))?.currentAdoptedAt).toBeNull();
 	consumeAgentMessageHistory([...first.history], first.currentText);
 	consumeAgentMessageHistory(first.history, "other replacement input");
 	await new Promise((resolve) => setTimeout(resolve, 0));
-	expect(store.getByDelivery(row.deliveryId as string)?.currentAdoptedAt).toBeNull();
+	expect((await store.getByDelivery(row.deliveryId as string))?.currentAdoptedAt).toBeNull();
 	const accepted = await buildRuntimeHistory(options());
 	consumeAgentMessageHistory(accepted.history, accepted.currentText);
 	await new Promise((resolve) => setTimeout(resolve, 0));
-	expect(store.getByDelivery(row.deliveryId as string)).toMatchObject({
+	expect(await store.getByDelivery(row.deliveryId as string)).toMatchObject({
 		currentAdoptedRevision: 2,
 		adoptedAt: null,
 	});
@@ -790,11 +790,11 @@ test("grouped extracted sys receipts require the exact projected packet before a
 	expect(prepared.currentText).toContain('<sender kind="agent" id="agent-b" name="B" />\ntwo');
 	consumeAgentMessageHistory(prepared.history, "unrelated replacement input");
 	await new Promise((resolve) => setTimeout(resolve, 0));
-	expect(store.getByDelivery(row.deliveryId as string)?.adoptedAt).toBeNull();
+	expect((await store.getByDelivery(row.deliveryId as string))?.adoptedAt).toBeNull();
 	const accepted = await buildRuntimeHistory(options());
 	consumeAgentMessageHistory(accepted.history, accepted.currentText);
 	await new Promise((resolve) => setTimeout(resolve, 0));
-	expect(store.getByDelivery(row.deliveryId as string)?.adoptedAt).not.toBeNull();
+	expect((await store.getByDelivery(row.deliveryId as string))?.adoptedAt).not.toBeNull();
 });
 
 test("an already prepared initial packet is not attributed or extracted twice", async () => {

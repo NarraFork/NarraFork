@@ -12,6 +12,7 @@ import { gitAvailable, recheckGit } from "./lib/git-status";
 import { logger } from "./lib/logger";
 import { narratorPrincipalOf } from "./lib/narrator-access";
 import { getRuntimeEnvironment } from "./lib/platform";
+import { requestDiagnostics } from "./lib/request-diagnostics";
 import { claimRevealToken, REVEAL_CLAIM_PATH } from "./lib/reveal-protocol";
 import { handleGracefullyShutdownRequest } from "./lib/server-restart";
 import { settings } from "./lib/settings";
@@ -112,8 +113,6 @@ export interface AppEnv {
 
 const app = new Hono<AppEnv>();
 
-const SLOW_API_REQUEST_MS = 1_000;
-
 /*
  * Cross-origin policy for `/api/*`.
  *
@@ -187,6 +186,7 @@ app.use(
 		exposeHeaders: [
 			SESSION_RENEWAL_HEADER,
 			"Content-Disposition",
+			"X-Request-Id",
 			"X-Session-Id",
 			"X-Resume-Command",
 			"X-Session-Warnings",
@@ -210,20 +210,14 @@ app.use("/api/*", async (c, next) => {
 });
 
 app.use("/api/*", async (c, next) => {
-	const startedAt = performance.now();
-	try {
-		await next();
-	} finally {
-		const durationMs = Math.round((performance.now() - startedAt) * 100) / 100;
-		if (durationMs >= SLOW_API_REQUEST_MS) {
-			logger.warn("Slow API request", {
-				method: c.req.method,
-				path: c.req.path,
-				status: c.res.status,
-				durationMs,
-			});
-		}
-	}
+	await requestDiagnostics.request(
+		c.req.path,
+		async (id) => {
+			c.header("X-Request-Id", id);
+			await next();
+		},
+		() => ({ status: c.res.status, cancelled: c.req.raw.signal.aborted }),
+	);
 });
 
 // Public routes (no auth required)

@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 import type { ScheduledTaskCleanupResult } from "@shared/scheduled-task-cleanup";
 import { and, desc, eq, inArray, lt, lte, ne, or, sql } from "drizzle-orm";
 import { db } from "../db";
@@ -53,11 +54,13 @@ async function loadBoundedSubtree(root: TreeRow): Promise<TreeRow[] | null> {
 	const seen = new Set([root.id]);
 	let frontier = [root.id];
 	while (frontier.length) {
-		const children = await db
-			.select(cleanupColumns)
-			.from(narrators)
-			.where(inArray(narrators.parentNarratorId, frontier))
-			.limit(SUBTREE_LIMIT - rows.length + 1);
+		const children = await readQuery(
+			db
+				.select(cleanupColumns)
+				.from(narrators)
+				.where(inArray(narrators.parentNarratorId, frontier))
+				.limit(SUBTREE_LIMIT - rows.length + 1),
+		);
 		if (rows.length + children.length > SUBTREE_LIMIT) return null;
 		frontier = [];
 		for (const child of children) {
@@ -75,10 +78,12 @@ export async function cleanupScheduledTaskNarrators(
 	taskId: string,
 ): Promise<ScheduledTaskCleanupResult> {
 	return cleanupLock.acquire(taskId, async () => {
-		const task = await db.query.scheduledTasks.findFirst({
-			where: eq(scheduledTasks.id, taskId),
-			columns: { cleanupPolicy: true, reuseNarratorId: true, createdBy: true },
-		});
+		const task = await readQuery(
+			db.query.scheduledTasks.findFirst({
+				where: eq(scheduledTasks.id, taskId),
+				columns: { cleanupPolicy: true, reuseNarratorId: true, createdBy: true },
+			}),
+		);
 		if (!task) throw new NotFoundError("ScheduledTask", taskId);
 		const policy = task.cleanupPolicy;
 		const result: ScheduledTaskCleanupResult = {
@@ -103,13 +108,15 @@ export async function cleanupScheduledTaskNarrators(
 		const boundary =
 			policy.mode === "keepLatestN"
 				? (
-						await db
-							.select({ createdAt: narrators.createdAt, id: narrators.id })
-							.from(narrators)
-							.where(eq(narrators.scheduledTaskId, taskId))
-							.orderBy(desc(narrators.createdAt), desc(narrators.id))
-							.offset(policy.keepLatestN)
-							.limit(1)
+						await readQuery(
+							db
+								.select({ createdAt: narrators.createdAt, id: narrators.id })
+								.from(narrators)
+								.where(eq(narrators.scheduledTaskId, taskId))
+								.orderBy(desc(narrators.createdAt), desc(narrators.id))
+								.offset(policy.keepLatestN)
+								.limit(1),
+						)
 					)[0]
 				: undefined;
 		if (policy.mode === "keepLatestN" && !boundary) {
@@ -117,32 +124,34 @@ export async function cleanupScheduledTaskNarrators(
 			return result;
 		}
 		// The covering (task, createdAt, id) index supplies the retention ordering.
-		const candidates = await db
-			.select(cleanupColumns)
-			.from(narrators)
-			.where(
-				and(
-					eq(narrators.scheduledTaskId, taskId),
-					cutoff ? lt(narrators.createdAt, cutoff) : undefined,
-					boundary
-						? or(
-								lt(narrators.createdAt, boundary.createdAt),
-								and(eq(narrators.createdAt, boundary.createdAt), lte(narrators.id, boundary.id)),
-							)
-						: undefined,
-					activeCursor
-						? or(
-								lt(narrators.createdAt, activeCursor.createdAt),
-								and(
-									eq(narrators.createdAt, activeCursor.createdAt),
-									lt(narrators.id, activeCursor.id),
-								),
-							)
-						: undefined,
-				),
-			)
-			.orderBy(desc(narrators.createdAt), desc(narrators.id))
-			.limit(TASK_CLEANUP_ROOT_LIMIT + 1);
+		const candidates = await readQuery(
+			db
+				.select(cleanupColumns)
+				.from(narrators)
+				.where(
+					and(
+						eq(narrators.scheduledTaskId, taskId),
+						cutoff ? lt(narrators.createdAt, cutoff) : undefined,
+						boundary
+							? or(
+									lt(narrators.createdAt, boundary.createdAt),
+									and(eq(narrators.createdAt, boundary.createdAt), lte(narrators.id, boundary.id)),
+								)
+							: undefined,
+						activeCursor
+							? or(
+									lt(narrators.createdAt, activeCursor.createdAt),
+									and(
+										eq(narrators.createdAt, activeCursor.createdAt),
+										lt(narrators.id, activeCursor.id),
+									),
+								)
+							: undefined,
+					),
+				)
+				.orderBy(desc(narrators.createdAt), desc(narrators.id))
+				.limit(TASK_CLEANUP_ROOT_LIMIT + 1),
+		);
 		result.limited = candidates.length > TASK_CLEANUP_ROOT_LIMIT;
 		for (const root of candidates.slice(0, TASK_CLEANUP_ROOT_LIMIT)) {
 			if (performance.now() - startedAt > BATCH_BUDGET_MS) {
@@ -170,11 +179,9 @@ export async function cleanupScheduledTaskNarrators(
 					// Re-read the complete bounded tree under the lifecycle reservation. In particular,
 					// a start/resume/fork that won admission must never be interrupted for retention.
 					const current = (
-						await db
-							.select(cleanupColumns)
-							.from(narrators)
-							.where(eq(narrators.id, root.id))
-							.limit(1)
+						await readQuery(
+							db.select(cleanupColumns).from(narrators).where(eq(narrators.id, root.id)).limit(1),
+						)
 					)[0];
 					if (
 						!current ||
@@ -193,39 +200,45 @@ export async function cleanupScheduledTaskNarrators(
 						return null;
 					// Do not delete a root that another task currently depends on, even if this task created it.
 					const ids = subtree.map((n) => n.id);
-					const referenced = await db
-						.select({ id: scheduledTasks.id })
-						.from(scheduledTasks)
-						.where(
-							and(
-								ne(scheduledTasks.id, taskId),
-								or(
-									inArray(scheduledTasks.reuseNarratorId, ids),
-									inArray(scheduledTasks.lastNarratorId, ids),
+					const referenced = await readQuery(
+						db
+							.select({ id: scheduledTasks.id })
+							.from(scheduledTasks)
+							.where(
+								and(
+									ne(scheduledTasks.id, taskId),
+									or(
+										inArray(scheduledTasks.reuseNarratorId, ids),
+										inArray(scheduledTasks.lastNarratorId, ids),
+									),
 								),
-							),
-						)
-						.limit(1);
+							)
+							.limit(1),
+					);
 					if (referenced.some((t) => t.id !== taskId)) return null;
-					const activeTasks = await db
-						.select({ id: backgroundTasks.id })
-						.from(backgroundTasks)
-						.where(
-							and(
-								or(
-									inArray(backgroundTasks.parentNarratorId, ids),
-									inArray(backgroundTasks.subagentNarratorId, ids),
+					const activeTasks = await readQuery(
+						db
+							.select({ id: backgroundTasks.id })
+							.from(backgroundTasks)
+							.where(
+								and(
+									or(
+										inArray(backgroundTasks.parentNarratorId, ids),
+										inArray(backgroundTasks.subagentNarratorId, ids),
+									),
+									inArray(backgroundTasks.status, ["running", "paused"]),
 								),
-								inArray(backgroundTasks.status, ["running", "paused"]),
-							),
-						)
-						.limit(1);
+							)
+							.limit(1),
+					);
 					if (activeTasks.length) return null;
-					const running = await db
-						.select({ narratorId: terminals.narratorId })
-						.from(terminals)
-						.where(and(inArray(terminals.narratorId, ids), eq(terminals.status, "running")))
-						.limit(1);
+					const running = await readQuery(
+						db
+							.select({ narratorId: terminals.narratorId })
+							.from(terminals)
+							.where(and(inArray(terminals.narratorId, ids), eq(terminals.status, "running")))
+							.limit(1),
+					);
 					const plan = buildNarratorCleanupPlan(
 						"scheduledSessions",
 						subtree.map((n) => ({
@@ -244,19 +257,23 @@ export async function cleanupScheduledTaskNarrators(
 					if (!plan.safeRoots.length) return null;
 					// Existing removal materializes/shared-history rows synchronously. Refuse giant
 					// sessions on this hot path; LIMIT probes do not fetch content or run COUNT.
-					const messages = await db
-						.select({
-							id: narratorMessages.id,
-							bytes: sql<number>`COALESCE(length(CAST(${narratorMessages.contentJson} AS BLOB)), 0)`,
-						})
-						.from(narratorMessages)
-						.where(inArray(narratorMessages.narratorId, ids))
-						.limit(1001);
-					const tools = await db
-						.select({ id: narratorToolCalls.id })
-						.from(narratorToolCalls)
-						.where(inArray(narratorToolCalls.narratorId, ids))
-						.limit(1001);
+					const messages = await readQuery(
+						db
+							.select({
+								id: narratorMessages.id,
+								bytes: sql<number>`COALESCE(length(CAST(${narratorMessages.contentJson} AS BLOB)), 0)`,
+							})
+							.from(narratorMessages)
+							.where(inArray(narratorMessages.narratorId, ids))
+							.limit(1001),
+					);
+					const tools = await readQuery(
+						db
+							.select({ id: narratorToolCalls.id })
+							.from(narratorToolCalls)
+							.where(inArray(narratorToolCalls.narratorId, ids))
+							.limit(1001),
+					);
 					if (
 						messages.length > 1000 ||
 						tools.length > 1000 ||

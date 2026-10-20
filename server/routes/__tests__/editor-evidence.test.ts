@@ -681,7 +681,7 @@ describe("editor evidence failures and immutable human projection", () => {
 		const path = join(workspace, "quota.txt");
 		await writeFile(path, `before-${narratorId}`);
 		const { catalog } = await runtime.initialize();
-		const budget = catalog.getBudget();
+		const budget = await catalog.getBudget();
 		if (!budget) throw new Error("No budget");
 		db.update(fileChangeStorageBudgets)
 			.set({ quotaBytes: 0 })

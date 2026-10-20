@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 /**
  * Recursion ceiling for the `ForkNarrator` tool.
  *
@@ -63,10 +64,12 @@ async function chapterForkDepth(chapterId: string): Promise<number> {
 	for (let step = 0; step < LINEAGE_WALK_MAX_STEPS && currentId; step++) {
 		if (seen.has(currentId)) break;
 		seen.add(currentId);
-		const row: { parentChapterId: string | null } | undefined = await db.query.chapters.findFirst({
-			where: eq(chapters.id, currentId),
-			columns: { parentChapterId: true },
-		});
+		const row: { parentChapterId: string | null } | undefined = await readQuery(
+			db.query.chapters.findFirst({
+				where: eq(chapters.id, currentId),
+				columns: { parentChapterId: true },
+			}),
+		);
 		currentId = row?.parentChapterId ?? null;
 		if (currentId) depth++;
 	}
@@ -83,11 +86,11 @@ async function standaloneForkDepth(narratorId: string): Promise<number> {
 	for (let step = 0; step < LINEAGE_WALK_MAX_STEPS && currentId; step++) {
 		if (seen.has(currentId)) break;
 		seen.add(currentId);
-		const row: { parentNarratorId: string | null } | undefined = await db.query.narrators.findFirst(
-			{
+		const row: { parentNarratorId: string | null } | undefined = await readQuery(
+			db.query.narrators.findFirst({
 				where: eq(narrators.id, currentId),
 				columns: { parentNarratorId: true },
-			},
+			}),
 		);
 		currentId = row?.parentNarratorId ?? null;
 		if (currentId) depth++;

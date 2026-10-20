@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, statSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
+import { readQuery } from "@server/db/worker-read";
 import { and, desc, eq, isNull } from "drizzle-orm";
 import { db } from "../db";
 import {
@@ -49,16 +50,18 @@ function snapshotFilePath(projectId: string, snapshotId: string): string {
  * Returns the container ID string or throws if not found / not running.
  */
 async function resolveContainerId(chapterId: string, serviceName: string): Promise<string> {
-	const instance = await db.query.containerInstances.findFirst({
-		where: and(
-			eq(containerInstances.chapterId, chapterId),
-			isNull(containerInstances.worktreeResourceId),
-			and(
-				eq(containerInstances.serviceName, serviceName),
-				eq(containerInstances.status, "running"),
+	const instance = await readQuery(
+		db.query.containerInstances.findFirst({
+			where: and(
+				eq(containerInstances.chapterId, chapterId),
+				isNull(containerInstances.worktreeResourceId),
+				and(
+					eq(containerInstances.serviceName, serviceName),
+					eq(containerInstances.status, "running"),
+				),
 			),
-		),
-	});
+		}),
+	);
 	if (instance) assertLegacyRuntimeOwner(instance);
 	if (!instance?.containerId) {
 		throw new ValidationError(
@@ -89,9 +92,11 @@ export const volumeSnapshotService = {
 		const { projectId, chapterId, serviceName, containerPath, name, description, userId } = opts;
 
 		// Verify chapter belongs to project
-		const chapter = await db.query.chapters.findFirst({
-			where: and(eq(chapters.id, chapterId), eq(chapters.projectId, projectId)),
-		});
+		const chapter = await readQuery(
+			db.query.chapters.findFirst({
+				where: and(eq(chapters.id, chapterId), eq(chapters.projectId, projectId)),
+			}),
+		);
 		if (!chapter) {
 			throw new NotFoundError("Chapter", chapterId);
 		}
@@ -163,9 +168,11 @@ export const volumeSnapshotService = {
 				eventBus.emit({ type: "volume-snapshot:created", projectId, snapshotId });
 				logger.info("Volume snapshot created", { snapshotId, projectId, serviceName });
 
-				return db.query.volumeSnapshots.findFirst({
-					where: eq(volumeSnapshots.id, snapshotId),
-				});
+				return readQuery(
+					db.query.volumeSnapshots.findFirst({
+						where: eq(volumeSnapshots.id, snapshotId),
+					}),
+				);
 			} catch (err) {
 				// Clean up partial file on failure
 				try {
@@ -193,17 +200,21 @@ export const volumeSnapshotService = {
 		});
 		const { snapshotId, targetChapterId, userId } = opts;
 
-		const snapshot = await db.query.volumeSnapshots.findFirst({
-			where: eq(volumeSnapshots.id, snapshotId),
-		});
+		const snapshot = await readQuery(
+			db.query.volumeSnapshots.findFirst({
+				where: eq(volumeSnapshots.id, snapshotId),
+			}),
+		);
 		if (!snapshot) {
 			throw new NotFoundError("VolumeSnapshot", snapshotId);
 		}
 
 		// Verify target chapter belongs to same project
-		const chapter = await db.query.chapters.findFirst({
-			where: and(eq(chapters.id, targetChapterId), eq(chapters.projectId, snapshot.projectId)),
-		});
+		const chapter = await readQuery(
+			db.query.chapters.findFirst({
+				where: and(eq(chapters.id, targetChapterId), eq(chapters.projectId, snapshot.projectId)),
+			}),
+		);
 		if (!chapter) {
 			throw new NotFoundError("Chapter", targetChapterId);
 		}
@@ -326,19 +337,23 @@ export const volumeSnapshotService = {
 		if (filters?.containerPath) {
 			conditions.push(eq(volumeSnapshots.containerPath, filters.containerPath));
 		}
-		return db.query.volumeSnapshots.findMany({
-			where: conditions.length === 1 ? conditions[0] : and(conditions[0], ...conditions.slice(1)),
-			orderBy: [desc(volumeSnapshots.createdAt)],
-		});
+		return readQuery(
+			db.query.volumeSnapshots.findMany({
+				where: conditions.length === 1 ? conditions[0] : and(conditions[0], ...conditions.slice(1)),
+				orderBy: [desc(volumeSnapshots.createdAt)],
+			}),
+		);
 	},
 
 	/**
 	 * Get a single snapshot by ID.
 	 */
 	async getSnapshot(snapshotId: string) {
-		const snapshot = await db.query.volumeSnapshots.findFirst({
-			where: eq(volumeSnapshots.id, snapshotId),
-		});
+		const snapshot = await readQuery(
+			db.query.volumeSnapshots.findFirst({
+				where: eq(volumeSnapshots.id, snapshotId),
+			}),
+		);
 		if (!snapshot) {
 			throw new NotFoundError("VolumeSnapshot", snapshotId);
 		}
@@ -349,9 +364,11 @@ export const volumeSnapshotService = {
 	 * Update snapshot metadata (name / description).
 	 */
 	async updateSnapshot(snapshotId: string, data: { name?: string; description?: string | null }) {
-		const snapshot = await db.query.volumeSnapshots.findFirst({
-			where: eq(volumeSnapshots.id, snapshotId),
-		});
+		const snapshot = await readQuery(
+			db.query.volumeSnapshots.findFirst({
+				where: eq(volumeSnapshots.id, snapshotId),
+			}),
+		);
 		if (!snapshot) {
 			throw new NotFoundError("VolumeSnapshot", snapshotId);
 		}
@@ -359,9 +376,11 @@ export const volumeSnapshotService = {
 			.update(volumeSnapshots)
 			.set({ ...data, updatedAt: new Date().toISOString() })
 			.where(eq(volumeSnapshots.id, snapshotId));
-		return db.query.volumeSnapshots.findFirst({
-			where: eq(volumeSnapshots.id, snapshotId),
-		});
+		return readQuery(
+			db.query.volumeSnapshots.findFirst({
+				where: eq(volumeSnapshots.id, snapshotId),
+			}),
+		);
 	},
 
 	/**
@@ -369,9 +388,11 @@ export const volumeSnapshotService = {
 	 * Guarded by snapshotDeleteLock to prevent racing with applySnapshot.
 	 */
 	async deleteSnapshot(snapshotId: string) {
-		const snapshot = await db.query.volumeSnapshots.findFirst({
-			where: eq(volumeSnapshots.id, snapshotId),
-		});
+		const snapshot = await readQuery(
+			db.query.volumeSnapshots.findFirst({
+				where: eq(volumeSnapshots.id, snapshotId),
+			}),
+		);
 		if (!snapshot) {
 			throw new NotFoundError("VolumeSnapshot", snapshotId);
 		}
@@ -406,16 +427,20 @@ export const volumeSnapshotService = {
 	 */
 	async getApplicationHistory(opts: { snapshotId?: string; chapterId?: string }) {
 		if (opts.snapshotId) {
-			return db.query.volumeSnapshotApplications.findMany({
-				where: eq(volumeSnapshotApplications.snapshotId, opts.snapshotId),
-				orderBy: [desc(volumeSnapshotApplications.appliedAt)],
-			});
+			return readQuery(
+				db.query.volumeSnapshotApplications.findMany({
+					where: eq(volumeSnapshotApplications.snapshotId, opts.snapshotId),
+					orderBy: [desc(volumeSnapshotApplications.appliedAt)],
+				}),
+			);
 		}
 		if (opts.chapterId) {
-			return db.query.volumeSnapshotApplications.findMany({
-				where: eq(volumeSnapshotApplications.chapterId, opts.chapterId),
-				orderBy: [desc(volumeSnapshotApplications.appliedAt)],
-			});
+			return readQuery(
+				db.query.volumeSnapshotApplications.findMany({
+					where: eq(volumeSnapshotApplications.chapterId, opts.chapterId),
+					orderBy: [desc(volumeSnapshotApplications.appliedAt)],
+				}),
+			);
 		}
 		return [];
 	},

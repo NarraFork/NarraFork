@@ -27,6 +27,7 @@
  *    branch kept, worktree absent, forkable, wakeable.
  */
 import { resolve } from "node:path";
+import { readQuery } from "@server/db/worker-read";
 import { and, desc, eq, inArray, isNotNull, sql } from "drizzle-orm";
 import { db } from "../db";
 import {
@@ -152,10 +153,12 @@ export async function resolveTruncationSeqForCommit(
 		repoPath?: string | null;
 	} = {},
 ): Promise<TruncationPoint | null> {
-	const primaryNarrator = await db.query.narrators.findFirst({
-		where: and(eq(narrators.chapterId, chapterId), eq(narrators.variant, "primary")),
-		columns: { id: true },
-	});
+	const primaryNarrator = await readQuery(
+		db.query.narrators.findFirst({
+			where: and(eq(narrators.chapterId, chapterId), eq(narrators.variant, "primary")),
+			columns: { id: true },
+		}),
+	);
 	if (!primaryNarrator) return null;
 	const narratorId = primaryNarrator.id;
 
@@ -165,20 +168,24 @@ export async function resolveTruncationSeqForCommit(
 			// A backfill failure is indistinguishable here from "the message is not
 			// this narrator's"; the ref lookup below decides either way.
 		});
-		const ref = await db.query.narratorMessageRefs.findFirst({
-			where: and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessageRefs.messageId, messageId),
-			),
-			columns: { seq: true },
-		});
+		const ref = await readQuery(
+			db.query.narratorMessageRefs.findFirst({
+				where: and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					eq(narratorMessageRefs.messageId, messageId),
+				),
+				columns: { seq: true },
+			}),
+		);
 		return ref?.seq ?? null;
 	};
 
-	const exact = await db.query.chapterCommits.findFirst({
-		where: and(eq(chapterCommits.chapterId, chapterId), eq(chapterCommits.sha, commitSha)),
-		columns: { narratorMessageId: true },
-	});
+	const exact = await readQuery(
+		db.query.chapterCommits.findFirst({
+			where: and(eq(chapterCommits.chapterId, chapterId), eq(chapterCommits.sha, commitSha)),
+			columns: { narratorMessageId: true },
+		}),
+	);
 	if (exact?.narratorMessageId) {
 		const seq = await seqOf(exact.narratorMessageId);
 		if (seq != null) {
@@ -195,32 +202,36 @@ export async function resolveTruncationSeqForCommit(
 	// names a message; they are ranked by `seq` and probed for ancestry in that
 	// order, so the answer is "the latest conversation point whose commit is
 	// contained in C" rather than "the latest by wall clock".
-	const candidates = await db
-		.select({ sha: chapterCommits.sha, messageId: chapterCommits.narratorMessageId })
-		.from(chapterCommits)
-		.where(
-			and(
-				eq(chapterCommits.chapterId, chapterId),
-				isNotNull(chapterCommits.narratorMessageId),
-				sql`${chapterCommits.sha} <> ${commitSha}`,
-			),
-		)
-		.orderBy(desc(chapterCommits.authoredAt))
-		.limit(MAX_APPROXIMATION_CANDIDATES);
+	const candidates = await readQuery(
+		db
+			.select({ sha: chapterCommits.sha, messageId: chapterCommits.narratorMessageId })
+			.from(chapterCommits)
+			.where(
+				and(
+					eq(chapterCommits.chapterId, chapterId),
+					isNotNull(chapterCommits.narratorMessageId),
+					sql`${chapterCommits.sha} <> ${commitSha}`,
+				),
+			)
+			.orderBy(desc(chapterCommits.authoredAt))
+			.limit(MAX_APPROXIMATION_CANDIDATES),
+	);
 	if (candidates.length === 0) return null;
 
 	const messageIds = candidates.map((c) => c.messageId).filter((id): id is string => id !== null);
 	if (messageIds.length === 0) return null;
 
-	const refs = await db
-		.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
-		.from(narratorMessageRefs)
-		.where(
-			and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				inArray(narratorMessageRefs.messageId, messageIds),
+	const refs = await readQuery(
+		db
+			.select({ messageId: narratorMessageRefs.messageId, seq: narratorMessageRefs.seq })
+			.from(narratorMessageRefs)
+			.where(
+				and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					inArray(narratorMessageRefs.messageId, messageIds),
+				),
 			),
-		);
+	);
 	const seqByMessage = new Map(refs.map((r) => [r.messageId, r.seq]));
 
 	const ranked = candidates
@@ -258,25 +269,29 @@ async function hasPendingCompact(narratorId: string): Promise<boolean> {
 	// then check ref membership by message id. Joining refs to message bodies
 	// would instead drag the whole conversation off disk to answer "is anything
 	// compacting", which is almost always "no".
-	const pending = await db
-		.select({ id: narratorMessages.id })
-		.from(narratorMessages)
-		.where(eq(narratorMessages.compactPending, 1))
-		.limit(50);
+	const pending = await readQuery(
+		db
+			.select({ id: narratorMessages.id })
+			.from(narratorMessages)
+			.where(eq(narratorMessages.compactPending, 1))
+			.limit(50),
+	);
 	if (pending.length === 0) return false;
-	const owned = await db
-		.select({ id: narratorMessageRefs.id })
-		.from(narratorMessageRefs)
-		.where(
-			and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				inArray(
-					narratorMessageRefs.messageId,
-					pending.map((p) => p.id),
+	const owned = await readQuery(
+		db
+			.select({ id: narratorMessageRefs.id })
+			.from(narratorMessageRefs)
+			.where(
+				and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					inArray(
+						narratorMessageRefs.messageId,
+						pending.map((p) => p.id),
+					),
 				),
-			),
-		)
-		.limit(1);
+			)
+			.limit(1),
+	);
 	return owned.length > 0;
 }
 
@@ -293,7 +308,9 @@ export const chapterSplit = {
 			const warnings: string[] = [];
 			const fallbacks: SplitFallback[] = [];
 
-			const original = await db.query.chapters.findFirst({ where: eq(chapters.id, chapterId) });
+			const original = await readQuery(
+				db.query.chapters.findFirst({ where: eq(chapters.id, chapterId) }),
+			);
 			if (!original) throw new NotFoundError("Chapter", chapterId);
 			// Same admissible set as fork: a dormant chapter is fine (its branch tip is
 			// all the git-level work needs), while merged/abandoned/frozen chapters may
@@ -311,9 +328,11 @@ export const chapterSplit = {
 				);
 			}
 
-			const project = await db.query.projects.findFirst({
-				where: eq(projects.id, original.projectId),
-			});
+			const project = await readQuery(
+				db.query.projects.findFirst({
+					where: eq(projects.id, original.projectId),
+				}),
+			);
 			if (!project?.gitPath) throw new ValidationError("Project has no git repository configured");
 			const gitPath = project.gitPath;
 			return withChapterCreation(project.id, gitPath, async () => {
@@ -352,10 +371,12 @@ export const chapterSplit = {
 					);
 				}
 
-				const primaryNarrator = await db.query.narrators.findFirst({
-					where: and(eq(narrators.chapterId, chapterId), eq(narrators.variant, "primary")),
-					columns: { id: true },
-				});
+				const primaryNarrator = await readQuery(
+					db.query.narrators.findFirst({
+						where: and(eq(narrators.chapterId, chapterId), eq(narrators.variant, "primary")),
+						columns: { id: true },
+					}),
+				);
 				if (!primaryNarrator) {
 					throw new ValidationError(
 						"This chapter has no primary narrator, so its conversation cannot be split.",
@@ -596,10 +617,12 @@ export const chapterSplit = {
 							// first on rollback: `chapter_edges` cascades on both endpoints, so
 							// deleting the prefix row while these point at it would destroy the
 							// project's parent→O edges outright.
-							const inboundForkEdges = await db
-								.select({ id: chapterEdges.id })
-								.from(chapterEdges)
-								.where(and(eq(chapterEdges.targetId, chapterId), eq(chapterEdges.type, "fork")));
+							const inboundForkEdges = await readQuery(
+								db
+									.select({ id: chapterEdges.id })
+									.from(chapterEdges)
+									.where(and(eq(chapterEdges.targetId, chapterId), eq(chapterEdges.type, "fork"))),
+							);
 							for (const edge of inboundForkEdges) {
 								const previousTargetId = await chapterEdgeService.redirectForkEdgeTarget(
 									edge.id,

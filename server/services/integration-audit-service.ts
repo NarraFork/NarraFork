@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 import type { CanonicalCapabilityId } from "@shared/integrations/capabilities";
 import {
 	type CredentialRef,
@@ -153,22 +154,25 @@ export class IntegrationAuditService {
 			Math.max(1, Math.trunc(input.limit ?? 50)),
 		);
 		const cursor = decodeCursor(input.cursor);
-		const rows = await db.query.integrationAuditEvents.findMany({
-			where: and(
-				eq(integrationAuditEvents.authorityId, authorityId),
-				cursor
-					? or(
-							lt(integrationAuditEvents.createdAt, cursor.createdAt),
-							and(
-								eq(integrationAuditEvents.createdAt, cursor.createdAt),
-								lt(integrationAuditEvents.id, cursor.id),
-							),
-						)
-					: undefined,
-			),
-			orderBy: [desc(integrationAuditEvents.createdAt), desc(integrationAuditEvents.id)],
-			limit: limit + 1,
-		});
+		const rows = await readQuery(
+			db.query.integrationAuditEvents.findMany({
+				where: and(
+					eq(integrationAuditEvents.authorityId, authorityId),
+					cursor
+						? or(
+								lt(integrationAuditEvents.createdAt, cursor.createdAt),
+								and(
+									eq(integrationAuditEvents.createdAt, cursor.createdAt),
+									lt(integrationAuditEvents.id, cursor.id),
+								),
+							)
+						: undefined,
+				),
+				orderBy: [desc(integrationAuditEvents.createdAt), desc(integrationAuditEvents.id)],
+				limit: limit + 1,
+			}),
+			{ site: "server/services/integration-audit-service.read" },
+		);
 		const hasMore = rows.length > limit;
 		const items = hasMore ? rows.slice(0, limit) : rows;
 		const last = items.at(-1);

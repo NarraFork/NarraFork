@@ -150,7 +150,7 @@ export const executeEditorDocumentFileChange: EditorDocumentDependencies["execut
 			const { query, hostOperationId } = terminal;
 			try {
 				const runtime = await getCurrentLocalFileChangeRuntime();
-				if (runtime.evidence.getOperation(hostOperationId)?.settlement === "settled")
+				if ((await runtime.evidence.getOperation(hostOperationId))?.settlement === "settled")
 					await acknowledgeEditorReceipt(backend.deviceId, query);
 			} catch (error) {
 				logger.debug("Editor engine ACK deferred", { error: String(error) });
@@ -245,7 +245,10 @@ export const queryEditorOperation: NonNullable<
 	actor.signal?.throwIfAborted();
 	const runtime = await getDefaultLocalFileChangeRuntime();
 	const namespace = await runtime.verifyNamespace(actor.signal);
-	const operation = runtime.evidence.getEditorOperation(namespace.sourceInstanceId, operationId);
+	const operation = await runtime.evidence.getEditorOperation(
+		namespace.sourceInstanceId,
+		operationId,
+	);
 	if (
 		!operation ||
 		operation.ownerUserId !== actor.userId ||
@@ -256,7 +259,7 @@ export const queryEditorOperation: NonNullable<
 			"No owned durable receipt is available; verify before retrying",
 			404,
 		);
-	const effects = runtime.evidence.listEffects(operation.id, { limit: 2 }).items;
+	const effects = (await runtime.evidence.listEffects(operation.id, { limit: 2 })).items;
 	const deviceId =
 		operation.executionBindingJson?.deviceId ?? effects[0]?.identityJson.deviceId ?? "local";
 	const authorize = actor.authorizeOperation?.bind(actor, deviceId);
@@ -302,7 +305,7 @@ export const queryEditorOperation: NonNullable<
 				(proof.outcome === "committed" || proof.outcome === "rejected")
 			) {
 				try {
-					runtime.settleEditorReceipt(operation.id, proof.result);
+					await runtime.settleEditorReceipt(operation.id, proof.result);
 				} catch (error) {
 					logger.warn("Editor receipt contradicts original intent", {
 						operationId,
@@ -318,8 +321,8 @@ export const queryEditorOperation: NonNullable<
 		}
 		// Access may have been revoked while the RPC was in flight.
 		await authorize();
-		const latest = runtime.evidence.getOperation(operation.id);
-		const observed = runtime.evidence.getEffect(operation.id, effect.mutationId);
+		const latest = await runtime.evidence.getOperation(operation.id);
+		const observed = await runtime.evidence.getEffect(operation.id, effect.mutationId);
 		return latest && observed
 			? remoteResult(latest, observed)
 			: { status: "uncertain", operationId };

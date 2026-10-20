@@ -75,6 +75,9 @@ export class GitStatusStreamParser {
 export async function readGitStatusStream(cwd: string, signal: AbortSignal) {
 	signal.throwIfAborted();
 	const parser = new GitStatusStreamParser();
+	let parsedBytes = 0;
+	let parseMs = 0;
+	const startedAt = performance.now();
 	const result = await safeSpawn({
 		cmd: [
 			"git",
@@ -93,7 +96,18 @@ export async function readGitStatusStream(cwd: string, signal: AbortSignal) {
 		signal,
 		timeout: GIT_STATUS_TIMEOUT_MS,
 		maxStderrBytes: 4096,
-		stdoutStream: { maxBytes: GIT_STATUS_MAX_BYTES, onChunk: (chunk) => parser.push(chunk) },
+		stdoutStream: {
+			maxBytes: GIT_STATUS_MAX_BYTES,
+			onChunk: (chunk) => {
+				parsedBytes += chunk.byteLength;
+				const parseStartedAt = performance.now();
+				try {
+					return parser.push(chunk);
+				} finally {
+					parseMs += performance.now() - parseStartedAt;
+				}
+			},
+		},
 	});
 	signal.throwIfAborted();
 	if (result.terminationReason === "timeout") throw new GitError("Git status timed out");
@@ -106,5 +120,14 @@ export async function readGitStatusStream(cwd: string, signal: AbortSignal) {
 	if (!budgetReason && (result.exitCode !== 0 || result.terminationReason))
 		throw new GitError("Git status failed");
 	parser.finish(!budgetReason);
-	return { parser, budgetReason };
+	return {
+		parser,
+		budgetReason,
+		diagnostics: {
+			wallMs: Math.round(performance.now() - startedAt),
+			parseMs: Math.round(parseMs * 100) / 100,
+			parsedBytes,
+			maxBytes: GIT_STATUS_MAX_BYTES,
+		},
+	};
 }

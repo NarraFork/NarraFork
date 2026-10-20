@@ -1,5 +1,6 @@
 import { cpSync, existsSync, lstatSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
+import { readQuery } from "@server/db/worker-read";
 import { and, asc, eq, inArray, ne } from "drizzle-orm";
 import { db } from "../db";
 import { chapters, projects } from "../db/schema";
@@ -94,9 +95,11 @@ function ignoredArchiveDir(chapterId: string): string {
 }
 
 async function getProjectGitPath(projectId: string): Promise<string | null> {
-	const project = await db.query.projects.findFirst({
-		where: eq(projects.id, projectId),
-	});
+	const project = await readQuery(
+		db.query.projects.findFirst({
+			where: eq(projects.id, projectId),
+		}),
+	);
 	return project?.gitPath ?? null;
 }
 
@@ -453,9 +456,11 @@ export const chapterCleanup = {
 	 */
 	async dormant(chapterId: string, userId?: string): Promise<DormantReport> {
 		return chapterLock.acquire(chapterId, async () => {
-			const chapter = await db.query.chapters.findFirst({
-				where: eq(chapters.id, chapterId),
-			});
+			const chapter = await readQuery(
+				db.query.chapters.findFirst({
+					where: eq(chapters.id, chapterId),
+				}),
+			);
 			if (!chapter) throw new NotFoundError("Chapter", chapterId);
 			if (chapter.isRoot) throw new ValidationError("Cannot make root chapter dormant");
 			if (chapter.status !== "active")
@@ -655,9 +660,11 @@ export const chapterCleanup = {
 	async wake(chapterId: string): Promise<WakeReport> {
 		return chapterLock.acquire(chapterId, async () => {
 			const warnings: string[] = [];
-			const chapter = await db.query.chapters.findFirst({
-				where: eq(chapters.id, chapterId),
-			});
+			const chapter = await readQuery(
+				db.query.chapters.findFirst({
+					where: eq(chapters.id, chapterId),
+				}),
+			);
 			if (!chapter) throw new NotFoundError("Chapter", chapterId);
 			// A merged chapter is deliberately NOT wakeable.
 			//
@@ -900,14 +907,16 @@ export const chapterCleanup = {
 					// workspace including everything uncommitted in it. Refusing is the only safe
 					// answer: the destructive branch exists to reclaim *this* chapter's leftovers,
 					// and it cannot tell those from another chapter's working state.
-					const claimant = await db.query.chapters.findFirst({
-						columns: { id: true, title: true, branch: true, status: true },
-						where: and(
-							ne(chapters.id, chapterId),
-							eq(chapters.worktreePath, worktreePath),
-							inArray(chapters.status, ["active", "dormant"]),
-						),
-					});
+					const claimant = await readQuery(
+						db.query.chapters.findFirst({
+							columns: { id: true, title: true, branch: true, status: true },
+							where: and(
+								ne(chapters.id, chapterId),
+								eq(chapters.worktreePath, worktreePath),
+								inArray(chapters.status, ["active", "dormant"]),
+							),
+						}),
+					);
 					if (claimant) {
 						throw new ValidationError(
 							`Cannot wake this chapter: the worktree path it derives from its branch ` +
@@ -961,9 +970,11 @@ export const chapterCleanup = {
 				// on one chapterId while operating on others, which protects none of them and
 				// blocks unrelated single-chapter operations for the duration of the batch.
 				await chapterLock.acquire(chapterId, async () => {
-					const chapter = await db.query.chapters.findFirst({
-						where: eq(chapters.id, chapterId),
-					});
+					const chapter = await readQuery(
+						db.query.chapters.findFirst({
+							where: eq(chapters.id, chapterId),
+						}),
+					);
 					if (!chapter) {
 						report.errors.push({ chapterId, error: "Not found" });
 						return;
@@ -1062,12 +1073,14 @@ export const chapterCleanup = {
 	async dormantInactiveChapters(projectId: string): Promise<string[]> {
 		const maxActive = settings.chapters.maxActiveWorktrees;
 
-		const activeChapters = await db.query.chapters.findMany({
-			where: eq(chapters.projectId, projectId),
-			// Scans every chapter in the project, so skip the per-node UI blobs.
-			columns: { dockLayoutJson: false, detachedPanelsJson: false },
-			orderBy: [asc(chapters.lastAccessedAt)],
-		});
+		const activeChapters = await readQuery(
+			db.query.chapters.findMany({
+				where: eq(chapters.projectId, projectId),
+				// Scans every chapter in the project, so skip the per-node UI blobs.
+				columns: { dockLayoutJson: false, detachedPanelsJson: false },
+				orderBy: [asc(chapters.lastAccessedAt)],
+			}),
+		);
 
 		const active = activeChapters.filter(
 			(c) => c.status === "active" && c.worktreePath && !c.isRoot,

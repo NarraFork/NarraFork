@@ -79,7 +79,7 @@ beforeEach(() => {
 afterAll(() => sqlite.close());
 
 describe("durable mailbox storage against generated migrations", () => {
-	test("atomic head predicate sees the eligible head, never a priority input beyond pending publication", () => {
+	test("atomic head predicate sees the eligible head, never a priority input beyond pending publication", async () => {
 		const publisher = createPublicationOutbox(db);
 		for (let i = 0; i < L.noticePending; i++)
 			store.enqueue({
@@ -124,7 +124,7 @@ describe("durable mailbox storage against generated migrations", () => {
 		);
 		expect(rejected).toBeUndefined();
 		expect(validatedId).not.toBe(priority.id);
-		expect(store.getByDelivery(priority.deliveryId as string)?.state).toBe("queued");
+		expect((await store.getByDelivery(priority.deliveryId as string))?.state).toBe("queued");
 		const claimed = store.claimEligibleHead(
 			"recipient",
 			{ token: "process:here:1", epoch: "owner" },
@@ -137,7 +137,7 @@ describe("durable mailbox storage against generated migrations", () => {
 		expect(claimed?.kind).toBe("task_notice");
 		expect(claimed?.text).toBe("older completion");
 	});
-	test("failed display row does not block eligible queued input or permit skipping another kind", () => {
+	test("failed display row does not block eligible queued input or permit skipping another kind", async () => {
 		const first = accepted(store.enqueue(input("failed-head")));
 		for (let i = 0; i < L.claimMaxAttempts; i++) {
 			const claimed = store.claimEligibleHead("recipient", {
@@ -146,7 +146,7 @@ describe("durable mailbox storage against generated migrations", () => {
 			}) as MailboxRow;
 			store.failClaim(claim(claimed), "broken attachment");
 		}
-		expect(store.list("recipient")[0]).toMatchObject({ id: first.id, state: "failed" });
+		expect((await store.list("recipient"))[0]).toMatchObject({ id: first.id, state: "failed" });
 		const next = accepted(
 			store.enqueue({
 				kind: "user_input",
@@ -162,9 +162,9 @@ describe("durable mailbox storage against generated migrations", () => {
 				(head) => head.kind === "user_input",
 			)?.id,
 		).toBe(next.id);
-		expect(store.getByDelivery(first.deliveryId as string)?.state).toBe("failed");
+		expect((await store.getByDelivery(first.deliveryId as string))?.state).toBe("failed");
 	});
-	test("cold recovery restores foreign-process claims but never hot/current or unproven legacy owners", () => {
+	test("cold recovery restores foreign-process claims but never hot/current or unproven legacy owners", async () => {
 		for (const key of ["old", "current", "legacy"]) store.enqueue(input(key));
 		const old = store.claimEligibleHead("recipient", {
 			token: "process:old-instance:1",
@@ -180,9 +180,9 @@ describe("durable mailbox storage against generated migrations", () => {
 		}) as MailboxRow;
 		const cold = createMailboxStore(db);
 		expect(cold.recoverForeignProcessClaims("current-instance").recovered).toBe(1);
-		expect(cold.getByDelivery(old.deliveryId as string)?.state).toBe("queued");
-		expect(cold.getByDelivery(current.deliveryId as string)?.state).toBe("claimed");
-		expect(cold.getByDelivery(legacy.deliveryId as string)?.state).toBe("claimed");
+		expect((await cold.getByDelivery(old.deliveryId as string))?.state).toBe("queued");
+		expect((await cold.getByDelivery(current.deliveryId as string))?.state).toBe("claimed");
+		expect((await cold.getByDelivery(legacy.deliveryId as string))?.state).toBe("claimed");
 		expect(
 			createMailboxStore(db).recoverForeignProcessClaims("current-instance", {
 				legacyOwnerTerminated: () => false,
@@ -198,7 +198,7 @@ describe("durable mailbox storage against generated migrations", () => {
 			epoch: "fresh-owner",
 		}) as MailboxRow;
 		expect(() => cold.materialize(claim(old), persist)).toThrow("Stale");
-		expect(cold.getByDelivery(fresh.deliveryId as string)?.claimEpoch).toBe("fresh-owner");
+		expect((await cold.getByDelivery(fresh.deliveryId as string))?.claimEpoch).toBe("fresh-owner");
 		expect(() => cold.recoverForeignProcessClaims("current%instance")).toThrow("process identity");
 	});
 	test("claim recovery pages use claimed state/id index and exact cursor without reading payload", () => {
@@ -231,7 +231,7 @@ describe("durable mailbox storage against generated migrations", () => {
 		"queued",
 		"materialized",
 		"cancelled",
-	] as const)("same receipt wins over oversized retry payload and deleted sender (%s)", (state) => {
+	] as const)("same receipt wins over oversized retry payload and deleted sender (%s)", async (state) => {
 		const first = accepted(store.enqueue(input()));
 		if (state === "materialized") materializeOne();
 		if (state === "cancelled") store.cancel(first.deliveryId as string, "cancelled");
@@ -245,17 +245,17 @@ describe("durable mailbox storage against generated migrations", () => {
 		);
 		expect(retry.status).toBe("duplicate");
 		expect(accepted(retry)).toMatchObject({ deliveryId: first.deliveryId, state });
-		expect(store.list("recipient")).toHaveLength(1);
+		expect(await store.list("recipient")).toHaveLength(1);
 		expect(() => store.enqueue(input("receipt", { sourceAttempt: 0 }))).toThrow("attempt");
 		expect(() => store.enqueue(input("", { projectedByteSize: 0 }))).toThrow("identity");
 	});
-	test("first acceptance requires a source narrator and rejection does not reserve quota or sequence", () => {
+	test("first acceptance requires a source narrator and rejection does not reserve quota or sequence", async () => {
 		expect(() => store.enqueue(input("missing", { sourceNarratorId: "missing" }))).toThrow(
 			"source narrator does not exist",
 		);
 		db.delete(narrators).where(eq(narrators.id, "sender")).run();
 		expect(() => store.enqueue(input())).toThrow("source narrator does not exist");
-		expect(store.list("recipient")).toHaveLength(0);
+		expect(await store.list("recipient")).toHaveLength(0);
 		expect(
 			db
 				.select({ seq: narrators.inboxSequence })
@@ -268,7 +268,7 @@ describe("durable mailbox storage against generated migrations", () => {
 			expect(store.enqueue(input(), tx).status).toBe("accepted");
 		});
 	});
-	test("exact receipt+attempt dedupe survives materialization and never compares text", () => {
+	test("exact receipt+attempt dedupe survives materialization and never compares text", async () => {
 		const first = accepted(store.enqueue(input()));
 		expect(store.enqueue(input()).status).toBe("duplicate");
 		expect(accepted(store.enqueue(input("other"))).deliveryId).not.toBe(first.deliveryId);
@@ -276,17 +276,17 @@ describe("durable mailbox storage against generated migrations", () => {
 		const rows = store.claimBatch("recipient", { token: "token", epoch: "epoch" });
 		for (const row of rows) store.materialize(claim(row), persist);
 		expect(store.enqueue(input()).status).toBe("duplicate");
-		expect(store.getByDelivery(first.deliveryId as string)?.text).toBe("");
+		expect((await store.getByDelivery(first.deliveryId as string))?.text).toBe("");
 		expect(db.select().from(narratorMessages).all()).toHaveLength(3);
 	});
-	test("acceptance rollback rolls counter and row back", () => {
+	test("acceptance rollback rolls counter and row back", async () => {
 		expect(() =>
 			db.transaction((tx) => {
 				store.enqueue(input(), tx);
 				throw new Error("commit failed");
 			}),
 		).toThrow("commit failed");
-		expect(store.list("recipient")).toHaveLength(0);
+		expect(await store.list("recipient")).toHaveLength(0);
 		expect(
 			db
 				.select({ seq: narrators.inboxSequence })
@@ -296,7 +296,7 @@ describe("durable mailbox storage against generated migrations", () => {
 		).toBe(0);
 		expect(store.enqueue(input()).status).toBe("accepted");
 	});
-	test("message success/ref failure and mailbox callback failure are atomic", () => {
+	test("message success/ref failure and mailbox callback failure are atomic", async () => {
 		accepted(store.enqueue(input()));
 		const row = store.claimBatch("recipient", { token: "token", epoch: "epoch" })[0] as MailboxRow;
 		expect(() =>
@@ -314,7 +314,7 @@ describe("durable mailbox storage against generated migrations", () => {
 			}),
 		).toThrow("ref write failed");
 		expect(db.select().from(narratorMessages).all()).toHaveLength(0);
-		expect(store.getByDelivery(row.deliveryId as string)?.state).toBe("claimed");
+		expect((await store.getByDelivery(row.deliveryId as string))?.state).toBe("claimed");
 		expect(() =>
 			store.materialize(claim(row), (tx, item) => {
 				persist(tx, item);
@@ -325,14 +325,14 @@ describe("durable mailbox storage against generated migrations", () => {
 		store.failClaim(claim(row), "retry");
 		expect(materializeOne().state).toBe("materialized");
 	});
-	test("existing persistence onPersist transaction can bind ref and mailbox atomically", () => {
+	test("existing persistence onPersist transaction can bind ref and mailbox atomically", async () => {
 		store.enqueue(input());
 		const row = store.claimBatch("recipient", { token: "token", epoch: "epoch" })[0] as MailboxRow;
 		db.transaction((tx) => {
 			const binding = persist(tx, row);
 			store.materializeInTransaction(tx, claim(row), binding);
 		});
-		expect(store.getByDelivery(row.deliveryId as string)?.state).toBe("materialized");
+		expect((await store.getByDelivery(row.deliveryId as string))?.state).toBe("materialized");
 	});
 	test("only terminated execution epoch can recover claims; stale owner cannot commit or clear", () => {
 		store.enqueue(input());
@@ -351,7 +351,7 @@ describe("durable mailbox storage against generated migrations", () => {
 		expect(store.recoverClaims("recipient", "old-epoch", { ownerTerminated: true })).toBe(0);
 		expect(store.materialize(claim(current), persist)?.state).toBe("materialized");
 	});
-	test("failed payloads retain quota, explicit cancellation keeps a negative receipt", () => {
+	test("failed payloads retain quota, explicit cancellation keeps a negative receipt", async () => {
 		for (let i = 0; i < L.agentPending; i++) store.enqueue(input(`key-${i}`));
 		for (let retry = 0; retry < L.claimMaxAttempts; retry++) {
 			const row = store.claimBatch(
@@ -361,9 +361,9 @@ describe("durable mailbox storage against generated migrations", () => {
 			)[0] as MailboxRow;
 			store.failClaim(claim(row), "attachment failed");
 		}
-		expect(store.list("recipient", { state: "failed" })).toHaveLength(1);
+		expect(await store.list("recipient", { state: "failed" })).toHaveLength(1);
 		expect(store.enqueue(input("full")).status).toBe("full");
-		const failed = store.list("recipient", { state: "failed" })[0];
+		const failed = (await store.list("recipient", { state: "failed" }))[0];
 		expect(store.cancel(failed?.deliveryId as string, "user abandoned")).toBe(true);
 		expect(store.enqueue(input("key-0")).status).toBe("duplicate");
 		expect(store.enqueue(input("full")).status).toBe("accepted");
@@ -384,7 +384,7 @@ describe("durable mailbox storage against generated migrations", () => {
 		expect(store.collectTombstones([row.id], () => false)).toBe(0);
 		expect(store.collectTombstones([row.id], () => true)).toBe(1);
 	});
-	test("stable COW ref preserves consumption; semantic edit cannot acknowledge the old revision", () => {
+	test("stable COW ref preserves consumption; semantic edit cannot acknowledge the old revision", async () => {
 		store.enqueue(input());
 		const row = materializeOne();
 		expect(row.adoptedAt).toBeNull();
@@ -423,7 +423,7 @@ describe("durable mailbox storage against generated migrations", () => {
 				messageId: "cow",
 			});
 		});
-		expect(store.getByDelivery(row.deliveryId as string)).toMatchObject({
+		expect(await store.getByDelivery(row.deliveryId as string)).toMatchObject({
 			currentMessageId: "cow",
 			adoptedAt: time,
 			receiptDisposition: "active",
@@ -437,7 +437,7 @@ describe("durable mailbox storage against generated migrations", () => {
 		expect(
 			store.ackAdopted(row.deliveryId as string, "recipient", row.recipientRefId as string, 1),
 		).toBe(false);
-		expect(store.getByDelivery(row.deliveryId as string)?.adoptedAt).toBe(time);
+		expect((await store.getByDelivery(row.deliveryId as string))?.adoptedAt).toBe(time);
 		expect(
 			db
 				.select({ consumed: narratorMessageRefs.injectionConsumedAt })
@@ -449,7 +449,7 @@ describe("durable mailbox storage against generated migrations", () => {
 	test.each([
 		false,
 		true,
-	])("edited revision has independent durable adoption without rewriting original Send (adopted=%s)", (originalAdopted) => {
+	])("edited revision has independent durable adoption without rewriting original Send (adopted=%s)", async (originalAdopted) => {
 		store.enqueue(input());
 		const row = materializeOne();
 		const deliveryId = row.deliveryId as string;
@@ -462,7 +462,7 @@ describe("durable mailbox storage against generated migrations", () => {
 				messageId: row.currentMessageId as string,
 			}),
 		);
-		expect(store.getByDelivery(deliveryId)).toMatchObject({
+		expect(await store.getByDelivery(deliveryId)).toMatchObject({
 			contentRevision: 1,
 			currentRevision: 2,
 			currentAdoptedRevision: null,
@@ -475,7 +475,7 @@ describe("durable mailbox storage against generated migrations", () => {
 		const coldStore = createMailboxStore(db);
 		const editedAt = "2026-09-09T00:01:00.000Z";
 		expect(coldStore.ackCurrentRevision(deliveryId, "recipient", refId, 2, editedAt)).toBe(true);
-		expect(coldStore.getByDelivery(deliveryId)).toMatchObject({
+		expect(await coldStore.getByDelivery(deliveryId)).toMatchObject({
 			contentRevision: 1,
 			receiptDisposition: "superseded",
 			adoptedRevision: originalAdopted ? 1 : null,
@@ -500,13 +500,13 @@ describe("durable mailbox storage against generated migrations", () => {
 			}),
 		);
 		expect(coldStore.ackCurrentRevision(deliveryId, "recipient", refId, 2)).toBe(false);
-		expect(coldStore.getByDelivery(deliveryId)).toMatchObject({
+		expect(await coldStore.getByDelivery(deliveryId)).toMatchObject({
 			currentRevision: 3,
 			currentAdoptedAt: null,
 			adoptedAt: originalAdopted ? time : null,
 		});
 	});
-	test("old reserved address resolves after COW via covering lookup and remains a deleted tombstone", () => {
+	test("old reserved address resolves after COW via covering lookup and remains a deleted tombstone", async () => {
 		store.enqueue(input());
 		const row = materializeOne();
 		db.transaction((tx) => {
@@ -529,13 +529,15 @@ describe("durable mailbox storage against generated migrations", () => {
 			});
 		});
 		expect(
-			store.resolveReservedMessage("recipient", row.recipientMessageId as string),
+			await store.resolveReservedMessage("recipient", row.recipientMessageId as string),
 		).toMatchObject({
 			deliveryId: row.deliveryId,
 			currentMessageId: "new-address",
 			currentRevision: 1,
 		});
-		expect(store.resolveReservedMessage("fork", row.recipientMessageId as string)).toBeUndefined();
+		expect(
+			await store.resolveReservedMessage("fork", row.recipientMessageId as string),
+		).toBeUndefined();
 		const plan = sqlite
 			.query(
 				"EXPLAIN QUERY PLAN SELECT delivery_id FROM narrator_buffered_messages WHERE narrator_id = ? AND recipient_message_id = ? LIMIT 1",
@@ -549,7 +551,7 @@ describe("durable mailbox storage against generated migrations", () => {
 			store.updateRecipientRef(tx, "recipient", row.recipientRefId as string, { kind: "deleted" });
 		});
 		expect(
-			store.resolveReservedMessage("recipient", row.recipientMessageId as string),
+			await store.resolveReservedMessage("recipient", row.recipientMessageId as string),
 		).toMatchObject({ receiptDisposition: "recipient_deleted", currentMessageId: null });
 		expect(
 			store.ackCurrentRevision(
@@ -583,7 +585,7 @@ describe("durable mailbox storage against generated migrations", () => {
 			store.materialize(claim(next[0] as MailboxRow), persist);
 		}
 	});
-	test("legacy user kind defaults and summary listing avoid body hydration", () => {
+	test("legacy user kind defaults and summary listing avoid body hydration", async () => {
 		db.insert(narratorBufferedMessages)
 			.values({
 				id: "old-second",
@@ -597,12 +599,12 @@ describe("durable mailbox storage against generated migrations", () => {
 			.values({ id: "old-first", narratorId: "recipient", text: "first", seq: 2, bufferedAt: time })
 			.run();
 		expect(store.initializeLegacy("recipient")).toBe(true);
-		const rows = store.list("recipient");
+		const rows = await store.list("recipient");
 		expect(rows.map((row) => row.id)).toEqual(["old-first", "old-second"]);
 		expect(rows.every((row) => row.kind === "user_input" && !("text" in row))).toBe(true);
 		expect(store.claimBatch("recipient", { token: "t", epoch: "e" })).toHaveLength(1);
 	});
-	test("large user payload uses references, cancellation never unlinks shared files", () => {
+	test("large user payload uses references, cancellation never unlinks shared files", async () => {
 		const row = accepted(
 			store.enqueue({
 				kind: "user_input",
@@ -618,16 +620,16 @@ describe("durable mailbox storage against generated migrations", () => {
 				},
 			}),
 		);
-		expect(store.list("recipient")[0]?.byteSize).toBe(2_000_000);
+		expect((await store.list("recipient"))[0]?.byteSize).toBe(2_000_000);
 		expect(store.cancel(row.deliveryId as string, "cancel")).toBe(true);
-		expect(store.getByDelivery(row.deliveryId as string)).toMatchObject({
+		expect(await store.getByDelivery(row.deliveryId as string)).toMatchObject({
 			payloadRefJson: null,
 			byteSize: 0,
 			state: "cancelled",
 		});
 		expect(store.collectTombstones([row.id], () => true)).toBe(0);
 	});
-	test("kind quotas, immutable nonuser order, user edit and principal barriers", () => {
+	test("kind quotas, immutable nonuser order, user edit and principal barriers", async () => {
 		for (let i = 0; i < 50; i++) store.enqueue(input(`full-${i}`));
 		expect(
 			store.enqueue({
@@ -649,7 +651,7 @@ describe("durable mailbox storage against generated migrations", () => {
 				priority: true,
 			}),
 		);
-		const agent = store.list("recipient", { kind: "agent_message" })[0];
+		const agent = (await store.list("recipient", { kind: "agent_message" }))[0];
 		expect(
 			store.editUser(agent?.deliveryId as string, { text: "forged", projectedByteSize: 6 }),
 		).toBe(false);
@@ -664,7 +666,7 @@ describe("durable mailbox storage against generated migrations", () => {
 		);
 		expect(store.cancel(user.deliveryId as string, "late")).toBe(false);
 	});
-	test("legacy clear never deletes another kind or a materialized receipt", () => {
+	test("legacy clear never deletes another kind or a materialized receipt", async () => {
 		db.insert(narratorBufferedMessages)
 			.values({ id: "legacy", narratorId: "recipient", text: "old", seq: 1, bufferedAt: time })
 			.run();
@@ -678,9 +680,9 @@ describe("durable mailbox storage against generated migrations", () => {
 			projectedByteSize: 4,
 		});
 		expect(store.cancelUserPage("recipient", "clear user projection")).toEqual([{ id: "legacy" }]);
-		expect(store.getByDelivery(agent.deliveryId as string)?.state).toBe("queued");
-		expect(store.list("recipient", { kind: "task_notice" })[0]?.state).toBe("queued");
-		expect(store.list("recipient", { kind: "user_input" })[0]?.state).toBe("cancelled");
+		expect((await store.getByDelivery(agent.deliveryId as string))?.state).toBe("queued");
+		expect((await store.list("recipient", { kind: "task_notice" }))[0]?.state).toBe("queued");
+		expect((await store.list("recipient", { kind: "user_input" }))[0]?.state).toBe("cancelled");
 	});
 	test("claim cancellation is epoch guarded and preserves negative acceptance", () => {
 		store.enqueue(input());
@@ -694,7 +696,7 @@ describe("durable mailbox storage against generated migrations", () => {
 			claimEpoch: null,
 		});
 	});
-	test("semantic edit before original adoption cannot create an adopted fact", () => {
+	test("semantic edit before original adoption cannot create an adopted fact", async () => {
 		store.enqueue(input());
 		const row = materializeOne();
 		db.transaction((tx) =>
@@ -706,7 +708,7 @@ describe("durable mailbox storage against generated migrations", () => {
 		expect(
 			store.ackAdopted(row.deliveryId as string, "recipient", row.recipientRefId as string, 1),
 		).toBe(false);
-		expect(store.getByDelivery(row.deliveryId as string)?.adoptedAt).toBeNull();
+		expect((await store.getByDelivery(row.deliveryId as string))?.adoptedAt).toBeNull();
 	});
 	test("edited user input materializes its content revision rather than resetting it", () => {
 		const row = accepted(
@@ -720,7 +722,7 @@ describe("durable mailbox storage against generated migrations", () => {
 		store.editUser(row.deliveryId as string, { text: "new", projectedByteSize: 3 });
 		expect(materializeOne().contentRevision).toBe(2);
 	});
-	test("oversized input, metadata and inaccurate projected sizes fail explicitly", () => {
+	test("oversized input, metadata and inaccurate projected sizes fail explicitly", async () => {
 		expect(() =>
 			store.enqueue(
 				input("large", {
@@ -736,6 +738,6 @@ describe("durable mailbox storage against generated migrations", () => {
 			store.enqueue(input("projection", { projectedByteSize: L.agentProjectedBytes + 1 })),
 		).toThrow("projection");
 		expect(() => store.enqueue(input("inaccurate", { projectedByteSize: 1 }))).toThrow("size");
-		expect(store.list("recipient")).toHaveLength(0);
+		expect(await store.list("recipient")).toHaveLength(0);
 	});
 });

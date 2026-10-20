@@ -122,7 +122,7 @@ beforeEach(() => {
 afterEach(() => database.sqlite.close());
 
 describe("explicit legacy publication admission", () => {
-	test("captured completed entry registers only its event once, without rewriting task status", () => {
+	test("captured completed entry registers only its event once, without rewriting task status", async () => {
 		database.db
 			.update(backgroundTasks)
 			.set({ status: "completed", completedAt: time })
@@ -155,7 +155,7 @@ describe("explicit legacy publication admission", () => {
 				.all()
 				.filter((row) => row.logicalRunId === first.run.logicalRunId),
 		).toHaveLength(1);
-		expect(store.listPending()).toHaveLength(0);
+		expect(await store.listPending()).toHaveLength(0);
 		expect(() => store.reserveRunSlots(first.run)).toThrow("captured event slot");
 		expect(() =>
 			store.commitIntent({
@@ -261,7 +261,7 @@ describe("explicit legacy publication admission", () => {
 			.run();
 		expect(store.registerLegacyCompletedRunSlots(agent).status).toBe("unmigratable");
 	});
-	test("full quota accepts a genuinely admitted old runtime, but not a new task or new protocol run", () => {
+	test("full quota accepts a genuinely admitted old runtime, but not a new task or new protocol run", async () => {
 		const store = publisher();
 		full(store);
 		const run = store.registerLegacyRunningRunSlots(source, { kind: "runtime" });
@@ -273,7 +273,7 @@ describe("explicit legacy publication admission", () => {
 				.where(eq(narrators.id, "parent"))
 				.get()?.seq,
 		).toBe(0);
-		expect(store.listPending()).toHaveLength(0);
+		expect(await store.listPending()).toHaveLength(0);
 		expect(
 			store.reserveRunSlots({ ...run, taskId: "new-normal", logicalRunId: "new-run" }).status,
 		).toBe("full");
@@ -305,7 +305,7 @@ describe("explicit legacy publication admission", () => {
 			"new-protocol",
 		);
 	});
-	test("legacy slots, source logical identity, terminal result and intent share a caller transaction", () => {
+	test("legacy slots, source logical identity, terminal result and intent share a caller transaction", async () => {
 		const store = publisher();
 		full(store);
 		expect(() =>
@@ -329,7 +329,7 @@ describe("explicit legacy publication admission", () => {
 				.where(eq(backgroundTasks.id, source.taskId))
 				.get(),
 		).toEqual({ run: null, state: "running" });
-		expect(store.listPending()).toHaveLength(0);
+		expect(await store.listPending()).toHaveLength(0);
 		database.db.transaction((tx) => {
 			const run = store.registerLegacyRunningRunSlots(source, { kind: "runtime" }, {}, tx);
 			tx.update(backgroundTasks)
@@ -350,7 +350,7 @@ describe("explicit legacy publication admission", () => {
 				.where(eq(backgroundTasks.id, source.taskId))
 				.get()?.result,
 		).toBe("result");
-		expect(store.listPending()).toHaveLength(1);
+		expect(await store.listPending()).toHaveLength(1);
 	});
 	test("recovery retains the durable old run and does not reserve twice", () => {
 		const store = publisher();
@@ -640,7 +640,7 @@ describe("explicit legacy publication admission", () => {
 			}),
 		).toThrow("running state");
 	});
-	test("unbound old Bash has only an explicit unknown-failure publication path, never success or rerun", () => {
+	test("unbound old Bash has only an explicit unknown-failure publication path, never success or rerun", async () => {
 		const store = publisher();
 		full(store);
 		admissions.clear();
@@ -678,7 +678,7 @@ describe("explicit legacy publication admission", () => {
 				).status,
 			).toBe("committed");
 		});
-		expect(store.listPending()).toHaveLength(1);
+		expect(await store.listPending()).toHaveLength(1);
 		expect(
 			database.db
 				.select({ summary: runtimePublicationOutbox.summary })

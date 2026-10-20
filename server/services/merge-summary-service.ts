@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 import { and, eq, inArray, sql } from "drizzle-orm";
 import { db } from "../db";
 import {
@@ -121,8 +122,8 @@ export const mergeSummaryService = {
 		try {
 			// Fetch source and target chapters
 			const [source, target] = await Promise.all([
-				db.query.chapters.findFirst({ where: eq(chapters.id, sourceChapterId) }),
-				db.query.chapters.findFirst({ where: eq(chapters.id, targetChapterId) }),
+				readQuery(db.query.chapters.findFirst({ where: eq(chapters.id, sourceChapterId) })),
+				readQuery(db.query.chapters.findFirst({ where: eq(chapters.id, targetChapterId) })),
 			]);
 			if (!source || !target) {
 				logger.warn("Merge summary: chapter not found", { sourceChapterId, targetChapterId });
@@ -130,9 +131,11 @@ export const mergeSummaryService = {
 			}
 
 			// Find target chapter's primary narrator
-			const primaryNarrator = await db.query.narrators.findFirst({
-				where: and(eq(narrators.chapterId, targetChapterId), eq(narrators.variant, "primary")),
-			});
+			const primaryNarrator = await readQuery(
+				db.query.narrators.findFirst({
+					where: and(eq(narrators.chapterId, targetChapterId), eq(narrators.variant, "primary")),
+				}),
+			);
 			if (!primaryNarrator) {
 				logger.debug("Merge summary: no primary narrator on target, skipping", {
 					targetChapterId,
@@ -141,9 +144,11 @@ export const mergeSummaryService = {
 			}
 
 			// Get project git path
-			const project = await db.query.projects.findFirst({
-				where: eq(projects.id, source.projectId),
-			});
+			const project = await readQuery(
+				db.query.projects.findFirst({
+					where: eq(projects.id, source.projectId),
+				}),
+			);
 			if (!project?.gitPath) {
 				logger.warn("Merge summary: project has no git path", {
 					projectId: source.projectId,
@@ -158,10 +163,12 @@ export const mergeSummaryService = {
 			let locale: Locale = "en";
 			if (userId) {
 				const [user, userLocale] = await Promise.all([
-					db.query.users.findFirst({
-						where: eq(users.id, userId),
-						columns: { username: true, avatarColor: true, avatarImageId: true },
-					}),
+					readQuery(
+						db.query.users.findFirst({
+							where: eq(users.id, userId),
+							columns: { username: true, avatarColor: true, avatarImageId: true },
+						}),
+					),
 					getUserLanguage(userId),
 				]);
 				username = user?.username;
@@ -172,15 +179,17 @@ export const mergeSummaryService = {
 
 			// Count existing merge_summary messages for this source chapter
 			// to determine the merge round (wake → re-merge produces round 2+).
-			const existingSummaries = await db
-				.select({ id: narratorMessages.id, contentJson: narratorMessages.contentJson })
-				.from(narratorMessages)
-				.where(
-					and(
-						sql`${narratorMessages.contentJson} LIKE '%"type":"merge_summary"%'`,
-						sql`${narratorMessages.contentJson} LIKE ${`%${sourceChapterId}%`}`,
+			const existingSummaries = await readQuery(
+				db
+					.select({ id: narratorMessages.id, contentJson: narratorMessages.contentJson })
+					.from(narratorMessages)
+					.where(
+						and(
+							sql`${narratorMessages.contentJson} LIKE '%"type":"merge_summary"%'`,
+							sql`${narratorMessages.contentJson} LIKE ${`%${sourceChapterId}%`}`,
+						),
 					),
-				);
+			);
 			const mergeRound = existingSummaries.length + 1;
 
 			// Mark existing merge_summary messages as historical (isLatest: false)
@@ -338,15 +347,17 @@ export const mergeSummaryService = {
 		// Find messages whose contentJson contains a merge_summary block
 		// referencing this source chapter. SQLite JSON: content_json is stored
 		// as text, so we use LIKE for a simple substring match.
-		const rows = await db
-			.select({ id: narratorMessages.id })
-			.from(narratorMessages)
-			.where(
-				and(
-					sql`${narratorMessages.contentJson} LIKE '%"type":"merge_summary"%'`,
-					sql`${narratorMessages.contentJson} LIKE ${`%${sourceChapterId}%`}`,
+		const rows = await readQuery(
+			db
+				.select({ id: narratorMessages.id })
+				.from(narratorMessages)
+				.where(
+					and(
+						sql`${narratorMessages.contentJson} LIKE '%"type":"merge_summary"%'`,
+						sql`${narratorMessages.contentJson} LIKE ${`%${sourceChapterId}%`}`,
+					),
 				),
-			);
+		);
 
 		if (rows.length === 0) return { deletedCount: 0, narratorIds: [] };
 
@@ -354,10 +365,12 @@ export const mergeSummaryService = {
 
 		// Get ALL narrators referencing these messages (via refs junction table),
 		// not just the original narratorId — messages can be shared via fork.
-		const refRows = await db
-			.select({ narratorId: narratorMessageRefs.narratorId })
-			.from(narratorMessageRefs)
-			.where(inArray(narratorMessageRefs.messageId, ids));
+		const refRows = await readQuery(
+			db
+				.select({ narratorId: narratorMessageRefs.narratorId })
+				.from(narratorMessageRefs)
+				.where(inArray(narratorMessageRefs.messageId, ids)),
+		);
 		const narratorIds = [...new Set(refRows.map((r) => r.narratorId))];
 
 		// Delete refs first (FK), then messages
@@ -408,16 +421,18 @@ export const mergeSummaryService = {
 		sourceChapterId: string,
 		commitSha: string | null,
 	): Promise<{ deletedCount: number; narratorIds: string[] }> {
-		const rows = await db
-			.select({ id: narratorMessages.id, contentJson: narratorMessages.contentJson })
-			.from(narratorMessages)
-			.where(
-				and(
-					sql`${narratorMessages.contentJson} LIKE '%"type":"merge_summary"%'`,
-					sql`${narratorMessages.contentJson} LIKE ${`%${sourceChapterId}%`}`,
-					...(commitSha ? [sql`${narratorMessages.contentJson} LIKE ${`%${commitSha}%`}`] : []),
+		const rows = await readQuery(
+			db
+				.select({ id: narratorMessages.id, contentJson: narratorMessages.contentJson })
+				.from(narratorMessages)
+				.where(
+					and(
+						sql`${narratorMessages.contentJson} LIKE '%"type":"merge_summary"%'`,
+						sql`${narratorMessages.contentJson} LIKE ${`%${sourceChapterId}%`}`,
+						...(commitSha ? [sql`${narratorMessages.contentJson} LIKE ${`%${commitSha}%`}`] : []),
+					),
 				),
-			);
+		);
 
 		if (rows.length === 0) return { deletedCount: 0, narratorIds: [] };
 
@@ -439,10 +454,12 @@ export const mergeSummaryService = {
 		const ids = selected.map((r) => r.id);
 
 		// Get ALL narrators referencing these messages (via refs junction table)
-		const refRows = await db
-			.select({ narratorId: narratorMessageRefs.narratorId })
-			.from(narratorMessageRefs)
-			.where(inArray(narratorMessageRefs.messageId, ids));
+		const refRows = await readQuery(
+			db
+				.select({ narratorId: narratorMessageRefs.narratorId })
+				.from(narratorMessageRefs)
+				.where(inArray(narratorMessageRefs.messageId, ids)),
+		);
 		const narratorIds = [...new Set(refRows.map((r) => r.narratorId))];
 
 		db.transaction((tx) => {
@@ -464,22 +481,26 @@ export const mergeSummaryService = {
 
 		// After removing the latest card, restore isLatest on the most recent
 		// remaining merge_summary for this source chapter (if any).
-		const remaining = await db
-			.select({ id: narratorMessages.id, createdAt: narratorMessages.createdAt })
-			.from(narratorMessages)
-			.where(
-				and(
-					sql`${narratorMessages.contentJson} LIKE '%"type":"merge_summary"%'`,
-					sql`${narratorMessages.contentJson} LIKE ${`%${sourceChapterId}%`}`,
-				),
-			)
-			.orderBy(sql`${narratorMessages.createdAt} DESC`)
-			.limit(1);
+		const remaining = await readQuery(
+			db
+				.select({ id: narratorMessages.id, createdAt: narratorMessages.createdAt })
+				.from(narratorMessages)
+				.where(
+					and(
+						sql`${narratorMessages.contentJson} LIKE '%"type":"merge_summary"%'`,
+						sql`${narratorMessages.contentJson} LIKE ${`%${sourceChapterId}%`}`,
+					),
+				)
+				.orderBy(sql`${narratorMessages.createdAt} DESC`)
+				.limit(1),
+		);
 
 		if (remaining.length > 0) {
-			const latest = await db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, remaining[0].id),
-			});
+			const latest = await readQuery(
+				db.query.narratorMessages.findFirst({
+					where: eq(narratorMessages.id, remaining[0].id),
+				}),
+			);
 			if (latest?.contentJson) {
 				const blocks = Array.isArray(latest.contentJson) ? latest.contentJson : [];
 				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure

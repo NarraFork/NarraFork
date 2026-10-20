@@ -319,7 +319,7 @@ describe("approval feedback takes one path for every session", () => {
 					});
 					await permission;
 					// The next safe boundary stops the pass for the feedback.
-					expect(options.config.shouldStop?.()).toBe(true);
+					expect(await options.config.shouldStop?.()).toBe(true);
 					return {
 						finalText: "",
 						hasError: false,

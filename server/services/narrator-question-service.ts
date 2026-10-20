@@ -1,3 +1,4 @@
+import { readQuery, readQueryFirst } from "../db/worker-read";
 /**
  * narrator-question-service.ts — asynchronous AskUserQuestion: questions the agent
  * asked WITHOUT stopping, and the path their answers take back into the conversation.
@@ -385,10 +386,13 @@ async function broadcastChange(
 		awaited,
 	};
 	seam.broadcastToNarrator(record.narratorId, event);
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, record.narratorId),
-		columns: { variant: true, parentNarratorId: true },
-	});
+	const narrator = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, record.narratorId),
+			columns: { variant: true, parentNarratorId: true },
+		}),
+		{ site: "narrator-question-service.broadcastChange" },
+	);
 	if (narrator && isSubagentVariant(narrator.variant) && narrator.parentNarratorId) {
 		// Parent visibility is an event about the child, never a synthetic user answer
 		// in the parent's history. The actual answer remains owned by the child.
@@ -417,10 +421,16 @@ export async function getAsyncQuestionExecutionPrincipal(
 	questionId: string,
 	narratorId: string,
 ): Promise<QuestionExecutionPrincipal | null> {
-	const row = await db.query.narratorQuestions.findFirst({
-		where: and(eq(narratorQuestions.id, questionId), eq(narratorQuestions.narratorId, narratorId)),
-		columns: { executionPrincipalJson: true },
-	});
+	const row = await readQuery(
+		db.query.narratorQuestions.findFirst({
+			where: and(
+				eq(narratorQuestions.id, questionId),
+				eq(narratorQuestions.narratorId, narratorId),
+			),
+			columns: { executionPrincipalJson: true },
+		}),
+		{ site: "narrator-question-service.getAsyncQuestionExecutionPrincipal" },
+	);
 	return parseQuestionExecutionPrincipal(row?.executionPrincipalJson);
 }
 
@@ -447,19 +457,25 @@ export async function createAsyncQuestion(
 	args: CreateAsyncQuestionArgs,
 ): Promise<{ record: AsyncQuestionRecord; created: boolean }> {
 	await assertNarratorCanAskQuestion(args.narratorId);
-	const call = await db.query.narratorToolCalls.findFirst({
-		where: and(
-			eq(narratorToolCalls.id, args.toolCallId),
-			eq(narratorToolCalls.narratorId, args.narratorId),
-			eq(narratorToolCalls.toolUseId, args.toolUseId),
-			eq(narratorToolCalls.toolName, "AskUserQuestion"),
-		),
-		columns: { id: true },
-	});
+	const call = await readQuery(
+		db.query.narratorToolCalls.findFirst({
+			where: and(
+				eq(narratorToolCalls.id, args.toolCallId),
+				eq(narratorToolCalls.narratorId, args.narratorId),
+				eq(narratorToolCalls.toolUseId, args.toolUseId),
+				eq(narratorToolCalls.toolName, "AskUserQuestion"),
+			),
+			columns: { id: true },
+		}),
+		{ site: "narrator-question-service.createAsyncQuestion" },
+	);
 	if (!call) throw new Error("Question tool call does not belong to this narrator.");
-	const existing = await db.query.narratorQuestions.findFirst({
-		where: eq(narratorQuestions.toolCallId, args.toolCallId),
-	});
+	const existing = await readQuery(
+		db.query.narratorQuestions.findFirst({
+			where: eq(narratorQuestions.toolCallId, args.toolCallId),
+		}),
+		{ site: "narrator-question-service.createAsyncQuestion" },
+	);
 	if (existing) return { record: toRecord(existing), created: false };
 
 	assertQuestionBudget(args.context ?? "", QUESTION_CONTEXT_MAX_BYTES, "Question context");
@@ -526,9 +542,12 @@ export async function createAsyncQuestion(
 	} catch (err) {
 		// Lost the insert race against a concurrent replay of the same tool call: the
 		// unique index did its job, so read the winner back instead of failing.
-		const winner = await db.query.narratorQuestions.findFirst({
-			where: eq(narratorQuestions.toolCallId, args.toolCallId),
-		});
+		const winner = await readQuery(
+			db.query.narratorQuestions.findFirst({
+				where: eq(narratorQuestions.toolCallId, args.toolCallId),
+			}),
+			{ site: "narrator-question-service.createAsyncQuestion" },
+		);
 		if (winner) return { record: toRecord(winner), created: false };
 		throw err;
 	}
@@ -594,29 +613,32 @@ export async function listAsyncQuestions(args: ListAsyncQuestionsArgs): Promise<
 	const budget = QUESTION_RECEIPT_MAX_BYTES + 4096;
 	const bounded = (column: SQLWrapper) =>
 		sql<string | null>`case when ${bytes} <= ${budget} then ${column} else null end`;
-	const rows = await db
-		.select({
-			...getTableColumns(narratorQuestions),
-			questionsJson: bounded(narratorQuestions.questionsJson).mapWith(
-				narratorQuestions.questionsJson,
-			),
-			answersJson: bounded(narratorQuestions.answersJson).mapWith(narratorQuestions.answersJson),
-			annotationsJson: bounded(narratorQuestions.annotationsJson).mapWith(
-				narratorQuestions.annotationsJson,
-			),
-			context: bounded(narratorQuestions.context),
-			resolutionJson: bounded(narratorQuestions.resolutionJson).mapWith(
-				narratorQuestions.resolutionJson,
-			),
-			withdrawReason: bounded(narratorQuestions.withdrawReason),
-			summaryJson: sql<null>`null`,
-			executionPrincipalJson: sql<null>`null`,
-			withinBudget: sql<number>`${bytes} <= ${budget}`,
-		})
-		.from(narratorQuestions)
-		.where(and(...conditions))
-		.orderBy(desc(narratorQuestions.createdAt), desc(narratorQuestions.id))
-		.limit(limit + 1);
+	const rows = await readQuery(
+		db
+			.select({
+				...getTableColumns(narratorQuestions),
+				questionsJson: bounded(narratorQuestions.questionsJson).mapWith(
+					narratorQuestions.questionsJson,
+				),
+				answersJson: bounded(narratorQuestions.answersJson).mapWith(narratorQuestions.answersJson),
+				annotationsJson: bounded(narratorQuestions.annotationsJson).mapWith(
+					narratorQuestions.annotationsJson,
+				),
+				context: bounded(narratorQuestions.context),
+				resolutionJson: bounded(narratorQuestions.resolutionJson).mapWith(
+					narratorQuestions.resolutionJson,
+				),
+				withdrawReason: bounded(narratorQuestions.withdrawReason),
+				summaryJson: sql<null>`null`,
+				executionPrincipalJson: sql<null>`null`,
+				withinBudget: sql<number>`${bytes} <= ${budget}`,
+			})
+			.from(narratorQuestions)
+			.where(and(...conditions))
+			.orderBy(desc(narratorQuestions.createdAt), desc(narratorQuestions.id))
+			.limit(limit + 1),
+		{ site: "narrator-question-service.listAsyncQuestions" },
+	);
 
 	const hasMore = rows.length > limit;
 	const page = hasMore ? rows.slice(0, limit) : rows;
@@ -648,17 +670,25 @@ export async function countOpenAsyncQuestions(narratorId: string): Promise<numbe
 	// A narrow `COUNT(*)` over the `(narrator_id, status)` index. The exception to the
 	// no-count rule is deliberate: this is an index-only probe of a set the soft limit
 	// keeps small, and the number itself is the product feature (the inbox badge).
-	const [row] = await db
-		.select({ n: sql<number>`count(*)` })
-		.from(narratorQuestions)
-		.where(and(eq(narratorQuestions.narratorId, narratorId), eq(narratorQuestions.status, "open")));
+	const [row] = await readQuery(
+		db
+			.select({ n: sql<number>`count(*)` })
+			.from(narratorQuestions)
+			.where(
+				and(eq(narratorQuestions.narratorId, narratorId), eq(narratorQuestions.status, "open")),
+			),
+		{ site: "narrator-question-service.countOpenAsyncQuestions" },
+	);
 	return row?.n ?? 0;
 }
 
 export async function getAsyncQuestion(id: string): Promise<AsyncQuestionRecord | null> {
-	const row = await db.query.narratorQuestions.findFirst({
-		where: eq(narratorQuestions.id, id),
-	});
+	const row = await readQuery(
+		db.query.narratorQuestions.findFirst({
+			where: eq(narratorQuestions.id, id),
+		}),
+		{ site: "narrator-question-service.getAsyncQuestion" },
+	);
 	return row ? toRecord(row) : null;
 }
 
@@ -677,36 +707,38 @@ export async function getBoundedOpenAsyncQuestion(
 		+ coalesce(length(cast(${narratorQuestions.withdrawReason} as blob)), 0)`;
 	const bounded = (column: SQLWrapper) =>
 		sql<string | null>`case when ${bytes} <= ${maxBytes} then ${column} else null end`;
-	const row = await db
-		.select({
-			id: narratorQuestions.id,
-			narratorId: narratorQuestions.narratorId,
-			toolCallId: narratorQuestions.toolCallId,
-			toolUseId: narratorQuestions.toolUseId,
-			context: bounded(narratorQuestions.context),
-			resolutionJson: bounded(narratorQuestions.resolutionJson),
-			withdrawReason: bounded(narratorQuestions.withdrawReason),
-			questionsJson: bounded(narratorQuestions.questionsJson),
-			answersJson: bounded(narratorQuestions.answersJson),
-			annotationsJson: bounded(narratorQuestions.annotationsJson),
-			withinBudget: sql<number>`${bytes} <= ${maxBytes}`,
-			status: narratorQuestions.status,
-			origin: narratorQuestions.origin,
-			answerMessageId: narratorQuestions.answerMessageId,
-			decidedBy: narratorQuestions.decidedBy,
-			decidedAt: narratorQuestions.decidedAt,
-			createdAt: narratorQuestions.createdAt,
-		})
-		.from(narratorQuestions)
-		.where(
-			and(
-				eq(narratorQuestions.id, id),
-				...(status ? [eq(narratorQuestions.status, status)] : []),
-				...(narratorId !== undefined ? [eq(narratorQuestions.narratorId, narratorId)] : []),
-			),
-		)
-		.limit(1)
-		.get();
+	const row = await readQueryFirst(
+		db
+			.select({
+				id: narratorQuestions.id,
+				narratorId: narratorQuestions.narratorId,
+				toolCallId: narratorQuestions.toolCallId,
+				toolUseId: narratorQuestions.toolUseId,
+				context: bounded(narratorQuestions.context),
+				resolutionJson: bounded(narratorQuestions.resolutionJson),
+				withdrawReason: bounded(narratorQuestions.withdrawReason),
+				questionsJson: bounded(narratorQuestions.questionsJson),
+				answersJson: bounded(narratorQuestions.answersJson),
+				annotationsJson: bounded(narratorQuestions.annotationsJson),
+				withinBudget: sql<number>`${bytes} <= ${maxBytes}`,
+				status: narratorQuestions.status,
+				origin: narratorQuestions.origin,
+				answerMessageId: narratorQuestions.answerMessageId,
+				decidedBy: narratorQuestions.decidedBy,
+				decidedAt: narratorQuestions.decidedAt,
+				createdAt: narratorQuestions.createdAt,
+			})
+			.from(narratorQuestions)
+			.where(
+				and(
+					eq(narratorQuestions.id, id),
+					...(status ? [eq(narratorQuestions.status, status)] : []),
+					...(narratorId !== undefined ? [eq(narratorQuestions.narratorId, narratorId)] : []),
+				),
+			)
+			.limit(1),
+		{ site: "narrator-question-service.getBoundedOpenAsyncQuestion" },
+	);
 	if (!row) return { record: null, tooLarge: false };
 	if (!row.withinBudget) return { record: null, tooLarge: true };
 	const parse = (value: string | null): unknown => {
@@ -733,22 +765,24 @@ export async function getBoundedQuestionReceipt(
 	messageId: string,
 	narratorId: string,
 ): Promise<string | null> {
-	const row = await db
-		.select({
-			text: sql<
-				string | null
-			>`case when length(cast(${narratorMessages.contentText} as blob)) <= ${QUESTION_RECEIPT_MAX_BYTES} then ${narratorMessages.contentText} else null end`,
-		})
-		.from(narratorMessages)
-		.where(
-			and(
-				eq(narratorMessages.id, messageId),
-				eq(narratorMessages.narratorId, narratorId),
-				eq(narratorMessages.role, "user"),
-			),
-		)
-		.limit(1)
-		.get();
+	const row = await readQueryFirst(
+		db
+			.select({
+				text: sql<
+					string | null
+				>`case when length(cast(${narratorMessages.contentText} as blob)) <= ${QUESTION_RECEIPT_MAX_BYTES} then ${narratorMessages.contentText} else null end`,
+			})
+			.from(narratorMessages)
+			.where(
+				and(
+					eq(narratorMessages.id, messageId),
+					eq(narratorMessages.narratorId, narratorId),
+					eq(narratorMessages.role, "user"),
+				),
+			)
+			.limit(1),
+		{ site: "narrator-question-service.getBoundedQuestionReceipt" },
+	);
 	return row?.text ?? null;
 }
 
@@ -780,25 +814,28 @@ export async function listQuestionEvents(
 			throw new Error("Invalid question event cursor.");
 		conditions.push(sql`${narratorQuestionEvents}.rowid > ${cursor}`);
 	}
-	const rows = await db
-		.select({
-			messageId: narratorQuestionEvents.messageId,
-			cursor: sql<number>`${narratorQuestionEvents}.rowid`,
-			resolution: sql<
-				string | null
-			>`case when length(cast(${narratorQuestionEvents.resolutionJson} as blob)) <= ${QUESTION_NOTE_MAX_BYTES + 1024} then ${narratorQuestionEvents.resolutionJson} else null end`,
-			kind: narratorQuestionEvents.kind,
-			createdAt: narratorQuestionEvents.createdAt,
-			text: sql<
-				string | null
-			>`case when length(cast(${narratorMessages.contentJson} as blob)) <= ${QUESTION_RECEIPT_MAX_BYTES * 3} then coalesce(json_extract(${narratorMessages.contentJson}, '$[0].body.supplement'), json_extract(${narratorMessages.contentJson}, '$[1].body.supplement'), '') else null end`,
-			actor: narratorMessages.createdBy,
-		})
-		.from(narratorQuestionEvents)
-		.innerJoin(narratorMessages, eq(narratorQuestionEvents.messageId, narratorMessages.id))
-		.where(and(...conditions))
-		.orderBy(sql`${narratorQuestionEvents}.rowid`)
-		.limit(limit + 1);
+	const rows = await readQuery(
+		db
+			.select({
+				messageId: narratorQuestionEvents.messageId,
+				cursor: sql<number>`${narratorQuestionEvents}.rowid`,
+				resolution: sql<
+					string | null
+				>`case when length(cast(${narratorQuestionEvents.resolutionJson} as blob)) <= ${QUESTION_NOTE_MAX_BYTES + 1024} then ${narratorQuestionEvents.resolutionJson} else null end`,
+				kind: narratorQuestionEvents.kind,
+				createdAt: narratorQuestionEvents.createdAt,
+				text: sql<
+					string | null
+				>`case when length(cast(${narratorMessages.contentJson} as blob)) <= ${QUESTION_RECEIPT_MAX_BYTES * 3} then coalesce(json_extract(${narratorMessages.contentJson}, '$[0].body.supplement'), json_extract(${narratorMessages.contentJson}, '$[1].body.supplement'), '') else null end`,
+				actor: narratorMessages.createdBy,
+			})
+			.from(narratorQuestionEvents)
+			.innerJoin(narratorMessages, eq(narratorQuestionEvents.messageId, narratorMessages.id))
+			.where(and(...conditions))
+			.orderBy(sql`${narratorQuestionEvents}.rowid`)
+			.limit(limit + 1),
+		{ site: "narrator-question-service.listQuestionEvents" },
+	);
 	const page = rows.slice(0, limit);
 	const last = page.at(-1);
 	return {
@@ -834,54 +871,60 @@ export async function listQuestionSummaries(args: {
 			sql`(${narratorQuestions.createdAt}, ${narratorQuestions.id}) < (${createdAt}, ${id})`,
 		);
 	}
-	const rows = await db
-		.select({
-			id: narratorQuestions.id,
-			narratorId: narratorQuestions.narratorId,
-			toolCallId: narratorQuestions.toolCallId,
-			toolUseId: narratorQuestions.toolUseId,
-			status: narratorQuestions.status,
-			origin: narratorQuestions.origin,
-			createdAt: narratorQuestions.createdAt,
-			answerMessageId: narratorQuestions.answerMessageId,
-			context: sql<
-				string | null
-			>`case when length(cast(${narratorQuestions.context} as blob)) <= ${QUESTION_CONTEXT_MAX_BYTES} then ${narratorQuestions.context} else null end`,
-			resolution: sql<
-				string | null
-			>`case when length(cast(${narratorQuestions.resolutionJson} as blob)) <= ${QUESTION_NOTE_MAX_BYTES + 1024} then ${narratorQuestions.resolutionJson} else null end`,
-			withdrawReason: sql<
-				string | null
-			>`case when length(cast(${narratorQuestions.withdrawReason} as blob)) <= ${QUESTION_NOTE_MAX_BYTES} then ${narratorQuestions.withdrawReason} else null end`,
-			resolved: sql<boolean>`${narratorQuestions.resolutionJson} is not null`,
-			questions: sql<string>`case when length(cast(${narratorQuestions.summaryJson} as blob)) <= 16384 and json_valid(${narratorQuestions.summaryJson}) then ${narratorQuestions.summaryJson} when length(cast(${narratorQuestions.questionsJson} as blob)) <= ${QUESTION_SNAPSHOT_MAX_BYTES} and json_valid(${narratorQuestions.questionsJson}) then (select json_group_array(json_object('id', json_extract(value, '$.id'), 'header', substr(json_extract(value, '$.header'), 1, 120))) from json_each(${narratorQuestions.questionsJson}) where key < 4) else '[]' end`,
-			narratorTitle: narrators.title,
-			chapterId: narrators.chapterId,
-		})
-		.from(narratorQuestions)
-		.innerJoin(narrators, eq(narratorQuestions.narratorId, narrators.id))
-		.where(and(...conditions))
-		.orderBy(desc(narratorQuestions.createdAt), desc(narratorQuestions.id))
-		.limit(limit + 1);
+	const rows = await readQuery(
+		db
+			.select({
+				id: narratorQuestions.id,
+				narratorId: narratorQuestions.narratorId,
+				toolCallId: narratorQuestions.toolCallId,
+				toolUseId: narratorQuestions.toolUseId,
+				status: narratorQuestions.status,
+				origin: narratorQuestions.origin,
+				createdAt: narratorQuestions.createdAt,
+				answerMessageId: narratorQuestions.answerMessageId,
+				context: sql<
+					string | null
+				>`case when length(cast(${narratorQuestions.context} as blob)) <= ${QUESTION_CONTEXT_MAX_BYTES} then ${narratorQuestions.context} else null end`,
+				resolution: sql<
+					string | null
+				>`case when length(cast(${narratorQuestions.resolutionJson} as blob)) <= ${QUESTION_NOTE_MAX_BYTES + 1024} then ${narratorQuestions.resolutionJson} else null end`,
+				withdrawReason: sql<
+					string | null
+				>`case when length(cast(${narratorQuestions.withdrawReason} as blob)) <= ${QUESTION_NOTE_MAX_BYTES} then ${narratorQuestions.withdrawReason} else null end`,
+				resolved: sql<boolean>`${narratorQuestions.resolutionJson} is not null`,
+				questions: sql<string>`case when length(cast(${narratorQuestions.summaryJson} as blob)) <= 16384 and json_valid(${narratorQuestions.summaryJson}) then ${narratorQuestions.summaryJson} when length(cast(${narratorQuestions.questionsJson} as blob)) <= ${QUESTION_SNAPSHOT_MAX_BYTES} and json_valid(${narratorQuestions.questionsJson}) then (select json_group_array(json_object('id', json_extract(value, '$.id'), 'header', substr(json_extract(value, '$.header'), 1, 120))) from json_each(${narratorQuestions.questionsJson}) where key < 4) else '[]' end`,
+				narratorTitle: narrators.title,
+				chapterId: narrators.chapterId,
+			})
+			.from(narratorQuestions)
+			.innerJoin(narrators, eq(narratorQuestions.narratorId, narrators.id))
+			.where(and(...conditions))
+			.orderBy(desc(narratorQuestions.createdAt), desc(narratorQuestions.id))
+			.limit(limit + 1),
+		{ site: "narrator-question-service.listQuestionSummaries" },
+	);
 	const page = rows.slice(0, limit);
 	const items = [];
 	const { canReadNarrator, canWriteNarrator } = await import("./narrator-acl");
 	for (const row of page) {
 		let canAct = true;
 		if (args.principal) {
-			const narrator = await db.query.narrators.findFirst({
-				where: eq(narrators.id, row.narratorId),
-				columns: {
-					id: true,
-					ownerUserId: true,
-					visibility: true,
-					writeAudience: true,
-					type: true,
-					aclRootNarratorId: true,
-					chapterId: true,
-					contextProjectId: true,
-				},
-			});
+			const narrator = await readQuery(
+				db.query.narrators.findFirst({
+					where: eq(narrators.id, row.narratorId),
+					columns: {
+						id: true,
+						ownerUserId: true,
+						visibility: true,
+						writeAudience: true,
+						type: true,
+						aclRootNarratorId: true,
+						chapterId: true,
+						contextProjectId: true,
+					},
+				}),
+				{ site: "narrator-question-service.listQuestionSummaries" },
+			);
 			if (!narrator || !(await canReadNarrator(narrator, args.principal))) continue;
 			canAct = await canWriteNarrator(narrator, args.principal);
 		}
@@ -1125,25 +1168,28 @@ export async function listAllOpenAsyncQuestionsForPrincipal(principal: {
 	isAdmin: boolean;
 }): Promise<AsyncQuestionWithContext[]> {
 	const HARD_LIMIT = 200;
-	const rows = await db
-		.select({
-			question: narratorQuestions,
-			narratorTitle: narrators.title,
-			chapterId: narrators.chapterId,
-			// The ACL columns, so the filter below needs no second query per row.
-			narratorId: narrators.id,
-			ownerUserId: narrators.ownerUserId,
-			visibility: narrators.visibility,
-			writeAudience: narrators.writeAudience,
-			type: narrators.type,
-			aclRootNarratorId: narrators.aclRootNarratorId,
-			contextProjectId: narrators.contextProjectId,
-		})
-		.from(narratorQuestions)
-		.innerJoin(narrators, eq(narratorQuestions.narratorId, narrators.id))
-		.where(eq(narratorQuestions.status, "open"))
-		.orderBy(desc(narratorQuestions.createdAt), desc(narratorQuestions.id))
-		.limit(HARD_LIMIT);
+	const rows = await readQuery(
+		db
+			.select({
+				question: narratorQuestions,
+				narratorTitle: narrators.title,
+				chapterId: narrators.chapterId,
+				// The ACL columns, so the filter below needs no second query per row.
+				narratorId: narrators.id,
+				ownerUserId: narrators.ownerUserId,
+				visibility: narrators.visibility,
+				writeAudience: narrators.writeAudience,
+				type: narrators.type,
+				aclRootNarratorId: narrators.aclRootNarratorId,
+				contextProjectId: narrators.contextProjectId,
+			})
+			.from(narratorQuestions)
+			.innerJoin(narrators, eq(narratorQuestions.narratorId, narrators.id))
+			.where(eq(narratorQuestions.status, "open"))
+			.orderBy(desc(narratorQuestions.createdAt), desc(narratorQuestions.id))
+			.limit(HARD_LIMIT),
+		{ site: "narrator-question-service.listAllOpenAsyncQuestionsForPrincipal" },
+	);
 
 	const { canReadNarrator } = await import("./narrator-acl");
 	const visible: AsyncQuestionWithContext[] = [];
@@ -1274,10 +1320,13 @@ async function deliverDecision(
 	const { content } = sideCarBodyWithText("async_question", body, locale);
 	assertQuestionBudget(content, QUESTION_RECEIPT_MAX_BYTES, "Question receipt");
 	const executionPrincipal = await getAsyncQuestionExecutionPrincipal(record.id, record.narratorId);
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, record.narratorId),
-		columns: { variant: true },
-	});
+	const narrator = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, record.narratorId),
+			columns: { variant: true },
+		}),
+		{ site: "narrator-question-service.deliverDecision" },
+	);
 	const unknownChildPrincipal =
 		!!narrator && isSubagentVariant(narrator.variant) && !executionPrincipal;
 	if (unknownChildPrincipal)
@@ -1357,12 +1406,16 @@ export async function retryQuestionAnswerDelivery(
 	questionId: string,
 	locale: Locale = "en",
 ) {
-	const row = await db
-		.select(questionStateColumns)
-		.from(narratorQuestions)
-		.where(and(eq(narratorQuestions.id, questionId), eq(narratorQuestions.narratorId, narratorId)))
-		.limit(1)
-		.get();
+	const row = await readQueryFirst(
+		db
+			.select(questionStateColumns)
+			.from(narratorQuestions)
+			.where(
+				and(eq(narratorQuestions.id, questionId), eq(narratorQuestions.narratorId, narratorId)),
+			)
+			.limit(1),
+		{ site: "narrator-question-service.retryQuestionAnswerDelivery" },
+	);
 	if (!row || (row.status !== "answered" && row.status !== "dismissed"))
 		return { ready: false, started: false };
 	return scheduleSavedQuestionDecision(toStateRecord(row), await resolveSeam(), locale);
@@ -1468,12 +1521,14 @@ export async function ignoreAsyncQuestion(
 	id: string,
 	args: { userId?: string | null; locale?: Locale } = {},
 ): Promise<AsyncQuestionTransition> {
-	const row = await db
-		.select(questionStateColumns)
-		.from(narratorQuestions)
-		.where(eq(narratorQuestions.id, id))
-		.limit(1)
-		.get();
+	const row = await readQueryFirst(
+		db
+			.select(questionStateColumns)
+			.from(narratorQuestions)
+			.where(eq(narratorQuestions.id, id))
+			.limit(1),
+		{ site: "narrator-question-service.ignoreAsyncQuestion" },
+	);
 	if (!row) return { ok: false, reason: "not_found" };
 	if (row.status !== "open") return { ok: false, reason: "stale" };
 	const claimed = await db
@@ -1867,12 +1922,14 @@ export async function notifyQuestionHistoryChanged(
 		// Prepared reverts can affect thousands of questions. Process every ID while
 		// yielding between small batches instead of silently dropping later waiters.
 		if (index > 0 && index % 32 === 0) await new Promise<void>((resolve) => setImmediate(resolve));
-		const row = await db
-			.select(questionStateColumns)
-			.from(narratorQuestions)
-			.where(and(eq(narratorQuestions.id, id), eq(narratorQuestions.narratorId, narratorId)))
-			.limit(1)
-			.get();
+		const row = await readQueryFirst(
+			db
+				.select(questionStateColumns)
+				.from(narratorQuestions)
+				.where(and(eq(narratorQuestions.id, id), eq(narratorQuestions.narratorId, narratorId)))
+				.limit(1),
+			{ site: "narrator-question-service.notifyQuestionHistoryChanged" },
+		);
 		const record: AsyncQuestionRecord = row
 			? toStateRecord(row)
 			: {

@@ -227,13 +227,13 @@ async function prepared(fileList = [fixed()], overrides: Partial<RevertPlanHeade
 		planId: plan.id,
 		planHash: plan.planHash,
 	};
-	return { ctx, request, files: allFiles(ctx), plan };
+	return { ctx, request, files: await allFiles(ctx), plan };
 }
-function allFiles(ctx: RevertJournalContext) {
+async function allFiles(ctx: RevertJournalContext) {
 	const result: RevertPlanFileMetadata[] = [];
 	let cursor: RevertPlanFileCursor | undefined;
 	do {
-		const page = plans.listFiles(ctx.owner, ctx.planId, { cursor });
+		const page = await plans.listFiles(ctx.owner, ctx.planId, { cursor });
 		result.push(...page.items);
 		cursor = page.nextCursor ?? undefined;
 	} while (cursor);
@@ -291,8 +291,8 @@ async function verified() {
 function injection(table: string, timing: string, body: string) {
 	conn.run(`CREATE TRIGGER injected_failure ${timing} ON ${table} BEGIN ${body}; END`);
 }
-function journal(ctx: RevertJournalContext, id: string) {
-	return service.listFiles(ctx).items.find((file) => file.id === id);
+async function journal(ctx: RevertJournalContext, id: string) {
+	return (await service.listFiles(ctx)).items.find((file) => file.id === id);
 }
 
 async function historyScenario() {
@@ -430,7 +430,7 @@ describe("real prepared plans and lease-bound durable claims", () => {
 		await expect(service.startExecution(p.ctx, p.request.manifestProof)).rejects.toThrow(
 			"not ready",
 		);
-		expect(service.getOperation(p.ctx).status).toBe("prepared");
+		expect((await service.getOperation(p.ctx)).status).toBe("prepared");
 	});
 
 	test("explicit recovery journal claims accept an observing lease during registered activity", async () => {
@@ -504,28 +504,28 @@ describe("real prepared plans and lease-bound durable claims", () => {
 		await coordinator.withRollback({ scope: other, runtime }, (lease) => {
 			expect(() => service.claimApply(p.ctx, file, lease)).toThrow();
 		});
-		expect(journal(p.ctx, file.id)?.receiptJson).toBeNull();
+		expect((await journal(p.ctx, file.id))?.receiptJson).toBeNull();
 	});
 
 	test("first claim alone grants execution and never counts an actual apply", async () => {
 		const p = await started();
 		const file = p.files[0];
 		if (!file) throw new Error("fixture");
-		await rollback((lease) => {
+		await rollback(async (lease) => {
 			const first = service.claimApply(p.ctx, file, lease);
 			expect(first.mayExecute).toBe(true);
 			expect(service.claimApply(p.ctx, file, lease).mayExecute).toBe(false);
-			expect(service.getOperation(p.ctx).appliedFileCount).toBe(0);
-			expect(journal(p.ctx, file.id)?.observedAfterStateJson).toBeNull();
+			expect((await service.getOperation(p.ctx)).appliedFileCount).toBe(0);
+			expect((await journal(p.ctx, file.id))?.observedAfterStateJson).toBeNull();
 		});
 		clock += FILE_CHANGE_LIMITS.planLifetimeMs * 5;
 		await rollback((lease) => {
 			expect(service.claimApply(p.ctx, file, lease).mayExecute).toBe(false);
 		});
 		expect(
-			service
-				.listPending(owner, { status: "applying" })
-				.items.some((row) => row.id === p.ctx.planId),
+			(await service.listPending(owner, { status: "applying" })).items.some(
+				(row) => row.id === p.ctx.planId,
+			),
 		).toBe(true);
 	});
 
@@ -533,7 +533,7 @@ describe("real prepared plans and lease-bound durable claims", () => {
 		const p = await started();
 		const file = p.files[0];
 		if (!file) throw new Error("fixture");
-		const before = service.getOperation(p.ctx);
+		const before = await service.getOperation(p.ctx);
 		injection(
 			"revert_operations",
 			"BEFORE UPDATE",
@@ -542,8 +542,8 @@ describe("real prepared plans and lease-bound durable claims", () => {
 		await rollback((lease) => {
 			expect(() => service.claimApply(p.ctx, file, lease)).toThrow();
 		});
-		expect(service.getOperation(p.ctx)).toEqual(before);
-		expect(journal(p.ctx, file.id)?.receiptJson).toBeNull();
+		expect(await service.getOperation(p.ctx)).toEqual(before);
+		expect((await journal(p.ctx, file.id))?.receiptJson).toBeNull();
 		conn.run("DROP TRIGGER injected_failure");
 		await rollback(async (lease) => {
 			await applyFile(p.ctx, file, lease);
@@ -554,11 +554,11 @@ describe("real prepared plans and lease-bound durable claims", () => {
 		const p = await prepared();
 		injection("revert_operations", "BEFORE UPDATE", "SELECT RAISE(ABORT, 'start commit failed')");
 		await expect(service.startExecution(p.ctx, p.request.manifestProof)).rejects.toThrow();
-		expect(service.getOperation(p.ctx).status).toBe("prepared");
+		expect((await service.getOperation(p.ctx)).status).toBe("prepared");
 		expect(
-			service
-				.listFiles(p.ctx)
-				.items.every((f) => f.receiptJson === null && f.status === "prepared"),
+			(await service.listFiles(p.ctx)).items.every(
+				(f) => f.receiptJson === null && f.status === "prepared",
+			),
 		).toBe(true);
 	});
 });
@@ -571,12 +571,12 @@ describe("immutable receipts and complete file verification", () => {
 		await rollback(async (lease) => {
 			const { proof, recorded } = await applyFile(p.ctx, file, lease);
 			expect(recorded.status).toBe("verified");
-			expect(service.getOperation(p.ctx).appliedFileCount).toBe(1);
+			expect((await service.getOperation(p.ctx)).appliedFileCount).toBe(1);
 			expect(await service.recordApplyReceipt(p.ctx, file.id, proof)).toEqual(recorded);
 			await expect(
 				service.recordApplyReceipt(p.ctx, file.id, { ...proof, receiptId: "replacement" }),
 			).rejects.toThrow("overwritten");
-			expect(service.getOperation(p.ctx).appliedFileCount).toBe(1);
+			expect((await service.getOperation(p.ctx)).appliedFileCount).toBe(1);
 		});
 		expect((await service.finishFiles(p.ctx)).status).toBe("files_verified");
 	});
@@ -608,7 +608,7 @@ describe("immutable receipts and complete file verification", () => {
 			expect((await service.finishFiles(p.ctx)).status).toBe("recovery_required");
 			expect(() => service.commit(p.ctx)).toThrow("receipts must be verified");
 			if (variant === "foreign_after" || variant === "missing_after")
-				expect(service.getOperation(p.ctx).appliedFileCount).toBe(1);
+				expect((await service.getOperation(p.ctx)).appliedFileCount).toBe(1);
 		});
 	}
 
@@ -619,7 +619,7 @@ describe("immutable receipts and complete file verification", () => {
 		await rollback(async (lease) => {
 			await applyFile(p.ctx, file, lease, { outcome: "not_applied" });
 		});
-		expect(service.getOperation(p.ctx).appliedFileCount).toBe(0);
+		expect((await service.getOperation(p.ctx)).appliedFileCount).toBe(0);
 		expect((await service.finishFiles(p.ctx)).status).toBe("files_verified");
 	});
 
@@ -649,8 +649,8 @@ describe("immutable receipts and complete file verification", () => {
 				await expect(
 					service.recordApplyReceipt(p.ctx, file.id, bad as unknown as FileChangeExecutionReceipt),
 				).rejects.toThrow();
-			expect(journal(p.ctx, file.id)?.observedAfterStateJson).toBeNull();
-			expect(journal(p.ctx, file.id)?.status).toBe("applying");
+			expect((await journal(p.ctx, file.id))?.observedAfterStateJson).toBeNull();
+			expect((await journal(p.ctx, file.id))?.status).toBe("applying");
 			await service.recordApplyReceipt(p.ctx, file.id, proof);
 		});
 	});
@@ -674,7 +674,7 @@ describe("immutable receipts and complete file verification", () => {
 			await expect(service.recordApplyReceipt(p.ctx, file.id, receipt(claim))).rejects.toThrow(
 				"namespace",
 			);
-			expect(journal(p.ctx, file.id)?.status).toBe("applying");
+			expect((await journal(p.ctx, file.id))?.status).toBe("applying");
 		});
 	});
 
@@ -687,8 +687,8 @@ describe("immutable receipts and complete file verification", () => {
 			const proof = receipt(claim);
 			injection("revert_operations", "BEFORE UPDATE", "SELECT RAISE(ABORT, 'receipt SQL failure')");
 			await expect(service.recordApplyReceipt(p.ctx, file.id, proof)).rejects.toThrow();
-			expect(service.getOperation(p.ctx).appliedFileCount).toBe(0);
-			expect(journal(p.ctx, file.id)?.observedAfterStateJson).toBeNull();
+			expect((await service.getOperation(p.ctx)).appliedFileCount).toBe(0);
+			expect((await journal(p.ctx, file.id))?.observedAfterStateJson).toBeNull();
 			conn.run("DROP TRIGGER injected_failure");
 			expect((await service.recordApplyReceipt(p.ctx, file.id, proof)).status).toBe("verified");
 		});
@@ -709,7 +709,7 @@ describe("immutable receipts and complete file verification", () => {
 		});
 		expect((await service.finishFiles(p.ctx)).status).toBe("recovery_required");
 		expect(yielded).toBe(true);
-		expect(service.getOperation(p.ctx).appliedFileCount).toBe(34);
+		expect((await service.getOperation(p.ctx)).appliedFileCount).toBe(34);
 		const last = p.files.at(-1);
 		if (!last) throw new Error("fixture");
 		db.delete(revertOperationFiles).where(eq(revertOperationFiles.id, last.id)).run();
@@ -729,7 +729,7 @@ describe("immutable receipts and complete file verification", () => {
 			.where(eq(revertOperations.id, p.ctx.planId))
 			.run();
 		await expect(service.finishFiles(p.ctx)).rejects.toThrow("prepared manifest commitment");
-		expect(service.getOperation(p.ctx).status).toBe("applying");
+		expect((await service.getOperation(p.ctx)).status).toBe("applying");
 	});
 
 	test("journal changes across a verification page yield cannot advance a stale scan", async () => {
@@ -742,7 +742,7 @@ describe("immutable receipts and complete file verification", () => {
 				.run(),
 		);
 		await expect(service.finishFiles(p.ctx)).rejects.toThrow("bounded page yield");
-		expect(service.getOperation(p.ctx).status).toBe("applying");
+		expect((await service.getOperation(p.ctx)).status).toBe("applying");
 	});
 
 	test("forged verified status with no receipt never passes finish", async () => {
@@ -767,7 +767,7 @@ describe("immutable receipts and complete file verification", () => {
 					receipt(claim, { observedAfter: known("too-big-observation", 2 * 1024 * 1024) }),
 				),
 			).rejects.toThrow("finite budget");
-			expect(journal(p.ctx, file.id)?.observedAfterStateJson).toBeNull();
+			expect((await journal(p.ctx, file.id))?.observedAfterStateJson).toBeNull();
 		});
 	});
 });
@@ -776,7 +776,7 @@ describe("history and journal form one synchronous transaction", () => {
 	test("real history collector/commit runs through the actual journal transaction without invalidating its stamp", async () => {
 		const p = await historyScenario();
 		const token = await p.prepareHistory();
-		const beforeFile = service.listFiles(p.ctx).items[0];
+		const beforeFile = (await service.listFiles(p.ctx)).items[0];
 		let affected: string[] = [];
 		const result = service.commit(p.ctx, {
 			db,
@@ -788,7 +788,7 @@ describe("history and journal form one synchronous transaction", () => {
 		expect(affected).toContain("history-narrator");
 		expect(remainingMessages()).toEqual(["keep-message"]);
 		expect(historyVersion()).toBe(8);
-		expect(service.listFiles(p.ctx).items[0]).toEqual(beforeFile);
+		expect((await service.listFiles(p.ctx)).items[0]).toEqual(beforeFile);
 		expect(
 			service.commit(p.ctx, {
 				db,
@@ -817,7 +817,7 @@ describe("history and journal form one synchronous transaction", () => {
 		).toThrow("real journal commit failed");
 		expect(remainingMessages()).toEqual(["keep-message", "remove-message"]);
 		expect(historyVersion()).toBe(7);
-		expect(service.getOperation(p.ctx).status).toBe("files_verified");
+		expect((await service.getOperation(p.ctx)).status).toBe("files_verified");
 		conn.run("DROP TRIGGER injected_failure");
 		const freshToken = await p.prepareHistory();
 		expect(
@@ -850,7 +850,7 @@ describe("history and journal form one synchronous transaction", () => {
 		if (!continuation) throw new Error("Expected continuation");
 		await expect(continuation).rejects.toThrow();
 		expect(db.select().from(narrators).where(eq(narrators.id, "escaped")).get()).toBeUndefined();
-		expect(service.getOperation(p.ctx).status).toBe("files_verified");
+		expect((await service.getOperation(p.ctx)).status).toBe("files_verified");
 	});
 
 	test("empty fixed plans still require start and finish; file-only commit needs no callback", async () => {
@@ -902,7 +902,7 @@ describe("history and journal form one synchronous transaction", () => {
 			}),
 		).toThrow();
 		expect(db.select().from(narrators).where(eq(narrators.id, "history")).get()).toBeUndefined();
-		expect(service.getOperation(p.ctx).status).toBe("files_verified");
+		expect((await service.getOperation(p.ctx)).status).toBe("files_verified");
 	});
 
 	test("native COMMIT failure rolls back verified marker and history together", async () => {
@@ -920,7 +920,7 @@ describe("history and journal form one synchronous transaction", () => {
 				},
 			}),
 		).toThrow();
-		expect(service.getOperation(p.ctx).status).toBe("files_verified");
+		expect((await service.getOperation(p.ctx)).status).toBe("files_verified");
 		expect(db.select().from(narrators).where(eq(narrators.id, "history")).get()).toBeUndefined();
 	});
 
@@ -943,7 +943,7 @@ describe("history and journal form one synchronous transaction", () => {
 			}),
 		).toThrow("Pinned raw evidence");
 		expect(called).toBe(false);
-		expect(service.getOperation(p.ctx).status).toBe("files_verified");
+		expect((await service.getOperation(p.ctx)).status).toBe("files_verified");
 	});
 
 	test("async, Promise-returning, foreign DB and ambient transactions reject", async () => {
@@ -976,7 +976,7 @@ describe("separate guarded compensation", () => {
 		const p = await verified();
 		const file = p.files[0];
 		if (!file) throw new Error("fixture");
-		const before = journal(p.ctx, file.id);
+		const before = await journal(p.ctx, file.id);
 		if (!before) throw new Error("fixture");
 		service.beginCompensation(p.ctx);
 		await rollback(async (lease) => {
@@ -1037,7 +1037,7 @@ describe("separate guarded compensation", () => {
 		const p = await started();
 		service.beginCompensation(p.ctx);
 		expect((await service.finishCompensation(p.ctx)).status).toBe("compensated");
-		expect(service.listFiles(p.ctx).items[0]?.receiptJson).toBeNull();
+		expect((await service.listFiles(p.ctx)).items[0]?.receiptJson).toBeNull();
 	});
 
 	test("unknown file cannot be hidden by compensating another confirmed file", async () => {
@@ -1054,8 +1054,8 @@ describe("separate guarded compensation", () => {
 			await service.recordCompensateReceipt(p.ctx, a.id, receipt(claim));
 		});
 		expect((await service.finishCompensation(p.ctx)).status).toBe("recovery_required");
-		expect(journal(p.ctx, a.id)?.status).toBe("compensated");
-		expect(journal(p.ctx, b.id)?.status).toBe("unknown");
+		expect((await journal(p.ctx, a.id))?.status).toBe("compensated");
+		expect((await journal(p.ctx, b.id))?.status).toBe("unknown");
 	});
 
 	test("compensation failure/foreign after cannot become compensated or erase apply evidence", async () => {
@@ -1069,7 +1069,7 @@ describe("separate guarded compensation", () => {
 			await service.recordCompensateReceipt(p.ctx, file.id, proof);
 		});
 		expect((await service.finishCompensation(p.ctx)).status).toBe("recovery_required");
-		expect(journal(p.ctx, file.id)?.observedAfterStateJson).toEqual(file.desiredStateJson);
+		expect((await journal(p.ctx, file.id))?.observedAfterStateJson).toEqual(file.desiredStateJson);
 	});
 
 	test("compensation claim commit failure cannot partly persist inverse execution permission", async () => {
@@ -1077,12 +1077,12 @@ describe("separate guarded compensation", () => {
 		const file = p.files[0];
 		if (!file) throw new Error("fixture");
 		service.beginCompensation(p.ctx);
-		const before = journal(p.ctx, file.id);
+		const before = await journal(p.ctx, file.id);
 		injection("revert_operations", "BEFORE UPDATE", "SELECT RAISE(ABORT, 'inverse claim failure')");
 		await rollback((lease) => {
 			expect(() => service.claimCompensate(p.ctx, file, lease)).toThrow();
 		});
-		expect(journal(p.ctx, file.id)).toEqual(before);
+		expect(await journal(p.ctx, file.id)).toEqual(before);
 	});
 
 	test("compensation phase failure rolls back only the new phase proof", async () => {
@@ -1095,8 +1095,10 @@ describe("separate guarded compensation", () => {
 			const proof = receipt(claim);
 			injection("revert_operations", "BEFORE UPDATE", "SELECT RAISE(ABORT, 'comp receipt failed')");
 			await expect(service.recordCompensateReceipt(p.ctx, file.id, proof)).rejects.toThrow();
-			expect(journal(p.ctx, file.id)?.compensationAfterStateJson).toBeNull();
-			expect(journal(p.ctx, file.id)?.observedAfterStateJson).toEqual(file.desiredStateJson);
+			expect((await journal(p.ctx, file.id))?.compensationAfterStateJson).toBeNull();
+			expect((await journal(p.ctx, file.id))?.observedAfterStateJson).toEqual(
+				file.desiredStateJson,
+			);
 			conn.run("DROP TRIGGER injected_failure");
 			expect((await service.recordCompensateReceipt(p.ctx, file.id, proof)).status).toBe(
 				"compensated",
@@ -1141,7 +1143,9 @@ describe("recovery inventory, durable reopen and bounded access", () => {
 		connect();
 		clock += FILE_CHANGE_LIMITS.planLifetimeMs * 10;
 		expect(
-			service.listPending(owner, { status: "applying" }).items.some((op) => op.id === p.ctx.planId),
+			(await service.listPending(owner, { status: "applying" })).items.some(
+				(op) => op.id === p.ctx.planId,
+			),
 		).toBe(true);
 		if (!first) throw new Error("fixture");
 		const old = first;
@@ -1162,11 +1166,13 @@ describe("recovery inventory, durable reopen and bounded access", () => {
 			{ ...owner, narratorId: "other" },
 			{ ...owner, projectId: "other" },
 		]) {
-			expect(service.listPending(altered, { status: "applying" }).items).toHaveLength(0);
-			expect(() => service.listFiles({ ...p.ctx, owner: altered })).toThrow("owning context");
+			expect((await service.listPending(altered, { status: "applying" })).items).toHaveLength(0);
+			await expect(service.listFiles({ ...p.ctx, owner: altered })).rejects.toThrow(
+				"owning context",
+			);
 		}
-		expect(() => service.listFiles(p.ctx, { limit: 101 })).toThrow();
-		expect(() => service.listPending(owner, { status: "applying", limit: 0 })).toThrow();
+		await expect(service.listFiles(p.ctx, { limit: 101 })).rejects.toThrow();
+		await expect(service.listPending(owner, { status: "applying", limit: 0 })).rejects.toThrow();
 	});
 
 	test("pending inventory seeks one owner/context/status and preserves timestamp ties", async () => {
@@ -1175,7 +1181,7 @@ describe("recovery inventory, durable reopen and bounded access", () => {
 		const found: string[] = [];
 		let cursor: RevertJournalPendingCursor | undefined;
 		do {
-			const page = service.listPending(owner, { status: "applying", limit: 2, cursor });
+			const page = await service.listPending(owner, { status: "applying", limit: 2, cursor });
 			found.push(...page.items.map((row) => row.id));
 			cursor = page.nextCursor ?? undefined;
 		} while (cursor);
@@ -1204,7 +1210,7 @@ describe("recovery inventory, durable reopen and bounded access", () => {
 			["compensating", compensating.ctx.planId],
 			["recovery_required", recovery.ctx.planId],
 		] as const) {
-			const page = service.listPending(owner, { status, limit: 1 });
+			const page = await service.listPending(owner, { status, limit: 1 });
 			expect(page.items.map((row) => row.id)).toEqual([id]);
 			expect(page.hasMore).toBe(false);
 		}
@@ -1227,7 +1233,7 @@ describe("recovery inventory, durable reopen and bounded access", () => {
 		const ids: string[] = [];
 		let cursor: string | undefined;
 		do {
-			const page = service.listFiles(p.ctx, { cursor, limit: 7 });
+			const page = await service.listFiles(p.ctx, { cursor, limit: 7 });
 			ids.push(...page.items.map((row) => row.id));
 			cursor = page.nextCursor ?? undefined;
 			expect(Buffer.byteLength(JSON.stringify(page))).toBeLessThan(FILE_CHANGE_LIMITS.summaryBytes);
@@ -1247,8 +1253,8 @@ describe("recovery inventory, durable reopen and bounded access", () => {
 		const c = new AbortController();
 		c.abort(new Error("cancelled"));
 		await expect(service.finishFiles(p.ctx, { signal: c.signal })).rejects.toThrow("cancelled");
-		expect(journal(p.ctx, file.id)?.status).toBe("applying");
-		expect(service.listPending(owner, { status: "applying" }).items).toHaveLength(1);
+		expect((await journal(p.ctx, file.id))?.status).toBe("applying");
+		expect((await service.listPending(owner, { status: "applying" })).items).toHaveLength(1);
 	});
 });
 
@@ -1275,7 +1281,7 @@ describe("receipt admission carries proven totals instead of rescanning the plan
 			for (const file of p.files) await applyFile(p.ctx, file, lease);
 		});
 		expect(scan).toHaveBeenCalledTimes(1);
-		expect(service.getOperation(p.ctx).appliedFileCount).toBe(40);
+		expect((await service.getOperation(p.ctx)).appliedFileCount).toBe(40);
 		// finish still proves the whole set on its own.
 		expect((await service.finishFiles(p.ctx)).status).toBe("files_verified");
 		expect(scan).toHaveBeenCalledTimes(2);
@@ -1295,7 +1301,7 @@ describe("receipt admission carries proven totals instead of rescanning the plan
 			await applyFile(p.ctx, b, lease);
 		});
 		await expect(service.finishFiles(p.ctx)).rejects.toThrow("File identity changed");
-		expect(service.getOperation(p.ctx).status).not.toBe("files_verified");
+		expect((await service.getOperation(p.ctx)).status).not.toBe("files_verified");
 	});
 
 	test("the receipt's own row is still fully validated on the incremental path", async () => {
@@ -1335,7 +1341,7 @@ describe("receipt admission carries proven totals instead of rescanning the plan
 		});
 		expect(scan).toHaveBeenCalledTimes(2);
 		// The rescan recounted from real receipts instead of trusting the forged counter.
-		expect(service.getOperation(p.ctx).appliedFileCount).toBe(3);
+		expect((await service.getOperation(p.ctx)).appliedFileCount).toBe(3);
 	});
 
 	test("a rolled-back receipt does not advance the carried totals", async () => {
@@ -1353,7 +1359,7 @@ describe("receipt admission carries proven totals instead of rescanning the plan
 			lease.settle(claim.mutationId, "applied");
 			await applyFile(p.ctx, c, lease);
 		});
-		expect(service.getOperation(p.ctx).appliedFileCount).toBe(3);
+		expect((await service.getOperation(p.ctx)).appliedFileCount).toBe(3);
 		expect((await service.finishFiles(p.ctx)).appliedFileCount).toBe(3);
 	});
 
@@ -1377,17 +1383,17 @@ describe("receipt admission carries proven totals instead of rescanning the plan
 			await expect(service.recordApplyReceipt(p.ctx, b.id, receipt(claim))).rejects.toThrow();
 			conn.run("DROP TRIGGER injected_failure");
 			conn.run("PRAGMA defer_foreign_keys = OFF");
-			expect(service.getOperation(p.ctx).appliedFileCount).toBe(1);
-			expect(journal(p.ctx, b.id)?.observedAfterStateJson).toBeNull();
+			expect((await service.getOperation(p.ctx)).appliedFileCount).toBe(1);
+			expect((await journal(p.ctx, b.id))?.observedAfterStateJson).toBeNull();
 			// The rolled-back attempt's revision never became live, so the revision equality check
 			// makes any totals that counted it unreachable; the retry reuses only the totals proven
 			// for the still-live claim revision and counts this file exactly once.
 			await service.recordApplyReceipt(p.ctx, b.id, receipt(claim));
-			expect(service.getOperation(p.ctx).appliedFileCount).toBe(2);
+			expect((await service.getOperation(p.ctx)).appliedFileCount).toBe(2);
 			lease.settle(claim.mutationId, "applied");
 			await applyFile(p.ctx, c, lease);
 		});
-		expect(service.getOperation(p.ctx).appliedFileCount).toBe(3);
+		expect((await service.getOperation(p.ctx)).appliedFileCount).toBe(3);
 		expect((await service.finishFiles(p.ctx)).status).toBe("files_verified");
 		expect(scan).toHaveBeenCalledTimes(2);
 	});
@@ -1428,6 +1434,6 @@ describe("receipt admission carries proven totals instead of rescanning the plan
 		});
 		// The second receipt was judged from carried totals, not a rescan.
 		expect(scan).toHaveBeenCalledTimes(1);
-		expect(journal(p.ctx, b.id)?.observedAfterStateJson).toBeNull();
+		expect((await journal(p.ctx, b.id))?.observedAfterStateJson).toBeNull();
 	});
 });

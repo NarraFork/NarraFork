@@ -21,6 +21,18 @@ export const DB_WORKER_READY_TIMEOUT_MS = 10_000;
  */
 export const DB_WORKER_PROBE_READY_TIMEOUT_MS = 1_500;
 
+import type { PublicationTerminalResultReadParams } from "../../services/agent-runtime/publication-result-read";
+import type { DatabaseCleanupReadTask } from "../../services/database-cleanup-read";
+import type { FileChangeBlobCatalogReadParams } from "../../services/file-change-blob-catalog-read";
+import type { FileChangeRetentionInventoryReadParams } from "../../services/file-change-retention-inventory";
+import type { CurrentDiffReadParams } from "../../services/git-current-diff-read";
+import type { NarratorReadTransactionParams } from "../../services/narrator-read-transactions";
+import type { ProjectArchiveReadParams } from "../../services/project-archive/archive-file-reader";
+import type { RevertJournalReadTask } from "../../services/revert-journal-read-task";
+import type { RevertPlanReadTask } from "../../services/revert-plan-read-task";
+import type { RevertSelectionReadTask } from "../../services/revert-selection-read-task";
+import type { WorkspaceRecoveryReadParams } from "../../services/workspace-recovery-read";
+import type { WorktreeLifecycleReadParams } from "../../services/worktree-lifecycle-read";
 import type {
 	DisplayPageMessagesParams,
 	PostgresDisplayPageMessagesParams,
@@ -28,6 +40,20 @@ import type {
 
 /** Task names the worker can execute. Read-only by contract. */
 export type DbReadTaskName =
+	| "revertSelectionReadV1"
+	| "databaseCleanupReadV1"
+	| "revertPlanReadV1"
+	| "revertJournalReadV1"
+	| "publication-terminal-result-v1"
+	| "fileChangeBlobCatalogV1"
+	| "fileChangeRetentionInventoryV1"
+	| "workspace-recovery-effects-v1"
+	| "selectRowsV1"
+	| "projectArchiveReadV1"
+	| "worktree-lifecycle-read-v1"
+	| "narrator-read-transaction-v1"
+	| "git-current-diff-read-v1"
+	| "git-current-diff-validate-v1"
 	| "storageScanContext"
 	| "storageScanTables"
 	| "storageScanSerial"
@@ -155,7 +181,30 @@ export interface StorageScanTablesResult {
 	}>;
 }
 
+export interface SelectRowsParams {
+	kind: "selectRowsV1";
+	/** Server-built SQL only. The connection is read-only and query_only. */
+	sql: string;
+	params: Array<string | number | bigint | boolean | null | Uint8Array>;
+	mode: "values" | "objects";
+	/** Opt-in local timings for fixed diagnostic query sites; never SQL/bind metadata. */
+	diagnosticTiming?: true;
+}
+
 export type DbReadTaskParams =
+	| RevertSelectionReadTask
+	| DatabaseCleanupReadTask
+	| RevertPlanReadTask
+	| RevertJournalReadTask
+	| PublicationTerminalResultReadParams
+	| FileChangeBlobCatalogReadParams
+	| FileChangeRetentionInventoryReadParams
+	| WorkspaceRecoveryReadParams
+	| SelectRowsParams
+	| ProjectArchiveReadParams
+	| WorktreeLifecycleReadParams
+	| NarratorReadTransactionParams
+	| CurrentDiffReadParams
 	| StorageScanContextParams
 	| StorageScanTablesParams
 	| StorageScanSerialParams
@@ -181,7 +230,35 @@ export interface DbWorkerCancel {
 	requestId: string;
 }
 
-export type DbWorkerInbound = DbWorkerRequest | DbWorkerShutdown | DbWorkerCancel;
+export interface DbWorkerChunkAck {
+	type: "chunkAck";
+	requestId: string;
+}
+
+export interface DbWorkerCloseConnection {
+	type: "closeConnection";
+	requestId: string;
+	dbPath: string;
+}
+
+export interface DbWorkerConnectionClosed {
+	type: "connectionClosed";
+	requestId: string;
+}
+
+export type DbWorkerInbound =
+	| DbWorkerRequest
+	| DbWorkerShutdown
+	| DbWorkerCancel
+	| DbWorkerChunkAck
+	| DbWorkerCloseConnection;
+
+export interface DbWorkerChunk {
+	type: "chunk";
+	requestId: string;
+	rows: unknown[];
+	bytes: number;
+}
 
 export interface DbWorkerReady {
 	type: "ready";
@@ -204,7 +281,23 @@ export interface DbWorkerSuccess {
 	durationMs: number;
 }
 
+export function readWorkerDomExceptionName(
+	error: unknown,
+): "AbortError" | "TimeoutError" | undefined {
+	return error instanceof DOMException &&
+		(error.name === "AbortError" || error.name === "TimeoutError")
+		? error.name
+		: undefined;
+}
+
 export interface DbWorkerFailure {
+	domExceptionName?: "AbortError" | "TimeoutError";
+	applicationError?: {
+		name: string;
+		statusCode: number;
+		messageCode?: import("../errors").AppErrorLocalization["messageCode"];
+		messageParams?: import("../errors").AppErrorLocalization["messageParams"];
+	};
 	type: "error";
 	requestId: string;
 	message: string;
@@ -212,4 +305,10 @@ export interface DbWorkerFailure {
 	code?: string;
 }
 
-export type DbWorkerOutbound = DbWorkerReady | DbWorkerProgress | DbWorkerSuccess | DbWorkerFailure;
+export type DbWorkerOutbound =
+	| DbWorkerReady
+	| DbWorkerProgress
+	| DbWorkerSuccess
+	| DbWorkerFailure
+	| DbWorkerChunk
+	| DbWorkerConnectionClosed;

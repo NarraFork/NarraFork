@@ -62,6 +62,19 @@ import { RevertMutationJournal } from "./revert-mutation-journal";
 import type { ValidatedTransactionManifest } from "./revert-transaction-manifest-worker";
 import type { RevertTransactionService } from "./revert-transaction-service";
 import { runRevertManifestWorker } from "./revert-transaction-worker";
+
+// Await outside Bun's native async matcher so worker messages can be dispatched.
+async function rejectionOf(promise: Promise<unknown>): Promise<() => void> {
+	try {
+		await promise;
+		return () => {};
+	} catch (error) {
+		return () => {
+			throw error;
+		};
+	}
+}
+
 import { createWorkspaceWriteCoordinatorState } from "./workspace-write-coordinator";
 
 describe("real tools -> original prepared manifests -> local transaction", () => {
@@ -162,22 +175,26 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 		broken.mockRestore();
 		const request = await manifestRequest(plan);
 		const code = fault === "wrong_snapshot_target" ? "SNAPSHOT_TARGET_CONFLICT" : "STEP_METHOD";
-		await expect(
-			runRevertManifestWorker(
-				{ ...request, acceptSnapshotRestore: true },
-				AbortSignal.timeout(10_000),
+		expect(
+			await rejectionOf(
+				runRevertManifestWorker(
+					{ ...request, acceptSnapshotRestore: true },
+					AbortSignal.timeout(10_000),
+				),
 			),
-		).rejects.toThrow(code);
-		await expect(
-			service.execute({
-				principal,
-				narratorId: "narrator",
-				planId: plan.id,
-				planHash: plan.planHash ?? "",
-				action: "revert_files",
-				acceptSnapshotRestore: true,
-			}).result,
-		).rejects.toThrow(code);
+		).toThrow(code);
+		expect(
+			await rejectionOf(
+				service.execute({
+					principal,
+					narratorId: "narrator",
+					planId: plan.id,
+					planHash: plan.planHash ?? "",
+					action: "revert_files",
+					acceptSnapshotRestore: true,
+				}).result,
+			),
+		).toThrow(code);
 		expect(operation(plan)?.status).toBe("prepared");
 		expect(await fs.readFile(path, "utf8")).toBe("selected two\n");
 	});
@@ -228,16 +245,18 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 		});
 		await fs.writeFile(path, "new content after preview\n");
 		const before = history();
-		await expect(
-			service.execute({
-				principal,
-				narratorId: "narrator",
-				planId: plan.id,
-				planHash: plan.planHash ?? "",
-				action: "revert_files",
-				acceptSnapshotRestore: true,
-			}).result,
-		).rejects.toThrow();
+		expect(
+			await rejectionOf(
+				service.execute({
+					principal,
+					narratorId: "narrator",
+					planId: plan.id,
+					planHash: plan.planHash ?? "",
+					action: "revert_files",
+					acceptSnapshotRestore: true,
+				}).result,
+			),
+		).toThrow();
 		expect(await fs.readFile(path, "utf8")).toBe("new content after preview\n");
 		expect(history()).toBe(before);
 		expect(operation(plan)?.status).toBe("prepared");
@@ -374,13 +393,15 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 		}
 		const plan = await prepare();
 		const previousHistory = history();
-		const targets = journalFiles(plan)
-			.map((file) => {
-				const scope = runtime.evidence.getScope(file.scopeId);
-				if (!scope) throw new Error("Missing real scope");
-				return scope;
-			})
-			.sort((left, right) => left.canonicalRoot.localeCompare(right.canonicalRoot));
+		const targets = (
+			await Promise.all(
+				journalFiles(plan).map(async (file) => {
+					const scope = await runtime.evidence.getScope(file.scopeId);
+					if (!scope) throw new Error("Missing real scope");
+					return scope;
+				}),
+			)
+		).sort((left, right) => left.canonicalRoot.localeCompare(right.canonicalRoot));
 		expect(targets).toHaveLength(2);
 		if (terminal === "compensated") failHistoryCommit();
 		// The second clear fails in the coordinator's real group transaction. The
@@ -420,22 +441,26 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 				expect((file.receiptJson as { compensate: unknown }).compensate).toBeNull();
 		}
 		expect(coordinatorState.leases.size).toBe(2);
-		const retained = targets.map((scope) => {
-			const live = runtime.evidence.getScope(scope.id);
-			expect(live?.activeLeaseId).toBeString();
-			expect(live?.activeMutationCount).toBe(0);
-			expect(runtime.coordinator.capture(scope).active).toMatchObject({
-				rollbacks: 1,
-				retainedRecoveryHolds: 1,
-			});
-			return live;
-		});
+		const retained = await Promise.all(
+			targets.map(async (scope) => {
+				const live = await runtime.evidence.getScope(scope.id);
+				expect(live?.activeLeaseId).toBeString();
+				expect(live?.activeMutationCount).toBe(0);
+				expect(runtime.coordinator.capture(scope).active).toMatchObject({
+					rollbacks: 1,
+					retainedRecoveryHolds: 1,
+				});
+				return live;
+			}),
+		);
 		const binding = localFileChangeRuntimeBinding("local");
 		if (!binding) throw new Error("Missing local runtime");
 		for (const scope of targets)
-			await expect(
-				runtime.coordinator.withWrite({ scope, runtime: binding, waitTimeoutMs: 0 }, () => {}),
-			).rejects.toThrow("busy");
+			expect(
+				await rejectionOf(
+					runtime.coordinator.withWrite({ scope, runtime: binding, waitTimeoutMs: 0 }, () => {}),
+				),
+			).toThrow("busy");
 		// A repeated request uses the terminal journal, never compensates committed
 		// files or repeats any apply while coordinator recovery remains outstanding.
 		const path = join(workspace, "file.txt");
@@ -453,7 +478,7 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 		// in-memory hold. It is NOT authority to clear a durable crash barrier.
 		expect(coordinatorState.leases.size).toBe(0);
 		for (const [index, scope] of targets.entries()) {
-			const live = runtime.evidence.getScope(scope.id);
+			const live = await runtime.evidence.getScope(scope.id);
 			expect(live).toMatchObject({
 				status: "active",
 				activeLeaseId: null,
@@ -495,18 +520,20 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 				active: { retainedRecoveryHolds: 0 },
 			});
 			// Only the actual rollback target remains quarantined.
-			await expect(
-				runtime.coordinator.withWrite(
-					{
-						scope,
-						runtime: binding,
-						ranges: [{ kind: "file", canonicalPath: join(scope.canonicalRoot, "file.txt") }],
-					},
-					() => {
-						throw new Error("Quarantined target must not admit writes");
-					},
+			expect(
+				await rejectionOf(
+					runtime.coordinator.withWrite(
+						{
+							scope,
+							runtime: binding,
+							ranges: [{ kind: "file", canonicalPath: join(scope.canonicalRoot, "file.txt") }],
+						},
+						() => {
+							throw new Error("Quarantined target must not admit writes");
+						},
+					),
 				),
-			).rejects.toThrow("verification");
+			).toThrow("verification");
 			await runtime.coordinator.withWrite(
 				{
 					scope,
@@ -591,7 +618,7 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 		const { a, b, plan } = await twoFiles();
 		await fs.chmod(b, 0o444);
 		const before = history();
-		await expect(execution(plan).result).rejects.toThrow("FILE_PREFLIGHT");
+		expect(await rejectionOf(execution(plan).result)).toThrow("FILE_PREFLIGHT");
 		expect(await fs.readFile(a, "utf8")).toBe("changed");
 		expect(await fs.readFile(b, "utf8")).toBe("changed");
 		expect(history()).toBe(before);
@@ -654,7 +681,7 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 		const row = journalFiles(plan)[0];
 		expect(row.observedAfterBlobDigest).toBe(hash("original"));
 		expect(row.compensationAfterBlobDigest).toBe(hash(sameBytes ? "original" : "third-party"));
-		const scope = runtime.evidence.getScope(row.scopeId);
+		const scope = await runtime.evidence.getScope(row.scopeId);
 		if (!scope) throw new Error("Missing rollback scope");
 		expect(scope).toMatchObject({
 			status: "active",
@@ -699,14 +726,16 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 		const binding = localFileChangeRuntimeBinding("local");
 		if (!binding) throw new Error("Missing local runtime");
 		for (const path of [a, b])
-			await expect(
-				runtime.coordinator.withWrite(
-					{ scope, runtime: binding, ranges: [{ kind: "file", canonicalPath: path }] },
-					() => {
-						throw new Error("Quarantined subtree must not admit writes");
-					},
+			expect(
+				await rejectionOf(
+					runtime.coordinator.withWrite(
+						{ scope, runtime: binding, ranges: [{ kind: "file", canonicalPath: path }] },
+						() => {
+							throw new Error("Quarantined subtree must not admit writes");
+						},
+					),
 				),
-			).rejects.toThrow("verification");
+			).toThrow("verification");
 		// A failed two-file recovery does not quarantine the entire repository.
 		await runtime.coordinator.withWrite(
 			{
@@ -1033,7 +1062,7 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 				maxEvidenceBytes: (await fixedEvidenceBytes(plan)) - 1,
 			}),
 		);
-		await expect(execution(plan).result).rejects.toThrow("BUDGET_EXCEEDED");
+		expect(await rejectionOf(execution(plan).result)).toThrow("BUDGET_EXCEEDED");
 		expect(await fs.readFile(a, "utf8")).toBe("changed");
 		expect(operation(plan)?.status).toBe("prepared");
 	});
@@ -1046,7 +1075,7 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 			.where(eq(schema.narratorMessages.id, first.id))
 			.run();
 		const changed = history();
-		await expect(execution(plan).result).rejects.toThrow();
+		expect(await rejectionOf(execution(plan).result)).toThrow();
 		expect(await fs.readFile(a, "utf8")).toBe("changed");
 		expect(history()).toBe(changed);
 		expect(operation(plan)?.status).toBe("prepared");
@@ -1176,7 +1205,7 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 				settling: true,
 			});
 			expect(journalFiles(plan)).toEqual(filesBefore);
-			const scope = runtime.evidence.getScope(filesBefore[0].scopeId);
+			const scope = await runtime.evidence.getScope(filesBefore[0].scopeId);
 			if (!scope) throw new Error("Missing scope");
 			expect(scope.activeLeaseId).toBeTruthy();
 			expect(scope.activeMutationCount).toBe(0);
@@ -1316,23 +1345,25 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 				namespaceAcquired = true;
 			});
 			const row = journalFiles(plan)[0];
-			const scope = runtime.evidence.getScope(row.scopeId);
+			const scope = await runtime.evidence.getScope(row.scopeId);
 			if (!scope) throw new Error("Missing scope");
 			expect(scope.activeLeaseId).toBeTruthy();
 			expect(scope.activeMutationCount).toBe(1);
 			expect(history()).toBe(before);
-			await expect(
-				runtime.coordinator.withWrite(
-					{
-						scope,
-						runtime: localFileChangeRuntimeBinding("local") as NonNullable<
-							ReturnType<typeof localFileChangeRuntimeBinding>
-						>,
-						waitTimeoutMs: 20,
-					},
-					() => {},
+			expect(
+				await rejectionOf(
+					runtime.coordinator.withWrite(
+						{
+							scope,
+							runtime: localFileChangeRuntimeBinding("local") as NonNullable<
+								ReturnType<typeof localFileChangeRuntimeBinding>
+							>,
+							waitTimeoutMs: 20,
+						},
+						() => {},
+					),
 				),
-			).rejects.toThrow();
+			).toThrow();
 			expect(namespaceAcquired).toBe(false);
 		} finally {
 			release.release();
@@ -1353,7 +1384,7 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 		const { a, plan } = await twoFiles();
 		const controller = new AbortController();
 		controller.abort();
-		await expect(execution(plan, controller.signal).result).rejects.toThrow();
+		expect(await rejectionOf(execution(plan, controller.signal).result)).toThrow();
 		expect(await fs.readFile(a, "utf8")).toBe("changed");
 		expect(operation(plan)?.status).toBe("prepared");
 	});
@@ -1363,7 +1394,7 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 		const path = join(root, "private", "file-change-blobs", "sha256", digest.slice(0, 2), digest);
 		await fs.writeFile(path, "{}\n");
 		const before = history();
-		await expect(execution(plan).result).rejects.toThrow();
+		expect(await rejectionOf(execution(plan).result)).toThrow();
 		expect(await fs.readFile(a, "utf8")).toBe("changed");
 		expect(history()).toBe(before);
 		expect(operation(plan)?.status).toBe("prepared");
@@ -1384,7 +1415,7 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 		const attempt = execution(plan);
 		try {
 			await waiting.promise;
-			const scope = runtime.evidence.getScope(journalFiles(plan)[0].scopeId);
+			const scope = await runtime.evidence.getScope(journalFiles(plan)[0].scopeId);
 			if (!scope) throw new Error("Missing scope");
 			const writer = runtime.coordinator.withWrite(
 				{
@@ -1396,15 +1427,15 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 				() => runtime.withNamespaceAccess(async () => "namespace acquired"),
 			);
 			// The deadline is a deadlock guard, not the sequencing mechanism.
-			await expect(
-				Promise.race([
+			expect(
+				await Promise.race([
 					writer,
 					new Promise((_, reject) => {
 						const timer = setTimeout(() => reject(new Error("Lock order deadlock")), 1000);
 						void writer.finally(() => clearTimeout(timer));
 					}),
 				]),
-			).resolves.toBe("namespace acquired");
+			).toBe("namespace acquired");
 		} finally {
 			release.release();
 			await attempt.whenSettled;
@@ -1485,7 +1516,7 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 		try {
 			await draining.promise;
 			controller.abort();
-			await expect(attempt.whenSettled).rejects.toThrow("CANCELLED");
+			expect(await rejectionOf(attempt.whenSettled)).toThrow("CANCELLED");
 			expect(admission).not.toHaveBeenCalled();
 			expect(claims).not.toHaveBeenCalled();
 			expect(operation(plan)?.status).toBe("prepared");
@@ -1521,14 +1552,14 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 			() => claims.mockRestore(),
 		);
 		try {
-			await expect(execution(plan).whenSettled).rejects.toThrow(
+			expect(await rejectionOf(execution(plan).whenSettled)).toThrow(
 				"Durable batch finalization failed",
 			);
 			expect(admission).toHaveBeenCalledTimes(1);
 			expect(claims).not.toHaveBeenCalled();
 			expect(operation(plan)?.status).toBe("prepared");
 			expect(
-				runtime.evidence.getScope(journalFiles(plan)[0].scopeId)?.activeLeaseId,
+				(await runtime.evidence.getScope(journalFiles(plan)[0].scopeId))?.activeLeaseId,
 			).not.toBeNull();
 		} finally {
 			sqlite.exec("DROP TRIGGER IF EXISTS reject_busy_scope_release");
@@ -1573,8 +1604,8 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 			admit.release();
 			await callbackEntered.promise;
 			controller.abort();
-			await expect(attempt.whenSettled).rejects.toThrow("CANCELLED");
-			const scope = runtime.evidence.getScope(journalFiles(plan)[0].scopeId);
+			expect(await rejectionOf(attempt.whenSettled)).toThrow("CANCELLED");
+			const scope = await runtime.evidence.getScope(journalFiles(plan)[0].scopeId);
 			expect(scope?.activeLeaseId).toBeNull();
 			expect(claims).not.toHaveBeenCalled();
 			expect(operation(plan)?.status).toBe("prepared");
@@ -1624,7 +1655,7 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 		const opens = spyOn(fileChangeLocalIo, "read");
 		restores.push(() => opens.mockRestore());
 		release.release();
-		await expect(attempt.whenSettled).rejects.toThrow();
+		expect(await rejectionOf(attempt.whenSettled)).toThrow();
 		expect(opens).not.toHaveBeenCalled();
 		expect(claims).not.toHaveBeenCalled();
 		expect(operation(plan)?.status).toBe("expired");
@@ -1668,14 +1699,16 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 				files: [],
 			} as Parameters<RevertTransactionService["execute"]>[0]),
 		).toThrow("INVALID_REQUEST");
-		await expect(
-			service.execute({
-				principal: { userId: "bob", isAdmin: false },
-				narratorId: "narrator",
-				planId: plan.id,
-				planHash: plan.planHash ?? "",
-			}).result,
-		).rejects.toThrow("Narrator denied");
+		expect(
+			await rejectionOf(
+				service.execute({
+					principal: { userId: "bob", isAdmin: false },
+					narratorId: "narrator",
+					planId: plan.id,
+					planHash: plan.planHash ?? "",
+				}).result,
+			),
+		).toThrow("Narrator denied");
 		expect(await fs.readFile(a, "utf8")).toBe("changed");
 		expect(operation(plan)?.status).toBe("prepared");
 	});
@@ -1789,7 +1822,9 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 			.where(eq(schema.narratorToolCalls.id, call.toolCallId))
 			.run();
 		const before = history();
-		await expect(prepare()).rejects.toMatchObject({ code: "REVERT_PLANNER_EVIDENCE_INCOMPLETE" });
+		expect(await prepare().catch((error: unknown) => error)).toMatchObject({
+			code: "REVERT_PLANNER_EVIDENCE_INCOMPLETE",
+		});
 		expect(history()).toBe(before);
 		expect(await fs.readFile(path, "utf8")).toBe("unchanged\n");
 	});
@@ -1830,7 +1865,7 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 		);
 		release.release();
 		await reset;
-		await expect(attempt.whenSettled).rejects.toThrow();
+		expect(await rejectionOf(attempt.whenSettled)).toThrow();
 		expect(claims).not.toHaveBeenCalled();
 		expect(admission).not.toHaveBeenCalled();
 		expect(operation(plan)?.status).toBe("expired");

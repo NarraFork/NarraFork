@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 import { formatOriginLabel } from "@shared/message-origin";
 import { and, eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
@@ -181,9 +182,11 @@ rulerRoutes.get("/:id/ruler", async (c) => {
 	// MAX_SAFE_INTEGER only keeps the arithmetic below exact.
 	let skip = parseBoundedInt(c.req.query("skip"), 0, 0, Number.MAX_SAFE_INTEGER);
 
-	const project = await db.query.projects.findFirst({
-		where: eq(projects.id, projectId),
-	});
+	const project = await readQuery(
+		db.query.projects.findFirst({
+			where: eq(projects.id, projectId),
+		}),
+	);
 	if (!project) throw new NotFoundError("Project", projectId);
 	if (!project.gitPath) return c.json({ commits: [], segments: [], activeChapters: [] });
 
@@ -242,29 +245,31 @@ rulerRoutes.get("/:id/ruler", async (c) => {
 	// would silently drop chapters whose parent fell outside the page. Bounded instead
 	// by the `columns` projection (no large fields) and by chapters-per-project, which
 	// is human-scale. The commit log is the side that pages.
-	const projectChapters = await db.query.chapters.findMany({
-		where: and(eq(chapters.projectId, projectId), eq(chapters.isRoot, 0)),
-		columns: {
-			id: true,
-			title: true,
-			status: true,
-			branch: true,
-			role: true,
-			parentChapterId: true,
-			startCommitSha: true,
-			mergeCommitSha: true,
-			preMergeTargetSha: true,
-			// Needed because the recovery entry point is otherwise unreachable after a
-			// reload: the debt lives in the row, but nothing else in the Ruler's data path
-			// reads it, so a refresh made the banner vanish while the next rebase still
-			// refused with REBASE_PARKED_WORK_CONFLICT. A 40-char sha is not a large field
-			// in the sense the list-API rule is about (no blobs, no JSON documents), so
-			// carrying it costs the projection nothing meaningful.
-			parkedSnapshotCommitSha: true,
-			axisOffset: true,
-			crossOffset: true,
-		},
-	});
+	const projectChapters = await readQuery(
+		db.query.chapters.findMany({
+			where: and(eq(chapters.projectId, projectId), eq(chapters.isRoot, 0)),
+			columns: {
+				id: true,
+				title: true,
+				status: true,
+				branch: true,
+				role: true,
+				parentChapterId: true,
+				startCommitSha: true,
+				mergeCommitSha: true,
+				preMergeTargetSha: true,
+				// Needed because the recovery entry point is otherwise unreachable after a
+				// reload: the debt lives in the row, but nothing else in the Ruler's data path
+				// reads it, so a refresh made the banner vanish while the next rebase still
+				// refused with REBASE_PARKED_WORK_CONFLICT. A 40-char sha is not a large field
+				// in the sense the list-API rule is about (no blobs, no JSON documents), so
+				// carrying it costs the projection nothing meaningful.
+				parkedSnapshotCommitSha: true,
+				axisOffset: true,
+				crossOffset: true,
+			},
+		}),
+	);
 
 	// Get active chapter narrator info
 	const activeChapterIds = projectChapters
@@ -273,10 +278,15 @@ rulerRoutes.get("/:id/ruler", async (c) => {
 
 	let narratorMap = new Map<string, { id: string; status: string; modelUnavailable: boolean }>();
 	if (activeChapterIds.length > 0) {
-		const chapterNarrators = await db.query.narrators.findMany({
-			where: and(inArray(narrators.chapterId, activeChapterIds), eq(narrators.variant, "primary")),
-			columns: { id: true, chapterId: true, status: true, substatus: true },
-		});
+		const chapterNarrators = await readQuery(
+			db.query.narrators.findMany({
+				where: and(
+					inArray(narrators.chapterId, activeChapterIds),
+					eq(narrators.variant, "primary"),
+				),
+				columns: { id: true, chapterId: true, status: true, substatus: true },
+			}),
+		);
 		narratorMap = new Map(
 			chapterNarrators.filter(hasChapterId).map((n) => [
 				n.chapterId,
@@ -567,20 +577,22 @@ rulerRoutes.get("/:id/ruler/segment", async (c) => {
 		// Lightweight: id, title, status, role, narrator status + layout position.
 		// Unpaginated for the same reason as the main endpoint: `chapterBelongsToSegment`
 		// needs the full parentChapterId chain to decide membership.
-		const projectChapters = await db.query.chapters.findMany({
-			where: and(eq(chapters.projectId, projectId), eq(chapters.isRoot, 0)),
-			columns: {
-				id: true,
-				title: true,
-				status: true,
-				role: true,
-				parentChapterId: true,
-				startCommitSha: true,
-				anchorCommitSha: true,
-				axisOffset: true,
-				crossOffset: true,
-			},
-		});
+		const projectChapters = await readQuery(
+			db.query.chapters.findMany({
+				where: and(eq(chapters.projectId, projectId), eq(chapters.isRoot, 0)),
+				columns: {
+					id: true,
+					title: true,
+					status: true,
+					role: true,
+					parentChapterId: true,
+					startCommitSha: true,
+					anchorCommitSha: true,
+					axisOffset: true,
+					crossOffset: true,
+				},
+			}),
+		);
 
 		// Resolve chapters to this segment via parent-chain fallback
 		const byId = new Map(projectChapters.map((ch) => [ch.id, ch]));
@@ -591,10 +603,12 @@ rulerRoutes.get("/:id/ruler/segment", async (c) => {
 
 		let narratorMap = new Map<string, { status: string; modelUnavailable: boolean }>();
 		if (chapterIds.length > 0) {
-			const chapterNarrators = await db.query.narrators.findMany({
-				where: and(inArray(narrators.chapterId, chapterIds), eq(narrators.variant, "primary")),
-				columns: { chapterId: true, status: true, substatus: true },
-			});
+			const chapterNarrators = await readQuery(
+				db.query.narrators.findMany({
+					where: and(inArray(narrators.chapterId, chapterIds), eq(narrators.variant, "primary")),
+					columns: { chapterId: true, status: true, substatus: true },
+				}),
+			);
 			narratorMap = new Map(
 				chapterNarrators.filter(hasChapterId).map((n) => [
 					n.chapterId,
@@ -627,33 +641,35 @@ rulerRoutes.get("/:id/ruler/segment", async (c) => {
 	// Get chapters whose startCommitSha matches the segment range.
 	// Unpaginated by design (full parent chain required); the projection keeps large
 	// columns out of the response.
-	const projectChapters = await db.query.chapters.findMany({
-		where: and(eq(chapters.projectId, projectId), eq(chapters.isRoot, 0)),
-		columns: {
-			id: true,
-			title: true,
-			status: true,
-			branch: true,
-			role: true,
-			parentChapterId: true,
-			startCommitSha: true,
-			mergeCommitSha: true,
-			preMergeTargetSha: true,
-			// See the main endpoint: without it the recovery entry point disappears on
-			// reload while the backend still considers the reapply owed. A short sha, so it
-			// does not make this a large-field projection.
-			parkedSnapshotCommitSha: true,
-			headCommitSha: true,
-			anchorCommitSha: true,
-			axisOffset: true,
-			crossOffset: true,
-			panelWidth: true,
-			panelHeight: true,
-			color: true,
-			reviewSourceChapterId: true,
-			reviewStatus: true,
-		},
-	});
+	const projectChapters = await readQuery(
+		db.query.chapters.findMany({
+			where: and(eq(chapters.projectId, projectId), eq(chapters.isRoot, 0)),
+			columns: {
+				id: true,
+				title: true,
+				status: true,
+				branch: true,
+				role: true,
+				parentChapterId: true,
+				startCommitSha: true,
+				mergeCommitSha: true,
+				preMergeTargetSha: true,
+				// See the main endpoint: without it the recovery entry point disappears on
+				// reload while the backend still considers the reapply owed. A short sha, so it
+				// does not make this a large-field projection.
+				parkedSnapshotCommitSha: true,
+				headCommitSha: true,
+				anchorCommitSha: true,
+				axisOffset: true,
+				crossOffset: true,
+				panelWidth: true,
+				panelHeight: true,
+				color: true,
+				reviewSourceChapterId: true,
+				reviewStatus: true,
+			},
+		}),
+	);
 
 	// Filter to chapters in this segment — includes parent-chain fallback
 	const fullById = new Map(projectChapters.map((ch) => [ch.id, ch]));
@@ -664,17 +680,21 @@ rulerRoutes.get("/:id/ruler/segment", async (c) => {
 
 	const [chapterNarrators, edges] = chapterIds.length
 		? await Promise.all([
-				db.query.narrators.findMany({
-					where: and(inArray(narrators.chapterId, chapterIds), eq(narrators.variant, "primary")),
-					columns: { id: true, chapterId: true, status: true, substatus: true },
-				}),
-				db.query.chapterEdges.findMany({
-					where: and(
-						eq(chapterEdges.projectId, projectId),
-						inArray(chapterEdges.sourceId, chapterIds),
-					),
-					columns: { id: true, sourceId: true, targetId: true, type: true },
-				}),
+				readQuery(
+					db.query.narrators.findMany({
+						where: and(inArray(narrators.chapterId, chapterIds), eq(narrators.variant, "primary")),
+						columns: { id: true, chapterId: true, status: true, substatus: true },
+					}),
+				),
+				readQuery(
+					db.query.chapterEdges.findMany({
+						where: and(
+							eq(chapterEdges.projectId, projectId),
+							inArray(chapterEdges.sourceId, chapterIds),
+						),
+						columns: { id: true, sourceId: true, targetId: true, type: true },
+					}),
+				),
 			])
 		: [[], []];
 
@@ -770,15 +790,19 @@ rulerRoutes.post("/:id/ruler/fork", async (c) => {
 
 	let parentId: string;
 	if (parentChapterId) {
-		const parent = await db.query.chapters.findFirst({
-			where: and(eq(chapters.id, parentChapterId), eq(chapters.projectId, projectId)),
-		});
+		const parent = await readQuery(
+			db.query.chapters.findFirst({
+				where: and(eq(chapters.id, parentChapterId), eq(chapters.projectId, projectId)),
+			}),
+		);
 		if (!parent) throw new NotFoundError("Chapter", parentChapterId);
 		parentId = parent.id;
 	} else {
-		const rootChapter = await db.query.chapters.findFirst({
-			where: and(eq(chapters.projectId, projectId), eq(chapters.isRoot, 1)),
-		});
+		const rootChapter = await readQuery(
+			db.query.chapters.findFirst({
+				where: and(eq(chapters.projectId, projectId), eq(chapters.isRoot, 1)),
+			}),
+		);
 		if (!rootChapter) throw new NotFoundError("Root chapter for project", projectId);
 		parentId = rootChapter.id;
 	}
@@ -827,14 +851,18 @@ rulerRoutes.post("/:id/ruler/fork", async (c) => {
  */
 async function deleteMergedSourceBranch(projectId: string, sourceChapterId: string): Promise<void> {
 	const [project, source] = await Promise.all([
-		db.query.projects.findFirst({
-			where: eq(projects.id, projectId),
-			columns: { gitPath: true },
-		}),
-		db.query.chapters.findFirst({
-			where: eq(chapters.id, sourceChapterId),
-			columns: { branch: true, mergeSnapshotCommitSha: true, mergedSourceSnapshotSha: true },
-		}),
+		readQuery(
+			db.query.projects.findFirst({
+				where: eq(projects.id, projectId),
+				columns: { gitPath: true },
+			}),
+		),
+		readQuery(
+			db.query.chapters.findFirst({
+				where: eq(chapters.id, sourceChapterId),
+				columns: { branch: true, mergeSnapshotCommitSha: true, mergedSourceSnapshotSha: true },
+			}),
+		),
 	]);
 	if (!project?.gitPath || !source?.branch) return;
 	if (source.mergeSnapshotCommitSha || source.mergedSourceSnapshotSha) {
@@ -868,17 +896,21 @@ rulerRoutes.post("/:id/ruler/merge", async (c) => {
 	const { sourceChapterId, strategy, message } = parsed.data;
 
 	// Find root chapter as merge target
-	const rootChapter = await db.query.chapters.findFirst({
-		where: and(eq(chapters.projectId, projectId), eq(chapters.isRoot, 1)),
-	});
+	const rootChapter = await readQuery(
+		db.query.chapters.findFirst({
+			where: and(eq(chapters.projectId, projectId), eq(chapters.isRoot, 1)),
+		}),
+	);
 	if (!rootChapter) throw new NotFoundError("Root chapter for project", projectId);
 	if (!rootChapter.worktreePath) {
 		throw new ValidationError("Root chapter has no worktree");
 	}
 
-	const source = await db.query.chapters.findFirst({
-		where: and(eq(chapters.id, sourceChapterId), eq(chapters.projectId, projectId)),
-	});
+	const source = await readQuery(
+		db.query.chapters.findFirst({
+			where: and(eq(chapters.id, sourceChapterId), eq(chapters.projectId, projectId)),
+		}),
+	);
 	if (!source) throw new NotFoundError("Chapter", sourceChapterId);
 
 	// Only the commit-based merge needs clean worktrees: it reads branch tips, so
@@ -957,9 +989,11 @@ rulerRoutes.post("/:id/ruler/abandon", async (c) => {
 	const { chapterId } = parsed.data;
 
 	// Verify chapter belongs to this project
-	const chapter = await db.query.chapters.findFirst({
-		where: and(eq(chapters.id, chapterId), eq(chapters.projectId, projectId)),
-	});
+	const chapter = await readQuery(
+		db.query.chapters.findFirst({
+			where: and(eq(chapters.id, chapterId), eq(chapters.projectId, projectId)),
+		}),
+	);
 	if (!chapter) throw new NotFoundError("Chapter", chapterId);
 	if (chapter.status !== "active") throw new ValidationError("Can only abandon active chapters");
 
@@ -976,14 +1010,18 @@ rulerRoutes.post("/:id/ruler/rebase", async (c) => {
 	const { chapterId } = parsed.data;
 
 	// Find root chapter (trunk)
-	const rootChapter = await db.query.chapters.findFirst({
-		where: and(eq(chapters.projectId, projectId), eq(chapters.isRoot, 1)),
-	});
+	const rootChapter = await readQuery(
+		db.query.chapters.findFirst({
+			where: and(eq(chapters.projectId, projectId), eq(chapters.isRoot, 1)),
+		}),
+	);
 	if (!rootChapter) throw new NotFoundError("Root chapter for project", projectId);
 
-	const project = await db.query.projects.findFirst({
-		where: eq(projects.id, projectId),
-	});
+	const project = await readQuery(
+		db.query.projects.findFirst({
+			where: eq(projects.id, projectId),
+		}),
+	);
 	if (!project?.gitPath) throw new ValidationError("Project has no git path");
 	const gitPath = project.gitPath;
 
@@ -998,10 +1036,12 @@ rulerRoutes.post("/:id/ruler/rebase", async (c) => {
 	// the critical section against a row the previous holder has already rewritten, so
 	// deciding what to settle from *this* read means settling against coordinates that
 	// have since been cleared or replaced.
-	const preLockChapter = await db.query.chapters.findFirst({
-		where: and(eq(chapters.id, chapterId), eq(chapters.projectId, projectId)),
-		columns: { worktreePath: true },
-	});
+	const preLockChapter = await readQuery(
+		db.query.chapters.findFirst({
+			where: and(eq(chapters.id, chapterId), eq(chapters.projectId, projectId)),
+			columns: { worktreePath: true },
+		}),
+	);
 	if (!preLockChapter) throw new NotFoundError("Chapter", chapterId);
 	if (!preLockChapter.worktreePath) throw new ValidationError("Chapter has no worktree");
 	const worktreePath = preLockChapter.worktreePath;
@@ -1034,9 +1074,11 @@ rulerRoutes.post("/:id/ruler/rebase", async (c) => {
 		// Re-read now that nobody else can be mid-sequence. The status check lives here for
 		// the same reason: a chapter that was merged or abandoned by whoever held the lock
 		// must not then be rebased on the strength of a pre-queue observation.
-		const chapter = await db.query.chapters.findFirst({
-			where: and(eq(chapters.id, chapterId), eq(chapters.projectId, projectId)),
-		});
+		const chapter = await readQuery(
+			db.query.chapters.findFirst({
+				where: and(eq(chapters.id, chapterId), eq(chapters.projectId, projectId)),
+			}),
+		);
 		if (!chapter) throw new NotFoundError("Chapter", chapterId);
 		if (chapter.status !== "active") throw new ValidationError("Can only rebase active chapters");
 		if (chapter.worktreePath !== worktreePath) {
@@ -1353,9 +1395,11 @@ rulerRoutes.post("/:id/ruler/rebase-parked", async (c) => {
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	const { chapterId, action } = parsed.data;
 
-	const chapter = await db.query.chapters.findFirst({
-		where: and(eq(chapters.id, chapterId), eq(chapters.projectId, projectId)),
-	});
+	const chapter = await readQuery(
+		db.query.chapters.findFirst({
+			where: and(eq(chapters.id, chapterId), eq(chapters.projectId, projectId)),
+		}),
+	);
 	if (!chapter) throw new NotFoundError("Chapter", chapterId);
 	if (!chapter.worktreePath) throw new ValidationError("Chapter has no worktree");
 	const worktreePath = chapter.worktreePath;
@@ -1532,9 +1576,11 @@ rulerRoutes.post("/:id/ruler/rebase-resolve", async (c) => {
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	const { chapterId, action } = parsed.data;
 
-	const chapter = await db.query.chapters.findFirst({
-		where: and(eq(chapters.id, chapterId), eq(chapters.projectId, projectId)),
-	});
+	const chapter = await readQuery(
+		db.query.chapters.findFirst({
+			where: and(eq(chapters.id, chapterId), eq(chapters.projectId, projectId)),
+		}),
+	);
 	if (!chapter) throw new NotFoundError("Chapter", chapterId);
 	if (!chapter.worktreePath) throw new ValidationError("Chapter has no worktree");
 	const resolveWorktreePath = chapter.worktreePath;
@@ -1547,10 +1593,12 @@ rulerRoutes.post("/:id/ruler/rebase-resolve", async (c) => {
 		// because the coordinates are what the restore acts on and whoever held the lock
 		// before may have settled or replaced them.
 		return worktreeLock.acquire(resolveWorktreePath, async () => {
-			const current = await db.query.chapters.findFirst({
-				where: and(eq(chapters.id, chapterId), eq(chapters.projectId, projectId)),
-				columns: { parkedSnapshotCommitSha: true, parkedSnapshotBaseTree: true },
-			});
+			const current = await readQuery(
+				db.query.chapters.findFirst({
+					where: and(eq(chapters.id, chapterId), eq(chapters.projectId, projectId)),
+					columns: { parkedSnapshotCommitSha: true, parkedSnapshotBaseTree: true },
+				}),
+			);
 			// Work parked by the rebase that is now ending, in whichever way.
 			const parked =
 				current?.parkedSnapshotCommitSha && current.parkedSnapshotBaseTree
@@ -1590,15 +1638,19 @@ rulerRoutes.post("/:id/ruler/rebase-resolve", async (c) => {
 	}
 
 	// action === "continue" — send conflict resolution message to narrator
-	const project = await db.query.projects.findFirst({
-		where: eq(projects.id, projectId),
-	});
+	const project = await readQuery(
+		db.query.projects.findFirst({
+			where: eq(projects.id, projectId),
+		}),
+	);
 	const trunkBranch = project?.defaultBranch ?? "main";
 
 	// Get or create primary narrator for this chapter
-	let narrator = await db.query.narrators.findFirst({
-		where: and(eq(narrators.chapterId, chapterId), eq(narrators.variant, "primary")),
-	});
+	let narrator = await readQuery(
+		db.query.narrators.findFirst({
+			where: and(eq(narrators.chapterId, chapterId), eq(narrators.variant, "primary")),
+		}),
+	);
 	if (!narrator) {
 		narrator = await narratorService.create({
 			chapterId,

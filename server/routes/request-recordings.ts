@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 import { and, eq, sql } from "drizzle-orm";
 import { Hono } from "hono";
 import type { RequestRecordingDetail } from "../../shared/request-recording";
@@ -19,17 +20,19 @@ export async function lookupApiRequestMetadata(
 	apiRequestId: string,
 ): Promise<RequestRecordingDetail["apiRequest"]> {
 	// Primary-key lookup, same-narrator ownership, bounded metadata only. No dump columns.
-	const [row] = await db
-		.select({
-			id: apiRequests.id,
-			createdAt: apiRequests.createdAt,
-			durationMs: apiRequests.durationMs,
-			ttftMs: apiRequests.ttftMs,
-			errorMessage: sql<string | null>`substr(${apiRequests.errorMessage}, 1, 2048)`,
-		})
-		.from(apiRequests)
-		.where(and(eq(apiRequests.id, apiRequestId), eq(apiRequests.narratorId, narratorId)))
-		.limit(1);
+	const [row] = await readQuery(
+		db
+			.select({
+				id: apiRequests.id,
+				createdAt: apiRequests.createdAt,
+				durationMs: apiRequests.durationMs,
+				ttftMs: apiRequests.ttftMs,
+				errorMessage: sql<string | null>`substr(${apiRequests.errorMessage}, 1, 2048)`,
+			})
+			.from(apiRequests)
+			.where(and(eq(apiRequests.id, apiRequestId), eq(apiRequests.narratorId, narratorId)))
+			.limit(1),
+	);
 	if (!row) return undefined;
 	return {
 		...row,

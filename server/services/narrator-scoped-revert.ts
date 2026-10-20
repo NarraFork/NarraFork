@@ -10,6 +10,7 @@ import { isAbsolute, relative } from "node:path";
 import { and, asc, eq, gte, inArray, sql } from "drizzle-orm";
 import { db } from "../db";
 import { narratorMessageRefs, narratorMessages, narratorToolCalls } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import {
 	EMPTY_RESULT,
@@ -90,26 +91,29 @@ async function classifyWindowWithoutOperations(
 	>,
 	knownMessageIds: ReadonlySet<string> = new Set(),
 ): Promise<WindowCoverage> {
-	const rows = await db
-		.select({
-			messageId: narratorMessageRefs.messageId,
-			role: narratorMessages.role,
-		})
-		.from(narratorMessageRefs)
-		.leftJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
-		.where(
-			and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				"messageIds" in scope
-					? inArray(narratorMessageRefs.messageId, scope.messageIds)
-					: gte(narratorMessageRefs.seq, scope.minSeq),
-				sql`NOT EXISTS (
+	const rows = await readQuery(
+		db
+			.select({
+				messageId: narratorMessageRefs.messageId,
+				role: narratorMessages.role,
+			})
+			.from(narratorMessageRefs)
+			.leftJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
+			.where(
+				and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					"messageIds" in scope
+						? inArray(narratorMessageRefs.messageId, scope.messageIds)
+						: gte(narratorMessageRefs.seq, scope.minSeq),
+					sql`NOT EXISTS (
 					SELECT 1 FROM ${narratorToolCalls}
 					WHERE ${narratorToolCalls.messageId} = ${narratorMessageRefs.messageId}
 				)`,
-			),
-		)
-		.limit(MAX_OPERATION_ROWS + 1);
+				),
+			)
+			.limit(MAX_OPERATION_ROWS + 1),
+		{ site: "narrator-scoped-revert.classifyWindowWithoutOperations" },
+	);
 	if (rows.length > MAX_OPERATION_ROWS) return { kind: "too_large" };
 	if (rows.some((row) => row.role == null)) {
 		return { kind: "incomplete_coverage" };
@@ -119,10 +123,13 @@ async function classifyWindowWithoutOperations(
 		const missing = scope.messageIds.filter((id) => !knownMessageIds.has(id) && !found.has(id));
 		if (missing.length > 0) {
 			if (rows.length + missing.length > MAX_OPERATION_ROWS) return { kind: "too_large" };
-			const extra = await db
-				.select({ id: narratorMessages.id, role: narratorMessages.role })
-				.from(narratorMessages)
-				.where(inArray(narratorMessages.id, missing));
+			const extra = await readQuery(
+				db
+					.select({ id: narratorMessages.id, role: narratorMessages.role })
+					.from(narratorMessages)
+					.where(inArray(narratorMessages.id, missing)),
+				{ site: "narrator-scoped-revert.classifyWindowWithoutOperations" },
+			);
 			if (extra.length !== missing.length) return { kind: "incomplete_coverage" };
 			if (extra.some((row) => row.role == null)) {
 				return { kind: "incomplete_coverage" };
@@ -179,41 +186,44 @@ async function selectPairs(
 		WHEN octet_length(${narratorToolCalls.inputJson}) <= ${MAX_INPUT_METADATA_BYTES}
 		THEN CASE WHEN json_valid(${narratorToolCalls.inputJson}) THEN ${narratorToolCalls.inputJson} ELSE '{}' END
 		ELSE '{}' END`;
-	const rows = await db
-		.select({
-			toolUseId: narratorToolCalls.toolUseId,
-			messageId: narratorToolCalls.messageId,
-			seq: narratorMessageRefs.seq,
-			toolName: narratorToolCalls.toolName,
-			status: narratorToolCalls.status,
-			isBackground: narratorToolCalls.isBackground,
-			fileChangeOperationId: narratorToolCalls.fileChangeOperationId,
-			before: narratorToolCalls.treeHashBefore,
-			after: narratorToolCalls.treeHashAfter,
-			executionDeviceId: narratorToolCalls.executionDeviceId,
-			executionCwd: narratorToolCalls.executionCwd,
-			executionPathFlavor: narratorToolCalls.executionPathFlavor,
-			resolvedFilePath: narratorToolCalls.resolvedFilePath,
-			canonicalFilePath: narratorToolCalls.canonicalFilePath,
-			inputFilePath: sql<string | null>`json_extract(${input}, '$.file_path')`,
-			inputDevice: sql<string | null>`json_extract(${input}, '$.device')`,
-			inputBackground: sql<number | null>`json_extract(${input}, '$.run_in_background')`,
-		})
-		.from(narratorToolCalls)
-		.innerJoin(
-			narratorMessageRefs,
-			and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessageRefs.messageId, narratorToolCalls.messageId),
-			),
-		)
-		.where(selectorCondition(scope))
-		.orderBy(
-			asc(narratorMessageRefs.seq),
-			asc(narratorToolCalls.createdAt),
-			asc(narratorToolCalls.id),
-		)
-		.limit(MAX_OPERATION_ROWS + 1);
+	const rows = await readQuery(
+		db
+			.select({
+				toolUseId: narratorToolCalls.toolUseId,
+				messageId: narratorToolCalls.messageId,
+				seq: narratorMessageRefs.seq,
+				toolName: narratorToolCalls.toolName,
+				status: narratorToolCalls.status,
+				isBackground: narratorToolCalls.isBackground,
+				fileChangeOperationId: narratorToolCalls.fileChangeOperationId,
+				before: narratorToolCalls.treeHashBefore,
+				after: narratorToolCalls.treeHashAfter,
+				executionDeviceId: narratorToolCalls.executionDeviceId,
+				executionCwd: narratorToolCalls.executionCwd,
+				executionPathFlavor: narratorToolCalls.executionPathFlavor,
+				resolvedFilePath: narratorToolCalls.resolvedFilePath,
+				canonicalFilePath: narratorToolCalls.canonicalFilePath,
+				inputFilePath: sql<string | null>`json_extract(${input}, '$.file_path')`,
+				inputDevice: sql<string | null>`json_extract(${input}, '$.device')`,
+				inputBackground: sql<number | null>`json_extract(${input}, '$.run_in_background')`,
+			})
+			.from(narratorToolCalls)
+			.innerJoin(
+				narratorMessageRefs,
+				and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					eq(narratorMessageRefs.messageId, narratorToolCalls.messageId),
+				),
+			)
+			.where(selectorCondition(scope))
+			.orderBy(
+				asc(narratorMessageRefs.seq),
+				asc(narratorToolCalls.createdAt),
+				asc(narratorToolCalls.id),
+			)
+			.limit(MAX_OPERATION_ROWS + 1),
+		{ site: "narrator-scoped-revert.selectPairs" },
+	);
 
 	if (rows.length > MAX_OPERATION_ROWS) return { pairs: [], unavailable: "window_too_large" };
 	if (rows.length === 0) {

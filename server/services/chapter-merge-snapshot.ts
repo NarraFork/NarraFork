@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 /**
  * Commit-free chapter merging.
  *
@@ -62,7 +63,9 @@ export interface SnapshotMergePlan extends GitTreeMergeResult {
 }
 
 async function getProjectGitPath(projectId: string): Promise<string> {
-	const project = await db.query.projects.findFirst({ where: eq(projects.id, projectId) });
+	const project = await readQuery(
+		db.query.projects.findFirst({ where: eq(projects.id, projectId) }),
+	);
 	if (!project?.gitPath) throw new ValidationError("Project has no git repository configured");
 	return project.gitPath;
 }
@@ -569,9 +572,13 @@ export async function checkSnapshotConflicts(
 	sourceChapterId: string,
 	targetChapterId: string,
 ): Promise<{ conflictFiles: string[]; hasConflicts: boolean }> {
-	const source = await db.query.chapters.findFirst({ where: eq(chapters.id, sourceChapterId) });
+	const source = await readQuery(
+		db.query.chapters.findFirst({ where: eq(chapters.id, sourceChapterId) }),
+	);
 	if (!source) throw new NotFoundError("Chapter", sourceChapterId);
-	const target = await db.query.chapters.findFirst({ where: eq(chapters.id, targetChapterId) });
+	const target = await readQuery(
+		db.query.chapters.findFirst({ where: eq(chapters.id, targetChapterId) }),
+	);
 	if (!target) throw new NotFoundError("Chapter", targetChapterId);
 	await getProjectGitPath(source.projectId);
 

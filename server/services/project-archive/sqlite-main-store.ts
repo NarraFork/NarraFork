@@ -64,6 +64,7 @@ import {
 	narratorToolCalls,
 	projects,
 } from "@server/db/schema";
+import { readDbAll } from "@server/db/worker-read";
 import { type Column, getTableColumns, getTableName, type SQL, sql, type Table } from "drizzle-orm";
 /**
  * Flatten one main-database value to something the portable file can hold, and the
@@ -320,7 +321,9 @@ export const sqliteProjectArchiveMainStore: ProjectArchiveMainStore = {
 			key.name,
 		)} ASC LIMIT ${limit + 1}`;
 
-		const raw = db.all(statement) as Record<string, unknown>[];
+		const raw = await readDbAll<Record<string, unknown>>(db, statement, {
+			site: "projectArchive.mainRows",
+		});
 		const hasMore = raw.length > limit;
 		const page = hasMore ? raw.slice(0, limit) : raw;
 		const rows: ArchiveRow[] = page.map((source) => {

@@ -18,6 +18,7 @@ import {
 	oauthClients,
 	remoteDevices,
 } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import type {
 	DangerInfo,
 	DangerSeverity,
@@ -201,15 +202,18 @@ async function refreshPermissionContextCharacters(
 	narratorId: string,
 	toolCallId: string,
 ): Promise<void> {
-	const row = await db.query.narratorToolCalls
-		.findFirst({ where: eq(narratorToolCalls.id, toolCallId), columns: { messageId: true } })
-		.catch((error: unknown) => {
-			logger.warn("Character refresh message identity unavailable", {
-				toolCallId,
-				error: String(error),
-			});
-			return undefined;
+	const row = await readQuery(
+		db.query.narratorToolCalls.findFirst({
+			where: eq(narratorToolCalls.id, toolCallId),
+			columns: { messageId: true },
+		}),
+	).catch((error: unknown) => {
+		logger.warn("Character refresh message identity unavailable", {
+			toolCallId,
+			error: String(error),
 		});
+		return undefined;
+	});
 	queueContextCharacterRefresh(narratorId, row?.messageId);
 }
 
@@ -1961,15 +1965,17 @@ function scheduleQuestionReflection(
 async function currentPermissionModeAllowsAutomaticQuestionReflection(
 	pending: PendingPermission,
 ): Promise<boolean> {
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, pending.narratorId),
-		columns: {
-			permissionMode: true,
-			relaxedPlan: true,
-			previousPermissionMode: true,
-			traits: true,
-		},
-	});
+	const narrator = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, pending.narratorId),
+			columns: {
+				permissionMode: true,
+				relaxedPlan: true,
+				previousPermissionMode: true,
+				traits: true,
+			},
+		}),
+	);
 	if (!narrator) return false;
 	const effectiveMode = getEffectivePermissionMode(
 		narrator.permissionMode ?? "default",
@@ -4794,10 +4800,12 @@ export async function classifyDeviceAccessGroup(
 	ctx: { oauthClientId: string; grantId: string },
 ): Promise<DeviceAccessGroup> {
 	if (deviceId === LOCAL_DEVICE_ID) return "host";
-	const device = await db.query.remoteDevices.findFirst({
-		where: eq(remoteDevices.id, deviceId),
-		columns: { scope: true },
-	});
+	const device = await readQuery(
+		db.query.remoteDevices.findFirst({
+			where: eq(remoteDevices.id, deviceId),
+			columns: { scope: true },
+		}),
+	);
 	if (!device) return "global"; // fail closed toward the more restrictive default level below
 	const binding = await integrationResourceBindingService.get("device", deviceId);
 	const isSelfRegistered =
@@ -4863,15 +4871,17 @@ export async function handlePermission(
 		}
 	}
 	// Legacy callers may omit the binding only when the provider id is unambiguous.
-	const candidates = await db.query.narratorToolCalls.findMany({
-		where: and(
-			binding ? eq(narratorToolCalls.id, binding.toolCallId) : undefined,
-			eq(narratorToolCalls.narratorId, narratorId),
-			eq(narratorToolCalls.toolUseId, toolUseId),
-		),
-		columns: { id: true, executionAttempt: true },
-		limit: 2,
-	});
+	const candidates = await readQuery(
+		db.query.narratorToolCalls.findMany({
+			where: and(
+				binding ? eq(narratorToolCalls.id, binding.toolCallId) : undefined,
+				eq(narratorToolCalls.narratorId, narratorId),
+				eq(narratorToolCalls.toolUseId, toolUseId),
+			),
+			columns: { id: true, executionAttempt: true },
+			limit: 2,
+		}),
+	);
 	if (candidates.length > 1 || (binding && candidates.length !== 1)) {
 		return { behavior: "deny", message: "Ambiguous or missing persisted tool execution record" };
 	}
@@ -4903,22 +4913,24 @@ export async function handlePermission(
 	let initialExecutionTarget = executionContext?.target;
 	const wsTarget = broadcastTargetId ?? narratorId;
 	const routingIdentity = permissionRoutingIdentity(narratorId, wsTarget, parentToolUseId);
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: {
-			permissionMode: true,
-			chapterId: true,
-			relaxedPlan: true,
-			previousPermissionMode: true,
-			planFileId: true,
-			dangerReflectionOverride: true,
-			variant: true,
-			type: true,
-			parentNarratorId: true,
-			runtimeRegistrationJson: true,
-			traits: true,
-		},
-	});
+	const narrator = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: {
+				permissionMode: true,
+				chapterId: true,
+				relaxedPlan: true,
+				previousPermissionMode: true,
+				planFileId: true,
+				dangerReflectionOverride: true,
+				variant: true,
+				type: true,
+				parentNarratorId: true,
+				runtimeRegistrationJson: true,
+				traits: true,
+			},
+		}),
+	);
 	const permMode = runtimeConstraint?.permissionMode ?? narrator?.permissionMode ?? "default";
 	// OAuth runtime constraints are hard ceilings and never inherit relaxed-plan expansion.
 	const isRelaxedPlan = runtimeConstraint
@@ -5362,9 +5374,11 @@ export async function handlePermission(
 		if (!opts.skipConfirmationCache && consumeDangerConfirmation(narratorId, fingerprint)) {
 			return null;
 		}
-		const toolCallRecord = await db.query.narratorToolCalls.findFirst({
-			where: and(eq(narratorToolCalls.id, permissionToolCallId)),
-		});
+		const toolCallRecord = await readQuery(
+			db.query.narratorToolCalls.findFirst({
+				where: and(eq(narratorToolCalls.id, permissionToolCallId)),
+			}),
+		);
 		if (!toolCallRecord) {
 			logger.error("Tool call record not found for danger reflection", {
 				narratorId,
@@ -5728,9 +5742,11 @@ export async function handlePermission(
 		};
 	}
 
-	const toolCallRecord = await db.query.narratorToolCalls.findFirst({
-		where: and(eq(narratorToolCalls.id, permissionToolCallId)),
-	});
+	const toolCallRecord = await readQuery(
+		db.query.narratorToolCalls.findFirst({
+			where: and(eq(narratorToolCalls.id, permissionToolCallId)),
+		}),
+	);
 
 	if (!toolCallRecord) {
 		logger.error("Tool call record not found for permission request", { narratorId, toolUseId });
@@ -6568,10 +6584,12 @@ export async function resolveDecisionNarratorId(requestId: string): Promise<stri
 	);
 	const planReflectionNarratorId = getExitPlanReflectionNarratorId(requestId);
 	if (planReflectionNarratorId) return planReflectionNarratorId;
-	const row = await db.query.narratorToolCalls.findFirst({
-		where: eq(narratorToolCalls.id, requestId),
-		columns: { narratorId: true },
-	});
+	const row = await readQuery(
+		db.query.narratorToolCalls.findFirst({
+			where: eq(narratorToolCalls.id, requestId),
+			columns: { narratorId: true },
+		}),
+	);
 	return row?.narratorId ?? null;
 }
 
@@ -6615,15 +6633,17 @@ export async function resolvePermissionOrDangerReflection(
 		const { manuallyResumeRestartRecovery, pausedRestartToolCallForRequest } = await import(
 			"./restart-recovery-service"
 		);
-		const stored = await db.query.narratorToolCalls.findFirst({
-			where: eq(narratorToolCalls.id, pausedRestartToolCallForRequest(requestId)),
-			columns: {
-				narratorId: true,
-				status: true,
-				executionStartedAt: true,
-				fileChangeOperationId: true,
-			},
-		});
+		const stored = await readQuery(
+			db.query.narratorToolCalls.findFirst({
+				where: eq(narratorToolCalls.id, pausedRestartToolCallForRequest(requestId)),
+				columns: {
+					narratorId: true,
+					status: true,
+					executionStartedAt: true,
+					fileChangeOperationId: true,
+				},
+			}),
+		);
 		if (
 			stored?.status === "pending" &&
 			stored.executionStartedAt == null &&
@@ -6861,30 +6881,36 @@ async function abortPersistedDangerReflectionWithoutRuntime(
 	requestId: string,
 	reason?: string,
 ): Promise<boolean> {
-	const toolCall = await db.query.narratorToolCalls.findFirst({
-		where: eq(narratorToolCalls.id, requestId),
-		columns: {
-			id: true,
-			narratorId: true,
-			messageId: true,
-			toolUseId: true,
-			status: true,
-			permissionSuggestions: true,
-		},
-	});
+	const toolCall = await readQuery(
+		db.query.narratorToolCalls.findFirst({
+			where: eq(narratorToolCalls.id, requestId),
+			columns: {
+				id: true,
+				narratorId: true,
+				messageId: true,
+				toolUseId: true,
+				status: true,
+				permissionSuggestions: true,
+			},
+		}),
+	);
 	if (!toolCall) return false;
 
 	const existingReflection = getPersistedDangerReflectionSuggestion(toolCall.permissionSuggestions);
 	if (!existingReflection) return false;
 	const [narrator, ownerMessage] = await Promise.all([
-		db.query.narrators.findFirst({
-			where: eq(narrators.id, toolCall.narratorId),
-			columns: { parentNarratorId: true },
-		}),
-		db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, toolCall.messageId),
-			columns: { parentToolUseId: true },
-		}),
+		readQuery(
+			db.query.narrators.findFirst({
+				where: eq(narrators.id, toolCall.narratorId),
+				columns: { parentNarratorId: true },
+			}),
+		),
+		readQuery(
+			db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, toolCall.messageId),
+				columns: { parentToolUseId: true },
+			}),
+		),
 	]);
 	// No runtime pause exists, so the route is rebuilt from persistence: the owner
 	// plus its parent (if it is a subagent) are exactly the pages that can be

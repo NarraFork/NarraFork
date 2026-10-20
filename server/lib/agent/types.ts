@@ -1087,6 +1087,8 @@ export interface AgentConfig {
 	 * or runs model/context hooks. The host must fence writes by toolCallBinding.
 	 */
 	onDetachedToolResult?: (event: Extract<AgentEvent, { type: "tool_result" }>) => Promise<void>;
+	/** Synchronously adopt execution → persistence before the consumer releases its owner. */
+	trackDetachedToolResult?: (work: Promise<void>) => Promise<void>;
 	/** Capture a live host observation before permission can terminate the unclaimed row. */
 	prepareToolNoDispatch?: (
 		ctx: ToolContext,
@@ -1200,7 +1202,7 @@ export interface AgentConfig {
 		sourceHistory: unknown[],
 		content: string,
 		questionAnswerEventIds?: ReadonlySet<string>,
-	) => void;
+	) => void | Promise<void>;
 	/** Authenticated receipt candidates, checked against the actual supplied model input. */
 	getQuestionModelReceipts?: () => readonly { id: string; text: string }[];
 	/**
@@ -1266,7 +1268,7 @@ export interface AgentConfig {
 	 * Called after each serial tool or complete parallel-safe group. If true,
 	 * the loop exits gracefully and marks later tool calls in the turn as skipped.
 	 */
-	shouldStop?: () => boolean;
+	shouldStop?: () => boolean | Promise<boolean>;
 	/** Event-driven immediate guidance: cancel the provider and unstarted preparation,
 	 * but drain actual running tools. Supply a fresh signal for each loop invocation. */
 	guidanceSignal?: AbortSignal;

@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 /**
  * Central resource authorization for the external OAuth API.
  *
@@ -136,32 +137,37 @@ export async function requireExternalOAuthContext(
 	const grantId = principal.oauth.grantId;
 	if (!grantId) throw grantRequired();
 
-	const [grant] = await db
-		.select({
-			id: oauthGrants.id,
-			oauthClientId: oauthGrants.oauthClientId,
-			userId: oauthGrants.userId,
-			revokedAt: oauthGrants.revokedAt,
-		})
-		.from(oauthGrants)
-		.where(eq(oauthGrants.id, grantId))
-		.limit(1);
+	const [grant] = await readQuery(
+		db
+			.select({
+				id: oauthGrants.id,
+				oauthClientId: oauthGrants.oauthClientId,
+				userId: oauthGrants.userId,
+				revokedAt: oauthGrants.revokedAt,
+			})
+			.from(oauthGrants)
+			.where(eq(oauthGrants.id, grantId))
+			.limit(1),
+		{ site: "server/services/oauth-resource-access.read" },
+	);
 	if (!grant || grant.revokedAt || grant.userId !== principal.user.sub) throw grantForbidden();
 
 	const [client, authority] = await Promise.all([
-		db
-			.select({
-				id: oauthClients.id,
-				clientId: oauthClients.clientId,
-				scopes: oauthClients.scopes,
-				policyJson: oauthClients.policyJson,
-				publicClient: oauthClients.publicClient,
-				revokedAt: oauthClients.revokedAt,
-			})
-			.from(oauthClients)
-			.where(eq(oauthClients.id, grant.oauthClientId))
-			.limit(1)
-			.then((rows) => rows[0]),
+		readQuery(
+			db
+				.select({
+					id: oauthClients.id,
+					clientId: oauthClients.clientId,
+					scopes: oauthClients.scopes,
+					policyJson: oauthClients.policyJson,
+					publicClient: oauthClients.publicClient,
+					revokedAt: oauthClients.revokedAt,
+				})
+				.from(oauthClients)
+				.where(eq(oauthClients.id, grant.oauthClientId))
+				.limit(1),
+			{ site: "server/services/oauth-resource-access.read" },
+		).then((rows) => rows[0]),
 		integrationAuthorityService.getSnapshot(grant.id),
 	]);
 	if (
@@ -334,16 +340,19 @@ export async function requireOwnedExternalDevice(
 	ctx: ExternalOAuthContext,
 	id: string,
 ): Promise<ExternalOAuthDeviceResource> {
-	const [device] = await db
-		.select({
-			id: remoteDevices.id,
-			scope: remoteDevices.scope,
-			projectId: remoteDevices.projectId,
-			revokedAt: remoteDevices.revokedAt,
-		})
-		.from(remoteDevices)
-		.where(and(eq(remoteDevices.id, id), isNull(remoteDevices.revokedAt)))
-		.limit(1);
+	const [device] = await readQuery(
+		db
+			.select({
+				id: remoteDevices.id,
+				scope: remoteDevices.scope,
+				projectId: remoteDevices.projectId,
+				revokedAt: remoteDevices.revokedAt,
+			})
+			.from(remoteDevices)
+			.where(and(eq(remoteDevices.id, id), isNull(remoteDevices.revokedAt)))
+			.limit(1),
+		{ site: "server/services/oauth-resource-access.read" },
+	);
 	if (!device) throw resourceNotFound("Remote device", id);
 	// Grant ownership (the active resource binding) is the sole isolation
 	// boundary for OAuth-owned devices; the device scope column no longer gates
@@ -357,16 +366,19 @@ export async function requireOwnedExternalNarrator(
 	ctx: ExternalOAuthContext,
 	id: string,
 ): Promise<ExternalOAuthNarratorResource> {
-	const [narrator] = await db
-		.select({
-			id: narrators.id,
-			chapterId: narrators.chapterId,
-			contextProjectId: narrators.contextProjectId,
-			defaultDeviceId: narrators.defaultDeviceId,
-		})
-		.from(narrators)
-		.where(eq(narrators.id, id))
-		.limit(1);
+	const [narrator] = await readQuery(
+		db
+			.select({
+				id: narrators.id,
+				chapterId: narrators.chapterId,
+				contextProjectId: narrators.contextProjectId,
+				defaultDeviceId: narrators.defaultDeviceId,
+			})
+			.from(narrators)
+			.where(eq(narrators.id, id))
+			.limit(1),
+		{ site: "server/services/oauth-resource-access.read" },
+	);
 	if (!narrator) throw resourceNotFound("Narrator", id);
 	await requireActiveOAuthResourceBinding(ctx, "narrator", id, "Narrator");
 	return narrator;

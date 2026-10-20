@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import type { db as applicationDb } from "../db";
 import { deviceTransferTasks } from "../db/schema";
@@ -35,30 +36,36 @@ export class DeviceTransferTaskStore {
 	 * stays device-scoped; this is read-only resolution.
 	 */
 	async getById(taskId: string): Promise<DeviceTransferTask | null> {
-		const [task] = await this.database
-			.select()
-			.from(deviceTransferTasks)
-			.where(eq(deviceTransferTasks.id, taskId))
-			.limit(1);
+		const [task] = await readQuery(
+			this.database
+				.select()
+				.from(deviceTransferTasks)
+				.where(eq(deviceTransferTasks.id, taskId))
+				.limit(1),
+		);
 		return task ?? null;
 	}
 
 	async get(deviceId: string, taskId: string): Promise<DeviceTransferTask | null> {
-		const [task] = await this.database
-			.select()
-			.from(deviceTransferTasks)
-			.where(and(eq(deviceTransferTasks.id, taskId), eq(deviceTransferTasks.deviceId, deviceId)))
-			.limit(1);
+		const [task] = await readQuery(
+			this.database
+				.select()
+				.from(deviceTransferTasks)
+				.where(and(eq(deviceTransferTasks.id, taskId), eq(deviceTransferTasks.deviceId, deviceId)))
+				.limit(1),
+		);
 		return task ?? null;
 	}
 
 	async list(deviceId: string): Promise<DeviceTransferTask[]> {
-		return this.database
-			.select()
-			.from(deviceTransferTasks)
-			.where(eq(deviceTransferTasks.deviceId, deviceId))
-			.orderBy(desc(deviceTransferTasks.createdAt))
-			.limit(100);
+		return readQuery(
+			this.database
+				.select()
+				.from(deviceTransferTasks)
+				.where(eq(deviceTransferTasks.deviceId, deviceId))
+				.orderBy(desc(deviceTransferTasks.createdAt))
+				.limit(100),
+		);
 	}
 
 	async claim(
@@ -252,10 +259,12 @@ export class DeviceTransferTaskStore {
 	}
 
 	async recoverInterrupted(): Promise<void> {
-		const active = await this.database
-			.select({ id: deviceTransferTasks.id, runGeneration: deviceTransferTasks.runGeneration })
-			.from(deviceTransferTasks)
-			.where(inArray(deviceTransferTasks.status, ["queued", "running"]));
+		const active = await readQuery(
+			this.database
+				.select({ id: deviceTransferTasks.id, runGeneration: deviceTransferTasks.runGeneration })
+				.from(deviceTransferTasks)
+				.where(inArray(deviceTransferTasks.status, ["queued", "running"])),
+		);
 		for (const task of active) {
 			await this.database
 				.update(deviceTransferTasks)

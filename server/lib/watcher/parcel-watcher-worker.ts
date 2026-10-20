@@ -9,6 +9,7 @@ import type {
 	WatcherBackend,
 	WatcherParentMessage,
 	WatcherWorkerMessage,
+	WorkerStageMessage,
 } from "./worker-protocol";
 
 const EVENT_AGGREGATE_DELAY = 75;
@@ -148,6 +149,36 @@ interface WorkerWatchInstance {
 
 const instances = new Map<string, WorkerWatchInstance>();
 const backend = getBackend();
+let starting = 0;
+let stopping = 0;
+
+type ObserveStage = (stage: WorkerStageMessage["stage"], error?: unknown) => void;
+
+function observeRequest(command: { requestId: string; id: string }): ObserveStage {
+	const started = performance.now();
+	let previous = started;
+	return (stage, error) => {
+		const now = performance.now();
+		try {
+			send({
+				type: "stage",
+				requestId: command.requestId,
+				watchId: command.id.slice(0, 256),
+				stage,
+				workerElapsedMs: Math.round(now - started),
+				workerStageDurationMs: Math.round(now - previous),
+				activeWatches: instances.size,
+				starting,
+				stopping,
+				errorName: error instanceof Error ? error.name.slice(0, 80) : undefined,
+				errorMessage: error === undefined ? undefined : String(error).slice(0, 256),
+			});
+		} catch {
+			// Diagnostics must never replace the subscription's result.
+		}
+		previous = now;
+	};
+}
 
 async function normalizeWatchPath(path: string): Promise<{
 	realPath: string;
@@ -205,14 +236,18 @@ function handleAggregatedEvents(instance: WorkerWatchInstance, rawEvents: IFileC
 	}
 }
 
-async function startWatch(command: WatchCommand): Promise<void> {
+async function startWatch(command: WatchCommand, observe: ObserveStage): Promise<void> {
 	if (instances.has(command.id)) {
+		observe("ack_send");
 		send({ type: "watch_ack", requestId: command.requestId, id: command.id });
 		return;
 	}
 
 	const { realPath, realPathDiffers, realPathLength } = await normalizeWatchPath(command.path);
+	observe("canonicalize_end");
+	observe("binding_start");
 	const parcelWatcher = await getParcelWatcher();
+	observe("binding_end");
 
 	let instance: WorkerWatchInstance | undefined;
 	const worker = new RunOnceWorker<IFileChange>((events) => {
@@ -228,6 +263,7 @@ async function startWatch(command: WatchCommand): Promise<void> {
 		},
 	);
 
+	observe("subscribe_start");
 	const subscription = await parcelWatcher.subscribe(
 		realPath,
 		(error, parcelEvents) => {
@@ -248,6 +284,7 @@ async function startWatch(command: WatchCommand): Promise<void> {
 		{ backend, ignore: command.ignore },
 	);
 
+	observe("subscribe_end");
 	instance = {
 		id: command.id,
 		path: command.path,
@@ -263,10 +300,11 @@ async function startWatch(command: WatchCommand): Promise<void> {
 	instances.set(command.id, instance);
 
 	log("debug", "started native watch", { path: command.path, realPath, backend });
+	observe("ack_send");
 	send({ type: "watch_ack", requestId: command.requestId, id: command.id });
 }
 
-async function stopWatch(id: string): Promise<void> {
+async function stopWatch(id: string, observe?: ObserveStage): Promise<void> {
 	const instance = instances.get(id);
 	if (!instance) return;
 	instances.delete(id);
@@ -274,30 +312,49 @@ async function stopWatch(id: string): Promise<void> {
 	instance.worker.dispose();
 	instance.throttledEmitter.dispose();
 	try {
+		observe?.("unsubscribe_start");
 		await instance.subscription.unsubscribe();
+		observe?.("unsubscribe_end");
 	} catch (error) {
+		observe?.("unsubscribe_error", error);
 		log("debug", "unsubscribe failed", { id, error: String(error) });
 	}
 }
 
 async function handleMessage(message: WatcherParentMessage): Promise<void> {
 	switch (message.type) {
-		case "watch":
+		case "watch": {
+			starting++;
+			const observe = observeRequest(message);
+			observe("received");
 			try {
-				await startWatch(message);
+				await startWatch(message, observe);
 			} catch (error) {
 				send({
 					type: "error",
 					requestId: message.requestId,
 					id: message.id,
 					error: String(error),
+					errorName: error instanceof Error ? error.name.slice(0, 80) : undefined,
 				});
+			} finally {
+				starting--;
 			}
 			break;
-		case "unwatch":
-			await stopWatch(message.id);
-			send({ type: "unwatch_ack", requestId: message.requestId, id: message.id });
+		}
+		case "unwatch": {
+			stopping++;
+			const observe = observeRequest(message);
+			observe("received");
+			try {
+				await stopWatch(message.id, observe);
+				observe("ack_send");
+				send({ type: "unwatch_ack", requestId: message.requestId, id: message.id });
+			} finally {
+				stopping--;
+			}
 			break;
+		}
 		case "ping":
 			send({ type: "pong", requestId: message.requestId });
 			break;

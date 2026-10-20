@@ -1,3 +1,4 @@
+import { readQueryFirst } from "@server/db/worker-read";
 import { modelTextFromContentBlocks } from "@shared/native-injection";
 import type { SideCarBody } from "@shared/sidecar-body";
 import { and, eq, inArray, isNull, sql } from "drizzle-orm";
@@ -209,45 +210,47 @@ async function persistAgentMessageConsumption(
 			const queuePort = getRuntimeQueuePort();
 			if (queuePort) return await persistConsumptionPostgres(queuePort, delivery, consumedAt);
 			const { db } = await import("../db");
-			const candidateRef = db
-				.select({ id: narratorMessageRefs.id })
-				.from(narratorMessageRefs)
-				.where(
-					and(
-						eq(narratorMessageRefs.narratorId, delivery.recipientNarratorId),
-						delivery.recipientRefId
-							? eq(narratorMessageRefs.id, delivery.recipientRefId)
-							: eq(narratorMessageRefs.messageId, delivery.recipientMessageId),
+			const candidateRef = await readQueryFirst(
+				db
+					.select({ id: narratorMessageRefs.id })
+					.from(narratorMessageRefs)
+					.where(
+						and(
+							eq(narratorMessageRefs.narratorId, delivery.recipientNarratorId),
+							delivery.recipientRefId
+								? eq(narratorMessageRefs.id, delivery.recipientRefId)
+								: eq(narratorMessageRefs.messageId, delivery.recipientMessageId),
+						),
 					),
-				)
-				.get();
+			);
 			if (!candidateRef && !delivery.deliveryId) return false;
 			const stable =
 				delivery.deliveryId || candidateRef
-					? db
-							.select({
-								deliveryId: narratorBufferedMessages.deliveryId,
-								kind: narratorBufferedMessages.kind,
-								narratorId: narratorBufferedMessages.narratorId,
-								refId: narratorBufferedMessages.recipientRefId,
-								messageId: narratorBufferedMessages.currentMessageId,
-								revision: narratorBufferedMessages.contentRevision,
-								currentRevision: narratorBufferedMessages.currentRevision,
-								disposition: narratorBufferedMessages.receiptDisposition,
-								sourceNarratorId: narratorBufferedMessages.sourceNarratorId,
-								sourceToolCallId: narratorBufferedMessages.sourceToolCallId,
-								sourceAttempt: narratorBufferedMessages.sourceAttempt,
-							})
-							.from(narratorBufferedMessages)
-							.where(
-								delivery.deliveryId
-									? eq(narratorBufferedMessages.deliveryId, delivery.deliveryId)
-									: and(
-											eq(narratorBufferedMessages.narratorId, delivery.recipientNarratorId),
-											eq(narratorBufferedMessages.recipientRefId, candidateRef?.id ?? ""),
-										),
-							)
-							.get()
+					? await readQueryFirst(
+							db
+								.select({
+									deliveryId: narratorBufferedMessages.deliveryId,
+									kind: narratorBufferedMessages.kind,
+									narratorId: narratorBufferedMessages.narratorId,
+									refId: narratorBufferedMessages.recipientRefId,
+									messageId: narratorBufferedMessages.currentMessageId,
+									revision: narratorBufferedMessages.contentRevision,
+									currentRevision: narratorBufferedMessages.currentRevision,
+									disposition: narratorBufferedMessages.receiptDisposition,
+									sourceNarratorId: narratorBufferedMessages.sourceNarratorId,
+									sourceToolCallId: narratorBufferedMessages.sourceToolCallId,
+									sourceAttempt: narratorBufferedMessages.sourceAttempt,
+								})
+								.from(narratorBufferedMessages)
+								.where(
+									delivery.deliveryId
+										? eq(narratorBufferedMessages.deliveryId, delivery.deliveryId)
+										: and(
+												eq(narratorBufferedMessages.narratorId, delivery.recipientNarratorId),
+												eq(narratorBufferedMessages.recipientRefId, candidateRef?.id ?? ""),
+											),
+								),
+						)
 					: undefined;
 			if (delivery.deliveryId && !stable) return false;
 			if (delivery.currentRevisionOnly) {
@@ -290,13 +293,14 @@ async function persistAgentMessageConsumption(
 					? eq(narratorMessageRefs.id, stable.refId)
 					: eq(narratorMessageRefs.messageId, delivery.recipientMessageId),
 			);
-			const readReceipt = () =>
-				db
-					.select({ consumedAt: narratorMessageRefs.injectionConsumedAt })
-					.from(narratorMessageRefs)
-					.where(exactRef)
-					.get();
-			const existing = readReceipt();
+			const readReceipt = async () =>
+				await readQueryFirst(
+					db
+						.select({ consumedAt: narratorMessageRefs.injectionConsumedAt })
+						.from(narratorMessageRefs)
+						.where(exactRef),
+				);
+			const existing = await readReceipt();
 			if (!existing) return false;
 			if (existing.consumedAt != null) {
 				// Upgrade pre-mailbox acknowledgement without changing its timestamp or re-invalidating pages.
@@ -332,16 +336,19 @@ async function persistAgentMessageConsumption(
 			const senderToolUseId =
 				delivery.fromToolUseId ||
 				(senderBinding
-					? db
-							.select({ id: narratorToolCalls.toolUseId })
-							.from(narratorToolCalls)
-							.where(
-								and(
-									eq(narratorToolCalls.id, senderBinding.toolCallId),
-									eq(narratorToolCalls.executionAttempt, senderBinding.attempt),
-								),
+					? (
+							await readQueryFirst(
+								db
+									.select({ id: narratorToolCalls.toolUseId })
+									.from(narratorToolCalls)
+									.where(
+										and(
+											eq(narratorToolCalls.id, senderBinding.toolCallId),
+											eq(narratorToolCalls.executionAttempt, senderBinding.attempt),
+										),
+									),
 							)
-							.get()?.id
+						)?.id
 					: undefined);
 			const changed = db.transaction((tx) => {
 				const receipt =
@@ -411,7 +418,7 @@ async function persistAgentMessageConsumption(
 					senderBinding,
 				);
 			}
-			return changed || readReceipt()?.consumedAt != null;
+			return changed || (await readReceipt())?.consumedAt != null;
 		} catch (error) {
 			if (attempt === 2) {
 				logger.warn("Failed to record adopted agent injection; delivery will not be repeated", {

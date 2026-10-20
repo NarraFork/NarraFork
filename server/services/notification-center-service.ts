@@ -1,3 +1,4 @@
+import { readDbAll, readQuery } from "@server/db/worker-read";
 /** Bounded event history. Source ACL and read watermarks are authoritative, not the projection. */
 import {
 	type MarkNotificationsReadBody,
@@ -155,12 +156,15 @@ interface NotificationRow {
 
 /** Always select the event window BEFORE kind/status filters. No request catches up old backlog. */
 async function loadWindow(userId: string, now: number): Promise<NotificationRow[]> {
-	return db.all<NotificationRow>(sql`
+	return readDbAll<NotificationRow>(
+		db,
+		sql`
 		SELECT id, kind, title, preview, link_json, source_key, status, created_at, read_at
 		FROM notifications WHERE user_id = ${userId}
 		AND created_at >= ${now - NOTIFICATION_RETENTION_MAX_AGE_MS}
 		ORDER BY created_at DESC, id DESC LIMIT ${NOTIFICATION_RETENTION_MAX_ROWS}
-	`);
+	`,
+	);
 }
 
 function rowBase(row: NotificationRow): NotificationListItem {
@@ -258,14 +262,17 @@ async function loadMessageSources(rows: NotificationRow[], userId: string) {
 	const result = new Map<string, MessageSource>();
 	const ids = rows.filter((row) => row.kind === "chat_message").map((row) => row.source_key);
 	for (const batch of chunks([...new Set(ids)])) {
-		const found = db.all<MessageSource>(sql`
+		const found = await readDbAll<MessageSource>(
+			db,
+			sql`
 			SELECT m.id, m.room_id AS roomId, m.seq, m.deleted_at AS deletedAt,
 			       r.kind AS roomKind, member.last_read_seq AS lastReadSeq,
 			       member.last_read_at AS lastReadAt
 			FROM chat_messages m INNER JOIN chat_rooms r ON r.id = m.room_id
 			LEFT JOIN chat_room_members member ON member.room_id = r.id AND member.user_id = ${userId}
 			WHERE m.id IN (${boundIds(batch)}) LIMIT ${NOTIFICATION_SQL_BATCH_SIZE}
-		`);
+		`,
+		);
 		for (const row of found) result.set(row.id, row);
 	}
 	return result;
@@ -288,18 +295,23 @@ async function deriveActivities(userId: string, now: number): Promise<Notificati
 		.filter((row) => row.kind === "permission_request")
 		.map((row) => row.source_key);
 	for (const batch of chunks([...new Set(toolIds)])) {
-		const found = db.all<PermissionSource>(sql`
+		const found = await readDbAll<PermissionSource>(
+			db,
+			sql`
 			SELECT id, narrator_id AS narratorId, status,
 			permission_decided_by AS decidedBy, permission_decided_at AS decidedAt
 			FROM narrator_tool_calls WHERE id IN (${boundIds(batch)}) LIMIT ${NOTIFICATION_SQL_BATCH_SIZE}
-		`);
+		`,
+		);
 		for (const tool of found) tools.set(tool.id, tool);
 	}
 
-	const principal = await db.query.users.findFirst({
-		where: eq(users.id, userId),
-		columns: { role: true },
-	});
+	const principal = await readQuery(
+		db.query.users.findFirst({
+			where: eq(users.id, userId),
+			columns: { role: true },
+		}),
+	);
 	const contexts = new Map<
 		string,
 		{
@@ -311,31 +323,33 @@ async function deriveActivities(userId: string, now: number): Promise<Notificati
 		}
 	>();
 	for (const batch of chunks([...new Set([...tools.values()].map((tool) => tool.narratorId))])) {
-		const found = await db
-			.select({
-				narratorId: narrators.id,
-				chapterId: chapters.id,
-				chapterTitle: sql<
-					string | null
-				>`substr(${chapters.title}, 1, ${NOTIFICATION_TITLE_MAX_LENGTH})`,
-				projectId: projects.id,
-				projectTitle: sql<
-					string | null
-				>`substr(${projects.name}, 1, ${NOTIFICATION_TITLE_MAX_LENGTH})`,
-			})
-			.from(narrators)
-			.leftJoin(chapters, eq(chapters.id, narrators.chapterId))
-			.leftJoin(
-				projects,
-				eq(projects.id, sql`coalesce(${chapters.projectId}, ${narrators.contextProjectId})`),
-			)
-			.where(
-				and(
-					inArray(narrators.id, batch),
-					narratorReadableWhere({ userId, isAdmin: principal?.role === "admin" }),
-				),
-			)
-			.limit(NOTIFICATION_SQL_BATCH_SIZE);
+		const found = await readQuery(
+			db
+				.select({
+					narratorId: narrators.id,
+					chapterId: chapters.id,
+					chapterTitle: sql<
+						string | null
+					>`substr(${chapters.title}, 1, ${NOTIFICATION_TITLE_MAX_LENGTH})`,
+					projectId: projects.id,
+					projectTitle: sql<
+						string | null
+					>`substr(${projects.name}, 1, ${NOTIFICATION_TITLE_MAX_LENGTH})`,
+				})
+				.from(narrators)
+				.leftJoin(chapters, eq(chapters.id, narrators.chapterId))
+				.leftJoin(
+					projects,
+					eq(projects.id, sql`coalesce(${chapters.projectId}, ${narrators.contextProjectId})`),
+				)
+				.where(
+					and(
+						inArray(narrators.id, batch),
+						narratorReadableWhere({ userId, isAdmin: principal?.role === "admin" }),
+					),
+				)
+				.limit(NOTIFICATION_SQL_BATCH_SIZE),
+		);
 		for (const context of found) contexts.set(context.narratorId, context);
 	}
 

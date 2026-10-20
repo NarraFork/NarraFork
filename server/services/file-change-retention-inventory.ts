@@ -1,7 +1,7 @@
 import type { Database, SQLQueryBindings } from "bun:sqlite";
 import { setImmediate as yieldToEventLoop } from "node:timers/promises";
-import { FILE_CHANGE_LIMITS } from "@shared/file-change-protocol";
-import { FILE_CHANGE_BLOB_BUDGET_ID } from "./file-change-blob-catalog";
+import { isMainThread } from "node:worker_threads";
+import { FILE_CHANGE_BLOB_BUDGET_ID, FILE_CHANGE_LIMITS } from "@shared/file-change-protocol";
 
 export const FILE_CHANGE_RETENTION_INVENTORY_LIMITS = Object.freeze({
 	pageItems: FILE_CHANGE_LIMITS.historyPageItems,
@@ -115,7 +115,7 @@ export interface FileChangeRetentionInventoryOptions {
 	 * No application DB import, open(), automatic startup hook, content lookup or ACL bypass.
 	 * An authenticated caller identity must be established outside this internal service;
 	 * neither this label nor any digest is an authorization capability. */
-	db: Pick<Database, "query" | "inTransaction">;
+	db: Pick<Database, "query" | "inTransaction"> & { filename?: string };
 	maintenanceCaller: { kind: "maintenance"; subjectKey: string };
 	namespaceKey: string;
 	expectedGeneration: number;
@@ -204,6 +204,45 @@ export class FileChangeRetentionInventory {
 		limit?: number;
 		cursor?: FileChangeRetentionInventoryCursor;
 	}): Promise<FileChangeRetentionInventoryPage> {
+		const startedAt = performance.now();
+		if (!isMainThread || input.signal.aborted) return this.listPageLocal(input, startedAt);
+		if (this.options.db.inTransaction)
+			throw new FileChangeRetentionInventoryError("root_connection_required");
+		const { readTransactionTask } = await import("../db/worker-read");
+		const { db, onSlow, ...options } = this.options;
+		try {
+			const page = await readTransactionTask<FileChangeRetentionInventoryPage>(
+				db,
+				{
+					kind: "fileChangeRetentionInventoryV1",
+					options,
+					limit: input.limit,
+					cursor: input.cursor,
+				},
+				() => this.listPageLocal(input, startedAt),
+				{
+					dbPath: db.filename,
+					signal: input.signal,
+					site: "file-change-retention-inventory.listPage",
+				},
+			);
+			if (db.filename && db.filename !== ":memory:" && page.metrics.durationMs >= LIMITS.slowMs)
+				onSlow?.({ ...page.metrics, service: "file-change-retention" });
+			return page;
+		} catch (error) {
+			if (input.signal.aborted) return this.listPageLocal(input, startedAt);
+			throw error;
+		}
+	}
+
+	private async listPageLocal(
+		input: {
+			signal: AbortSignal;
+			limit?: number;
+			cursor?: FileChangeRetentionInventoryCursor;
+		},
+		startedAt: number,
+	): Promise<FileChangeRetentionInventoryPage> {
 		if (!(input.signal instanceof AbortSignal)) invalid();
 		const limit = input.limit ?? LIMITS.pageItems;
 		integer(limit, LIMITS.pageItems, 1);
@@ -212,7 +251,7 @@ export class FileChangeRetentionInventory {
 		const graceCutoff = new Date(
 			Date.parse(cutoff) - FILE_CHANGE_LIMITS.unreferencedGraceMs,
 		).toISOString();
-		const meter = new ReadBudget(this.options, input.signal);
+		const meter = new ReadBudget(this.options, input.signal, startedAt);
 		const page: FileChangeRetentionInventoryPage = {
 			readOnly: true,
 			noDeletionAuthority: true,
@@ -621,14 +660,33 @@ export class FileChangeRetentionInventory {
 	}
 }
 
+export interface FileChangeRetentionInventoryReadParams {
+	kind: "fileChangeRetentionInventoryV1";
+	options: Omit<FileChangeRetentionInventoryOptions, "db" | "onSlow">;
+	limit?: number;
+	cursor?: FileChangeRetentionInventoryCursor;
+}
+
+export function executeFileChangeRetentionInventoryRead(
+	db: Database,
+	params: FileChangeRetentionInventoryReadParams,
+	signal: AbortSignal,
+) {
+	return new FileChangeRetentionInventory({ ...params.options, db }).listPage({
+		signal,
+		limit: params.limit,
+		cursor: params.cursor,
+	});
+}
+
 class ReadBudget {
-	private readonly startedAt = performance.now();
 	private queries = 0;
 	private metadataBytes = 0;
 	referenceProbes = 0;
 	constructor(
 		private readonly options: FileChangeRetentionInventoryOptions,
 		private readonly signal: AbortSignal,
+		private readonly startedAt: number,
 	) {}
 	get remainingMetadata(): number {
 		return LIMITS.metadataBytes - this.metadataBytes;

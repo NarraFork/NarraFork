@@ -105,6 +105,103 @@ class FakeSource implements BackgroundOccupancySource {
 	}
 }
 
+describe("shutdown occupancy ownership", () => {
+	test("cold shutdown never initializes the history scan", async () => {
+		const { source, store } = fixture();
+		store.refreshTask("queued-before-start");
+		store.beginShutdown();
+		await store.drainForShutdown(new AbortController().signal);
+		expect(source.calls).toEqual([]);
+		expect(store.getShutdownState().pending).toBe(0);
+		store.stop();
+		await expect(store.start()).rejects.toThrow("stopped");
+		expect(source.calls).toEqual([]);
+	});
+
+	test("shutdown waits scheduled notification and subscriber flush without self-deadlock", async () => {
+		const { source, store } = fixture();
+		await store.start();
+		await store.drainForShutdown(new AbortController().signal);
+		const entered = deferred();
+		const gate = deferred();
+		store.subscribe("flush-reentry", async () => {
+			await store.flush();
+			entered.resolve();
+			await gate.promise;
+		});
+		store.beginShutdown();
+		source.tasks.set("task", task("task", "root"));
+		store.refreshTask("task");
+		await store.flush();
+		expect(store.getShutdownState().pending).toBeGreaterThan(0);
+		let drained = false;
+		const drain = store.drainForShutdown(new AbortController().signal).then(() => {
+			drained = true;
+		});
+		await entered.promise;
+		expect(drained).toBe(false);
+		gate.resolve();
+		await drain;
+		expect(store.getShutdownState().pending).toBe(0);
+		const calls = source.calls.length;
+		store.stop();
+		store.refreshTask("task");
+		store.refreshNarrators(["root"]);
+		await Promise.resolve();
+		expect(source.calls.length).toBe(calls);
+	});
+
+	test("maintenance and async subscriber failures remain visible after settlement", async () => {
+		const { source, store } = fixture();
+		await store.start();
+		await store.drainForShutdown(new AbortController().signal);
+		store.beginShutdown();
+		const error = new Error("maintenance failed");
+		source.onRead = async () => {
+			throw error;
+		};
+		store.refreshTask("task");
+		await store.drainForShutdown(new AbortController().signal);
+		expect(store.getShutdownState()).toEqual({ pending: 0, failureCount: 1, firstError: error });
+		source.onRead = null;
+		store.subscribe("async-failed", async () => {
+			throw new Error("async subscriber failed");
+		});
+		source.tasks.set("task", task("task", "root"));
+		await store.flush();
+		await store.drainForShutdown(new AbortController().signal);
+		expect(store.getShutdownState()).toEqual({ pending: 0, failureCount: 2, firstError: error });
+	});
+
+	test("subscriber failures are accounted and abort retains pending work", async () => {
+		const { source, store } = fixture();
+		await store.start();
+		await store.drainForShutdown(new AbortController().signal);
+		const gate = deferred();
+		const entered = deferred();
+		const error = new Error("subscriber failed");
+		store.subscribe("failed", () => {
+			throw error;
+		});
+		store.subscribe("pending", async () => {
+			entered.resolve();
+			await gate.promise;
+		});
+		store.beginShutdown();
+		source.tasks.set("task", task("task", "root"));
+		store.refreshTask("task");
+		const controller = new AbortController();
+		const drain = store.drainForShutdown(controller.signal);
+		await entered.promise;
+		controller.abort(new Error("deadline"));
+		await expect(drain).rejects.toThrow("deadline");
+		expect(store.getShutdownState().pending).toBeGreaterThan(0);
+		gate.resolve();
+		await store.drainForShutdown(new AbortController().signal);
+		expect(store.getShutdownState()).toEqual({ pending: 0, failureCount: 1, firstError: error });
+	});
+});
+
 function fixture(): { source: FakeSource; store: BackgroundOccupancyStore } {
 	const source = new FakeSource();
 	source.narrators.set("root", narrator("root"));
@@ -208,6 +305,52 @@ describe("background occupancy coordinator", () => {
 			await store.ensureReady();
 		}
 		expect(source.calls.length).toBe(reads);
+	});
+
+	test("projection-free active narrators use bounded metadata pages without per-child reads", async () => {
+		const { source, store } = fixture();
+		for (let i = 0; i < 512; i++) {
+			const id = `active-${String(i).padStart(4, "0")}`;
+			source.narrators.set(
+				id,
+				narrator(id, "root", { status: "working", backgroundStatus: "running" }),
+			);
+		}
+		await store.start();
+		expect(source.calls.filter((label) => label === "getProjections")).toHaveLength(0);
+		expect(source.calls.filter((label) => label === "getNarrators").length).toBeLessThanOrEqual(6);
+		expect(store.getOccupiedChildIds("root", 512)).toHaveLength(512);
+		expect(store.snapshot(["root"]).counts.get("root")?.activeCount).toBe(200);
+	});
+
+	test("projection insertion after a negative existence read replays its dirty narrator", async () => {
+		const { source, store } = fixture();
+		source.tasks.set("work", task("work", "leaf"));
+		const entered = deferred();
+		const release = deferred();
+		let blocked = false;
+		source.onRead = async (label) => {
+			if (label === "getNarrators" && !blocked) {
+				blocked = true;
+				entered.resolve();
+				await release.promise;
+			}
+		};
+		const starting = store.start();
+		await entered.promise;
+		source.tasks.set(
+			"projection",
+			task("projection", "root", {
+				type: "agent",
+				status: "completed",
+				subagentNarratorId: "child",
+			}),
+		);
+		store.refreshNarrator("child");
+		release.resolve();
+		await starting;
+		expect(store.getActiveTaskIds("root")).toEqual(["projection"]);
+		expect(source.calls).toContain("getProjections");
 	});
 
 	test("startup pages yield actual macrotasks", async () => {

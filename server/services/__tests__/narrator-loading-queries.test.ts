@@ -13,6 +13,7 @@ const { narratorMessageQueries } = await import("../narrator-messages");
 const { narratorRoutes } = await import("../../routes/narrators");
 const gitSummaryModule = await import("../narrator-git-summary");
 const displayReaderModule = await import("../narrator-display-page-reader");
+const workerReadModule = await import("../../db/worker-read");
 const time = "2026-10-12T00:00:00.000Z";
 function narrator(
 	id: string,
@@ -135,6 +136,39 @@ describe("request-local narrator loading", () => {
 			narratorMessageQueries.getPretextDocumentPage("n1", { limit: 1 }),
 		).rejects.toMatchObject({ statusCode: 409, code: "HISTORY_AGGREGATE_UNAVAILABLE" });
 	});
+	test.each([
+		"narrator-messages.pretextMetadata",
+		"narrator-messages.pretextWindow",
+		"narrator-messages.pretextPrevious",
+		"narrator-messages.getMessageVersion",
+	])("page cancellation reaches %s and retains its public error", async (site) => {
+		narrator("n1");
+		message("first", 1, [{ type: "text", text: "first" }]);
+		message("second", 2, [{ type: "text", text: "second" }]);
+		const controller = new AbortController();
+		const read = workerReadModule.readQuery;
+		let intercepted = false;
+		spyOn(workerReadModule, "readQuery").mockImplementation(async (query, options) => {
+			if (options?.site === site) {
+				intercepted = true;
+				expect(options.signal).toBe(controller.signal);
+				expect(options.timeoutMs).toBeGreaterThan(0);
+				expect(options.timeoutMs).toBeLessThanOrEqual(10_000);
+				controller.abort();
+				throw new Error("worker query aborted");
+			}
+			return read(query, options);
+		});
+		await expect(
+			narratorMessageQueries.getPretextDocumentPage("n1", {
+				afterSeq: 1,
+				limit: 1,
+				signal: controller.signal,
+			}),
+		).rejects.toMatchObject({ statusCode: 499, code: "DISPLAY_PAGE_CANCELLED" });
+		expect(intercepted).toBe(true);
+	});
+
 	test("read middleware snapshot is reusable without a second query, never as write, and require remains fresh", async () => {
 		narrator("n1");
 		const app = new Hono();

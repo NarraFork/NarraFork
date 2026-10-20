@@ -3028,7 +3028,7 @@ async function* agentLoopInMetadataSnapshot(
 	 */
 	const pendingInputParts: AgentInputPart[] = [];
 	let replayedInjectionMessageIds = new Set<string>();
-	const pendingInputConsumptions: Array<() => void> = [];
+	const pendingInputConsumptions: Array<() => void | Promise<void>> = [];
 	async function collectAfterToolsInjections(): Promise<void> {
 		if (!config.getAfterToolsInjections) return;
 		try {
@@ -3238,7 +3238,7 @@ async function* agentLoopInMetadataSnapshot(
 		if (guidanceSignal?.aborted) {
 			// FIFO guidance may intentionally enter a pass already stopped. Consume the
 			// host flag and preserve pending input without activating provider/preflight IO.
-			config.shouldStop?.();
+			await config.shouldStop?.();
 			const isFirstTurn = turnIndex === 0;
 			provider.pushUserTurn(
 				history,
@@ -3434,14 +3434,23 @@ async function* agentLoopInMetadataSnapshot(
 			 * return the *next* request's answer (usually false) and silently resurrect
 			 * the turn the caller already agreed to end.
 			 */
-			const observeSoftStopForTurn = (): boolean => {
-				if (!gracefulStopRequested && guidanceSignal?.aborted) {
-					// Consume the host's one-shot flag too, so the next pass is not stopped again.
-					config.shouldStop?.();
-					gracefulStopRequested = true;
-				}
-				if (!gracefulStopRequested && config.shouldStop?.()) gracefulStopRequested = true;
-				return gracefulStopRequested;
+			let softStopObservation: Promise<boolean> | undefined;
+			let softStopError: { error: unknown } | undefined;
+			const observeSoftStopForTurn = (): boolean | Promise<boolean> => {
+				if (softStopError) throw softStopError.error;
+				if (gracefulStopRequested) return true;
+				// Streaming completions and the main loop share one consumption of the host flag.
+				if (softStopObservation) return softStopObservation;
+				const requested = config.shouldStop?.();
+				const adopt = (stop: boolean | undefined) => {
+					if (guidanceSignal?.aborted || stop) gracefulStopRequested = true;
+					return gracefulStopRequested;
+				};
+				if (typeof requested === "boolean" || requested === undefined) return adopt(requested);
+				softStopObservation = requested.then(adopt).finally(() => {
+					softStopObservation = undefined;
+				});
+				return softStopObservation;
 			};
 			// Map of tool executions started during streaming (toolUseId → Promise)
 			const earlyExecMap = new Map<string, Promise<ToolExecResult>>();
@@ -3497,10 +3506,15 @@ async function* agentLoopInMetadataSnapshot(
 					)
 					.finally(removeGuidance);
 				earlyExecMap.set(tu.toolUseId, execution);
-				void execution.then((result) => {
-					settledResults.set(tu.toolUseId, result);
-					pumpStreamingTools();
-				});
+				void execution
+					.then(async (result) => {
+						settledResults.set(tu.toolUseId, result);
+						await pumpStreamingTools();
+					})
+					.catch((error: unknown) => {
+						// Surface asynchronous stop-query failures at the next owned loop boundary.
+						softStopError = { error };
+					});
 				return execution;
 			};
 			async function waitForToolOrAbort<T>(
@@ -3521,14 +3535,15 @@ async function* agentLoopInMetadataSnapshot(
 					signal.removeEventListener("abort", onAbort);
 				}
 			}
-			const pumpStreamingTools = (): void => {
+			const pumpStreamingTools = async (): Promise<void> => {
 				if (
 					!streamExecutionOpen ||
 					config.signal.aborted ||
-					config.deferEagerToolsForSafeStop === true ||
-					observeSoftStopForTurn()
+					config.deferEagerToolsForSafeStop === true
 				)
 					return;
+				const stop = observeSoftStopForTurn();
+				if (typeof stop === "boolean" ? stop : await stop) return;
 				const completed = new Map(toolUses.map((tu) => [tu.toolUseId, tu]));
 				const candidates = selectStreamingToolExecutions(
 					[...toolOrderIdentities.values()].sort(compareToolOrder).map((identity) => {
@@ -3719,16 +3734,18 @@ async function* agentLoopInMetadataSnapshot(
 					// The executor still owns its IO, leases and after snapshot. Keep its
 					// final result alive without holding up interruption or emitting into
 					// a stream that may already belong to the narrator's next run.
-					void execution
-						.then((settled) => persist(earlyToolResultEvent(tu, settled)))
-						.catch((error) => {
-							logger.error("Failed to persist detached tool result", {
-								narratorId: config.narratorId,
-								toolUseId: tu.toolUseId,
-								toolCallId: executionBindings.get(tu)?.toolCallId,
-								error: String(error),
-							});
+					const work = execution.then((settled) => persist(earlyToolResultEvent(tu, settled)));
+					// Adopt the whole tail now, while the consumer's host lease is still live.
+					// Observe errors only after adoption so shutdown cannot mistake failure for success.
+					const tracked = config.trackDetachedToolResult?.(work) ?? work;
+					void tracked.catch((error) => {
+						logger.error("Failed to persist detached tool result", {
+							narratorId: config.narratorId,
+							toolUseId: tu.toolUseId,
+							toolCallId: executionBindings.get(tu)?.toolCallId,
+							error: String(error),
 						});
+					});
 				}
 			}
 
@@ -4429,7 +4446,7 @@ async function* agentLoopInMetadataSnapshot(
 				const updateReasoningStop = new Error("Reasoning paused for graceful restart");
 				const guidanceStop = new Error("Stopped for immediate guidance");
 				const onGuidanceAbort = () => {
-					observeSoftStopForTurn();
+					// The signal already establishes the stop. Consume the host flag at the awaited boundary.
 					streamExecutionOpen = false;
 					attemptAbort.abort(guidanceStop);
 				};
@@ -4559,7 +4576,7 @@ async function* agentLoopInMetadataSnapshot(
 						);
 						for (const callback of callbacks) {
 							try {
-								callback();
+								await callback();
 							} catch (error) {
 								logger.warn("Failed to acknowledge adopted model input", {
 									narratorId: config.narratorId,
@@ -4936,7 +4953,7 @@ async function* agentLoopInMetadataSnapshot(
 								};
 								throwIfUserAborted();
 								streamReadyTools.add(tu.toolUseId);
-								pumpStreamingTools();
+								await pumpStreamingTools();
 							}
 						}
 
@@ -5114,7 +5131,7 @@ async function* agentLoopInMetadataSnapshot(
 										};
 										throwIfUserAborted();
 										streamReadyTools.add(id);
-										pumpStreamingTools();
+										await pumpStreamingTools();
 
 										// Drain any tool results that settled during streaming.
 										// This lets fast tools (Read, Glob, etc.) report completion
@@ -5774,7 +5791,7 @@ async function* agentLoopInMetadataSnapshot(
 						continue;
 					}
 					if (guidanceSignal?.aborted) {
-						observeSoftStopForTurn();
+						await observeSoftStopForTurn();
 						// Guidance is not a transport fault. Finalize this partial turn below,
 						// without replay/retry or cancelling tools whose bodies already began.
 						break;
@@ -6240,7 +6257,7 @@ async function* agentLoopInMetadataSnapshot(
 				}
 
 				if (guidanceSignal?.aborted) {
-					observeSoftStopForTurn();
+					await observeSoftStopForTurn();
 					break;
 				}
 				if (firstTokenTimeoutTriggered) {
@@ -7027,7 +7044,7 @@ async function* agentLoopInMetadataSnapshot(
 			responseActivity.release();
 
 			if (guidanceSignal?.aborted) {
-				observeSoftStopForTurn();
+				await observeSoftStopForTurn();
 				yield* drainStartedEarlyToolResults();
 				if (config.signal.aborted) {
 					yield { type: "error", message: "Aborted" };
@@ -7221,7 +7238,7 @@ async function* agentLoopInMetadataSnapshot(
 						yield* drainEarlyToolResultsAfterAbort();
 						if (config.signal.aborted) yield { type: "error", message: "Aborted" };
 						else {
-							observeSoftStopForTurn();
+							await observeSoftStopForTurn();
 							yield { type: "turn_complete", turnIndex };
 						}
 						return;
@@ -7352,7 +7369,7 @@ async function* agentLoopInMetadataSnapshot(
 							yield* drainEarlyToolResultsAfterAbort();
 							if (config.signal.aborted) yield { type: "error", message: "Aborted" };
 							else {
-								observeSoftStopForTurn();
+								await observeSoftStopForTurn();
 								yield { type: "turn_complete", turnIndex };
 							}
 							return;
@@ -7439,7 +7456,7 @@ async function* agentLoopInMetadataSnapshot(
 				// Check after every serial tool and complete parallel-safe group. Once a soft
 				// stop is observed, never start another tool: only await promises that were
 				// already registered in earlyExecMap and mark every other remaining call skipped.
-				if (observeSoftStopForTurn()) {
+				if (await observeSoftStopForTurn()) {
 					const skippedOutput = getToolMessage("skippedForSoftStop", locale);
 					let fatalOutput: string | undefined;
 					for (const remainingTool of toolUses.slice(toolIndex)) {
@@ -7477,7 +7494,7 @@ async function* agentLoopInMetadataSnapshot(
 							yield* drainEarlyToolResultsAfterAbort();
 							if (config.signal.aborted) yield { type: "error", message: "Aborted" };
 							else {
-								observeSoftStopForTurn();
+								await observeSoftStopForTurn();
 								yield { type: "turn_complete", turnIndex };
 							}
 							return;
@@ -7611,7 +7628,7 @@ async function* agentLoopInMetadataSnapshot(
 
 			// Close the small race between the final group boundary and the next provider
 			// request: direct user feedback may arrive while after-tools injections are drained.
-			if (observeSoftStopForTurn()) {
+			if (await observeSoftStopForTurn()) {
 				yield { type: "turn_complete", turnIndex };
 				return;
 			}

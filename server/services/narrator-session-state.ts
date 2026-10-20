@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import type { EventEmitter } from "node:events";
 import type { FileReferenceSnapshot } from "@shared/file-reference";
+import { readQuery } from "../db/worker-read";
 import type { DangerInfo, PermissionResult, ReasoningEffort } from "../lib/agent";
 import { AsyncMutex } from "../lib/async-mutex";
 import { AppError, NotFoundError } from "../lib/errors";
@@ -9,6 +10,7 @@ import { hotSafe } from "../lib/hot-safe";
 import { isSubagentVariant } from "../lib/narrator-utils";
 import { normalizePathForComparison } from "../lib/platform-path";
 import type { Locale } from "../lib/prompt-i18n";
+import { waitForShutdownWork } from "../lib/shutdown-activity";
 import type { ImageRef } from "../lib/uploads";
 import { createRuntimeMapView, executionAdmissions } from "./agent-runtime/ownership";
 import type { FrozenExecutionTarget } from "./execution-policy/types";
@@ -766,12 +768,12 @@ export function isNarratorRuntimeBusy(narratorId: string): boolean {
 
 /** Deprecated read-only view; the mailbox is the sole queue authority. */
 export const bufferedMessages = {
-	get(narratorId: string): BufferedMessage[] | undefined {
-		const messages = getBufferedMessages(narratorId);
+	async get(narratorId: string): Promise<BufferedMessage[] | undefined> {
+		const messages = await getBufferedMessages(narratorId);
 		return messages.length ? messages : undefined;
 	},
-	has(narratorId: string): boolean {
-		return getBufferedMessages(narratorId).length > 0;
+	async has(narratorId: string): Promise<boolean> {
+		return (await getBufferedMessages(narratorId)).length > 0;
 	},
 };
 
@@ -799,6 +801,72 @@ const admissionWork = hotSafe<Map<string, Set<NarratorWorkAdmission>>>(
 	"narrafork.narratorAdmissionWork",
 	() => new Map(),
 );
+const admissionShutdown = hotSafe("narrafork.narratorAdmissionShutdown", () => ({
+	frozen: false,
+	cancellation: new AbortController(),
+	failure: null as { error: unknown } | null,
+	reason: new DOMException("Server shutdown", "AbortError"),
+}));
+
+/** Freeze starts, not final writes inherited from an already admitted producer. */
+export function freezeNarratorAdmissionForShutdown(): void {
+	admissionShutdown.frozen = true;
+}
+
+export function isNarratorAdmissionShuttingDown(): boolean {
+	return admissionShutdown.frozen;
+}
+
+export function getNarratorShutdownAbortReason(): DOMException {
+	return admissionShutdown.reason;
+}
+
+/** Called only after recovery snapshot/checkpoint preparation, never by freeze. */
+export function beginNarratorShutdownCancellation(): void {
+	admissionShutdown.cancellation.abort(admissionShutdown.reason);
+}
+
+export function getNarratorShutdownSignal(): AbortSignal {
+	return admissionShutdown.cancellation.signal;
+}
+
+/** Startup may install a controller after the synchronous cancellation fan-out. */
+export function abortLateNarratorControllerForShutdown(controller: AbortController): void {
+	if (admissionShutdown.cancellation.signal.aborted) controller.abort(admissionShutdown.reason);
+}
+
+export function recordNarratorShutdownFailure(error: unknown): void {
+	if (!admissionShutdown.frozen || error === admissionShutdown.reason) return;
+	if (error instanceof AppError && error.code === "NARRATOR_SHUTTING_DOWN") return;
+	admissionShutdown.failure ??= { error };
+}
+
+function assertNarratorStartAllowed(): void {
+	if (admissionShutdown.frozen) {
+		throw new AppError("Server is shutting down", 503, "NARRATOR_SHUTTING_DOWN");
+	}
+}
+
+export function getNarratorShutdownPendingCount(): number {
+	let count = 0;
+	for (const claims of admissionWork.values()) count += claims.size;
+	return count;
+}
+
+/** The caller must abort execution/gate waiters before waiting for their real tails. */
+export async function drainNarratorAdmissionWork(signal: AbortSignal): Promise<void> {
+	while (getNarratorShutdownPendingCount() > 0) {
+		await waitForShutdownWork(
+			Promise.all(
+				[...admissionWork.values()].flatMap((claims) => [...claims].map((work) => work.settled)),
+			),
+			signal,
+		);
+	}
+	signal.throwIfAborted();
+	if (admissionShutdown.failure) throw admissionShutdown.failure.error;
+}
+
 /**
  * Keyed by the reverted narrator. A subagent revert reserves only that subagent
  * (its parent keeps running); `rootId` lets one team's reverts serialize, since a
@@ -835,10 +903,13 @@ export async function resolveNarratorAdmissionRoot(narratorId: string): Promise<
 	while (seen.size < 32 && !seen.has(id)) {
 		seen.add(id);
 		// Admission is a frequent metadata read; never load prompts or compact summaries.
-		const narrator = await db.query.narrators.findFirst({
-			where: eq(narrators.id, id),
-			columns: { id: true, variant: true, parentNarratorId: true },
-		});
+		const narrator = await readQuery(
+			db.query.narrators.findFirst({
+				where: eq(narrators.id, id),
+				columns: { id: true, variant: true, parentNarratorId: true },
+			}),
+			{ site: "narrator-session-state.resolveNarratorAdmissionRoot" },
+		);
 		if (!narrator) throw new NotFoundError("Narrator", id);
 		if (!isSubagentVariant(narrator.variant)) return id;
 		if (!narrator.parentNarratorId) break;
@@ -904,7 +975,9 @@ export function withNarratorWorkAdmission<T>(
 	until?: (result: T) => Promise<unknown> | undefined,
 ): Promise<T> {
 	const inherited = admissionContext.getStore()?.work.get(narratorId);
+	if (!inherited?.live) assertNarratorStartAllowed();
 	const enter = (rootId: string): Promise<T> => {
+		if (!inherited?.live) assertNarratorStartAllowed();
 		const live = [...(admissionContext.getStore()?.work.values() ?? [])].filter(
 			(work) => work.live,
 		);
@@ -936,19 +1009,30 @@ export function withNarratorWorkAdmission<T>(
 			try {
 				const result = await fn();
 				const terminal = until?.(result);
-				if (terminal) void terminal.then(lease.release, lease.release);
+				if (terminal)
+					void terminal.then(lease.release, (error) => {
+						recordNarratorShutdownFailure(error);
+						lease.release();
+					});
 				else lease.release();
 				return result;
 			} catch (error) {
+				recordNarratorShutdownFailure(error);
 				lease.release();
 				throw error;
 			}
 		});
 	};
-	// Preserve the synchronous handoff from a start transaction into a background loop.
-	return inherited?.live
-		? enter(inherited.rootId)
-		: resolveNarratorAdmissionRoot(narratorId).then(enter);
+	// Preserve synchronous inherited handoff; root lookup itself must also drain.
+	if (inherited?.live) return enter(inherited.rootId);
+	const resolving = claimAdmissionWork(narratorId, narratorId);
+	return resolveNarratorAdmissionRoot(narratorId)
+		.then(enter)
+		.catch((error) => {
+			recordNarratorShutdownFailure(error);
+			throw error;
+		})
+		.finally(resolving.release);
 }
 
 /** Short start transaction: a pending revert also prevents NEW automatic turns. */
@@ -956,8 +1040,10 @@ export function withNarratorStartAdmission<T>(
 	narratorId: string,
 	fn: () => Promise<T>,
 ): Promise<T> {
+	assertNarratorStartAllowed();
 	assertNarratorNotReverting(narratorId);
 	return withNarratorMutationAdmission(narratorId, async () => {
+		assertNarratorStartAllowed();
 		assertNarratorNotReverting(narratorId);
 		return fn();
 	});

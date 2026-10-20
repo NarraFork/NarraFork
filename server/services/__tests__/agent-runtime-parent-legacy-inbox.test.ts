@@ -94,7 +94,7 @@ test("unbound legacy terminal diagnostic is durable before removal and valid nex
 	expect(
 		diagnostics.some((row) => row.contentText?.includes("old progress retained for human review")),
 	).toBe(true);
-	runtimePublication.flushRecipient("recipient");
+	await runtimePublication.flushRecipient("recipient");
 	const rows = db
 		.select()
 		.from(narratorBufferedMessages)

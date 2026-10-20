@@ -7,6 +7,7 @@ import { createThrottledProgressReporter, type ProgressSnapshot } from "@shared/
 import { and, eq } from "drizzle-orm";
 import { db } from "../db";
 import { narratorMessages } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { AppError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import { parseSubstatus } from "../lib/narrator-utils";
@@ -520,14 +521,17 @@ function currentHistoryCompactMode(narratorId: string, fallback: CompactMode): C
 export async function markCompactAsBlocking(narratorId: string) {
 	await setCompactingSubstatus(narratorId, "blocking", true);
 	try {
-		const markers = await db.query.narratorMessages.findMany({
-			where: and(
-				eq(narratorMessages.narratorId, narratorId),
-				eq(narratorMessages.role, "system"),
-				eq(narratorMessages.contentText, "[Compacting]"),
-			),
-			columns: { id: true, contentJson: true },
-		});
+		const markers = await readQuery(
+			db.query.narratorMessages.findMany({
+				where: and(
+					eq(narratorMessages.narratorId, narratorId),
+					eq(narratorMessages.role, "system"),
+					eq(narratorMessages.contentText, "[Compacting]"),
+				),
+				columns: { id: true, contentJson: true },
+			}),
+			{ site: "narrator-compact.markCompactAsBlocking" },
+		);
 		for (const marker of markers) {
 			const blocks = Array.isArray(marker.contentJson) ? marker.contentJson : [];
 			const compactBlock = blocks.map(parseCompactMessageBlock).find(Boolean);

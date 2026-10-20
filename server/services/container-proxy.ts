@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 import { and, eq, isNotNull, isNull, sql } from "drizzle-orm";
 import { db } from "../db";
 import { chapters, containerInstances, projects } from "../db/schema";
@@ -100,29 +101,33 @@ export async function refreshCache(): Promise<void> {
 	registeredDomains.clear();
 
 	// Load all project proxy domains
-	const projs = await db
-		.select({ id: projects.id, proxyDomain: projects.proxyDomain })
-		.from(projects)
-		.where(isNotNull(projects.proxyDomain));
+	const projs = await readQuery(
+		db
+			.select({ id: projects.id, proxyDomain: projects.proxyDomain })
+			.from(projects)
+			.where(isNotNull(projects.proxyDomain)),
+	);
 	for (const p of projs) {
 		if (p.proxyDomain) registeredDomains.add(p.proxyDomain.toLowerCase());
 	}
 
 	// Load running container instances with proxy info
-	const instances = await db
-		.select(legacyContainerProjection)
-		.from(containerInstances)
-		.innerJoin(chapters, eq(chapters.id, containerInstances.chapterId))
-		.innerJoin(projects, eq(projects.id, chapters.projectId))
-		.where(
-			and(
-				eq(containerInstances.status, "running"),
-				isNull(containerInstances.worktreeResourceId),
-				isNotNull(containerInstances.chapterId),
-				isNotNull(containerInstances.proxyLabel),
-				isNotNull(containerInstances.containerPort),
+	const instances = await readQuery(
+		db
+			.select(legacyContainerProjection)
+			.from(containerInstances)
+			.innerJoin(chapters, eq(chapters.id, containerInstances.chapterId))
+			.innerJoin(projects, eq(projects.id, chapters.projectId))
+			.where(
+				and(
+					eq(containerInstances.status, "running"),
+					isNull(containerInstances.worktreeResourceId),
+					isNotNull(containerInstances.chapterId),
+					isNotNull(containerInstances.proxyLabel),
+					isNotNull(containerInstances.containerPort),
+				),
 			),
-		);
+	);
 
 	for (const inst of instances) {
 		// Resource-owned rows never enter legacy inspect/cache or chapter namespace.
@@ -224,18 +229,20 @@ async function inspectContainerState(containerId: string): Promise<ContainerLive
  * Intended to be called once at server startup.
  */
 export async function reconcileContainerStates(): Promise<void> {
-	const running = await db
-		.select(legacyContainerProjection)
-		.from(containerInstances)
-		.innerJoin(chapters, eq(chapters.id, containerInstances.chapterId))
-		.innerJoin(projects, eq(projects.id, chapters.projectId))
-		.where(
-			and(
-				eq(containerInstances.status, "running"),
-				isNull(containerInstances.worktreeResourceId),
-				isNotNull(containerInstances.chapterId),
+	const running = await readQuery(
+		db
+			.select(legacyContainerProjection)
+			.from(containerInstances)
+			.innerJoin(chapters, eq(chapters.id, containerInstances.chapterId))
+			.innerJoin(projects, eq(projects.id, chapters.projectId))
+			.where(
+				and(
+					eq(containerInstances.status, "running"),
+					isNull(containerInstances.worktreeResourceId),
+					isNotNull(containerInstances.chapterId),
+				),
 			),
-		);
+	);
 
 	if (running.length === 0) return;
 

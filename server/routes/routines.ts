@@ -1,5 +1,6 @@
 import { mkdir, open, stat, writeFile } from "node:fs/promises";
 import { dirname } from "node:path";
+import { readQuery } from "@server/db/worker-read";
 import {
 	normalizeToolRoutineMode,
 	normalizeToolRoutineModeOverride,
@@ -72,10 +73,12 @@ routineRoutes.post("/:id/mode", async (c) => {
 routineRoutes.get("/project/:projectId", async (c) => {
 	await requireProjectAccess(c, c.req.param("projectId"), "read");
 	const projectId = c.req.param("projectId");
-	const project = await db.query.projects.findFirst({
-		where: eq(projects.id, projectId),
-		columns: { chapterSettings: true },
-	});
+	const project = await readQuery(
+		db.query.projects.findFirst({
+			where: eq(projects.id, projectId),
+			columns: { chapterSettings: true },
+		}),
+	);
 	if (!project) throw new NotFoundError("Project", projectId);
 
 	let routinesConf: RoutineModeConfig | undefined;

@@ -26,8 +26,9 @@ import { GitError, UnbornHeadError } from "../lib/errors";
 import { logger } from "../lib/logger";
 import * as spawn from "../lib/spawn";
 import { safeSpawn } from "../lib/spawn";
-import { gitService } from "./git-service";
+import { gitService, withGitRequestContext } from "./git-service";
 import { getStatusSummaryCached } from "./git-status-cache";
+import { clearGitStatusQueries } from "./git-status-query";
 
 // Windows' first `safeSpawn` performs the one-time inheritable-handle scan. On a
 // busy machine that alone can exceed Bun's 5-second default test timeout; killing
@@ -65,6 +66,67 @@ afterEach(() => {
 	while (tempDirs.length > 0) {
 		const dir = tempDirs.pop();
 		if (dir) rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+	}
+});
+
+describe("status diagnostics", () => {
+	for (const outcome of ["success", "error", "cancelled"] as const) {
+		test(`diagnostics preserve service ${outcome} results`, async () => {
+			clearGitStatusQueries();
+			let now = 0;
+			const clock = spyOn(performance, "now").mockImplementation(() => now);
+			const warn = spyOn(logger, "warn").mockImplementation(() => {});
+			const controller = new AbortController();
+			const failure = new Error("diagnostic fixture failure");
+			const spawnSpy = spyOn(spawn, "safeSpawn").mockImplementation(async (options) => {
+				if (options.cmd.includes("status")) {
+					now = 1500;
+					if (outcome === "error") throw failure;
+					if (outcome === "cancelled") controller.abort(failure);
+					options.stdoutStream?.onChunk(new TextEncoder().encode("?? file\0"));
+				}
+				return {
+					stdout: options.cmd.includes("symbolic-ref") ? "main" : "",
+					stderr: "",
+					exitCode: 0,
+				};
+			});
+			try {
+				const result = await withGitRequestContext(controller.signal, () =>
+					gitService.getStatusSummary(process.cwd(), { ttlMs: 0 }),
+				).catch((error: unknown) => error);
+				// Cancellation rejects its reader before the underlying siblings finish.
+				await new Promise<void>((resolve) => setImmediate(resolve));
+				if (outcome === "success") {
+					expect(result).toMatchObject({ branch: "main", totalFiles: 1 });
+					const detail = warn.mock.calls.find(
+						([message]) => message === "Slow Git status query",
+					)?.[1];
+					expect(detail).toMatchObject({
+						scopeId: expect.stringMatching(/^[0-9a-f]{16}$/),
+						commandWallMs: {
+							prefix: expect.any(Number),
+							status: expect.any(Number),
+							head: expect.any(Number),
+							branch: expect.any(Number),
+						},
+						peakCommandTasks: 4,
+						metadataMaxOutputBytes: 4096,
+						stream: { parsedBytes: 8, maxBytes: 1024 * 1024 },
+					});
+				} else expect(result).toBe(failure);
+				const coordinated = warn.mock.calls.find(
+					([message]) => message === "Slow coordinated Git status",
+				)?.[1];
+				expect(coordinated).toMatchObject({ outcome, queueMs: 0, loaderMs: 1500 });
+				expect(JSON.stringify(warn.mock.calls)).not.toContain(process.cwd());
+			} finally {
+				clearGitStatusQueries();
+				spawnSpy.mockRestore();
+				clock.mockRestore();
+				warn.mockRestore();
+			}
+		});
 	}
 });
 

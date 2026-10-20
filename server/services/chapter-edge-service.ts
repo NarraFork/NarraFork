@@ -1,5 +1,6 @@
 import { db } from "@server/db";
 import { chapterEdges } from "@server/db/schema";
+import { readQuery } from "@server/db/worker-read";
 import { generateId } from "@server/lib/id";
 import { logger } from "@server/lib/logger";
 import type { ForkWorktreeSource } from "@shared/chapter-fork";
@@ -163,11 +164,13 @@ class ChapterEdgeService {
 	 * Get all edges for a project.
 	 */
 	async getEdgesByProject(projectId: string) {
-		const rows = await db
-			.select()
-			.from(chapterEdges)
-			.where(eq(chapterEdges.projectId, projectId))
-			.limit(EDGE_QUERY_LIMIT + 1);
+		const rows = await readQuery(
+			db
+				.select()
+				.from(chapterEdges)
+				.where(eq(chapterEdges.projectId, projectId))
+				.limit(EDGE_QUERY_LIMIT + 1),
+		);
 		if (rows.length > EDGE_QUERY_LIMIT) {
 			logger.warn("getEdgesByProject hit safety limit, graph may be incomplete", {
 				projectId,
@@ -182,11 +185,13 @@ class ChapterEdgeService {
 	 * Get all edges for a chapter (both incoming and outgoing).
 	 */
 	async getEdgesByChapter(chapterId: string) {
-		const rows = await db
-			.select()
-			.from(chapterEdges)
-			.where(or(eq(chapterEdges.sourceId, chapterId), eq(chapterEdges.targetId, chapterId)))
-			.limit(EDGE_QUERY_LIMIT + 1);
+		const rows = await readQuery(
+			db
+				.select()
+				.from(chapterEdges)
+				.where(or(eq(chapterEdges.sourceId, chapterId), eq(chapterEdges.targetId, chapterId)))
+				.limit(EDGE_QUERY_LIMIT + 1),
+		);
 		if (rows.length > EDGE_QUERY_LIMIT) {
 			logger.warn("getEdgesByChapter hit safety limit, results may be incomplete", {
 				chapterId,
@@ -201,11 +206,13 @@ class ChapterEdgeService {
 	 * Get edges by type within a project.
 	 */
 	async getEdgesByType(projectId: string, type: "fork" | "merge" | "review") {
-		const rows = await db
-			.select()
-			.from(chapterEdges)
-			.where(and(eq(chapterEdges.projectId, projectId), eq(chapterEdges.type, type)))
-			.limit(EDGE_QUERY_LIMIT + 1);
+		const rows = await readQuery(
+			db
+				.select()
+				.from(chapterEdges)
+				.where(and(eq(chapterEdges.projectId, projectId), eq(chapterEdges.type, type)))
+				.limit(EDGE_QUERY_LIMIT + 1),
+		);
 		if (rows.length > EDGE_QUERY_LIMIT) {
 			logger.warn("getEdgesByType hit safety limit, results may be incomplete", {
 				projectId,

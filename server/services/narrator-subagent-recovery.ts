@@ -1,3 +1,4 @@
+import { readQuery } from "../db/worker-read";
 /**
  * Recovery of unfinished subagent work after a narrator error.
  *
@@ -376,22 +377,25 @@ export const TOOL_CALL_RESET_FIELDS = {
 };
 
 async function findLatestTopLevelMessage(narratorId: string) {
-	const rows = await db
-		.select({
-			messageId: narratorMessageRefs.messageId,
-			role: narratorMessages.role,
-		})
-		.from(narratorMessageRefs)
-		.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
-		.where(
-			and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				isNull(narratorMessages.parentToolUseId),
-				inArray(narratorMessages.role, ["user", "assistant"]),
-			),
-		)
-		.orderBy(desc(narratorMessageRefs.seq))
-		.limit(1);
+	const rows = await readQuery(
+		db
+			.select({
+				messageId: narratorMessageRefs.messageId,
+				role: narratorMessages.role,
+			})
+			.from(narratorMessageRefs)
+			.innerJoin(narratorMessages, eq(narratorMessageRefs.messageId, narratorMessages.id))
+			.where(
+				and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					isNull(narratorMessages.parentToolUseId),
+					inArray(narratorMessages.role, ["user", "assistant"]),
+				),
+			)
+			.orderBy(desc(narratorMessageRefs.seq))
+			.limit(1),
+		{ site: "narrator-subagent-recovery.findLatestTopLevelMessage" },
+	);
 	return rows.length > 0 ? rows[0] : null;
 }
 
@@ -405,14 +409,17 @@ async function loadSubagentsByOriginToolUse(
 	>();
 	if (toolUseIds.length === 0) return map;
 
-	const linked = await db
-		.select({
-			narratorId: narratorMessages.narratorId,
-			parentToolUseId: narratorMessages.parentToolUseId,
-		})
-		.from(narratorMessages)
-		.where(inArray(narratorMessages.parentToolUseId, toolUseIds))
-		.orderBy(asc(narratorMessages.createdAt));
+	const linked = await readQuery(
+		db
+			.select({
+				narratorId: narratorMessages.narratorId,
+				parentToolUseId: narratorMessages.parentToolUseId,
+			})
+			.from(narratorMessages)
+			.where(inArray(narratorMessages.parentToolUseId, toolUseIds))
+			.orderBy(asc(narratorMessages.createdAt)),
+		{ site: "narrator-subagent-recovery.loadSubagentsByOriginToolUse" },
+	);
 
 	const originBySubagent = new Map<string, string>();
 	for (const row of linked) {
@@ -422,17 +429,20 @@ async function loadSubagentsByOriginToolUse(
 	}
 	if (originBySubagent.size === 0) return map;
 
-	const rows = await db.query.narrators.findMany({
-		where: inArray(narrators.id, [...originBySubagent.keys()]),
-		columns: {
-			id: true,
-			status: true,
-			substatus: true,
-			isBackground: true,
-			title: true,
-			variant: true,
-		},
-	});
+	const rows = await readQuery(
+		db.query.narrators.findMany({
+			where: inArray(narrators.id, [...originBySubagent.keys()]),
+			columns: {
+				id: true,
+				status: true,
+				substatus: true,
+				isBackground: true,
+				title: true,
+				variant: true,
+			},
+		}),
+		{ site: "narrator-subagent-recovery.loadSubagentsByOriginToolUse" },
+	);
 	for (const row of rows) {
 		const origin = originBySubagent.get(row.id);
 		if (!origin) continue;
@@ -450,20 +460,23 @@ async function resolveOriginToolUseIds(subagentIds: string[]): Promise<Map<strin
 	const origins = new Map<string, string>();
 	if (subagentIds.length === 0) return origins;
 
-	const rows = await db
-		.select({
-			narratorId: narratorMessages.narratorId,
-			parentToolUseId: narratorMessages.parentToolUseId,
-		})
-		.from(narratorMessages)
-		.where(
-			and(
-				inArray(narratorMessages.narratorId, subagentIds),
-				eq(narratorMessages.role, "user"),
-				sql`${narratorMessages.parentToolUseId} IS NOT NULL`,
-			),
-		)
-		.orderBy(asc(narratorMessages.createdAt));
+	const rows = await readQuery(
+		db
+			.select({
+				narratorId: narratorMessages.narratorId,
+				parentToolUseId: narratorMessages.parentToolUseId,
+			})
+			.from(narratorMessages)
+			.where(
+				and(
+					inArray(narratorMessages.narratorId, subagentIds),
+					eq(narratorMessages.role, "user"),
+					sql`${narratorMessages.parentToolUseId} IS NOT NULL`,
+				),
+			)
+			.orderBy(asc(narratorMessages.createdAt)),
+		{ site: "narrator-subagent-recovery.resolveOriginToolUseIds" },
+	);
 
 	for (const row of rows) {
 		if (!row.parentToolUseId || origins.has(row.narratorId)) continue;
@@ -503,21 +516,24 @@ async function prepareAndStartRecovery(input: {
 	const latest = await findLatestTopLevelMessage(narratorId);
 	if (!latest || latest.role !== "assistant") return { recovering: false, items: [] };
 
-	const toolCalls = await db.query.narratorToolCalls.findMany({
-		where: and(
-			eq(narratorToolCalls.narratorId, narratorId),
-			eq(narratorToolCalls.messageId, latest.messageId),
-		),
-		columns: {
-			id: true,
-			toolUseId: true,
-			toolName: true,
-			status: true,
-			inputJson: true,
-			outputJson: true,
-			messageId: true,
-		},
-	});
+	const toolCalls = await readQuery(
+		db.query.narratorToolCalls.findMany({
+			where: and(
+				eq(narratorToolCalls.narratorId, narratorId),
+				eq(narratorToolCalls.messageId, latest.messageId),
+			),
+			columns: {
+				id: true,
+				toolUseId: true,
+				toolName: true,
+				status: true,
+				inputJson: true,
+				outputJson: true,
+				messageId: true,
+			},
+		}),
+		{ site: "narrator-subagent-recovery.prepareAndStartRecovery" },
+	);
 	if (toolCalls.length === 0) return { recovering: false, items: [] };
 
 	const agentToolUseIds = toolCalls
@@ -711,20 +727,23 @@ async function settleUnfinishedCandidates(
 	if (candidates.length === 0) return;
 	let rows: Array<{ id: string; toolUseId: string; status: string; messageId: string | null }>;
 	try {
-		rows = await db
-			.select({
-				id: narratorToolCalls.id,
-				toolUseId: narratorToolCalls.toolUseId,
-				status: narratorToolCalls.status,
-				messageId: narratorToolCalls.messageId,
-			})
-			.from(narratorToolCalls)
-			.where(
-				inArray(
-					narratorToolCalls.id,
-					candidates.map((candidate) => candidate.toolCallId),
+		rows = await readQuery(
+			db
+				.select({
+					id: narratorToolCalls.id,
+					toolUseId: narratorToolCalls.toolUseId,
+					status: narratorToolCalls.status,
+					messageId: narratorToolCalls.messageId,
+				})
+				.from(narratorToolCalls)
+				.where(
+					inArray(
+						narratorToolCalls.id,
+						candidates.map((candidate) => candidate.toolCallId),
+					),
 				),
-			);
+			{ site: "narrator-subagent-recovery.settleUnfinishedCandidates" },
+		);
 	} catch (err) {
 		logger.error("Could not verify recovered tool results before continuing", {
 			narratorId,
@@ -860,10 +879,13 @@ export interface SubagentRecoveryCardEntry extends RecoveryCardCandidate {}
  * cover. Fire-and-forget from `updateStatus`; never throws into the caller.
  */
 export async function persistSubagentRecoveryCard(narratorId: string): Promise<boolean> {
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { id: true, variant: true, turnStartedAt: true },
-	});
+	const narrator = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { id: true, variant: true, turnStartedAt: true },
+		}),
+		{ site: "narrator-subagent-recovery.persistSubagentRecoveryCard" },
+	);
 	if (!narrator || isSubagentVariant(narrator.variant)) return false;
 
 	const turnStartedAtMs = narrator.turnStartedAt ? Date.parse(narrator.turnStartedAt) : Number.NaN;
@@ -876,43 +898,49 @@ export async function persistSubagentRecoveryCard(narratorId: string): Promise<b
 	// only ever be too generous, never too strict (any row whose real failure time is
 	// within the cutoff necessarily has `updatedAt >= cutoff`). The precise decision is
 	// made in-memory by recoveryFailureTimeMs, which prefers the substatus timing tag.
-	const rows = await db.query.narrators.findMany({
-		where: and(
-			eq(narrators.parentNarratorId, narratorId),
-			eq(narrators.status, "idle"),
-			gte(narrators.updatedAt, new Date(cutoffMs).toISOString()),
-		),
-		columns: {
-			id: true,
-			status: true,
-			substatus: true,
-			isBackground: true,
-			title: true,
-			subagentType: true,
-			variant: true,
-			errorMessage: true,
-			traits: true,
-			createdAt: true,
-			updatedAt: true,
-			backgroundCompletedAt: true,
-			backgroundStatus: true,
-		},
-		orderBy: [desc(narrators.updatedAt), desc(narrators.id)],
-		limit: 50,
-	});
+	const rows = await readQuery(
+		db.query.narrators.findMany({
+			where: and(
+				eq(narrators.parentNarratorId, narratorId),
+				eq(narrators.status, "idle"),
+				gte(narrators.updatedAt, new Date(cutoffMs).toISOString()),
+			),
+			columns: {
+				id: true,
+				status: true,
+				substatus: true,
+				isBackground: true,
+				title: true,
+				subagentType: true,
+				variant: true,
+				errorMessage: true,
+				traits: true,
+				createdAt: true,
+				updatedAt: true,
+				backgroundCompletedAt: true,
+				backgroundStatus: true,
+			},
+			orderBy: [desc(narrators.updatedAt), desc(narrators.id)],
+			limit: 50,
+		}),
+		{ site: "narrator-subagent-recovery.persistSubagentRecoveryCard" },
+	);
 	if (rows.length === 0) return false;
 
 	const latest = await findLatestTopLevelMessage(narratorId);
 	const latestTurnToolUseIds = new Set<string>();
 	if (latest?.role === "assistant") {
-		const latestAgentCalls = await db.query.narratorToolCalls.findMany({
-			where: and(
-				eq(narratorToolCalls.narratorId, narratorId),
-				eq(narratorToolCalls.messageId, latest.messageId),
-				eq(narratorToolCalls.toolName, "Agent"),
-			),
-			columns: { toolUseId: true },
-		});
+		const latestAgentCalls = await readQuery(
+			db.query.narratorToolCalls.findMany({
+				where: and(
+					eq(narratorToolCalls.narratorId, narratorId),
+					eq(narratorToolCalls.messageId, latest.messageId),
+					eq(narratorToolCalls.toolName, "Agent"),
+				),
+				columns: { toolUseId: true },
+			}),
+			{ site: "narrator-subagent-recovery.persistSubagentRecoveryCard" },
+		);
 		for (const call of latestAgentCalls) latestTurnToolUseIds.add(call.toolUseId);
 	}
 
@@ -988,10 +1016,13 @@ export async function markRecoveryOffered(
 
 	let existing: Array<{ id: string; traits: unknown }>;
 	try {
-		existing = await db.query.narrators.findMany({
-			where: inArray(narrators.id, [...wanted.keys()]),
-			columns: { id: true, traits: true },
-		});
+		existing = await readQuery(
+			db.query.narrators.findMany({
+				where: inArray(narrators.id, [...wanted.keys()]),
+				columns: { id: true, traits: true },
+			}),
+			{ site: "narrator-subagent-recovery.markRecoveryOffered" },
+		);
 	} catch (err) {
 		logger.warn("Failed to read traits before watermarking offered recovery subagents", {
 			count: wanted.size,
@@ -1010,10 +1041,13 @@ export async function markRecoveryOffered(
 			await narratorTraitsLock.acquire(row.id, async () => {
 				// Re-read INSIDE the lock: the batched read above may be stale by now, and
 				// writing from it would clobber whatever landed in between.
-				const current = await db.query.narrators.findFirst({
-					where: eq(narrators.id, row.id),
-					columns: { traits: true },
-				});
+				const current = await readQuery(
+					db.query.narrators.findFirst({
+						where: eq(narrators.id, row.id),
+						columns: { traits: true },
+					}),
+					{ site: "narrator-subagent-recovery.query" },
+				);
 				if (!current) return;
 				await db
 					.update(narrators)
@@ -1053,15 +1087,18 @@ async function clearBackgroundRunningClaim(
 		// A manual continuation may have won the session while this batch prepared
 		// its row. Never withdraw the claim of that live run.
 		if (getExecutionOwner(subagentId)) return;
-		const task = await db.query.backgroundTasks.findFirst({
-			where: and(
-				eq(backgroundTasks.id, subagentId),
-				eq(backgroundTasks.type, "agent"),
-				eq(backgroundTasks.parentNarratorId, parentNarratorId),
-				eq(backgroundTasks.subagentNarratorId, subagentId),
-			),
-			columns: { id: true },
-		});
+		const task = await readQuery(
+			db.query.backgroundTasks.findFirst({
+				where: and(
+					eq(backgroundTasks.id, subagentId),
+					eq(backgroundTasks.type, "agent"),
+					eq(backgroundTasks.parentNarratorId, parentNarratorId),
+					eq(backgroundTasks.subagentNarratorId, subagentId),
+				),
+				columns: { id: true },
+			}),
+			{ site: "narrator-subagent-recovery.clearBackgroundRunningClaim" },
+		);
 		// Await reads background_tasks first: clearing only the narrator flag leaves
 		// a durable running task with no runner and can hold an await batch open.
 		if (task) await backgroundTaskService.markFailed(subagentId, reason);
@@ -1101,22 +1138,25 @@ export async function resumeRecoverySubagents(input: {
 		for (const subagentId of new Set(input.subagentIds)) {
 			let taskClaimed = false;
 			try {
-				const subagent = await db.query.narrators.findFirst({
-					where: eq(narrators.id, subagentId),
-					columns: {
-						...RUNTIME_SOURCE_COLUMNS,
-						id: true,
-						status: true,
-						substatus: true,
-						createdAt: true,
-						backgroundStatus: true,
-						backgroundCompletedAt: true,
-						isBackground: true,
-						title: true,
-						subagentType: true,
-						traits: true,
-					},
-				});
+				const subagent = await readQuery(
+					db.query.narrators.findFirst({
+						where: eq(narrators.id, subagentId),
+						columns: {
+							...RUNTIME_SOURCE_COLUMNS,
+							id: true,
+							status: true,
+							substatus: true,
+							createdAt: true,
+							backgroundStatus: true,
+							backgroundCompletedAt: true,
+							isBackground: true,
+							title: true,
+							subagentType: true,
+							traits: true,
+						},
+					}),
+					{ site: "narrator-subagent-recovery.query" },
+				);
 				if (!subagent || controllerOf(subagent)?.narratorId !== input.narratorId) {
 					skipped.push({ id: subagentId, reason: "not_controlled" });
 					continue;
@@ -1133,10 +1173,13 @@ export async function resumeRecoverySubagents(input: {
 				}
 				// Re-read the parent's latest turn for each item. A saved card or an
 				// earlier item in this batch must not authorize work from an older turn.
-				const parent = await db.query.narrators.findFirst({
-					where: eq(narrators.id, input.narratorId),
-					columns: { turnStartedAt: true },
-				});
+				const parent = await readQuery(
+					db.query.narrators.findFirst({
+						where: eq(narrators.id, input.narratorId),
+						columns: { turnStartedAt: true },
+					}),
+					{ site: "narrator-subagent-recovery.query" },
+				);
 				const turnStartedAtMs = Date.parse(parent?.turnStartedAt ?? "");
 				if (recoveryFailureTimeInTurn(subagent, turnStartedAtMs) == null) {
 					skipped.push({ id: subagentId, reason: "failure_outside_latest_turn" });
@@ -1223,10 +1266,13 @@ export async function markRecoveryCardResolved(input: {
 	/** Failed starts stay actionable; successful starts must not be restarted twice. */
 	retrySubagentIds?: string[];
 }): Promise<void> {
-	const message = await db.query.narratorMessages.findFirst({
-		where: eq(narratorMessages.id, input.messageId),
-		columns: { id: true, contentJson: true },
-	});
+	const message = await readQuery(
+		db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, input.messageId),
+			columns: { id: true, contentJson: true },
+		}),
+		{ site: "narrator-subagent-recovery.markRecoveryCardResolved" },
+	);
 	if (!message) return;
 	const blocks = Array.isArray(message.contentJson) ? [...message.contentJson] : [];
 	const index = blocks.findIndex(
@@ -1256,9 +1302,12 @@ export async function markRecoveryCardResolved(input: {
 		.prepare("UPDATE narrators SET message_version = message_version + 1 WHERE id = ?")
 		.run(input.narratorId);
 
-	const updated = await db.query.narratorMessages.findFirst({
-		where: eq(narratorMessages.id, input.messageId),
-	});
+	const updated = await readQuery(
+		db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, input.messageId),
+		}),
+		{ site: "narrator-subagent-recovery.markRecoveryCardResolved" },
+	);
 	if (!updated) return;
 	broadcastToNarrator(input.narratorId, {
 		type: "message_updated",
@@ -1314,10 +1363,13 @@ export async function startRecoveryAwaitBatch(input: {
 		},
 	});
 
-	const persisted = await db.query.narratorMessages.findFirst({
-		where: eq(narratorMessages.id, message.id),
-		with: { toolCalls: true },
-	});
+	const persisted = await readQuery(
+		db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, message.id),
+			with: { toolCalls: true },
+		}),
+		{ site: "narrator-subagent-recovery.startRecoveryAwaitBatch" },
+	);
 	const toolCallIdByUseId = new Map<string, string>();
 	for (const call of persisted?.toolCalls ?? []) {
 		toolCallIdByUseId.set(call.toolUseId, call.id);

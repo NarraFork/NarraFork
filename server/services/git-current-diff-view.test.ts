@@ -23,7 +23,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { and, eq } from "drizzle-orm";
 import { Hono } from "hono";
-import { db } from "../db";
+import { db, sqlite } from "../db";
 import {
 	chapters,
 	fileAttributions,
@@ -45,9 +45,11 @@ import { getNarraforkHome } from "../lib/narrafork-home";
 import { safeSpawn } from "../lib/spawn";
 import { gitRoutes } from "../routes/git";
 import { recordAttribution } from "./file-attribution-service";
+import { fileChangeIdentityKey } from "./file-change-identity";
 import { fileChangeLocalIo } from "./file-change-local-io";
 import { LocalFileChangeRuntime, withLocalFileChangeRuntime } from "./file-change-runtime";
 import { gitCurrentBaselineReader } from "./git-current-baseline";
+import { runCurrentDiffRead } from "./git-current-diff-read";
 import { getGitCurrentDiffView } from "./git-current-diff-view";
 import { getWorkspaceModificationView } from "./workspace-modification-view";
 import { createWorkspaceWriteCoordinatorState } from "./workspace-write-coordinator";
@@ -59,6 +61,7 @@ let narratorId: string;
 let userId: string;
 const initial = "first: initial\nkeep: middle\nlast: initial\n";
 const originalSnapshot = gitCurrentBaselineReader.snapshot;
+const originalVerifyBlobs = gitCurrentBaselineReader.verifyBlobs;
 
 beforeAll(() => {
 	expect(process.env.NARRAFORK_TEST).toBe("1");
@@ -92,6 +95,7 @@ beforeEach(async () => {
 });
 afterEach(async () => {
 	gitCurrentBaselineReader.snapshot = originalSnapshot;
+	gitCurrentBaselineReader.verifyBlobs = originalVerifyBlobs;
 	await rm(root, { recursive: true, force: true });
 });
 afterAll(() => {
@@ -215,7 +219,262 @@ async function view() {
 	return getGitCurrentDiffView(workspace, { filePaths: ["a.txt"] });
 }
 
+/** Real SQL evidence cloned from a real write; only worker IO is replaced for timing. */
+async function manyFileFixture(count: number) {
+	await aiWrite("many-file evidence\n");
+	const baseline = await originalSnapshot(
+		workspace,
+		undefined,
+		getNarraforkHome(),
+		new AbortController().signal,
+	);
+	const source = baseline.files[0];
+	const row = db
+		.select()
+		.from(fileChangeEffects)
+		.where(
+			eq(
+				fileChangeEffects.scopeId,
+				db
+					.select()
+					.from(fileChangeScopes)
+					.where(eq(fileChangeScopes.canonicalRoot, workspace))
+					.get()?.id ?? "",
+			),
+		)
+		.get();
+	if (!source || !row?.executionReceiptJson) throw new Error("missing fixture evidence");
+	const projection = db
+		.select()
+		.from(fileAttributions)
+		.where(eq(fileAttributions.effectId, row.id))
+		.get();
+	if (!projection) throw new Error("missing fixture projection");
+	baseline.files = [];
+	for (let index = 0; index < count; index++) {
+		const filePath = `fixture-${index}.txt`;
+		const canonicalPath = join(workspace, filePath);
+		const identity = { ...row.identityJson, canonicalPath, lexicalPath: canonicalPath };
+		const fileKey = fileChangeIdentityKey(identity);
+		const id = generateId();
+		const mutationId = generateId();
+		db.insert(fileChangeEffects)
+			.values({
+				...row,
+				id,
+				mutationId,
+				fileKey,
+				identityJson: identity,
+				executionReceiptJson: { ...row.executionReceiptJson, mutationId },
+			})
+			.run();
+		db.insert(fileAttributions)
+			.values({
+				...projection,
+				id: generateId(),
+				filePath,
+				fileKey,
+				effectId: id,
+			})
+			.run();
+		baseline.files.push({
+			...source,
+			filePath,
+			canonicalPath,
+			status: "MM",
+			indexState: source.worktreeState,
+		});
+	}
+	gitCurrentBaselineReader.snapshot = async () => baseline;
+	gitCurrentBaselineReader.verifyBlobs = async (refs) => refs.map((ref) => ref.digest);
+	return { baseline, scopeId: row.scopeId };
+}
+
 describe("current Git targets matched against actual v2 writes", () => {
+	test("many files deduplicate candidate SQL and immutable actors and service macrotasks", async () => {
+		const { baseline } = await manyFileFixture(84);
+		const queries = spyOn(sqlite, "prepare");
+		let tickServiced = false;
+		const immediate = setImmediate(() => {
+			tickServiced = true;
+		});
+		try {
+			// Exercise the connection-injected worker body separately: each path shares
+			// one candidate across index/worktree (summary, observations, four candidate reads).
+			const snapshot = runCurrentDiffRead(
+				sqlite,
+				{ kind: "git-current-diff-read-v1", baseline },
+				new AbortController().signal,
+			);
+			expect(snapshot.files).toHaveLength(84);
+			expect(snapshot.files?.every((file) => file.candidates.length === 1)).toBe(true);
+			expect(queries.mock.calls).toHaveLength(6 * 84 + 1);
+			queries.mockClear();
+			const result = await view();
+			expect(result.byFile).toHaveLength(84);
+			expect(
+				result.byFile.every(
+					(file) =>
+						file.index.status === "matching_evidence" &&
+						file.worktree.status === "matching_evidence",
+				),
+			).toBe(true);
+			const evidenceQueries = queries.mock.calls.filter(([query]) =>
+				/\b(?:file_change_(?:scopes|effects|operations|blobs)|file_attributions)\b/.test(query),
+			);
+			expect(evidenceQueries).toHaveLength(0);
+			expect(tickServiced).toBe(true);
+		} finally {
+			clearImmediate(immediate);
+			queries.mockRestore();
+		}
+	});
+
+	test("macrotask cancellation interrupts evidence SQL without publishing matches", async () => {
+		await manyFileFixture(200);
+		const controller = new AbortController();
+		const queries = spyOn(sqlite, "prepare");
+		const immediate = setImmediate(() => controller.abort());
+		try {
+			const result = await getGitCurrentDiffView(workspace, { signal: controller.signal });
+			expect(result.byFile).toHaveLength(200);
+			expect(
+				result.byFile.every(
+					(file) => file.index.reason === "cancelled" && file.worktree.reason === "cancelled",
+				),
+			).toBe(true);
+			expect(queries.mock.calls.length).toBeLessThan(7 * 200);
+		} finally {
+			clearImmediate(immediate);
+			queries.mockRestore();
+		}
+	});
+
+	for (const change of ["scope", "observation"] as const) {
+		test(`macrotask ${change} changes invalidate earlier candidates`, async () => {
+			const { scopeId } = await manyFileFixture(84);
+			let changed = false;
+			let immediate: ReturnType<typeof setImmediate> | undefined;
+			const mutate = () => {
+				if (change === "scope") {
+					db.update(fileChangeScopes)
+						.set({ revision: 999 })
+						.where(eq(fileChangeScopes.id, scopeId))
+						.run();
+				} else {
+					db.insert(fileAttributions)
+						.values({
+							id: generateId(),
+							deviceId: "local",
+							workspacePath: workspace,
+							filePath: "fixture-0.txt",
+							action: "external",
+							changedAt: new Date().toISOString(),
+						})
+						.run();
+				}
+				changed = true;
+			};
+			// Queue only after all candidates/initial observations were read, so
+			// the race specifically exercises actor-phase yielding and final rereads.
+			gitCurrentBaselineReader.verifyBlobs = async (refs) => {
+				immediate = setImmediate(mutate);
+				return refs.map((ref) => ref.digest);
+			};
+			try {
+				const result = await view();
+				expect(changed).toBe(true);
+				expect(result.baselineStatus).toBe("stale");
+				expect(
+					result.byFile.every(
+						(file) => file.index.status === "unknown" && file.worktree.status === "unknown",
+					),
+				).toBe(true);
+			} finally {
+				if (immediate) clearImmediate(immediate);
+			}
+		});
+	}
+
+	test("cancellation during actor resolution and the second baseline never publishes matches", async () => {
+		const { baseline } = await manyFileFixture(84);
+		for (const phase of ["actors", "baseline"] as const) {
+			const controller = new AbortController();
+			let immediate: ReturnType<typeof setImmediate> | undefined;
+			let snapshots = 0;
+			gitCurrentBaselineReader.snapshot = async () => {
+				if (++snapshots === 2 && phase === "baseline") controller.abort();
+				return baseline;
+			};
+			gitCurrentBaselineReader.verifyBlobs = async (refs) => {
+				if (phase === "actors") immediate = setImmediate(() => controller.abort());
+				return refs.map((ref) => ref.digest);
+			};
+			try {
+				const result = await getGitCurrentDiffView(workspace, { signal: controller.signal });
+				expect(
+					result.byFile.every(
+						(file) => file.index.reason === "cancelled" && file.worktree.reason === "cancelled",
+					),
+				).toBe(true);
+				expect(snapshots).toBe(phase === "actors" ? 1 : 2);
+			} finally {
+				if (immediate) clearImmediate(immediate);
+			}
+		}
+	});
+
+	for (const count of [75, 84, 200]) {
+		test(`many-file benchmark ${count} MM paths`, async () => {
+			const { baseline } = await manyFileFixture(count);
+			let snapshots = 0;
+			let finalRereadStarted = 0;
+			gitCurrentBaselineReader.snapshot = async () => {
+				if (++snapshots === 2) finalRereadStarted = performance.now();
+				return baseline;
+			};
+			const queries = spyOn(sqlite, "prepare");
+			let last = performance.now();
+			let maxBlockMs = 0;
+			let ticks = 0;
+			let immediate: ReturnType<typeof setImmediate>;
+			const tick = () => {
+				const now = performance.now();
+				maxBlockMs = Math.max(maxBlockMs, now - last);
+				last = now;
+				ticks++;
+				immediate = setImmediate(tick);
+			};
+			const started = last;
+			immediate = setImmediate(tick);
+			try {
+				const result = await view();
+				const finished = performance.now();
+				maxBlockMs = Math.max(maxBlockMs, finished - last);
+				expect(
+					result.byFile.every(
+						(file) =>
+							file.index.status === "matching_evidence" &&
+							file.worktree.status === "matching_evidence",
+					),
+				).toBe(true);
+				if (process.env.NF_CURRENT_DIFF_BENCHMARK === "1")
+					console.log(
+						JSON.stringify({
+							count,
+							queries: queries.mock.calls.length,
+							elapsedMs: finished - started,
+							maxBlockMs,
+							finalRereadMs: finished - finalRereadStarted,
+							ticks,
+						}),
+					);
+			} finally {
+				clearImmediate(immediate);
+				queries.mockRestore();
+			}
+		});
+	}
 	test("real AI Write and editor another hunk name only the latest matching after, not all contributors", async () => {
 		await aiWrite(initial.replace("first: initial", "first: AI"));
 		const ai = await view();

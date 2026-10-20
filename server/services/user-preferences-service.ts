@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 import { and, count as countFn, eq, inArray, isNull } from "drizzle-orm";
 import { db } from "../db";
 import { containerInstances, narrators, terminals } from "../db/schema";
@@ -45,14 +46,16 @@ export async function enrichTabs(
 	if (narratorIds.length > 0) {
 		// Narrator status + current user's private draft markers
 		const [rows, draftNarratorIds] = await Promise.all([
-			db
-				.select({
-					id: narrators.id,
-					status: narrators.status,
-					substatus: narrators.substatus,
-				})
-				.from(narrators)
-				.where(inArray(narrators.id, narratorIds)),
+			readQuery(
+				db
+					.select({
+						id: narrators.id,
+						status: narrators.status,
+						substatus: narrators.substatus,
+					})
+					.from(narrators)
+					.where(inArray(narrators.id, narratorIds)),
+			),
 			getNarratorIdsWithDraft(userId, narratorIds),
 		]);
 		const narratorMap = new Map(rows.map((r) => [r.id, r]));
@@ -71,14 +74,16 @@ export async function enrichTabs(
 		}
 
 		// Active terminal counts
-		const termRows = await db
-			.select({
-				narratorId: terminals.narratorId,
-				count: countFn(),
-			})
-			.from(terminals)
-			.where(and(inArray(terminals.narratorId, narratorIds), eq(terminals.status, "running")))
-			.groupBy(terminals.narratorId);
+		const termRows = await readQuery(
+			db
+				.select({
+					narratorId: terminals.narratorId,
+					count: countFn(),
+				})
+				.from(terminals)
+				.where(and(inArray(terminals.narratorId, narratorIds), eq(terminals.status, "running")))
+				.groupBy(terminals.narratorId),
+		);
 		const termCountMap = new Map(termRows.map((r) => [r.narratorId, r.count]));
 		for (const tab of tabs) {
 			const nId = getTabNarratorId(tab);
@@ -125,18 +130,20 @@ export async function enrichTabs(
 	// Container status for chapter tabs
 	const chapterIds = tabs.filter((t) => t.type === "chapter").map((t) => t.id as string);
 	if (chapterIds.length > 0) {
-		const containerRows = await db
-			.select({
-				chapterId: containerInstances.chapterId,
-				status: containerInstances.status,
-			})
-			.from(containerInstances)
-			.where(
-				and(
-					inArray(containerInstances.chapterId, chapterIds),
-					isNull(containerInstances.worktreeResourceId),
+		const containerRows = await readQuery(
+			db
+				.select({
+					chapterId: containerInstances.chapterId,
+					status: containerInstances.status,
+				})
+				.from(containerInstances)
+				.where(
+					and(
+						inArray(containerInstances.chapterId, chapterIds),
+						isNull(containerInstances.worktreeResourceId),
+					),
 				),
-			);
+		);
 
 		const containerStatusMap = new Map<string, string>();
 		for (const row of containerRows) {

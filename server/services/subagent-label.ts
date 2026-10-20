@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 /**
  * subagent-label.ts — the ONE rule turning a subagent narrator id into the
  * human/model-facing label that Await, Send, Agent and TeamStatus print.
@@ -122,12 +123,12 @@ async function loadLabelSources(subagentId: string): Promise<{
 	taskAlias: string | null;
 }> {
 	const [{ db }, schema] = await Promise.all([import("../db"), import("../db/schema")]);
-	const narrator = await db.query.narrators
-		.findFirst({
+	const narrator = await readQuery(
+		db.query.narrators.findFirst({
 			where: eq(schema.narrators.id, subagentId),
 			columns: { id: true, title: true, traits: true },
-		})
-		.catch(() => undefined);
+		}),
+	).catch(() => undefined);
 	if (narrator) {
 		const fromNarrator = agentLabelFromNarrator(narrator);
 		// A trait/title alias is already authoritative; skip the second query.
@@ -136,12 +137,12 @@ async function loadLabelSources(subagentId: string): Promise<{
 		}
 	}
 	// An agent background task row shares the subagent's id (see createAgentTask).
-	const task = await db.query.backgroundTasks
-		.findFirst({
+	const task = await readQuery(
+		db.query.backgroundTasks.findFirst({
 			where: eq(schema.backgroundTasks.id, subagentId),
 			columns: { alias: true },
-		})
-		.catch(() => undefined);
+		}),
+	).catch(() => undefined);
 	return { narrator: narrator ?? null, taskAlias: task?.alias ?? null };
 }
 

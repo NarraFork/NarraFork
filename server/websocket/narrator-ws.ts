@@ -1,3 +1,4 @@
+import { readQuery, readQueryFirst } from "@server/db/worker-read";
 import { HUMAN_ATTENTION_CHANGED_WS_TYPE } from "@shared/human-attention";
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
 import { NOTIFICATION_CENTER_CHANGED_WS_TYPE } from "@shared/notification-center";
@@ -847,10 +848,12 @@ async function authorizeReadableNarrators(
 	for (const narratorId of new Set(narratorIds)) {
 		let ok = false;
 		try {
-			const row = await db.query.narrators.findFirst({
-				where: eq(narrators.id, narratorId),
-				columns: NARRATOR_ACL_COLUMNS,
-			});
+			const row = await readQuery(
+				db.query.narrators.findFirst({
+					where: eq(narrators.id, narratorId),
+					columns: NARRATOR_ACL_COLUMNS,
+				}),
+			);
 			ok = row ? await canReadNarrator(row, principal) : false;
 		} catch (err) {
 			logger.warn("Narrator subscribe authorization failed", {
@@ -969,10 +972,12 @@ async function authorizeMergeDecisionFrame(
 	if (!userId) return false;
 	const principal = { userId, isAdmin: ws.data.userRole === "admin" };
 	try {
-		const session = await db.query.mergeSessions.findFirst({
-			where: eq(mergeSessions.id, mergeSessionId),
-			columns: { targetChapterId: true },
-		});
+		const session = await readQuery(
+			db.query.mergeSessions.findFirst({
+				where: eq(mergeSessions.id, mergeSessionId),
+				columns: { targetChapterId: true },
+			}),
+		);
 		if (!session?.targetChapterId) return false;
 		// Throws NotFoundError when the caller may not reach the project.
 		await assertChapterProjectAccess(session.targetChapterId, principal, "write");
@@ -992,10 +997,12 @@ async function authorizeNarratorId(
 	principal: { userId: string; isAdmin: boolean },
 	need: "read" | "write",
 ): Promise<boolean> {
-	const row = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: NARRATOR_ACL_COLUMNS,
-	});
+	const row = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: NARRATOR_ACL_COLUMNS,
+		}),
+	);
 	if (!row) return false;
 	return need === "write"
 		? await canWriteNarrator(row, principal)
@@ -1032,15 +1039,17 @@ type NarratorStatusRow = {
 
 async function loadStatusRows(narratorIds: string[]): Promise<NarratorStatusRow[]> {
 	if (narratorIds.length === 0) return [];
-	return db
-		.select({
-			id: narrators.id,
-			status: narrators.status,
-			substatus: narrators.substatus,
-			turnStartedAt: narrators.turnStartedAt,
-		})
-		.from(narrators)
-		.where(inArray(narrators.id, narratorIds));
+	return readQuery(
+		db
+			.select({
+				id: narrators.id,
+				status: narrators.status,
+				substatus: narrators.substatus,
+				turnStartedAt: narrators.turnStartedAt,
+			})
+			.from(narrators)
+			.where(inArray(narrators.id, narratorIds)),
+	);
 }
 
 function toListStateSnapshotItem(row: NarratorStatusRow): NarratorListStateSnapshotItem {
@@ -1368,10 +1377,12 @@ export async function dropNarratorSubscriptionsForUnauthorizedUsers(
 	narratorId: string,
 ): Promise<void> {
 	editorFileSubscriptions.hint(narratorId);
-	const row = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: NARRATOR_ACL_COLUMNS,
-	});
+	const row = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: NARRATOR_ACL_COLUMNS,
+		}),
+	);
 
 	const verdicts = new Map<string, boolean>();
 	for (const ws of connections) {
@@ -1558,10 +1569,12 @@ async function broadcastToProjectReaders(
 		if (allowed === undefined) {
 			const role = [...userConnections][0]?.data.userRole;
 			try {
-				const row = await db.query.projects.findFirst({
-					where: eq(projects.id, projectId),
-					columns: { id: true, ownerUserId: true, visibility: true },
-				});
+				const row = await readQuery(
+					db.query.projects.findFirst({
+						where: eq(projects.id, projectId),
+						columns: { id: true, ownerUserId: true, visibility: true },
+					}),
+				);
 				allowed = row ? await canReadProject(row, { userId, isAdmin: role === "admin" }) : false;
 			} catch (err) {
 				logger.warn("Project-scoped broadcast authorization failed", {
@@ -1598,10 +1611,12 @@ async function resolveChapterProjectId(chapterId: string): Promise<string | null
 	if (cached !== undefined) return cached;
 	let projectId: string | null = null;
 	try {
-		const row = await db.query.chapters.findFirst({
-			where: eq(chapters.id, chapterId),
-			columns: { projectId: true },
-		});
+		const row = await readQuery(
+			db.query.chapters.findFirst({
+				where: eq(chapters.id, chapterId),
+				columns: { projectId: true },
+			}),
+		);
 		projectId = row?.projectId ?? null;
 	} catch (err) {
 		logger.warn("Chapter project lookup failed for scoped broadcast", {
@@ -1642,11 +1657,12 @@ const pendingTerminalBroadcasts = new Map<string, ReturnType<typeof setTimeout>>
 
 async function broadcastTerminalCount(narratorId: string | null) {
 	if (!narratorId) return;
-	const row = await db
-		.select({ count: countFn() })
-		.from(terminals)
-		.where(and(eq(terminals.narratorId, narratorId), eq(terminals.status, "running")))
-		.get();
+	const row = await readQueryFirst(
+		db
+			.select({ count: countFn() })
+			.from(terminals)
+			.where(and(eq(terminals.narratorId, narratorId), eq(terminals.status, "running"))),
+	);
 	broadcastToNarrator(narratorId, {
 		type: "terminal_count_changed",
 		narratorId,
@@ -1672,10 +1688,12 @@ function debouncedTerminalCount(narratorId: string | null) {
  * broadcast terminal_count_changed to all narrators bound to that chapter.
  */
 async function broadcastTerminalCountByChapter(chapterId: string) {
-	const chapterNarrators = await db.query.narrators.findMany({
-		where: eq(narrators.chapterId, chapterId),
-		columns: { id: true },
-	});
+	const chapterNarrators = await readQuery(
+		db.query.narrators.findMany({
+			where: eq(narrators.chapterId, chapterId),
+			columns: { id: true },
+		}),
+	);
 	for (const n of chapterNarrators) {
 		broadcastTerminalCount(n.id);
 	}
@@ -1750,16 +1768,20 @@ const pendingContainerBroadcasts = new Map<string, ReturnType<typeof setTimeout>
 
 async function broadcastContainerStatus(chapterId: string) {
 	// A chapter may have multiple narrators — broadcast to all of them.
-	const chapterNarrators = await db.query.narrators.findMany({
-		where: eq(narrators.chapterId, chapterId),
-		columns: { id: true },
-	});
+	const chapterNarrators = await readQuery(
+		db.query.narrators.findMany({
+			where: eq(narrators.chapterId, chapterId),
+			columns: { id: true },
+		}),
+	);
 	if (chapterNarrators.length === 0) return;
 
-	const rows = await db
-		.select({ status: containerInstances.status })
-		.from(containerInstances)
-		.where(eq(containerInstances.chapterId, chapterId));
+	const rows = await readQuery(
+		db
+			.select({ status: containerInstances.status })
+			.from(containerInstances)
+			.where(eq(containerInstances.chapterId, chapterId)),
+	);
 
 	let bestStatus: string | null = null;
 	let bestPriority = -1;
@@ -2344,7 +2366,7 @@ export const handleNarratorWS = {
 				// Cancelling queued input must also drop a pending post-tool soft stop,
 				// otherwise the running turn ends at the next tool boundary with nothing
 				// to resume.
-				clearBufferedMessageSoftStopIfIdle(msg.narratorId);
+				await clearBufferedMessageSoftStopIfIdle(msg.narratorId);
 				broadcastToNarrator(msg.narratorId, {
 					type: "buffer_cleared",
 					narratorId: msg.narratorId,
@@ -2360,7 +2382,7 @@ export const handleNarratorWS = {
 			case "remove_buffer": {
 				const ok = await removeBufferedMessage(msg.narratorId, msg.messageId);
 				if (ok) {
-					clearBufferedMessageSoftStopIfIdle(msg.narratorId);
+					await clearBufferedMessageSoftStopIfIdle(msg.narratorId);
 					await broadcastBufferQueueForNarrator(msg.narratorId);
 				}
 				break;

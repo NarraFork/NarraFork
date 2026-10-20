@@ -211,8 +211,8 @@ describe("a user-continued run delivers its own result once", () => {
 				if (status === "cancelled")
 					await controlRun("notice-child", { kind: "cancel", reason: "Stopped by user" });
 				await handle.terminal;
-				runtimePublication.flushRecipient("notice-parent");
-				runtimePublication.flushRecipient("notice-parent");
+				await runtimePublication.flushRecipient("notice-parent");
+				await runtimePublication.flushRecipient("notice-parent");
 				const rows = db
 					.select()
 					.from(narratorBufferedMessages)

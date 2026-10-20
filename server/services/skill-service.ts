@@ -13,6 +13,7 @@ import {
 } from "node:fs/promises";
 import { homedir } from "node:os";
 import { basename, dirname, join, relative, resolve } from "node:path";
+import { readQuery } from "@server/db/worker-read";
 import { and, asc, count, eq, inArray, lt } from "drizzle-orm";
 import matter from "gray-matter";
 import { db } from "../db";
@@ -698,16 +699,18 @@ async function discoverSkillFiles(rootPath: string): Promise<DiscoveryResult> {
 }
 
 async function getRootCache(root: SkillRootInfo) {
-	const rows = await db
-		.select()
-		.from(skillDirectoryCaches)
-		.where(
-			and(
-				eq(skillDirectoryCaches.rootKind, root.rootKind),
-				eq(skillDirectoryCaches.normalizedRootPath, root.normalizedRootPath),
-			),
-		)
-		.limit(1);
+	const rows = await readQuery(
+		db
+			.select()
+			.from(skillDirectoryCaches)
+			.where(
+				and(
+					eq(skillDirectoryCaches.rootKind, root.rootKind),
+					eq(skillDirectoryCaches.normalizedRootPath, root.normalizedRootPath),
+				),
+			)
+			.limit(1),
+	);
 	return rows[0] ?? null;
 }
 
@@ -893,10 +896,12 @@ async function applyProjectRoutineSkillOverrides<T extends { name: string; locat
 	projectGitPath: string | null | undefined,
 ): Promise<T[]> {
 	if (!projectGitPath) return skills;
-	const project = await db.query.projects.findFirst({
-		where: eq(projects.gitPath, projectGitPath),
-		columns: { chapterSettings: true },
-	});
+	const project = await readQuery(
+		db.query.projects.findFirst({
+			where: eq(projects.gitPath, projectGitPath),
+			columns: { chapterSettings: true },
+		}),
+	);
 	let config: unknown = project?.chapterSettings;
 	if (typeof config === "string") {
 		try {
@@ -965,25 +970,31 @@ export async function loadSkillByNameForContext(
 }
 
 export async function resolveSkillContextForNarrator(narratorId: string): Promise<SkillContext> {
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { chapterId: true, contextProjectId: true, cwd: true },
-	});
+	const narrator = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { chapterId: true, contextProjectId: true, cwd: true },
+		}),
+	);
 	if (!narrator) throw new NotFoundError("Narrator", narratorId);
 
 	// Use the same explicit project resolution as ACL/traits; cwd never implies membership.
 	const projectId = await resolveNarratorProjectId(narrator);
 	const chapter = narrator.chapterId
-		? await db.query.chapters.findFirst({
-				where: eq(chapters.id, narrator.chapterId),
-				columns: { worktreePath: true },
-			})
+		? await readQuery(
+				db.query.chapters.findFirst({
+					where: eq(chapters.id, narrator.chapterId),
+					columns: { worktreePath: true },
+				}),
+			)
 		: null;
 	const project = projectId
-		? await db.query.projects.findFirst({
-				where: eq(projects.id, projectId),
-				columns: { gitPath: true },
-			})
+		? await readQuery(
+				db.query.projects.findFirst({
+					where: eq(projects.id, projectId),
+					columns: { gitPath: true },
+				}),
+			)
 		: null;
 	const projectGitPath = project?.gitPath ?? null;
 	return {
@@ -1094,10 +1105,12 @@ export async function readSkillFile(skillLocation: string, filePath: string): Pr
 
 export async function cleanupSkillDirectoryCaches(): Promise<{ expired: number; lru: number }> {
 	const nowIso = new Date().toISOString();
-	const expiredRows = await db
-		.select({ id: skillDirectoryCaches.id })
-		.from(skillDirectoryCaches)
-		.where(lt(skillDirectoryCaches.expiresAt, nowIso));
+	const expiredRows = await readQuery(
+		db
+			.select({ id: skillDirectoryCaches.id })
+			.from(skillDirectoryCaches)
+			.where(lt(skillDirectoryCaches.expiresAt, nowIso)),
+	);
 	if (expiredRows.length > 0) {
 		await db.delete(skillDirectoryCaches).where(
 			inArray(
@@ -1107,17 +1120,19 @@ export async function cleanupSkillDirectoryCaches(): Promise<{ expired: number; 
 		);
 	}
 
-	const [{ value: total = 0 } = { value: 0 }] = await db
-		.select({ value: count() })
-		.from(skillDirectoryCaches);
+	const [{ value: total = 0 } = { value: 0 }] = await readQuery(
+		db.select({ value: count() }).from(skillDirectoryCaches),
+	);
 	const overLimit = Math.max(0, total - MAX_SKILL_CACHE_ROOTS);
 	let lru = 0;
 	if (overLimit > 0) {
-		const rows = await db
-			.select({ id: skillDirectoryCaches.id })
-			.from(skillDirectoryCaches)
-			.orderBy(asc(skillDirectoryCaches.lastAccessedAt))
-			.limit(overLimit);
+		const rows = await readQuery(
+			db
+				.select({ id: skillDirectoryCaches.id })
+				.from(skillDirectoryCaches)
+				.orderBy(asc(skillDirectoryCaches.lastAccessedAt))
+				.limit(overLimit),
+		);
 		if (rows.length > 0) {
 			await db.delete(skillDirectoryCaches).where(
 				inArray(

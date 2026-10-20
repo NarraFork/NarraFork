@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 import {
 	CANONICAL_CAPABILITY_DESCRIPTORS,
 	type CanonicalCapabilityId,
@@ -561,9 +562,12 @@ export class IntegrationAuthorityService {
 		options: { includeExpired?: boolean } = {},
 	): Promise<IntegrationAuthoritySnapshot | null> {
 		const id = normalizeId(authorityId, "authorityId");
-		const storedAuthority = await db.query.integrationAuthorities.findFirst({
-			where: eq(integrationAuthorities.id, id),
-		});
+		const storedAuthority = await readQuery(
+			db.query.integrationAuthorities.findFirst({
+				where: eq(integrationAuthorities.id, id),
+			}),
+			{ site: "server/services/integration-authority-service.read" },
+		);
 		if (!storedAuthority) return null;
 		const now = new Date().toISOString();
 		const authority =
@@ -572,27 +576,30 @@ export class IntegrationAuthorityService {
 			storedAuthority.expiresAt <= now
 				? { ...storedAuthority, state: "expired" as const }
 				: storedAuthority;
-		const grants = await db.query.integrationCapabilityGrants.findMany({
-			where: options.includeExpired
-				? and(
-						eq(integrationCapabilityGrants.authorityId, id),
-						isNull(integrationCapabilityGrants.revokedAt),
-					)
-				: and(
-						eq(integrationCapabilityGrants.authorityId, id),
-						isNull(integrationCapabilityGrants.revokedAt),
-						or(
-							isNull(integrationCapabilityGrants.expiresAt),
-							gt(integrationCapabilityGrants.expiresAt, now),
+		const grants = await readQuery(
+			db.query.integrationCapabilityGrants.findMany({
+				where: options.includeExpired
+					? and(
+							eq(integrationCapabilityGrants.authorityId, id),
+							isNull(integrationCapabilityGrants.revokedAt),
+						)
+					: and(
+							eq(integrationCapabilityGrants.authorityId, id),
+							isNull(integrationCapabilityGrants.revokedAt),
+							or(
+								isNull(integrationCapabilityGrants.expiresAt),
+								gt(integrationCapabilityGrants.expiresAt, now),
+							),
 						),
-					),
-			orderBy: [
-				asc(integrationCapabilityGrants.capabilityId),
-				asc(integrationCapabilityGrants.scopeKey),
-				asc(integrationCapabilityGrants.id),
-			],
-			limit: MAX_GRANTS_PER_AUTHORITY + 1,
-		});
+				orderBy: [
+					asc(integrationCapabilityGrants.capabilityId),
+					asc(integrationCapabilityGrants.scopeKey),
+					asc(integrationCapabilityGrants.id),
+				],
+				limit: MAX_GRANTS_PER_AUTHORITY + 1,
+			}),
+			{ site: "server/services/integration-authority-service.read" },
+		);
 		if (grants.length > MAX_GRANTS_PER_AUTHORITY) {
 			throw new AppError(
 				"Integration authority grant limit was exceeded",
@@ -908,22 +915,25 @@ export class IntegrationAuthorityService {
 	}): Promise<IntegrationAuthoritySnapshot[]> {
 		const integrationId = normalizeId(input.integrationId, "integrationId");
 		const integrationType = integrationTypeFor(input.kind);
-		const authorities = await db.query.integrationAuthorities.findMany({
-			where: input.includeRevoked
-				? and(
-						eq(integrationAuthorities.kind, input.kind),
-						eq(integrationAuthorities.integrationType, integrationType),
-						eq(integrationAuthorities.integrationId, integrationId),
-					)
-				: and(
-						eq(integrationAuthorities.kind, input.kind),
-						eq(integrationAuthorities.integrationType, integrationType),
-						eq(integrationAuthorities.integrationId, integrationId),
-						eq(integrationAuthorities.state, "active"),
-					),
-			orderBy: [asc(integrationAuthorities.createdAt), asc(integrationAuthorities.id)],
-			limit: MAX_GRANTS_PER_AUTHORITY + 1,
-		});
+		const authorities = await readQuery(
+			db.query.integrationAuthorities.findMany({
+				where: input.includeRevoked
+					? and(
+							eq(integrationAuthorities.kind, input.kind),
+							eq(integrationAuthorities.integrationType, integrationType),
+							eq(integrationAuthorities.integrationId, integrationId),
+						)
+					: and(
+							eq(integrationAuthorities.kind, input.kind),
+							eq(integrationAuthorities.integrationType, integrationType),
+							eq(integrationAuthorities.integrationId, integrationId),
+							eq(integrationAuthorities.state, "active"),
+						),
+				orderBy: [asc(integrationAuthorities.createdAt), asc(integrationAuthorities.id)],
+				limit: MAX_GRANTS_PER_AUTHORITY + 1,
+			}),
+			{ site: "server/services/integration-authority-service.read" },
+		);
 		if (authorities.length > MAX_GRANTS_PER_AUTHORITY) {
 			throw new AppError(
 				"Integration authority limit was exceeded",

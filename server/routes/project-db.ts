@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
 import { resolve } from "node:path";
+import { readQuery } from "@server/db/worker-read";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../db";
@@ -21,10 +22,12 @@ projectDbRoutes.post("/:id/backup/sync", async (c) => {
 	// contains everything in it.
 	await requireProjectAccess(c, c.req.param("id"), "manage");
 	const id = c.req.param("id");
-	const project = await db.query.projects.findFirst({
-		where: eq(projects.id, id),
-		columns: { id: true, gitPath: true },
-	});
+	const project = await readQuery(
+		db.query.projects.findFirst({
+			where: eq(projects.id, id),
+			columns: { id: true, gitPath: true },
+		}),
+	);
 	if (!project) throw new NotFoundError("Project", id);
 	if (!project.gitPath) throw new ValidationError("Project has no git path configured");
 
@@ -43,10 +46,12 @@ projectDbRoutes.post("/:id/backup/sync", async (c) => {
 projectDbRoutes.get("/:id/backup/status", async (c) => {
 	await requireProjectAccess(c, c.req.param("id"), "read");
 	const id = c.req.param("id");
-	const project = await db.query.projects.findFirst({
-		where: eq(projects.id, id),
-		columns: { id: true, gitPath: true },
-	});
+	const project = await readQuery(
+		db.query.projects.findFirst({
+			where: eq(projects.id, id),
+			columns: { id: true, gitPath: true },
+		}),
+	);
 	if (!project) throw new NotFoundError("Project", id);
 
 	const dbPath = project.gitPath ? getProjectDbPath(project.gitPath) : null;

@@ -8,6 +8,11 @@ import {
 	validateStreamingEditOrigin,
 } from "@shared/streaming-edit-origin";
 import { z } from "zod/v4";
+import {
+	ShutdownActivityTracker,
+	shutdownStep,
+	waitForShutdownWork,
+} from "../../shutdown-activity";
 import type { ProviderAdapter } from "../provider";
 import { toolRegistry } from "../tool-registry";
 import type { AgentConfig, AgentEvent } from "../types";
@@ -803,8 +808,10 @@ describe("per-response tool call limit", () => {
 
 	test("abort inside a batch ignores cached provider calls and preserves finished results", async () => {
 		const controller = new AbortController();
+		const finished = gate();
 		script = async function* () {
 			yield { toolUses: [tool("Read", "finished", 0)] };
+			await finished.promise;
 			await nextTick();
 			yield {
 				toolUses: Array.from({ length: 711 }, (_, i) => tool("Read", `buffered-${i}`, i + 1)),
@@ -812,14 +819,17 @@ describe("per-response tool call limit", () => {
 			// Deliberately ignores params.signal, like an already decoded SSE buffer.
 			yield { toolUses: [tool("Read", "cached-late", 999)] };
 		};
-		const events = await run({ signal: controller.signal }, (event) => {
-			if (
-				event.type === "block_complete" &&
-				event.block.type === "tool_use" &&
-				event.block.toolUseId === "buffered-0"
-			)
-				controller.abort();
-		});
+		const events = await run(
+			{ signal: controller.signal, onToolExecutionAfter: () => finished.resolve() },
+			(event) => {
+				if (
+					event.type === "block_complete" &&
+					event.block.type === "tool_use" &&
+					event.block.toolUseId === "buffered-0"
+				)
+					controller.abort();
+			},
+		);
 		expect(started).toEqual(["finished"]);
 		expect(
 			events.filter((event) => event.type === "tool_result" && event.toolUseId === "finished"),
@@ -1184,7 +1194,7 @@ describe("ordered streaming tool scheduling", () => {
 				if (ending === "stream-error") throw new Error("stream failed after side effect");
 				yield { text: "stop boundary" };
 			};
-			const events = await run({ signal: ac.signal, shouldStop: () => stopped });
+			const events = await run({ signal: ac.signal, shouldStop: async () => stopped });
 			expect(started).toEqual(["write"]);
 			expect(
 				events.filter((event) => event.type === "tool_result" && event.toolUseId === "write")
@@ -1300,6 +1310,68 @@ describe("detached eager tool results after interruption", () => {
 				expect(started).toEqual(["write"]);
 			} finally {
 				write.release();
+			}
+		});
+	}
+
+	for (const outcome of ["ok", "failed", "timeout"] as const) {
+		test(`shutdown owns detached execution and persistence after consumer exit: ${outcome}`, async () => {
+			const ac = new AbortController();
+			const write = watch("write", true);
+			const persistEntered = gate();
+			const finishPersist = gate();
+			const owned: Promise<void>[] = [];
+			const failure = new Error("detached persistence failed");
+			const tracker = new ShutdownActivityTracker();
+			tracker.markDrainComplete();
+			script = async function* () {
+				yield { toolUses: [tool("Write", "write", 0)] };
+				await write.started;
+				ac.abort();
+				throw new Error("Aborted");
+			};
+			try {
+				const events = await run({
+					signal: ac.signal,
+					trackDetachedToolResult: (work) => {
+						owned.push(work);
+						return work;
+					},
+					onDetachedToolResult: async () => {
+						persistEntered.resolve();
+						await finishPersist.promise;
+						if (outcome === "failed") throw failure;
+					},
+				});
+				// Ordinary interruption returns before either execution or persistence finishes.
+				expect(events.at(-1)).toMatchObject({ type: "error", message: "Aborted" });
+				expect(owned).toHaveLength(1);
+				let drained = false;
+				const reported: unknown[] = [];
+				const draining = shutdownStep(
+					tracker,
+					"producers.drain",
+					(signal) => waitForShutdownWork(Promise.all(owned), signal),
+					outcome === "timeout" ? 20 : 1000,
+					(_status, error) => reported.push(error),
+				).then((status) => {
+					drained = true;
+					return status;
+				});
+				await nextTick();
+				expect(drained).toBe(false);
+				write.release();
+				await persistEntered.promise;
+				await nextTick();
+				expect(drained).toBe(false);
+				if (outcome !== "timeout") finishPersist.resolve();
+				expect(await draining).toBe(outcome);
+				expect(tracker.isCleanShutdown()).toBe(outcome === "ok");
+				if (outcome === "failed") expect(reported).toEqual([failure]);
+			} finally {
+				write.release();
+				finishPersist.resolve();
+				await Promise.allSettled(owned);
 			}
 		});
 	}

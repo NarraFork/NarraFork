@@ -7,6 +7,7 @@
  * additionally restricts the whole surface to admins, mirroring devices.ts.
  */
 import { randomBytes } from "node:crypto";
+import { readQuery } from "@server/db/worker-read";
 import { eq, isNull } from "drizzle-orm";
 import { Hono } from "hono";
 import { z } from "zod";
@@ -110,11 +111,13 @@ oauthAppRoutes.use("*", requireAdmin);
 
 // List all non-revoked OAuth clients.
 oauthAppRoutes.get("/", async (c) => {
-	const rows = await db.query.oauthClients.findMany({
-		where: isNull(oauthClients.revokedAt),
-		orderBy: (t, { asc }) => [asc(t.createdAt)],
-		limit: 100,
-	});
+	const rows = await readQuery(
+		db.query.oauthClients.findMany({
+			where: isNull(oauthClients.revokedAt),
+			orderBy: (t, { asc }) => [asc(t.createdAt)],
+			limit: 100,
+		}),
+	);
 	return c.json(rows.map(toClientView));
 });
 
@@ -125,9 +128,11 @@ oauthAppRoutes.post("/import", async (c) => {
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 
 	const manifest = parsed.data;
-	const existing = await db.query.oauthClients.findFirst({
-		where: eq(oauthClients.clientId, manifest.clientId),
-	});
+	const existing = await readQuery(
+		db.query.oauthClients.findFirst({
+			where: eq(oauthClients.clientId, manifest.clientId),
+		}),
+	);
 	const now = new Date().toISOString();
 	if (!existing) {
 		const [row] = await db
@@ -198,10 +203,12 @@ oauthAppRoutes.post("/", async (c) => {
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 
 	const clientId = parsed.data.clientId ?? generateClientId();
-	const duplicate = await db.query.oauthClients.findFirst({
-		where: eq(oauthClients.clientId, clientId),
-		columns: { id: true },
-	});
+	const duplicate = await readQuery(
+		db.query.oauthClients.findFirst({
+			where: eq(oauthClients.clientId, clientId),
+			columns: { id: true },
+		}),
+	);
 	if (duplicate) throw new ValidationError("OAuth clientId is already registered");
 
 	const now = new Date().toISOString();
@@ -226,9 +233,11 @@ oauthAppRoutes.post("/", async (c) => {
 
 // Export the portable registration data only; no runtime metadata or secrets.
 oauthAppRoutes.get("/:id/export", async (c) => {
-	const existing = await db.query.oauthClients.findFirst({
-		where: eq(oauthClients.id, c.req.param("id")),
-	});
+	const existing = await readQuery(
+		db.query.oauthClients.findFirst({
+			where: eq(oauthClients.id, c.req.param("id")),
+		}),
+	);
 	if (!existing || existing.revokedAt) throw new ValidationError("OAuth client not found");
 	return c.json(exportOAuthClientManifest(existing));
 });
@@ -238,9 +247,11 @@ oauthAppRoutes.patch("/:id", async (c) => {
 	const parsed = updateOAuthClientSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 
-	const existing = await db.query.oauthClients.findFirst({
-		where: eq(oauthClients.id, c.req.param("id")),
-	});
+	const existing = await readQuery(
+		db.query.oauthClients.findFirst({
+			where: eq(oauthClients.id, c.req.param("id")),
+		}),
+	);
 	if (!existing || existing.revokedAt) throw new ValidationError("OAuth client not found");
 
 	const { policy: policyPatch, ...clientPatch } = parsed.data;
@@ -277,9 +288,11 @@ oauthAppRoutes.patch("/:id", async (c) => {
 
 // Soft-revoke a client: every flow (authorize/token/refresh) rejects it.
 oauthAppRoutes.delete("/:id", async (c) => {
-	const existing = await db.query.oauthClients.findFirst({
-		where: eq(oauthClients.id, c.req.param("id")),
-	});
+	const existing = await readQuery(
+		db.query.oauthClients.findFirst({
+			where: eq(oauthClients.id, c.req.param("id")),
+		}),
+	);
 	if (!existing || existing.revokedAt) throw new ValidationError("OAuth client not found");
 
 	const now = new Date().toISOString();

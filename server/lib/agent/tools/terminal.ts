@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 import { eq } from "drizzle-orm";
 import { z } from "zod/v4";
 import { db } from "../../../db";
@@ -73,10 +74,12 @@ async function assertTerminalAccess(
 	| { allowed: true; terminal: { id: string; name: string; status: string | null } }
 	| { allowed: false; error: string }
 > {
-	const terminal = await db.query.terminals.findFirst({
-		where: eq(terminals.id, terminalId),
-		columns: { id: true, name: true, status: true, narratorId: true, chapterId: true },
-	});
+	const terminal = await readQuery(
+		db.query.terminals.findFirst({
+			where: eq(terminals.id, terminalId),
+			columns: { id: true, name: true, status: true, narratorId: true, chapterId: true },
+		}),
+	);
 	if (!terminal) {
 		return { allowed: false, error: `Terminal not found: ${terminalId}` };
 	}
@@ -92,10 +95,12 @@ async function assertTerminalAccess(
 		const narratorChapterId =
 			cachedChapterId ??
 			(
-				await db.query.narrators.findFirst({
-					where: eq(narrators.id, narratorId),
-					columns: { chapterId: true },
-				})
+				await readQuery(
+					db.query.narrators.findFirst({
+						where: eq(narrators.id, narratorId),
+						columns: { chapterId: true },
+					}),
+				)
 			)?.chapterId;
 		if (narratorChapterId && narratorChapterId === terminal.chapterId) {
 			return { allowed: true, terminal };
@@ -119,33 +124,41 @@ async function resolveTerminalId(
 	cachedChapterId?: string,
 ): Promise<{ id: string } | { error: string }> {
 	// 1. Try exact ID match
-	const byId = await db.query.terminals.findFirst({
-		where: eq(terminals.id, idOrName),
-		columns: { id: true },
-	});
+	const byId = await readQuery(
+		db.query.terminals.findFirst({
+			where: eq(terminals.id, idOrName),
+			columns: { id: true },
+		}),
+	);
 	if (byId) return { id: byId.id };
 
 	// 2. Fallback: search by name among accessible terminals
-	const narratorTerminals = await db.query.terminals.findMany({
-		where: eq(terminals.narratorId, narratorId),
-		columns: { id: true, name: true },
-	});
+	const narratorTerminals = await readQuery(
+		db.query.terminals.findMany({
+			where: eq(terminals.narratorId, narratorId),
+			columns: { id: true, name: true },
+		}),
+	);
 
 	const chapterId =
 		cachedChapterId ??
 		(
-			await db.query.narrators.findFirst({
-				where: eq(narrators.id, narratorId),
-				columns: { chapterId: true },
-			})
+			await readQuery(
+				db.query.narrators.findFirst({
+					where: eq(narrators.id, narratorId),
+					columns: { chapterId: true },
+				}),
+			)
 		)?.chapterId;
 
 	let chapterTerminals: { id: string; name: string }[] = [];
 	if (chapterId) {
-		chapterTerminals = await db.query.terminals.findMany({
-			where: eq(terminals.chapterId, chapterId),
-			columns: { id: true, name: true },
-		});
+		chapterTerminals = await readQuery(
+			db.query.terminals.findMany({
+				where: eq(terminals.chapterId, chapterId),
+				columns: { id: true, name: true },
+			}),
+		);
 	}
 
 	// Deduplicate
@@ -296,23 +309,29 @@ export const terminalTool: ToolDefinition = {
 
 async function listTerminals(narratorId: string): Promise<ToolResult> {
 	// Find terminals associated with this narrator
-	const narratorTerminals = await db.query.terminals.findMany({
-		where: eq(terminals.narratorId, narratorId),
-		columns: { id: true, name: true, status: true, cwd: true, createdAt: true },
-	});
+	const narratorTerminals = await readQuery(
+		db.query.terminals.findMany({
+			where: eq(terminals.narratorId, narratorId),
+			columns: { id: true, name: true, status: true, cwd: true, createdAt: true },
+		}),
+	);
 
 	// Also find terminals associated with the narrator's chapter
-	const narrator = await db.query.narrators.findFirst({
-		where: (n, { eq }) => eq(n.id, narratorId),
-		columns: { chapterId: true },
-	});
+	const narrator = await readQuery(
+		db.query.narrators.findFirst({
+			where: (n, { eq }) => eq(n.id, narratorId),
+			columns: { chapterId: true },
+		}),
+	);
 
 	let chapterTerminals: typeof narratorTerminals = [];
 	if (narrator?.chapterId) {
-		chapterTerminals = await db.query.terminals.findMany({
-			where: eq(terminals.chapterId, narrator.chapterId),
-			columns: { id: true, name: true, status: true, cwd: true, createdAt: true },
-		});
+		chapterTerminals = await readQuery(
+			db.query.terminals.findMany({
+				where: eq(terminals.chapterId, narrator.chapterId),
+				columns: { id: true, name: true, status: true, cwd: true, createdAt: true },
+			}),
+		);
 	}
 
 	// Deduplicate by ID and exclude exited terminals

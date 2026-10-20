@@ -1,6 +1,7 @@
 import { lookup } from "node:dns/promises";
 import { readdir, stat } from "node:fs/promises";
 import { basename, extname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { readQuery } from "@server/db/worker-read";
 import { eq } from "drizzle-orm";
 import { z } from "zod/v4";
 import { db } from "../../../db";
@@ -73,10 +74,12 @@ function defaultPluginsEnabled(manager: PluginInstallManager): boolean {
 
 async function defaultIsAdminUser(userId: string | null | undefined): Promise<boolean> {
 	if (!userId) return false;
-	const user = await db.query.users.findFirst({
-		where: eq(users.id, userId),
-		columns: { role: true },
-	});
+	const user = await readQuery(
+		db.query.users.findFirst({
+			where: eq(users.id, userId),
+			columns: { role: true },
+		}),
+	);
 	return user?.role === "admin";
 }
 

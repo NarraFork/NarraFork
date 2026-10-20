@@ -1,3 +1,4 @@
+import { readQuery, readQueryFirst } from "@server/db/worker-read";
 import { eventBus } from "@server/lib/event-bus";
 import { logger } from "@server/lib/logger";
 import { getSubagentType, parseSubstatus } from "@server/lib/narrator-utils";
@@ -485,14 +486,14 @@ export async function restoreSendAwaitFromSnapshot(
 }
 
 /** Stable coordinates survive COW and can be recovered for old reply checkpoints by reserved address. */
-function stableSendCoordinates(
+async function stableSendCoordinates(
 	id: string,
 	messageId?: string,
 	delivery?: Pick<
 		import("./agent-message-delivery").AgentMessageDelivery,
 		"deliveryId" | "recipientRefId" | "revision"
 	>,
-): Partial<SendDeliveryTarget> {
+): Promise<Partial<SendDeliveryTarget>> {
 	if (delivery?.deliveryId)
 		return {
 			deliveryId: delivery.deliveryId,
@@ -500,22 +501,23 @@ function stableSendCoordinates(
 			revision: delivery.revision,
 		};
 	if (!messageId) return {};
-	const row = db
-		.select({
-			deliveryId: narratorBufferedMessages.deliveryId,
-			recipientRefId: narratorBufferedMessages.recipientRefId,
-			revision: narratorBufferedMessages.contentRevision,
-			receiptDisposition: narratorBufferedMessages.receiptDisposition,
-		})
-		.from(narratorBufferedMessages)
-		.where(
-			and(
-				eq(narratorBufferedMessages.narratorId, id),
-				eq(narratorBufferedMessages.recipientMessageId, messageId),
-			),
-		)
-		.limit(1)
-		.get();
+	const row = await readQueryFirst(
+		db
+			.select({
+				deliveryId: narratorBufferedMessages.deliveryId,
+				recipientRefId: narratorBufferedMessages.recipientRefId,
+				revision: narratorBufferedMessages.contentRevision,
+				receiptDisposition: narratorBufferedMessages.receiptDisposition,
+			})
+			.from(narratorBufferedMessages)
+			.where(
+				and(
+					eq(narratorBufferedMessages.narratorId, id),
+					eq(narratorBufferedMessages.recipientMessageId, messageId),
+				),
+			)
+			.limit(1),
+	);
 	if (!row?.deliveryId) return {};
 	return {
 		deliveryId: row.deliveryId,
@@ -524,18 +526,18 @@ function stableSendCoordinates(
 		receiptDisposition: row.receiptDisposition,
 	};
 }
-function notifyDeliveryResolved(
+async function notifyDeliveryResolved(
 	input: SendSubagentInput,
 	id: string,
 	deliveryMessageId: string,
 	title?: string | null,
 	delivery?: import("./agent-message-delivery").AgentMessageDelivery,
-): void {
+): Promise<void> {
 	try {
 		input.onDeliveryResolved?.({
 			id,
 			deliveryMessageId,
-			...stableSendCoordinates(id, deliveryMessageId, delivery),
+			...(await stableSendCoordinates(id, deliveryMessageId, delivery)),
 			...(title !== undefined ? { title } : {}),
 		});
 	} catch (error) {
@@ -1245,7 +1247,13 @@ async function deliverSubagentMessageToParent(
 	if (accepted.delivery.state === "cancelled" || accepted.delivery.state === "failed")
 		throw new Error(`Previous delivery is ${accepted.delivery.state}; explicit retry is required`);
 
-	notifyDeliveryResolved(input, parentId, delivery.recipientMessageId, parent.title, delivery);
+	await notifyDeliveryResolved(
+		input,
+		parentId,
+		delivery.recipientMessageId,
+		parent.title,
+		delivery,
+	);
 
 	// Wake the parent only when idle; a working/waiting parent drains the queue
 	// at its next after_tools sidecar boundary.
@@ -1259,7 +1267,7 @@ async function deliverSubagentMessageToParent(
 		title: parent.title,
 		status: started ? "started" : "queued",
 		deliveryMessageId: delivery.recipientMessageId,
-		...stableSendCoordinates(parentId, delivery.recipientMessageId, delivery),
+		...(await stableSendCoordinates(parentId, delivery.recipientMessageId, delivery)),
 	};
 }
 
@@ -1493,12 +1501,12 @@ async function sendSubagentMessageDetailedWithRun(
 						title: fresh.title,
 						status: "queued",
 						deliveryMessageId,
-						...stableSendCoordinates(fresh.id, deliveryMessageId, delivery),
+						...(await stableSendCoordinates(fresh.id, deliveryMessageId, delivery)),
 						interrupted,
 						awaited: false,
 					});
 				}
-				notifyDeliveryResolved(input, fresh.id, deliveryMessageId, fresh.title, delivery);
+				await notifyDeliveryResolved(input, fresh.id, deliveryMessageId, fresh.title, delivery);
 				continue;
 			}
 
@@ -1558,11 +1566,11 @@ async function sendSubagentMessageDetailedWithRun(
 					title: fresh.title,
 					status: wakeFailed ? "queued" : "started",
 					deliveryMessageId,
-					...stableSendCoordinates(fresh.id, deliveryMessageId, delivery),
+					...(await stableSendCoordinates(fresh.id, deliveryMessageId, delivery)),
 					awaited: false,
 				});
 			}
-			notifyDeliveryResolved(input, fresh.id, deliveryMessageId, fresh.title, delivery);
+			await notifyDeliveryResolved(input, fresh.id, deliveryMessageId, fresh.title, delivery);
 		} catch (err) {
 			const error = err instanceof Error ? err.message : String(err);
 			if (replyHandle) {
@@ -1606,15 +1614,17 @@ export async function sendSubagentMessageDetailed(
 		// after the reply has already settled. Only the narrow PK row is read.
 		const binding = input.toolCallBinding;
 		try {
-			const row = await db.query.narratorToolCalls.findFirst({
-				where: and(
-					eq(narratorToolCalls.id, binding.toolCallId),
-					eq(narratorToolCalls.narratorId, input.callerNarratorId),
-					eq(narratorToolCalls.toolUseId, input.toolUseId),
-					eq(narratorToolCalls.executionAttempt, binding.attempt),
-				),
-				columns: { messageId: true },
-			});
+			const row = await readQuery(
+				db.query.narratorToolCalls.findFirst({
+					where: and(
+						eq(narratorToolCalls.id, binding.toolCallId),
+						eq(narratorToolCalls.narratorId, input.callerNarratorId),
+						eq(narratorToolCalls.toolUseId, input.toolUseId),
+						eq(narratorToolCalls.executionAttempt, binding.attempt),
+					),
+					columns: { messageId: true },
+				}),
+			);
 			input = { ...input, requesterMessageId: row?.messageId };
 		} catch (error) {
 			logger.warn("Failed to resolve waiting Send's bound message", { error: String(error) });
@@ -1638,7 +1648,7 @@ export async function sendSubagentMessageDetailed(
 		// waiter preserved that exact address; no additional inbox row is created.
 		for (const target of result.targets) {
 			if (target.recipientToolUseId && target.deliveryMessageId) {
-				notifyDeliveryResolved(input, target.id, target.deliveryMessageId, target.title);
+				await notifyDeliveryResolved(input, target.id, target.deliveryMessageId, target.title);
 			}
 		}
 		return result;

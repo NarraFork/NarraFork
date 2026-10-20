@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 /**
  * Deliver a human file-editor save to a working narrator as a cut-in user message.
  *
@@ -110,10 +111,12 @@ export function formatFileEditInterjection(notification: FileEditNotification): 
 async function resolveCreator(userId: string | null): Promise<BufferCreator | null> {
 	if (!userId) return null;
 	try {
-		const user = await db.query.users.findFirst({
-			where: eq(users.id, userId),
-			columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
-		});
+		const user = await readQuery(
+			db.query.users.findFirst({
+				where: eq(users.id, userId),
+				columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
+			}),
+		);
 		return user ?? null;
 	} catch (err) {
 		// Attribution is cosmetic; never block delivery on it.

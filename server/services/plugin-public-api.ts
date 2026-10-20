@@ -1,4 +1,5 @@
 import { createHash, createHmac, randomBytes, timingSafeEqual } from "node:crypto";
+import { readQuery } from "@server/db/worker-read";
 import { and, desc, eq, inArray, lt, or, type SQL } from "drizzle-orm";
 import { z } from "zod";
 import { chapters, narratorMessages, narrators } from "../db/schema";
@@ -3152,21 +3153,23 @@ export function createCorePluginPublicApiAdapters(options: {
 					);
 					if (afterPredicate) predicates.push(afterPredicate);
 				}
-				return db
-					.select({
-						id: chapters.id,
-						projectId: chapters.projectId,
-						title: chapters.title,
-						status: chapters.status,
-						role: chapters.role,
-						commitCount: chapters.commitCount,
-						createdAt: chapters.createdAt,
-						updatedAt: chapters.updatedAt,
-					})
-					.from(chapters)
-					.where(and(...predicates))
-					.orderBy(desc(chapters.updatedAt), desc(chapters.id))
-					.limit(input.limit);
+				return readQuery(
+					db
+						.select({
+							id: chapters.id,
+							projectId: chapters.projectId,
+							title: chapters.title,
+							status: chapters.status,
+							role: chapters.role,
+							commitCount: chapters.commitCount,
+							createdAt: chapters.createdAt,
+							updatedAt: chapters.updatedAt,
+						})
+						.from(chapters)
+						.where(and(...predicates))
+						.orderBy(desc(chapters.updatedAt), desc(chapters.id))
+						.limit(input.limit),
+				);
 			},
 		},
 		pluginLifecycle: {
@@ -3194,30 +3197,32 @@ export function createCorePluginPublicApiAdapters(options: {
 					if (afterPredicate) predicates.push(afterPredicate);
 				}
 				if (input.projectId) predicates.push(eq(chapters.projectId, input.projectId));
-				const rows = await db
-					.select({
-						id: narrators.id,
-						chapterId: narrators.chapterId,
-						projectId: chapters.projectId,
-						title: narrators.title,
-						handle: narrators.handle,
-						variant: narrators.variant,
-						type: narrators.type,
-						status: narrators.status,
-						substatus: narrators.substatus,
-						model: narrators.model,
-						permissionMode: narrators.permissionMode,
-						reasoningEffort: narrators.reasoningEffort,
-						messageCount: narrators.messageCount,
-						lastMessageAt: narrators.lastMessageAt,
-						createdAt: narrators.createdAt,
-						updatedAt: narrators.updatedAt,
-					})
-					.from(narrators)
-					.leftJoin(chapters, eq(narrators.chapterId, chapters.id))
-					.where(predicates.length ? and(...predicates) : undefined)
-					.orderBy(desc(narrators.updatedAt), desc(narrators.id))
-					.limit(input.limit);
+				const rows = await readQuery(
+					db
+						.select({
+							id: narrators.id,
+							chapterId: narrators.chapterId,
+							projectId: chapters.projectId,
+							title: narrators.title,
+							handle: narrators.handle,
+							variant: narrators.variant,
+							type: narrators.type,
+							status: narrators.status,
+							substatus: narrators.substatus,
+							model: narrators.model,
+							permissionMode: narrators.permissionMode,
+							reasoningEffort: narrators.reasoningEffort,
+							messageCount: narrators.messageCount,
+							lastMessageAt: narrators.lastMessageAt,
+							createdAt: narrators.createdAt,
+							updatedAt: narrators.updatedAt,
+						})
+						.from(narrators)
+						.leftJoin(chapters, eq(narrators.chapterId, chapters.id))
+						.where(predicates.length ? and(...predicates) : undefined)
+						.orderBy(desc(narrators.updatedAt), desc(narrators.id))
+						.limit(input.limit),
+				);
 				return rows.map((row) => ({
 					id: row.id,
 					chapterId: row.chapterId,
@@ -3240,17 +3245,19 @@ export function createCorePluginPublicApiAdapters(options: {
 			async listMessages(input) {
 				if (input.signal.aborted)
 					throw new PluginPublicApiError("CANCELLED", "Query was cancelled");
-				const rows = await db
-					.select({
-						id: narratorMessages.id,
-						role: narratorMessages.role,
-						contentText: narratorMessages.contentText,
-						createdAt: narratorMessages.createdAt,
-					})
-					.from(narratorMessages)
-					.where(eq(narratorMessages.narratorId, input.narratorId))
-					.orderBy(desc(narratorMessages.createdAt))
-					.limit(input.limit);
+				const rows = await readQuery(
+					db
+						.select({
+							id: narratorMessages.id,
+							role: narratorMessages.role,
+							contentText: narratorMessages.contentText,
+							createdAt: narratorMessages.createdAt,
+						})
+						.from(narratorMessages)
+						.where(eq(narratorMessages.narratorId, input.narratorId))
+						.orderBy(desc(narratorMessages.createdAt))
+						.limit(input.limit),
+				);
 				return rows.map((row) => ({
 					id: row.id,
 					role: row.role,

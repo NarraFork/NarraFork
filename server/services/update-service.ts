@@ -19,6 +19,7 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "node:path";
+import { readQuery } from "@server/db/worker-read";
 import { inArray } from "drizzle-orm";
 import type { GithubPatchStep } from "../../shared/release-patch";
 import {
@@ -1744,11 +1745,13 @@ export interface PlannedUpdateCheckpointHooks {
 async function listActiveToolCallIds(
 	snapshot: Pick<PlannedUpdateRecoverySnapshot, "narrators">,
 ): Promise<string[]> {
-	const rows = await db
-		.select({ id: narratorToolCalls.id, narratorId: narratorToolCalls.narratorId })
-		.from(narratorToolCalls)
-		.where(inArray(narratorToolCalls.status, ["initializing", "pending", "running"]))
-		.limit(CHECKPOINT_ACTIVE_TOOL_LIMIT);
+	const rows = await readQuery(
+		db
+			.select({ id: narratorToolCalls.id, narratorId: narratorToolCalls.narratorId })
+			.from(narratorToolCalls)
+			.where(inArray(narratorToolCalls.status, ["initializing", "pending", "running"]))
+			.limit(CHECKPOINT_ACTIVE_TOOL_LIMIT),
+	);
 	if (rows.length >= CHECKPOINT_ACTIVE_TOOL_LIMIT) {
 		throw new Error(
 			`Planned-update checkpoint exceeds the ${CHECKPOINT_ACTIVE_TOOL_LIMIT - 1}-row safety limit`,

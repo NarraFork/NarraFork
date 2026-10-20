@@ -5,6 +5,7 @@
  * describes recorded rows in the requested window, not all real filesystem writes.
  */
 import { posix } from "node:path";
+import { readDbAll, readQuery } from "@server/db/worker-read";
 import { and, desc, eq, gte, inArray, lt, lte, or, type SQL, sql } from "drizzle-orm";
 import type {
 	FileChangeActor,
@@ -20,6 +21,7 @@ import {
 } from "../db/schema";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import { localBackend } from "../lib/agent/execution/local-backend";
+import { diagnosticAwait, diagnosticSync } from "../lib/request-diagnostics";
 import {
 	type AttributionActor,
 	attributionActorKey,
@@ -179,13 +181,15 @@ function completeness(
  * Provider toolUseIds are reusable across forks/retries; v1 therefore stays unknown. */
 async function loadTreeHashes(effectIds: string[]): Promise<Map<string, string | null>> {
 	if (effectIds.length === 0) return new Map();
-	const rows = await db
-		.select({ effectId: fileChangeEffects.id, treeHashAfter: narratorToolCalls.treeHashAfter })
-		.from(fileChangeEffects)
-		.innerJoin(fileChangeOperations, eq(fileChangeOperations.id, fileChangeEffects.operationId))
-		.innerJoin(narratorToolCalls, eq(narratorToolCalls.id, fileChangeOperations.toolCallId))
-		.where(inArray(fileChangeEffects.id, effectIds))
-		.limit(MAX_QUERY_PATHS * PER_PATH_EVENT_LIMIT);
+	const rows = await readQuery(
+		db
+			.select({ effectId: fileChangeEffects.id, treeHashAfter: narratorToolCalls.treeHashAfter })
+			.from(fileChangeEffects)
+			.innerJoin(fileChangeOperations, eq(fileChangeOperations.id, fileChangeEffects.operationId))
+			.innerJoin(narratorToolCalls, eq(narratorToolCalls.id, fileChangeOperations.toolCallId))
+			.where(inArray(fileChangeEffects.id, effectIds))
+			.limit(MAX_QUERY_PATHS * PER_PATH_EVENT_LIMIT),
+	);
 	return new Map(rows.map((row) => [row.effectId, row.treeHashAfter]));
 }
 
@@ -332,14 +336,20 @@ async function selectPerPathRows(
 				)`,
 			),
 		);
-		const fetched = await db.all<EventRow>(sql.join(parts, sql` union all `));
-		fetched.sort((a, b) => b.changedAt.localeCompare(a.changedAt) || b.rowId - a.rowId);
-		for (const row of fetched) {
-			const count = (counts.get(row.filePath) ?? 0) + 1;
-			counts.set(row.filePath, count);
-			if (count > PER_PATH_EVENT_LIMIT) truncatedPaths.add(row.filePath);
-			else rows.push(row);
-		}
+		const fetched = await diagnosticAwait("modifications.history.read", () =>
+			readDbAll<EventRow>(db, sql.join(parts, sql` union all `), {
+				site: "modifications.history.perPath",
+			}),
+		);
+		diagnosticSync("modifications.history.sortFilter", () => {
+			fetched.sort((a, b) => b.changedAt.localeCompare(a.changedAt) || b.rowId - a.rowId);
+			for (const row of fetched) {
+				const count = (counts.get(row.filePath) ?? 0) + 1;
+				counts.set(row.filePath, count);
+				if (count > PER_PATH_EVENT_LIMIT) truncatedPaths.add(row.filePath);
+				else rows.push(row);
+			}
+		});
 	}
 	return { rows, truncatedPaths };
 }
@@ -358,7 +368,9 @@ export async function getWorkspaceModificationView(
 	if (deviceId === LOCAL_DEVICE_ID) {
 		try {
 			const canonical = (
-				await localBackend.resolvePathIdentity(workspacePath, { signal: options.signal })
+				await diagnosticAwait("modifications.identity", () =>
+					localBackend.resolvePathIdentity(workspacePath, { signal: options.signal }),
+				)
 			).canonicalPath;
 			// v2 stores backend-native canonical roots; legacy uses normalized comparison keys.
 			workspaceKeys.add(canonical);
@@ -390,17 +402,19 @@ export async function getWorkspaceModificationView(
 	const wantTimeline = (options.projection ?? "all") === "all";
 	const current = async () =>
 		options.currentDiff
-			? getGitCurrentDiffView(workspacePath, {
-					deviceId,
-					filePaths: options.filePaths
-						? [
-								...new Set(
-									options.filePaths.map((path) => resolveDisplayPath(path, options.pathAliases)),
-								),
-							]
-						: undefined,
-					signal: options.signal,
-				})
+			? diagnosticAwait("modifications.current-diff", () =>
+					getGitCurrentDiffView(workspacePath, {
+						deviceId,
+						filePaths: options.filePaths
+							? [
+									...new Set(
+										options.filePaths.map((path) => resolveDisplayPath(path, options.pathAliases)),
+									),
+								]
+							: undefined,
+						signal: options.signal,
+					}),
+				)
 			: undefined;
 	if (options.filePaths?.length === 0) {
 		return {
@@ -425,14 +439,13 @@ export async function getWorkspaceModificationView(
 	const incompleteDisplayPaths = new Set<string>();
 	if (options.filePaths) {
 		const paths = [...new Set(options.filePaths)];
-		const selected = await selectPerPathRows(
-			paths.slice(0, MAX_QUERY_PATHS),
-			conditions,
-			[...workspaceKeys],
-			scopes,
+		const selected = await diagnosticAwait("modifications.history", () =>
+			selectPerPathRows(paths.slice(0, MAX_QUERY_PATHS), conditions, [...workspaceKeys], scopes),
 		);
 		rows = selected.rows;
-		rows.sort((a, b) => b.changedAt.localeCompare(a.changedAt) || b.rowId - a.rowId);
+		diagnosticSync("modifications.history.sortFilter", () =>
+			rows.sort((a, b) => b.changedAt.localeCompare(a.changedAt) || b.rowId - a.rowId),
+		);
 		for (const path of [...selected.truncatedPaths, ...paths.slice(MAX_QUERY_PATHS)]) {
 			incompleteDisplayPaths.add(resolveDisplayPath(path, options.pathAliases));
 		}
@@ -441,24 +454,35 @@ export async function getWorkspaceModificationView(
 		// Each canonical/legacy spelling gets its own indexed bound; IN + global
 		// ORDER BY would otherwise sort the entire history across workspace keys.
 		const fetched = (
-			await Promise.all(
-				[...workspaceKeys].map(async (workspaceKey) => {
-					const rows = await db
-						.select(EVENT_COLUMNS)
-						.from(fileAttributions)
-						.where(and(...conditions, eq(fileAttributions.workspacePath, workspaceKey)))
-						.orderBy(desc(fileAttributions.changedAt), desc(EVENT_ROW_ID))
-						.limit(limit + 1);
-					return rows
-						.map((row) => ({
-							...row,
-							filePath: displayScopePath(row.filePath, scopes.get(workspaceKey)),
-						}))
-						.filter((row) => row.filePath !== "\0outside-workspace");
-				}),
+			await diagnosticAwait("modifications.history", () =>
+				Promise.all(
+					[...workspaceKeys].map(async (workspaceKey) => {
+						const rows = await diagnosticAwait("modifications.history.read", () =>
+							readQuery(
+								db
+									.select(EVENT_COLUMNS)
+									.from(fileAttributions)
+									.where(and(...conditions, eq(fileAttributions.workspacePath, workspaceKey)))
+									.orderBy(desc(fileAttributions.changedAt), desc(EVENT_ROW_ID))
+									.limit(limit + 1),
+								{ site: "modifications.history.workspace" },
+							),
+						);
+						return diagnosticSync("modifications.history.mapFilter", () =>
+							rows
+								.map((row) => ({
+									...row,
+									filePath: displayScopePath(row.filePath, scopes.get(workspaceKey)),
+								}))
+								.filter((row) => row.filePath !== "\0outside-workspace"),
+						);
+					}),
+				),
 			)
 		).flat();
-		fetched.sort((a, b) => b.changedAt.localeCompare(a.changedAt) || b.rowId - a.rowId);
+		diagnosticSync("modifications.history.sortFilter", () =>
+			fetched.sort((a, b) => b.changedAt.localeCompare(a.changedAt) || b.rowId - a.rowId),
+		);
 		hasMore = fetched.length > limit || options.additionalScopesTruncated === true;
 		rows = fetched.slice(0, limit);
 	}
@@ -468,36 +492,40 @@ export async function getWorkspaceModificationView(
 	const boundaries = new Map(
 		[...(options.sinceByPath ?? [])].map(([path, since]) => [path, utcTimestamp(since)]),
 	);
-	const windowRows = rows.filter((row) => {
-		const boundary = boundaries.get(resolveDisplayPath(row.filePath, options.pathAliases));
-		return boundary === undefined || row.changedAt > boundary;
-	});
+	const windowRows = diagnosticSync("modifications.history.mapFilter", () =>
+		rows.filter((row) => {
+			const boundary = boundaries.get(resolveDisplayPath(row.filePath, options.pathAliases));
+			return boundary === undefined || row.changedAt > boundary;
+		}),
+	);
 	const snapshots = new Map(
 		windowRows.map((row) => [row.id, actorSnapshot(row.actorSnapshotJson)]),
 	);
-	const [actorsById, humansById, treeHashes] = await Promise.all([
-		resolveAttributionActors([
-			...new Set(
-				windowRows.flatMap((row) => {
-					const id = snapshots.get(row.id)?.narratorId ?? row.narratorId;
-					return id ? [id] : [];
-				}),
-			),
+	const [actorsById, humansById, treeHashes] = await diagnosticAwait("modifications.actors", () =>
+		Promise.all([
+			resolveAttributionActors([
+				...new Set(
+					windowRows.flatMap((row) => {
+						const id = snapshots.get(row.id)?.narratorId ?? row.narratorId;
+						return id ? [id] : [];
+					}),
+				),
+			]),
+			resolveHumanAttributionActors([
+				...new Set(
+					windowRows.flatMap((row) => {
+						const id = snapshots.get(row.id)?.userId ?? row.userId;
+						return id ? [id] : [];
+					}),
+				),
+			]),
+			wantTimeline
+				? loadTreeHashes([
+						...new Set(windowRows.flatMap((row) => (row.effectId ? [row.effectId] : []))),
+					])
+				: Promise.resolve(new Map<string, string | null>()),
 		]),
-		resolveHumanAttributionActors([
-			...new Set(
-				windowRows.flatMap((row) => {
-					const id = snapshots.get(row.id)?.userId ?? row.userId;
-					return id ? [id] : [];
-				}),
-			),
-		]),
-		wantTimeline
-			? loadTreeHashes([
-					...new Set(windowRows.flatMap((row) => (row.effectId ? [row.effectId] : []))),
-				])
-			: Promise.resolve(new Map<string, string | null>()),
-	]);
+	);
 
 	const timeline: ModificationEvent[] = [];
 	const byFile = new Map<string, FileModificationGroup>();
@@ -634,17 +662,19 @@ export async function findImpreciseChanges(
 		eq(fileAttributions.workspacePath, key),
 	];
 	addTimeConditions(conditions, options);
-	const fetched = await db
-		.select({
-			filePath: fileAttributions.filePath,
-			narratorId: fileAttributions.narratorId,
-			userId: fileAttributions.userId,
-			action: fileAttributions.action,
-		})
-		.from(fileAttributions)
-		.where(and(...conditions))
-		.orderBy(desc(fileAttributions.changedAt))
-		.limit(MAX_EVENT_LIMIT + 1);
+	const fetched = await readQuery(
+		db
+			.select({
+				filePath: fileAttributions.filePath,
+				narratorId: fileAttributions.narratorId,
+				userId: fileAttributions.userId,
+				action: fileAttributions.action,
+			})
+			.from(fileAttributions)
+			.where(and(...conditions))
+			.orderBy(desc(fileAttributions.changedAt))
+			.limit(MAX_EVENT_LIMIT + 1),
+	);
 	const hasMore = fetched.length > MAX_EVENT_LIMIT;
 	const rows = fetched.slice(0, MAX_EVENT_LIMIT);
 	let externalCount = 0;

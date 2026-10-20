@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 /**
  * Loads the upper trait layers (user, project, policy source) and resolves them
  * against a narrator's own traits.
@@ -108,10 +109,12 @@ async function loadProjectTraits(
 	const cached = readCache(projectLayerCache, projectId);
 	if (cached) return cached;
 	try {
-		const row = await db.query.projects.findFirst({
-			where: eq(projects.id, projectId),
-			columns: { traits: true },
-		});
+		const row = await readQuery(
+			db.query.projects.findFirst({
+				where: eq(projects.id, projectId),
+				columns: { traits: true },
+			}),
+		);
 		const traits = Array.isArray(row?.traits) ? row.traits : [];
 		writeCache(projectLayerCache, projectId, traits);
 		return traits;
@@ -132,10 +135,12 @@ async function loadUserTraits(
 	const cached = readCache(userLayerCache, userId);
 	if (cached) return cached;
 	try {
-		const row = await db.query.userPreferences.findFirst({
-			where: eq(userPreferences.userId, userId),
-			columns: { traits: true },
-		});
+		const row = await readQuery(
+			db.query.userPreferences.findFirst({
+				where: eq(userPreferences.userId, userId),
+				columns: { traits: true },
+			}),
+		);
 		const traits = Array.isArray(row?.traits) ? row.traits : [];
 		writeCache(userLayerCache, userId, traits);
 		return traits;
@@ -208,15 +213,17 @@ async function resolveNarratorTraitsInChain(
 ): Promise<ResolvedTraitsResult> {
 	if (chain.includes(narratorId)) throw new Error("Policy source cycle detected");
 	if (chain.length >= MAX_POLICY_SOURCE_DEPTH) throw new Error("Policy source chain is too deep");
-	const row = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: {
-			...RUNTIME_SOURCE_COLUMNS,
-			traits: true,
-			chapterId: true,
-			contextProjectId: true,
-		},
-	});
+	const row = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: {
+				...RUNTIME_SOURCE_COLUMNS,
+				traits: true,
+				chapterId: true,
+				contextProjectId: true,
+			},
+		}),
+	);
 	if (!row) throw new NotFoundError("Narrator", narratorId);
 	return resolveLayers(
 		{
@@ -278,17 +285,21 @@ export interface LayerTraitsView {
 
 async function readLayerTraits(layer: EditableTraitLayer, ownerId: string): Promise<string[]> {
 	if (layer === "project") {
-		const row = await db.query.projects.findFirst({
-			where: eq(projects.id, ownerId),
-			columns: { traits: true },
-		});
+		const row = await readQuery(
+			db.query.projects.findFirst({
+				where: eq(projects.id, ownerId),
+				columns: { traits: true },
+			}),
+		);
 		if (!row) throw new NotFoundError("Project", ownerId);
 		return Array.isArray(row.traits) ? row.traits : [];
 	}
-	const row = await db.query.userPreferences.findFirst({
-		where: eq(userPreferences.userId, ownerId),
-		columns: { traits: true },
-	});
+	const row = await readQuery(
+		db.query.userPreferences.findFirst({
+			where: eq(userPreferences.userId, ownerId),
+			columns: { traits: true },
+		}),
+	);
 	// A user with no preferences row yet simply has no traits.
 	return Array.isArray(row?.traits) ? row.traits : [];
 }
@@ -327,10 +338,12 @@ export async function updateLayerTraits(
 				.where(eq(projects.id, ownerId));
 		} else {
 			// The preferences row may not exist yet for a user who never changed one.
-			const existing = await db.query.userPreferences.findFirst({
-				where: eq(userPreferences.userId, ownerId),
-				columns: { id: true },
-			});
+			const existing = await readQuery(
+				db.query.userPreferences.findFirst({
+					where: eq(userPreferences.userId, ownerId),
+					columns: { id: true },
+				}),
+			);
 			if (existing) {
 				await db
 					.update(userPreferences)

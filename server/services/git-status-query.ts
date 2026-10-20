@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { resolve } from "node:path";
 import { AppError } from "../lib/errors";
 import { logger } from "../lib/logger";
@@ -19,12 +20,24 @@ interface Job<T> {
 	invalidated: boolean;
 	discardResult?: boolean;
 	createdAt: number;
+	startedAt?: number;
+	queueDepth: number;
+	runningAtStart?: number;
+	source: "miss" | "dirty" | "expired" | "bypass" | "trailing";
+	trailing: boolean;
 	readers: number;
+	peakReaders: number;
+	outcome?: "success" | "error";
 	timer?: ReturnType<typeof setTimeout>;
 }
 interface Entry<T> {
 	current: Job<T>;
 	next?: Job<T>;
+}
+
+/** Stable log-only scope identity; never emit repository paths or remote query keys. */
+export function getGitStatusQueryScopeId(key: string): string {
+	return createHash("sha256").update(key).digest("hex").slice(0, 16);
 }
 
 export function getLocalGitStatusQueryKey(path: string): string {
@@ -96,7 +109,19 @@ export class GitStatusQueryCoordinator<T = GitStatusSummary> {
 				state: "queued",
 				invalidated: false,
 				createdAt: performance.now(),
+				queueDepth: this.queue.length,
+				trailing: entry?.current.invalidated === true,
+				source: entry?.current.invalidated
+					? "trailing"
+					: !cached
+						? "miss"
+						: cached.dirty
+							? "dirty"
+							: ttl <= 0
+								? "bypass"
+								: "expired",
 				readers: 0,
+				peakReaders: 0,
 			};
 			if (entry) entry.next = job;
 			else this.entries.set(key, { current: job });
@@ -126,6 +151,7 @@ export class GitStatusQueryCoordinator<T = GitStatusSummary> {
 			};
 			shared.waiters.add(waiter);
 			shared.readers++;
+			shared.peakReaders = Math.max(shared.peakReaders, shared.waiters.size);
 			signal?.addEventListener("abort", abort, { once: true });
 		});
 		this.pump();
@@ -210,12 +236,23 @@ export class GitStatusQueryCoordinator<T = GitStatusSummary> {
 		if (job.state === "running") this.running--;
 		else this.queue = this.queue.filter((queued) => queued !== job);
 		job.state = "finished";
-		const elapsedMs = Math.round(performance.now() - job.createdAt);
+		const finishedAt = performance.now();
+		const elapsedMs = Math.round(finishedAt - job.createdAt);
 		if (elapsedMs > 1000)
 			logger.warn("Slow coordinated Git status", {
+				scopeId: getGitStatusQueryScopeId(job.key),
 				elapsedMs,
+				queueMs: Math.round((job.startedAt ?? finishedAt) - job.createdAt),
+				loaderMs: job.startedAt === undefined ? 0 : Math.round(finishedAt - job.startedAt),
+				queueDepth: job.queueDepth,
+				runningAtStart: job.runningAtStart ?? 0,
+				source: job.source,
+				trailing: job.trailing,
+				invalidated: job.invalidated,
 				shared: job.readers > 1,
 				readers: job.readers,
+				peakReaders: job.peakReaders,
+				outcome: job.controller.signal.aborted ? "cancelled" : job.outcome,
 				cancelled: job.controller.signal.aborted,
 			});
 		const entry = this.entries.get(job.key);
@@ -240,13 +277,16 @@ export class GitStatusQueryCoordinator<T = GitStatusSummary> {
 			if (!job) return;
 			job.state = "running";
 			this.running++;
+			job.runningAtStart = this.running;
 			Promise.resolve()
 				.then(() => {
 					job.controller.signal.throwIfAborted();
+					job.startedAt = performance.now();
 					return job.loader(job.controller.signal);
 				})
 				.then(
 					(value) => {
+						job.outcome = "success";
 						if (!job.invalidated && !job.discardResult && !job.controller.signal.aborted) {
 							this.results.delete(job.key);
 							this.results.set(job.key, { value, producedAt: Date.now(), dirty: false });
@@ -259,6 +299,7 @@ export class GitStatusQueryCoordinator<T = GitStatusSummary> {
 						if (!job.controller.signal.aborted) this.settle(job, value);
 					},
 					(error: unknown) => {
+						job.outcome = "error";
 						this.finish(job);
 						this.settle(job, undefined, error);
 					},

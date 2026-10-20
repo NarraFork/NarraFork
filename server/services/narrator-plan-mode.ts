@@ -1,6 +1,7 @@
 import { and, eq, sql } from "drizzle-orm";
 import { db } from "../db";
 import { narrators, narratorToolCalls } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { shouldDisablePlanReflectionReview } from "../lib/agent/tools/plan-mode";
 import { AsyncMutex, narratorTraitsLock } from "../lib/async-mutex";
 import {
@@ -71,15 +72,18 @@ async function isPendingPlanFileIdUsable(narratorId: string, planFileId: string)
 		if (record?.narratorId) consumePendingPlanFileId(record.narratorId, planFileId);
 		return false;
 	}
-	const toolCall = await db.query.narratorToolCalls.findFirst({
-		where: and(
-			eq(narratorToolCalls.id, record.toolCallId),
-			eq(narratorToolCalls.narratorId, narratorId),
-			eq(narratorToolCalls.toolUseId, record.toolUseId),
-			eq(narratorToolCalls.toolName, "EnterPlanMode"),
-		),
-		columns: { status: true },
-	});
+	const toolCall = await readQuery(
+		db.query.narratorToolCalls.findFirst({
+			where: and(
+				eq(narratorToolCalls.id, record.toolCallId),
+				eq(narratorToolCalls.narratorId, narratorId),
+				eq(narratorToolCalls.toolUseId, record.toolUseId),
+				eq(narratorToolCalls.toolName, "EnterPlanMode"),
+			),
+			columns: { status: true },
+		}),
+		{ site: "narrator-plan-mode.isPendingPlanFileIdUsable" },
+	);
 	if (!toolCall || !["initializing", "pending", "running"].includes(toolCall.status)) {
 		consumePendingPlanFileId(narratorId, planFileId);
 		return false;
@@ -155,10 +159,13 @@ function isSafePlanFileId(value: string | null | undefined): value is string {
 
 async function isPlanFileIdTaken(planFileId: string): Promise<boolean> {
 	if (reservedPlanFileIds.has(planFileId)) return true;
-	const existing = await db.query.narrators.findFirst({
-		where: eq(narrators.planFileId, planFileId),
-		columns: { id: true },
-	});
+	const existing = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.planFileId, planFileId),
+			columns: { id: true },
+		}),
+		{ site: "narrator-plan-mode.isPlanFileIdTaken" },
+	);
 	return !!existing;
 }
 
@@ -216,16 +223,19 @@ export async function prepareNarratorPlanMode(
 	customPlanName?: string,
 ): Promise<PreparedPlanMode> {
 	return narratorTraitsLock.acquire(narratorId, async () => {
-		const current = await db.query.narrators.findFirst({
-			where: eq(narrators.id, narratorId),
-			columns: {
-				permissionMode: true,
-				previousPermissionMode: true,
-				planFileId: true,
-				planMode: true,
-				traits: true,
-			},
-		});
+		const current = await readQuery(
+			db.query.narrators.findFirst({
+				where: eq(narrators.id, narratorId),
+				columns: {
+					permissionMode: true,
+					previousPermissionMode: true,
+					planFileId: true,
+					planMode: true,
+					traits: true,
+				},
+			}),
+			{ site: "narrator-plan-mode.query" },
+		);
 		const currentIsPlanMode =
 			current?.planMode === true || parseTraits(current?.traits).includes("plan");
 		const durablePlanFileId =
@@ -389,17 +399,20 @@ export async function enterNarratorPlanMode(
 	preparedPlanFileId?: string,
 ): Promise<PlanModeStateResult> {
 	return narratorTraitsLock.acquire(narratorId, async () => {
-		const current = await db.query.narrators.findFirst({
-			where: eq(narrators.id, narratorId),
-			columns: {
-				permissionMode: true,
-				previousPermissionMode: true,
-				planFileId: true,
-				planMode: true,
-				relaxedPlan: true,
-				traits: true,
-			},
-		});
+		const current = await readQuery(
+			db.query.narrators.findFirst({
+				where: eq(narrators.id, narratorId),
+				columns: {
+					permissionMode: true,
+					previousPermissionMode: true,
+					planFileId: true,
+					planMode: true,
+					relaxedPlan: true,
+					traits: true,
+				},
+			}),
+			{ site: "narrator-plan-mode.query" },
+		);
 		const currentTraits = parseTraits(current?.traits);
 		const wasPlanMode = current?.planMode === true || currentTraits.includes("plan");
 		const previousPermissionMode =
@@ -461,16 +474,19 @@ export async function exitNarratorPlanMode(narratorId: string): Promise<PlanMode
 	return narratorTraitsLock.acquire(narratorId, async () => {
 		// Any identities prepared for the just-finished cycle are stale after exit.
 		clearPendingPlanFileIds(narratorId);
-		const current = await db.query.narrators.findFirst({
-			where: eq(narrators.id, narratorId),
-			columns: {
-				previousPermissionMode: true,
-				planFileId: true,
-				planMode: true,
-				relaxedPlan: true,
-				traits: true,
-			},
-		});
+		const current = await readQuery(
+			db.query.narrators.findFirst({
+				where: eq(narrators.id, narratorId),
+				columns: {
+					previousPermissionMode: true,
+					planFileId: true,
+					planMode: true,
+					relaxedPlan: true,
+					traits: true,
+				},
+			}),
+			{ site: "narrator-plan-mode.query" },
+		);
 		const currentTraits = parseTraits(current?.traits);
 		const wasPlanMode = currentTraits.includes("plan");
 		const nextTraits = wasPlanMode ? removeTrait(currentTraits, "plan") : currentTraits;

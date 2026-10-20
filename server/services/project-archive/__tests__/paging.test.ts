@@ -54,7 +54,7 @@ afterEach(async () => {
 		await db.delete(narrators).where(eq(narrators.id, narratorId));
 	}
 	for (const projectId of createdProjects.splice(0)) {
-		projectDbManager.close(projectId);
+		await projectDbManager.close(projectId);
 		await db.delete(chapters).where(eq(chapters.projectId, projectId));
 		await db.delete(projects).where(eq(projects.id, projectId));
 	}
@@ -222,7 +222,7 @@ describe("a multi-page export and import keeps every row", () => {
 		}
 
 		// Forget the project, then restore it from the file alone.
-		projectDbManager.close(fixture.projectId);
+		await projectDbManager.close(fixture.projectId);
 		await db
 			.delete(narratorMessageRefs)
 			.where(eq(narratorMessageRefs.narratorId, fixture.narratorId));
@@ -355,7 +355,8 @@ describe("a multi-page export yields the event loop between pages", () => {
 		// Without a macrotask yield the synchronous store would read every page in one turn and
 		// the timer would only fire afterwards (pagesAtTimer === pagesRead, or not at all yet).
 		expect(timerRanAt).not.toBeNull();
-		expect(pagesAtTimer).toBeGreaterThan(0);
+		// A worker-backed first page can yield before any result reaches the caller.
+		expect(pagesAtTimer).toBeGreaterThanOrEqual(0);
 		expect(pagesAtTimer).toBeLessThan(pagesRead);
 	});
 });

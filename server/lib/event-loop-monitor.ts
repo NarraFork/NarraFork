@@ -1,4 +1,5 @@
 import { logger } from "./logger";
+import { requestDiagnostics } from "./request-diagnostics";
 
 export interface EventLoopLagSnapshot {
 	currentLagMs: number;
@@ -15,7 +16,7 @@ interface EventLoopMonitorOptions {
 	warnThrottleMs?: number;
 }
 
-const DEFAULT_INTERVAL_MS = 1_000;
+const DEFAULT_INTERVAL_MS = 100;
 const DEFAULT_WARN_THRESHOLD_MS = 1_000;
 const DEFAULT_WARN_THROTTLE_MS = 30_000;
 
@@ -44,11 +45,14 @@ export function startEventLoopMonitor(options: EventLoopMonitorOptions = {}): vo
 	const warnThrottleMs = options.warnThrottleMs ?? DEFAULT_WARN_THROTTLE_MS;
 
 	state.startedAt = new Date().toISOString();
-	expectedAt = performance.now() + intervalMs;
+	const started = performance.now();
+	requestDiagnostics.start(started);
+	expectedAt = started + intervalMs;
 
 	timer = setInterval(() => {
 		const now = performance.now();
 		const lagMs = Math.max(0, now - expectedAt);
+		requestDiagnostics.tick(now, lagMs);
 		const roundedLag = roundMs(lagMs);
 		const lagAt = new Date().toISOString();
 
@@ -68,6 +72,7 @@ export function startEventLoopMonitor(options: EventLoopMonitorOptions = {}): vo
 				lagMs: roundedLag,
 				maxLagMs: state.maxLagMs,
 				thresholdMs: warnThresholdMs,
+				attribution: "unattributed",
 			});
 		}
 
@@ -75,6 +80,12 @@ export function startEventLoopMonitor(options: EventLoopMonitorOptions = {}): vo
 	}, intervalMs);
 
 	if (typeof timer === "object" && "unref" in timer) timer.unref();
+}
+
+export function stopEventLoopMonitor(): void {
+	if (timer) clearInterval(timer);
+	timer = null;
+	requestDiagnostics.stop();
 }
 
 export function getEventLoopLagSnapshot(): EventLoopLagSnapshot {

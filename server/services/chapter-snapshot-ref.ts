@@ -1,3 +1,4 @@
+import { readQuery } from "@server/db/worker-read";
 /**
  * Maintains each chapter's position in the snapshot DAG.
  *
@@ -116,10 +117,12 @@ async function pointChaptersAt(worktreePath: string, commitSha: string): Promise
 export async function resolveChapterSnapshot(
 	chapterId: string,
 ): Promise<{ commitSha: string; worktreePath: string } | null> {
-	const chapter = await db.query.chapters.findFirst({
-		where: eq(chapters.id, chapterId),
-		columns: { worktreePath: true, snapshotCommitSha: true },
-	});
+	const chapter = await readQuery(
+		db.query.chapters.findFirst({
+			where: eq(chapters.id, chapterId),
+			columns: { worktreePath: true, snapshotCommitSha: true },
+		}),
+	);
 	if (!chapter?.worktreePath) return null;
 	const worktreePath = chapter.worktreePath;
 

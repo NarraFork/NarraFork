@@ -14,12 +14,10 @@ import {
 } from "@shared/file-change-protocol";
 import { fileChangeIdentityKey } from "./file-change-identity";
 import type { RevertJournalFile, RevertJournalOperation } from "./revert-mutation-journal";
-import {
-	type AppendRevertPlanFile,
-	fingerprintRevertPlanFiles,
-	type RevertPlanHeader,
-	type RevertPlanManifestProof,
-	revertPlanHeaderDigest,
+import type {
+	AppendRevertPlanFile,
+	RevertPlanHeader,
+	RevertPlanManifestProof,
 } from "./revert-plan-service";
 import type { RevertSelectionResult } from "./revert-selection-service";
 
@@ -59,7 +57,7 @@ export type TransactionManifestRequest =
 
 const port = parentPort;
 if (port) {
-	port.on("message", (request: TransactionManifestRequest) => {
+	port.on("message", async (request: TransactionManifestRequest) => {
 		try {
 			if (request.action === "compare") {
 				check(equal(request.fixed, request.current), "SELECTION_STALE");
@@ -67,7 +65,7 @@ if (port) {
 			} else if (request.action === "entrypoint") {
 				validateEntrypoint(request);
 				port.postMessage({ value: true });
-			} else port.postMessage({ value: validate(request) });
+			} else port.postMessage({ value: await validate(request) });
 		} catch (error) {
 			port.postMessage({
 				error: error instanceof Error ? error.message.slice(0, 128) : "INVALID_MANIFEST",
@@ -131,9 +129,11 @@ function validateEntrypoint(input: Extract<TransactionManifestRequest, { action:
 	validateRecoveryPolicy(selector.request, input.acceptSnapshotRestore);
 }
 
-function validate(
+async function validate(
 	input: Extract<TransactionManifestRequest, { action: "validate" }>,
-): ValidatedTransactionManifest {
+): Promise<ValidatedTransactionManifest> {
+	// Only full validation needs plan helpers and their schema dependencies.
+	const { fingerprintRevertPlanFiles, revertPlanHeaderDigest } = await import("./revert-plan-read");
 	check(input.raw.length === 3, "ORIGINAL_REFS_REQUIRED");
 	const [manifest, selector, selection] = input.raw.map(({ ref, bytes }) => {
 		refValid(ref);

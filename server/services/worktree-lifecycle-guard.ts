@@ -1,7 +1,8 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { lstat } from "node:fs/promises";
 import { dirname, isAbsolute, resolve } from "node:path";
-import { eq, inArray, sql } from "drizzle-orm";
+import { eq } from "drizzle-orm";
+import { readQuery, readQueryFirst, readTransactionTask } from "../db/worker-read";
 import { localPathSemantics } from "../lib/agent/execution/path-semantics";
 import { AppError } from "../lib/errors";
 import { hotSafe } from "../lib/hot-safe";
@@ -14,6 +15,7 @@ import {
 	readProtectionClaims,
 } from "./resource-protection-index";
 import { treeSnapshotKey, treeSnapshotPhysicalDir } from "./tree-snapshot-paths";
+import { runWorktreeLifecycleRead } from "./worktree-lifecycle-read";
 
 export interface LifecycleTarget {
 	deviceId?: string;
@@ -171,12 +173,14 @@ export async function withChapterCreation<T>(
 		// Re-read after admission, not from a project captured before an await gap.
 		const { db } = await import("../db");
 		const { projects } = await import("../db/schema");
-		const project = db
-			.select({ path: projects.gitPath })
-			.from(projects)
-			.where(eq(projects.id, projectId))
-			.limit(1)
-			.get();
+		const project = await readQueryFirst(
+			db
+				.select({ path: projects.gitPath })
+				.from(projects)
+				.where(eq(projects.id, projectId))
+				.limit(1),
+			{ timeoutMs: Math.max(1, deadline - performance.now()) },
+		);
 		if (
 			!project?.path ||
 			(await boundedRead(productionPorts.canonicalPath(project.path), deadline)) !==
@@ -1029,12 +1033,13 @@ export async function withLegacyCreationRollback<T>(
 ): Promise<T> {
 	const { db } = await import("../db");
 	const { chapters } = await import("../db/schema");
-	const row = db
-		.select({ path: chapters.worktreePath, shadowKey: chapters.snapshotShadowKey })
-		.from(chapters)
-		.where(eq(chapters.id, chapterId))
-		.limit(1)
-		.get();
+	const row = await readQueryFirst(
+		db
+			.select({ path: chapters.worktreePath, shadowKey: chapters.snapshotShadowKey })
+			.from(chapters)
+			.where(eq(chapters.id, chapterId))
+			.limit(1),
+	);
 	const creation = creationContext.getStore();
 	if (row && creation && !creation.createdChapters?.has(chapterId))
 		reject("unowned chapter compensation", unavailable());
@@ -1107,35 +1112,28 @@ export async function withLegacyRetirement<T>(
 	const deadline = Math.min(deadlineLimit, performance.now() + MAX_MS);
 	let admitted = false;
 	try {
-		const { db } = await import("../db");
-		const { chapters, narrators } = await import("../db/schema");
-		const rows = db
-			.select({
-				id: chapters.id,
-				path: chapters.worktreePath,
-				shadowKey: chapters.snapshotShadowKey,
-			})
-			.from(chapters)
-			.where(inArray(chapters.id, [...chapterIds]))
-			.limit(MAX_TARGETS + 1)
-			.all();
+		const { db, sqlite } = await import("../db");
+		const task = {
+			kind: "worktree-lifecycle-read-v1" as const,
+			chapterIds: [...chapterIds],
+			limit: MAX_TARGETS + 1,
+		};
+		const { rows, owners } = await readTransactionTask<ReturnType<typeof runWorktreeLifecycleRead>>(
+			db,
+			task,
+			() => runWorktreeLifecycleRead(sqlite, task, signal ?? new AbortController().signal),
+			{
+				signal,
+				timeoutMs: Math.max(1, deadline - performance.now()),
+				site: "worktree.retirement.provenance",
+			},
+		);
 		if (rows.length !== new Set(chapterIds).size) reject(operation, unavailable());
 		const scope: VerifiedReleaseScope = {
 			chapters: new Set(rows.map((row) => row.id)),
 			narrators: new Map(),
 		};
 		verifiedScopes.add(scope);
-		const owners = db
-			.select({
-				id: narrators.id,
-				cwd: narrators.cwd,
-				contextCwd: sql<string | null>`json_extract(${narrators.workspaceContext}, '$.cwd')`,
-				revision: narrators.workspaceRevision,
-			})
-			.from(narrators)
-			.where(inArray(narrators.chapterId, [...chapterIds]))
-			.limit(MAX_TARGETS + 1)
-			.all();
 		const provenanceComplete =
 			owners.length <= MAX_TARGETS &&
 			Buffer.byteLength(JSON.stringify(rows)) + Buffer.byteLength(JSON.stringify(owners)) <=
@@ -1218,30 +1216,34 @@ export async function withProjectRetirement<T>(
 			async () => {
 				const { db } = await import("../db");
 				const { chapters, narratorWorktreeResources } = await import("../db/schema");
-				const scopedResource = db
-					.select({
-						id: narratorWorktreeResources.id,
-						path: narratorWorktreeResources.worktreePath,
-						deviceId: narratorWorktreeResources.deviceId,
-						state: narratorWorktreeResources.state,
-						scopeProjectId: narratorWorktreeResources.scopeProjectId,
-					})
-					.from(narratorWorktreeResources)
-					.where(eq(narratorWorktreeResources.scopeProjectId, projectId))
-					.limit(1)
-					.get();
+				const scopedResource = await readQueryFirst(
+					db
+						.select({
+							id: narratorWorktreeResources.id,
+							path: narratorWorktreeResources.worktreePath,
+							deviceId: narratorWorktreeResources.deviceId,
+							state: narratorWorktreeResources.state,
+							scopeProjectId: narratorWorktreeResources.scopeProjectId,
+						})
+						.from(narratorWorktreeResources)
+						.where(eq(narratorWorktreeResources.scopeProjectId, projectId))
+						.limit(1),
+					{ signal, timeoutMs: Math.max(1, deadline - performance.now()) },
+				);
 				if (scopedResource)
 					reject("project delete", {
 						status: "protected",
 						complete: false,
 						claims: [{ kind: "registry", ...scopedResource }],
 					});
-				const rows = db
-					.select({ id: chapters.id, path: chapters.worktreePath, isRoot: chapters.isRoot })
-					.from(chapters)
-					.where(eq(chapters.projectId, projectId))
-					.limit(MAX_TARGETS + 1)
-					.all();
+				const rows = await readQuery(
+					db
+						.select({ id: chapters.id, path: chapters.worktreePath, isRoot: chapters.isRoot })
+						.from(chapters)
+						.where(eq(chapters.projectId, projectId))
+						.limit(MAX_TARGETS + 1),
+					{ signal, timeoutMs: Math.max(1, deadline - performance.now()) },
+				);
 				if (rows.length > MAX_TARGETS) reject("project delete", unavailable());
 				const targets: LifecycleTarget[] = [];
 				for (const row of rows) {

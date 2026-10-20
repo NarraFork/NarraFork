@@ -36,7 +36,7 @@ beforeEach(() => {
 						get(prepared, method) {
 							if (method === "all")
 								return (...bindings: (string | number)[]) => {
-									const limit = bindings[bindings.length - 1];
+									const limit = /\bLIMIT 1\s*$/i.test(sql) ? 1 : bindings[bindings.length - 1];
 									expect(typeof limit).toBe("number");
 									expect(limit as number).toBeLessThanOrEqual(CONTEXT_COMPOSITION_LIMITS.toolBatch);
 									const started = performance.now();

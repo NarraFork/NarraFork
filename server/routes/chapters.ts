@@ -1,3 +1,4 @@
+import { readQuery, readQueryFirst } from "@server/db/worker-read";
 import { eq } from "drizzle-orm";
 import { Hono, type MiddlewareHandler } from "hono";
 import { activeDatabaseBackend, db } from "../db";
@@ -258,10 +259,12 @@ chapterRoutes.delete("/:id", async (c) => {
 
 chapterRoutes.get("/:id/dock-layout", async (c) => {
 	const id = c.req.param("id");
-	const row = await db.query.chapters.findFirst({
-		where: eq(chapters.id, id),
-		columns: { dockLayoutJson: true },
-	});
+	const row = await readQuery(
+		db.query.chapters.findFirst({
+			where: eq(chapters.id, id),
+			columns: { dockLayoutJson: true },
+		}),
+	);
 	if (!row) throw new NotFoundError("Chapter", id);
 	return c.json({ layout: row.dockLayoutJson ?? null });
 });
@@ -273,10 +276,12 @@ chapterRoutes.put("/:id/dock-layout", async (c) => {
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 	// Existence is checked before writing so a stale client (node deleted in
 	// another tab) gets a 404 instead of a silent no-op update.
-	const row = await db.query.chapters.findFirst({
-		where: eq(chapters.id, id),
-		columns: { id: true },
-	});
+	const row = await readQuery(
+		db.query.chapters.findFirst({
+			where: eq(chapters.id, id),
+			columns: { id: true },
+		}),
+	);
 	if (!row) throw new NotFoundError("Chapter", id);
 	await db.update(chapters).set({ dockLayoutJson: parsed.data.layout }).where(eq(chapters.id, id));
 	return c.json({ ok: true });
@@ -290,10 +295,12 @@ chapterRoutes.put("/:id/dock-layout", async (c) => {
 
 chapterRoutes.get("/:id/detached-panels", async (c) => {
 	const id = c.req.param("id");
-	const row = await db.query.chapters.findFirst({
-		where: eq(chapters.id, id),
-		columns: { detachedPanelsJson: true },
-	});
+	const row = await readQuery(
+		db.query.chapters.findFirst({
+			where: eq(chapters.id, id),
+			columns: { detachedPanelsJson: true },
+		}),
+	);
 	if (!row) throw new NotFoundError("Chapter", id);
 	return c.json({ panels: row.detachedPanelsJson ?? null });
 });
@@ -303,10 +310,12 @@ chapterRoutes.put("/:id/detached-panels", async (c) => {
 	const id = c.req.param("id");
 	const parsed = updateChapterDetachedPanelsSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const row = await db.query.chapters.findFirst({
-		where: eq(chapters.id, id),
-		columns: { id: true },
-	});
+	const row = await readQuery(
+		db.query.chapters.findFirst({
+			where: eq(chapters.id, id),
+			columns: { id: true },
+		}),
+	);
 	if (!row) throw new NotFoundError("Chapter", id);
 	await db
 		.update(chapters)
@@ -370,11 +379,13 @@ chapterRoutes.post("/:id/merge", async (c) => {
 	const parsed = mergeChapterSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 
-	const source = await db.query.chapters.findFirst({ where: eq(chapters.id, id) });
+	const source = await readQuery(db.query.chapters.findFirst({ where: eq(chapters.id, id) }));
 	if (!source) throw new NotFoundError("Chapter", id);
-	const target = await db.query.chapters.findFirst({
-		where: eq(chapters.id, parsed.data.targetChapterId),
-	});
+	const target = await readQuery(
+		db.query.chapters.findFirst({
+			where: eq(chapters.id, parsed.data.targetChapterId),
+		}),
+	);
 
 	// Uncommitted changes are only a problem for the commit-based merge, which reads
 	// branch tips and would silently drop them. The default snapshot merge takes the
@@ -550,15 +561,19 @@ chapterRoutes.get("/:id/containers", async (c) => {
 	// All instances belong to the same chapter — look up project domain once
 	const hasProxyInstances = instances.some((inst) => !!inst.proxyLabel);
 	if (hasProxyInstances) {
-		const chapter = await db.query.chapters.findFirst({
-			where: eq(chapters.id, id),
-			columns: { projectId: true },
-		});
+		const chapter = await readQuery(
+			db.query.chapters.findFirst({
+				where: eq(chapters.id, id),
+				columns: { projectId: true },
+			}),
+		);
 		if (chapter) {
-			const project = await db.query.projects.findFirst({
-				where: eq(projects.id, chapter.projectId),
-				columns: { proxyDomain: true },
-			});
+			const project = await readQuery(
+				db.query.projects.findFirst({
+					where: eq(projects.id, chapter.projectId),
+					columns: { proxyDomain: true },
+				}),
+			);
 			proxyDomain = project?.proxyDomain ?? null;
 		}
 	}
@@ -686,7 +701,9 @@ chapterRoutes.get("/:id/commits/:sha", async (c) => {
 	const commit = await commitSyncService.getCommitBySha(id, sha);
 	if (!commit) throw new NotFoundError("Commit", sha);
 
-	const project = await db.select().from(projects).where(eq(projects.id, chapter.projectId)).get();
+	const project = await readQueryFirst(
+		db.select().from(projects).where(eq(projects.id, chapter.projectId)),
+	);
 	const repoPath = chapter.worktreePath || project?.gitPath;
 
 	let files: Array<{
@@ -741,7 +758,9 @@ chapterRoutes.get("/:id/commits/:sha/files/*", async (c) => {
 	if (!filePath) throw new ValidationError("File path is required");
 
 	const chapter = await chapterService.getById(id);
-	const project = await db.select().from(projects).where(eq(projects.id, chapter.projectId)).get();
+	const project = await readQueryFirst(
+		db.select().from(projects).where(eq(projects.id, chapter.projectId)),
+	);
 	const repoPath = chapter.worktreePath || project?.gitPath;
 	if (!repoPath) throw new ValidationError("No git repository available");
 

@@ -7,6 +7,7 @@ import { FILE_CHANGE_LIMITS, type FileChangeUnavailableReason } from "@shared/fi
 import { and, eq, isNull, sql } from "drizzle-orm";
 import { db } from "../db";
 import { fileChangeScopes, snapshotCaptures } from "../db/schema";
+import { readQueryFirst } from "../db/worker-read";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
@@ -153,24 +154,26 @@ export class SnapshotCaptureReceiptService {
 		const workspaceInstanceId = hash.digest("hex");
 		signal.throwIfAborted();
 		this.assertConnection();
-		const row = this.options.db
-			.select({
-				id: sql<string>`substr(${fileChangeScopes.id}, 1, 257)`,
-				root: sql<string>`substr(${fileChangeScopes.canonicalRoot}, 1, 8193)`,
-				object: sql<string | null>`substr(${fileChangeScopes.rootIdentityJson}, 1, 1025)`,
-				status: fileChangeScopes.status,
-				flavor: fileChangeScopes.pathFlavor,
-			})
-			.from(fileChangeScopes)
-			.where(
-				and(
-					eq(fileChangeScopes.sourceInstanceId, source.id),
-					eq(fileChangeScopes.deviceId, LOCAL_DEVICE_ID),
-					eq(fileChangeScopes.workspaceInstanceId, workspaceInstanceId),
-				),
-			)
-			.limit(1)
-			.get();
+		const row = await readQueryFirst(
+			this.options.db
+				.select({
+					id: sql<string>`substr(${fileChangeScopes.id}, 1, 257)`,
+					root: sql<string>`substr(${fileChangeScopes.canonicalRoot}, 1, 8193)`,
+					object: sql<string | null>`substr(${fileChangeScopes.rootIdentityJson}, 1, 1025)`,
+					status: fileChangeScopes.status,
+					flavor: fileChangeScopes.pathFlavor,
+				})
+				.from(fileChangeScopes)
+				.where(
+					and(
+						eq(fileChangeScopes.sourceInstanceId, source.id),
+						eq(fileChangeScopes.deviceId, LOCAL_DEVICE_ID),
+						eq(fileChangeScopes.workspaceInstanceId, workspaceInstanceId),
+					),
+				)
+				.limit(1),
+			{ signal },
+		);
 		if (
 			!row ||
 			row.id.length > 256 ||

@@ -2,6 +2,7 @@ import { lstat, open, realpath } from "node:fs/promises";
 import { basename, dirname, resolve } from "node:path";
 import { db } from "@server/db";
 import { narrators } from "@server/db/schema";
+import { readQuery } from "@server/db/worker-read";
 import { eq } from "drizzle-orm";
 import { narratorTraitsLock } from "../async-mutex";
 import { parseTraits } from "../narrator-utils";
@@ -137,10 +138,12 @@ async function withPipelineLock<T>(narratorId: string, fn: () => Promise<T>): Pr
 }
 
 async function readTraits(narratorId: string): Promise<string[]> {
-	const row = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { traits: true },
-	});
+	const row = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { traits: true },
+		}),
+	);
 	return parseTraits(row?.traits);
 }
 

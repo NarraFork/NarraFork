@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import { access, constants, realpath, stat } from "node:fs/promises";
 import { isAbsolute } from "node:path";
+import { readQuery } from "@server/db/worker-read";
 import type { SwitchWorkingDirectoryRequest, WorkspaceContext } from "@shared/workspace-context";
 import { and, eq, isNull } from "drizzle-orm";
 import { db } from "../db";
@@ -73,21 +74,23 @@ export interface WorkspaceSwitchOptions {
 }
 
 async function loadWorkspaceRow(id: string) {
-	const row = await db.query.narrators.findFirst({
-		where: eq(narrators.id, id),
-		columns: {
-			id: true,
-			cwd: true,
-			workspaceRevision: true,
-			workspaceContext: true,
-			defaultDeviceId: true,
-			chapterId: true,
-			contextProjectId: true,
-			variant: true,
-			traits: true,
-			status: true,
-		},
-	});
+	const row = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, id),
+			columns: {
+				id: true,
+				cwd: true,
+				workspaceRevision: true,
+				workspaceContext: true,
+				defaultDeviceId: true,
+				chapterId: true,
+				contextProjectId: true,
+				variant: true,
+				traits: true,
+				status: true,
+			},
+		}),
+	);
 	if (!row) throw new NotFoundError("Narrator", id);
 	return row;
 }
@@ -330,17 +333,21 @@ export const workspaceContextService = {
 	async get(id: string): Promise<WorkspaceContext> {
 		const row = await loadWorkspaceRow(id);
 		const chapter = row.chapterId
-			? await db.query.chapters.findFirst({
-					where: eq(chapters.id, row.chapterId),
-					columns: { worktreePath: true, projectId: true, isRoot: true },
-				})
+			? await readQuery(
+					db.query.chapters.findFirst({
+						where: eq(chapters.id, row.chapterId),
+						columns: { worktreePath: true, projectId: true, isRoot: true },
+					}),
+				)
 			: undefined;
 		const projectId = chapter?.projectId ?? row.contextProjectId ?? undefined;
 		const project = projectId
-			? await db.query.projects.findFirst({
-					where: eq(projects.id, projectId),
-					columns: { gitPath: true },
-				})
+			? await readQuery(
+					db.query.projects.findFirst({
+						where: eq(projects.id, projectId),
+						columns: { gitPath: true },
+					}),
+				)
 			: undefined;
 		// Persistence is authoritative, including while runtime installation is awaiting.
 		const deviceId = row.workspaceContext
@@ -462,16 +469,20 @@ export const workspaceContextService = {
 					}
 					// cwd remains the narrator's selected local directory across remote visits.
 					const chapter = row.chapterId
-						? await db.query.chapters.findFirst({
-								where: eq(chapters.id, row.chapterId),
-								columns: { worktreePath: true },
-							})
+						? await readQuery(
+								db.query.chapters.findFirst({
+									where: eq(chapters.id, row.chapterId),
+									columns: { worktreePath: true },
+								}),
+							)
 						: undefined;
 					const project = previous.contextProjectId
-						? await db.query.projects.findFirst({
-								where: eq(projects.id, previous.contextProjectId),
-								columns: { gitPath: true },
-							})
+						? await readQuery(
+								db.query.projects.findFirst({
+									where: eq(projects.id, previous.contextProjectId),
+									columns: { gitPath: true },
+								}),
+							)
 						: undefined;
 					const target = await prepareLocalWorkspaceContext(
 						resolveNarratorSessionCwd(row.cwd, chapter?.worktreePath, project?.gitPath, getHome()),
@@ -586,10 +597,12 @@ export const workspaceContextService = {
 				);
 				await assertTargetAllowed(id, target.cwd);
 				if (row.chapterId) {
-					const chapter = await db.query.chapters.findFirst({
-						where: eq(chapters.id, row.chapterId),
-						columns: { worktreePath: true },
-					});
+					const chapter = await readQuery(
+						db.query.chapters.findFirst({
+							where: eq(chapters.id, row.chapterId),
+							columns: { worktreePath: true },
+						}),
+					);
 					const root = chapter?.worktreePath
 						? await realpath(chapter.worktreePath).catch(() => null)
 						: null;

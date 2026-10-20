@@ -1,9 +1,12 @@
 import { Database } from "bun:sqlite";
 import { existsSync, mkdirSync } from "node:fs";
 import { resolve } from "node:path";
+import { readQuery } from "@server/db/worker-read";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { projects } from "../db/schema";
+import { closeDbWorkerConnections } from "./db-worker/pool";
+import { logger } from "./logger";
 
 /**
  * Stamped into `PRAGMA user_version` and, as of today, read by nothing — schema drift is
@@ -382,6 +385,7 @@ interface CachedConnection {
 
 class ProjectDbManager {
 	private cache = new Map<string, CachedConnection>();
+	private closing = new Map<string, Promise<void>>();
 	private maxConnections = 8;
 	/** Idle timeout: close connections unused for 30 minutes. */
 	private idleTimeoutMs = 30 * 60 * 1000;
@@ -392,16 +396,19 @@ class ProjectDbManager {
 	 * Returns null if the project has no gitPath or the path doesn't exist.
 	 */
 	async getDb(projectId: string): Promise<Database | null> {
+		await this.closing.get(projectId);
 		const cached = this.cache.get(projectId);
 		if (cached) {
 			cached.lastUsed = Date.now();
 			return cached.conn;
 		}
 
-		const project = await db.query.projects.findFirst({
-			where: eq(projects.id, projectId),
-			columns: { gitPath: true },
-		});
+		const project = await readQuery(
+			db.query.projects.findFirst({
+				where: eq(projects.id, projectId),
+				columns: { gitPath: true },
+			}),
+		);
 		if (!project?.gitPath || !existsSync(project.gitPath)) return null;
 
 		return this.openForGitPath(projectId, project.gitPath);
@@ -411,7 +418,8 @@ class ProjectDbManager {
 	 * Open a project database for a known gitPath (skips DB lookup).
 	 * Used during project creation when the project record already exists.
 	 */
-	openForGitPath(projectId: string, gitPath: string): Database {
+	async openForGitPath(projectId: string, gitPath: string): Promise<Database> {
+		await this.closing.get(projectId);
 		// Check cache first
 		const cached = this.cache.get(projectId);
 		if (cached) {
@@ -419,7 +427,10 @@ class ProjectDbManager {
 			return cached.conn;
 		}
 
-		this.evictIfNeeded();
+		await this.evictIfNeeded();
+		// A concurrent opener may have populated the cache while eviction drained readers.
+		const opened = this.cache.get(projectId);
+		if (opened) return opened.conn;
 		this.ensureCleanupTimer();
 
 		const conn = initProjectDb(gitPath);
@@ -428,36 +439,35 @@ class ProjectDbManager {
 	}
 
 	/** Close a specific project's connection. */
-	close(projectId: string): void {
+	close(projectId: string): Promise<void> {
+		const pending = this.closing.get(projectId);
+		if (pending) return pending;
 		const cached = this.cache.get(projectId);
-		if (cached) {
+		if (!cached) return Promise.resolve();
+		const closing = closeDbWorkerConnections(cached.conn.filename, () => {
 			try {
 				cached.conn.run("PRAGMA wal_checkpoint(TRUNCATE)");
 			} catch {
-				// best-effort
+				// best-effort checkpoint; closing still releases the write handle.
 			}
 			cached.conn.close();
 			this.cache.delete(projectId);
-		}
-		if (this.cache.size === 0) this.stopCleanupTimer();
+		}).finally(() => {
+			this.closing.delete(projectId);
+			if (this.cache.size === 0) this.stopCleanupTimer();
+		});
+		this.closing.set(projectId, closing);
+		return closing;
 	}
 
 	/** Close all connections (process exit). */
-	closeAll(): void {
-		for (const [, cached] of this.cache) {
-			try {
-				cached.conn.run("PRAGMA wal_checkpoint(TRUNCATE)");
-				cached.conn.close();
-			} catch {
-				// best-effort
-			}
-		}
-		this.cache.clear();
+	async closeAll(): Promise<void> {
+		for (const projectId of [...this.cache.keys()]) await this.close(projectId);
 		this.stopCleanupTimer();
 	}
 
 	/** Evict least-recently-used connections if over limit. */
-	private evictIfNeeded(): void {
+	private async evictIfNeeded(): Promise<void> {
 		if (this.cache.size < this.maxConnections) return;
 		let oldestId: string | null = null;
 		let oldestTime = Number.POSITIVE_INFINITY;
@@ -467,13 +477,20 @@ class ProjectDbManager {
 				oldestId = id;
 			}
 		}
-		if (oldestId) this.close(oldestId);
+		if (oldestId) await this.close(oldestId);
 	}
 
 	/** Start periodic cleanup timer (every 10 minutes). */
 	private ensureCleanupTimer(): void {
 		if (this.cleanupTimer) return;
-		this.cleanupTimer = setInterval(() => this.evictIdle(), 10 * 60 * 1000);
+		this.cleanupTimer = setInterval(
+			() => {
+				void this.evictIdle().catch((error) =>
+					logger.warn("Project archive idle close failed", { error: String(error) }),
+				);
+			},
+			10 * 60 * 1000,
+		);
 		// Don't prevent process exit
 		if (
 			this.cleanupTimer &&
@@ -492,13 +509,13 @@ class ProjectDbManager {
 	}
 
 	/** Close connections that have been idle longer than idleTimeoutMs. */
-	private evictIdle(): void {
+	private async evictIdle(): Promise<void> {
 		const cutoff = Date.now() - this.idleTimeoutMs;
 		const toEvict: string[] = [];
 		for (const [id, cached] of this.cache) {
 			if (cached.lastUsed < cutoff) toEvict.push(id);
 		}
-		for (const id of toEvict) this.close(id);
+		for (const id of toEvict) await this.close(id);
 	}
 }
 

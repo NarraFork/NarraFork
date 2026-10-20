@@ -152,13 +152,13 @@ if (process.env.NARRAFORK_SUBAGENT_INTERRUPT_FIXTURE !== "1") {
 	}
 
 	/** What the loop's `shouldStop` callback decides at a tool boundary for this session. */
-	function boundaryStops(id = SUBAGENT_ID): boolean {
+	async function boundaryStops(id = SUBAGENT_ID): Promise<boolean> {
 		const active = activeNarrators.get(id);
 		if (!active) return false;
 		const decision = evaluateSoftStopRequest({
 			feedbackSoftStop: active._feedbackSoftStop,
 			bufferSoftStop: active._bufferSoftStop,
-			hasPendingBufferedWork: hasPendingBufferedGuidance(id),
+			hasPendingBufferedWork: await hasPendingBufferedGuidance(id),
 		});
 		active._bufferSoftStop = decision.bufferSoftStop;
 		return decision.stop;
@@ -234,7 +234,7 @@ if (process.env.NARRAFORK_SUBAGENT_INTERRUPT_FIXTURE !== "1") {
 			await pushRow("second");
 			await pushRow("third");
 
-			expect(getBufferedMessages(SUBAGENT_ID).map((message) => message.text)).toEqual([
+			expect((await getBufferedMessages(SUBAGENT_ID)).map((message) => message.text)).toEqual([
 				"first",
 				"second",
 				"third",
@@ -247,7 +247,7 @@ if (process.env.NARRAFORK_SUBAGENT_INTERRUPT_FIXTURE !== "1") {
 			await pushRow("priority-2", "front");
 			await pushRow("ordinary-2");
 
-			expect(getBufferedMessages(SUBAGENT_ID).map((message) => message.text)).toEqual([
+			expect((await getBufferedMessages(SUBAGENT_ID)).map((message) => message.text)).toEqual([
 				"priority-1",
 				"priority-2",
 				"ordinary-1",
@@ -260,13 +260,13 @@ if (process.env.NARRAFORK_SUBAGENT_INTERRUPT_FIXTURE !== "1") {
 			await sendInput("first", "tool");
 			await sendInput("second", "tool");
 
-			expect(getBufferedMessages(SUBAGENT_ID).map((message) => message.text)).toEqual([
+			expect((await getBufferedMessages(SUBAGENT_ID)).map((message) => message.text)).toEqual([
 				"first",
 				"second",
 			]);
 			// The guidance signal ends a streaming request; the boundary check stops the turn.
 			expect(active._guidanceAbortController.signal.aborted).toBe(true);
-			expect(boundaryStops()).toBe(true);
+			expect(await boundaryStops()).toBe(true);
 			// The turn itself is not cancelled: only the next safe boundary is requested.
 			expect(active.abortController.signal.aborted).toBe(false);
 		});
@@ -275,11 +275,11 @@ if (process.env.NARRAFORK_SUBAGENT_INTERRUPT_FIXTURE !== "1") {
 			const active = liveTurn();
 			await sendInput("first", "turn");
 			await sendInput("second", "turn");
-			const messages = getBufferedMessages(SUBAGENT_ID);
+			const messages = await getBufferedMessages(SUBAGENT_ID);
 			expect(messages.map((message) => message.text)).toEqual(["first", "second"]);
 			expect(messages.map((message) => message.queueMode)).toEqual(["turn", "turn"]);
 			expect(active._guidanceAbortController.signal.aborted).toBe(false);
-			expect(boundaryStops()).toBe(false);
+			expect(await boundaryStops()).toBe(false);
 		});
 
 		test("tool guidance only cancels the guidance channel and preserves the run", async () => {
@@ -287,7 +287,7 @@ if (process.env.NARRAFORK_SUBAGENT_INTERRUPT_FIXTURE !== "1") {
 			const { run, owner } = mountRun(SUBAGENT_ID);
 			await sendInput("feedback", "tool");
 			expect(active._bufferSoftStop).toBe(true);
-			expect(boundaryStops()).toBe(true);
+			expect(await boundaryStops()).toBe(true);
 			expect(active._guidanceAbortController.signal.aborted).toBe(true);
 			expect(active.abortController.signal.aborted).toBe(false);
 			expect(run.cancel.signal.aborted).toBe(false);
@@ -302,7 +302,7 @@ if (process.env.NARRAFORK_SUBAGENT_INTERRUPT_FIXTURE !== "1") {
 			await sendInput("urgent", "interrupt");
 			// Provider request and tool IO are cancelled through the urgent guidance signal…
 			expect(active._urgentGuidanceAbortController?.signal.aborted).toBe(true);
-			expect(boundaryStops()).toBe(true);
+			expect(await boundaryStops()).toBe(true);
 			// …but neither the session's turn controller nor the run is cancelled, and no
 			// user interrupt is recorded: the input is adopted inside the same run.
 			expect(active.abortController.signal.aborted).toBe(false);
@@ -379,7 +379,7 @@ if (process.env.NARRAFORK_SUBAGENT_INTERRUPT_FIXTURE !== "1") {
 			await sendInput("tool-1", "tool");
 			await sendInput("interrupt-1", "interrupt");
 			await sendInput("tool-2", "tool");
-			expect(getBufferedMessages(SUBAGENT_ID).map((message) => message.text)).toEqual([
+			expect((await getBufferedMessages(SUBAGENT_ID)).map((message) => message.text)).toEqual([
 				"interrupt-1",
 				"tool-1",
 				"tool-2",
@@ -403,8 +403,8 @@ if (process.env.NARRAFORK_SUBAGENT_INTERRUPT_FIXTURE !== "1") {
 			await sendInput("after completion", "turn");
 			requestBufferedMessageSoftStop(SUBAGENT_ID);
 			// A stop request with only a next step queued is dropped at the boundary.
-			expect(boundaryStops()).toBe(false);
-			expect(getBufferedMessages(SUBAGENT_ID).map((message) => message.text)).toEqual([
+			expect(await boundaryStops()).toBe(false);
+			expect((await getBufferedMessages(SUBAGENT_ID)).map((message) => message.text)).toEqual([
 				"after completion",
 			]);
 		});
@@ -412,15 +412,15 @@ if (process.env.NARRAFORK_SUBAGENT_INTERRUPT_FIXTURE !== "1") {
 		test("mode downgrade clears only when no queued guidance remains", async () => {
 			const active = liveTurn();
 			await sendInput("guide", "tool");
-			applyBufferedQueueModeControl(SUBAGENT_ID, "turn", true, true);
+			await applyBufferedQueueModeControl(SUBAGENT_ID, "turn", true, true);
 			expect(active._bufferSoftStop).toBe(true);
-			applyBufferedQueueModeControl(SUBAGENT_ID, "turn", false, true);
+			await applyBufferedQueueModeControl(SUBAGENT_ID, "turn", false, true);
 			expect(active._bufferSoftStop).toBe(false);
 		});
 
-		test("failed mode target cannot cancel a pass even with other queued guidance", () => {
+		test("failed mode target cannot cancel a pass even with other queued guidance", async () => {
 			const active = liveTurn();
-			applyBufferedQueueModeControl(SUBAGENT_ID, "interrupt", true, false);
+			await applyBufferedQueueModeControl(SUBAGENT_ID, "interrupt", true, false);
 			expect(active._guidanceAbortController.signal.aborted).toBe(false);
 			expect(active.abortController.signal.aborted).toBe(false);
 		});
@@ -432,13 +432,13 @@ if (process.env.NARRAFORK_SUBAGENT_INTERRUPT_FIXTURE !== "1") {
 			);
 			expect(active._guidanceAbortController.signal.aborted).toBe(false);
 			expect(active.abortController.signal.aborted).toBe(false);
-			expect(getBufferedMessages(SUBAGENT_ID)).toEqual([]);
+			expect(await getBufferedMessages(SUBAGENT_ID)).toEqual([]);
 		});
 
-		test("mode control on an idle session does not cancel anything", () => {
+		test("mode control on an idle session does not cancel anything", async () => {
 			const active = liveTurn();
 			active._loopRunning = false;
-			applyBufferedQueueModeControl(SUBAGENT_ID, "interrupt");
+			await applyBufferedQueueModeControl(SUBAGENT_ID, "interrupt");
 			expect(active._guidanceAbortController.signal.aborted).toBe(false);
 			expect(active.abortController.signal.aborted).toBe(false);
 		});
@@ -447,28 +447,30 @@ if (process.env.NARRAFORK_SUBAGENT_INTERRUPT_FIXTURE !== "1") {
 			const active = liveTurn();
 			await sendInput("manual");
 
-			expect(getBufferedMessages(SUBAGENT_ID).map((message) => message.text)).toEqual(["manual"]);
+			expect((await getBufferedMessages(SUBAGENT_ID)).map((message) => message.text)).toEqual([
+				"manual",
+			]);
 			expect(active._guidanceAbortController.signal.aborted).toBe(false);
-			expect(boundaryStops()).toBe(false);
+			expect(await boundaryStops()).toBe(false);
 		});
 
 		test("buffer soft-stop remains effective while queued guidance remains", async () => {
 			liveTurn();
 			await sendInput("first", "tool");
 			await sendInput("second", "tool");
-			expect(hasPendingBufferedGuidance(SUBAGENT_ID)).toBe(true);
-			expect(boundaryStops()).toBe(true);
+			expect(await hasPendingBufferedGuidance(SUBAGENT_ID)).toBe(true);
+			expect(await boundaryStops()).toBe(true);
 			// Re-armed for a later pass while guidance is still queued.
 			requestBufferedMessageSoftStop(SUBAGENT_ID);
-			expect(boundaryStops()).toBe(true);
+			expect(await boundaryStops()).toBe(true);
 		});
 
 		test("clearing the queue also clears its pending guidance", async () => {
 			liveTurn();
 			await sendInput("queued", "tool");
 			await clearBufferedMessages(SUBAGENT_ID);
-			expect(hasPendingBufferedGuidance(SUBAGENT_ID)).toBe(false);
-			expect(boundaryStops()).toBe(false);
+			expect(await hasPendingBufferedGuidance(SUBAGENT_ID)).toBe(false);
+			expect(await boundaryStops()).toBe(false);
 		});
 	});
 
@@ -483,9 +485,9 @@ if (process.env.NARRAFORK_SUBAGENT_INTERRUPT_FIXTURE !== "1") {
 
 			expect(await removeBufferedMessage(SUBAGENT_ID, queued.id)).toBe(true);
 
-			expect(getBufferedMessages(SUBAGENT_ID)).toEqual([]);
+			expect(await getBufferedMessages(SUBAGENT_ID)).toEqual([]);
 			// A stale soft stop would end the next turn with nothing left to resume.
-			expect(boundaryStops()).toBe(false);
+			expect(await boundaryStops()).toBe(false);
 		});
 
 		test("removing one of several messages keeps the rest and the soft stop", async () => {
@@ -495,8 +497,8 @@ if (process.env.NARRAFORK_SUBAGENT_INTERRUPT_FIXTURE !== "1") {
 
 			expect(await removeBufferedMessage(SUBAGENT_ID, first.id)).toBe(true);
 
-			expect(getBufferedMessages(SUBAGENT_ID).map((m) => m.text)).toEqual(["second"]);
-			expect(boundaryStops()).toBe(true);
+			expect((await getBufferedMessages(SUBAGENT_ID)).map((m) => m.text)).toEqual(["second"]);
+			expect(await boundaryStops()).toBe(true);
 		});
 
 		test("unknown ids report a miss", async () => {
@@ -512,7 +514,7 @@ if (process.env.NARRAFORK_SUBAGENT_INTERRUPT_FIXTURE !== "1") {
 
 			expect(await updateBufferedMessage(SUBAGENT_ID, queued.id, "after")).toBe(true);
 
-			expect(getBufferedMessages(SUBAGENT_ID).map((m) => m.text)).toEqual(["after"]);
+			expect((await getBufferedMessages(SUBAGENT_ID)).map((m) => m.text)).toEqual(["after"]);
 		});
 
 		test("reorder applies an exact permutation and rejects a mismatched id list", async () => {
@@ -520,12 +522,18 @@ if (process.env.NARRAFORK_SUBAGENT_INTERRUPT_FIXTURE !== "1") {
 			const second = await pushRow("second");
 
 			expect(await reorderBufferedMessages(SUBAGENT_ID, [second.id, first.id])).toBe(true);
-			expect(getBufferedMessages(SUBAGENT_ID).map((m) => m.text)).toEqual(["second", "first"]);
+			expect((await getBufferedMessages(SUBAGENT_ID)).map((m) => m.text)).toEqual([
+				"second",
+				"first",
+			]);
 
 			// A partial or foreign id list must leave the queue untouched.
 			expect(await reorderBufferedMessages(SUBAGENT_ID, [first.id])).toBe(false);
 			expect(await reorderBufferedMessages(SUBAGENT_ID, [second.id, "foreign"])).toBe(false);
-			expect(getBufferedMessages(SUBAGENT_ID).map((m) => m.text)).toEqual(["second", "first"]);
+			expect((await getBufferedMessages(SUBAGENT_ID)).map((m) => m.text)).toEqual([
+				"second",
+				"first",
+			]);
 		});
 	});
 
@@ -602,7 +610,7 @@ if (process.env.NARRAFORK_SUBAGENT_INTERRUPT_FIXTURE !== "1") {
 				expect(await parked).toBe("cancel");
 				expect(run.cancel.signal.aborted).toBe(true);
 				// The input stays queued for the session's next run, unclaimed.
-				const remaining = getBufferedMessages(SUBAGENT_ID);
+				const remaining = await getBufferedMessages(SUBAGENT_ID);
 				expect(remaining.map((message) => message.id)).toEqual([queued.id]);
 				expect(remaining[0]?.text).toBe("queued while held");
 				const head = await peekInbox(SUBAGENT_ID);

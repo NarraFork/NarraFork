@@ -1,3 +1,4 @@
+import { readQuery } from "../db/worker-read";
 /**
  * User-managed git commit identities, plus the per-(user × narrator) pick.
  *
@@ -135,21 +136,23 @@ export async function updateLegacyGitIdentityProfile(
 
 /** A user's identities, default first and then oldest first. */
 export async function listUserGitIdentities(userId: string): Promise<GitIdentityRecord[]> {
-	const rows = await db
-		.select({
-			id: userGitIdentities.id,
-			name: userGitIdentities.name,
-			email: userGitIdentities.email,
-			isDefault: userGitIdentities.isDefault,
-			createdAt: userGitIdentities.createdAt,
-		})
-		.from(userGitIdentities)
-		.where(eq(userGitIdentities.userId, userId))
-		.orderBy(
-			desc(userGitIdentities.isDefault),
-			asc(userGitIdentities.createdAt),
-			asc(userGitIdentities.id),
-		);
+	const rows = await readQuery(
+		db
+			.select({
+				id: userGitIdentities.id,
+				name: userGitIdentities.name,
+				email: userGitIdentities.email,
+				isDefault: userGitIdentities.isDefault,
+				createdAt: userGitIdentities.createdAt,
+			})
+			.from(userGitIdentities)
+			.where(eq(userGitIdentities.userId, userId))
+			.orderBy(
+				desc(userGitIdentities.isDefault),
+				asc(userGitIdentities.createdAt),
+				asc(userGitIdentities.id),
+			),
+	);
 	return rows;
 }
 
@@ -280,16 +283,18 @@ export async function getNarratorGitIdentityPick(
 	userId: string,
 	narratorId: string,
 ): Promise<string | null> {
-	const row = await db
-		.select({ identityId: narratorGitIdentityBindings.identityId })
-		.from(narratorGitIdentityBindings)
-		.where(
-			and(
-				eq(narratorGitIdentityBindings.narratorId, narratorId),
-				eq(narratorGitIdentityBindings.userId, userId),
-			),
-		)
-		.limit(1);
+	const row = await readQuery(
+		db
+			.select({ identityId: narratorGitIdentityBindings.identityId })
+			.from(narratorGitIdentityBindings)
+			.where(
+				and(
+					eq(narratorGitIdentityBindings.narratorId, narratorId),
+					eq(narratorGitIdentityBindings.userId, userId),
+				),
+			)
+			.limit(1),
+	);
 	return row[0]?.identityId ?? null;
 }
 
@@ -316,11 +321,13 @@ export async function setNarratorGitIdentityPick(
 		invalidateNarratorGitIdentityPickCache(narratorId, userId);
 		return;
 	}
-	const owned = await db
-		.select({ id: userGitIdentities.id })
-		.from(userGitIdentities)
-		.where(and(eq(userGitIdentities.id, identityId), eq(userGitIdentities.userId, userId)))
-		.limit(1);
+	const owned = await readQuery(
+		db
+			.select({ id: userGitIdentities.id })
+			.from(userGitIdentities)
+			.where(and(eq(userGitIdentities.id, identityId), eq(userGitIdentities.userId, userId)))
+			.limit(1),
+	);
 	if (owned.length === 0) throw new NotFoundError("Git identity", identityId);
 	const updatedAt = nowIso();
 	await db

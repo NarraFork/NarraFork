@@ -68,7 +68,7 @@ afterEach(async () => {
 		createdNarrators.length = 0;
 	}
 	for (const projectId of createdProjects.splice(0)) {
-		projectDbManager.close(projectId);
+		await projectDbManager.close(projectId);
 		// exploration_groups' chapter references are ON DELETE SET NULL, as are the
 		// chapters' self-references — no ordering constraint left here.
 		await db.delete(explorationGroups).where(eq(explorationGroups.projectId, projectId));
@@ -218,7 +218,7 @@ describe("import restores forward references whatever the row order", () => {
 
 		// Forget in FK-safe order: the child narrator's fork_message_id and the refs'
 		// message_id are NO ACTION references, so they go before the messages they name.
-		projectDbManager.close(projectId);
+		await projectDbManager.close(projectId);
 		await db.delete(narrators).where(eq(narrators.id, childNarratorId));
 		await db.delete(narratorMessageRefs).where(eq(narratorMessageRefs.messageId, forkMessageId));
 		await db.delete(narratorMessages).where(eq(narratorMessages.narratorId, parentNarratorId));
@@ -310,7 +310,7 @@ describe("import restores forward references whatever the row order", () => {
 		writable.run("DELETE FROM chapters WHERE id = ?", [parentId]);
 		writable.close();
 
-		projectDbManager.close(projectId);
+		await projectDbManager.close(projectId);
 		await db.delete(chapters).where(eq(chapters.projectId, projectId));
 		await db.delete(projects).where(eq(projects.id, projectId));
 

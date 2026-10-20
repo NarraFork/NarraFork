@@ -19,6 +19,7 @@ import {
 	narrators,
 	narratorToolCalls,
 } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import type { AgentEvent } from "../lib/agent";
 import { summaryGenerate } from "../lib/agent";
 import {
@@ -217,22 +218,31 @@ export async function persistDetachedToolResult(
 
 	// Refresh persisted history, not tool_completed (which mutates live streaming
 	// state by toolUseId). Project the current row so a newer attempt remains visible.
-	const message = await db.query.narratorMessages.findFirst({
-		where: eq(narratorMessages.id, affected.messageId),
-		with: { toolCalls: true },
-	});
-	const ref = await db.query.narratorMessageRefs.findFirst({
-		where: and(
-			eq(narratorMessageRefs.narratorId, narratorId),
-			eq(narratorMessageRefs.messageId, affected.messageId),
-		),
-		columns: { seq: true },
-	});
+	const message = await readQuery(
+		db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, affected.messageId),
+			with: { toolCalls: true },
+		}),
+		{ site: "narrator-event-handler.persistDetachedToolResult" },
+	);
+	const ref = await readQuery(
+		db.query.narratorMessageRefs.findFirst({
+			where: and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, affected.messageId),
+			),
+			columns: { seq: true },
+		}),
+		{ site: "narrator-event-handler.persistDetachedToolResult" },
+	);
 	if (!message || !ref) return;
-	const owner = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { type: true, parentNarratorId: true },
-	});
+	const owner = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { type: true, parentNarratorId: true },
+		}),
+		{ site: "narrator-event-handler.persistDetachedToolResult" },
+	);
 	const broadcastTargetId =
 		owner?.type === "subagent" ? (owner.parentNarratorId ?? narratorId) : narratorId;
 	const projected = enrichToolUseBlocks(truncateToolIO([{ ...message, seq: ref.seq }]))[0];
@@ -1177,10 +1187,13 @@ function reorderPersistedToolUseBlocks(
 /** Block count of a partial assistant message, or 0 when there is no partial row yet. */
 async function countPersistedBlocks(partialMessageId: string | undefined): Promise<number> {
 	if (!partialMessageId) return 0;
-	const row = await db.query.narratorMessages.findFirst({
-		where: eq(narratorMessages.id, partialMessageId),
-		columns: { contentJson: true },
-	});
+	const row = await readQuery(
+		db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, partialMessageId),
+			columns: { contentJson: true },
+		}),
+		{ site: "narrator-event-handler.countPersistedBlocks" },
+	);
 	return Array.isArray(row?.contentJson) ? row.contentJson.length : 0;
 }
 
@@ -1264,10 +1277,13 @@ async function discardAttemptPersistedBlocks(
 	if (!partialId) return;
 
 	try {
-		const message = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, partialId),
-			columns: { contentJson: true },
-		});
+		const message = await readQuery(
+			db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, partialId),
+				columns: { contentJson: true },
+			}),
+			{ site: "narrator-event-handler.discardAttemptPersistedBlocks" },
+		);
 		const blocks = Array.isArray(message?.contentJson)
 			? (message.contentJson as Array<Record<string, unknown>>)
 			: [];
@@ -1287,13 +1303,16 @@ async function discardAttemptPersistedBlocks(
 		// Which of those tool calls never ran — only these may be removed.
 		const executedToolUseIds = new Set<string>();
 		if (discardedToolUseIds.length > 0) {
-			const rows = await db.query.narratorToolCalls.findMany({
-				where: and(
-					eq(narratorToolCalls.messageId, partialId),
-					inArray(narratorToolCalls.toolUseId, discardedToolUseIds),
-				),
-				columns: { id: true, toolUseId: true, status: true },
-			});
+			const rows = await readQuery(
+				db.query.narratorToolCalls.findMany({
+					where: and(
+						eq(narratorToolCalls.messageId, partialId),
+						inArray(narratorToolCalls.toolUseId, discardedToolUseIds),
+					),
+					columns: { id: true, toolUseId: true, status: true },
+				}),
+				{ site: "narrator-event-handler.discardAttemptPersistedBlocks" },
+			);
 			const removableRowIds: string[] = [];
 			for (const row of rows) {
 				if (row.status === "initializing" || row.status === "pending") {
@@ -1358,18 +1377,24 @@ async function discardAttemptPersistedBlocks(
 		// message mutation) so an attached client and a reconnecting one agree.
 		await bumpNarratorMessageVersion(narratorId);
 		queueContextCharacterRefresh(narratorId, partialId);
-		const updated = await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, partialId),
-			with: { toolCalls: true },
-		});
+		const updated = await readQuery(
+			db.query.narratorMessages.findFirst({
+				where: eq(narratorMessages.id, partialId),
+				with: { toolCalls: true },
+			}),
+			{ site: "narrator-event-handler.discardAttemptPersistedBlocks" },
+		);
 		if (updated) {
-			const ref = await db.query.narratorMessageRefs.findFirst({
-				where: and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					eq(narratorMessageRefs.messageId, partialId),
-				),
-				columns: { seq: true },
-			});
+			const ref = await readQuery(
+				db.query.narratorMessageRefs.findFirst({
+					where: and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorMessageRefs.messageId, partialId),
+					),
+					columns: { seq: true },
+				}),
+				{ site: "narrator-event-handler.discardAttemptPersistedBlocks" },
+			);
 			const processed = enrichToolUseBlocks(truncateToolIO([{ ...updated, seq: ref?.seq }]))[0];
 			dualBroadcast(ctx, {
 				type: "message_updated",
@@ -1532,10 +1557,13 @@ function translateReasoningBlock(
 
 	(async () => {
 		try {
-			const before = await db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, messageId),
-				columns: { contentJson: true },
-			});
+			const before = await readQuery(
+				db.query.narratorMessages.findFirst({
+					where: eq(narratorMessages.id, messageId),
+					columns: { contentJson: true },
+				}),
+				{ site: "narrator-event-handler.query" },
+			);
 			const beforeBlocks = Array.isArray(before?.contentJson) ? before.contentJson : [];
 			const beforeIndex = findReasoningBlockIndex(beforeBlocks, { ...locator, reasoningText });
 			const beforeBlock = beforeBlocks[beforeIndex] as PersistedReasoningBlock | undefined;
@@ -1555,10 +1583,13 @@ function translateReasoningBlock(
 
 			// Find the exact reasoning block in the message.
 			// Prefer loop identity; provider coordinates/text are legacy-only fallbacks.
-			const msg = await db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, messageId),
-				columns: { contentJson: true },
-			});
+			const msg = await readQuery(
+				db.query.narratorMessages.findFirst({
+					where: eq(narratorMessages.id, messageId),
+					columns: { contentJson: true },
+				}),
+				{ site: "narrator-event-handler.query" },
+			);
 			if (!msg) return;
 			const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
 			const targetIdx = findReasoningBlockIndex(blocks, {
@@ -1585,18 +1616,24 @@ function translateReasoningBlock(
 			if (!patched) return;
 
 			// Broadcast updated message so frontend picks up the translation
-			const fullMessage = await db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, messageId),
-				with: { toolCalls: true },
-			});
+			const fullMessage = await readQuery(
+				db.query.narratorMessages.findFirst({
+					where: eq(narratorMessages.id, messageId),
+					with: { toolCalls: true },
+				}),
+				{ site: "narrator-event-handler.query" },
+			);
 			if (fullMessage) {
-				const ref = await db.query.narratorMessageRefs.findFirst({
-					where: and(
-						eq(narratorMessageRefs.narratorId, narratorId),
-						eq(narratorMessageRefs.messageId, messageId),
-					),
-					columns: { seq: true },
-				});
+				const ref = await readQuery(
+					db.query.narratorMessageRefs.findFirst({
+						where: and(
+							eq(narratorMessageRefs.narratorId, narratorId),
+							eq(narratorMessageRefs.messageId, messageId),
+						),
+						columns: { seq: true },
+					}),
+					{ site: "narrator-event-handler.query" },
+				);
 				const processed = enrichToolUseBlocks(
 					truncateToolIO([{ ...fullMessage, seq: ref?.seq }]),
 				)[0];
@@ -2360,10 +2397,13 @@ export async function processEvent(
 			}
 
 			// Load full message with tool calls for broadcast and exact EnterPlanMode row identity.
-			let fullMessage = await db.query.narratorMessages.findFirst({
-				where: eq(narratorMessages.id, savedId),
-				with: { toolCalls: true },
-			});
+			let fullMessage = await readQuery(
+				db.query.narratorMessages.findFirst({
+					where: eq(narratorMessages.id, savedId),
+					with: { toolCalls: true },
+				}),
+				{ site: "narrator-event-handler.processEvent" },
+			);
 
 			// Tool blocks may have been appended by block_complete in stop/completion order.
 			// The final event's toolUses is already in stable model/start order, so reconcile
@@ -2446,13 +2486,16 @@ export async function processEvent(
 				}
 			}
 
-			const ref = await db.query.narratorMessageRefs.findFirst({
-				where: and(
-					eq(narratorMessageRefs.narratorId, narratorId),
-					eq(narratorMessageRefs.messageId, savedId),
-				),
-				columns: { seq: true },
-			});
+			const ref = await readQuery(
+				db.query.narratorMessageRefs.findFirst({
+					where: and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorMessageRefs.messageId, savedId),
+					),
+					columns: { seq: true },
+				}),
+				{ site: "narrator-event-handler.processEvent" },
+			);
 
 			// Apply the same truncation and enrichment as the HTTP API so WS and REST
 			// clients receive identically shaped messages.

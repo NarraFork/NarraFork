@@ -19,6 +19,7 @@
 import { and, eq, gte, inArray, lt, sql } from "drizzle-orm";
 import { activeDatabaseBackend, db } from "../db";
 import { narratorMessageRefs, narrators } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { narratorRefsBackfillLock } from "../lib/async-mutex";
 import { AppError } from "../lib/errors";
 import { logger } from "../lib/logger";
@@ -70,10 +71,13 @@ function toActive(state: LazyRefsState | null | undefined): ActiveLazyState | nu
 }
 
 async function readLazyState(narratorId: string): Promise<ActiveLazyState | null> {
-	const row = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { refsInheritedFrom: true, refsBackfillCursor: true },
-	});
+	const row = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { refsInheritedFrom: true, refsBackfillCursor: true },
+		}),
+		{ site: "narrator-refs-backfill.readLazyState" },
+	);
 	return toActive(row);
 }
 
@@ -143,16 +147,19 @@ export async function hasUnmaterializedRefsBelow(
 	for (const step of lineage) {
 		const ceiling = Math.min(step.upperBoundSeq, seq);
 		if (ceiling <= 0) continue;
-		const older = await db
-			.select({ seq: narratorMessageRefs.seq })
-			.from(narratorMessageRefs)
-			.where(
-				and(
-					eq(narratorMessageRefs.narratorId, step.parentNarratorId),
-					lt(narratorMessageRefs.seq, ceiling),
-				),
-			)
-			.limit(1);
+		const older = await readQuery(
+			db
+				.select({ seq: narratorMessageRefs.seq })
+				.from(narratorMessageRefs)
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, step.parentNarratorId),
+						lt(narratorMessageRefs.seq, ceiling),
+					),
+				)
+				.limit(1),
+			{ site: "narrator-refs-backfill.hasUnmaterializedRefsBelow" },
+		);
 		if (older.length > 0) return true;
 	}
 	return false;
@@ -279,12 +286,15 @@ async function relinkToGrandparent(
 ): Promise<boolean> {
 	const parentState = await readLazyState(exhaustedParentId);
 	if (!parentState) return false;
-	const floor = await db
-		.select({ seq: narratorMessageRefs.seq })
-		.from(narratorMessageRefs)
-		.where(eq(narratorMessageRefs.narratorId, narratorId))
-		.orderBy(narratorMessageRefs.seq)
-		.limit(1);
+	const floor = await readQuery(
+		db
+			.select({ seq: narratorMessageRefs.seq })
+			.from(narratorMessageRefs)
+			.where(eq(narratorMessageRefs.narratorId, narratorId))
+			.orderBy(narratorMessageRefs.seq)
+			.limit(1),
+		{ site: "narrator-refs-backfill.relinkToGrandparent" },
+	);
 	const cursor = Math.min(floor[0]?.seq ?? parentState.cursor, parentState.cursor);
 	await db
 		.update(narrators)
@@ -330,32 +340,38 @@ export async function ensureRefsCoverSeq(narratorId: string, targetSeq: number):
 
 			// Size the window in *refs*, not in seq distance: seq is sparse after a
 			// lazy fork, so a fixed seq stride would copy wildly varying amounts.
-			const windowRows = await db
-				.select({ seq: narratorMessageRefs.seq })
-				.from(narratorMessageRefs)
-				.where(
-					and(
-						eq(narratorMessageRefs.narratorId, parentId),
-						lt(narratorMessageRefs.seq, current.cursor),
-						gte(narratorMessageRefs.seq, targetSeq),
-					),
-				)
-				.orderBy(sql`${narratorMessageRefs.seq} DESC`)
-				.limit(BACKFILL_WINDOW_REFS);
-
-			if (windowRows.length === 0) {
-				// This parent has nothing more to give in range. If it holds nothing older
-				// at all, we are done with it — try to continue up the chain.
-				const anyOlder = await db
+			const windowRows = await readQuery(
+				db
 					.select({ seq: narratorMessageRefs.seq })
 					.from(narratorMessageRefs)
 					.where(
 						and(
 							eq(narratorMessageRefs.narratorId, parentId),
 							lt(narratorMessageRefs.seq, current.cursor),
+							gte(narratorMessageRefs.seq, targetSeq),
 						),
 					)
-					.limit(1);
+					.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+					.limit(BACKFILL_WINDOW_REFS),
+				{ site: "narrator-refs-backfill.read" },
+			);
+
+			if (windowRows.length === 0) {
+				// This parent has nothing more to give in range. If it holds nothing older
+				// at all, we are done with it — try to continue up the chain.
+				const anyOlder = await readQuery(
+					db
+						.select({ seq: narratorMessageRefs.seq })
+						.from(narratorMessageRefs)
+						.where(
+							and(
+								eq(narratorMessageRefs.narratorId, parentId),
+								lt(narratorMessageRefs.seq, current.cursor),
+							),
+						)
+						.limit(1),
+					{ site: "narrator-refs-backfill.read" },
+				);
 				if (anyOlder.length > 0) return; // older than targetSeq: nothing requested
 				await db
 					.update(narrators)
@@ -407,29 +423,35 @@ export async function ensureRefsCoverMessage(narratorId: string, messageId: stri
 	const lineage = await resolveLazyLineage(narratorId);
 	if (lineage.length === 0) return;
 
-	const local = await db
-		.select({ seq: narratorMessageRefs.seq })
-		.from(narratorMessageRefs)
-		.where(
-			and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessageRefs.messageId, messageId),
-			),
-		)
-		.limit(1);
-	if (local.length > 0) return;
-
-	for (const step of lineage) {
-		const row = await db
+	const local = await readQuery(
+		db
 			.select({ seq: narratorMessageRefs.seq })
 			.from(narratorMessageRefs)
 			.where(
 				and(
-					eq(narratorMessageRefs.narratorId, step.parentNarratorId),
+					eq(narratorMessageRefs.narratorId, narratorId),
 					eq(narratorMessageRefs.messageId, messageId),
 				),
 			)
-			.limit(1);
+			.limit(1),
+		{ site: "narrator-refs-backfill.ensureRefsCoverMessage" },
+	);
+	if (local.length > 0) return;
+
+	for (const step of lineage) {
+		const row = await readQuery(
+			db
+				.select({ seq: narratorMessageRefs.seq })
+				.from(narratorMessageRefs)
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, step.parentNarratorId),
+						eq(narratorMessageRefs.messageId, messageId),
+					),
+				)
+				.limit(1),
+			{ site: "narrator-refs-backfill.ensureRefsCoverMessage" },
+		);
 		const seq = row[0]?.seq;
 		// Only history strictly below the inherited bound is missing locally; a hit at
 		// or above it belongs to a divergent branch of that ancestor, not to us.
@@ -459,10 +481,13 @@ export async function ensureAllRefsMaterialized(narratorId: string): Promise<voi
  */
 export async function materializeChildrenOf(parentNarratorId: string): Promise<string[]> {
 	requireSqliteLazyRefsBackfill("Materializing inherited narrator refs");
-	const children = await db
-		.select({ id: narrators.id })
-		.from(narrators)
-		.where(eq(narrators.refsInheritedFrom, parentNarratorId));
+	const children = await readQuery(
+		db
+			.select({ id: narrators.id })
+			.from(narrators)
+			.where(eq(narrators.refsInheritedFrom, parentNarratorId)),
+		{ site: "narrator-refs-backfill.materializeChildrenOf" },
+	);
 	const ids = children.map((row) => row.id);
 	for (const childId of ids) {
 		await ensureAllRefsMaterialized(childId).catch((err) => {

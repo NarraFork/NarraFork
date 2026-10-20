@@ -1,6 +1,7 @@
 import type { Worker } from "node:worker_threads";
 import type { FileChangeBlobRef } from "../../shared/file-change-protocol";
 import { compiledWorkerSpecifiers, connectCompiledWorker } from "../lib/compiled-worker";
+import { diagnosticAwait } from "../lib/request-diagnostics";
 import type { CurrentBaselineRequest, CurrentGitBaseline } from "./git-current-baseline-worker";
 
 export type {
@@ -20,42 +21,48 @@ async function worker<T>(request: CurrentBaselineRequest, signal: AbortSignal): 
 	let abort = () => {};
 	let forcedTermination: ReturnType<typeof setTimeout> | undefined;
 	try {
-		const started = await connectCompiledWorker(
-			resolvedWorkerSpecifier
-				? [resolvedWorkerSpecifier]
-				: compiledWorkerSpecifiers(
-						"services/git-current-baseline-worker.ts",
-						"./git-current-baseline-worker.ts",
-						import.meta.url,
-					),
-			{ signal },
+		const started = await diagnosticAwait("worker.startup", () =>
+			connectCompiledWorker(
+				resolvedWorkerSpecifier
+					? [resolvedWorkerSpecifier]
+					: compiledWorkerSpecifiers(
+							"services/git-current-baseline-worker.ts",
+							"./git-current-baseline-worker.ts",
+							import.meta.url,
+						),
+				{ signal },
+			),
 		);
 		resolvedWorkerSpecifier = started.specifier;
 		const active = started.worker;
 		thread = active;
-		return await new Promise<T>((resolve, reject) => {
-			abort = () => {
-				// Let the worker abort its currently owned Git child and close file handles
-				// before termination. Never signal the server or an unrelated process.
-				active.postMessage({ action: "cancel" });
-				forcedTermination = setTimeout(() => reject(new Error("cancelled")), 1000);
-			};
-			signal.addEventListener("abort", abort, { once: true });
-			active.once("message", (message: { value: T; error?: string }) => {
-				if (signal.aborted) reject(new Error("cancelled"));
-				else if (message.error) reject(new Error(message.error));
-				else resolve(message.value);
-			});
-			active.once("error", reject);
-			active.once("exit", () => reject(new Error("reader_exited")));
-			active.postMessage(request);
-			if (signal.aborted) abort();
-		});
+		return await diagnosticAwait(
+			"worker.response",
+			() =>
+				new Promise<T>((resolve, reject) => {
+					abort = () => {
+						// Let the worker abort its currently owned Git child and close file handles
+						// before termination. Never signal the server or an unrelated process.
+						active.postMessage({ action: "cancel" });
+						forcedTermination = setTimeout(() => reject(new Error("cancelled")), 1000);
+					};
+					signal.addEventListener("abort", abort, { once: true });
+					active.once("message", (message: { value: T; error?: string }) => {
+						if (signal.aborted) reject(new Error("cancelled"));
+						else if (message.error) reject(new Error(message.error));
+						else resolve(message.value);
+					});
+					active.once("error", reject);
+					active.once("exit", () => reject(new Error("reader_exited")));
+					active.postMessage(request);
+					if (signal.aborted) abort();
+				}),
+		);
 	} finally {
 		if (forcedTermination) clearTimeout(forcedTermination);
 		signal.removeEventListener("abort", abort);
 		try {
-			await thread?.terminate();
+			await diagnosticAwait("worker.cleanup", async () => thread?.terminate());
 		} finally {
 			workers--;
 		}

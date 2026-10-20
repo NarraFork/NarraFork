@@ -248,10 +248,10 @@ async function restart() {
 	}
 }
 
-beforeEach(() => {
+beforeEach(async () => {
 	cleanDb(sqlite);
 	clearPendingAgentReplyWaits();
-	clearBufferedMessages("child");
+	await clearBufferedMessages("child");
 	drainPendingInjections("parent");
 	clearTeamInbox("child");
 	clearTeamInbox("sibling");
@@ -261,9 +261,9 @@ beforeEach(() => {
 	seed("child", "parent");
 	seed("sibling", "parent");
 });
-afterAll(() => {
+afterAll(async () => {
 	clearPendingAgentReplyWaits();
-	clearBufferedMessages("child");
+	await clearBufferedMessages("child");
 	drainPendingInjections("parent");
 	mock.module("../agent-runtime/run", () => runModule);
 	mock.module("../../websocket/narrator-ws", () => realWs);
@@ -633,7 +633,7 @@ describe("Send exact delivery receipts", () => {
 			await markAgentMessageConsumed(delivery);
 			expect(consumedAt(id)).toBeNull();
 			expect(versions()).toEqual(before);
-			expect(getBufferedMessages("child")).toHaveLength(0);
+			expect(await getBufferedMessages("child")).toHaveLength(0);
 		} finally {
 			sqlite.run("DROP TRIGGER fail_receipt_version");
 		}
@@ -660,7 +660,7 @@ describe("Send exact delivery receipts", () => {
 		try {
 			await expect(markAgentMessageConsumed(delivery)).resolves.toBeUndefined();
 			expect(consumedAt(id)).toBeNull();
-			expect(getBufferedMessages("child")).toHaveLength(0);
+			expect(await getBufferedMessages("child")).toHaveLength(0);
 			expect(await consume()).toBeNull();
 			expect(
 				sqlite
@@ -772,9 +772,7 @@ describe("Send exact delivery receipts", () => {
 		expect(ids[0]).not.toBe(ids[1]);
 		await reorderBufferedMessages(
 			"child",
-			getBufferedMessages("child")
-				.map((item) => item.id)
-				.reverse(),
+			(await getBufferedMessages("child")).map((item) => item.id).reverse(),
 		);
 		await consume();
 		await consume();
@@ -785,7 +783,7 @@ describe("Send exact delivery receipts", () => {
 	test("clearing user buffers preserves accepted agent delivery and identical human text stays separate", async () => {
 		const result = await send();
 		const reserved = result.targets[0].deliveryMessageId;
-		clearBufferedMessages("child");
+		await clearBufferedMessages("child");
 		expect(await agentQueued()).toHaveLength(1);
 		await enqueueBufferedMessage("child", "[Message from the parent narrator]\nsame words");
 		// The agent message is adopted at the boundary; the human input starts a new turn.
@@ -846,7 +844,7 @@ describe("Send exact delivery receipts", () => {
 		expect(row(result.targets[0].deliveryMessageId)?.content_text).toBe(
 			"[Message from the parent narrator]\nsame words",
 		);
-		expect(getBufferedMessages("child")).toHaveLength(0);
+		expect(await getBufferedMessages("child")).toHaveLength(0);
 	});
 
 	test("a wake that cannot start leaves the Send queued and never labels later human text", async () => {
@@ -989,7 +987,7 @@ describe("Send exact delivery receipts", () => {
 			const consumed = await inPass({ narratorId: "child" });
 			expect(consumed?.text).toContain("same words");
 			expect(row(result.targets[0].deliveryMessageId)).not.toBeNull();
-			expect(getBufferedMessages("child")).toHaveLength(0);
+			expect(await getBufferedMessages("child")).toHaveLength(0);
 			expect(await consume()).toBeNull();
 			expect(
 				sqlite
@@ -1036,7 +1034,7 @@ describe("Send exact delivery receipts", () => {
 			"explicit test cancellation",
 		);
 		await enqueueBufferedMessage("child", "draft", undefined, null, "editor");
-		const queued = getBufferedMessages("child")[0];
+		const queued = (await getBufferedMessages("child"))[0];
 		expect(await updateBufferedMessage("child", queued.id, "human correction")).toBe(true);
 		// A human draft stays in the user lane: it is never an agent delivery.
 		expect((await agentQueued()).map((row) => row.text)).not.toContain("human correction");
@@ -1048,7 +1046,7 @@ describe("Send exact delivery receipts", () => {
 				.all();
 		// Explicit turn/pass input must wait for restart, never inject into this pass.
 		expect(await inPass({ narratorId: "child", currentUserId: "editor" })).toBeNull();
-		expect(getBufferedMessages("child")).toHaveLength(1);
+		expect(await getBufferedMessages("child")).toHaveLength(1);
 		const restores: Array<() => void> = [];
 		let rowsAtCreatorFailure = 0;
 		if (failure === "parent lookup") {
@@ -1080,7 +1078,7 @@ describe("Send exact delivery receipts", () => {
 			expect(consumed?.prompt).toBe(
 				'<sender kind="human" id="editor" name="Editor" />\nhuman correction',
 			);
-			expect(getBufferedMessages("child")).toHaveLength(0);
+			expect(await getBufferedMessages("child")).toHaveLength(0);
 			expect(await restart()).toBeNull();
 			expect(await consume()).toBeNull();
 			expect(row(result.targets[0].deliveryMessageId)).toBeNull();
@@ -1119,9 +1117,9 @@ describe("Send exact delivery receipts", () => {
 			"explicit test cancellation",
 		);
 		await enqueueBufferedMessage("child", "draft");
-		const queued = getBufferedMessages("child")[0];
+		const queued = (await getBufferedMessages("child"))[0];
 		expect(await updateBufferedMessage("child", queued.id, "retry human correction")).toBe(true);
-		const edited = getBufferedMessages("child")[0];
+		const edited = (await getBufferedMessages("child"))[0];
 		expect(await inPass({ narratorId: "child" })).toBeNull();
 		sqlite.run(`CREATE TEMP TRIGGER fail_message_ref BEFORE INSERT ON narrator_message_refs
 			BEGIN SELECT RAISE(ABORT, 'ref insertion unavailable'); END`);
@@ -1129,7 +1127,7 @@ describe("Send exact delivery receipts", () => {
 			// The wake reports nothing started; the failed persistence is released, not lost.
 			expect(await restart().catch(() => null)).toBeNull();
 			expect(runStarts).toHaveLength(0);
-			expect(getBufferedMessages("child")).toEqual([
+			expect(await getBufferedMessages("child")).toEqual([
 				expect.objectContaining({ id: edited.id, text: edited.text }),
 			]);
 			expect(
@@ -1149,7 +1147,7 @@ describe("Send exact delivery receipts", () => {
 		expect(consumed?.currentInput).toBe("retry human correction");
 		expect(consumed?.prompt).toBe('<sender kind="human" />\nretry human correction');
 		expect(await restart()).toBeNull();
-		expect(getBufferedMessages("child")).toHaveLength(0);
+		expect(await getBufferedMessages("child")).toHaveLength(0);
 		expect(row(result.targets[0].deliveryMessageId)).toBeNull();
 		expect(
 			sqlite.prepare("SELECT id FROM narrator_messages WHERE id NOT LIKE 'source-message-%'").all(),
@@ -1268,7 +1266,7 @@ describe("Send exact delivery receipts", () => {
 		expect(childMessage.delivery?.senderToolCallBinding).toEqual(message.fromToolCallBinding);
 		expect((await drainTeamInbox("sibling"))[0].delivery?.recipientMessageId).toBe(second);
 		expect(row(first)).toBeNull();
-		expect(getBufferedMessages("child")).toHaveLength(0);
+		expect(await getBufferedMessages("child")).toHaveLength(0);
 		const injection = await deliverInjection("child", {
 			messageId: first,
 			onPersist: (tx, messageId, refId) => {

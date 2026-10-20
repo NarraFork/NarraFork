@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { resolve } from "node:path";
+import { readQuery, readQueryFirst } from "@server/db/worker-read";
 import { resolveBufferQueueMode } from "@shared/buffer-queue-mode";
 import type { ComposerDocument } from "@shared/composer-document";
 import { FILE_CHANGE_LIMITS } from "@shared/file-change-protocol";
@@ -890,31 +891,39 @@ async function resolveRuleNarratorId(
 ): Promise<string | null> {
 	switch (segment) {
 		case "whitelist-dirs": {
-			const row = await db.query.narratorWhitelistDirs.findFirst({
-				where: eq(narratorWhitelistDirs.id, entryId),
-				columns: { narratorId: true },
-			});
+			const row = await readQuery(
+				db.query.narratorWhitelistDirs.findFirst({
+					where: eq(narratorWhitelistDirs.id, entryId),
+					columns: { narratorId: true },
+				}),
+			);
 			return row?.narratorId ?? null;
 		}
 		case "blacklist-dirs": {
-			const row = await db.query.narratorBlacklistDirs.findFirst({
-				where: eq(narratorBlacklistDirs.id, entryId),
-				columns: { narratorId: true },
-			});
+			const row = await readQuery(
+				db.query.narratorBlacklistDirs.findFirst({
+					where: eq(narratorBlacklistDirs.id, entryId),
+					columns: { narratorId: true },
+				}),
+			);
 			return row?.narratorId ?? null;
 		}
 		case "cmd-whitelist": {
-			const row = await db.query.narratorWhitelistCmds.findFirst({
-				where: eq(narratorWhitelistCmds.id, entryId),
-				columns: { narratorId: true },
-			});
+			const row = await readQuery(
+				db.query.narratorWhitelistCmds.findFirst({
+					where: eq(narratorWhitelistCmds.id, entryId),
+					columns: { narratorId: true },
+				}),
+			);
 			return row?.narratorId ?? null;
 		}
 		case "cmd-blacklist": {
-			const row = await db.query.narratorBlacklistCmds.findFirst({
-				where: eq(narratorBlacklistCmds.id, entryId),
-				columns: { narratorId: true },
-			});
+			const row = await readQuery(
+				db.query.narratorBlacklistCmds.findFirst({
+					where: eq(narratorBlacklistCmds.id, entryId),
+					columns: { narratorId: true },
+				}),
+			);
 			return row?.narratorId ?? null;
 		}
 	}
@@ -1111,13 +1120,15 @@ narratorRoutes.get("/", async (c) => {
 		const whereClause = cursorWhere ? and(baseWhere, cursorWhere) : baseWhere;
 
 		const [list, countResult] = await Promise.all([
-			db.query.narrators.findMany({
-				columns: { runtimeRegistrationJson: false },
-				where: whereClause,
-				orderBy: [orderFn(column), orderFn(narrators.id)],
-				limit: limit + 1,
-			}),
-			db.select({ count: sql<number>`count(*)` }).from(narrators).where(baseWhere),
+			readQuery(
+				db.query.narrators.findMany({
+					columns: { runtimeRegistrationJson: false },
+					where: whereClause,
+					orderBy: [orderFn(column), orderFn(narrators.id)],
+					limit: limit + 1,
+				}),
+			),
+			readQuery(db.select({ count: sql<number>`count(*)` }).from(narrators).where(baseWhere)),
 		]);
 		const totalCount = countResult[0]?.count ?? 0;
 
@@ -1151,18 +1162,20 @@ narratorRoutes.get("/", async (c) => {
 			}
 		>();
 		if (chapterIds.length > 0) {
-			const chapterRows = await db
-				.select({
-					id: chapters.id,
-					title: chapters.title,
-					projectId: chapters.projectId,
-					projectName: projects.name,
-					status: chapters.status,
-					role: chapters.role,
-				})
-				.from(chapters)
-				.leftJoin(projects, eq(chapters.projectId, projects.id))
-				.where(sql`${chapters.id} IN ${chapterIds}`);
+			const chapterRows = await readQuery(
+				db
+					.select({
+						id: chapters.id,
+						title: chapters.title,
+						projectId: chapters.projectId,
+						projectName: projects.name,
+						status: chapters.status,
+						role: chapters.role,
+					})
+					.from(chapters)
+					.leftJoin(projects, eq(chapters.projectId, projects.id))
+					.where(sql`${chapters.id} IN ${chapterIds}`),
+			);
 			for (const row of chapterRows) {
 				chapterMap.set(row.id, row);
 			}
@@ -1171,14 +1184,18 @@ narratorRoutes.get("/", async (c) => {
 		// Batch fetch active terminal counts
 		const terminalCounts = new Map<string, number>();
 		if (narratorIds.length > 0) {
-			const termRows = await db
-				.select({
-					narratorId: terminals.narratorId,
-					count: countFn(),
-				})
-				.from(terminals)
-				.where(and(sql`${terminals.narratorId} IN ${narratorIds}`, eq(terminals.status, "running")))
-				.groupBy(terminals.narratorId);
+			const termRows = await readQuery(
+				db
+					.select({
+						narratorId: terminals.narratorId,
+						count: countFn(),
+					})
+					.from(terminals)
+					.where(
+						and(sql`${terminals.narratorId} IN ${narratorIds}`, eq(terminals.status, "running")),
+					)
+					.groupBy(terminals.narratorId),
+			);
 			for (const row of termRows) {
 				if (row.narratorId) terminalCounts.set(row.narratorId, row.count);
 			}
@@ -1187,20 +1204,22 @@ narratorRoutes.get("/", async (c) => {
 		// Batch fetch container counts per chapter (total + running)
 		const containerCounts = new Map<string, { total: number; running: number }>();
 		if (chapterIds.length > 0) {
-			const containerRows = await db
-				.select({
-					chapterId: containerInstances.chapterId,
-					total: countFn(),
-					running: sql<number>`SUM(CASE WHEN ${containerInstances.status} = 'running' THEN 1 ELSE 0 END)`,
-				})
-				.from(containerInstances)
-				.where(
-					and(
-						sql`${containerInstances.chapterId} IN ${chapterIds}`,
-						isNull(containerInstances.worktreeResourceId),
-					),
-				)
-				.groupBy(containerInstances.chapterId);
+			const containerRows = await readQuery(
+				db
+					.select({
+						chapterId: containerInstances.chapterId,
+						total: countFn(),
+						running: sql<number>`SUM(CASE WHEN ${containerInstances.status} = 'running' THEN 1 ELSE 0 END)`,
+					})
+					.from(containerInstances)
+					.where(
+						and(
+							sql`${containerInstances.chapterId} IN ${chapterIds}`,
+							isNull(containerInstances.worktreeResourceId),
+						),
+					)
+					.groupBy(containerInstances.chapterId),
+			);
 			for (const row of containerRows) {
 				if (row.chapterId === null) continue;
 				containerCounts.set(row.chapterId, {
@@ -1337,10 +1356,12 @@ narratorRoutes.post("/", async (c) => {
 	let projectDir: string | undefined;
 	if (input.contextProjectId) {
 		await requireProjectAccess(c, input.contextProjectId, "write");
-		const project = await db.query.projects.findFirst({
-			where: eq(projects.id, input.contextProjectId),
-			columns: { gitPath: true },
-		});
+		const project = await readQuery(
+			db.query.projects.findFirst({
+				where: eq(projects.id, input.contextProjectId),
+				columns: { gitPath: true },
+			}),
+		);
 		projectDir = project?.gitPath ?? undefined;
 	}
 	const resolvedCwd = standaloneNarratorCwd(input, projectDir);
@@ -1637,22 +1658,25 @@ narratorRoutes.get("/:id/panel-state", async (c) => {
 narratorRoutes.get("/:id/messages/:mid/composer-document", async (c) => {
 	const id = c.req.param("id");
 	const mid = c.req.param("mid");
-	const ref = await db.query.narratorMessageRefs.findFirst({
-		where: and(eq(narratorMessageRefs.narratorId, id), eq(narratorMessageRefs.messageId, mid)),
-		columns: { id: true },
-	});
+	const ref = await readQuery(
+		db.query.narratorMessageRefs.findFirst({
+			where: and(eq(narratorMessageRefs.narratorId, id), eq(narratorMessageRefs.messageId, mid)),
+			columns: { id: true },
+		}),
+	);
 	if (!ref) throw new NotFoundError("Message", mid);
-	const message = await db
-		.select({
-			composerDocument: narratorMessages.composerDocument,
-			bodyRevision: narratorMessages.bodyRevision,
-			content: sql<
-				string | null
-			>`CASE WHEN ${narratorMessages.role} = 'user' AND length(CAST(${narratorMessages.contentJson} AS BLOB)) <= ${4 * 1024 * 1024} THEN ${narratorMessages.contentJson} ELSE NULL END`,
-		})
-		.from(narratorMessages)
-		.where(eq(narratorMessages.id, mid))
-		.get();
+	const message = await readQueryFirst(
+		db
+			.select({
+				composerDocument: narratorMessages.composerDocument,
+				bodyRevision: narratorMessages.bodyRevision,
+				content: sql<
+					string | null
+				>`CASE WHEN ${narratorMessages.role} = 'user' AND length(CAST(${narratorMessages.contentJson} AS BLOB)) <= ${4 * 1024 * 1024} THEN ${narratorMessages.contentJson} ELSE NULL END`,
+			})
+			.from(narratorMessages)
+			.where(eq(narratorMessages.id, mid)),
+	);
 	if (!message) throw new NotFoundError("Message", mid);
 	if (message.content === null)
 		throw new ValidationError("Message attachment metadata exceeds the composer detail limit");
@@ -1893,9 +1917,11 @@ narratorRoutes.post("/:id/optimize-prompt", async (c) => {
 	const userId = c.get("user").sub;
 
 	// ACL: narrator must exist and user must have access
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-	});
+	const narrator = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+		}),
+	);
 	if (!narrator) throw new NotFoundError("Narrator", narratorId);
 	await requireAccessToNarratorRow(c, narrator, "read");
 
@@ -2511,10 +2537,12 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		// Every session takes the same admission: a running one (including a run the
 		// user holds) queues the input for its next safe boundary, an idle one starts.
 		// Model overrides belong to the accepted input, not to the running turn.
-		const user = await db.query.users.findFirst({
-			where: eq(users.id, userId),
-			columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
-		});
+		const user = await readQuery(
+			db.query.users.findFirst({
+				where: eq(users.id, userId),
+				columns: { id: true, username: true, avatarColor: true, avatarImageId: true },
+			}),
+		);
 		const creator: BufferCreator | null = user
 			? {
 					id: user.id,
@@ -2808,18 +2836,22 @@ async function resolveEditedFileReferences(
 	signal: AbortSignal,
 ): Promise<FileReferenceSnapshot[] | undefined> {
 	if (requested === undefined) return undefined;
-	const ref = await db.query.narratorMessageRefs.findFirst({
-		where: and(
-			eq(narratorMessageRefs.narratorId, narratorId),
-			eq(narratorMessageRefs.messageId, messageId),
-		),
-		columns: { messageId: true },
-	});
+	const ref = await readQuery(
+		db.query.narratorMessageRefs.findFirst({
+			where: and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, messageId),
+			),
+			columns: { messageId: true },
+		}),
+	);
 	if (!ref) throw new NotFoundError("Message", messageId);
-	const message = await db.query.narratorMessages.findFirst({
-		where: eq(narratorMessages.id, ref.messageId),
-		columns: { role: true, contentJson: true },
-	});
+	const message = await readQuery(
+		db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, ref.messageId),
+			columns: { role: true, contentJson: true },
+		}),
+	);
 	if (!message) throw new NotFoundError("Message", messageId);
 	if (message.role !== "user") throw new ValidationError("Can only edit user messages");
 	return replaceFileReferenceSnapshots(
@@ -3274,7 +3306,7 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 	} finally {
 		if (!committed) {
 			for (const imageId of createdImageIds) deleteUploadedImage(id, imageId);
-			for (const file of createdSavedFiles) deleteBufferedTextFile(file);
+			for (const file of createdSavedFiles) await deleteBufferedTextFile(file);
 		}
 	}
 
@@ -3283,7 +3315,7 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 	for (const image of droppedImages) {
 		deleteUploadedImage(image.uploadNarratorId ?? id, image.imageId);
 	}
-	for (const file of droppedSavedFiles) deleteBufferedTextFile(file);
+	for (const file of droppedSavedFiles) await deleteBufferedTextFile(file);
 
 	await broadcastBufferQueue(id);
 	return c.json({ ok: true });
@@ -3309,7 +3341,7 @@ async function applyPendingBufferModeControl(
 			message.state !== "failed" &&
 			resolveBufferQueueMode(message.queueMode, message.priority) !== "turn",
 	);
-	applyControl(id, effectiveMode, hasPendingGuidance, targetQueued);
+	await applyControl(id, effectiveMode, hasPendingGuidance, targetQueued);
 	return targetQueued && effectiveMode !== "turn";
 }
 
@@ -3416,7 +3448,7 @@ narratorRoutes.delete("/:id/buffer/:mid", async (c) => {
 	const ok = await removeBufferedMessage(id, mid);
 	if (!ok) throw new NotFoundError("Buffered message", mid);
 	const remaining = await getBufferedMessagesAsync(id);
-	clearBufferedMessageSoftStopIfIdle(
+	await clearBufferedMessageSoftStopIfIdle(
 		id,
 		remaining.some(
 			(message) =>
@@ -3447,7 +3479,7 @@ narratorRoutes.delete("/:id/buffer", async (c) => {
 	const { clearBufferedMessages } = await import("../services/narrator-buffer");
 	await clearBufferedMessages(id);
 	const remaining = await getBufferedMessagesAsync(id);
-	clearBufferedMessageSoftStopIfIdle(
+	await clearBufferedMessageSoftStopIfIdle(
 		id,
 		remaining.some(
 			(message) =>
@@ -3492,10 +3524,12 @@ narratorRoutes.get("/:id/pretext-document", async (c) => {
 	// window in which any unrelated write on a live narrator turned a good page into
 	// a 409, so this read is just the existence check.
 	await requireNarratorAccess(c, id, "read");
-	const narratorMeta = await db.query.narrators.findFirst({
-		where: eq(narrators.id, id),
-		columns: { id: true },
-	});
+	const narratorMeta = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, id),
+			columns: { id: true },
+		}),
+	);
 	if (!narratorMeta) throw new NotFoundError("Narrator", id);
 	return c.json(result);
 });
@@ -4738,14 +4772,16 @@ narratorRoutes.post("/:id/plan-mode/enter", async (c) => {
 			],
 		},
 	});
-	const manualToolCall = await db.query.narratorToolCalls.findFirst({
-		where: and(
-			eq(narratorToolCalls.messageId, msg.id),
-			eq(narratorToolCalls.narratorId, id),
-			eq(narratorToolCalls.toolUseId, toolUseId),
-		),
-		columns: { id: true },
-	});
+	const manualToolCall = await readQuery(
+		db.query.narratorToolCalls.findFirst({
+			where: and(
+				eq(narratorToolCalls.messageId, msg.id),
+				eq(narratorToolCalls.narratorId, id),
+				eq(narratorToolCalls.toolUseId, toolUseId),
+			),
+			columns: { id: true },
+		}),
+	);
 	if (!manualToolCall) throw new Error("Manual plan-mode message has no persisted tool row");
 	await narratorService.updateToolCallResult(
 		toolUseId,
@@ -4760,10 +4796,12 @@ narratorRoutes.post("/:id/plan-mode/enter", async (c) => {
 		msg.id,
 		manualToolCall.id,
 	);
-	const fullMsg = await db.query.narratorMessages.findFirst({
-		where: eq(narratorMessages.id, msg.id),
-		with: { toolCalls: true },
-	});
+	const fullMsg = await readQuery(
+		db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, msg.id),
+			with: { toolCalls: true },
+		}),
+	);
 	if (fullMsg) {
 		broadcastToNarrator(id, {
 			type: "message",
@@ -5207,13 +5245,15 @@ narratorRoutes.post("/:id/ask-in-passing/start", async (c) => {
 	const { sourceMessageId, sourceMessageUuid } = parsed.data;
 
 	// Verify the source message belongs to this narrator and capture its position.
-	const ref = await db.query.narratorMessageRefs.findFirst({
-		where: and(
-			eq(narratorMessageRefs.narratorId, id),
-			eq(narratorMessageRefs.messageId, sourceMessageId),
-		),
-		columns: { seq: true },
-	});
+	const ref = await readQuery(
+		db.query.narratorMessageRefs.findFirst({
+			where: and(
+				eq(narratorMessageRefs.narratorId, id),
+				eq(narratorMessageRefs.messageId, sourceMessageId),
+			),
+			columns: { seq: true },
+		}),
+	);
 	if (!ref) throw new ValidationError("Source message not found in this narrator");
 
 	const now = new Date().toISOString();
@@ -5300,9 +5340,11 @@ narratorRoutes.post("/:id/ask-in-passing", async (c) => {
 	const { question, pendingMessageId } = parsed.data;
 
 	// Verify the pending message exists, belongs to this narrator, and is still pending
-	const pendingMsg = await db.query.narratorMessages.findFirst({
-		where: and(eq(narratorMessages.id, pendingMessageId), eq(narratorMessages.narratorId, id)),
-	});
+	const pendingMsg = await readQuery(
+		db.query.narratorMessages.findFirst({
+			where: and(eq(narratorMessages.id, pendingMessageId), eq(narratorMessages.narratorId, id)),
+		}),
+	);
 	const pendingBlock = getAskInPassingPendingBlock(pendingMsg);
 	if (!pendingMsg || !pendingBlock) {
 		throw new ValidationError("Pending ask-in-passing message not found");
@@ -5394,9 +5436,11 @@ narratorRoutes.delete("/:id/ask-in-passing/:messageId", async (c) => {
 	const messageId = c.req.param("messageId");
 
 	// Verify the message exists and is a pending ask-in-passing
-	const msg = await db.query.narratorMessages.findFirst({
-		where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)),
-	});
+	const msg = await readQuery(
+		db.query.narratorMessages.findFirst({
+			where: and(eq(narratorMessages.id, messageId), eq(narratorMessages.narratorId, narratorId)),
+		}),
+	);
 	if (!msg || !getAskInPassingPendingBlock(msg)) {
 		throw new ValidationError("Pending ask-in-passing message not found");
 	}
@@ -5589,10 +5633,12 @@ narratorRoutes.get("/:id/questions/:questionId", async (c) => {
 		return c.json({ error: "Question detail exceeds the byte limit", tooLarge: true }, 413);
 	}
 	if (!detail.record) return c.json({ error: "Question not found" }, 404);
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: NARRATOR_ACL_COLUMNS,
-	});
+	const narrator = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: NARRATOR_ACL_COLUMNS,
+		}),
+	);
 	const canAct = !!narrator && (await canWriteNarrator(narrator, narratorPrincipalOf(c)));
 	return c.json({
 		question: detail.record,
@@ -5607,11 +5653,13 @@ narratorRoutes.post("/:id/questions/:questionId/supplement", async (c) => {
 	const questionId = c.req.param("questionId");
 	const parsed = asyncQuestionSupplementSchema.safeParse(await c.req.json().catch(() => ({})));
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const [existing] = await db
-		.select({ narratorId: narratorQuestions.narratorId })
-		.from(narratorQuestions)
-		.where(eq(narratorQuestions.id, questionId))
-		.limit(1);
+	const [existing] = await readQuery(
+		db
+			.select({ narratorId: narratorQuestions.narratorId })
+			.from(narratorQuestions)
+			.where(eq(narratorQuestions.id, questionId))
+			.limit(1),
+	);
 	if (!existing || existing.narratorId !== narratorId) {
 		return c.json({ error: "Question not found" }, 404);
 	}
@@ -5642,12 +5690,13 @@ narratorRoutes.post("/:id/questions/:questionId/answer", async (c) => {
 	// Ownership is checked against the question's own narrator rather than trusting the
 	// path: the `/:id/*` gate authorized `narratorId`, so a question belonging to a
 	// DIFFERENT narrator must not be reachable by naming an id the caller can access.
-	const existing = db
-		.select({ narratorId: narratorQuestions.narratorId })
-		.from(narratorQuestions)
-		.where(eq(narratorQuestions.id, questionId))
-		.limit(1)
-		.get();
+	const existing = await readQueryFirst(
+		db
+			.select({ narratorId: narratorQuestions.narratorId })
+			.from(narratorQuestions)
+			.where(eq(narratorQuestions.id, questionId))
+			.limit(1),
+	);
 	if (!existing || existing.narratorId !== narratorId) {
 		return c.json({ error: "Question not found" }, 404);
 	}
@@ -5673,12 +5722,13 @@ narratorRoutes.post("/:id/questions/:questionId/dismiss", async (c) => {
 	const questionId = c.req.param("questionId");
 	const userId = c.get("user").sub;
 
-	const existing = db
-		.select({ narratorId: narratorQuestions.narratorId })
-		.from(narratorQuestions)
-		.where(eq(narratorQuestions.id, questionId))
-		.limit(1)
-		.get();
+	const existing = await readQueryFirst(
+		db
+			.select({ narratorId: narratorQuestions.narratorId })
+			.from(narratorQuestions)
+			.where(eq(narratorQuestions.id, questionId))
+			.limit(1),
+	);
 	if (!existing || existing.narratorId !== narratorId) {
 		return c.json({ error: "Question not found" }, 404);
 	}
@@ -5701,12 +5751,13 @@ narratorRoutes.post("/:id/questions/:questionId/ignore", async (c) => {
 	const questionId = c.req.param("questionId");
 	const userId = c.get("user").sub;
 
-	const existing = db
-		.select({ narratorId: narratorQuestions.narratorId })
-		.from(narratorQuestions)
-		.where(eq(narratorQuestions.id, questionId))
-		.limit(1)
-		.get();
+	const existing = await readQueryFirst(
+		db
+			.select({ narratorId: narratorQuestions.narratorId })
+			.from(narratorQuestions)
+			.where(eq(narratorQuestions.id, questionId))
+			.limit(1),
+	);
 	if (!existing || existing.narratorId !== narratorId) {
 		return c.json({ error: "Question not found" }, 404);
 	}
@@ -5943,25 +5994,27 @@ async function resolveSeqBoundaryStartedAt(
 	narratorId: string,
 	minSeq: number,
 ): Promise<string | null> {
-	const [earliest] = await db
-		.select({ createdAt: narratorToolCalls.createdAt })
-		.from(narratorToolCalls)
-		.innerJoin(
-			narratorMessageRefs,
-			and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessageRefs.messageId, narratorToolCalls.messageId),
-			),
-		)
-		.where(
-			and(
-				eq(narratorToolCalls.narratorId, narratorId),
-				eq(narratorToolCalls.status, "success"),
-				gte(narratorMessageRefs.seq, minSeq),
-			),
-		)
-		.orderBy(asc(narratorMessageRefs.seq), asc(narratorToolCalls.createdAt))
-		.limit(1);
+	const [earliest] = await readQuery(
+		db
+			.select({ createdAt: narratorToolCalls.createdAt })
+			.from(narratorToolCalls)
+			.innerJoin(
+				narratorMessageRefs,
+				and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					eq(narratorMessageRefs.messageId, narratorToolCalls.messageId),
+				),
+			)
+			.where(
+				and(
+					eq(narratorToolCalls.narratorId, narratorId),
+					eq(narratorToolCalls.status, "success"),
+					gte(narratorMessageRefs.seq, minSeq),
+				),
+			)
+			.orderBy(asc(narratorMessageRefs.seq), asc(narratorToolCalls.createdAt))
+			.limit(1),
+	);
 	return earliest?.createdAt ?? null;
 }
 
@@ -6075,13 +6128,15 @@ narratorRoutes.post("/:id/revert", async (c) => {
 
 	let targetSeq = 0;
 	if (body.messageId !== "__all__") {
-		const targetRef = await db.query.narratorMessageRefs.findFirst({
-			where: and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				eq(narratorMessageRefs.messageId, body.messageId),
-			),
-			columns: { seq: true },
-		});
+		const targetRef = await readQuery(
+			db.query.narratorMessageRefs.findFirst({
+				where: and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					eq(narratorMessageRefs.messageId, body.messageId),
+				),
+				columns: { seq: true },
+			}),
+		);
 		if (!targetRef) return c.json({ error: "Message not found" }, 404);
 		targetSeq = targetRef.seq;
 	}
@@ -6186,25 +6241,31 @@ narratorRoutes.get("/:id/rollback-preview", async (c) => {
 	}
 
 	// Verify narrator exists
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { id: true },
-	});
+	const narrator = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { id: true },
+		}),
+	);
 	if (!narrator) return c.json({ error: "Narrator not found" }, 404);
 
-	const targetRef = await db.query.narratorMessageRefs.findFirst({
-		where: and(
-			eq(narratorMessageRefs.narratorId, narratorId),
-			eq(narratorMessageRefs.messageId, messageId),
-		),
-		columns: { seq: true },
-	});
+	const targetRef = await readQuery(
+		db.query.narratorMessageRefs.findFirst({
+			where: and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, messageId),
+			),
+			columns: { seq: true },
+		}),
+	);
 	if (!targetRef) return c.json({ error: "Message not found for this narrator" }, 404);
 
-	const targetMsg = await db.query.narratorMessages.findFirst({
-		where: eq(narratorMessages.id, messageId),
-		columns: { role: true, contentJson: true },
-	});
+	const targetMsg = await readQuery(
+		db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, messageId),
+			columns: { role: true, contentJson: true },
+		}),
+	);
 	if (!targetMsg) return c.json({ error: "Message not found" }, 404);
 
 	const blocks = Array.isArray(targetMsg.contentJson)
@@ -6232,15 +6293,17 @@ narratorRoutes.get("/:id/rollback-preview", async (c) => {
 	const deletedBlockCount = blocks.length - effectiveBlockIndex - 1;
 
 	// Count subsequent messages
-	const subsequentMsgCount = await db
-		.select({ cnt: sql<number>`count(*)` })
-		.from(narratorMessageRefs)
-		.where(
-			and(
-				eq(narratorMessageRefs.narratorId, narratorId),
-				gt(narratorMessageRefs.seq, targetRef.seq),
+	const subsequentMsgCount = await readQuery(
+		db
+			.select({ cnt: sql<number>`count(*)` })
+			.from(narratorMessageRefs)
+			.where(
+				and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					gt(narratorMessageRefs.seq, targetRef.seq),
+				),
 			),
-		);
+	);
 	const deletedMessageCount = subsequentMsgCount[0]?.cnt ?? 0;
 
 	const subsequentFilter = and(
@@ -6266,17 +6329,18 @@ narratorRoutes.get("/:id/rollback-preview", async (c) => {
 	if (scopes) {
 		// Count-only: loading the rows to call `.length` would pull every `input_json`,
 		// and Write calls carry whole file bodies.
-		const [subsequentCount] = await db
-			.select({ value: countFn() })
-			.from(narratorToolCalls)
-			.innerJoin(narratorMessageRefs, subsequentJoin)
-			.where(subsequentFilter);
-		let truncatedCount = 0;
-		if (truncatedToolUseIds.length > 0) {
-			const [counted] = await db
+		const [subsequentCount] = await readQuery(
+			db
 				.select({ value: countFn() })
 				.from(narratorToolCalls)
-				.where(truncatedFilter);
+				.innerJoin(narratorMessageRefs, subsequentJoin)
+				.where(subsequentFilter),
+		);
+		let truncatedCount = 0;
+		if (truncatedToolUseIds.length > 0) {
+			const [counted] = await readQuery(
+				db.select({ value: countFn() }).from(narratorToolCalls).where(truncatedFilter),
+			);
 			truncatedCount = counted?.value ?? 0;
 		}
 		return c.json({
@@ -6289,41 +6353,45 @@ narratorRoutes.get("/:id/rollback-preview", async (c) => {
 
 	// Find tool calls from subsequent messages (seq > targetRef.seq). Only the replay
 	// path needs the recorded inputs, so these stay behind the tree-snapshot branch.
-	const subsequentToolCalls = await db
-		.select({
-			toolUseId: narratorToolCalls.toolUseId,
-			toolName: narratorToolCalls.toolName,
-			inputJson: narratorToolCalls.inputJson,
-			executionDeviceId: narratorToolCalls.executionDeviceId,
-			executionCwd: narratorToolCalls.executionCwd,
-			executionPathFlavor: narratorToolCalls.executionPathFlavor,
-			resolvedFilePath: narratorToolCalls.resolvedFilePath,
-			canonicalFilePath: narratorToolCalls.canonicalFilePath,
-			runtimeGeneration: narratorToolCalls.runtimeGeneration,
-			executionTargetsJson: narratorToolCalls.executionTargetsJson,
-		})
-		.from(narratorToolCalls)
-		.innerJoin(narratorMessageRefs, subsequentJoin)
-		.where(subsequentFilter);
+	const subsequentToolCalls = await readQuery(
+		db
+			.select({
+				toolUseId: narratorToolCalls.toolUseId,
+				toolName: narratorToolCalls.toolName,
+				inputJson: narratorToolCalls.inputJson,
+				executionDeviceId: narratorToolCalls.executionDeviceId,
+				executionCwd: narratorToolCalls.executionCwd,
+				executionPathFlavor: narratorToolCalls.executionPathFlavor,
+				resolvedFilePath: narratorToolCalls.resolvedFilePath,
+				canonicalFilePath: narratorToolCalls.canonicalFilePath,
+				runtimeGeneration: narratorToolCalls.runtimeGeneration,
+				executionTargetsJson: narratorToolCalls.executionTargetsJson,
+			})
+			.from(narratorToolCalls)
+			.innerJoin(narratorMessageRefs, subsequentJoin)
+			.where(subsequentFilter),
+	);
 
 	// Find tool calls from truncated blocks in the target message
 	const truncatedToolCalls =
 		truncatedToolUseIds.length > 0
-			? await db.query.narratorToolCalls.findMany({
-					where: truncatedFilter,
-					columns: {
-						toolUseId: true,
-						toolName: true,
-						inputJson: true,
-						executionDeviceId: true,
-						executionCwd: true,
-						executionPathFlavor: true,
-						resolvedFilePath: true,
-						canonicalFilePath: true,
-						runtimeGeneration: true,
-						executionTargetsJson: true,
-					},
-				})
+			? await readQuery(
+					db.query.narratorToolCalls.findMany({
+						where: truncatedFilter,
+						columns: {
+							toolUseId: true,
+							toolName: true,
+							inputJson: true,
+							executionDeviceId: true,
+							executionCwd: true,
+							executionPathFlavor: true,
+							resolvedFilePath: true,
+							canonicalFilePath: true,
+							runtimeGeneration: true,
+							executionTargetsJson: true,
+						},
+					}),
+				)
 			: [];
 
 	const allToolCalls = [...truncatedToolCalls, ...subsequentToolCalls];
@@ -6392,19 +6460,23 @@ narratorRoutes.get("/:id/block-delete-preview", async (c) => {
 		return c.json({ error: "blockIndex must be a non-negative integer" }, 400);
 	}
 
-	const targetRef = await db.query.narratorMessageRefs.findFirst({
-		where: and(
-			eq(narratorMessageRefs.narratorId, narratorId),
-			eq(narratorMessageRefs.messageId, messageId),
-		),
-		columns: { seq: true },
-	});
+	const targetRef = await readQuery(
+		db.query.narratorMessageRefs.findFirst({
+			where: and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, messageId),
+			),
+			columns: { seq: true },
+		}),
+	);
 	if (!targetRef) return c.json({ error: "Message not found for this narrator" }, 404);
 
-	const message = await db.query.narratorMessages.findFirst({
-		where: eq(narratorMessages.id, messageId),
-		columns: { contentJson: true },
-	});
+	const message = await readQuery(
+		db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, messageId),
+			columns: { contentJson: true },
+		}),
+	);
 	if (!message) return c.json({ error: "Message not found" }, 404);
 
 	const blocks = Array.isArray(message.contentJson)
@@ -6438,25 +6510,27 @@ narratorRoutes.get("/:id/permission-file-preview", async (c) => {
 	const toolUseId = c.req.query("toolUseId");
 	if (!toolUseId) return c.json({ error: "toolUseId query param is required" }, 400);
 
-	const toolCall = await db.query.narratorToolCalls.findFirst({
-		where: and(
-			eq(narratorToolCalls.narratorId, narratorId),
-			eq(narratorToolCalls.toolUseId, toolUseId),
-		),
-		columns: {
-			toolUseId: true,
-			toolName: true,
-			inputJson: true,
-			executionDeviceId: true,
-			executionCwd: true,
-			executionPathFlavor: true,
-			resolvedFilePath: true,
-			canonicalFilePath: true,
-			runtimeGeneration: true,
-			executionTargetsJson: true,
-			deviceSelectionSource: true,
-		},
-	});
+	const toolCall = await readQuery(
+		db.query.narratorToolCalls.findFirst({
+			where: and(
+				eq(narratorToolCalls.narratorId, narratorId),
+				eq(narratorToolCalls.toolUseId, toolUseId),
+			),
+			columns: {
+				toolUseId: true,
+				toolName: true,
+				inputJson: true,
+				executionDeviceId: true,
+				executionCwd: true,
+				executionPathFlavor: true,
+				resolvedFilePath: true,
+				canonicalFilePath: true,
+				runtimeGeneration: true,
+				executionTargetsJson: true,
+				deviceSelectionSource: true,
+			},
+		}),
+	);
 	if (!toolCall) return c.json({ error: "Tool call not found" }, 404);
 
 	// StructSed records no replayable file identity until it has written, and its pending
@@ -6771,9 +6845,11 @@ narratorRoutes.patch("/whitelist-dirs/:dirId", async (c) => {
 	const body = await c.req.json();
 	const parsed = updateWhitelistDirSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const existing = await db.query.narratorWhitelistDirs.findFirst({
-		where: eq(narratorWhitelistDirs.id, dirId),
-	});
+	const existing = await readQuery(
+		db.query.narratorWhitelistDirs.findFirst({
+			where: eq(narratorWhitelistDirs.id, dirId),
+		}),
+	);
 	if (!existing) throw new NotFoundError("Whitelist directory", dirId);
 	const rule = await permissionRuleService.updateNarratorRule(existing.narratorId, {
 		ruleType: "directoryWhitelist",
@@ -6784,10 +6860,12 @@ narratorRoutes.patch("/whitelist-dirs/:dirId", async (c) => {
 
 narratorRoutes.delete("/whitelist-dirs/:dirId", async (c) => {
 	const dirId = c.req.param("dirId");
-	const existing = await db.query.narratorWhitelistDirs.findFirst({
-		where: eq(narratorWhitelistDirs.id, dirId),
-		columns: { narratorId: true },
-	});
+	const existing = await readQuery(
+		db.query.narratorWhitelistDirs.findFirst({
+			where: eq(narratorWhitelistDirs.id, dirId),
+			columns: { narratorId: true },
+		}),
+	);
 	if (!existing) throw new NotFoundError("Whitelist directory", dirId);
 	await permissionRuleService.deleteNarratorRule(existing.narratorId, "directoryWhitelist", dirId);
 	return c.json({ ok: true });
@@ -6820,9 +6898,11 @@ narratorRoutes.patch("/blacklist-dirs/:dirId", async (c) => {
 	const body = await c.req.json();
 	const parsed = updateBlacklistDirSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const existing = await db.query.narratorBlacklistDirs.findFirst({
-		where: eq(narratorBlacklistDirs.id, dirId),
-	});
+	const existing = await readQuery(
+		db.query.narratorBlacklistDirs.findFirst({
+			where: eq(narratorBlacklistDirs.id, dirId),
+		}),
+	);
 	if (!existing) throw new NotFoundError("Blacklist directory", dirId);
 	const rule = await permissionRuleService.updateNarratorRule(existing.narratorId, {
 		ruleType: "directoryBlacklist",
@@ -6833,10 +6913,12 @@ narratorRoutes.patch("/blacklist-dirs/:dirId", async (c) => {
 
 narratorRoutes.delete("/blacklist-dirs/:dirId", async (c) => {
 	const dirId = c.req.param("dirId");
-	const existing = await db.query.narratorBlacklistDirs.findFirst({
-		where: eq(narratorBlacklistDirs.id, dirId),
-		columns: { narratorId: true },
-	});
+	const existing = await readQuery(
+		db.query.narratorBlacklistDirs.findFirst({
+			where: eq(narratorBlacklistDirs.id, dirId),
+			columns: { narratorId: true },
+		}),
+	);
 	if (!existing) throw new NotFoundError("Blacklist directory", dirId);
 	await permissionRuleService.deleteNarratorRule(existing.narratorId, "directoryBlacklist", dirId);
 	return c.json({ ok: true });
@@ -6869,9 +6951,11 @@ narratorRoutes.patch("/cmd-whitelist/:entryId", async (c) => {
 	const body = await c.req.json();
 	const parsed = updateWhitelistCmdSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const existing = await db.query.narratorWhitelistCmds.findFirst({
-		where: eq(narratorWhitelistCmds.id, entryId),
-	});
+	const existing = await readQuery(
+		db.query.narratorWhitelistCmds.findFirst({
+			where: eq(narratorWhitelistCmds.id, entryId),
+		}),
+	);
 	if (!existing) throw new NotFoundError("Whitelist command", entryId);
 	const rule = await permissionRuleService.updateNarratorRule(existing.narratorId, {
 		ruleType: "commandWhitelist",
@@ -6882,10 +6966,12 @@ narratorRoutes.patch("/cmd-whitelist/:entryId", async (c) => {
 
 narratorRoutes.delete("/cmd-whitelist/:entryId", async (c) => {
 	const entryId = c.req.param("entryId");
-	const existing = await db.query.narratorWhitelistCmds.findFirst({
-		where: eq(narratorWhitelistCmds.id, entryId),
-		columns: { narratorId: true },
-	});
+	const existing = await readQuery(
+		db.query.narratorWhitelistCmds.findFirst({
+			where: eq(narratorWhitelistCmds.id, entryId),
+			columns: { narratorId: true },
+		}),
+	);
 	if (!existing) throw new NotFoundError("Whitelist command", entryId);
 	await permissionRuleService.deleteNarratorRule(existing.narratorId, "commandWhitelist", entryId);
 	return c.json({ ok: true });
@@ -6918,9 +7004,11 @@ narratorRoutes.patch("/cmd-blacklist/:entryId", async (c) => {
 	const body = await c.req.json();
 	const parsed = updateBlacklistCmdSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
-	const existing = await db.query.narratorBlacklistCmds.findFirst({
-		where: eq(narratorBlacklistCmds.id, entryId),
-	});
+	const existing = await readQuery(
+		db.query.narratorBlacklistCmds.findFirst({
+			where: eq(narratorBlacklistCmds.id, entryId),
+		}),
+	);
 	if (!existing) throw new NotFoundError("Blacklist command", entryId);
 	const rule = await permissionRuleService.updateNarratorRule(existing.narratorId, {
 		ruleType: "commandBlacklist",
@@ -6931,10 +7019,12 @@ narratorRoutes.patch("/cmd-blacklist/:entryId", async (c) => {
 
 narratorRoutes.delete("/cmd-blacklist/:entryId", async (c) => {
 	const entryId = c.req.param("entryId");
-	const existing = await db.query.narratorBlacklistCmds.findFirst({
-		where: eq(narratorBlacklistCmds.id, entryId),
-		columns: { narratorId: true },
-	});
+	const existing = await readQuery(
+		db.query.narratorBlacklistCmds.findFirst({
+			where: eq(narratorBlacklistCmds.id, entryId),
+			columns: { narratorId: true },
+		}),
+	);
 	if (!existing) throw new NotFoundError("Blacklist command", entryId);
 	await permissionRuleService.deleteNarratorRule(existing.narratorId, "commandBlacklist", entryId);
 	return c.json({ ok: true });

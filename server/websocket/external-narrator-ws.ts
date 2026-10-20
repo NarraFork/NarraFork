@@ -1,4 +1,5 @@
 import { Buffer } from "node:buffer";
+import { readQuery } from "@server/db/worker-read";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { narrators } from "../db/schema";
@@ -379,10 +380,12 @@ async function handleSyncCheck(
 	// lets the client compare against the revision its last REST page reported and
 	// skip a re-read entirely; pushed frames stay version-free so the fan-out path
 	// keeps doing no database work.
-	const revision = await db.query.narrators.findFirst({
-		where: eq(narrators.id, msg.narratorId),
-		columns: { messageVersion: true },
-	});
+	const revision = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, msg.narratorId),
+			columns: { messageVersion: true },
+		}),
+	);
 	if (!isExternalNarratorConnectionRegistered(ws)) return;
 	sendExternalNarratorFrame(ws, {
 		type: "narrator_changed",

@@ -11,9 +11,11 @@ import { FILE_CHANGE_LIMITS } from "@shared/file-change-protocol";
 import { eq } from "drizzle-orm";
 import * as schema from "../db/schema";
 import { localBackend } from "../lib/agent/execution/local-backend";
+import * as readWorkers from "../lib/db-worker/pool";
 import { generateId } from "../lib/id";
 import {
 	access,
+	closeFixture,
 	coordinatorState,
 	db,
 	execution,
@@ -40,7 +42,10 @@ import {
 import { localDirectoryIdentity, localObjectIdentity } from "./file-change-local-io";
 import { restoreLocalFile } from "./file-change-local-restore";
 import { localFileChangeRuntimeBinding } from "./file-change-runtime";
-import { buildRevertScopeRanges } from "./revert-transaction-service";
+import {
+	buildRevertScopeRanges,
+	type RevertTransactionOutcome,
+} from "./revert-transaction-service";
 import { freezeWorkspaceRanges, WORKSPACE_RANGE_LIMITS } from "./workspace-write-ranges";
 
 describe("rollback activity admission and bounded ranges", () => {
@@ -58,6 +63,118 @@ describe("rollback activity admission and bounded ranges", () => {
 		} finally {
 			retained.finalize();
 			client.close(true);
+		}
+	});
+
+	test("fixture cancellation drains its database workers before local close and removal", async () => {
+		const directory = await fs.mkdtemp(join(root, "reader-close-probe-"));
+		const client = new Database(join(directory, "owned.sqlite"));
+		client.exec("PRAGMA journal_mode=WAL; CREATE TABLE owned(value TEXT);");
+		const retained = client.prepare("SELECT value FROM owned");
+		const entered = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const controller = new AbortController();
+		const original = readWorkers.closeDbWorkerConnections;
+		const close = spyOn(readWorkers, "closeDbWorkerConnections").mockImplementation(
+			async (path, afterClose) => {
+				expect(path).toBe(client.filename);
+				expect(controller.signal.aborted).toBe(true);
+				entered.resolve();
+				await release.promise;
+				return original(path, afterClose);
+			},
+		);
+		const pending = closeFixture({
+			controller,
+			work: new Set(),
+			holds: new Set(),
+			restores: [],
+			root: directory,
+			sqlite: client,
+		});
+		try {
+			await entered.promise;
+			expect(retained.all()).toEqual([]);
+			await fs.access(directory);
+			release.resolve();
+			await pending;
+			expect(() => retained.all()).toThrow("Database has closed");
+			await expect(fs.access(directory)).rejects.toMatchObject({ code: "ENOENT" });
+			expect(close).toHaveBeenCalledTimes(1);
+		} finally {
+			release.resolve();
+			await pending;
+			close.mockRestore();
+			retained.finalize();
+			client.close(true);
+		}
+	});
+
+	test("actual lifetime includes a bounded-response read already running when the body settles", async () => {
+		const instance = makeFixtureTransaction(db, options);
+		const body = Promise.withResolvers<RevertTransactionOutcome>();
+		const read = Promise.withResolvers<null>();
+		const entered = Promise.withResolvers<void>();
+		const outcome: RevertTransactionOutcome = {
+			planId: "owned-response-read",
+			status: "compensated",
+			journalStatus: "compensated",
+			settling: false,
+			reason: null,
+		};
+		const internals = instance as unknown as {
+			run(run: { started: boolean }): Promise<RevertTransactionOutcome>;
+			safeOperation(): Promise<null>;
+		};
+		const run = spyOn(internals, "run").mockImplementation((state) => {
+			state.started = true;
+			return body.promise;
+		});
+		const lookup = spyOn(internals, "safeOperation").mockImplementation(() => {
+			entered.resolve();
+			return read.promise;
+		});
+		const schedule = globalThis.setTimeout;
+		let response: (() => void) | undefined;
+		const timer = spyOn(globalThis, "setTimeout").mockImplementation(((
+			callback: (...args: unknown[]) => void,
+			delay?: number,
+			...args: unknown[]
+		) => {
+			if (delay === 30_000) response = () => callback(...args);
+			return schedule(callback, delay, ...args);
+		}) as typeof setTimeout);
+		const controller = new AbortController();
+		const attempt = instance.execute({
+			principal,
+			narratorId: "narrator",
+			planId: outcome.planId,
+			planHash: "a".repeat(64),
+			signal: controller.signal,
+		});
+		let settled = false;
+		void attempt.whenSettled.then(() => {
+			settled = true;
+		});
+		try {
+			controller.abort();
+			expect(response).toBeDefined();
+			response?.();
+			await entered.promise;
+			body.resolve(outcome);
+			expect(await attempt.result).toBe(outcome);
+			await new Promise<void>((resolve) => setImmediate(resolve));
+			expect(settled).toBe(false);
+			read.resolve(null);
+			expect(await attempt.whenSettled).toBe(outcome);
+			expect(lookup).toHaveBeenCalledTimes(1);
+		} finally {
+			body.resolve(outcome);
+			read.resolve(null);
+			await attempt.whenSettled;
+			timer.mockRestore();
+			lookup.mockRestore();
+			run.mockRestore();
 		}
 	});
 
@@ -185,7 +302,7 @@ describe("rollback activity admission and bounded ranges", () => {
 		paths[256] = join(root, "outside-scope");
 		expect(() => buildRevertScopeRanges(scope, paths)).toThrow("escapes");
 		expect(coordinatorState.leases.size).toBe(0);
-		expect(runtime.evidence.getScope(scope.id)?.activeLeaseId).toBeNull();
+		expect((await runtime.evidence.getScope(scope.id))?.activeLeaseId).toBeNull();
 	});
 
 	test.each([
@@ -221,15 +338,14 @@ describe("rollback activity admission and bounded ranges", () => {
 			const plan = await prepare();
 			const before = history();
 			const files = journalFiles(plan);
-			await expect(execution(plan).result).rejects.toMatchObject({
-				code: "uncoordinated_activity",
-			});
+			const failure = await execution(plan).result.catch((error: unknown) => error);
+			expect(failure).toMatchObject({ code: "uncoordinated_activity" });
 			expect(await fs.readFile(path, "utf8")).toBe("changed");
 			expect(history()).toBe(before);
 			expect(journalFiles(plan)).toEqual(files);
 			expect(operation(plan)?.status).toBe("prepared");
 			expect(coordinatorState.leases.size).toBe(0);
-			expect(runtime.evidence.getScope(scope.id)?.activeMutationCount).toBe(0);
+			expect((await runtime.evidence.getScope(scope.id))?.activeMutationCount).toBe(0);
 		} finally {
 			runtime.coordinator.endActivity(activity);
 		}
@@ -238,7 +354,7 @@ describe("rollback activity admission and bounded ranges", () => {
 	test("a real registered activity in the last dispatch barrier vetoes an observing native restore", async () => {
 		const { a, plan } = await twoFiles();
 		const file = journalFiles(plan)[0];
-		const scope = runtime.evidence.getScope(file.scopeId);
+		const scope = await runtime.evidence.getScope(file.scopeId);
 		const binding = localFileChangeRuntimeBinding("local");
 		const expected = file.expectedStateJson;
 		const desired = file.desiredStateJson;
@@ -311,7 +427,7 @@ describe("rollback activity admission and bounded ranges", () => {
 	test("strict rollback rejects new intersecting activity but allows sibling activity", async () => {
 		const { a, plan } = await twoFiles();
 		const fixed = journalFiles(plan)[0];
-		const scope = runtime.evidence.getScope(fixed.scopeId);
+		const scope = await runtime.evidence.getScope(fixed.scopeId);
 		const binding = localFileChangeRuntimeBinding("local");
 		if (!scope || !binding) throw new Error("Missing scope/runtime");
 		const siblingRoot = join(workspace, "sibling");
@@ -373,16 +489,15 @@ describe("rollback activity admission and bounded ranges", () => {
 		const files = journalFiles(plan);
 		const activity = runtime.coordinator.registerActivity({ scope: target, runtime: binding });
 		try {
-			await expect(execution(plan).result).rejects.toMatchObject({
-				code: "uncoordinated_activity",
-			});
+			const failure = await execution(plan).result.catch((error: unknown) => error);
+			expect(failure).toMatchObject({ code: "uncoordinated_activity" });
 			expect(history()).toBe(before);
 			expect(journalFiles(plan)).toEqual(files);
 			expect(operation(plan)?.status).toBe("prepared");
 			expect(coordinatorState.leases.size).toBe(0);
 			for (const scope of scopes) {
-				expect(runtime.evidence.getScope(scope.id)?.fencingToken).toBe(scope.fencingToken);
-				expect(runtime.evidence.getScope(scope.id)?.activeLeaseId).toBeNull();
+				expect((await runtime.evidence.getScope(scope.id))?.fencingToken).toBe(scope.fencingToken);
+				expect((await runtime.evidence.getScope(scope.id))?.activeLeaseId).toBeNull();
 				expect(await fs.readFile(join(scope.canonicalRoot, "file.txt"), "utf8")).toBe("changed");
 			}
 		} finally {
@@ -442,9 +557,8 @@ describe("rollback activity admission and bounded ranges", () => {
 		expect(files).toHaveLength(257);
 		try {
 			// A large fixed plan tightens admission to its authorized scope, not its mutation set.
-			await expect(execution(plan).result).rejects.toMatchObject({
-				code: "uncoordinated_activity",
-			});
+			const failure = await execution(plan).result.catch((error: unknown) => error);
+			expect(failure).toMatchObject({ code: "uncoordinated_activity" });
 			expect(history(FILE_CHANGE_LIMITS.revertFiles)).toBe(before);
 			expect(journalFiles(plan, FILE_CHANGE_LIMITS.revertFiles)).toEqual(files);
 			for (const path of paths) expect(await fs.readFile(path, "utf8")).toBe("changed");

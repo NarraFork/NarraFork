@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, unlinkSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
+import { readQuery } from "@server/db/worker-read";
 import { and, eq, isNull } from "drizzle-orm";
 import { db } from "../db";
 import { chapters, containerInstances, projects } from "../db/schema";
@@ -813,7 +814,9 @@ export const containerService = {
 	 * Progress is streamed via container:log events; completion via container:started/error.
 	 */
 	async startChapterContainers(chapterId: string): Promise<void> {
-		const chapter = await db.query.chapters.findFirst({ where: eq(chapters.id, chapterId) });
+		const chapter = await readQuery(
+			db.query.chapters.findFirst({ where: eq(chapters.id, chapterId) }),
+		);
 		if (!chapter) throw new NotFoundError("Chapter", chapterId);
 		if (!chapter.worktreePath) throw new ValidationError("Chapter has no worktree");
 
@@ -827,10 +830,12 @@ export const containerService = {
 		}
 
 		// Determine proxy mode: global proxy enabled + project has proxyDomain
-		const project = await db.query.projects.findFirst({
-			where: eq(projects.id, chapter.projectId),
-			columns: { proxyDomain: true },
-		});
+		const project = await readQuery(
+			db.query.projects.findFirst({
+				where: eq(projects.id, chapter.projectId),
+				columns: { proxyDomain: true },
+			}),
+		);
 		const proxyEnabled = settings.containers.proxy?.enabled && !!project?.proxyDomain;
 		const proxyDomain = project?.proxyDomain ?? null;
 
@@ -1030,7 +1035,9 @@ export const containerService = {
 	/** Pause all containers for a chapter (used during dormant). */
 	async pauseChapterContainers(chapterId: string): Promise<void> {
 		await containerLock.acquire(chapterId, async () => {
-			const chapter = await db.query.chapters.findFirst({ where: eq(chapters.id, chapterId) });
+			const chapter = await readQuery(
+				db.query.chapters.findFirst({ where: eq(chapters.id, chapterId) }),
+			);
 			if (!chapter) throw new NotFoundError("Chapter", chapterId);
 
 			const config = chapter.containerConfig as ContainerConfig | null;
@@ -1065,7 +1072,9 @@ export const containerService = {
 	/** Unpause all containers for a chapter (used during wake). */
 	async unpauseChapterContainers(chapterId: string): Promise<void> {
 		const needsFreshStart = await containerLock.acquire(chapterId, async () => {
-			const chapter = await db.query.chapters.findFirst({ where: eq(chapters.id, chapterId) });
+			const chapter = await readQuery(
+				db.query.chapters.findFirst({ where: eq(chapters.id, chapterId) }),
+			);
 			if (!chapter) throw new NotFoundError("Chapter", chapterId);
 			if (!chapter.worktreePath) throw new ValidationError("Chapter has no worktree");
 
@@ -1106,9 +1115,11 @@ export const containerService = {
 	/** Stop all containers for a chapter. */
 	async stopChapterContainers(chapterId: string): Promise<void> {
 		await containerLock.acquire(chapterId, async () => {
-			const chapter = await db.query.chapters.findFirst({
-				where: eq(chapters.id, chapterId),
-			});
+			const chapter = await readQuery(
+				db.query.chapters.findFirst({
+					where: eq(chapters.id, chapterId),
+				}),
+			);
 			if (!chapter) throw new NotFoundError("Chapter", chapterId);
 
 			const config = chapter.containerConfig as ContainerConfig | null;
@@ -1148,22 +1159,26 @@ export const containerService = {
 		opts: { deleteVolumes?: boolean } = {},
 	): Promise<void> {
 		await containerLock.acquire(chapterId, async () => {
-			const chapter = await db.query.chapters.findFirst({
-				where: eq(chapters.id, chapterId),
-			});
+			const chapter = await readQuery(
+				db.query.chapters.findFirst({
+					where: eq(chapters.id, chapterId),
+				}),
+			);
 			if (!chapter) throw new NotFoundError("Chapter", chapterId);
 
 			const config = chapter.containerConfig as ContainerConfig | null;
 			const worktreePath = chapter.worktreePath;
 
 			// Check if this chapter was using proxy mode (has proxyLabel records)
-			const existingInstances = await db.query.containerInstances.findMany({
-				where: and(
-					eq(containerInstances.chapterId, chapterId),
-					isNull(containerInstances.worktreeResourceId),
-				),
-				columns: { proxyLabel: true },
-			});
+			const existingInstances = await readQuery(
+				db.query.containerInstances.findMany({
+					where: and(
+						eq(containerInstances.chapterId, chapterId),
+						isNull(containerInstances.worktreeResourceId),
+					),
+					columns: { proxyLabel: true },
+				}),
+			);
 			const wasProxyMode = existingInstances.some((i) => !!i.proxyLabel);
 
 			// Try to run compose down if worktree exists
@@ -1210,7 +1225,9 @@ export const containerService = {
 		chapterId: string,
 		opts: { tail?: number; service?: string } = {},
 	): Promise<string> {
-		const chapter = await db.query.chapters.findFirst({ where: eq(chapters.id, chapterId) });
+		const chapter = await readQuery(
+			db.query.chapters.findFirst({ where: eq(chapters.id, chapterId) }),
+		);
 		if (!chapter) throw new NotFoundError("Chapter", chapterId);
 		if (!chapter.worktreePath) throw new ValidationError("Chapter has no worktree");
 
@@ -1231,12 +1248,14 @@ export const containerService = {
 
 	/** List container instances for a chapter from DB. */
 	async listByChapter(chapterId: string) {
-		return db.query.containerInstances.findMany({
-			where: and(
-				eq(containerInstances.chapterId, chapterId),
-				isNull(containerInstances.worktreeResourceId),
-			),
-		});
+		return readQuery(
+			db.query.containerInstances.findMany({
+				where: and(
+					eq(containerInstances.chapterId, chapterId),
+					isNull(containerInstances.worktreeResourceId),
+				),
+			}),
+		);
 	},
 
 	/**

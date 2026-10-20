@@ -312,7 +312,8 @@ describe("actual tree-scan observation receipts", () => {
 				return real(options);
 			}),
 		);
-		await expect(capture({ gitTimeoutMs: 20 })).rejects.toThrow();
+		const failure = await capture({ gitTimeoutMs: 20 }).catch((error: unknown) => error);
+		expect(failure).toBeInstanceOf(Error);
 		const failed = rows().find((row) => row.coverage === "unavailable");
 		expect(failed?.reason).toBe("budget_exceeded");
 		expect(failed?.treeHash).toBeNull();
@@ -654,6 +655,7 @@ describe("actual tree-scan observation receipts", () => {
 		delayed.resolve();
 		await new Promise<void>((done) => setImmediate(done));
 		expect(rows()).toHaveLength(0);
+		receipts = new SnapshotCaptureReceiptService({ db, privateRoot });
 		await capture();
 		expect(rows()).toHaveLength(1);
 	});

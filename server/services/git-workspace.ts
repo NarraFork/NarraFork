@@ -4,6 +4,7 @@ import type { GitWorkspace, GitWorkspaceState } from "@shared/git-workspace";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { chapters, narrators, projects } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import type { ExecutionBackend } from "../lib/agent/execution/backend";
 import { localBackend, resolveBackend } from "../lib/agent/execution/registry";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
@@ -128,32 +129,38 @@ export async function resolveNarratorGitTarget(
 	cachedDiscovery = false,
 	recoverWorktreeList = false,
 ): Promise<GitWorkspaceTarget> {
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: {
-			id: true,
-			cwd: true,
-			workspaceRevision: true,
-			workspaceContext: true,
-			chapterId: true,
-			contextProjectId: true,
-			defaultDeviceId: true,
-		},
-	});
+	const narrator = await readQuery(
+		db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: {
+				id: true,
+				cwd: true,
+				workspaceRevision: true,
+				workspaceContext: true,
+				chapterId: true,
+				contextProjectId: true,
+				defaultDeviceId: true,
+			},
+		}),
+	);
 	if (!narrator) throw new NotFoundError("Narrator", narratorId);
 	const chapter = narrator.chapterId
-		? await db.query.chapters.findFirst({
-				where: eq(chapters.id, narrator.chapterId),
-				columns: { id: true, projectId: true, worktreePath: true, isRoot: true },
-			})
+		? await readQuery(
+				db.query.chapters.findFirst({
+					where: eq(chapters.id, narrator.chapterId),
+					columns: { id: true, projectId: true, worktreePath: true, isRoot: true },
+				}),
+			)
 		: undefined;
 	if (narrator.chapterId && !chapter) throw new NotFoundError("Chapter", narrator.chapterId);
 	const projectId = chapter?.projectId ?? narrator.contextProjectId ?? undefined;
 	const project = projectId
-		? await db.query.projects.findFirst({
-				where: eq(projects.id, projectId),
-				columns: { gitPath: true },
-			})
+		? await readQuery(
+				db.query.projects.findFirst({
+					where: eq(projects.id, projectId),
+					columns: { gitPath: true },
+				}),
+			)
 		: undefined;
 	if (projectId && !project) throw new NotFoundError("Project", projectId);
 	const active = activeNarrators.get(narratorId);
@@ -356,7 +363,7 @@ export async function resolveNarratorGitTarget(
 }
 
 export async function resolveWorkspaceFromChapter(chapterId: string): Promise<ResolvedWorkspace> {
-	const ch = await db.query.chapters.findFirst({ where: eq(chapters.id, chapterId) });
+	const ch = await readQuery(db.query.chapters.findFirst({ where: eq(chapters.id, chapterId) }));
 	if (!ch) throw new NotFoundError("Chapter", chapterId);
 	if (!ch.worktreePath) throw new ValidationError("Chapter has no active worktree");
 	return {

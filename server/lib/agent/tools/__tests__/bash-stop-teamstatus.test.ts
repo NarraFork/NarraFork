@@ -61,6 +61,13 @@ const realAgentRuntimeRunModule = {
 };
 
 const fakeBackgroundTaskService = {
+	assertExecutionAdmission() {},
+	trackBashLifecycle(work: Promise<unknown>, isRunning?: () => boolean) {
+		realBackgroundTaskServiceModule.backgroundTaskService.trackBashLifecycle(work, isRunning);
+	},
+	reportShutdownFailure(error: unknown) {
+		realBackgroundTaskServiceModule.backgroundTaskService.reportShutdownFailure(error);
+	},
 	async getById(id: string) {
 		return tasks.get(id) ?? null;
 	},

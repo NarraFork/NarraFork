@@ -1,19 +1,17 @@
 import { createHash, createHmac, randomBytes } from "node:crypto";
 import type { BigIntStats } from "node:fs";
 import { lstat } from "node:fs/promises";
+import { readQuery, readQueryFirst, readTransactionTask } from "@server/db/worker-read";
 import {
 	FILE_CHANGE_LIMITS,
-	type FileChangeRecoveryDecision,
 	type FileChangeRecoveryVerdict,
 	type FileChangeState,
 	fileChangeStatesEqual,
 } from "@shared/file-change-protocol";
-import { and, asc, desc, eq, gt, inArray, isNotNull, isNull, ne, or, sql } from "drizzle-orm";
+import { and, asc, eq, gt, inArray, isNotNull, or } from "drizzle-orm";
 import type { db as defaultDb } from "../db";
 import {
-	fileChangeEffects,
 	fileChangeOperations,
-	fileChangeScopeRecoveries,
 	fileChangeScopes,
 	users,
 	workspaceExecutionOwners,
@@ -33,12 +31,12 @@ import {
 	assertWorkspaceMaintenanceAuthority,
 	proveWorkspaceOwnerEnded,
 } from "./workspace-execution-owner";
+import { leaseManifest, type RecoveryEffect, recoveryEffects } from "./workspace-recovery-read";
 import type { WorkspaceRecoveryReservation } from "./workspace-write-coordinator";
 import {
 	WORKSPACE_WRITE_COORDINATOR_LIMITS,
 	WorkspaceWriteCoordinatorError,
 } from "./workspace-write-coordinator";
-import { WORKSPACE_LEASE_LIMITS } from "./workspace-write-lease-store";
 
 /** No workspace file writes. Observation is bounded and outside the final synchronous transaction. */
 export const WORKSPACE_RECOVERY_LIMITS = Object.freeze({
@@ -119,24 +117,6 @@ export interface WorkspaceScopeRecoveryDeps {
 type ScopeRow = typeof fileChangeScopes.$inferSelect;
 type Database = WorkspaceScopeRecoveryDeps["database"];
 
-// Do not load immutable receipts, actor metadata or file bodies for inventory/preview.
-const effectColumns = {
-	id: fileChangeEffects.id,
-	operationId: fileChangeEffects.operationId,
-	identityJson: fileChangeEffects.identityJson,
-	beforeStateJson: fileChangeEffects.beforeStateJson,
-	intendedAfterStateJson: fileChangeEffects.intendedAfterStateJson,
-	settlement: fileChangeEffects.settlement,
-	updatedAt: fileChangeEffects.updatedAt,
-};
-type RecoveryEffect = {
-	[K in keyof typeof effectColumns]: (typeof fileChangeEffects.$inferSelect)[K];
-} & {
-	/** Current-state comparison only: never infer an original dispatch from a settled row. */
-	alreadySettled?: boolean;
-	historicallyDispatched?: boolean;
-};
-
 function scopeIdentity(row: ScopeRow): FileChangeScopeIdentity {
 	return {
 		id: row.id,
@@ -190,28 +170,29 @@ function barrierKind(row: ScopeRow): WorkspaceBarrier["kind"] {
 		? "unverified_root"
 		: "quarantined";
 }
-function requireScopeRow(database: Database, scopeId: string): ScopeRow {
-	const row = database
-		.select()
-		.from(fileChangeScopes)
-		.where(eq(fileChangeScopes.id, scopeId))
-		.get();
+async function requireScopeRow(database: Database, scopeId: string): Promise<ScopeRow> {
+	const row = await readQueryFirst(
+		database.select().from(fileChangeScopes).where(eq(fileChangeScopes.id, scopeId)),
+	);
 	if (!row) throw new AppError("Unknown file-change scope", 404, "SCOPE_NOT_FOUND");
 	return row;
 }
-function resolveLeaseId(
+async function resolveLeaseId(
 	database: Database,
 	scope: ScopeRow,
 	requested?: string | null,
-): string | null {
+): Promise<string | null> {
 	if (requested) return requested;
 	if (!scope.activeLeaseId) return null;
 	return (
-		database
-			.select({ id: workspaceWriteLeases.leaseId })
-			.from(workspaceWriteLeases)
-			.where(eq(workspaceWriteLeases.leaseId, scope.activeLeaseId))
-			.get()?.id ?? null
+		(
+			await readQueryFirst(
+				database
+					.select({ id: workspaceWriteLeases.leaseId })
+					.from(workspaceWriteLeases)
+					.where(eq(workspaceWriteLeases.leaseId, scope.activeLeaseId)),
+			)
+		)?.id ?? null
 	);
 }
 function requireLocal(scope: ScopeRow) {
@@ -239,159 +220,23 @@ function mapCoordinatorError(error: unknown): never {
 	throw error;
 }
 
-/** Legacy releases used two commits. Recover the exact audit's effect set, not an empty prefix. */
-function leaseManifest(database: Database, leaseId: string) {
-	// Mutation count and unique effect count are independent: apply + compensate
-	// can legally record 2,000 dispatch identities for at most 1,000 effects.
-	const header = database
-		.select({
-			bytes: sql<number>`length(cast(${workspaceWriteLeases.mutationManifestJson} as blob))`,
-		})
-		.from(workspaceWriteLeases)
-		.where(eq(workspaceWriteLeases.leaseId, leaseId))
-		.get();
-	if (!header) conflict("Recovery lease no longer exists");
-	if (header.bytes > WORKSPACE_LEASE_LIMITS.manifestBytes)
-		throw new AppError("Recovery manifest exceeds the byte limit", 413, "RECOVERY_MANIFEST_LIMIT");
-	const lease = database
-		.select({ manifest: workspaceWriteLeases.mutationManifestJson })
-		.from(workspaceWriteLeases)
-		.where(eq(workspaceWriteLeases.leaseId, leaseId))
-		.get();
-	if (!lease) conflict("Recovery lease no longer exists");
-	if (lease.manifest.version !== 1) conflict("Unsupported recovery manifest version");
-	return lease.manifest.mutations;
-}
-function recoveryEffects(
+function readRecoveryEffects(
 	database: Database,
 	scope: ScopeRow,
 	leaseId: string | null,
-): RecoveryEffect[] {
-	const manifest = leaseId ? leaseManifest(database, leaseId) : null;
-	if (manifest && manifest.length > WORKSPACE_RECOVERY_LIMITS.manifestMutations)
-		throw new AppError(
-			"Recovery manifest exceeds the mutation limit",
-			413,
-			"RECOVERY_MUTATION_LIMIT",
-		);
-	const effectIds = manifest
-		? [...new Set(manifest.flatMap((entry) => (entry.effectId ? [entry.effectId] : [])))]
-		: null;
-	const operationIds = manifest
-		? [
-				...new Set(
-					manifest.flatMap((entry) =>
-						!entry.effectId && entry.operationId ? [entry.operationId] : [],
-					),
-				),
-			]
-		: [];
-	const effects: RecoveryEffect[] = database
-		.select(effectColumns)
-		.from(fileChangeEffects)
-		.where(
-			and(
-				eq(fileChangeEffects.scopeId, scope.id),
-				effectIds
-					? or(
-							inArray(fileChangeEffects.id, effectIds),
-							inArray(fileChangeEffects.operationId, operationIds),
-						)
-					: ne(fileChangeEffects.settlement, "settled"),
-			),
-		)
-		.orderBy(asc(fileChangeEffects.id))
-		.limit(WORKSPACE_RECOVERY_LIMITS.files + 1)
-		.all();
-	if (effects.length > WORKSPACE_RECOVERY_LIMITS.files)
-		throw new AppError("Recovery exceeds the file limit", 413, "RECOVERY_FILE_LIMIT");
-	if (leaseId) {
-		for (const effect of effects) if (effect.settlement === "settled") effect.alreadySettled = true;
-		if (effectIds?.some((id) => !effects.some((effect) => effect.id === id)))
-			conflict("Recovery manifest references missing effects");
-	}
-	if (!leaseId) {
-		// Metadata first: never parse an unbounded audit history or silently trust
-		// only the latest (potentially empty) retry from the old two-commit release.
-		const audits = database
-			.select({
-				id: fileChangeScopeRecoveries.id,
-				bytes: sql<number>`length(cast(${fileChangeScopeRecoveries.effectDecisionsJson} as blob))`,
-			})
-			.from(fileChangeScopeRecoveries)
-			.where(
-				and(
-					eq(fileChangeScopeRecoveries.scopeId, scope.id),
-					isNull(fileChangeScopeRecoveries.workspaceLeaseId),
-					eq(fileChangeScopeRecoveries.scopeRevisionBefore, scope.revision),
-					eq(fileChangeScopeRecoveries.fencingTokenBefore, scope.fencingToken),
-				),
-			)
-			.orderBy(desc(fileChangeScopeRecoveries.createdAt), desc(fileChangeScopeRecoveries.id))
-			.limit(WORKSPACE_RECOVERY_LIMITS.legacyAudits + 1)
-			.all();
-		if (
-			audits.length > WORKSPACE_RECOVERY_LIMITS.legacyAudits ||
-			audits.reduce((sum, audit) => sum + audit.bytes, 0) > WORKSPACE_RECOVERY_LIMITS.metadataBytes
-		)
-			throw new AppError(
-				"Matching legacy audits exceed the recovery budget",
-				413,
-				"RECOVERY_AUDIT_LIMIT",
-			);
-		const decisions = new Map<string, FileChangeRecoveryDecision>();
-		for (const header of audits) {
-			const audit = database
-				.select({ decisions: fileChangeScopeRecoveries.effectDecisionsJson })
-				.from(fileChangeScopeRecoveries)
-				.where(eq(fileChangeScopeRecoveries.id, header.id))
-				.get();
-			if (!audit) conflict("Legacy recovery audit disappeared");
-			if (audit.decisions.length > WORKSPACE_RECOVERY_LIMITS.files)
-				throw new AppError("Legacy audit exceeds the file limit", 413, "RECOVERY_FILE_LIMIT");
-			for (const decision of audit.decisions)
-				if (!decisions.has(decision.effectId)) decisions.set(decision.effectId, decision);
-			if (decisions.size > WORKSPACE_RECOVERY_LIMITS.files)
-				throw new AppError(
-					"Legacy audit effects exceed the file limit",
-					413,
-					"RECOVERY_FILE_LIMIT",
-				);
-		}
+	signal?: AbortSignal,
+): Promise<RecoveryEffect[]> {
+	return readTransactionTask<RecoveryEffect[]>(
+		database,
 		{
-			const existing = new Set(effects.map((effect) => effect.id));
-			for (const decision of decisions.values()) {
-				if (existing.has(decision.effectId)) continue;
-				const effect = database
-					.select(effectColumns)
-					.from(fileChangeEffects)
-					.where(
-						and(
-							eq(fileChangeEffects.id, decision.effectId),
-							eq(fileChangeEffects.scopeId, scope.id),
-						),
-					)
-					.get();
-				if (!effect || effect.identityJson.canonicalPath !== decision.canonicalPath)
-					conflict("Legacy recovery evidence is missing or has changed");
-				effects.push({
-					...effect,
-					alreadySettled: effect.settlement === "settled",
-					historicallyDispatched: decision.verdict !== "not_dispatched",
-				});
-				existing.add(effect.id);
-			}
-		}
-	}
-	if (effects.length > WORKSPACE_RECOVERY_LIMITS.files)
-		throw new AppError("Recovery exceeds the file limit", 413, "RECOVERY_FILE_LIMIT");
-	if (Buffer.byteLength(JSON.stringify(effects)) > WORKSPACE_RECOVERY_LIMITS.metadataBytes)
-		throw new AppError(
-			"Recovery evidence metadata exceeds the byte limit",
-			413,
-			"RECOVERY_METADATA_LIMIT",
-		);
-	return effects.sort((a, b) => a.id.localeCompare(b.id));
+			kind: "workspace-recovery-effects-v1",
+			scope: { id: scope.id, revision: scope.revision, fencingToken: scope.fencingToken },
+			leaseId,
+			limits: WORKSPACE_RECOVERY_LIMITS,
+		},
+		() => recoveryEffects(database, scope, leaseId, WORKSPACE_RECOVERY_LIMITS),
+		{ signal },
+	);
 }
 
 interface ObservationBudget {
@@ -643,16 +488,16 @@ export function createWorkspaceScopeRecovery(deps: WorkspaceScopeRecoveryDeps) {
 		session.reservation.release();
 		if (maintenance.get(session.token) === session) maintenance.delete(session.token);
 	}
+	function ownerIdentityQuery(oldOwnerEpoch: string) {
+		return database
+			.select({ identity: workspaceExecutionOwners.identityJson })
+			.from(workspaceExecutionOwners)
+			.where(eq(workspaceExecutionOwners.ownerEpoch, oldOwnerEpoch));
+	}
 	function hasOwnerIdentity(oldOwnerEpoch: string | null) {
 		return (
 			!!oldOwnerEpoch &&
-			isWorkspaceProcessIdentity(
-				database
-					.select({ identity: workspaceExecutionOwners.identityJson })
-					.from(workspaceExecutionOwners)
-					.where(eq(workspaceExecutionOwners.ownerEpoch, oldOwnerEpoch))
-					.get()?.identity,
-			)
+			isWorkspaceProcessIdentity(ownerIdentityQuery(oldOwnerEpoch).get()?.identity)
 		);
 	}
 	function assertLegacyOwner(oldOwnerEpoch: string | null) {
@@ -730,17 +575,20 @@ export function createWorkspaceScopeRecovery(deps: WorkspaceScopeRecoveryDeps) {
 		const runtime = await getRuntime();
 		assertAdmin(input.adminUserId);
 		assertAuthority();
-		const scope = requireScopeRow(database, input.scopeId);
+		const scope = await requireScopeRow(database, input.scopeId);
 		requireLocal(scope);
-		const leaseId = resolveLeaseId(database, scope, input.leaseId);
+		const leaseId = await resolveLeaseId(database, scope, input.leaseId);
 		if (maintenance.size >= WORKSPACE_RECOVERY_LIMITS.maintenanceSessions)
 			throw new AppError("Too many maintenance sessions", 429, "MAINTENANCE_LIMIT");
 		const oldOwnerEpoch = leaseId
-			? (database
-					.select({ epoch: workspaceWriteLeases.ownerEpoch })
-					.from(workspaceWriteLeases)
-					.where(eq(workspaceWriteLeases.leaseId, leaseId))
-					.get()?.epoch ?? null)
+			? ((
+					await readQueryFirst(
+						database
+							.select({ epoch: workspaceWriteLeases.ownerEpoch })
+							.from(workspaceWriteLeases)
+							.where(eq(workspaceWriteLeases.leaseId, leaseId)),
+					)
+				)?.epoch ?? null)
 			: scope.activeLeaseEpoch;
 		assertLegacyOwner(oldOwnerEpoch);
 		const expiresAt = now() + WORKSPACE_RECOVERY_LIMITS.maintenanceDurationMs;
@@ -819,7 +667,7 @@ export function createWorkspaceScopeRecovery(deps: WorkspaceScopeRecoveryDeps) {
 	}
 
 	async function retryWorkspaceRecoveryPersistence(scopeId: string) {
-		const scope = requireScopeRow(database, scopeId);
+		const scope = await requireScopeRow(database, scopeId);
 		requireLocal(scope);
 		const runtime = await getRuntime();
 		try {
@@ -841,48 +689,51 @@ export function createWorkspaceScopeRecovery(deps: WorkspaceScopeRecoveryDeps) {
 		const targets: { scope: ScopeRow; leaseId: string | null }[] = [];
 		let nextCursor: string | null = null;
 		if (phase === "lease") {
-			const rows = database
-				.select({ id: workspaceWriteLeases.leaseId, scopeId: workspaceWriteLeases.scopeId })
-				.from(workspaceWriteLeases)
-				.where(
-					and(
-						inArray(workspaceWriteLeases.status, ["quarantined", "executing"]),
-						after ? gt(workspaceWriteLeases.leaseId, after) : undefined,
-					),
-				)
-				.orderBy(asc(workspaceWriteLeases.leaseId))
-				.limit(WORKSPACE_RECOVERY_LIMITS.pageItems + 1)
-				.all();
+			const rows = await readQuery(
+				database
+					.select({ id: workspaceWriteLeases.leaseId, scopeId: workspaceWriteLeases.scopeId })
+					.from(workspaceWriteLeases)
+					.where(
+						and(
+							inArray(workspaceWriteLeases.status, ["quarantined", "executing"]),
+							after ? gt(workspaceWriteLeases.leaseId, after) : undefined,
+						),
+					)
+					.orderBy(asc(workspaceWriteLeases.leaseId))
+					.limit(WORKSPACE_RECOVERY_LIMITS.pageItems + 1),
+			);
 			for (const lease of rows.slice(0, WORKSPACE_RECOVERY_LIMITS.pageItems))
-				targets.push({ scope: requireScopeRow(database, lease.scopeId), leaseId: lease.id });
+				targets.push({ scope: await requireScopeRow(database, lease.scopeId), leaseId: lease.id });
 			nextCursor =
 				rows.length > WORKSPACE_RECOVERY_LIMITS.pageItems
 					? `lease:${rows[WORKSPACE_RECOVERY_LIMITS.pageItems - 1]?.id}`
 					: "scope:";
 		} else {
-			const rows = database
-				.select()
-				.from(fileChangeScopes)
-				.where(
-					and(
-						or(
-							eq(fileChangeScopes.status, "needs_verification"),
-							isNotNull(fileChangeScopes.activeLeaseId),
+			const rows = await readQuery(
+				database
+					.select()
+					.from(fileChangeScopes)
+					.where(
+						and(
+							or(
+								eq(fileChangeScopes.status, "needs_verification"),
+								isNotNull(fileChangeScopes.activeLeaseId),
+							),
+							after ? gt(fileChangeScopes.id, after) : undefined,
 						),
-						after ? gt(fileChangeScopes.id, after) : undefined,
-					),
-				)
-				.orderBy(asc(fileChangeScopes.id))
-				.limit(WORKSPACE_RECOVERY_LIMITS.pageItems + 1)
-				.all();
+					)
+					.orderBy(asc(fileChangeScopes.id))
+					.limit(WORKSPACE_RECOVERY_LIMITS.pageItems + 1),
+			);
 			for (const scope of rows.slice(0, WORKSPACE_RECOVERY_LIMITS.pageItems)) {
 				if (
 					scope.activeLeaseId &&
-					database
-						.select({ id: workspaceWriteLeases.leaseId })
-						.from(workspaceWriteLeases)
-						.where(eq(workspaceWriteLeases.leaseId, scope.activeLeaseId))
-						.get()
+					(await readQueryFirst(
+						database
+							.select({ id: workspaceWriteLeases.leaseId })
+							.from(workspaceWriteLeases)
+							.where(eq(workspaceWriteLeases.leaseId, scope.activeLeaseId)),
+					))
 				)
 					continue;
 				targets.push({ scope, leaseId: null });
@@ -903,16 +754,17 @@ export function createWorkspaceScopeRecovery(deps: WorkspaceScopeRecoveryDeps) {
 			let blockedReason: string | null = null;
 			let maintenanceRequired = false;
 			if (leaseId) {
-				const row = database
-					.select({
-						ranges: workspaceWriteLeases.rangesJson,
-						ended: workspaceWriteLeases.executionEndedAt,
-						ownerEpoch: workspaceWriteLeases.ownerEpoch,
-						executionClass: workspaceWriteLeases.executionClass,
-					})
-					.from(workspaceWriteLeases)
-					.where(eq(workspaceWriteLeases.leaseId, leaseId))
-					.get();
+				const row = await readQueryFirst(
+					database
+						.select({
+							ranges: workspaceWriteLeases.rangesJson,
+							ended: workspaceWriteLeases.executionEndedAt,
+							ownerEpoch: workspaceWriteLeases.ownerEpoch,
+							executionClass: workspaceWriteLeases.executionClass,
+						})
+						.from(workspaceWriteLeases)
+						.where(eq(workspaceWriteLeases.leaseId, leaseId)),
+				);
 				if (row) {
 					ranges = [...row.ranges.ranges];
 					executionEnded = row.ended !== null;
@@ -932,30 +784,38 @@ export function createWorkspaceScopeRecovery(deps: WorkspaceScopeRecoveryDeps) {
 				const unknownOwner =
 					error instanceof WorkspaceWriteCoordinatorError &&
 					error.recoveryReason === "owner_unknown";
-				const identified = unknownOwner && hasOwnerIdentity(ownerEpoch);
+				const identified =
+					unknownOwner &&
+					!!ownerEpoch &&
+					isWorkspaceProcessIdentity(
+						(await readQueryFirst(ownerIdentityQuery(ownerEpoch)))?.identity,
+					);
 				maintenanceRequired = unknownOwner && !identified;
 				ownerProbeRetryAllowed = identified && localFileIo;
 			}
 			let effects: RecoveryEffect[] = [];
 			try {
-				effects = recoveryEffects(database, scope, leaseId);
+				effects = await readRecoveryEffects(database, scope, leaseId);
 			} catch (error) {
 				blockedReason = error instanceof Error ? error.message : String(error);
 			}
-			const operations = [...new Set(effects.map((effect) => effect.operationId))].flatMap(
-				(operationId) =>
-					database
-						.select({
-							operationId: fileChangeOperations.id,
-							sourceKind: fileChangeOperations.sourceKind,
-							narratorId: fileChangeOperations.narratorId,
-							toolCallId: fileChangeOperations.toolCallId,
-							startedAt: fileChangeOperations.startedAt,
-						})
-						.from(fileChangeOperations)
-						.where(eq(fileChangeOperations.id, operationId))
-						.all(),
-			);
+			const operations: WorkspaceBarrierOperationSummary[] = [];
+			for (const operationId of new Set(effects.map((effect) => effect.operationId))) {
+				operations.push(
+					...(await readQuery(
+						database
+							.select({
+								operationId: fileChangeOperations.id,
+								sourceKind: fileChangeOperations.sourceKind,
+								narratorId: fileChangeOperations.narratorId,
+								toolCallId: fileChangeOperations.toolCallId,
+								startedAt: fileChangeOperations.startedAt,
+							})
+							.from(fileChangeOperations)
+							.where(eq(fileChangeOperations.id, operationId)),
+					)),
+				);
+			}
 			const item: WorkspaceBarrier = {
 				scope: scopeSummary(scope),
 				leaseId,
@@ -994,8 +854,8 @@ export function createWorkspaceScopeRecovery(deps: WorkspaceScopeRecoveryDeps) {
 		maintenanceSession?: MaintenanceSession,
 	) {
 		const runtime = await getRuntime();
-		let scope = requireScopeRow(database, scopeId);
-		const leaseId = resolveLeaseId(database, scope, requestedLeaseId);
+		let scope = await requireScopeRow(database, scopeId);
+		const leaseId = await resolveLeaseId(database, scope, requestedLeaseId);
 		requireLocal(scope);
 		const started = performance.now();
 		const bounded = boundedSignal(limits.durationMs, signal);
@@ -1004,15 +864,16 @@ export function createWorkspaceScopeRecovery(deps: WorkspaceScopeRecoveryDeps) {
 			// Explicit POST only: retry a bounded strict owner probe after a transient startup failure.
 			// Never infer the end of Bash/opaque execution or write anything during inventory GET.
 			if (!maintenanceSession && leaseId) {
-				const lease = database
-					.select({
-						ownerEpoch: workspaceWriteLeases.ownerEpoch,
-						executionClass: workspaceWriteLeases.executionClass,
-						ended: workspaceWriteLeases.executionEndedAt,
-					})
-					.from(workspaceWriteLeases)
-					.where(eq(workspaceWriteLeases.leaseId, leaseId))
-					.get();
+				const lease = await readQueryFirst(
+					database
+						.select({
+							ownerEpoch: workspaceWriteLeases.ownerEpoch,
+							executionClass: workspaceWriteLeases.executionClass,
+							ended: workspaceWriteLeases.executionEndedAt,
+						})
+						.from(workspaceWriteLeases)
+						.where(eq(workspaceWriteLeases.leaseId, leaseId)),
+				);
 				if (
 					lease?.executionClass === "local_file_io" &&
 					!lease.ended &&
@@ -1023,7 +884,7 @@ export function createWorkspaceScopeRecovery(deps: WorkspaceScopeRecoveryDeps) {
 					bounded.throwIfAborted();
 					if (proof) {
 						runtime.coordinator.recordLocalOwnerTermination(leaseId, proof);
-						scope = requireScopeRow(database, scopeId);
+						scope = await requireScopeRow(database, scopeId);
 					}
 				}
 			}
@@ -1034,7 +895,7 @@ export function createWorkspaceScopeRecovery(deps: WorkspaceScopeRecoveryDeps) {
 					leaseId: leaseId ?? undefined,
 				});
 			try {
-				const effects = recoveryEffects(database, scope, leaseId ?? null);
+				const effects = await readRecoveryEffects(database, scope, leaseId ?? null, signal);
 				const rootIdentity =
 					!leaseId && barrierKind(scope) === "unverified_root"
 						? await localDirectoryIdentity(scope.canonicalRoot)
@@ -1078,14 +939,15 @@ export function createWorkspaceScopeRecovery(deps: WorkspaceScopeRecoveryDeps) {
 	}
 
 	async function reconcileWorkspaceBarrier(scopeId: string, leaseId: string, signal?: AbortSignal) {
-		const lease = database
-			.select({
-				scopeId: workspaceWriteLeases.scopeId,
-				executionClass: workspaceWriteLeases.executionClass,
-			})
-			.from(workspaceWriteLeases)
-			.where(eq(workspaceWriteLeases.leaseId, leaseId))
-			.get();
+		const lease = await readQueryFirst(
+			database
+				.select({
+					scopeId: workspaceWriteLeases.scopeId,
+					executionClass: workspaceWriteLeases.executionClass,
+				})
+				.from(workspaceWriteLeases)
+				.where(eq(workspaceWriteLeases.leaseId, leaseId)),
+		);
 		if (!lease || lease.scopeId !== scopeId || lease.executionClass !== "local_file_io")
 			return { recovered: false as const, reason: "manual_observation_required" };
 		const preview = await observeWorkspaceBarrier(scopeId, signal, leaseId);
@@ -1119,8 +981,8 @@ export function createWorkspaceScopeRecovery(deps: WorkspaceScopeRecoveryDeps) {
 		systemReconciled = false,
 	) {
 		const runtime = await getRuntime();
-		const scope = requireScopeRow(database, input.scopeId);
-		const leaseId = resolveLeaseId(database, scope, input.leaseId);
+		const scope = await requireScopeRow(database, input.scopeId);
+		const leaseId = await resolveLeaseId(database, scope, input.leaseId);
 		requireLocal(scope);
 		const started = performance.now();
 		const signal = boundedSignal(limits.durationMs, input.signal);
@@ -1133,7 +995,7 @@ export function createWorkspaceScopeRecovery(deps: WorkspaceScopeRecoveryDeps) {
 					leaseId: leaseId ?? undefined,
 				});
 			try {
-				const effects = recoveryEffects(database, scope, leaseId ?? null);
+				const effects = await readRecoveryEffects(database, scope, leaseId ?? null, signal);
 				const rootIdentity =
 					!leaseId && barrierKind(scope) === "unverified_root"
 						? await localDirectoryIdentity(scope.canonicalRoot)
@@ -1177,7 +1039,9 @@ export function createWorkspaceScopeRecovery(deps: WorkspaceScopeRecoveryDeps) {
 				// Detect evidence changes during awaited IO before entering the commit boundary.
 				if (
 					JSON.stringify(effects) !==
-					JSON.stringify(recoveryEffects(database, scope, leaseId ?? null))
+					JSON.stringify(
+						recoveryEffects(database, scope, leaseId ?? null, WORKSPACE_RECOVERY_LIMITS),
+					)
 				)
 					conflict("Recovery evidence changed during observation");
 				let settledEffectCount = 0;
@@ -1194,7 +1058,7 @@ export function createWorkspaceScopeRecovery(deps: WorkspaceScopeRecoveryDeps) {
 							tx,
 						);
 					if (!rootIdentity || maintenanceSession) {
-						const manifest = leaseId ? leaseManifest(database, leaseId) : [];
+						const manifest = leaseId ? leaseManifest(tx, leaseId) : [];
 						settledEffectCount = runtime.evidence.closeBooksForRecovery(
 							{
 								scopeId: scope.id,
@@ -1234,7 +1098,7 @@ export function createWorkspaceScopeRecovery(deps: WorkspaceScopeRecoveryDeps) {
 						).settledEffectCount;
 					}
 				});
-				const cleared = requireScopeRow(database, scope.id);
+				const cleared = await requireScopeRow(database, scope.id);
 				return {
 					recovered: rootIdentity ? ("root_verified" as const) : ("barrier_cleared" as const),
 					settledEffectCount,
@@ -1243,17 +1107,18 @@ export function createWorkspaceScopeRecovery(deps: WorkspaceScopeRecoveryDeps) {
 					remaining: {
 						rootVerificationRequired: cleared.status === "needs_verification",
 						legacyBarrier: cleared.activeLeaseId !== null,
-						leaseBarrier: !!database
-							.select({ id: workspaceWriteLeases.leaseId })
-							.from(workspaceWriteLeases)
-							.where(
-								and(
-									eq(workspaceWriteLeases.scopeId, scope.id),
-									inArray(workspaceWriteLeases.status, ["executing", "quarantined"]),
-								),
-							)
-							.limit(1)
-							.get(),
+						leaseBarrier: !!(await readQueryFirst(
+							database
+								.select({ id: workspaceWriteLeases.leaseId })
+								.from(workspaceWriteLeases)
+								.where(
+									and(
+										eq(workspaceWriteLeases.scopeId, scope.id),
+										inArray(workspaceWriteLeases.status, ["executing", "quarantined"]),
+									),
+								)
+								.limit(1),
+						)),
 					},
 				};
 			} finally {

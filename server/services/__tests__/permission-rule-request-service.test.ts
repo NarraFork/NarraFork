@@ -1268,7 +1268,7 @@ describe("attempt-bound permission requests", () => {
 		let after: string | undefined;
 		let terminated = 0;
 		do {
-			const page = service.recoverPermissionRuleRequests({
+			const page = await service.recoverPermissionRuleRequests({
 				after,
 				limit: 1,
 				reason: "Server restarted before tool completion",
@@ -1314,8 +1314,12 @@ describe("attempt-bound permission requests", () => {
 			}),
 		).toBe(false);
 		expect(
-			service.recoverPermissionRuleRequests({ expiredOnly: true, reason: "Receipt expired" })
-				.terminated,
+			(
+				await service.recoverPermissionRuleRequests({
+					expiredOnly: true,
+					reason: "Receipt expired",
+				})
+			).terminated,
 		).toBe(1);
 		const get = (id: string) =>
 			db
@@ -1806,7 +1810,9 @@ describe("attempt-bound permission requests", () => {
 		});
 		expect(result.isError).toBe(true);
 		expect(count()).toBe(0);
-		expect(service.listPermissionRuleRequests(identity.narratorId).items[0]?.status).toBe("failed");
+		expect((await service.listPermissionRuleRequests(identity.narratorId)).items[0]?.status).toBe(
+			"failed",
+		);
 	});
 	test("child project context cannot erase its ancestor project blacklist", async () => {
 		const parent = await seed(),
@@ -2343,17 +2349,21 @@ describe("attempt-bound permission requests", () => {
 		await service.preparePermissionRuleRequest(identity, proposal, identity.context);
 		const other = await call(identity.narratorId);
 		await service.preparePermissionRuleRequest(other, proposal, other.context);
-		const first = service.listPermissionRuleRequests(identity.narratorId, { limit: 1 });
+		const first = await service.listPermissionRuleRequests(identity.narratorId, { limit: 1 });
 		expect(first.items).toHaveLength(1);
 		expect(first.nextCursor).not.toBeNull();
 		expect(first.items[0]).not.toHaveProperty("proposalJson");
 		expect(
-			service.listPermissionRuleRequests(identity.narratorId, {
-				limit: 1,
-				cursor: first.nextCursor,
-			}).items,
+			(
+				await service.listPermissionRuleRequests(identity.narratorId, {
+					limit: 1,
+					cursor: first.nextCursor,
+				})
+			).items,
 		).toHaveLength(1);
-		expect(() => service.listPermissionRuleRequests(identity.narratorId, { limit: 101 })).toThrow();
+		await expect(
+			service.listPermissionRuleRequests(identity.narratorId, { limit: 101 }),
+		).rejects.toThrow();
 	});
 	test("NarraForkAdmin cannot enable opt-in through direct or ancestor update/reset", async () => {
 		for (const [action, path, value] of [

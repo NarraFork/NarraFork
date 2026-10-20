@@ -2,6 +2,7 @@ import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { chapters, projects } from "../db/schema";
+import { readQuery } from "../db/worker-read";
 import { buildHistory, resolveProviderAndModel } from "../lib/agent";
 import { estimateJsonTokens } from "../lib/agent/estimate-json-tokens";
 import { isPlanModeTrait } from "../lib/narrator-utils";
@@ -39,17 +40,23 @@ async function resolvePromptCwd(narrator: {
 		return resolveNarratorSessionCwd(narrator.cwd, null, null, getHome());
 	}
 
-	const chapter = await db.query.chapters.findFirst({
-		where: eq(chapters.id, narrator.chapterId),
-		columns: { projectId: true, worktreePath: true },
-	});
+	const chapter = await readQuery(
+		db.query.chapters.findFirst({
+			where: eq(chapters.id, narrator.chapterId),
+			columns: { projectId: true, worktreePath: true },
+		}),
+		{ site: "narrator-history-token-estimate.resolvePromptCwd" },
+	);
 	if (!chapter) {
 		return resolveNarratorSessionCwd(narrator.cwd, null, null, getHome());
 	}
-	const project = await db.query.projects.findFirst({
-		where: eq(projects.id, chapter.projectId),
-		columns: { gitPath: true },
-	});
+	const project = await readQuery(
+		db.query.projects.findFirst({
+			where: eq(projects.id, chapter.projectId),
+			columns: { gitPath: true },
+		}),
+		{ site: "narrator-history-token-estimate.resolvePromptCwd" },
+	);
 	return resolveNarratorSessionCwd(narrator.cwd, chapter.worktreePath, project?.gitPath, getHome());
 }
 

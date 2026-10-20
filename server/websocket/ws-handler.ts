@@ -5,6 +5,7 @@ import { hotTimer, hotTimerClear } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { settings } from "../lib/settings";
+import { waitForShutdownWork } from "../lib/shutdown-activity";
 import type { VNetClientMessage } from "../lib/vnet/types";
 import {
 	type DeviceWSData,
@@ -96,9 +97,13 @@ function trackWebSocketHandler(work: Promise<void>, onError: (error: unknown) =>
 }
 
 /** Wait until every application-level WS message handler that started before shutdown settles. */
-export async function waitForWebSocketActivityDrain(): Promise<void> {
+export async function waitForWebSocketActivityDrain(signal?: AbortSignal): Promise<void> {
+	signal?.throwIfAborted();
 	while (activeWebSocketHandlers.size > 0) {
-		await Promise.allSettled([...activeWebSocketHandlers]);
+		const pending = Promise.allSettled([...activeWebSocketHandlers]);
+		if (signal) await waitForShutdownWork(pending, signal);
+		else await pending;
+		signal?.throwIfAborted();
 	}
 }
 

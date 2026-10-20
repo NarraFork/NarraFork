@@ -24,6 +24,7 @@ import {
 	narrators,
 	narratorToolCalls,
 } from "../db/schema";
+import { readQueryFirst } from "../db/worker-read";
 import { type ExecutionBackend, LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import { localBackend } from "../lib/agent/execution/local-backend";
 import { withWorkspaceWriteLock } from "../lib/agent/tools/write-serialization";
@@ -375,9 +376,9 @@ export class LocalFileChangeRuntime {
 
 	/** Reconcile only a positively terminal engine receipt against its ORIGINAL intent.
 	 * No target read/write, current-hash inference, new runtime adoption, or rollback claim. */
-	settleEditorReceipt(operationId: string, result: EditorApplyResult): void {
-		const operation = this.evidence.getOperation(operationId);
-		const effects = this.evidence.listEffects(operationId, { limit: 2 }).items;
+	async settleEditorReceipt(operationId: string, result: EditorApplyResult): Promise<void> {
+		const operation = await this.evidence.getOperation(operationId);
+		const effects = (await this.evidence.listEffects(operationId, { limit: 2 })).items;
 		const effect = effects.length === 1 ? effects[0] : undefined;
 		const intent = operation && effect ? remoteEditorIntent(operation, effect) : null;
 		// Operation/effect are immutable intent rows; one check covers the coordinator and
@@ -404,7 +405,7 @@ export class LocalFileChangeRuntime {
 				throw new Error("Editor terminal receipt contradicts the original settled evidence");
 			return;
 		}
-		const scope = this.evidence.getScope(effect.identityJson.scopeId);
+		const scope = await this.evidence.getScope(effect.identityJson.scopeId);
 		if (!scope) throw new Error("Original editor scope unavailable");
 		this.coordinator.acknowledgeEditorReceipt({
 			leaseId: intent.workspaceLeaseId,
@@ -506,11 +507,13 @@ export class LocalFileChangeRuntime {
 		};
 		await assertBoundary();
 		let budget =
-			this.database
-				.select()
-				.from(fileChangeStorageBudgets)
-				.where(eq(fileChangeStorageBudgets.id, "file-change-blobs"))
-				.get() ?? null;
+			(await readQueryFirst(
+				this.database
+					.select()
+					.from(fileChangeStorageBudgets)
+					.where(eq(fileChangeStorageBudgets.id, "file-change-blobs")),
+				{ site: "file-change-runtime.initializeBudget" },
+			)) ?? null;
 		if (
 			budget &&
 			(budget.namespaceKey !== hash([sourceInstanceId, root, rootIdentity]) ||
@@ -523,11 +526,13 @@ export class LocalFileChangeRuntime {
 				db: this.database,
 				namespaceKey: hash([sourceInstanceId, root, rootIdentity]),
 			});
-			const resetting = this.database
-				.select()
-				.from(fileChangeStorageBudgets)
-				.where(eq(fileChangeStorageBudgets.id, "file-change-blobs"))
-				.get();
+			const resetting = await readQueryFirst(
+				this.database
+					.select()
+					.from(fileChangeStorageBudgets)
+					.where(eq(fileChangeStorageBudgets.id, "file-change-blobs")),
+				{ site: "file-change-runtime.resettingBudget" },
+			);
 			if (!resetting) throw new Error("Reset budget disappeared");
 			budget = catalog.completeNamespaceReset({ expectedGeneration: resetting.generation });
 		}
@@ -535,7 +540,12 @@ export class LocalFileChangeRuntime {
 			// Only a truly empty FIRST namespace has a complete bounded inventory.
 			// A nonempty directory needs the real maintenance worker, not guessed totals.
 			await requireEmptyDirectory(root);
-			if (this.database.select({ id: fileChangeBlobs.id }).from(fileChangeBlobs).limit(1).get())
+			if (
+				await readQueryFirst(
+					this.database.select({ id: fileChangeBlobs.id }).from(fileChangeBlobs).limit(1),
+					{ site: "file-change-runtime.hasBlobs" },
+				)
+			)
 				throw new Error("Blob catalog has evidence without a verified namespace");
 			budget = catalog.initializeNamespace({
 				expectedGeneration: null,
@@ -563,8 +573,13 @@ export class LocalFileChangeRuntime {
 		if (budget.status !== "ready") throw new Error("Blob namespace reset did not complete");
 		for (const status of ["reserved", "reconcile_required"] as const) {
 			if (
-				catalog.listReservations({ expectedGeneration: budget.generation, status, limit: 1 }).items
-					.length
+				(
+					await catalog.listReservations({
+						expectedGeneration: budget.generation,
+						status,
+						limit: 1,
+					})
+				).items.length
 			)
 				throw new Error(
 					"Unfinished blob reservation requires reconciliation; no target was written",
@@ -609,7 +624,7 @@ export class LocalFileChangeRuntime {
 				(await persistentSourceId(privateRoot, false)) !== namespace.sourceInstanceId
 			)
 				throw new Error("File-change source identity changed; evidence needs verification");
-			const budget = namespace.catalog.getBudget();
+			const budget = await namespace.catalog.getBudget();
 			if (budget?.status !== "ready" || budget.generation !== namespace.generation)
 				throw new Error("File-change namespace catalog needs verification");
 			signal?.throwIfAborted();
@@ -714,22 +729,24 @@ export class LocalFileChangeRuntime {
 		return { row, target: Object.freeze({ ...target }), runtime: Object.freeze({ ...runtime }) };
 	}
 
-	private existingOperation(
+	private async existingOperation(
 		sourceInstanceId: string,
 		request: Pick<BoundFileChange<unknown>, "sourceKind" | "sourceId" | "attempt">,
 	) {
-		return this.database
-			.select()
-			.from(fileChangeOperations)
-			.where(
-				and(
-					eq(fileChangeOperations.sourceInstanceId, sourceInstanceId),
-					eq(fileChangeOperations.sourceKind, request.sourceKind),
-					eq(fileChangeOperations.sourceId, request.sourceId),
-					eq(fileChangeOperations.attempt, request.attempt),
+		return readQueryFirst(
+			this.database
+				.select()
+				.from(fileChangeOperations)
+				.where(
+					and(
+						eq(fileChangeOperations.sourceInstanceId, sourceInstanceId),
+						eq(fileChangeOperations.sourceKind, request.sourceKind),
+						eq(fileChangeOperations.sourceId, request.sourceId),
+						eq(fileChangeOperations.attempt, request.attempt),
+					),
 				),
-			)
-			.get();
+			{ site: "file-change-runtime.existingOperation" },
+		);
 	}
 
 	private linkOperation(request: LocalFileChangeRequest, operationId: string): void {
@@ -832,11 +849,13 @@ export class LocalFileChangeRuntime {
 			observation.toolUseId === ctx.currentToolUseId &&
 			observation.toolName === toolName &&
 			observation.targetJson === JSON.stringify(target);
-		const row = this.database
-			.select(TOOL_COLUMNS)
-			.from(narratorToolCalls)
-			.where(eq(narratorToolCalls.id, binding.toolCallId))
-			.get();
+		const row = await readQueryFirst(
+			this.database
+				.select(TOOL_COLUMNS)
+				.from(narratorToolCalls)
+				.where(eq(narratorToolCalls.id, binding.toolCallId)),
+			{ site: "file-change-runtime.noDispatchAttempt" },
+		);
 		if (
 			!row ||
 			row.version !== 1 ||
@@ -860,16 +879,18 @@ export class LocalFileChangeRuntime {
 					row.startedAt !== null)
 		)
 			throw new Error("No-dispatch proof does not match the live host attempt");
-		const actorRow = this.database
-			.select({
-				type: narrators.type,
-				variant: narrators.variant,
-				title: narrators.title,
-				parent: narrators.parentNarratorId,
-			})
-			.from(narrators)
-			.where(eq(narrators.id, ctx.narratorId))
-			.get();
+		const actorRow = await readQueryFirst(
+			this.database
+				.select({
+					type: narrators.type,
+					variant: narrators.variant,
+					title: narrators.title,
+					parent: narrators.parentNarratorId,
+				})
+				.from(narrators)
+				.where(eq(narrators.id, ctx.narratorId)),
+			{ site: "file-change-runtime.actor" },
+		);
 		if (!actorRow) throw new Error("Executing narrator no longer exists");
 		const source = await this.workspaceSource();
 		const host = this.readRuntime(LOCAL_DEVICE_ID);
@@ -963,17 +984,19 @@ export class LocalFileChangeRuntime {
 			}
 			throw error;
 		}
-		const actorRow = this.database
-			.select({
-				title: narrators.title,
-				variant: narrators.variant,
-				type: narrators.type,
-				parent: narrators.parentNarratorId,
-				subtype: narrators.subagentType,
-			})
-			.from(narrators)
-			.where(eq(narrators.id, ctx.narratorId))
-			.get();
+		const actorRow = await readQueryFirst(
+			this.database
+				.select({
+					title: narrators.title,
+					variant: narrators.variant,
+					type: narrators.type,
+					parent: narrators.parentNarratorId,
+					subtype: narrators.subagentType,
+				})
+				.from(narrators)
+				.where(eq(narrators.id, ctx.narratorId)),
+			{ site: "file-change-runtime.actor" },
+		);
 		if (!actorRow) throw new Error("Executing narrator no longer exists");
 		const isSubagent = actorRow.variant.startsWith("subagent") || actorRow.type === "subagent";
 		const bound: BoundFileChange<ToolResult> = {
@@ -1245,12 +1268,17 @@ export class LocalFileChangeRuntime {
 		// An empty database has no durable coordinator state to preserve (also
 		// supports explicitly reset injected databases without retaining old IDs).
 		if (
-			!this.database
-				.select({ id: fileChangeStorageBudgets.id })
-				.from(fileChangeStorageBudgets)
-				.limit(1)
-				.get() &&
-			!this.database.select({ id: fileChangeScopes.id }).from(fileChangeScopes).limit(1).get()
+			!(await readQueryFirst(
+				this.database
+					.select({ id: fileChangeStorageBudgets.id })
+					.from(fileChangeStorageBudgets)
+					.limit(1),
+				{ site: "file-change-runtime.hasBudget" },
+			)) &&
+			!(await readQueryFirst(
+				this.database.select({ id: fileChangeScopes.id }).from(fileChangeScopes).limit(1),
+				{ site: "file-change-runtime.hasScopes" },
+			))
 		)
 			workspaceSources.delete(this.database);
 		let pending = workspaceSources.get(this.database);
@@ -1258,15 +1286,20 @@ export class LocalFileChangeRuntime {
 			pending = (async () => {
 				// Existing durable scopes keep Bash and writes in the same coordinator,
 				// even after a restart. Never use an unverified replacement file here.
-				const scope = this.database
-					.select({ sourceInstanceId: fileChangeScopes.sourceInstanceId })
-					.from(fileChangeScopes)
-					.where(eq(fileChangeScopes.deviceId, LOCAL_DEVICE_ID))
-					.orderBy(fileChangeScopes.id)
-					.limit(1)
-					.get();
+				const scope = await readQueryFirst(
+					this.database
+						.select({ sourceInstanceId: fileChangeScopes.sourceInstanceId })
+						.from(fileChangeScopes)
+						.where(eq(fileChangeScopes.deviceId, LOCAL_DEVICE_ID))
+						.orderBy(fileChangeScopes.id)
+						.limit(1),
+					{ site: "file-change-runtime.sourceScope" },
+				);
 				if (scope) return scope.sourceInstanceId;
-				const budget = this.database.select().from(fileChangeStorageBudgets).limit(1).get();
+				const budget = await readQueryFirst(
+					this.database.select().from(fileChangeStorageBudgets).limit(1),
+					{ site: "file-change-runtime.sourceBudget" },
+				);
 				const root = resolve(this.options.privateRoot);
 				try {
 					await mkdir(root, { recursive: true, mode: 0o700 });
@@ -1343,7 +1376,7 @@ export class LocalFileChangeRuntime {
 								backend,
 								request.cwd,
 								async () => {
-									const existing = this.existingOperation(source.sourceInstanceId, request);
+									const existing = await this.existingOperation(source.sourceInstanceId, request);
 									if (existing) throw alreadyAttempted(existing);
 									const assertTarget = async () => {
 										await request.assertBinding();
@@ -1550,7 +1583,7 @@ export class LocalFileChangeRuntime {
 			let namespace = await this.initialize();
 			try {
 				await this.assertNamespaceDirectories(namespace);
-				const budget = namespace.catalog.getBudget();
+				const budget = await namespace.catalog.getBudget();
 				if (budget?.generation !== namespace.generation || budget.status !== "ready")
 					throw new Error("Blob namespace generation changed");
 			} catch {
@@ -1607,7 +1640,7 @@ export class LocalFileChangeRuntime {
 			// Installation identity is independent of the resettable blob cache.
 			// Do not hold that cache while waiting for workspace admission.
 			const source = await this.workspaceSource();
-			const existing = this.existingOperation(source.sourceInstanceId, request);
+			const existing = await this.existingOperation(source.sourceInstanceId, request);
 			if (existing) throw alreadyAttempted(existing);
 			signal.throwIfAborted();
 			diagnostics.enter("resolve_target");
@@ -1684,9 +1717,12 @@ export class LocalFileChangeRuntime {
 											throw new LocalFileValidationError(
 												"Installation identity changed during admission",
 											);
-										const repeated = this.existingOperation(namespace.sourceInstanceId, request);
+										const repeated = await this.existingOperation(
+											namespace.sourceInstanceId,
+											request,
+										);
 										if (repeated) throw alreadyAttempted(repeated);
-										const scopeRevision = this.evidence.getScope(scope.id)?.revision;
+										const scopeRevision = (await this.evidence.getScope(scope.id))?.revision;
 										if (scopeRevision === undefined) throw new Error("Granted scope disappeared");
 										const operationInput: BeginFileChangeOperation = {
 											sourceInstanceId: namespace.sourceInstanceId,
@@ -2125,7 +2161,7 @@ export class LocalFileChangeRuntime {
 			signal,
 		});
 		if (
-			namespace.catalog.getMetadata({ expectedGeneration: namespace.generation, ref: blob })
+			(await namespace.catalog.getMetadata({ expectedGeneration: namespace.generation, ref: blob }))
 				?.status !== "ready"
 		)
 			throw new Error("Published raw evidence did not become ready");

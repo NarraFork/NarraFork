@@ -63,6 +63,7 @@ import {
 	installResourceProtectionTriggers,
 } from "./resource-protection-index";
 import * as schema from "./schema";
+import { installSqliteExecutionDiagnostics } from "./sqlite-execution-diagnostics";
 
 /**
  * Which database this process runs on. Resolved once, here, from the explicit configuration
@@ -72,7 +73,8 @@ import * as schema from "./schema";
 const databaseConfig = resolveDatabaseBackendConfig(process.env, settings.database);
 export const activeDatabaseBackend = databaseConfig.backend;
 
-const createMainDb = (client: Database) => drizzle({ client, schema: { ...schema, ...relations } });
+const createMainDb = (client: Database) =>
+	installSqliteExecutionDiagnostics(drizzle({ client, schema: { ...schema, ...relations } }));
 type MainDb = ReturnType<typeof createMainDb>;
 
 /**

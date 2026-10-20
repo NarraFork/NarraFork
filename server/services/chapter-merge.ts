@@ -1,5 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { resolve } from "node:path";
+import { readQuery } from "@server/db/worker-read";
 import { and, desc, eq } from "drizzle-orm";
 import { db } from "../db";
 import { chapters, narrators, projects, reviewConclusions } from "../db/schema";
@@ -225,7 +226,9 @@ async function withSourceMerge<T>(
 	body: (source: ChapterRow) => Promise<T>,
 ): Promise<T> {
 	return chapterLock.acquire(sourceId, async () => {
-		const source = await db.query.chapters.findFirst({ where: eq(chapters.id, sourceId) });
+		const source = await readQuery(
+			db.query.chapters.findFirst({ where: eq(chapters.id, sourceId) }),
+		);
 		if (!source) throw new NotFoundError("Chapter", sourceId);
 		const held = { sourceId, active: true };
 		try {
@@ -242,7 +245,7 @@ async function withSourceMerge<T>(
 }
 
 async function assertSourceStillMergeable(sourceId: string, target: ChapterRow): Promise<void> {
-	const source = await db.query.chapters.findFirst({ where: eq(chapters.id, sourceId) });
+	const source = await readQuery(db.query.chapters.findFirst({ where: eq(chapters.id, sourceId) }));
 	if (!source) throw new NotFoundError("Chapter", sourceId);
 	assertMergeableChapters(source, target);
 }
@@ -257,9 +260,11 @@ export interface RulerAiResolveResult {
 }
 
 async function getProjectGitPath(projectId: string): Promise<string> {
-	const project = await db.query.projects.findFirst({
-		where: eq(projects.id, projectId),
-	});
+	const project = await readQuery(
+		db.query.projects.findFirst({
+			where: eq(projects.id, projectId),
+		}),
+	);
 	if (!project?.gitPath) throw new ValidationError("Project has no git repository configured");
 	return project.gitPath;
 }
@@ -343,10 +348,12 @@ async function ensureSourceReadyForRequiredReview(
 		}
 	}
 
-	const latestConclusion = await db.query.reviewConclusions.findFirst({
-		where: eq(reviewConclusions.sourceChapterId, source.id),
-		orderBy: [desc(reviewConclusions.createdAt)],
-	});
+	const latestConclusion = await readQuery(
+		db.query.reviewConclusions.findFirst({
+			where: eq(reviewConclusions.sourceChapterId, source.id),
+			orderBy: [desc(reviewConclusions.createdAt)],
+		}),
+	);
 	if (!latestConclusion || latestConclusion.verdict !== "approve") {
 		throw new ValidationError(
 			"Review approval required before merge. " +
@@ -356,10 +363,12 @@ async function ensureSourceReadyForRequiredReview(
 		);
 	}
 
-	const reviewChapter = await db.query.chapters.findFirst({
-		where: eq(chapters.id, latestConclusion.reviewChapterId),
-		columns: { forkPoint: true, startCommitSha: true, headCommitSha: true },
-	});
+	const reviewChapter = await readQuery(
+		db.query.chapters.findFirst({
+			where: eq(chapters.id, latestConclusion.reviewChapterId),
+			columns: { forkPoint: true, startCommitSha: true, headCommitSha: true },
+		}),
+	);
 	const reviewedSha = reviewChapter ? reviewCommitSha(reviewChapter) : null;
 	const sourceHeadSha = (
 		source.worktreePath
@@ -819,7 +828,9 @@ async function markMergedSnapshot(
 	// Capture old chapter-owned narrator bindings before metadata clears worktreePath.
 	// No deletion target is reserved until the optional source cleanup below.
 	return withMergeMetadataScope(sourceChapterId, async (scopeWarning) => {
-		const source = await db.query.chapters.findFirst({ where: eq(chapters.id, sourceChapterId) });
+		const source = await readQuery(
+			db.query.chapters.findFirst({ where: eq(chapters.id, sourceChapterId) }),
+		);
 		const now = new Date().toISOString();
 		let warning = scopeWarning;
 
@@ -919,13 +930,17 @@ export const chapterMerge = {
 		sourceChapterId: string,
 		targetChapterId: string,
 	): Promise<MergeCheckResult> {
-		const source = await db.query.chapters.findFirst({
-			where: eq(chapters.id, sourceChapterId),
-		});
+		const source = await readQuery(
+			db.query.chapters.findFirst({
+				where: eq(chapters.id, sourceChapterId),
+			}),
+		);
 		if (!source) throw new NotFoundError("Chapter", sourceChapterId);
-		const target = await db.query.chapters.findFirst({
-			where: eq(chapters.id, targetChapterId),
-		});
+		const target = await readQuery(
+			db.query.chapters.findFirst({
+				where: eq(chapters.id, targetChapterId),
+			}),
+		);
 		if (!target) throw new NotFoundError("Chapter", targetChapterId);
 		if (sourceChapterId === targetChapterId)
 			throw new ValidationError("Cannot merge a chapter into itself");
@@ -942,9 +957,11 @@ export const chapterMerge = {
 		// check compares branch tips, while the merge auto-commits first — which is how
 		// it could promise a clean merge and then conflict on uncommitted changes it
 		// never looked at.
-		const project = await db.query.projects.findFirst({
-			where: eq(projects.id, source.projectId),
-		});
+		const project = await readQuery(
+			db.query.projects.findFirst({
+				where: eq(projects.id, source.projectId),
+			}),
+		);
 		const chapterSettings = project?.chapterSettings as Record<string, unknown> | null;
 		const mode = await resolveMergeMode(
 			source,
@@ -1090,13 +1107,17 @@ export const chapterMerge = {
 		if (!holdsSourceMergeLock(sourceChapterId)) {
 			return withSourceMerge(sourceChapterId, () => this.merge(sourceChapterId, input, userId));
 		}
-		const source = await db.query.chapters.findFirst({
-			where: eq(chapters.id, sourceChapterId),
-		});
+		const source = await readQuery(
+			db.query.chapters.findFirst({
+				where: eq(chapters.id, sourceChapterId),
+			}),
+		);
 		if (!source) throw new NotFoundError("Chapter", sourceChapterId);
-		const target = await db.query.chapters.findFirst({
-			where: eq(chapters.id, input.targetChapterId),
-		});
+		const target = await readQuery(
+			db.query.chapters.findFirst({
+				where: eq(chapters.id, input.targetChapterId),
+			}),
+		);
 		if (!target) throw new NotFoundError("Chapter", input.targetChapterId);
 		if (sourceChapterId === input.targetChapterId) {
 			throw new ValidationError("Cannot merge a chapter into itself");
@@ -1109,9 +1130,11 @@ export const chapterMerge = {
 		const message = input.message ?? `Merge ${source.branch} into ${target.branch}`;
 		const targetWorktree = target.worktreePath;
 
-		const project = await db.query.projects.findFirst({
-			where: eq(projects.id, source.projectId),
-		});
+		const project = await readQuery(
+			db.query.projects.findFirst({
+				where: eq(projects.id, source.projectId),
+			}),
+		);
 		const chapterSettings = project?.chapterSettings as Record<string, unknown> | null;
 		const requireReview = chapterSettings?.requireReviewBeforeMerge === true;
 
@@ -1559,13 +1582,17 @@ export const chapterMerge = {
 		userId?: string,
 		message?: string,
 	): Promise<AiResolveResult> {
-		const source = await db.query.chapters.findFirst({
-			where: eq(chapters.id, sourceChapterId),
-		});
+		const source = await readQuery(
+			db.query.chapters.findFirst({
+				where: eq(chapters.id, sourceChapterId),
+			}),
+		);
 		if (!source) throw new NotFoundError("Chapter", sourceChapterId);
-		const target = await db.query.chapters.findFirst({
-			where: eq(chapters.id, targetChapterId),
-		});
+		const target = await readQuery(
+			db.query.chapters.findFirst({
+				where: eq(chapters.id, targetChapterId),
+			}),
+		);
 		if (!target) throw new NotFoundError("Chapter", targetChapterId);
 		if (!state.targetSnapshot || !state.sourceSnapshot) {
 			// Both parents are required. Recording one would let the next merge recompute
@@ -1639,13 +1666,17 @@ export const chapterMerge = {
 				this.startInteractiveConflictMerge(sourceChapterId, input, locale, userId),
 			);
 		}
-		const source = await db.query.chapters.findFirst({
-			where: eq(chapters.id, sourceChapterId),
-		});
+		const source = await readQuery(
+			db.query.chapters.findFirst({
+				where: eq(chapters.id, sourceChapterId),
+			}),
+		);
 		if (!source) throw new NotFoundError("Chapter", sourceChapterId);
-		const target = await db.query.chapters.findFirst({
-			where: eq(chapters.id, input.targetChapterId),
-		});
+		const target = await readQuery(
+			db.query.chapters.findFirst({
+				where: eq(chapters.id, input.targetChapterId),
+			}),
+		);
 		if (!target) throw new NotFoundError("Chapter", input.targetChapterId);
 		if (sourceChapterId === input.targetChapterId) {
 			throw new ValidationError("Cannot merge a chapter into itself");
@@ -1662,9 +1693,11 @@ export const chapterMerge = {
 		}
 		const message = input.message ?? `Merge ${source.branch} into ${target.branch}`;
 		const targetWorktree = target.worktreePath;
-		const project = await db.query.projects.findFirst({
-			where: eq(projects.id, source.projectId),
-		});
+		const project = await readQuery(
+			db.query.projects.findFirst({
+				where: eq(projects.id, source.projectId),
+			}),
+		);
 		const chapterSettings = project?.chapterSettings as Record<string, unknown> | null;
 		const requireReview = chapterSettings?.requireReviewBeforeMerge === true;
 
@@ -1749,9 +1782,11 @@ export const chapterMerge = {
 		targetChapterId: string,
 		strategy: "merge" | "squash" | "cherry-pick" = "merge",
 	): Promise<void> {
-		const source = await db.query.chapters.findFirst({
-			where: eq(chapters.id, sourceChapterId),
-		});
+		const source = await readQuery(
+			db.query.chapters.findFirst({
+				where: eq(chapters.id, sourceChapterId),
+			}),
+		);
 		if (!source) throw new NotFoundError("Chapter", sourceChapterId);
 		await chapterEdgeService.createMergeEdge(source.projectId, sourceChapterId, targetChapterId, {
 			strategy,
@@ -1769,13 +1804,17 @@ export const chapterMerge = {
 				this.completeInteractiveConflictMerge(sourceChapterId, input, userId),
 			);
 		}
-		const source = await db.query.chapters.findFirst({
-			where: eq(chapters.id, sourceChapterId),
-		});
+		const source = await readQuery(
+			db.query.chapters.findFirst({
+				where: eq(chapters.id, sourceChapterId),
+			}),
+		);
 		if (!source) throw new NotFoundError("Chapter", sourceChapterId);
-		const target = await db.query.chapters.findFirst({
-			where: eq(chapters.id, input.targetChapterId),
-		});
+		const target = await readQuery(
+			db.query.chapters.findFirst({
+				where: eq(chapters.id, input.targetChapterId),
+			}),
+		);
 		if (!target) throw new NotFoundError("Chapter", input.targetChapterId);
 		if (target.status !== "active") throw new ValidationError("Target chapter must be active");
 		if (!target.worktreePath) throw new ValidationError("Target chapter has no worktree");
@@ -1877,9 +1916,11 @@ export const chapterMerge = {
 		assertMergeableChapters(source, target);
 		const targetWorktree = target.worktreePath;
 		if (!targetWorktree) throw new ValidationError("Target chapter has no worktree");
-		const primaryNarrator = await db.query.narrators.findFirst({
-			where: and(eq(narrators.chapterId, target.id), eq(narrators.variant, "primary")),
-		});
+		const primaryNarrator = await readQuery(
+			db.query.narrators.findFirst({
+				where: and(eq(narrators.chapterId, target.id), eq(narrators.variant, "primary")),
+			}),
+		);
 		if (!primaryNarrator) {
 			return { resolved: false, error: "Target chapter has no primary narrator" };
 		}
@@ -1995,13 +2036,17 @@ export const chapterMerge = {
 				this.aiResolveConflicts(sourceChapterId, input, locale, userId),
 			);
 		}
-		const source = await db.query.chapters.findFirst({
-			where: eq(chapters.id, sourceChapterId),
-		});
+		const source = await readQuery(
+			db.query.chapters.findFirst({
+				where: eq(chapters.id, sourceChapterId),
+			}),
+		);
 		if (!source) throw new NotFoundError("Chapter", sourceChapterId);
-		const target = await db.query.chapters.findFirst({
-			where: eq(chapters.id, input.targetChapterId),
-		});
+		const target = await readQuery(
+			db.query.chapters.findFirst({
+				where: eq(chapters.id, input.targetChapterId),
+			}),
+		);
 		if (!target) throw new NotFoundError("Chapter", input.targetChapterId);
 		if (sourceChapterId === input.targetChapterId) {
 			throw new ValidationError("Cannot merge a chapter into itself");
@@ -2014,9 +2059,14 @@ export const chapterMerge = {
 		// describe only one completed target, even through a different entry point.
 		assertMergeableChapters(source, target);
 
-		const primaryNarrator = await db.query.narrators.findFirst({
-			where: and(eq(narrators.chapterId, input.targetChapterId), eq(narrators.variant, "primary")),
-		});
+		const primaryNarrator = await readQuery(
+			db.query.narrators.findFirst({
+				where: and(
+					eq(narrators.chapterId, input.targetChapterId),
+					eq(narrators.variant, "primary"),
+				),
+			}),
+		);
 		if (!primaryNarrator) {
 			return { resolved: false, error: "Target chapter has no primary narrator" };
 		}
@@ -2026,9 +2076,11 @@ export const chapterMerge = {
 		const strategy = input.strategy ?? "merge";
 		const message = input.message ?? `Merge ${source.branch} into ${target.branch}`;
 		const targetWorktree = target.worktreePath;
-		const project = await db.query.projects.findFirst({
-			where: eq(projects.id, source.projectId),
-		});
+		const project = await readQuery(
+			db.query.projects.findFirst({
+				where: eq(projects.id, source.projectId),
+			}),
+		);
 		const chapterSettings = project?.chapterSettings as Record<string, unknown> | null;
 		const requireReview = chapterSettings?.requireReviewBeforeMerge === true;
 
@@ -2209,9 +2261,11 @@ export const chapterMerge = {
 		}
 		// Identity-only metadata scope remembers legacy bindings without reserving deletion.
 		return withMergeMetadataScope(sourceChapterId, async (scopeWarning) => {
-			const source = await db.query.chapters.findFirst({
-				where: eq(chapters.id, sourceChapterId),
-			});
+			const source = await readQuery(
+				db.query.chapters.findFirst({
+					where: eq(chapters.id, sourceChapterId),
+				}),
+			);
 			if (
 				source?.status === "merged" &&
 				(source.mergedIntoChapterId !== targetChapterId ||
@@ -2368,9 +2422,11 @@ export const chapterMerge = {
 	 * pointing at it. See {@link isMultiCommitMerge} for how that shape is recognised.
 	 */
 	async unmerge(sourceChapterId: string, userId?: string): Promise<{ ok: true; warning?: string }> {
-		const source = await db.query.chapters.findFirst({
-			where: eq(chapters.id, sourceChapterId),
-		});
+		const source = await readQuery(
+			db.query.chapters.findFirst({
+				where: eq(chapters.id, sourceChapterId),
+			}),
+		);
 		if (!source) throw new NotFoundError("Chapter", sourceChapterId);
 		if (source.status !== "merged") {
 			throw new ValidationError("Can only unmerge chapters with merged status");
@@ -2387,9 +2443,11 @@ export const chapterMerge = {
 			throw new ValidationError("Chapter has no merge commit SHA recorded — cannot unmerge");
 		}
 
-		const target = await db.query.chapters.findFirst({
-			where: eq(chapters.id, source.mergedIntoChapterId),
-		});
+		const target = await readQuery(
+			db.query.chapters.findFirst({
+				where: eq(chapters.id, source.mergedIntoChapterId),
+			}),
+		);
 		if (!target) throw new NotFoundError("Chapter", source.mergedIntoChapterId);
 		if (!target.worktreePath) {
 			throw new ValidationError("Target chapter has no active worktree — cannot unmerge");
@@ -2584,9 +2642,11 @@ export const chapterMerge = {
 		if (!source.mergeSnapshotCommitSha || !source.mergedSourceSnapshotSha) {
 			throw new ValidationError("Chapter has no snapshot merge coordinates — cannot unmerge");
 		}
-		const target = await db.query.chapters.findFirst({
-			where: eq(chapters.id, source.mergedIntoChapterId),
-		});
+		const target = await readQuery(
+			db.query.chapters.findFirst({
+				where: eq(chapters.id, source.mergedIntoChapterId),
+			}),
+		);
 		if (!target) throw new NotFoundError("Chapter", source.mergedIntoChapterId);
 		if (!target.worktreePath) {
 			throw new ValidationError("Target chapter has no active worktree — cannot unmerge");
@@ -2739,13 +2799,17 @@ export const chapterMerge = {
 		const { chapterService } = await import("./chapter-service");
 		const { narratorService } = await import("./narrator-service");
 
-		const source = await db.query.chapters.findFirst({
-			where: eq(chapters.id, sourceChapterId),
-		});
+		const source = await readQuery(
+			db.query.chapters.findFirst({
+				where: eq(chapters.id, sourceChapterId),
+			}),
+		);
 		if (!source) throw new NotFoundError("Chapter", sourceChapterId);
-		const target = await db.query.chapters.findFirst({
-			where: eq(chapters.id, targetChapterId),
-		});
+		const target = await readQuery(
+			db.query.chapters.findFirst({
+				where: eq(chapters.id, targetChapterId),
+			}),
+		);
 		if (!target) throw new NotFoundError("Chapter", targetChapterId);
 		if (!target.worktreePath) throw new ValidationError("Target chapter has no worktree");
 
@@ -2934,9 +2998,11 @@ export const chapterMerge = {
 				),
 			);
 		}
-		const target = await db.query.chapters.findFirst({
-			where: eq(chapters.id, targetChapterId),
-		});
+		const target = await readQuery(
+			db.query.chapters.findFirst({
+				where: eq(chapters.id, targetChapterId),
+			}),
+		);
 		if (!target?.worktreePath) {
 			return { resolved: false, error: "Target chapter lost worktree during resolve" };
 		}

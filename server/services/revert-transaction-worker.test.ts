@@ -4,7 +4,7 @@ import { watch } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { logger } from "../lib/logger";
 import type { RevertJournalOperation } from "./revert-mutation-journal";
 import type { RevertSelectionResult } from "./revert-selection-service";
@@ -44,6 +44,24 @@ async function fixture(name: string, source: string): Promise<string> {
 const signal = () => AbortSignal.timeout(10_000);
 
 describe("revert manifest worker resolution", () => {
+	test("manifest helper imports keep the worker graph scoped to pure validation", async () => {
+		const source = await readFile(new URL(realWorker), "utf8");
+		expect(source).not.toMatch(/import\s*\{[^}]*\}\s*from\s*["']\.\/revert-plan-service["']/);
+		const build = await Bun.build({
+			entrypoints: [fileURLToPath(realWorker)],
+			target: "bun",
+		});
+		expect(build.success).toBe(true);
+		const bundled = await build.outputs[0].text();
+		for (const symbol of [
+			"runReadTask",
+			"beginReadWorkerDiagnostic",
+			"loadSettingsFromDisk",
+			"consumeCleanShutdownState",
+			"runMigrations",
+		])
+			expect(bundled).not.toContain(symbol);
+	}, 60_000);
 	test("source uses TypeScript; compiled builds probe bounded JavaScript entries", () => {
 		expect(
 			revertManifestWorkerSpecifiers(false, "file:///workspace/server/services/jobs.ts"),
@@ -101,6 +119,45 @@ describe("snapshot consent bound to original selector", () => {
 			expectedAction: "revert_files" as const,
 		};
 	}
+
+	test("only full validation initializes schema dependencies in a bundled worker", async () => {
+		const marker = "VALIDATION_SCHEMA_INITIALIZED";
+		const build = await Bun.build({
+			entrypoints: [fileURLToPath(realWorker)],
+			target: "bun",
+			plugins: [
+				{
+					name: "observe-schema-initialization",
+					setup(builder) {
+						builder.onLoad(
+							{ filter: /(?:\/drizzle-orm\/|\/server\/db\/schema\.ts$)/ },
+							async ({ path }) => ({
+								contents: `throw new Error(${JSON.stringify(marker)});\n${await readFile(path, "utf8")}`,
+								loader: path.endsWith(".ts") ? "ts" : "js",
+							}),
+						);
+					},
+				},
+			],
+		});
+		if (!build.success) throw new AggregateError(build.logs, "Worker fixture build failed");
+		const bundled = await build.outputs[0].text();
+		expect(bundled).toContain(marker);
+		const path = join(root, "schema-observed-worker.js");
+		await writeFile(path, bundled);
+		const options = { specifiers: [pathToFileURL(path).href] };
+		await expect(runRevertManifestWorker(request, signal(), options)).resolves.toBe(true);
+		await expect(
+			runRevertManifestWorker({ ...entrypoint(), acceptSnapshotRestore: true }, signal(), options),
+		).resolves.toBe(true);
+		await expect(
+			runRevertManifestWorker(
+				{ action: "validate", raw: [] } as unknown as TransactionManifestRequest,
+				signal(),
+				options,
+			),
+		).rejects.toMatchObject({ code: `REVERT_TRANSACTION_${marker}` });
+	}, 60_000);
 
 	test("snapshot entrypoint refuses absent/false confirmation, accepts literal true", async () => {
 		const input = entrypoint();

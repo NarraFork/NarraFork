@@ -1,5 +1,6 @@
 import { lstat, realpath } from "node:fs/promises";
 import { resolve } from "node:path";
+import { readQuery } from "@server/db/worker-read";
 import { eq } from "drizzle-orm";
 import { type Context, Hono } from "hono";
 import type { z } from "zod";
@@ -241,18 +242,22 @@ export function editorActorForSubject(
 			// cwd is an optional override: chapter narrators normally inherit their worktree.
 			// Resolve it on every request so moving/dormant worktrees invalidate old bindings.
 			const chapter = narrator.chapterId
-				? await db.query.chapters.findFirst({
-						where: eq(chapters.id, narrator.chapterId),
-						columns: { projectId: true, worktreePath: true },
-					})
+				? await readQuery(
+						db.query.chapters.findFirst({
+							where: eq(chapters.id, narrator.chapterId),
+							columns: { projectId: true, worktreePath: true },
+						}),
+					)
 				: undefined;
 			if (narrator.chapterId && !chapter) throw new NotFoundError("Chapter", narrator.chapterId);
 			const projectId = chapter?.projectId ?? narrator.contextProjectId ?? null;
 			const project = projectId
-				? await db.query.projects.findFirst({
-						where: eq(projects.id, projectId),
-						columns: { gitPath: true },
-					})
+				? await readQuery(
+						db.query.projects.findFirst({
+							where: eq(projects.id, projectId),
+							columns: { gitPath: true },
+						}),
+					)
 				: undefined;
 			if (projectId && !project) throw new NotFoundError("Project", projectId);
 			const cwd = resolveNarratorSessionCwd(
