@@ -43,7 +43,7 @@ const realDb = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDb, db, sqlite }));
 const { narratorService } = await import("../narrator-service");
 const { narratorPersistence } = await import("../narrator-persistence");
-const { handlePermission } = await import("../narrator-permission");
+const { handlePermission, resolvePermission } = await import("../narrator-permission");
 const { buildFinalToolStartAuthorization } = await import("../tool-final-start-authorization");
 const { resolveNarratorCapabilities, resetTraitLayerCaches } = await import(
 	"../trait-layer-service"
@@ -185,20 +185,6 @@ async function fixture(id: string, name: string, input: Record<string, unknown>)
 
 // Real permission receipts, final authorization, backend dispatch and file absence, not a mock policy.
 describe("S4 read-only capability is stronger than bypassPermissions", () => {
-	for (const command of ["touch effect.txt", "printf changed > effect.txt"]) {
-		test(`blocks Bash ${command} before process dispatch`, async () => {
-			await db
-				.update(narrators)
-				.set({ traits: withRuntimePolicyTrait([], { version: 1, readOnly: true }) })
-				.where(eq(narrators.id, root));
-			const f = await fixture(root, "Bash", { command, timeout: 2000 });
-			const result = await f.execute();
-			expect(result.isError).toBe(true);
-			expect(result.output).toContain("read-only capability ceiling");
-			expect(execSpy).not.toHaveBeenCalled();
-			expect(await missing(join(cwd, "effect.txt"))).toBe(true);
-		});
-	}
 	test("blocks GenUI create before its body or backend writes", async () => {
 		await db
 			.update(narrators)
@@ -230,6 +216,52 @@ describe("S4 read-only capability is stronger than bypassPermissions", () => {
 		expect(result.isError).not.toBe(true);
 		expect(result.output).toContain(cwd);
 		expect(execSpy).toHaveBeenCalled();
+	});
+});
+
+// Explore/plan delegates keep Bash on the inherited permission mode; their prompt is
+// the read-only guard, not the capability ceiling.
+describe("explore delegate Bash follows the permission mode", () => {
+	async function exploreChild(permissionMode: "default" | "acceptEdits") {
+		await db.update(narrators).set({ permissionMode }).where(eq(narrators.id, root));
+		const child = await narratorService.createSubagent({
+			parentNarratorId: root,
+			subagentType: "explore",
+			cwd,
+		});
+		return child.id;
+	}
+	async function waitForPending(toolCallId: string) {
+		for (let i = 0; i < 100; i++) {
+			const call = await db.query.narratorToolCalls.findFirst({
+				where: eq(narratorToolCalls.id, toolCallId),
+			});
+			if (call?.status === "pending") return;
+			await new Promise((r) => setTimeout(r, 20));
+		}
+		throw new Error("tool call never reached a pending approval");
+	}
+
+	for (const command of ["du -sh .", "touch effect.txt"]) {
+		test(`runs ${command} after the user approves it`, async () => {
+			const f = await fixture(await exploreChild("default"), "Bash", { command, timeout: 2000 });
+			const running = f.execute();
+			await waitForPending(f.toolCallId);
+			expect(await resolvePermission(f.toolCallId, "allow", { userId: owner })).toBe(true);
+			const result = await running;
+			expect(result.isError).not.toBe(true);
+			expect(execSpy).toHaveBeenCalled();
+		});
+	}
+
+	test("auto-allows a worktree write under acceptEdits", async () => {
+		const f = await fixture(await exploreChild("acceptEdits"), "Bash", {
+			command: "touch effect.txt",
+			timeout: 2000,
+		});
+		const result = await f.execute();
+		expect(result.isError).not.toBe(true);
+		expect(await missing(join(cwd, "effect.txt"))).toBe(false);
 	});
 });
 

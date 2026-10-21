@@ -4692,12 +4692,16 @@ export async function recheckFinalToolExecutionPermission(
 			: constraint && (check.toolName === "KnowledgeCreate" || check.toolName === "KnowledgeEdit")
 				? "bypassPermissions"
 				: (constraint?.permissionMode ?? before.narrator.permissionMode ?? "default");
+	// Bash under a plain read-only ceiling (explore/plan delegates) is decided by the
+	// permission mode like any session; the delegate prompt is the read-only guard.
+	// Review keeps its strict, synchronous Git-only shell.
 	if (
 		(readOnlyGitShell || runtimePolicy.tools.readOnly) &&
 		!isTaskStateMaintenanceTool(check.toolName, check.input) &&
 		((WRITE_TOOLS.has(decisionTool) && !isReadOnlyCall(decisionTool, decisionInput)) ||
 			check.toolName === "RequestPermissionRule" ||
-			(isBashToolName(check.toolName) &&
+			(readOnlyGitShell &&
+				isBashToolName(check.toolName) &&
 				(!analysis ||
 					analysis.hasWriteOperation ||
 					analysis.nonWhitelisted.length > 0 ||
