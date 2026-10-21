@@ -908,7 +908,7 @@ export const PLAN_MODE_ALLOWED_TOOLS = new Set([
 
 // Single source of truth for the reasoning-effort tier union (shared with the
 // frontend). Re-exported here so existing importers keep their import path.
-import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-effort";
+import type { ReasoningEffort } from "@shared/reasoning-effort";
 
 export type { ReasoningEffort };
 
@@ -1325,15 +1325,21 @@ export function isDeepSeekModel(model: string): boolean {
 }
 
 /**
- * Map reasoning effort to DeepSeek effort value.
- * DeepSeek's reasoning_effort param only accepts "high" and "max". Uses the
- * shared clamp (就近、并列偏高): low/medium → high, xhigh/max → max.
+ * Map reasoning effort to DeepSeek's effort value.
+ *
+ * DeepSeek accepts three effective levels — low / high / max — and folds the finer
+ * request values onto them (minimal→low, medium|xhigh→high, ultra→max). The mapping
+ * is written out explicitly instead of using the shared clamp: the clamp resolves
+ * ties upward, which would send `xhigh` to max, but DeepSeek treats xhigh as high.
  */
-export function mapDeepSeekEffort(reasoningEffort: string | undefined): "high" | "max" | undefined {
+export function mapDeepSeekEffort(
+	reasoningEffort: string | undefined,
+): "low" | "high" | "max" | undefined {
 	if (!reasoningEffort || reasoningEffort === "none") return undefined;
-	return clampReasoningEffort(reasoningEffort as ReasoningEffort, ["high", "max"]) as
-		| "high"
-		| "max";
+	if (reasoningEffort === "low" || reasoningEffort === "minimal") return "low";
+	if (reasoningEffort === "max" || reasoningEffort === "ultra") return "max";
+	// medium / high / xhigh（以及任何未知值）→ high
+	return "high";
 }
 
 // ── Constants ────────────────────────────────────────────────────────────────

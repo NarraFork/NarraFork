@@ -42,11 +42,16 @@ const DEFAULT_CODEX_REASONING_EFFORT_OPTIONS: readonly ReasoningEffortValue[] = 
 	"high",
 ];
 
-/** DeepSeek only supports two effective tiers: high and max (mapped from xhigh). */
+/**
+ * DeepSeek exposes four selectable tiers: off / low / high / max. Upstream folds
+ * the finer values into these three effective levels (minimal→low, medium|xhigh→high,
+ * ultra→max), so中间档不再单独展示。
+ */
 const DEEPSEEK_REASONING_EFFORT_OPTIONS: readonly ReasoningEffortValue[] = [
 	"none",
+	"low",
 	"high",
-	"xhigh",
+	"max",
 ];
 
 /**
