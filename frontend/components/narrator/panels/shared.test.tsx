@@ -277,10 +277,7 @@ describe("usePanelGeometryReady", () => {
 });
 
 describe("usePanelHeaderDrag", () => {
-	it("preserves panel consent through a header tear-out and detached persistence", async () => {
-		const { makePanelEntry, parseDetachedNodes, serializeDetachedNodes } = await import(
-			"../../graph/dock/detached-panels"
-		);
+	it("preserves panel consent through a header drag", async () => {
 		for (const largeFileConfirmed of [true, false, undefined]) {
 			const state = await captureDrag({
 				toolKind: "file",
@@ -289,14 +286,8 @@ describe("usePanelHeaderDrag", () => {
 			});
 			if (!state) throw new Error("drag state missing");
 			expect(state.resourceId).toBe("/large.ts");
-			const entry = makePanelEntry("file", state.resourceId, state);
-			const raw = serializeDetachedNodes([
-				{ id: "detached", x: 0, y: 0, w: 480, h: 360, pendingPanels: [entry] },
-			]);
-			const restored = parseDetachedNodes(raw)[0].pendingPanels?.[0];
-			expect(restored?.panelId).toBe("file:/large.ts");
-			if (largeFileConfirmed) expect(restored?.largeFileConfirmed).toBe(true);
-			else expect(restored).not.toHaveProperty("largeFileConfirmed");
+			if (largeFileConfirmed) expect(state.largeFileConfirmed).toBe(true);
+			else expect(state.largeFileConfirmed).toBeFalsy();
 		}
 	});
 
@@ -308,8 +299,6 @@ describe("usePanelHeaderDrag", () => {
 	});
 
 	it("forwards the panel kind, so a consumer can rebuild it elsewhere", async () => {
-		// The canvas uses this to tear the panel out into its own node without parsing
-		// `panelId`'s `ndock-<kind>` shape, which is an implementation detail.
 		const state = await captureDrag({ toolKind: "terminal" });
 		expect(state?.toolKind).toBe("terminal");
 	});

@@ -28,14 +28,12 @@ describe("canonical plugin surface context recovery", () => {
 		expect(
 			resolveCanonicalPluginUiSessionContext(host, panel, {
 				narratorId: "narrator-1",
-				chapterId: "chapter-1",
 				projectId: "project-1",
 			}),
 		).toEqual({
 			surface: "workspace",
 			workspaceId: "workspace-1",
 			narratorId: "narrator-1",
-			chapterId: "chapter-1",
 			projectId: "project-1",
 		});
 	});
@@ -56,7 +54,6 @@ describe("canonical plugin surface context recovery", () => {
 				panel,
 				{
 					narratorId: "narrator-1",
-					chapterId: "chapter-1",
 					projectId: "project-1",
 				},
 			),
@@ -65,7 +62,6 @@ describe("canonical plugin surface context recovery", () => {
 			workspaceId: "workspace-1",
 			presentation: "director",
 			narratorId: "narrator-1",
-			chapterId: "chapter-1",
 			projectId: "project-1",
 		});
 	});
@@ -82,7 +78,6 @@ describe("canonical plugin surface context recovery", () => {
 				panel,
 				{
 					narratorId: "narrator-1",
-					chapterId: "chapter-1",
 					projectId: "project-1",
 				},
 			),
@@ -97,14 +92,12 @@ describe("canonical plugin surface context recovery", () => {
 				panel,
 				{
 					narratorId: "narrator-1",
-					chapterId: "chapter-1",
 					projectId: "project-1",
 				},
 			),
 		).toMatchObject({
 			surface: "focus",
 			narratorId: "narrator-1",
-			chapterId: "chapter-1",
 			projectId: "project-1",
 		});
 	});

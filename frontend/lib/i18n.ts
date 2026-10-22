@@ -18,12 +18,9 @@ export type SupportedLanguage = Locale;
 export const namespaces = [
 	"common",
 	"errors",
-	"chapters",
 	"containers",
 	"dashboard",
-	"explorations",
 	"git",
-	"graph",
 	"narrator",
 	"nav",
 	"learning",
@@ -103,7 +100,7 @@ export function getNamespacesForPath(pathname: string): Namespace[] {
 	// Private windows share auth/theme, not the navigation's translation bundles.
 	if (path === "/windows" || path.startsWith("/windows/")) {
 		const gitWindow =
-			path.startsWith("/windows/git/narrators/") || path.startsWith("/windows/git/chapters/");
+			path.startsWith("/windows/git/narrators/");
 		if (gitWindow) return ["common", "errors", "git"];
 		// Panel/workspace windows render panels whose components each carry their own
 		// namespace (terminal, git, knowledge, …) — preload the full panel set.
@@ -141,8 +138,6 @@ function getRouteNamespaces(path: string): Namespace[] {
 			"common",
 			"nav",
 			"projects",
-			"chapters",
-			"graph",
 			"narrator",
 			"settings",
 			"terminal",
@@ -150,7 +145,7 @@ function getRouteNamespaces(path: string): Namespace[] {
 			"chat",
 		];
 	}
-	if (path.startsWith("/git/narrators/") || path.startsWith("/git/chapters/")) {
+	if (path.startsWith("/git/narrators/")) {
 		return ["git"];
 	}
 	if (path === "/messages") return ["common", "nav", "chat"];
@@ -165,7 +160,6 @@ function getRouteNamespaces(path: string): Namespace[] {
 			"nav",
 			"narrators",
 			"narrator",
-			"chapters",
 			"settings",
 			"terminal",
 			"git",

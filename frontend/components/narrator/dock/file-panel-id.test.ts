@@ -4,7 +4,6 @@ import type { DockviewApi, SerializedDockview } from "dockview-react";
 import { parseHTML } from "linkedom";
 import { createElement } from "react";
 import { renderToString } from "react-dom/server";
-import { createDetachedPanelDockValue } from "../../graph/dock/detached-panel-context";
 import { stripIdentityFromLayout, stripNavigationFromLayout } from "../panels/layout-envelope";
 import {
 	type FilePanelParams,
@@ -380,19 +379,6 @@ describe("device-scoped navigation", () => {
 			deviceId: "Remote",
 			filePath: "/a",
 		});
-	});
-
-	it("detached panels do not pretend to have a file opener without a source dock", () => {
-		const input = { narratorId: "n", chapterId: "c", apiRef: { current: null } };
-		expect(
-			createDetachedPanelDockValue({ ...input, sourceDock: undefined }).openFilePanel,
-		).toBeUndefined();
-		const openFilePanel = () => {};
-		const addFileReference = () => {};
-		const sourceDock = { openFilePanel, addFileReference } as unknown as NarratorDockContextValue;
-		const detached = createDetachedPanelDockValue({ ...input, sourceDock });
-		expect(detached.openFilePanel).toBe(openFilePanel);
-		expect(detached.addFileReference).toBe(addFileReference);
 	});
 
 	it("file bridges are scoped per narrator and stale unregister cannot remove the replacement", () => {

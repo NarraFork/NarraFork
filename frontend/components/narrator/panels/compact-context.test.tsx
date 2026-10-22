@@ -158,7 +158,6 @@ describe("responsive narrator compact boundary", () => {
 			{ highlightRequestId: "next-highlight" },
 			{ terminalOpen: true },
 			{ onBack: () => {} },
-			{ onForkFromMessage: () => {} },
 			{ onToggleDetailsPanel: () => {} },
 			{ onDetailsPropsChange: () => {} },
 		];

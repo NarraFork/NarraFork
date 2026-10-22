@@ -228,7 +228,6 @@ describe("plugin tab window context", () => {
 		const sessionContext: PluginUiSessionContext = {
 			surface: "focus",
 			narratorId: "actual",
-			chapterId: "chapter1",
 			projectId: "project1",
 		};
 		await mountTab({

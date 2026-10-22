@@ -138,14 +138,12 @@ beforeEach(() => {
 	client.setQueryData(["narrators", "n1"], {
 		id: "n1",
 		title: "Narrator",
-		chapterId: null,
 		traits: [],
 	});
 	client.setQueryData(["narrators", "child"], {
 		id: "child",
 		title: "Child",
 		parentNarratorId: "n1",
-		chapterId: null,
 		traits: [],
 	});
 	client.setQueryData(["user-preferences"], { addSubagentToRecentTabs: true });
@@ -275,7 +273,6 @@ describe("real plugin view inside standalone host", () => {
 		const context: PluginUiSessionContext = {
 			surface: "focus",
 			narratorId: "n1",
-			chapterId: null,
 			projectId: "project1",
 		};
 		await render(

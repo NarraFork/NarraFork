@@ -153,7 +153,7 @@ export function resourceId(kind: ResourceKind) {
 
 function openResource(kind: ResourceKind) {
 	if (kind === "subagent") store.openSubagentPanel("narrator-a", "child-one");
-	else store.openToolPanel("narrator-a", kind, null);
+	else store.openToolPanel("narrator-a", kind);
 }
 
 function ResourceButtons({ director = false }: { director?: boolean }) {
@@ -172,7 +172,7 @@ function ResourceButtons({ director = false }: { director?: boolean }) {
 			<button
 				type="button"
 				data-toggle={`${director ? "director" : "grid"}-terminal`}
-				onClick={() => store.toggleToolPanel("narrator-a", "terminal", null)}
+				onClick={() => store.toggleToolPanel("narrator-a", "terminal")}
 			>
 				Toggle terminal
 			</button>

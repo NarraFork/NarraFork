@@ -436,13 +436,9 @@ describe("injectInjectionBubbleChrome", () => {
 			expect(seen).toEqual(["spec://index.md"]);
 		});
 
-		test("a chapter target passes the chapter id", () => {
-			const seen: string[] = [];
-			bindAndClick(
-				{ target: { kind: "chapter", chapterId: "chap-7" } },
-				{ onOpenChapter: (id) => seen.push(id) },
-			);
-			expect(seen).toEqual(["chap-7"]);
+		test("a legacy chapter target is inert", () => {
+			const { clickable } = bindAndClick({ target: { kind: "chapter", chapterId: "chap-7" } });
+			expect(clickable).toBe(false);
 		});
 
 		test("each kind uses its OWN opener, never another kind's", () => {
@@ -453,9 +449,6 @@ describe("injectInjectionBubbleChrome", () => {
 				{
 					onOpenNarrator: () => {
 						throw new Error("a spec target must not reach the narrator opener");
-					},
-					onOpenChapter: () => {
-						throw new Error("a spec target must not reach the chapter opener");
 					},
 				},
 			);
@@ -509,9 +502,6 @@ describe("injectInjectionBubbleChrome", () => {
 							throw new Error("a malformed target must not be opened");
 						},
 						onOpenSpec: () => {
-							throw new Error("a malformed target must not be opened");
-						},
-						onOpenChapter: () => {
 							throw new Error("a malformed target must not be opened");
 						},
 					},

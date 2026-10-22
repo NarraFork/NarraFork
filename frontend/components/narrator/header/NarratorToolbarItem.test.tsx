@@ -286,7 +286,6 @@ describe("shared bottom toolbar actions", () => {
 			relaxedPlanForced: false,
 			relaxedPlanMutation: { isPending: false },
 			isAskInPassing: true,
-			chapterId: null,
 			promoteMutation: { isPending: false },
 			handlePromote: () => {},
 			bottomActions,

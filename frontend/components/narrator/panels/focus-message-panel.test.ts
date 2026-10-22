@@ -138,7 +138,7 @@ describe("workspace tool panel toggle", () => {
 		const { api } = fixture();
 		const store = new WorkspaceDockStore({ current: api });
 		const { panel, closed } = bindToolPanel(api, { isActive: false });
-		store.toggleToolPanel("primary", "git", null);
+		store.toggleToolPanel("primary", "git");
 		expect(panel.api.setActive).toHaveBeenCalledTimes(1);
 		expect(closed.value).toBe(false);
 		expect(panel.api.isActive).toBe(true);
@@ -148,7 +148,7 @@ describe("workspace tool panel toggle", () => {
 		const { api } = fixture();
 		const store = new WorkspaceDockStore({ current: api });
 		const { panel, closed } = bindToolPanel(api, { isActive: true });
-		store.toggleToolPanel("primary", "git", null);
+		store.toggleToolPanel("primary", "git");
 		expect(panel.api.setActive).not.toHaveBeenCalled();
 		expect(closed.value).toBe(true);
 	});

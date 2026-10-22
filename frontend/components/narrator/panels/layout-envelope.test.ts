@@ -1,7 +1,5 @@
 import { describe, expect, it } from "bun:test";
 import type { SerializedDockview } from "dockview-react";
-import { parseDetachedNodes } from "../../graph/dock/detached-panels";
-import { parseChapterDockLayout } from "../../graph/dock/graph-node-dock-layout";
 import { isRetiredFilemodPanel, removeRetiredFilemodPanels } from "./layout-envelope";
 
 function group(id: string, views: string[], activeView = views[0]) {
@@ -84,26 +82,4 @@ describe("retired filemod layout compatibility", () => {
 		expect(removeRetiredFilemodPanels(original)).toBeNull();
 	});
 
-	it("chapter parser filters legacy panels while keeping remaining panels", () => {
-		const parsed = parseChapterDockLayout(JSON.stringify({ version: 1, layout: layout() }));
-		if (!parsed) throw new Error("Expected surviving chapter layout");
-		expect(Object.keys(parsed.panels)).toEqual(["chat", "file"]);
-	});
-
-	it("detached v3 nodes keep good tabs and drop retired-only nodes", () => {
-		const retiredOnly = layout();
-		delete retiredOnly.panels.chat;
-		delete retiredOnly.panels.file;
-		const nodes = parseDetachedNodes(
-			JSON.stringify({
-				version: 3,
-				nodes: [
-					{ id: "mixed", x: 1, y: 2, w: 400, h: 300, layout: layout() },
-					{ id: "retired", x: 1, y: 2, w: 400, h: 300, layout: retiredOnly },
-				],
-			}),
-		);
-		expect(nodes).toHaveLength(1);
-		expect(Object.keys(nodes[0].layout?.panels ?? {})).toEqual(["chat", "file"]);
-	});
 });

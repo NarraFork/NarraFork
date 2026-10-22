@@ -373,7 +373,7 @@ describe("real workspace Dockview resource lifecycle", () => {
 		const grid = structuredClone(api.toJSON().grid);
 		const events = layoutEvents;
 		const opens = [
-			() => store.openToolPanel("n0", "terminal", null),
+			() => store.openToolPanel("n0", "terminal"),
 			() => store.openFilePanel("n0", "/repo/a.ts"),
 			() => store.openSubagentPanel("n0", "child"),
 			() => store.openKnowledgePanel("n0", "entry"),
@@ -737,7 +737,7 @@ describe("real workspace Dockview resource lifecycle", () => {
 
 	test("single grid slot pins directly into a right split without replacing the resource", async () => {
 		await mountWorkspace(1);
-		await change(() => store.openToolPanel("n0", "terminal", null));
+		await change(() => store.openToolPanel("n0", "terminal"));
 		const id = workspaceToolPanelId("n0", "terminal");
 		const panel = requiredPanel(id);
 		const node = content(id);
@@ -770,7 +770,7 @@ describe("real workspace Dockview resource lifecycle", () => {
 		"temporary",
 	] as const)("mixed floating group with %s restores native tabs instead of hiding other members", async (kind) => {
 		await mountWorkspace();
-		await change(() => store.openToolPanel("n0", "terminal", null));
+		await change(() => store.openToolPanel("n0", "terminal"));
 		const id = workspaceToolPanelId("n0", "terminal");
 		const resource = requiredPanel(id);
 		const group = resource.group;
@@ -808,8 +808,8 @@ describe("real workspace Dockview resource lifecycle", () => {
 	] as const)("temporary capture/restore retains %s preview state without resurrecting hidden resources", async (action) => {
 		await mountWorkspace();
 		await change(() => {
-			store.openToolPanel("n0", "terminal", null);
-			store.openToolPanel("n0", "browser", null);
+			store.openToolPanel("n0", "terminal");
+			store.openToolPanel("n0", "browser");
 		});
 		const a = workspaceToolPanelId("n0", "terminal");
 		const b = workspaceToolPanelId("n0", "browser");
@@ -834,8 +834,8 @@ describe("real workspace Dockview resource lifecycle", () => {
 		const restored = requiredPanel(a);
 		const restoredNode = content(a);
 		await change(() => {
-			if (action === "close") store.toggleToolPanel("n0", "terminal", null);
-			else store.openToolPanel("n0", "terminal", null);
+			if (action === "close") store.toggleToolPanel("n0", "terminal");
+			else store.openToolPanel("n0", "terminal");
 		});
 		expect(requiredPanel(a)).toBe(restored);
 		expect(content(a)).toBe(restoredNode);
@@ -867,7 +867,7 @@ describe("real workspace Dockview resource lifecycle", () => {
 	test("all resource identities are owner-scoped, including repeated plugin contributions", async () => {
 		await mountWorkspace();
 		const openOwner = (owner: string) => {
-			store.openToolPanel(owner, "terminal", null);
+			store.openToolPanel(owner, "terminal");
 			store.openFilePanel(owner, "/repo/shared.ts");
 			store.openSubagentPanel(owner, "shared-child", "message");
 			store.openKnowledgePanel(owner, "shared-entry");
@@ -1007,7 +1007,7 @@ describe("real workspace Dockview resource lifecycle", () => {
 	test("closing an owner removes floating and pinned orphans, not another owner's resources", async () => {
 		await mountWorkspace();
 		await change(() => {
-			store.openToolPanel("n0", "terminal", null);
+			store.openToolPanel("n0", "terminal");
 			store.openFilePanel("n0", "/repo/shared.ts");
 			store.openSubagentPanel("n0", "child");
 			store.openKnowledgePanel("n0", "entry");
@@ -1048,7 +1048,7 @@ describe("real workspace Dockview resource lifecycle", () => {
 
 	test("closing a temporary resource clears its registration and reopening creates only one new instance", async () => {
 		await mountWorkspace();
-		await change(() => store.openToolPanel("n0", "terminal", null));
+		await change(() => store.openToolPanel("n0", "terminal"));
 		const id = workspaceToolPanelId("n0", "terminal");
 		const original = api.getPanel(id);
 		await change(() => store.closeToolPanel("n0", "terminal"));
@@ -1057,7 +1057,7 @@ describe("real workspace Dockview resource lifecycle", () => {
 		expect(store.captureTemporaryResources()).toEqual([]);
 		expect(store.getSnapshot("n0").openToolTypes.size).toBe(0);
 		expect(cleanups.get(id)).toBe(1);
-		await change(() => store.openToolPanel("n0", "terminal", null));
+		await change(() => store.openToolPanel("n0", "terminal"));
 		expect(api.getPanel(id)).not.toBe(original);
 		expect(store.isTemporary(id)).toBe(true);
 		expect(mounts.get(id)).toBe(2);
@@ -1138,7 +1138,7 @@ describe("real workspace Dockview resource lifecycle", () => {
 		expect(api.activePanel).toBe(pinned);
 		const before = gridSizes();
 		await change(() => {
-			if (kind === "browser") store.openToolPanel("n0", "browser", null);
+			if (kind === "browser") store.openToolPanel("n0", "browser");
 			else store.openSubagentPanel("n0", "child");
 		});
 		const id =
@@ -1164,7 +1164,7 @@ describe("real workspace Dockview resource lifecycle", () => {
 		await change(() => expect(store.pinResource(childId, requiredPanel("n1").group.id)).toBe(true));
 		await change(() => store.setDirectorActive(true));
 		await change(() => {
-			store.openToolPanel("n0", "browser", null, childId);
+			store.openToolPanel("n0", "browser", childId);
 			store.openSubagentPanel("n0", "grandchild", "message", childId);
 			store.openKnowledgePanel("n0", "child-entry", "personal", childId);
 		});
@@ -1192,7 +1192,7 @@ describe("real workspace Dockview resource lifecycle", () => {
 		"missing",
 	] as const)("membership addition with %s position stays in the grid despite floating focus", async (preference) => {
 		await mountWorkspace();
-		await change(() => store.openToolPanel("n0", "browser", null));
+		await change(() => store.openToolPanel("n0", "browser"));
 		const temporaryId = workspaceToolPanelId("n0", "browser");
 		const floating = requiredPanel(temporaryId);
 		expect(api.activePanel).toBe(floating);
@@ -1272,7 +1272,7 @@ describe("real workspace Dockview resource lifecycle", () => {
 		const initial = save();
 		const before = gridSizes();
 		const actions = [
-			() => store.openToolPanel("n0", "browser", null),
+			() => store.openToolPanel("n0", "browser"),
 			() => store.openSubagentPanel("n0", "child", "message"),
 			() => store.openFilePanel("n0", "/repo/a.ts", undefined, { selection: selection(4) }),
 			() => store.openKnowledgePanel("n0", "entry"),
@@ -1329,7 +1329,7 @@ describe("real workspace Dockview resource lifecycle", () => {
 		const { workspacePanelComponents } = await import("./panels");
 		await mountWorkspace(2, { ...workspacePanelComponents, narrator: ResourceWrapper });
 		await change(() => {
-			store.openToolPanel("n0", "terminal", null);
+			store.openToolPanel("n0", "terminal");
 			store.openFilePanel("n0", "/repo/a.ts");
 			store.openSubagentPanel("n0", "child");
 			store.openKnowledgePanel("n0", "entry");

@@ -67,7 +67,6 @@ afterEach(async () => {
 	originals.clear();
 });
 
-const fork = () => {};
 const back = () => {};
 const minimize = () => {};
 async function render(external: boolean, mobile = false) {
@@ -91,7 +90,6 @@ async function render(external: boolean, mobile = false) {
 				<QueryClientProvider client={client}>
 					<NarratorDockProvider
 						narratorId="live"
-						onForkFromMessage={fork}
 						highlightMessageId="deep-link"
 						onBack={back}
 						onMinimize={minimize}
@@ -119,7 +117,6 @@ test("real dock adapter outside focus host retains its lazy Panel and page callb
 	expect(mounts).toBe(1);
 	expect(host.querySelectorAll("[data-panel]").length).toBe(1);
 	expect(props.narratorId).toBe("live");
-	expect(props.onForkFromMessage).toBe(fork);
 	expect(props.highlightMessageId).toBe("deep-link");
 	expect(props.onBack).toBe(back);
 	expect(props.onMinimize).toBe(minimize);

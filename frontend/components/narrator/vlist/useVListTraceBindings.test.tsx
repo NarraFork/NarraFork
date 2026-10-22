@@ -390,7 +390,7 @@ describe("useVListTraceBindings", () => {
 		});
 		const first = render(input);
 		input = freshFrame(input);
-		input.rowHandlers = { ...input.rowHandlers, onOpenChapter: noop };
+		input.rowHandlers = { ...input.rowHandlers, onOpenKnowledgeEntry: noop };
 		expect(render(input).get("file")).toBe(first.get("file"));
 		input = freshFrame(input);
 		input.rowHandlers = { ...input.rowHandlers, onOpenFilePanel: nextOpen };
