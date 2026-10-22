@@ -3,8 +3,8 @@
  *
  * The width-settle rule needs to know whether the user is mid-drag. That fact
  * cannot be inferred from a clock (see vlist-width-settle), and it cannot come from
- * the resizing library either: the narrator list is dragged by at least two
- * independent hosts (dockview sashes, the ruler/graph node resizers) and is also
+ * the resizing library either: the narrator list is dragged by independent hosts
+ * (dockview sashes, panel resizers) and is also
  * embedded in places that resize it for reasons of their own. Subscribing to each
  * host's private drag events would couple this list to all of them and still miss
  * the next one.

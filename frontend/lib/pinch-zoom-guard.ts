@@ -4,8 +4,8 @@
  * `index.html` declares `user-scalable=no, maximum-scale=1.0`, and Chromium plus
  * iOS home-screen web apps honour it. Safari in a browser tab (iOS 10+) ignores
  * both, so on a tablet a two-finger gesture zooms the *page* instead of reaching
- * the handler under the fingers: the narrator list's LOD pinch, the ruler camera,
- * the terminal font size.
+ * the handler under the fingers: the narrator list's LOD pinch, the terminal font
+ * size.
  *
  * The meta tag cannot be patched up from inside a component, because of the ORDER
  * in which a gesture is claimed. Every in-app pinch handler calls preventDefault()

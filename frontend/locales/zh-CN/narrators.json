@@ -64,7 +64,6 @@
 	"sortDescending": "降序",
 	"sortAscending": "升序",
 	"loadingMore": "加载更多...",
-	"chapterLabel": "章节：{{title}}",
 	"activeTerminals": "{{count}} 个终端",
 	"viewingNow": "正在查看",
 	"filterHasTerminals": "有活跃终端",

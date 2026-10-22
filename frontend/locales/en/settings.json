@@ -1035,7 +1035,6 @@
 	"nugOAuthDeviceId": "Device ID",
 	"nugOAuthCallbackUrl": "Callback URL Override",
 	"pluginModelsCount": "{{count}} models available",
-	"chaptersSection": "Chapters",
 	"maxActiveWorktrees": "Max Active Worktrees",
 	"maxActiveContainers": "Max Active Containers",
 	"worktreeSizeWarning": "Worktree Size Warning",

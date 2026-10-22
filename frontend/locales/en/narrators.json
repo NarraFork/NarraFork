@@ -64,7 +64,6 @@
 	"sortDescending": "Descending",
 	"sortAscending": "Ascending",
 	"loadingMore": "Loading more...",
-	"chapterLabel": "Chapter: {{title}}",
 	"activeTerminals": "{{count}} terminal(s)",
 	"viewingNow": "Viewing now",
 	"filterHasTerminals": "Has Terminals",

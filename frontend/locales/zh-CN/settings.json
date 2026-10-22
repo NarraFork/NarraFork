@@ -1037,7 +1037,6 @@
 	"nugOAuthDeviceId": "设备 ID",
 	"nugOAuthCallbackUrl": "回调地址覆盖",
 	"pluginModelsCount": "{{count}} 个可用模型",
-	"chaptersSection": "章节",
 	"maxActiveWorktrees": "最大活跃工作区数",
 	"maxActiveContainers": "最大活跃容器数",
 	"worktreeSizeWarning": "工作区大小警告",
