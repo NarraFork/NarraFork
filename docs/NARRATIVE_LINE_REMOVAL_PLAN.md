@@ -1,78 +1,145 @@
-# 叙事线退役计划
+# 叙事线退役与项目自动索引计划
 
-> 状态：决策已定（见“已定决策”），数据迁移 SQL 的写法待确认。
+> 状态：决策已定（见“已定决策”），待按阶段实施。本分支目前只有本文档。
 
 ## 目标
 
 - 删除整条叙事线：章节、章节边、画布（classic 故事网络图）、尺子（ruler）、章节内的分叉/合并/拆分/评审。
 - 保留简化版项目（目录 + 会话，`frontend/routes/projects/$projectId.tsx`），界面上统一叫“项目”。
-- 旧的章节会话最终变成“项目下的普通会话”：会话 id、消息、历史都不变。
+- 项目改为轻量、无感、自动进入：会话属于哪个项目由它的工作目录推导，`projects` 表是可随时自动增补的索引。
+- 索引从一开始就支持“一个会话多个工作目录”。
 
 ## 不在范围内
 
-- 项目本身（`projects` 表、成员与权限、技能、例程、命令、知识库）全部保留。
-- `projects.chapterSettings` 名字带 chapter，但存的是项目级配置（例程工具模式、技能等，见 `server/services/routine-service.ts`、`skill-service.ts`）。它是活跃配置，保留；列名重命名需要迁移，不在本计划内。
+- 项目已有的能力（成员与权限、技能、例程、命令、知识库、traits、启动脚本等）全部保留，挂在项目行上不变。
+- `projects.chapterSettings` 名字带 chapter，但存的是项目级配置（例程工具模式、技能等，见 `server/services/routine-service.ts`、`skill-service.ts`）。它是活跃配置，保留；列名重命名不在本计划内。
 - 会话自己的 worktree（`narrator-worktree-*`）、tree 快照、文件回退保留，它们不依赖章节。
+- “给会话添加第二个工作目录”的功能本身（界面、工具）不在本计划内；本计划只让索引和读取方支持多目录。
+- 远程设备上的工作目录本计划不做自动索引（见阶段 3 的“范围限制”）。
 
 ## 现状
 
-### 新会话已经不建章节
+### 会话属于哪个项目
 
-项目页里新建会话走 `contextProjectId`，`chapterId` 为空（`server/routes/narrators.ts:1331`）。仍会写 `chapterId` 的路径只剩旧章节会话派生出来的：
+- 唯一的判断入口是 `server/services/narrator-project.ts` 的 `resolveNarratorProjectId`：先看章节，再看 `narrators.contextProjectId`。权限闸门、traits、例程、技能、设备都经过它或与它一致的逻辑。
+- 新会话不建章节：项目页里新建会话时写 `contextProjectId`，`chapterId` 为空（`server/routes/narrators.ts:1331`），cwd 默认是项目目录，可见性默认 `project`（`server/lib/narrator-audiences.ts`）。
+- 目前没有按 cwd 推导项目的逻辑（兼容面板注释也写明了这一点：`frontend/components/project/ProjectCompatibilityPanel.tsx:22`）。
+- 项目页的会话列表按 `contextProjectId` 或所属章节过滤（`server/routes/narrators.ts` 列表接口的 `projectId` 分支）。
 
-- 子代理继承父会话的章节（`server/services/narrator-service.ts:1837`）。
-- 从章节会话 fork 到章节（`narrator-service.ts:2766`）。
-- 章节的 fork / merge / split / review 等操作本身。
+仍会写 `chapterId` 的路径只剩旧章节会话派生出来的：子代理继承父会话的章节（`narrator-service.ts:1837`）、从章节会话 fork 到章节（`narrator-service.ts:2766`），以及章节的 fork / merge / split / review 操作本身。
 
-所以“停止产生新章节”只需要关掉上面这些入口，不影响普通会话。
+### 旧章节会话的工作目录
+
+旧章节会话的 cwd 大多没有存在会话上，而是运行时算出：会话自己的 cwd → 章节 worktree 路径 → 根章节才用项目目录（`server/services/narrator-cwd.ts:17`，调用处 `narrator-session.ts` 的章节分支）。休眠章节的 worktree 已被移除，这类会话现在就算不出目录，走 `WORKSPACE_DIRECTORY_REQUIRED` 让用户选。
 
 ### 资源表已经有非章节的归属方式
 
-终端、终端视图状态、容器实例、端口分配、快照应用都已经有 `worktreeResourceId` 列，并有 CHECK 约束保证“挂章节”和“挂 worktree 资源”二选一（`server/db/schema.ts` 中 `terminals`、`terminalViewState`、`containerInstances`、`portAllocations`、`volumeSnapshotApplications`）。按 D1 直接删表后，挂章节的这些行随级联删除；挂 `worktreeResourceId` 的行不受影响。
+终端、终端视图状态、容器实例、端口分配、快照应用都已有 `worktreeResourceId` 列，并有 CHECK 约束保证“挂章节”和“挂 worktree 资源”二选一。删表后挂章节的行随级联删除，挂 `worktreeResourceId` 的行不受影响。
 
 ### 指向 `chapters` 的外键
 
-| 表 | 列 | 删除行为 | 处理方式 |
+| 表 | 列 | 删除行为 | 删表后 |
 |---|---|---|---|
-| `chapter_edges` | 两端章节 | cascade | 随章节删除 |
-| `chapter_commits` | `chapter_id` | cascade | 随章节删除 |
-| `narrators` | `chapter_id` | 无 | 删表前的数据迁移里清空，回填 `contextProjectId`（D1a） |
-| `terminals` | `chapter_id` | cascade | 随删表删除（D1a） |
-| `terminal_view_state` | `chapter_id` | cascade | 同上 |
-| `container_instances` | `chapter_id` | cascade | 随删表删除（D1a） |
-| `port_allocations` | `chapter_id` | cascade | 随删表删除（D1a） |
-| `merge_sessions` | `target_chapter_id` | cascade | 随删表删除（D3） |
-| `volume_snapshots` | `source_chapter_id` | set null | 只是来源记录，置空即可 |
-| `volume_snapshot_applications` | `chapter_id` | cascade | 随删表删除（D1a） |
-| `review_conclusions` | 评审/来源章节 | cascade | 随删表删除（D2） |
-| `gateway_session_mappings` | `chapter_id` | set null | 置空即可 |
-| `scheduled_tasks` | `chapter_id` | set null | 数据迁移里改指向主会话，否则停用 |
+| `chapter_edges` | 两端章节 | cascade | 随表删除 |
+| `chapter_commits` | `chapter_id` | cascade | 随表删除 |
+| `narrators` | `chapter_id` | 无 | 列删除，不回填（D1a） |
+| `terminals` | `chapter_id` | cascade | 章节行删除 |
+| `terminal_view_state` | `chapter_id` | cascade | 章节行删除 |
+| `container_instances` | `chapter_id` | cascade | 章节行删除 |
+| `port_allocations` | `chapter_id` | cascade | 章节行删除 |
+| `merge_sessions` | `target_chapter_id` | cascade | 随表删除（D3） |
+| `volume_snapshots` | `source_chapter_id` | set null | 列删除，只是来源记录 |
+| `volume_snapshot_applications` | `chapter_id` | cascade | 章节行删除 |
+| `review_conclusions` | 评审/来源章节 | cascade | 随表删除（D2） |
+| `gateway_session_mappings` | `chapter_id` | set null | 列删除 |
+| `scheduled_tasks` | `chapter_id` | set null | 列删除；`runContext = "chapter"` 的任务改按项目目录运行（阶段 4） |
 
-`projects.flowMode`（classic/ruler）在功能删除后没有读者，最后随 schema 清理删除。
+`projects.flowMode`（classic/ruler）在功能删除后没有读者，随 schema 清理删除。
 
 ### 代码规模（main @ 6ff0a4ee）
 
 - 服务端非测试文件中提到 chapter 的有 213 个；前端 182 个；相关测试文件 248 个。
 - 可整体删除的主要模块：
   - 前端：`frontend/components/chapter/`、`graph/`、`ruler/`（合计约 1.4 MB 源码）；路由 `routes/chapters/`、`routes/git/chapters/`、`routes/windows/git/chapters/`；`hooks/useChapters.ts`、`lib/api/chapters.ts`。
-  - 服务端：路由 `chapters.ts`、`chapter-edges.ts`、`graph.ts`、`ruler.ts`、`reviews.ts`、`project-db.ts`；服务 `chapter-*.ts`、`chapter-write/`、`ruler-anchor-fallback.ts`、`merge-summary-service.ts`、`review-service.ts`、`review-event-handler.ts`、`project-db-sync*.ts`（D4）。这些路由和服务合计约 1.4 万行。
-- 不能整体删、需要逐处改的：`narrator-service.ts`、`narrator-session.ts`（上下文逐层继承里的章节层）、`narrator-acl.ts`（项目可见性先查章节再查 `contextProjectId`）、worktree 生命周期/清理、tree 快照与 shadow GC、容器/终端运行时、计划任务。
+  - 服务端：路由 `chapters.ts`、`chapter-edges.ts`、`graph.ts`、`ruler.ts`、`reviews.ts`、`project-db.ts`；服务 `chapter-*.ts`、`chapter-write/`、`ruler-anchor-fallback.ts`、`merge-summary-service.ts`、`review-service.ts`、`review-event-handler.ts`、`project-db-sync*.ts`。这些路由和服务合计约 1.4 万行。
+- 不能整体删、需要逐处改的：`narrator-project.ts`、`narrator-service.ts`、`narrator-session.ts`、`narrator-acl.ts`、`project-acl.ts`、worktree 生命周期/清理、tree 快照与 shadow GC、容器/终端运行时、计划任务。
 
 ## 已定决策（2026-10-22）
 
-- **D1 旧数据：直接删表。** 不做逐类资源接管的后台转换；章节相关表通过迁移删除。
-- **D1a 旧章节里的会话：保留为项目下的会话。** 删表前把 `narrators.chapter_id` 清空，`context_project_id` 设为章节所属项目，cwd 设为项目目录；会话和消息都保留。挂在章节上的终端、终端视图状态、容器、端口、快照应用、合并会话记录随删表级联删除。
-- **D1b 磁盘上的旧 worktree 和章节分支：原样保留。** 只删数据库记录，不删目录和分支；同时保证任何清理逻辑都不会把它们当孤儿删掉，由用户自行处理。
-- **D2 评审：整体删除。** 删除评审创建、`conclude_review` 工具和相关界面；已有评审会话按 D1a 保留为普通会话，`review_conclusions` 随删表删除。
+叙事线删除：
+
+- **D1 旧数据：直接删表。** 只用 `bun run db:generate` 生成的结构迁移，不写自定义数据迁移 SQL。
+- **D1a 旧章节会话：不回填。** 不回填 `contextProjectId`，也不把算出来的 cwd 固化到会话上。会话和消息保留；自己存了 cwd 的会话由自动索引重新归入项目；没存 cwd 的会话再打开时提示选择工作目录，选完后由索引归入项目。挂在章节上的终端、容器、端口、快照应用记录随删表级联删除。
+- **D1b 磁盘上的旧 worktree 和章节分支：原样保留。** 只删数据库记录，不删目录和分支；任何清理逻辑都不得把它们当孤儿删掉。
+- **D2 评审：整体删除。** 删除评审创建、`conclude_review` 工具和相关界面；已有评审会话按普通会话保留，`review_conclusions` 随删表删除。
 - **D3 项目内合并 / cherry-pick / 拆分：整体删除。** 需要时在会话里直接用 git。
 - **D4 `project.db` 归档同步：删除同步功能，已有的 `project.db` 文件不自动删除。**
 - **D5 设置页 `/settings/chapters`：保留通用项（最大容器数、tree 快照开关、大小警告、自动保存），页面改名“工作区与容器”。** 章节专属项（最大 worktree 数、休眠分钟数）在确认会话 worktree 不依赖后删除。
 
-### 待确认的实现点：数据迁移 SQL
+项目自动索引：
 
-D1a 的“清空 `chapter_id`、回填 `context_project_id` 和 cwd”必须和删表在同一个迁移里执行：`bun run start` 先跑迁移再启动应用，如果只靠应用启动时的回填，跨版本直接升级的用户会在回填前就丢掉 `chapter_id`，无法再知道会话属于哪个项目。
+- **P1 目录归属：已有项目优先，否则 git 主仓库。** 先在已有项目目录里按最长前缀匹配；都不匹配时取 git 主仓库根目录（worktree 归到它的主仓库，子目录归到仓库根）。
+- **P2 非 git 且不匹配已有项目的目录：不建项目，算独立会话。** 用户仍可手动把任意目录建成项目。
+- **P3 多工作目录：只按主工作目录的项目算配置和权限。** 会话出现在所有关联项目的项目页里（按各自权限过滤），但配置继承（traits、例程、技能、设备）和会话的 `project` 可见性只看主工作目录的项目。给会话加目录不会把它暴露给另一个项目的成员。
+- **P4 自动建的项目：首个进入者拥有，公开。** 一个目录只对应一个项目，后来的用户的会话也索引到这个项目。
+  - 后果：公开项目对所有登录用户开放读，所以可见性为 `project` 的会话在这类项目里对所有登录用户可读。从项目页新建的会话默认就是 `project` 可见性。写权限不受影响：公开项目不给写，`project` 写权限仍需要项目写授权。
+  - 自动索引本身不改任何会话的可见性；在项目页之外新建的会话默认 `private`，归入公开项目后仍然只有自己可见。
 
-drizzle-kit 不会从 schema 差异生成这种数据 UPDATE。可行做法是用 `drizzle-kit generate --custom` 生成一个空的自定义迁移，在其中写 UPDATE，排在删表迁移之前；PG 侧对应用 `db:generate:pg` 的自定义迁移。CLAUDE.md 禁止手改 `drizzle/` 下的文件，这一步需要你确认“由工具生成的空自定义迁移里填写 SQL”是否允许。
+## 项目自动索引的设计
+
+### 索引表
+
+新表 `narrator_project_links`：
+
+| 列 | 说明 |
+|---|---|
+| `narrator_id` | FK → narrators，cascade |
+| `project_id` | FK → projects，cascade |
+| `role` | `primary` / `additional`；每个会话至多一条 `primary`（部分唯一索引） |
+| `source` | `cwd`（由工作目录推导）/ `explicit`（来自 `contextProjectId`） |
+| `device_id` | 工作目录所在设备，本计划只写 `local` |
+| `directory` | 推导时用的规范化目录 |
+| `updated_at` | |
+
+索引：`(project_id, narrator_id)` 供项目页列表，`(narrator_id)` 供按会话查询。
+
+索引是会话自身数据（cwd、`contextProjectId`）的纯函数：任何时候都可以整表重建，重建会删除推导不出来的链接。
+
+### 归属规则
+
+`resolveProjectForDirectory(dir)`，只处理本机目录：
+
+1. 规范化：绝对路径；存在时取 realpath；Windows 和 macOS 按文件系统大小写规则比较。
+2. 在活跃项目的规范化 `gitPath` 中做最长前缀匹配，按路径段边界比较（`/a/b` 不匹配 `/a/bc`）。命中即返回。
+3. 不命中时异步执行 `git -C <dir> rev-parse --path-format=absolute --git-common-dir`（超时 2 秒，限制输出）。结果以 `/.git` 结尾时，其父目录是主仓库根；bare 仓库或失败按非 git 处理。
+4. 主仓库根存在：再按 2 查一次（防并发），仍不存在则建项目：名字取目录名，`gitPath` 为仓库根，`ownerUserId` 为会话所有者，`visibility = "public"`。
+5. 非 git：不建项目，不产生链接（P2）。
+
+并发建同一项目的去重：给 `projects` 加规范化根目录列 `root_key`，部分唯一索引（非空时唯一）。已有数据可能有多个项目指向同一 `gitPath`，`root_key` 由后台任务填写，重复时只给最早的那个填，其他保持空、不参与匹配。不在迁移里写数据。
+
+### 主项目
+
+- 有 `contextProjectId` 时，它就是主项目（`source = "explicit"`）。这保留外部授权会话（OAuth 预置）冻结的项目上下文语义，也覆盖项目页新建的会话。
+- 否则主工作目录推导出的项目是主项目。
+- 其余工作目录推导出的项目记为 `additional`（多工作目录功能上线后才会出现）。
+
+### 何时更新
+
+- 会话创建、工作目录提交（workspace revision 变化）、会话 worktree 资源创建：对该会话增量重算，几次小的带索引写入。
+- 项目新建或 `gitPath` 变更：后台任务重算可能受影响的会话。
+- 启动时：后台重建任务，按游标分页、每批有上限、可中断续跑，不阻塞主线程（CLAUDE.md 主线程规则）。
+- git 探测在请求路径里只做带超时的异步子进程调用；同一目录的结果短时缓存。
+
+### 读取方切换
+
+- `resolveNarratorProjectId` 改为读主链接。过渡期（章节表还在时）保留“先看章节”分支，阶段 5 前删除。
+- 项目页会话列表的 `projectId` 过滤改为 `EXISTS (narrator_project_links ...)`，任何角色的链接都算。
+- 配置继承、权限闸门、`project` 可见性只经过 `resolveNarratorProjectId`，也就只看主项目（P3）。不允许在别处另写一份“会话属于哪个项目”。
+
+### 范围限制
+
+- 远程设备的工作目录：路径属于另一台机器，不能拿本机项目目录做前缀匹配，也不能在本机跑 git。本计划不为它们推导链接，只保留 `explicit` 来源；之后要支持时，需要在设备执行器上做 git 探测，并给项目加设备维度。
+- 归档项目仍参与匹配，避免对同一目录重复建项目。
 
 ## 分阶段
 
@@ -83,51 +150,56 @@ drizzle-kit 不会从 schema 差异生成这种数据 UPDATE。可行做法是�
 - 4 处中文“叙事线”改为“项目”：`nav.json` 的 `projects`、`clearProjects`，`graph.json` 的 `storyNetwork`，`learning.json` 的 `subtitle`；`narrator.json` 的 `backToGraph`（“返回故事网络” / "Back to graph"）改为“返回项目” / "Back to project"。
 - 去掉导航、会话页、命令面板里通往画布、尺子、章节页的入口。
 - `/chapters/$chapterId` 和 git 子路由保留为重定向：有主会话跳会话，没有跳项目页（复用 `frontend/components/project/legacy-chapter-redirect.ts`）。
-- 项目页的兼容面板（`ProjectCompatibilityPanel`、`LegacyResourceRecovery`）先保留，这是旧章节资源的唯一恢复入口，阶段 3 删除。
+- 项目页的兼容面板（`ProjectCompatibilityPanel`、`LegacyResourceRecovery`）先保留，阶段 4 删除。
 
-### 阶段 2：服务端停止产生新章节
+### 阶段 2：删除章节功能
 
-- 删除或关闭创建章节的接口：新建章节、fork 到章节、merge、split、cherry-pick、review 创建。
-- 旧章节会话的子代理和 fork 改为生成普通会话（`chapterId: null`，继承 `contextProjectId`）。
+- 删除创建章节的接口：新建章节、fork 到章节、merge、split、cherry-pick、review 创建（D2、D3）。
+- 旧章节会话的子代理和 fork 改为生成普通会话：`chapterId: null`，cwd 取父会话当前的有效 cwd。
 - 删除前端对应的组件、hooks、API，以及阶段 1 已断开入口的画布/尺子代码。
 - 删除对应测试（含 `ruler-anchor-fallback.test.ts`、`chapter-*.test.ts` 等）。按 docs/TESTING.md，删除或移动被 `readFileSync` 守卫测试引用的文件后，全仓搜索旧路径字符串。
-- 读路径（列出旧章节、恢复资源、只读查看）保留到阶段 3。
+- 旧章节会话的读路径（打开会话、兼容面板恢复资源）保留到阶段 4。
 
-### 阶段 3：删除剩余章节代码
+### 阶段 3：项目自动索引
 
-- 删除兼容面板（`ProjectCompatibilityPanel`、`LegacyResourceRecovery`）、旧章节读路径和 `/chapters/$chapterId` 等重定向以外的章节路由。
-- `narrator-session.ts` 删掉上下文继承里的章节层；`narrator-acl.ts` 的项目可见性只看 `contextProjectId`。
-- worktree 生命周期、tree 快照与 shadow GC、容器、终端运行时、计划任务里的章节分支全部删除。
-- **worktree 清理守卫（D1b）**：检查 worktree 清理、孤儿扫描、shadow GC 的判断条件，确保没有了章节记录之后，`<gitPath>/.worktrees/` 下的旧目录和章节分支不会被当作孤儿删除。为此补测试。
+- schema：新增 `narrator_project_links`、`projects.root_key`，`bun run db:generate`（PG 侧走 `db:generate:pg`）。
+- 实现 `resolveProjectForDirectory`、单会话增量重算、后台重建任务和 `root_key` 填写任务。
+- 切换读取方：`resolveNarratorProjectId`、项目页列表。
+- 项目页新建会话保持现状（写 `contextProjectId` 和项目目录 cwd），索引把它记为 `explicit` 主链接。
+- 测试：前缀匹配边界、worktree 归到主仓库、子目录归到仓库根、非 git 目录不建项目、并发建项目只产生一行、重建会删除推导不出的链接、`explicit` 优先于 cwd、`additional` 链接不影响权限和配置。
+
+### 阶段 4：删除剩余章节代码
+
+- 删除兼容面板、旧章节读路径和重定向以外的章节路由。
+- `narrator-session.ts` 删掉章节分支：没有自己 cwd 的旧会话走现有 `WORKSPACE_DIRECTORY_REQUIRED` 提示；选择目录后触发索引重算。
+- `narrator-project.ts`、`narrator-acl.ts`、`project-acl.ts` 删除章节分支（含 `assertChapterProjectAccess`）。
+- worktree 生命周期、tree 快照与 shadow GC、容器、终端运行时里的章节分支全部删除。
+- **worktree 清理守卫（D1b）**：检查 worktree 清理、孤儿扫描、shadow GC 的判断，确保没有章节记录后，`<gitPath>/.worktrees/` 下的旧目录和章节分支不会被当作孤儿删除。补测试。
+- 计划任务：`runContext = "chapter"` 的任务按项目目录运行，读到旧值时按项目模式处理；界面只提供 standalone 和项目两种。
 - 删除 `project-db-sync*.ts`、`server/routes/project-db.ts` 及其调度器（D4），不碰磁盘上已有的 `project.db`。
 - 设置页按 D5 处理。
-- 更新 CLAUDE.md（删除“章节拆分”“章节边”“故事网络图”“Ruler 模式”等条目，worktree 条目改为会话 worktree）和相关 docs。
+- 更新 CLAUDE.md（删除“章节拆分”“章节边”“故事网络图”“Ruler 模式”等条目，项目条目改为“按工作目录自动索引”，worktree 条目改为会话 worktree）和相关 docs。
 
-### 阶段 4：迁移删表（已获授权：D1）
+### 阶段 5：删表
 
-一个 PR 内两个迁移，顺序执行：
-
-1. **数据迁移**（见上文“待确认的实现点”）：
-   - `narrators`：`context_project_id = chapters.project_id`（原值为空时）、cwd 设为项目目录、`chapter_id = NULL`；会话的 `visibility` 若是 `project`，因为仍在同一项目下，语义不变。
-   - `scheduled_tasks`：指向章节的任务改指向该章节的主会话；没有主会话的置为停用。
-   - 子代理会话同样处理（它们也带 `chapter_id`）。
-2. **schema 迁移**：在 `server/db/schema.ts` 删除 `chapters`、`chapter_edges`、`chapter_commits`、`merge_sessions`、`review_conclusions`、各表的 `chapter_id` 列与只服务章节的索引和 CHECK 约束、`projects.flowMode`，然后 `bun run db:generate`；PG 侧按 CLAUDE.md 的 `db:generate:pg` 流程。FTS5 里章节的索引和触发器在 `server/db/fts.ts` 同步删除。
-
-注意：
-
-- SQLite 删列会重建表。`narrators` 不含消息内容，行数有限；终端、容器等表的章节行会随之删除（D1a 已接受）。
-- 迁移在启动前执行，不经过应用代码，所以进行中的会话、终端、容器不会在迁移中被“安全点”保护。升级前应让用户停掉章节会话里的活跃运行；这一点写进 changelog。
+- 在 `server/db/schema.ts` 删除 `chapters`、`chapter_edges`、`chapter_commits`、`merge_sessions`、`review_conclusions`、各表的 `chapter_id` 列与只服务章节的索引和 CHECK 约束、`projects.flowMode`，然后 `bun run db:generate`；PG 侧按 CLAUDE.md 的 `db:generate:pg` 流程。不手改 `drizzle/`，不写自定义 SQL。
+- FTS5 里章节的索引和触发器在 `server/db/fts.ts` 同步删除。
+- SQLite 删列会重建表；`narrators` 不含消息内容，行数有限。
+- 迁移在应用启动前执行，进行中的章节会话、终端、容器不受安全点保护。升级说明里写明：升级前停掉章节会话里的运行，并备份数据库。
 
 ## 每个 PR 的验证
 
 - `bunx tsgo --noEmit`、`bunx @biomejs/biome check .`。
 - 只跑与改动相关的测试：`bun test --isolate <路径>`；全量交给 CI。
-- 阶段 4 额外需要：在带章节数据的 SQLite 副本上跑迁移（不碰 `~/.narrafork/narrafork.db`），核对：所有原章节会话的 `context_project_id` 已回填且可打开；没有残留 `chapter_id` 引用；磁盘上的 worktree 目录和章节分支仍在。PG 同样验证一遍。
+- 阶段 3：在一份数据库副本上（不碰 `~/.narrafork/narrafork.db`）跑重建任务，核对项目页会话数与切换前一致（旧章节会话在过渡期仍经章节归属显示），重复 `gitPath` 只给一个项目填 `root_key`。
+- 阶段 5：在带章节数据的数据库副本上跑迁移，核对：自己存了 cwd 的旧会话经重建后回到项目页；没存 cwd 的旧会话能打开并提示选目录；没有残留 `chapter_id` 引用；磁盘上的 worktree 目录和章节分支仍在。PG 同样验证一遍。
 
 ## 风险
 
-- **worktree 被误删**：删表后旧 worktree 目录不再有数据库记录，任何“没有记录就清理”的逻辑都会删掉其中未提交的改动。缓解：阶段 3 的清理守卫和测试，阶段 4 验证目录仍在。
-- **级联删除的不可逆**：终端、容器等章节资源记录和评审结论随删表消失，无法恢复。升级说明里写明，建议升级前备份数据库。
-- **级联删除**：阶段 5 删 `chapters` 会级联删掉仍挂章节的终端、容器等记录。缓解：阶段 5 前检查所有带 `chapter_id` 的表行数为 0。
+- **worktree 被误删**：删表后旧 worktree 目录不再有数据库记录，任何“没有记录就清理”的逻辑都会删掉其中未提交的改动。缓解：阶段 4 的清理守卫和测试，阶段 5 验证目录仍在。
+- **级联删除不可逆**：终端、容器等章节资源记录和评审结论随删表消失。升级说明写明，建议升级前备份。
+- **公开项目扩大 `project` 可见会话的读范围（P4）**：自动建的项目是公开的，其中 `project` 可见的会话对所有登录用户可读。阶段 3 的 PR 说明里写明。
+- **改 cwd 会改变主项目**：会话的 `project` 可见性和配置继承跟着主项目走，把会话 cwd 移到另一个项目会改变谁能看到它。改 cwd 本身需要会话写权限。
+- **项目表增长**：每个进入过的 git 仓库都会产生一个项目。阶段 3 需要确认项目列表的排序和筛选在项目数变多后仍然可用。
 - **运行中的 NarraFork 进程**：开发和验证过程中不得停止或重启 `bun run start:dev` 启动的进程；需要重载时由用户操作。
-- **参考**：废弃分支 `origin/abandoned/chapter-retirement-migration`（`42874fd2`）的 `docs/CHAPTER_RETIREMENT_MIGRATION_DESIGN.md` 记录了“转换并删除项目”这一更难版本的问题。本计划保留项目并直接删表，权限、项目级资源搬迁和逐类资源接管都不再需要。
+- **参考**：废弃分支 `origin/abandoned/chapter-retirement-migration`（`42874fd2`）的 `docs/CHAPTER_RETIREMENT_MIGRATION_DESIGN.md` 记录了“转换并删除项目”这一更难版本的问题。本计划保留项目、直接删表，权限搬迁和逐类资源接管都不再需要。
