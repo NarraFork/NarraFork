@@ -1109,7 +1109,6 @@
 	"promote_standalone_hint": "作为普通会话继续，保留访问限制",
 	"promote_chapter_hint": "转为独立会话，不创建章节或工作区",
 	"promote_success_unlocked": "已转为普通会话，访问限制保持不变",
-	"promote_success_forked": "已创建独立会话，没有新建章节或工作区",
 	"extractToPrimary": "另存为主叙述者",
 	"extractToPrimaryHint": "把这次探索上下文复制成主叙述者，可用 AskUserQuestion、Agent 等完整能力；原子代理本身不受影响。权限白/黑名单规则不会继承。",
 	"extractToPrimarySuccess": "已另存为主叙述者",

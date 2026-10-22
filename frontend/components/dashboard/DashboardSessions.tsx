@@ -58,7 +58,6 @@ function narratorListQuery(status: "working" | "waiting" | null) {
 		queryKey: ["narrators", "dashboard", status ?? "recent"],
 		queryFn: () =>
 			api.listNarratorsPaginated({
-				standalone: "all",
 				...(status ? { status } : {}),
 				limit: status ? LIVE_LIST_LIMIT : RECENT_LIST_LIMIT,
 				sortBy: "updatedAt",

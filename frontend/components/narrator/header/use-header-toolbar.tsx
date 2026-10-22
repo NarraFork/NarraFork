@@ -37,8 +37,7 @@ export interface UseHeaderToolbarOptions {
 	dock: NarratorDockContextValue | null;
 	/**
 	 * Whether the git panel can resolve a workspace for this narrator (ready
-	 * state + read capability). Replaces the old `!!chapterId` gate now that
-	 * standalone narrators can also have a Git workspace.
+	 * state + read capability).
 	 */
 	gitWorkspaceAvailable: boolean;
 	tasksSupported: boolean;
@@ -142,8 +141,8 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 					// this hook does not depend on a value defined after the early return.
 					return terminalToolAvailable || !!onOpenTerminalPanel;
 				case "git":
-					// Chapter or standalone, the git panel is offered whenever a
-					// workspace resolves with read capability for this narrator.
+					// The git panel is offered whenever a workspace resolves with read
+					// capability for this narrator.
 					return gitWorkspaceAvailable;
 				case "browser":
 					return browserSessionsSupported !== false;

@@ -10,12 +10,7 @@ interface GitFileDiffProps {
 	onClose: () => void;
 }
 
-export function GitFileDiff({
-	target,
-	file,
-	staged = false,
-	onClose,
-}: GitFileDiffProps) {
+export function GitFileDiff({ target, file, staged = false, onClose }: GitFileDiffProps) {
 	const { t } = useTranslation("git");
 	const { data, dataUpdatedAt, isLoading, error } = useGitDiff(target, file, staged);
 

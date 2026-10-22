@@ -1126,21 +1126,17 @@ describe("mobile safe-area layout contract", () => {
 	});
 
 	test("only authenticated layout conflicts use the dynamic viewport contract", async () => {
-		const [
-			appShell,
-			contentViewer,
-			settingsRoute,
-			oauthAppsRoute,
-			providersRoute,
-			loginRoute,
-		] = await Promise.all([
-			Bun.file(new URL("../components/AuthenticatedAppLayout.tsx", import.meta.url)).text(),
-			Bun.file(new URL("../components/narrator/content/ContentViewer.tsx", import.meta.url)).text(),
-			Bun.file(new URL("../routes/settings.tsx", import.meta.url)).text(),
-			Bun.file(new URL("../routes/settings/oauth-apps.tsx", import.meta.url)).text(),
-			Bun.file(new URL("../routes/settings/providers.tsx", import.meta.url)).text(),
-			Bun.file(new URL("../routes/login.tsx", import.meta.url)).text(),
-		]);
+		const [appShell, contentViewer, settingsRoute, oauthAppsRoute, providersRoute, loginRoute] =
+			await Promise.all([
+				Bun.file(new URL("../components/AuthenticatedAppLayout.tsx", import.meta.url)).text(),
+				Bun.file(
+					new URL("../components/narrator/content/ContentViewer.tsx", import.meta.url),
+				).text(),
+				Bun.file(new URL("../routes/settings.tsx", import.meta.url)).text(),
+				Bun.file(new URL("../routes/settings/oauth-apps.tsx", import.meta.url)).text(),
+				Bun.file(new URL("../routes/settings/providers.tsx", import.meta.url)).text(),
+				Bun.file(new URL("../routes/login.tsx", import.meta.url)).text(),
+			]);
 		const authenticatedLayout = appShell.slice(appShell.indexOf("function AuthenticatedLayout"));
 
 		expect(authenticatedLayout).toContain("useBrowserLayoutEffect(() => {");

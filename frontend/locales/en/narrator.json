@@ -1110,7 +1110,6 @@
 	"promote_standalone_hint": "Continue as an ordinary conversation, preserving access restrictions",
 	"promote_chapter_hint": "Continue in an independent conversation without creating a chapter or worktree",
 	"promote_success_unlocked": "Continued as an ordinary conversation — access restrictions preserved",
-	"promote_success_forked": "Created an independent conversation — no new chapter or worktree",
 	"extractToPrimary": "Save as primary",
 	"extractToPrimaryHint": "Copy this exploration into a primary narrator with full tools (AskUserQuestion, Agent, …). The subagent itself is not changed. Permission allow/deny rules are not inherited.",
 	"extractToPrimarySuccess": "Saved as a primary narrator",

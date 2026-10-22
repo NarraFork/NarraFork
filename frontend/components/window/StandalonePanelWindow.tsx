@@ -190,10 +190,7 @@ function PanelContent({ descriptor }: { descriptor: PanelWindowDescriptor }) {
 			return <WebviewWindow initialConfig={descriptor.webviewConfig} />;
 		case "narrator-tool":
 			return (
-				<NarratorToolWindow
-					toolType={descriptor.toolType}
-					narratorId={descriptor.narratorId}
-				/>
+				<NarratorToolWindow toolType={descriptor.toolType} narratorId={descriptor.narratorId} />
 			);
 		case "file":
 			return <FileWindow descriptor={descriptor} />;

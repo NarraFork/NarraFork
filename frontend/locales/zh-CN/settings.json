@@ -2301,8 +2301,6 @@
 	"gatewayRateLimitDesc": "每用户每分钟最大消息数。0 = 不限制。",
 	"gatewayDefaultProject": "默认项目 ID",
 	"gatewayDefaultProjectDesc": "将新 IM 会话绑定到此项目（可选）。",
-	"gatewayDefaultChapter": "默认章节 ID",
-	"gatewayDefaultChapterDesc": "将新 IM 会话绑定到此章节（可选）。",
 	"gatewayPlatforms": "平台",
 	"gatewayPlatformEnabled": "启用",
 	"gatewayPlatformToken": "Bot Token",

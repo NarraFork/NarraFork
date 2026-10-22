@@ -99,8 +99,7 @@ export function getNamespacesForPath(pathname: string): Namespace[] {
 
 	// Private windows share auth/theme, not the navigation's translation bundles.
 	if (path === "/windows" || path.startsWith("/windows/")) {
-		const gitWindow =
-			path.startsWith("/windows/git/narrators/");
+		const gitWindow = path.startsWith("/windows/git/narrators/");
 		if (gitWindow) return ["common", "errors", "git"];
 		// Panel/workspace windows render panels whose components each carry their own
 		// namespace (terminal, git, knowledge, …) — preload the full panel set.
@@ -134,16 +133,7 @@ function getRouteNamespaces(path: string): Namespace[] {
 	if (path === "/") return ["common", "nav", "dashboard"];
 	if (path === "/projects") return ["common", "nav", "projects"];
 	if (path.startsWith("/projects/")) {
-		return [
-			"common",
-			"nav",
-			"projects",
-			"narrator",
-			"settings",
-			"terminal",
-			"git",
-			"chat",
-		];
+		return ["common", "nav", "projects", "narrator", "settings", "terminal", "git", "chat"];
 	}
 	if (path.startsWith("/git/narrators/")) {
 		return ["git"];
@@ -155,16 +145,7 @@ function getRouteNamespaces(path: string): Namespace[] {
 		return ["common", "nav", "narrators", "narrator", "terminal", "git", "chat"];
 	}
 	if (path.startsWith("/narrators/")) {
-		return [
-			"common",
-			"nav",
-			"narrators",
-			"narrator",
-			"settings",
-			"terminal",
-			"git",
-			"chat",
-		];
+		return ["common", "nav", "narrators", "narrator", "settings", "terminal", "git", "chat"];
 	}
 	if (path === "/settings/providers" || path === "/settings/models" || path === "/settings/agent") {
 		return ["common", "nav", "settings", "narrator"];

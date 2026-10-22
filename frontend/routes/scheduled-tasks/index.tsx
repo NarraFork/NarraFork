@@ -178,7 +178,7 @@ function ScheduledTasksPage() {
 			permissionMode: draft.permissionMode,
 			locale: draft.locale,
 			runContext: draft.runContext,
-			cwd: isProject ? null : draft.cwd.trim() || null,
+			cwd: draft.cwd.trim() || null,
 			projectId: isProject ? draft.projectId || null : null,
 			narratorMode: draft.narratorMode,
 			cleanupPolicy:
@@ -705,16 +705,7 @@ function TaskFormModal({
 							{ value: "project", label: t("ctxProject") },
 						]}
 					/>
-					{draft.runContext === "standalone" ? (
-						<DirectoryPicker
-							label={t("cwd")}
-							description={t("cwdDesc")}
-							placeholder="/home/user/project"
-							leftSection={<IconFolder size={16} />}
-							value={draft.cwd}
-							onChange={(v) => patch({ cwd: v })}
-						/>
-					) : (
+					{draft.runContext === "project" && (
 						<Select
 							label={t("project")}
 							description={projects.length === 0 ? t("noProjectsAvailable") : t("projectDesc")}
@@ -729,6 +720,14 @@ function TaskFormModal({
 							disabled={projects.length === 0}
 						/>
 					)}
+					<DirectoryPicker
+						label={t("cwd")}
+						description={t(draft.runContext === "project" ? "cwdProjectDesc" : "cwdDesc")}
+						placeholder="/home/user/project"
+						leftSection={<IconFolder size={16} />}
+						value={draft.cwd}
+						onChange={(v) => patch({ cwd: v })}
+					/>
 				</Stack>
 
 				{/* Narrator options */}

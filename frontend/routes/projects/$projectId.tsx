@@ -47,7 +47,7 @@ function ProjectPage() {
 	const sessions = useInfiniteQuery({
 		queryKey: ["narrators", "project", projectId],
 		queryFn: ({ pageParam }) =>
-			api.listNarratorsPaginated({ standalone: "all", projectId, limit: 30, cursor: pageParam }),
+			api.listNarratorsPaginated({ projectId, limit: 30, cursor: pageParam }),
 		initialPageParam: undefined as string | undefined,
 		getNextPageParam: (page) => page.nextCursor ?? undefined,
 		enabled: !!project.data && !project.isError,

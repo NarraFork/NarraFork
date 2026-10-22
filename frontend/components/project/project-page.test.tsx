@@ -134,14 +134,7 @@ beforeEach(() => {
 	canWrite = true;
 	projectError = false;
 	settingsError = false;
-	for (const fn of [
-		navigate,
-		invalidate,
-		fetchNextPage,
-		list,
-		fullAccess,
-		installAccessListener,
-	])
+	for (const fn of [navigate, invalidate, fetchNextPage, list, fullAccess, installAccessListener])
 		fn.mockClear();
 	const { window } = parseHTML("<!doctype html><html><body></body></html>");
 	for (const [key, value] of Object.entries({
@@ -194,7 +187,6 @@ test("project shows directory and sessions, but does not mount tools on read", a
 	expect(container.querySelector("[data-settings]")).toBeNull();
 	expect(container.querySelector("[data-project]")).toBeNull();
 	expect(list).toHaveBeenCalledWith({
-		standalone: "all",
 		projectId: "original-project",
 		limit: 30,
 		cursor: "cursor",

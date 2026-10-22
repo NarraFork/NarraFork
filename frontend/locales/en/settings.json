@@ -2299,8 +2299,6 @@
 	"gatewayRateLimitDesc": "Max messages per user per minute. 0 = unlimited.",
 	"gatewayDefaultProject": "Default Project ID",
 	"gatewayDefaultProjectDesc": "Bind new IM sessions to this project (optional).",
-	"gatewayDefaultChapter": "Default Chapter ID",
-	"gatewayDefaultChapterDesc": "Bind new IM sessions to this chapter (optional).",
 	"gatewayPlatforms": "Platforms",
 	"gatewayPlatformEnabled": "Enabled",
 	"gatewayPlatformToken": "Bot Token",

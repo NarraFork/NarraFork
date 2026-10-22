@@ -131,8 +131,7 @@ export interface UseNarratorSendOptions {
 	 * Client-side slash commands mirroring the manual controls: `/fork` forks
 	 * from the latest message (its right-click fork action), `/compact` triggers
 	 * a compaction (the context-ring "compact now" action). The panel supplies
-	 * both because chapter-bound forks need the host's git-aware handler; an
-	 * absent handler turns the command into a no-op.
+	 * both; an absent handler turns the command into a no-op.
 	 */
 	onForkCommand?: () => void;
 	onCompactCommand?: () => void;

@@ -5201,13 +5201,7 @@ export const PretextExactMessageList = memo(
 						</Suspense>
 					);
 				},
-				[
-					messagesById,
-					rowHandlers,
-					narratorId,
-					tailMeta.lastUserMessageId,
-					closeEditor,
-				],
+				[messagesById, rowHandlers, narratorId, tailMeta.lastUserMessageId, closeEditor],
 			);
 
 			const originalModalMessage = originalModalMessageId

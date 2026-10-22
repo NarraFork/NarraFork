@@ -723,9 +723,7 @@ export const narratorsApi = {
 	},
 	listNarratorsPaginated: (opts?: {
 		projectId?: string;
-		standalone?: boolean | "all";
 		status?: string;
-		filter?: string;
 		sortBy?: string;
 		sortOrder?: string;
 		limit?: number;
@@ -737,10 +735,7 @@ export const narratorsApi = {
 	}) => {
 		const params = new URLSearchParams();
 		if (opts?.projectId) params.set("projectId", opts.projectId);
-		if (opts?.standalone === "all") params.set("standalone", "all");
-		else if (opts?.standalone) params.set("standalone", "true");
 		if (opts?.status) params.set("status", opts.status);
-		if (opts?.filter) params.set("filter", opts.filter);
 		if (opts?.sortBy) params.set("sortBy", opts.sortBy);
 		if (opts?.sortOrder) params.set("sortOrder", opts.sortOrder);
 		if (opts?.limit) params.set("limit", String(opts.limit));
@@ -2181,7 +2176,7 @@ export const narratorsApi = {
 			method: "DELETE",
 		}),
 	promoteNarrator: (narratorId: string) =>
-		request<{ type: "unlocked" | "forked"; narratorId: string; narrator?: ApiEntity }>(
+		request<{ type: "unlocked"; narratorId: string; narrator?: ApiEntity }>(
 			`/narrators/${narratorId}/promote`,
 			{ method: "POST" },
 		),

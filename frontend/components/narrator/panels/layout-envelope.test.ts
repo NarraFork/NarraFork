@@ -81,5 +81,4 @@ describe("retired filemod layout compatibility", () => {
 		delete original.panels.file;
 		expect(removeRetiredFilemodPanels(original)).toBeNull();
 	});
-
 });

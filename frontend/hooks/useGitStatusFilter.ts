@@ -104,9 +104,7 @@ if (import.meta.hot) {
  * An empty set means UNFILTERED, not "hide everything": a mis-click must never
  * leave the panel looking empty and broken.
  */
-export function useGitStatusFilter(
-	scopeKey: string,
-): {
+export function useGitStatusFilter(scopeKey: string): {
 	selected: Set<GitStatusFilterChar>;
 	toggle: (char: GitStatusFilterChar) => void;
 	clear: () => void;

@@ -917,9 +917,7 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 													)}
 												</Tooltip>
 												{promote.show && (
-													<Tooltip
-														label={t("promote_standalone_hint")}
-													>
+													<Tooltip label={t("promote_standalone_hint")}>
 														<Button
 															size="xs"
 															variant="light"

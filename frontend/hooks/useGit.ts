@@ -957,10 +957,8 @@ export function useGitStash(target: GitTarget) {
 	);
 }
 export function useGitReset(target: GitTarget) {
-	return useGitMutation(
-		target,
-		(params: { target: string; mode: "soft" | "hard" }) =>
-			api.gitReset(target, params.target, params.mode),
+	return useGitMutation(target, (params: { target: string; mode: "soft" | "hard" }) =>
+		api.gitReset(target, params.target, params.mode),
 	);
 }
 export function useGitAiCommitMessage(target: GitTarget) {

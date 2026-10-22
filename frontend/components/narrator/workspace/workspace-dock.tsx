@@ -34,10 +34,8 @@ import {
 	useCallback,
 	useContext,
 	useMemo,
-	useRef,
 	useSyncExternalStore,
 } from "react";
-import { useNarrator } from "../../../hooks/useNarrator";
 import type { PluginContributionPick } from "../../plugins/PluginContributionPicker";
 import { buildPluginDockPanelOpenRequest } from "../../plugins/PluginContributionPicker";
 import type { PluginUiSessionContext } from "../../plugins/PluginUiSurfaceContext";
@@ -893,11 +891,7 @@ export class WorkspaceDockStore {
 		)
 			(origin.opener as HTMLElement).focus();
 	}
-	openToolPanel(
-		narratorId: string,
-		type: NarratorToolPanelType,
-		sourcePanelId?: string,
-	) {
+	openToolPanel(narratorId: string, type: NarratorToolPanelType, sourcePanelId?: string) {
 		this.openResource(
 			narratorId,
 			{
@@ -1041,11 +1035,7 @@ export class WorkspaceDockStore {
 	 * Same contract as `NarratorDockContext.toggleToolPanel`: open if closed,
 	 * focus an open-but-background tab, close only when it is already active.
 	 */
-	toggleToolPanel(
-		narratorId: string,
-		type: NarratorToolPanelType,
-		sourcePanelId?: string,
-	) {
+	toggleToolPanel(narratorId: string, type: NarratorToolPanelType, sourcePanelId?: string) {
 		const existing = this.apiRef.current?.getPanel(workspaceToolPanelId(narratorId, type));
 		if (!existing) {
 			this.openToolPanel(narratorId, type, sourcePanelId);

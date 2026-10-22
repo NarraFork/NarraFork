@@ -2,12 +2,6 @@ import { notifications } from "@mantine/notifications";
 import { useCallback, useRef } from "react";
 import { useForkNarrator, useStartAskInPassing } from "../../../hooks/useNarrator";
 
-/** Promotion always lands on the independent narrator route. */
-export function ordinaryPromoteDestination(narratorId: string) {
-	if (!narratorId) throw new Error("Promoted conversation ID is missing");
-	return { to: "/narrators/$narratorId" as const, params: { narratorId } };
-}
-
 export interface UseNarratorForkActionsOptions {
 	narratorId: string;
 	/** Navigate to a narrator route (used after a standalone fork). */

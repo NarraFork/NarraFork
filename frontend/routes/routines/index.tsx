@@ -371,7 +371,6 @@ const HOOK_COMMON_FIELDS = [
 	["hook_event_name", "hookFieldHookEventName"],
 	["narrator_id", "hookFieldNarratorId"],
 	["narrator_title", "hookFieldNarratorTitle"],
-	["chapter_id", "hookFieldChapterId"],
 	["project_id", "hookFieldProjectId"],
 	["cwd", "hookFieldCwd"],
 ] as const;
@@ -413,7 +412,6 @@ function buildHookExample(event: string): string {
 		hook_event_name: event,
 		narrator_id: "n_abc123",
 		narrator_title: "Refactor auth flow",
-		chapter_id: "c_def456",
 		project_id: "p_ghi789",
 		cwd: "/home/user/project/.worktrees/feature",
 	};

@@ -5,7 +5,6 @@ import {
 	Group,
 	Indicator,
 	Popover,
-	SegmentedControl,
 	Select,
 	Stack,
 	Text,

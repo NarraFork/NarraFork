@@ -48,8 +48,7 @@ function GitCommitsContent({ target }: { target: GitTarget }) {
 
 	async function handleReset(sha: string, mode: "soft" | "hard") {
 		if (!canWrite) return;
-		const scope =
-			`\n${t("workspace.scope", { root: target.rootPath })}`;
+		const scope = `\n${t("workspace.scope", { root: target.rootPath })}`;
 		if (
 			!(await confirm({
 				message: `${t(mode === "hard" ? "resetConfirm" : "resetSoftConfirm")}${scope}`,
@@ -153,7 +152,7 @@ function GitCommitsContent({ target }: { target: GitTarget }) {
 									</UnstyledButton>
 								</Menu.Target>
 								<Menu.Dropdown>
-										<Menu.Item
+									<Menu.Item
 										disabled={!canWrite || reset.isPending}
 										onClick={() => handleReset(c.sha, "soft")}
 									>

@@ -30,9 +30,9 @@ import type { GitStatusSummary } from "../../hooks/useGit";
 import { __resetGitFolderPrefsCache } from "../../hooks/useGitFolderPrefs";
 import { __resetGitStatusFilterCache } from "../../hooks/useGitStatusFilter";
 import { api } from "../../lib/api";
+import type { GitTarget } from "../../lib/api/git";
 import commonLocale from "../../locales/en/common.json";
 import gitLocale from "../../locales/en/git.json";
-import type { GitTarget } from "../../lib/api/git";
 import { ConfirmDialogProvider } from "../common/ConfirmDialogProvider";
 
 // Isolated i18next instance, same reason as the sibling git suites: they mutate

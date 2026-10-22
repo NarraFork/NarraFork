@@ -160,9 +160,9 @@ describe("git APIs", () => {
 		const urls = calls.map(({ url }) => new URL(url, "http://localhost"));
 		expect(urls[0]?.pathname).toBe(`/api/narrators/narrator%20%2F%3F%23/git/commits/${sha}`);
 		expect(urls[1]?.pathname).toBe(`${urls[0]?.pathname}/diff`);
-		expect(
-			urls.every((url) => url.searchParams.get("workspaceKey") === target.workspaceKey),
-		).toBe(true);
+		expect(urls.every((url) => url.searchParams.get("workspaceKey") === target.workspaceKey)).toBe(
+			true,
+		);
 		expect(urls[0]?.searchParams.size).toBe(1);
 		for (const index of [1, 2, 4]) expect(urls[index]?.searchParams.get("file")).toBe(file);
 		for (const index of [1, 4]) expect(urls[index]?.searchParams.get("oldPath")).toBe(oldPath);

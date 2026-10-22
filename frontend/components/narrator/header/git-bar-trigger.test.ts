@@ -1,9 +1,5 @@
 import { describe, expect, it } from "bun:test";
-import {
-	isActivationKey,
-	isTextSelectionGesture,
-	type SelectionLike,
-} from "./git-bar-trigger";
+import { isActivationKey, isTextSelectionGesture, type SelectionLike } from "./git-bar-trigger";
 
 /** A `Selection` stub carrying only what the rules read. */
 function selection(text: string, isCollapsed = text.length === 0): SelectionLike {

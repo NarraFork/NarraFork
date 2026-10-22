@@ -388,7 +388,7 @@ function GrantsTab({ plugin }: { plugin: PluginDetail }) {
 						<Group grow>
 							<Field label={t("admin.detail.grants.scopeType")}>
 								<Select
-									data={["global", "project", "chapter", "narrator", "workspace", "device"]}
+									data={["global", "project", "narrator", "workspace", "device"]}
 									value={newScopeType}
 									onChange={(value) => setNewScopeType(value ?? "global")}
 								/>

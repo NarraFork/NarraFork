@@ -60,7 +60,6 @@ interface PlatformConfig {
 interface GatewayConfig {
 	enabled?: boolean;
 	defaultProjectId?: string;
-	defaultChapterId?: string;
 	defaultPermissionMode?: string;
 	sessionIdleMinutes?: number;
 	rateLimitPerMinute?: number;
@@ -218,7 +217,6 @@ export function GatewaySection({ userPrefs, updateUserPref }: GatewaySectionProp
 				serverSnapshot.current.streaming !== configToSave.streaming ||
 				serverSnapshot.current.defaultPermissionMode !== configToSave.defaultPermissionMode ||
 				serverSnapshot.current.defaultProjectId !== configToSave.defaultProjectId ||
-				serverSnapshot.current.defaultChapterId !== configToSave.defaultChapterId ||
 				serverSnapshot.current.sessionIdleMinutes !== configToSave.sessionIdleMinutes ||
 				serverSnapshot.current.rateLimitPerMinute !== configToSave.rateLimitPerMinute;
 
@@ -354,20 +352,12 @@ export function GatewaySection({ userPrefs, updateUserPref }: GatewaySectionProp
 						/>
 					</Group>
 
-					<Group grow>
-						<TextInput
-							label={t("gatewayDefaultProject")}
-							description={t("gatewayDefaultProjectDesc")}
-							value={config.defaultProjectId ?? ""}
-							onChange={(e) => updateField("defaultProjectId", e.currentTarget.value || undefined)}
-						/>
-						<TextInput
-							label={t("gatewayDefaultChapter")}
-							description={t("gatewayDefaultChapterDesc")}
-							value={config.defaultChapterId ?? ""}
-							onChange={(e) => updateField("defaultChapterId", e.currentTarget.value || undefined)}
-						/>
-					</Group>
+					<TextInput
+						label={t("gatewayDefaultProject")}
+						description={t("gatewayDefaultProjectDesc")}
+						value={config.defaultProjectId ?? ""}
+						onChange={(e) => updateField("defaultProjectId", e.currentTarget.value || undefined)}
+					/>
 
 					<Group justify="space-between" mt="md">
 						<Title order={5}>{t("gatewayPlatforms")}</Title>

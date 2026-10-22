@@ -154,9 +154,7 @@ function NarratorWorkspacePreview({
 	}, [refetch]);
 	const target = !workspace.isError ? gitWorkspaceTarget(narratorId, workspace.data) : null;
 	const mismatch =
-		target &&
-		search.workspaceKey !== undefined &&
-		search.workspaceKey !== target.workspaceKey;
+		target && search.workspaceKey !== undefined && search.workspaceKey !== target.workspaceKey;
 	const mustPin = checked && target && !mismatch && search.workspaceKey === undefined;
 	useEffect(() => {
 		if (!mustPin || !target) return;

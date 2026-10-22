@@ -110,12 +110,7 @@ export const miscApi = {
 		),
 
 	// Search
-	search: (
-		q: string,
-		entities = "messages",
-		sort?: "time" | "relevance",
-		signal?: AbortSignal,
-	) =>
+	search: (q: string, entities = "messages", sort?: "time" | "relevance", signal?: AbortSignal) =>
 		request<SearchResponse>(
 			`/search?q=${encodeURIComponent(q)}&entities=${entities}${sort ? `&sort=${sort}` : ""}`,
 			{ signal },

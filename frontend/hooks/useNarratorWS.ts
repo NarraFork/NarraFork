@@ -656,10 +656,7 @@ export interface NarratorWSCallbacks {
 		compactStart?: number,
 		snapshot?: import("@shared/context-usage").ContextUsageSnapshot,
 	) => void;
-	onGitStatus?: (data: {
-		linesAdded?: number;
-		linesRemoved?: number;
-	}) => void;
+	onGitStatus?: (data: { linesAdded?: number; linesRemoved?: number }) => void;
 	/**
 	 * Individual worktree paths changed, so a file tree can patch the affected
 	 * directories instead of refetching.

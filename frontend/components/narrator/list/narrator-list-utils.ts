@@ -75,7 +75,6 @@ export function normalizeNarratorListSearchPatch<T extends NarratorListSearchPar
 
 export function buildNarratorListQueryOptions(state: NarratorListState, status?: string) {
 	return {
-		standalone: "all" as const,
 		...(status ? { status } : {}),
 		sortBy: state.sortBy,
 		sortOrder: state.sortOrder,
@@ -93,13 +92,7 @@ export function filterNarratorsByLocalQuery<T extends NarratorListSearchable>(
 	const normalizedQuery = normalizeSearchText(localQuery);
 	if (!normalizedQuery) return narrators;
 	return narrators.filter((narrator) =>
-		[
-			narrator.title,
-			narrator.id,
-			narrator.cwd,
-			narrator.model,
-			narrator.status,
-		]
+		[narrator.title, narrator.id, narrator.cwd, narrator.model, narrator.status]
 			.filter(Boolean)
 			.some((value) => includesSearch(value, localQuery)),
 	);

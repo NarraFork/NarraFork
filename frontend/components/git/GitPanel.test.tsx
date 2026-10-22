@@ -1203,10 +1203,7 @@ describe("GitPanel", () => {
 			},
 		});
 
-		const { container, queryClient } = await renderWithBranch(
-			"git-branch-header",
-			LONG_BRANCH,
-		);
+		const { container, queryClient } = await renderWithBranch("git-branch-header", LONG_BRANCH);
 
 		expect(container.textContent).toContain(LONG_BRANCH);
 		// The compact header keeps the branch identity but removes the permanent HEAD

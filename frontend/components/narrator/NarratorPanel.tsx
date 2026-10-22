@@ -164,10 +164,7 @@ import { useComposerFileIngest } from "./interaction/use-composer-file-ingest";
 import { useInternalFileViewer } from "./interaction/use-internal-file-viewer";
 import { useInterruptLongPress } from "./interaction/use-interrupt-long-press";
 import { useMessageRevertConfirm } from "./interaction/use-message-revert-confirm";
-import {
-	ordinaryPromoteDestination,
-	useNarratorForkActions,
-} from "./interaction/use-narrator-fork-actions";
+import { useNarratorForkActions } from "./interaction/use-narrator-fork-actions";
 import { useNarratorSend } from "./interaction/use-narrator-send";
 import { usePermissionFocusNav } from "./interaction/use-permission-focus-nav";
 import { capabilityModelReference, useResolvedModel } from "./interaction/use-resolved-model";
@@ -559,19 +556,11 @@ function NarratorPanelBody({
 	}, [settingsData?.agent]);
 	const handlePromote = useCallback(() => {
 		promoteMutation.mutate(narratorId, {
-			onSuccess: (data) => {
-				if (data.type === "forked") {
-					notifications.show({
-						message: t("promote_success_forked"),
-						color: "teal",
-					});
-					navigate(ordinaryPromoteDestination(data.narratorId));
-				} else {
-					notifications.show({
-						message: t("promote_success_unlocked"),
-						color: "teal",
-					});
-				}
+			onSuccess: () => {
+				notifications.show({
+					message: t("promote_success_unlocked"),
+					color: "teal",
+				});
 			},
 			onError: (error: Error) => {
 				notifications.show({
@@ -581,7 +570,7 @@ function NarratorPanelBody({
 				});
 			},
 		});
-	}, [promoteMutation, narratorId, t, navigate]);
+	}, [promoteMutation, narratorId, t]);
 
 	/**
 	 * A host that already shows this title and owns the edit / generate actions sets

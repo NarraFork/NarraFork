@@ -4,7 +4,6 @@ import { act, memo } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import * as narratorHooks from "../../../hooks/useNarrator";
 import {
-	ordinaryPromoteDestination,
 	type UseNarratorForkActionsOptions,
 	type UseNarratorForkActionsResult,
 	useNarratorForkActions,
@@ -70,24 +69,11 @@ afterEach(async () => {
 
 async function render(overrides: Partial<UseNarratorForkActionsOptions> = {}) {
 	await act(async () => {
-		root.render(
-			<Probe
-				narratorId="narrator-a"
-				navigateToNarrator={() => {}}
-				{...overrides}
-			/>,
-		);
+		root.render(<Probe narratorId="narrator-a" navigateToNarrator={() => {}} {...overrides} />);
 	});
 }
 
 describe("narrator fork action identity", () => {
-	test("promotion targets the independent narrator URL and missing IDs fail closed", () => {
-		expect(ordinaryPromoteDestination("ordinary-child")).toEqual({
-			to: "/narrators/$narratorId",
-			params: { narratorId: "ordinary-child" },
-		});
-		expect(() => ordinaryPromoteDestination("")).toThrow("missing");
-	});
 	test("inline navigation on unrelated renders does not invalidate memoized rows", async () => {
 		await render();
 		const first = actions.forkHandler;

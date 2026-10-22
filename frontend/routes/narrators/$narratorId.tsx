@@ -306,14 +306,7 @@ function NarratorDetailPage() {
 		} else {
 			navigate({ to: ".." });
 		}
-	}, [
-		fromWorkspace,
-		workspaceId,
-		isSubagent,
-		from,
-		parentNarratorId,
-		navigate,
-	]);
+	}, [fromWorkspace, workspaceId, isSubagent, from, parentNarratorId, navigate]);
 
 	// Mobile drawer: auto-close when the last terminal exits
 	const handleTerminalExit = useCallback(() => {

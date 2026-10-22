@@ -78,11 +78,11 @@ test("worktree list fourth argument encodes pagination and keeps third argument 
 	expect(requests[0]?.input?.signal?.aborted).toBe(true);
 });
 
-test("projectId paginated compatibility filter retains standalone all and cursor", async () => {
-	await api.listNarratorsPaginated({ projectId: "p /1", standalone: "all", cursor: "cursor" });
+test("projectId paginated filter retains the cursor", async () => {
+	await api.listNarratorsPaginated({ projectId: "p /1", cursor: "cursor" });
 	const params = new URL(requests[0]?.url ?? "", "http://localhost").searchParams;
 	expect(params.get("projectId")).toBe("p /1");
-	expect(params.get("standalone")).toBe("all");
+	expect(params.has("standalone")).toBe(false);
 	expect(params.get("cursor")).toBe("cursor");
 });
 test("receipt reconciliation uses the original proposal at a distinct read-only endpoint", async () => {

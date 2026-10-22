@@ -256,8 +256,7 @@ export function GitChangesTab({
 			? t("filter.discardMatchedConfirm", { count: files.length })
 			: t("discardConfirm");
 		if (!canWrite) return;
-		const scope =
-			`\n${t("workspace.scope", { root: target.rootPath })}`;
+		const scope = `\n${t("workspace.scope", { root: target.rootPath })}`;
 		if (!(await confirm({ message: confirmMessage + scope }))) return;
 		if (files) {
 			if (files.length > 0) discard.mutate({ files });
@@ -294,8 +293,7 @@ export function GitChangesTab({
 				section === "unstaged"
 					? async (file) => {
 							if (!canWrite) return;
-							const scope =
-								`\n${t("workspace.scope", { root: target.rootPath })}`;
+							const scope = `\n${t("workspace.scope", { root: target.rootPath })}`;
 							if (await confirm({ message: t("discardFileConfirm", { file }) + scope }))
 								discard.mutate({ files: [file] });
 						}

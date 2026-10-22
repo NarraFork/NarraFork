@@ -28,10 +28,10 @@ import type {
 	WorkspaceModificationView,
 } from "../../hooks/useGit";
 import { __resetGitFolderPrefsCache } from "../../hooks/useGitFolderPrefs";
+import type { GitTarget } from "../../lib/api/git";
 import commonLocale from "../../locales/en/common.json";
 import gitLocale from "../../locales/en/git.json";
 import zhGitLocale from "../../locales/zh-CN/git.json";
-import type { GitTarget } from "../../lib/api/git";
 import { ConfirmDialogProvider } from "../common/ConfirmDialogProvider";
 
 // Isolated i18next instance, for the same reason as GitPanel.test.tsx: sibling suites

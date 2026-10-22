@@ -14,9 +14,8 @@
  *   - The chat toolbar *opens / closes / toggles* tool panels via the dockview
  *     api, without owning it.
  *
- * Everything is optional: outside a provider (workspace page, narraflow graph
- * embed) the publish hooks are no-ops and NarratorPanel keeps its legacy
- * prop-callback behaviour.
+ * Everything is optional: outside a provider (workspace page) the publish hooks
+ * are no-ops and NarratorPanel keeps its legacy prop-callback behaviour.
  */
 
 import type { FileReference, FileReferenceEditorSelection } from "@shared/file-reference";

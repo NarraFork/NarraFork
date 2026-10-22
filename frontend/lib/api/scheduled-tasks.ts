@@ -5,7 +5,10 @@ import type {
 } from "@shared/scheduled-task-cleanup";
 import { request } from "./client";
 
-/** Legacy `"chapter"` tasks are read back by the server as `"project"`. */
+/**
+ * Rows saved before chapters were removed may still report `"chapter"`; the UI treats
+ * anything other than `"standalone"` as a project task, as the server does.
+ */
 export type ScheduledTaskRunContext = "standalone" | "project";
 export type ScheduledTaskNarratorMode = "new" | "reuse";
 export type ScheduledTaskLocale = Locale;

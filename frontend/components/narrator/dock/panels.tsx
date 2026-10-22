@@ -7,7 +7,7 @@
  *   - terminal → NarratorTerminal (with a header bar)
  *   - details  → NarratorDetailsPanel (inline) — props from dock context
  *   - spec     → SpecPanel
- *   - git      → GitPanel (resolves narrator workspace; chapter adapter retained)
+ *   - git      → GitPanel (resolves the narrator workspace)
  *   - browser  → BrowserPanel — session info from dock context
  *
  * Tool panels take their cross-panel state from NarratorDockContext (published
@@ -88,9 +88,7 @@ const NarratorSearchPanel = lazy(() =>
 const NarratorUserChatPanel = lazy(() =>
 	import("../../chat/NarratorUserChatPanel").then((m) => ({ default: m.NarratorUserChatPanel })),
 );
-const GitPanel = lazy(() =>
-	import("../../git/GitPanel").then((m) => ({ default: m.GitPanel })),
-);
+const GitPanel = lazy(() => import("../../git/GitPanel").then((m) => ({ default: m.GitPanel })));
 const FileTreePanel = lazy(() =>
 	import("../file-tree/FileTreePanel").then((m) => ({ default: m.FileTreePanel })),
 );
