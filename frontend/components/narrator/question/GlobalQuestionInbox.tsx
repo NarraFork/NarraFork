@@ -87,7 +87,6 @@ const INERT_FILE_REFERENCES = { context: null } as const;
 /** A global-inbox row: the question plus enough context to say which session it is. */
 export interface GlobalQuestion extends AsyncQuestion {
 	narratorTitle: string | null;
-	chapterId: string | null;
 }
 
 export { globalQuestionsQueryKey } from "../../../hooks/useAsyncQuestions";

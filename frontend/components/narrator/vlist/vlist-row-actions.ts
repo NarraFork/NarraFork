@@ -92,8 +92,6 @@ export interface VListRowHandlers {
 	onOpenKnowledgeEntry?: (entryId: string, scope: "global" | "personal") => void;
 	/** Open the Dynamic Spec panel with one `spec://` file selected. */
 	onOpenSpecFile?: (uri: string) => void;
-	/** Open a chapter (a review's own chapter, a merge's source chapter). */
-	onOpenChapter?: (chapterId: string) => void;
 	/** Detach a running subagent to a background task; absent → item hidden. */
 	onDetachSubagent?: (narratorId: string) => void;
 	/** Detach this running foreground Bash tool call, not a child narrator. */

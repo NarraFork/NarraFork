@@ -89,7 +89,7 @@ const NarratorUserChatPanel = lazy(() =>
 	import("../../chat/NarratorUserChatPanel").then((m) => ({ default: m.NarratorUserChatPanel })),
 );
 const GitPanel = lazy(() =>
-	import("../../chapter/GitPanel").then((m) => ({ default: m.GitPanel })),
+	import("../../git/GitPanel").then((m) => ({ default: m.GitPanel })),
 );
 const FileTreePanel = lazy(() =>
 	import("../file-tree/FileTreePanel").then((m) => ({ default: m.FileTreePanel })),
@@ -297,7 +297,6 @@ function ChatDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams>) {
 							key={narratorId}
 							narratorId={narratorId}
 							compact={compact}
-							onForkFromMessage={dock?.onForkFromMessage ?? undefined}
 							onHeaderPointerDown={onHeaderPointerDown}
 							onViewSubagentSession={dock?.openSubagentPanel}
 							highlightMessageId={dock?.highlightMessageId}
@@ -626,7 +625,6 @@ export function GitDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams
 	const dock = useNarratorDockContext();
 	// Live context is the source of truth (see ChatDockPanel note).
 	const narratorId = dock?.narratorId ?? props.params.narratorId;
-	const chapterId = dock?.chapterId ?? props.params.chapterId;
 	const icon = <IconGitBranch size={16} color="var(--mantine-color-dimmed)" />;
 
 	// Sync Dockview tab title with localization
@@ -637,7 +635,7 @@ export function GitDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams
 		}
 	}, [t, props.api]);
 
-	if (!narratorId && !chapterId) {
+	if (!narratorId) {
 		return (
 			<ToolPanelShell
 				title={t("panel.title")}
@@ -663,7 +661,7 @@ export function GitDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams
 			detachKind="git"
 		>
 			<LazyPanelBoundary>
-				<GitPanel narratorId={narratorId} chapterId={chapterId} />
+				<GitPanel narratorId={narratorId} />
 			</LazyPanelBoundary>
 		</ToolPanelShell>
 	);

@@ -36,8 +36,7 @@ mock.module("./interaction/use-status-bar-props", () => ({ useStatusBarProps: ()
 mock.module("./interaction/use-queued-message-actions", () => ({
 	useQueuedMessageActions: () => ({}),
 }));
-mock.module("./header/ChapterBar", () => ({
-	ChapterBar: () => <div data-region="git" />,
+mock.module("./header/NarratorGitBar", () => ({
 	NarratorGitBar: () => <div data-region="git" />,
 }));
 mock.module("./interaction/QueuedMessageRow", () => ({
@@ -64,40 +63,36 @@ mock.module("./permission/PermissionRuleResultNotice", () => ({
 }));
 const { NarratorInteractionArea } = await import("./NarratorInteractionArea");
 
-for (const chapterId of ["chapter", null]) {
-	test(`${chapterId ? "chapter" : "standalone"} passes image/file resources into the composer without an external attachment strip`, () => {
-		// Control hooks and leaf panels are mocked: only the real area's composition is under test.
-		const props = {
-			common: { narratorId: "n", isWorkspacePreview: false },
-			chapterId,
-			onOpenGitPanel: () => {},
-			attachedImages: [new File(["image"], "image.png")],
-			attachedTextFiles: [new File(["text"], "notes.txt")],
-			queueDeps: { queuedMessages: [{}, {}, {}] },
-			statusBarInputs: {},
-			composerRowProps: {},
-			sendingState: { attachmentCount: 2, progress: 50, canCancel: true },
-			isChapterMerged: false,
-		} as unknown as NarratorInteractionAreaProps;
-		const html = renderToStaticMarkup(<NarratorInteractionArea {...props} />);
-		const regions = [...html.matchAll(/data-region="([^"]+)"/g)].map((match) => match[1]);
-		expect(regions).toEqual(["queue", "git", "status", "upload", "composer"]);
-		expect(html).not.toContain('data-region="attachments"');
-		expect(html).not.toContain('role="separator"');
-		expect(html).not.toContain("ns-resize");
-		expect(html).toContain("pointer-events:none");
-		resizeEnabled = true;
-		try {
-			const enabledHtml = renderToStaticMarkup(<NarratorInteractionArea {...props} />);
-			expect(enabledHtml).toContain('role="separator"');
-			expect(enabledHtml).toContain("cursor:ns-resize");
-		} finally {
-			resizeEnabled = false;
-		}
-		expect(html).toContain('data-images="1"');
-		expect(html).toContain('data-files="1"');
-		expect(html).toContain(
-			'data-region="queue" style="border-top:1px solid var(--mantine-color-default-border)',
-		);
-	});
-}
+test("passes image/file resources into the composer without an external attachment strip", () => {
+	// Control hooks and leaf panels are mocked: only the real area's composition is under test.
+	const props = {
+		common: { narratorId: "n", isWorkspacePreview: false },
+		onOpenGitPanel: () => {},
+		attachedImages: [new File(["image"], "image.png")],
+		attachedTextFiles: [new File(["text"], "notes.txt")],
+		queueDeps: { queuedMessages: [{}, {}, {}] },
+		statusBarInputs: {},
+		composerRowProps: {},
+		sendingState: { attachmentCount: 2, progress: 50, canCancel: true },
+	} as unknown as NarratorInteractionAreaProps;
+	const html = renderToStaticMarkup(<NarratorInteractionArea {...props} />);
+	const regions = [...html.matchAll(/data-region="([^"]+)"/g)].map((match) => match[1]);
+	expect(regions).toEqual(["queue", "git", "status", "upload", "composer"]);
+	expect(html).not.toContain('data-region="attachments"');
+	expect(html).not.toContain('role="separator"');
+	expect(html).not.toContain("ns-resize");
+	expect(html).toContain("pointer-events:none");
+	resizeEnabled = true;
+	try {
+		const enabledHtml = renderToStaticMarkup(<NarratorInteractionArea {...props} />);
+		expect(enabledHtml).toContain('role="separator"');
+		expect(enabledHtml).toContain("cursor:ns-resize");
+	} finally {
+		resizeEnabled = false;
+	}
+	expect(html).toContain('data-images="1"');
+	expect(html).toContain('data-files="1"');
+	expect(html).toContain(
+		'data-region="queue" style="border-top:1px solid var(--mantine-color-default-border)',
+	);
+});

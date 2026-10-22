@@ -30,8 +30,6 @@ export interface ExecutionLogRecord {
 	narratorTitle: string | null;
 	narratorType: string | null;
 	subagentType: string | null;
-	chapterId: string | null;
-	chapterTitle: string | null;
 	projectId: string | null;
 	projectName: string | null;
 }
@@ -62,7 +60,6 @@ export interface ExecutionLogDetail extends ExecutionLogRecord {
 export interface ExecutionLogFilters {
 	narratorId?: string;
 	includeSubagents?: boolean;
-	chapterId?: string;
 	projectId?: string;
 	toolName?: string;
 	status?: ExecutionLogStatus;

@@ -5,7 +5,6 @@ import type { NarratorListItem, NarratorListViewer } from "./NarratorListCard";
 export interface NarratorListSearchParams {
 	sortBy?: string;
 	sortOrder?: string;
-	filter?: string;
 	q?: string;
 	hasTerminals?: boolean;
 	hasContainers?: boolean;
@@ -16,7 +15,6 @@ export interface NarratorListSearchParams {
 export interface NarratorListState {
 	sortBy: string;
 	sortOrder: string;
-	filter: string;
 	localQuery: string;
 	hasTerminals: boolean;
 	hasContainers: boolean;
@@ -30,10 +28,6 @@ interface NarratorListSearchable {
 	cwd?: unknown;
 	model?: unknown;
 	status?: unknown;
-	chapter?: {
-		title?: unknown;
-		projectName?: unknown;
-	} | null;
 }
 
 export const parseBool = (v: unknown) => v === true || v === "true";
@@ -44,7 +38,6 @@ export function validateNarratorListSearch(
 	return {
 		sortBy: typeof search.sortBy === "string" ? search.sortBy : undefined,
 		sortOrder: typeof search.sortOrder === "string" ? search.sortOrder : undefined,
-		filter: typeof search.filter === "string" ? search.filter : undefined,
 		q: typeof search.q === "string" ? search.q : undefined,
 		hasTerminals: parseBool(search.hasTerminals) || undefined,
 		hasContainers: parseBool(search.hasContainers) || undefined,
@@ -57,7 +50,6 @@ export function getNarratorListState(search: NarratorListSearchParams): Narrator
 	return {
 		sortBy: search.sortBy ?? "updatedAt",
 		sortOrder: search.sortOrder ?? "desc",
-		filter: search.filter ?? "all",
 		localQuery: search.q ?? "",
 		hasTerminals: search.hasTerminals ?? false,
 		hasContainers: search.hasContainers ?? false,
@@ -73,7 +65,6 @@ export function normalizeNarratorListSearchPatch<T extends NarratorListSearchPar
 	const next = { ...prev, ...patch };
 	if (next.sortBy === "updatedAt") next.sortBy = undefined;
 	if (next.sortOrder === "desc") next.sortOrder = undefined;
-	if (next.filter === "all") next.filter = undefined;
 	if (!next.q?.trim()) next.q = undefined;
 	if (!next.hasTerminals) next.hasTerminals = undefined;
 	if (!next.hasContainers) next.hasContainers = undefined;
@@ -86,7 +77,6 @@ export function buildNarratorListQueryOptions(state: NarratorListState, status?:
 	return {
 		standalone: "all" as const,
 		...(status ? { status } : {}),
-		filter: state.filter === "all" ? undefined : state.filter,
 		sortBy: state.sortBy,
 		sortOrder: state.sortOrder,
 		hasTerminals: state.hasTerminals || undefined,
@@ -109,8 +99,6 @@ export function filterNarratorsByLocalQuery<T extends NarratorListSearchable>(
 			narrator.cwd,
 			narrator.model,
 			narrator.status,
-			narrator.chapter?.title,
-			narrator.chapter?.projectName,
 		]
 			.filter(Boolean)
 			.some((value) => includesSearch(value, localQuery)),

@@ -1,10 +1,10 @@
-import { Box, Text } from "@mantine/core";
+import { Box } from "@mantine/core";
 import type React from "react";
 import { useTranslation } from "react-i18next";
 import { useLocalPref } from "../../hooks/useLocalPref";
 import { startBottomSpacingResize, useBottomSpacing } from "../../hooks/useResizableBottomSpacing";
 import { NarratorComposerRow, type NarratorComposerRowProps } from "./composer/NarratorComposerRow";
-import { ChapterBar, NarratorGitBar } from "./header/ChapterBar";
+import { NarratorGitBar } from "./header/NarratorGitBar";
 import { NarratorInteractionStatusBar } from "./interaction/NarratorInteractionStatusBar";
 import { QueuedMessagesPanel } from "./interaction/QueuedMessagesPanel";
 import { UploadProgressBar } from "./interaction/UploadProgressBar";
@@ -65,8 +65,7 @@ export interface NarratorInteractionAreaProps {
 	//    `narratorId` comes from `common`, so it is omitted here.
 	queueDeps: Omit<UseQueuedMessageActionsOptions, "t" | "narratorId">;
 
-	// ── ChapterBar ──
-	chapterId?: string | null;
+	// ── Git strip ──
 	onOpenGitPanel?: () => void;
 
 	// ── Status bar — raw inputs; the props are assembled here via useStatusBarProps
@@ -91,9 +90,6 @@ export interface NarratorInteractionAreaProps {
 		| "cancelQueueHold"
 		| "handleQueueClick"
 	>;
-
-	// ── Merged-chapter read-only state ──
-	isChapterMerged: boolean;
 }
 
 export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
@@ -174,18 +170,8 @@ export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 				handleCancelAllQueued={handleCancelAllQueued}
 			/>
 
-			{/* Chapter bar — clicking the info strip opens the Git view. */}
-			{props.chapterId && (
-				<ChapterBar
-					chapterId={props.chapterId}
-					narratorId={props.common.narratorId}
-					onOpenGitPanel={props.onOpenGitPanel}
-					onRequirement={retainWorktreeRequirement}
-				/>
-			)}
-
-			{/* Standalone narrators have no chapter bar; offer the git workspace strip instead. */}
-			{!props.chapterId && props.onOpenGitPanel && (
+			{/* Git workspace strip — clicking it opens the Git view. */}
+			{props.onOpenGitPanel && (
 				<Box style={{ borderBottom: "1px solid var(--mantine-color-default-border)" }}>
 					<NarratorGitBar
 						narratorId={props.common.narratorId}
@@ -205,27 +191,13 @@ export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 			{/* Status bar */}
 			<NarratorInteractionStatusBar
 				{...statusBar}
-				borderTop={props.chapterId || props.onOpenGitPanel ? undefined : statusBar.borderTop}
+				borderTop={props.onOpenGitPanel ? undefined : statusBar.borderTop}
 			/>
 
 			{/* Upload / send progress while attachments upload. */}
 			<UploadProgressBar sendingState={props.sendingState} cancelSending={props.cancelSending} />
 			{/* Input */}
-			{props.common.isWorkspacePreview ? null : props.isChapterMerged ? (
-				<Box
-					px="md"
-					py="sm"
-					style={{
-						flexShrink: 0,
-						backgroundColor: "light-dark(var(--mantine-color-gray-1), var(--mantine-color-dark-6))",
-						opacity: 0.7,
-					}}
-				>
-					<Text size="sm" c="dimmed" ta="center">
-						{t("chapterMergedHint")}
-					</Text>
-				</Box>
-			) : (
+			{props.common.isWorkspacePreview ? null : (
 				<NarratorComposerRow
 					{...props.composerRowProps}
 					attachedImages={props.attachedImages}

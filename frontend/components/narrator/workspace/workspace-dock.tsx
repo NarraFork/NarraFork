@@ -896,7 +896,6 @@ export class WorkspaceDockStore {
 	openToolPanel(
 		narratorId: string,
 		type: NarratorToolPanelType,
-		chapterId: string | null | undefined,
 		sourcePanelId?: string,
 	) {
 		this.openResource(
@@ -904,7 +903,7 @@ export class WorkspaceDockStore {
 			{
 				id: workspaceToolPanelId(narratorId, type),
 				component: PANEL_COMPONENT.narratorTool,
-				params: { panelType: "narrator-tool", toolType: type, narratorId, chapterId },
+				params: { panelType: "narrator-tool", toolType: type, narratorId },
 			},
 			sourcePanelId,
 		);
@@ -1045,12 +1044,11 @@ export class WorkspaceDockStore {
 	toggleToolPanel(
 		narratorId: string,
 		type: NarratorToolPanelType,
-		chapterId: string | null | undefined,
 		sourcePanelId?: string,
 	) {
 		const existing = this.apiRef.current?.getPanel(workspaceToolPanelId(narratorId, type));
 		if (!existing) {
-			this.openToolPanel(narratorId, type, chapterId, sourcePanelId);
+			this.openToolPanel(narratorId, type, sourcePanelId);
 			return;
 		}
 		if (
@@ -1186,14 +1184,6 @@ export function useWorkspaceNarratorDockValue(
 		useCallback(() => (store ? store.getSnapshot(narratorId) : EMPTY_SHARD), [store, narratorId]),
 	);
 
-	// Legacy chapter association for the git tool. The adapter now resolves the
-	// narrator's actual workspace, so standalone and subagent narrators are supported.
-	const { data: narrator } = useNarrator(narratorId);
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON entity
-	const chapterId = (narrator as any)?.chapterId as string | null | undefined;
-	const chapterIdRef = useRef<string | null | undefined>(chapterId);
-	chapterIdRef.current = chapterId;
-
 	// Stable methods (keyed on store + narrator only, NOT on the reactive shard)
 	// so consumers that key effects on callback identity — e.g. NarratorPanel's
 	// details / browser publish effects — don't re-run on every shard
@@ -1227,7 +1217,7 @@ export function useWorkspaceNarratorDockValue(
 				if (api) store.refreshOpenToolTypes(api);
 			},
 			openToolPanel: (type: NarratorToolPanelType) =>
-				store.openToolPanel(narratorId, type, chapterIdRef.current, sourcePanelId),
+				store.openToolPanel(narratorId, type, sourcePanelId),
 			openSubagentPanel: (subagentNarratorId: string, messageId?: string) =>
 				store.openSubagentPanel(narratorId, subagentNarratorId, messageId, sourcePanelId),
 			openFilePanel: (filePath: string, fileName?: string, options?: FileOpenOptions) =>
@@ -1239,7 +1229,7 @@ export function useWorkspaceNarratorDockValue(
 				store.openKnowledgePanel(narratorId, entryId, scope, sourcePanelId),
 			closeToolPanel: (type: NarratorToolPanelType) => store.closeToolPanel(narratorId, type),
 			toggleToolPanel: (type: NarratorToolPanelType) =>
-				store.toggleToolPanel(narratorId, type, chapterIdRef.current, sourcePanelId),
+				store.toggleToolPanel(narratorId, type, sourcePanelId),
 		};
 	}, [store, narratorId, sourcePanelId]);
 
@@ -1247,9 +1237,7 @@ export function useWorkspaceNarratorDockValue(
 		if (!store || !methods) return null;
 		return {
 			narratorId,
-			chapterId,
 			// Workspace does not wire page-level navigation or deep-link highlight.
-			onForkFromMessage: null,
 			highlightMessageId: undefined,
 			onBack: null,
 			onMinimize: null,
@@ -1260,5 +1248,5 @@ export function useWorkspaceNarratorDockValue(
 			openToolTypes: shard.openToolTypes,
 			...methods,
 		};
-	}, [store, methods, narratorId, chapterId, shard]);
+	}, [store, methods, narratorId, shard]);
 }

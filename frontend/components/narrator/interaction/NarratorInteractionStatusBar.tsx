@@ -96,7 +96,6 @@ export interface NarratorInteractionStatusBarProps {
 		permissionMode?: string | null;
 		totalCostUsd?: number | null;
 		isAskInPassing?: boolean | null;
-		chapterId?: string | null;
 	};
 	ownsHorizontalSafeArea?: boolean;
 	borderTop?: string;
@@ -919,11 +918,7 @@ export function NarratorInteractionStatusBar(props: NarratorInteractionStatusBar
 												</Tooltip>
 												{promote.show && (
 													<Tooltip
-														label={
-															narrator.chapterId
-																? t("promote_chapter_hint")
-																: t("promote_standalone_hint")
-														}
+														label={t("promote_standalone_hint")}
 													>
 														<Button
 															size="xs"

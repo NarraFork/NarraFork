@@ -87,7 +87,6 @@ function sameSessionContext(a: PluginUiSessionContext, b: PluginUiSessionContext
 		a.workspaceId === b.workspaceId &&
 		a.projectId === b.projectId &&
 		a.narratorId === b.narratorId &&
-		a.chapterId === b.chapterId &&
 		a.presentation === b.presentation
 	);
 }

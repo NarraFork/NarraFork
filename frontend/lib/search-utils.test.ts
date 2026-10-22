@@ -31,7 +31,7 @@ describe("normalizeSearchType", () => {
 	});
 
 	test("still normalizes the plural entity names and unknown input", () => {
-		expect(normalizeSearchType("chapters")).toBe("chapter");
+		expect(normalizeSearchType("chapters")).toBe("all");
 		expect(normalizeSearchType("narrators")).toBe("narrator");
 		expect(normalizeSearchType("messages")).toBe("message");
 		expect(normalizeSearchType(undefined)).toBe("all");
@@ -44,15 +44,15 @@ describe("summarizeSearchRuntimeState", () => {
 		const status = summarizeSearchRuntimeState({
 			results: [],
 			degraded: true,
-			fallbacks: [{ entity: "chapters", from: "fts5", to: "like", reason: "fts_query_failed" }],
+			fallbacks: [{ entity: "narrators", from: "fts5", to: "like", reason: "fts_query_failed" }],
 			searchMetadata: {
 				degraded: true,
 				mode: "degraded-like-fallback",
 				ftsReady: false,
 				shortQuery: false,
-				requestedEntities: ["chapters"],
+				requestedEntities: ["narrators"],
 				fallbacks: [
-					{ entity: "chapters", from: "fts5", to: "like", reason: "fts_query_failed" },
+					{ entity: "narrators", from: "fts5", to: "like", reason: "fts_query_failed" },
 					{ entity: "messages", from: "fts5", to: "like", message: "message fallback" },
 				],
 			},
@@ -62,7 +62,7 @@ describe("summarizeSearchRuntimeState", () => {
 			degraded: true,
 			mode: "degraded-like-fallback",
 			fallbackMessages: [
-				"chapters: fts_query_failed (fts5 → like)",
+				"narrators: fts_query_failed (fts5 → like)",
 				"messages: message fallback (fts5 → like)",
 			],
 		});
@@ -81,7 +81,7 @@ describe("summarizeSearchRuntimeState", () => {
 
 	test("tolerates additive backend metadata on ready Search responses", () => {
 		const status = summarizeSearchRuntimeState({
-			results: [{ type: "chapter", id: "c1", title: "Ready chapter" }],
+			results: [{ type: "narrator", id: "n1", title: "Ready narrator" }],
 			degraded: false,
 			fallbacks: [],
 			searchMetadata: {
@@ -89,7 +89,7 @@ describe("summarizeSearchRuntimeState", () => {
 				mode: "fts5-with-like-fallback",
 				ftsReady: true,
 				shortQuery: false,
-				requestedEntities: ["chapters", "messages", "narrators"],
+				requestedEntities: ["messages", "narrators"],
 				fallbacks: [],
 				backendDiagnostic: "safe-to-ignore",
 			},

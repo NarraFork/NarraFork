@@ -29,7 +29,6 @@ import {
 const linkStyle = { textDecoration: "none", color: "inherit" } as const;
 /** Badge color per result type; unknown types fall back to grape. */
 const RESULT_TYPE_COLORS: Record<string, string> = {
-	chapter: "blue",
 	narrator: "indigo",
 	message: "grape",
 	knowledge: "teal",
@@ -55,23 +54,13 @@ function getResultLink(
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	result: any,
 ): { to: string; params: Record<string, string>; hash?: string } | null {
-	if (result.type === "chapter") {
-		return { to: "/chapters/$chapterId", params: { chapterId: result.id } };
-	}
 	if (result.type === "message") {
 		const hash = `msg-${result.id}`;
-		// Prefer direct narrator link — the /chapters/ route is a redirect that loses the hash
 		if (result.narratorId) {
 			return { to: "/narrators/$narratorId", params: { narratorId: result.narratorId }, hash };
 		}
-		if (result.chapterId) {
-			return { to: "/chapters/$chapterId", params: { chapterId: result.chapterId }, hash };
-		}
 	}
 	if (result.type === "narrator") {
-		if (result.chapterId) {
-			return { to: "/chapters/$chapterId", params: { chapterId: result.chapterId } };
-		}
 		return { to: "/narrators/$narratorId", params: { narratorId: result.id } };
 	}
 	if (result.type === "knowledge") {
@@ -98,7 +87,7 @@ export const Route = createFileRoute("/search")({
 function SearchPage() {
 	const { q, type = "all", sort = DEFAULT_SEARCH_SORT } = Route.useSearch();
 	const navigate = Route.useNavigate();
-	const { data, isLoading } = useSearch(q ?? "", "chapters,messages,narrators,knowledge", sort);
+	const { data, isLoading } = useSearch(q ?? "", "messages,narrators,knowledge", sort);
 	const { t } = useTranslation("search");
 	const searchRuntimeStatus = useMemo(() => summarizeSearchRuntimeState(data), [data]);
 	const translateSearchEnum = (prefix: string, value: string) =>
@@ -115,9 +104,6 @@ function SearchPage() {
 			(acc, result) => {
 				acc.all += 1;
 				switch (result.type) {
-					case "chapter":
-						acc.chapter += 1;
-						break;
 					case "narrator":
 						acc.narrator += 1;
 						break;
@@ -130,7 +116,7 @@ function SearchPage() {
 				}
 				return acc;
 			},
-			{ all: 0, chapter: 0, narrator: 0, message: 0, knowledge: 0 },
+			{ all: 0, narrator: 0, message: 0, knowledge: 0 },
 		);
 	}, [data?.results]);
 	const displayedResults = useMemo(() => results.slice(0, MAX_VISIBLE_RESULTS), [results]);
@@ -147,7 +133,6 @@ function SearchPage() {
 					) ?? "",
 				snippet: clampSearchText(result.snippet, MAX_SEARCH_SNIPPET_CHARS),
 				projectName: clampSearchText(result.projectName, MAX_SEARCH_META_CHARS),
-				chapterTitle: clampSearchText(result.chapterTitle, MAX_SEARCH_META_CHARS),
 				narratorTitle: clampSearchText(result.narratorTitle, MAX_SEARCH_META_CHARS),
 				collectionName: clampSearchText(result.collectionName, MAX_SEARCH_META_CHARS),
 				timestamp: result.updatedAt ?? result.createdAt ?? result.lastMessageAt,
@@ -195,7 +180,6 @@ function SearchPage() {
 						}
 						data={[
 							{ value: "all", label: t("typeAll", { count: counts.all }) },
-							{ value: "chapter", label: t("typeChapter", { count: counts.chapter }) },
 							{ value: "narrator", label: t("typeNarrator", { count: counts.narrator }) },
 							{ value: "message", label: t("typeMessage", { count: counts.message }) },
 							{ value: "knowledge", label: t("typeKnowledge", { count: counts.knowledge }) },
@@ -256,7 +240,6 @@ function SearchPage() {
 							title,
 							snippet,
 							projectName,
-							chapterTitle,
 							narratorTitle,
 							collectionName,
 							timestamp,
@@ -287,7 +270,6 @@ function SearchPage() {
 									</Text>
 									<Group gap={6} wrap="wrap">
 										{projectName && <Badge variant="outline">{projectName}</Badge>}
-										{chapterTitle && <Badge variant="light">{chapterTitle}</Badge>}
 										{narratorTitle && <Badge variant="light">{narratorTitle}</Badge>}
 										{collectionName && (
 											<Badge variant="outline" color="teal">

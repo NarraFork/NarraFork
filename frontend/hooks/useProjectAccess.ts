@@ -30,9 +30,8 @@ export function installProjectAccessListener() {
 			queryClient.invalidateQueries({ queryKey: projectAccessKeys.access(projectId) });
 		}
 		// Membership decides which projects appear in whose list, and the project gate
-		// sits above chapters and sessions, so those lists are refreshed too.
+		// sits above sessions, so those lists are refreshed too.
 		queryClient.invalidateQueries({ queryKey: ["projects"] });
-		queryClient.invalidateQueries({ queryKey: ["chapters"] });
 		queryClient.invalidateQueries({ queryKey: ["narrators"] });
 	});
 }

@@ -83,9 +83,9 @@ function NarratorCell({ record }: { record: ExecutionLogRecord }) {
 					</Badge>
 				) : null}
 			</Group>
-			{record.chapterTitle || record.projectName ? (
+			{record.projectName ? (
 				<Text size="xs" c="dimmed" lineClamp={1}>
-					{[record.projectName, record.chapterTitle].filter(Boolean).join(" · ")}
+					{record.projectName}
 				</Text>
 			) : (
 				<Text size="xs" c="dimmed">

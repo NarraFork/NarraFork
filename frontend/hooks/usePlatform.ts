@@ -365,41 +365,6 @@ export function useChapterContainersCapability(): ChapterContainersCapability {
 	return CHAPTER_CONTAINERS_SUPPORTED;
 }
 
-// === chapters: batch merge ===
-
-const CHAPTER_BATCH_MERGE_CAPABILITY: {
-	supported: boolean;
-	reason?: string;
-	mode?: string;
-	startRouteSupported: boolean;
-	sessionRouteSupported: boolean;
-	mergeSessionIdResponse: boolean;
-	targetChapterIdResponse: boolean;
-	createdTargetResponse: boolean;
-	statusResponse: boolean;
-	decisionWs: boolean;
-	staleSessionCleanup: boolean;
-	createdTargetRollback: boolean;
-	frontendCompletionMode?: string;
-	events: string[];
-} = Object.freeze({
-	supported: true,
-	startRouteSupported: true,
-	sessionRouteSupported: true,
-	mergeSessionIdResponse: true,
-	targetChapterIdResponse: true,
-	createdTargetResponse: true,
-	statusResponse: true,
-	decisionWs: true,
-	staleSessionCleanup: true,
-	createdTargetRollback: true,
-	events: [] as string[],
-});
-
-export function useChapterBatchMergeCapability(): typeof CHAPTER_BATCH_MERGE_CAPABILITY {
-	return CHAPTER_BATCH_MERGE_CAPABILITY;
-}
-
 // === chapters: split ===
 
 /**

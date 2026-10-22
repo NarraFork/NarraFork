@@ -23,8 +23,8 @@ import type { Direction, SerializedDockview } from "dockview-react";
  * Remove narrator/chapter identity from every panel's serialized params.
  *
  * Panels derive their host identity from the live page context (the focus page's
- * `NarratorDockProvider`, a workspace shard, a graph node's provider), NOT from
- * serialized params, so persisting `narratorId`/`chapterId` is (a) useless and
+ * `NarratorDockProvider`, a workspace shard), NOT from serialized params, so
+ * persisting `narratorId` (or a legacy `chapterId`) is (a) useless and
  * (b) the source of the "open A, see B" bug: a baked id could resurface on a
  * different narrator's surface.
  *

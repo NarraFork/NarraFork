@@ -14,7 +14,6 @@ import { IconAlertTriangle, IconPlugConnected, IconRefresh, IconTrash } from "@t
 import type { IDockviewPanelProps } from "dockview-react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef } from "react";
 import { useTranslation } from "react-i18next";
-import { useChapter } from "../../hooks/useChapters";
 import { useNarrator } from "../../hooks/useNarrator";
 import { pluginContributionStore } from "./PluginContributionStore";
 import { PluginPanelSlot } from "./PluginUiRuntimeProvider";
@@ -165,19 +164,11 @@ export function PluginDockPanelView({
 	const lastAppliedTitleRef = useRef<string | null>(null);
 	const ownerNarratorId = params ? surface?.resolveOwnerNarratorId(params) : undefined;
 	const { data: ownerNarrator } = useNarrator(ownerNarratorId ?? "");
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic narrator API entity
-	const ownerChapterId = (ownerNarrator as any)?.chapterId as string | null | undefined;
-	const { data: ownerChapter } = useChapter(ownerChapterId ?? "");
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic chapter API entity
-	const ownerProjectId = (ownerChapter as any)?.projectId as string | undefined;
+	const ownerProjectId = ownerNarrator?.contextProjectId ?? undefined;
 	useEffect(() => {
 		if (!surface || !ownerNarratorId) return;
-		surface.registerNarratorContext({
-			narratorId: ownerNarratorId,
-			chapterId: ownerChapterId,
-			projectId: ownerProjectId,
-		});
-	}, [surface, ownerNarratorId, ownerChapterId, ownerProjectId]);
+		surface.registerNarratorContext({ narratorId: ownerNarratorId, projectId: ownerProjectId });
+	}, [surface, ownerNarratorId, ownerProjectId]);
 	const sessionContext = params ? surface?.resolveSessionContext(params) : undefined;
 	const remove = useCallback(() => hostApi.close(), [hostApi]);
 

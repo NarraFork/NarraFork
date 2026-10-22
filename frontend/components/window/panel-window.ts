@@ -51,7 +51,6 @@ const pluginWindowHostContextSchema = z
 		surface: z.enum(["focus", "graph", "workspace", "director", "settings", "provider-settings"]),
 		workspaceId: contextIdSchema.optional(),
 		narratorId: contextIdSchema.optional(),
-		chapterId: contextIdSchema.nullable().optional(),
 		projectId: contextIdSchema.optional(),
 		presentation: z.enum(["grid", "director"]).optional(),
 	})
@@ -63,15 +62,14 @@ const pluginWindowHostContextSchema = z
  * narrator-bound and the workspace config-bound shapes.
  */
 export type PanelWindowDescriptor =
-	| { panelType: "chat"; narratorId: string; chapterId?: string | null }
-	| { panelType: "terminal"; narratorId: string; chapterId?: string | null }
+	| { panelType: "chat"; narratorId: string }
+	| { panelType: "terminal"; narratorId: string }
 	| { panelType: "terminal"; terminalConfig: TerminalLeafConfig }
 	| { panelType: "webview"; webviewConfig: WebviewLeafConfig }
 	| {
 			panelType: "narrator-tool";
 			toolType: NarratorToolPanelType;
 			narratorId: string;
-			chapterId?: string | null;
 	  }
 	| {
 			panelType: "subagent";
@@ -99,7 +97,6 @@ export type PanelWindowDescriptor =
 	| {
 			panelType: Exclude<NarratorToolPanelType, "terminal" | "mock">;
 			narratorId: string;
-			chapterId?: string | null;
 	  }
 	| PluginPanelWindowDescriptor;
 
@@ -114,22 +111,16 @@ function str(value: unknown): string | undefined {
 	return typeof value === "string" && value.length > 0 ? value : undefined;
 }
 
-function strOrNull(value: unknown): string | null | undefined {
-	return value === null ? null : str(value);
-}
-
 function narratorBound(
 	panelType: NarratorToolPanelType,
 	value: Record<string, unknown>,
 ): PanelWindowDescriptor | null {
 	const narratorId = str(value.narratorId);
 	if (!narratorId || panelType === "mock") return null;
-	const chapterId = strOrNull(value.chapterId);
-	const extra = chapterId !== undefined ? { chapterId } : {};
 	// The split return is for TS narrowing: "terminal" and the rest are distinct
 	// union members even though their shapes are identical here.
-	if (panelType === "terminal") return { panelType, narratorId, ...extra };
-	return { panelType, narratorId, ...extra };
+	if (panelType === "terminal") return { panelType, narratorId };
+	return { panelType, narratorId };
 }
 
 /**
@@ -153,8 +144,7 @@ function normalizeDescriptor(value: unknown): PanelWindowDescriptor | null {
 	if (panelType === "chat" || panelType === "narrator") {
 		const narratorId = str(value.narratorId);
 		if (!narratorId) return null;
-		const chapterId = strOrNull(value.chapterId);
-		return { panelType: "chat", narratorId, ...(chapterId !== undefined ? { chapterId } : {}) };
+		return { panelType: "chat", narratorId };
 	}
 
 	switch (panelType) {
@@ -209,7 +199,6 @@ function normalizeDescriptor(value: unknown): PanelWindowDescriptor | null {
 				const config = value.terminalConfig;
 				const terminalConfig: TerminalLeafConfig = {
 					...(str(config.narratorId) ? { narratorId: str(config.narratorId) } : {}),
-					...(str(config.chapterId) ? { chapterId: str(config.chapterId) } : {}),
 					...(str(config.cwd) ? { cwd: str(config.cwd) } : {}),
 				};
 				return { panelType: "terminal", terminalConfig };
@@ -221,13 +210,7 @@ function normalizeDescriptor(value: unknown): PanelWindowDescriptor | null {
 			const narratorId = str(value.narratorId);
 			if (!toolType || toolType === "mock" || !isNarratorToolPanelType(toolType) || !narratorId)
 				return null;
-			const chapterId = strOrNull(value.chapterId);
-			return {
-				panelType: "narrator-tool",
-				toolType,
-				narratorId,
-				...(chapterId !== undefined ? { chapterId } : {}),
-			};
+			return { panelType: "narrator-tool", toolType, narratorId };
 		}
 		case "plugin": {
 			// Window-only metadata and known dock membership are not plugin params.
@@ -238,7 +221,10 @@ function normalizeDescriptor(value: unknown): PanelWindowDescriptor | null {
 			const plugin = parsePluginDockPanelParams(params);
 			if (!plugin) return null;
 			if (value.hostContext === undefined) return plugin;
-			const context = pluginWindowHostContextSchema.safeParse(value.hostContext);
+			// Links minted before chapters were retired may still carry a chapterId.
+			const rawHost = isRecord(value.hostContext) ? { ...value.hostContext } : value.hostContext;
+			if (isRecord(rawHost)) delete rawHost.chapterId;
+			const context = pluginWindowHostContextSchema.safeParse(rawHost);
 			if (!context.success) return null;
 			const host = context.data;
 			if ((host.surface === "focus" || host.surface === "graph") && !host.narratorId) return null;
@@ -370,12 +356,9 @@ export function recentTabWindowHref(tab: {
 			// directly (the "subagent" panel kind is for embedding beside its host).
 			return buildPanelWindowBrowserHref({ panelType: "chat", narratorId: tab.id });
 		case "chapter":
+			// Legacy chapter tabs open their narrator.
 			return tab.narratorId
-				? buildPanelWindowBrowserHref({
-						panelType: "chat",
-						narratorId: tab.narratorId,
-						chapterId: tab.id,
-					})
+				? buildPanelWindowBrowserHref({ panelType: "chat", narratorId: tab.narratorId })
 				: null;
 		case "workspace":
 			return assetUrl(`/windows/workspaces/${encodeURIComponent(tab.id)}`);

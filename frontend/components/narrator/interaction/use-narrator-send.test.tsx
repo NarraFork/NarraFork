@@ -99,7 +99,6 @@ beforeEach(() => {
 		canContinueNarrator: false,
 		fetchedNarrator: null,
 		narrator: null,
-		chapterWorktreePath: null,
 		currentUser: null,
 		enterQueueMode: "interrupt",
 		ctrlEnterQueueMode: "tool",

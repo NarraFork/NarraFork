@@ -44,7 +44,6 @@ import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } fro
 import { useTranslation } from "react-i18next";
 import { resolveSwipeAnchorOffScreen } from "../../hooks/scroll-parent";
 import { useCurrentUser } from "../../hooks/useAuth";
-import { useChapter } from "../../hooks/useChapters";
 import { useChatUnread, useNarratorChatRoom } from "../../hooks/useChat";
 import { useDeepSeekBalance } from "../../hooks/useDeepSeekBalance";
 import { useFirstScreenActivity } from "../../hooks/useFirstScreenActivity";
@@ -123,7 +122,7 @@ import { SelectionPopover } from "../common/SelectionPopover";
 import { TruncatedPath } from "../common/TruncatedPath";
 import { buildPluginDockPanelOpenRequest } from "../plugins/PluginContributionPicker";
 import { usePluginUiSurface } from "../plugins/PluginUiSurfaceContext";
-import { NarratorCompatibilityModal } from "../project/NarratorCompatibilityEntry";
+import { NarratorProjectSettingsModal } from "../project/NarratorProjectSettings";
 import {
 	BackgroundTasksDrawerHost,
 	useBackgroundTasksButton,
@@ -274,7 +273,6 @@ export const NarratorPanel = createResponsiveNarratorPanel<NarratorPanelProps>(N
 function NarratorPanelBody({
 	narratorId,
 	narrator: narratorProp,
-	onForkFromMessage,
 	highlightMessageId,
 	highlightRequestId,
 	onSendToTerminal,
@@ -317,15 +315,7 @@ function NarratorPanelBody({
 	// Effective sidebar callbacks: prefer explicit props, else route through dock.
 	const effOnDetailsPropsChange = onDetailsPropsChange ?? dock?.setDetailsProps;
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	const chapterId = (narrator as any)?.chapterId as string | null | undefined;
-	const { data: chapterData } = useChapter(chapterId ?? "");
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	const projectId = (chapterData as any)?.projectId as string | undefined;
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	const chapterStatus = (chapterData as any)?.status as string | undefined;
-	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-	const chapterWorktreePath = (chapterData as any)?.worktreePath as string | null | undefined;
-	const isChapterMerged = chapterStatus === "merged";
+	const projectId = ((narrator as any)?.contextProjectId as string | null | undefined) ?? undefined;
 	const createNarratorMutation = useCreateNarrator();
 	const updateConclusionMutation = useUpdateSubagentConclusion();
 	const takeoverMutation = useTakeoverSubagent();
@@ -594,11 +584,10 @@ function NarratorPanelBody({
 	}, [promoteMutation, narratorId, t, navigate]);
 
 	/**
-	 * A chapter node's header already shows this title and owns the edit / generate
-	 * actions, so drawing them again here is not just redundant — this header's dozen
-	 * tool buttons squeezed the title to zero width, leaving the node with a header
-	 * full of icons and no readable title at all. The whole title block is dropped in
-	 * that case, which also hands its width to the tool row.
+	 * A host that already shows this title and owns the edit / generate actions sets
+	 * `hostOwnsTitle`; drawing them again would squeeze the title to zero width
+	 * behind this header's tool buttons. The whole title block is dropped in that
+	 * case, which also hands its width to the tool row.
 	 *
 	 * The editing state below stays wired up: every other surface (focus page,
 	 * workspace, detached subagent panel) still renders this block.
@@ -613,13 +602,11 @@ function NarratorPanelBody({
 
 	// Single predicate for the leading chrome slot: the layout budget
 	// (`showBack`) and the render branch below must never disagree. A
-	// host-provided `onBack` (subagent → parent, workspace origin) wins over
-	// the chapterId surrender — subagents inherit the parent's chapterId, and
-	// without this their header has no way back at all.
+	// host-provided `onBack` (subagent → parent, workspace origin) is shown
+	// whenever there is somewhere to go back to.
 	const showLeadingChrome = showHeaderLeadingChrome({
 		isWorkspacePreview,
 		onMinimize,
-		chapterId,
 		onBack,
 	});
 
@@ -1546,8 +1533,8 @@ function NarratorPanelBody({
 	// context (focus page) or the workspace shard store.
 	const dockApiRef = dock?.apiRef;
 	useEffect(() => {
-		pluginSurface?.registerNarratorContext({ narratorId, chapterId, projectId });
-	}, [pluginSurface, narratorId, chapterId, projectId]);
+		pluginSurface?.registerNarratorContext({ narratorId, projectId });
+	}, [pluginSurface, narratorId, projectId]);
 	const openPluginPanel = useCallback(
 		(pick: {
 			pluginId: string;
@@ -1560,7 +1547,6 @@ function NarratorPanelBody({
 				workspaceDock.openPluginPanel(narratorId, pick, {
 					...pluginSurface.hostContext,
 					narratorId,
-					chapterId,
 					projectId,
 				});
 				return;
@@ -1589,13 +1575,13 @@ function NarratorPanelBody({
 			const request = buildPluginDockPanelOpenRequest({
 				pick,
 				hostContext: pluginSurface
-					? { ...pluginSurface.hostContext, narratorId, chapterId, projectId }
+					? { ...pluginSurface.hostContext, narratorId, projectId }
 					: undefined,
 				panels: api.panels,
 			});
 			api.addPanel(request);
 		},
-		[dockApiRef, pluginSurface, narratorId, chapterId, projectId, workspaceDock],
+		[dockApiRef, pluginSurface, narratorId, projectId, workspaceDock],
 	);
 
 	// ── Asynchronous questions (AskUserQuestion with `async: true`) ──────────
@@ -1847,22 +1833,18 @@ function NarratorPanelBody({
 		narratorIsIdle &&
 		retryRecoveryAllowsContinue;
 
-	const hasChapter = !!narrator?.chapterId;
-
 	// --- Fork + ask-in-passing handlers ---
 	// Kept lifted here: the resolved handlers feed the trace-row action context
 	// memo below, consumed by descendants.
 	const { forkHandler, handleAskInPassing } = useNarratorForkActions({
 		narratorId,
-		chapterId: narrator?.chapterId,
-		onForkFromMessage,
 		navigateToNarrator: (id: string) =>
 			navigate({ to: "/narrators/$narratorId", params: { narratorId: id } }),
 	});
 
 	// Slash-command handlers for /fork and /compact, mirroring the manual
 	// controls exactly: fork from the latest real message (its right-click fork
-	// action — chapter-bound narrators open the same host fork flow), and trigger
+	// action), and trigger
 	// a compaction (the context-ring "compact now" action, with the same
 	// capability gating handleCompactBefore applies).
 	const handleForkCommand = useCallback(() => {
@@ -1984,7 +1966,7 @@ function NarratorPanelBody({
 	/** Off-dock host state for the background-tasks drawer. */
 	const [mobileTasksOpen, setMobileTasksOpen] = useState(false);
 	/**
-	 * Compatibility modal state lives here, not in the overflow menu: the menu's
+	 * Project settings modal state lives here, not in the overflow menu: the menu's
 	 * dropdown unmounts on close and would take a nested modal down with it.
 	 */
 	const [compatibilityOpen, setCompatibilityOpen] = useState(false);
@@ -1992,8 +1974,7 @@ function NarratorPanelBody({
 	 * Only an explicit project context gets the menu entry: without one the modal
 	 * is just a directory of links, which is noise in the toolbar menu.
 	 */
-	const compatibilityProjectId =
-		workspaceContext?.contextProjectId ?? projectId ?? narrator?.contextProjectId;
+	const compatibilityProjectId = workspaceContext?.contextProjectId ?? projectId;
 	/** Stable identity so HeaderToolbar's memo is not busted every render. */
 	const openCompatibility = useCallback(() => setCompatibilityOpen(true), []);
 	useMobileDrawerHistory(useInternalSpec && internalSpecOpen, () => setInternalSpecOpen(false));
@@ -2110,19 +2091,6 @@ function NarratorPanelBody({
 		[openSpecTool, narratorId],
 	);
 
-	/**
-	 * Open a chapter referenced by a review-feedback / merge-summary row.
-	 *
-	 * Always a route: a chapter is not a panel kind, so there is no in-surface
-	 * destination to prefer over navigation.
-	 */
-	const handleOpenChapter = useCallback(
-		(chapterId: string) => {
-			navigate({ to: "/chapters/$chapterId", params: { chapterId } });
-		},
-		[navigate],
-	);
-
 	const handleDetachSubagent = useCallback(async (subagentNarratorId: string) => {
 		try {
 			await api.detachSubagent(subagentNarratorId);
@@ -2209,7 +2177,6 @@ function NarratorPanelBody({
 			// the destination, which leaves those rows inert rather than dead-clickable.
 			onOpenKnowledgeEntry: handleOpenKnowledgeEntry,
 			onOpenSpecFile: handleOpenSpecFile,
-			onOpenChapter: handleOpenChapter,
 		}),
 		[
 			forkHandler,
@@ -2234,7 +2201,6 @@ function NarratorPanelBody({
 			handleOpenFilePanel,
 			handleOpenKnowledgeEntry,
 			handleOpenSpecFile,
-			handleOpenChapter,
 		],
 	);
 
@@ -2644,7 +2610,6 @@ function NarratorPanelBody({
 		canContinueNarrator,
 		fetchedNarrator,
 		narrator,
-		chapterWorktreePath,
 		currentUser,
 		enterQueueMode: userPrefs?.enterQueueMode ?? "turn",
 		ctrlEnterQueueMode: userPrefs?.ctrlEnterQueueMode ?? "tool",
@@ -3076,7 +3041,6 @@ function NarratorPanelBody({
 		relaxedPlanForced,
 		relaxedPlanMutation,
 		isAskInPassing: narrator.isAskInPassing,
-		chapterId: narrator.chapterId,
 		promoteMutation,
 		handlePromote,
 	});
@@ -3175,7 +3139,7 @@ function NarratorPanelBody({
 																	params: { narratorId },
 																	search: workspaceId
 																		? { from: "workspace", workspaceId }
-																		: { from: "graph" },
+																		: undefined,
 																})
 															}
 														>
@@ -3312,7 +3276,7 @@ function NarratorPanelBody({
 						onClose={closeCompactSummaryModal}
 					/>
 
-					<NarratorCompatibilityModal
+					<NarratorProjectSettingsModal
 						projectId={compatibilityProjectId}
 						opened={compatibilityOpen}
 						onClose={() => setCompatibilityOpen(false)}
@@ -3398,7 +3362,6 @@ function NarratorPanelBody({
 															onSelectionResolverChange={setChunkSelectionResolver}
 															rowHandlers={vlistRowHandlers}
 															permCb={permCbWithAsyncQuestions}
-															hasChapter={hasChapter}
 															highlightMessageId={highlightMessageId}
 															highlightRequestId={highlightRequestId}
 															tailFooter={messageListTailFooter}
@@ -3566,7 +3529,6 @@ function NarratorPanelBody({
 							queuedCancelRef,
 							queuedRetryRef,
 						}}
-						chapterId={narrator.chapterId}
 						onOpenGitPanel={
 							isWorkspacePreview
 								? undefined
@@ -3574,7 +3536,6 @@ function NarratorPanelBody({
 									? () => dock.openToolPanel("git")
 									: () => setMobileToolPanel("git")
 						}
-						isChapterMerged={isChapterMerged}
 						statusBarInputs={{
 							ownsHorizontalSafeArea,
 							borderTop:
@@ -3867,7 +3828,6 @@ function NarratorPanelBody({
 								kind={mobileToolPanel}
 								onClose={() => setMobileToolPanel(null)}
 								narratorId={narratorId}
-								chapterId={chapterId}
 								browserSessionCount={wsState.browserSessionCount}
 								browserVisualChange={wsState.browserVisualChange}
 								// Replaces the dock's `scrollToMessage` / `submitToNarrator` bridges,

@@ -12,9 +12,7 @@ export type PanelType = "narrator" | "terminal" | "webview";
 export interface TerminalLeafConfig {
 	/** Bind to a narrator's terminal list */
 	narratorId?: string;
-	/** Bind to a chapter's terminal list */
-	chapterId?: string;
-	/** Standalone terminal CWD (when neither narratorId nor chapterId) */
+	/** Standalone terminal CWD (when no narratorId) */
 	cwd?: string;
 }
 

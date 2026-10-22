@@ -112,7 +112,7 @@ export const miscApi = {
 	// Search
 	search: (
 		q: string,
-		entities = "chapters,messages",
+		entities = "messages",
 		sort?: "time" | "relevance",
 		signal?: AbortSignal,
 	) =>

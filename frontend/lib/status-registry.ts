@@ -4,7 +4,7 @@
  *
  * Usage:
  *   import { statusRegistry } from "@frontend/lib/status-registry";
- *   const { color, icon, i18nKey } = statusRegistry.chapterStatus("active");
+ *   const { color, icon, i18nKey } = statusRegistry.narratorStatus("idle");
  */
 
 // ---------------------------------------------------------------------------
@@ -61,7 +61,7 @@ export type StatusEntry = {
  * The closed vocabulary of status shapes.
  *
  * Deliberately semantic rather than pictorial: a surface picks its own glyph, so the
- * sidebar can use Tabler's filled check while the Pixi ruler draws geometry, without
+ * sidebar can use Tabler's filled check while another surface draws geometry, without
  * either one hard-coding the mapping twice.
  */
 export type StatusShape =
@@ -80,42 +80,6 @@ type StatusMap<K extends string = string> = Record<K, StatusEntry>;
  * bar's derived display) can use them too.
  */
 export type StatusAccent = Pick<StatusEntry, "color" | "accentShade">;
-
-// ---------------------------------------------------------------------------
-// Chapter Status
-// ---------------------------------------------------------------------------
-
-/**
- * `frozen` is kept on the display side only.
- *
- * The server stopped producing it (see the note on `chapters.status` in
- * `server/db/schema.ts`), but this map is what renders a status badge, and a
- * missing entry would throw on any row that still carries the old value — from a
- * project database written by an older build, for instance. Rendering it costs
- * one line; crashing the graph on unexpected data costs a lot more.
- */
-export type ChapterStatus = "active" | "dormant" | "merged" | "abandoned" | "frozen";
-
-const chapterStatusMap: StatusMap<ChapterStatus> = {
-	active: { color: "green", icon: "●", i18nKey: "status.chapterActive" },
-	dormant: { color: "yellow", icon: "◐", i18nKey: "status.chapterDormant" },
-	merged: { color: "blue", icon: "✓", i18nKey: "status.chapterMerged" },
-	abandoned: { color: "gray", icon: "✗", i18nKey: "status.chapterAbandoned" },
-	frozen: { color: "cyan", icon: "❄", i18nKey: "status.chapterFrozen" },
-};
-
-// ---------------------------------------------------------------------------
-// Chapter Role
-// ---------------------------------------------------------------------------
-
-export type ChapterRole = "trunk" | "branch" | "exploration" | "review";
-
-const chapterRoleMap: StatusMap<ChapterRole> = {
-	trunk: { color: "indigo", icon: "🏠", i18nKey: "status.roleTrunk" },
-	branch: { color: "gray", icon: "", i18nKey: "status.roleBranch" },
-	exploration: { color: "violet", icon: "🔬", i18nKey: "status.roleExploration" },
-	review: { color: "yellow", icon: "🔍", i18nKey: "status.roleReview" },
-};
 
 // ---------------------------------------------------------------------------
 // Narrator Status
@@ -225,9 +189,7 @@ const narratorSubstatusMap: StatusMap<NarratorSubstatus> = {
  * Substatus tags override the base status color when present, with a defined priority order.
  *
  * NOTE: This handles the full set of substatus tags (including transient ones like
- * reasoning/compacting/queued) for the detailed narrator panel. The Ruler view
- * (server/routes/ruler.ts resolveNarratorDisplayStatus) uses a smaller subset of
- * persistent tags only, since Pixi rendering doesn't need transient state granularity.
+ * reasoning/compacting/queued) for the detailed narrator panel.
  */
 export function getEffectiveNarratorDisplay(status: string, substatus?: string[]): StatusEntry {
 	if (substatus?.length) {
@@ -332,41 +294,6 @@ const projectStatusMap: StatusMap<ProjectStatus> = {
 };
 
 // ---------------------------------------------------------------------------
-// Edge Type
-// ---------------------------------------------------------------------------
-
-/**
- * Every edge type that can REACH the canvas, which is the full `chapter_edges.type` enum —
- * including the two nothing creates any more.
- *
- * `dependency` edges were user-drawn and the feature was removed; `cherry_pick` edges were
- * never created by anything. Both stay here because rows of either kind may still sit in an
- * existing database, and a graph that cannot colour a row it loaded would render a default
- * grey line instead of a labelled one.
- *
- * ⚠️ Wider than {@link QueryableEdgeType}: this is a DISPLAY vocabulary, not a request one.
- */
-export type EdgeType = "fork" | "merge" | "dependency" | "cherry_pick" | "review";
-
-/**
- * The subset `GET /api/chapter-edges?type=` accepts.
- *
- * The route validates against exactly these three (the types operations still produce) and
- * answers anything else with a 400 — so passing a display-only type from {@link EdgeType} to
- * a query is a request error, not an empty result. Kept as its own type so that mistake is a
- * compile error at the call site rather than a runtime 400.
- */
-export type QueryableEdgeType = "fork" | "merge" | "review";
-
-const edgeTypeMap: StatusMap<EdgeType> = {
-	fork: { color: "#4c6ef5", icon: "", i18nKey: "status.edgeFork" },
-	merge: { color: "#40c057", icon: "", i18nKey: "status.edgeMerge" },
-	dependency: { color: "#fd7e14", icon: "", i18nKey: "status.edgeDependency" },
-	cherry_pick: { color: "#7950f2", icon: "", i18nKey: "status.edgeCherryPick" },
-	review: { color: "#fab005", icon: "", i18nKey: "status.edgeReview" },
-};
-
-// ---------------------------------------------------------------------------
 // Git File Status
 // ---------------------------------------------------------------------------
 
@@ -418,8 +345,6 @@ function lookup<K extends string>(map: StatusMap<K>, key: string): StatusEntry {
 // ---------------------------------------------------------------------------
 
 export const statusRegistry = {
-	chapterStatus: (s: string) => lookup(chapterStatusMap, s),
-	chapterRole: (s: string) => lookup(chapterRoleMap, s),
 	narratorStatus: (s: string) => lookup(narratorStatusMap, s),
 	narratorSubstatus: (s: string) => lookup(narratorSubstatusMap, s),
 	/** Resolve effective display for a narrator given status + substatus tags */
@@ -431,19 +356,15 @@ export const statusRegistry = {
 	containerStatus: (s: string) => lookup(containerStatusMap, s),
 	toolCallStatus: (s: string) => lookup(toolCallStatusMap, s),
 	projectStatus: (s: string) => lookup(projectStatusMap, s),
-	edgeType: (s: string) => lookup(edgeTypeMap, s),
 	gitFileStatus: (s: string) => lookup(gitFileStatusMap, s),
 
 	/** Raw maps for iteration (e.g. legend rendering) */
 	maps: {
-		chapterStatus: chapterStatusMap,
-		chapterRole: chapterRoleMap,
 		narratorStatus: narratorStatusMap,
 		narratorSubstatus: narratorSubstatusMap,
 		containerStatus: containerStatusMap,
 		toolCallStatus: toolCallStatusMap,
 		projectStatus: projectStatusMap,
-		edgeType: edgeTypeMap,
 		gitFileStatus: gitFileStatusMap,
 	},
 } as const;
@@ -460,15 +381,7 @@ function colorOnly<K extends string>(map: StatusMap<K>): Record<string, string> 
 	return result;
 }
 
-export const CHAPTER_STATUS_COLORS = colorOnly(chapterStatusMap);
-export const CHAPTER_ROLE_ICONS: Record<string, string> = {
-	trunk: chapterRoleMap.trunk.icon,
-	branch: chapterRoleMap.branch.icon,
-	exploration: chapterRoleMap.exploration.icon,
-	review: chapterRoleMap.review.icon,
-};
 export const NARRATOR_STATUS_COLORS = colorOnly(narratorStatusMap);
 export const NARRATOR_SUBSTATUS_COLORS = colorOnly(narratorSubstatusMap);
 export const CONTAINER_STATUS_COLORS = colorOnly(containerStatusMap);
-export const EDGE_TYPE_COLORS = colorOnly(edgeTypeMap);
 export const TOOL_CALL_STATUS_COLORS = colorOnly(toolCallStatusMap);

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useSyncExternalStore } from "react";
+import { useCallback, useMemo, useSyncExternalStore } from "react";
 import {
 	clearStatusFilter,
 	GIT_STATUS_FILTER_KEY,
@@ -6,7 +6,7 @@ import {
 	parseStatusFilterPrefs,
 	readStatusFilter,
 	toggleStatusFilter,
-} from "../components/chapter/git-status-filter";
+} from "../components/git/git-status-filter";
 
 /**
  * React binding for the git panel's status filter (show only M / A / D / …).
@@ -99,37 +99,28 @@ if (import.meta.hot) {
 }
 
 /**
- * Selected status letters for one chapter, plus toggle/clear.
+ * Selected status letters for one workspace, plus toggle/clear.
  *
  * An empty set means UNFILTERED, not "hide everything": a mis-click must never
  * leave the panel looking empty and broken.
  */
 export function useGitStatusFilter(
-	chapterId: string,
-	legacyChapterId?: string | null,
+	scopeKey: string,
 ): {
 	selected: Set<GitStatusFilterChar>;
 	toggle: (char: GitStatusFilterChar) => void;
 	clear: () => void;
 } {
 	const prefs = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
-	useEffect(() => {
-		if (!legacyChapterId || legacyChapterId === chapterId) return;
-		const previous = getSnapshot();
-		if (!Object.hasOwn(previous, legacyChapterId)) return;
-		// Move once, rather than copy: clearing the new filter must not re-import the old one.
-		const { [legacyChapterId]: legacy, ...rest } = previous;
-		persist(Object.hasOwn(rest, chapterId) ? rest : { ...rest, [chapterId]: legacy });
-	}, [chapterId, legacyChapterId]);
-	const selected = useMemo(() => readStatusFilter(prefs, chapterId), [prefs, chapterId]);
+	const selected = useMemo(() => readStatusFilter(prefs, scopeKey), [prefs, scopeKey]);
 	const toggle = useCallback(
 		(char: GitStatusFilterChar) => {
-			persist(toggleStatusFilter(getSnapshot(), chapterId, char));
+			persist(toggleStatusFilter(getSnapshot(), scopeKey, char));
 		},
-		[chapterId],
+		[scopeKey],
 	);
 	const clear = useCallback(() => {
-		persist(clearStatusFilter(getSnapshot(), chapterId));
-	}, [chapterId]);
+		persist(clearStatusFilter(getSnapshot(), scopeKey));
+	}, [scopeKey]);
 	return { selected, toggle, clear };
 }

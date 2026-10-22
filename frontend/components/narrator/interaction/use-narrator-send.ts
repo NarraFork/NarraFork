@@ -112,7 +112,6 @@ export interface UseNarratorSendOptions {
 	canContinueNarrator: boolean;
 	fetchedNarrator: NarratorLike | null | undefined;
 	narrator: NarratorLike | null | undefined;
-	chapterWorktreePath: string | null | undefined;
 	currentUser: CurrentUserLike | null | undefined;
 	enterQueueMode: "turn" | "tool" | "interrupt";
 	ctrlEnterQueueMode: "turn" | "tool" | "interrupt";
@@ -197,7 +196,6 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 		canContinueNarrator,
 		fetchedNarrator,
 		narrator,
-		chapterWorktreePath,
 		currentUser,
 		enterQueueMode,
 		ctrlEnterQueueMode,
@@ -650,10 +648,8 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 				composerRef.current?.hideTextForSend();
 				hideAttachedFilesForSend();
 
-				const currentCwd =
-					fetchedNarrator?.cwd ?? narrator?.cwd ?? chapterWorktreePath ?? undefined;
+				const currentCwd = fetchedNarrator?.cwd ?? narrator?.cwd ?? undefined;
 				const newNarrator = await createNarrator.mutateAsync({
-					chapterId: null,
 					model: fetchedNarrator?.model ?? narrator?.model ?? undefined,
 					systemPrompt: fetchedNarrator?.systemPrompt ?? narrator?.systemPrompt ?? undefined,
 					permissionMode: fetchedNarrator?.permissionMode ?? narrator?.permissionMode ?? undefined,

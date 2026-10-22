@@ -9,7 +9,7 @@ const TERMINALS_QUERY_GC_TIME_MS = 60_000;
 
 function appendTerminalToCache(
 	qc: QueryClient,
-	queryKey: readonly ["terminals", { chapterId?: string; narratorId?: string }],
+	queryKey: readonly ["terminals", { narratorId: string }],
 	terminal: ApiEntity,
 ) {
 	if (!terminal?.id) return;
@@ -17,29 +17,6 @@ function appendTerminalToCache(
 		if (!old) return [terminal];
 		if (old.some((t) => t.id === terminal.id)) return old;
 		return [...old, terminal];
-	});
-}
-
-export function useTerminals(chapterId: string) {
-	const qc = useQueryClient();
-
-	// Invalidate when any narrator in this chapter reports terminal_count_changed
-	useEffect(() => {
-		if (!chapterId) return;
-		const handle = narratorWSManager.addListener(
-			{ narratorIds: "*", types: ["terminal_count_changed"] },
-			() => {
-				qc.invalidateQueries({ queryKey: ["terminals", { chapterId }] });
-			},
-		);
-		return () => narratorWSManager.removeListener(handle);
-	}, [chapterId, qc]);
-
-	return useQuery({
-		queryKey: ["terminals", { chapterId }],
-		queryFn: () => api.listTerminals(chapterId),
-		enabled: !!chapterId,
-		gcTime: TERMINALS_QUERY_GC_TIME_MS,
 	});
 }
 
@@ -66,26 +43,6 @@ export function useNarratorTerminals(narratorId: string) {
 	});
 }
 
-export function useCreateTerminal(chapterId: string) {
-	const qc = useQueryClient();
-	const terminalCapability = useTerminalCapability();
-	const queryKey = ["terminals", { chapterId }] as const;
-	return useMutation({
-		mutationFn: (data?: { name?: string; cols?: number; rows?: number; deviceId?: string }) => {
-			if (!terminalCapability.supported) {
-				return Promise.reject(
-					new Error(terminalCapability.reason ?? "Terminal runtime is not supported"),
-				);
-			}
-			return api.createTerminal({ chapterId, ...data });
-		},
-		onSuccess: (terminal) => {
-			appendTerminalToCache(qc, queryKey, terminal);
-			qc.invalidateQueries({ queryKey });
-		},
-	});
-}
-
 export function useCreateNarratorTerminal(narratorId: string) {
 	const qc = useQueryClient();
 	const terminalCapability = useTerminalCapability();
@@ -106,16 +63,6 @@ export function useCreateNarratorTerminal(narratorId: string) {
 	});
 }
 
-export function useDeleteTerminal(chapterId: string) {
-	const qc = useQueryClient();
-	return useMutation({
-		mutationFn: (id: string) => api.deleteTerminal(id),
-		onSuccess: () => {
-			qc.invalidateQueries({ queryKey: ["terminals", { chapterId }] });
-		},
-	});
-}
-
 export function useDeleteNarratorTerminal(narratorId: string) {
 	const qc = useQueryClient();
 	return useMutation({
@@ -126,7 +73,7 @@ export function useDeleteNarratorTerminal(narratorId: string) {
 	});
 }
 
-export function useRenameTerminal(key: { chapterId?: string; narratorId?: string }) {
+export function useRenameTerminal(key: { narratorId?: string }) {
 	const qc = useQueryClient();
 	return useMutation({
 		mutationFn: ({ id, name }: { id: string; name: string }) => api.renameTerminal(id, name),

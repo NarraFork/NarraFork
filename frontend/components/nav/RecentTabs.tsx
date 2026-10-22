@@ -539,14 +539,6 @@ export function RecentTabList({
 					gcTime: PREFETCH_QUERY_GC_TIME_MS,
 				});
 			}
-
-			if (tab.type === "chapter" && !qc.getQueryData(["chapters", tab.id])) {
-				void qc.prefetchQuery({
-					queryKey: ["chapters", tab.id],
-					queryFn: () => api.getChapter(tab.id),
-					gcTime: PREFETCH_QUERY_GC_TIME_MS,
-				});
-			}
 		},
 		[qc],
 	);
@@ -706,19 +698,15 @@ export function RecentTabList({
 	}, [ctxMenu, removeTab, navigate, releaseWorkspace]);
 
 	/**
-	 * Resolve the on-disk directory a tab points at: a chapter's worktree, or a
-	 * narrator/subagent's cwd. Returns null when the tab has no directory
-	 * (workspace, project) or the lookup fails.
+	 * Resolve the on-disk directory a tab points at: its narrator's cwd (a legacy
+	 * chapter tab resolves through its narrator). Returns null when the tab has no
+	 * directory (workspace, project) or the lookup fails.
 	 */
 	const resolveTabDirectory = useCallback(async (tab: RecentTab): Promise<string | null> => {
 		try {
-			if (tab.type === "chapter") {
-				const chapter = await api.getChapter(tab.id);
-				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-				return ((chapter as any)?.worktreePath as string | undefined) ?? null;
-			}
-			if (tab.type === "narrator" || tab.type === "subagent") {
-				const narrator = await api.getNarrator(tab.id);
+			const narratorId = getRecentTabNarratorId(tab);
+			if (narratorId) {
+				const narrator = await api.getNarrator(narratorId);
 				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 				return ((narrator as any)?.cwd as string | undefined) ?? null;
 			}
@@ -769,13 +757,9 @@ export function RecentTabList({
 		setCtxMenu(null);
 		if (!revealAvailable) return;
 		try {
-			if (tab.type === "chapter") {
-				const chapter = await api.getChapter(tab.id);
-				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-				const wt = (chapter as any)?.worktreePath;
-				if (wt) await api.fsReveal(wt);
-			} else if (tab.type === "narrator") {
-				const narrator = await api.getNarrator(tab.id);
+			const narratorId = tab.type === "subagent" ? null : getRecentTabNarratorId(tab);
+			if (narratorId) {
+				const narrator = await api.getNarrator(narratorId);
 				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 				const cwd = (narrator as any)?.cwd;
 				if (cwd) await api.fsReveal(cwd);

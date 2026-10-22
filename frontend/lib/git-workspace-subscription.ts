@@ -25,9 +25,7 @@ const FACTS = [
 ];
 let nextSubscriptionId = 0;
 const authorizationKey = (target: GitTarget) =>
-	JSON.stringify(
-		typeof target === "string" ? ["chapter", target] : [target.narratorId, target.workspaceKey],
-	);
+	JSON.stringify([target.narratorId, target.workspaceKey]);
 export const gitFactKey = (prefix: string, key: string | undefined, view: GitWorkspaceView) =>
 	view === "details" ? [prefix, key] : [prefix, key, "summary"];
 export const gitSnapshotKey = (key: string | undefined, view: GitWorkspaceView) => [
@@ -92,10 +90,7 @@ export class GitWorkspaceSubscriptions {
 		return (
 			this.connected &&
 			[...this.entries.values()].some(
-				(entry) =>
-					!entry.failed &&
-					(gitTargetKey(entry.target) === key ||
-						(typeof entry.target !== "string" && entry.target.chapterId === key)),
+				(entry) => !entry.failed && gitTargetKey(entry.target) === key,
 			)
 		);
 	}
@@ -179,9 +174,8 @@ export class GitWorkspaceSubscriptions {
 			type: "git_workspace_subscribe",
 			subscriptionId: entry.id,
 			view: entry.view,
-			...(typeof entry.target === "string"
-				? { chapterId: entry.target }
-				: { narratorId: entry.target.narratorId, workspaceKey: entry.target.workspaceKey }),
+			narratorId: entry.target.narratorId,
+			workspaceKey: entry.target.workspaceKey,
 		});
 	}
 	/** Manual refresh is one WS request; server mutations already mark their workspace dirty. */
@@ -274,12 +268,11 @@ export class GitWorkspaceSubscriptions {
 				this.qc.removeQueries({ queryKey: [prefix, gitTargetKey(target)] });
 			}
 			this.onRejected?.(target);
-			if (typeof target !== "string")
-				void this.qc.invalidateQueries({ queryKey: ["gitWorkspace", target.narratorId] });
+			void this.qc.invalidateQueries({ queryKey: ["gitWorkspace", target.narratorId] });
 			this.notify();
 			return;
 		}
-		if (typeof target !== "string" && data.workspaceKey !== target.workspaceKey) return;
+		if (data.workspaceKey !== target.workspaceKey) return;
 		const initial = data.type === "git_workspace_subscribed";
 		if (initial) {
 			if (entry.acknowledged) return;
@@ -326,14 +319,10 @@ export class GitWorkspaceSubscriptions {
 			if (!workspace?.workspaceKey) continue;
 			if (workspace.workspaceKey === data.workspaceKey) {
 				keys.add(workspace.workspaceKey);
-				if (workspace.chapterId) keys.add(workspace.chapterId);
 			} else if (data.repositoryKey && workspace.repositoryKey === data.repositoryKey) {
 				for (const prefix of ["gitLog", "gitStashList"])
-					if (prefixes.has(prefix)) {
+					if (prefixes.has(prefix))
 						void this.qc.invalidateQueries({ queryKey: [prefix, workspace.workspaceKey] });
-						if (workspace.chapterId)
-							void this.qc.invalidateQueries({ queryKey: [prefix, workspace.chapterId] });
-					}
 			}
 		}
 		for (const key of keys)

@@ -489,8 +489,6 @@ export interface InjectionNavigation {
 	onOpenKnowledge?: (entryId: string, scope: "global" | "personal") => void;
 	/** Open the Dynamic Spec panel with one file selected. */
 	onOpenSpec?: (uri: string) => void;
-	/** Open a chapter. */
-	onOpenChapter?: (chapterId: string) => void;
 	/** Localized tooltip / aria label per target kind. */
 	labels?: Partial<Record<InjectionTarget["kind"], string>>;
 }
@@ -520,9 +518,8 @@ function resolveInjectionOpener(
 			const open = navigation.onOpenSpec;
 			return open ? () => open(target.uri) : undefined;
 		}
-		case "chapter": {
-			const open = navigation.onOpenChapter;
-			return open ? () => open(target.chapterId) : undefined;
-		}
+		case "chapter":
+			// Chapters are retired; old review / merge rows stay readable but inert.
+			return undefined;
 	}
 }

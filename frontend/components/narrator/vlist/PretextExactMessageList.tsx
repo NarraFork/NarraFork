@@ -414,8 +414,6 @@ type PretextExactMessageListProps = {
 	 *  the chunked path's `permCb` (renderPermCb). Absent → permission rows fall
 	 *  back to the read-only zero-DOM copy (no interaction). */
 	permCb?: PermissionCallbacks;
-	/** Narrator is bound to a chapter (git) → user-edit offers the rollback option. */
-	hasChapter?: boolean;
 	/**
 	 * Deep-link / search target: jump to this message once and flash it.
 	 *
@@ -535,7 +533,6 @@ export const PretextExactMessageList = memo(
 				onSelectionResolverChange,
 				rowHandlers,
 				permCb,
-				hasChapter,
 				highlightMessageId,
 				highlightRequestId,
 				tailFooter,
@@ -5197,7 +5194,6 @@ export const PretextExactMessageList = memo(
 								creator={msg.creator ?? null}
 								initialText={row.initialText}
 								isLastUserMessage={row.messageId === tailMeta.lastUserMessageId}
-								hasChapter={hasChapter}
 								onEditAndRegenerate={handlers.onEditAndRegenerate}
 								onEditAssistantMessage={handlers.onEditAssistantMessage}
 								onClose={closeEditor}
@@ -5210,7 +5206,6 @@ export const PretextExactMessageList = memo(
 					rowHandlers,
 					narratorId,
 					tailMeta.lastUserMessageId,
-					hasChapter,
 					closeEditor,
 				],
 			);
@@ -5237,14 +5232,12 @@ export const PretextExactMessageList = memo(
 					onOpenNarrator: rowHandlers?.onViewSubagentSession,
 					onOpenKnowledge: rowHandlers?.onOpenKnowledgeEntry,
 					onOpenSpec: rowHandlers?.onOpenSpecFile,
-					onOpenChapter: rowHandlers?.onOpenChapter,
 					labels: injectionTargetLabels,
 				}),
 				[
 					rowHandlers?.onViewSubagentSession,
 					rowHandlers?.onOpenKnowledgeEntry,
 					rowHandlers?.onOpenSpecFile,
-					rowHandlers?.onOpenChapter,
 					injectionTargetLabels,
 				],
 			);

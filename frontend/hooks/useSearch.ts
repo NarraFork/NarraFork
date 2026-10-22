@@ -5,7 +5,7 @@ import type { SearchSortMode } from "../lib/search-utils";
 
 export function useSearch(
 	query: string,
-	entities = "chapters,messages,narrators",
+	entities = "messages,narrators",
 	sort: SearchSortMode = "relevance",
 ) {
 	const normalizedQuery = query.trim();

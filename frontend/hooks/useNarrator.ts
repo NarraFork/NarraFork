@@ -47,7 +47,6 @@ const NARRATOR_DETAIL_QUERY_GC_TIME_MS = 60_000;
 const TOOL_CALL_DETAIL_QUERY_GC_TIME_MS = 5 * 60_000;
 
 export function useNarrators(opts?: {
-	chapterId?: string;
 	standalone?: boolean;
 	status?: string;
 	sortBy?: string;
@@ -56,7 +55,7 @@ export function useNarrators(opts?: {
 	return useQuery({
 		queryKey: ["narrators", { ...opts }],
 		queryFn: () => api.listNarrators(opts),
-		enabled: !!(opts?.chapterId || opts?.standalone),
+		enabled: !!opts?.standalone,
 		gcTime: NARRATORS_LIST_GC_TIME_MS,
 	});
 }
@@ -776,7 +775,6 @@ export function useCreateNarrator() {
 	const qc = useQueryClient();
 	return useMutation({
 		mutationFn: (data: {
-			chapterId?: string | null;
 			contextProjectId?: string;
 			type?: string;
 			model?: string;

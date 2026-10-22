@@ -123,7 +123,7 @@ function ScheduledTaskDetailPage() {
 					</SummaryRow>
 					<SummaryRow label={t("runContext")}>
 						<Badge size="sm" variant="outline" color="indigo">
-							{task.runContext === "chapter" ? t("ctxChapter") : t("ctxStandalone")}
+							{task.runContext === "standalone" ? t("ctxStandalone") : t("ctxProject")}
 						</Badge>
 					</SummaryRow>
 					<SummaryRow label={t("model")}>

@@ -29,13 +29,11 @@ export interface PluginUiSessionContext {
 	workspaceId?: string;
 	projectId?: string;
 	narratorId?: string;
-	chapterId?: string | null;
 	presentation?: "grid" | "director";
 }
 
 type NarratorRuntimeContext = {
 	narratorId: string;
-	chapterId?: string | null;
 	projectId?: string;
 };
 
@@ -135,7 +133,6 @@ function sameSessionContext(
 		previous.workspaceId === context.workspaceId &&
 		previous.projectId === context.projectId &&
 		previous.narratorId === context.narratorId &&
-		previous.chapterId === context.chapterId &&
 		previous.presentation === context.presentation
 	);
 }
@@ -165,9 +162,7 @@ export function PluginUiSurfaceProvider({
 	);
 	const registerNarratorContext = useCallback((context: NarratorRuntimeContext) => {
 		const previous = narratorContextsRef.current.get(context.narratorId);
-		if (previous?.chapterId === context.chapterId && previous?.projectId === context.projectId) {
-			return;
-		}
+		if (previous?.projectId === context.projectId) return;
 		narratorContextsRef.current.set(context.narratorId, context);
 		setRevision((value) => value + 1);
 	}, []);

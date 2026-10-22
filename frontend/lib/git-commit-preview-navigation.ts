@@ -41,16 +41,13 @@ export function buildCommitPreviewHref(
 	mode: CommitPreviewPageMode = "page",
 ): string {
 	if (!GIT_COMMIT_SHA_PATTERN.test(sha)) throw new Error("A full commit SHA is required");
-	const owner =
-		typeof target === "string"
-			? `chapters/${encodeURIComponent(target)}`
-			: `narrators/${encodeURIComponent(target.narratorId)}`;
+	const owner = `narrators/${encodeURIComponent(target.narratorId)}`;
 	// Use the Router's own string encoding: numeric/JSON-looking filenames must
 	// be quoted or its default parser would silently change their value/type.
 	const params = new URLSearchParams(
 		defaultStringifySearch({
 			file: file ?? undefined,
-			workspaceKey: typeof target === "string" ? undefined : target.workspaceKey,
+			workspaceKey: target.workspaceKey,
 		}),
 	);
 	const query = params.toString();

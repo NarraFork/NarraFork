@@ -13,7 +13,6 @@ export interface BuildMobileToolbarActionsOptions {
 	// biome-ignore lint/suspicious/noExplicitAny: mutation shape is incidental here
 	relaxedPlanMutation: UseMutationResult<any, any, { id: string; relaxedPlan: boolean }, any>;
 	isAskInPassing: boolean | null | undefined;
-	chapterId: string | null | undefined;
 	// biome-ignore lint/suspicious/noExplicitAny: mutation shape is incidental here
 	promoteMutation: UseMutationResult<any, any, any, any>;
 	handlePromote: () => void;
@@ -32,7 +31,6 @@ export function buildMobileToolbarActions({
 	relaxedPlanForced,
 	relaxedPlanMutation,
 	isAskInPassing,
-	chapterId,
 	promoteMutation,
 	handlePromote,
 }: BuildMobileToolbarActionsOptions): NarratorStatusToolbarAction[] {
@@ -102,7 +100,7 @@ export function buildMobileToolbarActions({
 								</Menu.Item>
 							) : (
 								<Tooltip
-									label={chapterId ? t("promote_chapter_hint") : t("promote_standalone_hint")}
+									label={t("promote_standalone_hint")}
 								>
 									<Button
 										size="compact-xs"

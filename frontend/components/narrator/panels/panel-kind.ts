@@ -78,8 +78,6 @@ export type ResourcePanelKind = Exclude<
 export interface NarratorBoundPanelParams {
 	panelType: Exclude<PanelKind, "subagent" | "webview">;
 	narratorId: string;
-	/** Chapter id — required by the git panel; optional elsewhere. */
-	chapterId?: string | null;
 }
 
 /** Params carried by a multi-instance subagent session panel. */
@@ -125,7 +123,7 @@ export function nextHighlightRequestId(): string {
  * Params carried by a read-only file viewer panel (multi-instance: one panel per
  * path). Like `subagent`, the resource identity (`filePath`) MUST survive
  * serialization — `stripIdentityFromLayout` only removes host identity
- * (narratorId / chapterId).
+ * (narratorId).
  */
 /** Navigation is transient; file authority, device/path and toolEdit are resource identity. */
 export interface FileOpenOptions {

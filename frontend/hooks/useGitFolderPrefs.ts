@@ -1,11 +1,11 @@
-import { useCallback, useEffect, useMemo, useSyncExternalStore } from "react";
+import { useCallback, useMemo, useSyncExternalStore } from "react";
 import {
 	GIT_FOLDER_PREFS_KEY,
 	type GitFolderSection,
 	parseFolderPrefs,
 	readExpanded,
 	toggleExpanded,
-} from "../components/chapter/git-folder-prefs";
+} from "../components/git/git-folder-prefs";
 
 /**
  * React binding for the git panel's folder expansion state.
@@ -83,7 +83,7 @@ export function __resetGitFolderPrefsCache() {
 }
 
 /**
- * Expanded folders for one chapter section, plus a toggle that persists for the
+ * Expanded folders for one workspace section, plus a toggle that persists for the
  * rest of the session.
  *
  * Folders default to COLLAPSED: a repo with changes across many folders
@@ -91,31 +91,17 @@ export function __resetGitFolderPrefsCache() {
  * panel starts summarized. The returned set is the expanded exception list.
  */
 export function useGitFolderPrefs(
-	chapterId: string,
+	scopeKey: string,
 	section: GitFolderSection,
-	legacyChapterId?: string | null,
 ): { expanded: Set<string>; toggle: (path: string) => void } {
 	const prefs = useSyncExternalStore(subscribe, getSnapshot, getServerSnapshot);
-	useEffect(() => {
-		if (!legacyChapterId || legacyChapterId === chapterId) return;
-		const previous = getSnapshot();
-		if (!Object.hasOwn(previous, legacyChapterId)) return;
-		const { [legacyChapterId]: legacy, ...rest } = previous;
-		const next = Object.hasOwn(rest, chapterId) ? rest : { ...rest, [chapterId]: legacy };
-		try {
-			sessionStorage.setItem(GIT_FOLDER_PREFS_KEY, JSON.stringify(next));
-		} catch {
-			return;
-		}
-		notify();
-	}, [chapterId, legacyChapterId]);
 	const expanded = useMemo(
-		() => readExpanded(prefs, chapterId, section),
-		[prefs, chapterId, section],
+		() => readExpanded(prefs, scopeKey, section),
+		[prefs, scopeKey, section],
 	);
 	const toggle = useCallback(
 		(path: string) => {
-			const next = toggleExpanded(getSnapshot(), chapterId, section, path);
+			const next = toggleExpanded(getSnapshot(), scopeKey, section, path);
 			try {
 				sessionStorage.setItem(GIT_FOLDER_PREFS_KEY, JSON.stringify(next));
 			} catch {
@@ -124,7 +110,7 @@ export function useGitFolderPrefs(
 			}
 			notify();
 		},
-		[chapterId, section],
+		[scopeKey, section],
 	);
 	return { expanded, toggle };
 }

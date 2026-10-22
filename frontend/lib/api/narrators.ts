@@ -576,7 +576,6 @@ export interface BrokenModelNarrator {
 	title: string | null;
 	model: string;
 	status: string;
-	chapterId: string | null;
 	hasBrokenPendingRestore: boolean;
 }
 
@@ -709,14 +708,12 @@ export const narratorsApi = {
 	ensureWriteDocumentSource,
 	readTextDocumentRange,
 	listNarrators: (opts?: {
-		chapterId?: string;
 		standalone?: boolean;
 		status?: string;
 		sortBy?: string;
 		sortOrder?: string;
 	}) => {
 		const params = new URLSearchParams();
-		if (opts?.chapterId) params.set("chapterId", opts.chapterId);
 		if (opts?.standalone) params.set("standalone", "true");
 		if (opts?.status) params.set("status", opts.status);
 		if (opts?.sortBy) params.set("sortBy", opts.sortBy);
@@ -895,7 +892,6 @@ export const narratorsApi = {
 		}>(`/narrators/${id}/skills${qs ? `?${qs}` : ""}`);
 	},
 	createNarrator: (data: {
-		chapterId?: string | null;
 		contextProjectId?: string;
 		type?: string;
 		model?: string;
@@ -1260,7 +1256,7 @@ export const narratorsApi = {
 	// per-narrator one structurally cannot.
 	getAllAsyncQuestions: () =>
 		request<{
-			items: (AsyncQuestion & { narratorTitle: string | null; chapterId: string | null })[];
+			items: (AsyncQuestion & { narratorTitle: string | null })[];
 			openCount: number;
 			awaitedCount: number;
 		}>("/narrators/questions/all"),
@@ -1305,7 +1301,6 @@ export const narratorsApi = {
 		return request<{
 			items: (AsyncQuestion & {
 				narratorTitle: string | null;
-				chapterId: string | null;
 				canAct?: boolean;
 			})[];
 			nextCursor: string | null;
@@ -2145,7 +2140,7 @@ export const narratorsApi = {
 			`/narrators/${narratorId}/permission-file-preview?toolUseId=${encodeURIComponent(toolUseId)}`,
 		),
 
-	// Ordinary conversation fork (standalone output, including legacy chapter sources).
+	// Ordinary conversation fork (standalone output).
 	// The fork point is identified by the local narrator message id: only
 	// assistant messages carry an SDK uuid, so a uuid-only contract cannot fork
 	// from a user message.

@@ -67,8 +67,6 @@ export interface NarratorToolPanelParams {
 	panelType: "narrator-tool";
 	toolType: NarratorToolPanelType;
 	narratorId: string;
-	/** Chapter id — required by the git tool; optional elsewhere. */
-	chapterId?: string | null;
 }
 
 /** Multi-instance child session belonging to one root narrator cluster. */

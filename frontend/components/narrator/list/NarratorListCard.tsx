@@ -53,15 +53,6 @@ export interface NarratorListViewer {
 	avatarImageId: string | null;
 }
 
-export interface NarratorListChapter {
-	id: string;
-	title: string;
-	projectId: string;
-	projectName: string | null;
-	status: string;
-	role: string;
-}
-
 export interface NarratorListItem {
 	id: string;
 	title?: string | null;
@@ -80,7 +71,6 @@ export interface NarratorListItem {
 	activeBackgroundServiceCount?: number | null;
 	containerCount?: number | null;
 	runningContainerCount?: number | null;
-	chapter?: NarratorListChapter | null;
 	viewers?: NarratorListViewer[] | null;
 }
 
@@ -221,13 +211,8 @@ function NarratorBadges({
 
 function ProjectCwdLine({ narrator }: { narrator: NarratorListItem }) {
 	const { t } = useTranslation("narrators");
-	const chapter = narrator.chapter;
-	if (!chapter?.projectName && !narrator.cwd) return null;
+	if (!narrator.cwd) return null;
 	const parts = [
-		chapter?.projectName &&
-			t("projectLabel", {
-				name: clampNarratorListText(chapter.projectName, MAX_NARRATOR_LIST_META_CHARS),
-			}),
 		narrator.cwd &&
 			t("cwdLabel", {
 				path: clampNarratorListText(narrator.cwd, MAX_NARRATOR_LIST_META_CHARS),

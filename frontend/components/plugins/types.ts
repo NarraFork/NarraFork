@@ -135,7 +135,7 @@ export interface PluginUiContext {
 		active: boolean;
 		visible: boolean;
 	};
-	narrator?: { id: string; chapterId?: string | null; projectId?: string | null };
+	narrator?: { id: string; projectId?: string | null };
 	project?: { id: string };
 	workspace?: {
 		id: string;

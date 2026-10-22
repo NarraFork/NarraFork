@@ -338,7 +338,7 @@ function uiOpenExternal(
 }
 
 /** Internal route allow-list: only host-owned deep links may be navigated to. */
-const INTERNAL_NAVIGATION_PREFIXES = ["/narrators/", "/projects/", "/chapters/"];
+const INTERNAL_NAVIGATION_PREFIXES = ["/narrators/", "/projects/"];
 
 function uiNavigate(
 	request: UiRpcRequest,

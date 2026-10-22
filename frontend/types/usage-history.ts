@@ -28,8 +28,6 @@ export interface UsageHistoryRecord extends ReferenceCostSummary {
 	createdAt: string;
 	errorMessage?: string | null;
 	narratorTitle?: string | null;
-	chapterTitle?: string | null;
-	chapterId?: string | null;
 	projectId?: string | null;
 	/** Bounded diagnostics summary exists; list rows never carry its content. */
 	hasDiagnostics?: boolean;
@@ -92,7 +90,6 @@ export interface UsageHistoryFilters {
 	/** '__unattributed__' selects requests without known ownership. */
 	userId?: string;
 	narratorId?: string;
-	chapterId?: string;
 	projectId?: string;
 	provider?: string;
 	/** Exact credential id — narrows history to one account in a provider pool. */

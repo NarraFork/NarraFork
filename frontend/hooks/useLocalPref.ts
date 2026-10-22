@@ -25,9 +25,6 @@ type Key =
 	// whole transcript renders. With it off, Alt does nothing for LOD — the
 	// toolbar's detail-level menu (`lodlevel`) is the remaining click entry point.
 	| "narrafork_lod_alt_gesture"
-	// Ruler's deprecation notice has been acknowledged. Not per-project: the fact that
-	// the view is deprecated is global, so being told once is enough.
-	| "narrafork_ruler_deprecation_ack"
 	// Unified morph driver (visual-state + single rAF loop) instead of the keyframe
 	// planners. Now DEFAULT ON, after the browser comparison this gate existed for: the
 	// keyframe path loses a whole activity group's animation whenever the two levels'

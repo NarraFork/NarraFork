@@ -48,7 +48,6 @@ export interface MessageEditorPanelProps {
 	/** Optional preloaded detail; absent values are fetched only while editing. */
 	composerDocument?: ComposerDocument;
 	isLastUserMessage?: boolean;
-	hasChapter?: boolean;
 	onEditAndRegenerate?: (
 		messageId: string,
 		newContent: string,

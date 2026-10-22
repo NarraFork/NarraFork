@@ -556,15 +556,9 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 										<Text size="xs" fw={500}>
 											{formatLocaleDateTime(record.createdAt)}
 										</Text>
-										{record.chapterTitle ? (
-											<Text size="10px" c="dimmed" lineClamp={2}>
-												{record.chapterTitle}
-											</Text>
-										) : (
-											<Text size="10px" c="dimmed">
-												{getNarratorLabel(t, record)}
-											</Text>
-										)}
+										<Text size="10px" c="dimmed">
+											{getNarratorLabel(t, record)}
+										</Text>
 									</Stack>
 									<Group gap={4} wrap="nowrap">
 										<Badge color="gray" variant="outline" size="sm">
@@ -765,15 +759,9 @@ export function UsageHistoryTable({ records, loading }: UsageHistoryTableProps) 
 													<CopyableErrorBadge message={record.errorMessage} />
 												) : null}
 											</Group>
-											{record.chapterTitle ? (
-												<Text size="xs" c="dimmed">
-													{record.chapterTitle}
-												</Text>
-											) : (
-												<Text size="xs" c="dimmed">
-													{getNarratorLabel(t, record)}
-												</Text>
-											)}
+											<Text size="xs" c="dimmed">
+												{getNarratorLabel(t, record)}
+											</Text>
 										</Stack>
 									</Table.Td>
 									<Table.Td>

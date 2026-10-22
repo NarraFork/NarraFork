@@ -83,7 +83,7 @@ function SettingsExecutionLogPage() {
 
 	const inspectorDetail = useMemo(() => {
 		if (!selected) return null;
-		// Merge so the modal can show the row's own context (narrator, chapter)
+		// Merge so the modal can show the row's own context (narrator, project)
 		// immediately while the payload-bearing detail is still in flight.
 		return detail ? { ...selected, ...detail } : null;
 	}, [selected, detail]);

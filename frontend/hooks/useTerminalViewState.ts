@@ -10,14 +10,14 @@ interface ViewState {
 	panelAssignments: Record<string, string | string[]> | null;
 }
 
-export function useTerminalViewState(opts: { chapterId?: string; narratorId?: string }) {
+export function useTerminalViewState(opts: { narratorId?: string }) {
 	const qc = useQueryClient();
 	const debounceRef = useRef<ReturnType<typeof setTimeout>>(undefined);
 
 	const query = useQuery({
 		queryKey: ["terminalViewState", opts],
 		queryFn: () => api.getTerminalViewState(opts),
-		enabled: !!(opts.chapterId || opts.narratorId),
+		enabled: !!opts.narratorId,
 		gcTime: TERMINAL_VIEW_STATE_QUERY_GC_TIME_MS,
 	});
 

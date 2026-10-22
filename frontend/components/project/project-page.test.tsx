@@ -5,12 +5,10 @@ import { createRoot, type Root } from "react-dom/client";
 
 let canWrite = true;
 let projectError = false;
-let resourcesError = false;
 let settingsError = false;
 const navigate = mock(async (_value: unknown) => {});
 const invalidate = mock(async (_value: unknown) => {});
 const fetchNextPage = mock(async () => {});
-const chapters = mock(() => ({ isLoading: false, isError: resourcesError, data: [] }));
 const box = ({ children }: { children?: ReactNode }) => <div>{children}</div>;
 mock.module("@mantine/core", () => ({
 	Alert: box,
@@ -99,16 +97,14 @@ mock.module("../../hooks/useProjectAccess", () => ({
 	useProjectAccess: fullAccess,
 	installProjectAccessListener: installAccessListener,
 }));
-mock.module("../../hooks/useChapters", () => ({ useChapters: chapters }));
 const list = mock(async (_options: unknown) => ({}));
 mock.module("../../lib/api", () => ({ api: { listNarratorsPaginated: list } }));
-mock.module("./ProjectCompatibilityPanel", () => ({
-	ProjectCompatibilityPanel: () => {
+mock.module("./ProjectSettingsPanel", () => ({
+	ProjectSettingsPanel: () => {
 		if (settingsError) throw new Error("optional settings failed");
 		return <div data-settings />;
 	},
 }));
-mock.module("./LegacyResourceRecovery", () => ({ LegacyResourceRecovery: box }));
 mock.module("../narrator/CreateNarratorModal", () => ({
 	CreateNarratorModal: ({
 		contextProjectId,
@@ -137,13 +133,11 @@ const saved = new Map<string, PropertyDescriptor | undefined>();
 beforeEach(() => {
 	canWrite = true;
 	projectError = false;
-	resourcesError = false;
 	settingsError = false;
 	for (const fn of [
 		navigate,
 		invalidate,
 		fetchNextPage,
-		chapters,
 		list,
 		fullAccess,
 		installAccessListener,
@@ -187,7 +181,7 @@ async function openDetails(index: number) {
 		details.dispatchEvent(new window.Event("toggle"));
 	});
 }
-test("project shows directory and old/new sessions, but does not query resources or mount tools on read", async () => {
+test("project shows directory and sessions, but does not mount tools on read", async () => {
 	await act(async () => root.render(<Page />));
 	expect(container.textContent).toContain("My project");
 	expect(container.textContent).toContain("/project-directory");
@@ -195,7 +189,6 @@ test("project shows directory and old/new sessions, but does not query resources
 	expect(container.querySelector('a[href="/narrators/old-session"]')).not.toBeNull();
 	expect(container.querySelector('a[href="/narrators/new-session"]')).not.toBeNull();
 	expect(container.textContent).not.toContain("compatibility.retirement");
-	expect(chapters).not.toHaveBeenCalled();
 	expect(fullAccess).not.toHaveBeenCalled();
 	expect(installAccessListener).toHaveBeenCalledTimes(1);
 	expect(container.querySelector("[data-settings]")).toBeNull();
@@ -242,15 +235,6 @@ test("failed project refresh never authorizes creating from a stale writable sum
 	expect(container.querySelector("button")).toBeNull();
 	expect(container.querySelector("[data-project]")).toBeNull();
 	expect(list).not.toHaveBeenCalled();
-});
-test("resource errors load only after explicit expansion and preserve session links", async () => {
-	resourcesError = true;
-	await act(async () => root.render(<Page />));
-	expect(chapters).not.toHaveBeenCalled();
-	await openDetails(1);
-	expect(chapters).toHaveBeenCalled();
-	expect(container.textContent).toContain("compatibility.resourcesUnavailable");
-	expect(container.querySelector('a[href="/narrators/old-session"]')).not.toBeNull();
 });
 test("optional settings render failure stays local to the expanded section", async () => {
 	settingsError = true;

@@ -472,8 +472,8 @@ export const settingsApi = {
 			body: JSON.stringify({ tabs }),
 		}),
 	/**
-	 * Remove one recent tab. `cascade` is for entity-teardown cleanups (chapter deleted,
-	 * narrator archived) — it skips minting an undo token so it cannot clobber a pending
+	 * Remove one recent tab. `cascade` is for entity-teardown cleanups (a narrator
+	 * archived) — it skips minting an undo token so it cannot clobber a pending
 	 * user undo with a snapshot that points at already-deleted entities.
 	 */
 	removeRecentTab: (
@@ -516,23 +516,6 @@ export const settingsApi = {
 		request<RecentTabsMutationResponse>("/user-preferences/recent-tabs/restore", {
 			method: "POST",
 			body: JSON.stringify(input),
-		}),
-	saveGraphViewport: (
-		projectId: string,
-		viewport: {
-			x: number;
-			y: number;
-			zoom: number;
-			rulerOrientation?: "horizontal" | "vertical";
-			rulerEdge?: "start" | "end";
-			rulerMainPan?: number;
-			rulerCrossPan?: number;
-			rulerThickness?: number;
-		},
-	) =>
-		request<{ ok: boolean }>("/user-preferences/graph-viewports", {
-			method: "PATCH",
-			body: JSON.stringify({ projectId, viewport }),
 		}),
 	/**
 	 * 保存某个叙述者的大纲标签排布。服务端按 narratorId 合并写入，

@@ -403,7 +403,6 @@ export interface DatabaseCleanupApiRequestSample extends FallbackDiagnostics {
 	id: string;
 	narratorId: string | null;
 	narratorTitle: string | null;
-	chapterTitle: string | null;
 	createdAt: string;
 	approxBytes: number;
 }

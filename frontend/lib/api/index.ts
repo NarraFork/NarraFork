@@ -1,5 +1,4 @@
 import { authApi } from "./auth";
-import { chaptersApi } from "./chapters";
 import { chatApi } from "./chat";
 import { apiBase } from "./client";
 import { commandCodeApi } from "./commandcode";
@@ -33,7 +32,6 @@ export function getAvatarUrl(userId: string, avatarImageId: string): string {
 export const api = {
 	...authApi,
 	...projectsApi,
-	...chaptersApi,
 	...chatApi,
 	...narratorsApi,
 	...notificationsApi,

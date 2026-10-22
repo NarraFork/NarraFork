@@ -1,4 +1,4 @@
-import { GitCommitPreviewPage } from "@frontend/components/chapter/GitCommitPreviewPage";
+import { GitCommitPreviewPage } from "@frontend/components/git/GitCommitPreviewPage";
 import { validateCommitPreviewSearch } from "@frontend/lib/git-commit-preview-navigation";
 import { createFileRoute } from "@tanstack/react-router";
 

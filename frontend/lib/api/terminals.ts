@@ -2,16 +2,11 @@ import { request } from "./client";
 import type { ApiEntity } from "./types";
 
 export const terminalsApi = {
-	listTerminals: (chapterId: string) => {
-		const params = new URLSearchParams({ chapterId });
-		return request<ApiEntity[]>(`/terminals?${params}`);
-	},
 	listTerminalsByNarrator: (narratorId: string) => {
 		const params = new URLSearchParams({ narratorId });
 		return request<ApiEntity[]>(`/terminals?${params}`);
 	},
 	createTerminal: (data: {
-		chapterId?: string;
 		narratorId?: string;
 		name?: string;
 		cols?: number;
@@ -34,14 +29,12 @@ export const terminalsApi = {
 	// stores only their order in `terminal_view_state` (below, which is in use).
 
 	// Terminal View State
-	getTerminalViewState: (opts: { chapterId?: string; narratorId?: string }) => {
+	getTerminalViewState: (opts: { narratorId?: string }) => {
 		const params = new URLSearchParams();
-		if (opts.chapterId) params.set("chapterId", opts.chapterId);
 		if (opts.narratorId) params.set("narratorId", opts.narratorId);
 		return request<ApiEntity>(`/terminals/view-state?${params}`);
 	},
 	updateTerminalViewState: (data: {
-		chapterId?: string;
 		narratorId?: string;
 		layout?: string;
 		activeTabId?: string | null;

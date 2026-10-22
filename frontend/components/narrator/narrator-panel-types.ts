@@ -122,7 +122,6 @@ export interface PermissionCallbacks {
 
 export interface NarratorPanelSnapshot {
 	id: string;
-	chapterId?: string | null;
 	title?: string | null;
 	model: string | null;
 	status: string;
@@ -160,7 +159,6 @@ export interface NarratorDetailsPanelExternalProps {
 export interface NarratorPanelProps {
 	narratorId: string;
 	narrator?: NarratorPanelSnapshot;
-	onForkFromMessage?: (messageId: string) => void;
 	highlightMessageId?: string;
 	/** Re-arm a message jump without remounting the session. */
 	highlightRequestId?: string;
@@ -172,7 +170,7 @@ export interface NarratorPanelProps {
 	compact?: boolean;
 	/** Own the physical left/right safe areas for an edge-to-edge fullscreen mobile view. */
 	ownsHorizontalSafeArea?: boolean;
-	/** When provided, replaces the back arrow with a minimize button (e.g. return to narraflow) */
+	/** When provided, replaces the back arrow with a minimize button */
 	onMinimize?: () => void;
 	/** Custom back navigation handler (e.g. subagent → parent narrator) */
 	onBack?: () => void;

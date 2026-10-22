@@ -6,43 +6,11 @@ import { createElement, type ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import { narratorWSManager } from "../lib/narrator-ws-manager";
 import {
-	coerceCommitSyncErrorEvent,
 	coerceCompactProgressEvent,
 	coercePermissionRoutingFields,
 	normalizeSubagentActivityCatchUp,
 	useNarratorWS,
 } from "./useNarratorWS";
-
-describe("coerceCommitSyncErrorEvent", () => {
-	test("preserves structured commit sync diagnostics", () => {
-		expect(
-			coerceCommitSyncErrorEvent({
-				chapterId: "chapter-1",
-				code: "WORKTREE_WATCHER_COMMIT_SYNC_FAILED",
-				reason: "failed to read git log",
-				error: "git log failed",
-				fallback: true,
-				fatal: false,
-				backgroundSync: true,
-				extra: "kept",
-			}),
-		).toEqual({
-			chapterId: "chapter-1",
-			code: "WORKTREE_WATCHER_COMMIT_SYNC_FAILED",
-			reason: "failed to read git log",
-			error: "git log failed",
-			message: undefined,
-			fallback: true,
-			fatal: false,
-			backgroundSync: true,
-			extra: "kept",
-		});
-	});
-
-	test("ignores events without a chapter id", () => {
-		expect(coerceCommitSyncErrorEvent({ code: "WORKTREE_WATCHER_COMMIT_SYNC_FAILED" })).toBeNull();
-	});
-});
 
 describe("coerceCompactProgressEvent", () => {
 	test("normalizes live compact progress", () => {
@@ -461,26 +429,13 @@ describe("useNarratorWS initial catch-up cursor ownership", () => {
 			newListener?.({
 				type: "git_status",
 				narratorId: "n2",
-				chapterId: "c",
 				linesAdded: 7,
 				linesRemoved: 2,
 			});
-			newListener?.({
-				type: "git_status",
-				narratorId: "n2",
-				chapterId: "c",
-				commitsAhead: 1,
-				baseBranch: "main",
-			});
+			newListener?.({ type: "git_status", narratorId: "n2" });
 			expect(gitStatuses).toEqual([
-				{ chapterId: "c", commitsAhead: 0, baseBranch: "", linesAdded: 7, linesRemoved: 2 },
-				{
-					chapterId: "c",
-					commitsAhead: 1,
-					baseBranch: "main",
-					linesAdded: undefined,
-					linesRemoved: undefined,
-				},
+				{ linesAdded: 7, linesRemoved: 2 },
+				{ linesAdded: undefined, linesRemoved: undefined },
 			]);
 			// Dedicated evidence crosses the raw WS dispatcher; input metadata is not a fallback.
 			const editInput = { file_path: "a.ts", old_string: "h".repeat(20_000), new_string: "new" };

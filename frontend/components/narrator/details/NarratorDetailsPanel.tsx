@@ -45,7 +45,6 @@ import React, { createContext, useContext, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { invalidateAvatarCache } from "../../../hooks/useAvatarBlobUrl";
 import { useBrowserSessions } from "../../../hooks/useBrowserSessions";
-import { useChapter } from "../../../hooks/useChapters";
 import { useMobileDrawerHistory } from "../../../hooks/useMobileDrawerHistory";
 import {
 	useBlacklistDirs,
@@ -400,14 +399,12 @@ function NarratorDetailsContent({
 		t,
 	);
 
-	const chapterId = narrator?.chapterId ? String(narrator.chapterId) : "";
 	const parentNarratorId = narrator?.parentNarratorId ? String(narrator.parentNarratorId) : "";
 	// Same identity rule as NarratorPanel / server `isSubagentVariant`.
 	const isSubagent = !!(narrator as { variant?: string } | undefined)?.variant?.startsWith(
 		"subagent:",
 	);
 
-	const { data: chapter } = useChapter(opened ? chapterId : "");
 	const { data: parentNarrator } = useNarrator(opened ? parentNarratorId : "");
 	const { data: usageStats } = useNarratorUsageStats(narratorId, true, opened);
 	const { data: userPrefs } = useUserPreferences();
@@ -638,12 +635,6 @@ function NarratorDetailsContent({
 		if (source === "workspace") return "cyan";
 		if (source === "project") return "teal";
 		return "violet";
-	};
-
-	const openChapter = () => {
-		if (!chapterId) return;
-		onClose();
-		navigate({ to: "/chapters/$chapterId", params: { chapterId } });
 	};
 
 	const openParentNarrator = () => {
@@ -900,7 +891,7 @@ function NarratorDetailsContent({
 				[t("details.session"), ...sessionSearchableText],
 				[t("details.export"), t("details.exportFormat"), t("details.exportAction")],
 				[t("details.customTraits"), t("details.toolRestriction"), t("details.skillRestriction")],
-				[t("details.relationships"), t("details.chapter"), t("details.inheritMode")],
+				[t("details.relationships"), t("details.inheritMode")],
 				[t("details.activity"), t("details.viewerNames"), t("details.pendingPermissions")],
 				[t("details.rules"), t("details.whitelistDirs"), t("details.cmdBlacklist")],
 				[t("details.contextSummary")],
@@ -1586,16 +1577,10 @@ function NarratorDetailsContent({
 							narratorId={narratorId}
 							format={exportFormat}
 							narratorCwd={typeof narrator?.cwd === "string" ? narrator.cwd : null}
-							// Mirrors resolveNarratorProjectId: the chapter's project, else the context
-							// project. Decides which project-scoped devices can be offered.
+							// The narrator's project context decides which project-scoped devices
+							// can be offered.
 							projectId={
-								chapterId
-									? typeof chapter?.projectId === "string"
-										? chapter.projectId
-										: null
-									: typeof narrator?.contextProjectId === "string"
-										? narrator.contextProjectId
-										: null
+								typeof narrator?.contextProjectId === "string" ? narrator.contextProjectId : null
 							}
 						/>
 					) : (
@@ -1736,34 +1721,12 @@ function NarratorDetailsContent({
 					id="relationships"
 					title={t("details.relationships")}
 					searchableText={[
-						t("details.chapter"),
 						t("details.parentNarrator"),
 						t("details.inheritMode"),
 						t("details.forkMessageId"),
-						chapter?.title ?? "",
 						parentNarrator?.title ?? "",
 					]}
 				>
-					<DetailRow
-						label={t("details.chapter")}
-						value={
-							chapterId ? (
-								<Stack gap={6} align="flex-end">
-									<Text size="sm">{chapter?.title || chapterId}</Text>
-									<Group gap={6} justify="flex-end">
-										<Badge variant="outline">{chapterId.slice(0, 8)}</Badge>
-										<Button variant="light" size="compact-xs" onClick={openChapter}>
-											{t("details.openChapter")}
-										</Button>
-									</Group>
-								</Stack>
-							) : (
-								<Text size="sm" c="dimmed">
-									{t("details.standalone")}
-								</Text>
-							)
-						}
-					/>
 					{parentNarratorId ? (
 						<DetailRow
 							label={t("details.parentNarrator")}

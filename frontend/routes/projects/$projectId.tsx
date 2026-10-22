@@ -3,7 +3,6 @@ import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { Component, lazy, type ReactNode, Suspense, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useChapters } from "../../hooks/useChapters";
 import { installProjectAccessListener } from "../../hooks/useProjectAccess";
 import { useProject } from "../../hooks/useProjects";
 import { api } from "../../lib/api";
@@ -13,14 +12,9 @@ const CreateNarratorModal = lazy(() =>
 		default: m.CreateNarratorModal,
 	})),
 );
-const ProjectCompatibilityPanel = lazy(() =>
-	import("../../components/project/ProjectCompatibilityPanel").then((m) => ({
-		default: m.ProjectCompatibilityPanel,
-	})),
-);
-const LegacyResourceRecovery = lazy(() =>
-	import("../../components/project/LegacyResourceRecovery").then((m) => ({
-		default: m.LegacyResourceRecovery,
+const ProjectSettingsPanel = lazy(() =>
+	import("../../components/project/ProjectSettingsPanel").then((m) => ({
+		default: m.ProjectSettingsPanel,
 	})),
 );
 
@@ -50,7 +44,6 @@ function ProjectPage() {
 	const canWrite = !project.isError && project.data?.canWrite === true;
 	const [creating, setCreating] = useState(false);
 	const [settingsOpen, setSettingsOpen] = useState(false);
-	const [resourcesOpen, setResourcesOpen] = useState(false);
 	const sessions = useInfiniteQuery({
 		queryKey: ["narrators", "project", projectId],
 		queryFn: ({ pageParam }) =>
@@ -121,19 +114,7 @@ function ProjectPage() {
 						fallback={<Alert color="red">{t("compatibility.unavailable")}</Alert>}
 					>
 						<Suspense fallback={<Loader size="sm" />}>
-							<ProjectCompatibilityPanel projectId={projectId} />
-						</Suspense>
-					</ProjectToolsBoundary>
-				)}
-			</details>
-			<details onToggle={(event) => setResourcesOpen(event.currentTarget.open)}>
-				<summary>{t("compatibility.resources")}</summary>
-				{resourcesOpen && (
-					<ProjectToolsBoundary
-						fallback={<Alert color="red">{t("compatibility.resourcesUnavailable")}</Alert>}
-					>
-						<Suspense fallback={<Loader size="sm" />}>
-							<ProjectResources projectId={projectId} />
+							<ProjectSettingsPanel projectId={projectId} />
 						</Suspense>
 					</ProjectToolsBoundary>
 				)}
@@ -155,51 +136,6 @@ function ProjectPage() {
 						/>
 					</Suspense>
 				</ProjectToolsBoundary>
-			)}
-		</Stack>
-	);
-}
-
-function ProjectResources({ projectId }: { projectId: string }) {
-	const { t } = useTranslation("projects");
-	const chapters = useChapters(projectId);
-	return (
-		<Stack mt="sm">
-			<Text size="sm" c="dimmed">
-				{t("compatibility.resourcesDescription")}
-			</Text>
-			{chapters.isLoading && <Loader size="sm" />}
-			{chapters.isError && <Alert color="red">{t("compatibility.resourcesUnavailable")}</Alert>}
-			{!chapters.isError &&
-				chapters.data?.map((chapter) => (
-					<Card key={chapter.id} withBorder>
-						<Group justify="space-between">
-							<Stack gap={2}>
-								<Text>{chapter.title}</Text>
-								<Text size="xs" c="dimmed">
-									{chapter.status} · {chapter.worktreePath || chapter.branch}
-								</Text>
-							</Stack>
-							<Link
-								to="/chapters/$chapterId"
-								params={{ chapterId: chapter.id }}
-								style={{ textDecoration: "none" }}
-							>
-								<Button component="span" variant="light">
-									{t("compatibility.openResources")}
-								</Button>
-							</Link>
-							<LegacyResourceRecovery
-								chapterId={chapter.id}
-								projectId={projectId}
-								status={chapter.status}
-								containerConfig={chapter.containerConfig}
-							/>
-						</Group>
-					</Card>
-				))}
-			{chapters.isSuccess && chapters.data.length === 0 && (
-				<Text c="dimmed">{t("compatibility.noResources")}</Text>
 			)}
 		</Stack>
 	);

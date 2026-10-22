@@ -30,7 +30,6 @@ const changeTypes = [
 	"project_access_changed",
 	"narrator_deleted",
 	"narrators_deleted",
-	"chapter_deleted",
 	"project_deleted",
 ];
 

@@ -61,7 +61,7 @@ const NarratorDetailsPanel = lazy(() =>
 const SpecPanel = lazy(() =>
 	import("../narrator/spec/SpecPanel").then((m) => ({ default: m.SpecPanel })),
 );
-const GitPanel = lazy(() => import("../chapter/GitPanel").then((m) => ({ default: m.GitPanel })));
+const GitPanel = lazy(() => import("../git/GitPanel").then((m) => ({ default: m.GitPanel })));
 const BackgroundTasksPanel = lazy(() =>
 	import("../narrator/background/BackgroundTasksDrawer").then((m) => ({
 		default: m.BackgroundTasksPanel,
@@ -193,7 +193,6 @@ function PanelContent({ descriptor }: { descriptor: PanelWindowDescriptor }) {
 				<NarratorToolWindow
 					toolType={descriptor.toolType}
 					narratorId={descriptor.narratorId}
-					chapterId={descriptor.chapterId}
 				/>
 			);
 		case "file":
@@ -243,16 +242,8 @@ function WebviewWindow({ initialConfig }: { initialConfig: WebviewLeafConfig }) 
 }
 
 /** The workspace's narrator-tool wrapper, resolved to the narrator-bound renderer. */
-function NarratorToolWindow({
-	toolType,
-	narratorId,
-	chapterId,
-}: {
-	toolType: string;
-	narratorId: string;
-	chapterId?: string | null;
-}) {
-	const d = normalizePanelWindowDescriptor({ panelType: toolType, narratorId, chapterId });
+function NarratorToolWindow({ toolType, narratorId }: { toolType: string; narratorId: string }) {
+	const d = normalizePanelWindowDescriptor({ panelType: toolType, narratorId });
 	if (!d || !("narratorId" in d)) return null;
 	return <NarratorBoundWindow descriptor={d} />;
 }
@@ -268,14 +259,13 @@ function NarratorBoundWindow({
 	descriptor: Extract<PanelWindowDescriptor, { narratorId: string }>;
 }) {
 	const { narratorId } = descriptor;
-	const chapterId = "chapterId" in descriptor ? descriptor.chapterId : undefined;
 	switch (descriptor.panelType) {
 		case "details":
 			return <DetailsWindow narratorId={narratorId} />;
 		case "spec":
 			return <SpecPanel narratorId={narratorId} onClose={closeWindow} chromeless />;
 		case "git":
-			return <GitPanel narratorId={narratorId} chapterId={chapterId} />;
+			return <GitPanel narratorId={narratorId} />;
 		case "browser":
 			return <BrowserWindow narratorId={narratorId} />;
 		case "tasks":

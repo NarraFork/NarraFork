@@ -75,11 +75,6 @@ export function NotificationListItem({ item, onActivate }: NotificationListItemP
 							{item.projectTitle}
 						</Text>
 					)}
-					{item.chapterTitle && (
-						<Text size="xs" c="dimmed">
-							{item.chapterTitle}
-						</Text>
-					)}
 					<Text size="xs" c="dimmed">
 						{formatRelativeTime(new Date(item.createdAt).toISOString())}
 					</Text>

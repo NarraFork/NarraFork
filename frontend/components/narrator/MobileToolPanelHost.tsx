@@ -9,7 +9,7 @@
  * the buttons simply were not rendered.
  *
  * The panel CONTENT components were already independent of dockview: each takes
- * a `narratorId` (or `chapterId`) and most accept `chromeless`. Only the dock's
+ * a `narratorId` and most accept `chromeless`. Only the dock's
  * `ToolPanelShell` needed `props.api`. So the fix is a second host for the same
  * content, not a second implementation of it — this Drawer is that host.
  *
@@ -31,7 +31,7 @@ import {
 } from "../../lib/safe-area";
 import type { ScrollToMessageFn } from "./message/message-list-handle";
 
-const GitPanel = lazy(() => import("../chapter/GitPanel").then((m) => ({ default: m.GitPanel })));
+const GitPanel = lazy(() => import("../git/GitPanel").then((m) => ({ default: m.GitPanel })));
 const NarratorSearchPanel = lazy(() =>
 	import("./NarratorSearchPanel").then((m) => ({ default: m.NarratorSearchPanel })),
 );
@@ -94,8 +94,6 @@ export interface MobileToolPanelHostProps {
 	kind: MobileToolPanelKind | null;
 	onClose: () => void;
 	narratorId: string;
-	/** Optional legacy chapter association; Git resolves the narrator's actual workspace. */
-	chapterId?: string | null;
 	/** Live browser session count, forwarded so the panel matches the dock's props. */
 	browserSessionCount?: number;
 	browserVisualChange?: { sessionId: string; seq: number } | null;

@@ -39,7 +39,6 @@ import { createFileRoute, useNavigate } from "@tanstack/react-router";
 import { useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { DirectoryPicker } from "../../components/common/DirectoryPicker";
-import { useChapters } from "../../hooks/useChapters";
 import { useAllModels } from "../../hooks/useModels";
 import { useProjects } from "../../hooks/useProjects";
 import {
@@ -75,10 +74,9 @@ interface TaskDraft {
 	model: string;
 	permissionMode: string;
 	locale: Locale;
-	runContext: "standalone" | "chapter";
+	runContext: "standalone" | "project";
 	cwd: string;
 	projectId: string;
-	chapterId: string;
 	narratorMode: "new" | "reuse";
 	cleanupMode: "none" | "keepLatestN" | "olderThanDays";
 	cleanupValue: number;
@@ -96,7 +94,6 @@ const EMPTY_DRAFT: TaskDraft = {
 	runContext: "standalone",
 	cwd: "",
 	projectId: "",
-	chapterId: "",
 	narratorMode: "new",
 	cleanupMode: "none",
 	cleanupValue: 20,
@@ -112,10 +109,10 @@ function draftFromTask(task: ScheduledTask): TaskDraft {
 		model: task.model ?? "",
 		permissionMode: task.permissionMode,
 		locale: task.locale,
-		runContext: task.runContext,
+		// The server reads legacy chapter tasks as project tasks.
+		runContext: task.runContext === "standalone" ? "standalone" : "project",
 		cwd: task.cwd ?? "",
 		projectId: task.projectId ?? "",
-		chapterId: task.chapterId ?? "",
 		narratorMode: task.narratorMode,
 		cleanupMode: task.cleanupPolicy?.mode ?? "none",
 		cleanupValue:
@@ -170,7 +167,7 @@ function ScheduledTasksPage() {
 	);
 
 	const buildInput = useCallback((): ScheduledTaskInput => {
-		const isChapter = draft.runContext === "chapter";
+		const isProject = draft.runContext === "project";
 		return {
 			name: draft.name.trim(),
 			cronExpr,
@@ -181,9 +178,8 @@ function ScheduledTasksPage() {
 			permissionMode: draft.permissionMode,
 			locale: draft.locale,
 			runContext: draft.runContext,
-			cwd: isChapter ? null : draft.cwd.trim() || null,
-			projectId: isChapter ? draft.projectId || null : null,
-			chapterId: isChapter ? draft.chapterId || null : null,
+			cwd: isProject ? null : draft.cwd.trim() || null,
+			projectId: isProject ? draft.projectId || null : null,
 			narratorMode: draft.narratorMode,
 			cleanupPolicy:
 				draft.cleanupMode === "none"
@@ -209,9 +205,8 @@ function ScheduledTasksPage() {
 		deleteMutation.mutate(deletingTask.id, { onSuccess: closeDelete });
 	}, [deletingTask, deleteMutation, closeDelete]);
 
-	const chapterModeValid =
-		draft.runContext !== "chapter" || (!!draft.projectId && !!draft.chapterId);
-	const saveDisabled = !draft.name.trim() || !draft.prompt.trim() || !cronExpr || !chapterModeValid;
+	const projectModeValid = draft.runContext !== "project" || !!draft.projectId;
+	const saveDisabled = !draft.name.trim() || !draft.prompt.trim() || !cronExpr || !projectModeValid;
 
 	return (
 		<Container size="md" py="lg">
@@ -439,7 +434,7 @@ function TaskRow({
 									{task.enabled ? t("statusEnabled") : t("statusDisabled")}
 								</Badge>
 								<Badge size="sm" variant="outline" color="indigo">
-									{task.runContext === "chapter" ? t("ctxChapter") : t("ctxStandalone")}
+									{task.runContext === "standalone" ? t("ctxStandalone") : t("ctxProject")}
 								</Badge>
 							</Group>
 							<Text size="xs" c="dimmed" ff="monospace">
@@ -537,9 +532,6 @@ function TaskFormModal({
 	const { t } = useTranslation("scheduledTasks");
 	const { t: tc } = useTranslation("common");
 	const { data: projects = [] } = useProjects();
-	const { data: chapters = [] } = useChapters(
-		draft.runContext === "chapter" ? draft.projectId : "",
-	);
 	const { groupedModels } = useAllModels();
 
 	const patch = useCallback(
@@ -710,7 +702,7 @@ function TaskFormModal({
 						onChange={(v) => patch({ runContext: v as TaskDraft["runContext"] })}
 						data={[
 							{ value: "standalone", label: t("ctxStandalone") },
-							{ value: "chapter", label: t("ctxChapter") },
+							{ value: "project", label: t("ctxProject") },
 						]}
 					/>
 					{draft.runContext === "standalone" ? (
@@ -723,30 +715,19 @@ function TaskFormModal({
 							onChange={(v) => patch({ cwd: v })}
 						/>
 					) : (
-						<Group grow align="flex-start">
-							<Select
-								label={t("project")}
-								placeholder={t("selectProject")}
-								data={projects.map((p) => ({ value: p.id, label: p.name }))}
-								value={draft.projectId || null}
-								onChange={(v) => patch({ projectId: v ?? "", chapterId: "" })}
-								searchable
-								// With no readable project, a chapter-scoped task cannot be built at
-								// all. Disabling with a reason beats an empty dropdown that looks
-								// broken — the user needs project access, not a retry.
-								disabled={projects.length === 0}
-								description={projects.length === 0 ? t("noProjectsAvailable") : undefined}
-							/>
-							<Select
-								label={t("chapter")}
-								placeholder={t("selectChapter")}
-								data={chapters.map((c) => ({ value: c.id, label: c.title || c.branch }))}
-								value={draft.chapterId || null}
-								onChange={(v) => patch({ chapterId: v ?? "" })}
-								disabled={!draft.projectId}
-								searchable
-							/>
-						</Group>
+						<Select
+							label={t("project")}
+							description={projects.length === 0 ? t("noProjectsAvailable") : t("projectDesc")}
+							placeholder={t("selectProject")}
+							data={projects.map((p) => ({ value: p.id, label: p.name }))}
+							value={draft.projectId || null}
+							onChange={(v) => patch({ projectId: v ?? "" })}
+							searchable
+							// With no readable project, a project task cannot be built at all.
+							// Disabling with a reason beats an empty dropdown that looks broken —
+							// the user needs project access, not a retry.
+							disabled={projects.length === 0}
+						/>
 					)}
 				</Stack>
 
@@ -761,7 +742,6 @@ function TaskFormModal({
 						]}
 						value={draft.narratorMode}
 						onChange={(v) => patch({ narratorMode: (v as TaskDraft["narratorMode"]) ?? "new" })}
-						disabled={draft.runContext === "chapter"}
 					/>
 					<Select
 						label={t("locale")}

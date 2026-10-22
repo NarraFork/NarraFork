@@ -160,9 +160,9 @@ function PluginRuntimeShell({ children }: { children: React.ReactNode }) {
 	// endpoint is public, so this needs no session.
 	useBranding();
 
-	// Foreground/WS-reconnect catch-up for the git status badges (ChapterBar /
-	// NarratorGitBar), which have no polling of their own. App-shell level so a
-	// badge mounted anywhere (narrator page, graph node) benefits.
+	// Foreground/WS-reconnect catch-up for the git status badges (NarratorGitBar),
+	// which have no polling of their own. App-shell level so a badge mounted anywhere
+	// (narrator page, workspace) benefits.
 	useGitBadgeRefresh();
 
 	// WS reconnect → resync the contribution snapshot (the event stream is only
@@ -233,9 +233,9 @@ function PluginRuntimeShell({ children }: { children: React.ReactNode }) {
 					panelInstanceId: params.panelInstanceId,
 				},
 				surface: {
-					// `graph` (a chapter node's embedded dock) reports as `narrator-focus`:
-					// both host exactly one narrator, and a new wire value would break
-					// already-published plugins. Mirrors PluginUiRuntimeProvider.
+					// `graph` (a retired surface kept in the manifest enum) reports as
+					// `narrator-focus`: both host exactly one narrator, and a new wire value
+					// would break already-published plugins. Mirrors PluginUiRuntimeProvider.
 					kind:
 						sessionContext.surface === "focus" || sessionContext.surface === "graph"
 							? ("narrator-focus" as const)
@@ -249,7 +249,6 @@ function PluginRuntimeShell({ children }: { children: React.ReactNode }) {
 					? {
 							narrator: {
 								id: sessionContext.narratorId,
-								chapterId: sessionContext.chapterId,
 								projectId: sessionContext.projectId,
 							},
 						}

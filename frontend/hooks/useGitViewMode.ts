@@ -5,7 +5,7 @@ import {
 	parseGitViewPrefs,
 	readGitViewMode,
 	setGitViewMode,
-} from "../components/chapter/git-view-prefs";
+} from "../components/git/git-view-prefs";
 
 const listeners = new Set<() => void>();
 

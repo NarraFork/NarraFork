@@ -196,8 +196,7 @@ describe("waiting-for-model is distinguishable from idle", () => {
 });
 
 /**
- * The accent strings (`slate.5`, `var(--mantine-color-slate-5)`) and the Pixi
- * ruler layer (which reads the variable off the document) only work because
+ * The accent strings (`slate.5`, `var(--mantine-color-slate-5)`) only work because
  * Mantine emits per-shade variables for a *custom* theme color, not just the
  * built-in palette. Assert that contract so a Mantine upgrade that changed it
  * would fail here instead of silently rendering invisible dots.
@@ -405,31 +404,6 @@ describe("status shapes separate states colour no longer can", () => {
 function isFilledForShape(display: { solidAccent?: boolean; shape?: string }): boolean {
 	return !!display.solidAccent || !!display.shape;
 }
-
-/**
- * The Pixi ruler layer needs a numeric hex read off a CSS variable, so it cannot use
- * the registry's Mantine props — but it must not re-spell the shade either. That
- * duplicate is what shipped a stale shade in the first release of this feature, with
- * nothing failing: the ruler dots were simply the wrong colour.
- *
- * ⚠️ This used to be asserted by REGEX-MATCHING pixi-theme's source for the literal
- * `"--mantine-color-slate-5"`. That is a snapshot of an implementation detail: it
- * broke on any reformatting and, worse, it passed for two files that agreed on a
- * WRONG shade. The bridge now DERIVES the variable name from the registry, so the
- * duplicate is gone and the test can assert the real thing — the value both sides
- * resolve to.
- */
-describe("the Pixi theme bridge tracks the registry accent shade", () => {
-	test("pixi-theme derives its variable name from the registry entry", async () => {
-		const display = getEffectiveNarratorDisplay("waiting", ["model_unavailable"]);
-		const { PIXI_THEME_VARS } = await import("../components/ruler/pixi/pixi-theme");
-		// The exact variable the registry pins for this state — not a shade spelled
-		// twice, but one derivation observed from both sides.
-		expect(PIXI_THEME_VARS.narratorModelUnavailable).toBe(
-			`--mantine-color-${display.color}-${display.accentShade}`,
-		);
-	});
-});
 
 /**
  * The sidebar is where "indistinguishable from idle" was actually reported: it

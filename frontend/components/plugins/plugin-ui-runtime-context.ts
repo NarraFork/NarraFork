@@ -127,7 +127,6 @@ export function fallbackPluginUiContext(
 			? {
 					narrator: {
 						id: sessionContext.narratorId,
-						chapterId: sessionContext.chapterId,
 						projectId: sessionContext.projectId,
 					},
 				}

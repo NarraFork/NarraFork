@@ -23,7 +23,6 @@ export function appendExecutionLogFilters(
 ): void {
 	if (filters.narratorId) params.append("narratorId", filters.narratorId);
 	if (filters.includeSubagents) params.append("includeSubagents", "1");
-	if (filters.chapterId) params.append("chapterId", filters.chapterId);
 	if (filters.projectId) params.append("projectId", filters.projectId);
 	if (filters.toolName) params.append("toolName", filters.toolName);
 	if (filters.status) params.append("status", filters.status);

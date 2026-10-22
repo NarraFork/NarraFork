@@ -160,7 +160,7 @@ function SubagentDockPanel(props: IDockviewPanelProps<SubagentPanelParams>) {
 /**
  * Narrator-scoped tool panel adapter (terminal / details / spec /
  * git / browser). Reuses the focus dock's tool adapters verbatim — they read
- * `narratorId` / `chapterId` and published props from the dock context, so we
+ * `narratorId` and published props from the dock context, so we
  * just provide a per-narrator context and delegate by `toolType`.
  */
 function NarratorToolDockPanel(props: IDockviewPanelProps<NarratorToolPanelParams>) {
@@ -180,13 +180,12 @@ function NarratorToolDockPanel(props: IDockviewPanelProps<NarratorToolPanelParam
 	// Adapt the narrator-tool params to the NarratorBoundPanelParams shape the
 	// dock adapters expect. `toolType` (ResourcePanelKind) is a subset of the
 	// dock's panel types, so it maps directly onto `panelType`. Building a real
-	// params object (rather than a blanket `as unknown as`) keeps narratorId /
-	// chapterId type-checked; only the IDockviewPanelProps wrapper is asserted,
+	// params object (rather than a blanket `as unknown as`) keeps narratorId
+	// type-checked; only the IDockviewPanelProps wrapper is asserted,
 	// since its api fields are identical across both param generics.
 	const adaptedParams: NarratorBoundPanelParams = {
 		panelType: toolType,
 		narratorId,
-		chapterId: props.params.chapterId,
 	};
 	const toolProps = {
 		...props,

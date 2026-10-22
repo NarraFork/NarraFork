@@ -73,8 +73,6 @@ async function render(overrides: Partial<UseNarratorForkActionsOptions> = {}) {
 		root.render(
 			<Probe
 				narratorId="narrator-a"
-				chapterId={null}
-				onForkFromMessage={undefined}
 				navigateToNarrator={() => {}}
 				{...overrides}
 			/>,
@@ -137,29 +135,5 @@ describe("narrator fork action identity", () => {
 			narratorId: "narrator-b",
 			forkMessageId: "new-message",
 		});
-	});
-
-	test("chapter sources fork the conversation without invoking legacy resource callbacks", async () => {
-		const host = mock((_id: string) => {});
-		const replacement = mock((_id: string) => {});
-		const navigate = mock((_id: string) => {});
-		await render({ chapterId: "chapter", onForkFromMessage: host, navigateToNarrator: navigate });
-		const first = actions.forkHandler;
-		await render({
-			chapterId: "other-chapter",
-			onForkFromMessage: replacement,
-			navigateToNarrator: navigate,
-		});
-		expect(actions.forkHandler).toBe(first);
-		expect(rowRenders).toBe(1);
-		actions.forkHandler?.("host-message");
-		expect(host).not.toHaveBeenCalled();
-		expect(replacement).not.toHaveBeenCalled();
-		expect(mutate.mock.calls[0]?.[0]).toEqual({
-			narratorId: "narrator-a",
-			forkMessageId: "host-message",
-		});
-		mutate.mock.calls[0]?.[1].onSuccess({ id: "ordinary-child" });
-		expect(navigate).toHaveBeenCalledWith("ordinary-child");
 	});
 });

@@ -17,7 +17,7 @@ let client: QueryClient;
 let searchSpy: ReturnType<typeof spyOn<typeof api, "search">>;
 let result: ReturnType<typeof useSearch>;
 const originals = new Map<string, PropertyDescriptor | undefined>();
-const entities = "chapters,messages,narrators,knowledge";
+const entities = "messages,narrators,knowledge";
 const notificationTimers = new Map<ReturnType<typeof setTimeout>, () => void>();
 
 function Probe({ query, sort }: { query: string; sort?: SearchSortMode }) {

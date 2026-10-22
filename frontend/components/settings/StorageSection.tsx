@@ -1571,11 +1571,6 @@ export function StorageSection() {
 																{sample.narratorTitle || sample.narratorId || sample.id.slice(0, 8)}
 															</Text>
 															<Group gap="xs" wrap="wrap" mt={4}>
-																{sample.chapterTitle && (
-																	<Text size="xs" c="dimmed">
-																		{sample.chapterTitle}
-																	</Text>
-																)}
 																<Text size="xs" c="dimmed">
 																	{t("storageDatabaseCreatedAt", {
 																		time: formatDateTime(sample.createdAt),
