@@ -313,11 +313,10 @@ describe("mobile safe-area layout contract", () => {
 	});
 
 	test("only the fullscreen mobile narrator route opts into horizontal safe-area ownership", async () => {
-		const [route, workspacePanels, dockPanels, rulerFlow] = await Promise.all([
+		const [route, workspacePanels, dockPanels] = await Promise.all([
 			Bun.file(new URL("../routes/narrators/$narratorId.tsx", import.meta.url)).text(),
 			Bun.file(new URL("../components/narrator/workspace/panels.tsx", import.meta.url)).text(),
 			Bun.file(new URL("../components/narrator/dock/panels.tsx", import.meta.url)).text(),
-			Bun.file(new URL("../components/ruler/RulerFlow.tsx", import.meta.url)).text(),
 		]);
 
 		// One persistent chat now serves both layouts. Ownership must still be
@@ -326,7 +325,6 @@ describe("mobile safe-area layout contract", () => {
 		expect(route.match(/ownsHorizontalSafeArea/g)).toHaveLength(1);
 		expect(workspacePanels).not.toContain("ownsHorizontalSafeArea");
 		expect(dockPanels).not.toContain("ownsHorizontalSafeArea");
-		expect(rulerFlow).not.toContain("ownsHorizontalSafeArea");
 	});
 
 	test("AppShell navbar has one top exclusion owner in each responsive layout", async () => {
@@ -1131,7 +1129,6 @@ describe("mobile safe-area layout contract", () => {
 		const [
 			appShell,
 			contentViewer,
-			chapterRoute,
 			settingsRoute,
 			oauthAppsRoute,
 			providersRoute,
@@ -1139,7 +1136,6 @@ describe("mobile safe-area layout contract", () => {
 		] = await Promise.all([
 			Bun.file(new URL("../components/AuthenticatedAppLayout.tsx", import.meta.url)).text(),
 			Bun.file(new URL("../components/narrator/content/ContentViewer.tsx", import.meta.url)).text(),
-			Bun.file(new URL("../routes/chapters/$chapterId.tsx", import.meta.url)).text(),
 			Bun.file(new URL("../routes/settings.tsx", import.meta.url)).text(),
 			Bun.file(new URL("../routes/settings/oauth-apps.tsx", import.meta.url)).text(),
 			Bun.file(new URL("../routes/settings/providers.tsx", import.meta.url)).text(),
@@ -1155,7 +1151,6 @@ describe("mobile safe-area layout contract", () => {
 		expect(authenticatedLayout).not.toContain('h="100vh"');
 		expect(contentViewer).not.toContain('height: "calc(100vh - 60px)"');
 		expect(contentViewer).toContain("SAFE_AREA_FULLSCREEN_MODAL_CONTENT_STYLE");
-		expect(chapterRoute).toContain("h={APP_SHELL_CONTENT_HEIGHT}");
 		expect(settingsRoute).not.toContain("calc(100vh");
 		expect(settingsRoute).toContain("SAFE_AREA_INSET_BOTTOM");
 		expect(oauthAppsRoute).not.toContain("calc(100vh");

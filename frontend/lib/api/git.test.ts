@@ -106,7 +106,7 @@ describe("git APIs", () => {
 		clearToken();
 	});
 
-	test("line stats reads pin the workspace, preserve the chapter adapter and forward cancellation", async () => {
+	test("line stats reads pin the workspace and forward cancellation", async () => {
 		installLocalStorage();
 		const calls: Array<{ url: string; init?: RequestInit }> = [];
 		Object.defineProperty(g, "fetch", {
@@ -121,12 +121,9 @@ describe("git APIs", () => {
 			{ narratorId: "n /", workspaceKey: "设备:/a b?", canWrite: false },
 			controller.signal,
 		);
-		await api.getGitLineStats("chapter /", controller.signal);
 		const urls = calls.map(({ url }) => new URL(url, "http://localhost"));
 		expect(urls[0]?.pathname).toBe("/api/narrators/n%20%2F/git/line-stats");
 		expect(urls[0]?.searchParams.get("workspaceKey")).toBe("设备:/a b?");
-		expect(urls[1]?.pathname).toBe("/api/chapters/chapter%20%2F/git/line-stats");
-		expect(urls[1]?.search).toBe("");
 		controller.abort();
 		expect(calls.every(({ init }) => init?.signal?.aborted && !init.body && !init.method)).toBe(
 			true,
@@ -157,23 +154,22 @@ describe("git APIs", () => {
 		await api.getGitCommitDetail(target, sha, controller.signal);
 		await api.getGitCommitDiff(target, sha, file, oldPath, controller.signal);
 		await api.getGitCommitDiff(target, sha, file, undefined, controller.signal);
-		await api.getGitCommitDetail("chapter /?#", sha256, controller.signal);
-		await api.getGitCommitDiff("chapter /?#", sha256, file, oldPath, controller.signal);
+		await api.getGitCommitDetail(target, sha256, controller.signal);
+		await api.getGitCommitDiff(target, sha256, file, oldPath, controller.signal);
 
 		const urls = calls.map(({ url }) => new URL(url, "http://localhost"));
 		expect(urls[0]?.pathname).toBe(`/api/narrators/narrator%20%2F%3F%23/git/commits/${sha}`);
 		expect(urls[1]?.pathname).toBe(`${urls[0]?.pathname}/diff`);
 		expect(
-			urls.slice(0, 3).every((url) => url.searchParams.get("workspaceKey") === target.workspaceKey),
+			urls.every((url) => url.searchParams.get("workspaceKey") === target.workspaceKey),
 		).toBe(true);
 		expect(urls[0]?.searchParams.size).toBe(1);
 		for (const index of [1, 2, 4]) expect(urls[index]?.searchParams.get("file")).toBe(file);
 		for (const index of [1, 4]) expect(urls[index]?.searchParams.get("oldPath")).toBe(oldPath);
 		expect(urls[1]?.searchParams.size).toBe(3);
 		expect(urls[2]?.searchParams.has("oldPath")).toBe(false);
-		expect(urls[3]?.pathname).toBe(`/api/chapters/chapter%20%2F%3F%23/git/commits/${sha256}`);
+		expect(urls[3]?.pathname).toBe(`/api/narrators/narrator%20%2F%3F%23/git/commits/${sha256}`);
 		expect(urls[4]?.pathname).toBe(`${urls[3]?.pathname}/diff`);
-		expect(urls.slice(3).every((url) => !url.searchParams.has("workspaceKey"))).toBe(true);
 		expect(calls.every(({ init }) => (init?.method ?? "GET") === "GET" && !init?.body)).toBe(true);
 		expect(calls.every(({ init }) => init?.signal && !init.signal.aborted)).toBe(true);
 		controller.abort("preview closed");
@@ -255,6 +251,7 @@ describe("git APIs", () => {
 		Object.defineProperty(g, "fetch", {
 			value: async (input: RequestInfo | URL, init?: RequestInit) => {
 				const url = String(input);
+				const path = url.split("?")[0] ?? url;
 				calls.push({
 					url,
 					method: init?.method ?? "GET",
@@ -262,13 +259,13 @@ describe("git APIs", () => {
 					authorization: (init?.headers as Record<string, string> | undefined)?.Authorization,
 				});
 				let payload: unknown = summary;
-				if (url.includes("/git/diff")) {
+				if (path.endsWith("/git/diff")) {
 					payload = { diff: "diff --git a/src/file one.txt b/src/file one.txt", truncated: false };
-				} else if (url.endsWith("/git/stash/list")) {
+				} else if (path.endsWith("/git/stash/list")) {
 					payload = [{ index: 0, message: "stash change", date: "2026-06-09T00:00:00Z" }];
-				} else if (url.endsWith("/git/stash")) {
+				} else if (path.endsWith("/git/stash")) {
 					payload = { hasConflicts: false, status: summary };
-				} else if (url.includes("/git/log")) {
+				} else if (path.endsWith("/git/log")) {
 					payload = [
 						{
 							sha: "abcdef123456",
@@ -279,9 +276,9 @@ describe("git APIs", () => {
 							parents: ["1111111111111111111111111111111111111111"],
 						},
 					];
-				} else if (url.endsWith("/git/ai-commit-message")) {
+				} else if (path.endsWith("/git/ai-commit-message")) {
 					payload = { message: "fix: update file" };
-				} else if (url.endsWith("/git/commit")) {
+				} else if (path.endsWith("/git/commit")) {
 					payload = { commitSha: "abcdef123456", status: summary };
 				}
 				return new Response(JSON.stringify(payload), {
@@ -292,37 +289,37 @@ describe("git APIs", () => {
 			configurable: true,
 		});
 
-		const chapterId = "chapter-1";
-		expect((await api.getGitStatus(chapterId)).hasChanges).toBe(true);
-		expect((await api.gitStage(chapterId, { all: true })).staged).toBe(1);
-		expect((await api.gitUnstage(chapterId, { files: ["src/file one.txt"] })).unstaged).toBe(1);
-		expect((await api.gitCommit(chapterId, "fix: update file")).commitSha).toBe("abcdef123456");
-		expect((await api.gitDiscard(chapterId, { files: ["src/file one.txt"] })).totalFiles).toBe(1);
-		expect((await api.getGitDiff(chapterId, "src/file one.txt", true)).truncated).toBe(false);
-		expect((await api.getGitStashList(chapterId))[0]?.message).toBe("stash change");
-		expect((await api.gitStash(chapterId, { action: "apply", index: 0 })).hasConflicts).toBe(false);
-		const logEntry = (await api.getGitLog(chapterId, 5, 1))[0];
+		const target: GitTarget = { narratorId: "narrator-1", workspaceKey: "w", canWrite: true };
+		expect((await api.getGitStatus(target)).hasChanges).toBe(true);
+		expect((await api.gitStage(target, { all: true })).staged).toBe(1);
+		expect((await api.gitUnstage(target, { files: ["src/file one.txt"] })).unstaged).toBe(1);
+		expect((await api.gitCommit(target, "fix: update file")).commitSha).toBe("abcdef123456");
+		expect((await api.gitDiscard(target, { files: ["src/file one.txt"] })).totalFiles).toBe(1);
+		expect((await api.getGitDiff(target, "src/file one.txt", true)).truncated).toBe(false);
+		expect((await api.getGitStashList(target))[0]?.message).toBe("stash change");
+		expect((await api.gitStash(target, { action: "apply", index: 0 })).hasConflicts).toBe(false);
+		const logEntry = (await api.getGitLog(target, 5, 1))[0];
 		expect(logEntry?.shortSha).toBe("abcdef1");
 		expect(logEntry?.parents).toEqual(["1111111111111111111111111111111111111111"]);
-		expect((await api.gitReset(chapterId, "HEAD~1", "soft")).branch).toBe("main");
-		expect((await api.gitAiCommitMessage(chapterId)).message).toBe("fix: update file");
+		expect((await api.gitReset(target, "HEAD~1", "soft")).branch).toBe("main");
+		expect((await api.gitAiCommitMessage(target)).message).toBe("fix: update file");
 
 		expect(calls.map((call) => `${call.method} ${call.url}`)).toEqual([
-			"GET /api/chapters/chapter-1/git/status",
-			"POST /api/chapters/chapter-1/git/stage",
-			"POST /api/chapters/chapter-1/git/unstage",
-			"POST /api/chapters/chapter-1/git/commit",
-			"POST /api/chapters/chapter-1/git/discard",
-			"GET /api/chapters/chapter-1/git/diff?file=src%2Ffile%20one.txt&staged=true",
-			"GET /api/chapters/chapter-1/git/stash/list",
-			"POST /api/chapters/chapter-1/git/stash",
-			"GET /api/chapters/chapter-1/git/log?limit=5&skip=1",
-			"POST /api/chapters/chapter-1/git/reset",
-			"POST /api/chapters/chapter-1/git/ai-commit-message",
+			"GET /api/narrators/narrator-1/git/status?workspaceKey=w",
+			"POST /api/narrators/narrator-1/git/stage",
+			"POST /api/narrators/narrator-1/git/unstage",
+			"POST /api/narrators/narrator-1/git/commit",
+			"POST /api/narrators/narrator-1/git/discard",
+			"GET /api/narrators/narrator-1/git/diff?file=src%2Ffile%20one.txt&staged=true&workspaceKey=w",
+			"GET /api/narrators/narrator-1/git/stash/list?workspaceKey=w",
+			"POST /api/narrators/narrator-1/git/stash",
+			"GET /api/narrators/narrator-1/git/log?limit=5&skip=1&workspaceKey=w",
+			"POST /api/narrators/narrator-1/git/reset",
+			"POST /api/narrators/narrator-1/git/ai-commit-message",
 		]);
 		expect(calls.every((call) => call.authorization === "Bearer git-token")).toBe(true);
 		expect(calls.find((call) => call.url.endsWith("/git/reset"))?.body).toBe(
-			JSON.stringify({ target: "HEAD~1", mode: "soft" }),
+			JSON.stringify({ target: "HEAD~1", mode: "soft", workspaceKey: "w" }),
 		);
 		clearToken();
 	});

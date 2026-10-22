@@ -82,7 +82,8 @@ function NarratorGitPanel({ narratorId }: { narratorId: string }) {
 	);
 }
 
-function GitPanelContent({
+/** The panel for an already-resolved target; exported for tests. */
+export function GitPanelContent({
 	target,
 	onRefresh,
 	readOnly = false,

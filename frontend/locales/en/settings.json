@@ -723,7 +723,6 @@
 	"providerAgentModeUnsupportedTitle": "Some providers cannot run agent sessions",
 	"providerAgentModeUnsupportedDesc": "The current backend reports agent mode as unavailable for: {{providers}}. Their models are hidden from agent model selectors but remain visible in provider settings.",
 	"chaptersAndContainersSection": "Worktrees, snapshots & existing containers",
-	"chapterSplitUnsupported": "Chapter split is not available in this backend runtime.",
 	"chapterContainersUnsupportedTitle": "Container settings unavailable",
 	"chapterContainersUnsupported": "Container settings are not available in this backend runtime.",
 	"chapterContainersAsyncStartTitle": "Container start runs in background",

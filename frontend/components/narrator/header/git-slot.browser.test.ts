@@ -16,15 +16,9 @@ type FixtureWindow = Window & { fixture: typeof Fixture };
 const hookStubs: Record<string, string> = {
 	useGit: `export const useGitWorkspace=()=>window.gitFixtureWorkspace; export const useGitStatus=()=>({data:undefined}); export const useGitLineStats=()=>({data:undefined,isFetching:false,error:null}); export const gitWorkspaceTarget=(_id,workspace)=>workspace?.state==='ready'&&workspace.capabilities.read?{narratorId:'n'}:null;`,
 	useWorkspaceContext: `export const useWorkspaceContext=()=>({data:window.gitFixtureContext});`,
-	useChapters: `export const useChapter=()=>({data:{id:'chapter',projectId:'p',title:'Chapter',branch:'base',status:'active',worktreePath:'/repo'}});`,
-	useChapterGitStatus: `export const useChapterGitStatus=()=>({data:undefined});`,
-	useContainers: `export const useContainers=()=>({data:[]});`,
-	usePlatform: `export const useChapterContainersCapability=()=>({supported:false,routes:{}});`,
 	"react-i18next": `export const useTranslation=()=>({t:key=>key});`,
 	NarratorDockContext: `export const useNarratorDockContext=()=>null;`,
-	api: `export const api={dormantChapter:async()=>({}),wakeChapter:async()=>({})};`,
 	NarratorWorktreeControls: `export const NarratorWorktreeControls=()=>null;`,
-	NarratorCompatibilityEntry: `export const NarratorCompatibilityModal=()=>null;`,
 };
 beforeAll(async () => {
 	if (!existsSync(executablePath)) throw new Error(`Chromium unavailable: ${executablePath}`);
@@ -40,7 +34,7 @@ beforeAll(async () => {
 					builder.onResolve(
 						{
 							filter:
-								/(?:useGit|useWorkspaceContext|useChapters|useChapterGitStatus|useContainers|usePlatform|react-i18next|NarratorDockContext|NarratorWorktreeControls|NarratorCompatibilityEntry|lib\/api|ChapterForkModal|ChapterMergeModal|ContainerPanel|ContainerConfigModal|PodmanInstallModal)$/,
+								/(?:useGit|useWorkspaceContext|react-i18next|NarratorDockContext|NarratorWorktreeControls|lib\/api)$/,
 						},
 						(args) => ({ path: args.path, namespace: "git-fixture" }),
 					);
@@ -86,7 +80,7 @@ afterAll(async () => {
 	}
 });
 for (const width of [1200, 390]) {
-	for (const scenario of ["git", "chapter", "notgit", "cached-notgit", "chapter-cached-notgit"]) {
+	for (const scenario of ["git", "notgit", "cached-notgit"]) {
 		test(`${width}px ${scenario}: 2s discovery never shifts message viewport/slot`, async () => {
 			if (!browser || !server) throw new Error("Fixture not initialized");
 			const page = await browser.newPage();
@@ -143,8 +137,7 @@ for (const width of [1200, 390]) {
 						(window as unknown as FixtureWindow).fixture.snapshot(),
 					);
 					expect(initialized.text).toContain("initialized-branch");
-					if (!scenario.startsWith("chapter"))
-						expect(initialized.text).toContain("workspace.readOnly");
+					expect(initialized.text).toContain("workspace.readOnly");
 					expect(initialized.canOpen).toBe(true);
 					expect(initialized.height).toBe(before.height);
 					expect(initialized.top).toBe(before.top);

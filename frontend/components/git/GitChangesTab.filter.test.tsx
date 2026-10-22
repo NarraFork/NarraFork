@@ -14,7 +14,7 @@
  *    working tree while changes are only hidden.
  * 3. **Filtering happens before the row cap**, so a filter over a large change
  *    set cannot spend the row budget on rows it then removes.
- * 4. **Selection survives a remount** (sessionStorage), and is keyed per chapter.
+ * 4. **Selection survives a remount** (sessionStorage), and is keyed per workspace.
  *
  * The existing GitPanel suite cannot cover any of this: it never touches the
  * filter, so every assertion there runs on the unfiltered path.
@@ -32,6 +32,7 @@ import { __resetGitStatusFilterCache } from "../../hooks/useGitStatusFilter";
 import { api } from "../../lib/api";
 import commonLocale from "../../locales/en/common.json";
 import gitLocale from "../../locales/en/git.json";
+import type { GitTarget } from "../../lib/api/git";
 import { ConfirmDialogProvider } from "../common/ConfirmDialogProvider";
 
 // Isolated i18next instance, same reason as the sibling git suites: they mutate
@@ -49,6 +50,11 @@ mock.module("../../lib/i18n", () => ({
 	default: i18n,
 }));
 const { GitChangesTab } = await import("./GitChangesTab");
+
+/** A narrator Git target whose query key is `key`. */
+function workspaceTarget(key: string): GitTarget {
+	return { narratorId: key, workspaceKey: key, canWrite: true };
+}
 
 class TestResizeObserver {
 	observe() {}
@@ -183,15 +189,15 @@ function stubGitApi(calls: Array<{ name: string; body?: unknown }>, status: GitS
 		linesRemoved: status.linesRemoved ?? 0,
 		complete: true,
 	});
-	api.gitStage = async (_chapterId, body) => {
+	api.gitStage = async (_target, body) => {
 		calls.push({ name: "stage", body });
 		return status;
 	};
-	api.gitUnstage = async (_chapterId, body) => {
+	api.gitUnstage = async (_target, body) => {
 		calls.push({ name: "unstage", body });
 		return status;
 	};
-	api.gitDiscard = async (_chapterId, body) => {
+	api.gitDiscard = async (_target, body) => {
 		calls.push({ name: "discard", body });
 		return status;
 	};
@@ -219,7 +225,7 @@ function unmountTab() {
 	root = undefined;
 }
 
-function renderTab(chapterId: string, client: QueryClient) {
+function renderTab(workspaceKey: string, client: QueryClient) {
 	const container = document.createElement("div");
 	document.body.appendChild(container);
 	const tabRoot = createRoot(container);
@@ -229,7 +235,7 @@ function renderTab(chapterId: string, client: QueryClient) {
 			<MantineProvider>
 				<QueryClientProvider client={client}>
 					<ConfirmDialogProvider>
-						<GitChangesTab chapterId={chapterId} />
+						<GitChangesTab target={workspaceTarget(workspaceKey)} />
 					</ConfirmDialogProvider>
 				</QueryClientProvider>
 			</MantineProvider>
@@ -361,14 +367,14 @@ describe("GitChangesTab status filter", () => {
 
 	test("slow and failed line stats never delay status rows or disable actions", async () => {
 		const client = makeClient();
-		const chapterId = "chapter-slow-stats";
-		client.setQueryData(["gitStatus", chapterId], makeMixedStatus());
+		const workspaceKey = "git-slow-stats";
+		client.setQueryData(["gitStatus", workspaceKey], makeMixedStatus());
 		let rejectStats!: (error: Error) => void;
 		api.getGitLineStats = () =>
 			new Promise((_resolve, reject) => {
 				rejectStats = reject;
 			});
-		const container = renderTab(chapterId, client);
+		const container = renderTab(workspaceKey, client);
 		await flushRender();
 		await expandAllFolders(container);
 		expect(fileRowPaths(container)).toHaveLength(5);
@@ -386,7 +392,7 @@ describe("GitChangesTab status filter", () => {
 
 	test("complete binary measurements may display zero, but missing measurements do not", async () => {
 		const client = makeClient();
-		const chapterId = "chapter-binary-stats";
+		const workspaceKey = "git-binary-stats";
 		const status = {
 			...makeMixedStatus(),
 			staged: 0,
@@ -398,8 +404,8 @@ describe("GitChangesTab status filter", () => {
 			],
 			totalFiles: 2,
 		};
-		client.setQueryData(["gitStatus", chapterId], status);
-		client.setQueryData(["gitLineStats", chapterId], {
+		client.setQueryData(["gitStatus", workspaceKey], status);
+		client.setQueryData(["gitLineStats", workspaceKey], {
 			files: [
 				{ path: "binary.png", unstagedLinesAdded: 0, unstagedLinesRemoved: 0, complete: true },
 				{ path: "unknown.png", complete: false },
@@ -408,7 +414,7 @@ describe("GitChangesTab status filter", () => {
 			linesRemoved: 0,
 			complete: false,
 		});
-		const container = renderTab(chapterId, client);
+		const container = renderTab(workspaceKey, client);
 		await flushRender();
 		expect(
 			container.querySelector('[aria-label="View diff of binary.png"]')?.textContent,
@@ -420,11 +426,11 @@ describe("GitChangesTab status filter", () => {
 	});
 
 	test("branch name uses the remaining header space instead of a percentage cap", async () => {
-		const chapterId = "chapter-branch-width";
+		const workspaceKey = "git-branch-width";
 		const client = makeClient();
 		const branch = "fix/dashboard-unrestricted-branch-name";
-		client.setQueryData(["gitStatus", chapterId], { ...makeMixedStatus(), branch });
-		const container = renderTab(chapterId, client);
+		client.setQueryData(["gitStatus", workspaceKey], { ...makeMixedStatus(), branch });
+		const container = renderTab(workspaceKey, client);
 		await flushRender();
 
 		// linkedom has no layout engine; verify the rendered flex sizing contract.
@@ -439,10 +445,10 @@ describe("GitChangesTab status filter", () => {
 	});
 
 	test("offers one chip per kind of change, counting rows and nothing selected", async () => {
-		const chapterId = "chapter-filter-chips";
+		const workspaceKey = "git-filter-chips";
 		const client = makeClient();
-		client.setQueryData(["gitStatus", chapterId], makeMixedStatus());
-		const container = renderTab(chapterId, client);
+		client.setQueryData(["gitStatus", workspaceKey], makeMixedStatus());
+		const container = renderTab(workspaceKey, client);
 		await flushRender();
 
 		// Counts are ROWS, not files: `D ` produces a staged D row, ` D` an unstaged
@@ -455,10 +461,10 @@ describe("GitChangesTab status filter", () => {
 	});
 
 	test("selecting a letter keeps only its rows, in both sections", async () => {
-		const chapterId = "chapter-filter-rows";
+		const workspaceKey = "git-filter-rows";
 		const client = makeClient();
-		client.setQueryData(["gitStatus", chapterId], makeMixedStatus());
-		const container = renderTab(chapterId, client);
+		client.setQueryData(["gitStatus", workspaceKey], makeMixedStatus());
+		const container = renderTab(workspaceKey, client);
 		await flushRender();
 		await expandAllFolders(container);
 
@@ -496,9 +502,9 @@ describe("GitChangesTab status filter", () => {
 		// `AM` is the shape a raw-porcelain filter gets wrong: it belongs to both
 		// sections with a DIFFERENT letter in each, and filtering on the pair would
 		// hide it from both.
-		const chapterId = "chapter-filter-am";
+		const workspaceKey = "git-filter-am";
 		const client = makeClient();
-		client.setQueryData(["gitStatus", chapterId], {
+		client.setQueryData(["gitStatus", workspaceKey], {
 			hasChanges: true,
 			staged: 1,
 			unstaged: 1,
@@ -510,7 +516,7 @@ describe("GitChangesTab status filter", () => {
 			linesAdded: 2,
 			linesRemoved: 0,
 		} satisfies GitStatusSummary);
-		const container = renderTab(chapterId, client);
+		const container = renderTab(workspaceKey, client);
 		await flushRender();
 
 		expect(chipText(container)).toEqual(["A 1", "M 1"]);
@@ -526,9 +532,9 @@ describe("GitChangesTab status filter", () => {
 	});
 
 	test("MM contributes one row to each section and keeps the shared badge count", async () => {
-		const chapterId = "chapter-filter-mm";
+		const workspaceKey = "git-filter-mm";
 		const client = makeClient();
-		client.setQueryData(["gitStatus", chapterId], {
+		client.setQueryData(["gitStatus", workspaceKey], {
 			hasChanges: true,
 			staged: 2,
 			unstaged: 1,
@@ -540,7 +546,7 @@ describe("GitChangesTab status filter", () => {
 			linesAdded: 2,
 			linesRemoved: 0,
 		} satisfies GitStatusSummary);
-		const container = renderTab(chapterId, client);
+		const container = renderTab(workspaceKey, client);
 		await flushRender();
 
 		expect(chipText(container)).toEqual(["A 1", "M 2"]);
@@ -554,9 +560,9 @@ describe("GitChangesTab status filter", () => {
 	});
 
 	test("truncated status shows lower-bound counts for both sections", async () => {
-		const chapterId = "chapter-filter-truncated";
+		const workspaceKey = "git-filter-truncated";
 		const client = makeClient();
-		client.setQueryData(["gitStatus", chapterId], {
+		client.setQueryData(["gitStatus", workspaceKey], {
 			hasChanges: true,
 			truncated: true,
 			staged: 3,
@@ -569,7 +575,7 @@ describe("GitChangesTab status filter", () => {
 			linesAdded: 2,
 			linesRemoved: 0,
 		} satisfies GitStatusSummary);
-		const container = renderTab(chapterId, client);
+		const container = renderTab(workspaceKey, client);
 		await flushRender();
 
 		// Unstaged row count includes untracked files (2 + 1 → 3+).
@@ -578,7 +584,7 @@ describe("GitChangesTab status filter", () => {
 		expect(container.textContent).toContain("Staged count is a lower bound");
 		expect(container.textContent).toContain("Unstaged count is a lower bound");
 		client.setQueryData<GitStatusSummary>(
-			["gitStatus", chapterId],
+			["gitStatus", workspaceKey],
 			(old) =>
 				old && {
 					...old,
@@ -595,7 +601,7 @@ describe("GitChangesTab status filter", () => {
 	});
 
 	test("independent partial stats show known rows, never invent zero or sum incomplete folders", async () => {
-		const chapterId = "chapter-lightweight";
+		const workspaceKey = "git-lightweight";
 		const client = makeClient();
 		const status: GitStatusSummary = {
 			hasChanges: true,
@@ -607,8 +613,8 @@ describe("GitChangesTab status filter", () => {
 			headSha: "abc",
 			branch: "main",
 		};
-		client.setQueryData(["gitStatus", chapterId], status);
-		client.setQueryData(["gitLineStats", chapterId], {
+		client.setQueryData(["gitStatus", workspaceKey], status);
+		client.setQueryData(["gitLineStats", workspaceKey], {
 			files: [
 				{ path: "src/known.ts", unstagedLinesAdded: 1, unstagedLinesRemoved: 0, complete: true },
 			],
@@ -616,7 +622,7 @@ describe("GitChangesTab status filter", () => {
 			linesRemoved: 0,
 			complete: false,
 		});
-		const container = renderTab(chapterId, client);
+		const container = renderTab(workspaceKey, client);
 		await flushRender();
 		const folder = container.querySelector('[aria-label="Expand folder src"]');
 		expect(folder?.textContent).not.toContain("+1");
@@ -626,13 +632,13 @@ describe("GitChangesTab status filter", () => {
 		expect(row("src/known.ts")?.textContent).toContain("+1");
 		expect(row("src/unknown.ts")?.textContent).not.toMatch(/[+-]0|NaN/);
 		// A lightweight status refresh does not erase independently measured rows.
-		client.setQueryData(["gitStatus", chapterId], {
+		client.setQueryData(["gitStatus", workspaceKey], {
 			...status,
 			files: status.files.map(({ status, path }) => ({ status, path })),
 		});
 		await flushRender();
 		expect(row("src/known.ts")?.textContent).toContain("+1");
-		client.setQueryData(["gitLineStats", chapterId], {
+		client.setQueryData(["gitLineStats", workspaceKey], {
 			files: [],
 			linesAdded: 0,
 			linesRemoved: 0,
@@ -645,9 +651,9 @@ describe("GitChangesTab status filter", () => {
 	});
 
 	test("a list cap with an exact scan does not claim lower-bound section counts", async () => {
-		const chapterId = "chapter-exact-capped";
+		const workspaceKey = "git-exact-capped";
 		const client = makeClient();
-		client.setQueryData(["gitStatus", chapterId], {
+		client.setQueryData(["gitStatus", workspaceKey], {
 			hasChanges: true,
 			truncated: true,
 			totalFilesExact: true,
@@ -662,7 +668,7 @@ describe("GitChangesTab status filter", () => {
 			headSha: "abc",
 			branch: "main",
 		} satisfies GitStatusSummary);
-		const container = renderTab(chapterId, client);
+		const container = renderTab(workspaceKey, client);
 		await flushRender();
 		expect(container.textContent).toContain("Staged (3)");
 		expect(container.textContent).toContain("Unstaged (3)");
@@ -672,9 +678,9 @@ describe("GitChangesTab status filter", () => {
 	});
 
 	test("a filter matching nothing says so instead of looking like a clean tree", async () => {
-		const chapterId = "chapter-filter-empty";
+		const workspaceKey = "git-filter-empty";
 		const client = makeClient();
-		client.setQueryData(["gitStatus", chapterId], {
+		client.setQueryData(["gitStatus", workspaceKey], {
 			hasChanges: true,
 			staged: 0,
 			unstaged: 1,
@@ -686,7 +692,7 @@ describe("GitChangesTab status filter", () => {
 			linesAdded: 1,
 			linesRemoved: 0,
 		} satisfies GitStatusSummary);
-		const container = renderTab(chapterId, client);
+		const container = renderTab(workspaceKey, client);
 		await flushRender();
 
 		// Only one kind of change exists, so the bar stays hidden: a filter that can
@@ -697,12 +703,12 @@ describe("GitChangesTab status filter", () => {
 		// row has anymore.
 		window.sessionStorage.setItem(
 			"narrafork_git_status_filter",
-			JSON.stringify({ [chapterId]: ["D"] }),
+			JSON.stringify({ [workspaceKey]: ["D"] }),
 		);
 		__resetGitStatusFilterCache();
 		unmountTab();
 		const second = makeClient();
-		second.setQueryData(["gitStatus", chapterId], {
+		second.setQueryData(["gitStatus", workspaceKey], {
 			hasChanges: true,
 			staged: 0,
 			unstaged: 1,
@@ -714,7 +720,7 @@ describe("GitChangesTab status filter", () => {
 			linesAdded: 1,
 			linesRemoved: 0,
 		} satisfies GitStatusSummary);
-		const container2 = renderTab(chapterId, second);
+		const container2 = renderTab(workspaceKey, second);
 		await flushRender();
 
 		// The list is empty, so the panel has to explain why — and the selected letter
@@ -737,13 +743,13 @@ describe("GitChangesTab status filter", () => {
 		// The consequential one. `all: true` runs `checkout HEAD -- .` + `clean -fd`
 		// server-side, so sending it while rows are hidden destroys work the user
 		// could not see. Nothing about the result would reveal the mistake.
-		const chapterId = "chapter-filter-discard";
+		const workspaceKey = "git-filter-discard";
 		const calls: Array<{ name: string; body?: unknown }> = [];
 		const status = makeMixedStatus();
 		stubGitApi(calls, status);
 		const client = makeClient();
-		client.setQueryData(["gitStatus", chapterId], status);
-		const container = renderTab(chapterId, client);
+		client.setQueryData(["gitStatus", workspaceKey], status);
+		const container = renderTab(workspaceKey, client);
 		await flushRender();
 
 		await click(chipByLetter(container, "D"));
@@ -766,13 +772,13 @@ describe("GitChangesTab status filter", () => {
 	});
 
 	test("stage and unstage are scoped to the filtered files too", async () => {
-		const chapterId = "chapter-filter-stage";
+		const workspaceKey = "git-filter-stage";
 		const calls: Array<{ name: string; body?: unknown }> = [];
 		const status = makeMixedStatus();
 		stubGitApi(calls, status);
 		const client = makeClient();
-		client.setQueryData(["gitStatus", chapterId], status);
-		const container = renderTab(chapterId, client);
+		client.setQueryData(["gitStatus", workspaceKey], status);
+		const container = renderTab(workspaceKey, client);
 		await flushRender();
 
 		await click(chipByLetter(container, "M"));
@@ -791,13 +797,13 @@ describe("GitChangesTab status filter", () => {
 	test("without a filter the bulk actions still act on everything", async () => {
 		// The narrowing must not leak into the unfiltered case: "Stage All" has to
 		// keep sending `all: true`, which also covers files beyond the row cap.
-		const chapterId = "chapter-filter-none";
+		const workspaceKey = "git-filter-none";
 		const calls: Array<{ name: string; body?: unknown }> = [];
 		const status = makeMixedStatus();
 		stubGitApi(calls, status);
 		const client = makeClient();
-		client.setQueryData(["gitStatus", chapterId], status);
-		const container = renderTab(chapterId, client);
+		client.setQueryData(["gitStatus", workspaceKey], status);
+		const container = renderTab(workspaceKey, client);
 		await flushRender();
 
 		await click(buttonByText(container, "Stage All"));
@@ -822,13 +828,13 @@ describe("GitChangesTab status filter", () => {
 	test("filters before the row cap so a filter over many files still shows rows", async () => {
 		// Capping first would spend the 80-row budget on rows the filter then drops,
 		// leaving an empty list next to a "+N more" that claims otherwise.
-		const chapterId = "chapter-filter-cap";
+		const workspaceKey = "git-filter-cap";
 		const files = [
 			...Array.from({ length: 120 }, (_, i) => file(" M", `src/mod-${i}.ts`)),
 			file(" D", "src/deleted.ts"),
 		];
 		const client = makeClient();
-		client.setQueryData(["gitStatus", chapterId], {
+		client.setQueryData(["gitStatus", workspaceKey], {
 			hasChanges: true,
 			staged: 0,
 			unstaged: 121,
@@ -840,7 +846,7 @@ describe("GitChangesTab status filter", () => {
 			linesAdded: 121,
 			linesRemoved: 0,
 		} satisfies GitStatusSummary);
-		const container = renderTab(chapterId, client);
+		const container = renderTab(workspaceKey, client);
 		await flushRender();
 
 		await click(chipByLetter(container, "D"));
@@ -853,11 +859,11 @@ describe("GitChangesTab status filter", () => {
 		client.clear();
 	});
 
-	test("remembers the selection across a remount, per chapter", async () => {
-		const chapterId = "chapter-filter-persist";
+	test("remembers the selection across a remount, per workspace", async () => {
+		const workspaceKey = "git-filter-persist";
 		const first = makeClient();
-		first.setQueryData(["gitStatus", chapterId], makeMixedStatus());
-		const container = renderTab(chapterId, first);
+		first.setQueryData(["gitStatus", workspaceKey], makeMixedStatus());
+		const container = renderTab(workspaceKey, first);
 		await flushRender();
 
 		await click(chipByLetter(container, "D"));
@@ -867,17 +873,17 @@ describe("GitChangesTab status filter", () => {
 		first.clear();
 
 		const second = makeClient();
-		second.setQueryData(["gitStatus", chapterId], makeMixedStatus());
-		const remounted = renderTab(chapterId, second);
+		second.setQueryData(["gitStatus", workspaceKey], makeMixedStatus());
+		const remounted = renderTab(workspaceKey, second);
 		await flushRender();
 		expect(chips(remounted).D).toBe(true);
 
-		// A different chapter is unfiltered — the selection is keyed per chapter, so
-		// one chapter's filter cannot silently hide another's changes.
+		// A different workspace is unfiltered — the selection is keyed per workspace, so
+		// one workspace's filter cannot silently hide another's changes.
 		unmountTab();
 		const other = makeClient();
-		other.setQueryData(["gitStatus", "chapter-filter-persist-other"], makeMixedStatus());
-		const otherContainer = renderTab("chapter-filter-persist-other", other);
+		other.setQueryData(["gitStatus", "git-filter-persist-other"], makeMixedStatus());
+		const otherContainer = renderTab("git-filter-persist-other", other);
 		await flushRender();
 		expect(chips(otherContainer)).toEqual({ A: false, M: false, D: false });
 
@@ -886,10 +892,10 @@ describe("GitChangesTab status filter", () => {
 	});
 
 	test("toggling a chip off restores the full list", async () => {
-		const chapterId = "chapter-filter-toggle-off";
+		const workspaceKey = "git-filter-toggle-off";
 		const client = makeClient();
-		client.setQueryData(["gitStatus", chapterId], makeMixedStatus());
-		const container = renderTab(chapterId, client);
+		client.setQueryData(["gitStatus", workspaceKey], makeMixedStatus());
+		const container = renderTab(workspaceKey, client);
 		await flushRender();
 
 		await click(chipByLetter(container, "M"));
@@ -911,10 +917,10 @@ describe("GitChangesTab status filter", () => {
 		// It was taller than the chips, so the whole bar changed height on every
 		// toggle — the regression this guards. The contract now: the bar holds the
 		// chips plus exactly ONE icon button, and only that button's state changes.
-		const chapterId = "chapter-filter-clear-icon";
+		const workspaceKey = "git-filter-clear-icon";
 		const client = makeClient();
-		client.setQueryData(["gitStatus", chapterId], makeMixedStatus());
-		const container = renderTab(chapterId, client);
+		client.setQueryData(["gitStatus", workspaceKey], makeMixedStatus());
+		const container = renderTab(workspaceKey, client);
 		await flushRender();
 
 		const bar = () => {

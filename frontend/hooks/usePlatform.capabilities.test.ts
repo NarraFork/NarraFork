@@ -1,6 +1,5 @@
 import { describe, expect, test } from "bun:test";
 import {
-	useChapterSplitCapability,
 	useNarratorPermissionsCapability,
 	useNarratorSubagentsCapability,
 	useSettingsValidationCapability,
@@ -14,17 +13,6 @@ import {
  * `false`.
  */
 describe("collapsed capability constants", () => {
-	test("compressed splits report AI summary support", () => {
-		// `chapter-split` forwards `inheritMode` to `chapterFork.fork`, and `narrator-service`
-		// calls `narratorContext.generateContextSummary` for the compressed mode. The old
-		// getter had no absent-payload fallback for this field, so it read `false` and
-		// `ChapterSplitModal` warned users about a fallback that was not in use.
-		const split = useChapterSplitCapability();
-		expect(split.supported).toBe(true);
-		expect(split.compressedAISummarySupported).toBe(true);
-		expect(split.compressedAISummaryFallback).toBe(false);
-	});
-
 	test("permission modes and reflections match the agent loop", () => {
 		const permissions = useNarratorPermissionsCapability();
 		expect(permissions.supported).toBe(true);

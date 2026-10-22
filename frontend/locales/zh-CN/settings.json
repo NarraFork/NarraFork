@@ -725,7 +725,6 @@
 	"providerAgentModeUnsupportedTitle": "部分供应商无法运行代理会话",
 	"providerAgentModeUnsupportedDesc": "当前后端声明以下供应商不可用于 agent mode：{{providers}}。这些模型会从代理模型选择器中隐藏，但仍会保留在供应商设置中。",
 	"chaptersAndContainersSection": "worktree、快照与已有容器",
-	"chapterSplitUnsupported": "当前后端运行时不支持章节拆分。",
 	"chapterContainersUnsupportedTitle": "容器设置不可用",
 	"chapterContainersUnsupported": "当前后端运行时不支持容器设置。",
 	"chapterContainersAsyncStartTitle": "容器启动在后台执行",

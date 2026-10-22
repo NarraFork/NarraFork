@@ -961,7 +961,6 @@ export function useGitReset(target: GitTarget) {
 		target,
 		(params: { target: string; mode: "soft" | "hard" }) =>
 			api.gitReset(target, params.target, params.mode),
-		true,
 	);
 }
 export function useGitAiCommitMessage(target: GitTarget) {

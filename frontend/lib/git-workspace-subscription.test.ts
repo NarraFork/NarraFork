@@ -291,18 +291,18 @@ describe("Git workspace WS subscriptions", () => {
 		s.qc.clear();
 	});
 
-	test("supports chapter targets and removes revoked facts", () => {
+	test("removes revoked facts and retries once", () => {
 		const s = setup();
-		const off = s.subscriptions.subscribe("chapter");
-		expect(s.sent[0]?.chapterId).toBe("chapter");
-		s.qc.setQueryData(["gitLog", "chapter"], []);
-		s.qc.setQueryData(["gitLineStats", "chapter"], { linesAdded: 10 });
+		const off = s.subscriptions.subscribe(s.target);
+		expect(s.sent[0]?.narratorId).toBe("n");
+		s.qc.setQueryData(["gitLog", "w"], []);
+		s.qc.setQueryData(["gitLineStats", "w"], { linesAdded: 10 });
 		s.emit("git_workspace_error", { code: "access_denied" });
-		expect(s.qc.getQueryData(["gitLog", "chapter"])).toBeUndefined();
-		expect(s.qc.getQueryData(["gitLineStats", "chapter"])).toBeUndefined();
-		s.subscriptions.retry("chapter");
+		expect(s.qc.getQueryData(["gitLog", "w"])).toBeUndefined();
+		expect(s.qc.getQueryData(["gitLineStats", "w"])).toBeUndefined();
+		s.subscriptions.retry(s.target);
 		expect(s.sent[1]?.type).toBe("git_workspace_subscribe");
-		s.subscriptions.retry("chapter");
+		s.subscriptions.retry(s.target);
 		expect(s.sent).toHaveLength(2);
 		off();
 		s.qc.clear();

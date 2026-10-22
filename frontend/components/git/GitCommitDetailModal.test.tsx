@@ -452,7 +452,6 @@ describe("Git commit preview with real query observers", () => {
 		["SHA", SHA_B, TARGET],
 		["workspace", SHA_A, OTHER_WORKSPACE],
 		["narrator on the same workspace", SHA_A, OTHER_NARRATOR],
-		["chapter target", SHA_A, "other-chapter"],
 	];
 	test.each(
 		identityChanges,

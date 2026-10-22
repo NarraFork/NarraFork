@@ -95,8 +95,8 @@ describe("compactGitFileTree", () => {
 		expect(compacted).toHaveLength(1);
 		const merged = compacted[0];
 		if (merged?.type !== "directory") throw new Error("Expected directory node");
-		expect(merged.name).toBe("frontend/components/chapter");
-		expect(merged.path).toBe("frontend/components/chapter");
+		expect(merged.name).toBe("frontend/components/git");
+		expect(merged.path).toBe("frontend/components/git");
 		expect(merged.fileCount).toBe(1);
 		expect(merged.children).toEqual([
 			{

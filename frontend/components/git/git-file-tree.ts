@@ -101,7 +101,7 @@ export function buildGitFileTree<TFile extends { path: string }>(
 }
 
 /**
- * Merge single-child directory chains into one row (`src/components/chapter`), the
+ * Merge single-child directory chains into one row (`src/components/git`), the
  * way editors' "compact folders" mode does. Keeps deep paths from spending one
  * row per level in a short scroll area. The merged row keeps the deepest path so
  * folder-level actions still cover exactly its files.

@@ -31,6 +31,7 @@ import { __resetGitFolderPrefsCache } from "../../hooks/useGitFolderPrefs";
 import commonLocale from "../../locales/en/common.json";
 import gitLocale from "../../locales/en/git.json";
 import zhGitLocale from "../../locales/zh-CN/git.json";
+import type { GitTarget } from "../../lib/api/git";
 import { ConfirmDialogProvider } from "../common/ConfirmDialogProvider";
 
 // Isolated i18next instance, for the same reason as GitPanel.test.tsx: sibling suites
@@ -48,6 +49,11 @@ mock.module("../../lib/i18n", () => ({
 	default: i18n,
 }));
 const { GitChangesTab } = await import("./GitChangesTab");
+
+/** A narrator Git target whose query key is `key`. */
+function workspaceTarget(key: string): GitTarget {
+	return { narratorId: key, workspaceKey: key, canWrite: true };
+}
 
 class TestResizeObserver {
 	observe() {}
@@ -292,7 +298,7 @@ function flushRender() {
  * therefore its badge) exists.
  */
 async function renderBadge(
-	chapterId: string,
+	workspaceKey: string,
 	modifications: WorkspaceModificationView | null,
 	path = "src/one.ts",
 	statusOverride?: GitStatusSummary,
@@ -303,8 +309,8 @@ async function renderBadge(
 			mutations: { retry: false },
 		},
 	});
-	queryClient.setQueryData(["gitStatus", chapterId], statusOverride ?? makeStatus(path));
-	queryClient.setQueryData(["gitLineStats", chapterId], {
+	queryClient.setQueryData(["gitStatus", workspaceKey], statusOverride ?? makeStatus(path));
+	queryClient.setQueryData(["gitLineStats", workspaceKey], {
 		files: [],
 		linesAdded: 0,
 		linesRemoved: 0,
@@ -312,7 +318,7 @@ async function renderBadge(
 	});
 	if (modifications)
 		queryClient.setQueryData(
-			["gitModifications", chapterId, "uncommitted", "byFile", path],
+			["gitModifications", workspaceKey, "uncommitted", "byFile", path],
 			modifications,
 		);
 
@@ -324,7 +330,7 @@ async function renderBadge(
 			<MantineProvider>
 				<QueryClientProvider client={queryClient}>
 					<ConfirmDialogProvider>
-						<GitChangesTab chapterId={chapterId} />
+						<GitChangesTab target={workspaceTarget(workspaceKey)} />
 					</ConfirmDialogProvider>
 				</QueryClientProvider>
 			</MantineProvider>
@@ -387,7 +393,7 @@ describe("GitChangesTab attribution hover card", () => {
 	test("keeps attribution out of the file row and uses the Git status badge as target", async () => {
 		const last = narrator();
 		const container = await renderBadge(
-			"chapter-attr-hover-target",
+			"git-attr-hover-target",
 			view([
 				group({
 					lastActor: last,
@@ -407,7 +413,7 @@ describe("GitChangesTab attribution hover card", () => {
 	test("shows current evidence and a compact timeline only on hover", async () => {
 		const currentActor = narrator();
 		const external = { ...EXTERNAL_ACTOR };
-		const container = await renderBadge("chapter-attr-hover-timeline", {
+		const container = await renderBadge("git-attr-hover-timeline", {
 			...view([
 				group({
 					lastActor: currentActor,
@@ -435,7 +441,7 @@ describe("GitChangesTab attribution hover card", () => {
 
 	test("unknown attribution shows one short reason instead of a text dump", async () => {
 		const unknown = currentTarget({ status: "unknown", actor: null, reason: "state_mismatch" });
-		const container = await renderBadge("chapter-attr-hover-unknown", {
+		const container = await renderBadge("git-attr-hover-unknown", {
 			...view([group({ recentEvents: [event(EXTERNAL_ACTOR)] })]),
 			currentDiff: currentView(unknown, unknown),
 		});
@@ -450,7 +456,7 @@ describe("GitChangesTab attribution hover card", () => {
 
 	test("a clean target with no recorded history shows a short empty note", async () => {
 		const clean = currentTarget({ status: "clean", actor: null });
-		const container = await renderBadge("chapter-attr-hover-clean", {
+		const container = await renderBadge("git-attr-hover-clean", {
 			...view([]),
 			currentDiff: currentView(clean, clean, { clean: true }),
 		});
@@ -463,7 +469,7 @@ describe("GitChangesTab attribution hover card", () => {
 
 	test("history incompleteness is treated as the norm and not nagged in the hover card", async () => {
 		const last = narrator();
-		const container = await renderBadge("chapter-attr-hover-partial", {
+		const container = await renderBadge("git-attr-hover-partial", {
 			...view([
 				group({
 					lastActor: last,
@@ -492,7 +498,7 @@ describe("GitChangesTab attribution hover card", () => {
 			actor: null,
 			reason: "history_incomplete",
 		});
-		const container = await renderBadge("chapter-attr-hover-history-incomplete", {
+		const container = await renderBadge("git-attr-hover-history-incomplete", {
 			...view([group({ recentEvents: [event(EXTERNAL_ACTOR)] })]),
 			currentDiff: currentView(unknown, unknown),
 		});
@@ -505,7 +511,7 @@ describe("GitChangesTab attribution hover card", () => {
 
 	test("timeline shows measured +/- line counts and hides unmeasured rows", async () => {
 		const last = narrator();
-		const container = await renderBadge("chapter-attr-hover-line-stats", {
+		const container = await renderBadge("git-attr-hover-line-stats", {
 			...view([
 				group({
 					lastActor: last,
@@ -553,7 +559,7 @@ describe("GitChangesTab attribution hover card", () => {
 			);
 		}) as typeof fetch;
 		try {
-			const container = await renderBadge("chapter-attr-lazy", null);
+			const container = await renderBadge("git-attr-lazy", null);
 			expect(calls.filter((url) => url.includes("/modifications"))).toEqual([]);
 
 			const hoverText = await hoverAttribution(container);
@@ -580,7 +586,7 @@ describe("GitChangesTab attribution hover card", () => {
 			);
 		}) as typeof fetch;
 		try {
-			const container = await renderBadge("chapter-attr-abort", null);
+			const container = await renderBadge("git-attr-abort", null);
 			const hoverText = await hoverAttribution(container);
 			expect(hoverText).toContain(gitLocale.attributionLoadingShort);
 			expect(signals).toHaveLength(1);
@@ -609,7 +615,7 @@ describe("GitChangesTab attribution hover card", () => {
 		}) as typeof fetch;
 		const doc = document as Document & { visibilityState: string };
 		try {
-			const container = await renderBadge("chapter-attr-hidden", null);
+			const container = await renderBadge("git-attr-hidden", null);
 			await hoverAttribution(container);
 			expect(signals).toHaveLength(1);
 
@@ -642,7 +648,7 @@ describe("GitChangesTab attribution hover card", () => {
 			return Response.json({ error: "boom" }, { status: 500 });
 		}) as typeof fetch;
 		try {
-			const container = await renderBadge("chapter-attr-failed", null);
+			const container = await renderBadge("git-attr-failed", null);
 			const hoverText = await hoverAttribution(container);
 			expect(hoverText).toContain(gitLocale.attributionLoadFailedShort);
 			expect(rowFor(container).textContent).toContain("one.ts");

@@ -41,10 +41,10 @@ describe("commit preview navigation", () => {
 		});
 		Object.defineProperty(globalThis, "location", {
 			configurable: true,
-			value: { href: `https://example.test${base}git/chapters/chapter/commits/${SHA}` },
+			value: { href: `https://example.test${base}git/narrators/narrator/commits/${SHA}` },
 		});
 		resetAppBaseForTest();
-		for (const target of ["chapter /#", TARGET]) {
+		for (const target of [TARGET]) {
 			for (const file of [undefined, "目录/new +#?% name.ts", "123", "[ 1, 2 ]"]) {
 				const internal = buildCommitPreviewHref(target, SHA, file);
 				const browser = buildCommitPreviewBrowserHref(target, SHA, file);
@@ -57,13 +57,13 @@ describe("commit preview navigation", () => {
 				const url = new URL(browser, "https://example.test");
 				expect(validateCommitPreviewSearch(defaultParseSearch(url.search))).toEqual({
 					file,
-					workspaceKey: typeof target === "string" ? undefined : target.workspaceKey,
+					workspaceKey: target.workspaceKey,
 				});
 			}
 		}
 	});
 	test("explicit window URLs retain their owner, exact search and parent workspace pin", () => {
-		for (const target of ["chapter /#", TARGET]) {
+		for (const target of [TARGET]) {
 			for (const file of [undefined, "123", "目录/new +#?% name.ts"]) {
 				const legacy = buildCommitPreviewHref(target, SHA, file, "page");
 				const windowHref = buildCommitPreviewHref(target, SHA, file, "window");
@@ -75,15 +75,10 @@ describe("commit preview navigation", () => {
 					),
 				).toEqual({
 					file,
-					workspaceKey: typeof target === "string" ? undefined : target.workspaceKey,
+					workspaceKey: target.workspaceKey,
 				});
 			}
 		}
-	});
-
-	test("chapter links retain the legacy target and do not leak host paths or capabilities", () => {
-		const href = buildCommitPreviewHref("chapter /#", SHA);
-		expect(href).toBe(`/git/chapters/chapter%20%2F%23/commits/${SHA}`);
 	});
 
 	test("narrator links pin the resolved workspace and round-trip exact file names", () => {
@@ -115,7 +110,7 @@ describe("commit preview navigation", () => {
 		"g".repeat(40),
 		"a".repeat(65),
 	])("rejects non-full commit names: %s", (sha) =>
-		expect(() => buildCommitPreviewHref("chapter", sha)).toThrow("full commit SHA"));
+		expect(() => buildCommitPreviewHref(TARGET, sha)).toThrow("full commit SHA"));
 
 	test("search parsing is bounded and never accepts URL-supplied authority", () => {
 		expect(

@@ -178,7 +178,11 @@ describe("GitFileDiff incremental rows", () => {
 		root.render(
 			<I18nextProvider i18n={i18n}>
 				<MantineProvider>
-					<GitFileDiff chapterId="chapter" file="large.txt" onClose={() => {}} />
+					<GitFileDiff
+						target={{ narratorId: "narrator", workspaceKey: "workspace", canWrite: true }}
+						file="large.txt"
+						onClose={() => {}}
+					/>
 				</MantineProvider>
 			</I18nextProvider>,
 		);

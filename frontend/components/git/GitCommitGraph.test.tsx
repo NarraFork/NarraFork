@@ -234,7 +234,12 @@ function textOf(container: HTMLElement): string {
 	return container.textContent ?? "";
 }
 
-function renderGraph(target: GitTarget, queryClient?: QueryClient) {
+/** A narrator Git target whose query key is `key`. */
+function asTarget(key: string): GitTarget {
+	return { narratorId: key, workspaceKey: key, canWrite: true };
+}
+
+function renderGraph(target: GitTarget | string, queryClient?: QueryClient) {
 	const qc =
 		queryClient ??
 		new QueryClient({
@@ -246,12 +251,14 @@ function renderGraph(target: GitTarget, queryClient?: QueryClient) {
 	const container = document.createElement("div");
 	document.body.appendChild(container);
 	root = createRoot(container);
-	const rerender = (nextTarget: GitTarget) =>
+	const rerender = (nextTarget: GitTarget | string) =>
 		root?.render(
 			<I18nextProvider i18n={i18n}>
 				<MantineProvider>
 					<QueryClientProvider client={qc}>
-						<GitCommitGraph target={nextTarget} />
+						<GitCommitGraph
+							target={typeof nextTarget === "string" ? asTarget(nextTarget) : nextTarget}
+						/>
 					</QueryClientProvider>
 				</MantineProvider>
 			</I18nextProvider>,
@@ -333,7 +340,7 @@ describe("GitCommitGraph", () => {
 		await waitFor(() => !!container.querySelector("[data-commit-row]"));
 		const link = container.querySelector(`[data-commit-row="${HEAD_SHA}"]`) as HTMLAnchorElement;
 		expect(link.getAttribute("href")).toContain(
-			`/git/chapters/chapter-preview/commits/${HEAD_SHA}`,
+			`/git/narrators/chapter-preview/commits/${HEAD_SHA}`,
 		);
 		for (const modifier of ["ctrlKey", "metaKey", "shiftKey", "altKey"]) {
 			const event = new Event("click", { bubbles: true, cancelable: true });
@@ -624,7 +631,7 @@ describe("GitCommitGraph height is bounded by its host", () => {
 			<I18nextProvider i18n={i18n}>
 				<MantineProvider>
 					<QueryClientProvider client={qc}>
-						<GitCommitGraph target={chapterId} />
+						<GitCommitGraph target={asTarget(chapterId)} />
 					</QueryClientProvider>
 				</MantineProvider>
 			</I18nextProvider>,
@@ -802,7 +809,7 @@ describe("GitCommitGraph workspace switch", () => {
 				<I18nextProvider i18n={i18n}>
 					<MantineProvider>
 						<QueryClientProvider client={qc}>
-							<GitCommitGraph target={target} />
+							<GitCommitGraph target={asTarget(target)} />
 						</QueryClientProvider>
 					</MantineProvider>
 				</I18nextProvider>,
@@ -921,7 +928,9 @@ describe("GitCommitGraph query lifecycle", () => {
 					signal = requestSignal;
 					return pending.promise;
 				}
-				return target === "old-workspace" ? originalLog(target, limit, skip) : makeCommits();
+				return target.workspaceKey === "old-workspace"
+					? originalLog(target, limit, skip)
+					: makeCommits();
 			};
 			const { container, queryClient, rerender } = renderGraph("old-workspace");
 			await waitFor(() => hasButton(container, "Load More"));

@@ -35,7 +35,12 @@ mock.module("../../lib/i18n", () => ({
 	initI18n: async () => i18n,
 	default: i18n,
 }));
-const { GitPanel } = await import("./GitPanel");
+const { GitPanel, GitPanelContent } = await import("./GitPanel");
+
+/** A narrator Git target whose query key is `key`. */
+function workspaceTarget(key: string): GitTarget {
+	return { narratorId: key, workspaceKey: key, canWrite: true };
+}
 
 class TestResizeObserver {
 	observe() {}
@@ -218,7 +223,7 @@ function stubInteractiveGitApi(calls: Array<{ name: string; body?: unknown }>) {
 			parents: [],
 		},
 	];
-	api.gitStage = async (_chapterId, body) => {
+	api.gitStage = async (_target, body) => {
 		calls.push({ name: "stage", body });
 		return makeStatus();
 	};
@@ -367,14 +372,14 @@ describe("GitPanel", () => {
 	});
 
 	test("renders git changes panel without crashing on TS-compatible status data", async () => {
-		const chapterId = "chapter-git-smoke";
+		const workspaceKey = "git-smoke";
 		const queryClient = new QueryClient({
 			defaultOptions: {
 				queries: { retry: false, staleTime: Infinity, refetchOnMount: false },
 				mutations: { retry: false },
 			},
 		});
-		queryClient.setQueryData(["gitStatus", chapterId], makeStatus());
+		queryClient.setQueryData(["gitStatus", workspaceKey], makeStatus());
 
 		const container = document.createElement("div");
 		document.body.appendChild(container);
@@ -385,7 +390,7 @@ describe("GitPanel", () => {
 				<MantineProvider>
 					<QueryClientProvider client={queryClient}>
 						<ConfirmDialogProvider>
-							<GitPanel chapterId={chapterId} />
+							<GitPanelContent target={workspaceTarget(workspaceKey)} />
 						</ConfirmDialogProvider>
 					</QueryClientProvider>
 				</MantineProvider>
@@ -429,7 +434,7 @@ describe("GitPanel", () => {
 	});
 
 	test("collapses a folder and stages every file beneath it", async () => {
-		const chapterId = "chapter-git-tree";
+		const workspaceKey = "git-tree";
 		const calls: Array<{ name: string; body?: unknown }> = [];
 		stubInteractiveGitApi(calls);
 		const queryClient = new QueryClient({
@@ -438,7 +443,7 @@ describe("GitPanel", () => {
 				mutations: { retry: false },
 			},
 		});
-		queryClient.setQueryData(["gitStatus", chapterId], makeStatus());
+		queryClient.setQueryData(["gitStatus", workspaceKey], makeStatus());
 
 		const container = document.createElement("div");
 		document.body.appendChild(container);
@@ -448,7 +453,7 @@ describe("GitPanel", () => {
 				<MantineProvider>
 					<QueryClientProvider client={queryClient}>
 						<ConfirmDialogProvider>
-							<GitPanel chapterId={chapterId} />
+							<GitPanelContent target={workspaceTarget(workspaceKey)} />
 						</ConfirmDialogProvider>
 					</QueryClientProvider>
 				</MantineProvider>
@@ -499,14 +504,14 @@ describe("GitPanel", () => {
 		// A bare chevron made folder rows read as unanchored next to the files'
 		// status badge, and left the two name columns ragged. The glyph carries the
 		// "directory" signal; the equal leading width is what lines the names up.
-		const chapterId = "chapter-git-folder-glyph";
+		const workspaceKey = "git-folder-glyph";
 		const queryClient = new QueryClient({
 			defaultOptions: {
 				queries: { retry: false, staleTime: Infinity, refetchOnMount: false },
 				mutations: { retry: false },
 			},
 		});
-		queryClient.setQueryData(["gitStatus", chapterId], makeStatus());
+		queryClient.setQueryData(["gitStatus", workspaceKey], makeStatus());
 
 		const container = document.createElement("div");
 		document.body.appendChild(container);
@@ -516,7 +521,7 @@ describe("GitPanel", () => {
 				<MantineProvider>
 					<QueryClientProvider client={queryClient}>
 						<ConfirmDialogProvider>
-							<GitPanel chapterId={chapterId} />
+							<GitPanelContent target={workspaceTarget(workspaceKey)} />
 						</ConfirmDialogProvider>
 					</QueryClientProvider>
 				</MantineProvider>
@@ -553,7 +558,7 @@ describe("GitPanel", () => {
 	test("remembers which folders were opened within the browser session", async () => {
 		// The state has to outlive the component: a refresh used to reset every
 		// folder, which is the whole reason it now lives in sessionStorage.
-		const chapterId = "chapter-git-persist";
+		const workspaceKey = "git-persist";
 		const makeClient = () =>
 			new QueryClient({
 				defaultOptions: {
@@ -575,7 +580,7 @@ describe("GitPanel", () => {
 					<MantineProvider>
 						<QueryClientProvider client={client}>
 							<ConfirmDialogProvider>
-								<GitPanel chapterId={chapterId} />
+								<GitPanelContent target={workspaceTarget(workspaceKey)} />
 							</ConfirmDialogProvider>
 						</QueryClientProvider>
 					</MantineProvider>
@@ -585,7 +590,7 @@ describe("GitPanel", () => {
 		};
 
 		const first = makeClient();
-		first.setQueryData(["gitStatus", chapterId], makeStatus());
+		first.setQueryData(["gitStatus", workspaceKey], makeStatus());
 		const firstContainer = renderPanel(first);
 		await flushRender();
 
@@ -601,7 +606,7 @@ describe("GitPanel", () => {
 		first.clear();
 
 		const second = makeClient();
-		second.setQueryData(["gitStatus", chapterId], makeStatus());
+		second.setQueryData(["gitStatus", workspaceKey], makeStatus());
 		const secondContainer = renderPanel(second);
 		await flushRender();
 
@@ -612,10 +617,10 @@ describe("GitPanel", () => {
 			"Expand folder src",
 		]);
 
-		// A DIFFERENT chapter does not inherit it — state is keyed per chapter.
+		// A DIFFERENT workspace does not inherit it — state is keyed per workspace.
 		unmountPanel();
 		const other = makeClient();
-		other.setQueryData(["gitStatus", "chapter-git-persist-other"], makeStatus());
+		other.setQueryData(["gitStatus", "git-persist-other"], makeStatus());
 		const otherContainer = document.createElement("div");
 		document.body.appendChild(otherContainer);
 		const otherRoot = createRoot(otherContainer);
@@ -625,7 +630,7 @@ describe("GitPanel", () => {
 				<MantineProvider>
 					<QueryClientProvider client={other}>
 						<ConfirmDialogProvider>
-							<GitPanel chapterId="chapter-git-persist-other" />
+							<GitPanelContent target={workspaceTarget("git-persist-other")} />
 						</ConfirmDialogProvider>
 					</QueryClientProvider>
 				</MantineProvider>
@@ -643,14 +648,14 @@ describe("GitPanel", () => {
 		// shapes a new file takes. Both used to render something other than `A`:
 		// `??` printed the raw question marks, and `AM` fell through to the gray
 		// fallback because the badge concatenated BOTH porcelain halves.
-		const chapterId = "chapter-git-added-badge";
+		const workspaceKey = "git-added-badge";
 		const queryClient = new QueryClient({
 			defaultOptions: {
 				queries: { retry: false, staleTime: Infinity, refetchOnMount: false },
 				mutations: { retry: false },
 			},
 		});
-		queryClient.setQueryData(["gitStatus", chapterId], {
+		queryClient.setQueryData(["gitStatus", workspaceKey], {
 			hasChanges: true,
 			staged: 1,
 			unstaged: 1,
@@ -692,7 +697,7 @@ describe("GitPanel", () => {
 				<MantineProvider>
 					<QueryClientProvider client={queryClient}>
 						<ConfirmDialogProvider>
-							<GitPanel chapterId={chapterId} />
+							<GitPanelContent target={workspaceTarget(workspaceKey)} />
 						</ConfirmDialogProvider>
 					</QueryClientProvider>
 				</MantineProvider>
@@ -726,14 +731,14 @@ describe("GitPanel", () => {
 	});
 
 	test("keeps deep paths to two rows so a narrow panel does not indent off-screen", async () => {
-		const chapterId = "chapter-git-deep";
+		const workspaceKey = "git-deep";
 		const queryClient = new QueryClient({
 			defaultOptions: {
 				queries: { retry: false, staleTime: Infinity, refetchOnMount: false },
 				mutations: { retry: false },
 			},
 		});
-		queryClient.setQueryData(["gitStatus", chapterId], makeDeepStatus());
+		queryClient.setQueryData(["gitStatus", workspaceKey], makeDeepStatus());
 
 		const container = document.createElement("div");
 		document.body.appendChild(container);
@@ -743,7 +748,7 @@ describe("GitPanel", () => {
 				<MantineProvider>
 					<QueryClientProvider client={queryClient}>
 						<ConfirmDialogProvider>
-							<GitPanel chapterId={chapterId} />
+							<GitPanelContent target={workspaceTarget(workspaceKey)} />
 						</ConfirmDialogProvider>
 					</QueryClientProvider>
 				</MantineProvider>
@@ -779,7 +784,7 @@ describe("GitPanel", () => {
 	});
 
 	test("handles write and AI actions without crashing", async () => {
-		const chapterId = "chapter-git-interactive-smoke";
+		const workspaceKey = "git-interactive-smoke";
 		const calls: Array<{ name: string; body?: unknown }> = [];
 		stubInteractiveGitApi(calls);
 		const queryClient = new QueryClient({
@@ -788,7 +793,7 @@ describe("GitPanel", () => {
 				mutations: { retry: false },
 			},
 		});
-		queryClient.setQueryData(["gitStatus", chapterId], makeStatus());
+		queryClient.setQueryData(["gitStatus", workspaceKey], makeStatus());
 
 		const container = document.createElement("div");
 		document.body.appendChild(container);
@@ -798,7 +803,7 @@ describe("GitPanel", () => {
 				<MantineProvider>
 					<QueryClientProvider client={queryClient}>
 						<ConfirmDialogProvider>
-							<GitPanel chapterId={chapterId} />
+							<GitPanelContent target={workspaceTarget(workspaceKey)} />
 						</ConfirmDialogProvider>
 					</QueryClientProvider>
 				</MantineProvider>
@@ -924,7 +929,6 @@ describe("GitPanel", () => {
 		queryClient.setQueryData(["narrators", narratorId], {
 			id: narratorId,
 			cwd: "/repo/sub",
-			chapterId: null,
 			contextProjectId: "project-context",
 			workspaceRevision: revision,
 		});
@@ -1108,44 +1112,6 @@ describe("GitPanel", () => {
 		}
 	});
 
-	test("migrates chapter view preferences only when the server confirms the same worktree", async () => {
-		sessionStorage.setItem(
-			"narrafork_git_expanded_folders",
-			JSON.stringify({ legacy: { staged: ["src"], unstaged: ["src"] } }),
-		);
-		sessionStorage.setItem("narrafork_git_status_filter", JSON.stringify({ legacy: ["M"] }));
-		const { container, queryClient, update } = await renderNarratorWorkspace(
-			readyWorkspace({ chapterId: "legacy" }),
-		);
-		await flushRender();
-		expect(
-			JSON.parse(sessionStorage.getItem("narrafork_git_expanded_folders") ?? "{}")["local:/repo"]
-				.staged,
-		).toEqual(["src"]);
-		expect(JSON.parse(sessionStorage.getItem("narrafork_git_status_filter") ?? "{}")).toEqual({
-			"local:/repo": ["M"],
-		});
-		buttonByLabel(container, "Clear filter").click();
-		await flushRender();
-		await update(
-			readyWorkspace({ chapterId: "legacy", capabilities: { read: true, write: false } }),
-		);
-		await flushRender();
-		await flushRender();
-		expect(JSON.parse(sessionStorage.getItem("narrafork_git_status_filter") ?? "{}")).toEqual({});
-		queryClient.clear();
-	});
-
-	test("an explicit cwd in another repository does not import the old chapter preferences", async () => {
-		sessionStorage.setItem("narrafork_git_status_filter", JSON.stringify({ legacy: ["D"] }));
-		const { container, queryClient } = await renderNarratorWorkspace(readyWorkspace());
-		expect(container.textContent).not.toContain("No files match");
-		expect(JSON.parse(sessionStorage.getItem("narrafork_git_status_filter") ?? "{}")).toEqual({
-			legacy: ["D"],
-		});
-		queryClient.clear();
-	});
-
 	test("workspace cache shares roots, isolates devices, and refreshes repository peers", () => {
 		const qc = new QueryClient();
 		const target = {
@@ -1178,7 +1144,7 @@ describe("GitPanel", () => {
 	const LONG_BRANCH = "chapter/very-long-branch-name-Bo_bRv";
 
 	/** Mount the panel with `gitStatus` pre-seeded for a branch. */
-	async function renderWithBranch(chapterId: string, branch: string) {
+	async function renderWithBranch(workspaceKey: string, branch: string) {
 		const status = makeStatus();
 		status.branch = branch;
 		const queryClient = new QueryClient({
@@ -1187,7 +1153,7 @@ describe("GitPanel", () => {
 				mutations: { retry: false },
 			},
 		});
-		queryClient.setQueryData(["gitStatus", chapterId], status);
+		queryClient.setQueryData(["gitStatus", workspaceKey], status);
 
 		const container = document.createElement("div");
 		document.body.appendChild(container);
@@ -1197,7 +1163,7 @@ describe("GitPanel", () => {
 				<MantineProvider>
 					<QueryClientProvider client={queryClient}>
 						<ConfirmDialogProvider>
-							<GitPanel chapterId={chapterId} />
+							<GitPanelContent target={workspaceTarget(workspaceKey)} />
 						</ConfirmDialogProvider>
 					</QueryClientProvider>
 				</MantineProvider>
@@ -1238,7 +1204,7 @@ describe("GitPanel", () => {
 		});
 
 		const { container, queryClient } = await renderWithBranch(
-			"chapter-git-branch-header",
+			"git-branch-header",
 			LONG_BRANCH,
 		);
 
@@ -1270,7 +1236,7 @@ describe("GitPanel", () => {
 		const copied = installLegacyClipboard();
 
 		const { container, queryClient } = await renderWithBranch(
-			"chapter-git-branch-header-legacy",
+			"git-branch-header-legacy",
 			LONG_BRANCH,
 		);
 
@@ -1288,14 +1254,14 @@ describe("GitPanel", () => {
 	});
 
 	test("switches between the compact tree and flat file list", async () => {
-		const chapterId = "chapter-git-view-mode";
+		const workspaceKey = "git-view-mode";
 		const queryClient = new QueryClient({
 			defaultOptions: {
 				queries: { retry: false, staleTime: Infinity, refetchOnMount: false },
 				mutations: { retry: false },
 			},
 		});
-		queryClient.setQueryData(["gitStatus", chapterId], makeStatus());
+		queryClient.setQueryData(["gitStatus", workspaceKey], makeStatus());
 
 		const container = document.createElement("div");
 		document.body.appendChild(container);
@@ -1305,7 +1271,7 @@ describe("GitPanel", () => {
 				<MantineProvider>
 					<QueryClientProvider client={queryClient}>
 						<ConfirmDialogProvider>
-							<GitPanel chapterId={chapterId} />
+							<GitPanelContent target={workspaceTarget(workspaceKey)} />
 						</ConfirmDialogProvider>
 					</QueryClientProvider>
 				</MantineProvider>
@@ -1321,7 +1287,7 @@ describe("GitPanel", () => {
 			"View diff of src/unstaged.ts",
 			"View diff of src/new-file.ts",
 		]);
-		expect(JSON.parse(localStorage.getItem("narrafork_git_view_mode") ?? "{}")[chapterId]).toBe(
+		expect(JSON.parse(localStorage.getItem("narrafork_git_view_mode") ?? "{}")[workspaceKey]).toBe(
 			"flat",
 		);
 
@@ -1335,7 +1301,7 @@ describe("GitPanel", () => {
 				<MantineProvider>
 					<QueryClientProvider client={queryClient}>
 						<ConfirmDialogProvider>
-							<GitPanel chapterId={chapterId} />
+							<GitPanelContent target={workspaceTarget(workspaceKey)} />
 						</ConfirmDialogProvider>
 					</QueryClientProvider>
 				</MantineProvider>

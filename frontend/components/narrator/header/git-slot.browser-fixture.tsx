@@ -3,7 +3,7 @@ import { MantineProvider } from "@mantine/core";
 import type { GitWorkspace } from "@shared/git-workspace";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { createRoot } from "react-dom/client";
-import { ChapterBar, NarratorGitBar } from "./ChapterBar";
+import { NarratorGitBar } from "./NarratorGitBar";
 
 declare global {
 	interface Window {
@@ -14,7 +14,6 @@ declare global {
 const root = createRoot(document.getElementById("root") as HTMLElement);
 const qc = new QueryClient();
 let generation = 0;
-let mode = "git";
 let completed = false;
 let gitOpenCount = 0;
 let timer: ReturnType<typeof setTimeout> | undefined;
@@ -41,24 +40,13 @@ function render() {
 					<div id="messages" style={{ flex: 1, minHeight: 0, overflow: "auto" }}>
 						First-screen messages already adopted
 					</div>
-					{mode.startsWith("chapter") ? (
-						<ChapterBar
-							key={generation}
-							chapterId="chapter"
-							narratorId="n"
-							onOpenGitPanel={() => {
-								gitOpenCount++;
-							}}
-						/>
-					) : (
-						<NarratorGitBar
-							key={generation}
-							narratorId="n"
-							onOpenGitPanel={() => {
-								gitOpenCount++;
-							}}
-						/>
-					)}
+					<NarratorGitBar
+						key={generation}
+						narratorId="n"
+						onOpenGitPanel={() => {
+							gitOpenCount++;
+						}}
+					/>
 					<div style={{ height: 29, flexShrink: 0 }}>Status</div>
 					<div style={{ height: 54, flexShrink: 0 }}>Composer</div>
 				</div>
@@ -69,7 +57,6 @@ function render() {
 export function start(scenario: string) {
 	clearTimeout(timer);
 	generation++;
-	mode = scenario;
 	completed = false;
 	gitOpenCount = 0;
 	window.gitFixtureContext = { cwd: "/repo", deviceId: "remote", revision: 1 };
@@ -131,9 +118,7 @@ export function revise() {
 }
 export function snapshot() {
 	const viewport = document.getElementById("messages");
-	const slot =
-		document.querySelector("[data-git-slot]") ??
-		(mode.startsWith("chapter") ? viewport?.nextElementSibling : null);
+	const slot = document.querySelector("[data-git-slot]");
 	const rect = viewport?.getBoundingClientRect();
 	return {
 		ready: !!rect,

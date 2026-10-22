@@ -39,12 +39,8 @@ const disposeCanvas = installCanvasStub();
 const { Route: narratorRoute } = await import(
 	"../../routes/git/narrators/$narratorId/commits/$sha"
 );
-const { Route: chapterRoute } = await import("../../routes/git/chapters/$chapterId/commits/$sha");
 const { Route: narratorWindowRoute } = await import(
 	"../../routes/windows/git/narrators/$narratorId/commits/$sha"
-);
-const { Route: chapterWindowRoute } = await import(
-	"../../routes/windows/git/chapters/$chapterId/commits/$sha"
 );
 const SHA = "a".repeat(40);
 const PARENT = "b".repeat(64);
@@ -209,36 +205,19 @@ function makeRouter(href: string) {
 		path: "/git/narrators/$narratorId/commits/$sha",
 		id: "/git/narrators/$narratorId/commits/$sha",
 	} as never);
-	const chapter = chapterRoute.update({
-		getParentRoute: () => rootRoute,
-		path: "/git/chapters/$chapterId/commits/$sha",
-		id: "/git/chapters/$chapterId/commits/$sha",
-	} as never);
 	const narratorWindow = narratorWindowRoute.update({
 		getParentRoute: () => rootRoute,
 		path: "/windows/git/narrators/$narratorId/commits/$sha",
 		id: "/windows/git/narrators/$narratorId/commits/$sha",
 	} as never);
-	const chapterWindow = chapterWindowRoute.update({
-		getParentRoute: () => rootRoute,
-		path: "/windows/git/chapters/$chapterId/commits/$sha",
-		id: "/windows/git/chapters/$chapterId/commits/$sha",
-	} as never);
 	return createRouter({
 		routeTree: rootRoute.addChildren([
 			narrator,
-			chapter,
 			narratorWindow,
-			chapterWindow,
 			createRoute({
 				getParentRoute: () => rootRoute,
 				path: "/narrators/$narratorId",
 				component: () => <div data-narrator-dock />,
-			}),
-			createRoute({
-				getParentRoute: () => rootRoute,
-				path: "/chapters/$chapterId",
-				component: () => <div data-chapter-owner />,
 			}),
 		]),
 		history: createMemoryHistory({ initialEntries: [href] }),
@@ -410,16 +389,9 @@ describe("standalone commit file routes with real memory history", () => {
 		await waitFor(() => text().includes("PRIVATE_PATCH"), "fallback patch");
 		expect(text()).toContain(`Private commit ${SHA}`);
 	});
-	test.each([
-		"chapter",
-		"narrator",
-	])("%s window keeps file and parent navigation in its prefix", async (owner) => {
-		const target = owner === "chapter" ? "chapter-one" : TARGET;
-		const initial =
-			owner === "chapter"
-				? buildCommitPreviewHref(target, SHA, undefined, "window")
-				: `/windows/git/narrators/${TARGET.narratorId}/commits/${SHA}`;
-		const route = await mount(initial);
+	test("window keeps file and parent navigation in its prefix", async () => {
+		const target = TARGET;
+		const route = await mount(`/windows/git/narrators/${TARGET.narratorId}/commits/${SHA}`);
 		await expectSelected(FILE);
 		expect(route.history.length).toBe(1);
 		expect(route.state.location.pathname.startsWith("/windows/git/")).toBe(true);
@@ -427,9 +399,7 @@ describe("standalone commit file routes with real memory history", () => {
 			document.querySelector('[data-git-preview-page="window"] [data-commit-preview="window"]'),
 		).not.toBeNull();
 		const ownerLink = document.querySelector("[data-git-preview-owner-link]");
-		expect(ownerLink?.getAttribute("href")).toBe(
-			owner === "chapter" ? "/chapters/chapter-one" : "/narrators/narrator-one",
-		);
+		expect(ownerLink?.getAttribute("href")).toBe("/narrators/narrator-one");
 		expect(ownerLink?.getAttribute("target")).toBe("_blank");
 		expect(ownerLink?.textContent).toBe("Open in main app");
 		click(`[data-commit-file="${SECOND}"]`);
@@ -446,22 +416,6 @@ describe("standalone commit file routes with real memory history", () => {
 		route.history.back();
 		await expectSelected(SECOND);
 		expect(route.state.location.href).toBe(buildCommitPreviewHref(target, SHA, SECOND, "window"));
-	});
-
-	test("chapter direct entry resolves metadata without a narrator Dock or previous state", async () => {
-		const route = await mount(buildCommitPreviewHref("chapter-one", SHA));
-		await expectSelected(FILE);
-		expect(route.history.length).toBe(1);
-		expect(new URLSearchParams(route.state.location.searchStr).get("file")).toBe(FILE);
-		expect(api.getGitWorkspace).not.toHaveBeenCalled();
-		expect(api.getGitCommitDetail).toHaveBeenCalledWith(
-			"chapter-one",
-			SHA,
-			expect.any(AbortSignal),
-		);
-		expect(document.querySelector("[data-app-shell] [data-commit-preview=page]")).not.toBeNull();
-		expect(document.querySelector("[data-narrator-dock]")).toBeNull();
-		expect(document.querySelector('a[href="/chapters/chapter-one"]')).not.toBeNull();
 	});
 
 	test("a fresh narrator deep link probes its workspace and reads only the exact encoded selection", async () => {
@@ -572,19 +526,19 @@ describe("standalone commit file routes with real memory history", () => {
 				binary: false,
 			})),
 		});
-		const route = await mount(buildCommitPreviewHref("chapter-one", SHA, paths[1]));
+		const route = await mount(buildCommitPreviewHref(TARGET, SHA, paths[1]));
 		await expectSelected(paths[1]);
 		click(`[data-commit-file="${paths[0]}"]`);
 		await expectSelected(paths[0]);
 		expect(route.state.location.search.file).toBe(paths[0]);
-		await route.navigate({ href: buildCommitPreviewHref("chapter-one", SHA) });
+		await route.navigate({ href: buildCommitPreviewHref(TARGET, SHA) });
 		await waitFor(() => route.state.location.search.file === paths[0]);
 		await expectSelected(paths[0]);
-		await route.navigate({ href: buildCommitPreviewHref("chapter-one", SHA, paths[2]) });
+		await route.navigate({ href: buildCommitPreviewHref(TARGET, SHA, paths[2]) });
 		await expectSelected(paths[2]);
 		expect(route.state.location.search.file).toBe(paths[2]);
 		expect(api.getGitCommitDiff).toHaveBeenCalledWith(
-			"chapter-one",
+			expect.objectContaining(TARGET),
 			SHA,
 			paths[1],
 			undefined,
@@ -593,18 +547,18 @@ describe("standalone commit file routes with real memory history", () => {
 	}, 20_000);
 
 	test("an unavailable selected path is an explicit error, never an arbitrary diff request", async () => {
-		await mount(buildCommitPreviewHref("chapter-one", SHA, "/arbitrary/secret"));
+		await mount(buildCommitPreviewHref(TARGET, SHA, "/arbitrary/secret"));
 		await waitFor(() => text().includes("selected file is not"));
 		expect(api.getGitCommitDetail).toHaveBeenCalledTimes(1);
 		expect(api.getGitCommitDiff).not.toHaveBeenCalled();
 	});
 
 	test.each([
-		`/git/chapters/chapter-one/commits/HEAD`,
+		`/git/narrators/narrator-one/commits/HEAD`,
 		`/git/narrators/narrator-one/commits/${"a".repeat(41)}`,
-		`/git/chapters/chapter-one/commits/${SHA}?file=`,
-		`/git/chapters/chapter-one/commits/${SHA}?file=a&file=b`,
-		`/git/chapters/chapter-one/commits/${SHA}?file=${"a".repeat(4097)}`,
+		`/git/narrators/narrator-one/commits/${SHA}?file=`,
+		`/git/narrators/narrator-one/commits/${SHA}?file=a&file=b`,
+		`/git/narrators/narrator-one/commits/${SHA}?file=${"a".repeat(4097)}`,
 		`/git/narrators/narrator-one/commits/${SHA}?workspaceKey=a&workspaceKey=b`,
 	])("rejects invalid route parameters before any Git I/O: %.90s", async (href) => {
 		await mount(href);
@@ -639,25 +593,6 @@ describe("standalone commit file routes with real memory history", () => {
 		expect(api.getGitCommitDiff).not.toHaveBeenCalled();
 	});
 
-	test("chapter cache also requires fresh authorization; failure hides it and retry can recover", async () => {
-		queryClient.setQueryData(
-			["gitCommitDetail", "chapter-one", SHA, "/chapters/chapter-one/git"],
-			detail(),
-		);
-		const pending = deferred<GitCommitDetail>();
-		const read = spyOn(api, "getGitCommitDetail").mockReturnValue(pending.promise);
-		await mount(buildCommitPreviewHref("chapter-one", SHA, FILE));
-		await waitFor(() => read.mock.calls.length > 0);
-		expect(text()).not.toContain("Private Author");
-		pending.reject(new ApiError("Forbidden", 403));
-		await waitFor(() => text().includes("do not have access"));
-		expect(text()).not.toContain("Private Author");
-		expect(api.getGitCommitDiff).not.toHaveBeenCalled();
-		spyOn(api, "getGitCommitDetail").mockResolvedValue(detail());
-		click("button");
-		await expectSelected(FILE);
-	});
-
 	test.each([
 		"device_offline",
 		"unsupported",
@@ -684,7 +619,7 @@ describe("standalone commit file routes with real memory history", () => {
 
 	test.each([404, 409, 503])("HTTP %i remains explicit and offers retry", async (status) => {
 		spyOn(api, "getGitCommitDetail").mockRejectedValue(new ApiError("Unavailable", status));
-		await mount(buildCommitPreviewHref("chapter-one", SHA));
+		await mount(buildCommitPreviewHref(TARGET, SHA));
 		await waitFor(() => !!document.querySelector('[role="alert"]'));
 		expect(document.querySelector("button")?.textContent).toBe("Refresh");
 		expect(api.getGitCommitDiff).not.toHaveBeenCalled();

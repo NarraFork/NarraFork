@@ -1,6 +1,6 @@
 import { Alert, NumberInput, Stack, Switch, Title } from "@mantine/core";
 import { useTranslation } from "react-i18next";
-import { useChapterContainersCapability, useChapterSplitCapability } from "../../hooks/usePlatform";
+import { useChapterContainersCapability } from "../../hooks/usePlatform";
 
 export interface ChaptersContainersSectionProps {
 	maxWorktrees: number;
@@ -27,11 +27,7 @@ export interface ChaptersContainersSectionProps {
 
 export function ChaptersContainersSection(props: ChaptersContainersSectionProps) {
 	const { t } = useTranslation("settings");
-	const chapterSplitCapability = useChapterSplitCapability();
 	const chapterContainersCapability = useChapterContainersCapability();
-	const chapterSplitUnsupportedReason = chapterSplitCapability.supported
-		? undefined
-		: chapterSplitCapability.reason || t("chapterSplitUnsupported");
 	const chapterContainersUnsupportedReason = chapterContainersCapability.supported
 		? undefined
 		: chapterContainersCapability.reason || t("chapterContainersUnsupported");
@@ -44,11 +40,6 @@ export function ChaptersContainersSection(props: ChaptersContainersSectionProps)
 		<Stack>
 			{/* Chapters */}
 			<Title order={5}>{t("chaptersSubSection")}</Title>
-			{chapterSplitUnsupportedReason && (
-				<Alert color="yellow" variant="light" title={t("chapterSplitUnsupported")}>
-					{chapterSplitUnsupportedReason}
-				</Alert>
-			)}
 			<NumberInput
 				label={t("maxActiveWorktrees")}
 				value={props.maxWorktrees}

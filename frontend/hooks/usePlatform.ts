@@ -16,14 +16,9 @@ import { api } from "../lib/api";
  * capabilities object would have flipped every other getter's absent-payload fallback
  * off at once and turned 30+ working features unsupported.
  *
- * The inert structure was not free. `getChapterSplitCapability` deliberately failed closed
- * while `POST /chapters/:id/split` was missing, which was correct at the time; once the
- * route landed the fail-closed default kept the feature permanently unreachable, because
- * no payload ever arrived to say otherwise. Split was the bug that got noticed. The
- * compressed-summary warning in `ChapterSplitModal` was another: `compressedAISummary`
- * had no absent-payload fallback, so it read `false` and the modal told users this
- * backend cannot generate an AI summary for compressed splits, while `narrator-service`
- * generates one via `narratorContext.generateContextSummary`.
+ * The inert structure was not free: getters that deliberately failed closed while a route
+ * was missing stayed closed after the route landed, because no payload ever arrived to say
+ * otherwise, and features became permanently unreachable.
  *
  * So the getters are gone and what they returned is stated directly. Hook names and
  * return shapes are unchanged, so call sites still read `.supported` / `.reason` and can
@@ -363,33 +358,6 @@ export function useChapterContainersCapability(): ChapterContainersCapability {
 		};
 	}
 	return CHAPTER_CONTAINERS_SUPPORTED;
-}
-
-// === chapters: split ===
-
-/**
- * `compressedAISummarySupported` is true because compressed splits do get an AI summary:
- * `chapter-split` passes `inheritMode` through to `chapterFork.fork`, and
- * `narrator-service` calls `narratorContext.generateContextSummary` for the compressed
- * mode. The old getter had no fallback for this field so it read `false`, which made
- * `ChapterSplitModal` warn about a fallback that was not in use.
- */
-const CHAPTER_SPLIT_CAPABILITY: {
-	supported: boolean;
-	reason?: string;
-	mode?: string;
-	compressedAISummarySupported: boolean;
-	compressedAISummaryFallback: boolean;
-	compressedAISummaryMode?: string;
-	compressedAISummaryReason?: string;
-} = Object.freeze({
-	supported: true,
-	compressedAISummarySupported: true,
-	compressedAISummaryFallback: false,
-});
-
-export function useChapterSplitCapability(): typeof CHAPTER_SPLIT_CAPABILITY {
-	return CHAPTER_SPLIT_CAPABILITY;
 }
 
 // === narrator ===

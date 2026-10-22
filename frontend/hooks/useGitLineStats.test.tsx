@@ -202,7 +202,7 @@ test("healthy push shares one grant, keeps summary out of details and performs z
 	await flush();
 	expect(container.querySelector("[data-view]")?.getAttribute("data-updating")).toBe("false");
 	window.dispatchEvent(new window.Event("focus"));
-	invalidateGitStatusPushQueries(client, "n1", null);
+	invalidateGitStatusPushQueries(client, "n1");
 	invalidateWorkspaceQueries(client, target, false);
 	await flush();
 	expect(messages.filter((message) => message.type === "git_workspace_refresh")).toHaveLength(0);
@@ -374,7 +374,7 @@ test("push, manual refresh and writes invalidate the shared query and update bot
 	expect(container.textContent).toBe("main:1main:1");
 	const pending = deferred<GitLineStats>();
 	get.mockReturnValue(pending.promise);
-	invalidateGitStatusPushQueries(client, "n1", null);
+	invalidateGitStatusPushQueries(client, "n1");
 	await flush();
 	expect(container.textContent).toBe("main:unknownmain:unknown");
 	pending.resolve(stats(8));
