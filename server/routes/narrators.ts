@@ -1864,7 +1864,13 @@ narratorRoutes.post("/:id/optimize-prompt", async (c) => {
 
 	// Get system instruction for the chosen style
 	const locale = await getUserLanguage(userId);
-	const systemInstruction = getPromptOptimizeInstruction(style as PromptOptimizeStyle, locale);
+	let systemInstruction = getPromptOptimizeInstruction(style as PromptOptimizeStyle, locale);
+	// Multi-segment drafts wrap each segment in <<<NF_..._n>>> ... <<<NF_..._n_END>>> markers
+	// that the client uses to put results back; the model must echo them verbatim.
+	if (/<<<NF_[^>\n]+>>>/.test(text)) {
+		systemInstruction +=
+			"\n\nSEGMENT MARKERS: The draft contains several segments delimited by marker lines like <<<NF_xxx_0>>> and <<<NF_xxx_0_END>>>. Optimize each segment's content separately, and output every marker line EXACTLY as given, in the original order, each on its own line, with each segment's result between its start and end markers. Never merge, drop, reorder or alter markers, and add nothing outside them. This overrides the instruction to output only the prompt text.";
+	}
 
 	// Load context if requested
 	let contextText = "";
