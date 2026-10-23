@@ -26,6 +26,8 @@ export const createTerminalSchema = z.preprocess(
 			deviceId: z.string().min(1).optional(),
 			expectedRevision: z.number().int().nonnegative().optional(),
 			contextKey: z.string().min(1).max(128).optional(),
+			expectedBindingRevision: z.number().int().nonnegative().optional(),
+			bindingId: z.string().min(1).max(128).optional(),
 		})
 		.refine((d) => !(d.chapterId && d.narratorId), {
 			message: "Only one of chapterId or narratorId may be provided",

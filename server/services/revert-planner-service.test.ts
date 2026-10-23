@@ -690,7 +690,7 @@ describe("no partial executable prefix", () => {
 		expect(historySnapshot()).toBe(before);
 		expect(await readFile(path)).toEqual(disk);
 	});
-	test("one overlapping conflict refuses otherwise reversible files without persisting a prefix", async () => {
+	test("one overlapping conflict skips that file and prepares other reversible files", async () => {
 		const first = join(workspace, "safe.txt");
 		const second = join(workspace, "conflict.txt");
 		await writeFile(first, "old");
@@ -699,9 +699,12 @@ describe("no partial executable prefix", () => {
 		await write(second, "new");
 		await writeFile(second, "human overwrite");
 		const before = historySnapshot();
-		(await rejected(prepare())).toMatchObject({ code: "REVERT_PLANNER_REVERSAL_REFUSED" });
-		assertUnprepared();
-		expect(db.select().from(schema.revertOperationFiles).all()).toHaveLength(0);
+		const result = await prepare();
+		expect(result.plan.status).toBe("prepared");
+		expect(result.plan.expectedFileCount).toBe(1);
+		expect(result.coverage?.conflicts).toHaveLength(1);
+		expect(result.coverage?.conflicts[0]?.path).toBe("conflict.txt");
+		expect(db.select().from(schema.revertOperationFiles).all()).toHaveLength(1);
 		expect(historySnapshot()).toBe(before);
 		expect(await readFile(first, "utf8")).toBe("new");
 		expect(await readFile(second, "utf8")).toBe("human overwrite");

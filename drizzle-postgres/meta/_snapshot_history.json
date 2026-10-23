@@ -120,6 +120,30 @@
 			"prevId": "9a6cc3fb-d617-4dda-8102-e4df044a4605",
 			"version": "7",
 			"snapshotDigest": "c1817d01f566af4372144e24ccbfd2faece719c5d8db7016cbf3cee5324a0010"
+		},
+		{
+			"idx": 15,
+			"tag": "0015_narrator_device_workspaces",
+			"id": "8f813f0e-f688-46aa-b4fb-2b318b72d039",
+			"prevId": "53e025e9-8481-4811-bb4e-87436f8c5ca6",
+			"version": "7",
+			"snapshotDigest": "62c19ebd7c09cd06d86f8104e9f7415730a5fa43f40ec41872691eb271d7d532"
+		},
+		{
+			"idx": 16,
+			"tag": "0016_s4_workspace_install_lookup",
+			"id": "e6851aac-7ff0-4108-b18b-dbaa3a02f696",
+			"prevId": "8f813f0e-f688-46aa-b4fb-2b318b72d039",
+			"version": "7",
+			"snapshotDigest": "7e74baca48d835606c5c56f62d77078c24d01cd51b96090d8ff24f71f448d465"
+		},
+		{
+			"idx": 17,
+			"tag": "0017_workspace_write_activities",
+			"id": "62556ed3-0a7d-43e3-b441-d5eebb56522a",
+			"prevId": "e6851aac-7ff0-4108-b18b-dbaa3a02f696",
+			"version": "7",
+			"snapshotDigest": "03f0ee5a4c1ecd83451b0c5858447648670ac4d144ed413f12b671fa6b4eeaee"
 		}
 	]
 }

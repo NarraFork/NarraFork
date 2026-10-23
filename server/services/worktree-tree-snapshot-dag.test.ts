@@ -32,6 +32,20 @@ import {
 	worktreeTreeSnapshot,
 } from "./worktree-tree-snapshot";
 
+test("reversal skips a mismatched file while restoring the other known file", async () => {
+	const { worktree } = await createWorktree("nf-partial-tree-", { "a.txt": "old a", "b.txt": "old b" });
+	const before = await worktreeTreeSnapshot.capture(worktree);
+	writeFileSync(join(worktree, "a.txt"), "known a");
+	writeFileSync(join(worktree, "b.txt"), "known b");
+	const after = await worktreeTreeSnapshot.capture(worktree);
+	writeFileSync(join(worktree, "a.txt"), "external a");
+	const result = await worktreeTreeSnapshot.reverseAndRestore(worktree, [{ before, after, ownedPaths: ["a.txt", "b.txt"] }]);
+	expect(result.conflicts).toEqual(["a.txt"]);
+	expect(result.changedFiles).toEqual(["b.txt"]);
+	expect(readFileSync(join(worktree, "a.txt"), "utf8")).toBe("external a");
+	expect(readFileSync(join(worktree, "b.txt"), "utf8")).toBe("old b");
+});
+
 const tempDirs: string[] = [];
 const snapshotPaths: string[] = [];
 const createdChapters: string[] = [];

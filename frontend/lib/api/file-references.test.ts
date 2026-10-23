@@ -28,6 +28,60 @@ function mockFetch(fn: (url: string, options?: RequestInit) => Response | Promis
 }
 
 describe("file reference API contracts and budgets", () => {
+	test("captured snapshot sends only encoded server occurrence selectors and accepts only immutable bounded bytes", async () => {
+		let sentUrl = "";
+		mockFetch((url) => {
+			sentUrl = url;
+			return Response.json({
+				source: "captured_snapshot",
+				readOnly: true,
+				reference: { id: "ref/1", deviceId: "local", path: "/old/file", label: "file" },
+				content: "original",
+				hash: "a".repeat(64),
+				capturedAt: "2026-10-12",
+			});
+		});
+		expect(
+			(await fileReferenceApi.snapshot("n/id", { messageId: "m/id", referenceId: "ref/1" }))
+				.content,
+		).toBe("original");
+		const url = new URL(sentUrl, "http://test");
+		expect(url.pathname).toBe("/api/narrators/n%2Fid/file-references/snapshot");
+		expect(Object.fromEntries(url.searchParams)).toEqual({
+			messageId: "m/id",
+			referenceId: "ref/1",
+		});
+		for (const extra of [
+			{ readOnly: false },
+			{ source: "live_file" },
+			{ content: "x".repeat(32 * 1024 + 1) },
+		]) {
+			mockFetch(() =>
+				Response.json({
+					source: "captured_snapshot",
+					readOnly: true,
+					reference: { id: "r" },
+					content: "snapshot",
+					...extra,
+				}),
+			);
+			await expect(
+				fileReferenceApi.snapshot("n", { messageId: "m", referenceId: "r" }),
+			).rejects.toThrow("unavailable");
+		}
+	});
+	test("captured snapshot legacy/withdraw rejection never falls back to raw preview", async () => {
+		const urls: string[] = [];
+		mockFetch((url) => {
+			urls.push(url);
+			return Response.json({ error: "Original source unavailable" }, { status: 422 });
+		});
+		await expect(
+			fileReferenceApi.snapshot("n", { messageId: "m", referenceId: "r" }),
+		).rejects.toMatchObject({ status: 422 });
+		expect(urls).toHaveLength(1);
+		expect(urls[0]).toContain("/snapshot?");
+	});
 	test("imagePreview encodes explicit targets and returns a typed binary Blob", async () => {
 		let sentUrl = "";
 		mockFetch((url) => {

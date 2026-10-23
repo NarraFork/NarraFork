@@ -122,6 +122,7 @@ async function bindOriginalTextSource(sourceNarratorId = "n1") {
 					deviceId: workspace.deviceId,
 					contextKey: workspace.contextKey,
 					attachmentWorkspace: workspace,
+					attachmentOrigin: { version: 1, projectId: workspace.contextProjectId ?? null },
 					sourceNarratorId,
 				}
 			: block,
@@ -402,6 +403,37 @@ describe("editAndRegenerate text_file management", () => {
 		await Promise.allSettled([firstEdit, secondEdit]);
 
 		expect(secondStartedBeforeRelease).toBe(false);
+	});
+
+	test("legacy attachment without original project provenance is unavailable rather than copied", async () => {
+		const cwd = mkdtempSync(join(tmpdir(), "nf-edit-legacy-source-"));
+		seed(cwd, [{ type: "text", text: "old" }]);
+		const workspace = await workspaceContextService.get("n1", { userId: EDITOR_ID });
+		const { prepareNarratorTextAttachmentAccess, prepareRetainedNarratorTextFile } = await import(
+			"../narrator-text-attachments"
+		);
+		const target = await prepareNarratorTextAttachmentAccess("n1", {
+			userId: EDITOR_ID,
+			workspaceContext: workspace,
+		});
+		const retained = await prepareRetainedNarratorTextFile(
+			{
+				filename: "legacy.txt",
+				filePath: join(cwd, "legacy.txt"),
+				size: 1,
+				deviceId: workspace.deviceId,
+				contextKey: workspace.contextKey,
+				attachmentWorkspace: workspace,
+				sourceNarratorId: "n1",
+			},
+			target,
+			{ narratorId: "n1", sourceNarratorId: "n1", userId: EDITOR_ID },
+		);
+		expect(retained.copy).toBe(false);
+		expect(retained.ref.attachmentUnavailableReason).toContain(
+			"Original attachment source is unknown",
+		);
+		expect(existsSync(join(cwd, ".narrafork"))).toBe(false);
 	});
 
 	test("copies a shared modern text attachment into the editing narrator cwd", async () => {

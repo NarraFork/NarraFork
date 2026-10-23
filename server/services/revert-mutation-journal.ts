@@ -52,6 +52,7 @@ export interface RevertJournalContext {
 	owner: RevertPlanOwner;
 	planId: string;
 	planHash: string;
+	manifestProof?: RevertPlanManifestProof;
 }
 export interface RevertJournalOptions {
 	namespaceKey: string;
@@ -679,7 +680,7 @@ export class RevertMutationJournal {
 		for (let i = 0; i < original.fileCount; i++)
 			if (!sequences.has(i)) throw fail("INCOMPLETE_SET", "A fixed manifest position is missing");
 		assertRevision(original, requireOperation(this.db, context));
-		assertPlanCommitment(this.db, original, sequences, plannedFileBytes);
+		assertPlanCommitment(this.db, original, sequences, plannedFileBytes, context.manifestProof);
 		return result;
 	}
 }
@@ -688,7 +689,12 @@ function normalizeContext(ctx: RevertJournalContext): RevertJournalContext {
 	normalizeOwner(ctx.owner);
 	text(ctx.planId);
 	sha256(ctx.planHash);
-	return { owner: { ...ctx.owner }, planId: ctx.planId, planHash: ctx.planHash };
+	return {
+		owner: { ...ctx.owner },
+		planId: ctx.planId,
+		planHash: ctx.planHash,
+		...(ctx.manifestProof ? { manifestProof: { ...ctx.manifestProof } } : {}),
+	};
 }
 function normalizeOwner(owner: RevertPlanOwner) {
 	text(owner.subjectKey);
@@ -807,6 +813,7 @@ function assertPlanCommitment(
 	operation: RevertJournalOperation,
 	entries: Map<number, string>,
 	fileEvidenceBytes: number,
+	manifestProof?: RevertPlanManifestProof,
 ) {
 	// Verify, never construct/replace, the prepared planner's original commitment.
 	// Hash one bounded fingerprint per sequence; do not retain 1000 full identities.
@@ -833,11 +840,11 @@ function assertPlanCommitment(
 		headerDigest: digest(header),
 		orderedFilesDigest: ordered.digest("hex"),
 		fileEvidenceBytes,
-		computation: "complete",
-		selectorCoverage: "complete",
-		historyCoverage: "complete",
-		omittedFiles: 0,
-		unknownFiles: 0,
+		computation: manifestProof?.computation ?? "complete",
+		selectorCoverage: manifestProof?.selectorCoverage ?? "complete",
+		historyCoverage: manifestProof?.historyCoverage ?? "complete",
+		omittedFiles: manifestProof?.omittedFiles ?? 0,
+		unknownFiles: manifestProof?.unknownFiles ?? 0,
 	};
 	if (
 		digest([
@@ -885,7 +892,7 @@ function assertLease(
 	const scope = tx.select().from(scopes).where(eq(scopes.id, file.scopeId)).get();
 	if (
 		!scope ||
-		scope.status !== "active" ||
+		(scope.status !== "active" && scope.status !== "needs_verification") ||
 		!scope.activeLeaseId ||
 		!scope.activeLeaseEpoch ||
 		scope.id !== lease.scope.id ||

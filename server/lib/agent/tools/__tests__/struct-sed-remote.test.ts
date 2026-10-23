@@ -35,6 +35,14 @@ function context(windows = false) {
 	const ctx = {
 		narratorId: "remote-test",
 		cwd: "/host",
+		workspaceContext: {
+			deviceId: backend.deviceId,
+			cwd: paths.dirname(path),
+			pathFlavor: paths.flavor,
+			revision: 0,
+			contextKey: `remote-test:${backend.deviceId}:${path}`,
+			capabilities: { switchDirectory: true },
+		},
 		signal: new AbortController().signal,
 		resolveBackend: () => backend,
 	} as unknown as ToolContext;

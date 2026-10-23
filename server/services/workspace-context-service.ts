@@ -8,14 +8,19 @@ import type {
 } from "@shared/workspace-context";
 import { and, eq, isNull } from "drizzle-orm";
 import { db } from "../db";
-import { chapters, narrators, projects, workspaceSwitchRequests } from "../db/schema";
+import {
+	chapters,
+	narratorDeviceWorkspaceRequests,
+	narrators,
+	projects,
+	workspaceSwitchRequests,
+} from "../db/schema";
 import type { ExecutionBackend } from "../lib/agent/execution/backend";
 import { localBackend, resolveBackend } from "../lib/agent/execution/registry";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
 import { isSecretPlatformPath, isSecretUserPath } from "../lib/fs-secret-paths";
 import { hotSafe } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
-import { logger } from "../lib/logger";
 import { isKnowledgeStewardNarrator } from "../lib/narrator-utils";
 import { getHome } from "../lib/platform";
 import { isInsidePath } from "../lib/platform-path";
@@ -25,6 +30,10 @@ import { getSessionDevices } from "./device-connection-service";
 import { executionPolicyEngine } from "./execution-policy/engine";
 import { gitWorkspaceIdentity, probeLocalGitWorkspace } from "./git-workspace";
 import { resolveNarratorSessionCwd } from "./narrator-cwd";
+import {
+	readDeviceWorkspaceBinding,
+	saveLegacyDeviceWorkspaceBinding,
+} from "./narrator-device-workspace-store";
 import {
 	type ActiveNarrator,
 	activeNarrators,
@@ -213,7 +222,11 @@ export interface WorkspacePreparationOptions {
 	validateDevice?: () => Promise<void>;
 }
 
-async function runtimeDeviceClass(narratorId: string, deviceId: string, userId?: string | null) {
+export async function runtimeDeviceClass(
+	narratorId: string,
+	deviceId: string,
+	userId?: string | null,
+) {
 	const runtime = await resolveOAuthNarratorRuntimePolicy(narratorId, userId);
 	if (!runtime) return { runtime, deviceClass: deviceId === "local" ? ("host" as const) : null };
 	const { integrationResourceBindingService } = await import(
@@ -226,6 +239,8 @@ async function runtimeDeviceClass(narratorId: string, deviceId: string, userId?:
 			? ("host" as const)
 			: binding?.sourceType === "oauth_client" &&
 					binding.sourceId === runtime.clientId &&
+					binding.authorityType === "oauth_grant" &&
+					binding.state === "active" &&
 					binding.authorityId === runtime.grantId
 				? ("selfRegistered" as const)
 				: ("global" as const);
@@ -237,7 +252,7 @@ async function runtimeDeviceClass(narratorId: string, deviceId: string, userId?:
 		);
 	return { runtime, deviceClass };
 }
-async function authorizeWorkspaceDevice(
+export async function authorizeWorkspaceDevice(
 	deviceId: string,
 	projectId: string | undefined,
 	options: WorkspacePreparationOptions,
@@ -263,6 +278,52 @@ async function authorizeWorkspaceDevice(
 		throw new AppError("Remote device is not authorized", 403, "WORKSPACE_ACCESS_DENIED");
 	if (!device.online)
 		throw workspaceConflict("Remote device is offline", "WORKSPACE_DEVICE_OFFLINE");
+}
+
+/** Revalidate stored root evidence, live policy and the same connection; never mint new evidence. */
+export async function assertWorkspaceContextFresh(
+	id: string,
+	context: WorkspaceContext,
+	options: WorkspacePreparationOptions = {},
+): Promise<void> {
+	await authorizeWorkspaceDevice(context.deviceId, context.contextProjectId, {
+		...options,
+		narratorId: id,
+	});
+	const backend = resolveBackend({ requested: context.deviceId });
+	const generation = backend.runtimeGeneration;
+	await assertTargetAllowed(id, context.cwd, backend, options.userId);
+	if (
+		context.pathFlavor === "windows" &&
+		backend.kind === "remote" &&
+		!context.nativeRootDescriptor
+	)
+		throw workspaceConflict(
+			"Windows workspace needs original native root evidence",
+			"WORKSPACE_DIRECTORY_NOT_CONFIGURED",
+		);
+	if (context.nativeRootDescriptor) {
+		const info = await backend.statFile(context.cwd, {
+			timeoutMs: 10_000,
+			expectedNativeDescriptor: context.nativeRootDescriptor,
+		});
+		if (!info?.isDirectory) throw workspaceConflict("Workspace root is no longer available");
+	}
+	const fresh = await prepareWorkspaceContext(
+		{ deviceId: context.deviceId, cwd: context.cwd },
+		context.revision,
+		context.contextProjectId,
+		{ ...options, narratorId: id },
+	);
+	if (
+		fresh.contextKey !== context.contextKey ||
+		fresh.cwd !== context.cwd ||
+		(context.nativeRootDescriptor &&
+			JSON.stringify(fresh.nativeRootDescriptor) !==
+				JSON.stringify(context.nativeRootDescriptor)) ||
+		resolveBackend({ requested: context.deviceId }).runtimeGeneration !== generation
+	)
+		throw workspaceConflict("Workspace root or device connection changed");
 }
 
 /** Prepare one target using its own filesystem, never the host's path grammar. */
@@ -343,7 +404,7 @@ export async function prepareWorkspaceContext(
 	};
 }
 
-async function assertTargetAllowed(
+export async function assertTargetAllowed(
 	narratorId: string,
 	cwd: string,
 	backend: ExecutionBackend = localBackend,
@@ -388,7 +449,7 @@ async function assertTargetAllowed(
 		);
 }
 
-function assertSwitchAdmission(id: string, options: WorkspaceSwitchOptions) {
+export function assertSwitchAdmission(id: string, options: WorkspaceSwitchOptions) {
 	const active = activeNarrators.get(id);
 	if (active?._workspaceInstallFailed)
 		throw workspaceConflict("Workspace runtime requires recovery");
@@ -438,12 +499,67 @@ export async function installWorkspaceContext(
 	active._resetUpstreamSessionOnNextRequest = true;
 }
 
-function pauseWorkspace(id: string) {
+export function pauseWorkspace(id: string) {
 	const active = activeNarrators.get(id);
 	if (!active) return;
 	active._workspaceInstallFailed = true;
 	active._workspacePassInvalidated = true;
 	active.abortController.abort("Workspace installation failed");
+}
+
+/** Scalar indexed readiness, not a path/actor authorization or an existing-resource fence. */
+export function workspaceSelectionInstallationStatus(id: string) {
+	const row = db
+		.select({ revision: narrators.workspaceRevision })
+		.from(narrators)
+		.where(eq(narrators.id, id))
+		.get();
+	if (!row) throw new NotFoundError("Narrator", id);
+	const previousRevision = row.revision - 1;
+	const legacyPending =
+		previousRevision < 0
+			? undefined
+			: db
+					.select({ id: workspaceSwitchRequests.id })
+					.from(workspaceSwitchRequests)
+					.where(
+						and(
+							eq(workspaceSwitchRequests.narratorId, id),
+							eq(workspaceSwitchRequests.installState, "pending"),
+							eq(workspaceSwitchRequests.expectedRevision, previousRevision),
+						),
+					)
+					.limit(1)
+					.get();
+	const devicePending =
+		previousRevision < 0
+			? undefined
+			: db
+					.select({ id: narratorDeviceWorkspaceRequests.id })
+					.from(narratorDeviceWorkspaceRequests)
+					.where(
+						and(
+							eq(narratorDeviceWorkspaceRequests.narratorId, id),
+							eq(narratorDeviceWorkspaceRequests.installState, "pending"),
+							eq(narratorDeviceWorkspaceRequests.expectedSelectionRevision, previousRevision),
+						),
+					)
+					.limit(1)
+					.get();
+	return {
+		revision: row.revision,
+		installed:
+			!legacyPending && !devicePending && !activeNarrators.get(id)?._workspaceInstallFailed,
+	};
+}
+
+/** New IO must not consume a durable selection whose runtime installation is paused. */
+export function assertWorkspaceSelectionInstalled(id: string): void {
+	if (!workspaceSelectionInstallationStatus(id).installed)
+		throw workspaceConflict(
+			"Workspace selection is committed but waiting for installation",
+			"WORKSPACE_CONTEXT_INSTALL_PENDING",
+		);
 }
 
 function switchRequestDigest(request: SwitchWorkingDirectoryRequest, actor: string | null) {
@@ -465,11 +581,15 @@ export const workspaceContextService = {
 		expectedRevision: number,
 		expectedWorktreeKey: string | undefined,
 		action: (context: WorkspaceContext) => Promise<T>,
+		options: { userId?: string | null } = {},
 	): Promise<T> {
+		// The request actor is a source, not a mutable option read after admission waits.
+		const actor = { userId: options.userId };
 		return withNarratorMutationAdmission(id, async () => {
 			if (isNarratorRevertAdmissionBlocked(id))
 				throw workspaceConflict("Narrator history is reserved");
-			const context = await this.get(id);
+			assertWorkspaceSelectionInstalled(id);
+			const context = await this.get(id, actor);
 			if (
 				context.revision !== expectedRevision ||
 				(expectedWorktreeKey !== undefined && context.git?.workspaceKey !== expectedWorktreeKey)
@@ -513,14 +633,7 @@ export const workspaceContextService = {
 		};
 		check();
 		const current = receipt.result.current;
-		const fresh = await prepareWorkspaceContext(
-			{ deviceId: current.deviceId, cwd: current.cwd },
-			current.revision,
-			current.contextProjectId,
-			{ ...options, narratorId: id },
-		);
-		if (fresh.contextKey !== current.contextKey)
-			throw workspaceConflict("Recovery directory identity changed");
+		await assertWorkspaceContextFresh(id, current, { ...options, narratorId: id });
 		const generation = resolveBackend({ requested: current.deviceId }).runtimeGeneration;
 		return withNarratorMutationAdmission(
 			id,
@@ -591,35 +704,14 @@ export const workspaceContextService = {
 		} else {
 			const deviceId = row.defaultDeviceId ?? "local";
 			if (deviceId !== "local") {
-				try {
-					const backend = resolveBackend({ requested: deviceId });
-					if (!backend.defaultCwd)
-						throw new ValidationError("Remote directory needs configuration");
-					context = await prepareWorkspaceContext(
-						{ deviceId, cwd: backend.defaultCwd },
-						row.workspaceRevision,
-						projectId,
-						{
-							narratorId: id,
-							userId: options.userId ?? null,
-						},
-					);
-					context.compatibility = { version: 1, ...(row.cwd ? { localCwd: row.cwd } : {}) };
-				} catch (error) {
-					logger.warn("Remote workspace initialization unavailable", {
-						narratorId: id,
-						deviceId,
-						errorType: error instanceof Error ? error.name : "unknown",
-						errorCode: error instanceof AppError ? error.code : undefined,
-					});
-					return {
-						...unavailableWorkspaceContext(deviceId, "", "posix", row.workspaceRevision, projectId),
-						capabilities: {
-							switchDirectory: supported,
-							reason: "Remote workspace needs initialization; no local fallback",
-						},
-					};
-				}
+				return {
+					...unavailableWorkspaceContext(deviceId, "", "posix", row.workspaceRevision, projectId),
+					availability: "needs_initialization",
+					capabilities: {
+						switchDirectory: supported,
+						reason: "Remote workspace needs initialization; no local fallback",
+					},
+				};
 			} else {
 				const project = projectId
 					? await db.query.projects.findFirst({
@@ -655,6 +747,23 @@ export const workspaceContextService = {
 				if (rows.length !== 1) return this.get(id, options);
 			}
 		}
+		if (options.persistLegacy !== false && context.cwd && !context.binding) {
+			context = db.transaction((tx) => {
+				const latest = tx
+					.select({ revision: narrators.workspaceRevision, context: narrators.workspaceContext })
+					.from(narrators)
+					.where(eq(narrators.id, id))
+					.get();
+				if (
+					latest?.revision !== context.revision ||
+					latest.context?.contextKey !== context.contextKey
+				)
+					throw workspaceConflict("Workspace changed during legacy binding initialization");
+				const augmented = saveLegacyDeviceWorkspaceBinding(tx, id, context);
+				tx.update(narrators).set({ workspaceContext: augmented }).where(eq(narrators.id, id)).run();
+				return augmented;
+			});
+		}
 		let backend: ExecutionBackend | null = null;
 		try {
 			backend = resolveBackend({ requested: context.deviceId });
@@ -683,27 +792,28 @@ export const workspaceContextService = {
 		assertSwitchAdmission(id, options);
 		const previous = await this.get(id, { userId: options.userId, persistLegacy: false });
 		const targetDeviceId = deviceId ?? "local";
-		if (targetDeviceId === previous.deviceId)
-			return { changed: false, previous, current: previous };
+		if (targetDeviceId === previous.deviceId) {
+			if (!previous.cwd || previous.availability === "needs_initialization")
+				throw workspaceConflict(
+					"Device workspace needs explicit initialization",
+					"WORKSPACE_DIRECTORY_NOT_CONFIGURED",
+				);
+			await assertWorkspaceContextFresh(id, previous, { ...options, narratorId: id });
+			const current = await this.get(id, { userId: options.userId });
+			return { changed: false, previous: current, current };
+		}
 		await authorizeWorkspaceDevice(targetDeviceId, previous.contextProjectId, {
 			...options,
 			narratorId: id,
 		});
-		let cwd: string;
-		if (targetDeviceId !== "local") {
-			const backend = resolveBackend({ requested: targetDeviceId });
-			if (!backend.defaultCwd) throw new ValidationError("Remote device has no default directory");
-			cwd = backend.defaultCwd;
-		} else {
-			const row = await loadWorkspaceRow(id);
-			const chapter = row.chapterId
-				? await db.query.chapters.findFirst({
-						where: eq(chapters.id, row.chapterId),
-						columns: { worktreePath: true },
-					})
-				: undefined;
-			cwd = previous.compatibility?.localCwd ?? chapter?.worktreePath ?? getHome();
-		}
+		const binding = readDeviceWorkspaceBinding(db, id, targetDeviceId);
+		if (!binding)
+			throw workspaceConflict(
+				"Device workspace needs explicit initialization",
+				"WORKSPACE_DIRECTORY_NOT_CONFIGURED",
+			);
+		const cwd = binding.context.cwd;
+		await assertWorkspaceContextFresh(id, binding.context, { ...options, narratorId: id });
 		return this.switch(
 			id,
 			{
@@ -722,6 +832,21 @@ export const workspaceContextService = {
 		const actor = options.userId ?? null;
 		const digest = switchRequestDigest(request, actor);
 		const replay = async (): Promise<SwitchWorkingDirectoryResult | null> => {
+			const newReceipt = await db
+				.select({ id: narratorDeviceWorkspaceRequests.id })
+				.from(narratorDeviceWorkspaceRequests)
+				.where(
+					and(
+						eq(narratorDeviceWorkspaceRequests.narratorId, id),
+						eq(narratorDeviceWorkspaceRequests.requestId, request.requestId),
+					),
+				)
+				.limit(1);
+			if (newReceipt.length)
+				throw workspaceConflict(
+					"Request id belongs to a device workspace mutation",
+					"WORKSPACE_REQUEST_CONFLICT",
+				);
 			const receipt = await this.getRequest(id, request.requestId);
 			if (!receipt) return null;
 			if (receipt.requestDigest !== digest || receipt.actorUserId !== actor)
@@ -736,6 +861,7 @@ export const workspaceContextService = {
 		const prior = await replay();
 		if (prior) return prior;
 		let preparedGeneration: number | undefined;
+		let committedContext: WorkspaceContext | undefined;
 		try {
 			const result = await transitionWorkspaceContext(request, {
 				read: () => this.get(id, { userId: actor, persistLegacy: false }),
@@ -754,13 +880,23 @@ export const workspaceContextService = {
 					const row = await loadWorkspaceRow(id);
 					if (options.origin === "http" && (row.status === "working" || row.status === "waiting"))
 						throw workspaceConflict("Narrator is busy", "WORKSPACE_CONTEXT_BUSY");
+					await authorizeWorkspaceDevice(input.target.deviceId, previous.contextProjectId, {
+						...options,
+						narratorId: id,
+					});
+					preparedGeneration = resolveBackend({
+						requested: input.target.deviceId,
+					}).runtimeGeneration;
 					const target = await prepareWorkspaceContext(
 						input.target,
 						previous.revision,
 						previous.contextProjectId,
 						{ ...options, narratorId: id },
 					);
-					preparedGeneration = resolveBackend({ requested: target.deviceId }).runtimeGeneration;
+					if (
+						preparedGeneration !== resolveBackend({ requested: target.deviceId }).runtimeGeneration
+					)
+						throw workspaceConflict("Device connection changed during preparation");
 					if (row.chapterId && !options.deviceOnly) {
 						const chapter = await db.query.chapters.findFirst({
 							where: eq(chapters.id, row.chapterId),
@@ -794,16 +930,10 @@ export const workspaceContextService = {
 					const backend = resolveBackend({ requested: current.deviceId });
 					if (backend.runtimeGeneration !== preparedGeneration)
 						throw workspaceConflict("Execution device changed while preparing the workspace");
-					const fresh = await prepareWorkspaceContext(
-						{ deviceId: current.deviceId, cwd: current.cwd },
-						current.revision,
-						current.contextProjectId,
-						{ ...options, narratorId: id },
-					);
+					await assertWorkspaceContextFresh(id, current, { ...options, narratorId: id });
 					if (
-						fresh.contextKey !== current.contextKey ||
 						backend.runtimeGeneration !==
-							resolveBackend({ requested: current.deviceId }).runtimeGeneration
+						resolveBackend({ requested: current.deviceId }).runtimeGeneration
 					)
 						throw workspaceConflict("Target directory identity changed");
 					return withWorkspaceAdmission(
@@ -814,13 +944,17 @@ export const workspaceContextService = {
 						},
 						async () =>
 							db.transaction((tx) => {
+								// Preserve the departed endpoint, then save only the target pair.
+								if (previous.cwd && !readDeviceWorkspaceBinding(tx, id, previous.deviceId))
+									saveLegacyDeviceWorkspaceBinding(tx, id, previous);
+								const augmented = saveLegacyDeviceWorkspaceBinding(tx, id, current);
 								const rows = tx
 									.update(narrators)
 									.set({
 										cwd: current.cwd,
 										defaultDeviceId: current.deviceId === "local" ? null : current.deviceId,
 										workspaceRevision: current.revision,
-										workspaceContext: current,
+										workspaceContext: augmented,
 										apiConversationId: null,
 										updatedAt: new Date().toISOString(),
 									})
@@ -829,7 +963,8 @@ export const workspaceContextService = {
 									)
 									.returning({ id: narrators.id })
 									.all();
-								if (rows.length !== 1) return false;
+								if (rows.length !== 1) throw workspaceConflict("Workspace revision changed");
+								committedContext = augmented;
 								tx.insert(workspaceSwitchRequests)
 									.values({
 										id: generateId(),
@@ -838,7 +973,7 @@ export const workspaceContextService = {
 										actorUserId: actor,
 										requestDigest: digest,
 										expectedRevision: request.expectedRevision,
-										result: { changed: true, previous, current },
+										result: { changed: true, previous, current: augmented },
 										installState: "pending",
 										createdAt: new Date().toISOString(),
 										updatedAt: new Date().toISOString(),
@@ -849,7 +984,7 @@ export const workspaceContextService = {
 					);
 				},
 				install: async (current) => {
-					await installWorkspaceContext(id, current);
+					await installWorkspaceContext(id, committedContext ?? current);
 					await db
 						.update(workspaceSwitchRequests)
 						.set({ installState: "installed", updatedAt: new Date().toISOString() })
@@ -866,29 +1001,48 @@ export const workspaceContextService = {
 						type: "workspace_context_changed",
 						narratorId: id,
 						previous,
-						current,
+						current: committedContext ?? current,
 					}),
 			});
 			if (!result.changed) {
-				await db
-					.insert(workspaceSwitchRequests)
-					.values({
-						id: generateId(),
-						narratorId: id,
-						requestId: request.requestId,
-						actorUserId: actor,
-						requestDigest: digest,
-						expectedRevision: request.expectedRevision,
-						result,
-						installState: "installed",
-						createdAt: new Date().toISOString(),
-						updatedAt: new Date().toISOString(),
-					})
-					.onConflictDoNothing()
-					.run();
-				return (await replay()) ?? result;
+				const saved = db.transaction((tx) => {
+					const latest = tx
+						.select({ revision: narrators.workspaceRevision })
+						.from(narrators)
+						.where(eq(narrators.id, id))
+						.get();
+					if (latest?.revision !== result.current.revision)
+						throw workspaceConflict("Workspace revision changed");
+					const augmented = saveLegacyDeviceWorkspaceBinding(tx, id, result.current);
+					tx.update(narrators)
+						.set({
+							workspaceContext: augmented,
+							cwd: augmented.cwd,
+							defaultDeviceId: augmented.deviceId === "local" ? null : augmented.deviceId,
+						})
+						.where(eq(narrators.id, id))
+						.run();
+					const savedResult = { ...result, previous: augmented, current: augmented };
+					tx.insert(workspaceSwitchRequests)
+						.values({
+							id: generateId(),
+							narratorId: id,
+							requestId: request.requestId,
+							actorUserId: actor,
+							requestDigest: digest,
+							expectedRevision: request.expectedRevision,
+							result: savedResult,
+							installState: "installed",
+							createdAt: new Date().toISOString(),
+							updatedAt: new Date().toISOString(),
+						})
+						.onConflictDoNothing()
+						.run();
+					return savedResult;
+				});
+				return (await replay()) ?? saved;
 			}
-			return result;
+			return committedContext ? { ...result, current: committedContext } : result;
 		} catch (error) {
 			if (error instanceof AppError && error.code === "WORKSPACE_CONTEXT_INSTALL_FAILED")
 				throw error;

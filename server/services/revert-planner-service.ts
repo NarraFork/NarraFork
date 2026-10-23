@@ -21,6 +21,7 @@ import {
 	fileChangeStatesEqual,
 	type KnownFileChangeState,
 } from "@shared/file-change-protocol";
+import type { PartialRevertResult, RevertUnknownCoverage } from "@shared/partial-revert";
 import { AppError } from "../lib/errors";
 import type { FileChangeBlobCatalog } from "./file-change-blob-catalog";
 import { type FileChangeBlobStore, FileChangeBlobStoreError } from "./file-change-blob-store";
@@ -74,6 +75,7 @@ export interface RevertPlannerFileTarget {
 	identity: FileChangeIdentity;
 	executionBinding: FileChangeExecutionBinding;
 	scopeRevision: number;
+	unknownCoverage?: RevertUnknownCoverage[];
 	/** Must check live scope incarnation, canonical target, runtime/fence and write activity.
 	 * Reconnecting to another backend or resolving a remote path locally MUST fail. */
 	assertCurrent(options: { signal: AbortSignal }): Promise<void>;
@@ -120,6 +122,7 @@ export interface RevertPlannerOptions {
 }
 export interface RevertPlannerResult {
 	plan: RevertPlanSummary;
+	coverage?: PartialRevertResult;
 	/** Prepared is a durable preview, NOT execution admission or a history/files mutation. */
 	executable: false;
 	historySummary: { deletedMessageCount: number; deletedBlockCount: number };
@@ -148,6 +151,7 @@ type FixedRequest = Omit<RevertPlannerRequest, "signal">;
 type PreparedFile = AppendRevertPlanFile & {
 	executionBinding: FileChangeExecutionBinding;
 	scopeRevision: number;
+	unknownCoverage?: RevertUnknownCoverage[];
 	steps: FileChangeReversalStep[];
 };
 type FileContext = { access: RevertPlannerFileAccess; target: RevertPlannerFileTarget };
@@ -301,10 +305,24 @@ export class RevertPlannerService {
 				work,
 			);
 			work.addRef(selector.ref);
+			const coverage: PartialRevertResult = {
+				restoredFiles: [],
+				conflicts: [],
+				unknownCoverage: [],
+			};
+			for (const tool of selected.tools) {
+				if (tool.toolName === "Bash" || tool.toolName === "Terminal")
+					coverage.unknownCoverage.push({ toolCallId: tool.id, reason: "bash_without_snapshot" });
+			}
+			const reportedScopes = new Set<string>();
 			const files: PreparedFile[] = [];
 			for (const [, effects] of [...groups].sort(([a], [b]) => a.localeCompare(b))) {
 				const identity = effects[0].identity;
 				const context = await this.target(fixed, owner, identity, work);
+				if (!reportedScopes.has(identity.scopeId)) {
+					reportedScopes.add(identity.scopeId);
+					coverage.unknownCoverage.push(...(context.target.unknownCoverage ?? []));
+				}
 				const observed = await this.current(context, work, FILE_CHANGE_LIMITS.blobBytes);
 				work.addRef(stateRef(observed.state));
 				if (observed.raw) {
@@ -318,6 +336,20 @@ export class RevertPlannerService {
 						}),
 					);
 					this.ready(ref);
+				}
+				// With unmeasured writers, never infer that a merge is safe: compare the
+				// last known post-state before touching this file.
+				const lastKnown = [...effects].sort((a, b) => b.scopeRevision - a.scopeRevision)[0];
+				if (
+					coverage.unknownCoverage.length &&
+					!fileChangeStatesEqual(observed.state, lastKnown.observedAfter)
+				) {
+					coverage.conflicts.push({
+						path: identity.displayPath,
+						reason: "current_file_changed",
+						effectIds: effects.map((effect) => effect.id),
+					});
+					continue;
 				}
 				// Verify even intendedAfter / original receipt objects that a reverse shortcut
 				// would otherwise not need to read. A catalog row alone is not raw evidence.
@@ -384,6 +416,15 @@ export class RevertPlannerService {
 					}),
 				);
 				work.check();
+				if (!result.ok && ["state_conflict", "merge_conflict"].includes(result.reason)) {
+					work.release(reserved);
+					coverage.conflicts.push({
+						path: identity.displayPath,
+						reason: result.reason,
+						effectIds: effects.map((effect) => effect.id),
+					});
+					continue;
+				}
 				if (!result.ok) {
 					const effect = effects.find((item) => item.id === result.effectId);
 					const operation = selected.operations.find((item) => item.id === effect?.operationId);
@@ -449,11 +490,12 @@ export class RevertPlannerService {
 				headerDigest: revertPlanHeaderDigest(header),
 				orderedFilesDigest: fingerprint.orderedFilesDigest,
 				fileEvidenceBytes: fingerprint.fileEvidenceBytes,
-				computation: "complete",
+				computation:
+					coverage.conflicts.length || coverage.unknownCoverage.length ? "partial" : "complete",
 				selectorCoverage: "complete",
 				historyCoverage: "complete",
-				omittedFiles: 0,
-				unknownFiles: 0,
+				omittedFiles: coverage.conflicts.length,
+				unknownFiles: coverage.unknownCoverage.length,
 			};
 			const manifest = await encodeJson(
 				{
@@ -463,6 +505,7 @@ export class RevertPlannerService {
 					proof,
 					selectionMetadataDigest: selected.metadataDigest,
 					messageVersions: selected.messageVersions,
+					coverage,
 					files,
 				},
 				work,
@@ -522,6 +565,7 @@ export class RevertPlannerService {
 			);
 			return {
 				plan,
+				coverage,
 				executable: false,
 				...(fixed.recoveryMode ? { recoveryMode: fixed.recoveryMode } : {}),
 				historySummary: {
@@ -619,6 +663,7 @@ export class RevertPlannerService {
 			identity: { ...resolved.identity },
 			executionBinding: { ...resolved.executionBinding },
 			scopeRevision: resolved.scopeRevision,
+			unknownCoverage: resolved.unknownCoverage,
 			assertCurrent: resolved.assertCurrent.bind(resolved),
 			readCurrent: resolved.readCurrent.bind(resolved),
 		};

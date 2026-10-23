@@ -61,11 +61,7 @@ import { chapters, worktreeTreeSnapshots } from "../db/schema";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import { AsyncMutex } from "../lib/async-mutex";
 import { canWriteOptionalDiskData, DiskSpaceError, guardDiskWrite } from "../lib/disk-safety";
-import {
-	type GitTreeMergeResult,
-	mergeGitTrees,
-	requireCompleteMergeTree,
-} from "../lib/git-tree-merge";
+import { type GitTreeMergeResult, mergeGitTrees } from "../lib/git-tree-merge";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { getNarraforkPath } from "../lib/narrafork-home";
@@ -1650,49 +1646,44 @@ async function planSegmentReversalUnlocked(
 	segments: TreeRevertSegment[],
 ): Promise<SegmentReversalPlan> {
 	let accumulated = currentTree;
+	const skipped = new Set<string>();
 	for (const segment of [...segments].reverse()) {
 		if (segment.ownedPaths?.length === 0) continue;
-		const merged = await mergeTreeUnlocked(
+		const changed = await runGitPaths(
+			["diff-tree", "-r", "--name-only", "--no-commit-id", "-z", segment.before, segment.after],
 			dir,
 			worktreePath,
-			segment.after,
-			accumulated,
-			segment.before,
+			{ maxOutputBytes: GIT_MAX_LISTING_BYTES },
 		);
-		// Must precede the owned-path filter: structural conflicts can be absent
-		// from Git's index entirely, even when another file DID get listed.
-		const mergedTree = requireCompleteMergeTree(merged);
-		const owned = segment.ownedPaths;
-		// Membership goes through a Set rather than `Array.includes`: both sides scale
-		// with the change set, so a conflicted merge in a large window was O(n·m) — a
-		// few thousand owned paths against a few thousand conflicts is millions of
-		// string comparisons on the rollback path. The truthiness test is kept exactly
-		// as it was: only null/undefined mean "unknown range, reverse the whole tree",
-		// while an empty array remains a positive "owns nothing" and must still filter
-		// every conflict away.
-		const ownedLookup = owned ? new Set(owned) : null;
-		const conflicts = ownedLookup
-			? merged.conflicts.filter((path) => ownedLookup.has(path))
-			: merged.conflicts;
-		if (conflicts.length > 0) {
-			return {
-				currentTree,
-				mergedTree: accumulated,
-				conflicts,
-				changedPaths: [],
-			};
+		if (changed.exitCode !== 0)
+			throw new TreeSnapshotError(`snapshot diff-tree failed: ${changed.stderr}`);
+		const owned = segment.ownedPaths ? new Set(segment.ownedPaths) : null;
+		const candidates = changed.paths.filter((path) => !owned || owned.has(path));
+		const expected = await readTreeEntries(dir, worktreePath, segment.after, candidates);
+		const current = await readTreeEntries(dir, worktreePath, accumulated, candidates);
+		const safe: string[] = [];
+		for (const path of candidates) {
+			const after = expected.get(path);
+			const live = current.get(path);
+			const descendantsMatch =
+				[...current.keys()].filter((entry) => entry.startsWith(`${path}/`)).length === 0;
+			if (
+				skipped.has(path) ||
+				after?.objectId !== live?.objectId ||
+				after?.mode !== live?.mode ||
+				!descendantsMatch
+			) {
+				skipped.add(path);
+			} else {
+				safe.push(path);
+			}
 		}
-		if (!owned) {
-			accumulated = mergedTree;
-		} else if (owned.length > 0) {
-			// A conflicted merge tree is only safe to read at the paths that merged
-			// cleanly, and every owned path did (checked above).
-			accumulated = await adoptPathsUnlocked(dir, worktreePath, accumulated, mergedTree, owned);
-		}
+		if (safe.length > 0)
+			accumulated = await adoptPathsUnlocked(dir, worktreePath, accumulated, segment.before, safe);
 	}
 
 	if (accumulated === currentTree) {
-		return { currentTree, mergedTree: accumulated, conflicts: [], changedPaths: [] };
+		return { currentTree, mergedTree: accumulated, conflicts: [...skipped], changedPaths: [] };
 	}
 	const changed = await runGitPaths(
 		["diff-tree", "-r", "--name-only", "--no-commit-id", "-z", accumulated, currentTree],
@@ -1706,7 +1697,7 @@ async function planSegmentReversalUnlocked(
 	return {
 		currentTree,
 		mergedTree: accumulated,
-		conflicts: [],
+		conflicts: [...skipped],
 		changedPaths: changed.paths,
 	};
 }
@@ -2939,21 +2930,12 @@ export const worktreeTreeSnapshot = {
 				current,
 				planTreeRevertSegments(pairs),
 			);
-			// A conflicted tree carries conflict markers; writing it out would corrupt
-			// the files it claims to restore.
-			if (plan.conflicts.length > 0) {
-				return {
-					previousTreeHash: current,
-					mergedTree: plan.mergedTree,
-					conflicts: plan.conflicts,
-					changedFiles: [],
-				};
-			}
+			// The plan adopts only exact-match paths; skipped files retain current bytes.
 			if (plan.mergedTree === current) {
 				return {
 					previousTreeHash: current,
 					mergedTree: current,
-					conflicts: [],
+					conflicts: plan.conflicts,
 					changedFiles: [],
 				};
 			}
@@ -2961,7 +2943,7 @@ export const worktreeTreeSnapshot = {
 			return {
 				previousTreeHash: current,
 				mergedTree: plan.mergedTree,
-				conflicts: [],
+				conflicts: plan.conflicts,
 				changedFiles,
 			};
 		});

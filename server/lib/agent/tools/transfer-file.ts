@@ -1,5 +1,6 @@
 import { basename } from "node:path";
 import { z } from "zod/v4";
+import { createRecursiveTransferAuthorization } from "../../../services/device-transfer-authorization";
 import {
 	downloadDirectory,
 	downloadFile,
@@ -35,7 +36,7 @@ const BACKGROUND_PARAM_SCHEMA = {
 		"Run the transfer in the background and return immediately with a task handle. " +
 		"A background transfer survives a NarraFork restart, can be paused and resumed, " +
 		"and resumes from where it stopped rather than restarting. Use Await with " +
-		'`type: "transfer"` to wait for it. Recommended for large files and directories.',
+		'`type: "transfer"` to wait for it. Recommended for large single files. Not supported with `recursive: true`.',
 } as const;
 
 export const transferFileTool: ToolDefinition = {
@@ -71,8 +72,11 @@ export const transferFileTool: ToolDefinition = {
 		"Transfer files or directories between the NarraFork server (local) and a remote executor " +
 		'device. High-performance chunked transfer with resume. Use `direction: "download"` to copy ' +
 		'from the remote device to the server, or `"upload"` to copy from the server to the device. ' +
-		"Set `recursive: true` to transfer a whole directory. Paths on the device are constrained to its " +
-		"allowed roots.",
+		"Paths on the device are constrained to its allowed roots.\n\n" +
+		"Directories: prefer packing first (e.g. `tar -czf` via Bash on the source side), transferring " +
+		"the single archive, then unpacking on the destination. `recursive: true` transfers file by file " +
+		"in the foreground with per-file authorization; use it sparingly, only for small directories. " +
+		"It cannot run in the background and is refused above 50000 files.",
 	rawJsonSchema: {
 		type: "object",
 		properties: {
@@ -86,7 +90,8 @@ export const transferFileTool: ToolDefinition = {
 			localPath: { type: "string", description: "Absolute path on the NarraFork server." },
 			recursive: {
 				type: "boolean",
-				description: "Transfer a directory recursively. Default false (single file).",
+				description:
+					"Transfer a directory file by file (foreground only). Use sparingly; prefer packing into one archive first. Default false (single file).",
 			},
 			run_in_background: BACKGROUND_PARAM_SCHEMA,
 		},
@@ -117,7 +122,8 @@ export const transferFileTool: ToolDefinition = {
 				localPath: { type: "string", description: "Absolute path on the NarraFork server." },
 				recursive: {
 					type: "boolean",
-					description: "Transfer a directory recursively. Default false (single file).",
+					description:
+						"Transfer a directory file by file (foreground only). Use sparingly; prefer packing into one archive first. Default false (single file).",
 				},
 				run_in_background: BACKGROUND_PARAM_SCHEMA,
 			},
@@ -186,6 +192,13 @@ export const transferFileTool: ToolDefinition = {
 		// tool that returns immediately would otherwise report success for a transfer
 		// doomed by a bad path or an offline device, and the real error would surface
 		// minutes later in a drawer card the model is not looking at.
+		if (runInBackground && recursive) {
+			return {
+				output:
+					"Recursive transfer cannot run in the background. Prefer packing the directory into one archive (e.g. tar via Bash) and transferring that file; for a small directory, use a foreground recursive transfer (run_in_background: false).",
+				isError: true,
+			};
+		}
 		if (runInBackground) {
 			return startBackgroundTransfer({
 				ctx,
@@ -209,9 +222,11 @@ export const transferFileTool: ToolDefinition = {
 		});
 		try {
 			if (recursive) {
+				const authorization = await createRecursiveTransferAuthorization(ctx, direction, known.id);
 				const result =
 					direction === "download"
 						? await downloadDirectory({
+								...authorization,
 								deviceId: known.id,
 								remoteDir: remotePath,
 								localDir: localAbs,
@@ -220,6 +235,7 @@ export const transferFileTool: ToolDefinition = {
 								onProgress: reporter.report,
 							})
 						: await uploadDirectory({
+								...authorization,
 								deviceId: known.id,
 								localDir: localAbs,
 								remoteDir: remotePath,

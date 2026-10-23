@@ -363,15 +363,24 @@ function parseUnixPidPpid(output: string, children: Map<number, number[]>): void
 	}
 }
 
-async function killProcessTree(pid: number): Promise<void> {
+async function killProcessTree(
+	pid: number,
+	beforeDispatch?: () => void,
+	onDispatch?: () => void,
+): Promise<void> {
+	beforeDispatch?.();
 	const descendants = await getDescendantPids(pid);
 	for (const childPid of descendants.reverse()) {
+		beforeDispatch?.();
+		onDispatch?.();
 		try {
 			process.kill(childPid, "SIGKILL");
 		} catch {
 			// already exited
 		}
 	}
+	beforeDispatch?.();
+	onDispatch?.();
 	try {
 		process.kill(pid, "SIGKILL");
 	} catch {
@@ -466,14 +475,25 @@ export const dtachService = {
 		return pids.length > 0;
 	},
 
-	async killSession(terminalId: string): Promise<void> {
+	async killSession(
+		terminalId: string,
+		beforeDispatch?: () => void,
+		/** Marks effects before signal dispatch; absence proves a discovery/authority failure had no effects. */
+		onDispatch?: () => void,
+	): Promise<void> {
 		const socketPath = this.getSocketPath(terminalId);
+		beforeDispatch?.();
 		const dtachPids = await findProcessesByArg(socketPath);
 		for (const pid of dtachPids) {
-			await killProcessTree(pid);
+			beforeDispatch?.();
+			await killProcessTree(pid, beforeDispatch, onDispatch);
 		}
+		beforeDispatch?.();
 		try {
-			if (existsSync(socketPath)) unlinkSync(socketPath);
+			if (existsSync(socketPath)) {
+				onDispatch?.();
+				unlinkSync(socketPath);
+			}
 		} catch {
 			// ignore
 		}

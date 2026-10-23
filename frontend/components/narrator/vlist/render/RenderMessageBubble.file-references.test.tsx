@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
 import type { FileReference, FileReferenceSnapshot, FileTarget } from "@shared/file-reference";
 import { fileReferenceLabel } from "@shared/file-reference-display";
@@ -21,6 +21,20 @@ import { renderElement, resolveRenderExtra } from "../render-registry";
 import { VListViewBody } from "../vlist-content-view-body";
 import { resolveRowViewTargets } from "../vlist-content-view-target";
 import { buildSelectionIndex } from "../vlist-selection";
+
+const capturedViews: Array<{
+	narratorId?: string;
+	capturedSnapshot?: { messageId: string; referenceId: string };
+	attachmentPreview?: { messageId: string; attachmentId: string };
+	referenceOrigin?: boolean;
+}> = [];
+// The modal/viewer handoff is observed here; the real viewer hooks are mounted in its own isolated suite.
+mock.module("../../file-viewer/FileViewerContent", () => ({
+	FileViewerContent: (props: (typeof capturedViews)[number]) => {
+		capturedViews.push(props);
+		return <div data-captured-readonly="true">captured readonly viewer</div>;
+	},
+}));
 
 const reference: FileReference = {
 	id: "ref-1",
@@ -47,6 +61,8 @@ const globals = [
 	"getComputedStyle",
 	"matchMedia",
 	"IS_REACT_ACT_ENVIRONMENT",
+	"requestAnimationFrame",
+	"cancelAnimationFrame",
 ] as const;
 let previous: Map<string, PropertyDescriptor | undefined>;
 let dispose: () => void;
@@ -54,13 +70,28 @@ let container: HTMLDivElement;
 let root: Root;
 
 beforeEach(() => {
+	capturedViews.length = 0;
 	previous = new Map(globals.map((key) => [key, Object.getOwnPropertyDescriptor(globalThis, key)]));
 	dispose = installCanvasStub();
 	const { window } = parseHTML("<!doctype html><html><body></body></html>");
+	Object.defineProperty(window, "navigator", {
+		configurable: true,
+		value: { platform: "Linux", userAgent: "Chrome", maxTouchPoints: 0 },
+	});
+	Object.assign(window, {
+		getComputedStyle: () => ({
+			getPropertyValue: () => "",
+			marginLeft: "0px",
+			marginRight: "0px",
+			paddingLeft: "0px",
+			paddingRight: "0px",
+			direction: "ltr",
+		}),
+	});
 	Object.assign(globalThis, {
 		window,
 		document: window.document,
-		navigator: window.navigator,
+		navigator: { platform: "Linux", userAgent: "Chrome", maxTouchPoints: 0, vendor: "" },
 		HTMLElement: window.HTMLElement,
 		Element: window.Element,
 		Node: window.Node,
@@ -68,6 +99,9 @@ beforeEach(() => {
 		getComputedStyle: window.getComputedStyle,
 		matchMedia: () => ({ matches: false, addEventListener() {}, removeEventListener() {} }),
 		IS_REACT_ACT_ENVIRONMENT: true,
+		requestAnimationFrame: (callback: FrameRequestCallback) =>
+			setTimeout(() => callback(performance.now()), 0),
+		cancelAnimationFrame: (handle: number) => clearTimeout(handle),
 	});
 	container = document.createElement("div");
 	document.body.appendChild(container);
@@ -94,17 +128,17 @@ async function renderMessage(message: AdapterMessage, opened: FileTarget[]) {
 			<MantineProvider env="test">
 				<FileReferenceScopeProvider
 					value={{
+						narratorId: "request-narrator",
 						context: { deviceId: "CURRENT_DEFAULT", cwd: "/wrong" },
 						openFile: (target) => opened.push(target),
 					}}
 				>
 					{items.map((spec) => (
 						<div key={spec.key}>
-							{renderElement(
-								spec.kind,
-								measureElement(spec.kind, spec.data, 700, 4, spec.opts),
-								resolveRenderExtra(spec),
-							)}
+							{renderElement(spec.kind, measureElement(spec.kind, spec.data, 700, 4, spec.opts), {
+								...resolveRenderExtra(spec),
+								messageId: message.id,
+							})}
 						</div>
 					))}
 				</FileReferenceScopeProvider>
@@ -120,6 +154,180 @@ function click(element: Element) {
 }
 
 describe("captured message file references", () => {
+	test.each([
+		"Remote",
+		undefined,
+		"local",
+	])("historical attachment from %s without verifiable host provenance never opens the server path", async (deviceId) => {
+		const message: AdapterMessage = {
+			id: "attachment-history",
+			narratorId: "n",
+			role: "user",
+			omitHeader: true,
+			contentJson: [
+				{ type: "text_file", filename: "same.txt", filePath: "/repo/same.txt", deviceId, size: 4 },
+			],
+		};
+		const spec = specs(message)[0];
+		const opens = mock(() => {});
+		await act(async () =>
+			root.render(
+				<MantineProvider env="test">
+					{renderElement(spec.kind, measureElement(spec.kind, spec.data, 700, 4), {
+						...resolveRenderExtra(spec),
+						onOpenAttachment: opens,
+					})}
+				</MantineProvider>,
+			),
+		);
+		const row = container.querySelector('[role="button"]');
+		if (row) click(row);
+		expect(opens).not.toHaveBeenCalled();
+		expect(document.body.textContent).toContain("Unavailable");
+	});
+
+	test("verifiable remote attachment opens its original occurrence read-only, never host opener", async () => {
+		const message: AdapterMessage = {
+			id: "remote-message",
+			narratorId: "n",
+			role: "user",
+			omitHeader: true,
+			contentJson: [
+				{
+					type: "text_file",
+					filename: "a.txt",
+					filePath: "/repo/a.txt",
+					size: 4,
+					deviceId: "Remote",
+					sourceNarratorId: "source-n",
+					contextKey: "original",
+					attachmentId: "attachment-a",
+					attachmentOrigin: { version: 1, projectId: null },
+					attachmentWorkspace: {
+						deviceId: "Remote",
+						cwd: "/repo",
+						contextKey: "original",
+						pathFlavor: "posix",
+					},
+				},
+			],
+		};
+		const spec = specs(message)[0];
+		const opens = mock(() => {});
+		await act(async () =>
+			root.render(
+				<MantineProvider env="test">
+					{renderElement(spec.kind, measureElement(spec.kind, spec.data, 700, 4), {
+						...resolveRenderExtra(spec),
+						narratorId: "n",
+						messageId: message.id,
+						onOpenAttachment: opens,
+					})}
+				</MantineProvider>,
+			),
+		);
+		const row = container.querySelector('[role="button"]');
+		if (row) click(row);
+		await act(async () => {
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		});
+		expect(opens).not.toHaveBeenCalled();
+		expect(capturedViews.at(-1)?.attachmentPreview).toEqual({
+			messageId: "remote-message",
+			attachmentId: "attachment-a",
+		});
+	});
+
+	test("only a locally proven attachment retains the host opener", async () => {
+		const message: AdapterMessage = {
+			id: "host-attachment",
+			narratorId: "n",
+			role: "user",
+			omitHeader: true,
+			contentJson: [
+				{
+					type: "text_file",
+					filename: "a.txt",
+					filePath: "/repo/a.txt",
+					deviceId: "local",
+					sourceNarratorId: "n",
+					contextKey: "original",
+					attachmentOrigin: { version: 1, projectId: null },
+					attachmentWorkspace: { deviceId: "local", cwd: "/repo", contextKey: "original" },
+				},
+			],
+		};
+		const spec = specs(message)[0];
+		const opens = mock(() => {});
+		await act(async () =>
+			root.render(
+				<MantineProvider env="test">
+					{renderElement(spec.kind, measureElement(spec.kind, spec.data, 700, 4), {
+						...resolveRenderExtra(spec),
+						narratorId: "n",
+						onOpenAttachment: opens,
+					})}
+				</MantineProvider>,
+			),
+		);
+		const row = container.querySelector('[role="button"]');
+		if (row) click(row);
+		expect(opens).toHaveBeenCalledWith("/repo/a.txt");
+	});
+
+	test("attachment provenance changes invalidate equal-name cached rows", () => {
+		const message = {
+			id: "cached-attachment",
+			narratorId: "n",
+			role: "user",
+			omitHeader: true,
+			contentJson: [
+				{ type: "text_file", filename: "same.txt", filePath: "/repo/same.txt", deviceId: "local" },
+			],
+		} satisfies AdapterMessage;
+		const host = specs(message)[0];
+		const remote = specs({
+			...message,
+			contentJson: [{ ...message.contentJson[0], deviceId: "Remote" }],
+		})[0];
+		expect(extractDataRevision(host.data)).not.toBe(extractDataRevision(remote.data));
+	});
+
+	test("attachment payload retains device and original workspace provenance", () => {
+		const origin = { version: 1, projectId: "original-project" };
+		const workspace = { deviceId: "Remote", cwd: "/repo", contextKey: "original" };
+		const spec = specs({
+			id: "provenance",
+			narratorId: "n",
+			role: "user",
+			omitHeader: true,
+			contentJson: [
+				{
+					type: "text_file",
+					filename: "same.txt",
+					filePath: "/repo/same.txt",
+					deviceId: "Remote",
+					contextKey: "original",
+					attachmentOrigin: origin,
+					attachmentWorkspace: workspace,
+					sourceNarratorId: "source",
+					attachmentId: "attachment",
+				},
+			],
+		})[0];
+		const measured = measureElement(spec.kind, spec.data, 700, 4);
+		const attachment = measured.blocks.find(
+			(block) => block.kind === "fixed" && block.tag === "user-text-file",
+		);
+		expect(attachment?.kind === "fixed" ? attachment.data : undefined).toMatchObject({
+			deviceId: "Remote",
+			contextKey: "original",
+			attachmentOrigin: origin,
+			attachmentWorkspace: workspace,
+			sourceNarratorId: "source",
+			attachmentId: "attachment",
+		});
+	});
 	test("chat opt-in renders Markdown links inside an exact box with quote and attachment actions", async () => {
 		const message: AdapterMessage = {
 			id: "chat",
@@ -322,7 +530,13 @@ describe("captured message file references", () => {
 		expect(row?.textContent).toContain("/repo/src/a.ts:2-4");
 		expect(row?.textContent).toContain("DeviceA");
 		if (row) click(row);
-		expect(opened).toEqual([reference]);
+		await act(async () => {});
+		expect(opened).toEqual([]); // Historical occurrence must never become a live dock/editor target.
+		expect(capturedViews.at(-1)).toMatchObject({
+			narratorId: "request-narrator",
+			referenceOrigin: true,
+			capturedSnapshot: { messageId: message.id, referenceId: reference.id },
+		});
 		const spec = specs(message)[0];
 		expect(JSON.stringify(spec)).not.toContain("HIDDEN_SNAPSHOT_BODY");
 		expect(container.textContent).not.toContain("HIDDEN_SNAPSHOT_BODY");
@@ -363,7 +577,13 @@ describe("captured message file references", () => {
 		const row = container.querySelector('[role="button"]');
 		expect(row?.textContent).toContain("/repo/src/a.ts:2-4");
 		if (row) click(row);
-		expect(opened).toEqual([reference]);
+		await act(async () => {});
+		expect(opened).toEqual([]); // Historical occurrence must never become a live dock/editor target.
+		expect(capturedViews.at(-1)).toMatchObject({
+			narratorId: "request-narrator",
+			referenceOrigin: true,
+			capturedSnapshot: { messageId: message.id, referenceId: reference.id },
+		});
 		const spec = specs(message)[0];
 		const plain = specs({
 			...message,

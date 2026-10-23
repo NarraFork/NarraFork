@@ -18,6 +18,8 @@ let pathDecision = "ask";
 let oauth: Record<string, unknown> | null = null;
 let checks: { principal: { userId: string }; need: string }[];
 let rootHook: (() => void) | undefined;
+let identityHook: ((path: string) => void) | undefined;
+let statCalls = 0;
 const rootLookup = mock(async () => {
 	rootHook?.();
 	return { rootIdentity: "real-executor-root-object", maxWriteBytes: cap };
@@ -49,6 +51,7 @@ const backend: ExecutionBackend = {
 		return generation;
 	},
 	async resolvePathIdentity(path: string) {
+		identityHook?.(path);
 		return {
 			lexicalPath: path,
 			canonicalPath: canonicalAlias && path.endsWith("file.txt") ? canonicalAlias : path,
@@ -57,6 +60,7 @@ const backend: ExecutionBackend = {
 		};
 	},
 	async statFile() {
+		statCalls++;
 		return { isDirectory: false, isFile: true, size };
 	},
 };
@@ -72,6 +76,15 @@ mock.module("../db", () => ({
 		query: {
 			...dbExports.db.query,
 			users: { findFirst: async () => (actorExists ? { role: "user" } : undefined) },
+			remoteDevices: {
+				findFirst: async () => ({
+					id: "remote",
+					scope: "global",
+					ownerScope: "shared",
+					createdBy: "real-human",
+					revokedAt: null,
+				}),
+			},
 			narrators: {
 				findFirst: async () => ({
 					id: "narrator",
@@ -108,6 +121,7 @@ mock.module("./integration-resource-binding-service", () => ({
 const deviceExports = await import("./device-connection-service");
 mock.module("./device-connection-service", () => ({
 	...deviceExports,
+	isDeviceOnline: () => online,
 	getSessionDevices: async () => [{ id: "remote", online }],
 }));
 const policyExports = await import("./execution-policy/engine");
@@ -121,6 +135,54 @@ mock.module("./trait-layer-service", () => ({
 	resolveEffectiveTraits: async () => ({ traits: [] }),
 	resolveNarratorProjectId: async () => "project",
 }));
+const workspaceContextExports = await import("./workspace-context-service");
+mock.module("./workspace-context-service", () => ({
+	...workspaceContextExports,
+	assertWorkspaceSelectionInstalled() {},
+}));
+mock.module("./narrator-device-workspace-service", () => ({
+	narratorDeviceWorkspaceService: {
+		async assertCurrent() {
+			if (revision !== 8) throw new AppError("Workspace revision changed", 403, "WORKSPACE_STALE");
+		},
+		assertCurrentSync() {
+			if (revision !== 8) throw new AppError("Workspace revision changed", 403, "WORKSPACE_STALE");
+		},
+		async assertEndpointDeviceCurrent() {
+			return { assertStillCurrent() {} };
+		},
+		async assertOriginalEndpointDeviceCurrent() {
+			const pinned = {
+				generation,
+				actorExists,
+				canWrite,
+				canRead,
+				online,
+				oauth: JSON.stringify(oauth),
+			};
+			return {
+				assertStillCurrent() {
+					if (
+						JSON.stringify(pinned) !==
+						JSON.stringify({
+							generation,
+							actorExists,
+							canWrite,
+							canRead,
+							online,
+							oauth: JSON.stringify(oauth),
+						})
+					)
+						throw new AppError(
+							"Remote editor endpoint changed during authorization",
+							403,
+							"EDITOR_IDENTITY_CHANGED",
+						);
+				},
+			};
+		},
+	},
+}));
 const { authorizeRemoteEditorBinding } = await import("./remote-editor-access");
 const workspace: WorkspaceContext = {
 	deviceId: "remote",
@@ -130,6 +192,14 @@ const workspace: WorkspaceContext = {
 	contextKey: "workspace-eight",
 	contextProjectId: "project",
 	capabilities: { switchDirectory: true },
+	binding: {
+		version: 1,
+		narratorId: "narrator",
+		deviceId: "remote",
+		bindingId: "remote",
+		bindingKey: "workspace-eight",
+		bindingRevision: 8,
+	},
 };
 const actor: EditorActor = {
 	userId: "real-human",
@@ -164,6 +234,8 @@ beforeEach(() => {
 	oauth = null;
 	checks = [];
 	rootHook = undefined;
+	identityHook = undefined;
+	statCalls = 0;
 	rootLookup.mockClear();
 });
 
@@ -177,6 +249,42 @@ test("AI readOnly never prevents real human Write owner, and does not impersonat
 	expect(binding.rootIdentity).toBe("real-executor-root-object");
 	expect(checks.every((check) => check.principal.userId === "real-human")).toBe(true);
 	expect(checks.some((check) => check.need === "write")).toBe(true);
+});
+test("existing remote document uses frozen source after selection or same-device rebinding", async () => {
+	const original = await authorize();
+	revision = 999;
+	const live = await authorizeRemoteEditorBinding(
+		actor,
+		workspace,
+		{ ...input, path: original.canonicalPath },
+		"write",
+		{
+			signal: AbortSignal.timeout(10_000),
+			original,
+			originalProjectId: original.projectId,
+			authorizationGuard: async () => {},
+		},
+	);
+	expect(live.canonicalPath).toBe("/selected/file.txt");
+	expect(live.workspaceRevision).toBe(8);
+	expect(live.projectId).toBe("project");
+	generation++;
+	await expect(
+		authorizeRemoteEditorBinding(actor, workspace, input, "read", {
+			signal: AbortSignal.timeout(10_000),
+			original,
+			originalProjectId: original.projectId,
+			authorizationGuard: async () => {},
+		}),
+	).rejects.toThrow("provenance changed");
+});
+test("actor revocation during canonical metadata prevents the next stat dispatch", async () => {
+	identityHook = (path) => {
+		if (path.endsWith("file.txt")) canRead = false;
+	};
+	await expect(authorize()).rejects.toThrow("endpoint changed");
+	expect(statCalls).toBe(0);
+	expect(rootLookup).not.toHaveBeenCalled();
 });
 test("readonly narrator viewer can open but cannot save", async () => {
 	canWrite = false;

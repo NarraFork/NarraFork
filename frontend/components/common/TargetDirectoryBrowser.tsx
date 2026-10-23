@@ -52,7 +52,7 @@ export function TargetDirectoryBrowser({
 		setPath(next);
 		setInput(next);
 	};
-	const data = query.data;
+	const data = query.isError ? undefined : query.data;
 	const name = leaf.trim();
 	const windows = data?.sep === "\\";
 	const [selecting, setSelecting] = useState(false);

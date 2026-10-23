@@ -269,6 +269,27 @@ test("actual modal shows full original scope, bounded diff warning and requires 
 		confirmation: previewValue().confirmation,
 	});
 });
+test("partial restore displays restored, conflicting and uncovered ranges", async () => {
+	apply.mockImplementation(async (_id, input) => ({
+		planId: input.planId,
+		status: "committed" as const,
+		restoredFileCount: 1,
+		coverage: {
+			restoredFiles: ["restored.txt"],
+			conflicts: [{ path: "external.txt", reason: "current_state_mismatch" }],
+			unknownCoverage: [{ root: "D:\\original root", reason: "untracked_bash" }],
+		},
+	}));
+	await prepared();
+	await consent();
+	await click("snapshotRestore.apply");
+	expect(host.textContent).toContain("partialRevert.restored");
+	expect(host.textContent).toContain("partialRevert.conflicts");
+	expect(host.textContent).toContain("external.txt");
+	expect(host.textContent).toContain("current_state_mismatch");
+	expect(host.textContent).toContain("partialRevert.unknown");
+	expect(host.textContent).toContain("untracked_bash");
+});
 test("view revision change clears checked consent and leaves destructive action disabled", async () => {
 	await prepared();
 	await consent();

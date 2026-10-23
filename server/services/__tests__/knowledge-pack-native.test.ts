@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { WorkspaceContext } from "@shared/workspace-context";
@@ -159,6 +159,7 @@ test("native Pack complete, original fresh-fence cleanup, modified-target retain
 		expect(active?.targetBindingJson).toMatchObject({
 			materializationState: "complete",
 			actorUserId: userId,
+			originalProjectId: null,
 			workspace: { deviceId, cwd: first.ctx.workspaceContext?.cwd },
 		});
 		expect(
@@ -172,12 +173,53 @@ test("native Pack complete, original fresh-fence cleanup, modified-target retain
 				where: eq(narratorWhitelistDirs.id, active?.whitelistDirId ?? "missing"),
 			}),
 		).toMatchObject({ targetKind: "device", targetValue: deviceId });
+		// Rebinding the same device must clean A using its proofs, never B's same-named files.
+		const replacement = await context("selected-replacement", complete.id);
+		mkdirSync(replacement.root, { recursive: true });
+		writeFileSync(join(replacement.root, "a.txt"), "replacement-a");
+		writeFileSync(join(replacement.root, "b.txt"), "replacement-b");
+		// Old records with unknown project provenance are retained, never inferred from B.
+		if (!active?.targetBindingJson) throw new Error("Activation binding missing");
+		const legacyBinding = { ...active.targetBindingJson };
+		Reflect.deleteProperty(legacyBinding, "originalProjectId");
+		await db
+			.update(knowledgePackActivations)
+			.set({ targetBindingJson: legacyBinding })
+			.where(eq(knowledgePackActivations.id, active.id));
+		await expect(
+			packActivationService.deactivate(narratorId, complete.id, replacement.ctx),
+		).rejects.toThrow("Pack cleanup proof/original creator is unavailable");
+		expect(readFileSync(join(first.root, "a.txt"), "utf8")).toBe("a-complete");
+		await db
+			.update(knowledgePackActivations)
+			.set({ targetBindingJson: active.targetBindingJson })
+			.where(eq(knowledgePackActivations.id, active.id));
+		// An unavailable original root must retain the activation and never fall back to B.
+		const originalRoot = first.ctx.workspaceContext?.cwd as string;
+		renameSync(originalRoot, `${originalRoot}-unavailable`);
+		try {
+			await expect(
+				packActivationService.deactivate(narratorId, complete.id, replacement.ctx),
+			).rejects.toThrow();
+			expect(
+				await db.query.knowledgePackActivations.findFirst({
+					where: eq(knowledgePackActivations.id, active?.id ?? "missing"),
+				}),
+			).toMatchObject({ status: "active" });
+			expect(readFileSync(join(replacement.root, "a.txt"), "utf8")).toBe("replacement-a");
+		} finally {
+			renameSync(`${originalRoot}-unavailable`, originalRoot);
+		}
 		// New cleanup lease has a fresh fence; immutable original creation proof remains valid.
-		expect(await packActivationService.deactivate(narratorId, complete.id, first.ctx)).toEqual({
+		expect(
+			await packActivationService.deactivate(narratorId, complete.id, replacement.ctx),
+		).toEqual({
 			released: true,
 		});
 		expect(await Bun.file(join(first.root, "a.txt")).exists()).toBe(false);
 		expect(await Bun.file(join(first.root, "b.txt")).exists()).toBe(false);
+		expect(readFileSync(join(replacement.root, "a.txt"), "utf8")).toBe("replacement-a");
+		expect(readFileSync(join(replacement.root, "b.txt"), "utf8")).toBe("replacement-b");
 		const originalProofs = active?.targetBindingJson?.files.map((file) => file.receipt) ?? [];
 		const scope = await db.query.fileChangeScopes.findFirst({
 			where: eq(fileChangeScopes.id, originalProofs[0]?.binding.scopeId ?? "missing"),

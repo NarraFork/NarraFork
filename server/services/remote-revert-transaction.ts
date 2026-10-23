@@ -57,7 +57,7 @@ export async function resolveRecordedRemoteRevertScope(
 		scope.deviceId === "local" ||
 		scope.sourceInstanceId !== input.identity.sourceInstanceId ||
 		scope.workspaceInstanceId !== input.identity.workspaceInstanceId ||
-		scope.status !== "active"
+		(scope.status !== "active" && scope.status !== "needs_verification")
 	)
 		throw new Error(
 			"Recorded remote history scope unavailable; legacy provenance cannot be upgraded",
@@ -87,17 +87,24 @@ export async function resolveRecordedRemoteRevertScope(
 		"write",
 		input.signal,
 		input.identity,
+		true,
 	);
+	registry.coordinator.assertRevertActivityBarrier(scope);
 	const runtime = registry.runtimeBinding(scope.deviceId);
 	if (!runtime) throw new Error("Recorded remote device offline");
 	return {
 		...endpoint,
+		assertCurrent: async (signal: AbortSignal) => {
+			await endpoint.assertCurrent(signal);
+			registry.coordinator.assertRevertActivityBarrier(scope);
+		},
 		executionBinding: {
 			deviceId: scope.deviceId,
 			...runtime,
 			fencingToken: Math.max(1, scope.fencingToken),
 		},
 		scopeRevision: scope.revision,
+		unknownCoverage: registry.coordinator.revertUnknownCoverage(scope),
 	};
 }
 

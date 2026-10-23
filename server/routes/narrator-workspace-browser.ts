@@ -36,6 +36,7 @@ narratorWorkspaceBrowserRoutes.get("/:id/workspace-browser", async (c) => {
 				userId: c.get("user").sub,
 				signal: c.req.raw.signal,
 			}),
+		{ userId: c.get("user").sub },
 	);
 	// A grant revoked while a remote directory was in flight must hide the result.
 	await requireNarratorAccess(c, c.req.param("id"), "read");

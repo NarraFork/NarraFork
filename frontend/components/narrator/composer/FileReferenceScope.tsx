@@ -9,6 +9,8 @@ import { type ReactNode, useContext, useMemo } from "react";
 
 export interface FileReferenceScopeValue {
 	narratorId?: string;
+	/** Server message identity for immutable historical reference viewers. */
+	capturedMessageId?: string;
 	/** null explicitly disables inferred relative paths in historical content. */
 	context?: FileReferenceContext | null;
 	openFile?: (target: FileTarget) => void;

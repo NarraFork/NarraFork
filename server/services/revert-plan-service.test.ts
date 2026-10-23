@@ -524,8 +524,11 @@ describe("bounded fixed-file append and publication validation", () => {
 			.set({ status: "needs_verification" })
 			.where(eq(fileChangeScopes.id, scope.id))
 			.run();
-		await rejected(service.appendFiles(owner, result.id, [f]), "TARGET_UNVERIFIED");
-		expect(storedFiles(result.id)).toHaveLength(0);
+		await service.appendFiles(owner, result.id, [f]);
+		expect(storedFiles(result.id)).toHaveLength(1);
+		expect(
+			db.select().from(fileChangeScopes).where(eq(fileChangeScopes.id, scope.id)).get()?.status,
+		).toBe("needs_verification");
 	});
 
 	test("manifest refs reject nonexistent, staging, expired, missing and wrong-size catalog entries", () => {

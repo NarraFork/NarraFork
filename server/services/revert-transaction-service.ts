@@ -29,6 +29,7 @@ import {
 	type FileChangeRevertMutationJournal,
 	fileChangeStatesEqual,
 } from "@shared/file-change-protocol";
+import type { PartialRevertResult } from "@shared/partial-revert";
 import { eq } from "drizzle-orm";
 import { fileChangeBlobs, fileChangeScopes, revertOperationFiles } from "../db/schema";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
@@ -133,6 +134,7 @@ export interface RevertTransactionOutcome {
 	/** Internal post-commit invalidation data, never serialized as the public result. */
 	historyResult?: RevertHistoryApplyResult;
 	worktreePaths?: string[];
+	coverage?: PartialRevertResult;
 }
 export interface RevertTransactionExecution {
 	/** Bounded caller wait. Rejection means preflight refused without target dispatch. */
@@ -219,6 +221,7 @@ type Run = {
 	worktreePaths: string[];
 	historyResult?: RevertHistoryApplyResult;
 	leases: readonly WorkspaceWriteLease[];
+	coverage?: PartialRevertResult;
 };
 
 /** Internal POSIX/local narrator-only vertical execution. NO HTTP apply, broadcasts, legacy
@@ -462,6 +465,8 @@ export class RevertTransactionService {
 			run.signal,
 		);
 		run.usedBytes = manifest.evidenceBytes;
+		run.coverage = manifest.coverage;
+		if (run.ctx) run.ctx.manifestProof = manifest.proof;
 		bound(run.usedBytes, this.maxEvidenceBytes);
 		for (const ref of manifest.rawRefs) await this.readBlob(ref, run.signal);
 		const scopes = new Map<string, Scope>();
@@ -490,7 +495,8 @@ export class RevertTransactionService {
 				.get();
 			// The lease below owns CURRENT admission. A fence from the read-only
 			// preview is not a dependency on every other file in this workspace.
-			if (!scope || scope.status !== "active") throw fail("SCOPE_STALE");
+			if (!scope || (scope.status !== "active" && scope.status !== "needs_verification"))
+				throw fail("SCOPE_STALE");
 			if (this.options.provider?.handles(file.identity)) {
 				await this.options.provider.verifyScope(scope, file, run.signal);
 			} else {
@@ -1073,7 +1079,7 @@ export class RevertTransactionService {
 			.get();
 		if (
 			!current ||
-			current.status !== "active" ||
+			(current.status !== "active" && current.status !== "needs_verification") ||
 			current.sourceInstanceId !== namespace.sourceInstanceId ||
 			current.rootIdentityJson?.object !== file.scope.rootIdentityJson?.object ||
 			current.canonicalRoot !== file.scope.canonicalRoot
@@ -1297,7 +1303,15 @@ export class RevertTransactionService {
 			journalStatus: operation?.status ?? null,
 			settling,
 			...(status === "committed"
-				? { historyResult: run.historyResult, worktreePaths: run.worktreePaths }
+				? {
+						historyResult: run.historyResult,
+						worktreePaths: run.worktreePaths,
+						coverage: {
+							restoredFiles: run.files.map((file) => file.manifest.identity.displayPath),
+							conflicts: run.coverage?.conflicts ?? [],
+							unknownCoverage: run.coverage?.unknownCoverage ?? [],
+						},
+					}
 				: {}),
 			// History/file terminality does not prove coordinator finalization succeeded.
 			// Preserve an explicit release/recovery warning alongside the durable result.

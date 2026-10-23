@@ -938,7 +938,7 @@ function assertScope(tx: Executor, identity: FileChangeIdentity) {
 		.from(fileChangeScopes)
 		.where(eq(fileChangeScopes.id, identity.scopeId))
 		.get();
-	if (!scope || scope.status !== "active")
+	if (!scope || (scope.status !== "active" && scope.status !== "needs_verification"))
 		throw fail("TARGET_UNVERIFIED", "A verified active scope is required");
 	if (!equal(createFileChangeIdentity(scope, identity), identity))
 		throw fail(
@@ -1055,7 +1055,7 @@ function assertPinnedRefsStillReady(tx: Executor, planId: string) {
 			and(
 				eq(revertOperationFiles.revertOperationId, planId),
 				sql`(
-			${revertOperationFiles.status} != 'prepared' OR ${fileChangeScopes.status} IS NOT 'active'
+			${revertOperationFiles.status} != 'prepared' OR ${fileChangeScopes.status} IS NULL OR ${fileChangeScopes.status} NOT IN ('active', 'needs_verification')
 			OR (${revertOperationFiles.beforeBlobDigest} IS NOT NULL AND (${before.status} IS NOT 'ready'
 				OR ${before.sizeBytes} IS NOT coalesce(json_extract(${revertOperationFiles.expectedStateJson}, '$.blob.sizeBytes'), json_extract(${revertOperationFiles.expectedStateJson}, '$.target.sizeBytes'))))
 			OR (${revertOperationFiles.desiredBlobDigest} IS NOT NULL AND (${desired.status} IS NOT 'ready'

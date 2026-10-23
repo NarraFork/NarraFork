@@ -51,6 +51,7 @@ import licenseRoutes from "./routes/licenses";
 import { mcpRoutes } from "./routes/mcp";
 import { modelCardRoutes } from "./routes/model-cards";
 import { modelCatalogRoutes } from "./routes/model-catalog";
+import { narratorAttachmentRoutes } from "./routes/narrator-attachments";
 import { createNarratorWorktreeRoutes } from "./routes/narrator-worktrees";
 import { narratorRoutes } from "./routes/narrators";
 import { notificationSoundRoutes } from "./routes/notification-sounds";
@@ -374,6 +375,7 @@ app.route(
 	createNarratorWorktreeRoutes(narratorWorktreeService, narratorPrincipalOf),
 );
 app.route("/api/narrators", narratorGitRoutes);
+app.route("/api/narrators", narratorAttachmentRoutes);
 app.route("/api/narrators", narratorRoutes);
 app.route("/api/narrators", specRoutes);
 app.route("/api/terminals", terminalRoutes);

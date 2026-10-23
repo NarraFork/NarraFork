@@ -345,6 +345,8 @@ export interface BufferedMessage {
 	fileReferences?: FileReferenceSnapshot[];
 	images?: ImageRef[];
 	textFiles?: File[];
+	/** Server-owned submission source; null/absent legacy provenance must never use today's cwd. */
+	attachmentWorkspace?: import("@shared/workspace-context").WorkspaceContext | null;
 	bufferedAt: string;
 	commandText?: string | null;
 	/** runBashFirst command to execute before the prompt when this message is consumed. */

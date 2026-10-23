@@ -1,4 +1,8 @@
 import type {
+	ListNarratorDeviceWorkspacesResult,
+	NarratorDeviceWorkspaceMutationResult,
+	SelectNarratorDeviceWorkspaceRequest,
+	SetNarratorDeviceWorkspaceRequest,
 	SwitchWorkingDirectoryRequest,
 	SwitchWorkingDirectoryResult,
 	WorkspaceContext,
@@ -23,7 +27,54 @@ export interface WorkspaceDirectoryListing {
 	revision: number;
 }
 
+export interface DeviceWorkspaceRequestReceipt {
+	requestId: string;
+	kind: "set" | "select";
+	result: NarratorDeviceWorkspaceMutationResult;
+	installState: "pending" | "installed" | "superseded";
+}
+
 export const workspaceContextApi = {
+	listNarratorDeviceWorkspaces: (
+		narratorId: string,
+		opts: { cursor?: string; limit?: number; signal?: AbortSignal } = {},
+	) => {
+		const query = new URLSearchParams({ limit: String(opts.limit ?? 32) });
+		if (opts.cursor) query.set("cursor", opts.cursor);
+		return request<ListNarratorDeviceWorkspacesResult>(
+			`/narrators/${encodeURIComponent(narratorId)}/device-workspaces?${query}`,
+			{ signal: opts.signal },
+		);
+	},
+	getWorkspaceSelectionStatus: (narratorId: string, signal?: AbortSignal) =>
+		request<{ revision: number; installed: boolean }>(
+			`/narrators/${encodeURIComponent(narratorId)}/device-workspaces/selection-status`,
+			{ signal },
+		),
+	setNarratorDeviceWorkspace: (narratorId: string, input: SetNarratorDeviceWorkspaceRequest) => {
+		const { deviceId, ...body } = input;
+		return request<NarratorDeviceWorkspaceMutationResult>(
+			`/narrators/${encodeURIComponent(narratorId)}/device-workspaces/${encodeURIComponent(deviceId)}`,
+			{ method: "PUT", body: JSON.stringify(body) },
+		);
+	},
+	selectNarratorDeviceWorkspace: (
+		narratorId: string,
+		input: SelectNarratorDeviceWorkspaceRequest,
+	) =>
+		request<NarratorDeviceWorkspaceMutationResult>(
+			`/narrators/${encodeURIComponent(narratorId)}/device-workspaces/select`,
+			{ method: "POST", body: JSON.stringify(input) },
+		),
+	getNarratorDeviceWorkspaceRequest: (narratorId: string, requestId: string) =>
+		request<DeviceWorkspaceRequestReceipt>(
+			`/narrators/${encodeURIComponent(narratorId)}/device-workspaces/requests/${encodeURIComponent(requestId)}`,
+		),
+	recoverNarratorDeviceWorkspaceRequest: (narratorId: string, requestId: string) =>
+		request<NarratorDeviceWorkspaceMutationResult>(
+			`/narrators/${encodeURIComponent(narratorId)}/device-workspaces/requests/${encodeURIComponent(requestId)}/recover`,
+			{ method: "POST" },
+		),
 	browseNarratorWorkspace: (
 		narratorId: string,
 		context: WorkspaceContext,

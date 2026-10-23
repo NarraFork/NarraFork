@@ -1,0 +1,2 @@
+CREATE INDEX "idx_narrator_device_workspace_request_install" ON "narrator_device_workspace_requests" USING btree ("narrator_id","install_state","expected_selection_revision");--> statement-breakpoint
+CREATE INDEX "idx_workspace_switch_request_install" ON "workspace_switch_requests" USING btree ("narrator_id","install_state","expected_revision");

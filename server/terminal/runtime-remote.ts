@@ -32,6 +32,8 @@ export interface RemotePtyDependencies {
 	requireLifecycleEvidence?: boolean;
 	/** Revalidate original creator/binding for non-WS writes at actual dispatch. */
 	beforeInput?: InputAuthority;
+	/** Narrator-linked publishers require a real request-bound synchronous final proof. */
+	requireInputAuthorityProof?: boolean;
 	onFailure?: (error: Error) => void;
 	/** Original selected directory identity, never minted from current cwd later. */
 	expectedNativeDescriptor?: NativePathDescriptorV2;
@@ -121,6 +123,18 @@ export function spawnRemotePty(
 		deps.onFailure?.(error);
 		requestClose(error);
 	};
+	const assertInputProof = (proof: unknown) => {
+		if (
+			proof &&
+			typeof proof === "object" &&
+			"assertStillCurrent" in proof &&
+			typeof proof.assertStillCurrent === "function"
+		) {
+			proof.assertStillCurrent();
+		} else if (deps.requireInputAuthorityProof) {
+			throw new Error("Terminal input requires a final authority proof");
+		}
+	};
 	const pump = async () => {
 		if (pumping || !ready || exited || closing) return;
 		pumping = true;
@@ -129,8 +143,9 @@ export function spawnRemotePty(
 				const write = queuedWrites.shift();
 				if (write) {
 					try {
-						await (write.authority ?? deps.beforeInput)?.();
+						const proof = await (write.authority ?? deps.beforeInput)?.();
 						if (exited || closing) break;
+						assertInputProof(proof);
 						await sendRpc(
 							deviceId,
 							"pty.write",
@@ -143,8 +158,9 @@ export function spawnRemotePty(
 				} else if (queuedResize) {
 					const resize = queuedResize;
 					queuedResize = null;
-					await (resize.authority ?? deps.beforeInput)?.();
+					const proof = await (resize.authority ?? deps.beforeInput)?.();
 					if (exited || closing) break;
+					assertInputProof(proof);
 					await sendRpc(
 						deviceId,
 						"pty.resize",

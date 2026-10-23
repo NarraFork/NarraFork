@@ -292,6 +292,7 @@ function ensureStagingDirectory(id: string): string {
 	return dir;
 }
 interface StagingMetadata {
+	attachmentWorkspace?: BufferedMessage["attachmentWorkspace"];
 	queueMode?: BufferQueueMode;
 	executionIntent?: BufferedMessage["executionIntent"];
 	stagingId?: string;
@@ -458,6 +459,9 @@ export function projectMailboxUserMessage(row: RuntimeMailboxRow): BufferedMessa
 	const metadata = json<StagingMetadata>(row.metadataJson, {});
 	return {
 		executionIntent: metadata.executionIntent,
+		attachmentWorkspace: metadata.attachmentWorkspace
+			? structuredClone(metadata.attachmentWorkspace)
+			: null,
 		queueMode: resolveBufferQueueMode(metadata.queueMode, row.priority),
 		id: row.id,
 		state: row.state === "failed" ? "failed" : "queued",
@@ -619,6 +623,15 @@ export async function enqueueBufferedMessage(
 	let port: RuntimeQueuePort | undefined;
 	let admittedOwnerId: string | undefined;
 	try {
+		// Capture server-owned source BEFORE staging/creator awaits. Even text-only input
+		// keeps its source, since an in-place queue edit may add attachments later.
+		const submitted = await db.query.narrators.findFirst({
+			where: eq(narrators.id, narratorId),
+			columns: { workspaceContext: true },
+		});
+		const attachmentWorkspace = submitted?.workspaceContext
+			? structuredClone(submitted.workspaceContext)
+			: null;
 		if (!creator && createdBy) creator = (await loadBufferCreators([createdBy]))[0] ?? null;
 		saved = await persistBufferedTextFiles(stagingId, textFiles ?? []);
 		const bytes = Buffer.byteLength(text);
@@ -631,7 +644,12 @@ export async function enqueueBufferedMessage(
 			payloadRef = { storage: "buffered_file", path, byteSize: bytes, ownership: "mailbox" };
 		}
 		let fileReferencesJson = refs.length ? JSON.stringify(refs) : null;
-		const metadata: StagingMetadata = { stagingId, executionIntent, queueMode };
+		const metadata: StagingMetadata = {
+			stagingId,
+			executionIntent,
+			queueMode,
+			attachmentWorkspace,
+		};
 		if (queueMode) frontOrder = queueMode === "interrupt" ? "stack" : "fifo";
 		if (commandText && Buffer.byteLength(commandText) > MAILBOX_LIMITS.metadataBytes / 8) {
 			metadata.commandTextPath = await writeStagingText(stagingId, "command", commandText);

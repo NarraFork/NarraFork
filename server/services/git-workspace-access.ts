@@ -1,8 +1,9 @@
+import { createHash } from "node:crypto";
 import { realpath } from "node:fs/promises";
 import { and, asc, eq, gt, inArray, isNull, ne, or, sql } from "drizzle-orm";
 import type { Context } from "hono";
 import { db } from "../db";
-import { chapters, projects, remoteDevices } from "../db/schema";
+import { aclGrants, chapters, projects, remoteDevices, users } from "../db/schema";
 import { AppError } from "../lib/errors";
 import { isSecretPlatformPath, isSecretUserPath } from "../lib/fs-secret-paths";
 import { logger } from "../lib/logger";
@@ -17,7 +18,11 @@ import {
 	resolveChapterGitTarget,
 	resolveNarratorGitTarget,
 } from "./git-workspace";
-import { ACCESS_PAGE_SIZE, GitAccessScan } from "./git-workspace-access-scan";
+import {
+	ACCESS_PAGE_SIZE,
+	accessCheckUnavailable,
+	GitAccessScan,
+} from "./git-workspace-access-scan";
 import { gitPathPolicyAllows } from "./git-workspace-path-policy";
 import { integrationResourceBindingService } from "./integration-resource-binding-service";
 import { canWriteNarrator, loadNarratorForAccess, type NarratorPrincipal } from "./narrator-acl";
@@ -27,6 +32,99 @@ import { assertChapterProjectAccess, hasProjectAccess, loadProjectForAccess } fr
 
 const denied = () =>
 	new AppError("Git workspace access denied", 403, "GIT_WORKSPACE_ACCESS_DENIED");
+
+const MAX_RELATED_GIT_PROJECTS = 512;
+const MAX_RELATED_GIT_GRANTS = 2048;
+const MAX_RELATED_GIT_FINGERPRINT_BYTES = 256 * 1024;
+
+/** Identity-only stamp for this already-matched project set; never grants path/device authority. */
+function captureRelatedProjectAuthority(projectIds: string[], principal: NarratorPrincipal) {
+	const ids = [...new Set(projectIds)].sort();
+	if (ids.length > MAX_RELATED_GIT_PROJECTS) throw accessCheckUnavailable();
+	const snapshot = () => {
+		const actor = db
+			.select({ id: users.id, role: users.role })
+			.from(users)
+			.where(eq(users.id, principal.userId))
+			.get();
+		if (!actor || (actor.role === "admin") !== principal.isAdmin) throw denied();
+		const rows = ids.length
+			? db
+					.select({
+						id: projects.id,
+						ownerUserId: projects.ownerUserId,
+						visibility: projects.visibility,
+						gitPath: sql<string | null>`substr(${projects.gitPath}, 1, 4097)`,
+						gitPathLength: sql<number | null>`length(${projects.gitPath})`,
+					})
+					.from(projects)
+					.where(inArray(projects.id, ids))
+					.orderBy(asc(projects.id))
+					.limit(MAX_RELATED_GIT_PROJECTS + 1)
+					.all()
+			: [];
+		if (rows.length !== ids.length) throw denied();
+		if (rows.some((row) => (row.gitPathLength ?? 0) > 4096)) throw accessCheckUnavailable();
+		const grants = ids.length
+			? db
+					.select({
+						id: aclGrants.id,
+						scopeType: aclGrants.scopeType,
+						scopeId: aclGrants.scopeId,
+						principalType: aclGrants.principalType,
+						principalId: aclGrants.principalId,
+						capability: aclGrants.capability,
+						domainKind: aclGrants.domainKind,
+						domainValue: sql<string | null>`substr(${aclGrants.domainValue}, 1, 4097)`,
+						domainValueLength: sql<number | null>`length(${aclGrants.domainValue})`,
+					})
+					.from(aclGrants)
+					.where(
+						and(
+							or(
+								and(
+									eq(aclGrants.principalType, "user"),
+									eq(aclGrants.principalId, principal.userId),
+								),
+								and(
+									eq(aclGrants.principalType, "role"),
+									eq(aclGrants.principalId, principal.isAdmin ? "admin" : "user"),
+								),
+							),
+							or(
+								and(eq(aclGrants.scopeType, "global"), isNull(aclGrants.scopeId)),
+								and(eq(aclGrants.scopeType, "project"), inArray(aclGrants.scopeId, ids)),
+							),
+						),
+					)
+					.orderBy(asc(aclGrants.id))
+					.limit(MAX_RELATED_GIT_GRANTS + 1)
+					.all()
+			: [];
+		if (
+			grants.length > MAX_RELATED_GIT_GRANTS ||
+			grants.some((row) => (row.domainValueLength ?? 0) > 4096)
+		)
+			throw accessCheckUnavailable();
+		let bytes = 0;
+		const hash = createHash("sha256");
+		for (const row of [actor, ...rows, ...grants]) {
+			const chunk = JSON.stringify(row);
+			bytes += Buffer.byteLength(chunk);
+			if (bytes > MAX_RELATED_GIT_FINGERPRINT_BYTES) throw accessCheckUnavailable();
+			hash.update(chunk);
+		}
+		return { rows, fingerprint: hash.digest("hex") };
+	};
+	// Synchronous baseline precedes the FIRST project hasProjectAccess await.
+	const before = snapshot();
+	return {
+		rows: before.rows,
+		assertStillCurrent() {
+			if (snapshot().fingerprint !== before.fingerprint) throw denied();
+		},
+	};
+}
 
 function redactDeniedTarget(target: GitWorkspaceTarget): void {
 	const { workspace } = target;
@@ -38,6 +136,8 @@ function redactDeniedTarget(target: GitWorkspaceTarget): void {
 	workspace.rootPath = null;
 	workspace.workspaceKey = null;
 	workspace.repositoryKey = null;
+	delete workspace.contextKey;
+	delete workspace.workspaceRevision;
 	delete workspace.chapterId;
 	delete workspace.projectId;
 	delete target.repositoryPath;
@@ -114,6 +214,11 @@ async function relatedProjects(
 	};
 	type Project = Pick<typeof projects.$inferSelect, keyof typeof fields>;
 	const matches = new Map<string, Project>();
+	const addMatch = (row: Project) => {
+		if (!matches.has(row.id) && matches.size >= MAX_RELATED_GIT_PROJECTS)
+			throw accessCheckUnavailable();
+		matches.set(row.id, row);
+	};
 	for await (const page of scan.pagesOf((cursor) =>
 		db
 			.select(fields)
@@ -131,7 +236,7 @@ async function relatedProjects(
 			.orderBy(asc(projects.id))
 			.limit(ACCESS_PAGE_SIZE),
 	)) {
-		for (const row of page) matches.set(row.id, row);
+		for (const row of page) addMatch(row);
 	}
 	for await (const page of scan.pagesOf((cursor) =>
 		db
@@ -155,7 +260,7 @@ async function relatedProjects(
 				.where(and(foreignProject, inArray(projects.id, missing)))
 				.limit(ACCESS_PAGE_SIZE),
 		);
-		for (const row of rows) matches.set(row.id, row);
+		for (const row of rows) addMatch(row);
 	}
 	// Registered symlink aliases can occur anywhere in the project table.
 	const paths = target.backend.paths;
@@ -175,7 +280,7 @@ async function relatedProjects(
 					paths.contains(root, path) ||
 					(target.repositoryPath && paths.contains(path, target.repositoryPath))
 				)
-					matches.set(project.id, project);
+					addMatch(project);
 			},
 		);
 	}
@@ -198,6 +303,19 @@ export async function authorizeGitTargetForPrincipal(
 	signal: AbortSignal,
 	cachedDiscovery = false,
 ): Promise<GitWorkspaceTarget> {
+	// HTTP tokens and WS upgrade roles are historical claims, never current authority.
+	const actorId = principal.userId;
+	const user = await db.query.users.findFirst({
+		where: eq(users.id, actorId),
+		columns: { role: true },
+	});
+	if (!user) throw denied();
+	principal = { userId: actorId, isAdmin: user.role === "admin" };
+	const expectedRole = user.role;
+	const assertPrincipalStillCurrent = () => {
+		const live = db.select({ role: users.role }).from(users).where(eq(users.id, actorId)).get();
+		if (!live || live.role !== expectedRole) throw denied();
+	};
 	let canWrite = true;
 	let policy: Awaited<ReturnType<typeof resolveOAuthNarratorRuntimePolicy>> = null;
 	let deviceClass: ExecutionDeviceClass | null = null;
@@ -209,11 +327,12 @@ export async function authorizeGitTargetForPrincipal(
 	if ("narratorId" in source) {
 		const narrator = await loadNarratorForAccess(source.narratorId, principal, need);
 		canWrite = await canWriteNarrator(narrator, principal);
-		policy = await resolveOAuthNarratorRuntimePolicy(source.narratorId);
+		policy = await resolveOAuthNarratorRuntimePolicy(source.narratorId, principal.userId);
 		target = await resolveNarratorGitTarget(
 			source.narratorId,
 			signal,
 			async (initial) => {
+				assertPrincipalStillCurrent();
 				if (initial.contextProjectId) {
 					const project = await loadProjectForAccess(initial.contextProjectId, principal, need);
 					canWrite &&= await hasProjectAccess(project, principal, "write");
@@ -229,10 +348,18 @@ export async function authorizeGitTargetForPrincipal(
 						!isDeviceAuthorized(device, {
 							userId: principal.userId,
 							projectId: initial.contextProjectId,
-						}) ||
-						!(await resolveOAuthDeviceRuntimeAuthorization(device)).allowed
+						})
 					)
 						throw denied();
+					const authorization = await resolveOAuthDeviceRuntimeAuthorization(device);
+					const level = authorization.policy?.deviceAccess.selfRegistered;
+					if (
+						!authorization.allowed ||
+						(authorization.oauthOwned && level !== "readOnly" && level !== "readWrite")
+					)
+						throw denied();
+					canWrite &&= !authorization.oauthOwned || level === "readWrite";
+					if (need === "write" && !canWrite) throw denied();
 				}
 				if (policy) {
 					if (id === "local" ? !policy.allowLocalExecution : !policy.deviceIds.includes(id))
@@ -295,6 +422,7 @@ export async function authorizeGitTargetForPrincipal(
 				if (need === "write" && !canWrite) throw denied();
 			},
 			cachedDiscovery && need === "read",
+			{ userId: principal.userId },
 		);
 	} else {
 		await assertChapterProjectAccess(source.chapterId, principal, need);
@@ -314,7 +442,18 @@ export async function authorizeGitTargetForPrincipal(
 	const root = workspace.rootPath;
 	const scan = new GitAccessScan(signal);
 	try {
-		for (const project of await relatedProjects(target, scan, principal)) {
+		const matchedProjects = await relatedProjects(target, scan, principal);
+		const relatedAuthority = captureRelatedProjectAuthority(
+			matchedProjects.map((project) => project.id),
+			principal,
+		);
+		const endpointFence = target.assertStillCurrent;
+		target.assertStillCurrent = () => {
+			assertPrincipalStillCurrent();
+			relatedAuthority.assertStillCurrent();
+			endpointFence?.();
+		};
+		for (const project of relatedAuthority.rows) {
 			if (!(await scan.run(() => hasProjectAccess(project, principal, "read")))) throw denied();
 			canWrite &&= await scan.run(() => hasProjectAccess(project, principal, "write"));
 		}
@@ -340,6 +479,8 @@ export async function authorizeGitTargetForPrincipal(
 		}
 		if (need === "write" && !canWrite) throw denied();
 		scan.check();
+		assertPrincipalStillCurrent();
+		target.assertStillCurrent?.();
 		workspace.capabilities = { read: true, write: canWrite };
 	} catch (error) {
 		if (!(error instanceof AppError) || error.statusCode !== 403) throw error;

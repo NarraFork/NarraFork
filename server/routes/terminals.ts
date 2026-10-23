@@ -73,6 +73,9 @@ terminalRoutes.post("/", async (c) => {
 		deviceId: parsed.data.deviceId,
 		expectedRevision: parsed.data.expectedRevision,
 		contextKey: parsed.data.contextKey,
+		expectedBindingRevision: parsed.data.expectedBindingRevision,
+		bindingId: parsed.data.bindingId,
+		signal: c.req.raw.signal,
 		principal,
 	});
 	return c.json(terminal, 201);
@@ -133,7 +136,7 @@ terminalRoutes.get("/:id/processes", async (c) => {
 terminalRoutes.patch("/:id", async (c) => {
 	const body = await c.req.json();
 	const id = c.req.param("id");
-	await terminalService.authorizeTargetAccess(id, await livePrincipal(c), "write");
+	const ticket = await terminalService.authorizeTargetAccess(id, await livePrincipal(c), "write");
 
 	// Name update
 	if (body?.name !== undefined) {
@@ -141,7 +144,7 @@ terminalRoutes.patch("/:id", async (c) => {
 		if (typeof name !== "string" || !name.trim()) {
 			throw new ValidationError("name must be a non-empty string");
 		}
-		await terminalService.rename(id, name.trim());
+		await terminalService.rename(id, name.trim(), () => ticket.assertStillCurrent?.());
 	}
 
 	// Graph-state updates used to be accepted here, for terminals shown as their own
@@ -153,7 +156,11 @@ terminalRoutes.patch("/:id", async (c) => {
 });
 
 terminalRoutes.delete("/:id", async (c) => {
-	await terminalService.authorizeTargetAccess(c.req.param("id"), await livePrincipal(c), "write");
-	await terminalService.kill(c.req.param("id"));
+	const ticket = await terminalService.authorizeTargetAccess(
+		c.req.param("id"),
+		await livePrincipal(c),
+		"write",
+	);
+	await terminalService.kill(c.req.param("id"), () => ticket.assertStillCurrent?.());
 	return c.json({ ok: true });
 });

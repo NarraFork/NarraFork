@@ -962,9 +962,70 @@ export const workspaceSwitchRequests = sqliteTable(
 	(table) => [
 		uniqueIndex("uq_workspace_switch_request").on(table.narratorId, table.requestId),
 		index("idx_workspace_switch_request_created").on(table.createdAt),
+		index("idx_workspace_switch_request_install").on(
+			table.narratorId,
+			table.installState,
+			table.expectedRevision,
+		),
 	],
 );
 
+/** One independently versioned working directory for each narrator/device pair. */
+export const narratorDeviceWorkspaces = sqliteTable(
+	"narrator_device_workspaces",
+	{
+		id: text("id").primaryKey(),
+		narratorId: text("narrator_id")
+			.notNull()
+			.references(() => narrators.id, { onDelete: "cascade" }),
+		/** Logical device id including "local"; deletion never remaps old source identities. */
+		deviceId: text("device_id").notNull(),
+		bindingRevision: integer("binding_revision").notNull(),
+		cwd: text("cwd").notNull(),
+		pathFlavor: text("path_flavor", { enum: ["posix", "windows"] }).notNull(),
+		workspaceContext: text("workspace_context", { mode: "json" })
+			.$type<import("@shared/workspace-context").WorkspaceContext>()
+			.notNull(),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [uniqueIndex("uq_narrator_device_workspace").on(table.narratorId, table.deviceId)],
+);
+
+/** Actor-bound receipts have a separate domain from legacy workspace switches. */
+export const narratorDeviceWorkspaceRequests = sqliteTable(
+	"narrator_device_workspace_requests",
+	{
+		id: text("id").primaryKey(),
+		narratorId: text("narrator_id")
+			.notNull()
+			.references(() => narrators.id, { onDelete: "cascade" }),
+		requestId: text("request_id").notNull(),
+		actorUserId: text("actor_user_id"),
+		kind: text("kind", { enum: ["set", "select"] }).notNull(),
+		deviceId: text("device_id").notNull(),
+		requestDigest: text("request_digest").notNull(),
+		expectedBindingRevision: integer("expected_binding_revision").notNull(),
+		expectedSelectionRevision: integer("expected_selection_revision"),
+		result: text("result_json", { mode: "json" })
+			.$type<import("@shared/workspace-context").NarratorDeviceWorkspaceMutationResult>()
+			.notNull(),
+		installState: text("install_state", { enum: ["pending", "installed", "superseded"] })
+			.notNull()
+			.default("pending"),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("uq_narrator_device_workspace_request").on(table.narratorId, table.requestId),
+		index("idx_narrator_device_workspace_request_created").on(table.createdAt),
+		index("idx_narrator_device_workspace_request_install").on(
+			table.narratorId,
+			table.installState,
+			table.expectedSelectionRevision,
+		),
+	],
+);
 // === narrator_grants ===
 /**
  * Explicit per-user share list for a narrator, the "shared with specific people"
@@ -4088,6 +4149,40 @@ export const fileChangeScopes = sqliteTable(
 		index("idx_fc_scope_root").on(table.sourceInstanceId, table.deviceId, table.canonicalRoot),
 		index("idx_fc_scope_status").on(table.status, table.updatedAt),
 		index("idx_fc_scope_active_lease").on(table.deviceId, table.activeLeaseId, table.canonicalRoot),
+	],
+);
+
+/** Small durable Bash/PTY lifetime ledger; never stores process output or file bytes. */
+export const workspaceWriteActivities = sqliteTable(
+	"workspace_write_activities",
+	{
+		id: text("id").primaryKey(),
+		scopeId: text("scope_id").notNull(),
+		sourceInstanceId: text("source_instance_id").notNull(),
+		workspaceInstanceId: text("workspace_instance_id").notNull(),
+		narratorId: text("narrator_id"),
+		userId: text("user_id").notNull(),
+		projectId: text("project_id"),
+		deviceId: text("device_id").notNull(),
+		bindingId: text("binding_id").notNull(),
+		bindingRevision: integer("binding_revision").notNull(),
+		contextKey: text("context_key").notNull(),
+		canonicalRoot: text("canonical_root").notNull(),
+		pathFlavor: text("path_flavor", { enum: ["posix", "windows"] }).notNull(),
+		rootEvidenceDigest: text("root_evidence_digest").notNull(),
+		ownerEpoch: text("owner_epoch").notNull(),
+		kind: text("kind", { enum: ["bash", "pty"] }).notNull(),
+		operationId: text("operation_id").notNull(),
+		attempt: integer("attempt").notNull(),
+		status: text("status", { enum: ["prepared", "running", "finished", "unknown"] }).notNull(),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+		finishedAt: text("finished_at"),
+	},
+	(table) => [
+		index("idx_workspace_activity_status_id").on(table.status, table.id),
+		index("idx_workspace_activity_scope_status").on(table.scopeId, table.status),
+		index("idx_workspace_activity_device_status").on(table.deviceId, table.status, table.id),
 	],
 );
 

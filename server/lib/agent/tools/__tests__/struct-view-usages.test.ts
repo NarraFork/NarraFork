@@ -38,6 +38,14 @@ function ctx(): ToolContext {
 	return {
 		narratorId: "test",
 		cwd: workDir,
+		workspaceContext: {
+			deviceId: "local",
+			cwd: workDir,
+			pathFlavor: "posix",
+			revision: 0,
+			contextKey: `test:${workDir}`,
+			capabilities: { switchDirectory: true },
+		},
 		signal: new AbortController().signal,
 		locale: "en",
 		requestPermission: async () => ({ behavior: "allow" }),

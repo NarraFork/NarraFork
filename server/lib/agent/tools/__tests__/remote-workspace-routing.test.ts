@@ -3,12 +3,22 @@ import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { WorkspaceContext } from "@shared/workspace-context";
+import { z } from "zod/v4";
 import {
 	createExecutionTargetContext,
 	executionTargetContextKey,
 } from "../../../../services/execution-policy/target-context";
 
+import { toolContinuationService } from "../../../../services/tool-continuation-service";
+import {
+	beginQuiescingTools,
+	failScheduledUpdate,
+	resetUpdateCoordinationForTests,
+	scheduleUpdate,
+	waitForUpdateCheckpointFence,
+} from "../../../../services/update-coordinator";
 import { generateId } from "../../../id";
+import { createWorkspaceFileAccess } from "../../../plan-file-path";
 import { settings } from "../../../settings";
 import type { ExecHandle, ExecutionBackend } from "../../execution/backend";
 import { withDeviceParam } from "../../execution/device-schema";
@@ -19,6 +29,10 @@ import type { AgentConfig, ToolContext, ToolExecutionTarget } from "../../types"
 
 // Routing tests isolate persistence; no migration files or live database are required.
 const query = { findFirst: async () => undefined, findMany: async () => [] };
+let terminalEndpoint:
+	| { id: string; deviceId: string; cwd?: string; workspaceContext?: WorkspaceContext }
+	| undefined;
+const terminalQuery = { ...query, findFirst: async () => terminalEndpoint };
 interface PersistenceBuilder {
 	from(): PersistenceBuilder;
 	where(): PersistenceBuilder;
@@ -47,7 +61,10 @@ const builder: PersistenceBuilder = {
 };
 mock.module("../../../../db", () => ({
 	db: {
-		query: new Proxy({}, { get: () => query }),
+		query: new Proxy(
+			{},
+			{ get: (_target, table) => (table === "terminals" ? terminalQuery : query) },
+		),
 		select: () => builder,
 		insert: () => builder,
 		update: () => builder,
@@ -83,7 +100,9 @@ mock.module("../../../../services/agent-runtime/publication", () => ({
 const { resolvePermissionDecision, resolveExitPlanModeInputWithBackend } = await import(
 	"../../../../services/narrator-permission"
 );
-const { executeTool, freezeToolExecutionTarget } = await import("../../tool-executor");
+const { executeTool, freezeToolExecution, freezeToolExecutionTarget } = await import(
+	"../../tool-executor"
+);
 const { toolRegistry } = await import("../../tool-registry");
 const { bashTool } = await import("../bash");
 const { editTool } = await import("../edit");
@@ -94,6 +113,7 @@ const { structSedTool } = await import("../struct-sed");
 const { structViewTool } = await import("../struct-view");
 const { switchDeviceTool } = await import("../switch-device");
 const { writeTool } = await import("../write");
+const { terminalTool } = await import("../terminal");
 
 const configuredDir = settings.paths.defaultProjectDir;
 let narratorId: string;
@@ -106,15 +126,18 @@ const trackedTools = [
 	bashTool,
 	structViewTool,
 	structSedTool,
+	terminalTool,
 ];
 const originalTools = new Map(trackedTools.map((tool) => [tool.name, toolRegistry.get(tool.name)]));
 
 beforeEach(() => {
 	narratorId = generateId();
+	terminalEndpoint = undefined;
 	for (const tool of trackedTools) toolRegistry.register(tool);
 });
 afterEach(() => {
 	settings.paths.defaultProjectDir = configuredDir;
+	resetUpdateCoordinationForTests();
 	setRemoteBackendResolver(null);
 	for (const tool of trackedTools) {
 		const original = originalTools.get(tool.name);
@@ -198,13 +221,44 @@ function context(backend: ExecutionBackend, windows = false): ToolContext {
 		resolveBackend: () => backend,
 	};
 }
-function config(backends: ExecutionBackend[], selected = workspace()): AgentConfig {
+function config(
+	backends: ExecutionBackend[],
+	selected = workspace(),
+	bindings = new Map([[selected.deviceId, selected]]),
+): AgentConfig {
 	setRemoteBackendResolver(
 		(deviceId) => backends.find((backend) => backend.deviceId === deviceId) ?? null,
 	);
+	const assertCurrent = (frozen: WorkspaceContext) => {
+		const current = bindings.get(frozen.deviceId);
+		if (
+			!current ||
+			current.cwd !== frozen.cwd ||
+			current.contextKey !== frozen.contextKey ||
+			JSON.stringify(current.binding) !== JSON.stringify(frozen.binding)
+		)
+			throw new Error("WORKSPACE_BINDING_STALE: original device binding changed");
+	};
 	return {
 		narratorId,
 		conversationId: "routing-test",
+		resolveDeviceWorkspace: async (id) => bindings.get(id) ?? null,
+		assertEndpointAuthorized: async (target) => {
+			const admitted =
+				target.deviceId === "local"
+					? localBackend
+					: backends.find((item) => item.deviceId === target.deviceId);
+			if (!admitted) throw new Error("Fixture device is unauthorized");
+			const generation = admitted.runtimeGeneration;
+			return {
+				assertStillCurrent() {
+					if (admitted.runtimeGeneration !== generation)
+						throw new Error("Fixture device generation changed");
+				},
+			};
+		},
+		assertDeviceWorkspaceCurrent: async (frozen) => assertCurrent(frozen),
+		assertDeviceWorkspaceCurrentSync: assertCurrent,
 		provider: "codex",
 		model: "test",
 		cwd: "/host/decoy",
@@ -289,21 +343,24 @@ for (const windows of [false, true]) {
 	});
 }
 
-test("cross device overrides use their own base and explicit local is pure instance default", async () => {
+test("cross device overrides cannot borrow global or host directory defaults", async () => {
 	const selected = remote() as unknown as ExecutionBackend;
-	const other = remote("other") as unknown as ExecutionBackend;
+	const fakeOther = remote("other");
+	const other = fakeOther as unknown as ExecutionBackend;
 	const cfg = config([selected, other]);
-	expect(
-		(await freeze("Read", { device: "other", file_path: "notes.txt" }, cfg))?.resolvedFilePath,
-	).toBe("/other/default/notes.txt");
+	for (const device of ["other", "local"])
+		await expect(freeze("Read", { device, file_path: "notes.txt" }, cfg)).rejects.toThrow(
+			"WORKSPACE_DIRECTORY_NOT_CONFIGURED",
+		);
+	expect(fakeOther.resolvePathIdentity).not.toHaveBeenCalled();
+	expect(fakeOther.readFileBytes).not.toHaveBeenCalled();
 	const path = join(homedir(), `not-created-${generateId()}`);
 	settings.paths.defaultProjectDir = path;
-	expect(
-		(await freeze("Read", { device: "local", file_path: "notes.txt" }, cfg))?.resolvedFilePath,
-	).toBe(join(path, "notes.txt"));
 	expect(localToolBaseCwd()).toBe(path);
 	expect(existsSync(path)).toBe(false);
-	expect(toolBaseCwd(other, "/host/decoy", workspace())).toBe("/other/default");
+	expect(() => toolBaseCwd(other, "/host/decoy", workspace())).toThrow(
+		"WORKSPACE_DIRECTORY_NOT_CONFIGURED",
+	);
 });
 
 test("missing remote default rejects relative paths but permits an explicit absolute workdir", async () => {
@@ -311,7 +368,7 @@ test("missing remote default rejects relative paths but permits an explicit abso
 	const backend = { ...fake, defaultCwd: null } as unknown as ExecutionBackend;
 	const cfg = config([backend]);
 	await expect(freeze("Read", { device: "other", file_path: "notes.txt" }, cfg)).rejects.toThrow(
-		"absolute default",
+		"WORKSPACE_DIRECTORY_NOT_CONFIGURED",
 	);
 	const target = await freeze(
 		"Bash",
@@ -481,15 +538,56 @@ test("same device SwitchDevice preserves chosen cwd without a transition", async
 
 test("cross-device Windows workdir uses the override grammar, not the POSIX workspace", async () => {
 	const backend = remote("windows-device", true) as unknown as ExecutionBackend;
-	const cfg = config([backend]);
+	const selected = workspace();
+	const cfg = config(
+		[backend],
+		selected,
+		new Map([
+			[selected.deviceId, selected],
+			["windows-device", workspace("windows-device", true)],
+		]),
+	);
 	const target = await freeze(
 		"Bash",
 		{ device: "windows-device", command: "whoami", workdir: "src" },
 		cfg,
 	);
-	expect(target?.cwd).toBe("C:\\default\\src");
-	expect(target?.baseCwd).toBe("C:\\default");
+	expect(target?.cwd).toBe("D:\\chosen\\repo\\src");
+	expect(target?.baseCwd).toBe("D:\\chosen\\repo");
 });
+
+for (const bound of [false, true]) {
+	test(`live registry replacement rejects the old backend object before Read dispatch (${bound ? "bound" : "temporary"})`, async () => {
+		const old = remote("A");
+		const replacement = remote("A");
+		replacement.runtimeGeneration = 4;
+		const original = boundWorkspace("A", "/n1/a");
+		const cfg = config(
+			[old as unknown as ExecutionBackend],
+			original,
+			bound ? new Map([["A", original]]) : new Map(),
+		);
+		cfg.permissionHandler = async () => {
+			setRemoteBackendResolver((id) =>
+				id === "A" ? (replacement as unknown as ExecutionBackend) : null,
+			);
+			return { behavior: "allow" };
+		};
+		const result = await executeTool(
+			{
+				name: "Read",
+				toolUseId: generateId(),
+				input: { device: "A", file_path: bound ? "notes.txt" : "/temporary/notes.txt" },
+			},
+			cfg,
+		);
+		expect(result.isError).toBe(true);
+		expect(result.output).toContain("runtime generation");
+		expect(old.runtimeGeneration).toBe(3);
+		expect(old.readFileBytes).not.toHaveBeenCalled();
+		expect(replacement.readFileBytes).not.toHaveBeenCalled();
+	});
+}
 
 test("connection drift while freezing fails before permission", async () => {
 	const fake = remote();
@@ -563,7 +661,15 @@ test("plan file binding reads its original directory and rejects a different adm
 test("cross-device permission redirects retain their admitted base when device defaults change", async () => {
 	const fake = remote("other");
 	const backend = fake as unknown as ExecutionBackend;
-	const cfg = config([backend]);
+	const selected = workspace();
+	const cfg = config(
+		[backend],
+		selected,
+		new Map([
+			[selected.deviceId, selected],
+			["other", { ...workspace("other"), cwd: "/other/session" }],
+		]),
+	);
 	const targets: ToolExecutionTarget[] = [];
 	cfg.onExecutionTargetResolved = async (_id, target) => {
 		targets.push(target);
@@ -579,8 +685,8 @@ test("cross-device permission redirects retain their admitted base when device d
 	);
 	expect(result.isError).toBe(true);
 	expect(targets.map((target) => target.resolvedFilePath)).toEqual([
-		"/other/default/draft.txt",
-		"/other/default/final.txt",
+		"/other/session/draft.txt",
+		"/other/session/final.txt",
 	]);
 	expect(fake.readFileBytes).not.toHaveBeenCalled();
 });
@@ -588,4 +694,410 @@ test("cross-device permission redirects retain their admitted base when device d
 test("a changed backend path grammar never reinterprets the selected workspace", () => {
 	const backend = remote() as unknown as ExecutionBackend;
 	expect(() => toolBaseCwd(backend, "/decoy", workspace("selected", true))).toThrow("path grammar");
+});
+
+function boundWorkspace(
+	deviceId: string,
+	cwd: string,
+	owner = narratorId,
+	version = 1,
+): WorkspaceContext {
+	return {
+		...workspace(deviceId),
+		cwd,
+		contextKey: `${owner}:${deviceId}:${version}`,
+		binding: {
+			version: 1,
+			bindingId: `${owner}-${deviceId}`,
+			narratorId: owner,
+			deviceId,
+			bindingRevision: version,
+			bindingKey: `${owner}:${deviceId}:${version}`,
+		},
+	};
+}
+
+describe("independent narrator/device execution bindings", () => {
+	test("real Read and Bash use N1/A, N1/B and N2/A independently; metadata names the actual endpoint", async () => {
+		const a = remote("A");
+		const b = remote("B");
+		const backends = [a, b] as unknown as ExecutionBackend[];
+		const n1a = boundWorkspace("A", "/n1/a");
+		const n1b = boundWorkspace("B", "/n1/b");
+		const n1 = config(
+			backends,
+			n1a,
+			new Map([
+				["A", n1a],
+				["B", n1b],
+			]),
+		);
+		const n2a = boundWorkspace("A", "/n2/a", "N2");
+		const n2 = { ...config(backends, n2a), narratorId: "N2" };
+		for (const [cfg, device, expected] of [
+			[n1, "A", n1a],
+			[n1, "B", n1b],
+			[n2, "A", n2a],
+		] as const) {
+			cfg.permissionHandler = async () => ({ behavior: "allow" });
+			for (const name of ["Read", "Bash"]) {
+				const result = await executeTool(
+					{
+						name,
+						toolUseId: generateId(),
+						input:
+							name === "Read" ? { device, file_path: "notes.txt" } : { device, command: "pwd" },
+					},
+					cfg,
+				);
+				expect(result.isError, result.output).not.toBe(true);
+				expect(result.metadata?.executionWorkspace).toEqual(expected);
+				expect(result.metadata?.executionTarget).toMatchObject({
+					deviceId: device,
+					cwd: expected.cwd,
+					workspaceBinding: expected.binding,
+				});
+			}
+		}
+		expect(a.readFileBytes.mock.calls.map(([path]) => path)).toEqual([
+			"/n1/a/notes.txt",
+			"/n2/a/notes.txt",
+		]);
+		expect(b.readFileBytes.mock.calls[0][0]).toBe("/n1/b/notes.txt");
+		expect(a.execCommand.mock.calls.map(([input]) => input.cwd)).toEqual(["/n1/a", "/n2/a"]);
+		expect(b.execCommand.mock.calls[0][0].cwd).toBe("/n1/b");
+	});
+
+	test("non-default resource scopes do not inherit the selected device's skill, git, worktree or file-access origins", async () => {
+		const a = remote("A");
+		const b = remote("B");
+		const first = boundWorkspace("A", "/n1/a");
+		const second = {
+			...boundWorkspace("B", "/n1/b"),
+			git: { rootPath: "/n1/b/git", repositoryKey: "repo-b", workspaceKey: "git-b" },
+		};
+		const cfg = config(
+			[a, b] as unknown as ExecutionBackend[],
+			first,
+			new Map([
+				["A", first],
+				["B", second],
+			]),
+		);
+		cfg.permissionHandler = async () => ({ behavior: "allow" });
+		cfg.skillRoot = "/n1/a/git";
+		cfg.projectGitPath = "/n1/a/git";
+		cfg.worktreePath = "/n1/a/worktree";
+		cfg.skillScopeKey = "selected-A-scope";
+		cfg.workspaceFileAccess = createWorkspaceFileAccess({
+			backend: a as unknown as ExecutionBackend,
+			workspaceContext: first,
+			signal: cfg.signal,
+			authorizeRead: async () => false,
+		});
+		const name = "__ResourceBindingOrigin";
+		toolRegistry.register({
+			name,
+			description: "Resource scope source check",
+			parameters: z.object({}),
+			executionRouting: {
+				kind: "single",
+				resolve: () => ({ key: "primary", operation: "control", deviceId: "B", path: "." }),
+			},
+			async execute(_input, ctx) {
+				return {
+					output: "scope",
+					metadata: {
+						sourceSkillRoot: ctx.skillRoot,
+						sourceGitPath: ctx.projectGitPath,
+						sourceWorktree: ctx.worktreePath,
+						sourceScopeKey: ctx.skillScopeKey,
+						sourceAccess: ctx.workspaceFileAccess?.workspaceContext,
+					},
+				};
+			},
+		});
+		try {
+			const result = await executeTool({ name, input: {}, toolUseId: generateId() }, cfg);
+			expect(result.isError, result.output).not.toBe(true);
+			expect(result.metadata).toMatchObject({
+				sourceSkillRoot: "/n1/b/git",
+				sourceGitPath: "/n1/b/git",
+				sourceScopeKey: second.binding?.bindingKey,
+				executionWorkspace: second,
+			});
+			expect(result.metadata?.sourceWorktree).toBeUndefined();
+			expect(result.metadata?.sourceAccess).toBeUndefined();
+		} finally {
+			toolRegistry.unregister(name);
+		}
+	});
+
+	test("each endpoint of a multi-device plan retains its own binding, including a persisted retry", async () => {
+		const a = remote("A");
+		const b = remote("B");
+		const first = boundWorkspace("A", "/n1/a");
+		const second = boundWorkspace("B", "/n1/b");
+		const bindings = new Map([
+			["A", first],
+			["B", second],
+		]);
+		const cfg = config([a, b] as unknown as ExecutionBackend[], first, bindings);
+		cfg.permissionHandler = async () => ({ behavior: "allow" });
+		const name = "__MultiBindingRead";
+		toolRegistry.register({
+			name,
+			description: "Two real approved Read endpoints",
+			parameters: z.object({}),
+			executionRouting: {
+				kind: "multi",
+				resolve: () => ({
+					primaryKey: "A",
+					endpoints: [
+						{ key: "A", operation: "read", deviceId: "A", path: "notes.txt" },
+						{ key: "B", operation: "read", deviceId: "B", path: "notes.txt" },
+					],
+				}),
+			},
+			async execute(_input, ctx) {
+				const outputs: string[] = [];
+				for (const endpoint of ctx.executionPlan?.endpoints ?? []) {
+					const backend = ctx.resolveBackend?.(endpoint.target.deviceId);
+					if (!backend) throw new Error("Fixture endpoint backend missing");
+					const result = await readTool.execute(
+						{ file_path: endpoint.target.lexicalPath },
+						{
+							...ctx,
+							cwd: endpoint.target.cwd,
+							executionTarget: endpoint.target,
+							workspaceContext: endpoint.target.workspaceContext,
+							resolveBackend: () => backend,
+						},
+					);
+					outputs.push(result.output);
+				}
+				return { output: outputs.join("\n") };
+			},
+		});
+		try {
+			const use = { name, input: {}, toolUseId: generateId() };
+			const frozen = await freezeToolExecution(use, cfg);
+			if (!frozen) throw new Error("Expected frozen plan");
+			expect(frozen.plan.endpoints.map((endpoint) => endpoint.target.workspaceBinding)).toEqual([
+				first.binding,
+				second.binding,
+			]);
+			const result = await executeTool(use, cfg, {
+				preFrozenTarget: frozen.target,
+				preFrozenPlan: frozen.plan,
+			});
+			expect(result.isError, result.output).not.toBe(true);
+			expect(result.metadata?.executionWorkspace).toEqual(first);
+			expect(a.readFileBytes.mock.calls[0][0]).toBe("/n1/a/notes.txt");
+			expect(b.readFileBytes.mock.calls[0][0]).toBe("/n1/b/notes.txt");
+			a.readFileBytes.mockClear();
+			b.readFileBytes.mockClear();
+			bindings.set("B", boundWorkspace("B", "/n1/b", narratorId, 2));
+			const retried = await executeTool(use, cfg, {
+				preFrozenTarget: frozen.target,
+				preFrozenPlan: frozen.plan,
+				preGrantedPermission: { behavior: "allow" },
+			});
+			expect(retried.isError).toBe(true);
+			expect(retried.output).toContain("WORKSPACE_BINDING_STALE");
+			expect(a.readFileBytes).not.toHaveBeenCalled();
+			expect(b.readFileBytes).not.toHaveBeenCalled();
+			expect(frozen.plan.endpoints[1].target.workspaceBinding?.bindingRevision).toBe(1);
+		} finally {
+			toolRegistry.unregister(name);
+		}
+	});
+
+	test("unbound relative Read/Bash perform zero RPC; explicit workdir/path is one-shot only", async () => {
+		const fake = remote("B");
+		const selected = boundWorkspace("A", "/n1/a");
+		const bindings = new Map([["A", selected]]);
+		const cfg = config([fake as unknown as ExecutionBackend], selected, bindings);
+		const permission = mock(async () => ({ behavior: "allow" as const }));
+		cfg.permissionHandler = permission;
+		for (const [name, input] of [
+			["Read", { device: "B", file_path: "notes.txt" }],
+			["Bash", { device: "B", command: "pwd" }],
+		] as const) {
+			const result = await executeTool({ name, input, toolUseId: generateId() }, cfg);
+			expect(result.isError).toBe(true);
+			expect(result.output).toContain("WORKSPACE_DIRECTORY_NOT_CONFIGURED");
+		}
+		expect(permission).not.toHaveBeenCalled();
+		expect(fake.resolvePathIdentity).not.toHaveBeenCalled();
+		expect(fake.execCommand).not.toHaveBeenCalled();
+		expect(fake.readFileBytes).not.toHaveBeenCalled();
+		for (const [name, input] of [
+			["Read", { device: "B", file_path: "/once/notes.txt" }],
+			["Bash", { device: "B", command: "pwd", workdir: "/once" }],
+		] as const) {
+			const result = await executeTool({ name, input, toolUseId: generateId() }, cfg);
+			expect(result.isError, result.output).not.toBe(true);
+			expect(result.metadata?.executionWorkspace).toBeUndefined();
+		}
+		expect(bindings.size).toBe(1);
+		expect(bindings.has("B")).toBe(false);
+		expect(fake.execCommand.mock.calls[0][0].cwd).toBe("/once");
+	});
+
+	for (const stage of ["permission", "final-ticket"] as const) {
+		test(`same-cwd binding version changes at ${stage} reject before real Read IO`, async () => {
+			const fake = remote("A");
+			const original = boundWorkspace("A", "/n1/a");
+			const bindings = new Map([["A", original]]);
+			const cfg = config([fake as unknown as ExecutionBackend], original, bindings);
+			const change = () => bindings.set("A", boundWorkspace("A", "/n1/a", narratorId, 2));
+			cfg.permissionHandler = async () => {
+				if (stage === "permission") change();
+				return { behavior: "allow" };
+			};
+			if (stage === "final-ticket")
+				cfg.onToolExecutionFinalAuthorization = async () => {
+					change();
+					return { assertStillCurrent() {} };
+				};
+			const result = await executeTool(
+				{ name: "Read", input: { file_path: "notes.txt" }, toolUseId: generateId() },
+				cfg,
+			);
+			expect(result.isError).toBe(true);
+			expect(result.output).toContain("WORKSPACE_BINDING_STALE");
+			expect(fake.readFileBytes).not.toHaveBeenCalled();
+			expect(result.metadata?.executionWorkspace).toEqual(original);
+		});
+	}
+
+	test("update-queued approved Read keeps its original binding and rejects a later same-cwd version", async () => {
+		const fake = remote("A");
+		const original = boundWorkspace("A", "/n1/a");
+		const bindings = new Map([["A", original]]);
+		const cfg = config([fake as unknown as ExecutionBackend], original, bindings);
+		const pending = Promise.withResolvers<void>();
+		const approve = Promise.withResolvers<void>();
+		const deferred = Promise.withResolvers<void>();
+		const originalUpsert = toolContinuationService.upsert;
+		toolContinuationService.upsert = mock(async (input) => {
+			if (input.state === "paused") deferred.resolve();
+			return input as never;
+		}) as typeof toolContinuationService.upsert;
+		try {
+			cfg.permissionHandler = async (_name, _input, _id, options) => {
+				options?.onAwaitingUserDecision?.();
+				pending.resolve();
+				await approve.promise;
+				return { behavior: "allow" };
+			};
+			cfg.onToolExecutionStarting = async (_id, binding) => binding;
+			const execution = executeTool(
+				{ name: "Read", toolUseId: generateId(), input: { file_path: "notes.txt" } },
+				cfg,
+				{ toolCallBinding: { toolCallId: "queued-binding-receipt", attempt: 1 } },
+			);
+			await pending.promise;
+			scheduleUpdate("binding-test");
+			beginQuiescingTools();
+			await waitForUpdateCheckpointFence();
+			approve.resolve();
+			await deferred.promise;
+			bindings.set("A", boundWorkspace("A", "/n1/a", narratorId, 2));
+			expect(fake.readFileBytes).not.toHaveBeenCalled();
+			failScheduledUpdate("binding-test reopen");
+			const result = await execution;
+			expect(result.isError).toBe(true);
+			expect(result.output).toContain("WORKSPACE_BINDING_STALE");
+			expect(fake.readFileBytes).not.toHaveBeenCalled();
+			expect(result.metadata?.executionWorkspace).toEqual(original);
+		} finally {
+			toolContinuationService.upsert = originalUpsert;
+			resetUpdateCoordinationForTests();
+		}
+	});
+
+	test("Terminal explicitly refuses another device rather than borrowing the selected binding", async () => {
+		const a = remote("A");
+		const b = remote("B");
+		const cfg = config([a, b] as unknown as ExecutionBackend[], boundWorkspace("A", "/n1/a"));
+		cfg.permissionHandler = async () => ({ behavior: "allow" });
+		terminalEndpoint = { id: "terminal-B", deviceId: "B" };
+		for (const action of ["read", "write", "rename"] as const) {
+			const result = await executeTool(
+				{
+					name: "Terminal",
+					toolUseId: generateId(),
+					input: { action, terminal_id: "terminal-B", input: "pwd", name: "renamed" },
+				},
+				cfg,
+			);
+			expect(result.isError).toBe(true);
+			expect(result.output).toContain("WORKSPACE_TERMINAL_BINDING_UNSUPPORTED");
+		}
+		terminalEndpoint = {
+			id: "terminal-A-old",
+			deviceId: "A",
+			cwd: "/n1/a",
+			workspaceContext: boundWorkspace("A", "/n1/a", narratorId, 0),
+		};
+		const oldSameDevice = await executeTool(
+			{
+				name: "Terminal",
+				toolUseId: generateId(),
+				input: { action: "read", terminal_id: "terminal-A-old" },
+			},
+			cfg,
+		);
+		expect(oldSameDevice.isError).toBe(true);
+		expect(oldSameDevice.output).toContain("WORKSPACE_TERMINAL_BINDING_UNSUPPORTED");
+		expect(b.execCommand).not.toHaveBeenCalled();
+	});
+
+	test("denied retry retains the exact original binding instead of refreshing its device map", async () => {
+		const fake = remote("A");
+		const original = boundWorkspace("A", "/n1/a");
+		const bindings = new Map([["A", original]]);
+		const cfg = config([fake as unknown as ExecutionBackend], original, bindings);
+		const use = { name: "Read", input: { file_path: "notes.txt" }, toolUseId: generateId() };
+		const target = await freezeToolExecutionTarget(use, cfg);
+		bindings.set("A", boundWorkspace("A", "/replacement", narratorId, 2));
+		const result = await executeTool(use, cfg, {
+			preFrozenTarget: target,
+			preGrantedPermission: { behavior: "allow" },
+		});
+		expect(result.isError).toBe(true);
+		expect(result.output).toContain("WORKSPACE_BINDING_STALE");
+		expect(fake.readFileBytes).not.toHaveBeenCalled();
+	});
+
+	test("late real Read completion retains the admitted workspace after its binding changes", async () => {
+		const fake = remote("A");
+		const original = boundWorkspace("A", "/n1/a");
+		const bindings = new Map([["A", original]]);
+		const cfg = config([fake as unknown as ExecutionBackend], original, bindings);
+		cfg.permissionHandler = async () => ({ behavior: "allow" });
+		const reading = Promise.withResolvers<void>();
+		const finish = Promise.withResolvers<void>();
+		fake.readFileBytes.mockImplementation(async () => {
+			reading.resolve();
+			await finish.promise;
+			return { bytes: Buffer.from("old source\n"), truncated: false, totalSize: 11 };
+		});
+		const execution = executeTool(
+			{ name: "Read", input: { file_path: "notes.txt" }, toolUseId: generateId() },
+			cfg,
+		);
+		await reading.promise;
+		bindings.set("A", boundWorkspace("A", "/replacement", narratorId, 2));
+		finish.resolve();
+		const result = await execution;
+		expect(result.metadata?.executionWorkspace).toEqual(original);
+		expect(result.metadata?.executionTarget).toMatchObject({
+			cwd: "/n1/a",
+			workspaceBinding: original.binding,
+		});
+		expect(fake.readFileBytes.mock.calls[0][0]).toBe("/n1/a/notes.txt");
+	});
 });

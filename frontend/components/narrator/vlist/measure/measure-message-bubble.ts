@@ -159,6 +159,13 @@ export interface MeasureUserAttachment {
 	 * always TEXT_FILE_HEIGHT, this only lets the render layer make it clickable.
 	 */
 	filePath?: string | null;
+	deviceId?: string | null;
+	contextKey?: string | null;
+	attachmentId?: string | null;
+	sourceNarratorId?: string | null;
+	attachmentOrigin?: unknown;
+	attachmentWorkspace?: unknown;
+	attachmentUnavailableReason?: string | null;
 	/**
 	 * Authenticated API path serving this attachment's bytes (e.g. a chat
 	 * attachment's `/chat/attachments/:id`). HEIGHT-NEUTRAL passthrough: the box
@@ -368,6 +375,13 @@ function attachmentBlock(
 			// Render-only (see MeasureUserAttachment.filePath / .fetchUrl): neither
 			// touches height — the box comes from the persisted dimensions above.
 			filePath: attachment.filePath ?? null,
+			deviceId: attachment.deviceId ?? null,
+			contextKey: attachment.contextKey ?? null,
+			attachmentId: attachment.attachmentId ?? null,
+			sourceNarratorId: attachment.sourceNarratorId ?? null,
+			attachmentOrigin: attachment.attachmentOrigin ?? null,
+			attachmentWorkspace: attachment.attachmentWorkspace ?? null,
+			attachmentUnavailableReason: attachment.attachmentUnavailableReason ?? null,
 			fetchUrl: attachment.fetchUrl ?? null,
 			...(natural && fit
 				? {

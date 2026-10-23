@@ -12,6 +12,7 @@ const workspace: WorkspaceContext = {
 	revision: 5,
 	contextKey: "selected-5",
 	capabilities: { switchDirectory: true },
+	contextProjectId: "project",
 };
 const identity = mock(async (path: string) => ({
 	lexicalPath: path,
@@ -39,6 +40,7 @@ const accessFactory = mock(
 	) =>
 		({
 			backend,
+			artifactOrigin: { version: 1, projectId: "project" },
 			workspaceContext: binding,
 			signal: options.signal,
 			authorizeWrite: writes,
@@ -57,6 +59,7 @@ mock.module("../workspace-context-service", () => ({
 	workspaceContextService: { get: committedContext },
 }));
 mock.module("../workspace-artifact-access", () => ({
+	assertNarratorWorkspaceArtifactCreationAdmission: async () => {},
 	createNarratorWorkspaceAttachmentAccess: accessFactory,
 	createNarratorWorkspaceAttachmentSourceAccess: sourceFactory,
 }));
@@ -139,6 +142,7 @@ describe("production text attachment paths", () => {
 				attachmentId: "123456789012345678901",
 				sourceNarratorId: "narrator",
 				attachmentWorkspace: workspace,
+				attachmentOrigin: { version: 1, projectId: "project" },
 			});
 			expect(committedContext).not.toHaveBeenCalled();
 		});
@@ -174,6 +178,15 @@ describe("production text attachment paths", () => {
 		expect(feed).toContain("textPersistenceStarted");
 		expect(edit).toContain("textCopyOnWriteStarted");
 	});
+	test("actor and explicit endpoint are fixed before the first admission await", async () => {
+		const options = { userId: "original-actor", workspaceContext: structuredClone(workspace) };
+		const pending = prepareNarratorTextAttachmentAccess("narrator", options);
+		options.userId = "later-actor";
+		options.workspaceContext.cwd = "/different";
+		const access = await pending;
+		expect(accessFactory.mock.calls[0][2].userId).toBe("original-actor");
+		expect(access.workspaceContext.cwd).toBe("/selected/repo");
+	});
 	test("missing active context gets committed workspace rather than host cwd", async () => {
 		const access = await prepareNarratorTextAttachmentAccess("narrator", { userId: "user" });
 		expect(access.workspaceContext.cwd).toBe("/selected/repo");
@@ -200,6 +213,22 @@ describe("production text attachment paths", () => {
 		expect(sourceFactory).not.toHaveBeenCalled();
 		expect(identity).not.toHaveBeenCalled();
 		expect(buildNarratorTextAttachmentHint([retained.ref])).not.toContain("Use the Read tool");
+	});
+	test("legacy local source inside current root is unavailable rather than assigned invented provenance", async () => {
+		const localWorkspace = { ...workspace, deviceId: "local" };
+		const target = {
+			backend: { ...backend, deviceId: "local", kind: "local" as const },
+			workspaceContext: localWorkspace,
+			authorizeWrite: writes,
+		};
+		const retained = await prepareRetainedNarratorTextFile(
+			{ filename: "legacy.txt", filePath: "/selected/repo/legacy.txt", size: 6 },
+			target,
+			{ narratorId: "narrator", sourceNarratorId: "parent", userId: "user" },
+		);
+		expect(retained.ref.attachmentUnavailableReason).toContain("unknown");
+		expect(sourceFactory).not.toHaveBeenCalled();
+		expect(identity).not.toHaveBeenCalled();
 	});
 	test("known origin passes the original binding and source narrator, not an inferred root", async () => {
 		const original = { ...workspace, cwd: "/original/repo", contextKey: "original-2", revision: 2 };

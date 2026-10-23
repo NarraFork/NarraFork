@@ -23,6 +23,7 @@ let writes: string[] = [];
 let scenario: "switch-write" | "background-switch" | "device-switch" | "write" | "late-old" =
 	"switch-write";
 let backgroundResult: (() => { cwd: string; targetCwd: string | undefined }) | undefined;
+let backgroundWorkspace: (() => WorkspaceContext | undefined) | undefined;
 const provider: ProviderAdapter = {
 	formatTools: (tools) => tools,
 	buildHistory: async () => ({ history: [], trailingToolResults: [] }),
@@ -110,6 +111,7 @@ toolRegistry.register({
 	executionRouting: { kind: "single", resolve: () => ({ key: "primary", operation: "execute" }) },
 	async execute(_input, ctx) {
 		backgroundResult = () => ({ cwd: ctx.cwd, targetCwd: ctx.executionTarget?.cwd });
+		backgroundWorkspace = () => ctx.workspaceContext;
 		return { output: "background started" };
 	},
 });
@@ -142,6 +144,7 @@ beforeEach(() => {
 	streaming = false;
 	writes = [];
 	backgroundResult = undefined;
+	backgroundWorkspace = undefined;
 	scenario = "switch-write";
 });
 function config(context: WorkspaceContext): AgentConfig {
@@ -285,6 +288,35 @@ describe("workspace switch pass barrier", () => {
 		expect(oldLink?.cwd).toBe("/old");
 		expect(getAgentFileReferenceContext(oldPass)?.cwd).toBe("/old");
 	});
+	test("started background closures retain their exact device binding after a new directory binding is installed", async () => {
+		const bound: WorkspaceContext = {
+			...initial,
+			binding: {
+				version: 1,
+				bindingId: "old-local",
+				narratorId: "workspace-test",
+				deviceId: "local",
+				bindingRevision: 3,
+				bindingKey: "workspace-test-local-3",
+			},
+		};
+		current = bound;
+		const conf = config(bound);
+		conf.resolveDeviceWorkspace = async (deviceId) => (deviceId === "local" ? bound : null);
+		conf.assertDeviceWorkspaceCurrent = async (frozen) => {
+			if (current.contextKey !== frozen.contextKey) throw new Error("binding changed");
+		};
+		conf.assertDeviceWorkspaceCurrentSync = (frozen) => {
+			if (current.contextKey !== frozen.contextKey) throw new Error("binding changed");
+		};
+		scenario = "background-switch";
+		await run(conf);
+		expect(current.cwd).toBe("/new");
+		expect(backgroundWorkspace?.()).toEqual(bound);
+		expect(backgroundWorkspace?.()?.binding?.bindingRevision).toBe(3);
+		expect(backgroundResult?.()).toEqual({ cwd: "/old", targetCwd: "/old" });
+	});
+
 	test("a stale deferred pass is rejected at real executor admission", async () => {
 		const oldPass = config(initial);
 		current = { ...initial, revision: 1, cwd: "/new", contextKey: "new" };

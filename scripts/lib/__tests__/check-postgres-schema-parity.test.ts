@@ -404,14 +404,14 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 120 tables and 1740 columns including immutable capture origins", () => {
-		expect(target.tables.length).toBe(120);
-		// 1737 SQLite-derived columns plus the three PG-only insert_seq identity columns.
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1740);
-		expect(source.tableCount).toBe(120);
-		expect(source.columnCount).toBe(1740);
+	test("covers 122 tables and 1762 columns including device bindings and immutable capture origins", () => {
+		expect(target.tables.length).toBe(122);
+		// 1759 SQLite-derived columns plus the three PG-only insert_seq identity columns.
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1762);
+		expect(source.tableCount).toBe(122);
+		expect(source.columnCount).toBe(1762);
 		for (const coverage of [source, target]) {
-			expect(coverage.tables.reduce((count, table) => count + table.indexes.length, 0)).toBe(433);
+			expect(coverage.tables.reduce((count, table) => count + table.indexes.length, 0)).toBe(438);
 			expect(
 				coverage.tables.reduce(
 					(count, table) =>
@@ -420,7 +420,7 @@ describe("real schema parity", () => {
 						table.columns.filter((column) => column.references).length,
 					0,
 				),
-			).toBe(229);
+			).toBe(231);
 		}
 		for (const name of ["narrators", "api_requests"]) {
 			expect(
@@ -440,6 +440,26 @@ describe("real schema parity", () => {
 		const expectedColumns: Record<string, string[]> = {
 			narrators: ["workspaceRevision", "workspaceContext", "planFileBinding", "lastStopReason"],
 			terminals: ["workspaceRevision", "workspaceContext"],
+			narrator_device_workspaces: [
+				"narratorId",
+				"deviceId",
+				"bindingRevision",
+				"cwd",
+				"pathFlavor",
+				"workspaceContext",
+			],
+			narrator_device_workspace_requests: [
+				"narratorId",
+				"requestId",
+				"actorUserId",
+				"kind",
+				"deviceId",
+				"requestDigest",
+				"expectedBindingRevision",
+				"expectedSelectionRevision",
+				"result",
+				"installState",
+			],
 			knowledge_pack_activations: ["targetBindingJson"],
 			workspace_switch_requests: [
 				"requestId",

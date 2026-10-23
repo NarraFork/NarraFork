@@ -237,6 +237,33 @@ export const terminalTool: ToolDefinition = {
 			wait_for?: string;
 		};
 
+		// S4 creation can consume a pair binding, but original-ID endpoint compilation
+		// remains deferred. Never borrow the current ToolContext for another old binding.
+		if (terminal_id && action !== "list" && action !== "create" && ctx.workspaceContext) {
+			const resolved = await resolveTerminalId(terminal_id, ctx.narratorId, ctx.chapterId);
+			if ("error" in resolved) return { output: resolved.error, isError: true };
+			const original = await db.query.terminals.findFirst({
+				where: eq(terminals.id, resolved.id),
+				columns: { deviceId: true, cwd: true, workspaceContext: true },
+			});
+			if (
+				original &&
+				((original.deviceId ?? "local") !== ctx.workspaceContext.deviceId ||
+					!original.cwd ||
+					original.cwd !== ctx.workspaceContext.cwd ||
+					(original.workspaceContext?.binding &&
+						JSON.stringify(original.workspaceContext.binding) !==
+							JSON.stringify(ctx.workspaceContext.binding)) ||
+					(original.workspaceContext &&
+						!original.workspaceContext.binding &&
+						original.workspaceContext.contextKey !== ctx.workspaceContext.contextKey))
+			)
+				return {
+					output:
+						"WORKSPACE_TERMINAL_BINDING_UNSUPPORTED: Terminal tools cannot access a non-selected device/workspace binding; use Bash on that device instead.",
+					isError: true,
+				};
+		}
 		switch (action) {
 			case "list":
 				return await listTerminals(ctx.narratorId);
@@ -377,11 +404,17 @@ async function createTerminal(ctx: ToolContext, name?: string): Promise<ToolResu
 		const { narratorWorktreePrincipalForTool } = await import(
 			"../../../services/narrator-worktree-runtime"
 		);
+		const workspace = ctx.executionTarget?.workspaceContext ?? ctx.workspaceContext;
 		const terminal = await terminalService.create({
 			narratorId: ctx.narratorId,
 			name,
-			expectedRevision: ctx.workspaceContext?.revision,
-			contextKey: ctx.workspaceContext?.contextKey,
+			deviceId: workspace?.deviceId,
+			expectedBindingRevision: workspace?.binding?.bindingRevision,
+			bindingId: workspace?.binding?.bindingId,
+			signal: ctx.signal,
+			// Selection pins belong only to the selected ToolContext, not an inactive pair.
+			expectedRevision: workspace?.binding ? undefined : ctx.workspaceContext?.revision,
+			contextKey: workspace?.binding ? undefined : ctx.workspaceContext?.contextKey,
 			principal: await narratorWorktreePrincipalForTool(ctx),
 		});
 		return {

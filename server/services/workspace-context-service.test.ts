@@ -11,6 +11,7 @@ let root = "";
 let events: unknown[] = [];
 let failInstall = false;
 const findRow = async () => row;
+let deviceBinding: Record<string, unknown> | undefined;
 const mockDb = {
 	$client: {},
 	get: () => undefined,
@@ -21,11 +22,40 @@ const mockDb = {
 		remoteDevices: { findMany: async () => [] },
 		workspaceSwitchRequests: { findFirst: async () => undefined },
 	},
+	// Keep this old single-narrator fixture's indexed binding reads faithful to the new store.
+	select: (columns?: Record<string, { name: string }>) => ({
+		from: (table: Record<symbol, unknown>) => ({
+			where: () => {
+				const name = table[Symbol.for("drizzle:Name")];
+				const value =
+					name === "narrators"
+						? row
+						: name === "narrator_device_workspaces"
+							? deviceBinding
+							: undefined;
+				const projected =
+					value && columns
+						? Object.fromEntries(
+								Object.entries(columns).map(([alias, column]) => {
+									const property = column.name.replace(/_([a-z])/g, (_match, part: string) =>
+										part.toUpperCase(),
+									);
+									return [alias, value[property]];
+								}),
+							)
+						: value;
+				return { get: () => projected, limit: () => Promise.resolve(projected ? [projected] : []) };
+			},
+		}),
+	}),
 	update: (table: Record<symbol, unknown>) => ({
 		set: (values: Record<string, unknown>) => ({
 			where: () => {
 				if (table[Symbol.for("drizzle:Name")] === "narrators") row = { ...row, ...values };
+				if (table[Symbol.for("drizzle:Name")] === "narrator_device_workspaces")
+					deviceBinding = { ...deviceBinding, ...values };
 				return {
+					run: () => {},
 					returning: () =>
 						Object.assign(Promise.resolve([{ id: row.id }]), {
 							all: () => [{ id: row.id }],
@@ -34,9 +64,15 @@ const mockDb = {
 			},
 		}),
 	}),
-	insert: () => ({
-		values: () => {
-			const query = { run: () => {}, onConflictDoNothing: () => query };
+	insert: (table: Record<symbol, unknown>) => ({
+		values: (values: Record<string, unknown>) => {
+			const query = {
+				run: () => {
+					if (table[Symbol.for("drizzle:Name")] === "narrator_device_workspaces")
+						deviceBinding = values;
+				},
+				onConflictDoNothing: () => query,
+			};
 			return query;
 		},
 	}),
@@ -86,6 +122,7 @@ beforeEach(async () => {
 		status: "idle",
 	};
 	chapter = undefined;
+	deviceBinding = undefined;
 	events = [];
 	failInstall = false;
 	policySpy = spyOn(executionPolicyEngine, "compile").mockResolvedValue({

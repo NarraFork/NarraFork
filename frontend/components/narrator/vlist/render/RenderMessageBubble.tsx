@@ -15,9 +15,18 @@
  */
 
 import { layoutWithLines } from "@chenglou/pretext";
+import { Loader, Modal, Text } from "@mantine/core";
 import type { FileReference } from "@shared/file-reference";
 import { IconChevronDown, IconChevronRight } from "@tabler/icons-react";
-import { useId, useMemo } from "react";
+import { lazy, Suspense, useEffect, useId, useMemo, useState } from "react";
+import { useTranslation } from "react-i18next";
+
+const CapturedSnapshotViewer = lazy(() =>
+	import("../../file-viewer/FileViewerContent").then((module) => ({
+		default: module.FileViewerContent,
+	})),
+);
+
 import {
 	FileReferenceScopeProvider,
 	useFileReferenceScope,
@@ -84,6 +93,7 @@ interface RenderMessageBubbleProps {
 	isSelf?: boolean;
 	/** Panel narrator id — lets user-bubble image attachments resolve their blob. */
 	narratorId?: string;
+	messageId?: string;
 	/** Forwarded for mermaid/katex local-measure refinement. */
 	onUnknownHeight?: (height: number) => void;
 	/** Slash-command bubbles: reveal / fold the expanded prompt. */
@@ -118,6 +128,7 @@ export function RenderMessageBubble({
 	hasHeader = true,
 	isSelf = true,
 	narratorId,
+	messageId,
 	onUnknownHeight,
 	onToggle,
 	onOpenAttachment,
@@ -142,30 +153,34 @@ export function RenderMessageBubble({
 	}
 	if (isMeasuredCommandBubble(measured)) {
 		return (
-			<CommandBubble
+			<FileReferenceScopeProvider value={{ capturedMessageId: messageId }}>
+				<CommandBubble
+					measured={measured}
+					header={header}
+					hasHeader={hasHeader}
+					isSelf={isSelf}
+					onToggle={onToggle}
+					narratorId={narratorId}
+					onOpenAttachment={onOpenAttachment}
+					openAttachmentLabel={openAttachmentLabel}
+				/>
+			</FileReferenceScopeProvider>
+		);
+	}
+	return (
+		<FileReferenceScopeProvider value={{ capturedMessageId: messageId }}>
+			<UserBubble
 				measured={measured}
 				header={header}
 				hasHeader={hasHeader}
 				isSelf={isSelf}
-				onToggle={onToggle}
 				narratorId={narratorId}
 				onOpenAttachment={onOpenAttachment}
 				openAttachmentLabel={openAttachmentLabel}
+				onQuoteClick={onQuoteClick}
+				onFetchAttachment={onFetchAttachment}
 			/>
-		);
-	}
-	return (
-		<UserBubble
-			measured={measured}
-			header={header}
-			hasHeader={hasHeader}
-			isSelf={isSelf}
-			narratorId={narratorId}
-			onOpenAttachment={onOpenAttachment}
-			openAttachmentLabel={openAttachmentLabel}
-			onQuoteClick={onQuoteClick}
-			onFetchAttachment={onFetchAttachment}
-		/>
+		</FileReferenceScopeProvider>
 	);
 }
 
@@ -651,7 +666,15 @@ function UserAttachmentView({
 	onFetchAttachment?: (fetchUrl: string, filename: string) => void;
 }) {
 	const scope = useFileReferenceScope();
+	const { t } = useTranslation("narrator");
+	const [snapshotOpen, setSnapshotOpen] = useState(false);
 	const data = block.data ?? {};
+	const historicalReference =
+		block.tag === "user-file-reference" ? (data.reference as FileReference | undefined) : undefined;
+	// biome-ignore lint/correctness/useExhaustiveDependencies: recycling a vlist slot must close the prior resource view.
+	useEffect(() => {
+		setSnapshotOpen(false);
+	}, [scope.capturedMessageId, historicalReference?.id, narratorId]);
 	const str = (v: unknown): string | undefined => (typeof v === "string" && v ? v : undefined);
 	if (block.tag === "user-text-file" || block.tag === "user-file-reference") {
 		// The path is a height-neutral passthrough from measure; when both it and a
@@ -660,16 +683,71 @@ function UserAttachmentView({
 		const fetchUrl = str(data.fetchUrl);
 		const filename = str(data.filename) ?? "";
 		const reference = data.reference as FileReference | undefined;
+		const originalWorkspace = data.attachmentWorkspace as
+			| { deviceId?: string; contextKey?: string; cwd?: string; pathFlavor?: string }
+			| undefined;
+		const originalOrigin = data.attachmentOrigin as
+			| { version?: number; projectId?: string | null }
+			| undefined;
+		const originalPathInsideRoot =
+			originalWorkspace?.pathFlavor === "windows"
+				? !!filePath
+						?.replace(/\\/g, "/")
+						.toLowerCase()
+						.startsWith(
+							`${originalWorkspace.cwd?.replace(/\\/g, "/").replace(/\/$/, "").toLowerCase()}/`,
+						)
+				: originalWorkspace?.pathFlavor === "posix" &&
+					!!filePath?.startsWith(`${originalWorkspace.cwd?.replace(/\/$/, "")}/`);
+		// Original-source remote attachments use only a persisted occurrence selector.
+		// Unknown provenance never becomes a host path or today's device binding.
+		const remoteAttachment =
+			block.tag === "user-text-file" &&
+			!!str(data.deviceId) &&
+			data.deviceId !== "local" &&
+			!!originalWorkspace &&
+			originalWorkspace.deviceId === data.deviceId &&
+			!!str(data.contextKey) &&
+			originalWorkspace.contextKey === data.contextKey &&
+			!!str(data.sourceNarratorId) &&
+			!!str(data.attachmentId) &&
+			originalOrigin?.version === 1 &&
+			(originalOrigin.projectId === null || !!str(originalOrigin.projectId)) &&
+			!!originalWorkspace.cwd &&
+			!!filePath &&
+			originalPathInsideRoot &&
+			!!scope.capturedMessageId &&
+			!!(narratorId ?? scope.narratorId) &&
+			!data.attachmentUnavailableReason;
+		const hostAttachment =
+			data.deviceId === "local" &&
+			originalWorkspace?.deviceId === "local" &&
+			!!str(data.contextKey) &&
+			originalWorkspace.contextKey === data.contextKey &&
+			!!str(data.sourceNarratorId) &&
+			data.sourceNarratorId === (narratorId ?? scope.narratorId) &&
+			originalOrigin?.version === 1 &&
+			(originalOrigin.projectId === null || !!str(originalOrigin.projectId)) &&
+			!!originalWorkspace.cwd &&
+			!!filePath?.startsWith(`${originalWorkspace.cwd.replace(/\/$/, "")}/`) &&
+			!data.attachmentUnavailableReason;
+		const unavailableAttachment =
+			block.tag === "user-text-file" && !fetchUrl && !hostAttachment && !remoteAttachment;
+		const unavailableLabel = t("fileReferences.attachmentUnavailable", {
+			defaultValue: "Unavailable: view this attachment on its original device.",
+		});
 		const openFile =
 			block.tag === "user-file-reference"
-				? reference && scope.openFile
-					? () => scope.openFile?.(reference)
+				? reference
+					? () => setSnapshotOpen(true)
 					: undefined
 				: fetchUrl && onFetchAttachment
 					? () => onFetchAttachment(fetchUrl, filename)
-					: filePath && onOpenAttachment
-						? () => onOpenAttachment(filePath)
-						: undefined;
+					: unavailableAttachment || remoteAttachment
+						? () => setSnapshotOpen(true)
+						: filePath && onOpenAttachment
+							? () => onOpenAttachment(filePath)
+							: undefined;
 		return (
 			<div style={{ position: "absolute", top, left, height: block.height, maxWidth: "100%" }}>
 				<TextFileRow
@@ -681,8 +759,71 @@ function UserAttachmentView({
 					// out of its single reserved line.
 					width={block.displayWidth}
 					onOpen={openFile}
-					openLabel={openAttachmentLabel}
+					openLabel={unavailableAttachment ? unavailableLabel : openAttachmentLabel}
 				/>
+				{snapshotOpen && unavailableAttachment && (
+					<Modal opened onClose={() => setSnapshotOpen(false)} title={unavailableLabel}>
+						{unavailableLabel}
+					</Modal>
+				)}
+				{snapshotOpen && remoteAttachment && (
+					<Modal
+						opened
+						onClose={() => setSnapshotOpen(false)}
+						size="xl"
+						title={t("fileReferences.originalAttachment", {
+							defaultValue: "Original attachment (read-only)",
+						})}
+					>
+						<Suspense fallback={<Loader size="sm" />}>
+							<div style={{ height: "60vh" }}>
+								<CapturedSnapshotViewer
+									filePath={filePath as string}
+									deviceId={str(data.deviceId)}
+									narratorId={narratorId ?? scope.narratorId}
+									attachmentPreview={{
+										messageId: scope.capturedMessageId as string,
+										attachmentId: str(data.attachmentId) as string,
+									}}
+								/>
+							</div>
+						</Suspense>
+					</Modal>
+				)}
+				{snapshotOpen && reference && (
+					<Modal
+						opened
+						onClose={() => setSnapshotOpen(false)}
+						size="xl"
+						title={t("fileReferences.capturedSnapshot", {
+							defaultValue: "Captured snapshot (read-only)",
+						})}
+					>
+						{scope.capturedMessageId && (narratorId ?? scope.narratorId) ? (
+							<Suspense fallback={<Loader size="sm" />}>
+								<div style={{ height: "60vh" }}>
+									<CapturedSnapshotViewer
+										filePath={reference.path}
+										deviceId={reference.deviceId}
+										narratorId={narratorId ?? scope.narratorId}
+										referenceOrigin
+										capturedSnapshot={{
+											messageId: scope.capturedMessageId,
+											referenceId: reference.id,
+										}}
+									/>
+								</div>
+							</Suspense>
+						) : (
+							<Text size="sm" c="dimmed">
+								{t("fileReferences.capturedUnavailable", {
+									defaultValue:
+										"Original captured reference is unavailable; add a new explicit reference.",
+								})}
+							</Text>
+						)}
+					</Modal>
+				)}
 			</div>
 		);
 	}

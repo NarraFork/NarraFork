@@ -178,4 +178,16 @@ CREATE TABLE workspace_write_leases (
 CREATE INDEX idx_workspace_lease_device_status ON workspace_write_leases(device_id,status,lease_id);
 CREATE INDEX idx_workspace_lease_scope ON workspace_write_leases(scope_id,status,lease_id);
 CREATE INDEX idx_workspace_lease_cleanup ON workspace_write_leases(status,updated_at,lease_id);
+CREATE TABLE workspace_write_activities (
+ id TEXT PRIMARY KEY NOT NULL, scope_id TEXT NOT NULL, source_instance_id TEXT NOT NULL,
+ workspace_instance_id TEXT NOT NULL, narrator_id TEXT, user_id TEXT NOT NULL, project_id TEXT,
+ device_id TEXT NOT NULL, binding_id TEXT NOT NULL, binding_revision INTEGER NOT NULL,
+ context_key TEXT NOT NULL, canonical_root TEXT NOT NULL, path_flavor TEXT NOT NULL,
+ root_evidence_digest TEXT NOT NULL, owner_epoch TEXT NOT NULL, kind TEXT NOT NULL,
+ operation_id TEXT NOT NULL, attempt INTEGER NOT NULL, status TEXT NOT NULL,
+ created_at TEXT NOT NULL, updated_at TEXT NOT NULL, finished_at TEXT
+);
+CREATE INDEX idx_workspace_activity_status_id ON workspace_write_activities(status,id);
+CREATE INDEX idx_workspace_activity_scope_status ON workspace_write_activities(scope_id,status);
+CREATE INDEX idx_workspace_activity_device_status ON workspace_write_activities(device_id,status,id);
 `;

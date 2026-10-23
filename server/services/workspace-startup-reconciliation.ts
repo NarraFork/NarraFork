@@ -151,6 +151,12 @@ export function initializeWorkspaceOwnerOnStartup(): Promise<{
 		import("../db"),
 	]).then(async ([runtime, { db }]) => {
 		await initializeWorkspaceExecutionOwner(db, runtime.coordinator.ownerEpoch());
+		// Before HTTP admissions and the remote recovery dispatcher. Stale process ownership
+		// only establishes uncertainty, NEVER termination of executor Bash/PTY processes.
+		const activities = await runtime.coordinator.reconcileActivitiesOnStartup(
+			startup.controller.signal,
+		);
+		logger.info("Workspace activity startup recovery holds loaded", activities);
 		return { runtime, database: db };
 	});
 	return startup.initialization;

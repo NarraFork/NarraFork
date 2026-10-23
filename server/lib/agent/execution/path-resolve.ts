@@ -5,6 +5,7 @@
  */
 import { homedir } from "node:os";
 import { resolve } from "node:path";
+import { AppError } from "@server/lib/errors";
 import { settings } from "@server/lib/settings";
 import { resolveStandaloneNarratorCwd } from "@server/services/standalone-narrator-cwd";
 import type { WorkspaceContext } from "@shared/workspace-context";
@@ -20,6 +21,16 @@ export {
 	targetPathSemantics,
 	windowsPathSemantics,
 } from "./path-semantics";
+
+export class WorkspaceDirectoryNotConfiguredError extends AppError {
+	constructor(detail: string) {
+		super(
+			`WORKSPACE_DIRECTORY_NOT_CONFIGURED: ${detail}`,
+			409,
+			"WORKSPACE_DIRECTORY_NOT_CONFIGURED",
+		);
+	}
+}
 
 /** Pure local default resolution: selecting an endpoint must never create a directory. */
 export function localToolBaseCwd(): string {
@@ -51,7 +62,11 @@ export function toolBaseCwd(
 		}
 		return workspaceContext.cwd;
 	}
-	if (backend.kind === "local") return workspaceContext ? localToolBaseCwd() : cwd;
+	if (workspaceContext)
+		throw new WorkspaceDirectoryNotConfiguredError(
+			`no frozen narrator workspace for device "${backend.deviceId}"`,
+		);
+	if (backend.kind === "local") return cwd;
 	if (backend.defaultCwd && backend.paths.isAbsolute(backend.defaultCwd)) return backend.defaultCwd;
 	throw new Error(
 		`Execution device "${backend.deviceId}" has no absolute default working directory; supply an absolute workdir.`,
@@ -61,7 +76,8 @@ export function toolBaseCwd(
 /** Tools consume the admitted endpoint, not a fresh device default or a reapplied workdir. */
 export function toolExecutionCwd(
 	backend: ExecutionBackend,
-	ctx: Pick<ToolContext, "cwd" | "workspaceContext" | "executionTarget">,
+	ctx: Pick<ToolContext, "cwd" | "workspaceContext" | "executionTarget"> &
+		Partial<Pick<ToolContext, "narratorId">>,
 ): string {
 	if (ctx.executionTarget) {
 		if (ctx.executionTarget.deviceId !== backend.deviceId) {
@@ -72,6 +88,8 @@ export function toolExecutionCwd(
 		}
 		return ctx.executionTarget.cwd;
 	}
+	if (ctx.narratorId && !ctx.workspaceContext)
+		throw new WorkspaceDirectoryNotConfiguredError("tool requires its admitted device endpoint");
 	return toolBaseCwd(backend, ctx.cwd, ctx.workspaceContext);
 }
 

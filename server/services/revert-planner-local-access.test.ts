@@ -514,13 +514,18 @@ async function committed(plan: RevertPlanSummary, action: RevertAction, extra = 
 	const response = await apply(plan, action, extra);
 	const body = await boundedJson(response);
 	expect(response.headers.get("cache-control")).toBe("no-store");
-	expect(body).toEqual({
+	const { coverage, ...responseBody } = body;
+	expect(responseBody).toEqual({
 		planId: plan.id,
 		status: "committed",
 		journalStatus: "committed",
 		settling: false,
 		reason: null,
 	});
+	expect(Object.keys(coverage).sort()).toEqual(["conflicts", "restoredFiles", "unknownCoverage"]);
+	expect(Array.isArray(coverage.restoredFiles)).toBe(true);
+	expect(Array.isArray(coverage.conflicts)).toBe(true);
+	expect(Array.isArray(coverage.unknownCoverage)).toBe(true);
 	expect(ownPlans().find((row) => row.id === plan.id)?.status).toBe("committed");
 	return body;
 }
@@ -1042,22 +1047,22 @@ describe("action-bound HTTP preview and real local execution", () => {
 		expect(await readFile(path, "utf8")).toBe("old\n");
 		expect(history()).toBe(before);
 	});
-	test("conflicting human changes make action preview unavailable without changing files or history", async () => {
+	test("conflicting human changes are skipped by a prepared partial plan without changing files or history", async () => {
 		const { path } = await fixture();
 		await human(path, "human replaced the tool hunk\n");
 		const before = history();
 		const disk = await readFile(path);
-		const unavailable = await actionUnavailable(
-			await actionPreview("revert_files"),
-			"revert_files",
-		);
-		expect(unavailable.unavailable).toBe("file_conflict");
-		expect(unavailable.diagnostics[0]).toMatchObject({
-			code: "REVERT_PLANNER_REVERSAL_REFUSED",
+		const preview = await boundedJson(await actionPreview("revert_files"));
+		const plan = preview.plan as RevertPlanSummary;
+		expect(plan.status).toBe("prepared");
+		expect(preview.coverage.conflicts[0]).toMatchObject({
+			path: "file.txt",
 			reason: "merge_conflict",
-			filePath: "file.txt",
 		});
-		expect(unavailable.diagnostics[0].effectId).toEqual(expect.any(String));
+		expect(preview.coverage.conflicts[0].effectIds).toEqual([expect.any(String)]);
+		const result = await committed(plan, "revert_files");
+		expect(result.coverage.restoredFiles).toEqual([]);
+		expect(result.coverage.conflicts).toEqual(preview.coverage.conflicts);
 		expect(await readFile(path)).toEqual(disk);
 		expect(history()).toBe(before);
 	});
@@ -1103,14 +1108,13 @@ describe("action-bound HTTP preview and real local execution", () => {
 		await writeFile(path, original);
 		await edit(path, "value=1", "value=2");
 		await writeFile(path, "const value = 2; // formatter and later edit\n");
-		const conflict = await actionUnavailable(
+		const conflict = await boundedJson(
 			await actionPreview("rollback_to_block", boundary, { blockIndex: 0 }),
-			"rollback_to_block",
 		);
-		expect(conflict.unavailable).toBe("file_conflict");
-		expect(conflict.diagnostics[0]).toMatchObject({
+		expect(conflict.plan.status).toBe("prepared");
+		expect(conflict.coverage.conflicts[0]).toMatchObject({
 			reason: "merge_conflict",
-			filePath: "formatted.ts",
+			path: "formatted.ts",
 		});
 		const response = await boundedJson(
 			await actionPreview("rollback_to_block", boundary, {
@@ -1600,13 +1604,15 @@ describe("action unavailable evidence, actual failure outcomes and bounded reque
 		});
 		try {
 			const body = await boundedJson(await apply(plan, "revert_files"));
-			expect(body).toEqual({
+			const { coverage, ...responseBody } = body;
+			expect(responseBody).toEqual({
 				planId: plan.id,
 				status: "committed",
 				journalStatus: "committed",
 				settling: false,
 				reason: "POST_COMMIT_REFRESH_FAILED",
 			});
+			expect(coverage).toEqual({ restoredFiles: ["file.txt"], conflicts: [], unknownCoverage: [] });
 			expect(failedRefreshes).toBeGreaterThan(0);
 		} finally {
 			refresh.mockRestore();
@@ -1902,7 +1908,9 @@ describe("production preview API and actual local evidence", () => {
 		expect(history()).toBe(before);
 		expect(raw).not.toContain("contentJson");
 		expect(raw).not.toContain("executionReceiptJson");
-		expect(raw).not.toContain("H2");
+		// A random opaque ID can legitimately contain H2; forbid actual file contents.
+		expect(raw).not.toContain(JSON.stringify(disk.toString()).slice(1, -1));
+		expect(raw).not.toContain(JSON.stringify(original.replace("H0", "H2")).slice(1, -1));
 		const repeated = await prepared();
 		expect(repeated.id).toBe(plan.id);
 	});
@@ -2461,7 +2469,7 @@ describe("live/durable coordinator checks and unchanged state", () => {
 		expect(named?.detail ?? "").not.toContain(workspace);
 		await actionPrepared("revert_files");
 	});
-	test("durable recovery barriers are checked at apply rather than disabling preview", async () => {
+	test("durable needs_verification is reported without blocking known revert or clearing evidence", async () => {
 		const { path } = await fixture();
 		const previous = {
 			...scope(),
@@ -2478,10 +2486,19 @@ describe("live/durable coordinator checks and unchanged state", () => {
 		});
 		const before = history();
 		const plan = await actionPrepared("revert_files");
-		await boundedJson(await apply(plan, "revert_files"), 409);
-		expect(await readFile(path, "utf8")).toBe("new\n");
+		const result = await committed(plan, "revert_files");
+		expect(result.coverage.unknownCoverage).toEqual(
+			expect.arrayContaining([expect.objectContaining({ scopeId: previous.id })]),
+		);
+		expect(await readFile(path, "utf8")).toBe("old\n");
 		expect(history()).toBe(before);
-		expect(journalFiles(plan).every((file) => file.receiptJson === null)).toBe(true);
+		expect(
+			db
+				.select()
+				.from(schema.fileChangeScopes)
+				.where(eq(schema.fileChangeScopes.id, previous.id))
+				.get()?.status,
+		).toBe("needs_verification");
 	});
 	test("brief activity between read and final guard does not invalidate unchanged file bytes", async () => {
 		const { path } = await fixture();

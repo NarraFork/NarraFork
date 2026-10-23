@@ -11,6 +11,10 @@ import { posixPathSemantics } from "../lib/agent/execution/path-semantics";
 import { AppError } from "../lib/errors";
 import { generateId } from "../lib/id";
 import { type DeviceOperationLevel, normalizeOAuthClientPolicy } from "../lib/oauth-client-policy";
+import {
+	insertInitialDeviceWorkspaceBinding,
+	saveLegacyDeviceWorkspaceBinding,
+} from "./narrator-device-workspace-store";
 
 // The DB, device/narrator OAuth resolvers and ACLs are real. Transport, PTY,
 // workspace-history admission and buffer IO are mocked: this is not native E2E.
@@ -28,6 +32,9 @@ const tables = [
 	schema.integrationCapabilityGrants,
 	schema.integrationResourceBindings,
 	schema.aclGrants,
+	schema.narratorDeviceWorkspaces,
+	schema.narratorDeviceWorkspaceRequests,
+	schema.workspaceSwitchRequests,
 ];
 for (const table of tables) {
 	const config = getTableConfig(table);
@@ -54,7 +61,21 @@ for (const table of tables) {
 	sqlite.run(`CREATE TABLE "${config.name}" (${columns.join(",")})`);
 }
 const db = drizzle({ client: sqlite, schema: { ...schema, ...relations } });
-mock.module("../db", () => ({ db }));
+mock.module("../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
+mock.module("../websocket/narrator-ws", () => ({
+	broadcastToNarrator: () => {},
+	broadcastToUser: () => {},
+	broadcastToAll: () => {},
+	broadcastToAdmins: () => {},
+}));
+mock.module("./narrator-session-state", () => ({
+	activeNarrators: new Map(),
+	compactLocks: new Set(),
+	pendingDangerReflections: new Map(),
+	pendingPermissions: new Map(),
+	isNarratorRevertAdmissionBlocked: () => false,
+	withNarratorMutationAdmission: async (_id: string, body: () => Promise<unknown>) => body(),
+}));
 
 let deviceId: string;
 let actorId: string;
@@ -64,6 +85,21 @@ let grantId: string;
 let context: WorkspaceContext;
 let afterIdentity: (() => Promise<void>) | undefined;
 let afterCompile: (() => Promise<void>) | undefined;
+let identityRequests: string[] = [];
+let detachedLocal = false;
+let afterSocketAlive: (() => Promise<void>) | undefined;
+let afterDetachedDiscovery: (() => Promise<void>) | undefined;
+let afterDetachedSignal: (() => Promise<void>) | undefined;
+const detachedKill = mock(() => {});
+const detachedKillSession = mock(
+	async (_id: string, beforeDispatch?: () => void, onDispatch?: () => void) => {
+		await afterDetachedDiscovery?.();
+		beforeDispatch?.();
+		onDispatch?.();
+		detachedKill();
+		await afterDetachedSignal?.();
+	},
+);
 const write = mock((_data: string) => {});
 const resize = mock((_cols: number, _rows: number) => {});
 const kill = mock(() => {});
@@ -86,8 +122,29 @@ mock.module("./remote-tree-snapshot-hooks", () => ({
 	registerRemoteActivity: registerActivity,
 	registerRemoteTerminalActivity: registerTerminalActivity,
 	finishRemoteActivity: finishActivity,
+	markRemoteActivityRunning: mock((_input: unknown) => {}),
 }));
 mock.module("./workspace-context-service", () => ({
+	assertWorkspaceSelectionInstalled: () => {}, // Installation admission has its own real HTTP/core partition.
+	workspaceSelectionInstallationStatus: (id: string) => ({
+		revision:
+			db
+				.select({ revision: schema.narrators.workspaceRevision })
+				.from(schema.narrators)
+				.where(eq(schema.narrators.id, id))
+				.get()?.revision ?? 0,
+		installed: true,
+	}),
+	assertSwitchAdmission: () => {},
+	assertTargetAllowed: async () => {},
+	assertWorkspaceContextFresh: async () => {},
+	authorizeWorkspaceDevice: async () => {},
+	installWorkspaceContext: async () => {},
+	pauseWorkspace: () => {},
+	prepareWorkspaceContext: async () => context,
+	runtimeDeviceClass: async (id: string, _device: string, actor: string) => ({
+		runtime: await resolveOAuthNarratorRuntimePolicy(id, actor),
+	}),
 	workspaceContextService: {
 		get: async () => context,
 		withRevision: async (
@@ -98,7 +155,18 @@ mock.module("./workspace-context-service", () => ({
 		) => action(structuredClone(context)),
 	},
 }));
+mock.module("../lib/narrator-custom-traits", () => ({ getDisabledToolSet: () => new Set() }));
+mock.module("./trait-layer-service", () => ({
+	resolveEffectiveTraits: async () => [],
+	resolveNarratorProjectId: async () => null,
+}));
+mock.module("./workspace-file-access", () => ({
+	createNarratorWorkspaceFileAccess: () => {
+		throw new Error("PTY tests must not request artifact IO");
+	},
+}));
 mock.module("./execution-policy/engine", () => ({
+	executionPolicyRevision: 0,
 	executionPolicyEngine: {
 		compile: async () => {
 			await afterCompile?.();
@@ -107,14 +175,19 @@ mock.module("./execution-policy/engine", () => ({
 	},
 }));
 mock.module("../lib/agent/execution/registry", () => ({
+	localBackend: { kind: "local", deviceId: "local", paths: posixPathSemantics },
+	ExecutionTargetError: AppError,
 	resolveBackend: ({ requested }: { requested: string }) => {
-		if (requested !== deviceId) throw new Error("Unknown backend: no host fallback");
+		if (requested !== deviceId && !(detachedLocal && requested === "local"))
+			throw new Error("Unknown backend: no host fallback");
 		return {
-			kind: "remote",
-			deviceId,
+			kind: requested === "local" ? "local" : "remote",
+			deviceId: requested,
 			paths: posixPathSemantics,
+			pathFlavor: "posix",
 			runtimeGeneration: 7,
 			resolvePathIdentity: async (path: string) => {
+				identityRequests.push(path);
 				await afterIdentity?.();
 				return { exists: true, canonicalPath: path, runtimeGeneration: 7 };
 			},
@@ -122,6 +195,15 @@ mock.module("../lib/agent/execution/registry", () => ({
 	},
 }));
 mock.module("./device-connection-service", () => ({
+	getSessionDevices: async (projectId: string | null, actor: string) => {
+		const device = await db.query.remoteDevices.findFirst({
+			where: eq(schema.remoteDevices.id, deviceId),
+		});
+		const { isDeviceAuthorized } = await import("./device-service");
+		return device && !device.revokedAt && isDeviceAuthorized(device, { projectId, userId: actor })
+			? [{ ...device, online: true }]
+			: [];
+	},
 	isDeviceOnline: () => true,
 	getConnectedDeviceHello: () => ({
 		defaultCwd: "/remote/selected",
@@ -140,7 +222,15 @@ mock.module("../terminal/runtime-remote", () => ({
 mock.module("../terminal/runtime-bun", () => ({ spawnBunTerminal: hostPty }));
 mock.module("../terminal/runtime-pty", () => ({ spawnPortablePty: hostPty }));
 mock.module("../terminal/dtach-service", () => ({
-	dtachService: { isAvailable: async () => false },
+	dtachService: {
+		isAvailable: async () => detachedLocal,
+		isSocketAlive: async () => {
+			await afterSocketAlive?.();
+			return true;
+		},
+		killSession: detachedKillSession,
+		attachSession: (options: unknown) => nativePty("local", options),
+	},
 	findProcessesByArg: async () => [],
 	getDescendantPids: async () => [],
 	ProcessSnapshot: class {},
@@ -151,6 +241,7 @@ mock.module("../terminal/buffer-manager", () => ({
 		rows = 24;
 		startPeriodicFlush() {}
 		async dispose() {}
+		async deleteFromDisk() {}
 		async resize() {}
 		async loadFromDisk() {
 			return true;
@@ -254,10 +345,14 @@ async function projectFixture() {
 		capability: "write",
 		createdAt: now,
 	});
-	context = { ...context, contextProjectId: projectId };
+	context = saveLegacyDeviceWorkspaceBinding(db, narratorId, {
+		...context,
+		contextKey: `project:${projectId}`,
+		contextProjectId: projectId,
+	});
 	await db
 		.update(schema.narrators)
-		.set({ contextProjectId: projectId })
+		.set({ contextProjectId: projectId, workspaceContext: context })
 		.where(eq(schema.narrators.id, narratorId));
 	return { projectId, chapterId, writeGrant };
 }
@@ -266,6 +361,13 @@ beforeEach(async () => {
 	[deviceId, actorId, narratorId, clientId, grantId] = Array.from({ length: 5 }, generateId);
 	afterIdentity = undefined;
 	afterCompile = undefined;
+	identityRequests = [];
+	detachedLocal = false;
+	afterSocketAlive = undefined;
+	afterDetachedDiscovery = undefined;
+	afterDetachedSignal = undefined;
+	detachedKill.mockClear();
+	detachedKillSession.mockClear();
 	for (const fn of [
 		write,
 		resize,
@@ -304,6 +406,11 @@ beforeEach(async () => {
 		createdAt: now,
 		updatedAt: now,
 	});
+	context = insertInitialDeviceWorkspaceBinding(db, { narratorId, context, createdAt: now });
+	await db
+		.update(schema.narrators)
+		.set({ workspaceContext: context, workspaceRevision: context.revision })
+		.where(eq(schema.narrators.id, narratorId));
 	await db.insert(schema.oauthClients).values({
 		id: clientId,
 		clientId,
@@ -359,6 +466,290 @@ afterEach(() => {
 afterAll(() => sqlite.close());
 
 describe("live OAuth-owned device Terminal ceiling through production HTTP/WS", () => {
+	for (const phase of ["before-signals", "after-signals"] as const)
+		test(`attached dtach close revocation ${phase} preserves the correct input lifecycle`, async () => {
+			detachedLocal = true;
+			const id = generateId();
+			const original: WorkspaceContext = {
+				revision: 0,
+				contextKey: "active-original",
+				deviceId: "local",
+				cwd: "/local/original",
+				pathFlavor: "posix",
+				capabilities: { switchDirectory: false },
+				...{ terminalOrigin: { version: 1, projectId: null, runtimeGeneration: 7 } },
+			};
+			await db.insert(schema.terminals).values({
+				id,
+				narratorId,
+				name: "Active original",
+				cwd: original.cwd,
+				workspaceContext: original,
+				dtachSocket: "/mock/dtach.sock",
+				status: "running",
+				createdAt: new Date().toISOString(),
+			});
+			expect(await terminalService.reattach(id)).toBe(true);
+			const revoke = async () => {
+				await db
+					.update(schema.narrators)
+					.set({ ownerUserId: "other-owner" })
+					.where(eq(schema.narrators.id, narratorId));
+			};
+			if (phase === "before-signals") afterDetachedDiscovery = revoke;
+			else afterDetachedSignal = revoke;
+			const response = await app().request(`/terminals/${id}`, { method: "DELETE" });
+			expect(response.status, JSON.stringify(await response.clone().json())).toBe(403);
+			expect(detachedKill).toHaveBeenCalledTimes(phase === "before-signals" ? 0 : 1);
+			expect(kill).not.toHaveBeenCalled();
+			afterDetachedDiscovery = undefined;
+			afterDetachedSignal = undefined;
+			await db
+				.update(schema.narrators)
+				.set({ ownerUserId: actorId })
+				.where(eq(schema.narrators.id, narratorId));
+			const authority = await terminalService.authorizeTargetAccess(
+				id,
+				{ userId: actorId, isAdmin: false },
+				"write",
+			);
+			terminalService.writeAuthorized(
+				id,
+				"still writable",
+				async () => authority,
+				authority.assertStillCurrent,
+			);
+			if (phase === "before-signals") expect(write).toHaveBeenCalledWith("still writable");
+			else expect(write).not.toHaveBeenCalled();
+			const retry = await app().request(`/terminals/${id}`, { method: "DELETE" });
+			expect(retry.status).toBe(200);
+			expect(detachedKill).toHaveBeenCalledTimes(1);
+			expect(kill).toHaveBeenCalledTimes(phase === "before-signals" ? 1 : 0);
+		});
+	for (const phase of ["socket discovery", "process discovery"] as const) {
+		test(`detached kill rechecks the original authority after ${phase} await`, async () => {
+			const { projectId, writeGrant } = await projectFixture();
+			detachedLocal = true;
+			const id = generateId();
+			const original: WorkspaceContext = {
+				revision: 0,
+				contextKey: "detached-original",
+				deviceId: "local",
+				cwd: "/local/original",
+				pathFlavor: "posix",
+				contextProjectId: projectId,
+				capabilities: { switchDirectory: false },
+			};
+			await db.insert(schema.terminals).values({
+				id,
+				narratorId,
+				name: "Detached original",
+				deviceId: null,
+				cwd: original.cwd,
+				workspaceContext: original,
+				dtachSocket: "/mock/dtach.sock",
+				status: "running",
+				createdAt: new Date().toISOString(),
+			});
+			if (phase === "socket discovery")
+				afterSocketAlive = async () => {
+					await db.delete(schema.aclGrants).where(eq(schema.aclGrants.id, writeGrant));
+				};
+			else
+				afterDetachedDiscovery = async () => {
+					await db
+						.update(schema.narrators)
+						.set({ ownerUserId: "other-owner" })
+						.where(eq(schema.narrators.id, narratorId));
+				};
+			const response = await app().request(`/terminals/${id}`, { method: "DELETE" });
+			expect(detachedKill).not.toHaveBeenCalled();
+			expect(response.status).toBe(403);
+			const stored = await db.query.terminals.findFirst({ where: eq(schema.terminals.id, id) });
+			expect(stored?.status).toBe("running");
+		});
+	}
+	test("explicit inactive pair creates through HTTP without changing selection", async () => {
+		const selected = {
+			...context,
+			deviceId: "selected-other",
+			cwd: "/other/selected",
+			contextKey: "other",
+		};
+		await db
+			.update(schema.narrators)
+			.set({ workspaceContext: selected, defaultDeviceId: selected.deviceId })
+			.where(eq(schema.narrators.id, narratorId));
+		const response = await app().request("/terminals", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({
+				narratorId,
+				deviceId,
+				bindingId: context.binding?.bindingId,
+				expectedBindingRevision: context.binding?.bindingRevision,
+			}),
+		});
+		expect(response.status).toBe(201);
+		const terminal = await response.json();
+		expect(terminal.cwd).toBe("/remote/selected");
+		expect(terminal.workspaceContext.binding).toEqual(context.binding);
+		expect(terminal.workspaceContext.terminalOrigin.projectId).toBeNull();
+		const narrator = await db.query.narrators.findFirst({
+			where: eq(schema.narrators.id, narratorId),
+		});
+		expect(narrator?.workspaceContext?.deviceId).toBe("selected-other");
+		expect(nativePty).toHaveBeenCalledTimes(1);
+	});
+	test("unconfigured explicit pair refuses before any metadata, row or PTY", async () => {
+		await db.delete(schema.narratorDeviceWorkspaces);
+		await db
+			.update(schema.narrators)
+			.set({
+				workspaceContext: { ...context, deviceId: "selected-other" },
+				defaultDeviceId: "selected-other",
+			})
+			.where(eq(schema.narrators.id, narratorId));
+		const response = await app().request("/terminals", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify({ narratorId, deviceId }),
+		});
+		expect(response.status).toBe(409);
+		expect(identityRequests).toEqual([]);
+		expect(await db.select().from(schema.terminals)).toHaveLength(0);
+		expect(nativePty).not.toHaveBeenCalled();
+	});
+	test("binding changes at writer admission prevent PTY; old terminal remains at original source", async () => {
+		const old = await create();
+		const original = old.workspaceContext;
+		const oldPin = context.binding?.bindingRevision;
+		nativePty.mockClear();
+		registerActivity.mockImplementationOnce(async () => {
+			context = saveLegacyDeviceWorkspaceBinding(db, narratorId, {
+				...context,
+				cwd: "/remote/new",
+				contextKey: "new",
+				revision: 4,
+			});
+			await db
+				.update(schema.narrators)
+				.set({ workspaceContext: context, workspaceRevision: 4 })
+				.where(eq(schema.narrators.id, narratorId));
+		});
+		await expect(create()).rejects.toThrow("binding identity changed");
+		expect(nativePty).not.toHaveBeenCalled();
+		const detail = await app().request(`/terminals/${old.id}`);
+		expect(detail.status).toBe(200);
+		expect((await detail.json()).workspaceContext).toEqual(original);
+		const s = socket();
+		await handleTerminalWS.message(s.ws, { type: "subscribe", terminalIds: [old.id] });
+		await handleTerminalWS.message(s.ws, {
+			type: "input",
+			terminalId: old.id,
+			data: "original-target",
+		});
+		expect(write).toHaveBeenCalledWith("original-target");
+		await expect(
+			terminalService.create({
+				narratorId,
+				deviceId,
+				expectedBindingRevision: oldPin,
+				principal: { userId: actorId, isAdmin: false },
+			}),
+		).rejects.toThrow("binding changed");
+		expect(nativePty).not.toHaveBeenCalled();
+	});
+	test("old terminal retains original project authority after current selection moves to private project", async () => {
+		const { projectId, writeGrant } = await projectFixture();
+		const old = await create();
+		const otherProject = generateId();
+		const now = new Date().toISOString();
+		await db.insert(schema.projects).values({
+			id: otherProject,
+			name: "Other private project",
+			ownerUserId: "different-owner",
+			createdAt: now,
+			updatedAt: now,
+		});
+		await db
+			.update(schema.narrators)
+			.set({
+				contextProjectId: otherProject,
+				workspaceContext: {
+					...context,
+					contextProjectId: otherProject,
+					deviceId: "selected-other",
+				},
+			})
+			.where(eq(schema.narrators.id, narratorId));
+		const original = await terminalService.authorizeTargetAccess(
+			old.id,
+			{ userId: actorId, isAdmin: false },
+			"write",
+		);
+		expect(original.workspaceContext?.contextProjectId).toBe(projectId);
+		await db.delete(schema.aclGrants).where(eq(schema.aclGrants.id, writeGrant));
+		await expect(
+			terminalService.authorizeTargetAccess(old.id, { userId: actorId, isAdmin: false }, "write"),
+		).rejects.toThrow();
+	});
+	test("WS final resize notification cannot leave an accepted input ticket after live downgrade", async () => {
+		const terminal = await create();
+		const s = socket();
+		await handleTerminalWS.message(s.ws, { type: "subscribe", terminalIds: [terminal.id] });
+		const originalSend = s.ws.send.bind(s.ws);
+		s.ws.send = ((payload: string) => {
+			if (JSON.parse(payload).type === "requestResize")
+				db.update(schema.oauthClients)
+					.set({ policyJson: policy("readOnly") })
+					.where(eq(schema.oauthClients.id, clientId))
+					.run();
+			return originalSend(payload);
+		}) as typeof s.ws.send;
+		await handleTerminalWS.message(s.ws, {
+			type: "input",
+			terminalId: terminal.id,
+			data: "must-not-write",
+		});
+		expect(write).not.toHaveBeenCalled();
+	});
+	test("legacy narrator terminal without project/source evidence cannot borrow current binding", async () => {
+		const id = generateId();
+		await db.insert(schema.terminals).values({
+			id,
+			narratorId,
+			name: "Unknown source",
+			cwd: context.cwd,
+			deviceId,
+			workspaceContext: context,
+			status: "running",
+			createdAt: new Date().toISOString(),
+		});
+		expect((await app().request(`/terminals/${id}`)).status).toBe(409);
+		expect(identityRequests).toEqual([]);
+	});
+	test("WS disconnect cancels creation while metadata is pending before PTY", async () => {
+		let release!: () => void;
+		afterIdentity = () =>
+			new Promise<void>((resolve) => {
+				release = resolve;
+			});
+		const s = socket();
+		const creating = handleTerminalWS.message(s.ws, {
+			type: "create",
+			requestId: "cancelled",
+			narratorId,
+			deviceId,
+		});
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		handleTerminalWS.close(s.ws);
+		release();
+		await creating;
+		expect(nativePty).not.toHaveBeenCalled();
+		expect(await db.select().from(schema.terminals)).toHaveLength(0);
+		expect(s.frames.some((frame) => frame.type === "created")).toBe(false);
+	});
 	for (const source of ["client", "grant"] as const) {
 		test(`ordinary narrator refuses ${source} readOnly before row, claim or PTY even while allowed=true`, async () => {
 			await setLevel("readOnly", source);
@@ -401,6 +792,10 @@ describe("live OAuth-owned device Terminal ceiling through production HTTP/WS", 
 			narratorId,
 			name: "Detached",
 			cwd: context.cwd,
+			workspaceContext: {
+				...context,
+				...{ terminalOrigin: { version: 1, projectId: null, runtimeGeneration: 7 } },
+			},
 			deviceId,
 			status: "running",
 			createdAt: new Date().toISOString(),
@@ -449,6 +844,11 @@ describe("live OAuth-owned device Terminal ceiling through production HTTP/WS", 
 	});
 	test("readWrite allows native admission and WS input without granting host authority", async () => {
 		const terminal = await create();
+		await terminalService.authorizeTargetAccess(
+			terminal.id,
+			{ userId: actorId, isAdmin: false },
+			"write",
+		);
 		const s = socket();
 		await handleTerminalWS.message(s.ws, { type: "subscribe", terminalIds: [terminal.id] });
 		await handleTerminalWS.message(s.ws, {

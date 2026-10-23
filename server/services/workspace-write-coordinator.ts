@@ -10,6 +10,7 @@ export {
 } from "./file-history-locks";
 
 import {
+	workspaceWriteActivities as durableActivities,
 	workspaceWriteLeases as durableLeases,
 	fileChangeScopes as scopes,
 	workspaceExecutionOwners,
@@ -41,7 +42,7 @@ export type { WorkspaceWriteRange } from "./workspace-write-ranges";
 import { hotSafe } from "@server/lib/hot-safe";
 import { generateId } from "@server/lib/id";
 import { FILE_CHANGE_LIMITS, type FileChangeExecutionBinding } from "@shared/file-change-protocol";
-import { and, eq, isNotNull, ne, or, sql } from "drizzle-orm";
+import { and, asc, eq, gt, inArray, isNotNull, ne, or, sql } from "drizzle-orm";
 import type { BunSQLiteDatabase } from "drizzle-orm/bun-sqlite";
 import type { SQLiteTransactionConfig } from "drizzle-orm/sqlite-core";
 import {
@@ -247,7 +248,22 @@ interface LeaseGroup {
 	contextToken: WorkspaceWriteLeaseToken;
 	records: readonly LeaseRecord[];
 }
+export type WorkspaceDurableActivity = Pick<
+	typeof durableActivities.$inferInsert,
+	| "narratorId"
+	| "userId"
+	| "projectId"
+	| "bindingId"
+	| "bindingRevision"
+	| "contextKey"
+	| "rootEvidenceDigest"
+	| "kind"
+	| "operationId"
+	| "attempt"
+>;
+
 interface ActivityRecord {
+	durableId?: string;
 	owner: WorkspaceWriteCoordinator;
 	scope: Readonly<FileChangeScopeIdentity>;
 	uncertain: boolean;
@@ -354,8 +370,8 @@ export interface WorkspaceWriteCoordinatorOptions {
  * identity verification. A crash leaves a durable admission barrier, not a TTL.
  * Only fully settled execution may clear its matching lease. Unknown/unsettled work
  * first persists needs_verification, retaining the lease for external recovery.
- * Activity registration survives hot reload, not process death: startup recovery
- * must separately account for surviving external processes. No automatic recovery.
+ * Remote activity registration persists before spawn. Startup converts abandoned
+ * process ownership into durable unknown holds, never into process-end evidence.
  */
 
 export class WorkspaceWriteCoordinator {
@@ -568,7 +584,9 @@ export class WorkspaceWriteCoordinator {
 	 * permission or a long-held write lock. A strict rollback rejects intersecting registration.
 	 */
 	registerActivity(
-		input: Pick<WorkspaceWriteRequest, "scope" | "runtime">,
+		input: Pick<WorkspaceWriteRequest, "scope" | "runtime"> & {
+			durable?: WorkspaceDurableActivity;
+		},
 	): WorkspaceActivityToken {
 		const scope = copyScope(input.scope);
 		this.requireRuntime(scope.deviceId, input.runtime);
@@ -603,8 +621,51 @@ export class WorkspaceWriteCoordinator {
 				throw fail("rollback_active", "An overlapping rollback is still executing");
 			}
 		}
+		let durableId: string | undefined;
+		if (input.durable) {
+			if (scope.deviceId === "local")
+				throw fail("invalid_input", "Remote activity requires a remote scope");
+			for (const value of [
+				input.durable.userId,
+				input.durable.bindingId,
+				input.durable.contextKey,
+				input.durable.rootEvidenceDigest,
+				input.durable.operationId,
+			])
+				assertString(value, "activity identity", 1024);
+			if (input.durable.narratorId) assertString(input.durable.narratorId, "narratorId", 256);
+			if (input.durable.projectId) assertString(input.durable.projectId, "projectId", 256);
+			assertInteger(input.durable.attempt, "attempt");
+			assertInteger(input.durable.bindingRevision, "bindingRevision");
+			if (!["bash", "pty"].includes(input.durable.kind))
+				throw fail("invalid_input", "Invalid activity kind");
+			const activityId = generateId();
+			durableId = activityId;
+			const durable = input.durable;
+			this.transaction((tx) => {
+				const current = this.requireScope(tx, scope);
+				if (current.status !== "active")
+					throw fail("needs_verification", "Activity scope is not active");
+				tx.insert(durableActivities)
+					.values({
+						...durable,
+						id: activityId,
+						scopeId: scope.id,
+						sourceInstanceId: scope.sourceInstanceId,
+						workspaceInstanceId: scope.workspaceInstanceId,
+						deviceId: scope.deviceId,
+						canonicalRoot: scope.canonicalRoot,
+						pathFlavor: scope.pathFlavor,
+						ownerEpoch: this.state.ownerEpoch,
+						status: "prepared",
+						createdAt: now(),
+						updatedAt: now(),
+					})
+					.run();
+			});
+		}
 		const token = Object.freeze({ id: Symbol("workspace-activity") });
-		this.state.activities.set(token, { owner: this, scope, uncertain: false });
+		this.state.activities.set(token, { owner: this, scope, uncertain: false, durableId });
 		for (const record of this.state.leases.values()) {
 			if (activityIntersects(record, scope)) record.hadActivity = true;
 		}
@@ -612,6 +673,87 @@ export class WorkspaceWriteCoordinator {
 		// Reject an already queued rollback too; ending this activity cannot erase it.
 		this.pump();
 		return token;
+	}
+
+	/** Successful dispatch is not termination evidence. A failed update retains the prepared barrier. */
+	markActivityRunning(token: WorkspaceActivityToken): void {
+		const record = this.state.activities.get(token);
+		if (!record) throw fail("activity_not_found", "Activity is not registered");
+		if (!record.durableId) return;
+		const updated = record.owner.db
+			.update(durableActivities)
+			.set({ status: "running", updatedAt: now() })
+			.where(
+				and(
+					eq(durableActivities.id, record.durableId),
+					eq(durableActivities.ownerEpoch, this.state.ownerEpoch),
+					eq(durableActivities.status, "prepared"),
+				),
+			)
+			.returning({ id: durableActivities.id })
+			.get();
+		if (!updated) throw fail("persistence_failed", "Activity dispatch ledger changed");
+	}
+
+	/** Durable rows ARE recovery holds: unscanned rows also deny recovery/rollback. No process replay. */
+	async reconcileActivitiesOnStartup(
+		signal?: AbortSignal,
+	): Promise<{ inspected: number; stopped: boolean }> {
+		const bounded = AbortSignal.any([AbortSignal.timeout(30_000), ...(signal ? [signal] : [])]);
+		let inspected = 0;
+		// Equality on status + cursor on id avoids sorting an entire two-status inventory.
+		for (const status of ["prepared", "running"] as const) {
+			let cursor: string | undefined;
+			while (inspected < 4096) {
+				if (bounded.aborted) return { inspected, stopped: true };
+				const rows = this.db
+					.select({ id: durableActivities.id, scopeId: durableActivities.scopeId })
+					.from(durableActivities)
+					.where(
+						and(
+							eq(durableActivities.status, status),
+							ne(durableActivities.ownerEpoch, this.state.ownerEpoch),
+							cursor ? gt(durableActivities.id, cursor) : undefined,
+						),
+					)
+					.orderBy(asc(durableActivities.id))
+					.limit(Math.min(16, 4096 - inspected))
+					.all();
+				if (!rows.length) break;
+				for (const row of rows) {
+					if (bounded.aborted) return { inspected, stopped: true };
+					this.transaction((tx) => {
+						const changed = tx
+							.update(durableActivities)
+							.set({ status: "unknown", updatedAt: now() })
+							.where(
+								and(
+									eq(durableActivities.id, row.id),
+									ne(durableActivities.ownerEpoch, this.state.ownerEpoch),
+									inArray(durableActivities.status, ["prepared", "running"]),
+								),
+							)
+							.returning({ id: durableActivities.id })
+							.get();
+						if (changed)
+							tx.update(scopes)
+								.set({
+									status: "needs_verification",
+									revision: sql`${scopes.revision} + 1`,
+									updatedAt: now(),
+								})
+								.where(and(eq(scopes.id, row.scopeId), ne(scopes.status, "retired")))
+								.run();
+					});
+					cursor = row.id;
+					inspected++;
+				}
+				this.changed();
+				await new Promise<void>((resolve) => setImmediate(resolve));
+			}
+			if (inspected >= 4096) return { inspected, stopped: true };
+		}
+		return { inspected, stopped: false };
 	}
 
 	endActivity(token: WorkspaceActivityToken, outcome: "finished" | "unknown" = "finished"): void {
@@ -626,6 +768,30 @@ export class WorkspaceWriteCoordinator {
 			throw fail("invalid_input", "Invalid activity outcome");
 		}
 		if (outcome === "unknown") record.uncertain = true;
+		if (record.durableId) {
+			try {
+				const status = record.uncertain ? "unknown" : "finished";
+				const updated = record.owner.db
+					.update(durableActivities)
+					.set({ status, updatedAt: now(), finishedAt: status === "finished" ? now() : null })
+					.where(
+						and(
+							eq(durableActivities.id, record.durableId),
+							eq(durableActivities.ownerEpoch, this.state.ownerEpoch),
+							inArray(
+								durableActivities.status,
+								record.uncertain ? ["prepared", "running", "unknown"] : ["prepared", "running"],
+							),
+						),
+					)
+					.returning({ id: durableActivities.id })
+					.get();
+				if (!updated) throw fail("persistence_failed", "Activity settlement ledger changed");
+			} catch (error) {
+				record.uncertain = true;
+				throw error;
+			}
+		}
 		// An unknown activity must not be cleared by a concurrent lease settling its
 		// OWN mutation guard. Failed persistence cannot be retried as "finished".
 		if (record.uncertain) {
@@ -831,6 +997,7 @@ export class WorkspaceWriteCoordinator {
 			throw fail("recovery_conflict", "Maintenance recovery requires a local workspace");
 		}
 		const current = this.requireScope(this.db, scope);
+		this.requireNoDurableActivity(scope);
 		const leaseId = input.leaseId ?? current.activeLeaseId;
 		const lease = leaseId
 			? (this.db.select().from(durableLeases).where(eq(durableLeases.leaseId, leaseId)).get() ??
@@ -1495,7 +1662,11 @@ export class WorkspaceWriteCoordinator {
 			const current = this.requireScope(tx, request.scope);
 			this.requireRuntime(request.scope.deviceId, request.runtime);
 			if (request.signal?.aborted) throw fail("aborted", "Workspace admission cancelled");
-			if (current.status !== "active") throw scopeStatusError(current.status);
+			if (
+				current.status !== "active" &&
+				!(kind === "rollback" && current.status === "needs_verification")
+			)
+				throw scopeStatusError(current.status);
 			if (
 				current.activeLeaseId !== null ||
 				current.activeLeaseEpoch !== null ||
@@ -1512,7 +1683,7 @@ export class WorkspaceWriteCoordinator {
 				tx,
 				request.scope,
 				undefined,
-				kind === "write" ? "write" : "strict",
+				kind === "write" ? "write" : "rollback",
 				request.ranges,
 			);
 			const granted = tx
@@ -1549,7 +1720,11 @@ export class WorkspaceWriteCoordinator {
 				const row = this.requireScope(tx, target.scope);
 				this.requireRuntime(target.scope.deviceId, target.runtime);
 				if (request.signal?.aborted) throw fail("aborted", "Workspace admission cancelled");
-				if (row.status !== "active") throw scopeStatusError(row.status);
+				if (
+					row.status !== "active" &&
+					!(kind === "rollback" && row.status === "needs_verification")
+				)
+					throw scopeStatusError(row.status);
 				if (
 					row.activeLeaseId !== null ||
 					row.activeLeaseEpoch !== null ||
@@ -1571,7 +1746,7 @@ export class WorkspaceWriteCoordinator {
 				targets.map((target) => target.scope),
 				undefined,
 				true,
-				kind === "write" ? "write" : "strict",
+				kind === "write" ? "write" : "rollback",
 				targets.map((target) => target.ranges ?? freezeWorkspaceRanges(target.scope)),
 			);
 			return targets.map((target, index) => {
@@ -1704,7 +1879,7 @@ export class WorkspaceWriteCoordinator {
 					this.db,
 					record.scope,
 					record,
-					record.kind === "write" ? "write" : "strict",
+					record.kind === "write" ? "write" : "rollback",
 					record.ranges,
 				);
 			},
@@ -1831,7 +2006,10 @@ export class WorkspaceWriteCoordinator {
 		) {
 			throw fail("stale_lease", "Scope fence, lease owner, revision or mutation count has changed");
 		}
-		if (row.status !== "active" && !(record.uncertain && row.status === "needs_verification")) {
+		if (
+			row.status !== "active" &&
+			!((record.uncertain || record.kind === "rollback") && row.status === "needs_verification")
+		) {
 			throw scopeStatusError(row.status);
 		}
 		return row;
@@ -1979,7 +2157,7 @@ export class WorkspaceWriteCoordinator {
 		}
 		for (const blocker of blockers) {
 			// Real uncertainty is NEVER exempted, even for a sibling in this group.
-			if (intersects(blocker)) {
+			if (_mode !== "rollback" && intersects(blocker)) {
 				throw fail(
 					"needs_verification",
 					`An overlapping physical scope needs verification: "${blocker.canonicalRoot}" ` +
@@ -2156,14 +2334,161 @@ export class WorkspaceWriteCoordinator {
 		return false;
 	}
 
+	/** Revert still checks ACL/root separately; only a live writer prevents partial rollback. */
+	assertRevertActivityBarrier(scope: Readonly<FileChangeScopeIdentity>): void {
+		this.requireScope(this.db, scope);
+		const rows = this.db
+			.select({
+				deviceId: durableActivities.deviceId,
+				pathFlavor: durableActivities.pathFlavor,
+				canonicalRoot: durableActivities.canonicalRoot,
+			})
+			.from(durableActivities)
+			.where(
+				and(
+					eq(durableActivities.deviceId, scope.deviceId),
+					eq(durableActivities.status, "running"),
+					eq(durableActivities.ownerEpoch, this.state.ownerEpoch),
+				),
+			)
+			.limit(WORKSPACE_WRITE_COORDINATOR_LIMITS.activities + 1)
+			.all();
+		if (rows.length > WORKSPACE_WRITE_COORDINATOR_LIMITS.activities)
+			throw fail("verification_backlog", "Live activity inventory exceeds admission budget");
+		if (rows.some((row) => overlaps(scope, row)))
+			throw fail("uncoordinated_activity", "A workspace writer is running; wait for it to finish");
+	}
+
+	/** Bounded metadata only, preserving every activity record and scope status. */
+	revertUnknownCoverage(scope: Readonly<FileChangeScopeIdentity>) {
+		const current = this.requireScope(this.db, scope);
+		const result: import("@shared/partial-revert").RevertUnknownCoverage[] = [];
+		if (current.status === "needs_verification")
+			result.push({
+				scopeId: scope.id,
+				deviceId: scope.deviceId,
+				root: scope.canonicalRoot,
+				reason: "needs_verification",
+			});
+		for (const activity of this.state.activities.values()) {
+			if (activity.uncertain && activityIntersects({ scope }, activity.scope))
+				result.push({
+					deviceId: scope.deviceId,
+					root: scope.canonicalRoot,
+					reason: "unknown_activity",
+				});
+		}
+		const unverified = this.db
+			.select({
+				id: scopes.id,
+				deviceId: scopes.deviceId,
+				pathFlavor: scopes.pathFlavor,
+				canonicalRoot: scopes.canonicalRoot,
+			})
+			.from(scopes)
+			.where(eq(scopes.status, "needs_verification"))
+			.limit(WORKSPACE_WRITE_COORDINATOR_LIMITS.verificationScopes + 1)
+			.all();
+		for (const row of unverified) {
+			if (row.id !== scope.id && overlaps(scope, row))
+				result.push({
+					scopeId: row.id,
+					deviceId: row.deviceId,
+					root: row.canonicalRoot,
+					reason: "needs_verification",
+				});
+		}
+		if (unverified.length > WORKSPACE_WRITE_COORDINATOR_LIMITS.verificationScopes)
+			result.push({
+				deviceId: scope.deviceId,
+				root: scope.canonicalRoot,
+				reason: "scope_inventory_truncated",
+			});
+		const rows = this.db
+			.select({
+				activityId: durableActivities.id,
+				scopeId: durableActivities.scopeId,
+				deviceId: durableActivities.deviceId,
+				pathFlavor: durableActivities.pathFlavor,
+				canonicalRoot: durableActivities.canonicalRoot,
+				status: durableActivities.status,
+				kind: durableActivities.kind,
+			})
+			.from(durableActivities)
+			.where(eq(durableActivities.deviceId, scope.deviceId))
+			.limit(WORKSPACE_WRITE_COORDINATOR_LIMITS.activities + 1)
+			.all();
+		for (const row of rows) {
+			if (!overlaps(scope, row)) continue;
+			result.push({
+				scopeId: row.scopeId,
+				activityId: row.activityId,
+				deviceId: row.deviceId,
+				root: row.canonicalRoot,
+				reason: row.status === "finished" ? `${row.kind}_without_snapshot` : row.status,
+			});
+		}
+		if (rows.length > WORKSPACE_WRITE_COORDINATOR_LIMITS.activities)
+			result.push({
+				deviceId: scope.deviceId,
+				root: scope.canonicalRoot,
+				reason: "activity_inventory_truncated",
+			});
+		return result;
+	}
+
+	private requireNoDurableActivity(scope: Readonly<FileChangeScopeIdentity>): void {
+		// Indexed EXISTS catches the exact scope even when startup's bounded pass has not reached it.
+		const exact = this.db.get<[number]>(sql`SELECT EXISTS (
+			SELECT 1 FROM ${durableActivities} WHERE ${durableActivities.scopeId} = ${scope.id}
+			AND ${durableActivities.status} IN ('prepared', 'running', 'unknown')) AS blocked`);
+		if (exact?.[0])
+			throw fail("uncoordinated_activity", "Durable workspace activity requires verification");
+		// Source/scope aliases cannot bypass a physical-root hold. Bounded indexed device/status pages.
+		for (const status of ["prepared", "running", "unknown"] as const) {
+			const rows = this.db
+				.select({
+					deviceId: durableActivities.deviceId,
+					pathFlavor: durableActivities.pathFlavor,
+					canonicalRoot: durableActivities.canonicalRoot,
+				})
+				.from(durableActivities)
+				.where(
+					and(eq(durableActivities.deviceId, scope.deviceId), eq(durableActivities.status, status)),
+				)
+				.limit(WORKSPACE_WRITE_COORDINATOR_LIMITS.activities + 1)
+				.all();
+			if (rows.length > WORKSPACE_WRITE_COORDINATOR_LIMITS.activities)
+				throw fail(
+					"verification_backlog",
+					"Durable activity inventory exceeds the admission budget",
+				);
+			if (rows.some((row) => overlaps(scope, row)))
+				throw fail(
+					"uncoordinated_activity",
+					"Overlapping durable workspace activity requires verification",
+				);
+		}
+	}
+
 	private rejectActivityOverlap(kind: WorkspaceWriteLeaseKind, target: WorkspaceWriteTarget) {
+		if (kind === "rollback") {
+			this.assertRevertActivityBarrier(target.scope);
+			for (const activity of this.state.activities.values()) {
+				if (
+					!activity.durableId &&
+					!activity.uncertain &&
+					target.activityPolicy !== "observe" &&
+					activityIntersects(target, activity.scope)
+				)
+					throw fail("uncoordinated_activity", "An overlapping uncoordinated writer is registered");
+			}
+			return;
+		}
 		for (const activity of this.state.activities.values()) {
 			if (!activityIntersects(target, activity.scope)) continue;
 			if (activity.uncertain) {
 				throw fail("needs_verification", "An uncertain activity still needs durable quarantine");
-			}
-			if (kind === "rollback" && target.activityPolicy !== "observe") {
-				throw fail("uncoordinated_activity", "An overlapping uncoordinated writer is registered");
 			}
 		}
 	}
@@ -2372,7 +2697,7 @@ function overlaps(left: PhysicalScope, right: PhysicalScope): boolean {
 
 /** Legacy scope-only callers are conservative in BOTH directions. Actual files
  * use immutable range intersection above; a scope identity is not a write range. */
-type RecoveryBarrierMode = "write" | "strict";
+type RecoveryBarrierMode = "write" | "strict" | "rollback";
 
 function barrierBlocks(
 	target: PhysicalScope,

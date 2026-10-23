@@ -30,10 +30,33 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "messages") {
 	// exact text/blocks the REAL send/edit/queue services supply, then reads JSON back.
 	const { sqlite, db: fixtureDb } = getTestDb();
 	sqlite.exec("CREATE TABLE saved_messages (id TEXT PRIMARY KEY, row_json TEXT NOT NULL)");
+	fixtureDb
+		.insert(schema.users)
+		.values({
+			id: "original-actor",
+			username: "original-actor",
+			passwordHash: "fixture-only",
+			createdAt: new Date().toISOString(),
+		})
+		.run();
 	for (const id of ["n", "child", "resume-official", "resume-child", "resume-followup"]) {
 		fixtureDb
 			.insert(schema.narrators)
-			.values({ id, createdAt: new Date().toISOString(), updatedAt: new Date().toISOString() })
+			.values({
+				id,
+				ownerUserId: "original-actor",
+				cwd: import.meta.dir,
+				workspaceContext: {
+					revision: 0,
+					deviceId: "local",
+					cwd: import.meta.dir,
+					pathFlavor: "posix",
+					contextKey: `message-flow-fixture:${id}`,
+					capabilities: { switchDirectory: true },
+				},
+				createdAt: new Date().toISOString(),
+				updatedAt: new Date().toISOString(),
+			})
 			.run();
 	}
 	let idSeq = 0;
@@ -83,28 +106,7 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "messages") {
 				if (key === "query")
 					return {
 						...target.query,
-						narrators: {
-							findFirst: async () => ({
-								id: "n",
-								variant: "primary",
-								status: "idle",
-								substatus: [],
-								traits: [],
-								cwd: import.meta.dir,
-								defaultDeviceId: null,
-								chapterId: null,
-								contextProjectId: null,
-								workspaceRevision: 0,
-								workspaceContext: {
-									revision: 0,
-									deviceId: "local",
-									cwd: import.meta.dir,
-									pathFlavor: "posix",
-									contextKey: "message-flow-fixture",
-									capabilities: { switchDirectory: true },
-								},
-							}),
-						},
+						narrators: target.query.narrators,
 						narratorMessageRefs: {
 							findFirst: async () => ({ narratorId: "n", messageId: currentTarget, seq: 1 }),
 						},

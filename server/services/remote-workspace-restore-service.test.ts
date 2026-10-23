@@ -131,6 +131,7 @@ for (const scenario of [
 	"cross_filesystem_refused",
 	"cross_filesystem_lost_refusal",
 	"committed",
+	"unknown_activity",
 	"unchanged_modified",
 	"new_file",
 	"lost_reply",
@@ -359,6 +360,12 @@ for (const scenario of [
 					expect(restoreDispatches).toBe(0);
 					return;
 				}
+				if (scenario === "unknown_activity") {
+					db.update(schema.fileChangeScopes)
+						.set({ status: "needs_verification" })
+						.where(eq(schema.fileChangeScopes.id, origin.binding.scopeId))
+						.run();
+				}
 				const preview = await service.prepare({
 					principal,
 					narratorId,
@@ -404,6 +411,19 @@ for (const scenario of [
 				permit = true;
 				expect(dispatchNotifications).toBe(0);
 				let result = await service.apply(request);
+				if (scenario === "unknown_activity") {
+					expect(result.status).toBe("committed");
+					expect(
+						result.coverage?.unknownCoverage.some((entry) => entry.reason === "needs_verification"),
+					).toBe(true);
+					expect(
+						db
+							.select()
+							.from(schema.fileChangeScopes)
+							.where(eq(schema.fileChangeScopes.id, origin.binding.scopeId))
+							.get()?.status,
+					).toBe("needs_verification");
+				}
 				expect(dispatchNotifications).toBe(1);
 				expect(restoreDispatches).toBe(1);
 				if (scenario.startsWith("cross_filesystem_")) {

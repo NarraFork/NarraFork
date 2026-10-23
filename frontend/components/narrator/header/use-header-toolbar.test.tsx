@@ -1,8 +1,11 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { parseHTML } from "linkedom";
 import { act, Children, isValidElement, type ReactElement, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import * as layoutHooks from "../../../hooks/useNarratorToolbarLayout";
+import { api } from "../../../lib/api";
+import { narratorWSManager } from "../../../lib/narrator-ws-manager";
 import { PathRulesPopover } from "../interaction/PathRulesPopover";
 import {
 	ExecutionDeviceOptions,
@@ -18,6 +21,7 @@ import {
 } from "./use-header-toolbar";
 
 let root: Root;
+let client: QueryClient;
 let controller: UseHeaderToolbarResult;
 let restoreLayout: () => void;
 let entryEnabled: Parameters<typeof layoutHooks.useNarratorToolbarLayout>[0]["entryEnabled"];
@@ -71,6 +75,20 @@ beforeEach(() => {
 		originals.set(key, Object.getOwnPropertyDescriptor(globalThis, key));
 		Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
 	}
+	client = new QueryClient({
+		defaultOptions: { queries: { retry: false, staleTime: Infinity, gcTime: 0 } },
+	});
+	client.setQueryData(["auth", "me"], { id: "actor" });
+	for (const id of ["narrator-a", "narrator-b"])
+		client.setQueryData(["deviceWorkspaces", id, "actor"], {
+			pages: [{ items: [], nextCursor: null }],
+			pageParams: [null],
+		});
+	spyOn(narratorWSManager, "addListener").mockReturnValue({ _id: 1 } as ReturnType<
+		typeof narratorWSManager.addListener
+	>);
+	spyOn(narratorWSManager, "removeListener").mockImplementation(() => {});
+	spyOn(api, "listNarratorDeviceWorkspaces").mockResolvedValue({ items: [], nextCursor: null });
 	root = createRoot(document.body.appendChild(document.createElement("div")));
 	const bottom = [narratorToolbarItem("path-rules"), narratorToolbarItem("terminal")].filter(
 		(def): def is NonNullable<typeof def> => !!def,
@@ -85,6 +103,8 @@ beforeEach(() => {
 afterEach(async () => {
 	await act(async () => root.unmount());
 	restoreLayout();
+	client.clear();
+	mock.restore();
 	for (const [key, descriptor] of originals) {
 		if (descriptor) Object.defineProperty(globalThis, key, descriptor);
 		else Reflect.deleteProperty(globalThis, key);
@@ -93,7 +113,24 @@ afterEach(async () => {
 });
 
 async function render(props = options()) {
-	await act(async () => root.render(<Probe {...props} />));
+	client.setQueryData(
+		["workspaceContext", props.narratorId],
+		props.workspaceContext ?? {
+			revision: 4,
+			deviceId: "local",
+			cwd: "/local",
+			contextKey: "local:4",
+			pathFlavor: "posix",
+			capabilities: { switchDirectory: true },
+		},
+	);
+	await act(async () =>
+		root.render(
+			<QueryClientProvider client={client}>
+				<Probe {...props} />
+			</QueryClientProvider>,
+		),
+	);
 }
 
 function overlayOf(type: unknown) {

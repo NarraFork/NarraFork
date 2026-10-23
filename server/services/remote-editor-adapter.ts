@@ -111,6 +111,7 @@ export function createRemoteEditorAdapter(
 						const fresh = await actor.authorize(
 							{ path: binding.lexicalPath, deviceId: binding.deviceId, origin: "reference" },
 							"read",
+							binding,
 						);
 						if (!sameEditorBinding(fresh, binding))
 							throw new EditorDocumentError(
@@ -206,6 +207,7 @@ export function createRemoteEditorAdapter(
 						const fresh = await actor.authorize(
 							{ path: binding.lexicalPath, deviceId: binding.deviceId, origin: "reference" },
 							"write",
+							binding,
 						);
 						if (!sameEditorBinding(fresh, binding))
 							throw new EditorDocumentError(

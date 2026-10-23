@@ -36,7 +36,87 @@ let policyNarrators: string[] = [];
 let aclChecks: unknown[] = [];
 let policyOperations: string[] = [];
 let compileHook: (() => void) | undefined;
+let selectionInstalled = true;
+let deviceLookupHook: (() => void) | undefined;
+mock.module("./workspace-context-service", () => ({
+	assertWorkspaceSelectionInstalled() {
+		if (!selectionInstalled) throw new Error("WORKSPACE_CONTEXT_INSTALL_PENDING");
+	},
+}));
 let fence = mock(async () => {});
+let bindingContexts = new Map<string, WorkspaceContext>();
+let bindingChecks: Array<{
+	narratorId: string;
+	workspace: WorkspaceContext;
+	actor: string | null | undefined;
+}> = [];
+function assertBinding(
+	narratorId: string,
+	workspace: WorkspaceContext,
+	options: { userId?: string | null },
+) {
+	bindingChecks.push({ narratorId, workspace: structuredClone(workspace), actor: options.userId });
+	const current = bindingContexts.get(`${narratorId}:${workspace.deviceId}`);
+	if (
+		!workspace.binding ||
+		workspace.binding.narratorId !== narratorId ||
+		!current ||
+		current.contextKey !== workspace.contextKey ||
+		current.cwd !== workspace.cwd ||
+		JSON.stringify(current.binding) !== JSON.stringify(workspace.binding)
+	)
+		throw new Error("WORKSPACE_BINDING_STALE");
+}
+mock.module("./narrator-device-workspace-service", () => ({
+	narratorDeviceWorkspaceService: {
+		resolve: async (narratorId: string, deviceId: string) =>
+			bindingContexts.get(`${narratorId}:${deviceId}`) ?? null,
+		assertCurrent: async (
+			narratorId: string,
+			workspace: WorkspaceContext,
+			options: { userId?: string | null },
+		) => assertBinding(narratorId, workspace, options),
+		assertCurrentSync: assertBinding,
+		assertEndpointDeviceCurrent: async () => ({ assertStillCurrent() {} }),
+		assertOriginalEndpointDeviceCurrent: async (
+			_narrator: string,
+			_device: string,
+			options: { userId: string; originalProjectId: string | null },
+		) => {
+			actorChecks.push({ project: options.originalProjectId, actor: options.userId });
+			const state = {
+				actorExists,
+				aclRead,
+				aclWrite,
+				projectRead,
+				projectWrite,
+				online,
+				devicesAuthorized,
+				runtime: JSON.stringify(runtime),
+				generation,
+			};
+			return {
+				assertStillCurrent() {
+					if (
+						JSON.stringify(state) !==
+						JSON.stringify({
+							actorExists,
+							aclRead,
+							aclWrite,
+							projectRead,
+							projectWrite,
+							online,
+							devicesAuthorized,
+							runtime: JSON.stringify(runtime),
+							generation,
+						})
+					)
+						throw new Error("live endpoint authority changed");
+				},
+			};
+		},
+	},
+}));
 
 const remote = {
 	kind: "remote",
@@ -68,6 +148,20 @@ mock.module("../db", () => ({
 	db: {
 		query: {
 			users: { findFirst: async () => (actorExists ? { role } : undefined) },
+			remoteDevices: {
+				findFirst: async () => {
+					deviceLookupHook?.();
+					return devicesAuthorized
+						? {
+								id: "remote",
+								scope: "global",
+								ownerScope: "shared",
+								createdBy: "actor",
+								revokedAt: null,
+							}
+						: undefined;
+				},
+			},
 			narrators: {
 				findFirst: async () => ({
 					id: "narrator",
@@ -110,6 +204,7 @@ mock.module("./integration-resource-binding-service", () => ({
 	integrationResourceBindingService: { get: async () => binding },
 }));
 mock.module("./device-connection-service", () => ({
+	isDeviceOnline: () => online,
 	getSessionDevices: async (project: string, actor: string) => {
 		actorChecks.push({ project, actor });
 		return devicesAuthorized ? [{ id: "remote", online, scope: "project" }] : [];
@@ -151,6 +246,7 @@ const {
 	createApprovedWorkspaceReadGuard,
 	createApprovedWorkspaceArtifactAccess,
 	createNarratorWorkspaceAttachmentSourceAccess,
+	createDeviceWorkspaceConfig,
 } = await import("./workspace-artifact-access");
 
 function workspace(deviceId = "remote", cwd = "/workspace"): WorkspaceContext {
@@ -162,6 +258,14 @@ function workspace(deviceId = "remote", cwd = "/workspace"): WorkspaceContext {
 		pathFlavor: "posix",
 		contextProjectId: "project",
 		capabilities: { switchDirectory: true },
+		binding: {
+			version: 1,
+			narratorId: "narrator",
+			deviceId,
+			bindingId: `binding-${deviceId}`,
+			bindingRevision: 1,
+			bindingKey: "remote-context",
+		},
 	};
 }
 function target(root = "/approved", deviceId = "remote"): ToolExecutionTarget {
@@ -240,10 +344,31 @@ beforeEach(() => {
 	aclChecks = [];
 	policyOperations = [];
 	compileHook = undefined;
+	selectionInstalled = true;
+	deviceLookupHook = undefined;
 	fence = mock(async () => {});
+	bindingContexts = new Map([
+		["narrator:remote", workspace()],
+		["narrator:local", workspace("local", narraforkDir)],
+	]);
+	bindingChecks = [];
 });
 
 describe("explicit human workspace attachments", () => {
+	test("pending selected installation blocks new uploads but not exact original document writes", async () => {
+		selectionInstalled = false;
+		const created = createNarratorWorkspaceAttachmentAccess("narrator", workspace(), {
+			userId: "actor",
+		});
+		await expect(created.authorizeWrite("/workspace/x", remote)).rejects.toThrow("INSTALL_PENDING");
+		const original = createNarratorWorkspaceAttachmentAccess("narrator", workspace(), {
+			userId: "actor",
+			originalFilePath: "/workspace/x",
+		});
+		expect(await original.authorizeWrite("/workspace/x", remote)).toBe(true);
+		selectionInstalled = true;
+		expect(await created.authorizeWrite("/workspace/x", remote)).toBe(true);
+	});
 	test("ordinary AI readOnly does not prohibit a write-authorized human upload", async () => {
 		const access = createNarratorWorkspaceAttachmentAccess("narrator", workspace(), {
 			userId: "actor",
@@ -256,6 +381,31 @@ describe("explicit human workspace attachments", () => {
 		]);
 		expect(actorChecks).toContain("actor");
 		expect(actorChecks).toContainEqual({ project: "project", actor: "actor" });
+	});
+	test("inactive device human upload ignores selection revision but still pins its own binding", async () => {
+		const access = createNarratorWorkspaceAttachmentAccess("narrator", workspace(), {
+			userId: "actor",
+		});
+		revision++;
+		contextKey = "selected-other-device";
+		expect(await access.authorizeWrite("/workspace/x", remote)).toBe(true);
+		compileHook = () =>
+			bindingContexts.set("narrator:remote", { ...workspace(), cwd: "/new-binding" });
+		await expect(access.authorizeWrite("/workspace/x", remote)).rejects.toThrow(
+			"WORKSPACE_BINDING_STALE",
+		);
+	});
+	test("existing document exact target survives same-device rebinding and rejects target substitution", async () => {
+		const access = createNarratorWorkspaceAttachmentAccess("narrator", workspace(), {
+			userId: "actor",
+			originalFilePath: "/workspace/x",
+		});
+		bindingContexts.set("narrator:remote", { ...workspace(), cwd: "/new-binding" });
+		revision++;
+		expect(await access.authorizeWrite("/workspace/x", remote)).toBe(true);
+		await expect(access.authorizeWrite("/workspace/other", remote)).rejects.toThrow("exact target");
+		projectWrite = false;
+		await expect(access.authorizeWrite("/workspace/x", remote)).rejects.toThrow("project ACL");
 	});
 	test("anonymous never borrows narrator owner authority", async () => {
 		const access = createNarratorWorkspaceAttachmentAccess("narrator", workspace());
@@ -370,17 +520,33 @@ describe("explicit human workspace attachments", () => {
 			"canonical path changed",
 		);
 	});
-	test("workspace revision and execution generation changes fail closed", async () => {
+	test("new attachment binding revision and execution generation changes fail closed", async () => {
 		const access = createNarratorWorkspaceAttachmentAccess("narrator", workspace(), {
 			userId: "actor",
 		});
-		revision++;
-		await expect(access.authorizeWrite("/workspace/x", remote)).rejects.toThrow("context changed");
-		revision--;
+		bindingContexts.set("narrator:remote", { ...workspace(), cwd: "/changed" });
+		await expect(access.authorizeWrite("/workspace/x", remote)).rejects.toThrow(
+			"WORKSPACE_BINDING_STALE",
+		);
+		bindingContexts.set("narrator:remote", workspace());
 		generation++;
 		await expect(access.authorizeWrite("/workspace/x", remote)).rejects.toThrow(
 			"execution identity changed",
 		);
+	});
+	test("Write downgrade after the final ACL lookup cannot be captured as a fresh Read-only ticket", async () => {
+		let lookups = 0;
+		deviceLookupHook = () => {
+			if (++lookups === 2) aclWrite = false;
+		};
+		const access = createNarratorWorkspaceAttachmentAccess("narrator", workspace(), {
+			userId: "actor",
+			originalFilePath: "/workspace/x",
+		});
+		await expect(access.authorizeWrite("/workspace/x", remote)).rejects.toThrow(
+			"live endpoint authority changed",
+		);
+		expect(lookups).toBe(2);
 	});
 	test("late generation changes and caller cancellation are fenced", async () => {
 		const controller = new AbortController();
@@ -464,6 +630,38 @@ describe("persisted original attachment exact source access", () => {
 		expect(policyOperations).toEqual(["read"]);
 		expect(aclChecks.every((check) => (check as { need: string }).need === "read")).toBe(true);
 		expect(access.runtimeGeneration).toBe(7);
+	});
+	test("original native root evidence is forwarded intact and root replacement cannot mint fresh provenance", async () => {
+		const original = originalSourceWorkspace();
+		original.nativeRootDescriptor = { originalRoot: "saved-object-pin" } as never;
+		const previous = remote.statFile;
+		let rootMatches = true;
+		const stat = mock(
+			async (
+				_path: string,
+				options?: import("../lib/agent/execution/backend").FileMetadataOptions,
+			) => {
+				expect(options?.expectedNativeDescriptor).toEqual(original.nativeRootDescriptor);
+				return { isDirectory: rootMatches, isFile: false, size: 0 };
+			},
+		);
+		remote.statFile = stat;
+		try {
+			const access = createNarratorWorkspaceAttachmentSourceAccess(
+				"source-narrator",
+				original,
+				originalAttachmentPath,
+				{ userId: "actor" },
+			);
+			expect(await access.authorizeRead(originalAttachmentPath, remote)).toBe(true);
+			rootMatches = false;
+			await expect(access.authorizeRead(originalAttachmentPath, remote)).rejects.toThrow(
+				"root identity changed",
+			);
+			expect(stat).toHaveBeenCalledTimes(3);
+		} finally {
+			remote.statFile = previous;
+		}
 	});
 	test("exact-file scope never becomes a whole original workspace or a directory read", async () => {
 		const access = createNarratorWorkspaceAttachmentSourceAccess(
@@ -642,6 +840,7 @@ describe("persisted original attachment exact source access", () => {
 function artifactContext(): ToolContext {
 	const ctx = context();
 	ctx.workspaceContext = workspace();
+	delete ctx.workspaceContext.binding; // Legacy AI fixture retains its original selected-context checks.
 	ctx.executionPlan = {
 		kind: "multi",
 		primaryKey: "source",
@@ -653,6 +852,107 @@ function artifactContext(): ToolContext {
 	return ctx;
 }
 const artifactPath = "/workspace/.narrafork/attached/nonce/SKILL.md";
+
+function boundArtifactContext(): ToolContext {
+	const ctx = artifactContext();
+	const bound: WorkspaceContext = {
+		...workspace(),
+		contextKey: "narrator:remote:binding:1",
+		binding: {
+			version: 1,
+			bindingId: "binding-remote",
+			narratorId: "narrator",
+			deviceId: "remote",
+			bindingRevision: 1,
+			bindingKey: "narrator:remote:binding:1",
+		},
+	};
+	ctx.workspaceContext = bound;
+	if (!ctx.executionPlan) throw new Error("Fixture requires an endpoint plan");
+	for (const endpoint of ctx.executionPlan.endpoints) {
+		endpoint.target.workspaceContext = structuredClone(bound);
+		endpoint.target.workspaceBinding = structuredClone(bound.binding);
+	}
+	bindingContexts.set("narrator:remote", structuredClone(bound));
+	return ctx;
+}
+
+describe("device-bound AI artifact and production access", () => {
+	test("a correct independent binding allows an authorized Write even when another endpoint selection has changed", async () => {
+		permissionMode = "default";
+		const ctx = boundArtifactContext();
+		revision = 90;
+		contextKey = "other-selected-workspace";
+		const access = createApprovedWorkspaceArtifactAccess(ctx);
+		expect(await access.authorizeWrite(artifactPath, remote)).toBe(true);
+		expect(bindingChecks).toHaveLength(2);
+		expect(bindingChecks.every((check) => check.actor === "actor")).toBe(true);
+	});
+
+	test("foreign narrator references and mismatched approved endpoint references never grant artifact writes", async () => {
+		permissionMode = "default";
+		const ctx = boundArtifactContext();
+		if (!ctx.workspaceContext?.binding) throw new Error("Fixture binding missing");
+		ctx.workspaceContext.binding.narratorId = "foreign";
+		await expect(
+			createApprovedWorkspaceArtifactAccess(ctx).authorizeWrite(artifactPath, remote),
+		).rejects.toThrow("foreign");
+		const second = boundArtifactContext();
+		const write = second.executionPlan?.endpoints.find(
+			(endpoint) => endpoint.operation === "write",
+		);
+		if (!write?.target.workspaceBinding) throw new Error("Fixture Write binding missing");
+		write.target.workspaceBinding.bindingRevision = 2;
+		await expect(
+			createApprovedWorkspaceArtifactAccess(second).authorizeWrite(artifactPath, remote),
+		).rejects.toThrow("approved canonical Write endpoints");
+	});
+
+	test("same directory version changes, including late policy-time changes, reject a bound artifact", async () => {
+		permissionMode = "default";
+		for (const late of [false, true]) {
+			const ctx = boundArtifactContext();
+			const change = () => {
+				const stored = bindingContexts.get("narrator:remote");
+				if (!stored?.binding) throw new Error("Fixture binding missing");
+				const current = structuredClone(stored);
+				if (!current.binding) throw new Error("Fixture binding missing");
+				current.binding.bindingRevision++;
+				bindingContexts.set("narrator:remote", current);
+			};
+			if (late) compileHook = change;
+			else change();
+			await expect(
+				createApprovedWorkspaceArtifactAccess(ctx).authorizeWrite(artifactPath, remote),
+			).rejects.toThrow("WORKSPACE_BINDING_STALE");
+			compileHook = undefined;
+		}
+	});
+
+	test("production file-access factory freezes the actual actor and signal rather than rereading mutable session state", async () => {
+		permissionMode = "default";
+		const ctx = boundArtifactContext();
+		const controller = new AbortController();
+		const input = { userId: "actor", signal: controller.signal };
+		const pendingConfig = createDeviceWorkspaceConfig("narrator", input);
+		// Mutation happens while even the module import is pending, before factory resolution.
+		input.userId = "later-user";
+		input.signal = new AbortController().signal;
+		const config = await pendingConfig;
+		const frozen = await config.resolveDeviceWorkspace?.("remote");
+		if (!frozen) throw new Error("Expected configured endpoint");
+		const file = config.createDeviceWorkspaceFileAccess?.(frozen, remote);
+		if (!file) throw new Error("Expected real actor-bound file access");
+		expect(await file.authorizeRead("/workspace/read.txt", remote, controller.signal)).toBe(true);
+		expect(bindingChecks.every((check) => check.actor === "actor")).toBe(true);
+		if (!ctx.workspaceContext) throw new Error("Fixture workspace missing");
+		expect(frozen).toEqual(ctx.workspaceContext);
+		controller.abort(new Error("original pass cancelled"));
+		expect(() => config.assertDeviceWorkspaceCurrentSync?.(frozen)).toThrow(
+			"original pass cancelled",
+		);
+	});
+});
 
 describe("explicit AI workspace artifact materialization", () => {
 	test("a frozen approved Write endpoint admits the live authorized actor", async () => {

@@ -275,6 +275,7 @@ export class RevertPlannerLocalAccess implements RevertPlannerAccess {
 			identity,
 			executionBinding,
 			scopeRevision: scope.revision,
+			unknownCoverage: runtime.coordinator.revertUnknownCoverage(scope),
 			assertCurrent,
 			async readCurrent({ signal, maxBytes }) {
 				if (

@@ -184,6 +184,7 @@ beforeEach(async () => {
 				identity,
 				executionBinding,
 				scopeRevision: scope.revision,
+				unknownCoverage: runtime.coordinator.revertUnknownCoverage(scope),
 				async assertCurrent({ signal }) {
 					signal.throwIfAborted();
 					const live = runtime.evidence.getScope(scope.id);
@@ -191,7 +192,7 @@ beforeEach(async () => {
 						!live ||
 						live.activeLeaseId ||
 						live.activeMutationCount ||
-						live.status !== "active" ||
+						(live.status !== "active" && live.status !== "needs_verification") ||
 						live.revision !== scope.revision ||
 						live.fencingToken !== scope.fencingToken
 					)
@@ -1030,6 +1031,67 @@ describe("deterministic actor interleaving model", () => {
 });
 
 describe("real tools -> original prepared manifests -> local transaction", () => {
+	test("known Write rolls back beside crashed unknown Bash and preserves uncertainty", async () => {
+		const path = join(workspace, "partial-known.txt");
+		await fs.writeFile(path, "before\n");
+		await write(path, "after\n");
+		const effect = db.select().from(schema.fileChangeEffects).get();
+		if (!effect) throw new Error("Missing known Write evidence");
+		const scope = runtime.evidence.getScope(effect.scopeId);
+		if (!scope) throw new Error("Missing known Write scope");
+		db.insert(schema.workspaceWriteActivities)
+			.values({
+				id: generateId(),
+				scopeId: scope.id,
+				sourceInstanceId: scope.sourceInstanceId,
+				workspaceInstanceId: scope.workspaceInstanceId,
+				deviceId: "local",
+				userId: "alice",
+				narratorId: "narrator",
+				projectId: "project",
+				bindingId: "test-binding",
+				bindingRevision: 1,
+				contextKey: "test-context",
+				canonicalRoot: scope.canonicalRoot,
+				pathFlavor: scope.pathFlavor,
+				rootEvidenceDigest: "test-root",
+				ownerEpoch: "crashed-process",
+				kind: "bash",
+				operationId: "crashed-bash",
+				attempt: 1,
+				status: "unknown",
+				createdAt: now(),
+				updatedAt: now(),
+			})
+			.run();
+		db.update(schema.fileChangeScopes)
+			.set({ status: "needs_verification" })
+			.where(eq(schema.fileChangeScopes.id, scope.id))
+			.run();
+		const plan = await prepare({ kind: "revert", uiAction: "revert_files" });
+		const result = await execution(plan).result;
+		expect(result.status).toBe("committed");
+		expect(await fs.readFile(path, "utf8")).toBe("before\n");
+		expect(result.coverage?.restoredFiles).toContain("partial-known.txt");
+		expect(result.coverage?.unknownCoverage.some((entry) => entry.reason === "unknown")).toBe(true);
+		expect(runtime.evidence.getScope(scope.id)?.status).toBe("needs_verification");
+	});
+
+	test("conflicted Write is skipped while another known file restores", async () => {
+		const safe = join(workspace, "partial-safe.txt");
+		const conflict = join(workspace, "partial-conflict.txt");
+		await fs.writeFile(safe, "safe before\n");
+		await write(safe, "safe after\n");
+		await fs.writeFile(conflict, "conflict before\n");
+		await write(conflict, "conflict after\n");
+		await fs.writeFile(conflict, "bash overwrite\n");
+		const plan = await prepare({ kind: "revert", uiAction: "revert_files" });
+		const result = await execution(plan).result;
+		expect(result.status).toBe("committed");
+		expect(await fs.readFile(safe, "utf8")).toBe("safe before\n");
+		expect(await fs.readFile(conflict, "utf8")).toBe("bash overwrite\n");
+		expect(result.coverage?.conflicts.map((entry) => entry.path)).toContain("partial-conflict.txt");
+	});
 	test("snapshot conflict recovery requires explicit confirmation before journal or target mutation", async () => {
 		const path = join(workspace, "snapshot-conflict.txt");
 		await fs.writeFile(path, "baseline\r\n", { mode: 0o751 });
@@ -1038,10 +1100,10 @@ describe("real tools -> original prepared manifests -> local transaction", () =>
 		await write(path, "selected two\n");
 		await fs.writeFile(path, "human after selections\n");
 		await fs.chmod(path, 0o600);
-		const selectiveFailure = await prepare({ kind: "revert", uiAction: "revert_files" }).catch(
-			(error: unknown) => error,
-		);
-		expect(selectiveFailure).toMatchObject({ code: "REVERT_PLANNER_REVERSAL_REFUSED" });
+		const selectivePlan = await prepare({ kind: "revert", uiAction: "revert_files" });
+		expect(selectivePlan.status).toBe("prepared");
+		expect(selectivePlan.expectedFileCount).toBe(0);
+		expect(await fs.readFile(path, "utf8")).toBe("human after selections\n");
 		const plan = await prepare({
 			kind: "revert",
 			uiAction: "revert_files",

@@ -624,6 +624,49 @@ export async function executeQueuedNewCommand(
 					)
 				).model
 			: (sourceNarrator.model ?? undefined);
+	// /new keeps its consumption-time cwd semantics, but cannot reinterpret queued files.
+	const creationCwd = active.cwd;
+	const attachmentSource = buffered.attachmentWorkspace
+		? structuredClone(buffered.attachmentWorkspace)
+		: null;
+	const assertAttachmentForwarding = async () => {
+		if (!buffered.textFiles?.length) return;
+		const unavailable = () =>
+			new AppError("附件来源已变化，请在新会话中重新附加", 409, "QUEUED_ATTACHMENT_SOURCE_CHANGED");
+		try {
+			if (
+				!attachmentSource ||
+				attachmentSource.deviceId !== "local" ||
+				attachmentSource.cwd !== creationCwd
+			)
+				throw unavailable();
+			const access = await prepareNarratorTextAttachmentAccess(active.narratorId, {
+				userId: buffered.createdBy,
+				workspaceContext: attachmentSource,
+				requireWorkspaceSource: true,
+			});
+			await access.authorizeWrite(attachmentSource.cwd, access.backend);
+			const selected = db
+				.select({ context: narrators.workspaceContext, deviceId: narrators.defaultDeviceId })
+				.from(narrators)
+				.where(eq(narrators.id, active.narratorId))
+				.get();
+			if (
+				!selected ||
+				(selected.deviceId ?? "local") !== attachmentSource.deviceId ||
+				selected.context?.contextKey !== attachmentSource.contextKey ||
+				JSON.stringify(selected.context?.binding) !== JSON.stringify(attachmentSource.binding)
+			)
+				throw unavailable();
+		} catch (error) {
+			throw new AppError(
+				"附件来源已变化，请在新会话中重新附加",
+				error instanceof AppError ? error.statusCode : 409,
+				"QUEUED_ATTACHMENT_SOURCE_CHANGED",
+			);
+		}
+	};
+	await assertAttachmentForwarding();
 	const newNarrator = await narratorService.create({
 		chapterId: null,
 		model: newModel,
@@ -638,14 +681,20 @@ export async function executeQueuedNewCommand(
 		dangerReflectionOverride: normalizeOptionalDangerReflectionOverride(
 			sourceNarrator.dangerReflectionOverride,
 		),
-		cwd: active.cwd,
+		cwd: creationCwd,
 		// The person who queued `/new` owns the session it spawns. Falling back to the
 		// source narrator's owner keeps it out of "ownerless" territory when the
 		// buffered message has no recorded author (system-queued paths).
 		ownerUserId: buffered.createdBy ?? sourceNarrator.ownerUserId,
 	});
 
-	if (initialMessage || buffered.fileReferences?.length) {
+	if (
+		initialMessage ||
+		buffered.fileReferences?.length ||
+		buffered.textFiles?.length ||
+		buffered.images?.length
+	) {
+		await assertAttachmentForwarding();
 		await sendMessage(
 			newNarrator.id,
 			initialMessage,
@@ -3115,7 +3164,8 @@ async function feedMessageUnlocked(
 		if (rawTextFiles?.length) {
 			textAttachmentAccess = await prepareNarratorTextAttachmentAccess(narratorId, {
 				userId,
-				workspaceContext: active._workspaceContext,
+				workspaceContext: accepted.attachmentWorkspace ?? undefined,
+				requireWorkspaceSource: true,
 				authorizationGuard: async () => {
 					if (!inputOwner.isCurrent()) throw new ValidationError("Attachment input owner changed");
 				},
@@ -5613,185 +5663,208 @@ async function reExecuteDeniedToolCallUnlocked(
 				// Restore the triggering user so knowledge-base ACL works after a rebuild.
 				// The active may have been freshly recreated (interrupt destroyed the old one),
 				// in which case _currentUserId would otherwise be undefined → null.
-				active._currentUserId = userId ?? active._currentUserId ?? null;
-				await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
-
-				broadcastToNarrator(narratorId, {
-					type: "tool_started",
-					narratorId,
-					toolCallId: toolCall.id,
-					toolUseId,
-					toolName: toolCall.toolName,
-					input: toolInput,
-				});
-
-				const { executeTool } = await import("../lib/agent/tool-executor");
+				active._currentUserId = userId ?? null;
 				const toolName = toolCall.toolName;
-
-				// Reuse the same runtime/device ACL ceiling as the ordinary loop, including recovery.
-				const oauthRuntime = await assertOAuthNarratorRuntimeActive(
-					narratorId,
-					active._currentUserId,
-				);
-				const sessionDevices = (await resolveSessionDevices(active._projectId ?? null)) ?? [];
-				const rerunMessage = await db.query.narratorMessages.findFirst({
-					where: eq(narratorMessages.id, toolCall.messageId),
-					columns: { parentToolUseId: true },
-				});
-				const parentNarratorId = isSubagent ? (narrator.parentNarratorId ?? undefined) : undefined;
-				const parentToolUseId = isSubagent
-					? (rerunMessage?.parentToolUseId ?? undefined)
-					: undefined;
-				const config: import("../lib/agent").AgentConfig = {
-					narratorId,
-					conversationId: active.conversationId,
-					model: active.model,
-					provider: active.provider,
-					cwd: active.cwd,
-					locale,
-					signal: active.abortController.signal,
-					chapterId: active._chapterId,
-					parentNarratorId,
-					parentToolUseId,
-					reviewReadOnlyBash: isSubagent && narrator.subagentType === "review",
-					allowedTools: oauthRuntime ? new Set(oauthRuntime.allowedTools) : undefined,
-					allowLocalExecution: oauthRuntime?.allowLocalExecution ?? true,
-					onToolExecutionFinalAuthorization: buildFinalToolStartAuthorization({
-						narratorId,
-						cwd: active.cwd,
-						signal: active.abortController.signal,
-						userId: active._currentUserId,
-						reviewReadOnlyBash: isSubagent && narrator.subagentType === "review",
-					}),
-					runtimeAuthorizationGuard: oauthRuntime
-						? async () => {
-								await assertOAuthNarratorRuntimeActive(narratorId, active._currentUserId);
-							}
-						: undefined,
-					get planFileId() {
-						return active._planFileId;
-					},
-					get planFilePath() {
-						return active._planFilePath;
-					},
-					skillRoot: active._skillRoot ?? undefined,
-					projectGitPath: active._projectGitPath ?? undefined,
-					skillScopeKey: active._skillScopeKey ?? undefined,
-					userId: active._currentUserId ?? null,
-					projectId: active._projectId ?? null,
-					defaultDeviceId: sourceToolCall.executionDeviceId ?? active._defaultDeviceId ?? null,
-					availableDevices: oauthRuntime
-						? filterOAuthSessionDevices(sessionDevices, oauthRuntime)
-						: sessionDevices,
-					setDefaultDevice: (deviceId) => applySessionDefaultDevice(narratorId, active, deviceId),
-					disabledTools: active._disabledTools,
-					blockedSkills: {
-						all: active._blockedSkills.all,
-						names: [...active._blockedSkills.names],
-					},
-					...buildTreeSnapshotExecutionHooks({
-						session: active,
-						narratorId,
-						isInGitRepo: active._isInGitRepo === true,
-					}),
-					requireToolCallBinding: true,
-					onInternalReadAuthorization: async (toolUseId, binding) => {
-						await narratorPersistence.validateToolCallBinding(narratorId, toolUseId, binding);
-					},
-					onInternalReadCreated: (toolUseId, binding, input, sequence) =>
-						narratorPersistence.createInternalRead(narratorId, toolUseId, binding, input, sequence),
-					onInternalReadCompleted: (toolUseId, binding, result) =>
-						narratorPersistence.completeInternalRead(narratorId, toolUseId, binding, result),
-					onToolExecutionStarting: (resolvedToolUseId, binding, startedAt) =>
-						narratorPersistence.claimToolCallExecution(
-							narratorId,
-							resolvedToolUseId,
-							binding,
-							startedAt,
-						),
-					onExecutionTargetResolved: (resolvedToolUseId, target, binding) =>
-						narratorService.updateToolCallExecutionTarget(
-							narratorId,
-							resolvedToolUseId,
-							target,
-							binding,
-						),
-					onExecutionPlanResolved: (resolvedToolUseId, plan, binding) =>
-						narratorService.updateToolCallExecutionPlan(
-							narratorId,
-							resolvedToolUseId,
-							plan,
-							binding,
-						),
-					permissionHandler: (tName, input, tUseId, options) =>
-						handlePermission(
-							narratorId,
-							active.abortController.signal,
-							tName,
-							input,
-							tUseId,
-							active.cwd,
-							locale,
-							parentNarratorId,
-							options,
-							parentToolUseId,
-							oauthRuntime
-								? {
-										permissionMode: oauthRuntime.permissionMode,
-										allowKnowledgeWrite: oauthRuntime.allowKnowledgeWrite,
-										dangerReflectionPrompt: oauthRuntime.dangerReflectionPrompt,
-										useRobotDiagnosticPreset: oauthRuntime.useRobotDiagnosticPreset,
-										deviceAccess: oauthRuntime.policy.deviceAccess,
-										oauthClientId: oauthRuntime.clientId,
-										grantId: oauthRuntime.grantId,
-									}
-								: undefined,
-							config.reviewReadOnlyBash,
-						),
-					onDetachedToolResult: (event) => persistDetachedToolResult(narratorId, event),
-					onEvent: (event) => {
-						if (event.type === "tool_output") {
-							broadcastToNarrator(narratorId, {
-								type: "tool_output",
-								narratorId,
-								toolUseId: event.toolUseId,
-								output: event.output,
-							});
-						} else if (event.type === "tool_progress") {
-							broadcastToNarrator(narratorId, {
-								type: "tool_progress",
-								narratorId,
-								toolUseId: event.toolUseId,
-								elapsed: event.elapsed,
-							});
-						} else if (event.type === "tool_structured_progress") {
-							broadcastToNarrator(narratorId, {
-								type: "tool_structured_progress",
-								narratorId,
-								toolUseId: event.toolUseId,
-								progress: event.progress,
-							});
-						} else if (event.type === "tool_long_running") {
-							broadcastToNarrator(narratorId, {
-								type: "tool_long_running",
-								narratorId,
-								toolUseId: event.toolUseId,
-								elapsed: event.elapsed,
-							});
-						}
-					},
-				};
-
-				// Reproduce the exact execution identity frozen on the original pass. It pins the
-				// audit-only selectionSource (a local tool frozen as "local_default" would otherwise be
-				// recomputed as "session_default" once defaultDeviceId is seeded with the frozen device
-				// id, which the persistence-layer frozen-target guard rejects once the row has left
-				// "initializing") and, for a pre-granted re-run, acts as the baseline that executeTool
-				// compares against to detect environment drift. Legacy rows without a frozen device
-				// fall back to normal resolution.
-				const preFrozenTarget = reconstructToolExecutionTarget(sourceToolCall);
-
 				try {
+					await narratorService.updateStatus(narratorId, "working", { setTurnStart: true });
+
+					broadcastToNarrator(narratorId, {
+						type: "tool_started",
+						narratorId,
+						toolCallId: toolCall.id,
+						toolUseId,
+						toolName: toolCall.toolName,
+						input: toolInput,
+					});
+
+					const { executeTool } = await import("../lib/agent/tool-executor");
+					const retryUserId = userId ?? null;
+					const retrySignal = active.abortController.signal;
+					const preFrozenTarget = reconstructToolExecutionTarget(sourceToolCall);
+					const { reconstructToolExecutionPlan } = await import("./narrator-persistence");
+					const preFrozenPlan = reconstructToolExecutionPlan(sourceToolCall);
+					const { createDeviceWorkspaceConfig } = await import("./workspace-artifact-access");
+					const deviceWorkspaceConfig = await createDeviceWorkspaceConfig(narratorId, {
+						userId: retryUserId,
+						signal: retrySignal,
+					});
+					const retryWorkspace = preFrozenTarget?.workspaceContext;
+					// executeTool validates this original version inside the recorded attempt's
+					// failure boundary. Never throw a stale-binding guard before that boundary.
+
+					// Reuse the same runtime/device ACL ceiling as the ordinary loop, including recovery.
+					const oauthRuntime = await assertOAuthNarratorRuntimeActive(narratorId, retryUserId);
+					const sessionDevices =
+						(await resolveSessionDevices(active._projectId ?? null, retryUserId)) ?? [];
+					const rerunMessage = await db.query.narratorMessages.findFirst({
+						where: eq(narratorMessages.id, toolCall.messageId),
+						columns: { parentToolUseId: true },
+					});
+					const parentNarratorId = isSubagent
+						? (narrator.parentNarratorId ?? undefined)
+						: undefined;
+					const parentToolUseId = isSubagent
+						? (rerunMessage?.parentToolUseId ?? undefined)
+						: undefined;
+					const config: import("../lib/agent").AgentConfig = {
+						...deviceWorkspaceConfig,
+						workspaceContext: retryWorkspace,
+						assertWorkspaceCurrent: retryWorkspace
+							? () => deviceWorkspaceConfig.assertDeviceWorkspaceCurrentSync?.(retryWorkspace)
+							: undefined,
+						narratorId,
+						conversationId: active.conversationId,
+						model: active.model,
+						provider: active.provider,
+						cwd: preFrozenTarget?.cwd ?? active.cwd,
+						locale,
+						signal: retrySignal,
+						chapterId: active._chapterId,
+						parentNarratorId,
+						parentToolUseId,
+						reviewReadOnlyBash: isSubagent && narrator.subagentType === "review",
+						allowedTools: oauthRuntime ? new Set(oauthRuntime.allowedTools) : undefined,
+						allowLocalExecution: oauthRuntime?.allowLocalExecution ?? true,
+						onToolExecutionFinalAuthorization: buildFinalToolStartAuthorization({
+							narratorId,
+							cwd: preFrozenTarget?.cwd ?? active.cwd,
+							signal: retrySignal,
+							userId: retryUserId,
+							reviewReadOnlyBash: isSubagent && narrator.subagentType === "review",
+						}),
+						runtimeAuthorizationGuard: oauthRuntime
+							? async () => {
+									await assertOAuthNarratorRuntimeActive(narratorId, retryUserId);
+								}
+							: undefined,
+						get planFileId() {
+							return active._planFileId;
+						},
+						get planFilePath() {
+							return active._planFilePath;
+						},
+						skillRoot: active._skillRoot ?? undefined,
+						projectGitPath: active._projectGitPath ?? undefined,
+						skillScopeKey: active._skillScopeKey ?? undefined,
+						userId: retryUserId,
+						projectId: retryWorkspace?.contextProjectId ?? active._projectId ?? null,
+						defaultDeviceId: sourceToolCall.executionDeviceId ?? active._defaultDeviceId ?? null,
+						availableDevices: oauthRuntime
+							? filterOAuthSessionDevices(sessionDevices, oauthRuntime)
+							: sessionDevices,
+						setDefaultDevice: (deviceId) => applySessionDefaultDevice(narratorId, active, deviceId),
+						disabledTools: active._disabledTools,
+						blockedSkills: {
+							all: active._blockedSkills.all,
+							names: [...active._blockedSkills.names],
+						},
+						...buildTreeSnapshotExecutionHooks({
+							session: active,
+							narratorId,
+							isInGitRepo: active._isInGitRepo === true,
+						}),
+						requireToolCallBinding: true,
+						onInternalReadAuthorization: async (toolUseId, binding) => {
+							await narratorPersistence.validateToolCallBinding(narratorId, toolUseId, binding);
+						},
+						onInternalReadCreated: (toolUseId, binding, input, sequence) =>
+							narratorPersistence.createInternalRead(
+								narratorId,
+								toolUseId,
+								binding,
+								input,
+								sequence,
+							),
+						onInternalReadCompleted: (toolUseId, binding, result) =>
+							narratorPersistence.completeInternalRead(narratorId, toolUseId, binding, result),
+						onToolExecutionStarting: (resolvedToolUseId, binding, startedAt) =>
+							narratorPersistence.claimToolCallExecution(
+								narratorId,
+								resolvedToolUseId,
+								binding,
+								startedAt,
+							),
+						onExecutionTargetResolved: (resolvedToolUseId, target, binding) =>
+							narratorService.updateToolCallExecutionTarget(
+								narratorId,
+								resolvedToolUseId,
+								target,
+								binding,
+							),
+						onExecutionPlanResolved: (resolvedToolUseId, plan, binding) =>
+							narratorService.updateToolCallExecutionPlan(
+								narratorId,
+								resolvedToolUseId,
+								plan,
+								binding,
+							),
+						permissionHandler: (tName, input, tUseId, options) =>
+							handlePermission(
+								narratorId,
+								retrySignal,
+								tName,
+								input,
+								tUseId,
+								options?.executionTarget?.cwd ?? config.cwd,
+								locale,
+								parentNarratorId,
+								options,
+								parentToolUseId,
+								oauthRuntime
+									? {
+											permissionMode: oauthRuntime.permissionMode,
+											allowKnowledgeWrite: oauthRuntime.allowKnowledgeWrite,
+											dangerReflectionPrompt: oauthRuntime.dangerReflectionPrompt,
+											useRobotDiagnosticPreset: oauthRuntime.useRobotDiagnosticPreset,
+											deviceAccess: oauthRuntime.policy.deviceAccess,
+											oauthClientId: oauthRuntime.clientId,
+											grantId: oauthRuntime.grantId,
+										}
+									: undefined,
+								config.reviewReadOnlyBash,
+							),
+						onDetachedToolResult: (event) => persistDetachedToolResult(narratorId, event),
+						onEvent: (event) => {
+							if (event.type === "tool_output") {
+								broadcastToNarrator(narratorId, {
+									type: "tool_output",
+									narratorId,
+									toolUseId: event.toolUseId,
+									output: event.output,
+								});
+							} else if (event.type === "tool_progress") {
+								broadcastToNarrator(narratorId, {
+									type: "tool_progress",
+									narratorId,
+									toolUseId: event.toolUseId,
+									elapsed: event.elapsed,
+								});
+							} else if (event.type === "tool_structured_progress") {
+								broadcastToNarrator(narratorId, {
+									type: "tool_structured_progress",
+									narratorId,
+									toolUseId: event.toolUseId,
+									progress: event.progress,
+								});
+							} else if (event.type === "tool_long_running") {
+								broadcastToNarrator(narratorId, {
+									type: "tool_long_running",
+									narratorId,
+									toolUseId: event.toolUseId,
+									elapsed: event.elapsed,
+								});
+							}
+						},
+					};
+
+					// Reproduce the exact execution identity frozen on the original pass. It pins the
+					// audit-only selectionSource (a local tool frozen as "local_default" would otherwise be
+					// recomputed as "session_default" once defaultDeviceId is seeded with the frozen device
+					// id, which the persistence-layer frozen-target guard rejects once the row has left
+					// "initializing") and, for a pre-granted re-run, acts as the baseline that executeTool
+					// compares against to detect environment drift. Legacy rows without a frozen device
+					// fall back to normal resolution.
+
 					const result = await executeTool(
 						{ name: toolName, input: toolInput, toolUseId },
 						config,
@@ -5804,6 +5877,7 @@ async function reExecuteDeniedToolCallUnlocked(
 								? {}
 								: { preGrantedPermission: { behavior: "allow" as const } }),
 							...(preFrozenTarget ? { preFrozenTarget } : {}),
+							...(preFrozenPlan ? { preFrozenPlan } : {}),
 						},
 					);
 

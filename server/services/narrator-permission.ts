@@ -4356,6 +4356,14 @@ export async function recheckFinalToolExecutionPermission(
 				(target) =>
 					target.deviceId === frozen.target.deviceId &&
 					target.backendKind === frozen.target.backendKind &&
+					stableJson(target.workspaceBinding ?? null) ===
+						stableJson(check.executionTarget?.workspaceBinding ?? null) &&
+					stableJson(target.workspaceContext ?? null) ===
+						stableJson(check.executionTarget?.workspaceContext ?? null) &&
+					stableJson(target.nativeDescriptor ?? null) ===
+						stableJson(check.executionTarget?.nativeDescriptor ?? null) &&
+					stableJson(target.nativeRootDescriptor ?? null) ===
+						stableJson(check.executionTarget?.nativeRootDescriptor ?? null) &&
 					frozen.paths.equals(target.cwd, frozen.target.cwd) &&
 					(!target.pathFlavor || target.pathFlavor === frozen.target.pathFlavor) &&
 					(target.runtimeGeneration ?? 0) === frozen.target.runtimeGeneration &&

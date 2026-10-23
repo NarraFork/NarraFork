@@ -12,6 +12,7 @@ import {
 } from "../lib/uploads";
 import { isWorkspaceAttachmentProof } from "../lib/workspace-attachment-io";
 import {
+	assertNarratorWorkspaceArtifactCreationAdmission,
 	createNarratorWorkspaceAttachmentAccess,
 	createNarratorWorkspaceAttachmentSourceAccess,
 } from "./workspace-artifact-access";
@@ -27,20 +28,29 @@ export async function prepareNarratorTextAttachmentAccess(
 	options: {
 		userId?: string | null;
 		workspaceContext?: WorkspaceContext;
+		/** Mailbox consumption must never reinterpret unknown/legacy source through current cwd. */
+		requireWorkspaceSource?: boolean;
 		signal?: AbortSignal;
 		authorizationGuard?: () => Promise<void>;
 	} = {},
 ): Promise<WorkspaceAttachmentAccess> {
+	// Freeze request inputs before admission awaits; never reread a mutable active-session getter.
+	const userId = options.userId;
+	const signal = options.signal ?? AbortSignal.timeout(5 * 60_000);
+	const authorizationGuard = options.authorizationGuard;
+	const original = options.workspaceContext ? structuredClone(options.workspaceContext) : undefined;
+	if (options.requireWorkspaceSource && (!original || !validSourceWorkspace(original)))
+		throw new ValidationError(
+			"Queued attachment workspace source is unavailable; remove and reattach the file",
+		);
+	await assertNarratorWorkspaceArtifactCreationAdmission(narratorId, { userId, signal });
 	const workspace = Object.freeze(
-		structuredClone(
-			options.workspaceContext ??
-				(await workspaceContextService.get(narratorId, { userId: options.userId })),
-		),
+		original ?? structuredClone(await workspaceContextService.get(narratorId, { userId })),
 	);
 	return createNarratorWorkspaceAttachmentAccess(narratorId, workspace, {
-		userId: options.userId,
-		signal: options.signal ?? AbortSignal.timeout(5 * 60_000),
-		authorizationGuard: options.authorizationGuard,
+		userId,
+		signal,
+		authorizationGuard,
 	});
 }
 
@@ -82,10 +92,27 @@ export function textAttachmentRef(value: unknown): TextFileRef | undefined {
 		...(isWorkspaceAttachmentProof(block.attachmentCreationProof)
 			? { attachmentCreationProof: structuredClone(block.attachmentCreationProof) }
 			: {}),
+		...(validSourceOrigin(block.attachmentOrigin)
+			? { attachmentOrigin: { ...block.attachmentOrigin } }
+			: {}),
 		...(validSourceWorkspace(block.attachmentWorkspace)
 			? { attachmentWorkspace: structuredClone(block.attachmentWorkspace) }
 			: {}),
 	};
+}
+
+function validSourceOrigin(
+	value: unknown,
+): value is import("../lib/uploads").WorkspaceArtifactOrigin {
+	if (!value || typeof value !== "object") return false;
+	const candidate = value as Record<string, unknown>;
+	return (
+		candidate.version === 1 &&
+		(candidate.projectId === null ||
+			(typeof candidate.projectId === "string" &&
+				candidate.projectId.length > 0 &&
+				candidate.projectId.length <= 128))
+	);
 }
 
 function validSourceWorkspace(value: unknown): value is WorkspaceContext {
@@ -115,6 +142,7 @@ function acceptedRef(
 		deviceId: access.backend.deviceId,
 		contextKey: access.workspaceContext.contextKey,
 		attachmentWorkspace: structuredClone(access.workspaceContext),
+		attachmentOrigin: access.artifactOrigin ? { ...access.artifactOrigin } : undefined,
 		sourceNarratorId: narratorId,
 	};
 }
@@ -170,8 +198,15 @@ export async function prepareRetainedNarratorTextFile(
 		deviceId === target.backend.deviceId &&
 		target.backend.paths.isAbsolute(source.filePath) &&
 		target.backend.paths.contains(target.workspaceContext.cwd, source.filePath);
-	let original = source.attachmentWorkspace;
-	if (original && (original.deviceId !== deviceId || original.contextKey !== source.contextKey)) {
+	const original = source.attachmentWorkspace;
+	if (
+		original &&
+		(original.deviceId !== deviceId ||
+			original.contextKey !== source.contextKey ||
+			(validSourceOrigin(source.attachmentOrigin) &&
+				original.contextProjectId !== undefined &&
+				original.contextProjectId !== source.attachmentOrigin.projectId))
+	) {
 		return {
 			ref: {
 				...source,
@@ -181,9 +216,10 @@ export async function prepareRetainedNarratorTextFile(
 			copy: false,
 		};
 	}
-	// A legacy local file already inside the admitted local workspace needs no invented root.
-	if (!original && insideTarget && deviceId === "local") original = target.workspaceContext;
-	if (!original) {
+	if (
+		!original ||
+		(!validSourceOrigin(source.attachmentOrigin) && original.contextProjectId === undefined)
+	) {
 		return {
 			ref: {
 				...source,
@@ -200,6 +236,9 @@ export async function prepareRetainedNarratorTextFile(
 		{
 			userId: options.userId,
 			signal: target.signal,
+			...(validSourceOrigin(source.attachmentOrigin)
+				? { originalProjectId: source.attachmentOrigin.projectId }
+				: {}),
 		},
 	);
 	const identity = await sourceAccess.backend.resolvePathIdentity(source.filePath, {

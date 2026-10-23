@@ -1,4 +1,5 @@
 import { afterAll, describe, expect, mock, test } from "bun:test";
+import { fileURLToPath } from "node:url";
 
 import { toolRegistry } from "../../tool-registry";
 import { PLAN_MODE_ALLOWED_TOOLS, type ToolContext } from "../../types";
@@ -295,9 +296,18 @@ afterAll(() => {
 });
 
 function makeCtx(narratorId: string, parentNarratorId?: string): ToolContext {
+	const cwd = fileURLToPath(new URL(".", import.meta.url));
 	return {
 		narratorId,
-		cwd: ".",
+		cwd,
+		workspaceContext: {
+			deviceId: "local",
+			cwd,
+			pathFlavor: process.platform === "win32" ? "windows" : "posix",
+			revision: 0,
+			contextKey: `${narratorId}:${cwd}`,
+			capabilities: { switchDirectory: true },
+		},
 		signal: new AbortController().signal,
 		locale: "en",
 		parentNarratorId,

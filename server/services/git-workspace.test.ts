@@ -4,17 +4,29 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { GitCommitDetail, GitCommitPatch } from "@shared/git-commit-preview";
 import type { GitWorkspace } from "@shared/git-workspace";
+import type { NativePathDescriptorV2 } from "@shared/target-native-path";
+import type { WorkspaceContext } from "@shared/workspace-context";
 import { eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
-import { chapters, narrators, projects, remoteDevices, users } from "../db/schema";
+import {
+	aclGrants,
+	chapters,
+	narratorDeviceWorkspaceRequests,
+	narrators,
+	projects,
+	remoteDevices,
+	users,
+} from "../db/schema";
 import type { ExecutionBackend } from "../lib/agent/execution/backend";
 import { windowsPathSemantics } from "../lib/agent/execution/path-semantics";
 import { localBackend, setRemoteBackendResolver } from "../lib/agent/execution/registry";
 import { AppError } from "../lib/errors";
 import { generateId } from "../lib/id";
+import * as spawnModule from "../lib/spawn";
 import { safeSpawn } from "../lib/spawn";
 import { gitRoutes, narratorGitRoutes } from "../routes/git";
 import { commitSyncService } from "./commit-sync-service";
+import * as deviceConnection from "./device-connection-service";
 import { compileExecutionPolicy } from "./execution-policy/compiler";
 import { executionPolicyEngine } from "./execution-policy/engine";
 import type { ExecutionTargetContext } from "./execution-policy/types";
@@ -24,16 +36,39 @@ import { gitService, withGitRequestContext } from "./git-service";
 import { gitWorkspaceIdentity, probeLocalGitWorkspace } from "./git-workspace";
 import { gitPathPolicyAllows } from "./git-workspace-access";
 import { GitAccessScan } from "./git-workspace-access-scan";
+import { saveLegacyDeviceWorkspaceBinding } from "./narrator-device-workspace-store";
 import { getNarratorGitSummary } from "./narrator-git-summary";
 import { type ActiveNarrator, activeNarrators } from "./narrator-session-state";
+import * as projectAcl from "./project-acl";
+import { workspaceContextService } from "./workspace-context-service";
 
 // The singleton starts asynchronously; await it before a fixture captures its handle.
 const { db } = await import("../db");
 
 let root: string, repo: string, owner: string, narratorId: string;
+let restoreOnline: (() => void) | undefined;
 const scanProjectIds: string[] = [];
 const scanChapterIds: string[] = [];
 const now = () => new Date().toISOString();
+function windowsGitRootProof(): NativePathDescriptorV2 {
+	const root = {
+		canonicalPath: "C:\\",
+		object: { volumeId: "volume", fileId: "root", creationTime: "1" },
+		caseSensitive: false,
+	};
+	return {
+		version: 2,
+		platform: "windows",
+		volumeId: "volume",
+		pathSlotKey: "native:repo:packages:a",
+		componentKeys: ["C:", "repo", "packages", "a"],
+		ancestors: [root],
+		parent: root,
+		missingSuffix: [],
+		object: { volumeId: "volume", fileId: "directory", creationTime: "2" },
+		caseSensitive: false,
+	};
+}
 async function git(cwd: string, ...args: string[]) {
 	const r = await safeSpawn({
 		cmd: ["git", "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", ...args],
@@ -70,10 +105,10 @@ async function newNarrator(cwd: string | null, extra: Partial<typeof narrators.$
 	});
 	return id;
 }
-function app(user = owner) {
+function app(user = owner, tokenRole: "user" | "admin" = "user") {
 	const result = new Hono();
 	result.use("*", async (c, next) => {
-		c.set("user", { sub: user, role: "user", iat: 0, exp: Number.MAX_SAFE_INTEGER });
+		c.set("user", { sub: user, role: tokenRole, iat: 0, exp: Number.MAX_SAFE_INTEGER });
 		await next();
 	});
 	result.onError(
@@ -160,6 +195,8 @@ async function commitPreviewFixture() {
 }
 
 beforeEach(async () => {
+	const online = spyOn(deviceConnection, "isDeviceOnline").mockReturnValue(true);
+	restoreOnline = () => online.mockRestore();
 	root = await mkdtemp(join(await realpath(tmpdir()), "nf-git-workspace-"));
 	repo = await newRepo("repo");
 	owner = generateId();
@@ -174,6 +211,7 @@ beforeEach(async () => {
 	narratorId = await newNarrator(repo);
 });
 afterEach(async () => {
+	restoreOnline?.();
 	activeNarrators.delete(narratorId);
 	setRemoteBackendResolver(null);
 	if (scanChapterIds.length)
@@ -184,6 +222,177 @@ afterEach(async () => {
 });
 
 describe("Git workspace discovery", () => {
+	test("related private project's accepted Read grant revoked at the next Write await cannot retain root or Read", async () => {
+		const projectId = await project(repo);
+		const actor = generateId();
+		await db.insert(users).values({
+			id: actor,
+			username: actor,
+			role: "user",
+			passwordHash: "fixture",
+			createdAt: now(),
+		});
+		const id = await newNarrator(repo, { ownerUserId: actor });
+		const grantId = generateId();
+		await db.insert(aclGrants).values({
+			id: grantId,
+			scopeType: "project",
+			scopeId: projectId,
+			principalType: "user",
+			principalId: actor,
+			capability: "read",
+			createdAt: now(),
+		});
+		const actualHasAccess = projectAcl.hasProjectAccess;
+		let readAccepted = false;
+		let revoked = false;
+		const access = spyOn(projectAcl, "hasProjectAccess").mockImplementation(
+			async (row, principal, need) => {
+				const allowed = await actualHasAccess(row, principal, need);
+				if (row.id === projectId && need === "read") readAccepted = allowed;
+				if (row.id === projectId && need === "write" && readAccepted) {
+					await db.delete(aclGrants).where(eq(aclGrants.id, grantId));
+					revoked = true;
+				}
+				return allowed;
+			},
+		);
+		try {
+			const response = await app(actor).request(`/narrators/${id}/git/workspace`);
+			expect(response.status).toBe(200);
+			expect(readAccepted).toBe(true);
+			expect(revoked).toBe(true);
+			const target = await response.json();
+			expect(target.state).toBe("access_denied");
+			expect(target.rootPath).toBeNull();
+			expect(target.workspaceKey).toBeNull();
+			expect(target.contextKey).toBeUndefined();
+			expect(target.capabilities).toEqual({ read: false, write: false });
+		} finally {
+			access.mockRestore();
+		}
+	});
+	test("stale admin token cannot skip the actual user's private repository project ACL", async () => {
+		await project(repo);
+		const actor = generateId();
+		await db.insert(users).values({
+			id: actor,
+			username: actor,
+			role: "user",
+			passwordHash: "fixture",
+			createdAt: now(),
+		});
+		const id = await newNarrator(repo, { ownerUserId: actor });
+		const response = await app(actor, "admin").request(`/narrators/${id}/git/workspace`);
+		expect(response.status).toBe(200);
+		const target = await response.json();
+		expect(target.state).toBe("access_denied");
+		expect(target.rootPath).toBeNull();
+		expect(target.contextKey).toBeUndefined();
+		expect(target.workspaceRevision).toBeUndefined();
+		expect(target.capabilities).toEqual({ read: false, write: false });
+	});
+	test("durable pending receipt without active runtime blocks metadata/Git until installed", async () => {
+		const current = await workspaceContextService.get(narratorId, { userId: owner });
+		const next = saveLegacyDeviceWorkspaceBinding(db, narratorId, {
+			...current,
+			revision: current.revision + 1,
+		});
+		await db
+			.update(narrators)
+			.set({ workspaceRevision: next.revision, workspaceContext: next })
+			.where(eq(narrators.id, narratorId));
+		const receiptId = generateId();
+		await db.insert(narratorDeviceWorkspaceRequests).values({
+			id: receiptId,
+			narratorId,
+			requestId: generateId(),
+			actorUserId: owner,
+			kind: "select",
+			deviceId: next.deviceId,
+			requestDigest: "fixture",
+			expectedBindingRevision: next.binding?.bindingRevision ?? 1,
+			expectedSelectionRevision: current.revision,
+			installState: "pending",
+			result: {
+				kind: "select",
+				changed: true,
+				binding: {
+					id: next.binding?.bindingId ?? "fixture",
+					narratorId,
+					deviceId: next.deviceId,
+					bindingRevision: next.binding?.bindingRevision ?? 1,
+					context: next,
+					createdAt: now(),
+					updatedAt: now(),
+				},
+			},
+			createdAt: now(),
+			updatedAt: now(),
+		});
+		const metadata = spyOn(localBackend, "resolvePathIdentity");
+		const spawn = spyOn(spawnModule, "safeSpawn");
+		try {
+			const response = await request("workspace");
+			expect(response.status).toBe(409);
+			expect((await response.json()).code).toBe("WORKSPACE_CONTEXT_INSTALL_PENDING");
+			expect(metadata).not.toHaveBeenCalled();
+			expect(spawn).not.toHaveBeenCalled();
+		} finally {
+			metadata.mockRestore();
+			spawn.mockRestore();
+		}
+		// The real HTTP recover protocol is tested by the core owner; simulate its final receipt here.
+		await db
+			.update(narratorDeviceWorkspaceRequests)
+			.set({ installState: "installed" })
+			.where(eq(narratorDeviceWorkspaceRequests.id, receiptId));
+		expect((await workspace()).workspaceRevision).toBe(next.revision);
+	});
+	test("unconfigured local narrator refuses before metadata or Git instead of home fallback", async () => {
+		const id = await newNarrator(null);
+		const metadata = spyOn(localBackend, "resolvePathIdentity");
+		const spawn = spyOn(spawnModule, "safeSpawn");
+		try {
+			const response = await request("workspace", undefined, id);
+			expect(response.status).toBe(409);
+			expect((await response.json()).code).toBe("WORKSPACE_BINDING_REQUIRED");
+			expect(metadata).not.toHaveBeenCalled();
+			expect(spawn).not.toHaveBeenCalled();
+		} finally {
+			metadata.mockRestore();
+			spawn.mockRestore();
+		}
+	});
+	test("actual actor revoked during endpoint metadata cannot reach a new Git probe", async () => {
+		await workspace(); // Seed the trusted pair before the race, not during it.
+		const replacement = generateId();
+		await db.insert(users).values({
+			id: replacement,
+			username: replacement,
+			passwordHash: "fixture",
+			createdAt: now(),
+		});
+		const original = localBackend.resolvePathIdentity.bind(localBackend);
+		const metadata = spyOn(localBackend, "resolvePathIdentity").mockImplementation(
+			async (...args) => {
+				const identity = await original(...args);
+				await db
+					.update(narrators)
+					.set({ ownerUserId: replacement })
+					.where(eq(narrators.id, narratorId));
+				return identity;
+			},
+		);
+		const spawn = spyOn(spawnModule, "safeSpawn");
+		try {
+			expect((await request("workspace")).status).toBe(403);
+			expect(spawn).not.toHaveBeenCalled();
+		} finally {
+			metadata.mockRestore();
+			spawn.mockRestore();
+		}
+	});
 	test("subdirectories share their actual nearest root and device identity", async () => {
 		await mkdir(join(repo, "sub"));
 		const child = await newNarrator(join(repo, "sub"));
@@ -241,10 +450,10 @@ describe("Git workspace discovery", () => {
 		const legacy = await app().request(`/chapters/${chapterId}/git/workspace`);
 		expect(((await legacy.json()) as GitWorkspace).rootPath).toBe(repo);
 	});
-	test("running local session cwd wins over stale persisted configuration", async () => {
+	test("running local session cwd cannot retarget the durable selected binding", async () => {
 		const other = await newRepo("active");
 		activeNarrators.set(narratorId, { cwd: other, _defaultDeviceId: "local" } as ActiveNarrator);
-		expect((await workspace()).rootPath).toBe(other);
+		expect((await workspace()).rootPath).toBe(repo);
 	});
 	test("unborn, missing, non-git and bare targets are distinguished", async () => {
 		const empty = await newRepo("empty", false);
@@ -402,7 +611,16 @@ describe("authenticated Git management", () => {
 		const ws = await workspace();
 		const other = await newRepo("changed-target");
 		await writeFile(join(other, "new.txt"), "new\n");
-		await db.update(narrators).set({ cwd: other }).where(eq(narrators.id, narratorId));
+		const current = await workspaceContextService.get(narratorId, { userId: owner });
+		await workspaceContextService.switch(
+			narratorId,
+			{
+				expectedRevision: current.revision,
+				requestId: generateId(),
+				target: { deviceId: "local", cwd: other },
+			},
+			{ userId: owner, origin: "http" },
+		);
 		const stale = await request("stage", { all: true, workspaceKey: ws.workspaceKey });
 		expect(stale.status).toBe(409);
 		expect(((await stale.json()) as { code: string }).code).toBe("GIT_WORKSPACE_CHANGED");
@@ -947,7 +1165,7 @@ test("sibling-directory observations include other narrators but redact private 
 	}
 });
 
-test("remote Windows sibling paths use case-folded workspace attribution", async () => {
+test("remote Windows sibling paths use original native root and canonical workspace attribution", async () => {
 	const deviceId = generateId();
 	await db.insert(remoteDevices).values({
 		id: deviceId,
@@ -971,6 +1189,7 @@ test("remote Windows sibling paths use case-folded workspace attribution", async
 				cwd: "C:\\Repo\\Packages\\A",
 				pathFlavor: "windows",
 				contextKey: "windows-selected",
+				nativeRootDescriptor: windowsGitRootProof(),
 				capabilities: { switchDirectory: true },
 			},
 		})
@@ -1010,13 +1229,14 @@ test("remote Windows sibling paths use case-folded workspace attribution", async
 			canonicalPath: path,
 			exists: true,
 			runtimeGeneration: 1,
+			nativeDescriptor: windowsGitRootProof(),
 		}),
 	} as unknown as ExecutionBackend;
 	setRemoteBackendResolver(() => backend);
 	await recordAttribution({
 		deviceId,
-		workspacePath: "c:\\repo\\packages\\a",
-		filePath: "c:\\repo\\packages\\b\\change.txt",
+		workspacePath: "C:\\Repo\\Packages\\A",
+		filePath: "C:\\Repo\\packages\\b\\change.txt",
 		narratorId,
 		action: "edit",
 	});
@@ -1213,7 +1433,11 @@ describe("Narrator first-paint Git summary", () => {
 		expect(denied?.branch).toBeNull();
 		expect(denied?.workspace.branch).toBeUndefined();
 		await db.update(projects).set({ visibility: "public" }).where(eq(projects.id, projectId));
-		const readable = await summary(narratorId, generateId());
+		const reader = generateId();
+		await db
+			.insert(users)
+			.values({ id: reader, username: reader, passwordHash: "fixture", createdAt: now() });
+		const readable = await summary(narratorId, reader);
 		expect(readable?.workspace.capabilities).toEqual({ read: true, write: false });
 		expect(readable?.branch).toBe("main");
 	});
@@ -1239,6 +1463,16 @@ describe("Narrator first-paint Git summary", () => {
 		await mkdir(bare);
 		await git(bare, "init", "--bare");
 		const id = await newNarrator(bare);
+		const source: WorkspaceContext = {
+			revision: 0,
+			deviceId: "local",
+			cwd: bare,
+			pathFlavor: "posix",
+			contextKey: "bare-configured",
+			capabilities: { switchDirectory: true },
+		};
+		const binding = saveLegacyDeviceWorkspaceBinding(db, id, source);
+		await db.update(narrators).set({ workspaceContext: binding }).where(eq(narrators.id, id));
 		const result = await summary(id);
 		expect(result?.workspace.state).toBe("unsupported");
 		expect(result?.workspace.capabilities).toEqual({ read: false, write: false });

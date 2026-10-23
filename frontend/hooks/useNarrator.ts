@@ -33,6 +33,7 @@ import type {
 	DirectoryWhitelistRuleInput,
 	RuleTargetSelector,
 } from "../lib/api/types";
+import { formatPartialRevert } from "../lib/revert-warnings";
 import { RECENT_TABS_QUERY_KEY } from "./useRecentTabs";
 
 const FILE_PREVIEW_QUERY_GC_TIME_MS = 30_000;
@@ -530,10 +531,12 @@ export function useRevertHistoryAction(narratorId: string) {
 			return result;
 		},
 		onSuccess: (result) => {
-			if (result.reason) {
+			const coverage = "coverage" in result ? result.coverage : undefined;
+			const coverageText = formatPartialRevert(t, coverage);
+			if (result.reason || coverageText) {
 				notifications.show({
 					title: t("rollbackPartialTitle"),
-					message: result.reason,
+					message: [coverageText, result.reason].filter(Boolean).join("\n"),
 					color: "yellow",
 					autoClose: false,
 				});

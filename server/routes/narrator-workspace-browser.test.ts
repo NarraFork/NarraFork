@@ -34,7 +34,9 @@ const withRevision = mock(
 		revision: number,
 		_key: unknown,
 		action: (context: WorkspaceContext) => Promise<unknown>,
+		actor: { userId?: string | null },
 	) => {
+		expect(actor).toEqual({ userId: "reader" });
 		if (revision !== 7) throw new AppError("Workspace identity changed", 409);
 		return action(context);
 	},

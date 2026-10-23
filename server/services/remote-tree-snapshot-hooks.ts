@@ -26,7 +26,10 @@ import type {
 	RemoteWorkspaceHistoryRuntime,
 } from "./remote-workspace-history-runtime";
 import { getRemoteWorkspaceHistoryRuntime } from "./remote-workspace-history-runtime";
-import type { WorkspaceActivityToken } from "./workspace-write-coordinator";
+import type {
+	WorkspaceActivityToken,
+	WorkspaceDurableActivity,
+} from "./workspace-write-coordinator";
 
 export const REMOTE_TREE_HOT_BUDGET_MS = 4_000;
 export const REMOTE_TREE_WARM_BUDGET_MS = 120_000;
@@ -286,6 +289,7 @@ function createActivity(
 	adopted: boolean,
 	actorSubjectKey: string,
 	narratorId: string,
+	durable: WorkspaceDurableActivity,
 ): string {
 	const source = sourceKey(endpoint, target.deviceId);
 	const id = `${source}:${key}`;
@@ -303,6 +307,7 @@ function createActivity(
 	const token = endpoint.coordinator.registerActivity({
 		scope: endpoint.scope,
 		runtime: endpoint.runtimeBinding,
+		durable,
 	});
 	let resolve!: (outcome: "finished" | "unknown") => void;
 	const settled = new Promise<"finished" | "unknown">((done) => {
@@ -346,6 +351,7 @@ export async function registerRemoteActivity(input: {
 	userId: string;
 	projectId?: string | null;
 	actorKind: RemoteHistoryActor["kind"];
+	workspaceContext?: WorkspaceContext;
 	target: ToolExecutionTarget;
 	binding?: ToolCallBinding;
 	activityId?: string;
@@ -378,7 +384,23 @@ export async function registerRemoteActivity(input: {
 		existing.adopted = true;
 		return;
 	}
-	createActivity(endpoint, target, key, true, `user:${input.userId}`, input.narratorId);
+	const operationId = input.binding?.toolCallId ?? input.activityId;
+	if (!operationId) throw new Error("Remote activity requires an actual operation identity");
+	createActivity(endpoint, target, key, true, `user:${input.userId}`, input.narratorId, {
+		narratorId: input.narratorId,
+		userId: input.userId,
+		projectId: input.projectId ?? null,
+		bindingId: input.workspaceContext?.binding?.bindingId ?? endpoint.scope.id,
+		bindingRevision:
+			input.workspaceContext?.binding?.bindingRevision ?? endpoint.scope.fencingToken,
+		contextKey:
+			input.workspaceContext?.contextKey ??
+			hash([sourceKey(endpoint, target.deviceId), target.cwd]),
+		rootEvidenceDigest: hash(endpoint.history.binding),
+		kind: input.kind,
+		operationId,
+		attempt: input.binding?.attempt ?? 0,
+	});
 }
 /** Standalone PTY origin is its actual prepared terminal row, never a synthetic narrator. */
 export async function registerRemoteTerminalActivity(input: {
@@ -441,6 +463,22 @@ export async function registerRemoteTerminalActivity(input: {
 	const token = endpoint.coordinator.registerActivity({
 		scope: endpoint.scope,
 		runtime: endpoint.runtime,
+		...(endpoint.scope.deviceId !== "local"
+			? {
+					durable: {
+						narratorId: null,
+						userId: input.principal.userId,
+						projectId: frozen.contextProjectId ?? null,
+						bindingId: frozen.binding?.bindingId ?? input.terminalId,
+						bindingRevision: frozen.binding?.bindingRevision ?? frozen.revision,
+						contextKey: frozen.contextKey,
+						rootEvidenceDigest: source,
+						kind: "pty" as const,
+						operationId: input.terminalId,
+						attempt: 0,
+					},
+				}
+			: {}),
 	});
 	try {
 		await endpoint.assertCurrent();
@@ -455,6 +493,23 @@ export async function registerRemoteTerminalActivity(input: {
 		actorSubjectKey: `user:${input.principal.userId}`,
 		terminalId: input.terminalId,
 	});
+}
+
+/** Called after dispatch acknowledgement; never interprets a connection close as process exit. */
+export function markRemoteActivityRunning(input: {
+	target: ToolExecutionTarget;
+	binding?: ToolCallBinding;
+	activityId?: string;
+}): void {
+	const key = requestKey(input);
+	const terminal = terminalActivities.get(key);
+	if (terminal) {
+		terminal.endpoint.coordinator.markActivityRunning(terminal.token);
+		return;
+	}
+	const id = activityRequests.get(key);
+	const entry = id ? activities.get(id) : undefined;
+	if (entry) entry.endpoint.coordinator.markActivityRunning(entry.token);
 }
 
 export async function finishRemoteActivity(input: {
@@ -669,6 +724,19 @@ export async function beforeRemoteTreeSnapshot(
 					false,
 					`user:${actor.userId}`,
 					actor.narratorId,
+					{
+						narratorId: actor.narratorId,
+						userId: actor.userId,
+						projectId: actor.projectId,
+						bindingId: options.workspaceContext?.binding?.bindingId ?? endpoint.scope.id,
+						bindingRevision:
+							options.workspaceContext?.binding?.bindingRevision ?? endpoint.scope.fencingToken,
+						contextKey,
+						rootEvidenceDigest: hash(endpoint.history.binding),
+						kind: "bash",
+						operationId: context.binding.toolCallId,
+						attempt: context.binding.attempt,
+					},
 				)
 			: undefined;
 	const attempt: RemoteTreeAttempt = {

@@ -102,6 +102,7 @@ beforeEach(() => {
 	allowedRead = true;
 	allowedWrite = true;
 	attached = true;
+	record.deviceId = "original-device";
 	hold = undefined;
 	for (const fn of [
 		authorize,
@@ -169,6 +170,7 @@ describe("production Terminal WS authorization", () => {
 		const s = socket();
 		sockets.push(s);
 		attached = false;
+		record.deviceId = "local"; // This branch can start a shell through local reattachment.
 		allowedWrite = false;
 		await handleTerminalWS.message(s.ws, { type: "subscribe", terminalIds: ["old"] });
 		expect(ensureAttached).not.toHaveBeenCalled();

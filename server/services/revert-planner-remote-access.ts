@@ -1,4 +1,5 @@
 import type { FileChangeExecutionBinding } from "@shared/file-change-protocol";
+import type { RevertUnknownCoverage } from "@shared/partial-revert";
 import { remoteHistoryFileState } from "@shared/remote-history-protocol";
 import type { RemoteFileChangeRuntime } from "./remote-file-change-runtime";
 import { assertRemoteHistoryBinding } from "./remote-history-service";
@@ -19,6 +20,7 @@ export interface RemoteRevertAuthority
 		runtime: RemoteFileChangeRuntime;
 		executionBinding: FileChangeExecutionBinding;
 		scopeRevision: number;
+		unknownCoverage?: RevertUnknownCoverage[];
 		assertCurrent(signal: AbortSignal): Promise<void>;
 	}>;
 }
@@ -56,6 +58,7 @@ export class RevertPlannerRemoteAccess implements RevertPlannerAccess {
 			identity,
 			executionBinding: Object.freeze({ ...granted.executionBinding }),
 			scopeRevision: granted.scopeRevision,
+			unknownCoverage: granted.unknownCoverage,
 			assertCurrent,
 			readCurrent: async ({ signal, maxBytes }) => {
 				await assertCurrent({ signal });

@@ -34,6 +34,47 @@ test("workspace context endpoints encode owner identity and pin switch to the ob
 	expect(requests[1]?.url).toEndWith("/narrators/n%20%2F1/workspace-context/switch");
 	expect(JSON.parse(String(requests[1]?.input?.body))).toEqual(input);
 });
+test("device binding endpoints keep selection and per-device updates separate and encode identity", async () => {
+	const signal = new AbortController().signal;
+	await api.listNarratorDeviceWorkspaces("n /1", { cursor: "device /2", limit: 32, signal });
+	await api.setNarratorDeviceWorkspace("n /1", {
+		requestId: "set-original",
+		deviceId: "device /2",
+		cwd: "D:\\own\\dir",
+		expectedBindingRevision: 4,
+	});
+	await api.selectNarratorDeviceWorkspace("n /1", {
+		requestId: "select-original",
+		deviceId: "device /2",
+		expectedBindingRevision: 5,
+		expectedSelectionRevision: 8,
+	});
+	await api.getNarratorDeviceWorkspaceRequest("n /1", "select /original");
+	await api.recoverNarratorDeviceWorkspaceRequest("n /1", "select /original");
+	expect(requests[0]?.url).toContain("/narrators/n%20%2F1/device-workspaces?");
+	expect(new URL(requests[0]?.url ?? "", "http://localhost").searchParams.get("cursor")).toBe(
+		"device /2",
+	);
+	expect(requests[0]?.input?.signal).toBe(signal);
+	expect(requests[1]?.url).toEndWith("/device-workspaces/device%20%2F2");
+	expect(requests[1]?.input?.method).toBe("PUT");
+	expect(JSON.parse(String(requests[1]?.input?.body))).toEqual({
+		requestId: "set-original",
+		cwd: "D:\\own\\dir",
+		expectedBindingRevision: 4,
+	});
+	expect(JSON.parse(String(requests[2]?.input?.body))).toEqual({
+		requestId: "select-original",
+		deviceId: "device /2",
+		expectedBindingRevision: 5,
+		expectedSelectionRevision: 8,
+	});
+	expect(requests[3]?.url).toEndWith("/device-workspaces/requests/select%20%2Foriginal");
+	expect(requests[4]?.url).toEndWith("/device-workspaces/requests/select%20%2Foriginal/recover");
+	expect(requests[4]?.input?.method).toBe("POST");
+	expect(requests[4]?.input?.body).toBeUndefined();
+});
+
 test("worktree prepare/list/create use frozen shared endpoints; no extra confirmation request", async () => {
 	await api.prepareNarratorWorktree("n", {
 		expectedRevision: 4,

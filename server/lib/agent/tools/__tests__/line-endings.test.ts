@@ -37,6 +37,14 @@ function makeCtx(): ToolContext {
 	return {
 		narratorId: TEST_NARRATOR_ID,
 		cwd: TEST_DIR,
+		workspaceContext: {
+			deviceId: "local",
+			cwd: TEST_DIR,
+			pathFlavor: "posix",
+			revision: 0,
+			contextKey: `${TEST_NARRATOR_ID}:${TEST_DIR}`,
+			capabilities: { switchDirectory: true },
+		},
 		signal: new AbortController().signal,
 		locale: "en",
 		requestPermission: async () => ({ behavior: "allow" as const }),

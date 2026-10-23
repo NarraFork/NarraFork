@@ -1,14 +1,11 @@
+import { lstat } from "node:fs/promises";
 import { resolve } from "node:path";
-import { eq } from "drizzle-orm";
 import { type Context, Hono } from "hono";
 import type { z } from "zod";
 import { EDITOR_METADATA_MAX_BYTES } from "../../shared/editor-document";
-import { db } from "../db";
-import { chapters, projects } from "../db/schema";
-import { AppError, NotFoundError, zodValidationError } from "../lib/errors";
+import { AppError, zodValidationError } from "../lib/errors";
 import { checkWriteBoundary, describeWriteRefusal } from "../lib/fs-write-boundary";
 import { requireNarratorAccess } from "../lib/narrator-access";
-import { getHome } from "../lib/platform";
 import { settings } from "../lib/settings";
 import {
 	commitEditorUploadSchema,
@@ -27,8 +24,11 @@ import {
 } from "../services/editor-document-service";
 import { rejectEditorSymlinks } from "../services/editor-document-worker";
 import { authorizeEditorReferenceTarget } from "../services/file-reference-service";
-import { resolveNarratorSessionCwd } from "../services/narrator-cwd";
+import { narratorDeviceWorkspaceService } from "../services/narrator-device-workspace-service";
+import { resolveNarratorProjectId } from "../services/narrator-project";
 import { authorizeRemoteEditorBinding } from "../services/remote-editor-access";
+import { assertNarratorOriginalWorkspaceAuthority } from "../services/workspace-artifact-access";
+import { assertWorkspaceSelectionInstalled } from "../services/workspace-context-service";
 
 /** Bounded raw metadata reading also covers chunked requests with no Content-Length. */
 export async function readEditorMetadata<T>(request: Request, schema: z.ZodType<T>): Promise<T> {
@@ -66,64 +66,91 @@ export function editorActor(c: Context): EditorActor {
 		userId: c.get("user").sub,
 		narratorId: c.req.param("id") ?? "",
 		locale: c.req.header("accept-language")?.startsWith("zh") ? "zh-CN" : "en",
-		async authorize(input, need) {
-			const narrator = await requireNarratorAccess(c, c.req.param("id") ?? "", need);
-			const device = input.deviceId ?? narrator.defaultDeviceId ?? "local";
+		async authorize(input, need, original) {
+			const narrator = await requireNarratorAccess(c, actor.narratorId, need);
+			if (!original) assertWorkspaceSelectionInstalled(narrator.id);
+			const signal = AbortSignal.any([c.req.raw.signal, AbortSignal.timeout(30_000)]);
+			const device = original?.deviceId ?? input.deviceId ?? narrator.defaultDeviceId ?? "local";
+			const source = original
+				? original.workspaceContext
+				: await narratorDeviceWorkspaceService.resolve(narrator.id, device, {
+						userId: actor.userId,
+					});
+			if (!source || source.deviceId !== device)
+				throw new EditorDocumentError(
+					"EDITOR_IDENTITY_CHANGED",
+					"Editor original source or configured device binding is unavailable",
+					403,
+				);
+			const workspace = Object.freeze(structuredClone(source));
+			const projectId = original ? original.projectId : await resolveNarratorProjectId(narrator);
+			let proof: { assertStillCurrent(): void } | undefined;
+			const authorizationGuard = async (required: "read" | "write") => {
+				await requireNarratorAccess(c, narrator.id, required);
+				if (original) {
+					proof = await assertNarratorOriginalWorkspaceAuthority(narrator.id, workspace, {
+						userId: actor.userId,
+						signal,
+						need: required,
+						originalProjectId: projectId,
+					});
+				} else {
+					await narratorDeviceWorkspaceService.assertCurrent(narrator.id, workspace, {
+						userId: actor.userId,
+					});
+					proof = await assertNarratorOriginalWorkspaceAuthority(narrator.id, workspace, {
+						userId: actor.userId,
+						signal,
+						need: required,
+						originalProjectId: projectId,
+					});
+				}
+			};
+			const assertCreationCurrent = () => {
+				signal.throwIfAborted();
+				proof?.assertStillCurrent();
+				if (!original) assertWorkspaceSelectionInstalled(narrator.id);
+				if (!original)
+					narratorDeviceWorkspaceService.assertCurrentSync(narrator.id, workspace, {
+						userId: actor.userId,
+					});
+			};
 			if (device !== "local") {
-				const workspace = narrator.workspaceContext;
-				if (
-					!workspace ||
-					workspace.deviceId !== device ||
-					workspace.revision !== narrator.workspaceRevision
-				)
-					throw new EditorDocumentError(
-						"EDITOR_REMOTE_UNSUPPORTED",
-						"Remote editor requires an initialized workspace binding",
-						422,
-					);
-				return authorizeRemoteEditorBinding(actor, workspace, input, need, {
-					signal: AbortSignal.any([c.req.raw.signal, AbortSignal.timeout(30_000)]),
-					async authorizationGuard(required) {
-						const live = await requireNarratorAccess(c, narrator.id, required);
-						if (
-							!live.workspaceContext ||
-							live.workspaceRevision !== workspace.revision ||
-							live.workspaceContext.contextKey !== workspace.contextKey ||
-							live.workspaceContext.deviceId !== workspace.deviceId ||
-							live.workspaceContext.cwd !== workspace.cwd
-						)
-							throw new EditorDocumentError(
-								"EDITOR_IDENTITY_CHANGED",
-								"Remote editor workspace changed",
-								403,
-							);
+				const binding = await authorizeRemoteEditorBinding(
+					actor,
+					workspace,
+					original ? { ...input, path: original.lexicalPath, deviceId: device } : input,
+					need,
+					{
+						signal,
+						authorizationGuard,
+						original,
+						originalProjectId: projectId,
+						assertStillCurrent: assertCreationCurrent,
 					},
+				);
+				assertCreationCurrent();
+				return Object.freeze({
+					...binding,
+					workspaceContext: workspace,
+					assertCreationCurrent: original ? undefined : assertCreationCurrent,
 				});
 			}
-			// cwd is an optional override: chapter narrators normally inherit their worktree.
-			// Resolve it on every request so moving/dormant worktrees invalidate old bindings.
-			const chapter = narrator.chapterId
-				? await db.query.chapters.findFirst({
-						where: eq(chapters.id, narrator.chapterId),
-						columns: { projectId: true, worktreePath: true },
-					})
-				: undefined;
-			if (narrator.chapterId && !chapter) throw new NotFoundError("Chapter", narrator.chapterId);
-			const projectId = chapter?.projectId ?? narrator.contextProjectId ?? null;
-			const project = projectId
-				? await db.query.projects.findFirst({
-						where: eq(projects.id, projectId),
-						columns: { gitPath: true },
-					})
-				: undefined;
-			if (projectId && !project) throw new NotFoundError("Project", projectId);
-			const cwd = resolveNarratorSessionCwd(
-				narrator.cwd,
-				chapter?.worktreePath,
-				project?.gitPath,
-				getHome(),
-			);
-			const lexicalPath = resolve(cwd, input.path);
+			await authorizationGuard(need);
+			const cwd = workspace.cwd;
+			const rootStat = await lstat(cwd);
+			const rootIdentity = `${rootStat.dev}:${rootStat.ino}`;
+			if (
+				!rootStat.isDirectory() ||
+				rootStat.isSymbolicLink() ||
+				(original && original.rootIdentity !== rootIdentity)
+			)
+				throw new EditorDocumentError(
+					"EDITOR_IDENTITY_CHANGED",
+					"Original editor root identity changed",
+					403,
+				);
+			const lexicalPath = original?.lexicalPath ?? resolve(cwd, input.path);
 			try {
 				await rejectEditorSymlinks(lexicalPath);
 			} catch {
@@ -148,11 +175,28 @@ export function editorActor(c: Context): EditorActor {
 					narrator.id,
 					c.get("user").sub,
 					lexicalPath,
+					workspace,
+					projectId,
 				);
 				if (canonical !== decision.physicalPath)
 					throw new AppError("Editor source identity changed", 403, "EDITOR_IDENTITY_CHANGED");
 			}
+			await authorizationGuard(need);
+			proof = await assertNarratorOriginalWorkspaceAuthority(narrator.id, workspace, {
+				userId: actor.userId,
+				signal,
+				need,
+				originalProjectId: projectId,
+				canonicalPath: decision.physicalPath,
+			});
+			assertCreationCurrent();
 			return {
+				deviceId: device,
+				rootIdentity,
+				workspaceContext: workspace,
+				workspaceRevision: workspace.revision,
+				contextKey: workspace.contextKey,
+				assertCreationCurrent: original ? undefined : assertCreationCurrent,
 				cwd,
 				lexicalPath,
 				canonicalPath: decision.physicalPath,

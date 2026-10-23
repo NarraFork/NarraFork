@@ -408,6 +408,13 @@ export function extractDataRevision(data: unknown): string | undefined {
 					a.width,
 					a.height,
 					a.filePath,
+					a.deviceId,
+					a.contextKey,
+					a.attachmentId,
+					a.sourceNarratorId,
+					a.attachmentOrigin,
+					a.attachmentWorkspace,
+					a.attachmentUnavailableReason,
 					a.uploadNarratorId,
 					// Domain-endpoint locator (chat attachments): the id lives in the path,
 					// so this also re-keys a same-filename re-upload.

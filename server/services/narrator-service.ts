@@ -116,6 +116,7 @@ import { getAvailableOptionalToolIds } from "./command-service";
 import { integrationResourceBindingService } from "./integration-resource-binding-service";
 import { assertNarratorAccess, type NarratorAccessNeed } from "./narrator-acl";
 import { resolveNarratorSessionCwd } from "./narrator-cwd";
+import { insertInitialDeviceWorkspaceBinding } from "./narrator-device-workspace-store";
 import { buildSystemInjectionBlock, type SystemInjectionBlock } from "./narrator-injection";
 import { DEFAULT_TOOL_IO_BUDGET, narratorMessageQueries, truncateJson } from "./narrator-messages";
 // `bumpParentNarratorMessageVersion` is deliberately NOT imported any more: the bump
@@ -938,7 +939,7 @@ export async function handleBashCommand(
 	options?: { skipUserMessage?: boolean; signal?: AbortSignal },
 ): Promise<{ type: "bash"; id: string; output: string; isError: boolean }> {
 	const narrator = await narratorService.getById(narratorId);
-	const cwd = narrator.cwd ?? process.cwd();
+	const actorId = userId ?? null;
 
 	// 1. Persist and broadcast the user-visible /bash command immediately.
 	// When skipUserMessage is set (runBashFirst flow), the user's slash command was
@@ -1009,7 +1010,9 @@ export async function handleBashCommand(
 		toolName: "Bash",
 		inputJson: toolInput,
 		inputChars: measureSerializedCharacters(toolInput),
-		status: "running",
+		status: "initializing",
+		executionAttempt: 1,
+		executionIdentityVersion: 1,
 		streamStartedAt: streamStartedAtIso,
 		createdAt: now,
 	});
@@ -1076,31 +1079,132 @@ export async function handleBashCommand(
 		});
 	}, 5000);
 
-	let result: Awaited<ReturnType<typeof bashTool.execute>>;
+	let result: Awaited<ReturnType<typeof bashTool.execute>> & { executionStartedAt?: number };
 	try {
-		result = await bashTool.execute(toolInput, {
+		const { executeTool } = await import("../lib/agent/tool-executor");
+		const { toolRegistry } = await import("../lib/agent/tool-registry");
+		const { createDeviceWorkspaceConfig } = await import("./workspace-artifact-access");
+		const { handlePermission } = await import("./narrator-permission");
+		const { buildFinalToolStartAuthorization } = await import("./tool-final-start-authorization");
+		const { assertOAuthNarratorRuntimeActive } = await import("./oauth-narrator-runtime-policy");
+		const { getSessionDevices } = await import("./device-connection-service");
+		const { assertWorkspaceSelectionInstalled } = await import("./workspace-context-service");
+		assertWorkspaceSelectionInstalled(narratorId);
+		if (!toolRegistry.get("Bash")) toolRegistry.register(bashTool);
+		const signal = bashAbort.signal;
+		const deviceConfig = await createDeviceWorkspaceConfig(narratorId, { userId: actorId, signal });
+		const defaultDeviceId = narrator.defaultDeviceId ?? "local";
+		const workspace = await deviceConfig.resolveDeviceWorkspace?.(defaultDeviceId);
+		// Capture selection only after legacy genesis (which can initialize its projection).
+		const projection = db
+			.select({
+				revision: narrators.workspaceRevision,
+				deviceId: narrators.defaultDeviceId,
+				context: narrators.workspaceContext,
+			})
+			.from(narrators)
+			.where(eq(narrators.id, narratorId))
+			.get();
+		if (!projection) throw new Error("Manual Bash narrator no longer exists");
+		if ((projection.deviceId ?? "local") !== defaultDeviceId)
+			throw new Error("Workspace changed while preparing manual Bash");
+		const projectId = workspace?.contextProjectId ?? (await resolveNarratorProjectId(narrator));
+		const runtime = await assertOAuthNarratorRuntimeActive(narratorId, actorId);
+		const devices = await getSessionDevices(projectId, actorId);
+		const executionConfig: import("../lib/agent").AgentConfig = {
+			...deviceConfig,
 			narratorId,
-			cwd,
-			signal: bashAbort.signal,
+			conversationId: `manual-bash-${toolCallId}`,
+			// This path executes a human command; it never contacts an AI provider.
+			provider: "manual",
+			model: "manual-bash",
+			cwd: workspace?.cwd ?? "",
+			workspaceContext: workspace ?? undefined,
+			defaultDeviceId,
+			userId: actorId,
+			projectId,
+			signal,
 			locale: "en",
-			requestPermission: async () => ({ behavior: "allow" as const }),
-			currentToolUseId: toolUseId,
-			emitOutput: (output) => {
-				broadcastToNarrator(narratorId, {
-					type: "tool_output",
-					narratorId,
-					toolUseId,
-					output,
-				});
+			availableDevices: runtime
+				? devices.filter((device) => runtime.deviceIds.includes(device.id))
+				: devices,
+			allowLocalExecution: runtime?.allowLocalExecution ?? true,
+			allowedTools: runtime ? new Set(runtime.allowedTools) : undefined,
+			assertWorkspaceCurrent() {
+				signal.throwIfAborted();
+				assertWorkspaceSelectionInstalled(narratorId);
+				const current = db
+					.select({
+						revision: narrators.workspaceRevision,
+						deviceId: narrators.defaultDeviceId,
+						context: narrators.workspaceContext,
+					})
+					.from(narrators)
+					.where(eq(narrators.id, narratorId))
+					.get();
+				if (
+					!current ||
+					current.revision !== projection.revision ||
+					current.deviceId !== projection.deviceId ||
+					current.context?.contextKey !== projection.context?.contextKey
+				)
+					throw new Error("Workspace changed; this manual Bash cannot start on another selection");
 			},
-			emitLongRunning: (_toolUseId, elapsed) => {
-				broadcastToNarrator(narratorId, {
-					type: "tool_long_running",
-					narratorId,
-					toolUseId,
-					elapsed,
-				});
+			requireToolCallBinding: true,
+			runtimeAuthorizationGuard: async () => {
+				await assertOAuthNarratorRuntimeActive(narratorId, actorId);
 			},
+			permissionHandler: (name, input, useId, options) =>
+				handlePermission(
+					narratorId,
+					signal,
+					name,
+					input,
+					useId,
+					options?.executionTarget?.cwd ?? executionConfig.cwd,
+					"en",
+					narrator.parentNarratorId ?? undefined,
+					options,
+					undefined,
+					runtime
+						? {
+								permissionMode: runtime.permissionMode,
+								allowKnowledgeWrite: runtime.allowKnowledgeWrite,
+								dangerReflectionPrompt: runtime.dangerReflectionPrompt,
+								useRobotDiagnosticPreset: runtime.useRobotDiagnosticPreset,
+								deviceAccess: runtime.policy.deviceAccess,
+								oauthClientId: runtime.clientId,
+								grantId: runtime.grantId,
+							}
+						: undefined,
+				),
+			onExecutionTargetResolved: (useId, target, binding) =>
+				narratorPersistence.updateToolCallExecutionTarget(narratorId, useId, target, binding),
+			onExecutionPlanResolved: (useId, plan, binding) =>
+				narratorPersistence.updateToolCallExecutionPlan(narratorId, useId, plan, binding),
+			onToolExecutionStarting: (useId, binding, startedAt) =>
+				narratorPersistence.claimToolCallExecution(narratorId, useId, binding, startedAt),
+			onEvent(event) {
+				if (event.type === "tool_output")
+					broadcastToNarrator(narratorId, {
+						type: "tool_output",
+						narratorId,
+						toolUseId,
+						output: event.output,
+					});
+				else if (event.type === "tool_long_running")
+					broadcastToNarrator(narratorId, {
+						type: "tool_long_running",
+						narratorId,
+						toolUseId,
+						elapsed: event.elapsed,
+					});
+			},
+		};
+		executionConfig.onToolExecutionFinalAuthorization =
+			buildFinalToolStartAuthorization(executionConfig);
+		result = await executeTool({ name: "Bash", input: toolInput, toolUseId }, executionConfig, {
+			toolCallBinding: { toolCallId, attempt: 1 },
 		});
 	} catch (err) {
 		result = {
@@ -1148,7 +1252,7 @@ export async function handleBashCommand(
 			status,
 			errorMessage: result.isError ? result.output : undefined,
 			durationMs,
-			executionStartedAt: streamStartedAt,
+			executionStartedAt: result.executionStartedAt,
 			completedAt,
 		},
 		assistantMsgId,
@@ -1259,7 +1363,7 @@ async function insertSpecClearedCarryoverCard(narratorId: string): Promise<void>
 	}
 }
 
-type NarratorInsertExecutor = Pick<typeof db, "insert">;
+type NarratorInsertExecutor = Pick<typeof db, "insert" | "select" | "update">;
 
 /** A fork keeps execution constraints and explicit audiences, but not named/task identity. */
 function forkTraits(parent: typeof narrators.$inferSelect, chapterId: string | null): string[] {
@@ -1724,7 +1828,7 @@ export async function narratorCreationWorkspaceTarget(
 	if (context) row.workspaceContext = { ...context, cwd: target.canonicalCwd ?? context.cwd };
 	return [target];
 }
-/** Insert a prepared narrator using the caller's synchronous SQLite transaction. */
+/** Insert a prepared narrator and its explicit first device binding in one transaction. */
 export function createPreparedNarratorInTransaction(
 	executor: NarratorInsertExecutor,
 	prepared: PreparedNarratorCreation,
@@ -1738,7 +1842,22 @@ export function createPreparedNarratorInTransaction(
 		});
 	// Synchronous assertion and insert share this transaction with no await gap.
 	for (const target of admission.target) assertWorkspaceAdmission(target);
-	return executor.insert(narrators).values(prepared.row).returning().get();
+	const narrator = executor.insert(narrators).values(prepared.row).returning().get();
+	return installInitialNarratorDeviceBinding(executor, narrator);
+}
+
+function installInitialNarratorDeviceBinding(
+	executor: NarratorInsertExecutor,
+	narrator: typeof narrators.$inferSelect,
+): typeof narrators.$inferSelect {
+	if (!narrator.workspaceContext) return narrator;
+	const workspaceContext = insertInitialDeviceWorkspaceBinding(executor, {
+		narratorId: narrator.id,
+		context: narrator.workspaceContext,
+		createdAt: narrator.createdAt,
+	});
+	executor.update(narrators).set({ workspaceContext }).where(eq(narrators.id, narrator.id)).run();
+	return { ...narrator, workspaceContext };
 }
 
 /** Publish non-transactional narrator creation side effects after commit. */
@@ -1878,65 +1997,69 @@ export const narratorService = {
 			};
 			const creationTarget = await narratorCreationWorkspaceTarget(creationWorkspace);
 			return withWorkspaceAdmission(creationTarget, async () => {
-				const [narrator] = await db
-					.insert(narrators)
-					.values({
-						id,
-						chapterId: subChapterId,
-						type: "subagent",
-						subagentType: input.subagentType,
-						variant: subagentVariant(input.subagentType),
-						traits: subTraits,
-						title: input.title ?? null,
-						model: storedModel,
-						systemPrompt: input.systemPrompt ?? null,
-						permissionMode: resolvedPermMode,
-						reasoningEffort: resolvedReasoningEffort,
-						fastModeOverride: normalizeBooleanOverride(parent.fastModeOverride),
-						fastMode: legacyFastModeMirror(parent.fastModeOverride),
-						relaxedPlan: resolvedRelaxedPlan,
-						planReflectionAutoApproveOverride:
-							input.planReflectionAutoApproveOverride ??
-							parent.planReflectionAutoApproveOverride ??
-							"inherit",
-						dangerReflectionOverride: parent.dangerReflectionOverride ?? "inherit",
-						autoContinuationOverride: parent.autoContinuationOverride ?? "inherit",
-						behaviorFenceIntervalOverride: parent.behaviorFenceIntervalOverride ?? null,
-						behaviorFenceAttachOverride: parent.behaviorFenceAttachOverride ?? "inherit",
-						parentNarratorId: input.parentNarratorId,
-						originToolCallId: input.originToolCallId ?? null,
-						subagentOriginKind:
-							input.originToolCallId != null ? "tool" : (input.subagentOriginKind ?? null),
-						cwd: creationWorkspace.cwd,
-						workspaceContext: creationWorkspace.workspaceContext ?? null,
-						workspaceRevision: creationWorkspace.workspaceContext?.revision ?? 0,
-						defaultDeviceId: creationWorkspace.defaultDeviceId,
-						// A subagent is part of its parent's work, so its access is DELEGATED to the
-						// root rather than copied: `acl_root_narrator_id` is the only thing consulted
-						// when deciding who may read or drive it. That is what makes a later sharing
-						// change on the main session reach its subagents — there is nothing to
-						// propagate, because there is no copy. Copying used to be the approach, and
-						// sharing a parent afterwards silently left its subagents unreachable.
-						//
-						// Nested subagents point at the same root, so the chain is never walked on a
-						// decision path.
-						aclRootNarratorId: parent.aclRootNarratorId ?? input.parentNarratorId,
-						// Kept because "whose work is this" is still read for listings, attribution
-						// and user deletion — it just no longer decides access.
-						ownerUserId: parent.ownerUserId,
-						// Frozen at their strictest values ON PURPOSE, not copied from the parent.
-						// Delegation means these are never consulted, and a copy that cannot follow
-						// the root is a trap: any future code path that reads them instead of the
-						// judged row would get a stale snapshot that may be WIDER than the root.
-						// Pinning them here makes such a mistake fail closed instead of leaking.
-						visibility: "private",
-						writeAudience: "owner",
-						inheritMode: "fresh",
-						status: "working",
-						createdAt: now,
-						updatedAt: now,
-					})
-					.returning();
+				const narrator = db.transaction((tx) => {
+					const created = tx
+						.insert(narrators)
+						.values({
+							id,
+							chapterId: subChapterId,
+							type: "subagent",
+							subagentType: input.subagentType,
+							variant: subagentVariant(input.subagentType),
+							traits: subTraits,
+							title: input.title ?? null,
+							model: storedModel,
+							systemPrompt: input.systemPrompt ?? null,
+							permissionMode: resolvedPermMode,
+							reasoningEffort: resolvedReasoningEffort,
+							fastModeOverride: normalizeBooleanOverride(parent.fastModeOverride),
+							fastMode: legacyFastModeMirror(parent.fastModeOverride),
+							relaxedPlan: resolvedRelaxedPlan,
+							planReflectionAutoApproveOverride:
+								input.planReflectionAutoApproveOverride ??
+								parent.planReflectionAutoApproveOverride ??
+								"inherit",
+							dangerReflectionOverride: parent.dangerReflectionOverride ?? "inherit",
+							autoContinuationOverride: parent.autoContinuationOverride ?? "inherit",
+							behaviorFenceIntervalOverride: parent.behaviorFenceIntervalOverride ?? null,
+							behaviorFenceAttachOverride: parent.behaviorFenceAttachOverride ?? "inherit",
+							parentNarratorId: input.parentNarratorId,
+							originToolCallId: input.originToolCallId ?? null,
+							subagentOriginKind:
+								input.originToolCallId != null ? "tool" : (input.subagentOriginKind ?? null),
+							cwd: creationWorkspace.cwd,
+							workspaceContext: creationWorkspace.workspaceContext ?? null,
+							workspaceRevision: creationWorkspace.workspaceContext?.revision ?? 0,
+							defaultDeviceId: creationWorkspace.defaultDeviceId,
+							// A subagent is part of its parent's work, so its access is DELEGATED to the
+							// root rather than copied: `acl_root_narrator_id` is the only thing consulted
+							// when deciding who may read or drive it. That is what makes a later sharing
+							// change on the main session reach its subagents — there is nothing to
+							// propagate, because there is no copy. Copying used to be the approach, and
+							// sharing a parent afterwards silently left its subagents unreachable.
+							//
+							// Nested subagents point at the same root, so the chain is never walked on a
+							// decision path.
+							aclRootNarratorId: parent.aclRootNarratorId ?? input.parentNarratorId,
+							// Kept because "whose work is this" is still read for listings, attribution
+							// and user deletion — it just no longer decides access.
+							ownerUserId: parent.ownerUserId,
+							// Frozen at their strictest values ON PURPOSE, not copied from the parent.
+							// Delegation means these are never consulted, and a copy that cannot follow
+							// the root is a trap: any future code path that reads them instead of the
+							// judged row would get a stale snapshot that may be WIDER than the root.
+							// Pinning them here makes such a mistake fail closed instead of leaking.
+							visibility: "private",
+							writeAudience: "owner",
+							inheritMode: "fresh",
+							status: "working",
+							createdAt: now,
+							updatedAt: now,
+						})
+						.returning()
+						.get();
+					return installInitialNarratorDeviceBinding(tx, created);
+				});
 
 				logger.info("Subagent created", {
 					id,
@@ -2593,7 +2716,7 @@ export const narratorService = {
 						insertRefsBatched(tx, dupRefValues);
 						const nextSeq = initializeRefSeqFloor(tx, id);
 
-						return { ...created, nextSeq };
+						return { ...installInitialNarratorDeviceBinding(tx, created), nextSeq };
 					}),
 				),
 			);
@@ -3021,7 +3144,7 @@ export const narratorService = {
 							.findFirst({ where: eq(narrators.id, id) })
 							.sync();
 						if (!finalNarrator) throw new NotFoundError("Narrator", id);
-						return finalNarrator;
+						return installInitialNarratorDeviceBinding(tx, finalNarrator);
 					}),
 				),
 			);

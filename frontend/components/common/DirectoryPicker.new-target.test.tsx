@@ -1,6 +1,6 @@
 import { afterAll, afterEach, beforeEach, expect, mock, test } from "bun:test";
 import { parseHTML } from "linkedom";
-import type { ReactNode } from "react";
+import { type ReactNode, useState } from "react";
 import type { Root } from "react-dom/client";
 
 const keys = ["window", "document", "navigator", "IS_REACT_ACT_ENVIRONMENT"] as const;
@@ -28,7 +28,33 @@ const browse = mock(async (path?: string, _opts?: unknown) => ({
 	entries,
 }));
 mock.module("./PathInput", () => ({ PathInput: () => null }));
-mock.module("../../lib/api", () => ({ api: { fsBrowse: browse, fsMkdir: mkdir } }));
+const narratorBrowse = mock(
+	async (_narratorId: string, deviceId: string, path?: string, _opts?: unknown) => ({
+		path: path ?? (deviceId === "win" ? "C:\\root" : "/root"),
+		parent: null,
+		sep: deviceId === "win" ? "\\" : "/",
+		entries: [],
+		truncated: false,
+	}),
+);
+const adminBrowse = mock(async () => {
+	throw new Error("admin browsing forbidden");
+});
+mock.module("../../lib/api", () => ({
+	api: {
+		fsBrowse: browse,
+		fsMkdir: mkdir,
+		browseNarratorDevice: narratorBrowse,
+		browseDevicePath: adminBrowse,
+	},
+}));
+mock.module("@mantine/hooks", () => ({
+	useMediaQuery: () => false,
+	useDisclosure: () => {
+		const [opened, setOpened] = useState(false);
+		return [opened, { open: () => setOpened(true), close: () => setOpened(false) }];
+	},
+}));
 mock.module("../../hooks/usePlatform", () => ({
 	useFileSystemCapability: () => ({
 		browse: { supported: true },
@@ -102,17 +128,20 @@ mock.module("@mantine/core", () => {
 			onChange,
 			error,
 			placeholder,
+			rightSection,
 			"aria-label": label,
 		}: {
 			value: string;
 			onChange: (event: unknown) => void;
 			error?: string;
 			placeholder?: string;
+			rightSection?: ReactNode;
 			"aria-label"?: string;
 		}) => (
 			<label>
 				<input aria-label={label ?? placeholder} value={value} onInput={onChange} />
 				{error}
+				{rightSection}
 			</label>
 		),
 	};
@@ -120,7 +149,7 @@ mock.module("@mantine/core", () => {
 const { act } = await import("react");
 const { createRoot } = await import("react-dom/client");
 const { QueryClient, QueryClientProvider } = await import("@tanstack/react-query");
-const { DirectoryBrowser } = await import("./DirectoryPicker");
+const { DirectoryBrowser, DirectoryPicker } = await import("./DirectoryPicker");
 const { TargetDirectoryBrowser } = await import("./TargetDirectoryBrowser");
 let root: Root;
 let container: HTMLElement;
@@ -171,6 +200,8 @@ beforeEach(() => {
 	selected.mockClear();
 	mkdir.mockClear();
 	browse.mockClear();
+	narratorBrowse.mockClear();
+	adminBrowse.mockClear();
 	client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } });
 	container = document.createElement("div");
 	document.body.appendChild(container);
@@ -396,6 +427,64 @@ test("existing caller still selects an existing directory and mkdir still create
 	});
 	expect(mkdir).toHaveBeenCalledTimes(1);
 	expect(directories.has("/repo/created-now")).toBe(true);
+});
+test.each([
+	"local",
+	"win",
+	"linux",
+])("session-qualified %s picker browses through narrator authority without host/admin requests", async (deviceId) => {
+	await act(async () =>
+		root.render(
+			<QueryClientProvider client={client}>
+				<DirectoryPicker narratorId="n1" deviceId={deviceId} value="" onChange={selected} />
+			</QueryClientProvider>,
+		),
+	);
+	expect(narratorBrowse).not.toHaveBeenCalled();
+	await act(async () => {
+		container.querySelector<HTMLButtonElement>("button")?.click();
+	});
+	await act(async () => {
+		await flush();
+	});
+	expect(narratorBrowse.mock.calls[0]?.slice(0, 3)).toEqual(["n1", deviceId, undefined]);
+	expect(narratorBrowse.mock.calls[0]?.[3]).toMatchObject({ signal: expect.any(AbortSignal) });
+	expect(browse).not.toHaveBeenCalled();
+	expect(adminBrowse).not.toHaveBeenCalled();
+	expect(mkdir).not.toHaveBeenCalled();
+	expect(selected).not.toHaveBeenCalled(); // Browsing is not submitting a binding.
+	await select();
+	expect(selected.mock.calls[0]?.[0]).toBe(deviceId === "win" ? "C:\\root" : "/root");
+});
+test("session picker switching device while browser stays mounted never reads old-device path on the new pair", async () => {
+	const mount = async (deviceId: string, value: string) => {
+		await act(async () =>
+			root.render(
+				<QueryClientProvider client={client}>
+					<DirectoryPicker narratorId="n1" deviceId={deviceId} value={value} onChange={selected} />
+				</QueryClientProvider>,
+			),
+		);
+		await act(async () => {
+			await flush();
+		});
+	};
+	await mount("win", "C:\\original");
+	await act(async () => {
+		container.querySelector<HTMLButtonElement>("button")?.click();
+	});
+	await act(async () => {
+		await flush();
+	});
+	await mount("linux", "/new-target");
+	expect(narratorBrowse.mock.calls.filter((call) => call[1] === "linux")).toHaveLength(0);
+	await act(async () => {
+		container.querySelector<HTMLButtonElement>("button")?.click();
+	});
+	await act(async () => {
+		await flush();
+	});
+	expect(narratorBrowse.mock.calls.at(-1)?.slice(0, 3)).toEqual(["n1", "linux", "/new-target"]);
 });
 test("newTarget double click navigates parent, never selects an existing entry", async () => {
 	entries = [{ name: "folder", path: "/repo/folder" }];

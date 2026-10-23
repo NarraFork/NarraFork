@@ -19,8 +19,8 @@ import { PathRulesPopover } from "../interaction/PathRulesPopover";
 import { NarratorLodOptions } from "../lod/NarratorLodMenu";
 import type { RenderLod } from "../lod/RenderLodCtx";
 import type { MobileToolPanelKind } from "../MobileToolPanelHost";
-import { ExecutionDeviceOptions } from "../model/ExecutionDeviceMenu";
-import { WorkspaceTargetPickerModal } from "../model/WorkspaceTargetPickerModal";
+import { ExecutionDeviceOptions, useDeviceWorkspaceControls } from "../model/ExecutionDeviceMenu";
+import { WorkspaceTransitionNotice } from "../model/WorkspaceTargetPickerModal";
 import { WorkspaceSnapshotRestoreModal } from "../workspace/WorkspaceSnapshotRestoreModal";
 import type {
 	NarratorToolbarHost,
@@ -135,10 +135,11 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 	const closeSnapshots = useCallback(() => setSnapshotsOpened(false), []);
 	// biome-ignore lint/correctness/useExhaustiveDependencies: narrator ownership changes discard the old manager surface
 	useEffect(() => setSnapshotsOpened(false), [narratorId]);
-	const [workspaceTargetId, setWorkspaceTargetId] = useState<string | null>(null);
-	// biome-ignore lint/correctness/useExhaustiveDependencies: narrator ownership changes must discard the old target selection
-	useEffect(() => setWorkspaceTargetId(null), [narratorId]);
-	const closeWorkspaceTarget = useCallback(() => setWorkspaceTargetId(null), []);
+	const deviceControls = useDeviceWorkspaceControls(
+		narratorId,
+		executionDevicesQuery.data?.devices ?? [],
+		t("executionTargetLocal"),
+	);
 	const [pathRulesOpened, setPathRulesOpened] = useState(false);
 	const closePathRules = useCallback(() => setPathRulesOpened(false), []);
 
@@ -310,25 +311,31 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 							localLabel={t("executionTargetLocal")}
 							offlineLabel={t("executionDeviceOffline")}
 							devices={executionDevicesQuery.data?.devices ?? []}
+							{...deviceControls.rows}
 							currentDeviceId={
-								workspaceContext?.deviceId ?? executionDevicesQuery.data?.defaultDeviceId ?? "local"
+								deviceControls.workspace.transition?.phase === "unconfirmed" &&
+								deviceControls.workspace.transition.affectsSelection !== false
+									? ""
+									: (deviceControls.display?.deviceId ?? workspaceContext?.deviceId ?? "local")
 							}
 							onSelect={(deviceId) => {
 								close();
-								setWorkspaceTargetId(deviceId ?? "local");
+								deviceControls.select(deviceId);
+							}}
+							onConfigure={(deviceId) => {
+								close();
+								deviceControls.open(deviceId);
 							}}
 							snapshotsLabel={t("snapshotRestore.title")}
 							onManageSnapshots={() => {
 								close();
 								setSnapshotsOpened(true);
 							}}
-							directoryLabel={t("workspaceSwitch")}
+							directoryLabel={t("deviceWorkspace.configure")}
 							onChangeDirectory={() => {
 								close();
-								setWorkspaceTargetId(
-									workspaceContext?.deviceId ??
-										executionDevicesQuery.data?.defaultDeviceId ??
-										"local",
+								deviceControls.open(
+									deviceControls.display?.deviceId ?? workspaceContext?.deviceId ?? "local",
 								);
 							}}
 							withLabel={false}
@@ -367,6 +374,7 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 			t,
 			executionDevicesQuery.data,
 			workspaceContext?.deviceId,
+			deviceControls,
 			renderLod,
 			renderLodIsDefault,
 			handleSelectLod,
@@ -396,22 +404,9 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 							onClose={closeSnapshots}
 						/>
 					)}
-					{workspaceTargetId && (
-						<WorkspaceTargetPickerModal
-							key={`${narratorId}:${workspaceTargetId}`}
-							narratorId={narratorId}
-							deviceId={workspaceTargetId}
-							deviceLabel={
-								workspaceTargetId === "local"
-									? t("executionTargetLocal")
-									: (executionDevicesQuery.data?.devices.find(
-											(device: { id: string }) => device.id === workspaceTargetId,
-										)?.name ?? workspaceTargetId)
-							}
-							opened
-							onClose={closeWorkspaceTarget}
-						/>
-					)}
+					<WorkspaceTransitionNotice narratorId={narratorId} />
+					{deviceControls.error && !deviceControls.workspace.transition && deviceControls.error}
+					{deviceControls.modal}
 				</>
 			),
 			saveToolbarLayout,
@@ -428,11 +423,11 @@ export function useHeaderToolbar(options: UseHeaderToolbarOptions): UseHeaderToo
 			t,
 			pathRulesOpened,
 			closePathRules,
-			workspaceTargetId,
-			closeWorkspaceTarget,
+			deviceControls.error,
+			deviceControls.workspace.transition,
+			deviceControls.modal,
 			snapshotsOpened,
 			closeSnapshots,
-			executionDevicesQuery.data,
 			saveToolbarLayout,
 			toolbarEntryActive,
 			activateToolbarEntry,

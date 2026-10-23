@@ -149,6 +149,62 @@ afterEach(() => {
 	sqlite.run("DELETE FROM narrator_buffered_messages");
 });
 
+describe("queued attachment workspace source", () => {
+	test("unknown legacy submission source explicitly rejects instead of resolving current cwd", async () => {
+		const { prepareNarratorTextAttachmentAccess } = await import("../narrator-text-attachments");
+		await expect(
+			prepareNarratorTextAttachmentAccess(NARRATOR_ID, {
+				requireWorkspaceSource: true,
+			} as Parameters<typeof prepareNarratorTextAttachmentAccess>[1]),
+		).rejects.toThrow("Queued attachment workspace source is unavailable");
+	});
+	test("persists the submission workspace across directory changes and mailbox reload", async () => {
+		const original = {
+			deviceId: "device-a",
+			cwd: "/repo/a",
+			revision: 7,
+			contextKey: "workspace-a",
+			pathFlavor: "posix" as const,
+			capabilities: { switchDirectory: true },
+			binding: {
+				version: 1 as const,
+				bindingKey: "binding-key-a",
+				narratorId: NARRATOR_ID,
+				deviceId: "device-a",
+				bindingId: "binding-a",
+				bindingRevision: 3,
+			},
+		};
+		await db
+			.update(narrators)
+			.set({ workspaceContext: original })
+			.where(eq(narrators.id, NARRATOR_ID));
+		const admitted = await enqueueBufferedMessage(
+			NARRATOR_ID,
+			"attachment",
+			undefined,
+			null,
+			null,
+			null,
+			[textFile("queued.txt")],
+		);
+		await db
+			.update(narrators)
+			.set({
+				workspaceContext: { ...original, cwd: "/repo/b", contextKey: "workspace-b", revision: 8 },
+			})
+			.where(eq(narrators.id, NARRATOR_ID));
+		const recovered = getBufferedMessages(NARRATOR_ID).find(
+			(message) => message.id === admitted.id,
+		);
+		expect(recovered).toBeDefined();
+		expect((recovered as unknown as { attachmentWorkspace?: unknown }).attachmentWorkspace).toEqual(
+			original,
+		);
+		await db.update(narrators).set({ workspaceContext: null }).where(eq(narrators.id, NARRATOR_ID));
+	});
+});
+
 describe("toBufferSummary — attachments are visible to clients", () => {
 	test("reports full image metadata and sized, positionally-keyed text files", async () => {
 		registerLiveLoop(NARRATOR_ID);

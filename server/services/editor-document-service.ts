@@ -42,6 +42,10 @@ export interface EditorBinding {
 	rootIdentity?: string;
 	editable?: boolean;
 	readOnlyReason?: string;
+	/** Server-owned frozen provenance, never part of the HTTP create input. */
+	workspaceContext?: import("@shared/workspace-context").WorkspaceContext;
+	/** Final synchronous current-binding fence used only before new source dispatch. */
+	assertCreationCurrent?: () => void;
 	cwd: string;
 	projectId: string | null;
 	lexicalPath: string;
@@ -52,7 +56,11 @@ export interface EditorActor {
 	userId: string;
 	narratorId: string;
 	locale?: "en" | "zh-CN";
-	authorize(input: CreateEditorDocumentInput, need: "read" | "write"): Promise<EditorBinding>;
+	authorize(
+		input: CreateEditorDocumentInput,
+		need: "read" | "write",
+		original?: Readonly<EditorBinding>,
+	): Promise<EditorBinding>;
 }
 export class EditorDocumentError extends AppError {
 	constructor(
@@ -402,7 +410,7 @@ export class EditorDocumentService {
 			throw expired();
 		}
 		await this.assertStore();
-		const binding = await actor.authorize(session.input, need);
+		const binding = await actor.authorize(session.input, need, session.binding);
 		if (!sameEditorBinding(binding, session.binding))
 			throw new EditorDocumentError(
 				"EDITOR_IDENTITY_CHANGED",
@@ -481,6 +489,14 @@ export class EditorDocumentService {
 			const result = await this.jobs.withIo(
 				actor.userId,
 				async (admitted) => {
+					const admittedBinding = await actor.authorize(input, "read");
+					if (!sameEditorBinding(admittedBinding, binding))
+						throw new EditorDocumentError(
+							"EDITOR_IDENTITY_CHANGED",
+							"New editor binding changed before source dispatch",
+							403,
+						);
+					admittedBinding.assertCreationCurrent?.();
 					if (deviceId === "local")
 						return this.jobs.run(
 							actor.userId,
@@ -893,7 +909,7 @@ export class EditorDocumentService {
 						},
 						authorize: async () => {
 							// Cancellation/DELETE may mark closing after commit began; pin keeps the bound bytes alive.
-							const fresh = await actor.authorize(session.input, "write");
+							const fresh = await actor.authorize(session.input, "write", session.binding);
 							if (
 								!sameEditorBinding(fresh, binding) ||
 								fresh.editable === false ||

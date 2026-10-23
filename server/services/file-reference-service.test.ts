@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test";
 import type { FileReference, FileSelection } from "@shared/file-reference";
 import { MAX_FILE_REFERENCE_POSITION } from "@shared/file-reference";
 import { MAX_FILE_REFERENCE_IMAGE_BYTES } from "@shared/file-reference-image";
+import type { WorkspaceContext } from "@shared/workspace-context";
 import type {
 	ExecutionBackend,
 	GlobMatches,
@@ -146,7 +147,34 @@ function fixture(
 		supportsFsReadAtomicResolvedPath: boolean;
 		supportsFsReadBounded: boolean;
 	};
+	let workspace: WorkspaceContext | null = {
+		deviceId: id,
+		cwd,
+		revision: 1,
+		contextKey: "pair-context",
+		pathFlavor: options.windows ? "windows" : "posix",
+		capabilities: { switchDirectory: true },
+		binding: {
+			version: 1,
+			narratorId: "narrator",
+			deviceId: id,
+			bindingId: "pair",
+			bindingRevision: 1,
+			bindingKey: "pair-context",
+		},
+	};
 	const deps: FileReferenceDependencies = {
+		async resolveWorkspace() {
+			return workspace;
+		},
+		async assertWorkspaceCurrent(_scope, pinned) {
+			if (!workspace || workspace.cwd !== pinned.cwd || workspace.contextKey !== pinned.contextKey)
+				throw new Error("binding stale");
+		},
+		assertWorkspaceCurrentSync(_scope, pinned) {
+			if (!workspace || workspace.cwd !== pinned.cwd || workspace.contextKey !== pinned.contextKey)
+				throw new Error("binding stale");
+		},
 		async loadScope(narratorId, userId, need) {
 			access.push({ narratorId, userId, need });
 			if (revoked || userId !== "visitor") throw new NotFoundError("Narrator", narratorId);
@@ -174,6 +202,9 @@ function fixture(
 	const service = createFileReferenceService(deps, options);
 	return {
 		service,
+		setWorkspace(value: WorkspaceContext | null) {
+			workspace = value;
+		},
 		deps,
 		backend,
 		scope,
@@ -536,6 +567,49 @@ describe("file-reference metadata and positions", () => {
 });
 
 describe("safe file capture and preview", () => {
+	test("relative remote reference uses pair binding, never executor default cwd", async () => {
+		const f = fixture({ remote: true });
+		f.backend.defaultCwd = "/executor-decoy";
+		const targets = await f.service.resolveFileReferences("narrator", "visitor", [
+			{ deviceId: f.id, path: "file.ts" },
+		]);
+		expect(targets[0].path).toBe("/work/file.ts");
+	});
+	test("unconfigured relative and search roots fail before metadata, but exact absolute Read remains possible", async () => {
+		const f = fixture({ remote: true });
+		f.setWorkspace(null);
+		let metadata = 0;
+		const resolve = f.backend.resolvePathIdentity;
+		f.backend.resolvePathIdentity = async (path) => {
+			metadata++;
+			return resolve(path);
+		};
+		await expect(
+			f.service.resolveFileReferences("narrator", "visitor", [{ deviceId: f.id, path: "file.ts" }]),
+		).rejects.toThrow("Configure");
+		await expect(
+			f.service.searchFileReferences("narrator", "visitor", { deviceId: f.id, q: "file" }),
+		).rejects.toThrow("Configure");
+		expect(metadata).toBe(0);
+		const result = await f.service.previewFileReference("narrator", "visitor", {
+			deviceId: f.id,
+			path: "/work/file.ts",
+		});
+		expect(result.content).toContain("alpha");
+	});
+	test("relative binding revoked during Read policy resolution causes zero byte dispatch", async () => {
+		const f = fixture({ remote: true });
+		const decide = f.deps.readDecision;
+		f.deps.readDecision = async (scope, context) => {
+			const decision = await decide(scope, context);
+			f.setWorkspace(null);
+			return decision;
+		};
+		await expect(
+			f.service.previewFileReference("narrator", "visitor", { deviceId: f.id, path: "file.ts" }),
+		).rejects.toMatchObject({ code: "FILE_REFERENCE_UNAVAILABLE" });
+		expect(f.reads).toHaveLength(0);
+	});
 	test("preview and expectedHash use saved decoded text; snapshot hashes only selected text", async () => {
 		const f = fixture();
 		f.files.set("/work/file.ts", "one\r\n中文😀");

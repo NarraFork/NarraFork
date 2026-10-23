@@ -48,6 +48,14 @@ describe("missing working directory recovery", () => {
 			const result = await bashTool.execute({ command: "pwd" }, {
 				narratorId: "test-narrator",
 				cwd: windowsCwd,
+				workspaceContext: {
+					deviceId: "local",
+					cwd: windowsCwd,
+					pathFlavor: "windows",
+					revision: 0,
+					contextKey: "test-narrator:windows",
+					capabilities: { switchDirectory: true },
+				},
 				signal: new AbortController().signal,
 				locale: "en",
 				requestPermission: async () => ({ behavior: "allow" as const }),
@@ -66,6 +74,14 @@ describe("missing working directory recovery", () => {
 			const result = await bashTool.execute({ command: "pwd" }, {
 				narratorId: "test-narrator",
 				cwd: join(worktree, "missing"),
+				workspaceContext: {
+					deviceId: "local",
+					cwd: join(worktree, "missing"),
+					pathFlavor: "posix",
+					revision: 0,
+					contextKey: "test-narrator:missing-worktree",
+					capabilities: { switchDirectory: true },
+				},
 				worktreePath: worktree,
 				projectGitPath: join(worktree, "project-missing"),
 				signal: new AbortController().signal,

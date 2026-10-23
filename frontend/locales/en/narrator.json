@@ -1,4 +1,10 @@
 {
+	"partialRevert": {
+		"restored": "Known files reverted: {{count}}",
+		"conflicts": "Conflict files skipped (not overwritten): {{count}}",
+		"unknown": "Unknown ranges not covered: {{count}}. Unsnapshotted Bash/terminal activity and incomplete evidence are not fully recoverable; their records are retained.",
+		"truncated": "Only the first 100 entries in each category are shown."
+	},
 	"you": "You",
 	"asyncQuestionResolved": "Agent responded",
 	"asyncQuestionPending": "Answered · awaiting Agent response",
@@ -243,6 +249,10 @@
 	},
 	"fileReferences": {
 		"title": "File references",
+		"capturedSnapshot": "Captured snapshot (read-only)",
+		"attachmentUnavailable": "Unavailable: view this attachment on its original device.",
+		"originalAttachment": "Original attachment (read-only)",
+		"capturedUnavailable": "Original captured reference is unavailable; add a new explicit reference.",
 		"searching": "Searching files…",
 		"searchTimeout": "File search timed out. Try a more specific path.",
 		"queryTooLong": "The file query is too long. Narrow your search.",
@@ -337,6 +347,26 @@
 	"workspaceCreate": "Create worktree",
 	"workspaceList": "List worktrees",
 	"workspaceSwitch": "Switch directory",
+	"deviceWorkspace": {
+		"configure": "Configure directory",
+		"configureDevice": "Configure directory · {{device}}",
+		"configureAndSelect": "Configure and select",
+		"saveOnly": "Save directory only",
+		"unconfigured": "Not configured",
+		"notLoaded": "Directory not loaded yet",
+		"loadMore": "Load more device directories",
+		"not_committed": "This request was not committed. Refresh and confirm before trying a new action.",
+		"savedNotSelected": "Directory saved; the default device was not switched.",
+		"committed_pending": "The new selection was committed and is waiting for installation/recovery. Workspace operations remain paused.",
+		"bindingPending": "Directory configuration was committed and is waiting for installation/recovery.",
+		"unconfirmed": "The submission outcome is unconfirmed. Check the original request; do not resubmit.",
+		"superseded": "The original request was superseded by a newer change. Its old target will not be replayed.",
+		"recover": "Check / recover original request",
+		"refreshCurrent": "Refresh current selection",
+		"refreshBaseline": "Refresh baseline and prepare a new submission",
+		"baselineReady": "Baseline refreshed. Your directory text is unchanged; confirm it and submit again to create a new request.",
+		"baselineNotReady": "The current selection is not confirmed installed, or its baseline changed. No new request was prepared."
+	},
 	"workspaceDevice": "Switch device",
 	"workspaceCreated": "Created",
 	"workspaceFailed": "Failed",

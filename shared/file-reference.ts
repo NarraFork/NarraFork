@@ -23,6 +23,30 @@ export interface FileSelection {
 	endColumn: number;
 }
 
+export interface CapturedFileReferenceSelector {
+	messageId: string;
+	referenceId: string;
+}
+
+export interface FileReferenceSourceOrigin {
+	version: 1;
+	narratorId: string;
+	projectId: string | null;
+	deviceId: string;
+	canonicalPath: string;
+	/** A captured binding root, not a live filesystem capability. */
+	cwd?: string;
+}
+
+export interface CapturedFileReferencePreview {
+	source: "captured_snapshot";
+	readOnly: true;
+	reference: FileReference;
+	content: string;
+	hash: string;
+	capturedAt: string;
+}
+
 export interface FileTarget {
 	deviceId: string;
 	path: string;
@@ -52,6 +76,7 @@ export interface FileReferenceSnapshot {
 	snapshotText: string;
 	snapshotHash: string;
 	capturedAt: string;
+	sourceOrigin?: FileReferenceSourceOrigin;
 }
 
 /** The lightweight shape allowed in message lists and queue/WS summaries. */

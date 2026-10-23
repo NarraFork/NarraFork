@@ -271,6 +271,7 @@ export class RemoteWorkspaceHistoryRuntime {
 		signal: AbortSignal,
 		recorded?: FileChangeIdentity,
 		metadataOnly = false,
+		partialRevert = false,
 	) {
 		actor = Object.freeze({ ...actor });
 		target = Object.freeze({ ...target });
@@ -291,7 +292,7 @@ export class RemoteWorkspaceHistoryRuntime {
 				stored.workspaceInstanceId !== recorded.workspaceInstanceId ||
 				stored.deviceId !== recorded.deviceId ||
 				stored.canonicalRoot !== historyRoot ||
-				stored.status !== "active"
+				(stored.status !== "active" && !(partialRevert && stored.status === "needs_verification"))
 			)
 				throw new Error("Recorded remote source/scope unavailable");
 			scope = stored;
@@ -310,7 +311,9 @@ export class RemoteWorkspaceHistoryRuntime {
 					and(
 						eq(fileChangeScopes.deviceId, target.deviceId),
 						eq(fileChangeScopes.canonicalRoot, historyRoot),
-						eq(fileChangeScopes.status, "active"),
+						partialRevert
+							? sql`${fileChangeScopes.status} in ('active', 'needs_verification')`
+							: eq(fileChangeScopes.status, "active"),
 					),
 				)
 				.limit(2)
@@ -344,7 +347,8 @@ export class RemoteWorkspaceHistoryRuntime {
 				.get();
 			if (stored) {
 				if (
-					stored.status !== "active" ||
+					(stored.status !== "active" &&
+						!(partialRevert && stored.status === "needs_verification")) ||
 					(!metadataOnly && (stored.activeLeaseId || stored.activeMutationCount))
 				)
 					throw new Error("Remote scope requires reconciliation; no TTL/PID release");
@@ -567,7 +571,11 @@ export class RemoteWorkspaceHistoryRuntime {
 		actor = Object.freeze({ ...actor });
 		original = Object.freeze({ ...original });
 		const scope = this.evidence.getScope(original.scopeId);
-		if (!scope || scope.deviceId !== deviceId || scope.status !== "active")
+		if (
+			!scope ||
+			scope.deviceId !== deviceId ||
+			(scope.status !== "active" && scope.status !== "needs_verification")
+		)
 			throw new Error("Recorded snapshot source scope unavailable");
 		this.assertScope(scope, original);
 		const backend = this.options.backend(deviceId);
@@ -583,8 +591,8 @@ export class RemoteWorkspaceHistoryRuntime {
 			await this.options.authorize(actor, target, "read", currentSignal);
 			this.backend(target);
 			const current = this.evidence.getScope(scope.id);
-			if (!current || current.status !== "active")
-				throw new Error("Snapshot scope needs verification");
+			if (!current || (current.status !== "active" && current.status !== "needs_verification"))
+				throw new Error("Snapshot scope unavailable");
 			this.assertScope(current, original);
 			const opened = await backend.remoteHistory?.(
 				"open",
@@ -792,6 +800,7 @@ export class RemoteWorkspaceHistoryRuntime {
 		target: RemoteHistoryTarget,
 		signal: AbortSignal,
 		lease?: WorkspaceWriteLease,
+		partialRevert = false,
 	) {
 		actor = Object.freeze({ ...actor });
 		target = Object.freeze({ ...target });
@@ -802,6 +811,7 @@ export class RemoteWorkspaceHistoryRuntime {
 			signal,
 			undefined,
 			Boolean(lease),
+			partialRevert,
 		);
 		if (
 			lease &&
@@ -815,7 +825,8 @@ export class RemoteWorkspaceHistoryRuntime {
 			const current = this.evidence.getScope(scope.id);
 			if (
 				!current ||
-				current.status !== "active" ||
+				(current.status !== "active" &&
+					!(partialRevert && current.status === "needs_verification")) ||
 				current.fencingToken !== binding.fence ||
 				(!lease && (current.activeLeaseId || current.activeMutationCount))
 			)
@@ -839,10 +850,19 @@ export class RemoteWorkspaceHistoryRuntime {
 		need: "read" | "write",
 		signal: AbortSignal,
 		recorded?: FileChangeIdentity,
+		partialRevert = false,
 	): Promise<RemoteHistoryEndpoint> {
 		actor = Object.freeze({ ...actor });
 		target = Object.freeze({ ...target });
-		const { scope, binding, backend } = await this.openScope(actor, target, need, signal, recorded);
+		const { scope, binding, backend } = await this.openScope(
+			actor,
+			target,
+			need,
+			signal,
+			recorded,
+			false,
+			partialRevert,
+		);
 		const identity =
 			recorded ??
 			createFileChangeIdentity(scope, {
@@ -858,7 +878,8 @@ export class RemoteWorkspaceHistoryRuntime {
 			const current = this.evidence.getScope(scope.id);
 			if (
 				!current ||
-				current.status !== "active" ||
+				(current.status !== "active" &&
+					!(partialRevert && current.status === "needs_verification")) ||
 				current.revision !== scope.revision ||
 				current.activeLeaseId ||
 				current.activeMutationCount
@@ -868,7 +889,11 @@ export class RemoteWorkspaceHistoryRuntime {
 		};
 		const guarded = this.authorizedBackend(actor, target, need, () => {
 			const current = this.evidence.getScope(scope.id);
-			if (!current || current.status !== "active") throw new Error("Remote scope unavailable");
+			if (
+				!current ||
+				(current.status !== "active" && !(partialRevert && current.status === "needs_verification"))
+			)
+				throw new Error("Remote scope unavailable");
 			this.assertScope(current, binding);
 		});
 		const history = this.history(guarded, binding);

@@ -36,6 +36,32 @@ describe("file reference generation contexts", () => {
 		).toBeNull();
 	});
 
+	test("production narrator sources use their frozen pass workspace, never device.defaultCwd", () => {
+		const workspaceContext = {
+			deviceId: "Remote",
+			cwd: "C:\\narrator\\repo",
+			revision: 4,
+			contextKey: "n1-remote",
+			pathFlavor: "windows" as const,
+			capabilities: { switchDirectory: true },
+		};
+		const lookup = () => {
+			throw new Error("frozen source must not consult the live registry");
+		};
+		expect(
+			getAgentFileReferenceContext(
+				{ narratorId: "n1", cwd: "/host", defaultDeviceId: "Other", workspaceContext },
+				lookup,
+			),
+		).toEqual({ deviceId: "Remote", cwd: "C:\\narrator\\repo" });
+		expect(
+			getAgentFileReferenceContext(
+				{ narratorId: "n1", cwd: "/host", defaultDeviceId: "Remote" },
+				() => backend("Remote", "C:\\global"),
+			),
+		).toBeNull();
+	});
+
 	test("captures each lane only once and retains copies across device/cwd changes", () => {
 		const tracker = new FileReferenceContextTracker();
 		const current = { deviceId: "A", cwd: "/repo" };

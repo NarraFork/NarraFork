@@ -1,6 +1,7 @@
 /** Device-aware, compensating snapshot rollback helpers used before history deletion. */
 import { resolve as nodeResolve } from "node:path";
 import type { FileChangeEvidenceUncertaintyWarning } from "@shared/file-change-protocol";
+import type { PartialRevertResult } from "@shared/partial-revert";
 import { and, asc, eq, gte, inArray } from "drizzle-orm";
 import { db } from "../db";
 import {
@@ -22,6 +23,7 @@ import { getDevice, isDeviceAuthorizedForProject } from "./device-service";
 import {
 	type DeviceFileIdentity,
 	type DeviceFileState,
+	deviceFileKey,
 	FileHistoryError,
 	getAffectedDeviceFilesStrict,
 	ReplayDivergedError,
@@ -121,6 +123,7 @@ export interface RevertResult {
 	 * be refused, even if the UI could show a warning.
 	 */
 	warnings?: RevertWarning[];
+	coverage?: PartialRevertResult;
 }
 
 /**
@@ -479,6 +482,7 @@ async function undoRevert(result: RevertResult): Promise<RevertFailure[]> {
 export async function applyDeviceFileStates(
 	narratorId: string,
 	states: DeviceFileState[],
+	expectedStates?: Map<string, DeviceFileState>,
 ): Promise<RevertResult> {
 	if (states.length === 0) return EMPTY_RESULT;
 	const projectId = await resolveNarratorProjectId(narratorId);
@@ -496,8 +500,39 @@ export async function applyDeviceFileStates(
 	// writing so the invalidation cannot be skipped by an early failure exit.
 	const sessionWorktree = prepared.plan.length > 0 ? await resolveNarratorCwd(narratorId) : null;
 
+	const coverage: PartialRevertResult = { restoredFiles: [], conflicts: [], unknownCoverage: [] };
 	const attempted: RevertPlanItem[] = [];
 	for (const item of prepared.plan) {
+		if (expectedStates) {
+			const expected =
+				expectedStates.get(deviceFileKey(item.state)) ??
+				[...expectedStates.values()].find(
+					(state) =>
+						state.deviceId === item.state.deviceId &&
+						state.filePath === item.state.filePath &&
+						state.pathFlavor === item.state.pathFlavor,
+				);
+			const current = await captureFileState(item.backend, item.state.filePath);
+			const expectedBytes =
+				expected?.content == null
+					? null
+					: encodeFileBytesAs(expected.content, expected.encoding ?? "utf-8");
+			if (
+				!expected ||
+				current.exists !== (expectedBytes !== null) ||
+				(expectedBytes !== null &&
+					(!current.bytes || !Buffer.from(current.bytes).equals(Buffer.from(expectedBytes))))
+			) {
+				coverage.conflicts.push({
+					path: displayFile(item.state),
+					reason:
+						item.state.pathFlavor === "posix" && item.state.filePath.includes("\\")
+							? "path_semantics_uncertain"
+							: "current_state_mismatch",
+				});
+				continue;
+			}
+		}
 		attempted.push(item);
 		try {
 			await applyFileState(
@@ -526,11 +561,18 @@ export async function applyDeviceFileStates(
 	}
 	if (sessionWorktree) invalidateWorkspaceTreeCache(sessionWorktree);
 
-	const files = prepared.plan.map((item) => displayFile(item.state));
-	const result = { reverted: files.length > 0, fileCount: files.length, files, failures: [] };
-	if (prepared.plan.length > 0) {
+	const files = attempted.map((item) => displayFile(item.state));
+	coverage.restoredFiles = files;
+	const result = {
+		reverted: files.length > 0,
+		fileCount: files.length,
+		files,
+		failures: [],
+		coverage,
+	};
+	if (attempted.length > 0) {
 		evictStaleCompensationPlans();
-		compensationPlans.set(result, { plan: prepared.plan, createdAt: Date.now() });
+		compensationPlans.set(result, { plan: attempted, createdAt: Date.now() });
 	}
 	return result;
 }
@@ -542,12 +584,31 @@ async function applyRebuiltStates(
 ): Promise<RevertResult> {
 	if (identities.length === 0) return EMPTY_RESULT;
 	try {
-		const states = await rebuildDeviceFileStatesExcluding(
-			narratorId,
-			identities,
-			excludeToolUseIds,
-		);
-		return applyDeviceFileStates(narratorId, [...states.values()]);
+		const states = new Map<string, DeviceFileState>();
+		const expected = new Map<string, DeviceFileState>();
+		const conflicts: PartialRevertResult["conflicts"] = [];
+		for (const identity of identities) {
+			try {
+				const before = await rebuildDeviceFileStatesExcluding(
+					narratorId,
+					[identity],
+					excludeToolUseIds,
+				);
+				const after = await rebuildDeviceFileStatesExcluding(narratorId, [identity], new Set());
+				for (const [key, state] of before) states.set(key, state);
+				for (const [key, state] of after) expected.set(key, state);
+			} catch (error) {
+				if (!(error instanceof ReplayDivergedError)) throw error;
+				conflicts.push({ path: displayFile(identity), reason: error.message });
+			}
+		}
+		const result =
+			states.size > 0
+				? await applyDeviceFileStates(narratorId, [...states.values()], expected)
+				: { ...EMPTY_RESULT };
+		result.coverage ??= { restoredFiles: result.files, conflicts: [], unknownCoverage: [] };
+		result.coverage.conflicts.push(...conflicts);
+		return result;
 	} catch (error) {
 		const code = error instanceof FileHistoryError ? error.code : "PREPARE_FAILED";
 		// A diverged replay knows exactly which file could not be rebuilt; prefer it

@@ -684,31 +684,59 @@ test.skipIf(process.platform !== "linux")(
 					.set({ permissionMode: "readOnly" })
 					.where(eq(schema.narrators.id, narratorId))
 					.run();
+				// Replace the fixture's synthetic key with production root evidence, then install S4.
+				const { prepareWorkspaceContext } = await import("./workspace-context-service");
+				const preparedWorkspace = await prepareWorkspaceContext(
+					{ deviceId, cwd: root },
+					workspace.revision,
+					undefined,
+					{ userId, narratorId },
+				);
+				db.update(schema.narrators)
+					.set({ workspaceContext: preparedWorkspace })
+					.where(eq(schema.narrators.id, narratorId))
+					.run();
+				const { narratorDeviceWorkspaceService } = await import(
+					"./narrator-device-workspace-service"
+				);
+				const editorWorkspace = await narratorDeviceWorkspaceService.resolve(narratorId, deviceId, {
+					userId,
+				});
+				if (!editorWorkspace) throw new Error("Native editor workspace binding is unavailable");
+				Object.assign(workspace, editorWorkspace);
 				const remote = createProductionRemoteEditorAdapter();
 				configureRemoteEditorAdapter(remote, resolveProductionRemoteEditorRoot);
 				const actor: EditorActor = {
 					userId,
 					narratorId,
-					authorize: (input, need) =>
-						authorizeRemoteEditorBinding(actor, workspace, input, need, {
-							signal: deadline,
-							authorizationGuard: async (required) => {
-								await loadNarratorForAccess(narratorId, principal, required);
-								const current = db
-									.select({
-										workspaceContext: schema.narrators.workspaceContext,
-										revision: schema.narrators.workspaceRevision,
-									})
-									.from(schema.narrators)
-									.where(eq(schema.narrators.id, narratorId))
-									.get();
-								if (
-									current?.revision !== workspace.revision ||
-									current.workspaceContext?.contextKey !== workspace.contextKey
-								)
-									throw new Error("Frozen editor workspace changed");
+					authorize: (input, need, original) =>
+						authorizeRemoteEditorBinding(
+							actor,
+							original?.workspaceContext ?? workspace,
+							input,
+							need,
+							{
+								signal: deadline,
+								original,
+								originalProjectId: original?.projectId ?? null,
+								authorizationGuard: async (required) => {
+									await loadNarratorForAccess(narratorId, principal, required);
+									const current = db
+										.select({
+											workspaceContext: schema.narrators.workspaceContext,
+											revision: schema.narrators.workspaceRevision,
+										})
+										.from(schema.narrators)
+										.where(eq(schema.narrators.id, narratorId))
+										.get();
+									if (
+										current?.revision !== workspace.revision ||
+										current.workspaceContext?.contextKey !== workspace.contextKey
+									)
+										throw new Error("Frozen editor workspace changed");
+								},
 							},
-						}),
+						),
 				};
 				editor = new EditorDocumentService({
 					root: join(directory, "editor-private"),
@@ -718,6 +746,7 @@ test.skipIf(process.platform !== "linux")(
 					},
 				});
 				const doc = await editor.create(actor, { path: "editor.txt", deviceId, origin: "legacy" });
+				expect(doc.readOnlyReason).toBeUndefined();
 				expect(doc.editable).toBe(true);
 				expect(
 					await new Response(await editor.content(actor, doc.docId, doc.versionHandle)).text(),

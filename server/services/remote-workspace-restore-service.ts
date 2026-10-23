@@ -100,6 +100,7 @@ export interface RemoteWorkspaceRestoreResult {
 	reason?: string;
 	restoredFileCount: number;
 	nativeOperationId?: string;
+	coverage?: import("@shared/partial-revert").PartialRevertResult;
 }
 export interface RemoteWorkspaceRestoreOptions {
 	registry: RemoteWorkspaceHistoryRuntime;
@@ -130,7 +131,7 @@ export class RemoteWorkspaceRestoreService {
 		const scope = this.options.registry.evidence.getScope(origin.binding.scopeId);
 		if (
 			!scope ||
-			scope.status !== "active" ||
+			(scope.status !== "active" && scope.status !== "needs_verification") ||
 			scope.deviceId !== origin.deviceId ||
 			scope.sourceInstanceId !== origin.binding.sourceInstanceId ||
 			scope.workspaceInstanceId !== origin.binding.workspaceInstanceId ||
@@ -238,7 +239,7 @@ export class RemoteWorkspaceRestoreService {
 		lease?.assertCurrent();
 		// Even metadata open goes through the realtime registry gate. No direct
 		// backend RPC may bypass connection generation/actor/root authorization.
-		const history = (await registry.resolveWorkspace(actor, target, signal, lease)).history;
+		const history = (await registry.resolveWorkspace(actor, target, signal, lease, true)).history;
 		assertRemoteHistoryBinding(
 			{ ...origin.binding, fence: history.binding.fence },
 			history.binding,
@@ -308,6 +309,7 @@ export class RemoteWorkspaceRestoreService {
 			const backend = this.options.registry.options.backend(origin.deviceId);
 			const generation = backend.runtimeGeneration;
 			await this.authority.policy(actor, origin, signal);
+			this.options.registry.coordinator.assertRevertActivityBarrier(scope);
 			await this.readTree(
 				parser,
 				actor,
@@ -364,6 +366,7 @@ export class RemoteWorkspaceRestoreService {
 					"read",
 					signal,
 					identity,
+					true,
 				);
 				for (const state of [change.expected, change.desired])
 					if (state.kind === "regular")
@@ -471,6 +474,11 @@ export class RemoteWorkspaceRestoreService {
 			});
 			return {
 				plan,
+				coverage: {
+					restoredFiles: [] as string[],
+					conflicts: [],
+					unknownCoverage: this.options.registry.coordinator.revertUnknownCoverage(scope),
+				},
 				origin: {
 					captureId: origin.captureId,
 					deviceId: origin.deviceId,
@@ -649,7 +657,7 @@ export class RemoteWorkspaceRestoreService {
 			if (!runtime || runtime.runtimeGeneration !== fixed.manifest.runtimeGeneration)
 				throw new Error("Workspace restore execution generation changed since preview");
 			const actor = this.actor(input.principal, input.narratorId, fixed.origin);
-			return await registry.coordinator.withRollback(
+			const result = await registry.coordinator.withRollback<RemoteWorkspaceRestoreResult>(
 				{
 					scope,
 					runtime,
@@ -962,6 +970,17 @@ export class RemoteWorkspaceRestoreService {
 					}
 				},
 			);
+			return {
+				...result,
+				coverage: {
+					restoredFiles:
+						result.status === "committed"
+							? fixed.files.map((file) => file.identityJson.displayPath)
+							: [],
+					conflicts: [],
+					unknownCoverage: registry.coordinator.revertUnknownCoverage(scope),
+				},
+			};
 		} finally {
 			ownedParser?.close();
 			this.active--;
@@ -1016,6 +1035,7 @@ export class RemoteWorkspaceRestoreService {
 					"read",
 					signal,
 					fixed.manifest.files[index].identity,
+					true,
 				);
 				await registry.importState(
 					fixed.namespace,
@@ -1305,6 +1325,7 @@ export class RemoteWorkspaceRestoreService {
 					"read",
 					signal,
 					file.identityJson,
+					true,
 				);
 				const current = await endpoint.runtime.observe(file.identityJson, signal);
 				const nativeAfter = receipt.effects.find(

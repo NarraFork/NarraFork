@@ -26,6 +26,7 @@ import type {
 	WorkspaceSnapshotSummary,
 } from "../../../lib/api/workspace-snapshot-restores";
 import { formatLocaleDateTime } from "../../../lib/intl-format";
+import { formatPartialRevert } from "../../../lib/revert-warnings";
 import { snapshotIsCandidate } from "./snapshot-restore-flow";
 
 export function WorkspaceSnapshotRestoreModal({
@@ -204,6 +205,11 @@ function ScopedWorkspaceSnapshotRestoreModal({
 				)}
 				{state.preview && (
 					<>
+						{(state.preview.coverage ?? state.preview.plan.coverage) && (
+							<Text size="sm" style={{ whiteSpace: "pre-wrap" }}>
+								{formatPartialRevert(t, state.preview.coverage ?? state.preview.plan.coverage)}
+							</Text>
+						)}
 						<Text size="sm">
 							{t("snapshotRestore.diffSummary", { count: state.preview.totalFileCount })}
 						</Text>
@@ -264,6 +270,11 @@ function ScopedWorkspaceSnapshotRestoreModal({
 						{t(`snapshotRestore.result.${state.result.status}`, {
 							count: state.result.restoredFileCount,
 						})}
+						{state.result.coverage && (
+							<Text size="sm" style={{ whiteSpace: "pre-wrap" }}>
+								{formatPartialRevert(t, state.result.coverage)}
+							</Text>
+						)}
 					</Alert>
 				)}
 				<Group justify="flex-end">

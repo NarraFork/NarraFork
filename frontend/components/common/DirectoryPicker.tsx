@@ -66,6 +66,8 @@ const MAX_DIRECTORY_ENTRIES = 1_000;
 const FS_SHORTCUTS_QUERY_GC_TIME_MS = 60_000;
 
 interface DirectoryPickerProps {
+	/** Session directory configuration uses actual narrator/device authority, even for local. */
+	narratorId?: string;
 	/** Remote navigation is device-qualified, without host favorites or suggestions. */
 	deviceId?: string;
 	deviceLabel?: string;
@@ -87,6 +89,7 @@ interface DirectoryPickerProps {
 }
 
 export function DirectoryPicker({
+	narratorId,
 	deviceId = "local",
 	deviceLabel,
 	mode = "existing",
@@ -106,14 +109,19 @@ export function DirectoryPicker({
 	const { t } = useTranslation("common");
 	const fsCapability = useFileSystemCapability();
 	const isRemote = deviceId !== "local";
-	const browseSupported = isRemote || fsCapability.browse.supported;
+	const targetQualified = !!narratorId || isRemote;
+	const browseSupported = targetQualified || fsCapability.browse.supported;
 	const browseUnavailableReason = fsCapability.browse.reason ?? t("fileSystemBrowseUnavailable");
 	const [opened, { open, close }] = useDisclosure(false);
 	const [browsePath, setBrowsePath] = useState<string | undefined>(undefined);
+	const [browseScope, setBrowseScope] = useState<string>();
+	const scope = `${narratorId ?? "device"}:${deviceId}`;
+	const browsing = opened && browseScope === scope;
 	const isWide = useMediaQuery("(min-width: 62em)") ?? false;
 
 	const handleOpen = () => {
 		if (!browseSupported) return;
+		setBrowseScope(scope);
 		if (mode === "newTarget" && value) {
 			const parent = value.replace(/[/\\][^/\\]+$/, "");
 			setBrowsePath(
@@ -155,7 +163,7 @@ export function DirectoryPicker({
 
 	return (
 		<>
-			{isRemote ? (
+			{targetQualified ? (
 				<TextInput
 					label={label}
 					placeholder={placeholder}
@@ -186,36 +194,50 @@ export function DirectoryPicker({
 				/>
 			)}
 			<Modal
-				opened={opened}
+				opened={browsing}
 				onClose={close}
 				title={t("selectDirectory")}
 				size={isWide ? 880 : "md"}
 				styles={DIRECTORY_BROWSER_MODAL_STYLES}
 			>
-				{isRemote ? (
-					<TargetDirectoryBrowser
-						key={deviceId}
-						mode={mode}
-						deviceLabel={deviceLabel ?? deviceId}
-						initialPath={browsePath}
-						queryKey={["deviceDirectory", deviceId]}
-						listDirectory={(path) =>
-							api.browseDevicePath(deviceId, path, { showHidden: mode === "newTarget" })
-						}
-						checkNewTarget={async (path) => !(await api.statDevicePath(deviceId, path)).exists}
-						onSelect={handleSelect}
-						onCancel={close}
-					/>
-				) : (
-					<DirectoryBrowser
-						mode={mode}
-						newTargetError={newTargetError}
-						initialPath={browsePath}
-						onSelect={handleSelect}
-						onCancel={close}
-						isWide={isWide}
-					/>
-				)}
+				{browsing &&
+					(targetQualified ? (
+						<TargetDirectoryBrowser
+							key={`${narratorId ?? "device"}:${deviceId}`}
+							mode={mode}
+							deviceLabel={deviceLabel ?? deviceId}
+							initialPath={browsePath}
+							queryKey={
+								narratorId
+									? ["narratorDeviceDirectory", narratorId, deviceId]
+									: ["deviceDirectory", deviceId]
+							}
+							listDirectory={(path, signal) =>
+								narratorId
+									? api.browseNarratorDevice(narratorId, deviceId, path, {
+											showHidden: mode === "newTarget",
+											signal,
+										})
+									: api.browseDevicePath(deviceId, path, { showHidden: mode === "newTarget" })
+							}
+							checkNewTarget={
+								narratorId
+									? undefined
+									: async (path) => !(await api.statDevicePath(deviceId, path)).exists
+							}
+							onSelect={handleSelect}
+							onCancel={close}
+						/>
+					) : (
+						<DirectoryBrowser
+							mode={mode}
+							newTargetError={newTargetError}
+							initialPath={browsePath}
+							onSelect={handleSelect}
+							onCancel={close}
+							isWide={isWide}
+						/>
+					))}
 			</Modal>
 		</>
 	);

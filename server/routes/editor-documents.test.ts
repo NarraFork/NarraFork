@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
@@ -15,6 +15,7 @@ import { generateId } from "../lib/id";
 import { commitEditorUploadSchema } from "../lib/validators/editor-documents";
 import { EditorDocumentService } from "../services/editor-document-service";
 import { LocalFileChangeRuntime } from "../services/file-change-runtime";
+import { narratorDeviceWorkspaceService } from "../services/narrator-device-workspace-service";
 import { createEditorDocumentRoutes, readEditorMetadata } from "./editor-documents";
 
 let root: string, path: string, narratorId: string, userId: string, tokenUser: string;
@@ -184,7 +185,7 @@ describe("editor HTTP identity, small metadata and policies", () => {
 		expect(response.status).toBe(200);
 		expect(((await response.json()) as EditorDocumentDescriptor).target.path).toBe(path);
 	});
-	test("inherited worktree changes invalidate an opened document before commit", async () => {
+	test("inherited worktree pointer changes preserve the opened document original source", async () => {
 		const { chapterId } = bindChapter();
 		const doc = await openDoc();
 		const { url } = await seal(doc);
@@ -193,9 +194,41 @@ describe("editor HTTP identity, small metadata and policies", () => {
 			.where(eq(chapters.id, chapterId))
 			.run();
 		const response = await request(`${url}/commit`, "POST", {});
-		expect(response.status).toBe(403);
-		expect(await response.json()).toMatchObject({ code: "EDITOR_IDENTITY_CHANGED" });
-		expect(await readFile(path, "utf8")).toBe("original\r\n");
+		expect(response.status).toBe(200);
+		expect(await response.json()).toMatchObject({ status: "saved" });
+		expect(await readFile(path, "utf8")).toBe("new\r\n");
+	});
+	test("same-device rebinding preserves existing document but a new document uses the new pair", async () => {
+		const doc = await openDoc();
+		const { url } = await seal(doc);
+		const next = join(root, "other-binding");
+		await mkdir(next);
+		await writeFile(join(next, "test.txt"), "other device directory\n");
+		const binding = await narratorDeviceWorkspaceService.get(narratorId, "local", { userId });
+		if (!binding) throw new Error("Expected fixture binding");
+		await narratorDeviceWorkspaceService.set(
+			narratorId,
+			{
+				requestId: generateId(),
+				deviceId: "local",
+				cwd: next,
+				expectedBindingRevision: binding.bindingRevision,
+				expectedSelectionRevision: binding.context.revision,
+			},
+			{ origin: "http", userId },
+		);
+		const opened = await request(base(), "POST", {
+			path: "test.txt",
+			deviceId: "local",
+			origin: "reference",
+		});
+		expect(opened.status).toBe(200);
+		expect(((await opened.json()) as EditorDocumentDescriptor).target.path).toBe(
+			join(next, "test.txt"),
+		);
+		expect((await request(`${url}/commit`, "POST", {})).status).toBe(200);
+		expect(await readFile(path, "utf8")).toBe("new\r\n");
+		expect(await readFile(join(next, "test.txt"), "utf8")).toBe("other device directory\n");
 	});
 	test("actual routes expose immutable content, read-only upload status and stable operation ID", async () => {
 		const doc = await openDoc();
@@ -233,7 +266,7 @@ describe("editor HTTP identity, small metadata and policies", () => {
 		);
 		expect(response.status).toBe(410);
 	});
-	test("ACL revocation and cwd changes are rechecked for existing sessions", async () => {
+	test("ACL revocation and original physical target changes are rechecked for existing sessions", async () => {
 		const doc = await openDoc();
 		const { url } = await seal(doc);
 		tokenUser = "different-user";
@@ -243,8 +276,12 @@ describe("editor HTTP identity, small metadata and policies", () => {
 			.set({ cwd: testEnvironment.isolatedHome })
 			.where(eq(narrators.id, narratorId))
 			.run();
+		const originalTarget = join(root, "original-target.txt");
+		await writeFile(originalTarget, "original\r\n");
+		await rm(path);
+		await symlink(originalTarget, path);
 		expect((await request(`${url}/commit`, "POST", {})).status).toBe(403);
-		expect(await readFile(path, "utf8")).toBe("original\r\n");
+		expect(await readFile(originalTarget, "utf8")).toBe("original\r\n");
 	});
 	test("read visibility never grants write and remote never falls back to local", async () => {
 		const doc = await openDoc();
@@ -263,7 +300,7 @@ describe("editor HTTP identity, small metadata and policies", () => {
 		).toBe(404);
 		expect(
 			(await request(base(), "POST", { path, origin: "legacy", deviceId: "remote-test" })).status,
-		).toBe(422);
+		).toBe(403);
 	});
 	test("secret, git-internal, symlink and post-open symlink swaps are hard refusals", async () => {
 		const original = path;

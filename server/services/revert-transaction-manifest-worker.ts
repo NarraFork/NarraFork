@@ -12,6 +12,7 @@ import {
 	type KnownFileChangeState,
 	FILE_CHANGE_LIMITS as LIMIT,
 } from "@shared/file-change-protocol";
+import type { PartialRevertResult } from "@shared/partial-revert";
 import { fileChangeIdentityKey } from "./file-change-identity";
 import type { RevertJournalFile, RevertJournalOperation } from "./revert-mutation-journal";
 import {
@@ -37,6 +38,7 @@ export interface ValidatedTransactionManifest {
 	files: TransactionManifestFile[];
 	rawRefs: FileChangeBlobRef[];
 	evidenceBytes: number;
+	coverage?: PartialRevertResult;
 }
 export type TransactionManifestRequest =
 	| {
@@ -146,15 +148,19 @@ function validate(
 	check(input.raw[0].ref.digest === operation.planBlobDigest, "PLAN_REF");
 	check(input.raw[1].ref.digest === operation.selectorBlobDigest, "SELECTOR_REF");
 	check(input.raw[2].ref.digest === operation.historyManifestBlobDigest, "HISTORY_REF");
-	keys(manifest, [
-		"version",
-		"protocolVersion",
-		"header",
-		"proof",
-		"selectionMetadataDigest",
-		"messageVersions",
-		"files",
-	]);
+	keys(
+		manifest,
+		[
+			"version",
+			"protocolVersion",
+			"header",
+			"proof",
+			"selectionMetadataDigest",
+			"messageVersions",
+			"files",
+		],
+		["coverage"],
+	);
 	check(
 		manifest.version === 1 && manifest.protocolVersion === FILE_CHANGE_EVIDENCE_VERSION,
 		"VERSION",
@@ -220,11 +226,11 @@ function validate(
 	]);
 	check(
 		proof.source === "trusted_published_planner_v1" &&
-			proof.computation === "complete" &&
+			(proof.computation === "complete" || proof.computation === "partial") &&
 			proof.selectorCoverage === "complete" &&
-			proof.historyCoverage === "complete" &&
-			proof.omittedFiles === 0 &&
-			proof.unknownFiles === 0,
+			(proof.historyCoverage === "complete" || proof.historyCoverage === "partial") &&
+			proof.omittedFiles >= 0 &&
+			proof.unknownFiles >= 0,
 		"INCOMPLETE_PROOF",
 	);
 	check(proof.headerDigest === revertPlanHeaderDigest(header), "HEADER_DIGEST");
@@ -535,6 +541,33 @@ function validate(
 			};
 		},
 	);
+	const coverage = manifest.coverage as PartialRevertResult | undefined;
+	if (coverage) {
+		keys(coverage, ["restoredFiles", "conflicts", "unknownCoverage"]);
+		array(coverage.restoredFiles, 0);
+		array(coverage.conflicts, LIMIT.revertFiles);
+		array(coverage.unknownCoverage, LIMIT.historyToolRelatedChanges);
+		if (coverage.conflicts.length || coverage.unknownCoverage.length)
+			check(proof.computation === "partial", "COVERAGE_CONFLICT");
+		check(
+			coverage.conflicts.length === proof.omittedFiles &&
+				coverage.unknownCoverage.length === proof.unknownFiles,
+			"COVERAGE_CONFLICT",
+		);
+		for (const conflict of coverage.conflicts) {
+			keys(conflict, ["path", "reason", "effectIds"]);
+			check(
+				typeof conflict.path === "string" && typeof conflict.reason === "string",
+				"COVERAGE_CONFLICT",
+			);
+			array(conflict.effectIds, LIMIT.historyToolRelatedChanges);
+			for (const id of conflict.effectIds) {
+				check(typeof id === "string" && effects.has(id) && !usedEffects.has(id), "OMITTED_EFFECT");
+				usedEffects.add(id);
+			}
+		}
+	}
+	if (!coverage) check(proof.omittedFiles === 0 && proof.unknownFiles === 0, "COVERAGE_CONFLICT");
 	check(usedEffects.size === effects.size, "OMITTED_EFFECT");
 	const fingerprint = fingerprintRevertPlanFiles(
 		files.map(({ sequence, identity, expected, desired }) => ({
@@ -552,7 +585,7 @@ function validate(
 	// Expected/desired are already charged above. Matching apply/compensation observations
 	// reuse those typed states; only later independent third-state evidence grows the budget.
 	integer(evidenceBytes, LIMIT.operationEvidenceBytes);
-	return { header, proof, selection, files, rawRefs: [...refs.values()], evidenceBytes };
+	return { header, proof, selection, files, rawRefs: [...refs.values()], evidenceBytes, coverage };
 }
 
 function validateRecoveryPolicy(

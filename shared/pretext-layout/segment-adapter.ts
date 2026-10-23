@@ -1339,6 +1339,13 @@ function userAttachmentData(block: AdapterContentBlock, msg: AdapterMessage) {
 		// row height (measure keeps TEXT_FILE_HEIGHT), so adding it cannot shift
 		// any predicted geometry.
 		filePath: readNonEmptyString(block, "filePath") ?? null,
+		deviceId: readNonEmptyString(block, "deviceId") ?? null,
+		contextKey: readNonEmptyString(block, "contextKey") ?? null,
+		attachmentId: readNonEmptyString(block, "attachmentId") ?? null,
+		sourceNarratorId: readNonEmptyString(block, "sourceNarratorId") ?? null,
+		attachmentOrigin: block.attachmentOrigin ?? null,
+		attachmentWorkspace: block.attachmentWorkspace ?? null,
+		attachmentUnavailableReason: readNonEmptyString(block, "attachmentUnavailableReason") ?? null,
 		// HEIGHT-NEUTRAL: an authenticated endpoint serving the bytes (chat
 		// attachments) — resolved by VListImage's fetchUrl lane, never measured.
 		fetchUrl: readNonEmptyString(block, "fetchUrl") ?? null,

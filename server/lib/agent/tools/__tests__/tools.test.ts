@@ -43,10 +43,18 @@ const SAMPLE_FILE = join(TEST_DIR, "sample.txt");
 const NESTED_DIR = join(TEST_DIR, "sub", "dir");
 const NESTED_FILE = join(NESTED_DIR, "nested.ts");
 
-function makeCtx(cwd = TEST_DIR): ToolContext {
+function makeCtx(cwd = TEST_DIR, deviceId = "local"): ToolContext {
 	return {
 		narratorId: TEST_NARRATOR_ID,
 		cwd,
+		workspaceContext: {
+			deviceId,
+			cwd,
+			pathFlavor: "posix",
+			revision: 0,
+			contextKey: `${TEST_NARRATOR_ID}:${deviceId}:${cwd}`,
+			capabilities: { switchDirectory: true },
+		},
 		signal: new AbortController().signal,
 		locale: "en",
 		requestPermission: async () => ({ behavior: "allow" as const }),
@@ -255,7 +263,7 @@ describe("Write", () => {
 
 	test("does not overwrite a file when the backend read is truncated", async () => {
 		let writes = 0;
-		const ctx = makeCtx();
+		const ctx = makeCtx(TEST_DIR, "remote-truncated");
 		ctx.resolveBackend = () => makeTruncatedBackend(() => writes++);
 
 		const result = await writeTool.execute(
@@ -348,7 +356,7 @@ describe("Edit", () => {
 
 	test("does not replace content when the backend read is truncated", async () => {
 		let writes = 0;
-		const ctx = makeCtx();
+		const ctx = makeCtx(TEST_DIR, "remote-truncated");
 		ctx.resolveBackend = () => makeTruncatedBackend(() => writes++);
 
 		const result = await editTool.execute(
@@ -363,7 +371,7 @@ describe("Edit", () => {
 
 	test("does not use empty-search overwrite mode on a truncated existing file", async () => {
 		let writes = 0;
-		const ctx = makeCtx();
+		const ctx = makeCtx(TEST_DIR, "remote-truncated");
 		ctx.resolveBackend = () => makeTruncatedBackend(() => writes++);
 
 		const result = await editTool.execute(

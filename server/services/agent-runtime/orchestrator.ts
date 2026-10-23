@@ -626,17 +626,33 @@ export async function runAgentLoopUnlocked(
 			// The run entry froze execution authority. Neither a later parent-user change
 			// nor the author of an async answer may replace it; null stays anonymous.
 			const actingUserId = active._currentUserId ?? null;
+			const actingSignal = active.abortController.signal;
+			const turnWorkspaceContext = active._workspaceContext
+				? Object.freeze(structuredClone(active._workspaceContext))
+				: undefined;
 			active._workspaceFileAccess = undefined;
-			if (active._workspaceContext?.cwd && active._workspaceContext.availability === "ready") {
+			if (turnWorkspaceContext?.cwd && turnWorkspaceContext.availability === "ready") {
 				const { createNarratorWorkspaceFileAccess } = await import("../workspace-file-access");
+				const automaticWorkspace = turnWorkspaceContext;
+				const automaticSignal = actingSignal;
 				active._workspaceFileAccess = createNarratorWorkspaceFileAccess(
 					narratorId,
-					active._workspaceContext,
+					automaticWorkspace,
 					{
 						userId: actingUserId,
-						signal: active.abortController.signal,
+						signal: automaticSignal,
 						authorizationGuard: async () => {
+							automaticSignal.throwIfAborted();
 							await assertOAuthNarratorRuntimeActive(narratorId, actingUserId);
+							if (automaticWorkspace.binding) {
+								const { narratorDeviceWorkspaceService } = await import(
+									"../narrator-device-workspace-service"
+								);
+								await narratorDeviceWorkspaceService.assertCurrent(narratorId, automaticWorkspace, {
+									userId: actingUserId,
+								});
+							}
+							automaticSignal.throwIfAborted();
 						},
 					},
 				);
@@ -1415,8 +1431,16 @@ export async function runAgentLoopUnlocked(
 			const availableDevices = turnSessionDevices;
 
 			let toolCallLimitExceeded = false;
-			const passWorkspaceContext = active._workspaceContext;
+			const passWorkspaceContext = turnWorkspaceContext;
+			const passUserId = actingUserId;
+			const passSignal = actingSignal;
+			const { createDeviceWorkspaceConfig } = await import("../workspace-artifact-access");
+			const deviceWorkspaceConfig = await createDeviceWorkspaceConfig(narratorId, {
+				userId: passUserId,
+				signal: passSignal,
+			});
 			const config: import("../../lib/agent").AgentConfig = {
+				...deviceWorkspaceConfig,
 				// Freeze this logical run's segment across every retry/compact pass.
 				executionSegmentId: profile.kind === "subagent" ? profile.executionSegmentId : undefined,
 				runtimePolicy,
@@ -1451,7 +1475,7 @@ export async function runAgentLoopUnlocked(
 								return workspaceContextService.switch(narratorId, request, {
 									origin: "agent",
 									active,
-									userId: active._currentUserId,
+									userId: passUserId,
 								});
 							}
 						: undefined,
@@ -1467,7 +1491,7 @@ export async function runAgentLoopUnlocked(
 						signal,
 					),
 				locale,
-				signal: active.abortController.signal,
+				signal: passSignal,
 				guidanceSignal: active._guidanceAbortController.signal,
 				urgentGuidanceSignal: active._urgentGuidanceAbortController.signal,
 				chapterId: active._chapterId,
@@ -1515,7 +1539,7 @@ export async function runAgentLoopUnlocked(
 				projectGitPath: active._projectGitPath ?? undefined,
 				worktreePath: active._worktreePath ?? undefined,
 				skillScopeKey: active._skillScopeKey ?? undefined,
-				userId: active._currentUserId ?? null,
+				userId: passUserId,
 				projectId: oauthRuntime?.projectId ?? active._projectId ?? null,
 				// A pass owns its device identity; selection changes only affect the next pass.
 				defaultDeviceId: active._defaultDeviceId ?? null,
@@ -1572,13 +1596,13 @@ export async function runAgentLoopUnlocked(
 				onToolExecutionFinalAuthorization: buildFinalToolStartAuthorization({
 					narratorId,
 					cwd: active.cwd,
-					signal: active.abortController.signal,
-					userId: active._currentUserId,
+					signal: passSignal,
+					userId: passUserId,
 					reviewReadOnlyBash: profile.kind === "subagent" && profile.subagentType === "review",
 				}),
 				runtimeAuthorizationGuard: oauthRuntime
 					? async () => {
-							await assertOAuthNarratorRuntimeActive(narratorId, active._currentUserId);
+							await assertOAuthNarratorRuntimeActive(narratorId, passUserId);
 						}
 					: undefined,
 				deferEagerToolsForSafeStop: profile.kind === "subagent",
@@ -1620,11 +1644,11 @@ export async function runAgentLoopUnlocked(
 				permissionHandler: (toolName, input, toolUseId, options) =>
 					handlePermission(
 						narratorId,
-						options?.signal ?? active.abortController.signal,
+						options?.signal ? AbortSignal.any([options.signal, passSignal]) : passSignal,
 						toolName,
 						input,
 						toolUseId,
-						active.cwd,
+						options?.executionTarget?.cwd ?? config.cwd,
 						locale,
 						saParentNarratorId,
 						options,
@@ -3006,7 +3030,8 @@ export async function runAgentLoopUnlocked(
 					if (buffered.textFiles?.length) {
 						const attachmentAccess = await prepareNarratorTextAttachmentAccess(narratorId, {
 							userId: buffered.createdBy,
-							workspaceContext: active._workspaceContext,
+							workspaceContext: buffered.attachmentWorkspace ?? undefined,
+							requireWorkspaceSource: true,
 							signal: active.abortController.signal,
 							authorizationGuard: async () => {
 								if (!owner.isCurrent()) throw new Error("Buffered attachment owner changed");

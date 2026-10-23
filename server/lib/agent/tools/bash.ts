@@ -232,6 +232,7 @@ async function prepareBashExecution(
 			userId: ctx.userId,
 			projectId: ctx.projectId,
 			actorKind: ctx.parentNarratorId ? "subagent" : "primary",
+			workspaceContext: ctx.workspaceContext,
 			target: remoteIdentity.target,
 			binding: remoteIdentity.binding,
 			kind: "bash",
@@ -239,6 +240,12 @@ async function prepareBashExecution(
 		});
 		remoteFinish = finishRemoteActivity;
 	}
+	let remoteRunning:
+		| typeof import("@server/services/remote-tree-snapshot-hooks")["markRemoteActivityRunning"]
+		| undefined;
+	if (remoteIdentity)
+		remoteRunning = (await import("@server/services/remote-tree-snapshot-hooks"))
+			.markRemoteActivityRunning;
 	let started = false;
 	let ended = false;
 	let bashWindow: { end(): void } | undefined;
@@ -296,6 +303,15 @@ async function prepareBashExecution(
 				// spawn/process errors always come with a handle and its real barrier.
 				end(backend.kind === "remote" && dispatchRequested ? "unknown" : "finished");
 				throw error;
+			}
+			if (remoteRunning && remoteIdentity?.target) {
+				try {
+					remoteRunning({ target: remoteIdentity.target, binding: remoteIdentity.binding });
+				} catch (error) {
+					logger.warn("Remote Bash running ledger update failed; prepared barrier retained", {
+						error: String(error),
+					});
+				}
 			}
 			void (handle.whenSettled ?? handle.exited).then(
 				(code) =>

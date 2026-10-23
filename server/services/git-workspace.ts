@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
 import { realpath, stat } from "node:fs/promises";
 import type { GitWorkspace, GitWorkspaceState } from "@shared/git-workspace";
+import { nativePathEquals } from "@shared/target-native-path";
 import type { WorkspaceContext } from "@shared/workspace-context";
 import { eq } from "drizzle-orm";
 import { db } from "../db";
@@ -8,12 +9,9 @@ import { chapters, narrators, projects } from "../db/schema";
 import type { ExecutionBackend } from "../lib/agent/execution/backend";
 import { localBackend, resolveBackend } from "../lib/agent/execution/registry";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
-import { getHome } from "../lib/platform";
 import { normalizePathForComparison } from "../lib/platform-path";
 import { safeSpawn } from "../lib/spawn";
 import { gitDiscoveryCache } from "./git-discovery-cache";
-import { resolveNarratorSessionCwd } from "./narrator-cwd";
-import { activeNarrators } from "./narrator-session-state";
 import { createRemoteGitService, supportsRemoteGitWorkspace } from "./remote-git-service";
 
 /** Legacy path consumers retain their local path key; management uses device/root keys. */
@@ -116,6 +114,8 @@ export interface GitWorkspaceTarget {
 	configuredCwd?: string;
 	/** Request-bound authorization refresh, never serialized to clients. */
 	beforeWrite?: () => Promise<void>;
+	/** Non-serialized, request-bound final fence after HTTP/WS ACL scans. */
+	assertStillCurrent?: () => void;
 	/** Frozen authoritative session binding; never the device's default directory. */
 	workspaceContext?: WorkspaceContext;
 }
@@ -127,7 +127,9 @@ export async function resolveNarratorGitTarget(
 	beforeProbe?: (target: GitWorkspaceTarget) => Promise<void>,
 	/** Display discovery only; authoritative reads/writes keep the uncached probe. */
 	cachedDiscovery = false,
+	options: { userId?: string | null } = {},
 ): Promise<GitWorkspaceTarget> {
+	options = { userId: options.userId };
 	const narrator = await db.query.narrators.findFirst({
 		where: eq(narrators.id, narratorId),
 		columns: {
@@ -156,18 +158,14 @@ export async function resolveNarratorGitTarget(
 			})
 		: undefined;
 	if (projectId && !project) throw new NotFoundError("Project", projectId);
-	const active = activeNarrators.get(narratorId);
 	let committedContext =
 		narrator.workspaceContext?.revision === narrator.workspaceRevision
 			? narrator.workspaceContext
 			: null;
-	const localCwd =
-		committedContext?.cwd ??
-		active?.cwd ??
-		resolveNarratorSessionCwd(narrator.cwd, chapter?.worktreePath, project?.gitPath, getHome());
-	const deviceId =
-		committedContext?.deviceId ??
-		(active ? (active._defaultDeviceId ?? "local") : (narrator.defaultDeviceId ?? "local"));
+	// Only the durable selected endpoint may provide a Git cwd. Runtime mirrors,
+	// project paths and the host home are not configuration for a missing pair.
+	const localCwd = committedContext?.cwd ?? "";
+	const deviceId = committedContext?.deviceId ?? narrator.defaultDeviceId ?? "local";
 	const workspace: GitWorkspace = {
 		narratorId,
 		projectId,
@@ -187,17 +185,52 @@ export async function resolveNarratorGitTarget(
 	} catch {
 		return { workspace, contextProjectId: projectId, configuredCwd: localCwd };
 	}
-	// Legacy initialization belongs to the context service and runs only AFTER the access gate.
-	// Dynamic import avoids its Git discovery import cycle. It captures defaultCwd once, not
-	// on each Git request; an offline or uninitialized binding never falls back to host Git.
-	if (!committedContext && backend.kind === "remote") {
-		const { workspaceContextService } = await import("./workspace-context-service");
-		committedContext = await workspaceContextService.get(narratorId);
-		if (committedContext.deviceId !== deviceId)
-			throw new AppError("Workspace changed during Git admission", 409, "GIT_WORKSPACE_CHANGED");
-	}
-	workspace.cwd = committedContext?.cwd ?? (backend.kind === "local" ? localCwd : "");
+	if (
+		!committedContext?.cwd &&
+		(deviceId !== "local" || (!narrator.cwd && !chapter?.worktreePath && !project?.gitPath))
+	)
+		throw new AppError(
+			"Selected Git workspace is not configured",
+			409,
+			"WORKSPACE_BINDING_REQUIRED",
+		);
+	const { workspaceContextService, assertWorkspaceSelectionInstalled } = await import(
+		"./workspace-context-service"
+	);
+	assertWorkspaceSelectionInstalled(narratorId);
+	const { narratorDeviceWorkspaceService } = await import("./narrator-device-workspace-service");
+	committedContext = await workspaceContextService.get(narratorId, options);
+	if (committedContext.deviceId !== deviceId || !committedContext.binding)
+		throw new AppError(
+			"Selected Git workspace binding is unavailable",
+			409,
+			"WORKSPACE_BINDING_REQUIRED",
+		);
+	narratorDeviceWorkspaceService.assertCurrentSync(narratorId, committedContext, options);
+	const endpointProof = await narratorDeviceWorkspaceService.assertEndpointDeviceCurrent(
+		narratorId,
+		deviceId,
+		{
+			...options,
+			contextProjectId: committedContext.contextProjectId,
+		},
+	);
+	workspace.cwd = committedContext.cwd;
+	const assertStillCurrent = () => {
+		signal?.throwIfAborted();
+		assertWorkspaceSelectionInstalled(narratorId);
+		endpointProof.assertStillCurrent();
+		narratorDeviceWorkspaceService.assertCurrentSync(narratorId, committedContext, options);
+		const live = resolveBackend({ requested: deviceId });
+		if (
+			live.kind !== backend.kind ||
+			live.runtimeGeneration !== backend.runtimeGeneration ||
+			live.paths.flavor !== backend.paths.flavor
+		)
+			throw new AppError("Git backend changed", 409, "GIT_WORKSPACE_CHANGED");
+	};
 	const target: GitWorkspaceTarget = {
+		assertStillCurrent,
 		workspace,
 		backend,
 		contextProjectId: projectId,
@@ -213,8 +246,38 @@ export async function resolveNarratorGitTarget(
 		workspace.reason = "Execution device has no absolute working directory";
 		return target;
 	}
-	// The cwd itself must pass execution policy before Git reads any metadata from it.
+	// The cwd itself must pass execution policy before reading endpoint metadata.
 	await beforeProbe?.(target);
+	assertWorkspaceSelectionInstalled(narratorId);
+	endpointProof.assertStillCurrent();
+	narratorDeviceWorkspaceService.assertCurrentSync(narratorId, committedContext, options);
+	if (
+		backend.paths.flavor === "windows" &&
+		backend.kind === "remote" &&
+		!committedContext.nativeRootDescriptor
+	)
+		throw new AppError(
+			"Git workspace lacks original native root evidence",
+			409,
+			"WORKSPACE_BINDING_REQUIRED",
+		);
+	const identity = await backend.resolvePathIdentity(workspace.cwd, {
+		signal,
+		timeoutMs: GIT_PROBE_TIMEOUT_MS,
+		expectedNativeDescriptor: committedContext.nativeRootDescriptor,
+	});
+	if (
+		!identity.exists ||
+		!backend.paths.equals(identity.canonicalPath, workspace.cwd) ||
+		identity.runtimeGeneration !== backend.runtimeGeneration ||
+		(committedContext.nativeRootDescriptor &&
+			(!identity.nativeDescriptor ||
+				!nativePathEquals(committedContext.nativeRootDescriptor, identity.nativeDescriptor)))
+	)
+		throw new AppError("Git workspace endpoint identity changed", 409, "GIT_WORKSPACE_CHANGED");
+	assertWorkspaceSelectionInstalled(narratorId);
+	endpointProof.assertStillCurrent();
+	narratorDeviceWorkspaceService.assertCurrentSync(narratorId, committedContext, options);
 	if (backend.kind === "remote" && !supportsRemoteGitWorkspace(backend)) {
 		workspace.state = "unsupported";
 		workspace.reason = "Upgrade the remote executor to support Git workspace management";
@@ -223,6 +286,16 @@ export async function resolveNarratorGitTarget(
 	let probe: GitProbe;
 	try {
 		const discover = async (probeSignal?: AbortSignal): Promise<GitProbe> => {
+			assertWorkspaceSelectionInstalled(narratorId);
+			endpointProof.assertStillCurrent();
+			narratorDeviceWorkspaceService.assertCurrentSync(narratorId, committedContext, options);
+			const live = resolveBackend({ requested: deviceId });
+			if (
+				live.kind !== backend.kind ||
+				live.runtimeGeneration !== backend.runtimeGeneration ||
+				live.paths.flavor !== backend.paths.flavor
+			)
+				throw new AppError("Git backend changed", 409, "GIT_WORKSPACE_CHANGED");
 			const result =
 				backend.kind === "local"
 					? await probeLocalGitWorkspace(workspace.cwd, probeSignal)
@@ -276,6 +349,9 @@ export async function resolveNarratorGitTarget(
 		workspace.reason = "Execution device could not resolve the Git working tree";
 		return target;
 	}
+	assertWorkspaceSelectionInstalled(narratorId);
+	endpointProof.assertStillCurrent();
+	narratorDeviceWorkspaceService.assertCurrentSync(narratorId, committedContext, options);
 	workspace.state = probe.state ?? "unsupported";
 	workspace.reason = probe.reason;
 	if (cachedDiscovery) workspace.branch = probe.branch ?? null;

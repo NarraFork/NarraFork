@@ -1,4 +1,6 @@
 import {
+	type CapturedFileReferencePreview,
+	type CapturedFileReferenceSelector,
 	FILE_REFERENCE_READ_TIMEOUT_MS,
 	FILE_REFERENCE_SEARCH_TIMEOUT_MS,
 	type FileReferencePreview,
@@ -10,6 +12,7 @@ import {
 	MAX_FILE_REFERENCE_QUERY_CHARS,
 	MAX_FILE_REFERENCE_SEARCH_BYTES,
 	MAX_FILE_REFERENCE_SOURCE_BYTES,
+	MAX_FILE_REFERENCE_TEXT_BYTES,
 } from "@shared/file-reference";
 import {
 	FILE_REFERENCE_IMAGE_MIME_TYPES,
@@ -94,6 +97,37 @@ async function boundedRequest<T>(
 
 /** Metadata-only search/resolve. Only the file viewer requests preview; no client creates snapshots. */
 export const fileReferenceApi = {
+	async snapshot(
+		narratorId: string,
+		selector: CapturedFileReferenceSelector,
+		signal?: AbortSignal,
+	): Promise<CapturedFileReferencePreview> {
+		if (
+			![selector.messageId, selector.referenceId].every(
+				(value) => typeof value === "string" && value.length > 0 && value.length <= 128,
+			)
+		)
+			throw new Error("Captured reference selector is unavailable");
+		const query = new URLSearchParams({
+			messageId: selector.messageId,
+			referenceId: selector.referenceId,
+		});
+		const result = await boundedRequest<CapturedFileReferencePreview>(
+			`${basePath(narratorId)}/snapshot?${query}`,
+			MAX_FILE_REFERENCE_TEXT_BYTES * 6 + MAX_FILE_REFERENCE_METADATA_BYTES,
+			FILE_REFERENCE_READ_TIMEOUT_MS,
+			{ signal },
+		);
+		if (
+			result.source !== "captured_snapshot" ||
+			result.readOnly !== true ||
+			typeof result.content !== "string" ||
+			new TextEncoder().encode(result.content).byteLength > MAX_FILE_REFERENCE_TEXT_BYTES ||
+			result.reference?.id !== selector.referenceId
+		)
+			throw new Error("Captured reference snapshot is unavailable");
+		return result;
+	},
 	search(
 		narratorId: string,
 		options: { q: string; deviceId?: string; directory?: string },

@@ -33,6 +33,7 @@ import {
 import { useClipboard } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import {
+	type CapturedFileReferenceSelector,
 	FILE_REFERENCE_READ_TIMEOUT_MS,
 	type FileReferenceEditorSelection,
 	type FileSelection,
@@ -45,6 +46,10 @@ import { useTranslation } from "react-i18next";
 import { useFileSystemCapability } from "../../../hooks/usePlatform";
 import { ApiError, api, authorizedFetch, readFetchError } from "../../../lib/api";
 import { fileReferenceApi } from "../../../lib/api/file-references";
+import {
+	type AttachmentPreviewSelector,
+	narratorAttachmentApi,
+} from "../../../lib/api/narrator-attachments";
 import { saveBlobAsFile } from "../../../lib/file-download";
 import { formatLocaleNumber } from "../../../lib/intl-format";
 import { getShikiLang } from "../../../lib/shiki-lang";
@@ -165,6 +170,10 @@ export interface FileViewerContentProps {
 	deviceId?: string;
 	/** References use scoped text/image readers, never the legacy binary/download reader. */
 	referenceOrigin?: boolean;
+	/** Immutable message occurrence; never interpreted as a live file target. */
+	capturedSnapshot?: CapturedFileReferenceSelector;
+	/** Server-owned original attachment occurrence, read-only and without live-path fallback. */
+	attachmentPreview?: AttachmentPreviewSelector;
 	selection?: FileSelection;
 	highlightRequestId?: string;
 	onOpenFileTarget?: (target: FileTarget) => void;
@@ -204,6 +213,8 @@ export function FileViewerContent({
 	narratorId: narratorIdProp,
 	deviceId = "local",
 	referenceOrigin = false,
+	capturedSnapshot,
+	attachmentPreview,
 	selection,
 	highlightRequestId,
 	onOpenFileTarget,
@@ -212,9 +223,16 @@ export function FileViewerContent({
 	const { t } = useTranslation("narrator");
 	const parentScope = useFileReferenceScope();
 	const narratorId = narratorIdProp ?? parentScope.narratorId;
-	const readerMode = fileViewerReadMode(narratorId, deviceId, referenceOrigin);
+	const readerMode = fileViewerReadMode(
+		narratorId,
+		deviceId,
+		referenceOrigin || !!capturedSnapshot || !!attachmentPreview,
+	);
 	const scopedNarratorId = readerMode === "scoped" ? narratorId : undefined;
-	const publishSelection = onFileReferenceSelectionChange ?? parentScope.setSelection;
+	const publishSelection =
+		capturedSnapshot || attachmentPreview
+			? undefined
+			: (onFileReferenceSelectionChange ?? parentScope.setSelection);
 	const [sourceSelection, setSourceSelection] = useState<FileSelection | null>(null);
 	// The fetch effect needs `t` only for its fallback error string. Held in a ref so
 	// switching the UI language does not re-run the effect and re-download the file.
@@ -231,9 +249,12 @@ export function FileViewerContent({
 	const [load, setLoad] = useState<LoadState>(INITIAL_LOAD);
 
 	const previewType = getFilePreviewType(filePath);
-	const isText = fileViewerUsesText(previewType, selection, referenceOrigin, deviceId);
+	const isText =
+		!!capturedSnapshot ||
+		!!attachmentPreview ||
+		fileViewerUsesText(previewType, selection, referenceOrigin, deviceId);
 	const previewSupported = readerMode !== "legacy" || previewCapability.supported;
-	const sourceOnly = !!selection;
+	const sourceOnly = !!selection || !!capturedSnapshot || !!attachmentPreview;
 	const lang = useMemo(() => getShikiLang(filePath), [filePath]);
 	const fileName = fileBaseName(filePath);
 	const structuredFormat = useMemo(() => detectStructuredFormat(filePath), [filePath]);
@@ -257,6 +278,38 @@ export function FileViewerContent({
 		setSourceSelection(null);
 		const timeout = setTimeout(() => controller.abort(), FILE_REFERENCE_READ_TIMEOUT_MS);
 		const read = async (): Promise<LoadState> => {
+			if (attachmentPreview) {
+				if (!scopedNarratorId)
+					throw new Error(tRef.current("fileReferences.attachmentUnavailable"));
+				const preview = await narratorAttachmentApi.preview(
+					scopedNarratorId,
+					attachmentPreview,
+					controller.signal,
+				);
+				return { text: preview.content, truncated: false, error: null, loading: false };
+			}
+			if (capturedSnapshot) {
+				if (!scopedNarratorId)
+					throw new Error(
+						tRef.current("fileReferences.capturedUnavailable", {
+							defaultValue:
+								"Original captured reference is unavailable; add a new explicit reference.",
+						}),
+					);
+				const snapshot = await fileReferenceApi.snapshot(
+					scopedNarratorId,
+					capturedSnapshot,
+					controller.signal,
+				);
+				if (snapshot.reference.deviceId !== deviceId || snapshot.reference.path !== filePath)
+					throw new Error(
+						tRef.current("fileReferences.capturedUnavailable", {
+							defaultValue:
+								"Original captured reference is unavailable; add a new explicit reference.",
+						}),
+					);
+				return { text: snapshot.content, truncated: false, error: null, loading: false };
+			}
 			if (referenceOrigin && previewType !== "text")
 				throw new Error(
 					tRef.current("fileReferences.binaryNotSupported", {
@@ -326,6 +379,10 @@ export function FileViewerContent({
 		previewSupported,
 		previewType,
 		referenceOrigin,
+		capturedSnapshot?.messageId,
+		capturedSnapshot?.referenceId,
+		attachmentPreview?.messageId,
+		attachmentPreview?.attachmentId,
 		reloadToken,
 	]);
 
@@ -343,7 +400,7 @@ export function FileViewerContent({
 	 */
 	const download = useCallback(async () => {
 		// Scoped/remote references must not bypass their reader via local fsDownload.
-		if (referenceOrigin || deviceId !== "local") return;
+		if (capturedSnapshot || attachmentPreview || referenceOrigin || deviceId !== "local") return;
 		setDownloading(true);
 		try {
 			const { blob, fileName: served } = await api.fsDownload(filePath);
@@ -357,7 +414,7 @@ export function FileViewerContent({
 		} finally {
 			setDownloading(false);
 		}
-	}, [deviceId, referenceOrigin, filePath]);
+	}, [capturedSnapshot, attachmentPreview, deviceId, referenceOrigin, filePath]);
 
 	// Parse for node mode. A truncated read is NOT attempted at all: its tail is
 	// cut mid-token, so any parser would either fail or (worse) succeed on a
@@ -382,12 +439,27 @@ export function FileViewerContent({
 	const viewerScope = useMemo(
 		() => ({
 			narratorId,
-			context: fileReferenceDirectory(sourcePath)
-				? { deviceId: sourceDeviceId, cwd: fileReferenceDirectory(sourcePath) }
-				: null,
-			openFile: onOpenFileTarget ?? parentScope.openFile,
+			context:
+				!capturedSnapshot && !attachmentPreview && fileReferenceDirectory(sourcePath)
+					? { deviceId: sourceDeviceId, cwd: fileReferenceDirectory(sourcePath) }
+					: null,
+			openFile:
+				capturedSnapshot || attachmentPreview
+					? undefined
+					: (onOpenFileTarget ?? parentScope.openFile),
+			...(capturedSnapshot || attachmentPreview
+				? { addReference: undefined, setSelection: undefined, selection: null }
+				: {}),
 		}),
-		[narratorId, sourcePath, sourceDeviceId, onOpenFileTarget, parentScope.openFile],
+		[
+			capturedSnapshot,
+			attachmentPreview,
+			narratorId,
+			sourcePath,
+			sourceDeviceId,
+			onOpenFileTarget,
+			parentScope.openFile,
+		],
 	);
 	useEffect(() => {
 		publishSelection?.(
@@ -456,7 +528,7 @@ export function FileViewerContent({
 				</Tooltip>
 				{/* Offered even when the panel cannot render the file (binary, or a read
 				    that failed): saving the bytes does not depend on previewing them. */}
-				{!referenceOrigin && deviceId === "local" && (
+				{!capturedSnapshot && !attachmentPreview && !referenceOrigin && deviceId === "local" && (
 					<Tooltip label={t("fileViewer.download")} withinPortal>
 						<ActionIcon
 							size="sm"

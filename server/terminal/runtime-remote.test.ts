@@ -55,6 +55,80 @@ async function tick() {
 }
 
 describe("spawnRemotePty", () => {
+	for (const operation of ["write", "resize"] as const) {
+		test(`linked ${operation} requires a final proof, not an accepted legacy callback`, async () => {
+			const harness = createRpcHarness();
+			const runtime = spawnRemotePty("device-proof", spawnOptions(), {
+				sendRpc: harness.sendRpc,
+				requireInputAuthorityProof: true,
+				beforeInput: async () => undefined,
+			});
+			harness.calls[0].options?.onStream?.("pty_ready", new Uint8Array());
+			await runtime.ready;
+			if (operation === "write") runtime.write("forbidden");
+			else runtime.resize(100, 30);
+			await tick();
+			expect(harness.calls.some((call) => call.method === `pty.${operation}`)).toBe(false);
+			harness.resolveOpen(provenExit(0));
+			await runtime.exited;
+		});
+		test(`linked ${operation} rechecks proof after authorization await, before RPC`, async () => {
+			const harness = createRpcHarness();
+			let revoked = false;
+			const proof = {
+				assertStillCurrent() {
+					if (revoked) throw new Error("actor revoked at final dispatch");
+				},
+			};
+			const authority = () =>
+				new Promise<typeof proof>((resolve) => {
+					queueMicrotask(() => {
+						revoked = true;
+					});
+					resolve(proof);
+				});
+			const runtime = spawnRemotePty("device-proof", spawnOptions(), {
+				sendRpc: harness.sendRpc,
+				requireInputAuthorityProof: true,
+			});
+			harness.calls[0].options?.onStream?.("pty_ready", new Uint8Array());
+			await runtime.ready;
+			if (operation === "write") runtime.writeAuthorized("forbidden", authority);
+			else runtime.resizeAuthorized(100, 30, authority);
+			await tick();
+			expect(revoked).toBe(true);
+			expect(harness.calls.some((call) => call.method === `pty.${operation}`)).toBe(false);
+			harness.resolveOpen(provenExit(0));
+			await runtime.exited;
+		});
+	}
+	test("linked queued input and resize carry their own final proofs", async () => {
+		const harness = createRpcHarness();
+		let checks = 0;
+		const authority = async () => ({
+			assertStillCurrent() {
+				checks++;
+			},
+		});
+		const runtime = spawnRemotePty("device-proof", spawnOptions(), {
+			sendRpc: harness.sendRpc,
+			requireInputAuthorityProof: true,
+		});
+		runtime.writeAuthorized("allowed", authority);
+		runtime.resizeAuthorized(100, 30, authority);
+		expect(checks).toBe(0);
+		harness.calls[0].options?.onStream?.("pty_ready", new Uint8Array());
+		await runtime.ready;
+		await tick();
+		expect(checks).toBe(2);
+		expect(harness.calls.map((call) => call.method)).toEqual([
+			"pty.open",
+			"pty.write",
+			"pty.resize",
+		]);
+		harness.resolveOpen(provenExit(0));
+		await runtime.exited;
+	});
 	test("queues input/latest resize until real ready and decodes split UTF-8 without CRLF rewriting", async () => {
 		const harness = createRpcHarness();
 		const output: string[] = [];

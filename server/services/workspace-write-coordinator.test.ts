@@ -236,20 +236,22 @@ describe("scope admission and execution fencing", () => {
 		expect(queries.some((query) => /select.*root_identity_json/i.test(query))).toBe(false);
 	});
 
-	test("unknown, retired and unverified scopes cannot grant or consume a fence", async () => {
+	test("unknown and retired scopes reject; unverified scopes permit partial rollback", async () => {
 		const unknown = { ...scope, id: "never-registered" };
 		await expect(coordinator.withWrite(request(unknown), () => undefined)).rejects.toThrow(
 			errorCode("scope_not_found"),
 		);
 		expectCode(() => coordinator.capture(unknown), "scope_not_found");
 		expectCode(() => coordinator.registerActivity(request(unknown)), "scope_not_found");
-		for (const status of ["retired", "needs_verification"] as const) {
-			update({ status });
-			await expect(coordinator.withRollback(request(), () => undefined)).rejects.toThrow(
-				errorCode(status === "retired" ? "scope_inactive" : "needs_verification"),
-			);
-		}
+		update({ status: "retired" });
+		await expect(coordinator.withRollback(request(), () => undefined)).rejects.toThrow(
+			errorCode("scope_inactive"),
+		);
 		expect(row()?.fencingToken).toBe(0);
+		update({ status: "needs_verification" });
+		await coordinator.withRollback(request(), () => undefined);
+		expect(row()?.status).toBe("needs_verification");
+		expect(row()?.fencingToken).toBe(1);
 	});
 
 	test("requires explicit target grammar and fully qualified roots", async () => {
@@ -896,20 +898,16 @@ describe("explicit rollback activity observation", () => {
 		expect(row()?.fencingToken).toBe(0);
 	});
 
-	test("observe never bypasses uncertain activity retained after failed persistence", async () => {
+	test("partial rollback preserves uncertain activity retained after failed persistence", async () => {
 		const activity = coordinator.registerActivity(request());
 		sqlite.exec(`CREATE TRIGGER reject_observed_unknown BEFORE UPDATE OF status ON file_change_scopes
 			WHEN NEW.status = 'needs_verification' BEGIN SELECT RAISE(ABORT, 'observed-unknown'); END;`);
 		expect(() => coordinator.endActivity(activity, "unknown")).toThrow("observed-unknown");
-		await expect(
-			coordinator.withRollback(request(scope, { activityPolicy: "observe" }), () => undefined),
-		).rejects.toThrow(errorCode("needs_verification"));
+		await coordinator.withRollback(request(scope, { activityPolicy: "observe" }), () => undefined);
 		sqlite.exec("DROP TRIGGER reject_observed_unknown;");
 		coordinator.endActivity(activity);
 		expect(row()?.status).toBe("needs_verification");
-		await expect(
-			coordinator.withRollback(request(scope, { activityPolicy: "observe" }), () => undefined),
-		).rejects.toThrow(errorCode("needs_verification"));
+		await coordinator.withRollback(request(scope, { activityPolicy: "observe" }), () => undefined);
 	});
 
 	test("unknown intersecting activity taints observe and retains the durable quarantine", async () => {
@@ -2474,10 +2472,9 @@ describe("recovery barrier directionality", () => {
 			() => undefined,
 		);
 		expect(row(parent)?.status).toBe("active");
-		// Rollback rewrites whole subtrees and stays bidirectional.
-		await expect(coordinator.withRollback(request(parent), () => undefined)).rejects.toThrow(
-			errorCode("needs_verification"),
-		);
+		// Partial rollback may restore independently guarded known files.
+		await coordinator.withRollback(request(parent), () => undefined);
+		expect(row(child)?.status).toBe("needs_verification");
 		// Writes inside (or equal to) the quarantined root stay blocked.
 		const { grandchild } = { grandchild: addScope({ canonicalRoot: "/workspace/repo/sub" }) };
 		await expect(coordinator.withWrite(request(grandchild), () => undefined)).rejects.toThrow(
@@ -2520,12 +2517,11 @@ describe("recovery barrier directionality", () => {
 		);
 	});
 
-	test("quarantine error names the blocking scope root", async () => {
+	test("partial rollback preserves the overlapping unverified scope", async () => {
 		const { parent, child } = addTree();
 		update({ status: "needs_verification" }, child);
-		await expect(coordinator.withRollback(request(parent), () => undefined)).rejects.toThrow(
-			/\/workspace\/repo.*Settings → Storage/s,
-		);
+		await coordinator.withRollback(request(parent), () => undefined);
+		expect(row(child)?.status).toBe("needs_verification");
 	});
 });
 

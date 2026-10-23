@@ -6,7 +6,6 @@ import { and, eq, isNull } from "drizzle-orm";
 import { db } from "../db";
 import { chapters, narrators, terminals, users } from "../db/schema";
 import type { ExecutionBackend } from "../lib/agent/execution/backend";
-import { localToolBaseCwd } from "../lib/agent/execution/path-resolve";
 import { resolveBackend } from "../lib/agent/execution/registry";
 import { detectShell } from "../lib/agent/shell";
 import { resetCursorForTerminal } from "../lib/agent/tools/terminal";
@@ -49,6 +48,7 @@ import type { NarratorPrincipal } from "./narrator-acl";
 import { loadNarratorForAccess } from "./narrator-acl";
 import {
 	finishRemoteActivity,
+	markRemoteActivityRunning,
 	registerRemoteActivity,
 	registerRemoteTerminalActivity,
 } from "./remote-tree-snapshot-hooks";
@@ -107,9 +107,10 @@ async function terminalRuntimeAuthority(
 	narratorId: string,
 	backend: ExecutionBackend,
 	need: "read" | "write",
+	userId: string,
 ) {
 	const { resolveOAuthNarratorRuntimePolicy } = await import("./oauth-narrator-runtime-policy");
-	const oauth = await resolveOAuthNarratorRuntimePolicy(narratorId);
+	const oauth = await resolveOAuthNarratorRuntimePolicy(narratorId, userId);
 	if (!oauth) return { oauth, deviceClass: null };
 	const { integrationResourceBindingService } = await import(
 		"./integration-resource-binding-service"
@@ -386,6 +387,10 @@ export interface CreateTerminalOptions {
 	worktreeResourceId?: string;
 	expectedRevision?: number;
 	contextKey?: string;
+	/** Pair binding pin, independent of the selected workspace revision. */
+	expectedBindingRevision?: number;
+	bindingId?: string;
+	signal?: AbortSignal;
 	principal?: NarratorPrincipal;
 }
 
@@ -415,25 +420,116 @@ export const terminalService = {
 				403,
 				"TERMINAL_ACTOR_REQUIRED",
 			);
-		const admittedOpts = { ...opts, principal: await terminalCreationAuthority(opts, null) };
-		const { workspaceContextService } = await import("./workspace-context-service");
-		const context = await workspaceContextService.get(opts.narratorId);
-		if (opts.contextKey !== undefined && opts.contextKey !== context.contextKey)
+		const narratorId = opts.narratorId;
+		const signal = opts.signal
+			? AbortSignal.any([opts.signal, AbortSignal.timeout(10_000)])
+			: AbortSignal.timeout(10_000);
+		const principal = await terminalCreationAuthority(opts, null);
+		const actor = { userId: principal.userId };
+		const { workspaceContextService, assertWorkspaceSelectionInstalled } = await import(
+			"./workspace-context-service"
+		);
+		assertWorkspaceSelectionInstalled(narratorId);
+		const { createDeviceWorkspaceConfig } = await import("./workspace-artifact-access");
+		const explicit = opts.deviceId !== undefined;
+		// Resolve the pair before asking the legacy projection service to initialize:
+		// an unconfigured local narrator must not create a home-based workspace.
+		const stored = explicit
+			? undefined
+			: await db.query.narrators.findFirst({
+					where: eq(narrators.id, narratorId),
+					columns: { workspaceContext: true, defaultDeviceId: true },
+				});
+		const deviceId =
+			opts.deviceId ?? stored?.workspaceContext?.deviceId ?? stored?.defaultDeviceId ?? "local";
+		const config = await createDeviceWorkspaceConfig(narratorId, { ...actor, signal });
+		const resolved = await config.resolveDeviceWorkspace?.(deviceId);
+		if (!resolved?.cwd)
+			throw new AppError(
+				"Terminal device workspace is not configured",
+				409,
+				"WORKSPACE_BINDING_REQUIRED",
+			);
+		const frozen = structuredClone(resolved);
+		// Legacy selection pins still name the selected projection, never another device's cwd.
+		const selected =
+			!explicit || opts.expectedRevision !== undefined || opts.contextKey !== undefined
+				? await workspaceContextService.get(narratorId, actor)
+				: undefined;
+		if (
+			selected &&
+			((!explicit && selected.deviceId !== deviceId) ||
+				(opts.contextKey !== undefined && opts.contextKey !== selected.contextKey) ||
+				(opts.expectedRevision !== undefined && opts.expectedRevision !== selected.revision))
+		)
 			throw new AppError(
 				"Workspace changed before terminal creation",
 				409,
 				"WORKSPACE_CONTEXT_STALE",
 			);
-		return workspaceContextService.withRevision(
-			opts.narratorId,
-			opts.expectedRevision ?? context.revision,
-			undefined,
-			(frozen) => this.createAdmitted(admittedOpts, frozen),
-		);
+		if (
+			(opts.expectedBindingRevision !== undefined &&
+				opts.expectedBindingRevision !== frozen.binding?.bindingRevision) ||
+			(opts.bindingId !== undefined && opts.bindingId !== frozen.binding?.bindingId)
+		)
+			throw new AppError("Terminal workspace binding changed", 409, "WORKSPACE_CONTEXT_STALE");
+		const backend = resolveBackend({ requested: deviceId });
+		const proof = await config.assertEndpointAuthorized?.({
+			deviceId,
+			backendKind: backend.kind,
+			cwd: frozen.cwd,
+			baseCwd: frozen.cwd,
+			pathFlavor: backend.paths.flavor,
+			runtimeGeneration: backend.runtimeGeneration,
+			selectionSource: explicit ? "explicit" : "session_default",
+			workspaceContext: frozen,
+		});
+		if (!proof || !config.assertDeviceWorkspaceCurrent || !config.assertDeviceWorkspaceCurrentSync)
+			throw new AppError(
+				"Terminal endpoint authority is unavailable",
+				403,
+				"TERMINAL_AUTHORITY_DENIED",
+			);
+		const guard = {
+			async assertCurrent() {
+				signal.throwIfAborted();
+				await config.assertDeviceWorkspaceCurrent?.(frozen);
+			},
+			assertStillCurrent() {
+				signal.throwIfAborted();
+				assertWorkspaceSelectionInstalled(narratorId);
+				config.assertDeviceWorkspaceCurrentSync?.(frozen);
+				proof.assertStillCurrent();
+				const live = resolveBackend({ requested: deviceId });
+				if (
+					live.kind !== backend.kind ||
+					live.runtimeGeneration !== backend.runtimeGeneration ||
+					live.paths.flavor !== backend.paths.flavor
+				)
+					throw new AppError("Terminal backend changed", 409, "WORKSPACE_CONTEXT_STALE");
+			},
+		};
+		guard.assertStillCurrent();
+		const admitted = { ...opts, principal, signal, deviceId };
+		// Only default/legacy-pinned calls are serialized with selection. Explicit inactive
+		// pair bindings do not mutate or borrow the current selection.
+		return selected
+			? workspaceContextService.withRevision(
+					narratorId,
+					selected.revision,
+					undefined,
+					() => this.createAdmitted(admitted, frozen, guard),
+					actor,
+				)
+			: this.createAdmitted(admitted, frozen, guard);
 	},
 
 	/** Internal admission body; existing terminals always use their persisted device/cwd. */
-	async createAdmitted(opts: CreateTerminalOptions, frozenWorkspace?: WorkspaceContext) {
+	async createAdmitted(
+		opts: CreateTerminalOptions,
+		frozenWorkspace?: WorkspaceContext,
+		guard?: { assertCurrent(): Promise<void>; assertStillCurrent(): void },
+	) {
 		assertLegacyRuntimeOwner(opts);
 		const cols = opts.cols ?? 80;
 		const rows = opts.rows ?? 24;
@@ -461,55 +557,48 @@ export const terminalService = {
 			projectId = chapter.projectId;
 			cwd = chapter.worktreePath;
 		} else if (narratorId) {
-			const narrator = await db.query.narrators.findFirst({
+			if (!frozenWorkspace || !guard)
+				throw new AppError(
+					"Terminal device workspace is not configured",
+					409,
+					"WORKSPACE_BINDING_REQUIRED",
+				);
+			cwd = frozenWorkspace.cwd;
+			const source = await db.query.narrators.findFirst({
 				where: eq(narrators.id, narratorId),
+				columns: { chapterId: true, contextProjectId: true },
 			});
-			if (!narrator) throw new NotFoundError("Narrator", narratorId);
-			if (!hasExplicitDevice && narrator.defaultDeviceId && narrator.defaultDeviceId !== "local") {
-				deviceId = narrator.defaultDeviceId;
-			}
-			if (narrator.chapterId) {
-				const chapter = await db.query.chapters.findFirst({
-					where: eq(chapters.id, narrator.chapterId),
-				});
-				projectId = chapter?.projectId ?? null;
-				logger.info("Terminal CWD resolution (chapter-bound narrator)", {
-					narratorId,
-					chapterId: narrator.chapterId,
-					chapterFound: !!chapter,
-					worktreePath: chapter?.worktreePath,
-					narratorCwd: narrator.cwd,
-				});
-				if (chapter?.worktreePath) {
-					cwd = chapter.worktreePath;
-				} else {
-					cwd = narrator.cwd ?? getHome();
-				}
-			} else {
-				cwd = narrator.cwd ?? getHome();
-			}
-			if (!cwd || cwd === getHome()) {
-				logger.warn("Narrator has no cwd, falling back", { narratorId, cwd });
-			}
+			if (!source) throw new NotFoundError("Narrator", narratorId);
+			const chapter = source.chapterId
+				? await db.query.chapters.findFirst({
+						where: eq(chapters.id, source.chapterId),
+						columns: { projectId: true },
+					})
+				: undefined;
+			projectId = chapter?.projectId ?? source.contextProjectId ?? null;
+			if (
+				frozenWorkspace.contextProjectId !== undefined &&
+				frozenWorkspace.contextProjectId !== projectId
+			)
+				throw new AppError(
+					"Terminal original project binding changed",
+					409,
+					"WORKSPACE_CONTEXT_STALE",
+				);
 		} else {
 			// Standalone terminals are used by global flows such as setup wizard dependency installs.
 			cwd = getHome();
 		}
 
-		// Same-device requests inherit the selected session cwd. Explicit cross-device
-		// creation uses only that target's base directory, never the resident path.
+		// Narrator-linked creation uses this device's own server-read binding only.
 		const requested = hasExplicitDevice
 			? (requestedDeviceId ?? "local")
 			: (frozenWorkspace?.deviceId ?? deviceId ?? "local");
 		if (frozenWorkspace) {
 			deviceId = requested === "local" ? undefined : requested;
-			cwd =
-				requested === frozenWorkspace.deviceId
-					? frozenWorkspace.cwd
-					: requested === "local"
-						? localToolBaseCwd()
-						: "";
-			projectId = frozenWorkspace.contextProjectId ?? projectId;
+			if (requested !== frozenWorkspace.deviceId)
+				throw new AppError("Terminal binding device mismatch", 409, "WORKSPACE_CONTEXT_STALE");
+			cwd = frozenWorkspace.cwd;
 		}
 		let remoteShell: string | null = null;
 		let remoteWindows = false;
@@ -553,8 +642,8 @@ export const terminalService = {
 					"DEVICE_EXECUTOR_UPGRADE_REQUIRED",
 				);
 			}
-			if (!frozenWorkspace || requested !== frozenWorkspace.deviceId)
-				cwd = hello?.defaultCwd || device.defaultCwd || "";
+			// Global setup terminals are not narrator workspace consumers.
+			if (!narratorId && !frozenWorkspace) cwd = hello?.defaultCwd || device.defaultCwd || "";
 			remoteShell =
 				hello?.platform.shellPath ||
 				device.shellPath ||
@@ -574,8 +663,11 @@ export const terminalService = {
 				"DEVICE_EXECUTOR_UPGRADE_REQUIRED",
 			);
 		}
+		await guard?.assertCurrent();
+		guard?.assertStillCurrent();
 		const identity = await backend.resolvePathIdentity(cwd, {
 			timeoutMs: 10_000,
+			signal: opts.signal,
 			...(boundNativeRoot ? { expectedNativeDescriptor: boundNativeRoot } : {}),
 		});
 		if (!identity.exists)
@@ -606,12 +698,16 @@ export const terminalService = {
 				"DEVICE_EXECUTOR_UPGRADE_REQUIRED",
 			);
 		}
-		// A temporary cross-device/default endpoint is canonicalized once; it cannot
-		// reinterpret the resident binding or follow a replaced resident directory.
+		// The admitted pair must retain its original canonical root.
 		cwd = identity.canonicalPath;
 		let spawnAuthority: Awaited<ReturnType<typeof terminalRuntimeAuthority>> | undefined;
 		if (narratorId) {
-			const authority = await terminalRuntimeAuthority(narratorId, backend, "write");
+			const authority = await terminalRuntimeAuthority(
+				narratorId,
+				backend,
+				"write",
+				opts.principal?.userId ?? "",
+			);
 			spawnAuthority = authority;
 			const policy = await executionPolicyEngine.compile(
 				narratorId,
@@ -645,12 +741,16 @@ export const terminalService = {
 				throw new AppError("Terminal working directory access denied", 403, "TERMINAL_PATH_DENIED");
 			assertTerminalAuthorityStable(
 				authority,
-				await terminalRuntimeAuthority(narratorId, backend, "write"),
+				await terminalRuntimeAuthority(narratorId, backend, "write", opts.principal?.userId ?? ""),
 			);
 		}
 		const terminalWorkspace:
 			| (WorkspaceContext & {
-					terminalOrigin?: { version: 1; runtimeGeneration: number | undefined };
+					terminalOrigin?: {
+						version: 1;
+						runtimeGeneration: number | undefined;
+						projectId: string | null;
+					};
 			  })
 			| undefined =
 			!frozenWorkspace && backend.kind === "remote"
@@ -675,35 +775,29 @@ export const terminalService = {
 							: {}),
 						...(projectId ? { contextProjectId: projectId } : {}),
 						capabilities: { switchDirectory: false },
-						terminalOrigin: { version: 1 as const, runtimeGeneration: backend.runtimeGeneration },
+						terminalOrigin: {
+							version: 1 as const,
+							runtimeGeneration: backend.runtimeGeneration,
+							projectId,
+						},
 					}
-				: frozenWorkspace && requested !== frozenWorkspace.deviceId
+				: frozenWorkspace
 					? {
 							...frozenWorkspace,
-							deviceId: backend.deviceId,
-							cwd,
-							pathFlavor:
-								backend.paths.flavor === "windows" ? ("windows" as const) : ("posix" as const),
-							git: undefined,
-							nativeRootDescriptor: identity.nativeDescriptor
-								? structuredClone(identity.nativeDescriptor)
-								: undefined,
-							contextKey: createHash("sha256")
-								.update(
-									JSON.stringify([
-										frozenWorkspace.contextKey,
-										backend.deviceId,
-										identity.nativeDescriptor?.pathSlotKey ?? backend.paths.identityKey(cwd),
-									]),
-								)
-								.digest("hex"),
+							terminalOrigin: {
+								version: 1,
+								runtimeGeneration: backend.runtimeGeneration,
+								projectId,
+							},
 						}
-					: frozenWorkspace;
+					: undefined;
 		// Path resolution/compilation can yield; refresh the device ceiling before a row or writer claim.
 		if (deviceId && opts.principal)
 			await terminalDeviceAuthority(deviceId, projectId, opts.principal, "write");
 		if (opts.principal)
 			opts = { ...opts, principal: await terminalCreationAuthority(opts, projectId) };
+		await guard?.assertCurrent();
+		guard?.assertStillCurrent();
 		// All remote authorization/capability checks above must finish before any terminal side effect.
 		const id = generateId();
 		const now = new Date().toISOString();
@@ -778,6 +872,7 @@ export const terminalService = {
 						userId: opts.principal.userId,
 						projectId,
 						actorKind: "human",
+						workspaceContext: terminalWorkspace ?? undefined,
 						target: activityTarget,
 						activityId,
 						kind: "pty",
@@ -792,6 +887,7 @@ export const terminalService = {
 
 		let runtime: TerminalRuntime;
 		let dtachSocket: string | null = null;
+		let releasePreparationCancellation: (() => void) | undefined;
 
 		if (!useRemote && opts.principal) {
 			try {
@@ -809,13 +905,29 @@ export const terminalService = {
 				if (narratorId && spawnAuthority)
 					assertTerminalAuthorityStable(
 						spawnAuthority,
-						await terminalRuntimeAuthority(narratorId, backend, "write"),
+						await terminalRuntimeAuthority(
+							narratorId,
+							backend,
+							"write",
+							opts.principal?.userId ?? "",
+						),
 					);
 				if (opts.principal) {
 					await terminalDeviceAuthority(deviceId, projectId, opts.principal, "write");
 					// ACL/role changes are not serialized by the workspace revision lock.
 					opts = { ...opts, principal: await terminalCreationAuthority(opts, projectId) };
 				}
+				await guard?.assertCurrent();
+				guard?.assertStillCurrent();
+				opts.signal?.throwIfAborted();
+				// pty.open is a lifetime stream, not a finite prepare RPC. Forward caller/10s
+				// cancellation only until ready, then retain the runtime's own lifecycle signal.
+				const preparation = new AbortController();
+				const preparationSignal = opts.signal;
+				const cancelPreparation = () => preparation.abort(preparationSignal?.reason);
+				preparationSignal?.addEventListener("abort", cancelPreparation, { once: true });
+				releasePreparationCancellation = () =>
+					preparationSignal?.removeEventListener("abort", cancelPreparation);
 				runtime = spawnRemotePty(
 					deviceId,
 					{
@@ -832,6 +944,7 @@ export const terminalService = {
 					},
 					{
 						requireLifecycleEvidence: remoteWindows,
+						requireInputAuthorityProof: !!narratorId,
 						expectedNativeDescriptor: remoteWindows
 							? structuredClone(boundNativeRoot ?? identity.nativeDescriptor)
 							: undefined,
@@ -846,12 +959,22 @@ export const terminalService = {
 							if (!opts.principal)
 								throw new AppError("Terminal input actor missing", 403, "TERMINAL_ACTOR_REQUIRED");
 							const principal = await terminalCreationAuthority(opts, projectId);
-							await this.authorizeTargetAccess(id, principal, "write");
+							return this.authorizeTargetAccess(id, principal, "write");
 						},
 						sendRpc: (device, method, params, options) => {
-							if (method === "pty.open") dispatched = true;
+							if (method === "pty.open") {
+								guard?.assertStillCurrent();
+								dispatched = true;
+							}
 							return sendRpc(device, method, params, {
 								...options,
+								...(method === "pty.open" && opts.signal
+									? {
+											signal: options?.signal
+												? AbortSignal.any([preparation.signal, options.signal])
+												: preparation.signal,
+										}
+									: {}),
 								expectedConnectionGeneration: backend.runtimeGeneration,
 								requiredFeatures: remoteRequiredFeatures,
 							});
@@ -859,6 +982,7 @@ export const terminalService = {
 					},
 				);
 			} catch (error) {
+				releasePreparationCancellation?.();
 				if (activityTarget)
 					await finishRemoteActivity({
 						target: activityTarget,
@@ -874,7 +998,9 @@ export const terminalService = {
 				throw error;
 			}
 		} else if (useDtach) {
-			// dtach mode: create detached session, then attach via PTY
+			// No await may intervene between the final proof and local writer start.
+			await guard?.assertCurrent();
+			guard?.assertStillCurrent();
 			await dtachService.createSession({ terminalId: id, cwd });
 			dtachSocket = dtachService.getSocketPath(id);
 			runtime = dtachService.attachSession({
@@ -901,6 +1027,8 @@ export const terminalService = {
 				rows,
 				onData: (data) => onData(id, buffer, data),
 			};
+			await guard?.assertCurrent();
+			guard?.assertStillCurrent();
 			if (IS_WINDOWS) {
 				runtime = spawnPortablePty(spawnOpts);
 			} else {
@@ -942,6 +1070,18 @@ export const terminalService = {
 				throw new ValidationError(
 					`Remote terminal failed to start: ${error instanceof Error ? error.message : String(error)}`,
 				);
+			} finally {
+				releasePreparationCancellation?.();
+			}
+		} else releasePreparationCancellation?.();
+		if (activityTarget) {
+			try {
+				markRemoteActivityRunning({ target: activityTarget, activityId });
+			} catch (error) {
+				logger.warn("PTY running ledger update failed; prepared barrier retained", {
+					terminalId: id,
+					error: String(error),
+				});
 			}
 		}
 
@@ -1009,9 +1149,77 @@ export const terminalService = {
 	) {
 		const terminal = await this.getById(terminalId);
 		let projectId = terminal.workspaceContext?.contextProjectId ?? null;
+		let originalProof: { assertStillCurrent(): void } | undefined;
 		if (terminal.narratorId) {
-			const narrator = await loadNarratorForAccess(terminal.narratorId, principal, need);
-			projectId ??= narrator.contextProjectId;
+			const original = terminal.workspaceContext;
+			if (
+				!original ||
+				original.deviceId !== (terminal.deviceId ?? "local") ||
+				original.cwd !== terminal.cwd
+			)
+				throw new AppError(
+					"Terminal original workspace is unavailable",
+					409,
+					"TERMINAL_ORIGIN_UNAVAILABLE",
+				);
+			const origin = (
+				original as WorkspaceContext & {
+					terminalOrigin?: {
+						version?: number;
+						projectId?: string | null;
+						runtimeGeneration?: number;
+					};
+				}
+			).terminalOrigin;
+			const originalProjectId =
+				original.contextProjectId ?? (origin?.version === 1 ? origin.projectId : undefined);
+			if (originalProjectId === undefined)
+				throw new AppError(
+					"Terminal original project source is unavailable",
+					409,
+					"TERMINAL_ORIGIN_UNAVAILABLE",
+				);
+			projectId = originalProjectId;
+			const backend = resolveBackend({ requested: original.deviceId });
+			await terminalRuntimeAuthority(terminal.narratorId, backend, need, principal.userId);
+			if (
+				origin?.runtimeGeneration !== undefined &&
+				origin.runtimeGeneration !== backend.runtimeGeneration
+			)
+				throw new AppError("Terminal original backend changed", 409, "TERMINAL_ORIGIN_UNAVAILABLE");
+			const { assertNarratorOriginalWorkspaceAuthority } = await import(
+				"./workspace-artifact-access"
+			);
+			originalProof = await assertNarratorOriginalWorkspaceAuthority(
+				terminal.narratorId,
+				original,
+				{ userId: principal.userId, need, originalProjectId },
+			);
+			// Native metadata must follow actor/narrator/original-project admission.
+			if (backend.paths.flavor === "windows") {
+				if (!original.nativeRootDescriptor)
+					throw new AppError(
+						"Terminal original native root is unavailable",
+						409,
+						"TERMINAL_ORIGIN_UNAVAILABLE",
+					);
+				const identity = await backend.resolvePathIdentity(original.cwd, {
+					timeoutMs: 5_000,
+					expectedNativeDescriptor: original.nativeRootDescriptor,
+				});
+				if (
+					!identity.exists ||
+					!identity.nativeDescriptor ||
+					!nativePathEquals(original.nativeRootDescriptor, identity.nativeDescriptor) ||
+					identity.runtimeGeneration !== backend.runtimeGeneration ||
+					!backend.paths.equals(identity.canonicalPath, original.cwd)
+				)
+					throw new AppError(
+						"Terminal original native root changed",
+						409,
+						"TERMINAL_ORIGIN_UNAVAILABLE",
+					);
+			}
 		} else if (terminal.chapterId) {
 			const { assertChapterProjectAccess } = await import("./project-acl");
 			await assertChapterProjectAccess(terminal.chapterId, principal, need);
@@ -1027,7 +1235,12 @@ export const terminalService = {
 			await terminalDeviceAuthority(terminal.deviceId, projectId, principal, need);
 		if (terminal.narratorId && terminal.cwd) {
 			const backend = resolveBackend({ requested: terminal.deviceId ?? "local" });
-			const authority = await terminalRuntimeAuthority(terminal.narratorId, backend, need);
+			const authority = await terminalRuntimeAuthority(
+				terminal.narratorId,
+				backend,
+				need,
+				principal.userId,
+			);
 			const policy = await executionPolicyEngine.compile(
 				terminal.narratorId,
 				{
@@ -1058,17 +1271,27 @@ export const terminalService = {
 				);
 			assertTerminalAuthorityStable(
 				authority,
-				await terminalRuntimeAuthority(terminal.narratorId, backend, need),
+				await terminalRuntimeAuthority(terminal.narratorId, backend, need, principal.userId),
 			);
 			if (terminal.deviceId && terminal.deviceId !== "local")
 				await terminalDeviceAuthority(terminal.deviceId, projectId, principal, need);
 		}
-		return terminal;
+		originalProof?.assertStillCurrent();
+		// Request-bound final proof is deliberately non-enumerable: never part of the HTTP DTO.
+		return Object.defineProperty(terminal, "assertStillCurrent", {
+			value: () => originalProof?.assertStillCurrent(),
+		}) as typeof terminal & { assertStillCurrent(): void };
 	},
 
-	writeAuthorized(terminalId: string, data: string, authority: () => Promise<unknown>) {
+	writeAuthorized(
+		terminalId: string,
+		data: string,
+		authority: () => Promise<unknown>,
+		beforeDispatch?: () => void,
+	) {
 		const active = activeTerminals.get(terminalId);
 		if (!active || active.closing) return;
+		beforeDispatch?.();
 		if ("writeAuthorized" in active.runtime) {
 			(active.runtime as RemoteTerminalRuntime).writeAuthorized(data, authority);
 		} else {
@@ -1081,9 +1304,11 @@ export const terminalService = {
 		cols: number,
 		rows: number,
 		authority: () => Promise<unknown>,
+		beforeDispatch?: () => void,
 	) {
 		const active = activeTerminals.get(terminalId);
 		if (!active || active.closing) return;
+		beforeDispatch?.();
 		if ("resizeAuthorized" in active.runtime) {
 			(active.runtime as RemoteTerminalRuntime).resizeAuthorized(cols, rows, authority);
 			void active.buffer.resize(cols, rows);
@@ -1118,17 +1343,37 @@ export const terminalService = {
 		active.buffer.resize(cols, rows);
 	},
 
-	async kill(terminalId: string) {
+	async kill(terminalId: string, beforeDispatch?: () => void) {
 		const terminal = await this.getById(terminalId);
+		beforeDispatch?.();
 		const active = activeTerminals.get(terminalId);
 		if (active) {
 			if (active.closing) return;
 			active.closing = true;
 			sendToTerminal(terminalId, { type: "lifecycle", terminalId, state: "closing", code: null });
-			if (active.useDtach) await dtachService.killSession(terminalId);
-			// Retain the original runtime and observer until REAL exit/unknown.
-			// In particular do not abort pty.open or broadcast a synthetic -1.
-			active.runtime.kill();
+			let dispatched = false;
+			try {
+				if (active.useDtach)
+					await dtachService.killSession(terminalId, beforeDispatch, () => {
+						dispatched = true;
+					});
+				beforeDispatch?.();
+				// Retain the original runtime and observer until REAL exit/unknown.
+				// Once effects were dispatched (or their outcome is unknown), never reopen input.
+				dispatched = true;
+				active.runtime.kill();
+			} catch (error) {
+				if (!dispatched && activeTerminals.get(terminalId) === active) {
+					active.closing = false;
+					sendToTerminal(terminalId, {
+						type: "lifecycle",
+						terminalId,
+						state: "ready",
+						code: null,
+					});
+				}
+				throw error;
+			}
 			logger.info("Terminal close requested", { terminalId });
 			return;
 		}
@@ -1141,10 +1386,15 @@ export const terminalService = {
 			);
 		}
 		if (await dtachService.isAvailable()) {
-			if (await dtachService.isSocketAlive(terminalId)) await dtachService.killSession(terminalId);
+			beforeDispatch?.();
+			const socketAlive = await dtachService.isSocketAlive(terminalId);
+			beforeDispatch?.();
+			if (socketAlive) await dtachService.killSession(terminalId, beforeDispatch);
+			beforeDispatch?.();
 			const buf = new BufferManager(terminalId);
 			await buf.deleteFromDisk();
 		}
+		beforeDispatch?.();
 		// Detached cleanup has no original process wait handle: keep that honest.
 		await markTerminalExited(terminalId, null, terminal.narratorId, terminal.chapterId);
 		broadcastExit(terminalId, null);
@@ -1167,12 +1417,13 @@ export const terminalService = {
 		}
 	},
 
-	async rename(terminalId: string, name: string) {
+	async rename(terminalId: string, name: string, beforeDispatch?: () => void) {
 		const terminal = await db.query.terminals.findFirst({
 			where: eq(terminals.id, terminalId),
 		});
 		if (!terminal) throw new NotFoundError("Terminal", terminalId);
 		assertLegacyRuntimeOwner(terminal);
+		beforeDispatch?.();
 		await db.update(terminals).set({ name }).where(eq(terminals.id, terminalId));
 	},
 
@@ -1266,7 +1517,7 @@ export const terminalService = {
 	 * automatically re-attach so new output flows through WebSocket.
 	 * No-op for non-dtach terminals or already-attached terminals.
 	 */
-	async ensureAttached(terminalId: string): Promise<void> {
+	async ensureAttached(terminalId: string, beforeDispatch?: () => void): Promise<void> {
 		if (activeTerminals.has(terminalId)) return;
 		if (!(await dtachService.isAvailable())) return;
 
@@ -1284,7 +1535,7 @@ export const terminalService = {
 		if (terminal.deviceId && terminal.deviceId !== "local") return;
 		if (terminal.worktreeResourceId != null) return;
 
-		await this.reattach(terminalId);
+		await this.reattach(terminalId, beforeDispatch);
 	},
 
 	/** Get attached status for multiple terminals at once */
@@ -1296,7 +1547,7 @@ export const terminalService = {
 	 * Re-attach to a dtach terminal that exists in DB but is not in activeTerminals.
 	 * Returns true if successfully re-attached.
 	 */
-	async reattach(terminalId: string): Promise<boolean> {
+	async reattach(terminalId: string, beforeDispatch?: () => void): Promise<boolean> {
 		const terminal = await db.query.terminals.findFirst({
 			where: eq(terminals.id, terminalId),
 		});
@@ -1309,6 +1560,12 @@ export const terminalService = {
 
 		const buffer = new BufferManager(terminalId);
 		await buffer.loadFromDisk();
+		try {
+			beforeDispatch?.();
+		} catch (error) {
+			await buffer.dispose();
+			throw error;
+		}
 		buffer.startPeriodicFlush();
 
 		const runtime = dtachService.attachSession({

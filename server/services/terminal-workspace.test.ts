@@ -6,6 +6,10 @@ import { compileExecutionPolicy } from "./execution-policy/compiler";
 import type { ExecutionTargetContext } from "./execution-policy/types";
 
 let context: WorkspaceContext;
+let otherBinding: WorkspaceContext | undefined;
+let identityCalls = 0;
+let afterIdentity: (() => void) | undefined;
+let backendGeneration = 2;
 let platformOs: "linux" | "windows" = "linux";
 let nativeIdentity: NativePathDescriptorV2 | undefined;
 let lastExpectedNativeRoot: NativePathDescriptorV2 | undefined;
@@ -13,6 +17,7 @@ let missingFeature: string | undefined;
 let online = true;
 let authorized = true;
 let denied = false;
+let installationPending = false;
 let records: Record<string, unknown>[] = [];
 let policyTargets: string[] = [];
 let groupDeny: "global" | "selfRegistered" | null = null;
@@ -34,8 +39,17 @@ mock.module("./remote-tree-snapshot-hooks", () => ({
 	registerRemoteActivity: registerActivity,
 	registerRemoteTerminalActivity: registerTerminalActivity,
 	finishRemoteActivity: finishActivity,
+	markRemoteActivityRunning: mock((_input: unknown) => {}),
 }));
 const write = mock((_data: string) => {});
+const rpc = mock(
+	async (
+		_device: string,
+		_method: string,
+		_params: unknown,
+		_options?: { signal?: AbortSignal },
+	) => ({}),
+);
 const remotePty = mock((_device: string, _options: unknown, _dependencies?: unknown) => ({
 	write,
 	resize: () => {},
@@ -77,6 +91,9 @@ mock.module("../db", () => ({
 }));
 mock.module("./narrator-acl", () => ({ loadNarratorForAccess: async () => ({ id: "n" }) }));
 mock.module("./workspace-context-service", () => ({
+	assertWorkspaceSelectionInstalled: () => {
+		if (installationPending) throw new Error("installation pending");
+	},
 	workspaceContextService: {
 		get: async () => context,
 		withRevision: async (
@@ -88,6 +105,48 @@ mock.module("./workspace-context-service", () => ({
 			if (revision !== context.revision) throw new Error("stale revision");
 			return action(structuredClone(context));
 		},
+	},
+}));
+mock.module("./workspace-artifact-access", () => ({
+	createDeviceWorkspaceConfig: async (
+		_id: string,
+		options: { userId: string; signal: AbortSignal },
+	) => {
+		expect(options.userId).toBe("actor");
+		const find = (device: string) =>
+			otherBinding?.deviceId === device
+				? otherBinding
+				: context.deviceId === device
+					? context
+					: null;
+		const assertCurrent = (frozen: WorkspaceContext) => {
+			options.signal.throwIfAborted();
+			if (JSON.stringify(find(frozen.deviceId)) !== JSON.stringify(frozen))
+				throw new Error("binding stale");
+		};
+		return {
+			resolveDeviceWorkspace: async (device: string) => find(device),
+			assertDeviceWorkspaceCurrent: async (frozen: WorkspaceContext) => assertCurrent(frozen),
+			assertDeviceWorkspaceCurrentSync: assertCurrent,
+			assertEndpointAuthorized: async () => ({
+				assertStillCurrent() {
+					options.signal.throwIfAborted();
+					if (!authorized) throw new Error("actor authority denied");
+				},
+			}),
+		};
+	},
+	assertNarratorOriginalWorkspaceAuthority: async (
+		_id: string,
+		_context: WorkspaceContext,
+		options: { userId: string },
+	) => {
+		expect(options.userId).toBe("actor");
+		return {
+			assertStillCurrent() {
+				if (!authorized) throw new Error("actor authority denied");
+			},
+		};
 	},
 }));
 mock.module("./execution-policy/engine", () => ({
@@ -138,12 +197,14 @@ mock.module("../lib/agent/execution/registry", () => ({
 		kind: "remote",
 		deviceId: "remote",
 		paths: platformOs === "windows" ? windowsPathSemantics : posixPathSemantics,
-		runtimeGeneration: 2,
+		runtimeGeneration: backendGeneration,
 		resolvePathIdentity: async (
 			path: string,
 			options?: { expectedNativeDescriptor?: NativePathDescriptorV2 },
 		) => {
+			identityCalls++;
 			lastExpectedNativeRoot = options?.expectedNativeDescriptor;
+			afterIdentity?.();
 			return {
 				canonicalPath: path === "/remote/default-decoy" ? (canonicalDefault ?? path) : path,
 				lexicalPath: path,
@@ -158,6 +219,7 @@ mock.module("../lib/agent/execution/path-resolve", () => ({
 	localToolBaseCwd: () => "/host/default",
 }));
 mock.module("./device-connection-service", () => ({
+	sendRpc: rpc,
 	isDeviceOnline: () => online,
 	getConnectedDeviceHello: () => ({
 		defaultCwd: platformOs === "windows" ? "C:\\chosen" : "/remote/default-decoy",
@@ -205,6 +267,10 @@ const { terminalService } = await import("./terminal-service");
 const principal = { userId: "actor", isAdmin: false };
 beforeEach(() => {
 	platformOs = "linux";
+	otherBinding = undefined;
+	identityCalls = 0;
+	afterIdentity = undefined;
+	backendGeneration = 2;
 	nativeIdentity = undefined;
 	lastExpectedNativeRoot = undefined;
 	missingFeature = undefined;
@@ -219,6 +285,7 @@ beforeEach(() => {
 	online = true;
 	authorized = true;
 	denied = false;
+	installationPending = false;
 	groupDeny = null;
 	canonicalDefault = null;
 	selfRegistered = false;
@@ -229,6 +296,7 @@ beforeEach(() => {
 	remotePty.mockClear();
 	localPty.mockClear();
 	write.mockClear();
+	rpc.mockClear();
 	registerActivity.mockClear();
 	registerTerminalActivity.mockClear();
 	finishActivity.mockClear();
@@ -264,6 +332,59 @@ function selectWindowsRoot() {
 }
 
 describe("terminal frozen workspace creation", () => {
+	test("prepare cancellation is detached from the native open lifetime after readiness", async () => {
+		const caller = new AbortController();
+		const lifetime = new AbortController();
+		remotePty.mockImplementationOnce((device, _options, dependencies) => {
+			const deps = dependencies as {
+				sendRpc(
+					device: string,
+					method: string,
+					params: unknown,
+					options: { signal: AbortSignal },
+				): Promise<unknown>;
+			};
+			void deps.sendRpc(device, "pty.open", {}, { signal: lifetime.signal });
+			return {
+				write,
+				resize: () => {},
+				kill: () => {},
+				close: () => {},
+				ready: Promise.resolve(),
+				exited: new Promise(() => {}),
+			};
+		});
+		await terminalService.create({ narratorId: "n", principal, signal: caller.signal });
+		const openSignal = rpc.mock.calls[0]?.[3]?.signal;
+		expect(openSignal).toBeDefined();
+		caller.abort();
+		expect(openSignal?.aborted).toBe(false);
+		lifetime.abort();
+		expect(openSignal?.aborted).toBe(true);
+	});
+	test("pending installation blocks new terminal before metadata but not the stored original ID", async () => {
+		const old = await terminalService.create({ narratorId: "n", principal });
+		identityCalls = 0;
+		remotePty.mockClear();
+		installationPending = true;
+		await expect(
+			terminalService.create({ narratorId: "n", principal, deviceId: "remote" }),
+		).rejects.toThrow("installation pending");
+		expect(identityCalls).toBe(0);
+		expect(remotePty).not.toHaveBeenCalled();
+		await expect(
+			terminalService.authorizeTargetAccess(old.id, principal, "read"),
+		).resolves.toMatchObject({ cwd: "/chosen/first" });
+	});
+	test("installation becomes pending during writer admission: final fence refuses new PTY", async () => {
+		registerActivity.mockImplementationOnce(async () => {
+			installationPending = true;
+		});
+		await expect(terminalService.create({ narratorId: "n", principal })).rejects.toThrow(
+			"installation pending",
+		);
+		expect(remotePty).not.toHaveBeenCalled();
+	});
 	test("native Windows dispatch freezes the ORIGINAL root and never uses Unix interactive flags", async () => {
 		selectWindowsRoot();
 		const original = structuredClone(context.nativeRootDescriptor);
@@ -344,7 +465,7 @@ describe("terminal frozen workspace creation", () => {
 					revision: 0,
 					deviceId: "remote",
 					cwd: "/remote/default-decoy",
-					terminalOrigin: { version: 1, runtimeGeneration: 2 },
+					terminalOrigin: { version: 1, runtimeGeneration: 2, projectId: null },
 				},
 			});
 			return {
@@ -370,7 +491,7 @@ describe("terminal frozen workspace creation", () => {
 				runtimeGeneration: 2,
 				workspaceContext: expect.objectContaining({
 					cwd: "/remote/default-decoy",
-					terminalOrigin: { version: 1, runtimeGeneration: 2 },
+					terminalOrigin: { version: 1, runtimeGeneration: 2, projectId: null },
 				}),
 			}),
 		);
@@ -437,7 +558,8 @@ describe("terminal frozen workspace creation", () => {
 			contextKey: "chosen-1",
 		});
 		expect(remotePty.mock.calls[0]?.[1]).toMatchObject({ cwd: "/chosen/first" });
-		expect(old.workspaceContext).toEqual(context);
+		expect(old.workspaceContext).toMatchObject(context);
+		expect(old.workspaceContext).toHaveProperty("terminalOrigin.projectId", null);
 		expect(old.workspaceRevision).toBe(8);
 		context = { ...context, cwd: "/chosen/second", contextKey: "chosen-2", revision: 9 };
 		const newer = await terminalService.create({ narratorId: "n", principal, expectedRevision: 9 });
@@ -448,20 +570,94 @@ describe("terminal frozen workspace creation", () => {
 		expect(write).toHaveBeenCalledWith("old terminal input");
 		expect(localPty).not.toHaveBeenCalled();
 	});
-	test("temporary other-device creation canonicalizes its own default without moving the resident workspace", async () => {
+	test("unconfigured other-device creation rejects rather than borrowing device default cwd", async () => {
 		context = { ...context, deviceId: "resident-other", cwd: "/resident/selected" };
-		canonicalDefault = "/target/canonical";
+		await expect(
+			terminalService.create({ narratorId: "n", principal, deviceId: "remote" }),
+		).rejects.toThrow("not configured");
+		expect(remotePty).not.toHaveBeenCalled();
+		expect(records).toHaveLength(0);
+		expect(identityCalls).toBe(0);
+	});
+
+	test("binding replacement after metadata rejects before writer admission or PTY", async () => {
+		afterIdentity = () => {
+			context = { ...context, cwd: "/chosen/new" };
+		};
+		await expect(terminalService.create({ narratorId: "n", principal })).rejects.toThrow(
+			"binding stale",
+		);
+		expect(remotePty).not.toHaveBeenCalled();
+		expect(registerActivity).not.toHaveBeenCalled();
+	});
+
+	test("binding replacement during writer admission rejects at final PTY fence", async () => {
+		registerActivity.mockImplementationOnce(async () => {
+			context = { ...context, contextKey: "replacement" };
+		});
+		await expect(terminalService.create({ narratorId: "n", principal })).rejects.toThrow(
+			"binding stale",
+		);
+		expect(remotePty).not.toHaveBeenCalled();
+		expect(finishActivity).toHaveBeenCalledWith(expect.objectContaining({ outcome: "finished" }));
+	});
+
+	test("cancelled prepare and live backend replacement never start PTY", async () => {
+		const cancelled = new AbortController();
+		cancelled.abort();
+		await expect(
+			terminalService.create({ narratorId: "n", principal, signal: cancelled.signal }),
+		).rejects.toThrow();
+		expect(remotePty).not.toHaveBeenCalled();
+		afterIdentity = () => {
+			backendGeneration = 3;
+		};
+		await expect(terminalService.create({ narratorId: "n", principal })).rejects.toThrow(
+			"backend changed",
+		);
+		expect(remotePty).not.toHaveBeenCalled();
+	});
+
+	test("stale independent binding pin refuses before metadata", async () => {
+		await expect(
+			terminalService.create({
+				narratorId: "n",
+				principal,
+				deviceId: "remote",
+				expectedBindingRevision: 77,
+			}),
+		).rejects.toThrow("binding changed");
+		expect(identityCalls).toBe(0);
+		expect(remotePty).not.toHaveBeenCalled();
+	});
+
+	test("configured inactive pair uses its own cwd and binding without moving the selected workspace", async () => {
+		otherBinding = {
+			...context,
+			cwd: "/target/canonical",
+			contextKey: "own-pair",
+			binding: {
+				version: 1,
+				narratorId: "n",
+				deviceId: "remote",
+				bindingId: "b",
+				bindingRevision: 3,
+				bindingKey: "bk",
+			},
+		};
+		context = { ...context, deviceId: "resident-other", cwd: "/resident/selected" };
 		const terminal = await terminalService.create({
 			narratorId: "n",
 			principal,
 			deviceId: "remote",
 		});
 		expect(terminal.cwd).toBe("/target/canonical");
-		expect(terminal.workspaceContext).toMatchObject({
-			deviceId: "remote",
-			cwd: "/target/canonical",
-			revision: 8,
-		});
+		const expectedSource = {
+			...otherBinding,
+			terminalOrigin: { version: 1, runtimeGeneration: 2, projectId: null },
+		};
+		expect(terminal.workspaceContext).toEqual(expectedSource);
+		expect(terminal.workspaceContext).toHaveProperty("terminalOrigin.projectId", null);
 		expect(context).toMatchObject({ deviceId: "resident-other", cwd: "/resident/selected" });
 		expect(localPty).not.toHaveBeenCalled();
 	});
@@ -599,7 +795,7 @@ describe("terminal frozen workspace creation", () => {
 	test("stale revision/key, offline, actor and path denial all refuse before PTY or insert", async () => {
 		await expect(
 			terminalService.create({ narratorId: "n", principal, expectedRevision: 7 }),
-		).rejects.toThrow("stale");
+		).rejects.toThrow("changed");
 		await expect(
 			terminalService.create({ narratorId: "n", principal, contextKey: "old" }),
 		).rejects.toThrow("changed");

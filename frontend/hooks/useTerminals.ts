@@ -72,7 +72,14 @@ export function useCreateTerminal(chapterId: string) {
 	const terminalCapability = useTerminalCapability();
 	const queryKey = ["terminals", { chapterId }] as const;
 	return useMutation({
-		mutationFn: (data?: { name?: string; cols?: number; rows?: number; deviceId?: string }) => {
+		mutationFn: (data?: {
+			name?: string;
+			cols?: number;
+			rows?: number;
+			deviceId?: string;
+			expectedBindingRevision?: number;
+			bindingId?: string;
+		}) => {
 			if (!terminalCapability.supported) {
 				return Promise.reject(
 					new Error(terminalCapability.reason ?? "Terminal runtime is not supported"),
@@ -94,7 +101,14 @@ export function useCreateNarratorTerminal(narratorId: string) {
 	const workspace = useWorkspaceContext(narratorId);
 	const queryKey = ["terminals", { narratorId }] as const;
 	return useMutation({
-		mutationFn: (data?: { name?: string; cols?: number; rows?: number; deviceId?: string }) => {
+		mutationFn: (data?: {
+			name?: string;
+			cols?: number;
+			rows?: number;
+			deviceId?: string;
+			expectedBindingRevision?: number;
+			bindingId?: string;
+		}) => {
 			const context = workspace.data;
 			const targetCapability = context?.capabilities.terminal;
 			const supported =

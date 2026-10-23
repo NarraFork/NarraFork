@@ -10,6 +10,8 @@ export interface WorkspaceContext {
 	cwd: string;
 	pathFlavor: "posix" | "windows";
 	contextKey: string;
+	/** Independently versioned session/device binding; never an authorization grant. */
+	binding?: WorkspaceBindingReference;
 	/** Original v2 root evidence; legacy bindings cannot synthesize it from a new observation. */
 	nativeRootDescriptor?: import("./target-native-path").NativePathDescriptorV2;
 	contextProjectId?: string;
@@ -49,4 +51,73 @@ export interface WorkspaceContextChangedEvent {
 	narratorId: string;
 	previous: WorkspaceContext;
 	current: WorkspaceContext;
+}
+
+/** Invalidate actor-filtered summaries; no device/path/native evidence is broadcast. */
+export interface DeviceWorkspaceBindingsChangedEvent {
+	type: "device_workspace_bindings_changed";
+	narratorId: string;
+}
+
+/** Binding identity is distinct from the default selection's workspaceRevision. */
+export interface WorkspaceBindingReference {
+	version: 1;
+	bindingId: string;
+	narratorId: string;
+	deviceId: string;
+	bindingRevision: number;
+	bindingKey: string;
+}
+
+export interface NarratorDeviceWorkspaceBinding {
+	id: string;
+	narratorId: string;
+	deviceId: string;
+	bindingRevision: number;
+	context: WorkspaceContext;
+	createdAt: string;
+	updatedAt: string;
+}
+
+/** List responses deliberately omit original native root evidence and large JSON. */
+export interface NarratorDeviceWorkspaceSummary {
+	id: string;
+	deviceId: string;
+	cwd: string;
+	pathFlavor: WorkspaceContext["pathFlavor"];
+	bindingRevision: number;
+	selected: boolean;
+	availability: WorkspaceContext["availability"];
+	updatedAt: string;
+}
+
+export interface ListNarratorDeviceWorkspacesResult {
+	items: NarratorDeviceWorkspaceSummary[];
+	nextCursor: string | null;
+}
+
+export interface SetNarratorDeviceWorkspaceRequest {
+	requestId: string;
+	deviceId: string;
+	cwd: string;
+	/** Zero only when creating a binding that does not exist. */
+	expectedBindingRevision: number;
+	/** Required when the edited binding is also the selected endpoint. */
+	expectedSelectionRevision?: number;
+	expectedWorktreeKey?: string;
+}
+
+export interface SelectNarratorDeviceWorkspaceRequest {
+	requestId: string;
+	deviceId: string;
+	expectedBindingRevision: number;
+	expectedSelectionRevision: number;
+}
+
+export interface NarratorDeviceWorkspaceMutationResult {
+	kind: "set" | "select";
+	changed: boolean;
+	binding: NarratorDeviceWorkspaceBinding;
+	/** Present only if this operation updated the selected/default projection. */
+	selection?: SwitchWorkingDirectoryResult;
 }

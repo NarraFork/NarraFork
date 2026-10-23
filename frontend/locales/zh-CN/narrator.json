@@ -1,4 +1,10 @@
 {
+	"partialRevert": {
+		"restored": "已回退的已知文件：{{count}}",
+		"conflicts": "冲突跳过（未覆盖）的文件：{{count}}",
+		"unknown": "未知未覆盖的范围：{{count}}。无快照的 Bash／终端活动及不完整证据无法保证恢复；相关记录仍保留。",
+		"truncated": "每类仅展示前 100 条记录。"
+	},
 	"workspaceAvailability": {
 		"ready": "就绪",
 		"offline": "设备离线",
@@ -300,6 +306,10 @@
 	},
 	"fileReferences": {
 		"title": "文件引用",
+		"capturedSnapshot": "已捕获快照（只读）",
+		"attachmentUnavailable": "附件不可用，请在原设备查看。",
+		"originalAttachment": "原来源附件（只读）",
+		"capturedUnavailable": "原始引用快照不可用，请重新添加明确的文件引用。",
 		"searching": "正在搜索文件…",
 		"searchTimeout": "文件搜索超时，请输入更具体的路径。",
 		"queryTooLong": "文件查询过长，请缩小搜索范围。",
@@ -394,6 +404,26 @@
 	"workspaceCreate": "创建工作树",
 	"workspaceList": "列出工作树",
 	"workspaceSwitch": "切换工作目录",
+	"deviceWorkspace": {
+		"configure": "配置目录",
+		"configureDevice": "配置目录 · {{device}}",
+		"configureAndSelect": "配置并切换",
+		"saveOnly": "仅保存目录",
+		"unconfigured": "未配置",
+		"notLoaded": "目录尚未加载",
+		"loadMore": "加载更多设备目录",
+		"not_committed": "此请求确认未提交。请刷新并确认后发起新操作。",
+		"savedNotSelected": "目录已保存，默认设备未切换。",
+		"committed_pending": "新选择已提交，等待安装／恢复。工作区操作继续暂停。",
+		"bindingPending": "目录配置已提交，等待安装／恢复。",
+		"unconfirmed": "提交结果未确认。请查询原请求，不要重新提交。",
+		"superseded": "原请求已被较新的变更替代，不会重放旧目标。",
+		"recover": "查询／恢复原请求",
+		"refreshCurrent": "刷新当前选择",
+		"refreshBaseline": "刷新基线，准备新提交",
+		"baselineReady": "基线已刷新，目录文本保持不变。请确认后再次提交，创建新请求。",
+		"baselineNotReady": "当前选择尚未确认安装，或基线发生变化。尚未准备新请求。"
+	},
 	"workspaceDevice": "切换设备",
 	"workspaceCreated": "已创建",
 	"workspaceFailed": "创建失败",

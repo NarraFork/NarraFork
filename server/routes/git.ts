@@ -174,12 +174,16 @@ export function createGitRoutes(source: "chapter" | "narrator") {
 		try {
 			if (source === "narrator" && need === "write" && target.workspace.deviceId === "local") {
 				const id = c.req.param("id") ?? "";
-				const context = await workspaceContextService.get(id);
+				const actor = { userId: narratorPrincipalOf(c).userId };
+				const context = await workspaceContextService.get(id, actor);
+				if (context.contextKey !== target.workspaceContext?.contextKey)
+					throw new AppError("Git workspace changed", 409, "GIT_WORKSPACE_CHANGED");
 				await workspaceContextService.withRevision(
 					id,
 					context.revision,
 					target.workspace.workspaceKey ?? undefined,
 					write,
+					actor,
 				);
 			} else await write();
 		} finally {

@@ -153,6 +153,25 @@ export function buildFinalToolStartAuthorization(
 		config.signal.throwIfAborted();
 		if (!context.binding)
 			throw new Error("Final policy authorization requires a durable execution binding");
+		const workspaces = (
+			context.executionPlan?.endpoints.map((endpoint) => endpoint.target) ??
+			(context.executionTarget ? [context.executionTarget] : [])
+		).flatMap((target) => {
+			if (!target.workspaceContext?.binding) {
+				if (target.workspaceBinding)
+					throw new Error("Final authorization endpoint lost its original workspace binding");
+				return [];
+			}
+			const workspace = structuredClone(target.workspaceContext);
+			if (JSON.stringify(target.workspaceBinding) !== JSON.stringify(workspace.binding))
+				throw new Error("Final authorization endpoint binding does not match its workspace");
+			return [workspace];
+		});
+		const bindingService = workspaces.length
+			? (await import("./narrator-device-workspace-service")).narratorDeviceWorkspaceService
+			: undefined;
+		for (const workspace of workspaces)
+			await bindingService?.assertCurrent(config.narratorId, workspace, { userId: config.userId });
 		const runtime = await assertOAuthNarratorRuntimeActive(config.narratorId, config.userId);
 		if (runtime && !runtime.allowedTools.has(context.toolUse.name))
 			throw new Error("OAuth tool capability was revoked");
@@ -206,6 +225,10 @@ export function buildFinalToolStartAuthorization(
 			assertStillCurrent() {
 				config.signal.throwIfAborted();
 				policyFence.assertStillCurrent();
+				for (const workspace of workspaces)
+					bindingService?.assertCurrentSync(config.narratorId, workspace, {
+						userId: config.userId,
+					});
 				if (
 					actorId &&
 					actorBefore &&

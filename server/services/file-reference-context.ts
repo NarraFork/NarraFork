@@ -7,9 +7,20 @@ import type { AgentConfig } from "../lib/agent/types";
 
 /** Registry lookup uses live connection memory; never queries the DB or remote filesystem. */
 export function getAgentFileReferenceContext(
-	config: Pick<AgentConfig, "cwd" | "defaultDeviceId" | "executionBackend">,
+	config: Pick<AgentConfig, "cwd" | "defaultDeviceId" | "executionBackend"> &
+		Partial<Pick<AgentConfig, "narratorId" | "workspaceContext" | "executionTarget">>,
 	resolve: typeof resolveBackend = resolveBackend,
 ): FileReferenceContext | null {
+	if (config.executionTarget)
+		return normalizeFileReferenceContext({
+			deviceId: config.executionTarget.deviceId,
+			cwd: config.executionTarget.cwd,
+		});
+	const workspace = config.workspaceContext;
+	if (workspace)
+		return normalizeFileReferenceContext({ deviceId: workspace.deviceId, cwd: workspace.cwd });
+	// A narrator's provider pass must never claim the device's global default directory.
+	if (config.narratorId) return null;
 	const deviceId = config.defaultDeviceId ?? LOCAL_DEVICE_ID;
 	let backend: ExecutionBackend;
 	try {

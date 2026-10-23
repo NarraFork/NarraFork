@@ -6,6 +6,7 @@ import {
 	replaceFileReferenceSnapshots,
 } from "@server/lib/file-reference-input";
 import {
+	bufferQueueModeSchema,
 	editAndRegenerateJsonSchema,
 	editAssistantMessageSchema,
 	sendMessageSchema,
@@ -44,12 +45,13 @@ const routeCode = [
 	section("async function resolveEditedFileReferences(", "// Edit an assistant message's text"),
 	section(
 		'narratorRoutes.post("/:id/edit-message/:messageId"',
-		"/**\n * Resolve the authoritative buffer queue",
+		"/** Primary and subagent user queues are projections of the same durable mailbox. */",
 	),
 	section("interface LocatedBufferedMessage", "// Remove a single queued buffered message"),
 ]
 	.join("\n")
-	.replaceAll('import("../services/narrator-subagent")', "Promise.resolve(subagentQueue)")
+	.replace(/import\(\s*"\.\.\/services\/narrator-subagent"\s*\)/g, "Promise.resolve(subagentQueue)")
+	.replaceAll('import("../services/subagent-executor")', "Promise.resolve(subagentQueue)")
 	.replaceAll("export async function", "async function");
 const compiled = new Bun.Transpiler({ loader: "ts" }).transformSync(routeCode);
 
@@ -168,7 +170,7 @@ function fixture(
 			text: string,
 			opts: { fileReferences?: FileReferenceSnapshot[] },
 		) => {
-			const item = queue.find((entry) => entry.id === mid);
+			const item = (options.subagent ? subqueue : queue).find((entry) => entry.id === mid);
 			if (!item) return false;
 			item.text = text;
 			if (opts.fileReferences !== undefined) item.fileReferences = opts.fileReferences;
@@ -220,6 +222,40 @@ function fixture(
 	);
 	child.get("/preview", (c) => c.json({ ok: true }));
 	const bindings = {
+		withNarratorWorkAdmission: async (_id: string, body: () => Promise<unknown>) => body(),
+		acceptUserMessage: async (id: string, text: string, opts: Record<string, unknown>) => {
+			const args = [
+				id,
+				text,
+				opts.images,
+				opts.locale,
+				opts.replyInUserLanguage,
+				opts.commandText,
+				undefined,
+				opts.userId,
+				opts.textFiles,
+				opts.preBashCommand,
+				opts.fileReferences,
+			];
+			if (options.busy || options.compact) {
+				const result = await push(
+					id,
+					text,
+					opts.images,
+					opts.locale,
+					opts.replyInUserLanguage,
+					opts.commandText,
+					opts.creator,
+					opts.textFiles,
+					opts.preBashCommand,
+					opts.fileReferences,
+				);
+				if (!result.ok) throw new ValidationError("Message queue is full");
+				return { ...result, buffered: true };
+			}
+			return { buffered: false, userMsg: await send(...args) };
+		},
+		getBufferedMessagesAsync: async () => (options.subagent ? subqueue : queue),
 		narratorRoutes: routes,
 		fileReferenceRoutes: child,
 		requireNarratorAccess: acl,
@@ -231,6 +267,7 @@ function fixture(
 		fileReferenceMessageForDisplay,
 		sendMessageSchema,
 		updateBufferedMessageSchema,
+		bufferQueueModeSchema,
 		editAndRegenerateJsonSchema,
 		editAssistantMessageSchema,
 		updateNarratorDraftSchema,
@@ -255,6 +292,7 @@ function fixture(
 		isSubagentVariant: (variant: string) => variant === "subagent",
 		isLoopRunning: () => !!options.busy,
 		isNarratorRuntimeBusy: () => !!options.busy,
+		isExecutionSuspended: () => false,
 		reconcileRunningStatus: async () => {},
 		awaitCompactCompletion: async () => {},
 		requestBufferedMessageSoftStop: () => {},
@@ -285,6 +323,7 @@ function fixture(
 		subagentQueue: {
 			bufferSubagentUserMessage: pushSub,
 			getSubagentBufferedMessages: () => subqueue,
+			getSubagentBufferedMessagesAsync: async () => subqueue,
 			isTakenOver: () => true,
 			updateSubagentBufferedMessage: updateSub,
 		},
@@ -346,14 +385,17 @@ function fixture(
 		),
 	);
 	app.route("/api/narrators", routes);
-	const request = (path: string, body: unknown, method = "POST", signal?: AbortSignal) =>
-		app.request(`/api/narrators/session/${path}`, {
+	const request = async (path: string, body: unknown, method = "POST", signal?: AbortSignal) => {
+		const response = await app.request(`/api/narrators/session/${path}`, {
 			method,
 			signal,
 			...(body instanceof FormData
 				? { body }
 				: { body: JSON.stringify(body), headers: { "content-type": "application/json" } }),
 		});
+		if (response.status === 500) throw new Error(await response.text());
+		return response;
+	};
 	return {
 		app,
 		request,
@@ -626,13 +668,16 @@ describe("file reference edits", () => {
 		false,
 		true,
 	])("queue edit uses actual snapshots and permits reference-only text (subagent=%s)", async (subagent) => {
-		const f = fixture();
+		const f = fixture({ subagent });
 		const queue = subagent ? f.subqueue : f.queue;
 		queue.push({ id: "queued", text: "old", fileReferences: [snapshot()] });
 		f.state.captureError = new ValidationError("offline");
-		expect(
-			(await f.request("buffer/queued", { text: "", fileReferences: [reference] }, "PATCH")).status,
-		).toBe(200);
+		const response = await f.request(
+			"buffer/queued",
+			{ text: "", fileReferences: [reference] },
+			"PATCH",
+		);
+		expect(response.status, await response.text()).toBe(200);
 		expect(queue[0].fileReferences).toEqual([snapshot()]);
 		expect(f.captures).toHaveLength(0);
 		expect((await f.request("buffer/queued", { text: "new wording" }, "PATCH")).status).toBe(200);

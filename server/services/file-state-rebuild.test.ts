@@ -2461,6 +2461,39 @@ describe("device-aware file state rebuild", () => {
 });
 
 describe("device-aware snapshot revert", () => {
+	test("external conflict skips only that file and reverts the other known file", async () => {
+		const cwd = mkdtempSync(join(tmpdir(), "nf-partial-revert-"));
+		tempDirs.push(cwd);
+		const narratorId = await createNarrator(cwd);
+		const a = join(cwd, "a.txt");
+		const b = join(cwd, "b.txt");
+		await ensureFileSnapshot(narratorId, "local", a, async () => "old a");
+		await ensureFileSnapshot(narratorId, "local", b, async () => "old b");
+		const first = await addToolCall(
+			narratorId,
+			1,
+			{ file_path: a, content: "known a" },
+			{ deviceId: "local", filePath: a },
+		);
+		const second = await addToolCall(
+			narratorId,
+			2,
+			{ file_path: b, content: "known b" },
+			{ deviceId: "local", filePath: b },
+		);
+		writeFileSync(a, "external a");
+		writeFileSync(b, "known b");
+		const result = await revertPatchForToolUses(narratorId, [first, second]);
+		try {
+			expect(readFileSync(a, "utf8")).toBe("external a");
+			expect(readFileSync(b, "utf8")).toBe("old b");
+			expect(result.coverage?.restoredFiles).toEqual([b]);
+			expect(result.coverage?.conflicts).toEqual([{ path: a, reason: "current_state_mismatch" }]);
+			expect(result.coverage?.unknownCoverage).toEqual([]);
+		} finally {
+			finalizeSnapshotRevert(result);
+		}
+	});
 	for (const pathFlavor of ["posix", undefined] as const) {
 		test.skipIf(process.platform === "win32")(
 			`internal first-Write revert preserves a POSIX literal backslash baseline (flavor=${pathFlavor})`,
@@ -2490,14 +2523,27 @@ describe("device-aware snapshot revert", () => {
 					{ deviceId: "local", filePath, pathFlavor },
 				);
 				writeFileSync(filePath, "first Write\r\n");
+				expect(
+					[
+						...(
+							await rebuildDeviceFileStatesExcluding(
+								narratorId,
+								[{ deviceId: "local", filePath, pathFlavor }],
+								new Set(),
+							)
+						).values(),
+					][0]?.content,
+				).toBe("first Write\r\n");
 
 				// This calls the internal compatibility helper, not a user-route replay
 				// fallback. Text-only history remains legacy_unverified under M0.
 				const result = await revertPatchForToolUse(narratorId, toolUseId);
 				try {
-					expect(result).toMatchObject({ reverted: true, fileCount: 1, failures: [] });
+					expect(result).toMatchObject({ reverted: false, fileCount: 0, failures: [] });
+					expect(result.coverage?.conflicts[0]).toMatchObject({ path: filePath });
+					expect(result.coverage?.conflicts[0]?.reason).toBe("path_semantics_uncertain");
 					expect(existsSync(filePath)).toBe(true);
-					expect(readFileSync(filePath, "utf8")).toBe(original);
+					expect(readFileSync(filePath, "utf8")).toBe("first Write\r\n");
 					expect(readFileSync(differentPath, "utf8")).toBe("different file must remain untouched");
 				} finally {
 					finalizeSnapshotRevert(result);
@@ -3233,7 +3279,9 @@ describe("replay divergence is never silently absorbed", () => {
 		// leave the file alone instead.
 		const result = await revertPatchForToolUses(narratorId, [firstToolUseId]);
 		expect(result.reverted).toBe(false);
-		expect(result.failures[0]).toMatchObject({ code: "REPLAY_DIVERGED", filePath });
+		expect(result.failures).toEqual([]);
+		expect(result.coverage?.conflicts[0]).toMatchObject({ path: filePath });
+		expect(result.coverage?.conflicts[0]?.reason).toContain("no longer applies");
 		expect(readFileSync(filePath, "utf8")).toBe("second\n");
 	});
 

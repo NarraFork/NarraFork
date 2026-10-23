@@ -450,6 +450,59 @@ export const workspaceSwitchRequests = pgTable(
 	(table) => [
 		uniqueIndex("uq_workspace_switch_request").on(table.narratorId, table.requestId),
 		index("idx_workspace_switch_request_created").on(table.createdAt),
+		index("idx_workspace_switch_request_install").on(
+			table.narratorId,
+			table.installState,
+			table.expectedRevision,
+		),
+	],
+);
+
+export const narratorDeviceWorkspaces = pgTable(
+	"narrator_device_workspaces",
+	{
+		id: text("id").primaryKey().notNull(),
+		narratorId: text("narrator_id")
+			.notNull()
+			.references((): PgColumn => narrators.id, { onDelete: "cascade" }),
+		deviceId: text("device_id").notNull(),
+		bindingRevision: integer("binding_revision").notNull(),
+		cwd: text("cwd").notNull(),
+		pathFlavor: text("path_flavor").notNull(),
+		workspaceContext: jsonText("workspace_context").notNull(),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [uniqueIndex("uq_narrator_device_workspace").on(table.narratorId, table.deviceId)],
+);
+
+export const narratorDeviceWorkspaceRequests = pgTable(
+	"narrator_device_workspace_requests",
+	{
+		id: text("id").primaryKey().notNull(),
+		narratorId: text("narrator_id")
+			.notNull()
+			.references((): PgColumn => narrators.id, { onDelete: "cascade" }),
+		requestId: text("request_id").notNull(),
+		actorUserId: text("actor_user_id"),
+		kind: text("kind").notNull(),
+		deviceId: text("device_id").notNull(),
+		requestDigest: text("request_digest").notNull(),
+		expectedBindingRevision: integer("expected_binding_revision").notNull(),
+		expectedSelectionRevision: integer("expected_selection_revision"),
+		result: jsonText("result_json").notNull(),
+		installState: text("install_state").notNull().default("pending"),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("uq_narrator_device_workspace_request").on(table.narratorId, table.requestId),
+		index("idx_narrator_device_workspace_request_created").on(table.createdAt),
+		index("idx_narrator_device_workspace_request_install").on(
+			table.narratorId,
+			table.installState,
+			table.expectedSelectionRevision,
+		),
 	],
 );
 
@@ -2416,6 +2469,39 @@ export const fileChangeScopes = pgTable(
 	],
 );
 
+export const workspaceWriteActivities = pgTable(
+	"workspace_write_activities",
+	{
+		id: text("id").primaryKey().notNull(),
+		scopeId: text("scope_id").notNull(),
+		sourceInstanceId: text("source_instance_id").notNull(),
+		workspaceInstanceId: text("workspace_instance_id").notNull(),
+		narratorId: text("narrator_id"),
+		userId: text("user_id").notNull(),
+		projectId: text("project_id"),
+		deviceId: text("device_id").notNull(),
+		bindingId: text("binding_id").notNull(),
+		bindingRevision: integer("binding_revision").notNull(),
+		contextKey: text("context_key").notNull(),
+		canonicalRoot: text("canonical_root").notNull(),
+		pathFlavor: text("path_flavor").notNull(),
+		rootEvidenceDigest: text("root_evidence_digest").notNull(),
+		ownerEpoch: text("owner_epoch").notNull(),
+		kind: text("kind").notNull(),
+		operationId: text("operation_id").notNull(),
+		attempt: integer("attempt").notNull(),
+		status: text("status").notNull(),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+		finishedAt: text("finished_at"),
+	},
+	(table) => [
+		index("idx_workspace_activity_status_id").on(table.status, table.id),
+		index("idx_workspace_activity_scope_status").on(table.scopeId, table.status),
+		index("idx_workspace_activity_device_status").on(table.deviceId, table.status, table.id),
+	],
+);
+
 export const remoteHistoryObjects = pgTable(
 	"remote_history_objects",
 	{
@@ -3855,8 +3941,8 @@ export const notifications = pgTable(
 );
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
-  "tableCount": 120,
-  "columnCount": 1740,
+  "tableCount": 123,
+  "columnCount": 1784,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -6716,6 +6802,289 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "name": "idx_workspace_switch_request_created",
           "columns": [
             "createdAt"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_workspace_switch_request_install",
+          "columns": [
+            "narratorId",
+            "installState",
+            "expectedRevision"
+          ],
+          "unique": false
+        }
+      ],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "narratorDeviceWorkspaces",
+      "name": "narrator_device_workspaces",
+      "columns": [
+        {
+          "property": "id",
+          "name": "id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "narratorId",
+          "name": "narrator_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "narrators",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "narrator_device_workspaces_narrator_id_narrators_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "deviceId",
+          "name": "device_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "bindingRevision",
+          "name": "binding_revision",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "cwd",
+          "name": "cwd",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "pathFlavor",
+          "name": "path_flavor",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "workspaceContext",
+          "name": "workspace_context",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "updatedAt",
+          "name": "updated_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "uq_narrator_device_workspace",
+          "columns": [
+            "narratorId",
+            "deviceId"
+          ],
+          "unique": true
+        }
+      ],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "narratorDeviceWorkspaceRequests",
+      "name": "narrator_device_workspace_requests",
+      "columns": [
+        {
+          "property": "id",
+          "name": "id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "narratorId",
+          "name": "narrator_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "narrators",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "narrator_device_workspace_requests_narrator_id_narrators_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "requestId",
+          "name": "request_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "actorUserId",
+          "name": "actor_user_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "kind",
+          "name": "kind",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "deviceId",
+          "name": "device_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "requestDigest",
+          "name": "request_digest",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "expectedBindingRevision",
+          "name": "expected_binding_revision",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "expectedSelectionRevision",
+          "name": "expected_selection_revision",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "result",
+          "name": "result_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "installState",
+          "name": "install_state",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "\"pending\"",
+          "defaultExpression": "\"pending\""
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "updatedAt",
+          "name": "updated_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "uq_narrator_device_workspace_request",
+          "columns": [
+            "narratorId",
+            "requestId"
+          ],
+          "unique": true
+        },
+        {
+          "name": "idx_narrator_device_workspace_request_created",
+          "columns": [
+            "createdAt"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_narrator_device_workspace_request_install",
+          "columns": [
+            "narratorId",
+            "installState",
+            "expectedSelectionRevision"
           ],
           "unique": false
         }
@@ -18468,6 +18837,242 @@ export const POSTGRES_SCHEMA_COVERAGE = {
             "deviceId",
             "activeLeaseId",
             "canonicalRoot"
+          ],
+          "unique": false
+        }
+      ],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "workspaceWriteActivities",
+      "name": "workspace_write_activities",
+      "columns": [
+        {
+          "property": "id",
+          "name": "id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "scopeId",
+          "name": "scope_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "sourceInstanceId",
+          "name": "source_instance_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "workspaceInstanceId",
+          "name": "workspace_instance_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "narratorId",
+          "name": "narrator_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "userId",
+          "name": "user_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "projectId",
+          "name": "project_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "deviceId",
+          "name": "device_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "bindingId",
+          "name": "binding_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "bindingRevision",
+          "name": "binding_revision",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "contextKey",
+          "name": "context_key",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "canonicalRoot",
+          "name": "canonical_root",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "pathFlavor",
+          "name": "path_flavor",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "rootEvidenceDigest",
+          "name": "root_evidence_digest",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "ownerEpoch",
+          "name": "owner_epoch",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "kind",
+          "name": "kind",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "operationId",
+          "name": "operation_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "attempt",
+          "name": "attempt",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "status",
+          "name": "status",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "updatedAt",
+          "name": "updated_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "finishedAt",
+          "name": "finished_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_workspace_activity_status_id",
+          "columns": [
+            "status",
+            "id"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_workspace_activity_scope_status",
+          "columns": [
+            "scopeId",
+            "status"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_workspace_activity_device_status",
+          "columns": [
+            "deviceId",
+            "status",
+            "id"
           ],
           "unique": false
         }

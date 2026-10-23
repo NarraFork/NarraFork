@@ -292,6 +292,7 @@ export function renderElement(
 					hasHeader={extra.hasHeader as boolean | undefined}
 					isSelf={extra.isSelf as boolean | undefined}
 					narratorId={extra.narratorId as string | undefined}
+					messageId={extra.messageId as string | undefined}
 					onUnknownHeight={extra.onUnknownHeight as ((h: number) => void) | undefined}
 					onToggle={extra.onToggle as (() => void) | undefined}
 					onOpenAttachment={extra.onOpenAttachment as ((filePath: string) => void) | undefined}

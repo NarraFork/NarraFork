@@ -19,6 +19,8 @@ export const terminalsApi = {
 		deviceId?: string;
 		expectedRevision?: number;
 		contextKey?: string;
+		expectedBindingRevision?: number;
+		bindingId?: string;
 	}) => request<ApiEntity>("/terminals", { method: "POST", body: JSON.stringify(data) }),
 	getTerminal: (id: string) => request<ApiEntity>(`/terminals/${id}`),
 	getTerminalProcesses: (id: string) =>

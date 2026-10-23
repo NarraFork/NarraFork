@@ -1056,7 +1056,7 @@ export class RevertSelectionService {
 				);
 				if (
 					!actualScope ||
-					actualScope.status !== "active" ||
+					(actualScope.status !== "active" && actualScope.status !== "needs_verification") ||
 					JSON.stringify(
 						Object.entries(createFileChangeIdentity(actualScope, effect.identity)).sort(),
 					) !== JSON.stringify(Object.entries(effect.identity).sort())

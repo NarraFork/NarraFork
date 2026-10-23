@@ -1,3 +1,4 @@
+import type { PartialRevertResult } from "@shared/partial-revert";
 import { ApiError, request } from "./client";
 
 /** Catalogue metadata only. Candidate does not mean an authorized/fresh restore plan. */
@@ -32,7 +33,9 @@ export interface WorkspaceSnapshotRestoreConfirmation {
 	treeDigest: string;
 }
 export interface WorkspaceSnapshotRestorePreview {
+	coverage?: PartialRevertResult;
 	plan: {
+		coverage?: PartialRevertResult;
 		id: string;
 		status: string;
 		planHash: string | null;
@@ -64,6 +67,7 @@ export interface WorkspaceSnapshotRestoreRequest {
 	confirmation: WorkspaceSnapshotRestoreConfirmation;
 }
 export interface WorkspaceSnapshotRestoreResult {
+	coverage?: PartialRevertResult;
 	planId: string;
 	status: "committed" | "compensated" | "recovery_required";
 	reason?: string;

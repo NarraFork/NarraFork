@@ -6,7 +6,28 @@
  * advisory appears in the rollback dialog, the delete-preview tab, and a toast, and
  * three copies of the phrasing would drift.
  */
+import type { PartialRevertResult } from "@shared/partial-revert";
 import type { RevertWarning } from "./api/narrators";
+
+/** Render known outcomes separately; unknown ranges are never described as restored. */
+export function formatPartialRevert(t: Translate, coverage?: PartialRevertResult): string | null {
+	if (!coverage) return null;
+	const sections = [
+		t("partialRevert.restored", { count: coverage.restoredFiles.length }),
+		t("partialRevert.conflicts", { count: coverage.conflicts.length }),
+		...coverage.conflicts.slice(0, 100).map(({ path, reason }) => `${path}: ${reason}`),
+		t("partialRevert.unknown", { count: coverage.unknownCoverage.length }),
+		...coverage.unknownCoverage
+			.slice(0, 100)
+			.map(
+				(range) =>
+					`${[range.deviceId, range.root, range.activityId, range.operationId, range.toolCallId].filter(Boolean).join(" / ")}: ${range.reason}`,
+			),
+	];
+	if (coverage.conflicts.length > 100 || coverage.unknownCoverage.length > 100)
+		sections.push(t("partialRevert.truncated"));
+	return sections.join("\n");
+}
 
 type Translate = (key: string, options?: Record<string, unknown>) => string;
 

@@ -25,7 +25,15 @@ import { knowledgeWriteStore } from "./knowledge/store";
 import type { Principal } from "./knowledge-acl";
 import { knowledgeAcl } from "./knowledge-acl";
 import { knowledgePackService, type Pack } from "./knowledge-pack-service";
+import { resolveProjectIdForNarratorId } from "./narrator-project";
 import { resolveOAuthNarratorRuntimePolicy } from "./oauth-narrator-runtime-policy";
+
+type PackMaterializationBinding = NonNullable<
+	import("./knowledge/write-store").RecordPackActivationWrite["targetBindingJson"]
+> & {
+	/** Missing on old records: unknown provenance is never inferred during cleanup. */
+	originalProjectId?: string | null;
+};
 
 /** Hard timeout for an extraction subprocess. */
 const EXTRACT_TIMEOUT_MS = 60_000;
@@ -282,7 +290,12 @@ async function materialize(
 	packId: string,
 	principal: Principal,
 ): Promise<ActivationResult> {
-	if (!ctx.userId || !ctx.workspaceContext || !/^[A-Za-z0-9_-]{1,128}$/.test(packId))
+	if (
+		!ctx.userId ||
+		!ctx.workspaceContext ||
+		!ctx.recheckAuthorization ||
+		!/^[A-Za-z0-9_-]{1,128}$/.test(packId)
+	)
 		throw new ValidationError(
 			"Pack materialization needs its actual actor, frozen workspace and opaque id",
 		);
@@ -291,7 +304,22 @@ async function materialize(
 	const { createWorkspaceAttachmentFromStagedFile } = await import(
 		"../lib/workspace-attachment-io"
 	);
-	const access = createApprovedWorkspaceArtifactAccess(ctx);
+	const recheckAuthorization = ctx.recheckAuthorization;
+	await recheckAuthorization();
+	const originalProjectId = await resolveProjectIdForNarratorId(ctx.narratorId);
+	if (
+		ctx.workspaceContext.contextProjectId !== undefined &&
+		ctx.workspaceContext.contextProjectId !== originalProjectId
+	)
+		throw new ValidationError("Pack original project does not match its frozen workspace");
+	const access = createApprovedWorkspaceArtifactAccess({
+		...ctx,
+		recheckAuthorization: async () => {
+			await recheckAuthorization();
+			if ((await resolveProjectIdForNarratorId(ctx.narratorId)) !== originalProjectId)
+				throw new ValidationError("Pack original project changed during activation");
+		},
+	});
 	const workspace = Object.freeze({ ...ctx.workspaceContext });
 	const backend = access.backend;
 	const generation = backend.runtimeGeneration;
@@ -320,6 +348,7 @@ async function materialize(
 	const makeBinding = (state: "complete" | "partial", retainedFiles = files) => ({
 		version: 1 as const,
 		materializationState: state,
+		originalProjectId,
 		workspace,
 		extractDir: root.canonicalPath,
 		runtimeGeneration: generation,
@@ -588,15 +617,15 @@ async function releaseActivation(
 			.limit(1);
 		const binding =
 			typeof raw[0]?.binding === "string"
-				? (JSON.parse(raw[0].binding) as NonNullable<
-						import("./knowledge/write-store").RecordPackActivationWrite["targetBindingJson"]
-					>)
+				? (JSON.parse(raw[0].binding) as PackMaterializationBinding)
 				: null;
 		const { isWorkspaceAttachmentProof, cleanupWorkspaceAttachmentByProof } = await import(
 			"../lib/workspace-attachment-io"
 		);
 		if (
 			!binding ||
+			!Object.hasOwn(binding, "originalProjectId") ||
+			(binding.originalProjectId !== null && typeof binding.originalProjectId !== "string") ||
 			binding.actorUserId !== ctx.userId ||
 			binding.extractDir !== extractDir ||
 			binding.files.length > 1000 ||
@@ -605,28 +634,26 @@ async function releaseActivation(
 			throw new ValidationError("Pack cleanup proof/original creator is unavailable; retained");
 		const { createNarratorWorkspaceAttachmentAccess } = await import("./workspace-artifact-access");
 		const { withWorkspaceAttachmentTarget } = await import("./workspace-attachment-runtime");
-		const access = createNarratorWorkspaceAttachmentAccess(ctx.narratorId, binding.workspace, {
-			userId: ctx.userId,
-			signal: ctx.signal,
-			authorizationGuard: ctx.recheckAuthorization,
-		});
-		if (access.backend.runtimeGeneration !== binding.runtimeGeneration)
+		const { resolveBackend } = await import("../lib/agent/execution/registry");
+		const backend = resolveBackend({ requested: binding.workspace.deviceId });
+		if (backend.runtimeGeneration !== binding.runtimeGeneration)
 			throw new ValidationError(
 				"Pack source generation changed; retained without borrowing current cwd",
 			);
 		for (const file of binding.files) {
-			const canonicalPath = access.backend.paths.resolve(
-				file.receipt.binding.root,
-				file.receipt.path,
-			);
+			const canonicalPath = backend.paths.resolve(file.receipt.binding.root, file.receipt.path);
 			if (
-				!access.backend.paths.contains(extractDir, canonicalPath) ||
-				!access.backend.paths.equals(
-					canonicalPath,
-					access.backend.paths.resolve(extractDir, file.relativePath),
-				)
+				!backend.paths.contains(extractDir, canonicalPath) ||
+				!backend.paths.equals(canonicalPath, backend.paths.resolve(extractDir, file.relativePath))
 			)
 				throw new ValidationError("Pack proof path does not match original installation");
+			const access = createNarratorWorkspaceAttachmentAccess(ctx.narratorId, binding.workspace, {
+				userId: ctx.userId,
+				signal: ctx.signal,
+				originalFilePath: canonicalPath,
+				originalProjectId: binding.originalProjectId,
+				authorizationGuard: ctx.recheckAuthorization,
+			});
 			const operationId = `pack_cleanup_${generateId()}`;
 			const result = await withWorkspaceAttachmentTarget({
 				narratorId: ctx.narratorId,

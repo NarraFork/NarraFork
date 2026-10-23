@@ -727,6 +727,12 @@ import { isTextFile, MAX_TEXT_FILE_SIZE } from "@shared/text-file-types";
 
 export { MAX_TEXT_FILE_SIZE };
 
+export interface WorkspaceArtifactOrigin {
+	version: 1;
+	/** Explicit null is a server-confirmed standalone origin, never an unknown project. */
+	projectId: string | null;
+}
+
 export interface TextFileRef {
 	filename: string;
 	/** Absolute path on deviceId; legacy records without a deviceId refer to the host. */
@@ -738,6 +744,7 @@ export interface TextFileRef {
 	attachmentId?: string;
 	/** Persisted original binding; read authority is always revalidated, never taken from capabilities. */
 	attachmentWorkspace?: WorkspaceContext;
+	attachmentOrigin?: WorkspaceArtifactOrigin;
 	sourceNarratorId?: string;
 	attachmentUnavailableReason?: string;
 	/** Missing a creation receipt is not proof of ownership, even for a random path. */
@@ -748,6 +755,7 @@ export interface TextFileRef {
 
 /** Runtime callers supply the full actor/project/device/OAuth/write-policy intersection. */
 export interface WorkspaceAttachmentAccess {
+	readonly artifactOrigin?: WorkspaceArtifactOrigin;
 	backend: ExecutionBackend;
 	workspaceContext: WorkspaceContext;
 	signal?: AbortSignal;

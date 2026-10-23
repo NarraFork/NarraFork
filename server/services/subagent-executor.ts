@@ -120,6 +120,7 @@ export interface SubagentBufferedMessage {
 	text: string;
 	images?: ImageRef[];
 	textFiles?: File[];
+	attachmentWorkspace?: WorkspaceContext | null;
 	fileReferences?: FileReferenceSnapshot[];
 	commandText?: string | null;
 	createdBy?: string | null;
@@ -853,21 +854,22 @@ export function createSubagentWorkspaceAttachmentAccess(
 
 async function saveBufferedTextFiles(
 	narratorId: string,
-	cwd: string,
+	workspace: WorkspaceContext | null | undefined,
 	files?: File[],
 	userId?: string | null,
 ): Promise<TextFileRef[]> {
-	const saved: TextFileRef[] = [];
-	if (!files?.length) return saved;
+	if (!files?.length) return [];
 	const active = activeNarrators.get(narratorId);
-	const workspace =
-		active?._workspaceContext ?? (await workspaceContextService.get(narratorId, { userId }));
-	const access = createSubagentWorkspaceAttachmentAccess(narratorId, workspace, {
+	const { prepareNarratorTextAttachmentAccess } = await import("./narrator-text-attachments");
+	const access = await prepareNarratorTextAttachmentAccess(narratorId, {
+		workspaceContext: workspace ?? undefined,
+		requireWorkspaceSource: true,
 		userId,
 		signal: active?.abortController.signal,
 	});
+	const saved: TextFileRef[] = [];
 	for (const file of files) {
-		saved.push(await saveTextFileToWorktree(workspace.cwd || cwd, file, access));
+		saved.push(await saveTextFileToWorktree(access.workspaceContext.cwd, file, access));
 	}
 	return saved;
 }
@@ -918,7 +920,7 @@ async function persistNextBufferedSubagentMessageAdmitted(opts: {
 	try {
 		const textFiles = await saveBufferedTextFiles(
 			narratorId,
-			opts.cwd,
+			buffered.attachmentWorkspace,
 			buffered.textFiles,
 			row.kind === "user_input"
 				? (buffered.createdBy ?? null)

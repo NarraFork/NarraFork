@@ -102,6 +102,24 @@ function makeConfig(permissionHandler: AgentConfig["permissionHandler"]): AgentC
 		model: "codex:gpt-5.5",
 		provider: "codex",
 		cwd: "/tmp",
+		// Explicit narrator-owned fixture directories; these are not backend defaults.
+		resolveDeviceWorkspace: async (deviceId) => {
+			const cwd = new Map([
+				["local", "/tmp"],
+				["device-remote", "/remote/work"],
+				["device-secondary", "/secondary/work"],
+			]).get(deviceId);
+			return cwd
+				? {
+						deviceId,
+						cwd,
+						revision: 0,
+						contextKey: `narrator-self:${deviceId}`,
+						pathFlavor: "posix",
+						capabilities: { switchDirectory: true },
+					}
+				: null;
+		},
 		signal: abortController.signal,
 		permissionHandler,
 		requireToolCallBinding: true,
@@ -115,8 +133,9 @@ function makeConfig(permissionHandler: AgentConfig["permissionHandler"]): AgentC
 			}
 		})(),
 		onToolExecutionStarting: async (_toolUseId, binding) => binding,
-		// This unit fixture owns no real narrator/tool rows. Production authorization and
-		// no-dispatch CAS are tested against real rows in file-change-runtime.test.ts.
+		// This unit fixture owns no real narrator/tool/device rows. Production actor/device
+		// authorization and final fences are exercised in tool-final-start-authorization.test.ts.
+		assertEndpointAuthorized: async () => ({ assertStillCurrent() {} }),
 		onToolExecutionFinalAuthorization: async () => ({ assertStillCurrent() {} }),
 		recordToolNoDispatch: async () => {},
 	};

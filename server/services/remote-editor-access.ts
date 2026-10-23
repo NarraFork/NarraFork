@@ -9,6 +9,7 @@ import {
 	EditorDocumentError,
 } from "./editor-document-service";
 import {
+	assertNarratorOriginalWorkspaceAuthority,
 	createNarratorWorkspaceAttachmentAccess,
 	createNarratorWorkspaceAttachmentSourceAccess,
 } from "./workspace-artifact-access";
@@ -19,12 +20,33 @@ export async function authorizeRemoteEditorBinding(
 	workspaceContext: WorkspaceContext,
 	input: CreateEditorDocumentInput,
 	need: "read" | "write",
-	options: { signal: AbortSignal; authorizationGuard: (need: "read" | "write") => Promise<void> },
+	options: {
+		signal: AbortSignal;
+		authorizationGuard: (need: "read" | "write") => Promise<void>;
+		original?: Readonly<EditorBinding>;
+		originalProjectId?: string | null;
+		assertStillCurrent?: () => void;
+	},
 ): Promise<EditorBinding> {
-	const workspace = Object.freeze({ ...workspaceContext });
+	const workspace = Object.freeze(structuredClone(workspaceContext));
 	const signal = options.signal;
 	const backend = resolveBackend({ requested: workspace.deviceId });
 	const generation = backend.runtimeGeneration;
+	if (
+		options.original &&
+		(options.original.runtimeGeneration !== generation ||
+			options.original.cwd !== workspace.cwd ||
+			options.original.contextKey !== workspace.contextKey ||
+			options.original.projectId !==
+				(options.originalProjectId !== undefined
+					? options.originalProjectId
+					: workspace.contextProjectId))
+	)
+		throw new EditorDocumentError(
+			"EDITOR_IDENTITY_CHANGED",
+			"Original editor endpoint provenance changed",
+			403,
+		);
 	if (
 		backend.kind !== "remote" ||
 		(input.deviceId && input.deviceId !== workspace.deviceId) ||
@@ -43,6 +65,16 @@ export async function authorizeRemoteEditorBinding(
 			403,
 		);
 	await options.authorizationGuard(need);
+	const authority = await assertNarratorOriginalWorkspaceAuthority(actor.narratorId, workspace, {
+		userId: actor.userId,
+		signal,
+		need,
+		...(options.originalProjectId !== undefined
+			? { originalProjectId: options.originalProjectId }
+			: {}),
+	});
+	authority.assertStillCurrent();
+	options.assertStillCurrent?.();
 	const path = await backend.resolvePathIdentity(lexicalPath, { signal, timeoutMs: 5_000 });
 	if (
 		path.runtimeGeneration !== generation ||
@@ -54,6 +86,8 @@ export async function authorizeRemoteEditorBinding(
 			"Remote editor symlink or canonical identity changed",
 			403,
 		);
+	authority.assertStillCurrent();
+	options.assertStillCurrent?.();
 	const stat = await backend.statFile(path.canonicalPath, { signal, timeoutMs: 5_000 });
 	if (stat && !stat.isFile)
 		throw new EditorDocumentError(
@@ -68,6 +102,9 @@ export async function authorizeRemoteEditorBinding(
 		{
 			userId: actor.userId,
 			signal,
+			...(options.originalProjectId !== undefined
+				? { originalProjectId: options.originalProjectId }
+				: {}),
 			authorizationGuard: () => options.authorizationGuard("read"),
 		},
 	);
@@ -75,6 +112,10 @@ export async function authorizeRemoteEditorBinding(
 	const writeAccess = createNarratorWorkspaceAttachmentAccess(actor.narratorId, workspace, {
 		userId: actor.userId,
 		signal,
+		originalFilePath: options.original ? path.canonicalPath : undefined,
+		...(options.originalProjectId !== undefined
+			? { originalProjectId: options.originalProjectId }
+			: {}),
 		authorizationGuard: () => options.authorizationGuard("write"),
 	});
 	let editable = true;
@@ -89,7 +130,10 @@ export async function authorizeRemoteEditorBinding(
 	const binding: EditorBinding = {
 		deviceId: workspace.deviceId,
 		cwd: workspace.cwd,
-		projectId: workspace.contextProjectId ?? null,
+		projectId:
+			options.originalProjectId !== undefined
+				? options.originalProjectId
+				: (workspace.contextProjectId ?? null),
 		lexicalPath,
 		canonicalPath: path.canonicalPath,
 		outsideRoots: false,
@@ -99,6 +143,8 @@ export async function authorizeRemoteEditorBinding(
 		canonicalIdentity: path.canonicalPath,
 		editable,
 		readOnlyReason,
+		workspaceContext: workspace,
+		rootIdentity: options.original?.rootIdentity,
 	};
 	if (!backend.supportsRemoteHistory || !backend.remoteHistory)
 		throw new EditorDocumentError(
@@ -106,12 +152,20 @@ export async function authorizeRemoteEditorBinding(
 			"Executor upgrade required: history.v1 for journaled human editing",
 			422,
 		);
+	authority.assertStillCurrent();
+	options.assertStillCurrent?.();
 	const root = await resolveRemoteEditorRoot(actor, binding, signal);
 	if (!root.rootIdentity || !Number.isSafeInteger(root.maxWriteBytes) || root.maxWriteBytes <= 0)
 		throw new EditorDocumentError(
 			"EDITOR_REMOTE_UNSUPPORTED",
 			"Remote editor capability is not backed by a valid history endpoint",
 			422,
+		);
+	if (options.original?.rootIdentity && options.original.rootIdentity !== root.rootIdentity)
+		throw new EditorDocumentError(
+			"EDITOR_IDENTITY_CHANGED",
+			"Original editor root identity changed",
+			403,
 		);
 	binding.rootIdentity = root.rootIdentity;
 	if (stat && stat.size > root.maxWriteBytes) {
@@ -133,5 +187,7 @@ export async function authorizeRemoteEditorBinding(
 			"Remote editor endpoint changed during authorization",
 			403,
 		);
+	authority.assertStillCurrent();
+	options.assertStillCurrent?.();
 	return Object.freeze(binding);
 }

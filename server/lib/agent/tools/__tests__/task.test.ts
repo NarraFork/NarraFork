@@ -89,6 +89,14 @@ describe("Agent task tool", () => {
 		const ctx: ToolContext = {
 			narratorId: "parent-narrator",
 			cwd: "/worktree",
+			workspaceContext: {
+				deviceId: "local",
+				cwd: "/worktree",
+				pathFlavor: "posix",
+				revision: 0,
+				contextKey: "parent-narrator:worktree",
+				capabilities: { switchDirectory: true },
+			},
 			signal: new AbortController().signal,
 			locale: "en",
 			currentToolUseId: "agent-tool-use",
@@ -125,6 +133,14 @@ describe("Agent task tool", () => {
 		const ctx: ToolContext = {
 			narratorId: "parent-narrator",
 			cwd: "/worktree",
+			workspaceContext: {
+				deviceId: "local",
+				cwd: "/worktree",
+				pathFlavor: "posix",
+				revision: 0,
+				contextKey: "parent-narrator:worktree",
+				capabilities: { switchDirectory: true },
+			},
 			signal: new AbortController().signal,
 			locale: "en",
 			currentToolUseId: "agent-tool-use-2",
@@ -220,6 +236,14 @@ describe("Agent task tool", () => {
 		const ctx: ToolContext = {
 			narratorId: "parent-narrator",
 			cwd: "/worktree",
+			workspaceContext: {
+				deviceId: "local",
+				cwd: "/worktree",
+				pathFlavor: "posix",
+				revision: 0,
+				contextKey: "parent-narrator:worktree",
+				capabilities: { switchDirectory: true },
+			},
 			signal: new AbortController().signal,
 			locale: "en",
 			currentToolUseId: "agent-tool-use-3",
@@ -403,6 +427,14 @@ describe("Agent archive / unarchive commands", () => {
 		return {
 			narratorId,
 			cwd: "/worktree",
+			workspaceContext: {
+				deviceId: "local",
+				cwd: "/worktree",
+				pathFlavor: "posix",
+				revision: 0,
+				contextKey: "parent-narrator:worktree",
+				capabilities: { switchDirectory: true },
+			},
 			signal: new AbortController().signal,
 			locale: "en",
 			requestPermission: async () => ({ behavior: "allow" as const }),

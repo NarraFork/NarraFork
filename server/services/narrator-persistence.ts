@@ -220,6 +220,19 @@ function normalizeExecutionTarget(target: ToolExecutionTarget): ToolExecutionTar
 		deviceId: target.deviceId,
 		backendKind: target.backendKind,
 		cwd: target.cwd,
+		...(target.baseCwd !== undefined && { baseCwd: target.baseCwd }),
+		...(target.workspaceContext !== undefined && {
+			workspaceContext: structuredClone(target.workspaceContext),
+		}),
+		...(target.workspaceBinding !== undefined && {
+			workspaceBinding: structuredClone(target.workspaceBinding),
+		}),
+		...(target.nativeDescriptor !== undefined && {
+			nativeDescriptor: structuredClone(target.nativeDescriptor),
+		}),
+		...(target.nativeRootDescriptor !== undefined && {
+			nativeRootDescriptor: structuredClone(target.nativeRootDescriptor),
+		}),
 		...(target.pathFlavor !== undefined && { pathFlavor: target.pathFlavor }),
 		...(lexicalPath !== undefined && { lexicalPath, resolvedFilePath: lexicalPath }),
 		...(target.canonicalPath !== undefined && { canonicalPath: target.canonicalPath }),
@@ -338,6 +351,50 @@ function normalizeExecutionPlan(plan: ToolExecutionPlan): ToolExecutionPlan {
 	};
 }
 
+/** Restore every stored endpoint; malformed plans cannot degrade to a primary-only retry. */
+export function reconstructToolExecutionPlan(
+	row: ExecutionTargetRow,
+): ToolExecutionPlan | undefined {
+	const stored = row.executionTargetsJson;
+	const plan = parseStoredExecutionPlan(stored);
+	if (!plan) {
+		if (
+			stored &&
+			typeof stored === "object" &&
+			!Array.isArray(stored) &&
+			("kind" in stored || "primaryKey" in stored || "endpoints" in stored)
+		) {
+			throw new ValidationError("Stored execution plan is invalid");
+		}
+		return undefined;
+	}
+	const keys = new Set<string>();
+	const operations = new Set(["read", "write", "search", "execute", "control"]);
+	if (
+		(plan.kind !== "single" && plan.kind !== "multi") ||
+		typeof plan.primaryKey !== "string" ||
+		plan.endpoints.length === 0 ||
+		plan.endpoints.length > 64
+	)
+		throw new ValidationError("Stored execution plan is invalid");
+	for (const endpoint of plan.endpoints) {
+		if (
+			!endpoint ||
+			typeof endpoint.key !== "string" ||
+			!endpoint.key ||
+			keys.has(endpoint.key) ||
+			!operations.has(endpoint.operation) ||
+			!isToolExecutionTarget(endpoint.target)
+		) {
+			throw new ValidationError("Stored execution plan endpoint is invalid");
+		}
+		keys.add(endpoint.key);
+	}
+	if (!keys.has(plan.primaryKey) || (plan.kind === "single" && keys.size !== 1)) {
+		throw new ValidationError("Stored execution plan primary endpoint is invalid");
+	}
+	return normalizeExecutionPlan(plan);
+}
 /** Reconstruct complete target objects while remaining compatible with pre-identity rows. */
 export function reconstructToolExecutionTargets(row: ExecutionTargetRow): ToolExecutionTarget[] {
 	const stored = parseStoredExecutionTargets(row.executionTargetsJson);
@@ -3420,6 +3477,15 @@ const sqliteNarratorPersistence = {
 		const targetChanged =
 			previousTarget !== undefined &&
 			(previousTarget.backendKind !== normalizedTarget.backendKind ||
+				previousTarget.baseCwd !== normalizedTarget.baseCwd ||
+				JSON.stringify(previousTarget.workspaceContext) !==
+					JSON.stringify(normalizedTarget.workspaceContext) ||
+				JSON.stringify(previousTarget.workspaceBinding) !==
+					JSON.stringify(normalizedTarget.workspaceBinding) ||
+				JSON.stringify(previousTarget.nativeDescriptor) !==
+					JSON.stringify(normalizedTarget.nativeDescriptor) ||
+				JSON.stringify(previousTarget.nativeRootDescriptor) !==
+					JSON.stringify(normalizedTarget.nativeRootDescriptor) ||
 				previousTarget.cwd !== normalizedTarget.cwd ||
 				previousTarget.lexicalPath !== normalizedTarget.lexicalPath ||
 				previousTarget.canonicalPath !== normalizedTarget.canonicalPath ||

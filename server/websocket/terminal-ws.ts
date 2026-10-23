@@ -44,6 +44,8 @@ export type TerminalClientMessage =
 			deviceId?: string;
 			expectedRevision?: number;
 			contextKey?: string;
+			expectedBindingRevision?: number;
+			bindingId?: string;
 			name?: string;
 			cols?: number;
 			rows?: number;
@@ -55,6 +57,7 @@ const connections = new Set<TerminalWS>();
 const closedSockets = new WeakSet<TerminalWS>();
 const lastActiveClient = new Map<string, TerminalWS>();
 const intents = new WeakMap<TerminalWS, Map<string, object>>();
+const pendingCreations = new WeakMap<TerminalWS, Set<AbortController>>();
 export const TERMINAL_WS_MAX_SUBSCRIPTIONS = 64;
 export const TERMINAL_WS_QUEUE_MAX_BYTES = 256 * 1024;
 export const TERMINAL_WS_BACKPRESSURE_BYTES = 1024 * 1024;
@@ -151,14 +154,17 @@ async function flush(ws: TerminalWS, queue: OutputQueue): Promise<void> {
 			const token = intents.get(ws)?.get(id);
 			if (!token || !ws.data.subscribedTerminals.has(id)) continue;
 			try {
-				await authorize(ws, id, "read");
+				const ticket = await authorize(ws, id, "read");
 				if (
 					closedSockets.has(ws) ||
 					intents.get(ws)?.get(id) !== token ||
 					!ws.data.subscribedTerminals.has(id)
 				)
 					continue;
-				for (const message of messages) send(ws, message);
+				for (const message of messages) {
+					ticket.assertStillCurrent?.();
+					send(ws, message);
+				}
 			} catch (cause) {
 				removeSubscription(ws, id);
 				error(ws, id, cause);
@@ -217,17 +223,19 @@ async function subscribeToTerminal(ws: TerminalWS, terminalId: string): Promise<
 			!terminalService.isAttached(terminalId) &&
 			(!terminal.deviceId || terminal.deviceId === "local")
 		) {
-			await authorize(ws, terminalId, "write");
+			const ticket = await authorize(ws, terminalId, "write");
 			if (!current()) return;
-			await terminalService.ensureAttached(terminalId);
+			await terminalService.ensureAttached(terminalId, () => ticket.assertStillCurrent?.());
 		}
 		if (!current()) return;
 		const scrollback = await terminalService.getScrollback(terminalId);
-		await authorize(ws, terminalId, "read");
+		const replayTicket = await authorize(ws, terminalId, "read");
 		if (!current()) return;
+		replayTicket.assertStillCurrent?.();
 		ws.data.subscribedTerminals.add(terminalId);
 		if (scrollback) send(ws, { type: "scrollback", terminalId, ...scrollback });
 		const state = terminalService.getBufferState(terminalId);
+		replayTicket.assertStillCurrent?.();
 		if (state) send(ws, { type: "bufferState", terminalId, ...state });
 		const latest = await authorize(ws, terminalId, "read");
 		if (current() && latest.lifecycle)
@@ -285,13 +293,15 @@ export const handleTerminalWS = {
 						msg.terminalId,
 						intents.get(ws)?.get(msg.terminalId),
 					);
-					await authority();
+					const ticket = await authority();
 					if (closedSockets.has(ws) || !ws.data.subscribedTerminals.has(msg.terminalId)) break;
 					if (lastActiveClient.get(msg.terminalId) !== ws) {
 						lastActiveClient.set(msg.terminalId, ws);
 						send(ws, { type: "requestResize", terminalId: msg.terminalId });
 					}
-					terminalService.writeAuthorized(msg.terminalId, msg.data, authority);
+					terminalService.writeAuthorized(msg.terminalId, msg.data, authority, () =>
+						ticket.assertStillCurrent?.(),
+					);
 					break;
 				}
 				case "resize": {
@@ -301,33 +311,51 @@ export const handleTerminalWS = {
 						msg.terminalId,
 						intents.get(ws)?.get(msg.terminalId),
 					);
-					await authority();
+					const ticket = await authority();
 					if (closedSockets.has(ws) || !ws.data.subscribedTerminals.has(msg.terminalId)) break;
 					const active = lastActiveClient.get(msg.terminalId);
 					if (!active || active === ws)
-						terminalService.resizeAuthorized(msg.terminalId, msg.cols, msg.rows, authority);
+						terminalService.resizeAuthorized(msg.terminalId, msg.cols, msg.rows, authority, () =>
+							ticket.assertStillCurrent?.(),
+						);
 					break;
 				}
 				case "create": {
 					const { requestId, ...opts } = msg;
 					const principal = await principalFor(ws);
 					if (opts.chapterId) await assertChapterProjectAccess(opts.chapterId, principal, "write");
-					const terminal = await terminalService.create({ ...opts, principal });
-					send(ws, { type: "created", requestId, terminal });
-					await subscribeToTerminal(ws, terminal.id);
+					if (closedSockets.has(ws)) break;
+					const controller = new AbortController();
+					const pending = pendingCreations.get(ws) ?? new Set<AbortController>();
+					pendingCreations.set(ws, pending);
+					pending.add(controller);
+					try {
+						const terminal = await terminalService.create({
+							...opts,
+							principal,
+							signal: controller.signal,
+						});
+						if (closedSockets.has(ws)) break;
+						send(ws, { type: "created", requestId, terminal });
+						await subscribeToTerminal(ws, terminal.id);
+					} finally {
+						pending.delete(controller);
+					}
 					break;
 				}
 				case "kill": {
-					await authorize(ws, msg.terminalId, "write");
+					const ticket = await authorize(ws, msg.terminalId, "write");
 					if (closedSockets.has(ws)) break;
-					await terminalService.kill(msg.terminalId);
+					await terminalService.kill(msg.terminalId, () => ticket.assertStillCurrent?.());
 					sendToTerminal(msg.terminalId, { type: "killed", terminalId: msg.terminalId });
 					break;
 				}
 				case "rename": {
-					await authorize(ws, msg.terminalId, "write");
+					const ticket = await authorize(ws, msg.terminalId, "write");
 					if (closedSockets.has(ws)) break;
-					await terminalService.rename(msg.terminalId, msg.name);
+					await terminalService.rename(msg.terminalId, msg.name, () =>
+						ticket.assertStillCurrent?.(),
+					);
 					sendToTerminal(msg.terminalId, {
 						type: "renamed",
 						terminalId: msg.terminalId,
@@ -344,6 +372,8 @@ export const handleTerminalWS = {
 	},
 	close(ws: TerminalWS) {
 		closedSockets.add(ws);
+		for (const controller of pendingCreations.get(ws) ?? []) controller.abort();
+		pendingCreations.delete(ws);
 		connections.delete(ws);
 		const queue = queues.get(ws);
 		if (queue?.timer) clearTimeout(queue.timer);

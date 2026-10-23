@@ -216,6 +216,23 @@ export interface ToolContext {
 	assertWorkspaceCurrent?: () => void;
 	/** Frozen workspace identity for this pass; background closures retain it. */
 	workspaceContext?: import("@shared/workspace-context").WorkspaceContext;
+	/** Resolve only this narrator's binding for the requested device; null never means device.defaultCwd. */
+	resolveDeviceWorkspace?: (
+		deviceId: string,
+	) => Promise<import("@shared/workspace-context").WorkspaceContext | null>;
+	/** Revalidate the exact admitted binding, never replace it with today's map. */
+	assertDeviceWorkspaceCurrent?: (
+		workspace: import("@shared/workspace-context").WorkspaceContext,
+	) => Promise<void>;
+	/** Indexed final fence, called synchronously immediately before tool dispatch. */
+	assertDeviceWorkspaceCurrentSync?: (
+		workspace: import("@shared/workspace-context").WorkspaceContext,
+	) => void;
+	/** Actual actor/signal-bound file access for this endpoint, not the selected/default endpoint. */
+	createDeviceWorkspaceFileAccess?: (
+		workspace: import("@shared/workspace-context").WorkspaceContext,
+		backend: import("./execution/backend").ExecutionBackend,
+	) => import("@server/lib/plan-file-path").WorkspaceFileAccess;
 	/** Actor/device/path-authorized access for automatic workspace instructions, skills and plans. */
 	workspaceFileAccess?: import("@server/lib/plan-file-path").WorkspaceFileAccess;
 	/** Manual read scope derives only from the permission-approved endpoint plan. */
@@ -241,6 +258,9 @@ export interface ToolExecutionTarget {
 	cwd: string;
 	/** Frozen original base directory used for workspace scope checks, before workdir. */
 	baseCwd?: string;
+	/** Original endpoint workspace, including the independent binding revision. Not a grant. */
+	workspaceContext?: import("@shared/workspace-context").WorkspaceContext;
+	workspaceBinding?: import("@shared/workspace-context").WorkspaceBindingReference;
 	/** Path grammar used to interpret cwd and path fields. Optional for persisted legacy targets. */
 	pathFlavor?: PathFlavor;
 	/** Lexically normalized absolute path for the primary path argument. */
@@ -1026,6 +1046,10 @@ export interface AgentConfig {
 	/** Frozen backend/target supplied to preflight gates such as ExitPlanMode reflection. */
 	executionBackend?: import("./execution/backend").ExecutionBackend;
 	executionTarget?: ToolExecutionTarget;
+	/** Device authority is live even for a qualified one-shot endpoint without a directory binding. */
+	assertEndpointAuthorized?: (
+		target: ToolExecutionTarget,
+	) => Promise<ToolFinalStartAuthorizationTicket>;
 	/**
 	 * Persist + apply a new session default device (SwitchDevice tool). Flows
 	 * into ToolContext.setDefaultDevice. Absent → SwitchDevice reports failure.
@@ -1035,6 +1059,23 @@ export interface AgentConfig {
 	assertWorkspaceCurrent?: () => void;
 	/** Frozen workspace identity for this pass; background closures retain it. */
 	workspaceContext?: import("@shared/workspace-context").WorkspaceContext;
+	/** Resolve only this narrator's binding for the requested device; null never means device.defaultCwd. */
+	resolveDeviceWorkspace?: (
+		deviceId: string,
+	) => Promise<import("@shared/workspace-context").WorkspaceContext | null>;
+	/** Revalidate the exact admitted binding, never replace it with today's map. */
+	assertDeviceWorkspaceCurrent?: (
+		workspace: import("@shared/workspace-context").WorkspaceContext,
+	) => Promise<void>;
+	/** Indexed final fence, called synchronously immediately before tool dispatch. */
+	assertDeviceWorkspaceCurrentSync?: (
+		workspace: import("@shared/workspace-context").WorkspaceContext,
+	) => void;
+	/** Actual actor/signal-bound file access for this endpoint, not the selected/default endpoint. */
+	createDeviceWorkspaceFileAccess?: (
+		workspace: import("@shared/workspace-context").WorkspaceContext,
+		backend: import("./execution/backend").ExecutionBackend,
+	) => import("@server/lib/plan-file-path").WorkspaceFileAccess;
 	/** Actor/device/path-authorized access for automatic workspace instructions, skills and plans. */
 	workspaceFileAccess?: import("@server/lib/plan-file-path").WorkspaceFileAccess;
 	/** Manual read scope derives only from the permission-approved endpoint plan. */

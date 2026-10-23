@@ -398,6 +398,7 @@ export const ExactRow = memo(
 		onQuoteJump,
 	}: ExactRowProps) {
 		const extra = resolveRenderExtra(item.spec);
+		extra.messageId = interaction?.messageId;
 		const kind = item.spec.kind;
 		// Read-only shares retain this reader-owned fold without enabling mutation/menu actions.
 		extra.textPreviewLabels = renderLabels.textPreview;

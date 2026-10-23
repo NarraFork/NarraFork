@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
 import {
+	type CapturedFileReferencePreview,
+	type CapturedFileReferenceSelector,
 	FILE_REFERENCE_READ_CONCURRENCY,
 	FILE_REFERENCE_READ_TIMEOUT_MS,
 	FILE_REFERENCE_SEARCH_TIMEOUT_MS,
@@ -8,8 +10,11 @@ import {
 	type FileReferencePreview,
 	type FileReferenceSearchResult,
 	type FileReferenceSnapshot,
+	type FileReferenceSourceOrigin,
 	type FileSelection,
 	type FileTarget,
+	isFileReferenceSnapshot,
+	MAX_FILE_REFERENCE_METADATA_BYTES,
 	MAX_FILE_REFERENCE_PATH_CHARS,
 	MAX_FILE_REFERENCE_SEARCH_BYTES,
 	MAX_FILE_REFERENCE_SEARCH_RESULTS,
@@ -21,6 +26,7 @@ import {
 	getFileReferenceImageMimeType,
 	MAX_FILE_REFERENCE_IMAGE_BYTES,
 } from "@shared/file-reference-image";
+import type { WorkspaceContext } from "@shared/workspace-context";
 import type { DeviceSummary, ExecutionBackend, FileStat } from "../lib/agent/execution/backend";
 import { AppError, NotFoundError, zodValidationError } from "../lib/errors";
 import { isPlanModeTrait } from "../lib/narrator-utils";
@@ -76,6 +82,8 @@ export interface FileReferenceService {
 export interface FileReferenceScope {
 	narratorId: string;
 	userId: string;
+	/** Server-confirmed new capture project; absence is legacy/unknown, not standalone. */
+	projectId?: string | null;
 	cwd: string;
 	defaultDeviceId: string;
 	devices: readonly DeviceSummary[];
@@ -88,8 +96,20 @@ export interface FileReferenceDependencies {
 		narratorId: string,
 		userId: string,
 		need: "read" | "write",
+		options?: { originalResource?: boolean },
 	): Promise<FileReferenceScope>;
 	getBackend(deviceId: string): ExecutionBackend | Promise<ExecutionBackend>;
+	resolveWorkspace?(
+		scope: FileReferenceScope,
+		deviceId: string,
+		options: { required: boolean },
+	): Promise<WorkspaceContext | null>;
+	assertWorkspaceCurrent?(scope: FileReferenceScope, workspace: WorkspaceContext): Promise<void>;
+	assertWorkspaceCurrentSync?(scope: FileReferenceScope, workspace: WorkspaceContext): void;
+	authorizeEndpoint?(
+		scope: FileReferenceScope,
+		deviceId: string,
+	): Promise<{ assertStillCurrent(): void }>;
 	readDecision(
 		scope: FileReferenceScope,
 		context: ExecutionTargetContext,
@@ -141,7 +161,7 @@ function publicFailure(error: unknown): AppError {
 /** Pure Read decision shared by the production permission path and isolated regressions. */
 export function evaluateFileReferenceReadPolicy(
 	scope: Pick<FileReferenceScope, "permissionMode" | "runtimePolicy">,
-	context: ExecutionTargetContext,
+	context: ExecutionTargetContext & { fileReferenceExactOnly?: boolean },
 	policy: Pick<CompiledExecutionPolicy, "evaluatePath">,
 ): "allow" | "ask" | "deny" {
 	const path = context.target.canonicalPath;
@@ -162,7 +182,8 @@ export function evaluateFileReferenceReadPolicy(
 	if (decision === "deny" || decision === "allow") return decision;
 	if (mode === "dontAsk") return "deny";
 	if (mode === "bypassPermissions") return "allow";
-	if (context.paths.contains(context.target.cwd, path)) return "allow";
+	if (!context.fileReferenceExactOnly && context.paths.contains(context.target.cwd, path))
+		return "allow";
 	return mode === "readOnly" ? "deny" : "ask";
 }
 
@@ -275,6 +296,7 @@ class Operation {
 interface DeviceContext {
 	backend: ExecutionBackend;
 	cwd: string;
+	workspace?: WorkspaceContext;
 	generation: number;
 }
 interface AuthorizedFile {
@@ -320,19 +342,29 @@ export function createFileReferenceService(
 			const result = await op.wait(() => execute(scope, op, devices));
 			// Recheck ACL/device availability before releasing results. No long-lived auth cache.
 			const current = await op.wait(() => deps.loadScope(narratorId, userId, need));
-			if (current.cwd !== scope.cwd)
+			if (current.projectId !== scope.projectId)
 				throw failure(
 					"IDENTITY_CHANGED",
-					"Narrator working directory changed during file reference operation",
+					"Narrator project changed during new reference admission",
 					409,
 				);
+
 			for (const context of op.authorizedContexts.values()) {
 				if ((await op.wait(() => deps.readDecision(current, context))) !== "allow")
 					throw failure("FORBIDDEN", "Read policy changed during file reference operation", 403);
 			}
+			const finalDevices: DeviceContext[] = [];
+			const finalProofs: Array<{ assertStillCurrent(): void }> = [];
 			for (const [id, pending] of devices) {
 				assertDeviceAllowed(current, id);
 				const original = await pending;
+				finalDevices.push(original);
+				if (original.workspace)
+					await op.wait(
+						() =>
+							deps.assertWorkspaceCurrent?.(scope, original.workspace as WorkspaceContext) ??
+							Promise.resolve(),
+					);
 				const fresh = await op.wait(() => Promise.resolve(deps.getBackend(id)));
 				if (
 					fresh.deviceId !== id ||
@@ -345,7 +377,14 @@ export function createFileReferenceService(
 						"Execution device changed during file reference operation",
 						409,
 					);
+				const proof = await op.wait(
+					() => deps.authorizeEndpoint?.(current, id) ?? Promise.resolve(null),
+				);
+				if (proof) finalProofs.push(proof);
 			}
+			for (const proof of finalProofs) proof.assertStillCurrent();
+			for (const device of finalDevices)
+				if (device.workspace) deps.assertWorkspaceCurrentSync?.(scope, device.workspace);
 			op.check();
 			failed = false;
 			truncated = !!(
@@ -365,7 +404,7 @@ export function createFileReferenceService(
 		}
 	}
 	function assertDeviceAllowed(scope: FileReferenceScope, id: string): void {
-		if (id !== "local") {
+		if (id !== "local" && !deps.authorizeEndpoint) {
 			const allowed = scope.devices.find((device) => device.id === id);
 			if (!allowed)
 				throw failure("FORBIDDEN", "Device is not authorized for this user and narrator", 403);
@@ -393,6 +432,10 @@ export function createFileReferenceService(
 		let result = devices.get(id);
 		if (!result) {
 			result = (async () => {
+				const endpoint = await op.wait(
+					() => deps.authorizeEndpoint?.(scope, id) ?? Promise.resolve(null),
+				);
+				endpoint?.assertStillCurrent();
 				const backend = await op.wait(() => Promise.resolve(deps.getBackend(id)));
 				if (
 					backend.deviceId !== id ||
@@ -415,33 +458,95 @@ export function createFileReferenceService(
 						"Upgrade the executor: canonical path, atomic read and fs.read.bounded.v1 capabilities are required",
 						422,
 					);
-				const cwd = backend.kind === "remote" ? backend.defaultCwd : scope.cwd;
-				if (!cwd || !backend.paths.isAbsolute(cwd))
-					throw failure("INVALID_TARGET", "Execution device has no absolute working directory");
+				endpoint?.assertStillCurrent();
 				// Policy canonicalization must receive the same cancellation and deadline.
 				const bounded = new Proxy(backend, {
 					get(target, key) {
 						if (key === "resolvePathIdentity")
 							return (path: string) =>
-								op.wait(() =>
-									target.resolvePathIdentity(path, { signal: op.signal, timeoutMs: op.remaining }),
-								);
+								op.wait(async () => {
+									const proof = await deps.authorizeEndpoint?.(scope, id);
+									proof?.assertStillCurrent();
+									return target.resolvePathIdentity(path, {
+										signal: op.signal,
+										timeoutMs: op.remaining,
+									});
+								});
 						const value = Reflect.get(target, key, target);
 						return typeof value === "function" ? value.bind(target) : value;
 					},
 				});
-				const cwdIdentity = await bounded.resolvePathIdentity(cwd);
-				if (!cwdIdentity.exists || cwdIdentity.runtimeGeneration !== backend.runtimeGeneration)
-					throw failure("IDENTITY_CHANGED", "Working directory identity is unavailable", 409);
-				return {
-					backend: bounded,
-					cwd: cwdIdentity.canonicalPath,
-					generation: backend.runtimeGeneration,
-				};
+				return { backend: bounded, cwd: "", generation: backend.runtimeGeneration };
 			})();
 			devices.set(id, result);
 		}
 		return result;
+	}
+	async function bindingRoot(
+		scope: FileReferenceScope,
+		device: DeviceContext,
+		op: Operation,
+		required = true,
+	): Promise<string> {
+		if (!device.workspace) {
+			const workspace = await op.wait(
+				() =>
+					deps.resolveWorkspace?.(scope, device.backend.deviceId, { required }) ??
+					Promise.resolve(null),
+			);
+			if (!workspace && !required) return "";
+			if (
+				!workspace?.binding ||
+				workspace.deviceId !== device.backend.deviceId ||
+				!device.backend.paths.isAbsolute(workspace.cwd) ||
+				workspace.pathFlavor !== device.backend.pathFlavor
+			)
+				throw failure(
+					"WORKSPACE_UNCONFIGURED",
+					"Configure this narrator/device working directory first",
+					409,
+				);
+			device.workspace = Object.freeze(structuredClone(workspace));
+			await deps.assertWorkspaceCurrent?.(scope, device.workspace);
+			const identity = await device.backend.resolvePathIdentity(workspace.cwd);
+			if (
+				!identity.exists ||
+				identity.runtimeGeneration !== device.generation ||
+				!device.backend.paths.equals(identity.canonicalPath, workspace.cwd)
+			)
+				throw failure("IDENTITY_CHANGED", "Working directory identity is unavailable", 409);
+			device.cwd = workspace.cwd;
+		}
+		return device.cwd;
+	}
+	async function beforeDispatch(
+		scope: FileReferenceScope,
+		device: DeviceContext,
+		op: Operation,
+		context?: ExecutionTargetContext,
+	): Promise<void> {
+		const current = await op.wait(() => deps.loadScope(scope.narratorId, scope.userId, "read"));
+		if (current.projectId !== scope.projectId)
+			throw failure(
+				"IDENTITY_CHANGED",
+				"Narrator project changed before new reference dispatch",
+				409,
+			);
+		assertDeviceAllowed(current, device.backend.deviceId);
+		if (context && (await op.wait(() => deps.readDecision(current, context))) !== "allow")
+			throw failure("FORBIDDEN", "Read policy changed before file dispatch", 403);
+		if (device.workspace)
+			await op.wait(
+				() =>
+					deps.assertWorkspaceCurrent?.(scope, device.workspace as WorkspaceContext) ??
+					Promise.resolve(),
+			);
+		const proof = await op.wait(
+			() => deps.authorizeEndpoint?.(current, device.backend.deviceId) ?? Promise.resolve(null),
+		);
+		proof?.assertStillCurrent();
+		if (device.workspace) deps.assertWorkspaceCurrentSync?.(scope, device.workspace);
+		op.check();
 	}
 	async function authorize(
 		scope: FileReferenceScope,
@@ -461,16 +566,18 @@ export function createFileReferenceService(
 					input.path.replace(/^[a-z]:/i, "").includes(":")))
 		)
 			throw failure("INVALID_TARGET", "File path does not match the target device path grammar");
-		const lexical = backend.paths.resolve(device.cwd, input.path);
+		const root = await bindingRoot(scope, device, op, !backend.paths.isAbsolute(input.path));
+		const cwd = root || backend.paths.resolve(input.path, "..");
+		const lexical = backend.paths.resolve(cwd, input.path);
 		if (!backend.paths.isAbsolute(lexical) || lexical.length > MAX_FILE_REFERENCE_PATH_CHARS)
 			throw failure("INVALID_TARGET", "File path must resolve to a bounded absolute path");
-		const context = await op.wait(() =>
+		const resolvedContext = await op.wait(() =>
 			createExecutionTargetContext({
 				backend,
 				target: {
 					deviceId: input.deviceId,
 					backendKind: backend.kind,
-					cwd: device.cwd,
+					cwd,
 					lexicalPath: lexical,
 					pathFlavor: backend.pathFlavor,
 					runtimeGeneration: device.generation,
@@ -478,6 +585,7 @@ export function createFileReferenceService(
 				},
 			}),
 		);
+		const context = { ...resolvedContext, fileReferenceExactOnly: !root };
 		const canonical = context.target.canonicalPath;
 		if (
 			!canonical ||
@@ -503,6 +611,7 @@ export function createFileReferenceService(
 					: "Read policy denies this file reference",
 				403,
 			);
+		await beforeDispatch(scope, device, op, context);
 		const stat = await op.wait(() =>
 			backend.statFile(lexical, { signal: op.signal, timeoutMs: op.remaining }),
 		);
@@ -545,6 +654,7 @@ export function createFileReferenceService(
 		const file = await authorize(scope, input, op, devices);
 		if (file.stat.size > MAX_FILE_REFERENCE_SOURCE_BYTES)
 			throw failure("SOURCE_TOO_LARGE", "Source file exceeds 1 MiB; choose a smaller file", 413);
+		await beforeDispatch(scope, file.device, op, file.context);
 		const result = await op.wait(() =>
 			file.device.backend.readFileBytes(file.context.target.lexicalPath as string, {
 				maxBytes: MAX_FILE_REFERENCE_SOURCE_BYTES,
@@ -622,10 +732,13 @@ export function createFileReferenceService(
 			if (!parsed.success) throw zodValidationError(parsed.error);
 			return run("capture", narratorId, userId, "write", signal, async (scope, op, devices) => {
 				let totalBytes = 0;
+				let originBytes = 0;
 				const snapshots = await mapBounded(
 					parsed.data,
 					op,
-					async (reference): Promise<FileReferenceSnapshot> => {
+					async (
+						reference,
+					): Promise<FileReferenceSnapshot & { sourceOrigin?: FileReferenceSourceOrigin }> => {
 						const file = await read(scope, reference, op, devices, reference.expectedHash);
 						const bytes = Buffer.byteLength(file.selectedText, "utf8");
 						totalBytes += bytes;
@@ -638,8 +751,27 @@ export function createFileReferenceService(
 								"Reference text exceeds 32 KiB per reference or 128 KiB per message; select a smaller range",
 								413,
 							);
+						const sourceOrigin: FileReferenceSourceOrigin | undefined =
+							scope.projectId !== undefined
+								? {
+										version: 1,
+										narratorId: scope.narratorId,
+										projectId: scope.projectId,
+										deviceId: file.target.deviceId,
+										canonicalPath: file.target.path,
+										...(file.device.workspace ? { cwd: file.device.workspace.cwd } : {}),
+									}
+								: undefined;
+						originBytes += sourceOrigin ? Buffer.byteLength(JSON.stringify(sourceOrigin)) : 0;
+						if (originBytes > MAX_FILE_REFERENCE_METADATA_BYTES)
+							throw failure(
+								"SNAPSHOT_TOO_LARGE",
+								"Reference source metadata exceeds its 64 KiB budget",
+								413,
+							);
 						return {
 							type: "file_reference",
+							...(sourceOrigin ? { sourceOrigin } : {}),
 							reference: { ...reference, ...file.target },
 							snapshotText: file.selectedText,
 							snapshotHash: hashFileReferenceText(file.selectedText),
@@ -702,6 +834,7 @@ export function createFileReferenceService(
 						);
 					if (file.stat.size > MAX_FILE_REFERENCE_IMAGE_BYTES)
 						throw failure("SOURCE_TOO_LARGE", "Image exceeds 25 MiB", 413);
+					await beforeDispatch(scope, file.device, op, file.context);
 					const result = await op.wait(() =>
 						file.device.backend.readFileBytes(file.context.target.lexicalPath as string, {
 							maxBytes: MAX_FILE_REFERENCE_IMAGE_BYTES,
@@ -738,6 +871,7 @@ export function createFileReferenceService(
 				if (!query) return { entries: [], truncated: false };
 				const deviceId = parsed.data.deviceId ?? scope.defaultDeviceId;
 				const device = await deviceFor(scope, deviceId, op, devices);
+				await bindingRoot(scope, device, op);
 				const root = await authorize(
 					scope,
 					{ deviceId, path: parsed.data.directory ?? device.cwd },
@@ -746,6 +880,7 @@ export function createFileReferenceService(
 					true,
 				);
 				// Literal query, not a user-supplied glob. Matching happens inside the bounded scan.
+				await beforeDispatch(scope, device, op, root.context);
 				const matches = await op.wait(() =>
 					device.backend.glob("**/*", {
 						cwd: root.target.path,
@@ -772,6 +907,7 @@ export function createFileReferenceService(
 					const lexical = device.backend.paths.resolve(root.target.path, match);
 					if (!device.backend.paths.contains(root.target.path, lexical)) continue;
 					try {
+						await beforeDispatch(scope, device, op, root.context);
 						const stat = await op.wait(() =>
 							device.backend.statFile(lexical, { signal: op.signal, timeoutMs: op.remaining }),
 						);
@@ -813,25 +949,201 @@ export function createFileReferenceService(
 }
 
 /** Lazy production bindings: importing the factory in isolated tests never opens a DB. */
+/** Lazy immutable bytes by a server-owned message occurrence. No current map or live source IO. */
+export async function previewCapturedFileReference(
+	narratorId: string,
+	userId: string,
+	selector: CapturedFileReferenceSelector,
+	signal?: AbortSignal,
+): Promise<CapturedFileReferencePreview> {
+	const op = new Operation(FILE_REFERENCE_READ_TIMEOUT_MS, signal);
+	try {
+		if (
+			![narratorId, userId, selector.messageId, selector.referenceId].every(
+				(value) => typeof value === "string" && value.length > 0 && value.length <= 128,
+			)
+		)
+			throw failure("INVALID_TARGET", "Invalid captured reference selector");
+		const [{ db }, schema, { and, eq, sql }, acl] = await op.wait(() =>
+			Promise.all([
+				import("../db"),
+				import("../db/schema"),
+				import("drizzle-orm"),
+				import("./narrator-acl"),
+			]),
+		);
+		const actor = await op.wait(() =>
+			db.query.users.findFirst({ where: eq(schema.users.id, userId), columns: { role: true } }),
+		);
+		const narrator = await op.wait(() =>
+			db.query.narrators.findFirst({
+				where: eq(schema.narrators.id, narratorId),
+				columns: acl.NARRATOR_ACL_COLUMNS,
+			}),
+		);
+		if (!actor || !narrator) throw new NotFoundError("Narrator", narratorId);
+		await op.wait(() =>
+			acl.assertNarratorAccess(narrator, { userId, isAdmin: actor.role === "admin" }, "read"),
+		);
+		const relation = await op.wait(() =>
+			db.query.narratorMessageRefs.findFirst({
+				where: and(
+					eq(schema.narratorMessageRefs.narratorId, narratorId),
+					eq(schema.narratorMessageRefs.messageId, selector.messageId),
+				),
+				columns: { messageId: true },
+			}),
+		);
+		if (!relation) throw new NotFoundError("Captured reference", selector.referenceId);
+		// PK length gate before the JSON column is decoded; at most 1 MiB UTF-8 (256K codepoints).
+		const summary = db
+			.select({
+				role: schema.narratorMessages.role,
+				characters: sql<number>`length(cast(${schema.narratorMessages.contentJson} as text))`,
+			})
+			.from(schema.narratorMessages)
+			.where(eq(schema.narratorMessages.id, selector.messageId))
+			.get();
+		if (
+			!summary ||
+			summary.role !== "user" ||
+			!Number.isSafeInteger(summary.characters) ||
+			summary.characters > 256 * 1024
+		)
+			throw failure(
+				"SNAPSHOT_UNAVAILABLE",
+				"Captured reference message is unavailable or exceeds its bounded lookup budget",
+				422,
+			);
+		const row = await op.wait(() =>
+			db.query.narratorMessages.findFirst({
+				where: and(
+					eq(schema.narratorMessages.id, selector.messageId),
+					sql`length(cast(${schema.narratorMessages.contentJson} as text)) <= ${256 * 1024}`,
+				),
+				columns: { contentJson: true },
+			}),
+		);
+		if (!Array.isArray(row?.contentJson) || row.contentJson.length > 256)
+			throw failure("SNAPSHOT_UNAVAILABLE", "Captured reference message is unavailable", 422);
+		const matches = row.contentJson.filter(
+			(block) => isFileReferenceSnapshot(block) && block.reference.id === selector.referenceId,
+		);
+		if (matches.length !== 1 || !isFileReferenceSnapshot(matches[0]))
+			throw failure(
+				"SNAPSHOT_UNAVAILABLE",
+				"Captured reference occurrence is unknown or ambiguous",
+				422,
+			);
+		const snapshot = matches[0];
+		const metadata = fileReferencesSchema.safeParse([snapshot.reference]);
+		if (
+			!metadata.success ||
+			snapshot.capturedAt.length > 64 ||
+			!/^[a-f0-9]{64}$/.test(snapshot.snapshotHash)
+		)
+			throw failure("SNAPSHOT_UNAVAILABLE", "Captured reference metadata is unavailable", 422);
+		const origin = snapshot.sourceOrigin;
+		if (
+			!origin ||
+			origin.version !== 1 ||
+			![origin.narratorId, origin.deviceId, origin.canonicalPath].every(
+				(value) => typeof value === "string" && value.length > 0 && value.length <= 4096,
+			) ||
+			!(origin.projectId === null || typeof origin.projectId === "string") ||
+			origin.deviceId !== snapshot.reference.deviceId ||
+			origin.canonicalPath !== snapshot.reference.path ||
+			(origin.cwd !== undefined && (typeof origin.cwd !== "string" || origin.cwd.length > 4096))
+		)
+			throw failure(
+				"SNAPSHOT_UNAVAILABLE",
+				"Original captured reference provenance is unavailable; add a new explicit reference",
+				422,
+			);
+		if (
+			Buffer.byteLength(snapshot.snapshotText) > MAX_FILE_REFERENCE_TEXT_BYTES ||
+			hashFileReferenceText(snapshot.snapshotText) !== snapshot.snapshotHash
+		)
+			throw failure(
+				"SNAPSHOT_UNAVAILABLE",
+				"Captured reference bytes are unavailable or exceed 32 KiB",
+				422,
+			);
+		const { assertNarratorCapturedReferenceAuthority } = await op.wait(
+			() => import("./workspace-artifact-access"),
+		);
+		const proof = await op.wait(() =>
+			assertNarratorCapturedReferenceAuthority(origin, userId, op.signal),
+		);
+		const { narratorDeviceWorkspaceService } = await op.wait(
+			() => import("./narrator-device-workspace-service"),
+		);
+		const requestProof = await op.wait(() =>
+			narratorDeviceWorkspaceService.assertOriginalEndpointDeviceCurrent(
+				narratorId,
+				origin.deviceId,
+				{ userId, originalProjectId: origin.projectId },
+			),
+		);
+		const currentActor = await op.wait(() =>
+			db.query.users.findFirst({ where: eq(schema.users.id, userId), columns: { role: true } }),
+		);
+		const currentNarrator = await op.wait(() =>
+			db.query.narrators.findFirst({
+				where: eq(schema.narrators.id, narratorId),
+				columns: acl.NARRATOR_ACL_COLUMNS,
+			}),
+		);
+		if (!currentActor || !currentNarrator) throw new NotFoundError("Narrator", narratorId);
+		await op.wait(() =>
+			acl.assertNarratorAccess(
+				currentNarrator,
+				{ userId, isAdmin: currentActor.role === "admin" },
+				"read",
+			),
+		);
+		proof.assertStillCurrent();
+		requestProof.assertStillCurrent();
+		if (
+			!db
+				.select({ id: schema.narratorMessageRefs.id })
+				.from(schema.narratorMessageRefs)
+				.where(
+					and(
+						eq(schema.narratorMessageRefs.narratorId, narratorId),
+						eq(schema.narratorMessageRefs.messageId, selector.messageId),
+					),
+				)
+				.limit(1)
+				.get()
+		)
+			throw new NotFoundError("Captured reference", selector.referenceId);
+		op.check();
+		return {
+			source: "captured_snapshot",
+			readOnly: true,
+			reference: snapshot.reference,
+			content: snapshot.snapshotText,
+			hash: snapshot.snapshotHash,
+			capturedAt: snapshot.capturedAt,
+		};
+	} catch (error) {
+		throw publicFailure(op.signal.aborted ? op.signal.reason : error);
+	} finally {
+		op.close();
+	}
+}
+
+let deviceWorkspaceService:
+	| typeof import("./narrator-device-workspace-service").narratorDeviceWorkspaceService
+	| undefined;
 const productionDependencies: FileReferenceDependencies = {
-	async loadScope(narratorId, userId, need) {
-		const [
-			{ db },
-			schema,
-			{ eq },
-			acl,
-			{ getHome },
-			{ getSessionDevices },
-			{ resolveNarratorSessionCwd },
-			{ resolveOAuthNarratorRuntimePolicy },
-		] = await Promise.all([
+	async loadScope(narratorId, userId, need, options) {
+		const [{ db }, schema, { eq }, acl, { resolveOAuthNarratorRuntimePolicy }] = await Promise.all([
 			import("../db"),
 			import("../db/schema"),
 			import("drizzle-orm"),
 			import("./narrator-acl"),
-			import("../lib/platform"),
-			import("./device-connection-service"),
-			import("./narrator-cwd"),
 			import("./oauth-narrator-runtime-policy"),
 		]);
 		const user = await db.query.users.findFirst({
@@ -851,6 +1163,8 @@ const productionDependencies: FileReferenceDependencies = {
 		});
 		if (!user || !row) throw new NotFoundError("Narrator", narratorId);
 		await acl.assertNarratorAccess(row, { userId, isAdmin: user.role === "admin" }, need);
+		const { assertWorkspaceSelectionInstalled } = await import("./workspace-context-service");
+		if (!options?.originalResource) assertWorkspaceSelectionInstalled(narratorId);
 		const chapter = row.chapterId
 			? await db.query.chapters.findFirst({
 					where: eq(schema.chapters.id, row.chapterId),
@@ -866,7 +1180,7 @@ const productionDependencies: FileReferenceDependencies = {
 				})
 			: undefined;
 		if (projectId && !project) throw new NotFoundError("Project", projectId);
-		const runtimePolicy = await resolveOAuthNarratorRuntimePolicy(narratorId);
+		const runtimePolicy = await resolveOAuthNarratorRuntimePolicy(narratorId, userId);
 		const permissionMode = runtimePolicy?.permissionMode ?? row.permissionMode ?? "default";
 		const strictPlan =
 			!runtimePolicy &&
@@ -875,9 +1189,10 @@ const productionDependencies: FileReferenceDependencies = {
 		return {
 			narratorId,
 			userId,
-			cwd: resolveNarratorSessionCwd(row.cwd, chapter?.worktreePath, project?.gitPath, getHome()),
+			projectId: projectId ?? null,
+			cwd: "", // Absolute targets need no cwd; relative targets resolve their own pair binding.
 			defaultDeviceId: row.defaultDeviceId ?? "local",
-			devices: await getSessionDevices(projectId, userId),
+			devices: [], // Production uses the indexed per-target endpoint proof, not device enumeration.
 			permissionMode: strictPlan ? "readOnly" : permissionMode,
 			runtimePolicy,
 		};
@@ -885,6 +1200,43 @@ const productionDependencies: FileReferenceDependencies = {
 	async getBackend(deviceId) {
 		const { resolveBackend } = await import("../lib/agent/execution/registry");
 		return resolveBackend({ requested: deviceId });
+	},
+	async resolveWorkspace(scope, deviceId, options) {
+		const { narratorDeviceWorkspaceService } = await import("./narrator-device-workspace-service");
+		return (
+			(
+				await narratorDeviceWorkspaceService.get(scope.narratorId, deviceId, {
+					userId: scope.userId,
+					ensureLegacy: options.required,
+				})
+			)?.context ?? null
+		);
+	},
+	async assertWorkspaceCurrent(scope, workspace) {
+		const { narratorDeviceWorkspaceService } = await import("./narrator-device-workspace-service");
+		deviceWorkspaceService = narratorDeviceWorkspaceService;
+		await narratorDeviceWorkspaceService.assertCurrent(scope.narratorId, workspace, {
+			userId: scope.userId,
+		});
+	},
+	assertWorkspaceCurrentSync(scope, workspace) {
+		if (!deviceWorkspaceService) throw failure("FORBIDDEN", "Binding guard is unavailable", 403);
+		deviceWorkspaceService.assertCurrentSync(scope.narratorId, workspace, { userId: scope.userId });
+	},
+	async authorizeEndpoint(scope, deviceId) {
+		const { narratorDeviceWorkspaceService } = await import("./narrator-device-workspace-service");
+		const proof = await narratorDeviceWorkspaceService.assertEndpointDeviceCurrent(
+			scope.narratorId,
+			deviceId,
+			{ userId: scope.userId },
+		);
+		const { assertWorkspaceSelectionInstalled } = await import("./workspace-context-service");
+		return {
+			assertStillCurrent() {
+				proof.assertStillCurrent();
+				assertWorkspaceSelectionInstalled(scope.narratorId);
+			},
+		};
 	},
 	async readDecision(scope, context) {
 		const { executionPolicyEngine } = await import("./execution-policy/engine");
@@ -984,24 +1336,42 @@ export async function authorizeEditorReferenceTarget(
 	narratorId: string,
 	userId: string,
 	path: string,
+	originalWorkspace?: WorkspaceContext,
+	originalProjectId?: string | null,
 ): Promise<string> {
 	const deps = productionDependencies;
-	const scope = await deps.loadScope(narratorId, userId, "read");
+	const scope = await deps.loadScope(narratorId, userId, "read", {
+		originalResource: originalWorkspace !== undefined,
+	});
 	if (scope.runtimePolicy && !scope.runtimePolicy.allowLocalExecution)
 		throw failure("FORBIDDEN", "Narrator runtime policy denies local files", 403);
 	const backend = await deps.getBackend("local");
-	const context = await createExecutionTargetContext({
+	const cwd =
+		originalWorkspace?.cwd ??
+		(backend.paths.isAbsolute(path) ? backend.paths.resolve(path, "..") : "");
+	if (!cwd)
+		throw failure("WORKSPACE_UNCONFIGURED", "Editor source requires a configured workspace", 409);
+	const { assertNarratorOriginalWorkspaceAuthority } = await import("./workspace-artifact-access");
+	const proof = originalWorkspace
+		? await assertNarratorOriginalWorkspaceAuthority(narratorId, originalWorkspace, {
+				userId,
+				...(originalProjectId !== undefined ? { originalProjectId } : {}),
+			})
+		: await deps.authorizeEndpoint?.(scope, "local");
+	proof?.assertStillCurrent();
+	const resolvedContext = await createExecutionTargetContext({
 		backend,
 		target: {
 			deviceId: "local",
 			backendKind: "local",
-			cwd: scope.cwd,
-			lexicalPath: backend.paths.resolve(scope.cwd, path),
+			cwd,
+			lexicalPath: backend.paths.resolve(cwd, path),
 			pathFlavor: backend.pathFlavor,
 			runtimeGeneration: backend.runtimeGeneration,
 			selectionSource: "explicit",
 		},
 	});
+	const context = { ...resolvedContext, fileReferenceExactOnly: !originalWorkspace };
 	const canonical = context.target.canonicalPath;
 	if (
 		!canonical ||
@@ -1010,6 +1380,7 @@ export async function authorizeEditorReferenceTarget(
 		(await deps.readDecision(scope, context)) !== "allow"
 	)
 		throw failure("FORBIDDEN", "Read policy denies this editor source", 403);
+	proof?.assertStillCurrent();
 	return canonical;
 }
 

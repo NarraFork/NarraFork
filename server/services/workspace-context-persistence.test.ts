@@ -9,6 +9,7 @@ import { ZodError } from "zod";
 import {
 	chapters,
 	narratorBlacklistDirs,
+	narratorDeviceWorkspaces,
 	narratorMessageRefs,
 	narratorMessages,
 	narrators,
@@ -25,6 +26,9 @@ import { generateId } from "../lib/id";
 import * as deviceConnections from "./device-connection-service";
 import { RemoteBackend } from "./device-remote-backend";
 import { executionPolicyEngine } from "./execution-policy/engine";
+import { narratorDeviceWorkspaceService } from "./narrator-device-workspace-service";
+import * as deviceWorkspaceStore from "./narrator-device-workspace-store";
+import { narratorService } from "./narrator-service";
 import { applySessionDefaultDevice } from "./narrator-session";
 import { type ActiveNarrator, activeNarrators } from "./narrator-session-state";
 import { permissionPolicyChanges } from "./permission-rule-service";
@@ -284,6 +288,22 @@ describe("selected remote workspace persistence", () => {
 				workspaceRevision: 0,
 				workspaceContext: { cwd: "/remote/repo-b", deviceId: backend.deviceId },
 			});
+			const bindings = await db
+				.select()
+				.from(narratorDeviceWorkspaces)
+				.where(eq(narratorDeviceWorkspaces.narratorId, created.id));
+			expect(bindings).toHaveLength(1);
+			expect(bindings[0]).toMatchObject({
+				deviceId: backend.deviceId,
+				cwd: "/remote/repo-b",
+				bindingRevision: 1,
+			});
+			expect(row?.workspaceContext?.binding).toMatchObject({
+				version: 1,
+				narratorId: created.id,
+				bindingId: bindings[0].id,
+				bindingRevision: 1,
+			});
 		} finally {
 			await db.delete(narrators).where(eq(narrators.id, created.id));
 		}
@@ -331,6 +351,18 @@ describe("real SQLite workspace CAS", () => {
 				: null,
 		);
 		const initial = await workspaceContextService.get(id);
+		// A device's global startup cwd is not a session binding. Configure this
+		// pair explicitly before exercising the legacy default-device route.
+		await narratorDeviceWorkspaceService.set(
+			id,
+			{
+				requestId: generateId(),
+				deviceId: "remote-fixture",
+				cwd: "/remote/default",
+				expectedBindingRevision: 0,
+			},
+			{ origin: "http", userId: owner },
+		);
 		const active = {
 			alive: true,
 			cwd: initial.cwd,
@@ -452,7 +484,7 @@ describe("real SQLite workspace CAS", () => {
 		try {
 			await expect(
 				workspaceContextService.switchDevice(id, "no-cwd", { origin: "http" }),
-			).rejects.toThrow("default directory");
+			).rejects.toMatchObject({ code: "WORKSPACE_DIRECTORY_NOT_CONFIGURED" });
 			expect((await workspaceContextService.get(id)).revision).toBe(0);
 			await db
 				.update(narrators)
@@ -1022,3 +1054,116 @@ for (const nativeV2 of [false, true]) {
 		expect(rpcSpy.mock.calls.length).toBe(calls);
 	});
 }
+
+test("fork persists only its selected original device endpoint under the child's own binding key", async () => {
+	const backend = remoteWorkspaceFixture();
+	await workspaceContextService.get(id, { userId: owner });
+	await narratorDeviceWorkspaceService.set(
+		id,
+		{
+			requestId: generateId(),
+			deviceId: backend.deviceId,
+			cwd: "/remote/repo-b",
+			expectedBindingRevision: 0,
+		},
+		{ origin: "http", userId: owner },
+	);
+	await workspaceContextService.switchDevice(id, backend.deviceId, {
+		origin: "http",
+		userId: owner,
+	});
+	const selected = await workspaceContextService.get(id, { userId: owner });
+	const parentBindings = await db
+		.select()
+		.from(narratorDeviceWorkspaces)
+		.where(eq(narratorDeviceWorkspaces.narratorId, id));
+	expect(parentBindings).toHaveLength(2);
+	const child = await narratorService.forkNarrator(id, null, { standalone: true, userId: owner });
+	try {
+		const bindings = await db
+			.select()
+			.from(narratorDeviceWorkspaces)
+			.where(eq(narratorDeviceWorkspaces.narratorId, child.id));
+		expect(bindings).toHaveLength(1);
+		expect(bindings[0]).toMatchObject({
+			narratorId: child.id,
+			deviceId: backend.deviceId,
+			cwd: "/remote/repo-b",
+			bindingRevision: 1,
+		});
+		expect(child.workspaceContext?.revision).toBe(0);
+		expect(child.workspaceContext?.contextKey).toBe(selected.contextKey);
+		expect(child.workspaceContext?.binding?.narratorId).toBe(child.id);
+		expect(child.workspaceContext?.binding?.bindingId).toBe(bindings[0].id);
+		expect(child.workspaceContext?.binding?.bindingId).not.toBe(selected.binding?.bindingId);
+		expect(
+			await narratorDeviceWorkspaceService.resolve(child.id, "local", { userId: owner }),
+		).toBeNull();
+	} finally {
+		await db.delete(narrators).where(eq(narrators.id, child.id));
+	}
+});
+
+test("subagent first binding uses the admitted non-default endpoint, not the parent's selected cwd", async () => {
+	const backend = remoteWorkspaceFixture();
+	await workspaceContextService.get(id, { userId: owner });
+	const configured = await narratorDeviceWorkspaceService.set(
+		id,
+		{
+			requestId: generateId(),
+			deviceId: backend.deviceId,
+			cwd: "/remote/repo-a",
+			expectedBindingRevision: 0,
+		},
+		{ origin: "http", userId: owner },
+	);
+	const admitted = configured.binding.context;
+	const child = await narratorService.createSubagent({
+		parentNarratorId: id,
+		subagentType: "general",
+		subagentOriginKind: "standalone",
+		cwd: admitted.cwd,
+		workspaceContext: admitted,
+	});
+	try {
+		const bindings = await db
+			.select()
+			.from(narratorDeviceWorkspaces)
+			.where(eq(narratorDeviceWorkspaces.narratorId, child.id));
+		expect(bindings).toHaveLength(1);
+		expect(child).toMatchObject({ cwd: "/remote/repo-a", defaultDeviceId: backend.deviceId });
+		expect(child.workspaceContext?.binding?.narratorId).toBe(child.id);
+		expect(child.workspaceContext?.binding?.bindingId).not.toBe(admitted.binding?.bindingId);
+		expect((await workspaceContextService.get(id, { userId: owner })).deviceId).toBe("local");
+		expect(
+			await narratorDeviceWorkspaceService.resolve(child.id, "local", { userId: owner }),
+		).toBeNull();
+	} finally {
+		await db.delete(narrators).where(eq(narrators.id, child.id));
+	}
+});
+
+test("primary creation rolls back its narrator when initial device binding insertion fails", async () => {
+	const before = (await db.select({ id: narrators.id }).from(narrators))
+		.map((row) => row.id)
+		.sort();
+	const failure = spyOn(
+		deviceWorkspaceStore,
+		"insertInitialDeviceWorkspaceBinding",
+	).mockImplementationOnce(() => {
+		throw new Error("injected binding insert failure");
+	});
+	try {
+		const response = await app(owner).request("/api/narrators", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ workspaceTarget: { deviceId: "local", cwd: join(root, "new") } }),
+		});
+		expect(response.status).toBe(500);
+		expect(
+			(await db.select({ id: narrators.id }).from(narrators)).map((row) => row.id).sort(),
+		).toEqual(before);
+	} finally {
+		failure.mockRestore();
+	}
+});

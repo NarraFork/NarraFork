@@ -10,10 +10,14 @@ import {
 import {
 	type FileReferenceService,
 	fileReferenceService,
+	previewCapturedFileReference,
 } from "../services/file-reference-service";
 
 /** Injectable service keeps route tests isolated from DB, devices and user files. */
-export function createFileReferenceRoutes(service: FileReferenceService = fileReferenceService) {
+export function createFileReferenceRoutes(
+	service: FileReferenceService = fileReferenceService,
+	readSnapshot: typeof previewCapturedFileReference = previewCapturedFileReference,
+) {
 	const routes = new Hono();
 	routes.use("*", async (c, next) => {
 		if (!c.get("user")?.sub) throw new AppError("Authentication required", 401, "UNAUTHORIZED");
@@ -69,6 +73,28 @@ export function createFileReferenceRoutes(service: FileReferenceService = fileRe
 			});
 		},
 	);
+	routes.get("/snapshot", async (c) => {
+		const query = c.req.query();
+		if (
+			Object.keys(query).some((key) => key !== "messageId" && key !== "referenceId") ||
+			![query.messageId, query.referenceId].every(
+				(value) => typeof value === "string" && value.length > 0 && value.length <= 128,
+			)
+		)
+			throw new AppError(
+				"Snapshot accepts only a bounded message/reference selector",
+				400,
+				"VALIDATION_ERROR",
+			);
+		return c.json(
+			await readSnapshot(
+				c.req.param("id") ?? "",
+				c.get("user").sub,
+				{ messageId: query.messageId, referenceId: query.referenceId },
+				c.req.raw.signal,
+			),
+		);
+	});
 	routes.get("/preview", async (c) => {
 		const parsed = previewFileReferenceSchema.safeParse(c.req.query());
 		if (!parsed.success) throw zodValidationError(parsed.error);

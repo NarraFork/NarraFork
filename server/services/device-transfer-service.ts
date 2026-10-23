@@ -260,6 +260,7 @@ interface ReceiveState {
 	 * showing a progress bar sat at zero for the whole transfer.
 	 */
 	progress?: TransferProgressMeta;
+	assertCurrent?: () => void;
 }
 
 /** transferId → receive state (server is the receiver, i.e. download). */
@@ -467,6 +468,7 @@ export async function downloadFile(args: {
 	remotePlatformOs?: string;
 	progress?: TransferProgressMeta;
 	signal?: AbortSignal;
+	assertCurrent?: () => void;
 	_slotHeld?: boolean;
 }): Promise<{ transferId: string; bytes: number }> {
 	return withTransferSlot(args.deviceId, args._slotHeld ?? false, () => downloadFileInner(args));
@@ -481,6 +483,7 @@ async function downloadFileInner(args: {
 	remotePlatformOs?: string;
 	progress?: TransferProgressMeta;
 	signal?: AbortSignal;
+	assertCurrent?: () => void;
 }): Promise<{ transferId: string; bytes: number }> {
 	const { deviceId, localDest, remoteSize, remoteMtimeMs } = args;
 	if (args.signal?.aborted) throw new Error("transfer cancelled");
@@ -492,6 +495,7 @@ async function downloadFileInner(args: {
 	const totalChunks = remoteSize === 0 ? 0 : Math.ceil(remoteSize / cs);
 	const transferId = `tx_${generateId()}`;
 	const finalPath = validateLocalAbsolutePath(localDest, "Local download destination");
+	args.assertCurrent?.();
 	mkdirSync(dirname(finalPath), { recursive: true });
 	const partPath = `${finalPath}.nfpart`;
 
@@ -531,6 +535,12 @@ async function downloadFileInner(args: {
 
 	const verify = settings.devices?.transferVerify ?? "crc32c";
 	if (args.signal?.aborted) await abandonBeforeStart();
+	try {
+		args.assertCurrent?.();
+	} catch (error) {
+		await fileHandle.close().catch(() => {});
+		throw error;
+	}
 
 	return await new Promise((resolvePromise, reject) => {
 		const state: ReceiveState = {
@@ -560,6 +570,7 @@ async function downloadFileInner(args: {
 			settled: false,
 			cleaned: false,
 			progress: args.progress,
+			assertCurrent: args.assertCurrent,
 		};
 		receives.set(transferId, state);
 		if (args.signal) {
@@ -625,6 +636,7 @@ export async function uploadFile(args: {
 	remotePlatformOs?: string;
 	progress?: TransferProgressMeta;
 	signal?: AbortSignal;
+	assertCurrent?: () => void;
 	_slotHeld?: boolean;
 }): Promise<{ transferId: string; bytes: number }> {
 	return withTransferSlot(args.deviceId, args._slotHeld ?? false, () => uploadFileInner(args));
@@ -637,6 +649,7 @@ async function uploadFileInner(args: {
 	remotePlatformOs?: string;
 	progress?: TransferProgressMeta;
 	signal?: AbortSignal;
+	assertCurrent?: () => void;
 }): Promise<{ transferId: string; bytes: number }> {
 	const { deviceId, localPath } = args;
 	if (!isDeviceOnline(deviceId)) throw new Error(`Device ${deviceId} is offline`);
@@ -650,6 +663,7 @@ async function uploadFileInner(args: {
 	const totalChunks = fileSize === 0 ? 0 : Math.ceil(fileSize / cs);
 	const transferId = `tx_${generateId()}`;
 	const verify = settings.devices?.transferVerify ?? "crc32c";
+	args.assertCurrent?.();
 	const contentDigest = await hashFileSha256(src, args.signal);
 	const supportsContentIdentity = hasDeviceProtocolFeature(
 		deviceId,
@@ -661,12 +675,14 @@ async function uploadFileInner(args: {
 			`${remoteDest}.nfmeta`,
 			`${remoteDest}.nfmeta.tmp`,
 		]) {
+			args.assertCurrent?.();
 			await sendRpc(deviceId, "fs.remove", { path }, { signal: args.signal });
 		}
 	}
 
 	// Ask the executor to prepare the destination; it returns already-received
 	// chunks for resume.
+	args.assertCurrent?.();
 	const begin = (await sendRpc(
 		deviceId,
 		"transfer.begin",
@@ -694,6 +710,7 @@ async function uploadFileInner(args: {
 
 	try {
 		if (totalChunks === 0) {
+			args.assertCurrent?.();
 			const complete = (await sendRpc(
 				deviceId,
 				"transfer.complete",
@@ -715,12 +732,14 @@ async function uploadFileInner(args: {
 			const offset = chunkIndex * cs;
 			const len = Math.min(cs, fileSize - offset);
 			const buf = Buffer.allocUnsafe(len);
+			args.assertCurrent?.();
 			await fileHandle.read(buf, 0, len, offset);
 			await waitForDrain(deviceId, args.signal);
 			const frame = encodeChunkFrame(
 				{ transferId, chunkIndex },
 				new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength),
 			);
+			args.assertCurrent?.();
 			if (!sendChunkFrame(deviceId, frame)) {
 				throw new Error(`Device ${deviceId} went offline mid-upload`);
 			}
@@ -752,6 +771,7 @@ async function uploadFileInner(args: {
 
 		// Signal completion with the same digest used to bind resume state. The
 		// executor hashes the received file, detecting source changes during upload.
+		args.assertCurrent?.();
 		const complete = (await sendRpc(
 			deviceId,
 			"transfer.complete",
@@ -796,6 +816,9 @@ export async function downloadDirectory(args: {
 	remotePlatformOs?: string;
 	signal?: AbortSignal;
 	onProgress?: (progress: TransferProgressUpdate) => void;
+	/** Tool-owned frozen endpoint authorization; omitted for administrator transfers. */
+	authorizeFile?: (localPath: string, remotePath: string) => Promise<void>;
+	assertCurrent?: () => void;
 }): Promise<DirectoryTransferResult> {
 	// A directory transfer holds a single device slot for its whole run; the
 	// per-file downloads below pass _slotHeld so they don't each acquire one.
@@ -810,6 +833,7 @@ export async function downloadDirectory(args: {
 		const localRoot = validateLocalAbsolutePath(args.localDir, "Local download directory");
 		const stat = await statRemote(deviceId, remoteRoot, {
 			recursive: true,
+			maxEntries: 50_001,
 			signal: args.signal,
 			remotePlatformOs: platformOs,
 		});
@@ -817,6 +841,10 @@ export async function downloadDirectory(args: {
 			throw new Error(`Remote path is not a directory: ${remoteRoot}`);
 		}
 		const entries = stat.entries ?? [];
+		if (stat.truncated || entries.length > 50_000)
+			throw new Error(
+				"Directory manifest truncated or exceeds the 50000 file limit; no files transferred",
+			);
 		const totalBytes = entries.reduce((sum, e) => sum + e.size, 0);
 		let baseBytes = 0;
 		let filesDone = 0;
@@ -825,7 +853,16 @@ export async function downloadDirectory(args: {
 			if (args.signal?.aborted) throw new Error("directory download aborted");
 			const localFile = resolveDownloadManifestPath(localRoot, entry.relPath);
 			const remoteFile = joinRemotePath(remoteRoot, entry.relPath, platformOs);
+			try {
+				await args.authorizeFile?.(localFile, remoteFile);
+				args.assertCurrent?.();
+			} catch (error) {
+				throw new Error(
+					`Directory transfer denied: ${error instanceof Error ? error.message : String(error)}; denied files: 1; transferred: ${filesDone}; untransferred: ${entries.length - filesDone}`,
+				);
+			}
 			await downloadFile({
+				assertCurrent: args.assertCurrent,
 				deviceId,
 				remotePath: remoteFile,
 				localDest: localFile,
@@ -862,6 +899,9 @@ export async function uploadDirectory(args: {
 	remotePlatformOs?: string;
 	signal?: AbortSignal;
 	onProgress?: (progress: TransferProgressUpdate) => void;
+	/** Tool-owned frozen endpoint authorization; omitted for administrator transfers. */
+	authorizeFile?: (localPath: string, remotePath: string) => Promise<void>;
+	assertCurrent?: () => void;
 }): Promise<DirectoryTransferResult> {
 	// A directory transfer holds a single device slot for its whole run; the
 	// per-file uploads below pass _slotHeld so they don't each acquire one.
@@ -882,7 +922,16 @@ export async function uploadDirectory(args: {
 		for (const file of files) {
 			if (args.signal?.aborted) throw new Error("directory upload aborted");
 			const remoteFile = joinRemotePath(remoteRoot, file.relPath, platformOs);
+			try {
+				await args.authorizeFile?.(file.absPath, remoteFile);
+				args.assertCurrent?.();
+			} catch (error) {
+				throw new Error(
+					`Directory transfer denied: ${error instanceof Error ? error.message : String(error)}; denied files: 1; transferred: ${filesDone}; untransferred: ${files.length - filesDone}`,
+				);
+			}
 			await uploadFile({
+				assertCurrent: args.assertCurrent,
 				deviceId,
 				localPath: file.absPath,
 				remoteDest: remoteFile,
@@ -931,13 +980,14 @@ async function enumerateLocalDir(
 			if (dirent.isDirectory()) {
 				stack.push(abs);
 			} else if (dirent.isFile()) {
+				if (out.length >= maxEntries)
+					throw new Error(`Directory exceeds the ${maxEntries} file limit; no files transferred`);
 				const info = await stat(abs);
 				out.push({
 					absPath: abs,
 					relPath: relative(root, abs).replaceAll("\\", "/"),
 					size: info.size,
 				});
-				if (out.length >= maxEntries) return out;
 			}
 		}
 	}
@@ -962,6 +1012,7 @@ async function writeChunk(
 	if (state.cleaned || state.received.has(header.chunkIndex)) return;
 	const offset = header.chunkIndex * state.chunkSize;
 	try {
+		state.assertCurrent?.();
 		await state.fileHandle.write(payload, 0, payload.length, offset);
 		if (state.cleaned) return;
 	} catch (err) {
@@ -1048,6 +1099,7 @@ async function finalizeReceive(state: ReceiveState): Promise<void> {
 		if (finalInfo && state.fileSize > 0 && finalInfo.size !== state.fileSize) {
 			throw new Error(`size mismatch: got ${finalInfo.size}, expected ${state.fileSize}`);
 		}
+		state.assertCurrent?.();
 		await rename(state.partPath, state.finalPath);
 		await removeLocalManifest(state.finalPath);
 		eventBus.emit({

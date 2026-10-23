@@ -4,6 +4,7 @@ import type { BackgroundTaskListPage } from "@shared/background-task-list";
 import type { FileChangeEvidenceUncertaintyWarning } from "@shared/file-change-protocol";
 import type { FileReference } from "@shared/file-reference";
 import type { HumanAttentionPage } from "@shared/human-attention";
+import type { PartialRevertResult } from "@shared/partial-revert";
 import {
 	TEXT_DOCUMENT_PACKET_BYTES,
 	TEXT_DOCUMENT_PAGE_CHARS,
@@ -285,6 +286,7 @@ export interface RevertActionConfirmOptions {
 }
 
 export interface RevertActionPlan {
+	coverage?: PartialRevertResult;
 	id: string;
 	planHash: string | null;
 	status: string;
@@ -368,6 +370,7 @@ export interface RevertPlanFilesPage {
 }
 
 export interface RevertPlanApplyResult {
+	coverage?: PartialRevertResult;
 	planId: string;
 	status: "committed" | "compensated" | "recovery_required";
 	journalStatus: string;
@@ -1302,12 +1305,17 @@ export const narratorsApi = {
 		id: string,
 		deviceId: string,
 		path?: string,
-		opts?: { showHidden?: boolean },
+		opts?: { showHidden?: boolean; signal?: AbortSignal },
 	) => {
 		const params = new URLSearchParams({ deviceId });
 		if (path) params.set("path", path);
 		if (opts?.showHidden) params.set("showHidden", "1");
-		return request<RemoteDirectoryListing>(`/narrators/${id}/device-browse?${params}`);
+		return request<RemoteDirectoryListing>(
+			`/narrators/${encodeURIComponent(id)}/device-browse?${params}`,
+			{
+				signal: opts?.signal,
+			},
+		);
 	},
 	updateNarratorDefaultDevice: (id: string, deviceId: string | null) =>
 		request<{ defaultDeviceId: string | null; current?: WorkspaceContext }>(

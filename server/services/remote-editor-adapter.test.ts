@@ -233,6 +233,38 @@ afterEach(async () => {
 	await rm(root, { recursive: true, force: true });
 });
 
+test("save after same-device rebind authorizes the original document, never the new root", async () => {
+	const rebound = { ...binding, cwd: "/replacement", contextKey: "replacement" };
+	const authorizations: (Readonly<EditorBinding> | undefined)[] = [];
+	const reboundActor: EditorActor = {
+		...actor,
+		async authorize(_input, _need, original) {
+			authorizations.push(original);
+			return { ...(original ?? rebound) };
+		},
+	};
+	await adapter().execute(reboundActor, binding, request());
+	expect(authorizations.length).toBeGreaterThan(0);
+	expect(authorizations.every((original) => original?.cwd === binding.cwd)).toBe(true);
+	expect(new TextDecoder().decode(bytes)).toBe("human edit");
+	expect(trace).toContain("mutate");
+});
+
+test("unavailable original document authority refuses save before mutation after rebind", async () => {
+	const deniedActor: EditorActor = {
+		...actor,
+		async authorize(_input, _need, original) {
+			expect(original).toEqual(binding);
+			throw new EditorDocumentError("EDITOR_WRITE_REFUSED", "Original source revoked", 403);
+		},
+	};
+	await expect(adapter().execute(deniedActor, binding, request())).rejects.toThrow(
+		"Original source revoked",
+	);
+	expect(new TextDecoder().decode(bytes)).toBe("remote before");
+	expect(trace).not.toContain("mutate");
+});
+
 test("source reads immutable remote object in bounded chunks, never a host path", async () => {
 	bytes = new Uint8Array(FILE_CHANGE_LIMITS.streamChunkBytes + 17).fill(65);
 	state = { kind: "regular", object: object(bytes), mode: 0o644 };
