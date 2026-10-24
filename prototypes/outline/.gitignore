@@ -1,0 +1,3 @@
+data/.local/
+data/log.lock
+__pycache__/
