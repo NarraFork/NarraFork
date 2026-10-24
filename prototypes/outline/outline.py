@@ -779,6 +779,10 @@ def badges(st: State, addr: str) -> list[str]:
 		out.append(STATUS_ZH.get(p.get("status", "todo"), p.get("status", "")))
 		if p.get("owner"):
 			out.append("执行：" + p["owner"])
+		if p.get("status", "todo") in ("todo", "doing"):
+			waiting = [lk["target"] for lk in st.links_from(addr, "blocked_by") if st.blocks.get(lk["target"], {}).get("props", {}).get("status") not in ("done", "cancelled")]
+			if waiting:  # 等前置是推导出来的，不写进状态（§0 规则 2）
+				out.append("等前置：" + ",".join(st.blocks[w]["props"].get("alias") or w for w in waiting))
 		if p.get("blocked_reason") and p.get("status") == "blocked":
 			out.append("等：" + p["blocked_reason"])
 		if p.get("no_evidence") and p.get("status") == "done":
@@ -1452,7 +1456,8 @@ def board_lines(st: State, under: str | None) -> list[str]:
 		lines.append(f"### {STATUS_ZH[status]}（{len(group)}）")
 		for a in group:
 			bd = [x for x in badges(st, a) if x not in (STATUS_ZH[status], "任务")]
-			where = first_line(st.blocks[st.blocks[a]["parent"]]["content"], 24) if st.blocks[a]["parent"] else ""
+			par = st.blocks[a]["parent"]
+			where = (st.blocks[par]["props"].get("alias") or first_line(st.blocks[par]["content"], 16)) if par else ""
 			lines.append(f"- [{a}] {first_line(st.blocks[a]['content'], 60)}" + (f" ‹{'·'.join(bd)}›" if bd else "") + (f" ← {where}" if where else ""))
 		lines.append("")
 	return lines or ["（没有任务）"]
