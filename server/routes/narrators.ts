@@ -449,6 +449,7 @@ import {
 import { generateTitle, persistTitle } from "../services/narrator-title";
 import { permissionRuleService } from "../services/permission-rule-service";
 import { usableProjectDir } from "../services/project-dir";
+import { ensureNarratorProjectLinks } from "../services/project-index";
 import {
 	applyLocalRevertPlan,
 	getLocalRevertPlan,
@@ -852,6 +853,8 @@ narratorRoutes.use("/:id/*", async (c, next) => {
 narratorRoutes.use("/:id", async (c, next) => {
 	const id = c.req.param("id");
 	if (!id || NARRATOR_ID_GATE_EXEMPT_SEGMENTS.has(id)) return next();
+	// Viewing a session repairs its project links once per process (no startup rebuild).
+	if (c.req.method === "GET") await ensureNarratorProjectLinks(id);
 	await requireNarratorAccess(c, id, c.req.method === "GET" ? "read" : "write");
 	return c.req.method === "GET" ? next() : withNarratorWorkAdmission(id, next);
 });

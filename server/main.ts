@@ -101,7 +101,6 @@ import {
 	recoverPendingQuestionAnswerDeliveries,
 	restorePendingModelOverrides,
 } from "./services/narrator-session";
-import { scheduleProjectIndexRebuild } from "./services/project-index";
 import "./services/notification-service"; // Register notification event listeners
 import {
 	startNotificationCenterMaintenance,
@@ -1772,8 +1771,6 @@ if (activeDatabaseBackend === "sqlite") {
 	retireLegacyChapterResources().catch((err) => {
 		logger.warn("Legacy chapter resource cleanup failed", { error: String(err) });
 	});
-	// Re-derive which project every session belongs to, in bounded background pages.
-	void scheduleProjectIndexRebuild();
 }
 
 // Establish client-egress relay channels for NUG providers configured with

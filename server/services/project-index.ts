@@ -349,6 +349,24 @@ export async function syncNarratorProjectLinks(narratorId: string): Promise<void
 		await invalidateProjectDerivedState(row.id);
 }
 
+const VERIFIED_NARRATORS_MAX = 4096;
+const verifiedNarrators = new Set<string>();
+
+/**
+ * Lazy repair for sessions nothing has re-derived yet (history from before the index, or
+ * a directory that moved while the server was down): verify one narrator's links the
+ * first time it is viewed in this process. Failures are logged, never thrown.
+ */
+export async function ensureNarratorProjectLinks(narratorId: string): Promise<void> {
+	if (activeDatabaseBackend !== "sqlite" || verifiedNarrators.has(narratorId)) return;
+	if (verifiedNarrators.size >= VERIFIED_NARRATORS_MAX) {
+		const oldest = verifiedNarrators.values().next().value;
+		if (oldest !== undefined) verifiedNarrators.delete(oldest);
+	}
+	verifiedNarrators.add(narratorId);
+	await syncNarratorProjectLinksSafely(narratorId);
+}
+
 /**
  * The primary project decides the session's execution policy (project directory and
  * command rules), which is cached per narrator: drop it when the project changed.
@@ -517,4 +535,5 @@ export function resetProjectIndexStateForTests(): void {
 	gitProbeCache.clear();
 	creationsInFlight.clear();
 	rootKeysReady = null;
+	verifiedNarrators.clear();
 }

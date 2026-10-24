@@ -114,7 +114,7 @@ server/
 - **可选工具三段式模式**（`shared/routine-modes.ts`）：`manual`（会话内 `/load` 临时加载）、`auto`（预留，当前等同 manual）、`resident`（新会话默认加载）。模式存于 `settings.routines.toolModes` 与项目 `chapterSettings.routines.toolModes`（项目层优先），`enabledRoutines`/`disabledRoutines` 作为兼容投射双向同步；`narrators.enabledTools` 是正交的会话级临时装载。
 - **子代理**：通过 `narrator_messages.parentToolUseId` 关联消息树，子代理有独立叙述者记录（`type="subagent"`）。
 - **Fork 上下文继承**：`full`（延迟会话 fork）/ `compressed`（摘要注入 system prompt）/ `fresh`（无上下文）。
-- **项目归属**：会话的项目只经 `resolveNarratorProjectId`（SQL 侧 `narratorProjectIdText` / `narratorProjectIdColumn`）判断：有 `contextProjectId` 用它，否则用工作目录推导出的主链接；最长前缀匹配已有项目根，否则取 git 主仓库根并自动建公开项目，非 git 目录不建项目。权限与配置只看主项目，`additional` 链接只让会话出现在其他项目页。索引可随时整表重建（启动时后台分页重建）。
+- **项目归属**：会话的项目只经 `resolveNarratorProjectId`（SQL 侧 `narratorProjectIdText` / `narratorProjectIdColumn`）判断：有 `contextProjectId` 用它，否则用工作目录推导出的主链接；最长前缀匹配已有项目根，否则取 git 主仓库根并自动建公开项目，非 git 目录不建项目。权限与配置只看主项目，`additional` 链接只让会话出现在其他项目页。索引不要求 100% 正确、可随时整表重建；启动时不再全量重建，改为会话创建/切换目录/首次被打开（`GET /api/narrators/:id`，每进程每会话一次）时按需重新推导，手动设置项目目录时仍后台整表重建。
 - **Git worktrees**：会话 worktree 由 narrator worktree 资源管理；`<project.gitPath>/.worktrees/` 下叙事线时代留下的目录和分支没有任何记录，任何清理逻辑都不得删除它们。
 - **容器**：Podman 只用于插件与基准测试；设置页“工作区与容器”提供检测与安装。
 - **终端管理**：Unix 用 `Bun.Terminal`，Windows 用 `bun-pty`，统一 `TerminalRuntime` 接口；可选 dtach；生命周期绑定服务器进程。

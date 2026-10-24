@@ -16,6 +16,7 @@ import { resolveNarratorProjectId } from "../narrator-project";
 import {
 	ancestorKeys,
 	directoryKey,
+	ensureNarratorProjectLinks,
 	ensureProjectRootKeys,
 	resetProjectIndexStateForTests,
 	scheduleProjectIndexRebuild,
@@ -250,6 +251,22 @@ describe("rebuild", () => {
 
 		expect(await linksOf(moved)).toEqual([]);
 		expect((await linksOf(unindexed))[0]?.projectId).toBe((await projectsAt(repo))[0].id);
+	});
+});
+
+describe("lazy verification", () => {
+	test("derives links the first time a narrator is viewed, then skips it", async () => {
+		const repo = makeRepo("repo-lazy");
+		const narrator = await makeNarrator({ cwd: repo });
+		expect(await linksOf(narrator)).toEqual([]);
+
+		await ensureNarratorProjectLinks(narrator);
+		const projectId = (await projectsAt(repo))[0].id;
+		expect((await linksOf(narrator))[0]?.projectId).toBe(projectId);
+
+		await db.delete(narratorProjectLinks).where(eq(narratorProjectLinks.narratorId, narrator));
+		await ensureNarratorProjectLinks(narrator);
+		expect(await linksOf(narrator)).toEqual([]);
 	});
 });
 
