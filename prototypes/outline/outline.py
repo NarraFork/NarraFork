@@ -1917,6 +1917,9 @@ def cmd_verify(args) -> None:
 			for lk in st.links_from(addr, "based_on"):
 				tx.push({"op": "link.remove", "id": lk["id"]})
 				add_link(tx, addr, "based_on", lk["target"], lk["data"].get("excerpt"), args.ref or lk["data"].get("ref_name") or DEFAULT_REF)
+			# 假设经复核成立、并且有了证据，就是采纳（§5.4）
+			if st.blocks[addr]["props"].get("stance", "hypothesis") == "hypothesis" and (args.evidence or st.has_evidence(addr)):
+				guarded(tx, {"op": "block.update", "addr": addr, "props": {"stance": "accepted"}})
 		elif args.verdict == "refuted":
 			guarded(tx, {"op": "block.update", "addr": addr, "props": {"stance": "refuted"}})
 		else:
@@ -2381,7 +2384,7 @@ def build_parser() -> argparse.ArgumentParser:
 	s.add_argument("--ref", help="统一对照这个 ref；不写就按每个锚点建立时的 ref（默认 origin/main）")
 	s.add_argument("--fetch", action="store_true")
 
-	s = p("verify", cmd_verify, "复核断言：fresh（仍然成立）/ update（需要改写）/ refuted（不成立）")
+	s = p("verify", cmd_verify, "复核断言：fresh（成立；假设带上证据就变成采纳）/ update（需要改写）/ refuted（不成立）")
 	s.add_argument("addr")
 	s.add_argument("verdict", choices=["fresh", "update", "refuted"])
 	s.add_argument("--evidence", action="append")

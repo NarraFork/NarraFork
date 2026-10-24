@@ -126,7 +126,7 @@ python3 outline.py scope rm agent:w-x p/<页>                      # 缩小范�
 
 ```bash
 python3 outline.py fresh [--fetch]          # 按各锚点建立时的 ref 检查（默认 origin/main）；--fetch 先拉最新 main
-python3 outline.py verify p/<断言> fresh|update|refuted [--evidence ...]
+python3 outline.py verify p/<断言> fresh|update|refuted [--evidence ...]   # 假设复核成立、带上证据就变成采纳
 python3 outline.py candidates p/<计划根>     # 结项：提炼候选（结论、负面知识、遗留、过程）
 python3 outline.py archive p/<计划根>
 ```
