@@ -1193,6 +1193,8 @@ def cmd_recheck(args) -> None:
 def cmd_ask(args) -> None:
 	"""问人：问题、选项、建议和理由。结构写在属性里，不靠措辞（§3.3）。"""
 	actor = actor_of(args)
+	if not args.question:
+		return add_recommendation(args, actor)
 	with locked():
 		st = load_state()
 		space, parent = parent_and_space(st, args.parent)
@@ -1221,6 +1223,27 @@ def cmd_ask(args) -> None:
 		finish(tx, quiet=True)
 	if not tx.divert:
 		print(f"已提问 {tx.st.blocks[addrs[0]]['props'].get('alias')}（{addrs[0]}）给 {args.to}" + (f"，放在决策包「{args.bundle}」里" if args.bundle else "") + "；回答回来时会唤醒你")
+
+
+def add_recommendation(args, actor: str) -> None:
+	"""给已有的提问补上选项和建议：`ask Q11 --recommend "…" --reason "…"`。"""
+	if not args.recommend and not args.option:
+		raise OutlineError("给已有的提问补建议：写 --recommend（可以再加 --option）")
+	with locked():
+		st = load_state()
+		q = resolve(st, args.parent)
+		if not st.blocks[q]["props"].get("question"):
+			raise OutlineError(f"{args.parent} 不是提问；要新建提问，就在后面写上问题")
+		tx = Tx(st, actor, args.message or f"给 {st.blocks[q]['props'].get('alias') or q} 补建议")
+		start = len([c for c in st.children(q) if st.blocks[c]["props"].get("option")])
+		items = [dict(new_item(opt), extra={"option": start + i + 1}) for i, opt in enumerate(args.option or [])]
+		if args.recommend:
+			opts = [title_of(st.blocks[c]) for c in st.children(q) if st.blocks[c]["props"].get("option")] + list(args.option or [])
+			text = opts[int(args.recommend) - 1] if args.recommend.isdigit() and 0 < int(args.recommend) <= len(opts) else args.recommend
+			items.append(dict(new_item(f"建议：{text}" + (f"。{args.reason}" if args.reason else "")), extra={"rec": True}))
+		create_items(tx, st.blocks[q]["space"], q, items)
+		finish(tx, quiet=True)
+	print(f"已给 {st.blocks[q]['props'].get('alias') or q} 补上" + ("建议" if args.recommend else "选项") + "，它会带着建议出现在负责人的收件箱里")
 
 
 def recommendation(st: State, q: str) -> str | None:
@@ -1948,9 +1971,9 @@ def build_parser() -> argparse.ArgumentParser:
 	s.add_argument("--steal", action="store_true", help="接手别人正在做的任务")
 	s.add_argument("--force", action="store_true")
 	s.add_argument("-m", "--message")
-	s = p("ask", cmd_ask, "问人：问题、选项、建议和理由；回答回来时唤醒你")
-	s.add_argument("parent")
-	s.add_argument("question")
+	s = p("ask", cmd_ask, "问人：问题、选项、建议和理由；回答回来时唤醒你。只写已有提问的地址、不写问题，就是给它补建议")
+	s.add_argument("parent", help="放在哪里；或者一条已有的提问（给它补建议）")
+	s.add_argument("question", nargs="?")
 	s.add_argument("--option", action="append")
 	s.add_argument("--recommend", help="建议：选项编号，或一句话")
 	s.add_argument("--reason")
