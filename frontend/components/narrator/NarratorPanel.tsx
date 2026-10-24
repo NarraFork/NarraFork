@@ -843,6 +843,9 @@ function NarratorPanelBody({
 		async (messageId: string, newContent: string) => {
 			try {
 				await api.editAssistantMessage(narratorId, messageId, newContent);
+				// The `message_updated` broadcast can be deferred (reader not at the
+				// bottom) or declined as a non-prefix change, so force a refetch.
+				chunkListRef.current?.refreshStructure("full");
 			} catch (err) {
 				const message = err instanceof Error ? err.message : "Failed to edit message";
 				notifications.show({ title: t("editFailed"), message, color: "red" });
@@ -855,6 +858,7 @@ function NarratorPanelBody({
 		async (messageId: string) => {
 			try {
 				await api.restoreAssistantMessage(narratorId, messageId);
+				chunkListRef.current?.refreshStructure("full");
 			} catch (err) {
 				const message = err instanceof Error ? err.message : "Failed to restore message";
 				notifications.show({ title: t("editFailed"), message, color: "red" });
