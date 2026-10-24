@@ -609,22 +609,32 @@ def sync_basis(tx: Tx, addr: str, fallback: bool = True) -> None:
 	b = st.blocks[addr]
 	have = {lk["target"]: lk for lk in st.links_from(addr, "basis")}
 	want: dict[str, dict] = {}
+	spans: list[tuple[str, int, int]] = []
 	for path, l1, l2, sym in code_positions(b["content"]):
 		got = make_anchor(path, l1, l2, sym)
 		if not got:
 			tx.note(f"提示：{path}{':' + str(l1) if l1 else '#' + sym if sym else ''} 没能定位，按普通文字保留")
 			continue
 		want[got[0]] = got[1]
+		lo, _, hi = got[1]["lines"].partition("-")
+		spans.append((path, l1 or int(lo), (l2 or l1) or int(hi or lo)))
 	owner = evidence_owner(st, addr)
 	if owner and owner in st.traces:
-		files = {p for p, *_ in code_positions(b["content"])}
-		calls = [c for c in st.traces[owner]["calls"] if files & set(c["files"])]
-		for c in calls[-2:]:
-			want[f"trace:{owner}#{c['n']}"] = {"excerpt": c["excerpt"], "tool": c["tool"], "target": c["target"][:120]}
-	if not want and fallback and owner and is_agent(tx.actor) and not b["props"].get("report"):
-		rep = next((c for c in st.children(owner) if st.blocks[c]["props"].get("report")), None)
-		if rep and rep != addr and rep not in st.ancestors(addr):
-			want[rep] = {"candidate": True}
+		# 只挂真的读到过这几行的调用，读得越窄越优先
+		for path, a, z in spans:
+			cands = []
+			for c in st.traces[owner]["calls"]:
+				hit = [r for r in c.get("ranges", {}).get(path, []) if r[0] <= z and r[1] >= a]
+				if hit:
+					cands.append((min(r[1] - r[0] for r in hit), c["n"], c))
+			for _, _, c in sorted(cands)[:2]:
+				want[f"trace:{owner}#{c['n']}"] = {"excerpt": c["excerpt"], "tool": c["tool"], "target": c["target"][:120]}
+	in_report = any(st.blocks[x]["props"].get("report") for x in [addr, *st.ancestors(addr)])
+	rep = next((c for c in st.children(owner) if st.blocks[c]["props"].get("report")), None) if owner and not in_report else None
+	if rep and is_agent(tx.actor) and not any(lk["target"] == rep for lk in st.links_from(addr, "source")):
+		tx.push({"op": "link.add", "id": tx.link_id(), "from": addr, "kind": "source", "target": rep})  # 从报告整理出来的，出处指回报告
+	if not want and fallback and rep and is_agent(tx.actor):
+		want[rep] = {"candidate": True}
 	for target, lk in have.items():
 		if target.startswith("code:") and target not in want:
 			tx.push({"op": "link.remove", "id": lk["id"]})
@@ -1028,7 +1038,7 @@ def cmd_read(args) -> None:
 	addr = resolve(st, args.addr)
 	anc = st.ancestors(addr)
 	if anc:
-		print("位置：" + " › ".join(title_of(st.blocks[a])[:24] for a in reversed(anc)))
+		print("位置：" + " › ".join(title_of(st.blocks[a])[:40] for a in reversed(anc)))
 	if args.as_of is not None:
 		print(f"（时间机器：第 {args.as_of} 个提交时的样子）")
 	lines = render_block(st, addr, args.depth)
@@ -1072,6 +1082,11 @@ def cmd_add(args) -> None:
 	if not tx.divert:
 		for a in created:
 			print(f"+ {a}\t{title_of(tx.st.blocks[a])[:60]}")
+		lks = [lk for a in created for lk in tx.st.links_from(a, "basis")]
+		if lks:
+			n_code = sum(1 for lk in lks if lk["target"].startswith("code:"))
+			n_trace = sum(1 for lk in lks if lk["target"].startswith("trace:"))
+			print(f"依据：代码锚点 {n_code} 处，运行记录 {n_trace} 处，其他 {len(lks) - n_code - n_trace} 处（read --basis 看详情）")
 
 
 def cmd_edit(args) -> None:
@@ -1109,6 +1124,9 @@ def cmd_edit(args) -> None:
 					raise OutlineError(f"{owner} 正在做这个任务；确实要接手就加 --steal")
 				props.setdefault("assignee", owner or actor)
 			props["status"] = status
+			owner = b["props"].get("assignee")
+			if status != "doing" and owner and owner != actor and b["props"].get("status") == "doing":
+				tx.note(f"提示：这个任务原来是 {owner} 在做，已替它改成「{STATUS_ZH[status]}」")
 			if status == "done" and is_agent(actor):
 				open_kids = [a for a in st.subtree(addr)[1:] if st.is_task(a) and not st.blocks[a]["deleted"] and st.blocks[a]["props"].get("status") in ("todo", "doing")]
 				if open_kids:
@@ -1205,7 +1223,7 @@ def cmd_ask(args) -> None:
 			if existing:
 				under = existing[0]
 			else:
-				[under] = create_items(tx, space, parent, [dict(new_item(args.bundle), extra={"bundle": True})])
+				[under] = create_items(tx, space, parent, [dict(new_item(args.bundle), extra={"bundle": True})], after=resolve(st, args.after) if args.after else None)
 		q = dict(new_item(args.question, " "), extra={"question": True})
 		q["content"] = args.question
 		q["props"] = {"alias": "Q?"}
@@ -1216,7 +1234,7 @@ def cmd_ask(args) -> None:
 			rec["extra"] = {"rec": True} | ({"rec_option": int(args.recommend)} if args.recommend.isdigit() else {})
 			children.append(rec)
 		q["children"] = children
-		addrs = create_items(tx, space, under, [q])
+		addrs = create_items(tx, space, under, [q], after=resolve(st, args.after) if args.after and under == parent else None)
 		if not tx.divert:
 			qa = addrs[0]
 			tx.push({"op": "block.update", "addr": qa, "props": {"assignee": args.to, "manager": actor}})
@@ -1257,11 +1275,14 @@ def open_questions(st: State, who: str) -> list[str]:
 
 def cmd_answer(args) -> None:
 	actor = actor_of(args)
-	if args.text and (len(args.questions) > 1 or args.bundle):
+	if args.text and (len(args.questions) > 1 or args.bundle or args.tree):
 		raise OutlineError("--text 只能回答一条")
 	with locked():
 		st = load_state()
 		qs = [resolve(st, r) for r in args.questions]
+		for tname in args.tree or []:
+			root = resolve(st, tname)
+			qs += [x for x in st.subtree(root) if st.blocks[x]["props"].get("question") and st.blocks[x]["props"].get("status") in ("todo", "doing")]
 		for bname in args.bundle or []:
 			bundle = resolve(st, bname)
 			qs += [c for c in st.children(bundle) if st.blocks[c]["props"].get("question") and st.blocks[c]["props"].get("status") in ("todo", "doing")]
@@ -1460,6 +1481,20 @@ def board_lines(st: State, tasks: list[str]) -> list[str]:
 	return lines or ["（没有任务）"]
 
 
+def decision_groups(st: State, qs: list[str]) -> dict[str, list[str]]:
+	"""每件事的根：最上层的未答提问，或决策包。挂在一条提问下面的细项和包都算这一件。"""
+	groups: dict[str, list[str]] = {}
+	for q in qs:
+		anc = [x for x in st.ancestors(q) if st.blocks[x]["props"].get("question") and st.blocks[x]["props"].get("status") in ("todo", "doing")]
+		if anc:
+			key = anc[-1]
+		else:
+			par = st.blocks[q]["parent"]
+			key = par if par and st.blocks[par]["props"].get("bundle") else q
+		groups.setdefault(key, []).append(q)
+	return groups
+
+
 def inbox_lines(st: State, who: str) -> list[str]:
 	lines = []
 	pend = [p for p in st.pending.values() if p["status"] == "pending" and can_decide(st, who, p)]
@@ -1469,30 +1504,27 @@ def inbox_lines(st: State, who: str) -> list[str]:
 		lines.append("")
 	qs = open_questions(st, who)
 	if qs:
-		bundles: dict[str | None, list[str]] = {}
-		for q in qs:
-			par = st.blocks[q]["parent"]
-			key = par if par and st.blocks[par]["props"].get("bundle") else None
-			bundles.setdefault(key, []).append(q)
-		n_b = sum(1 for k in bundles if k)
-		lines.append(f"### 等你回答（{n_b} 个决策包，{len(bundles.get(None, []))} 条单独的问题）")
-		for key, group in sorted(bundles.items(), key=lambda kv: kv[0] is None):  # 决策包排前面
-			if key:
-				with_rec = sum(1 for q in group if recommendation(st, q))
-				lines.append(f"- 决策包「{title_of(st.blocks[key])}」：{len(group)} 条，{with_rec} 条有建议 → 全部采纳：`outline.py --as {who} answer --bundle {key}`")
-				for q in group:
-					rec = recommendation(st, q)
-					lines.append(f"  - {st.blocks[q]['props'].get('alias', '')} {title_of(st.blocks[q])[:60]}" + (f"\n    {title_of(st.blocks[rec])[:80]}" if rec else ""))
-			else:
-				for q in group:
-					rec = recommendation(st, q)
-					lines.append(f"- {st.blocks[q]['props'].get('alias', '')} {title_of(st.blocks[q])[:70]}" + (f"\n  {title_of(st.blocks[rec])[:80]}" if rec else ""))
+		groups = decision_groups(st, qs)
+		lines.append(f"### 等你决定（{len(groups)} 件）")
+		for key, group in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+			kb = st.blocks[key]
+			name = (kb["props"].get("alias") + " " if kb["props"].get("alias") else "") + title_of(kb)[:60]
+			if len(group) == 1:
+				rec = recommendation(st, key)
+				lines.append(f"- {name}" + (f"\n  {title_of(st.blocks[rec])[:90]}" if rec else "（还没有建议）"))
+				continue
+			with_rec = sum(1 for q in group if recommendation(st, q))
+			how = f"answer --tree {key}" if kb["props"].get("question") else f"answer --bundle {key}"
+			lines.append(f"- {name}：{len(group)} 条，{with_rec} 条有建议 → 全部采纳：`outline.py --as {who} {how}`")
+			for q in group:
+				rec = recommendation(st, q)
+				lines.append(f"  - {st.blocks[q]['props'].get('alias', '')} {title_of(st.blocks[q])[:60]}" + (f"\n    {title_of(st.blocks[rec])[:80]}" if rec else ""))
 		lines.append("")
 	return lines or ["收件箱是空的"]
 
 
 def cmd_inbox(args) -> None:
-	print("\n".join(inbox_lines(load_state(), args.who or "human:owner")))
+	print("\n".join(inbox_lines(load_state(), args.who or actor_of(args))))
 
 
 def digest_lines(st: State, since: int) -> list[str]:
@@ -1517,10 +1549,8 @@ def digest_lines(st: State, since: int) -> list[str]:
 		lines.append("**标为不成立**")
 		lines += [f"- [{a}] {title_of(st.blocks[a])[:50]}：{st.blocks[a]['props']['invalid'][:40]}" for a in inval]
 	pend = [p for p in st.pending.values() if p["status"] == "pending"]
-	qs = open_questions(st, "human:owner")
-	bundles = {st.blocks[q]["parent"] for q in qs if st.blocks[q]["parent"] and st.blocks[st.blocks[q]["parent"]]["props"].get("bundle")}
-	single = [q for q in qs if st.blocks[q]["parent"] not in bundles]
-	lines.append(f"**等你决定**：{len(pend)} 条待确认，{len(bundles)} 个决策包，{len(single)} 条单独的问题（`outline.py inbox` 看详情）")
+	groups = decision_groups(st, open_questions(st, "human:owner"))
+	lines.append(f"**等你决定**：{len(pend)} 条待确认，{len(groups)} 件要回答的事（`outline.py inbox --who human:owner` 看详情）")
 	return lines
 
 
@@ -1751,7 +1781,7 @@ def cmd_attach(args) -> None:
 		st = load_state()
 		task = resolve(st, args.task)
 		tx = Tx(st, args.author, f"挂上 {args.author} 的报告", kind="system")
-		[addr, *rest] = create_items(tx, st.blocks[task]["space"], task, [root], basis=False)
+		[addr, *rest] = create_items(tx, st.blocks[task]["space"], task, [root])
 		finish(tx, quiet=True)
 	print(f"已挂上 [{addr}] {title_of(tx.st.blocks[addr])[:50]}：{len(rest) + 1} 个块")
 
@@ -1898,8 +1928,42 @@ def parse_transcript(path: Path) -> list[dict]:
 		res, err = results.get(uid, ("", False))
 		target = str(inp.get("file_path") or inp.get("command") or inp.get("pattern") or inp.get("path") or json.dumps(inp, ensure_ascii=False))
 		files = repo_paths(target) if name == "Bash" else repo_paths(str(inp.get("file_path") or inp.get("path") or ""))
-		calls.append({"n": n, "tool": name, "target": target[:300], "files": sorted(files)[:20], "ok": not err, "excerpt": res.strip()[:300]})
+		calls.append({"n": n, "tool": name, "target": target[:300], "files": sorted(files)[:20], "ranges": read_ranges(name, inp, target, res, files, repo_paths), "ok": not err, "excerpt": res.strip()[:300]})
 	return calls[:400]
+
+
+WHOLE = 10**9
+
+
+def read_ranges(name: str, inp: dict, cmd: str, res: str, files: set[str], repo_paths=None) -> dict[str, list[list[int]]]:
+	"""这次调用读到了文件的哪些行：Read 的 offset/limit、sed -n、head、cat，以及 grep -n 输出里的行号。"""
+	out: dict[str, list[list[int]]] = {}
+	if not files:
+		return out
+	if name == "Read":
+		off, lim = int(inp.get("offset") or 1), inp.get("limit")
+		return {f: [[off, off + int(lim) - 1] if lim else [1, WHOLE]] for f in files}
+	if name != "Bash":
+		return out
+	# 按 ; && || 换行切成几段，每段只碰一个文件时，段里的行号才能确定属于它
+	segs = [x for x in re.split(r"\s*(?:;|&&|\|\||\n)\s*", cmd) if x.strip()]
+	for f in files:
+		rngs: list[list[int]] = []
+		for seg in segs:
+			if repo_paths is not None and repo_paths(seg) != {f}:
+				continue
+			rngs += [[int(a), int(b)] for a, b in re.findall(r"sed\s+-n\s+['\"]?(\d+),(\d+)p", seg)]
+			rngs += [[int(a), int(b)] for a, b in re.findall(r"NR\s*>=\s*(\d+)\s*&&\s*NR\s*<=\s*(\d+)", seg)]
+			if m := re.search(r"\bhead\s+-n?\s*(\d+)", seg):
+				rngs.append([1, int(m.group(1))])
+			if re.match(r"\s*(?:cat|nl|less)\s", seg) and not re.search(r"sed|head|tail|grep|awk", seg):
+				rngs.append([1, WHOLE])
+		if len(files) == 1 and len(segs) == 1:  # 输出里的行号只在单个文件、单段命令时可信
+			rngs += [[int(x), int(x)] for x in re.findall(r"(?m)^\s*(\d+)[:-]", res)][:40]
+		rngs += [[int(x), int(x)] for x in re.findall(rf"(?m)^(?:\./)?{re.escape(f)}[:-](\d+)[:-]", res)][:40]
+		if rngs:
+			out[f] = rngs[:60]
+	return out
 
 
 def cmd_trace(args) -> None:
@@ -1960,7 +2024,7 @@ def build_parser() -> argparse.ArgumentParser:
 	s.add_argument("parent", help="父块，或 p/ 表示在空间顶层新建页")
 	s.add_argument("text", nargs="?")
 	s.add_argument("--md", help="从文件读大纲；- 表示标准输入")
-	s.add_argument("--after", help="插在这个块后面；多条依次往后接")
+	s.add_argument("--after", help="插在这个块后面（同一个父块下）；多条依次往后接")
 	s.add_argument("-m", "--message")
 	s = p("edit", cmd_edit, "改正文、勾复选框、改属性")
 	s.add_argument("addr")
@@ -1974,11 +2038,12 @@ def build_parser() -> argparse.ArgumentParser:
 	s = p("ask", cmd_ask, "问人：问题、选项、建议和理由；回答回来时唤醒你。只写已有提问的地址、不写问题，就是给它补建议")
 	s.add_argument("parent", help="放在哪里；或者一条已有的提问（给它补建议）")
 	s.add_argument("question", nargs="?")
-	s.add_argument("--option", action="append")
+	s.add_argument("--option", action="append", help="一个选项；可以写多次")
 	s.add_argument("--recommend", help="建议：选项编号，或一句话")
-	s.add_argument("--reason")
-	s.add_argument("--bundle", help="放进同名的决策包，人可以一次回答一整包")
-	s.add_argument("--to", default="human:owner")
+	s.add_argument("--reason", help="建议的理由")
+	s.add_argument("--bundle", help="放进同名的决策包（建在 parent 下面；parent 是一条提问时，包就挂在这条提问下面）")
+	s.add_argument("--after", help="新提问或新决策包插在这个块后面")
+	s.add_argument("--to", default="human:owner", help="交给谁回答（默认 human:owner）")
 	s.add_argument("-m", "--message")
 	s = p("invalid", cmd_invalid, "标为不成立（试过不行的方案、被推翻的结论）")
 	s.add_argument("addr")
@@ -1989,10 +2054,10 @@ def build_parser() -> argparse.ArgumentParser:
 	s.add_argument("space", nargs="?")
 	s = p("board", cmd_board, "任务看板")
 	s.add_argument("--under")
-	s = p("inbox", cmd_inbox, "收件箱：待你确认的改动、等你回答的问题")
+	s = p("inbox", cmd_inbox, "收件箱：待你确认的改动、等你回答的问题（默认看自己的，--who human:owner 看负责人的）")
 	s.add_argument("--who")
 	s = p("digest", cmd_digest, "汇报：这段时间变了什么、什么在等人")
-	s.add_argument("--since", type=int)
+	s.add_argument("--since", type=int, help="从第几个提交算起（默认最近 20 个）")
 	s = p("log", cmd_log, "提交记录")
 	s.add_argument("-n", type=int, default=20)
 	s.add_argument("--since", type=int)
@@ -2034,6 +2099,7 @@ def build_parser() -> argparse.ArgumentParser:
 	s = p("answer", cmd_answer, "回答提问（人用）：不写 --text/--option 就采纳建议")
 	s.add_argument("questions", nargs="*")
 	s.add_argument("--bundle", action="append", help="一次回答一整个决策包")
+	s.add_argument("--tree", action="append", help="一次回答一条提问和挂在它下面的全部细项")
 	s.add_argument("--text")
 	s.add_argument("--option", type=int)
 	s.add_argument("-m", "--message")
