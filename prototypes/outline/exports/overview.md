@@ -1,4 +1,4 @@
-<!-- 由 prototypes/outline/outline.py export 生成（第 14 个提交）。真相源是 data/log.jsonl，不要手改。 -->
+<!-- 由 prototypes/outline/outline.py export 生成（第 16 个提交）。真相源是 data/log.jsonl，不要手改。 -->
 
 # 大纲总览
 
@@ -123,7 +123,7 @@
     - [p/SYEAKBsz] 多 agent 试用：子代理领任务、写结果、提交验收，管理者代批 ‹任务·待办›
     - [p/dtLLZ8zT] 新鲜度检查对着最新的 main 跑一次（先 fetch） ‹任务·完成·执行：agent:main›
       ↳ 证据：tool:outline fresh --fetch @b256a9ef
-      - [p/AbuH7dSE] 结果：main 从 7c5170d7 前进到 b256a9ef（60 个提交），15 处代码锚点全部新鲜
+      - [p/AbuH7dSE] 结果：main 从 7c5170d7 前进到 b256a9ef（60 个提交），13 处代码锚点全部新鲜
     - [p/eYUSIhDP] 把原型发现整理回设计文档 ‹任务·待办›
       ↳ 前置：p/NVqKvrzA
   - [p/ydKe7oMn] P0 设计与验证 ‹P0·任务·待办›
@@ -182,6 +182,8 @@
     ↳ 证据：commit:aae9623b
   - [p/JNYdq1NP] 看板要区分「可以开始」和「等前置」：前置没完成的任务看起来和普通待办一样；原型改为推导出「等前置」标记，不写进状态 ‹断言·采纳·#发现›
     ↳ 证据：tool:outline-board
+  - [p/wJsEdT5n] 工具输出里要直接给出数量（检查了几处锚点、改了几个块），agent 凭记忆写数字容易写错：录入时把 13 处锚点写成了 15，见第 15 个提交的更正 ‹断言·采纳·#发现›
+    ↳ 证据：tool:outline-log
 
 - [p/a4bsGcVR] 概念与规则 ‹概念›
   - [p/CQhWv1YD] 六个概念：块、类型、链接、空间、提交、层。详见 docs/OUTLINE_KNOWLEDGE-DESIGN.md §2

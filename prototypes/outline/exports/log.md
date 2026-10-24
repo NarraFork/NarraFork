@@ -1,7 +1,9 @@
-<!-- 由 prototypes/outline/outline.py export 生成（第 14 个提交）。真相源是 data/log.jsonl，不要手改。 -->
+<!-- 由 prototypes/outline/outline.py export 生成（第 16 个提交）。真相源是 data/log.jsonl，不要手改。 -->
 
 # 最近的提交
 
+- #16 2026-10-24T05:47 agent:main（代 human:owner）：新增 1 个条目
+- #15 2026-10-24T05:47 agent:main（代 human:owner）：更正锚点数量（15 → 13）
 - #14 2026-10-24T05:47 agent:main（代 human:owner）：任务 done p/dtLLZ8zT
 - #13 2026-10-24T05:47 agent:main（代 human:owner）：新增 1 个条目
 - #12 2026-10-24T05:47 agent:main（代 human:owner）：任务 start p/dtLLZ8zT

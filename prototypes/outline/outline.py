@@ -1599,9 +1599,11 @@ def cmd_fresh(args) -> None:
 	cache = fresh_cache()
 	head = ref_commit(args.ref)
 	report: dict[str, list[str]] = {}
+	checked = 0
 	for lk in st.links.values():
 		if lk.get("removed") or lk["role"] != "based_on" or not re.match(r"^(code|grep):", lk["target"]):
 			continue
+		checked += 1
 		fp, why = fingerprint(lk["target"], args.ref)
 		if fp is None:
 			state = "expired"
@@ -1614,9 +1616,9 @@ def cmd_fresh(args) -> None:
 			report.setdefault(lk["from"], []).append(f"{lk['target']}：{why}")
 	_local("fresh.json").write_text(json.dumps(cache, ensure_ascii=False, indent=1), encoding="utf-8")
 	if not report:
-		print(f"对照 {args.ref}（{head}）：全部新鲜")
+		print(f"对照 {args.ref}（{head}）：{checked} 处锚点全部新鲜")
 		return
-	print(f"对照 {args.ref}（{head}）：{len(report)} 条断言需要复核")
+	print(f"对照 {args.ref}（{head}）：检查了 {checked} 处锚点，{len(report)} 条断言需要复核")
 	for addr, why in report.items():
 		print(f"- [{addr}] {first_line(st.blocks[addr]['content'], 60)}")
 		for w in why:
