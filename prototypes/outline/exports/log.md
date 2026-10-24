@@ -1,29 +1,84 @@
-<!-- 由 prototypes/outline/outline.py export 生成（第 25 个提交）。真相源是 data/log.jsonl，不要手改。 -->
+<!-- 由 prototypes/outline/outline.py export 生成（第 113 个提交）。真相源是 data/log.jsonl，不要手改。 -->
 
 # 最近的提交
 
-- #25 2026-10-24T06:00 agent:main（代 human:owner）：任务 start p/SYEAKBsz
-- #24 2026-10-24T06:00 agent:main（代 human:owner）：派给专注 agent，要验收
-- #23 2026-10-24T06:00 agent:main（代 human:owner）：派给专注 agent，要验收
-- #22 2026-10-24T06:00 agent:main（代 human:owner）：登记参与者 agent:w-reflection
-- #21 2026-10-24T06:00 agent:main（代 human:owner）：登记参与者 agent:w-dialect
-- #20 2026-10-24T06:00 agent:main（代 human:owner）：登记参与者 agent:steward
-- #19 2026-10-24T06:00 agent:main（代 human:owner）：记下负责人的新要求：专注与协调
-- #18 2026-10-24T06:00 agent:main（代 human:owner）：任务 done p/RsN47wP2
-- #17 2026-10-24T06:00 agent:main（代 human:owner）：任务 start p/RsN47wP2
-- #16 2026-10-24T05:47 agent:main（代 human:owner）：新增 1 个条目
-- #15 2026-10-24T05:47 agent:main（代 human:owner）：更正锚点数量（15 → 13）
-- #14 2026-10-24T05:47 agent:main（代 human:owner）：任务 done p/dtLLZ8zT
-- #13 2026-10-24T05:47 agent:main（代 human:owner）：新增 1 个条目
-- #12 2026-10-24T05:47 agent:main（代 human:owner）：任务 start p/dtLLZ8zT
-- #11 2026-10-24T05:46 agent:main（代 human:owner）：新增 1 个条目
-- #10 2026-10-24T05:46 agent:main（代 human:owner）：任务 done p/NVqKvrzA
-- #9 2026-10-24T05:46 agent:main（代 human:owner）：任务 done p/uHnUVJL1
-- #8 2026-10-24T05:46 agent:main（代 human:owner）：记下负责人的偏好（转成 CR1）
-- #7 2026-10-24T05:46 agent:main（代 human:owner）：录入概念与规则
-- #6 2026-10-24T05:46 agent:main（代 human:owner）：记录原型发现
-- #5 2026-10-24T05:46 agent:main（代 human:owner）：录入路线图（草稿计划）
-- #4 2026-10-24T05:45 agent:main（代 human:owner）：录入待定问题
-- #3 2026-10-24T05:45 agent:main（代 human:owner）：录入现状盘点（锚在代码上）
-- #2 2026-10-24T05:45 agent:main（代 human:owner）：录入设计决策 D1–D15
-- #1 2026-10-24T05:45 human:owner：初始化：空间与参与者
+- #113 2026-10-24T08:00 agent:main（责任人 human:owner）：推进决策：提问都写了建议，等负责人回答
+- #112 2026-10-24T08:00 agent:main（责任人 human:owner）：原型发现已整理回设计文档（两轮试用、提问交接、范围细则、往返不丢）
+- #111 2026-10-24T07:59 agent:main（责任人 human:owner）：多 agent 试用两轮都跑完了
+- #110 2026-10-24T07:59 agent:main（责任人 human:owner）：多 agent 试用：第二轮结果和摩擦的处理
+- #109 2026-10-24T07:59 agent:main（责任人 human:owner）：原型发现：第二轮收尾时发现的问题
+- #108 2026-10-24T07:59 agent:main（责任人 human:owner）：给 Q31 写建议
+- #107 2026-10-24T07:59 agent:main（责任人 human:owner）：给 Q29 写建议
+- #106 2026-10-24T07:59 agent:main（责任人 human:owner）：验收：复现可信，结论、提问、复核都已记好
+- #105 2026-10-24T07:58 agent:w-table，由 agent:main 代记（责任人 human:owner）：保存复现脚本 headless.ts（原文件在会话临时目录）
+- #104 2026-10-24T07:58 agent:w-table，由 agent:main 代记（责任人 human:owner）：保存复现脚本 fix.ts（原文件在会话临时目录）
+- #103 2026-10-24T07:58 agent:w-table，由 agent:main 代记（责任人 human:owner）：保存复现脚本 repro.ts（原文件在会话临时目录）
+- #102 2026-10-24T07:58 agent:w-table，由 agent:main 代记（责任人 human:owner）：保存复现脚本 cases.ts（原文件在会话临时目录）
+- #101 2026-10-24T07:58 agent:w-table，由 agent:main 代记（责任人 human:owner）：保存复现脚本 harness.ts（原文件在会话临时目录）
+- #100 2026-10-24T07:58 agent:w-table，由 agent:main 代记（责任人 human:owner）：保存复现脚本 package.json（原文件在会话临时目录）
+- #99 2026-10-24T07:58 agent:w-table，由 agent:main 代记（责任人 human:owner）：挂上报告 fix-all-3.32.txt
+- #98 2026-10-24T07:58 agent:w-table，由 agent:main 代记（责任人 human:owner）：挂上报告 fix-all-output.txt
+- #97 2026-10-24T07:58 agent:w-table，由 agent:main 代记（责任人 human:owner）：挂上报告 repro-output.txt
+- #96 2026-10-24T07:54 agent:main（责任人 human:owner）：给复核成立的假设补一句复核说明（verify 的 --note 在转成请求时丢了）
+- #95 2026-10-24T07:54 agent:main（责任人 human:owner）：把 Q31 挪回「已回答」之前（转成请求后批准时丢了插入位置）
+- #94 2026-10-24T07:54 agent:main（责任人 human:owner）：把 Q30 挪回「已回答」之前（转成请求后批准时丢了插入位置）
+- #93 2026-10-24T07:54 agent:main（责任人 human:owner）：把 Q29 挪回「已回答」之前（转成请求后批准时丢了插入位置）
+- #92 2026-10-24T07:54 agent:main（责任人 human:owner）：把 Q28 挪回「已回答」之前（转成请求后批准时丢了插入位置）
+- #91 2026-10-24T07:54 agent:main（责任人 human:owner）：把 Q27 挪回「已回答」之前（转成请求后批准时丢了插入位置）
+- #90 2026-10-24T07:54 agent:main（责任人 human:owner）：批准 CR4
+- #89 2026-10-24T07:54 agent:main（责任人 human:owner）：批准 CR3
+- #88 2026-10-24T07:54 agent:main（责任人 human:owner）：批准 CR2
+- #87 2026-10-24T07:51 agent:steward2（责任人 human:owner）：第二轮协调者（agent:steward2）的试用摩擦：代记 w-table 的核实报告（转成 CR4）
+- #86 2026-10-24T07:48 agent:steward2（责任人 human:owner）：协调者笔记：代记说明、转出的请求、复核意见
+- #85 2026-10-24T07:48 agent:w-table，由 agent:steward2 代记（责任人 human:owner）：代交：核实完成，表格确实会丢（agent:w-table，steward2 代记）
+- #84 2026-10-24T07:47 agent:steward2（责任人 human:owner）：按 w-table 的核实结论复核 Q6 的顺带发现：成立（转成 CR3）
+- #83 2026-10-24T07:47 agent:steward2（责任人 human:owner）：w-table 报告「需要人决定的点」建成 5 条提问（有倾向的写了建议）（转成 CR2）
+- #82 2026-10-24T07:46 agent:w-table，由 agent:steward2 代记（责任人 human:owner）：代记 w-table 的核实结论（10 条断言）
+- #81 2026-10-24T07:44 agent:w-table，由 agent:steward2 代记（责任人 human:owner）：挂上 w-table 的核实报告（原文在会话临时目录，挂进大纲后证据不再悬空）
+- #80 2026-10-24T07:10 agent:main（责任人 human:owner）：开始把原型发现整理回设计文档
+- #79 2026-10-24T07:10 agent:main（责任人 human:owner）：多 agent 试用：第一轮结果、摩擦的处理、第二轮开始
+- #78 2026-10-24T07:10 agent:main（责任人 human:owner）：原型发现：设计文档重排、注意范围、建议、挂回报告
+- #77 2026-10-24T07:10 agent:main（责任人 human:owner）：给 Q26 写建议
+- #76 2026-10-24T07:10 agent:main（责任人 human:owner）：给 Q25 写建议
+- #75 2026-10-24T07:10 agent:main（责任人 human:owner）：给 Q24 写建议
+- #74 2026-10-24T07:10 agent:main（责任人 human:owner）：给 Q23 写建议
+- #73 2026-10-24T07:10 agent:main（责任人 human:owner）：给 Q22 写建议
+- #72 2026-10-24T07:10 agent:main（责任人 human:owner）：给 Q21 写建议
+- #71 2026-10-24T07:10 agent:main（责任人 human:owner）：给 Q20 写建议
+- #70 2026-10-24T07:10 agent:main（责任人 human:owner）：给 Q19 写建议
+- #69 2026-10-24T07:10 agent:main（责任人 human:owner）：给 Q18 写建议
+- #68 2026-10-24T07:10 agent:main（责任人 human:owner）：给 Q17 写建议
+- #67 2026-10-24T07:10 agent:main（责任人 human:owner）：给 Q5 写建议
+- #66 2026-10-24T07:10 agent:main（责任人 human:owner）：给 Q4 写建议
+- #65 2026-10-24T07:10 agent:main（责任人 human:owner）：给 Q3 写建议
+- #64 2026-10-24T07:10 agent:main（责任人 human:owner）：给 Q2 写建议
+- #63 2026-10-24T07:10 agent:main（责任人 human:owner）：给 Q1 写建议
+- #62 2026-10-24T07:09 agent:main（责任人 human:owner）：记下 D17：注意范围与多工作区
+- #61 2026-10-24T07:09 agent:w-table，由 agent:main 代记（责任人 human:owner）：专注 agent 开工（它不碰大纲，由派它的 agent:main 代记）
+- #60 2026-10-24T07:08 agent:main（责任人 human:owner）：给专注 agent 圈泡：它的任务
+- #59 2026-10-24T07:08 agent:main（责任人 human:owner）：圈错了泡：脚本把正文里的提及当成了任务地址
+- #58 2026-10-24T07:08 agent:main（责任人 human:owner）：给第二轮协调者圈泡：提问页只关注
+- #57 2026-10-24T07:08 agent:main（责任人 human:owner）：给第二轮协调者圈泡：任务所在的页
+- #56 2026-10-24T07:08 agent:main（责任人 human:owner）：给专注 agent 圈泡：要看的代码
+- #55 2026-10-24T07:08 agent:main（责任人 human:owner）：给专注 agent 圈泡：它的任务
+- #54 2026-10-24T07:08 agent:main（责任人 human:owner）：第二轮多 agent 试用：派专注 agent 核实现有产品里的疑似数据丢失
+- #53 2026-10-24T07:08 agent:main（责任人 human:owner）：登记参与者 agent:w-table
+- #52 2026-10-24T07:08 agent:main（责任人 human:owner）：登记参与者 agent:steward2
+- #51 2026-10-24T07:06 agent:main（责任人 human:owner）：提问约定：提问留给做决定的人，调研是子任务，交接靠「建议」（原型发现）
+- #50 2026-10-24T07:06 agent:main（责任人 human:owner）：章节号随设计文档重排更新：§10.4 → §11.4
+- #49 2026-10-24T07:06 agent:main（责任人 human:owner）：章节号随设计文档重排更新：§10.4 → §11.4
+- #48 2026-10-24T07:06 agent:main（责任人 human:owner）：章节号随设计文档重排更新：§16 → §17
+- #47 2026-10-24T07:06 agent:w-reflection，由 agent:main 代记（责任人 human:owner）：挂上 Q13 的调研报告（原文在会话临时目录，挂进大纲后证据不再悬空）
+- #46 2026-10-24T07:06 agent:w-dialect，由 agent:main 代记（责任人 human:owner）：挂上 Q6 的调研报告（原文在会话临时目录，挂进大纲后证据不再悬空）
+- #45 2026-10-24T06:46 agent:main（责任人 human:owner）：验收 Q13：任务反思调研完整，待决定的点已建成 Q25、Q26
+- #44 2026-10-24T06:46 agent:main（责任人 human:owner）：验收 Q6：方言调研完整，待决定的点已建成 Q17–Q24
+- #43 2026-10-24T06:44 agent:steward（责任人 human:owner）：协调者试用代记的发现（14 条）
+- #42 2026-10-24T06:41 agent:w-reflection，由 agent:steward 代记（责任人 human:owner）：代交 Q13：任务反思调研完成（agent:w-reflection，steward 代记）
+- #41 2026-10-24T06:41 agent:steward（责任人 human:owner）：协调者：Q13 的提问索引和看法
+- #40 2026-10-24T06:40 agent:w-reflection，由 agent:steward 代记（责任人 human:owner）：代记 Q13 调研结论（agent:w-reflection 的报告）
+- #39 2026-10-24T06:40 agent:steward（责任人 human:owner）：建提问 Q26（来自 Q13 调研）
+- #38 2026-10-24T06:40 agent:steward（责任人 human:owner）：建提问 Q25（来自 Q13 调研）
+- #37 2026-10-24T06:39 agent:w-dialect，由 agent:steward 代记（责任人 human:owner）：代交 Q6：方言调研完成（agent:w-dialect，steward 代记）
+- #36 2026-10-24T06:39 agent:steward（责任人 human:owner）：协调者：Q6 的提问索引和看法
+- #35 2026-10-24T06:39 agent:w-dialect，由 agent:steward 代记（责任人 human:owner）：代记 Q6 调研结论（agent:w-dialect 的报告）
+- #34 2026-10-24T06:38 agent:steward（责任人 human:owner）：Q6 调研的标签问题并入 Q10
