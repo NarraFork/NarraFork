@@ -1281,6 +1281,7 @@ export async function executeTool(
 			blockedSkills: config.blockedSkills,
 			parentNarratorId: config.parentNarratorId,
 			runtimePolicy: config.runtimePolicy,
+			bot: config.bot,
 			userId: config.userId,
 			projectId: config.projectId,
 			requestPermission: (toolName, input, toolUseId) =>

@@ -136,6 +136,8 @@ export interface ToolContext {
 	blockedSkills?: { all: boolean; names: string[] } | null;
 	/** Server-resolved capability ceiling, copied from AgentConfig, never tool input. */
 	runtimePolicy?: RuntimePolicy;
+	/** Copied from `AgentConfig.bot`: a bot's own loop stays free for the conversation. */
+	bot?: boolean;
 	/** Parent narrator ID — set for subagents, used for Team file-change tracking */
 	parentNarratorId?: string;
 	/**

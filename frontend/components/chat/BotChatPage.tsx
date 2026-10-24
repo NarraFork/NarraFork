@@ -27,6 +27,7 @@ import {
 	SAFE_AREA_INSET_RIGHT,
 } from "../../lib/safe-area";
 import { NarratorAvatar } from "../narrator/header/NarratorAvatar";
+import { BotChatComposer } from "./BotChatComposer";
 import { botActivity } from "./bot-activity";
 import { ChatRoomView } from "./ChatRoomView";
 import { CHAT_HEADER_HEIGHT } from "./chat-header";
@@ -191,6 +192,14 @@ export function BotChatPage({
 						key={room.id}
 						roomId={room.id}
 						readOnlyReason={canPost ? undefined : t("botReadOnly")}
+						renderComposer={({ replyTo, onSent }) => (
+							<BotChatComposer
+								narratorId={narratorId}
+								roomId={room.id}
+								replyTo={replyTo}
+								onSent={onSent}
+							/>
+						)}
 					/>
 				) : error ? (
 					<Text size="sm" c="red" p="md">

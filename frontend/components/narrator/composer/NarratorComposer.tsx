@@ -201,8 +201,13 @@ export interface NarratorComposerProps {
 	 * the draft persists in this browser only, the slash menu resolves from
 	 * `draft.cwd`, and session-bound features (server draft sync, prompt
 	 * optimization) are off.
+	 *
+	 * `sessionId` names a real session behind a local-only draft (a bot's chat):
+	 * file search and prompt optimization then run against it, while the draft
+	 * still never touches that session's own composer. `commands: false` hides
+	 * the slash menu where the text is delivered literally.
 	 */
-	draft?: { cwd: string | null };
+	draft?: { cwd: string | null; sessionId?: string; commands?: boolean };
 	/**
 	 * False keeps the editor in its expanded layout (multi-line box, controls on a
 	 * row below) instead of collapsing to one line while short.
@@ -735,7 +740,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 
 		// Prompt optimization hook
 		const optimizeHook = usePromptOptimize({
-			narratorId,
+			narratorId: draft?.sessionId ?? narratorId,
 			textareaRef: useRef<HTMLTextAreaElement>(null),
 			target: () => composerOptimizeTarget(editorRef.current),
 			onOptimized: (text) => {
@@ -1277,7 +1282,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			? ""
 			: bodyText;
 		// Only fetch commands when user starts typing "/" to avoid unnecessary API call on page load
-		const typingCommand = commandInput.startsWith("/");
+		const typingCommand = commandInput.startsWith("/") && draft?.commands !== false;
 		const { data: sessionCommands } = useNarratorCommands(
 			typingCommand && !draft ? narratorId : undefined,
 		);
@@ -1285,11 +1290,13 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 			draft?.cwd ?? null,
 			typingCommand && !!draft,
 		);
-		const commandsList = draft ? draftCommands : sessionCommands;
+		const commandsList =
+			draft?.commands === false ? undefined : draft ? draftCommands : sessionCommands;
 		// Show command popover only when typing command name (no space yet),
 		// or when typing optional tool sub-completion (/load <tool>, /unload <tool>).
 		// Suppress when browsing input history so arrow keys keep navigating history.
 		const commandPopoverVisible =
+			typingCommand &&
 			editorFocused &&
 			commandInput.startsWith("/") &&
 			!commandInput.includes("\n") &&
@@ -1825,7 +1832,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 					onClose={closeMentionPopover}
 				/>
 				<FileReferencePopover
-					narratorId={narratorId}
+					narratorId={draft?.sessionId ?? narratorId}
 					context={fileScope.context}
 					cacheScope={fileCacheScope}
 					query={fileQuery}
@@ -1947,7 +1954,7 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 								</Button>
 							)}
 							<TextareaOptimizeControls
-								optimizeAvailable={!draft}
+								optimizeAvailable={!draft || !!draft.sessionId}
 								disabled={!bodyText.trim() || optimizeHook.loading || sending}
 								loading={optimizeHook.loading}
 								withContext={optimizeHook.withContext}

@@ -428,8 +428,11 @@ export const agentTool: ToolDefinition = {
 		// Normalize timeout leniently: floats/strings/negatives → sane non-negative int
 		// (0 = no wall-clock limit).
 		const timeout = normalizeNumber(raw.timeout, { min: 0, max: Number.MAX_SAFE_INTEGER });
-		// Prefer new name, fall back to legacy name for in-flight conversations
-		const run_in_background = raw.run_in_background ?? raw.background;
+		// Prefer new name, fall back to legacy name for in-flight conversations.
+		// A bot never runs one in the foreground: that would hold its loop — and every
+		// person waiting on a reply — for the whole task. The result arrives as its next
+		// input instead, like any background completion.
+		const run_in_background = ctx.bot ? true : (raw.run_in_background ?? raw.background);
 
 		// Resolve effective cwd: use workdir if provided, otherwise parent's cwd
 		const resolvedWorkdir = workdir ? resolvePath(ctx.cwd, workdir) : ctx.cwd;

@@ -59,15 +59,12 @@ import {
 } from "./chat-composer-draft";
 import { buildForwardText } from "./chat-forward-text";
 import { CHAT_HEADER_HEIGHT } from "./chat-header";
+import { CHAT_ATTACHMENTS_PER_MESSAGE_MAX, CHAT_MESSAGE_MAX_CHARS } from "./chat-limits";
 
-/** Server-side cap, mirrored so the composer can show the remaining budget. */
-const CHAT_MESSAGE_MAX_CHARS = 8_000;
-/** Mirror of `CHAT_ATTACHMENTS_PER_MESSAGE_MAX` (server). */
-const CHAT_ATTACHMENTS_PER_MESSAGE_MAX = 10;
 /**
  * Mirror of `CHAT_ATTACHMENTS_UNAVAILABLE_CODE` (server/lib/chat-attachments.ts).
  *
- * Mirrored, like the two above, because that module imports `node:path` and the
+ * Mirrored, like the limits in chat-limits.ts, because that module imports `node:path` and the
  * server data directory at module scope and cannot be bundled for the browser.
  */
 const CHAT_ATTACHMENTS_UNAVAILABLE_CODE = "CHAT_ATTACHMENTS_UNAVAILABLE";
@@ -97,6 +94,11 @@ export interface ChatRoomViewProps {
 	 * bot they may watch but not drive. The server enforces the same rule regardless.
 	 */
 	readOnlyReason?: string;
+	/**
+	 * Replaces the plain composer (a bot room uses the narrator one). The room keeps
+	 * the reply strip, so the composer is handed the target and told when it is spent.
+	 */
+	renderComposer?: (reply: { replyTo: ChatMessage | null; onSent: () => void }) => React.ReactNode;
 }
 
 export function ChatRoomView({
@@ -106,6 +108,7 @@ export function ChatRoomView({
 	title,
 	headerActions,
 	readOnlyReason,
+	renderComposer,
 }: ChatRoomViewProps) {
 	const { t } = useTranslation("chat");
 	const { data: currentUser } = useCurrentUser();
@@ -659,6 +662,8 @@ export function ChatRoomView({
 				>
 					{readOnlyReason}
 				</Text>
+			) : renderComposer ? (
+				renderComposer({ replyTo, onSent: () => setReplyTo(null) })
 			) : (
 				<>
 					<ChatComposerAttachments items={pending} onRemove={handleRemovePending} />
