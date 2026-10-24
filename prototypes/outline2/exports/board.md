@@ -1,13 +1,12 @@
-<!-- 由 prototypes/outline2/outline.py export 生成（第 9 个提交）。真相源是 data/log.jsonl，不要手改。 -->
+<!-- 由 prototypes/outline2/outline.py export 生成（第 29 个提交）。真相源是 data/log.jsonl，不要手改。 -->
 
 # 任务看板
 
-### 进行中（3）
+### 进行中（2）
 - [p/H0a1nXuL] [/] 大纲系统路线图：建成知识、记忆与任务的统一平台
 - [p/DrYdFrth] [/] P-1 Python 原型与自用：先用原型承载这份计划，真实推进，从使用中发现问题 @agent:main ← 路线图
-- [p/N5cdiUhM] [/] 调研：一个需求跨多个仓库时，会话、工作目录和项目现在怎么对应，多工作区以后该怎么对应 @agent:w-xrepo ← Q11
 
-### 待办（14）
+### 待办（13）
 - [p/ydKe7oMn] [ ] P0 P0 设计与验证 ← 路线图
 - [p/bd2Egjgc] [ ] P1a P1a 核心存储、大纲编辑器（先单人，建在协同协议上）、时间机器最小版、会话读权限 ‹等前置：P0› ← 路线图
 - [p/kDh2CgDg] [ ] P1b P1b 多人实时协同：页订阅、页实时会话、在场信息、大纲事务、agent 的三方合并 ‹等前置：P1a› ← 路线图
@@ -21,9 +20,8 @@
 - [p/wBqGEPp7] [ ] db-worker 向量扫描基准 ← P0
 - [p/5QM1KHbG] [ ] agent 使用结构化编辑工具的实测：Python 原型已经覆盖了一部分 ← P0
 - [p/aTj0jdv3] [ ] 确认 D6–D15 的建议 ‹等前置：P-1› ← P0
-- [p/8PsVaMVZ] [ ] 第三轮：按第二版改原型（复选框任务、锁定、待确认、依据从运行记录挂接、代码锚点），重跑同类任务，对比协调成本、命令数和查帮助次数 @agent:main ← P-1
 
-### 完成（8）
+### 完成（10）
 - [p/5nB0TYwk] [x] 核实：在 SpecMarkdownEditor 里编辑含表格的 spec 文件并保存，表格会不会丢；属实就给出修复方案（来自 Q6 调研的顺带发现 [[p/f3TO9Yre]]） @agent:w-table ← 现状spec
 - [p/uHnUVJL1] [x] 搭原型：块、链接、提交、时间机器、任务、两档计划、变更请求、断言与锚点 @agent:main ← P-1
 - [p/NVqKvrzA] [x] 把这次的计划录进原型 @agent:main ← P-1
@@ -32,4 +30,6 @@
 - [p/dtLLZ8zT] [x] 新鲜度检查对着最新的 main 跑一次（先 fetch） @agent:main ← P-1
 - [p/eYUSIhDP] [x] 把原型发现整理回设计文档 @agent:main ← P-1
 - [p/UV8qXrr2] [x] 设计文档讨论稿 ← P0
+- [p/8PsVaMVZ] [x] 第三轮：按第二版改原型（复选框任务、锁定、待确认、依据从运行记录挂接、代码锚点），重跑同类任务，对比协调成本、命令数和查帮助次数 @agent:main ← P-1
+- [p/N5cdiUhM] [x] 调研：一个需求跨多个仓库时，会话、工作目录和项目现在怎么对应，多工作区以后该怎么对应 @agent:w-xrepo ← Q11
 

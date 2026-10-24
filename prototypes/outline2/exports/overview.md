@@ -1,4 +1,4 @@
-<!-- 由 prototypes/outline2/outline.py export 生成（第 9 个提交）。真相源是 data/log.jsonl，不要手改。 -->
+<!-- 由 prototypes/outline2/outline.py export 生成（第 29 个提交）。真相源是 data/log.jsonl，不要手改。 -->
 
 # 大纲总览
 
@@ -1908,7 +1908,232 @@
   - [p/3bxAuIFU] [ ] Q10 标签：属性里的字符串数组，还是像 Obsidian 一样每个标签对应一页？
     - [p/KYtP04jH] 补充（来自 Q6 方言调研，报告「需要人决定」第 4 点）：`#标签` 要不要进块正文取决于这一问。如果进，还要定字符集和边界：中文不用空格分词、纯数字（如 `#81`）、色值（如 `#1a1b1e`）、composer 的 `#file:路径:行` 都要处理；方言草案目前按「首版不进正文」写
   - [p/UMJvCvWQ] [ ] Q11 一个需求跨多个仓库时，项目空间怎么对应多个 projects 行？ @human:owner
-    - [p/N5cdiUhM] [/] 调研：一个需求跨多个仓库时，会话、工作目录和项目现在怎么对应，多工作区以后该怎么对应 @agent:w-xrepo
+    - [p/N5cdiUhM] [x] 调研：一个需求跨多个仓库时，会话、工作目录和项目现在怎么对应，多工作区以后该怎么对应 @agent:w-xrepo
+      （运行记录：agent:w-xrepo 的 70 次调用，碰过 33 个文件，0 次失败）
+      - [p/KEa7thwQ] 专注 agent agent:w-xrepo 的报告（跨仓库需求怎么对应项目）
+        - [p/XqMNUMZX] > 只读调查，基线是当前分支 `claude/youthful-johnson-vu2z3q` @ `becf57ee`。下面的 `路径:行号` 都对应这个提交。标「推断」的是读代码得出、没有实际跑过的结论。唯一做过的实验是 git 探测：在 scratchpad 里分别对子模块、嵌套仓库、worktree、子目录跑了 `git rev-parse --git-common-dir`，看它们各输出什么。
+        - [p/tedzQxma] 0. 结论
+          - [p/W2wED9E6] **现状是单主项目模型**。会话只有一个「主项目」：有 `contextProjectId` 就用它，否则用本地 cwd 推导出的项目。ACL 的项目门、trait 层、routines、技能、设备授权、执行策略、知识注入、通知都只看主项目。`additional` 链接只在 `contextProjectId` 和 cwd 推导出的项目不同时才会产生，一个会话最多一条，作用也只有一个：让会话出现在另一个项目的会话列表里。即使出现了，列表仍然先过主项目的 ACL 门。远端设备上的目录完全不参与索引。
+          - [p/5mqFt3dH] **现有代码里已经有好几种「一个会话碰多个仓库」的情况，每种都有缺口**。最严重的三个：
+            - [p/Hr0uL4r5] 会话把 cwd 切到另一个仓库后，DB 里的主项目异步跟着变了，活动会话内存里的项目却没变。知识注入、trait、routines、设备列表用的还是旧项目。会话的可见范围也随之从旧项目成员换成了新项目成员，而会话历史里还留着旧仓库的内容。
+            - [p/WTKzUxT1] 会话切到远端设备后，如果它没有 `contextProjectId`，主项目会变成 null。项目门随之消失，只授权给项目的设备也跟着失效（推断）。
+            - [p/NrGPQ5XY] `contextProjectId=A`、cwd 在 B 的会话：B 的执行策略、设备、routines 都不生效，B 的成员也看不到这个会话。
+          - [p/UwceYJOz] **倾向**：保留「一个主项目作归属和权限锚点」，并把它拆成两层：
+            - [p/8Dvfwynk] **归属层**：谁能看会话，需求和任务挂在哪里。仍然只认一个主项目。
+            - [p/RRwtNK6Z] **执行层**：每个工作区按它自己所属的项目生效，包括 CLAUDE.md/AGENTS.md、执行策略的 deny 层、设备授权。
+            - [p/mznDaAH9] 需求和任务树放在主项目的空间里，用链接、嵌入和提交依据引用其他仓库，其他项目页通过反向链接看到「有外部需求在这里动过」。项目组先不做。真出现「固定几个仓库长期一起开发、成员一致」的需求时，再把项目组做成纯聚合视图，不给它单独的 ACL 轴。
+          - [p/nthvYQ3N] **需要人拍板的有十来个点**，最关键的是：主项目怎么定、能不能换；把工作区 B 加进会话需要对 B 有什么权限；B 的成员能看到多少；执行策略按什么规则合并；远端工作区靠什么判断属于哪个项目。详见 §5。
+        - [p/PloAcVUx] 1. 现状
+          - [p/pxTGvwDP] 1.1 项目怎么建出来
+            - [p/6WZT5QrH] **自动建（会话索引顺带建）**：入口是 `resolveProjectForDirectory`（`server/services/project-index.ts:207-234`），规则写在文件头 `server/services/project-index.ts:14-25`。
+            - [p/1MXsYwrL] | 目录类型 | 处理 | 代码 |
+              |---|---|---|
+              | 已在某项目根下（含子目录） | 按路径段边界取**最长前缀**的项目根。已归档的项目也参与匹配，所以归档后不会为同一目录再建一个 | `matchProjectByKey` `server/services/project-index.ts:113-125`；`ancestorKeys` `:99-110`；`directoryKey`（realpath，macOS 下转小写）`:87-96` |
+              | git 主仓库根或其子目录 | `git rev-parse --git-common-dir` 得到主仓库根，没有对应项目就当场建一个，**公开**、owner 是会话 owner、名字取目录名 | `probeRepositoryRoot` `:137-155`；`createProjectForRoot` `:173-201`（`visibility: "public"` 在 `:188`）；进程内单飞 `:171`，跨进程靠唯一索引 `uq_projects_root_key`（`server/db/schema.ts:256`） |
+              | linked worktree | `--git-common-dir` 指向主仓库的 `.git`，所以归到主仓库的项目。会话 worktree 默认放在 `<repoRoot>/.worktrees/`（`server/services/narrator-worktree-service.ts:1061`），直接被前缀匹配到 | `:131-136` 注释 |
+              | 非 git 目录 | 不建项目，会话保持独立 | `:22`、`:217` |
+              | bare 仓库、`--separate-git-dir`、子模块 | 输出不以 `/.git` 结尾的都当作「不是仓库」 | `:153` |
+              | 远端设备目录 | 不索引 | `isLocalDevice` `:236-238`；`deriveNarratorProjectLinks` 的 `:254` |
+            - [p/i5a0DNH8] git 探测缓存 30 秒，最多 512 条（`:46-49`、`:157-168`）。
+            - [p/45s8vsZZ] **手动建**：`POST /api/projects` 支持三种方式：clone、init、关联已有目录（`server/routes/projects.ts:149` 起，`:241-246`）。关联已有目录**不要求是 git 仓库**，只记元数据。手动设置或修改 `gitPath` 后，会认领 root key 并在后台全表重建索引（`server/routes/projects.ts:61-63`、`:380`）。有几点要注意：
+              - [p/QAA0TTiK] root key 只给最早建的那个项目，同目录的后来者 key 为 null，不参与匹配（`assignProjectRootKey` `server/services/project-index.ts:379-403`）。
+              - [p/F4tst3no] 项目表只有一个 `gitPath` 和一个 `rootKey`（`server/db/schema.ts:209`、`:251`），**一个项目只对应一个根目录**。
+              - [p/nhUVMNJk] 手动把项目建在「多个仓库的共同父目录」上，按最长前缀规则，父目录下还没有自己项目的仓库都会归进来。这实际上就是一个「项目组」的土办法，只是配置只有一份。
+          - [p/VepaVtEr] 1.2 会话怎么归到项目（链接表）
+            - [p/OgvnRjwB] 表 `narrator_project_links`：`server/db/schema.ts:692-716`。
+              - [p/ZJ7cTWhr] 字段：`role`（`primary`/`additional`）、`source`（`explicit`/`cwd`）、`device_id`（默认 `local`）、`directory`。
+              - [p/8VLlV31C] 主键是 `(narrator_id, project_id)`（`:710`），每个会话最多一个 primary，由部分唯一索引保证（`:711-713`）。
+            - [p/rkOWNbO9] 推导：`deriveNarratorProjectLinks`（`server/services/project-index.ts:241-267`）。
+              - [p/a61A5ZFn] 有 `contextProjectId` 时 → 生成 primary/explicit（`:245-253`）。
+              - [p/miqkOqiH] cwd 在本地、且推导出的项目 ≠ `contextProjectId` 时 → 生成一条 cwd 链接。前面没有 explicit 链接就是 primary，有就是 `additional`（`:254-265`）。
+              - [p/uxBcEjkU] 所以 **`additional` 只出现在「从项目页或外部渠道创建会话，但 cwd 在另一个仓库」这一种情况**，一个会话最多 2 条链接，`device_id` 永远是 `local`。
+            - [p/7Gto208e] `contextProjectId` 怎么来：从项目页创建会话时，要求调用者对该项目有 write（`server/routes/narrators.ts:1285-1292`）。cwd 不传时默认取项目 `gitPath`（`server/routes/narrators.ts:1243`）。传了任意 cwd 也**不检查 cwd 所属项目的权限**。另外 OAuth/外部渠道创建的会话也会带上它（列注释见 `server/db/schema.ts:494-497`）。
+            - [p/0EsPvnBq] 什么时候同步：
+              - [p/tDp9QQIk] 会话创建：`server/services/narrator-service.ts:1677`。
+              - [p/AAkfOr2t] 会话运行时建立：`server/services/narrator-session.ts:1226`，先同步，再按项目取配置。
+              - [p/VnTq9YPy] 切目录或切设备之后的 publish：`server/services/workspace-context-service.ts:543`、`:648`，这里是 `void` 异步调用，不等结果。
+              - [p/NEmLuF4H] 启动时后台分页重建：`server/main.ts:1780` → `scheduleProjectIndexRebuild` `server/services/project-index.ts:492-513`。
+              - [p/NawrTOaY] 改了项目根时也会触发重建。
+              - [p/lD8Pzjrt] 子代理建档时（`server/services/narrator-service.ts:1681` 起）**不同步**，要等它的会话运行起来、走到 `:1226` 才同步。
+            - [p/OgZogR7h] 链接有变化时会让执行策略缓存失效（`server/services/project-index.ts:357-360`）。
+            - [p/RiAXzzH1] PostgreSQL 后端没有这张索引：只认 `contextProjectId`（`server/services/narrator-project.ts:35-37`，`server/services/project-index.ts:341`）。
+          - [p/LH1fGD0v] 1.3 权限和配置看哪个项目
+            - [p/tDZ927hX] 唯一的答案是 `resolveNarratorProjectId`（`server/services/narrator-project.ts:31-49`）：`contextProjectId`，否则 primary 链接，**additional 一律不参与**。它有三个镜像：Drizzle 表达式 `narratorProjectIdColumn`（`:72-74`）、原生 SQL `narratorProjectIdText`（`server/services/read/acl-sql.ts:94-96`），以及同步版 `server/services/tool-final-start-authorization.ts:72-85`。
+            - [p/yA3tup45] | 用途 | 怎么用主项目 | 代码 |
+              |---|---|---|
+              | 会话读写 ACL 的「项目门」 | 主项目不可读，就挡住所有非 owner、非 public 的访问（授权也一样挡住）。`visibility='project'` 对主项目成员开放 | `server/services/read/acl-sql.ts:105-145`；`gateAndProjectFor` `server/services/narrator-acl.ts:213-224` |
+              | 子代理 ACL | 完全按 `acl_root_narrator_id`（根会话）判断 | `server/services/read/acl-sql.ts:146-170`；`server/services/narrator-service.ts`（createSubagent 的 `aclRootNarratorId` 注释） |
+              | 项目 gitPath、routines、trait 层（user→project→narrator） | 会话建立时读一次，存进活动会话 | `server/services/narrator-session.ts:1226-1256`，`_projectId`/`_projectGitPath` 在 `:1355`、`:1360` |
+              | 设备 | `getSessionDevices(projectId)`：项目级设备要求 `device.projectId === 主项目`，`device.projectId` 只能填一个 | `server/services/narrator-session.ts:499-509`、`:1259-1261`；`isDeviceAuthorizedForProject` `server/services/device-service.ts:101-107`；`remoteDevices.projectId` `server/db/schema.ts:942` 起 |
+              | 执行策略（目录/命令规则） | 沿 policy source 链收集每个会话的主项目，**把各项目规则层都合并进去**（这样子代理换了上下文也去不掉父项目的 deny 层），`projectGitPath` 取第一个 | `server/services/execution-policy/repository.ts:43-95` |
+              | 技能 | global + 主项目 `gitPath` + cwd 所在 git 根（workspace），这一项**已经是多根了** | `resolveSkillRootsForContext` `server/services/skill-service.ts:518-533`；`resolveSkillRoot` `:1055-1062`；`resolveSkillContextForNarrator` `:967-987` |
+              | CLAUDE.md / AGENTS.md | **只读 cwd 那一层**（`join(cwd, filename)`），不向上找，也和项目无关 | `server/services/narrator-prompt.ts:247-262`；文件名列表 `server/lib/global-prompt-paths.ts:15` |
+              | 知识注入 | `active._projectId`：只取该项目的集合和全局集合 | `server/services/agent-runtime/orchestrator.ts:1081-1083`；`projectScopeClause` `server/services/knowledge/sqlite-read-store.ts:178-186`；`knowledgeCollections.projectId`（schema 中 `knowledge_collections` 定义处） |
+              | 通知、最近标签、导航摘要、回退、git workspace | 都调 `resolveNarratorProjectId` | `server/services/notification-fanout.ts:328`、`server/services/recent-tabs-service.ts:1973`、`server/services/git-workspace.ts:143` 等 |
+              | 任务 | spec 任务按**会话**存（每个叙述者一个 `tasks.json`），没有项目级看板 | `server/services/spec-task-service.ts`；`frontend/components/narrator/spec/SpecTaskBoard.tsx` |
+          - [p/Find6RWU] 1.4 项目页怎么列会话
+            - [p/l4bbVAKg] 会话列表：`/api/narrators?projectId=` 的条件是「任意链接（primary 或 additional）指向该项目，或者 `context_project_id` 等于该项目」（`server/routes/narrators.ts:1034-1043`）。另外**只列 `variant='primary'`**（`:1023`），子代理不列；同时叠加会话可读性谓词（`:1024`），而这个谓词的项目门看的是**主项目**。
+            - [p/saCK3vzO] 前端 `frontend/routes/projects/$projectId.tsx:48-50` 分页拉取，每条显示 `session.cwd`（`:83`）。
+            - [p/TBP6ZKF8] 项目权限收窄时，清理旧标签页也按「`context_project_id` 或链接」扫描（`server/services/project-membership.ts:426-430`）。
+        - [p/ALeuYILG] 2. 现在已经出现的「一个会话碰多个仓库」
+          - [p/rVPs937q] | 情形 | 现在怎么处理 | 问题 |
+            |---|---|---|
+            | **A. `contextProjectId=A`，cwd 在仓库 B**（additional 链接） | A 是主项目；B 得到 additional/cwd 链接（`server/services/project-index.ts:254-265`） | ① 执行发生在 B 的文件上，但执行策略只合并了 A 的项目层（`server/services/execution-policy/repository.ts:72-95`），**B 的 deny 规则不生效**。② B 的项目级设备、routines、trait 都不生效。③ B 的页面虽然「列出」了这个会话，但列表要过 A 的门（`server/routes/narrators.ts:1024`）。B 的成员只要不是 A 的读者，就看不到（`visibility='public'` 的会话除外）。④ 创建时只检查对 A 的 write，不检查 B（`server/routes/narrators.ts:1285-1292`）。⑤ 技能倒是已经同时加载了 A 的根和 B 的 workspace 根 |
+            | **B. 会话里切目录**（HTTP `PATCH /:id/cwd`、`/workspace-context/switch`，或 agent 调 `SwitchWorkingDirectory` 工具） | 只经过会话 write ACL 和敏感路径检查（`server/routes/narrator-workspace-context.ts:14-39`、`server/services/workspace-context-service.ts:245-270`）；publish 时 `void` 同步链接（`:648`） | ① **不检查目标目录所属项目的权限**。② 没有 `contextProjectId` 的会话切到另一个仓库，主项目就变了：ACL 门、执行策略跟着变（策略在 install 时失效重算，`:617`）。但活动会话的 `_projectId`/`_projectGitPath`/routines/trait/设备不刷新，`updateActiveNarratorCwdAndSkillContext`（`server/services/narrator-session.ts:1693-1712`）只更新 cwd、技能根和 isGitRepo，于是知识注入还在用旧项目（`server/services/agent-runtime/orchestrator.ts:1083`），**DB 和内存对「属于哪个项目」给出不同答案**。③ `visibility='project'` 的会话切换后，对旧项目成员消失、对新项目成员出现，而会话历史里还有旧仓库的代码和讨论，**存在跨项目可见性迁移**。④ 链接同步是异步的，有一个窗口期 |
+            | **C. worktree** | 默认位置被前缀匹配到；自定义 `destinationPath` 时靠 git-common-dir 回到主仓库 | 推断：项目根如果是**仓库子目录**（手动建的 monorepo 子项目，例如 `repo/packages/a`），worktree 里对应的 `packages/a` 不在 `repo/packages/a` 前缀下。这时探测得到主仓库根，而主仓库根没有项目，就会**自动给仓库根新建一个公开项目**，同一份代码在 checkout 里和 worktree 里归属不同。另外链接表主键 `(narrator, project)` 记不下「同一项目下的多个目录或 worktree」 |
+            | **D. 嵌套仓库 / 子模块** | 先前缀匹配，再探测 git | 外层已经有项目时，内层的**独立仓库**会被并进外层项目（最长前缀优先于 git 探测）。子模块的 `--git-common-dir` 是 `super/.git/modules/sub`（已实测），不以 `/.git` 结尾，外层没有项目时就**不建项目**（`server/services/project-index.ts:153`） |
+            | **E. 子代理在别的目录工作**（Agent 工具 `workdir`，需用户批准，`server/lib/agent/tools/task.ts:134`、`:434-435`） | 子代理 `contextProjectId` 复制父会话的，cwd 用自己的（`server/services/narrator-service.ts:1776-1779`）；ACL 随根会话；trait/模型按**父会话**的项目（`server/services/subagent-runner.ts:209`）；执行策略用子代理自己的主项目，再叠加父链上各项目的 deny 层 | 这是现有代码里**唯一真正「多项目叠加」的地方**（执行策略的 deny 并集），可以当作先例。但项目页不列子代理（`server/routes/narrators.ts:1023`），B 项目里完全看不出有人在这里改过东西。trait 用父项目、策略又以子代理自己的项目为主，两边不一致 |
+            | **F. 远端设备** | 远端目录不进索引（`server/services/project-index.ts:24-25`、`:254`）；切到远端时 `narrators.cwd` 仍保留本地目录（`server/services/workspace-context-service.ts:451`），`defaultDeviceId` 变成远端 | 推断：没有 `contextProjectId` 的本地会话切到远端后，cwd 链接被删，主项目变成 null。结果是 `visibility='project'` 的会话对项目成员不可见（`server/services/read/acl-sql.ts:130` 要求项目非空），项目级设备不再授权：切换前用旧项目校验通过（`server/services/narrator-session.ts:655-656`），切换后下一次 `getSessionDevices(null)` 就看不到刚切过去的那台设备了。远端目录属于哪个项目，现在没有任何判断依据 |
+            | **G. 手动把项目建在父目录** | 父目录下还没有项目的仓库都归进来 | 配置只有一份，跨设备不成立；已经有自己项目的仓库不受影响，结果是一部分仓库在里面、一部分不在 |
+          - [p/VOtAHLNa] 讨论分支 `discuss/narrator-remote-workspace`
+            - [p/DIYop3xL] 这个分支和当前 HEAD **在本克隆里没有共同祖先**（`git merge-base` 失败，可能因为是浅克隆）。它的基线还是叙事线时代：`server/services/narrator-project.ts` 按 `chapterId` 走，没有 `project-index.ts`。最近三个提交是 `5237d416`（远端叙述者工作目录）、`ad4e2554`（Windows 远端执行）、`8354861a`（会话 × 设备独立工作目录绑定）。
+            - [p/PfqpVh7p] 和本问题相关的内容：
+              - [p/GilPwXGq] 新表 `narrator_device_workspaces`，唯一键 `(narrator_id, device_id)`（`drizzle-postgres/0015_narrator_device_workspaces.sql`）。也就是**每台设备一个目录**，同一台设备上没法同时挂两个仓库。
+              - [p/kfq8rZDA] 项目取 `workspaceContext.contextProjectId ?? narrators.contextProjectId`（该分支 `server/services/narrator-device-workspace-service.ts:129`、`:146-148`），没有从远端路径推导项目的逻辑。
+              - [p/nNVExdDe] **工作区项目门**：操作某个工作区时，既要过会话 ACL，又要对该工作区的项目 `loadProjectForAccess`（同文件 `:104-131`）。
+              - [p/JKBQBJbe] **原来源授权**：在工作区 A 产生的附件和引用，即使会话后来切到了 B，也按 A 的项目授权。注释原话：「selecting workspace B must not make B's extra workspace-project gate the grant for a server-owned original resource A」（`:99-100`、`:566-614`）。
+              - [p/CRDrBrTq] 提交说明里列了没解决的问题：AI Terminal 写入和 Git 多步写缺末尾授权栅栏、远端关闭零派发不回滚等，S5 双设备验收也没跑。
+            - [p/G3WEkJGe] 这两条机制（绑定工作区要对它的项目有权限；产出按来源项目授权）和下面推荐的方案方向一致，可以直接借用。但要移植到 project-index 体系上，而且该分支的 `workspaceContext.contextProjectId` 和当前「项目由目录推导」的模型需要先统一。
+            - [p/EvvE9f0r] 设计稿 `docs/OUTLINE_KNOWLEDGE-DESIGN.md`：
+              - [p/yEdPrQZP] §4.6 目前写的是「每个工作区对应一个项目，会话因此出现在多个项目里」，CLAUDE.md 按工作区首次使用时懒加载。
+              - [p/oRwO2rqZ] §2.4 写的是「会话属于哪个项目，仍由 `resolveNarratorProjectId` 决定」。
+              - [p/YOclBuXX] 这两处的关系没说清，§11 第 9 条把这个问题列为待定（原型 Q11）。
+        - [p/7SqbZjIV] 3. 方案对比
+          - [p/Hn7w3iX3] 前提：一个会话绑定多个工作区，每个工作区是 `(device, directory)`，可能在不同设备、属于不同仓库。
+          - [p/1N4bXLUS] 方案 1：单主项目 + 附加链接（现状的直接扩展）
+            - [p/o1A9vhm2] 每个工作区推导出一个项目链接，第一个或人指定的那个是 primary，其他都是 additional。所有消费方仍然只看主项目。
+              - [p/4YZwrfIa] **权限**：门只有一个，现有 ACL、SQL 镜像、列表分页都不用改。B 的成员看不到会话，除非同时是 A 的读者，或者会话是 public。
+              - [p/zpTNFmy1] **配置**：B 的 CLAUDE.md 只有 cwd 恰好落在 B 时才读到；B 的执行策略、设备、routines **不生效**，这是安全缺口，和情形 A 一样。
+              - [p/hUammlNt] **任务看板**：任务在会话或 A 里，B 看不到。
+              - [p/DUSfq7aN] **知识检索**：只查 A 的集合和全局集合，查不到 B 的知识。
+              - [p/jvb7JuNf] 评价：代价最低，但执行层不安全，B 对这次改动一无所知。
+          - [p/CR35vP8b] 方案 1'：单主项目（归属）+ 按工作区的执行层（推荐的底座）
+            - [p/rQV3UdDJ] 「这个会话属于谁」和「在某个工作区执行时守谁的规矩」分开回答。
+              - [p/DS7q3UEP] **权限（读）**：会话、历史、产出的可见性仍然只由主项目门决定。`resolveNarratorProjectId` 的语义不变，所有 ACL 镜像不用动。
+              - [p/Lqn1IjYV] **权限（绑定）**：把工作区 B 加进会话，要求对 B 的项目有 write，私有项目还要是成员。这就是讨论分支的工作区项目门。cwd 切换、Agent `workdir`、远端绑定都走同一道检查。
+              - [p/6u6e5jDL] **配置**：在工作区 W 上执行时 = 全局 + 主项目的 deny 层 + **W 所属项目的规则层** + 会话层。执行策略本来就支持多项目层合并（`server/services/execution-policy/repository.ts:79-95`），把「沿 policy 链收集」扩展成「沿 policy 链收集 ∪ 目标工作区的项目」就行。设备授权按目标工作区的项目判断。CLAUDE.md/AGENTS.md 按工作区懒加载（设计稿 §4.6）。trait/routines 仍按主项目，因为它们描述的是会话行为，不是仓库约束。
+              - [p/MJTNjL5h] **任务看板**：任务树在主项目空间。每条跨仓库的改动把各仓库的提交作为依据挂在任务下。B 的项目页通过反向链接或链接索引显示「来自 A 的需求 X 在此工作区有改动」，读不到的部分显示占位。
+              - [p/3RrHTZ4n] **知识检索**：查询范围 = 主项目 ∪ 各工作区项目 ∪ 全局。按驱动者权限过滤（设计稿 D9 交集），先在 SQL 里过滤再取 top-N。写入默认落到主项目空间，写进 B 的空间需要直写权限，否则转待确认。
+              - [p/Bc8B8c2b] 代价：链接表要能表达 `(narrator, project, device, directory)` 多行（改主键或增加 workspace 子表），`deviceId` 字段真正用起来；远端工作区需要显式指定项目（见 §5）；活动会话的项目相关缓存要按工作区做 key。
+          - [p/wzD9EBKz] 方案 2：多主项目（设计稿 §4.6 现在的字面意思）
+            - [p/JwQETTqw] 每个工作区一个项目，会话平等地属于所有这些项目。
+              - [p/g6aSmZiu] **权限**：门取**并集**的话，B 的成员能读到会话里 A 仓库的代码和讨论，等于泄露；门取**交集**的话，几乎没人能看，项目成员也看不到自己项目下的会话。两种都不好。而且 `resolveNarratorProjectId` 的「唯一答案」不变量（`server/services/narrator-project.ts:1-12` 的注释明确说分叉就是绕过点）要整体推翻，三处镜像（acl-sql、tool-final-start-authorization、narratorProjectIdColumn）和所有 `limit n+1` 分页谓词都要重写。
+              - [p/0bJ7WzAM] **配置**：多套 trait/routines 怎么合并没有自然答案。
+              - [p/6IYObNwX] **任务看板**：任务属于哪个项目说不清。
+              - [p/fuXjvBjk] **知识**：检索范围和方案 1' 一样，但写入落点说不清。
+              - [p/FATpTsUw] 评价：概念上最「平」，工程风险和权限风险最大，不推荐。
+          - [p/gK4CSKXW] 方案 3：项目组 / 跨项目需求实体
+            - [p/gCFZroFN] 新增 `project_groups`（或「需求/initiative」）实体，成员是若干项目，会话或需求挂在组上。
+              - [p/pfFzteyd] **权限**：要么组有自己的成员和 ACL（新增一条权限轴，与项目门怎么组合要重新设计），要么组只是视图，权限仍然下沉到各个项目（那它就退化成方案 1' 加一个聚合页）。
+              - [p/43PJEWU6] **配置**：组级配置要和项目配置分层，层数从 3 变成 4。
+              - [p/j8Oyn7j0] **任务看板**：组级看板天然适合「前端 + 后端 + 契约」这种长期固定组合。
+              - [p/EaVP7wwb] **知识**：可以有一个组空间，跨仓库的结论放在这里，归属清楚。
+              - [p/loUdHEND] 代价：新实体、新 UI、新迁移；所有 `resolveNarratorProjectId` 调用方都要回答「组算不算」。一次性的跨仓库需求用这个太重。设计稿 D18 的方向是收缩概念。
+              - [p/C3pcRbOJ] 评价：等真实需求出现再做，而且建议做成**聚合视图**，不另起 ACL 轴。
+          - [p/yPPxUTS7] 方案 4：需求放在一个项目里，用链接引用别的项目
+            - [p/QNxj862N] 这是任务和知识层面的组织方式，和方案 1' 正交，可以叠加。
+              - [p/ObM6VsNj] **权限**：需求块的权限跟着 A 的空间走。指向 B 的链接对读不到 B 的人显示占位（设计稿 §2.4「链接不是后门」）。
+              - [p/sQYGgPwz] **配置**：不涉及。
+              - [p/FWouplzJ] **任务看板**：A 的看板有完整任务。B 的页面靠反向链接或嵌入看到相关子任务。如果需要「B 自己的视角」，可以在 B 里建一个嵌入 A 子树的页（拼接视图，R6）。
+              - [p/TJWOQgN6] **知识**：结项时把关于 B 的结论按出处**复制**进 B 的空间（设计稿规定块不跨空间移动），A 留原始计划。
+              - [p/FXKFcRkY] 评价：不新增概念，复用大纲已有的链接、嵌入、出处。
+          - [p/pFWriCPS] 汇总
+            - [p/hzFNnSst] | | 权限（谁能看会话和产出） | 配置（CLAUDE.md、执行策略、设备） | 任务看板 | 知识检索 | 改动量 |
+              |---|---|---|---|---|---|
+              | 1 单主 + 附加 | 主项目门，安全但 B 看不到 | 只有主项目，**B 的规矩不生效** | 只在主项目 | 只查主项目 | 小 |
+              | **1' 单主 + 按工作区执行** | 主项目门；绑定要 B 的 write | 按目标工作区的项目 + 主项目 deny | 主项目，B 有反向链接 | 主 ∪ 工作区项目，按权限过滤 | 中 |
+              | 2 多主项目 | 并集泄露 / 交集不可用 | 合并规则不清 | 归属不清 | 同 1' | 大，推翻不变量 |
+              | 3 项目组 | 新 ACL 轴或退化成视图 | 再多一层 | 组看板 | 组空间 | 大 |
+              | 4 需求放一处 + 链接 | 跟着空间，链接占位 | 不涉及 | A 完整，B 反向 | A 为主，结论复制进 B | 小（大纲内） |
+        - [p/U5aZV3HT] 4. 倾向：方案 1' + 方案 4，项目组以后再说
+          - [p/U42QaMgU] 理由：
+            - [p/V5uKnHYY] **保住「唯一答案」不变量**。`server/services/narrator-project.ts:1-12` 说得很清楚：每多一份对「会话属于哪个项目」的回答，就多一个绕过点。会话历史本身混着所有工作区的内容，读权限只能由一个主体来定。用主项目作锚点，所有现有 ACL 和 SQL 镜像都不用动。
+            - [p/4Cu5ZYOt] **执行安全必须按工作区来**。情形 A 已经说明：只看主项目，B 的 deny 规则就失效。执行策略已经有多项目层合并（`server/services/execution-policy/repository.ts:79-95`），讨论分支也已经有工作区项目门和原来源授权，方案 1' 是这些已有机制的自然延伸，不是从零发明。
+            - [p/VqLaLasj] **B 需要知道有人在它这里动过东西**，但不需要能读整个会话。反向链接和「参与会话」列表（标题、主项目、工作目录、提交）就够了，正文仍然按会话 ACL。
+            - [p/ki7pLiKC] **概念最少**。不新增实体，符合设计稿 D18 的收缩方向。项目组以后可以做成纯视图，只要链接结构是对的，到时候不需要迁移数据。
+            - [p/IYFd9joU] **顺带修掉现有问题**：cwd 切换、Agent `workdir`、远端绑定统一走「绑定工作区」检查；活动会话的项目缓存按工作区刷新；远端工作区显式指定项目。§2 里的 B、E、F 三种情形都能收敛。
+          - [p/KS7tqTz6] 建议的落地顺序（只是建议）：
+            - [p/y6y2Rjuv] (1) 先修现有缺口，不依赖新能力：
+              - [p/J5HoRkB2] cwd 切换后刷新 `_projectId` 等缓存，或者重建活动会话；
+              - [p/jkhnhq5N] 切换和绑定时检查目标项目的 write；
+              - [p/OBRh3y1y] 远端切换不丢主项目，比如切换时把当前主项目冻结进 `contextProjectId` 或 workspaceContext。
+            - [p/BUaVFSJg] (2) 链接表支持一个会话对应多个工作区，`device_id` 真正用起来。
+            - [p/pFVIkSSl] (3) 执行策略、设备授权、CLAUDE.md 按目标工作区解析。
+            - [p/05ge6Pvv] (4) 大纲侧：需求放在主项目，加上反向链接视图。
+        - [p/smaqcCW9] 5. 需要人决定的点
+          - [p/CU97cwcb] **主项目怎么定**：创建时选？默认取第一个工作区？没有 git 的工作区能不能当主项目？中途能不能**换主项目**？换主项目等于改变会话可见范围，建议换的时候弹出确认，并说明哪些人会新获得或失去访问。
+          - [p/vHLUm1zl] **把工作区 B 加进会话的门槛**：要 B 的 write 还是 read？私有项目 B 能不能被 A 的会话使用？B 的 owner 要不要收到通知或审批？生产设备怎么处理（设计稿已经倾向「由人确认、带期限」）？
+          - [p/CNvIVm00] **B 的成员能看到什么**：只看到「有会话在此工作」（标题、主项目、目录、提交），还是能看会话正文？对读不到的人，要不要连这个会话的存在都隐藏？（现在的做法是完全不可见。）
+          - [p/q2DITrd3] **执行策略合并规则**：执行落在工作区 W 时，用「全局 + 主项目 deny + W 项目 + 会话」，还是「所有已绑定工作区项目的 deny 并集」？allow 规则只取 W 项目的吗？
+          - [p/Ul3wbYUB] **设备授权**：项目级设备按「目标工作区的项目」授权，还是仍然按主项目？`remoteDevices.projectId` 只能填一个，要不要允许一台设备服务多个项目？
+          - [p/aOutCm4a] **远端工作区属于哪个项目**：远端路径没法做本地前缀匹配，也没法本地 git 探测。可选：绑定时人工选项目；executor 上报 `git remote` URL，和项目的 `remoteUrl` 匹配；设备注册时固定项目。
+          - [p/8y2bTFaN] **同一项目下多个工作区**：两个 worktree、两台机器上各一份同一仓库。这需要改链接表主键 `(narrator, project)`。
+          - [p/nS2q6YSr] **trait/routines/技能**：继续只看主项目？技能现在已经是多根（主项目 + cwd workspace），要不要扩展成「所有工作区根」？
+          - [p/NcZODhM3] **知识**：写入默认落到主项目空间还是工作区项目空间？跨项目结论要不要在结项时自动提议复制进对应项目？
+          - [p/Z617Bdgp] **项目组**：现在就做，还是等真实需求？如果做，组有没有自己的成员和 ACL，还是只是聚合视图？
+          - [p/3ywYIMYn] **子代理**：子代理只拿到父会话工作区的一个子集时，trait 跟父项目、执行策略跟自己的工作区项目，这个现状要不要统一？
+          - [p/6P7ChezJ] **PostgreSQL**：项目索引现在只在 SQLite 上（`server/services/narrator-project.ts:35-37`）。多工作区能力要不要以 PG 移植为前提？
+          - [p/VpZihlxa] **手动项目落在仓库子目录、嵌套仓库、子模块**（§2 情形 C、D）：维持现状还是修？修的话，worktree 应该按「同仓库同相对路径」映射回子目录项目。
+      - [p/3wC0tThD] 会话现在只有一个主项目：`resolveNarratorProjectId` 是唯一答案（有 `contextProjectId` 用它，否则用 primary 链接，additional 不参与），见 `server/services/narrator-project.ts:31-49`。ACL 项目门、trait、routines、设备、执行策略、知识注入、通知都只看主项目。镜像有三处：`server/services/narrator-project.ts:72-74`、`server/services/read/acl-sql.ts:94-96`、`server/services/tool-final-start-authorization.ts:72-85`
+      - [p/ZiU2exDm] 项目自动建出来的规则：先按路径段取最长前缀的已有项目根，否则用 `git rev-parse --git-common-dir` 找主仓库根，没有项目就当场建一个公开项目（`server/services/project-index.ts:207-234`，公开在 `server/services/project-index.ts:188`）。非 git 目录、bare 仓库、子模块都不建项目（`server/services/project-index.ts:153`），远端设备目录不进索引（`server/services/project-index.ts:236-238`）
+      - [p/hYJfYbCJ] 链接表 `narrator_project_links` 主键是 `(narrator_id, project_id)`（`server/db/schema.ts:692-716`）：一个会话最多两条链接，`device_id` 永远是 `local`，记不下「同一项目下的多个目录或 worktree」。`additional` 只在 `contextProjectId` 和 cwd 推导出的项目不同时产生（`server/services/project-index.ts:254-265`），作用只是让会话出现在另一个项目的列表里，而列表仍先过主项目的门（`server/routes/narrators.ts:1024`）。PostgreSQL 后端没有这张索引，只认 `contextProjectId`（`server/services/narrator-project.ts:35-37`）
+      - [p/cYBhu6IP] 缺口一：`contextProjectId=A`、cwd 在仓库 B 的会话，执行策略只合并 A 的项目层（`server/services/execution-policy/repository.ts:72-95`），B 的 deny 规则不生效，B 的设备、routines、trait 也不生效；创建时只检查对 A 的 write（`server/routes/narrators.ts:1285-1292`）
+      - [p/3ecCXHpa] 缺口二：会话切目录只检查会话 write 和敏感路径，不检查目标目录所属项目的权限（`server/routes/narrator-workspace-context.ts:14-39`、`server/services/workspace-context-service.ts:245-270`）
+      - [p/9xiKXVj8] 缺口三：没有 `contextProjectId` 的会话切到另一个仓库后，DB 里的主项目异步变了，活动会话内存里的 `_projectId` 不刷新（`server/services/narrator-session.ts:1693-1712` 只更新 cwd、技能根和 isGitRepo），知识注入还用旧项目（`server/services/agent-runtime/orchestrator.ts:1083`）；`visibility='project'` 的会话随之从旧项目成员换给新项目成员，历史里却留着旧仓库的内容
+      - [p/ZbXzYkdi] 缺口四（推断）：没有 `contextProjectId` 的本地会话切到远端设备后，cwd 链接被删，主项目变成 null（`server/services/workspace-context-service.ts:451`），项目门消失、`visibility='project'` 对成员不可见（`server/services/read/acl-sql.ts:130`），只授权给项目的设备失效（`server/services/narrator-session.ts:655-656`）
+      - [p/6Kge1JJb] 已有的多项目先例：执行策略沿 policy 链把各项目规则层都合并进去，子代理去不掉父项目的 deny 层（`server/services/execution-policy/repository.ts:79-95`）；技能已经是多根，global + 主项目 + cwd 所在 git 根（`server/services/skill-service.ts:518-533`）。讨论分支 `discuss/narrator-remote-workspace` 有「工作区项目门」和「原来源授权」两条机制，可以借用，但要移植到 project-index 体系
+      - [p/9NaHR75W] 多主项目（会话平等属于每个工作区的项目）不可行：门取并集会把 A 仓库的内容泄露给 B 的成员，取交集几乎没人能看；还要推翻 `server/services/narrator-project.ts:1-12` 说的「唯一答案」不变量，重写三处镜像和分页谓词
+      - [p/PL4X2sda] 报告的倾向：方案 1'（一个主项目管归属和读权限；每个工作区按自己所属的项目管执行层：执行策略 deny、设备授权、CLAUDE.md）加方案 4（需求和任务树放主项目空间，用链接、嵌入、提交依据引用其他仓库），项目组以后做成纯聚合视图。落地顺序：先修上面四个缺口，再让链接表支持多工作区，再按工作区解析执行层，最后做大纲侧的反向链接视图。报告原文见 [[p/U5aZV3HT]]
+    - [p/jfVvqDuK] 建议：一个会话只有一个主项目，管归属和读权限；每个工作区按它自己所属的项目管执行层（执行策略的 deny、设备授权、CLAUDE.md）。需求和任务树放主项目空间，用链接、嵌入、提交依据引用其他仓库，其他项目页用反向链接看到「有外部需求在这里动过」。项目组先不做，真有长期固定的多仓库组合时再做成纯聚合视图，不另起权限轴。细项见决策包「跨仓库会话：归属与可见性」（Q32–Q35）、「跨仓库会话：执行层」（Q36–Q37）、「跨仓库会话：落地范围」（Q38–Q40）。调研 [[p/N5cdiUhM]] 的倾向（方案 1' + 方案 4，[[p/PL4X2sda]]）。多主项目会让读权限要么泄露、要么没人能看，还要推翻「唯一答案」不变量（[[p/9NaHR75W]]）；而只看主项目又让 B 的 deny 规则在 B 的文件上失效（[[p/cYBhu6IP]]）。所以归属只认一个，执行按工作区：现有 ACL 和 SQL 镜像不用动，执行策略已有多项目层合并、讨论分支已有工作区项目门可以借用（[[p/6Kge1JJb]]）。项目组以后做成视图时，只要链接结构对，不需要迁移数据
+  - [p/DwyfCdFp] 跨仓库会话：归属与可见性
+    - [p/DHAPw96a] [ ] Q32 多工作区会话的主项目怎么定、中途能不能换？（主项目决定谁能看会话；现在没有 contextProjectId 的会话切 cwd 或切远端时主项目会隐式改变） @human:owner
+      - [p/hfKNObBk] 创建时定下，之后不能换
+      - [p/034LhbA4] 创建时定下（从项目页建就是该项目，否则取第一个工作区推导出的项目，非 git 工作区不能当主项目）；允许显式换，换前确认并列出会新获得、失去访问的人；切 cwd、切设备不再隐式改主项目
+      - [p/57BqZY5t] 维持现状：随 cwd 推导，跟着切换变
+      - [p/M1OuQoOn] 建议：创建时定下（从项目页建就是该项目，否则取第一个工作区推导出的项目，非 git 工作区不能当主项目）；允许显式换，换前确认并列出会新获得、失去访问的人；切 cwd、切设备不再隐式改主项目。主项目是读权限的唯一锚点（[[p/3wC0tThD]]），隐式改变就是可见性迁移：会话历史里有旧仓库的内容，却换给了新项目的成员（[[p/9xiKXVj8]]），切远端还会变成 null（[[p/ZbXzYkdi]]）。完全不能换又太死，开错项目只能重建会话；显式换加确认，把可见范围的变化摆在人面前。实现上切换时把当前主项目冻结进 contextProjectId，就是报告落地顺序的第一步
+    - [p/LneaKsbw] [ ] Q33 把工作区 B（另一个仓库，或另一台设备上的目录）加进会话，要对 B 的项目有什么权限？B 的 owner 要不要知道？ @human:owner
+      - [p/pbYE9RPH] 要 B 的 write，私有项目还要是成员；B 的 owner 收通知、不审批；生产设备由人确认、带期限
+      - [p/ySGqyxFP] B 的 read 就够
+      - [p/JWaszfpm] 每次都要 B 的 owner 审批
+      - [p/465BpVvP] 建议：要 B 的 write，私有项目还要是成员；B 的 owner 收通知、不审批；生产设备由人确认、带期限。现在切目录完全不查目标项目（[[p/3ecCXHpa]]），创建时也只查 A（[[p/cYBhu6IP]]）。在 B 上执行就是改 B 的代码，门槛应当和直接在 B 里开会话一样，也就是 write；讨论分支的「工作区项目门」已经这么做，可以借用（[[p/6Kge1JJb]]）。cwd 切换、Agent workdir、远端绑定统一走这一道门。逐次审批对一次性的跨仓库改动太重，通知足以让 B 知道有人来过；生产设备沿用设计稿「人确认、带期限」的倾向
+    - [p/DdQ4g15D] [ ] Q34 B 项目的成员能看到在 B 上工作过的、主项目是 A 的会话多少内容？ @human:owner
+      - [p/hy8Ynjlh] 只看到「有会话在此工作」：标题、主项目、工作目录、提交；正文仍按会话 ACL
+      - [p/N7HGdYmX] 能读会话正文
+      - [p/1a78Dm5v] 完全不可见（现状）
+      - [p/37prsxqz] 建议：只看到「有会话在此工作」：标题、主项目、工作目录、提交；正文仍按会话 ACL。会话历史混着所有工作区的内容，B 的成员能读正文就等于把 A 仓库的代码和讨论泄露给 B（[[p/9NaHR75W]]）。完全不可见则 B 对自己仓库被改一无所知。摘要加提交够 B 追溯改动；读不到正文的人看到占位，符合设计稿「链接不是后门」
+    - [p/TW9heTNw] [ ] Q35 远端设备上的工作区属于哪个项目？（远端路径没法本地前缀匹配，也没法本地 git 探测，现在完全不进索引） @human:owner
+      - [p/hAnh9LoC] 绑定时由人选项目
+      - [p/qwY16snB] executor 上报 git remote URL，和项目的 remoteUrl 匹配
+      - [p/fjuYpd1S] 设备注册时固定一个项目
+      - [p/Kr9RF1Dm] 绑定时由人选；executor 上报的 remote URL 只用来预填建议
+      - [p/OkWINqQD] 建议：绑定时由人选；executor 上报的 remote URL 只用来预填建议。remote URL 匹配不唯一（fork、同一 remote 的多个项目、没有 remote 的仓库），单靠它会归错项目，而归属直接决定执行层守谁的规矩；设备固定项目和「一台设备上挂多个仓库」冲突。人选最可靠，用上报的 URL 预填，大多数情况人只需点确认。远端目录现在不进索引（[[p/ZiU2exDm]]），切过去主项目还会丢（[[p/ZbXzYkdi]]）
+  - [p/EjB1P6vB] 跨仓库会话：执行层
+    - [p/jBujF3QI] [ ] Q36 在工作区 W 上执行时，执行策略和设备授权按哪些项目算？ @human:owner
+      - [p/I2eoq8r0] 全局 + 主项目的 deny 层 + W 所属项目的全部规则层 + 会话层；allow 只取 W 项目；设备按 W 的项目授权
+      - [p/RZARgaqY] 所有已绑定工作区项目的 deny 取并集，再加 W 项目的 allow；设备按 W 的项目授权
+      - [p/jKPvoO6l] 维持现状：只按主项目
+      - [p/sRe0Ufnk] 建议：全局 + 主项目的 deny 层 + W 所属项目的全部规则层 + 会话层；allow 只取 W 项目；设备按 W 的项目授权。现状只按主项目，B 的 deny 规则在 B 的文件上失效（[[p/cYBhu6IP]]）。执行策略本来就支持多项目层合并（[[p/6Kge1JJb]]），加上「目标工作区的项目」改动最小。主项目的 deny 保留，是因为会话归属 A，A 不允许的事换个工作区也不该能做；其他工作区的 deny 管的是它们自己的文件，叠到 W 上会让绑定越多越难用，而且和 W 无关。remoteDevices.projectId 暂保持单值，一台设备服务多个项目等真有需求再改
+    - [p/V0udLkMT] [ ] Q37 trait、routines、技能在多工作区会话里按哪个项目加载？子代理「trait 跟父会话的项目、执行策略跟自己的项目」要不要统一？ @human:owner
+      - [p/9AUvORJA] trait、routines 继续只看主项目；技能扩成所有工作区的根；子代理现状保留并写成规则：行为跟归属走，执行跟工作区走
+      - [p/HAc6U10l] 全部按当前工作区的项目切换
+      - [p/YQoIqrmH] 全部只看主项目，技能也收回到主项目
+      - [p/17H9M2eP] 建议：trait、routines 继续只看主项目；技能扩成所有工作区的根；子代理现状保留并写成规则：行为跟归属走，执行跟工作区走。trait、routines 描述的是会话怎么做事，属于归属层，随工作区切换会让同一个会话前后行为不一；执行策略、CLAUDE.md 是仓库的约束，属于执行层。按这条分法，子代理的「不一致」其实是对的，不用改代码，只需写清楚。技能现在已经同时加载主项目和 cwd 两个根（[[p/6Kge1JJb]]），扩成所有工作区根是顺势延伸
+  - [p/YoWydZZf] 跨仓库会话：落地范围
+    - [p/FFVWVeX5] [ ] Q38 跨仓库会话产出的知识默认写到哪个项目空间？结项时关于其他仓库的结论要不要自动提议复制过去？ @human:owner
+      - [p/JmFrPMXt] 默认写主项目空间；写进 B 的空间要有直写权限，否则转待确认；结项时自动提议复制，由人或 B 的管理者确认
+      - [p/VadXt8MJ] 默认写当前工作区所属项目的空间
+      - [p/tL0XJkIE] 只写主项目空间，不做复制提议
+      - [p/BcjwumD9] 建议：默认写主项目空间；写进 B 的空间要有直写权限，否则转待确认；结项时自动提议复制，由人或 B 的管理者确认。需求和任务树都在主项目空间（报告方案 4，[[p/PL4X2sda]]），结论跟着计划放，出处才连得上。B 的成员读不到 A 的空间，所以关于 B 的结论要按出处复制进 B（设计稿规定块不跨空间移动）；但自动写进别人的空间等于绕过 B 的权限，只能提议
+    - [p/l34FWfPn] [ ] Q39 多工作区会话（链接表改成一个会话多个工作区、同一项目多个目录，device_id 真正用起来）要不要以 PostgreSQL 移植项目索引为前提？ @human:owner
+      - [p/5lbhHMhj] 先修四个现有缺口（不依赖新能力，也不等 PG）；改链接表时同步给 PG 建索引，不再让两个后端分叉
+      - [p/1CeY38Cu] 以 PG 移植为前提，移植完再动
+      - [p/FLdqDQSr] 只在 SQLite 上做，PG 以后补
+      - [p/eFk6rrMi] 建议：先修四个现有缺口（不依赖新能力，也不等 PG）；改链接表时同步给 PG 建索引，不再让两个后端分叉。四个缺口（[[p/cYBhu6IP]]、[[p/3ecCXHpa]]、[[p/9xiKXVj8]]、[[p/ZbXzYkdi]]）现在就在漏权限，修它们不需要改表，不该被 PG 卡住。但 PG 现在只认 contextProjectId（[[p/hYJfYbCJ]]），链接表一改结构，两个后端对「会话在哪些工作区」的答案会差得更远，所以改表那一步要两边一起做
+    - [p/Ja76tnpr] [ ] Q40 项目建在仓库子目录、嵌套的独立仓库、子模块这几种边界情形：维持现状还是修？ @human:owner
+      - [p/6HQ2kpzt] 修 worktree：按「同仓库同相对路径」映射回子目录项目；嵌套仓库和子模块维持现状，在文档里写明
+      - [p/uU4reY3t] 全部修
+      - [p/rnJRxIZo] 全部维持现状
+      - [p/PEpnJZXj] 建议：修 worktree：按「同仓库同相对路径」映射回子目录项目；嵌套仓库和子模块维持现状，在文档里写明。worktree 这一种会让同一份代码在 checkout 里和 worktree 里归属不同，还会给仓库根自动建一个公开项目（报告 §2 情形 C，推断），会话 worktree 是常用路径，影响面最大。嵌套仓库并进外层项目、子模块不建项目（[[p/ZiU2exDm]]），属于少见配置，规则是确定的，写清楚就行，等多工作区能显式绑定项目后自然有解
   - [p/XzYozzQg] [ ] Q12 探索组的对比视图要不要内置「方案 / 结果 / 代价」模板？
   - [p/WxOgq9RU] [x] Q13 任务反思是否保留为可选的完成证据核查？ @agent:w-reflection
     - [p/u2EO60oS] 调研说明（agent:w-reflection，只读调研，全程没有改动文件）：本地仓库是浅克隆，最早的提交是 2026-10-14，更早的提交是在 GitHub 远端查的。主要文件：server/lib/agent/tools/task-reflection.ts、server/lib/agent/loop.ts、server/services/spec-task-service.ts、server/services/turn-continuation-decisions.ts、server/services/spec-edit-interject.ts、docs/OUTLINE_KNOWLEDGE-DESIGN.md
@@ -2029,7 +2254,12 @@
       - [p/AbuH7dSE] 结果：main 从 7c5170d7 前进到 b256a9ef（60 个提交），13 处代码锚点全部新鲜
     - [p/eYUSIhDP] [x] 把原型发现整理回设计文档 @agent:main
       depends:: [[把这次的计划录进原型]]
-    - [p/8PsVaMVZ] [ ] 第三轮：按第二版改原型（复选框任务、锁定、待确认、依据从运行记录挂接、代码锚点），重跑同类任务，对比协调成本、命令数和查帮助次数 @agent:main
+    - [p/8PsVaMVZ] [x] 第三轮：按第二版改原型（复选框任务、锁定、待确认、依据从运行记录挂接、代码锚点），重跑同类任务，对比协调成本、命令数和查帮助次数 @agent:main
+      - [p/ajuQo3MG] 第三轮结果：专注 agent w-xrepo 调研 Q11，花 18.8 万 token、71 次调用；只读 README 的 lead3 记账花 12.0 万 token、48 条命令（查帮助 9、写入 16、报错 0），记了 10 条结论、9 条提问（3 个决策包）、给 Q11 补了建议。第二轮协调者是 23.9 万 token、58 条命令、查帮助 17、写入 7
+      - [p/dIGr3LUl] 对照验收线：记账成本比 0.73 → 0.64，没到 0.2；每次写入的辅助命令 8.3 → 3.0；查帮助 17 → 9；每行标记 3.2 → 0.01；等你决定的条目 20 条提问 → 7 个决策包加 1 条（目标 ≤5 个）
+      - [p/NYWQftb9] 记账成本降得少，是因为大头在读报告：209 行的报告读了 19 次 read。机械的部分（身份、编号、链接、位置）已经基本消失，剩下的是理解和判断
+      - [p/W2Pz2HEg] 自动挂依据：10 条结论都挂上了，代码锚点 24 处、运行记录 14 处；但运行记录按「碰过同一文件」去对，挂错不少（同一次 createNarrator 调用挂到了三条不相关的缺口上）；行号换成符号有时太粗（十几行换成整个 runAgentLoopUnlocked）
+      - [p/J9phBeeo] 新暴露的问题：ask 没有 --after，新决策包落在「已回答」后面；inbox 不带 --who 时看的是负责人的；勾掉别人进行中的任务不提示；协调者整理的结论没有自动链回报告；7 个决策包里有 3 个其实都属于 Q11，没有结构上的关联
   - [p/ydKe7oMn] [ ] P0 P0 设计与验证
     - [p/UV8qXrr2] [x] 设计文档讨论稿
     - [p/gPDU0vgb] [ ] 大纲编辑器与实时协同原型，按设计文档 §7.8 的清单验收
@@ -2109,6 +2339,21 @@
   - [p/CJxh3m7M] 转成请求的批量写入，批准时丢了插入位置：第二轮的 Q27–Q31 落到了「已回答」后面，只好手动挪回去（#91–#95）。原型改成在请求里记下要接在谁后面，批准时照原位插；cr show 也显示出来，批准前能检查
   - [p/dMypdGwK] Python 代码锚点原来只取到 def 那一行：取范围的办法是配平括号，而 Python 的括号在签名那一行就配平了，函数体怎么改都不会存疑。改成按缩进取整个函数或类。真实日志里还没有 Python 锚点，没有受影响；正式系统用 tree-sitter 取结构，不会有这个问题，但「锚点覆盖到哪」要有测试
   - [p/J0Wts4Pj] 复现脚本和输出也要挂回大纲：专注 agent 的证据大多是临时目录里的脚本输出，报告挂回之后，这些 file: 证据仍然悬空（12 条）。原型的 attach 改成也收非 markdown 文件，整个放进代码块，指向它们的证据跟着改指；第二轮的 3 份输出和 6 个脚本都挂在任务下了
+  - [p/1Gy7MXgj] 第三轮协调者的发现
+    - [p/Foueogjo] 新建的决策包落在页尾「已回答」后面：ask --bundle 第一次用某个包名时，系统在待定问题页的末尾新建包块，排到「已回答」之后（同 [[p/CJxh3m7M]] 一类问题）。ask 没有 --after，bundle 命令也没有位置参数，只能事后用 3 条 mv 挪到 Q11 后面
+    - [p/oE11u3X5] ask 的父块和 --bundle 的关系 README 没写：父块写「待定问题」页，包建在哪、包已存在时父块还起不起作用，都是试出来的（包建在父块下，题目放进包里）。从调研里拆出来的细项提问该放在页上的包里，还是放在 Q11 下面，[[p/i5q1KUdz]] 也没说；我放进了页上的包，和 Q11 之间没有结构关系，只在 Q11 的建议正文里写了 Q32–Q40
+    - [p/QhztterZ] Q11 和它的细项不在一起：Q11 是单独的问题，三个决策包在另一处；负责人采纳 Q11 的建议时会不会连带看到细项、要不要把 Q11 也放进包，README 没说。我没有把 Q11 编进包，因为它是负责人自己的问题
+    - [p/iOmfLVmT] inbox 不说是谁的收件箱：以 agent:lead3 身份运行 inbox，显示的是 human:owner 的待确认和待回答（P1 要「本人确认」、7 个决策包），标题却是「待你确认」「等你回答」；digest 末尾也写「等你决定：1 条待确认，7 个决策包」。inbox -h 有 --who，但没说不写时默认看谁。我差点以为 P1 要我确认
+    - [p/N3QwN9D9] 自动挂的运行记录依据有不少不相关：add 之后用 read --basis 看，缺口二、三、四三条结论都挂上了同样的 trace #67（createNarrator）和 #69（executionPolicyEngine.invalidate），缺口一挂上了 #66（subagentVar），第一条挂上 #5（visibility = public）。和结论对不上的依据会让人以为这是证据。README 只说「依据不用自己写」，没说运行记录依据怎么挑，挑错了怎么删
+    - [p/fmBW3qa8] add 的输出不报依据：只列新块的地址和正文开头，不说每块锚上了几处代码、挂了哪些运行记录，要再跑 read --basis 才知道（同 [[p/wJsEdT5n]]）。这次 10 条结论写了约 30 处位置，有 4 处留成了行范围（没换成符号），从输出看不出来
+    - [p/2DwNVZSG] 行号换成符号的结果有的看不出对不对：一个只覆盖十几行的行范围被换成了整个大函数（orchestrator 的 runAgentLoopUnlocked），函数里任何改动都会让这条结论存疑；报告说某段是 resolveNarratorProjectId 的同步镜像，换出来的符号却叫 actorAuthorizationSnapshot。另外报告的基线是讨论里那个分支的 becf57ee，README 没说指纹按工作区、HEAD 还是 origin/main 记，我没法判断这些锚点是否和报告读的是同一版
+    - [p/jWILTtiM] 报告里的简写位置要手工展开：报告大量用 `:648`、`:1226` 这种省略文件名的写法，抄进结论时我都改成了完整的 路径:行号，否则不知道会不会被认成位置。讨论分支上的位置（narrator-device-workspace-service）在当前工作区不存在，我干脆没写行号，只写了分支名
+    - [p/tjbN2mGW] 从报告整理的结论怎么标出处没写：10 条结论里只有写了报告块链接的那一条挂上了「依据：报告」，其余 9 条没有任何指向报告的依据，以后检索到时看不出它们来自 w-xrepo 的报告。README 第二版不再提出处、based_on、--by，我按「依据不用自己写」处理了，但不确定协调者整理的结论该记谁的名、要不要链回报告
+    - [p/Y26gFGQS] 勾掉别人的任务没有任何提示：调研任务指派给 agent:w-xrepo、状态是进行中，我用 edit --box x 直接勾成完成，没要 --steal，也没提示执行者是谁、要不要验收。README 说「别人正在做的会告诉你是谁」，这次没告诉；如果是因为我是派活的人所以放行，README 应该写明
+    - [p/ixNfWbQE] 位置行截断成了误导：read 的「位置：」把 Q11 的标题截成「项目空间怎么对应多个 pr」，我一开始以为 Q11 问的是多个 PR，读了 Q11 本身才知道是「多个 projects 行」。截断应该在词边界或加省略号
+    - [p/AcGmMcLZ] 帮助缺说明：ask -h 的 --option、--reason、--to 没有说明，--to 不写时交给谁没说，我每条都显式写了 --to human:owner；digest -h 的 --since 没说是提交号还是日期（试出来是提交号）；mv -h 没说 --after 和 parent 冲突时以谁为准
+    - [p/gUPgPIf3] 这轮 README 够用的地方：ask 自动编号（Q32–Q40 连续，没有手工找空号）、--bundle 同名复用、ask Q11 --recommend 补建议、写入回显身份「（agent:lead3）」，都和 README 写的一致；--recommend 写编号时建议块会带上选项原文，负责人不用对照编号
+    - [p/h5ypfM0g] 步数：到这一条为止执行了 48 条 outline 命令，0 条报错，没有命令被拒绝或转成请求。其中帮助 9 条（总帮助和 read、ask、add、edit、bundle、mv、digest、inbox）；写入 16 次：结论 1 次（10 块）、提问 9 次、Q11 补建议 1 次、勾完成 1 次、挪决策包 3 次、这批发现 1 次；其余 23 条是读页、read --basis、inbox、digest。读的文档：README 全文和上面 9 个 -h，外加大纲里「原型发现」页和待定问题页的说明块；没有读 outline.py 源码，没有读 data/ 下的文件，也没有用 git、grep 做别的核对
 
 - [p/a4bsGcVR] 概念与规则
   - [p/CQhWv1YD] 六个概念：块、类型、链接、空间、提交、层。详见 docs/OUTLINE_KNOWLEDGE-DESIGN.md §2
