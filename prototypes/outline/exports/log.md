@@ -1,7 +1,16 @@
-<!-- 由 prototypes/outline/outline.py export 生成（第 113 个提交）。真相源是 data/log.jsonl，不要手改。 -->
+<!-- 由 prototypes/outline/outline.py export 生成（第 122 个提交）。真相源是 data/log.jsonl，不要手改。 -->
 
 # 最近的提交
 
+- #122 2026-10-24T17:03 agent:main（责任人 human:owner）：P-1 加上第三轮试用
+- #121 2026-10-24T17:03 agent:main（责任人 human:owner）：D13 的第二版变化
+- #120 2026-10-24T17:03 agent:main（责任人 human:owner）：D12 的第二版变化
+- #119 2026-10-24T17:03 agent:main（责任人 human:owner）：D17c 按第二版改写
+- #118 2026-10-24T17:03 agent:main（责任人 human:owner）：D17b 被第二版取消
+- #117 2026-10-24T17:03 agent:main（责任人 human:owner）：D17a 被第二版取消
+- #116 2026-10-24T17:03 agent:main（责任人 human:owner）：D16b 被第二版取消
+- #115 2026-10-24T17:03 agent:main（责任人 human:owner）：记下 D18：按需求清单收缩概念
+- #114 2026-10-24T17:03 agent:main（责任人 human:owner）：录入需求清单（R1–R25）
 - #113 2026-10-24T08:00 agent:main（责任人 human:owner）：推进决策：提问都写了建议，等负责人回答
 - #112 2026-10-24T08:00 agent:main（责任人 human:owner）：原型发现已整理回设计文档（两轮试用、提问交接、范围细则、往返不丢）
 - #111 2026-10-24T07:59 agent:main（责任人 human:owner）：多 agent 试用两轮都跑完了
@@ -73,12 +82,3 @@
 - #45 2026-10-24T06:46 agent:main（责任人 human:owner）：验收 Q13：任务反思调研完整，待决定的点已建成 Q25、Q26
 - #44 2026-10-24T06:46 agent:main（责任人 human:owner）：验收 Q6：方言调研完整，待决定的点已建成 Q17–Q24
 - #43 2026-10-24T06:44 agent:steward（责任人 human:owner）：协调者试用代记的发现（14 条）
-- #42 2026-10-24T06:41 agent:w-reflection，由 agent:steward 代记（责任人 human:owner）：代交 Q13：任务反思调研完成（agent:w-reflection，steward 代记）
-- #41 2026-10-24T06:41 agent:steward（责任人 human:owner）：协调者：Q13 的提问索引和看法
-- #40 2026-10-24T06:40 agent:w-reflection，由 agent:steward 代记（责任人 human:owner）：代记 Q13 调研结论（agent:w-reflection 的报告）
-- #39 2026-10-24T06:40 agent:steward（责任人 human:owner）：建提问 Q26（来自 Q13 调研）
-- #38 2026-10-24T06:40 agent:steward（责任人 human:owner）：建提问 Q25（来自 Q13 调研）
-- #37 2026-10-24T06:39 agent:w-dialect，由 agent:steward 代记（责任人 human:owner）：代交 Q6：方言调研完成（agent:w-dialect，steward 代记）
-- #36 2026-10-24T06:39 agent:steward（责任人 human:owner）：协调者：Q6 的提问索引和看法
-- #35 2026-10-24T06:39 agent:w-dialect，由 agent:steward 代记（责任人 human:owner）：代记 Q6 调研结论（agent:w-dialect 的报告）
-- #34 2026-10-24T06:38 agent:steward（责任人 human:owner）：Q6 调研的标签问题并入 Q10

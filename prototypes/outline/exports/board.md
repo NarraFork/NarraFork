@@ -1,8 +1,8 @@
-<!-- 由 prototypes/outline/outline.py export 生成（第 113 个提交）。真相源是 data/log.jsonl，不要手改。 -->
+<!-- 由 prototypes/outline/outline.py export 生成（第 122 个提交）。真相源是 data/log.jsonl，不要手改。 -->
 
 # 任务看板
 
-### 待办（41）
+### 待办（42）
 - [p/G8CCrUUY] 「创建人」指 agent 的创建者，还是计划的创建者？ ‹Q1·执行：human:owner·管理：agent:main·#提问› ← 问题
 - [p/8NPAfqiW] D1 的例外改成「转成提议、不打断 agent」，可以吗？ ‹Q2·执行：human:owner·管理：agent:main·#提问› ← 问题
 - [p/t5G1F2nN] 代批授权：只能逐个计划授权，还是允许责任人设一个会话级默认值？ ‹Q3·执行：human:owner·管理：agent:main·#提问› ← 问题
@@ -44,6 +44,7 @@
 - [p/FUd5vw6c] Tiptap 版本：整套 @tiptap/* 升到 3.32.0（修好单元格里竖线转义和 `<br>`，但要回归 In… ‹Q29·执行：human:owner·管理：agent:main·#提问› ← 问题
 - [p/2npkqyKh] 非 .md 的 spec 文件（agent 建的 .json、.yaml 等）和 behavior_fence，是否一… ‹Q30·执行：human:owner·管理：agent:main·#提问› ← 问题
 - [p/aPJZmbvr] 数据恢复：要不要做 spec 的历史查看和恢复功能？要不要先离线排查一遍现有数据库里被 UI 保存吞掉表格的记录？ ‹Q31·执行：human:owner·管理：agent:main·#提问› ← 问题
+- [p/8PsVaMVZ] 第三轮：按第二版改原型（复选框任务、锁定、待确认、依据从运行记录挂接、代码锚点），重跑同类任务，对比协调成本、命令数和… ‹执行：agent:main·管理：human:owner› ← P-1
 
 ### 进行中（2）
 - [p/H0a1nXuL] 大纲系统路线图：建成知识、记忆与任务的统一平台 ‹路线图·管理：human:owner›
