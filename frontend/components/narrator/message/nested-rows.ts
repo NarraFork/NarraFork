@@ -22,6 +22,34 @@ export function isNestedRow(row: { parentMessageId?: unknown }): boolean {
 	return typeof row.parentMessageId === "string" && row.parentMessageId.length > 0;
 }
 
+/**
+ * Whether a realtime row belongs to a SUBAGENT's own document, seen from the page
+ * that received it.
+ *
+ * The server dual-broadcasts a subagent's row to both pages
+ * (`server/websocket/narrator-dual-broadcast`): the subagent keeps it as one of its
+ * own top-level rows, while the parent receives the SAME row tagged with
+ * `parentToolUseId` so its card can attach it. The tag is the only thing marking it
+ * as foreign: a subagent's rows are never nested under the parent's row
+ * (`isNestedRow` stays false for them) and their `seq` belongs to the subagent's own
+ * numbering, so nothing on the parent page can place them in its document.
+ *
+ * A page must therefore read the tag as "not a message of this conversation": the
+ * parent still learns about its subagents from the live channels (tool
+ * started/chunk/completed, activity summaries) and from its own card's
+ * `parentToolUseId`, never by treating a subagent row as one of its own. A
+ * subagent's own page receives the same row with the pointer stripped, so it keeps
+ * working unchanged.
+ */
+export function isForeignSubagentRow(
+	message: { parentToolUseId?: unknown } | undefined,
+	isSubagent: boolean,
+): boolean {
+	if (isSubagent) return false;
+	const parentToolUseId = message?.parentToolUseId;
+	return typeof parentToolUseId === "string" && parentToolUseId.length > 0;
+}
+
 /** The rows directly under each row, in document order. */
 export function nestedRowsByParent<T extends NestableRow>(rows: readonly T[]): Map<string, T[]> {
 	const byParent = new Map<string, T[]>();

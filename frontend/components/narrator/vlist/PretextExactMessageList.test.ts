@@ -195,6 +195,17 @@ describe("PretextExactMessageList", () => {
 		expect(isCompactMarkerMessage({ blocks: null } as never)).toBe(false);
 	});
 
+	it("keeps a subagent's dual-broadcast row out of this document's revision count", () => {
+		// The parent page receives a subagent row tagged with `parentToolUseId`
+		// (`isForeignSubagentRow`), and it is not a row of THIS document. Counting it as a
+		// structural change left the applied revision behind with nothing to apply — and
+		// that gap is exactly the unread count the scroll-to-bottom badge renders, so a
+		// subagent running beside the parent inflated a badge scrolling could never clear.
+		// Both realtime entry points must decline it, or one path silently keeps counting.
+		const source = shellModule("PretextExactMessageList.tsx");
+		expect(source.match(/isForeignSubagentRow\(message, !!isSubagent\)/g)?.length).toBe(2);
+	});
+
 	it("prefers the synchronous live scroll view when capturing a rebuild anchor", () => {
 		const fallback = { scrollTop: 120, viewportHeight: 600, pinnedToBottom: false };
 		const live = { scrollTop: 480, viewportHeight: 640, pinnedToBottom: true };

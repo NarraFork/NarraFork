@@ -9,6 +9,7 @@ import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { segmentMessages } from "../message/message-segments";
 import {
 	endOfNestedRows,
+	isForeignSubagentRow,
 	isNestedRow,
 	nestedRowsByParent,
 	withNestedRowIds,
@@ -63,6 +64,22 @@ describe("nested-rows helpers", () => {
 		expect([...withNestedRowIds(rows, new Set(["p"]))].sort()).toEqual(["c1", "c2", "g1", "p"]);
 		expect(endOfNestedRows(document(), 1)).toBe(4);
 		expect(endOfNestedRows(document(), 0)).toBe(1);
+	});
+
+	it("recognizes the row a subagent's parent page receives as foreign", () => {
+		// The same row is dual-broadcast to both pages: the subagent keeps it as one of its
+		// own top-level rows, and the parent receives it tagged with `parentToolUseId` — not
+		// nested, because a subagent's rows are never nested under its parent's row.
+		expect(isForeignSubagentRow(row("plain", 3, { parentToolUseId: "run" }), false)).toBe(true);
+		// The subagent's own page receives that same row with the pointer stripped, so its
+		// pages must keep treating it as an ordinary row.
+		expect(isForeignSubagentRow(row("plain", 3, { parentToolUseId: "run" }), true)).toBe(false);
+		expect(isForeignSubagentRow(row("plain", 3), true)).toBe(false);
+		// Ordinary rows and legacy inline replies (nested under a parent ROW) stay part of
+		// the conversation that holds them.
+		expect(isForeignSubagentRow(row("plain", 3), false)).toBe(false);
+		expect(isForeignSubagentRow(row("plain", 3, { parentToolUseId: "" }), false)).toBe(false);
+		expect(isForeignSubagentRow(undefined, false)).toBe(false);
 	});
 });
 

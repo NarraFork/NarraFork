@@ -29,6 +29,7 @@ import {
 } from "./context-management/context-usage-state";
 import { localizeNarratorError } from "./error-localization";
 import { withQueueSubstatus } from "./header/narrator-status-bar";
+import { isForeignSubagentRow } from "./message/nested-rows";
 import type {
 	ContentBlock,
 	NarratorMsg,
@@ -930,6 +931,12 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				clearRetryIfActive();
 			},
 			onMessage: (wsData: { message?: NarratorMsg; [key: string]: unknown }) => {
+				// A subagent's row is dual-broadcast to this page too, tagged with
+				// `parentToolUseId` (see `isForeignSubagentRow`). Nothing derived from it may
+				// touch THIS conversation's state — most visibly it used to look like an
+				// assistant answer, so a subagent finishing its turn cleared this panel's
+				// queued-message and retry chips while the parent was still running.
+				if (isForeignSubagentRow(wsData.message, !!isSubagent)) return;
 				const blocks = messageBody(wsData.message);
 				const compactBlock = blocks.find(
 					(b: ContentBlock) =>

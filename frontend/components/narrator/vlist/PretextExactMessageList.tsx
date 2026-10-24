@@ -79,6 +79,7 @@ import { useRenderLod } from "../lod/RenderLodCtx";
 import { type MessageSelectionResolver, useMessageSelection } from "../message/MessageSelectionCtx";
 import { resolveEditorInitialText } from "../message/message-edit-text";
 import type { MessageListHandle, MessageListTailMeta } from "../message/message-list-handle";
+import { isForeignSubagentRow } from "../message/nested-rows";
 import { NarratorMessageListSkeleton } from "../NarratorMessageListSkeleton";
 import { findLatestSpecTasksToolUseId } from "../narrator-message-helpers";
 import type { NarratorMsg, PermissionCallbacks } from "../narrator-panel-types";
@@ -2269,6 +2270,12 @@ export const PretextExactMessageList = memo(
 			// their existing exact insert fast path.
 			const upsertOrReload = useCallback(
 				(message: TreeMessage | undefined) => {
+					// A subagent's row is dual-broadcast here too, but it is never a row of
+					// THIS document (see `isForeignSubagentRow`). Applying it always fails and
+					// yet the revision bump below still counted it, so every subagent message
+					// inflated the "new messages" badge of a parent panel that nothing was
+					// arriving in. Its card is maintained by the live-patch channel instead.
+					if (isForeignSubagentRow(message, !!isSubagent)) return;
 					if (message && upsertMessageRef.current(message)) {
 						appliedMessageRevisionRef.current += 1;
 					} else if (message && askInPassingBlock(message)) {
@@ -2283,7 +2290,7 @@ export const PretextExactMessageList = memo(
 					}
 					bumpMessageRevision();
 				},
-				[bumpMessageRevision, refreshAskInPassingWindow],
+				[bumpMessageRevision, refreshAskInPassingWindow, isSubagent],
 			);
 
 			// A deletion is applied to the loaded window IN PLACE for the same reason an
@@ -2329,6 +2336,10 @@ export const PretextExactMessageList = memo(
 						replacementMessageId?: string;
 					},
 				) => {
+					// Same reasoning as `upsertOrReload`: a subagent row's update is not this
+					// document's business, and every one of them used to leave the applied
+					// revision behind the structural one.
+					if (isForeignSubagentRow(message, !!isSubagent)) return;
 					// Same-id updates (including queued → claimed/materialized/failed and
 					// canonical user edits) use the id+seq upsert path. Alias-bearing COW
 					// replacements still use the legacy replacement guard below.
@@ -2354,7 +2365,7 @@ export const PretextExactMessageList = memo(
 					}
 					bumpMessageRevision();
 				},
-				[bumpMessageRevision, refreshAskInPassingWindow],
+				[bumpMessageRevision, refreshAskInPassingWindow, isSubagent],
 			);
 
 			// The exact shell is stable-state only. Subscribe to the existing message
