@@ -785,6 +785,7 @@
 	"jumpTargetUnavailable": "That message is no longer in this conversation's history.",
 	"jumpTargetTooFar": "That message is too far back to jump to. Scroll up to load more history, then try again.",
 	"archiveNarrator": "Archive",
+	"archiveFailed": "Could not archive the session. Please try again.",
 	"permissionMode": "Permission Mode",
 	"permissionModesUnavailable": "Permission modes unavailable",
 	"enterPlanMode": "Enter plan mode",

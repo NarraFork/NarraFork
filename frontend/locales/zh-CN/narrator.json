@@ -784,6 +784,7 @@
 	"jumpTargetUnavailable": "该消息已不在此会话的历史记录中。",
 	"jumpTargetTooFar": "该消息距离当前位置过远，无法直接跳转。请向上滚动加载更多历史后重试。",
 	"archiveNarrator": "归档",
+	"archiveFailed": "归档失败，请重试。",
 	"permissionMode": "权限模式",
 	"permissionModesUnavailable": "权限模式不可用",
 	"enterPlanMode": "进入计划模式",

@@ -758,6 +758,32 @@ function restoreSectionSnapshots(
 	syncCompatibilityCache(qc);
 }
 
+/**
+ * Remove an entity's tab from the sectioned caches (the source of truth that
+ * `useRecentTabs` re-derives the flat array from) and cascade-delete it server side.
+ * Editing only the flat array is overwritten by that derivation, which left an archived
+ * session's tab visible until a WS delta happened to arrive.
+ */
+export async function removeRecentTabCascade(
+	qc: QueryClient,
+	type: RecentTab["type"],
+	id: string,
+): Promise<void> {
+	const section = recentTabsSectionQueryKey(type === "project" ? "projects" : "work");
+	await qc.cancelQueries({ queryKey: section });
+	const snapshots = snapshotSections(qc);
+	updateSectionData(qc, type === "project" ? "projects" : "work", (current) =>
+		applyOperation(current, { type: "remove", key: `${type}:${id}` }),
+	);
+	syncCompatibilityCache(qc);
+	try {
+		const result = await api.removeRecentTab(type, id, { cascade: true });
+		await applyRecentTabsDeltaAndFollowUp(qc, mutationDelta(result));
+	} catch {
+		restoreSectionSnapshots(qc, snapshots);
+	}
+}
+
 class RecentTabsStaleWindowError extends Error {}
 
 export function isRecentTabsStaleCursorError(error: unknown): boolean {

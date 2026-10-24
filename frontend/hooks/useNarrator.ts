@@ -40,7 +40,7 @@ import {
 	invalidateRevertQueries,
 	isRevertHistoryCommitted,
 } from "../lib/revert-result";
-import { RECENT_TABS_QUERY_KEY } from "./useRecentTabs";
+import { removeRecentTabCascade } from "./useRecentTabs";
 
 const FILE_PREVIEW_QUERY_GC_TIME_MS = 30_000;
 const NARRATORS_LIST_GC_TIME_MS = 60_000;
@@ -775,26 +775,16 @@ export function useCreateNarrator() {
 
 export function useArchiveNarrator() {
 	const qc = useQueryClient();
+	const { t } = useTranslation("narrator");
 	return useMutation({
 		mutationFn: (id: string) => api.archiveNarrator(id),
 		onSuccess: (_data, narratorId) => {
 			qc.invalidateQueries({ queryKey: ["narrators"] });
-			// Remove all tabs associated with the archived narrator from the sidebar
-			const tabs =
-				qc.getQueryData<{ type: "narrator" | "project"; id: string }[]>(RECENT_TABS_QUERY_KEY) ??
-				[];
-			const isMatch = (t: (typeof tabs)[number]) => t.type === "narrator" && t.id === narratorId;
-			const matched = tabs.filter(isMatch);
-			if (matched.length > 0) {
-				for (const tab of matched) {
-					// Cascade cleanup after archive — no undo token for entities that are gone.
-					api.removeRecentTab(tab.type, tab.id, { cascade: true }).catch(() => {});
-				}
-				qc.setQueryData(
-					RECENT_TABS_QUERY_KEY,
-					tabs.filter((t) => !isMatch(t)),
-				);
-			}
+			// Cascade cleanup after archive — no undo token for entities that are gone.
+			void removeRecentTabCascade(qc, "narrator", narratorId);
+		},
+		onError: () => {
+			notifications.show({ color: "red", message: t("archiveFailed") });
 		},
 	});
 }
