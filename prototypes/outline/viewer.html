@@ -314,6 +314,8 @@ function chipsFor(st, b) {
 		const s = p.status || "todo";
 		out.push(["st-" + s, STATUS_ZH[s] || s]);
 		if (p.owner) out.push(["", "执行：" + p.owner]);
+		if (p.manager && p.manager !== p.owner) out.push(["", "管理：" + p.manager]);
+		if (p.acceptance === "required" && s !== "done" && s !== "cancelled") out.push(["", "需验收"]);
 		if (p.no_evidence && s === "done") out.push(["st-blocked", "无依据"]);
 	}
 	if (b.kind === "assertion") {
@@ -424,8 +426,8 @@ function renderDetail(cur) {
 	if (!c) { box.appendChild(el("div", "empty", "还没有提交")); return; }
 	box.appendChild(el("div", "who", "#" + c.seq + " " + c.summary));
 	let meta = (c.ts || "").replace("T", " ").slice(0, 16) + " · " + c.actor;
-	if (c.on_behalf_of) meta += "（代 " + c.on_behalf_of + "）";
-	if (c.recorded_by) meta += " · 由 " + c.recorded_by + " 代记";
+	if (c.recorded_by) meta += "，由 " + c.recorded_by + " 代记";
+	if (c.on_behalf_of) meta += "（责任人 " + c.on_behalf_of + "）";
 	box.appendChild(el("div", "meta", meta));
 	const ol = el("ol", "ops");
 	const shown = c.ops.slice(0, 60);

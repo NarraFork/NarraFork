@@ -341,10 +341,20 @@ def reads_path(actor: str) -> Path:
 def record_reads(actor: str, st: State, addrs) -> None:
 	path = reads_path(actor)
 	reads = load_json(path, {})
+	addrs = [a for a in addrs if a in st.blocks]
 	for a in addrs:
-		if a in st.blocks:
-			reads[a] = st.blocks[a]["version"]
+		reads[a] = st.blocks[a]["version"]
 	path.write_text(json.dumps(reads, ensure_ascii=False), encoding="utf-8")
+	# 泡外的读取不拦，只记录，上级能看到它看了范围外的什么（§10.3）
+	outside = [st.page_of(a) for a in addrs if not in_scope(st, actor, a)]
+	if outside:
+		opath = outside_path(actor)
+		seen = [x for x in load_json(opath, []) if x not in outside]
+		opath.write_text(json.dumps((seen + list(dict.fromkeys(outside)))[-50:], ensure_ascii=False), encoding="utf-8")
+
+
+def outside_path(actor: str) -> Path:
+	return _local("outside-" + re.sub(r"[^A-Za-z0-9_.-]", "_", actor) + ".json")
 
 
 def fresh_cache() -> dict:
@@ -403,13 +413,31 @@ def resolve(st: State, ref: str, labels: dict | None = None) -> str:
 		return ref
 	space, key = ref.split("/", 1)
 	hits = [a for a, b in st.blocks.items() if b["space"] == space and b["props"].get("alias") == key]
-	if len(hits) == 1:
-		return hits[0]
+	live = [a for a in hits if not st.blocks[a]["deleted"]]
+	if len(live) == 1 or (not live and len(hits) == 1):
+		return (live or hits)[0]
+	if len(live) > 1:
+		raise OutlineError(f"别名 {ref} 指向多个块：{', '.join(live)}")
 	raise OutlineError(f"找不到块 {ref}")
 
 
+def assign_alias(st: State, space: str, alias: str, addr: str | None = None, taken: set[str] | None = None) -> str:
+	"""`Q?` 取下一个空号；其他别名要在空间内唯一（已删除的块不占用）。"""
+	taken = taken or set()
+	if alias.endswith("?"):
+		prefix = alias[:-1]
+		pat = re.compile(re.escape(prefix) + r"(\d+)")
+		used = [b["props"].get("alias") or "" for b in st.blocks.values() if b["space"] == space] + list(taken)
+		nums = [int(m.group(1)) for a in used if (m := pat.fullmatch(a))]
+		return f"{prefix}{max(nums, default=0) + 1}"
+	clash = [a for a, b in st.blocks.items() if b["space"] == space and not b["deleted"] and b["props"].get("alias") == alias and a != addr]
+	if clash or alias in taken:
+		raise OutlineError(f"别名 {alias} 已被 {clash[0] if clash else '同一批的另一条'} 使用")
+	return alias
+
+
 def is_block_target(target: str) -> bool:
-	return not re.match(r"^(code|grep|url|msg|chat|tool|commit|file|report|human|agent):", target)
+	return not re.match(r"^(code|grep|url|msg|chat|tool|commit|file|report|human|agent|space|ws):", target)
 
 
 def resolve_target(st: State, target: str, labels: dict | None = None) -> str:
@@ -430,9 +458,12 @@ def next_order(st: State, parent_key: str, after: str | None) -> float:
 	return (lo + hi) / 2
 
 
+CODE_SPAN = re.compile(r"(`+)(?:(?!\1).)+?\1", re.S)
+
+
 def inline_targets(st: State, content: str, labels: dict | None = None) -> list[tuple[str, str]]:
 	out = []
-	for bang, ref in INLINE_LINK.findall(content):
+	for bang, ref in INLINE_LINK.findall(CODE_SPAN.sub("", content)):  # 行内代码里的 [[…]] 是字面文字
 		try:
 			out.append(("embed" if bang else "mention", resolve(st, ref, labels)))
 		except OutlineError:
@@ -524,8 +555,11 @@ def can_approve_plan_change(st: State, actor: str, root: str, ap: dict, touches_
 def check_policy(tx: Tx, op: dict) -> None:
 	"""在操作生效前判断是否需要转成提议；需要时记到 tx.divert，事务结束时整体转换。"""
 	st, actor = tx.st, tx.actor
-	if tx.kind == "system":
+	if tx.kind in ("system", "scope"):
 		return
+	src = st.blocks.get(op.get("from") or "")
+	if op["op"] == "link.add" and op["role"] == "touches" and src and src["props"].get("alias") == "范围":
+		raise OutlineError("范围页上的泡用 scope 命令增减：扩大范围要上级批准（§10.4）")
 	addr = op.get("addr")
 	space = op.get("space") or (st.blocks[addr]["space"] if addr in st.blocks else None)
 	if space and st.spaces.get(space, {}).get("kind") == "personal" and is_agent(actor):
@@ -545,6 +579,87 @@ def check_policy(tx: Tx, op: dict) -> None:
 			tx.divert.append(
 				(f"删除或移动团队之外写的块（作者 {author}）", {"kind": "human", "who": st.responsible(author)})
 			)
+			return
+	# 注意范围（§10）：有范围的 agent 在泡外写入，转成扩大范围请求
+	target = op.get("parent") if op["op"] == "block.create" else (op.get("from") if op["op"] == "link.add" else addr)
+	where = target if target in st.blocks else (f"space:{op['space']}" if op["op"] == "block.create" and not target else None)
+	if where and is_agent(actor) and not in_scope(st, actor, where, "修改"):
+		bubble = st.page_of(where) if where in st.blocks else where  # 按整页纳入
+		tx.divert.append((f"在范围外写入（{where}）", scope_decider(st, actor, bubble, "修改") | {"scope_actor": actor, "scope_target": bubble}))
+
+
+# ---------------------------------------------------------------------------
+# 注意范围（§10）：会话空间里的「范围」页，用「涉及」链接圈出几个泡
+
+
+LEVELS = ("关注", "修改", "执行")
+
+
+def creator_of(st: State, actor: str) -> str:
+	return st.actors.get(actor, {}).get("creator") or "human:owner"
+
+
+def session_space(actor: str) -> str:
+	return "s." + actor.split(":", 1)[-1]
+
+
+def scope_page(st: State, actor: str) -> str | None:
+	space = session_space(actor)
+	hits = [a for a, b in st.blocks.items() if b["space"] == space and b["props"].get("alias") == "范围" and not b["deleted"]]
+	return hits[0] if hits else None
+
+
+def now_iso() -> str:
+	return time.strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def bubbles(st: State, actor: str) -> list[dict] | None:
+	"""这个 agent 的泡（过期的不算）；None 表示没有设范围，不受限制。"""
+	page = scope_page(st, actor)
+	if not page:
+		return None
+	now = now_iso()
+	return [lk for lk in st.links_from(page, "touches") if (lk["data"].get("until") or "9999") > now]
+
+
+def level_ok(bubble: dict, need: str) -> bool:
+	return LEVELS.index(bubble["data"].get("level", "关注")) >= LEVELS.index(need)
+
+
+def bubble_covers(st: State, root: str, where: str) -> bool:
+	if root.startswith("space:"):
+		return where == root or (where in st.blocks and st.blocks[where]["space"] == root[6:])
+	if root in st.blocks:
+		return where == root or (where in st.blocks and root in st.ancestors(where))
+	# code:、ws: 按路径前缀；以 `:` 或 `/` 结尾表示整台设备、整个目录
+	return where == root or where.startswith(root if root.endswith(("/", ":")) else root + "/")
+
+
+def in_scope(st: State, actor: str, where: str, need: str = "关注") -> bool:
+	bs = bubbles(st, actor)
+	if bs is None:
+		return True
+	own = session_space(actor)
+	if where == f"space:{own}" or (where in st.blocks and st.blocks[where]["space"] == own):
+		return True  # 自己的会话空间永远在范围内
+	return any(level_ok(b, need) and bubble_covers(st, b["target"], where) for b in bs)
+
+
+def can_grant(st: State, granter: str, target: str, level: str) -> bool:
+	"""能不能把这个泡给下级：人都能；agent 要自己的范围覆盖它。工作区的「执行」只能转授自己明确有的。"""
+	if not is_agent(granter):
+		return True
+	if level == "执行" and target.startswith("ws:"):
+		return any(level_ok(b, "执行") and bubble_covers(st, b["target"], target) for b in bubbles(st, granter) or [])
+	return in_scope(st, granter, target, level)
+
+
+def scope_decider(st: State, actor: str, bubble: str, level: str) -> dict:
+	"""扩大范围找谁批：从派它的会话开始沿链往上，第一个能转授的批；都不能就由人批（§10.4）。"""
+	cur = creator_of(st, actor)
+	while is_agent(cur) and not can_grant(st, cur, bubble, level):
+		cur = creator_of(st, cur)
+	return {"kind": "agent" if is_agent(cur) else "human", "who": cur}
 
 
 def check_read(tx: Tx, addr: str) -> None:
@@ -574,7 +689,7 @@ def guarded(tx: Tx, op: dict) -> None:
 
 def finish(tx: Tx, quiet: bool = False) -> int | None:
 	"""写入提交。需要别人决定的改动整体转成提议 / 变更请求，不打断 agent。"""
-	if not tx.ops:
+	if not tx.ops and not tx.divert:
 		for n in tx.notices:
 			print(n)
 		return None
@@ -603,6 +718,13 @@ def finish(tx: Tx, quiet: bool = False) -> int | None:
 					blocked.add(task)
 		tx2 = Tx(fresh, tx.actor, f"{tx.summary}（转成 {cid}）", kind="system")
 		ops = []
+		if decider.get("scope_target"):
+			kind = "scope"
+			data = {"level": decider.get("scope_level", "修改")}
+			if decider.get("scope_until"):
+				data["for"] = decider["scope_until"]  # 批准时再换算成截止时间
+			page = scope_page(fresh, decider["scope_actor"])
+			ops.append({"op": "link.add", "id": f"L{tx2.seq}-scope", "from": page, "role": "touches", "target": decider["scope_target"], "data": data})
 		for o in tx.ops:
 			if o.get("addr") in fresh.blocks:
 				base = tx2.seq if o["addr"] in blocked else fresh.blocks[o["addr"]]["version"]
@@ -613,8 +735,11 @@ def finish(tx: Tx, quiet: bool = False) -> int | None:
 			prev = fresh.blocks[task]["props"].get("status", "todo")
 			tx2.push({"op": "block.update", "addr": task, "props": {"status": "blocked", "prev_status": prev, "blocked_reason": f"等待 {cid}"}})
 		seq = write_commit(tx2)
-		where = "变更请求" if kind == "change_request" else "提议"
-		print(f"已转成{where} {cid}：{reason}。决定者：{describe_decider(fresh, decider)}。")
+		where = {"change_request": "变更请求", "scope": "扩大范围请求"}.get(kind, "提议")
+		extra = ""
+		if kind == "scope":
+			extra = f"批准后 {decider['scope_target']} 以「{decider.get('scope_level', '修改')}」级别纳入范围" + ("，并执行这次写入。" if tx.ops else "。")
+		print(f"已转成{where} {cid}：{reason}。决定者：{describe_decider(fresh, decider)}。{extra}")
 		if blocked:
 			print(f"受影响的任务已标为受阻：{', '.join(sorted(set(blocked)))}。先做不受影响的部分。")
 		return seq
@@ -623,6 +748,9 @@ def finish(tx: Tx, quiet: bool = False) -> int | None:
 	if not quiet:
 		for n in tx.notices:
 			print(n)
+		recorder = os.environ.get("OUTLINE_RECORDED_BY")
+		who = f"#{seq} 以 {tx.actor} 的身份写入" + (f"，由 {recorder} 代记" if recorder and recorder != tx.actor else "")
+		print(who + (f"（责任人 {tx.st.responsible(tx.actor)}）" if is_agent(tx.actor) else ""))
 	return seq
 
 
@@ -693,6 +821,7 @@ def symbol_segment(text: str, symbol: str) -> str | None:
 	patterns = [
 		re.compile(rf"^\s*(export\s+)?(default\s+)?(declare\s+)?(async\s+)?(function\*?|const|let|var|class|interface|type|enum)\s+{name}\b"),
 		re.compile(rf"^\s*(public\s+|private\s+|protected\s+|static\s+|readonly\s+)*(async\s+)?{name}\s*[(<]"),
+		re.compile(rf"^(\s*)(async\s+)?def\s+{name}\b|^(\s*)class\s+{name}\b"),  # Python
 	]
 	start = next((i for p in patterns for i, ln in enumerate(lines) if p.search(ln)), None)
 	if start is None:
@@ -741,6 +870,26 @@ def ref_commit(ref: str) -> str:
 	return (git("rev-parse", "--short", ref) or "?").strip()
 
 
+def file_meta(path: str) -> tuple[dict, str | None]:
+	"""file: 证据记下当时的版本：内容指纹，仓库内的文件再记提交号（原型发现）。"""
+	full = Path(path) if Path(path).is_absolute() else repo_root() / path
+	if not full.is_file():
+		return {}, f"{path} 不存在，证据无法核对"
+	with full.open("rb") as f:
+		raw = f.read(GIT_MAX_BYTES)
+	data = {"sha1": hashlib.sha1(raw).hexdigest()[:16], "bytes": full.stat().st_size}
+	try:
+		rel = str(full.resolve().relative_to(repo_root()))
+	except ValueError:
+		return data, f"{path} 在仓库之外，会话结束可能就没了；报告类文件请先用 attach 放进大纲"
+	if git("ls-files", "--error-unmatch", "--", rel) is None:
+		return data, f"{path} 没有纳入 git，只记下了内容指纹"
+	data["commit"] = ref_commit("HEAD")
+	if git("diff", "--quiet", "HEAD", "--", rel) is None:
+		data["dirty"] = True  # 有未提交的改动：指纹对应的是工作区里的内容
+	return data, None
+
+
 def freshness(st: State, addr: str) -> tuple[str, list[str]]:
 	cache = fresh_cache()
 	state, why = "fresh", []
@@ -782,6 +931,10 @@ def badges(st: State, addr: str) -> list[str]:
 		out.append(STATUS_ZH.get(p.get("status", "todo"), p.get("status", "")))
 		if p.get("owner"):
 			out.append("执行：" + p["owner"])
+		if p.get("manager") and p["manager"] != p.get("owner"):
+			out.append("管理：" + p["manager"])
+		if p.get("acceptance") == "required" and p.get("status", "todo") not in ("done", "cancelled"):
+			out.append("需验收")
 		if p.get("status", "todo") in ("todo", "doing"):
 			waiting = [lk["target"] for lk in st.links_from(addr, "blocked_by") if st.blocks.get(lk["target"], {}).get("props", {}).get("status") not in ("done", "cancelled")]
 			if waiting:  # 等前置是推导出来的，不写进状态（§0 规则 2）
@@ -862,25 +1015,35 @@ ITEM_PROPS = re.compile(r"\s*\{([^{}]*)\}\s*$")
 def parse_outline(text: str) -> list[dict]:
 	roots: list[dict] = []
 	stack: list[dict] = []
+	blanks = 0  # 续行之间的空行要保留（原型发现）
+	fence = None  # 续行里的代码块：块内的行原样保留，`- ` 开头也不算新条目
 	for raw in text.splitlines():
-		if not raw.strip():
-			continue
 		expanded = raw.replace("\t", "  ")
 		indent = len(expanded) - len(expanded.lstrip(" "))
 		body = expanded.strip()
-		if body.startswith("- "):
+		if not body and fence is None:
+			blanks += 1 if stack else 0
+			continue
+		if body.startswith("- ") and fence is None:
+			blanks = 0
 			item = parse_item(body[2:])
 			item["indent"] = indent
 			while stack and stack[-1]["indent"] >= indent:
 				stack.pop()
 			(stack[-1]["children"] if stack else roots).append(item)
 			stack.append(item)
-		else:
-			if not stack:
-				raise OutlineError(f"续行前面没有条目：{raw}")
-			base = stack[-1]["indent"] + 2
-			cont = expanded[base:] if len(expanded) - len(expanded.lstrip(" ")) >= base else body
-			stack[-1]["content"] += "\n" + cont
+			continue
+		if not stack:
+			raise OutlineError(f"续行前面没有条目：{raw}")
+		base = stack[-1]["indent"] + 2
+		cont = expanded[base:] if indent >= base else body
+		stack[-1]["content"] += "\n" * (blanks + 1) + cont
+		blanks = 0
+		mark = re.match(r"(`{3,}|~{3,})", body)
+		if mark and fence is None:
+			fence = mark.group(1)
+		elif fence and re.fullmatch(re.escape(fence[0]) + "{%d,}" % len(fence), body):
+			fence = None
 	return roots
 
 
@@ -922,20 +1085,22 @@ def default_props(st: State, actor: str, kind: str, props: dict, links: list) ->
 		if props["status"] not in STATUSES:
 			raise OutlineError(f"未知任务状态 {props['status']}")
 	if kind == "assertion":
-		stance = props.setdefault("stance", "hypothesis" if is_agent(actor) else "accepted")
+		# 有证据或「基于」的结论直接采纳，没有的记为假设；人写的默认采纳（§5.4、§9.6）
+		has_basis = any(r in ("evidence", "based_on") for r, _ in links)
+		stance = props.setdefault("stance", "accepted" if has_basis or not is_agent(actor) else "hypothesis")
 		if stance not in STANCES:
 			raise OutlineError(f"未知立场 {stance}")
-		has_basis = any(r in ("evidence", "based_on") for r, _ in links)
 		if stance == "accepted" and is_agent(actor) and not has_basis:
 			props["stance"] = "hypothesis"
 			notes.append("没有证据或基于，已记为「假设」（§5.4）")
 	return props, notes
 
 
-def create_items(tx: Tx, space: str, parent: str | None, items: list[dict], after: str | None = None) -> list[tuple[str, dict]]:
+def create_items(tx: Tx, space: str, parent: str | None, items: list[dict], after: str | None = None, ref: str = DEFAULT_REF) -> list[tuple[str, dict]]:
 	st = tx.st
 	labels: dict[str, str] = {}
 	plan: list[tuple[dict, str, str | None]] = []
+	aliases: set[str] = set()
 
 	def assign(its, par):
 		for it in its:
@@ -949,9 +1114,12 @@ def create_items(tx: Tx, space: str, parent: str | None, items: list[dict], afte
 
 	assign(items, parent)
 	created = []
-	first = True
+	anchor = after  # 给了 --after 时，顶层条目依次接在上一条后面
 	for it, addr, par in plan:
 		props = dict(it["props"])
+		if props.get("alias"):
+			props["alias"] = assign_alias(st, space, props["alias"], taken=aliases)
+			aliases.add(props["alias"])
 		if it["kind"] == "task" and "manager" not in props:
 			# 管理者默认是创建者，子树继承（§8.4）
 			up = next((x for x in ([par, *st.ancestors(par)] if par in st.blocks else []) if st.blocks[x]["props"].get("manager")), None)
@@ -961,24 +1129,27 @@ def create_items(tx: Tx, space: str, parent: str | None, items: list[dict], afte
 		for n in notes:
 			tx.note(f"{addr}：{n}")
 		pkey = par or f"{space}/"
+		top = par == parent
 		op = {
 			"op": "block.create",
 			"addr": addr,
 			"space": space,
 			"parent": par,
-			"order": next_order(st, pkey, after if (first and par == parent) else None) if not tx.divert else 0.0,
+			"order": next_order(st, pkey, anchor if top else None) if not tx.divert else 0.0,
 			"kind": it["kind"],
 			"content": rewrite_labels(it["content"], labels),
 			"props": props,
 		}
-		first = False
 		guarded(tx, op)
+		if top and anchor and not tx.divert:
+			anchor = addr
+		it["props"] = props
 		created.append((addr, it))
 	for it, addr, _ in plan:
 		if not tx.divert:
 			sync_inline_links(tx, addr)
 		for role, target in it["links"]:
-			add_link(tx, addr, role, resolve_target(st, target, labels))
+			add_link(tx, addr, role, resolve_target(st, target, labels), ref=ref)
 	return created
 
 
@@ -991,11 +1162,20 @@ def add_link(tx: Tx, frm: str, role: str, target: str, excerpt: str | None = Non
 	if role == "based_on" and re.match(r"^(code|grep):", target):
 		fp, why = fingerprint(target, ref)
 		if fp is None:
-			raise OutlineError(f"锚点无效：{target}：{why}")
+			raise OutlineError(f"锚点无效：{target}：{why}（还没合进 {ref} 的文件可以加 --ref HEAD）")
 		data.update(fp=fp, ref=ref_commit(ref), what=why)
+		if ref != DEFAULT_REF:
+			data["ref_name"] = ref  # fresh 默认按各自的 ref 检查
+	if target.startswith("file:"):
+		meta, warn = file_meta(target[5:].split("#", 1)[0])
+		data.update(meta)
+		if warn:
+			tx.note(f"提示：{warn}")
 	if role == "blocked_by" and target in tx.st.blocks and frm in [target, *dependency_chain(tx.st, target)]:
 		raise OutlineError("前置关系不能成环")
 	op = {"op": "link.add", "id": tx.link_id(), "from": frm, "role": role, "target": target, "data": data}
+	if not tx.divert:
+		check_policy(tx, op)  # 比如从范围外的块往外连，也算在范围外写入
 	if tx.divert:
 		tx.ops.append(op)  # 跟着整个事务进提议
 	else:
@@ -1063,9 +1243,12 @@ def cmd_read(args) -> None:
 		print("位置：" + " › ".join(first_line(st.blocks[a]["content"], 30) for a in reversed(anc)))
 	if args.as_of is not None:
 		print(f"（时间机器：第 {args.as_of} 个提交时的样子）")
+	actor = actor_of(args)
+	if not in_scope(st, actor, addr):
+		print(f"（范围外：{actor} 可以读，这里的内容不会自动注入；要在这里写，会转成扩大范围请求）")
 	print("\n".join(lines))
 	if args.as_of is None:
-		record_reads(actor_of(args), st, shown(lines))
+		record_reads(actor, st, shown(lines))
 
 
 def cmd_pages(args) -> None:
@@ -1114,12 +1297,13 @@ def cmd_add(args) -> None:
 			items = [item]
 		after = resolve(st, args.after) if args.after else None
 		tx = Tx(st, actor, args.message or f"新增 {len(items)} 个条目")
-		created = create_items(tx, space, parent, items, after)
+		created = create_items(tx, space, parent, items, after, ref=args.ref)
 		finish(tx)
 	if not tx.divert:
 		for addr, it in created:
 			label = f" #{it['label']}" if it["label"] else ""
-			print(f"+ [{addr}]{label} {first_line(tx.st.blocks[addr]['content'], 60)}")
+			alias = f" {it['props']['alias']}" if it["props"].get("alias") else ""
+			print(f"+ [{addr}]{label}{alias} {first_line(tx.st.blocks[addr]['content'], 60)}")
 
 
 def cmd_edit(args) -> None:
@@ -1151,6 +1335,8 @@ def cmd_set(args) -> None:
 				kind = KIND_ALIASES.get(v, v)
 				continue
 			props[k] = None if v == "" else ([t for t in v.split(",") if t] if k == "tags" else v)
+		if props.get("alias"):
+			props["alias"] = assign_alias(st, st.blocks[addr]["space"], props["alias"], addr)
 		tx = Tx(st, actor, args.message or f"设置 {addr} 的属性")
 		tx.force = args.force
 		check_read(tx, addr)
@@ -1263,6 +1449,10 @@ def cmd_task(args) -> None:
 			]
 			if open_kids:
 				tx.note(f"还有 {len(open_kids)} 个子任务没完成：{', '.join(open_kids[:5])}{'…' if len(open_kids) > 5 else ''}。结项时它们会成为遗留。")
+			par = b["parent"]
+			if par and is_question(st, par) and not recommendation(st, par):
+				q = st.blocks[par]["props"].get("alias") or par
+				tx.note(f"{addr} 是提问 {q} 的调研：在 {q} 下写一条带 tags=建议 的块，提问才会带着建议进负责人的收件箱（§8.7）")
 			if b["author"] != actor and not st.has_evidence(addr) and not args.evidence:
 				props["no_evidence"] = True
 				tx.note(f"{addr} 没有依据，看板上会标「无依据」")
@@ -1361,6 +1551,16 @@ def cmd_cr(args) -> None:
 					raise OutlineError(f"{op['addr']} 在请求之后又被改过，请重新提出")
 			for op in cr["ops"]:
 				clean = {k: v for k, v in op.items() if k != "base_version"}
+				if clean["op"] == "link.add" and clean["role"] == "touches" and clean["from"] in st.blocks and st.blocks[clean["from"]]["props"].get("alias") == "范围":
+					data = dict(clean.get("data") or {})
+					if "for" in data:  # 期限从批准时算起
+						data["until"] = parse_until(data.pop("for"))
+					clean["data"] = data
+					olds = [lk for lk in st.links_from(clean["from"], "touches") if lk["target"] == clean["target"]]
+					if any(not level_ok({"data": data}, lk["data"].get("level", "关注")) for lk in olds):
+						continue  # 已经有更高的级别，不降级
+					for lk in olds:
+						tx.push({"op": "link.remove", "id": lk["id"]})
 				if clean["op"] == "block.create":
 					pkey = clean.get("parent") or f"{clean['space']}/"
 					clean["order"] = next_order(st, pkey, None)
@@ -1373,6 +1573,12 @@ def cmd_cr(args) -> None:
 				if clean["op"] == "block.create" and clean["kind"] == "assertion" and not is_agent(actor) and cr["kind"] == "proposal":
 					add_link(tx, clean["addr"], "evidence", actor, f"{actor} 在 {cr['id']} 中确认")
 		tx.push({"op": "cr.decide", "id": cr["id"], "status": "approved" if args.action == "approve" else "rejected", "note": args.note or ""})
+		if args.action == "approve" and cr["kind"] == "scope":
+			# 只要范围的请求，范围已经满足了就由系统关掉，不留给人处理
+			for other in list(st.crs.values()):
+				d = other["decider"]
+				if other["status"] == "pending" and other["kind"] == "scope" and len(other["ops"]) == 1 and in_scope(st, d["scope_actor"], d["scope_target"], d.get("scope_level", "修改")):
+					tx.push({"op": "cr.decide", "id": other["id"], "status": "satisfied", "note": f"已由 {cr['id']} 满足"})
 		for task in cr.get("blocked_tasks", []):
 			prev = st.blocks[task]["props"].get("prev_status", "todo")
 			tx.push({"op": "block.update", "addr": task, "props": {"status": prev, "prev_status": None, "blocked_reason": None}})
@@ -1380,8 +1586,55 @@ def cmd_cr(args) -> None:
 			for task in cr.get("blocked_tasks", []) or []:
 				create_items(tx, st.blocks[task]["space"], task, [parse_item(f"{cr['id']} 的决定：{args.note}")])
 		finish(tx)
-	who = f"（{actor} 代 {st.responsible(actor)}）" if is_agent(actor) else ""
+	who = f"（由 {actor} 决定，责任人 {st.responsible(actor)}）" if is_agent(actor) else ""
 	print(f"{cr['id']} 已{'批准' if args.action == 'approve' else '驳回'}{who}")
+
+
+def is_question(st: State, addr: str) -> bool:
+	b = st.blocks[addr]
+	return b["kind"] == "task" and "提问" in (b["props"].get("tags") or [])
+
+
+def recommendation(st: State, q: str) -> str | None:
+	"""提问下最新的一条建议（带 tags=建议 的子块）。"""
+	recs = [c for c in st.children(q) if "建议" in (st.blocks[c]["props"].get("tags") or [])]
+	return recs[-1] if recs else None
+
+
+def cmd_answer(args) -> None:
+	"""负责人回答提问：不写 --text 就采纳提问下的建议，可以一次回答多条（§13）。"""
+	actor = actor_of(args)
+	if args.text and len(args.questions) > 1:
+		raise OutlineError("--text 只能回答一条提问；采纳建议才能一次回答多条")
+	with locked():
+		st = load_state()
+		tx = Tx(st, actor, args.message or f"回答 {'、'.join(args.questions)}")
+		answered = []
+		for ref in args.questions:
+			q = resolve(st, ref)
+			b = st.blocks[q]
+			name = b["props"].get("alias") or q
+			if not is_question(st, q):
+				raise OutlineError(f"{ref} 不是提问")
+			if b["props"].get("status") in ("done", "cancelled"):
+				raise OutlineError(f"{name} 已经回答过了")
+			owner = b["props"].get("owner")
+			if owner and not is_agent(owner) and actor != owner:
+				raise OutlineError(f"{name} 要由 {owner} 回答；转述本人的回答时用 --as {owner} --by {actor}")
+			rec = recommendation(st, q)
+			if not args.text and not rec:
+				raise OutlineError(f"{name} 还没有建议，用 --text 写出回答")
+			text = f"回答：{args.text}" if args.text else f"回答：采纳建议 [[{rec}]]"
+			item = {"kind": "note", "content": text, "props": {"tags": ["回答"]}, "links": [], "label": None, "children": []}
+			[(ans, _)] = create_items(tx, b["space"], q, [item])
+			add_link(tx, q, "evidence", ans)
+			guarded(tx, {"op": "block.update", "addr": q, "props": {"status": "done", "blocked_reason": None}})
+			if rec and not args.text and st.blocks[rec]["kind"] == "assertion":
+				guarded(tx, {"op": "block.update", "addr": rec, "props": {"stance": "accepted"}})
+			answered.append(name)
+		finish(tx)
+	if not tx.divert:
+		print(f"已回答 {'、'.join(answered)}" + ("（采纳建议）" if not args.text else ""))
 
 
 def describe_op(st: State, op: dict) -> str:
@@ -1491,10 +1744,20 @@ def inbox_lines(st: State, who: str) -> list[str]:
 		lines.append(f"### 待你验收（{len(accept)}）")
 		lines += [f"- [{a}] {first_line(st.blocks[a]['content'], 60)}" for a in accept]
 		lines.append("")
-	asks = [a for a, b in st.blocks.items() if b["kind"] == "task" and not b["deleted"] and b["props"].get("owner") == who and b["props"].get("status") in ("todo", "doing") and "提问" in (b["props"].get("tags") or [])]
+	asks = [a for a, b in st.blocks.items() if is_question(st, a) and not b["deleted"] and b["props"].get("owner") == who and b["props"].get("status") in ("todo", "doing")]
 	if asks:
 		lines.append(f"### 等你回答的问题（{len(asks)}）")
-		lines += [f"- [{a}] {first_line(st.blocks[a]['content'], 70)}" for a in asks]
+		with_rec = []
+		for a in asks:
+			name = st.blocks[a]["props"].get("alias") or a
+			lines.append(f"- [{a}] {name} {first_line(st.blocks[a]['content'], 70)}")
+			rec = recommendation(st, a)
+			if rec:
+				with_rec.append(name)
+				lines.append(f"  - 建议：{first_line(re.sub(r'^建议[：:]\s*', '', st.blocks[rec]['content']), 90)}")
+		if with_rec:
+			lines.append("")
+			lines.append(f"全部采纳建议：`outline.py --as {who} answer {' '.join(with_rec)}`；个别不同意的去掉，再用 `answer Qn --text …` 单独回答")
 		lines.append("")
 	noev = [a for a, b in st.blocks.items() if b["kind"] == "task" and not b["deleted"] and b["props"].get("no_evidence") and b["props"].get("status") == "done"]
 	stale = [a for a, b in st.blocks.items() if b["kind"] == "assertion" and visible(st, a, set()) and freshness(st, a)[0] != "fresh"]
@@ -1538,9 +1801,10 @@ def cmd_search(args) -> None:
 		scored.append((hits * weight, a))
 	scored.sort(reverse=True)
 	lines = []
-	for score, a in scored[: args.limit]:
+	actor = actor_of(args)
+	for _, a in scored[: args.limit]:
 		crumb = " › ".join(first_line(st.blocks[x]["content"], 16) for x in reversed(st.ancestors(a)))
-		bd = badges(st, a)
+		bd = badges(st, a) + ([] if in_scope(st, actor, a) else ["范围外"])
 		lines.append(f"- [{a}] {first_line(st.blocks[a]['content'], 70)}" + (f" ‹{'·'.join(bd)}›" if bd else "") + (f"\n    在：{crumb}" if crumb else ""))
 	print("\n".join(lines) if lines else "（没有结果）")
 	record_reads(actor_of(args), st, [a for _, a in scored[: args.limit]])
@@ -1567,8 +1831,17 @@ def cmd_log(args) -> None:
 			continue
 		rows.append(c)
 	for c in rows[-args.n :]:
-		who = c["actor"] + (f"（代 {c['on_behalf_of']}）" if c.get("on_behalf_of") else "")
-		print(f"#{c['seq']} {c['ts'][:16]} {who}：{c['summary']}（{len(c['ops'])} 个操作）")
+		print(f"#{c['seq']} {c['ts'][:16]} {commit_who(c)}：{c['summary']}（{len(c['ops'])} 个操作）")
+
+
+def commit_who(c: dict) -> str:
+	"""谁写的、责任人是谁、谁代记的：三件事分开写，不再用一个「代」字（原型发现）。"""
+	who = c["actor"]
+	if c.get("recorded_by"):
+		who += f"，由 {c['recorded_by']} 代记"
+	if c.get("on_behalf_of"):
+		who += f"（责任人 {c['on_behalf_of']}）"
+	return who
 
 
 def cmd_diff(args) -> None:
@@ -1600,14 +1873,14 @@ def cmd_fresh(args) -> None:
 		git("fetch", "origin", "main")
 	st = load_state()
 	cache = fresh_cache()
-	head = ref_commit(args.ref)
+	head = ref_commit(args.ref or DEFAULT_REF)
 	report: dict[str, list[str]] = {}
 	checked = 0
 	for lk in st.links.values():
 		if lk.get("removed") or lk["role"] != "based_on" or not re.match(r"^(code|grep):", lk["target"]):
 			continue
 		checked += 1
-		fp, why = fingerprint(lk["target"], args.ref)
+		fp, why = fingerprint(lk["target"], args.ref or lk["data"].get("ref_name") or DEFAULT_REF)
 		if fp is None:
 			state = "expired"
 		elif fp != lk["data"].get("fp"):
@@ -1618,10 +1891,11 @@ def cmd_fresh(args) -> None:
 		if state != "fresh":
 			report.setdefault(lk["from"], []).append(f"{lk['target']}：{why}")
 	_local("fresh.json").write_text(json.dumps(cache, ensure_ascii=False, indent=1), encoding="utf-8")
+	against = f"{args.ref}（{head}）" if args.ref else f"各锚点自己的 ref（默认 {DEFAULT_REF}，{head}）"
 	if not report:
-		print(f"对照 {args.ref}（{head}）：{checked} 处锚点全部新鲜")
+		print(f"对照 {against}：{checked} 处锚点全部新鲜")
 		return
-	print(f"对照 {args.ref}（{head}）：检查了 {checked} 处锚点，{len(report)} 条断言需要复核")
+	print(f"对照 {against}：检查了 {checked} 处锚点，{len(report)} 条断言需要复核")
 	for addr, why in report.items():
 		print(f"- [{addr}] {first_line(st.blocks[addr]['content'], 60)}")
 		for w in why:
@@ -1642,7 +1916,7 @@ def cmd_verify(args) -> None:
 		if args.verdict == "fresh":
 			for lk in st.links_from(addr, "based_on"):
 				tx.push({"op": "link.remove", "id": lk["id"]})
-				add_link(tx, addr, "based_on", lk["target"], lk["data"].get("excerpt"), args.ref)
+				add_link(tx, addr, "based_on", lk["target"], lk["data"].get("excerpt"), args.ref or lk["data"].get("ref_name") or DEFAULT_REF)
 		elif args.verdict == "refuted":
 			guarded(tx, {"op": "block.update", "addr": addr, "props": {"stance": "refuted"}})
 		else:
@@ -1691,6 +1965,263 @@ def cmd_archive(args) -> None:
 	print(f"{root} 已归档：不进默认视图和搜索；read 时可加 --as-of {st.seq + 1} 看结项那一刻")
 
 
+# ---------------------------------------------------------------------------
+# 报告挂回大纲（§9.6）：一份 markdown 文档 → 一棵子树
+
+
+MD_FENCE = re.compile(r"^(\s*)(`{3,}|~{3,})")
+MD_HEADING = re.compile(r"^(#{1,6})\s+(.*?)\s*#*\s*$")
+MD_LIST = re.compile(r"^(\s*)([-*+]|\d+[.)])\s+(.*)$")
+MD_HR = re.compile(r"^([-*_])(\s*\1){2,}$")
+
+
+def md_tokens(text: str) -> list[dict]:
+	"""切成块：标题、段落、列表项、代码块、表格、引用。分隔线丢掉。"""
+	lines = text.splitlines()
+	toks: list[dict] = []
+	i, gap = 0, False
+
+	def starts_block(ln: str) -> bool:
+		s = ln.strip()
+		return not s or bool(MD_FENCE.match(ln) or MD_HEADING.match(s) or MD_LIST.match(ln) or MD_HR.match(s) or s[0] in "|>")
+
+	while i < len(lines):
+		ln = lines[i]
+		s = ln.strip()
+		ind = len(ln) - len(ln.lstrip(" "))
+		if not s:
+			gap, i = True, i + 1
+			continue
+		tok = {"indent": ind, "gap": gap}
+		if fm := MD_FENCE.match(ln):
+			fence, j = fm.group(2), i + 1
+			while j < len(lines) and not re.fullmatch(re.escape(fence[0]) + "{%d,}" % len(fence), lines[j].strip()):
+				j += 1
+			body = [x[ind:] if x[:ind].strip() == "" else x.strip() for x in lines[i : j + 1]]
+			tok.update(type="code", content="\n".join(body))
+			i = j + 1
+		elif (hm := MD_HEADING.match(s)) and ind < 4:
+			tok.update(type="heading", level=len(hm.group(1)), content=hm.group(2))
+			i += 1
+		elif MD_HR.match(s):
+			i += 1
+			gap = False
+			continue
+		elif s[0] in "|>":
+			j = i
+			while j < len(lines) and lines[j].strip()[:1] == s[0]:
+				j += 1
+			tok.update(type="table" if s[0] == "|" else "quote", content="\n".join(x.strip() for x in lines[i:j]))
+			i = j
+		elif lm := MD_LIST.match(ln):
+			body, j = [lm.group(3)], i + 1
+			while j < len(lines) and not starts_block(lines[j]):  # 紧跟的续行并进这一项
+				body.append(lines[j].strip())
+				j += 1
+			tok.update(type="list", content="\n".join(body))
+			i = j
+		else:
+			body, j = [s], i + 1
+			while j < len(lines) and not starts_block(lines[j]):
+				body.append(lines[j].strip())
+				j += 1
+			tok.update(type="para", content="\n".join(body))
+			i = j
+		toks.append(tok)
+		gap = False
+	return toks
+
+
+def md_to_items(text: str) -> list[dict]:
+	"""标题成为父块；段落、表格、代码块、引用各成一块；列表项按缩进嵌套。
+	紧跟在段落后面（中间没有空行）的列表挂在那个段落下面，比如「**样本**」下面的几条。"""
+
+	def new(content: str) -> dict:
+		return {"kind": "note", "content": content, "props": {}, "links": [], "label": None, "children": []}
+
+	roots: list[dict] = []
+	heads: list[tuple[int, dict]] = []
+	stack: list[tuple[int, dict]] = []  # 当前小节里打开的列表项
+	label: dict | None = None
+	list_parent: list | None = None
+	for t in md_tokens(text):
+		section = heads[-1][1]["children"] if heads else roots
+		if t["type"] == "heading":
+			while heads and heads[-1][0] >= t["level"]:
+				heads.pop()
+			it = new(t["content"])
+			(heads[-1][1]["children"] if heads else roots).append(it)
+			heads.append((t["level"], it))
+			stack, label, list_parent = [], None, None
+			continue
+		while stack and stack[-1][0] >= t["indent"]:
+			stack.pop()
+		it = new(t["content"])
+		if t["type"] == "list":
+			if stack:
+				stack[-1][1]["children"].append(it)
+			else:
+				if list_parent is None:
+					list_parent = label["children"] if label is not None and not t["gap"] else section
+				list_parent.append(it)
+			stack.append((t["indent"], it))
+			continue
+		if stack:  # 缩进在列表项里面：那一项的子块
+			stack[-1][1]["children"].append(it)
+			continue
+		section.append(it)
+		list_parent = None
+		label = it if t["type"] == "para" else None
+	return roots
+
+
+def cmd_attach(args) -> None:
+	"""把一份报告挂到大纲上，并把指向这个文件的链接改指到挂好的块（§9.6）。"""
+	actor = actor_of(args)
+	src = Path(args.file)
+	raw = src.read_bytes()
+	if len(raw) > 512 * 1024:
+		raise OutlineError("报告超过 512KB，先拆分或摘要")
+	items = md_to_items(raw.decode("utf-8"))
+	if len(items) == 1 and items[0]["children"]:
+		root = items[0]
+	else:
+		root = {"kind": "note", "content": args.title or src.stem, "props": {}, "links": [], "label": None, "children": items}
+	if args.title:
+		root["content"] = args.title
+	root["props"]["tags"] = ["报告"]
+	full = str(src.resolve())
+	with locked():
+		st = load_state()
+		parent = resolve(st, args.parent)
+		tx = Tx(st, actor, args.message or f"挂上报告 {src.name}")
+		[(addr, _), *rest] = create_items(tx, st.blocks[parent]["space"], parent, [root])
+		moved = 0
+		if not tx.divert:
+			# 出处记下原文件和它当时的指纹；原文件以后没了也没关系，内容已经在大纲里
+			tx.push({"op": "link.add", "id": tx.link_id(), "from": addr, "role": "source", "target": f"file:{full}", "data": file_meta(full)[0]})
+			olds = {f"file:{full}", f"file:{args.file}"}
+			try:
+				olds.add(f"file:{src.resolve().relative_to(repo_root())}")
+			except ValueError:
+				pass
+			for lk in list(st.links.values()):
+				if lk.get("removed") or lk["target"] not in olds or lk["from"] == addr:
+					continue
+				tx.push({"op": "link.remove", "id": lk["id"]})
+				tx.push({"op": "link.add", "id": tx.link_id(), "from": lk["from"], "role": lk["role"], "target": addr, "data": dict(lk["data"], was=lk["target"])})
+				moved += 1
+		finish(tx)
+	if not tx.divert:
+		print(f"已挂上 [{addr}] {first_line(root['content'], 50)}：{len(rest) + 1} 个块" + (f"；{moved} 条指向原文件的链接改指到它" if moved else ""))
+
+
+# ---------------------------------------------------------------------------
+# 范围命令（§10.4）
+
+
+def parse_until(v: str | None) -> str | None:
+	if not v:
+		return None
+	m = re.fullmatch(r"(\d+)([mhd])", v)
+	if m:
+		secs = int(m.group(1)) * {"m": 60, "h": 3600, "d": 86400}[m.group(2)]
+		return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(time.time() + secs))
+	if re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d(:\d\d)?", v):
+		return v if len(v) == 19 else v + ":00"
+	raise OutlineError("--until 写成 30m、2h、1d，或 2026-10-24T18:00")
+
+
+def scope_lines(st: State, who: str) -> list[str]:
+	bs = bubbles(st, who)
+	if bs is None:
+		return [f"{who} 没有设范围：不受限制"]
+	page = scope_page(st, who)
+	lines = [f"{who} 的注意范围（{page}）：" + ("" if bs else "还没有泡，只能写自己的会话空间")]
+	for b in bs:
+		tgt = b["target"]
+		title = f" {first_line(st.blocks[tgt]['content'], 40)}" if tgt in st.blocks else ""
+		until = f"，到 {b['data']['until']}" if b["data"].get("until") else ""
+		lines.append(f"- {tgt}{title} · {b['data'].get('level', '关注')}（{b['author']} 加于 #{b['created_seq']}{until}）")
+	outside = load_json(outside_path(who), [])
+	if outside:
+		lines.append("最近读过的范围外内容：" + "、".join(outside[-10:]))
+	return lines
+
+
+def cmd_scope(args) -> None:
+	actor = actor_of(args)
+	who = args.agent or actor
+	if args.action == "show":
+		print("\n".join(scope_lines(load_state(), who)))
+		return
+	if not args.agent or not args.target:
+		raise OutlineError(f"用法：scope {args.action} AGENT TARGET")
+	if args.level not in LEVELS:
+		raise OutlineError(f"级别只有 {'、'.join(LEVELS)}")
+	with locked():
+		st = load_state()
+		if who not in st.actors or not is_agent(who):
+			raise OutlineError(f"{who} 不是登记过的 agent")
+		target = resolve_target(st, args.target)
+		chain = []
+		cur = who
+		while is_agent(cur):
+			cur = creator_of(st, cur)
+			chain.append(cur)
+		if actor != who and actor not in chain and is_agent(actor):
+			raise OutlineError(f"只有 {who} 自己、它的上级（{'、'.join(chain)}）或人能改它的范围")
+		page = scope_page(st, who)
+		mine = [lk for lk in (st.links_from(page, "touches") if page else []) if lk["target"] == target]
+		tx = Tx(st, actor, args.message or f"{who} 的范围：{args.action} {target}", kind="scope")
+		if args.action == "rm":
+			if not mine:
+				raise OutlineError(f"{target} 不在 {who} 的范围里")
+			for lk in mine:  # 缩小范围不需要批准（§10.3）
+				tx.push({"op": "link.remove", "id": lk["id"]})
+			finish(tx)
+			print(f"已把 {target} 移出 {who} 的范围")
+			return
+		until = parse_until(args.until)
+		first = bubbles(st, who) is None
+		exec_ws = args.level == "执行" and target.startswith("ws:")
+		# 人加的直接生效。第一个泡是在收窄（原来不受限），直接生效；自己加「关注」只影响注入和路由，
+		# 也直接生效；自己加「修改」「执行」要上级批。上级在自己能转授的范围内直接给，否则继续往上请求。
+		# 工作区的「执行」例外：只有人，或自己就有这一级的上级能给（§10.4）。
+		if not is_agent(actor):
+			direct = True
+		elif exec_ws:
+			direct = actor != who and can_grant(st, actor, target, args.level)
+		elif first:
+			direct = True
+		elif actor == who:
+			direct = args.level == "关注"
+		else:
+			direct = can_grant(st, actor, target, args.level)
+		if not direct and not page:
+			raise OutlineError(f"{who} 还没有范围：先用 scope add 圈出它工作的泡，再申请工作区的「执行」")
+		if not direct:
+			base = who if actor == who else actor
+			decider = scope_decider(st, base, target, args.level) | {"scope_actor": who, "scope_target": target, "scope_level": args.level, "scope_until": args.until}
+			tx.kind = "edit"
+			tx.divert.append((f"扩大 {who} 的范围：{target}（{args.level}）", decider))
+			finish(tx)
+			return
+		if not page:
+			space = session_space(who)
+			if space not in st.spaces:
+				tx.push({"op": "space.create", "space": space, "kind": "session", "title": f"{who} 的会话空间", "owner": who})
+			page = f"{space}/{new_sid(st, space)}"
+			tx.push({"op": "block.create", "addr": page, "space": space, "parent": None, "order": next_order(st, f"{space}/", None), "kind": "note", "content": "注意范围", "props": {"alias": "范围"}})
+		for lk in mine:
+			tx.push({"op": "link.remove", "id": lk["id"]})
+		data = {"level": args.level} | ({"until": until} if until else {})
+		tx.push({"op": "link.add", "id": tx.link_id(), "from": page, "role": "touches", "target": target, "data": data})
+		finish(tx)
+	note = "（这是第一个泡：从此它只能在泡内和自己的会话空间里直接写）" if first else ""
+	print(f"{who} 的范围加上 {target} · {args.level}" + (f"，到 {until}" if until else "") + note)
+
+
 def cmd_export(args) -> None:
 	st = load_state()
 	EXPORTS.mkdir(parents=True, exist_ok=True)
@@ -1706,7 +2237,7 @@ def cmd_export(args) -> None:
 	(EXPORTS / "overview.md").write_text("\n".join(ov), encoding="utf-8")
 	(EXPORTS / "board.md").write_text(header + "# 任务看板\n\n" + "\n".join(board_lines(st, None)) + "\n", encoding="utf-8")
 	(EXPORTS / "inbox.md").write_text(header + "# 负责人的收件箱\n\n" + "\n".join(inbox_lines(st, "human:owner")) + "\n", encoding="utf-8")
-	log_lines = [f"- #{c['seq']} {c['ts'][:16]} {c['actor']}" + (f"（代 {c['on_behalf_of']}）" if c.get("on_behalf_of") else "") + f"：{c['summary']}" for c in st.commits[-80:]]
+	log_lines = [f"- #{c['seq']} {c['ts'][:16]} {commit_who(c)}：{c['summary']}" for c in st.commits[-80:]]
 	(EXPORTS / "log.md").write_text(header + "# 最近的提交\n\n" + "\n".join(reversed(log_lines)) + "\n", encoding="utf-8")
 	# 时间机器：把提交日志嵌进静态页，由浏览器回放（§4）
 	data = json.dumps({"commits": st.commits}, ensure_ascii=False).replace("</", "<\\/")
@@ -1757,7 +2288,8 @@ def build_parser() -> argparse.ArgumentParser:
 	s.add_argument("--stance")
 	s.add_argument("--prop", action="append")
 	s.add_argument("--link", action="append", help="role=target，例如 based_on=code:server/x.ts#fn")
-	s.add_argument("--after")
+	s.add_argument("--after", help="插在这个块后面；--md 的多个顶层条目依次往后接")
+	s.add_argument("--ref", default=DEFAULT_REF, help="代码锚点对照的 git ref；还没合进 main 的文件用 HEAD")
 	s.add_argument("-m", "--message")
 
 	s = p("edit", cmd_edit, "改写块正文")
@@ -1846,7 +2378,7 @@ def build_parser() -> argparse.ArgumentParser:
 	s.add_argument("--under")
 
 	s = p("fresh", cmd_fresh, "对照代码检查锚点的新鲜度")
-	s.add_argument("--ref", default=DEFAULT_REF)
+	s.add_argument("--ref", help="统一对照这个 ref；不写就按每个锚点建立时的 ref（默认 origin/main）")
 	s.add_argument("--fetch", action="store_true")
 
 	s = p("verify", cmd_verify, "复核断言：fresh（仍然成立）/ update（需要改写）/ refuted（不成立）")
@@ -1855,7 +2387,26 @@ def build_parser() -> argparse.ArgumentParser:
 	s.add_argument("--evidence", action="append")
 	s.add_argument("--excerpt")
 	s.add_argument("--note")
-	s.add_argument("--ref", default=DEFAULT_REF)
+	s.add_argument("--ref")
+	s.add_argument("-m", "--message")
+
+	s = p("answer", cmd_answer, "回答提问：不写 --text 就采纳建议，可以一次回答多条")
+	s.add_argument("questions", nargs="+")
+	s.add_argument("--text", help="自己的回答（只能回答一条）")
+	s.add_argument("-m", "--message")
+
+	s = p("attach", cmd_attach, "把一份 markdown 报告挂到某个块下面，并把指向这个文件的链接改指过来")
+	s.add_argument("parent")
+	s.add_argument("file")
+	s.add_argument("--title")
+	s.add_argument("-m", "--message")
+
+	s = p("scope", cmd_scope, "注意范围：show [AGENT] / add AGENT TARGET / rm AGENT TARGET")
+	s.add_argument("action", choices=["show", "add", "rm"])
+	s.add_argument("agent", nargs="?")
+	s.add_argument("target", nargs="?", help="块地址、space:p、code:路径前缀、ws:设备:目录")
+	s.add_argument("--level", default="修改", help="关注 / 修改 / 执行")
+	s.add_argument("--until", help="期限：30m、2h、1d，或 2026-10-24T18:00")
 	s.add_argument("-m", "--message")
 
 	s = p("candidates", cmd_candidates, "结项时的提炼候选（§9.8）")
