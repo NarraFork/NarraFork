@@ -21,6 +21,7 @@ import os
 import re
 import secrets
 import shlex
+import signal
 import string
 import subprocess
 import sys
@@ -35,7 +36,7 @@ LOCAL = DATA / ".local"
 EXPORTS = Path(os.environ.get("OUTLINE_EXPORTS") or ROOT / "exports")
 
 KINDS = {"note", "task", "assertion", "view"}
-KIND_ALIASES = {"assert": "assertion", "q": "task"}
+KIND_ALIASES = {"assert": "assertion", "q": "task", "笔记": "note", "任务": "task", "断言": "assertion", "视图": "view"}
 STATUSES = ("todo", "doing", "blocked", "submitted", "done", "cancelled")
 STANCES = ("hypothesis", "accepted", "refuted")
 ROLES = (
@@ -60,7 +61,7 @@ STATUS_ZH = {
 	"cancelled": "取消",
 }
 STANCE_ZH = {"hypothesis": "假设", "accepted": "采纳", "refuted": "否定"}
-ROLE_ZH = {
+ROLE_ZH: dict[str, str] = {
 	"mention": "提及",
 	"embed": "嵌入",
 	"based_on": "基于",
@@ -71,6 +72,15 @@ ROLE_ZH = {
 	"same_as": "同一",
 	"source": "出处",
 }
+ZH_VALUES = {"status": {v: k for k, v in STATUS_ZH.items()}, "stance": {v: k for k, v in STANCE_ZH.items()}}
+
+
+def norm_value(key: str, v):
+	"""状态和立场既认英文也认中文：输出里显示的是中文。"""
+	table = ZH_VALUES.get(key)
+	return table.get(v, v) if table and isinstance(v, str) else v
+
+
 # 已批准的计划里，改这些属性属于「推进」而不是「改计划」（§9.3）。
 PROGRESS_PROPS = {"status", "owner", "blocked_reason", "no_evidence", "prev_status", "archived", "archived_seq"}
 BIG_CHANGE = 50  # D1：单次改动超过这么多块，转成提议
@@ -386,7 +396,8 @@ class Tx:
 		return f"L{self.seq}-{sum(1 for o in self.ops if o['op'] == 'link.add') + 1}"
 
 	def note(self, msg: str) -> None:
-		self.notices.append(msg)
+		if msg not in self.notices:
+			self.notices.append(msg)
 
 
 def is_agent(actor: str) -> bool:
@@ -583,9 +594,11 @@ def check_policy(tx: Tx, op: dict) -> None:
 	# 注意范围（§10）：有范围的 agent 在泡外写入，转成扩大范围请求
 	target = op.get("parent") if op["op"] == "block.create" else (op.get("from") if op["op"] == "link.add" else addr)
 	where = target if target in st.blocks else (f"space:{op['space']}" if op["op"] == "block.create" and not target else None)
-	if where and is_agent(actor) and not in_scope(st, actor, where, "修改"):
+	recorder = os.environ.get("OUTLINE_RECORDED_BY")
+	acting = recorder if recorder and is_agent(recorder) else actor  # 代记时看动手的那个会话的范围（原型发现）
+	if where and is_agent(actor) and not in_scope(st, acting, where, "修改"):
 		bubble = st.page_of(where) if where in st.blocks else where  # 按整页纳入
-		tx.divert.append((f"在范围外写入（{where}）", scope_decider(st, actor, bubble, "修改") | {"scope_actor": actor, "scope_target": bubble}))
+		tx.divert.append((f"在范围外写入（{where}）", scope_decider(st, acting, bubble, "修改") | {"scope_actor": acting, "scope_target": bubble}))
 
 
 # ---------------------------------------------------------------------------
@@ -818,10 +831,17 @@ def git(*args: str) -> str | None:
 def symbol_segment(text: str, symbol: str) -> str | None:
 	lines = text.splitlines()
 	name = re.escape(symbol)
+	python = re.compile(rf"^(\s*)(async\s+def|def|class)\s+{name}\b")
+	for i, ln in enumerate(lines):
+		m = python.match(ln)
+		if m:  # Python 按缩进取整个函数或类，不按括号（括号在签名那一行就配平了）
+			indent, end = len(m.group(1)), i + 1
+			while end < len(lines) and (not lines[end].strip() or len(lines[end]) - len(lines[end].lstrip()) > indent):
+				end += 1
+			return "\n".join(lines[i:end]).rstrip()
 	patterns = [
 		re.compile(rf"^\s*(export\s+)?(default\s+)?(declare\s+)?(async\s+)?(function\*?|const|let|var|class|interface|type|enum)\s+{name}\b"),
 		re.compile(rf"^\s*(public\s+|private\s+|protected\s+|static\s+|readonly\s+)*(async\s+)?{name}\s*[(<]"),
-		re.compile(rf"^(\s*)(async\s+)?def\s+{name}\b|^(\s*)class\s+{name}\b"),  # Python
 	]
 	start = next((i for p in patterns for i, ln in enumerate(lines) if p.search(ln)), None)
 	if start is None:
@@ -845,11 +865,7 @@ def fingerprint(target: str, ref: str) -> tuple[str | None, str]:
 		text = git("show", f"{ref}:{path}")
 		if text is None:
 			return None, "文件不存在"
-		seg = text if not symbol else symbol_segment(text, symbol)
-		if seg is None:
-			return None, f"找不到符号 {symbol}"
-		norm = "\n".join(ln.strip() for ln in seg.splitlines() if ln.strip())
-		return hashlib.sha1(norm.encode()).hexdigest()[:16], f"{len(seg.splitlines())} 行"
+		return code_fingerprint(text, symbol)
 	if target.startswith("grep:"):
 		pattern, _, pathspec = target[5:].rpartition("@") if "@" in target else (target[5:], "", "")
 		args = ["grep", "-l", "-E", pattern, ref]
@@ -864,6 +880,25 @@ def fingerprint(target: str, ref: str) -> tuple[str | None, str]:
 		files = sorted({ln.split(":", 1)[-1] for ln in out.stdout.decode(errors="replace").splitlines() if ln})
 		return hashlib.sha1("\n".join(files).encode()).hexdigest()[:16], f"{len(files)} 个文件匹配"
 	return None, "不是代码锚点"
+
+
+def code_fingerprint(text: str, symbol: str) -> tuple[str | None, str]:
+	seg = text if not symbol else symbol_segment(text, symbol)
+	if seg is None:
+		return None, f"找不到符号 {symbol}"
+	norm = "\n".join(ln.strip() for ln in seg.splitlines() if ln.strip())
+	return hashlib.sha1(norm.encode()).hexdigest()[:16], f"{len(seg.splitlines())} 行"
+
+
+def worktree_differs(target: str, fp: str) -> bool:
+	"""工作区里的这段代码和记指纹用的 ref 是否不一样（原型发现：报告是按工作区读的）。"""
+	path, _, symbol = target[5:].partition("#")
+	local = repo_root() / path
+	if not local.is_file():
+		return True
+	with local.open("rb") as f:
+		text = f.read(GIT_MAX_BYTES).decode("utf-8", errors="replace")
+	return code_fingerprint(text, symbol)[0] != fp
 
 
 def ref_commit(ref: str) -> str:
@@ -1078,7 +1113,7 @@ def parse_item(body: str) -> dict:
 
 def default_props(st: State, actor: str, kind: str, props: dict, links: list) -> tuple[dict, list[str]]:
 	notes = []
-	props = dict(props)
+	props = {k: norm_value(k, v) for k, v in props.items()}
 	if kind == "task":
 		props.setdefault("status", "todo")
 		props.setdefault("manager", actor)
@@ -1086,13 +1121,14 @@ def default_props(st: State, actor: str, kind: str, props: dict, links: list) ->
 			raise OutlineError(f"未知任务状态 {props['status']}")
 	if kind == "assertion":
 		# 有证据或「基于」的结论直接采纳，没有的记为假设；人写的默认采纳（§5.4、§9.6）
-		has_basis = any(r in ("evidence", "based_on") for r, _ in links)
+		suggestion = "建议" in (props.get("tags") or [])  # 建议由回答决定立场（§13），带不带证据都先是假设
+		has_basis = any(r in ("evidence", "based_on") for r, _ in links) and not suggestion
 		stance = props.setdefault("stance", "accepted" if has_basis or not is_agent(actor) else "hypothesis")
 		if stance not in STANCES:
 			raise OutlineError(f"未知立场 {stance}")
 		if stance == "accepted" and is_agent(actor) and not has_basis:
 			props["stance"] = "hypothesis"
-			notes.append("没有证据或基于，已记为「假设」（§5.4）")
+			notes.append("建议要等负责人采纳，先记为「假设」（§13）" if suggestion else "没有证据或基于，已记为「假设」（§5.4）")
 	return props, notes
 
 
@@ -1141,7 +1177,9 @@ def create_items(tx: Tx, space: str, parent: str | None, items: list[dict], afte
 			"props": props,
 		}
 		guarded(tx, op)
-		if top and anchor and not tx.divert:
+		if tx.divert and top and anchor:
+			op["after"] = anchor  # 转成请求了：批准时照这个位置插（原型发现）
+		if top and anchor:
 			anchor = addr
 		it["props"] = props
 		created.append((addr, it))
@@ -1166,6 +1204,8 @@ def add_link(tx: Tx, frm: str, role: str, target: str, excerpt: str | None = Non
 		data.update(fp=fp, ref=ref_commit(ref), what=why)
 		if ref != DEFAULT_REF:
 			data["ref_name"] = ref  # fresh 默认按各自的 ref 检查
+		if target.startswith("code:") and worktree_differs(target, fp):
+			tx.note(f"提示：工作区里的 {target} 和 {ref} 不一样，指纹按 {ref} 记；结论如果是按工作区的代码得出的，先提交再加 --ref HEAD")
 	if target.startswith("file:"):
 		meta, warn = file_meta(target[5:].split("#", 1)[0])
 		data.update(meta)
@@ -1246,6 +1286,8 @@ def cmd_read(args) -> None:
 	actor = actor_of(args)
 	if not in_scope(st, actor, addr):
 		print(f"（范围外：{actor} 可以读，这里的内容不会自动注入；要在这里写，会转成扩大范围请求）")
+	elif not in_scope(st, actor, addr, "修改"):
+		print(f"（这里在 {actor} 的范围里只是「关注」：可以读，要在这里写，会转成扩大范围请求）")
 	print("\n".join(lines))
 	if args.as_of is None:
 		record_reads(actor, st, shown(lines))
@@ -1334,7 +1376,7 @@ def cmd_set(args) -> None:
 			if k == "kind":
 				kind = KIND_ALIASES.get(v, v)
 				continue
-			props[k] = None if v == "" else ([t for t in v.split(",") if t] if k == "tags" else v)
+			props[k] = None if v == "" else ([t for t in v.split(",") if t] if k == "tags" else norm_value(k, v))
 		if props.get("alias"):
 			props["alias"] = assign_alias(st, st.blocks[addr]["space"], props["alias"], addr)
 		tx = Tx(st, actor, args.message or f"设置 {addr} 的属性")
@@ -1563,7 +1605,9 @@ def cmd_cr(args) -> None:
 						tx.push({"op": "link.remove", "id": lk["id"]})
 				if clean["op"] == "block.create":
 					pkey = clean.get("parent") or f"{clean['space']}/"
-					clean["order"] = next_order(st, pkey, None)
+					after = clean.pop("after", None)
+					sibs = st.children(pkey, include_deleted=True)
+					clean["order"] = next_order(st, pkey, after if after in sibs else None)
 				if clean["op"] == "block.create" and clean["kind"] == "assertion" and not is_agent(actor) and cr["kind"] == "proposal":
 					# 人确认本身就是证据：确认过的断言直接采纳（§5.4）
 					clean["props"] = dict(clean.get("props") or {}, stance="accepted")
@@ -1640,7 +1684,11 @@ def cmd_answer(args) -> None:
 def describe_op(st: State, op: dict) -> str:
 	t = op["op"]
 	if t == "block.create":
-		return f"新增 [{op['addr']}] 于 {op.get('parent') or op['space'] + '/'}：{first_line(op.get('content', ''), 60)}"
+		props = op.get("props") or {}
+		meta = [KIND_ZH.get(op["kind"], op["kind"])] if op["kind"] != "note" else []
+		meta += [f"{k}={','.join(v) if isinstance(v, list) else v}" for k, v in props.items()]
+		where = f"，接在 {op['after']} 后面" if op.get("after") else ""
+		return f"新增 [{op['addr']}] 于 {op.get('parent') or op['space'] + '/'}{where}：{first_line(op.get('content', ''), 60)}" + (f" ‹{' '.join(meta)}›" if meta else "")
 	if t == "block.update":
 		parts = []
 		if "content" in op:
@@ -1685,9 +1733,9 @@ def cmd_ls(args) -> None:
 			continue
 		if args.kind and b["kind"] != KIND_ALIASES.get(args.kind, args.kind):
 			continue
-		if args.status and p.get("status") != args.status:
+		if args.status and p.get("status") != norm_value("status", args.status):
 			continue
-		if args.stance and p.get("stance") != args.stance:
+		if args.stance and p.get("stance") != norm_value("stance", args.stance):
 			continue
 		if args.tag and args.tag not in (p.get("tags") or []):
 			continue
@@ -1830,7 +1878,11 @@ def cmd_log(args) -> None:
 		if under is not None and not (addrs & under):
 			continue
 		rows.append(c)
-	for c in rows[-args.n :]:
+	if args.since:
+		rows = [c for c in rows if c["seq"] >= args.since][: args.n]
+	else:
+		rows = rows[-args.n :]
+	for c in rows:
 		print(f"#{c['seq']} {c['ts'][:16]} {commit_who(c)}：{c['summary']}（{len(c['ops'])} 个操作）")
 
 
@@ -1922,10 +1974,13 @@ def cmd_verify(args) -> None:
 				guarded(tx, {"op": "block.update", "addr": addr, "props": {"stance": "accepted"}})
 		elif args.verdict == "refuted":
 			guarded(tx, {"op": "block.update", "addr": addr, "props": {"stance": "refuted"}})
-		else:
-			create_items(tx, st.blocks[addr]["space"], addr, [parse_item(f"复核：需要改写。{args.note or ''}".strip())])
+		if args.note or args.verdict == "update":
+			verdict = {"fresh": "成立", "update": "需要改写", "refuted": "不成立"}[args.verdict]
+			note = {"kind": "note", "content": f"复核：{verdict}。{args.note or ''}".strip(), "props": {}, "links": [], "label": None, "children": []}
+			create_items(tx, st.blocks[addr]["space"], addr, [note])
 		finish(tx)
-	print(f"已复核 {addr}：{args.verdict}")
+	if not tx.divert:
+		print(f"已复核 {addr}：{args.verdict}")
 
 
 def cmd_candidates(args) -> None:
@@ -2035,6 +2090,12 @@ def md_tokens(text: str) -> list[dict]:
 	return toks
 
 
+def is_label(text: str) -> bool:
+	"""「补充三点：」「**样本**」这种段落，后面的列表是它的内容。"""
+	s = text.strip()
+	return s.endswith(("：", ":")) or bool(re.fullmatch(r"\*\*[^*\n]+\*\*[：:]?", s))
+
+
 def md_to_items(text: str) -> list[dict]:
 	"""标题成为父块；段落、表格、代码块、引用各成一块；列表项按缩进嵌套。
 	紧跟在段落后面（中间没有空行）的列表挂在那个段落下面，比如「**样本**」下面的几条。"""
@@ -2065,7 +2126,8 @@ def md_to_items(text: str) -> list[dict]:
 				stack[-1][1]["children"].append(it)
 			else:
 				if list_parent is None:
-					list_parent = label["children"] if label is not None and not t["gap"] else section
+					labelled = label is not None and (not t["gap"] or is_label(label["content"]))
+					list_parent = label["children"] if labelled else section
 				list_parent.append(it)
 			stack.append((t["indent"], it))
 			continue
@@ -2085,14 +2147,19 @@ def cmd_attach(args) -> None:
 	raw = src.read_bytes()
 	if len(raw) > 512 * 1024:
 		raise OutlineError("报告超过 512KB，先拆分或摘要")
-	items = md_to_items(raw.decode("utf-8"))
+	text = raw.decode("utf-8", errors="replace")
+	if src.suffix.lower() in (".md", ".markdown"):
+		items = md_to_items(text)
+	else:  # 复现输出、日志这类文件，原样放进一个代码块
+		fence = "`" * max(3, max((len(m) for m in re.findall(r"`+", text)), default=0) + 1)
+		items = [{"kind": "note", "content": f"{fence}\n{text.rstrip()}\n{fence}", "props": {}, "links": [], "label": None, "children": []}]
 	if len(items) == 1 and items[0]["children"]:
 		root = items[0]
 	else:
 		root = {"kind": "note", "content": args.title or src.stem, "props": {}, "links": [], "label": None, "children": items}
 	if args.title:
 		root["content"] = args.title
-	root["props"]["tags"] = ["报告"]
+	root["props"]["tags"] = ["报告"] if src.suffix.lower() in (".md", ".markdown") else ["附件"]
 	full = str(src.resolve())
 	with locked():
 		st = load_state()
@@ -2289,7 +2356,7 @@ def build_parser() -> argparse.ArgumentParser:
 	s.add_argument("--kind")
 	s.add_argument("--status")
 	s.add_argument("--stance")
-	s.add_argument("--prop", action="append")
+	s.add_argument("--prop", action="append", help="k=v。常用：alias（写 Q? 自动编号）、owner、manager、acceptance=required、tags=a,b")
 	s.add_argument("--link", action="append", help="role=target，例如 based_on=code:server/x.ts#fn")
 	s.add_argument("--after", help="插在这个块后面；--md 的多个顶层条目依次往后接")
 	s.add_argument("--ref", default=DEFAULT_REF, help="代码锚点对照的 git ref；还没合进 main 的文件用 HEAD")
@@ -2329,7 +2396,13 @@ def build_parser() -> argparse.ArgumentParser:
 	s.add_argument("id")
 
 	s = p("task", cmd_task, "任务动作")
-	s.add_argument("action", choices=["start", "block", "submit", "done", "accept", "revise", "cancel", "reopen"])
+	s.add_argument(
+		"action",
+		choices=["start", "block", "submit", "done", "accept", "revise", "cancel", "reopen"],
+		help="start 开始做（即领取）；block 受阻（--reason 写在等什么）；submit 交给管理者验收；"
+		"done 完成（要验收的任务，执行者 done 也会变成待验收）；accept 管理者或批准人验收；"
+		"revise 打回到待办（--reason 写意见）；cancel 取消；reopen 重开",
+	)
 	s.add_argument("addr")
 	s.add_argument("--reason")
 	s.add_argument("--evidence", action="append")
@@ -2371,8 +2444,9 @@ def build_parser() -> argparse.ArgumentParser:
 	s.add_argument("addr")
 	s.add_argument("--as-of", type=int)
 
-	s = p("log", cmd_log, "提交记录")
+	s = p("log", cmd_log, "提交记录：默认最近 n 条；--since N 从第 N 个提交往后看 n 条")
 	s.add_argument("-n", type=int, default=20)
+	s.add_argument("--since", type=int)
 	s.add_argument("--under")
 
 	s = p("diff", cmd_diff, "两个提交之间的变化")
@@ -2423,6 +2497,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv=None) -> int:
+	if hasattr(signal, "SIGPIPE"):
+		signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # 输出接 head 时安静退出
 	args = build_parser().parse_args(argv)
 	if args.recorder:
 		os.environ["OUTLINE_RECORDED_BY"] = args.recorder

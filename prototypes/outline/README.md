@@ -18,7 +18,7 @@ python3 outline.py read p/<短id> -d 3    # 读一棵子树（地址也可以用
 python3 outline.py board                 # 任务看板
 python3 outline.py inbox                 # 负责人的收件箱：待决定、待验收、待回答、值得看一眼
 python3 outline.py search 关键词 关键词   # 检索（默认不含否定、已被取代、归档）
-python3 outline.py log -n 20             # 提交记录
+python3 outline.py log -n 20             # 提交记录；--since 30 从第 30 个提交往后看
 python3 outline.py read p/<短id> --as-of 12   # 时间机器：第 12 个提交时的样子
 python3 outline.py diff 10 20            # 两个提交之间的变化
 python3 outline.py export                # 生成 exports/*.md
@@ -36,6 +36,7 @@ python3 outline.py export                # 生成 exports/*.md
   - **代记人**：`--by agent:<自己>`（或 `OUTLINE_RECORDED_BY`），替别人把内容记进大纲时写上自己。协调者替专注 agent 记它报告里的结论、替负责人记他在对话里的决定，都用这个；
   - **责任人**：系统沿创建链自动算出，不用写。
 - `log` 和 `export` 显示成「agent:w-dialect，由 agent:steward 代记（责任人 human:owner）」。
+- 代记时，注意范围按代记人判断：动手写的是代记人（见「注意范围」）。
 
 ## 写入
 
@@ -63,21 +64,28 @@ python3 outline.py link p/<块> based_on code:server/x.ts#fn   # 角色：mentio
 - `--md` 带 `--after` 时，所有顶层条目依次接在它后面。续行里的空行和代码块原样保留，代码块里以 `- ` 开头的行不算新条目。
 - 正文里行内代码中的 `[[…]]` 是字面文字，不算提及。
 
-大纲行的写法：`- [类型:状态或立场] 正文 {#标签 键=值 角色=目标}`。类型有 `note`（默认）、`task`、`assert`、`view`。`#标签` 只在这一次插入里有效，用来互相引用。
+大纲行的写法：`- [类型:状态或立场] 正文 {#标签 键=值 角色=目标}`。类型有 `note`（默认）、`task`、`assert`、`view`，也可以写中文（笔记、任务、断言、视图）。`#标签` 只在这一次插入里有效，用来互相引用。
+
+- 常用属性：`alias`（别名，`Q?` 自动编号）、`owner`（执行者）、`manager`（管理者，默认是创建者，子任务继承）、`acceptance=required`（要验收）、`tags=a,b`。
+- 任务状态：`todo` 待办、`doing` 进行中、`blocked` 受阻、`submitted` 待验收、`done` 完成、`cancelled` 取消。断言立场：`hypothesis` 假设、`accepted` 采纳、`refuted` 否定。写入和 `ls` 过滤时英文、中文都认。
+- 同一个角色可以写多条链接：`{evidence=commit:abc evidence=p/xxxx based_on=code:a.ts#f based_on=code:b.ts#g}`。值里有空格就加引号。
 
 链接目标：块地址（`p/xxxx`、别名、`#标签`），或者外部地址 `code:路径#符号`、`grep:正则@路径`、`file:路径`、`url:`、`commit:`、`tool:`、`chat:`、`report:`、`human:`、`space:空间`、`ws:设备:目录`。
 
-- `based_on` 指向代码时会记下指纹，之后用 `fresh` 检查是否过期。符号支持 TS/JS 和 Python 的声明。还没合进 main 的文件（比如这个原型自己）加 `--ref HEAD`，`fresh` 之后也按 HEAD 检查。
+- `based_on` 指向代码时会记下指纹，之后用 `fresh` 检查是否过期。符号支持 TS/JS 的声明（按括号取范围）和 Python 的 def/class（按缩进取整个函数或类）。还没合进 main 的文件（比如这个原型自己）加 `--ref HEAD`，`fresh` 之后也按 HEAD 检查。工作区里的代码和对照的 ref 不一样时会提示。
 - `file:` 证据会记下内容指纹，仓库里的文件再记提交号。指向仓库外的临时文件会提示：报告类的文件先用 `attach` 放进大纲。
 - 断言带了 `evidence` 或 `based_on` 就直接是「采纳」；agent 写的、没有依据的记为「假设」。
 
 ## 任务与计划
 
 ```bash
-python3 outline.py task start p/<任务>               # 开始做即领取
+python3 outline.py task start p/<任务>               # 开始做即领取；别人领着的要加 --steal
 python3 outline.py task block p/<任务> --reason "等 X"
-python3 outline.py task done p/<任务> --evidence commit:abc123
+python3 outline.py task submit p/<任务> --evidence commit:abc123   # 交给管理者验收
+python3 outline.py task done p/<任务> --evidence commit:abc123     # 完成；要验收的任务由执行者 done，也会变成待验收
 python3 outline.py task accept p/<任务>               # 管理者或批准人验收
+python3 outline.py task revise p/<任务> --reason "…"  # 打回到待办，意见写成子块
+python3 outline.py task cancel p/<任务> | task reopen p/<任务>
 python3 outline.py --as human:owner plan approve p/<计划根> [--delegate agent:mgr]
 python3 outline.py cr list | cr show CR1 | cr approve CR1 --note ... | cr reject CR1
 ```
@@ -85,6 +93,8 @@ python3 outline.py cr list | cr show CR1 | cr approve CR1 --note ... | cr reject
 - 计划默认是草稿，随情况改。人批准之后，骨架冻结：改步骤内容、加减步骤、取消或移动步骤，会自动转成变更请求，相关任务标为受阻；推进状态、在步骤下写笔记、把叶子步骤拆成子任务不受影响。
 - 获授权的 agent 可以代批步骤层面的变更请求，但不能自批，也不能批目标和验收（计划根和它直接挂着的非任务块）。
 - agent 写个人空间 `me`、删除或移动团队之外的人写的块、单次改动超过 50 个已有块，会转成提议，不打断 agent。
+- 转成提议或请求的写入：别名在提出时就编好号，插入位置在批准时照原样保留（`--after` 接在哪就插在哪）。批准前用 `cr show` 检查，它会列出新块的类型、属性和位置。
+- 转出去的新块在批准前还不存在，不能往它们下面再加子块；要加的话，在同一条命令里一起写。
 
 ## 提问与回答
 
@@ -106,7 +116,9 @@ python3 outline.py --as human:owner answer Q29 --text "不做，因为 …"     
 python3 outline.py --as agent:w-x --by agent:steward attach p/<任务> 报告.md
 ```
 
-把专注 agent 的 markdown 报告转成任务下的一棵子树：标题成为父块，段落、表格、代码块、引用各成一块，列表按缩进嵌套，紧跟在段落后面的列表挂在那个段落下面。原来指向这个文件的 `file:` 链接会改指到挂好的块，报告文件之后删掉也没关系。
+把专注 agent 的 markdown 报告转成任务下的一棵子树：标题成为父块，段落、表格、代码块、引用各成一块，列表按缩进嵌套。列表挂在前一个段落下面的情况：两者之间没有空行，或者那个段落是「补充三点：」这种以冒号结尾的、「**样本**」这种整段加粗的标签。原来指向这个文件的 `file:` 链接会改指到挂好的块，报告文件之后删掉也没关系。
+
+不是 markdown 的文件（复现输出、日志）整个放进一个代码块，标 `#附件`，可以作为证据引用。
 
 ## 注意范围
 
@@ -121,6 +133,8 @@ python3 outline.py scope rm agent:w-x p/<页>                      # 缩小范�
 - 泡外可以读、可以搜，结果标「范围外」，读过什么会记下来给上级看。泡外写入会自动转成「扩大范围」请求，附上这次操作；批准后泡加上，操作也执行。
 - 谁来批：从派它的会话开始沿创建链往上，第一个自己的范围覆盖新泡的 agent 批；都不行就由人批。工作区的「执行」只有人，或自己明确有这一级的上级能给。期限从批准时算起。
 - agent 自己加「关注」级别的泡直接生效（只影响注入和路由）；自己加「修改」「执行」要批。范围页上的泡只能用 `scope` 命令改。
+- `read` 会提示这里对你是「范围外」还是只有「关注」：两种情况下写入都会转成请求。
+- 代记（`--as 作者 --by 代记人`）时按代记人的范围判断。
 
 ## 知识
 
