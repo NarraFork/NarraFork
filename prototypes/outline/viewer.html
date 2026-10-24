@@ -1,0 +1,570 @@
+<title>大纲时间机器</title>
+<meta name="claude:viewport-fit-sides" content="cover">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+/* 布局：顶部是摘要和筛选；中间左边是某一时刻的大纲，右边是这次提交的详情（窄屏时堆叠）；底部固定一条时间轴 */
+:root {
+	--bg: #f5f6fb;
+	--panel: #ffffff;
+	--fg: #1b1e2d;
+	--muted: #5c6180;
+	--line: #dde0ed;
+	--accent: #4b59d0;
+	--accent-soft: #e7e9fb;
+	--add: #1d7f47;
+	--add-soft: #e2f3e9;
+	--chg: #946100;
+	--chg-soft: #faefd6;
+	--del: #ab3337;
+	--del-soft: #f8e2e2;
+	--mov: #2c69ab;
+	--human: #c2410c;
+	--agent: #4b59d0;
+	--system: #8a8fa8;
+	--font-ui: "IBM Plex Sans", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", system-ui, sans-serif;
+	--font-mono: "IBM Plex Mono", ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+	--bar-h: 132px;
+}
+@media (prefers-color-scheme: dark) {
+	:root:not([data-theme="light"]) {
+		--bg: #11131b;
+		--panel: #191b27;
+		--fg: #e3e5f1;
+		--muted: #9a9fbc;
+		--line: #2b2e41;
+		--accent: #929dff;
+		--accent-soft: #262a49;
+		--add: #63cf91;
+		--add-soft: #15301f;
+		--chg: #e8b54e;
+		--chg-soft: #33290f;
+		--del: #f07c7f;
+		--del-soft: #3a1a1c;
+		--mov: #80b5ee;
+		--human: #f59f68;
+		--agent: #929dff;
+		--system: #6c7191;
+		color-scheme: dark;
+	}
+}
+:root[data-theme="dark"] {
+	--bg: #11131b;
+	--panel: #191b27;
+	--fg: #e3e5f1;
+	--muted: #9a9fbc;
+	--line: #2b2e41;
+	--accent: #929dff;
+	--accent-soft: #262a49;
+	--add: #63cf91;
+	--add-soft: #15301f;
+	--chg: #e8b54e;
+	--chg-soft: #33290f;
+	--del: #f07c7f;
+	--del-soft: #3a1a1c;
+	--mov: #80b5ee;
+	--human: #f59f68;
+	--agent: #929dff;
+	--system: #6c7191;
+	color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body {
+	background: var(--bg);
+	color: var(--fg);
+	font-family: var(--font-ui);
+	font-size: 14px;
+	line-height: 1.55;
+	padding-left: max(16px, env(safe-area-inset-left, 0px));
+	padding-right: max(16px, env(safe-area-inset-right, 0px));
+	padding-block: 20px calc(var(--bar-h) + 24px + env(safe-area-inset-bottom, 0px));
+}
+.wrap { max-width: 1180px; margin: 0 auto; display: grid; gap: 16px; }
+header { display: grid; gap: 10px; }
+h1 { font-size: 20px; font-weight: 600; margin: 0; letter-spacing: 0.01em; text-wrap: balance; }
+.sub { color: var(--muted); margin: 0; max-width: 65ch; }
+.stats { display: flex; flex-wrap: wrap; gap: 6px 18px; font-variant-numeric: tabular-nums; color: var(--muted); }
+.stats b { color: var(--fg); font-weight: 600; }
+.controls { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; }
+.controls label { display: inline-flex; gap: 6px; align-items: center; color: var(--muted); }
+select, button, input[type="search"] {
+	font: inherit;
+	color: var(--fg);
+	background: var(--panel);
+	border: 1px solid var(--line);
+	border-radius: 6px;
+	padding: 4px 10px;
+}
+select { max-width: 100%; text-overflow: ellipsis; }
+.controls label { min-width: 0; max-width: 100%; }
+button { cursor: pointer; }
+button:hover { border-color: var(--accent); }
+button[aria-pressed="true"] { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 14px; color: var(--muted); font-size: 12px; }
+.legend span { display: inline-flex; align-items: center; gap: 5px; }
+.sw { width: 10px; height: 10px; border-radius: 2px; display: inline-block; }
+.main { display: grid; grid-template-columns: minmax(0, 1fr) 340px; gap: 16px; align-items: start; }
+@media (max-width: 880px) { .main { grid-template-columns: minmax(0, 1fr); } }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; min-width: 0; }
+.panel h2 { font-size: 12px; font-weight: 600; letter-spacing: 0.06em; color: var(--muted); margin: 0; padding: 10px 14px; border-bottom: 1px solid var(--line); }
+.tree { padding: 8px 6px 12px; overflow-x: auto; }
+.page + .page { border-top: 1px dashed var(--line); margin-top: 6px; padding-top: 6px; }
+.node { min-width: 0; }
+.row { display: grid; grid-template-columns: 18px 14px minmax(0, 1fr); gap: 4px; align-items: start; padding: 2px 8px 2px 4px; border-radius: 5px; }
+.row.add { background: var(--add-soft); }
+.row.chg { background: var(--chg-soft); }
+.row.del { background: var(--del-soft); }
+.row.del .text { text-decoration: line-through; color: var(--muted); }
+.mark { font-family: var(--font-mono); font-size: 12px; text-align: center; line-height: 22px; }
+.row.add .mark { color: var(--add); }
+.row.chg .mark { color: var(--chg); }
+.row.del .mark { color: var(--del); }
+.row.mov .mark { color: var(--mov); }
+.toggle { border: 0; background: none; padding: 0; width: 14px; height: 22px; color: var(--muted); font-size: 11px; line-height: 22px; }
+.toggle:disabled { cursor: default; opacity: 0.35; }
+.body { min-width: 0; display: grid; gap: 2px; }
+.line1 { display: flex; flex-wrap: wrap; gap: 2px 8px; align-items: baseline; }
+.addr { font-family: var(--font-mono); font-size: 11px; color: var(--muted); }
+.text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.text.multi { font-family: var(--font-mono); font-size: 12px; display: block; width: 100%; }
+.chips { display: inline-flex; flex-wrap: wrap; gap: 4px; }
+.chip { font-size: 11px; line-height: 18px; padding: 0 6px; border-radius: 9px; border: 1px solid var(--line); color: var(--muted); white-space: nowrap; }
+.chip.alias { border-color: var(--accent); color: var(--accent); font-family: var(--font-mono); }
+.chip.st-doing { color: var(--accent); border-color: var(--accent); }
+.chip.st-done { color: var(--add); border-color: var(--add); }
+.chip.st-blocked, .chip.st-submitted { color: var(--chg); border-color: var(--chg); }
+.chip.st-cancelled { text-decoration: line-through; }
+.chip.stance-accepted { color: var(--add); border-color: var(--add); }
+.chip.stance-refuted { color: var(--del); border-color: var(--del); }
+.chip.approved { color: var(--human); border-color: var(--human); }
+.links { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
+.kids { margin-left: 18px; border-left: 1px solid var(--line); padding-left: 4px; }
+.detail { padding: 12px 14px; display: grid; gap: 10px; }
+.detail .who { font-weight: 600; }
+.detail .meta { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; }
+.ops { margin: 0; padding-left: 18px; display: grid; gap: 4px; font-size: 13px; }
+.ops li { overflow-wrap: anywhere; }
+.empty { color: var(--muted); padding: 12px 14px; }
+.bar {
+	position: fixed;
+	left: 0;
+	right: 0;
+	bottom: 0;
+	background: var(--panel);
+	border-top: 1px solid var(--line);
+	padding-left: max(16px, env(safe-area-inset-left, 0px));
+	padding-right: max(16px, env(safe-area-inset-right, 0px));
+	padding-block: 8px calc(10px + env(safe-area-inset-bottom, 0px));
+	z-index: 5;
+}
+.bar-in { max-width: 1180px; margin: 0 auto; display: grid; gap: 6px; }
+.ticks { display: flex; align-items: flex-end; gap: 2px; height: 46px; overflow-x: auto; padding-bottom: 2px; }
+.tick { flex: 1 0 6px; max-width: 26px; border: 0; padding: 0; border-radius: 2px 2px 0 0; background: var(--system); opacity: 0.55; cursor: pointer; }
+.tick.human { background: var(--human); }
+.tick.agent { background: var(--agent); }
+.tick.past { opacity: 0.9; }
+.tick.cur { opacity: 1; outline: 2px solid var(--fg); outline-offset: 1px; }
+.tick.base { box-shadow: inset 0 -4px 0 var(--chg); }
+.tick.flag { border-top: 3px solid var(--chg); }
+input[type="range"] { width: 100%; accent-color: var(--accent); margin: 0; }
+.bar-row { display: flex; flex-wrap: wrap; gap: 6px 10px; align-items: center; justify-content: space-between; }
+.bar-row .left, .bar-row .right { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.now { font-variant-numeric: tabular-nums; color: var(--muted); font-size: 13px; }
+.now b { color: var(--fg); }
+@media (prefers-reduced-motion: reduce) { * { scroll-behavior: auto !important; } }
+</style>
+
+<div class="wrap">
+	<header>
+		<h1>大纲时间机器</h1>
+		<p class="sub">拖动底部的时间轴，看大纲在每一个提交时的样子。高亮的是这一步（或从对照点到现在）发生的变化。</p>
+		<div class="stats" id="stats"></div>
+		<div class="controls">
+			<label for="space">空间 <select id="space"></select></label>
+			<label for="page">页 <select id="page"></select></label>
+			<button type="button" id="onlyChanged" aria-pressed="false">只看有变化的分支</button>
+			<button type="button" id="showDeleted" aria-pressed="false">显示已删除</button>
+			<button type="button" id="expandAll">全部展开</button>
+		</div>
+		<div class="legend" aria-hidden="true">
+			<span><i class="sw" style="background: var(--add)"></i>新增</span>
+			<span><i class="sw" style="background: var(--chg)"></i>修改</span>
+			<span><i class="sw" style="background: var(--del)"></i>删除</span>
+			<span><i class="sw" style="background: var(--mov)"></i>移动</span>
+			<span><i class="sw" style="background: var(--human)"></i>人的提交</span>
+			<span><i class="sw" style="background: var(--agent)"></i>agent 的提交</span>
+			<span><i class="sw" style="background: var(--system)"></i>系统提交</span>
+		</div>
+	</header>
+	<div class="main">
+		<section class="panel" aria-label="大纲">
+			<h2 id="treeTitle">大纲</h2>
+			<div class="tree" id="tree"></div>
+		</section>
+		<aside class="panel" aria-label="这次提交">
+			<h2>这次提交</h2>
+			<div class="detail" id="detail"></div>
+		</aside>
+	</div>
+</div>
+
+<div class="bar" role="region" aria-label="时间轴">
+	<div class="bar-in">
+		<div class="ticks" id="ticks"></div>
+		<label for="seq" class="now" id="now"></label>
+		<input type="range" id="seq" min="1" max="1" value="1">
+		<div class="bar-row">
+			<div class="left">
+				<button type="button" id="first" aria-label="第一个提交">⏮</button>
+				<button type="button" id="prev" aria-label="上一个提交">◀</button>
+				<button type="button" id="play" aria-pressed="false">播放</button>
+				<button type="button" id="next" aria-label="下一个提交">▶</button>
+				<button type="button" id="last" aria-label="最新">⏭</button>
+			</div>
+			<div class="right">
+				<button type="button" id="pin">把这里设为对照点</button>
+				<button type="button" id="unpin" hidden>取消对照</button>
+			</div>
+		</div>
+	</div>
+</div>
+
+<script>
+const DATA = /*__OUTLINE_DATA__*/null;
+
+const KIND_ZH = { note: "笔记", task: "任务", assertion: "断言", view: "视图" };
+const STATUS_ZH = { todo: "待办", doing: "进行中", blocked: "受阻", submitted: "待验收", done: "完成", cancelled: "取消" };
+const STANCE_ZH = { hypothesis: "假设", accepted: "采纳", refuted: "否定" };
+const ROLE_ZH = { mention: "提及", embed: "嵌入", based_on: "基于", evidence: "证据", supersedes: "取代", blocked_by: "前置", touches: "涉及", same_as: "同一", source: "出处" };
+const commits = (DATA && DATA.commits) || [];
+const $ = (id) => document.getElementById(id);
+
+function emptyState() {
+	return { spaces: {}, actors: {}, blocks: {}, links: {}, approvals: {}, crs: {} };
+}
+
+function apply(st, op, seq, actor) {
+	const b = op.addr ? st.blocks[op.addr] : null;
+	switch (op.op) {
+		case "space.create": st.spaces[op.space] = { kind: op.kind, title: op.title }; break;
+		case "actor.register": st.actors[op.actor] = { kind: op.kind, creator: op.creator }; break;
+		case "block.create":
+			st.blocks[op.addr] = { addr: op.addr, space: op.space, parent: op.parent || null, order: op.order, kind: op.kind, content: op.content || "", props: { ...(op.props || {}) }, version: seq, created: seq, deleted: false };
+			break;
+		case "block.update":
+			if (!b) break;
+			if ("content" in op) b.content = op.content;
+			for (const [k, v] of Object.entries(op.props || {})) { if (v === null) delete b.props[k]; else b.props[k] = v; }
+			if (op.kind) b.kind = op.kind;
+			b.version = seq;
+			break;
+		case "block.move": if (b) { b.parent = op.parent || null; b.order = op.order; b.version = seq; } break;
+		case "block.delete": if (b) { b.deleted = true; b.version = seq; } break;
+		case "block.restore": if (b) { b.deleted = false; b.version = seq; } break;
+		case "link.add": st.links[op.id] = { from: op.from, role: op.role, target: op.target }; break;
+		case "link.remove": if (st.links[op.id]) st.links[op.id].removed = true; break;
+		case "plan.approve": st.approvals[op.root] = { approver: op.approver, seq }; break;
+		case "plan.release": delete st.approvals[op.root]; break;
+		case "cr.create": st.crs[op.id] = { status: "pending", ops: op.ops, reason: op.reason }; break;
+		case "cr.decide": if (st.crs[op.id]) st.crs[op.id].status = op.status; break;
+	}
+}
+
+const cache = new Map();
+function stateAt(seq) {
+	if (cache.has(seq)) return cache.get(seq);
+	const st = emptyState();
+	for (const c of commits) {
+		if (c.seq > seq) break;
+		for (const op of c.ops) apply(st, op, c.seq, c.actor);
+	}
+	cache.set(seq, st);
+	return st;
+}
+
+function childrenOf(st, key, showDeleted) {
+	return Object.values(st.blocks)
+		.filter((b) => (b.parent || b.space + "/") === key && (showDeleted || !b.deleted))
+		.sort((a, b) => a.order - b.order);
+}
+
+function diffOf(base, cur, addr) {
+	const now = cur.blocks[addr];
+	const was = base.blocks[addr];
+	if (!was || (was.deleted && !now.deleted)) return "add";
+	if (now.deleted && !was.deleted) return "del";
+	if (was.parent !== now.parent) return "mov";
+	if (was.content !== now.content || JSON.stringify(was.props) !== JSON.stringify(now.props) || was.kind !== now.kind) return "chg";
+	return "";
+}
+
+function actorKind(c) {
+	if (c.kind === "system" && !String(c.summary).startsWith("批准") && !String(c.summary).startsWith("驳回")) return "system";
+	return String(c.actor).startsWith("human:") ? "human" : "agent";
+}
+
+function chipsFor(st, b) {
+	const out = [];
+	const p = b.props;
+	if (p.alias) out.push(["alias", p.alias]);
+	if (b.kind !== "note") out.push(["", KIND_ZH[b.kind] || b.kind]);
+	if (b.kind === "task") {
+		const s = p.status || "todo";
+		out.push(["st-" + s, STATUS_ZH[s] || s]);
+		if (p.owner) out.push(["", "执行：" + p.owner]);
+		if (p.no_evidence && s === "done") out.push(["st-blocked", "无依据"]);
+	}
+	if (b.kind === "assertion") {
+		const s = p.stance || "hypothesis";
+		out.push(["stance-" + s, STANCE_ZH[s] || s]);
+		const sup = Object.values(st.links).some((l) => !l.removed && l.role === "supersedes" && l.target === b.addr && st.blocks[l.from] && st.blocks[l.from].props.stance === "accepted");
+		if (sup) out.push(["stance-refuted", "已被取代"]);
+	}
+	for (const t of p.tags || []) out.push(["", "#" + t]);
+	if (st.approvals[b.addr]) out.push(["approved", "已批准：" + st.approvals[b.addr].approver]);
+	if (p.archived) out.push(["", "归档"]);
+	const pending = Object.entries(st.crs).filter(([, cr]) => cr.status === "pending" && cr.ops.some((o) => o.addr === b.addr || o.parent === b.addr)).map(([id]) => id);
+	if (pending.length) out.push(["st-blocked", "待决定：" + pending.join(",")]);
+	return out;
+}
+
+function linksFor(st, addr) {
+	const by = {};
+	for (const l of Object.values(st.links)) {
+		if (l.removed || l.from !== addr || l.role === "mention" || l.role === "embed") continue;
+		const t = st.blocks[l.target] ? (st.blocks[l.target].props.alias || l.target) : l.target;
+		(by[ROLE_ZH[l.role] || l.role] ||= []).push(t);
+	}
+	return Object.entries(by).map(([r, ts]) => r + "：" + ts.join("；")).join("　");
+}
+
+const ui = { seq: commits.length ? commits[commits.length - 1].seq : 0, base: null, space: "p", page: "", onlyChanged: false, showDeleted: false, collapsed: new Set(), playing: null };
+
+function el(tag, cls, text) {
+	const n = document.createElement(tag);
+	if (cls) n.className = cls;
+	if (text !== undefined) n.textContent = text;
+	return n;
+}
+
+function subtreeChanged(cur, base, addr, memo) {
+	if (memo.has(addr)) return memo.get(addr);
+	let changed = !!diffOf(base, cur, addr);
+	if (!changed) for (const k of childrenOf(cur, addr, true)) if (subtreeChanged(cur, base, k.addr, memo)) { changed = true; break; }
+	memo.set(addr, changed);
+	return changed;
+}
+
+function renderNode(cur, base, b, memo) {
+	const node = el("div", "node");
+	const d = diffOf(base, cur, b.addr);
+	const row = el("div", "row" + (d ? " " + d : ""));
+	row.appendChild(el("span", "mark", { add: "+", chg: "~", del: "−", mov: "↷" }[d] || ""));
+	const kids = childrenOf(cur, b.addr, ui.showDeleted).filter((k) => !ui.onlyChanged || subtreeChanged(cur, base, k.addr, memo));
+	const tg = el("button", "toggle", kids.length ? (ui.collapsed.has(b.addr) ? "▸" : "▾") : "·");
+	tg.type = "button";
+	tg.disabled = !kids.length;
+	tg.setAttribute("aria-label", ui.collapsed.has(b.addr) ? "展开" : "折叠");
+	tg.addEventListener("click", () => { ui.collapsed.has(b.addr) ? ui.collapsed.delete(b.addr) : ui.collapsed.add(b.addr); render(); });
+	row.appendChild(tg);
+	const body = el("div", "body");
+	const l1 = el("div", "line1");
+	const multi = b.content.includes("\n");
+	const first = multi ? b.content.split("\n")[0] : b.content;
+	l1.appendChild(el("span", "text", first || "（空）"));
+	const chips = el("span", "chips");
+	for (const [c, t] of chipsFor(cur, b)) chips.appendChild(el("span", "chip" + (c ? " " + c : ""), t));
+	l1.appendChild(chips);
+	l1.appendChild(el("span", "addr", b.addr));
+	body.appendChild(l1);
+	if (multi) body.appendChild(el("span", "text multi", b.content.split("\n").slice(1).join("\n")));
+	const lk = linksFor(cur, b.addr);
+	if (lk) body.appendChild(el("div", "links", "↳ " + lk));
+	row.appendChild(body);
+	node.appendChild(row);
+	if (kids.length && !ui.collapsed.has(b.addr)) {
+		const box = el("div", "kids");
+		for (const k of kids) box.appendChild(renderNode(cur, base, k, memo));
+		node.appendChild(box);
+	}
+	return node;
+}
+
+function describeOp(st, op) {
+	const short = (s) => { const f = String(s || "").split("\n")[0]; return f.length > 60 ? f.slice(0, 59) + "…" : f; };
+	switch (op.op) {
+		case "block.create": return "新增 " + op.addr + "：" + short(op.content);
+		case "block.update": {
+			const parts = [];
+			if ("content" in op) parts.push("内容 → " + short(op.content));
+			const pr = Object.entries(op.props || {}).map(([k, v]) => k + "=" + (v === null ? "（删除）" : Array.isArray(v) ? v.join(",") : v));
+			if (pr.length) parts.push(pr.join("，"));
+			return "修改 " + op.addr + "：" + parts.join("；");
+		}
+		case "block.move": return "移动 " + op.addr + " → " + (op.parent || "顶层");
+		case "block.delete": return "删除 " + op.addr;
+		case "link.add": return "链接 " + op.from + " —" + (ROLE_ZH[op.role] || op.role) + "→ " + op.target;
+		case "link.remove": return "移除链接 " + op.id;
+		case "plan.approve": return "批准计划 " + op.root + (op.delegates && op.delegates.length ? "（授权 " + op.delegates.join(",") + " 代批）" : "");
+		case "plan.release": return "把 " + op.root + " 放开为草稿";
+		case "cr.create": return "提出 " + op.id + "：" + op.reason + "（" + op.ops.length + " 个操作，等待决定）";
+		case "cr.decide": return (op.status === "approved" ? "批准 " : "驳回 ") + op.id + (op.note ? "：" + op.note : "");
+		case "space.create": return "建立空间 " + op.space + "（" + op.title + "）";
+		case "actor.register": return "登记参与者 " + op.actor + (op.creator ? "，创建者 " + op.creator : "");
+		default: return op.op;
+	}
+}
+
+function renderDetail(cur) {
+	const box = $("detail");
+	box.replaceChildren();
+	const c = commits.find((x) => x.seq === ui.seq);
+	if (!c) { box.appendChild(el("div", "empty", "还没有提交")); return; }
+	box.appendChild(el("div", "who", "#" + c.seq + " " + c.summary));
+	let meta = (c.ts || "").replace("T", " ").slice(0, 16) + " · " + c.actor;
+	if (c.on_behalf_of) meta += "（代 " + c.on_behalf_of + "）";
+	if (c.recorded_by) meta += " · 由 " + c.recorded_by + " 代记";
+	box.appendChild(el("div", "meta", meta));
+	const ol = el("ol", "ops");
+	const shown = c.ops.slice(0, 60);
+	for (const op of shown) ol.appendChild(el("li", "", describeOp(cur, op)));
+	if (c.ops.length > shown.length) ol.appendChild(el("li", "", "……另有 " + (c.ops.length - shown.length) + " 个操作"));
+	box.appendChild(ol);
+	if (ui.base !== null) box.appendChild(el("div", "meta", "高亮：从第 " + ui.base + " 个提交到现在的变化"));
+}
+
+function renderStats(cur) {
+	const blocks = Object.values(cur.blocks).filter((b) => !b.deleted);
+	const tasks = blocks.filter((b) => b.kind === "task");
+	const done = tasks.filter((b) => b.props.status === "done").length;
+	const pending = Object.values(cur.crs).filter((c) => c.status === "pending").length;
+	const parts = [
+		["提交", ui.seq + " / " + (commits.length ? commits[commits.length - 1].seq : 0)],
+		["块", blocks.length],
+		["任务", tasks.length + "（完成 " + done + "）"],
+		["断言", blocks.filter((b) => b.kind === "assertion").length],
+		["待决定", pending],
+	];
+	$("stats").replaceChildren(...parts.map(([k, v]) => { const s = el("span"); s.append(k + " "); s.appendChild(el("b", "", String(v))); return s; }));
+}
+
+function renderSelectors(cur) {
+	const spaceSel = $("space");
+	const spaces = Object.entries(cur.spaces);
+	if (!spaces.find(([k]) => k === ui.space) && spaces.length) ui.space = spaces[0][0];
+	spaceSel.replaceChildren(...spaces.map(([k, v]) => { const o = el("option", "", k + " · " + v.title); o.value = k; o.selected = k === ui.space; return o; }));
+	const pageSel = $("page");
+	const roots = childrenOf(cur, ui.space + "/", ui.showDeleted);
+	if (ui.page && !roots.find((r) => r.addr === ui.page)) ui.page = "";
+	const all = el("option", "", "全部页");
+	all.value = "";
+	pageSel.replaceChildren(all, ...roots.map((r) => { const o = el("option", "", (r.props.alias ? r.props.alias + " · " : "") + r.content.split("\n")[0].slice(0, 28)); o.value = r.addr; o.selected = r.addr === ui.page; return o; }));
+}
+
+function renderTicks() {
+	const box = $("ticks");
+	if (box.childElementCount !== commits.length) {
+		const maxOps = Math.max(1, ...commits.map((c) => c.ops.length));
+		box.replaceChildren(...commits.map((c) => {
+			const t = el("button", "tick " + actorKind(c));
+			t.type = "button";
+			t.style.height = Math.round(8 + 36 * Math.log(1 + c.ops.length) / Math.log(1 + maxOps)) + "px";
+			t.title = "#" + c.seq + " " + c.actor + "：" + c.summary;
+			t.setAttribute("aria-label", "第 " + c.seq + " 个提交：" + c.summary);
+			if (c.ops.some((o) => o.op === "plan.approve" || o.op === "cr.create" || o.op === "cr.decide")) t.classList.add("flag");
+			t.addEventListener("click", () => go(c.seq));
+			return t;
+		}));
+	}
+	[...box.children].forEach((t, i) => {
+		const s = commits[i].seq;
+		t.classList.toggle("past", s <= ui.seq);
+		t.classList.toggle("cur", s === ui.seq);
+		t.classList.toggle("base", s === ui.base);
+	});
+	const cur = box.children[commits.findIndex((c) => c.seq === ui.seq)];
+	if (cur && cur.scrollIntoView) cur.scrollIntoView({ block: "nearest", inline: "nearest" });
+}
+
+function render() {
+	const cur = stateAt(ui.seq);
+	const base = stateAt(ui.base !== null ? ui.base : ui.seq - 1);
+	renderSelectors(cur);
+	renderStats(cur);
+	const tree = $("tree");
+	tree.replaceChildren();
+	const memo = new Map();
+	let roots = childrenOf(cur, ui.space + "/", ui.showDeleted);
+	if (ui.page) roots = roots.filter((r) => r.addr === ui.page);
+	if (ui.onlyChanged) roots = roots.filter((r) => subtreeChanged(cur, base, r.addr, memo));
+	$("treeTitle").textContent = "第 " + ui.seq + " 个提交时的大纲";
+	if (!roots.length) tree.appendChild(el("div", "empty", ui.onlyChanged ? "这一步在这个空间里没有变化" : "这个空间在这一刻还是空的"));
+	for (const r of roots) { const pg = el("div", "page"); pg.appendChild(renderNode(cur, base, r, memo)); tree.appendChild(pg); }
+	renderDetail(cur);
+	const c = commits.find((x) => x.seq === ui.seq);
+	$("now").replaceChildren();
+	$("now").append("第 ");
+	$("now").appendChild(el("b", "", String(ui.seq)));
+	$("now").append(" 个提交" + (c ? " · " + (c.ts || "").replace("T", " ").slice(0, 16) + " · " + c.actor + "：" + c.summary : ""));
+	$("seq").value = String(ui.seq);
+	$("pin").hidden = ui.base === ui.seq;
+	$("unpin").hidden = ui.base === null;
+	renderTicks();
+}
+
+function go(seq) {
+	if (!commits.length) return;
+	const lo = commits[0].seq;
+	const hi = commits[commits.length - 1].seq;
+	ui.seq = Math.max(lo, Math.min(hi, seq));
+	render();
+}
+
+function stopPlay() {
+	if (ui.playing) clearInterval(ui.playing);
+	ui.playing = null;
+	$("play").textContent = "播放";
+	$("play").setAttribute("aria-pressed", "false");
+}
+
+function init() {
+	if (!commits.length) {
+		$("tree").replaceChildren(el("div", "empty", "没有提交数据。先在 prototypes/outline 下运行 python3 outline.py export"));
+		return;
+	}
+	const seqInput = $("seq");
+	seqInput.min = String(commits[0].seq);
+	seqInput.max = String(commits[commits.length - 1].seq);
+	seqInput.addEventListener("input", () => go(Number(seqInput.value)));
+	$("first").addEventListener("click", () => go(commits[0].seq));
+	$("prev").addEventListener("click", () => go(ui.seq - 1));
+	$("next").addEventListener("click", () => go(ui.seq + 1));
+	$("last").addEventListener("click", () => go(commits[commits.length - 1].seq));
+	$("play").addEventListener("click", () => {
+		if (ui.playing) return stopPlay();
+		if (ui.seq >= commits[commits.length - 1].seq) go(commits[0].seq);
+		$("play").textContent = "暂停";
+		$("play").setAttribute("aria-pressed", "true");
+		ui.playing = setInterval(() => { if (ui.seq >= commits[commits.length - 1].seq) return stopPlay(); go(ui.seq + 1); }, 800);
+	});
+	$("pin").addEventListener("click", () => { ui.base = ui.seq; render(); });
+	$("unpin").addEventListener("click", () => { ui.base = null; render(); });
+	$("space").addEventListener("change", (e) => { ui.space = e.target.value; ui.page = ""; render(); });
+	$("page").addEventListener("change", (e) => { ui.page = e.target.value; render(); });
+	$("onlyChanged").addEventListener("click", (e) => { ui.onlyChanged = !ui.onlyChanged; e.target.setAttribute("aria-pressed", String(ui.onlyChanged)); render(); });
+	$("showDeleted").addEventListener("click", (e) => { ui.showDeleted = !ui.showDeleted; e.target.setAttribute("aria-pressed", String(ui.showDeleted)); render(); });
+	$("expandAll").addEventListener("click", () => { ui.collapsed.clear(); render(); });
+	document.addEventListener("keydown", (e) => {
+		if (e.target.closest && e.target.closest("select, input")) return;
+		if (e.key === "ArrowLeft") { go(ui.seq - 1); e.preventDefault(); }
+		if (e.key === "ArrowRight") { go(ui.seq + 1); e.preventDefault(); }
+		if (e.key === "Home") go(commits[0].seq);
+		if (e.key === "End") go(commits[commits.length - 1].seq);
+	});
+	render();
+}
+
+init();
+</script>

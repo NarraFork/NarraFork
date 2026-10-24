@@ -204,7 +204,7 @@ def apply_op(st: State, op: dict, seq: int, actor: str) -> None:
 	if t == "space.create":
 		st.spaces[op["space"]] = {k: op.get(k) for k in ("kind", "title", "owner")}
 	elif t == "actor.register":
-		st.actors[op["actor"]] = {k: op.get(k) for k in ("kind", "creator", "label")}
+		st.actors[op["actor"]] = {k: op.get(k) for k in ("kind", "creator", "label", "mode")}
 	elif t == "block.create":
 		addr = op["addr"]
 		st.blocks[addr] = {
@@ -636,6 +636,9 @@ def write_commit(tx: Tx) -> int:
 		"summary": tx.summary,
 		"ops": tx.ops,
 	}
+	recorder = os.environ.get("OUTLINE_RECORDED_BY")
+	if recorder and recorder != tx.actor:
+		commit["recorded_by"] = recorder  # 协调者替专注 agent 代记（§8.14）
 	with LOG.open("a", encoding="utf-8") as f:
 		f.write(json.dumps(commit, ensure_ascii=False) + "\n")
 		f.flush()
@@ -1041,7 +1044,7 @@ def cmd_actor(args) -> None:
 		if args.name.startswith("agent:") and not args.creator:
 			raise OutlineError("agent 必须有创建者（--creator）")
 		tx = Tx(st, actor_of(args), f"登记参与者 {args.name}", kind="system")
-		tx.push({"op": "actor.register", "actor": args.name, "kind": "agent" if args.name.startswith("agent:") else "human", "creator": args.creator, "label": args.label})
+		tx.push({"op": "actor.register", "actor": args.name, "kind": "agent" if args.name.startswith("agent:") else "human", "creator": args.creator, "label": args.label, "mode": args.mode})
 		finish(tx)
 	print(f"已登记 {args.name}，责任人 {load_state().responsible(args.name)}")
 
@@ -1705,8 +1708,12 @@ def cmd_export(args) -> None:
 	(EXPORTS / "inbox.md").write_text(header + "# 负责人的收件箱\n\n" + "\n".join(inbox_lines(st, "human:owner")) + "\n", encoding="utf-8")
 	log_lines = [f"- #{c['seq']} {c['ts'][:16]} {c['actor']}" + (f"（代 {c['on_behalf_of']}）" if c.get("on_behalf_of") else "") + f"：{c['summary']}" for c in st.commits[-80:]]
 	(EXPORTS / "log.md").write_text(header + "# 最近的提交\n\n" + "\n".join(reversed(log_lines)) + "\n", encoding="utf-8")
+	# 时间机器：把提交日志嵌进静态页，由浏览器回放（§4）
+	data = json.dumps({"commits": st.commits}, ensure_ascii=False).replace("</", "<\\/")
+	page = (ROOT / "viewer.html").read_text(encoding="utf-8").replace("/*__OUTLINE_DATA__*/null", data, 1)
+	(EXPORTS / "timeline.html").write_text(page, encoding="utf-8")
 	where = EXPORTS.relative_to(repo_root()) if EXPORTS.is_relative_to(repo_root()) else EXPORTS
-	print(f"已导出到 {where}/：overview.md、board.md、inbox.md、log.md")
+	print(f"已导出到 {where}/：overview.md、board.md、inbox.md、log.md、timeline.html")
 
 
 # ---------------------------------------------------------------------------
@@ -1715,6 +1722,7 @@ def cmd_export(args) -> None:
 def build_parser() -> argparse.ArgumentParser:
 	ap = argparse.ArgumentParser(prog="outline.py", description="大纲原型：块、类型、链接、空间、提交、层")
 	ap.add_argument("--as", dest="actor", help="以谁的身份操作（默认取 OUTLINE_ACTOR，否则 agent:main）")
+	ap.add_argument("--by", dest="recorder", help="代记：协调者替别人记录时写自己的身份（也可用 OUTLINE_RECORDED_BY）")
 	sub = ap.add_subparsers(dest="cmd", required=True)
 
 	def p(name, fn, help_):
@@ -1727,6 +1735,7 @@ def build_parser() -> argparse.ArgumentParser:
 	s.add_argument("name")
 	s.add_argument("--creator")
 	s.add_argument("--label")
+	s.add_argument("--mode", choices=["focus", "steward"], help="focus：专注攻坚，不碰大纲；steward：协调者，替别人记账")
 
 	s = p("read", cmd_read, "读一棵子树")
 	s.add_argument("addr")
@@ -1861,6 +1870,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
 	args = build_parser().parse_args(argv)
+	if args.recorder:
+		os.environ["OUTLINE_RECORDED_BY"] = args.recorder
 	try:
 		args.fn(args)
 	except OutlineError as e:

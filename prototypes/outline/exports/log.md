@@ -1,7 +1,16 @@
-<!-- 由 prototypes/outline/outline.py export 生成（第 16 个提交）。真相源是 data/log.jsonl，不要手改。 -->
+<!-- 由 prototypes/outline/outline.py export 生成（第 25 个提交）。真相源是 data/log.jsonl，不要手改。 -->
 
 # 最近的提交
 
+- #25 2026-10-24T06:00 agent:main（代 human:owner）：任务 start p/SYEAKBsz
+- #24 2026-10-24T06:00 agent:main（代 human:owner）：派给专注 agent，要验收
+- #23 2026-10-24T06:00 agent:main（代 human:owner）：派给专注 agent，要验收
+- #22 2026-10-24T06:00 agent:main（代 human:owner）：登记参与者 agent:w-reflection
+- #21 2026-10-24T06:00 agent:main（代 human:owner）：登记参与者 agent:w-dialect
+- #20 2026-10-24T06:00 agent:main（代 human:owner）：登记参与者 agent:steward
+- #19 2026-10-24T06:00 agent:main（代 human:owner）：记下负责人的新要求：专注与协调
+- #18 2026-10-24T06:00 agent:main（代 human:owner）：任务 done p/RsN47wP2
+- #17 2026-10-24T06:00 agent:main（代 human:owner）：任务 start p/RsN47wP2
 - #16 2026-10-24T05:47 agent:main（代 human:owner）：新增 1 个条目
 - #15 2026-10-24T05:47 agent:main（代 human:owner）：更正锚点数量（15 → 13）
 - #14 2026-10-24T05:47 agent:main（代 human:owner）：任务 done p/dtLLZ8zT

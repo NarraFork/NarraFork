@@ -1,27 +1,23 @@
-<!-- 由 prototypes/outline/outline.py export 生成（第 16 个提交）。真相源是 data/log.jsonl，不要手改。 -->
+<!-- 由 prototypes/outline/outline.py export 生成（第 25 个提交）。真相源是 data/log.jsonl，不要手改。 -->
 
 # 任务看板
 
-### 待办（32）
+### 待办（28）
 - [p/G8CCrUUY] 「创建人」指 agent 的创建者，还是计划的创建者？ ‹Q1·执行：human:owner·#提问› ← 问题
 - [p/8NPAfqiW] D1 的例外改成「转成提议、不打断 agent」，可以吗？ ‹Q2·执行：human:owner·#提问› ← 问题
 - [p/t5G1F2nN] 代批授权：只能逐个计划授权，还是允许责任人设一个会话级默认值？ ‹Q3·执行：human:owner·#提问› ← 问题
 - [p/iGqfdydQ] 规划阶段默认只读（像现在的计划模式），还是默认宽松？ ‹Q4·执行：human:owner·#提问› ← 问题
 - [p/7XCKKkng] 主题页要不要标准结构（概述、职责、关键决策、坑、不变量、试过的方案），做成内置模板？ ‹Q5·执行：human:owner·#提问› ← 问题
-- [p/sxbH6X7b] 块内 markdown 方言支持哪些行内语法和块体？规范写法怎么定？ ‹Q6·#提问 #P0› ← 问题
 - [p/shELx7W7] 块选择模式与移动端手势的交互细节 ‹Q7·#提问 #P0› ← 问题
 - [p/uBFCt3q3] 超长页：占位节点按需替换够不够，还是只靠折叠与聚焦？以 P0 性能数据为准 ‹Q8·#提问 #P0› ← 问题
 - [p/OL2RTQbp] 知识库旧修订：迁移时只迁当前状态，旧修订只读保留多久？ ‹Q9·#提问 #P4› ← 问题
 - [p/3bxAuIFU] 标签：属性里的字符串数组，还是像 Obsidian 一样每个标签对应一页？ ‹Q10·#提问› ← 问题
 - [p/UMJvCvWQ] 一个需求跨多个仓库时，项目空间怎么对应多个 projects 行？ ‹Q11·#提问› ← 问题
 - [p/XzYozzQg] 探索组的对比视图要不要内置「方案 / 结果 / 代价」模板？ ‹Q12·#提问 #P4› ← 问题
-- [p/WxOgq9RU] 任务反思是否保留为可选的完成证据核查？ ‹Q13·#提问 #P2› ← 问题
 - [p/ciIOhsMN] 团队任务树什么时候放项目空间、什么时候放会话空间，要不要让用户选？ ‹Q14·#提问 #P2› ← 问题
 - [p/zNm6LqxY] 可领取池除了「自动领取默认关闭」，要不要按团队配置更多策略？ ‹Q15·#提问 #P2› ← 问题
 - [p/5gWCGnt3] agent 的在场信息在界面上怎么显示才不吵？ ‹Q16·#提问 #P1b› ← 问题
 - [p/sdn8PPim] 用原型推进剩下的决策，用的过程中把问题记到「原型发现」 ‹执行：agent:main› ← P-1
-- [p/RsN47wP2] 时间机器的 HTML 查看器：静态页，拖时间轴看大纲怎么变 ← P-1
-- [p/SYEAKBsz] 多 agent 试用：子代理领任务、写结果、提交验收，管理者代批 ← P-1
 - [p/eYUSIhDP] 把原型发现整理回设计文档 ← P-1
 - [p/ydKe7oMn] P0 设计与验证 ‹P0› ← 路线图
 - [p/gPDU0vgb] 大纲编辑器与实时协同原型，按设计文档 §7.8 的清单验收 ← P0
@@ -36,17 +32,21 @@
 - [p/pJciER7x] P4 层（提议、探索、记忆确认、Bot 隔离）与知识库迁移 ‹P4·等前置：P3› ← 路线图
 - [p/2Ywkt58i] P5 视图编辑器、图谱与图谱时间机器、模板、实体合并、只读导出 ‹P5·等前置：P4› ← 路线图
 
-### 进行中（2）
+### 进行中（5）
+- [p/sxbH6X7b] 块内 markdown 方言支持哪些行内语法和块体？规范写法怎么定？ ‹Q6·执行：agent:w-dialect·#提问 #P0› ← 问题
+- [p/WxOgq9RU] 任务反思是否保留为可选的完成证据核查？ ‹Q13·执行：agent:w-reflection·#提问 #P2› ← 问题
 - [p/H0a1nXuL] 大纲系统路线图：建成知识、记忆与任务的统一平台 ‹路线图›
 - [p/DrYdFrth] P-1 Python 原型与自用：先用原型承载这份计划，真实推进，从使用中发现问题 ‹P-1·执行：agent:main› ← 路线图
+- [p/SYEAKBsz] 多 agent 试用：子代理领任务、写结果、提交验收，管理者代批 ‹执行：agent:main› ← P-1
 
-### 完成（8）
+### 完成（9）
 - [p/vIkPD0xT] 真相源放哪里？ ‹执行：human:owner·#提问› ← 已回答
 - [p/Z50dD22z] 要不要多人实时协同编辑同一个块？ ‹执行：human:owner·#提问› ← 已回答
 - [p/8jNsS3fV] 每块一个编辑器可以吗？ ‹执行：human:owner·#提问› ← 已回答
 - [p/Q9jT9DZk] agent 能不能批准计划和变更？ ‹执行：human:owner·#提问› ← 已回答
 - [p/uHnUVJL1] 搭原型：块、链接、提交、时间机器、任务、两档计划、变更请求、断言与锚点 ‹执行：agent:main› ← P-1
 - [p/NVqKvrzA] 把这次的计划录进原型 ‹执行：agent:main› ← P-1
+- [p/RsN47wP2] 时间机器的 HTML 查看器：静态页，拖时间轴看大纲怎么变 ‹执行：agent:main› ← P-1
 - [p/dtLLZ8zT] 新鲜度检查对着最新的 main 跑一次（先 fetch） ‹执行：agent:main› ← P-1
 - [p/UV8qXrr2] 设计文档讨论稿 ← P0
 

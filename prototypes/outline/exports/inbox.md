@@ -1,4 +1,4 @@
-<!-- 由 prototypes/outline/outline.py export 生成（第 16 个提交）。真相源是 data/log.jsonl，不要手改。 -->
+<!-- 由 prototypes/outline/outline.py export 生成（第 25 个提交）。真相源是 data/log.jsonl，不要手改。 -->
 
 # 负责人的收件箱
 

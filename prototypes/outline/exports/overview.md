@@ -1,4 +1,4 @@
-<!-- 由 prototypes/outline/outline.py export 生成（第 16 个提交）。真相源是 data/log.jsonl，不要手改。 -->
+<!-- 由 prototypes/outline/outline.py export 生成（第 25 个提交）。真相源是 data/log.jsonl，不要手改。 -->
 
 # 大纲总览
 
@@ -34,6 +34,11 @@
     - [p/gUgKSWlV] 计划不再是一段 markdown ‹断言·采纳·#决策›
       ↳ 证据：chat:2026-10-24「总之应该不是现在这种一段md一个plan」
   - [p/4HXBJkws] D15 计划结项：系统分拣、agent 提炼进主题页；计划归档并钉在完成那一刻；用「出处」双向追溯 ‹D15·断言·假设·#决策 #待确认›
+  - [p/CZyp6nnF] D16 系统要支持派「没有什么约束」的专注 agent 集中攻坚，由遵循规则的协调 agent 帮它们记账、处理规则 ‹D16·断言·采纳·#决策›
+    ↳ 证据：chat:2026-10-24「这套系统需要支持派一些没有什么约束的子agent来集中精力攻坚，由遵循规则的agent来帮忙协调处理」
+    - [p/QSWtw144] 专注 agent 只拿到普通语言写的任务说明，不知道大纲、地址、角色和规则；它交一份报告就结束 ‹D16a·断言·假设·#决策 #待确认›
+    - [p/oYaXx3vw] 协调 agent 把报告翻译成大纲上的东西：状态、证据、结论、遗留、提议；以专注 agent 的身份代记，并留下自己的名字 ‹D16b·断言·假设·#决策 #待确认›
+    - [p/ZZkZIZOE] 「无约束」指不背大纲协议，不是不受安全约束：工具权限、行为边界照旧由系统强制 ‹D16c·断言·假设·#决策 #待确认›
 
 - [p/BUvPjg55] 现状：spec:// ‹现状spec›
   - [p/sqzCCSvC] 2026-10-23 对 main @ 7c5170d7 的盘点。每条结论都锚在代码上，main 变了就会存疑。
@@ -82,7 +87,7 @@
   - [p/t5G1F2nN] 代批授权：只能逐个计划授权，还是允许责任人设一个会话级默认值？ ‹Q3·任务·待办·执行：human:owner·#提问›
   - [p/iGqfdydQ] 规划阶段默认只读（像现在的计划模式），还是默认宽松？ ‹Q4·任务·待办·执行：human:owner·#提问›
   - [p/7XCKKkng] 主题页要不要标准结构（概述、职责、关键决策、坑、不变量、试过的方案），做成内置模板？ ‹Q5·任务·待办·执行：human:owner·#提问›
-  - [p/sxbH6X7b] 块内 markdown 方言支持哪些行内语法和块体？规范写法怎么定？ ‹Q6·任务·待办·#提问 #P0›
+  - [p/sxbH6X7b] 块内 markdown 方言支持哪些行内语法和块体？规范写法怎么定？ ‹Q6·任务·进行中·执行：agent:w-dialect·#提问 #P0›
     - [p/84a3O52n] 原型发现：表格要能做块体，见「原型发现」页
   - [p/shELx7W7] 块选择模式与移动端手势的交互细节 ‹Q7·任务·待办·#提问 #P0›
   - [p/uBFCt3q3] 超长页：占位节点按需替换够不够，还是只靠折叠与聚焦？以 P0 性能数据为准 ‹Q8·任务·待办·#提问 #P0›
@@ -90,7 +95,7 @@
   - [p/3bxAuIFU] 标签：属性里的字符串数组，还是像 Obsidian 一样每个标签对应一页？ ‹Q10·任务·待办·#提问›
   - [p/UMJvCvWQ] 一个需求跨多个仓库时，项目空间怎么对应多个 projects 行？ ‹Q11·任务·待办·#提问›
   - [p/XzYozzQg] 探索组的对比视图要不要内置「方案 / 结果 / 代价」模板？ ‹Q12·任务·待办·#提问 #P4›
-  - [p/WxOgq9RU] 任务反思是否保留为可选的完成证据核查？ ‹Q13·任务·待办·#提问 #P2›
+  - [p/WxOgq9RU] 任务反思是否保留为可选的完成证据核查？ ‹Q13·任务·进行中·执行：agent:w-reflection·#提问 #P2›
   - [p/ciIOhsMN] 团队任务树什么时候放项目空间、什么时候放会话空间，要不要让用户选？ ‹Q14·任务·待办·#提问 #P2›
   - [p/zNm6LqxY] 可领取池除了「自动领取默认关闭」，要不要按团队配置更多策略？ ‹Q15·任务·待办·#提问 #P2›
   - [p/5gWCGnt3] agent 的在场信息在界面上怎么显示才不吵？ ‹Q16·任务·待办·#提问 #P1b›
@@ -119,8 +124,9 @@
       ↳ 证据：file:prototypes/outline/exports/overview.md
     - [p/sdn8PPim] 用原型推进剩下的决策，用的过程中把问题记到「原型发现」 ‹任务·待办·执行：agent:main›
       ↳ 前置：p/NVqKvrzA
-    - [p/RsN47wP2] 时间机器的 HTML 查看器：静态页，拖时间轴看大纲怎么变 ‹任务·待办›
-    - [p/SYEAKBsz] 多 agent 试用：子代理领任务、写结果、提交验收，管理者代批 ‹任务·待办›
+    - [p/RsN47wP2] 时间机器的 HTML 查看器：静态页，拖时间轴看大纲怎么变 ‹任务·完成·执行：agent:main›
+      ↳ 证据：url:https://claude.ai/artifact/CioFZFhdnfL1uaay4v3qrT；file:prototypes/outline/viewer.html
+    - [p/SYEAKBsz] 多 agent 试用：子代理领任务、写结果、提交验收，管理者代批 ‹任务·进行中·执行：agent:main›
     - [p/dtLLZ8zT] 新鲜度检查对着最新的 main 跑一次（先 fetch） ‹任务·完成·执行：agent:main›
       ↳ 证据：tool:outline fresh --fetch @b256a9ef
       - [p/AbuH7dSE] 结果：main 从 7c5170d7 前进到 b256a9ef（60 个提交），13 处代码锚点全部新鲜
