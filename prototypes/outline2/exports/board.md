@@ -1,4 +1,4 @@
-<!-- 由 prototypes/outline2/outline.py export 生成（第 41 个提交）。真相源是 data/log.jsonl，不要手改。 -->
+<!-- 由 prototypes/outline2/outline.py export 生成（第 73 个提交）。真相源是 data/log.jsonl，不要手改。 -->
 
 # 任务看板
 
@@ -6,7 +6,7 @@
 - [p/H0a1nXuL] [/] 大纲系统路线图：建成知识、记忆与任务的统一平台
 - [p/DrYdFrth] [/] P-1 Python 原型与自用：先用原型承载这份计划，真实推进，从使用中发现问题 @agent:main ← 路线图
 
-### 待办（13）
+### 待办（18）
 - [p/ydKe7oMn] [ ] P0 设计与验证 ← 路线图
 - [p/bd2Egjgc] [ ] P1a 核心存储、大纲编辑器（先单人，建在协同协议上）、时间机器最小版、会话读权限 ‹等前置：P0› ← 路线图
 - [p/kDh2CgDg] [ ] P1b 多人实时协同：页订阅、页实时会话、在场信息、大纲事务、agent 的三方合并 ‹等前置：P1a› ← 路线图
@@ -20,8 +20,13 @@
 - [p/wBqGEPp7] [ ] db-worker 向量扫描基准 ← P0
 - [p/5QM1KHbG] [ ] agent 使用结构化编辑工具的实测：Python 原型已经覆盖了一部分 ← P0
 - [p/aTj0jdv3] [ ] 确认 D6–D15 的建议 ‹等前置：P-1› ← P0
+- [p/erXdou0A] [ ] 核实：公开分享链接能不能看到会话里注入的知识内容 ← 调研：知识库现在怎么检索、注入、
+- [p/12SC55ZX] [ ] 实测 compact、fork、回退时注入内容和 `knowledge_injection_events` 账本的表现（现在是读代码推断） ← 调研：知识库现在怎么检索、注入、
+- [p/lElgFPJW] [ ] 在 PG 后端上跑一遍检索和 ACL 的探针（这次只跑了 SQLite） ← 调研：知识库现在怎么检索、注入、
+- [p/CJUTlph7] [ ] 端到端验证两个推断：Task 派发的子代理初始 prompt 也会被扫；pass 重启时可能陆续注入超过 3 条 ← 调研：知识库现在怎么检索、注入、
+- [p/6yOuvxoQ] [ ] 把 SQL 谓词版 ACL 在大知识库上的性能放进 P0 基准 ← 调研：知识库现在怎么检索、注入、
 
-### 完成（11）
+### 完成（13）
 - [p/5nB0TYwk] [x] 核实：在 SpecMarkdownEditor 里编辑含表格的 spec 文件并保存，表格会不会丢；属实就给出修复方案（来自 Q6 调研的顺带发现 [[p/f3TO9Yre]]） @agent:w-table ‹待整理› ← 现状spec
 - [p/uHnUVJL1] [x] 搭原型：块、链接、提交、时间机器、任务、两档计划、变更请求、断言与锚点 @agent:main ← P-1
 - [p/NVqKvrzA] [x] 把这次的计划录进原型 @agent:main ← P-1
@@ -33,4 +38,6 @@
 - [p/8PsVaMVZ] [x] 第三轮：按第二版改原型（复选框任务、锁定、待确认、依据从运行记录挂接、代码锚点），重跑同类任务，对比协调成本、命令数和查帮助次数 @agent:main ‹待整理› ← P-1
 - [p/N5cdiUhM] [x] 调研：一个需求跨多个仓库时，会话、工作目录和项目现在怎么对应，多工作区以后该怎么对应 @agent:w-xrepo ← Q11
 - [p/lPnCUsBy] [x] 整理试跑：整理 agent（较便宜的模型）只看 `settle` 的输出，把 Q11 的调研整理进事实树 @agent:main ‹待整理› ← P-1
+- [p/ccBGXE4T] [x] 调研：知识库现在怎么检索、注入、过滤权限；换成大纲的混合检索和「相关知识」视图时，哪些行为要保留、哪些是缺陷 @agent:w-kb ← P3
+- [p/Vww0RyM1] [x] 第四轮：专注调研知识库检索与注入 → 派活的会话记摘要、提问、遗留 → 整理 agent 放进事实树 → 新起一个 agent 测找不找得到 @agent:main ‹待整理› ← P-1
 

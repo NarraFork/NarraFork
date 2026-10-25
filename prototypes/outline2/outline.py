@@ -1345,9 +1345,9 @@ def cmd_edit(args) -> None:
 			if status != "doing" and owner and owner != actor and b["props"].get("status") == "doing":
 				tx.note(f"提示：这个任务原来是 {owner} 在做，已替它改成「{STATUS_ZH[status]}」")
 			if status == "done" and is_agent(actor):
-				open_kids = [a for a in st.subtree(addr)[1:] if st.is_task(a) and not st.blocks[a]["deleted"] and st.blocks[a]["props"].get("status") in ("todo", "doing")]
+				open_kids = [a for a in st.subtree(addr)[1:] if st.is_task(a) and not st.blocks[a]["props"].get("question") and st.blocks[a]["props"].get("status") in ("todo", "doing")]
 				if open_kids:
-					tx.note(f"还有 {len(open_kids)} 个子任务没完成，整理时会列为遗留")
+					tx.note(f"还有 {len(open_kids)} 个子任务没完成，它们留在看板上")
 		if args.assign:
 			props["assignee"] = None if args.assign == "-" else args.assign
 		for kv in args.prop or []:
@@ -1661,7 +1661,7 @@ SETTLE_GUIDE = """怎么整理：
    - 还没有：加在最贴近的块下面，和兄弟块一样粗细，`add 父块 --md - --from {t}`；
    - 没有合适的页：新建一页，第一条子块写一两句概括（格式见 `add -h`）：
      add {space}/ --md - --from {t} --after 前一页
-5. 一个块的直接子块别超过 {dense} 个，多了就加一层归组（`mv`）。改了下层，看一眼上层的概括还对不对。
+5. 一个块的直接子块别超过 {dense} 个，多了就加一层归组（`mv`）。改了下层，看一眼上层的概括、同组的块还对不对，别互相矛盾。
 6. 试过不行、以后还会有人想到的方案，写一条「不用 X：原因」，放在相关的事实下面。
 7. 没做完的子任务不用管，它们还在看板上。
 8. 整理完：`settle {t} --done`（什么都不用搬也这样收尾）。`read {space}/` 可以看整个空间的顶层。"""
@@ -1688,6 +1688,10 @@ def destinations(st: State, t: str, limit: int = 6) -> list[str]:
 		shared = sorted(paths & {m[1] for m in mine})
 		if meet or shared or a in linked:
 			scored.append((3 * len(meet) + len(shared) + (2 if a in linked else 0), a, meet, shared))
+	if any(meet or a in linked for _, a, meet, _ in scored):
+		scored = [x for x in scored if x[2] or x[1] in linked]  # 只是同一个文件的多半无关，有更准的就不列
+	else:
+		limit = min(limit, 3)
 	out = []
 	for _, a, meet, shared in sorted(scored, key=lambda x: -x[0])[:limit]:
 		crumb = " › ".join(title_of(st.blocks[x])[:14] for x in reversed(st.ancestors(a)))
@@ -1738,7 +1742,7 @@ def cmd_settle(args) -> None:
 			for c in notes:
 				print("\n".join(render_block(st, c, None, 1, opened=budget_open(st, c, args.budget, False))))
 			for r in reports:
-				print("\n挂回的报告（只列到第二层，细节用 `read 地址`）：")
+				print(f"\n挂回的报告（只列到第二层；一节一节看用 `read 地址`，整份看用 `read {r} --budget 1000`）：")
 				print("\n".join(render_block(st, r, 2, 1)))
 			if subs:
 				print(f"\n子任务（{len(subs)} 个，各自整理）：")
@@ -2395,10 +2399,10 @@ def build_parser() -> argparse.ArgumentParser:
 	s.add_argument("b", type=int)
 	s = p("backlinks", cmd_backlinks, "反链")
 	s.add_argument("addr")
-	s = p("mv", cmd_mv, "移动块")
+	s = p("mv", cmd_mv, "移动块（连同子树）到新的父块下")
 	s.add_argument("addr")
-	s.add_argument("parent")
-	s.add_argument("--after")
+	s.add_argument("parent", help="新的父块，或 p/ 表示空间顶层")
+	s.add_argument("--after", help="插在这个块后面；不写就放到最后")
 	s.add_argument("-m", "--message")
 	s = p("rm", cmd_rm, "删除块及其子树")
 	s.add_argument("addr")
