@@ -1,4 +1,4 @@
-<!-- 由 prototypes/outline2/outline.py export 生成（第 33 个提交）。真相源是 data/log.jsonl，不要手改。 -->
+<!-- 由 prototypes/outline2/outline.py export 生成（第 34 个提交）。真相源是 data/log.jsonl，不要手改。 -->
 
 # 任务看板
 
@@ -22,14 +22,14 @@
 - [p/aTj0jdv3] [ ] 确认 D6–D15 的建议 ‹等前置：P-1› ← P0
 
 ### 完成（10）
-- [p/5nB0TYwk] [x] 核实：在 SpecMarkdownEditor 里编辑含表格的 spec 文件并保存，表格会不会丢；属实就给出修复方案（来自 Q6 调研的顺带发现 [[p/f3TO9Yre]]） @agent:w-table ← 现状spec
+- [p/5nB0TYwk] [x] 核实：在 SpecMarkdownEditor 里编辑含表格的 spec 文件并保存，表格会不会丢；属实就给出修复方案（来自 Q6 调研的顺带发现 [[p/f3TO9Yre]]） @agent:w-table ‹待整理› ← 现状spec
 - [p/uHnUVJL1] [x] 搭原型：块、链接、提交、时间机器、任务、两档计划、变更请求、断言与锚点 @agent:main ← P-1
 - [p/NVqKvrzA] [x] 把这次的计划录进原型 @agent:main ← P-1
 - [p/RsN47wP2] [x] 时间机器的 HTML 查看器：静态页，拖时间轴看大纲怎么变 @agent:main ← P-1
-- [p/SYEAKBsz] [x] 多 agent 试用：子代理领任务、写结果、提交验收，管理者代批 @agent:main ← P-1
-- [p/dtLLZ8zT] [x] 新鲜度检查对着最新的 main 跑一次（先 fetch） @agent:main ← P-1
+- [p/SYEAKBsz] [x] 多 agent 试用：子代理领任务、写结果、提交验收，管理者代批 @agent:main ‹待整理› ← P-1
+- [p/dtLLZ8zT] [x] 新鲜度检查对着最新的 main 跑一次（先 fetch） @agent:main ‹待整理› ← P-1
 - [p/eYUSIhDP] [x] 把原型发现整理回设计文档 @agent:main ← P-1
 - [p/UV8qXrr2] [x] 设计文档讨论稿 ← P0
-- [p/8PsVaMVZ] [x] 第三轮：按第二版改原型（复选框任务、锁定、待确认、依据从运行记录挂接、代码锚点），重跑同类任务，对比协调成本、命令数和查帮助次数 @agent:main ← P-1
-- [p/N5cdiUhM] [x] 调研：一个需求跨多个仓库时，会话、工作目录和项目现在怎么对应，多工作区以后该怎么对应 @agent:w-xrepo ← Q11
+- [p/8PsVaMVZ] [x] 第三轮：按第二版改原型（复选框任务、锁定、待确认、依据从运行记录挂接、代码锚点），重跑同类任务，对比协调成本、命令数和查帮助次数 @agent:main ‹待整理› ← P-1
+- [p/N5cdiUhM] [x] 调研：一个需求跨多个仓库时，会话、工作目录和项目现在怎么对应，多工作区以后该怎么对应 @agent:w-xrepo ‹待整理› ← Q11
 

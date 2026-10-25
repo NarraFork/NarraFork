@@ -1,4 +1,4 @@
-<!-- 由 prototypes/outline2/outline.py export 生成（第 33 个提交）。真相源是 data/log.jsonl，不要手改。 -->
+<!-- 由 prototypes/outline2/outline.py export 生成（第 34 个提交）。真相源是 data/log.jsonl，不要手改。 -->
 
 # 负责人的收件箱
 
@@ -27,7 +27,7 @@
     建议：先修四个现有缺口（不依赖新能力，也不等 PG）；改链接表时同步给 PG 建索引，不再让两个后端分叉。四个缺口（[[p/cYBhu6IP]]、[[p/3ec
   - Q40 项目建在仓库子目录、嵌套的独立仓库、子模块这几种边界情形：维持现状还是修？
     建议：修 worktree：按「同仓库同相对路径」映射回子目录项目；嵌套仓库和子模块维持现状，在文档里写明。worktree 这一种会让同一份代码在 check
-- 块内方言的细项：8 条，8 条有建议 → 全部采纳：`outline.py --as human:owner answer --bundle p/u0N4je9K`
+- 块内方言的细项：8 条，8 条有建议 → 全部采纳：`outline.py --as human:owner answer --tree p/u0N4je9K`
   - Q17 表格是否正式进块体？设计文档已把表格写进块体，但标着「表格待定」（§7.7）；单元格里能不能换行（docs 样本里唯一的
     建议：表格进块体，按方言草案的 GFM 写法；单元格只放行内内容、不换行，docs 里 12 处 `<br>` 迁移时改成「；」。编辑器用 prosemirro
   - Q18 提及 `[[…]]` 怎么写：存短 id 还是别名（人和 agent 都用别名，原型正文里存的就是别名，见 [[p/bB
@@ -44,7 +44,7 @@
     建议：最小转义，再做三个解析器的一致性模糊测试：以 `shared/` 里的 marked@18 分词器为准，只读渲染的 micromark 和 Tiptap 
   - Q24 标题级别用 1–6 还是 1–3？分隔线要不要做成块体（docs 样本里 `---` 有 135 处）？
     建议：标题 1–3 级。docs 样本里 h4 只有 18 个，层级本来就由大纲表达，迁移时 h4 及以下改成粗体段落。分隔线不做块体，迁移时丢掉，需要分组就用
-- 协作规则的默认值：5 条，5 条有建议 → 全部采纳：`outline.py --as human:owner answer --bundle p/TxVzefA3`
+- 协作规则的默认值：5 条，5 条有建议 → 全部采纳：`outline.py --as human:owner answer --tree p/TxVzefA3`
   - Q1 「创建人」指 agent 的创建者，还是计划的创建者？
     建议：指 agent 的创建者，也就是责任人链（§9.4）：后果落到派出这个 agent 的人身上。计划的作者另记为计划根的作者，计划被代批修改时通知他，但 a
   - Q2 D1 的例外改成「转成提议、不打断 agent」，可以吗？
@@ -55,7 +55,7 @@
     建议：默认宽松，只读作为可选。计划就是大纲里的任务子树，规划时本来就要写大纲、读代码、跑只读命令；要防的是规划阶段改代码，可以单独做成「规划时不改文件」的选项
   - Q5 主题页要不要标准结构（概述、职责、关键决策、坑、不变量、试过的方案），做成内置模板？
     建议：做成可选的内置模板（P5），不强制；提炼归位时，目标页有对应小节就放进小节，没有就放到页尾的「待整理」
-- SpecMarkdownEditor 丢内容：5 条，5 条有建议 → 全部采纳：`outline.py --as human:owner answer --bundle p/hLvWQ8rF`
+- SpecMarkdownEditor 丢内容：5 条，5 条有建议 → 全部采纳：`outline.py --as human:owner answer --tree p/hLvWQ8rF`
   - Q27 Spec 文件以什么方式编辑：继续以所见即所得为主（补上表格、任务列表、图片扩展，长期保留检测），还是改成源码优先、所见
     建议：源码优先、所见即所得可选（agent:w-table 报告的倾向）。agent 读写 spec 靠精确字符串匹配（Edit 的 old_string），所
   - Q28 检测到编辑器保不住的语法（表格、HTML、图片、任务列表、脚注、front matter）时怎么处理：禁止在所见即所得里
@@ -66,7 +66,7 @@
     建议：是。非 .md 路径（包括 behavior_fence）默认用源码模式：JSON、YAML 经所见即所得保存一次就不再合法；behavior_fence
   - Q31 数据恢复：要不要做 spec 的历史查看和恢复功能？要不要先离线排查一遍现有数据库里被 UI 保存吞掉表格的记录？
     建议：先写离线排查脚本，在后台跑、不进请求路径，找出 created_by 是 user、父 revision 含表格分隔行而本条不含的记录，把结果交给人看；历
-- 任务反思与 /goal：2 条，2 条有建议 → 全部采纳：`outline.py --as human:owner answer --bundle p/nYkmnrR7`
+- 任务反思与 /goal：2 条，2 条有建议 → 全部采纳：`outline.py --as human:owner answer --tree p/nYkmnrR7`
   - Q25 任务反思：采纳 Q13 的调研建议吗？建议是不改成可选，等 P2 补齐四个缺口后，把门禁、两个决策工具、`spec_pr
     建议：采纳调研建议（[[p/MwhYZUvK]]）：不改成可选，P2 补齐四个缺口后一起删。理由：没有找到它拦对过的记录，误拦和故障却有一串；它自己不能验证，只
   - Q26 `/goal` 建的任务默认按草稿还是按已批准处理？调研建议默认按已批准：`/goal` 是用户在说「务必完成」；按草稿
