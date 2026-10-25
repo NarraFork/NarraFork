@@ -205,6 +205,10 @@ function NarratorDetailPage() {
 	// First visit: register the tab on the server (once per narratorId)
 	useEffect(() => {
 		if (!narrator) return;
+		// An archived session must not be re-registered: archiving the one being viewed
+		// flips its status here, and re-running this effect would resurrect the tab that
+		// the archive just removed. Interacting auto-unarchives it, which re-registers.
+		if (narratorStatus === "archived") return;
 		if (isSubagent) {
 			if (
 				!shouldAddSubagentRecentTab({
