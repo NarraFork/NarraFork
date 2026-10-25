@@ -26,7 +26,7 @@ python3 outline.py edit <地址> --box x        # 勾复选框
 python3 outline.py ask <父> "问题" --option 甲 --option 乙 --recommend 1 --reason "…"
 ```
 
-地址可以写短 id（`p/Ab3dEf9Q` 或 `Ab3dEf9Q`）、别名（`Q17`）或标题。
+地址可以写短 id（`p/Ab3dEf9Q` 或 `Ab3dEf9Q`）、别名（`Q17`）或标题；`p/` 是整个空间的顶层。
 
 ## 写法
 

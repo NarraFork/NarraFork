@@ -1,4 +1,4 @@
-<!-- 由 prototypes/outline2/outline.py export 生成（第 34 个提交）。真相源是 data/log.jsonl，不要手改。 -->
+<!-- 由 prototypes/outline2/outline.py export 生成（第 41 个提交）。真相源是 data/log.jsonl，不要手改。 -->
 
 # 任务看板
 
@@ -7,13 +7,13 @@
 - [p/DrYdFrth] [/] P-1 Python 原型与自用：先用原型承载这份计划，真实推进，从使用中发现问题 @agent:main ← 路线图
 
 ### 待办（13）
-- [p/ydKe7oMn] [ ] P0 P0 设计与验证 ← 路线图
-- [p/bd2Egjgc] [ ] P1a P1a 核心存储、大纲编辑器（先单人，建在协同协议上）、时间机器最小版、会话读权限 ‹等前置：P0› ← 路线图
-- [p/kDh2CgDg] [ ] P1b P1b 多人实时协同：页订阅、页实时会话、在场信息、大纲事务、agent 的三方合并 ‹等前置：P1a› ← 路线图
-- [p/f7vElM5K] [ ] P2 P2 替换 spec://，落地多 agent 协作、两档计划与计划模式改造 ‹等前置：P1a› ← 路线图
-- [p/yxk3tBVg] [ ] P3 P3 检索（embedding、rerank、混合检索）、真值维护、计划结项 ‹等前置：P2› ← 路线图
-- [p/pJciER7x] [ ] P4 P4 层（提议、探索、记忆确认、Bot 隔离）与知识库迁移 ‹等前置：P3› ← 路线图
-- [p/2Ywkt58i] [ ] P5 P5 视图编辑器、图谱与图谱时间机器、模板、实体合并、只读导出 ‹等前置：P4› ← 路线图
+- [p/ydKe7oMn] [ ] P0 设计与验证 ← 路线图
+- [p/bd2Egjgc] [ ] P1a 核心存储、大纲编辑器（先单人，建在协同协议上）、时间机器最小版、会话读权限 ‹等前置：P0› ← 路线图
+- [p/kDh2CgDg] [ ] P1b 多人实时协同：页订阅、页实时会话、在场信息、大纲事务、agent 的三方合并 ‹等前置：P1a› ← 路线图
+- [p/f7vElM5K] [ ] P2 替换 spec://，落地多 agent 协作、两档计划与计划模式改造 ‹等前置：P1a› ← 路线图
+- [p/yxk3tBVg] [ ] P3 检索（embedding、rerank、混合检索）、真值维护、计划结项 ‹等前置：P2› ← 路线图
+- [p/pJciER7x] [ ] P4 层（提议、探索、记忆确认、Bot 隔离）与知识库迁移 ‹等前置：P3› ← 路线图
+- [p/2Ywkt58i] [ ] P5 视图编辑器、图谱与图谱时间机器、模板、实体合并、只读导出 ‹等前置：P4› ← 路线图
 - [p/sdn8PPim] [ ] 用原型推进剩下的决策，用的过程中把问题记到「原型发现」 @agent:main ← P-1
 - [p/gPDU0vgb] [ ] 大纲编辑器与实时协同原型，按设计文档 §7.8 的清单验收 ← P0
 - [p/BFv4Byng] [ ] 按时间点读取的性能基准（SQLite 与 PG） ← P0
@@ -21,7 +21,7 @@
 - [p/5QM1KHbG] [ ] agent 使用结构化编辑工具的实测：Python 原型已经覆盖了一部分 ← P0
 - [p/aTj0jdv3] [ ] 确认 D6–D15 的建议 ‹等前置：P-1› ← P0
 
-### 完成（10）
+### 完成（11）
 - [p/5nB0TYwk] [x] 核实：在 SpecMarkdownEditor 里编辑含表格的 spec 文件并保存，表格会不会丢；属实就给出修复方案（来自 Q6 调研的顺带发现 [[p/f3TO9Yre]]） @agent:w-table ‹待整理› ← 现状spec
 - [p/uHnUVJL1] [x] 搭原型：块、链接、提交、时间机器、任务、两档计划、变更请求、断言与锚点 @agent:main ← P-1
 - [p/NVqKvrzA] [x] 把这次的计划录进原型 @agent:main ← P-1
@@ -31,5 +31,6 @@
 - [p/eYUSIhDP] [x] 把原型发现整理回设计文档 @agent:main ← P-1
 - [p/UV8qXrr2] [x] 设计文档讨论稿 ← P0
 - [p/8PsVaMVZ] [x] 第三轮：按第二版改原型（复选框任务、锁定、待确认、依据从运行记录挂接、代码锚点），重跑同类任务，对比协调成本、命令数和查帮助次数 @agent:main ‹待整理› ← P-1
-- [p/N5cdiUhM] [x] 调研：一个需求跨多个仓库时，会话、工作目录和项目现在怎么对应，多工作区以后该怎么对应 @agent:w-xrepo ‹待整理› ← Q11
+- [p/N5cdiUhM] [x] 调研：一个需求跨多个仓库时，会话、工作目录和项目现在怎么对应，多工作区以后该怎么对应 @agent:w-xrepo ← Q11
+- [p/lPnCUsBy] [x] 整理试跑：整理 agent（较便宜的模型）只看 `settle` 的输出，把 Q11 的调研整理进事实树 @agent:main ‹待整理› ← P-1
 

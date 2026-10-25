@@ -1114,7 +1114,7 @@ def render_line(st: State, addr: str, detail: bool = False, facts: bool = False)
 	p = b["props"]
 	head, *rest = b["content"].split("\n") if b["content"] else [""]
 	box = f"[{BOX_OF.get(p.get('status', 'todo'), ' ')}] " if b["kind"] == "task" else ""
-	alias = f"{p['alias']} " if re.fullmatch(r"[A-Za-z]+\d+[a-z]?", p.get("alias") or "") else ""  # Q17、D5 这类编号才显示
+	alias = f"{p['alias']} " if re.fullmatch(r"[A-Za-z]+\d+[a-z]?", p.get("alias") or "") and not head.startswith(p["alias"] + " ") else ""  # Q17、D5 这类编号才显示，正文已经以它开头的不重复
 	who = f" @{p['assignee']}" if p.get("assignee") else ""
 	mk = marks(st, addr, detail, facts)
 	line = f"- [{addr}] {box}{alias}{head}{who}" + (f" ‹{'·'.join(mk)}›" if mk else "")
@@ -1131,16 +1131,18 @@ def view_kids(st: State, addr: str, facts: bool, seen: set) -> list[tuple[str, s
 	return out + [("child", c) for c in kids if not st.blocks[c]["props"].get("archived")]
 
 
-def budget_open(st: State, root: str, budget: int, facts: bool) -> set[str]:
-	"""按预算逐层展开：先放满一层，再放下一层；放不下的折起来（§3.1）。返回要展开的块。"""
-	opened, used, level, seen = {root}, 1, [root], {root}
+def budget_open(st: State, roots: str | list[str], budget: int, facts: bool) -> set[str]:
+	"""按预算逐层展开：先放满一层，再放下一层；放不下的折起来（§3.1）。返回要展开的块。
+	只有一个根时，根总是展开（子块太多时由 render_block 的 limit 截断）。"""
+	roots = [roots] if isinstance(roots, str) else roots
+	opened, used, level, seen = set(), len(roots), list(roots), set(roots)
 	while level:
 		nxt = []
 		for a in level:
 			kids = [t for _, t in view_kids(st, a, facts, seen)]
 			if not kids:
 				continue
-			if a != root and used + len(kids) > budget:
+			if not (len(roots) == 1 and a == roots[0]) and used + len(kids) > budget:
 				return opened
 			opened.add(a)
 			used += len(kids)
@@ -1205,9 +1207,23 @@ def parent_and_space(st: State, ref: str) -> tuple[str, str | None]:
 	return st.blocks[addr]["space"], addr
 
 
+def basis_label(st: State, lk: dict) -> str:
+	t, d = lk["target"], lk["data"]
+	if t.startswith("trace:"):
+		return f"运行记录 #{t.rsplit('#', 1)[-1]}：{d.get('tool', '')} {first_line(d.get('target', ''), 90)}"
+	if t.startswith("code:"):
+		return f"代码 {t[5:]}" + (f"（第 {d['lines']} 行）" if "#" in t and d.get("lines") else "")
+	if t in st.blocks:
+		return f"[{t}] {title_of(st.blocks[t])[:50]}"
+	return t
+
+
 def cmd_read(args) -> None:
 	st = load_state(args.as_of)
-	addr = resolve(st, args.addr)
+	ref = args.addr.strip()
+	if ref.rstrip("/") in st.spaces and (ref.endswith("/") or ref not in {b["content"] for b in st.blocks.values()}):
+		return read_space(st, ref.rstrip("/"), args)
+	addr = resolve(st, ref)
 	anc = st.ancestors(addr)
 	if anc:
 		print("位置：" + " › ".join(title_of(st.blocks[a])[:40] for a in reversed(anc)))
@@ -1219,11 +1235,31 @@ def cmd_read(args) -> None:
 	if args.basis:
 		for a in shown(lines):
 			for lk in st.links_from(a, "basis"):
-				lines.append(f"    · {a} 的依据：{lk['target']}" + (f"（{first_line(lk['data'].get('excerpt', ''), 60)}）" if lk["data"].get("excerpt") else ""))
+				lines.append(f"    · {a} 的依据：{basis_label(st, lk)}")
+			for lk in st.links_from(a, "source"):
+				lines.append(f"    · {a} 的出处：[{lk['target']}] {title_of(st.blocks[lk['target']])[:50] if lk['target'] in st.blocks else ''}")
 	print("\n".join(lines))
 	hidden = hidden_process(st, addr) if facts else 0
 	if hidden:
 		print(f"（这里只列事实；任务和它们下面的 {hidden} 块没列出，加 --all 一起看）")
+	if args.as_of is None:
+		record_reads(actor_of(args), st, shown(lines))
+
+
+def read_space(st: State, space: str, args) -> None:
+	"""读整个空间：顶层页按顺序列出，再按预算往下展开。"""
+	if args.as_of is not None:
+		print(f"（时间机器：第 {args.as_of} 个提交时的样子）")
+	facts = not args.all
+	pages = [a for a in st.children(f"{space}/") if not st.blocks[a]["props"].get("archived")]
+	roots = [a for a in pages if not (facts and is_process(st, a))]
+	opened = budget_open(st, roots, args.budget, facts) if args.depth is None else None
+	lines = [f"## {space} · {st.spaces[space]['title']}"]
+	for r in roots:
+		lines += render_block(st, r, args.depth, facts=facts, opened=opened)
+	print("\n".join(lines))
+	if len(roots) < len(pages):
+		print(f"（这里只列事实；另有 {len(pages) - len(roots)} 页本身是任务，加 --all 一起看）")
 	if args.as_of is None:
 		record_reads(actor_of(args), st, shown(lines))
 
@@ -1262,7 +1298,7 @@ def cmd_add(args) -> None:
 		finish(tx)
 	if not tx.divert:
 		for a in created:
-			print(f"+ {a}\t{title_of(tx.st.blocks[a])[:60]}")
+			print(f"+ {a}\t{first_line(tx.st.blocks[a]['content'], 100)}")
 		lks = [lk for a in created for lk in tx.st.links_from(a, "basis")]
 		if lks:
 			n_code = sum(1 for lk in lks if lk["target"].startswith("code:"))
@@ -1617,16 +1653,18 @@ def cmd_decide(args) -> None:
 
 
 SETTLE_GUIDE = """怎么整理：
-1. 只挑以后还用得到、站得住的结论；只对这次任务有意义的过程、拿不准的，不搬。
-2. 写成脱离这次任务也读得懂的现在时陈述，代码位置照写。决定写成现行规则，带一句理由。
-3. 先找它该在的地方：
+1. 只挑以后还用得到、站得住的结论。只对这次任务有意义的过程、还没拍板的建议，不搬；标了「推断」的可以搬，留着「推断」二字。
+2. 不用逐条回仓库核对：笔记的依据已经挂在运行记录上。只有说法互相矛盾、或者内容只在报告里出现时，才去看代码。
+3. 写成脱离这次任务也读得懂的现在时陈述，代码位置照写成完整路径。决定写成现行规则，带一句理由。
+4. 先找它该在的地方：
    - 事实树里已经有这件事：改写那一块，`edit 地址 "新正文" --from {t}`，旧说法留在历史里；
    - 还没有：加在最贴近的块下面，和兄弟块一样粗细，`add 父块 --md - --from {t}`；
-   - 没有合适的页：新建一页，`add {space}/ --md - --from {t}`，第一行写标题，紧接着的子块写一两句概括。
-4. 一个块的直接子块别超过 {dense} 个，多了就加一层归组（`mv`）。改了下层，看一眼上层的概括还对不对。
-5. 试过不行、以后还会有人想到的方案，写一条「不用 X：原因」，放在相关的事实下面。
-6. 没做完的子任务不用管，它们还在看板上。
-7. 整理完：`settle {t} --done`（什么都不用搬也这样收尾）。"""
+   - 没有合适的页：新建一页，第一条子块写一两句概括（格式见 `add -h`）：
+     add {space}/ --md - --from {t} --after 前一页
+5. 一个块的直接子块别超过 {dense} 个，多了就加一层归组（`mv`）。改了下层，看一眼上层的概括还对不对。
+6. 试过不行、以后还会有人想到的方案，写一条「不用 X：原因」，放在相关的事实下面。
+7. 没做完的子任务不用管，它们还在看板上。
+8. 整理完：`settle {t} --done`（什么都不用搬也这样收尾）。`read {space}/` 可以看整个空间的顶层。"""
 
 
 def settle_queue(st: State) -> tuple[list[str], list[str]]:
@@ -1638,19 +1676,22 @@ def settle_queue(st: State) -> tuple[list[str], list[str]]:
 def destinations(st: State, t: str, limit: int = 6) -> list[str]:
 	"""事实树里可能的去处：和任务的笔记碰到同一批文件的块，以及笔记链接到的事实。"""
 	notes = [a for a in st.subtree(t)[1:] if not st.is_task(a)]
-	paths = {sp[1] for a in notes for sp in anchor_spans(st, a)}
+	spans = [sp for a in notes for sp in anchor_spans(st, a)]
+	paths = {sp[1] for sp in spans}
 	linked = {lk["target"] for a in notes for lk in st.links_from(a) if lk["kind"] in ("link", "embed") and lk["target"] in st.blocks}
 	scored = []
 	for a, b in st.blocks.items():
 		if b["deleted"] or is_process(st, a) or b["props"].get("invalid"):
 			continue
-		shared = paths & {sp[1] for sp in anchor_spans(st, a)}
-		if shared or a in linked:
-			scored.append((len(shared) + (2 if a in linked else 0), a, shared))
+		mine = anchor_spans(st, a)
+		meet = sorted({m[0][5:] for m in mine if any(spans_meet(m, sp) for sp in spans)})
+		shared = sorted(paths & {m[1] for m in mine})
+		if meet or shared or a in linked:
+			scored.append((3 * len(meet) + len(shared) + (2 if a in linked else 0), a, meet, shared))
 	out = []
-	for _, a, shared in sorted(scored, key=lambda x: -x[0])[:limit]:
+	for _, a, meet, shared in sorted(scored, key=lambda x: -x[0])[:limit]:
 		crumb = " › ".join(title_of(st.blocks[x])[:14] for x in reversed(st.ancestors(a)))
-		why = f"都碰到 {len(shared)} 个文件" if shared else "笔记里链接到它"
+		why = ("讲的是同一段代码：" + "、".join(meet[:2])) if meet else ("只是同一个文件：" + "、".join(shared[:2])) if shared else "笔记里链接到它"
 		out.append(f"- [{a}] {title_of(st.blocks[a])[:60]}（{why}；在：{crumb or '页'}）")
 	return out
 
@@ -2273,13 +2314,26 @@ def cmd_export(args) -> None:
 # ---------------------------------------------------------------------------
 
 
+ADD_EPILOG = """大纲格式（--md）：
+  - 每个「- 」开头的列表项是一个块；缩进两个空格，就是上一项的子块
+  - 「- [ ] 」开头是任务（[/] 进行中、[x] 完成、[-] 取消）；@agent:x 是指派
+  - 任务下一行可以写 键:: 值（depends、due、alias、tags）
+  - 提到代码就写位置：path:12、path:12-30 或 path#符号
+例：在空间顶层新建一页，第一条子块写概括
+  python3 outline.py add p/ --md - <<'EOF'
+  - 页的标题
+    - 一两句概括
+    - 一条事实（`server/x.ts:10-20`）
+  EOF"""
+
+
 def build_parser() -> argparse.ArgumentParser:
 	ap = argparse.ArgumentParser(prog="outline.py", description="大纲原型第二版：块、任务、依据、空间、历史、待确认")
 	ap.add_argument("--as", dest="actor", help="以谁的身份（默认取 OUTLINE_ACTOR）")
 	sub = ap.add_subparsers(dest="cmd", required=True)
 
-	def p(name, fn, help_):
-		sp = sub.add_parser(name, help=help_)
+	def p(name, fn, help_, **kw):
+		sp = sub.add_parser(name, help=help_, description=help_, **kw)
 		sp.set_defaults(fn=fn)
 		return sp
 
@@ -2294,7 +2348,7 @@ def build_parser() -> argparse.ArgumentParser:
 	s.add_argument("query", nargs="+")
 	s.add_argument("--include", help="invalid,archived")
 	s.add_argument("--limit", type=int, default=12)
-	s = p("add", cmd_add, "用 markdown 大纲写：列表项是块，- [ ] 是任务，下一行写 键:: 值")
+	s = p("add", cmd_add, "用 markdown 大纲写：列表项是块，- [ ] 是任务，下一行写 键:: 值", epilog=ADD_EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
 	s.add_argument("parent", help="父块，或 p/ 表示在空间顶层新建页")
 	s.add_argument("text", nargs="?")
 	s.add_argument("--md", help="从文件读大纲；- 表示标准输入")
