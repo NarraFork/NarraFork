@@ -139,6 +139,9 @@ button[aria-pressed="true"] { background: var(--accent-soft); border-color: var(
 .chip.stance-accepted { color: var(--add); border-color: var(--add); }
 .chip.stance-refuted { color: var(--del); border-color: var(--del); }
 .chip.approved { color: var(--human); border-color: var(--human); }
+.chip.live { color: var(--accent); border-color: var(--accent); background: var(--accent-soft); }
+.tick.proc { opacity: 0.18; height: 6px !important; }
+.fold { color: var(--muted); font-size: 12px; padding: 1px 0 3px 40px; }
 .links { font-size: 12px; color: var(--muted); overflow-wrap: anywhere; }
 .kids { margin-left: 18px; border-left: 1px solid var(--line); padding-left: 4px; }
 .detail { padding: 12px 14px; display: grid; gap: 10px; }
@@ -179,11 +182,12 @@ input[type="range"] { width: 100%; accent-color: var(--accent); margin: 0; }
 <div class="wrap">
 	<header>
 		<h1>大纲时间机器（第二版）</h1>
-		<p class="sub">拖动底部的时间轴，看大纲在每一个提交时的样子。高亮的是这一步（或从对照点到现在）发生的变化。</p>
+		<p class="sub">拖动底部的时间轴，看大纲在每一个提交时的样子。高亮的是这一步（或从对照点到现在）发生的变化。默认只看事实：任务和它下面的内容是过程，收成事实上的「进行中」标记；时间轴也只走改到事实的提交。</p>
 		<div class="stats" id="stats"></div>
 		<div class="controls">
 			<label for="space">空间 <select id="space"></select></label>
 			<label for="page">页 <select id="page"></select></label>
+			<button type="button" id="factsOnly" aria-pressed="true">只看事实</button>
 			<button type="button" id="onlyChanged" aria-pressed="false">只看有变化的分支</button>
 			<button type="button" id="showDeleted" aria-pressed="false">显示已删除</button>
 			<button type="button" id="expandAll">全部展开</button>
@@ -263,7 +267,7 @@ function apply(st, op, seq, actor) {
 		case "block.move": if (b) { b.parent = op.parent || null; b.order = op.order; b.version = seq; } break;
 		case "block.delete": if (b) { b.deleted = true; b.version = seq; } break;
 		case "block.restore": if (b) { b.deleted = false; b.version = seq; } break;
-		case "link.add": st.links[op.id] = { from: op.from, role: op.kind || op.role, target: op.target }; break;
+		case "link.add": st.links[op.id] = { from: op.from, role: op.kind || op.role, target: op.target, data: op.data || {} }; break;
 		case "link.remove": if (st.links[op.id]) st.links[op.id].removed = true; break;
 		case "lock.set": st.locks[op.root] = { locker: op.locker, seq }; break;
 		case "lock.clear": delete st.locks[op.root]; break;
@@ -285,10 +289,96 @@ function stateAt(seq) {
 	return st;
 }
 
+function cached(st, key, fn) {
+	if (!st.memo) st.memo = new Map();
+	if (!st.memo.has(key)) st.memo.set(key, fn());
+	return st.memo.get(key);
+}
+
 function childrenOf(st, key, showDeleted) {
-	return Object.values(st.blocks)
-		.filter((b) => (b.parent || b.space + "/") === key && (showDeleted || !b.deleted))
-		.sort((a, b) => a.order - b.order);
+	const idx = cached(st, "kids", () => {
+		const m = new Map();
+		for (const b of Object.values(st.blocks)) {
+			const k = b.parent || b.space + "/";
+			if (!m.has(k)) m.set(k, []);
+			m.get(k).push(b);
+		}
+		for (const list of m.values()) list.sort((a, b) => a.order - b.order);
+		return m;
+	});
+	return (idx.get(key) || []).filter((b) => showDeleted || !b.deleted);
+}
+
+// 事实与过程（设计文档 §2.1）：任务和它下面的块是过程，其余是事实；不另存，由位置推出来
+function taskOf(st, addr) {
+	return cached(st, "t:" + addr, () => {
+		for (let a = addr; a && st.blocks[a]; a = st.blocks[a].parent) if (st.blocks[a].kind === "task") return a;
+		return null;
+	});
+}
+function isProcess(st, addr) {
+	const b = st.blocks[addr];
+	return (st.spaces[b.space] || {}).kind === "session" || taskOf(st, addr) !== null;
+}
+function subtreeOf(st, addr) {
+	const out = [addr];
+	for (const k of childrenOf(st, addr, false)) out.push(...subtreeOf(st, k.addr));
+	return out;
+}
+function unsettled(st, t) {
+	const b = st.blocks[t];
+	if (b.kind !== "task" || b.deleted || !["done", "cancelled"].includes(b.props.status)) return false;
+	const since = b.props.settled || 0;
+	return subtreeOf(st, t).slice(1).some((a) => st.blocks[a].kind !== "task" && taskOf(st, a) === t && st.blocks[a].version > since);
+}
+function live(st, t) {
+	return cached(st, "live:" + t, () => ["todo", "doing", undefined].includes(st.blocks[t].props.status) || unsettled(st, t));
+}
+function spansOf(st, addr) {
+	return cached(st, "sp:" + addr, () => Object.values(st.links)
+		.filter((l) => !l.removed && l.from === addr && l.role === "basis" && String(l.target).startsWith("code:"))
+		.map((l) => {
+			const [lo, hi] = String((l.data || {}).lines || "").split("-").map(Number);
+			return { target: l.target, path: l.target.slice(5).split(/#|:(?=\d)/)[0], lo: lo || 0, hi: hi || lo || 0 };
+		}));
+}
+function liveSpans(st) {
+	return cached(st, "liveSpans", () => {
+		const out = [];
+		for (const b of Object.values(st.blocks)) {
+			if (b.deleted || b.kind === "task") continue;
+			const t = taskOf(st, b.addr);
+			if (t && live(st, t)) for (const sp of spansOf(st, b.addr)) out.push([sp, t]);
+		}
+		return out;
+	});
+}
+function liveAround(st, addr) {
+	// 挂在它下面的任务、笔记碰到同一段代码的任务、它等确认的改动；只链接到它的不算
+	const out = childrenOf(st, addr, false).filter((k) => k.kind === "task" && live(st, k.addr)).map((k) => k.addr);
+	const mine = spansOf(st, addr);
+	if (mine.length) for (const [sp, t] of liveSpans(st)) {
+		if (out.includes(t)) continue;
+		if (mine.some((m) => m.target === sp.target || (m.path === sp.path && m.lo && sp.lo && m.lo <= sp.hi && sp.lo <= m.hi))) out.push(t);
+	}
+	for (const [id, x] of Object.entries(st.pending)) if (x.status === "pending" && x.ops.some((o) => o.addr === addr)) out.push(id);
+	return out;
+}
+function viewKids(st, addr) {
+	const kids = childrenOf(st, addr, ui.showDeleted);
+	if (!ui.factsOnly || isProcess(st, addr)) return kids;
+	return kids.filter((k) => !isProcess(st, k.addr) && !k.props.invalid);
+}
+function touchesFacts(c) {
+	// 这个提交有没有改到事实：按提交前后两个时刻各判断一次
+	return cached(stateAt(c.seq), "touch", () => {
+		const after = stateAt(c.seq);
+		const before = stateAt(c.seq - 1);
+		return c.ops.some((op) => {
+			const addrs = [op.addr, op.from, op.parent].filter(Boolean);
+			return addrs.some((a) => (after.blocks[a] && !isProcess(after, a)) || (before.blocks[a] && !isProcess(before, a)));
+		});
+	});
 }
 
 function diffOf(base, cur, addr) {
@@ -318,14 +408,17 @@ function chipsFor(st, b) {
 	}
 	if (p.question) out.push(["", "问"]);
 	if (p.rec) out.push(["", p.adopted ? "建议（已采纳）" : "建议"]);
-	if (p.bundle) out.push(["", "决策包"]);
+	if (b.kind === "task" && unsettled(st, b.addr)) out.push(["st-blocked", "待整理"]);
 	if (p.report) out.push(["", "报告"]);
 	if (p.invalid) out.push(["stance-refuted", "不成立"]);
 	if (st.locks[b.addr]) out.push(["approved", "锁定：" + st.locks[b.addr].locker]);
 	if (st.traces[b.addr]) out.push(["", "运行记录 " + st.traces[b.addr].calls + " 次调用"]);
 	if (p.archived) out.push(["", "归档"]);
 	const pending = Object.entries(st.pending).filter(([, x]) => x.status === "pending" && x.ops.some((o) => o.addr === b.addr)).map(([id]) => id);
-	if (pending.length) out.push(["st-blocked", "等确认：" + pending.join(",")]);
+	if (ui.factsOnly && !isProcess(st, b.addr)) {
+		const around = liveAround(st, b.addr).map((x) => (st.blocks[x] && st.blocks[x].props.alias) || x);
+		if (around.length) out.push(["live", "进行中：" + around.slice(0, 3).join("、") + (around.length > 3 ? " 等 " + around.length + " 项" : "")]);
+	} else if (pending.length) out.push(["st-blocked", "等确认：" + pending.join(",")]);
 	return out;
 }
 
@@ -339,7 +432,32 @@ function linksFor(st, addr) {
 	return Object.entries(by).map(([r, ts]) => r + "：" + ts.join("；")).join("　");
 }
 
-const ui = { seq: commits.length ? commits[commits.length - 1].seq : 0, base: null, space: "p", page: "", onlyChanged: false, showDeleted: false, collapsed: new Set(), playing: null };
+const ui = { seq: commits.length ? commits[commits.length - 1].seq : 0, base: null, space: "p", page: "", onlyChanged: false, showDeleted: false, factsOnly: true, collapsed: new Set(), touched: new Set(), playing: null };
+const BUDGET = 120; // 默认按这么多块逐层展开：先放满一层，再放下一层（§3.1）
+
+function budgetCollapse(st, roots) {
+	// 用户点过的保持原样；其余按预算决定折不折
+	const open = new Set(roots.map((r) => r.addr));
+	let used = roots.length;
+	let level = roots.map((r) => r.addr);
+	while (level.length) {
+		const next = [];
+		for (const a of level) {
+			const kids = viewKids(st, a);
+			if (!kids.length) continue;
+			if (used + kids.length > BUDGET && !roots.some((r) => r.addr === a)) { level = []; next.length = 0; break; }
+			open.add(a);
+			used += kids.length;
+			next.push(...kids.map((k) => k.addr));
+		}
+		level = next;
+	}
+	for (const b of Object.values(st.blocks)) {
+		if (ui.touched.has(b.addr)) continue;
+		if (open.has(b.addr)) ui.collapsed.delete(b.addr);
+		else ui.collapsed.add(b.addr);
+	}
+}
 
 function el(tag, cls, text) {
 	const n = document.createElement(tag);
@@ -361,12 +479,12 @@ function renderNode(cur, base, b, memo) {
 	const d = diffOf(base, cur, b.addr);
 	const row = el("div", "row" + (d ? " " + d : ""));
 	row.appendChild(el("span", "mark", { add: "+", chg: "~", del: "−", mov: "↷" }[d] || ""));
-	const kids = childrenOf(cur, b.addr, ui.showDeleted).filter((k) => !ui.onlyChanged || subtreeChanged(cur, base, k.addr, memo));
+	const kids = viewKids(cur, b.addr).filter((k) => !ui.onlyChanged || subtreeChanged(cur, base, k.addr, memo));
 	const tg = el("button", "toggle", kids.length ? (ui.collapsed.has(b.addr) ? "▸" : "▾") : "·");
 	tg.type = "button";
 	tg.disabled = !kids.length;
 	tg.setAttribute("aria-label", ui.collapsed.has(b.addr) ? "展开" : "折叠");
-	tg.addEventListener("click", () => { ui.collapsed.has(b.addr) ? ui.collapsed.delete(b.addr) : ui.collapsed.add(b.addr); render(); });
+	tg.addEventListener("click", () => { ui.touched.add(b.addr); ui.collapsed.has(b.addr) ? ui.collapsed.delete(b.addr) : ui.collapsed.add(b.addr); render(); });
 	row.appendChild(tg);
 	const body = el("div", "body");
 	const l1 = el("div", "line1");
@@ -379,7 +497,7 @@ function renderNode(cur, base, b, memo) {
 	l1.appendChild(el("span", "addr", b.addr));
 	body.appendChild(l1);
 	if (multi) body.appendChild(el("span", "text multi", b.content.split("\n").slice(1).join("\n")));
-	const lk = linksFor(cur, b.addr);
+	const lk = ui.factsOnly ? "" : linksFor(cur, b.addr); // 依据和出处是另一个维度：只看事实时不列
 	if (lk) body.appendChild(el("div", "links", "↳ " + lk));
 	row.appendChild(body);
 	node.appendChild(row);
@@ -456,7 +574,7 @@ function renderSelectors(cur) {
 	if (!spaces.find(([k]) => k === ui.space) && spaces.length) ui.space = spaces[0][0];
 	spaceSel.replaceChildren(...spaces.map(([k, v]) => { const o = el("option", "", k + " · " + v.title); o.value = k; o.selected = k === ui.space; return o; }));
 	const pageSel = $("page");
-	const roots = childrenOf(cur, ui.space + "/", ui.showDeleted);
+	const roots = childrenOf(cur, ui.space + "/", ui.showDeleted).filter((r) => !ui.factsOnly || !isProcess(cur, r.addr));
 	if (ui.page && !roots.find((r) => r.addr === ui.page)) ui.page = "";
 	const all = el("option", "", "全部页");
 	all.value = "";
@@ -480,6 +598,7 @@ function renderTicks() {
 	}
 	[...box.children].forEach((t, i) => {
 		const s = commits[i].seq;
+		t.classList.toggle("proc", ui.factsOnly && !touchesFacts(commits[i]));
 		t.classList.toggle("past", s <= ui.seq);
 		t.classList.toggle("cur", s === ui.seq);
 		t.classList.toggle("base", s === ui.base);
@@ -497,7 +616,9 @@ function render() {
 	tree.replaceChildren();
 	const memo = new Map();
 	let roots = childrenOf(cur, ui.space + "/", ui.showDeleted);
+	if (ui.factsOnly) roots = roots.filter((r) => !isProcess(cur, r.addr));
 	if (ui.page) roots = roots.filter((r) => r.addr === ui.page);
+	budgetCollapse(cur, roots);
 	if (ui.onlyChanged) roots = roots.filter((r) => subtreeChanged(cur, base, r.addr, memo));
 	$("treeTitle").textContent = "第 " + ui.seq + " 个提交时的大纲";
 	if (!roots.length) tree.appendChild(el("div", "empty", ui.onlyChanged ? "这一步在这个空间里没有变化" : "这个空间在这一刻还是空的"));
@@ -512,6 +633,13 @@ function render() {
 	$("pin").hidden = ui.base === ui.seq;
 	$("unpin").hidden = ui.base === null;
 	renderTicks();
+}
+
+function step(dir) {
+	// 只看事实时，单步跳过没改到事实的提交
+	let i = commits.findIndex((c) => c.seq === ui.seq) + dir;
+	while (ui.factsOnly && i > 0 && i < commits.length - 1 && !touchesFacts(commits[i])) i += dir;
+	if (i >= 0 && i < commits.length) go(commits[i].seq);
 }
 
 function go(seq) {
@@ -539,27 +667,28 @@ function init() {
 	seqInput.max = String(commits[commits.length - 1].seq);
 	seqInput.addEventListener("input", () => go(Number(seqInput.value)));
 	$("first").addEventListener("click", () => go(commits[0].seq));
-	$("prev").addEventListener("click", () => go(ui.seq - 1));
-	$("next").addEventListener("click", () => go(ui.seq + 1));
+	$("prev").addEventListener("click", () => step(-1));
+	$("next").addEventListener("click", () => step(1));
 	$("last").addEventListener("click", () => go(commits[commits.length - 1].seq));
 	$("play").addEventListener("click", () => {
 		if (ui.playing) return stopPlay();
 		if (ui.seq >= commits[commits.length - 1].seq) go(commits[0].seq);
 		$("play").textContent = "暂停";
 		$("play").setAttribute("aria-pressed", "true");
-		ui.playing = setInterval(() => { if (ui.seq >= commits[commits.length - 1].seq) return stopPlay(); go(ui.seq + 1); }, 800);
+		ui.playing = setInterval(() => { if (ui.seq >= commits[commits.length - 1].seq) return stopPlay(); step(1); }, 800);
 	});
 	$("pin").addEventListener("click", () => { ui.base = ui.seq; render(); });
 	$("unpin").addEventListener("click", () => { ui.base = null; render(); });
 	$("space").addEventListener("change", (e) => { ui.space = e.target.value; ui.page = ""; render(); });
 	$("page").addEventListener("change", (e) => { ui.page = e.target.value; render(); });
 	$("onlyChanged").addEventListener("click", (e) => { ui.onlyChanged = !ui.onlyChanged; e.target.setAttribute("aria-pressed", String(ui.onlyChanged)); render(); });
+	$("factsOnly").addEventListener("click", (e) => { ui.factsOnly = !ui.factsOnly; ui.touched.clear(); e.target.setAttribute("aria-pressed", String(ui.factsOnly)); render(); });
 	$("showDeleted").addEventListener("click", (e) => { ui.showDeleted = !ui.showDeleted; e.target.setAttribute("aria-pressed", String(ui.showDeleted)); render(); });
-	$("expandAll").addEventListener("click", () => { ui.collapsed.clear(); render(); });
+	$("expandAll").addEventListener("click", () => { ui.collapsed.clear(); for (const a of Object.keys(stateAt(ui.seq).blocks)) ui.touched.add(a); render(); });
 	document.addEventListener("keydown", (e) => {
 		if (e.target.closest && e.target.closest("select, input")) return;
-		if (e.key === "ArrowLeft") { go(ui.seq - 1); e.preventDefault(); }
-		if (e.key === "ArrowRight") { go(ui.seq + 1); e.preventDefault(); }
+		if (e.key === "ArrowLeft") { step(-1); e.preventDefault(); }
+		if (e.key === "ArrowRight") { step(1); e.preventDefault(); }
 		if (e.key === "Home") go(commits[0].seq);
 		if (e.key === "End") go(commits[commits.length - 1].seq);
 	});

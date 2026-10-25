@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""大纲原型第二版：按 docs/OUTLINE_KNOWLEDGE-DESIGN.md 第二版的六个概念实现，跑第三轮试用。
+"""大纲原型第二版：按 docs/OUTLINE_KNOWLEDGE-DESIGN.md 第二版的六个概念实现，跑第三轮起的试用。
 
 - 真相源是 data/log.jsonl：只追加的提交日志；状态由回放得到，时间机器就是回放到第 N 个提交。
 - 第一版（prototypes/outline/）的当前状态用 import-v1 导入成第一个提交，不带历史（设计文档 §8 的迁移方式）。
 - data/.local/ 是本地缓存（读取记录、锚点检查结果、命令统计），不入库。
+- 事实与过程不另存：任务和它下面的块是过程，其余是事实（§2.1）。读页默认只显示事实，按预算逐层展开。
 
 只用标准库。用法见同目录 README.md。
 """
@@ -42,6 +43,9 @@ LINK_ZH = {"link": "链接", "embed": "嵌入", "depends": "前置", "basis": "�
 PROP_KEYS = ("depends", "due", "alias", "tags")  # 大纲里 `键:: 值` 能写的键
 BULK = 50  # 一次删除或移动这么多别人写的已有块，转待确认
 BASIS_MAX = 5
+READ_BUDGET = 80  # read 不写 -d 时，按这么多块逐层展开（§3.1）
+DENSE = 15  # 整理时：一个块的直接子块超过这么多，就加一层归组（§4.7）
+STALE_EDITS = 3  # 直接子块自上次改动或核实以来变了这么多处，上层的概括要看一眼（§4.7）
 GIT_TIMEOUT = 15
 MAX_BYTES = 8 * 1024 * 1024
 SID_ALPHABET = string.ascii_letters + string.digits
@@ -71,6 +75,7 @@ class State:
 		self.traces: dict[str, dict] = {}
 		self.commits: list[dict] = []
 		self.seq = 0
+		self.memo: dict = {}  # 派生索引；任何操作都会清空
 
 	def children(self, key: str, include_deleted: bool = False) -> list[str]:
 		out = [a for a in self.kids.get(key, []) if include_deleted or not self.blocks[a]["deleted"]]
@@ -97,11 +102,21 @@ class State:
 		anc = self.ancestors(addr)
 		return anc[-1] if anc else addr
 
+	def _link_index(self, end: str) -> dict[str, list[dict]]:
+		key = ("links", end)
+		if key not in self.memo:
+			idx: dict[str, list[dict]] = {}
+			for lk in self.links.values():
+				if not lk.get("removed"):
+					idx.setdefault(lk[end], []).append(lk)
+			self.memo[key] = idx
+		return self.memo[key]
+
 	def links_from(self, addr: str, kind: str | None = None) -> list[dict]:
-		return [lk for lk in self.links.values() if lk["from"] == addr and not lk.get("removed") and (kind is None or lk["kind"] == kind)]
+		return [lk for lk in self._link_index("from").get(addr, []) if kind is None or lk["kind"] == kind]
 
 	def links_to(self, addr: str, kind: str | None = None) -> list[dict]:
-		return [lk for lk in self.links.values() if lk["target"] == addr and not lk.get("removed") and (kind is None or lk["kind"] == kind)]
+		return [lk for lk in self._link_index("target").get(addr, []) if kind is None or lk["kind"] == kind]
 
 	def lock_for(self, addr: str) -> tuple[str, dict] | None:
 		for a in [addr, *self.ancestors(addr)]:
@@ -133,6 +148,7 @@ class State:
 
 def apply_op(st: State, op: dict, seq: int, actor: str) -> None:
 	t = op["op"]
+	st.memo.clear()
 	if t == "space.create":
 		st.spaces[op["space"]] = {k: op.get(k) for k in ("kind", "title", "owner")}
 	elif t == "actor.register":
@@ -603,8 +619,8 @@ def evidence_owner(st: State, addr: str) -> str | None:
 	return None
 
 
-def sync_basis(tx: Tx, addr: str, fallback: bool = True) -> None:
-	"""按正文里的代码位置挂锚点；在有运行记录的任务下面，再对上那次运行里碰过这个文件的调用。"""
+def sync_basis(tx: Tx, addr: str, fallback: bool = True, source: str | None = None) -> None:
+	"""按正文里的代码位置挂锚点；在有运行记录的任务下面（或从这个任务整理出来的），再对上那次运行里读过这几行的调用。"""
 	st = tx.st
 	b = st.blocks[addr]
 	have = {lk["target"]: lk for lk in st.links_from(addr, "basis")}
@@ -618,7 +634,7 @@ def sync_basis(tx: Tx, addr: str, fallback: bool = True) -> None:
 		want[got[0]] = got[1]
 		lo, _, hi = got[1]["lines"].partition("-")
 		spans.append((path, l1 or int(lo), (l2 or l1) or int(hi or lo)))
-	owner = evidence_owner(st, addr)
+	owner = evidence_owner(st, source or addr)
 	if owner and owner in st.traces:
 		# 只挂真的读到过这几行的调用，读得越窄越优先
 		for path, a, z in spans:
@@ -630,7 +646,7 @@ def sync_basis(tx: Tx, addr: str, fallback: bool = True) -> None:
 			for _, _, c in sorted(cands)[:2]:
 				want[f"trace:{owner}#{c['n']}"] = {"excerpt": c["excerpt"], "tool": c["tool"], "target": c["target"][:120]}
 	in_report = any(st.blocks[x]["props"].get("report") for x in [addr, *st.ancestors(addr)])
-	rep = next((c for c in st.children(owner) if st.blocks[c]["props"].get("report")), None) if owner and not in_report else None
+	rep = next((c for c in st.children(owner) if st.blocks[c]["props"].get("report")), None) if owner and not in_report and not source else None
 	if rep and is_agent(tx.actor) and not any(lk["target"] == rep for lk in st.links_from(addr, "source")):
 		tx.push({"op": "link.add", "id": tx.link_id(), "from": addr, "kind": "source", "target": rep})  # 从报告整理出来的，出处指回报告
 	if not want and fallback and rep and is_agent(tx.actor):
@@ -657,7 +673,8 @@ def anchor_state(st: State, addr: str) -> str | None:
 
 
 def has_basis(st: State, addr: str) -> bool:
-	return bool(st.links_from(addr, "basis"))
+	"""整理进事实树的块，出处（指回任务）也算依据。"""
+	return bool(st.links_from(addr, "basis") or st.links_from(addr, "source"))
 
 
 # ---------------------------------------------------------------------------
@@ -815,7 +832,7 @@ def write_commit(tx: Tx) -> int:
 # 写入
 
 
-def create_items(tx: Tx, space: str, parent: str | None, items: list[dict], after: str | None = None, basis: bool = True) -> list[str]:
+def create_items(tx: Tx, space: str, parent: str | None, items: list[dict], after: str | None = None, basis: bool = True, source: str | None = None) -> list[str]:
 	st = tx.st
 	plan: list[tuple[dict, str, str | None]] = []
 	titles: dict[str, str] = {}
@@ -876,8 +893,10 @@ def create_items(tx: Tx, space: str, parent: str | None, items: list[dict], afte
 			except OutlineError as e:
 				raise OutlineError(f"前置 {ref}：{e}") from None
 			add_link(tx, addr, "depends", target)
+		if source:
+			add_link(tx, addr, "source", source)
 		if basis:
-			sync_basis(tx, addr)
+			sync_basis(tx, addr, source=source)
 	return [a for _, a, _ in plan]
 
 
@@ -948,7 +967,115 @@ def pending_on(st: State, addr: str) -> list[str]:
 	return [pid for pid, p in st.pending.items() if p["status"] == "pending" and any(o.get("addr") == addr for o in p["ops"])]
 
 
-def marks(st: State, addr: str, detail: bool = False) -> list[str]:
+# ---------------------------------------------------------------------------
+# 事实与过程（§2.1）：任务和它下面的块、会话空间里的一切是过程，其余是事实。不另存，由位置推出来
+
+
+def task_of(st: State, addr: str) -> str | None:
+	"""最近的任务（含自己）。"""
+	key = ("task_of", addr)
+	if key not in st.memo:
+		st.memo[key] = next((a for a in [addr, *st.ancestors(addr)] if st.is_task(a)), None)
+	return st.memo[key]
+
+
+def is_process(st: State, addr: str) -> bool:
+	return st.spaces.get(st.blocks[addr]["space"], {}).get("kind") == "session" or task_of(st, addr) is not None
+
+
+def own_notes(st: State, t: str) -> list[str]:
+	"""任务自己下面的笔记（不含子任务下面的，那些由子任务自己整理）。"""
+	return [a for a in st.subtree(t)[1:] if not st.is_task(a) and task_of(st, a) == t]
+
+
+def unsettled(st: State, t: str) -> bool:
+	"""完成或取消了、下面有还没整理的笔记（§4.7）。"""
+	b = st.blocks[t]
+	if b["kind"] != "task" or b["deleted"] or b["props"].get("status") not in ("done", "cancelled"):
+		return False
+	since = b["props"].get("settled") or 0
+	return any(st.blocks[a]["version"] > since for a in own_notes(st, t))
+
+
+def live(st: State, t: str) -> bool:
+	"""从事实这边看还在进行的任务：没完成，或者完成了还没整理。"""
+	return st.blocks[t]["props"].get("status", "todo") in ("todo", "doing") or unsettled(st, t)
+
+
+def anchor_spans(st: State, addr: str) -> list[tuple[str, str, int, int]]:
+	"""块的代码锚点：(锚点, 路径, 起行, 止行)；不知道行号的记 0。"""
+	out = []
+	for lk in st.links_from(addr, "basis"):
+		t = lk["target"]
+		if t.startswith("code:"):
+			path = re.split(r"#|:(?=\d)", t[5:], maxsplit=1)[0]
+			lo, _, hi = str(lk["data"].get("lines") or "").partition("-")
+			a = int(lo) if lo.isdigit() else 0
+			out.append((t, path, a, int(hi) if hi.isdigit() else a))
+	return out
+
+
+def spans_meet(x: tuple, y: tuple) -> bool:
+	return x[0] == y[0] or (x[1] == y[1] and bool(x[2] and y[2]) and x[2] <= y[3] and y[2] <= x[3])
+
+
+def live_spans(st: State) -> list[tuple[tuple, str]]:
+	"""还在进行的任务自己的笔记碰到的代码：(锚点, 任务)。"""
+	if "live_spans" not in st.memo:
+		out = []
+		for a, b in st.blocks.items():
+			if b["deleted"] or b["kind"] == "task":
+				continue
+			t = task_of(st, a)
+			if t and live(st, t):
+				out += [(sp, t) for sp in anchor_spans(st, a)]
+		st.memo["live_spans"] = out
+	return st.memo["live_spans"]
+
+
+def live_around(st: State, addr: str) -> list[str]:
+	"""事实周围还在进行的过程：挂在它下面的任务、笔记碰到同一段代码的任务、它等确认的改动。
+	只链接到它的不算：计划引用一条事实，多半是依赖它，不是要改它。"""
+	out = [c for c in st.children(addr) if st.is_task(c) and live(st, c)]
+	mine = anchor_spans(st, addr)
+	for sp, t in live_spans(st) if mine else []:
+		if t not in out and any(spans_meet(sp, m) for m in mine):
+			out.append(t)
+	return out + pending_on(st, addr)
+
+
+def child_events(st: State) -> dict[str, list[tuple[int, str]]]:
+	"""每个块的直接子块在哪些提交里变过：新增、改正文、移入移出、删除。"""
+	if "child_events" not in st.memo:
+		parent: dict[str, str | None] = {}
+		ev: dict[str, list[tuple[int, str]]] = {}
+		for c in st.commits:
+			for op in c["ops"]:
+				t, a = op["op"], op.get("addr")
+				if t == "block.create":
+					parent[a] = op.get("parent")
+					ev.setdefault(op.get("parent") or "", []).append((c["seq"], a))
+				elif t == "block.move":
+					ev.setdefault(parent.get(a) or "", []).append((c["seq"], a))
+					parent[a] = op.get("parent")
+					ev.setdefault(op.get("parent") or "", []).append((c["seq"], a))
+				elif (t == "block.update" and "content" in op) or t in ("block.delete", "block.restore"):
+					ev.setdefault(parent.get(a) or "", []).append((c["seq"], a))
+		st.memo["child_events"] = ev
+	return st.memo["child_events"]
+
+
+def stale_below(st: State, addr: str) -> int:
+	"""自这个块上次改动或核实以来，它的直接子块（事实）变了几处（§4.7「下层已变」）。"""
+	since = st.blocks[addr]["version"]
+	return len({a for seq, a in child_events(st).get(addr, []) if seq > since and a in st.blocks and st.blocks[a]["kind"] != "task"})
+
+
+def fact_kids(st: State, addr: str) -> list[str]:
+	return [c for c in st.children(addr) if not is_process(st, c) and not st.blocks[c]["props"].get("invalid")]
+
+
+def marks(st: State, addr: str, detail: bool = False, facts: bool = False) -> list[str]:
 	b = st.blocks[addr]
 	p = b["props"]
 	out = []
@@ -956,7 +1083,9 @@ def marks(st: State, addr: str, detail: bool = False) -> list[str]:
 		w = waiting_on(st, addr)
 		if w:
 			out.append("等前置：" + ",".join(st.blocks[x]["props"].get("alias") or title_of(st.blocks[x])[:12] for x in w))
-	if pending_on(st, addr):
+	if b["kind"] == "task" and unsettled(st, addr):
+		out.append("待整理")
+	if not facts and pending_on(st, addr):
 		out.append("等确认：" + ",".join(pending_on(st, addr)))
 	if p.get("invalid"):
 		out.append("不成立：" + p["invalid"][:30])
@@ -970,27 +1099,62 @@ def marks(st: State, addr: str, detail: bool = False) -> list[str]:
 	in_report = any(st.blocks[x]["props"].get("report") or st.blocks[x]["props"].get("attachment") for x in [addr, *st.ancestors(addr)])
 	if detail and b["kind"] != "task" and is_agent(b["author"]) and not has_basis(st, addr) and not in_report and not (p.get("question") or p.get("bundle") or p.get("answer")):
 		out.append("无依据")
+	if facts and not is_process(st, addr):
+		around = live_around(st, addr)
+		if around:
+			names = [x if x in st.pending else (st.blocks[x]["props"].get("alias") or x) for x in around]
+			out.append("进行中：" + "、".join(names[:3]) + (f" 等 {len(names)} 项" if len(names) > 3 else ""))
 	if b["deleted"]:
 		out.append("已删除")
 	return out
 
 
-def render_line(st: State, addr: str, detail: bool = False) -> str:
+def render_line(st: State, addr: str, detail: bool = False, facts: bool = False) -> str:
 	b = st.blocks[addr]
 	p = b["props"]
 	head, *rest = b["content"].split("\n") if b["content"] else [""]
 	box = f"[{BOX_OF.get(p.get('status', 'todo'), ' ')}] " if b["kind"] == "task" else ""
 	alias = f"{p['alias']} " if re.fullmatch(r"[A-Za-z]+\d+[a-z]?", p.get("alias") or "") else ""  # Q17、D5 这类编号才显示
 	who = f" @{p['assignee']}" if p.get("assignee") else ""
-	mk = marks(st, addr, detail)
+	mk = marks(st, addr, detail, facts)
 	line = f"- [{addr}] {box}{alias}{head}{who}" + (f" ‹{'·'.join(mk)}›" if mk else "")
 	return "\n".join([line, *[f"  {r}" for r in rest]])
 
 
-def render_block(st: State, addr: str, depth: int, indent: int = 0, embeds: bool = True, seen=None) -> list[str]:
+def view_kids(st: State, addr: str, facts: bool, seen: set) -> list[tuple[str, str]]:
+	"""视图里一个块下面的东西：先是它嵌入的块，再是子块。事实视图里不列过程和不成立的块。"""
+	out = []
+	for kind, target in inline_targets(st, st.blocks[addr]["content"], None, st.blocks[addr]["space"])[0]:
+		if kind == "embed" and target in st.blocks and target not in seen and not st.blocks[target]["deleted"]:
+			out.append(("embed", target))
+	kids = fact_kids(st, addr) if facts and not is_process(st, addr) else st.children(addr)
+	return out + [("child", c) for c in kids if not st.blocks[c]["props"].get("archived")]
+
+
+def budget_open(st: State, root: str, budget: int, facts: bool) -> set[str]:
+	"""按预算逐层展开：先放满一层，再放下一层；放不下的折起来（§3.1）。返回要展开的块。"""
+	opened, used, level, seen = {root}, 1, [root], {root}
+	while level:
+		nxt = []
+		for a in level:
+			kids = [t for _, t in view_kids(st, a, facts, seen)]
+			if not kids:
+				continue
+			if a != root and used + len(kids) > budget:
+				return opened
+			opened.add(a)
+			used += len(kids)
+			seen.update(kids)
+			nxt += kids
+		level = nxt
+	return opened
+
+
+def render_block(st: State, addr: str, depth: int | None, indent: int = 0, facts: bool = False, opened: set | None = None, seen: set | None = None, limit: int | None = None) -> list[str]:
+	"""depth 为 None 时按 opened（预算）展开。limit 只限制根下面列几项。"""
 	seen = seen if seen is not None else set()
 	pad = "  " * indent
-	lines = [pad + ln for ln in render_line(st, addr).split("\n")]
+	lines = [pad + ln for ln in render_line(st, addr, facts=facts).split("\n")]
 	deps = [lk["target"] for lk in st.links_from(addr, "depends")]
 	if deps:
 		lines.append(pad + "  depends:: " + ", ".join(f"[[{st.blocks[d]['props'].get('alias') or title_of(st.blocks[d])[:24]}]]" for d in deps if d in st.blocks))
@@ -1000,17 +1164,25 @@ def render_block(st: State, addr: str, depth: int, indent: int = 0, embeds: bool
 		bad = sum(1 for c in calls if not c["ok"])
 		lines.append(pad + f"  （运行记录：{st.traces[addr]['agent']} 的 {len(calls)} 次调用，碰过 {len(files)} 个文件，{bad} 次失败）")
 	seen.add(addr)
-	if embeds:
-		for kind, target in inline_targets(st, st.blocks[addr]["content"], None, st.blocks[addr]["space"])[0]:
-			if kind == "embed" and target in st.blocks and target not in seen:
-				lines.extend(render_block(st, target, 1, indent + 1, False, seen))
-	kids = [c for c in st.children(addr) if not st.blocks[c]["props"].get("archived")]
-	if depth > 0:
-		for c in kids:
-			lines.extend(render_block(st, c, depth - 1, indent + 1, embeds, seen))
+	kids = view_kids(st, addr, facts, seen)
+	go_on = (depth is None and opened is not None and addr in opened) or (depth is not None and depth > 0)
+	if go_on:
+		shown_kids = kids[:limit] if limit else kids
+		for kind, c in shown_kids:
+			if c in seen:
+				continue
+			sub_depth = None if depth is None else (0 if kind == "embed" else depth - 1)
+			lines.extend(render_block(st, c, sub_depth, indent + 1, facts, opened, seen))
+		if len(kids) > len(shown_kids):
+			lines.append(f"{pad}  …还有 {len(kids) - len(shown_kids)} 项")
 	elif kids:
-		lines.append(f"{pad}  …（{len(kids)} 个子块未展开）")
+		lines.append(f"{pad}  …（{len(kids)} 项未展开）")
 	return lines
+
+
+def hidden_process(st: State, root: str) -> int:
+	"""事实视图里没列出的过程块数。"""
+	return sum(1 for a in st.subtree(root) if is_process(st, a)) if not is_process(st, root) else 0
 
 
 def shown(lines: list[str]) -> list[str]:
@@ -1041,12 +1213,17 @@ def cmd_read(args) -> None:
 		print("位置：" + " › ".join(title_of(st.blocks[a])[:40] for a in reversed(anc)))
 	if args.as_of is not None:
 		print(f"（时间机器：第 {args.as_of} 个提交时的样子）")
-	lines = render_block(st, addr, args.depth)
+	facts = not args.all and not is_process(st, addr)
+	opened = budget_open(st, addr, args.budget, facts) if args.depth is None else None
+	lines = render_block(st, addr, args.depth, facts=facts, opened=opened, limit=args.budget if args.depth is None else None)
 	if args.basis:
 		for a in shown(lines):
 			for lk in st.links_from(a, "basis"):
 				lines.append(f"    · {a} 的依据：{lk['target']}" + (f"（{first_line(lk['data'].get('excerpt', ''), 60)}）" if lk["data"].get("excerpt") else ""))
 	print("\n".join(lines))
+	hidden = hidden_process(st, addr) if facts else 0
+	if hidden:
+		print(f"（这里只列事实；任务和它们下面的 {hidden} 块没列出，加 --all 一起看）")
 	if args.as_of is None:
 		record_reads(actor_of(args), st, shown(lines))
 
@@ -1061,7 +1238,10 @@ def cmd_pages(args) -> None:
 		for a in st.children(f"{space}/"):
 			if st.blocks[a]["props"].get("archived"):
 				continue
-			print(f"- [{a}] {title_of(st.blocks[a])[:50]}（{len(st.subtree(a)) - 1} 个子块）")
+			sub_ = st.subtree(a)[1:]
+			n_proc = sum(1 for x in sub_ if is_process(st, x))
+			kind = "（这一页本身是任务）" if is_process(st, a) else f"（事实 {len(sub_) - n_proc} 块" + (f"，另有过程 {n_proc} 块）" if n_proc else "）")
+			print(f"- [{a}] {title_of(st.blocks[a])[:50]}{kind}")
 
 
 def cmd_add(args) -> None:
@@ -1076,8 +1256,9 @@ def cmd_add(args) -> None:
 		else:
 			raise OutlineError("要么给出文本，要么用 --md")
 		after = resolve(st, args.after) if args.after else None
-		tx = Tx(st, actor, args.message or f"新增 {len(items)} 条")
-		created = create_items(tx, space, parent, items, after)
+		source = resolve(st, args.source) if args.source else None
+		tx = Tx(st, actor, args.message or (f"从 {source} 整理 {len(items)} 条" if source else f"新增 {len(items)} 条"))
+		created = create_items(tx, space, parent, items, after, source=source)
 		finish(tx)
 	if not tx.divert:
 		for a in created:
@@ -1130,7 +1311,7 @@ def cmd_edit(args) -> None:
 			if status == "done" and is_agent(actor):
 				open_kids = [a for a in st.subtree(addr)[1:] if st.is_task(a) and not st.blocks[a]["deleted"] and st.blocks[a]["props"].get("status") in ("todo", "doing")]
 				if open_kids:
-					tx.note(f"还有 {len(open_kids)} 个子任务没完成，结项时会成为遗留")
+					tx.note(f"还有 {len(open_kids)} 个子任务没完成，整理时会列为遗留")
 		if args.assign:
 			props["assignee"] = None if args.assign == "-" else args.assign
 		for kv in args.prop or []:
@@ -1142,10 +1323,13 @@ def cmd_edit(args) -> None:
 			op["props"] = props
 		if len(op) == 2:
 			raise OutlineError("没有要改的：给出新正文，或 --box、--prop")
+		source = resolve(st, args.source) if args.source else None
 		guarded(tx, op)
+		if not tx.divert and source and not any(lk["target"] == source for lk in st.links_from(addr, "source")):
+			add_link(tx, addr, "source", source)
 		if not tx.divert and "content" in op:
 			sync_links(tx, addr)
-			sync_basis(tx, addr)
+			sync_basis(tx, addr, source=source)
 		finish(tx)
 
 
@@ -1196,6 +1380,7 @@ def cmd_recheck(args) -> None:
 		addr = resolve(st, args.addr)
 		tx = Tx(st, actor, args.message or f"核实 {addr}：{args.verdict}")
 		if args.verdict == "ok":
+			tx.push({"op": "block.update", "addr": addr, "props": {"reviewed": tx.seq}})  # 也清掉「下层已变」
 			for lk in st.links_from(addr, "basis"):
 				if lk["target"].startswith("code:"):
 					fp, what = anchor_fingerprint(lk["target"])
@@ -1217,13 +1402,6 @@ def cmd_ask(args) -> None:
 		st = load_state()
 		space, parent = parent_and_space(st, args.parent)
 		tx = Tx(st, actor, args.message or f"提问：{args.question[:30]}")
-		under = parent
-		if args.bundle:
-			existing = [c for c in (st.children(parent) if parent else st.children(f"{space}/")) if st.blocks[c]["props"].get("bundle") and title_of(st.blocks[c]) == args.bundle]
-			if existing:
-				under = existing[0]
-			else:
-				[under] = create_items(tx, space, parent, [dict(new_item(args.bundle), extra={"bundle": True})], after=resolve(st, args.after) if args.after else None)
 		q = dict(new_item(args.question, " "), extra={"question": True})
 		q["content"] = args.question
 		q["props"] = {"alias": "Q?"}
@@ -1234,13 +1412,13 @@ def cmd_ask(args) -> None:
 			rec["extra"] = {"rec": True} | ({"rec_option": int(args.recommend)} if args.recommend.isdigit() else {})
 			children.append(rec)
 		q["children"] = children
-		addrs = create_items(tx, space, under, [q], after=resolve(st, args.after) if args.after and under == parent else None)
+		addrs = create_items(tx, space, parent, [q], after=resolve(st, args.after) if args.after else None)
 		if not tx.divert:
 			qa = addrs[0]
 			tx.push({"op": "block.update", "addr": qa, "props": {"assignee": args.to, "manager": actor}})
 		finish(tx, quiet=True)
 	if not tx.divert:
-		print(f"已提问 {tx.st.blocks[addrs[0]]['props'].get('alias')}（{addrs[0]}）给 {args.to}" + (f"，放在决策包「{args.bundle}」里" if args.bundle else "") + "；回答回来时会唤醒你")
+		print(f"已提问 {tx.st.blocks[addrs[0]]['props'].get('alias')}（{addrs[0]}）给 {args.to}；回答回来时会唤醒你")
 
 
 def add_recommendation(args, actor: str) -> None:
@@ -1275,7 +1453,7 @@ def open_questions(st: State, who: str) -> list[str]:
 
 def cmd_answer(args) -> None:
 	actor = actor_of(args)
-	if args.text and (len(args.questions) > 1 or args.bundle or args.tree):
+	if args.text and (len(args.questions) > 1 or args.tree):
 		raise OutlineError("--text 只能回答一条")
 	with locked():
 		st = load_state()
@@ -1283,9 +1461,6 @@ def cmd_answer(args) -> None:
 		for tname in args.tree or []:
 			root = resolve(st, tname)
 			qs += [x for x in st.subtree(root) if st.blocks[x]["props"].get("question") and st.blocks[x]["props"].get("status") in ("todo", "doing")]
-		for bname in args.bundle or []:
-			bundle = resolve(st, bname)
-			qs += [c for c in st.children(bundle) if st.blocks[c]["props"].get("question") and st.blocks[c]["props"].get("status") in ("todo", "doing")]
 		if not qs:
 			raise OutlineError("没有要回答的提问")
 		tx = Tx(st, actor, args.message or f"回答 {'、'.join(st.blocks[q]['props'].get('alias') or q for q in qs)}")
@@ -1320,28 +1495,6 @@ def cmd_answer(args) -> None:
 			done.append(name)
 		finish(tx)
 	print(f"已回答 {'、'.join(done)}")
-
-
-def cmd_bundle(args) -> None:
-	"""把几条相关的提问编成一个决策包，人可以一次回答一整包（§3.3）。"""
-	actor = actor_of(args)
-	with locked():
-		st = load_state()
-		qs = [resolve(st, r) for r in args.questions]
-		for q in qs:
-			if not st.blocks[q]["props"].get("question"):
-				raise OutlineError(f"{q} 不是提问")
-		parent = st.blocks[qs[0]]["parent"]
-		space = st.blocks[qs[0]]["space"]
-		tx = Tx(st, actor, args.message or f"编成决策包「{args.name}」")
-		existing = [c for c in (st.children(parent) if parent else st.children(f"{space}/")) if st.blocks[c]["props"].get("bundle") and title_of(st.blocks[c]) == args.name]
-		if existing:
-			bundle = existing[0]
-		else:
-			[bundle] = create_items(tx, space, parent, [dict(new_item(args.name), extra={"bundle": True})], after=st.children(parent)[0] if parent and st.children(parent) else None)
-		for q in qs:
-			guarded(tx, {"op": "block.move", "addr": q, "parent": bundle, "order": next_order(st, bundle, None)})
-		finish(tx)
 
 
 def cmd_lock(args) -> None:
@@ -1459,6 +1612,123 @@ def cmd_decide(args) -> None:
 	print(f"{args.id} 已{'确认' if confirm else '退回'}" + (f"（由 {actor} 确认，责任人 {st.responsible(actor)}）" if is_agent(actor) else ""))
 
 
+# ---------------------------------------------------------------------------
+# 整理（§4.7）：任务完成后，把站得住的结论放进事实树，出处指回任务
+
+
+SETTLE_GUIDE = """怎么整理：
+1. 只挑以后还用得到、站得住的结论；只对这次任务有意义的过程、拿不准的，不搬。
+2. 写成脱离这次任务也读得懂的现在时陈述，代码位置照写。决定写成现行规则，带一句理由。
+3. 先找它该在的地方：
+   - 事实树里已经有这件事：改写那一块，`edit 地址 "新正文" --from {t}`，旧说法留在历史里；
+   - 还没有：加在最贴近的块下面，和兄弟块一样粗细，`add 父块 --md - --from {t}`；
+   - 没有合适的页：新建一页，`add {space}/ --md - --from {t}`，第一行写标题，紧接着的子块写一两句概括。
+4. 一个块的直接子块别超过 {dense} 个，多了就加一层归组（`mv`）。改了下层，看一眼上层的概括还对不对。
+5. 试过不行、以后还会有人想到的方案，写一条「不用 X：原因」，放在相关的事实下面。
+6. 没做完的子任务不用管，它们还在看板上。
+7. 整理完：`settle {t} --done`（什么都不用搬也这样收尾）。"""
+
+
+def settle_queue(st: State) -> tuple[list[str], list[str]]:
+	tasks = sorted((a for a in st.blocks if unsettled(st, a)), key=lambda a: -st.blocks[a]["version"])
+	stale = [a for a, b in st.blocks.items() if not b["deleted"] and not is_process(st, a) and not b["props"].get("invalid") and stale_below(st, a) >= STALE_EDITS]
+	return tasks, stale
+
+
+def destinations(st: State, t: str, limit: int = 6) -> list[str]:
+	"""事实树里可能的去处：和任务的笔记碰到同一批文件的块，以及笔记链接到的事实。"""
+	notes = [a for a in st.subtree(t)[1:] if not st.is_task(a)]
+	paths = {sp[1] for a in notes for sp in anchor_spans(st, a)}
+	linked = {lk["target"] for a in notes for lk in st.links_from(a) if lk["kind"] in ("link", "embed") and lk["target"] in st.blocks}
+	scored = []
+	for a, b in st.blocks.items():
+		if b["deleted"] or is_process(st, a) or b["props"].get("invalid"):
+			continue
+		shared = paths & {sp[1] for sp in anchor_spans(st, a)}
+		if shared or a in linked:
+			scored.append((len(shared) + (2 if a in linked else 0), a, shared))
+	out = []
+	for _, a, shared in sorted(scored, key=lambda x: -x[0])[:limit]:
+		crumb = " › ".join(title_of(st.blocks[x])[:14] for x in reversed(st.ancestors(a)))
+		why = f"都碰到 {len(shared)} 个文件" if shared else "笔记里链接到它"
+		out.append(f"- [{a}] {title_of(st.blocks[a])[:60]}（{why}；在：{crumb or '页'}）")
+	return out
+
+
+def cmd_settle(args) -> None:
+	actor = actor_of(args)
+	if not args.task:
+		st = load_state()
+		tasks, stale = settle_queue(st)
+		print(f"### 完成了、还没整理的任务（{len(tasks)}）")
+		for a in tasks[: args.limit]:
+			b = st.blocks[a]
+			n = len([x for x in own_notes(st, a) if st.blocks[x]["version"] > (b["props"].get("settled") or 0)])
+			print(f"- [{a}] {title_of(b)[:60]}（{STATUS_ZH[b['props']['status']]}；{n} 块没整理）")
+		if len(tasks) > args.limit:
+			print(f"- …另有 {len(tasks) - args.limit} 个（--limit 看更多）")
+		print(f"\n### 下层已变的块（{len(stale)}）：看一眼概括还对不对，对就 `recheck 地址 ok`，不对就改写")
+		for a in stale[: args.limit]:
+			print(f"- [{a}] {title_of(st.blocks[a])[:60]}（直接子块变了 {stale_below(st, a)} 处，现有 {len(fact_kids(st, a))} 个）")
+		print("\n整理一个任务：`settle 任务地址`")
+		return
+	if not args.done:
+		st = load_state()
+		t = resolve(st, args.task)
+		b = st.blocks[t]
+		if b["kind"] != "task" or b["props"].get("status") not in ("done", "cancelled"):
+			raise OutlineError(f"{t} 不是完成或取消了的任务；做完了再整理")
+		anc = st.ancestors(t)
+		print(f"整理 [{t}] {title_of(b)[:70]}（{STATUS_ZH[b['props']['status']]}" + (f"，@{b['props']['assignee']}" if b["props"].get("assignee") else "") + "）")
+		if anc:
+			print("位置：" + " › ".join(title_of(st.blocks[a])[:30] for a in reversed(anc)))
+		since = b["props"].get("settled")
+		print()
+		if since:
+			fresh = [a for a in own_notes(st, t) if st.blocks[a]["version"] > since]
+			print(f"上次整理在第 {since} 个提交；之后新增或改过的 {len(fresh)} 块：")
+			print("\n".join(render_line(st, a).split("\n")[0] for a in fresh))
+		else:
+			kids = st.children(t)
+			reports = [c for c in kids if st.blocks[c]["props"].get("report") or st.blocks[c]["props"].get("attachment")]
+			notes = [c for c in kids if c not in reports and not st.is_task(c)]
+			subs = [c for c in kids if st.is_task(c)]
+			print(f"任务下写的（{len(notes)} 条）：")
+			for c in notes:
+				print("\n".join(render_block(st, c, None, 1, opened=budget_open(st, c, args.budget, False))))
+			for r in reports:
+				print("\n挂回的报告（只列到第二层，细节用 `read 地址`）：")
+				print("\n".join(render_block(st, r, 2, 1)))
+			if subs:
+				print(f"\n子任务（{len(subs)} 个，各自整理）：")
+				print("\n".join("  " + render_line(st, c).split("\n")[0] for c in subs))
+		dest = destinations(st, t)
+		print("\n可能的去处（事实树里的块）：")
+		print("\n".join(dest) if dest else "（没有碰到同一批文件的事实）")
+		print("\n事实树的顶层页：")
+		for a in st.children(f"{b['space']}/"):
+			if not is_process(st, a) and not st.blocks[a]["props"].get("archived"):
+				print(f"- [{a}] {title_of(st.blocks[a])[:50]}（{sum(1 for x in st.subtree(a) if not is_process(st, x))} 块）")
+		print()
+		print(SETTLE_GUIDE.format(t=t, space=b["space"], dense=DENSE))
+		return
+	with locked():
+		st = load_state()
+		t = resolve(st, args.task)
+		b = st.blocks[t]
+		if b["kind"] != "task" or b["props"].get("status") not in ("done", "cancelled"):
+			raise OutlineError(f"{t} 不是完成或取消了的任务")
+		tx = Tx(st, actor, args.message or f"整理完 {b['props'].get('alias') or t}")
+		tx.push({"op": "block.update", "addr": t, "props": {"settled": tx.seq}})
+		out = [lk for lk in st.links_to(t, "source") if lk["from"] in st.blocks and not st.blocks[lk["from"]]["deleted"]]
+		new = sum(1 for lk in out if st.blocks[lk["from"]]["created_seq"] == lk["created_seq"])
+		for par in dict.fromkeys(st.blocks[lk["from"]]["parent"] for lk in out):
+			if par and not is_process(st, par):
+				tx.push({"op": "block.update", "addr": par, "props": {"reviewed": tx.seq}})  # 上层的概括整理时看过了
+		finish(tx, quiet=True)
+	print(f"已整理 [{t}]：事实树里有 {len(out)} 块出自它（新建 {new}，改写 {len(out) - new}）" if out else f"已整理 [{t}]：没有要搬进事实树的内容")
+
+
 def cmd_board(args) -> None:
 	st = load_state()
 	pool = st.subtree(resolve(st, args.under)) if args.under else list(st.blocks)
@@ -1482,17 +1752,14 @@ def board_lines(st: State, tasks: list[str]) -> list[str]:
 
 
 def decision_groups(st: State, qs: list[str]) -> dict[str, list[str]]:
-	"""每件事的根：最上层的未答提问，或决策包。挂在一条提问下面的细项和包都算这一件。"""
+	"""收件箱里的一件事：一条提问连同它下面的细项；不在提问下面的，同一个块下的提问算一件（页的根除外）。"""
 	groups: dict[str, list[str]] = {}
 	for q in qs:
 		anc = [x for x in st.ancestors(q) if st.blocks[x]["props"].get("question") and st.blocks[x]["props"].get("status") in ("todo", "doing")]
-		if anc:
-			key = anc[-1]
-		else:
-			par = st.blocks[q]["parent"]
-			key = par if par and st.blocks[par]["props"].get("bundle") else q
+		par = st.blocks[q]["parent"]
+		key = anc[-1] if anc else (par if par and st.blocks[par]["parent"] else q)
 		groups.setdefault(key, []).append(q)
-	return groups
+	return {(g[0] if len(g) == 1 and k not in g else k): g for k, g in groups.items()}
 
 
 def inbox_lines(st: State, who: str) -> list[str]:
@@ -1514,7 +1781,7 @@ def inbox_lines(st: State, who: str) -> list[str]:
 				lines.append(f"- {name}" + (f"\n  {title_of(st.blocks[rec])[:90]}" if rec else "（还没有建议）"))
 				continue
 			with_rec = sum(1 for q in group if recommendation(st, q))
-			how = f"answer --tree {key}" if kb["props"].get("question") else f"answer --bundle {key}"
+			how = f"answer --tree {key}"
 			lines.append(f"- {name}：{len(group)} 条，{with_rec} 条有建议 → 全部采纳：`outline.py --as {who} {how}`")
 			for q in group:
 				rec = recommendation(st, q)
@@ -1530,20 +1797,21 @@ def cmd_inbox(args) -> None:
 def digest_lines(st: State, since: int) -> list[str]:
 	"""汇报：这段时间变了什么、什么在等你（§3.4）。"""
 	old = load_state(since)
-	new_blocks = [a for a, b in st.blocks.items() if a not in old.blocks and not b["deleted"]]
+	# 新知识只看事实树：新增或改写的事实；过程里的新内容由「完成的任务」代表
+	facts = [a for a, b in st.blocks.items() if not b["deleted"] and not is_process(st, a) and (a not in old.blocks or old.blocks[a]["content"] != b["content"])]
 	by_page: dict[str, list[str]] = {}
-	for a in new_blocks:
+	for a in facts:
 		by_page.setdefault(st.page_of(a), []).append(a)
 	lines = [f"## 从第 {since} 个提交到第 {st.seq} 个", ""]
 	if by_page:
-		lines.append("**新内容**")
+		lines.append("**新知识**（事实树里新增或改写的）")
 		for page, addrs in sorted(by_page.items(), key=lambda kv: -len(kv[1])):
 			tops = [a for a in addrs if st.blocks[a]["parent"] not in addrs][:3]
 			lines.append(f"- {title_of(st.blocks[page])[:30]}：{len(addrs)} 块，" + "；".join(f"[{a}] {title_of(st.blocks[a])[:40]}" for a in tops))
 	done = [a for a, b in st.blocks.items() if b["kind"] == "task" and b["props"].get("status") == "done" and (a not in old.blocks or old.blocks[a]["props"].get("status") != "done") and not b["props"].get("question")]
 	if done:
 		lines.append("**完成的任务**")
-		lines += [f"- [{a}] {title_of(st.blocks[a])[:60]}" + (f" @{st.blocks[a]['props']['assignee']}" if st.blocks[a]["props"].get("assignee") else "") for a in done]
+		lines += [f"- [{a}] {title_of(st.blocks[a])[:60]}" + (f" @{st.blocks[a]['props']['assignee']}" if st.blocks[a]["props"].get("assignee") else "") + ("（待整理）" if unsettled(st, a) else "") for a in done]
 	inval = [a for a, b in st.blocks.items() if b["props"].get("invalid") and not (a in old.blocks and old.blocks[a]["props"].get("invalid"))]
 	if inval:
 		lines.append("**标为不成立**")
@@ -1580,11 +1848,14 @@ def cmd_search(args) -> None:
 			score *= 0.6
 		if anchor_state(st, a):
 			score *= 0.7
+		if is_process(st, a):
+			score *= 0.5  # 同样相关时，事实排在过程前面（§5.4）
 		scored.append((score, a))
 	scored.sort(reverse=True)
 	for _, a in scored[: args.limit]:
 		crumb = " › ".join(title_of(st.blocks[x])[:14] for x in reversed(st.ancestors(a)))
-		print(render_line(st, a, detail=True).split("\n")[0] + (f"\n    在：{crumb}" if crumb else ""))
+		where = (f"在：{crumb}" if crumb else "") + ("（过程）" if is_process(st, a) else "")
+		print(render_line(st, a, detail=True).split("\n")[0] + (f"\n    {where}" if where else ""))
 	if not scored:
 		print("（没有结果）")
 	record_reads(actor_of(args), st, [a for _, a in scored[: args.limit]])
@@ -1983,11 +2254,12 @@ def cmd_export(args) -> None:
 	st = load_state()
 	EXPORTS.mkdir(parents=True, exist_ok=True)
 	header = f"<!-- 由 prototypes/outline2/outline.py export 生成（第 {st.seq} 个提交）。真相源是 data/log.jsonl，不要手改。 -->\n\n"
-	ov = [header + "# 大纲总览\n"]
+	ov = [header + "# 大纲总览（事实视图）\n", "只列事实；任务和它们下面的内容是过程，见 board.md，或 `read 任务`。`‹进行中：…›` 是还在进行、会改到这里的过程。\n"]
 	for space, sp in st.spaces.items():
 		ov.append(f"## {space} · {sp['title']}\n")
 		for a in st.children(f"{space}/"):
-			ov.append("\n".join(render_block(st, a, 50)) + "\n")
+			if not is_process(st, a):
+				ov.append("\n".join(render_block(st, a, 50, facts=True)) + "\n")
 	(EXPORTS / "overview.md").write_text("\n".join(ov), encoding="utf-8")
 	tasks = [a for a in st.blocks if st.is_task(a) and not st.blocks[a]["deleted"] and not st.blocks[a]["props"].get("question")]
 	(EXPORTS / "board.md").write_text(header + "# 任务看板\n\n" + "\n".join(board_lines(st, tasks)) + "\n", encoding="utf-8")
@@ -2011,9 +2283,11 @@ def build_parser() -> argparse.ArgumentParser:
 		sp.set_defaults(fn=fn)
 		return sp
 
-	s = p("read", cmd_read, "读一页或一棵子树")
+	s = p("read", cmd_read, "读一页或一棵子树：页只列事实，任务列出全部；按预算逐层展开")
 	s.add_argument("addr", help="短 id、空间/短id、别名或标题")
-	s.add_argument("-d", "--depth", type=int, default=3)
+	s.add_argument("-d", "--depth", type=int, help="按层数展开，不按预算")
+	s.add_argument("--budget", type=int, default=READ_BUDGET, help=f"最多列多少块（默认 {READ_BUDGET}）")
+	s.add_argument("--all", action="store_true", help="连同任务和它们下面的内容一起列")
 	s.add_argument("--basis", action="store_true", help="列出每块的依据")
 	s.add_argument("--as-of", type=int)
 	s = p("search", cmd_search, "检索（默认不含不成立和归档）")
@@ -2025,6 +2299,7 @@ def build_parser() -> argparse.ArgumentParser:
 	s.add_argument("text", nargs="?")
 	s.add_argument("--md", help="从文件读大纲；- 表示标准输入")
 	s.add_argument("--after", help="插在这个块后面（同一个父块下）；多条依次往后接")
+	s.add_argument("--from", dest="source", help="（整理时）出处：这些内容是从哪个任务整理来的")
 	s.add_argument("-m", "--message")
 	s = p("edit", cmd_edit, "改正文、勾复选框、改属性")
 	s.add_argument("addr")
@@ -2033,16 +2308,16 @@ def build_parser() -> argparse.ArgumentParser:
 	s.add_argument("--prop", action="append", help="alias=…（Q? 自动编号）、due=…、tags=a,b；值留空表示删除")
 	s.add_argument("--assign", help="指派给谁（agent:x 或 human:x；- 表示取消指派）")
 	s.add_argument("--steal", action="store_true", help="接手别人正在做的任务")
+	s.add_argument("--from", dest="source", help="（整理时）出处：改写依据的是哪个任务")
 	s.add_argument("--force", action="store_true")
 	s.add_argument("-m", "--message")
 	s = p("ask", cmd_ask, "问人：问题、选项、建议和理由；回答回来时唤醒你。只写已有提问的地址、不写问题，就是给它补建议")
-	s.add_argument("parent", help="放在哪里；或者一条已有的提问（给它补建议）")
+	s.add_argument("parent", help="放在哪里：相关的几条放在同一个块下面，一条提问的细项放在那条提问下面；或者一条已有的提问（给它补建议）")
 	s.add_argument("question", nargs="?")
 	s.add_argument("--option", action="append", help="一个选项；可以写多次")
 	s.add_argument("--recommend", help="建议：选项编号，或一句话")
 	s.add_argument("--reason", help="建议的理由")
-	s.add_argument("--bundle", help="放进同名的决策包（建在 parent 下面；parent 是一条提问时，包就挂在这条提问下面）")
-	s.add_argument("--after", help="新提问或新决策包插在这个块后面")
+	s.add_argument("--after", help="新提问插在这个块后面")
 	s.add_argument("--to", default="human:owner", help="交给谁回答（默认 human:owner）")
 	s.add_argument("-m", "--message")
 	s = p("invalid", cmd_invalid, "标为不成立（试过不行的方案、被推翻的结论）")
@@ -2075,14 +2350,16 @@ def build_parser() -> argparse.ArgumentParser:
 	s.add_argument("addr")
 	s.add_argument("-m", "--message")
 	p("fresh", cmd_fresh, "检查代码锚点：代码变了的块会标「代码已变」")
-	s = p("recheck", cmd_recheck, "核实代码已变的块：ok 仍成立（刷新锚点）/ invalid 不成立")
+	s = p("recheck", cmd_recheck, "核实标了「代码已变」或「下层已变」的块：ok 仍成立 / invalid 不成立")
 	s.add_argument("addr")
 	s.add_argument("verdict", choices=["ok", "invalid"])
 	s.add_argument("--reason")
 	s.add_argument("-m", "--message")
-	s = p("bundle", cmd_bundle, "把几条相关的提问编成决策包")
-	s.add_argument("name")
-	s.add_argument("questions", nargs="+")
+	s = p("settle", cmd_settle, "（整理用）列出要整理的；带任务地址看它要整理的内容和做法；--done 收尾")
+	s.add_argument("task", nargs="?")
+	s.add_argument("--done", action="store_true")
+	s.add_argument("--budget", type=int, default=150, help="列任务内容时最多列多少块")
+	s.add_argument("--limit", type=int, default=20)
 	s.add_argument("-m", "--message")
 	s = p("lock", cmd_lock, "锁定一份计划（人、计划的作者或管理者）；--unlock 解锁")
 	s.add_argument("addr")
@@ -2098,8 +2375,7 @@ def build_parser() -> argparse.ArgumentParser:
 		s.add_argument("--note")
 	s = p("answer", cmd_answer, "回答提问（人用）：不写 --text/--option 就采纳建议")
 	s.add_argument("questions", nargs="*")
-	s.add_argument("--bundle", action="append", help="一次回答一整个决策包")
-	s.add_argument("--tree", action="append", help="一次回答一条提问和挂在它下面的全部细项")
+	s.add_argument("--tree", action="append", help="一次回答这个块下面的全部提问（一条提问连同细项，或一个块下的几条）")
 	s.add_argument("--text")
 	s.add_argument("--option", type=int)
 	s.add_argument("-m", "--message")
