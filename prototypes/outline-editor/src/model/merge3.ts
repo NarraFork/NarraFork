@@ -5,7 +5,7 @@
 import { diffHunks, type Hunk } from "./diff";
 
 export type Merge3Result =
-	| { ok: true; result: string; /** 应用到 theirs 上的补丁（theirs 坐标） */ patch: Hunk[] }
+	| { ok: true; result: string /** 应用到 theirs 上的补丁（theirs 坐标） */; patch: Hunk[] }
 	| { ok: false; current: string; conflicts: Array<{ mine: Hunk; theirs: Hunk }> };
 
 function overlaps(a: Hunk, b: Hunk): boolean {
@@ -17,18 +17,29 @@ function overlaps(a: Hunk, b: Hunk): boolean {
 	return a.start < b.end && b.start < a.end;
 }
 
-export function merge3(base: string, mine: string, theirs: string): Merge3Result {
+/**
+ * lenient：人的编辑用（Y.Text 建好之前的几次按键）。不拒绝：重叠时尽量放到对应位置，
+ * 同一位置的插入排在别人的插入之后。agent 用严格模式（重叠就拒绝，§6.5）。
+ */
+export function merge3(
+	base: string,
+	mine: string,
+	theirs: string,
+	opts: { lenient?: boolean } = {},
+): Merge3Result {
 	const mh = diffHunks(base, mine);
 	if (base === theirs) return { ok: true, result: mine, patch: mh };
 	if (mh.length === 0) return { ok: true, result: theirs, patch: [] };
 	const th = diffHunks(base, theirs);
 	const conflicts: Array<{ mine: Hunk; theirs: Hunk }> = [];
-	for (const m of mh) for (const t of th) if (overlaps(m, t)) conflicts.push({ mine: m, theirs: t });
-	if (conflicts.length) return { ok: false, current: theirs, conflicts };
+	for (const m of mh)
+		for (const t of th) if (overlaps(m, t)) conflicts.push({ mine: m, theirs: t });
+	if (conflicts.length && !opts.lenient) return { ok: false, current: theirs, conflicts };
 	// 把 mine 的每个区间从 base 坐标映射到 theirs 坐标：
 	// 起点算上恰好在此处的插入（mine 排在 theirs 的插入之后），终点不算。
 	const delta = (t: Hunk) => t.text.length - (t.end - t.start);
-	const mapStart = (pos: number) => pos + th.filter((t) => t.end <= pos).reduce((n, t) => n + delta(t), 0);
+	const mapStart = (pos: number) =>
+		pos + th.filter((t) => t.end <= pos).reduce((n, t) => n + delta(t), 0);
 	const mapEnd = (pos: number) =>
 		pos +
 		th
@@ -40,6 +51,15 @@ export function merge3(base: string, mine: string, theirs: string): Merge3Result
 		return { start: s, end: e, text: m.text };
 	});
 	patch.sort((a, b) => a.start - b.start);
+	// 宽松模式下映射后的区间可能交叠：截断，保证补丁可以依次应用
+	for (let i = 1; i < patch.length; i++) {
+		if (patch[i].start < patch[i - 1].end)
+			patch[i] = {
+				...patch[i],
+				start: patch[i - 1].end,
+				end: Math.max(patch[i].end, patch[i - 1].end),
+			};
+	}
 	let out = "";
 	let pos = 0;
 	for (const h of patch) {

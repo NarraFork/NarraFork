@@ -98,7 +98,8 @@ function walkInline(tokens: Token[], b: InlineBuilder, marks: Mark[], pos: numbe
 			case "em":
 			case "del": {
 				const tt = t as Tokens.Strong;
-				const prefix = t.type === "strong" ? 2 : t.type === "del" ? (raw.startsWith("~~") ? 2 : 1) : 1;
+				const prefix =
+					t.type === "strong" ? 2 : t.type === "del" ? (raw.startsWith("~~") ? 2 : 1) : 1;
 				const type = t.type === "del" ? "strike" : t.type;
 				walkInline(tt.tokens ?? [], b, addMark(marks, { type } as Mark), pos + prefix, tr);
 				break;
@@ -236,11 +237,7 @@ function cellTranslation(src: string, a: number, z: number): Tr {
 	return (x: number) => offs[Math.min(Math.max(x, 0), offs.length - 1)];
 }
 
-function tableBody(
-	t: Tokens.Table,
-	src: string,
-	start: number,
-): { body: Body; map: SourceMap } {
+function tableBody(t: Tokens.Table, src: string, start: number): { body: Body; map: SourceMap } {
 	const raw = t.raw;
 	const lines: Array<[string, number]> = [];
 	let i = 0;
@@ -248,7 +245,9 @@ function tableBody(
 		lines.push([line, start + i]);
 		i += line.length + 1;
 	}
-	const srcRows = [lines[0], ...lines.slice(2)].filter((l) => l !== undefined && l[0].trim() !== "");
+	const srcRows = [lines[0], ...lines.slice(2)].filter(
+		(l) => l !== undefined && l[0].trim() !== "",
+	);
 	const tokenRows = [t.header, ...t.rows];
 	const points: number[] = [];
 	const rows: Inline[][][] = [];
@@ -274,7 +273,10 @@ function tableBody(
 	points.push(start + raw.length);
 	for (let k = 1; k < points.length; k++) if (points[k] < points[k - 1]) points[k] = points[k - 1];
 	const align = (t.align as Align[]).map((a) => a ?? null);
-	return { body: { type: "table", align, rows }, map: { size: points.length - 1, pmToSrc: points } };
+	return {
+		body: { type: "table", align, rows },
+		map: { size: points.length - 1, pmToSrc: points },
+	};
 }
 
 function allStrong(content: Inline[]): Inline[] {
@@ -361,7 +363,12 @@ function tokenToBody(t: Token, src: string, start: number, notes: string[]): Bod
 				pos += inner.raw.length;
 			}
 			if (extra.length) notes.push("多段引用拆成子块");
-			if (!first) first = { body: { type: "quote", content: [] }, map: { size: 0, pmToSrc: [start] }, extra: [] };
+			if (!first)
+				first = {
+					body: { type: "quote", content: [] },
+					map: { size: 0, pmToSrc: [start] },
+					extra: [],
+				};
 			first.extra = extra;
 			return first;
 		}
@@ -470,6 +477,7 @@ export function parseBlock(src: string): ParsedBlock {
 		if (!first) {
 			first = tokenToBody(t, src, pos, notes);
 		} else if (t.type !== "space") {
+			if (t.type === "list") notes.push("列表拆成子块");
 			extra.push(...tokenToNodes(t, notes));
 		}
 		pos += t.raw.length;

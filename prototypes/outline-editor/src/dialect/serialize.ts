@@ -141,9 +141,7 @@ function lineStartEscape(line: string): number {
 }
 
 function serializeInline(content: Inline[], ctx: Ctx): string {
-	const nodes = ctx.table
-		? content.filter((n) => n.type !== "br")
-		: normalizeBreaks(content);
+	const nodes = ctx.table ? content.filter((n) => n.type !== "br") : normalizeBreaks(content);
 	// 扁平文本，用于上下文相关的转义判断
 	const runs: Run[] = [];
 	let flat = "";
@@ -198,7 +196,8 @@ function serializeInline(content: Inline[], ctx: Ctx): string {
 	for (let k = 1; k < runs.length; k++) {
 		const a = runs[k - 1];
 		const b = runs[k];
-		if (b.kind !== "text" || a.kind !== "text" || markSig(a.marks) !== markSig(b.marks)) boundary.add(b.flatStart);
+		if (b.kind !== "text" || a.kind !== "text" || markSig(a.marks) !== markSig(b.marks))
+			boundary.add(b.flatStart);
 	}
 	// 代码区内的字符不参与转义
 	const inCode = new Uint8Array(flat.length);
@@ -208,7 +207,7 @@ function serializeInline(content: Inline[], ctx: Ctx): string {
 	}
 
 	let out = "";
-	let open: Mark[] = []; // 当前打开的标记（不含 code，code 单独处理）
+	const open: Mark[] = []; // 当前打开的标记（不含 code，code 单独处理）
 	const close = (keep: number) => {
 		while (open.length > keep) {
 			const m = open.pop() as Mark;
@@ -247,7 +246,12 @@ function serializeInline(content: Inline[], ctx: Ctx): string {
 		let text = r.text;
 		const isCode = r.marks.some((m) => m.type === "code");
 		let leadWs = "";
-		if (r.kind === "text" && !isCode && toOpen.length > 0 && !toOpen.some((m) => m.type === "link")) {
+		if (
+			r.kind === "text" &&
+			!isCode &&
+			toOpen.length > 0 &&
+			!toOpen.some((m) => m.type === "link")
+		) {
 			const m = /^[ \t]+/.exec(text);
 			if (m) {
 				leadWs = m[0];
@@ -264,7 +268,17 @@ function serializeInline(content: Inline[], ctx: Ctx): string {
 				out += trail[0];
 			} else close(keep);
 		}
-		out += escapeText(leadWs, r.flatStart, flat, lineEsc, indentEntity, inCode, ctx, false, boundary);
+		out += escapeText(
+			leadWs,
+			r.flatStart,
+			flat,
+			lineEsc,
+			indentEntity,
+			inCode,
+			ctx,
+			false,
+			boundary,
+		);
 		for (const m of toOpen) openMark(m);
 		const inLink = open.some((m) => m.type === "link");
 		const offset = r.flatStart + leadWs.length;
@@ -280,8 +294,10 @@ function serializeInline(content: Inline[], ctx: Ctx): string {
 				rj < runs.length &&
 				runs[rj].kind === "text" &&
 				runs[rj].marks.some((m) => m.type === "code") &&
-				runs[rj].marks.filter((m) => m.type !== "code").map(markKey).join() ===
-					want.map(markKey).join()
+				runs[rj].marks
+					.filter((m) => m.type !== "code")
+					.map(markKey)
+					.join() === want.map(markKey).join()
 			) {
 				codeText += runs[rj].text;
 				rj++;
@@ -357,7 +373,7 @@ function trimInline(content: Inline[]): Inline[] {
 	const out = content.map((n) => ({ ...n })) as Inline[];
 	while (out.length) {
 		const f = out[0];
-		if (f.type !== "text") break;
+		if (f.type !== "text" || f.marks.some((m) => m.type === "code")) break;
 		const t = f.text.replace(/^\s+/, "");
 		if (t) {
 			out[0] = { ...f, text: t };
@@ -367,7 +383,7 @@ function trimInline(content: Inline[]): Inline[] {
 	}
 	while (out.length) {
 		const l = out[out.length - 1];
-		if (l.type !== "text") break;
+		if (l.type !== "text" || l.marks.some((m) => m.type === "code")) break;
 		const t = l.text.replace(/\s+$/, "");
 		if (t) {
 			out[out.length - 1] = { ...l, text: t };
@@ -417,7 +433,11 @@ export function serializeBodyRaw(body: Body): string {
 			const cols = Math.max(1, ...body.rows.map((r) => r.length));
 			const cell = (c: Inline[] | undefined) =>
 				c
-					? serializeInline(trimInline(c), { table: true, firstLineIndentGuard: false, lineRules: false })
+					? serializeInline(trimInline(c), {
+							table: true,
+							firstLineIndentGuard: false,
+							lineRules: false,
+						})
 					: "";
 			const lines: string[] = [];
 			const rows = body.rows.length ? body.rows : [[[]]];
@@ -427,7 +447,13 @@ export function serializeBodyRaw(body: Body): string {
 				tableRow(
 					Array.from({ length: cols }, (_, i) => {
 						const a = body.align[i] ?? null;
-						return a === "left" ? ":---" : a === "center" ? ":---:" : a === "right" ? "---:" : "---";
+						return a === "left"
+							? ":---"
+							: a === "center"
+								? ":---:"
+								: a === "right"
+									? "---:"
+									: "---";
 					}),
 				),
 			);

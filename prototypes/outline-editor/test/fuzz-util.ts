@@ -76,7 +76,10 @@ export function randomInline(r: () => number, opts: { br: boolean; mention: bool
 		}
 		const marks: Mark[] = [];
 		for (const m of MARKS) {
-			if (r() < 0.18) marks.push(m === "link" ? { type: "link", href: "https://e.x/a", title: null } : { type: m });
+			if (r() < 0.18)
+				marks.push(
+					m === "link" ? { type: "link", href: "https://e.x/a", title: null } : { type: m },
+				);
 		}
 		if (opts.mention && x < 0.2) {
 			out.push({
@@ -110,7 +113,10 @@ export function randomBody(r: () => number): Body {
 	const rows = 1 + Math.floor(r() * 3);
 	return {
 		type: "table",
-		align: Array.from({ length: cols }, () => [null, "left", "center", "right"][Math.floor(r() * 4)] as never),
+		align: Array.from(
+			{ length: cols },
+			() => [null, "left", "center", "right"][Math.floor(r() * 4)] as never,
+		),
 		rows: Array.from({ length: rows }, () =>
 			Array.from({ length: cols }, () => randomInline(r, { br: false, mention: true })),
 		),
@@ -123,14 +129,18 @@ export function charMarks(content: Inline[]): string[] {
 	for (const n of content) {
 		if (n.type === "br") out.push("\n");
 		else if (n.type === "mention") {
-			const ms = n.marks.map((m) => m.type).sort().join(",");
+			const ms = n.marks
+				.map((m) => m.type)
+				.sort()
+				.join(",");
 			out.push(`@${n.ref}|${n.label ?? ""}{${ms}}`);
 		} else {
 			const ms = n.marks
 				.map((m) => (m.type === "link" ? `link:${m.href}` : m.type))
 				.sort()
 				.join(",");
-			for (const ch of n.text) out.push(/\s/.test(ch) && !ms.includes("code") ? ch : `${ch}{${ms}}`);
+			for (const ch of n.text)
+				out.push(/\s/.test(ch) && !ms.includes("code") ? ch : `${ch}{${ms}}`);
 		}
 	}
 	return out;

@@ -40,7 +40,8 @@ function myers(a: string[], b: string[]): Array<[number, number]> {
 		trace.push(new Map(v));
 		for (let k = -d; k <= d; k += 2) {
 			let x: number;
-			if (k === -d || (k !== d && (v.get(k - 1) ?? -1) < (v.get(k + 1) ?? -1))) x = v.get(k + 1) ?? 0;
+			if (k === -d || (k !== d && (v.get(k - 1) ?? -1) < (v.get(k + 1) ?? -1)))
+				x = v.get(k + 1) ?? 0;
 			else x = (v.get(k - 1) ?? 0) + 1;
 			let y = x - k;
 			while (x < n && y < m && a[x] === b[y]) {

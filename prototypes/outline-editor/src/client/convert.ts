@@ -49,7 +49,9 @@ export function bodyToPM(body: Body): PMNode {
 			);
 			return schema.nodes.table.create(
 				{ align: body.align },
-				rows.length ? rows : [schema.nodes.table_row.create(null, schema.nodes.table_cell.create())],
+				rows.length
+					? rows
+					: [schema.nodes.table_row.create(null, schema.nodes.table_cell.create())],
 			);
 		}
 	}
@@ -65,7 +67,12 @@ export function inlineFromPM(frag: Fragment): Inline[] {
 	frag.forEach((n) => {
 		if (n.isText) out.push({ type: "text", text: n.text ?? "", marks: n.marks.map(markOf) });
 		else if (n.type.name === "mention")
-			out.push({ type: "mention", ref: n.attrs.ref, label: n.attrs.label, marks: n.marks.map(markOf) });
+			out.push({
+				type: "mention",
+				ref: n.attrs.ref,
+				label: n.attrs.label,
+				marks: n.marks.map(markOf),
+			});
 		else if (n.type.name === "hard_break") out.push({ type: "br" });
 	});
 	return out;
@@ -85,7 +92,9 @@ export function bodyFromPM(n: PMNode): Body {
 			const rows: Inline[][][] = [];
 			n.forEach((row) => {
 				const cells: Inline[][] = [];
-				row.forEach((cell) => cells.push(inlineFromPM(cell.content)));
+				row.forEach((cell) => {
+					cells.push(inlineFromPM(cell.content));
+				});
 				rows.push(cells);
 			});
 			return { type: "table", align: n.attrs.align ?? [], rows };
@@ -159,7 +168,7 @@ export function fragmentToOutline(frag: Fragment): OutlineNode[] {
 		if (n.type.name === "block") {
 			const first = n.firstChild;
 			const hasBody = first && first.type.name !== "children";
-			const kidsNode = hasBody ? n.childCount > 1 ? n.child(1) : null : first;
+			const kidsNode = hasBody ? (n.childCount > 1 ? n.child(1) : null) : first;
 			out.push({
 				body: hasBody && first ? bodyFromPM(first) : { type: "paragraph", content: [] },
 				task: n.attrs.task,
@@ -168,7 +177,11 @@ export function fragmentToOutline(frag: Fragment): OutlineNode[] {
 		} else if (n.type.name === "children" || n.type.name === "outline") {
 			out.push(...fragmentToOutline(n.content));
 		} else if (n.type.name === "table_row" || n.type.name === "table_cell") {
-			out.push({ body: { type: "paragraph", content: inlineFromPM(Fragment.from(n.content)) }, task: null, children: [] });
+			out.push({
+				body: { type: "paragraph", content: inlineFromPM(Fragment.from(n.content)) },
+				task: null,
+				children: [],
+			});
 		} else {
 			out.push({ body: bodyFromPM(n), task: null, children: [] });
 		}

@@ -34,7 +34,8 @@ function fromUnits(units: Unit[]): Inline[] {
 		else if (u.kind === "atom") out.push({ ...u.node, marks: u.marks });
 		else {
 			const last = out[out.length - 1];
-			if (last && last.type === "text" && markKey(last.marks) === markKey(u.marks)) last.text += u.ch;
+			if (last && last.type === "text" && markKey(last.marks) === markKey(u.marks))
+				last.text += u.ch;
 			else out.push({ type: "text", text: u.ch, marks: u.marks });
 		}
 	}
@@ -52,7 +53,8 @@ function markKey(marks: Mark[]): string {
 function unitKey(u: Unit | undefined): string {
 	if (!u) return "∅";
 	if (u.kind === "br") return "\n";
-	if (u.kind === "atom") return `@${u.node.ref}|${u.node.label ?? ""}{${markKey(u.marks.filter((m) => m.type !== "code" && m.type !== "link"))}}`;
+	if (u.kind === "atom")
+		return `@${u.node.ref}|${u.node.label ?? ""}{${markKey(u.marks.filter((m) => m.type !== "code" && m.type !== "link"))}}`;
 	if (/\s/.test(u.ch) && !u.marks.some((m) => m.type === "code")) return u.ch;
 	return `${u.ch}{${markKey(u.marks)}}`;
 }
@@ -62,15 +64,26 @@ function normUnits(units: Unit[], trim: boolean): Unit[] {
 	const out: Unit[] = [];
 	for (const u of units) {
 		if (u.kind === "br") {
-			while (out.length && out[out.length - 1].kind === "ch" && /[ \t]/.test((out[out.length - 1] as { ch: string }).ch)) out.pop();
+			while (
+				out.length &&
+				out[out.length - 1].kind === "ch" &&
+				/[ \t]/.test((out[out.length - 1] as { ch: string }).ch)
+			)
+				out.pop();
 			if (!out.length || out[out.length - 1].kind === "br") continue;
 		}
 		out.push(u);
 	}
 	while (out.length && out[out.length - 1].kind === "br") out.pop();
 	if (trim) {
-		while (out.length && out[0].kind === "ch" && /\s/.test((out[0] as { ch: string }).ch)) out.shift();
-		while (out.length && out[out.length - 1].kind === "ch" && /\s/.test((out[out.length - 1] as { ch: string }).ch)) out.pop();
+		while (out.length && out[0].kind === "ch" && /\s/.test((out[0] as { ch: string }).ch))
+			out.shift();
+		while (
+			out.length &&
+			out[out.length - 1].kind === "ch" &&
+			/\s/.test((out[out.length - 1] as { ch: string }).ch)
+		)
+			out.pop();
 	}
 	return out;
 }
@@ -86,7 +99,8 @@ function withContainers(b: Body, cs: Inline[][]): Body {
 		let k = 0;
 		return { ...b, rows: b.rows.map((r) => r.map(() => cs[k++])) };
 	}
-	if (b.type === "paragraph" || b.type === "heading" || b.type === "quote") return { ...b, content: cs[0] };
+	if (b.type === "paragraph" || b.type === "heading" || b.type === "quote")
+		return { ...b, content: cs[0] };
 	return b;
 }
 
@@ -157,7 +171,8 @@ function degrade(units: Unit[], i: number, parsed: Unit[]): boolean {
 		}
 		return true;
 	}
-	for (let k = s; k <= e; k++) units[k] = { ...units[k], marks: without(units[k].marks, culprit) } as Unit;
+	for (let k = s; k <= e; k++)
+		units[k] = { ...units[k], marks: without(units[k].marks, culprit) } as Unit;
 	safeStats.dropped++;
 	return true;
 }
@@ -165,9 +180,7 @@ function degrade(units: Unit[], i: number, parsed: Unit[]): boolean {
 function stripMarks(b: Body): Body {
 	return withContainers(
 		b,
-		containers(b).map((c) =>
-			c.map((n) => (n.type === "br" ? n : { ...n, marks: [] })),
-		),
+		containers(b).map((c) => c.map((n) => (n.type === "br" ? n : { ...n, marks: [] }))),
 	);
 }
 
@@ -190,7 +203,7 @@ function fixedPoint(s: string, parsed: Body, want: Body): string {
 export function serializeBodySafe(body: Body): string {
 	if (body.type === "code" || body.type === "embed") return serializeBodyRaw(body);
 	safeStats.calls++;
-	let cur = body;
+	let cur: Body = body;
 	for (let attempt = 0; attempt < 16; attempt++) {
 		const s = serializeBodyRaw(cur);
 		const p = parseBlock(s);
@@ -208,4 +221,62 @@ export function serializeBodySafe(body: Body): string {
 	}
 	safeStats.dropped++;
 	return serializeBodyRaw(stripMarks(cur));
+}
+
+/**
+ * 测试用：按序列化器的规范化规则对齐两边，逐字比较。
+ * textEqual：文字是否相同；extraMarks：解析结果里多出来的标记个数；changed：有标记被降级的字数。
+ */
+export function compareBodies(
+	want: Body,
+	got: Body,
+): { textEqual: boolean; extraMarks: number; changed: number } {
+	const A = containers(want);
+	const B = containers(got);
+	if (A.length !== B.length) return { textEqual: false, extraMarks: 0, changed: 0 };
+	const trim = want.type === "heading" || want.type === "table";
+	let extraMarks = 0;
+	let changed = 0;
+	// 比较时再忽略：行尾空白、只有空白的行、末尾空白（视觉上不可见，序列化会规范化掉）
+	const cmpNorm = (u: Unit[]): Unit[] => {
+		const lines: Unit[][] = [[]];
+		for (const x of normUnits(u, trim)) {
+			if (x.kind === "br") lines.push([]);
+			else lines[lines.length - 1].push(x);
+		}
+		const isWs = (x: Unit) => x.kind === "ch" && /\s/.test(x.ch);
+		const kept = lines
+			.map((l) => {
+				const r = [...l];
+				while (r.length && isWs(r[r.length - 1])) r.pop();
+				return r;
+			})
+			.filter((l) => l.length > 0);
+		const out: Unit[] = [];
+		kept.forEach((l, i) => {
+			if (i > 0) out.push({ kind: "br", marks: [] });
+			out.push(...l);
+		});
+		return out;
+	};
+	for (let c = 0; c < A.length; c++) {
+		const a = cmpNorm(toUnits(A[c]));
+		const b = cmpNorm(toUnits(B[c]));
+		const txt = (u: Unit[]) =>
+			u.map((x) => (x.kind === "ch" ? x.ch : x.kind === "br" ? "\n" : "@")).join("");
+		if (txt(a) !== txt(b)) return { textEqual: false, extraMarks, changed };
+		for (let i = 0; i < a.length; i++) {
+			if (unitKey(a[i]) === unitKey(b[i])) continue;
+			changed++;
+			const have = new Set(a[i].marks.map(mk));
+			if (
+				b[i].marks.some(
+					(m) =>
+						!have.has(mk(m)) && !(b[i].kind === "ch" && /\s/.test((b[i] as { ch: string }).ch)),
+				)
+			)
+				extraMarks++;
+		}
+	}
+	return { textEqual: true, extraMarks, changed };
 }

@@ -82,7 +82,8 @@ export class Net {
 	}
 
 	private checkIdle() {
-		for (const l of this.links.values()) if (!l.held && (l.toServer.length || l.toClient.length)) return;
+		for (const l of this.links.values())
+			if (!l.held && (l.toServer.length || l.toClient.length)) return;
 		const w = this.idleWaiters;
 		this.idleWaiters = [];
 		for (const f of w) f();

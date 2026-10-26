@@ -6,7 +6,8 @@
 		"build": "bun scripts/build.ts",
 		"test": "bun test test/",
 		"e2e": "bun scripts/build.ts && node e2e/run.mjs",
-		"serve": "bun scripts/build.ts && node e2e/serve.mjs"
+		"serve": "bun scripts/build.ts && node e2e/serve.mjs",
+		"check": "cd ../.. && bunx tsgo --noEmit -p prototypes/outline-editor && bunx @biomejs/biome check prototypes/outline-editor"
 	},
 	"dependencies": {
 		"marked": "18.0.7",

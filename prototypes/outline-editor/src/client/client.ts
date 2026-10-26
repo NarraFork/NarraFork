@@ -6,7 +6,7 @@
  *   只撤销自己的；结构用逆操作。经嵌入/拼接视图编辑别的页，也记在同一个栈里。
  */
 import * as Y from "yjs";
-import { applyHunks, type Hunk, simpleDiff } from "../model/diff";
+import { applyHunks, type DeltaOp, type Hunk, simpleDiff } from "../model/diff";
 import { merge3 } from "../model/merge3";
 import { type BlockRec, type Op, Store } from "../model/store";
 import type { Msg, Net } from "../net";
@@ -75,12 +75,18 @@ export class Client {
 	undoStack: Step[] = [];
 	redoStack: Step[] = [];
 	originView: OutlineView | null = null;
-	presence = new Map<string, { user: string; color: string; pageId: string; blockId: string; offset: number }>();
-	stats = { txSent: 0, rejects: 0, remoteTx: 0, deferredSyncs: 0 };
+	presence = new Map<
+		string,
+		{ user: string; color: string; pageId: string; blockId: string; offset: number }
+	>();
+	stats = { txSent: 0, rejects: 0, resyncs: 0, remoteTx: 0, deferredSyncs: 0 };
 	log: string[] = [];
 	private outY = new Map<string, Uint8Array[]>();
+	/** 还没被确认的 text 操作（Y.Text 建好之前的输入）：确认之前一直用乐观内容，后续输入也继续走 text 操作。 */
+	pendingText = new Map<string, number>();
 	private textCache = new Map<string, string>();
 	private openRequested = new Set<string>();
+	private resyncing = new Set<string>();
 	private txCounter = 0;
 	private undoing = false;
 	onChange: (() => void) | null = null;
@@ -138,8 +144,11 @@ export class Client {
 					this.textCache.delete(id);
 					if (local) {
 						for (const v of this.views) if (v !== this.originView) v.noteTextReset(id);
+					} else if ((this.pendingText.get(id) ?? 0) > 0) {
+						// 编辑器显示的是乐观内容，Y.Text 的 delta 对不上：确认后按 diff 映射光标
+						for (const v of this.views) v.noteTextReset(id);
 					} else {
-						const delta = ev.delta as Array<{ insert?: string; delete?: number; retain?: number }>;
+						const delta = ev.delta as DeltaOp[];
 						for (const v of this.views) v.noteDelta(id, delta);
 					}
 				}
@@ -170,6 +179,7 @@ export class Client {
 	}
 
 	textOf(id: string): string {
+		if ((this.pendingText.get(id) ?? 0) > 0) return this.visible.get(id)?.content ?? "";
 		const c = this.textCache.get(id);
 		if (c !== undefined) return c;
 		const t = this.ytext(id);
@@ -213,17 +223,19 @@ export class Client {
 
 	/** 写一段正文：有 Y.Text 写差异；没有就发 text 操作，由服务端初始化后三方合并。 */
 	private writeBody(b: BodyChange, origin: unknown, ops: Op[], inverses: Op[]) {
-		const t = this.ytext(b.id);
+		const t = (this.pendingText.get(b.id) ?? 0) > 0 ? undefined : this.ytext(b.id);
 		if (t) {
 			const cur = t.toString();
 			if (cur === b.md && !b.hunks) return;
 			const pageId = this.visible.get(b.id)?.pageId ?? "";
 			const doc = this.page(pageId).doc;
 			doc.transact(() => {
-				const hunks = b.hunks ?? (() => {
-					const h = simpleDiff(cur, b.md);
-					return h ? [h] : [];
-				})();
+				const hunks =
+					b.hunks ??
+					(() => {
+						const h = simpleDiff(cur, b.md);
+						return h ? [h] : [];
+					})();
 				for (const h of [...hunks].sort((x, y) => y.start - x.start)) {
 					if (h.end > h.start) t.delete(h.start, h.end - h.start);
 					if (h.text) t.insert(h.start, h.text);
@@ -234,6 +246,7 @@ export class Client {
 		const base = this.visible.get(b.id)?.content ?? "";
 		if (base === b.md) return;
 		const op: Op = { t: "text", id: b.id, base, next: b.md };
+		this.pendingText.set(b.id, (this.pendingText.get(b.id) ?? 0) + 1);
 		const inv = this.visible.apply(op);
 		if (inv) inverses.unshift(inv);
 		ops.push(op);
@@ -355,7 +368,8 @@ export class Client {
 					this.log.push(`撤销：父块 ${op.parentId} 已不在，跳过恢复 ${op.id}`);
 					continue;
 				}
-				if (op.t === "move" && (!this.visible.alive(op.id) || !this.visible.alive(op.parentId))) continue;
+				if (op.t === "move" && (!this.visible.alive(op.id) || !this.visible.alive(op.parentId)))
+					continue;
 				const inv = this.visible.apply(op, (id) => this.textOf(id));
 				if (inv) inverses.unshift(inv);
 				ops.push(op);
@@ -399,14 +413,16 @@ export class Client {
 		switch (m.t) {
 			case "joined": {
 				const pageId = m.pageId as string;
-				const resync = this.page(pageId).joined;
+				const resync = this.resyncing.has(pageId);
+				this.resyncing.delete(pageId);
+				const waiters = this.page(pageId).waiters;
 				if (resync) this.resetPage(pageId);
 				for (const b of m.blocks as BlockRec[]) this.confirmed.put(b);
 				const p = this.page(pageId);
 				Y.applyUpdate(p.doc, m.y as Uint8Array, REMOTE);
 				p.joined = true;
 				this.rebuildVisible();
-				const w = p.waiters;
+				const w = resync ? waiters : p.waiters;
 				p.waiters = [];
 				for (const f of w) f();
 				this.syncViews(null, resync);
@@ -426,6 +442,14 @@ export class Client {
 			case "ack": {
 				const p = this.pending.shift();
 				const ops = m.ops as Op[];
+				for (const op of p?.ops ?? []) {
+					if (op.t !== "text") continue;
+					const n = (this.pendingText.get(op.id) ?? 1) - 1;
+					if (n > 0) this.pendingText.set(op.id, n);
+					else this.pendingText.delete(op.id);
+					this.textCache.delete(op.id);
+					for (const v of this.views) v.noteTextReset(op.id);
+				}
 				for (const op of ops) this.confirmed.apply(op);
 				const same = p && JSON.stringify(p.ops) === JSON.stringify(ops);
 				if (!same) this.rebuildVisible();
@@ -439,6 +463,7 @@ export class Client {
 				const pagesToSync = new Set<string>();
 				for (const p of this.pending) for (const op of p.ops) pagesToSync.add(this.pageOf(op.id));
 				this.pending = [];
+				this.pendingText.clear();
 				this.rebuildVisible();
 				for (const pid of pagesToSync) if (pid) this.resync(pid);
 				this.syncViews(null);
@@ -468,9 +493,9 @@ export class Client {
 	/** 被拒绝：丢弃这一页的本地状态，重新同步（§6.4）。 */
 	private resync(pageId: string) {
 		const p = this.pages.get(pageId);
-		if (!p) return;
-		p.joined = false;
-		p.waiters.push(() => {});
+		if (!p || this.resyncing.has(pageId)) return;
+		this.resyncing.add(pageId);
+		this.stats.resyncs++;
 		this.net.sendToServer(this.id, { t: "join", pageId });
 	}
 
@@ -479,13 +504,14 @@ export class Client {
 		old?.um.destroy();
 		old?.doc.destroy();
 		this.pages.delete(pageId);
-		for (const [id, b] of [...this.confirmed.blocks]) if (b.pageId === pageId || id === pageId) this.confirmed.blocks.delete(id);
+		for (const [id, b] of [...this.confirmed.blocks])
+			if (b.pageId === pageId || id === pageId) this.confirmed.blocks.delete(id);
 		this.confirmed = Store.from(this.confirmed.blocks.values());
 		this.undoStack = this.undoStack.filter((s) => !s.umPages.has(pageId));
 		this.redoStack = [];
 		this.textCache.clear();
 		this.openRequested.clear();
-		this.createPage(pageId).joined = true;
+		this.createPage(pageId);
 	}
 
 	syncViews(except: OutlineView | null, full = false) {
@@ -504,7 +530,11 @@ export class Client {
 			for (const c of this.visible.children(id)) {
 				const b = this.visible.get(c);
 				const task = b?.task ? `[${b.task}] ` : "";
-				lines.push(`${"  ".repeat(depth)}- ${task}${this.textOf(c).split("\n").join(`\n${"  ".repeat(depth + 1)}`)}`);
+				lines.push(
+					`${"  ".repeat(depth)}- ${task}${this.textOf(c)
+						.split("\n")
+						.join(`\n${"  ".repeat(depth + 1)}`)}`,
+				);
 				walk(c, depth + 1);
 			}
 		};

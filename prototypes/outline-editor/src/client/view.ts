@@ -21,7 +21,14 @@ import { ReplaceStep } from "prosemirror-transform";
 import { Decoration, DecorationSet, EditorView, type NodeView } from "prosemirror-view";
 import { parseBlock, parseOutline, pmToSrc, srcToPm } from "../dialect/parse";
 import { serializeInlineFragment, serializeOutline } from "../dialect/serialize";
-import { type DeltaOp, diffHunks, type Hunk, hunksToDelta, mapOffset, simpleDiff } from "../model/diff";
+import {
+	type DeltaOp,
+	diffHunks,
+	type Hunk,
+	hunksToDelta,
+	mapOffset,
+	simpleDiff,
+} from "../model/diff";
 import { keyBetween } from "../model/orderkey";
 import type { Op } from "../model/store";
 import type { BodyChange, Client, SelInfo, SelPoint } from "./client";
@@ -37,7 +44,14 @@ import {
 	splitBlock,
 	toggleTask,
 } from "./commands";
-import { bodyToPM, fragmentToOutline, inlineFromPM, outlineToPM, parseToPM, serializePM } from "./convert";
+import {
+	bodyToPM,
+	fragmentToOutline,
+	inlineFromPM,
+	outlineToPM,
+	parseToPM,
+	serializePM,
+} from "./convert";
 import { schema } from "./schema";
 
 const N = schema.nodes;
@@ -121,7 +135,18 @@ export class OutlineView implements CmdHost {
 	chain: string[];
 	placeholderId: string;
 	lastSelBlock: string | null = null;
-	stats = { syncs: 0, syncMs: 0, reconcileFast: 0, reconcileFull: 0, deferred: 0, fallbackReplace: 0 };
+	/** reconcile 算出的拼接视图新根序列：本地校验通过后才生效 */
+	private pendingRoots: string[] | null = null;
+	stats = {
+		syncs: 0,
+		syncMs: 0,
+		reconcileFast: 0,
+		reconcileFull: 0,
+		deferred: 0,
+		frozenSkips: 0,
+		fallbackReplace: 0,
+		crossPageRefused: 0,
+	};
 
 	constructor(
 		public client: Client,
@@ -260,6 +285,7 @@ export class OutlineView implements CmdHost {
 			const rec = v.alive(id);
 			if (!rec || depth > 100) return null;
 			if (id === frozenId && frozenNode) {
+				if (this.client.textOf(id) !== this.nodeCache.get(id)?.content) this.stats.frozenSkips++;
 				frozenNode.descendants((n) => {
 					if (n.type === N.block) {
 						const c = this.nodeCache.get(n.attrs.id);
@@ -274,8 +300,11 @@ export class OutlineView implements CmdHost {
 			const content = this.client.textOf(id);
 			const c = this.nodeCache.get(id);
 			let body: PMNode;
-			if (c && c.content === content) body = c.body;
-			else {
+			if (c && c.content === content) {
+				body = c.body;
+				// 内容没变：之前记下的映射（例如 Y.Text 刚建好时的 reset）作废
+				if (this.pendingMap.has(id)) this.pendingMap.delete(id);
+			} else {
 				body = parseToPM(content).node;
 				if (c) changed.add(id);
 			}
@@ -286,7 +315,13 @@ export class OutlineView implements CmdHost {
 			}
 			const collapsed = this.collapsed.has(id) && kids.length > 0;
 			let node: PMNode;
-			if (c && c.body === body && c.task === rec.task && c.collapsed === collapsed && sameArr(c.kids, kids))
+			if (
+				c &&
+				c.body === body &&
+				c.task === rec.task &&
+				c.collapsed === collapsed &&
+				sameArr(c.kids, kids)
+			)
 				node = c.node;
 			else
 				node = N.block.create(
@@ -466,7 +501,12 @@ export class OutlineView implements CmdHost {
 			const bpos = findBlockPos(doc, pr.blockId);
 			if (bpos == null) continue;
 			const block = doc.nodeAt(bpos) as PMNode;
-			decos.push(Decoration.node(bpos, bpos + block.nodeSize, { class: "ob-peer", style: `--peer:${pr.color}` }));
+			decos.push(
+				Decoration.node(bpos, bpos + block.nodeSize, {
+					class: "ob-peer",
+					style: `--peer:${pr.color}`,
+				}),
+			);
 			const map = parseToPM(this.client.textOf(pr.blockId)).map;
 			const off = Math.min(srcToPm(map, pr.offset), block.child(0).content.size);
 			const el = document.createElement("span");
@@ -475,7 +515,11 @@ export class OutlineView implements CmdHost {
 			el.dataset.user = pr.user;
 			decos.push(Decoration.widget(bpos + 2 + off, el, { side: 1, key: `peer-${cid}` }));
 		}
-		this.pm.dispatch(this.pm.state.tr.setMeta(presenceKey, DecorationSet.create(doc, decos)).setMeta("remote", true));
+		this.pm.dispatch(
+			this.pm.state.tr
+				.setMeta(presenceKey, DecorationSet.create(doc, decos))
+				.setMeta("remote", true),
+		);
 	}
 
 	// ---------- 输入 → 大纲事务 ----------
@@ -622,7 +666,8 @@ export class OutlineView implements CmdHost {
 				emit(r, parentId, key);
 			}
 		}
-		for (const r of oldRecs) if (!newIds.has(r.id) && v.alive(r.id)) deletes.push({ t: "delete", id: r.id });
+		for (const r of oldRecs)
+			if (!newIds.has(r.id) && v.alive(r.id)) deletes.push({ t: "delete", id: r.id });
 		for (const r of newRecs) {
 			if (inserted.has(r.id)) continue;
 			const body = r.node.child(0);
@@ -640,7 +685,10 @@ export class OutlineView implements CmdHost {
 	/** 嵌入 / 拼接视图的顶层：根块的位置不在这里改；新出现的顶层块放在前一个根块后面（同一页）。 */
 	private reconcileTop(kids: Rec[], emit: (r: Rec, parentId: string, key: string) => void) {
 		const v = this.client.visible;
-		const roots = this.surface.kind === "stitch" ? this.surface.roots : [(this.surface as { blockId: string }).blockId];
+		const roots =
+			this.surface.kind === "stitch"
+				? this.surface.roots
+				: [(this.surface as { blockId: string }).blockId];
 		const rootSet = new Set(roots);
 		const order: string[] = [];
 		let prevRoot: string | null = null;
@@ -676,16 +724,20 @@ export class OutlineView implements CmdHost {
 			order.push(r.id);
 			if (this.surface.kind === "stitch") rootSet.add(r.id);
 		}
-		if (this.surface.kind === "stitch") this.surface.roots = order;
+		if (this.surface.kind === "stitch") this.pendingRoots = order;
 	}
 
 	private cacheNode(node: PMNode, bodies: Map<string, string>): PMNode[] {
 		const id = node.attrs.id as string;
 		const kids: PMNode[] = [];
-		if (node.childCount > 1) node.child(1).forEach((k) => kids.push(k));
+		if (node.childCount > 1)
+			node.child(1).forEach((k) => {
+				kids.push(k);
+			});
 		const old = this.nodeCache.get(id);
 		const body = node.child(0);
-		const content = bodies.get(id) ?? (old && old.body === body ? old.content : this.client.textOf(id));
+		const content =
+			bodies.get(id) ?? (old && old.body === body ? old.content : this.client.textOf(id));
 		this.nodeCache.set(id, {
 			content,
 			body,
@@ -701,7 +753,65 @@ export class OutlineView implements CmdHost {
 		const visit = (node: PMNode) => {
 			for (const k of this.cacheNode(node, bodies)) visit(k);
 		};
-		doc.forEach((n) => visit(n));
+		doc.forEach((n) => {
+			visit(n);
+		});
+	}
+
+	/**
+	 * 本地修改 = shadow（编辑器当前反映的源码）→ local 的差异；当前 Y.Text 里可能还有没投影进来的
+	 * 远端修改（输入法组合期间推迟了），所以把差异按这些远端修改映射过去再写，绝不拿 local 直接覆盖当前文本。
+	 */
+	private rebase(id: string, shadow: string, local: string, current: string) {
+		const hunks = diffHunks(shadow, local);
+		const pm = this.pendingMap.get(id);
+		const R = (p: number): number => {
+			if (Array.isArray(pm)) {
+				let x = p;
+				for (const d of pm) x = mapOffset(d, x);
+				return x;
+			}
+			if (typeof pm === "function") return pm(p);
+			const h = simpleDiff(shadow, current);
+			return h ? mapOffset(hunksToDelta([h]), p) : p;
+		};
+		const mapped: Hunk[] = hunks.map((h) => {
+			const s = R(h.start);
+			const e = h.start === h.end ? s : Math.max(s, R(h.end));
+			return { start: s, end: e, text: h.text };
+		});
+		// 本地坐标 → 最终坐标（用来放光标）
+		const finalOf = (p: number): number => {
+			let shift = 0;
+			let applied = 0;
+			for (let i = 0; i < hunks.length; i++) {
+				const h = hunks[i];
+				const ls = h.start + shift;
+				if (p < ls) return R(p - shift) + applied;
+				if (p <= ls + h.text.length) return mapped[i].start + applied + (p - ls);
+				shift += h.text.length - (h.end - h.start);
+				applied += h.text.length - (mapped[i].end - mapped[i].start);
+			}
+			return R(p - shift) + applied;
+		};
+		return { hunks: mapped, finalOf };
+	}
+
+	/** 一个块的正文修改：没有未投影的远端修改时直接 diff，否则 rebase。 */
+	private bodyChange(
+		id: string,
+		md: string,
+		rebased: Map<string, (p: number) => number>,
+	): BodyChange | null {
+		const current = this.client.textOf(id);
+		const shadow = this.nodeCache.get(id)?.content;
+		if (shadow === undefined || shadow === current || !this.client.ytext(id)) {
+			return md === current ? null : { id, md };
+		}
+		if (md === shadow) return null; // 本地没改，只是有待投影的远端修改
+		const r = this.rebase(id, shadow, md, current);
+		rebased.set(id, r.finalOf);
+		return { id, md, hunks: r.hunks };
 	}
 
 	dispatch(tr: Transaction) {
@@ -726,6 +836,7 @@ export class OutlineView implements CmdHost {
 		let ops: Op[] = [];
 		let bodies: BodyChange[] = [];
 		const bodyMd = new Map<string, string>();
+		const rebased = new Map<string, (p: number) => number>();
 		if (fast) {
 			this.stats.reconcileFast++;
 			for (const id of fast) {
@@ -733,7 +844,8 @@ export class OutlineView implements CmdHost {
 				if (pos == null) continue;
 				const md = serializePM((doc.nodeAt(pos) as PMNode).child(0));
 				bodyMd.set(id, md);
-				if (md !== this.client.textOf(id)) bodies.push({ id, md });
+				const b = this.bodyChange(id, md, rebased);
+				if (b) bodies.push(b);
 			}
 			// 快路径：只刷新这个块和它的祖先在缓存里的节点
 			for (const id of fast) {
@@ -748,9 +860,34 @@ export class OutlineView implements CmdHost {
 		} else {
 			this.stats.reconcileFull++;
 			const moved = (tr.getMeta("moved") as Set<string> | undefined) ?? new Set<string>();
+			this.pendingRoots = null;
 			const r = this.reconcileFull(before.doc, doc, moved);
+			// 块不跨页移动：ProseMirror 的默认合并（跨页的跨块删除）会把后一页的子块挂到前一页的块下面，
+			// 服务端会拒绝。这里先在本地拒绝，避免往返和重新同步。
+			const v = this.client.visible;
+			const pageOfNew = new Map<string, string>();
+			for (const op of r.ops) if (op.t === "insert") pageOfNew.set(op.id, op.pageId);
+			const cross = r.ops.find((op) => {
+				if (op.t !== "move") return false;
+				const pid = pageOfNew.get(op.parentId) ?? this.client.pageOf(op.parentId);
+				return pid !== v.get(op.id)?.pageId;
+			});
+			if (cross) {
+				this.stats.crossPageRefused++;
+				this.client.log.push(`跨页移动被拒绝：${cross.t} ${(cross as { id: string }).id}`);
+				this.pendingRoots = null;
+				this.pm.updateState(before);
+				return;
+			}
+			if (this.pendingRoots && this.surface.kind === "stitch")
+				this.surface.roots = this.pendingRoots;
+			this.pendingRoots = null;
 			ops = r.ops;
-			bodies = r.bodies;
+			bodies = [];
+			for (const b of r.bodies) {
+				const c = this.bodyChange(b.id, b.md, rebased);
+				if (c) bodies.push(c);
+			}
 			for (const b of bodies) bodyMd.set(b.id, b.md);
 			for (const op of ops) if (op.t === "insert") bodyMd.set(op.id, op.content);
 			this.refreshCacheFromDoc(doc, bodyMd);
@@ -765,6 +902,11 @@ export class OutlineView implements CmdHost {
 			selAfter: this.captureSel(state),
 			view: this,
 		});
+		if (rebased.size) {
+			// 编辑器里还是 local；最终文本里多了远端修改：按映射重新投影这些块，保住光标
+			for (const [id, f] of rebased) this.pendingMap.set(id, f);
+			this.sync();
+		}
 		this.afterSelection();
 	}
 
@@ -777,68 +919,25 @@ export class OutlineView implements CmdHost {
 		this.compositionDirty = false;
 		if (id && dirty) {
 			const pos = findBlockPos(this.pm.state.doc, id);
-			const c = this.nodeCache.get(id);
-			if (pos != null && c) {
+			if (pos != null && this.nodeCache.get(id)) {
 				const node = this.pm.state.doc.nodeAt(pos) as PMNode;
 				const local = serializePM(node.child(0));
-				const shadow = c.content;
-				if (local !== shadow) {
-					if (this.client.ytext(id)) {
-						const current = this.client.textOf(id);
-						const hunks = diffHunks(shadow, local);
-						const pm = this.pendingMap.get(id);
-						const R = (p: number): number => {
-							if (Array.isArray(pm)) {
-								let x = p;
-								for (const d of pm) x = mapOffset(d, x);
-								return x;
-							}
-							const h = simpleDiff(shadow, current);
-							return h ? mapOffset(hunksToDelta([h]), p) : p;
-						};
-						const mapped: Hunk[] = hunks.map((h) => {
-							const s = R(h.start);
-							const e = h.start === h.end ? s : Math.max(s, R(h.end));
-							return { start: s, end: e, text: h.text };
-						});
-						// 本地坐标 → 最终坐标（用来放光标）
-						const finalOf = (p: number): number => {
-							let shift = 0;
-							let applied = 0;
-							for (let i = 0; i < hunks.length; i++) {
-								const h = hunks[i];
-								const ls = h.start + shift;
-								if (p < ls) return R(p - shift) + applied;
-								if (p <= ls + h.text.length) return mapped[i].start + applied + (p - ls);
-								shift += h.text.length - (h.end - h.start);
-								applied += h.text.length - (mapped[i].end - mapped[i].start);
-							}
-							return R(p - shift) + applied;
-						};
-						this.client.commit({
-							ops: [],
-							bodies: [{ id, md: local, hunks: mapped }],
-							kind: "typing",
-							blockId: id,
-							selBefore: this.compSelBefore,
-							selAfter: this.captureSel(),
-							view: this,
-						});
-						this.nodeCache.set(id, { ...c, content: local, body: node.child(0), node });
-						this.pendingMap.set(id, finalOf);
-					} else {
-						this.client.commit({
-							ops: [],
-							bodies: [{ id, md: local }],
-							kind: "typing",
-							blockId: id,
-							selBefore: this.compSelBefore,
-							selAfter: this.captureSel(),
-							view: this,
-						});
-						this.nodeCache.set(id, { ...c, content: local, body: node.child(0), node });
-					}
+				const rebased = new Map<string, (p: number) => number>();
+				const b = this.bodyChange(id, local, rebased);
+				if (b) {
+					this.client.commit({
+						ops: [],
+						bodies: [b],
+						kind: "typing",
+						blockId: id,
+						selBefore: this.compSelBefore,
+						selAfter: this.captureSel(),
+						view: this,
+					});
 				}
+				const c = this.nodeCache.get(id);
+				if (c) this.nodeCache.set(id, { ...c, content: local, body: node.child(0), node });
+				for (const [k, f] of rebased) this.pendingMap.set(k, f);
 			}
 		}
 		this.deferred = false;
@@ -848,12 +947,23 @@ export class OutlineView implements CmdHost {
 	// ---------- 剪贴板 ----------
 
 	private copyText(slice: Slice): string {
+		// 选区的 slice 带着外层节点（outline > block > 块体）：两端都开着的单个外层节点逐层剥掉
+		let frag = slice.content;
+		let os = slice.openStart;
+		let oe = slice.openEnd;
+		while (frag.childCount === 1 && os > 0 && oe > 0 && !(frag.firstChild as PMNode).isTextblock) {
+			frag = (frag.firstChild as PMNode).content;
+			os--;
+			oe--;
+		}
+		if (frag.childCount === 1 && (frag.firstChild as PMNode).isTextblock && os > 0 && oe > 0)
+			frag = (frag.firstChild as PMNode).content;
 		let inline = true;
-		slice.content.forEach((n) => {
+		frag.forEach((n) => {
 			if (!n.isInline) inline = false;
 		});
-		if (inline) return serializeInlineFragment(inlineFromPM(slice.content));
-		return serializeOutline(fragmentToOutline(slice.content));
+		if (inline) return serializeInlineFragment(inlineFromPM(frag));
+		return serializeOutline(fragmentToOutline(frag));
 	}
 
 	private handlePaste(ev: ClipboardEvent): boolean {
@@ -866,16 +976,23 @@ export class OutlineView implements CmdHost {
 			this.pm.dispatch(state.tr.insertText(text));
 			return true;
 		}
-		const single = !text.trim().includes("\n") && !/^\s*([-*+]\s|\d+[.)]\s|#{1,6}\s|>|```|\|)/.test(text);
+		const single =
+			!text.trim().includes("\n") && !/^\s*([-*+]\s|\d+[.)]\s|#{1,6}\s|>|```|\|)/.test(text);
 		if (single || !$from.parent.type.spec.group?.includes("body")) {
 			const p = parseBlock(text.trim().replace(/\n/g, " "));
-			const frag = p.body.type === "paragraph" ? bodyToPM(p.body).content : Fragment.from(schema.text(text.trim()));
+			const frag =
+				p.body.type === "paragraph"
+					? bodyToPM(p.body).content
+					: Fragment.from(schema.text(text.trim()));
 			const nodes: PMNode[] = [];
 			frag.forEach((n) => {
-				if (n.type === N.hard_break && $from.parent.type !== N.paragraph) nodes.push(schema.text(" "));
+				if (n.type === N.hard_break && $from.parent.type !== N.paragraph)
+					nodes.push(schema.text(" "));
 				else nodes.push(n);
 			});
-			this.pm.dispatch(state.tr.replaceSelection(new Slice(Fragment.from(nodes), 0, 0)).scrollIntoView());
+			this.pm.dispatch(
+				state.tr.replaceSelection(new Slice(Fragment.from(nodes), 0, 0)).scrollIntoView(),
+			);
 			return true;
 		}
 		const parsed = parseOutline(text);
@@ -929,7 +1046,12 @@ export class OutlineView implements CmdHost {
 		const $from = state.doc.resolve(from);
 		const parent = $from.parent;
 		if (!parent.inlineContent || parent.type === N.code_block) return false;
-		const before = parent.textBetween(Math.max(0, $from.parentOffset - 200), $from.parentOffset, null, "￼");
+		const before = parent.textBetween(
+			Math.max(0, $from.parentOffset - 200),
+			$from.parentOffset,
+			null,
+			"￼",
+		);
 		if (text === "]") {
 			const m = /\[\[([^[\]\n|￼]+)(?:\|([^[\]\n￼]*))?\]$/.exec(before);
 			if (m) {
@@ -943,7 +1065,9 @@ export class OutlineView implements CmdHost {
 			const bodyPos = $from.before(d) + 1;
 			const h = /^(#{1,3})$/.exec(before);
 			if (h) {
-				const tr = state.tr.delete(from - before.length, to).setNodeMarkup(bodyPos, N.heading, { level: h[1].length });
+				const tr = state.tr
+					.delete(from - before.length, to)
+					.setNodeMarkup(bodyPos, N.heading, { level: h[1].length });
 				this.pm.dispatch(tr);
 				return true;
 			}
@@ -952,7 +1076,13 @@ export class OutlineView implements CmdHost {
 				return true;
 			}
 		}
-		if (text === "`" && parent.type === N.paragraph && before === "``" && $from.parentOffset === 2 && parent.content.size === 2) {
+		if (
+			text === "`" &&
+			parent.type === N.paragraph &&
+			before === "``" &&
+			$from.parentOffset === 2 &&
+			parent.content.size === 2
+		) {
 			const d = blockDepth($from);
 			const bodyPos = $from.before(d) + 1;
 			this.pm.dispatch(state.tr.delete(from - 2, to).setNodeMarkup(bodyPos, N.code_block));
@@ -1064,8 +1194,12 @@ class MentionView implements NodeView {
 		this.dom.className = "ob-mention";
 		this.dom.dataset.ref = node.attrs.ref;
 		const { blockId } = refTarget(node.attrs.ref);
-		const text = owner.client.visible.alive(blockId) ? owner.client.textOf(blockId).split("\n")[0] : null;
-		this.dom.textContent = node.attrs.label ?? (text ? text.replace(/[#*_`~[\]>!\\]/g, "").slice(0, 40) : node.attrs.ref);
+		const text = owner.client.visible.alive(blockId)
+			? owner.client.textOf(blockId).split("\n")[0]
+			: null;
+		this.dom.textContent =
+			node.attrs.label ??
+			(text ? text.replace(/[#*_`~[\]>!\\]/g, "").slice(0, 40) : node.attrs.ref);
 	}
 	ignoreMutation() {
 		return true;
@@ -1082,7 +1216,7 @@ class EmbedView implements NodeView {
 		private node: PMNode,
 		_view: EditorView,
 		_getPos: () => number,
-		private owner: OutlineView,
+		owner: OutlineView,
 	) {
 		this.dom = document.createElement("div");
 		this.dom.className = "ob-embed";

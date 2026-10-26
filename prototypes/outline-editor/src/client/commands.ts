@@ -117,8 +117,12 @@ export function splitBlock(host: CmdHost): Command {
 }
 
 function inlineFor(target: PMNode, src: PMNode): Fragment {
-	if (target.type === N.code_block) return src.textContent ? Fragment.from(schema.text(src.textContent)) : Fragment.empty;
-	if (src.type === N.code_block) return src.textContent ? Fragment.from(schema.text(src.textContent.replace(/\n/g, " "))) : Fragment.empty;
+	if (target.type === N.code_block)
+		return src.textContent ? Fragment.from(schema.text(src.textContent)) : Fragment.empty;
+	if (src.type === N.code_block)
+		return src.textContent
+			? Fragment.from(schema.text(src.textContent.replace(/\n/g, " ")))
+			: Fragment.empty;
 	if (target.type === N.heading) {
 		const nodes: PMNode[] = [];
 		src.content.forEach((n) => {
@@ -131,7 +135,7 @@ function inlineFor(target: PMNode, src: PMNode): Fragment {
 }
 
 /** 块首 Backspace：标题 / 引用先变段落；段落并入文档顺序里的上一块，子块跟过去。 */
-export function joinBackward(host: CmdHost): Command {
+export function joinBackward(_host: CmdHost): Command {
 	return (state, dispatch) => {
 		const sel = state.selection;
 		if (!sel.empty) return false;
@@ -172,6 +176,21 @@ export function joinBackward(host: CmdHost): Command {
 		const tBody = tNode.child(0);
 		const tr = state.tr;
 		const kids = blockNode.childCount > 1 ? blockNode.child(1).content : Fragment.empty;
+		// 上一块是空段落：删掉空块，而不是把有内容的块并进去（保住有内容的块的 id，指向它的链接不断）
+		if (
+			!targetIsParent &&
+			tBody.type === N.paragraph &&
+			tBody.content.size === 0 &&
+			tNode.childCount === 1
+		) {
+			const $t = state.doc.resolve(tPos);
+			if ($t.parent.type === N.children && $t.parent.childCount === 1)
+				tr.delete($t.before(), $t.after());
+			else tr.delete(tPos, tPos + tNode.nodeSize);
+			tr.setSelection(TextSelection.create(tr.doc, tr.mapping.map(blockPos) + 2));
+			dispatch?.(tr.scrollIntoView());
+			return true;
+		}
 		if (tBody.type === N.embed || tBody.type === N.table) {
 			if (body.content.size === 0 && kids.size === 0) {
 				if (parent.childCount === 1 && d > 1) tr.delete($from.before(d - 1), $from.after(d - 1));
@@ -218,6 +237,19 @@ export function joinForward(host: CmdHost): Command {
 		const body = $from.node(d).child(0);
 		if ($from.parent !== body || $from.parentOffset !== body.content.size) return false;
 		if (body.type === N.code_block) return false;
+		// 当前块是空的且没有子块：删掉它，光标去下一块开头（保住下一块的 id）
+		if (body.type === N.paragraph && body.content.size === 0 && $from.node(d).childCount === 1) {
+			const bp = $from.before(d);
+			const parent = $from.node(d - 1);
+			if (bp + $from.node(d).nodeSize >= state.doc.content.size && d === 1) return true;
+			const tr = state.tr;
+			if (parent.type === N.children && parent.childCount === 1)
+				tr.delete($from.before(d - 1), $from.after(d - 1));
+			else tr.delete(bp, bp + $from.node(d).nodeSize);
+			const $n = tr.doc.resolve(Math.min(tr.mapping.map(bp), tr.doc.content.size));
+			dispatch?.(tr.setSelection(TextSelection.near($n, 1)).scrollIntoView());
+			return true;
+		}
 		// 下一块的块体起点
 		let next: number | null = null;
 		state.doc.nodesBetween($from.pos, state.doc.content.size, (n, pos) => {

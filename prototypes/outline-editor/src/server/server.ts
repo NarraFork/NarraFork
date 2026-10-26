@@ -9,8 +9,8 @@
  */
 import * as Y from "yjs";
 import { normalizeBlock } from "../dialect/index";
-import type { OutlineNode, TaskState } from "../dialect/types";
 import { serializeBody } from "../dialect/serialize";
+import type { OutlineNode, TaskState } from "../dialect/types";
 import type { Hunk } from "../model/diff";
 import { merge3 } from "../model/merge3";
 import { keyBetween } from "../model/orderkey";
@@ -161,7 +161,12 @@ export class Server {
 				s.clients.add(from);
 				// 先把缓冲里的更新发给已在场的人，再给新人完整状态
 				const pending = this.takeUpdates([pageId]);
-				if (pending[pageId]) this.broadcast([pageId], { t: "tx", seq: this.seq, ops: [], y: pending, from: "server" }, from);
+				if (pending[pageId])
+					this.broadcast(
+						[pageId],
+						{ t: "tx", seq: this.seq, ops: [], y: pending, from: "server" },
+						from,
+					);
 				this.send(from, {
 					t: "joined",
 					pageId,
@@ -224,7 +229,7 @@ export class Server {
 	}
 
 	/** 同级排序键冲突时由服务端重新生成。 */
-	private fixKey(store: Store, op: Op & { orderKey: string; parentId: string }): Op {
+	private fixKey(store: Store, op: Extract<Op, { t: "insert" | "move" }>): Op {
 		const sibs = store.children(op.parentId).filter((x) => x !== op.id);
 		const keys = sibs.map((x) => store.get(x)?.orderKey ?? "");
 		if (!keys.includes(op.orderKey)) return op;
@@ -277,7 +282,8 @@ export class Server {
 		for (const op of textOps) {
 			const t = this.ensureText(op.id);
 			if (!t) continue;
-			const r = merge3(op.base, op.next, t.toString());
+			// 人的按键不拒绝（宽松合并）；见 RESULTS.md「首次编辑的竞争窗口」
+			const r = merge3(op.base, op.next, t.toString(), { lenient: true });
 			if (!r.ok) {
 				this.log.push(`拒绝 ${from} ${txId}: 块 ${op.id} 正文冲突`);
 				this.send(from, { t: "reject", txId, reason: `块 ${op.id} 正文冲突` });
@@ -331,7 +337,10 @@ export class Server {
 	// ---------- agent（§6.5） ----------
 
 	/** agent 读取一页：返回快照，并按会话缓存读到的正文作为合并基线。 */
-	agentRead(agent: string, pageId: string): { outline: string; blocks: Array<BlockRec & { depth: number }> } {
+	agentRead(
+		agent: string,
+		pageId: string,
+	): { outline: string; blocks: Array<BlockRec & { depth: number }> } {
 		let cache = this.agentReads.get(agent);
 		if (!cache) {
 			cache = new Map();
@@ -346,7 +355,9 @@ export class Server {
 				const text = this.textOf(c);
 				out.push({ ...b, content: text, depth });
 				cache?.set(c, { text, version: b.version });
-				lines.push(`${"  ".repeat(depth)}- ${text.split("\n").join(`\n${"  ".repeat(depth + 1)}`)} <!-- ${c} -->`);
+				lines.push(
+					`${"  ".repeat(depth)}- ${text.split("\n").join(`\n${"  ".repeat(depth + 1)}`)} <!-- ${c} -->`,
+				);
 				walk(c, depth + 1);
 			}
 		};
@@ -414,7 +425,14 @@ export class Server {
 					task: null,
 					children: norm.children,
 				};
-				const ids = this.insertNodes(e.parentId, parent.parentId === null ? parent.id : parent.pageId, e.after ?? null, [node], ops, norm.content);
+				const ids = this.insertNodes(
+					e.parentId,
+					parent.parentId === null ? parent.id : parent.pageId,
+					e.after ?? null,
+					[node],
+					ops,
+					norm.content,
+				);
 				res.applied.push({ t: "insert", id: ids[0] });
 				if (norm.notes.length) res.notes.push(`新块 ${ids[0]}：${norm.notes.join("；")}`);
 				continue;
@@ -423,7 +441,11 @@ export class Server {
 				const b = this.store.alive(e.id);
 				const read = cache.get(e.id);
 				if (!b || !read || read.version !== b.version) {
-					res.rejected.push({ t: e.t, id: e.id, reason: "块在读取之后变了（结构按读取时的版本检查）" });
+					res.rejected.push({
+						t: e.t,
+						id: e.id,
+						reason: "块在读取之后变了（结构按读取时的版本检查）",
+					});
 					continue;
 				}
 				if (e.t === "delete") {
@@ -440,8 +462,8 @@ export class Server {
 					}
 					const sibs = this.store.children(parentId).filter((x) => x !== e.id);
 					const idx = e.after ? sibs.indexOf(e.after) + 1 : 0;
-					const prev = idx > 0 ? this.store.get(sibs[idx - 1])?.orderKey ?? null : null;
-					const next = idx < sibs.length ? this.store.get(sibs[idx])?.orderKey ?? null : null;
+					const prev = idx > 0 ? (this.store.get(sibs[idx - 1])?.orderKey ?? null) : null;
+					const next = idx < sibs.length ? (this.store.get(sibs[idx])?.orderKey ?? null) : null;
 					const op: Op = { t: "move", id: e.id, parentId, orderKey: keyBetween(prev, next) };
 					this.store.apply(op);
 					ops.push(op);
@@ -477,8 +499,8 @@ export class Server {
 		const sibs = this.store.children(parentId);
 		let idx = after ? sibs.indexOf(after) + 1 : sibs.length;
 		if (idx < 0) idx = sibs.length;
-		let prev = idx > 0 ? this.store.get(sibs[idx - 1])?.orderKey ?? null : null;
-		const next = idx < sibs.length ? this.store.get(sibs[idx])?.orderKey ?? null : null;
+		let prev = idx > 0 ? (this.store.get(sibs[idx - 1])?.orderKey ?? null) : null;
+		const next = idx < sibs.length ? (this.store.get(sibs[idx])?.orderKey ?? null) : null;
 		nodes.forEach((n, i) => {
 			const id = newId("a");
 			const key = keyBetween(prev, next);
@@ -509,7 +531,11 @@ export class Server {
 			for (const c of this.store.children(id)) {
 				const b = this.store.get(c);
 				const task = b?.task ? `[${b.task}] ` : "";
-				lines.push(`${"  ".repeat(depth)}- ${task}${this.textOf(c).split("\n").join(`\n${"  ".repeat(depth + 1)}`)}`);
+				lines.push(
+					`${"  ".repeat(depth)}- ${task}${this.textOf(c)
+						.split("\n")
+						.join(`\n${"  ".repeat(depth + 1)}`)}`,
+				);
 				walk(c, depth + 1);
 			}
 		};
