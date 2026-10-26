@@ -28,6 +28,7 @@ import type { SpecTaskItem } from "../../../lib/api/spec";
 import { MarkdownContent } from "../markdown/MarkdownContent";
 import { SpecFileTabStrip, type SpecTabChip } from "./SpecFileTabStrip";
 import { SpecTaskBoard } from "./SpecTaskBoard";
+import type { SpecEditorMode } from "./spec-editor-mode";
 import { registerSpecFileSelector } from "./spec-file-reveal";
 import {
 	FIXED_DOC_PATHS,
@@ -38,8 +39,8 @@ import {
 } from "./spec-tab-order";
 import { useSpecTabLayout } from "./useSpecTabLayout";
 
-const SpecMarkdownEditor = lazy(() =>
-	import("./SpecMarkdownEditor").then((m) => ({ default: m.SpecMarkdownEditor })),
+const SpecDocumentEditor = lazy(() =>
+	import("./SpecDocumentEditor").then((m) => ({ default: m.SpecDocumentEditor })),
 );
 
 interface SpecPanelProps {
@@ -61,10 +62,11 @@ export function SpecPanel({ narratorId, onClose, chromeless = false }: SpecPanel
 	const [selectedUri, setSelectedUri] = useState<string>(TASKS_URI);
 	const isTasksFile = selectedUri === TASKS_URI;
 
-	const { data: fileData, isLoading: fileLoading } = useSpecFile(
-		narratorId,
-		isTasksFile ? "" : selectedUri,
-	);
+	const {
+		data: fileData,
+		isLoading: fileLoading,
+		error: fileError,
+	} = useSpecFile(narratorId, isTasksFile ? "" : selectedUri);
 	const { data: tasksData, isLoading: tasksLoading } = useSpecTasks(narratorId);
 	const updateFile = useUpdateSpecFile(narratorId);
 	const { layout: tabLayout, save: saveTabLayout } = useSpecTabLayout(narratorId);
@@ -78,9 +80,24 @@ export function SpecPanel({ narratorId, onClose, chromeless = false }: SpecPanel
 
 	// Local editing state
 	const [editContent, setEditContent] = useState<string>("");
+	// Mirrors editContent synchronously: a save fired right after a keystroke (Ctrl+S from an
+	// editor's own key handler) runs before React re-renders and must not save the older text.
+	const editContentRef = useRef("");
+	// Which document editContent belongs to. Until the selected file's content has been copied
+	// in, the editor is not rendered, so it never shows (or saves) another file's text.
+	const [loadedDoc, setLoadedDoc] = useState<{ uri: string; path: string } | null>(null);
 	const [editTasks, setEditTasks] = useState<SpecTaskItem[]>([]);
 	const [dirty, setDirty] = useState(false);
+	// `dirty` as of the latest edit, readable before the re-render: the source editor's own
+	// Ctrl+S calls handleSave directly, and an unchanged document must not be saved again
+	// (each save is a new revision and pings the agent).
+	const dirtyRef = useRef(false);
+	dirtyRef.current = dirty;
 	const baseRevisionRef = useRef<string | null>(null);
+	// One save at a time: a second request would carry the same base revision and 409.
+	const saveInFlightRef = useRef(false);
+	// Source / split / rich, as last picked in this panel. Spec documents open in source mode.
+	const [docEditorMode, setDocEditorMode] = useState<SpecEditorMode>("source");
 	// Monotonic edit counter. A save captures the version it is persisting; if the
 	// user edits again while the request is in flight the version advances, so on
 	// success we only clear `dirty` when nothing changed meanwhile — otherwise the
@@ -111,6 +128,8 @@ export function SpecPanel({ narratorId, onClose, chromeless = false }: SpecPanel
 	useEffect(() => {
 		if (!isTasksFile && fileData && !dirty) {
 			setEditContent(fileData.content);
+			editContentRef.current = fileData.content;
+			setLoadedDoc({ uri: fileData.uri, path: fileData.path });
 			baseRevisionRef.current = fileData.revisionId;
 			setDocRevisionKey(`${fileData.uri}:${fileData.revisionId ?? "builtin"}`);
 		}
@@ -198,11 +217,13 @@ export function SpecPanel({ narratorId, onClose, chromeless = false }: SpecPanel
 	);
 
 	const handleSave = useCallback(async () => {
-		if (isPreviewOnly) return;
+		if (isPreviewOnly || saveInFlightRef.current) return;
+		if (!isTasksFile && !dirtyRef.current) return;
 		const content = isTasksFile
 			? `${JSON.stringify({ tasks: editTasks }, null, "\t")}\n`
-			: editContent;
+			: editContentRef.current;
 		const savedVersion = editVersionRef.current;
+		saveInFlightRef.current = true;
 		try {
 			const result = await updateFile.mutateAsync({
 				uri: selectedUri,
@@ -237,8 +258,10 @@ export function SpecPanel({ narratorId, onClose, chromeless = false }: SpecPanel
 			} else {
 				notifications.show({ title: t("spec.saveError"), message: msg, color: "red" });
 			}
+		} finally {
+			saveInFlightRef.current = false;
 		}
-	}, [isPreviewOnly, isTasksFile, editTasks, editContent, selectedUri, updateFile, t]);
+	}, [isPreviewOnly, isTasksFile, editTasks, selectedUri, updateFile, t]);
 
 	const handleReload = useCallback(() => {
 		setDirty(false);
@@ -250,6 +273,8 @@ export function SpecPanel({ narratorId, onClose, chromeless = false }: SpecPanel
 			}
 		} else if (fileData) {
 			setEditContent(fileData.content);
+			editContentRef.current = fileData.content;
+			setLoadedDoc({ uri: fileData.uri, path: fileData.path });
 			baseRevisionRef.current = fileData.revisionId;
 			setDocRevisionKey(`${fileData.uri}:${fileData.revisionId ?? "builtin"}:reload:${Date.now()}`);
 		}
@@ -273,11 +298,14 @@ export function SpecPanel({ narratorId, onClose, chromeless = false }: SpecPanel
 
 	const handleContentChange = useCallback((next: string) => {
 		editVersionRef.current += 1;
+		editContentRef.current = next;
+		dirtyRef.current = true;
 		setEditContent(next);
 		setDirty(true);
 	}, []);
 
 	const loading = isTasksFile ? tasksLoading : fileLoading;
+	const docReady = loadedDoc !== null && loadedDoc.uri === selectedUri;
 
 	return (
 		<Box h="100%" style={{ display: "flex", flexDirection: "column", overflow: "hidden" }}>
@@ -376,23 +404,37 @@ export function SpecPanel({ narratorId, onClose, chromeless = false }: SpecPanel
 							<BehaviorFenceControl narratorId={narratorId} />
 						)}
 						<Box style={{ flex: 1, minHeight: 0, display: "flex" }}>
-							<Suspense
-								fallback={
-									<Center style={{ flex: 1 }}>
-										<Loader size="sm" />
-									</Center>
-								}
-							>
-								<SpecMarkdownEditor
-									value={editContent}
-									revisionKey={docRevisionKey}
-									onChange={handleContentChange}
-									dirty={dirty}
-									onSave={handleSave}
-									onReload={handleReload}
-									isSaving={updateFile.isPending}
-								/>
-							</Suspense>
+							{loadedDoc && docReady ? (
+								<Suspense
+									fallback={
+										<Center style={{ flex: 1 }}>
+											<Loader size="sm" />
+										</Center>
+									}
+								>
+									<SpecDocumentEditor
+										documentKey={loadedDoc.uri}
+										path={loadedDoc.path}
+										value={editContent}
+										revisionKey={docRevisionKey}
+										onChange={handleContentChange}
+										dirty={dirty}
+										onSave={handleSave}
+										onReload={handleReload}
+										isSaving={updateFile.isPending}
+										preferredMode={docEditorMode}
+										onPreferredModeChange={setDocEditorMode}
+									/>
+								</Suspense>
+							) : fileError ? (
+								<Text size="xs" c="red" p="sm" role="alert">
+									{fileError.message}
+								</Text>
+							) : (
+								<Center style={{ flex: 1 }}>
+									<Loader size="sm" />
+								</Center>
+							)}
 						</Box>
 					</Box>
 				)}

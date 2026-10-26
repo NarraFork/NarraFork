@@ -1,12 +1,8 @@
-import { ActionIcon, Tooltip } from "@mantine/core";
 import { RichTextEditor } from "@mantine/tiptap";
-import { IconDeviceFloppy, IconRefresh } from "@tabler/icons-react";
-import { Markdown } from "@tiptap/markdown";
 import { useEditor } from "@tiptap/react";
-import StarterKit from "@tiptap/starter-kit";
-import { useEffect, useRef } from "react";
-import { useTranslation } from "react-i18next";
+import { useEffect, useMemo, useRef } from "react";
 import classes from "./SpecMarkdownEditor.module.css";
+import { createSpecMarkdownExtensions } from "./spec-markdown-extensions";
 
 interface SpecMarkdownEditorProps {
 	/** Initial markdown content (loaded once per revision). */
@@ -14,48 +10,58 @@ interface SpecMarkdownEditorProps {
 	/** Distinguishes reloads: when this changes, editor content is reset. */
 	revisionKey: string;
 	onChange: (markdown: string) => void;
-	dirty: boolean;
-	onSave: () => void;
-	onReload: () => void;
-	isSaving: boolean;
+	/**
+	 * Ctrl/Cmd+S inside the editor. The panel-level hotkey ignores contenteditable targets, so
+	 * without this the shortcut fell through to the browser's own "save page".
+	 */
+	onSave?: () => void;
 }
 
 /**
  * WYSIWYG markdown editor built on Tiptap + Mantine RichTextEditor.
  * Content round-trips through the official @tiptap/markdown extension.
+ *
+ * Only mount it for content that `detectRichUnsupported` accepts: Tiptap drops or rewrites the
+ * rest on load, and every change here writes the whole re-serialized document back.
  */
 export function SpecMarkdownEditor({
 	value,
 	revisionKey,
 	onChange,
-	dirty,
 	onSave,
-	onReload,
-	isSaving,
 }: SpecMarkdownEditorProps) {
-	const { t } = useTranslation("narrator");
 	const onChangeRef = useRef(onChange);
 	onChangeRef.current = onChange;
+	const onSaveRef = useRef(onSave);
+	onSaveRef.current = onSave;
 	// Track the revision we last synced so external reloads reset the doc, but
 	// local keystrokes (which don't change revisionKey) never clobber the cursor.
 	const syncedRevisionRef = useRef<string | null>(null);
+	const extensions = useMemo(() => createSpecMarkdownExtensions(), []);
 
 	const editor = useEditor({
 		// Client-only render — first paint happens after mount, so `editor` is
 		// briefly null. Mantine controls and our effects guard against that.
 		immediatelyRender: false,
-		extensions: [
-			// StarterKit already bundles the Link extension in Tiptap v3; adding a
-			// separate Link caused a duplicate-extension conflict that broke the
-			// command manager. Configure link options through StarterKit instead.
-			StarterKit.configure({ link: { openOnClick: false } }),
-			Markdown.configure({ indentation: { style: "space", size: 2 } }),
-		],
+		extensions,
 		content: value,
 		contentType: "markdown",
 		onUpdate: ({ editor }) => {
 			if (editor.isDestroyed) return;
 			onChangeRef.current(editor.getMarkdown());
+		},
+		editorProps: {
+			handleKeyDown: (_view, event) => {
+				const save =
+					(event.ctrlKey || event.metaKey) &&
+					!event.altKey &&
+					!event.shiftKey &&
+					event.key.toLowerCase() === "s";
+				if (!save) return false;
+				event.preventDefault();
+				onSaveRef.current?.();
+				return true;
+			},
 		},
 	});
 
@@ -96,34 +102,6 @@ export function SpecMarkdownEditor({
 					<RichTextEditor.Undo />
 					<RichTextEditor.Redo />
 				</RichTextEditor.ControlsGroup>
-				{dirty && (
-					<RichTextEditor.ControlsGroup>
-						<Tooltip label={t("spec.save")} openDelay={200}>
-							<ActionIcon
-								variant="filled"
-								color="green"
-								onClick={onSave}
-								loading={isSaving}
-								size="sm"
-								style={{ height: 26, width: 26 }}
-							>
-								<IconDeviceFloppy size={14} />
-							</ActionIcon>
-						</Tooltip>
-						<Tooltip label={t("spec.reload")} openDelay={200}>
-							<ActionIcon
-								variant="subtle"
-								color="gray"
-								onClick={onReload}
-								disabled={isSaving}
-								size="sm"
-								style={{ height: 26, width: 26 }}
-							>
-								<IconRefresh size={14} />
-							</ActionIcon>
-						</Tooltip>
-					</RichTextEditor.ControlsGroup>
-				)}
 			</RichTextEditor.Toolbar>
 			<RichTextEditor.Content className={classes.content} />
 		</RichTextEditor>

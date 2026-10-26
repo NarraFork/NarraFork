@@ -1,7 +1,9 @@
 .root {
 	display: flex;
+	flex: 1;
 	flex-direction: column;
 	height: 100%;
+	min-width: 0;
 	min-height: 0;
 	border: none;
 }
@@ -34,4 +36,40 @@
 
 .content :global(.ProseMirror p) {
 	margin: var(--mantine-spacing-xs) 0;
+}
+
+/* @mantine/tiptap ships no table styles; without borders a GFM table reads as loose text. */
+.content :global(.ProseMirror table) {
+	border-collapse: collapse;
+	margin: var(--mantine-spacing-xs) 0;
+	max-width: 100%;
+}
+
+.content :global(.ProseMirror th),
+.content :global(.ProseMirror td) {
+	position: relative;
+	min-width: 3em;
+	padding: 4px 8px;
+	border: 1px solid var(--mantine-color-default-border);
+	vertical-align: top;
+}
+
+.content :global(.ProseMirror th) {
+	background: var(--mantine-color-default-hover);
+	font-weight: 600;
+	text-align: left;
+}
+
+.content :global(.ProseMirror th p),
+.content :global(.ProseMirror td p) {
+	margin: 0;
+}
+
+/* prosemirror-tables marks a multi-cell selection with .selectedCell. */
+.content :global(.ProseMirror .selectedCell)::after {
+	position: absolute;
+	inset: 0;
+	content: "";
+	background: color-mix(in srgb, var(--mantine-primary-color-filled) 18%, transparent);
+	pointer-events: none;
 }
