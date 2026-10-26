@@ -1,4 +1,4 @@
-<!-- 由 prototypes/outline2/outline.py export 生成（第 73 个提交）。真相源是 data/log.jsonl，不要手改。 -->
+<!-- 由 prototypes/outline2/outline.py export 生成（第 254 个提交）。真相源是 data/log.jsonl，不要手改。 -->
 
 # 大纲总览（事实视图）
 
@@ -7,46 +7,160 @@
 ## p · NarraFork
 
 - [p/Pa320SYM] 设计决策
-  - [p/7QQgsP3M] 这一页记录大纲系统的设计决策。已确认的决策带着负责人在对话里的原话作为证据；建议还是「假设」，等负责人确认。详细论证见 docs/OUTLINE_KNOWLEDGE-DESIGN.md §17（决策记录）。
-  - [p/aQdrRFwd] D1 默认直写：每次写入都带来源、可以撤销；探索 fork 的写入进层
-    - [p/cSRo6HMn] D1a 例外（删除或移动团队之外的人写的块、单次改动超过 50 个已有块）自动转成提议，不打断 agent
-  - [p/PeiyVKZE] D2 知识过期默认在读取时复核；批量复核由用户点按钮触发；后台复核默认关闭
-  - [p/OjBAfwCV] D3 共享空间历史永久保留，会话空间历史随会话；管理员可以彻底清除；被引用的版本不能删
-  - [p/iMIREuDd] D4 时间机器按当前权限显示历史
-  - [p/74dzXAGs] D5 数据库是唯一真相源；永远不以 markdown 文件为真相源，永远不与 Obsidian vault 双向同步
-  - [p/oyRkMECT] D6 支持多人实时协同编辑同一个块
-    - [p/NEN9Br1I] D6a 选型：按页建实时会话，一页一个 Y.Doc，块正文是其中的 Y.Text；结构由服务端排序；agent 按读取版本三方合并
-  - [p/UX1YUbm4] D7 embedding 与 rerank 从模型目录配置，支持 API 与 OpenAI 兼容的本地端点；没配置时退化为 FTS
-  - [p/1byjKamb] D8 知识库空间默认走审核（层即提议），可以按空间改成直写
-  - [p/YjEt8WXX] D9 会话的读权限取所有驱动者权限的交集
-  - [p/BG0a5PpL] D10 向量初版存成 BLOB，在 db-worker 里暴力扫描，不引入原生扩展
-  - [p/4Z0d9qlG] D11 自研大纲编辑器，建在 ProseMirror 视图层上；块模型是真相，编辑器文档只是投影
-    - [p/D0h4UHSk] 不用「每块一个编辑器」作为主架构
-  - [p/I6StRgTN] D12 多 agent：图谱是黑板；委派即建任务；角色由任务推导；开始做即领取；验收默认关闭
-    - [p/nFdzmREY] 第二版（D18）：去掉验收关口，完成后通知管理者，不满意可以重开；试用里 3 次验收全部原样通过
-  - [p/aYM78wgu] D13 计划分草稿和已批准两档，由写计划的人声明；已批准的计划要改先停下汇报；agent 可以在权限内批准，后果落到责任人头上
-    - [p/rDUGYfqZ] 第二版（D18）：做法从「两档 + 骨架 + 契约」改为一个「锁定」开关，锁定后的改动先交给锁定人确认
-  - [p/YRVOALjs] D14 计划模式重做：计划就是任务子树，审批时选择草稿或已批准，计划文件退役
-    - [p/gUgKSWlV] 计划不再是一段 markdown
-  - [p/4HXBJkws] D15 整理：任务完成或取消后，由整理 agent 把站得住的结论放进事实树，出处双向可查；「下层已变」维护各层的概括；不设结项任务、计划归档和钉住（原来是「结项时系统分拣、agent 提炼进主题页，计划归档并钉在完成那一刻」）
-  - [p/CZyp6nnF] D16 系统要支持派「没有什么约束」的专注 agent 集中攻坚，由遵循规则的协调 agent 帮它们记账、处理规则
-    - [p/QSWtw144] D16a 专注 agent 只拿到普通语言写的任务说明，不知道大纲、地址、角色和规则；它交一份报告就结束
-    - [p/ZZkZIZOE] D16c 「无约束」指不背大纲协议，不是不受安全约束：工具权限、行为边界照旧由系统强制
-  - [p/S7dMgVAI] D17 一个会话能同时管多个工作区（多台设备上的目录、多个仓库）；agent 在全局的大网上有几个「泡」作为注意范围，泡外的内容也可以适当查看；主 agent 或人批准下级改变范围
-    - [p/v8ZWaFWs] D17c 扩大范围沿创建链找第一个能转授的上级批，都不行就由人批；工作区的「执行」只有人或自己就有这一级的上级能给；期限从批准时算起
-      - [p/6ymZEpQq] 复核：需要改写。第二版只保留工作区这一半：给工作区的执行权限由派它的会话或人给，生产设备一律人确认，期限从确认时算起
-  - [p/SEK5MhWU] D18 按需求清单收缩概念：六个概念（块、任务、依据、空间、历史、待确认），agent 和人各三条规则，关口只留少数几种，每道关口统计原样通过率
-  - [p/PWB7QR1F] D19 事实与过程由位置推出：任务和它下面的块、会话空间里的是过程，其余是事实；页默认是事实视图，过程只露「进行中」；按预算逐层展开；时间轴跟着视图走
-  - [p/DtboPBPt] D20 提问按所在的块成组：一条提问连同细项，或者同一个块下的几条，在收件箱里是一件事；不再有决策包的名字
+  - [p/7QQgsP3M] 这一页记录大纲系统的设计决策，按主题分七组，每组里按编号排。已确认的决策带着负责人在对话里的原话作为证据；建议还是「假设」，等负责人确认。详细论证见 docs/OUTLINE_KNOWLEDGE-DESIGN.md §9（决策记录）。
+  - [p/Z7tUVtaX] 存储、历史与真相源：数据库是唯一真相源；共享空间历史永久保留，时间机器按当前权限显示（D3–D5）
+    - [p/OjBAfwCV] D3 共享空间历史永久保留，会话空间历史随会话；管理员可以彻底清除；被引用的版本不能删
+    - [p/iMIREuDd] D4 时间机器按当前权限显示历史
+    - [p/74dzXAGs] D5 数据库是唯一真相源；永远不以 markdown 文件为真相源，永远不与 Obsidian vault 双向同步
+  - [p/gY26rSAk] 写入、审核与权限：默认直写、可以撤销；知识库空间默认走审核；会话的读权限取能读它的人的权限交集（D1、D8、D9）
+    - [p/aQdrRFwd] D1 默认直写，带来源、可以撤销；少数改动转成待确认，不打断 agent；探索出来的会话只写自己的会话空间
+      - [p/cSRo6HMn] D1a 例外（删除或移动团队之外的人写的块、单次改动超过 50 个已有块）自动转成待确认，不打断 agent；待确认进负责人的收件箱，agent 接着做别的（见 D25b）
+    - [p/1byjKamb] D8 知识库空间默认走审核（写入转成待确认），可以按空间改成直写
+    - [p/YjEt8WXX] D9 会话里能读到的内容取所有能读这个会话的人的权限交集（原来是所有驱动者的交集，2026-10-26 改，因为注入的内容每个能读会话的人都看得到，细项见 [[p/tlMnqe0k]]）
+  - [p/Jd78KW69] 检索、注入与新鲜度：embedding 与 rerank 可配置，没配置时退化为 FTS，向量初版暴力扫描；注入受权限约束；代码已变的块在读取时复核（D2、D7、D10、D22）
+    - [p/PeiyVKZE] D2 知识过期默认在读取时复核；批量复核由用户点按钮触发；后台复核默认关闭
+    - [p/UX1YUbm4] D7 embedding 与 rerank 从模型目录配置，支持 API 与 OpenAI 兼容的本地端点；没配置时退化为 FTS
+    - [p/BG0a5PpL] D10 向量初版存成 BLOB，在 db-worker 里暴力扫描，不引入原生扩展
+    - [p/isfs9UNk] D22 知识检索与注入：知识库集合的项目门真正生效；注入的权限受 D9 约束；关键词仍是唯一能无条件触发注入的方式；没有执行用户不注入；没有项目的会话只看全局和个人；归档的条目默认不返回；Recall 的全站搜索和公开分享链接不在这次范围；已确认（负责人 2026-10-26 全部采纳建议，提问 Q41–Q47）
+      - [p/XqxCk8Yz] D22a 知识库集合的项目门真正生效：私有项目的非成员搜不到、读不到该项目集合里的条目。现在知识库的 `canRead` 和 `filterReadable` 都不检查 `inheritProjectGate`（[[p/x8mG1ECS]]）。上线前先跑一份只读报表，列出生效后会失去可见性的（用户 × 集合），让受影响的人提前知道。理由：这是现有的安全缺口
+      - [p/tlMnqe0k] D22b 会话里注入的知识按所有能读这个会话的人的权限交集算（D9）：公开会话退回匿名基线；项目会话先过项目门，再取成员交集（有人数上限，具体数还没定）；个人空间只在单人私有会话里注入。会话的可见性放宽时，已经注入的内容另外处理（做法还没定）。理由：注入的内容会持久化、广播、每轮重放，能读会话的人都等于读到了它（[[p/KojJGsXl]]）；原来的 D9 只算驱动者，覆盖不到只读的人
+      - [p/ar0gJyPk] D22c 关键词仍是唯一能无条件触发注入的通道（[[p/c4qF3WT0]]）；放宽到按相关度的注入要过阈值，受 D22b 的交集权限约束，和关键词注入共用每轮的字符预算（现状没有这个预算，见 [[p/aZTE7ksm]]，要新补）。现有测试钉的是只在正文里出现的词不注入（`server/services/__tests__/knowledge-draft-search.test.ts:326`），放宽要有边界
+      - [p/yUQxEVJE] D22d 没有执行用户的轮次（例程、系统触发）不注入，public 条目也不注入。理由：现在 `userId` 为 null 时退回匿名基线，照样注入 public 条目（[[p/ZvpuClQN]]），没有人对这些内容的可见性负责
+      - [p/3th3bVc1] D22e 没有项目的会话只看全局集合和个人空间。理由：现在没有项目范围限制，检索和注入会看到所有项目的集合（[[p/aAMYBBTi]]）
+      - [p/qGMr0qZB] D22f 已归档的条目检索时默认不返回，显式 `include` 才返回。理由：现在检索返回、注入排除，两边不一致（[[p/wrFOnNIn]]）；新设计里不成立的块也是这样处理
+      - [p/l2kX1SwR] D22g 不把 Recall 的全站搜索和公开分享链接纳入这次知识库替换，单独立项。理由：它们不限于知识库（[[p/gdvk6G9v]]），放进来会拖大这次的范围
+  - [p/E14Z2FJE] 编辑器与块格式：自研大纲编辑器，多人实时协同，块内方言的细项，SpecMarkdownEditor 丢内容的修法（D6、D11、D23、D24）
+    - [p/oyRkMECT] D6 支持多人实时协同编辑同一个块
+      - [p/NEN9Br1I] D6a 选型：按页建实时会话，一页一个 Y.Doc，块正文是其中的 Y.Text；结构由服务端排序；agent 按读取版本三方合并
+    - [p/4Z0d9qlG] D11 自研大纲编辑器，建在 ProseMirror 视图层上；块模型是真相，编辑器文档只是投影
+      - [p/D0h4UHSk] 不用「每块一个编辑器」作为主架构
+    - [p/AHMTUYMt] D23 块内方言的细项：表格进块体；提及存 `[[空间/短id]]`；嵌入独占一块；数学和图片首版不进方言；块内换行就是换行；方言外的结构拆成子块；最小转义；标题 1–3 级；已确认（负责人 2026-10-26 全部采纳建议，提问 Q17–Q24）
+      - [p/bGSNekcv] D23a 表格进块体，按 GFM 写法；单元格只放行内内容、不换行，docs 里 12 处 `<br>` 迁移时改成「；」。编辑器用 `@tiptap/pm` 里的 prosemirror-tables。理由：docs 里有 249 张表格（[[p/bToUdECx]]）。SpecMarkdownEditor 丢表格的问题单独核实、单独修，不等方言定稿（见 D24）
+      - [p/o89VG1uT] D23b 提及在正文里存 `[[空间/短id]]`：短 id 稳定，改别名不断链。输入时可以写别名、省略本空间前缀，保存时规范成短 id；给人和 agent 显示时渲染成别名或标题。会话空间的块存绝对的会话空间 id（`s` 指「本会话」，随读者变，不能直接存）。支持 `[[地址|显示文本]]`，表格里的竖线要转义（解析器会把单元格里的竖线切开，[[p/llzhPsdb]]）
+      - [p/neaT23dq] D23c 嵌入 `![[…]]` 首版只做独占一块的，放在一行中间的只能是提及。理由：行内嵌入要在一行里放一棵可编辑的子树，编辑器和渲染都复杂，docs 样本和原型里也没有这种需求。不用行内嵌入节点
+      - [p/UYSH9m71] D23d 数学和图片首版都不进方言，写入时转义（`!\[`、`\$`）。理由：不转义的话，只读视图 MarkdownContent 照样会渲染它们（[[p/TNeykCjS]]）。图片以后做成附件块（上传、预览、尺寸要单独设计），数学看需求再加
+      - [p/aEQv8KgM] D23e 块内的换行就是换行：存的就是普通的换行符，渲染时按硬换行显示（marked 的 breaks、remark-breaks）。理由：块已经是段落的单位，软换行在大纲里用处不大，也省掉「反斜杠加换行」这种 agent 容易写错的写法。不用把段内单换行保留成软换行（显示成空格）
+      - [p/cekYrgC0] D23f agent 写入列表、多段等方言外的结构时，拆成子块（列表项、多段各成一块），工具返回里告诉 agent 拆成了什么；拆不了的（HTML 块、定义列表）按普通文本保留。理由：符合「能转换就不拒绝」，也不静默丢弃。不用直接拒绝
+      - [p/PFLnl4nF] D23g 块内转义用最小转义，再做三个解析器的一致性模糊测试：以 `shared/` 里的 marked@18 分词器为准，只读渲染的 micromark 和 Tiptap 自带的 marked@17 对不上的写成用例。不用 Tiptap 式保守转义：它会把 agent 写的 `snake_case` 改成 `snake\_case`（[[p/FoG7AKts]]），和 Y.Text 做 diff 时还会来回改写
+      - [p/DzR0VMpY] D23h 标题用 1–3 级：docs 样本里 h4 只有 18 个，层级本来就由大纲表达，迁移时 h4 及以下改成粗体段落。分隔线不做块体（docs 样本里 `---` 有 135 处），迁移时丢掉，需要分组就用父块
+    - [p/IXQHBXMH] D24 SpecMarkdownEditor 丢内容：spec 文件源码优先、所见即所得可选；检测到保不住的语法就不让在所见即所得里保存；先在 Tiptap 3.27.1 上补表格，升级另开 PR；非 .md 文件和 `behavior_fence` 用纯文本；离线排查已被吞掉的记录。不等 spec:// 迁移和方言定稿，单独修（丢表格是数据丢失，要尽快修）；已确认（负责人 2026-10-26 全部采纳建议，提问 Q27–Q31）
+      - [p/rtynSbRi] D24a spec 文件改成源码优先、所见即所得可选（像文件编辑器的 raw / split / preview）。理由：agent 读写 spec 靠精确字符串匹配（Edit 的 `old_string`），所见即所得一定会改写字节，`spec_vfs_service.ts` 存回去成了 `spec\_vfs\_service.ts`（[[p/RkPWKwO4]]），agent 再拿原文去 Edit 就对不上；而且加了扩展，HTML、脚注、front matter 等照样保不住（[[p/2DjLKIQU]]）。不用「继续以所见即所得为主，补上表格、任务列表、图片扩展，长期保留检测」
+      - [p/nBX8s6p9] D24b 检测到编辑器保不住的语法（表格、HTML、图片、任务列表、脚注、front matter）时，不允许在所见即所得里保存（拦住 SpecPanel 的 `handleSave` 和 Ctrl/Cmd+S，或者 `setEditable(false)`），查看改用只读的 MarkdownContent 分支（能正确渲染表格，但现在走不到，见 [[p/1vWHUvmD]]），并默认进源码模式。检测用前端已打包的 marked 跑 lexer（[[p/gpV5F95o]]）。不用确认框：它最弱，用户很容易直接点过去；不用渲染比较当主检测（[[p/xerP7Zg6]]）
+      - [p/nMabER6Q] D24c Tiptap 分两步，不把升级和修复绑在一起：先在 3.27.1 上加 TableKit（`resizable: false`），自己覆盖 Table 的 `renderMarkdown`，给单元格里的 `|` 补转义（3.27.1 的表格扩展有这个序列化缺陷，[[p/RWv6qQBn]]），配上不依赖 DOM 的单元测试（[[p/Pbk0zBXQ]]）；整套 `@tiptap/*` 升到 3.32.0 另开一个 PR，并回归聊天输入框 InlineComposerEditor。理由：丢表格是数据丢失，要尽快修；升级会碰到每天都在用的输入框，风险不同。不用只升级到 3.32.0：不加表格扩展时它的输出和 3.27.1 逐字相同（[[p/HMPFfYbM]]）
+      - [p/5tnp54bl] D24d 非 .md 的 spec 文件（agent 建的 .json、.yaml 等）和 `behavior_fence` 一律用纯文本（源码模式）编辑。理由：JSON、YAML 经所见即所得保存一次就不再合法；`behavior_fence` 的内容原样注入模型提示，`\_`、`&amp;` 这类转义会直接进 prompt（[[p/HV7j1m0U]]）
+      - [p/5NrvJRyh] D24e 数据恢复：先写离线排查脚本，在后台跑、不进请求路径（遵守主线程规则），找出 `created_by` 是 user、父 revision 含表格分隔行而本条不含的记录，把结果交给人看；旧内容都还在 `spec_file_revisions` 里（[[p/f65PZBTV]]）。历史查看和恢复不在 spec:// 上单独做，放进大纲系统的时间机器里统一做（D4），因为 spec:// 在 P2 就退役了
+  - [p/zKjNiGOW] 任务、计划与多 agent 协作：计划就是任务树，锁定管住改动，完成后整理，专注 agent 集中攻坚，协作默认值，任务反思与 `/goal`（D12–D16、D25、D26）
+    - [p/I6StRgTN] D12 多 agent：图谱是黑板；委派即建任务；角色由任务推导；开始做即领取；验收默认关闭
+      - [p/nFdzmREY] 第二版（D18）：去掉验收关口，完成后通知管理者，不满意可以重开；试用里 3 次验收全部原样通过
+    - [p/aYM78wgu] D13 计划的严格程度由写计划的人决定：不锁定的随情况改；锁定的计划，增删和改步骤先交给锁定人确认；agent 可以在权限内代为确认，后果落到它的责任人头上
+      - [p/rDUGYfqZ] 第二版（D18）：做法从「两档 + 骨架 + 契约」改为一个「锁定」开关，锁定后的改动先交给锁定人确认
+    - [p/YRVOALjs] D14 计划就是任务树；退出规划时人选择按草稿执行，或锁定后执行；计划文件退役
+      - [p/gUgKSWlV] 计划不再是一段 markdown
+    - [p/4HXBJkws] D15 整理：任务完成或取消后，由整理 agent 把站得住的结论放进事实树，出处双向可查；「下层已变」维护各层的概括；不设结项任务、计划归档和钉住（原来是「结项时系统分拣、agent 提炼进主题页，计划归档并钉在完成那一刻」）
+      - [p/aiBGRCbv] 整理 agent 靠 `settle` 给的说明就能做：第一次试跑用较便宜的模型，不读 README 和源码，写出了脱离任务语境、带完整代码位置的现在时事实。它把 Q11 的调研（跨仓库需求怎么对应项目）整理成新页 [[p/WPaz7Csw]]：1 条概括、9 条事实、一组 4 个缺口、1 条「不用多主项目」共 16 块，代码锚点 35 处、运行记录依据 17 处，四个缺口自己加了一层归组，没有超过 15 个子块；没搬的是还没拍板的倾向方案、核实不了的讨论分支、推断出来的情形和方案对比，判断合理。第二次整理知识库检索与注入的调研，产出 54 块（新建 50、改写 4），把 [[p/pMf5hzCG]] 原来平铺的 6 条分成检索、注入、权限、兼容四组，每组不超过 13 条
+      - [p/tkGnRah1] 不用让整理 agent 逐条回仓库核对笔记：第一次试跑花了 26.5 万 token、68 次工具调用、约 15 分钟（大纲命令 25 条：写入 3 次、查帮助 1 次、报错 2 次，产出 16 块），其中 41 次回仓库读代码是大头，是产出它的调研（18.8 万 token）的 1.4 倍（两者用的模型不同）。笔记的依据本来就挂在运行记录上，所以只在两种情况下才回去看代码：说法互相矛盾，或内容只在报告里出现。试跑里核对改对的两处正属于这两种：报告里「trait 和 routines 不刷新」核实不了，没写；子代理合并的是整套规则层，不只是 deny 层。整理说明按这条改过之后，第二次整理（调研 35.9 万 token）花 14.2 万 token、19 次调用、约 5.5 分钟，是调研的 0.4 倍，回仓库读代码降到 2 次，产出 54 块
+      - [p/kLtJgJPF] 整理会漏搬：第一次试跑漏了手动建项目的几条现状（一个项目只对应一个根目录；项目建在几个仓库的共同父目录上时，下面还没有项目的仓库都会归进来），是第二次整理之后，用一个新起的、没有上下文的 agent 做「找不找得到」测试时才发现的：那一题的答案只在过程里，靠检索才找到。事后补进了 [[p/gXLXMVzZ]]。整理时「不搬」的判断可以信，要防的是报告里不起眼位置的事实被漏掉；事实视图加过程检索能兜住漏搬的内容
+      - [p/EK5mvRYr] 整理写出来的内容有两种常见毛病，整理完要看一眼同组的块和上层概括：同一组里自相矛盾（一处说检索过滤 status、另一处说不过滤，已改正，见 [[p/sv1MJ4Xo]]、[[p/wrFOnNIn]]）；把要求写成现状（「兼容」组里有几条写成了「要继续能用」「要映射过去」，那是换掉检索或注入时的要求，不是现有行为，已改成只写事实，见 [[p/SylrFBbS]]、[[p/WGwu2CRS]]）
+      - [p/7k7Jp7zH] 「下层已变」触发得对：给「设计决策」页加了 D19、D20 两条之后，这一页按规则进了整理队列，核实后清掉（第四轮）
+    - [p/CZyp6nnF] D16 系统要支持派「没有什么约束」的专注 agent 集中攻坚，由遵循规则的协调 agent 帮它们记账、处理规则
+      - [p/QSWtw144] D16a 专注 agent 只拿到普通语言写的任务说明，不知道大纲、地址、角色和规则；它交一份报告就结束
+        - [p/tU364lLv] 试用（三个专注 agent，两轮）：只拿普通语言的任务说明，没有规则负担，交的报告质量都高；其中核实 SpecMarkdownEditor 丢表格的那个按 `bun.lock` 的版本用脚本复现，还查出报告问题之外的一串丢失和改写
+      - [p/ZZkZIZOE] D16c 「无约束」指不背大纲协议，不是不受安全约束：工具权限、行为边界照旧由系统强制
+      - [p/ZwQz8Np3] 第二版（D18）起由派活的会话用自己的名义记账，量它的成本看边际，不看「记账成本 ÷ 专注工作成本」：后者把另开会话读整份报告的成本都算成记账，还随报告长短乱跳；原定的 ≤0.2 目标是凭感觉定的，没有从需求推出来，「没到 0.2」不说明记账方案不行。边际成本是派活的会话在读子代理回复、接着干活之外多花的 token 和步数。第四轮（专注 agent 调研知识库检索与注入，35.9 万 token）：派活的会话记摘要、提问、遗留，共 9 条命令（串成 2 次调用），写了约 3 千字，按字数估约 5 千 token，约为专注调研的 1–2%；同一件事第三轮另开会话记账花了 12.0 万 token。试用数据见 docs/OUTLINE_KNOWLEDGE-DESIGN.md 附录 B。
+    - [p/X9MvrQOX] D25 协作默认值：「创建人」指派出 agent 的人（责任链）；没有直写权限的写入和 D1 的例外转成待确认、不打断 agent；代为确认的 agent 逐个计划指定，默认不授权；规划阶段默认宽松；主题页的标准结构做成可选的内置模板；已确认（负责人 2026-10-26 全部采纳建议，提问 Q1–Q5）
+      - [p/MsZFTw5F] D25a 「创建人」指 agent 的创建者，也就是责任人链（子代理 → 派它的会话 → 会话的发起人）：后果落到派出这个 agent 的人身上。计划的作者另记为计划根的作者，计划里的改动被代为确认时通知他，但 agent 的后果不算到他头上
+      - [p/WxpoGKgq] D25b D1 的例外（[[p/cSRo6HMn]]）转成待确认，不打断 agent：待确认进负责人的收件箱，agent 不停下，接着做别的；没有直写权限的写入同样处理。原型已按这个实现；实际使用中这两种例外还没触发过，暂时没有反例
+      - [p/GXS3JaEM] D25c 锁定人可以指定一个 agent 替他确认步骤调整，首版只做逐个计划授权，默认不授权。等用起来发现每次都在勾同一个选项，再加责任人级的默认值。不用一开始就做会话级或责任人级的默认值
+      - [p/TNGQGcQ9] D25d 规划阶段默认宽松，只读作为可选。理由：计划就是大纲里的任务子树（D14），规划时本来就要写大纲、读代码、跑只读命令；要防的是规划阶段改代码，所以单独做成「规划时不改文件」的选项。不用默认只读（像现在的计划模式）
+      - [p/7sVq4MMh] D25e 主题页的标准结构（概述、职责、关键决策、坑、不变量、试过的方案）做成可选的内置模板（P5），不强制；整理时目标页有对应小节就放进小节，没有就放到页尾的「待整理」
+    - [p/g5nk1b5p] D26 任务反思不改成可选，等 P2 补齐四个缺口后连同相关代码一起删；`/goal` 建的任务默认锁定；已确认（负责人 2026-10-26 全部采纳建议，提问 Q25、Q26）
+      - [p/XyDj7G49] D26a 任务反思（`server/lib/agent/tools/task-reflection.ts`）不改成可选：P2（大纲任务迁移）补齐四个缺口后，把它的门禁、两个决策工具、`spec_protected_tasks` 和 human attention 里的 task_reflection 一起删。四个缺口：取消、删除和完成一样会让任务消失，同样要标出来；`/goal` 默认锁定（D26b）；依据要带结果（测试通过还是失败）并且晚于最后一次相关改动，能确定性校验的由系统校验；依据要有地方挂，现在 tasks.json 没有任务 ID，规定里也不许写依据（[[p/XZvymKNb]]），要等大纲任务块。理由：只找到它误拦和出故障的记录，没有拦对的案例（[[p/blfoGieo]]）；它自己不能验证，只能读会话历史（[[p/3o5WNrRu]]）。如果以后还想要模型复核，调研的备选做法是只在任务上留审查意见、不阻塞、默认关闭，这不是已定的规则
+        - [p/EfcqD1xd] 不用改成可选：配套的全部代码和常驻的两个决策工具照样要维护
+        - [p/HnUzh3KP] 不用现在单独删：`/goal` 建的任务会失去任何完成把关，要等 P2 的缺口补齐
+      - [p/tv1IkIvW] D26b `/goal` 建的任务默认锁定，不再按草稿处理：锁的只是 `/goal` 本身（目标和验收），agent 在下面建的步骤不锁定，可以随时调整；整个目标完成要人确认。理由：`/goal` 是用户在说「务必完成」；按草稿处理时，无人值守的 agent 可以提前标完成、停掉续跑，要等人看看板才会发现；锁定正好接住任务反思想防的「提前标完成」。现在的「受保护任务」和文本 hash 锁（`spec_protected_tasks`）由锁定替代
+  - [p/6hcdPxNX] 多工作区与跨仓库：一个会话管多个工作区；归属只认一个主项目，执行按工作区（D17、D21）
+    - [p/S7dMgVAI] D17 一个会话能同时管多个工作区（多台设备上的目录、多个仓库）；agent 在全局的大网上有几个「泡」作为注意范围，泡外的内容也可以适当查看；主 agent 或人批准下级改变范围
+      - [p/v8ZWaFWs] D17c 扩大范围沿创建链找第一个能转授的上级批，都不行就由人批；工作区的「执行」只有人或自己就有这一级的上级能给；期限从批准时算起
+        - [p/6ymZEpQq] 复核：需要改写。第二版只保留工作区这一半：给工作区的执行权限由派它的会话或人给，生产设备一律人确认，期限从确认时算起
+    - [p/CGfIcqJc] D21 跨仓库会话：归属和读权限只认一个主项目，执行层按工作区所属的项目算；已确认（负责人 2026-10-26 全部采纳建议，提问 Q11、Q32–Q40）。理由：多主项目会让读权限要么泄露、要么没人能看，还要推翻「会话只有一个主项目」的唯一答案（[[p/QTGR5IuC]]）；只看主项目又让 B 仓库的 deny 规则在 B 的文件上失效（[[p/ZtGuF1xl]]）。归属只认一个，执行按工作区，现有的 ACL 和 SQL 镜像不用动
+      - [p/HUZdurGu] D21a 主项目创建时定下：从项目页建就是该项目，否则取第一个工作区推导出的项目，非 git 工作区不能当主项目；允许显式换，换前确认并列出会新获得、失去访问的人；切工作目录、切设备不再隐式改主项目。理由：主项目是读权限的唯一锚点，隐式改变就是可见性迁移，会话历史里有旧仓库的内容，却换给了新项目的成员（[[p/qDwEUyPN]]），切到远端设备还会变成 null（[[p/6a86UUdd]]）。实现上，切换时把当前主项目冻结进 `contextProjectId`。不用「创建后不能换」：开错项目就只能重建会话；不用「随工作目录推导、跟着切换变」：就是上面的隐式迁移
+      - [p/VCBOgqyh] D21b 把工作区 B（另一个仓库，或另一台设备上的目录）加进会话，要有 B 所属项目的 write，私有项目还要是成员；B 的 owner 收到通知，不用审批；生产设备由人确认，带期限，期限从确认时算起。切工作目录、Agent 的 `workdir`、远端绑定统一走这一道门。讨论分支 `discuss/narrator-remote-workspace` 里有现成的「工作区项目门」可以借用，要移植到 project-index 体系（调研里读到的，没有在这里核实）。理由：在 B 上执行就是改 B 的代码，门槛应当和直接在 B 里开会话一样；现在切目录不查目标项目（[[p/HMsyO5er]]），创建时也只查 A（[[p/ZtGuF1xl]]）。不用「B 的 read 就够」：读权限挡不住改代码；不用「每次都要 B 的 owner 审批」：对一次性的跨仓库改动太重，通知足以让 B 知道有人来过
+      - [p/mTizm5hc] D21c B 项目的成员只看到「有会话在此工作」：标题、主项目、工作目录、提交；正文仍按会话的 ACL，读不到正文的人看到占位（链接不是后门）。理由：会话历史混着所有工作区的内容，B 的成员能读正文就等于把 A 仓库的代码和讨论泄露给 B；完全不可见（现状）则 B 对自己仓库被改一无所知，摘要加提交够 B 追溯改动。其他项目页用反向链接看到「有外部需求在这里动过」
+      - [p/734Ce5AD] D21d 远端设备上的工作区属于哪个项目，绑定时由人选；executor 上报的 git remote URL 只用来预填建议，大多数情况人只需点确认。理由：归属直接决定执行层守谁的规矩，要最可靠的来源；远端目录不进项目索引，切过去主项目还会丢（[[p/6a86UUdd]]）
+        - [p/bBZ1UTBw] D21d 的备选：不用 remote URL 直接匹配：不唯一（fork、同一 remote 的多个项目、没有 remote 的仓库），单靠它会归错项目；不用设备注册时固定一个项目：和「一台设备上挂多个仓库」冲突
+      - [p/mGi2WmjX] D21e 在工作区 W 上执行时，规则 = 全局 + 主项目的 deny 层 + W 所属项目的全部规则层 + 会话层；allow 只取 W 项目；设备按 W 的项目授权。理由：执行策略本来就支持多项目层合并（[[p/Pgihm9vx]]），加上「目标工作区的项目」改动最小；主项目的 deny 保留，是因为会话归属 A，A 不允许的事换个工作区也不该能做。`remoteDevices.projectId` 暂保持单值，一台设备服务多个项目等真有需求再改
+        - [p/bQ1Xl2vc] 不用「所有已绑定工作区项目的 deny 取并集」：其他工作区的 deny 管的是它们自己的文件，叠到 W 上和 W 无关，绑定越多越难用
+        - [p/iobYXCPH] 不用「维持只按主项目」：B 的 deny 规则、项目级设备和 CLAUDE.md 在 B 的文件上都不生效（[[p/ZtGuF1xl]]）
+      - [p/8iI4SavU] D21f 行为跟归属走，执行跟工作区走：trait、routines 描述会话怎么做事，只看主项目；执行策略、设备授权、CLAUDE.md 是仓库的约束，按工作区；技能加载所有工作区的根，现在已经同时加载主项目和 cwd 两个根（[[p/Pgihm9vx]]）。子代理现在「trait 跟父会话的项目、执行策略跟自己的项目」，按这条分法是对的，保留，不改代码，只写成规则。理由：trait 随工作区切换会让同一个会话前后行为不一。不用「全部按当前工作区的项目切换」，也不用「全部只看主项目、技能收回主项目」
+      - [p/BwO2O4g6] D21g 跨仓库会话产出的知识默认写主项目空间；写进 B 的空间要有直写权限，否则转待确认；整理时关于 B 的结论自动转成「复制到 B 的空间」的待确认，由人或 B 的管理者确认。理由：需求和任务树都在主项目空间，结论跟着计划放，出处才连得上；块不跨空间移动，B 的成员读不到 A 的空间，所以关于 B 的结论按出处复制进 B；自动写进别人的空间等于绕过 B 的权限，只能待确认。不用「默认写当前工作区所属项目的空间」，也不用「只写主项目、不做复制」
+      - [p/0dalNYsQ] D21h 落地顺序：先修现有的四个缺口（[[p/ZtGuF1xl]]、[[p/HMsyO5er]]、[[p/qDwEUyPN]]、[[p/6a86UUdd]]），它们不需要改表，不等 PostgreSQL 移植；之后改链接表（一个会话多个工作区、同一项目多个目录、`device_id` 真正用起来）时，SQLite 和 PG 的项目索引一起做，不再让两个后端分叉。理由：四个缺口现在就在漏权限；PG 后端现在没有这张索引、只认 `contextProjectId`（[[p/hYJfYbCJ]]），链接表一改结构，两边对「会话在哪些工作区」的答案会差得更远。不用「以 PG 移植为前提」，也不用「只在 SQLite 上做、PG 以后补」
+      - [p/7LryM20q] D21i 项目建在仓库子目录时，worktree 按「同仓库同相对路径」映射回子目录项目；嵌套的独立仓库（并进外层项目）和子模块（不建项目）维持现状（[[p/ZaINwQLx]]），把规则写进文档。理由：推断（读代码得出，没有实际跑过）worktree 会让同一份代码在 checkout 里和 worktree 里归属不同，还会给仓库根自动建一个公开项目，而会话 worktree 是常用路径，影响面最大；嵌套仓库和子模块是少见配置，规则是确定的，等多工作区能显式绑定项目后自然有解。不用「全部修」，也不用「全部维持现状」
+      - [p/rICeDeUy] 不用项目组：项目组先不做；真有长期固定的多仓库组合时，再做成纯聚合视图，不另起权限轴。只要链接结构对，以后做成视图不需要迁移数据。需求和任务树放主项目空间，用链接、嵌入、提交依据引用其他仓库
+  - [p/g3h0y7cm] 概念、事实与过程视图：按需求收缩概念；事实与过程由位置推出；提问按所在的块成组（D18–D20）
+    - [p/SEK5MhWU] D18 按需求清单收缩概念：六个概念（块、任务、依据、空间、历史、待确认），agent 和人各三条规则，关口只留少数几种，每道关口统计原样通过率
+      - [p/Hx3d9V99] 第二版对 agent 写入负担的效果（同类调研任务各一次，样本很小）：第二轮 → 第三轮的协调者，每次写入的辅助命令 8.3 → 3.0，查帮助 17 → 9，每行平均的方言标记 3.2 → 0.01，报错 1 → 0；等负责人决定的条目 20 条提问 → 7 个决策包加 1 条。身份、编号、链接角色、插入位置这些机械的部分基本消失，剩下的是读懂报告和判断。
+      - [p/HQe0AorB] 依据自动挂接：系统从写这个块的会话（或它整理的那个任务）的运行记录里挂上依据，正文里的代码位置成为锚点，agent 不用手写。运行记录要按「真的读到过所引的那几行」对应，不能只按「碰过同一个文件」：第三轮按文件对应时挂错不少，同一次创建会话的调用被挂到三条不相关的缺口结论上；改成按读到的行对应之后，整理试跑和第四轮共抽查 32 条，没有挂错的，1 条偏弱（搜索结果里只出现过那一行）。另外，行号换成符号时有的太粗：十几行的位置被换成整个会话主循环函数，函数里任何改动都会让这条结论存疑。挂错的依据目前没有办法删
+    - [p/PWB7QR1F] D19 事实与过程由位置推出：任务和它下面的块、会话空间里的是过程，其余是事实；页默认是事实视图，过程只露「进行中」；按预算逐层展开；时间轴跟着视图走
+      - [p/jDli86Qn] 试用（一次，10 道题，样本小）：另起一个没有上下文的 agent，只用大纲回答 10 道关于知识库检索与注入的题，全部答对，包括一道陷阱题（答案是「还没定」）；共 9 条命令、0 次查帮助、8.5 万 token、约 78 秒。其中 8 题从空间顶层 `read p/` 看到页、再读那一页两步就找到，不用知道当时有过哪次调研；1 题的答案只在过程里，靠检索找到，那正是整理漏搬的一条（[[p/kLtJgJPF]]）
+    - [p/DtboPBPt] D20 提问按所在的块成组：一条提问连同细项，或者同一个块下的几条，在收件箱里是一件事；不再有决策包的名字
+      - [p/gDqP3iMs] 试用中的一次观察：第三轮协调者给 Q11 的细项提问按主题建了 3 个决策包，包放在待定问题页的别处，和 Q11 之间没有结构上的关联（7 个决策包里有 3 个其实都属于 Q11）；按所在的块成组就不会出现这种分散
 
-- [p/BUvPjg55] 现状：spec:// ‹进行中：p/5nB0TYwk›
-  - [p/sqzCCSvC] 2026-10-23 对 main @ 7c5170d7 的盘点。每条结论都锚在代码上，main 变了就会存疑。
+- [p/BUvPjg55] 现状：spec://
+  - [p/sqzCCSvC] 2026-10-23 对 main @ 7c5170d7 的盘点。每条结论都锚在代码上，main 变了就会存疑。之后 main 前进到 b256a9ef（60 个提交），对它跑过一次新鲜度检查：当时库里的 13 处代码锚点全部新鲜，所以这页最初的盘点在 b256a9ef 上仍然成立；这次检查之后新增的块不在其内
   - [p/5SbJBOHq] 每个叙述者一个 spec 命名空间（narrator_id 唯一）
-  - [p/nxoITrqe] fork 时子会话的文件指针直接引用父会话的修订行，修订行随父会话的命名空间级联删除；父会话被硬删后，子会话的文件会悄悄消失 ‹进行中：p/5nB0TYwk›
+  - [p/nxoITrqe] fork 时子会话的文件指针直接引用父会话的修订行，修订行随父会话的命名空间级联删除；父会话被硬删后，子会话的文件会悄悄消失
   - [p/BYer0yuP] 回退会话时 spec 内容不跟着回退：只把 spec 修订的来源消息置空
   - [p/GGLDhXV9] tasks.json 最多 100 条，任务以正文的 hash 为身份，改一个字就成了删旧建新
+    - [p/XZvymKNb] tasks.json 的任务没有 ID，规定里也不许写依据（证据）字段（`server/lib/prompts/system-reminders.ts:76`），所以任务完成的依据没地方挂；任务反思的结论也因此只在工具卡片里，见 [[p/65JHQGgo]]
+      - [p/Mm6XAcei] 决定：依据没地方挂是任务反思删除前要补的缺口之一，等大纲任务块；见 [[p/XyDj7G49]]（D26a）
+    - [p/J4DlSFnV] 决定：文本 hash 锁和受保护任务由锁定替代，`/goal` 建的任务默认锁定；见 [[p/tv1IkIvW]]（D26b）
+  - [p/65JHQGgo] 任务反思（taskReflection）：agent 用 Write/Edit 改 `spec://tasks.json`，并且检出受保护任务被标 done、被删除或被去掉 protected 标记时，这次工具调用先挂起，由同一个模型另跑一轮反思，放行了才执行（`server/lib/agent/loop.ts#executeToolAfterReflections`、`server/services/spec-task-service.ts#detectProtectedMutations`）。行号核对于 2026-10-26 的工作区
+    - [p/SZwBdsX1] 触发范围窄：改任务文本会让 hash 变化，所以也算删除；新增任务、改成 blocked、用户在面板上改都不触发。它不看权限模式，也没有设置开关，`shouldRunTaskReflection` 只排除嵌套反思（`server/lib/agent/loop.ts:2066`）
+    - [p/3o5WNrRu] 判断只问一件事：「这次修改是否违背了用户真正要求的东西」，证据只用来辅助判断（`buildTaskReflectionPrompt`，`server/lib/agent/loop.ts:1036`）。反思只能调用两个决策工具 `TaskReflectConfirm` 和 `TaskReflectRevise`（`server/lib/agent/tools/task-reflection.ts:8-9`），不能读文件、不能跑测试，只能读父会话历史（`runReflectionLoop`，`server/lib/agent/loop.ts:1319`）。检查本身失败时，修改不会执行（`buildReflectionFallbackMessage`，`server/lib/agent/loop.ts:1114`）
+    - [p/hXp8vjke] 成本：每次多发 1 个请求，用同一个模型，带上父会话的全部历史；请求前缀和父请求相同，可以命中缓存（`server/lib/agent/__tests__/loop-reflection-cache-prefix.test.ts`）。最多 2 轮决策，瞬态错误最多重试 10 次（`getAuxiliaryMaxRetries`）。反思期间这次工具调用一直挂起，会话显示 reflecting；人接管后一直等人决定，没有超时；每次被驳回后重新提交，都会再跑一遍。两个决策工具为了保持缓存前缀，常驻在每个请求里，说明文字约 2.2K 字符（`server/lib/agent/tools/reflection-description.ts`）
+    - [p/rpAgOloB] 可见性：自动反思不会出现在 human attention 里，只有人接管后才以 `reflection` 类型出现（`server/services/__tests__/human-attention-service.test.ts`）；反思结论只在工具卡片里，任务看板不显示（`frontend/components/narrator/spec/SpecTaskBoard.tsx`）
+    - [p/yGOrQ4h8] 它要防的：受保护任务没做完就标完成、被删除或被改弱（`TaskReflectRevise` 的工具描述）；agent 为摆脱自动续跑而把条目标 done（`server/lib/prompts/system-reminders.ts:86` 的提示词让 agent 去掉 protected 标记，而不是标完成）。默认续跑模式是 `protectedOnly`（`server/lib/settings/defaults.ts:108`），所以标完成就能结束无人值守的运行。存储层另有兜底：没有反思授权时拒绝完成受保护任务（`server/services/__tests__/spec-vfs-service.test.ts`）
+    - [p/blfoGieo] 有记录的全是它自身的问题：在代码注释、测试和提交历史里，没找到一次它拦下真实虚假完成的记录；`narrator_tool_calls.permission_suggestions` 里 task_reflection 状态为 cancelled 的线上驳回记录还没统计
+      - [p/ABnRLWha] 一次会话里 3067 个测试全部通过，它仍连续驳回 5 次，耗时 1.5 小时；之后提示词从「证据够不够」改成「问意图」（`server/lib/agent/loop.ts:1022` 注释，`server/lib/agent/__tests__/tool-executor.test.ts:2008`）。这次改写随 a365c6de 合入，提交信息没提；旧版提示词见 f32a9bcc
+      - [p/7t1EUI0E] 同一个驳回反复出现会让续跑空转，于是加了「第 3 次相同驳回就停止续跑」（45a2cd9e，`server/services/turn-continuation-decisions.ts:106`）
+      - [p/8F7PwN96] 用户在面板上新加的任务被当成偏离主线而驳回，因为反思只认 user 消息里的要求；为此专门写了 `server/services/spec-edit-interject.ts`（见文件头注释）
+      - [p/Gb5A9YJm] 检查故障被当成内容否决（538c6abe）；确认受保护任务改动时报工具路由错误（8bd4cf62）
+    - [p/Nxp8cxY7] 决定：任务反思不改成可选，P2 补齐缺口后连同门禁、决策工具一起删；见 [[p/XyDj7G49]]（D26a）
   - [p/iZyoacoR] 任务摘要默认每 15 次工具调用注入一次
   - [p/CEIo4QC5] spec 上的 Grep 是把全部文件读出来跑正则，没有索引
+  - [p/ymFGGNLa] Spec 面板用 SpecMarkdownEditor（Tiptap）编辑除 tasks.json 以外的所有 spec 文件，保存会把编辑器表示不了的 Markdown 语法删掉或改写：含 GFM 表格的文件改一个字再保存，整张表格（表头和所有行）从文件里消失，其余内容保留；表格在编辑器里本来就不显示，保存前看不到（`frontend/components/narrator/spec/SpecMarkdownEditor.tsx:43-69`）。2026-10 在 Tiptap 3.27.1（与 `bun.lock` 一致）上用脚本复现，没在真浏览器里点过；用 happy-dom 和完全不给 DOM 两种环境结果相同，说明丢表格发生在 Markdown 解析阶段，和 DOM 无关
+    - [p/G0QXtBGI] 只打开不改不会写入，改动之后才会：加载、切换文件、重新加载都用 `emitUpdate: false` 设置内容，不置 dirty（`frontend/components/narrator/spec/SpecMarkdownEditor.tsx:64-69`）；任何一次改动（打字、工具栏加粗、撤销）都会把重新序列化的整份 Markdown 存进 `editContent` 并置 dirty，不比较内容是否真的变了，打一个字再删掉也算（`frontend/components/narrator/spec/SpecPanel.tsx:274-278`）；之后点保存或按 Ctrl/Cmd+S 才写回（`frontend/components/narrator/spec/SpecPanel.tsx:200-241`、`:258-266`），没有自动保存
+    - [p/ihrMDQe9] 原因：编辑器只装了 StarterKit 和 Markdown 两个扩展，没有处理表格的扩展。marked 解析出的 table token 没有子 token，`@tiptap/markdown@3.27.1` 包内 `src/MarkdownManager.ts:920-925` 的兜底分支是「有子 token 就解析子 token，否则 return null」，加载时整张表就被扔掉；`getMarkdown()` 只是把编辑器里的文档再序列化一遍（同包 `src/Extension.ts:185-187`），文档里早就没有表格了
+    - [p/qesndcYT] 丢的不只是表格，但也不是「没有对应处理器的语法一律直接丢弃」（Tiptap 兜底分支的规则见 [[p/ECwDNE3k]]）：41 个样例里 19 个渲染变了，按后果分三类，另有一条稳定性
+      - [p/bckAYSCj] 整段消失：表格（包括无首尾竖线的、列表项里的）、HTML 注释（原位置留下一个空段落）、只含 `<img>` 的 HTML 块；只有表格的文件保存后只剩用户打的那个字
+      - [p/NuW3Rv5d] 降级
+        - [p/7vPxWTf1] 图片和 HTML：图片只剩 alt 文字，地址和标题没了；HTML 标签被剥掉、文字留下，`<details>` 的折叠效果没了，`<u>` 变成非标准的 `++x++`（NarraFork 和 GitHub 都会把加号原样显示），`<br>` 变成等价的硬换行
+        - [p/SMnDgbrm] 任务列表：复选框和勾选状态没了，载入后的文档结构不合法（listItem 里直接是文本），脚本里在该行打字会抛 `Called contentMatchAt on a node with invalid content`；浏览器里会怎样没验证
+        - [p/179XDmNr] 脚注变成以脚注正文作 URL 的坏链接，定义行消失；front matter 变成一条分隔线加一个二级标题；数学公式里多出 `\_`，KaTeX 不再把它当下标；HTML 实体 `&copy;`、`&nbsp;` 变成字面文字
+        - [p/IhjrlGsF] 列表：`*` 和 `+` 两个列表合成一个松散列表；`3.` 开头的列表后接 `1)` 列表时，后者被并进前者并重新编号
+      - [p/RkPWKwO4] 渲染不变但源文本被改写：`snake_case` 变成 `snake\_case`，`&`、`<`、`>` 变成实体，`__init__` 变成 `**init**`，`*`、`[`、`~`、反斜杠被转义，Setext 标题变 ATX 标题，`~~~` 围栏变成反引号围栏。推断：agent 用 Edit 的 old_string 做精确匹配，拿原文去改存回后的文件就会对不上
+      - [p/BnpPJRNQ] 稳定性：front matter 和 `*`、`+` 列表在第二次保存时还会再变一次，其余样例第一次保存后就不再变化
+    - [p/1vWHUvmD] tasks.json 以外的 spec 文件只能用 SpecMarkdownEditor 查看和编辑，没有源码模式，也没有源码/预览切换（`frontend/components/narrator/spec/SpecPanel.tsx:386-394`）：`spec://index.md`、`spec://behavior_fence`、agent 用 Write 建的任何 `spec://` 文件都在内。SpecPanel 里有只读预览分支（用 MarkdownContent，能正确渲染表格，`frontend/components/narrator/spec/SpecPanel.tsx:324-327`），条件是 `!uiEditable`（`frontend/components/narrator/spec/SpecPanel.tsx:98`），但内置文件全是 `uiEditable: true`（`server/services/spec-vfs-service.ts:54-64`），非内置文件恒为 true（`server/services/spec-vfs-service.ts:157-161`），这个分支现在走不到
+      - [p/xOmLsxRK] 决定：改成源码优先、所见即所得可选，检测到保不住的语法就只读并默认进源码模式；见 [[p/rtynSbRi]]（D24a）、[[p/nBX8s6p9]]（D24b）
+    - [p/HV7j1m0U] 非 .md 的文件同样按 Markdown 打开：spec 路径只限制字符不限制扩展名（`server/lib/spec-uri.ts:42-44`），agent 建的 .json、.yaml 保存一次就不再合法（`"key_name"` 变成 `"key\_name"`，缩进和结构被打乱）；`behavior_fence` 的内容原样注入模型提示（`server/services/spec-reminder.ts:105-114`），保存后的 `\_`、`&amp;` 转义会直接进 prompt。agent 用 Write/Edit 写 spec 不经过这个编辑器，不受影响
+      - [p/xuG8JATg] 决定：非 .md 的文件和 behavior_fence 一律用纯文本编辑；见 [[p/5tnp54bl]]（D24d）
+    - [p/f65PZBTV] 被覆盖的旧内容还在数据库里：每次保存都往 `spec_file_revisions` 插入一条新 revision，`parent_revision_id` 指向旧的那条，再把文件指针切过去（`server/services/knowledge/sqlite-write-store.ts:1008-1038`、`server/db/schema.ts#specFileRevisions`）；spec 文件不落盘，只存在数据库里，命名空间被删时修订行一起删（[[p/nxoITrqe]]）。但 spec 的 API 只有列文件、读文件、读任务、清任务、重置、写文件，前端也没有历史视图，现在没法查看或恢复旧 revision
+      - [p/tLam2CD7] 决定：先写离线脚本排查被吞掉表格的记录，历史查看和恢复放进大纲的时间机器里做；见 [[p/5NrvJRyh]]（D24e）
+    - [p/pf3LOUWL] 保存请求是 `PUT /api/narrators/:id/spec/file`（`server/routes/spec.ts:155-256`），带 `baseRevisionId` 做乐观并发检查（不一致返回 409）和 `notifyAgent: true`；内容上限 20 万字符（`MAX_SPEC_FILE_CHARS`，`server/services/spec-vfs-service.ts:24`）。保存后通知叙述者：它正在工作时，这条通知作为一条真正的 user 消息插进对话（原因见 [[p/8F7PwN96]]），空闲时走 sidecar 队列（`server/services/spec-edit-interject.ts`）；非 tasks 文件只带前 300 个字符的预览（`server/routes/spec.ts:227`）。所以表格消失会以「用户编辑了这个文件」的名义告诉 agent；agent 会不会因此以为用户有意删了表、照着继续改，没有验证
+    - [p/8sXFudJP] 实际受损的 spec 有多少没有数据：spec 只存在数据库里，开发环境没有数据库可抽样。系统提示让 agent 把规划和设计笔记写进 `spec://index.md` 或另建的 `spec://*.md`（`server/lib/prompts/system-reminders.ts:59`、`:97`）；替代样本是仓库里 agent 写的 Markdown：git 跟踪的 71 个 .md（不算 prototypes/）有 48 个含 GFM 表格。`docs/DYNAMIC_SPEC_TEAM_TASKS.md:525-528` 还规划了 `spec://team/tasks.md`、`spec://designs/*`、`spec://notes/<member>/*`，Markdown 类 spec 文件只会增加。压测：20 万字符（上限）的文档往返一次剩 97,633 字符，少掉的一半是表格
+    - [p/fmYw007g] 在 3.27.1 上加 `@tiptap/extension-table`（TableKit）能保住表格，几乎不加依赖
+      - [p/BQ2ubiNB] 版本和依赖：它的 peer `@tiptap/core`、`@tiptap/pm` 与锁定的 3.27.1 一致，依赖的 `prosemirror-tables@1.8.5` 已经在 `bun.lock` 里，lock 只多一个包；扩展自带 `parseMarkdown` 和 `renderMarkdown`（包内 `src/table/table.ts:318-361`），`@tiptap/markdown` 自动用上，不用另配序列化
+      - [p/509G9zpf] 实测：4 个表格样例和一篇设计笔记都完整保留、渲染一致、第二次保存不再变化，对齐标记保留；源码会被重排，各列补空格对齐，表格前后多出空行。列宽写不进 Markdown，所以 `resizable: false`
+      - [p/wTEXU1ye] 任务列表和图片可以一起加：任务列表用 `@tiptap/extension-list@3.27.1` 的 TaskList、TaskItem（已在 `bun.lock`，`package.json` 没有直接依赖），加上后 `- [ ]`/`- [x]` 完整保留，上面的结构不合法和打字抛错也消失；图片用 `@tiptap/extension-image@3.27.1`，必须配 `inline: true`，默认的块级图片遇到行内图片会生成不合法文档，打字同样抛错
+      - [p/MGJeBiet] 界面要补：`@mantine/tiptap@9.5.1` 的样式里没有表格，RichTextEditor 也没有表格按钮，要在 `frontend/components/narrator/spec/SpecMarkdownEditor.module.css` 里给 `.ProseMirror table/th/td` 加边框和内边距；没有增删行列的按钮也能改单元格里的文字
+      - [p/Pbk0zBXQ] 表格、任务列表、图片的往返不依赖 DOM（`element: null` 的编辑器在纯 bun 里结果相同），回归测试可以写成普通单元测试；只有 HTML 相关的需要 `window.DOMParser`
+      - [p/UxuGPsYC] 决定：先在 3.27.1 上补表格和竖线转义，升级到 3.32.0 另开 PR；见 [[p/nMabER6Q]]（D24c）
+    - [p/RWv6qQBn] 3.27.1 的表格扩展有两个序列化缺陷：单元格里转义过的竖线（包括行内代码里的）写回时不再转义，`| a \| b | 或 |` 变成 `| a | b | 或 |`，多出一列、「或」被挤掉，每保存一次再坏一点；单元格里的 `<br>` 变成空格。3.32.0 两处都修好了
+      - [p/HMPFfYbM] 不用只升级到 3.32.0 来解决丢表格：不加表格扩展时 3.32.0 的输出和 3.27.1 逐字相同。升级整套 `@tiptap/*` 还要回归用同一个 StarterKit 的聊天输入框（`frontend/components/narrator/composer/InlineComposerEditor.tsx:38`）
+    - [p/2DjLKIQU] 加了所有扩展也保不住的语法：HTML、脚注、front matter、数学公式、HTML 实体在所见即所得里没有对应表示，3.32.0 加上全部扩展后仍有 12 个样例渲染有变化，所以对「保不住的语法」的检测要长期保留
+      - [p/gpV5F95o] 低成本检测用前端已经打包的 marked（`shared/pretext-layout/parse-markdown.ts` 在用）跑 lexer，遇到 table、html、image、任务项、脚注定义（标签以 `^` 开头的链接定义）、开头的 front matter 就标记。样例上这几类 15 个全部标出，偏保守地多标了 `Promise<void>`（当成 HTML），漏掉数学公式、HTML 实体和两种列表合并共 4 个；20 万字符约 80ms，不加依赖
+      - [p/xerP7Zg6] 不用渲染比较（加载后 `getMarkdown()`，再用 remark-gfm 渲染原文和往返结果）当主检测：它能标出全部 19 个渲染变化的样例，但 5k-20k 字符单次渲染约 130-170ms，20 万字符约 1.8 秒，比较要渲染两次，而且抓不到 JSON、YAML 被改坏（按 Markdown 渲染看不出变化）。只适合小文件或空闲时当兜底
+    - [p/dZEVjLjQ] 决定：单独修，不等迁移；源码优先、保不住的语法不让在所见即所得里保存；见 [[p/IXQHBXMH]]（D24）
 
 - [p/pMf5hzCG] 现状：知识库
   - [p/aOYgbhLy] 2026-10-23 对 main @ 7c5170d7 的盘点；其中检索、注入、权限、兼容四组的细节是后来对 `b9749949`（分支 `claude/youthful-johnson-vu2z3q`）的调研，行号以它为准，main 变了就会存疑。探针只跑了 SQLite，PG 没跑。
@@ -61,12 +175,14 @@
     - [p/uG6mscXl] 索引路径里不足 3 个字符的词被静默忽略，等于「匹配一切」；【实测】「充电 故障码」能命中不含「充电」的文档，「zz error」这类查询能命中不含 zz 的文档。全局搜索已经用 `globalQueryTerms` 把短词改成子串过滤（`server/services/search/query.ts:43-77`），知识库检索没有跟进。
     - [p/w66OEpnX] trigram 是子串语义，不做 CJK 分词：【实测】「充电桩故障码」连写搜不到正文里的「充电桩 故障码」。
     - [p/wrFOnNIn] 检索不过滤 status：已归档的条目会被 `KnowledgeSearch`、HTTP 搜索和全局搜索返回（【实测】；SQL 里没有 status 条件，`server/services/search/sqlite-store.ts:1160-1169`），而注入候选只取 active（`server/services/knowledge/sqlite-read-store.ts:857`）。
+      - [p/0rlgDBR6] 决定：已归档的条目检索时默认不返回，显式 include 才返回；见 [[p/qGMr0qZB]]（D22f）
     - [p/AVxOcYvA] 相关度排序是 FTS5 的 bm25，title、content、keywords 三列等权，没有标题加权（`server/services/search/sqlite-store.ts:1150`）；`sort=time` 按 `updated_at DESC, id`。有个人版本（working-copy 视图）时，相关度模式下草稿行整体排在主线行前面，不按分数合并（`server/services/knowledge-service.ts:1441-1456`）。
     - [p/3NGdju5z] 仓库里没有向量检索，也没有 embedding 或 rerank 代码（sqlite-vec、pgvector 都没有，grep 过）
   - [p/UBYfaHMf] 注入
     - [p/Ry3lMqJE] 被动注入只认作者声明的关键词，扫两处文本，命中后先过 ACL、再按 compact 周期去重、最多 3 条，写成会话里一条持久的 system 行；没有字符预算，权限按当轮的执行主体算。
     - [p/q1nxbrMf] 注入有两个触发点。A 点扫当前输入（`preparedHistory.currentInputText`，每个 loop pass 只要非空就扫，`server/services/agent-runtime/orchestrator.ts:1072-1141`）；B 点扫每次工具成功返回的输出，只扫前 `maxToolOutputScanChars=8000` 个字符，跳过 broken、fatal 和所有以 `Knowledge` 开头的工具（`server/lib/agent/loop.ts:3051-3102`、`server/services/knowledge-injection.ts:373-376`）。子代理也跑统一的 orchestrator，A、B 两点同样生效；`server/services/subagent-knowledge-injection.ts` 的 `scanSubagentTextForKnowledge` 没有生产调用方，只有测试在用（推断，grep 结论）。
-    - [p/c4qF3WT0] 匹配不走 FTS，只认条目作者声明的关键词：输入做 NFKC 和小写后用 Aho-Corasick 扫一遍，拉丁关键词要求词边界，CJK 关键词按子串（`server/services/knowledge-injection.ts:79-152,214-264`）。没有关键词的条目永远不会被注入；只在正文里出现、没有声明关键词的词不注入，这条被测试钉住（`server/services/__tests__/knowledge-draft-search.test.ts:326`，关键词相关用例在 `:310-437`）。`docs/KNOWLEDGE_BASE.md:729` 写标签名也是命中来源，代码不是（`server/services/knowledge-injection.ts:106-107`）。 ‹进行中：Q43›
+    - [p/c4qF3WT0] 匹配不走 FTS，只认条目作者声明的关键词：输入做 NFKC 和小写后用 Aho-Corasick 扫一遍，拉丁关键词要求词边界，CJK 关键词按子串（`server/services/knowledge-injection.ts:79-152,214-264`）。没有关键词的条目永远不会被注入；只在正文里出现、没有声明关键词的词不注入，这条被测试钉住（`server/services/__tests__/knowledge-draft-search.test.ts:326`，关键词相关用例在 `:310-437`）。`docs/KNOWLEDGE_BASE.md:729` 写标签名也是命中来源，代码不是（`server/services/knowledge-injection.ts:106-107`）。
+      - [p/TXWhlL7h] 决定：关键词仍是唯一无条件触发的通道，按相关度的注入要过阈值；见 [[p/ar0gJyPk]]（D22c）
     - [p/W6A5CTbn] 候选集是 `status='active'` 且 `current_keywords` 非空的条目：本项目集合加全局集合，再加本人的独立个人条目（`entry_id IS NULL`），合并后按 `updatedAt DESC` 取前 5000 条。这个上限在 ACL 之前，知识库大了以后较老的条目永远不会被注入（`server/services/knowledge-service.ts:1288,1517-1550`、`server/services/knowledge/sqlite-read-store.ts:176-220,843-866`）。
     - [p/kYqdrFOC] 命中按首次出现的位置、关键词长度（长的优先）、候选顺序（即 updatedAt）排序；全局条目先过 `filterReadable`，个人条目只要是本人的就直接放行，跳过已注入的，再取前 `maxInjectedEntries=3` 条（`server/services/knowledge-injection.ts:304-320`）。
     - [p/bVSXRVC6] 注入的摘要固定取正文前 1536 个字符，剥掉 markdown，截到 320 字，和命中的位置无关；格式是 `- [scope:id] 标题: 摘要 (KnowledgeRead {...})`，外层包 `<knowledge_base_hint>`（`server/services/knowledge-service.ts:1339`、`shared/knowledge-excerpt.ts:37`、`shared/sidecar-body.ts:75-81`、`server/services/knowledge-injection.ts:347-350`）。
@@ -75,6 +191,7 @@
       - [p/OriD5NBT] 账本在回退、分段 compact、fork 时和历史对不上（均为推断）：回退只把账本行的触发引用置 NULL（`server/services/narrator-messages.ts:815-829`、`server/services/revert-history-commit.ts:199-232`），提示行被回退后该条目在本周期内仍被压住，A 点的记录更是根本没关联到提示行；分段 compact（`segmentCompactId`）不改变 `getLatestCompactSeq`（`server/services/narrator-messages.ts:3376-3401`），被折叠掉的提示仍算已注入；fork 出的会话 narratorId 是新的、账本为空，继承来的前缀里已有的条目会再注入一次。
     - [p/Pe2pGzYa] A 点用 `persistSystemMessage` 把提示写成一条带 `knowledge_hint` block（entries、source、compactSeq、modelText）的 system 消息，并广播给这个叙述者的所有订阅者（`server/services/agent-runtime/orchestrator.ts:1091-1114`）；B 点通过 `deliverInjection` 写一条 sys 行。两种行都是原生模型上下文 block（`shared/native-injection.ts:21-29`），之后每次请求都原样重放，直到被 compact 掉：这样重建的历史逐字节一致，prompt cache 才稳定（`server/services/agent-runtime/orchestrator.ts:1072-1076`）。
     - [p/ZvpuClQN] 注入的权限按当轮执行主体算：A 点用 `active._currentUserId`，即最近一次被采纳为执行主体的人（`adoptHumanPrincipal`，`server/services/agent-runtime/orchestrator.ts:527-537,699,779,934`），Bot 房间里是每条发言的发帖人（`server/services/bot-chat.ts:153-157`）；B 点用 pass 开始时的 `config.userId`（`server/services/agent-runtime/orchestrator.ts:1724`）。`userId` 为 null 时退回匿名基线（只能读 public、没有受控标签，`server/services/knowledge-acl.ts:420-446`），仍然会注入 public 条目；`server/services/subagent-knowledge-injection.ts:39-43,247-255` 的设计相反（没有可追责的人就不注入），但那条路径没有接进生产，它的测试只证明了那个没人调用的函数（`server/services/__tests__/subagent-knowledge-injection.test.ts:220-259`）。
+      - [p/05RdaGHF] 决定：没有执行用户的轮次不注入；见 [[p/yUQxEVJE]]（D22d）
     - [p/W59G4KAo] A 点扫的文本带 `<sender kind="human" id="…" name="…" />` 标记（`server/lib/agent/sender-projection.ts:112-120`、`server/services/agent-runtime/history.ts:110,120,131`），标记参与关键词匹配：关键词 `human`、`sender`、`kind`、`system`、`name` 或某个用户名会让每条消息都触发（【实测】带标记的文本命中「human」和用户名两条关键词，原文命中 0 条）。
     - [p/exYMtADx] 编译好的匹配器按 `(collectionId, projectId, userId)` 缓存，最多 64 个，满了淘汰最早的，每次调用先算一次签名 `count:max(updated_at)`（`server/services/knowledge-injection.ts:175-212`）。缓存键含 userId，与用户无关的全局候选会按用户各存一份 5000 行，超过 64 个组合就反复重建，每次聚合都在主线程（`server/services/knowledge/sqlite-read-store.ts:868-885`）。
     - [p/ImUMpN28] 两个尚未端到端验证的推断：Task 派发的子代理的初始 prompt 会被 A 点扫（`server/services/turn-continuation-registry.ts:417-438` 声称不扫，但统一 orchestrator 扫 `currentInputText`，注释称它是 Projected caller packet，`server/services/agent-runtime/history.ts:69`）；同一个 run 在 assistant 回复前重启 pass（恢复、换模型等）会重扫同一条输入，每个 pass 各 3 条，可能陆续注入超过 3 条（`server/lib/agent/sender-projection.ts:222-237`，影响小）。
@@ -84,8 +201,10 @@
     - [p/aocCRF9c] 失败时一律拒绝：未知密级名的 rank 视为无穷大（`server/services/knowledge-acl.ts:90-101`）；没有 public 行时 public 也按 0 处理（`server/services/knowledge-acl.ts:78-79`）；集合行缺失直接拒绝（`server/services/knowledge-service.ts:1504-1508,112-116`）；没有身份时按匿名基线处理（只读 public），不是放行（`server/services/knowledge-service.ts:1475-1481`）。读不到的条目当作不存在（返回 NotFound），也不计数（`server/services/knowledge-service.ts:104-121`，`docs/KNOWLEDGE_BASE.md` §6.4）。
     - [p/K6CS4gMR] 项目上下文是独立于 ACL 的另一道边界：`getEntry` 传了 projectId 时不允许读其他项目的集合，对 admin 也生效（`server/services/knowledge-service.ts:713-721`）；带项目的检索和注入只看本项目加全局集合。个人空间只有本人可读，检索、注入、读取都一样，`KnowledgeRead` 读个人条目时连 admin 也不放行（`server/lib/agent/tools/knowledge.ts:206`）。
     - [p/aAMYBBTi] 没有项目的会话（`projectId` 为空）做检索、注入、`KnowledgeRead` 时都没有项目范围，会看到所有项目的集合（`server/services/knowledge-service.ts:719` 的 `opts.projectId &&`、`server/services/knowledge/sqlite-read-store.ts:178-179`）。这是否合理见 [[p/2suNeuFL]]。
+      - [p/4wKSOOkJ] 决定：没有项目的会话只看全局集合和个人空间；见 [[p/3th3bVc1]]（D22e）
     - [p/lvqIFIRE] ACL 全部是 JS 后过滤：`knowledgeService.search()` 本身不做 ACL，返回的行带 snippet，每个调用方都要自己调用 `filterReadable`，现有 5 个调用点都调了（`server/services/knowledge-service.ts:1470-1512`）。搜索层明确把知识库列为「查询内不做 ACL」的例外，理由是双轴规则没法写成一个 SQL 片段（`server/services/search/port.ts:20-29`、`server/services/search-service.ts:735-741`）；但叙述者和项目的 ACL 已有方言无关的 SQL 片段，并配了对照测试（`server/services/read/acl-sql.ts`、`server/services/read/__tests__/acl-sql-parity.test.ts`）。`server/services/search/port.ts:20-29` 的注释说 `KnowledgeSearchRow` 不带 snippet，已过时，`server/services/search/types.ts:412` 有 `snippet` 字段。
     - [p/x8mG1ECS] 集合的项目门（`inheritProjectGate`）对知识库没有生效（【实测】）：schema 里新建的项目集合默认 `inherit_project_gate=true`（`server/db/schema.ts:4713-4724`），ACL 内核把它当项目门（`server/services/acl/acl-scope.ts:108-124`），成员变更时会广播知识库刷新，注释写着「the gate is re-evaluated server-side on the next read」（`server/services/project-membership.ts:476-499`）；但知识库的 `canRead` 和 `filterReadable` 都不调用它，全仓库没有知识库路径调用 `resolveAncestorChain` 或 `resolveProjectGate`。探针里私有项目的非成员在 `resolveProjectGate` 下 `read=false`，`filterReadable` 却保留了该条目，`/api/knowledge/search` 能搜到，带 projectId 的注入也命中。是安全缺陷还是未完成的功能，见 [[p/2L2h7HTV]]。
+      - [p/NWKVGIWw] 决定：项目门要真正生效，上线前先跑只读报表；见 [[p/XqxCk8Yz]]（D22a）
     - [p/KojJGsXl] 知识库 ACL 只在「取出」的那一刻按当时的执行主体（`_currentUserId`）判断一次；内容进了会话历史（注入的 system 行、`KnowledgeRead` 的工具结果）之后，读会话、驱动会话、重放历史、compact、fork 都不再检查知识库 ACL（grep 过，没有按主体打码的逻辑），所以多人会话里 A 读进来的内容 B 能问出来。
       - [p/2om4hDJr] B 是谁：能读会话的人（`canReadNarrator`，`server/services/narrator-acl.ts:290-313`）直接在界面上看到注入的标题和摘要；能写的人（GET 需要 read，POST 需要 write，`server/routes/narrators.ts:820-830`）发消息就能让模型复述。项目会话默认 `project` 可见，写权限默认取允许的最宽范围，也是 `project`（`server/lib/settings/defaults.ts:504-510`、`server/services/narrator-service.ts:1546-1552`），所以项目成员默认既能看也能驱动；admin 发起的轮次没有任何 ACL 限制。设计决策 D9 只算驱动者权限的交集 [[p/YjEt8WXX]]，覆盖不到只读的人，怎么改见 [[p/81ZJYfpZ]]。
       - [p/g1ookX45] 同一类泄露链路有六条，公开分享链接能否看到这些内容还没核实（`server/services/public-narrator-share-service.ts`）：
@@ -95,21 +214,24 @@
         - [p/7fJabG0G] compact 与 fork：compact 摘要会把这些内容带进下一个周期（推断）；B 有写权限就能 fork，副本归 B 所有，然后随便问（`server/routes/narrators.ts:5216-5236`）。
         - [p/pxVvOwXB] Bot 房间：共享 bot 只有一个上下文，隔离完全靠提示词（`docs/BOT_NARRATOR.md:30,42`、`server/lib/prompts/bot.ts:24`）。
         - [p/gdvk6G9v] Recall：任何用户 `/load Recall` 后用 `all_narrators:true` 自己批准权限，就能搜所有会话的消息，搜索层不按查看者过滤（推断；不限于知识库，但会把上面几条链路扩大到全站，`server/lib/agent/tools/recall.ts:497-506`、`server/services/narrator-permission.ts:1074-1079`、`server/services/search/port.ts:100-106`）。
+          - [p/4Z3YDD2R] 决定：Recall 的全站搜索和公开分享链接不纳入这次知识库替换，单独立项；见 [[p/l2kX1SwR]]（D22g）
+      - [p/VhgF7qem] 决定：注入按所有能读这个会话的人的权限交集算；见 [[p/tlMnqe0k]]（D22b）
   - [p/QjGne9F9] 兼容
     - [p/LbGyNTHi] 换掉检索或注入时，下面这些现有依赖会被碰到：历史里已落库的数据要继续渲染，用户可能改过的设置，调用方依赖的返回形状，以及被测试钉住的行为。
-    - [p/SylrFBbS] 已经落库的 `knowledge_hint` block、`knowledge_base_hint` side-car body 和 `KnowledgeSearch` 工具卡片的 metadata 由前端和排版代码直接读取（`shared/native-injection.ts:21-29`、`shared/pretext-layout/segment-adapter.ts:3275`、`frontend/components/narrator/vlist/measure/measure-system-list.ts:113`、`shared/pretext-layout/tool-detail.ts:3263`）。工具或注入形式退役后，旧消息里的「点条目打开」要么继续能用，要么优雅降级。
-    - [p/WGwu2CRS] 用户可调的设置：`injectMode=off`、`scanToolOutput` 等 `knowledge.*` 键（`server/lib/settings/defaults.ts:32-41,355-376`），用户可能已经改过，换新视图要映射过去或保留为别名。
+    - [p/SylrFBbS] 已经落库的 `knowledge_hint` block、`knowledge_base_hint` side-car body 和 `KnowledgeSearch` 工具卡片的 metadata 由前端和排版代码直接读取（`shared/native-injection.ts:21-29`、`shared/pretext-layout/segment-adapter.ts:3275`、`frontend/components/narrator/vlist/measure/measure-system-list.ts:113`、`shared/pretext-layout/tool-detail.ts:3263`）；旧消息里的「点条目打开」用的就是这些数据。
+    - [p/WGwu2CRS] 用户可调的设置：`injectMode=off`、`scanToolOutput` 等 `knowledge.*` 键（`server/lib/settings/defaults.ts:32-41,355-376`），用户可能已经改过。
     - [p/pdW5rA65] HTTP 返回形状：`/api/knowledge/search` 返回数组；`GET /api/knowledge/entries?q=` 不带 limit 时返回旧的裸数组（`docs/KNOWLEDGE_BASE.md` §4.2）。
     - [p/zCiwygKA] 检索里个人版本覆盖主线（working copy，草稿行排在主线行前面，`server/services/knowledge-service.ts:1441-1456`），个人版本落后主线时有提示，独立个人条目在检索里可见。
-    - [p/DJtxR2xe] 钉住注入行为的测试：关键词用例（`server/services/__tests__/knowledge-draft-search.test.ts:310-437`，其中 `:326` 钉的是只在正文出现的词不注入）；账本在读失败时保持旧状态、下个 pass 重试（`server/services/__tests__/knowledge-cycle-async.test.ts`）；子代理注入的 ACL 用例只测那个没接进生产的函数（`server/services/__tests__/subagent-knowledge-injection.test.ts:220-259`）。 ‹进行中：Q43›
+    - [p/DJtxR2xe] 钉住注入行为的测试：关键词用例（`server/services/__tests__/knowledge-draft-search.test.ts:310-437`，其中 `:326` 钉的是只在正文出现的词不注入）；账本在读失败时保持旧状态、下个 pass 重试（`server/services/__tests__/knowledge-cycle-async.test.ts`）；子代理注入的 ACL 用例只测那个没接进生产的函数（`server/services/__tests__/subagent-knowledge-injection.test.ts:220-259`）。
     - [p/ajfsMSdv] 现有检索是只读且受限的：生产查询在 SQLite 搜索 worker 里执行并带 `signal`（`server/services/search/sqlite-store.ts:32`、`server/services/knowledge-service.ts:1189,1222`），子串路径另有更紧的 limit，摘要读取有上限（`server/services/knowledge-service.ts:1339`）；注入出错都是 catch 后打 warn，不会让本轮失败。
-  - [p/ga38jnrJ] human attention 现有五种：异步提问、阻塞提问、权限、计划审批、反思
+  - [p/ga38jnrJ] human attention 现有五种：异步提问、阻塞提问、权限、计划审批、反思；其中「反思」只在人接管任务反思后才出现，自动反思不会出现，见 [[p/65JHQGgo]]
   - [p/Xtj0I8nI] 计划模式提交的是一段 markdown，或 .narrafork/plans/ 下的计划文件
 
 - [p/WPaz7Csw] 现状：会话与项目归属
   - [p/hYhwFEtJ] 会话属于哪个项目由一个「主项目」回答，读权限、设备授权、执行策略和知识注入都看它；工作目录只用来推导主项目或一条附加链接，一个会话的多个工作区记不下（[[p/S7dMgVAI]] 要的正是多工作区会话）。2026-10-25 对分支 `claude/youthful-johnson-vu2z3q` @ `2f991c80` 的盘点（调研读的是同一分支的 `becf57ee`）。每条结论都锚在代码上，代码变了就会存疑。
   - [p/QTGR5IuC] 会话只有一个主项目，`resolveNarratorProjectId` 是唯一答案：有 `contextProjectId` 用它，否则用 `primary` 链接，`additional` 链接不参与（`server/services/narrator-project.ts:31-49`）。ACL 的项目门、trait 层、routines、技能的项目根、设备授权、执行策略、知识注入、通知都只看主项目。同一个规则有三处镜像，改规则要一起改：Drizzle 表达式 `narratorProjectIdColumn`（`server/services/narrator-project.ts:72-74`）、原生 SQL `narratorProjectIdText`（`server/services/read/acl-sql.ts:94-96`）、同步版 `projectIdOf`（`server/services/tool-final-start-authorization.ts:72-86`）。
     - [p/i74SvCEF] 不用多主项目：让会话平等属于每个工作区所属的项目，读权限的项目门取并集，会把 A 仓库的内容泄露给 B 的成员；取交集，又几乎没有人能看；而会话历史混着所有工作区的内容，读权限只能由一个主体来定。它还要推翻 `server/services/narrator-project.ts:1-12` 写明的「唯一答案」不变量（每多一份对「会话属于哪个项目」的回答，就多一个绕过点），重写上面三处镜像，包括会话列表分页用的 SQL 谓词。单主项目之上怎么支持多工作区，还在待定问题里讨论：[[p/UMJvCvWQ]]。
+    - [p/f1YVDv57] 决定：这条唯一答案保留，多工作区会话也只有一个主项目；见 [[p/CGfIcqJc]]
   - [p/zR5b9WQw] 项目由会话的工作目录自动建出来，不用手动建：先按路径段边界取最长前缀的已有项目根（已归档的项目也参与匹配，所以归档后不会为同一目录再建一个）；没有就用 `git rev-parse --git-common-dir` 找主仓库根（linked worktree 因此归到主仓库的项目），主仓库根上还没有项目就当场建一个公开项目，owner 是会话的 owner（`server/services/project-index.ts:207-234`，公开在 `server/services/project-index.ts:188`）。前缀匹配先于 git 探测，外层已有项目时，内层的独立仓库会并进外层项目。
   - [p/ZaINwQLx] 不建项目的目录：非 git 目录；bare 仓库、`--separate-git-dir` 和子模块都读成「不是仓库」，因为它们的 `--git-common-dir` 输出不以 `/.git` 结尾（子模块是 `super/.git/modules/sub`），外层没有项目时就不建（`server/services/project-index.ts:153`）。远端设备上的目录不进索引，本地的前缀匹配和 git 探测对另一台机器的路径没有意义（`server/services/project-index.ts:236-238`）。
   - [p/gXLXMVzZ] 一个项目只对应一个根目录：项目表只有一个 `gitPath` 和一个 `rootKey`（`server/db/schema.ts:209`、`server/db/schema.ts:251`）；同一个目录上后建的项目拿不到 root key，不参与匹配（`server/services/project-index.ts:379-403`）。把项目手动建在几个仓库的共同父目录上，按最长前缀规则，下面还没有自己项目的仓库都会归进来，相当于一个只有一份配置的项目组
@@ -120,17 +242,48 @@
   - [p/jG7h27b7] 子代理在别的目录工作时（Agent 工具的 `workdir`，指向别的目录要先过用户批准，`server/lib/agent/tools/task.ts:209-211`），`contextProjectId` 复制父会话的，工作目录用自己的（`server/services/narrator-service.ts:1776-1780`）；读权限随根会话的 `acl_root_narrator_id`；模型策略按父会话的主项目解析（`server/services/subagent-runner.ts:209`），执行策略以子代理自己的主项目为主，再把父链上各项目的规则层也合并进来（`server/services/execution-policy/repository.ts:43-95`）。项目页只列 primary 会话，所以那个目录所属项目的页面上看不到这个子代理。
   - [p/SxJW0U00] 现有的几条路径会让一个会话碰到第二个仓库：`contextProjectId` 与工作目录不属于同一个项目、会话里切工作目录、切到远端设备。规则和权限都只跟主项目走，留下四处缺口：
     - [p/ZtGuF1xl] `contextProjectId` 是 A、工作目录在仓库 B 的会话：执行发生在 B 的文件上，执行策略却只合并 A 的项目层（`server/services/execution-policy/repository.ts:72-95`），B 的 deny 规则、项目级设备、routines、trait 都不生效；B 的成员只要不是 A 的读者就看不到这个会话（`visibility='public'` 除外）。创建时只检查调用者对 A 的 write，不检查工作目录所属项目的权限（`server/routes/narrators.ts:1285-1292`）。
+      - [p/rtmKpeeE] 决定：在工作区上执行时，规则按该工作区所属的项目算，主项目的 deny 层保留；见 [[p/mGi2WmjX]]（D21e）、[[p/VCBOgqyh]]（D21b）
     - [p/HMsyO5er] 会话里切工作目录（HTTP `PATCH /:id/cwd`、`/workspace-context/switch`，或 agent 调 `SwitchWorkingDirectory` 工具）只检查会话的 write 权限、敏感路径和会话自己的执行策略，不检查目标目录所属项目的权限（`server/routes/narrator-workspace-context.ts:14-39`、`server/services/workspace-context-service.ts:245-280`）。
+      - [p/XHxMTsRs] 决定：切工作目录和加工作区统一过「目标工作区所属项目的 write」这一道门；见 [[p/VCBOgqyh]]（D21b）
     - [p/qDwEUyPN] 没有 `contextProjectId` 的会话切到另一个仓库后，DB 里的主项目异步变了（切换发布时 `void` 触发链接同步，`server/services/workspace-context-service.ts:648`），活动会话内存里的 `_projectId`、`_projectGitPath` 却是会话建立时读的，之后不刷新（`server/services/narrator-session.ts:1226-1236`）：`updateActiveNarratorCwdAndSkillContext` 只更新 cwd、技能根和 `isGitRepo`（`server/services/narrator-session.ts:1693-1712`），知识注入和每轮的设备列表还用旧项目（`server/services/agent-runtime/orchestrator.ts:1083`、`server/services/agent-runtime/orchestrator.ts:936`）。DB 和内存对「属于哪个项目」给出不同答案；`visibility='project'` 的会话随之从旧项目成员换给新项目成员，历史里却留着旧仓库的内容。
+      - [p/jvXVldft] 决定：主项目创建时定下，切工作目录不再隐式改主项目；见 [[p/HUZdurGu]]（D21a）
     - [p/6a86UUdd] 推断（读代码得出，没有实际跑过）：没有 `contextProjectId` 的本地会话切到远端设备后，目录推导出的链接被删，主项目变成 null。远端目录不进索引（`server/services/project-index.ts:254`），切设备只改 `defaultDeviceId`，`narrators.cwd` 仍是本地目录（`server/services/workspace-context-service.ts:451`），发布时重新同步链接（`server/services/workspace-context-service.ts:543`）。结果是项目门消失，`visibility='project'` 的会话对项目成员不可见（`server/services/read/acl-sql.ts:130` 要求项目非空）；设备列表按 null 项目取，只授权给项目的设备不再出现（`server/services/device-service.ts:101-107`）：切换前的校验用旧项目通过（`server/services/narrator-session.ts:655-656`），切换后 `getSessionDevices(null)` 就看不到刚切过去的那台设备。
+      - [p/uu1xhZfW] 决定：主项目创建时定下，切设备不再让它变成 null；远端工作区的项目绑定时由人选；见 [[p/HUZdurGu]]（D21a）、[[p/734Ce5AD]]（D21d）
 
-- [p/5N6EK3Bl] 待定问题 ‹进行中：Q6、Q7、Q8 等 11 项›
+- [p/HNCPid9n] 现状：markdown 解析与渲染
+  - [p/DbQ2xgKM] 仓库里同时有三套 Markdown 解析器，只读渲染、聊天排版和 Tiptap 编辑器各走各的，没有统一的方言模式，对同一段文本的行为并不一致。2026-10 读码并实测 marked 17 和 18（当时仓库没装 node_modules，Tiptap 各包的源码按 `bun.lock` 的版本从 npm 取来读，marked 用校验和与 `bun.lock` 一致的包在内存里跑）。块内方言要支持哪些写法、怎么规范化，还有待负责人拍板的细项在 [[p/u0N4je9K]]
+  - [p/BVnZyy07] 三套解析器并存：micromark（`frontend/components/narrator/markdown/MarkdownContent.tsx`，react-markdown 加 remark-gfm）、marked@18（`shared/pretext-layout/parse-markdown.ts`，聊天排版用）、marked@17（`@tiptap/markdown` 自带，`bun.lock:2631`）。要给块内 markdown 定一份各处通用的写法，只能取三者行为一致的子集（推断）
+    - [p/TNeykCjS] MarkdownContent 没有方言模式：remark-gfm 始终开着（脚注、自动链接、单个 `~` 删除线都认），检测到公式才加载 remark-math 和 KaTeX，外链图片直接加载（`frontend/components/narrator/markdown/MarkdownImage.tsx:10`）；浏览器不支持正则后行断言（Safari 16.4 以前）时整个跳过 remark-gfm（`frontend/components/narrator/markdown/MarkdownContent.tsx:556-564`、`:791`）；`mermaid` 围栏画成图（`:277`）
+      - [p/t2O5YeID] 决定：数学和图片首版不进方言，写入时转义；见 [[p/UYSH9m71]]（D23d）
+    - [p/r5r8KfS0] MarkdownContent 和 parse-markdown 已有分歧：脚注（MarkdownContent 渲染成脚注，marked 把它变成链接，实测）；图片（parse-markdown 只显示 alt 文字，`shared/pretext-layout/parse-markdown.ts:921`）；math 代码块（parse-markdown 渲染成公式，`:519`，MarkdownContent 显示成代码）；HTML 实体（parse-markdown 不解码，`&amp;` 原样显示）
+    - [p/1xSGm4aR] 两边一致的地方：HTML 都当文本显示（`shared/pretext-layout/parse-markdown.ts:935`）；中文粗体都先经过 `shared/markdown-emphasis-compat.ts`，它放宽 CommonMark 对中文标点的限制（`**注意：**说明` 算粗体），`_` 不放宽，因为会误伤 `snake_case`
+    - [p/vnAHnWAu] 两边都不识别 `[[…]]` 和 `![[…]]`。要识别必须在分词阶段做（micromark 扩展加 marked 扩展），解析完再替换不行：实测 `[[p/…]](上文)` 会被解析成链接，`![[p/…]](图)` 会被解析成图片
+    - [p/llzhPsdb] 实测的几处解析差异：marked 把 `1~2天，3~5个` 里的单个 `~` 解析成删除线；marked@18 的裸网址会把紧跟的中文一起吞进链接；表格单元格里的 `[[p/x|显示]]` 会被竖线切开，marked 把它拆成两格，多出来的格被丢掉
+      - [p/oyA3isCE] 决定：提及存 `[[空间/短id]]`，支持 `[[地址|显示文本]]`，表格里的竖线要转义；见 [[p/o89VG1uT]]（D23b）
+  - [p/8kaIbu8e] 不用 `@tiptap/markdown`（SpecMarkdownEditor 在用）当块内方言的规范实现：它的往返行为和稳定的写法冲突。下面的 TM 指 `@tiptap/markdown@3.27.1` 包内的 `src/MarkdownManager.ts`
+    - [p/kW420Iov] 浏览器里用 DOMParser 把 HTML 解析成节点，服务端没有 window 就按文本保留（TM:953），同一段正文两边结果不同
+    - [p/FoG7AKts] 普通文本里的 `\`、反引号、`*`、`_`、`[`、`]`、`~` 一律转义，`&`、`<`、`>` 编成实体（TM:1100、1112），`snake_case` 会变成 `snake\_case`
+      - [p/durTgSrH] 决定：块内用最小转义，不用这种保守转义；见 [[p/PFLnl4nF]]（D23g）
+    - [p/Yur9bBhA] 硬换行写成两个尾随空格，代码围栏和行内代码的反引号个数是固定的
+    - [p/ECwDNE3k] 没有对应处理器的 token：有子 token 就解析子 token，没有就返回 null（TM:920-925）；表格就是这样整张丢的。其余语法的下场不一，图片只剩 alt 文字，HTML 标签被剥掉而文字留下，任务列表丢复选框，并不是一律直接丢弃，详见 [[p/qesndcYT]]
+    - [p/JHOhMsQ1] StarterKit 自带的下划线输出 `++x++`，现有渲染器把它显示成原字符
+    - [p/UBfklEyH] 注册分词扩展会改动全局的 marked 实例（TM:262）
+  - [p/0wSv2vqR] `#` 已经有别的用途：composer 的 `#file:路径:行`（`frontend/components/narrator/composer/file-reference-input.ts:147-155`），以及正文里的 `#81`、色值 `#1a1b1e`。`#标签` 要不要进块正文，得先处理这些冲突
+  - [p/WR9xb2MM] 能直接复用的
+    - [p/64yTl8Mk] marked@18 是纯 JS，已经在 `shared/` 里用，浏览器和 Bun 都能跑，可以当块内方言的分词器；序列化器要自己写
+    - [p/UwKoGD4R] 浏览器和服务端要共用 `shared/` 里同一份解析和序列化实现（推断）：编辑器把块序列化成 markdown 后与 Y.Text 当前内容做 diff（`docs/OUTLINE_KNOWLEDGE-DESIGN.md:551`），两边写法不一致就会互相改写
+    - [p/UA6C3WEg] `@tiptap/pm`（含 prosemirror-tables）可以直接用；行内 atom 加 NodeView 的样板是 `frontend/components/narrator/composer/InlineComposerEditor.tsx:451-465` 的 `atomExtension`，位置映射的样板是 `frontend/components/narrator/composer/composer-document-adapter.ts`
+    - [p/DKLz33Xc] 链接安全和文件链接：`shared/pretext-layout/parse-markdown.ts` 的 `parseHref`（`:1550`，目前没导出，只放行 http、https、mailto、tel 和相对路径）和 `shared/markdown-file-path.ts` 可以复用
+  - [p/bToUdECx] `docs/` 下 54 篇 Markdown 的写法分布（2026-10 脚本统计）：行内代码 9704 处；`**` 粗体 3296 处，`__` 为 0；`-` 列表 4142 行，其中嵌套 496 行；表格 249 张；h2 和 h3 共 1513 个，h4 只有 18 个；代码块 321 个，全部用反引号围栏；引用 150 行，`---` 135 处，链接 113 个，删除线 3 处；斜体、图片、脚注、数学、`[[…]]`、`#标签` 都是 0；HTML 只有表格里的 `<br>`，共 12 处
+    - [p/NWsHZmru] 决定：表格进块体、h4 及以下改成粗体段落、分隔线不做；见 [[p/bGSNekcv]]（D23a）、[[p/DzR0VMpY]]（D23h）
+
+- [p/5N6EK3Bl] 待定问题 ‹进行中：Q7、Q8、Q9 等 8 项›
   - [p/i5q1KUdz] 提问指派给做决定的人（通常是 human:owner），会出现在收件箱里。需要先调研的，在提问下建调研子任务指派给 agent；调研做完，在提问下写一条带 #建议 的块，提问就带着建议进收件箱，负责人可以一次采纳多条（answer）。回答写成子块，形成决策后链接到「设计决策」。
-  - [p/hLvWQ8rF] SpecMarkdownEditor 丢内容 ‹进行中：Q27、Q28、Q29 等 5 项›
-  - [p/nYkmnrR7] 任务反思与 /goal ‹进行中：Q25、Q26›
-  - [p/u0N4je9K] 块内方言的细项 ‹进行中：Q17、Q18、Q19 等 8 项›
-  - [p/TxVzefA3] 协作规则的默认值 ‹进行中：Q1、Q2、Q3 等 5 项›
-  - [p/UEVQdYkB] 已回答 ‹进行中：p/vIkPD0xT、p/Z50dD22z、p/8jNsS3fV 等 4 项›
+  - [p/hLvWQ8rF] SpecMarkdownEditor 丢内容
+  - [p/nYkmnrR7] 任务反思与 /goal
+  - [p/u0N4je9K] 块内方言的细项
+  - [p/TxVzefA3] 协作规则的默认值
+  - [p/UEVQdYkB] 已回答
 
 - [p/TMdwYNRd] 原型发现
   - [p/CBTVZMXi] 搭原型和录入计划时发现的设计问题。每条都是要反馈进设计文档的修改，整理回文档后标为已处理。
@@ -150,42 +303,42 @@
   - [p/6hhSPqRU] 写检索锚点时，正则里的反斜杠会被参数解析吃掉；agent 写锚点需要不依赖转义的写法
   - [p/JNYdq1NP] 看板要区分「可以开始」和「等前置」：前置没完成的任务看起来和普通待办一样；原型改为推导出「等前置」标记，不写进状态
   - [p/wJsEdT5n] 工具输出里要直接给出数量（检查了几处锚点、改了几个块），agent 凭记忆写数字容易写错：录入时把 13 处锚点写成了 15，见第 15 个提交的更正
-  - [p/IQn7U6Pl] 默认身份是个陷阱：命令不带 --as 时按 agent:main 执行。我开头 21 条读和检索命令没带身份，读取记录全记进了 agent:main 名下，等于替它刷新了「读到的版本」，它之后再改这些块时，并发检查会漏掉别人的修改。这次的块都是 agent:main 自己写的，没造成实际影响。协调者要在三个身份之间切换，没给身份时应该报错，至少在输出里回显当前身份
-  - [p/8xOHADRj] 「代」有两种意思，命令行只显示一种：log 里「agent:w-dialect（代 human:owner）」的「代」指责任人；这次真正的代记人（recorded_by=agent:steward）只写进了 log.jsonl，命令行的 log 和 export 都不显示，只有 viewer.html 显示，读的人会以为是 w-dialect 自己写的。我只好把「steward 代记」写进每条提交消息和协调者笔记。责任人、代批、代记三个「代」，是这次最让我犹豫的概念
-  - [p/JxNV7qfA] 代记时该用谁的身份，没有定下来的规则：报告结论是用专注 agent 的身份加 --by，还是用协调者身份写，只能从 [[p/D16b]]（还是待确认的假设）和 --by 的帮助推断；代码注释说代记见 §8.14，设计文档只到 §8.13。这条我读了好几遍，最后定为：报告里的结论和代交用专注 agent 身份加 --by，提问、看法、发现用 agent:steward
-  - [p/wezmydyv] agent 写的 [assert] 带了证据，默认也是「假设」，要显式写 [assert:accepted]。README 说「没有依据的结论会被记为假设」，§9.6 说有证据的结论「直接是采纳」，读起来像有证据就会自动采纳；我读了 default_props 才确认，不然这次 30 条有依据的结论会全部记成假设
-  - [p/eWnSiDjJ] 建一条提问要手填五项：alias（先扫一遍已有别名找空号，这次是 Q17–Q26）、owner=human:owner、manager、tags（提问加阶段）、source。manager 默认是创建者，也就是临时的协调者，我手动改成了 agent:main。别名重复不会报错，但两个块都会按别名解析失败（resolve 要求唯一）。这些应该由系统做：提问命令自动编号，管理者和阶段标签随 source 指向的任务继承
-  - [p/X2hS0N1J] add --md 加 --after 时，只有第一条落在指定位置，其余追加到页尾，在待定问题页会排到「已回答」后面。我读 create_items 时发现了这一点，只好把 10 个提问拆成 10 条命令，每条接在上一条后面
-  - [p/VpoFI7PK] 正文里没法写字面的双中括号：原型在正文任何位置都把它认成提及，行内代码里也一样。代记方言报告时，报告里用真实别名 D5、D6 写的示例会变成真链接，我只好改写成 `[[p/…]]`。这正是 Q6 要回答的转义和提及写法问题（[[p/Q23]]、[[p/Q18]]）
-  - [p/FRkh7rVZ] 代码锚点只认 TS/JS 写法的声明，而且只对照 origin/main：报告引用的 outline.py 常量 INLINE_LINK 和 Python 函数都锚不上，origin/main 上也还没有 prototypes/outline/；按行号引用的位置也锚不上（同 [[p/PoBH5Bog]]）。这些只能写 evidence=file:，过期了看不出来。为了不报错，我先用 Python 预算了 16 个锚点的指纹，确认能算出来才写进去
-  - [p/ACeb4kF6] 报告里的行号在代记前就对不上了：w-dialect 写完报告后，21c0ff6f 改了设计文档，报告里的 OD:438 现在在第 446 行。evidence=file:路径 不带版本，过后没人知道指的是哪一版，我只能在图例里注明「行号按 eeb244b6」。file: 证据应该自动记下当时的提交号，或者像 based_on 一样记指纹
-  - [p/uHX4EGi1] 两份报告放在会话的临时目录里，会话结束就没了，指向它们的 file: 证据会失效。行内写法 {evidence=…} 带不了摘录，只有 task --excerpt 和 link --excerpt 能带，所以只在两次代交时加了摘录。已有的现状盘点用的是 report:spec-inventory-…，两种写法并存。§9.6 说子代理的最终报告应该自动挂到任务下面，现在这一步全靠协调者手抄，这次抄了 53 个块
-  - [p/WSjnydef] read 和 board 看不出任务要不要验收、管理者是谁，只显示执行者。为了确认 Q6、Q13 要验收、管理者是 agent:main，我只能用 Python 直接加载状态查属性
-  - [p/xetsZBvn] 调研型提问做完以后，没有把建议交给负责人拍板的环节：Q13 本身就是「是否保留」的提问，调研完进入待验收、由 agent:main 验收，负责人的收件箱里看不到。我另建了 [[p/Q25]] 请负责人决定，但拿不准它算不算和 Q13 重复；[[p/i5q1KUdz]] 只说「形成决策后链接到设计决策」，没说由谁发起
-  - [p/a9JvCq6q] add --md 会静默丢掉空行：代码块里的空行会丢；表格后面也没法另起一段，因为 GFM 会把紧跟的文字并进表格，所以我把方言草案的缩写说明放进了子块
+  - [p/IQn7U6Pl] 默认身份是个陷阱：命令不带身份（`--as` 或环境变量 `OUTLINE_ACTOR`）时按 agent:main 执行，没给身份也不报错。不带身份的读取记录同样记在 agent:main 名下，等于替它刷新了「读到的版本」，它之后再改这些块时，并发检查会漏掉别人的修改（第一轮试用开头有 21 条读和检索命令这样记了；那些块都是 agent:main 自己写的，没造成实际影响）。协调者要在几个身份之间切换，没给身份时应该报错，至少在输出里回显当前身份。状态：部分处理（853ebf0e）：写入时回显当前身份，README 要求子代理先设 `OUTLINE_ACTOR`，没给身份仍不报错
+  - [p/8xOHADRj] 「代」有两种意思，命令行只显示一种：log 里「agent:w-dialect（代 human:owner）」的「代」指责任人；这次真正的代记人（recorded_by=agent:steward）只写进了 log.jsonl，命令行的 log 和 export 都不显示，只有 viewer.html 显示，读的人会以为是 w-dialect 自己写的。我只好把「steward 代记」写进每条提交消息和协调者笔记。责任人、代批、代记三个「代」，是这次最让我犹豫的概念。状态：原型里已处理（853ebf0e）
+  - [p/JxNV7qfA] 代记时该用谁的身份，没有定下来的规则：报告结论是用专注 agent 的身份加 --by，还是用协调者身份写，只能从 [[p/D16b]]（还是待确认的假设）和 --by 的帮助推断；代码注释说代记见 §8.14，设计文档只到 §8.13。这条我读了好几遍，最后定为：报告里的结论和代交用专注 agent 身份加 --by，提问、看法、发现用 agent:steward。状态：原型里已处理（853ebf0e）；第二轮又定了按代记人的范围判断，见 [[p/ZFWs7gMs]]；第二版取消代记，不再有协调者模式（[[p/Vgac6c7S]]），这条只对原型有效
+  - [p/wezmydyv] agent 写的 [assert] 带了证据，默认也是「假设」，要显式写 [assert:accepted]。README 说「没有依据的结论会被记为假设」，§9.6 说有证据的结论「直接是采纳」，读起来像有证据就会自动采纳；我读了 default_props 才确认，不然这次 30 条有依据的结论会全部记成假设。状态：原型里已处理（853ebf0e）
+  - [p/eWnSiDjJ] 建一条提问要手填五项：alias（先扫一遍已有别名找空号，这次是 Q17–Q26）、owner=human:owner、manager、tags（提问加阶段）、source。manager 默认是创建者，也就是临时的协调者，我手动改成了 agent:main。别名重复不会报错，但两个块都会按别名解析失败（resolve 要求唯一）。这些应该由系统做：提问命令自动编号，管理者和阶段标签随 source 指向的任务继承。状态：部分处理（853ebf0e）：别名自动编号并校验唯一，管理者和阶段标签还要手填
+  - [p/X2hS0N1J] add --md 加 --after 时，只有第一条落在指定位置，其余追加到页尾，在待定问题页会排到「已回答」后面。我读 create_items 时发现了这一点，只好把 10 个提问拆成 10 条命令，每条接在上一条后面。状态：原型里已处理（853ebf0e）：多条依次往后接
+  - [p/VpoFI7PK] 正文里没法写字面的双中括号：原型在正文任何位置都把它认成提及，行内代码里也一样。代记方言报告时，报告里用真实别名 D5、D6 写的示例会变成真链接，我只好改写成 `[[p/…]]`。这正是 Q6 要回答的转义和提及写法问题（[[p/Q23]]、[[p/Q18]]）。状态：原型里已处理（853ebf0e）
+  - [p/FRkh7rVZ] 代码锚点只认 TS/JS 写法的声明，而且只对照 origin/main：报告引用的 outline.py 常量 INLINE_LINK 和 Python 函数都锚不上，origin/main 上也还没有 prototypes/outline/；按行号引用的位置也锚不上（同 [[p/PoBH5Bog]]）。这些只能写 evidence=file:，过期了看不出来。为了不报错，我先用 Python 预算了 16 个锚点的指纹，确认能算出来才写进去。状态：部分处理（853ebf0e）：锚点支持 Python 和 `--ref HEAD`，按行号的位置还锚不上
+  - [p/ACeb4kF6] 报告里的行号在代记前就对不上了：w-dialect 写完报告后，21c0ff6f 改了设计文档，报告里的 OD:438 现在在第 446 行。evidence=file:路径 不带版本，过后没人知道指的是哪一版，我只能在图例里注明「行号按 eeb244b6」。file: 证据应该自动记下当时的提交号，或者像 based_on 一样记指纹。状态：原型里已处理（853ebf0e）
+  - [p/uHX4EGi1] 两份报告放在会话的临时目录里，会话结束就没了，指向它们的 file: 证据会失效。行内写法 {evidence=…} 带不了摘录，只有 task --excerpt 和 link --excerpt 能带，所以只在两次代交时加了摘录。已有的现状盘点用的是 report:spec-inventory-…，两种写法并存。§9.6 说子代理的最终报告应该自动挂到任务下面，现在这一步全靠协调者手抄，这次抄了 53 个块。状态：原型里已处理（853ebf0e）
+  - [p/WSjnydef] read 和 board 看不出任务要不要验收、管理者是谁，只显示执行者。为了确认 Q6、Q13 要验收、管理者是 agent:main，我只能用 Python 直接加载状态查属性。状态：原型里已处理（853ebf0e）
+  - [p/xetsZBvn] 调研型提问做完以后，没有把建议交给负责人拍板的环节：Q13 本身就是「是否保留」的提问，调研完进入待验收、由 agent:main 验收，负责人的收件箱里看不到。我另建了 [[p/Q25]] 请负责人决定，但拿不准它算不算和 Q13 重复；[[p/i5q1KUdz]] 只说「形成决策后链接到设计决策」，没说由谁发起。状态：原型里已处理（853ebf0e）
+  - [p/a9JvCq6q] add --md 会静默丢掉空行：代码块里的空行会丢；表格后面也没法另起一段，因为 GFM 会把紧跟的文字并进表格，所以我把方言草案的缩写说明放进了子块。状态：原型里已处理（853ebf0e）
   - [p/oDcGZOLZ] 步数：到这一条为止执行了 57 条 outline 命令，没有报错。其中写入 18 条：代记内容 2 条（53 个块）、提问 10 条、Q10 补充 1 条、协调者笔记 2 条、代交 2 条、这一批发现 1 条；其余 39 条是帮助、读页、检索和核对。不报错的代价是先读了 outline.py 全文约 1900 行里的约 1600 行，又用 git、Python、curl 做了近 20 次只读核对（锚点指纹、文件路径、设计文档版本、任务属性）。纯记账的部分有别名编号、提问的五项属性、提问索引笔记、代交、核对位置和收件箱，大多可以由系统自动做
   - [p/e4NgxR0k] 章节号引用会随文档重排失效：设计文档插入 §10 之后，大纲里引用设计文档章节号的 13 处有 3 处指错了（[[p/7QQgsP3M]]、[[p/Q26]]、[[p/1wEcDyvj]]，已改）；写明提交号的 [[p/7rCR5pnr]]（「设计文档 21c0ff6f……§18」）仍然准确。正式系统里设计文档本身就在大纲里，引用是块链接，重排不会断；迁移期间引用外部文档，要像 file: 证据一样记下版本
   - [p/LRzBRVNS] 范围页上的泡本来可以用普通的 link 命令直接加，等于自己扩大范围、绕过批准；原型改成范围页上的「涉及」只能用 scope 命令增减。正式系统里，决定范围和权限的链接不能走通用的写链接路径
-  - [p/QNztNKwM] 同一个泡会攒出好几条扩大范围请求：agent 被挡住时系统替它提一条，它自己再申请一条，上级替它申请又是一条。原型里批准其中一条之后，其余只要范围、而且已经满足的请求由系统关掉（状态 satisfied），不留给人处理
+  - [p/QNztNKwM] 同一个泡会攒出好几条扩大范围请求：agent 被挡住时系统替它提一条，它自己再申请一条，上级替它申请又是一条。原型里批准其中一条之后，其余只要范围、而且已经满足的请求由系统关掉（状态 satisfied），不留给人处理；带写入的请求不在此列，要单独批（[[p/R5VvXWTt]]）。第二版取消了泡外写入的关卡（[[p/isEhqvEW]]），这条只对原型有效
   - [p/Xu6k5OQ3] 带期限的授权，期限要从批准时算起：请求可能排队很久，从提出时算，授权时间会耗在等待上
   - [p/IkoZqV55] 范围一旦建立就是白名单：原来不受限的 agent 只要有了第一个泡，泡外的写入就都要申请。所以「执行」不能单独作为第一个泡，只申请一台设备的执行，会顺带把它在大纲上的写入都锁住。正式系统里，会话的主工作区和它所属项目的空间应当默认就是泡，额外的工作区和区域才需要申请
   - [p/CHZaxTxI] 「建议」不能按普通断言的默认立场处理：有证据的断言默认采纳，但建议在负责人采纳之前不该是采纳。原型里写建议时显式标成假设，answer 采纳时再改成采纳；正式系统里可以让建议成为提问下的一种块，立场由回答决定
   - [p/5oXqgL87] agent 从命令输出里抠地址容易抠错：行首的 [地址] 和正文里的 [[提及]] 长得一样。我用 sed 取新任务的地址，取到了正文里提及的块，给专注 agent 圈错了泡（#55，#59 改回）。正式工具的返回值要结构化，新建的块单独给出地址
   - [p/oN5wEBog] 报告挂回能用：两份报告分别转成 45 和 53 个块，表格、嵌套列表、「**样本**」这类标签段落下的列表都落在该在的位置；12 条指向临时文件的证据改指到挂好的块（[[p/4LKK4aHV]]、[[p/MwhYZUvK]]）
-  - [p/exPd2lFV] verify 被转成请求时，输出前后矛盾：先说「已转成扩大范围请求 CR3」，紧接着又打印「已复核 p/f3TO9Yre：fresh」，读起来像已经生效；实际块还是「假设·待决定：CR3」。被转出去的命令应该只报请求，不报结果
-  - [p/2HJvJjrd] verify 的 --note 不在请求里：CR3 只有「涉及」链接、证据链接和 stance=accepted 三个操作，我写的复核意见（没在真浏览器里点、丢表格和 DOM 无关）不见了。不读源码没法知道批准后会不会补上，只好在任务下另写一条协调者笔记（[[p/60fYKsDg]]）。另外，复核成立后，正文里「这是读源码推断的，没在浏览器里实测」会原样变成采纳的断言；用 fresh 不会提示改写，用 update 又像是结论本身要改，README 没说这种情况选哪个
-  - [p/OcqvZ54e] cr show 看不出转出去的写入写得对不对：CR2 列了新块的地址、正文和链接，但不显示属性（alias=Q? 会编成几号、执行者、管理者、标签、立场）和插入位置（--after p/Q26）。提问是不是排在「已回答」前面、建议是不是假设，要等 agent:main 批准后才知道，写错了也只能批准后再改
-  - [p/R5VvXWTt] 同一个泡攒了两条带操作的请求：CR2（建提问）和 CR3（复核）都要把待定问题页以「修改」纳入我的范围。[[p/QNztNKwM]] 说批准一条之后，其余「只要范围、已经满足」的请求由系统关掉；CR3 带着自己的操作，批准 CR2 之后它会被关掉（复核丢失）、自动执行，还是继续等决定，README 没写
-  - [p/ZFWs7gMs] 代记时按谁的范围判断没写：README 说 --as 是作者、--by 是代记人，但没说泡内泡外看作者（agent:w-table 的泡只有这个任务）还是代记人（agent:steward2 的泡是整个 spec 现状页）。这次写在任务下的内容两人的泡都覆盖，看不出来。提问我改用自己的身份写，免得批准后扩大的是已经收工的 w-table 的范围
-  - [p/alIh4NqM] 提问和下面的建议只能用同一个身份写：建议是 w-table 报告的倾向，按代记规则应该算 w-table 的；但提问在泡外，整批转成 CR2，新块要批准后才存在，没法先建提问、再换 w-table 的身份在下面补建议，只好在建议正文里写明「agent:w-table 报告的倾向」。README 只说报告里的「结论」用专注 agent 的身份加 --by，没说报告里要人决定的点和倾向怎么记
-  - [p/53C4gjE1] task 的动作要猜：README 只写了 start、block、done、accept，task -h 还列了 submit、revise、cancel、reopen，都没有说明；需验收的任务用 done 是进待验收还是直接完成，也没写。我看了上一轮的 diff 36 37（doing → submitted）才决定用 submit
-  - [p/EAX0Hwa5] 帮助里没有属性和取值：add -h、set -h、ls -h 只有参数名，不列属性键（alias、owner、manager、tags）和类型、状态、立场的取值。manager 这个键 README 里一次也没出现，我是从上一轮的发现 [[p/eWnSiDjJ]] 里看到的。输出显示中文（假设、待验收），过滤却要英文：ls --stance 假设 什么也查不到，--stance hypothesis 才行，而 README 里只出现过 accepted
-  - [p/5460okFI] 同一角色写多条链接的写法没写：README 的例子每行只有一个 based_on、一个 evidence。我在花括号里重复写 based_on=…、evidence=…，读回来都在（[[p/mTbiTmRJ]] 有 5 个基于）；这是试出来的，应该写进 README
-  - [p/GzzDzTKS] attach 对段落和列表之间的空行敏感：README 说「紧跟在段落后面的列表挂在那个段落下面」。w-dialect 的报告里「**路径缩写**」下一行就是列表，挂成了子块；w-table 的报告按常见写法在标签段落和列表之间空一行，「补充三点：」「**版本**」「**脚本**」「**原因**」后面的列表就都成了兄弟块（[[p/YBQH5ZDL]]）。在 Markdown 里有没有这个空行是同一个结构，挂回的结果不该不同
-  - [p/wv7gCwbn] 复现输出没有好去处：w-table 的复现脚本和输出存档在会话临时目录，我按要求用 file: 作证据，每条链接都提示一次「在仓库之外……报告类文件请先用 attach 放进大纲」（3 个文件提示了 6 次）；可它们不是报告，attach 只收 markdown 报告，会话结束后这些证据只剩指纹。证据类的附件需要一个能存进大纲的地方
-  - [p/Jp1WgEIU] 锚点对照的版本要自己核对：based_on 默认按 origin/main 记指纹，报告却是按工作区读的代码，而这个仓库的工作区和 origin/main 已经分叉（HEAD 落后 60 个提交、领先 15 个）。add 不提示被引用的文件两边是否一致，我用 git diff 逐个核对了被引用的文件（只有 schema.ts 不同，且不在 specFileRevisions 那段）。写完后 fresh 只报「44 处锚点全部新鲜」，看不出新加的 13 处 based_on 有没有被记上（其中有对象方法 writeSpecFileRevision 和检索锚点），也不能用 --under 只查自己写的
-  - [p/csjqCZAm] 「关注」级别的页读起来和能写的页一样：待定问题页在我的泡里是「关注」，read 时没有任何提示；只有完全在泡外的「原型发现」页才显示「范围外……要在这里写，会转成扩大范围请求」。我是先看了 scope show 才知道写提问会被转出去
-  - [p/EaZ7Aeeq] 小问题：log -n 35 接 head 会抛 BrokenPipeError 的 Python 调用栈；log 只有 -n（最近 N 条）和 --under，看不了中间一段（比如第 50 到 61 个提交），只能多取再截
+  - [p/exPd2lFV] verify 被转成请求时，输出前后矛盾：先说「已转成扩大范围请求 CR3」，紧接着又打印「已复核 p/f3TO9Yre：fresh」，读起来像已经生效；实际块还是「假设·待决定：CR3」。被转出去的命令应该只报请求，不报结果。状态：原型里已处理（990935d7）
+  - [p/2HJvJjrd] verify 的 --note 不在请求里：CR3 只有「涉及」链接、证据链接和 stance=accepted 三个操作，我写的复核意见（没在真浏览器里点、丢表格和 DOM 无关）不见了。不读源码没法知道批准后会不会补上，只好在任务下另写一条协调者笔记（[[p/60fYKsDg]]）。另外，复核成立后，正文里「这是读源码推断的，没在浏览器里实测」会原样变成采纳的断言；用 fresh 不会提示改写，用 update 又像是结论本身要改，README 没说这种情况选哪个。状态：原型里已处理（990935d7）
+  - [p/OcqvZ54e] cr show 看不出转出去的写入写得对不对：CR2 列了新块的地址、正文和链接，但不显示属性（alias=Q? 会编成几号、执行者、管理者、标签、立场）和插入位置（--after p/Q26）。提问是不是排在「已回答」前面、建议是不是假设，要等 agent:main 批准后才知道，写错了也只能批准后再改。状态：原型里已处理（990935d7）
+  - [p/R5VvXWTt] 同一个泡攒了两条带操作的请求：CR2（建提问）和 CR3（复核）都要把待定问题页以「修改」纳入我的范围。[[p/QNztNKwM]] 说批准一条之后，其余「只要范围、已经满足」的请求由系统关掉；CR3 带着自己的操作，批准 CR2 之后它会被关掉（复核丢失）、自动执行，还是继续等决定，README 没写。状态：说明清楚、不改（990935d7）：只有纯范围请求会被自动关掉，带写入的请求要单独批，CR3 就是这样批的；第二版取消了泡外写入的关卡（[[p/isEhqvEW]]），这条只对原型有效
+  - [p/ZFWs7gMs] 代记时按谁的范围判断没写：README 说 --as 是作者、--by 是代记人，但没说泡内泡外看作者（agent:w-table 的泡只有这个任务）还是代记人（agent:steward2 的泡是整个 spec 现状页）。这次写在任务下的内容两人的泡都覆盖，看不出来。提问我改用自己的身份写，免得批准后扩大的是已经收工的 w-table 的范围。状态：已定（990935d7）：代记时按代记人的范围判断，动手写的是代记人；第二版取消代记（[[p/Vgac6c7S]]），这条只对原型有效
+  - [p/alIh4NqM] 提问和下面的建议只能用同一个身份写：建议是 w-table 报告的倾向，按代记规则应该算 w-table 的；但提问在泡外，整批转成 CR2，新块要批准后才存在，没法先建提问、再换 w-table 的身份在下面补建议，只好在建议正文里写明「agent:w-table 报告的倾向」。README 只说报告里的「结论」用专注 agent 的身份加 --by，没说报告里要人决定的点和倾向怎么记。状态：没解决：转出去的新块在批准前不存在，所以不能往下面再挂子块；这是泡外写入转请求的机制带来的限制，第二版取消了这道关卡（[[p/isEhqvEW]]）
+  - [p/53C4gjE1] task 的动作要猜：README 只写了 start、block、done、accept，task -h 还列了 submit、revise、cancel、reopen，都没有说明；需验收的任务用 done 是进待验收还是直接完成，也没写。我看了上一轮的 diff 36 37（doing → submitted）才决定用 submit。状态：原型里已处理（990935d7）
+  - [p/EAX0Hwa5] 帮助里没有属性和取值：add -h、set -h、ls -h 只有参数名，不列属性键（alias、owner、manager、tags）和类型、状态、立场的取值。manager 这个键 README 里一次也没出现，我是从上一轮的发现 [[p/eWnSiDjJ]] 里看到的。输出显示中文（假设、待验收），过滤却要英文：ls --stance 假设 什么也查不到，--stance hypothesis 才行，而 README 里只出现过 accepted。状态：原型里已处理（990935d7）
+  - [p/5460okFI] 同一角色写多条链接的写法没写：README 的例子每行只有一个 based_on、一个 evidence。我在花括号里重复写 based_on=…、evidence=…，读回来都在（[[p/mTbiTmRJ]] 有 5 个基于）；这是试出来的，应该写进 README。状态：原型里已处理（990935d7）
+  - [p/GzzDzTKS] attach 对段落和列表之间的空行敏感：README 说「紧跟在段落后面的列表挂在那个段落下面」。w-dialect 的报告里「**路径缩写**」下一行就是列表，挂成了子块；w-table 的报告按常见写法在标签段落和列表之间空一行，「补充三点：」「**版本**」「**脚本**」「**原因**」后面的列表就都成了兄弟块（[[p/YBQH5ZDL]]）。在 Markdown 里有没有这个空行是同一个结构，挂回的结果不该不同。状态：原型里已处理（990935d7）
+  - [p/wv7gCwbn] 复现输出没有好去处：w-table 的复现脚本和输出存档在会话临时目录，我按要求用 file: 作证据，每条链接都提示一次「在仓库之外……报告类文件请先用 attach 放进大纲」（3 个文件提示了 6 次）；可它们不是报告，attach 只收 markdown 报告，会话结束后这些证据只剩指纹。证据类的附件需要一个能存进大纲的地方。状态：原型里已处理（990935d7）
+  - [p/Jp1WgEIU] 锚点对照的版本要自己核对：based_on 默认按 origin/main 记指纹，报告却是按工作区读的代码，而这个仓库的工作区和 origin/main 已经分叉（HEAD 落后 60 个提交、领先 15 个）。add 不提示被引用的文件两边是否一致，我用 git diff 逐个核对了被引用的文件（只有 schema.ts 不同，且不在 specFileRevisions 那段）。写完后 fresh 只报「44 处锚点全部新鲜」，看不出新加的 13 处 based_on 有没有被记上（其中有对象方法 writeSpecFileRevision 和检索锚点），也不能用 --under 只查自己写的。状态：部分处理（990935d7）：工作区和 ref 不一致时会提示，`fresh` 还不能按子树查
+  - [p/csjqCZAm] 「关注」级别的页读起来和能写的页一样：待定问题页在我的泡里是「关注」，read 时没有任何提示；只有完全在泡外的「原型发现」页才显示「范围外……要在这里写，会转成扩大范围请求」。我是先看了 scope show 才知道写提问会被转出去。状态：原型里已处理（990935d7）
+  - [p/EaZ7Aeeq] 小问题：log -n 35 接 head 会抛 BrokenPipeError 的 Python 调用栈；log 只有 -n（最近 N 条）和 --under，看不了中间一段（比如第 50 到 61 个提交），只能多取再截。状态：原型里已处理（990935d7）
   - [p/ksGzonZJ] 步数：到这一条为止执行了 57 条 outline 命令，1 条报错（log 接 head 时的 BrokenPipeError，是我加管道引起的），没有命令被拒绝。其中帮助 17 条；写入 7 次，直接生效 4 次（挂报告 151 块、代记 10 条断言、代交、协调者笔记），转成请求 3 次（CR2：5 条提问、3 条建议、1 条参考；CR3：复核；CR4：这批发现）；其余 33 条是读页、范围、日志、diff、看板、ls、cr、收件箱和 fresh（fresh 重复跑了 2 次）。读的文档：README 全文和 16 个子命令的 -h；没有读 outline.py，也没有读 data/log.jsonl。另外用 git、grep、sed 做了 17 次只读核对（报告目录、被引用的产品源码、node_modules 里的 Tiptap 源码、复现输出、两份报告的空行），其中 2 次是我自己写错了路径或参数。README 这次写对、我验证到的：有依据的断言直接采纳，只带出处的是假设，显式立场优先，行内代码里的反斜杠原样保留，报告挂回后表格和代码块完整
   - [p/CJxh3m7M] 转成请求的批量写入，批准时丢了插入位置：第二轮的 Q27–Q31 落到了「已回答」后面，只好手动挪回去（#91–#95）。原型改成在请求里记下要接在谁后面，批准时照原位插；cr show 也显示出来，批准前能检查
   - [p/dMypdGwK] Python 代码锚点原来只取到 def 那一行：取范围的办法是配平括号，而 Python 的括号在签名那一行就配平了，函数体怎么改都不会存疑。改成按缩进取整个函数或类。真实日志里还没有 Python 锚点，没有受影响；正式系统用 tree-sitter 取结构，不会有这个问题，但「锚点覆盖到哪」要有测试
@@ -207,17 +360,17 @@
     - [p/h5ypfM0g] 步数：到这一条为止执行了 48 条 outline 命令，0 条报错，没有命令被拒绝或转成请求。其中帮助 9 条（总帮助和 read、ask、add、edit、bundle、mv、digest、inbox）；写入 16 次：结论 1 次（10 块）、提问 9 次、Q11 补建议 1 次、勾完成 1 次、挪决策包 3 次、这批发现 1 次；其余 23 条是读页、read --basis、inbox、digest。读的文档：README 全文和上面 9 个 -h，外加大纲里「原型发现」页和待定问题页的说明块；没有读 outline.py 源码，没有读 data/ 下的文件，也没有用 git、grep 做别的核对
 
 - [p/a4bsGcVR] 概念与规则
-  - [p/CQhWv1YD] 六个概念：块、类型、链接、空间、提交、层。详见 docs/OUTLINE_KNOWLEDGE-DESIGN.md §2
-  - [p/ay8D5pME] 九条规则
-    - [p/zb1ow927] 一切关系都是链接，含义由角色决定
+  - [p/CQhWv1YD] 六个概念（第二版）：块、任务、依据、空间、历史、待确认。第一版的「类型、链接角色、层」都去掉了。详见 docs/OUTLINE_KNOWLEDGE-DESIGN.md §2
+  - [p/AtpSIQJz] agent 只需要知道三条：以后还用得到的写进大纲，写在手头的任务下面就行；开始做就勾成进行中、做完勾完成，要人决定的提问并附建议；工具说「已交给某人确认」时先做不受影响的部分
+  - [p/ZJxzqMyG] 人只需要知道三条：计划默认随 agent 调整，要严格照做就锁定；收件箱只放要你决定的事，每条带建议，可以一次回答多条；一切都能在时间轴上回放、撤销
+  - [p/ay8D5pME] 第一版的九条规则里，第二版还成立的几条
     - [p/2uUBkSI4] 能推导的不存储：新鲜度、「已被取代」都从链接推导
     - [p/3jlovrjM] 历史只追加：撤销是补偿提交，fork 是复制
     - [p/V1utFors] 块不跨空间：跨空间「移动」是复制加原处删除
-    - [p/cC6VPdFb] 层只为待决定的改动而存在
     - [p/1iTUhoFx] 注入即视图
     - [p/5TYh69qJ] 人看实时，agent 看快照
     - [p/orLbw5BK] 图谱是黑板：以后还会用到的东西都写进图谱
-    - [p/8T6jFKZI] 自由度由计划决定：草稿随情况改；已批准的计划，要改先停下汇报 [[p/D13]]
+    - [p/8T6jFKZI] 计划的严格程度由写计划的人决定：不锁定的随情况改；锁定的改动先交给锁定人确认 [[D13]]
 
 - [p/eD06Kd6H] 需求清单：负责人确认过的 25 条需求，按功能写，不按名字写。设计文档第二版 §1.1 和附录 A 逐条对应
   - [p/v0Y4L01Z] R1 一个统一平台：全局知识、个人知识和偏好、工程规格、任务放在同一套东西里
@@ -249,3 +402,7 @@
   - [p/WkMQ37qq] R27 计划、演进、评估、证据放在另一个维度，不干扰人对结构和事实的观察
 
 ## me · 负责人的个人空间
+
+- [me/E7EClfCV] 讨论设计时，先用具体场景走查，再定方案
+
+- [me/EPTE8J3C] 不要过度防御：默认信任，事后可见、可撤销

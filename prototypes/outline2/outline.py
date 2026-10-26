@@ -1664,7 +1664,7 @@ SETTLE_GUIDE = """怎么整理：
 5. 一个块的直接子块别超过 {dense} 个，多了就加一层归组（`mv`）。改了下层，看一眼上层的概括、同组的块还对不对，别互相矛盾。
 6. 试过不行、以后还会有人想到的方案，写一条「不用 X：原因」，放在相关的事实下面。
 7. 没做完的子任务不用管，它们还在看板上。
-8. 整理完：`settle {t} --done`（什么都不用搬也这样收尾）。`read {space}/` 可以看整个空间的顶层。"""
+8. 归组、改概括都在收尾之前做完。整理完：`settle {t} --done`（什么都不用搬也这样收尾）。`read {space}/` 可以看整个空间的顶层。"""
 
 
 def settle_group(st: State, addr: str) -> list[str]:
@@ -1820,7 +1820,13 @@ def cmd_settle(args) -> None:
 		for g in group:
 			tx.push({"op": "block.update", "addr": g, "props": {"settled": tx.seq}})
 		new = sum(1 for lk in out if st.blocks[lk["from"]]["created_seq"] == lk["created_seq"])
-		for par in dict.fromkeys(st.blocks[lk["from"]]["parent"] for lk in out):
+		touched = [st.blocks[lk["from"]]["parent"] for lk in out]
+		for c in st.commits:  # 整理时自己挪进来、改过的块，父块也算看过了（归组时先写概括再挪子块）
+			if c["seq"] > since and c["actor"] == actor:
+				for op in c["ops"]:
+					if (op["op"] in ("block.create", "block.move") or (op["op"] == "block.update" and "content" in op)) and op.get("addr") in st.blocks:
+						touched.append(st.blocks[op["addr"]]["parent"])
+		for par in dict.fromkeys(touched):
 			if par and not is_process(st, par):
 				tx.push({"op": "block.update", "addr": par, "props": {"reviewed": tx.seq}})  # 上层的概括整理时看过了
 		finish(tx, quiet=True)
