@@ -197,7 +197,7 @@ frontend/lib/api/outline.ts，frontend/hooks/useOutline*.ts，frontend/locales/{
     - `PLAN_MODE_ALLOWED_TOOLS`（`server/lib/agent/types.ts:894-919`）
     - `server/lib/agent/disk-safety.ts:15-26`
   - `OutlineEdit` 加进 `GENERAL_TOOLS`。
-- **`OutlineEdit` 的权限档位（待评审）**：
+- **`OutlineEdit` 的权限档位**（负责人 2026-10-26 定，D32）：
   - 默认模式下放行：写入都能撤销（D1）。
   - 只读模式和计划模式下只能写会话空间（规划默认宽松，D25），做法照 tasks.json 在 `server/services/narrator-permission.ts:828` 的处理。
   - bypass 下的危险分类照 Knowledge 写入的先例（`:2956-3021`）。
@@ -265,6 +265,7 @@ frontend/lib/api/outline.ts，frontend/hooks/useOutline*.ts，frontend/locales/{
   - `/outline`：我能读的空间和最近访问。
   - `/outline/$spaceId/$blockId`：编辑页，`blockId` 是聚焦的块。
   - 导航项加进 `shared/nav-layout.ts:15` 和 `frontend/components/nav/nav-items.tsx:65`。
+  - 入口（负责人 2026-10-26 定，D32）：顶层导航项「大纲」列出能读的空间和最近访问；项目页有链接进项目空间；会话面板里能打开这个会话的空间。
   - i18n 命名空间 `outline` 加进 `frontend/lib/i18n.ts:18-38` 和路由映射 `:131-175`。
 - **编辑页**：面包屑；视图切换（大纲或导图，导图再选向右或向下）；快速切换器；底部时间轴（选一个时间点，只读看页）；侧栏（反链、历史）。
 - **编辑器**：移植原型 `src/client`（`view.ts`、`commands.ts`、`schema.ts`、`convert.ts`、`client.ts`）到 `frontend/components/outline/editor/`，网络层换成真实的 WebSocket。块外框用原生 DOM 的 node view。
