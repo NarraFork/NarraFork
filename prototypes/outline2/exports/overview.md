@@ -1,4 +1,4 @@
-<!-- 由 prototypes/outline2/outline.py export 生成（第 402 个提交）。真相源是 data/log.jsonl，不要手改。 -->
+<!-- 由 prototypes/outline2/outline.py export 生成（第 435 个提交）。真相源是 data/log.jsonl，不要手改。 -->
 
 # 大纲总览（事实视图）
 
@@ -30,7 +30,7 @@
       - [p/cSRo6HMn] D1a 例外（删除或移动团队之外的人写的块、单次改动超过 50 个已有块）自动转成待确认，不打断 agent；待确认进负责人的收件箱，agent 接着做别的（见 D25b）
     - [p/1byjKamb] D8 知识库空间默认走审核（写入转成待确认），可以按空间改成直写
     - [p/YjEt8WXX] D9 会话里能读到的内容取所有能读这个会话的人的权限交集（原来是所有驱动者的交集，2026-10-26 改，因为注入的内容每个能读会话的人都看得到，细项见 [[p/tlMnqe0k]]）
-  - [p/Jd78KW69] 检索、注入与新鲜度：embedding 与 rerank 可配置，没配置时退化为 FTS，向量初版在 db-worker 里常驻 int8 暴力扫描（P0 基准验证过，换扩展的信号见 D10）；注入受权限约束；代码已变的块在读取时复核（D2、D7、D10、D22）
+  - [p/Jd78KW69] 检索、注入与新鲜度：embedding 与 rerank 可配置，没配置时退化为 FTS，向量初版在 db-worker 里常驻 int8 暴力扫描（P0 基准验证过，换扩展的信号见 D10）；注入受权限约束；代码已变的块在读取时复核；整理过的笔记在检索里折叠到事实下（D2、D7、D10、D22、D28）
     - [p/PeiyVKZE] D2 知识过期默认在读取时复核；批量复核由用户点按钮触发；后台复核默认关闭
     - [p/UX1YUbm4] D7 embedding 与 rerank 从模型目录配置，支持 API 与 OpenAI 兼容的本地端点；没配置时退化为 FTS
     - [p/BG0a5PpL] D10 向量初版量化成 int8，打包存成 BLOB，在 db-worker 里常驻内存、暴力扫描，不引入原生扩展。P0 基准验证过：1024 维、100 万向量、目标空间占 10% 时 p95 46–71 ms，常驻约 1.2 GB；换扩展的信号和各方案的数字见下面的子块（`prototypes/outline-bench/RESULTS.md` 基准二）
@@ -52,6 +52,10 @@
       - [p/3th3bVc1] D22e 没有项目的会话只看全局集合和个人空间。理由：现在没有项目范围限制，检索和注入会看到所有项目的集合（[[p/aAMYBBTi]]）
       - [p/qGMr0qZB] D22f 已归档的条目检索时默认不返回，显式 `include` 才返回。理由：现在检索返回、注入排除，两边不一致（[[p/wrFOnNIn]]）；新设计里不成立的块也是这样处理
       - [p/l2kX1SwR] D22g 不把 Recall 的全站搜索和公开分享链接纳入这次知识库替换，单独立项。理由：它们不限于知识库（[[p/gdvk6G9v]]），放进来会拖大这次的范围
+    - [p/0V1OFXmm] D28 整理后过程和事实两份都留，检索去重：任务下的笔记已经整理成某条事实（那条事实的出处指回这个任务或它所在的组，笔记的内容大部分在事实里），默认检索和自动注入就只给事实，笔记作为出处跟在后面，不单列；要看过程原文，就显式检索过程或直接读任务。已确认（负责人 2026-10-26 选了「保留两份，检索去重」）
+      - [p/iPadNf5q] 理由：第五轮原会话边做边记，笔记本来就写成了事实的样子，整理基本等于再抄一遍，检索时同样的内容出现两份（[[p/GQn7WsJR]]）。删掉笔记会丢追溯（R21），也会让整理变成有损操作；不整理，事实树就缺了这块，读页的人看不到
+      - [p/NhnV9d55] 原型的判断（`prototypes/outline2/outline.py#settled_into`）：笔记的二字组有六成以上出现在某条出处指回它所在任务或组的事实里，就算已整理进那条事实；太短的笔记不比。按这个规则，现有 875 块过程笔记里 244 块会折叠，第五轮任务下 88 块里 48 块。产品里换成 embedding 相似度加出处链接，阈值要用真实数据再定
+      - [p/BFZShHBI] 不用整理时把笔记换成指向事实的链接或删掉：过程要原样保留（§4.7），而且整理放错时，原文是唯一的对照
   - [p/E14Z2FJE] 编辑器与块格式：自研大纲编辑器，多人实时协同（P0 原型已在无头 Chromium 上验证，真机输入法和移动端还没测），块内方言的细项，SpecMarkdownEditor 丢内容的修法（D6、D11、D23、D24）
     - [p/oyRkMECT] D6 支持多人实时协同编辑同一个块
       - [p/NEN9Br1I] D6a 选型：按页建实时会话，一页一个 Y.Doc，块正文是其中的 Y.Text（会话开始时就给整页的块建好，不等第一次编辑）；结构由服务端排序；agent 按读取版本三方合并
@@ -93,7 +97,7 @@
       - [p/5tnp54bl] D24d 非 .md 的 spec 文件（agent 建的 .json、.yaml 等）和 `behavior_fence` 一律用纯文本（源码模式）编辑。理由：JSON、YAML 经所见即所得保存一次就不再合法；`behavior_fence` 的内容原样注入模型提示，`\_`、`&amp;` 这类转义会直接进 prompt（[[p/HV7j1m0U]]）
       - [p/5NrvJRyh] D24e 数据恢复：先写离线排查脚本，在后台跑、不进请求路径（遵守主线程规则），找出 `created_by` 是 user、父 revision 含表格分隔行而本条不含的记录，把结果交给人看；旧内容都还在 `spec_file_revisions` 里（[[p/f65PZBTV]]）。历史查看和恢复不在 spec:// 上单独做，放进大纲系统的时间机器里统一做（D4），因为 spec:// 在 P2 就退役了
       - [p/zAZzhH24] 已实现（提交 `2a3e1917`、`df821f4d`）：spec 文件默认源码模式，.md 文件可切到并列预览或所见即所得；检测到 HTML、图片、任务项、脚注定义或开头的 front matter 时，所见即所得只读显示、不能保存；表格补上扩展和竖线转义后能完整往返，不再拦；非 .md 文件和 behavior_fence 只给纯文本；离线排查脚本 `scripts/find-spec-table-loss.ts`。检测范围之外、所见即所得仍会改坏的：HTML 实体、数学公式、相邻两个列表被合并
-  - [p/zKjNiGOW] 任务、计划与多 agent 协作：计划就是任务树，锁定管住改动，完成后整理，专注 agent 集中攻坚，协作默认值，任务反思与 `/goal`（D12–D16、D25、D26）
+  - [p/zKjNiGOW] 任务、计划与多 agent 协作：计划就是任务树，锁定管住改动，完成后整理，专注 agent 集中攻坚，协作默认值，任务反思与 `/goal`，spec 任务迁成大纲任务的细则（D12–D16、D25–D27）
     - [p/I6StRgTN] D12 多 agent：图谱是黑板；委派即建任务；角色由任务推导；开始做即领取；验收默认关闭
       - [p/nFdzmREY] 第二版（D18）：去掉验收关口，完成后通知管理者，不满意可以重开；试用里 3 次验收全部原样通过
     - [p/aYM78wgu] D13 计划的严格程度由写计划的人决定：不锁定的随情况改；锁定的计划，增删和改步骤先交给锁定人确认；agent 可以在权限内代为确认，后果落到它的责任人头上
@@ -111,6 +115,9 @@
       - [p/g4HzDN9a] 决定比整理晚到时，不重写事实：现状事实下加一条链接指向决策。清积压里有两个整理 agent 在负责人回答之前就整理完了，「任务反思要删」这类决定当时还没定，就没搬；回答之后这组提问单独整理，在现状事实下加了指向决策的链接
       - [p/PSqWuA6x] 「下层已变」会被整理自己的归组动作误触发：整理 agent 先建好 7 个组、写好概括，再把 26 条决策挪进去，挪动被算成「下层变了」，造成误报。所以收尾（`settle --done`）时，整理者自己挪动过、改过的块的父块也记为已核实
       - [p/wctQq4K3] 清积压整理出的毛病，整理完要查：两条事实写错了（第三轮依据挂错的原因、检索过不过滤 status）；新写的决策没加别名，按编号查不到（D21–D26 事后补了）；有几条旧事实还留着第一版的说法（D1、D8、D13、D14 和「概念与规则」页），要改成第二版的说法
+      - [p/8EqOzIbZ] 原会话整理比单独的整理 agent 省（第五轮，2026-10-26）：原会话自己调研 spec 任务的读写方，边做边在任务下记了 65 块笔记和 5 条提问，勾完成后按 `settle` 的说明接着整理。以勾完成为界切开，整理这一段新处理 3.0 万 token、输出 1.2 万、读缓存 224 万、8 轮；第四轮单独的整理 agent 是新处理 13.9 万、输出 4.1 万、读缓存 174 万、17 轮，新处理少 4.6 倍、输出少 3.3 倍（两边模型不同）。产出是「现状：spec://」页新增一组 38 块（[[p/Gc05H1cp]]），改写 2 块，顺手改正了一处过时的代码位置。另起一个没有上下文的 agent 只用大纲答 6 题，全对，陷阱题答「还没定」，前 5 题每题一次检索、第一条就是事实页上的块；抽 8 处代码位置核对，全部对得上
+        - [p/oKqX5LkI] 原会话的笔记本来就写成了事实的样子，整理基本等于再抄一遍，检索时出现两份；所以两份都留，检索去重（[[D28]]）
+        - [p/n9uJcCsg] 原型只给子代理挂运行记录，原会话自己写的事实没挂；产品里会话自己的运行记录同样是依据（§2.3）
     - [p/CZyp6nnF] D16 系统要支持派「没有什么约束」的专注 agent 集中攻坚，由遵循规则的协调 agent 帮它们记账、处理规则
       - [p/QSWtw144] D16a 专注 agent 只拿到普通语言写的任务说明，不知道大纲、地址、角色和规则；它交一份报告就结束
         - [p/tU364lLv] 试用（三个专注 agent，两轮）：只拿普通语言的任务说明，没有规则负担，交的报告质量都高；其中核实 SpecMarkdownEditor 丢表格的那个按 `bun.lock` 的版本用脚本复现，还查出报告问题之外的一串丢失和改写
@@ -127,6 +134,19 @@
         - [p/EfcqD1xd] 不用改成可选：配套的全部代码和常驻的两个决策工具照样要维护
         - [p/HnUzh3KP] 不用现在单独删：`/goal` 建的任务会失去任何完成把关，要等 P2 的缺口补齐
       - [p/tv1IkIvW] D26b `/goal` 建的任务默认锁定，不再按草稿处理：锁的只是 `/goal` 本身（目标和验收），agent 在下面建的步骤不锁定，可以随时调整；整个目标完成要人确认。理由：`/goal` 是用户在说「务必完成」；按草稿处理时，无人值守的 agent 可以提前标完成、停掉续跑，要等人看看板才会发现；锁定正好接住任务反思想防的「提前标完成」。现在的「受保护任务」和文本 hash 锁（`spec_protected_tasks`）由锁定替代
+    - [p/Nd6nLg2i] D27 spec 任务迁成大纲任务时的五处：续跑保留四档，protectedOnly 改看人建任务；blocked 迁成进行中加子块；子代理只按回合预算续跑；插件新增按块操作的命令，旧命令留一个兼容期；行为边界在变化时、第一轮和每次 compact 后注入；已确认（负责人 2026-10-26 全部采纳建议，提问 Q48–Q52）
+      - [p/LeCa7QT5] D27a 续跑模式保留四档（always、blockStop、protectedOnly、off），默认仍是 protectedOnly，含义改成「会话里有未完成的人建任务（`/goal` 或界面添加）才续跑」；续跑的对象仍按 §4.8 取第一个候选，不一定是人建的那条。理由：现在没有 `/goal` 的会话不会自己接着跑（`server/lib/settings/defaults.ts:108`、`server/services/turn-continuation-decisions.ts:253-257`），照 §4.8 字面「有候选就续跑」迁移，每个建过任务的会话都会多跑、多花钱，人没要求时也会被打扰；人建任务正好对应现在的 protected（D26b）
+        - [p/lPeaEsMa] 不用去掉档位：已经调成 always 或 off 的会话会被改掉行为
+      - [p/vufOm7n1] D27b `blocked` 迁成进行中 `[/]`，原文下面加一个子块写受阻原因；要人决定的用 Ask 挂在任务下。续跑不选有未回答提问或前置没完成的任务；blocked 专用的续跑提示和 blockStop 档改成按「等人、等前置」判断，任务摘要里单列 blocked 的做法随任务提醒一起去掉（§4.8）。理由：现在 blocked 续跑的主要用处是逼 agent 拆出解阻任务或者问人（`server/lib/prompts/system-reminders.ts:22-33`）；大纲里提问是一等的、回答回来会唤醒，前置有 `depends::`，这两种等待系统都看得见
+        - [p/f3SZe4gA] 不用加 `blocked::` 属性：多一种 agent 要维护、会忘了改回来的状态
+      - [p/0PQNVgSx] D27c 子代理只按回合预算续跑：预算用尽、还没给出最终回复，就再给一趟；仍受每次运行 6 趟的上限和停滞规则约束（`server/services/agent-runtime/policy.ts:113`、`server/services/turn-continuation-decisions.ts:128-144`），不看任务。理由：子代理默认不拿大纲工具（R16），没有自己的任务；保留回合预算的兜底，长任务才不会半途交回
+        - [p/jr8TbUHU] 不用按派它的那个任务的状态续跑：子代理勾不了那个任务，任务要等报告挂回后由父会话处理，续跑期间它一直是进行中，等于无条件跑满 6 趟
+        - [p/WIsr1EOD] 不用取消子代理的续跑：回合预算用尽时就会半途交回
+      - [p/s1bgWDaP] D27d 插件接口新增按块操作的命令：加任务返回块 id、按 id 推进状态、读会话空间的任务树、订阅任务变更事件。旧的四个命令（`server/lib/plugins/permissions.ts:203-207`）保留一个版本做兼容转换：覆盖 tasks.json 按正文比对转成块的增删改，按正文去重照旧；behavior_fence 的 SOP 段落转成作者为插件的块；之后下线。理由：团队插件 `com.whisent.narrator-team` 的源码不在仓库里，宿主没法跟它同步改、同步验证，兼容期内插件按自己的节奏切
+        - [p/7k51UfNs] 不用迁移时直接下线旧命令：插件会在宿主升级那一刻失效
+      - [p/RRuhbVui] D27e 「行为边界」视图（含插件的 SOP）在有变化时、会话第一轮、每次 compact 之后各注入一次，不再按工具调用次数周期注入。理由：现在行为边界只跟着每 15 次工具调用的任务摘要捎带（`server/services/narrator-session.ts:2553`），去掉任务提醒以后，compact 之后模型就看不到它了，插件要周期注入正是为了长跑和 compact 后还记得 SOP（`server/services/narrator-session.ts:4093-4106`）；边界很少变，第一轮和 compact 后补一次就一直在上下文里
+        - [p/iQJDpxly] 不用放进系统提示：系统提示只放三条约定（§4.2），而且边界一改就会打掉整段请求缓存
+        - [p/g6RvHO7m] 不用保留按工具调用次数的周期注入：每 15 次调用重复花 token，内容却几乎不变
   - [p/6hcdPxNX] 多工作区与跨仓库：一个会话管多个工作区；归属只认一个主项目，执行按工作区（D17、D21）
     - [p/S7dMgVAI] D17 一个会话能同时管多个工作区（多台设备上的目录、多个仓库）；agent 在全局的大网上有几个「泡」作为注意范围，泡外的内容也可以适当查看；主 agent 或人批准下级改变范围
       - [p/v8ZWaFWs] D17c 扩大范围沿创建链找第一个能转授的上级批，都不行就由人批；工作区的「执行」只有人或自己就有这一级的上级能给；期限从批准时算起
@@ -174,11 +194,49 @@
     - [p/yGOrQ4h8] 它要防的：受保护任务没做完就标完成、被删除或被改弱（`TaskReflectRevise` 的工具描述）；agent 为摆脱自动续跑而把条目标 done（`server/lib/prompts/system-reminders.ts:86` 的提示词让 agent 去掉 protected 标记，而不是标完成）。默认续跑模式是 `protectedOnly`（`server/lib/settings/defaults.ts:108`），所以标完成就能结束无人值守的运行。存储层另有兜底：没有反思授权时拒绝完成受保护任务（`server/services/__tests__/spec-vfs-service.test.ts`）
     - [p/blfoGieo] 有记录的全是它自身的问题：在代码注释、测试和提交历史里，没找到一次它拦下真实虚假完成的记录；`narrator_tool_calls.permission_suggestions` 里 task_reflection 状态为 cancelled 的线上驳回记录还没统计
       - [p/ABnRLWha] 一次会话里 3067 个测试全部通过，它仍连续驳回 5 次，耗时 1.5 小时；之后提示词从「证据够不够」改成「问意图」（`server/lib/agent/loop.ts:1022` 注释，`server/lib/agent/__tests__/tool-executor.test.ts:2008`）。这次改写随 a365c6de 合入，提交信息没提；旧版提示词见 f32a9bcc
-      - [p/7t1EUI0E] 同一个驳回反复出现会让续跑空转，于是加了「第 3 次相同驳回就停止续跑」（45a2cd9e，`server/services/turn-continuation-decisions.ts:106`）
+      - [p/7t1EUI0E] 同一个驳回反复出现会让续跑空转，于是加了「第 3 次相同驳回就停止续跑」（45a2cd9e；规则在 `server/services/turn-continuation-decisions.ts:128-144`，上限常量在 `server/services/turn-continuation-decisions.ts:94`）
       - [p/8F7PwN96] 用户在面板上新加的任务被当成偏离主线而驳回，因为反思只认 user 消息里的要求；为此专门写了 `server/services/spec-edit-interject.ts`（见文件头注释）
       - [p/Gb5A9YJm] 检查故障被当成内容否决（538c6abe）；确认受保护任务改动时报工具路由错误（8bd4cf62）
     - [p/Nxp8cxY7] 决定：任务反思不改成可选，P2 补齐缺口后连同门禁、决策工具一起删；见 [[p/XyDj7G49]]（D26a）
-  - [p/iZyoacoR] 任务摘要默认每 15 次工具调用注入一次
+  - [p/Gc05H1cp] tasks.json 被谁读、被谁写：读者是续跑、任务摘要注入、compact、中断守卫、界面状态栏和插件；写者是 agent、用户（Spec 面板和 /goal）、系统和插件。核对于 2026-10-26 的 HEAD 5fc534b1；迁成大纲任务时要保留的行为清单在 [[p/UMvz9lIu]]
+    - [p/YHI6lEyy] 选任务规则只有一处 `compileSpecTasks`：当前任务是数组里第一个 doing，下一个是第一个 todo；没有 todo、doing、blocked 就算全部完成；另算未完成的 protected 条数（`server/services/spec-task-service.ts:130-147`）。顺序就是数组顺序，界面只能在同一状态组内拖动排序（`frontend/components/narrator/spec/SpecTaskBoard.tsx:428-456`）。正文最多 1000 字；pending、in_progress、active、completed、complete 会被归一成四种状态（`server/services/spec-task-service.ts:52-96`）
+    - [p/FKPQv6HU] 续跑：回合结束时按 tasks.json 决定要不要再跑一趟
+      - [p/UJS2kyq3] 入口有三个：回合自然结束（`server/services/agent-runtime/orchestrator.ts:3072`）、回合预算用尽（`server/services/agent-runtime/orchestrator.ts:2696`）、/goal 的首轮（`server/services/narrator-session.ts:4217-4262`；排队中的 /goal 走 `server/services/agent-runtime/orchestrator.ts:694-701` 和 `server/services/narrator-session.ts:1024-1031`）。都经过 `maybeStartContinuation`（`server/services/narrator-session.ts:2025-2058`）
+      - [p/NXEtD4YM] 不续跑的情况：本轮出错或在计划模式（`server/services/narrator-session.ts:1795`）；用户中断后的下一轮，只抑制一次（`server/services/narrator-session.ts:1801`）；模式是 off 且不是 /goal 首轮（`server/services/narrator-session.ts:1811`）；停滞抑制中（`server/services/narrator-session.ts:2039`）；只有思考没有输出的空闲回合（`server/services/agent-runtime/orchestrator.ts:455`）
+      - [p/B1XwDUj3] 自动提为进行中：没有 doing 但有 todo 时，系统把第一个 todo 改成 doing 写回去，revision 记为 system，绕过受保护检查（`server/services/narrator-session.ts:1739-1763`）。这一步在判断续跑模式之前做（`server/services/narrator-session.ts:1821`），所以默认模式下没有 protected 任务、不续跑时也会提升；这次写入只发事件总线的 `spec:changed`（`server/services/spec-vfs-service.ts:281-288`），代码里只有插件网关在听，界面不会马上刷新【推断】。委派出去的子代理关掉了这一步（`server/services/agent-runtime/policy.ts:113`）
+      - [p/4aLakbOZ] 续跑选哪条：第一个 doing，没有就第一个 blocked（`server/services/narrator-session.ts:1765-1782`）；有 doing 时 blocked 不会被选中。迁成大纲任务时 blocked 改成进行中加受阻子块，续跑跳过等人、等前置的任务（[[D27]] 的 D27b）
+      - [p/mWR3pX1E] 四档模式（`server/services/turn-continuation-decisions.ts:253-257`）：always；blockStop，只剩 blocked 就停；protectedOnly，有未完成的 protected 才续跑，续跑的仍是上一条选出的任务，不一定是 protected 的那条；off。默认 protectedOnly（`server/lib/settings/defaults.ts:108`），每个会话可以覆盖（`server/lib/boolean-override.ts:59-95`）。所以默认只有 /goal 这类受保护任务会驱动续跑，系统提示里「普通任务同样会触发提醒和续跑」（`server/lib/prompts/system-reminders.ts:82`）和这不符。迁移后保留四档，protectedOnly 改看人建任务（[[D27]] 的 D27a）
+      - [p/El7r6J8D] 停滞规则：续跑出来的一趟没调用工具，或者反复撞同一次任务反思驳回，算一次停滞；task 连续 3 次、blocked 1 次就停（`server/services/turn-continuation-decisions.ts:94`、`server/services/turn-continuation-decisions.ts:128-144`，记账在 `server/services/agent-runtime/orchestrator.ts:2394-2416`）。子代理每次运行最多续跑 6 趟（`server/services/agent-runtime/policy.ts:113`），停下时把原因写进交回父会话的结果（`server/services/turn-continuation-decisions.ts:358-371`、`server/services/agent-runtime/orchestrator.ts:454-466`）
+      - [p/Su60obHI] 续跑提示是一条 system 消息，只点名一条任务，写明是系统发的、不代表没做完，并给四种合法结局：已完成就标完成、继续做、需要人就问、过期就改写或删除。旧措辞造成过三种失败：返工已经正确的改动；需要用户的任务被连催 37 次；硬做过期的目标（`server/services/narrator-session.ts:1914-1932` 的注释）
+      - [p/XG3iPCC9] 中断守卫：用户中断时如果还有未完成任务，抑制下一次续跑，并留一条系统消息列出最多 8 条未完成任务，同一个 revision 只发一次（`server/services/narrator-session.ts:1599-1659`，调用在 `server/services/narrator-session.ts:1558`）
+    - [p/j6FfBIEm] 提醒注入
+      - [p/PsPtff7W] compact：摘要模型的系统提示里带完整任务列表，已完成的也带（`server/services/narrator-context.ts:344`、`server/services/spec-reminder.ts:129-147`）
+      - [p/5QLUMEEk] 系统提示：每个会话（子代理也是）都有一段 Dynamic Spec 说明，规定格式、什么不算任务、protected 什么时候能用、blocked 怎么处理（`server/services/narrator-prompt.ts:240-245`、`server/lib/prompts/system-reminders.ts:51-128`）
+      - [p/68f6sMe9] 界面：工作中的状态栏显示当前任务正文（`frontend/components/narrator/NarratorPanel.tsx:1502-1503`、`frontend/components/narrator/interaction/NarratorInteractionStatusBar.tsx:394`）；会话记录里最近一次 tasks.json 工具调用始终展开成任务看板（`frontend/components/narrator/vlist/vlist-spec-tasks-pin.ts`）
+      - [p/iZyoacoR] 任务摘要：每完成 N 次工具调用（默认 15，`server/lib/settings/defaults.ts:114`，会话可覆盖，`server/services/agent-runtime/orchestrator.ts:1019-1023`），在回合边界插一条 `living_work_spec` 消息（`server/services/narrator-session.ts:2520-2549`）。最多列 4 条：当前或下一个、最多 3 条 blocked、再补 todo（`server/services/spec-reminder.ts:47-78`）。没有未完成任务时也发：从没建过任务就催建，全部做完就催整理（`server/services/spec-reminder.ts:30-36`）；超过 30 条催整理（`server/services/spec-reminder.ts:38-45`）
+      - [p/VJyuMsAs] 行为边界是捎带的：默认 `behaviorFenceInterval` 是 -1（关），`behaviorFenceAttachTasks` 是 true（`server/lib/settings/defaults.ts:113-115`），行为边界只跟着任务摘要一起发（`server/services/narrator-session.ts:2553`）。没有任务时也发摘要，所以默认配置下行为边界每 15 次工具调用到一次；它不在系统提示里，也不进 compact。迁移后改为在变化时、第一轮和每次 compact 后注入（[[D27]] 的 D27e）
+    - [p/SlhKvPiu] 写入方
+      - [p/mopsL49i] agent：Read、Write、Edit 访问 `spec://tasks.json`，每次写整份 JSON；工具结果的 metadata 带上 tasks 数组，界面用它画卡片（`server/lib/agent/tools/write.ts:133-146`、`server/lib/agent/tools/edit.ts:572-581`、`server/lib/agent/tools/read.ts:164-173`）
+      - [p/L7AZxCpd] 用户在 Spec 面板：改状态、改正文、组内排序、增删、标或取消 protected，受保护的要先取消才能删（`frontend/components/narrator/spec/SpecTaskBoard.tsx:252`、`frontend/components/narrator/spec/SpecTaskBoard.tsx:394-413`）。保存以 user 身份写，受保护的改动直接放行，不经过任务反思（`server/routes/spec.ts:183-187`）；再通知 agent（见 [[p/pf3LOUWL]]），tasks.json 附最多 8 条未完成任务（`server/routes/spec.ts:205-222`）。另有清空任务和重置整个 spec，两者都把所有受保护锁标成 deleted（`server/routes/spec.ts:80-120`、`server/services/spec-vfs-service.ts:471-497`）
+      - [p/6oehrsQz] /goal：`server/services/command-service.ts:414-418` 解析；追加一条 protected 的 todo，以 user 身份写，按正文去重（`server/services/spec-vfs-service.ts:385-435`）；留一张 `spec_goal_added` 卡片（`server/services/narrator-session.ts:731-748`）；会话空闲就立刻启动首轮，模式是 off 也启动，计划模式或不空闲就不启动（`server/services/narrator-session.ts:4217-4231`、`server/routes/narrators.ts:2342-2368`）
+      - [p/3uGDyF9b] agent 自己也能标 protected，但系统提示只许在用户明确要求时标（`server/lib/prompts/system-reminders.ts:82`）；插件要显式要（`server/services/plugin-public-api.ts:1404-1412`）
+      - [p/mbJDZruP] 插件：团队插件 `com.whisent.narrator-team` 的源码不在仓库里，宿主侧有四个命令（`server/lib/plugins/permissions.ts:203-207`）。迁移后新增按块操作的命令，旧命令留一个兼容期（[[D27]] 的 D27d）
+        - [p/mJsitVSt] `spec_tasks_get` 返回原文、revisionId 和正文、状态、protected 列表（`server/services/plugin-public-api.ts:3176-3190`）；`spec_task_add` 追加一条任务，默认不是 protected，按正文去重，方便重复派发（`server/services/narrator-session.ts:4057-4088`、`server/services/plugin-public-api.ts:1401-1414`）
+        - [p/Xd4idilL] `spec_write` 整份覆盖 tasks.json 或 index.md，以 agent 身份写，碰到受保护任务直接报错（`server/services/narrator-session.ts:4188-4205`、`server/services/plugin-public-api.ts:1453-1466`）；`spec_behavior_fence_update` 在 behavior_fence 里维护一段带 `team-sop` 标记的 SOP，注释说周期注入是为了长跑和 compact 后成员还记得 SOP（`server/services/narrator-session.ts:4089-4142`）
+        - [p/2H3rD3lg] 插件能订阅 `narrafork.narrator.spec.changed` 事件（`server/services/plugin-event-gateway.ts:549-567`），推断团队插件靠它跟踪成员进度【推断】。派给成员的任务进成员自己的队列，由成员自己的循环捡起来（`server/services/narrator-session.ts:4057-4068` 的注释）；默认 protectedOnly 下，不是 protected 的任务不会让成员自动续跑【推断】
+    - [p/YFpxuPQK] 计划模式
+      - [p/iciz9PCB] 计划模式下不续跑、/goal 不启动首轮、注入不唤醒（`server/services/narrator-session.ts:1795`、`server/services/narrator-session.ts:4227`、`server/services/narrator-session.ts:4686`）
+      - [p/jv4IgRhB] 计划模式下 agent 写 tasks.json 一律放行：权限判断在检查计划文件之前就 allow（`server/services/narrator-permission.ts:826-831`），只读能力上限也豁免它（`server/services/narrator-permission.ts:4732`），relaxed plan 的提醒也跳过它（`server/lib/agent/loop.ts:629-647`）
+      - [p/00hkVtGl] 计划和任务是两样东西：计划是 `.narrafork/plans/` 下的 markdown，ExitPlanMode 批准后只重启循环（`server/services/agent-runtime/orchestrator.ts:1444-1452`），不生成任务，步骤要 agent 自己再抄进 tasks.json
+    - [p/Nhp7cUq4] fork、清上下文、子代理
+      - [p/aJLM4yec] fork 把父会话的 tasks.json 和受保护锁一起复制给子会话（`server/services/knowledge/sqlite-write-store.ts:1067-1128`）；有任务就在子会话插一张卡片，让人查看、清空或重置（`server/services/narrator-service.ts:1158-1184`）；ask-in-passing 直接清空（`server/routes/narrators.ts:5418`）；extract 也复制（`server/services/subagent-extract.ts:345`）
+      - [p/3qHQVCgW] 完全清空上下文时任务留着，同样插卡片；「清到这里」不插（`server/routes/narrators.ts:4280-4286`、`server/services/narrator-service.ts:1195-1215`）
+      - [p/3bUIafIT] 子代理有自己的 spec 和同一段系统提示；委派模板不自动提升 todo，最多续跑 6 趟（`server/services/agent-runtime/policy.ts:110-114`）；只读模板没有 Write、Edit，实际上建不了任务【推断】（`server/services/agent-runtime/policy.ts:38-56`）。迁移后子代理只按回合预算续跑（[[D27]] 的 D27c）
+    - [p/EQTki1Vh] 旧会话里的任务痕迹
+      - [p/RR92YWgv] 消息块 `spec_continuation`、`spec_blocked_continuation`（`server/services/narrator-session.ts:1884-1890`、`server/services/narrator-session.ts:1950-1956`）、`spec_goal_added`、`spec_fork_carryover`、`spec_context_cleared`（`server/services/narrator-service.ts:1172`、`server/services/narrator-service.ts:1201`），注入来源 `living_work_spec`、`interrupt_task_guard`、`spec_update`。渲染器在 `frontend/components/narrator/vlist/` 下，不在 `frontend/components/narrator/spec/` 里
+      - [p/Q8vi2WqA] tasks.json 工具调用的输入不截断，界面靠它画任务卡（`server/services/narrator-messages.ts:1996-2006`、`server/lib/db-worker/display-page-projection.ts:14`）
+      - [p/fJv8dPTW] 三种卡片上的「清空」「重置 Spec」按钮调 `/spec/tasks/clear` 和 `/spec/reset`（`frontend/components/narrator/vlist/vlist-spec-carryover-actions.ts`），`server/routes/spec.ts` 退役后这些按钮会失效
+    - [p/t5lUB4Cm] `detectProtectedMutations` 末尾那段循环什么都不做（`server/services/spec-task-service.ts:223-232`）：注释说改写受保护任务的正文要单独标出，没实现，改正文按删除处理
   - [p/CEIo4QC5] spec 上的 Grep 是把全部文件读出来跑正则，没有索引
   - [p/ymFGGNLa] Spec 面板用 SpecMarkdownEditor（Tiptap）编辑除 tasks.json 以外的所有 spec 文件，保存会把编辑器表示不了的 Markdown 语法删掉或改写：含 GFM 表格的文件改一个字再保存，整张表格（表头和所有行）从文件里消失，其余内容保留；表格在编辑器里本来就不显示，保存前看不到（`frontend/components/narrator/spec/SpecMarkdownEditor.tsx:43-69`）。2026-10 在 Tiptap 3.27.1（与 `bun.lock` 一致）上用脚本复现，没在真浏览器里点过；用 happy-dom 和完全不给 DOM 两种环境结果相同，说明丢表格发生在 Markdown 解析阶段，和 DOM 无关
     - [p/G0QXtBGI] 只打开不改不会写入，改动之后才会：加载、切换文件、重新加载都用 `emitUpdate: false` 设置内容，不置 dirty（`frontend/components/narrator/spec/SpecMarkdownEditor.tsx:64-69`）；任何一次改动（打字、工具栏加粗、撤销）都会把重新序列化的整份 Markdown 存进 `editContent` 并置 dirty，不比较内容是否真的变了，打一个字再删掉也算（`frontend/components/narrator/spec/SpecPanel.tsx:274-278`）；之后点保存或按 Ctrl/Cmd+S 才写回（`frontend/components/narrator/spec/SpecPanel.tsx:200-241`、`:258-266`），没有自动保存

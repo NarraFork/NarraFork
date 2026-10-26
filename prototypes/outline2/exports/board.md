@@ -1,4 +1,4 @@
-<!-- 由 prototypes/outline2/outline.py export 生成（第 402 个提交）。真相源是 data/log.jsonl，不要手改。 -->
+<!-- 由 prototypes/outline2/outline.py export 生成（第 435 个提交）。真相源是 data/log.jsonl，不要手改。 -->
 
 # 任务看板
 
@@ -23,7 +23,7 @@
 - [p/6yOuvxoQ] [ ] 把 SQL 谓词版 ACL 在大知识库上的性能放进 P0 基准 ← 调研：知识库现在怎么检索、注入、
 - [p/cp4IAr6P] [ ] 真机测输入法和移动端软键盘：§6.9 第 2 项，以及 Safari、iOS、Android 和 macOS、Windows 上的真实输入法；先看组合中收到不经输入法的 Enter 会不会拆块 ← P1a
 
-### 完成（18）
+### 完成（20）
 - [p/5nB0TYwk] [x] 核实：在 SpecMarkdownEditor 里编辑含表格的 spec 文件并保存，表格会不会丢；属实就给出修复方案（来自 Q6 调研的顺带发现 [[p/f3TO9Yre]]） @agent:w-table ← 现状spec
 - [p/uHnUVJL1] [x] 搭原型：块、链接、提交、时间机器、任务、两档计划、变更请求、断言与锚点 @agent:main ← P-1
 - [p/NVqKvrzA] [x] 把这次的计划录进原型 @agent:main ← P-1
@@ -42,4 +42,6 @@
 - [p/ccBGXE4T] [x] 调研：知识库现在怎么检索、注入、过滤权限；换成大纲的混合检索和「相关知识」视图时，哪些行为要保留、哪些是缺陷 @agent:w-kb ← P3
 - [p/Vww0RyM1] [x] 第四轮：专注调研知识库检索与注入 → 派活的会话记摘要、提问、遗留 → 整理 agent 放进事实树 → 新起一个 agent 测找不找得到 @agent:main ← P-1
 - [p/LxVmXH4D] [x] 清积压：四个整理 agent 把 12 个旧任务和刚回答的 37 条提问整理进事实树 @agent:main ← P-1
+- [p/1dPpT682] [x] 调研：spec 任务现在被谁用（续跑选任务、提醒注入、插件写入、受保护任务、计划模式），迁移成大纲任务时哪些行为要保留 @agent:w5 ← P2
+- [p/ji6fchWa] [x] 第五轮：原会话自己调研、边做边记、勾完成后接着整理（D15），再测找不找得到 @agent:main ← P-1
 

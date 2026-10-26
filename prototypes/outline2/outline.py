@@ -677,6 +677,33 @@ def has_basis(st: State, addr: str) -> bool:
 	return bool(st.links_from(addr, "basis") or st.links_from(addr, "source"))
 
 
+SETTLED_COVER = 0.6  # 笔记的字有六成以上出现在某条事实里，就算已整理进那条事实
+
+
+def _bigrams(text: str) -> set[str]:
+	s = re.sub(r"`[^`]*`|\[\[[^\]]*\]\]|\s+", "", text)
+	return {s[i : i + 2] for i in range(len(s) - 1)}
+
+
+def settled_into(st: State, addr: str) -> str | None:
+	"""过程里的笔记已经整理成了哪条事实（D28）：出处指回它所在任务或组的事实里，覆盖它最多的那条。"""
+	key = ("settled_into", addr)
+	if key not in st.memo:
+		mine = _bigrams(st.blocks[addr]["content"])
+		best, best_cover = None, SETTLED_COVER
+		if len(mine) >= 12 and not st.is_task(addr):  # 太短的笔记比不出来
+			for up in st.ancestors(addr):
+				for lk in st.links_to(up, "source"):
+					f = lk["from"]
+					if f not in st.blocks or st.blocks[f]["deleted"] or is_process(st, f):
+						continue
+					cover = len(mine & _bigrams(st.blocks[f]["content"])) / len(mine)
+					if cover >= best_cover:
+						best, best_cover = f, cover
+		st.memo[key] = best
+	return st.memo[key]
+
+
 # ---------------------------------------------------------------------------
 # 待确认（§2.6）
 
@@ -1938,6 +1965,7 @@ def cmd_search(args) -> None:
 	include = set((args.include or "").split(","))
 	terms = [t.lower() for t in " ".join(args.query).split() if t]
 	scored = []
+	folded: dict[str, list[str]] = {}
 	for a, b in st.blocks.items():
 		if b["deleted"] or (b["props"].get("invalid") and "invalid" not in include):
 			continue
@@ -1955,16 +1983,26 @@ def cmd_search(args) -> None:
 		if anchor_state(st, a):
 			score *= 0.7
 		if is_process(st, a):
+			fact = settled_into(st, a) if "process" not in include else None
+			if fact:  # 已整理进事实树的笔记：给事实，笔记作为出处跟在后面（D28）
+				folded.setdefault(fact, []).append(a)
+				scored.append((score, fact))
+				continue
 			score *= 0.5  # 同样相关时，事实排在过程前面（§5.4）
 		scored.append((score, a))
-	scored.sort(reverse=True)
-	for _, a in scored[: args.limit]:
+	best: dict[str, float] = {}
+	for score, a in scored:
+		best[a] = max(score, best.get(a, 0))
+	hits = sorted(best, key=lambda a: -best[a])[: args.limit]
+	for a in hits:
 		crumb = " › ".join(title_of(st.blocks[x])[:14] for x in reversed(st.ancestors(a)))
 		where = (f"在：{crumb}" if crumb else "") + ("（过程）" if is_process(st, a) else "")
 		print(render_line(st, a, detail=True).split("\n")[0] + (f"\n    {where}" if where else ""))
-	if not scored:
+		for n in folded.get(a, [])[:3]:
+			print(f"    出处：[{n}] {title_of(st.blocks[n])[:40]}（过程，已整理进这一块）")
+	if not hits:
 		print("（没有结果）")
-	record_reads(actor_of(args), st, [a for _, a in scored[: args.limit]])
+	record_reads(actor_of(args), st, hits)
 
 
 def cmd_backlinks(args) -> None:
@@ -2411,7 +2449,7 @@ def build_parser() -> argparse.ArgumentParser:
 	s.add_argument("--as-of", type=int)
 	s = p("search", cmd_search, "检索（默认不含不成立和归档）")
 	s.add_argument("query", nargs="+")
-	s.add_argument("--include", help="invalid,archived")
+	s.add_argument("--include", help="invalid,archived,process（process：已整理的笔记也单列）")
 	s.add_argument("--limit", type=int, default=12)
 	s = p("add", cmd_add, "用 markdown 大纲写：列表项是块，- [ ] 是任务，下一行写 键:: 值", epilog=ADD_EPILOG, formatter_class=argparse.RawDescriptionHelpFormatter)
 	s.add_argument("parent", help="父块，或 p/ 表示在空间顶层新建页")
