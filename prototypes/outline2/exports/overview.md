@@ -1,4 +1,4 @@
-<!-- 由 prototypes/outline2/outline.py export 生成（第 462 个提交）。真相源是 data/log.jsonl，不要手改。 -->
+<!-- 由 prototypes/outline2/outline.py export 生成（第 466 个提交）。真相源是 data/log.jsonl，不要手改。 -->
 
 # 大纲总览（事实视图）
 
@@ -25,6 +25,14 @@
         - [p/rj6sJoPM] 写入：SQLite 单块提交约 0.08 ms（WAL、synchronous=NORMAL），PG 约 1 ms（WAL fsync 主导）；200 块的提交 SQLite 11–25 ms；PG 的 40–59 ms 是原型里 1000 条语句的往返，真实实现要批量插入，只有各索引方案之间的相对差别可信
         - [p/CoL62QGv] 已知缺口和没测的：本页的时间轴看不到「块被移到别页」，因为移走那一刻的新版本属于别页，要补成员区间或在跨页移动时在原页补一条标记，没实现也没测；每个版本存全文，只移动不改内容也复制正文，按 `content_hash` 拆表没测；没测并发写入时的读取、WAL 检查点对读的影响、FTS 并存时的缓存挤占、历史超过 30 版本/块、非 Linux 平台；冷读只在 10 版本/块做过，PG 冷读用 16 MB 的 shared_buffers 近似
     - [p/74dzXAGs] D5 数据库是唯一真相源；永远不以 markdown 文件为真相源，永远不与 Obsidian vault 双向同步
+    - [p/RMYEs9IR] 存储层已在产品代码里实现：`server/services/outline/`（#261，2026-10-26 合并），P1a 的 7 张表一次建齐，SQLite 和 PG 两套实现，入口 `writeOutline`。都在开关 `outline.enabled`（默认关）后面
+      - [p/oZPSftxS] 写入先规划后落库：在内存里按需读出的行上检查父块、成环、别名、`baseVersionSeq` 和行数上限，同步事务里只写行；第一条语句用 `UPDATE … SET next_seq = next_seq + 1 WHERE next_seq = 计划时的值` 认领序号，认领不到说明别的提交先落地，整个事务重新规划，最多 5 次
+      - [p/be6IyWNz] 上限：一次 200 个操作，单块正文 16 KiB，整个事务正文 128 KiB，涉及行数（新版本加链接）2000；更大的子树删除或移动直接拒绝，不在主线程上跑大事务
+      - [p/B6FqS313] 标签存成单独的链接类型 `tag`，读回时才能还原 `tags::`，改正文也不会关掉标签
+      - [p/bRL3vwEo] PG 的转译器不支持列级排序规则，PG 实现里按排序键排序的地方都写 `COLLATE "C"`
+      - [p/mHPXdGnR] 块和空间的短 id 只用字母和数字：`_` 在 `[[…]]` 里会被方言转义，开头的 `-`、`_` 也不是合法的地址字符
+      - [p/1GA4nIZi] 加表要同步改 `scripts/lib/__tests__/check-postgres-schema-parity.test.ts` 里写死的表数和列数，否则 CI 会红
+      - [p/eF5scG1a] 规范化目前在主线程上跑，最坏一次写入约一秒；PR6、PR8 接入不可信输入前要挪进 worker
   - [p/gY26rSAk] 写入、审核与权限：默认直写、可以撤销；知识库空间默认走审核；会话的读权限取能读它的人的权限交集（D1、D8、D9）
     - [p/aQdrRFwd] D1 默认直写，带来源、可以撤销；少数改动转成待确认，不打断 agent；探索出来的会话只写自己的会话空间
       - [p/cSRo6HMn] D1a 例外（删除或移动团队之外的人写的块、单次改动超过 50 个已有块）自动转成待确认，不打断 agent；待确认进负责人的收件箱，agent 接着做别的（见 D25b）
