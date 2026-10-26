@@ -1,12 +1,14 @@
-<!-- 由 prototypes/outline2/outline.py export 生成（第 447 个提交）。真相源是 data/log.jsonl，不要手改。 -->
+<!-- 由 prototypes/outline2/outline.py export 生成（第 449 个提交）。真相源是 data/log.jsonl，不要手改。 -->
 
 # 任务看板
 
-### 进行中（2）
+### 进行中（4）
 - [p/H0a1nXuL] [/] 大纲系统路线图：建成知识、记忆与任务的统一平台
 - [p/DrYdFrth] [/] P-1 Python 原型与自用：先用原型承载这份计划，真实推进，从使用中发现问题 @agent:main ← 路线图
+- [p/EZKMMzR0] [/] PR1 导图与聚焦原型：在 prototypes/outline-editor 上加导图视图、切换动画、聚焦、快速切换，按实施计划 §10.2 验收 @agent:main ← P1a
+- [p/bFHA849C] [/] PR2 shared/outline：方言、markdown 大纲、地址、排序键，从原型移植，加三个解析器的一致性模糊测试 @agent:main ← P1a
 
-### 待办（22）
+### 待办（20）
 - [p/bd2Egjgc] [ ] P1a 核心存储、三个 agent 工具、大纲编辑器（先单人，建在协同协议上）、导图与聚焦、时间机器最小版、会话读权限；实施计划见 docs/OUTLINE_IMPLEMENTATION-PLAN.md ← 路线图
 - [p/kDh2CgDg] [ ] P1b 多人实时协同：页订阅、页实时会话、在场信息、大纲事务、agent 的三方合并 ‹等前置：P1a› ← 路线图
 - [p/f7vElM5K] [ ] P2 替换 spec://，落地多 agent 协作、两档计划与计划模式改造 ‹等前置：P1a› ← 路线图
@@ -20,8 +22,6 @@
 - [p/CJUTlph7] [ ] 端到端验证两个推断：Task 派发的子代理初始 prompt 也会被扫；pass 重启时可能陆续注入超过 3 条 ← 调研：知识库现在怎么检索、注入、
 - [p/6yOuvxoQ] [ ] 把 SQL 谓词版 ACL 在大知识库上的性能放进 P0 基准 ← 调研：知识库现在怎么检索、注入、
 - [p/cp4IAr6P] [ ] 真机测输入法和移动端软键盘：§6.9 第 2 项，以及 Safari、iOS、Android 和 macOS、Windows 上的真实输入法；先看组合中收到不经输入法的 Enter 会不会拆块 ← P1a
-- [p/EZKMMzR0] [ ] PR1 导图与聚焦原型：在 prototypes/outline-editor 上加导图视图、切换动画、聚焦、快速切换，按实施计划 §10.2 验收 ← P1a
-- [p/bFHA849C] [ ] PR2 shared/outline：方言、markdown 大纲、地址、排序键，从原型移植，加三个解析器的一致性模糊测试 ← P1a
 - [p/7uSZ51Cn] [ ] PR3 存储：表和两种方言的迁移、存储端口和实现、写入不变量、提交、链接抽取、FTS 运行时建表、全局开关 outline.enabled ‹等前置：PR2 shared/o› ← P1a
 - [p/jFJm2zG1] [ ] PR4 读取与检索：读页、读子树、按时间点读、按预算渲染、事实过滤、FTS 检索、补偿提交 ‹等前置：PR3 存储：表和两种方› ← P1a
 - [p/PROPV87j] [ ] PR5 空间与权限：项目、个人、会话空间的建立与解析，HTTP 权限，会话的读权限交集（D9、D22b） ‹等前置：PR3 存储：表和两种方› ← P1a
