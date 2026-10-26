@@ -41,7 +41,8 @@ export function quantize(v: Float32Array, out: Int8Array): number {
 	}
 	const scale = max / 127 || 1;
 	const inv = 1 / scale;
-	for (let i = 0; i < v.length; i++) out[i] = Math.max(-127, Math.min(127, Math.round((v[i] as number) * inv)));
+	for (let i = 0; i < v.length; i++)
+		out[i] = Math.max(-127, Math.min(127, Math.round((v[i] as number) * inv)));
 	return scale;
 }
 
@@ -105,40 +106,92 @@ export function dotI8(q: Int8Array, v: Int8Array, off: number, dim: number): num
 	return s0 + s1 + s2 + s3;
 }
 
-export function jsScanF32Range(top: TopK, vecs: Float32Array, start: number, end: number, dim: number, q: Float32Array) {
+export function jsScanF32Range(
+	top: TopK,
+	vecs: Float32Array,
+	start: number,
+	end: number,
+	dim: number,
+	q: Float32Array,
+) {
 	for (let i = start; i < end; i++) {
 		const s = dotF32(q, vecs, i * dim, dim);
 		if (s > top.thr || top.n < top.k) top.push(s, i);
 	}
 }
-export function jsScanF32Tag(top: TopK, vecs: Float32Array, space: Uint32Array, want: number, start: number, end: number, dim: number, q: Float32Array) {
+export function jsScanF32Tag(
+	top: TopK,
+	vecs: Float32Array,
+	space: Uint32Array,
+	want: number,
+	start: number,
+	end: number,
+	dim: number,
+	q: Float32Array,
+) {
 	for (let i = start; i < end; i++) {
 		if (space[i] !== want) continue;
 		const s = dotF32(q, vecs, i * dim, dim);
 		if (s > top.thr || top.n < top.k) top.push(s, i);
 	}
 }
-export function jsScanF32Ids(top: TopK, vecs: Float32Array, ids: Uint32Array, n: number, dim: number, q: Float32Array) {
+export function jsScanF32Ids(
+	top: TopK,
+	vecs: Float32Array,
+	ids: Uint32Array,
+	n: number,
+	dim: number,
+	q: Float32Array,
+) {
 	for (let j = 0; j < n; j++) {
 		const i = ids[j] as number;
 		const s = dotF32(q, vecs, i * dim, dim);
 		if (s > top.thr || top.n < top.k) top.push(s, i);
 	}
 }
-export function jsScanI8Range(top: TopK, vecs: Int8Array, scales: Float32Array, start: number, end: number, dim: number, q: Int8Array, qscale: number) {
+export function jsScanI8Range(
+	top: TopK,
+	vecs: Int8Array,
+	scales: Float32Array,
+	start: number,
+	end: number,
+	dim: number,
+	q: Int8Array,
+	qscale: number,
+) {
 	for (let i = start; i < end; i++) {
 		const s = dotI8(q, vecs, i * dim, dim) * qscale * (scales[i] as number);
 		if (s > top.thr || top.n < top.k) top.push(s, i);
 	}
 }
-export function jsScanI8Tag(top: TopK, vecs: Int8Array, scales: Float32Array, space: Uint32Array, want: number, start: number, end: number, dim: number, q: Int8Array, qscale: number) {
+export function jsScanI8Tag(
+	top: TopK,
+	vecs: Int8Array,
+	scales: Float32Array,
+	space: Uint32Array,
+	want: number,
+	start: number,
+	end: number,
+	dim: number,
+	q: Int8Array,
+	qscale: number,
+) {
 	for (let i = start; i < end; i++) {
 		if (space[i] !== want) continue;
 		const s = dotI8(q, vecs, i * dim, dim) * qscale * (scales[i] as number);
 		if (s > top.thr || top.n < top.k) top.push(s, i);
 	}
 }
-export function jsScanI8Ids(top: TopK, vecs: Int8Array, scales: Float32Array, ids: Uint32Array, n: number, dim: number, q: Int8Array, qscale: number) {
+export function jsScanI8Ids(
+	top: TopK,
+	vecs: Int8Array,
+	scales: Float32Array,
+	ids: Uint32Array,
+	n: number,
+	dim: number,
+	q: Int8Array,
+	qscale: number,
+) {
 	for (let j = 0; j < n; j++) {
 		const i = ids[j] as number;
 		const s = dotI8(q, vecs, i * dim, dim) * qscale * (scales[i] as number);

@@ -1,3500 +1,3488 @@
 {
- "label": "sqlite-prod-vpb30",
- "meta": {
-  "info": {
-   "blocks": 110000,
-   "pages": 51,
-   "versions": 3300002,
-   "commits": 872084,
-   "members": 239953,
-   "versionsPerBlock": {
-    "mean": 30.00001818181818,
-    "p50": 11,
-    "p90": 70,
-    "p99": 226,
-    "max": 56388
-   },
-   "versionsPerCommit": {
-    "mean": 3.7840414455488234,
-    "p50": 1,
-    "p95": 15,
-    "max": 9000
-   },
-   "avgContentBytes": 392,
-   "spaceMaxSeq": [
-    182184,
-    123272,
-    271168,
-    123017,
-    172443
-   ],
-   "flagCounts": {
-    "CREATED": 109341,
-    "CONTENT": 2728781,
-    "MOVED": 71772,
-    "DELETED": 147938,
-    "RESTORED": 117048,
-    "TASK": 195236,
-    "PAGE": 14842
-   }
-  },
-  "params": {
-   "seed": 1,
-   "spaces": 5,
-   "pagesPerSpace": 10,
-   "blocksPerPage": 2000,
-   "giantBlocks": 10000,
-   "vpb": 30,
-   "initialFraction": 0.9
-  }
- },
- "sizesBase": {
-  "c_space_seq": 29630464,
-  "outline_block_versions": 1968328704,
-  "outline_blocks": 46403584,
-  "outline_commits": 151613440,
-  "outline_page_members": 15134720,
-  "pk_blocks": 3280896,
-  "pk_commits": 26296320,
-  "pk_versions": 111890432,
-  "sqlite_schema": 4096,
-  "v_commit": 99467264
- },
- "sizesByVariant": {
-  "A2": {
-   "ix_a2": 118165504
-  },
-  "B2": {
-   "ix_b2": 124219392
-  },
-  "B3": {
-   "ix_b3": 124997632
-  },
-  "B5": {
-   "ix_b5": 290820096
-  },
-  "C": {
-   "ix_c": 9285632
-  }
- },
- "verifyReport": {
-  "p2000:Q2 page@T": {
-   "variants": [
-    "A2",
-    "B2",
-    "B3",
-    "B5",
-    "C"
-   ],
-   "samples": 60,
-   "mismatches": {
-    "A2": 0,
-    "B2": 0,
-    "B3": 0,
-    "B5": 0,
-    "C": 0
-   }
-  }
- },
- "plans": {
-  "sqlite-prod-vpb30/A2/page2000": "CO-ROUTINE tree\nSETUP\nSEARCH x USING INDEX pk_versions (block_id=? AND from_seq<?)\nRECURSIVE STEP\nSCAN tr\nSEARCH c USING INDEX ix_a2 (parent_id=? AND from_seq<?)\nSCAN tr\nSEARCH v USING INDEX pk_versions (block_id=? AND from_seq=?)",
-  "sqlite-prod-vpb30/B2/page2000": "SEARCH v USING INDEX ix_b2 (page_id=? AND from_seq<?)",
-  "sqlite-prod-vpb30/B3/page2000": "SEARCH v USING INDEX ix_b3 (page_id=? AND from_seq<?)",
-  "sqlite-prod-vpb30/B5/page2000": "SEARCH v USING INDEX ix_b5 (page_id=? AND from_seq<?)",
-  "sqlite-prod-vpb30/C/page2000": "SEARCH m USING INDEX ix_c (page_id=? AND from_seq<?)\nSEARCH v USING INDEX pk_versions (block_id=? AND from_seq=?)\nCORRELATED SCALAR SUBQUERY 1\nSEARCH x USING COVERING INDEX pk_versions (block_id=? AND from_seq<?)"
- },
- "results": [
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "-",
-   "query": "Q4a commits (space)",
-   "scope": "200/page",
-   "bucket": "all",
-   "rows": 201,
-   "summary": {
-    "n": 150,
-    "p50": 0.33259300000099756,
-    "p95": 0.4159289999988687,
-    "p99": 0.5008710000001884,
-    "max": 0.6749859999999899,
-    "mean": 0.34262893333324124
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "-",
-   "query": "Q4a commits (space)",
-   "scope": "200/page",
-   "bucket": "mid",
-   "rows": 201,
-   "summary": {
-    "n": 150,
-    "p50": 0.33259300000099756,
-    "p95": 0.4159289999988687,
-    "p99": 0.5008710000001884,
-    "max": 0.6749859999999899,
-    "mean": 0.34262893333324124
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "-",
-   "query": "Q4b commits agent only",
-   "scope": "200/page",
-   "bucket": "all",
-   "rows": 201,
-   "summary": {
-    "n": 150,
-    "p50": 0.4267010000003211,
-    "p95": 0.6441860000013548,
-    "p99": 2.1190150000002177,
-    "max": 2.9422210000011546,
-    "mean": 0.4839475266666341
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "-",
-   "query": "Q4b commits agent only",
-   "scope": "200/page",
-   "bucket": "mid",
-   "rows": 201,
-   "summary": {
-    "n": 150,
-    "p50": 0.4267010000003211,
-    "p95": 0.6441860000013548,
-    "p99": 2.1190150000002177,
-    "max": 2.9422210000011546,
-    "mean": 0.4839475266666341
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "-",
-   "query": "Q4c commits narrator",
-   "scope": "200/page",
-   "bucket": "all",
-   "rows": 199,
-   "summary": {
-    "n": 150,
-    "p50": 0.42050299999937124,
-    "p95": 0.5335729999987961,
-    "p99": 0.6163630000010016,
-    "max": 0.6997260000007373,
-    "mean": 0.3733797066665526
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "-",
-   "query": "Q4c commits narrator",
-   "scope": "200/page",
-   "bucket": "mid",
-   "rows": 199,
-   "summary": {
-    "n": 150,
-    "p50": 0.42050299999937124,
-    "p95": 0.5335729999987961,
-    "p99": 0.6163630000010016,
-    "max": 0.6997260000007373,
-    "mean": 0.3733797066665526
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "A2",
-   "query": "Q2 page@T",
-   "scope": "p2000",
-   "bucket": "all",
-   "rows": 1839,
-   "summary": {
-    "n": 300,
-    "p50": 21.353773999999248,
-    "p95": 32.16828000000169,
-    "p99": 64.80467399999907,
-    "max": 90.67364100000123,
-    "mean": 22.027811763333375
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "A2",
-   "query": "Q2 page@T",
-   "scope": "p2000",
-   "bucket": "early",
-   "rows": 1839,
-   "summary": {
-    "n": 100,
-    "p50": 19.801629000001412,
-    "p95": 25.319985000001907,
-    "p99": 27.748897000001307,
-    "max": 28.625643000003038,
-    "mean": 19.627407790000106
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "A2",
-   "query": "Q2 page@T",
-   "scope": "p2000",
-   "bucket": "mid",
-   "rows": 1839,
-   "summary": {
-    "n": 100,
-    "p50": 21.403368000002956,
-    "p95": 28.934132000002137,
-    "p99": 34.638214999999036,
-    "max": 44.32322600000043,
-    "mean": 20.13267547000003
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "A2",
-   "query": "Q2 page@T",
-   "scope": "p2000",
-   "bucket": "late",
-   "rows": 1839,
-   "summary": {
-    "n": 100,
-    "p50": 24.37180299999818,
-    "p95": 45.34817100000146,
-    "p99": 71.95391999999993,
-    "max": 90.67364100000123,
-    "mean": 26.323352029999988
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "A2",
-   "query": "Q2 page@T",
-   "scope": "p10000",
-   "bucket": "all",
-   "rows": 8716,
-   "summary": {
-    "n": 100,
-    "p50": 118.36045999999988,
-    "p95": 142.26858599999832,
-    "p99": 148.0892649999987,
-    "max": 156.89864699999453,
-    "mean": 119.63358900999985
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "A2",
-   "query": "Q2 page@T",
-   "scope": "p10000",
-   "bucket": "early",
-   "rows": 8716,
-   "summary": {
-    "n": 34,
-    "p50": 110.11165400000027,
-    "p95": 142.10176599999977,
-    "p99": 147.98931200000152,
-    "max": 147.98931200000152,
-    "mean": 112.72592611764765
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "A2",
-   "query": "Q2 page@T",
-   "scope": "p10000",
-   "bucket": "mid",
-   "rows": 8716,
-   "summary": {
-    "n": 33,
-    "p50": 125.43424299999606,
-    "p95": 143.07729499999914,
-    "p99": 144.47427700000117,
-    "max": 144.47427700000117,
-    "mean": 125.2710560303029
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "A2",
-   "query": "Q2 page@T",
-   "scope": "p10000",
-   "bucket": "late",
-   "rows": 8716,
-   "summary": {
-    "n": 33,
-    "p50": 117.23092599999654,
-    "p95": 148.0892649999987,
-    "p99": 156.89864699999453,
-    "max": 156.89864699999453,
-    "mean": 121.11310799999906
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "A2",
-   "query": "Q1 vp500 native-dfs",
-   "scope": "p2000",
-   "bucket": "all",
-   "rows": 500,
-   "summary": {
-    "n": 300,
-    "p50": 6.4341719999938505,
-    "p95": 26.278022000005876,
-    "p99": 58.442729000002146,
-    "max": 77.72501400000328,
-    "mean": 9.081576363333394
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "A2",
-   "query": "Q1 vp500 native-dfs",
-   "scope": "p2000",
-   "bucket": "early",
-   "rows": 500,
-   "summary": {
-    "n": 100,
-    "p50": 6.035602000003564,
-    "p95": 7.697039999999106,
-    "p99": 8.339128999999957,
-    "max": 8.435999999994237,
-    "mean": 6.156083009999784
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "A2",
-   "query": "Q1 vp500 native-dfs",
-   "scope": "p2000",
-   "bucket": "mid",
-   "rows": 500,
-   "summary": {
-    "n": 100,
-    "p50": 6.280459000001429,
-    "p95": 12.786705999998958,
-    "p99": 33.635567999997875,
-    "max": 42.645251000001736,
-    "mean": 7.780287409999946
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "A2",
-   "query": "Q1 vp500 native-dfs",
-   "scope": "p2000",
-   "bucket": "late",
-   "rows": 500,
-   "summary": {
-    "n": 100,
-    "p50": 7.367191000004823,
-    "p95": 48.58613100000366,
-    "p99": 75.21219999999448,
-    "max": 77.72501400000328,
-    "mean": 13.308358670000452
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "A2",
-   "query": "Q1 vp500 native-dfs",
-   "scope": "p10000",
-   "bucket": "all",
-   "rows": 500,
-   "summary": {
-    "n": 100,
-    "p50": 5.0584709999966435,
-    "p95": 6.115585999999894,
-    "p99": 6.862286999996286,
-    "max": 7.327604999998584,
-    "mean": 5.094148239999922
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "A2",
-   "query": "Q1 vp500 native-dfs",
-   "scope": "p10000",
-   "bucket": "early",
-   "rows": 500,
-   "summary": {
-    "n": 34,
-    "p50": 4.721593999995093,
-    "p95": 5.654914999999164,
-    "p99": 6.703270000005432,
-    "max": 6.703270000005432,
-    "mean": 4.731424499999669
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "A2",
-   "query": "Q1 vp500 native-dfs",
-   "scope": "p10000",
-   "bucket": "mid",
-   "rows": 500,
-   "summary": {
-    "n": 33,
-    "p50": 5.087747999998101,
-    "p95": 5.808894000001601,
-    "p99": 6.862286999996286,
-    "max": 6.862286999996286,
-    "mean": 5.037655363636573
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "A2",
-   "query": "Q1 vp500 native-dfs",
-   "scope": "p10000",
-   "bucket": "late",
-   "rows": 500,
-   "summary": {
-    "n": 33,
-    "p50": 5.522761000000173,
-    "p95": 6.332676999998512,
-    "p99": 7.327604999998584,
-    "max": 7.327604999998584,
-    "mean": 5.524356484848382
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "A2",
-   "query": "Q1 vp500 read+js-order",
-   "scope": "p2000",
-   "bucket": "all",
-   "rows": 500,
-   "summary": {
-    "n": 300,
-    "p50": 22.33389100000204,
-    "p95": 34.12433400000009,
-    "p99": 61.96458899999561,
-    "max": 92.57425199999852,
-    "mean": 22.657148010000068
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "A2",
-   "query": "Q1 vp500 read+js-order",
-   "scope": "p2000",
-   "bucket": "early",
-   "rows": 500,
-   "summary": {
-    "n": 100,
-    "p50": 20.37539700000343,
-    "p95": 25.56263200000103,
-    "p99": 27.086608999998134,
-    "max": 30.520973999999114,
-    "mean": 20.34229408999978
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "A2",
-   "query": "Q1 vp500 read+js-order",
-   "scope": "p2000",
-   "bucket": "mid",
-   "rows": 500,
-   "summary": {
-    "n": 100,
-    "p50": 22.49401300000318,
-    "p95": 28.870872999999847,
-    "p99": 37.53996200000256,
-    "max": 38.27272699999594,
-    "mean": 20.826868870000254
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "A2",
-   "query": "Q1 vp500 read+js-order",
-   "scope": "p2000",
-   "bucket": "late",
-   "rows": 500,
-   "summary": {
-    "n": 100,
-    "p50": 25.506073000004108,
-    "p95": 44.86803900000086,
-    "p99": 72.69842799999606,
-    "max": 92.57425199999852,
-    "mean": 26.802281070000173
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "A2",
-   "query": "Q3 diff W=1",
-   "scope": "p2000",
-   "bucket": "all",
-   "rows": 1,
-   "summary": {
-    "n": 150,
-    "p50": 47.689833000004,
-    "p95": 69.94940899999347,
-    "p99": 140.58930500000133,
-    "max": 167.03041099999973,
-    "mean": 48.69518731333349
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "A2",
-   "query": "Q3 diff W=1",
-   "scope": "p2000",
-   "bucket": "early",
-   "rows": 1,
-   "summary": {
-    "n": 50,
-    "p50": 47.93979099999706,
-    "p95": 64.9162770000039,
-    "p99": 69.94940899999347,
-    "max": 69.94940899999347,
-    "mean": 47.4913681000004
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "A2",
-   "query": "Q3 diff W=1",
-   "scope": "p2000",
-   "bucket": "mid",
-   "rows": 1,
-   "summary": {
-    "n": 50,
-    "p50": 47.73920899999939,
-    "p95": 135.99110099999962,
-    "p99": 167.03041099999973,
-    "max": 167.03041099999973,
-    "mean": 51.08752157999989
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "A2",
-   "query": "Q3 diff W=1",
-   "scope": "p2000",
-   "bucket": "late",
-   "rows": 1,
-   "summary": {
-    "n": 50,
-    "p50": 45.92516099999921,
-    "p95": 69.04070499999943,
-    "p99": 90.31154799999786,
-    "max": 90.31154799999786,
-    "mean": 47.506672260000194
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "A2",
-   "query": "Q3 diff W=100",
-   "scope": "p2000",
-   "bucket": "all",
-   "rows": 17,
-   "summary": {
-    "n": 150,
-    "p50": 47.64180199999828,
-    "p95": 71.76397800000268,
-    "p99": 107.14526399999886,
-    "max": 111.41467099999136,
-    "mean": 48.14226136666689
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "A2",
-   "query": "Q3 diff W=100",
-   "scope": "p2000",
-   "bucket": "early",
-   "rows": 17,
-   "summary": {
-    "n": 50,
-    "p50": 48.152979999998934,
-    "p95": 79.9826680000042,
-    "p99": 111.41467099999136,
-    "max": 111.41467099999136,
-    "mean": 48.96763724000033
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "A2",
-   "query": "Q3 diff W=100",
-   "scope": "p2000",
-   "bucket": "mid",
-   "rows": 17,
-   "summary": {
-    "n": 50,
-    "p50": 47.64180199999828,
-    "p95": 69.01753599999938,
-    "p99": 85.22698500000115,
-    "max": 85.22698500000115,
-    "mean": 47.210154139999794
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "A2",
-   "query": "Q3 diff W=100",
-   "scope": "p2000",
-   "bucket": "late",
-   "rows": 17,
-   "summary": {
-    "n": 50,
-    "p50": 46.91291700000875,
-    "p95": 77.52463400000124,
-    "p99": 87.97732800000085,
-    "max": 87.97732800000085,
-    "mean": 48.24899272000053
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "A2",
-   "query": "Q3 diff W=5000",
-   "scope": "p2000",
-   "bucket": "all",
-   "rows": 495,
-   "summary": {
-    "n": 150,
-    "p50": 45.982554999995045,
-    "p95": 75.3063589999947,
-    "p99": 87.84804599999916,
-    "max": 90.8142680000019,
-    "mean": 47.339946073333074
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "A2",
-   "query": "Q3 diff W=5000",
-   "scope": "p2000",
-   "bucket": "early",
-   "rows": 495,
-   "summary": {
-    "n": 50,
-    "p50": 46.828982999999425,
-    "p95": 82.92821099999128,
-    "p99": 90.8142680000019,
-    "max": 90.8142680000019,
-    "mean": 50.23578366000031
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "A2",
-   "query": "Q3 diff W=5000",
-   "scope": "p2000",
-   "bucket": "mid",
-   "rows": 495,
-   "summary": {
-    "n": 50,
-    "p50": 45.90624399999797,
-    "p95": 66.40083400000003,
-    "p99": 74.78619300000719,
-    "max": 74.78619300000719,
-    "mean": 45.88027238000009
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "A2",
-   "query": "Q3 diff W=5000",
-   "scope": "p2000",
-   "bucket": "late",
-   "rows": 495,
-   "summary": {
-    "n": 50,
-    "p50": 44.66895600000862,
-    "p95": 75.3063589999947,
-    "p99": 87.84804599999916,
-    "max": 87.84804599999916,
-    "mean": 45.903782179998814
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B2",
-   "query": "Q2 page@T",
-   "scope": "p2000",
-   "bucket": "all",
-   "rows": 1839,
-   "summary": {
-    "n": 300,
-    "p50": 7.9331919999967795,
-    "p95": 13.03604500000074,
-    "p99": 15.490936999995029,
-    "max": 17.75369499999215,
-    "mean": 8.261684756666558
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B2",
-   "query": "Q2 page@T",
-   "scope": "p2000",
-   "bucket": "early",
-   "rows": 1839,
-   "summary": {
-    "n": 100,
-    "p50": 6.410430999996606,
-    "p95": 8.88345800001116,
-    "p99": 9.2898259999929,
-    "max": 9.626124999995227,
-    "mean": 6.437394129999302
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B2",
-   "query": "Q2 page@T",
-   "scope": "p2000",
-   "bucket": "mid",
-   "rows": 1839,
-   "summary": {
-    "n": 100,
-    "p50": 8.248653000002378,
-    "p95": 12.262900000001537,
-    "p99": 15.490936999995029,
-    "max": 15.786538000000292,
-    "mean": 8.36686267000041
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B2",
-   "query": "Q2 page@T",
-   "scope": "p2000",
-   "bucket": "late",
-   "rows": 1839,
-   "summary": {
-    "n": 100,
-    "p50": 9.599851999999373,
-    "p95": 13.678671999994549,
-    "p99": 16.744673000008333,
-    "max": 17.75369499999215,
-    "mean": 9.980797469999962
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B2",
-   "query": "Q2 page@T",
-   "scope": "p10000",
-   "bucket": "all",
-   "rows": 8716,
-   "summary": {
-    "n": 100,
-    "p50": 34.788172000000486,
-    "p95": 46.00226500000281,
-    "p99": 55.33788099999947,
-    "max": 60.54738000000361,
-    "mean": 34.45884855999946
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B2",
-   "query": "Q2 page@T",
-   "scope": "p10000",
-   "bucket": "early",
-   "rows": 8716,
-   "summary": {
-    "n": 34,
-    "p50": 25.16850100000738,
-    "p95": 35.36436700000195,
-    "p99": 37.59315099999367,
-    "max": 37.59315099999367,
-    "mean": 26.14970044117731
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B2",
-   "query": "Q2 page@T",
-   "scope": "p10000",
-   "bucket": "mid",
-   "rows": 8716,
-   "summary": {
-    "n": 33,
-    "p50": 34.7628379999951,
-    "p95": 42.77788399999554,
-    "p99": 60.54738000000361,
-    "max": 60.54738000000361,
-    "mean": 35.79027178787686
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B2",
-   "query": "Q2 page@T",
-   "scope": "p10000",
-   "bucket": "late",
-   "rows": 8716,
-   "summary": {
-    "n": 33,
-    "p50": 40.06711499999801,
-    "p95": 48.79533100000117,
-    "p99": 55.33788099999947,
-    "max": 55.33788099999947,
-    "mean": 41.688365818181246
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B2",
-   "query": "Q1 vp500 read+js-order",
-   "scope": "p2000",
-   "bucket": "all",
-   "rows": 500,
-   "summary": {
-    "n": 300,
-    "p50": 8.3249080000096,
-    "p95": 13.015716000008979,
-    "p99": 16.007559999998193,
-    "max": 20.924901000005775,
-    "mean": 8.51751435666704
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B2",
-   "query": "Q1 vp500 read+js-order",
-   "scope": "p2000",
-   "bucket": "early",
-   "rows": 500,
-   "summary": {
-    "n": 100,
-    "p50": 6.456981000010273,
-    "p95": 10.697421000004397,
-    "p99": 12.37052599999879,
-    "max": 12.549906999993254,
-    "mean": 6.900594120000023
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B2",
-   "query": "Q1 vp500 read+js-order",
-   "scope": "p2000",
-   "bucket": "mid",
-   "rows": 500,
-   "summary": {
-    "n": 100,
-    "p50": 8.251482000006945,
-    "p95": 13.015716000008979,
-    "p99": 14.584874000007403,
-    "max": 16.007559999998193,
-    "mean": 8.50782571000076
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B2",
-   "query": "Q1 vp500 read+js-order",
-   "scope": "p2000",
-   "bucket": "late",
-   "rows": 500,
-   "summary": {
-    "n": 100,
-    "p50": 9.679617999994662,
-    "p95": 14.107124000001932,
-    "p99": 16.700928999998723,
-    "max": 20.924901000005775,
-    "mean": 10.144123240000335
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B2",
-   "query": "Q1 vp500 read+js-order",
-   "scope": "p10000",
-   "bucket": "all",
-   "rows": 500,
-   "summary": {
-    "n": 100,
-    "p50": 40.937974000000395,
-    "p95": 56.529103000008035,
-    "p99": 63.96331999999529,
-    "max": 67.17939000000479,
-    "mean": 41.07620589999962
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B2",
-   "query": "Q1 vp500 read+js-order",
-   "scope": "p10000",
-   "bucket": "early",
-   "rows": 500,
-   "summary": {
-    "n": 34,
-    "p50": 32.61891000000469,
-    "p95": 44.761335999995936,
-    "p99": 52.99790400000347,
-    "max": 52.99790400000347,
-    "mean": 32.500566323529604
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B2",
-   "query": "Q1 vp500 read+js-order",
-   "scope": "p10000",
-   "bucket": "mid",
-   "rows": 500,
-   "summary": {
-    "n": 33,
-    "p50": 40.52143399999477,
-    "p95": 58.455140000005485,
-    "p99": 59.415930000002845,
-    "max": 59.415930000002845,
-    "mean": 42.379063787878046
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B2",
-   "query": "Q1 vp500 read+js-order",
-   "scope": "p10000",
-   "bucket": "late",
-   "rows": 500,
-   "summary": {
-    "n": 33,
-    "p50": 46.097245999990264,
-    "p95": 63.96331999999529,
-    "p99": 67.17939000000479,
-    "max": 67.17939000000479,
-    "mean": 48.60885545454485
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B2",
-   "query": "Q3 diff W=1 flags",
-   "scope": "p2000",
-   "bucket": "all",
-   "rows": 1,
-   "summary": {
-    "n": 150,
-    "p50": 0.01617600000463426,
-    "p95": 0.052404999994905666,
-    "p99": 0.14454900000419002,
-    "max": 0.17711800000688527,
-    "mean": 0.023257666667341255
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B2",
-   "query": "Q3 diff W=1 flags",
-   "scope": "p2000",
-   "bucket": "early",
-   "rows": 1,
-   "summary": {
-    "n": 50,
-    "p50": 0.01558800000930205,
-    "p95": 0.052404999994905666,
-    "p99": 0.06535900000017136,
-    "max": 0.06535900000017136,
-    "mean": 0.020345620001025962
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B2",
-   "query": "Q3 diff W=1 flags",
-   "scope": "p2000",
-   "bucket": "mid",
-   "rows": 1,
-   "summary": {
-    "n": 50,
-    "p50": 0.01731399999698624,
-    "p95": 0.10912800001096912,
-    "p99": 0.17711800000688527,
-    "max": 0.17711800000688527,
-    "mean": 0.02797824000037508
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B2",
-   "query": "Q3 diff W=1 flags",
-   "scope": "p2000",
-   "bucket": "late",
-   "rows": 1,
-   "summary": {
-    "n": 50,
-    "p50": 0.01615600001241546,
-    "p95": 0.04808999999659136,
-    "p99": 0.07152699999278411,
-    "max": 0.07152699999278411,
-    "mean": 0.02144914000062272
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B2",
-   "query": "Q3 diff W=1 join",
-   "scope": "p2000",
-   "bucket": "all",
-   "rows": 1,
-   "summary": {
-    "n": 150,
-    "p50": 0.025880999994114973,
-    "p95": 0.1608459999988554,
-    "p99": 0.3789470000047004,
-    "max": 0.6890999999886844,
-    "mean": 0.05258926000019225
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B2",
-   "query": "Q3 diff W=1 join",
-   "scope": "p2000",
-   "bucket": "early",
-   "rows": 1,
-   "summary": {
-    "n": 50,
-    "p50": 0.024409000005107373,
-    "p95": 0.14631999999983236,
-    "p99": 0.1532640000077663,
-    "max": 0.1532640000077663,
-    "mean": 0.042721120000933296
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B2",
-   "query": "Q3 diff W=1 join",
-   "scope": "p2000",
-   "bucket": "mid",
-   "rows": 1,
-   "summary": {
-    "n": 50,
-    "p50": 0.025878000000375323,
-    "p95": 0.24421699999948032,
-    "p99": 0.6890999999886844,
-    "max": 0.6890999999886844,
-    "mean": 0.07129273999977158
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B2",
-   "query": "Q3 diff W=1 join",
-   "scope": "p2000",
-   "bucket": "late",
-   "rows": 1,
-   "summary": {
-    "n": 50,
-    "p50": 0.026433999999426305,
-    "p95": 0.20590699999593198,
-    "p99": 0.23118499999691267,
-    "max": 0.23118499999691267,
-    "mean": 0.04375391999987187
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B2",
-   "query": "Q3 diff W=100 flags",
-   "scope": "p2000",
-   "bucket": "all",
-   "rows": 22,
-   "summary": {
-    "n": 150,
-    "p50": 0.06737499999871943,
-    "p95": 0.2846829999907641,
-    "p99": 0.568463999996311,
-    "max": 0.6187910000007832,
-    "mean": 0.0977815333334729
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B2",
-   "query": "Q3 diff W=100 flags",
-   "scope": "p2000",
-   "bucket": "early",
-   "rows": 22,
-   "summary": {
-    "n": 50,
-    "p50": 0.07824399998935405,
-    "p95": 0.35130400001071393,
-    "p99": 0.42168700000911485,
-    "max": 0.42168700000911485,
-    "mean": 0.10653300000005402
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B2",
-   "query": "Q3 diff W=100 flags",
-   "scope": "p2000",
-   "bucket": "mid",
-   "rows": 22,
-   "summary": {
-    "n": 50,
-    "p50": 0.0769399999990128,
-    "p95": 0.2885950000054436,
-    "p99": 0.6187910000007832,
-    "max": 0.6187910000007832,
-    "mean": 0.12203642000007676
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B2",
-   "query": "Q3 diff W=100 flags",
-   "scope": "p2000",
-   "bucket": "late",
-   "rows": 22,
-   "summary": {
-    "n": 50,
-    "p50": 0.04376400000182912,
-    "p95": 0.17414100001042243,
-    "p99": 0.28306300000986084,
-    "max": 0.28306300000986084,
-    "mean": 0.06477518000028795
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B2",
-   "query": "Q3 diff W=100 join",
-   "scope": "p2000",
-   "bucket": "all",
-   "rows": 22,
-   "summary": {
-    "n": 150,
-    "p50": 0.20904800000425894,
-    "p95": 1.1594089999998687,
-    "p99": 2.259487999996054,
-    "max": 2.5672900000063237,
-    "mean": 0.3670327733327091
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B2",
-   "query": "Q3 diff W=100 join",
-   "scope": "p2000",
-   "bucket": "early",
-   "rows": 22,
-   "summary": {
-    "n": 50,
-    "p50": 0.24173999999766238,
-    "p95": 1.384835999997449,
-    "p99": 1.7339309999952093,
-    "max": 1.7339309999952093,
-    "mean": 0.40511579999903913
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B2",
-   "query": "Q3 diff W=100 join",
-   "scope": "p2000",
-   "bucket": "mid",
-   "rows": 22,
-   "summary": {
-    "n": 50,
-    "p50": 0.23802799999248236,
-    "p95": 1.2281019999936689,
-    "p99": 2.5672900000063237,
-    "max": 2.5672900000063237,
-    "mean": 0.44408443999942393
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B2",
-   "query": "Q3 diff W=100 join",
-   "scope": "p2000",
-   "bucket": "late",
-   "rows": 22,
-   "summary": {
-    "n": 50,
-    "p50": 0.15132099999755155,
-    "p95": 0.7086430000053952,
-    "p99": 1.1703229999984615,
-    "max": 1.1703229999984615,
-    "mean": 0.25189807999966435
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B2",
-   "query": "Q3 diff W=5000 flags",
-   "scope": "p2000",
-   "bucket": "all",
-   "rows": 1198,
-   "summary": {
-    "n": 150,
-    "p50": 3.416440999993938,
-    "p95": 14.799314999996568,
-    "p99": 33.07867800000531,
-    "max": 33.29191699999501,
-    "mean": 5.097789480000113
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B2",
-   "query": "Q3 diff W=5000 flags",
-   "scope": "p2000",
-   "bucket": "early",
-   "rows": 1198,
-   "summary": {
-    "n": 50,
-    "p50": 3.785868000006303,
-    "p95": 12.38312899999437,
-    "p99": 23.16704899999604,
-    "max": 23.16704899999604,
-    "mean": 4.374630720000423
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B2",
-   "query": "Q3 diff W=5000 flags",
-   "scope": "p2000",
-   "bucket": "mid",
-   "rows": 1198,
-   "summary": {
-    "n": 50,
-    "p50": 3.296749999994063,
-    "p95": 17.3028529999865,
-    "p99": 33.07867800000531,
-    "max": 33.07867800000531,
-    "mean": 5.669778839999635
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B2",
-   "query": "Q3 diff W=5000 flags",
-   "scope": "p2000",
-   "bucket": "late",
-   "rows": 1198,
-   "summary": {
-    "n": 50,
-    "p50": 3.410305999990669,
-    "p95": 11.896040999999968,
-    "p99": 33.29191699999501,
-    "max": 33.29191699999501,
-    "mean": 5.248958880000282
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B2",
-   "query": "Q3 diff W=5000 join",
-   "scope": "p2000",
-   "bucket": "all",
-   "rows": 1198,
-   "summary": {
-    "n": 150,
-    "p50": 8.628245999992942,
-    "p95": 39.44513700000243,
-    "p99": 92.56608899999992,
-    "max": 98.81453400000464,
-    "mean": 13.461770499999597
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B2",
-   "query": "Q3 diff W=5000 join",
-   "scope": "p2000",
-   "bucket": "early",
-   "rows": 1198,
-   "summary": {
-    "n": 50,
-    "p50": 7.849771000008332,
-    "p95": 25.296912999998312,
-    "p99": 61.75513499999943,
-    "max": 61.75513499999943,
-    "mean": 11.640583720000286
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B2",
-   "query": "Q3 diff W=5000 join",
-   "scope": "p2000",
-   "bucket": "mid",
-   "rows": 1198,
-   "summary": {
-    "n": 50,
-    "p50": 9.468458999996074,
-    "p95": 45.28178499999922,
-    "p99": 92.56608899999992,
-    "max": 92.56608899999992,
-    "mean": 15.395569020000112
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B2",
-   "query": "Q3 diff W=5000 join",
-   "scope": "p2000",
-   "bucket": "late",
-   "rows": 1198,
-   "summary": {
-    "n": 50,
-    "p50": 8.298937999992631,
-    "p95": 29.239982999992208,
-    "p99": 98.81453400000464,
-    "max": 98.81453400000464,
-    "mean": 13.34915875999839
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B2",
-   "query": "Q4d commits of page",
-   "scope": "200/page",
-   "bucket": "all",
-   "rows": 201,
-   "summary": {
-    "n": 150,
-    "p50": 1.9194120000029216,
-    "p95": 2.3276180000102613,
-    "p99": 2.712327000001096,
-    "max": 2.931830000001355,
-    "mean": 1.898943346666735
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B2",
-   "query": "Q4d commits of page",
-   "scope": "200/page",
-   "bucket": "mid",
-   "rows": 201,
-   "summary": {
-    "n": 150,
-    "p50": 1.9194120000029216,
-    "p95": 2.3276180000102613,
-    "p99": 2.712327000001096,
-    "max": 2.931830000001355,
-    "mean": 1.898943346666735
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B3",
-   "query": "Q2 page@T",
-   "scope": "p2000",
-   "bucket": "all",
-   "rows": 1839,
-   "summary": {
-    "n": 300,
-    "p50": 7.289517000011983,
-    "p95": 10.934394000010798,
-    "p99": 13.00306499999715,
-    "max": 14.499133999997866,
-    "mean": 7.428488196666876
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B3",
-   "query": "Q2 page@T",
-   "scope": "p2000",
-   "bucket": "early",
-   "rows": 1839,
-   "summary": {
-    "n": 100,
-    "p50": 5.762291999999434,
-    "p95": 8.607176999998046,
-    "p99": 9.29478399999789,
-    "max": 9.94983100000536,
-    "mean": 5.96722534999979
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B3",
-   "query": "Q2 page@T",
-   "scope": "p2000",
-   "bucket": "mid",
-   "rows": 1839,
-   "summary": {
-    "n": 100,
-    "p50": 7.448169000010239,
-    "p95": 9.542325000002165,
-    "p99": 10.934394000010798,
-    "max": 13.00306499999715,
-    "mean": 7.425586070001009
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B3",
-   "query": "Q2 page@T",
-   "scope": "p2000",
-   "bucket": "late",
-   "rows": 1839,
-   "summary": {
-    "n": 100,
-    "p50": 8.610509999998612,
-    "p95": 12.20199099999445,
-    "p99": 13.198540999990655,
-    "max": 14.499133999997866,
-    "mean": 8.89265316999983
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B3",
-   "query": "Q2 page@T",
-   "scope": "p10000",
-   "bucket": "all",
-   "rows": 8716,
-   "summary": {
-    "n": 100,
-    "p50": 32.78145999999833,
-    "p95": 41.658027999990736,
-    "p99": 42.87959099998989,
-    "max": 48.65979900000093,
-    "mean": 32.40283621000053
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B3",
-   "query": "Q2 page@T",
-   "scope": "p10000",
-   "bucket": "early",
-   "rows": 8716,
-   "summary": {
-    "n": 34,
-    "p50": 24.62550999999803,
-    "p95": 32.57092700000794,
-    "p99": 40.280684999990626,
-    "max": 40.280684999990626,
-    "mean": 24.842633529413007
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B3",
-   "query": "Q2 page@T",
-   "scope": "p10000",
-   "bucket": "mid",
-   "rows": 8716,
-   "summary": {
-    "n": 33,
-    "p50": 32.78145999999833,
-    "p95": 42.30878800000937,
-    "p99": 48.65979900000093,
-    "max": 48.65979900000093,
-    "mean": 34.12215848485005
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B3",
-   "query": "Q2 page@T",
-   "scope": "p10000",
-   "bucket": "late",
-   "rows": 8716,
-   "summary": {
-    "n": 33,
-    "p50": 38.473234000004595,
-    "p95": 42.81392100000812,
-    "p99": 42.87959099998989,
-    "max": 42.87959099998989,
-    "mean": 38.472813666665445
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B3",
-   "query": "Q2 page@T no-content",
-   "scope": "p2000",
-   "bucket": "all",
-   "rows": 1839,
-   "summary": {
-    "n": 300,
-    "p50": 6.460221000001184,
-    "p95": 11.4225940000033,
-    "p99": 13.468931999988854,
-    "max": 23.068104000005405,
-    "mean": 6.918522126666261
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B3",
-   "query": "Q2 page@T no-content",
-   "scope": "p2000",
-   "bucket": "early",
-   "rows": 1839,
-   "summary": {
-    "n": 100,
-    "p50": 4.698134999998729,
-    "p95": 8.004607999988366,
-    "p99": 9.610603000008268,
-    "max": 23.068104000005405,
-    "mean": 5.1328957599996645
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B3",
-   "query": "Q2 page@T no-content",
-   "scope": "p2000",
-   "bucket": "mid",
-   "rows": 1839,
-   "summary": {
-    "n": 100,
-    "p50": 7.06602300000668,
-    "p95": 10.266818000003695,
-    "p99": 11.4225940000033,
-    "max": 12.18681800000195,
-    "mean": 6.971862719999626
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B3",
-   "query": "Q2 page@T no-content",
-   "scope": "p2000",
-   "bucket": "late",
-   "rows": 1839,
-   "summary": {
-    "n": 100,
-    "p50": 8.280087999999523,
-    "p95": 13.399881999997888,
-    "p99": 13.872434000004432,
-    "max": 15.803166000012425,
-    "mean": 8.65080789999949
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B3",
-   "query": "Q1 vp500 read+js-order",
-   "scope": "p2000",
-   "bucket": "all",
-   "rows": 500,
-   "summary": {
-    "n": 300,
-    "p50": 7.6632620000018505,
-    "p95": 11.314925999991829,
-    "p99": 13.283803999991505,
-    "max": 13.53794399999606,
-    "mean": 7.7432723666664485
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B3",
-   "query": "Q1 vp500 read+js-order",
-   "scope": "p2000",
-   "bucket": "early",
-   "rows": 500,
-   "summary": {
-    "n": 100,
-    "p50": 6.034507000003941,
-    "p95": 8.041645999997854,
-    "p99": 8.764321000009659,
-    "max": 9.720344000001205,
-    "mean": 6.213483810000034
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B3",
-   "query": "Q1 vp500 read+js-order",
-   "scope": "p2000",
-   "bucket": "mid",
-   "rows": 500,
-   "summary": {
-    "n": 100,
-    "p50": 7.6632620000018505,
-    "p95": 10.052374999999302,
-    "p99": 12.037601999996696,
-    "max": 13.376665000003413,
-    "mean": 7.777613139999448
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B3",
-   "query": "Q1 vp500 read+js-order",
-   "scope": "p2000",
-   "bucket": "late",
-   "rows": 500,
-   "summary": {
-    "n": 100,
-    "p50": 9.129409000001033,
-    "p95": 12.508657999991556,
-    "p99": 13.517649999994319,
-    "max": 13.53794399999606,
-    "mean": 9.238720149999862
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B3",
-   "query": "Q1 vp500 read+js-order",
-   "scope": "p10000",
-   "bucket": "all",
-   "rows": 500,
-   "summary": {
-    "n": 100,
-    "p50": 38.52271999999357,
-    "p95": 50.523904000001494,
-    "p99": 55.36051800000132,
-    "max": 59.39352399999916,
-    "mean": 38.00160670999889
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B3",
-   "query": "Q1 vp500 read+js-order",
-   "scope": "p10000",
-   "bucket": "early",
-   "rows": 500,
-   "summary": {
-    "n": 34,
-    "p50": 30.395845999999437,
-    "p95": 38.75675400000182,
-    "p99": 43.68490300000121,
-    "max": 43.68490300000121,
-    "mean": 30.024145264704096
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B3",
-   "query": "Q1 vp500 read+js-order",
-   "scope": "p10000",
-   "bucket": "mid",
-   "rows": 500,
-   "summary": {
-    "n": 33,
-    "p50": 38.52271999999357,
-    "p95": 49.28102199999557,
-    "p99": 55.36051800000132,
-    "max": 55.36051800000132,
-    "mean": 39.73372703030129
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B3",
-   "query": "Q1 vp500 read+js-order",
-   "scope": "p10000",
-   "bucket": "late",
-   "rows": 500,
-   "summary": {
-    "n": 33,
-    "p50": 43.37446900000214,
-    "p95": 54.87774999999965,
-    "p99": 59.39352399999916,
-    "max": 59.39352399999916,
-    "mean": 44.488689090909304
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B3",
-   "query": "Q3 diff W=1 flags",
-   "scope": "p2000",
-   "bucket": "all",
-   "rows": 1,
-   "summary": {
-    "n": 150,
-    "p50": 0.015930000008665957,
-    "p95": 0.051545000009355135,
-    "p99": 0.14472999999998137,
-    "max": 0.1640719999995781,
-    "mean": 0.022258560000239715
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B3",
-   "query": "Q3 diff W=1 flags",
-   "scope": "p2000",
-   "bucket": "early",
-   "rows": 1,
-   "summary": {
-    "n": 50,
-    "p50": 0.016101000001071952,
-    "p95": 0.051545000009355135,
-    "p99": 0.054320000010193326,
-    "max": 0.054320000010193326,
-    "mean": 0.020839919999998527
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B3",
-   "query": "Q3 diff W=1 flags",
-   "scope": "p2000",
-   "bucket": "mid",
-   "rows": 1,
-   "summary": {
-    "n": 50,
-    "p50": 0.016134000004967675,
-    "p95": 0.062433999992208555,
-    "p99": 0.1640719999995781,
-    "max": 0.1640719999995781,
-    "mean": 0.026559520000591873
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B3",
-   "query": "Q3 diff W=1 flags",
-   "scope": "p2000",
-   "bucket": "late",
-   "rows": 1,
-   "summary": {
-    "n": 50,
-    "p50": 0.01556200000050012,
-    "p95": 0.03937199999927543,
-    "p99": 0.08159600000362843,
-    "max": 0.08159600000362843,
-    "mean": 0.019376240000128747
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B3",
-   "query": "Q3 diff W=1 join",
-   "scope": "p2000",
-   "bucket": "all",
-   "rows": 1,
-   "summary": {
-    "n": 150,
-    "p50": 0.022257999997236766,
-    "p95": 0.19373800000175834,
-    "p99": 0.38853099998959806,
-    "max": 0.6947829999990063,
-    "mean": 0.0505185533335316
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B3",
-   "query": "Q3 diff W=1 join",
-   "scope": "p2000",
-   "bucket": "early",
-   "rows": 1,
-   "summary": {
-    "n": 50,
-    "p50": 0.02216799999587238,
-    "p95": 0.13155700000061188,
-    "p99": 0.21121900000434835,
-    "max": 0.21121900000434835,
-    "mean": 0.04128803999978117
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B3",
-   "query": "Q3 diff W=1 join",
-   "scope": "p2000",
-   "bucket": "mid",
-   "rows": 1,
-   "summary": {
-    "n": 50,
-    "p50": 0.02312500000698492,
-    "p95": 0.21081899999990128,
-    "p99": 0.6947829999990063,
-    "max": 0.6947829999990063,
-    "mean": 0.0670606200004113
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B3",
-   "query": "Q3 diff W=1 join",
-   "scope": "p2000",
-   "bucket": "late",
-   "rows": 1,
-   "summary": {
-    "n": 50,
-    "p50": 0.021590999996988103,
-    "p95": 0.1798819999967236,
-    "p99": 0.2541720000008354,
-    "max": 0.2541720000008354,
-    "mean": 0.04320700000040233
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B3",
-   "query": "Q3 diff W=100 flags",
-   "scope": "p2000",
-   "bucket": "all",
-   "rows": 22,
-   "summary": {
-    "n": 150,
-    "p50": 0.0674929999950109,
-    "p95": 0.29170000000158325,
-    "p99": 0.5149169999931473,
-    "max": 0.6522070000064559,
-    "mean": 0.09911412666648782
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B3",
-   "query": "Q3 diff W=100 flags",
-   "scope": "p2000",
-   "bucket": "early",
-   "rows": 22,
-   "summary": {
-    "n": 50,
-    "p50": 0.07289199999650009,
-    "p95": 0.32908799999859184,
-    "p99": 0.4273839999950724,
-    "max": 0.4273839999950724,
-    "mean": 0.1057452400017064
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B3",
-   "query": "Q3 diff W=100 flags",
-   "scope": "p2000",
-   "bucket": "mid",
-   "rows": 22,
-   "summary": {
-    "n": 50,
-    "p50": 0.06901599999400787,
-    "p95": 0.2917159999924479,
-    "p99": 0.6522070000064559,
-    "max": 0.6522070000064559,
-    "mean": 0.11816701999865473
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B3",
-   "query": "Q3 diff W=100 flags",
-   "scope": "p2000",
-   "bucket": "late",
-   "rows": 22,
-   "summary": {
-    "n": 50,
-    "p50": 0.050444000007701106,
-    "p95": 0.18271500000264496,
-    "p99": 0.29670800000894815,
-    "max": 0.29670800000894815,
-    "mean": 0.07343011999910232
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B3",
-   "query": "Q3 diff W=100 join",
-   "scope": "p2000",
-   "bucket": "all",
-   "rows": 22,
-   "summary": {
-    "n": 150,
-    "p50": 0.20521099999314174,
-    "p95": 1.175165000007837,
-    "p99": 2.3817239999916637,
-    "max": 2.5305610000068555,
-    "mean": 0.3683915066684131
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B3",
-   "query": "Q3 diff W=100 join",
-   "scope": "p2000",
-   "bucket": "early",
-   "rows": 22,
-   "summary": {
-    "n": 50,
-    "p50": 0.24455099999613594,
-    "p95": 1.3784860000014305,
-    "p99": 1.82544699999562,
-    "max": 1.82544699999562,
-    "mean": 0.4080171800017706
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B3",
-   "query": "Q3 diff W=100 join",
-   "scope": "p2000",
-   "bucket": "mid",
-   "rows": 22,
-   "summary": {
-    "n": 50,
-    "p50": 0.24377300000924151,
-    "p95": 1.195638000004692,
-    "p99": 2.5305610000068555,
-    "max": 2.5305610000068555,
-    "mean": 0.4508755400017253
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B3",
-   "query": "Q3 diff W=100 join",
-   "scope": "p2000",
-   "bucket": "late",
-   "rows": 22,
-   "summary": {
-    "n": 50,
-    "p50": 0.1475910000008298,
-    "p95": 0.7475340000091819,
-    "p99": 1.1857920000038575,
-    "max": 1.1857920000038575,
-    "mean": 0.24628180000174324
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B3",
-   "query": "Q3 diff W=5000 flags",
-   "scope": "p2000",
-   "bucket": "all",
-   "rows": 1198,
-   "summary": {
-    "n": 150,
-    "p50": 2.9504650000017136,
-    "p95": 13.258762999990722,
-    "p99": 33.50760799999989,
-    "max": 33.82868299999973,
-    "mean": 4.268636013333744
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B3",
-   "query": "Q3 diff W=5000 flags",
-   "scope": "p2000",
-   "bucket": "early",
-   "rows": 1198,
-   "summary": {
-    "n": 50,
-    "p50": 2.9434850000106962,
-    "p95": 9.915692999988096,
-    "p99": 13.258762999990722,
-    "max": 13.258762999990722,
-    "mean": 3.625121260001033
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B3",
-   "query": "Q3 diff W=5000 flags",
-   "scope": "p2000",
-   "bucket": "mid",
-   "rows": 1198,
-   "summary": {
-    "n": 50,
-    "p50": 2.9632369999890216,
-    "p95": 14.442642000009073,
-    "p99": 33.82868299999973,
-    "max": 33.82868299999973,
-    "mean": 4.981633339999826
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B3",
-   "query": "Q3 diff W=5000 flags",
-   "scope": "p2000",
-   "bucket": "late",
-   "rows": 1198,
-   "summary": {
-    "n": 50,
-    "p50": 2.8792370000010123,
-    "p95": 9.757612000001245,
-    "p99": 33.50760799999989,
-    "max": 33.50760799999989,
-    "mean": 4.199153440000373
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B3",
-   "query": "Q3 diff W=5000 join",
-   "scope": "p2000",
-   "bucket": "all",
-   "rows": 1198,
-   "summary": {
-    "n": 150,
-    "p50": 8.527313999991748,
-    "p95": 38.929564000005485,
-    "p99": 87.2503299999953,
-    "max": 97.46396000000823,
-    "mean": 12.62329844666645
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B3",
-   "query": "Q3 diff W=5000 join",
-   "scope": "p2000",
-   "bucket": "early",
-   "rows": 1198,
-   "summary": {
-    "n": 50,
-    "p50": 8.657970000000205,
-    "p95": 28.326115000003483,
-    "p99": 52.376058000008925,
-    "max": 52.376058000008925,
-    "mean": 11.04475744000054
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B3",
-   "query": "Q3 diff W=5000 join",
-   "scope": "p2000",
-   "bucket": "mid",
-   "rows": 1198,
-   "summary": {
-    "n": 50,
-    "p50": 8.573860999997123,
-    "p95": 41.44886499999848,
-    "p99": 87.2503299999953,
-    "max": 87.2503299999953,
-    "mean": 14.335493639998603
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B3",
-   "query": "Q3 diff W=5000 join",
-   "scope": "p2000",
-   "bucket": "late",
-   "rows": 1198,
-   "summary": {
-    "n": 50,
-    "p50": 8.196775000003981,
-    "p95": 31.135823000004166,
-    "p99": 97.46396000000823,
-    "max": 97.46396000000823,
-    "mean": 12.489644260000205
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B3",
-   "query": "Q4d commits of page",
-   "scope": "200/page",
-   "bucket": "all",
-   "rows": 201,
-   "summary": {
-    "n": 150,
-    "p50": 2.0328499999886844,
-    "p95": 2.4861040000105277,
-    "p99": 2.7790510000049835,
-    "max": 3.295780000000377,
-    "mean": 2.0085606600005605
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B3",
-   "query": "Q4d commits of page",
-   "scope": "200/page",
-   "bucket": "mid",
-   "rows": 201,
-   "summary": {
-    "n": 150,
-    "p50": 2.0328499999886844,
-    "p95": 2.4861040000105277,
-    "p99": 2.7790510000049835,
-    "max": 3.295780000000377,
-    "mean": 2.0085606600005605
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q2 page@T",
-   "scope": "p2000",
-   "bucket": "all",
-   "rows": 1839,
-   "summary": {
-    "n": 300,
-    "p50": 8.263666999991983,
-    "p95": 13.19187399999646,
-    "p99": 15.968380000005709,
-    "max": 16.38789500000712,
-    "mean": 8.458082300000097
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q2 page@T",
-   "scope": "p2000",
-   "bucket": "early",
-   "rows": 1839,
-   "summary": {
-    "n": 100,
-    "p50": 6.925736999997753,
-    "p95": 9.542610999997123,
-    "p99": 10.636308000001009,
-    "max": 11.451138999997056,
-    "mean": 6.702069559999945
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q2 page@T",
-   "scope": "p2000",
-   "bucket": "mid",
-   "rows": 1839,
-   "summary": {
-    "n": 100,
-    "p50": 8.24529399999301,
-    "p95": 11.429808000000776,
-    "p99": 14.29680300000473,
-    "max": 15.998779000001377,
-    "mean": 8.395328109999973
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q2 page@T",
-   "scope": "p2000",
-   "bucket": "late",
-   "rows": 1839,
-   "summary": {
-    "n": 100,
-    "p50": 9.814440000001923,
-    "p95": 15.100321999998414,
-    "p99": 16.19655199999397,
-    "max": 16.38789500000712,
-    "mean": 10.276849230000371
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q2 page@T",
-   "scope": "p10000",
-   "bucket": "all",
-   "rows": 8716,
-   "summary": {
-    "n": 100,
-    "p50": 38.15430300000298,
-    "p95": 52.29304600000614,
-    "p99": 62.62944500001322,
-    "max": 69.31528400001116,
-    "mean": 38.17242676999987
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q2 page@T",
-   "scope": "p10000",
-   "bucket": "early",
-   "rows": 8716,
-   "summary": {
-    "n": 34,
-    "p50": 28.97846299999219,
-    "p95": 40.31115399999544,
-    "p99": 45.89113000000361,
-    "max": 45.89113000000361,
-    "mean": 29.047282970587464
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q2 page@T",
-   "scope": "p10000",
-   "bucket": "mid",
-   "rows": 8716,
-   "summary": {
-    "n": 33,
-    "p50": 38.15430300000298,
-    "p95": 52.18858600000385,
-    "p99": 62.62944500001322,
-    "max": 62.62944500001322,
-    "mean": 39.135054454546086
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q2 page@T",
-   "scope": "p10000",
-   "bucket": "late",
-   "rows": 8716,
-   "summary": {
-    "n": 33,
-    "p50": 45.30778499999724,
-    "p95": 59.437380999996094,
-    "p99": 69.31528400001116,
-    "max": 69.31528400001116,
-    "mean": 46.61146239393918
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q1 vp500 read+js-order",
-   "scope": "p2000",
-   "bucket": "all",
-   "rows": 500,
-   "summary": {
-    "n": 300,
-    "p50": 8.220910000003641,
-    "p95": 12.38499099999899,
-    "p99": 15.96750799997244,
-    "max": 27.131366000015987,
-    "mean": 8.435718776667587
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q1 vp500 read+js-order",
-   "scope": "p2000",
-   "bucket": "early",
-   "rows": 500,
-   "summary": {
-    "n": 100,
-    "p50": 6.706036000017775,
-    "p95": 9.25500699999975,
-    "p99": 10.431400000001304,
-    "max": 11.406996000005165,
-    "mean": 6.833515330002119
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q1 vp500 read+js-order",
-   "scope": "p2000",
-   "bucket": "mid",
-   "rows": 500,
-   "summary": {
-    "n": 100,
-    "p50": 7.984444999980042,
-    "p95": 10.763390999985859,
-    "p99": 12.2846669999999,
-    "max": 13.128788999980316,
-    "mean": 8.22270583000005
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q1 vp500 read+js-order",
-   "scope": "p2000",
-   "bucket": "late",
-   "rows": 500,
-   "summary": {
-    "n": 100,
-    "p50": 9.614417000004323,
-    "p95": 15.012768999993568,
-    "p99": 21.116970000002766,
-    "max": 27.131366000015987,
-    "mean": 10.250935170000593
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q1 vp500 read+js-order",
-   "scope": "p10000",
-   "bucket": "all",
-   "rows": 500,
-   "summary": {
-    "n": 100,
-    "p50": 40.443037999997614,
-    "p95": 53.36831099999836,
-    "p99": 61.676235999999335,
-    "max": 66.99133399999118,
-    "mean": 40.17104060999904
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q1 vp500 read+js-order",
-   "scope": "p10000",
-   "bucket": "early",
-   "rows": 500,
-   "summary": {
-    "n": 34,
-    "p50": 30.57708100002492,
-    "p95": 38.571492000017315,
-    "p99": 47.66375199999311,
-    "max": 47.66375199999311,
-    "mean": 31.18289532352869
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q1 vp500 read+js-order",
-   "scope": "p10000",
-   "bucket": "mid",
-   "rows": 500,
-   "summary": {
-    "n": 33,
-    "p50": 40.443037999997614,
-    "p95": 53.1989149999863,
-    "p99": 55.322529999975814,
-    "max": 55.322529999975814,
-    "mean": 41.97426736363118
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q1 vp500 read+js-order",
-   "scope": "p10000",
-   "bucket": "late",
-   "rows": 500,
-   "summary": {
-    "n": 33,
-    "p50": 45.86217300000135,
-    "p95": 61.676235999999335,
-    "p99": 66.99133399999118,
-    "max": 66.99133399999118,
-    "mean": 47.62832718182119
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q2s structure only",
-   "scope": "p2000",
-   "bucket": "all",
-   "rows": 1839,
-   "summary": {
-    "n": 300,
-    "p50": 2.7135049999924377,
-    "p95": 9.049536999984412,
-    "p99": 11.012214999995194,
-    "max": 115.95927500000107,
-    "mean": 4.0973528899988745
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q2s structure only",
-   "scope": "p2000",
-   "bucket": "early",
-   "rows": 1839,
-   "summary": {
-    "n": 100,
-    "p50": 1.8386520000058226,
-    "p95": 5.237159000011161,
-    "p99": 6.99456600000849,
-    "max": 115.95927500000107,
-    "mean": 3.3957411999980103
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q2s structure only",
-   "scope": "p2000",
-   "bucket": "mid",
-   "rows": 1839,
-   "summary": {
-    "n": 100,
-    "p50": 3.0558180000225548,
-    "p95": 7.5207030000165105,
-    "p99": 9.17586799999117,
-    "max": 9.827418000000762,
-    "mean": 3.7314079999993557
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q2s structure only",
-   "scope": "p2000",
-   "bucket": "late",
-   "rows": 1839,
-   "summary": {
-    "n": 100,
-    "p50": 4.456181999994442,
-    "p95": 10.424108000006527,
-    "p99": 11.96935199998552,
-    "max": 15.190013999992516,
-    "mean": 5.164909469999256
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q1 vp500 two-step",
-   "scope": "p2000",
-   "bucket": "all",
-   "rows": 500,
-   "summary": {
-    "n": 300,
-    "p50": 7.2780820000043605,
-    "p95": 11.345477000024403,
-    "p99": 13.518745000008494,
-    "max": 18.6788499999966,
-    "mean": 7.540484353333207
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q1 vp500 two-step",
-   "scope": "p2000",
-   "bucket": "early",
-   "rows": 500,
-   "summary": {
-    "n": 100,
-    "p50": 6.253318000002764,
-    "p95": 10.039728000003379,
-    "p99": 10.957003999996232,
-    "max": 11.306800000020303,
-    "mean": 6.53082054000115
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q1 vp500 two-step",
-   "scope": "p2000",
-   "bucket": "mid",
-   "rows": 500,
-   "summary": {
-    "n": 100,
-    "p50": 6.900794000015594,
-    "p95": 11.137995999975828,
-    "p99": 13.02250599997933,
-    "max": 13.518745000008494,
-    "mean": 7.422621469999722
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q1 vp500 two-step",
-   "scope": "p2000",
-   "bucket": "late",
-   "rows": 500,
-   "summary": {
-    "n": 100,
-    "p50": 8.100633000023663,
-    "p95": 12.871358999982476,
-    "p99": 14.324602000007872,
-    "max": 18.6788499999966,
-    "mean": 8.66801104999875
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q2s structure only",
-   "scope": "p10000",
-   "bucket": "all",
-   "rows": 8716,
-   "summary": {
-    "n": 100,
-    "p50": 13.581219000014244,
-    "p95": 24.483004000008805,
-    "p99": 27.865629000007175,
-    "max": 38.53878699999768,
-    "mean": 13.908437389999163
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q2s structure only",
-   "scope": "p10000",
-   "bucket": "early",
-   "rows": 8716,
-   "summary": {
-    "n": 34,
-    "p50": 8.192191000009188,
-    "p95": 10.97723199997563,
-    "p99": 13.852336000010837,
-    "max": 13.852336000010837,
-    "mean": 7.950161764704664
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q2s structure only",
-   "scope": "p10000",
-   "bucket": "mid",
-   "rows": 8716,
-   "summary": {
-    "n": 33,
-    "p50": 13.581219000014244,
-    "p95": 18.416193999990355,
-    "p99": 38.53878699999768,
-    "max": 38.53878699999768,
-    "mean": 14.30961551514867
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q2s structure only",
-   "scope": "p10000",
-   "bucket": "late",
-   "rows": 8716,
-   "summary": {
-    "n": 33,
-    "p50": 19.06583999999566,
-    "p95": 27.595321000000695,
-    "p99": 27.865629000007175,
-    "max": 27.865629000007175,
-    "mean": 19.646088696971262
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q1 vp500 two-step",
-   "scope": "p10000",
-   "bucket": "all",
-   "rows": 500,
-   "summary": {
-    "n": 100,
-    "p50": 20.30122900000424,
-    "p95": 28.25575100001879,
-    "p99": 30.246761999995215,
-    "max": 40.32233399999677,
-    "mean": 20.019703030000382
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q1 vp500 two-step",
-   "scope": "p10000",
-   "bucket": "early",
-   "rows": 500,
-   "summary": {
-    "n": 34,
-    "p50": 13.530637000018032,
-    "p95": 18.446400999993784,
-    "p99": 24.62011899999925,
-    "max": 24.62011899999925,
-    "mean": 14.510415058826124
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q1 vp500 two-step",
-   "scope": "p10000",
-   "bucket": "mid",
-   "rows": 500,
-   "summary": {
-    "n": 33,
-    "p50": 20.30122900000424,
-    "p95": 23.291029000014532,
-    "p99": 28.41707399999723,
-    "max": 28.41707399999723,
-    "mean": 19.971465787877662
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q1 vp500 two-step",
-   "scope": "p10000",
-   "bucket": "late",
-   "rows": 500,
-   "summary": {
-    "n": 33,
-    "p50": 24.89255800002138,
-    "p95": 30.246761999995215,
-    "p99": 40.32233399999677,
-    "max": 40.32233399999677,
-    "mean": 25.744176363635976
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q3 diff W=1 flags",
-   "scope": "p2000",
-   "bucket": "all",
-   "rows": 1,
-   "summary": {
-    "n": 150,
-    "p50": 0.01630200000363402,
-    "p95": 0.05007200001273304,
-    "p99": 0.08717799998703413,
-    "max": 0.19212200000765733,
-    "mean": 0.02213882000146744
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q3 diff W=1 flags",
-   "scope": "p2000",
-   "bucket": "early",
-   "rows": 1,
-   "summary": {
-    "n": 50,
-    "p50": 0.016666999988956377,
-    "p95": 0.05532699998002499,
-    "p99": 0.0650690000038594,
-    "max": 0.0650690000038594,
-    "mean": 0.02122186000167858
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q3 diff W=1 flags",
-   "scope": "p2000",
-   "bucket": "mid",
-   "rows": 1,
-   "summary": {
-    "n": 50,
-    "p50": 0.01541899997391738,
-    "p95": 0.060582000005524606,
-    "p99": 0.19212200000765733,
-    "max": 0.19212200000765733,
-    "mean": 0.02461978000239469
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q3 diff W=1 flags",
-   "scope": "p2000",
-   "bucket": "late",
-   "rows": 1,
-   "summary": {
-    "n": 50,
-    "p50": 0.016337999986717477,
-    "p95": 0.045058000017888844,
-    "p99": 0.07486200000857934,
-    "max": 0.07486200000857934,
-    "mean": 0.020574820000329053
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q3 diff W=1 join",
-   "scope": "p2000",
-   "bucket": "all",
-   "rows": 1,
-   "summary": {
-    "n": 150,
-    "p50": 0.020915000000968575,
-    "p95": 0.15388600001460873,
-    "p99": 0.34750000000349246,
-    "max": 0.652907999989111,
-    "mean": 0.04825709333371681
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q3 diff W=1 join",
-   "scope": "p2000",
-   "bucket": "early",
-   "rows": 1,
-   "summary": {
-    "n": 50,
-    "p50": 0.023248999990755692,
-    "p95": 0.10458199999993667,
-    "p99": 0.15388600001460873,
-    "max": 0.15388600001460873,
-    "mean": 0.03902165999868885
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q3 diff W=1 join",
-   "scope": "p2000",
-   "bucket": "mid",
-   "rows": 1,
-   "summary": {
-    "n": 50,
-    "p50": 0.020818999997572973,
-    "p95": 0.26208100002259016,
-    "p99": 0.652907999989111,
-    "max": 0.652907999989111,
-    "mean": 0.0639024800027255
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q3 diff W=1 join",
-   "scope": "p2000",
-   "bucket": "late",
-   "rows": 1,
-   "summary": {
-    "n": 50,
-    "p50": 0.020915000000968575,
-    "p95": 0.20333899999968708,
-    "p99": 0.32799699998577125,
-    "max": 0.32799699998577125,
-    "mean": 0.0418471399997361
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q3 diff W=100 flags",
-   "scope": "p2000",
-   "bucket": "all",
-   "rows": 22,
-   "summary": {
-    "n": 150,
-    "p50": 0.06842799999867566,
-    "p95": 0.32415599998785183,
-    "p99": 0.5548100000014529,
-    "max": 0.6657349999877624,
-    "mean": 0.10357477333435479
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q3 diff W=100 flags",
-   "scope": "p2000",
-   "bucket": "early",
-   "rows": 22,
-   "summary": {
-    "n": 50,
-    "p50": 0.082605000003241,
-    "p95": 0.3820490000071004,
-    "p99": 0.4537830000044778,
-    "max": 0.4537830000044778,
-    "mean": 0.10985024000168778
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q3 diff W=100 flags",
-   "scope": "p2000",
-   "bucket": "mid",
-   "rows": 22,
-   "summary": {
-    "n": 50,
-    "p50": 0.06662900000810623,
-    "p95": 0.3312230000155978,
-    "p99": 0.6657349999877624,
-    "max": 0.6657349999877624,
-    "mean": 0.12627881999942475
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q3 diff W=100 flags",
-   "scope": "p2000",
-   "bucket": "late",
-   "rows": 22,
-   "summary": {
-    "n": 50,
-    "p50": 0.05622500000754371,
-    "p95": 0.17410599999129772,
-    "p99": 0.33068300000741147,
-    "max": 0.33068300000741147,
-    "mean": 0.07459526000195182
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q3 diff W=100 join",
-   "scope": "p2000",
-   "bucket": "all",
-   "rows": 22,
-   "summary": {
-    "n": 150,
-    "p50": 0.20340299999224953,
-    "p95": 1.2648120000085328,
-    "p99": 2.6438450000132434,
-    "max": 2.722810000006575,
-    "mean": 0.3915851599992796
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q3 diff W=100 join",
-   "scope": "p2000",
-   "bucket": "early",
-   "rows": 22,
-   "summary": {
-    "n": 50,
-    "p50": 0.2398830000020098,
-    "p95": 1.5454489999974612,
-    "p99": 2.008049999974901,
-    "max": 2.008049999974901,
-    "mean": 0.42734787999943363
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q3 diff W=100 join",
-   "scope": "p2000",
-   "bucket": "mid",
-   "rows": 22,
-   "summary": {
-    "n": 50,
-    "p50": 0.24712200000067241,
-    "p95": 1.2648120000085328,
-    "p99": 2.722810000006575,
-    "max": 2.722810000006575,
-    "mean": 0.4724143200006802
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q3 diff W=100 join",
-   "scope": "p2000",
-   "bucket": "late",
-   "rows": 22,
-   "summary": {
-    "n": 50,
-    "p50": 0.1441820000181906,
-    "p95": 1.213618999987375,
-    "p99": 1.5159709999861661,
-    "max": 1.5159709999861661,
-    "mean": 0.27499327999772505
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q3 diff W=5000 flags",
-   "scope": "p2000",
-   "bucket": "all",
-   "rows": 1198,
-   "summary": {
-    "n": 150,
-    "p50": 2.9716110000154004,
-    "p95": 12.383088999980828,
-    "p99": 32.27114399999846,
-    "max": 38.4210890000104,
-    "mean": 4.364409166666641
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q3 diff W=5000 flags",
-   "scope": "p2000",
-   "bucket": "early",
-   "rows": 1198,
-   "summary": {
-    "n": 50,
-    "p50": 2.9809109999914654,
-    "p95": 8.055019999999786,
-    "p99": 17.307501000002958,
-    "max": 17.307501000002958,
-    "mean": 3.67783177999896
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q3 diff W=5000 flags",
-   "scope": "p2000",
-   "bucket": "mid",
-   "rows": 1198,
-   "summary": {
-    "n": 50,
-    "p50": 3.0253220000013243,
-    "p95": 14.652627000003122,
-    "p99": 32.27114399999846,
-    "max": 32.27114399999846,
-    "mean": 4.985603899999988
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q3 diff W=5000 flags",
-   "scope": "p2000",
-   "bucket": "late",
-   "rows": 1198,
-   "summary": {
-    "n": 50,
-    "p50": 2.8604790000244975,
-    "p95": 10.38604199999827,
-    "p99": 38.4210890000104,
-    "max": 38.4210890000104,
-    "mean": 4.429791820000974
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q3 diff W=5000 join",
-   "scope": "p2000",
-   "bucket": "all",
-   "rows": 1198,
-   "summary": {
-    "n": 150,
-    "p50": 9.032338999997592,
-    "p95": 40.630406000011135,
-    "p99": 92.65126700000837,
-    "max": 109.84002299999702,
-    "mean": 13.455599859999104
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q3 diff W=5000 join",
-   "scope": "p2000",
-   "bucket": "early",
-   "rows": 1198,
-   "summary": {
-    "n": 50,
-    "p50": 9.248242000001483,
-    "p95": 28.843344999972032,
-    "p99": 43.74853800001438,
-    "max": 43.74853800001438,
-    "mean": 11.55907278000086
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q3 diff W=5000 join",
-   "scope": "p2000",
-   "bucket": "mid",
-   "rows": 1198,
-   "summary": {
-    "n": 50,
-    "p50": 8.604202000016812,
-    "p95": 48.93047099999967,
-    "p99": 92.65126700000837,
-    "max": 92.65126700000837,
-    "mean": 15.707070939998957
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q3 diff W=5000 join",
-   "scope": "p2000",
-   "bucket": "late",
-   "rows": 1198,
-   "summary": {
-    "n": 50,
-    "p50": 9.032338999997592,
-    "p95": 36.542886000010185,
-    "p99": 109.84002299999702,
-    "max": 109.84002299999702,
-    "mean": 13.100655859997495
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q4d commits of page",
-   "scope": "200/page",
-   "bucket": "all",
-   "rows": 201,
-   "summary": {
-    "n": 150,
-    "p50": 2.0116930000076536,
-    "p95": 2.328628999995999,
-    "p99": 2.53007500001695,
-    "max": 2.673804999998538,
-    "mean": 1.9549793866655092
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "B5",
-   "query": "Q4d commits of page",
-   "scope": "200/page",
-   "bucket": "mid",
-   "rows": 201,
-   "summary": {
-    "n": 150,
-    "p50": 2.0116930000076536,
-    "p95": 2.328628999995999,
-    "p99": 2.53007500001695,
-    "max": 2.673804999998538,
-    "mean": 1.9549793866655092
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "C",
-   "query": "Q2 page@T",
-   "scope": "p2000",
-   "bucket": "all",
-   "rows": 1839,
-   "summary": {
-    "n": 300,
-    "p50": 13.316185000003316,
-    "p95": 17.750377999997,
-    "p99": 20.700119000015547,
-    "max": 22.263650000008056,
-    "mean": 11.84693531333304
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "C",
-   "query": "Q2 page@T",
-   "scope": "p2000",
-   "bucket": "early",
-   "rows": 1839,
-   "summary": {
-    "n": 100,
-    "p50": 13.150368000002345,
-    "p95": 16.45641899999464,
-    "p99": 20.185073999979068,
-    "max": 21.761432000028435,
-    "mean": 12.80442760999984
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "C",
-   "query": "Q2 page@T",
-   "scope": "p2000",
-   "bucket": "mid",
-   "rows": 1839,
-   "summary": {
-    "n": 100,
-    "p50": 13.323059000016656,
-    "p95": 17.35572900000261,
-    "p99": 19.775905999995302,
-    "max": 22.263650000008056,
-    "mean": 11.244788579999877
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "C",
-   "query": "Q2 page@T",
-   "scope": "p2000",
-   "bucket": "late",
-   "rows": 1839,
-   "summary": {
-    "n": 100,
-    "p50": 13.857592999993358,
-    "p95": 18.05825500001083,
-    "p99": 20.700119000015547,
-    "max": 20.818155999993905,
-    "mean": 11.491589749999402
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "C",
-   "query": "Q2 page@T",
-   "scope": "p10000",
-   "bucket": "all",
-   "rows": 8716,
-   "summary": {
-    "n": 100,
-    "p50": 68.83133399998769,
-    "p95": 87.90250900000683,
-    "p99": 99.20688400001382,
-    "max": 103.12179200001992,
-    "mean": 70.08602879000013
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "C",
-   "query": "Q2 page@T",
-   "scope": "p10000",
-   "bucket": "early",
-   "rows": 8716,
-   "summary": {
-    "n": 34,
-    "p50": 68.83133399998769,
-    "p95": 76.89945499997702,
-    "p99": 91.73755900000106,
-    "max": 91.73755900000106,
-    "mean": 68.5316414705868
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "C",
-   "query": "Q2 page@T",
-   "scope": "p10000",
-   "bucket": "mid",
-   "rows": 8716,
-   "summary": {
-    "n": 33,
-    "p50": 71.13170299999183,
-    "p95": 91.26928799998132,
-    "p99": 99.20688400001382,
-    "max": 99.20688400001382,
-    "mean": 73.9486950000009
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "C",
-   "query": "Q2 page@T",
-   "scope": "p10000",
-   "bucket": "late",
-   "rows": 8716,
-   "summary": {
-    "n": 33,
-    "p50": 65.23555400001351,
-    "p95": 91.68315199998324,
-    "p99": 103.12179200001992,
-    "max": 103.12179200001992,
-    "mean": 67.82485254545551
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "C",
-   "query": "Q1 vp500 read+js-order",
-   "scope": "p2000",
-   "bucket": "all",
-   "rows": 500,
-   "summary": {
-    "n": 300,
-    "p50": 13.867335999995703,
-    "p95": 18.085863999993308,
-    "p99": 19.88671500000055,
-    "max": 23.07667500001844,
-    "mean": 12.331583460000596
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "C",
-   "query": "Q1 vp500 read+js-order",
-   "scope": "p2000",
-   "bucket": "early",
-   "rows": 500,
-   "summary": {
-    "n": 100,
-    "p50": 13.714345000014873,
-    "p95": 16.302017000009073,
-    "p99": 17.484582000004593,
-    "max": 17.968522000010125,
-    "mean": 13.239100320000725
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "C",
-   "query": "Q1 vp500 read+js-order",
-   "scope": "p2000",
-   "bucket": "mid",
-   "rows": 500,
-   "summary": {
-    "n": 100,
-    "p50": 14.214332999981707,
-    "p95": 16.983468999998877,
-    "p99": 19.347108999994816,
-    "max": 21.815380999993067,
-    "mean": 11.846025450000306
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "C",
-   "query": "Q1 vp500 read+js-order",
-   "scope": "p2000",
-   "bucket": "late",
-   "rows": 500,
-   "summary": {
-    "n": 100,
-    "p50": 14.281048000004375,
-    "p95": 18.970387999986997,
-    "p99": 23.04503300000215,
-    "max": 23.07667500001844,
-    "mean": 11.909624610000755
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "C",
-   "query": "Q1 vp500 read+js-order",
-   "scope": "p10000",
-   "bucket": "all",
-   "rows": 500,
-   "summary": {
-    "n": 100,
-    "p50": 75.65142599999672,
-    "p95": 95.6572500000184,
-    "p99": 119.9852269999974,
-    "max": 128.1958980000054,
-    "mean": 77.69712895000092
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "C",
-   "query": "Q1 vp500 read+js-order",
-   "scope": "p10000",
-   "bucket": "early",
-   "rows": 500,
-   "summary": {
-    "n": 34,
-    "p50": 75.68363499999396,
-    "p95": 95.6572500000184,
-    "p99": 128.1958980000054,
-    "max": 128.1958980000054,
-    "mean": 78.169876205883
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "C",
-   "query": "Q1 vp500 read+js-order",
-   "scope": "p10000",
-   "bucket": "mid",
-   "rows": 500,
-   "summary": {
-    "n": 33,
-    "p50": 78.96643999998923,
-    "p95": 108.77531900000758,
-    "p99": 119.9852269999974,
-    "max": 119.9852269999974,
-    "mean": 80.91694206060933
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "C",
-   "query": "Q1 vp500 read+js-order",
-   "scope": "p10000",
-   "bucket": "late",
-   "rows": 500,
-   "summary": {
-    "n": 33,
-    "p50": 71.20344299997669,
-    "p95": 93.05988400001661,
-    "p99": 103.12094800002524,
-    "max": 103.12094800002524,
-    "mean": 73.99024290908974
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "C",
-   "query": "Q3 diff W=1",
-   "scope": "p2000",
-   "bucket": "all",
-   "rows": 1,
-   "summary": {
-    "n": 150,
-    "p50": 5.068854999990435,
-    "p95": 6.449845999974059,
-    "p99": 7.154781999997795,
-    "max": 7.392334000003757,
-    "mean": 4.438962246669107
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "C",
-   "query": "Q3 diff W=1",
-   "scope": "p2000",
-   "bucket": "early",
-   "rows": 1,
-   "summary": {
-    "n": 50,
-    "p50": 5.2956300000078045,
-    "p95": 6.25994200000423,
-    "p99": 6.491733000002569,
-    "max": 6.491733000002569,
-    "mean": 4.54823408000404
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "C",
-   "query": "Q3 diff W=1",
-   "scope": "p2000",
-   "bucket": "mid",
-   "rows": 1,
-   "summary": {
-    "n": 50,
-    "p50": 5.06501500000013,
-    "p95": 6.988073000014992,
-    "p99": 7.154781999997795,
-    "max": 7.154781999997795,
-    "mean": 4.207124980001827
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "C",
-   "query": "Q3 diff W=1",
-   "scope": "p2000",
-   "bucket": "late",
-   "rows": 1,
-   "summary": {
-    "n": 50,
-    "p50": 5.031228000007104,
-    "p95": 6.392351999995299,
-    "p99": 7.392334000003757,
-    "max": 7.392334000003757,
-    "mean": 4.561527680001454
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "C",
-   "query": "Q3 diff W=100",
-   "scope": "p2000",
-   "bucket": "all",
-   "rows": 23,
-   "summary": {
-    "n": 150,
-    "p50": 5.121562000014819,
-    "p95": 6.199060999992071,
-    "p99": 6.843640000006417,
-    "max": 6.917937999998685,
-    "mean": 4.567753020000722
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "C",
-   "query": "Q3 diff W=100",
-   "scope": "p2000",
-   "bucket": "early",
-   "rows": 23,
-   "summary": {
-    "n": 50,
-    "p50": 5.099370999989333,
-    "p95": 6.00281599999289,
-    "p99": 6.917937999998685,
-    "max": 6.917937999998685,
-    "mean": 4.472745679999934
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "C",
-   "query": "Q3 diff W=100",
-   "scope": "p2000",
-   "bucket": "mid",
-   "rows": 23,
-   "summary": {
-    "n": 50,
-    "p50": 5.226642000023276,
-    "p95": 6.356245000002673,
-    "p99": 6.843640000006417,
-    "max": 6.843640000006417,
-    "mean": 4.8285537600028325
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "C",
-   "query": "Q3 diff W=100",
-   "scope": "p2000",
-   "bucket": "late",
-   "rows": 23,
-   "summary": {
-    "n": 50,
-    "p50": 4.971343000011984,
-    "p95": 6.157283999986248,
-    "p99": 6.736183999979403,
-    "max": 6.736183999979403,
-    "mean": 4.401959619999397
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "C",
-   "query": "Q3 diff W=5000",
-   "scope": "p2000",
-   "bucket": "all",
-   "rows": 1367,
-   "summary": {
-    "n": 150,
-    "p50": 9.796486000006553,
-    "p95": 30.303784999996424,
-    "p99": 81.49999599999865,
-    "max": 89.98585299999104,
-    "mean": 12.320242886667256
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "C",
-   "query": "Q3 diff W=5000",
-   "scope": "p2000",
-   "bucket": "early",
-   "rows": 1367,
-   "summary": {
-    "n": 50,
-    "p50": 9.798206000006758,
-    "p95": 18.35723200000939,
-    "p99": 36.13698999999906,
-    "max": 36.13698999999906,
-    "mean": 11.064109220000683
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "C",
-   "query": "Q3 diff W=5000",
-   "scope": "p2000",
-   "bucket": "mid",
-   "rows": 1367,
-   "summary": {
-    "n": 50,
-    "p50": 9.71411800000351,
-    "p95": 31.77504000000772,
-    "p99": 89.98585299999104,
-    "max": 89.98585299999104,
-    "mean": 14.0651336800016
-   }
-  },
-  {
-   "dialect": "sqlite-prod-vpb30",
-   "variant": "C",
-   "query": "Q3 diff W=5000",
-   "scope": "p2000",
-   "bucket": "late",
-   "rows": 1367,
-   "summary": {
-    "n": 50,
-    "p50": 9.675534999987576,
-    "p95": 17.77034200000344,
-    "p99": 81.49999599999865,
-    "max": 81.49999599999865,
-    "mean": 11.831485759999486
-   }
-  }
- ]
+	"label": "sqlite-prod-vpb30",
+	"meta": {
+		"info": {
+			"blocks": 110000,
+			"pages": 51,
+			"versions": 3300002,
+			"commits": 872084,
+			"members": 239953,
+			"versionsPerBlock": {
+				"mean": 30.00001818181818,
+				"p50": 11,
+				"p90": 70,
+				"p99": 226,
+				"max": 56388
+			},
+			"versionsPerCommit": {
+				"mean": 3.7840414455488234,
+				"p50": 1,
+				"p95": 15,
+				"max": 9000
+			},
+			"avgContentBytes": 392,
+			"spaceMaxSeq": [182184, 123272, 271168, 123017, 172443],
+			"flagCounts": {
+				"CREATED": 109341,
+				"CONTENT": 2728781,
+				"MOVED": 71772,
+				"DELETED": 147938,
+				"RESTORED": 117048,
+				"TASK": 195236,
+				"PAGE": 14842
+			}
+		},
+		"params": {
+			"seed": 1,
+			"spaces": 5,
+			"pagesPerSpace": 10,
+			"blocksPerPage": 2000,
+			"giantBlocks": 10000,
+			"vpb": 30,
+			"initialFraction": 0.9
+		}
+	},
+	"sizesBase": {
+		"c_space_seq": 29630464,
+		"outline_block_versions": 1968328704,
+		"outline_blocks": 46403584,
+		"outline_commits": 151613440,
+		"outline_page_members": 15134720,
+		"pk_blocks": 3280896,
+		"pk_commits": 26296320,
+		"pk_versions": 111890432,
+		"sqlite_schema": 4096,
+		"v_commit": 99467264
+	},
+	"sizesByVariant": {
+		"A2": {
+			"ix_a2": 118165504
+		},
+		"B2": {
+			"ix_b2": 124219392
+		},
+		"B3": {
+			"ix_b3": 124997632
+		},
+		"B5": {
+			"ix_b5": 290820096
+		},
+		"C": {
+			"ix_c": 9285632
+		}
+	},
+	"verifyReport": {
+		"p2000:Q2 page@T": {
+			"variants": ["A2", "B2", "B3", "B5", "C"],
+			"samples": 60,
+			"mismatches": {
+				"A2": 0,
+				"B2": 0,
+				"B3": 0,
+				"B5": 0,
+				"C": 0
+			}
+		}
+	},
+	"plans": {
+		"sqlite-prod-vpb30/A2/page2000": "CO-ROUTINE tree\nSETUP\nSEARCH x USING INDEX pk_versions (block_id=? AND from_seq<?)\nRECURSIVE STEP\nSCAN tr\nSEARCH c USING INDEX ix_a2 (parent_id=? AND from_seq<?)\nSCAN tr\nSEARCH v USING INDEX pk_versions (block_id=? AND from_seq=?)",
+		"sqlite-prod-vpb30/B2/page2000": "SEARCH v USING INDEX ix_b2 (page_id=? AND from_seq<?)",
+		"sqlite-prod-vpb30/B3/page2000": "SEARCH v USING INDEX ix_b3 (page_id=? AND from_seq<?)",
+		"sqlite-prod-vpb30/B5/page2000": "SEARCH v USING INDEX ix_b5 (page_id=? AND from_seq<?)",
+		"sqlite-prod-vpb30/C/page2000": "SEARCH m USING INDEX ix_c (page_id=? AND from_seq<?)\nSEARCH v USING INDEX pk_versions (block_id=? AND from_seq=?)\nCORRELATED SCALAR SUBQUERY 1\nSEARCH x USING COVERING INDEX pk_versions (block_id=? AND from_seq<?)"
+	},
+	"results": [
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "-",
+			"query": "Q4a commits (space)",
+			"scope": "200/page",
+			"bucket": "all",
+			"rows": 201,
+			"summary": {
+				"n": 150,
+				"p50": 0.33259300000099756,
+				"p95": 0.4159289999988687,
+				"p99": 0.5008710000001884,
+				"max": 0.6749859999999899,
+				"mean": 0.34262893333324124
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "-",
+			"query": "Q4a commits (space)",
+			"scope": "200/page",
+			"bucket": "mid",
+			"rows": 201,
+			"summary": {
+				"n": 150,
+				"p50": 0.33259300000099756,
+				"p95": 0.4159289999988687,
+				"p99": 0.5008710000001884,
+				"max": 0.6749859999999899,
+				"mean": 0.34262893333324124
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "-",
+			"query": "Q4b commits agent only",
+			"scope": "200/page",
+			"bucket": "all",
+			"rows": 201,
+			"summary": {
+				"n": 150,
+				"p50": 0.4267010000003211,
+				"p95": 0.6441860000013548,
+				"p99": 2.1190150000002177,
+				"max": 2.9422210000011546,
+				"mean": 0.4839475266666341
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "-",
+			"query": "Q4b commits agent only",
+			"scope": "200/page",
+			"bucket": "mid",
+			"rows": 201,
+			"summary": {
+				"n": 150,
+				"p50": 0.4267010000003211,
+				"p95": 0.6441860000013548,
+				"p99": 2.1190150000002177,
+				"max": 2.9422210000011546,
+				"mean": 0.4839475266666341
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "-",
+			"query": "Q4c commits narrator",
+			"scope": "200/page",
+			"bucket": "all",
+			"rows": 199,
+			"summary": {
+				"n": 150,
+				"p50": 0.42050299999937124,
+				"p95": 0.5335729999987961,
+				"p99": 0.6163630000010016,
+				"max": 0.6997260000007373,
+				"mean": 0.3733797066665526
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "-",
+			"query": "Q4c commits narrator",
+			"scope": "200/page",
+			"bucket": "mid",
+			"rows": 199,
+			"summary": {
+				"n": 150,
+				"p50": 0.42050299999937124,
+				"p95": 0.5335729999987961,
+				"p99": 0.6163630000010016,
+				"max": 0.6997260000007373,
+				"mean": 0.3733797066665526
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "A2",
+			"query": "Q2 page@T",
+			"scope": "p2000",
+			"bucket": "all",
+			"rows": 1839,
+			"summary": {
+				"n": 300,
+				"p50": 21.353773999999248,
+				"p95": 32.16828000000169,
+				"p99": 64.80467399999907,
+				"max": 90.67364100000123,
+				"mean": 22.027811763333375
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "A2",
+			"query": "Q2 page@T",
+			"scope": "p2000",
+			"bucket": "early",
+			"rows": 1839,
+			"summary": {
+				"n": 100,
+				"p50": 19.801629000001412,
+				"p95": 25.319985000001907,
+				"p99": 27.748897000001307,
+				"max": 28.625643000003038,
+				"mean": 19.627407790000106
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "A2",
+			"query": "Q2 page@T",
+			"scope": "p2000",
+			"bucket": "mid",
+			"rows": 1839,
+			"summary": {
+				"n": 100,
+				"p50": 21.403368000002956,
+				"p95": 28.934132000002137,
+				"p99": 34.638214999999036,
+				"max": 44.32322600000043,
+				"mean": 20.13267547000003
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "A2",
+			"query": "Q2 page@T",
+			"scope": "p2000",
+			"bucket": "late",
+			"rows": 1839,
+			"summary": {
+				"n": 100,
+				"p50": 24.37180299999818,
+				"p95": 45.34817100000146,
+				"p99": 71.95391999999993,
+				"max": 90.67364100000123,
+				"mean": 26.323352029999988
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "A2",
+			"query": "Q2 page@T",
+			"scope": "p10000",
+			"bucket": "all",
+			"rows": 8716,
+			"summary": {
+				"n": 100,
+				"p50": 118.36045999999988,
+				"p95": 142.26858599999832,
+				"p99": 148.0892649999987,
+				"max": 156.89864699999453,
+				"mean": 119.63358900999985
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "A2",
+			"query": "Q2 page@T",
+			"scope": "p10000",
+			"bucket": "early",
+			"rows": 8716,
+			"summary": {
+				"n": 34,
+				"p50": 110.11165400000027,
+				"p95": 142.10176599999977,
+				"p99": 147.98931200000152,
+				"max": 147.98931200000152,
+				"mean": 112.72592611764765
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "A2",
+			"query": "Q2 page@T",
+			"scope": "p10000",
+			"bucket": "mid",
+			"rows": 8716,
+			"summary": {
+				"n": 33,
+				"p50": 125.43424299999606,
+				"p95": 143.07729499999914,
+				"p99": 144.47427700000117,
+				"max": 144.47427700000117,
+				"mean": 125.2710560303029
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "A2",
+			"query": "Q2 page@T",
+			"scope": "p10000",
+			"bucket": "late",
+			"rows": 8716,
+			"summary": {
+				"n": 33,
+				"p50": 117.23092599999654,
+				"p95": 148.0892649999987,
+				"p99": 156.89864699999453,
+				"max": 156.89864699999453,
+				"mean": 121.11310799999906
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "A2",
+			"query": "Q1 vp500 native-dfs",
+			"scope": "p2000",
+			"bucket": "all",
+			"rows": 500,
+			"summary": {
+				"n": 300,
+				"p50": 6.4341719999938505,
+				"p95": 26.278022000005876,
+				"p99": 58.442729000002146,
+				"max": 77.72501400000328,
+				"mean": 9.081576363333394
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "A2",
+			"query": "Q1 vp500 native-dfs",
+			"scope": "p2000",
+			"bucket": "early",
+			"rows": 500,
+			"summary": {
+				"n": 100,
+				"p50": 6.035602000003564,
+				"p95": 7.697039999999106,
+				"p99": 8.339128999999957,
+				"max": 8.435999999994237,
+				"mean": 6.156083009999784
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "A2",
+			"query": "Q1 vp500 native-dfs",
+			"scope": "p2000",
+			"bucket": "mid",
+			"rows": 500,
+			"summary": {
+				"n": 100,
+				"p50": 6.280459000001429,
+				"p95": 12.786705999998958,
+				"p99": 33.635567999997875,
+				"max": 42.645251000001736,
+				"mean": 7.780287409999946
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "A2",
+			"query": "Q1 vp500 native-dfs",
+			"scope": "p2000",
+			"bucket": "late",
+			"rows": 500,
+			"summary": {
+				"n": 100,
+				"p50": 7.367191000004823,
+				"p95": 48.58613100000366,
+				"p99": 75.21219999999448,
+				"max": 77.72501400000328,
+				"mean": 13.308358670000452
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "A2",
+			"query": "Q1 vp500 native-dfs",
+			"scope": "p10000",
+			"bucket": "all",
+			"rows": 500,
+			"summary": {
+				"n": 100,
+				"p50": 5.0584709999966435,
+				"p95": 6.115585999999894,
+				"p99": 6.862286999996286,
+				"max": 7.327604999998584,
+				"mean": 5.094148239999922
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "A2",
+			"query": "Q1 vp500 native-dfs",
+			"scope": "p10000",
+			"bucket": "early",
+			"rows": 500,
+			"summary": {
+				"n": 34,
+				"p50": 4.721593999995093,
+				"p95": 5.654914999999164,
+				"p99": 6.703270000005432,
+				"max": 6.703270000005432,
+				"mean": 4.731424499999669
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "A2",
+			"query": "Q1 vp500 native-dfs",
+			"scope": "p10000",
+			"bucket": "mid",
+			"rows": 500,
+			"summary": {
+				"n": 33,
+				"p50": 5.087747999998101,
+				"p95": 5.808894000001601,
+				"p99": 6.862286999996286,
+				"max": 6.862286999996286,
+				"mean": 5.037655363636573
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "A2",
+			"query": "Q1 vp500 native-dfs",
+			"scope": "p10000",
+			"bucket": "late",
+			"rows": 500,
+			"summary": {
+				"n": 33,
+				"p50": 5.522761000000173,
+				"p95": 6.332676999998512,
+				"p99": 7.327604999998584,
+				"max": 7.327604999998584,
+				"mean": 5.524356484848382
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "A2",
+			"query": "Q1 vp500 read+js-order",
+			"scope": "p2000",
+			"bucket": "all",
+			"rows": 500,
+			"summary": {
+				"n": 300,
+				"p50": 22.33389100000204,
+				"p95": 34.12433400000009,
+				"p99": 61.96458899999561,
+				"max": 92.57425199999852,
+				"mean": 22.657148010000068
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "A2",
+			"query": "Q1 vp500 read+js-order",
+			"scope": "p2000",
+			"bucket": "early",
+			"rows": 500,
+			"summary": {
+				"n": 100,
+				"p50": 20.37539700000343,
+				"p95": 25.56263200000103,
+				"p99": 27.086608999998134,
+				"max": 30.520973999999114,
+				"mean": 20.34229408999978
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "A2",
+			"query": "Q1 vp500 read+js-order",
+			"scope": "p2000",
+			"bucket": "mid",
+			"rows": 500,
+			"summary": {
+				"n": 100,
+				"p50": 22.49401300000318,
+				"p95": 28.870872999999847,
+				"p99": 37.53996200000256,
+				"max": 38.27272699999594,
+				"mean": 20.826868870000254
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "A2",
+			"query": "Q1 vp500 read+js-order",
+			"scope": "p2000",
+			"bucket": "late",
+			"rows": 500,
+			"summary": {
+				"n": 100,
+				"p50": 25.506073000004108,
+				"p95": 44.86803900000086,
+				"p99": 72.69842799999606,
+				"max": 92.57425199999852,
+				"mean": 26.802281070000173
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "A2",
+			"query": "Q3 diff W=1",
+			"scope": "p2000",
+			"bucket": "all",
+			"rows": 1,
+			"summary": {
+				"n": 150,
+				"p50": 47.689833000004,
+				"p95": 69.94940899999347,
+				"p99": 140.58930500000133,
+				"max": 167.03041099999973,
+				"mean": 48.69518731333349
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "A2",
+			"query": "Q3 diff W=1",
+			"scope": "p2000",
+			"bucket": "early",
+			"rows": 1,
+			"summary": {
+				"n": 50,
+				"p50": 47.93979099999706,
+				"p95": 64.9162770000039,
+				"p99": 69.94940899999347,
+				"max": 69.94940899999347,
+				"mean": 47.4913681000004
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "A2",
+			"query": "Q3 diff W=1",
+			"scope": "p2000",
+			"bucket": "mid",
+			"rows": 1,
+			"summary": {
+				"n": 50,
+				"p50": 47.73920899999939,
+				"p95": 135.99110099999962,
+				"p99": 167.03041099999973,
+				"max": 167.03041099999973,
+				"mean": 51.08752157999989
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "A2",
+			"query": "Q3 diff W=1",
+			"scope": "p2000",
+			"bucket": "late",
+			"rows": 1,
+			"summary": {
+				"n": 50,
+				"p50": 45.92516099999921,
+				"p95": 69.04070499999943,
+				"p99": 90.31154799999786,
+				"max": 90.31154799999786,
+				"mean": 47.506672260000194
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "A2",
+			"query": "Q3 diff W=100",
+			"scope": "p2000",
+			"bucket": "all",
+			"rows": 17,
+			"summary": {
+				"n": 150,
+				"p50": 47.64180199999828,
+				"p95": 71.76397800000268,
+				"p99": 107.14526399999886,
+				"max": 111.41467099999136,
+				"mean": 48.14226136666689
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "A2",
+			"query": "Q3 diff W=100",
+			"scope": "p2000",
+			"bucket": "early",
+			"rows": 17,
+			"summary": {
+				"n": 50,
+				"p50": 48.152979999998934,
+				"p95": 79.9826680000042,
+				"p99": 111.41467099999136,
+				"max": 111.41467099999136,
+				"mean": 48.96763724000033
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "A2",
+			"query": "Q3 diff W=100",
+			"scope": "p2000",
+			"bucket": "mid",
+			"rows": 17,
+			"summary": {
+				"n": 50,
+				"p50": 47.64180199999828,
+				"p95": 69.01753599999938,
+				"p99": 85.22698500000115,
+				"max": 85.22698500000115,
+				"mean": 47.210154139999794
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "A2",
+			"query": "Q3 diff W=100",
+			"scope": "p2000",
+			"bucket": "late",
+			"rows": 17,
+			"summary": {
+				"n": 50,
+				"p50": 46.91291700000875,
+				"p95": 77.52463400000124,
+				"p99": 87.97732800000085,
+				"max": 87.97732800000085,
+				"mean": 48.24899272000053
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "A2",
+			"query": "Q3 diff W=5000",
+			"scope": "p2000",
+			"bucket": "all",
+			"rows": 495,
+			"summary": {
+				"n": 150,
+				"p50": 45.982554999995045,
+				"p95": 75.3063589999947,
+				"p99": 87.84804599999916,
+				"max": 90.8142680000019,
+				"mean": 47.339946073333074
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "A2",
+			"query": "Q3 diff W=5000",
+			"scope": "p2000",
+			"bucket": "early",
+			"rows": 495,
+			"summary": {
+				"n": 50,
+				"p50": 46.828982999999425,
+				"p95": 82.92821099999128,
+				"p99": 90.8142680000019,
+				"max": 90.8142680000019,
+				"mean": 50.23578366000031
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "A2",
+			"query": "Q3 diff W=5000",
+			"scope": "p2000",
+			"bucket": "mid",
+			"rows": 495,
+			"summary": {
+				"n": 50,
+				"p50": 45.90624399999797,
+				"p95": 66.40083400000003,
+				"p99": 74.78619300000719,
+				"max": 74.78619300000719,
+				"mean": 45.88027238000009
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "A2",
+			"query": "Q3 diff W=5000",
+			"scope": "p2000",
+			"bucket": "late",
+			"rows": 495,
+			"summary": {
+				"n": 50,
+				"p50": 44.66895600000862,
+				"p95": 75.3063589999947,
+				"p99": 87.84804599999916,
+				"max": 87.84804599999916,
+				"mean": 45.903782179998814
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B2",
+			"query": "Q2 page@T",
+			"scope": "p2000",
+			"bucket": "all",
+			"rows": 1839,
+			"summary": {
+				"n": 300,
+				"p50": 7.9331919999967795,
+				"p95": 13.03604500000074,
+				"p99": 15.490936999995029,
+				"max": 17.75369499999215,
+				"mean": 8.261684756666558
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B2",
+			"query": "Q2 page@T",
+			"scope": "p2000",
+			"bucket": "early",
+			"rows": 1839,
+			"summary": {
+				"n": 100,
+				"p50": 6.410430999996606,
+				"p95": 8.88345800001116,
+				"p99": 9.2898259999929,
+				"max": 9.626124999995227,
+				"mean": 6.437394129999302
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B2",
+			"query": "Q2 page@T",
+			"scope": "p2000",
+			"bucket": "mid",
+			"rows": 1839,
+			"summary": {
+				"n": 100,
+				"p50": 8.248653000002378,
+				"p95": 12.262900000001537,
+				"p99": 15.490936999995029,
+				"max": 15.786538000000292,
+				"mean": 8.36686267000041
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B2",
+			"query": "Q2 page@T",
+			"scope": "p2000",
+			"bucket": "late",
+			"rows": 1839,
+			"summary": {
+				"n": 100,
+				"p50": 9.599851999999373,
+				"p95": 13.678671999994549,
+				"p99": 16.744673000008333,
+				"max": 17.75369499999215,
+				"mean": 9.980797469999962
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B2",
+			"query": "Q2 page@T",
+			"scope": "p10000",
+			"bucket": "all",
+			"rows": 8716,
+			"summary": {
+				"n": 100,
+				"p50": 34.788172000000486,
+				"p95": 46.00226500000281,
+				"p99": 55.33788099999947,
+				"max": 60.54738000000361,
+				"mean": 34.45884855999946
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B2",
+			"query": "Q2 page@T",
+			"scope": "p10000",
+			"bucket": "early",
+			"rows": 8716,
+			"summary": {
+				"n": 34,
+				"p50": 25.16850100000738,
+				"p95": 35.36436700000195,
+				"p99": 37.59315099999367,
+				"max": 37.59315099999367,
+				"mean": 26.14970044117731
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B2",
+			"query": "Q2 page@T",
+			"scope": "p10000",
+			"bucket": "mid",
+			"rows": 8716,
+			"summary": {
+				"n": 33,
+				"p50": 34.7628379999951,
+				"p95": 42.77788399999554,
+				"p99": 60.54738000000361,
+				"max": 60.54738000000361,
+				"mean": 35.79027178787686
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B2",
+			"query": "Q2 page@T",
+			"scope": "p10000",
+			"bucket": "late",
+			"rows": 8716,
+			"summary": {
+				"n": 33,
+				"p50": 40.06711499999801,
+				"p95": 48.79533100000117,
+				"p99": 55.33788099999947,
+				"max": 55.33788099999947,
+				"mean": 41.688365818181246
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B2",
+			"query": "Q1 vp500 read+js-order",
+			"scope": "p2000",
+			"bucket": "all",
+			"rows": 500,
+			"summary": {
+				"n": 300,
+				"p50": 8.3249080000096,
+				"p95": 13.015716000008979,
+				"p99": 16.007559999998193,
+				"max": 20.924901000005775,
+				"mean": 8.51751435666704
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B2",
+			"query": "Q1 vp500 read+js-order",
+			"scope": "p2000",
+			"bucket": "early",
+			"rows": 500,
+			"summary": {
+				"n": 100,
+				"p50": 6.456981000010273,
+				"p95": 10.697421000004397,
+				"p99": 12.37052599999879,
+				"max": 12.549906999993254,
+				"mean": 6.900594120000023
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B2",
+			"query": "Q1 vp500 read+js-order",
+			"scope": "p2000",
+			"bucket": "mid",
+			"rows": 500,
+			"summary": {
+				"n": 100,
+				"p50": 8.251482000006945,
+				"p95": 13.015716000008979,
+				"p99": 14.584874000007403,
+				"max": 16.007559999998193,
+				"mean": 8.50782571000076
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B2",
+			"query": "Q1 vp500 read+js-order",
+			"scope": "p2000",
+			"bucket": "late",
+			"rows": 500,
+			"summary": {
+				"n": 100,
+				"p50": 9.679617999994662,
+				"p95": 14.107124000001932,
+				"p99": 16.700928999998723,
+				"max": 20.924901000005775,
+				"mean": 10.144123240000335
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B2",
+			"query": "Q1 vp500 read+js-order",
+			"scope": "p10000",
+			"bucket": "all",
+			"rows": 500,
+			"summary": {
+				"n": 100,
+				"p50": 40.937974000000395,
+				"p95": 56.529103000008035,
+				"p99": 63.96331999999529,
+				"max": 67.17939000000479,
+				"mean": 41.07620589999962
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B2",
+			"query": "Q1 vp500 read+js-order",
+			"scope": "p10000",
+			"bucket": "early",
+			"rows": 500,
+			"summary": {
+				"n": 34,
+				"p50": 32.61891000000469,
+				"p95": 44.761335999995936,
+				"p99": 52.99790400000347,
+				"max": 52.99790400000347,
+				"mean": 32.500566323529604
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B2",
+			"query": "Q1 vp500 read+js-order",
+			"scope": "p10000",
+			"bucket": "mid",
+			"rows": 500,
+			"summary": {
+				"n": 33,
+				"p50": 40.52143399999477,
+				"p95": 58.455140000005485,
+				"p99": 59.415930000002845,
+				"max": 59.415930000002845,
+				"mean": 42.379063787878046
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B2",
+			"query": "Q1 vp500 read+js-order",
+			"scope": "p10000",
+			"bucket": "late",
+			"rows": 500,
+			"summary": {
+				"n": 33,
+				"p50": 46.097245999990264,
+				"p95": 63.96331999999529,
+				"p99": 67.17939000000479,
+				"max": 67.17939000000479,
+				"mean": 48.60885545454485
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B2",
+			"query": "Q3 diff W=1 flags",
+			"scope": "p2000",
+			"bucket": "all",
+			"rows": 1,
+			"summary": {
+				"n": 150,
+				"p50": 0.01617600000463426,
+				"p95": 0.052404999994905666,
+				"p99": 0.14454900000419002,
+				"max": 0.17711800000688527,
+				"mean": 0.023257666667341255
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B2",
+			"query": "Q3 diff W=1 flags",
+			"scope": "p2000",
+			"bucket": "early",
+			"rows": 1,
+			"summary": {
+				"n": 50,
+				"p50": 0.01558800000930205,
+				"p95": 0.052404999994905666,
+				"p99": 0.06535900000017136,
+				"max": 0.06535900000017136,
+				"mean": 0.020345620001025962
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B2",
+			"query": "Q3 diff W=1 flags",
+			"scope": "p2000",
+			"bucket": "mid",
+			"rows": 1,
+			"summary": {
+				"n": 50,
+				"p50": 0.01731399999698624,
+				"p95": 0.10912800001096912,
+				"p99": 0.17711800000688527,
+				"max": 0.17711800000688527,
+				"mean": 0.02797824000037508
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B2",
+			"query": "Q3 diff W=1 flags",
+			"scope": "p2000",
+			"bucket": "late",
+			"rows": 1,
+			"summary": {
+				"n": 50,
+				"p50": 0.01615600001241546,
+				"p95": 0.04808999999659136,
+				"p99": 0.07152699999278411,
+				"max": 0.07152699999278411,
+				"mean": 0.02144914000062272
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B2",
+			"query": "Q3 diff W=1 join",
+			"scope": "p2000",
+			"bucket": "all",
+			"rows": 1,
+			"summary": {
+				"n": 150,
+				"p50": 0.025880999994114973,
+				"p95": 0.1608459999988554,
+				"p99": 0.3789470000047004,
+				"max": 0.6890999999886844,
+				"mean": 0.05258926000019225
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B2",
+			"query": "Q3 diff W=1 join",
+			"scope": "p2000",
+			"bucket": "early",
+			"rows": 1,
+			"summary": {
+				"n": 50,
+				"p50": 0.024409000005107373,
+				"p95": 0.14631999999983236,
+				"p99": 0.1532640000077663,
+				"max": 0.1532640000077663,
+				"mean": 0.042721120000933296
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B2",
+			"query": "Q3 diff W=1 join",
+			"scope": "p2000",
+			"bucket": "mid",
+			"rows": 1,
+			"summary": {
+				"n": 50,
+				"p50": 0.025878000000375323,
+				"p95": 0.24421699999948032,
+				"p99": 0.6890999999886844,
+				"max": 0.6890999999886844,
+				"mean": 0.07129273999977158
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B2",
+			"query": "Q3 diff W=1 join",
+			"scope": "p2000",
+			"bucket": "late",
+			"rows": 1,
+			"summary": {
+				"n": 50,
+				"p50": 0.026433999999426305,
+				"p95": 0.20590699999593198,
+				"p99": 0.23118499999691267,
+				"max": 0.23118499999691267,
+				"mean": 0.04375391999987187
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B2",
+			"query": "Q3 diff W=100 flags",
+			"scope": "p2000",
+			"bucket": "all",
+			"rows": 22,
+			"summary": {
+				"n": 150,
+				"p50": 0.06737499999871943,
+				"p95": 0.2846829999907641,
+				"p99": 0.568463999996311,
+				"max": 0.6187910000007832,
+				"mean": 0.0977815333334729
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B2",
+			"query": "Q3 diff W=100 flags",
+			"scope": "p2000",
+			"bucket": "early",
+			"rows": 22,
+			"summary": {
+				"n": 50,
+				"p50": 0.07824399998935405,
+				"p95": 0.35130400001071393,
+				"p99": 0.42168700000911485,
+				"max": 0.42168700000911485,
+				"mean": 0.10653300000005402
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B2",
+			"query": "Q3 diff W=100 flags",
+			"scope": "p2000",
+			"bucket": "mid",
+			"rows": 22,
+			"summary": {
+				"n": 50,
+				"p50": 0.0769399999990128,
+				"p95": 0.2885950000054436,
+				"p99": 0.6187910000007832,
+				"max": 0.6187910000007832,
+				"mean": 0.12203642000007676
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B2",
+			"query": "Q3 diff W=100 flags",
+			"scope": "p2000",
+			"bucket": "late",
+			"rows": 22,
+			"summary": {
+				"n": 50,
+				"p50": 0.04376400000182912,
+				"p95": 0.17414100001042243,
+				"p99": 0.28306300000986084,
+				"max": 0.28306300000986084,
+				"mean": 0.06477518000028795
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B2",
+			"query": "Q3 diff W=100 join",
+			"scope": "p2000",
+			"bucket": "all",
+			"rows": 22,
+			"summary": {
+				"n": 150,
+				"p50": 0.20904800000425894,
+				"p95": 1.1594089999998687,
+				"p99": 2.259487999996054,
+				"max": 2.5672900000063237,
+				"mean": 0.3670327733327091
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B2",
+			"query": "Q3 diff W=100 join",
+			"scope": "p2000",
+			"bucket": "early",
+			"rows": 22,
+			"summary": {
+				"n": 50,
+				"p50": 0.24173999999766238,
+				"p95": 1.384835999997449,
+				"p99": 1.7339309999952093,
+				"max": 1.7339309999952093,
+				"mean": 0.40511579999903913
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B2",
+			"query": "Q3 diff W=100 join",
+			"scope": "p2000",
+			"bucket": "mid",
+			"rows": 22,
+			"summary": {
+				"n": 50,
+				"p50": 0.23802799999248236,
+				"p95": 1.2281019999936689,
+				"p99": 2.5672900000063237,
+				"max": 2.5672900000063237,
+				"mean": 0.44408443999942393
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B2",
+			"query": "Q3 diff W=100 join",
+			"scope": "p2000",
+			"bucket": "late",
+			"rows": 22,
+			"summary": {
+				"n": 50,
+				"p50": 0.15132099999755155,
+				"p95": 0.7086430000053952,
+				"p99": 1.1703229999984615,
+				"max": 1.1703229999984615,
+				"mean": 0.25189807999966435
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B2",
+			"query": "Q3 diff W=5000 flags",
+			"scope": "p2000",
+			"bucket": "all",
+			"rows": 1198,
+			"summary": {
+				"n": 150,
+				"p50": 3.416440999993938,
+				"p95": 14.799314999996568,
+				"p99": 33.07867800000531,
+				"max": 33.29191699999501,
+				"mean": 5.097789480000113
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B2",
+			"query": "Q3 diff W=5000 flags",
+			"scope": "p2000",
+			"bucket": "early",
+			"rows": 1198,
+			"summary": {
+				"n": 50,
+				"p50": 3.785868000006303,
+				"p95": 12.38312899999437,
+				"p99": 23.16704899999604,
+				"max": 23.16704899999604,
+				"mean": 4.374630720000423
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B2",
+			"query": "Q3 diff W=5000 flags",
+			"scope": "p2000",
+			"bucket": "mid",
+			"rows": 1198,
+			"summary": {
+				"n": 50,
+				"p50": 3.296749999994063,
+				"p95": 17.3028529999865,
+				"p99": 33.07867800000531,
+				"max": 33.07867800000531,
+				"mean": 5.669778839999635
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B2",
+			"query": "Q3 diff W=5000 flags",
+			"scope": "p2000",
+			"bucket": "late",
+			"rows": 1198,
+			"summary": {
+				"n": 50,
+				"p50": 3.410305999990669,
+				"p95": 11.896040999999968,
+				"p99": 33.29191699999501,
+				"max": 33.29191699999501,
+				"mean": 5.248958880000282
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B2",
+			"query": "Q3 diff W=5000 join",
+			"scope": "p2000",
+			"bucket": "all",
+			"rows": 1198,
+			"summary": {
+				"n": 150,
+				"p50": 8.628245999992942,
+				"p95": 39.44513700000243,
+				"p99": 92.56608899999992,
+				"max": 98.81453400000464,
+				"mean": 13.461770499999597
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B2",
+			"query": "Q3 diff W=5000 join",
+			"scope": "p2000",
+			"bucket": "early",
+			"rows": 1198,
+			"summary": {
+				"n": 50,
+				"p50": 7.849771000008332,
+				"p95": 25.296912999998312,
+				"p99": 61.75513499999943,
+				"max": 61.75513499999943,
+				"mean": 11.640583720000286
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B2",
+			"query": "Q3 diff W=5000 join",
+			"scope": "p2000",
+			"bucket": "mid",
+			"rows": 1198,
+			"summary": {
+				"n": 50,
+				"p50": 9.468458999996074,
+				"p95": 45.28178499999922,
+				"p99": 92.56608899999992,
+				"max": 92.56608899999992,
+				"mean": 15.395569020000112
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B2",
+			"query": "Q3 diff W=5000 join",
+			"scope": "p2000",
+			"bucket": "late",
+			"rows": 1198,
+			"summary": {
+				"n": 50,
+				"p50": 8.298937999992631,
+				"p95": 29.239982999992208,
+				"p99": 98.81453400000464,
+				"max": 98.81453400000464,
+				"mean": 13.34915875999839
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B2",
+			"query": "Q4d commits of page",
+			"scope": "200/page",
+			"bucket": "all",
+			"rows": 201,
+			"summary": {
+				"n": 150,
+				"p50": 1.9194120000029216,
+				"p95": 2.3276180000102613,
+				"p99": 2.712327000001096,
+				"max": 2.931830000001355,
+				"mean": 1.898943346666735
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B2",
+			"query": "Q4d commits of page",
+			"scope": "200/page",
+			"bucket": "mid",
+			"rows": 201,
+			"summary": {
+				"n": 150,
+				"p50": 1.9194120000029216,
+				"p95": 2.3276180000102613,
+				"p99": 2.712327000001096,
+				"max": 2.931830000001355,
+				"mean": 1.898943346666735
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B3",
+			"query": "Q2 page@T",
+			"scope": "p2000",
+			"bucket": "all",
+			"rows": 1839,
+			"summary": {
+				"n": 300,
+				"p50": 7.289517000011983,
+				"p95": 10.934394000010798,
+				"p99": 13.00306499999715,
+				"max": 14.499133999997866,
+				"mean": 7.428488196666876
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B3",
+			"query": "Q2 page@T",
+			"scope": "p2000",
+			"bucket": "early",
+			"rows": 1839,
+			"summary": {
+				"n": 100,
+				"p50": 5.762291999999434,
+				"p95": 8.607176999998046,
+				"p99": 9.29478399999789,
+				"max": 9.94983100000536,
+				"mean": 5.96722534999979
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B3",
+			"query": "Q2 page@T",
+			"scope": "p2000",
+			"bucket": "mid",
+			"rows": 1839,
+			"summary": {
+				"n": 100,
+				"p50": 7.448169000010239,
+				"p95": 9.542325000002165,
+				"p99": 10.934394000010798,
+				"max": 13.00306499999715,
+				"mean": 7.425586070001009
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B3",
+			"query": "Q2 page@T",
+			"scope": "p2000",
+			"bucket": "late",
+			"rows": 1839,
+			"summary": {
+				"n": 100,
+				"p50": 8.610509999998612,
+				"p95": 12.20199099999445,
+				"p99": 13.198540999990655,
+				"max": 14.499133999997866,
+				"mean": 8.89265316999983
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B3",
+			"query": "Q2 page@T",
+			"scope": "p10000",
+			"bucket": "all",
+			"rows": 8716,
+			"summary": {
+				"n": 100,
+				"p50": 32.78145999999833,
+				"p95": 41.658027999990736,
+				"p99": 42.87959099998989,
+				"max": 48.65979900000093,
+				"mean": 32.40283621000053
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B3",
+			"query": "Q2 page@T",
+			"scope": "p10000",
+			"bucket": "early",
+			"rows": 8716,
+			"summary": {
+				"n": 34,
+				"p50": 24.62550999999803,
+				"p95": 32.57092700000794,
+				"p99": 40.280684999990626,
+				"max": 40.280684999990626,
+				"mean": 24.842633529413007
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B3",
+			"query": "Q2 page@T",
+			"scope": "p10000",
+			"bucket": "mid",
+			"rows": 8716,
+			"summary": {
+				"n": 33,
+				"p50": 32.78145999999833,
+				"p95": 42.30878800000937,
+				"p99": 48.65979900000093,
+				"max": 48.65979900000093,
+				"mean": 34.12215848485005
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B3",
+			"query": "Q2 page@T",
+			"scope": "p10000",
+			"bucket": "late",
+			"rows": 8716,
+			"summary": {
+				"n": 33,
+				"p50": 38.473234000004595,
+				"p95": 42.81392100000812,
+				"p99": 42.87959099998989,
+				"max": 42.87959099998989,
+				"mean": 38.472813666665445
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B3",
+			"query": "Q2 page@T no-content",
+			"scope": "p2000",
+			"bucket": "all",
+			"rows": 1839,
+			"summary": {
+				"n": 300,
+				"p50": 6.460221000001184,
+				"p95": 11.4225940000033,
+				"p99": 13.468931999988854,
+				"max": 23.068104000005405,
+				"mean": 6.918522126666261
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B3",
+			"query": "Q2 page@T no-content",
+			"scope": "p2000",
+			"bucket": "early",
+			"rows": 1839,
+			"summary": {
+				"n": 100,
+				"p50": 4.698134999998729,
+				"p95": 8.004607999988366,
+				"p99": 9.610603000008268,
+				"max": 23.068104000005405,
+				"mean": 5.1328957599996645
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B3",
+			"query": "Q2 page@T no-content",
+			"scope": "p2000",
+			"bucket": "mid",
+			"rows": 1839,
+			"summary": {
+				"n": 100,
+				"p50": 7.06602300000668,
+				"p95": 10.266818000003695,
+				"p99": 11.4225940000033,
+				"max": 12.18681800000195,
+				"mean": 6.971862719999626
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B3",
+			"query": "Q2 page@T no-content",
+			"scope": "p2000",
+			"bucket": "late",
+			"rows": 1839,
+			"summary": {
+				"n": 100,
+				"p50": 8.280087999999523,
+				"p95": 13.399881999997888,
+				"p99": 13.872434000004432,
+				"max": 15.803166000012425,
+				"mean": 8.65080789999949
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B3",
+			"query": "Q1 vp500 read+js-order",
+			"scope": "p2000",
+			"bucket": "all",
+			"rows": 500,
+			"summary": {
+				"n": 300,
+				"p50": 7.6632620000018505,
+				"p95": 11.314925999991829,
+				"p99": 13.283803999991505,
+				"max": 13.53794399999606,
+				"mean": 7.7432723666664485
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B3",
+			"query": "Q1 vp500 read+js-order",
+			"scope": "p2000",
+			"bucket": "early",
+			"rows": 500,
+			"summary": {
+				"n": 100,
+				"p50": 6.034507000003941,
+				"p95": 8.041645999997854,
+				"p99": 8.764321000009659,
+				"max": 9.720344000001205,
+				"mean": 6.213483810000034
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B3",
+			"query": "Q1 vp500 read+js-order",
+			"scope": "p2000",
+			"bucket": "mid",
+			"rows": 500,
+			"summary": {
+				"n": 100,
+				"p50": 7.6632620000018505,
+				"p95": 10.052374999999302,
+				"p99": 12.037601999996696,
+				"max": 13.376665000003413,
+				"mean": 7.777613139999448
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B3",
+			"query": "Q1 vp500 read+js-order",
+			"scope": "p2000",
+			"bucket": "late",
+			"rows": 500,
+			"summary": {
+				"n": 100,
+				"p50": 9.129409000001033,
+				"p95": 12.508657999991556,
+				"p99": 13.517649999994319,
+				"max": 13.53794399999606,
+				"mean": 9.238720149999862
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B3",
+			"query": "Q1 vp500 read+js-order",
+			"scope": "p10000",
+			"bucket": "all",
+			"rows": 500,
+			"summary": {
+				"n": 100,
+				"p50": 38.52271999999357,
+				"p95": 50.523904000001494,
+				"p99": 55.36051800000132,
+				"max": 59.39352399999916,
+				"mean": 38.00160670999889
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B3",
+			"query": "Q1 vp500 read+js-order",
+			"scope": "p10000",
+			"bucket": "early",
+			"rows": 500,
+			"summary": {
+				"n": 34,
+				"p50": 30.395845999999437,
+				"p95": 38.75675400000182,
+				"p99": 43.68490300000121,
+				"max": 43.68490300000121,
+				"mean": 30.024145264704096
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B3",
+			"query": "Q1 vp500 read+js-order",
+			"scope": "p10000",
+			"bucket": "mid",
+			"rows": 500,
+			"summary": {
+				"n": 33,
+				"p50": 38.52271999999357,
+				"p95": 49.28102199999557,
+				"p99": 55.36051800000132,
+				"max": 55.36051800000132,
+				"mean": 39.73372703030129
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B3",
+			"query": "Q1 vp500 read+js-order",
+			"scope": "p10000",
+			"bucket": "late",
+			"rows": 500,
+			"summary": {
+				"n": 33,
+				"p50": 43.37446900000214,
+				"p95": 54.87774999999965,
+				"p99": 59.39352399999916,
+				"max": 59.39352399999916,
+				"mean": 44.488689090909304
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B3",
+			"query": "Q3 diff W=1 flags",
+			"scope": "p2000",
+			"bucket": "all",
+			"rows": 1,
+			"summary": {
+				"n": 150,
+				"p50": 0.015930000008665957,
+				"p95": 0.051545000009355135,
+				"p99": 0.14472999999998137,
+				"max": 0.1640719999995781,
+				"mean": 0.022258560000239715
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B3",
+			"query": "Q3 diff W=1 flags",
+			"scope": "p2000",
+			"bucket": "early",
+			"rows": 1,
+			"summary": {
+				"n": 50,
+				"p50": 0.016101000001071952,
+				"p95": 0.051545000009355135,
+				"p99": 0.054320000010193326,
+				"max": 0.054320000010193326,
+				"mean": 0.020839919999998527
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B3",
+			"query": "Q3 diff W=1 flags",
+			"scope": "p2000",
+			"bucket": "mid",
+			"rows": 1,
+			"summary": {
+				"n": 50,
+				"p50": 0.016134000004967675,
+				"p95": 0.062433999992208555,
+				"p99": 0.1640719999995781,
+				"max": 0.1640719999995781,
+				"mean": 0.026559520000591873
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B3",
+			"query": "Q3 diff W=1 flags",
+			"scope": "p2000",
+			"bucket": "late",
+			"rows": 1,
+			"summary": {
+				"n": 50,
+				"p50": 0.01556200000050012,
+				"p95": 0.03937199999927543,
+				"p99": 0.08159600000362843,
+				"max": 0.08159600000362843,
+				"mean": 0.019376240000128747
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B3",
+			"query": "Q3 diff W=1 join",
+			"scope": "p2000",
+			"bucket": "all",
+			"rows": 1,
+			"summary": {
+				"n": 150,
+				"p50": 0.022257999997236766,
+				"p95": 0.19373800000175834,
+				"p99": 0.38853099998959806,
+				"max": 0.6947829999990063,
+				"mean": 0.0505185533335316
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B3",
+			"query": "Q3 diff W=1 join",
+			"scope": "p2000",
+			"bucket": "early",
+			"rows": 1,
+			"summary": {
+				"n": 50,
+				"p50": 0.02216799999587238,
+				"p95": 0.13155700000061188,
+				"p99": 0.21121900000434835,
+				"max": 0.21121900000434835,
+				"mean": 0.04128803999978117
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B3",
+			"query": "Q3 diff W=1 join",
+			"scope": "p2000",
+			"bucket": "mid",
+			"rows": 1,
+			"summary": {
+				"n": 50,
+				"p50": 0.02312500000698492,
+				"p95": 0.21081899999990128,
+				"p99": 0.6947829999990063,
+				"max": 0.6947829999990063,
+				"mean": 0.0670606200004113
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B3",
+			"query": "Q3 diff W=1 join",
+			"scope": "p2000",
+			"bucket": "late",
+			"rows": 1,
+			"summary": {
+				"n": 50,
+				"p50": 0.021590999996988103,
+				"p95": 0.1798819999967236,
+				"p99": 0.2541720000008354,
+				"max": 0.2541720000008354,
+				"mean": 0.04320700000040233
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B3",
+			"query": "Q3 diff W=100 flags",
+			"scope": "p2000",
+			"bucket": "all",
+			"rows": 22,
+			"summary": {
+				"n": 150,
+				"p50": 0.0674929999950109,
+				"p95": 0.29170000000158325,
+				"p99": 0.5149169999931473,
+				"max": 0.6522070000064559,
+				"mean": 0.09911412666648782
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B3",
+			"query": "Q3 diff W=100 flags",
+			"scope": "p2000",
+			"bucket": "early",
+			"rows": 22,
+			"summary": {
+				"n": 50,
+				"p50": 0.07289199999650009,
+				"p95": 0.32908799999859184,
+				"p99": 0.4273839999950724,
+				"max": 0.4273839999950724,
+				"mean": 0.1057452400017064
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B3",
+			"query": "Q3 diff W=100 flags",
+			"scope": "p2000",
+			"bucket": "mid",
+			"rows": 22,
+			"summary": {
+				"n": 50,
+				"p50": 0.06901599999400787,
+				"p95": 0.2917159999924479,
+				"p99": 0.6522070000064559,
+				"max": 0.6522070000064559,
+				"mean": 0.11816701999865473
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B3",
+			"query": "Q3 diff W=100 flags",
+			"scope": "p2000",
+			"bucket": "late",
+			"rows": 22,
+			"summary": {
+				"n": 50,
+				"p50": 0.050444000007701106,
+				"p95": 0.18271500000264496,
+				"p99": 0.29670800000894815,
+				"max": 0.29670800000894815,
+				"mean": 0.07343011999910232
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B3",
+			"query": "Q3 diff W=100 join",
+			"scope": "p2000",
+			"bucket": "all",
+			"rows": 22,
+			"summary": {
+				"n": 150,
+				"p50": 0.20521099999314174,
+				"p95": 1.175165000007837,
+				"p99": 2.3817239999916637,
+				"max": 2.5305610000068555,
+				"mean": 0.3683915066684131
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B3",
+			"query": "Q3 diff W=100 join",
+			"scope": "p2000",
+			"bucket": "early",
+			"rows": 22,
+			"summary": {
+				"n": 50,
+				"p50": 0.24455099999613594,
+				"p95": 1.3784860000014305,
+				"p99": 1.82544699999562,
+				"max": 1.82544699999562,
+				"mean": 0.4080171800017706
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B3",
+			"query": "Q3 diff W=100 join",
+			"scope": "p2000",
+			"bucket": "mid",
+			"rows": 22,
+			"summary": {
+				"n": 50,
+				"p50": 0.24377300000924151,
+				"p95": 1.195638000004692,
+				"p99": 2.5305610000068555,
+				"max": 2.5305610000068555,
+				"mean": 0.4508755400017253
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B3",
+			"query": "Q3 diff W=100 join",
+			"scope": "p2000",
+			"bucket": "late",
+			"rows": 22,
+			"summary": {
+				"n": 50,
+				"p50": 0.1475910000008298,
+				"p95": 0.7475340000091819,
+				"p99": 1.1857920000038575,
+				"max": 1.1857920000038575,
+				"mean": 0.24628180000174324
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B3",
+			"query": "Q3 diff W=5000 flags",
+			"scope": "p2000",
+			"bucket": "all",
+			"rows": 1198,
+			"summary": {
+				"n": 150,
+				"p50": 2.9504650000017136,
+				"p95": 13.258762999990722,
+				"p99": 33.50760799999989,
+				"max": 33.82868299999973,
+				"mean": 4.268636013333744
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B3",
+			"query": "Q3 diff W=5000 flags",
+			"scope": "p2000",
+			"bucket": "early",
+			"rows": 1198,
+			"summary": {
+				"n": 50,
+				"p50": 2.9434850000106962,
+				"p95": 9.915692999988096,
+				"p99": 13.258762999990722,
+				"max": 13.258762999990722,
+				"mean": 3.625121260001033
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B3",
+			"query": "Q3 diff W=5000 flags",
+			"scope": "p2000",
+			"bucket": "mid",
+			"rows": 1198,
+			"summary": {
+				"n": 50,
+				"p50": 2.9632369999890216,
+				"p95": 14.442642000009073,
+				"p99": 33.82868299999973,
+				"max": 33.82868299999973,
+				"mean": 4.981633339999826
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B3",
+			"query": "Q3 diff W=5000 flags",
+			"scope": "p2000",
+			"bucket": "late",
+			"rows": 1198,
+			"summary": {
+				"n": 50,
+				"p50": 2.8792370000010123,
+				"p95": 9.757612000001245,
+				"p99": 33.50760799999989,
+				"max": 33.50760799999989,
+				"mean": 4.199153440000373
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B3",
+			"query": "Q3 diff W=5000 join",
+			"scope": "p2000",
+			"bucket": "all",
+			"rows": 1198,
+			"summary": {
+				"n": 150,
+				"p50": 8.527313999991748,
+				"p95": 38.929564000005485,
+				"p99": 87.2503299999953,
+				"max": 97.46396000000823,
+				"mean": 12.62329844666645
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B3",
+			"query": "Q3 diff W=5000 join",
+			"scope": "p2000",
+			"bucket": "early",
+			"rows": 1198,
+			"summary": {
+				"n": 50,
+				"p50": 8.657970000000205,
+				"p95": 28.326115000003483,
+				"p99": 52.376058000008925,
+				"max": 52.376058000008925,
+				"mean": 11.04475744000054
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B3",
+			"query": "Q3 diff W=5000 join",
+			"scope": "p2000",
+			"bucket": "mid",
+			"rows": 1198,
+			"summary": {
+				"n": 50,
+				"p50": 8.573860999997123,
+				"p95": 41.44886499999848,
+				"p99": 87.2503299999953,
+				"max": 87.2503299999953,
+				"mean": 14.335493639998603
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B3",
+			"query": "Q3 diff W=5000 join",
+			"scope": "p2000",
+			"bucket": "late",
+			"rows": 1198,
+			"summary": {
+				"n": 50,
+				"p50": 8.196775000003981,
+				"p95": 31.135823000004166,
+				"p99": 97.46396000000823,
+				"max": 97.46396000000823,
+				"mean": 12.489644260000205
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B3",
+			"query": "Q4d commits of page",
+			"scope": "200/page",
+			"bucket": "all",
+			"rows": 201,
+			"summary": {
+				"n": 150,
+				"p50": 2.0328499999886844,
+				"p95": 2.4861040000105277,
+				"p99": 2.7790510000049835,
+				"max": 3.295780000000377,
+				"mean": 2.0085606600005605
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B3",
+			"query": "Q4d commits of page",
+			"scope": "200/page",
+			"bucket": "mid",
+			"rows": 201,
+			"summary": {
+				"n": 150,
+				"p50": 2.0328499999886844,
+				"p95": 2.4861040000105277,
+				"p99": 2.7790510000049835,
+				"max": 3.295780000000377,
+				"mean": 2.0085606600005605
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q2 page@T",
+			"scope": "p2000",
+			"bucket": "all",
+			"rows": 1839,
+			"summary": {
+				"n": 300,
+				"p50": 8.263666999991983,
+				"p95": 13.19187399999646,
+				"p99": 15.968380000005709,
+				"max": 16.38789500000712,
+				"mean": 8.458082300000097
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q2 page@T",
+			"scope": "p2000",
+			"bucket": "early",
+			"rows": 1839,
+			"summary": {
+				"n": 100,
+				"p50": 6.925736999997753,
+				"p95": 9.542610999997123,
+				"p99": 10.636308000001009,
+				"max": 11.451138999997056,
+				"mean": 6.702069559999945
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q2 page@T",
+			"scope": "p2000",
+			"bucket": "mid",
+			"rows": 1839,
+			"summary": {
+				"n": 100,
+				"p50": 8.24529399999301,
+				"p95": 11.429808000000776,
+				"p99": 14.29680300000473,
+				"max": 15.998779000001377,
+				"mean": 8.395328109999973
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q2 page@T",
+			"scope": "p2000",
+			"bucket": "late",
+			"rows": 1839,
+			"summary": {
+				"n": 100,
+				"p50": 9.814440000001923,
+				"p95": 15.100321999998414,
+				"p99": 16.19655199999397,
+				"max": 16.38789500000712,
+				"mean": 10.276849230000371
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q2 page@T",
+			"scope": "p10000",
+			"bucket": "all",
+			"rows": 8716,
+			"summary": {
+				"n": 100,
+				"p50": 38.15430300000298,
+				"p95": 52.29304600000614,
+				"p99": 62.62944500001322,
+				"max": 69.31528400001116,
+				"mean": 38.17242676999987
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q2 page@T",
+			"scope": "p10000",
+			"bucket": "early",
+			"rows": 8716,
+			"summary": {
+				"n": 34,
+				"p50": 28.97846299999219,
+				"p95": 40.31115399999544,
+				"p99": 45.89113000000361,
+				"max": 45.89113000000361,
+				"mean": 29.047282970587464
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q2 page@T",
+			"scope": "p10000",
+			"bucket": "mid",
+			"rows": 8716,
+			"summary": {
+				"n": 33,
+				"p50": 38.15430300000298,
+				"p95": 52.18858600000385,
+				"p99": 62.62944500001322,
+				"max": 62.62944500001322,
+				"mean": 39.135054454546086
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q2 page@T",
+			"scope": "p10000",
+			"bucket": "late",
+			"rows": 8716,
+			"summary": {
+				"n": 33,
+				"p50": 45.30778499999724,
+				"p95": 59.437380999996094,
+				"p99": 69.31528400001116,
+				"max": 69.31528400001116,
+				"mean": 46.61146239393918
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q1 vp500 read+js-order",
+			"scope": "p2000",
+			"bucket": "all",
+			"rows": 500,
+			"summary": {
+				"n": 300,
+				"p50": 8.220910000003641,
+				"p95": 12.38499099999899,
+				"p99": 15.96750799997244,
+				"max": 27.131366000015987,
+				"mean": 8.435718776667587
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q1 vp500 read+js-order",
+			"scope": "p2000",
+			"bucket": "early",
+			"rows": 500,
+			"summary": {
+				"n": 100,
+				"p50": 6.706036000017775,
+				"p95": 9.25500699999975,
+				"p99": 10.431400000001304,
+				"max": 11.406996000005165,
+				"mean": 6.833515330002119
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q1 vp500 read+js-order",
+			"scope": "p2000",
+			"bucket": "mid",
+			"rows": 500,
+			"summary": {
+				"n": 100,
+				"p50": 7.984444999980042,
+				"p95": 10.763390999985859,
+				"p99": 12.2846669999999,
+				"max": 13.128788999980316,
+				"mean": 8.22270583000005
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q1 vp500 read+js-order",
+			"scope": "p2000",
+			"bucket": "late",
+			"rows": 500,
+			"summary": {
+				"n": 100,
+				"p50": 9.614417000004323,
+				"p95": 15.012768999993568,
+				"p99": 21.116970000002766,
+				"max": 27.131366000015987,
+				"mean": 10.250935170000593
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q1 vp500 read+js-order",
+			"scope": "p10000",
+			"bucket": "all",
+			"rows": 500,
+			"summary": {
+				"n": 100,
+				"p50": 40.443037999997614,
+				"p95": 53.36831099999836,
+				"p99": 61.676235999999335,
+				"max": 66.99133399999118,
+				"mean": 40.17104060999904
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q1 vp500 read+js-order",
+			"scope": "p10000",
+			"bucket": "early",
+			"rows": 500,
+			"summary": {
+				"n": 34,
+				"p50": 30.57708100002492,
+				"p95": 38.571492000017315,
+				"p99": 47.66375199999311,
+				"max": 47.66375199999311,
+				"mean": 31.18289532352869
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q1 vp500 read+js-order",
+			"scope": "p10000",
+			"bucket": "mid",
+			"rows": 500,
+			"summary": {
+				"n": 33,
+				"p50": 40.443037999997614,
+				"p95": 53.1989149999863,
+				"p99": 55.322529999975814,
+				"max": 55.322529999975814,
+				"mean": 41.97426736363118
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q1 vp500 read+js-order",
+			"scope": "p10000",
+			"bucket": "late",
+			"rows": 500,
+			"summary": {
+				"n": 33,
+				"p50": 45.86217300000135,
+				"p95": 61.676235999999335,
+				"p99": 66.99133399999118,
+				"max": 66.99133399999118,
+				"mean": 47.62832718182119
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q2s structure only",
+			"scope": "p2000",
+			"bucket": "all",
+			"rows": 1839,
+			"summary": {
+				"n": 300,
+				"p50": 2.7135049999924377,
+				"p95": 9.049536999984412,
+				"p99": 11.012214999995194,
+				"max": 115.95927500000107,
+				"mean": 4.0973528899988745
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q2s structure only",
+			"scope": "p2000",
+			"bucket": "early",
+			"rows": 1839,
+			"summary": {
+				"n": 100,
+				"p50": 1.8386520000058226,
+				"p95": 5.237159000011161,
+				"p99": 6.99456600000849,
+				"max": 115.95927500000107,
+				"mean": 3.3957411999980103
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q2s structure only",
+			"scope": "p2000",
+			"bucket": "mid",
+			"rows": 1839,
+			"summary": {
+				"n": 100,
+				"p50": 3.0558180000225548,
+				"p95": 7.5207030000165105,
+				"p99": 9.17586799999117,
+				"max": 9.827418000000762,
+				"mean": 3.7314079999993557
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q2s structure only",
+			"scope": "p2000",
+			"bucket": "late",
+			"rows": 1839,
+			"summary": {
+				"n": 100,
+				"p50": 4.456181999994442,
+				"p95": 10.424108000006527,
+				"p99": 11.96935199998552,
+				"max": 15.190013999992516,
+				"mean": 5.164909469999256
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q1 vp500 two-step",
+			"scope": "p2000",
+			"bucket": "all",
+			"rows": 500,
+			"summary": {
+				"n": 300,
+				"p50": 7.2780820000043605,
+				"p95": 11.345477000024403,
+				"p99": 13.518745000008494,
+				"max": 18.6788499999966,
+				"mean": 7.540484353333207
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q1 vp500 two-step",
+			"scope": "p2000",
+			"bucket": "early",
+			"rows": 500,
+			"summary": {
+				"n": 100,
+				"p50": 6.253318000002764,
+				"p95": 10.039728000003379,
+				"p99": 10.957003999996232,
+				"max": 11.306800000020303,
+				"mean": 6.53082054000115
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q1 vp500 two-step",
+			"scope": "p2000",
+			"bucket": "mid",
+			"rows": 500,
+			"summary": {
+				"n": 100,
+				"p50": 6.900794000015594,
+				"p95": 11.137995999975828,
+				"p99": 13.02250599997933,
+				"max": 13.518745000008494,
+				"mean": 7.422621469999722
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q1 vp500 two-step",
+			"scope": "p2000",
+			"bucket": "late",
+			"rows": 500,
+			"summary": {
+				"n": 100,
+				"p50": 8.100633000023663,
+				"p95": 12.871358999982476,
+				"p99": 14.324602000007872,
+				"max": 18.6788499999966,
+				"mean": 8.66801104999875
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q2s structure only",
+			"scope": "p10000",
+			"bucket": "all",
+			"rows": 8716,
+			"summary": {
+				"n": 100,
+				"p50": 13.581219000014244,
+				"p95": 24.483004000008805,
+				"p99": 27.865629000007175,
+				"max": 38.53878699999768,
+				"mean": 13.908437389999163
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q2s structure only",
+			"scope": "p10000",
+			"bucket": "early",
+			"rows": 8716,
+			"summary": {
+				"n": 34,
+				"p50": 8.192191000009188,
+				"p95": 10.97723199997563,
+				"p99": 13.852336000010837,
+				"max": 13.852336000010837,
+				"mean": 7.950161764704664
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q2s structure only",
+			"scope": "p10000",
+			"bucket": "mid",
+			"rows": 8716,
+			"summary": {
+				"n": 33,
+				"p50": 13.581219000014244,
+				"p95": 18.416193999990355,
+				"p99": 38.53878699999768,
+				"max": 38.53878699999768,
+				"mean": 14.30961551514867
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q2s structure only",
+			"scope": "p10000",
+			"bucket": "late",
+			"rows": 8716,
+			"summary": {
+				"n": 33,
+				"p50": 19.06583999999566,
+				"p95": 27.595321000000695,
+				"p99": 27.865629000007175,
+				"max": 27.865629000007175,
+				"mean": 19.646088696971262
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q1 vp500 two-step",
+			"scope": "p10000",
+			"bucket": "all",
+			"rows": 500,
+			"summary": {
+				"n": 100,
+				"p50": 20.30122900000424,
+				"p95": 28.25575100001879,
+				"p99": 30.246761999995215,
+				"max": 40.32233399999677,
+				"mean": 20.019703030000382
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q1 vp500 two-step",
+			"scope": "p10000",
+			"bucket": "early",
+			"rows": 500,
+			"summary": {
+				"n": 34,
+				"p50": 13.530637000018032,
+				"p95": 18.446400999993784,
+				"p99": 24.62011899999925,
+				"max": 24.62011899999925,
+				"mean": 14.510415058826124
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q1 vp500 two-step",
+			"scope": "p10000",
+			"bucket": "mid",
+			"rows": 500,
+			"summary": {
+				"n": 33,
+				"p50": 20.30122900000424,
+				"p95": 23.291029000014532,
+				"p99": 28.41707399999723,
+				"max": 28.41707399999723,
+				"mean": 19.971465787877662
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q1 vp500 two-step",
+			"scope": "p10000",
+			"bucket": "late",
+			"rows": 500,
+			"summary": {
+				"n": 33,
+				"p50": 24.89255800002138,
+				"p95": 30.246761999995215,
+				"p99": 40.32233399999677,
+				"max": 40.32233399999677,
+				"mean": 25.744176363635976
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q3 diff W=1 flags",
+			"scope": "p2000",
+			"bucket": "all",
+			"rows": 1,
+			"summary": {
+				"n": 150,
+				"p50": 0.01630200000363402,
+				"p95": 0.05007200001273304,
+				"p99": 0.08717799998703413,
+				"max": 0.19212200000765733,
+				"mean": 0.02213882000146744
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q3 diff W=1 flags",
+			"scope": "p2000",
+			"bucket": "early",
+			"rows": 1,
+			"summary": {
+				"n": 50,
+				"p50": 0.016666999988956377,
+				"p95": 0.05532699998002499,
+				"p99": 0.0650690000038594,
+				"max": 0.0650690000038594,
+				"mean": 0.02122186000167858
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q3 diff W=1 flags",
+			"scope": "p2000",
+			"bucket": "mid",
+			"rows": 1,
+			"summary": {
+				"n": 50,
+				"p50": 0.01541899997391738,
+				"p95": 0.060582000005524606,
+				"p99": 0.19212200000765733,
+				"max": 0.19212200000765733,
+				"mean": 0.02461978000239469
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q3 diff W=1 flags",
+			"scope": "p2000",
+			"bucket": "late",
+			"rows": 1,
+			"summary": {
+				"n": 50,
+				"p50": 0.016337999986717477,
+				"p95": 0.045058000017888844,
+				"p99": 0.07486200000857934,
+				"max": 0.07486200000857934,
+				"mean": 0.020574820000329053
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q3 diff W=1 join",
+			"scope": "p2000",
+			"bucket": "all",
+			"rows": 1,
+			"summary": {
+				"n": 150,
+				"p50": 0.020915000000968575,
+				"p95": 0.15388600001460873,
+				"p99": 0.34750000000349246,
+				"max": 0.652907999989111,
+				"mean": 0.04825709333371681
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q3 diff W=1 join",
+			"scope": "p2000",
+			"bucket": "early",
+			"rows": 1,
+			"summary": {
+				"n": 50,
+				"p50": 0.023248999990755692,
+				"p95": 0.10458199999993667,
+				"p99": 0.15388600001460873,
+				"max": 0.15388600001460873,
+				"mean": 0.03902165999868885
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q3 diff W=1 join",
+			"scope": "p2000",
+			"bucket": "mid",
+			"rows": 1,
+			"summary": {
+				"n": 50,
+				"p50": 0.020818999997572973,
+				"p95": 0.26208100002259016,
+				"p99": 0.652907999989111,
+				"max": 0.652907999989111,
+				"mean": 0.0639024800027255
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q3 diff W=1 join",
+			"scope": "p2000",
+			"bucket": "late",
+			"rows": 1,
+			"summary": {
+				"n": 50,
+				"p50": 0.020915000000968575,
+				"p95": 0.20333899999968708,
+				"p99": 0.32799699998577125,
+				"max": 0.32799699998577125,
+				"mean": 0.0418471399997361
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q3 diff W=100 flags",
+			"scope": "p2000",
+			"bucket": "all",
+			"rows": 22,
+			"summary": {
+				"n": 150,
+				"p50": 0.06842799999867566,
+				"p95": 0.32415599998785183,
+				"p99": 0.5548100000014529,
+				"max": 0.6657349999877624,
+				"mean": 0.10357477333435479
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q3 diff W=100 flags",
+			"scope": "p2000",
+			"bucket": "early",
+			"rows": 22,
+			"summary": {
+				"n": 50,
+				"p50": 0.082605000003241,
+				"p95": 0.3820490000071004,
+				"p99": 0.4537830000044778,
+				"max": 0.4537830000044778,
+				"mean": 0.10985024000168778
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q3 diff W=100 flags",
+			"scope": "p2000",
+			"bucket": "mid",
+			"rows": 22,
+			"summary": {
+				"n": 50,
+				"p50": 0.06662900000810623,
+				"p95": 0.3312230000155978,
+				"p99": 0.6657349999877624,
+				"max": 0.6657349999877624,
+				"mean": 0.12627881999942475
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q3 diff W=100 flags",
+			"scope": "p2000",
+			"bucket": "late",
+			"rows": 22,
+			"summary": {
+				"n": 50,
+				"p50": 0.05622500000754371,
+				"p95": 0.17410599999129772,
+				"p99": 0.33068300000741147,
+				"max": 0.33068300000741147,
+				"mean": 0.07459526000195182
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q3 diff W=100 join",
+			"scope": "p2000",
+			"bucket": "all",
+			"rows": 22,
+			"summary": {
+				"n": 150,
+				"p50": 0.20340299999224953,
+				"p95": 1.2648120000085328,
+				"p99": 2.6438450000132434,
+				"max": 2.722810000006575,
+				"mean": 0.3915851599992796
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q3 diff W=100 join",
+			"scope": "p2000",
+			"bucket": "early",
+			"rows": 22,
+			"summary": {
+				"n": 50,
+				"p50": 0.2398830000020098,
+				"p95": 1.5454489999974612,
+				"p99": 2.008049999974901,
+				"max": 2.008049999974901,
+				"mean": 0.42734787999943363
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q3 diff W=100 join",
+			"scope": "p2000",
+			"bucket": "mid",
+			"rows": 22,
+			"summary": {
+				"n": 50,
+				"p50": 0.24712200000067241,
+				"p95": 1.2648120000085328,
+				"p99": 2.722810000006575,
+				"max": 2.722810000006575,
+				"mean": 0.4724143200006802
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q3 diff W=100 join",
+			"scope": "p2000",
+			"bucket": "late",
+			"rows": 22,
+			"summary": {
+				"n": 50,
+				"p50": 0.1441820000181906,
+				"p95": 1.213618999987375,
+				"p99": 1.5159709999861661,
+				"max": 1.5159709999861661,
+				"mean": 0.27499327999772505
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q3 diff W=5000 flags",
+			"scope": "p2000",
+			"bucket": "all",
+			"rows": 1198,
+			"summary": {
+				"n": 150,
+				"p50": 2.9716110000154004,
+				"p95": 12.383088999980828,
+				"p99": 32.27114399999846,
+				"max": 38.4210890000104,
+				"mean": 4.364409166666641
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q3 diff W=5000 flags",
+			"scope": "p2000",
+			"bucket": "early",
+			"rows": 1198,
+			"summary": {
+				"n": 50,
+				"p50": 2.9809109999914654,
+				"p95": 8.055019999999786,
+				"p99": 17.307501000002958,
+				"max": 17.307501000002958,
+				"mean": 3.67783177999896
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q3 diff W=5000 flags",
+			"scope": "p2000",
+			"bucket": "mid",
+			"rows": 1198,
+			"summary": {
+				"n": 50,
+				"p50": 3.0253220000013243,
+				"p95": 14.652627000003122,
+				"p99": 32.27114399999846,
+				"max": 32.27114399999846,
+				"mean": 4.985603899999988
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q3 diff W=5000 flags",
+			"scope": "p2000",
+			"bucket": "late",
+			"rows": 1198,
+			"summary": {
+				"n": 50,
+				"p50": 2.8604790000244975,
+				"p95": 10.38604199999827,
+				"p99": 38.4210890000104,
+				"max": 38.4210890000104,
+				"mean": 4.429791820000974
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q3 diff W=5000 join",
+			"scope": "p2000",
+			"bucket": "all",
+			"rows": 1198,
+			"summary": {
+				"n": 150,
+				"p50": 9.032338999997592,
+				"p95": 40.630406000011135,
+				"p99": 92.65126700000837,
+				"max": 109.84002299999702,
+				"mean": 13.455599859999104
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q3 diff W=5000 join",
+			"scope": "p2000",
+			"bucket": "early",
+			"rows": 1198,
+			"summary": {
+				"n": 50,
+				"p50": 9.248242000001483,
+				"p95": 28.843344999972032,
+				"p99": 43.74853800001438,
+				"max": 43.74853800001438,
+				"mean": 11.55907278000086
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q3 diff W=5000 join",
+			"scope": "p2000",
+			"bucket": "mid",
+			"rows": 1198,
+			"summary": {
+				"n": 50,
+				"p50": 8.604202000016812,
+				"p95": 48.93047099999967,
+				"p99": 92.65126700000837,
+				"max": 92.65126700000837,
+				"mean": 15.707070939998957
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q3 diff W=5000 join",
+			"scope": "p2000",
+			"bucket": "late",
+			"rows": 1198,
+			"summary": {
+				"n": 50,
+				"p50": 9.032338999997592,
+				"p95": 36.542886000010185,
+				"p99": 109.84002299999702,
+				"max": 109.84002299999702,
+				"mean": 13.100655859997495
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q4d commits of page",
+			"scope": "200/page",
+			"bucket": "all",
+			"rows": 201,
+			"summary": {
+				"n": 150,
+				"p50": 2.0116930000076536,
+				"p95": 2.328628999995999,
+				"p99": 2.53007500001695,
+				"max": 2.673804999998538,
+				"mean": 1.9549793866655092
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "B5",
+			"query": "Q4d commits of page",
+			"scope": "200/page",
+			"bucket": "mid",
+			"rows": 201,
+			"summary": {
+				"n": 150,
+				"p50": 2.0116930000076536,
+				"p95": 2.328628999995999,
+				"p99": 2.53007500001695,
+				"max": 2.673804999998538,
+				"mean": 1.9549793866655092
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "C",
+			"query": "Q2 page@T",
+			"scope": "p2000",
+			"bucket": "all",
+			"rows": 1839,
+			"summary": {
+				"n": 300,
+				"p50": 13.316185000003316,
+				"p95": 17.750377999997,
+				"p99": 20.700119000015547,
+				"max": 22.263650000008056,
+				"mean": 11.84693531333304
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "C",
+			"query": "Q2 page@T",
+			"scope": "p2000",
+			"bucket": "early",
+			"rows": 1839,
+			"summary": {
+				"n": 100,
+				"p50": 13.150368000002345,
+				"p95": 16.45641899999464,
+				"p99": 20.185073999979068,
+				"max": 21.761432000028435,
+				"mean": 12.80442760999984
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "C",
+			"query": "Q2 page@T",
+			"scope": "p2000",
+			"bucket": "mid",
+			"rows": 1839,
+			"summary": {
+				"n": 100,
+				"p50": 13.323059000016656,
+				"p95": 17.35572900000261,
+				"p99": 19.775905999995302,
+				"max": 22.263650000008056,
+				"mean": 11.244788579999877
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "C",
+			"query": "Q2 page@T",
+			"scope": "p2000",
+			"bucket": "late",
+			"rows": 1839,
+			"summary": {
+				"n": 100,
+				"p50": 13.857592999993358,
+				"p95": 18.05825500001083,
+				"p99": 20.700119000015547,
+				"max": 20.818155999993905,
+				"mean": 11.491589749999402
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "C",
+			"query": "Q2 page@T",
+			"scope": "p10000",
+			"bucket": "all",
+			"rows": 8716,
+			"summary": {
+				"n": 100,
+				"p50": 68.83133399998769,
+				"p95": 87.90250900000683,
+				"p99": 99.20688400001382,
+				"max": 103.12179200001992,
+				"mean": 70.08602879000013
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "C",
+			"query": "Q2 page@T",
+			"scope": "p10000",
+			"bucket": "early",
+			"rows": 8716,
+			"summary": {
+				"n": 34,
+				"p50": 68.83133399998769,
+				"p95": 76.89945499997702,
+				"p99": 91.73755900000106,
+				"max": 91.73755900000106,
+				"mean": 68.5316414705868
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "C",
+			"query": "Q2 page@T",
+			"scope": "p10000",
+			"bucket": "mid",
+			"rows": 8716,
+			"summary": {
+				"n": 33,
+				"p50": 71.13170299999183,
+				"p95": 91.26928799998132,
+				"p99": 99.20688400001382,
+				"max": 99.20688400001382,
+				"mean": 73.9486950000009
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "C",
+			"query": "Q2 page@T",
+			"scope": "p10000",
+			"bucket": "late",
+			"rows": 8716,
+			"summary": {
+				"n": 33,
+				"p50": 65.23555400001351,
+				"p95": 91.68315199998324,
+				"p99": 103.12179200001992,
+				"max": 103.12179200001992,
+				"mean": 67.82485254545551
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "C",
+			"query": "Q1 vp500 read+js-order",
+			"scope": "p2000",
+			"bucket": "all",
+			"rows": 500,
+			"summary": {
+				"n": 300,
+				"p50": 13.867335999995703,
+				"p95": 18.085863999993308,
+				"p99": 19.88671500000055,
+				"max": 23.07667500001844,
+				"mean": 12.331583460000596
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "C",
+			"query": "Q1 vp500 read+js-order",
+			"scope": "p2000",
+			"bucket": "early",
+			"rows": 500,
+			"summary": {
+				"n": 100,
+				"p50": 13.714345000014873,
+				"p95": 16.302017000009073,
+				"p99": 17.484582000004593,
+				"max": 17.968522000010125,
+				"mean": 13.239100320000725
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "C",
+			"query": "Q1 vp500 read+js-order",
+			"scope": "p2000",
+			"bucket": "mid",
+			"rows": 500,
+			"summary": {
+				"n": 100,
+				"p50": 14.214332999981707,
+				"p95": 16.983468999998877,
+				"p99": 19.347108999994816,
+				"max": 21.815380999993067,
+				"mean": 11.846025450000306
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "C",
+			"query": "Q1 vp500 read+js-order",
+			"scope": "p2000",
+			"bucket": "late",
+			"rows": 500,
+			"summary": {
+				"n": 100,
+				"p50": 14.281048000004375,
+				"p95": 18.970387999986997,
+				"p99": 23.04503300000215,
+				"max": 23.07667500001844,
+				"mean": 11.909624610000755
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "C",
+			"query": "Q1 vp500 read+js-order",
+			"scope": "p10000",
+			"bucket": "all",
+			"rows": 500,
+			"summary": {
+				"n": 100,
+				"p50": 75.65142599999672,
+				"p95": 95.6572500000184,
+				"p99": 119.9852269999974,
+				"max": 128.1958980000054,
+				"mean": 77.69712895000092
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "C",
+			"query": "Q1 vp500 read+js-order",
+			"scope": "p10000",
+			"bucket": "early",
+			"rows": 500,
+			"summary": {
+				"n": 34,
+				"p50": 75.68363499999396,
+				"p95": 95.6572500000184,
+				"p99": 128.1958980000054,
+				"max": 128.1958980000054,
+				"mean": 78.169876205883
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "C",
+			"query": "Q1 vp500 read+js-order",
+			"scope": "p10000",
+			"bucket": "mid",
+			"rows": 500,
+			"summary": {
+				"n": 33,
+				"p50": 78.96643999998923,
+				"p95": 108.77531900000758,
+				"p99": 119.9852269999974,
+				"max": 119.9852269999974,
+				"mean": 80.91694206060933
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "C",
+			"query": "Q1 vp500 read+js-order",
+			"scope": "p10000",
+			"bucket": "late",
+			"rows": 500,
+			"summary": {
+				"n": 33,
+				"p50": 71.20344299997669,
+				"p95": 93.05988400001661,
+				"p99": 103.12094800002524,
+				"max": 103.12094800002524,
+				"mean": 73.99024290908974
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "C",
+			"query": "Q3 diff W=1",
+			"scope": "p2000",
+			"bucket": "all",
+			"rows": 1,
+			"summary": {
+				"n": 150,
+				"p50": 5.068854999990435,
+				"p95": 6.449845999974059,
+				"p99": 7.154781999997795,
+				"max": 7.392334000003757,
+				"mean": 4.438962246669107
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "C",
+			"query": "Q3 diff W=1",
+			"scope": "p2000",
+			"bucket": "early",
+			"rows": 1,
+			"summary": {
+				"n": 50,
+				"p50": 5.2956300000078045,
+				"p95": 6.25994200000423,
+				"p99": 6.491733000002569,
+				"max": 6.491733000002569,
+				"mean": 4.54823408000404
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "C",
+			"query": "Q3 diff W=1",
+			"scope": "p2000",
+			"bucket": "mid",
+			"rows": 1,
+			"summary": {
+				"n": 50,
+				"p50": 5.06501500000013,
+				"p95": 6.988073000014992,
+				"p99": 7.154781999997795,
+				"max": 7.154781999997795,
+				"mean": 4.207124980001827
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "C",
+			"query": "Q3 diff W=1",
+			"scope": "p2000",
+			"bucket": "late",
+			"rows": 1,
+			"summary": {
+				"n": 50,
+				"p50": 5.031228000007104,
+				"p95": 6.392351999995299,
+				"p99": 7.392334000003757,
+				"max": 7.392334000003757,
+				"mean": 4.561527680001454
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "C",
+			"query": "Q3 diff W=100",
+			"scope": "p2000",
+			"bucket": "all",
+			"rows": 23,
+			"summary": {
+				"n": 150,
+				"p50": 5.121562000014819,
+				"p95": 6.199060999992071,
+				"p99": 6.843640000006417,
+				"max": 6.917937999998685,
+				"mean": 4.567753020000722
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "C",
+			"query": "Q3 diff W=100",
+			"scope": "p2000",
+			"bucket": "early",
+			"rows": 23,
+			"summary": {
+				"n": 50,
+				"p50": 5.099370999989333,
+				"p95": 6.00281599999289,
+				"p99": 6.917937999998685,
+				"max": 6.917937999998685,
+				"mean": 4.472745679999934
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "C",
+			"query": "Q3 diff W=100",
+			"scope": "p2000",
+			"bucket": "mid",
+			"rows": 23,
+			"summary": {
+				"n": 50,
+				"p50": 5.226642000023276,
+				"p95": 6.356245000002673,
+				"p99": 6.843640000006417,
+				"max": 6.843640000006417,
+				"mean": 4.8285537600028325
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "C",
+			"query": "Q3 diff W=100",
+			"scope": "p2000",
+			"bucket": "late",
+			"rows": 23,
+			"summary": {
+				"n": 50,
+				"p50": 4.971343000011984,
+				"p95": 6.157283999986248,
+				"p99": 6.736183999979403,
+				"max": 6.736183999979403,
+				"mean": 4.401959619999397
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "C",
+			"query": "Q3 diff W=5000",
+			"scope": "p2000",
+			"bucket": "all",
+			"rows": 1367,
+			"summary": {
+				"n": 150,
+				"p50": 9.796486000006553,
+				"p95": 30.303784999996424,
+				"p99": 81.49999599999865,
+				"max": 89.98585299999104,
+				"mean": 12.320242886667256
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "C",
+			"query": "Q3 diff W=5000",
+			"scope": "p2000",
+			"bucket": "early",
+			"rows": 1367,
+			"summary": {
+				"n": 50,
+				"p50": 9.798206000006758,
+				"p95": 18.35723200000939,
+				"p99": 36.13698999999906,
+				"max": 36.13698999999906,
+				"mean": 11.064109220000683
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "C",
+			"query": "Q3 diff W=5000",
+			"scope": "p2000",
+			"bucket": "mid",
+			"rows": 1367,
+			"summary": {
+				"n": 50,
+				"p50": 9.71411800000351,
+				"p95": 31.77504000000772,
+				"p99": 89.98585299999104,
+				"max": 89.98585299999104,
+				"mean": 14.0651336800016
+			}
+		},
+		{
+			"dialect": "sqlite-prod-vpb30",
+			"variant": "C",
+			"query": "Q3 diff W=5000",
+			"scope": "p2000",
+			"bucket": "late",
+			"rows": 1367,
+			"summary": {
+				"n": 50,
+				"p50": 9.675534999987576,
+				"p95": 17.77034200000344,
+				"p99": 81.49999599999865,
+				"max": 81.49999599999865,
+				"mean": 11.831485759999486
+			}
+		}
+	]
 }

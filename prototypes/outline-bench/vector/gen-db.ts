@@ -32,12 +32,20 @@ export function buildDbs(n: number, dim: number, specs: DbSpec[]) {
 		db.run("PRAGMA synchronous = OFF");
 		db.run("PRAGMA cache_size = -200000");
 		if (s.tables.includes("r2"))
-			db.run("CREATE TABLE vec2 (space_id INTEGER NOT NULL, block_id INTEGER NOT NULL, scale REAL NOT NULL, vec BLOB NOT NULL, PRIMARY KEY (space_id, block_id)) WITHOUT ROWID");
+			db.run(
+				"CREATE TABLE vec2 (space_id INTEGER NOT NULL, block_id INTEGER NOT NULL, scale REAL NOT NULL, vec BLOB NOT NULL, PRIMARY KEY (space_id, block_id)) WITHOUT ROWID",
+			);
 		if (s.tables.includes("r3"))
-			db.run("CREATE TABLE chunks (space_id INTEGER NOT NULL, chunk_no INTEGER NOT NULL, n INTEGER NOT NULL, ids BLOB NOT NULL, scales BLOB NOT NULL, vecs BLOB NOT NULL, PRIMARY KEY (space_id, chunk_no)) WITHOUT ROWID");
+			db.run(
+				"CREATE TABLE chunks (space_id INTEGER NOT NULL, chunk_no INTEGER NOT NULL, n INTEGER NOT NULL, ids BLOB NOT NULL, scales BLOB NOT NULL, vecs BLOB NOT NULL, PRIMARY KEY (space_id, chunk_no)) WITHOUT ROWID",
+			);
 		if (s.tables.includes("r1")) {
-			db.run("CREATE TABLE blocks (id INTEGER PRIMARY KEY, space_id INTEGER NOT NULL, content_hash TEXT NOT NULL)");
-			db.run("CREATE TABLE embeddings (model_id TEXT NOT NULL, content_hash TEXT NOT NULL, dims INTEGER NOT NULL, scale REAL NOT NULL, vector_blob BLOB NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (model_id, content_hash))");
+			db.run(
+				"CREATE TABLE blocks (id INTEGER PRIMARY KEY, space_id INTEGER NOT NULL, content_hash TEXT NOT NULL)",
+			);
+			db.run(
+				"CREATE TABLE embeddings (model_id TEXT NOT NULL, content_hash TEXT NOT NULL, dims INTEGER NOT NULL, scale REAL NOT NULL, vector_blob BLOB NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (model_id, content_hash))",
+			);
 		}
 		return { spec: s, db, begin: false };
 	});
@@ -46,7 +54,8 @@ export function buildDbs(n: number, dim: number, specs: DbSpec[]) {
 	const make = (i: number) => {
 		genVector(g, i, f);
 		const out: { f32?: Uint8Array; i8?: Uint8Array; scale: number } = { scale: 1 };
-		if (dbs.some((d) => d.spec.dtype === "f32")) out.f32 = new Uint8Array(new Float32Array(f).buffer);
+		if (dbs.some((d) => d.spec.dtype === "f32"))
+			out.f32 = new Uint8Array(new Float32Array(f).buffer);
 		if (dbs.some((d) => d.spec.dtype === "i8")) {
 			const q = new Int8Array(dim);
 			out.scale = quantize(f, q);
@@ -59,8 +68,12 @@ export function buildDbs(n: number, dim: number, specs: DbSpec[]) {
 	// pass A: clustered order (space-major) for r2 / r3
 	const needA = dbs.some((d) => d.spec.tables.includes("r2") || d.spec.tables.includes("r3"));
 	if (needA) {
-		const ins2 = dbs.map((d) => (d.spec.tables.includes("r2") ? d.db.prepare("INSERT INTO vec2 VALUES (?,?,?,?)") : null));
-		const ins3 = dbs.map((d) => (d.spec.tables.includes("r3") ? d.db.prepare("INSERT INTO chunks VALUES (?,?,?,?,?,?)") : null));
+		const ins2 = dbs.map((d) =>
+			d.spec.tables.includes("r2") ? d.db.prepare("INSERT INTO vec2 VALUES (?,?,?,?)") : null,
+		);
+		const ins3 = dbs.map((d) =>
+			d.spec.tables.includes("r3") ? d.db.prepare("INSERT INTO chunks VALUES (?,?,?,?,?,?)") : null,
+		);
 		for (let s = 0; s < SPACES; s++) {
 			const chunkBuf = dbs.map((d) => new Uint8Array(CHUNK * bytesPer(d.spec.dtype)));
 			const chunkScale = new Float32Array(CHUNK);
@@ -74,7 +87,14 @@ export function buildDbs(n: number, dim: number, specs: DbSpec[]) {
 					const st = ins3[k];
 					if (!st) return;
 					const bytes = bytesPer(d.spec.dtype);
-					st.run(s, chunkNo, inChunk, new Uint8Array(chunkIds.buffer.slice(0, inChunk * 4)), new Uint8Array(chunkScale.buffer.slice(0, inChunk * 4)), (chunkBuf[k] as Uint8Array).slice(0, inChunk * bytes));
+					st.run(
+						s,
+						chunkNo,
+						inChunk,
+						new Uint8Array(chunkIds.buffer.slice(0, inChunk * 4)),
+						new Uint8Array(chunkScale.buffer.slice(0, inChunk * 4)),
+						(chunkBuf[k] as Uint8Array).slice(0, inChunk * bytes),
+					);
 				});
 				chunkNo++;
 				inChunk = 0;
@@ -107,8 +127,14 @@ export function buildDbs(n: number, dim: number, specs: DbSpec[]) {
 	// pass B: arrival order for r1
 	const needB = dbs.some((d) => d.spec.tables.includes("r1"));
 	if (needB) {
-		const insB = dbs.map((d) => (d.spec.tables.includes("r1") ? d.db.prepare("INSERT INTO blocks VALUES (?,?,?)") : null));
-		const insE = dbs.map((d) => (d.spec.tables.includes("r1") ? d.db.prepare("INSERT INTO embeddings VALUES (?,?,?,?,?,?)") : null));
+		const insB = dbs.map((d) =>
+			d.spec.tables.includes("r1") ? d.db.prepare("INSERT INTO blocks VALUES (?,?,?)") : null,
+		);
+		const insE = dbs.map((d) =>
+			d.spec.tables.includes("r1")
+				? d.db.prepare("INSERT INTO embeddings VALUES (?,?,?,?,?,?)")
+				: null,
+		);
 		for (const d of dbs) d.db.run("BEGIN");
 		for (let i = 0; i < n; i++) {
 			const v = make(i);
@@ -117,7 +143,14 @@ export function buildDbs(n: number, dim: number, specs: DbSpec[]) {
 				if (!insB[k]) return;
 				const blob = d.spec.dtype === "i8" ? (v.i8 as Uint8Array) : (v.f32 as Uint8Array);
 				insB[k]?.run(i, i % SPACES, hash);
-				insE[k]?.run("text-embedding-bench", hash, dim, d.spec.dtype === "i8" ? v.scale : 1, blob, 1700000000000);
+				insE[k]?.run(
+					"text-embedding-bench",
+					hash,
+					dim,
+					d.spec.dtype === "i8" ? v.scale : 1,
+					blob,
+					1700000000000,
+				);
 			});
 			if (i % 50000 === 49999) {
 				for (const d of dbs) {
@@ -127,7 +160,8 @@ export function buildDbs(n: number, dim: number, specs: DbSpec[]) {
 			}
 		}
 		for (const d of dbs) d.db.run("COMMIT");
-		for (const d of dbs) if (d.spec.tables.includes("r1")) d.db.run("CREATE INDEX blocks_space ON blocks (space_id)");
+		for (const d of dbs)
+			if (d.spec.tables.includes("r1")) d.db.run("CREATE INDEX blocks_space ON blocks (space_id)");
 	}
 	for (const d of dbs) {
 		d.db.run("ANALYZE");
@@ -136,9 +170,14 @@ export function buildDbs(n: number, dim: number, specs: DbSpec[]) {
 }
 
 if (import.meta.main) {
+	// bun vector/gen-db.ts <n> <dim> [dtype=i8] [tables=r1,r2,r3] [path]
 	const n = Number(process.argv[2] ?? 50000);
 	const dim = Number(process.argv[3] ?? 768);
+	const dtype = (process.argv[4] ?? "i8") as Dtype;
+	const tables = (process.argv[5] ?? "r1,r2,r3").split(",") as DbSpec["tables"];
+	const path =
+		process.argv[6] ?? `${process.env.OUTLINE_BENCH_DATA ?? "."}/vec-test-${n}-${dim}-${dtype}.db`;
 	const t0 = performance.now();
-	buildDbs(n, dim, [{ dtype: "i8", path: `${process.env.OUTLINE_BENCH_DATA ?? "."}/vec-test-${n}-${dim}-i8.db`, tables: ["r1", "r2", "r3"] }]);
-	console.log(`built in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
+	buildDbs(n, dim, [{ dtype, path, tables }]);
+	console.log(`built ${path} in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
 }

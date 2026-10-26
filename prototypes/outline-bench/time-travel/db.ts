@@ -58,7 +58,9 @@ export function openSqlite(path: string, tuning: SqliteTuning = SQLITE_PROD): Db
 		async tx(fn) {
 			db.run("BEGIN IMMEDIATE");
 			try {
-				const out = await fn(async (sql, params = []) => db.query(sql).all(...(params as never[])) as Row[]);
+				const out = await fn(
+					async (sql, params = []) => db.query(sql).all(...(params as never[])) as Row[],
+				);
 				db.run("COMMIT");
 				return out;
 			} catch (e) {
@@ -87,7 +89,10 @@ export function openPg(database: string): Db {
 		},
 		async tx(fn) {
 			return (await sql.begin(async (t) => {
-				return fn(async (text, params = []) => (await t.unsafe(text, params as never[])) as unknown as Row[]);
+				return fn(
+					async (text, params = []) =>
+						(await t.unsafe(text, params as never[])) as unknown as Row[],
+				);
 			})) as never;
 		},
 	};

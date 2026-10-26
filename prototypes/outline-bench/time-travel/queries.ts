@@ -32,7 +32,10 @@ export const VARIANTS: Record<VariantId, VariantDef> = {
 		approach: "parent",
 		index: "ix_a1",
 		useMax: false,
-		ddl: { sqlite: [`CREATE INDEX ix_a1 ON ${V} (parent_id, from_seq)`], pg: [`CREATE INDEX ix_a1 ON ${V} (parent_id, from_seq)`] },
+		ddl: {
+			sqlite: [`CREATE INDEX ix_a1 ON ${V} (parent_id, from_seq)`],
+			pg: [`CREATE INDEX ix_a1 ON ${V} (parent_id, from_seq)`],
+		},
 		drop: ["ix_a1"],
 	},
 	A2: {
@@ -41,7 +44,10 @@ export const VARIANTS: Record<VariantId, VariantDef> = {
 		approach: "parent",
 		index: "ix_a2",
 		useMax: true,
-		ddl: { sqlite: [`CREATE INDEX ix_a2 ON ${V} (parent_id, from_seq, to_max)`], pg: [`CREATE INDEX ix_a2 ON ${V} (parent_id, from_seq, to_max)`] },
+		ddl: {
+			sqlite: [`CREATE INDEX ix_a2 ON ${V} (parent_id, from_seq, to_max)`],
+			pg: [`CREATE INDEX ix_a2 ON ${V} (parent_id, from_seq, to_max)`],
+		},
 		drop: ["ix_a2"],
 	},
 	B1: {
@@ -50,7 +56,10 @@ export const VARIANTS: Record<VariantId, VariantDef> = {
 		approach: "page",
 		index: "ix_b1",
 		useMax: false,
-		ddl: { sqlite: [`CREATE INDEX ix_b1 ON ${V} (page_id, from_seq)`], pg: [`CREATE INDEX ix_b1 ON ${V} (page_id, from_seq)`] },
+		ddl: {
+			sqlite: [`CREATE INDEX ix_b1 ON ${V} (page_id, from_seq)`],
+			pg: [`CREATE INDEX ix_b1 ON ${V} (page_id, from_seq)`],
+		},
 		drop: ["ix_b1"],
 	},
 	B2: {
@@ -59,7 +68,10 @@ export const VARIANTS: Record<VariantId, VariantDef> = {
 		approach: "page",
 		index: "ix_b2",
 		useMax: false,
-		ddl: { sqlite: [`CREATE INDEX ix_b2 ON ${V} (page_id, from_seq, to_seq)`], pg: [`CREATE INDEX ix_b2 ON ${V} (page_id, from_seq, to_seq)`] },
+		ddl: {
+			sqlite: [`CREATE INDEX ix_b2 ON ${V} (page_id, from_seq, to_seq)`],
+			pg: [`CREATE INDEX ix_b2 ON ${V} (page_id, from_seq, to_seq)`],
+		},
 		drop: ["ix_b2"],
 	},
 	B3: {
@@ -68,7 +80,10 @@ export const VARIANTS: Record<VariantId, VariantDef> = {
 		approach: "page",
 		index: "ix_b3",
 		useMax: true,
-		ddl: { sqlite: [`CREATE INDEX ix_b3 ON ${V} (page_id, from_seq, to_max)`], pg: [`CREATE INDEX ix_b3 ON ${V} (page_id, from_seq, to_max)`] },
+		ddl: {
+			sqlite: [`CREATE INDEX ix_b3 ON ${V} (page_id, from_seq, to_max)`],
+			pg: [`CREATE INDEX ix_b3 ON ${V} (page_id, from_seq, to_max)`],
+		},
 		drop: ["ix_b3"],
 	},
 	B4: {
@@ -87,13 +102,18 @@ export const VARIANTS: Record<VariantId, VariantDef> = {
 	},
 	B5: {
 		id: "B5",
-		title: "B5 page_id + covering structure index (page_id, from_seq, to_max | deleted, block_id, parent_id, order_key)",
+		title:
+			"B5 page_id + covering structure index (page_id, from_seq, to_max | deleted, block_id, parent_id, order_key)",
 		approach: "page",
 		index: "ix_b5",
 		useMax: true,
 		ddl: {
-			sqlite: [`CREATE INDEX ix_b5 ON ${V} (page_id, from_seq, to_max, deleted, block_id, parent_id, order_key)`],
-			pg: [`CREATE INDEX ix_b5 ON ${V} (page_id, from_seq, to_max) INCLUDE (deleted, block_id, parent_id, order_key)`],
+			sqlite: [
+				`CREATE INDEX ix_b5 ON ${V} (page_id, from_seq, to_max, deleted, block_id, parent_id, order_key)`,
+			],
+			pg: [
+				`CREATE INDEX ix_b5 ON ${V} (page_id, from_seq, to_max) INCLUDE (deleted, block_id, parent_id, order_key)`,
+			],
 		},
 		drop: ["ix_b5"],
 	},
@@ -103,7 +123,10 @@ export const VARIANTS: Record<VariantId, VariantDef> = {
 		approach: "members",
 		index: "ix_c",
 		useMax: true,
-		ddl: { sqlite: [`CREATE INDEX ix_c ON ${M} (page_id, from_seq, to_max)`], pg: [`CREATE INDEX ix_c ON ${M} (page_id, from_seq, to_max)`] },
+		ddl: {
+			sqlite: [`CREATE INDEX ix_c ON ${M} (page_id, from_seq, to_max)`],
+			pg: [`CREATE INDEX ix_c ON ${M} (page_id, from_seq, to_max)`],
+		},
 		drop: ["ix_c"],
 	},
 };
@@ -124,13 +147,19 @@ const COLS_NOCONTENT = "v.block_id, v.from_seq, v.parent_id, v.order_key, v.task
 // ---------------------------------------------------------------------------------------------
 // Q2: a whole page at T (all live blocks)
 
-function recursionSql(d: Dialect, def: VariantDef, mode: "all" | "dfs500" | "bfs500" | "path-sort500"): string {
+function recursionSql(
+	d: Dialect,
+	def: VariantDef,
+	mode: "all" | "dfs500" | "bfs500" | "path-sort500",
+): string {
 	const { p, t } = ph(d);
 	const by = d === "sqlite" ? ` INDEXED BY ${def.index}` : "";
 	const rootLive = live("x", def.useMax, t);
 	const childLive = live("c", def.useMax, t);
 	const needPath = mode === "dfs500" || mode === "path-sort500";
-	const rootSel = needPath ? "SELECT x.block_id, x.from_seq, 0 AS depth, ''::text AS path" : "SELECT x.block_id, x.from_seq, 0 AS depth";
+	const rootSel = needPath
+		? "SELECT x.block_id, x.from_seq, 0 AS depth, ''::text AS path"
+		: "SELECT x.block_id, x.from_seq, 0 AS depth";
 	const root =
 		d === "sqlite"
 			? `SELECT x.block_id, x.from_seq, 0 AS depth${needPath ? ", '' AS path" : ""} FROM ${V} x WHERE x.block_id = ${p} AND x.from_seq <= ${t} AND ${rootLive} AND x.deleted = 0`
@@ -139,7 +168,7 @@ function recursionSql(d: Dialect, def: VariantDef, mode: "all" | "dfs500" | "bfs
 	let rec = `${childSel} FROM tree tr JOIN ${V} c${by} ON c.parent_id = tr.block_id AND c.from_seq <= ${t} AND ${childLive} AND c.deleted = 0 WHERE tr.depth < 64`;
 	if (d === "sqlite" && mode === "dfs500") rec += " ORDER BY 4 LIMIT 500";
 	if (d === "sqlite" && mode === "bfs500") rec += " LIMIT 500";
-	const cols = needPath || mode !== "all" ? "block_id, from_seq, depth" + (needPath ? ", path" : "") : "block_id, from_seq, depth";
+	const cols = needPath ? "block_id, from_seq, depth, path" : "block_id, from_seq, depth";
 	const head = `WITH RECURSIVE tree(${cols}) AS (${root} UNION ALL ${rec})`;
 	let tail = `SELECT ${COLS} FROM tree tr JOIN ${V} v ON v.block_id = tr.block_id AND v.from_seq = tr.from_seq`;
 	if (mode === "dfs500" && d === "sqlite") tail += " ORDER BY tr.path";
@@ -173,7 +202,13 @@ export function pageAtSql(d: Dialect, def: VariantDef, opts: { noContent?: boole
 	return pageSql(d, def, opts.noContent);
 }
 
-export async function pageAt(db: Db, def: VariantDef, page: string, t: number, opts: { noContent?: boolean } = {}): Promise<Row[]> {
+export async function pageAt(
+	db: Db,
+	def: VariantDef,
+	page: string,
+	t: number,
+	opts: { noContent?: boolean } = {},
+): Promise<Row[]> {
 	return db.all(pageAtSql(db.dialect, def, opts), [page, t]);
 }
 
@@ -189,12 +224,13 @@ export function treeOrder(rows: Row[], limit: number): Row[] {
 		const par = r.parent_id as string | null;
 		if (par === null || !ids.has(par)) roots.push(r);
 		else {
-			let a = kids.get(par);
-			if (!a) kids.set(par, (a = []));
+			const a = kids.get(par) ?? [];
+			kids.set(par, a);
 			a.push(r);
 		}
 	}
-	const cmp = (a: Row, b: Row) => (a.order_key < b.order_key ? -1 : a.order_key > b.order_key ? 1 : 0);
+	const cmp = (a: Row, b: Row) =>
+		a.order_key < b.order_key ? -1 : a.order_key > b.order_key ? 1 : 0;
 	roots.sort(cmp);
 	const out: Row[] = [];
 	const stack: Row[] = [];
@@ -214,7 +250,13 @@ export function treeOrder(rows: Row[], limit: number): Row[] {
 export type ViewportMode = "native" | "fullsort";
 
 /** native: the recursion stops after 500 rows (sqlite: DFS order, pg: BFS order). fullsort: read the page, order in JS. */
-export async function viewport(db: Db, def: VariantDef, page: string, t: number, mode: ViewportMode): Promise<Row[]> {
+export async function viewport(
+	db: Db,
+	def: VariantDef,
+	page: string,
+	t: number,
+	mode: ViewportMode,
+): Promise<Row[]> {
 	if (def.approach === "parent" && mode === "native") {
 		const sql = recursionSql(db.dialect, def, db.dialect === "sqlite" ? "dfs500" : "bfs500");
 		return db.all(sql, [page, t]);
@@ -229,7 +271,8 @@ export async function viewport(db: Db, def: VariantDef, page: string, t: number,
 // ---------------------------------------------------------------------------------------------
 // Q3: changes between two time points (timeline box select). t1 < t2.
 
-const CHG_COLS = "v.block_id, v.from_seq, v.parent_id, v.order_key, v.content, v.deleted, v.change_flags, v.commit_id";
+const CHG_COLS =
+	"v.block_id, v.from_seq, v.parent_id, v.order_key, v.content, v.deleted, v.change_flags, v.commit_id";
 
 export type ChangeMode = "flags" | "join";
 
@@ -263,7 +306,8 @@ export async function changesBetween(
 		const sql = `SELECT ${CHG_COLS} FROM ${M} m${by} JOIN ${V} v ON v.block_id = m.block_id AND v.from_seq > ${t} AND v.from_seq <= ${u} WHERE m.page_id = ${p} AND m.from_seq <= ${u} AND m.to_max > ${t}`;
 		return { rows: await db.all(sql, [page, t1, t2]) };
 	}
-	const by = db.dialect === "sqlite" && def.index && def.id !== "B4" ? ` INDEXED BY ${def.index}` : "";
+	const by =
+		db.dialect === "sqlite" && def.index && def.id !== "B4" ? ` INDEXED BY ${def.index}` : "";
 	const idxHint = def.id === "B4" ? "" : by;
 	if (mode === "flags") {
 		const sql = `SELECT ${CHG_COLS} FROM ${V} v${idxHint} WHERE v.page_id = ${p} AND v.from_seq > ${t} AND v.from_seq <= ${u}`;
@@ -289,11 +333,20 @@ export async function commitList(
 	const d = db.dialect;
 	const q = (i: number) => (d === "sqlite" ? `?${i}` : `$${i}${i === 2 ? "::bigint" : ""}`);
 	if (kind === "all")
-		return db.all(`SELECT * FROM outline_commits WHERE space_id = ${q(1)} AND seq < ${q(2)} ORDER BY seq DESC LIMIT 201`, [args.space, args.cursor]);
+		return db.all(
+			`SELECT * FROM outline_commits WHERE space_id = ${q(1)} AND seq < ${q(2)} ORDER BY seq DESC LIMIT 201`,
+			[args.space, args.cursor],
+		);
 	if (kind === "agent")
-		return db.all(`SELECT * FROM outline_commits WHERE space_id = ${q(1)} AND seq < ${q(2)} AND actor_kind = 'agent' ORDER BY seq DESC LIMIT 201`, [args.space, args.cursor]);
+		return db.all(
+			`SELECT * FROM outline_commits WHERE space_id = ${q(1)} AND seq < ${q(2)} AND actor_kind = 'agent' ORDER BY seq DESC LIMIT 201`,
+			[args.space, args.cursor],
+		);
 	if (kind === "narrator")
-		return db.all(`SELECT * FROM outline_commits WHERE space_id = ${q(1)} AND seq < ${q(2)} AND narrator_id = ${q(3)} ORDER BY seq DESC LIMIT 201`, [args.space, args.cursor, args.narrator]);
+		return db.all(
+			`SELECT * FROM outline_commits WHERE space_id = ${q(1)} AND seq < ${q(2)} AND narrator_id = ${q(3)} ORDER BY seq DESC LIMIT 201`,
+			[args.space, args.cursor, args.narrator],
+		);
 	return db.all(
 		`SELECT c.* FROM (SELECT from_seq, MIN(commit_id) AS commit_id FROM ${V} WHERE page_id = ${q(1)} AND from_seq < ${q(2)} GROUP BY from_seq ORDER BY from_seq DESC LIMIT 201) x JOIN outline_commits c ON c.id = x.commit_id ORDER BY x.from_seq DESC`,
 		[args.page, args.cursor],
@@ -303,7 +356,12 @@ export async function commitList(
 // ---------------------------------------------------------------------------------------------
 // B5: structure first (covering index, no table access), content only for the blocks actually shown
 
-export async function structureAt(db: Db, def: VariantDef, page: string, t: number): Promise<Row[]> {
+export async function structureAt(
+	db: Db,
+	def: VariantDef,
+	page: string,
+	t: number,
+): Promise<Row[]> {
 	const { p, t: tt } = ph(db.dialect);
 	const by = db.dialect === "sqlite" ? ` INDEXED BY ${def.index}` : "";
 	const sql = `SELECT v.block_id, v.from_seq, v.parent_id, v.order_key FROM ${V} v${by} WHERE v.page_id = ${p} AND v.from_seq <= ${tt} AND v.to_max > ${tt} AND v.deleted = 0`;
@@ -318,11 +376,20 @@ export async function contentFor(db: Db, rows: Row[]): Promise<Row[]> {
 	return db.all(sql);
 }
 
-export async function viewportTwoStep(db: Db, def: VariantDef, page: string, t: number): Promise<Row[]> {
+export async function viewportTwoStep(
+	db: Db,
+	def: VariantDef,
+	page: string,
+	t: number,
+): Promise<Row[]> {
 	const structure = await structureAt(db, def, page, t);
 	const first = treeOrder(structure, 500);
 	const content = await contentFor(db, first);
 	const byKey = new Map<string, Row>();
 	for (const r of content) byKey.set(`${r.block_id}`, r);
-	return first.map((r) => ({ ...r, content: byKey.get(r.block_id)?.content, task_json: byKey.get(r.block_id)?.task_json }));
+	return first.map((r) => ({
+		...r,
+		content: byKey.get(r.block_id)?.content,
+		task_json: byKey.get(r.block_id)?.task_json,
+	}));
 }

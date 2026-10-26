@@ -4,8 +4,9 @@
  *
  * Run: bun time-travel/pg-load.ts --dir=<datadir> --db=ob10
  */
-import { SQL } from "bun";
+
 import { join } from "node:path";
+import { SQL } from "bun";
 import { PG_DDL } from "./gen";
 import { arg, DATA_ROOT, PG_SOCKET } from "./lib";
 
@@ -21,8 +22,27 @@ await admin.close();
 
 async function psql(command: string) {
 	const p = Bun.spawn(
-		["psql", "-h", sockDir, "-p", port, "-U", "postgres", "-d", dbName, "-v", "ON_ERROR_STOP=1", "-q", "-c", command],
-		{ stdout: "inherit", stderr: "inherit", env: { ...process.env, PATH: `/usr/lib/postgresql/16/bin:${process.env.PATH}` } },
+		[
+			"psql",
+			"-h",
+			sockDir,
+			"-p",
+			port,
+			"-U",
+			"postgres",
+			"-d",
+			dbName,
+			"-v",
+			"ON_ERROR_STOP=1",
+			"-q",
+			"-c",
+			command,
+		],
+		{
+			stdout: "inherit",
+			stderr: "inherit",
+			env: { ...process.env, PATH: `/usr/lib/postgresql/16/bin:${process.env.PATH}` },
+		},
 	);
 	const code = await p.exited;
 	if (code !== 0) throw new Error(`psql failed: ${command}`);
@@ -31,7 +51,12 @@ async function psql(command: string) {
 const t0 = performance.now();
 for (const stmt of PG_DDL.split(";")) if (stmt.trim()) await psql(stmt);
 await psql("CREATE EXTENSION IF NOT EXISTS btree_gist");
-for (const t of ["outline_commits", "outline_blocks", "outline_block_versions", "outline_page_members"]) {
+for (const t of [
+	"outline_commits",
+	"outline_blocks",
+	"outline_block_versions",
+	"outline_page_members",
+]) {
 	const t1 = performance.now();
 	await psql(`\\copy ${t} FROM '${join(dir, `${t}.tsv`)}'`);
 	console.log(`copied ${t} in ${((performance.now() - t1) / 1000).toFixed(1)}s`);

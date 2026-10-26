@@ -6,7 +6,16 @@
  * Run: bun vector/recall.ts --n=50000 --dim=768 [--queries=200]
  */
 import { arg, argNum, fmt } from "../time-travel/lib";
-import { dotF32, genVector, jsScanF32Range, jsScanI8Range, makeGen, quantize, SPACES, TopK } from "./common";
+import {
+	dotF32,
+	genVector,
+	jsScanF32Range,
+	jsScanI8Range,
+	makeGen,
+	quantize,
+	SPACES,
+	TopK,
+} from "./common";
 
 const n = argNum("n", 50000);
 const dim = argNum("dim", 768);
@@ -76,4 +85,6 @@ console.log(
 		int8Top200ThenF32RerankRecallAt50: rr50 / Q,
 	}),
 );
-console.log(`n=${n} dim=${dim}: int8 recall@10 ${fmt(r10 / Q, 3)} @50 ${fmt(r50 / Q, 3)}; with f32 rerank of int8 top-200: @10 ${fmt(rr10 / Q, 3)} @50 ${fmt(rr50 / Q, 3)}`);
+console.log(
+	`n=${n} dim=${dim}: int8 recall@10 ${fmt(r10 / Q, 3)} @50 ${fmt(r50 / Q, 3)}; with f32 rerank of int8 top-200: @10 ${fmt(rr10 / Q, 3)} @50 ${fmt(rr50 / Q, 3)}`,
+);

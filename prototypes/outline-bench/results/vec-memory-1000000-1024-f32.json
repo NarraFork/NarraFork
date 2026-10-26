@@ -1,0 +1,10 @@
+{
+	"n": 1000000,
+	"dim": 1024,
+	"dtype": "f32",
+	"loadFromR3Ms": 21121.95705,
+	"matrixMB": 4105.465024,
+	"rssBeforeMB": 17.83203125,
+	"rssAfterLoadMB": 4103.97265625,
+	"peakMB": 8033.4921875
+}

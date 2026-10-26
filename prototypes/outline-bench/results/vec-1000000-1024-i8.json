@@ -1,0 +1,343 @@
+{
+	"n": 1000000,
+	"dim": 1024,
+	"dtype": "i8",
+	"k": 50,
+	"loads": [
+		{
+			"layout": "clustered",
+			"loadFrom": "r2",
+			"loadMs": 3777.263218,
+			"matrixBytes": 1033465024,
+			"rssDeltaMB": 2579.623936,
+			"vmRssMB": 2507.13671875,
+			"vmHwmMB": 2507.26171875
+		},
+		{
+			"layout": "interleaved",
+			"loadFrom": "r2",
+			"loadMs": 3824.664375,
+			"matrixBytes": 1033465024,
+			"rssDeltaMB": 2586.259456,
+			"vmRssMB": 2513.53515625,
+			"vmHwmMB": 2513.48828125
+		},
+		{
+			"layout": "clustered",
+			"loadFrom": "r3",
+			"loadMs": 1553.7074830000001,
+			"matrixBytes": 1033465024
+		}
+	],
+	"rows": [
+		{
+			"scenario": "resident",
+			"layout": "clustered",
+			"filter": "range",
+			"kernel": "wasm",
+			"n": 1000000,
+			"dim": 1024,
+			"dtype": "i8",
+			"queries": 97,
+			"p50": 24.60122500000034,
+			"p95": 46.40743500000008,
+			"p99": 82.15829699999995,
+			"max": 82.15829699999995,
+			"scanP50": 24.036023999999998,
+			"scanned": 100000,
+			"extra": {
+				"eventLoopLagP99Ms": 0.8168780000005427,
+				"eventLoopLagMaxMs": 29.73141200000009,
+				"recallAt10": 0.9824999999999999,
+				"recallAt50": 0.9879999999999999
+			}
+		},
+		{
+			"scenario": "resident",
+			"layout": "clustered",
+			"filter": "none",
+			"kernel": "wasm",
+			"n": 1000000,
+			"dim": 1024,
+			"dtype": "i8",
+			"queries": 82,
+			"p50": 230.14142700000048,
+			"p95": 267.7829010000023,
+			"p99": 309.3864619999986,
+			"max": 309.3864619999986,
+			"scanP50": 229.78560700000162,
+			"scanned": 1000000,
+			"extra": {
+				"eventLoopLagP99Ms": 0.5804040000002715,
+				"eventLoopLagMaxMs": 64.79912899999908
+			}
+		},
+		{
+			"scenario": "resident",
+			"layout": "clustered",
+			"filter": "range",
+			"kernel": "js",
+			"n": 1000000,
+			"dim": 1024,
+			"dtype": "i8",
+			"queries": 97,
+			"p50": 96.79573800000071,
+			"p95": 152.28812900000048,
+			"p99": 172.50007699999696,
+			"max": 172.50007699999696,
+			"scanP50": 96.32575000000361,
+			"scanned": 100000,
+			"extra": {
+				"eventLoopLagP99Ms": 0.33323899999959394,
+				"eventLoopLagMaxMs": 32.49849600000016,
+				"recallAt10": 0.9824999999999999,
+				"recallAt50": 0.9879999999999999,
+				"kernelAgreement": "40/40"
+			}
+		},
+		{
+			"scenario": "resident",
+			"layout": "clustered",
+			"filter": "none",
+			"kernel": "js",
+			"n": 1000000,
+			"dim": 1024,
+			"dtype": "i8",
+			"queries": 19,
+			"p50": 917.7290009999997,
+			"p95": 1065.6632060000047,
+			"p99": 1065.6632060000047,
+			"max": 1065.6632060000047,
+			"scanP50": 917.4124099999972,
+			"scanned": 1000000,
+			"extra": {
+				"eventLoopLagP99Ms": 0.29894400000193855,
+				"eventLoopLagMaxMs": 6.387531000000308,
+				"kernelAgreement": "22/22"
+			}
+		},
+		{
+			"scenario": "resident",
+			"layout": "interleaved",
+			"filter": "tag",
+			"kernel": "wasm",
+			"n": 1000000,
+			"dim": 1024,
+			"dtype": "i8",
+			"queries": 97,
+			"p50": 56.62269899999956,
+			"p95": 71.32443199999398,
+			"p99": 79.00364000000263,
+			"max": 79.00364000000263,
+			"scanP50": 56.367017999999916,
+			"scanned": 100000,
+			"extra": {
+				"eventLoopLagP99Ms": 0.23625900000479305,
+				"eventLoopLagMaxMs": 4.072025999994366,
+				"recallAt10": 0.9824999999999999,
+				"recallAt50": 0.9879999999999999
+			}
+		},
+		{
+			"scenario": "resident",
+			"layout": "interleaved",
+			"filter": "ids",
+			"kernel": "wasm",
+			"n": 1000000,
+			"dim": 1024,
+			"dtype": "i8",
+			"queries": 97,
+			"p50": 57.14112400000158,
+			"p95": 71.29101000000082,
+			"p99": 99.99837599998864,
+			"max": 99.99837599998864,
+			"scanP50": 56.5736109999998,
+			"scanned": 100000,
+			"extra": {
+				"eventLoopLagP99Ms": 0.3405849999981001,
+				"eventLoopLagMaxMs": 76.1124770000024,
+				"recallAt10": 0.9824999999999999,
+				"recallAt50": 0.9879999999999999
+			}
+		},
+		{
+			"scenario": "resident",
+			"layout": "interleaved",
+			"filter": "tag",
+			"kernel": "js",
+			"n": 1000000,
+			"dim": 1024,
+			"dtype": "i8",
+			"queries": 97,
+			"p50": 126.01675399999658,
+			"p95": 166.2708549999952,
+			"p99": 221.62208299999475,
+			"max": 221.62208299999475,
+			"scanP50": 125.70976000000155,
+			"scanned": 100000,
+			"extra": {
+				"eventLoopLagP99Ms": 0.37761500000488013,
+				"eventLoopLagMaxMs": 50.77630099999078,
+				"recallAt10": 0.9824999999999999,
+				"recallAt50": 0.9879999999999999,
+				"kernelAgreement": "40/40"
+			}
+		},
+		{
+			"scenario": "resident",
+			"layout": "interleaved",
+			"filter": "ids",
+			"kernel": "js",
+			"n": 1000000,
+			"dim": 1024,
+			"dtype": "i8",
+			"queries": 97,
+			"p50": 116.06975900000543,
+			"p95": 143.41604100000404,
+			"p99": 198.06253900000593,
+			"max": 198.06253900000593,
+			"scanP50": 115.5245849999992,
+			"scanned": 100000,
+			"extra": {
+				"eventLoopLagP99Ms": 0.21768199998768978,
+				"eventLoopLagMaxMs": 5.9231739999959245,
+				"recallAt10": 0.9824999999999999,
+				"recallAt50": 0.9879999999999999,
+				"kernelAgreement": "40/40"
+			}
+		},
+		{
+			"scenario": "sqlite",
+			"filter": "r2-read",
+			"kernel": "js",
+			"n": 1000000,
+			"dim": 1024,
+			"dtype": "i8",
+			"queries": 93,
+			"p50": 206.3854469999933,
+			"p95": 247.59720899999957,
+			"p99": 270.8663899999956,
+			"max": 270.8663899999956,
+			"scanP50": 205.740812,
+			"scanned": 100000,
+			"extra": {
+				"rowsPerQuery": 100000,
+				"mbPerQuery": 102.4,
+				"eventLoopLagP99Ms": 0.22950199998740572,
+				"eventLoopLagMaxMs": 25.64010699999926
+			}
+		},
+		{
+			"scenario": "sqlite",
+			"filter": "r2",
+			"kernel": "js",
+			"n": 1000000,
+			"dim": 1024,
+			"dtype": "i8",
+			"queries": 56,
+			"p50": 339.3050499999954,
+			"p95": 386.236871000001,
+			"p99": 398.56268800000544,
+			"max": 398.56268800000544,
+			"scanP50": 337.9298940000008,
+			"scanned": 100000,
+			"extra": {
+				"rowsPerQuery": 100000,
+				"mbPerQuery": 102.4,
+				"eventLoopLagP99Ms": 0.21342499999445863,
+				"eventLoopLagMaxMs": 4.653740999987349,
+				"recallAt10": 0.9824999999999999,
+				"recallAt50": 0.9879999999999999
+			}
+		},
+		{
+			"scenario": "sqlite",
+			"filter": "r3-read",
+			"kernel": "js",
+			"n": 1000000,
+			"dim": 1024,
+			"dtype": "i8",
+			"queries": 97,
+			"p50": 59.389151000010315,
+			"p95": 76.90658499998972,
+			"p99": 108.27634099998977,
+			"max": 108.27634099998977,
+			"scanP50": 59.09047699999792,
+			"scanned": 100000,
+			"extra": {
+				"rowsPerQuery": 100000,
+				"mbPerQuery": 102.4,
+				"eventLoopLagP99Ms": 0.21876099999644794,
+				"eventLoopLagMaxMs": 59.58192399999825
+			}
+		},
+		{
+			"scenario": "sqlite",
+			"filter": "r3",
+			"kernel": "js",
+			"n": 1000000,
+			"dim": 1024,
+			"dtype": "i8",
+			"queries": 97,
+			"p50": 156.35372199999983,
+			"p95": 211.0440959999978,
+			"p99": 242.07557200000156,
+			"max": 242.07557200000156,
+			"scanP50": 156.05687999999645,
+			"scanned": 100000,
+			"extra": {
+				"rowsPerQuery": 100000,
+				"mbPerQuery": 102.4,
+				"eventLoopLagP99Ms": 0.238063000026159,
+				"eventLoopLagMaxMs": 21.013730000006035,
+				"recallAt10": 0.9824999999999999,
+				"recallAt50": 0.9879999999999999
+			}
+		},
+		{
+			"scenario": "sqlite",
+			"filter": "r1-read",
+			"kernel": "js",
+			"n": 1000000,
+			"dim": 1024,
+			"dtype": "i8",
+			"queries": 26,
+			"p50": 686.8039849999768,
+			"p95": 778.8904329999932,
+			"p99": 783.2009580000013,
+			"max": 783.2009580000013,
+			"scanP50": 686.422040999998,
+			"scanned": 100000,
+			"extra": {
+				"rowsPerQuery": 100000,
+				"mbPerQuery": 102.4,
+				"eventLoopLagP99Ms": 0.2659249999851454,
+				"eventLoopLagMaxMs": 5.960951999993995
+			}
+		},
+		{
+			"scenario": "sqlite",
+			"filter": "r1",
+			"kernel": "js",
+			"n": 1000000,
+			"dim": 1024,
+			"dtype": "i8",
+			"queries": 20,
+			"p50": 886.4554970000172,
+			"p95": 1040.6370480000041,
+			"p99": 1075.3553870000178,
+			"max": 1075.3553870000178,
+			"scanP50": 884.6557080000057,
+			"scanned": 100000,
+			"extra": {
+				"rowsPerQuery": 100000,
+				"mbPerQuery": 102.4,
+				"eventLoopLagP99Ms": 0.27110300000640564,
+				"eventLoopLagMaxMs": 33.20372399999178,
+				"recallAt10": 0.982608695652174,
+				"recallAt50": 0.9852173913043479
+			}
+		}
+	],
+	"peakRssMB": 2513.296875
+}

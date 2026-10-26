@@ -57,7 +57,7 @@ let blockIdAt: Int32Array;
 let idsBuf: Uint32Array; // candidate id list scratch (inside wasm memory)
 let spaceStart: number[] = [];
 let spaceCount: number[] = [];
-let ptr = { q: 0, topS: 0, topI: 0, scales: 0, space: 0, ids: 0, vecs: 0 };
+const ptr = { q: 0, topS: 0, topI: 0, scales: 0, space: 0, ids: 0, vecs: 0 };
 const top = new TopK(50);
 let N = 0;
 let D = 0;
@@ -88,7 +88,6 @@ async function doInit(msg: InitMsg) {
 	}
 	// resident
 	const bytesPer = msg.dtype === "i8" ? D : D * 4;
-	const perSpace = N / SPACES;
 	ptr.q = 1 << 20;
 	ptr.topS = ptr.q + 8192;
 	ptr.topI = ptr.topS + 4096;
@@ -125,7 +124,12 @@ async function doInit(msg: InitMsg) {
 	if (msg.loadFrom === "r2") {
 		// PK order = clustered by space; interleaved layout places each row at its arrival index
 		const it = d.query("SELECT space_id, block_id, scale, vec FROM vec2").iterate();
-		for (const r of it as Iterable<{ space_id: number; block_id: number; scale: number; vec: Uint8Array }>) {
+		for (const r of it as Iterable<{
+			space_id: number;
+			block_id: number;
+			scale: number;
+			vec: Uint8Array;
+		}>) {
 			if (msg.layout === "clustered") {
 				if (spaceStart[r.space_id] === undefined) spaceStart[r.space_id] = pos;
 				spaceCount[r.space_id]++;
@@ -136,9 +140,19 @@ async function doInit(msg: InitMsg) {
 		}
 	} else {
 		const it = d.query("SELECT space_id, n, ids, scales, vecs FROM chunks").iterate();
-		for (const r of it as Iterable<{ space_id: number; n: number; ids: Uint8Array; scales: Uint8Array; vecs: Uint8Array }>) {
-			const ids = new Int32Array(r.ids.buffer.slice(r.ids.byteOffset, r.ids.byteOffset + r.ids.byteLength));
-			const scs = new Float32Array(r.scales.buffer.slice(r.scales.byteOffset, r.scales.byteOffset + r.scales.byteLength));
+		for (const r of it as Iterable<{
+			space_id: number;
+			n: number;
+			ids: Uint8Array;
+			scales: Uint8Array;
+			vecs: Uint8Array;
+		}>) {
+			const ids = new Int32Array(
+				r.ids.buffer.slice(r.ids.byteOffset, r.ids.byteOffset + r.ids.byteLength),
+			);
+			const scs = new Float32Array(
+				r.scales.buffer.slice(r.scales.byteOffset, r.scales.byteOffset + r.scales.byteLength),
+			);
 			const base = msg.layout === "clustered" ? pos : -1;
 			if (msg.layout === "clustered") {
 				if (spaceStart[r.space_id] === undefined) spaceStart[r.space_id] = pos;
@@ -192,8 +206,10 @@ function queryResident(m: QueryMsg) {
 	if (useWasm) {
 		mk.topk_reset?.(ptr.topS, ptr.topI, k);
 		if (init.dtype === "i8") {
-			if (m.filter === "tag") mk.scan_i8_tag?.(ptr.vecs, ptr.scales, ptr.space, m.space, 0, N, D, ptr.q, m.qscale);
-			else if (m.filter === "ids") mk.scan_i8_ids?.(ptr.vecs, ptr.scales, ptr.ids, nIds, D, ptr.q, m.qscale);
+			if (m.filter === "tag")
+				mk.scan_i8_tag?.(ptr.vecs, ptr.scales, ptr.space, m.space, 0, N, D, ptr.q, m.qscale);
+			else if (m.filter === "ids")
+				mk.scan_i8_ids?.(ptr.vecs, ptr.scales, ptr.ids, nIds, D, ptr.q, m.qscale);
 			else mk.scan_i8_range?.(ptr.vecs, ptr.scales, start, end, D, ptr.q, m.qscale);
 		} else {
 			if (m.filter === "tag") mk.scan_f32_tag?.(ptr.vecs, ptr.space, m.space, 0, N, D, ptr.q);
@@ -203,13 +219,18 @@ function queryResident(m: QueryMsg) {
 		const cnt = mk.topk_count?.() as number;
 		const scoresOut = new Float32Array(mem.buffer, ptr.topS, cnt).slice();
 		const idsOut = new Int32Array(mem.buffer, ptr.topI, cnt).slice();
-		return { scanMs: performance.now() - t0, scores: scoresOut, ids: idsOut.map((i) => blockIdAt[i] as number) };
+		return {
+			scanMs: performance.now() - t0,
+			scores: scoresOut,
+			ids: idsOut.map((i) => blockIdAt[i] as number),
+		};
 	}
 	top.reset();
 	if (init.dtype === "i8") {
 		const q = new Int8Array(mem.buffer, ptr.q, D);
 		if (m.filter === "tag") jsScanI8Tag(top, vecsI8, scales, space, m.space, 0, N, D, q, m.qscale);
-		else if (m.filter === "ids") jsScanI8Ids(top, vecsI8, scales, ids as Uint32Array, nIds, D, q, m.qscale);
+		else if (m.filter === "ids")
+			jsScanI8Ids(top, vecsI8, scales, ids as Uint32Array, nIds, D, q, m.qscale);
 		else jsScanI8Range(top, vecsI8, scales, start, end, D, q, m.qscale);
 	} else {
 		const q = new Float32Array(mem.buffer, ptr.q, D);
@@ -229,7 +250,8 @@ function toI8(blob: Uint8Array): Int8Array {
 	return new Int8Array(blob.buffer, blob.byteOffset, blob.byteLength);
 }
 function toF32(blob: Uint8Array): Float32Array {
-	if (blob.byteOffset % 4 === 0) return new Float32Array(blob.buffer, blob.byteOffset, blob.byteLength / 4);
+	if (blob.byteOffset % 4 === 0)
+		return new Float32Array(blob.buffer, blob.byteOffset, blob.byteLength / 4);
 	const c = new Uint8Array(blob.byteLength);
 	c.set(blob);
 	return new Float32Array(c.buffer);
@@ -258,28 +280,52 @@ function querySqlite(m: QueryMsg) {
 		rows++;
 		bytes += blob.byteLength;
 		if (readOnly) return;
-		const s = qI8 ? dotI8(qI8, toI8(blob), 0, D) * m.qscale * sc : dotF32(qF32 as Float32Array, toF32(blob), 0, D);
+		const s = qI8
+			? dotI8(qI8, toI8(blob), 0, D) * m.qscale * sc
+			: dotF32(qF32 as Float32Array, toF32(blob), 0, D);
 		if (s > top.thr || top.n < top.k) top.push(s, blockId);
 	};
 	if (kind === "r2") {
 		const it = stmt("SELECT block_id, scale, vec FROM vec2 WHERE space_id = ?1").iterate(m.space);
-		for (const r of it as Iterable<{ block_id: number; scale: number; vec: Uint8Array }>) score(r.block_id, r.scale, r.vec);
+		for (const r of it as Iterable<{ block_id: number; scale: number; vec: Uint8Array }>)
+			score(r.block_id, r.scale, r.vec);
 	} else if (kind === "r1") {
 		const it = stmt(
 			"SELECT b.id AS block_id, e.scale AS scale, e.vector_blob AS vec FROM blocks b JOIN embeddings e ON e.model_id = ?1 AND e.content_hash = b.content_hash WHERE b.space_id = ?2",
 		).iterate("text-embedding-bench", m.space);
-		for (const r of it as Iterable<{ block_id: number; scale: number; vec: Uint8Array }>) score(r.block_id, r.scale, r.vec);
+		for (const r of it as Iterable<{ block_id: number; scale: number; vec: Uint8Array }>)
+			score(r.block_id, r.scale, r.vec);
 	} else {
 		const it = stmt("SELECT n, ids, scales, vecs FROM chunks WHERE space_id = ?1").iterate(m.space);
 		const bytesPer = init.dtype === "i8" ? D : D * 4;
-		for (const r of it as Iterable<{ n: number; ids: Uint8Array; scales: Uint8Array; vecs: Uint8Array }>) {
-			const ids = new Int32Array(r.ids.buffer.slice(r.ids.byteOffset, r.ids.byteOffset + r.ids.byteLength));
-			const scs = new Float32Array(r.scales.buffer.slice(r.scales.byteOffset, r.scales.byteOffset + r.scales.byteLength));
-			for (let j = 0; j < r.n; j++) score(ids[j] as number, scs[j] as number, r.vecs.subarray(j * bytesPer, (j + 1) * bytesPer));
+		for (const r of it as Iterable<{
+			n: number;
+			ids: Uint8Array;
+			scales: Uint8Array;
+			vecs: Uint8Array;
+		}>) {
+			const ids = new Int32Array(
+				r.ids.buffer.slice(r.ids.byteOffset, r.ids.byteOffset + r.ids.byteLength),
+			);
+			const scs = new Float32Array(
+				r.scales.buffer.slice(r.scales.byteOffset, r.scales.byteOffset + r.scales.byteLength),
+			);
+			for (let j = 0; j < r.n; j++)
+				score(
+					ids[j] as number,
+					scs[j] as number,
+					r.vecs.subarray(j * bytesPer, (j + 1) * bytesPer),
+				);
 		}
 	}
 	const cnt = top.n;
-	return { scanMs: performance.now() - t0, scores: top.scores.slice(0, cnt), ids: top.ids.slice(0, cnt), rows, bytes };
+	return {
+		scanMs: performance.now() - t0,
+		scores: top.scores.slice(0, cnt),
+		ids: top.ids.slice(0, cnt),
+		rows,
+		bytes,
+	};
 }
 
 declare const self: Worker;

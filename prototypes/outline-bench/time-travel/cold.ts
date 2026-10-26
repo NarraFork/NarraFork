@@ -7,11 +7,20 @@
  * Run: bun time-travel/cold.ts --dialect=sqlite|pg --dir=<datadir> [--db=ob10] [--variants=B3,B5,A2,C] [--n=40]
  *        [--pgdata=<cluster dir>]
  */
-import { join } from "node:path";
+
 import { mkdirSync } from "node:fs";
+import { join } from "node:path";
 import { type Db, openPg, openSqlite } from "./db";
 import { arg, argNum, DATA_ROOT, fmt, Rng, summarize } from "./lib";
-import { pageAt, structureAt, VARIANTS, type VariantDef, type VariantId, viewport, viewportTwoStep } from "./queries";
+import {
+	pageAt,
+	structureAt,
+	VARIANTS,
+	type VariantDef,
+	type VariantId,
+	viewport,
+	viewportTwoStep,
+} from "./queries";
 
 const dialect = (arg("dialect") ?? "sqlite") as "sqlite" | "pg";
 const dir = arg("dir") ?? join(DATA_ROOT, "tt-vpb10");
@@ -28,7 +37,10 @@ interface PageMeta {
 	spaceIdx: number;
 	size: number;
 }
-const meta = JSON.parse(await Bun.file(join(dir, "meta.json")).text()) as { pages: PageMeta[]; spaceMaxSeq: number[] };
+const meta = JSON.parse(await Bun.file(join(dir, "meta.json")).text()) as {
+	pages: PageMeta[];
+	spaceMaxSeq: number[];
+};
 const pages = meta.pages.filter((p) => p.size <= 2000);
 
 let evictCmd: string;
@@ -37,7 +49,9 @@ async function setupEvict() {
 		evictCmd = `for f in ${join(dir, "bench.db")} ${join(dir, "bench.db-wal")}; do [ -f "$f" ] && dd if="$f" iflag=nocache count=0 status=none; done; true`;
 	} else {
 		const admin = openPg(dbName);
-		const oid = (await admin.all("SELECT oid FROM pg_database WHERE datname = current_database()"))[0]?.oid;
+		const oid = (
+			await admin.all("SELECT oid FROM pg_database WHERE datname = current_database()")
+		)[0]?.oid;
 		await admin.close();
 		evictCmd = `find ${pgdata}/base/${oid} -type f -print0 | xargs -0 -P4 -I{} dd if={} iflag=nocache count=0 status=none; true`;
 	}
@@ -60,7 +74,8 @@ for (const id of variantIds) {
 	if (!ddls) continue;
 	for (const n of def.drop) await db.exec(`DROP INDEX IF EXISTS ${n}`);
 	for (const d of ddls) await db.exec(d);
-	if (dialect === "pg") await db.exec("ANALYZE outline_block_versions; ANALYZE outline_page_members");
+	if (dialect === "pg")
+		await db.exec("ANALYZE outline_block_versions; ANALYZE outline_page_members");
 	console.log(`\n== ${label}: ${def.title}`);
 	const rng = new Rng(4242);
 	const samples = Array.from({ length: N }, () => {
@@ -68,7 +83,9 @@ for (const id of variantIds) {
 		const max = meta.spaceMaxSeq[page.spaceIdx] as number;
 		return { page, t: Math.floor(max * (0.1 + 0.9 * rng.rnd())) };
 	});
-	const tests: [string, (s: (typeof samples)[number]) => Promise<unknown>][] = [["Q2 page@T", (s) => pageAt(db, def, s.page.id, s.t)]];
+	const tests: [string, (s: (typeof samples)[number]) => Promise<unknown>][] = [
+		["Q2 page@T", (s) => pageAt(db, def, s.page.id, s.t)],
+	];
 	if (def.id === "B5") {
 		tests.push(["Q2s structure only", (s) => structureAt(db, def, s.page.id, s.t)]);
 		tests.push(["Q1 vp500 two-step", (s) => viewportTwoStep(db, def, s.page.id, s.t)]);
@@ -104,4 +121,7 @@ for (const id of variantIds) {
 }
 await db.close();
 mkdirSync(join(import.meta.dir, "..", "results"), { recursive: true });
-await Bun.write(join(import.meta.dir, "..", "results", `tt-${label}.json`), JSON.stringify({ label, n: N, results: out }, null, 1));
+await Bun.write(
+	join(import.meta.dir, "..", "results", `tt-${label}.json`),
+	JSON.stringify({ label, n: N, results: out }, null, 1),
+);

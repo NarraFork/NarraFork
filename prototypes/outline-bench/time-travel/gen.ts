@@ -356,7 +356,6 @@ export function simulate(params: GenParams): History {
 		nvers: new Col(1 << 16),
 		page: new Col(1 << 16),
 	};
-	const cTimeArr: number[] = [];
 	const commitIds: string[] = [];
 	const spaceSeq = new Int32Array(params.spaces);
 
@@ -641,7 +640,11 @@ export function simulate(params: GenParams): History {
 				live[x] = 2;
 				markDirty(x, FLAG.DELETED);
 			}
-			(groups[(pages[p] as PageRec).space] as (typeof groups)[number]).push({ nodes, root: b, page: p });
+			(groups[(pages[p] as PageRec).space] as (typeof groups)[number]).push({
+				nodes,
+				root: b,
+				page: p,
+			});
 			return;
 		}
 		opEdit(p);
@@ -740,7 +743,8 @@ export function simulate(params: GenParams): History {
 	const cTime = new Float64Array(nCommits);
 	const t0 = Date.UTC(2026, 0, 1);
 	const span = 300 * 86400_000;
-	for (let i = 0; i < nCommits; i++) cTime[i] = Math.floor(t0 + (i / nCommits) * span + rng.int(1000));
+	for (let i = 0; i < nCommits; i++)
+		cTime[i] = Math.floor(t0 + (i / nCommits) * span + rng.int(1000));
 
 	const spaceMaxSeq = Array.from(spaceSeq);
 	const vSlice = (c: Col | ColU8) => c.a.slice(0, c.n);
@@ -873,7 +877,7 @@ export function* commitRows(h: History): Generator<Row> {
 			actorId as string,
 			ak === 0 ? (actorId as string) : resp,
 			ak === 1 ? (h.narrators[h.cNarrator[c] as number] as string) : null,
-			ak === 1 ? h.commitIds[(c * 31) % h.nCommits]?.slice(0, 12) ?? null : null,
+			ak === 1 ? (h.commitIds[(c * 31) % h.nCommits]?.slice(0, 12) ?? null) : null,
 			ak === 1 ? `tc_${(c % 9973).toString(36)}` : null,
 			c % 20 === 0 ? 0 : 1,
 			h.cTime[c] as number,
@@ -983,7 +987,11 @@ async function writeTsv(h: History, dir: string) {
 		let buf: string[] = [];
 		let n = 0;
 		for (const r of rows) {
-			buf.push(r.map((x) => (x === null ? "\\N" : typeof x === "number" ? String(x) : escCopy(x))).join("\t"));
+			buf.push(
+				r
+					.map((x) => (x === null ? "\\N" : typeof x === "number" ? String(x) : escCopy(x)))
+					.join("\t"),
+			);
 			if (buf.length >= 20_000) {
 				sink.write(`${buf.join("\n")}\n`);
 				buf = [];
@@ -1005,10 +1013,13 @@ export function describe(h: History) {
 	const V = h.V;
 	const perBlock = new Int32Array(h.blockCount);
 	for (let i = 0; i < V.n; i++) perBlock[V.block[i] as number]++;
-	const arr = Array.from(perBlock).filter((x) => x > 0).sort((a, b) => a - b);
+	const arr = Array.from(perBlock)
+		.filter((x) => x > 0)
+		.sort((a, b) => a - b);
 	const q = (p: number) => arr[Math.min(arr.length - 1, Math.floor(arr.length * p))] as number;
 	const perCommit = Array.from(h.cNVers).sort((a, b) => a - b);
-	const qc = (p: number) => perCommit[Math.min(perCommit.length - 1, Math.floor(perCommit.length * p))] as number;
+	const qc = (p: number) =>
+		perCommit[Math.min(perCommit.length - 1, Math.floor(perCommit.length * p))] as number;
 	let contentBytes = 0;
 	let cnt = 0;
 	for (let i = 0; i < V.n; i += 7) {
