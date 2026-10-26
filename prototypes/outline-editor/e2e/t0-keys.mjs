@@ -137,13 +137,13 @@ export async function run() {
 		await t.idle();
 		it.check("点击复选框：待办 → 进行中", (await out()).endsWith("- [/] ## 新标题"), await out());
 		it.check("Bob 那边的复选框同步", (await t.viewOutline("B")).endsWith("- [/] ## 新标题"));
-		// 折叠：只影响本视图
-		await t.page.click('[data-label="A"] .ob-block[data-id="P1b2"] > .ob-gutter .ob-bullet');
+		// 折叠：只影响本视图。PR1 起项目符号用来聚焦（§6.10），折叠改由项目符号左边的折叠箭头负责
+		await t.page.click('[data-label="A"] .ob-block[data-id="P1b2"] > .ob-gutter .ob-arrow');
 		const hidden = await t.ev(() => {
 			const el = document.querySelector('[data-label="A"] .ob-block[data-id="P1b2_1"]');
 			return el ? el.offsetParent === null : null;
 		});
-		it.check("点击项目符号折叠子块", hidden === true, hidden);
+		it.check("点击折叠箭头折叠子块", hidden === true, hidden);
 		it.check(
 			"折叠是本视图状态（Bob 不受影响）",
 			await t.ev(

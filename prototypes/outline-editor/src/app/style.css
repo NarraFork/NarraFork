@@ -5,6 +5,12 @@
 	--line: #d0d7de;
 	--accent: #4c6ef5;
 	--code-bg: #f6f8fa;
+	--node-bg: #fff;
+	--root-bg: #edf2ff;
+	/* 具名字体：导图用 pretext 测量文字，字体必须和这里一致（measure.ts 的 FAMILY / MONO） */
+	--font:
+		Inter, "PingFang SC", "Microsoft YaHei", "Noto Sans CJK SC", "WenQuanYi Zen Hei", sans-serif;
+	--mono: "JetBrains Mono", "DejaVu Sans Mono", Menlo, monospace;
 	color-scheme: light dark;
 }
 @media (prefers-color-scheme: dark) {
@@ -15,6 +21,8 @@
 		--line: #373a40;
 		--accent: #748ffc;
 		--code-bg: #25262b;
+		--node-bg: #25262b;
+		--root-bg: #2b2f45;
 	}
 }
 * {
@@ -22,11 +30,7 @@
 }
 body {
 	margin: 0;
-	font:
-		15px / 1.5 system-ui,
-		"PingFang SC",
-		"Noto Sans CJK SC",
-		sans-serif;
+	font: 15px / 1.5 var(--font);
 	background: var(--bg);
 	color: var(--fg);
 	display: grid;
@@ -95,6 +99,9 @@ body {
 	word-wrap: break-word;
 	min-height: 40px;
 }
+.editor-host > .ProseMirror {
+	padding-left: 16px;
+}
 .ob-block {
 	position: relative;
 	padding-left: 22px;
@@ -114,19 +121,34 @@ body {
 	margin: 0;
 	min-height: 1.5em;
 }
+/* 块外框（大纲和导图节点共用 chrome.ts）：折叠箭头（挂在左边）、项目符号（点了聚焦）、复选框 */
 .ob-gutter {
 	position: absolute;
-	left: 0;
+	left: -16px;
 	top: 0;
-	width: 22px;
+	width: 38px;
 	height: 1.5em;
 	display: flex;
 	align-items: center;
-	gap: 2px;
 	user-select: none;
 }
+.ob-arrow {
+	width: 16px;
+	flex: none;
+	text-align: center;
+	cursor: pointer;
+	color: var(--muted);
+	font-size: 11px;
+}
+.has-kids > .ob-gutter .ob-arrow::before {
+	content: "▾";
+}
+.collapsed > .ob-gutter .ob-arrow::before {
+	content: "▸";
+}
 .ob-bullet {
-	width: 14px;
+	width: 22px;
+	flex: none;
 	text-align: center;
 	cursor: pointer;
 	color: var(--muted);
@@ -134,8 +156,8 @@ body {
 .ob-bullet::before {
 	content: "•";
 }
-.ob-block.collapsed > .ob-gutter .ob-bullet::before {
-	content: "▸";
+.collapsed > .ob-gutter .ob-bullet::before {
+	content: "◉";
 }
 .ob-block.collapsed > .ob-content > .ob-children {
 	display: none;
@@ -144,10 +166,33 @@ body {
 	padding-left: 40px;
 }
 .ob-block[data-task]:not([data-task=""]) > .ob-gutter {
-	width: 40px;
+	width: 56px;
 }
 .ob-check {
+	width: 18px;
+	flex: none;
 	cursor: pointer;
+}
+.ob-bsel > .ob-content > :first-child {
+	background: color-mix(in srgb, var(--accent) 18%, transparent);
+	border-radius: 3px;
+}
+/* 聚焦：被聚焦的块放在根的位置，当标题 */
+.ProseMirror[data-focus] > .ob-block {
+	padding-left: 0;
+}
+.ProseMirror[data-focus] > .ob-block > .ob-gutter {
+	display: none;
+}
+.ProseMirror[data-focus] > .ob-block > .ob-content > :first-child {
+	font-size: 1.5em;
+	font-weight: 700;
+	margin-bottom: 6px;
+}
+.ProseMirror[data-focus] > .ob-block > .ob-content > .ob-children {
+	margin-left: 0;
+	border-left: 0;
+	padding-left: 0;
 }
 .ob-block[data-task="x"] > .ob-content > p {
 	color: var(--muted);
@@ -171,15 +216,18 @@ body {
 	background: var(--code-bg);
 	padding: 4px 8px;
 	border-radius: 4px;
-	font:
-		13px / 1.5 ui-monospace,
-		monospace;
+	font: 13px / 1.5 var(--mono);
 }
 .ob-content code {
 	background: var(--code-bg);
 	border-radius: 3px;
 	padding: 0 3px;
-	font-family: ui-monospace, monospace;
+	font-family: var(--mono);
+	font-size: 13px;
+}
+.ob-content pre code {
+	padding: 0;
+	background: none;
 }
 .ob-content table {
 	border-collapse: collapse;
@@ -229,5 +277,313 @@ body {
 	color: #fff;
 	background: currentColor;
 	padding: 0 2px;
+	white-space: nowrap;
+}
+
+/* ---------- 编辑面：工具栏、面包屑、编辑区（大纲和导图叠在一起） ---------- */
+.sf-bar {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 8px;
+	margin-bottom: 4px;
+}
+.sf-seg {
+	display: inline-flex;
+}
+.sf-seg button {
+	font: 12px / 1.6 var(--font);
+	border: 1px solid var(--line);
+	background: var(--bg);
+	color: var(--fg);
+	padding: 1px 8px;
+	cursor: pointer;
+}
+.sf-seg button + button {
+	border-left: 0;
+}
+.sf-seg button.on {
+	background: var(--accent);
+	border-color: var(--accent);
+	color: #fff;
+}
+.sf-frame[data-view="outline"] .sf-dirs {
+	opacity: 0.5;
+}
+.sf-crumbs {
+	font-size: 12px;
+	color: var(--muted);
+	min-height: 20px;
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 2px;
+}
+.sf-crumbs button {
+	font: inherit;
+	border: 0;
+	background: none;
+	color: var(--accent);
+	cursor: pointer;
+	padding: 0 2px;
+}
+.sf-crumbs button.here {
+	color: var(--fg);
+	font-weight: 600;
+}
+.sf-frame {
+	position: relative;
+	overflow: clip;
+	border: 1px solid var(--line);
+	border-radius: 6px;
+}
+.sf-scroller {
+	position: absolute;
+	inset: 0;
+	overflow: auto;
+	padding: 6px 8px 200px;
+	/* 一直是自己的合成层：显示 / 隐藏只改透明度和平移的数值，不用重走整棵子树的 PrePaint */
+	will-change: opacity, transform;
+}
+/* 不显示的大纲：透明（不改 pointer-events：它是继承属性，改了要重算整棵子树的样式）。
+   在导图里时再整个平移到编辑区外面（编辑区 overflow: clip）：排版结果一直有效，绘制被视口裁掉；
+   切回来只改一个合成层的 transform。试过 content-visibility: hidden：解锁那一帧要对整页重做
+   PrePaint + Paint（2000 块约 23 ms），帧时间更差（见 RESULTS「导图与聚焦」）。 */
+.sf-frame[data-view="map"] .sf-scroller,
+.sf-frame.morphing .sf-scroller {
+	opacity: 0;
+}
+.sf-frame[data-view="map"]:not(.morphing) .sf-scroller {
+	transform: translateX(-30000px);
+}
+/* 聚焦时停放的整页大纲：跳过排版和绘制，DOM 和排版结果留着 */
+.editor-host.sf-parked {
+	content-visibility: hidden;
+}
+
+/* ---------- 导图 ---------- */
+.mm-stage {
+	position: absolute;
+	inset: 0;
+	/* clip 而不是 hidden：舞台不能被浏览器滚动（光标进入视野、focus 都不会改 scrollTop） */
+	overflow: clip;
+	visibility: hidden;
+	touch-action: none;
+	outline: none;
+	background: var(--bg);
+	user-select: none;
+}
+.mm-stage.active,
+.sf-frame.morphing .mm-stage {
+	visibility: visible;
+}
+/* 切到导图的第一帧：舞台已经能接按键、节点已经画好，但还透明 */
+.mm-stage.pre {
+	visibility: visible;
+	opacity: 0;
+}
+.mm-world {
+	position: absolute;
+	left: 0;
+	top: 0;
+	transform-origin: 0 0;
+}
+.mm-edges {
+	position: absolute;
+	left: 0;
+	top: 0;
+	width: 1px;
+	height: 1px;
+	overflow: visible;
+	pointer-events: none;
+}
+.mm-edges path {
+	fill: none;
+	stroke: var(--muted);
+	stroke-opacity: 0.6;
+	stroke-width: 1.2;
+}
+.mm-node {
+	position: absolute;
+	left: 0;
+	top: 0;
+	transform-origin: 0 0;
+	display: flex;
+	align-items: flex-start;
+	box-sizing: border-box;
+	padding: 4px 8px;
+	border: 1px solid var(--line);
+	border-radius: 6px;
+	background: var(--node-bg);
+	font: 15px / 1.5 var(--font);
+	white-space: normal;
+	overflow-wrap: break-word;
+}
+.mm-node > .ob-gutter {
+	position: static;
+	flex: none;
+	width: 28px;
+	height: 22.5px;
+}
+.mm-node[data-task]:not([data-task=""]) > .ob-gutter {
+	width: 46px;
+}
+.mm-node .ob-arrow,
+.mm-node .ob-bullet {
+	width: 14px;
+}
+.mm-body {
+	flex: none;
+	min-width: 0;
+}
+.mm-body pre {
+	white-space: pre;
+	overflow: hidden;
+	max-height: calc(6 * 19.5px + 8px);
+}
+.mm-body table {
+	table-layout: fixed;
+	width: 100%;
+}
+.mm-body td {
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+.mm-body tr:nth-child(n + 7) {
+	display: none;
+}
+.mm-body .ob-embed {
+	height: 48px;
+	box-sizing: border-box;
+	overflow: hidden;
+	margin: 0;
+}
+.mm-body .ob-embed-body {
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+}
+.mm-node.is-root {
+	background: var(--root-bg);
+}
+.mm-node.sel {
+	border-color: var(--accent);
+	box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 40%, transparent);
+}
+.mm-node.msel {
+	background: color-mix(in srgb, var(--accent) 16%, var(--node-bg));
+}
+.mm-node.editing {
+	width: max-content;
+	max-width: 330px;
+	z-index: 1;
+}
+.mm-node.editing .mm-body {
+	flex: 0 1 auto;
+	min-width: 8px;
+}
+.mm-node.editing .ProseMirror {
+	min-height: 0;
+}
+.mm-node.dragging {
+	opacity: 0.75;
+	z-index: 2;
+	pointer-events: none;
+}
+.mm-node.ob-peer {
+	box-shadow: inset 3px 0 0 var(--peer);
+}
+.mm-more {
+	position: absolute;
+	right: -12px;
+	top: 50%;
+	transform: translateY(-50%);
+	font-size: 10px;
+	line-height: 14px;
+	padding: 0 4px;
+	border-radius: 7px;
+	background: var(--accent);
+	color: #fff;
+}
+.mm-more:empty {
+	display: none;
+}
+.sf-frame[data-layout="down"] .mm-more {
+	right: auto;
+	left: 50%;
+	top: auto;
+	bottom: -10px;
+	transform: translateX(-50%);
+}
+.mm-drop {
+	position: absolute;
+	left: 0;
+	top: 0;
+	display: none;
+	pointer-events: none;
+	background: var(--accent);
+	border-radius: 2px;
+}
+.mm-drop[data-where="child"] {
+	background: color-mix(in srgb, var(--accent) 15%, transparent);
+	outline: 2px dashed var(--accent);
+}
+
+/* ---------- 快速切换器 ---------- */
+.qs {
+	position: fixed;
+	inset: 0;
+	background: rgb(0 0 0 / 0.25);
+	display: flex;
+	justify-content: center;
+	align-items: flex-start;
+	padding-top: 12vh;
+	z-index: 10;
+}
+.qs[hidden] {
+	display: none;
+}
+.qs-box {
+	width: min(560px, calc(100vw - 32px));
+	background: var(--bg);
+	border: 1px solid var(--line);
+	border-radius: 8px;
+	box-shadow: 0 8px 30px rgb(0 0 0 / 0.2);
+	overflow: hidden;
+}
+.qs-input {
+	width: 100%;
+	border: 0;
+	border-bottom: 1px solid var(--line);
+	padding: 10px 12px;
+	font: 15px / 1.5 var(--font);
+	background: var(--bg);
+	color: var(--fg);
+	outline: none;
+}
+.qs-list {
+	max-height: 50vh;
+	overflow: auto;
+}
+.qs-row {
+	display: flex;
+	gap: 8px;
+	padding: 4px 12px;
+	cursor: pointer;
+	font-size: 13px;
+}
+.qs-row.on {
+	background: color-mix(in srgb, var(--accent) 15%, transparent);
+}
+.qs-title {
+	flex: 1;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+.qs-via,
+.qs-page {
+	color: var(--muted);
+	font-size: 11px;
 	white-space: nowrap;
 }

@@ -26,9 +26,12 @@ export async function closeEnv() {
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 /** 打开一个新的页面（新的上下文：服务端、客户端都是全新的）。 */
-export async function open(query = "", { viewport = { width: 1400, height: 1000 } } = {}) {
+export async function open(
+	query = "",
+	{ viewport = { width: 1400, height: 1000 }, touch = false } = {},
+) {
 	const { url, browser } = await env();
-	const context = await browser.newContext({ viewport });
+	const context = await browser.newContext(touch ? { viewport, hasTouch: true } : { viewport });
 	const origin = new URL(url).origin;
 	await context.grantPermissions(["clipboard-read", "clipboard-write"], { origin });
 	const page = await context.newPage();
