@@ -1,5 +1,5 @@
 /**
- * Tests for the offline spec table-loss scan (design doc D24).
+ * Tests for the offline spec table-loss scan.
  *
  * Every database here is a small fixture built in a temp directory; the real ~/.narrafork is never
  * touched (the test preload also isolates HOME). The fixture schema is the subset of columns the

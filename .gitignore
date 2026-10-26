@@ -180,7 +180,7 @@ drizzle-postgres/meta/_generation_pending.json
 !scripts/smoke-editor-query-client.ts
 !scripts/build-editor-test-helper.ts
 !scripts/smoke-editor-windows-native.ts
-# Offline read-only scan for spec tables lost to Spec-panel saves (D24); imported by
+# Offline read-only scan for spec tables lost to Spec-panel saves; imported by
 # tests/scripts/find-spec-table-loss.test.ts, so fresh clones need it.
 !scripts/find-spec-table-loss.ts
 .tmp-narrafork-home.*

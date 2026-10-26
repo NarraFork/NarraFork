@@ -1,5 +1,5 @@
 /**
- * Offline check: which spec files lost their GFM tables to a Spec-panel save (design doc D24).
+ * Offline check: which spec files lost their GFM tables to a Spec-panel save.
  *
  * The old WYSIWYG spec editor dropped every table when it loaded a file, so the first save from
  * the panel wrote the file back without them. Nothing is lost for good: each save inserts a new
