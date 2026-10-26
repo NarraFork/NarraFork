@@ -1361,6 +1361,8 @@ def cmd_edit(args) -> None:
 			raise OutlineError("没有要改的：给出新正文，或 --box、--prop")
 		source = resolve(st, args.source) if args.source else None
 		guarded(tx, op)
+		if not tx.divert and props.get("status") in ("done", "cancelled") and own_notes(tx.st, addr):
+			tx.note(f"这个任务下面有 {len(own_notes(tx.st, addr))} 块笔记，请接着整理进事实树：`settle {addr}` 看要整理的内容和做法（D15）")
 		if not tx.divert and source and not any(lk["target"] == source for lk in st.links_from(addr, "source")):
 			add_link(tx, addr, "source", source)
 		if not tx.divert and "content" in op:
@@ -2472,7 +2474,7 @@ def build_parser() -> argparse.ArgumentParser:
 	s.add_argument("verdict", choices=["ok", "invalid"])
 	s.add_argument("--reason")
 	s.add_argument("-m", "--message")
-	s = p("settle", cmd_settle, "（整理用）列出要整理的；带任务地址看它要整理的内容和做法；--done 收尾")
+	s = p("settle", cmd_settle, "整理：任务完成后看要整理进事实树的内容和做法；不带地址列出队列；--done 收尾")
 	s.add_argument("task", nargs="?")
 	s.add_argument("--done", action="store_true")
 	s.add_argument("--budget", type=int, default=150, help="列任务内容时最多列多少块")

@@ -1,4 +1,4 @@
-<!-- 由 prototypes/outline2/outline.py export 生成（第 372 个提交）。真相源是 data/log.jsonl，不要手改。 -->
+<!-- 由 prototypes/outline2/outline.py export 生成（第 402 个提交）。真相源是 data/log.jsonl，不要手改。 -->
 
 # 任务看板
 
@@ -32,14 +32,14 @@
 - [p/dtLLZ8zT] [x] 新鲜度检查对着最新的 main 跑一次（先 fetch） @agent:main ← P-1
 - [p/eYUSIhDP] [x] 把原型发现整理回设计文档 @agent:main ← P-1
 - [p/UV8qXrr2] [x] 设计文档讨论稿 ← P0
-- [p/gPDU0vgb] [x] 大纲编辑器与实时协同原型，按设计文档 §6.9 的清单验收 ‹待整理› ← P0
-- [p/BFv4Byng] [x] 按时间点读取的性能基准（SQLite 与 PG） ‹待整理› ← P0
-- [p/wBqGEPp7] [x] db-worker 向量扫描基准 ‹待整理› ← P0
-- [p/5QM1KHbG] [x] agent 使用结构化编辑工具的实测：Python 原型已经覆盖了一部分 ‹待整理› ← P0
+- [p/gPDU0vgb] [x] 大纲编辑器与实时协同原型，按设计文档 §6.9 的清单验收 ← P0
+- [p/BFv4Byng] [x] 按时间点读取的性能基准（SQLite 与 PG） ← P0
+- [p/wBqGEPp7] [x] db-worker 向量扫描基准 ← P0
+- [p/5QM1KHbG] [x] agent 使用结构化编辑工具的实测：Python 原型已经覆盖了一部分 ← P0
 - [p/8PsVaMVZ] [x] 第三轮：按第二版改原型（复选框任务、锁定、待确认、依据从运行记录挂接、代码锚点），重跑同类任务，对比协调成本、命令数和查帮助次数 @agent:main ← P-1
 - [p/N5cdiUhM] [x] 调研：一个需求跨多个仓库时，会话、工作目录和项目现在怎么对应，多工作区以后该怎么对应 @agent:w-xrepo ← Q11
 - [p/lPnCUsBy] [x] 整理试跑：整理 agent（较便宜的模型）只看 `settle` 的输出，把 Q11 的调研整理进事实树 @agent:main ← P-1
 - [p/ccBGXE4T] [x] 调研：知识库现在怎么检索、注入、过滤权限；换成大纲的混合检索和「相关知识」视图时，哪些行为要保留、哪些是缺陷 @agent:w-kb ← P3
 - [p/Vww0RyM1] [x] 第四轮：专注调研知识库检索与注入 → 派活的会话记摘要、提问、遗留 → 整理 agent 放进事实树 → 新起一个 agent 测找不找得到 @agent:main ← P-1
-- [p/LxVmXH4D] [x] 清积压：四个整理 agent 把 12 个旧任务和刚回答的 37 条提问整理进事实树 @agent:main ‹待整理› ← P-1
+- [p/LxVmXH4D] [x] 清积压：四个整理 agent 把 12 个旧任务和刚回答的 37 条提问整理进事实树 @agent:main ← P-1
 
