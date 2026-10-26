@@ -1,4 +1,4 @@
-<!-- 由 prototypes/outline2/outline.py export 生成（第 453 个提交）。真相源是 data/log.jsonl，不要手改。 -->
+<!-- 由 prototypes/outline2/outline.py export 生成（第 455 个提交）。真相源是 data/log.jsonl，不要手改。 -->
 
 # 大纲总览（事实视图）
 
@@ -99,6 +99,11 @@
       - [p/zAZzhH24] 已实现（提交 `2a3e1917`、`df821f4d`）：spec 文件默认源码模式，.md 文件可切到并列预览或所见即所得；检测到 HTML、图片、任务项、脚注定义或开头的 front matter 时，所见即所得只读显示、不能保存；表格补上扩展和竖线转义后能完整往返，不再拦；非 .md 文件和 behavior_fence 只给纯文本；离线排查脚本 `scripts/find-spec-table-loss.ts`。检测范围之外、所见即所得仍会改坏的：HTML 实体、数学公式、相邻两个列表被合并
     - [p/z0PDKt5p] D29 大纲和导图是同一个编辑面的两种视图，都能完整编辑；导图向右或向下展开，不做左右平衡；聚焦、折叠、选中、视口锚点两种视图共用；自绘节点，不用 xyflow；先在原型上量过再并入 P1a；已确认（负责人 2026-10-26 补充 R28，并在提问工具里选了完整编辑、向右或向下、先做原型）
       - [p/GlHWSQxP] 理由：导图和大纲走同一套大纲事务、撤销和协同，切换才能随时做、不丢状态；向右展开时层级对应横向、顺序对应纵向，和大纲一一对应，切换时每块位移最小。细节和性能目标见 docs/OUTLINE_KNOWLEDGE-DESIGN.md §6.10，原型验收见 docs/OUTLINE_IMPLEMENTATION-PLAN.md §10
+      - [p/O1bfofjW] 原型验证过（PR1，2026-10-26，无头 Chromium、无 GPU）：8 项验收全过；2000 块布局 p95 4–5 ms，切换动画期间全部帧的 p95 18.1–20.9 ms（卡在 20 ms 目标边上，真机还要复核），锚点偏差 ≤ 1 px，节点里打字和大纲一样快；1 万块里快速切换 p50 26–34 ms。细节见 prototypes/outline-editor/RESULTS.md 和设计文档 §6.10「原型结果」
+        - [p/4pW08cle] 打开页时在 Worker 里预先测量节点尺寸：现量 2000 块要 0.4–0.6 s，预先测量后首次画出 42–60 ms
+        - [p/rlHLQPPq] 聚焦不在同一个编辑器里换文档：换文档要 88–200 ms；保留整页的编辑视图、另建聚焦视图只要 4–12 ms
+        - [p/r96GexL1] 隐藏的视图移出视口：切 `pointer-events` 触发过 58 ms 的样式重算，`content-visibility: hidden` 再显示约 23 ms；隐藏子树里残留的选区每帧多花约 20 ms；一次切换分两帧
+        - [p/6N9JHfNq] 页实时会话开始时就给整页的块建 Y.Text：没建时打字，重做会把字倒过来
       - [p/TsDYPAA9] 折叠和导图方向是每个人自己的，按（用户，页）存在服务端，不进块模型、不产生提交
       - [p/FvTthFQ5] 不用 `@xyflow/react`：每个节点一个 React 组件，2000 个节点做 FLIP 动画时每帧都要重渲染；节点外框也要和大纲共用原生 DOM 的 node view。它和 `@dagrejs/dagre` 自 2026-10-22 删掉旧图谱后已经没人用
       - [p/Ku3rqEXK] 不做左右平衡布局：负责人选了向右、向下两种；平衡布局切换时一半的块要翻到另一边

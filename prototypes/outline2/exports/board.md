@@ -1,4 +1,4 @@
-<!-- 由 prototypes/outline2/outline.py export 生成（第 453 个提交）。真相源是 data/log.jsonl，不要手改。 -->
+<!-- 由 prototypes/outline2/outline.py export 生成（第 455 个提交）。真相源是 data/log.jsonl，不要手改。 -->
 
 # 任务看板
 
@@ -52,5 +52,5 @@
 - [p/LxVmXH4D] [x] 清积压：四个整理 agent 把 12 个旧任务和刚回答的 37 条提问整理进事实树 @agent:main ← P-1
 - [p/1dPpT682] [x] 调研：spec 任务现在被谁用（续跑选任务、提醒注入、插件写入、受保护任务、计划模式），迁移成大纲任务时哪些行为要保留 @agent:w5 ← P2
 - [p/ji6fchWa] [x] 第五轮：原会话自己调研、边做边记、勾完成后接着整理（D15），再测找不找得到 @agent:main ← P-1
-- [p/EZKMMzR0] [x] PR1 导图与聚焦原型：在 prototypes/outline-editor 上加导图视图、切换动画、聚焦、快速切换，按实施计划 §10.2 验收 @agent:main ‹待整理› ← P1a
+- [p/EZKMMzR0] [x] PR1 导图与聚焦原型：在 prototypes/outline-editor 上加导图视图、切换动画、聚焦、快速切换，按实施计划 §10.2 验收 @agent:main ← P1a
 
