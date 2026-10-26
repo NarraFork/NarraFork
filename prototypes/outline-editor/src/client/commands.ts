@@ -16,7 +16,7 @@ import { schema } from "./schema";
 const N = schema.nodes;
 
 export interface CmdHost {
-	surfaceKind: "page" | "embed" | "stitch";
+	surfaceKind: "page" | "embed" | "stitch" | "node";
 	newId(): string;
 	locate(doc: PMNode, pos: number): SelPoint | null;
 	pointToPos(doc: PMNode, p: SelPoint): number | null;
@@ -390,6 +390,131 @@ export function toggleTask(): Command {
 		const pos = state.selection.$from.before(d);
 		const cur = state.selection.$from.node(d).attrs.task;
 		dispatch?.(state.tr.setNodeAttribute(pos, "task", cur ? null : " "));
+		return true;
+	};
+}
+
+// ---------- 导图键位（§6.10）：同样是对编辑面文档的 ProseMirror 事务，经 reconcile 变成大纲事务 ----------
+
+/** 块在文档里的位置（只走块和子块容器）。 */
+export function blockPos(doc: PMNode, id: string): number | null {
+	let found: number | null = null;
+	doc.descendants((n, pos) => {
+		if (found !== null) return false;
+		if (n.type === N.block) {
+			if (n.attrs.id === id) {
+				found = pos;
+				return false;
+			}
+			return true;
+		}
+		return n.type === N.children;
+	});
+	return found;
+}
+
+/** 块体里的一个合法光标位置：offset < 0 表示块体末尾。 */
+export function caretIn(doc: PMNode, pos: number, offset = -1): TextSelection | NodeSelection {
+	const block = doc.nodeAt(pos) as PMNode;
+	const body = block.child(0);
+	if (body.type === N.embed) return NodeSelection.create(doc, pos + 1);
+	if (!body.isTextblock) return TextSelection.near(doc.resolve(pos + 2)) as TextSelection;
+	const off = offset < 0 ? body.content.size : Math.min(offset, body.content.size);
+	return TextSelection.create(doc, pos + 2 + off);
+}
+
+/** 导图 Tab：在当前块的子块末尾加一个空块，光标进新块。 */
+export function addChild(host: CmdHost): Command {
+	return (state, dispatch) => {
+		const $ = state.selection.$from;
+		const d = blockDepth($);
+		if (d < 0) return false;
+		const pos = $.before(d);
+		const node = $.node(d);
+		const nb = newBlock(host);
+		const tr = state.tr;
+		let at: number;
+		if (node.childCount > 1) {
+			at = pos + node.nodeSize - 2;
+			tr.insert(at, nb);
+		} else {
+			at = pos + 1 + node.child(0).nodeSize;
+			tr.insert(at, N.children.create(null, nb));
+			at += 1;
+		}
+		tr.setSelection(TextSelection.create(tr.doc, at + 2));
+		dispatch?.(tr.scrollIntoView());
+		return true;
+	};
+}
+
+/** 在文档最后加一个顶层空块（导图里在页根上按 Tab）。 */
+export function addTopLevel(host: CmdHost): Command {
+	return (state, dispatch) => {
+		const at = state.doc.content.size;
+		const tr = state.tr.insert(at, newBlock(host));
+		tr.setSelection(TextSelection.create(tr.doc, at + 2));
+		dispatch?.(tr.scrollIntoView());
+		return true;
+	};
+}
+
+export type DropWhere = "before" | "after" | "child";
+
+/** 拖动：把块（连同子块）挪到目标块之前 / 之后 / 子块末尾。不能挪进自己的子树。 */
+export function moveBlockTo(id: string, targetId: string, where: DropWhere): Command {
+	return (state, dispatch) => {
+		const doc = state.doc;
+		const from = blockPos(doc, id);
+		const to0 = blockPos(doc, targetId);
+		if (from == null || to0 == null || id === targetId) return false;
+		const node = doc.nodeAt(from) as PMNode;
+		if (to0 > from && to0 < from + node.nodeSize) return false; // 目标在自己的子树里
+		const tr = state.tr;
+		const $f = doc.resolve(from);
+		if ($f.parent.type === N.children && $f.parent.childCount === 1)
+			tr.delete($f.before(), $f.after());
+		else tr.delete(from, from + node.nodeSize);
+		const tp = blockPos(tr.doc, targetId);
+		if (tp == null) return false;
+		const tn = tr.doc.nodeAt(tp) as PMNode;
+		let at: number;
+		if (where === "before") {
+			at = tp;
+			tr.insert(at, node);
+		} else if (where === "after") {
+			at = tp + tn.nodeSize;
+			tr.insert(at, node);
+		} else if (tn.childCount > 1) {
+			at = tp + tn.nodeSize - 2;
+			tr.insert(at, node);
+		} else {
+			at = tp + 1 + tn.child(0).nodeSize;
+			tr.insert(at, N.children.create(null, node));
+			at += 1;
+		}
+		tr.setSelection(caretIn(tr.doc, at));
+		tr.setMeta("moved", new Set([id]));
+		dispatch?.(tr.scrollIntoView());
+		return true;
+	};
+}
+
+/** 删除当前块（连同子块）。光标去前一块（没有就后一块）。 */
+export function deleteBlock(): Command {
+	return (state, dispatch) => {
+		const $ = state.selection.$from;
+		const d = blockDepth($);
+		if (d < 0) return false;
+		const pos = $.before(d);
+		const node = $.node(d);
+		const tr = state.tr;
+		if ($.node(d - 1).type === N.children && $.node(d - 1).childCount === 1)
+			tr.delete($.before(d - 1), $.after(d - 1));
+		else tr.delete(pos, pos + node.nodeSize);
+		const near = Math.max(0, Math.min(tr.mapping.map(pos) - 1, tr.doc.content.size));
+		tr.setSelection(TextSelection.near(tr.doc.resolve(near), -1));
+		dispatch?.(tr.scrollIntoView());
 		return true;
 	};
 }

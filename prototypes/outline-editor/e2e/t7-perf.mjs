@@ -188,7 +188,9 @@ async function scenario(n, opts = { full: true }) {
 		};
 		// 滚动：每帧滚 300px 到底，记录帧间隔
 		const scroll = await t.ev(async () => {
-			const el = document.scrollingElement;
+			// PR1 起编辑区是固定高度的滚动容器（导图要和大纲叠在同一个视口里），滚的是它
+			const el =
+				document.querySelector('[data-surface="A"] .sf-scroller') ?? document.scrollingElement;
 			el.scrollTop = 0;
 			await new Promise((r) => requestAnimationFrame(r));
 			const deltas = [];

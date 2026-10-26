@@ -15,8 +15,21 @@ const all = {
 	6: "./t6-embed.mjs",
 	7: "./t7-perf.mjs",
 	8: "./t8-stitch.mjs",
+	// PR1：导图与聚焦（docs/OUTLINE_IMPLEMENTATION-PLAN.md §10.2 的第 1–8 项）
+	9.1: "./t9-1-perf.mjs",
+	9.2: "./t9-2-state.mjs",
+	9.3: "./t9-3-edit.mjs",
+	9.4: "./t9-4-ime.mjs",
+	9.5: "./t9-5-focus.mjs",
+	9.6: "./t9-6-switcher.mjs",
+	9.7: "./t9-7-motion.mjs",
+	9.8: "./t9-8-touch.mjs",
 };
-const pick = process.argv.slice(2).filter((x) => all[x]);
+// 「9」= 9.1–9.8 全部
+const args = process.argv
+	.slice(2)
+	.flatMap((x) => (x === "9" ? Object.keys(all).filter((k) => k.startsWith("9.")) : [x]));
+const pick = args.filter((x) => all[x]);
 const ids = pick.length ? pick : Object.keys(all);
 const results = [];
 for (const id of ids) {
@@ -38,7 +51,7 @@ await closeEnv();
 const dir = join(here, "..", "results");
 mkdirSync(dir, { recursive: true });
 writeFileSync(
-	join(dir, pick.length ? `e2e-${ids.join("-")}.json` : "e2e.json"),
+	join(dir, pick.length ? `e2e-${ids.join("-").slice(0, 60)}.json` : "e2e.json"),
 	JSON.stringify(
 		{
 			at: new Date().toISOString(),

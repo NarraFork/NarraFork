@@ -10,6 +10,7 @@ import { baseKeymap, toggleMark } from "prosemirror-commands";
 import { keymap } from "prosemirror-keymap";
 import { Fragment, type Node as PMNode, Slice } from "prosemirror-model";
 import {
+	type Command,
 	EditorState,
 	NodeSelection,
 	Plugin,
@@ -31,6 +32,14 @@ import {
 } from "../model/diff";
 import { keyBetween } from "../model/orderkey";
 import type { Op } from "../model/store";
+import {
+	applyChrome,
+	createGutter,
+	type Gutter,
+	mentionLabel,
+	refTarget,
+	TASK_NEXT,
+} from "./chrome";
 import type { BodyChange, Client, SelInfo, SelPoint } from "./client";
 import {
 	blockDepth,
@@ -59,7 +68,9 @@ const N = schema.nodes;
 export type Surface =
 	| { kind: "page"; pageId: string }
 	| { kind: "embed"; blockId: string }
-	| { kind: "stitch"; roots: string[] };
+	| { kind: "stitch"; roots: string[] }
+	/** 导图节点里的单块编辑：只有这一块的块体，不带子块（§6.10） */
+	| { kind: "node"; blockId: string };
 
 interface CacheEntry {
 	content: string;
@@ -79,6 +90,7 @@ interface Rec {
 }
 
 const presenceKey = new PluginKey<DecorationSet>("presence");
+const bselKey = new PluginKey<DecorationSet>("bsel");
 const TOP = "\u0000top";
 
 function sameArr(a: PMNode[], b: PMNode[]) {
@@ -111,15 +123,26 @@ function lis(keys: string[]): Set<number> {
 	return out;
 }
 
-export function refTarget(ref: string): { pageId: string; blockId: string } {
-	const parts = ref.split("/");
-	return { pageId: parts.length > 1 ? parts[0] : "", blockId: parts[parts.length - 1] };
-}
+export { refTarget };
 
 export interface ViewOptions {
 	chain?: string[];
 	label?: string;
 	parent?: OutlineView;
+	/** 聚焦视图的根（编辑面聚焦时另建一个以它为根的视图，§6.10） */
+	focusRoot?: string | null;
+	/** 共用的折叠集合（视图状态，§6.10）；不给就是本视图自己的 */
+	collapsed?: Set<string>;
+	/** 额外键位（编辑面的聚焦、折叠全部等），优先于大纲键位 */
+	keys?: Record<string, Command>;
+	/** 点项目符号：编辑面用来聚焦；不给就和 P0 一样折叠 */
+	onBullet?: (id: string) => void;
+	/** 点折叠箭头之后（编辑面用来通知另一个视图） */
+	onCollapse?: (id: string) => void;
+	/** 光标换块 */
+	onSelect?: (blockId: string) => void;
+	/** 撤销 / 重做要恢复选区：编辑面接管（可能在导图里），返回 true 表示已处理 */
+	restoreSel?: (sel: SelInfo) => boolean;
 }
 
 export class OutlineView implements CmdHost {
@@ -135,6 +158,12 @@ export class OutlineView implements CmdHost {
 	chain: string[];
 	placeholderId: string;
 	lastSelBlock: string | null = null;
+	/** true：不做 ProseMirror 的「滚到选区」 */
+	noScroll = false;
+	/** 聚焦的块（编辑面以它为根）；null = 整页 */
+	focusRoot: string | null = null;
+	/** 块 id → 块外框 DOM（FLIP 动画、锚点要按块取屏幕位置，避免 querySelector） */
+	blockEls = new Map<string, HTMLElement>();
 	/** reconcile 算出的拼接视图新根序列：本地校验通过后才生效 */
 	private pendingRoots: string[] | null = null;
 	stats = {
@@ -155,6 +184,8 @@ export class OutlineView implements CmdHost {
 		public opts: ViewOptions = {},
 	) {
 		this.chain = opts.chain ?? [];
+		this.focusRoot = opts.focusRoot ?? null;
+		if (opts.collapsed) this.collapsed = opts.collapsed;
 		this.placeholderId = client.newId();
 		client.views.add(this);
 		const built = this.buildDoc();
@@ -169,6 +200,8 @@ export class OutlineView implements CmdHost {
 				mention: (node) => new MentionView(node, this),
 			},
 			handlePaste: (_v, ev) => this.handlePaste(ev),
+			// 导图模式下（大纲不显示）和导图节点里的编辑器不滚动：滚动由导图的平移负责
+			handleScrollToSelection: () => this.noScroll,
 			clipboardTextSerializer: (slice) => this.copyText(slice),
 			handleTextInput: (_v, from, to, text) => this.handleTextInput(from, to, text),
 			handleDOMEvents: {
@@ -190,6 +223,7 @@ export class OutlineView implements CmdHost {
 			},
 		});
 		(this.pm.dom as HTMLElement).dataset.surface = surface.kind;
+		if (this.focusRoot) (this.pm.dom as HTMLElement).dataset.focus = this.focusRoot;
 		if (opts.label) (this.pm.dom as HTMLElement).dataset.label = opts.label;
 	}
 
@@ -219,6 +253,7 @@ export class OutlineView implements CmdHost {
 			return true;
 		};
 		return [
+			keymap(this.opts.keys ?? {}),
 			keymap({
 				Enter: splitBlock(this),
 				"Shift-Enter": hardBreak(),
@@ -249,6 +284,14 @@ export class OutlineView implements CmdHost {
 				},
 				props: { decorations: (s) => presenceKey.getState(s) },
 			}),
+			new Plugin({
+				key: bselKey,
+				state: {
+					init: () => DecorationSet.empty,
+					apply: (tr, old) => tr.getMeta(bselKey) ?? old.map(tr.mapping, tr.doc),
+				},
+				props: { decorations: (s) => bselKey.getState(s) },
+			}),
 		];
 	}
 
@@ -260,10 +303,30 @@ export class OutlineView implements CmdHost {
 			case "page":
 				return v.children(this.surface.pageId);
 			case "embed":
+			case "node":
 				return v.alive(this.surface.blockId) ? [this.surface.blockId] : [];
 			case "stitch":
 				return this.surface.roots.filter((id) => v.alive(id));
 		}
+	}
+
+	get hasBlockSelection(): boolean {
+		return (bselKey.getState(this.pm.state)?.find().length ?? 0) > 0;
+	}
+
+	/** 块选择模式：给一组块加高亮（视图状态里的「选中的一组块」）。 */
+	setBlockSelection(ids: string[]) {
+		const doc = this.pm.state.doc;
+		const decos: Decoration[] = [];
+		for (const id of ids) {
+			const pos = findBlockPos(doc, id);
+			if (pos == null) continue;
+			const n = doc.nodeAt(pos) as PMNode;
+			decos.push(Decoration.node(pos, pos + n.nodeSize, { class: "ob-bsel" }));
+		}
+		this.pm.dispatch(
+			this.pm.state.tr.setMeta(bselKey, DecorationSet.create(doc, decos)).setMeta("remote", true),
+		);
 	}
 
 	resetCache() {
@@ -309,11 +372,13 @@ export class OutlineView implements CmdHost {
 				if (c) changed.add(id);
 			}
 			const kids: PMNode[] = [];
-			for (const k of v.children(id)) {
-				const n = build(k, depth + 1);
-				if (n) kids.push(n);
-			}
-			const collapsed = this.collapsed.has(id) && kids.length > 0;
+			const single = depth === 0 && this.surface.kind === "node";
+			if (!single)
+				for (const k of v.children(id)) {
+					const n = build(k, depth + 1);
+					if (n) kids.push(n);
+				}
+			const collapsed = id !== this.focusRoot && this.collapsed.has(id) && kids.length > 0;
 			let node: PMNode;
 			if (
 				c &&
@@ -468,6 +533,13 @@ export class OutlineView implements CmdHost {
 	}
 
 	restoreSelection(sel: SelInfo) {
+		if (this.opts.restoreSel?.(sel)) return;
+		this.applySelection(sel);
+	}
+
+	/** 直接在本视图里设选区（不经编辑面）。scroll = false：不滚动（切换视图时锚点不能动）。 */
+	applySelection(sel: SelInfo, scroll = true) {
+		if (this.destroyed) return;
 		const doc = this.pm.state.doc;
 		const a = this.pointToPos(doc, sel.anchor);
 		const h = this.pointToPos(doc, sel.head);
@@ -480,13 +552,15 @@ export class OutlineView implements CmdHost {
 				return;
 			}
 		} else tr.setSelection(TextSelection.between(doc.resolve(a), doc.resolve(h)));
-		this.pm.dispatch(tr.setMeta("remote", true).scrollIntoView());
+		tr.setMeta("remote", true);
+		this.pm.dispatch(scroll ? tr.scrollIntoView() : tr);
 	}
 
 	private afterSelection() {
 		const p = this.locate(this.pm.state.doc, this.pm.state.selection.head);
 		if (!p || p.blockId === this.lastSelBlock) return;
 		this.lastSelBlock = p.blockId;
+		this.opts.onSelect?.(p.blockId);
 		this.client.openBlock(p.blockId);
 		const pageId = this.client.pageOf(p.blockId);
 		if (pageId) this.client.sendPresence(pageId, p.blockId, Math.max(0, p.offset));
@@ -1095,6 +1169,7 @@ export class OutlineView implements CmdHost {
 		if (this.collapsed.has(id)) this.collapsed.delete(id);
 		else this.collapsed.add(id);
 		this.sync();
+		this.opts.onCollapse?.(id);
 	}
 }
 
@@ -1116,16 +1191,11 @@ export function findBlockPos(doc: PMNode, id: string): number | null {
 
 // ---------- node views ----------
 
-const TASK_GLYPH: Record<string, string> = { " ": "☐", "/": "◐", x: "☑", "-": "⊘" };
-const TASK_NEXT: Record<string, string> = { " ": "/", "/": "x", x: " ", "-": " " };
-
-/** 块的外框：项目符号、折叠箭头、复选框，原生 DOM（不是每块一个 React 根）。 */
+/** 块的外框：折叠箭头、项目符号、复选框，原生 DOM（不是每块一个 React 根），和导图节点共用（chrome.ts）。 */
 class BlockView implements NodeView {
 	dom: HTMLElement;
 	contentDOM: HTMLElement;
-	private gutter: HTMLElement;
-	private toggle: HTMLElement;
-	private check: HTMLElement;
+	private g: Gutter;
 
 	constructor(
 		private node: PMNode,
@@ -1135,39 +1205,44 @@ class BlockView implements NodeView {
 	) {
 		this.dom = document.createElement("div");
 		this.dom.className = "ob-block";
-		this.gutter = document.createElement("div");
-		this.gutter.className = "ob-gutter";
-		this.gutter.contentEditable = "false";
-		this.toggle = document.createElement("span");
-		this.toggle.className = "ob-bullet";
-		this.toggle.addEventListener("mousedown", (e) => {
+		this.g = createGutter();
+		this.g.arrow.addEventListener("mousedown", (e) => {
 			e.preventDefault();
 			this.owner.toggleCollapse(this.node.attrs.id);
 		});
-		this.check = document.createElement("span");
-		this.check.className = "ob-check";
-		this.check.addEventListener("mousedown", (e) => {
+		this.g.bullet.addEventListener("mousedown", (e) => {
+			e.preventDefault();
+			const id = this.node.attrs.id as string;
+			if (this.owner.opts.onBullet) this.owner.opts.onBullet(id);
+			else this.owner.toggleCollapse(id);
+		});
+		this.g.check.addEventListener("mousedown", (e) => {
 			e.preventDefault();
 			const task = this.node.attrs.task as string | null;
 			if (!task) return;
 			const pos = this.getPos();
 			this.view.dispatch(this.view.state.tr.setNodeAttribute(pos, "task", TASK_NEXT[task]));
 		});
-		this.gutter.append(this.toggle, this.check);
 		this.contentDOM = document.createElement("div");
 		this.contentDOM.className = "ob-content";
-		this.dom.append(this.gutter, this.contentDOM);
+		this.dom.append(this.g.el, this.contentDOM);
 		this.render();
 	}
 
 	private render() {
 		const n = this.node;
-		this.dom.dataset.id = n.attrs.id ?? "";
-		this.dom.classList.toggle("collapsed", !!n.attrs.collapsed);
-		this.dom.classList.toggle("has-kids", n.childCount > 1);
-		this.dom.dataset.task = n.attrs.task ?? "";
-		this.check.textContent = n.attrs.task ? TASK_GLYPH[n.attrs.task] : "";
-		this.check.style.display = n.attrs.task ? "" : "none";
+		const id = n.attrs.id ?? "";
+		if (this.dom.dataset.id && this.dom.dataset.id !== id) {
+			if (this.owner.blockEls.get(this.dom.dataset.id) === this.dom)
+				this.owner.blockEls.delete(this.dom.dataset.id);
+		}
+		this.dom.dataset.id = id;
+		if (id) this.owner.blockEls.set(id, this.dom);
+		applyChrome(this.dom, this.g, {
+			hasKids: n.childCount > 1,
+			collapsed: !!n.attrs.collapsed,
+			task: n.attrs.task ?? null,
+		});
 	}
 
 	update(node: PMNode) {
@@ -1177,13 +1252,18 @@ class BlockView implements NodeView {
 		return true;
 	}
 
+	destroy() {
+		const id = this.dom.dataset.id;
+		if (id && this.owner.blockEls.get(id) === this.dom) this.owner.blockEls.delete(id);
+	}
+
 	ignoreMutation(m: MutationRecord | { type: "selection"; target: Node }) {
 		if (m.type === "selection") return false;
 		return !this.contentDOM.contains(m.target) || m.target === this.dom;
 	}
 
 	stopEvent(e: Event) {
-		return this.gutter.contains(e.target as Node);
+		return this.g.el.contains(e.target as Node);
 	}
 }
 
@@ -1193,13 +1273,7 @@ class MentionView implements NodeView {
 		this.dom = document.createElement("span");
 		this.dom.className = "ob-mention";
 		this.dom.dataset.ref = node.attrs.ref;
-		const { blockId } = refTarget(node.attrs.ref);
-		const text = owner.client.visible.alive(blockId)
-			? owner.client.textOf(blockId).split("\n")[0]
-			: null;
-		this.dom.textContent =
-			node.attrs.label ??
-			(text ? text.replace(/[#*_`~[\]>!\\]/g, "").slice(0, 40) : node.attrs.ref);
+		this.dom.textContent = mentionLabel(owner.client, node.attrs.ref, node.attrs.label);
 	}
 	ignoreMutation() {
 		return true;

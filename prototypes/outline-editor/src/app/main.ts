@@ -1,7 +1,9 @@
 /**
  * 原型页面：一个内存「服务端」+ 两个客户端（Alice、Bob）+ 一个模拟 agent。
- * 默认模式：两人并排编辑同一页；下方是 Alice 的拼接视图（三页的块混排）和 Bob 看第二页。
- * 性能模式（?mode=perf&n=2000）：一个客户端、一页 n 个块。
+ * 默认模式：两人并排编辑同一页（每人一个编辑面：大纲 / 导图可切换）；下方是 Alice 的拼接视图
+ * （三页的块混排）和 Bob 看第二页。
+ * 性能模式（?mode=perf&n=2000&pages=1）：一个客户端、一页 n 个块；pages > 1 时另有 pages-1 页各 n 块
+ * （快速切换器的索引覆盖所有页）。
  */
 
 import { type EditorState, TextSelection, type Transaction } from "prosemirror-state";
@@ -9,10 +11,13 @@ import * as Y from "yjs";
 import { Client } from "../client/client";
 import { indent, joinBackward, moveBlock, outdent, splitBlock } from "../client/commands";
 import { fragmentToOutline, parseStats } from "../client/convert";
+import { activeSurface, EditSurface, FocusHistory, setHistory } from "../client/surface";
+import { QuickSwitcher } from "../client/switcher";
 import { findBlockPos, OutlineView } from "../client/view";
 import { parseOutline } from "../dialect/parse";
 import { serializeBody, serializeOutline } from "../dialect/serialize";
 import type { OutlineNode } from "../dialect/types";
+import { measureStats, NODE, prewarmStats } from "../mindmap/measure";
 import { keyBetween } from "../model/orderkey";
 import { Net } from "../net";
 import { type AgentEdit, Server } from "../server/server";
@@ -100,9 +105,10 @@ function seedDefault() {
 	);
 }
 
-function seedPerf(n: number) {
+function seedPerf(n: number, pageId = "P1", title = "性能页") {
 	const lines: string[] = [];
 	const words = "块 模型 是 真相 编辑器 文档 只是 投影 outline block children body".split(" ");
+	const tag = pageId === "P1" ? "" : `${pageId}-`;
 	for (let i = 0; i < n; i++) {
 		const depth = i % 10 === 0 ? 0 : i % 3 === 0 ? 2 : 1;
 		const w = Array.from({ length: 8 + (i % 7) }, (_, k) => words[(i + k) % words.length]).join(
@@ -110,10 +116,15 @@ function seedPerf(n: number) {
 		);
 		let text = `${i}. ${w}`;
 		if (i % 13 === 0) text = `**${i}** ${w} \`code\` [[P1/P1b1]]`;
-		if (i % 50 === 0) text = `## 小节 ${i}`;
-		lines.push(`${"  ".repeat(depth)}- ${text.replace(/^(\d+)\./, "$1\\.")}`);
+		if (i % 50 === 0) text = `## 小节 ${tag}${i}`;
+		const ind = "  ".repeat(depth);
+		lines.push(`${ind}- ${text.replace(/^(\d+)\./, "$1\\.")}`);
+		// 快速切换器用：别名（属性行）和只在正文第二行出现的词
+		// （标题不能续行，跳过，保证块数正好是 n）
+		if (i % 37 === 5 && i % 50 !== 0) lines.push(`${ind}  alias:: 别名${tag}${i}`);
+		if (i % 41 === 7 && i % 50 !== 0) lines.push(`${ind}  备注 tok${tag}${i}x`);
 	}
-	seedPage("P1", "性能页", lines.join("\n"));
+	seedPage(pageId, title, lines.join("\n"));
 }
 
 const app = document.getElementById("app") as HTMLElement;
@@ -132,22 +143,35 @@ function panel(title: string, cls = ""): HTMLElement {
 
 const clients: Record<string, Client> = {};
 const views: Record<string, OutlineView> = {};
+const surfaces: Record<string, EditSurface> = {};
+/** views.A / views.B 是编辑面当前的大纲视图（聚焦时是聚焦视图），P0 的测试接口照常用 */
+function defineSurfaceView(k: string) {
+	Object.defineProperty(views, k, { get: () => surfaces[k].outline, enumerable: true });
+}
+const focusHistory = new FocusHistory("A");
+setHistory(focusHistory);
+const switcher = new QuickSwitcher();
 
 async function setup() {
 	if (mode === "perf") {
 		const n = Number(params.get("n") ?? 2000);
+		const pages = Number(params.get("pages") ?? 1);
 		seedPerf(n);
+		for (let p = 2; p <= pages; p++) seedPerf(n, `P${p}`, `性能页 ${p}`);
 		const A = new Client("A", "Alice", "#d6336c", net);
 		server.connect("A", "Alice");
 		clients.A = A;
 		await A.joinPage("P1");
+		for (let p = 2; p <= pages; p++) await A.joinPage(`P${p}`);
 		const t0 = performance.now();
-		views.A = new OutlineView(
-			A,
-			{ kind: "page", pageId: "P1" },
-			panel(`性能页 · ${n} 块`, "wide"),
-			{ label: "A" },
-		);
+		surfaces.A = new EditSurface(A, "P1", app, {
+			label: "A",
+			title: `性能页 · ${n} 块${pages > 1 ? `（另有 ${pages - 1} 页，共 ${n * pages} 块）` : ""}`,
+			height: "calc(100vh - 150px)",
+			premeasure: params.get("premeasure") !== "0",
+		});
+		surfaces.A.panel.classList.add("wide");
+		defineSurfaceView("A");
 		const t1 = performance.now();
 		(window as unknown as Record<string, unknown>).initialRenderMs = t1 - t0;
 	} else {
@@ -165,12 +189,18 @@ async function setup() {
 			A.joinPage("P3"),
 			B.joinPage("P2"),
 		]);
-		views.A = new OutlineView(A, { kind: "page", pageId: "P1" }, panel("Alice · 设计文档 (P1)"), {
+		surfaces.A = new EditSurface(A, "P1", app, {
 			label: "A",
+			title: "Alice · 设计文档 (P1)",
+			height: "460px",
 		});
-		views.B = new OutlineView(B, { kind: "page", pageId: "P1" }, panel("Bob · 设计文档 (P1)"), {
+		surfaces.B = new EditSurface(B, "P1", app, {
 			label: "B",
+			title: "Bob · 设计文档 (P1)",
+			height: "460px",
 		});
+		defineSurfaceView("A");
+		defineSurfaceView("B");
 		views.AS = new OutlineView(
 			A,
 			{ kind: "stitch", roots: ["P1b3", "P2b1", "P3b1"] },
@@ -181,10 +211,29 @@ async function setup() {
 			label: "B2",
 		});
 	}
+	for (const [k, sf] of Object.entries(surfaces)) focusHistory.add(k, sf);
+	switcher.watch(clients.A);
+	const initial = FocusHistory.fromHash();
+	if (initial && surfaces.A) surfaces.A.focusBlock(initial, { push: false, animate: false });
+	focusHistory.replace();
 	renderDebug();
 	for (const c of Object.values(clients)) c.onChange = scheduleDebug;
 	document.body.dataset.ready = "1";
 }
+
+// Mod-K：快速切换器（对当前编辑面）
+document.addEventListener(
+	"keydown",
+	(e) => {
+		if ((e.ctrlKey || e.metaKey) && !e.altKey && (e.key === "k" || e.key === "K")) {
+			e.preventDefault();
+			e.stopPropagation();
+			const sf = activeSurface ?? surfaces.A;
+			if (sf) switcher.open(sf);
+		}
+	},
+	true,
+);
 
 // ---------- 调试面板 ----------
 const debug = document.getElementById("debug") as HTMLElement;
@@ -381,6 +430,124 @@ const proto = {
 			.filter((x) => x.opts.parent === v)
 			.map((x) => (x.surface as { blockId: string }).blockId);
 	},
+
+	// ---------- 导图与聚焦（PR1） ----------
+	surfaces,
+	switcher,
+	setView: (k: string, kind: "outline" | "map") => surfaces[k].setView(kind),
+	setLayout: (k: string, dir: "right" | "down") => surfaces[k].setLayout(dir),
+	focusBlock: (k: string, id: string | null) => surfaces[k].focusBlock(id),
+	focusUp: (k: string) => surfaces[k].focusUp(),
+	toggleCollapse: (k: string, id: string) => surfaces[k].toggleCollapse(id),
+	/** 视图状态快照（先把当前视图的光标写进去） */
+	viewState: (k: string) => {
+		surfaces[k].captureCaret();
+		return surfaces[k].state.snapshot();
+	},
+	animating: (k: string) => surfaces[k].animating,
+	finishAnim: (k: string) => surfaces[k].finishTransition(),
+	transitionLog: (k: string) => surfaces[k].log.slice(),
+	mapFlush: (k: string) => surfaces[k].map.flush(),
+	mapFit: (k: string) => surfaces[k].map.fit(),
+	mapTransform: (k: string, tx: number, ty: number, s: number) => {
+		surfaces[k].map.setTransform(tx, ty, s);
+		surfaces[k].map.flush();
+	},
+	mapSelect: (k: string, id: string) => surfaces[k].map.select(id),
+	mapEdit: (k: string, id: string, caret?: number) => surfaces[k].map.enterEdit(id, caret ?? "end"),
+	mapState: (k: string) => {
+		const m = surfaces[k].map;
+		return {
+			active: m.active,
+			root: m.rootId,
+			selected: m.selected,
+			editing: m.editing?.id ?? null,
+			tx: m.tx,
+			ty: m.ty,
+			scale: m.scale,
+			nodes: m.order.length,
+			inDom: m.els.size,
+			focusedStage: document.activeElement === m.stage,
+		};
+	},
+	/** 导图的块树（按布局顺序）：id → 父块，用来和大纲比对折叠 / 聚焦 */
+	mapTree: (k: string) => {
+		const m = surfaces[k].map;
+		m.flush();
+		return m.order.map((id) => ({ id, parent: m.info.get(id)?.parent ?? null }));
+	},
+	mapStats: (k: string) => {
+		const m = surfaces[k].map;
+		return {
+			layouts: m.stats.layouts.slice(),
+			measureMs: m.stats.measureMs.slice(),
+			treeMs: m.stats.treeMs.slice(),
+			renders: m.stats.renders.slice(),
+			measure: { ...measureStats },
+			prewarm: { ...prewarmStats },
+		};
+	},
+	/** 等 Worker 预先测量完 */
+	prewarmDone: (k: string) => surfaces[k].prewarmDone.then(() => ({ ...prewarmStats })),
+	/** 导图节点的屏幕矩形（页面坐标，读 DOM） */
+	nodeRect: (k: string, id: string) => {
+		const el = surfaces[k].map.el(id);
+		if (!el) return null;
+		const r = el.getBoundingClientRect();
+		return { x: r.left, y: r.top, w: r.width, h: r.height };
+	},
+	/** pretext 预测的节点尺寸 vs DOM 实际尺寸（只看已渲染、不在编辑的节点） */
+	nodeAccuracy: (k: string) => {
+		const m = surfaces[k].map;
+		m.flush();
+		let n = 0;
+		let maxDw = 0;
+		let maxDh = 0;
+		let overH = 0;
+		const worst: Array<{ id: string; dh: number; dw: number }> = [];
+		for (const [id, ne] of m.els) {
+			if (m.editing?.id === id) continue;
+			const inf = m.info.get(id);
+			if (!inf) continue;
+			const body = ne.body;
+			// 块体内容的实际高度（scrollHeight：内容溢出时也算进去）
+			const realH = body.scrollHeight + NODE.padY * 2 + NODE.border * 2;
+			const predH = inf.node.h;
+			const realW = body.scrollWidth;
+			const dh = realH - predH;
+			const dw = realW - inf.bodyW;
+			n++;
+			if (Math.abs(dh) > Math.abs(maxDh)) maxDh = dh;
+			if (dw > maxDw) maxDw = dw;
+			if (Math.abs(dh) > 1) {
+				overH++;
+				if (worst.length < 5) worst.push({ id, dh, dw });
+			}
+		}
+		return { n, maxDh, maxDw, overH, worst };
+	},
+	/** 某块的块体左上角相对编辑区的屏幕位置（当前视图，读 DOM） */
+	anchorScreen: (k: string, id: string) => {
+		const sf = surfaces[k];
+		const fr = sf.frame.getBoundingClientRect();
+		let el: Element | null = null;
+		if (sf.state.view === "map") el = sf.map.el(id)?.querySelector(".mm-body") ?? null;
+		else el = sf.rowBody(id);
+		if (!el) return null;
+		const r = el.getBoundingClientRect();
+		return { x: r.left - fr.left, y: r.top - fr.top };
+	},
+	/** 块树快照：[文字, 任务, 子块…]（比对两种视图里做同样操作的结果；新块的 id 不同，所以不带 id） */
+	blockTree: (pageId: string, rootId?: string) => {
+		const st = server.store;
+		const walk = (id: string): unknown[] =>
+			st.children(id).map((c) => {
+				const b = st.get(c);
+				return [server.textOf(c), b?.task ?? null, walk(c)];
+			});
+		return walk(rootId ?? pageId);
+	},
+	location: () => location.hash,
 };
 function findView(key: string): OutlineView {
 	// "A>embed:P2b3" 这样的键：某个视图下嵌入的子视图

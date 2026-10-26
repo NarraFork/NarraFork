@@ -478,6 +478,7 @@ export class Client {
 					offset: m.offset as number,
 				});
 				for (const v of this.views) v.renderPresence();
+				for (const f of this.listeners) f("presence");
 				break;
 			}
 		}
@@ -520,7 +521,11 @@ export class Client {
 			if (full) v.resetCache();
 			v.sync();
 		}
+		for (const f of this.listeners) f("sync");
 	}
+
+	/** 存储或在场变了之后通知（导图等不是 OutlineView 的投影用来安排重新布局） */
+	listeners = new Set<(kind: "sync" | "presence") => void>();
 
 	// ---------- 调试 / 测试 ----------
 

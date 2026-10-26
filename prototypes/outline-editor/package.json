@@ -10,6 +10,7 @@
 		"check": "cd ../.. && bunx tsgo --noEmit -p prototypes/outline-editor && bunx @biomejs/biome check prototypes/outline-editor"
 	},
 	"dependencies": {
+		"@chenglou/pretext": "0.0.8",
 		"marked": "18.0.7",
 		"prosemirror-commands": "1.7.2",
 		"prosemirror-keymap": "1.2.3",
