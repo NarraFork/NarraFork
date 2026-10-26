@@ -1143,6 +1143,35 @@ describe("assistant file-reference provenance", () => {
 });
 
 describe("narrator event handler streaming snapshot", () => {
+	test("exact trusted receipt attempts travel with tool_started and its reconnect chunk", async () => {
+		const parent = makeMainContext();
+		parent.toolExecutionReceipts = new Map([
+			[
+				PARENT_TOOL_USE_ID,
+				{ messageId: "saved-step", binding: { toolCallId: "exact-pk", attempt: 3 } },
+			],
+		]);
+		await processEvent(
+			{
+				type: "tool_call",
+				toolUseId: PARENT_TOOL_USE_ID,
+				toolName: "Agent",
+				input: { prompt: "go" },
+			},
+			parent,
+		);
+		expect(broadcastMessages.at(-1)).toMatchObject({
+			type: "tool_started",
+			toolCallId: "exact-pk",
+			executionAttempt: 3,
+		});
+		expect(
+			getStreamingSnapshot(PARENT_NARRATOR_ID)?.toolChunks.get(PARENT_TOOL_USE_ID),
+		).toMatchObject({
+			toolCallId: "exact-pk",
+			executionAttempt: 3,
+		});
+	});
 	test("trusted Edit origin travels in tool_started and reconnect snapshot, never model metadata", async () => {
 		const ctx = makeMainContext();
 		const input = {

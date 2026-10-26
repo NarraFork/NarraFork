@@ -60,6 +60,7 @@ import {
 	dropDiscardedStreamingTools,
 	dropPersistedStreamingTools,
 	isRetiredStreamingDocument,
+	isRetiredStreamingToolBinding,
 	isTextDocumentPersisted,
 	streamingToolChunks,
 } from "./streaming-tool-chunks";
@@ -380,6 +381,9 @@ export function useVListStreamingMessage(
 				let toolsChanged = false;
 				for (const chunk of snapshot.toolChunks) {
 					if (!isSubagent && chunk.parentToolUseId) continue;
+					// Retired bindings must not reach the snapshot's later started/executing
+					// folds either; rejecting only its raw input chunk would be too late.
+					if (isRetiredStreamingToolBinding(toolStoreRef.current, chunk)) continue;
 					if (
 						chunk.inputDocument
 							? isTextDocumentPersisted(chunk.inputDocument.ref, persistedDocumentPins)
@@ -408,8 +412,12 @@ export function useVListStreamingMessage(
 					// A name-only tool may receive no more deltas for a long time.
 					// Restore it from the subscription snapshot, not the next live event.
 					toolsChanged =
-						applyStreamingToolChunk(toolStoreRef.current, { ...chunk, inputDocument }) ||
-						toolsChanged;
+						applyStreamingToolChunk(toolStoreRef.current, {
+							...chunk,
+							inputDocument,
+							fromSnapshot: true,
+						}) || toolsChanged;
+					if (isRetiredStreamingToolBinding(toolStoreRef.current, chunk)) continue;
 					if (chunk.started) {
 						toolsChanged =
 							applyStreamingToolStarted(toolStoreRef.current, {
@@ -572,7 +580,7 @@ export function useVListStreamingMessage(
 				extractedFields,
 				metadata,
 				streamingField,
-				_meta,
+				meta,
 				inputDocument,
 			) => {
 				if (!isSubagent && rawParentToolUseId) return;
@@ -598,6 +606,10 @@ export function useVListStreamingMessage(
 					applyStreamingToolChunk(toolStoreRef.current, {
 						toolUseId,
 						toolName,
+						...(meta?.toolCallId ? { toolCallId: meta.toolCallId } : {}),
+						...(meta?.executionAttempt !== undefined
+							? { executionAttempt: meta.executionAttempt }
+							: {}),
 						inputCharsTotal,
 						...(extractedFilePath !== undefined ? { extractedFilePath } : {}),
 						...(contentCharsReceived !== undefined ? { contentCharsReceived } : {}),
@@ -633,6 +645,10 @@ export function useVListStreamingMessage(
 					applyStreamingToolStarted(toolStoreRef.current, {
 						toolUseId,
 						toolName,
+						...(meta?.toolCallId ? { toolCallId: meta.toolCallId } : {}),
+						...(meta?.executionAttempt !== undefined
+							? { executionAttempt: meta.executionAttempt }
+							: {}),
 						...(streamStartedAt != null ? { streamStartedAt } : {}),
 						...(streamCompletedAt != null ? { streamCompletedAt } : {}),
 						...(input

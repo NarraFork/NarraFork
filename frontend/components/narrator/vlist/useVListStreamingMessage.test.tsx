@@ -13,6 +13,7 @@ import { installCanvasStub } from "./measure/test-canvas-stub";
 import { measureCache } from "./measure-cache";
 import { PretextLayoutCoordinator } from "./pretext-layout-coordinator";
 import { renderElement, resolveRenderExtra } from "./render-registry";
+import { useVListLivePatches } from "./useVListLivePatches";
 import { useVListStreamingMessage } from "./useVListStreamingMessage";
 import { resolveStreamAnimExtra } from "./vlist-stream-anim-extra";
 
@@ -71,12 +72,15 @@ async function withStream(
 		coordinator: PretextLayoutCoordinator;
 		switchNarrator: (id: string, subagent?: boolean) => Promise<void>;
 		live: () => TreeMessage | null;
+		promptCounts: () => string[];
 	}) => Promise<void>,
 	{
 		animateStreaming = false,
 		textExpanded = false,
 		keepEmptyReasoningLive = false,
+		livePatches = false,
 	}: {
+		livePatches?: boolean;
 		animateStreaming?: boolean;
 		textExpanded?: boolean;
 		keepEmptyReasoningLive?: boolean;
@@ -161,6 +165,11 @@ async function withStream(
 	function Harness() {
 		const snapshot = useSyncExternalStore(coordinator.subscribe, coordinator.getSnapshot);
 		const committed = snapshot.input?.messages ?? [];
+		useVListLivePatches(livePatches ? narratorId : undefined, {
+			enabled: livePatches,
+			isSubagent,
+			applyLivePatch: (patch) => coordinator.applyLivePatch(patch, VIEW),
+		});
 		const streaming = useVListStreamingMessage(narratorId, {
 			enabled: true,
 			isSubagent,
@@ -234,6 +243,10 @@ async function withStream(
 					.map((span) => span.textContent ?? "")
 					.join(""),
 			live: () => latestLive,
+			promptCounts: () =>
+				Array.from(container.querySelectorAll('[data-testid="subagent-prompt-chars"]')).map(
+					(badge) => badge.textContent ?? "",
+				),
 			showOnlyKeys: async (keys) => {
 				await act(async () => {
 					visibleKeys = keys == null ? null : new Set(keys);
@@ -297,6 +310,509 @@ async function withStream(
 		}
 	}
 }
+
+describe("Agent prompt length through real WS / hook / coordinator / DOM", () => {
+	const identity = {
+		toolUseId: "agent-wire",
+		toolCallId: "agent-call",
+		attempt: 0,
+	};
+	const input = {
+		subagent_type: "explore",
+		description: "Counted child",
+		prompt: "inspect repo",
+		background: true,
+	};
+	const persisted = (status: string) => ({
+		type: "tool_use",
+		id: identity.toolUseId,
+		name: "Agent",
+		input,
+		tcId: identity.toolCallId,
+		executionAttempt: identity.attempt,
+		status,
+		...(status === "success" ? { output: { background_task_id: "child" } } : {}),
+	});
+	it("counts over-16k raw prompt frames including CRLF and unchanged saturated previews", async () => {
+		await withStream(async (h) => {
+			const first = "x\r\n".repeat(7000);
+			await h.frame({
+				type: "tool_use_chunk",
+				toolUseId: identity.toolUseId,
+				toolName: "Agent",
+				inputCharsTotal: 50000,
+				streamingField: { name: "prompt", delta: first, offset: 0, startsField: true },
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["21000 chars"]);
+			await h.frame({
+				type: "tool_use_chunk",
+				toolUseId: identity.toolUseId,
+				toolName: "Agent",
+				inputCharsTotal: 50001,
+				streamingField: { name: "prompt", delta: "\r", offset: 21000 },
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["21001 chars"]);
+			await h.frame({
+				type: "tool_use_chunk",
+				toolUseId: identity.toolUseId,
+				toolName: "Agent",
+				inputCharsTotal: 50002,
+				streamingField: { name: "prompt", delta: "\n", offset: 21001 },
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["21002 chars"]);
+			await h.frame({
+				type: "tool_use_chunk",
+				toolUseId: identity.toolUseId,
+				toolName: "Agent",
+				inputCharsTotal: 50003,
+				streamingField: { name: "prompt", delta: "stale", offset: 20 },
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["21002 chars"]);
+			await h.frame({
+				type: "tool_use_chunk",
+				toolUseId: identity.toolUseId,
+				toolName: "Agent",
+				inputCharsTotal: 60000,
+				streamingField: { name: "description", delta: "description", offset: 0, startsField: true },
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["21002 chars"]);
+		});
+	});
+
+	it("recovers raw prompt length from live offsets after cold snapshots without inventing a tail length", async () => {
+		await withStream(async (h) => {
+			const binding = { toolCallId: identity.toolCallId, executionAttempt: 0 };
+			await h.frame({
+				type: "streaming_snapshot",
+				streamingBlocks: [],
+				toolChunks: [
+					{
+						toolUseId: identity.toolUseId,
+						toolName: "Agent",
+						inputCharsTotal: 50000,
+						...binding,
+					},
+				],
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual([]);
+			await h.frame({
+				type: "tool_use_chunk",
+				toolUseId: identity.toolUseId,
+				toolName: "Agent",
+				inputCharsTotal: 50010,
+				...binding,
+				streamingField: { name: "prompt", delta: "tail", offset: 25000 },
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["25004 chars"]);
+			await h.frame({
+				type: "streaming_snapshot",
+				streamingBlocks: [],
+				toolChunks: [
+					{
+						toolUseId: identity.toolUseId,
+						toolName: "Agent",
+						inputCharsTotal: 50010,
+						...binding,
+					},
+				],
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["25004 chars"]);
+			await h.frame({
+				type: "streaming_snapshot",
+				streamingBlocks: [],
+				toolChunks: [
+					{
+						toolUseId: identity.toolUseId,
+						toolName: "Agent",
+						inputCharsTotal: 50000,
+						...binding,
+					},
+				],
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["25004 chars"]);
+			await h.frame({
+				type: "streaming_snapshot",
+				streamingBlocks: [],
+				toolChunks: [
+					{
+						toolUseId: identity.toolUseId,
+						toolName: "Agent",
+						inputCharsTotal: 30,
+						toolCallId: "next-call",
+						executionAttempt: 0,
+					},
+				],
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual([]);
+			await h.frame({
+				type: "tool_use_chunk",
+				toolUseId: identity.toolUseId,
+				toolName: "Agent",
+				toolCallId: "next-call",
+				executionAttempt: 0,
+				inputCharsTotal: 40,
+				streamingField: { name: "prompt", delta: "new", offset: 0, startsField: true },
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["3 chars"]);
+			await h.frame({
+				type: "streaming_snapshot",
+				streamingBlocks: [],
+				toolChunks: [
+					{
+						toolUseId: identity.toolUseId,
+						toolName: "Agent",
+						inputCharsTotal: 50020,
+						...binding,
+						started: true,
+						executing: true,
+						input: { prompt: "retired snapshot" },
+					},
+				],
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["3 chars"]);
+			expect(h.live()?.toolCalls?.[0]).toMatchObject({
+				id: "next-call",
+				executionAttempt: 0,
+				status: "initializing",
+			});
+			await h.frame({
+				type: "tool_started",
+				toolUseId: identity.toolUseId,
+				toolName: "Agent",
+				...binding,
+				input: { prompt: "retired started" },
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["3 chars"]);
+			await h.frame({
+				type: "tool_use_chunk",
+				toolUseId: identity.toolUseId,
+				toolName: "Agent",
+				inputCharsTotal: 50020,
+				...binding,
+				streamingField: { name: "prompt", delta: "late", offset: 25004 },
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["3 chars"]);
+			await h.frame({
+				type: "tool_use_chunk",
+				toolUseId: identity.toolUseId,
+				toolName: "Agent",
+				toolCallId: "next-call",
+				executionAttempt: 1,
+				inputCharsTotal: 50,
+				streamingField: { name: "prompt", delta: "retry", offset: 0, startsField: true },
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["5 chars"]);
+			await h.frame({
+				type: "streaming_snapshot",
+				streamingBlocks: [],
+				toolChunks: [
+					{
+						toolUseId: identity.toolUseId,
+						toolName: "Agent",
+						inputCharsTotal: 50030,
+						toolCallId: "next-call",
+						executionAttempt: 0,
+						started: true,
+						executing: true,
+						input: { prompt: "retired attempt snapshot" },
+					},
+				],
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["5 chars"]);
+			await h.frame({
+				type: "tool_started",
+				toolUseId: identity.toolUseId,
+				toolName: "Agent",
+				toolCallId: "next-call",
+				executionAttempt: 0,
+				input: { prompt: "retired attempt started" },
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["5 chars"]);
+			expect(h.live()?.toolCalls?.[0]).toMatchObject({
+				id: "next-call",
+				executionAttempt: 1,
+				status: "initializing",
+			});
+			await h.frame({
+				type: "tool_use_chunk",
+				toolUseId: identity.toolUseId,
+				toolName: "Agent",
+				toolCallId: "next-call",
+				executionAttempt: 0,
+				inputCharsTotal: 60,
+				streamingField: { name: "prompt", delta: "late", offset: 3 },
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["5 chars"]);
+		});
+	});
+
+	it("hides an unbound warm snapshot's length until a decoded offset proves it again", async () => {
+		await withStream(async (h) => {
+			await h.frame({
+				type: "tool_use_chunk",
+				toolUseId: identity.toolUseId,
+				toolName: "Agent",
+				inputCharsTotal: 40000,
+				streamingField: { name: "prompt", delta: "x".repeat(20000), offset: 0, startsField: true },
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["20000 chars"]);
+			await h.frame({
+				type: "streaming_snapshot",
+				streamingBlocks: [],
+				toolChunks: [
+					{
+						toolUseId: identity.toolUseId,
+						toolName: "Agent",
+						inputCharsTotal: 40000,
+					},
+				],
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual([]);
+			await h.frame({
+				type: "tool_use_chunk",
+				toolUseId: identity.toolUseId,
+				toolName: "Agent",
+				inputCharsTotal: 40010,
+				streamingField: { name: "prompt", delta: "tail", offset: 20000 },
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["20004 chars"]);
+		});
+	});
+
+	it("resets an unknown wire-only prompt when the exact stream identity becomes known", async () => {
+		await withStream(async (h) => {
+			await h.frame({
+				type: "tool_use_chunk",
+				toolUseId: identity.toolUseId,
+				toolName: "Agent",
+				inputCharsTotal: 40000,
+				streamingField: { name: "prompt", delta: "x".repeat(20000), offset: 0, startsField: true },
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["20000 chars"]);
+			await h.frame({
+				type: "streaming_snapshot",
+				streamingBlocks: [],
+				toolChunks: [
+					{
+						toolUseId: identity.toolUseId,
+						toolName: "Agent",
+						inputCharsTotal: 40000,
+						toolCallId: identity.toolCallId,
+						executionAttempt: 0,
+					},
+				],
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual([]);
+			await h.frame({
+				type: "tool_use_chunk",
+				toolUseId: identity.toolUseId,
+				toolName: "Agent",
+				toolCallId: identity.toolCallId,
+				executionAttempt: 0,
+				inputCharsTotal: 40010,
+				streamingField: { name: "prompt", delta: "tail", offset: 20000 },
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["20004 chars"]);
+			await h.switchNarrator("other-narrator");
+			await h.frame({
+				type: "tool_use_chunk",
+				toolUseId: identity.toolUseId,
+				toolName: "Agent",
+				inputCharsTotal: 100,
+				streamingField: { name: "prompt", delta: "unknown tail" },
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual([]);
+		});
+	});
+
+	it("counts streamed prompt growth and keeps it visible while generating description, then hides on execution", async () => {
+		await withStream(async (h) => {
+			await h.frame({
+				type: "tool_use_chunk",
+				toolUseId: identity.toolUseId,
+				toolName: "Agent",
+				inputCharsTotal: 800,
+				streamingField: { name: "prompt", delta: "abc", startsField: true },
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["3 chars"]);
+			await h.frame({
+				type: "tool_use_chunk",
+				toolUseId: identity.toolUseId,
+				toolName: "Agent",
+				inputCharsTotal: 803,
+				streamingField: { name: "prompt", delta: "def" },
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["6 chars"]);
+			await h.frame({
+				type: "tool_use_chunk",
+				toolUseId: identity.toolUseId,
+				toolName: "Agent",
+				inputCharsTotal: 2000,
+				streamingField: { name: "description", delta: "description".repeat(50), startsField: true },
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["6 chars"]);
+			const prepared = { ...input, prompt: "abcdef" };
+			await h.frame({
+				type: "tool_started",
+				toolUseId: identity.toolUseId,
+				toolName: "Agent",
+				toolCallId: identity.toolCallId,
+				executionAttempt: 0,
+				streamStartedAt: 100,
+				input: prepared,
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["6 chars"]);
+			await h.frame({
+				type: "tool_executing",
+				toolUseId: identity.toolUseId,
+				executionStartedAt: 200,
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual([]);
+			await h.frame({
+				type: "tool_use_chunk",
+				toolUseId: identity.toolUseId,
+				toolName: "Agent",
+				inputCharsTotal: 3000,
+				streamingField: { name: "prompt", delta: "late" },
+			});
+			await h.frame({
+				type: "tool_output",
+				toolUseId: identity.toolUseId,
+				output: "0",
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual([]);
+		});
+	});
+
+	it("keeps a single preparation badge through persistence and applies tool_executing to that card", async () => {
+		await withStream(
+			async (h) => {
+				await h.frame({
+					type: "tool_started",
+					toolUseId: identity.toolUseId,
+					toolName: "Agent",
+					toolCallId: identity.toolCallId,
+					executionAttempt: 0,
+					streamStartedAt: 100,
+					input,
+				});
+				await h.raf();
+				expect(h.promptCounts()).toEqual(["12 chars"]);
+				await h.commit([persisted("initializing")]);
+				await h.raf();
+				expect(h.live()).toBeNull();
+				expect(h.promptCounts()).toEqual(["12 chars"]);
+				await h.frame({
+					type: "tool_executing",
+					toolUseId: identity.toolUseId,
+					executionStartedAt: 200,
+				});
+				await h.raf();
+				expect(h.promptCounts()).toEqual([]);
+				await h.frame({
+					type: "streaming_snapshot",
+					streamingBlocks: [],
+					toolChunks: [
+						{
+							toolUseId: identity.toolUseId,
+							toolName: "Agent",
+							toolCallId: identity.toolCallId,
+							executionAttempt: 0,
+							inputCharsTotal: 5000,
+							started: true,
+							executing: true,
+							input: { ...input, _streamingChars: 5000 },
+							streamingOutput: "2000",
+						},
+					],
+				});
+				await h.raf();
+				expect(h.promptCounts()).toEqual([]);
+				expect(h.live()).toBeNull();
+			},
+			{ livePatches: true },
+		);
+	});
+
+	it("shows known zero and permission-wait prompt length, but never fabricates a missing prompt", async () => {
+		await withStream(async (h) => {
+			await h.frame({
+				type: "tool_started",
+				toolUseId: identity.toolUseId,
+				toolName: "Agent",
+				toolCallId: identity.toolCallId,
+				executionAttempt: 0,
+				input: { ...input, prompt: "" },
+			});
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["0 chars"]);
+			await h.commit([{ ...persisted("pending"), input: { ...input, prompt: "" } }]);
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["0 chars"]);
+			await h.commit([persisted("pending")]);
+			await h.raf();
+			expect(h.promptCounts()).toEqual(["12 chars"]);
+			await h.commit([{ ...persisted("pending"), input: { description: "missing prompt" } }]);
+			await h.raf();
+			expect(h.promptCounts()).toEqual([]);
+		});
+	});
+
+	it("restores executing synthetic identity without an output badge from the same snapshot", async () => {
+		await withStream(async (h) => {
+			await h.frame({
+				type: "streaming_snapshot",
+				streamingBlocks: [],
+				toolChunks: [
+					{
+						toolUseId: identity.toolUseId,
+						toolName: "Agent",
+						toolCallId: identity.toolCallId,
+						executionAttempt: 0,
+						inputCharsTotal: 0,
+						started: true,
+						executing: true,
+						input,
+					},
+				],
+			});
+			await h.raf();
+			expect(h.live()?.toolCalls?.[0]).toMatchObject({ id: "agent-call", executionAttempt: 0 });
+			expect(h.promptCounts()).toEqual([]);
+		});
+	});
+});
 
 describe("snapshot animation through real WS / hook / coordinator / DOM", () => {
 	for (const type of ["text", "reasoning"] as const) {

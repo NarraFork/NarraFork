@@ -598,6 +598,8 @@ export interface EventHooks {
 
 export interface ToolChunkSnapshot {
 	toolCallId: string | null;
+	/** Exact persisted execution receipt, when input completion already has one. */
+	executionAttempt?: number;
 	toolUseId: string;
 	toolName: string;
 	inputCharsTotal: number;
@@ -1771,7 +1773,16 @@ export async function processEvent(
 				);
 			}
 			// Workspace captures belong to executeTool's awaited lifecycle, not UI events.
-			const routing = subagentToolRouting(ctx, event.toolUseId);
+			const receipt = ctx.toolExecutionReceipts?.get(event.toolUseId);
+			const routing = {
+				...subagentToolRouting(ctx, event.toolUseId),
+				...(receipt
+					? {
+							toolCallId: receipt.binding.toolCallId,
+							executionAttempt: receipt.binding.attempt,
+						}
+					: {}),
+			};
 			// The child row's label. Computed once and reused by both the snapshot and
 			// the reduced parent frame — `input` is complete here, so this is the
 			// EARLIEST point the row can show anything beyond the tool name.

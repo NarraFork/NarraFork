@@ -74,6 +74,11 @@ export function subagentToolEventMeta(data: Record<string, unknown>): SubagentTo
 	};
 	return {
 		toolCallId: typeof data.toolCallId === "string" ? data.toolCallId : null,
+		...(typeof data.executionAttempt === "number" &&
+		Number.isSafeInteger(data.executionAttempt) &&
+		data.executionAttempt >= 0
+			? { executionAttempt: data.executionAttempt }
+			: {}),
 		...(typeof data.blockId === "string" ? { blockId: data.blockId } : {}),
 		toolName: typeof data.toolName === "string" ? data.toolName : null,
 		createdAt:
@@ -353,6 +358,7 @@ export function coerceReflectionProgressEvent(
 
 export interface SubagentToolEventMeta {
 	toolCallId?: string | null;
+	executionAttempt?: number;
 	/** The tool block the event is about, in the block-keyed protocol (§8.2). */
 	blockId?: string | null;
 	toolName?: string | null;
@@ -905,6 +911,7 @@ export interface NarratorWSCallbacks {
 			/** Latest determinate progress, so a reconnect paints the bar immediately. */
 			structuredProgress?: ToolProgressPayload;
 			toolCallId?: string | null;
+			executionAttempt?: number;
 			createdAt?: string | number | null;
 			timing?: SubagentToolCallTiming | null;
 			subagentNarratorId?: string | null;
@@ -1821,6 +1828,7 @@ export function useNarratorWS(
 								streamingOutput?: string;
 								structuredProgress?: ToolProgressPayload;
 								toolCallId?: string | null;
+								executionAttempt?: number;
 								createdAt?: string | number | null;
 								timing?: SubagentToolCallTiming | null;
 								subagentNarratorId?: string | null;

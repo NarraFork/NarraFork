@@ -347,6 +347,12 @@ export interface ExactRowProps {
  * only rows entering/leaving the window render; rows still in view skip React
  * work unless their item, geometry, or interaction signature changed.
  */
+function visiblePromptChars(item: VListItem): number | undefined {
+	if (item.spec.kind !== "subagent-card") return undefined;
+	const data = item.spec.data as { showPromptChars?: boolean; promptChars?: number };
+	return data.showPromptChars === true ? data.promptChars : undefined;
+}
+
 export const ExactRow = memo(
 	function ExactRow({
 		item,
@@ -1027,6 +1033,9 @@ export const ExactRow = memo(
 		// `measured`, and the measure cache keys on a content revision, so different data
 		// yields a different `measured` object (see measure-cache.extractDataRevision).
 		prev.item.measured === next.item.measured &&
+		// This height-neutral badge comes from immutable fresh specs, not cached
+		// geometry. A saturated prompt preview can remain byte-identical as it grows.
+		visiblePromptChars(prev.item) === visiblePromptChars(next.item) &&
 		prev.item.spec.key === next.item.spec.key &&
 		prev.item.spec.kind === next.item.spec.kind &&
 		prev.item.spec.opts === next.item.spec.opts &&

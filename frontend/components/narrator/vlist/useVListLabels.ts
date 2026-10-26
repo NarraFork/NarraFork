@@ -189,8 +189,9 @@ export interface VListRenderLabels {
 		backgroundBadge: string;
 		/** "Taken over by user" badge on a card whose child the user is driving. */
 		takenOverBadge: string;
-		/** Live output counter badge: `{count}` chars written so far. */
-		liveOutputChars: string;
+		/** Prompt-length badge shown while the Agent input is being prepared. */
+		promptChars: string;
+		promptCharsTooltip: string;
 		followParent: string;
 		followTooltip: string;
 		/** `{parentModel}` / `{pool}` are substituted by the card. */
@@ -414,7 +415,7 @@ export function useVListLabels(): VListLabels {
 			contextAskQuestions: t("contextAskQuestions", { count: COUNT_PLACEHOLDER }),
 			contextAskStatusSummary: t("contextAskStatusSummary"),
 			// Generic live output counter ("123 chars") for any running tool whose
-			// streamed output is a bare cumulative count (Agent / Await today).
+			// streamed output is a bare cumulative count (Await).
 			liveOutputChars: t("liveOutputChars", { count: COUNT_PLACEHOLDER }),
 			askAnswerPrefix: t("askAnswerPrefix"),
 			askCustomAnswerPrefix: t("askCustomAnswerPrefix"),
@@ -710,9 +711,8 @@ export function useVListLabels(): VListLabels {
 				waitingBadge: t("subagentWaitingPermissionTitle"),
 				backgroundBadge: t("backgroundBadge"),
 				takenOverBadge: t("subagentTakenOver"),
-				// Same wording as the adapter-level live counter; one locale key serves
-				// both the header badge and the folded-row summary.
-				liveOutputChars: t("liveOutputChars", { count: "{count}" }),
+				promptChars: t("subagentPromptChars", { count: "{count}" }),
+				promptCharsTooltip: t("subagentPromptCharsTooltip"),
 				followParent: t("followParent"),
 				followTooltip: t("inheritance.followTooltip"),
 				// Placeholders stay literal so the card can substitute per-badge values.

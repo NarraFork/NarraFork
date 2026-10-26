@@ -513,6 +513,8 @@
 	"contextAskOutputChars": "{{count}} 字符",
 	"contextAskQuestions": "{{count}} 个问题",
 	"liveOutputChars": "{{count}} 字符",
+	"subagentPromptChars": "{{count}} 字符",
+	"subagentPromptCharsTooltip": "提示词长度",
 	"workspaceCreate": "创建工作树",
 	"workspaceAttach": "挂载工作树",
 	"workspaceOperation": "查询工作树操作",

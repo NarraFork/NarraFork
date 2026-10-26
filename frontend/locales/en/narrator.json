@@ -513,6 +513,8 @@
 	"contextAskOutputChars": "{{count}} chars",
 	"contextAskQuestions": "{{count}} questions",
 	"liveOutputChars": "{{count}} chars",
+	"subagentPromptChars": "{{count}} chars",
+	"subagentPromptCharsTooltip": "Prompt length",
 	"workspaceCreate": "Create worktree",
 	"workspaceAttach": "Attach worktree",
 	"workspaceOperation": "Get worktree operation",

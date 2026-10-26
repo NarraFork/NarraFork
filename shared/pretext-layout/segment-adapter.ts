@@ -4002,19 +4002,11 @@ function buildSubagentCardData(item: AdapterToolItem, ctx: AdapterContext) {
 	const outputJson = toolOutputValue(withFullOutput(item, ctx), metadata);
 	const resultValue = readLeafText(outputJson) ?? readLeafText(asObject(outputJson)._text);
 	const isActive = !isTerminalStatus(item.tc.status);
-	// The subagent's live reply length, streamed by the server as a bare numeric
-	// `tool_output` payload (the ContextAsk convention) and bridged onto the
-	// metadata by resolveToolMetadata. Height-neutral: painted as a badge on the
-	// fixed header row, so it is keyed in `subagentRevision` instead of measured.
-	const liveOutputChars = isActive
-		? parseLiveOutputChars(asObject(metadata)?._streamingOutput)
-		: null;
-	// A running card's "output" can BE that bare counter — `toolOutputValue` folds
-	// `_streamingOutput` in when no real output exists. The count rides the header
-	// badge, so it must never become the conclusion body (a lone number reading
-	// as the child's result).
+	// Legacy tool_output may carry a bare reply counter. It is not a conclusion
+	// body and does not describe the prompt that this card's header counts.
 	const resultIsLiveCount =
-		liveOutputChars != null &&
+		isActive &&
+		parseLiveOutputChars(asObject(metadata)?._streamingOutput) != null &&
 		resultValue !== undefined &&
 		resultValue.trim() === readLeafText(asObject(metadata)?._streamingOutput)?.trim();
 	const resultContent =
@@ -4033,6 +4025,32 @@ function buildSubagentCardData(item: AdapterToolItem, ctx: AdapterContext) {
 	const promptSource = "input.prompt";
 	const prompt = readLeafText(input.prompt);
 	const promptTruncated = hasTruncatedLeaf(input.prompt);
+	// The leaf projection preserves the complete string length independently of
+	// its bounded preview. No prompt means unknown; an explicit empty string is 0.
+	const streamingInput = asObject(inputJson);
+	const streamedPromptChars = streamingInput._streamingPromptChars;
+	const promptChars = Object.hasOwn(streamingInput, "_streamingPromptChars")
+		? typeof streamedPromptChars === "number" &&
+			Number.isSafeInteger(streamedPromptChars) &&
+			streamedPromptChars >= 0
+			? streamedPromptChars
+			: undefined
+		: typeof input.prompt === "string"
+			? input.prompt.length
+			: isTruncated(input.prompt) &&
+					typeof input.prompt.fullLength === "number" &&
+					Number.isSafeInteger(input.prompt.fullLength) &&
+					input.prompt.fullLength >= 0
+				? input.prompt.fullLength
+				: undefined;
+	// `startedAt` is argument-stream time. Only these phases precede execution;
+	// stale streaming fields never make an executing or finished call preparatory.
+	const showPromptChars =
+		promptChars !== undefined &&
+		item.tc.executionStartedAt == null &&
+		(item.tc.status === "streaming" ||
+			item.tc.status === "initializing" ||
+			item.tc.status === "pending");
 	const bodyContext: ClassifyToolDetailInput = {
 		...(item.dedupeSuffix ? { occurrence: item.dedupeSuffix } : {}),
 		...(item.tc.toolUseId ? { toolUseId: item.tc.toolUseId } : { previewId: key }),
@@ -4098,7 +4116,8 @@ function buildSubagentCardData(item: AdapterToolItem, ctx: AdapterContext) {
 			? { modelInheritance: activity.modelInheritance }
 			: {}),
 		...(reasoningEffort === undefined ? {} : { reasoningEffort }),
-		...(liveOutputChars != null ? { liveOutputChars } : {}),
+		...(promptChars === undefined ? {} : { promptChars }),
+		showPromptChars,
 		...(prompt === undefined ? {} : { prompt, promptBody }),
 		// The prompt block's own fold state (independent of the card's), so the
 		// measure layer reserves the body only when the reader opened it. The key is

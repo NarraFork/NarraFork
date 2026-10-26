@@ -694,6 +694,7 @@ export type NarratorServerMessage =
 			streamingEditOrigin?: StreamingEditOrigin;
 			narratorId: string;
 			toolCallId: string | null;
+			executionAttempt?: number;
 			toolUseId: string;
 			/** Protocol v2 only: the tool block of the ledger attempt (§8.2). */
 			blockId?: string;
@@ -995,6 +996,7 @@ export type NarratorServerMessage =
 			>;
 			toolChunks: Array<{
 				toolCallId: string | null;
+				executionAttempt?: number;
 				toolUseId: string;
 				subagentNarratorId?: string;
 				toolName: string;

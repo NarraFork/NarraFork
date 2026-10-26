@@ -120,8 +120,9 @@ export interface SubagentLabels {
 	backgroundBadge?: string;
 	/** "Taken over by user" badge label. */
 	takenOverBadge?: string;
-	/** Live output counter badge: `{count}` chars written so far. */
-	liveOutputChars?: string;
+	/** Prompt-length badge, shown only before execution begins. */
+	promptChars?: string;
+	promptCharsTooltip?: string;
 	/** The model follows the parent's live selection, not a concrete snapshot. */
 	followParent?: string;
 	/** Tooltip on a followed-parent badge. */
@@ -177,7 +178,8 @@ const DEFAULT_LABELS: Required<Omit<SubagentLabels, "timing" | "statusMark">> = 
 	waitingBadge: "Awaiting permission",
 	backgroundBadge: "Background",
 	takenOverBadge: "Taken over by user",
-	liveOutputChars: "{count} chars",
+	promptChars: "{count} chars",
+	promptCharsTooltip: "Prompt length",
 	followParent: "Follow parent",
 	followTooltip: "Following the parent model",
 	fallbackReason: "The parent's {parentModel} is not in the {pool} pool",
@@ -252,8 +254,10 @@ interface RenderSubagentProps {
 	 * on — so the badge is what says the session is waiting on a PERSON.
 	 */
 	isTakenOver?: boolean;
-	/** The child's live reply char count — a badge on the fixed header row. */
-	liveOutputChars?: number;
+	/** Known prompt length; independent of output and the fixed card geometry. */
+	promptChars?: number;
+	/** The adapter's fresh pre-execution phase, not the launch tool's isActive. */
+	showPromptChars?: boolean;
 	/** Extra model badge. */
 	model?: string;
 	/** Follow/fallback decision when `model` is `__parent__`. */
@@ -542,7 +546,8 @@ function SubagentInner({
 	agentType = "agent",
 	isBackground,
 	isTakenOver,
-	liveOutputChars,
+	promptChars,
+	showPromptChars,
 	model,
 	modelInheritance,
 	reasoningEffort,
@@ -617,12 +622,12 @@ function SubagentInner({
 						{reasoningEffort}
 					</Badge>
 				) : null}
-				{/* Live reply counter (grey, same fixed badge row): the child's streamed
-				    output char count, ticking while it works. */}
-				{active && typeof liveOutputChars === "number" ? (
-					<Badge data-testid="subagent-output-chars" size="xs" variant="light" color="gray">
-						{withCount(labels.liveOutputChars, liveOutputChars)}
-					</Badge>
+				{showPromptChars && typeof promptChars === "number" ? (
+					<Tooltip label={labels.promptCharsTooltip}>
+						<Badge data-testid="subagent-prompt-chars" size="xs" variant="light" color="gray">
+							{withCount(labels.promptChars, promptChars)}
+						</Badge>
+					</Tooltip>
 				) : null}
 				<Box style={{ flex: 1, minWidth: 0 }} />
 				{active ? (

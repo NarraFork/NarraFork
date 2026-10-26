@@ -4,6 +4,7 @@ import { createSourceText } from "@shared/pretext-layout/source-text";
 import {
 	buildTopLevelStreamingChunksMsg,
 	findLatestSpecTasksToolUseId,
+	foldStreamingToolFields,
 	normalizeReflectionAfterToolStatus,
 	resolveAllToolCallsFromMsg,
 	type TopLevelStreamingChunk,
@@ -28,6 +29,105 @@ function msg(overrides: Partial<NarratorMsg> = {}): NarratorMsg {
 		messageBody({ blocks }),
 	) as NarratorMsg;
 }
+
+describe("decoded streaming prompt lengths", () => {
+	function feed(
+		previous: TopLevelStreamingChunk | undefined,
+		inputCharsTotal: number,
+		streamingField: { name: string; delta: string; startsField?: boolean; offset?: number },
+		toolUseId = "agent",
+	): TopLevelStreamingChunk {
+		return {
+			...previous,
+			toolUseId,
+			toolName: "Agent",
+			inputCharsTotal,
+			...foldStreamingToolFields(previous, { toolUseId, inputCharsTotal, streamingField }),
+		};
+	}
+
+	test("keeps raw decoded length beyond the bounded tail and across description generation", () => {
+		let chunk = feed(undefined, 20050, {
+			name: "prompt",
+			delta: "x".repeat(20000),
+			offset: 0,
+			startsField: true,
+		});
+		expect(chunk.streamingFieldValue?.length).toBe(16000);
+		expect(chunk.streamingPromptChars).toBe(20000);
+		const preview = chunk.streamingFieldValue;
+		chunk = feed(chunk, 20051, { name: "prompt", delta: "x", offset: 20000 });
+		expect(chunk.streamingFieldValue).toBe(preview);
+		expect(chunk.streamingPromptChars).toBe(20001);
+		chunk = feed(chunk, 22000, {
+			name: "description",
+			delta: "description".repeat(100),
+			offset: 0,
+			startsField: true,
+		});
+		expect(chunk.streamingPromptChars).toBe(20001);
+		expect(chunk.extractedFields?.prompt?.length).toBe(16000);
+		const input = topLevelStreamingChunkToToolFields(chunk).inputJson as Record<string, unknown>;
+		expect(input._streamingPromptChars).toBe(20001);
+		const synthetic = buildTopLevelStreamingChunksMsg([chunk], "n", null);
+		expect(synthetic?.toolCalls?.[0]?.inputJson).toEqual(input);
+	});
+
+	test("counts original CRLF units and split CR/LF deltas, not normalized range offsets", () => {
+		const body = "x\r\n".repeat(7000);
+		let chunk = feed(undefined, body.length + 50, {
+			name: "prompt",
+			delta: body,
+			offset: 0,
+			startsField: true,
+		});
+		expect(chunk.streamingPromptChars).toBe(21000);
+		expect(chunk.streamingFieldRanges?.prompt.endOffset).toBe(14000);
+		chunk = feed(chunk, body.length + 51, { name: "prompt", delta: "\r", offset: 21000 });
+		chunk = feed(chunk, body.length + 52, { name: "prompt", delta: "\n", offset: 21001 });
+		expect(chunk.streamingPromptChars).toBe(21002);
+		expect(chunk.streamingFieldRanges?.prompt.endOffset).toBe(14001);
+	});
+
+	test("uses raw offsets after a reconnect gap and suppresses unknown or malformed tails", () => {
+		const unknown = feed(undefined, 50000, { name: "prompt", delta: "tail" });
+		expect(unknown.streamingPromptChars).toBeNull();
+		const restored = feed(unknown, 50005, { name: "prompt", delta: "next", offset: 24000 });
+		expect(restored.streamingPromptChars).toBe(24004);
+		for (const offset of [-1, 0.5, Number.NaN, Number.MAX_SAFE_INTEGER]) {
+			expect(
+				feed(undefined, 100, { name: "prompt", delta: "x", offset, startsField: true })
+					.streamingPromptChars,
+			).toBeNull();
+		}
+	});
+
+	test("does not replay an old offset or borrow a different tool's prior prompt length", () => {
+		const first = feed(undefined, 20050, {
+			name: "prompt",
+			delta: "x".repeat(20000),
+			offset: 0,
+			startsField: true,
+		});
+		const old = feed(first, 20050, { name: "prompt", delta: "old", offset: 20 });
+		expect(old.streamingPromptChars).toBe(20000);
+		expect(old.streamingFieldValue).toBe(first.streamingFieldValue);
+		const other = feed(first, 20055, { name: "prompt", delta: "tail" }, "other-agent");
+		expect(other.streamingPromptChars).toBeNull();
+	});
+
+	test("supports older offset-less servers only after an explicit uninterrupted field start", () => {
+		let chunk = feed(undefined, 20050, {
+			name: "prompt",
+			delta: "x".repeat(20000),
+			startsField: true,
+		});
+		chunk = feed(chunk, 20051, { name: "prompt", delta: "x" });
+		expect(chunk.streamingPromptChars).toBe(20001);
+		chunk = feed(chunk, 20051, { name: "prompt", delta: "x" });
+		expect(chunk.streamingPromptChars).toBe(20001);
+	});
+});
 
 describe("streaming source-range projection", () => {
 	test("preserves empty active fields and range metadata in both synthetic representations", () => {

@@ -1939,46 +1939,163 @@ describe("adaptSegment — subagent card enrichment (height-safe field passthrou
 		expect("isTakenOver" in subagentData({ toolName: "Task", status: "running" })).toBe(false);
 	});
 
-	/**
-	 * The live output counter: the server streams the child's reply length as a
-	 * bare numeric `tool_output` payload (the ContextAsk convention), bridged onto
-	 * the card's metadata by `resolveToolMetadata`. It is a header BADGE — painted
-	 * from the cached payload — so the adapter must surface it (and
-	 * `subagentRevision` must key it) only while the child is still working.
-	 */
-	it("carries the child's live output counter while running", () => {
+	it("counts only the known prompt leaf, including projected fullLength and explicit zero", () => {
+		for (const [prompt, expected] of [
+			["hello🙂", 7],
+			["", 0],
+			[{ _truncated: true, preview: "preview", fullLength: 12000 }, 12000],
+		] as const) {
+			const data = subagentData({
+				toolName: "Agent",
+				status: "initializing",
+				inputJson: {
+					prompt,
+					description: "d".repeat(900),
+					context: "c".repeat(1200),
+					_streamingChars: 99999,
+				},
+				_streamingOutput: "4000",
+			});
+			expect(data.promptChars).toBe(expected);
+			expect(data.showPromptChars).toBe(true);
+			expect("liveOutputChars" in data).toBe(false);
+		}
+		for (const inputJson of [
+			{},
+			{ description: "hello", _streamingChars: 80 },
+			{ prompt: { _truncated: true, preview: "unknown length" } },
+		]) {
+			const data = subagentData({ toolName: "Agent", status: "initializing", inputJson });
+			expect("promptChars" in data).toBe(false);
+			expect(data.showPromptChars).toBe(false);
+		}
+	});
+
+	it("uses live prompt then settled fields then formal input independently of description streaming", () => {
+		const base = { toolName: "Agent", status: "streaming", startedAt: 100 };
+		const first = subagentData({
+			...base,
+			inputJson: {
+				prompt: "formal",
+				_streamingChars: 999,
+				_streamingFields: { prompt: "settled" },
+				_streamingFieldName: "prompt",
+				_streamingFieldValue: "live prompt",
+			},
+		});
+		const description = subagentData({
+			...base,
+			inputJson: {
+				prompt: "formal",
+				_streamingChars: 2000,
+				_streamingFields: { prompt: "live prompt" },
+				_streamingFieldName: "description",
+				_streamingFieldValue: "description".repeat(100),
+			},
+		});
+		const formal = subagentData({
+			...base,
+			status: "initializing",
+			inputJson: { prompt: "formal" },
+		});
+		expect(first.promptChars).toBe(11);
+		expect(first.promptBody.live).toBe(true);
+		expect(description.promptChars).toBe(11);
+		expect(description.promptBody.live).toBe(false);
+		expect([first, description, formal].map((data) => data.showPromptChars)).toEqual([
+			true,
+			true,
+			true,
+		]);
+		expect(formal.promptChars).toBe(6);
+	});
+
+	it("shows preparation and permission phases but execution evidence always hides the badge", () => {
+		for (const status of ["streaming", "initializing", "pending"]) {
+			expect(
+				subagentData({
+					toolName: "Agent",
+					status,
+					startedAt: 100,
+					inputJson: { prompt: "known prompt" },
+				}).showPromptChars,
+			).toBe(true);
+			expect(
+				subagentData({
+					toolName: "Agent",
+					status,
+					executionStartedAt: 0,
+					inputJson: { prompt: "known prompt" },
+				}).showPromptChars,
+			).toBe(false);
+		}
+		for (const status of ["running", "success", "completed", "fail", "cancelled", "hold"]) {
+			const data = subagentData({
+				toolName: "Agent",
+				status,
+				inputJson: {
+					prompt: "known prompt",
+					_streamingChars: 999,
+					_streamingFieldName: "prompt",
+					_streamingFieldValue: "known prompt",
+				},
+				_streamingOutput: "0",
+				_takenOver: true,
+			});
+			expect(data.promptChars).toBe(12);
+			expect(data.showPromptChars).toBe(false);
+		}
+	});
+
+	it("retains the prompt badge when an earlier tool queues an initializing Agent", () => {
+		const specs = adaptSegment(
+			{
+				kind: "tool-run",
+				sourceMessages: [],
+				items: [
+					{
+						blockIndex: 0,
+						isSubagent: false,
+						tc: {
+							toolUseId: "upstream",
+							toolName: "Bash",
+							status: "running",
+							inputJson: { command: "sleep 1" },
+						},
+					},
+					{
+						blockIndex: 1,
+						isSubagent: true,
+						tc: {
+							toolUseId: "queued-agent",
+							toolName: "Agent",
+							status: "initializing",
+							inputJson: { prompt: "queued prompt" },
+						},
+					},
+				],
+			},
+			CTX,
+		);
+		const data = specs.find((spec) => spec.kind === "subagent-card")?.data as Record<
+			string,
+			unknown
+		>;
+		expect(data).toMatchObject({ promptChars: 13, showPromptChars: true });
+	});
+
+	it("keeps a legacy output count out of both the prompt badge and conclusion", () => {
 		const data = subagentData({
 			toolName: "Agent",
 			status: "running",
-			inputJson: { subagent_type: "explore", description: "dig" },
+			inputJson: { description: "dig" },
 			_streamingOutput: "1240",
 		});
-		expect(data.liveOutputChars).toBe(1240);
-		// The count rides the header badge — `toolOutputValue` folds the same payload
-		// into the output slot, and it must never become the conclusion body.
+		expect("promptChars" in data).toBe(false);
+		expect("liveOutputChars" in data).toBe(false);
+		expect(data.showPromptChars).toBe(false);
 		expect(data.resultText).toBeUndefined();
 		expect(data.resultBody).toBeUndefined();
-	});
-
-	it("omits the counter on a terminal card or a non-numeric stream", () => {
-		expect(
-			"liveOutputChars" in
-				subagentData({
-					toolName: "Agent",
-					status: "success",
-					inputJson: {},
-					_streamingOutput: "1240",
-				}),
-		).toBe(false);
-		expect(
-			"liveOutputChars" in
-				subagentData({
-					toolName: "Agent",
-					status: "running",
-					inputJson: {},
-					_streamingOutput: "thinking…",
-				}),
-		).toBe(false);
 	});
 
 	it("omits prompt when inputJson carries none (no fabrication)", () => {
