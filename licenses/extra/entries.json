@@ -1,5 +1,15 @@
 [
 	{
+		"name": "ModelTrace fingerprint core and candidate bank",
+		"version": "6cd4a8ff0f3f4e49d6d6969dd2fbadfa1569fde2",
+		"license": "MIT",
+		"author": "xqy2006",
+		"repository": "https://github.com/xqy2006/ModelTrace",
+		"textFile": "modeltrace.txt",
+		"distributedVia": "TypeScript port of static/fingerprint-core.js and embedded data/unified_bank.json, compiled into the server binary for local single-sample model fingerprint analysis.",
+		"note": "The full upstream MIT license is reproduced verbatim. Numeric calibration and candidate names are upstream artifacts, not independently verified model identities."
+	},
+	{
 		"name": "Bun runtime",
 		"version": "1.4.3",
 		"versionSource": "bun-runtime",

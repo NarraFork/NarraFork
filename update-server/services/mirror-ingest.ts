@@ -114,7 +114,11 @@ export function parseTools(
 		Array.isArray(data) ||
 		data.schemaVersion !== 1 ||
 		typeof data.repository !== "string" ||
-		data.repository.toLowerCase() !== repository ||
+		// GitHub slugs are case-insensitive, and the expected side is not always
+		// normalized: the relay pull passes the signed manifest's repository, which
+		// reflects GITHUB_REPOSITORY as published. Comparing only the payload side
+		// lowercased rejected every tools import for a mixed-case repository.
+		data.repository.toLowerCase() !== repository.toLowerCase() ||
 		data.kind !== kind ||
 		data.tag !== tag ||
 		!Array.isArray(data.assets) ||
@@ -209,7 +213,9 @@ export function parseTools(
 	}
 	return {
 		schemaVersion: 1,
-		repository,
+		// Store the canonical lowercase slug regardless of which caller supplied it,
+		// so relay-imported metadata matches the direct-upload form byte for byte.
+		repository: repository.toLowerCase(),
 		kind,
 		tag,
 		assets,

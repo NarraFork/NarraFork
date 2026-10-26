@@ -84,6 +84,8 @@ export interface ChatParams extends ProtocolChatParams {
 	 * For narrator loops this is narratorId.
 	 */
 	stickySessionKey?: string;
+	/** Local transport isolation only; does not change wire session IDs or credential affinity. */
+	transportSessionKey?: string;
 	/** Reasoning effort level — maps to thinking config (Anthropic), reasoning config (Codex), or provider-specific effort ("max" may be provider-specific) */
 	reasoningEffort?: "none" | "low" | "medium" | "high" | "xhigh" | "max";
 	/** Optional output ceiling; effective model metadata may lower, never raise it. */

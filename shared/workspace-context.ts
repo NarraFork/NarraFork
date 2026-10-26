@@ -20,7 +20,6 @@ export interface SwitchWorkingDirectoryRequest {
 	expectedRevision: number;
 	requestId: string;
 	target: { deviceId: string; cwd: string };
-	expectedWorktreeKey?: string;
 }
 
 export interface SwitchWorkingDirectoryResult {

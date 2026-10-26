@@ -2619,6 +2619,10 @@ function NarratorPanelBody({
 			navigate({ to: "/narrators/$narratorId", params: { narratorId: id } }),
 		onForkCommand: handleForkCommand,
 		onCompactCommand: handleCompactCommand,
+		onModelTraceStarted: (id) => {
+			if (dock?.openSubagentPanel) dock.openSubagentPanel(id);
+			else navigate({ to: "/narrators/$narratorId", params: { narratorId: id } });
+		},
 		onRequestRecordingSaved: handleRecordingSaved,
 		normalizeBooleanOverride,
 		normalizeDangerReflectionOverride,

@@ -376,6 +376,21 @@ export type NarraForkEvent =
 			previousOwnerUserId: string | null;
 			newOwnerUserId: string | null;
 	  }
+	| {
+			/**
+			 * An outline transaction committed. Ids and scalars only, never block content: a
+			 * listener (page subscriptions over WebSocket) re-reads what its subscriber may see.
+			 * Emitted after the commit, once per commit.
+			 */
+			type: "outline:committed";
+			spaceId: string;
+			commitId: string;
+			seq: number;
+			/** Pages whose blocks changed, including pages blocks moved out of. */
+			pageIds: string[];
+			actorKind: "human" | "agent" | "system";
+			actorId: string;
+	  }
 	// Human-to-human chat. Ids and scalars only — never message bodies — so a
 	// listener (WS fan-out today, an IM bridge later) can route without holding a
 	// copy of content it has no authorization story for.

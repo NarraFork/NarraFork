@@ -60,6 +60,7 @@ import { buildAdapterHistory, historyTail } from "./history-build";
 import { countInputCharacters } from "./input-characters";
 import { LoopTranscript, type TranscriptImage } from "./loop-transcript";
 import { isMalformedRequestBodyError, summarizeRequestBody } from "./malformed-request";
+import { rememberModelTraceRequest } from "./modeltrace-request";
 import { type ContentLane, OutputContentAccumulator } from "./output-content";
 import { type DbMessage, type ParsedStreamEvent, resolveProviderAndModel } from "./provider";
 import { projectQuestionModelInput } from "./question-model-input";
@@ -4832,7 +4833,7 @@ async function* agentLoopInMetadataSnapshot(
 						}
 						consumeSearchExecutionTurn();
 					}
-					const stream = provider.chat({
+					const requestParams: import("./provider").ChatParams = {
 						conversationId: config.conversationId,
 						content: requestContent,
 						model: effectiveModel,
@@ -4849,7 +4850,12 @@ async function* agentLoopInMetadataSnapshot(
 						requestDump,
 						streamProgress,
 						resetUpstreamSession,
-						onRequestStart: markRequestStarted,
+						onRequestStart: (info) => {
+							if (!config.reflectionLoop) {
+								rememberModelTraceRequest(config.narratorId, provider, requestParams);
+							}
+							markRequestStarted(info);
+						},
 						onInputCharacters: async (counts) => {
 							inputCharacters = validInputCharacters(counts);
 							try {
@@ -4865,7 +4871,8 @@ async function* agentLoopInMetadataSnapshot(
 							}
 						},
 						...(hostHistory && turnImages?.length ? { images: turnImages } : {}),
-					});
+					};
+					const stream = provider.chat(requestParams);
 
 					streamExecutionOpen = true;
 					for await (const streamItem of interleaveWakeups(stream, toolSettledWake)) {

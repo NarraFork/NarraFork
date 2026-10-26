@@ -40,6 +40,8 @@
  *     shadow title of every draft linked to the renamed entry.
  *   - knowledge_drafts binds the shadow row to `knowledge_drafts.id` directly (SQLite binds
  *     the FTS rowid to `knowledge_drafts.rowid` for the same O(log n) maintenance).
+ *   - outline_blocks: every block is indexed (deleted ones too), and only a content change
+ *     re-indexes a row (`AFTER UPDATE OF content`), as in SQLite.
  *
  * DRIFT DETECTION WITHOUT THE SQLITE MACHINERY
  * --------------------------------------------
@@ -131,6 +133,15 @@ const SHADOW_SPECS: readonly ShadowSpec[] = [
 		select: [DRAFT_TITLE_EXPR, "b.content"],
 		mismatch: `f.title IS DISTINCT FROM ${DRAFT_TITLE_EXPR} OR f.content IS DISTINCT FROM b.content`,
 	},
+	{
+		base: "outline_blocks",
+		shadow: "search_outline_blocks",
+		columns: ["content"],
+		// Every block, deleted ones too, mirroring the SQLite index; search filters on the row.
+		indexable: "TRUE",
+		select: ["b.content"],
+		mismatch: "f.content IS DISTINCT FROM b.content",
+	},
 ];
 
 /** The shadow spec of one base table, looked up by name rather than by array position. */
@@ -164,6 +175,7 @@ const EXPECTED = {
 		"nf_search_knowledge_entries_sync",
 		"nf_search_knowledge_drafts_sync",
 		"nf_search_drafts_entry_title_sync",
+		"nf_search_outline_blocks_sync",
 	],
 	triggers: [
 		"narrator_messages_fts_insert",
@@ -179,6 +191,9 @@ const EXPECTED = {
 		"knowledge_drafts_fts_update",
 		"knowledge_drafts_fts_delete",
 		"knowledge_drafts_fts_entry_title",
+		"outline_blocks_fts_insert",
+		"outline_blocks_fts_update",
+		"outline_blocks_fts_delete",
 	],
 } as const;
 
@@ -364,6 +379,15 @@ function triggerDdl(): string[] {
 		...mirror(specFor("knowledge_drafts")),
 		`CREATE OR REPLACE TRIGGER "knowledge_drafts_fts_entry_title" AFTER UPDATE OF title ON "knowledge_entries"
 			FOR EACH ROW EXECUTE FUNCTION "nf_search_drafts_entry_title_sync"()`,
+		// Outline blocks re-index only when the content changes, like SQLite's
+		// `AFTER UPDATE OF content`: moves and tombstones rewrite whole subtrees' other columns.
+		`CREATE OR REPLACE TRIGGER "outline_blocks_fts_insert" AFTER INSERT ON "outline_blocks"
+			FOR EACH ROW EXECUTE FUNCTION "nf_search_outline_blocks_sync"()`,
+		`CREATE OR REPLACE TRIGGER "outline_blocks_fts_update" AFTER UPDATE OF content ON "outline_blocks"
+			FOR EACH ROW WHEN (OLD.content IS DISTINCT FROM NEW.content)
+			EXECUTE FUNCTION "nf_search_outline_blocks_sync"()`,
+		`CREATE OR REPLACE TRIGGER "outline_blocks_fts_delete" AFTER DELETE ON "outline_blocks"
+			FOR EACH ROW EXECUTE FUNCTION "nf_search_outline_blocks_sync"()`,
 	];
 }
 
@@ -390,6 +414,7 @@ export async function ensurePgFts(sql: PgExecutor): Promise<void> {
 	await sql.unsafe(mirrorFunctionDdl(specFor("knowledge_entries")));
 	await sql.unsafe(DRAFTS_FUNCTION_DDL);
 	await sql.unsafe(ENTRY_TITLE_FUNCTION_DDL);
+	await sql.unsafe(mirrorFunctionDdl(specFor("outline_blocks")));
 	for (const ddl of triggerDdl()) await sql.unsafe(ddl);
 }
 

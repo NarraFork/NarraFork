@@ -85,6 +85,16 @@ function useSlashMenuItems({
 					type: "command" as const,
 				},
 				{
+					name: "modeltrace",
+					prompt: "",
+					description: localize(
+						"Trace the model's current task in a one-turn child session without interrupting it",
+						"在单轮子会话中追踪模型当前任务，不中断原会话",
+					),
+					source: "builtin",
+					type: "command" as const,
+				},
+				{
 					name: "save_dump",
 					prompt: "",
 					description: localize(
@@ -98,7 +108,7 @@ function useSlashMenuItems({
 			const commands: CommandItem[] = [
 				...(sessionCommands ? builtins : []),
 				...(data.commands ?? [])
-					.filter((c) => c.name !== "save_dump")
+					.filter((c) => c.name !== "save_dump" && c.name !== "modeltrace")
 					.map((c) => ({
 						name: c.name,
 						prompt: c.prompt,

@@ -559,12 +559,16 @@ for (const mode of ["stop", "deadline", "storage-deadline"] as const) {
 		let hangingPath = "";
 		let cancelled = false;
 		const entered = Promise.withResolvers<void>();
+		const reading = Promise.withResolvers<void>();
 		const ctx = await setup((request) => {
 			if (request.method !== "GET" || new URL(request.url).pathname !== hangingPath) return null;
 			return new Response(
 				new ReadableStream<Uint8Array>({
 					start(controller) {
 						controller.enqueue(new Uint8Array([1, 2, 3]));
+					},
+					pull() {
+						reading.resolve();
 					},
 					cancel() {
 						cancelled = true;
@@ -579,15 +583,21 @@ for (const mode of ["stop", "deadline", "storage-deadline"] as const) {
 			if (!patch) throw new Error("Expected patch");
 			hangingPath = staged.assetPath(patch.sha256);
 			const originalTimeout = AbortSignal.timeout.bind(AbortSignal);
-			const deadline = spyOn(AbortSignal, "timeout").mockImplementation((ms) =>
-				originalTimeout(mode === "deadline" && ms === 25 * 60_000 ? 150 : ms),
-			);
+			const jobDeadline = new AbortController();
+			const deadline = spyOn(AbortSignal, "timeout").mockImplementation((ms) => {
+				// Trigger the job cancellation only after the hanging stream has arrived. A real 150ms
+				// timeout races CI scheduling and can expire before the fixture reaches its checkpoint.
+				if (ms === 25 * 60_000) return jobDeadline.signal;
+				return originalTimeout(ms);
+			});
 			const originalSave = ctx.storage.saveVerifiedFile.bind(ctx.storage);
 			const saving = spyOn(ctx.storage, "saveVerifiedFile").mockImplementation(
 				(path, stream, options) => {
 					const work = originalSave(path, stream, {
 						...options,
-						timeoutMs: mode === "storage-deadline" ? options.timeoutMs / 6000 : options.timeoutMs,
+						// Keep the native storage timer and TimeoutError semantics, but allow enough time for
+						// the fixture to observe the blocked read before expiry on a loaded CI runner.
+						timeoutMs: mode === "storage-deadline" ? 1_000 : options.timeoutMs,
 					});
 					if (options.sha256 === patch.sha256) entered.resolve();
 					return work;
@@ -600,7 +610,12 @@ for (const mode of ["stop", "deadline", "storage-deadline"] as const) {
 				});
 				const work = short.pollOnce();
 				await entered.promise;
+				// Admission can complete asynchronously. Wait until writeStream is actually blocked in
+				// reader.read(), so cancellation exercises the hanging-body path rather than setup/admission.
+				await reading.promise;
+				const expired = () => new DOMException("The operation timed out.", "TimeoutError");
 				if (mode === "stop") await short.stop();
+				else if (mode === "deadline") jobDeadline.abort(expired());
 				const result = await work;
 				expect(result.committed).toBe(0);
 				if (mode !== "stop") expect(result.failed).toBe(1);
@@ -755,6 +770,82 @@ for (const corrupt of [false, true]) {
 		}
 	});
 }
+
+// GitHub repository slugs are case-insensitive, but the relay carries the slug as the
+// publisher spelled it. `GITHUB_REPOSITORY` keeps the repository's own casing, so a
+// mixed-case repository signed a tools manifest that the operator-configured lowercase
+// slug then had to accept. Only the payload side was lowercased before comparison, so
+// every tools import failed with a bare IMPORT_FAILED and the mirror silently served no
+// executor/helpers binaries at all.
+test("relay commits tools for a mixed-case repository slug", async () => {
+	const ctx = await setup();
+	try {
+		const mixed = "Fixture-Owner/Fork-Product";
+		const payload = executorPayload("a".repeat(40));
+		const binary = Buffer.alloc(128, 7);
+		const manifest = JSON.parse(payload.assets[0].content);
+		for (const entry of Object.values(manifest.manifest.platforms) as { sha256: string }[])
+			entry.sha256 = hash(binary);
+		const content = JSON.stringify(manifest);
+		const binaries = EXECUTOR_PLATFORMS.map((entry) => ({
+			kind: "executor-binary",
+			version: "1.2.0",
+			platform: entry,
+			name: executorPublishedFilename("1.2.0", entry),
+			size: binary.length,
+			sha256: hash(binary),
+		}));
+		const producer = new MirrorRelayStage(
+			{ kind: "executor", repository: mixed, tag: payload.tag },
+			{
+				config: ctx.settings.webdav,
+				signingKey: key,
+				client: ctx.client,
+				now: () => new Date(ctx.clock.now),
+				jobId: "mixed-case-repository",
+			},
+			signal(),
+		);
+		// Every platform shares one object here, so a single PUT backs all six identities.
+		await producer.uploadObject(binaries[0], binary);
+		await producer.preparePayload(
+			{
+				...payload,
+				repository: mixed,
+				binaries,
+				assets: [
+					{
+						...payload.assets[0],
+						content,
+						size: Buffer.byteLength(content),
+						sha256: hash(Buffer.from(content)),
+					},
+					payload.assets[1],
+				],
+			},
+			1024 * 1024,
+		);
+		await producer.publish(async () => {});
+
+		let committed = 0;
+		for (let i = 0; i < 3; i++) committed += (await ctx.puller.pollOnce()).committed;
+		expect(ctx.events.filter((event) => event.code !== "DISCOVERY_FAILED")).toEqual([
+			expect.objectContaining({ code: "COMMITTED", kind: "executor" }),
+		]);
+		expect(committed).toBe(1);
+		// Stored metadata is canonical, so the direct-upload read path finds it too.
+		expect(await (await ctx.app.request(`${root}/tools/executor/${payload.tag}`)).json()).toEqual(
+			expect.objectContaining({ repository: mixed.toLowerCase(), binaries }),
+		);
+		const response = await ctx.app.request(
+			`${root}/tools/executor/${payload.tag}/assets/${binaries[0].name}`,
+		);
+		expect(response.status).toBe(200);
+		expect(Buffer.from(await response.arrayBuffer()).equals(binary)).toBe(true);
+	} finally {
+		await ctx.close();
+	}
+});
 
 test("actual tools same-tag conflict becomes terminal CONFLICT instead of re-downloading forever", async () => {
 	const ctx = await setup();

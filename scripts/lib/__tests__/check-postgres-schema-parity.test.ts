@@ -523,8 +523,8 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 126 tables and 1676 columns including the token accounting version", () => {
-		expect(target.tables.length).toBe(126);
+	test("covers 133 tables and 1743 columns including the outline storage tables", () => {
+		expect(target.tables.length).toBe(133);
 		// 1714 SQLite-derived columns include disk_outcome and the two editor recovery columns,
 		// plus the three PG-only insert_seq identity columns.
 		// The numeric context stats replace the 5-column page cache with pins (3) and stats (4).
@@ -538,7 +538,10 @@ describe("real schema parity", () => {
 		// The block sync's cost bookkeeping adds narrator_block_index_queue (2),
 		// narrator_blocks.ledger_revision and narrator_messages.blocks_content_hash.
 		// Historical token recalculation adds api_requests.token_accounting_version (1).
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1676);
+		// Outline storage adds seven tables (67): outline_spaces (8), outline_blocks (14),
+		// outline_block_versions (13), outline_links (8), outline_commits (12),
+		// outline_live_updates (7) and outline_view_state (5).
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1743);
 		expect(
 			target.tables
 				.find((table) => table.name === "narrator_context_pins")

@@ -26,7 +26,6 @@ test("workspace context endpoints encode owner identity and pin switch to the ob
 		expectedRevision: 4,
 		requestId: "switch-id",
 		target: { deviceId: "local", cwd: "/new/path" },
-		expectedWorktreeKey: "new-key",
 	};
 	await api.getWorkspaceContext("n /1");
 	await api.switchWorkspaceContext("n /1", input);

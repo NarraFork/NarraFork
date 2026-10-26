@@ -352,6 +352,14 @@
 			"prevId": "738f075a-db1e-4d17-ab16-032656d87253",
 			"version": "7",
 			"snapshotDigest": "dce20ffffd337aff8dc399f63ae547393c304dee16acac60c01eefed5c0e1004"
+		},
+		{
+			"idx": 44,
+			"tag": "0044_outline_storage",
+			"id": "30f5ec4d-b57c-40b3-a85d-a69332fe44bf",
+			"prevId": "4079ddee-70fe-4250-a6f9-614a7270d6ae",
+			"version": "7",
+			"snapshotDigest": "8f5daccf0d27fa16385d9de26e353e15fd162de8ca4b99e24c286f6f399ecae5"
 		}
 	]
 }

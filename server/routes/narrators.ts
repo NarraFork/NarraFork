@@ -5256,6 +5256,14 @@ function getAskInPassingPendingBlock(
 	return null;
 }
 
+// A one-shot sampling fork reuses the parent's frozen upstream request prefix.
+narratorRoutes.post("/:id/modeltrace", async (c) => {
+	const userId = c.get("user").sub;
+	const { startModelTrace } = await import("../services/modeltrace-service");
+	const result = await startModelTrace(c.req.param("id"), userId, await getUserLanguage(userId));
+	return c.json(result, 201);
+});
+
 // Start: create a persistent pending message in the source narrator's chat
 narratorRoutes.post("/:id/ask-in-passing/start", async (c) => {
 	const id = c.req.param("id");

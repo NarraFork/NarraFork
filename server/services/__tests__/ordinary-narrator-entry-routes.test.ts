@@ -219,6 +219,29 @@ describe("ask-in-passing answers in the block protocol", () => {
 	});
 });
 
+describe("ModelTrace HTTP entry", () => {
+	test("requires narrator write access before launching a sampling fork", async () => {
+		await source(false, { visibility: "public" });
+		const service = await import("../modeltrace-service");
+		const start = spyOn(service, "startModelTrace").mockResolvedValue({ id: "trace-child" });
+		spies.push(start);
+		expect((await post(appFor("reader"), "/narrators/source/modeltrace")).status).toBe(404);
+		expect(start).not.toHaveBeenCalled();
+	});
+
+	test("returns the child and attributes the single probe to the authenticated user", async () => {
+		await source(false);
+		const service = await import("../modeltrace-service");
+		const start = spyOn(service, "startModelTrace").mockResolvedValue({ id: "trace-child" });
+		spies.push(start);
+		const response = await post(appFor(), "/narrators/source/modeltrace");
+		expect(response.status).toBe(201);
+		expect(await response.json()).toEqual({ id: "trace-child" });
+		expect(start).toHaveBeenCalledTimes(1);
+		expect(start.mock.calls[0]?.slice(0, 2)).toEqual(["source", "owner"]);
+	});
+});
+
 describe("project creation creates context only, no sessions", () => {
 	function isolateProjectFilesystem() {
 		spies.push(spyOn(gitService, "isGitRepo").mockResolvedValue(true));

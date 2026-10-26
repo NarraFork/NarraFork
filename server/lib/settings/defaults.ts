@@ -39,6 +39,9 @@ export const DEFAULTS: NarraForkSettings = {
 		packMaxUncompressedMb: 500,
 		packActivateRequiresPermission: true,
 	},
+	outline: {
+		enabled: false,
+	},
 	requestEvidence: {
 		ringEnabled: true,
 		ringRequestBytes: DEFAULT_RECORDING_REQUEST_BYTES,
@@ -385,6 +388,13 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	"knowledge.packActivateRequiresPermission": {
 		desc: "PackActivate 是否需要用户显式批准（它会改变叙述者的目录访问范围）。",
 		type: "boolean",
+	},
+
+	// ── outline ─────────────────────────────────────────────────────────
+	"outline.enabled": {
+		desc: "大纲系统（块大纲、时间轴、导图）的总开关，开发中，默认关闭。关闭时大纲的 agent 工具不出现、接口返回 404、导航不显示；现有的 spec:// 和知识库不受影响。",
+		type: "boolean",
+		valid: "true / false，默认 false",
 	},
 
 	// ── plugins ─────────────────────────────────────────────────────────

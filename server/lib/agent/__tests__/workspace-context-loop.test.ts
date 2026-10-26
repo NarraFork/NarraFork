@@ -57,6 +57,7 @@ const provider: ProviderAdapter = {
 										expectedRevision: 0,
 										requestId: "request",
 										target: { deviceId: "local", cwd: "/new" },
+										expectedWorktreeKey: "obsolete-wrong-key",
 									},
 					},
 					{
@@ -182,6 +183,46 @@ async function run(conf: AgentConfig) {
 }
 
 describe("workspace switch pass barrier", () => {
+	test("switch schema hides obsolete worktree keys and strips them from historical calls", () => {
+		const schema = z.toJSONSchema(switchWorkingDirectoryTool.parameters);
+		expect(schema.properties).not.toHaveProperty("expectedWorktreeKey");
+		const input = {
+			expectedRevision: 0,
+			requestId: "request",
+			target: { deviceId: "local", cwd: "/new" },
+		};
+		expect(
+			switchWorkingDirectoryTool.parameters.parse({ ...input, expectedWorktreeKey: "wrong-key" }),
+		).toEqual(input);
+		expect(
+			switchWorkingDirectoryTool.parameters.safeParse({ ...input, expectedRevision: -1 }).success,
+		).toBe(false);
+	});
+	test("tool ignores obsolete keys, reports actual success and preserves failures as errors", async () => {
+		const input = {
+			expectedRevision: 0,
+			requestId: "request",
+			target: { deviceId: "local", cwd: "/new" },
+			expectedWorktreeKey: "wrong-key",
+		};
+		const result = { changed: true, previous: initial, current: { ...initial, cwd: "/new" } };
+		const switchDirectory = mock(async () => result);
+		const ctx = { switchWorkingDirectory: switchDirectory } as unknown as Parameters<
+			typeof switchWorkingDirectoryTool.execute
+		>[1];
+		const success = await switchWorkingDirectoryTool.execute(input, ctx);
+		expect(success.isError).not.toBe(true);
+		expect(JSON.parse(success.output)).toEqual(result);
+		expect(switchDirectory).toHaveBeenCalledWith({
+			expectedRevision: 0,
+			requestId: "request",
+			target: input.target,
+		});
+		switchDirectory.mockRejectedValueOnce(new Error("Workspace revision changed"));
+		const failure = await switchWorkingDirectoryTool.execute(input, ctx);
+		expect(failure.isError).toBe(true);
+		expect(failure.output).toBe("Workspace revision changed");
+	});
 	test("SwitchDevice runs mid-stream as a strict barrier and leaves started background execution frozen", async () => {
 		scenario = "device-switch";
 		const conf = config(initial);

@@ -135,6 +135,7 @@ export interface UseNarratorSendOptions {
 	 */
 	onForkCommand?: () => void;
 	onCompactCommand?: () => void;
+	onModelTraceStarted?: (narratorId: string) => void;
 	onRequestRecordingSaved?: (recording: SavedRecording) => void;
 
 	normalizeBooleanOverride: (value: unknown) => BooleanOverride;
@@ -204,10 +205,21 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 		navigateToNarrator,
 		onForkCommand,
 		onCompactCommand,
+		onModelTraceStarted,
 		normalizeBooleanOverride,
 		normalizeDangerReflectionOverride,
 		t,
 	} = options;
+
+	const startModelTrace = useCallback(
+		async (command: string) => {
+			if (command.toLowerCase() !== "/modeltrace") throw new Error(t("modelTraceUsage"));
+			const result = await api.startModelTrace(narratorId);
+			if (onModelTraceStarted) onModelTraceStarted(result.id);
+			else navigateToNarrator(result.id);
+		},
+		[narratorId, onModelTraceStarted, navigateToNarrator, t],
+	);
 
 	const ingestingRef = options.ingestingRef;
 	const blockWhileIngesting = useCallback(() => {
@@ -568,6 +580,37 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 			composerDocument?: ComposerDocument;
 		} | null = null;
 		try {
+			// This one-shot control never becomes parent model input, even while busy.
+			const modelTraceText = composerDocument
+				? composerDocumentText({
+						...composerDocument,
+						paragraphs: composerDocument.paragraphs.map((p) => ({
+							children: p.children.filter((n) => n.type !== "attachment"),
+						})),
+					}).text.trim()
+				: msg;
+			if (/^\/modeltrace(?:\s|$)/i.test(modelTraceText)) {
+				if (fileReferences.length) throw new Error(t("fileReferences.controlCommand"));
+				setSendingState({ attachmentCount: 0, progress: null, canCancel: false });
+				await startModelTrace(modelTraceText);
+				// Never clear staged resources or a newer draft, including layout-only edits.
+				if (
+					composerRef.current?.getText() === composerText &&
+					JSON.stringify(composerRef.current?.getDocument?.()) === JSON.stringify(liveDocument)
+				) {
+					if (composerDocument) {
+						const remaining = {
+							...composerDocument,
+							paragraphs: composerDocument.paragraphs.map((p) => ({
+								children: p.children.filter((n) => n.type === "attachment"),
+							})),
+						};
+						const projection = composerDocumentText(remaining);
+						composerRef.current.restoreInput(projection.text, projection.fileReferences, remaining);
+					} else composerRef.current.restoreInput("", []);
+				}
+				return;
+			}
 			// This diagnostic control is never model input, queued guidance or an interrupt,
 			// including while working/compacting. Leave drafts untouched until acceptance.
 			if (isPlainCommand && /^\/save_dump(?:\s|$)/i.test(msg)) {
@@ -826,6 +869,22 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 			if (!trimmed) return;
 			// Forwarded controls have the same immediate admission as composer controls,
 			// without ever replacing the operator's draft or staging attachments.
+			if (/^\/modeltrace(?:\s|$)/i.test(trimmed)) {
+				if (sendingRef.current) return;
+				sendingRef.current = true;
+				void startModelTrace(trimmed)
+					.catch((err: unknown) => {
+						notifications.show({
+							title: t("sendFailed"),
+							message: err instanceof Error ? err.message : String(err),
+							color: "red",
+						});
+					})
+					.finally(() => {
+						sendingRef.current = false;
+					});
+				return;
+			}
 			if (/^\/save_dump(?:\s|$)/i.test(trimmed)) {
 				if (sendingRef.current) return;
 				sendingRef.current = true;
@@ -893,7 +952,14 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 				}
 			})();
 		},
-		[narratorId, t, updateAttachedImages, updateAttachedTextFiles, blockWhileIngesting],
+		[
+			narratorId,
+			t,
+			updateAttachedImages,
+			updateAttachedTextFiles,
+			blockWhileIngesting,
+			startModelTrace,
+		],
 	);
 
 	useEffect(() => {

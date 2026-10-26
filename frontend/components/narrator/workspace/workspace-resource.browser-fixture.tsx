@@ -9,7 +9,14 @@ import {
 	type SerializedDockview,
 } from "dockview-react";
 import { createInstance } from "i18next";
-import { type ReactNode, useEffect, useRef, useState, useSyncExternalStore } from "react";
+import {
+	type ReactNode,
+	useEffect,
+	useLayoutEffect,
+	useRef,
+	useState,
+	useSyncExternalStore,
+} from "react";
 import { createRoot } from "react-dom/client";
 import { I18nextProvider } from "react-i18next";
 import type { PretextDocumentPageResult, TreeMessage } from "../../../lib/api/types";
@@ -59,6 +66,13 @@ let ready = false;
 // Opt-in only: existing resource/Director cases retain their original mocked bodies.
 const messagesMode = new URLSearchParams(location.search).get("messages") === "1";
 const messageRequests: { narratorId: string; tail: boolean; aborted: boolean }[] = [];
+const parkAfterMessageCommit = new Set<string>();
+const parkedMessageCommits: { panelId: string; width: number; height: number }[] = [];
+
+/** Force commit -> CSS parking -> passive effects without depending on browser scheduling. */
+export function parkAfterNextMessageCommit(panelId: string) {
+	parkAfterMessageCommit.add(panelId);
+}
 const messageDocuments: Record<
 	string,
 	{
@@ -262,7 +276,10 @@ function MessageDocumentProbe({ panelId, narratorId }: { panelId: string; narrat
 		pinnedToBottom: true,
 		loadOptions: messageLoadOptions,
 	});
-	useEffect(() => {
+	// Observe each committed index synchronously. A passive observer can see an
+	// older commit's index after Dockview/test code has already CSS-parked its DOM,
+	// falsely counting retention of a measured document as a zero-size adoption.
+	useLayoutEffect(() => {
 		if (document.status === "ready" && document.index && firstReadyAt.current == null)
 			firstReadyAt.current = performance.now();
 		if (previouslyReady.current && document.messages.length === 0) cleared.current++;
@@ -289,6 +306,15 @@ function MessageDocumentProbe({ panelId, narratorId }: { panelId: string; narrat
 			error: document.error == null ? null : String(document.error),
 		};
 	});
+	// Registered after the commit observer: a measured ready document is committed
+	// with real geometry, then parked before React can flush its passive effects.
+	useLayoutEffect(() => {
+		const node = nodeRef.current;
+		if (document.status !== "ready" || !document.index || !node) return;
+		if (!parkAfterMessageCommit.delete(panelId)) return;
+		parkedMessageCommits.push({ panelId, width: node.clientWidth, height: node.clientHeight });
+		node.style.display = "none";
+	}, [document.index, document.status, panelId]);
 	return (
 		<div
 			ref={nodeRef}
@@ -305,6 +331,7 @@ function MessageDocumentProbe({ panelId, narratorId }: { panelId: string; narrat
 
 export function messageSnapshot() {
 	return {
+		parkedCommits: parkedMessageCommits.map((commit) => ({ ...commit })),
 		requests: messageRequests.map((request) => ({ ...request })),
 		documents: Object.entries(messageDocuments).map(([panelId, document]) => {
 			const node = window.document.querySelector(`[data-message-document="${panelId}"]`);

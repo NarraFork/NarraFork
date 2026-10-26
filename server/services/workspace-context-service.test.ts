@@ -327,6 +327,36 @@ describe("local authoritative workspace context", () => {
 		expect((await workspaceContextService.get("narrator")).cwd).toBe(join(root, "new"));
 		expect(events).toEqual([]);
 	});
+	test.each([
+		false,
+		true,
+	])("HTTP ignores an obsolete mismatched worktree key (Git target: %s)", async (gitTarget) => {
+		const cwd = join(root, "new");
+		if (gitTarget) {
+			const process = Bun.spawn(["git", "init", "--quiet", cwd], {
+				stdout: "ignore",
+				stderr: "ignore",
+			});
+			expect(await process.exited).toBe(0);
+		}
+		const response = await app().request("/api/narrators/narrator/workspace-context/switch", {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				expectedRevision: 0,
+				requestId: "obsolete-key",
+				target: { deviceId: "local", cwd },
+				expectedWorktreeKey: "wrong-current-worktree-key",
+			}),
+		});
+		expect(response.status).toBe(200);
+		const result = await response.json();
+		expect(result.changed).toBe(true);
+		expect(result.current.cwd).toBe(cwd);
+		expect(result.current.revision).toBe(1);
+		expect(Boolean(result.current.git)).toBe(gitTarget);
+		expect(row.cwd).toBe(cwd);
+	});
 	test("HTTP read, switch and legacy PATCH all use the actual service", async () => {
 		const router = app();
 		const get = await router.request("/api/narrators/narrator/workspace-context");

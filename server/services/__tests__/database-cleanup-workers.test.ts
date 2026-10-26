@@ -17,30 +17,23 @@ import {
 import * as scanRunner from "@server/lib/db-worker/storage-scan-runner";
 import { narratorService } from "@server/services/narrator-service";
 
-// A dedicated file is visible to real read workers; neither main-thread nor worker queries use
-// the user's database. Keep raw_dump_json in this legacy fixture to pin honest byte accounting.
-const home = mkdtempSync(join(tmpdir(), "narrafork-cleanup-workers-"));
-const dbPath = join(home, "fixture.db");
-const sqlite = new Database(dbPath);
-sqlite.run("PRAGMA journal_mode = WAL");
-sqlite.exec(`
-	CREATE TABLE narrators (
-		id TEXT PRIMARY KEY, parent_narrator_id TEXT, type TEXT DEFAULT 'primary',
-		variant TEXT DEFAULT 'primary', traits TEXT, title TEXT, status TEXT,
-		message_count INTEGER DEFAULT 0, created_at TEXT, updated_at TEXT,
-		last_message_at TEXT, is_background INTEGER DEFAULT 0, background_status TEXT
-	);
-	CREATE TABLE terminals (id TEXT PRIMARY KEY, narrator_id TEXT, status TEXT);
-	CREATE TABLE narrator_messages (id TEXT PRIMARY KEY, narrator_id TEXT, content_json TEXT);
-	CREATE TABLE narrator_message_refs (narrator_id TEXT, message_id TEXT);
-	CREATE TABLE narrator_tool_calls (
-		id TEXT PRIMARY KEY, narrator_id TEXT, input_json TEXT, output_json TEXT,
-		created_at TEXT, is_file_history_checkpoint INTEGER DEFAULT 0
-	);
-	CREATE TABLE api_requests (id TEXT PRIMARY KEY, narrator_id TEXT, raw_dump_json TEXT);
-`);
+// Each test gets a dedicated file visible to its real read workers. A previous test's readonly
+// connection must never hold a lock while the next test resets its fixture. Keep raw_dump_json in
+// this legacy schema to pin honest byte accounting; neither connection touches the user's database.
+const homes: string[] = [];
+let home: string;
+let dbPath: string;
+let sqlite: Database;
+// Bun materializes mocked exports, so a getter alone would capture the initially undefined value.
+// Keep one stable facade and forward every access to the current test's real connection instead.
+const sqliteFacade = new Proxy({} as Database, {
+	get(_target, property) {
+		const value = Reflect.get(sqlite, property);
+		return typeof value === "function" ? value.bind(sqlite) : value;
+	},
+});
 const realDbModule = { ...(await import("../../db")) };
-mock.module("../../db", () => ({ ...realDbModule, sqlite }));
+mock.module("../../db", () => ({ ...realDbModule, sqlite: sqliteFacade }));
 const { databaseCleanupService } = await import("../database-cleanup-service");
 const old = "2020-01-01T00:00:00.000Z";
 const savedWorkerSetting = process.env.NARRAFORK_DB_WORKER;
@@ -68,28 +61,39 @@ beforeEach(() => {
 	mock.restore();
 	pool.resetDbWorkerPoolForTest();
 	delete process.env.NARRAFORK_DB_WORKER;
+	home = mkdtempSync(join(tmpdir(), "narrafork-cleanup-workers-"));
+	homes.push(home);
+	dbPath = join(home, "fixture.db");
+	sqlite = new Database(dbPath);
+	sqlite.run("PRAGMA journal_mode = WAL");
+	sqlite.exec(`
+		CREATE TABLE narrators (
+			id TEXT PRIMARY KEY, parent_narrator_id TEXT, type TEXT DEFAULT 'primary',
+			variant TEXT DEFAULT 'primary', traits TEXT, title TEXT, status TEXT,
+			message_count INTEGER DEFAULT 0, created_at TEXT, updated_at TEXT,
+			last_message_at TEXT, is_background INTEGER DEFAULT 0, background_status TEXT
+		);
+		CREATE TABLE terminals (id TEXT PRIMARY KEY, narrator_id TEXT, status TEXT);
+		CREATE TABLE narrator_messages (id TEXT PRIMARY KEY, narrator_id TEXT, content_json TEXT);
+		CREATE TABLE narrator_message_refs (narrator_id TEXT, message_id TEXT);
+		CREATE TABLE narrator_tool_calls (
+			id TEXT PRIMARY KEY, narrator_id TEXT, input_json TEXT, output_json TEXT,
+			created_at TEXT, is_file_history_checkpoint INTEGER DEFAULT 0
+		);
+		CREATE TABLE api_requests (id TEXT PRIMARY KEY, narrator_id TEXT, raw_dump_json TEXT);
+	`);
 	spyOn(connection, "getDbPath").mockReturnValue(dbPath);
-	for (const table of [
-		"narrators",
-		"terminals",
-		"narrator_messages",
-		"narrator_message_refs",
-		"narrator_tool_calls",
-		"api_requests",
-	]) {
-		sqlite.exec(`DELETE FROM ${table}`);
-	}
 });
 afterEach(() => {
 	mock.restore();
 	pool.shutdownDbWorkerPool();
+	sqlite.close();
 	if (savedWorkerSetting === undefined) delete process.env.NARRAFORK_DB_WORKER;
 	else process.env.NARRAFORK_DB_WORKER = savedWorkerSetting;
 });
 afterAll(() => {
 	mock.module("../../db", () => realDbModule);
-	sqlite.close();
-	rmSync(home, { recursive: true, force: true });
+	for (const path of homes.splice(0)) rmSync(path, { recursive: true, force: true });
 });
 
 describe("session cleanup read workers", () => {

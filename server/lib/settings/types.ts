@@ -630,6 +630,14 @@ export interface NarraForkSettings {
 		/** Whether PackActivate requires explicit user permission (it changes the narrator's dir access). */
 		packActivateRequiresPermission: boolean;
 	};
+	/** Block outlines (spaces, pages, timeline, mind map). */
+	outline: {
+		/**
+		 * Master switch, off by default while the feature is built: when off the outline agent
+		 * tools are not offered, its routes answer 404 and navigation hides it.
+		 */
+		enabled: boolean;
+	};
 	/** Plugin subsystem settings. */
 	/** Request evidence (ring recording + auto-pin); read live for each provider request. */
 	requestEvidence: RecordingSettings;

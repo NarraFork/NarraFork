@@ -26,6 +26,26 @@ describe("narrators API", () => {
 		}
 	});
 
+	test("modeltrace posts once to the encoded endpoint without a body", async () => {
+		Object.defineProperty(g, "localStorage", {
+			value: { getItem: () => null },
+			configurable: true,
+		});
+		const requests: Array<{ url: string; init: RequestInit }> = [];
+		Object.defineProperty(g, "fetch", {
+			configurable: true,
+			value: async (url: unknown, init: RequestInit) => {
+				requests.push({ url: String(url), init });
+				return Response.json({ id: "trace-child" });
+			},
+		});
+		expect(await api.startModelTrace("n/a")).toEqual({ id: "trace-child" });
+		expect(requests).toHaveLength(1);
+		expect(requests[0].url).toBe("/api/narrators/n%2Fa/modeltrace");
+		expect(requests[0].init.method).toBe("POST");
+		expect(requests[0].init.body).toBeUndefined();
+	});
+
 	test("message and block deletions are always history-only", async () => {
 		Object.defineProperty(g, "localStorage", {
 			value: { getItem: () => null },

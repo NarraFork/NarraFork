@@ -3436,6 +3436,176 @@ export const knowledgePackActivations = pgTable(
 	],
 );
 
+export const outlineSpaces = pgTable(
+	"outline_spaces",
+	{
+		id: text("id").primaryKey().notNull(),
+		key: text("key").notNull(),
+		kind: text("kind").notNull(),
+		projectId: text("project_id").references((): PgColumn => projects.id, { onDelete: "set null" }),
+		narratorId: text("narrator_id").references((): PgColumn => narrators.id, {
+			onDelete: "cascade",
+		}),
+		ownerUserId: text("owner_user_id").references((): PgColumn => users.id, {
+			onDelete: "set null",
+		}),
+		nextSeq: integer("next_seq").notNull().default(1),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("uq_outline_spaces_key").on(table.key),
+		uniqueIndex("uq_outline_spaces_project")
+			.on(table.projectId)
+			.where(sql.raw("\"kind\" = 'project'")),
+		uniqueIndex("uq_outline_spaces_personal")
+			.on(table.ownerUserId)
+			.where(sql.raw("\"kind\" = 'personal'")),
+		uniqueIndex("uq_outline_spaces_session")
+			.on(table.narratorId)
+			.where(sql.raw("\"kind\" = 'session'")),
+		index("idx_outline_spaces_project").on(table.projectId),
+		index("idx_outline_spaces_narrator").on(table.narratorId),
+		index("idx_outline_spaces_owner").on(table.ownerUserId),
+	],
+);
+
+export const outlineBlocks = pgTable(
+	"outline_blocks",
+	{
+		id: text("id").primaryKey().notNull(),
+		spaceId: text("space_id")
+			.notNull()
+			.references((): PgColumn => outlineSpaces.id, { onDelete: "cascade" }),
+		sid: text("sid").notNull(),
+		parentId: text("parent_id"),
+		pageId: text("page_id").notNull(),
+		orderKey: text("order_key").notNull(),
+		content: text("content").notNull(),
+		contentHash: text("content_hash").notNull(),
+		alias: text("alias"),
+		taskJson: jsonText("task_json"),
+		authorKind: text("author_kind").notNull(),
+		authorId: text("author_id").notNull(),
+		versionSeq: integer("version_seq").notNull(),
+		deleted: boolean("deleted").notNull().default(false),
+	},
+	(table) => [
+		uniqueIndex("uq_outline_blocks_space_sid").on(table.spaceId, table.sid),
+		uniqueIndex("uq_outline_blocks_space_alias")
+			.on(table.spaceId, table.alias)
+			.where(sql.raw('"alias" IS NOT NULL AND "deleted" = FALSE')),
+		index("idx_outline_blocks_page").on(table.pageId),
+		index("idx_outline_blocks_children").on(table.spaceId, table.parentId, table.orderKey),
+	],
+);
+
+export const outlineCommits = pgTable(
+	"outline_commits",
+	{
+		id: text("id").primaryKey().notNull(),
+		spaceId: text("space_id")
+			.notNull()
+			.references((): PgColumn => outlineSpaces.id, { onDelete: "cascade" }),
+		seq: integer("seq").notNull(),
+		kind: text("kind").notNull(),
+		actorKind: text("actor_kind").notNull(),
+		actorId: text("actor_id").notNull(),
+		responsibleUserId: text("responsible_user_id"),
+		narratorId: text("narrator_id"),
+		messageId: text("message_id"),
+		toolCallId: text("tool_call_id"),
+		createdAt: text("created_at").notNull(),
+		summary: text("summary").notNull(),
+	},
+	(table) => [
+		uniqueIndex("uq_outline_commits_space_seq").on(table.spaceId, table.seq),
+		index("idx_outline_commits_space_narrator").on(table.spaceId, table.narratorId, table.seq),
+	],
+);
+
+export const outlineBlockVersions = pgTable(
+	"outline_block_versions",
+	{
+		blockId: text("block_id")
+			.notNull()
+			.references((): PgColumn => outlineBlocks.id, { onDelete: "cascade" }),
+		fromSeq: integer("from_seq").notNull(),
+		toSeq: integer("to_seq"),
+		commitId: text("commit_id")
+			.notNull()
+			.references((): PgColumn => outlineCommits.id, { onDelete: "cascade" }),
+		pageId: text("page_id").notNull(),
+		parentId: text("parent_id"),
+		orderKey: text("order_key").notNull(),
+		content: text("content"),
+		taskJson: jsonText("task_json"),
+		alias: text("alias"),
+		contentHash: text("content_hash").notNull(),
+		changeFlags: integer("change_flags").notNull(),
+		deleted: boolean("deleted").notNull(),
+	},
+	(table) => [
+		index("idx_outline_versions_page_range").on(table.pageId, table.fromSeq, table.toSeq),
+		index("idx_outline_versions_commit").on(table.commitId),
+		primaryKey({ columns: [table.blockId, table.fromSeq] }),
+	],
+);
+
+export const outlineLinks = pgTable(
+	"outline_links",
+	{
+		id: text("id").primaryKey().notNull(),
+		spaceId: text("space_id").notNull(),
+		fromBlockId: text("from_block_id")
+			.notNull()
+			.references((): PgColumn => outlineBlocks.id, { onDelete: "cascade" }),
+		kind: text("kind").notNull(),
+		targetKind: text("target_kind").notNull(),
+		targetRef: text("target_ref").notNull(),
+		fromSeq: integer("from_seq").notNull(),
+		toSeq: integer("to_seq"),
+	},
+	(table) => [
+		index("idx_outline_links_from").on(table.fromBlockId, table.toSeq),
+		index("idx_outline_links_target").on(table.targetKind, table.targetRef),
+	],
+);
+
+export const outlineLiveUpdates = pgTable(
+	"outline_live_updates",
+	{
+		pageBlockId: text("page_block_id")
+			.notNull()
+			.references((): PgColumn => outlineBlocks.id, { onDelete: "cascade" }),
+		epoch: integer("epoch").notNull(),
+		seq: integer("seq").notNull(),
+		updateB64: text("update_b64").notNull(),
+		actorKind: text("actor_kind").notNull(),
+		actorId: text("actor_id").notNull(),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [primaryKey({ columns: [table.pageBlockId, table.epoch, table.seq] })],
+);
+
+export const outlineViewState = pgTable(
+	"outline_view_state",
+	{
+		userId: text("user_id")
+			.notNull()
+			.references((): PgColumn => users.id, { onDelete: "cascade" }),
+		pageBlockId: text("page_block_id")
+			.notNull()
+			.references((): PgColumn => outlineBlocks.id, { onDelete: "cascade" }),
+		collapsedJson: jsonText("collapsed_json").notNull().default(sql.raw("'[]'::text")),
+		layout: text("layout").notNull().default("right"),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		index("idx_outline_view_state_page").on(table.pageBlockId),
+		primaryKey({ columns: [table.userId, table.pageBlockId] }),
+	],
+);
+
 export const scheduledTasks = pgTable(
 	"scheduled_tasks",
 	{
@@ -3893,8 +4063,8 @@ export const notifications = pgTable(
 );
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
-  "tableCount": 126,
-  "columnCount": 1676,
+  "tableCount": 133,
+  "columnCount": 1743,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -23712,6 +23882,952 @@ export const POSTGRES_SCHEMA_COVERAGE = {
       "foreignKeys": [],
       "uniqueConstraints": [],
       "primaryKeys": []
+    },
+    {
+      "exportName": "outlineSpaces",
+      "name": "outline_spaces",
+      "columns": [
+        {
+          "property": "id",
+          "name": "id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "key",
+          "name": "key",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "kind",
+          "name": "kind",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "projectId",
+          "name": "project_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "projects",
+            "column": "id",
+            "onDelete": "set null",
+            "constraintName": "outline_spaces_project_id_projects_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "narratorId",
+          "name": "narrator_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "narrators",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "outline_spaces_narrator_id_narrators_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "ownerUserId",
+          "name": "owner_user_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "users",
+            "column": "id",
+            "onDelete": "set null",
+            "constraintName": "outline_spaces_owner_user_id_users_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "nextSeq",
+          "name": "next_seq",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "1",
+          "defaultExpression": "1"
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "uq_outline_spaces_key",
+          "columns": [
+            "key"
+          ],
+          "unique": true
+        },
+        {
+          "name": "uq_outline_spaces_project",
+          "columns": [
+            "projectId"
+          ],
+          "unique": true,
+          "predicate": "\"kind\" = 'project'"
+        },
+        {
+          "name": "uq_outline_spaces_personal",
+          "columns": [
+            "ownerUserId"
+          ],
+          "unique": true,
+          "predicate": "\"kind\" = 'personal'"
+        },
+        {
+          "name": "uq_outline_spaces_session",
+          "columns": [
+            "narratorId"
+          ],
+          "unique": true,
+          "predicate": "\"kind\" = 'session'"
+        },
+        {
+          "name": "idx_outline_spaces_project",
+          "columns": [
+            "projectId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_outline_spaces_narrator",
+          "columns": [
+            "narratorId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_outline_spaces_owner",
+          "columns": [
+            "ownerUserId"
+          ],
+          "unique": false
+        }
+      ],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "outlineBlocks",
+      "name": "outline_blocks",
+      "columns": [
+        {
+          "property": "id",
+          "name": "id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "spaceId",
+          "name": "space_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "outlineSpaces",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "outline_blocks_space_id_outline_spaces_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "sid",
+          "name": "sid",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "parentId",
+          "name": "parent_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "pageId",
+          "name": "page_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "orderKey",
+          "name": "order_key",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "content",
+          "name": "content",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "contentHash",
+          "name": "content_hash",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "alias",
+          "name": "alias",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "taskJson",
+          "name": "task_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "authorKind",
+          "name": "author_kind",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "authorId",
+          "name": "author_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "versionSeq",
+          "name": "version_seq",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "deleted",
+          "name": "deleted",
+          "kind": "integer",
+          "mode": "boolean",
+          "pgType": "boolean",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "false",
+          "defaultExpression": "false"
+        }
+      ],
+      "indexes": [
+        {
+          "name": "uq_outline_blocks_space_sid",
+          "columns": [
+            "spaceId",
+            "sid"
+          ],
+          "unique": true
+        },
+        {
+          "name": "uq_outline_blocks_space_alias",
+          "columns": [
+            "spaceId",
+            "alias"
+          ],
+          "unique": true,
+          "predicate": "\"alias\" IS NOT NULL AND \"deleted\" = FALSE"
+        },
+        {
+          "name": "idx_outline_blocks_page",
+          "columns": [
+            "pageId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_outline_blocks_children",
+          "columns": [
+            "spaceId",
+            "parentId",
+            "orderKey"
+          ],
+          "unique": false
+        }
+      ],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "outlineCommits",
+      "name": "outline_commits",
+      "columns": [
+        {
+          "property": "id",
+          "name": "id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "spaceId",
+          "name": "space_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "outlineSpaces",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "outline_commits_space_id_outline_spaces_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "seq",
+          "name": "seq",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "kind",
+          "name": "kind",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "actorKind",
+          "name": "actor_kind",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "actorId",
+          "name": "actor_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "responsibleUserId",
+          "name": "responsible_user_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "narratorId",
+          "name": "narrator_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "messageId",
+          "name": "message_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "toolCallId",
+          "name": "tool_call_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "summary",
+          "name": "summary",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "uq_outline_commits_space_seq",
+          "columns": [
+            "spaceId",
+            "seq"
+          ],
+          "unique": true
+        },
+        {
+          "name": "idx_outline_commits_space_narrator",
+          "columns": [
+            "spaceId",
+            "narratorId",
+            "seq"
+          ],
+          "unique": false
+        }
+      ],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "outlineBlockVersions",
+      "name": "outline_block_versions",
+      "columns": [
+        {
+          "property": "blockId",
+          "name": "block_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "outlineBlocks",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "outline_block_versions_block_id_outline_blocks_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "fromSeq",
+          "name": "from_seq",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "toSeq",
+          "name": "to_seq",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "commitId",
+          "name": "commit_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "outlineCommits",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "outline_block_versions_commit_id_outline_commits_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "pageId",
+          "name": "page_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "parentId",
+          "name": "parent_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "orderKey",
+          "name": "order_key",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "content",
+          "name": "content",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "taskJson",
+          "name": "task_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "alias",
+          "name": "alias",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "contentHash",
+          "name": "content_hash",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "changeFlags",
+          "name": "change_flags",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "deleted",
+          "name": "deleted",
+          "kind": "integer",
+          "mode": "boolean",
+          "pgType": "boolean",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_outline_versions_page_range",
+          "columns": [
+            "pageId",
+            "fromSeq",
+            "toSeq"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_outline_versions_commit",
+          "columns": [
+            "commitId"
+          ],
+          "unique": false
+        }
+      ],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": [
+        {
+          "columns": [
+            "blockId",
+            "fromSeq"
+          ]
+        }
+      ]
+    },
+    {
+      "exportName": "outlineLinks",
+      "name": "outline_links",
+      "columns": [
+        {
+          "property": "id",
+          "name": "id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "spaceId",
+          "name": "space_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "fromBlockId",
+          "name": "from_block_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "outlineBlocks",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "outline_links_from_block_id_outline_blocks_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "kind",
+          "name": "kind",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "targetKind",
+          "name": "target_kind",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "targetRef",
+          "name": "target_ref",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "fromSeq",
+          "name": "from_seq",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "toSeq",
+          "name": "to_seq",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_outline_links_from",
+          "columns": [
+            "fromBlockId",
+            "toSeq"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_outline_links_target",
+          "columns": [
+            "targetKind",
+            "targetRef"
+          ],
+          "unique": false
+        }
+      ],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "outlineLiveUpdates",
+      "name": "outline_live_updates",
+      "columns": [
+        {
+          "property": "pageBlockId",
+          "name": "page_block_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "outlineBlocks",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "outline_live_updates_page_block_id_outline_blocks_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "epoch",
+          "name": "epoch",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "seq",
+          "name": "seq",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "updateB64",
+          "name": "update_b64",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "actorKind",
+          "name": "actor_kind",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "actorId",
+          "name": "actor_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": [
+        {
+          "columns": [
+            "pageBlockId",
+            "epoch",
+            "seq"
+          ]
+        }
+      ]
+    },
+    {
+      "exportName": "outlineViewState",
+      "name": "outline_view_state",
+      "columns": [
+        {
+          "property": "userId",
+          "name": "user_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "users",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "outline_view_state_user_id_users_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "pageBlockId",
+          "name": "page_block_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "outlineBlocks",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "outline_view_state_page_block_id_outline_blocks_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "collapsedJson",
+          "name": "collapsed_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "[]",
+          "defaultExpression": "sql.raw(\"'[]'::text\")"
+        },
+        {
+          "property": "layout",
+          "name": "layout",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "\"right\"",
+          "defaultExpression": "\"right\""
+        },
+        {
+          "property": "updatedAt",
+          "name": "updated_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_outline_view_state_page",
+          "columns": [
+            "pageBlockId"
+          ],
+          "unique": false
+        }
+      ],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": [
+        {
+          "columns": [
+            "userId",
+            "pageBlockId"
+          ]
+        }
+      ]
     },
     {
       "exportName": "scheduledTasks",

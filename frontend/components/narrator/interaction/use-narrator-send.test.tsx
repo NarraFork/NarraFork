@@ -607,6 +607,142 @@ describe("narrator retry without file rollback", () => {
 	});
 });
 
+describe("modeltrace immediate control", () => {
+	let start: ReturnType<typeof spyOn<typeof api, "startModelTrace">>;
+	beforeEach(() => {
+		start = spyOn(api, "startModelTrace").mockResolvedValue({ id: "trace-child" });
+		const composer = options.composerRef.current as NarratorComposerHandle;
+		composer.getText = () => " /modeltrace ";
+		composer.getFileReferences = () => [];
+	});
+	afterEach(() => start.mockRestore());
+
+	for (const state of ["working", "compacting", "idle"]) {
+		for (const mode of ["turn", "tool", "interrupt"] as const) {
+			test(`${state} ${mode} starts one child without sending or interrupting the parent`, async () => {
+				const onStarted = mock(() => {});
+				await render({
+					isActive: state === "working",
+					showCompactQueueChoice: state === "compacting",
+					onModelTraceStarted: onStarted,
+					attachedImages: [new File(["image"], "image.png")],
+					attachedTextFiles: [new File(["notes"], "notes.txt")],
+				});
+				await act(async () => actions.handleSendWithModeRef.current(mode));
+				expect(start.mock.calls).toEqual([["n"]]);
+				expect(onStarted).toHaveBeenCalledWith("trace-child");
+				expect(options.navigateToNarrator).not.toHaveBeenCalled();
+				expect(send).not.toHaveBeenCalled();
+				expect(options.interruptNarrator.mutateAsync).not.toHaveBeenCalled();
+				expect(options.setNarratorWorking).not.toHaveBeenCalled();
+				expect(queue.map((message) => message.id)).toEqual(["existing"]);
+				expect(options.hideAttachedFilesForSend).not.toHaveBeenCalled();
+				expect(options.clearAttachedFilesAndDraft).not.toHaveBeenCalled();
+				expect(options.composerRef.current?.clearTextAndDraft).not.toHaveBeenCalled();
+				expect(options.composerRef.current?.restoreInput).toHaveBeenCalledWith("", []);
+				expect(options.composerRef.current?.noteSent).not.toHaveBeenCalled();
+				expect(options.sendingRef.current).toBe(false);
+			});
+		}
+	}
+
+	test("rich composer keeps attachment nodes and resources when removing only the command", async () => {
+		const image = new File(["image"], "image.png", { type: "image/png" });
+		const assetId = getComposerAssetId(image);
+		const attachment = { type: "attachment" as const, id: "node", assetId };
+		const doc: ComposerDocument = {
+			version: 1,
+			assets: [
+				{ id: assetId, kind: "image", name: image.name, size: image.size, mimeType: image.type },
+			],
+			paragraphs: [{ children: [{ type: "text", text: "/MODELTRACE " }, attachment] }],
+		};
+		Object.assign(options.composerRef.current ?? {}, {
+			getDocument: () => doc,
+			getText: () => composerDocumentText(doc).text,
+		});
+		await render({ attachedImages: [image] });
+		await act(async () => actions.handleSend());
+		expect(start).toHaveBeenCalledTimes(1);
+		expect(send).not.toHaveBeenCalled();
+		expect(options.composerRef.current?.restoreInput).toHaveBeenCalledWith("", [], {
+			...doc,
+			paragraphs: [{ children: [attachment] }],
+		});
+		expect(options.composerRef.current?.clearTextAndDraft).not.toHaveBeenCalled();
+		expect(options.clearAttachedFilesAndDraft).not.toHaveBeenCalled();
+	});
+
+	test("without callback navigates to the child", async () => {
+		await render();
+		await act(async () => actions.handleSend());
+		expect(options.navigateToNarrator).toHaveBeenCalledWith("trace-child");
+	});
+
+	test("arguments are rejected without any parent send or trace request", async () => {
+		await render();
+		(options.composerRef.current as NarratorComposerHandle).getText = () => "/modeltrace extra";
+		await act(async () => actions.handleSend());
+		expect(start).not.toHaveBeenCalled();
+		expect(send).not.toHaveBeenCalled();
+		expect(notify).toHaveBeenCalledWith(expect.objectContaining({ message: "modelTraceUsage" }));
+		expect(options.composerRef.current?.restoreInput).not.toHaveBeenCalled();
+	});
+
+	test("file references are rejected and preserved", async () => {
+		(options.composerRef.current as NarratorComposerHandle).getFileReferences = () => [reference];
+		await render();
+		await act(async () => actions.handleSend());
+		expect(start).not.toHaveBeenCalled();
+		expect(send).not.toHaveBeenCalled();
+		expect(options.composerRef.current?.restoreInput).not.toHaveBeenCalled();
+	});
+
+	test("failure preserves the draft and does not retry", async () => {
+		start.mockRejectedValue(new Error("trace failed"));
+		await render();
+		await act(async () => actions.handleSend());
+		expect(start).toHaveBeenCalledTimes(1);
+		expect(send).not.toHaveBeenCalled();
+		expect(options.navigateToNarrator).not.toHaveBeenCalled();
+		expect(options.composerRef.current?.restoreInput).not.toHaveBeenCalled();
+		expect(options.sendingRef.current).toBe(false);
+	});
+
+	test("pending request suppresses duplicate sends and preserves a newer draft", async () => {
+		const pending = Promise.withResolvers<{ id: string }>();
+		start.mockReturnValue(pending.promise);
+		await render();
+		let first: Promise<void>;
+		await act(async () => {
+			first = actions.handleSend();
+			await actions.handleSend();
+		});
+		expect(start).toHaveBeenCalledTimes(1);
+		(options.composerRef.current as NarratorComposerHandle).getText = () => "new draft";
+		await act(async () => {
+			pending.resolve({ id: "trace-child" });
+			await first;
+		});
+		expect(options.composerRef.current?.restoreInput).not.toHaveBeenCalled();
+	});
+
+	test.each([
+		"/modeltrace",
+		"/modeltrace extra",
+	])("forwarded %s never reaches the parent or alters its draft", async (text) => {
+		const onStarted = mock(() => {});
+		await render({ onModelTraceStarted: onStarted });
+		await act(async () => actions.forwardTextToNarrator(text));
+		expect(start).toHaveBeenCalledTimes(text === "/modeltrace" ? 1 : 0);
+		expect(onStarted).toHaveBeenCalledTimes(text === "/modeltrace" ? 1 : 0);
+		expect(send).not.toHaveBeenCalled();
+		expect(options.interruptNarrator.mutateAsync).not.toHaveBeenCalled();
+		expect(options.composerRef.current?.restoreInput).not.toHaveBeenCalled();
+		expect(options.clearAttachedFilesAndDraft).not.toHaveBeenCalled();
+	});
+});
+
 describe("save_dump command discovery", () => {
 	test.each([
 		"en",
@@ -616,6 +752,7 @@ describe("save_dump command discovery", () => {
 		client.setQueryData(["narrator-commands", "n"], {
 			commands: [
 				{ name: "save_dump", prompt: "old implementation", source: "builtin" },
+				{ name: "modeltrace", prompt: "old implementation", source: "builtin" },
 				{
 					name: "existing",
 					prompt: "existing prompt",
@@ -646,6 +783,19 @@ describe("save_dump command discovery", () => {
 					</I18nextProvider>,
 				);
 			});
+			const traces = commands.filter((command) => command.name === "modeltrace");
+			expect(traces).toHaveLength(1);
+			expect(traces[0]).toMatchObject({
+				name: "modeltrace",
+				source: "builtin",
+				prompt: "",
+				type: "command",
+			});
+			expect(traces[0].description).toBe(
+				language === "en"
+					? "Trace the model's current task in a one-turn child session without interrupting it"
+					: "在单轮子会话中追踪模型当前任务，不中断原会话",
+			);
 			const saves = commands.filter((command) => command.name === "save_dump");
 			expect(saves).toHaveLength(1);
 			expect(saves[0]).toMatchObject({

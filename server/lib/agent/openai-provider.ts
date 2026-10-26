@@ -1448,7 +1448,8 @@ export class OpenAIProvider implements ProviderAdapter {
 		}
 
 		const request = this.buildCodexWebSocketRequest(params);
-		const sessionKey = params.stickySessionKey ?? params.conversationId;
+		const sessionKey =
+			params.transportSessionKey ?? params.stickySessionKey ?? params.conversationId;
 		const fingerprint = this.resolveFingerprint(params.conversationId);
 
 		try {

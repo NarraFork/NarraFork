@@ -606,7 +606,8 @@ export class CodexProvider implements ProviderAdapter {
 					authorization: ctx.authorization,
 					accountId: ctx.credential.accountId,
 					proxy: resolveOverride(settings.codex?.proxy),
-					sessionKey: params.stickySessionKey ?? params.conversationId,
+					sessionKey:
+						params.transportSessionKey ?? params.stickySessionKey ?? params.conversationId,
 					conversationId: params.conversationId,
 					narratorId: params.stickySessionKey,
 					credentialId: ctx.id,

@@ -15,6 +15,7 @@ import type {
 } from "@shared/file-change-protocol";
 import { DEFAULT_LOCALE, type Locale } from "@shared/i18n-locales";
 import type { NotificationLink } from "@shared/notification-center";
+import type { LinkTarget, TaskStatus } from "@shared/outline";
 import type { ScheduledTaskCleanupPolicy } from "@shared/scheduled-task-cleanup";
 import { sql } from "drizzle-orm";
 import {
@@ -5356,6 +5357,252 @@ export const knowledgePackActivations = sqliteTable(
 		index("idx_kpackact_narrator").on(table.narratorId),
 		index("idx_kpackact_pack").on(table.packId),
 		index("idx_kpackact_narrator_pack_status").on(table.narratorId, table.packId, table.status),
+	],
+);
+
+// === outline ===
+// Block outlines (`server/services/outline/`): spaces hold forests of blocks, every change is a
+// commit, and every block keeps an append-only version history. Writes go through the outline
+// store port only; `server/services/outline/model.ts` states the write invariants.
+
+/** Task state of an outline block (`task_json`): checkbox, assignee, prerequisites, due date. */
+export interface OutlineTaskJson {
+	status: TaskStatus;
+	/** `agent:name` or `human:name`, without the `@`. */
+	assignee: string | null;
+	/** `depends::` links as written; also indexed as `depends` rows in `outline_links`. */
+	depends?: LinkTarget[];
+	/** `due::` as written: `YYYY-MM-DD` with an optional time. */
+	due?: string;
+}
+
+// === outline_spaces ===
+/**
+ * A container of one block forest and its history. Exactly one project space per project, one
+ * personal space per user and one session space per narrator: the partial unique indexes make a
+ * racing get-or-create resolve to one row.
+ *
+ * `key` is the short ASCII name addresses use (`key/sid`). `next_seq` is the commit counter: a
+ * commit claims it and increments it in the same transaction (never MAX+1), and a writer that
+ * planned against an older value is turned away by the claim itself.
+ *
+ * A deleted project or user leaves its space behind (`set null`): shared history is kept until an
+ * explicit purge. A session space goes with its narrator, like the rest of the session.
+ */
+export const outlineSpaces = sqliteTable(
+	"outline_spaces",
+	{
+		id: text("id").primaryKey(),
+		key: text("key").notNull(),
+		kind: text("kind", { enum: ["project", "personal", "session"] }).notNull(),
+		projectId: text("project_id").references(() => projects.id, { onDelete: "set null" }),
+		narratorId: text("narrator_id").references(() => narrators.id, { onDelete: "cascade" }),
+		ownerUserId: text("owner_user_id").references(() => users.id, { onDelete: "set null" }),
+		nextSeq: integer("next_seq").notNull().default(1),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [
+		uniqueIndex("uq_outline_spaces_key").on(table.key),
+		uniqueIndex("uq_outline_spaces_project").on(table.projectId).where(sql`"kind" = 'project'`),
+		uniqueIndex("uq_outline_spaces_personal").on(table.ownerUserId).where(sql`"kind" = 'personal'`),
+		uniqueIndex("uq_outline_spaces_session").on(table.narratorId).where(sql`"kind" = 'session'`),
+		// FK covering indexes: a partial index cannot serve the FK actions.
+		index("idx_outline_spaces_project").on(table.projectId),
+		index("idx_outline_spaces_narrator").on(table.narratorId),
+		index("idx_outline_spaces_owner").on(table.ownerUserId),
+	],
+);
+
+// === outline_blocks ===
+/**
+ * Current state of every block, live or deleted (deleted blocks keep their row so they can be
+ * restored). A page is a top-level block (`parent_id` null); `page_id` is the id of the block's
+ * top-level ancestor (a page's own id for the page), kept on every live block so a page is read
+ * with one indexed query and no recursion. `version_seq` is the seq of the commit that produced
+ * the current version; the row always equals the block's open version in
+ * `outline_block_versions`.
+ *
+ * `parent_id` and `page_id` carry no foreign key: the write path validates them, and a space is
+ * only ever removed as a whole. Aliases are unique among the live blocks of a space; `sid` is
+ * unique in the space for good, deleted blocks included.
+ */
+export const outlineBlocks = sqliteTable(
+	"outline_blocks",
+	{
+		id: text("id").primaryKey(),
+		spaceId: text("space_id")
+			.notNull()
+			.references(() => outlineSpaces.id, { onDelete: "cascade" }),
+		sid: text("sid").notNull(),
+		parentId: text("parent_id"),
+		pageId: text("page_id").notNull(),
+		/** Fractional order key among siblings (`shared/outline/order-key.ts`); bytewise order. */
+		orderKey: text("order_key").notNull(),
+		/** Canonical in-block markdown (`normalizeBlock`). */
+		content: text("content").notNull(),
+		/** SHA-256 of `content`, hex. */
+		contentHash: text("content_hash").notNull(),
+		alias: text("alias"),
+		taskJson: text("task_json", { mode: "json" }).$type<OutlineTaskJson>(),
+		/** Who last wrote the content (creation included); moves and deletes do not change it. */
+		authorKind: text("author_kind", { enum: ["human", "agent", "system"] }).notNull(),
+		authorId: text("author_id").notNull(),
+		versionSeq: integer("version_seq").notNull(),
+		deleted: integer("deleted", { mode: "boolean" }).notNull().default(false),
+	},
+	(table) => [
+		uniqueIndex("uq_outline_blocks_space_sid").on(table.spaceId, table.sid),
+		uniqueIndex("uq_outline_blocks_space_alias")
+			.on(table.spaceId, table.alias)
+			.where(sql`"alias" IS NOT NULL AND "deleted" = 0`),
+		index("idx_outline_blocks_page").on(table.pageId),
+		index("idx_outline_blocks_children").on(table.spaceId, table.parentId, table.orderKey),
+	],
+);
+
+// === outline_commits ===
+/**
+ * One row per outline transaction: who wrote it and on whose behalf. The actor, narrator,
+ * message and tool-call ids are an audit record and deliberately carry no foreign keys, so the
+ * record outlives what it names.
+ */
+export const outlineCommits = sqliteTable(
+	"outline_commits",
+	{
+		id: text("id").primaryKey(),
+		spaceId: text("space_id")
+			.notNull()
+			.references(() => outlineSpaces.id, { onDelete: "cascade" }),
+		seq: integer("seq").notNull(),
+		kind: text("kind", { enum: ["edit", "revert", "import"] }).notNull(),
+		actorKind: text("actor_kind", { enum: ["human", "agent", "system"] }).notNull(),
+		actorId: text("actor_id").notNull(),
+		responsibleUserId: text("responsible_user_id"),
+		narratorId: text("narrator_id"),
+		messageId: text("message_id"),
+		toolCallId: text("tool_call_id"),
+		createdAt: text("created_at").notNull(),
+		summary: text("summary").notNull(),
+	},
+	(table) => [
+		uniqueIndex("uq_outline_commits_space_seq").on(table.spaceId, table.seq),
+		index("idx_outline_commits_space_narrator").on(table.spaceId, table.narratorId, table.seq),
+	],
+);
+
+// === outline_block_versions ===
+/**
+ * Append-only block history. A version is valid for `from_seq <= seq < to_seq`; the current one
+ * has `to_seq` NULL, and every change closes it and opens the next in the same commit. `page_id`
+ * is redundant on purpose: a page as of a seq is one range query on
+ * `(page_id, from_seq, to_seq)`, which is why deleting a subtree writes a tombstone version for
+ * every descendant and moving one to another page writes a new version for every descendant.
+ * `change_flags` says what changed relative to the previous version (`OUTLINE_CHANGE`).
+ * Tombstones keep no content: restoring reads the version before them.
+ */
+export const outlineBlockVersions = sqliteTable(
+	"outline_block_versions",
+	{
+		blockId: text("block_id")
+			.notNull()
+			.references(() => outlineBlocks.id, { onDelete: "cascade" }),
+		fromSeq: integer("from_seq").notNull(),
+		toSeq: integer("to_seq"),
+		commitId: text("commit_id")
+			.notNull()
+			.references(() => outlineCommits.id, { onDelete: "cascade" }),
+		pageId: text("page_id").notNull(),
+		parentId: text("parent_id"),
+		orderKey: text("order_key").notNull(),
+		content: text("content"),
+		taskJson: text("task_json", { mode: "json" }).$type<OutlineTaskJson>(),
+		alias: text("alias"),
+		contentHash: text("content_hash").notNull(),
+		changeFlags: integer("change_flags").notNull(),
+		deleted: integer("deleted", { mode: "boolean" }).notNull(),
+	},
+	(table) => [
+		primaryKey({ columns: [table.blockId, table.fromSeq] }),
+		// The end bound belongs in the index: without it an as-of page read is ~3x slower.
+		index("idx_outline_versions_page_range").on(table.pageId, table.fromSeq, table.toSeq),
+		index("idx_outline_versions_commit").on(table.commitId),
+	],
+);
+
+// === outline_links ===
+/**
+ * Links out of a block, with the seq range they held for. Rows come from the block's content
+ * (`link` for `[[…]]`, `embed` for `![[…]]`), its task (`depends`) and its tags (`tag`: a tag is
+ * a link to the tag's page, so the tag page's backlinks are the tagged blocks). A row closes
+ * (`to_seq`) when what produced it changes or the block is deleted.
+ *
+ * `target_kind` is `block` when the target is written as an address (`target_ref` = `key/sid`)
+ * and `text` for an alias or title that has not been resolved to a block.
+ */
+export const outlineLinks = sqliteTable(
+	"outline_links",
+	{
+		id: text("id").primaryKey(),
+		spaceId: text("space_id").notNull(),
+		fromBlockId: text("from_block_id")
+			.notNull()
+			.references(() => outlineBlocks.id, { onDelete: "cascade" }),
+		kind: text("kind", { enum: ["link", "embed", "depends", "tag"] }).notNull(),
+		targetKind: text("target_kind", { enum: ["block", "text"] }).notNull(),
+		targetRef: text("target_ref").notNull(),
+		fromSeq: integer("from_seq").notNull(),
+		toSeq: integer("to_seq"),
+	},
+	(table) => [
+		index("idx_outline_links_from").on(table.fromBlockId, table.toSeq),
+		// Backlinks: who links to this target.
+		index("idx_outline_links_target").on(table.targetKind, table.targetRef),
+	],
+);
+
+// === outline_live_updates ===
+/**
+ * Pending CRDT updates of a page's live editing session, flushed at least once a second so a
+ * crash loses nothing; folded into a commit when the session ends. `update_b64` is the Yjs update
+ * as base64 text (there is no binary column type). `epoch` numbers the sessions of a page.
+ */
+export const outlineLiveUpdates = sqliteTable(
+	"outline_live_updates",
+	{
+		pageBlockId: text("page_block_id")
+			.notNull()
+			.references(() => outlineBlocks.id, { onDelete: "cascade" }),
+		epoch: integer("epoch").notNull(),
+		seq: integer("seq").notNull(),
+		updateB64: text("update_b64").notNull(),
+		actorKind: text("actor_kind", { enum: ["human", "agent", "system"] }).notNull(),
+		actorId: text("actor_id").notNull(),
+		createdAt: text("created_at").notNull(),
+	},
+	(table) => [primaryKey({ columns: [table.pageBlockId, table.epoch, table.seq] })],
+);
+
+// === outline_view_state ===
+/** Per user and page: collapsed blocks and the mind-map layout direction. Not part of history. */
+export const outlineViewState = sqliteTable(
+	"outline_view_state",
+	{
+		userId: text("user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "cascade" }),
+		pageBlockId: text("page_block_id")
+			.notNull()
+			.references(() => outlineBlocks.id, { onDelete: "cascade" }),
+		/** Ids of the collapsed blocks. */
+		collapsedJson: text("collapsed_json", { mode: "json" }).$type<string[]>().notNull().default([]),
+		layout: text("layout", { enum: ["right", "down"] })
+			.notNull()
+			.default("right"),
+		updatedAt: text("updated_at").notNull(),
+	},
+	(table) => [
+		primaryKey({ columns: [table.userId, table.pageBlockId] }),
+		index("idx_outline_view_state_page").on(table.pageBlockId),
 	],
 );
 

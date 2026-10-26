@@ -1590,6 +1590,13 @@
       "when": 1792983622028,
       "tag": "0226_token_accounting_version",
       "breakpoints": true
+    },
+    {
+      "idx": 227,
+      "version": "6",
+      "when": 1793021493403,
+      "tag": "0227_outline_storage",
+      "breakpoints": true
     }
   ]
 }

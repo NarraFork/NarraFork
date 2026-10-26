@@ -74,6 +74,7 @@ export const FTS_INDEX_TABLES = [
 	"narrators_fts",
 	"knowledge_entries_fts",
 	"knowledge_drafts_fts",
+	"outline_blocks_fts",
 ] as const;
 
 /**
@@ -585,6 +586,25 @@ export function ensureFts(
 		`);
 	}
 
+	// outline_blocks_fts indexes the current content of every outline block (deleted ones too:
+	// the search filters on the block row). External content keyed by rowid, like
+	// knowledge_entries_fts; created once the outline migration has run.
+	const hasOutlineBlocks =
+		(
+			sqlite
+				.prepare(
+					"SELECT COUNT(*) as c FROM sqlite_master WHERE type='table' AND name='outline_blocks'",
+				)
+				.get() as { c: number }
+		).c === 1;
+	if (hasOutlineBlocks) {
+		sqlite.run(`
+			CREATE VIRTUAL TABLE IF NOT EXISTS outline_blocks_fts USING fts5(
+				content, content='outline_blocks', content_rowid=rowid, tokenize='trigram'
+			)
+		`);
+	}
+
 	// A Drizzle content-table rebuild drops its triggers and can renumber rowids while
 	// leaving the external-content FTS index untouched (for example migration 0170).
 	// Check BEFORE reinstalling triggers, even on a clean startup. Missing triggers are
@@ -632,6 +652,19 @@ export function ensureFts(
 							"knowledge_drafts_fts_update",
 							"knowledge_drafts_fts_delete",
 							"knowledge_drafts_fts_entry_title",
+						],
+					},
+				]
+			: []),
+		...(hasOutlineBlocks
+			? [
+					{
+						table: "outline_blocks_fts",
+						rebuild: true,
+						triggers: [
+							"outline_blocks_fts_insert",
+							"outline_blocks_fts_update",
+							"outline_blocks_fts_delete",
 						],
 					},
 				]
@@ -787,6 +820,31 @@ export function ensureFts(
 		}
 	}
 
+	// --- Sync triggers: outline_blocks (content only) ---
+	// The update trigger fires only when the content changes: moves, page changes and
+	// tombstones rewrite other columns of whole subtrees and must not re-index them.
+	if (hasOutlineBlocks) {
+		sqlite.run(`
+			CREATE TRIGGER IF NOT EXISTS outline_blocks_fts_insert AFTER INSERT ON outline_blocks BEGIN
+				INSERT INTO outline_blocks_fts(rowid, content) VALUES (NEW.rowid, NEW.content);
+			END
+		`);
+		sqlite.run(`
+			CREATE TRIGGER IF NOT EXISTS outline_blocks_fts_update AFTER UPDATE OF content ON outline_blocks
+			WHEN OLD.content IS NOT NEW.content BEGIN
+				INSERT INTO outline_blocks_fts(outline_blocks_fts, rowid, content)
+				VALUES ('delete', OLD.rowid, OLD.content);
+				INSERT INTO outline_blocks_fts(rowid, content) VALUES (NEW.rowid, NEW.content);
+			END
+		`);
+		sqlite.run(`
+			CREATE TRIGGER IF NOT EXISTS outline_blocks_fts_delete AFTER DELETE ON outline_blocks BEGIN
+				INSERT INTO outline_blocks_fts(outline_blocks_fts, rowid, content)
+				VALUES ('delete', OLD.rowid, OLD.content);
+			END
+		`);
+	}
+
 	// --- Rebuild FTS indexes if needed ---
 	// Three reasons, none of which reads an index to find out:
 	//   1) Migration (tokenizer change / dropped-and-recreated table): the index is empty or
@@ -807,6 +865,7 @@ export function ensureFts(
 		"narrators_fts",
 		...envelopeIndex,
 		...(hasKnowledgeEntries ? ["knowledge_entries_fts"] : []),
+		...(hasOutlineBlocks ? ["outline_blocks_fts"] : []),
 	];
 	const toRebuild = ftsTables.filter(
 		(table) => !repairedContentIndexes.has(table) && (needsRebuild || corruptIndexes.has(table)),

@@ -575,8 +575,6 @@ export const workspaceContextService = {
 					previous.contextProjectId,
 				);
 				await assertTargetAllowed(id, target.cwd);
-				if (input.expectedWorktreeKey && input.expectedWorktreeKey !== target.git?.workspaceKey)
-					throw workspaceConflict("Target worktree identity changed");
 				return target;
 			},
 			admit: (action) => withNarratorMutationAdmission(id, action, { failIfBusy: true }),

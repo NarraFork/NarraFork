@@ -113,6 +113,79 @@ export async function runHarnessCommand(
 }
 
 type Runner = typeof runHarnessCommand;
+type HarnessConnection = Parameters<Parameters<typeof withPostgres>[0]>[0];
+const EXTERNAL_DATABASE = "nf_harness";
+
+/**
+ * Opt-in for machines without Podman: `PG_TEST_EXTERNAL_URL` names a disposable PostgreSQL
+ * server (a superuser URL, listening on 127.0.0.1; its database part is ignored). Each call
+ * drops and recreates the database `nf_harness` there, runs the callback, and drops it again,
+ * so never point it at a server whose `nf_harness` matters. `psql` comes from PATH unless
+ * `PG_TEST_PSQL` names it. Calls that inject a runner or an image keep using Podman.
+ */
+async function withExternalPostgres<T>(
+	url: string,
+	fn: (connection: HarnessConnection) => Promise<T>,
+	signal: AbortSignal | undefined,
+): Promise<T | PgHarnessResult> {
+	let target: URL;
+	try {
+		target = new URL(url);
+	} catch {
+		return {
+			status: "blocked",
+			errorType: "environment",
+			reason: "PG_TEST_EXTERNAL_URL is not a URL",
+		};
+	}
+	const port = Number(target.port || 5432);
+	const credentials = {
+		user: decodeURIComponent(target.username),
+		password: decodeURIComponent(target.password),
+		database: EXTERNAL_DATABASE,
+	};
+	const urlFor = (database: string) => {
+		const copy = new URL(target.href);
+		copy.pathname = `/${database}`;
+		return copy.href;
+	};
+	const psql = process.env.PG_TEST_PSQL ?? "psql";
+	const run = (database: string, sql: string, cancel: AbortSignal | undefined) =>
+		runHarnessCommand([psql, "-d", urlFor(database), "-v", "ON_ERROR_STOP=1", "-Atq"], {
+			signal: cancel,
+			input: sql,
+		});
+	const exec = (sql: string) => run(EXTERNAL_DATABASE, sql, signal);
+	const schema = `h_${randomBytes(8).toString("hex")}`;
+	const drop = `DROP DATABASE IF EXISTS ${EXTERNAL_DATABASE} WITH (FORCE);`;
+	let result: T | PgHarnessResult;
+	try {
+		const created = await run("postgres", `${drop}\nCREATE DATABASE ${EXTERNAL_DATABASE};`, signal);
+		if (created.code !== 0) throw new Error(`create:${created.stderr.slice(0, 256)}`);
+		const check = await exec(
+			`CREATE SCHEMA ${schema}; CREATE TABLE ${schema}.sentinel(value integer); INSERT INTO ${schema}.sentinel VALUES (1); SELECT 1;`,
+		);
+		if (check.code !== 0 || check.stdout.trim().split("\n").at(-1) !== "1")
+			throw new Error("validation");
+		try {
+			result = await fn({ port, schema, exec, credentials });
+		} catch {
+			result = { status: "failed", errorType: "callback", reason: "PostgreSQL callback failed" };
+		}
+	} catch (error) {
+		if (error instanceof HarnessCommandError && error.kind === "cancelled") throw error;
+		result = {
+			status: "blocked",
+			errorType: "environment",
+			reason: `external PostgreSQL unavailable (${error instanceof Error ? error.message.slice(0, 256) : "unknown"})`,
+		};
+	} finally {
+		// Never inherit a cancelled operation's signal for the cleanup.
+		await run("postgres", drop, undefined).catch(() => undefined);
+	}
+	return result;
+}
+
 export async function withPostgres<T>(
 	fn: (connection: {
 		port: number;
@@ -128,6 +201,10 @@ export async function withPostgres<T>(
 	}) => Promise<T>,
 	options: { signal?: AbortSignal; run?: Runner; image?: string } = {},
 ): Promise<T | PgHarnessResult> {
+	const external = process.env.PG_TEST_EXTERNAL_URL;
+	if (external && !options.run && !options.image) {
+		return withExternalPostgres(external, fn, options.signal);
+	}
 	const run = options.run ?? runHarnessCommand;
 	// An explicitly requested image is never substituted for another major version:
 	// if it is missing locally we pull exactly it, or report why we could not.
