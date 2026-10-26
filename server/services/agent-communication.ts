@@ -1251,7 +1251,7 @@ async function deliverSubagentMessageToParent(
 	// at its next after_tools sidecar boundary.
 	const started =
 		accepted.delivery.state === "queued" && !getExecutionOwner(parentId)
-			? await wakeInboxIfEligible(parentId, input.locale as Locale)
+			? await wakeInboxIfEligible(parentId)
 			: false;
 
 	return {
@@ -1450,7 +1450,7 @@ async function sendSubagentMessageDetailedWithRun(
 				// The run may have ended while this was being queued; the ordinary wake
 				// rechecks ownership, so a still-live run simply adopts it at its boundary.
 				if (!buffered.duplicate)
-					void wakeInboxIfEligible(fresh.id, input.locale as Locale).catch((error) =>
+					void wakeInboxIfEligible(fresh.id).catch((error) =>
 						logger.warn("Queued Send wake deferred", {
 							narratorId: fresh.id,
 							error: String(error),
@@ -1517,9 +1517,7 @@ async function sendSubagentMessageDetailedWithRun(
 				// idle session starts a run that adopts the message in order. The sender's
 				// identity is the message author only, never the recipient's principal.
 				try {
-					wakeFailed =
-						!wakeHeldRun(fresh.id) &&
-						!(await wakeInboxIfEligible(fresh.id, input.locale as Locale));
+					wakeFailed = !wakeHeldRun(fresh.id) && !(await wakeInboxIfEligible(fresh.id));
 				} catch (error) {
 					wakeFailed = true;
 					logger.warn("Accepted mailbox input awaits eligible wake", {

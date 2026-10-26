@@ -12,6 +12,7 @@ function message(contentJson: BaseContentBlock[], id = "a1", extra = {}): TreeMe
 	return rowWithElements(
 		{
 			id,
+			narratorId: "n1",
 			role: "assistant",
 			parentToolUseId: null,
 			toolCalls: [],
@@ -29,6 +30,58 @@ const text = (id: string, revision: number, value = "正文") => ({
 const live = (blocks: BaseContentBlock[], liveBlockIndex = -1) =>
 	message(blocks, "__streaming__", { liveBlockIndex });
 const tool = (id: string) => ({ type: "tool_use", id, name: "Read", input: {} });
+
+describe("reasoning translation handoff", () => {
+	it("preserves a validated translated prefix across append-only live growth", () => {
+		const part = {
+			id: "p",
+			generation: "g",
+			start: 0,
+			end: 3,
+			sourceText: "abc",
+			translatedText: "甲",
+		};
+		const original = {
+			type: "reasoning",
+			id: "r",
+			revision: 1,
+			text: "abc",
+			translationGeneration: "g",
+			translationParts: [part],
+		};
+		const committed = [message([original])];
+		const projected = projectStreamingDocument(
+			committed,
+			live([{ type: "reasoning", id: "r", revision: 2, text: "abcdef" }], 0),
+		);
+		expect(messageBody(projected[0])[0]).toMatchObject({
+			text: "abcdef",
+			translationGeneration: "g",
+			translationParts: [part],
+		});
+		expect(messageBody(committed[0])[0]).toEqual(original);
+	});
+
+	it("drops translated parts for a rewritten source or changed generation", () => {
+		const original = {
+			type: "reasoning",
+			id: "r",
+			revision: 1,
+			text: "abc",
+			translationGeneration: "g",
+			translationParts: [
+				{ id: "p", generation: "g", start: 0, end: 3, sourceText: "abc", translatedText: "甲" },
+			],
+		};
+		for (const incoming of [
+			{ type: "reasoning", id: "r", revision: 2, text: "different" },
+			{ type: "reasoning", id: "r", revision: 2, text: "abcdef", translationGeneration: "new" },
+		]) {
+			const result = projectStreamingDocument([message([original])], live([incoming], 0));
+			expect(messageBody(result[0])[0].translationParts).toBeUndefined();
+		}
+	});
+});
 
 describe("block identity/revision handoff projection", () => {
 	it("a mid-turn user message does not cut off modern global block ownership", () => {
@@ -129,6 +182,291 @@ describe("block identity/revision handoff projection", () => {
 				committed.map((m) => ({ ...m, toolCalls: [] })),
 			),
 		).toBe(fresh);
+	});
+});
+
+const ATTEMPT = "0123456789abcdefghijk";
+const RETRY = "ZYXWVUTSRQPONMLKJIHGF";
+const reasoning = (order: number, value = String(order + 1), attempt = ATTEMPT, revision = 1) => ({
+	type: "reasoning",
+	id: `${attempt}:${order}`,
+	revision,
+	text: value,
+});
+
+function deepFreeze<T>(value: T): T {
+	if (value && typeof value === "object") {
+		for (const child of Object.values(value)) deepFreeze(child);
+		Object.freeze(value);
+	}
+	return value;
+}
+
+describe("consecutive reasoning checkpoint ownership", () => {
+	it("appends only consecutive live lanes after the acknowledged raw lane has been released", () => {
+		const committed = [message([reasoning(0, "123")])];
+		const streaming = live([reasoning(1, "4"), reasoning(2, "5")], 1);
+		const document = projectStreamingDocument(committed, streaming);
+		expect(document.map((row) => row.id)).toEqual(["a1"]);
+		expect(messageBody(document[0])).toEqual([
+			reasoning(0, "123"),
+			reasoning(1, "4"),
+			reasoning(2, "5"),
+		]);
+		expect(document[0].liveBlockIndex).toBe(2);
+		expect(isLiveStreamingBlock(false, document[0], 2)).toBe(true);
+		expect(messageBody(committed[0])).toEqual([reasoning(0, "123")]);
+		expect(messageBody(streaming)).toEqual([reasoning(1, "4"), reasoning(2, "5")]);
+	});
+
+	it("keeps frozen canonical holders, translations and live holder metadata unchanged", () => {
+		const part = {
+			id: "p",
+			generation: "g",
+			start: 0,
+			end: 3,
+			sourceText: "123",
+			translatedText: "一二三",
+		};
+		const original = message([
+			{
+				...reasoning(0, "123"),
+				translationGeneration: "g",
+				translationParts: [part],
+			},
+		]);
+		const owner = {
+			...original,
+			model: "pool:default",
+			blocks: original.blocks.map((holder) => ({
+				...holder,
+				id: "server-holder",
+				named: true,
+				revision: 17,
+				attemptId: "req_0",
+				hasOriginal: true,
+			})),
+		};
+		const streaming = {
+			...live([reasoning(1, "4")], 0),
+			model: "actual-model",
+			provider: "codex",
+		};
+		const committed = deepFreeze([owner]);
+		deepFreeze(streaming);
+		const result = projectStreamingDocument(committed, streaming);
+		expect(result).toHaveLength(1);
+		expect(result[0].blocks[0]).toBe(owner.blocks[0]);
+		expect(result[0].blocks[1]).toBe(streaming.blocks[0]);
+		expect(result[0].blocks[0]).toMatchObject({
+			id: "server-holder",
+			named: true,
+			revision: 17,
+			attemptId: "req_0",
+			hasOriginal: true,
+		});
+		expect(messageBody(result[0])[0].translationParts?.[0]).toBe(part);
+		expect(result[0]).toMatchObject({
+			model: "actual-model",
+			provider: "codex",
+			liveContentProjection: true,
+			liveBlockIndex: 1,
+		});
+		expect(owner.model).toBe("pool:default");
+		expect(owner.blocks).toHaveLength(1);
+		expect(streaming.blocks).toHaveLength(1);
+	});
+
+	it("preserves same-id revisions and raw offsets before appending another lane", () => {
+		const part = {
+			id: "p",
+			generation: "g",
+			start: 0,
+			end: 3,
+			sourceText: "123",
+			translatedText: "一二三",
+		};
+		const committed = [
+			message([
+				{
+					...reasoning(0, "123"),
+					rawTextLength: 3,
+					translationGeneration: "g",
+					translationParts: [part],
+				},
+			]),
+		];
+		const streaming = live(
+			[{ ...reasoning(0, "34", ATTEMPT, 2), textOffset: 2 }, reasoning(1, "5")],
+			1,
+		);
+		const result = projectStreamingDocument(committed, streaming);
+		expect(result).toHaveLength(1);
+		expect(messageBody(result[0])).toEqual([
+			{
+				...reasoning(0, "1234", ATTEMPT, 2),
+				rawTextLength: 3,
+				textOffset: 2,
+				translationGeneration: "g",
+				translationParts: [part],
+			},
+			reasoning(1, "5"),
+		]);
+		expect(result[0].blocks[0].id).toBe(committed[0].blocks[0].id);
+		expect(result[0].liveBlockIndex).toBe(1);
+	});
+
+	it("preserves the active lane when a late delta reopens the owner or appended prefix", () => {
+		const owner = message([reasoning(0, "123")]);
+		for (const [streaming, expectedIndex] of [
+			[live([reasoning(0, "1235", ATTEMPT, 2), reasoning(1, "4")], 0), 0],
+			[live([reasoning(1, "45", ATTEMPT, 2), tool("tu")], 0), 1],
+		] as const) {
+			const result = projectStreamingDocument([owner], streaming);
+			expect(result[0].liveBlockIndex).toBe(expectedIndex);
+			expect(isLiveStreamingBlock(false, result[0], expectedIndex)).toBe(true);
+			expect(messageBody(result[0])).toHaveLength(2);
+			if (result.length > 1) {
+				expect(messageBody(result[1])).toEqual([tool("tu")]);
+				expect(result[1].liveBlockIndex).toBe(-1);
+			}
+		}
+	});
+
+	it("leaves later live text and tool cards in place and settles the reasoning run", () => {
+		for (const suffix of [text(`${ATTEMPT}:2`, 1, "answer"), tool("tu")]) {
+			const committed = [message([reasoning(0, "123")])];
+			const streaming = live([reasoning(1, "4"), suffix], suffix.type === "text" ? 1 : -1);
+			const result = projectStreamingDocument(committed, streaming);
+			expect(result.map((row) => row.id)).toEqual(["a1", "__streaming__"]);
+			expect(messageBody(result[0])).toEqual([reasoning(0, "123"), reasoning(1, "4")]);
+			expect(messageBody(result[1])).toEqual([suffix]);
+			expect(result[0].liveBlockIndex).toBe(-1);
+			expect(isLiveStreamingBlock(false, result[0], 1)).toBe(false);
+			expect(result[1].liveBlockIndex).toBe(suffix.type === "text" ? 0 : -1);
+			expect(result[0].blocks[1]).toBe(streaming.blocks[0]);
+			expect(result[1].blocks[0]).toBe(streaming.blocks[1]);
+		}
+	});
+
+	it.each([
+		["another attempt or retry", reasoning(1, "4", RETRY)],
+		["legacy id", { ...reasoning(1), id: "r2" }],
+		["missing id", { type: "reasoning", text: "4", revision: 1 }],
+		["short epoch", { ...reasoning(1), id: "attempt:1" }],
+		["invalid epoch", { ...reasoning(1), id: "0123456789abcdefghij!:1" }],
+		["leading zero", { ...reasoning(1), id: `${ATTEMPT}:01` }],
+		["negative order", { ...reasoning(1), id: `${ATTEMPT}:-1` }],
+		["unsafe order", { ...reasoning(1), id: `${ATTEMPT}:9007199254740992` }],
+		["missing revision", { type: "reasoning", text: "4", id: `${ATTEMPT}:1` }],
+		["ordinal gap occupied by an external tool", reasoning(2, "4")],
+	] as const)("keeps %s independent", (_name, incoming) => {
+		const owner = message([reasoning(0, "123")]);
+		const streaming = live([incoming], 0);
+		const result = projectStreamingDocument([owner], streaming);
+		expect(result).toEqual([owner, streaming]);
+		expect(result[0]).toBe(owner);
+	});
+
+	it("rejects duplicate or gapped lanes and mixed-attempt reasoning runs", () => {
+		for (const [committedBlocks, liveBlocks] of [
+			[[reasoning(0), reasoning(0)], [reasoning(1)]],
+			[[reasoning(0), reasoning(2)], [reasoning(3)]],
+			[[reasoning(0, "old", RETRY), reasoning(0)], [reasoning(1)]],
+			[[reasoning(0)], [reasoning(1), reasoning(1)]],
+			[[reasoning(0)], [reasoning(1), reasoning(3)]],
+			[[reasoning(0)], [reasoning(1), reasoning(2, "retry", RETRY)]],
+		]) {
+			const owner = message(committedBlocks);
+			const streaming = live(liveBlocks);
+			expect(projectStreamingDocument([owner], streaming)).toEqual([owner, streaming]);
+		}
+	});
+
+	it("does not cross text/tool boundaries in either row", () => {
+		for (const barrier of [text(`${ATTEMPT}:1`, 1), tool("tu")]) {
+			const owner = message([reasoning(0), barrier]);
+			const streaming = live([reasoning(2)]);
+			expect(projectStreamingDocument([owner], streaming)).toEqual([owner, streaming]);
+			const before = message([reasoning(0)]);
+			const after = live([barrier, reasoning(2)]);
+			expect(projectStreamingDocument([before], after)).toEqual([before, after]);
+		}
+	});
+
+	it("requires the actual tail owner and rejects COW or another message sharing the epoch", () => {
+		const owner = message([reasoning(0)]);
+		const streaming = live([reasoning(1)]);
+		for (const committed of [
+			[owner, message([], "u", { role: "user" })],
+			[owner, message([], "t", { role: "tool" })],
+			[owner, message([], "system", { role: "system" })],
+			[owner, message([reasoning(0, "retry", RETRY)], "next")],
+			[message([reasoning(0)], "copy"), owner],
+			[message([text(`${ATTEMPT}:9`, 1)], "another"), owner],
+		]) {
+			expect(projectStreamingDocument(committed, streaming)).toEqual([...committed, streaming]);
+		}
+		// Existing exact-id revision ownership still survives an interjected user.
+		const interjected = [owner, message([], "u", { role: "user" })];
+		const revised = projectStreamingDocument(
+			interjected,
+			live([reasoning(0, "updated", ATTEMPT, 2), reasoning(1)], 1),
+		);
+		expect(messageBody(revised[0])[0]).toEqual(reasoning(0, "updated", ATTEMPT, 2));
+		expect(messageBody(revised[2])).toEqual([reasoning(1)]);
+	});
+
+	it("requires the narrator's own nonnested page scope, including a subagent's own page", () => {
+		const streaming = live([reasoning(1)]);
+		for (const extra of [
+			{ narratorId: "other" },
+			{ narratorId: undefined },
+			{ parentToolUseId: "foreign-agent" },
+			{ parentMessageId: "nested" },
+		]) {
+			const owner = message([reasoning(0)], "a1", extra);
+			expect(projectStreamingDocument([owner], streaming)).toEqual([owner, streaming]);
+		}
+		const owner = message([reasoning(0)]);
+		for (const extra of [
+			{ narratorId: undefined },
+			{ narratorId: "" },
+			{ parentToolUseId: "foreign-agent" },
+			{ parentMessageId: "nested" },
+		]) {
+			const foreign = { ...streaming, ...extra } as TreeMessage;
+			expect(projectStreamingDocument([owner], foreign)).toEqual([owner, foreign]);
+		}
+		const child = message([reasoning(0)], "child", { narratorId: "child-narrator" });
+		const childLive = { ...streaming, narratorId: "child-narrator" };
+		expect(projectStreamingDocument([child], childLive)).toHaveLength(1);
+	});
+
+	it("rejects holder ids shared with the owner or retained live suffix", () => {
+		const owner = message([reasoning(0)]);
+		const raw = live([reasoning(1), text(`${ATTEMPT}:2`, 1)]);
+		for (const streaming of [
+			{
+				...raw,
+				blocks: raw.blocks.map((holder, index) => ({
+					...holder,
+					id: index === 0 ? owner.blocks[0].id : holder.id,
+				})),
+			},
+			{ ...raw, blocks: raw.blocks.map((holder) => ({ ...holder, id: "shared-holder" })) },
+			{ ...raw, blocks: [{ ...raw.blocks[0], elements: messageBody(raw) }] },
+			{
+				...raw,
+				blocks: [
+					raw.blocks[0],
+					{ ...raw.blocks[1], id: "tool-holder", elements: [tool("tu")] },
+					{ ...raw.blocks[0], id: "duplicate-element-holder" },
+				],
+			},
+		]) {
+			expect(projectStreamingDocument([owner], streaming)).toEqual([owner, streaming]);
+		}
 	});
 });
 

@@ -56,6 +56,7 @@ import {
 const PANEL_EXCLUDED_EVENT_TYPES = [
 	"user_message",
 	"message_updated",
+	"reasoning_translation_patch",
 	"tool_use_chunk",
 	"tool_completed",
 	"tool_long_running",

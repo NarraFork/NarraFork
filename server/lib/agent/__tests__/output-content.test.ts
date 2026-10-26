@@ -7,6 +7,37 @@ function blocks(events: Iterable<AgentEvent>) {
 }
 
 describe("output content lifecycle", () => {
+	test("summary seal follows acknowledged persistence without completing native reasoning", () => {
+		const content = new OutputContentAccumulator();
+		const lane = { blockId: "native-item", outputIndex: 0 };
+		const first = content.append("reasoning", "A😀", lane);
+		const part = { id: "summary-0", index: 0, start: 0, end: 3 };
+		const events = content.sealSummaryPart(part, lane);
+		expect(events.next().value).toMatchObject({
+			type: "block_complete",
+			block: { id: first.blockId, text: "A😀", completed: false },
+		});
+		expect(events.next().value).toMatchObject({
+			type: "reasoning_summary_sealed",
+			blockId: first.blockId,
+			start: 0,
+			end: 3,
+			sourceText: "A😀",
+		});
+		expect([...content.sealSummaryPart(part, lane)]).toEqual([]);
+		content.append("reasoning", "\n\nB", lane);
+		expect([...content.sealSummaryPart({ id: "bad", index: 1, start: 1, end: 2 }, lane)]).toEqual(
+			[],
+		);
+		expect(
+			blocks(content.boundary({ kind: "reasoning", phase: "complete", ...lane }))[0],
+		).toMatchObject({
+			id: first.blockId,
+			text: "A😀\n\nB",
+			completed: true,
+		});
+	});
+
 	test("native complete persists a new revision even after an unchanged checkpoint", () => {
 		const content = new OutputContentAccumulator();
 		const lane = { blockId: "native", outputIndex: 0 };

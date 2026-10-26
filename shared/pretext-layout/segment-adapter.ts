@@ -33,6 +33,11 @@ import { hasUsablePlanBody } from "../plan-reference";
 import { isPreferOpenTool } from "../prefer-open-tool";
 import { type ProgressPhase, shouldShowThinkingChars } from "../progress-phase";
 import {
+	composeReasoningTranslation,
+	getValidReasoningTranslationParts,
+	type ReasoningTranslationFields,
+} from "../reasoning-translation";
+import {
 	escapeMarkdown,
 	rawSideCarToMarkdown,
 	readSideCarBody,
@@ -122,7 +127,7 @@ import { resolveTurnUsageLines, type TurnUsageJson, type UsageNumberFormatter } 
 // satisfy these.
 // ─────────────────────────────────────────────────────────────────────────────
 
-export interface AdapterContentBlock {
+export interface AdapterContentBlock extends ReasoningTranslationFields {
 	type: string;
 	text?: string | null;
 	/** Native system injection's exact model-facing projection. */
@@ -1238,17 +1243,35 @@ function joinRunText(parts: readonly string[]): string {
 	return parts.filter((value) => value.length > 0).join("\n\n");
 }
 
-/**
- * A run's translation, or null when it is not fully translated.
- *
- * All-or-nothing on purpose: a partially translated run would otherwise render some
- * steps in one language and some in another. The denominator counts only NON-EMPTY
- * blocks, matching what `joinRunText` keeps.
- */
+/** Partial translations replace only their validated source ranges; gaps stay original. */
 function canonicalReasoningRunTranslation(blocks: readonly AdapterContentBlock[]): string | null {
-	const translatedParts = blocks.map((block) => block.translatedText).filter(Boolean) as string[];
-	const nonEmpty = blocks.filter((block) => (block.thinking ?? block.text ?? "").length > 0).length;
-	return translatedParts.length === nonEmpty && nonEmpty > 0 ? joinRunText(translatedParts) : null;
+	if (!blocks.some((block) => block.translationGeneration || block.translationParts)) {
+		const translated = blocks.map((block) => block.translatedText).filter(Boolean) as string[];
+		const nonEmpty = blocks.filter(
+			(block) => (block.thinking ?? block.text ?? "").length > 0,
+		).length;
+		return translated.length === nonEmpty && nonEmpty > 0 ? joinRunText(translated) : null;
+	}
+	let translated = false;
+	const parts = blocks.map((block) => {
+		const text = block.thinking ?? block.text ?? "";
+		if (block.translationGeneration || block.translationParts) {
+			const valid = getValidReasoningTranslationParts(
+				text,
+				block.translationGeneration,
+				block.translationParts,
+			);
+			if (!valid.length) return text;
+			translated = true;
+			return composeReasoningTranslation(text, block.translationGeneration, valid);
+		}
+		if (block.translatedText) {
+			translated = true;
+			return block.translatedText;
+		}
+		return text;
+	});
+	return translated ? joinRunText(parts) : null;
 }
 
 /**
@@ -1271,6 +1294,20 @@ function reasoningData(blocks: AdapterContentBlock[], isStreaming: boolean) {
 	return {
 		text,
 		translatedText,
+		...(blocks.some((block) => block.translationGeneration || block.translationParts)
+			? {
+					translationRevision: JSON.stringify(
+						blocks.map((block) => [
+							block.translationGeneration ?? null,
+							getValidReasoningTranslationParts(
+								block.thinking ?? block.text ?? "",
+								block.translationGeneration,
+								block.translationParts,
+							).map((part) => [part.id, part.start, part.end]),
+						]),
+					),
+				}
+			: {}),
 		isStreaming,
 		stepCount: blocks.length,
 		charCount: displayText.length,

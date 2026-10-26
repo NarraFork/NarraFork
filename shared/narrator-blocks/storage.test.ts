@@ -80,6 +80,37 @@ const SHAPES: Record<string, DecodableMessage> = {
 };
 
 describe("block storage codec", () => {
+	test("reasoning generations and translated ranges are reader state, never model payload", () => {
+		const part = {
+			id: "p1",
+			generation: "g1",
+			start: 0,
+			end: 5,
+			sourceText: "think",
+			translatedText: "思考",
+		};
+		for (const type of ["reasoning", "thinking"]) {
+			const raw = {
+				type,
+				id: "r1",
+				text: "think",
+				translatedText: "想",
+				translationGeneration: "g1",
+				translationParts: [part],
+			};
+			const [block] = splitEnvelope(message("assistant", [raw])).blocks;
+			expect(block.payload.raw).toEqual([{ type, id: "r1", text: "think" }]);
+			expect(block.state).toEqual({
+				raw: [{ translatedText: "想", translationGeneration: "g1", translationParts: [part] }],
+			});
+			expect(block.canonical?.state).toEqual({
+				translatedText: "想",
+				translationGeneration: "g1",
+				translationParts: [part],
+			});
+			expect(assembleContent([{ payload: block.payload, state: block.state }])).toEqual([raw]);
+		}
+	});
 	for (const [name, row] of Object.entries(SHAPES)) {
 		test(`round-trips: ${name}`, () => {
 			expect(assembleContent(rows(row))).toEqual(row.contentJson as unknown[]);

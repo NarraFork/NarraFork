@@ -11,6 +11,10 @@ import {
 } from "@shared/compact-message";
 import type { MessageOriginOptions } from "@shared/message-origin";
 import { isNativeModelContextBlock, modelTextFromContentBlocks } from "@shared/native-injection";
+import {
+	getValidReasoningTranslationParts,
+	type ReasoningTranslationPart,
+} from "@shared/reasoning-translation";
 import { and, desc, eq, inArray, isNull, ne, type SQL, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import {
@@ -66,6 +70,7 @@ import {
 	flushQueuedSince,
 	newEnvelopeColumns,
 	patchEnvelopeState,
+	patchReasoningPartState,
 	type SyncMode,
 	syncEnvelopeNow,
 	syncQueueMark,
@@ -2473,6 +2478,8 @@ const sqliteNarratorPersistence = {
 					completed?: boolean;
 					providerMetadata?: import("@server/lib/agent/types").ReasoningProviderMetadata;
 					outputIndex?: number;
+					translationGeneration?: string;
+					translationParts?: ReasoningTranslationPart[];
 			  }
 			| { type: "redacted_thinking"; data: string; outputIndex?: number; signatureSource?: string }
 			| {
@@ -2586,6 +2593,10 @@ const sqliteNarratorPersistence = {
 				(block.type === "text" || block.type === "reasoning") && block.id
 					? current.findIndex((entry) => entry.type === block.type && entry.id === block.id)
 					: -1;
+			const newBlock =
+				block.type === "reasoning"
+					? { ...block, translationGeneration: block.translationGeneration ?? generateId() }
+					: block;
 			if (matchingIndex !== -1 && (block.type === "text" || block.type === "reasoning")) {
 				const previous = current[matchingIndex] as Record<string, unknown>;
 				const stale =
@@ -2602,6 +2613,25 @@ const sqliteNarratorPersistence = {
 					);
 				}
 				if (previous.text !== block.text) delete next.translatedText;
+				if (block.type === "reasoning") {
+					const appendOnly =
+						typeof previous.text === "string" && block.text.startsWith(previous.text);
+					const previousGeneration = previous.translationGeneration;
+					const generation = appendOnly
+						? (previousGeneration ?? block.translationGeneration ?? generateId())
+						: block.translationGeneration && block.translationGeneration !== previousGeneration
+							? block.translationGeneration
+							: generateId();
+					next.translationGeneration = generation;
+					const previousParts = appendOnly
+						? (previous.translationParts as ReasoningTranslationPart[] | undefined)
+						: undefined;
+					next.translationParts = getValidReasoningTranslationParts(
+						block.text,
+						String(generation),
+						[...(previousParts ?? []), ...(block.translationParts ?? [])],
+					);
+				}
 				if (stale || isDeepStrictEqual(previous, next)) {
 					content = current;
 				} else {
@@ -2617,7 +2647,7 @@ const sqliteNarratorPersistence = {
 				};
 				// ECMAScript's stable sort preserves arrival order for ties/unindexed blocks;
 				// avoid the former wrapper object + two extra arrays for every checkpoint.
-				content = [...current, block as StoredAssistantBlock];
+				content = [...current, newBlock as StoredAssistantBlock];
 				content.sort((a, b) => {
 					const aOrder = getOutputIndex(a) ?? Number.POSITIVE_INFINITY;
 					const bOrder = getOutputIndex(b) ?? Number.POSITIVE_INFINITY;
@@ -2626,7 +2656,7 @@ const sqliteNarratorPersistence = {
 			} else {
 				// Unindexed providers/checkpoints already arrive in occurrence order. Do not
 				// pull later reasoning in front of text/tools that were actually seen first.
-				content = [...current, block];
+				content = [...current, newBlock];
 			}
 			if (content === current && !options?.republishUnchanged) return undefined;
 			const writeLedgerRow = () => {
@@ -2719,6 +2749,25 @@ const sqliteNarratorPersistence = {
 
 		await publishPartial();
 		return toolCallId;
+	},
+
+	/** Merge one validated part with the latest checkpoint; reader state is shared by holders. */
+	async patchReasoningTranslationPart(input: {
+		messageId: string;
+		elementId: string;
+		expected: { sourceText: string; generation: string };
+		part: ReasoningTranslationPart;
+		signal?: AbortSignal;
+	}): Promise<null | {
+		messageId: string;
+		blockId: string;
+		elementId: string;
+		blockRevision: number;
+		stateRevision: number;
+		translationGeneration: string;
+		part: ReasoningTranslationPart;
+	}> {
+		return patchReasoningPartState(input);
 	},
 
 	async patchReasoningTranslation(
@@ -4214,6 +4263,17 @@ const sqliteNarratorPersistence = {
 		overrides?: Partial<typeof narratorMessages.$inferInsert>,
 		options: {
 			preserveExecutionOwner?: boolean;
+			/** Derive a body edit from the current envelope inside the COW write transaction. */
+			mutateBody?: (
+				content: unknown,
+				tx: DbTx,
+				messageId: string,
+			) =>
+				| (Partial<typeof narratorMessages.$inferInsert> & {
+						contentJson: unknown[];
+						contentText: string | null;
+				  })
+				| null;
 			/** Writes that belong to the edit, run first in its transaction. */
 			beforeWrite?: (tx: DbTx) => void;
 			/** Writes that follow the edit once its block rows are rebuilt, in its transaction. */
@@ -4227,7 +4287,7 @@ const sqliteNarratorPersistence = {
 			),
 		});
 		if (!ref) throw new NotFoundError("Message", messageId);
-		const semanticEdit =
+		let semanticEdit =
 			overrides != null &&
 			(Object.hasOwn(overrides, "contentJson") || Object.hasOwn(overrides, "contentText"));
 		if (semanticEdit && overrides) {
@@ -4252,9 +4312,31 @@ const sqliteNarratorPersistence = {
 			return id;
 		});
 		function rewrite(tx: DbTx): string {
-			const original = readEnvelope(tx, messageId);
-			if (!original) throw new NotFoundError("Message", messageId);
+			const before = readEnvelope(tx, messageId);
+			if (!before) throw new NotFoundError("Message", messageId);
 			options.beforeWrite?.(tx);
+			const original =
+				options.mutateBody && options.beforeWrite ? readEnvelope(tx, messageId) : before;
+			if (!original) throw new NotFoundError("Message", messageId);
+			let mutationNoop = false;
+			if (options.mutateBody) {
+				// A state patch may have settled during the ref read above. Mutate the latest body,
+				// including any synchronous beforeWrite changes, never the caller's earlier snapshot.
+				const mutation = options.mutateBody(original.contentJson, tx, messageId);
+				mutationNoop = !mutation && !overrides;
+				if (mutation) {
+					overrides = {
+						...overrides,
+						...mutation,
+						contextCharsJson: measureMessageCharacters(
+							mutation.role ?? overrides?.role ?? original.role,
+							mutation.contentJson,
+							mutation.contentText,
+						),
+					};
+					semanticEdit = true;
+				}
+			}
 			// Read ref membership atomically with the rewrite, including forks made while the
 			// caller awaited context accounting. Never mutate a newly-shared row in place.
 			const recipients = tx
@@ -4267,6 +4349,7 @@ const sqliteNarratorPersistence = {
 				throw new ValidationError("Message COW exceeds the 1000-recipient limit");
 			const currentRef = recipients.find((recipient) => recipient.narratorId === narratorId);
 			if (!currentRef) throw new NotFoundError("Message", messageId);
+			if (mutationNoop) return messageId;
 			const bumpVersion = (recipientId: string, replacementId: string) => {
 				const narrator = tx.query.narrators
 					.findFirst({ where: eq(narrators.id, recipientId), columns: { forkMessageId: true } })

@@ -171,6 +171,8 @@ export type NarratorClientMessage =
 			kind?: NarratorSubscriptionKind;
 			requestId?: string;
 			version?: number;
+			/** Reader state can advance without changing the model message version. */
+			restoreState?: boolean;
 			/** `activity` only: lower narrators already streamed in full (see subscribe). */
 			downgrade?: boolean;
 	  }
@@ -771,12 +773,33 @@ export function broadcastToNarrator(narratorId: string, message: NarratorServerM
 		if (ws.data.catchingUpNarrators.has(narratorId)) {
 			const buffer = ws.data.catchUpBuffers.get(narratorId);
 			if (buffer) {
-				for (const [frame, framePayload] of frames)
-					bufferRealtimeMessage(buffer, frame, framePayload.length);
+				for (const [frame, framePayload] of frames) {
+					if (frame.type === "reasoning_translation_patch") {
+						if (buffer.overflowed) continue;
+						const bytes = Buffer.byteLength(framePayload);
+						const queued = (reasoningPatchCatchUpBytes.get(buffer) ?? 0) + bytes;
+						if ((ws.getBufferedAmount?.() ?? 0) + queued > INPUT_LANE_BACKLOG_BYTES) {
+							buffer.overflowed = true;
+							buffer.messages.length = 0;
+							buffer.bytes = 0;
+							reasoningPatchCatchUpBytes.delete(buffer);
+							continue;
+						}
+						reasoningPatchCatchUpBytes.set(buffer, queued);
+						bufferRealtimeMessage(buffer, frame, bytes);
+					} else bufferRealtimeMessage(buffer, frame, framePayload.length);
+				}
 				continue;
 			}
 		}
-		for (const [, framePayload] of frames) if (!sendPayload(ws, framePayload)) break;
+		for (const [frame, framePayload] of frames) {
+			if (
+				!(frame.type === "reasoning_translation_patch"
+					? sendReasoningTranslationPatch(ws, framePayload)
+					: sendPayload(ws, framePayload))
+			)
+				break;
+		}
 	}
 	eventBus.emit({ type: "narrator:message_broadcast", narratorId, message });
 }
@@ -796,6 +819,28 @@ function withSubscriptionRequestId<T extends Record<string, unknown>>(
 	subscriptionRequestId?: string,
 ): T & { subscriptionRequestId?: string } {
 	return subscriptionRequestId ? { ...message, subscriptionRequestId } : message;
+}
+
+const reasoningPatchCatchUpBytes = new WeakMap<CatchUpBuffer, number>();
+
+/** One completed part per bounded auxiliary frame, live or after catch-up. */
+function sendReasoningTranslationPatch(ws: NarratorWS, payload: string): boolean {
+	if (!connections.has(ws)) return false;
+	try {
+		if ((ws.getBufferedAmount?.() ?? 0) + Buffer.byteLength(payload) > INPUT_LANE_BACKLOG_BYTES) {
+			ws.close(1013, "Reasoning translation recovery required");
+			removeConnection(ws);
+			return false;
+		}
+		if (ws.send(payload) === 0) {
+			removeConnection(ws);
+			return false;
+		}
+		return true;
+	} catch {
+		removeConnection(ws);
+		return false;
+	}
 }
 
 /** Send one serialized frame; a failed send drops the connection. */
@@ -831,6 +876,8 @@ function safeSend(
 	if (inProtocol) outgoing = inProtocol(outgoing as Record<string, unknown> & { type: string });
 	if (outgoing.type === "tool_use_chunk" && outgoing.inputDocument)
 		return sendToolInputLane(ws, outgoing as unknown as ToolInputChunkMessage);
+	if (outgoing.type === "reasoning_translation_patch")
+		return sendReasoningTranslationPatch(ws, JSON.stringify(outgoing));
 	try {
 		ws.send(JSON.stringify(outgoing));
 		return true;
@@ -1950,6 +1997,14 @@ export const handleNarratorWS = {
 					sendRuntimeSnapshot(ws, allowedIds, requestId);
 				}
 				if (kind === "messages") sendStreamingSnapshot(ws, allowedIds, requestId);
+
+				// State-only translations may advance independently of the message version.
+				// Recover through the existing bounded page path rather than scanning state.
+				if (kind === "messages" && msg.restoreState === true) {
+					for (const narratorId of allowedIds)
+						safeSend(ws, withSubscriptionRequestId({ type: "full_reload", narratorId }, requestId));
+					break;
+				}
 
 				if (messageNarratorId && msg.version != null) {
 					// The version belongs to the REST snapshot used by THIS subscription,

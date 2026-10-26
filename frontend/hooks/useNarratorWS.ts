@@ -7,6 +7,10 @@ import {
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
 import type { TextDocumentStreamUpdate } from "@shared/pretext-layout/text-document";
 import { coerceProgressSnapshot, type ProgressSnapshot } from "@shared/progress-phase";
+import {
+	type ReasoningTranslationPatch,
+	readReasoningTranslationPatch,
+} from "@shared/reasoning-translation";
 import { readStreamingEditOrigin, type StreamingEditOrigin } from "@shared/streaming-edit-origin";
 import {
 	normalizeSubagentToolInputSummary,
@@ -387,6 +391,7 @@ export function coercePermissionRoutingFields(
 }
 
 export interface NarratorWSCallbacks {
+	onReasoningTranslationPatch?: (patch: ReasoningTranslationPatch) => void;
 	onMessage?: (data: { message?: TreeMessage; [key: string]: unknown }) => void;
 	onUserMessage?: (data: { message?: TreeMessage; [key: string]: unknown }) => void;
 	onStreamEvent?: (data: { event?: Record<string, unknown>; [key: string]: unknown }) => void;
@@ -1004,6 +1009,11 @@ export function useNarratorWS(
 				// Guard: discard messages targeting a different narrator
 				if (data.narratorId && data.narratorId !== subscribedId) return;
 				switch (data.type) {
+					case "reasoning_translation_patch": {
+						const patch = readReasoningTranslationPatch(data);
+						if (patch) callbackOwner.callbacks.onReasoningTranslationPatch?.(patch);
+						break;
+					}
 					case "message":
 						callbackOwner.callbacks.onMessage?.(
 							data as { message?: TreeMessage; [key: string]: unknown },

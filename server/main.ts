@@ -84,6 +84,7 @@ import {
 	activatePostgresRuntimeQueue,
 	composePostgresStores,
 } from "./services/postgres-composition";
+import { stopReasoningTranslations } from "./services/reasoning-translation-scheduler";
 import { ensureAllRecentTabsMigrated } from "./services/recent-tabs-service";
 
 // Parse --wsl=true|false CLI flag (default: false — WSL disallowed)
@@ -1907,6 +1908,7 @@ async function performGracefulShutdown(
 
 		getCodexManager().stopUsageRefreshScheduler();
 		stopScheduledTaskScheduler();
+		await shutdownStep(tracker, "reasoningTranslations.stop", stopReasoningTranslations);
 		await shutdownStep(tracker, "notificationFanout.stop", stopNotificationFanout);
 		await shutdownStep(tracker, "notificationMaintenance.stop", stopNotificationCenterMaintenance);
 		await shutdownStep(tracker, "terminalService.shutdownAll", () => terminalService.shutdownAll());

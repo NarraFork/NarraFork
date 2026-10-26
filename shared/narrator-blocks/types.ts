@@ -16,6 +16,7 @@
 import type { TextCitation } from "../citations";
 import type { FileReference } from "../file-reference";
 import type { MessageOrigin } from "../message-origin";
+import type { ReasoningTranslationFields } from "../reasoning-translation";
 
 /** Who wrote a block and how it came to be (§3.3). */
 export type BlockKind = "input" | "output" | "reasoning" | "tool" | "context";
@@ -173,6 +174,7 @@ export interface OutputBlock extends BlockBase {
 
 export interface ReasoningBlock extends BlockBase {
 	kind: "reasoning";
+	state?: Record<string, unknown> & ReasoningTranslationFields;
 	payload: ReasoningPayload;
 	providerMeta?: ProviderMeta;
 }

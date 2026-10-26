@@ -236,6 +236,8 @@ export interface ParsedStreamEvent {
 		phase: "start" | "checkpoint" | "complete";
 		blockId?: string;
 		outputIndex?: number;
+		/** Native summary seal; ordinary checkpoints carry no translation boundary. */
+		summaryPart?: import("../reasoning-translation").ReasoningSummaryPartBoundary;
 	};
 	/** Provider-native content block index for the text block (e.g. Anthropic SSE event.index). */
 	textOutputIndex?: number;

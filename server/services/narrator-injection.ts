@@ -282,7 +282,6 @@ async function deliverInjectionUnlocked(
 	// blank card for the reader plus a wasted turn for the model.
 	if (!content) return EMPTY_RESULT;
 
-	const locale = options.locale ?? "en";
 	const existingRole = options.messageId
 		? db
 				.select({ role: narratorMessages.role })
@@ -393,7 +392,7 @@ async function deliverInjectionUnlocked(
 		// subagent, and what may start one" in a module that reaches the session layer only
 		// through a lazy import — and would leave the route-level caller of the same
 		// scheduler entry unprotected.
-		result.started = await wakeIfIdle(narratorId, locale, options.executionPrincipal);
+		result.started = await wakeIfIdle(narratorId, options.locale, options.executionPrincipal);
 	}
 
 	return result;
@@ -420,7 +419,7 @@ export interface InjectionScheduler {
 	requestSoftStop: (narratorId: string) => boolean;
 	wakeIfIdle: (
 		narratorId: string,
-		locale: Locale,
+		locale?: Locale,
 		executionPrincipal?: QuestionExecutionPrincipal,
 	) => Promise<{ started: boolean }>;
 }
@@ -490,7 +489,7 @@ async function requestSoftStop(narratorId: string): Promise<boolean> {
  */
 async function wakeIfIdle(
 	narratorId: string,
-	locale: Locale,
+	locale?: Locale,
 	executionPrincipal?: QuestionExecutionPrincipal,
 ): Promise<boolean> {
 	try {

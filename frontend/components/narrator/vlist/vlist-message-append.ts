@@ -27,7 +27,9 @@
  * Pure: no React, no DOM, no network.
  */
 
+import type { BaseContentBlock } from "@frontend/lib/api/types";
 import {
+	blockAtIndex,
 	type MessageBodySource,
 	type MessageWithBody,
 	mapRowElements,
@@ -37,11 +39,13 @@ import {
 import { mergeToolRecordWithSubagentActivity } from "../message/message-tree-utils";
 import { endOfNestedRows, isNestedRow } from "../message/nested-rows";
 import { contentBlockIdentity } from "../streaming/streaming-block-supersede";
+import { preserveReasoningTranslationElement } from "./vlist-live-patch";
 
 /** The subset of a message this module reads. */
 export interface AppendCandidate extends MessageBodySource {
 	id?: unknown;
 	seq?: unknown;
+	stateRevision?: number;
 	role?: unknown;
 	parentToolUseId?: unknown;
 	parentMessageId?: unknown;
@@ -202,7 +206,16 @@ export function upsertLoadedMessage<T extends AppendCandidate>(
 					return [[candidate.id, block] as const];
 				}),
 			);
-			incoming = mapRowElements(asRow(message), (block) => {
+			const translationElements = new Map(
+				previous.blocks?.flatMap((held) =>
+					held.elements.flatMap((value) => {
+						const element = value as BaseContentBlock;
+						return element?.id ? [[JSON.stringify([held.id, element.id]), element] as const] : [];
+					}),
+				) ?? [],
+			);
+			const previousBlocks = new Map(previous.blocks?.map((block) => [block.id, block]));
+			incoming = mapRowElements(asRow(message), (block, index) => {
 				const identity = block && typeof block === "object" ? contentBlockIdentity(block) : null;
 				const existing = identity ? revisions.get(identity.id) : undefined;
 				if (existing && identity && existing.revision > identity.revision) return existing.block;
@@ -216,8 +229,37 @@ export function upsertLoadedMessage<T extends AppendCandidate>(
 						return mergeToolRecordWithSubagentActivity(prior, block);
 					}
 				}
-				return block;
+				const held = blockAtIndex(asRow(message), index);
+				const priorHeld = held ? previousBlocks.get(held.id) : undefined;
+				const olderSameBody =
+					!!held?.named &&
+					!!priorHeld?.named &&
+					held.revision === priorHeld.revision &&
+					typeof message.stateRevision === "number" &&
+					typeof previous.stateRevision === "number" &&
+					message.stateRevision < previous.stateRevision;
+				return preserveReasoningTranslationElement(
+					block as unknown as BaseContentBlock,
+					translationElements.get(JSON.stringify([held?.id, block.id])),
+					olderSameBody,
+				) as unknown as typeof block;
 			}) as unknown as T;
+			if (incoming.blocks) {
+				const blocks = incoming.blocks.map((block) => {
+					const prior = previousBlocks.get(block.id);
+					// A delayed checkpoint cannot roll either a reasoning body or its
+					// persistent body revision backwards after a state patch was accepted.
+					return block.kind === "reasoning" &&
+						block.named &&
+						prior?.named &&
+						prior.kind === "reasoning" &&
+						prior.revision > block.revision
+						? prior
+						: block;
+				});
+				if (blocks.some((block, index) => block !== incoming.blocks?.[index]))
+					incoming = { ...incoming, blocks } as T;
+			}
 		}
 		const previousToolCalls = new Map(
 			(Array.isArray(previous.toolCalls) ? previous.toolCalls : []).map((call) => {
@@ -241,6 +283,7 @@ export function upsertLoadedMessage<T extends AppendCandidate>(
 			// Same-block replay cannot roll an acknowledged revision backwards. Missing
 			// blocks still follow the incoming snapshot (explicit rollback/edit semantics).
 			...incoming,
+			stateRevision: Math.max(previous.stateRevision ?? 0, incoming.stateRevision ?? 0),
 			// Projection broadcasts intentionally omit aggregate tool calls; retain the
 			// already-loaded ones while still applying canonical body/state fields. Rows
 			// nested under this one stay where they are.

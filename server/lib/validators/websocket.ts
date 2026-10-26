@@ -59,6 +59,7 @@ export const narratorWsMessageSchema = z.discriminatedUnion("type", [
 			narratorIds: z.array(z.string().min(1)).max(RECENT_TABS_WS_BATCH_SIZE),
 			catchUpCursor: catchUpCursorSchema.optional(),
 			kind: z.enum(["list", "panel", "messages", "activity"]).optional(),
+			restoreState: z.boolean().optional(),
 			requestId: z.string().min(1).optional(),
 			downgrade: z.boolean().optional(),
 			// Client's last-known messageVersion for this narrator. When it matches

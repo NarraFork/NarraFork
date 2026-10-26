@@ -28,6 +28,128 @@ function decide(message: AppendCandidate, isSubagent = false) {
 	return resolveMessageAppend({ message, loaded, isSubagent });
 }
 
+describe("reasoning state on full-message upserts", () => {
+	it("keeps the persistent reasoning body revision when a delayed checkpoint is older", () => {
+		const previous = msg(
+			"m",
+			1,
+			rowWithElements({}, [
+				{ type: "reasoning", id: "e", revision: 4, text: "abcdef", translationGeneration: "g" },
+			]),
+		);
+		const incoming = msg(
+			"m",
+			1,
+			rowWithElements({}, [
+				{ type: "reasoning", id: "e", revision: 3, text: "abc", translationGeneration: "g" },
+			]),
+		);
+		if (!previous.blocks?.[0] || !incoming.blocks?.[0]) throw new Error("fixture has no block");
+		previous.blocks[0].id = "persistent";
+		previous.blocks[0].revision = 2;
+		previous.blocks[0].named = true;
+		incoming.blocks[0].id = "persistent";
+		incoming.blocks[0].revision = 1;
+		incoming.blocks[0].named = true;
+		const result = upsertLoadedMessage([previous], incoming, false);
+		expect(result.messages[0].blocks?.[0]).toBe(previous.blocks[0]);
+		expect(messageBody(result.messages[0])).toEqual(messageBody(previous));
+	});
+
+	it("keeps REST translations when an older identical persistent checkpoint omits state", () => {
+		const valid = {
+			id: "p",
+			generation: "g",
+			start: 0,
+			end: 3,
+			sourceText: "abc",
+			translatedText: "甲",
+		};
+		const element = { type: "reasoning", id: "e", revision: 2, text: "abcdef" };
+		const checkpoint = (
+			stateRevision: number | undefined,
+			extra = {},
+			blockId = "b",
+			bodyRevision = 2,
+		) => {
+			const result = msg("m", 1, {
+				stateRevision,
+				...rowWithElements({}, [{ ...element, ...extra }]),
+			});
+			if (!result.blocks?.[0]) throw new Error("fixture has no block");
+			result.blocks[0].id = blockId;
+			result.blocks[0].revision = bodyRevision;
+			result.blocks[0].named = true;
+			return result;
+		};
+		// This state came only from REST, so no completed-part patch store can replay it.
+		const previous = checkpoint(9, {
+			translationGeneration: "g",
+			translationParts: [valid, { ...valid, id: "invalid", start: 3, end: 6, sourceText: "bad" }],
+		});
+		const late = checkpoint(4);
+		const result = upsertLoadedMessage([previous], late, false);
+		expect(messageBody(result.messages[0])[0]).toEqual({
+			...element,
+			translationGeneration: "g",
+			translationParts: [valid],
+		});
+		expect(result.messages[0].stateRevision).toBe(9);
+		expect(result.messages[0].blocks?.[0].revision).toBe(2);
+		expect(messageBody(late)[0]).toEqual(element);
+		for (const incoming of [
+			checkpoint(4, { text: "changed" }),
+			checkpoint(4, { translationGeneration: "different" }),
+			checkpoint(4, {}, "other-block"),
+			checkpoint(4, { id: "other-element" }),
+			checkpoint(4, {}, "b", 3),
+			checkpoint(9),
+			checkpoint(10),
+			checkpoint(undefined),
+		]) {
+			const unchanged = messageBody(
+				upsertLoadedMessage([previous], incoming, false).messages[0],
+			)[0];
+			expect(unchanged).not.toHaveProperty("translationParts");
+			expect(unchanged).toEqual(messageBody(incoming)[0]);
+		}
+	});
+
+	it("retains independently completed parts through a late same-body checkpoint", () => {
+		const part = {
+			id: "p",
+			generation: "g",
+			start: 0,
+			end: 3,
+			sourceText: "abc",
+			translatedText: "甲",
+		};
+		const reasoning = {
+			type: "reasoning",
+			id: "e",
+			revision: 2,
+			text: "abcdef",
+			translationGeneration: "g",
+		};
+		const previous = msg("m", 1, {
+			stateRevision: 9,
+			...rowWithElements({}, [{ ...reasoning, translationParts: [part] }]),
+		});
+		const incoming = msg("m", 1, { stateRevision: 4, ...rowWithElements({}, [reasoning]) });
+		const result = upsertLoadedMessage([previous], incoming, false);
+		expect(messageBody(result.messages[0])[0]).toEqual({ ...reasoning, translationParts: [part] });
+		expect(result.messages[0].stateRevision).toBe(9);
+		expect(messageBody(incoming)[0]).toEqual(reasoning);
+		const rewritten = msg("m", 1, {
+			stateRevision: 10,
+			...rowWithElements({}, [{ ...reasoning, revision: 3, translationGeneration: "new" }]),
+		});
+		expect(
+			messageBody(upsertLoadedMessage(result.messages, rewritten, false).messages[0])[0],
+		).toEqual({ ...reasoning, revision: 3, translationGeneration: "new" });
+	});
+});
+
 describe("resolveMessageAppend — what may extend the loaded window", () => {
 	it("appends a message newer than the loaded tail", () => {
 		expect(decide(msg("m4", 4))).toEqual({ append: true });

@@ -51,15 +51,18 @@ import { storeNarratorContextUsage } from "./narrator-context-composition";
 import { completeAssistantOutput } from "./narrator-output-recovery";
 import { bumpNarratorMessageVersion, narratorPersistence } from "./narrator-persistence";
 import type { EnterPlanModeToolResultCommit } from "./narrator-plan-mode";
-import {
-	enrichToolUseBlocks,
-	narratorService,
-	truncateJson,
-	truncateToolIO,
-} from "./narrator-service";
+import { enrichToolUseBlocks, truncateJson, truncateToolIO } from "./narrator-service";
 import { narratorStore } from "./narrator-store";
 import { recordTurnStep, recordTurnToolCall } from "./narrator-turns";
 import { recordOutputChunk } from "./output-stats";
+import {
+	type ReasoningTranslationResponse,
+	reasoningTranslationDiagnosticId,
+	reasoningTranslationDiagnosticNumber,
+	reasoningTranslationScheduler,
+	type TranslationLifecycleReason,
+	translationPrefixEnd,
+} from "./reasoning-translation-scheduler";
 import { toolInputStreamSource } from "./tool-input-stream-source";
 
 /** Maps are scoped to this consumer/session, not globally to provider tool ids. */
@@ -350,12 +353,12 @@ export interface EventHandlerContext {
 		string,
 		Extract<SnapshotStreamingBlock, { type: "text" | "reasoning" }>
 	>;
-	/** Avoid translating the same checkpoint concurrently while metadata catches up. */
-	reasoningTranslations?: Set<string>;
-	/** Latest checkpoints wait for real output; reasoning-only retries never translate. */
-	pendingReasoningTranslations?: Map<string, { messageId: string; block: PersistedReasoningBlock }>;
-	/** A reasoning block is dispatched at most once per provider attempt. */
-	dispatchedReasoningTranslations?: Set<string>;
+	/** Frozen ranges remain reserved until the response and all asynchronous tasks settle. */
+	reasoningTranslations?: ReasoningTranslationResponse;
+	/** Only successfully persisted reasoning checkpoints can be frozen. */
+	reasoningTranslationSources?: Map<string, ReasoningTranslationSource>;
+	/** Fixed-size diagnostic counters are retired at the same response boundary. */
+	reasoningTranslationDiagnostics?: ReasoningTranslationDiagnostics;
 	/** Retry publication after a checkpoint write succeeded but its announce failed. */
 	unpublishedContentBlockIds?: Set<string>;
 	getTtftMs?: () => number | undefined;
@@ -1406,217 +1409,288 @@ type PersistedReasoningBlock = {
 	providerMetadata?: import("../lib/agent/types").ReasoningProviderMetadata;
 };
 
-function getReasoningItemId(
-	metadata?: import("../lib/agent/types").ReasoningProviderMetadata,
-): string | undefined {
-	const itemId = metadata?.openai?.itemId;
-	return typeof itemId === "string" && itemId.length > 0 ? itemId : undefined;
+interface ReasoningTranslationSource {
+	messageId: string;
+	generation: string;
+	/** Bounded translation prefix, independent of the full model payload. */
+	text: string;
+	revision?: number;
+	outputIndex?: number;
 }
 
-function findReasoningBlockIndex(
-	blocks: unknown[],
-	locator: {
-		id?: string;
-		reasoningText: string;
-		providerMetadata?: import("../lib/agent/types").ReasoningProviderMetadata;
-		outputIndex?: number;
-	},
-): number {
-	if (locator.id) {
-		// An attempt-scoped ID must never fall back to text/outputIndex and attach
-		// an old translation to a different block after a retry.
-		return blocks.findIndex((block) => {
-			const candidate = block as PersistedReasoningBlock;
-			return candidate?.type === "reasoning" && candidate.id === locator.id;
+const REASONING_TRANSLATION_SOURCE_LIMIT = 96;
+interface ReasoningTranslationDiagnostics {
+	id: string;
+	emitted: number;
+	suppressed: number;
+	counts: Map<string, number>;
+	captureCalls: number;
+	scheduleCalls: number;
+	freezeCalls: number;
+}
+interface ReasoningTranslationDiagnosticDetails {
+	messageId?: string;
+	elementId?: string;
+	elementPresent?: boolean;
+	previous?: boolean;
+	stale?: boolean;
+	accepted?: boolean;
+	boundaryPresent?: boolean;
+	messageMatches?: number;
+	boundaryMatches?: number;
+	textMatches?: number;
+	freezeCalls?: number;
+}
+
+/** No payloads or storage reads: 24 details, two per phase/reason/trigger, plus one summary. */
+function observeReasoningTranslation(
+	ctx: EventHandlerContext,
+	phase: "capture" | "schedule" | "response",
+	reason:
+		| "captured"
+		| "disabled"
+		| "missing_element"
+		| "stale"
+		| "source_limit"
+		| "english"
+		| "no_sources"
+		| "no_message"
+		| "scan"
+		| TranslationLifecycleReason,
+	trigger: "capture" | "tool" | "summary" | "final" | "lifecycle",
+	details: ReasoningTranslationDiagnosticDetails = {},
+): void {
+	try {
+		if (phase === "response" && !ctx.reasoningTranslationDiagnostics) return;
+		ctx.reasoningTranslationDiagnostics ??= {
+			id: randomUUID(),
+			emitted: 0,
+			suppressed: 0,
+			counts: new Map(),
+			captureCalls: 0,
+			scheduleCalls: 0,
+			freezeCalls: 0,
+		};
+		const diagnostics = ctx.reasoningTranslationDiagnostics;
+		if (phase === "capture")
+			diagnostics.captureCalls = reasoningTranslationDiagnosticNumber(diagnostics.captureCalls + 1);
+		if (phase === "schedule")
+			diagnostics.scheduleCalls = reasoningTranslationDiagnosticNumber(
+				diagnostics.scheduleCalls + 1,
+			);
+		diagnostics.freezeCalls = reasoningTranslationDiagnosticNumber(
+			diagnostics.freezeCalls + (details.freezeCalls ?? 0),
+		);
+		if (phase !== "response") {
+			const key = `${phase}:${reason}:${trigger}`;
+			const count = diagnostics.counts.get(key) ?? 0;
+			if (diagnostics.emitted >= 24 || count >= 2) {
+				diagnostics.suppressed = reasoningTranslationDiagnosticNumber(diagnostics.suppressed + 1);
+				return;
+			}
+			diagnostics.counts.set(key, count + 1);
+			diagnostics.emitted++;
+		}
+		const locale = ctx.locale || "en";
+		const queue = reasoningTranslationScheduler.stats();
+		const data: Record<string, unknown> = {
+			diagnosticId: diagnostics.id,
+			narratorId: reasoningTranslationDiagnosticId(ctx.narratorId),
+			responseId: reasoningTranslationDiagnosticId(ctx.reasoningTranslations?.id),
+			messageId: reasoningTranslationDiagnosticId(details.messageId),
+			elementId: reasoningTranslationDiagnosticId(details.elementId),
+			phase,
+			reason,
+			trigger,
+			enabled: Boolean(settings.agent.translateReasoning),
+			locale: Object.hasOwn(LOCALE_NAMES, locale) ? locale : "other",
+			localeDefaulted: !ctx.locale,
+			sourceCount: reasoningTranslationDiagnosticNumber(ctx.reasoningTranslationSources?.size ?? 0),
+			sourceLimit: REASONING_TRANSLATION_SOURCE_LIMIT,
+			pending: reasoningTranslationDiagnosticNumber(ctx.reasoningTranslations?.pending ?? 0),
+			active: reasoningTranslationDiagnosticNumber(queue.active),
+			queued: reasoningTranslationDiagnosticNumber(queue.queued),
+			captureCalls: diagnostics.captureCalls,
+			scheduleCalls: diagnostics.scheduleCalls,
+			totalFreezeCalls: diagnostics.freezeCalls,
+			suppressed: diagnostics.suppressed,
+		};
+		for (const key of [
+			"elementPresent",
+			"previous",
+			"stale",
+			"accepted",
+			"boundaryPresent",
+		] as const) {
+			if (details[key] != null) data[key] = Boolean(details[key]);
+		}
+		for (const key of [
+			"messageMatches",
+			"boundaryMatches",
+			"textMatches",
+			"freezeCalls",
+		] as const) {
+			const value = details[key];
+			if (value != null) data[key] = reasoningTranslationDiagnosticNumber(value);
+		}
+		logger.info("Reasoning translation scheduling", data);
+	} catch {
+		// Diagnostic failures cannot turn a checkpoint or a scheduling no-op into a failure.
+	}
+}
+
+const translationResponses = new WeakMap<EventHandlerContext, Set<ReasoningTranslationResponse>>();
+
+function settleReasoningTranslations(
+	ctx: EventHandlerContext,
+	cancel = false,
+	reason: TranslationLifecycleReason = "done",
+): void {
+	observeReasoningTranslation(ctx, "response", reason, "lifecycle");
+	ctx.reasoningTranslationDiagnostics = undefined;
+	if (cancel) {
+		for (const response of translationResponses.get(ctx) ?? [])
+			reasoningTranslationScheduler.cancel(response, reason);
+		translationResponses.delete(ctx);
+		ctx.reasoningTranslations = undefined;
+		ctx.reasoningTranslationSources = undefined;
+	} else if (ctx.reasoningTranslations) {
+		reasoningTranslationScheduler.settle(ctx.reasoningTranslations, reason);
+	}
+}
+
+/** Models run independently of the foreground loop, including during Await tools. */
+function scheduleReasoningTranslations(
+	ctx: EventHandlerContext,
+	messageId: string,
+	reason: "tool" | "summary" | "final",
+	boundary?: { elementId: string; start: number; end: number; sourceText: string },
+): void {
+	const sources = ctx.reasoningTranslationSources;
+	const exitReason = !settings.agent.translateReasoning
+		? "disabled"
+		: (ctx.locale || "en") === "en"
+			? "english"
+			: !sources?.size
+				? "no_sources"
+				: undefined;
+	if (exitReason) {
+		observeReasoningTranslation(ctx, "schedule", exitReason, reason, {
+			messageId,
+			boundaryPresent: Boolean(boundary),
+		});
+		return;
+	}
+	// The gate above preserves the same source-map requirement as the translation path.
+	if (!sources) return;
+	if (!ctx.reasoningTranslations || ctx.reasoningTranslations.settled) {
+		const langName = LOCALE_NAMES[ctx.locale || "en"] || ctx.locale;
+		const response = reasoningTranslationScheduler.create({
+			sessionId: ctx.narratorId,
+			translate: async (task, signal, onDelta) => {
+				const result = await summaryGenerate(
+					task.sourceText,
+					`You are a translator. Translate the following AI reasoning/thinking content into ${langName}. Preserve the original meaning, technical terms, and markdown formatting. Output ONLY the translation, no explanations.`,
+					{ narratorId: ctx.narratorId, userId: ctx.userId ?? null, kind: "reasoning_translation" },
+					signal,
+					onDelta,
+					resolveTranslationModelOverride(),
+					16_384,
+					false,
+				);
+				return result.text ?? "";
+			},
+			apply: async (task, part, signal) => {
+				const live = () => {
+					const source = sources.get(task.elementId);
+					return (
+						!signal.aborted &&
+						!response.cancelled &&
+						source?.messageId === task.messageId &&
+						source.generation === task.generation &&
+						source.text.slice(task.start, task.end) === task.sourceText
+					);
+				};
+				if (!live()) return false;
+				const source = sources.get(task.elementId) as ReasoningTranslationSource;
+				const patched = await narratorPersistence.patchReasoningTranslationPart({
+					messageId: task.messageId,
+					elementId: task.elementId,
+					expected: { sourceText: source.text.slice(0, task.end), generation: task.generation },
+					part,
+					signal,
+				});
+				if (!patched || !live()) return false;
+				dualBroadcast(ctx, {
+					type: "reasoning_translation_patch",
+					narratorId: ctx.broadcastTargetId,
+					ownerNarratorId: ctx.narratorId,
+					...patched,
+					...(ctx.parentToolUseId
+						? {
+								parentToolUseId: ctx.parentToolUseId,
+								subagentNarratorId: ctx.narratorId,
+							}
+						: {}),
+				});
+				return true;
+			},
+			observe: (observation) =>
+				logger.info("Reasoning translation task", {
+					responseId: response.id,
+					narratorId: reasoningTranslationDiagnosticId(ctx.narratorId),
+					...observation,
+				}),
+			onIdle: () => {
+				translationResponses.get(ctx)?.delete(response);
+				if (ctx.reasoningTranslations === response) ctx.reasoningTranslations = undefined;
+			},
+		});
+		let responses = translationResponses.get(ctx);
+		if (!responses) {
+			responses = new Set();
+			translationResponses.set(ctx, responses);
+		}
+		responses.add(response);
+		ctx.reasoningTranslations = response;
+	}
+	const response = ctx.reasoningTranslations;
+	let messageMatches = 0;
+	let boundaryMatches = 0;
+	let textMatches = 0;
+	let freezeCalls = 0;
+	for (const [elementId, source] of sources) {
+		if (source.messageId !== messageId) continue;
+		messageMatches++;
+		if (boundary && boundary.elementId !== elementId) continue;
+		boundaryMatches++;
+		if (boundary && source.text.slice(boundary.start, boundary.end) !== boundary.sourceText)
+			continue;
+		textMatches++;
+		freezeCalls++;
+		reasoningTranslationScheduler.freeze(response, {
+			elementId,
+			messageId,
+			generation: source.generation,
+			text: source.text,
+			end: boundary?.end,
+			reason,
 		});
 	}
-	const targetItemId = getReasoningItemId(locator.providerMetadata);
-	if (targetItemId) {
-		for (let i = blocks.length - 1; i >= 0; i--) {
-			const block = blocks[i] as PersistedReasoningBlock;
-			if (
-				block.type === "reasoning" &&
-				getReasoningItemId(block.providerMetadata) === targetItemId
-			) {
-				return i;
-			}
-		}
-	}
-
-	if (locator.outputIndex != null) {
-		for (let i = blocks.length - 1; i >= 0; i--) {
-			const block = blocks[i] as PersistedReasoningBlock;
-			if (block.type === "reasoning" && block.outputIndex === locator.outputIndex) {
-				return i;
-			}
-		}
-	}
-
-	for (let i = blocks.length - 1; i >= 0; i--) {
-		const block = blocks[i] as PersistedReasoningBlock;
-		if (block.type === "reasoning" && block.text === locator.reasoningText) {
-			return i;
-		}
-	}
-
-	return -1;
+	observeReasoningTranslation(ctx, "schedule", "scan", reason, {
+		messageId,
+		boundaryPresent: Boolean(boundary),
+		messageMatches,
+		boundaryMatches,
+		textMatches,
+		freezeCalls,
+	});
 }
 
-/**
- * Whether a resolved reasoning index still points at the block that was translated.
- *
- * Translation is fire-and-forget and settles long after the request that produced
- * the block, so in between the attempt can be discarded and replayed
- * (`attempt_discarded` truncates the blocks that attempt persisted). Neither
- * locator key is attempt-scoped: `outputIndex` in particular is reproduced by the
- * replay, so the index can resolve to the NEW attempt's reasoning — a different
- * thought wearing the same coordinates.
- *
- * The text is the discriminator: `appendBlockToMessage` stores it verbatim and
- * `patchReasoningTranslation` only ever adds `translatedText`, so an exact match
- * means the target is still the same block.
- */
+/** Source comparison retained for adapters that validate a reasoning checkpoint. */
 export function isSameReasoningBlock(block: unknown, reasoningText: string): boolean {
 	const candidate = block as PersistedReasoningBlock | undefined;
 	return candidate?.type === "reasoning" && candidate.text === reasoningText;
-}
-
-/**
- * Translate a reasoning block's text via `agent.translationModel`, then patch
- * the message in DB and broadcast the updated message to connected clients.
- * Runs as fire-and-forget — errors are logged but never propagate.
- *
- * The model comes from `resolveTranslationModelOverride()`, which returns
- * `undefined` while the setting follows the summary model. That is the only
- * reason translation ever runs on the summary model: it must be the *fallback*,
- * not the hardcoded target. Passing no override at all — as this did before —
- * makes the user's translation-model setting silently inert.
- *
- * `reportSummaryModelErrors` is false because a failure here belongs to the
- * translation model, and the summary-model picker modal it would otherwise open
- * saves to `agent.summaryModel` — pointing the user at the wrong setting and
- * changing a model that was working.
- */
-function translateReasoningBlock(
-	messageId: string,
-	narratorId: string,
-	broadcastTargetId: string,
-	reasoningText: string,
-	ctx: EventHandlerContext,
-	locator?: {
-		id?: string;
-		providerMetadata?: import("../lib/agent/types").ReasoningProviderMetadata;
-		outputIndex?: number;
-	},
-): void {
-	const locale = ctx.locale || "en";
-	// Skip translation for English content when locale is English
-	if (locale === "en") return;
-
-	const langName = LOCALE_NAMES[locale] || locale;
-	const translationKey = JSON.stringify([
-		messageId,
-		locator?.id,
-		locator?.outputIndex,
-		reasoningText,
-	]);
-	ctx.reasoningTranslations ??= new Set();
-	if (ctx.reasoningTranslations.has(translationKey)) return;
-	ctx.reasoningTranslations.add(translationKey);
-
-	(async () => {
-		try {
-			const before = fillBody(
-				await db.query.narratorMessages.findFirst({
-					where: eq(narratorMessages.id, messageId),
-					...bodyColumns({ id: true, contentJson: true }),
-				}),
-			);
-			const beforeBlocks = Array.isArray(before?.contentJson) ? before.contentJson : [];
-			const beforeIndex = findReasoningBlockIndex(beforeBlocks, { ...locator, reasoningText });
-			const beforeBlock = beforeBlocks[beforeIndex] as PersistedReasoningBlock | undefined;
-			if (!isSameReasoningBlock(beforeBlock, reasoningText) || beforeBlock?.translatedText) return;
-			const result = await summaryGenerate(
-				reasoningText,
-				`You are a translator. Translate the following AI reasoning/thinking content into ${langName}. Preserve the original meaning, technical terms, and markdown formatting. Output ONLY the translation, no explanations.`,
-				{ narratorId, userId: ctx.userId ?? null, kind: "reasoning_translation" },
-				undefined,
-				undefined,
-				resolveTranslationModelOverride(),
-				undefined,
-				false,
-			);
-			const translated = result.text?.trim();
-			if (!translated) return;
-
-			// Find the exact reasoning block in the message.
-			// Prefer loop identity; provider coordinates/text are legacy-only fallbacks.
-			const msg = fillBody(
-				await db.query.narratorMessages.findFirst({
-					where: eq(narratorMessages.id, messageId),
-					...bodyColumns({ id: true, contentJson: true }),
-				}),
-			);
-			if (!msg) return;
-			const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
-			const targetIdx = findReasoningBlockIndex(blocks, {
-				id: locator?.id,
-				reasoningText,
-				providerMetadata: locator?.providerMetadata,
-				outputIndex: locator?.outputIndex,
-			});
-			if (targetIdx === -1) return;
-			// The resolved block must still BE the one that was translated: a discarded
-			// and replayed attempt can put different reasoning at the same coordinates.
-			// See isSameReasoningBlock.
-			if (!isSameReasoningBlock(blocks[targetIdx], reasoningText)) return;
-
-			const patched = await narratorService.patchReasoningTranslation(
-				messageId,
-				targetIdx,
-				translated,
-				{
-					id: locator?.id,
-					text: reasoningText,
-				},
-			);
-			if (!patched) return;
-
-			// Broadcast updated message so frontend picks up the translation
-			const fullMessage = fillBody(
-				await db.query.narratorMessages.findFirst({
-					...bodyColumns(),
-					where: eq(narratorMessages.id, messageId),
-					with: { toolCalls: true },
-				}),
-			);
-			if (fullMessage) {
-				const ref = await db.query.narratorMessageRefs.findFirst({
-					where: and(
-						eq(narratorMessageRefs.narratorId, narratorId),
-						eq(narratorMessageRefs.messageId, messageId),
-					),
-					columns: { seq: true },
-				});
-				const processed = enrichToolUseBlocks(
-					truncateToolIO([{ ...fullMessage, seq: ref?.seq }]),
-				)[0];
-				dualBroadcast(ctx, {
-					type: "message",
-					narratorId: broadcastTargetId,
-					message: processed,
-				});
-			}
-		} catch (err) {
-			logger.warn("Reasoning translation failed", {
-				narratorId,
-				messageId,
-				error: String(err),
-			});
-		} finally {
-			ctx.reasoningTranslations?.delete(translationKey);
-		}
-	})();
 }
 
 // === Unified event processor ===
@@ -1633,33 +1707,6 @@ export async function processEvent(
 	hooks?: EventHooks,
 ): Promise<{ titleUpdate?: boolean } | null> {
 	const { narratorId, broadcastTargetId } = ctx;
-
-	if (
-		event.type === "attempt_discarded" ||
-		event.type === "stream_reset" ||
-		event.type === "api_request_start"
-	) {
-		ctx.pendingReasoningTranslations?.clear();
-		ctx.dispatchedReasoningTranslations?.clear();
-	} else if (
-		(event.type === "stream_text" && event.text.trim().length > 0) ||
-		event.type === "tool_call" ||
-		event.type === "tool_use_chunk" ||
-		(event.type === "block_complete" &&
-			((event.block.type === "text" && event.block.text.trim().length > 0) ||
-				event.block.type === "tool_use"))
-	) {
-		// Drain synchronously before starting asynchronous translations. Further tokens,
-		// tool argument chunks and completion events must not dispatch the same block.
-		ctx.dispatchedReasoningTranslations ??= new Set();
-		for (const [key, { messageId, block }] of ctx.pendingReasoningTranslations ?? []) {
-			ctx.dispatchedReasoningTranslations.add(key);
-			if (settings.agent.translateReasoning && block.text) {
-				translateReasoningBlock(messageId, narratorId, broadcastTargetId, block.text, ctx, block);
-			}
-		}
-		ctx.pendingReasoningTranslations?.clear();
-	}
 
 	switch (event.type) {
 		case "stream_text": {
@@ -2076,6 +2123,15 @@ export async function processEvent(
 				});
 				retireCompletedSnapshot();
 			} else if (block.type === "reasoning") {
+				const previous = block.id ? ctx.reasoningTranslationSources?.get(block.id) : undefined;
+				const stale =
+					previous?.revision != null &&
+					block.revision != null &&
+					block.revision < previous.revision;
+				const generation =
+					stale || (previous?.messageId === partialId && block.text.startsWith(previous.text))
+						? (previous as ReasoningTranslationSource).generation
+						: randomUUID();
 				await persistContentCheckpoint(ctx, partialId, {
 					type: "reasoning",
 					text: block.text,
@@ -2085,23 +2141,49 @@ export async function processEvent(
 					...(block.completed != null ? { completed: block.completed } : {}),
 					providerMetadata: block.providerMetadata,
 					outputIndex: block.outputIndex,
+					translationGeneration: generation,
 				});
 				retireCompletedSnapshot();
-				// Summary segments share a block ID and can repeatedly checkpoint a growing
-				// prefix. Only retain the latest version until real output begins.
-				if (settings.agent.translateReasoning && block.text) {
-					const key = JSON.stringify([
-						partialId,
-						block.id ??
-							getReasoningItemId(block.providerMetadata) ??
-							block.outputIndex ??
-							block.text,
-					]);
-					if (!ctx.dispatchedReasoningTranslations?.has(key)) {
-						ctx.pendingReasoningTranslations ??= new Map();
-						ctx.pendingReasoningTranslations.set(key, { messageId: partialId, block });
+				let captured = false;
+				if (settings.agent.translateReasoning && block.id && !stale) {
+					ctx.reasoningTranslationSources ??= new Map();
+					if (
+						previous ||
+						ctx.reasoningTranslationSources.size < REASONING_TRANSLATION_SOURCE_LIMIT
+					) {
+						const end = translationPrefixEnd(block.text, 0, block.text.length, 256 * 1024);
+						ctx.reasoningTranslationSources.set(block.id, {
+							messageId: partialId,
+							generation,
+							text: block.text.slice(0, end),
+							revision: block.revision,
+							outputIndex: block.outputIndex,
+						});
+						captured = true;
 					}
 				}
+				observeReasoningTranslation(
+					ctx,
+					"capture",
+					!settings.agent.translateReasoning
+						? "disabled"
+						: !block.id
+							? "missing_element"
+							: stale
+								? "stale"
+								: captured
+									? "captured"
+									: "source_limit",
+					"capture",
+					{
+						messageId: partialId,
+						elementId: block.id,
+						elementPresent: Boolean(block.id),
+						previous: Boolean(previous),
+						stale,
+						accepted: captured,
+					},
+				);
 			} else if (block.type === "redacted_thinking") {
 				await writeAttemptItem(ctx, partialId, {
 					type: "redacted_thinking",
@@ -2144,6 +2226,8 @@ export async function processEvent(
 					await hooks.onPrepareEnterPlanMode(toolCallId, block.toolUseId, block.input);
 				}
 				event.onToolPersisted?.(binding);
+				// Freeze only after a durable, fully bound call; argument deltas are not boundaries.
+				scheduleReasoningTranslations(ctx, partialId, "tool");
 				recordTurnToolCall(narratorId);
 				if (block.name === "Write" && typeof block.input.content === "string") {
 					await handoffWriteInput(ctx, block.toolUseId, block.input.content, partialId, binding);
@@ -2235,6 +2319,22 @@ export async function processEvent(
 					cleanupPartialImageGenerationArtifacts(ctx, block.id);
 				}
 			}
+			return null;
+		}
+
+		case "reasoning_summary_sealed": {
+			const messageId = ctx.getPartialMessageId();
+			if (messageId)
+				scheduleReasoningTranslations(ctx, messageId, "summary", {
+					elementId: event.blockId,
+					start: event.start,
+					end: event.end,
+					sourceText: event.sourceText,
+				});
+			else
+				observeReasoningTranslation(ctx, "schedule", "no_message", "summary", {
+					boundaryPresent: true,
+				});
 			return null;
 		}
 
@@ -2482,6 +2582,15 @@ export async function processEvent(
 
 			const savedMsg = fullMessage ?? { id: savedId };
 			ctx.sseEmitter?.emit("event", { type: "assistant_message", data: savedMsg });
+
+			if (event.outputCompleted !== false) scheduleReasoningTranslations(ctx, savedId, "final");
+			settleReasoningTranslations(
+				ctx,
+				event.outputCompleted === false,
+				event.outputCompleted === false ? "output_incomplete" : "final",
+			);
+			// Settled responses retain their own bounded source map until all jobs finish.
+			ctx.reasoningTranslationSources = undefined;
 
 			// Effects deferred until the response is persisted whole (plan approval restart).
 			if (hooks?.onAssistantMessageFinalized) {
@@ -2865,6 +2974,7 @@ export async function processEvent(
 		}
 
 		case "error": {
+			settleReasoningTranslations(ctx, true, "error");
 			// Snapshot: clear streaming state on error
 			clearAuthorStreamingSnapshot(ctx);
 			ctx.fileReferenceContexts?.clear();
@@ -2932,6 +3042,7 @@ export async function processEvent(
 		}
 
 		case "stream_reset": {
+			settleReasoningTranslations(ctx, true, "stream_reset");
 			await discardInputSources(ctx);
 			// A reasoning-only dead turn was discarded. Clear the streaming snapshot
 			// (which still holds the live reasoning that will not be persisted) and
@@ -3460,6 +3571,7 @@ export async function processEvent(
 		}
 
 		case "attempt_discarded": {
+			settleReasoningTranslations(ctx, true, "attempt_discarded");
 			if (inputSourceContexts.get(ctx)?.attempt === event.requestId) await discardInputSources(ctx);
 			// The loop is about to replay the identical request. Everything this attempt
 			// persisted must go: blocks are written as they complete, so leaving them
@@ -3603,6 +3715,10 @@ export async function processEvent(
 			}
 			return null;
 		}
+
+		case "done":
+			settleReasoningTranslations(ctx);
+			return null;
 
 		default:
 			return null;

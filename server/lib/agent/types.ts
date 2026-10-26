@@ -535,6 +535,18 @@ export type AgentEvent =
 			/** Called only after the current message's real tool row is durable. */
 			onToolPersisted?: (binding: ToolCallBinding) => void;
 	  }
+	| {
+			/** Scheduling hint after the corresponding checkpoint was acknowledged. */
+			type: "reasoning_summary_sealed";
+			blockId: string;
+			blockRevision: number;
+			outputIndex?: number;
+			nativePartId: string;
+			nativePartIndex: number;
+			start: number;
+			end: number;
+			sourceText: string;
+	  }
 	| { type: "turn_complete"; turnIndex: number }
 	| { type: "max_turns_exceeded"; maxTurns: number }
 	| { type: "stream_reset" }
@@ -839,6 +851,8 @@ export type ContentBlock =
 			type: "reasoning";
 			text: string;
 			translatedText?: string;
+			translationGeneration?: string;
+			translationParts?: import("@shared/reasoning-translation").ReasoningTranslationPart[];
 			providerMetadata?: ReasoningProviderMetadata;
 			outputIndex?: number;
 			id?: string;

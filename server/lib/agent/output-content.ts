@@ -1,4 +1,8 @@
 import type { ProviderTextCitation, ReasoningProviderMetadata } from "@shared/agent-protocol/types";
+import {
+	isReasoningTranslationBoundary,
+	type ReasoningSummaryPartBoundary,
+} from "@shared/reasoning-translation";
 import { generateId } from "../id";
 import { finalizeAssistantTextWithCitations } from "./citation-stream";
 import type { AgentEvent, ContentBlock } from "./types";
@@ -24,6 +28,7 @@ interface Lane {
 	revision: number;
 	publishedRevision: number;
 	completed: boolean;
+	sealedSummaryParts: Set<string>;
 }
 
 function mergeMetadata(
@@ -116,6 +121,7 @@ export class OutputContentAccumulator {
 				revision: 0,
 				publishedRevision: 0,
 				completed: false,
+				sealedSummaryParts: new Set(),
 			};
 			this.lanes.push(lane);
 		}
@@ -278,6 +284,39 @@ export class OutputContentAccumulator {
 			if (this.active === lane) this.active = undefined;
 			if (this.anonymous.get(event.kind) === lane) this.anonymous.delete(event.kind);
 		}
+	}
+
+	/** A durable summary range does not complete the native reasoning item. */
+	*sealSummaryPart(
+		part: ReasoningSummaryPartBoundary,
+		hint: ContentLane = {},
+	): Generator<AgentEvent> {
+		const lane = this.resolve("reasoning", hint, true);
+		if (
+			lane.sealedSummaryParts.has(part.id) ||
+			!part.id ||
+			!Number.isSafeInteger(part.index) ||
+			part.index < 0 ||
+			part.start >= part.end ||
+			!isReasoningTranslationBoundary(lane.text, part.start) ||
+			!isReasoningTranslationBoundary(lane.text, part.end)
+		)
+			return;
+		// The consumer acknowledges the checkpoint before this generator resumes.
+		yield* this.publish(lane);
+		if (!lane.publishedRevision) return;
+		lane.sealedSummaryParts.add(part.id);
+		yield {
+			type: "reasoning_summary_sealed",
+			blockId: lane.id,
+			blockRevision: lane.publishedRevision,
+			outputIndex: lane.nativeIndex ?? lane.order,
+			nativePartId: part.id,
+			nativePartIndex: part.index,
+			start: part.start,
+			end: part.end,
+			sourceText: lane.text.slice(part.start, part.end),
+		};
 	}
 
 	/** Checkpoint before even the first tool UI chunk, not merely before execution. */

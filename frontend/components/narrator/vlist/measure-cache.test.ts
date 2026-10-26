@@ -18,6 +18,19 @@ beforeAll(() => {
 	installCanvasStub();
 });
 
+describe("reasoning translation cache keys", () => {
+	it("invalidates equal-length translated edits while keeping the source and body version fixed", async () => {
+		const { extractDataRevision } = await import("./measure-cache");
+		const source = { text: "source", translatedText: "甲译文", isStreaming: false };
+		expect(extractDataRevision(source)).not.toBe(
+			extractDataRevision({ ...source, translatedText: "乙译文" }),
+		);
+		expect(extractDataRevision({ ...source, translationRevision: "g:p1" })).not.toBe(
+			extractDataRevision({ ...source, translationRevision: "g:p2" }),
+		);
+	});
+});
+
 describe("text preview cache keys", () => {
 	it("budgets the full preview source and nested trace bodies, not visible geometry", async () => {
 		const { retainedBodySourceChars, MeasureCache } = await import("./measure-cache");

@@ -79,7 +79,12 @@ import {
 import { normalizeLegacyPlanPreviousPermissionMode } from "../lib/permission-modes";
 import { resolveExistingPlanFileRelPath } from "../lib/plan-file-path";
 import { getHome } from "../lib/platform";
-import { getBlockedTaskActionInstruction, getToolMessage, type Locale } from "../lib/prompt-i18n";
+import {
+	getBlockedTaskActionInstruction,
+	getToolMessage,
+	getUserLanguage,
+	type Locale,
+} from "../lib/prompt-i18n";
 import {
 	executionPrincipalOf,
 	type OwnTurnPlacement,
@@ -4263,9 +4268,20 @@ export async function startSpecContinuationIfPossible(
 	});
 }
 
+async function resolveBackgroundContinuationLocale(
+	narratorId: string,
+	locale: Locale | undefined,
+	userId: string | null | undefined,
+): Promise<Locale> {
+	const existing = activeNarrators.get(narratorId);
+	if (existing?.alive && !existing.abortController.signal.aborted) return existing.locale;
+	if (locale !== undefined) return locale;
+	return userId == null ? "en" : getUserLanguage(userId);
+}
+
 export async function startBackgroundCompletionContinuationIfPossible(
 	narratorId: string,
-	locale: Locale = "en",
+	locale?: Locale,
 	replyInUserLanguage = false,
 ): Promise<{ started: boolean }> {
 	// Background results and Send(parent) share one mailbox and the same wake policy.
@@ -4337,7 +4353,7 @@ async function canWakeQuestionAnswer(
 }
 
 export async function recoverPendingQuestionAnswerDeliveries(
-	locale: Locale = "en",
+	locale?: Locale,
 	options: { signal?: AbortSignal } = {},
 ): Promise<number> {
 	if (getNarratorMessageRefsPort()) return 0;
@@ -4520,7 +4536,7 @@ export function registerQuestionAnswerFallback(narratorId: string, messageId: st
 /** Retry only receipts whose earlier inbox acceptance failed; existing delivery identities never repeat. */
 export async function retryDeferredQuestionAnswerDeliveries(
 	narratorId: string,
-	locale: Locale = "en",
+	locale?: Locale,
 ): Promise<number> {
 	if (getNarratorMessageRefsPort()) return 0;
 	const { getAsyncQuestionExecutionPrincipal, getBoundedQuestionReceipt } = await import(
@@ -4595,7 +4611,7 @@ export async function scheduleQuestionAnswerDelivery(
 	messageId: string,
 	text: string,
 	executionPrincipal: QuestionExecutionPrincipal | undefined,
-	locale: Locale = "en",
+	locale?: Locale,
 ): Promise<{ ready: boolean; started: boolean }> {
 	// Questions still use the SQLite business service. Fail closed rather than enqueue
 	// on another backend while reading the receipt from the local database.
@@ -4669,7 +4685,7 @@ export async function scheduleQuestionAnswerDelivery(
 
 export async function startInjectionContinuationIfPossible(
 	narratorId: string,
-	locale: Locale = "en",
+	locale?: Locale,
 	replyInUserLanguage = false,
 	executionPrincipal?: QuestionExecutionPrincipal,
 ): Promise<{ started: boolean }> {
@@ -4686,7 +4702,13 @@ export async function startInjectionContinuationIfPossible(
 		if (isPlanModeTrait(narrator.traits)) return { started: false };
 		if (executionPrincipal && !(await canWakeQuestionAnswer(narrator))) return { started: false };
 
-		const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
+		const principal = executionPrincipal ?? executionPrincipalOf(narrator);
+		const continuationLocale = await resolveBackgroundContinuationLocale(
+			narratorId,
+			locale,
+			principal?.userId,
+		);
+		const active = await ensureNarrator(narratorId, continuationLocale, replyInUserLanguage);
 		if (active._loopRunning || getExecutionOwner(narratorId)) return { started: false };
 		if (
 			executionPrincipal &&
@@ -4771,12 +4793,13 @@ export async function startInjectionContinuationIfPossible(
  */
 export async function resumeBufferedMessagesIfIdle(
 	narratorId: string,
-	locale: Locale = "en",
+	locale?: Locale,
 	replyInUserLanguage = false,
 ): Promise<{ resumed: boolean }> {
 	if ((await getBufferedMessagesAsync(narratorId)).length === 0) return { resumed: false };
 	const result = await continuationStartLock.acquire(narratorId, async () => {
-		if ((await getBufferedMessagesAsync(narratorId)).length === 0) return { resumed: false };
+		const [first] = await getBufferedMessagesAsync(narratorId);
+		if (!first) return { resumed: false };
 		// A live loop (or any other runtime owner) will consume the queue itself.
 		if (isNarratorRuntimeBusy(narratorId)) return { resumed: false };
 
@@ -4787,10 +4810,19 @@ export async function resumeBufferedMessagesIfIdle(
 		const narrator = await narratorService.getById(narratorId);
 		if (narrator.status !== "idle") return { resumed: false };
 
-		const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
+		const principal = first.createdBy
+			? { userId: first.createdBy }
+			: executionPrincipalOf(narrator);
+		// A queued person's preference outranks a hint left by the previous run.
+		const continuationLocale = await resolveBackgroundContinuationLocale(
+			narratorId,
+			first.createdBy ? undefined : locale,
+			principal?.userId,
+		);
+		const active = await ensureNarrator(narratorId, continuationLocale, replyInUserLanguage);
 		if (active._loopRunning) return { resumed: false };
 
-		const dispatch = await resumeNextBufferedMessageUnlocked(active, locale);
+		const dispatch = await resumeNextBufferedMessageUnlocked(active, continuationLocale);
 		return { resumed: true, dispatch };
 	});
 	if ("dispatch" in result) await result.dispatch?.();
@@ -4809,7 +4841,7 @@ export async function resumeBufferedMessagesIfIdle(
  */
 export async function startParentInboundContinuationIfPossible(
 	narratorId: string,
-	locale: Locale = "en",
+	locale?: Locale,
 	replyInUserLanguage = false,
 ): Promise<{ started: boolean }> {
 	return continuationStartLock.acquire(narratorId, async () => {
@@ -4837,7 +4869,12 @@ export async function startParentInboundContinuationIfPossible(
 			});
 			return { started: false };
 		}
-		const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
+		const continuationLocale = await resolveBackgroundContinuationLocale(
+			narratorId,
+			locale,
+			principal.userId,
+		);
+		const active = await ensureNarrator(narratorId, continuationLocale, replyInUserLanguage);
 		if (active._loopRunning) return { started: false };
 		active._currentUserId = principal.userId;
 

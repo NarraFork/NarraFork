@@ -57,12 +57,13 @@ export async function completeAssistantOutput(
 	const completed = completeOutputBlocks(message?.contentJson);
 	if (!completed) return messageId;
 	// The persistence method updates recipient refs, versions and character accounting too.
-	return narratorPersistence.copyOnWriteMessage(
-		narratorId,
-		messageId,
-		{ contentJson: completed, contentText: contentText(completed) },
-		{ preserveExecutionOwner: true },
-	);
+	return narratorPersistence.copyOnWriteMessage(narratorId, messageId, undefined, {
+		preserveExecutionOwner: true,
+		mutateBody: (current) => {
+			const completed = completeOutputBlocks(current);
+			return completed ? { contentJson: completed, contentText: contentText(completed) } : null;
+		},
+	});
 }
 
 /**
@@ -89,14 +90,20 @@ export async function cleanupIncompleteNarratorOutput(
 	if (!message) return { removedBlocks: 0 };
 	const retained = removeIncompleteOutputBlocks(message.contentJson);
 	if (!retained) return { messageId: message.id, removedBlocks: 0 };
+	let removedBlocks = 0;
 	const messageId = await narratorPersistence.copyOnWriteMessage(
 		narratorId,
 		message.id,
-		{ contentJson: retained, contentText: contentText(retained) },
-		{ preserveExecutionOwner: true },
+		undefined,
+		{
+			preserveExecutionOwner: true,
+			mutateBody: (current) => {
+				const retained = removeIncompleteOutputBlocks(current);
+				if (!retained) return null;
+				removedBlocks = (current as unknown[]).length - retained.length;
+				return { contentJson: retained, contentText: contentText(retained) };
+			},
+		},
 	);
-	return {
-		messageId,
-		removedBlocks: (message.contentJson as unknown[]).length - retained.length,
-	};
+	return { messageId, removedBlocks };
 }

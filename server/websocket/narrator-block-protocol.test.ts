@@ -38,6 +38,29 @@ const roundTrip = (frame: Parameters<typeof protocol.toBlockFrames>[0]) =>
 			.flatMap((item) => decodeBlockFrame(item as unknown as Record<string, unknown>)),
 	);
 
+test("translation is one bounded part frame using the successful writer's persistent identity", () => {
+	const patch = {
+		type: "reasoning_translation_patch" as const,
+		narratorId: "n1",
+		ownerNarratorId: "n1",
+		messageId: "message",
+		blockId: "persistent-block",
+		elementId: "output-element",
+		blockRevision: 3,
+		stateRevision: 8,
+		translationGeneration: "g",
+		part: { id: "part", generation: "g", start: 0, end: 1, sourceText: "A", translatedText: "甲" },
+	};
+	expect(protocol.toBlockFrames(patch)).toEqual([patch]);
+	expect(() =>
+		protocol.toBlockFrames({
+			...patch,
+			part: { ...patch.part, translatedText: "中".repeat(22000) },
+		}),
+	).toThrow();
+	expect(() => protocol.toBlockFrames({ ...patch, translationGeneration: "other" })).toThrow();
+});
+
 const NOW = "2026-10-01T00:00:00.000Z";
 
 type Sent = Record<string, unknown>;

@@ -10,6 +10,7 @@ import type { LocalizedValue } from "@shared/i18n-locales";
 import type { SubagentModelInheritance } from "@shared/model-inheritance";
 import type { NarratorVisibility, NarratorWriteAudience } from "@shared/narrator-access";
 import type { RowBlock } from "@shared/narrator-blocks/message-blocks";
+import type { ReasoningTranslationFields } from "@shared/reasoning-translation";
 import type { StorageCategoryKey } from "@shared/storage-categories";
 import type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
 
@@ -684,7 +685,7 @@ export interface ExecutionTargetIdentity {
 	selectionSource?: "explicit" | "session_default" | "local_default";
 }
 
-export interface BaseContentBlock {
+export interface BaseContentBlock extends ReasoningTranslationFields {
 	type: string;
 	text?: string;
 	thinking?: string;
@@ -1045,6 +1046,8 @@ export interface TreeMessage {
 	 * `messageBlocks` (blocks); rewrite it through the helpers next to them.
 	 */
 	blocks: MessageRowBlock[];
+	/** Mutable envelope state version; independent of each block's body revision. */
+	stateRevision?: number;
 	contentText: string | null;
 	toolCalls: ToolCallRecord[];
 	tokensIn?: number | null;

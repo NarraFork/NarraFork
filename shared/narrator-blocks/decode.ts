@@ -17,6 +17,7 @@ import {
 	modelTextFromContentBlocks,
 	NATIVE_MODEL_CONTEXT_BLOCK_TYPES,
 } from "../native-injection";
+import { getValidReasoningTranslationParts } from "../reasoning-translation";
 import type {
 	BlockPart,
 	BlockPhase,
@@ -214,6 +215,19 @@ function decodeReasoning(id: string, raw: RawBlock): ReasoningBlock {
 	const openai = record(wire.openai);
 	const segment = openai?.textFormat === "reasoning_text" ? "content" : undefined;
 	const translated = string(raw.translatedText);
+	const generation = string(raw.translationGeneration);
+	const parts = getValidReasoningTranslationParts(
+		text,
+		generation,
+		raw.translationParts as
+			| import("../reasoning-translation").ReasoningTranslationPart[]
+			| undefined,
+	);
+	const state = {
+		...(translated ? { translatedText: translated } : {}),
+		...(generation ? { translationGeneration: generation } : {}),
+		...(parts.length ? { translationParts: parts } : {}),
+	};
 	return {
 		id,
 		kind: "reasoning",
@@ -221,7 +235,7 @@ function decodeReasoning(id: string, raw: RawBlock): ReasoningBlock {
 		phase: outputPhase(raw),
 		payload: { parts: text ? [{ type: "text", text, ...(segment ? { segment } : {}) }] : [] },
 		...(Object.keys(providerMeta).length ? { providerMeta } : {}),
-		...(translated ? { state: { translatedText: translated } } : {}),
+		...(Object.keys(state).length ? { state } : {}),
 	};
 }
 

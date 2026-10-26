@@ -46,6 +46,13 @@ import {
 	splitEnvelope,
 } from "@shared/narrator-blocks/storage";
 import type { EnvelopeRole } from "@shared/narrator-blocks/types";
+import {
+	getValidReasoningTranslationParts,
+	isReasoningTranslationId,
+	MAX_REASONING_TRANSLATION_OUTPUT_BYTES,
+	MAX_REASONING_TRANSLATION_SOURCE_BYTES,
+	type ReasoningTranslationPart,
+} from "@shared/reasoning-translation";
 import * as database from "../db";
 import { removeBlockIndexText } from "../db/fts";
 import { hotSafe } from "../lib/hot-safe";
@@ -545,6 +552,10 @@ export function contentHash(text: string): string {
 const ENVELOPE_COLUMNS = `id, narrator_id AS narratorId, role, content_text AS contentText,
 	parent_tool_use_id AS parentToolUseId, sdk_message_uuid AS messageUuid, origin, provider,
 	body_format AS bodyFormat, body_rows_only AS rowsOnly`;
+const ENVELOPE_READ_BYTES_SQL = ENVELOPE_COLUMNS.split(",")
+	.map((column) => column.trim().split(/\s+/)[0])
+	.map((column) => `coalesce(octet_length(m.${column}), 0)`)
+	.join(" + ");
 
 function envelopeRow(messageId: string): EnvelopeRow | null {
 	return database.sqlite
@@ -1008,6 +1019,293 @@ function writeBlockStates(messageId: string, drafts: BlockDraft[], wasRowsOnly: 
 		database.sqlite
 			.prepare("UPDATE narrator_messages SET body_bytes = body_bytes + ? WHERE id = ?")
 			.run(delta, messageId);
+}
+
+export const REASONING_TRANSLATION_WRITE_MAX_BYTES = 1024 * 1024;
+const REASONING_TRANSLATION_WRITE_MAX_BLOCKS = 1000;
+
+interface ReasoningPartStateInput {
+	messageId: string;
+	elementId: string;
+	expected: { sourceText: string; generation: string };
+	part: ReasoningTranslationPart;
+	signal?: AbortSignal;
+}
+function normalizeReasoningPartInput(
+	candidate: ReasoningPartStateInput,
+): ReasoningPartStateInput | null {
+	if (
+		!isReasoningTranslationId(candidate.messageId) ||
+		!isReasoningTranslationId(candidate.elementId) ||
+		!candidate.expected ||
+		!isReasoningTranslationId(candidate.expected.generation) ||
+		typeof candidate.expected.sourceText !== "string" ||
+		candidate.expected.sourceText.length > 256 * 1024 ||
+		!candidate.part ||
+		!isReasoningTranslationId(candidate.part.id) ||
+		!isReasoningTranslationId(candidate.part.generation)
+	)
+		return null;
+	const { id, generation, start, end, sourceText, translatedText } = candidate.part;
+	if (
+		!Number.isSafeInteger(start) ||
+		!Number.isSafeInteger(end) ||
+		start < 0 ||
+		start >= end ||
+		typeof sourceText !== "string" ||
+		sourceText.length > MAX_REASONING_TRANSLATION_SOURCE_BYTES ||
+		typeof translatedText !== "string" ||
+		translatedText.length > MAX_REASONING_TRANSLATION_OUTPUT_BYTES ||
+		Buffer.byteLength(candidate.expected.sourceText) > 256 * 1024
+	)
+		return null;
+	// Keep exactly the protocol fields; extra properties never enter a state serializer or clone.
+	const part: ReasoningTranslationPart = { id, generation, start, end, sourceText, translatedText };
+	if (
+		getValidReasoningTranslationParts(
+			candidate.expected.sourceText,
+			candidate.expected.generation,
+			[part],
+		).length !== 1
+	)
+		return null;
+	return {
+		messageId: candidate.messageId,
+		elementId: candidate.elementId,
+		expected: {
+			sourceText: candidate.expected.sourceText,
+			generation: candidate.expected.generation,
+		},
+		part,
+		signal: candidate.signal,
+	};
+}
+
+function translatedParts(
+	element: Record<string, unknown>,
+	input: ReasoningPartStateInput,
+): ReasoningTranslationPart[] | null {
+	if (
+		element.type !== "reasoning" ||
+		element.id !== input.elementId ||
+		typeof element.text !== "string" ||
+		!element.text.startsWith(input.expected.sourceText) ||
+		!input.expected.generation ||
+		element.translationGeneration !== input.expected.generation ||
+		input.part.generation !== input.expected.generation ||
+		input.part.end > input.expected.sourceText.length
+	)
+		return null;
+	const previous = getValidReasoningTranslationParts(
+		element.text,
+		input.expected.generation,
+		element.translationParts as ReasoningTranslationPart[] | undefined,
+	);
+	if (
+		previous.some(
+			(part) =>
+				part.id === input.part.id || (part.start < input.part.end && input.part.start < part.end),
+		)
+	)
+		return null;
+	const next = getValidReasoningTranslationParts(element.text, input.expected.generation, [
+		...previous,
+		input.part,
+	]);
+	return next.length === previous.length + 1 && next.includes(input.part) ? next : null;
+}
+
+/**
+ * Bounded translation write: rows-only envelopes touch just the matching block state.
+ * Compatibility projections retain patchEnvelopeState semantics within a 1MiB write budget.
+ * Larger sources retain their original text; this budget does not constrain history reads.
+ */
+export function patchReasoningPartState(candidate: ReasoningPartStateInput): null | {
+	messageId: string;
+	blockId: string;
+	elementId: string;
+	blockRevision: number;
+	stateRevision: number;
+	translationGeneration: string;
+	part: ReasoningTranslationPart;
+} {
+	candidate.signal?.throwIfAborted();
+	const input = normalizeReasoningPartInput(candidate);
+	if (!input) return null;
+	return database.sqlite.transaction(() => {
+		input.signal?.throwIfAborted();
+		const envelope = database.sqlite
+			.query<
+				{
+					bodyFormat: number;
+					rowsOnly: number;
+					bodyRevision: number;
+					stateRevision: number;
+					projectionBytes: number;
+					envelopeBytes: number;
+					pending: number;
+				},
+				[string]
+			>(`SELECT body_format AS bodyFormat, body_rows_only AS rowsOnly,
+			body_revision AS bodyRevision, state_revision AS stateRevision,
+			octet_length(content_json) AS projectionBytes,
+			(${ENVELOPE_READ_BYTES_SQL}) AS envelopeBytes,
+			EXISTS(SELECT 1 FROM narrator_block_sync_queue q WHERE q.message_id = m.id) AS pending
+			FROM narrator_messages m WHERE id = ? LIMIT 1`)
+			.get(input.messageId);
+		if (
+			!envelope ||
+			envelope.bodyFormat !== 2 ||
+			(!envelope.rowsOnly && envelope.pending) ||
+			(!envelope.rowsOnly && envelope.projectionBytes > REASONING_TRANSLATION_WRITE_MAX_BYTES)
+		)
+			return null;
+		const rows = database.sqlite
+			.query<
+				{
+					id: string;
+					kind: string;
+					revision: number;
+					payloadBytes: number;
+					stateBytes: number;
+				},
+				[string, number]
+			>(`SELECT id, kind, revision, octet_length(payload) AS payloadBytes,
+			coalesce(octet_length(state),0) AS stateBytes FROM narrator_blocks
+			WHERE message_id = ? ORDER BY ordinal LIMIT ?`)
+			.all(input.messageId, REASONING_TRANSLATION_WRITE_MAX_BLOCKS + 1);
+		if (rows.length > REASONING_TRANSLATION_WRITE_MAX_BLOCKS) return null;
+		// One aggregate parsing allowance, including both candidate lookup and compatibility assembly.
+		// Rows-only storage never decodes the unrelated kinds.
+		const reasoningBytes = rows
+			.filter((row) => row.kind === "reasoning")
+			.reduce((sum, row) => sum + row.payloadBytes + row.stateBytes, 0);
+		const assemblyBytes = envelope.rowsOnly
+			? 0
+			: envelope.envelopeBytes +
+				Math.max(
+					envelope.projectionBytes,
+					rows.reduce((sum, row) => sum + row.payloadBytes + row.stateBytes, 0),
+				);
+		if (reasoningBytes + assemblyBytes > REASONING_TRANSLATION_WRITE_MAX_BYTES) return null;
+		const matches: Array<{
+			id: string;
+			revision: number;
+			state: string | null;
+			raw: unknown[];
+			index: number;
+			stateRaw: Array<Record<string, unknown> | null>;
+			next: ReasoningTranslationPart[];
+		}> = [];
+		for (const row of rows) {
+			if (row.kind !== "reasoning") continue;
+			input.signal?.throwIfAborted();
+			const stored = database.sqlite
+				.query<{ payload: string; state: string | null }, [string, string, number]>(
+					"SELECT payload, state FROM narrator_blocks WHERE id = ? AND message_id = ? AND revision = ? LIMIT 1",
+				)
+				.get(row.id, input.messageId, row.revision);
+			if (!stored) return null;
+			const payload = parse(stored.payload) as { raw?: unknown[] } | null;
+			const state = parse(stored.state) as { raw?: Array<Record<string, unknown> | null> } | null;
+			if (!Array.isArray(payload?.raw)) continue;
+			const stateRaw = Array.isArray(state?.raw) ? state.raw : [];
+			if (
+				stateRaw.some(
+					(fields) => fields !== null && (typeof fields !== "object" || Array.isArray(fields)),
+				)
+			)
+				return null;
+			for (let index = 0; index < payload.raw.length; index++) {
+				const raw = payload.raw[index];
+				if (!raw || typeof raw !== "object" || Array.isArray(raw)) continue;
+				const element = { ...raw, ...stateRaw[index] } as Record<string, unknown>;
+				if (element.type !== "reasoning" || element.id !== input.elementId) continue;
+				const next = translatedParts(element, input);
+				if (!next) return null;
+				matches.push({
+					id: row.id,
+					revision: row.revision,
+					state: stored.state,
+					raw: payload.raw,
+					index,
+					stateRaw,
+					next,
+				});
+			}
+		}
+		if (matches.length !== 1) return null;
+		const target = matches[0];
+		let stateRevision: number;
+		if (envelope.rowsOnly) {
+			const stateRaw = Array.from(
+				{ length: target.raw.length },
+				(_, index) => target.stateRaw[index] ?? null,
+			);
+			stateRaw[target.index] = {
+				...stateRaw[target.index],
+				translationGeneration: input.expected.generation,
+				translationParts: target.next,
+			};
+			const state = JSON.stringify({ raw: stateRaw });
+			const bytes = Buffer.byteLength(state);
+			if (bytes > REASONING_TRANSLATION_WRITE_MAX_BYTES) return null;
+			const delta = bytes - (target.state === null ? 0 : Buffer.byteLength(target.state));
+			input.signal?.throwIfAborted();
+			const written = database.sqlite
+				.query<{ stateRevision: number }, [number, string, number, number]>(
+					`UPDATE narrator_messages SET state_revision = state_revision + 1, body_bytes = body_bytes + ?
+				 WHERE id = ? AND body_format = 2 AND body_rows_only = 1 AND body_revision = ? AND state_revision = ?
+				 RETURNING state_revision AS stateRevision`,
+				)
+				.get(delta, input.messageId, envelope.bodyRevision, envelope.stateRevision);
+			if (!written) return null;
+			const block = database.sqlite
+				.query<{ revision: number }, [string, number, string, string, number, string | null]>(
+					`UPDATE narrator_blocks SET state = ?, byte_size = byte_size + ?
+				 WHERE id = ? AND message_id = ? AND revision = ? AND state IS ? RETURNING revision`,
+				)
+				.get(state, delta, target.id, input.messageId, target.revision, target.state);
+			if (!block) throw new Error("Reasoning translation state identity changed");
+			stateRevision = written.stateRevision;
+		} else {
+			const changed = patchEnvelopeState(input.messageId, (content) => {
+				const candidates = content.filter(
+					(entry) =>
+						(entry as { type?: unknown } | null)?.type === "reasoning" &&
+						(entry as { id?: unknown }).id === input.elementId,
+				);
+				if (candidates.length !== 1) return null;
+				const element = candidates[0] as Record<string, unknown>;
+				const next = translatedParts(element, input);
+				if (!next) return null;
+				element.translationParts = next;
+				return Buffer.byteLength(JSON.stringify(content)) <= REASONING_TRANSLATION_WRITE_MAX_BYTES
+					? content
+					: null;
+			});
+			if (!changed) return null;
+			const written = database.sqlite
+				.query<{ revision: number; stateRevision: number }, [string, string]>(
+					`SELECT b.revision, m.state_revision AS stateRevision FROM narrator_blocks b
+				 INNER JOIN narrator_messages m ON m.id = b.message_id WHERE b.id = ? AND m.id = ? LIMIT 1`,
+				)
+				.get(target.id, input.messageId);
+			if (!written || written.revision !== target.revision)
+				throw new Error("Reasoning translation changed its body identity");
+			stateRevision = written.stateRevision;
+		}
+		input.signal?.throwIfAborted();
+		return {
+			messageId: input.messageId,
+			blockId: target.id,
+			elementId: input.elementId,
+			blockRevision: target.revision,
+			stateRevision,
+			translationGeneration: input.expected.generation,
+			part: structuredClone(input.part),
+		};
+	})();
 }
 
 /**

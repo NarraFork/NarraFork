@@ -2532,6 +2532,7 @@ export const PretextExactMessageList = memo(
 				enabled: !!revisionSubscriptionId,
 				isSubagent: !!isSubagent,
 				applyLivePatch: pretextDocument.applyLivePatch,
+				messages: pretextDocument.messages,
 				// A terminal event can race the initial exact-document load: the synthetic
 				// streaming row has the completed output, but the persisted message is not
 				// in the coordinator yet, so an in-place patch necessarily misses. Re-run

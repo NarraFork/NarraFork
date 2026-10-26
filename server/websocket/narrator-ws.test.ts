@@ -57,6 +57,7 @@ function createFakeWs(
 			if (throwOnSend) throw new Error("socket closed");
 			sent.push(JSON.parse(payload) as SentMessage);
 		},
+		close() {},
 	} as unknown as FakeNarratorWS;
 	return {
 		ws,
@@ -220,6 +221,56 @@ describe("HumanAttention global invalidation", () => {
 });
 
 describe("narrator WebSocket message snapshot subscribe", () => {
+	it("restores state after a missed part even when the model message version is equal", async () => {
+		seedReadableNarrator("state-reconnect");
+		const { ws, sent } = openFakeWs();
+		const { narratorService } = await import("../services/narrator-service");
+		const version = await narratorService.getMessageVersion("state-reconnect");
+		await handleNarratorWS.message(ws, {
+			type: "subscribe",
+			kind: "messages",
+			narratorIds: ["state-reconnect"],
+			version,
+			restoreState: true,
+			requestId: "restore-reader-state",
+		});
+		expect(
+			sent.some(
+				(frame) =>
+					frame.type === "full_reload" && frame.subscriptionRequestId === "restore-reader-state",
+			),
+		).toBe(true);
+		expect(sent.some((frame) => frame.type === "sync_ok")).toBe(false);
+	});
+
+	it("a translation frame exceeding the socket budget closes for bounded recovery", () => {
+		const { ws } = openFakeWs({ subscribedNarrators: new Set(["state-backpressure"]) });
+		const close = spyOn(ws, "close").mockImplementation(() => {});
+		ws.getBufferedAmount = () => 256 * 1024;
+		broadcastToNarrator("state-backpressure", {
+			type: "reasoning_translation_patch",
+			narratorId: "state-backpressure",
+			ownerNarratorId: "state-backpressure",
+			messageId: "m",
+			blockId: "persisted",
+			elementId: "reason",
+			blockRevision: 1,
+			stateRevision: 2,
+			translationGeneration: "g",
+			part: {
+				id: "part",
+				generation: "g",
+				start: 0,
+				end: 1,
+				sourceText: "A",
+				translatedText: "甲",
+			},
+		});
+		expect(close).toHaveBeenCalledWith(1013, "Reasoning translation recovery required");
+		expect(getNarratorConnections().has(ws)).toBe(false);
+		close.mockRestore();
+	});
+
 	it("returns request-scoped sync_ok for a matching version-only empty snapshot", async () => {
 		await seedNarrators();
 		const { ws, sent } = openFakeWs();

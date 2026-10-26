@@ -12,8 +12,14 @@
  */
 
 import { afterAll, describe, expect, it } from "bun:test";
+import type { BaseContentBlock } from "@frontend/lib/api/types";
+import { OutputContentAccumulator } from "@server/lib/agent/output-content";
 import { messageBody, rowWithElements } from "@shared/narrator-blocks/message-blocks";
-import { segmentMessages } from "../message/message-segments";
+import {
+	buildStreamingMsg,
+	type StreamingBlock,
+	segmentMessages,
+} from "../message/message-segments";
 import type { NarratorMsg } from "../narrator-panel-types";
 import { groupRenderUnits } from "../trace/render-units";
 import type { MeasuredCommunicationBubble } from "./measure/measure-communication-bubble";
@@ -27,7 +33,9 @@ import {
 	type AdapterSegment,
 	adaptSegments,
 	type CommunicationBubbleData,
+	reasoningRunDisplayText,
 } from "./segment-adapter";
+import { projectStreamingDocument, projectStreamingMessage } from "./streaming-handoff";
 import { toolCompletedPatch } from "./vlist-live-events";
 import { buildSelectionIndex } from "./vlist-selection";
 
@@ -35,6 +43,244 @@ const disposeCanvasStub = installCanvasStub();
 afterAll(() => disposeCanvasStub());
 
 const CTX: AdapterContext = { lod: 5 };
+
+describe("source-range reasoning translation", () => {
+	it("uses the same mixed source/translation at every level without regrouping messages", () => {
+		const blocks = [
+			{
+				type: "reasoning",
+				id: "r1",
+				revision: 1,
+				text: "one\n\n tail",
+				translationGeneration: "g",
+				translationParts: [
+					{ id: "p", generation: "g", start: 0, end: 3, sourceText: "one", translatedText: "一" },
+				],
+			},
+			{ type: "reasoning", id: "r2", revision: 1, text: "next" },
+		];
+		const source = rowWithElements(textMessage("r", "assistant", ""), blocks) as NarratorMsg;
+		const specs = adaptSegments(segmentMessages([source]) as unknown as AdapterSegment[], CTX);
+		const reasoning = specs.find((spec) => spec.kind === "reasoning");
+		expect(reasoning?.data).toMatchObject({
+			text: "one\n\n tail\n\nnext",
+			translatedText: "一\n\n tail\n\nnext",
+		});
+		expect(reasoningRunDisplayText(blocks)).toBe("一\n\n tail\n\nnext");
+		expect(messageBody(source)).toEqual(blocks);
+		const rewritten = [{ ...blocks[0], translationGeneration: "new" }, blocks[1]];
+		expect(reasoningRunDisplayText(rewritten)).toBe("one\n\n tail\n\nnext");
+	});
+});
+
+describe("reasoning checkpoint projection × real segments and adapter", () => {
+	function rawLane(
+		output: OutputContentAccumulator,
+		kind: "reasoning" | "text",
+		text: string,
+		nativeId: string,
+	): StreamingBlock {
+		const delta = output.append(kind, text, { blockId: nativeId });
+		return {
+			type: kind,
+			id: delta.blockId,
+			revision: delta.blockRevision,
+			textOffset: 0,
+			outputIndex: delta.outputIndex,
+			text,
+		};
+	}
+	function reasoningLane(output: OutputContentAccumulator, text: string, nativeId: string) {
+		const lane = rawLane(output, "reasoning", text, nativeId);
+		if (lane.type !== "reasoning") throw new Error("Expected a reasoning lane");
+		return lane;
+	}
+	function checkpoint(elements: readonly BaseContentBlock[]): NarratorMsg {
+		const row = rowWithElements(textMessage("reply", "assistant", ""), elements);
+		return {
+			...row,
+			blocks: row.blocks.map((holder) => ({
+				...holder,
+				id: `server:${holder.id}`,
+				named: true,
+				revision: 7,
+				attemptId: "req_checkpoint",
+				hasOriginal: true,
+			})),
+		};
+	}
+	function render(committed: NarratorMsg[], streaming: NarratorMsg | null) {
+		const document = projectStreamingDocument(committed, streaming);
+		return adaptSegments(segmentMessages([...document]) as unknown as AdapterSegment[], CTX);
+	}
+
+	it("keeps one ordered card through raw release, the next lane, and its checkpoint", () => {
+		const output = new OutputContentAccumulator();
+		const first = reasoningLane(output, "123", "native-r1");
+		const firstLive = buildStreamingMsg({
+			narratorId: "n1",
+			streamingBlocks: [first],
+			liveBlockIndex: 0,
+		});
+		const firstCheckpoint = [...output.flush()].flatMap((event) =>
+			event.type === "block_complete" ? [event.block] : [],
+		);
+		const owner = checkpoint(firstCheckpoint);
+		// The hook has acknowledged and released all of r1 before r2 is born.
+		expect(projectStreamingMessage(firstLive, [owner])).toBeNull();
+		const second = reasoningLane(output, "4", "native-r2");
+		expect(first.id).toMatch(/^[A-Za-z0-9_-]{21}:0$/);
+		expect(second.id).toBe(`${first.id.slice(0, -1)}1`);
+		const secondLive = buildStreamingMsg({
+			narratorId: "n1",
+			streamingBlocks: [second],
+			liveBlockIndex: 0,
+		});
+		expect(messageBody(secondLive).map((block) => block.id)).toEqual([second.id]);
+		const secondCheckpoint = [...output.flush()].flatMap((event) =>
+			event.type === "block_complete" ? [event.block] : [],
+		);
+		const completed = checkpoint([...firstCheckpoint, ...secondCheckpoint]);
+		const frames = [
+			render([], firstLive),
+			render([owner], firstLive),
+			render([owner], secondLive),
+			render([completed], secondLive),
+		];
+		const cards = frames.map((specs) => specs.filter((spec) => spec.kind === "reasoning"));
+		expect(cards.map((items) => items.length)).toEqual([1, 1, 1, 1]);
+		expect(cards.map((items) => (items[0].data as { text: string }).text)).toEqual([
+			"123",
+			"123",
+			"123\n\n4",
+			"123\n\n4",
+		]);
+		expect(cards.map((items) => (items[0].data as { isStreaming: boolean }).isStreaming)).toEqual([
+			true,
+			false,
+			true,
+			false,
+		]);
+		expect(new Set(cards.slice(1).map((items) => items[0].key)).size).toBe(1);
+		expect(new Set(cards.map((items) => items[0].lifecycleId)).size).toBe(1);
+		expect(cards[0][0].lifecycleId).toBeTruthy();
+	});
+
+	it("preserves source-range translations and keys through revisions and multiple new lanes", () => {
+		const output = new OutputContentAccumulator();
+		const first = reasoningLane(output, "one\n\n tail", "native-r1");
+		const part = {
+			id: "p",
+			generation: "g",
+			start: 0,
+			end: 3,
+			sourceText: "one",
+			translatedText: "一",
+		};
+		const original = { ...first, translationGeneration: "g", translationParts: [part] };
+		const owner = checkpoint([original]);
+		const second = reasoningLane(output, "next", "native-r2");
+		const grownDelta = output.append("reasoning", " more", { blockId: "native-r2" });
+		const grown = { ...second, text: "next more", revision: grownDelta.blockRevision };
+		const third = reasoningLane(output, "last", "native-r3");
+		const frames = [
+			render(
+				[owner],
+				buildStreamingMsg({ narratorId: "n1", streamingBlocks: [second], liveBlockIndex: 0 }),
+			),
+			render(
+				[owner],
+				buildStreamingMsg({ narratorId: "n1", streamingBlocks: [grown, third], liveBlockIndex: 1 }),
+			),
+			render([checkpoint([original, grown, third])], null),
+		];
+		const cards = frames.map((specs) => specs.filter((spec) => spec.kind === "reasoning"));
+		expect(cards.map((items) => items.length)).toEqual([1, 1, 1]);
+		expect(
+			cards.map((items) => (items[0].data as { translatedText: string }).translatedText),
+		).toEqual([
+			"一\n\n tail\n\nnext",
+			"一\n\n tail\n\nnext more\n\nlast",
+			"一\n\n tail\n\nnext more\n\nlast",
+		]);
+		expect(new Set(cards.map((items) => items[0].key)).size).toBe(1);
+		expect(messageBody(owner)[0].translationParts?.[0]).toBe(part);
+		expect(messageBody(owner)).toHaveLength(1);
+	});
+
+	it("keeps late-delta reasoning live in the revised owner and before a retained tool", () => {
+		for (const active of ["owner", "prefix"] as const) {
+			const output = new OutputContentAccumulator();
+			const first = reasoningLane(output, "123", "native-r1");
+			const owner = checkpoint([first]);
+			const second = reasoningLane(output, "4", "native-r2");
+			if (active === "prefix") output.observeExternal("external-tool");
+			const delta = output.append("reasoning", "5", {
+				blockId: active === "owner" ? "native-r1" : "native-r2",
+			});
+			const streaming = buildStreamingMsg({
+				narratorId: "n1",
+				streamingBlocks:
+					active === "owner"
+						? [{ ...first, text: "1235", revision: delta.blockRevision }, second]
+						: [{ ...second, text: "45", revision: delta.blockRevision }],
+				toolChunksMsg: active === "prefix" ? toolMessage() : null,
+				liveBlockIndex: 0,
+			});
+			const specs = render([owner], streaming);
+			const cards = specs.filter((spec) => spec.kind === "reasoning");
+			expect(cards).toHaveLength(1);
+			expect(cards[0].data).toMatchObject({
+				text: active === "owner" ? "1235\n\n4" : "123\n\n45",
+				isStreaming: true,
+			});
+			expect(cards[0].opts?.streamingContent).toBe(true);
+		}
+	});
+
+	it("settles the projected run when live answer text or a tool begins", () => {
+		for (const suffixKind of ["text", "tool"] as const) {
+			const output = new OutputContentAccumulator();
+			const first = reasoningLane(output, "123", "native-r1");
+			const second = reasoningLane(output, "4", "native-r2");
+			const answer =
+				suffixKind === "text" ? rawLane(output, "text", "answer", "native-text") : null;
+			const toolRow = toolMessage();
+			const streaming = buildStreamingMsg({
+				narratorId: "n1",
+				streamingBlocks: answer ? [second, answer] : [second],
+				toolChunksMsg: answer ? null : toolRow,
+				liveBlockIndex: answer ? 1 : -1,
+			});
+			const specs = render([checkpoint([first])], streaming);
+			const cards = specs.filter((spec) => spec.kind === "reasoning");
+			expect(cards).toHaveLength(1);
+			expect(cards[0].data).toMatchObject({ text: "123\n\n4", isStreaming: false });
+			expect(cards[0].opts?.streamingContent).toBeUndefined();
+			expect(specs.some((spec) => spec.kind === (answer ? "markdown" : "tool-call"))).toBe(true);
+		}
+	});
+
+	it("keeps external-order gaps and retry epochs on separate cards", () => {
+		for (const boundary of ["tool", "retry"] as const) {
+			const output = new OutputContentAccumulator();
+			const first = reasoningLane(output, "123", "native-r1");
+			if (boundary === "tool") output.observeExternal("external-tool");
+			else output.reset();
+			const second = reasoningLane(output, "4", "native-r2");
+			const streaming = buildStreamingMsg({
+				narratorId: "n1",
+				streamingBlocks: [second],
+				liveBlockIndex: 0,
+			});
+			const cards = render([checkpoint([first])], streaming).filter(
+				(spec) => spec.kind === "reasoning",
+			);
+			expect(cards).toHaveLength(2);
+			expect(cards.map((card) => (card.data as { text: string }).text)).toEqual(["123", "4"]);
+		}
+	});
+});
 
 // A realistic assistant message with a tool_use block (mirrors what the backend
 // sends: contentJson carries the enriched tool_use block).

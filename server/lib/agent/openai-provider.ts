@@ -2005,6 +2005,8 @@ export interface ResponsesReasoningAccum {
 	lastSummaryIndex?: number;
 	/** Track each summary separately: a later done-only part must not be dropped. */
 	emittedParts?: Set<string>;
+	/** Parser-normalized source ranges; summary completion is not native item completion. */
+	summaryParts?: Map<number, { text: string; start: number; end: number; sealed: boolean }>;
 	/** Exact bytes seen per native content part, including partial delta recovery. */
 	nativeParts?: Map<number, string>;
 	textFormat?: "reasoning_text" | "summary_text" | "mixed";
@@ -2060,6 +2062,8 @@ function pushReasoningTextEvent(
 	const format = native ? "reasoning_text" : "summary_text";
 	acc.textFormat = acc.textFormat && acc.textFormat !== format ? "mixed" : format;
 	const partKey = `${native ? "content" : "summary"}:${chunk.summary_index ?? chunk.content_index ?? 0}`;
+	const summaryIndex = chunk.summary_index ?? 0;
+	const summaryPart = native ? undefined : acc.summaryParts?.get(summaryIndex);
 	if (native) {
 		acc.nativeParts ??= new Map();
 		const index = chunk.content_index ?? 0;
@@ -2072,6 +2076,11 @@ function pushReasoningTextEvent(
 		} else {
 			acc.nativeParts.set(index, previous + text);
 		}
+	} else if (options.emitOnlyIfAccumulatorEmpty && summaryPart) {
+		if (!text.startsWith(summaryPart.text) || summaryPart.end !== (acc.emittedText?.length ?? 0))
+			return;
+		text = text.slice(summaryPart.text.length);
+		if (!text) return;
 	} else if (options.emitOnlyIfAccumulatorEmpty && acc.emittedParts?.has(partKey)) return;
 	acc.emittedParts ??= new Set();
 	acc.emittedParts.add(partKey);
@@ -2093,6 +2102,21 @@ function pushReasoningTextEvent(
 		acc.lastSummaryIndex = chunk.summary_index;
 	}
 
+	if (!native) {
+		acc.summaryParts ??= new Map();
+		const end = (acc.emittedText?.length ?? 0) + emitText.length;
+		if (summaryPart) {
+			summaryPart.text += text;
+			summaryPart.end = end;
+		} else {
+			acc.summaryParts.set(summaryIndex, {
+				text,
+				start: end - text.length,
+				end,
+				sealed: false,
+			});
+		}
+	}
 	if (options.appendToAccumulator || options.emitOnlyIfAccumulatorEmpty) {
 		acc.emittedText = `${acc.emittedText ?? ""}${emitText}`;
 	}
@@ -2114,6 +2138,33 @@ function pushReasoningTextEvent(
 	results.push({
 		reasoning: emitText,
 		reasoningOutputIndex: chunk.output_index,
+	});
+}
+
+function pushReasoningSummarySeal(
+	results: ParsedStreamEvent[],
+	chunk: ResponsesAPIChunk,
+	acc: ResponsesReasoningAccum | undefined,
+	index: number,
+): void {
+	const part = acc?.summaryParts?.get(index);
+	if (
+		!part ||
+		part.sealed ||
+		!part.text ||
+		acc?.emittedText?.slice(part.start, part.end) !== part.text
+	)
+		return;
+	part.sealed = true;
+	const blockId = responsesBlockId(chunk, "reasoning");
+	results.push({
+		contentBoundary: {
+			kind: "reasoning",
+			phase: "checkpoint",
+			blockId,
+			outputIndex: chunk.output_index,
+			summaryPart: { id: `${blockId}:summary:${index}`, index, start: part.start, end: part.end },
+		},
 	});
 }
 
@@ -2547,6 +2598,9 @@ export function parseResponsesAPIEvent(
 				);
 			}
 		}
+		for (const index of acc.summaryParts?.keys() ?? []) {
+			pushReasoningSummarySeal(results, itemChunk, acc, index);
+		}
 		const finalEncrypted = chunk.item.encrypted_content ?? acc.encryptedContent;
 		acc.encryptedContent = finalEncrypted;
 		acc.completed = true;
@@ -2599,16 +2653,24 @@ export function parseResponsesAPIEvent(
 				emitOnlyIfAccumulatorEmpty: true,
 			});
 		}
-		// A summary is not an independently replayable reasoning item. Final
-		// encrypted_content arrives only on output_item.done.
-		results.push({
-			contentBoundary: {
-				kind: "reasoning",
-				phase: "checkpoint",
-				blockId: responsesBlockId(chunk, "reasoning"),
-				outputIndex: chunk.output_index,
-			},
-		});
+		// Summary seals schedule display work without completing native replay credentials.
+		if (type !== "response.reasoning_text.done") {
+			pushReasoningSummarySeal(
+				results,
+				chunk,
+				resolveReasoningAccum(chunk, reasoningAccum),
+				chunk.summary_index ?? 0,
+			);
+		} else {
+			results.push({
+				contentBoundary: {
+					kind: "reasoning",
+					phase: "checkpoint",
+					blockId: responsesBlockId(chunk, "reasoning"),
+					outputIndex: chunk.output_index,
+				},
+			});
+		}
 		return results;
 	}
 

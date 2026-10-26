@@ -160,7 +160,17 @@ describe("native content boundaries", () => {
 				],
 			},
 		});
-		expect(checkpoint.at(-1)?.contentBoundary?.phase).toBe("checkpoint");
+		expect(checkpoint.at(-1)?.contentBoundary).toMatchObject({
+			phase: "checkpoint",
+			summaryPart: { index: 0, start: 0, end: 5 },
+		});
+		expect(second.at(-1)?.contentBoundary).toMatchObject({
+			phase: "checkpoint",
+			summaryPart: { index: 1, start: 7, end: 13 },
+		});
+		expect(
+			[...checkpoint, ...second].some((event) => event.contentBoundary?.phase === "complete"),
+		).toBe(false);
 		expect(second.find((event) => event.reasoning)?.reasoning).toBe("\n\nsecond");
 		expect(first[0].reasoningBlockId).toBe(second[0].reasoningBlockId);
 		expect(done.some((event) => event.reasoning)).toBe(false);

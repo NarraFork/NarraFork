@@ -837,11 +837,11 @@ async function deliverClaimedInboxInjectionPg(
 						await (options.executionPrincipal
 							? session.startInjectionContinuationIfPossible(
 									narratorId,
-									options.locale ?? "en",
+									options.locale,
 									undefined,
 									options.executionPrincipal,
 								)
-							: session.startInjectionContinuationIfPossible(narratorId, options.locale ?? "en"))
+							: session.startInjectionContinuationIfPossible(narratorId, options.locale))
 					).started;
 				} catch (error) {
 					logger.warn("Injection delivered but waking the narrator failed", {
@@ -1110,7 +1110,7 @@ const pendingWakes = hotSafe(
 	() => new Map<string, Promise<boolean>>(),
 );
 /** Coalesced control-plane wake; the only payload authority remains the mailbox table. */
-export function wakeInboxIfEligible(narratorId: string, locale: Locale = "en"): Promise<boolean> {
+export function wakeInboxIfEligible(narratorId: string, locale?: Locale): Promise<boolean> {
 	const pending = pendingWakes.get(narratorId);
 	if (pending) return pending;
 	const wake = Promise.resolve()
@@ -1203,7 +1203,7 @@ export function wakeInboxIfEligible(narratorId: string, locale: Locale = "en"): 
 			// delegated reports alone use the notification continuation, also in plan mode.
 			if (first?.kind === "user_input" || (await hasInboxKind(narratorId, ["user_input"])))
 				return (await resumeBufferedMessagesIfIdle(narratorId, locale)).resumed;
-			return (await startParentInboundContinuationIfPossible(narratorId, "en")).started;
+			return (await startParentInboundContinuationIfPossible(narratorId, locale)).started;
 		})
 		.catch((error) => {
 			logger.warn("Mailbox wake deferred", { narratorId, error: String(error) });

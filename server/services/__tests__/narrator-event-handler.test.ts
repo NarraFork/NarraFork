@@ -192,134 +192,543 @@ describe("Write complete input source routing", () => {
 	});
 });
 
-describe("reasoning translation output boundary", () => {
-	for (const boundary of [
-		"stream_text",
-		"tool_use_chunk",
-		"tool_call",
-		"block_complete",
-	] as const) {
-		test(`${boundary} translates the latest reasoning once, never intermediate prefixes`, async () => {
-			const { settings } = await import("../../lib/settings");
-			const agent = await import("../../lib/agent");
-			const generate = spyOn(agent, "summaryGenerate").mockResolvedValue({ text: "" });
-			const original = settings.agent.translateReasoning;
-			settings.agent.translateReasoning = true;
-			const id = `translation-boundary-${boundary}`;
-			const createdAt = new Date().toISOString();
-			await db
-				.insert(narrators)
-				.values({ id, type: "primary", inheritMode: "fresh", createdAt, updatedAt: createdAt });
-			let partialId: string | undefined;
-			const ctx: EventHandlerContext = {
-				...makeMainContext(),
-				narratorId: id,
-				broadcastTargetId: id,
-				locale: "zh-CN",
-				getPartialMessageId: () => partialId,
-				setPartialMessageId: (value) => {
-					partialId = value;
-				},
-			};
-			const checkpoint = (text: string, revision: number) =>
-				processEvent(
-					{
-						type: "block_complete",
-						block: { type: "reasoning", id: "reason", text, revision },
-					},
-					ctx,
-				);
-			try {
-				await checkpoint("A", 1);
-				await checkpoint("A+B", 2);
-				await checkpoint("A+B+C", 3);
-				expect(generate).not.toHaveBeenCalled();
-				expect(ctx.pendingReasoningTranslations?.size).toBe(1);
-				const event =
-					boundary === "stream_text"
-						? {
-								type: "stream_text" as const,
-								blockRevision: 1,
-								blockTextOffset: 0,
-								blockId: "text",
-								text: "Answer",
-							}
-						: boundary === "tool_use_chunk"
-							? {
-									type: "tool_use_chunk" as const,
-									toolUseId: "tool",
-									toolName: "Read",
-									inputCharsTotal: 1,
-								}
-							: boundary === "tool_call"
-								? { type: "tool_call" as const, toolUseId: "tool", toolName: "Read", input: {} }
-								: {
-										type: "block_complete" as const,
-										block: { type: "text" as const, text: "Answer" },
-									};
-				await processEvent(event, ctx);
-				await Bun.sleep(10);
-				expect(generate).toHaveBeenCalledTimes(1);
-				expect(generate.mock.calls[0]?.[0]).toBe("A+B+C");
-				await checkpoint("A+B+C", 4);
-				await processEvent(event, ctx);
-				await Bun.sleep(10);
-				expect(generate).toHaveBeenCalledTimes(1);
-				expect(ctx.pendingReasoningTranslations?.size).toBe(0);
-				// A later, distinct reasoning phase in the same response is independent.
-				await processEvent(
-					{
-						type: "block_complete",
-						block: { type: "reasoning", id: "next-reason", text: "Next thought", revision: 1 },
-					},
-					ctx,
-				);
-				expect(generate).toHaveBeenCalledTimes(1);
-				await processEvent(event, ctx);
-				await Bun.sleep(10);
-				expect(generate).toHaveBeenCalledTimes(2);
-				expect(generate.mock.calls[1]?.[0]).toBe("Next thought");
-			} finally {
-				generate.mockRestore();
-				settings.agent.translateReasoning = original;
-				clearStreamingSnapshot(id);
-				await cleanupFileContextNarrator(id);
-			}
+describe("reasoning translation durable boundaries", () => {
+	const seal = (sourceText = "PRIVATE SOURCE BODY", blockId = "reason") => ({
+		type: "reasoning_summary_sealed" as const,
+		blockId,
+		blockRevision: 1,
+		nativePartId: "summary-0",
+		nativePartIndex: 0,
+		start: 0,
+		end: sourceText.length,
+		sourceText,
+	});
+	async function captureDiagnostics() {
+		const { logger } = await import("../../lib/logger");
+		const logs: Array<Record<string, unknown>> = [];
+		const log = spyOn(logger, "info").mockImplementation((message, data) => {
+			if (
+				message === "Reasoning translation scheduling" ||
+				message === "Reasoning translation task"
+			)
+				logs.push({ message, ...data });
 		});
+		return { log, logs };
 	}
 
-	for (const reset of ["stream_reset", "attempt_discarded", "api_request_start"] as const) {
-		test(`${reset} drops reasoning-only attempts without translation`, async () => {
-			const ctx = makeMainContext();
-			ctx.pendingReasoningTranslations = new Map([
-				[
-					"old",
-					{
-						messageId: "discarded",
-						block: { type: "reasoning", id: "old", text: "unused" },
-					},
-				],
-			]);
-			await processEvent(
-				reset === "stream_reset"
-					? { type: reset }
-					: reset === "attempt_discarded"
-						? { type: reset, requestId: "old" }
-						: { type: reset, requestId: "new", model: "test", provider: "test" },
-				ctx,
-			);
-			expect(ctx.pendingReasoningTranslations.size).toBe(0);
-			await processEvent(
+	test("summary seals translate during Await, tool seals reserve only the remaining source", async () => {
+		const { settings } = await import("../../lib/settings");
+		const agent = await import("../../lib/agent");
+		const { narratorPersistence } = await import("../narrator-persistence");
+		const { log, logs } = await captureDiagnostics();
+		const generate = spyOn(agent, "summaryGenerate").mockResolvedValue({ text: "译文" });
+		const patch = spyOn(narratorPersistence, "patchReasoningTranslationPart").mockImplementation(
+			async (input) => ({
+				messageId: input.messageId,
+				blockId: "persisted-reasoning-block",
+				elementId: input.elementId,
+				blockRevision: 2,
+				stateRevision: 7,
+				translationGeneration: input.expected.generation,
+				part: input.part,
+			}),
+		);
+		const original = settings.agent.translateReasoning;
+		settings.agent.translateReasoning = true;
+		const id = "translation-durable-boundaries";
+		const createdAt = new Date().toISOString();
+		await db
+			.insert(narrators)
+			.values({ id, type: "primary", inheritMode: "fresh", createdAt, updatedAt: createdAt });
+		let partialId: string | undefined;
+		const ctx: EventHandlerContext = {
+			...makeMainContext(),
+			narratorId: id,
+			broadcastTargetId: id,
+			locale: "zh-CN",
+			getPartialMessageId: () => partialId,
+			setPartialMessageId: (value) => {
+				partialId = value;
+			},
+		};
+		const checkpoint = (text: string, revision: number) =>
+			processEvent(
 				{
-					type: "stream_text",
-					blockRevision: 1,
-					blockTextOffset: 0,
-					blockId: "text-6",
-					text: "new answer",
+					type: "block_complete",
+					block: { type: "reasoning", id: "reason", text, revision },
 				},
 				ctx,
 			);
-			expect(ctx.reasoningTranslations?.size ?? 0).toBe(0);
+		try {
+			await checkpoint("A", 1);
+			await processEvent(
+				{ type: "tool_use_chunk", toolUseId: "await", toolName: "Await", inputCharsTotal: 1 },
+				ctx,
+			);
+			expect(generate).not.toHaveBeenCalled();
+			await processEvent(
+				{
+					type: "reasoning_summary_sealed",
+					blockId: "reason",
+					blockRevision: 1,
+					nativePartId: "summary-0",
+					nativePartIndex: 0,
+					start: 0,
+					end: 1,
+					sourceText: "A",
+				},
+				ctx,
+			);
+			// The foreground is idle inside its Await; the independent scheduler still runs.
+			await Bun.sleep(350);
+			expect(generate).toHaveBeenCalledTimes(1);
+			expect(generate.mock.calls[0]?.[0]).toBe("A");
+			const sent = broadcastMessages.find(
+				(value) => (value as { type?: string }).type === "reasoning_translation_patch",
+			);
+			expect(sent).toMatchObject({
+				blockId: "persisted-reasoning-block",
+				elementId: "reason",
+				blockRevision: 2,
+				stateRevision: 7,
+			});
+			await checkpoint("A+B", 2);
+			await processEvent(
+				{
+					type: "block_complete",
+					block: { type: "tool_use", toolUseId: "await", name: "Await", input: {} },
+				},
+				ctx,
+			);
+			await Bun.sleep(5);
+			expect(generate.mock.calls.map((call) => call[0])).toEqual(["A", "+B"]);
+			expect(patch.mock.calls[1]?.[0].expected.generation).toBe(
+				patch.mock.calls[0]?.[0].expected.generation,
+			);
+			await processEvent({ type: "done" }, ctx);
+			expect(logs.find((entry) => entry.phase === "capture")).toMatchObject({
+				reason: "captured",
+				enabled: true,
+				locale: "zh-CN",
+				localeDefaulted: false,
+				elementPresent: true,
+				previous: false,
+				stale: false,
+				accepted: true,
+				sourceCount: 1,
+				sourceLimit: 96,
+			});
+			expect(
+				logs.find((entry) => entry.phase === "schedule" && entry.trigger === "summary"),
+			).toMatchObject({
+				reason: "scan",
+				sourceCount: 1,
+				messageMatches: 1,
+				boundaryMatches: 1,
+				textMatches: 1,
+				freezeCalls: 1,
+			});
+			expect(
+				logs.find((entry) => entry.phase === "task" && entry.status === "started"),
+			).toMatchObject({ pending: 1, active: 1, queued: 0 });
+			expect(logs.find((entry) => entry.status === "idle")).toMatchObject({
+				tasks: 2,
+				blocks: 1,
+				sourceBytes: 3,
+				outputBytes: 12,
+				skips: 0,
+			});
+			expect(ctx.reasoningTranslationDiagnostics).toBeUndefined();
+		} finally {
+			await processEvent({ type: "stream_reset" }, ctx);
+			log.mockRestore();
+			generate.mockRestore();
+			patch.mockRestore();
+			settings.agent.translateReasoning = original;
+			clearStreamingSnapshot(id);
+			await cleanupFileContextNarrator(id);
+		}
+	});
+
+	test("entry gates report effective locale and summarize bounded suppressed diagnostics", async () => {
+		const { settings } = await import("../../lib/settings");
+		const { log, logs } = await captureDiagnostics();
+		const original = settings.agent.translateReasoning;
+		const context = (locale?: string): EventHandlerContext => ({
+			...makeMainContext(),
+			locale,
+			getPartialMessageId: () => "pending",
+			reasoningTranslationSources: new Map([
+				["reason", { messageId: "pending", generation: "g", text: "PRIVATE SOURCE BODY" }],
+			]),
+		});
+		const disabled = context("zh-CN");
+		const defaultLocale = context();
+		const explicitEnglish = context("en");
+		const noSources = context("PRIVATE LANGUAGE TOKEN");
+		noSources.reasoningTranslationSources = undefined;
+		const noMessage = context("zh-CN");
+		noMessage.getPartialMessageId = () => undefined;
+		try {
+			settings.agent.translateReasoning = false;
+			await processEvent(seal(), disabled);
+			settings.agent.translateReasoning = true;
+			for (let index = 0; index < 1000; index++) await processEvent(seal(), defaultLocale);
+			await processEvent(seal(), explicitEnglish);
+			await processEvent(seal(), noSources);
+			await processEvent(seal(), noMessage);
+			expect(logs.find((entry) => entry.reason === "disabled")).toMatchObject({
+				trigger: "summary",
+				enabled: false,
+				locale: "zh-CN",
+				sourceCount: 1,
+			});
+			const english = logs.filter((entry) => entry.reason === "english");
+			expect(english).toHaveLength(3);
+			expect(english[0]).toMatchObject({ enabled: true, locale: "en", localeDefaulted: true });
+			expect(english[2]).toMatchObject({ locale: "en", localeDefaulted: false });
+			expect(logs.find((entry) => entry.reason === "no_sources")).toMatchObject({
+				locale: "other",
+				localeDefaulted: false,
+				sourceCount: 0,
+			});
+			expect(logs.find((entry) => entry.reason === "no_message")).toMatchObject({
+				trigger: "summary",
+				boundaryPresent: true,
+			});
+			await processEvent({ type: "done" }, defaultLocale);
+			const summaries = logs.filter((entry) => entry.phase === "response");
+			expect(summaries).toHaveLength(1);
+			expect(summaries[0]).toMatchObject({
+				scheduleCalls: 1000,
+				suppressed: 998,
+				totalFreezeCalls: 0,
+			});
+			expect(defaultLocale.reasoningTranslationDiagnostics).toBeUndefined();
+			expect(JSON.stringify(logs)).not.toContain("PRIVATE");
+			expect(logs.every((entry) => entry.phase !== "task")).toBe(true);
+		} finally {
+			for (const ctx of [disabled, defaultLocale, explicitEnglish, noSources, noMessage])
+				await processEvent({ type: "stream_reset" }, ctx);
+			settings.agent.translateReasoning = original;
+			log.mockRestore();
+		}
+	});
+
+	test("source scan counts distinguish message, boundary and text mismatches", async () => {
+		const { settings } = await import("../../lib/settings");
+		const agent = await import("../../lib/agent");
+		const { log, logs } = await captureDiagnostics();
+		const generate = spyOn(agent, "summaryGenerate");
+		const original = settings.agent.translateReasoning;
+		settings.agent.translateReasoning = true;
+		const ctx: EventHandlerContext = {
+			...makeMainContext(),
+			locale: "zh-CN",
+			getPartialMessageId: () => "pending",
+			reasoningTranslationSources: new Map([
+				["wrong-message", { messageId: "another", generation: "g", text: "PRIVATE SOURCE BODY" }],
+				["wrong-boundary", { messageId: "pending", generation: "g", text: "PRIVATE SOURCE BODY" }],
+				["reason", { messageId: "pending", generation: "g", text: "PRIVATE SOURCE BODY" }],
+			]),
+		};
+		try {
+			await processEvent(seal("MISMATCHED PRIVATE BODY"), ctx);
+			await processEvent(seal("PRIVATE SOURCE BODY", "missing"), ctx);
+			const scans = logs.filter((entry) => entry.phase === "schedule");
+			expect(scans[0]).toMatchObject({
+				reason: "scan",
+				sourceCount: 3,
+				messageMatches: 2,
+				boundaryMatches: 1,
+				textMatches: 0,
+				freezeCalls: 0,
+				pending: 0,
+			});
+			expect(scans[1]).toMatchObject({
+				messageMatches: 2,
+				boundaryMatches: 0,
+				textMatches: 0,
+				freezeCalls: 0,
+			});
+			expect(ctx.reasoningTranslations?.blocks.size).toBe(0);
+			expect(generate).not.toHaveBeenCalled();
+			await processEvent({ type: "done" }, ctx);
+			expect(logs.find((entry) => entry.status === "idle")).toMatchObject({
+				tasks: 0,
+				blocks: 0,
+				sourceBytes: 0,
+				skips: 0,
+			});
+			expect(JSON.stringify(logs)).not.toContain("PRIVATE");
+		} finally {
+			await processEvent({ type: "stream_reset" }, ctx);
+			settings.agent.translateReasoning = original;
+			generate.mockRestore();
+			log.mockRestore();
+		}
+	});
+
+	test("capture diagnostics preserve missing, stale and full source-map outcomes", async () => {
+		const { settings } = await import("../../lib/settings");
+		const { narratorStore } = await import("../narrator-store");
+		const write = spyOn(narratorStore, "writeStepItem").mockResolvedValue(undefined);
+		const { log, logs } = await captureDiagnostics();
+		const original = settings.agent.translateReasoning;
+		settings.agent.translateReasoning = true;
+		const ctx: EventHandlerContext = {
+			...makeMainContext(),
+			locale: "zh-CN",
+			getPartialMessageId: () => "pending",
+		};
+		const checkpoint = (id?: string, revision = 2) =>
+			processEvent(
+				{
+					type: "block_complete",
+					block: { type: "reasoning", id, text: "PRIVATE SOURCE BODY", revision },
+				},
+				ctx,
+			);
+		try {
+			await checkpoint();
+			await checkpoint("reason");
+			await checkpoint("reason", 1);
+			await checkpoint("reason", 3);
+			settings.agent.translateReasoning = false;
+			await checkpoint("disabled");
+			settings.agent.translateReasoning = true;
+			for (let index = 1; index < 96; index++)
+				ctx.reasoningTranslationSources?.set(`source-${index}`, {
+					messageId: "pending",
+					generation: "g",
+					text: "PRIVATE SOURCE BODY",
+				});
+			await checkpoint("over-limit");
+			expect(ctx.reasoningTranslationSources?.size).toBe(96);
+			expect(ctx.reasoningTranslationSources?.has("over-limit")).toBe(false);
+			const captures = logs.filter((entry) => entry.phase === "capture");
+			expect(captures.map((entry) => entry.reason)).toEqual([
+				"missing_element",
+				"captured",
+				"stale",
+				"captured",
+				"disabled",
+				"source_limit",
+			]);
+			expect(captures[0]).toMatchObject({
+				elementPresent: false,
+				previous: false,
+				accepted: false,
+			});
+			expect(captures[2]).toMatchObject({ previous: true, stale: true, accepted: false });
+			expect(captures[3]).toMatchObject({ previous: true, stale: false, accepted: true });
+			expect(captures[5]).toMatchObject({ sourceCount: 96, sourceLimit: 96, accepted: false });
+			expect(write).toHaveBeenCalledTimes(6);
+			await processEvent({ type: "stream_reset" }, ctx);
+			expect(ctx.reasoningTranslationDiagnostics).toBeUndefined();
+			expect(ctx.reasoningTranslationSources).toBeUndefined();
+			expect(JSON.stringify(logs)).not.toContain("PRIVATE");
+		} finally {
+			await processEvent({ type: "stream_reset" }, ctx);
+			settings.agent.translateReasoning = original;
+			write.mockRestore();
+			log.mockRestore();
+		}
+	});
+
+	test("logger failures leave checkpoint capture, translation and publication intact", async () => {
+		const { settings } = await import("../../lib/settings");
+		const agent = await import("../../lib/agent");
+		const { logger } = await import("../../lib/logger");
+		const { narratorStore } = await import("../narrator-store");
+		const { narratorPersistence } = await import("../narrator-persistence");
+		const original = settings.agent.translateReasoning;
+		settings.agent.translateReasoning = true;
+		const log = spyOn(logger, "info").mockImplementation(() => {
+			throw new Error("logger failure");
+		});
+		const write = spyOn(narratorStore, "writeStepItem").mockResolvedValue(undefined);
+		const generate = spyOn(agent, "summaryGenerate").mockResolvedValue({ text: "译文" });
+		const patch = spyOn(narratorPersistence, "patchReasoningTranslationPart").mockImplementation(
+			async (input) => ({
+				messageId: input.messageId,
+				blockId: "persisted",
+				elementId: input.elementId,
+				blockRevision: 1,
+				stateRevision: 2,
+				translationGeneration: input.expected.generation,
+				part: input.part,
+			}),
+		);
+		const ctx: EventHandlerContext = {
+			...makeMainContext(),
+			locale: "zh-CN",
+			getPartialMessageId: () => "pending",
+		};
+		try {
+			await processEvent(
+				{
+					type: "block_complete",
+					block: { type: "reasoning", id: "reason", text: "PRIVATE SOURCE BODY" },
+				},
+				ctx,
+			);
+			expect(ctx.reasoningTranslationSources?.size).toBe(1);
+			await processEvent(seal(), ctx);
+			await Bun.sleep(350);
+			expect(generate).toHaveBeenCalledTimes(1);
+			expect(patch).toHaveBeenCalledTimes(1);
+			expect(
+				broadcastMessages.some(
+					(value) => (value as { type?: string }).type === "reasoning_translation_patch",
+				),
+			).toBe(true);
+			await processEvent({ type: "done" }, ctx);
+			expect(ctx.reasoningTranslations).toBeUndefined();
+			expect(ctx.reasoningTranslationDiagnostics).toBeUndefined();
+		} finally {
+			await processEvent({ type: "stream_reset" }, ctx);
+			settings.agent.translateReasoning = original;
+			log.mockRestore();
+			write.mockRestore();
+			generate.mockRestore();
+			patch.mockRestore();
+		}
+	});
+
+	test("a cancelled awaited state commit cannot publish its successful metadata", async () => {
+		const { settings } = await import("../../lib/settings");
+		const agent = await import("../../lib/agent");
+		const { narratorPersistence } = await import("../narrator-persistence");
+		const original = settings.agent.translateReasoning;
+		settings.agent.translateReasoning = true;
+		const entered = Promise.withResolvers<void>(),
+			release = Promise.withResolvers<void>();
+		const generate = spyOn(agent, "summaryGenerate").mockResolvedValue({ text: "译文" });
+		const patch = spyOn(narratorPersistence, "patchReasoningTranslationPart").mockImplementation(
+			async (input) => {
+				entered.resolve();
+				await release.promise;
+				return {
+					messageId: input.messageId,
+					blockId: "persisted",
+					elementId: input.elementId,
+					blockRevision: 1,
+					stateRevision: 2,
+					translationGeneration: input.expected.generation,
+					part: input.part,
+				};
+			},
+		);
+		const ctx: EventHandlerContext = {
+			...makeMainContext(),
+			locale: "zh-CN",
+			getPartialMessageId: () => "pending",
+			reasoningTranslationSources: new Map([
+				["reason", { messageId: "pending", generation: "g", text: "A" }],
+			]),
+		};
+		try {
+			await processEvent(
+				{
+					type: "reasoning_summary_sealed",
+					blockId: "reason",
+					blockRevision: 1,
+					nativePartId: "summary-0",
+					nativePartIndex: 0,
+					start: 0,
+					end: 1,
+					sourceText: "A",
+				},
+				ctx,
+			);
+			await entered.promise;
+			await processEvent({ type: "stream_reset" }, ctx);
+			release.resolve();
+			await Bun.sleep(5);
+			expect(patch.mock.calls[0]?.[0].signal?.aborted).toBe(true);
+			expect(
+				broadcastMessages.some(
+					(value) => (value as { type?: string }).type === "reasoning_translation_patch",
+				),
+			).toBe(false);
+		} finally {
+			release.resolve();
+			generate.mockRestore();
+			patch.mockRestore();
+			settings.agent.translateReasoning = original;
+		}
+	});
+
+	for (const reset of ["stream_reset", "attempt_discarded", "error"] as const) {
+		test(`${reset} cancels in-flight translation before state writes or broadcast`, async () => {
+			const { settings } = await import("../../lib/settings");
+			const agent = await import("../../lib/agent");
+			const { narratorPersistence } = await import("../narrator-persistence");
+			const { log, logs } = await captureDiagnostics();
+			let resolve: (value: { text: string }) => void = () => {};
+			const generate = spyOn(agent, "summaryGenerate").mockImplementation(
+				() =>
+					new Promise((done) => {
+						resolve = done;
+					}),
+			);
+			const patch = spyOn(narratorPersistence, "patchReasoningTranslationPart");
+			const original = settings.agent.translateReasoning;
+			settings.agent.translateReasoning = true;
+			const ctx: EventHandlerContext = {
+				...makeMainContext(),
+				locale: "zh-CN",
+				getPartialMessageId: () => "pending",
+				reasoningTranslationSources: new Map([
+					["reason", { messageId: "pending", generation: "g", text: "A" }],
+				]),
+			};
+			try {
+				await processEvent(
+					{
+						type: "reasoning_summary_sealed",
+						blockId: "reason",
+						blockRevision: 1,
+						nativePartId: "summary-0",
+						nativePartIndex: 0,
+						start: 0,
+						end: 1,
+						sourceText: "A",
+					},
+					ctx,
+				);
+				await Bun.sleep(350);
+				expect(generate).toHaveBeenCalledTimes(1);
+				await processEvent(
+					reset === "stream_reset"
+						? { type: reset }
+						: reset === "attempt_discarded"
+							? { type: reset, requestId: "old" }
+							: { type: reset, message: "stopped" },
+					ctx,
+				);
+				resolve({ text: "late" });
+				await Bun.sleep(5);
+				expect(
+					logs.find((entry) => entry.phase === "response" && entry.status === "cancelled"),
+				).toMatchObject({ reason: reset, tasks: 1, blocks: 1, sourceBytes: 1, pending: 1 });
+				expect(
+					logs.find((entry) => entry.phase === "task" && entry.status === "cancelled"),
+				).toMatchObject({ abortReason: reset, pending: 0 });
+				expect(ctx.reasoningTranslationDiagnostics).toBeUndefined();
+				expect(patch).not.toHaveBeenCalled();
+				expect(
+					broadcastMessages.some(
+						(value) => (value as { type?: string }).type === "reasoning_translation_patch",
+					),
+				).toBe(false);
+			} finally {
+				log.mockRestore();
+				generate.mockRestore();
+				patch.mockRestore();
+				settings.agent.translateReasoning = original;
+			}
 		});
 	}
 });

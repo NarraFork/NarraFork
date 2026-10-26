@@ -374,9 +374,11 @@ describe("useNarratorWS initial catch-up cursor ownership", () => {
 		const editOrigins: unknown[] = [];
 		const snapshotOrigins: unknown[] = [];
 		const gitStatuses: unknown[] = [];
+		const translationPatches: unknown[] = [];
 		function Harness(): ReactNode {
 			useNarratorWS(narratorId, {
 				onGitStatus: (status) => gitStatuses.push(status),
+				onReasoningTranslationPatch: (patch) => translationPatches.push(patch),
 				onToolStarted: (_id, _name, _start, _end, _input, _parent, _meta, origin) =>
 					editOrigins.push(origin),
 				onStreamingSnapshot: (snapshot) =>
@@ -488,6 +490,32 @@ describe("useNarratorWS initial catch-up cursor ownership", () => {
 			});
 			expect(editOrigins).toEqual([origin, undefined, undefined]);
 			expect(snapshotOrigins).toEqual([origin]);
+			const patch = {
+				narratorId: "n2",
+				ownerNarratorId: "n2",
+				messageId: "message",
+				blockId: "persistent-block",
+				elementId: "reason",
+				blockRevision: 2,
+				stateRevision: 7,
+				translationGeneration: "generation",
+				part: {
+					id: "part",
+					generation: "generation",
+					start: 0,
+					end: 1,
+					sourceText: "A",
+					translatedText: "甲",
+				},
+			};
+			newListener?.({ type: "reasoning_translation_patch", ...patch });
+			newListener?.({
+				type: "reasoning_translation_patch",
+				...patch,
+				translationGeneration: "different",
+			});
+			oldListener?.({ type: "reasoning_translation_patch", ...patch, narratorId: "n1" });
+			expect(translationPatches).toEqual([patch]);
 			const targets = [
 				{
 					id: "child",

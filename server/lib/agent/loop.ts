@@ -5099,6 +5099,15 @@ async function* agentLoopInMetadataSnapshot(
 						}
 						if (parsed.contentBoundary && parsed.contentBoundary.phase !== "start") {
 							yield* outputContent.boundary(parsed.contentBoundary);
+							if (
+								parsed.contentBoundary.kind === "reasoning" &&
+								parsed.contentBoundary.summaryPart
+							) {
+								yield* outputContent.sealSummaryPart(
+									parsed.contentBoundary.summaryPart,
+									parsed.contentBoundary,
+								);
+							}
 						}
 						// Content is acknowledged by the awaited event consumer before even
 						// the first tool card is shown (not just before eager execution).

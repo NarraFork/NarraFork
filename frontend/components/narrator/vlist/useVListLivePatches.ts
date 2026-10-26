@@ -55,11 +55,14 @@ import {
 	patchSubagentActivitySnapshots,
 	patchSubagentIdentity,
 	patchSubagentTakeoverByNarrator,
+	ReasoningTranslationPatchStore,
 } from "./vlist-live-patch";
 
 export interface UseVListLivePatchesOptions {
 	/** Only subscribe once a complete document exists to patch. */
 	enabled: boolean;
+	/** Replay retained completed parts after an in-flight page/checkpoint commits. */
+	messages?: readonly TreeMessage[];
 	/** A subagent page treats its own (parent-pointing) tool events as top-level. */
 	isSubagent: boolean;
 	/** Apply a patch to the loaded document; returns true when it changed something. */
@@ -121,6 +124,8 @@ export function useVListLivePatches(
 	 * when a message event indicates the document may now own the tool.
 	 */
 	const pendingCompletionsRef = useRef(new Map<string, LivePatch>());
+	const translationPartsRef = useRef(new ReasoningTranslationPatchStore());
+	const translationQueuedRef = useRef(false);
 	// Read fresh on every enqueue AND every flush: the queue rejects a batch whose
 	// narrator changed between the two (see LivePatchQueue for why the effect
 	// cleanup alone cannot cover that window).
@@ -146,6 +151,19 @@ export function useVListLivePatches(
 	const enqueue = useCallback((patch: LivePatch | null, onMiss?: () => void) => {
 		queueRef.current?.enqueue(patch, onMiss);
 	}, []);
+
+	const replayTranslationParts = useCallback(() => {
+		if (translationQueuedRef.current) return;
+		translationQueuedRef.current = true;
+		enqueue((messages) => {
+			translationQueuedRef.current = false;
+			return translationPartsRef.current.apply(messages);
+		});
+	}, [enqueue]);
+
+	useEffect(() => {
+		if (enabled && options.messages) replayTranslationParts();
+	}, [enabled, options.messages, replayTranslationParts]);
 
 	/** Enqueue a completion, remembering it when the tool is not loaded yet. */
 	const enqueueCompletion = useCallback(
@@ -182,6 +200,8 @@ export function useVListLivePatches(
 	useEffect(() => {
 		return () => {
 			pendingCompletionsRef.current.clear();
+			translationPartsRef.current.clear();
+			translationQueuedRef.current = false;
 			queueRef.current?.dispose();
 		};
 	}, [narratorId, enabled]);
@@ -275,6 +295,12 @@ export function useVListLivePatches(
 	useNarratorWS(
 		enabled ? narratorId : undefined,
 		{
+			onReasoningTranslationPatch: (patch) => {
+				// Authorized parent routing may describe a nested child row; identity checks
+				// in the pure patch prevent it from touching an unrelated parent element.
+				if (!translationPartsRef.current.remember(patch)) onUnappliedToolCompletion?.();
+				replayTranslationParts();
+			},
 			// ── Tool lifecycle ──────────────────────────────────────────────────
 			onToolStarted: (
 				toolUseId,
@@ -528,6 +554,7 @@ export function useVListLivePatches(
 			onCatchUp: (_orphanChildren, _topLevel, subagentActivities) => {
 				// A catch-up reload may finally load the tool_use a completion missed.
 				replayPendingCompletions();
+				replayTranslationParts();
 				if (subagentActivities.length === 0) return;
 				const snapshots = subagentActivities as SubagentActivityCatchUp[];
 				enqueue((messages) => patchSubagentActivitySnapshots(messages, snapshots));
@@ -537,7 +564,10 @@ export function useVListLivePatches(
 			// clears in the same frame the card appears.
 			onMessage: () => {
 				replayPendingCompletions();
+				replayTranslationParts();
 			},
+			onMessageUpdated: replayTranslationParts,
+			onMessagesDeleted: (messageIds) => translationPartsRef.current.forget(messageIds),
 		},
 		undefined,
 		{ kind: "messages" },

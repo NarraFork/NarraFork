@@ -62,8 +62,8 @@ export interface SplitOptions {
 /** Fields readers patch in place without changing what the block says (§3.4, §5.4). */
 const STATE_KEYS: Readonly<Record<string, readonly string[]>> = {
 	text: ["translatedText"],
-	reasoning: ["translatedText"],
-	thinking: ["translatedText"],
+	reasoning: ["translatedText", "translationGeneration", "translationParts"],
+	thinking: ["translatedText", "translationGeneration", "translationParts"],
 	review_feedback: ["applied"],
 	compact: ["status", "attempts", "mode", "error"],
 	segment_compact: ["status", "error"],
