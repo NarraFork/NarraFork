@@ -1,4 +1,4 @@
-<!-- 由 prototypes/outline2/outline.py export 生成（第 362 个提交）。真相源是 data/log.jsonl，不要手改。 -->
+<!-- 由 prototypes/outline2/outline.py export 生成（第 372 个提交）。真相源是 data/log.jsonl，不要手改。 -->
 
 # 大纲总览（事实视图）
 
@@ -49,6 +49,7 @@
       - [p/nMabER6Q] D24c Tiptap 分两步，不把升级和修复绑在一起：先在 3.27.1 上加 TableKit（`resizable: false`），自己覆盖 Table 的 `renderMarkdown`，给单元格里的 `|` 补转义（3.27.1 的表格扩展有这个序列化缺陷，[[p/RWv6qQBn]]），配上不依赖 DOM 的单元测试（[[p/Pbk0zBXQ]]）；整套 `@tiptap/*` 升到 3.32.0 另开一个 PR，并回归聊天输入框 InlineComposerEditor。理由：丢表格是数据丢失，要尽快修；升级会碰到每天都在用的输入框，风险不同。不用只升级到 3.32.0：不加表格扩展时它的输出和 3.27.1 逐字相同（[[p/HMPFfYbM]]）
       - [p/5tnp54bl] D24d 非 .md 的 spec 文件（agent 建的 .json、.yaml 等）和 `behavior_fence` 一律用纯文本（源码模式）编辑。理由：JSON、YAML 经所见即所得保存一次就不再合法；`behavior_fence` 的内容原样注入模型提示，`\_`、`&amp;` 这类转义会直接进 prompt（[[p/HV7j1m0U]]）
       - [p/5NrvJRyh] D24e 数据恢复：先写离线排查脚本，在后台跑、不进请求路径（遵守主线程规则），找出 `created_by` 是 user、父 revision 含表格分隔行而本条不含的记录，把结果交给人看；旧内容都还在 `spec_file_revisions` 里（[[p/f65PZBTV]]）。历史查看和恢复不在 spec:// 上单独做，放进大纲系统的时间机器里统一做（D4），因为 spec:// 在 P2 就退役了
+      - [p/zAZzhH24] 已实现（提交 `2a3e1917`、`df821f4d`）：spec 文件默认源码模式，.md 文件可切到并列预览或所见即所得；检测到 HTML、图片、任务项、脚注定义或开头的 front matter 时，所见即所得只读显示、不能保存；表格补上扩展和竖线转义后能完整往返，不再拦；非 .md 文件和 behavior_fence 只给纯文本；离线排查脚本 `scripts/find-spec-table-loss.ts`。检测范围之外、所见即所得仍会改坏的：HTML 实体、数学公式、相邻两个列表被合并
   - [p/zKjNiGOW] 任务、计划与多 agent 协作：计划就是任务树，锁定管住改动，完成后整理，专注 agent 集中攻坚，协作默认值，任务反思与 `/goal`（D12–D16、D25、D26）
     - [p/I6StRgTN] D12 多 agent：图谱是黑板；委派即建任务；角色由任务推导；开始做即领取；验收默认关闭
       - [p/nFdzmREY] 第二版（D18）：去掉验收关口，完成后通知管理者，不满意可以重开；试用里 3 次验收全部原样通过

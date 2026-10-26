@@ -203,7 +203,7 @@
 
 ### 2.5 历史
 - **每次改动都是一个提交**：谁写的（人、会话或子代理）、哪条消息、哪次工具调用、什么时候。人在同一页上空闲 30 秒以内的连续编辑合并成一个提交；多人在实时会话里共同编辑的窗口，提交记下全部参与者。
-- **时间机器**（R7）：大纲视图底部有一条时间轴（体验见 §3.2）。块的每个版本记录由哪个提交产生、到哪个提交失效，按时间点读取直接按区间查询。
+- **时间机器**（R7）：大纲视图底部有一条时间轴（体验见 §3.2）。块的每个版本记录由哪个提交产生、到哪个提交失效，还冗余记下块那时在哪一页。按时间点读取一页就是一次按页加区间的查询（`page_id = ? AND from_seq <= T AND (to_seq IS NULL OR to_seq > T)`）；页里某棵子树从整页结果在内存里截取。P0 基准：2000 块的页 p95 约 8–10 ms（§7.2）。
 - **撤销 = 补偿提交**：之后没人再改过的块恢复原状；被别人改过的列为冲突，不覆盖。
 - **回退会话到某条消息**：会话空间里晚于这条消息的改动自动补偿；已经写到共享空间的列出来，由人选择是否一并撤销。现在回退会话不会回退 spec 内容（`server/services/revert-history-commit.ts` 只把修订的来源消息置空），新模型补上了这一点。
 - **fork = 复制**：子会话复制父会话空间的当前状态，不复制历史，短 id 不变，所以继承来的上下文里的地址仍然有效。共享空间不复制，直接共享。现在的 `forkSpecNamespace`（`server/services/knowledge/sqlite-write-store.ts`）让子会话的指针引用父会话的修订行，父会话被硬删后文件会悄悄消失；改成复制就没有这个问题。
@@ -252,7 +252,7 @@
 - 拖到某一点看那个时刻的样子；框选一段，看这段时间的增、删、改、移。
 - 播放、单步前进后退，按人、会话或子树过滤；从任意一处变更跳回产生它的会话和消息。
 - 把一个块或一页恢复到某个时间点，恢复本身是一个补偿提交。
-- 实现：按视口分批读取，每批最多 500 块；拖动时只拉相邻提交的增量；超过增量上限的大提交折叠成一个事件；图谱布局对时间窗内出现过的全部节点一次算好，拖动时不乱跳。
+- 实现：读出那个时刻的整页（2000 块以内），在内存里按树序切成每批最多 500 块；拖动时只拉相邻提交的增量，版本行上的变化标记直接给出增、改、移、删；超过增量上限的大提交折叠成一个事件；图谱布局对时间窗内出现过的全部节点一次算好，拖动时不乱跳。
 - **跟着视图走**（R27）：事实视图的时间轴只走改到事实的提交，单步和播放都跳过只改过程的提交；每一处变化都能点回造成它的任务（整理的提交带着出处）。过程视图回放的是进展。
 - 时间机器按「系统时间」回答「当时我们是怎么认为的」；代码锚点里的提交号回答「这件事对哪个代码版本成立」，两者不混用。
 
@@ -480,9 +480,14 @@
 - 模型从模型目录里选（`shared/model-catalog` 已有 embedding 类别），支持 API 和 OpenAI 兼容的本地端点（D7）。
 
 ### 5.3 向量存储
-- 初版不引入原生扩展：量化后的向量存成 BLOB，在 db-worker（`server/lib/db-worker/`）里先按空间过滤，再暴力扫描。两种方言通用（D10）。
-- 单次扫描超过时间预算就降级为纯 FTS，并记慢日志。
-- 规模上去以后再接 sqlite-vec 或 pgvector，接口提前预留，门槛以 P0 基准为准。不一开始就用扩展，是因为 bun:sqlite 在 macOS 上默认用系统自带的 SQLite，要加载扩展就得换构建，跨平台打包成本高。
+- 初版不引入原生扩展：向量量化成 int8，在 db-worker（`server/lib/db-worker/`）里常驻成矩阵，先按空间过滤，再暴力扫描。两种方言通用（D10）。
+  - 存储：按 `(model_id, space_id, chunk_no)` 打包存，每行约 512 个向量（带块 id 和缩放系数），worker 启动时分批加载，按（空间, 页）连续存放。分批是因为加载峰值是稳态的两倍。
+  - `outline_embeddings`（按内容去重的缓存）不在查询路径上 join：P0 基准里这样做，20 万向量、10% 过滤时 p95 就要 190 ms 左右。
+  - 内核用 WebAssembly SIMD（5 KB，`prototypes/outline-bench/vector/kernels.c`），不支持时回退纯 JS（慢 3–4 倍）。
+  - 精度：int8 对 float32 的召回 @10 约 0.98；要更高就 int8 先取前 200 再用 float32 重排（合成数据上召回 1.000，真实嵌入要复测）。
+- P0 基准（100 万 × 1024 维，常驻 int8 + wasm）：10% 过滤 p95 46–71 ms，不过滤扫全量 268 ms；常驻内存约 1.2 GB；扫描期间主线程事件循环 p99 ≤ 2 ms。
+- 单次扫描超过时间预算就降级为纯 FTS，并记慢日志。预算按**候选数**算，不按总向量数。
+- **该换扩展的信号**，满足任一：候选数长期超过 50–70 万（没有 wasm 时 10–15 万）；常驻内存超过 1–2 GB 不可接受；不过滤的全库检索超过约 75 万向量；需要在 PG 里直接做库内检索。届时接 pgvector 的 HNSW；sqlite-vec 是否能带来量级提升没有验证。接口提前预留。不一开始就用扩展，是因为 bun:sqlite 在 macOS 上默认用系统自带的 SQLite，要加载扩展就得换构建，跨平台打包成本高。
 
 ### 5.4 排序与注入
 
@@ -623,22 +628,26 @@ outline_spaces          id, kind(library/project/personal/session), project_id?,
 outline_blocks          id, space_id, sid, parent_id, order_key, content, alias?,
                         task_json?(状态、指派、前置、截止、锁定人、整理到的提交), invalid_reason?(不成立),
                         in_process(派生缓存), reviewed_seq?(上次核实概括),
-                        author_kind, author_id, version_seq, deleted        -- 当前态，快速读取
-                        UNIQUE(space_id, sid)
-outline_block_versions  block_id, from_seq, to_seq?, commit_id, parent_id, order_key, content?,
-                        task_json?, invalid_reason?, content_hash, deleted, redacted  -- 只追加
+                        page_id(冗余), author_kind, author_id, version_seq, deleted  -- 当前态，快速读取
+                        UNIQUE(space_id, sid)；INDEX(page_id)
+outline_block_versions  block_id, from_seq, to_seq?, commit_id, page_id(冗余), parent_id, order_key,
+                        content?, task_json?, invalid_reason?, content_hash, change_flags,
+                        deleted, redacted                                   -- 只追加
+                        PK(block_id, from_seq)；INDEX(page_id, from_seq, to_seq)；INDEX(commit_id)
 outline_links           id, space_id, from_block_id, kind(link/embed/depends/basis/source),
                         target_kind, target_ref, snapshot_json?(摘录、指纹、提交), from_seq, to_seq?
 outline_commits         id, space_id, seq, kind(edit/confirm/revert/import/purge),
                         actor_kind, actor_id, responsible_user_id, narrator_id?, message_id?,
                         tool_call_id?, visible, created_at, summary
+                        UNIQUE(space_id, seq)；INDEX(space_id, narrator_id, seq)
 outline_pending         id, space_id, kind, ops_json, base_json, requested_by, decider_json,
                         status, created_at, decided_at?                     -- 待确认
 outline_task_claims     task_block_id, holder_narrator_id, epoch, task_version_at_claim,
                         claimed_at, expires_at
 outline_live_updates    page_block_id, epoch, seq, update_blob, actor_kind, actor_id, created_at
 outline_anchor_state    link_id, state(ok/changed/gone), checked_commit, checked_at  -- 派生缓存
-outline_embeddings      model_id, content_hash, dims, vector_blob, created_at
+outline_embeddings      model_id, content_hash, dims, vector_blob, created_at   -- 按内容去重的缓存
+outline_vector_chunks   model_id, space_id, chunk_no, block_ids, scales, vectors_i8  -- 每行约 512 个向量，worker 加载用
 outline_curation        id, kind(settle/stale), block_id, since_seq, status, actor?, created_at,
                         done_seq?                                           -- 整理队列
 outline_gate_stats      kind, window, unchanged, edited, rejected             -- 关口和整理的原样通过率
@@ -646,6 +655,9 @@ outline_fts             FTS5 / pg_trgm
 ```
 
 - 链接的 `kind` 是系统内部的区分，不是给人和 agent 的概念：`link`、`embed` 来自正文，`depends` 来自任务属性，`basis` 由系统挂上，`source` 记复制和提炼的来源。
+- **版本表的写入不变量**：删除一棵子树，给每个后代都写一条墓碑版本；跨页移动一棵子树，给每个后代都写一条 `page_id` 改变的新版本。这样按页读取不用递归。`to_seq` 用 NULL 表示当前版本，索引里带上结束边界：只按 `(page_id, from_seq)` 建索引时，p95 慢 3 倍（P0 基准）。
+- `change_flags` 是这个版本相对上一个变了什么（创建、内容、移动、删除、恢复、任务、换页），时间轴不用临时和上一个版本比较，快 2.5–3.5 倍。
+- `order_key` 在 PG 里声明 `COLLATE "C"`，两种方言的排序才一致。
 - 事实还是过程不是字段：`in_process` 只是随结构维护的缓存（移动子树、改复选框时批量更新，受子树条数上限约束），给检索和视图过滤用。
 - 关注范围和工作区绑定存在会话上，在场信息只放内存。
 - 表定义写在 `server/db/schema.ts`，按规范流程生成迁移；PG schema 由 `scripts/generate-postgres-schema.ts` 转译，两种方言同时交付。统一用 `outline_` 前缀，避免和消息块存储的 `narrator_blocks` 混淆。
@@ -669,11 +681,12 @@ outline_fts             FTS5 / pg_trgm
 | `OutlineEdit` 单次 | 200 个操作；改动超过 50 个别人写的已有块时转待确认 |
 | `OutlineSearch` | 最多返回 50 条 |
 | 依据 | 每块自动挂接最多 5 条；摘录 2 KiB |
-| 按时间点读取，单个视口 | 500 块 |
+| 按时间点读取，单个视口 | 500 块；热缓存 p95 ≤ 15 ms，冷缓存 p95 ≤ 150 ms（P0 基准：9–10 ms / 65–125 ms） |
+| 按时间点读取整页 | 2000 块以内可以在主线程；更大的页（最多 1 万块）走 db-worker，或先读结构再读正文 |
 | 时间轴提交列表 | 每页 200 条，游标分页 |
 | 单个提交的增量下发 | 256 KiB；超过则在时间轴上折叠 |
 | 锚点重算的变更路径 | 5000 条或 10 秒；超过时按目录粗粒度标记 |
-| 单次向量扫描 | 200 ms；超时降级为 FTS |
+| 单次向量扫描 | 200 ms，按候选数算；超时降级为 FTS |
 | 单条待确认 | 5000 块 |
 | 导入单页 | 1 MiB；超过时按标题拆页 |
 | 单页同时订阅者 / 实时会话参与者 | 50 / 20 |
@@ -740,7 +753,7 @@ outline_fts             FTS5 / pg_trgm
 | D7 | embedding 和 rerank 从模型目录配置，支持 API 和 OpenAI 兼容的本地端点；未配置时退化为 FTS | 建议 |
 | D8 | 知识库空间默认走审核，可以按空间改为直写 | 建议 |
 | D9 | 会话能读到的内容 = 所有能读这个会话的人的权限交集（原来是所有驱动者的交集） | 已确认（2026-10-26，原型 Q42） |
-| D10 | 向量初版存为 BLOB，在 db-worker 里暴力扫描 | 建议 |
+| D10 | 向量初版量化成 int8，在 db-worker 里常驻、暴力扫描；按空间打包存储 | P0 基准验证（§5.3）：百万级候选以内够用，换扩展的信号见 §5.3 |
 | D11 | 自研大纲编辑器，建在 ProseMirror 视图层上；块模型是真相 | P0 原型在桌面 Chromium 上验证可行（§6.9）；移动端和真实输入法待 P1 真机 |
 | D12 | 多 agent：图谱是黑板；委派即建任务；勾成进行中即领取，带租约；完成后通知管理者，不设验收关口 | 建议（第二版去掉了验收） |
 | D13 | 计划的严格程度由写计划的人决定：不锁定的随情况改；锁定的改动先交给锁定人确认 | 已确认（做法从「两档 + 骨架 + 契约」改为「锁定」） |
@@ -771,7 +784,7 @@ outline_fts             FTS5 / pg_trgm
 | 阶段 | 内容 | 完成标准 |
 |---|---|---|
 | P-1 | Python 原型：第一版模型（`prototypes/outline/`）跑了两轮，本版模型（`prototypes/outline2/`）跑了第三轮。第四轮：派活的会话自己从子代理的回复记账，只写摘要、提问和遗留；任务完成后由整理 agent 放进事实树；另起一个 agent 只用大纲回答报告里答过的问题。第四轮已跑完（附录 B） | 附录 B 第四轮的指标 |
-| P0 | 本文；四项验证：编辑器原型（§6.9）、两种方言下按时间点读取的性能、db-worker 向量扫描基准、agent 用 markdown 大纲编辑的实测 | D6 选型、D7–D12 确认；四项验证都有数据 |
+| P0 | 本文；四项验证：编辑器原型（§6.9）、两种方言下按时间点读取的性能、db-worker 向量扫描基准、agent 用 markdown 大纲编辑的实测 | 四项都有数据（2026-10-26）：编辑器在桌面 Chromium 上验收通过（`prototypes/outline-editor/RESULTS.md`），移动端和真实输入法留到 P1 真机；按时间点读取和向量扫描见 §5.3、§7.1、§7.2（`prototypes/outline-bench/RESULTS.md`）；agent 用 markdown 大纲编辑见附录 B 四轮试用。D7、D8、D12 还待确认 |
 | P1a | 存储（空间、块、版本、提交、链接）；项目、个人、会话空间；`OutlineRead` / `OutlineSearch` / `OutlineEdit`，按预算展开；FTS；撤销即补偿提交；大纲编辑器（先单人，直接建在协同协议上）；时间机器最小版；读权限规则 | 能在新系统里起草一个项目的规格，时间轴能回放 |
 | P1b | 多人实时协同：页订阅、页实时会话、在场信息、大纲事务、agent 的三方合并 | 两人同时编辑同一块、agent 同时写入，结果正确且可回放 |
 | P2 | 替换 spec://：复选框任务、事实视图（过程收成「进行中」）、领取与租约、锁定与待确认、计划模式改造、委派即任务、子代理报告挂回、唤醒、团队动态、续跑改造、行为边界页、内置视图注入、旧 spec 导入（含被吞内容的排查）；多工作区与关注范围；`Ask` 与收件箱、汇报 | spec 相关的表和代码退役；一个团队任务能从委派走到完成 |
@@ -789,7 +802,7 @@ outline_fts             FTS5 / pg_trgm
 3. **任务反思与 `/goal`**：已定（D26，§4.8）。
 4. **SpecMarkdownEditor 丢内容**：已修（D24，提交 `df821f4d`）。
 5. **块选择模式与移动端手势**（原型 Q7）。
-6. **超长页**：占位节点是否够用，还是只靠折叠与聚焦（原型 Q8），以 P0 数据为准。
+6. **超长页**：存储这一侧已有答案，1 万块的页整页读取 p95 31–38 ms，不用因为性能拆页；编辑器这一侧，P0 原型 5000 块首次渲染 172 ms，占位节点没做，是否够用留到 P1（原型 Q8）。
 7. **知识库旧修订保留多久**（原型 Q9）。
 8. **标签**：属性里的字符串数组，还是每个标签一页（原型 Q10）。
 9. **跨仓库**：已定（D21，§4.6）。
@@ -807,7 +820,7 @@ outline_fts             FTS5 / pg_trgm
 - **编辑器与实时协同的复杂度**：自研编辑器、块内方言、页实时会话、嵌入就地编辑、输入法和移动端叠在一起，是工作量最大的不确定项。P0 原型在桌面 Chromium 上按 §6.9 验收通过；剩下最大的风险是真实输入法和移动端软键盘，P1 要真机测。
 - **依据挂错**：自动挂接只是候选，块上显示依据来自哪次调用，人和 agent 可以改；第三轮试用量化准确率。
 - **暂定决定被推翻的连锁影响**：建在暂定决定上的块都被标出来，推翻时列出受影响的范围。
-- **按时间点读取的性能**：历史增长后能否保持视口级延迟，P0 先做基准。
+- **按时间点读取的性能**：P0 基准已验证，每块 30 个版本时仍在视口级延迟内；外推到每块 100 个版本是 25–30 ms，没有实测，到那时再考虑按页做检查点。
 - **多 agent 的成本与唤醒风暴**：唤醒有频率上限，自动领取默认关闭，关注范围里的变化只进摘要、不单独唤醒。
 - **多工作区的安全**：执行类工具能落到多台设备上，授权检查必须在执行路径上；生产设备默认不绑定，要执行时由人确认，建议带期限。
 - **整理放错或改坏事实**：出处双向可查，时间轴上可以撤销；统计原样保留率，偏低就换模型或先转待确认；知识库空间本来就走审核。
