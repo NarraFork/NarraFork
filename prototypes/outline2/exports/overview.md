@@ -1,4 +1,4 @@
-<!-- 由 prototypes/outline2/outline.py export 生成（第 476 个提交）。真相源是 data/log.jsonl，不要手改。 -->
+<!-- 由 prototypes/outline2/outline.py export 生成（第 480 个提交）。真相源是 data/log.jsonl，不要手改。 -->
 
 # 大纲总览（事实视图）
 
@@ -33,6 +33,12 @@
       - [p/mHPXdGnR] 块和空间的短 id 只用字母和数字：`_` 在 `[[…]]` 里会被方言转义，开头的 `-`、`_` 也不是合法的地址字符
       - [p/1GA4nIZi] 加表要同步改 `scripts/lib/__tests__/check-postgres-schema-parity.test.ts` 里写死的表数和列数，否则 CI 会红
       - [p/eF5scG1a] 规范化目前在主线程上跑，最坏一次写入约一秒；PR6、PR8 接入不可信输入前要挪进 worker
+    - [p/BvJTt1Ci] 读取与检索已在产品代码里实现：`server/services/outline/read.ts`、`render.ts`、`search.ts`、`resolve.ts`、`revert.ts`（#266，2026-10-26 合并）。都只接受调用方给的可读空间，不自己查权限；撤销也不查谁能撤销
+      - [p/VECJi32s] 按时间点读一页：先用一条走 `(page_id, from_seq, to_seq)` 索引的语句读结构（不带正文），再只为要显示的块按精确的版本键取正文。2000 块的页、每块约 10 个版本：一屏 500 块 p95 10.3 ms，agent 默认预算的 readOutline p95 9.6 ms；超过 2000 块的页放到 db-worker 读
+      - [p/2AaKDNIa] 每次读页都走的两条语句用预编译语句而不是 Drizzle 构建器：构建和行映射的开销是查询本身的好几倍（500 块正文 6 ms 降到 1.5 ms）
+      - [p/5K5qZPCv] 渲染：根块总显示，之后广度优先、一层放满再往下，放不下的折成缩进的「‹… N more›」行；事实视图隐藏任务和它下面的一切，末尾一行说隐藏了多少；这些注释行用 stripReadAnnotations 去掉后，读回来正好是显示的块
+      - [p/pO5fqzlB] 撤销是补偿提交（kind = revert），走普通写入规划器；之后又被改过、父块已删、会成环、会连带删掉别的块的，跳过并说明；恢复已删除的块时别名被占就去掉，排序键被占就排在占用者后面
+      - [p/RixxXurj] 没做的：事实块上的「进行中」标记、嵌入展开（PR6）；事实视图的时间轴过滤（PR7）
   - [p/gY26rSAk] 写入、审核与权限：默认直写、可以撤销；知识库空间默认走审核；会话的读权限取能读它的人的权限交集；个人空间和子代理空间的取舍（D1、D8、D9、D31）
     - [p/aQdrRFwd] D1 默认直写，带来源、可以撤销；少数改动转成待确认，不打断 agent；探索出来的会话只写自己的会话空间
       - [p/cSRo6HMn] D1a 例外（删除或移动团队之外的人写的块、单次改动超过 50 个已有块）自动转成待确认，不打断 agent；待确认进负责人的收件箱，agent 接着做别的（见 D25b）
