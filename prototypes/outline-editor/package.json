@@ -1,0 +1,21 @@
+{
+	"name": "outline-editor-prototype",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"build": "bun scripts/build.ts",
+		"test": "bun test test/",
+		"e2e": "bun scripts/build.ts && node e2e/run.mjs",
+		"serve": "bun scripts/build.ts && node e2e/serve.mjs"
+	},
+	"dependencies": {
+		"marked": "18.0.7",
+		"prosemirror-commands": "1.7.2",
+		"prosemirror-keymap": "1.2.3",
+		"prosemirror-model": "1.25.12",
+		"prosemirror-state": "1.4.4",
+		"prosemirror-transform": "1.12.2",
+		"prosemirror-view": "1.42.6",
+		"yjs": "13.6.33"
+	}
+}

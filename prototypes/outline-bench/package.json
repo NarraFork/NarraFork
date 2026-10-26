@@ -1,0 +1,12 @@
+{
+	"name": "outline-bench",
+	"private": true,
+	"type": "module",
+	"description": "P0 benchmarks for the outline knowledge design (docs/OUTLINE_KNOWLEDGE-DESIGN.md): point-in-time reads and brute-force vector scan.",
+	"scripts": {
+		"tt:gen": "bun time-travel/gen.ts",
+		"tt:bench": "bun time-travel/bench.ts",
+		"vec:bench": "bun vector/bench.ts",
+		"vec:recall": "bun vector/recall.ts"
+	}
+}

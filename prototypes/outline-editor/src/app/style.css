@@ -1,0 +1,227 @@
+:root {
+	--bg: #fff;
+	--fg: #1f2328;
+	--muted: #6e7781;
+	--line: #d0d7de;
+	--accent: #4c6ef5;
+	--code-bg: #f6f8fa;
+	color-scheme: light dark;
+}
+@media (prefers-color-scheme: dark) {
+	:root {
+		--bg: #1a1b1e;
+		--fg: #e6e6e6;
+		--muted: #9aa0a6;
+		--line: #373a40;
+		--accent: #748ffc;
+		--code-bg: #25262b;
+	}
+}
+* {
+	box-sizing: border-box;
+}
+body {
+	margin: 0;
+	font: 15px/1.5 system-ui, "PingFang SC", "Noto Sans CJK SC", sans-serif;
+	background: var(--bg);
+	color: var(--fg);
+	display: grid;
+	grid-template-columns: 1fr 320px;
+	grid-template-rows: auto 1fr;
+	min-height: 100vh;
+}
+.toolbar {
+	grid-column: 1 / -1;
+	display: flex;
+	flex-wrap: wrap;
+	gap: 12px;
+	align-items: center;
+	padding: 8px 16px;
+	border-bottom: 1px solid var(--line);
+}
+.toolbar input[type="number"] {
+	width: 64px;
+}
+#app {
+	display: grid;
+	grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+	gap: 12px;
+	padding: 12px 16px;
+	align-content: start;
+}
+.panel {
+	border: 1px solid var(--line);
+	border-radius: 8px;
+	padding: 8px 12px;
+	min-width: 0;
+}
+.panel.wide {
+	grid-column: 1 / -1;
+}
+.panel h2,
+.side h2 {
+	font-size: 13px;
+	color: var(--muted);
+	margin: 0 0 6px;
+}
+.side {
+	border-left: 1px solid var(--line);
+	padding: 12px;
+	overflow: auto;
+	font-size: 12px;
+}
+.side pre {
+	white-space: pre-wrap;
+	word-break: break-all;
+}
+@media (max-width: 800px) {
+	body {
+		grid-template-columns: 1fr;
+	}
+	.side {
+		border-left: 0;
+		border-top: 1px solid var(--line);
+	}
+}
+
+/* 编辑器 */
+.ProseMirror {
+	outline: none;
+	white-space: pre-wrap;
+	word-wrap: break-word;
+	min-height: 40px;
+}
+.ob-block {
+	position: relative;
+	padding-left: 22px;
+}
+.ob-gutter {
+	position: absolute;
+	left: 0;
+	top: 0;
+	width: 22px;
+	height: 1.5em;
+	display: flex;
+	align-items: center;
+	gap: 2px;
+	user-select: none;
+}
+.ob-bullet {
+	width: 14px;
+	text-align: center;
+	cursor: pointer;
+	color: var(--muted);
+}
+.ob-bullet::before {
+	content: "•";
+}
+.ob-block.collapsed > .ob-gutter .ob-bullet::before {
+	content: "▸";
+}
+.ob-block.collapsed > .ob-content > .ob-children {
+	display: none;
+}
+.ob-block[data-task]:not([data-task=""]) {
+	padding-left: 40px;
+}
+.ob-block[data-task]:not([data-task=""]) > .ob-gutter {
+	width: 40px;
+}
+.ob-check {
+	cursor: pointer;
+}
+.ob-block[data-task="x"] > .ob-content > p {
+	color: var(--muted);
+	text-decoration: line-through;
+}
+.ob-children {
+	border-left: 1px solid var(--line);
+	margin-left: -15px;
+	padding-left: 14px;
+}
+.ob-content p,
+.ob-content h1,
+.ob-content h2,
+.ob-content h3,
+.ob-content blockquote,
+.ob-content pre,
+.ob-content table {
+	margin: 0;
+	min-height: 1.5em;
+}
+.ob-content h1 {
+	font-size: 1.5em;
+}
+.ob-content h2 {
+	font-size: 1.25em;
+}
+.ob-content h3 {
+	font-size: 1.1em;
+}
+.ob-content blockquote {
+	border-left: 3px solid var(--line);
+	padding-left: 8px;
+	color: var(--muted);
+}
+.ob-content pre {
+	background: var(--code-bg);
+	padding: 4px 8px;
+	border-radius: 4px;
+	font: 13px/1.5 ui-monospace, monospace;
+}
+.ob-content code {
+	background: var(--code-bg);
+	border-radius: 3px;
+	padding: 0 3px;
+	font-family: ui-monospace, monospace;
+}
+.ob-content table {
+	border-collapse: collapse;
+}
+.ob-content td {
+	border: 1px solid var(--line);
+	padding: 2px 8px;
+	min-width: 40px;
+}
+.ob-content tr:first-child td {
+	font-weight: 600;
+}
+.ob-mention {
+	color: var(--accent);
+	background: color-mix(in srgb, var(--accent) 12%, transparent);
+	border-radius: 3px;
+	padding: 0 3px;
+}
+.ob-embed {
+	border: 1px dashed var(--accent);
+	border-radius: 6px;
+	padding: 2px 8px 4px;
+	margin: 2px 0;
+}
+.ob-embed.selected {
+	outline: 2px solid var(--accent);
+}
+.ob-embed-head {
+	font-size: 11px;
+	color: var(--muted);
+}
+.ob-peer > .ob-gutter {
+	box-shadow: inset 3px 0 0 var(--peer);
+}
+.ob-peer-caret {
+	border-left: 2px solid;
+	margin-left: -1px;
+	margin-right: -1px;
+	position: relative;
+}
+.ob-peer-caret::after {
+	content: attr(data-user);
+	position: absolute;
+	top: -1.1em;
+	left: -1px;
+	font-size: 10px;
+	color: #fff;
+	background: currentColor;
+	padding: 0 2px;
+	white-space: nowrap;
+}

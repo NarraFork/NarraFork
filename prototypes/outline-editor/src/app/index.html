@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN">
+	<head>
+		<meta charset="utf-8" />
+		<meta name="viewport" content="width=device-width, initial-scale=1" />
+		<title>大纲编辑器原型</title>
+		<link rel="stylesheet" href="style.css" />
+	</head>
+	<body>
+		<header class="toolbar">
+			<strong>大纲编辑器原型（P0）</strong>
+			<label>网络延迟 <input id="latency" type="number" value="0" min="0" step="10" /> ms</label>
+			<label><input id="holdA" type="checkbox" /> 暂停 Alice 的网络</label>
+			<label><input id="holdB" type="checkbox" /> 暂停 Bob 的网络</label>
+			<button id="agentRead" type="button">agent 读 P1</button>
+			<button id="agentWrite" type="button">agent 改「第三块」</button>
+		</header>
+		<main id="app"></main>
+		<aside class="side">
+			<h2>agent 输出</h2>
+			<pre id="agentOut"></pre>
+			<h2>服务端状态</h2>
+			<pre id="debug"></pre>
+		</aside>
+		<script type="module" src="main.js"></script>
+	</body>
+</html>

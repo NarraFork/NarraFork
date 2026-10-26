@@ -1,0 +1,314 @@
+{
+ "label": "sqlite-write-vpb10",
+ "meta": {
+  "info": {
+   "blocks": 110000,
+   "pages": 51,
+   "versions": 1100015,
+   "commits": 195494,
+   "members": 137021,
+   "versionsPerBlock": {
+    "mean": 10.000136363636363,
+    "p50": 3,
+    "p90": 25,
+    "p99": 108,
+    "max": 1637
+   },
+   "versionsPerCommit": {
+    "mean": 5.626847882799472,
+    "p50": 1,
+    "p95": 19,
+    "max": 9000
+   },
+   "avgContentBytes": 372,
+   "spaceMaxSeq": [
+    40863,
+    27440,
+    60886,
+    27639,
+    38666
+   ],
+   "flagCounts": {
+    "CREATED": 105712,
+    "CONTENT": 855215,
+    "MOVED": 25126,
+    "DELETED": 40800,
+    "RESTORED": 27062,
+    "TASK": 69752,
+    "PAGE": 4614
+   }
+  },
+  "params": {
+   "seed": 1,
+   "spaces": 5,
+   "pagesPerSpace": 10,
+   "blocksPerPage": 2000,
+   "giantBlocks": 10000,
+   "vpb": 10,
+   "initialFraction": 0.9
+  }
+ },
+ "sizesBase": {
+  "c_space_seq": 6635520,
+  "outline_block_versions": 647749632,
+  "outline_blocks": 49336320,
+  "outline_commits": 34131968,
+  "outline_page_members": 8597504,
+  "pk_blocks": 3170304,
+  "pk_commits": 5959680,
+  "pk_versions": 43773952,
+  "sqlite_schema": 4096,
+  "v_commit": 33984512
+ },
+ "sizesByVariant": {
+  "A1": {
+   "ix_a1": 39247872
+  },
+  "A2": {
+   "ix_a2": 43765760
+  },
+  "B1": {
+   "ix_b1": 39387136
+  },
+  "B2": {
+   "ix_b2": 43003904
+  },
+  "B3": {
+   "ix_b3": 43835392
+  },
+  "B5": {
+   "ix_b5": 105684992
+  },
+  "C": {
+   "ix_c": 5414912
+  }
+ },
+ "verifyReport": {},
+ "plans": {},
+ "results": [
+  {
+   "dialect": "sqlite-write-vpb10",
+   "variant": "A1",
+   "query": "W1 commit 1 block",
+   "scope": "write",
+   "bucket": "all",
+   "rows": 1,
+   "summary": {
+    "n": 400,
+    "p50": 0.08469500000001062,
+    "p95": 0.255069000000276,
+    "p99": 1.5074979999999414,
+    "max": 19.04165600000033,
+    "mean": 0.3033527174999972
+   }
+  },
+  {
+   "dialect": "sqlite-write-vpb10",
+   "variant": "A1",
+   "query": "W2 commit 200 blocks",
+   "scope": "write",
+   "bucket": "all",
+   "rows": 200,
+   "summary": {
+    "n": 30,
+    "p50": 38.68391700000029,
+    "p95": 57.86469500000021,
+    "p99": 59.400055999999495,
+    "max": 59.400055999999495,
+    "mean": 31.582147933333303
+   }
+  },
+  {
+   "dialect": "sqlite-write-vpb10",
+   "variant": "A2",
+   "query": "W1 commit 1 block",
+   "scope": "write",
+   "bucket": "all",
+   "rows": 1,
+   "summary": {
+    "n": 400,
+    "p50": 0.07685099999980594,
+    "p95": 0.2123410000003787,
+    "p99": 1.030257000000347,
+    "max": 16.232030000000123,
+    "mean": 0.2534573299999897
+   }
+  },
+  {
+   "dialect": "sqlite-write-vpb10",
+   "variant": "A2",
+   "query": "W2 commit 200 blocks",
+   "scope": "write",
+   "bucket": "all",
+   "rows": 200,
+   "summary": {
+    "n": 30,
+    "p50": 37.50145900000007,
+    "p95": 56.33377199999995,
+    "p99": 59.589765999999145,
+    "max": 59.589765999999145,
+    "mean": 31.073021899999972
+   }
+  },
+  {
+   "dialect": "sqlite-write-vpb10",
+   "variant": "B1",
+   "query": "W1 commit 1 block",
+   "scope": "write",
+   "bucket": "all",
+   "rows": 1,
+   "summary": {
+    "n": 400,
+    "p50": 0.07324300000072981,
+    "p95": 0.20249499999954423,
+    "p99": 1.0421429999987595,
+    "max": 19.084960000000137,
+    "mean": 0.2495724600000358
+   }
+  },
+  {
+   "dialect": "sqlite-write-vpb10",
+   "variant": "B1",
+   "query": "W2 commit 200 blocks",
+   "scope": "write",
+   "bucket": "all",
+   "rows": 200,
+   "summary": {
+    "n": 30,
+    "p50": 11.267400000000634,
+    "p95": 40.10237100000086,
+    "p99": 41.98195900000064,
+    "max": 41.98195900000064,
+    "mean": 23.19027246666671
+   }
+  },
+  {
+   "dialect": "sqlite-write-vpb10",
+   "variant": "B2",
+   "query": "W1 commit 1 block",
+   "scope": "write",
+   "bucket": "all",
+   "rows": 1,
+   "summary": {
+    "n": 400,
+    "p50": 0.08075800000005984,
+    "p95": 0.205324999998993,
+    "p99": 13.276718999999503,
+    "max": 20.11315899999863,
+    "mean": 0.2868694175000428
+   }
+  },
+  {
+   "dialect": "sqlite-write-vpb10",
+   "variant": "B2",
+   "query": "W2 commit 200 blocks",
+   "scope": "write",
+   "bucket": "all",
+   "rows": 200,
+   "summary": {
+    "n": 30,
+    "p50": 15.367784000000029,
+    "p95": 43.51544600000125,
+    "p99": 50.645174000001134,
+    "max": 50.645174000001134,
+    "mean": 25.331208900000213
+   }
+  },
+  {
+   "dialect": "sqlite-write-vpb10",
+   "variant": "B3",
+   "query": "W1 commit 1 block",
+   "scope": "write",
+   "bucket": "all",
+   "rows": 1,
+   "summary": {
+    "n": 400,
+    "p50": 0.08722400000078778,
+    "p95": 0.15663800000038464,
+    "p99": 13.50936300000103,
+    "max": 22.353729000000385,
+    "mean": 0.31117096500004665
+   }
+  },
+  {
+   "dialect": "sqlite-write-vpb10",
+   "variant": "B3",
+   "query": "W2 commit 200 blocks",
+   "scope": "write",
+   "bucket": "all",
+   "rows": 200,
+   "summary": {
+    "n": 30,
+    "p50": 25.20946499999991,
+    "p95": 41.71145500000057,
+    "p99": 44.2515199999998,
+    "max": 44.2515199999998,
+    "mean": 24.59490220000001
+   }
+  },
+  {
+   "dialect": "sqlite-write-vpb10",
+   "variant": "B5",
+   "query": "W1 commit 1 block",
+   "scope": "write",
+   "bucket": "all",
+   "rows": 1,
+   "summary": {
+    "n": 400,
+    "p50": 0.07732700000269688,
+    "p95": 0.17472599999746308,
+    "p99": 14.313292000002548,
+    "max": 23.14672799999971,
+    "mean": 0.2955188425000961
+   }
+  },
+  {
+   "dialect": "sqlite-write-vpb10",
+   "variant": "B5",
+   "query": "W2 commit 200 blocks",
+   "scope": "write",
+   "bucket": "all",
+   "rows": 200,
+   "summary": {
+    "n": 30,
+    "p50": 14.426410000000033,
+    "p95": 43.620215999999346,
+    "p99": 44.728502999998454,
+    "max": 44.728502999998454,
+    "mean": 25.487819200000256
+   }
+  },
+  {
+   "dialect": "sqlite-write-vpb10",
+   "variant": "C",
+   "query": "W1 commit 1 block",
+   "scope": "write",
+   "bucket": "all",
+   "rows": 1,
+   "summary": {
+    "n": 400,
+    "p50": 0.06135300000096322,
+    "p95": 0.211170000002312,
+    "p99": 1.4406980000021576,
+    "max": 14.348593999999139,
+    "mean": 0.19037309000001187
+   }
+  },
+  {
+   "dialect": "sqlite-write-vpb10",
+   "variant": "C",
+   "query": "W2 commit 200 blocks",
+   "scope": "write",
+   "bucket": "all",
+   "rows": 200,
+   "summary": {
+    "n": 30,
+    "p50": 10.05276899999808,
+    "p95": 36.27981300000101,
+    "p99": 37.387456000000384,
+    "max": 37.387456000000384,
+    "mean": 21.044083200000387
+   }
+  }
+ ]
+}
