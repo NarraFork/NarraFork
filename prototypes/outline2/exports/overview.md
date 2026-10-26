@@ -1,4 +1,4 @@
-<!-- 由 prototypes/outline2/outline.py export 生成（第 472 个提交）。真相源是 data/log.jsonl，不要手改。 -->
+<!-- 由 prototypes/outline2/outline.py export 生成（第 476 个提交）。真相源是 data/log.jsonl，不要手改。 -->
 
 # 大纲总览（事实视图）
 
@@ -42,6 +42,11 @@
       - [p/04Kyx8dy] 理由：个人空间放的是本人的笔记、偏好和记忆；不加「本轮由所有者执行」，管理员驱动别人的单人会话就能绕过去。管理员的运维入口另有：项目或用户删掉后留下的空间对管理员可读，以后还有彻底清除。知识库的先例相反（管理员能打开别人的个人条目），迁移时以这里为准
       - [p/55q8Jba5] 子代理没有自己的受众，权限本来就按根会话判断，干的活也由派它的会话记账；写在根会话空间里，根会话直接读得到，子代理的会话记录被清掉时笔记不丢。提交上仍记子代理是执行者
       - [p/UU9Ip8Gv] 分享链接的读者包括实例外的人，严格说比公开项目的读者范围大；负责人选择和公开会话一样处理，让分享出去的会话里 agent 仍能用公开项目的知识。要收紧只改 session-scope.ts 一处
+    - [p/VNLmGDGl] 空间与权限已在产品代码里实现：`server/services/outline/spaces.ts`、`access.ts`、`session-scope.ts`（#265，2026-10-26 合并）。会话的读权限交集按空间逐个判断，结果按会话缓存 30 秒，收到 narrator:access_changed、project:access_changed、auth:changed 时清掉
+      - [p/HdMGLlpc] 现有的项目、会话权限函数只能在 SQLite 上跑，大纲这边在 `access-reads.ts` 里用两种方言都能跑的 SQL 重述了规则，`access-parity.test.ts` 和原函数逐条对照；以后那些模块迁到 PG 时可以反过来复用
+      - [p/Ahtp66es] 权限变化原先只有发给受影响用户的 WebSocket 消息，没有服务端事件；PR5 在共享、项目成员、分享链接三处补发了 narrator:access_changed 和 project:access_changed
+      - [p/EaSDiBON] 列表谓词（projectReadableWhere 等）只看用户授权、不看角色授权，所以 listReadableSpaces 可能比单个空间的判断少列，不会多列
+      - [p/PqVohns8] PG 上 resolveNarratorProjectId 只认 contextProjectId：靠工作目录归入项目的会话在 PG 上算没有项目，只能读自己的会话空间
   - [p/Jd78KW69] 检索、注入与新鲜度：embedding 与 rerank 可配置，没配置时退化为 FTS，向量初版在 db-worker 里常驻 int8 暴力扫描（P0 基准验证过，换扩展的信号见 D10）；注入受权限约束；代码已变的块在读取时复核；整理过的笔记在检索里折叠到事实下（D2、D7、D10、D22、D28）
     - [p/PeiyVKZE] D2 知识过期默认在读取时复核；批量复核由用户点按钮触发；后台复核默认关闭
     - [p/UX1YUbm4] D7 embedding 与 rerank 从模型目录配置，支持 API 与 OpenAI 兼容的本地端点；没配置时退化为 FTS

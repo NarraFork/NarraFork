@@ -1,12 +1,11 @@
-<!-- 由 prototypes/outline2/outline.py export 生成（第 472 个提交）。真相源是 data/log.jsonl，不要手改。 -->
+<!-- 由 prototypes/outline2/outline.py export 生成（第 476 个提交）。真相源是 data/log.jsonl，不要手改。 -->
 
 # 任务看板
 
-### 进行中（4）
+### 进行中（3）
 - [p/H0a1nXuL] [/] 大纲系统路线图：建成知识、记忆与任务的统一平台
 - [p/DrYdFrth] [/] P-1 Python 原型与自用：先用原型承载这份计划，真实推进，从使用中发现问题 @agent:main ← 路线图
 - [p/jFJm2zG1] [/] PR4 读取与检索：读页、读子树、按时间点读、按预算渲染、事实过滤、FTS 检索、补偿提交 @agent:main ← P1a
-- [p/PROPV87j] [/] PR5 空间与权限：项目、个人、会话空间的建立与解析，HTTP 权限，会话的读权限交集（D9、D22b） @agent:main ← P1a
 
 ### 待办（17）
 - [p/bd2Egjgc] [ ] P1a 核心存储、三个 agent 工具、大纲编辑器（先单人，建在协同协议上）、导图与聚焦、时间机器最小版、会话读权限；实施计划见 docs/OUTLINE_IMPLEMENTATION-PLAN.md ← 路线图
@@ -22,12 +21,12 @@
 - [p/CJUTlph7] [ ] 端到端验证两个推断：Task 派发的子代理初始 prompt 也会被扫；pass 重启时可能陆续注入超过 3 条 ← 调研：知识库现在怎么检索、注入、
 - [p/6yOuvxoQ] [ ] 把 SQL 谓词版 ACL 在大知识库上的性能放进 P0 基准 ← 调研：知识库现在怎么检索、注入、
 - [p/cp4IAr6P] [ ] 真机测输入法和移动端软键盘：§6.9 第 2 项，以及 Safari、iOS、Android 和 macOS、Windows 上的真实输入法；先看组合中收到不经输入法的 Enter 会不会拆块 ← P1a
-- [p/7KtDqc4v] [ ] PR6 agent 工具：OutlineRead、OutlineSearch、OutlineEdit，权限名单、界面卡片、截断豁免、知识注入点 B 排除 ‹等前置：PR4 读取与检索：读页,PR5 空间与权限：项目› ← P1a
-- [p/aSzIreyL] [ ] PR7 HTTP 路由、页订阅（只读）、前端只读页：空间列表、读页、时间轴、导航、i18n ‹等前置：PR4 读取与检索：读页,PR5 空间与权限：项目› ← P1a
+- [p/7KtDqc4v] [ ] PR6 agent 工具：OutlineRead、OutlineSearch、OutlineEdit，权限名单、界面卡片、截断豁免、知识注入点 B 排除 ‹等前置：PR4 读取与检索：读页› ← P1a
+- [p/aSzIreyL] [ ] PR7 HTTP 路由、页订阅（只读）、前端只读页：空间列表、读页、时间轴、导航、i18n ‹等前置：PR4 读取与检索：读页› ← P1a
 - [p/B4WqfZIX] [ ] PR8 页实时会话（单人）和大纲编辑器，P0 验收清单第 1、3、4、7、9 项在产品里重跑 ‹等前置：PR7 HTTP 路由、› ← P1a
 - [p/P1TNP03K] [ ] PR9 导图视图、聚焦、快速切换、每人每页的视图状态，原型验收在产品里重跑 ‹等前置：PR8 页实时会话（单人› ← P1a
 
-### 完成（25）
+### 完成（26）
 - [p/ydKe7oMn] [x] P0 设计与验证 ← 路线图
 - [p/5nB0TYwk] [x] 核实：在 SpecMarkdownEditor 里编辑含表格的 spec 文件并保存，表格会不会丢；属实就给出修复方案（来自 Q6 调研的顺带发现 [[p/f3TO9Yre]]） @agent:w-table ← 现状spec
 - [p/uHnUVJL1] [x] 搭原型：块、链接、提交、时间机器、任务、两档计划、变更请求、断言与锚点 @agent:main ← P-1
@@ -53,4 +52,5 @@
 - [p/EZKMMzR0] [x] PR1 导图与聚焦原型：在 prototypes/outline-editor 上加导图视图、切换动画、聚焦、快速切换，按实施计划 §10.2 验收 @agent:main ← P1a
 - [p/bFHA849C] [x] PR2 shared/outline：方言、markdown 大纲、地址、排序键，从原型移植，加三个解析器的一致性模糊测试 @agent:main ← P1a
 - [p/7uSZ51Cn] [x] PR3 存储：表和两种方言的迁移、存储端口和实现、写入不变量、提交、链接抽取、FTS 运行时建表、全局开关 outline.enabled @agent:main ← P1a
+- [p/PROPV87j] [x] PR5 空间与权限：项目、个人、会话空间的建立与解析，HTTP 权限，会话的读权限交集（D9、D22b） @agent:main ← P1a
 
