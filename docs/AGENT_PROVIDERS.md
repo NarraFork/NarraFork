@@ -46,6 +46,7 @@
 **选择规则**
 - 模型卡字段 `tool_loading_modes`（按优先级排列）优先；未声明时按裸模型名取默认值：含 `claude` → `anthropic_tool_addition`（Opus 4.8+、Sonnet/Haiku 5.5+、Fable/Mythos；更早的版本不启用），含 `gpt` → `openai_additional_tools`（OpenAI API 需 5.4+，Codex 后端需 5.6+；开源权重的 `gpt-oss` 按"其他"处理），含 `deepseek` → `anthropic_deferred_tail`，Kimi K3+（`kimi-k3*`、Kimi Coding 的 `k3`/`k3-256k`）与 `kimi-for-coding` → `kimi_system_tools`、`custom_injection`（K2.x 与 `kimi-for-coding-highspeed` 会以 400 拒绝带 `tools` 的 system 消息，只用 `custom_injection`；经 Anthropic/Responses 协议访问时落到 `custom_injection`），其他 → `custom_injection`。解析不出版本号的照常启用。
 - 取列表里第一个与适配器 `toolLoadingTarget()` 报告的协议相容的方式，都不相容就用 `replace_tools`。NUG 按渠道类型报告协议，并用路由后的模型名匹配默认值。
+- 因此新增 Kimi 供应商时默认创建为 Chat Completions 协议（预设字段 `creationProtocol`，见 `frontend/components/providers/provider-connection-presets.ts`），只有这条路径能给出 `kimi_system_tools`。Anthropic/Responses 仍可在协议下拉里手选，届时按上一条落到 `custom_injection`。
 - 设为空列表 `[]` 即对该模型关闭，在设置页模型卡里编辑。
 
 **几处容易出错的地方**

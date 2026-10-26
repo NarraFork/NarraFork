@@ -236,6 +236,7 @@ async function render(
 		.map((item) => `- ${item.message} (offset ${item.offset})`);
 	const metadata = {
 		genUiInline: { version: 1, kit: project ? "project" : "builtin" },
+		genUiInspection: { workspaceKey: workspaceKey(env.workspace) },
 		genUiKit: notice(snapshot.status, prompt.shown),
 	};
 	const notes = [
@@ -257,6 +258,7 @@ async function render(
 			? [`kit.json is invalid (${snapshot.status.reason}); fix it before the next build.`]
 			: []),
 		describeRenderRequest(prompt),
+		`Inspect: ${JSON.stringify({ action: "inspect", toolUseId: env.ctx.currentToolUseId, toolCallId: env.ctx.toolCallBinding?.toolCallId })}`,
 	];
 	if (input.wait) return waitForForm(input, env, state.actions, notes, metadata);
 	return {

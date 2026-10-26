@@ -38,6 +38,13 @@ import { resolveAdvertisedAppUrl } from "./lib/dev-app-url";
 import { startEventLoopMonitor } from "./lib/event-loop-monitor";
 import { rebindHttpListener } from "./lib/http-listener-rebind";
 import { logger } from "./lib/logger";
+import {
+	createManagerRebindCoordinator,
+	isListenerPortConflict,
+	resolveManagerListenHost,
+	startManagerListenerGroup,
+} from "./lib/manager-control-server";
+import { readManagerToken } from "./lib/manager-token";
 import { mcpManager } from "./lib/mcp/manager";
 import { syncMcpTools } from "./lib/mcp/tool-bridge";
 import { getNarraforkHome, getNarraforkPath } from "./lib/narrafork-home";
@@ -51,7 +58,6 @@ import {
 	registerOperatorShutdownHandler,
 	registerRuntimeAddressGetter,
 	registerServerRestart,
-	scheduleServerRestart,
 } from "./lib/server-restart";
 import { reloadSettings, reloadSettingsIfChanged, settings } from "./lib/settings";
 import { startServerAddressWatcher } from "./lib/settings-address-watcher";
@@ -150,6 +156,7 @@ import {
 	resolveWSData,
 	startHeartbeat,
 	stopHeartbeat,
+	type WSData,
 	waitForWebSocketActivityDrain,
 	wsHandlers,
 } from "./websocket/ws-handler";
@@ -301,7 +308,11 @@ const cliHost = process.argv.find((a) => a.startsWith("--host="))?.split("=")[1]
 const portExplicit = !!(cliPort || process.env.PORT);
 const port = Number(cliPort) || Number(process.env.PORT) || settings.server.port;
 let configuredHost = cliHost || process.env.HOST || settings.server.host;
-let currentHost = resolveListenHost(configuredHost);
+let configuredPort = port;
+let currentHost = await resolveManagerListenHost(
+	resolveListenHost(configuredHost),
+	readManagerToken(),
+);
 // Compiled single-executable binaries are always treated as production.
 // Bun embeds files under $bunfs (Linux/macOS) or ~BUN/%7EBUN (Windows).
 const isCompiledBinary = import.meta.url.includes("$bunfs/") || import.meta.url.includes("%7EBUN/");
@@ -785,9 +796,9 @@ const startupReadiness = createStartupReadinessGate();
 // Try to start the server, with automatic port fallback when the default port is busy.
 const MAX_PORT_RETRIES = 10;
 
-/** Return the URL protocol based on current TLS config. */
+/** Advertise the listener's real protocol, including after a TLS rollback. */
 function getProtocol(): "https" | "http" {
-	return settings.server.tls?.enabled ? "https" : "http";
+	return _server.url.protocol === "https:" ? "https" : "http";
 }
 
 async function resolveVNetRelayAuth(req: Request, url: URL): Promise<VNetRelayAuth | null> {
@@ -861,7 +872,11 @@ function stopHttpListener(): void {
 
 let boundTlsConfig = settings.server.tls;
 
-function startServer(listenPort: number, tlsCfg: typeof settings.server.tls) {
+function startServer(
+	listenPort: number,
+	tlsCfg: typeof settings.server.tls,
+	allowHostFallback = false,
+) {
 	const tls =
 		tlsCfg?.enabled && tlsCfg.certFile && tlsCfg.keyFile
 			? {
@@ -872,265 +887,283 @@ function startServer(listenPort: number, tlsCfg: typeof settings.server.tls) {
 				}
 			: undefined;
 
-	const server = Bun.serve({
-		port: listenPort,
-		hostname: currentHost,
-		idleTimeout: 255,
-		tls,
-		fetch(req, server) {
-			if (!acceptingHttpRequests) {
-				return new Response("Server is shutting down", {
+	const fetchRequest = (
+		req: Request,
+		server: Pick<Bun.Server<WSData>, "requestIP" | "upgrade">,
+	) => {
+		if (!acceptingHttpRequests) {
+			return new Response("Server is shutting down", {
+				status: 503,
+				headers: { "Retry-After": "1" },
+			});
+		}
+		const requestId = ++nextHttpRequestId;
+		const execution = httpRequestContext.run(requestId, async () => {
+			const url = new URL(req.url);
+
+			// Keep liveness available while exposing whether continuation recovery is still
+			// running or has failed. Recovery is considered admitted once every continuation
+			// has been protected and mounted in the background; terminal Agent/Await and user
+			// permission waits must never hold this barrier.
+			if (url.pathname === "/api/health") {
+				const healthResponse = await app.fetch(req);
+				const healthPayload = (await healthResponse.json().catch(() => ({}))) as Record<
+					string,
+					unknown
+				>;
+				const headers = new Headers(healthResponse.headers);
+				headers.delete("content-length");
+				headers.set("content-type", "application/json; charset=UTF-8");
+				return new Response(
+					JSON.stringify({
+						...buildHealthPayload(healthPayload, startupReadiness.state),
+						// Which database backend this process wired at startup. A monitor that
+						// watches a PostgreSQL deployment must be able to tell it actually came
+						// up on PostgreSQL — a silent fallback would report a healthy SQLite.
+						database: { backend: activeDatabaseBackend },
+					}),
+					{
+						status: healthStatusCode(startupReadiness.state, healthResponse.status),
+						headers,
+					},
+				);
+			}
+
+			const narratorWsRefusal = narratorWebSocketBackendRefusal(
+				url.pathname,
+				activeDatabaseBackend,
+			);
+			if (narratorWsRefusal) return narratorWsRefusal;
+
+			// Wait for recovery to reach a terminal outcome so restored narrators observe a
+			// consistent state, but never turn a recovery failure into a dead server: the
+			// frontend, auth and settings routes are what the user needs to repair whatever
+			// made recovery fail (e.g. a narrator pinned to a deleted provider prefix).
+			await startupReadiness.barrier;
+			if (!shouldServeRequests(startupReadiness.state)) {
+				return new Response("Startup narrator recovery failed", {
 					status: 503,
-					headers: { "Retry-After": "1" },
+					headers: { "Retry-After": "5" },
 				});
 			}
-			const requestId = ++nextHttpRequestId;
-			const execution = httpRequestContext.run(requestId, async () => {
-				const url = new URL(req.url);
 
-				// Keep liveness available while exposing whether continuation recovery is still
-				// running or has failed. Recovery is considered admitted once every continuation
-				// has been protected and mounted in the background; terminal Agent/Await and user
-				// permission waits must never hold this barrier.
-				if (url.pathname === "/api/health") {
-					const healthResponse = await app.fetch(req);
-					const healthPayload = (await healthResponse.json().catch(() => ({}))) as Record<
-						string,
-						unknown
-					>;
-					const headers = new Headers(healthResponse.headers);
-					headers.delete("content-length");
-					headers.set("content-type", "application/json; charset=UTF-8");
-					return new Response(
-						JSON.stringify({
-							...buildHealthPayload(healthPayload, startupReadiness.state),
-							// Which database backend this process wired at startup. A monitor that
-							// watches a PostgreSQL deployment must be able to tell it actually came
-							// up on PostgreSQL — a silent fallback would report a healthy SQLite.
-							database: { backend: activeDatabaseBackend },
-						}),
-						{
-							status: healthStatusCode(startupReadiness.state, healthResponse.status),
-							headers,
-						},
-					);
+			if (url.pathname === "/ws/external/v1/narrators") {
+				const rollout = getExternalWebSocketRolloutSettings();
+				const origin = req.headers.get("origin");
+				if (!isExternalWebSocketOriginAllowed(origin, rollout.allowedOrigins)) {
+					return new Response("WebSocket Origin is not allowed", { status: 403 });
 				}
-
-				const narratorWsRefusal = narratorWebSocketBackendRefusal(
-					url.pathname,
-					activeDatabaseBackend,
-				);
-				if (narratorWsRefusal) return narratorWsRefusal;
-
-				// Wait for recovery to reach a terminal outcome so restored narrators observe a
-				// consistent state, but never turn a recovery failure into a dead server: the
-				// frontend, auth and settings routes are what the user needs to repair whatever
-				// made recovery fail (e.g. a narrator pinned to a deleted provider prefix).
-				await startupReadiness.barrier;
-				if (!shouldServeRequests(startupReadiness.state)) {
-					return new Response("Startup narrator recovery failed", {
-						status: 503,
-						headers: { "Retry-After": "5" },
-					});
+				if (!canAcceptExternalNarratorConnection()) {
+					return new Response("External narrator WebSocket capacity reached", { status: 503 });
 				}
-
-				if (url.pathname === "/ws/external/v1/narrators") {
-					const rollout = getExternalWebSocketRolloutSettings();
-					const origin = req.headers.get("origin");
-					if (!isExternalWebSocketOriginAllowed(origin, rollout.allowedOrigins)) {
-						return new Response("WebSocket Origin is not allowed", { status: 403 });
-					}
-					if (!canAcceptExternalNarratorConnection()) {
-						return new Response("External narrator WebSocket capacity reached", { status: 503 });
-					}
-					const ticket = url.searchParams.get("ticket");
-					if (!ticket) return new Response("WebSocket ticket required", { status: 401 });
-					const consumed = consumeOAuthWsTicket(ticket, EXTERNAL_NARRATORS_WS_CHANNEL);
-					if (!consumed)
-						return new Response("Invalid or expired WebSocket ticket", { status: 401 });
-					const live = await validateAccessTokenById(consumed.auth.oauth.tokenId).catch(() => null);
-					if (
-						!live ||
-						live.userId !== consumed.auth.user.sub ||
-						live.clientId !== consumed.auth.oauth.clientId ||
-						live.oauthClientId !== consumed.auth.oauth.oauthClientId ||
-						live.grantId !== consumed.auth.oauth.grantId ||
-						live.refreshFamilyId !== consumed.auth.oauth.refreshFamilyId ||
-						!live.scopes.includes("narrator.read") ||
-						!live.scopes.includes("event.subscribe")
-					) {
-						return new Response("OAuth authorization is no longer valid", { status: 401 });
-					}
-					const upgraded = server.upgrade(req, {
-						data: resolveExternalNarratorWSData(consumed.auth),
-					});
-					if (upgraded) return undefined;
-					return new Response("WebSocket upgrade failed", { status: 400 });
+				const ticket = url.searchParams.get("ticket");
+				if (!ticket) return new Response("WebSocket ticket required", { status: 401 });
+				const consumed = consumeOAuthWsTicket(ticket, EXTERNAL_NARRATORS_WS_CHANNEL);
+				if (!consumed) return new Response("Invalid or expired WebSocket ticket", { status: 401 });
+				const live = await validateAccessTokenById(consumed.auth.oauth.tokenId).catch(() => null);
+				if (
+					!live ||
+					live.userId !== consumed.auth.user.sub ||
+					live.clientId !== consumed.auth.oauth.clientId ||
+					live.oauthClientId !== consumed.auth.oauth.oauthClientId ||
+					live.grantId !== consumed.auth.oauth.grantId ||
+					live.refreshFamilyId !== consumed.auth.oauth.refreshFamilyId ||
+					!live.scopes.includes("narrator.read") ||
+					!live.scopes.includes("event.subscribe")
+				) {
+					return new Response("OAuth authorization is no longer valid", { status: 401 });
 				}
+				const upgraded = server.upgrade(req, {
+					data: resolveExternalNarratorWSData(consumed.auth),
+				});
+				if (upgraded) return undefined;
+				return new Response("WebSocket upgrade failed", { status: 400 });
+			}
 
-				if (url.pathname === "/ws/vnet") {
-					const auth = await resolveVNetRelayAuth(req, url);
-					if (!auth) {
-						return new Response("VNet relay authentication required", { status: 401 });
-					}
-					const wsData = resolveWSData(url, undefined, auth);
-					if (!wsData) {
-						return new Response("Unknown WebSocket endpoint", { status: 404 });
-					}
-					const upgraded = server.upgrade(req, { data: wsData });
-					if (upgraded) return undefined;
-					return new Response("WebSocket upgrade failed", { status: 400 });
+			if (url.pathname === "/ws/vnet") {
+				const auth = await resolveVNetRelayAuth(req, url);
+				if (!auth) {
+					return new Response("VNet relay authentication required", { status: 401 });
 				}
-
-				// Remote executor devices authenticate via the hello frame (device token),
-				// not a JWT, so accept the upgrade here and let the handshake verify.
-				if (url.pathname === "/ws/device") {
-					const wsData = resolveWSData(url);
-					if (!wsData) {
-						return new Response("Unknown WebSocket endpoint", { status: 404 });
-					}
-					const upgraded = server.upgrade(req, { data: wsData });
-					if (upgraded) return undefined;
-					return new Response("WebSocket upgrade failed", { status: 400 });
+				const wsData = resolveWSData(url, undefined, auth);
+				if (!wsData) {
+					return new Response("Unknown WebSocket endpoint", { status: 404 });
 				}
+				const upgraded = server.upgrade(req, { data: wsData });
+				if (upgraded) return undefined;
+				return new Response("WebSocket upgrade failed", { status: 400 });
+			}
 
-				// WebSocket upgrade for /ws/narrator and /ws/terminal
-				if (url.pathname.startsWith("/ws")) {
-					// Anonymous public-share reader: `?share=<shareId>&token=<secret>` instead
-					// of a session token. Verified once at upgrade, scoped at subscribe time
-					// (narrator-ws reads `ws.data.publicShare`), and dropped on revocation.
-					const shareId = url.searchParams.get("share");
-					if (shareId && url.pathname === "/ws/narrator") {
-						const shareToken = url.searchParams.get("token");
-						if (!shareToken) {
-							return new Response("Authentication required", { status: 401 });
-						}
-						let share: VerifiedPublicShare;
-						try {
-							share = verifyPublicShare(shareId, `Share ${shareToken}`);
-						} catch {
-							return new Response("Share link unavailable", { status: 401 });
-						}
-						const wsData = resolveWSData(url, undefined, undefined, undefined, share);
-						if (!wsData) {
-							return new Response("Unknown WebSocket endpoint", { status: 404 });
-						}
-						const ip = resolveClientIp({
-							peerIp: server.requestIP(req)?.address,
-							xForwardedFor: req.headers.get("x-forwarded-for"),
-							xRealIp: req.headers.get("x-real-ip"),
-							trustedProxyCidrs: settings.auth.trustedProxyCidrs ?? ["127.0.0.0/8", "::1/128"],
-						});
-						if (wsData.channel !== "narrator") {
-							return new Response("Unknown WebSocket endpoint", { status: 404 });
-						}
-						const upgraded = publicShareConnectionBudget.upgrade(share.shareId, ip, (lease) => {
-							wsData.publicShareConnectionLease = lease;
-							return server.upgrade(req, { data: wsData });
-						});
-						if (upgraded === null) {
-							return new Response("Too many sharing connections", {
-								status: 429,
-								headers: { "Retry-After": "15" },
-							});
-						}
-						if (upgraded) return undefined;
-						return new Response("WebSocket upgrade failed", { status: 400 });
-					}
+			// Remote executor devices authenticate via the hello frame (device token),
+			// not a JWT, so accept the upgrade here and let the handshake verify.
+			if (url.pathname === "/ws/device") {
+				const wsData = resolveWSData(url);
+				if (!wsData) {
+					return new Response("Unknown WebSocket endpoint", { status: 404 });
+				}
+				const upgraded = server.upgrade(req, { data: wsData });
+				if (upgraded) return undefined;
+				return new Response("WebSocket upgrade failed", { status: 400 });
+			}
 
-					// Verify the session token from the query param
-					const token = url.searchParams.get("token");
-					if (!token) {
+			// WebSocket upgrade for /ws/narrator and /ws/terminal
+			if (url.pathname.startsWith("/ws")) {
+				// Anonymous public-share reader: `?share=<shareId>&token=<secret>` instead
+				// of a session token. Verified once at upgrade, scoped at subscribe time
+				// (narrator-ws reads `ws.data.publicShare`), and dropped on revocation.
+				const shareId = url.searchParams.get("share");
+				if (shareId && url.pathname === "/ws/narrator") {
+					const shareToken = url.searchParams.get("token");
+					if (!shareToken) {
 						return new Response("Authentication required", { status: 401 });
 					}
-					let payload: Awaited<ReturnType<typeof verifyToken>>;
+					let share: VerifiedPublicShare;
 					try {
-						payload = await verifyToken(token);
+						share = verifyPublicShare(shareId, `Share ${shareToken}`);
 					} catch {
-						return new Response("Invalid or expired token", { status: 401 });
+						return new Response("Share link unavailable", { status: 401 });
 					}
-
-					// Look up user info for presence tracking
-					const user = await db.query.users.findFirst({
-						where: eq(users.id, payload.sub),
-						columns: {
-							id: true,
-							username: true,
-							avatarColor: true,
-							avatarImageId: true,
-							// Read live, so a demotion applies to the next socket. The narrator
-							// subscribe path uses it for the admin short-circuit.
-							role: true,
-						},
-					});
-					// `verifyToken` already rejected revoked and expired sessions; a user row that
-					// vanished since still fails the upgrade.
-					if (!user) {
-						return new Response("Invalid or expired token", { status: 401 });
-					}
-					const userInfo = user
-						? {
-								userId: user.id,
-								username: user.username,
-								avatarColor: user.avatarColor,
-								avatarImageId: user.avatarImageId,
-								role: user.role,
-							}
-						: undefined;
-
-					// Remember the session so the socket can be re-checked when it lapses or
-					// when the user's authorization changes (logout, revocation, role).
-					const wsData = resolveWSData(url, userInfo, undefined, {
-						sessionExp: payload.exp,
-						sessionId: payload.sid,
-						sessionUserId: payload.sub,
-					});
+					const wsData = resolveWSData(url, undefined, undefined, undefined, share);
 					if (!wsData) {
 						return new Response("Unknown WebSocket endpoint", { status: 404 });
 					}
-
-					const upgraded = server.upgrade(req, { data: wsData });
+					const ip = resolveClientIp({
+						peerIp: server.requestIP(req)?.address,
+						xForwardedFor: req.headers.get("x-forwarded-for"),
+						xRealIp: req.headers.get("x-real-ip"),
+						trustedProxyCidrs: settings.auth.trustedProxyCidrs ?? ["127.0.0.0/8", "::1/128"],
+					});
+					if (wsData.channel !== "narrator") {
+						return new Response("Unknown WebSocket endpoint", { status: 404 });
+					}
+					const upgraded = publicShareConnectionBudget.upgrade(share.shareId, ip, (lease) => {
+						wsData.publicShareConnectionLease = lease;
+						return server.upgrade(req, { data: wsData });
+					});
+					if (upgraded === null) {
+						return new Response("Too many sharing connections", {
+							status: 429,
+							headers: { "Retry-After": "15" },
+						});
+					}
 					if (upgraded) return undefined;
 					return new Response("WebSocket upgrade failed", { status: 400 });
 				}
 
-				// Everything else goes to Hono. Resolve the client IP and whether the immediate
-				// socket peer is trusted at the Bun boundary, so routes never trust forwarding
-				// headers solely because a caller supplied them.
-				const peerIp = server.requestIP(req)?.address;
-				const trustedProxyCidrs = settings.auth.trustedProxyCidrs ?? ["127.0.0.0/8", "::1/128"];
-				const clientIp = resolveClientIp({
-					peerIp,
-					xForwardedFor: req.headers.get("x-forwarded-for"),
-					xRealIp: req.headers.get("x-real-ip"),
-					trustedProxyCidrs,
-				});
-				return app.fetch(req, {
-					clientIp,
-					peerIp,
-					trustedProxy: isTrustedProxyAddress(peerIp, trustedProxyCidrs),
-				});
-			});
-			activeHttpRequests.set(requestId, execution);
-			void execution.then(
-				() => activeHttpRequests.delete(requestId),
-				() => activeHttpRequests.delete(requestId),
-			);
-			return execution;
-		},
-		websocket: wsHandlers,
-	});
+				// Verify the session token from the query param
+				const token = url.searchParams.get("token");
+				if (!token) {
+					return new Response("Authentication required", { status: 401 });
+				}
+				let payload: Awaited<ReturnType<typeof verifyToken>>;
+				try {
+					payload = await verifyToken(token);
+				} catch {
+					return new Response("Invalid or expired token", { status: 401 });
+				}
 
+				// Look up user info for presence tracking
+				const user = await db.query.users.findFirst({
+					where: eq(users.id, payload.sub),
+					columns: {
+						id: true,
+						username: true,
+						avatarColor: true,
+						avatarImageId: true,
+						// Read live, so a demotion applies to the next socket. The narrator
+						// subscribe path uses it for the admin short-circuit.
+						role: true,
+					},
+				});
+				// `verifyToken` already rejected revoked and expired sessions; a user row that
+				// vanished since still fails the upgrade.
+				if (!user) {
+					return new Response("Invalid or expired token", { status: 401 });
+				}
+				const userInfo = user
+					? {
+							userId: user.id,
+							username: user.username,
+							avatarColor: user.avatarColor,
+							avatarImageId: user.avatarImageId,
+							role: user.role,
+						}
+					: undefined;
+
+				// Remember the session so the socket can be re-checked when it lapses or
+				// when the user's authorization changes (logout, revocation, role).
+				const wsData = resolveWSData(url, userInfo, undefined, {
+					sessionExp: payload.exp,
+					sessionId: payload.sid,
+					sessionUserId: payload.sub,
+				});
+				if (!wsData) {
+					return new Response("Unknown WebSocket endpoint", { status: 404 });
+				}
+
+				const upgraded = server.upgrade(req, { data: wsData });
+				if (upgraded) return undefined;
+				return new Response("WebSocket upgrade failed", { status: 400 });
+			}
+
+			// Everything else goes to Hono. Resolve the client IP and whether the immediate
+			// socket peer is trusted at the Bun boundary, so routes never trust forwarding
+			// headers solely because a caller supplied them.
+			const peerIp = server.requestIP(req)?.address;
+			const trustedProxyCidrs = settings.auth.trustedProxyCidrs ?? ["127.0.0.0/8", "::1/128"];
+			const clientIp = resolveClientIp({
+				peerIp,
+				xForwardedFor: req.headers.get("x-forwarded-for"),
+				xRealIp: req.headers.get("x-real-ip"),
+				trustedProxyCidrs,
+			});
+			return app.fetch(req, {
+				clientIp,
+				peerIp,
+				trustedProxy: isTrustedProxyAddress(peerIp, trustedProxyCidrs),
+			});
+		});
+		activeHttpRequests.set(requestId, execution);
+		void execution.then(
+			() => activeHttpRequests.delete(requestId),
+			() => activeHttpRequests.delete(requestId),
+		);
+		return execution;
+	};
+	const group = startManagerListenerGroup({
+		bindPublic: () => {
+			const bind = (host: string) => ({
+				listener: Bun.serve({
+					port: listenPort,
+					hostname: host,
+					idleTimeout: 255,
+					tls,
+					fetch: fetchRequest,
+					websocket: wsHandlers,
+				}),
+				host,
+			});
+			// Only public binding may fall back. A companion collision fails the whole group.
+			return allowHostFallback
+				? listenWithLanFallback(configuredHost, currentHost, bind)
+				: bind(currentHost);
+		},
+		managerToken: readManagerToken(),
+		tls,
+		dispatch: (req, server) =>
+			fetchRequest(req, {
+				requestIP: server.requestIP.bind(server),
+				upgrade: () => false,
+			}),
+	});
+	currentHost = group.host;
 	boundTlsConfig = tlsCfg;
 	clearInheritableHandlesAfterServerBind();
-	return server;
+	return group;
 }
 
 function startServerWithHostFallback(listenPort: number) {
-	return listenWithLanFallback(configuredHost, currentHost, (host) => {
-		currentHost = host;
-		return startServer(listenPort, settings.server.tls);
-	});
+	return startServer(listenPort, settings.server.tls, true);
 }
 
 let actualPort = port;
@@ -1171,9 +1204,9 @@ if (portExplicit) {
 	}
 	try {
 		_server = startServerWithHostFallback(port);
+		actualPort = _server.port ?? port;
 	} catch (err) {
-		const msg = err instanceof Error ? err.message : String(err);
-		if (msg.includes("EADDRINUSE") || msg.includes("address already in use")) {
+		if (isListenerPortConflict(err)) {
 			logger.error(`Port ${port} is already in use. Cannot start server.`);
 			console.error(
 				`\x1b[31mError: Port ${port} is already in use.\x1b[0m\nPlease free the port or choose a different one with --port=XXXX.`,
@@ -1192,7 +1225,7 @@ if (portExplicit) {
 		attemptedPorts.push(tryPort);
 		try {
 			_server = startServerWithHostFallback(tryPort);
-			actualPort = tryPort;
+			actualPort = _server.port ?? tryPort;
 			started = true;
 			if (tryPort !== port) {
 				if (excludedRangeForPort) {
@@ -1213,8 +1246,7 @@ if (portExplicit) {
 			}
 			break;
 		} catch (err) {
-			const msg = err instanceof Error ? err.message : String(err);
-			if (msg.includes("EADDRINUSE") || msg.includes("address already in use")) {
+			if (isListenerPortConflict(err)) {
 				candidate = nextAllowedPort(tryPort + 1, excludedPortRanges);
 				continue;
 			}
@@ -1256,47 +1288,78 @@ function runtimeAddress() {
 }
 registerRuntimeAddressGetter(runtimeAddress);
 
+// Startup CLI overrides and default-port fallback are not committed settings intents.
+let lastCommittedAddressIntent: { host: string; port: number } | undefined;
 // Register server restart handler for hot-reloading host/port from settings
-registerServerRestart((newHost: string, newPort: number, options) => {
-	const oldHost = currentHost;
-	const oldConfiguredHost = configuredHost;
-	const oldPort = actualPort;
-	const oldTls = boundTlsConfig;
-	_server = rebindHttpListener(
-		_server,
-		() => {
-			configuredHost = newHost;
-			currentHost = resolveListenHost(configuredHost);
-			const replacement = startServerWithHostFallback(newPort);
-			actualPort = replacement.port ?? newPort;
-			return replacement;
-		},
-		() => {
-			configuredHost = oldConfiguredHost;
-			currentHost = oldHost;
-			// Restore the TLS options actually used by the previous listener, not newly saved settings.
-			const replacement = startServer(oldPort, oldTls);
-			actualPort = replacement.port ?? oldPort;
-			return replacement;
-		},
-		options?.preserveResponse === true,
-	);
-	const address = runtimeAddress();
-	// 与启动时同一句式，管理器才能在热重绑后更新面板上的地址。
-	logger.info(
-		`NarraFork server running on ${address.protocol}://${urlHost(address.host)}:${address.port}`,
-		{ rebound: true, listenHost: address.host, port: address.port },
-	);
-	return address;
+const restartHttpListener = createManagerRebindCoordinator({
+	// Resolve before detaching; stale DNS completions must never overwrite a newer rebind.
+	resolveHost: (host) => resolveManagerListenHost(resolveListenHost(host), readManagerToken()),
+	getCurrentAddress: runtimeAddress,
+	isAccepting: () => acceptingHttpRequests,
+	rebind: (newHost, newPort, resolvedHost, options) => {
+		const oldHost = currentHost;
+		const oldConfiguredHost = configuredHost;
+		const oldConfiguredPort = configuredPort;
+		const oldPort = actualPort;
+		const oldTls = boundTlsConfig;
+		_server = rebindHttpListener(
+			_server,
+			() => {
+				configuredHost = newHost;
+				configuredPort = newPort;
+				currentHost = resolvedHost;
+				const replacement = startServerWithHostFallback(newPort);
+				actualPort = replacement.port ?? newPort;
+				lastCommittedAddressIntent = { host: newHost, port: newPort };
+				return replacement;
+			},
+			() => {
+				configuredHost = oldConfiguredHost;
+				configuredPort = oldConfiguredPort;
+				currentHost = oldHost;
+				// Restore the TLS options actually used by the previous listener, not newly saved settings.
+				const replacement = startServer(oldPort, oldTls);
+				actualPort = replacement.port ?? oldPort;
+				return replacement;
+			},
+			options?.preserveResponse === true,
+		);
+		const address = runtimeAddress();
+		// 与启动时同一句式，管理器才能在热重绑后更新面板上的地址。
+		logger.info(
+			`NarraFork server running on ${address.protocol}://${urlHost(address.host)}:${address.port}`,
+			{ rebound: true, listenHost: address.host, port: address.port },
+		);
+		return address;
+	},
 });
+registerServerRestart(restartHttpListener);
 
 // settings.json 地址热重载：管理器面板或外部编辑直接写文件也能即时生效。
 // PATCH /api/settings 的保存路径同样写该文件，isCurrent 比对可避免双重重绑。
 startServerAddressWatcher({
-	isCurrent: (address) => address.host === configuredHost && address.port === actualPort,
+	onIntentChanged: (address) => {
+		restartHttpListener.invalidatePendingUnless(address.host, address.port);
+		return (
+			lastCommittedAddressIntent !== undefined &&
+			(address.host !== lastCommittedAddressIntent.host ||
+				address.port !== lastCommittedAddressIntent.port)
+		);
+	},
+	isCurrent: (address) =>
+		(address.host === configuredHost && address.port === configuredPort) ||
+		restartHttpListener.isPending(address.host, address.port),
 	onChanged: (address) => {
 		reloadSettings();
-		scheduleServerRestart(address.host, address.port);
+		if (process.env.NARRAFORK_CONTRACT_SUPPRESS_RESTART === "1") {
+			logger.warn("Server restart suppressed for contract harness", address);
+			return;
+		}
+		// The watcher already debounced and has no HTTP response to flush. Start the intent now;
+		// an additional timer would leave queued work that a later no-op intent cannot invalidate.
+		void restartHttpListener(address.host, address.port).catch((error) => {
+			logger.error("Server restart failed", { error: String(error) });
+		});
 	},
 });
 

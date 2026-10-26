@@ -1,6 +1,13 @@
 /** Kept dependency-free so permission gates never load the preview compiler. */
 export const GEN_UI_TOOL_NAME = "GenUI";
-export const GEN_UI_ACTIONS = ["create", "show", "render", "kit_status", "kit_build"] as const;
+export const GEN_UI_ACTIONS = [
+	"create",
+	"show",
+	"render",
+	"inspect",
+	"kit_status",
+	"kit_build",
+] as const;
 export type GenUiToolAction = (typeof GEN_UI_ACTIONS)[number];
 
 /**

@@ -9,6 +9,15 @@ export interface ProviderPreset {
 	endpoints: Partial<Record<AddProviderType, string>>;
 	category?: "api" | "platform-login";
 	defaultProtocol?: AddProviderType;
+	/**
+	 * Protocol the add-provider form starts on when this preset offers several.
+	 *
+	 * NarraFork otherwise prefers Responses → Messages → Chat Completions, so a
+	 * provider whose features only unlock on one route has to say so here: Kimi
+	 * needs Chat Completions for its dynamic tool loading (a `system` message
+	 * carrying `tools`), which the Anthropic and Responses relays have no form of.
+	 */
+	creationProtocol?: AddProviderType;
 	/** Short tagline shown on the catalog card. */
 	descriptionKey?: string;
 	/**

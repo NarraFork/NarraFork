@@ -361,6 +361,15 @@ describe("AddProviderPage interactions", () => {
 		expect(field("addProviderRegion").value).toBe(i18n.t("addProviderRegionInternational"));
 	});
 
+	test("KIMI is created on Chat Completions for both plans and regions", async () => {
+		await click(preset("moonshot"));
+		expect(field("addProviderProtocol").value).toBe(i18n.t("addProviderCompletions"));
+		await selectOption("addProviderBilling", "addProviderBillingTokenPlan");
+		expect(field("addProviderProtocol").value).toBe(i18n.t("addProviderCompletions"));
+		await selectOption("addProviderRegion", "addProviderRegionChina");
+		expect(field("addProviderProtocol").value).toBe(i18n.t("addProviderCompletions"));
+	});
+
 	test("region and plan update the exact URLs for KIMI, MiniMax and Zhipu", async () => {
 		for (const [id, internationalPayg, internationalPlan, chinaPayg, chinaPlan] of [
 			[

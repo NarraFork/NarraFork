@@ -24,8 +24,12 @@ const HOST = `<!doctype html><html><body style="margin:0">
 	window.actions = [];
 	window.fields = [];
 	window.ready = false;
+	window.painted = 0;
+	window.diagnostics = [];
 	addEventListener("message", (event) => {
 		if (event.data?.type === "narrafork:ui-ready") window.ready = true;
+		if (event.data?.type === "narrafork:preview-painted") window.painted++;
+		if (event.data?.type === "narrafork:preview-diagnostic") window.diagnostics.push(event.data);
 		if (event.data?.type === "narrafork:ui-action") {
 			window.actions.push([event.data.action, event.data.value]);
 			if (event.data.fields) window.fields.push(event.data.fields);
@@ -151,12 +155,17 @@ export default function Setup({ children }: { children?: ReactNode }) {
 async function open(
 	source: PreviewShellSource,
 	kit: boolean,
+	inspection = false,
 ): Promise<{ page: Page; frame: Frame }> {
 	if (!browser) throw new Error("browser not started");
 	const page = await browser.newPage();
 	page.setDefaultTimeout(8000);
 	await page.setContent(HOST);
-	const srcdoc = createPreviewShell(source, THEME, "Render failed", { mode: "markup", kit });
+	const srcdoc = createPreviewShell(source, THEME, "Render failed", {
+		mode: "markup",
+		kit,
+		inspection,
+	});
 	await page.evaluate((html) => {
 		(document.getElementById("ui") as HTMLIFrameElement).srcdoc = html;
 	}, srcdoc);
@@ -181,6 +190,74 @@ async function post(page: Page, source: string, complete: boolean) {
 }
 const actions = (page: Page) =>
 	page.evaluate(() => (window as unknown as { actions: [string, string][] }).actions);
+
+browserTest("inspection paint follows a committed tree and actions stay disabled", async () => {
+	const { page, frame } = await open(await builtinRuntime(), false, true);
+	try {
+		expect(await page.evaluate(() => (window as unknown as { painted: number }).painted)).toBe(0);
+		await post(
+			page,
+			'<Button id="inspect" onClick={sendPrompt("not allowed")}>Painted</Button>',
+			true,
+		);
+		await page.waitForFunction(() => (window as unknown as { painted: number }).painted > 0);
+		expect(await frame.$eval("#inspect", (node) => node.textContent)).toBe("Painted");
+		await frame.click("#inspect");
+		await frame.evaluate(() => new Promise<void>((done) => requestAnimationFrame(() => done())));
+		expect(await actions(page)).toEqual([]);
+	} finally {
+		await page.close();
+	}
+});
+
+browserTest(
+	"app and provider crashes report bounded errors instead of painted success",
+	async () => {
+		if (!browser) throw new Error("browser not started");
+		const runtime = await builtinRuntime();
+		for (const providerCrash of [false, true]) {
+			const page = await browser.newPage();
+			page.setDefaultTimeout(8000);
+			try {
+				await page.setContent(HOST);
+				const html = createPreviewShell(
+					{
+						...runtime,
+						runtimeJs:
+							runtime.runtimeJs +
+							(providerCrash
+								? ';globalThis.__nfKit={...globalThis.__nfPluginRuntime, components:{}, Setup:function Setup(){throw new Error("provider exploded")}}'
+								: ""),
+						js: providerCrash
+							? "globalThis.__nfGenUiApp=()=>null"
+							: 'globalThis.__nfGenUiApp=()=>{throw new Error("app exploded")}',
+					},
+					THEME,
+					"Render failed",
+					{ inspection: true, kit: providerCrash },
+				);
+				await page.evaluate((srcdoc) => {
+					(document.getElementById("ui") as HTMLIFrameElement).srcdoc = srcdoc;
+				}, html);
+				await page.waitForFunction(
+					() => (window as unknown as { diagnostics: unknown[] }).diagnostics.length > 0,
+				);
+				const result = await page.evaluate(() => ({
+					painted: (window as unknown as { painted: number }).painted,
+					diagnostics: (window as unknown as { diagnostics: { message: string }[] }).diagnostics,
+				}));
+				expect(result.painted).toBe(0);
+				expect(
+					result.diagnostics.some((entry) =>
+						entry.message.includes(providerCrash ? "provider exploded" : "app exploded"),
+					),
+				).toBe(true);
+			} finally {
+				await page.close();
+			}
+		}
+	},
+);
 
 browserTest(
 	"built-in kit: UI appears while it streams, typed state survives, actions reach the host",

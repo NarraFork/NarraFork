@@ -6,6 +6,7 @@ import { FitAddon } from "@xterm/addon-fit";
 import { Terminal } from "@xterm/xterm";
 import "@xterm/xterm/css/xterm.css";
 import { useEffect, useRef, useState } from "react";
+import { isHeadlessTerminalReply } from "../terminal/terminal-reply";
 import { type InstallPhase, nextInstallAction } from "./dependency-install-progress";
 
 interface DependencyInstallTerminalProps {
@@ -213,7 +214,10 @@ export function DependencyInstallTerminal({ command, onDone }: DependencyInstall
 
 		// Forward user input to terminal
 		const dataDisposable = term.onData((data) => {
-			if (writingRef.current) return;
+			// Same split as TerminalPanel: writingRef covers only a synchronous
+			// parse. Async device reports are dropped by shape so they are not
+			// written to the PTY a second time.
+			if (writingRef.current || isHeadlessTerminalReply(data)) return;
 			write(data);
 		});
 

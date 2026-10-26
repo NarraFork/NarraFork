@@ -191,7 +191,11 @@ describe("provider connection metadata", () => {
 				[C]: completions,
 				...(responses ? { [R]: responses } : {}),
 			});
-			expect(result?.preset.defaultProtocol).toBe(responses ? R : A);
+			// Kimi is created on Chat Completions even though it also serves Responses:
+			// only that route gives it dynamic tool loading.
+			const kimi = getConnectionFamily(id) === "kimi";
+			expect(result?.preset.defaultProtocol).toBe(kimi ? C : responses ? R : A);
+			expect(result?.preset.creationProtocol).toBe(kimi ? C : undefined);
 			expect(result?.userAgentMode).toBe(billing === "token-plan" ? "narrafork" : undefined);
 			expect(Object.keys(result ?? {}).sort()).toEqual(
 				billing === "token-plan" ? ["preset", "userAgentMode"] : ["preset"],

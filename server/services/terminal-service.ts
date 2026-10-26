@@ -135,6 +135,8 @@ interface ActiveTerminal {
 	terminalId: string;
 	buffer: BufferManager;
 	useDtach: boolean;
+	/** Serializes geometry changes so the emulator resizes before the PTY. */
+	resizeChain?: Promise<void>;
 }
 
 const activeTerminals = new Map<string, ActiveTerminal>();
@@ -176,6 +178,32 @@ function onData(id: string, buffer: BufferManager, data: string | Uint8Array) {
 		buffer.append(text);
 		sendToTerminal(id, { type: "output", terminalId: id, data: text });
 	}
+}
+
+/**
+ * Build a buffer whose parser answers the queries it is asked.
+ *
+ * The headless xterm holds the cursor state and sees the same byte stream, so
+ * it answers DA / DSR-CPR (`CSI 6n`) / DECRPM / DECRQSS. It does not answer
+ * OSC color or focus queries; the browser terminal still does. Without the
+ * cursor report, atuin, codex and reedline block until their own timeout.
+ *
+ * `getRuntime` covers the window before the terminal is in `activeTerminals`.
+ * Remote `runtime.write` queues until the PTY is ready, so a startup CPR is
+ * kept instead of dropped. Other callers resolve the live runtime from the map.
+ */
+function createBufferManager(
+	terminalId: string,
+	cols?: number,
+	rows?: number,
+	getRuntime?: () => TerminalRuntime | undefined,
+): BufferManager {
+	return new BufferManager(terminalId, cols, rows, {
+		onReply: (data) => {
+			const runtime = getRuntime ? getRuntime() : activeTerminals.get(terminalId)?.runtime;
+			runtime?.write(data);
+		},
+	});
 }
 
 /**
@@ -226,7 +254,7 @@ export const terminalService = {
 		const cols = opts.cols ?? 80;
 		const rows = opts.rows ?? 24;
 		let cwd: string;
-		let projectId: string | null = null;
+		const projectId: string | null = null;
 		const narratorId: string | undefined = opts.narratorId;
 		const requestedDeviceId = opts.deviceId?.trim();
 		const hasExplicitDevice = requestedDeviceId !== undefined && requestedDeviceId !== "";
@@ -287,13 +315,15 @@ export const terminalService = {
 		// All remote authorization/capability checks above must finish before any terminal side effect.
 		const id = generateId();
 		const now = new Date().toISOString();
-		const buffer = new BufferManager(id);
+		// Assigned as soon as the PTY exists, before `await runtime.ready`, so
+		// replies during remote startup hit the runtime's pre-ready queue.
+		let runtime: TerminalRuntime | undefined;
+		const buffer = createBufferManager(id, cols, rows, () => runtime);
 		buffer.startPeriodicFlush();
 		// Remote terminals run on a device PTY; dtach (local detach) does not apply.
 		const useRemote = !!deviceId;
 		const useDtach = !useRemote && (await dtachService.isAvailable());
 
-		let runtime: TerminalRuntime;
 		let dtachSocket: string | null = null;
 
 		if (useRemote && deviceId && remoteShell) {
@@ -417,18 +447,27 @@ export const terminalService = {
 	resize(terminalId: string, cols: number, rows: number) {
 		const active = activeTerminals.get(terminalId);
 		if (!active) return;
-		active.runtime.resize(cols, rows);
-		// Bun.Terminal.resize() does not send SIGWINCH to the child.
-		// dtach relies on SIGWINCH to forward the new size. Only on Unix.
-		if (active.useDtach && !IS_WINDOWS && active.runtime.pid) {
-			try {
-				process.kill(active.runtime.pid, "SIGWINCH");
-			} catch {
-				// process may have exited
-			}
-		}
-		// Buffer resize is async (waits for pending writes) — fire and forget
-		active.buffer.resize(cols, rows);
+		const previous = active.resizeChain ?? Promise.resolve();
+		// Parse bytes already on the wire at the old size, resize the emulator,
+		// then the PTY. A SIGWINCH CPR is therefore answered at the new geometry.
+		// Concurrent requests stay ordered so an older size cannot land last.
+		active.resizeChain = previous
+			.catch(() => {})
+			.then(async () => {
+				if (activeTerminals.get(terminalId) !== active) return;
+				await active.buffer.resize(cols, rows);
+				if (activeTerminals.get(terminalId) !== active) return;
+				active.runtime.resize(cols, rows);
+				// Bun.Terminal.resize() does not send SIGWINCH to the child.
+				// dtach relies on SIGWINCH to forward the new size. Only on Unix.
+				if (active.useDtach && !IS_WINDOWS && active.runtime.pid) {
+					try {
+						process.kill(active.runtime.pid, "SIGWINCH");
+					} catch {
+						// process may have exited
+					}
+				}
+			});
 	},
 
 	async kill(terminalId: string) {
@@ -448,7 +487,7 @@ export const terminalService = {
 				await dtachService.killSession(terminalId);
 			}
 			// Clean up buffer file
-			const buf = new BufferManager(terminalId);
+			const buf = createBufferManager(terminalId);
 			await buf.deleteFromDisk();
 		}
 
@@ -528,7 +567,7 @@ export const terminalService = {
 		if (existing) assertLegacyRuntimeOwner(existing);
 		await dtachService.killSession(terminalId);
 		// Clean up buffer file if any
-		const buf = new BufferManager(terminalId);
+		const buf = createBufferManager(terminalId);
 		await buf.deleteFromDisk();
 	},
 
@@ -576,7 +615,7 @@ export const terminalService = {
 		if (!(await dtachService.isAvailable())) return false;
 		if (!(await dtachService.isSocketAlive(terminalId))) return false;
 
-		const buffer = new BufferManager(terminalId);
+		const buffer = createBufferManager(terminalId);
 		await buffer.loadFromDisk();
 		buffer.startPeriodicFlush();
 
@@ -659,7 +698,7 @@ export const terminalService = {
 			return { data: contents, cols: active.buffer.cols, rows: active.buffer.rows };
 		}
 		// Try loading from disk (detached terminal)
-		const buf = new BufferManager(terminalId);
+		const buf = createBufferManager(terminalId);
 		if (await buf.loadFromDisk()) {
 			const contents = await buf.getContents();
 			await this.getById(terminalId);
@@ -704,7 +743,7 @@ export const terminalService = {
 			if (terminal.worktreeResourceId != null) continue;
 			if (terminal.dtachSocket && (await dtachService.isSocketAlive(terminal.id))) {
 				// Re-attach to the dtach session
-				const buffer = new BufferManager(terminal.id);
+				const buffer = createBufferManager(terminal.id);
 				await buffer.loadFromDisk();
 				buffer.startPeriodicFlush();
 
@@ -767,7 +806,7 @@ export const terminalService = {
 						})
 						.where(eq(terminals.id, terminalId));
 
-					const buffer = new BufferManager(terminalId);
+					const buffer = createBufferManager(terminalId);
 					await buffer.loadFromDisk();
 					buffer.startPeriodicFlush();
 

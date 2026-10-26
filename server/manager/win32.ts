@@ -83,6 +83,8 @@ export const CW_USEDEFAULT = -2147483648;
 
 // ── 消息 ────────────────────────────────────────────────────────────────────
 
+export const WM_NULL = 0x0000;
+export const WM_NCDESTROY = 0x0082;
 export const WM_CREATE = 0x0001;
 export const WM_DESTROY = 0x0002;
 export const WM_SIZE = 0x0005;
@@ -110,6 +112,13 @@ export const SW_RESTORE = 9;
 
 interface User32 {
 	RegisterClassExW: (wndClass: Pointer) => number;
+	RegisterWindowMessageW: (name: Pointer) => number;
+	GetActiveWindow: () => Pointer;
+	GetAncestor: (hwnd: Pointer, flags: number) => Pointer;
+	GetNextDlgTabItem: (hwnd: Pointer, control: Pointer, previous: number) => Pointer;
+	GetDlgItem: (hwnd: Pointer, id: number) => Pointer;
+	GetClassNameW: (hwnd: Pointer, buffer: Pointer, max: number) => number;
+	IsWindowEnabled: (hwnd: Pointer) => number;
 	UnregisterClassW: (className: Pointer, instance: Pointer) => number;
 	CreateWindowExW: (
 		exStyle: number,
@@ -280,6 +289,13 @@ export function loadNative(): { user32: User32; gdi32: Gdi32; kernel32: Kernel32
 	try {
 		user32 = dlopen("user32.dll", {
 			RegisterClassExW: { args: [FFIType.ptr], returns: FFIType.u16 },
+			RegisterWindowMessageW: { args: [FFIType.ptr], returns: FFIType.u32 },
+			GetActiveWindow: { args: [], returns: FFIType.ptr },
+			GetAncestor: { args: [FFIType.ptr, FFIType.u32], returns: FFIType.ptr },
+			GetNextDlgTabItem: { args: [FFIType.ptr, FFIType.ptr, FFIType.i32], returns: FFIType.ptr },
+			GetDlgItem: { args: [FFIType.ptr, FFIType.i32], returns: FFIType.ptr },
+			GetClassNameW: { args: [FFIType.ptr, FFIType.ptr, FFIType.i32], returns: FFIType.i32 },
+			IsWindowEnabled: { args: [FFIType.ptr], returns: FFIType.i32 },
 			UnregisterClassW: { args: [FFIType.ptr, FFIType.ptr], returns: FFIType.i32 },
 			CreateWindowExW: {
 				args: [
@@ -577,6 +593,10 @@ export interface WindowOptions {
 	visible?: boolean;
 	/** owner 窗口：owned 窗口由系统保证永远显示在它之上（模态对话框用）。 */
 	owner?: Pointer;
+	/** Enter 在非按钮控件上触发的默认按钮；不使用对话框隐式 IDOK。 */
+	defaultButtonId?: number;
+	/** Esc 对应的取消按钮；未指定则不拦截，不隐式发送 IDCANCEL。 */
+	cancelButtonId?: number;
 	/** 收到 WM_CLOSE 时的处理；未提供则走默认销毁（对话框点 X 即取消）。 */
 	onClose?: () => void;
 	onMessage: (
@@ -590,6 +610,8 @@ export interface WindowOptions {
 export interface NativeWindow {
 	hwnd: Pointer;
 	instance: Pointer;
+	/** 将字体所有权转给窗口；在子控件销毁后的 WM_NCDESTROY 释放一次。 */
+	ownFont(font: Pointer | undefined): Pointer | undefined;
 	/** 排空一次消息队列，返回 false 表示收到 WM_QUIT。 */
 	pump(): boolean;
 	/** 注销窗口类并释放 WndProc 回调；窗口销毁后必须调用，否则重开同类窗口会挂到旧回调。 */
@@ -598,6 +620,59 @@ export interface NativeWindow {
 
 /** 窗口类名唯一化计数：同名类重复注册会失败，而失败时新窗口仍会挂到旧类的 WndProc 上。 */
 let windowClassSeq = 0;
+const keyboardWindows = new Map<Pointer, WindowOptions>();
+let pumpingMessages = false;
+
+/** 注册跨进程广播消息（例如 Explorer 重启时的 TaskbarCreated）；失败返回 0。 */
+export function registerWindowMessage(name: string): number {
+	return loadNative()?.user32.RegisterWindowMessageW(wstrTemp(name)) ?? 0;
+}
+
+/** 自建窗口不是 DLGPROC：不要用 IsDialogMessage 发送隐式 IDOK/IDCANCEL。 */
+function navigateWindowMessage(user32: User32, message: Buffer): boolean {
+	if (message.readUInt32LE(8) !== 0x0100) return false; // WM_KEYDOWN，不拦截 Alt+F4
+	const key = Number(message.readBigUInt64LE(16));
+	if (key !== 9 && key !== 13 && key !== 27) return false;
+	const target = Number(message.readBigUInt64LE(0)) as Pointer;
+	const active = user32.GetActiveWindow();
+	const options = keyboardWindows.get(active);
+	if (!options || !target || !user32.IsWindowEnabled(active)) return false;
+	if (target !== active && user32.GetAncestor(target, 2) !== active) return false; // GA_ROOT
+	const code = Number(
+		user32.SendMessageW(target, 0x0087, key as Pointer, toPtr(message)), // WM_GETDLGCODE
+	);
+	if ((code & 0x0004) !== 0 || (key === 9 && (code & 0x0002) !== 0)) return false;
+	if (key === 9) {
+		const next = user32.GetNextDlgTabItem(
+			active,
+			target === active ? (0 as Pointer) : target,
+			(user32.GetKeyState(0x10) & 0x8000) !== 0 ? 1 : 0,
+		);
+		if (next) user32.SetFocus(next);
+		return true;
+	}
+	// 展开的组合框须自己处理 Enter/Esc（接受/取消选项），不能提交整个设置窗口。
+	const classBuffer = Buffer.alloc(64);
+	const classLength = user32.GetClassNameW(target, toPtr(classBuffer), 32);
+	if (
+		classBuffer.toString("utf16le", 0, classLength * 2).toUpperCase() === "COMBOBOX" &&
+		user32.SendMessageW(target, 0x0157, 0 as Pointer, 0 as Pointer) // CB_GETDROPPEDSTATE
+	)
+		return false;
+	let button: Pointer;
+	if (key === 13 && (code & 0x2000) !== 0) {
+		const type = user32.GetWindowLongW(target, -16) & 0xf;
+		// 复选框/单选框用 Space 切换；Enter 仍触发窗口默认动作。
+		button = type === 0 || type === 1 || type === BS_OWNERDRAW ? target : (0 as Pointer);
+	} else button = 0 as Pointer;
+	const id = key === 27 ? options.cancelButtonId : options.defaultButtonId;
+	if (!button && id !== undefined) button = user32.GetDlgItem(active, id);
+	if (!button) return false;
+	if (user32.IsWindowEnabled(button) && user32.IsWindowVisible(button)) {
+		user32.SendMessageW(button, 0x00f5, 0 as Pointer, 0 as Pointer); // BM_CLICK
+	}
+	return true;
+}
 
 export function createWindow(options: WindowOptions): NativeWindow | undefined {
 	const native = loadNative();
@@ -612,23 +687,37 @@ export function createWindow(options: WindowOptions): NativeWindow | undefined {
 	// 感知生效后读取真实 DPI，后续所有界面坐标按此缩放。
 	refreshDpiScale();
 
+	const fonts = new Set<Pointer>();
+	let destroyed = false;
+	let disposed = false;
 	const wndProc = new JSCallback(
 		(hwnd: Pointer | null, msg: number, wParam: Pointer, lParam: Pointer): Pointer | number => {
 			if (hwnd == null) return 0;
-			if (msg === WM_CLOSE && options.onClose) {
-				options.onClose();
-				return 0;
+			try {
+				if (msg === WM_CLOSE && options.onClose) {
+					options.onClose();
+					return 0;
+				}
+				const handled = options.onMessage(hwnd, msg, wParam, lParam);
+				if (handled !== undefined) return handled;
+				return user32.DefWindowProcW(hwnd, msg, wParam, lParam);
+			} finally {
+				if (msg === WM_NCDESTROY) {
+					destroyed = true;
+					keyboardWindows.delete(hwnd);
+					for (const font of fonts) gdi32.DeleteObject(font);
+					// 保留已登记句柄，重复 ownFont/dispose 不会再次释放。
+				}
 			}
-			const handled = options.onMessage(hwnd, msg, wParam, lParam);
-			if (handled !== undefined) return handled;
-			return user32.DefWindowProcW(hwnd, msg, wParam, lParam);
 		},
 		{ args: [FFIType.ptr, FFIType.u32, FFIType.ptr, FFIType.ptr], returns: FFIType.ptr },
 	);
 
 	// 类名带上序号：同名类第二次注册会失败，而失败后 CreateWindowExW 仍会成功，
 	// 结果是新窗口的消息全部落进旧窗口的 WndProc（旧闭包状态），新闭包永远等不到消息。
-	const className = wstr(`${options.className}#${++windowClassSeq}`);
+	// 生命周期由 dispose 闭包持有，不能放进进程级 retained（反复打开弹窗会泄漏）。
+	const classNameBuffer = Buffer.from(`${options.className}#${++windowClassSeq}\0`, "utf16le");
+	const className = toPtr(classNameBuffer);
 	const wndClass = Buffer.alloc(80);
 	wndClass.writeUInt32LE(80, 0); // cbSize
 	wndClass.writeUInt32LE(0x0002 | 0x0001, 4); // CS_HREDRAW | CS_VREDRAW
@@ -645,13 +734,12 @@ export function createWindow(options: WindowOptions): NativeWindow | undefined {
 	wndClass.writeBigUInt64LE(0n, 56); // lpszMenuName
 	wndClass.writeBigUInt64LE(ptrValue(className), 64); // lpszClassName
 	wndClass.writeBigUInt64LE(0n, 72); // hIconSm
-	retained.push(wndClass);
-
 	if (!user32.RegisterClassExW(toPtr(wndClass))) {
-		// 已注册（同一进程重复创建）也算可用：继续建窗口。
 		console.error(
 			`[manager] RegisterClassExW 失败 class=${options.className} err=${kernel32.GetLastError()}`,
 		);
+		wndProc.close();
+		return undefined;
 	}
 
 	// options.width/height 是客户区尺寸：内容按它布局，窗口外框由样式换算，
@@ -701,29 +789,48 @@ export function createWindow(options: WindowOptions): NativeWindow | undefined {
 		console.error(
 			`[manager] CreateWindowExW 失败 class=${options.className} style=0x${style.toString(16)} size=${windowWidth}x${windowHeight} err=${kernel32.GetLastError()}`,
 		);
+		user32.UnregisterClassW(className, instance);
 		wndProc.close();
 		return undefined;
 	}
 
+	keyboardWindows.set(hwnd, options);
 	const message = makeMessageBuffer();
 	return {
 		hwnd,
 		instance,
-		pump(): boolean {
-			// PM_REMOVE = 1：取走消息；每次最多排空 64 条，避免长队列饿死事件循环。
-			// 不过滤 hwnd：对话框等子窗口的消息也由这一个泵派发；WM_QUIT 是线程消息，
-			// 带窗口过滤时会被 PeekMessage 挡住，导致退出信号永远到不了调用方。
-			for (let i = 0; i < 64; i++) {
-				if (!user32.PeekMessageW(toPtr(message), 0 as unknown as Pointer, 0, 0, 1)) return true;
-				const msg = message.readUInt32LE(8);
-				if (msg === WM_QUIT) return false;
-				user32.TranslateMessage(toPtr(message));
-				user32.DispatchMessageW(toPtr(message));
+		ownFont(font): Pointer | undefined {
+			if (font && !fonts.has(font)) {
+				fonts.add(font);
+				if (destroyed) gdi32.DeleteObject(font);
 			}
-			return true;
+			return font;
+		},
+		pump(): boolean {
+			// 一个线程队列、一套导航逻辑；嵌套调用不能抢走当前泵的消息。
+			if (pumpingMessages) return true;
+			pumpingMessages = true;
+			try {
+				// PM_REMOVE = 1；包含全部窗口和线程消息，每轮最多 64 条。
+				for (let i = 0; i < 64; i++) {
+					if (!user32.PeekMessageW(toPtr(message), 0 as Pointer, 0, 0, 1)) return true;
+					if (message.readUInt32LE(8) === WM_QUIT) return false;
+					if (navigateWindowMessage(user32, message)) continue;
+					user32.TranslateMessage(toPtr(message));
+					user32.DispatchMessageW(toPtr(message));
+				}
+				return true;
+			} finally {
+				pumpingMessages = false;
+			}
 		},
 		dispose(): void {
-			user32.UnregisterClassW(className, instance);
+			if (disposed) return;
+			if (!destroyed && user32.IsWindow(hwnd)) user32.DestroyWindow(hwnd);
+			// 销毁失败时仍有原生窗口引用回调，绝不能提前释放字体或 WndProc。
+			if (!destroyed && user32.IsWindow(hwnd)) return;
+			if (!user32.UnregisterClassW(toPtr(classNameBuffer), instance)) return;
+			disposed = true;
 			wndProc.close();
 		},
 	};
@@ -752,7 +859,13 @@ export function createControl(options: ControlOptions): Pointer | undefined {
 		options.exStyle ?? 0,
 		wstr(options.className),
 		wstrTemp(options.text),
-		WS_CHILD | WS_VISIBLE | options.style,
+		WS_CHILD |
+			WS_VISIBLE |
+			options.style |
+			(/^(BUTTON|EDIT|COMBOBOX|RICHEDIT50W)$/i.test(options.className) &&
+			!(options.className.toUpperCase() === "BUTTON" && (options.style & 0xf) === BS_GROUPBOX)
+				? WS_TABSTOP
+				: 0),
 		px(options.x),
 		px(options.y),
 		px(options.width),
@@ -1524,7 +1637,7 @@ export function showTrayMenu(hwnd: Pointer, items: TrayMenuItem[]): number {
 		if (!native.user32.GetCursorPos(toPtr(point))) return 0;
 		// 弹菜单前先抢前台，否则点击别处菜单不会消失（托盘菜单的经典要求）。
 		native.user32.SetForegroundWindow(hwnd);
-		return Number(
+		const selected = Number(
 			native.user32.TrackPopupMenu(
 				menu,
 				TPM_RETURNCMD | TPM_RIGHTBUTTON,
@@ -1535,6 +1648,9 @@ export function showTrayMenu(hwnd: Pointer, items: TrayMenuItem[]): number {
 				0 as unknown as Pointer,
 			),
 		);
+		// TrackPopupMenu 的通知托盘惯例：菜单关闭后补投 WM_NULL，保证下次正确退出菜单模式。
+		native.user32.PostMessageW(hwnd, WM_NULL, 0, 0);
+		return selected;
 	} finally {
 		native.user32.DestroyMenu(menu);
 	}

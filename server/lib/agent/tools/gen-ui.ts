@@ -19,6 +19,11 @@ export const genUiParameters = z
 		title: z.string().min(1).max(80).optional(),
 		size: z.enum(["sm", "md", "lg"]).optional(),
 		wait: z.boolean().optional(),
+		toolUseId: z.string().min(1).max(200).optional(),
+		toolCallId: z.string().min(1).max(200).optional(),
+		width: z.number().int().min(240).max(1600).optional(),
+		height: z.number().int().min(240).max(1200).optional(),
+		theme: z.enum(["light", "dark"]).optional(),
 		// Retired: still parsed so a call already in flight is answered, never honoured.
 		skip_build: z.boolean().optional(),
 		source: z.string().min(1).max(UI_MARKUP_LIMITS.sourceChars).optional(),
@@ -27,9 +32,22 @@ export const genUiParameters = z
 	.superRefine((input, ctx) => {
 		const given = (key: keyof typeof input) => input[key] !== undefined;
 		const only = (...allowed: Array<keyof typeof input>) =>
-			(["prefix", "path", "title", "size", "wait", "skip_build", "source"] as const).every(
-				(key) => allowed.includes(key) || !given(key),
-			);
+			(
+				[
+					"prefix",
+					"path",
+					"title",
+					"size",
+					"wait",
+					"skip_build",
+					"source",
+					"toolUseId",
+					"toolCallId",
+					"width",
+					"height",
+					"theme",
+				] as const
+			).every((key) => allowed.includes(key) || !given(key));
 		const valid =
 			input.action === "create"
 				? given("prefix") && only("prefix")
@@ -37,14 +55,18 @@ export const genUiParameters = z
 					? given("path") && only("path", "size")
 					: input.action === "render"
 						? given("source") && only("source", "title", "size", "wait")
-						: input.action === "kit_build"
-							? only("skip_build")
-							: only();
+						: input.action === "inspect"
+							? given("toolUseId") &&
+								given("toolCallId") &&
+								only("toolUseId", "toolCallId", "width", "height", "theme")
+							: input.action === "kit_build"
+								? only("skip_build")
+								: only();
 		if (!valid)
 			ctx.addIssue({
 				code: "custom",
 				message:
-					"create takes only prefix; show takes path (+ size); render takes source (+ title, size, wait); kit_build and kit_status take nothing",
+					"create takes only prefix; show takes path (+ size); render takes source (+ title, size, wait); inspect takes toolUseId and toolCallId (+ width, height, theme); kit_build and kit_status take nothing",
 			});
 	});
 export type GenUiInput =
@@ -56,6 +78,14 @@ export type GenUiInput =
 			title?: string;
 			size?: "sm" | "md" | "lg";
 			wait?: boolean;
+	  }
+	| {
+			action: "inspect";
+			toolUseId: string;
+			toolCallId: string;
+			width?: number;
+			height?: number;
+			theme?: "light" | "dark";
 	  }
 	| { action: "kit_status" }
 	| { action: "kit_build"; skip_build?: boolean };
@@ -76,6 +106,8 @@ Example: <Stack gap="sm"><Title order={4}>Card corners</Title><Slider bind="radi
 create({prefix}) then show({path, size}) — a full React app, only when markup cannot do it (arithmetic or conditions on values, lists that grow, timers, live data). create writes ${GEN_UI_DIRECTORY}/<prefix>-<id>/App.tsx. Edit it with the normal file tools: default-export a component; import react, @mantine/core, @mantine/hooks and relative files, or "kit" when the project has a kit; no other packages. Then show the directory: the app is built and runs inside the chat (only the latest one starts by itself; older ones wait for a click). To reach you, call globalThis.genUI.sendPrompt(text), genUI.submit(values, message?) or genUI.openLink(url) from a click handler; the user confirms each before it is sent.
 
 kit_status() — optional: the project kit's components with props and examples, or how to author one. kit_build() — builds the project kit from ${GEN_UI_DIRECTORY}/kit/kit.json with the project's own Vite once the user confirms in the chat. The confirmation is requested for you; never ask for it repeatedly. A bundle you build yourself is never used.
+
+inspect({toolUseId, toolCallId, width?, height?, theme?}) — check a completed render/show using the IDs in its result. Returns a screenshot and diagnostics; defaults to 960×640, dark. This replays current source and kit offline, not the user's live screen or form values. External resources and UI actions are disabled; resource warnings do not mean the app is broken. Requires a server-local workspace, execution permission and sandbox-enabled Chrome. Use it to check important UI and fix runtime errors.
 
 Never put secrets in UI.`,
 	parameters: genUiParameters,
@@ -98,7 +130,7 @@ Never put secrets in UI.`,
 		},
 	},
 	formatValidationError: () =>
-		"Use {action:'render',title,size,wait,source}, {action:'kit_status'}, {action:'kit_build'}, {action:'create',prefix:'safe-name'} or {action:'show',path:'directory-or-App.tsx',size}.",
+		"Use {action:'render',title,size,wait,source}, {action:'inspect',toolUseId,toolCallId,width,height,theme}, {action:'kit_status'}, {action:'kit_build'}, {action:'create',prefix:'safe-name'} or {action:'show',path:'directory-or-App.tsx',size}.",
 	async execute(args, ctx) {
 		try {
 			const { executeGenUiTool } = await import("@server/services/gen-ui/runtime");

@@ -30,10 +30,18 @@ export function nugProviderFromDraft(id: string, draft: AddProviderDraft): NUGPr
 export function draftFromPreset(preset: ProviderPreset): AddProviderDraft {
 	if (preset.category === "platform-login" || !preset.defaultProtocol)
 		throw new Error("Platform providers require login");
+	// A preset that names its creation protocol wins over the generic preference:
+	// some providers only unlock a feature on that one route.
+	const creation =
+		preset.creationProtocol && Object.hasOwn(preset.endpoints, preset.creationProtocol)
+			? preset.creationProtocol
+			: undefined;
 	const protocol =
+		creation ??
 		(["openai-responses", "anthropic-messages", "completions-compatible"] as const).find(
 			(candidate) => Object.hasOwn(preset.endpoints, candidate),
-		) ?? preset.defaultProtocol;
+		) ??
+		preset.defaultProtocol;
 	return {
 		protocol,
 		name: preset.name,

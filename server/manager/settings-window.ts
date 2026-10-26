@@ -78,7 +78,7 @@ export interface SettingsDialogInput {
 	managerToken?: string;
 	/** 应用更新即将发出。面板据此在子进程退出后等待替换进程。 */
 	onApplyStarting?: () => void;
-	/** 应用请求被服务拒绝。连接被重启打断不算失败。 */
+	/** 应用失败或请求结果未知；退出/替换进程的确认由面板独立追踪。 */
 	onApplyFailed?: () => void;
 }
 
@@ -170,6 +170,8 @@ export async function showSettingsDialog(
 	// 待保存的主题色（#rrggbb）与最近一次更新检查结果。
 	let pendingColor = input.narrafork.brandColor || DEFAULT_BRAND_COLOR;
 	let latestCheck: UpdateCheckSummary | undefined;
+	let updateBusy = false;
+	let checkBusy = false;
 
 	const controls: Record<string, Pointer | undefined> = {};
 	const finish = (): void => {
@@ -185,6 +187,8 @@ export async function showSettingsDialog(
 		height: HEIGHT,
 		resizable: false,
 		owner,
+		defaultButtonId: ID.save,
+		cancelButtonId: ID.cancel,
 		onMessage: (_hwnd, msg, wParam, lParam): Pointer | number | undefined => {
 			switch (msg) {
 				case WM_COMMAND: {
@@ -265,10 +269,10 @@ export async function showSettingsDialog(
 	/** 系统取色框的自定义色槽（16 个 COLORREF），本窗口生命周期内保留以便回填。 */
 	const customColors = Buffer.alloc(64);
 
-	const uiFont = createFont(13);
-	const hintFont = createFont(12);
-	const buttonFont = createFont(13, 600);
-	const titleFont = createFont(13, 600);
+	const uiFont = dialog.ownFont(createFont(13));
+	const hintFont = dialog.ownFont(createFont(12));
+	const buttonFont = dialog.ownFont(createFont(13, 600));
+	const titleFont = dialog.ownFont(createFont(13, 600));
 
 	const add = (
 		className: string,
@@ -516,6 +520,7 @@ export async function showSettingsDialog(
 
 	/** 检查更新：结果写入状态行，检测到新版本时露出「立即更新」。 */
 	function runCheck(): void {
+		if (updateBusy || checkBusy) return;
 		const baseUrl = input.serviceBaseUrl;
 		const token = input.managerToken;
 		if (!baseUrl) {
@@ -526,11 +531,15 @@ export async function showSettingsDialog(
 			setText(controls.status, t("settings.updateUnmanaged"));
 			return;
 		}
+		checkBusy = true;
+		enableWindow(controls.checkUpdate, false);
 		setText(controls.status, t("settings.checking"));
 		setVisible(controls.updateNow, false);
 		void (async () => {
 			const summary = await checkForUpdate(baseUrl, token);
+			checkBusy = false;
 			if (closed) return;
+			enableWindow(controls.checkUpdate, true);
 			if (summary.error) {
 				latestCheck = undefined;
 				setText(controls.status, t("settings.checkFailed", { error: summary.error }));
@@ -553,8 +562,9 @@ export async function showSettingsDialog(
 		})();
 	}
 
-	/** 下载并应用：进度进状态行；服务端应用后重启，连接中断属正常。 */
+	/** 下载并应用：失败和未知结果均保留错误与重试入口，不把连接中断当成成功。 */
 	function runUpdate(): void {
+		if (updateBusy || checkBusy) return;
 		const baseUrl = input.serviceBaseUrl;
 		const token = input.managerToken;
 		const releaseInfo = latestCheck?.releaseInfo;
@@ -565,25 +575,66 @@ export async function showSettingsDialog(
 		) {
 			return;
 		}
+		updateBusy = true;
+		enableWindow(controls.checkUpdate, false);
 		setVisible(controls.updateNow, false);
 		setText(controls.status, t("settings.downloading", { percent: 0 }));
 		void (async () => {
-			const outcome = await downloadUpdate(baseUrl, token, releaseInfo, (percent) => {
+			let applying = false;
+			let awaitingRestart = false;
+			try {
+				const outcome = await downloadUpdate(baseUrl, token, releaseInfo, (percent) => {
+					if (closed) return;
+					setText(controls.status, t("settings.downloading", { percent: Math.round(percent) }));
+				});
 				if (closed) return;
-				setText(controls.status, t("settings.downloading", { percent: Math.round(percent) }));
-			});
-			if (closed) return;
-			if (!outcome.success || !outcome.preparedIdentity) {
-				setText(
-					controls.status,
-					t("settings.downloadFailed", { error: outcome.error ?? "download failed" }),
+				if (!outcome.success || !outcome.preparedIdentity) {
+					setText(
+						controls.status,
+						t("settings.downloadFailed", { error: outcome.error ?? "download failed" }),
+					);
+					return;
+				}
+				setText(controls.status, t("settings.applying"));
+				applying = true;
+				input.onApplyStarting?.();
+				const applied = await applyUpdate(
+					baseUrl,
+					token,
+					outcome.version,
+					outcome.preparedIdentity,
 				);
-				return;
+				if (!applied.success) {
+					applying = false;
+					input.onApplyFailed?.();
+					if (!closed) {
+						setText(
+							controls.status,
+							t("settings.applyFailed", { error: applied.error ?? "apply failed" }),
+						);
+					}
+					return;
+				}
+				awaitingRestart = true;
+			} catch (error) {
+				if (applying) input.onApplyFailed?.();
+				if (!closed) {
+					setText(
+						controls.status,
+						t(applying ? "settings.applyFailed" : "settings.downloadFailed", {
+							error: error instanceof Error ? error.message : String(error),
+						}),
+					);
+				}
+			} finally {
+				if (!awaitingRestart) {
+					updateBusy = false;
+					if (!closed) {
+						enableWindow(controls.checkUpdate, true);
+						setVisible(controls.updateNow, true);
+					}
+				}
 			}
-			setText(controls.status, t("settings.applying"));
-			input.onApplyStarting?.();
-			const applied = await applyUpdate(baseUrl, token, outcome.version, outcome.preparedIdentity);
-			if (!applied.success && !applied.interrupted) input.onApplyFailed?.();
 		})();
 	}
 

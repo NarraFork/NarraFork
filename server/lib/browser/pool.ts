@@ -62,7 +62,7 @@ export function browserContextProxyOptions(proxy: string | undefined) {
  * 3. System Chrome (google-chrome, chromium, etc.)
  * 4. Flatpak Chrome/Chromium installations
  */
-function findChromePath(): string | undefined {
+export function findChromePath(): string | undefined {
 	// 1. Explicit env var
 	for (const envKey of ["PUPPETEER_EXECUTABLE_PATH"]) {
 		const envPath = process.env[envKey];

@@ -114,6 +114,14 @@ const MESSAGES: Record<string, Message> = {
 		"zh-CN": "更新后的服务已重新就绪。",
 		en: "The updated service is ready.",
 	},
+	"log.serviceLost": {
+		"zh-CN": "托管服务连续无响应，请检查服务状态后重新启动。",
+		en: "The managed service is not responding. Check its status before starting it again.",
+	},
+	"error.managedStopUnconfirmed": {
+		"zh-CN": "尚未确认托管服务停止，已保留管理器连接；请稍后重试停止。",
+		en: "The managed service has not stopped. The manager connection is retained; retry stopping later.",
+	},
 	"log.trayFailed": {
 		"zh-CN": "托盘图标添加失败，关闭窗口将直接退出。",
 		en: "Failed to add the tray icon; closing the window will exit.",

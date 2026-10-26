@@ -58,6 +58,8 @@ export async function loadGenUiPreview(
 		: await loadBuiltinRuntime(signal);
 	if (preview.kit && !runtime.kit)
 		throw new Error("The component kit this preview was built against is unavailable");
+	if (preview.kit && runtime.id !== `kit:${preview.kit.hash}`)
+		throw new Error("The component kit changed after this preview was built; rebuild the preview");
 	return {
 		...preview,
 		runtimeJs: runtime.runtimeJs,

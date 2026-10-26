@@ -48,12 +48,37 @@ interface BufferFileV3 {
 	};
 }
 
+/**
+ * Bytes the VT parser must send back to the program it is emulating.
+ *
+ * Not every escape sequence a program sends is purely visual: DA, DSR
+ * (`CSI 6n`, the cursor position report), DECRPM and DECRQSS all expect an
+ * answer on stdin. A program that asks and waits — atuin's
+ * inline search UI, codex CLI, nushell/reedline — blocks until its own
+ * timeout expires (crossterm waits ~2s) and then reports
+ * "The cursor position could not be read within a normal duration".
+ */
+export interface BufferManagerOptions {
+	/**
+	 * Receives parser replies, ready to be written to the PTY. Not called
+	 * while a saved snapshot is being replayed (see {@link replay}) or after
+	 * {@link BufferManager.dispose}: that byte stream is history, and answering
+	 * queries inside it would inject stray characters into a live shell.
+	 */
+	onReply?: (data: string) => void;
+}
+
 export class BufferManager {
 	private terminalId: string;
 	private xterm: Terminal;
 	private serializeAddon: SerializeAddon;
 	private dirty = false;
 	private flushTimer: ReturnType<typeof setInterval> | null = null;
+	private onReply: ((data: string) => void) | undefined;
+	/** True while a restored snapshot is being fed to the parser (replies muted). */
+	private replaying = false;
+	/** True once dispose() ran, so late parser replies cannot touch a dead PTY. */
+	private disposed = false;
 
 	/**
 	 * Chain of pending xterm.write() calls. The drain loop consumes
@@ -87,8 +112,14 @@ export class BufferManager {
 		sgr: false, // ESC[?1006h/l
 	};
 
-	constructor(terminalId: string, cols = DEFAULT_COLS, rows = DEFAULT_ROWS) {
+	constructor(
+		terminalId: string,
+		cols = DEFAULT_COLS,
+		rows = DEFAULT_ROWS,
+		options: BufferManagerOptions = {},
+	) {
 		this.terminalId = terminalId;
+		this.onReply = options.onReply;
 		this.xterm = new Terminal({
 			cols,
 			rows,
@@ -97,6 +128,23 @@ export class BufferManager {
 		});
 		this.serializeAddon = new SerializeAddon();
 		this.xterm.loadAddon(this.serializeAddon);
+		// The headless terminal keeps its own cursor state, parsed from the same
+		// byte stream as the browser and with the same dimensions, so it can
+		// answer queries with no round trip to a client.
+		this.xterm.onData((data) => {
+			if (this.replaying || this.disposed) return;
+			try {
+				this.onReply?.(data);
+			} catch (err) {
+				// A reply is best-effort: a PTY that has already closed must not
+				// abort the parser write, which would reject writeChain and take
+				// getContents()/resize()/saveToDisk() down with it.
+				logger.debug("Dropped terminal reply", {
+					terminalId: this.terminalId,
+					error: String(err),
+				});
+			}
+		});
 	}
 
 	/** Start periodic disk flush (call after creation or restore) */
@@ -221,6 +269,36 @@ export class BufferManager {
 		return p;
 	}
 
+	/**
+	 * Feed a restored snapshot to the parser with replies muted.
+	 *
+	 * A snapshot is history, not a live program: it may contain the very
+	 * sequences that expect an answer (`serialize` emits cursor moves, and can
+	 * emit whatever the program once printed). Answering them would push stray
+	 * bytes into the shell's input, so the parser speaks only for live output.
+	 */
+	private replay(content: string): Promise<void> {
+		this.replaying = true;
+		return new Promise<void>((resolve) => {
+			try {
+				this.xterm.write(content, () => {
+					this.replaying = false;
+					resolve();
+				});
+			} catch (err) {
+				// A throw here used to leave `replaying` set, so every later
+				// query on this terminal stayed silent. Unmute and let the
+				// write chain continue.
+				this.replaying = false;
+				logger.debug("Dropped terminal snapshot replay", {
+					terminalId: this.terminalId,
+					error: String(err),
+				});
+				resolve();
+			}
+		});
+	}
+
 	async loadFromDisk(): Promise<boolean> {
 		const filePath = join(getBuffersDir(), `${this.terminalId}.buf`);
 		try {
@@ -234,9 +312,7 @@ export class BufferManager {
 				if (parsed.cols && parsed.rows) {
 					this.xterm.resize(parsed.cols, parsed.rows);
 				}
-				this.writeChain = this.writeChain.then(
-					() => new Promise<void>((resolve) => this.xterm.write(content, resolve)),
-				);
+				this.writeChain = this.writeChain.then(() => this.replay(content));
 				if (parsed.mouseMode) {
 					this.mouseMode = { ...parsed.mouseMode };
 				}
@@ -248,9 +324,7 @@ export class BufferManager {
 
 			if ((parsed.version === 1 || parsed.version === 2) && typeof parsed.content === "string") {
 				const content = Buffer.from(parsed.content, "base64").toString();
-				this.writeChain = this.writeChain.then(
-					() => new Promise<void>((resolve) => this.xterm.write(content, resolve)),
-				);
+				this.writeChain = this.writeChain.then(() => this.replay(content));
 				if (parsed.mouseMode) {
 					this.mouseMode = {
 						x10: !!parsed.mouseMode.x10,
@@ -292,6 +366,7 @@ export class BufferManager {
 		} else if (this.dirty) {
 			await this.saveToDisk();
 		}
+		this.disposed = true;
 		this.xterm.dispose();
 	}
 

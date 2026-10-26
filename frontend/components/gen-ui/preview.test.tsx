@@ -135,6 +135,32 @@ test("API build diagnostics are visible and malformed/oversize responses are rej
 	);
 });
 
+test("rejects a kit changed between compilation and runtime loading", async () => {
+	globalThis.fetch = (async (input) => {
+		const url = String(input);
+		if (url.endsWith("/bundle"))
+			return Response.json({ hash: "new-runtime", js: "runtime()", css: "" });
+		if (url.endsWith("/kit")) return Response.json({ status: { hash: "new-runtime" } });
+		return Response.json({ ...previewResult(), kit: { hash: "compiled-runtime" } });
+	}) as typeof fetch;
+	await expect(
+		loadGenUiPreview("kit-mismatch", fileReference, new AbortController().signal),
+	).rejects.toThrow("component kit changed");
+});
+
+test("accepts the exact kit used by the compilation", async () => {
+	globalThis.fetch = (async (input) => {
+		const url = String(input);
+		if (url.endsWith("/bundle"))
+			return Response.json({ hash: "same-runtime", js: "runtime()", css: "" });
+		if (url.endsWith("/kit")) return Response.json({ status: { hash: "same-runtime" } });
+		return Response.json({ ...previewResult(), kit: { hash: "same-runtime" } });
+	}) as typeof fetch;
+	const preview = await loadGenUiPreview("kit-match", fileReference, new AbortController().signal);
+	expect(preview.kitRuntime).toBe(true);
+	expect(preview.runtimeJs).toBe("runtime()");
+});
+
 test("shell safely embeds JS/CSS with no host credentials and restricted resource connections", () => {
 	const js = 'globalThis.test = "</script><script>parent.stolen=1</script>"';
 	const css = '/* </style><img src="https://example.invalid/leak"> */';

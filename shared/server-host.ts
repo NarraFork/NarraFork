@@ -37,3 +37,43 @@ export function probeHost(host: string, lanAddresses: readonly string[] = []): s
 	}
 	return urlHost(host);
 }
+
+/** Literal loopback hosts only: never trust an arbitrary DNS name with manager credentials. */
+export function isLoopbackHost(host: string): boolean {
+	const bare = host.replace(/^\[|\]$/g, "").toLowerCase();
+	if (bare === "localhost" || bare === "::1") return true;
+	if (/^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(bare)) {
+		return bare.split(".").every((part) => Number(part) <= 255);
+	}
+	// URL canonicalizes expanded IPv6 and IPv4-mapped IPv6 without any DNS lookup.
+	if (bare.includes(":")) {
+		try {
+			const canonical = new URL(`http://[${bare}]`).hostname;
+			return canonical === "[::1]" || /^\[::ffff:7f[\da-f]{2}:[\da-f]{1,4}\]$/.test(canonical);
+		} catch {
+			return false;
+		}
+	}
+	return false;
+}
+
+/** Only local destinations; retain localhost so IPv6-only resolution continues to work. */
+export function managerControlHost(listenHost: string): string {
+	const host = listenHost.replace(/^\[|\]$/g, "");
+	if (host === "::") return "::1";
+	if (isLoopbackHost(host)) return host;
+	return "127.0.0.1";
+}
+
+/** Call with the actual resolved bind address, not persisted `auto-lan` intent. */
+export function managerControlCompanionHost(listenHost: string): "127.0.0.1" | undefined {
+	return isWildcardHost(listenHost) || isLoopbackHost(listenHost) ? undefined : "127.0.0.1";
+}
+
+export function managerControlOrigin(address: {
+	protocol: "http" | "https";
+	host: string;
+	port: number;
+}): string {
+	return `${address.protocol}://${urlHost(managerControlHost(address.host))}:${address.port}`;
+}

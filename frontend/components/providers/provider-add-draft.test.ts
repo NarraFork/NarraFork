@@ -98,6 +98,27 @@ describe("provider addition draft", () => {
 		}
 	});
 
+	test("an explicit creation protocol wins over the preferred priority", () => {
+		const preset: ProviderPreset = {
+			id: "creation",
+			name: "Creation",
+			defaultProtocol: "openai-responses",
+			creationProtocol: "completions-compatible",
+			endpoints: {
+				"openai-responses": "https://example.com/responses/v1",
+				"anthropic-messages": "https://example.com/anthropic/v1",
+				"completions-compatible": "https://example.com/chat/v1",
+			},
+		};
+		expect(draftFromPreset(preset)).toMatchObject({
+			protocol: "completions-compatible",
+			baseUrl: "https://example.com/chat/v1",
+		});
+		// A creation protocol without an endpoint cannot be used; the priority order stands.
+		delete preset.endpoints["completions-compatible"];
+		expect(draftFromPreset(preset)).toMatchObject({ protocol: "openai-responses" });
+	});
+
 	test("explicit single-protocol custom choices stay unchanged, including empty URLs", () => {
 		for (const protocol of [
 			"openai-responses",

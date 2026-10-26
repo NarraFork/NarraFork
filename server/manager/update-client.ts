@@ -25,8 +25,6 @@ export interface DownloadOutcome {
 export interface ApplyOutcome {
 	success: boolean;
 	error?: string;
-	/** 连接在服务重启时断开。调用方应把它当成“替换进程已启动”，而不是失败。 */
-	interrupted?: boolean;
 }
 
 import { managerFetch } from "./manager-fetch";
@@ -143,10 +141,7 @@ export async function downloadUpdate(
 	}
 }
 
-/**
- * 应用已下载的更新；服务端随即重启，因此调用方在调用后应立即展示"正在重启"，
- * 并把这里的网络类错误视为正常（连接会被重启中断）。
- */
+/** 应用已下载的更新；只有服务端明确接受排程才算成功，网络中断不证明更新已开始。 */
 export async function applyUpdate(
 	baseUrl: string,
 	token: string,
@@ -161,14 +156,19 @@ export async function applyUpdate(
 			signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
 		});
 		const body = (await response.json().catch(() => ({}))) as Record<string, unknown>;
-		if (!response.ok) {
+		if (!response.ok || body.success !== true) {
 			return {
 				success: false,
-				error: typeof body.error === "string" ? body.error : `HTTP ${response.status}`,
+				error:
+					typeof body.error === "string"
+						? body.error
+						: !response.ok
+							? `HTTP ${response.status}`
+							: "Update was not accepted",
 			};
 		}
 		return { success: true };
 	} catch (error) {
-		return { success: false, interrupted: true, error: messageOf(error) };
+		return { success: false, error: messageOf(error) };
 	}
 }

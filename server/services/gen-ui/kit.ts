@@ -21,6 +21,7 @@ import {
 } from "@shared/gen-ui-kit";
 import type { WorkspaceContext } from "@shared/workspace-context";
 import { type AuthorizeFile, uiError, workspaceKey, workspaceRoot } from "./files";
+import { kitBuildCommand, readKitRunnerSignals } from "./kit-runner";
 import {
 	type KitSignedFields,
 	kitFileSha256,
@@ -80,7 +81,6 @@ export interface KitSnapshot {
 	meta?: KitMeta;
 }
 
-const LOCKFILES = ["bun.lock", "bun.lockb", "pnpm-lock.yaml", "yarn.lock", "package-lock.json"];
 const SETUP_EXTENSIONS = ["", ".tsx", ".ts", ".jsx", ".js"];
 const BUNDLE_JS = /^kit-[0-9a-f]{12}\.js$/;
 // `style.css` is what Vite before 6 calls a library's stylesheet. It is accepted in a
@@ -152,21 +152,6 @@ function viteRoot(backend: ExecutionBackend, location: KitLocation, root: string
 	return resolved;
 }
 
-async function findLockfile(
-	backend: ExecutionBackend,
-	directories: string[],
-	signal: AbortSignal,
-): Promise<{ name: string; path: string; size: number } | null> {
-	for (const directory of directories) {
-		for (const name of LOCKFILES) {
-			const path = backend.paths.resolve(directory, name);
-			const stat = await backend.statFile(path, { signal, timeoutMs: 15_000 });
-			if (stat?.isFile) return { name, path, size: stat.size };
-		}
-	}
-	return null;
-}
-
 /**
  * Identity of everything the bundle is built FROM that the host can observe cheaply:
  * the manifest, the setup wrapper, and the dependency set. Edits inside the component
@@ -194,10 +179,8 @@ async function fingerprint(
 		}
 	}
 	const projectRoot = viteRoot(backend, location, manifest.root);
-	const lockfile = await findLockfile(backend, [projectRoot, location.root], signal);
-	// Size is a deliberate proxy: hashing a multi-megabyte lockfile on every status
-	// check would put file IO on the request path for no practical gain.
-	parts.push(lockfile ? `${lockfile.name}:${lockfile.size}` : "no-lockfile");
+	const runner = await readKitRunnerSignals(backend, projectRoot, location.root, authorize, signal);
+	parts.push(runner.fingerprint);
 	return sha256(...parts);
 }
 
@@ -423,21 +406,6 @@ export async function readKitBundle(
 	};
 }
 
-function buildCommand(lockfile: string | undefined, config: string): string {
-	const runner =
-		lockfile === "bun.lock" || lockfile === "bun.lockb"
-			? "bunx vite"
-			: lockfile === "pnpm-lock.yaml"
-				? "pnpm exec vite"
-				: lockfile === "yarn.lock"
-					? "yarn vite"
-					: "npx --no-install vite";
-	// `config` is built from a workspace-relative path the host generated; quotes and
-	// shell metacharacters cannot appear in a directory the host itself located, but a
-	// space can.
-	return `${runner} build --mode production --config "${config}"`;
-}
-
 export interface KitBuildResult {
 	ok: boolean;
 	/** Bounded tail of the build output, for the agent to act on. */
@@ -483,7 +451,16 @@ async function execBuild(
 		// test, and Vite would then compile the components with the development
 		// JSX runtime while the bundle's React is the production build. The two
 		// do not fit together, and the bundle fails only when a component renders.
-		env: { CI: "1", NO_COLOR: "1", FORCE_COLOR: "0", NODE_ENV: "production" },
+		env: {
+			CI: "1",
+			NO_COLOR: "1",
+			FORCE_COLOR: "0",
+			NODE_ENV: "production",
+			COREPACK_ENABLE_NETWORK: "0",
+			COREPACK_ENABLE_DOWNLOAD_PROMPT: "0",
+			npm_config_offline: "true",
+			npm_config_yes: "false",
+		},
 	});
 	const decoder = new TextDecoder();
 	let log = "";
@@ -649,8 +626,19 @@ async function buildKitLocked(
 		signal.throwIfAborted();
 		await backend.writeFileBytes(path, encoder.encode(text), { signal, timeoutMs: 30_000 });
 	}
-	const lockfile = await findLockfile(backend, [projectRoot, location.root], signal);
-	const command = buildCommand(lockfile?.name, relative(projectRoot, configPath));
+	const runner = await readKitRunnerSignals(backend, projectRoot, location.root, authorize, signal);
+	let runnerLog = "";
+	const command = await kitBuildCommand(
+		backend,
+		runner,
+		relative(projectRoot, configPath),
+		authorize,
+		signal,
+		!!options.runCommand,
+		(diagnostic) => {
+			runnerLog = diagnostic;
+		},
+	);
 	const unchanged = async (log: string): Promise<KitBuildResult> => {
 		await clearStaging(backend, stagingDir, authorize, signal).catch(() => {});
 		return {
@@ -673,7 +661,8 @@ async function buildKitLocked(
 	const run = options.runCommand
 		? await options.runCommand(request)
 		: await execBuild(backend, request);
-	const log = run.log.slice(-LIMITS.buildLogBytes).trim();
+	const log =
+		`${runnerLog}\n${run.log.slice(-(LIMITS.buildLogBytes - runnerLog.length - 1))}`.trim();
 	if (run.code !== 0) return unchanged(log);
 	const built = await backend.statFile(bundlePath, { signal, timeoutMs: 15_000 });
 	if (!built?.isFile || built.size === 0)

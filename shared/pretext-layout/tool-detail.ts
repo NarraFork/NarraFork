@@ -13,6 +13,7 @@
  * Shared types are the single source for classification, measurement and paint.
  */
 
+import { toolOutputImages } from "../agent-protocol/tool-output";
 import { type GenUiFileReference, readGenUiFileReference } from "../gen-ui-files";
 import { type GenUiKitNotice, readGenUiKitNotice } from "../gen-ui-kit";
 import { GEN_UI_PUBLIC_SUMMARY, GEN_UI_PUBLIC_SUMMARY_CODE } from "../gen-ui-public";
@@ -106,6 +107,8 @@ export interface ToolMediaRef {
 	filePath?: string;
 	/** An uploaded image id → fetched via /api/uploads/:narratorId/:imageId. */
 	imageId?: string;
+	/** Upload owner retained across narrator forks; the upload endpoint enforces access. */
+	uploadNarratorId?: string;
 	/** Filename (alt text / image viewer title). */
 	filename?: string;
 	/** Optional size (KB) + format label shown above an image read. */
@@ -987,7 +990,9 @@ export function classifyToolDetail(input: ClassifyToolDetailInput): ToolDetailDa
 				: null;
 	const base = withErrorSection(
 		toolName === "GenUI"
-			? (uiDetail ?? sections([textSection("output.main", output, "output")]))
+			? uiInput?.action === "inspect"
+				? classifyGenUiInspection(output)
+				: (uiDetail ?? sections([textSection("output.main", output, "output")]))
 			: classifyByCategory(toolName, category, status, fields, output, metadata, input),
 		input.errorMessage,
 		input.outputJson,
@@ -1000,6 +1005,28 @@ export function classifyToolDetail(input: ClassifyToolDetailInput): ToolDetailDa
 			body: part.body.kind === "capped" ? describeToolBody(part.body, input) : part.body,
 		})),
 	};
+}
+
+/** Inspection screenshots use the existing private upload lane, not diagnostic metadata URLs. */
+function classifyGenUiInspection(output: unknown): ToolDetailData | null {
+	return sections([
+		textSection("output.main", output, "output"),
+		...toolOutputImages(output).flatMap((image, index) => {
+			if (!("uploadNarratorId" in image) || !image.imageId || !image.uploadNarratorId) return [];
+			const source = `output._images.${index}` as const;
+			return [
+				section(
+					source,
+					undefined,
+					capped(source, "media", {
+						format: "media",
+						contentPx: MEDIA_IMAGE_CONTENT_PX,
+						media: { imageId: image.imageId, uploadNarratorId: image.uploadNarratorId },
+					}),
+				),
+			];
+		}),
+	]);
 }
 
 /** Resolve each field once: current delta > settled stream fields > formal input. */

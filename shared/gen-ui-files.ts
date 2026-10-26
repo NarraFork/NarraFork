@@ -22,6 +22,8 @@ export interface GenUiPreview {
 	directory: string;
 	entry: string;
 	files: string[];
+	/** Content identity of the exact source snapshot consumed by the compiler. */
+	sourceHash?: string;
 	/** Set when the build targets the project's component kit instead of the built-in runtime. */
 	kit?: { hash: string };
 }

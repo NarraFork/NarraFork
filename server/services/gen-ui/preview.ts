@@ -205,6 +205,7 @@ export async function buildGenUiPreview(
 					directory,
 					entry: reference.entry,
 					files: sources.map((source) => source.path),
+					sourceHash: key,
 					...(kit ? { kit: { hash: kit.hash } } : {}),
 				};
 				if (Buffer.byteLength(JSON.stringify(preview)) > LIMITS.outputBytes)

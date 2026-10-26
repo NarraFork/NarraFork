@@ -56,6 +56,21 @@ describe("GenUI file execution routing", () => {
 		});
 	});
 
+	test("inspection is an execution/write operation, not an exempt UI read", () => {
+		const input = { action: "inspect", toolUseId: "use", toolCallId: "call" };
+		expect(resolveTarget(input)).toMatchObject({ operation: "write", deviceId: "local" });
+		for (const ceiling of [
+			{ permMode: "readOnly" },
+			{ permMode: "bypassPermissions", planMode: true, relaxedPlan: true },
+			{ permMode: "bypassPermissions", reviewReadOnlyBash: true },
+		]) {
+			expect(resolvePermissionDecision({ toolName: "GenUI", input, cwd, ...ceiling })).toBe("deny");
+		}
+		expect(resolvePermissionDecision({ toolName: "GenUI", input, cwd, permMode: "default" })).toBe(
+			"ask",
+		);
+	});
+
 	test("removed actions and project-kit parameters are rejected", () => {
 		for (const action of ["prepare", "catalog", "read", "list", "edit", "archive"]) {
 			expect(genUiParameters.safeParse({ action }).success).toBe(false);

@@ -151,6 +151,10 @@ export async function executeGenUiTool(
 		authorizeRead: (path) => deps.authorizeRead(ctx, backend, path),
 		authorizeWrite: (path) => deps.authorizeWrite(ctx, backend, path),
 	};
+	if (input.action === "inspect") {
+		const { inspectGenUi } = await import("./inspect");
+		return inspectGenUi(input, kitEnvironment);
+	}
 	if (input.action === "render" || input.action === "kit_status" || input.action === "kit_build")
 		return executeKitAction(input, kitEnvironment);
 	let directory: string;
@@ -284,7 +288,7 @@ export async function executeGenUiTool(
 			output:
 				input.action === "create"
 					? `Created ${directory}/App.tsx. Edit it using ordinary file tools, then show this directory. The user sees nothing until you show it.`
-					: `Shown: ${directory}/App.tsx. The user's browser builds the app from the files on disk when the card displays it, and runs it in the chat: build errors appear in the card and are not reported to you, and later edits change what a reopened card shows. Only the latest app starts by itself; an older one waits for the user to click Run. Calls to genUI.sendPrompt / submit / openLink reach you only after the user confirms them.`,
+					: `Shown: ${directory}/App.tsx. The user's browser builds the app from the files on disk when the card displays it, and runs it in the chat: build errors appear in the card and are not reported to you, and later edits change what a reopened card shows. Only the latest app starts by itself; an older one waits for the user to click Run. Calls to genUI.sendPrompt / submit / openLink reach you only after the user confirms them. \nInspect: ${JSON.stringify({ action: "inspect", toolUseId, toolCallId: binding.toolCallId })}`,
 			title: reference.title,
 			metadata: {
 				...fileMetadata,

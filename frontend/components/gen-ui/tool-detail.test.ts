@@ -110,6 +110,71 @@ describe("GenUI file preview classification", () => {
 			publicSummary: true,
 		});
 	});
+	for (const status of ["completed", "error"]) {
+		test(`inspect ${status} keeps diagnostics and private screenshots in ordinary media sections`, () => {
+			const result = classifyToolDetail({
+				toolName: "GenUI",
+				toolUseId: "inspect-use",
+				category: "generic",
+				status,
+				inputJson: { action: "inspect" },
+				outputJson: {
+					_text: "Runtime diagnostics: component failed",
+					_images: [
+						{ imageId: "shot-1", mediaType: "image/png", uploadNarratorId: "origin" },
+						{ imageId: "shot-2", mediaType: "image/png", uploadNarratorId: "origin" },
+					],
+				},
+				metadata: { genUiInspection: { previewUrl: "https://untrusted.invalid/shot.png" } },
+			});
+			expect(result?.sections).toHaveLength(3);
+			expect(result?.sections[0].body).toMatchObject({
+				kind: "capped",
+				text: "Runtime diagnostics: component failed",
+			});
+			for (const [index, part] of (result?.sections.slice(1) ?? []).entries()) {
+				expect(part.body).toMatchObject({
+					kind: "capped",
+					cap: "media",
+					format: "media",
+					source: `output._images.${index}`,
+					media: { imageId: `shot-${index + 1}`, uploadNarratorId: "origin" },
+				});
+				expect(part.body).not.toHaveProperty("media.previewUrl");
+				expect(measureToolBody(part.body, 360).height).toBeGreaterThan(0);
+			}
+		});
+	}
+	test("inspect metadata and transient bytes never become upload capabilities", () => {
+		const result = classifyToolDetail({
+			toolName: "GenUI",
+			toolUseId: "inspect-use",
+			category: "generic",
+			inputJson: { action: "inspect" },
+			outputJson: {
+				_text: "No screenshot available",
+				_images: [null, {}, { imageId: "inline", mediaType: "image/png", data: "bytes" }],
+			},
+			metadata: { genUiInspection: { imageId: "forged", uploadNarratorId: "private" } },
+		});
+		expect(result?.sections).toHaveLength(1);
+		expect(result?.sections[0].body).toMatchObject({ text: "No screenshot available" });
+	});
+	test("inspect public summaries suppress screenshots and private diagnostics", () => {
+		const result = classifyToolDetail({
+			toolName: "GenUI",
+			toolUseId: "inspect-use",
+			category: "generic",
+			publicSummary: "GEN_UI_PRIVATE",
+			inputJson: { action: "inspect" },
+			outputJson: {
+				_text: "private diagnostics",
+				_images: [{ imageId: "secret", mediaType: "image/png", uploadNarratorId: "owner" }],
+			},
+		});
+		expect(result?.sections).toHaveLength(1);
+		expect(result?.sections[0].body).toEqual({ kind: "gen-ui", file: null, publicSummary: true });
+	});
 	test("legacy metadata is unavailable, not a compatibility document", () => {
 		const result = classifyToolDetail({
 			toolName: "GenUI",

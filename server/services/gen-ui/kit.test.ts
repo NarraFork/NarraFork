@@ -3,13 +3,15 @@ import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { LocalBackend } from "@server/lib/agent/execution/local-backend";
 import type { WorkspaceContext } from "@shared/workspace-context";
 import { buildKit, type KitBuildRun, readKit, readKitBundle } from "./kit";
 import { kitFileSha256, resetKitSigningKeyForTest, signKitFields } from "./kit-signature";
 
 const KIT = ".narrafork/gen_ui/kit";
-const REPO_MODULES = resolve(import.meta.dir, "../../../node_modules");
+// Worktrees may resolve dependencies from the main checkout rather than their own root.
+const REPO_MODULES = resolve(fileURLToPath(import.meta.resolve("vite/package.json")), "../..");
 const roots: string[] = [];
 afterEach(async () => {
 	await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
@@ -522,9 +524,9 @@ describe("component kit build (real Vite)", () => {
 		if (!f) return;
 		const result = await buildKit(f.backend, f.workspace, f.options);
 		if (!result.ok) throw new Error(`kit build failed:\n${result.log}`);
-		expect(result.command).toBe(
-			`bunx vite build --mode production --config "${KIT}/vite.kit.config.mjs"`,
-		);
+		expect(result.command).toStartWith("bun --bun ");
+		expect(result.command).toContain("node_modules/vite/bin/vite.js");
+		expect(result.command).toContain(`${KIT}/vite.kit.config.mjs`);
 		expect(result.status).toMatchObject({ state: "ready", components: ["Button", "Card"] });
 		// What Vite wrote is signed, and only the signed bytes are served.
 		const meta = JSON.parse(await readFile(join(f.root, KIT, "dist/kit.meta.json"), "utf8"));

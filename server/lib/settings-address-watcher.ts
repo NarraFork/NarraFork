@@ -15,8 +15,12 @@ const DEBOUNCE_MS = 300;
 export type ListenAddress = { host: string; port: number };
 
 export interface ServerAddressWatcherOptions {
-	/** 文件里的地址是否已经是当前运行中的配置（一致则不触发重绑）。 */
+	/** 每次有效观测先通知意图；返回 true 可调和基线未变但运行态已偏离的情况。 */
+	onIntentChanged?: (address: ListenAddress) => boolean | undefined;
+	/** 文件里的地址是否已经生效或正在处理（一致则不触发重复重绑）。 */
 	isCurrent: (address: ListenAddress) => boolean;
+	/** Optional owner lifetime, also closes the watcher and its pending debounce timer. */
+	signal?: AbortSignal;
 	/** 文件地址与基线不同且尚未生效时调用；调用方负责 reload 设置并触发重绑。 */
 	onChanged: (address: ListenAddress) => void;
 }
@@ -37,6 +41,7 @@ function readListenAddress(): ListenAddress | undefined {
 
 /** 启动 settings.json 监听地址热重载；返回 false 表示未能启动（文件不可读）。 */
 export function startServerAddressWatcher(options: ServerAddressWatcherOptions): boolean {
+	if (options.signal?.aborted) return false;
 	const initial = readListenAddress();
 	if (!initial) {
 		logger.warn("settings.json 缺少有效的监听地址，地址热重载监听未启动");
@@ -55,7 +60,10 @@ export function startServerAddressWatcher(options: ServerAddressWatcherOptions):
 				timer = undefined;
 				const next = readListenAddress();
 				if (!next) return;
-				if (next.host === baseline.host && next.port === baseline.port) return;
+				// A route may have started DNS before this watcher observed its temporary file value.
+				// Observe even baseline-equal intent so a revert can still cancel that pending work.
+				const reconcile = options.onIntentChanged?.(next) === true;
+				if (!reconcile && next.host === baseline.host && next.port === baseline.port) return;
 				baseline = next;
 				if (options.isCurrent(next)) {
 					logger.info("settings.json 监听地址与运行配置一致，跳过热重绑", next);
@@ -69,6 +77,15 @@ export function startServerAddressWatcher(options: ServerAddressWatcherOptions):
 		logger.error("settings.json 地址监听启动失败", { error: String(error) });
 		return false;
 	}
+	options.signal?.addEventListener(
+		"abort",
+		() => {
+			if (timer) clearTimeout(timer);
+			watcher?.close();
+			watcher = undefined;
+		},
+		{ once: true },
+	);
 	// watcher 不应阻止进程退出。
 	(watcher as { unref?: () => void }).unref?.();
 	logger.info("settings.json 地址热重载监听已启动", baseline);

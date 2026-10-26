@@ -105,6 +105,8 @@ export async function showCloseDialog(
 		resizable: false,
 		// owner 关系：系统保证该对话框永远显示在主窗口之上，切不到它后面去。
 		owner,
+		defaultButtonId: ID_MINIMIZE,
+		cancelButtonId: ID_CANCEL,
 		onMessage: (_hwnd, msg, wParam, lParam): Pointer | number | undefined => {
 			switch (msg) {
 				case WM_COMMAND: {
@@ -171,8 +173,8 @@ export async function showCloseDialog(
 	}
 	const { hwnd, instance } = dialog;
 
-	const uiFont = createFont(13);
-	const buttonFont = createFont(13, 600);
+	const uiFont = dialog.ownFont(createFont(13));
+	const buttonFont = dialog.ownFont(createFont(13, 600));
 
 	const add = (
 		className: string,

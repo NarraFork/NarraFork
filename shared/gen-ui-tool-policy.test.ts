@@ -8,11 +8,20 @@ import {
 
 describe("GenUI file tool permission classification", () => {
 	test("show, render and kit_status are read-only; everything else is mutating", () => {
-		expect(GEN_UI_ACTIONS).toEqual(["create", "show", "render", "kit_status", "kit_build"]);
+		expect(GEN_UI_ACTIONS).toEqual([
+			"create",
+			"show",
+			"render",
+			"inspect",
+			"kit_status",
+			"kit_build",
+		]);
 		for (const action of ["show", "render", "kit_status"])
 			expect(isGenUiReadAction(action)).toBe(true);
 		for (const action of [
 			"create",
+			// Executes generated code in a server-side browser; not an exempt read.
+			"inspect",
 			// Runs the project's bundler and rewrites the bundle previews load.
 			"kit_build",
 			"catalog",

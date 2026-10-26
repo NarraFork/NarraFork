@@ -86,8 +86,15 @@ export function resolveProviderConnection(
 	const china = selection.region === "china";
 	const tokenPlan = selection.billing === "token-plan";
 	let resolvedEndpoints: ProviderPreset["endpoints"];
+	/** Set when the family's creation default is not the generic Responses-first pick. */
+	let creationProtocol: ProviderPreset["creationProtocol"];
 	switch (family) {
 		case "kimi": {
+			// Kimi's dynamic tool loading (a `system` message carrying `tools`) exists only
+			// on Chat Completions; through the Messages or Responses relay the only option is
+			// injecting the schema into the load notice. Responses stays selectable, but Chat
+			// Completions is what the provider is created with.
+			creationProtocol = "completions-compatible";
 			if (tokenPlan) {
 				const base = `https://api.kimi.${china ? "com" : "ai"}/coding/v1`;
 				resolvedEndpoints = endpoints(base, base, base);
@@ -128,13 +135,20 @@ export function resolveProviderConnection(
 			break;
 		}
 	}
-	const defaultProtocol = resolvedEndpoints["openai-responses"]
-		? "openai-responses"
-		: resolvedEndpoints["anthropic-messages"]
-			? "anthropic-messages"
-			: "completions-compatible";
+	const defaultProtocol =
+		creationProtocol ??
+		(resolvedEndpoints["openai-responses"]
+			? "openai-responses"
+			: resolvedEndpoints["anthropic-messages"]
+				? "anthropic-messages"
+				: "completions-compatible");
 	return {
-		preset: { ...preset, endpoints: resolvedEndpoints, defaultProtocol },
+		preset: {
+			...preset,
+			endpoints: resolvedEndpoints,
+			defaultProtocol,
+			...(creationProtocol ? { creationProtocol } : {}),
+		},
 		...(tokenPlan ? { userAgentMode: "narrafork" as const } : {}),
 	};
 }
