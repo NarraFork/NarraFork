@@ -1667,6 +1667,20 @@ SETTLE_GUIDE = """怎么整理：
 8. 整理完：`settle {t} --done`（什么都不用搬也这样收尾）。`read {space}/` 可以看整个空间的顶层。"""
 
 
+def settle_group(st: State, addr: str) -> list[str]:
+	"""这个块（含自己）下面所有要整理的任务：一组回答过的提问可以一起整理。"""
+	return [a for a in st.subtree(addr) if unsettled(st, a)]
+
+
+def settle_key(st: State, t: str) -> str:
+	"""队列里按组列：最外层还没整理的任务；不在这样的任务下的，按所在的块（页的根除外）。"""
+	outer = [a for a in st.ancestors(t) if unsettled(st, a)]
+	if outer:
+		return outer[-1]
+	par = st.blocks[t]["parent"]
+	return par if par and st.blocks[par]["parent"] and not unsettled(st, par) and st.blocks[t]["props"].get("question") else t
+
+
 def settle_queue(st: State) -> tuple[list[str], list[str]]:
 	tasks = sorted((a for a in st.blocks if unsettled(st, a)), key=lambda a: -st.blocks[a]["version"])
 	stale = [a for a, b in st.blocks.items() if not b["deleted"] and not is_process(st, a) and not b["props"].get("invalid") and stale_below(st, a) >= STALE_EDITS]
@@ -1700,27 +1714,63 @@ def destinations(st: State, t: str, limit: int = 6) -> list[str]:
 	return out
 
 
+def show_group(st: State, root: str, group: list[str], args) -> None:
+	anc = st.ancestors(root)
+	print(f"整理 [{root}] {title_of(st.blocks[root])[:70]} 下面的 {len(group)} 个任务（一起整理，一起收尾）")
+	if anc:
+		print("位置：" + " › ".join(title_of(st.blocks[a])[:30] for a in reversed(anc)))
+	for g in group:
+		print()
+		print(render_line(st, g).split("\n")[0])
+		for c in st.children(g):
+			if st.is_task(c):
+				continue
+			if st.blocks[c]["props"].get("report") or st.blocks[c]["props"].get("attachment"):
+				print(f"  - [{c}] {title_of(st.blocks[c])[:60]}（挂回的报告，`read {c}` 看）")
+			else:
+				print("\n".join(render_block(st, c, None, 1, opened=budget_open(st, c, 20, False))))
+	dest = destinations(st, root)
+	print("\n可能的去处（事实树里的块）：")
+	print("\n".join(dest) if dest else "（没有碰到同一批文件的事实）")
+	print("\n事实树的顶层页：")
+	space = st.blocks[root]["space"]
+	for a in st.children(f"{space}/"):
+		if not is_process(st, a) and not st.blocks[a]["props"].get("archived"):
+			print(f"- [{a}] {title_of(st.blocks[a])[:50]}（{sum(1 for x in st.subtree(a) if not is_process(st, x))} 块）")
+	print()
+	print(SETTLE_GUIDE.format(t=root, space=space, dense=DENSE))
+
+
 def cmd_settle(args) -> None:
 	actor = actor_of(args)
 	if not args.task:
 		st = load_state()
 		tasks, stale = settle_queue(st)
-		print(f"### 完成了、还没整理的任务（{len(tasks)}）")
-		for a in tasks[: args.limit]:
-			b = st.blocks[a]
-			n = len([x for x in own_notes(st, a) if st.blocks[x]["version"] > (b["props"].get("settled") or 0)])
-			print(f"- [{a}] {title_of(b)[:60]}（{STATUS_ZH[b['props']['status']]}；{n} 块没整理）")
-		if len(tasks) > args.limit:
-			print(f"- …另有 {len(tasks) - args.limit} 个（--limit 看更多）")
+		groups: dict[str, list[str]] = {}
+		for a in tasks:
+			groups.setdefault(settle_key(st, a), []).append(a)
+		print(f"### 完成了、还没整理的任务（{len(tasks)} 个，{len(groups)} 组）")
+		for key, members in list(groups.items())[: args.limit]:
+			b = st.blocks[key]
+			if members == [key]:
+				n = len([x for x in own_notes(st, key) if st.blocks[x]["version"] > (b["props"].get("settled") or 0)])
+				print(f"- [{key}] {title_of(b)[:60]}（{STATUS_ZH[b['props']['status']]}；{n} 块没整理）")
+			else:
+				print(f"- [{key}] {title_of(b)[:60]}（下面 {len(members)} 个任务一起整理）")
+		if len(groups) > args.limit:
+			print(f"- …另有 {len(groups) - args.limit} 组（--limit 看更多）")
 		print(f"\n### 下层已变的块（{len(stale)}）：看一眼概括还对不对，对就 `recheck 地址 ok`，不对就改写")
 		for a in stale[: args.limit]:
 			print(f"- [{a}] {title_of(st.blocks[a])[:60]}（直接子块变了 {stale_below(st, a)} 处，现有 {len(fact_kids(st, a))} 个）")
-		print("\n整理一个任务：`settle 任务地址`")
+		print("\n整理一个任务或一组：`settle 地址`")
 		return
 	if not args.done:
 		st = load_state()
 		t = resolve(st, args.task)
 		b = st.blocks[t]
+		group = settle_group(st, t)
+		if len(group) > 1 or (group and group[0] != t):
+			return show_group(st, t, group, args)
 		if b["kind"] != "task" or b["props"].get("status") not in ("done", "cancelled"):
 			raise OutlineError(f"{t} 不是完成或取消了的任务；做完了再整理")
 		anc = st.ancestors(t)
@@ -1761,12 +1811,14 @@ def cmd_settle(args) -> None:
 		st = load_state()
 		t = resolve(st, args.task)
 		b = st.blocks[t]
-		if b["kind"] != "task" or b["props"].get("status") not in ("done", "cancelled"):
-			raise OutlineError(f"{t} 不是完成或取消了的任务")
-		tx = Tx(st, actor, args.message or f"整理完 {b['props'].get('alias') or t}")
-		since = b["version"]  # 任务完成（或上次整理）之后加的出处才算这次整理的
-		out = [lk for lk in st.links_to(t, "source") if lk["created_seq"] > since and lk["from"] in st.blocks and not st.blocks[lk["from"]]["deleted"]]
-		tx.push({"op": "block.update", "addr": t, "props": {"settled": tx.seq}})
+		group = settle_group(st, t) or ([t] if b["kind"] == "task" and b["props"].get("status") in ("done", "cancelled") else [])
+		if not group:
+			raise OutlineError(f"{t} 下面没有完成了、要整理的任务")
+		tx = Tx(st, actor, args.message or f"整理完 {b['props'].get('alias') or t}" + (f" 下面的 {len(group)} 个任务" if group != [t] else ""))
+		since = min(st.blocks[g]["version"] for g in group)  # 任务完成（或上次整理）之后加的出处才算这次整理的
+		out = [lk for g in dict.fromkeys([t, *group]) for lk in st.links_to(g, "source") if lk["created_seq"] > since and lk["from"] in st.blocks and not st.blocks[lk["from"]]["deleted"]]
+		for g in group:
+			tx.push({"op": "block.update", "addr": g, "props": {"settled": tx.seq}})
 		new = sum(1 for lk in out if st.blocks[lk["from"]]["created_seq"] == lk["created_seq"])
 		for par in dict.fromkeys(st.blocks[lk["from"]]["parent"] for lk in out):
 			if par and not is_process(st, par):
