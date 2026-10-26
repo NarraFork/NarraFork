@@ -4,6 +4,7 @@
  */
 
 import type { PathFlavor, RuleTargetSelector } from "@server/services/execution-policy/types";
+import type { McpLoadingMode } from "@shared/mcp-loading-mode";
 import type { RecordingSettings } from "@shared/request-recording";
 import type { SubagentModelReasoningEfforts } from "@shared/subagent-model-policy";
 import type { TokenDanceCatalogModel } from "@shared/tokendance";
@@ -385,7 +386,9 @@ export interface McpServerConfig {
 	url?: string;
 	/** sse/streamable-http: custom request headers. */
 	headers?: Record<string, string>;
-	/** Whether this server is enabled. */
+	/** Authoritative loading policy; absent only on legacy input. */
+	mode?: McpLoadingMode;
+	/** Compatibility projection of mode !== disabled. */
 	enabled: boolean;
 	/** Default permission behavior for all tools from this server. When unset, follows the narrator's permission mode. */
 	defaultBehavior?: "readOnly" | "readWrite" | "ask" | "deny";

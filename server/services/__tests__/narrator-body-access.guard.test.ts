@@ -65,7 +65,10 @@ const RAW_BODY_ACCESS: Record<string, { count: number; why: string }> = {
 	"server/services/storage-service.ts": { count: 2, why: "read switch off" },
 	"server/services/narrator-export.ts": { count: 1, why: "read switch off" },
 	"server/services/session-interchange/export.ts": { count: 1, why: "read switch off" },
-	"server/services/narrator-epochs.ts": { count: 1, why: "read switch off" },
+	"server/services/narrator-epochs.ts": {
+		count: 2,
+		why: "PG compact epoch-only projection, whose column is the body",
+	},
 	"server/services/agent-runtime/publication.ts": { count: 1, why: "column fallback" },
 	// Writes whose rows the sync queue builds from the column (`insertEnvelopeQueued`'s
 	// contract): a legacy-format import, and the revert program's prepared statements, which

@@ -1,9 +1,9 @@
 /**
- * The outline store contract against a real PostgreSQL: the same cases as
+ * The outline store and read contracts against a real PostgreSQL: the same cases as
  * `server/services/outline/__tests__/store-contract.test.ts` (SQLite), run through the
- * PostgreSQL store and the write path over a pooled network connection, on a database that has
- * every `drizzle-postgres` migration applied verbatim plus the pg_trgm search catalog
- * (`ensurePgFts`).
+ * PostgreSQL store, the write path and the read services over a pooled network connection, on a
+ * database that has every `drizzle-postgres` migration applied verbatim plus the pg_trgm search
+ * catalog (`ensurePgFts`).
  *
  * The concurrency case is genuine here: racing writers hold separate pooled connections, so the
  * space counter's row lock is what serializes them.
@@ -25,6 +25,7 @@ import {
 	type OutlineContractContext,
 	type SpaceDump,
 } from "../../../../server/services/outline/__tests__/contract";
+import { OUTLINE_READ_CONTRACT } from "../../../../server/services/outline/__tests__/read-contract";
 import type { OutlineTaskJson } from "../../../../server/services/outline/model";
 import {
 	chunked,
@@ -57,7 +58,7 @@ describe("PostgreSQL outline store", () => {
 	}
 
 	it(
-		"satisfies the outline store contract on a real server",
+		"satisfies the outline store and read contracts on a real server",
 		async () => {
 			const sqls = await migrationSql();
 			const outcome = await withPostgres(async ({ exec, port, credentials }) => {
@@ -150,7 +151,7 @@ describe("PostgreSQL outline store", () => {
 				const problems: string[] = [];
 				const passed: string[] = [];
 				try {
-					for (const contractCase of OUTLINE_STORE_CONTRACT) {
+					for (const contractCase of [...OUTLINE_STORE_CONTRACT, ...OUTLINE_READ_CONTRACT]) {
 						try {
 							await contractCase.run(ctx);
 							passed.push(contractCase.name);
@@ -172,7 +173,9 @@ describe("PostgreSQL outline store", () => {
 				throw new Error(`PostgreSQL harness did not run: ${JSON.stringify(outcome)}`);
 			}
 			expect(outcome.problems).toEqual([]);
-			expect(outcome.passed).toHaveLength(OUTLINE_STORE_CONTRACT.length);
+			expect(outcome.passed).toHaveLength(
+				OUTLINE_STORE_CONTRACT.length + OUTLINE_READ_CONTRACT.length,
+			);
 		},
 		RUN_TIMEOUT_MS,
 	);

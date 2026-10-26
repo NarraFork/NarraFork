@@ -44,7 +44,7 @@ import type { ModelProtocol } from "../settings/types";
 import type { ProviderAdapter } from "./provider";
 import { effectiveModelProfile } from "./provider-model-metadata";
 import { resolveToolJsonSchema, toolRegistry } from "./tool-registry";
-import type { ResolvedToolDefinition } from "./types";
+import type { ResolvedToolDefinition, ToolDefinition } from "./types";
 
 export const TOOL_LOADING_MODES = [
 	"anthropic_tool_addition",
@@ -196,18 +196,84 @@ export function resolveAdapterToolLoadingStrategy(
  * definitions qualify: a description computed from the loop config could not be
  * reproduced byte-for-byte here.
  */
-export function resolveLoadableToolDefinition(name: string): ResolvedToolDefinition | null {
-	const tool = toolRegistry.get(name);
+function staticLoadableToolDefinition(
+	tool: ToolDefinition | undefined,
+): ResolvedToolDefinition | null {
 	if (!tool || (tool.isAvailable && !tool.isAvailable())) return null;
 	if (typeof tool.description !== "string" || tool.getRawJsonSchema) return null;
 	return { ...tool, description: tool.description };
 }
 
+export function resolveLoadableToolDefinition(name: string): ResolvedToolDefinition | null {
+	return staticLoadableToolDefinition(toolRegistry.get(name));
+}
+
 // === Loading state of one context epoch ===
+
+export interface ToolDefinitionSnapshot {
+	name: string;
+	description: string;
+	parameters: Record<string, unknown>;
+}
+
+export function snapshotToolDefinitions(
+	names: Iterable<string>,
+	candidates?: readonly ToolDefinition[],
+): ToolDefinitionSnapshot[] {
+	const byName = candidates ? new Map(candidates.map((tool) => [tool.name, tool])) : undefined;
+	const snapshots: ToolDefinitionSnapshot[] = [];
+	let remaining = 1024 * 1024;
+	for (const name of names) {
+		if (snapshots.length >= 2048) throw new Error("Tool definition group exceeds 2048 tools");
+		// A supplied candidate view is authoritative: a missing name must not leak back
+		// into a second registry lookup with potentially different filters or metadata.
+		const tool = byName
+			? staticLoadableToolDefinition(byName.get(name))
+			: resolveLoadableToolDefinition(name);
+		if (!tool) continue;
+		// The replacer charges a conservative escaped-JSON budget BEFORE each value
+		// is serialized. Never clone an entire oversized group and measure afterwards.
+		const encoded = JSON.stringify(
+			{ name, description: tool.description, parameters: resolveToolJsonSchema(tool) },
+			(key, value: unknown) => {
+				remaining -= key.length * 6 + 4;
+				remaining -=
+					typeof value === "string" ? value.length * 6 + 2 : typeof value === "number" ? 32 : 8;
+				if (remaining < 0)
+					throw new Error("Tool definition group exceeds 1 MiB serialization budget");
+				return value;
+			},
+		);
+		snapshots.push(JSON.parse(encoded) as ToolDefinitionSnapshot);
+	}
+	return snapshots;
+}
+
+function snapshotDefinition(snapshot: ToolDefinitionSnapshot): ResolvedToolDefinition {
+	return {
+		name: snapshot.name,
+		description: snapshot.description,
+		rawJsonSchema: snapshot.parameters,
+	} as ResolvedToolDefinition;
+}
+
+function readSnapshots(value: unknown): ToolDefinitionSnapshot[] | undefined {
+	if (!Array.isArray(value)) return undefined;
+	return value.filter(
+		(item): item is ToolDefinitionSnapshot =>
+			!!item &&
+			typeof item.name === "string" &&
+			typeof item.description === "string" &&
+			!!item.parameters &&
+			typeof item.parameters === "object" &&
+			!Array.isArray(item.parameters),
+	);
+}
 
 export interface ToolLoadingEvent {
 	kind: "load" | "unload";
 	tools: readonly string[];
+	definitionSnapshots?: ToolDefinitionSnapshot[];
 }
 
 /**
@@ -229,6 +295,7 @@ export interface ToolLoadingState {
 	loaded: readonly string[];
 	/** Managed tools loaded right now. */
 	current: ReadonlySet<string>;
+	definitionSnapshots?: ToolDefinitionSnapshot[];
 }
 
 /** The loaded set an epoch froze when it opened, and where it opened. */
@@ -237,6 +304,7 @@ export interface ToolLoadingEpoch {
 	markerId?: string;
 	/** Optional tools loaded when the epoch opened (any tool; managed ones are kept). */
 	toolNames: readonly string[];
+	definitionSnapshots?: ToolDefinitionSnapshot[];
 	/** The request target the epoch opened for (`resolveEpochTarget`), when recorded. */
 	target?: string;
 }
@@ -246,6 +314,7 @@ export interface EpochRecord {
 	reason: "compact" | "target" | "cold" | "manual";
 	target?: string;
 	toolNames: string[];
+	definitionSnapshots?: ToolDefinitionSnapshot[];
 }
 
 /** The epoch a stored element opens: a marker `{type:"epoch"}` or a compact with `epoch`. */
@@ -259,6 +328,7 @@ export function epochRecordOf(block: unknown): EpochRecord | undefined {
 		reason: (typeof epoch.reason === "string" ? epoch.reason : "manual") as EpochRecord["reason"],
 		...(typeof epoch.target === "string" ? { target: epoch.target } : {}),
 		toolNames: epoch.toolNames.filter((name): name is string => typeof name === "string"),
+		definitionSnapshots: readSnapshots(epoch.definitionSnapshots),
 	};
 }
 
@@ -274,6 +344,7 @@ export function latestToolLoadingEpoch(
 			return {
 				markerId: message.id,
 				toolNames: epoch.toolNames,
+				definitionSnapshots: epoch.definitionSnapshots,
 				...(epoch.target ? { target: epoch.target } : {}),
 			};
 	}
@@ -302,7 +373,9 @@ export function toolLoadingEventOf(
 		record.type === "tool_loaded" ? "load" : record.type === "tool_unloaded" ? "unload" : null;
 	if (!kind) return null;
 	const tools = eventToolNames(record).filter((name) => managed.has(name));
-	return tools.length > 0 ? { kind, tools } : null;
+	return tools.length > 0
+		? { kind, tools, definitionSnapshots: readSnapshots(record.definitionSnapshots) }
+		: null;
 }
 
 /** The rows of the current epoch: those after its marker, or all of them. */
@@ -352,6 +425,19 @@ export function deriveToolLoadingState(
 		base,
 		loaded,
 		current: currentSet,
+		definitionSnapshots: [
+			...(epoch?.definitionSnapshots ?? []),
+			...epochRows(messages, epoch?.markerId).flatMap((message) => {
+				const block = Array.isArray(message.contentJson)
+					? (message.contentJson[0] as Record<string, unknown>)
+					: undefined;
+				return message.role === "user" && !message.parentToolUseId && block?.type === "tool_loaded"
+					? (readSnapshots(block.definitionSnapshots) ?? [])
+					: [];
+			}),
+		].filter(
+			(snapshot, index, all) => all.findIndex((item) => item.name === snapshot.name) === index,
+		),
 	};
 }
 
@@ -388,23 +474,6 @@ export function usesToolLoading(state: ToolLoadingState | undefined): state is T
 	return !!state && state.managed.size > 0;
 }
 
-/** Whether two states would produce the same `tools` array. */
-export function sameToolLoadingLayout(
-	a: ToolLoadingState | undefined,
-	b: ToolLoadingState | undefined,
-): boolean {
-	if (!a || !b) return a === b;
-	const sameSet = (x: ReadonlySet<string>, y: ReadonlySet<string>) =>
-		x.size === y.size && [...x].every((name) => y.has(name));
-	return (
-		sameSet(a.managed, b.managed) &&
-		sameSet(a.base, b.base) &&
-		sameSet(a.current, b.current) &&
-		a.loaded.length === b.loaded.length &&
-		a.loaded.every((name, index) => b.loaded[index] === name)
-	);
-}
-
 // === Request tools ===
 
 /**
@@ -435,9 +504,16 @@ export function selectRequestTools(
 		strategy === "replace_tools"
 			? (name: string) => state.current.has(name)
 			: (name: string) => state.base.has(name);
-	const tools = candidates.filter((tool) => !state.managed.has(tool.name) || keep(tool.name));
+	const frozen = new Map(
+		state.definitionSnapshots?.map((snapshot) => [snapshot.name, snapshotDefinition(snapshot)]),
+	);
+	const definitions =
+		strategy === "replace_tools"
+			? candidates
+			: candidates.map((tool) => frozen.get(tool.name) ?? tool);
+	const tools = definitions.filter((tool) => !state.managed.has(tool.name) || keep(tool.name));
 	if (strategy !== "anthropic_deferred_tail") return { tools, deferred: [] };
-	const byName = new Map(candidates.map((tool) => [tool.name, tool]));
+	const byName = new Map(definitions.map((tool) => [tool.name, tool]));
 	const deferred = state.loaded.flatMap((name) => {
 		const tool = byName.get(name);
 		return tool && !state.base.has(name) ? [tool] : [];
@@ -541,6 +617,11 @@ export function projectToolLoadingHistory(
 	resolveDefinition: (name: string) => ResolvedToolDefinition | null,
 ): DbMessage[] {
 	if (strategy === "replace_tools") return [...messages];
+	const liveDefinition = resolveDefinition;
+	const frozen = new Map(
+		state.definitionSnapshots?.map((snapshot) => [snapshot.name, snapshotDefinition(snapshot)]),
+	);
+	resolveDefinition = (name) => frozen.get(name) ?? liveDefinition(name);
 	// Under the additive modes a tool is only ever declared once per epoch. A base tool
 	// that no longer resolves is not in the request's array either.
 	const declared = new Set([...state.base].filter((name) => resolveDefinition(name)));

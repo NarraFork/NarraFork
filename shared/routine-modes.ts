@@ -5,9 +5,8 @@
  *
  *   - `manual`   — the tool stays out of the session's tool table. Only `/load <id>`
  *                  (or a panel's one-click load button) puts it there for that session.
- *   - `auto`     — reserved for the future toolsearch mechanism, where the model
- *                  retrieves and loads a tool on demand. **Not implemented yet**, so
- *                  it currently behaves exactly like `manual` (see `isPreloadedMode`).
+ *   - `auto`     — discoverable through ToolSearch and loaded on demand as a group;
+ *                  not preloaded (see `isPreloadedMode`).
  *   - `resident` — preloaded into every new session, which is what the old "on"
  *                  position meant.
  *
@@ -145,11 +144,8 @@ export function resolveEffectiveToolRoutineMode(
 /**
  * Whether a mode preloads the tool into every new session.
  *
- * `auto` returns false: toolsearch does not exist yet, so an "auto" tool is
- * simply absent until something loads it, same as `manual`. When toolsearch
- * lands, this predicate and the load path are the two places to revisit — the
- * stored mode does not need to change, so users who pick `auto` today get the
- * new behaviour without reconfiguring anything.
+ * `auto` returns false because its tools are discovered and loaded on demand
+ * through ToolSearch rather than placed in every new session's initial tool table.
  */
 export function isPreloadedMode(mode: ToolRoutineMode): boolean {
 	return mode === "resident";
@@ -161,7 +157,8 @@ export function isPreloadedMode(mode: ToolRoutineMode): boolean {
  * Returns a new object; the input is not mutated. `resident` maps onto the old
  * whitelist and `manual` onto the old blacklist, so a downgrade or an old reader
  * still sees the same on/off state. `auto` deliberately lands in neither list:
- * to a legacy reader it is "not enabled", which matches how it currently behaves.
+ * to a legacy reader it is "not enabled", while ToolSearch reads the explicit mode
+ * and loads the group on demand.
  */
 export function applyToolRoutineMode<T extends RoutineModeConfig>(
 	config: T,

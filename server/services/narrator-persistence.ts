@@ -1312,6 +1312,7 @@ async function appendPersistedMessage(
 	message: RefMessageInput,
 	options?: {
 		bumpMessageVersion?: boolean;
+		enabledTools?: string[];
 		/** Rows that belong to the message, written in its transaction (SQLite only). */
 		withRows?: (tx: DbTx) => void;
 		/** How incomplete output reads when the envelope is stored as blocks. */
@@ -1322,7 +1323,10 @@ async function appendPersistedMessage(
 	const pg = getNarratorMessageRefsPort();
 	if (pg) {
 		if (options?.withRows) throw new Error("PostgreSQL message rows unavailable");
-		const created = await pg.append(message, { bumpMessageVersion });
+		const created = await pg.append(message, {
+			bumpMessageVersion,
+			...(options?.enabledTools ? { enabledTools: options.enabledTools } : {}),
+		});
 		if (message.role !== "disp") queueContextCharacterRefresh(message.narratorId, message.id);
 		return created;
 	}
@@ -1344,6 +1348,11 @@ async function appendPersistedMessage(
 						rows: () => {
 							seq = appendMessageRefSync(tx, message.narratorId, message.id, 0, bumpMessageVersion);
 							options?.withRows?.(tx);
+							if (options?.enabledTools)
+								tx.update(narrators)
+									.set({ enabledTools: options.enabledTools })
+									.where(eq(narrators.id, message.narratorId))
+									.run();
 						},
 					},
 				);
@@ -1731,20 +1740,25 @@ const sqliteNarratorPersistence = {
 			toolName: string;
 			toolNames: string[];
 			text: string;
+			definitionSnapshots?: import("../lib/agent/tool-loading").ToolDefinitionSnapshot[];
 		},
 		/** `system` for a change the runtime reconciled rather than a `/load` someone typed. */
 		origin?: "system",
+		enabledTools?: string[],
 	): Promise<RefMessage> {
-		return appendPersistedMessage({
-			id: generateId(),
-			narratorId,
-			role: "user",
-			contentJson: [block],
-			contextCharsJson: measureMessageCharacters("user", [block], block.text),
-			contentText: block.text,
-			...(origin ? { origin } : {}),
-			createdAt: new Date().toISOString(),
-		});
+		return appendPersistedMessage(
+			{
+				id: generateId(),
+				narratorId,
+				role: "user",
+				contentJson: [block],
+				contextCharsJson: measureMessageCharacters("user", [block], block.text),
+				contentText: block.text,
+				...(origin ? { origin } : {}),
+				createdAt: new Date().toISOString(),
+			},
+			enabledTools ? { enabledTools } : undefined,
+		);
 	},
 
 	/**
@@ -4897,6 +4911,8 @@ const PG_MESSAGE_METHODS = new Set<PropertyKey>([
 	"persistUserMessage",
 	"persistSystemMessage",
 	"persistDisplayMessage",
+	"persistToolChangeMessage",
+	"persistEpochMarker",
 	"persistAssistantMessage",
 	"createPartialAssistantMessage",
 ]);

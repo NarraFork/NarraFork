@@ -48,6 +48,7 @@ import { agentTool } from "./task";
 import { taskReflectConfirmTool, taskReflectReviseTool } from "./task-reflection";
 import { teamStatusTool } from "./team-status";
 import { terminalTool } from "./terminal";
+import { toolSearchTool } from "./tool-search";
 import { transferFileTool } from "./transfer-file";
 import { webFetchTool } from "./web-fetch";
 import { webSearchTool } from "./web-search";
@@ -115,6 +116,7 @@ const coreProvider: ToolProvider = {
 	name: "core",
 	tools() {
 		return [
+			toolSearchTool,
 			bashTool,
 			readTool,
 			writeTool,

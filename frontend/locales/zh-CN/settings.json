@@ -1771,7 +1771,7 @@
 	"toolMode.manual": "手动",
 	"toolMode.auto": "自动",
 	"toolMode.resident": "常驻",
-	"toolModeAutoPending": "toolsearch 机制尚未实现，自动挡当前行为与手动一致。",
+	"toolModeAutoPending": "自动模式通过 ToolSearch 按需发现并加载工具。",
 	"depsSection": "系统依赖",
 	"depsPackageManager": "检测到的包管理器：{{pm}}",
 	"depsNoPackageManager": "未检测到支持的包管理器",

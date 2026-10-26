@@ -14,6 +14,11 @@
  * knows how to leave those keys untouched.
  */
 
+import {
+	hasMcpLoadingConflict,
+	type McpLoadingMode,
+	resolveMcpLoadingMode,
+} from "@shared/mcp-loading-mode";
 import { createPreservedMcpSecretEntries, type McpSecretDraftEntry } from "./mcp-secrets";
 
 /** Sentinel for "leave the persisted secret value unchanged". */
@@ -35,7 +40,7 @@ export interface McpJsonDraft {
 	headers: McpSecretDraftEntry[];
 	originalEnvKeys: string[];
 	originalHeaderKeys: string[];
-	enabled: boolean;
+	mode: McpLoadingMode;
 	defaultBehavior: McpJsonBehavior;
 }
 
@@ -113,7 +118,7 @@ export function mcpDraftToJsonText(draft: McpJsonDraft): string {
 	const env = secretEntriesToJson(draft.env);
 	if (Object.keys(env).length > 0) doc.env = env;
 
-	doc.enabled = draft.enabled;
+	doc.mode = draft.mode;
 	if (draft.defaultBehavior) doc.defaultBehavior = draft.defaultBehavior;
 
 	return JSON.stringify(doc, null, 2);
@@ -228,15 +233,18 @@ export function parseMcpDraftJson(text: string, current: McpJsonDraft): McpJsonP
 		return { ok: false, errorKey: "mcpJsonInvalidField", params: { field: "headers" } };
 	}
 
-	// `enabled` defaults to true when omitted, matching the create API default and
-	// the convention of every MCP config format we import from.
-	let enabled = true;
-	if (parsed.enabled !== undefined && parsed.enabled !== null) {
-		if (typeof parsed.enabled !== "boolean") {
-			return { ok: false, errorKey: "mcpJsonInvalidField", params: { field: "enabled" } };
-		}
-		enabled = parsed.enabled;
+	if (parsed.enabled !== undefined && typeof parsed.enabled !== "boolean") {
+		return { ok: false, errorKey: "mcpJsonInvalidField", params: { field: "enabled" } };
 	}
+	if (
+		(parsed.mode !== undefined &&
+			(typeof parsed.mode !== "string" ||
+				!["disabled", "auto", "resident"].includes(parsed.mode))) ||
+		hasMcpLoadingConflict(parsed)
+	) {
+		return { ok: false, errorKey: "mcpJsonInvalidField", params: { field: "mode" } };
+	}
+	const mode = resolveMcpLoadingMode(parsed);
 
 	let defaultBehavior: McpJsonBehavior = "";
 	if ("defaultBehavior" in parsed) {
@@ -270,7 +278,7 @@ export function parseMcpDraftJson(text: string, current: McpJsonDraft): McpJsonP
 			// existing preserved entries would silently resurrect them on save,
 			// so drop headers entirely when the document describes stdio.
 			headers: transport === "stdio" ? [] : headers,
-			enabled,
+			mode,
 			defaultBehavior,
 		},
 	};

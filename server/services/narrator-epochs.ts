@@ -20,16 +20,21 @@
  */
 
 import type { DbMessage } from "@shared/agent-protocol/types";
-import { activeDatabaseBackend, sqlite } from "../db";
+import { and, desc, eq, isNull, sql } from "drizzle-orm";
+import { activeDatabaseBackend, db, sqlite } from "../db";
+import { narratorMessageRefs, narratorMessages } from "../db/schema";
 import { resolveEpochTarget } from "../lib/agent";
 import {
 	deriveToolLoadingState,
 	type EpochRecord,
 	epochRecordOf,
 	latestToolLoadingEpoch,
+	snapshotToolDefinitions,
 	type ToolLoadingEpoch,
 	toolLoadingDrift,
 } from "../lib/agent/tool-loading";
+import { toolRegistry } from "../lib/agent/tool-registry";
+import type { ToolDefinition } from "../lib/agent/types";
 import { getBuiltinToolNames, getBuiltinToolRoutines } from "../lib/builtin-routines";
 import type { Locale } from "../lib/i18n";
 import { logger } from "../lib/logger";
@@ -62,6 +67,7 @@ export function compactEpochRecord(
 		reason: "compact",
 		target: resolveEpochTarget(active.model, active.provider).fingerprint,
 		toolNames: [...active._enabledOptionalTools].sort(),
+		definitionSnapshots: snapshotToolDefinitions(active._enabledOptionalTools),
 	};
 }
 
@@ -90,23 +96,67 @@ export function compactToolLoadingEpoch(narratorId: string): ToolLoadingEpoch | 
 	}
 	const epoch = epochRecordOf({ type: "compact", epoch: recorded });
 	return epoch
-		? { toolNames: epoch.toolNames, ...(epoch.target ? { target: epoch.target } : {}) }
+		? {
+				toolNames: epoch.toolNames,
+				definitionSnapshots: epoch.definitionSnapshots,
+				...(epoch.target ? { target: epoch.target } : {}),
+			}
 		: undefined;
 }
 
 /** The epoch a history window is in: its latest marker row, else the compact before it. */
-export function toolLoadingEpochOf(
+export async function toolLoadingEpochOf(
 	narratorId: string,
 	messages: readonly DbMessage[],
-): ToolLoadingEpoch | undefined {
-	return latestToolLoadingEpoch(messages) ?? compactToolLoadingEpoch(narratorId);
+): Promise<ToolLoadingEpoch | undefined> {
+	const visible = latestToolLoadingEpoch(messages);
+	if (visible) return visible;
+	if (activeDatabaseBackend === "sqlite") return compactToolLoadingEpoch(narratorId);
+	// PG stores the authoritative body in content_json, so block reads do not apply.
+	// Project only the compact epoch, never the potentially large summary beside it.
+	const [row] = await db
+		.select({ epoch: sql<unknown>`(${narratorMessages.contentJson}::jsonb)->0->'epoch'` })
+		.from(narratorMessageRefs)
+		.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
+		.where(
+			and(eq(narratorMessageRefs.narratorId, narratorId), eq(narratorMessageRefs.isCompact, 1)),
+		)
+		.orderBy(desc(narratorMessageRefs.seq))
+		.limit(1);
+	const epoch = epochRecordOf({ type: "compact", epoch: row?.epoch });
+	return epoch
+		? {
+				toolNames: epoch.toolNames,
+				definitionSnapshots: epoch.definitionSnapshots,
+				...(epoch.target ? { target: epoch.target } : {}),
+			}
+		: undefined;
 }
 
 /** The newest assistant step this narrator holds: when and through what it was sent. */
-function lastStep(
+async function lastStep(
 	narratorId: string,
-): { provider: string | null; model: string | null; createdAt: string } | undefined {
-	if (activeDatabaseBackend !== "sqlite") return undefined;
+): Promise<{ provider: string | null; model: string | null; createdAt: string } | undefined> {
+	if (activeDatabaseBackend !== "sqlite") {
+		const [row] = await db
+			.select({
+				provider: narratorMessages.provider,
+				model: narratorMessages.model,
+				createdAt: narratorMessages.createdAt,
+			})
+			.from(narratorMessageRefs)
+			.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
+			.where(
+				and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					eq(narratorMessages.role, "assistant"),
+					isNull(narratorMessages.parentToolUseId),
+				),
+			)
+			.orderBy(desc(narratorMessageRefs.seq))
+			.limit(1);
+		return row;
+	}
 	return (
 		(sqlite
 			.prepare(
@@ -125,31 +175,48 @@ function lastStep(
 const sameSet = (a: ReadonlySet<string>, b: ReadonlySet<string>) =>
 	a.size === b.size && [...a].every((name) => b.has(name));
 
+export interface ReconciledEpoch {
+	changed: boolean;
+	epoch: ToolLoadingEpoch | undefined;
+}
+
+/** Shared by sessions without managed tools; they perform no epoch DB/history work. */
+const EMPTY_RECONCILED_EPOCH: ReconciledEpoch = Object.freeze({
+	changed: false,
+	epoch: undefined,
+});
+
 /**
- * Write what this pass's request must carry before its history is built. Returns
- * whether rows were written (the caller reloads the history then). Best effort: a
- * failure is logged and the request goes out with the history as it is.
+ * Write what this pass's request must carry before its history is built. `changed` says
+ * whether rows were written; `epoch` is the exact already-read/opened epoch for history.
+ * A failed freeze aborts assembly: current definitions must never rewrite history.
  */
 export async function reconcileEpoch(input: {
 	narratorId: string;
 	messages: readonly DbMessage[];
 	managed: ReadonlySet<string>;
 	current: Iterable<string>;
+	/** Full candidates from the caller's current registry view (legacy callers may omit). */
+	candidates?: readonly ToolDefinition[];
 	model: string;
 	provider: string;
 	/** Notice text for a reconciled load or unload of `toolName`. */
 	noticeText: (kind: "tool_loaded" | "tool_unloaded", toolName: string) => string;
 	now?: number;
 	resolveTarget?: typeof resolveEpochTarget;
-}): Promise<boolean> {
+}): Promise<ReconciledEpoch> {
 	const { narratorId, messages, managed } = input;
-	if (managed.size === 0 || activeDatabaseBackend !== "sqlite") return false;
+	if (managed.size === 0) return EMPTY_RECONCILED_EPOCH;
 	try {
+		// Production always supplies this view. The fallback keeps standalone legacy callers
+		// working without ever mixing two registry arrays inside one reconcile.
+		const candidates = input.candidates ?? toolRegistry.all();
+		const snapshots = (current: Iterable<string>) => snapshotToolDefinitions(current, candidates);
 		const resolveTarget = input.resolveTarget ?? resolveEpochTarget;
 		const target = resolveTarget(input.model, input.provider);
-		const epoch = toolLoadingEpochOf(narratorId, messages);
+		const epoch = await toolLoadingEpochOf(narratorId, messages);
 		const state = deriveToolLoadingState(messages, managed, input.current, epoch);
-		const last = lastStep(narratorId);
+		const last = await lastStep(narratorId);
 		const sentTo =
 			last?.model && last.provider
 				? resolveTarget(last.model, last.provider).fingerprint
@@ -160,15 +227,50 @@ export async function reconcileEpoch(input: {
 			!!last &&
 			(input.now ?? Date.now()) - Date.parse(last.createdAt) > target.cacheTtlMs;
 		const layoutChanges = state.loaded.length > 0 || !sameSet(state.base, state.current);
-		if ((targetChanged || cold) && layoutChanges) {
-			await narratorStore.openEpoch(narratorId, {
-				reason: targetChanged ? "target" : "cold",
+		const liveSnapshots = new Map(
+			snapshots(state.definitionSnapshots?.map((item) => item.name) ?? []).map((item) => [
+				item.name,
+				item,
+			]),
+		);
+		const definitionsChanged =
+			state.definitionSnapshots?.some(
+				(item) => JSON.stringify(item) !== JSON.stringify(liveSnapshots.get(item.name)),
+			) ?? false;
+		const frozenNames = new Set(state.definitionSnapshots?.map((item) => item.name));
+		const missingMcpSnapshots =
+			snapshots(
+				(epoch?.toolNames ?? []).filter(
+					(name) => name.startsWith("mcp__") && managed.has(name) && !frozenNames.has(name),
+				),
+			).length > 0;
+		if (
+			(!epoch && [...managed].some((name) => name.startsWith("mcp__"))) ||
+			missingMcpSnapshots ||
+			definitionsChanged ||
+			((targetChanged || cold) && layoutChanges)
+		) {
+			const definitionSnapshots = snapshots(state.current);
+			const opened: EpochRecord = {
+				reason: definitionsChanged ? "manual" : targetChanged ? "target" : cold ? "cold" : "manual",
 				target: target.fingerprint,
 				toolNames: [...state.current].sort(),
-			});
-			return true;
+				...(definitionSnapshots.length ? { definitionSnapshots } : {}),
+			};
+			const marker = await narratorStore.openEpoch(narratorId, opened);
+			return {
+				changed: true,
+				epoch: {
+					markerId: marker.id,
+					toolNames: opened.toolNames,
+					...(opened.definitionSnapshots
+						? { definitionSnapshots: opened.definitionSnapshots }
+						: {}),
+					...(opened.target ? { target: opened.target } : {}),
+				},
+			};
 		}
-		if (!epoch) return false;
+		if (!epoch) return { changed: false, epoch };
 		const drift = toolLoadingDrift(messages, state);
 		for (const [type, names] of [
 			["tool_loaded", drift.loads],
@@ -177,15 +279,30 @@ export async function reconcileEpoch(input: {
 			for (const toolName of names)
 				await narratorStore.appendToolChange(
 					narratorId,
-					{ type, toolName, toolNames: [toolName], text: input.noticeText(type, toolName) },
+					{
+						type,
+						toolName,
+						toolNames: [toolName],
+						text: input.noticeText(type, toolName),
+						...(type === "tool_loaded" ? { definitionSnapshots: snapshots([toolName]) } : {}),
+					},
 					"system",
 				);
-		return drift.loads.length > 0 || drift.unloads.length > 0;
+		return {
+			changed: drift.loads.length > 0 || drift.unloads.length > 0,
+			epoch,
+		};
 	} catch (error) {
-		logger.warn("Epoch reconcile failed; the request keeps the history as it is", {
-			narratorId,
-			error: String(error),
-		});
-		return false;
+		logger.warn(
+			"Epoch reconcile failed; request assembly stopped to preserve frozen tool definitions",
+			{
+				narratorId,
+				error: String(error),
+			},
+		);
+		throw new Error(
+			"Tool epoch could not be saved or its definitions exceed the snapshot budget; retry after correcting the tool configuration or storage error.",
+			{ cause: error },
+		);
 	}
 }

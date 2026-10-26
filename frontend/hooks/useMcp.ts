@@ -1,3 +1,4 @@
+import { applyMcpLoadingPatch } from "@shared/mcp-loading-mode";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../lib/api";
 import i18n from "../lib/i18n";
@@ -87,6 +88,15 @@ function applyMcpServerPatch(
 ): Record<string, unknown> & { id: string } {
 	const { toolPermissionPatch, ...rest } = patch;
 	const next = { ...server, ...rest };
+	if (patch.mode !== undefined || patch.enabled !== undefined) {
+		Object.assign(
+			next,
+			applyMcpLoadingPatch(
+				{ mode: server.mode, enabled: server.enabled },
+				{ mode: patch.mode, enabled: patch.enabled },
+			),
+		);
+	}
 	if (Object.hasOwn(patch, "defaultBehavior") && patch.defaultBehavior == null) {
 		delete next.defaultBehavior;
 	}
@@ -149,14 +159,6 @@ export function useConnectMcpServer() {
 	const qc = useQueryClient();
 	return useMutation({
 		mutationFn: api.mcpConnectServer,
-		onSuccess: () => qc.invalidateQueries({ queryKey: ["mcp-servers"] }),
-	});
-}
-
-export function useDisconnectMcpServer() {
-	const qc = useQueryClient();
-	return useMutation({
-		mutationFn: api.mcpDisconnectServer,
 		onSuccess: () => qc.invalidateQueries({ queryKey: ["mcp-servers"] }),
 	});
 }

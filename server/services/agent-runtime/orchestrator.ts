@@ -3,6 +3,7 @@ import { quotaExhaustedCode } from "@shared/agent-protocol/quota-exhausted";
 import { bufferedRowMode, resolveBufferQueueMode } from "@shared/buffer-queue-mode";
 import { serializeCatalogErrorMessage } from "@shared/error-catalog";
 import { type FileReferenceSnapshot, fileReferenceMessageForDisplay } from "@shared/file-reference";
+import { resolveMcpLoadingMode } from "@shared/mcp-loading-mode";
 import { formatOriginLabel } from "@shared/message-origin";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { eq } from "drizzle-orm";
@@ -17,9 +18,11 @@ import {
 	clearPipelineStateIfActive,
 } from "../../lib/agent/pipeline-state";
 import { detectShell } from "../../lib/agent/shell";
+import { toolRegistry } from "../../lib/agent/tool-registry";
 import { getMissingWorkingDirectoryRecovery, SHELL_TOOL_NAME } from "../../lib/agent/tools/bash";
 import { clearBehaviorFenceEditGrant } from "../../lib/agent/tools/behavior-fence-grant";
 import { KNOWLEDGE_KIND_DENY_CORE, OPTIONAL_TOOLS } from "../../lib/agent/tools/index";
+import type { ToolDefinition } from "../../lib/agent/types";
 import { buildAttachedFilesHint } from "../../lib/attached-files";
 import { normalizeBooleanOverride, resolveBooleanOverride } from "../../lib/boolean-override";
 import { queueContextCharacterRefresh } from "../../lib/context-characters";
@@ -200,6 +203,7 @@ import { resolvePlanApprovalAttribution } from "../plan-approval-attribution";
 import { subagentRetryRecoveredBroadcast } from "../subagent-executor";
 import { isMcpToolAllowedForNarrator, runtimeToolFilter } from "../subagent-tools";
 import { buildFinalToolStartAuthorization } from "../tool-final-start-authorization";
+import { parseMcpServerMarker } from "../tool-load-markers";
 import { resolveNarratorCapabilities } from "../trait-layer-service";
 import { buildTreeSnapshotExecutionHooks, FILE_MUTATING_TOOLS } from "../tree-snapshot-loop-hooks";
 import {
@@ -943,25 +947,73 @@ export async function runAgentLoopUnlocked(
 				? filterOAuthSessionDevices(resolvedTurnSessionDevices, oauthRuntime)
 				: resolvedTurnSessionDevices;
 
-			// Optional tools whose presence follows session loading this pass. An explicit
-			// ceiling allowlist is authoritative and admits them regardless of loading;
-			// otherwise only tools the other filters admit can be loaded into the request.
-			const managedOptionalTools = new Set(
-				runtimePolicy.tools.builtin === "all"
-					? [...OPTIONAL_TOOLS.values()]
-							.filter(
-								(tool) =>
-									(!tool.isAvailable || tool.isAvailable()) &&
-									profileToolFilter(tool) &&
-									(!oauthRuntime || oauthRuntime.allowedTools.has(tool.name)) &&
-									!active._disabledTools.has(tool.name),
-							)
-							.map((tool) => tool.name)
-					: [],
-			);
+			// Every refresh derives the complete request view from one registry array. An
+			// explicit ceiling has no managed loading and needs no MCP grant DB read.
+			const managedOptionalTools = new Set<string>();
+			let toolCandidates: readonly ToolDefinition[] = [];
+			const refreshMcpToolLoading = async () => {
+				const candidates = toolRegistry.all();
+				toolCandidates = candidates;
+				managedOptionalTools.clear();
+				if (runtimePolicy.tools.builtin !== "all") return;
+				for (const tool of candidates) {
+					if (
+						OPTIONAL_TOOLS.has(tool.name) &&
+						(!tool.isAvailable || tool.isAvailable()) &&
+						profileToolFilter(tool) &&
+						(!oauthRuntime || oauthRuntime.allowedTools.has(tool.name)) &&
+						!active._disabledTools.has(tool.name)
+					)
+						managedOptionalTools.add(tool.name);
+				}
+				const [latestNarrator] = await db
+					.select({ enabledTools: narrators.enabledTools })
+					.from(narrators)
+					.where(eq(narrators.id, narratorId))
+					.limit(1);
+				const loadedMcpServers = new Set(
+					(latestNarrator?.enabledTools ?? []).flatMap((value) => {
+						const id = parseMcpServerMarker(value);
+						return id ? [id] : [];
+					}),
+				);
+				// Rebuild on every model request: neither resident membership nor old
+				// registry names are an explicit server-loading grant.
+				for (const name of managedOptionalTools) {
+					if (name.startsWith("mcp__")) managedOptionalTools.delete(name);
+				}
+				for (const name of active._enabledOptionalTools) {
+					if (name.startsWith("mcp__") || parseMcpServerMarker(name))
+						active._enabledOptionalTools.delete(name);
+				}
+				for (const value of latestNarrator?.enabledTools ?? []) {
+					if (parseMcpServerMarker(value)) active._enabledOptionalTools.add(value);
+				}
+				const servers = new Map((settings.mcpServers ?? []).map((server) => [server.id, server]));
+				for (const tool of candidates) {
+					if (!tool.metadata?.mcpServerId) continue;
+					const server = servers.get(tool.metadata.mcpServerId);
+					if (
+						!server ||
+						resolveMcpLoadingMode(server) === "disabled" ||
+						!profileToolFilter(tool) ||
+						(oauthRuntime && !oauthRuntime.allowedTools.has(tool.name)) ||
+						active._disabledTools.has(tool.name) ||
+						!isMcpToolAllowedForNarrator(tool)
+					)
+						continue;
+					managedOptionalTools.add(tool.name);
+					if (resolveMcpLoadingMode(server) === "resident" || loadedMcpServers.has(server.id))
+						active._enabledOptionalTools.add(tool.name);
+					else active._enabledOptionalTools.delete(tool.name);
+				}
+			};
+			await refreshMcpToolLoading();
 			const toolLoadingInput = () => ({
-				managed: managedOptionalTools,
-				current: active._enabledOptionalTools,
+				// Freeze one request's derivation; live active membership is only for execution.
+				managed: new Set(managedOptionalTools),
+				current: new Set(active._enabledOptionalTools),
+				candidates: toolCandidates,
 			});
 
 			// Preserve the original signed array. buildRuntimeHistory drops the placement under
@@ -1038,23 +1090,24 @@ export async function runAgentLoopUnlocked(
 			clearPlanModePromptRebuild(narratorId);
 
 			// What this request must carry before its history is built: a new epoch at a
-			// boundary, or notices for tool changes that bypassed `/load` (§7.7).
-			if (
-				await reconcileEpoch({
-					narratorId,
-					messages: rawMessages,
-					...toolLoadingInput(),
-					model: resolved.model,
-					provider: resolved.provider,
-					noticeText: (kind, toolName) =>
-						kind === "tool_loaded"
-							? getToolMessageWithParams("toolLoaded", locale, {
-									toolName,
-									toolDescription: optionalToolDescription(toolName, locale),
-								})
-							: getToolMessageWithParams("toolUnloaded", locale, { toolName }),
-				})
-			)
+			// boundary, or notices for tool changes that bypassed `/load` (§7.7). Reuse the
+			// exact epoch and candidates for projection instead of querying/scanning again.
+			const toolLoading = toolLoadingInput();
+			const reconciled = await reconcileEpoch({
+				narratorId,
+				messages: rawMessages,
+				...toolLoading,
+				model: resolved.model,
+				provider: resolved.provider,
+				noticeText: (kind, toolName) =>
+					kind === "tool_loaded"
+						? getToolMessageWithParams("toolLoaded", locale, {
+								toolName,
+								toolDescription: optionalToolDescription(toolName, locale),
+							})
+						: getToolMessageWithParams("toolUnloaded", locale, { toolName }),
+			});
+			if (reconciled.changed)
 				rawMessages = await narratorService.getModelHistorySinceLastCompact(narratorId, undefined, {
 					signal: active.abortController.signal,
 					deadline: historyDeadline,
@@ -1067,7 +1120,7 @@ export async function runAgentLoopUnlocked(
 				attachmentCwd: active.cwd,
 				attachmentSignal: active.abortController.signal,
 				deadline: historyDeadline,
-				toolLoading: toolLoadingInput(),
+				toolLoading: { ...toolLoading, epoch: reconciled.epoch },
 			};
 			let preparedHistory = await buildRuntimeHistory({
 				...historyOptions,
@@ -1270,6 +1323,7 @@ export async function runAgentLoopUnlocked(
 				getProvider: () => resolveProviderAndModel(active.model, active.provider).provider,
 				getAttachmentCwd: () => active.cwd,
 				getToolLoading: toolLoadingInput,
+				refreshToolLoading: refreshMcpToolLoading,
 				attachmentSignal: active.abortController.signal,
 				onCompactDone: () => {
 					compactDoneFlag = true;
@@ -1814,6 +1868,7 @@ export async function runAgentLoopUnlocked(
 					freshNarrator.traits,
 				),
 				toolLoading: preparedHistory.toolLoading,
+				toolCandidates: preparedHistory.toolCandidates,
 				isToolLoaded: (name) => active._enabledOptionalTools.has(name),
 				toolFilter: (tool) => {
 					if (!profileToolFilter(tool)) return false;
@@ -1821,6 +1876,18 @@ export async function runAgentLoopUnlocked(
 					if (active._disabledTools.has(tool.name)) return false;
 					// When all skills are blocked, hide the Skill tool entirely.
 					if (tool.name === "Skill" && active._blockedSkills.all) return false;
+					// Newly connected MCP tools wait for the next managed snapshot; auto must never leak.
+					if (tool.name.startsWith("mcp__")) {
+						const server = settings.mcpServers?.find(
+							(item) => item.id === tool.metadata?.mcpServerId,
+						);
+						return (
+							!!server &&
+							resolveMcpLoadingMode(server) !== "disabled" &&
+							(runtimePolicy.tools.builtin !== "all" || managedOptionalTools.has(tool.name)) &&
+							isMcpToolAllowedForNarrator(tool)
+						);
+					}
 					// An explicit ceiling allowlist is authoritative; session-level optional
 					// tool loading only narrows a session whose ceiling admits every tool.
 					if (runtimePolicy.tools.builtin !== "all") return true;
@@ -1828,10 +1895,6 @@ export async function runAgentLoopUnlocked(
 					// loop from the history's loading state (`toolLoading` above).
 					if (OPTIONAL_TOOLS.has(tool.name)) {
 						return managedOptionalTools.has(tool.name);
-					}
-					// MCP tools: exclude tools with "deny" behavior
-					if (tool.name.startsWith("mcp__")) {
-						return isMcpToolAllowedForNarrator(tool);
 					}
 					// Knowledge Steward: drop a few unrelated core tools (e.g. web search/fetch).
 					// Deny-list only — never touches planning/reflection/goal control tools.

@@ -73,6 +73,49 @@ function makeSettings(initial: unknown[] = []): SettingsLike & { saved: number }
 }
 
 describe("McpAdmin tool", () => {
+	test("persists connect/disconnect mode intent and rejects contradictory add", async () => {
+		const { manager } = makeManager();
+		const settings = makeSettings([{ id: "s1", name: "demo", mode: "auto", enabled: true }]);
+		const tool = createMcpAdminTool({ manager, settings, isAdminUser: () => true });
+		await tool.execute({ action: "connect", id: "s1" }, makeCtx());
+		expect(settings.mcpServers[0]).toMatchObject({ mode: "auto", enabled: true });
+		await tool.execute({ action: "disconnect", id: "s1" }, makeCtx());
+		expect(settings.mcpServers[0]).toMatchObject({ mode: "disabled", enabled: false });
+		await tool.execute({ action: "connect", id: "s1" }, makeCtx());
+		expect(settings.mcpServers[0]).toMatchObject({ mode: "resident", enabled: true });
+		expect(settings.saved).toBe(3);
+		const result = await tool.execute(
+			{ action: "add", name: "bad", mode: "disabled", enabled: true },
+			makeCtx(),
+		);
+		expect(result.isError).toBe(true);
+		expect(settings.mcpServers).toHaveLength(1);
+	});
+
+	test("connect honors explicit auto/resident modes without changing disconnect semantics", async () => {
+		const { manager } = makeManager();
+		const settings = makeSettings([{ id: "s1", name: "demo", mode: "disabled", enabled: false }]);
+		const tool = createMcpAdminTool({ manager, settings, isAdminUser: () => true });
+
+		for (const mode of ["auto", "resident", "auto"] as const) {
+			const result = await tool.execute({ action: "connect", id: "s1", mode }, makeCtx());
+			expect(result.isError).toBeFalsy();
+			expect(settings.mcpServers[0]).toMatchObject({ mode, enabled: true });
+		}
+		await tool.execute({ action: "disconnect", id: "s1" }, makeCtx());
+		expect(settings.mcpServers[0]).toMatchObject({ mode: "disabled", enabled: false });
+		expect(settings.saved).toBe(4);
+		await tool.execute({ action: "disconnect", id: "s1" }, makeCtx());
+		expect(settings.saved).toBe(4);
+
+		const rejected = await tool.execute(
+			{ action: "connect", id: "s1", mode: "disabled" },
+			makeCtx(),
+		);
+		expect(rejected.isError).toBe(true);
+		expect(settings.saved).toBe(4);
+	});
+
 	test("lists configured servers with projected safe fields and tool names", async () => {
 		const { manager } = makeManager();
 		const tool = createMcpAdminTool({
@@ -147,10 +190,29 @@ describe("McpAdmin tool", () => {
 		expect(settings.mcpServers).toHaveLength(1);
 		const added = settings.mcpServers[0] as Record<string, unknown>;
 		expect(added.name).toBe("gh");
+		expect(added).toMatchObject({ mode: "auto", enabled: true });
 		expect(added.env).toEqual({ GITHUB_TOKEN: "super-secret" });
 		expect(calls).toEqual(["connect:gh"]);
 		// output never echoes the secret
 		expect(result.output).not.toContain("super-secret");
+	});
+
+	test("add keeps the loading switch separate from tool permission behavior", async () => {
+		const { manager, calls } = makeManager();
+		const settings = makeSettings();
+		const tool = createMcpAdminTool({ manager, settings, isAdminUser: () => true });
+
+		const result = await tool.execute(
+			{ action: "add", name: "off", command: "demo", enabled: false, defaultBehavior: "deny" },
+			makeCtx(),
+		);
+		expect(result.isError).toBeFalsy();
+		expect(settings.mcpServers[0]).toMatchObject({
+			mode: "disabled",
+			enabled: false,
+			defaultBehavior: "deny",
+		});
+		expect(calls).toEqual([]);
 	});
 
 	test("removes a server after approval", async () => {
@@ -188,10 +250,16 @@ describe("McpAdmin tool", () => {
 		expect(calls).toContain("disconnect:s1");
 	});
 
-	test("test action runs testConnection without persisting", async () => {
+	test("test uses a consistent temporary loading config without persisting", async () => {
 		const { manager, calls } = makeManager();
 		const settings = makeSettings();
 		const tool = createMcpAdminTool({ manager, settings, isAdminUser: () => true });
+		let testedConfig: Record<string, unknown> | null = null;
+		let permissionInput: Record<string, unknown> | null = null;
+		manager.testConnection = async (config) => {
+			testedConfig = config;
+			return { ok: true, tools: [{ name: "test-tool" }] };
+		};
 
 		const result = await tool.execute(
 			{
@@ -199,11 +267,20 @@ describe("McpAdmin tool", () => {
 				name: "probe",
 				transport: "streamable-http",
 				url: "https://example.com/mcp",
+				enabled: false,
+				defaultBehavior: "ask",
 			},
-			makeCtx(),
+			makeCtx({
+				onPermission: (input) => {
+					permissionInput = input;
+				},
+			}),
 		);
 		expect(result.isError).toBeFalsy();
 		expect(result.output).toContain("test-tool");
+		expect(testedConfig).toMatchObject({ mode: "auto", enabled: true, defaultBehavior: "ask" });
+		expect(permissionInput).toMatchObject({ mode: "auto" });
+		expect(permissionInput).not.toHaveProperty("enabled");
 		expect(settings.mcpServers).toHaveLength(0);
 		expect(settings.saved).toBe(0);
 		expect(calls.some((c) => c.startsWith("connect"))).toBe(false);

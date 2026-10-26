@@ -880,7 +880,7 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		type: "string[]",
 	},
 	"routines.toolModes": {
-		desc: '工具类例程的三段式模式表，键为例程 ID（如 "terminal"、"browser"）。"manual" 仅可通过 /load 临时加载；"auto" 预留给未来的 toolsearch 机制，当前行为等同 manual；"resident" 每个新会话默认加载。未列出的例程按 enabledRoutines/disabledRoutines 推导。',
+		desc: '工具类例程的三段式模式表，键为例程 ID（如 "terminal"、"browser"）。"manual" 仅可通过 /load 临时加载；"auto" 通过 ToolSearch 按需发现并加载，不预加载；"resident" 每个新会话默认加载。未列出的例程按 enabledRoutines/disabledRoutines 推导。',
 		type: "Record<string, string>",
 		valid: '"manual" | "auto" | "resident"',
 	},

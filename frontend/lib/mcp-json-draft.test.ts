@@ -19,7 +19,7 @@ function stdioDraft(overrides: Partial<McpJsonDraft> = {}): McpJsonDraft {
 		headers: [],
 		originalEnvKeys: [],
 		originalHeaderKeys: [],
-		enabled: true,
+		mode: "auto",
 		defaultBehavior: "",
 		...overrides,
 	};
@@ -45,7 +45,7 @@ describe("mcpDraftToJsonText", () => {
 			command: "npx",
 			args: ["-y", "@modelcontextprotocol/server-filesystem"],
 			cwd: "/srv",
-			enabled: true,
+			mode: "auto",
 		});
 		expect("url" in json).toBe(false);
 		expect("headers" in json).toBe(false);
@@ -66,7 +66,7 @@ describe("mcpDraftToJsonText", () => {
 			transport: "streamable-http",
 			url: "https://example.test/mcp",
 			headers: { "X-Trace": "on" },
-			enabled: true,
+			mode: "auto",
 			defaultBehavior: "ask",
 		});
 		expect("command" in json).toBe(false);
@@ -95,8 +95,44 @@ describe("mcpDraftToJsonText", () => {
 });
 
 describe("parseMcpDraftJson", () => {
+	for (const mode of ["disabled", "auto", "resident"] as const) {
+		test(`round-trips ${mode} loading mode`, () => {
+			const draft = stdioDraft({ mode });
+			const result = parseMcpDraftJson(mcpDraftToJsonText(draft), draft);
+			expect(result).toEqual({ ok: true, draft });
+			expect(JSON.parse(mcpDraftToJsonText(draft)).enabled).toBeUndefined();
+		});
+	}
+
+	test("migrates legacy enabled and defaults missing policy to auto", () => {
+		for (const [input, mode] of [
+			[{ enabled: true }, "resident"],
+			[{ enabled: false }, "disabled"],
+			[{}, "auto"],
+		] as const) {
+			const result = parseMcpDraftJson(JSON.stringify(input), stdioDraft());
+			expect(result.ok).toBe(true);
+			if (result.ok) expect(result.draft.mode).toBe(mode);
+		}
+	});
+
+	test("rejects invalid modes and conflicting legacy enablement", () => {
+		for (const input of [
+			{ mode: "manual" },
+			{ mode: null },
+			{ mode: ["auto"] },
+			{ mode: "auto", enabled: false },
+			{ mode: "disabled", enabled: true },
+		]) {
+			expect(parseMcpDraftJson(JSON.stringify(input), stdioDraft())).toEqual({
+				ok: false,
+				errorKey: "mcpJsonInvalidField",
+				params: { field: "mode" },
+			});
+		}
+	});
 	test("round-trips a draft without mutating any field", () => {
-		const original = stdioDraft({ cwd: "/srv", defaultBehavior: "readOnly", enabled: false });
+		const original = stdioDraft({ cwd: "/srv", defaultBehavior: "readOnly", mode: "disabled" });
 		const result = parseMcpDraftJson(mcpDraftToJsonText(original), original);
 
 		expect(result.ok).toBe(true);
@@ -226,9 +262,8 @@ describe("parseMcpDraftJson", () => {
 		expect(result.draft.args).toBe("");
 		expect(result.draft.cwd).toBe("");
 		expect(result.draft.defaultBehavior).toBe("");
-		// Absent `enabled` means enabled, matching the create API default and every
-		// MCP config format we import from.
-		expect(result.draft.enabled).toBe(true);
+		// New configurations default to discovery rather than resident schemas.
+		expect(result.draft.mode).toBe("auto");
 	});
 
 	test("keeps the persisted secret key lists, which the document cannot carry", () => {

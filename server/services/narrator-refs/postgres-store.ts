@@ -313,6 +313,12 @@ export function createPostgresNarratorMessageRefsPort(db: BunSQLDatabase): Narra
 				...(beforeMessageId === undefined ? {} : { beforeMessageId }),
 				bumpMessageVersion: options?.bumpMessageVersion !== false,
 			});
+			if (options?.enabledTools) {
+				await tx
+					.update(narrators)
+					.set({ enabledTools: options.enabledTools })
+					.where(eq(narrators.id, message.narratorId));
+			}
 			return persisted;
 		}).then((persisted) => {
 			if (persisted.needsSeqFloorMark) markNarratorSeqFloorHealed(message.narratorId);

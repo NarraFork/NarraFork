@@ -967,6 +967,8 @@ export interface AgentHistoryReplacement {
 	replayedInjectionMessageIds?: readonly string[];
 	/** Loading state of the rebuilt history; the `tools` array is re-derived from it. */
 	toolLoading?: import("./tool-loading").ToolLoadingState;
+	/** The same registry candidates used to build `toolLoading`; applied only together with it. */
+	toolCandidates?: readonly ToolDefinition[];
 }
 
 export interface AgentConfig {
@@ -1171,6 +1173,8 @@ export interface AgentConfig {
 	 * (see `tool-loading.ts`).
 	 */
 	toolLoading?: import("./tool-loading").ToolLoadingState;
+	/** Registry candidates already materialized by the host for this pass's first request. */
+	toolCandidates?: readonly ToolDefinition[];
 	/** Live loaded state of a managed tool; a call to an unloaded one is rejected. */
 	isToolLoaded?: (name: string) => boolean;
 	/** Tool names disabled by narrator custom traits. Enforced again at execution time. */

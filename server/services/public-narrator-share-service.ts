@@ -8,6 +8,7 @@ import { and, desc, eq, isNull, lt, or, sql } from "drizzle-orm";
 import { db } from "../db";
 import { chatRooms, narratorPublicShares, narrators } from "../db/schema";
 import { AppError } from "../lib/errors";
+import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import {
 	createPublicShareSchema,
@@ -126,6 +127,9 @@ export async function createPublicShare(
 		})
 		.returning(shareSelection)
 		.get();
+	// A link opens the session to people outside the instance, which narrows what an agent
+	// in it may read.
+	eventBus.emit({ type: "narrator:access_changed", narratorId, reason: "public_share_created" });
 	return { share, token };
 }
 
@@ -207,6 +211,7 @@ export async function revokePublicShare(
 		.get();
 	if (!row) throw unavailablePublicShare();
 	for (const listener of revokeListeners) listener(shareId);
+	eventBus.emit({ type: "narrator:access_changed", narratorId, reason: "public_share_revoked" });
 }
 
 export function getPublicSharedSession(auth: VerifiedPublicShare): PublicSharedSession {

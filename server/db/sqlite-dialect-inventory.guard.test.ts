@@ -589,6 +589,10 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/notification-center-maintenance.ts": ["sessionFn"],
 	"server/services/notification-center-service.ts": ["sessionFn"],
 	"server/services/oauth-grant-service.ts": ["errorCode"],
+	// The SQLite side of `outline/store/read-port.ts`: FTS5 search, and cached raw statements for
+	// the reads on every page read's path. The PostgreSQL store answers the same port (search
+	// from its pg_trgm shadow table).
+	"server/services/outline/store/sqlite-read.ts": ["handle", "rowid", "fts5"],
 	"server/services/parent-injection-queue.ts": ["json1"],
 	"server/services/revert-history-commit.ts": [
 		"driver",

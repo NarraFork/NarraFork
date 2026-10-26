@@ -1,8 +1,9 @@
-import { afterAll, afterEach, beforeEach, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
+import { z } from "zod/v4";
 import { historyStrings } from "../../../tests/fixtures/model-input";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import { narratorMessageRefs, narrators, narratorToolCalls } from "../../db/schema";
@@ -590,6 +591,46 @@ test("child placement is projected while complete tools and reasoning metadata a
 	expect(JSON.stringify(child.history)).toContain("reasoned");
 	const primary = await buildRuntimeHistory({ ...options(), sourceMessages: source });
 	expect(primary.history).toEqual([]);
+});
+
+test("reconciled epoch and raw candidates are reused without a second epoch query", async () => {
+	const epochs = await import("../narrator-epochs");
+	const epochQuery = spyOn(epochs, "toolLoadingEpochOf");
+	const name = "HistoryCandidateTool";
+	const candidates = [
+		{
+			name,
+			description: "candidate from this request",
+			parameters: z.object({}),
+			execute: async () => ({ output: "ok" }),
+		},
+	];
+	try {
+		const prepared = await buildRuntimeHistory({
+			...options(),
+			sourceMessages: [],
+			toolLoading: {
+				managed: new Set([name]),
+				current: new Set([name]),
+				candidates,
+				epoch: {
+					toolNames: [name],
+					definitionSnapshots: [
+						{
+							name,
+							description: "candidate from this request",
+							parameters: { type: "object", properties: {} },
+						},
+					],
+				},
+			},
+		});
+		expect(epochQuery).not.toHaveBeenCalled();
+		expect(prepared.toolCandidates).toBe(candidates);
+		expect(prepared.toolLoading?.base).toEqual(new Set([name]));
+	} finally {
+		epochQuery.mockRestore();
+	}
 });
 
 test("empty prompt keeps the accepted user in history and tool results never invent continuation", async () => {

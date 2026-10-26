@@ -4,8 +4,9 @@
  * store's own writes and through the queue for everyone else's.
  */
 
-import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { assembleContent } from "@shared/narrator-blocks/storage";
+import { z } from "zod/v4";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 
 const { db, sqlite } = getTestDb();
@@ -306,17 +307,19 @@ describe("epoch reconcile", () => {
 	}
 
 	const reconcile = async (current: string[], fingerprint: string, now: number) =>
-		epochs.reconcileEpoch({
-			narratorId: "n1",
-			messages: await rows(),
-			managed,
-			current,
-			model: "claude",
-			provider: "anthropic",
-			noticeText: (kind, name) => `${kind}:${name}`,
-			now,
-			resolveTarget: target(fingerprint),
-		});
+		(
+			await epochs.reconcileEpoch({
+				narratorId: "n1",
+				messages: await rows(),
+				managed,
+				current,
+				model: "claude",
+				provider: "anthropic",
+				noticeText: (kind, name) => `${kind}:${name}`,
+				now,
+				resolveTarget: target(fingerprint),
+			})
+		).changed;
 
 	test("a cold cache opens an epoch only when the rebuild changes the tools", async () => {
 		await stepAt("2026-10-01T00:00:00.000Z");
@@ -337,6 +340,142 @@ describe("epoch reconcile", () => {
 		]);
 		// The new epoch froze the set; with the cache warm again nothing more is written.
 		expect(await reconcile(["WebFetch"], "t", Date.parse("2026-10-01T00:00:01.000Z"))).toBe(false);
+	});
+
+	test("a same-name schema change opens a new epoch rather than rewriting its prefix", async () => {
+		const { toolRegistry } = await import("../../lib/agent/tool-registry");
+		const name = "mcp__epoch_test__run";
+		const definition = {
+			name,
+			description: "old",
+			parameters: z.object({}),
+			rawJsonSchema: { type: "object", properties: {} },
+			execute: async () => ({ output: "ok" }),
+		};
+		toolRegistry.register(definition);
+		try {
+			await narratorStore.openEpoch("n1", {
+				reason: "manual",
+				target: "t",
+				toolNames: [name],
+			});
+			const upgrade = async () =>
+				(
+					await epochs.reconcileEpoch({
+						narratorId: "n1",
+						messages: await rows(),
+						managed: new Set([name]),
+						current: [name],
+						model: "claude",
+						provider: "anthropic",
+						noticeText: () => "changed",
+						resolveTarget: target("t"),
+					})
+				).changed;
+			// A legacy SQLite epoch gets one explicit snapshot boundary, not repeated rewrites.
+			expect(await upgrade()).toBe(true);
+			expect(await upgrade()).toBe(false);
+			toolRegistry.register({ ...definition, description: "new" });
+			expect(
+				(
+					await epochs.reconcileEpoch({
+						narratorId: "n1",
+						messages: await rows(),
+						managed: new Set([name]),
+						current: [name],
+						model: "claude",
+						provider: "anthropic",
+						noticeText: () => "changed",
+						resolveTarget: target("t"),
+					})
+				).changed,
+			).toBe(true);
+			expect((await rows()).at(-1)?.contentJson).toMatchObject([
+				{
+					type: "epoch",
+					epoch: { reason: "manual", definitionSnapshots: [{ name, description: "new" }] },
+				},
+			]);
+		} finally {
+			toolRegistry.unregister(name);
+		}
+	});
+
+	test("request history rebuild reconciles same-name schema changes before projecting definitions", async () => {
+		const { toolRegistry } = await import("../../lib/agent/tool-registry");
+		const { buildContextManagementHooks } = await import("../narrator-session");
+		const runtimeHistory = await import("../agent-runtime/history");
+		const { deriveToolLoadingState } = await import("../../lib/agent/tool-loading");
+		const realReconcile = epochs.reconcileEpoch;
+		const reconcileSpy = spyOn(epochs, "reconcileEpoch").mockImplementation((input) =>
+			realReconcile({ ...input, resolveTarget: target("request-test") }),
+		);
+		// Keep the DB/epoch/state derivation real; only bypass provider-specific wire encoding.
+		const projectionSpy = spyOn(runtimeHistory, "buildRuntimeHistory").mockImplementation(
+			async (options) => {
+				const sourceMessages = [...(options.sourceMessages ?? [])];
+				if (!options.toolLoading) throw new Error("Expected request loading state");
+				return {
+					history: [],
+					sourceMessages,
+					modelMessages: sourceMessages,
+					replayedInjectionMessageIds: [],
+					currentText: "",
+					currentInputText: "",
+					currentInputPersisted: false,
+					endsWithToolResults: false,
+					endsWithInput: false,
+					toolLoading: deriveToolLoadingState(
+						sourceMessages,
+						options.toolLoading.managed,
+						options.toolLoading.current,
+						options.toolLoading.epoch,
+					),
+					toolCandidates: options.toolLoading.candidates,
+				};
+			},
+		);
+		const name = "mcp__request_schema__run";
+		const definition = {
+			name,
+			description: "request schema",
+			parameters: z.object({}),
+			rawJsonSchema: { type: "object", properties: { old: { type: "string" } } },
+			execute: async () => ({ output: "ok" }),
+		};
+		toolRegistry.register(definition);
+		try {
+			const hooks = buildContextManagementHooks({
+				narratorId: "n1",
+				locale: "en",
+				getModel: () => "claude",
+				getProvider: () => "anthropic",
+				getToolLoading: () => ({
+					managed: new Set([name]),
+					current: new Set([name]),
+					candidates: toolRegistry.all(),
+				}),
+			});
+			const first = await hooks.rebuildRequestHistory();
+			expect(first?.toolLoading?.definitionSnapshots).toMatchObject([
+				{ name, parameters: definition.rawJsonSchema },
+			]);
+			const firstRows = await rows();
+			const replacement = { type: "object", properties: { updated: { type: "number" } } };
+			toolRegistry.register({ ...definition, rawJsonSchema: replacement });
+			const second = await hooks.rebuildRequestHistory();
+			expect(second?.toolLoading?.definitionSnapshots).toMatchObject([
+				{ name, parameters: replacement },
+			]);
+			expect((await rows()).length).toBeGreaterThan(firstRows.length);
+			expect((await rows()).at(-1)?.contentJson).toMatchObject([
+				{ type: "epoch", epoch: { definitionSnapshots: [{ name, parameters: replacement }] } },
+			]);
+		} finally {
+			toolRegistry.unregister(name);
+			reconcileSpy.mockRestore();
+			projectionSpy.mockRestore();
+		}
 	});
 
 	test("inside a frozen epoch, a load that bypassed /load becomes a system notice", async () => {

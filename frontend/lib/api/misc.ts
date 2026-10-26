@@ -3,6 +3,7 @@ import type {
 	CredentialUsageTotalsDetail,
 } from "@frontend/types/usage-history";
 import type { ResolvedBranding } from "@shared/branding";
+import type { McpLoadingMode } from "@shared/mcp-loading-mode";
 import type { ProviderBalanceSnapshot } from "@shared/provider-balance";
 import type { ToolRoutineMode, ToolRoutineModeOverride } from "@shared/routine-modes";
 import type { WorkspacePanel, WorkspacePanelInput } from "@shared/workspace-panels";
@@ -362,6 +363,7 @@ export const miscApi = {
 				url?: string;
 				envKeys: string[];
 				headerKeys: string[];
+				mode?: McpLoadingMode;
 				enabled: boolean;
 				defaultBehavior?: string;
 				toolPermissions?: Array<{
@@ -388,11 +390,6 @@ export const miscApi = {
 		request<{ ok: boolean }>(`/mcp/servers/${id}`, { method: "DELETE" }),
 	mcpConnectServer: (id: string) =>
 		request<Record<string, unknown>>(`/mcp/servers/${id}/connect`, { method: "POST" }),
-	// Returns the server's status projection (like connect), not a bare ack:
-	// disconnecting now persists `enabled: false`, and the caller needs the
-	// authoritative post-change state rather than having to infer it.
-	mcpDisconnectServer: (id: string) =>
-		request<Record<string, unknown>>(`/mcp/servers/${id}/disconnect`, { method: "POST" }),
 	// Re-fetch one server's tool list (reconnects only if the live connection is gone).
 	mcpRefreshServer: (id: string) =>
 		request<{

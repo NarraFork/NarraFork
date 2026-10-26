@@ -1,3 +1,4 @@
+import { isAdminToolExecutionAllowed, mcpServerMarker } from "@server/services/tool-load-markers";
 import {
 	beginToolStartAdmission,
 	convertToolStartGrantToExecution,
@@ -9,9 +10,11 @@ import {
 	type UpdateToolStartGrant,
 	waitUntilUpdateGateOpens,
 } from "@server/services/update-coordinator";
+import { resolveMcpLoadingMode } from "@shared/mcp-loading-mode";
 import { logger } from "../logger";
 import { getToolMessage, getToolMessageWithParams, type Locale } from "../prompt-i18n";
 import { shouldUseNativeSearch } from "../search/native";
+import { settings } from "../settings";
 import { assertSpecPath, assertToolSpecPaths, toolSpecPathError } from "../spec-uri";
 import { checkToolDiskSafety, diskToolError } from "./disk-safety";
 import type { ExecutionBackend } from "./execution/backend";
@@ -887,9 +890,41 @@ export async function executeTool(
 			};
 		}
 
+		// Keep existing declarations/cache intact, but a non-admin can neither execute
+		// nor approve an admin tool, even when it was loaded by another principal.
+		if (!(await isAdminToolExecutionAllowed(tool.name, config.userId))) {
+			return {
+				output: `Tool is restricted to administrators: ${tu.name}`,
+				isError: true,
+				durationMs: 0,
+			};
+		}
+
+		if (tool.metadata?.mcpServerId) {
+			const server = settings.mcpServers?.find((item) => item.id === tool.metadata?.mcpServerId);
+			if (
+				!server ||
+				resolveMcpLoadingMode(server) === "disabled" ||
+				(config.toolFilter && !config.toolFilter(tool)) ||
+				(config.toolLoading?.managed.size !== 0 &&
+					resolveMcpLoadingMode(server) === "auto" &&
+					config.isToolLoaded?.(mcpServerMarker(server.id)) !== true)
+			) {
+				return {
+					output: `MCP tool is disabled or not loaded: ${tu.name}`,
+					isError: true,
+					durationMs: 0,
+				};
+			}
+		}
+
 		// Within a context epoch an unloaded tool stays declared (see tool-loading.ts), so
 		// the declaration alone no longer means the tool may run.
-		if (config.toolLoading?.managed.has(tu.name) && config.isToolLoaded?.(tu.name) === false) {
+		if (
+			!tool.metadata?.mcpServerId &&
+			config.toolLoading?.managed.has(tu.name) &&
+			config.isToolLoaded?.(tu.name) === false
+		) {
 			return {
 				output: `Tool is not loaded in this session: ${tu.name}. Ask the user to /load it if it is needed.`,
 				isError: true,

@@ -4,9 +4,10 @@
  * Two kinds of operation live here:
  *
  *   - READS of current state, small and indexed, each with a hard row limit. The write path
- *     uses them to plan a transaction; tests use them to check what was written. Higher-level
- *     reads (a page as of a seq, budgeted rendering, search) build on the same tables in their
- *     own module and are not part of this port.
+ *     uses them to plan a transaction; tests use them to check what was written. Reads of
+ *     history, links and the full-text index (a page as of a seq, timelines, search, backlinks)
+ *     are stated in `read-port.ts` and are part of this port too; budgeted rendering and the
+ *     rest of the reading logic live in their own modules above it.
  *   - `applyCommit`, the one write: it takes a fully computed {@link OutlineCommitPlan} and
  *     writes it atomically. All deciding (validation, normalization, order keys, link
  *     extraction, invariants) happens before, in `server/services/outline/write.ts`, so the
@@ -36,6 +37,7 @@ import type {
 	OutlineSpaceKind,
 	OutlineTaskJson,
 } from "../model";
+import type { OutlineReadPort } from "./read-port";
 
 export { WriteConflictError } from "@server/db/backend/write-port";
 
@@ -192,7 +194,7 @@ export class OutlineStaleWriteError extends Error {
 // The port
 // ─────────────────────────────────────────────────────────────────────────────
 
-export interface OutlineStore extends WritePortIdentity {
+export interface OutlineStore extends WritePortIdentity, OutlineReadPort {
 	/**
 	 * The space of a project, user or narrator, created on first use. Concurrent callers get
 	 * the same row (one per scope, enforced by a unique index). New spaces start at seq 1.

@@ -15,8 +15,10 @@ import {
 	writeFileSync,
 } from "node:fs";
 import { resolve } from "node:path";
+import { normalizeMcpLoadingConfig } from "@shared/mcp-loading-mode";
 import { normalizeProxyUrl } from "@shared/proxy-settings";
 import type { RecordingSettings } from "@shared/request-recording";
+import { getBuiltinToolRoutines } from "../builtin-routines";
 import { migrateLegacyCodexOAuth } from "../codex-manager";
 import { COMMAND_CODE_PREFIX } from "../commandcode-protocol";
 import { generateShortId } from "../id";
@@ -356,7 +358,18 @@ function loadSettingsFromDisk(): NarraForkSettings {
 	mkdirSync(narraforkDir, { recursive: true, mode: 0o700 });
 	if (process.platform !== "win32") chmodSync(narraforkDir, 0o700);
 	if (!existsSync(settingsPath)) {
-		writeFileSync(settingsPath, JSON.stringify(DEFAULTS, null, 2), { mode: 0o600 });
+		// Only a new installation opts into discovery. Merging these into DEFAULTS
+		// would silently change every existing user's explicit manual/resident choices.
+		const initial = {
+			...DEFAULTS,
+			routines: {
+				...DEFAULTS.routines,
+				toolModes: Object.fromEntries(
+					getBuiltinToolRoutines().map((routine) => [routine.id, "auto"]),
+				),
+			},
+		};
+		writeFileSync(settingsPath, JSON.stringify(initial, null, 2), { mode: 0o600 });
 	}
 	const text = existsSync(settingsPath) ? readFileSync(settingsPath, "utf-8") : undefined;
 	const raw = text === undefined ? {} : JSON.parse(text);
@@ -666,6 +679,12 @@ export function normalizeMcpServerIds(settings: NarraForkSettings): boolean {
 			dirty = true;
 		}
 		seen.add(server.id);
+		const normalized = normalizeMcpLoadingConfig(server);
+		if (server.mode !== normalized.mode || server.enabled !== normalized.enabled) {
+			server.mode = normalized.mode;
+			server.enabled = normalized.enabled;
+			dirty = true;
+		}
 	}
 	return dirty;
 }

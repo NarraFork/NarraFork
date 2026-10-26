@@ -16,6 +16,8 @@ export interface RefOperationOptions {
 	 * enter the client document until real content is appended.
 	 */
 	bumpMessageVersion?: boolean;
+	/** Tool-loading state committed in the same transaction as the notice and ref. */
+	enabledTools?: string[];
 }
 
 /** Networked domain port. All results are Promises; no SQLite transaction handles cross it. */

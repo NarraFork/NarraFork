@@ -97,7 +97,7 @@ describe("MCP server IDs from raw settings", () => {
 		expect(new Set(ids).size).toBe(raw.length);
 		expect(ids[4]).toBe("existing");
 		for (const [index, server] of settings.mcpServers.entries()) {
-			expect(server).toEqual({ ...raw[index], id: ids[index] });
+			expect(server).toEqual({ ...raw[index], id: ids[index], mode: "disabled" });
 		}
 		expect(normalizeMcpServerIds(settings)).toBe(false);
 		expect(settings.mcpServers.map((server) => server.id)).toEqual(ids);

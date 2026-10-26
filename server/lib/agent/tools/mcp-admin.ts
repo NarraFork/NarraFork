@@ -1,3 +1,9 @@
+import {
+	applyMcpLoadingPatch,
+	hasMcpLoadingConflict,
+	normalizeMcpLoadingConfig,
+	resolveMcpLoadingMode,
+} from "@shared/mcp-loading-mode";
 import { z } from "zod/v4";
 import type { ToolDefinition, ToolResult } from "../types";
 import { errorResult, isAdminUser, requestWritePermission } from "./admin-common";
@@ -33,7 +39,11 @@ const serverFieldsSchema = {
 		.record(z.string().min(1).max(200), z.string().max(2000))
 		.optional()
 		.describe("HTTP headers (secret values; never echoed back)"),
-	enabled: z.boolean().optional().describe("Whether the server is enabled (default true)"),
+	mode: z
+		.enum(["disabled", "auto", "resident"])
+		.optional()
+		.describe("Loading policy for add (default auto), or auto/resident target for connect"),
+	enabled: z.boolean().optional().describe("Legacy loading switch for add; prefer mode"),
 	defaultBehavior: mcpBehaviorSchema
 		.optional()
 		.describe("Default permission behavior for tools from this server"),
@@ -72,7 +82,7 @@ export function createMcpAdminTool(deps: McpAdminToolDeps = {}): ToolDefinition 
 	return {
 		name: "McpAdmin",
 		description:
-			"Manage external MCP servers (admin only, mutating actions require approval). action=list shows configured servers and connection status; action=add registers a new server (stdio command or streamable-http/sse URL) and connects it; action=remove deletes a server; action=connect/disconnect toggles the runtime connection; action=refresh re-fetches the tool list from a connected server (or all enabled servers when id is omitted) so tool changes that did not emit tools/list_changed become visible; action=test validates connectivity without persisting. Secret env/header values are never echoed back.",
+			"Manage external MCP servers (admin only, mutating actions require approval). action=list shows configured servers and connection status; action=add registers a new server (stdio command or streamable-http/sse URL) and connects it unless disabled; action=remove deletes a server; action=connect/disconnect persists loading intent and toggles the runtime connection (connect accepts an explicit auto/resident mode); action=refresh re-fetches the tool list from a connected server (or all enabled servers when id is omitted) so tool changes that did not emit tools/list_changed become visible; action=test validates connectivity without persisting. Secret env/header values are never echoed back.",
 		parameters: z.object({
 			action: actionSchema.describe("The MCP server management action to perform."),
 			id: z
@@ -106,7 +116,8 @@ export function createMcpAdminTool(deps: McpAdminToolDeps = {}): ToolDefinition 
 							url: s.url,
 							envKeys: s.envKeys,
 							headerKeys: s.headerKeys,
-							enabled: s.enabled,
+							mode: resolveMcpLoadingMode(s),
+							enabled: resolveMcpLoadingMode(s) !== "disabled",
 							defaultBehavior: s.defaultBehavior,
 							status: s.status,
 							error: s.error,
@@ -135,6 +146,7 @@ export function createMcpAdminTool(deps: McpAdminToolDeps = {}): ToolDefinition 
 				}
 
 				if (action === "add" || action === "test") {
+					if (hasMcpLoadingConflict(input)) return errorResult("MCP mode conflicts with enabled");
 					if (action === "add" && !input.name) {
 						return errorResult("Error: 'name' is required for add.");
 					}
@@ -144,7 +156,8 @@ export function createMcpAdminTool(deps: McpAdminToolDeps = {}): ToolDefinition 
 						...(input.transport !== undefined && { transport: input.transport }),
 						...(input.command !== undefined && { command: input.command }),
 						...(input.url !== undefined && { url: input.url }),
-						...(input.enabled !== undefined && { enabled: input.enabled }),
+						...(action === "add" && input.enabled !== undefined && { enabled: input.enabled }),
+						mode: action === "test" ? "auto" : resolveMcpLoadingMode(input),
 						warning:
 							action === "add"
 								? "This will register a new MCP server. stdio servers spawn a local process with the given command; HTTP servers connect to the given URL. MCP tools become available to narrators according to their permission configuration."
@@ -165,7 +178,10 @@ export function createMcpAdminTool(deps: McpAdminToolDeps = {}): ToolDefinition 
 						...(input.headers !== undefined && {
 							headers: input.headers as Record<string, string>,
 						}),
-						enabled: action === "test" ? true : ((input.enabled as boolean | undefined) ?? true),
+						...normalizeMcpLoadingConfig({
+							mode: action === "test" ? "auto" : input.mode,
+							enabled: action === "test" ? undefined : input.enabled,
+						}),
 						...(input.defaultBehavior !== undefined && {
 							defaultBehavior: input.defaultBehavior as McpBehavior,
 						}),
@@ -293,11 +309,15 @@ export function createMcpAdminTool(deps: McpAdminToolDeps = {}): ToolDefinition 
 					) as Record<string, unknown>[];
 					const idx = servers.findIndex((s) => s.id === id);
 					if (idx === -1) return errorResult(`MCP server not found: ${id}`);
+					if (action === "connect" && input.mode === "disabled") {
+						return errorResult("Error: 'mode' must be auto or resident for connect.");
+					}
 
 					const denied = await requestWritePermission(ctx, "McpAdmin", {
 						action,
 						id,
 						name: servers[idx].name,
+						...(action === "connect" && input.mode !== undefined && { mode: input.mode }),
 						warning:
 							action === "remove"
 								? "This will permanently remove the MCP server configuration and disconnect it."
@@ -318,6 +338,19 @@ export function createMcpAdminTool(deps: McpAdminToolDeps = {}): ToolDefinition 
 							title: "MCP server removed",
 							metadata: { tool: "McpAdmin", action, serverId: id },
 						};
+					}
+					const loadingPatch =
+						action === "connect" && input.mode !== undefined
+							? { mode: input.mode as "auto" | "resident" }
+							: { enabled: action === "connect" };
+					if (
+						action === "connect" ||
+						resolveMcpLoadingMode(servers[idx]) !== "disabled" ||
+						servers[idx].enabled !== false
+					) {
+						Object.assign(servers[idx], applyMcpLoadingPatch(servers[idx], loadingPatch));
+						settingsRef.mcpServers = servers;
+						settingsRef.save();
 					}
 					if (action === "connect") {
 						await manager.connect(servers[idx]);
@@ -365,7 +398,8 @@ function project(config: Record<string, unknown>): Record<string, unknown> {
 			config.headers && typeof config.headers === "object"
 				? Object.keys(config.headers).sort()
 				: [],
-		enabled: config.enabled,
+		mode: resolveMcpLoadingMode(config),
+		enabled: resolveMcpLoadingMode(config) !== "disabled",
 		...(config.defaultBehavior !== undefined && { defaultBehavior: config.defaultBehavior }),
 	};
 }

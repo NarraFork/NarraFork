@@ -27,7 +27,6 @@ import {
 	projects,
 	terminals,
 	terminalViewState,
-	users,
 } from "../db/schema";
 import { localPathSemantics } from "../lib/agent/execution/path-semantics";
 import {
@@ -43,7 +42,6 @@ import {
 	type DangerReflectionOverride,
 	normalizeBooleanOverride,
 } from "../lib/boolean-override";
-import { getBuiltinToolRoutines } from "../lib/builtin-routines";
 import {
 	measureMessageCharacters,
 	measureSummaryCharacters,
@@ -61,7 +59,6 @@ import {
 	type BlockedSkillsTrait,
 	buildCustomTraitsResponse,
 	getBlockedSkills,
-	getDisabledToolSet,
 	isBlockedSkillsEmpty,
 	isSkillBlocked,
 	normalizeBlockedSkills,
@@ -83,7 +80,6 @@ import { getHome } from "../lib/platform";
 import {
 	buildKnowledgeStewardSystemPrompt,
 	buildSetupAssistantSystemPrompt,
-	getToolMessageWithParams,
 	type Locale,
 } from "../lib/prompt-i18n";
 import {
@@ -422,21 +418,6 @@ function formatAvailableOptionalToolIds(): string {
 }
 
 /**
- * Optional tools that may only be loaded by admin users. Non-admin /load attempts
- * are rejected in handleLoadToolCommand. KnowledgeReview is intentionally NOT here:
- * reviewers need not be admins, and per-action authority is enforced by the service
- * layer (canReview / canWriteMain) at execution time.
- */
-const ADMIN_ONLY_LOAD_TOOLS = new Set([
-	"NarraForkAdmin",
-	"KnowledgeAdmin",
-	"PluginInstall",
-	"McpAdmin",
-	"HookAdmin",
-	"ScheduledTaskAdmin",
-]);
-
-/**
  * Resolve a narrator's traits across the user/project/narrator layers.
  *
  * Local helper so the several command handlers below share one lazy import; the
@@ -465,27 +446,6 @@ async function resolveLayeredTraitsFor(
 	return resolved.traits;
 }
 
-/** Persist a tool load/unload notice row and announce it to the transcript. */
-async function persistToolChange(
-	narratorId: string,
-	block: Parameters<typeof narratorStore.appendToolChange>[1],
-): Promise<void> {
-	const msg = await narratorStore.appendToolChange(narratorId, block);
-	broadcastToNarrator(narratorId, {
-		type: "user_message",
-		narratorId,
-		message: {
-			id: msg.id,
-			narratorId,
-			role: "user",
-			contentJson: msg.contentJson,
-			contentText: msg.contentText,
-			createdAt: msg.createdAt,
-			children: [],
-		},
-	});
-}
-
 /**
  * Shared handler for `/load <tool>` commands.
  */
@@ -507,74 +467,44 @@ export async function handleLoadToolCommand(
 	}
 	const toolNames = cmdResult.loadTools ?? [cmdResult.loadTool];
 	const displayToolName = cmdResult.loadToolId ?? cmdResult.loadTool;
-	const currentNarrator = await narratorService.getById(narratorId);
-	// Layered: a project/user-level deny must also block a manual `/load`.
-	const loadTraits = await resolveLayeredTraitsFor(currentNarrator, userId);
-	const disabledTools = getDisabledToolSet(loadTraits);
-	const disabledTool = toolNames.find((name) => disabledTools.has(name));
-	if (disabledTool) {
+	const { changeLoadedToolGroup } = await import("./tool-loading-service");
+	const status = await changeLoadedToolGroup(
+		narratorId,
+		{
+			id: displayToolName,
+			toolNames,
+			description: displayToolName,
+		},
+		true,
+		userId,
+		undefined,
+		locale,
+	);
+	if (status.startsWith("denied")) {
 		const infoText =
-			locale === "zh-CN"
-				? `⛔ 工具已被此叙述者的自定义 trait 禁用：${displayToolName}`
-				: `⛔ Tool disabled by this narrator's custom trait: ${displayToolName}`;
+			status === "denied_trait"
+				? locale === "zh-CN"
+					? `⛔ 工具已被此叙述者的自定义 trait 禁用：${displayToolName}`
+					: `⛔ Tool disabled by this narrator's custom trait: ${displayToolName}`
+				: status === "denied_admin"
+					? locale === "zh-CN"
+						? "⛔ 只有管理员才能加载此工具"
+						: "⛔ Only administrators can load this tool"
+					: locale === "zh-CN"
+						? `⛔ 工具当前不可加载：${displayToolName}`
+						: `⛔ Tool is not available for loading: ${displayToolName}`;
 		await narratorService.persistDisplayMessage(narratorId, infoText);
 		return { toolName: displayToolName, loaded: false, alreadyLoaded: false };
 	}
-
-	// Admin-only tool check
-	if (toolNames.some((name) => ADMIN_ONLY_LOAD_TOOLS.has(name))) {
-		const adminOnlyMsg =
-			locale === "zh-CN"
-				? "⛔ 只有管理员才能加载此工具"
-				: "⛔ Only administrators can load this tool";
-		if (!userId) {
-			await narratorService.persistDisplayMessage(narratorId, adminOnlyMsg);
-			return { toolName: displayToolName, loaded: false, alreadyLoaded: false };
-		}
-		const user = await db.query.users.findFirst({
-			where: eq(users.id, userId),
-			columns: { role: true },
-		});
-		if (!user || user.role !== "admin") {
-			await narratorService.persistDisplayMessage(narratorId, adminOnlyMsg);
-			return { toolName: displayToolName, loaded: false, alreadyLoaded: false };
-		}
-	}
-
-	const { loadOptionalTool } = await import("./narrator-session");
-	const results: Awaited<ReturnType<typeof loadOptionalTool>>[] = [];
-	for (const toolName of toolNames) {
-		results.push(await loadOptionalTool(narratorId, toolName));
-	}
-	const alreadyLoaded = results.every((result) => result === "already_loaded");
+	const alreadyLoaded = status === "already_loaded";
 	const infoText = alreadyLoaded
-		? `🔧 Tool already loaded: ${displayToolName}`
-		: `🔧 Tool loaded: ${displayToolName}`;
+		? locale === "zh-CN"
+			? `🔧 工具已加载：${displayToolName}`
+			: `🔧 Tool already loaded: ${displayToolName}`
+		: locale === "zh-CN"
+			? `🔧 工具加载成功：${displayToolName}`
+			: `🔧 Tool loaded: ${displayToolName}`;
 	await narratorService.persistDisplayMessage(narratorId, infoText);
-
-	// Persist a user-role message so the model is aware the tool was just loaded
-	if (!alreadyLoaded) {
-		const routine =
-			getBuiltinToolRoutines().find((r) => r.id === cmdResult.loadToolId) ??
-			getBuiltinToolRoutines().find((r) => r.tool?.toolName === cmdResult.loadTool);
-		const toolDescription =
-			locale === "zh-CN"
-				? (routine?.tool?.descriptionZh ?? routine?.tool?.descriptionEn ?? displayToolName)
-				: (routine?.tool?.descriptionEn ?? displayToolName);
-		const text = getToolMessageWithParams("toolLoaded", locale, {
-			toolName: displayToolName,
-			toolDescription,
-		});
-		// The registry names this row changed; tool loading reads them to keep the
-		// request's tool array fixed (see lib/agent/tool-loading.ts).
-		const changedToolNames = toolNames.filter((_, index) => results[index] === "loaded");
-		await persistToolChange(narratorId, {
-			type: "tool_loaded",
-			toolName: displayToolName,
-			toolNames: changedToolNames,
-			text,
-		});
-	}
 
 	return { toolName: displayToolName, loaded: true, alreadyLoaded };
 }
@@ -586,6 +516,7 @@ export async function handleUnloadToolCommand(
 	narratorId: string,
 	cmdResult: UnloadToolResult | UnloadToolNotFound,
 	locale: Locale = "en",
+	userId?: string,
 ): Promise<{ toolName: string; unloaded: boolean; notLoaded: boolean }> {
 	if ("unloadToolNotFound" in cmdResult) {
 		const toolId = cmdResult.unloadToolNotFound;
@@ -600,31 +531,33 @@ export async function handleUnloadToolCommand(
 
 	const toolNames = cmdResult.unloadTools ?? [cmdResult.unloadTool];
 	const displayToolName = cmdResult.unloadToolId ?? cmdResult.unloadTool;
-	const { unloadOptionalTool } = await import("./narrator-session");
-	const results: Awaited<ReturnType<typeof unloadOptionalTool>>[] = [];
-	for (const toolName of toolNames) {
-		results.push(await unloadOptionalTool(narratorId, toolName));
-	}
-	const notLoaded = results.every((result) => result === "not_loaded");
-	const unknownTool = results.some((result) => result === "unknown_tool");
+	const { changeLoadedToolGroup } = await import("./tool-loading-service");
+	const status = await changeLoadedToolGroup(
+		narratorId,
+		{
+			id: displayToolName,
+			toolNames,
+			description: displayToolName,
+		},
+		false,
+		userId,
+		undefined,
+		locale,
+	);
+	const notLoaded = status === "not_loaded";
+	const unknownTool = status.startsWith("denied");
 	const infoText = unknownTool
-		? `⚠️ Unknown tool: ${displayToolName}`
+		? locale === "zh-CN"
+			? `⚠️ 未知工具：${displayToolName}`
+			: `⚠️ Unknown tool: ${displayToolName}`
 		: notLoaded
-			? `🔧 Tool not loaded: ${displayToolName}`
-			: `🔧 Tool unloaded: ${displayToolName}`;
+			? locale === "zh-CN"
+				? `🔧 工具尚未加载：${displayToolName}`
+				: `🔧 Tool not loaded: ${displayToolName}`
+			: locale === "zh-CN"
+				? `🔧 工具已卸载：${displayToolName}`
+				: `🔧 Tool unloaded: ${displayToolName}`;
 	await narratorService.persistDisplayMessage(narratorId, infoText);
-
-	// Persist a user-role message so the model is aware the tool is no longer available.
-	if (!notLoaded && !unknownTool) {
-		const text = getToolMessageWithParams("toolUnloaded", locale, { toolName: displayToolName });
-		const changedToolNames = toolNames.filter((_, index) => results[index] === "unloaded");
-		await persistToolChange(narratorId, {
-			type: "tool_unloaded",
-			toolName: displayToolName,
-			toolNames: changedToolNames,
-			text,
-		});
-	}
 
 	return { toolName: displayToolName, unloaded: !notLoaded && !unknownTool, notLoaded };
 }

@@ -2248,6 +2248,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 				id,
 				cmdResult as UnloadToolResult | UnloadToolNotFound,
 				locale,
+				userId,
 			);
 			return c.json(result, 200);
 		}

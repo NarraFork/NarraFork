@@ -45,6 +45,7 @@ import {
 	type OutlineStore,
 	type OutlineVersionRow,
 } from "./port";
+import { sqliteOutlineReads } from "./sqlite-read";
 
 type Tx = Parameters<Parameters<typeof db.transaction>[0]>[0];
 
@@ -264,6 +265,7 @@ function applyCommitSection(tx: Tx, plan: OutlineCommitPlan): boolean {
 
 export const sqliteOutlineStore: OutlineStore = {
 	backendId: "sqlite",
+	...sqliteOutlineReads,
 
 	async ensureSpace(scope, now) {
 		for (let attempt = 0; attempt < SPACE_KEY_ATTEMPTS; attempt++) {

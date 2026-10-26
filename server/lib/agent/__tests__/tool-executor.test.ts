@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { z } from "zod/v4";
 import { db } from "../../../db";
-import { narratorMessages, narrators, narratorToolCalls } from "../../../db/schema";
+import { narratorMessages, narrators, narratorToolCalls, users } from "../../../db/schema";
 import {
 	compileDelegationPolicy,
 	resolveRuntimePolicy,
@@ -151,6 +151,39 @@ function stubAdmissionPersistence(records: Array<Record<string, unknown>>): void
 		return input as never;
 	}) as typeof toolContinuationService.upsert;
 }
+
+describe("admin tool execution role gate", () => {
+	test("keeps a declared admin tool but blocks a non-admin before approval", async () => {
+		const original = toolRegistry.get("NarraForkAdmin");
+		const permission = mock(async () => ({ behavior: "allow" as const }));
+		const now = new Date().toISOString();
+		const ids = ["exec-admin-user", "exec-regular-user"];
+		try {
+			toolRegistry.register({
+				name: "NarraForkAdmin",
+				description: "already declared",
+				parameters: z.object({}),
+				execute: async () => ({ output: "must not run for ordinary user" }),
+			});
+			await db.insert(users).values([
+				{ id: ids[0], username: ids[0], role: "admin", passwordHash: "test", createdAt: now },
+				{ id: ids[1], username: ids[1], role: "user", passwordHash: "test", createdAt: now },
+			]);
+			const call = { toolUseId: "admin-role-gate", name: "NarraForkAdmin", input: {} };
+			const denied = await executeTool(call, { ...makeConfig(permission), userId: ids[1] });
+			expect(denied.isError).toBe(true);
+			expect(denied.output).toContain("restricted to administrators");
+			expect(permission).not.toHaveBeenCalled();
+			const allowed = await executeTool(call, { ...makeConfig(permission), userId: ids[0] });
+			expect(allowed.output).toBe("must not run for ordinary user");
+			expect(permission).toHaveBeenCalledTimes(1);
+		} finally {
+			for (const id of ids) await db.delete(users).where(eq(users.id, id));
+			if (original) toolRegistry.register(original);
+			else toolRegistry.unregister("NarraForkAdmin");
+		}
+	});
+});
 
 describe("knowledge tool internal permission feedback", () => {
 	test("preserves the internal denial after outer approval and keeps both approval inputs intact", async () => {

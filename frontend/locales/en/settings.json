@@ -1769,7 +1769,7 @@
 	"toolMode.manual": "Manual",
 	"toolMode.auto": "Auto",
 	"toolMode.resident": "Resident",
-	"toolModeAutoPending": "Toolsearch is not implemented yet, so Auto currently behaves the same as Manual.",
+	"toolModeAutoPending": "Auto tools are discovered and loaded on demand through ToolSearch.",
 	"depsSection": "System Dependencies",
 	"depsPackageManager": "Detected package manager: {{pm}}",
 	"depsNoPackageManager": "No supported package manager detected",

@@ -2,6 +2,23 @@ import { describe, expect, test } from "bun:test";
 import { filterUnsupportedMcpImportTransports } from "./mcp-import";
 
 describe("filterUnsupportedMcpImportTransports", () => {
+	test("preserves loading modes and independent tool permission flags in every import shape", () => {
+		for (const mode of ["disabled", "auto", "resident"] as const) {
+			const config = {
+				command: "bunx",
+				mode,
+				toolPermissions: [{ toolName: "read", behavior: "deny", enabled: false }],
+			};
+			for (const input of [
+				config,
+				{ mcpServers: { example: config } },
+				{ servers: { example: config } },
+				{ example: config },
+			]) {
+				expect(filterUnsupportedMcpImportTransports(input).json).toEqual(input);
+			}
+		}
+	});
 	test("filters unsupported transports from mcpServers while preserving stdio entries", () => {
 		const input = {
 			mcpServers: {

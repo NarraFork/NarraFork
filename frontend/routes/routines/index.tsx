@@ -22,6 +22,7 @@ import {
 } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import { pickLocalizedValue } from "@shared/i18n-locales";
+import { type McpLoadingMode, resolveMcpLoadingMode } from "@shared/mcp-loading-mode";
 import {
 	normalizeToolRoutineMode,
 	TOOL_ROUTINE_MODES,
@@ -31,7 +32,6 @@ import {
 	IconChevronDown,
 	IconChevronRight,
 	IconPlug,
-	IconPlugOff,
 	IconPlus,
 	IconRefresh,
 	IconTrash,
@@ -62,7 +62,6 @@ import {
 	useConnectMcpServer,
 	useCreateMcpServer,
 	useDeleteMcpServer,
-	useDisconnectMcpServer,
 	useImportMcpServers,
 	useMcpServers,
 	useRefreshAllMcpServers,
@@ -1834,7 +1833,7 @@ interface McpServerDraft {
 	headers: McpSecretDraftEntry[];
 	originalEnvKeys: string[];
 	originalHeaderKeys: string[];
-	enabled: boolean;
+	mode: McpLoadingMode;
 	defaultBehavior: "" | "readOnly" | "readWrite" | "ask" | "deny";
 }
 
@@ -1855,7 +1854,7 @@ const EMPTY_DRAFT: McpServerDraft = {
 	headers: [],
 	originalEnvKeys: [],
 	originalHeaderKeys: [],
-	enabled: true,
+	mode: "auto",
 	defaultBehavior: "",
 };
 
@@ -1883,20 +1882,8 @@ const MCP_STATUS_LABEL_KEYS = {
 
 type McpStatusLabelKey = (typeof MCP_STATUS_LABEL_KEYS)[keyof typeof MCP_STATUS_LABEL_KEYS];
 
-/**
- * Translation key for a server's badge.
- *
- * A disabled server and a manually disconnected one used to render identically
- * ("Disconnected", gray), which hid the fact that disconnecting persists. Only
- * the settled `disconnected` state is relabeled: a `connecting`/`error` entry
- * that still exists while `enabled` is already false is a real transient and
- * should be shown as such rather than dressed up as "Disabled".
- */
-function mcpStatusLabelKey(
-	status: string,
-	enabled: boolean | undefined,
-): McpStatusLabelKey | "mcpStatusDisabled" {
-	if (enabled === false && status === "disconnected") return "mcpStatusDisabled";
+/** Connection health is independent of the configured loading mode. */
+function mcpStatusLabelKey(status: string): McpStatusLabelKey {
 	// An unrecognised status falls back to the disconnected label rather than
 	// rendering a missing key: the badge is a hint, not a diagnostic surface.
 	return (
@@ -1906,6 +1893,11 @@ function mcpStatusLabelKey(
 
 function McpToolsTab() {
 	const { t } = useTranslation("routines");
+	const mcpModeOptions = [
+		{ value: "disabled", label: t("mcpModeDisabled") },
+		{ value: "auto", label: t("mcpModeAuto") },
+		{ value: "resident", label: t("mcpModeResident") },
+	];
 	const { data: currentUser } = useCurrentUser();
 	const isAdmin = currentUser?.role === "admin";
 	const mcpServerSettingsStorageCapability = useMcpServerSettingsStorageCapability();
@@ -1942,7 +1934,6 @@ function McpToolsTab() {
 	const updateMutation = useUpdateMcpServer();
 	const deleteMutation = useDeleteMcpServer();
 	const connectMutation = useConnectMcpServer();
-	const disconnectMutation = useDisconnectMcpServer();
 	const refreshMutation = useRefreshMcpServer();
 	const refreshAllMutation = useRefreshAllMcpServers();
 	const testMutation = useTestMcpConnection();
@@ -2076,6 +2067,7 @@ function McpToolsTab() {
 			url?: string;
 			envKeys?: string[];
 			headerKeys?: string[];
+			mode?: McpLoadingMode;
 			enabled?: boolean;
 			defaultBehavior?: string;
 		}) => {
@@ -2096,7 +2088,7 @@ function McpToolsTab() {
 				headers: createPreservedMcpSecretEntries(headerKeys),
 				originalEnvKeys: [...envKeys],
 				originalHeaderKeys: [...headerKeys],
-				enabled: server.enabled ?? true,
+				mode: resolveMcpLoadingMode(server),
 				defaultBehavior: (server.defaultBehavior as McpServerDraft["defaultBehavior"]) ?? "",
 			});
 			testMutation.reset();
@@ -2109,7 +2101,7 @@ function McpToolsTab() {
 		const payload: Record<string, unknown> = {
 			name: d.name.trim(),
 			transport: d.transport,
-			enabled: d.enabled,
+			mode: d.mode,
 		};
 		if (d.transport === "stdio") {
 			payload.command = d.command.trim();
@@ -2314,7 +2306,7 @@ function McpToolsTab() {
 										{server.name}
 									</Text>
 									<Badge size="xs" variant="light" color={statusColor(server.status)}>
-										{t(mcpStatusLabelKey(server.status, server.enabled))}
+										{t(mcpStatusLabelKey(server.status))}
 									</Badge>
 									<Badge size="xs" variant="outline">
 										{server.transport}
@@ -2326,49 +2318,31 @@ function McpToolsTab() {
 									)}
 								</Group>
 								<Group gap={4}>
-									{/* These buttons write the persisted `enabled` intent, so they branch on
-									    it rather than on the live socket state. An enabled-but-unreachable
-									    server still needs a disable button here: branching on `connected`
-									    alone would leave it with only "Connect", making it impossible to
-									    stop from this list while it retries on every startup. */}
-									{server.enabled && (
-										<ActionIcon
-											variant="subtle"
-											size="sm"
-											color="orange"
-											disabled={!mcpServerManagementSupported}
-											onClick={() => {
-												if (!mcpServerManagementSupported) return;
-												disconnectMutation.mutate(server.id);
-											}}
-											loading={disconnectMutation.isPending}
-											title={
-												mcpServerManagementSupported
-													? server.status === "connected"
-														? t("mcpDisconnect")
-														: t("mcpDisableAndDisconnect")
-													: mcpServerManagementUnsupportedReason
-											}
-										>
-											<IconPlugOff size={14} />
-										</ActionIcon>
-									)}
-									{server.status !== "connected" && (
-										<ActionIcon
-											variant="subtle"
-											size="sm"
-											color="green"
-											disabled={!canConnectServer}
-											onClick={() => {
-												if (!canConnectServer) return;
-												connectMutation.mutate(server.id);
-											}}
-											loading={connectMutation.isPending}
-											title={canConnectServer ? t("mcpConnect") : connectUnsupportedReason}
-										>
-											<IconPlug size={14} />
-										</ActionIcon>
-									)}
+									<SegmentedControl
+										size="xs"
+										aria-label={t("mcpLoadingMode")}
+										value={resolveMcpLoadingMode(server)}
+										data={mcpModeOptions}
+										disabled={!mcpServerManagementSupported || updateMutation.isPending}
+										onChange={(mode) => updateMutation.mutate({ id: server.id, mode })}
+									/>
+									{resolveMcpLoadingMode(server) !== "disabled" &&
+										server.status !== "connected" && (
+											<ActionIcon
+												variant="subtle"
+												size="sm"
+												color="green"
+												disabled={!canConnectServer}
+												onClick={() => {
+													if (!canConnectServer) return;
+													connectMutation.mutate(server.id);
+												}}
+												loading={connectMutation.isPending}
+												title={canConnectServer ? t("mcpConnect") : connectUnsupportedReason}
+											>
+												<IconPlug size={14} />
+											</ActionIcon>
+										)}
 									{/* Refresh re-lists tools on the live connection (or reconnects a
 									    dead one). Available whenever management is: a disabled server
 									    reports an error rather than silently coming back up. */}
@@ -2764,15 +2738,18 @@ function McpToolsTab() {
 								))}
 							</div>
 
-							<Switch
-								label={t("mcpEnabled")}
-								description={t("mcpEnabledDesc")}
-								checked={draft.enabled}
-								onChange={(e) => {
-									const val = e.currentTarget.checked;
-									setDraft((d) => ({ ...d, enabled: val }));
-								}}
-							/>
+							<Stack gap={4}>
+								<Text size="sm">{t("mcpLoadingMode")}</Text>
+								<SegmentedControl
+									aria-label={t("mcpLoadingMode")}
+									value={draft.mode}
+									data={mcpModeOptions}
+									onChange={(mode) => setDraft((d) => ({ ...d, mode: mode as McpLoadingMode }))}
+								/>
+								<Text size="xs" c="dimmed">
+									{t("mcpLoadingModeDesc")}
+								</Text>
+							</Stack>
 
 							<Select
 								label={t("mcpDefaultBehavior")}

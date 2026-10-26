@@ -98,7 +98,6 @@ import { ToolInputStream } from "./tool-input-stream";
 import {
 	formatRequestTools,
 	resolveAdapterToolLoadingStrategy,
-	sameToolLoadingLayout,
 	type ToolLoadingStrategy,
 	usesToolLoading,
 } from "./tool-loading";
@@ -141,6 +140,7 @@ import type {
 	ContentBlock,
 	PermissionResult,
 	ResolvedToolDefinition,
+	ToolDefinition,
 } from "./types";
 import {
 	PLAN_MODE_ALLOWED_TOOLS,
@@ -2739,41 +2739,49 @@ async function* agentLoopInMetadataSnapshot(
 		return run;
 	};
 
-	let allTools: ResolvedToolDefinition[] = (inheritedTools ? [] : toolRegistry.all())
-		.filter((t) => t.name && (!t.isAvailable || t.isAvailable()))
-		// Last line of defence before the wire. Providers validate the whole `tools`
-		// array and reject the entire request when one name breaks their alphabet
-		// (OpenAI: `Invalid 'tools[19].function.name': ... '^[a-zA-Z0-9_-]+$'`), so a
-		// single malformed dynamic tool would otherwise make every turn fail. Names are
-		// minted sanitized upstream (MCP + plugin bridges); dropping the tool here keeps
-		// the session usable if a future source misses that, instead of rewriting the
-		// name behind the registry's back — a renamed tool could not be executed or
-		// matched against history.
-		.filter((t) => {
-			if (isValidToolName(t.name)) return true;
-			logger.warn("Dropping tool with a provider-invalid name", { toolName: t.name });
-			return false;
-		})
-		.map((t) => ({
-			...t,
-			description: typeof t.description === "function" ? t.description(config) : t.description,
-			rawJsonSchema: t.getRawJsonSchema ? t.getRawJsonSchema(config) : t.rawJsonSchema,
-		}));
+	/** Materialize one candidate view; rebuilds never read a second registry snapshot. */
+	function materializeToolCandidates(
+		candidates: readonly ToolDefinition[],
+	): ResolvedToolDefinition[] {
+		let resolved = candidates
+			.filter((t) => t.name && (!t.isAvailable || t.isAvailable()))
+			// Last line of defence before the wire. Providers validate the whole `tools`
+			// array and reject the entire request when one name breaks their alphabet
+			// (OpenAI: `Invalid 'tools[19].function.name': ... '^[a-zA-Z0-9_-]+$'`), so a
+			// single malformed dynamic tool would otherwise make every turn fail. Names are
+			// minted sanitized upstream (MCP + plugin bridges); dropping the tool here keeps
+			// the session usable if a future source misses that, instead of rewriting the
+			// name behind the registry's back — a renamed tool could not be executed or
+			// matched against history.
+			.filter((t) => {
+				if (isValidToolName(t.name)) return true;
+				logger.warn("Dropping tool with a provider-invalid name", { toolName: t.name });
+				return false;
+			})
+			.map((t) => ({
+				...t,
+				description: typeof t.description === "function" ? t.description(config) : t.description,
+				rawJsonSchema: t.getRawJsonSchema ? t.getRawJsonSchema(config) : t.rawJsonSchema,
+			}));
 
-	// Keep the wire-level tool list identical for primary and reflection requests so
-	// provider prompt caches can share the same prefix. Reflection permissions remain
-	// narrow: the reflection loop's permissionHandler and executeTool checks enforce
-	// `reflectionLoop.allowedTools` when the model actually attempts a call.
+		// Keep the wire-level tool list identical for primary and reflection requests so
+		// provider prompt caches can share the same prefix. Reflection permissions remain
+		// narrow: the reflection loop's permissionHandler and executeTool checks enforce
+		// `reflectionLoop.allowedTools` when the model actually attempts a call.
+		if (config.toolFilter) {
+			resolved = resolved.filter((tool) => tool.reflectionOnly || config.toolFilter?.(tool));
+		}
 
-	// Apply toolFilter if provided (used by subagents to restrict available tools)
-	if (config.toolFilter) {
-		allTools = allTools.filter((tool) => tool.reflectionOnly || config.toolFilter?.(tool));
+		// Keep SwitchDevice available for a stale remote default so the model can
+		// recover by explicitly switching back to local. TransferFile still requires
+		// at least one online remote endpoint.
+		return filterDeviceTools(resolved, config);
 	}
 
-	// Keep SwitchDevice available for a stale remote default so the model can
-	// recover by explicitly switching back to local. TransferFile still requires
-	// at least one online remote endpoint.
-	allTools = filterDeviceTools(allTools, config);
+	// Only a standalone first request without host candidates materializes the registry.
+	let allTools = materializeToolCandidates(
+		inheritedTools ? [] : (config.toolCandidates ?? toolRegistry.all()),
+	);
 
 	/**
 	 * Whether plan mode should currently blank out the forbidden tools' descriptions.
@@ -3236,6 +3244,9 @@ async function* agentLoopInMetadataSnapshot(
 		replacement: AgentHistoryReplacement,
 		options: { sameUpstreamSession?: boolean } = {},
 	) {
+		if (!inheritedTools && replacement.toolLoading && !replacement.toolCandidates) {
+			throw new Error("A tool-loading history replacement must include tool candidates");
+		}
 		historyReplacements++;
 		// A per-request rebuild continues the same conversation; only a replacement that
 		// changes what was already sent (compact, model switch) starts a new upstream session.
@@ -3248,13 +3259,11 @@ async function* agentLoopInMetadataSnapshot(
 		}
 		hostHistory = withSystemPrompt(replacement.history);
 		transcript.replace(replacement.rows);
-		// A rebuild after compact (or a load the old history did not contain) moves tools
-		// between the array and the history; keep the array in step with the new history.
-		if (
-			!inheritedTools &&
-			replacement.toolLoading &&
-			!sameToolLoadingLayout(config.toolLoading, replacement.toolLoading)
-		) {
+		// Only a loading-aware rebuild may replace the request's tool view. Candidates and
+		// loading state move together; even an unchanged layout may carry a new tool/schema.
+		if (!inheritedTools && replacement.toolLoading && replacement.toolCandidates) {
+			config.toolCandidates = replacement.toolCandidates;
+			allTools = materializeToolCandidates(replacement.toolCandidates);
 			config.toolLoading = replacement.toolLoading;
 			tools = formatRequestToolsForProvider();
 			void reportToolsCharacters(tools);

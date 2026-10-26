@@ -13,11 +13,14 @@ import {
 	latestToolLoadingEpoch,
 	projectToolLoadingHistory,
 	resolveToolLoadingStrategy,
+	selectRequestTools,
+	snapshotToolDefinitions,
 	type ToolLoadingState,
 	type ToolLoadingStrategy,
 	toolLoadingChangeOf,
 	toolLoadingDrift,
 } from "../tool-loading";
+import { toolRegistry } from "../tool-registry";
 import type { ResolvedToolDefinition } from "../types";
 
 function tool(name: string): ResolvedToolDefinition {
@@ -56,6 +59,57 @@ function notice(kind: "tool_loaded" | "tool_unloaded", toolNames: string[]): DbM
 		contentJson: [{ type: kind, toolName: toolNames[0], toolNames, text }],
 	});
 }
+
+describe("frozen tool definitions", () => {
+	test("notice definitions survive registry schema changes and disappearance", () => {
+		const message = notice("tool_loaded", ["Eval"]);
+		(message.contentJson as Record<string, unknown>[])[0].definitionSnapshots = [
+			{
+				name: "Eval",
+				description: "original",
+				parameters: { type: "object", properties: { old: { type: "string" } } },
+			},
+		];
+		const state = deriveToolLoadingState([message], MANAGED, ["Eval"]);
+		const projected = projectToolLoadingHistory([message], state, "custom_injection", () => null);
+		expect(projected[0].contentText).toContain('"description":"original"');
+		expect(projected[0].contentText).toContain('"old"');
+	});
+
+	test("snapshot helper resolves current only from the supplied raw candidate view", () => {
+		const name = "CandidateOnly";
+		const candidate = { ...tool(name), description: "candidate view" };
+		const other = tool("OtherCandidate");
+		toolRegistry.register({ ...candidate, description: "registry view" });
+		try {
+			const snapshots = snapshotToolDefinitions([name], [candidate, other]);
+			expect(snapshots.map((snapshot) => snapshot.name)).toEqual([name]);
+			expect(snapshots[0]?.description).toBe("candidate view");
+			expect(snapshotToolDefinitions([name], [])).toEqual([]);
+		} finally {
+			toolRegistry.unregister(name);
+		}
+	});
+
+	test("epoch base uses frozen JSON while replacement uses current registry", () => {
+		const state = deriveToolLoadingState([], MANAGED, ["Eval"], {
+			toolNames: ["Eval"],
+			definitionSnapshots: [
+				{ name: "Eval", description: "frozen", parameters: { type: "object" } },
+			],
+		});
+		expect(
+			selectRequestTools(CANDIDATES, state, "custom_injection").tools.find(
+				(item) => item.name === "Eval",
+			)?.description,
+		).toBe("frozen");
+		expect(
+			selectRequestTools(CANDIDATES, state, "replace_tools").tools.find(
+				(item) => item.name === "Eval",
+			)?.description,
+		).toBe("Eval tool");
+	});
+});
 
 describe("tool loading strategy resolution", () => {
 	test("name defaults honour the documented version floors", () => {

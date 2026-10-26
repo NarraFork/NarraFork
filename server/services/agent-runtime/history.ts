@@ -18,9 +18,11 @@ import {
 	deriveToolLoadingState,
 	projectToolLoadingHistory,
 	resolveLoadableToolDefinition,
+	type ToolLoadingEpoch,
 	type ToolLoadingState,
 	usesToolLoading,
 } from "../../lib/agent/tool-loading";
+import type { ToolDefinition } from "../../lib/agent/types";
 import { isTopLevelMessage, type OwnTurnPlacement } from "../../lib/runtime-source";
 import { trackAgentMessageHistory } from "../agent-message-delivery";
 
@@ -54,7 +56,14 @@ export interface RuntimeHistoryOptions {
 	 * Optional tools whose presence follows session loading, and the currently loaded
 	 * ones. When set, loads inside the history keep the request's tool array fixed.
 	 */
-	toolLoading?: { managed: ReadonlySet<string>; current: Iterable<string> };
+	toolLoading?: {
+		managed: ReadonlySet<string>;
+		current: Iterable<string>;
+		/** The request's already-materialized registry candidates; never re-read the registry. */
+		candidates?: readonly ToolDefinition[];
+		/** A reconciled epoch. Property presence suppresses the legacy compact query, even if empty. */
+		epoch?: ToolLoadingEpoch;
+	};
 }
 
 export interface PreparedRuntimeHistory extends BuiltHistory {
@@ -76,6 +85,8 @@ export interface PreparedRuntimeHistory extends BuiltHistory {
 	endsWithInput: boolean;
 	/** Loading state of this history; the loop derives the tool array from it. */
 	toolLoading?: ToolLoadingState;
+	/** Full request candidates from the same registry view as `toolLoading`. */
+	toolCandidates?: readonly ToolDefinition[];
 }
 
 /**
@@ -226,17 +237,24 @@ export async function buildRuntimeHistory(
 		currentInput = prepared.currentInput;
 	}
 	checkBudget();
-	const toolLoadingState = options.toolLoading
+	const loading = options.toolLoading;
+	const epoch = loading
+		? Object.hasOwn(loading, "epoch")
+			? loading.epoch
+			: loading.managed.size
+				? await (await import("../narrator-epochs")).toolLoadingEpochOf(
+						options.narratorId,
+						modelMessages,
+					)
+				: undefined
+		: undefined;
+	const toolLoadingState = loading
 		? deriveToolLoadingState(
-				modelMessages,
-				options.toolLoading.managed,
-				options.toolLoading.current,
-				options.toolLoading.managed.size
-					? (await import("../narrator-epochs")).toolLoadingEpochOf(
-							options.narratorId,
-							modelMessages,
-						)
-					: undefined,
+				// No managed tool means no events to derive; do not scan the history at all.
+				loading.managed.size ? modelMessages : [],
+				loading.managed,
+				loading.current,
+				epoch,
 			)
 		: undefined;
 	const toolLoadingStrategy = usesToolLoading(toolLoadingState)
@@ -245,11 +263,20 @@ export async function buildRuntimeHistory(
 	// Injected schemas are plain notice text, so they are written here: the receipt guards
 	// and a notice recovered as the current turn then carry the same bytes as a rebuild.
 	if (toolLoadingState && toolLoadingStrategy === "custom_injection") {
+		const candidates = loading?.candidates;
+		const byName = candidates ? new Map(candidates.map((tool) => [tool.name, tool])) : undefined;
+		const resolveDefinition = (name: string) => {
+			if (!byName) return resolveLoadableToolDefinition(name);
+			const tool = byName.get(name);
+			if (!tool || (tool.isAvailable && !tool.isAvailable())) return null;
+			if (typeof tool.description !== "string" || tool.getRawJsonSchema) return null;
+			return { ...tool, description: tool.description };
+		};
 		modelMessages = projectToolLoadingHistory(
 			modelMessages,
 			toolLoadingState,
 			toolLoadingStrategy,
-			resolveLoadableToolDefinition,
+			resolveDefinition,
 		) as typeof modelMessages;
 	}
 	// Full Await outputs remain intact until the actual provider-input boundary.
@@ -293,5 +320,6 @@ export async function buildRuntimeHistory(
 		endsWithToolResults: tail.toolResults,
 		endsWithInput: tail.input,
 		...(toolLoadingState ? { toolLoading: toolLoadingState } : {}),
+		...(loading?.candidates ? { toolCandidates: loading.candidates } : {}),
 	};
 }

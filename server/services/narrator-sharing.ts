@@ -22,6 +22,7 @@ import { and, eq, inArray, isNull } from "drizzle-orm";
 import { db } from "../db";
 import { aclGrants, narrators, users } from "../db/schema";
 import { AppError, NotFoundError, ValidationError } from "../lib/errors";
+import { eventBus } from "../lib/event-bus";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import {
@@ -602,6 +603,9 @@ async function announceAccessChange(
 		| "owner_changed",
 	affectedUserIds: string[] = [],
 ): Promise<void> {
+	// Server-side caches of access decisions hear about every change, including a visibility
+	// change that names no affected users below.
+	eventBus.emit({ type: "narrator:access_changed", narratorId, reason });
 	try {
 		for (const userId of new Set(affectedUserIds)) {
 			broadcastToUser(userId, { type: "narrator_access_changed", narratorId, reason });

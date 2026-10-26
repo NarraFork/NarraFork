@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 import { isAbsolute } from "node:path";
 import { encodeToolOutput } from "@shared/agent-protocol/tool-output";
 import { resolveBufferQueueMode } from "@shared/buffer-queue-mode";
+import { resolveMcpLoadingMode } from "@shared/mcp-loading-mode";
 import type { MessageOriginOptions } from "@shared/message-origin";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { parseStored } from "@shared/narrator-blocks/plan";
@@ -35,6 +36,7 @@ import { diagnosticsFromError } from "../lib/agent/error-diagnostics";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import { forgetModelTraceRequest } from "../lib/agent/modeltrace-request";
 import { projectMessageSenderText } from "../lib/agent/sender-projection";
+import { toolRegistry } from "../lib/agent/tool-registry";
 import {
 	clearBehaviorFenceEditGrant,
 	grantBehaviorFenceEdit,
@@ -80,7 +82,12 @@ import {
 import { normalizeLegacyPlanPreviousPermissionMode } from "../lib/permission-modes";
 import { resolveExistingPlanFileRelPath } from "../lib/plan-file-path";
 import { getHome } from "../lib/platform";
-import { getBlockedTaskActionInstruction, getToolMessage, type Locale } from "../lib/prompt-i18n";
+import {
+	getBlockedTaskActionInstruction,
+	getToolMessage,
+	getToolMessageWithParams,
+	type Locale,
+} from "../lib/prompt-i18n";
 import {
 	executionPrincipalOf,
 	type OwnTurnPlacement,
@@ -164,6 +171,7 @@ import {
 import { gitService } from "./git-service";
 import { cancelModelTrace } from "./modeltrace-service";
 import { isFormerChapterSessionWithoutDirectory, resolveNarratorSessionCwd } from "./narrator-cwd";
+import { optionalToolDescription, reconcileEpoch } from "./narrator-epochs";
 import {
 	clearStreamingSnapshot,
 	type EventHooks,
@@ -202,6 +210,7 @@ import { appendSubagentFileChanges } from "./subagent-file-changes";
 import { agentResultTag, resolveAgentLabel } from "./subagent-label";
 import { resolveSubagentModelForRun, subagentRunReasoningEffort } from "./subagent-model";
 import { buildFinalToolStartAuthorization } from "./tool-final-start-authorization";
+import { parseMcpServerMarker } from "./tool-load-markers";
 import { resolveEffectiveTraits, resolveNarratorRuntimePolicy } from "./trait-layer-service";
 import {
 	buildSpecContinuationPrompt,
@@ -1404,6 +1413,24 @@ async function createNarrator(
 			for (const toolName of narrator.enabledTools) {
 				if (OPTIONAL_TOOLS.has(toolName)) active._enabledOptionalTools.add(toolName);
 			}
+		}
+	}
+
+	if (!initialOAuthRuntime) {
+		const loadedServers = new Set(
+			(narrator.enabledTools ?? []).flatMap((value) => {
+				const id = parseMcpServerMarker(value);
+				return id ? [id] : [];
+			}),
+		);
+		for (const tool of toolRegistry.all()) {
+			const server = settings.mcpServers?.find((item) => item.id === tool.metadata?.mcpServerId);
+			if (
+				server &&
+				resolveMcpLoadingMode(server) !== "disabled" &&
+				(resolveMcpLoadingMode(server) === "resident" || loadedServers.has(server.id))
+			)
+				active._enabledOptionalTools.add(tool.name);
 		}
 	}
 
@@ -2717,6 +2744,8 @@ export interface ContextManagementOptions {
 	getAttachmentCwd?: () => string | undefined;
 	/** Optional tool loading input for rebuilt histories (see `RuntimeHistoryOptions`). */
 	getToolLoading?: () => import("./agent-runtime/history").RuntimeHistoryOptions["toolLoading"];
+	/** Refresh registry membership and explicit MCP server grants before every request. */
+	refreshToolLoading?: () => Promise<void>;
 	attachmentSignal?: AbortSignal;
 	/** Called after compact completes (e.g. reset conversationId, set restart flag) */
 	onCompactDone?: () => void;
@@ -2785,10 +2814,35 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 		const deadline = Date.now() + 10_000;
 		const signal = opts.attachmentSignal;
 		signal?.throwIfAborted();
-		const rawMsgs = await narratorService.getModelHistorySinceLastCompact(narratorId, undefined, {
+		if (opts.refreshToolLoading) await opts.refreshToolLoading();
+		let rawMsgs = await narratorService.getModelHistorySinceLastCompact(narratorId, undefined, {
 			signal,
 			deadline,
 		});
+		let toolLoading = opts.getToolLoading?.();
+		if (toolLoading) {
+			const reconciled = await reconcileEpoch({
+				narratorId,
+				messages: rawMsgs,
+				...toolLoading,
+				model: getModel(),
+				provider: getProvider(),
+				noticeText: (kind, toolName) =>
+					kind === "tool_loaded"
+						? getToolMessageWithParams("toolLoaded", locale, {
+								toolName,
+								toolDescription: optionalToolDescription(toolName, locale),
+							})
+						: getToolMessageWithParams("toolUnloaded", locale, { toolName }),
+			});
+			if (reconciled.changed) {
+				rawMsgs = await narratorService.getModelHistorySinceLastCompact(narratorId, undefined, {
+					signal,
+					deadline,
+				});
+			}
+			toolLoading = { ...toolLoading, epoch: reconciled.epoch };
+		}
 		// The in-memory history is now rebuilt from the latest (post-compact)
 		// messages, so any pending-compact guard can be released.
 		clearActiveHistoryCompactPending(narratorId);
@@ -2800,8 +2854,11 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 			attachmentCwd: opts.getAttachmentCwd?.(),
 			attachmentSignal: signal,
 			deadline,
-			toolLoading: opts.getToolLoading?.(),
+			toolLoading,
 		});
+		if (result.toolLoading && !result.toolCandidates) {
+			throw new Error("A tool-loading history rebuild must include tool candidates");
+		}
 		const systemPrompt = includeSystemPrompt
 			? ((await rebuildSystemPrompt?.()) ?? undefined)
 			: undefined;
@@ -2811,7 +2868,12 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 			history: result.history,
 			rows: result.modelMessages,
 			replayedInjectionMessageIds: result.replayedInjectionMessageIds,
-			...(result.toolLoading ? { toolLoading: result.toolLoading } : {}),
+			...(result.toolLoading
+				? {
+						toolLoading: result.toolLoading,
+						...(result.toolCandidates ? { toolCandidates: result.toolCandidates } : {}),
+					}
+				: {}),
 			...(systemPrompt !== undefined ? { systemPrompt } : {}),
 		};
 	};
@@ -3682,7 +3744,7 @@ async function executeQueuedControlCommand(
 	} else if ("loadTool" in result || "loadToolNotFound" in result) {
 		await handlers.handleLoadToolCommand(narratorId, result, locale, userId);
 	} else if ("unloadTool" in result || "unloadToolNotFound" in result) {
-		await handlers.handleUnloadToolCommand(narratorId, result, locale);
+		await handlers.handleUnloadToolCommand(narratorId, result, locale, userId);
 	} else if ("blockSkill" in result) {
 		await handlers.handleBlockSkillCommand(narratorId, result, locale);
 	} else if ("blockAllSkills" in result) {
@@ -8946,32 +9008,17 @@ export async function loadOptionalTool(
 ): Promise<"loaded" | "already_loaded" | "unknown_tool"> {
 	if (!OPTIONAL_TOOLS.has(toolName)) return "unknown_tool";
 
-	// Read current enabled tools from DB
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { enabledTools: true },
-	});
-	const current: string[] = (narrator?.enabledTools as string[] | null) ?? [];
-	if (current.includes(toolName)) return "already_loaded";
-	// A resident tool is preloaded in memory only. Loading it again changes nothing the
-	// model sees, so no load notice may be written for it: the notice would move it out
-	// of the request's tool array (see lib/agent/tool-loading.ts).
-	const active = activeNarrators.get(narratorId);
-	const alreadyActive = active?._enabledOptionalTools.has(toolName) ?? false;
-
-	// Persist
-	await db
-		.update(narrators)
-		.set({ enabledTools: [...current, toolName] })
-		.where(eq(narrators.id, narratorId));
-
-	// Also update in-memory session if active
-	if (active) {
-		active._enabledOptionalTools.add(toolName);
-	}
-
-	logger.info("Optional tool loaded", { narratorId, toolName });
-	return alreadyActive ? "already_loaded" : "loaded";
+	const { changeLoadedToolGroup } = await import("./tool-loading-service");
+	const result = await changeLoadedToolGroup(
+		narratorId,
+		{ id: toolName, description: toolName, toolNames: [toolName] },
+		true,
+	);
+	return result === "loaded"
+		? "loaded"
+		: result === "already_loaded"
+			? "already_loaded"
+			: "unknown_tool";
 }
 
 /**
@@ -8984,32 +9031,29 @@ export async function unloadOptionalTool(
 ): Promise<"unloaded" | "not_loaded" | "unknown_tool"> {
 	if (!OPTIONAL_TOOLS.has(toolName)) return "unknown_tool";
 
-	const narrator = await db.query.narrators.findFirst({
-		where: eq(narrators.id, narratorId),
-		columns: { enabledTools: true },
-	});
-	const current: string[] = (narrator?.enabledTools as string[] | null) ?? [];
-	const next = current.filter((name) => name !== toolName);
-	const wasPersisted = next.length !== current.length;
-
-	const active = activeNarrators.get(narratorId);
-	const wasActive = active?._enabledOptionalTools.has(toolName) ?? false;
-
-	if (!wasPersisted && !wasActive) return "not_loaded";
-
-	if (wasPersisted) {
-		await db.update(narrators).set({ enabledTools: next }).where(eq(narrators.id, narratorId));
-	}
-
-	if (active) {
-		active._enabledOptionalTools.delete(toolName);
-	}
-
-	logger.info("Optional tool unloaded", { narratorId, toolName });
-	return "unloaded";
+	const { changeLoadedToolGroup } = await import("./tool-loading-service");
+	const result = await changeLoadedToolGroup(
+		narratorId,
+		{ id: toolName, description: toolName, toolNames: [toolName] },
+		false,
+	);
+	return result === "unloaded" ? "unloaded" : "not_loaded";
 }
 
 /** Get the set of enabled optional tool names for a narrator session. */
+export function updateActiveLoadedTools(
+	narratorId: string,
+	toolNames: Iterable<string>,
+	loaded = true,
+): void {
+	const active = activeNarrators.get(narratorId);
+	if (!active) return;
+	for (const name of toolNames) {
+		if (loaded) active._enabledOptionalTools.add(name);
+		else active._enabledOptionalTools.delete(name);
+	}
+}
+
 export function getEnabledOptionalTools(narratorId: string): Set<string> {
 	const active = activeNarrators.get(narratorId);
 	return active?._enabledOptionalTools ?? new Set();

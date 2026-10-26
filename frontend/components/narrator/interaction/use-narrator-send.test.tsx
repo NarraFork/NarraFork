@@ -11,7 +11,7 @@ import { I18nextProvider } from "react-i18next";
 import { useNarratorCommands } from "../../../hooks/useCommands";
 import { api, type BufferMessageSummary } from "../../../lib/api";
 import type { CommandItem } from "../composer/CommandPopover";
-import { getComposerAssetId } from "../composer/draft-image-attachments";
+import { getComposerAssetId, loadDraftImageAttachments } from "../composer/draft-image-attachments";
 import type { NarratorComposerHandle } from "../composer/NarratorComposer";
 import {
 	snapshotComposerFiles,
@@ -79,11 +79,6 @@ beforeEach(() => {
 		composerRef: { current: composer },
 		attachedImages: [],
 		attachedTextFiles: [],
-		attachedImagesRef: { current: [] },
-		attachedTextFilesRef: { current: [] },
-		updateAttachedImages: mock(() => {}),
-		updateAttachedTextFiles: mock(() => {}),
-		hideAttachedFilesForSend: mock(() => {}),
 		clearAttachedFilesAndDraft: mock(() => {}),
 		sendingRef: { current: false },
 		setQueuedMessages: (update) => {
@@ -196,7 +191,7 @@ describe("structured send snapshots", () => {
 		"busy",
 		"idle",
 		"compacting",
-	] as const)("%s restores the identical mixed document after cancellation", async (state) => {
+	] as const)("%s preserves the identical mixed document after cancellation", async (state) => {
 		const { doc, projection, images, textFiles } = richDraft();
 		send.mockRejectedValue(new DOMException("Cancelled", "AbortError"));
 		await render({
@@ -206,13 +201,13 @@ describe("structured send snapshots", () => {
 			attachedTextFiles: textFiles,
 		});
 		await act(async () => actions.handleSend());
-		expect(options.composerRef.current?.restoreInput).toHaveBeenCalledWith(
-			projection.text,
-			projection.fileReferences,
-			doc,
-		);
-		expect(options.updateAttachedImages).toHaveBeenCalledWith([images[1], images[0]]);
-		expect(options.updateAttachedTextFiles).toHaveBeenCalledWith(textFiles);
+		expect(options.composerRef.current?.getDocument?.()).toBe(doc);
+		expect(options.composerRef.current?.getText()).toBe(projection.text);
+		expect(options.composerRef.current?.getFileReferences()).toEqual(projection.fileReferences);
+		expect(options.composerRef.current?.hideTextForSend).not.toHaveBeenCalled();
+		expect(options.composerRef.current?.restoreInput).not.toHaveBeenCalled();
+		expect(options.attachedImages).toEqual(images);
+		expect(options.attachedTextFiles).toEqual(textFiles);
 		expect(options.clearAttachedFilesAndDraft).not.toHaveBeenCalled();
 		expect(options.sendingRef.current).toBe(false);
 	});
@@ -259,8 +254,6 @@ describe("structured send snapshots", () => {
 		await render({
 			attachedImages: images,
 			attachedTextFiles: textFiles,
-			attachedImagesRef: { current: images },
-			attachedTextFilesRef: { current: textFiles },
 		});
 		await act(async () => {
 			actions.forwardTextToNarrator("forwarded");
@@ -270,12 +263,13 @@ describe("structured send snapshots", () => {
 		expect(send.mock.calls[0]?.[2]).toBeUndefined();
 		expect(send.mock.calls[0]?.[3]).toBeUndefined();
 		expect(send.mock.calls[0]?.[10]).toBeUndefined();
-		expect(options.composerRef.current?.restoreInput).toHaveBeenLastCalledWith(
-			projection.text,
-			projection.fileReferences,
-			doc,
-		);
-		expect(options.updateAttachedImages).toHaveBeenLastCalledWith(images);
+		expect(options.composerRef.current?.getText()).toBe(projection.text);
+		expect(options.composerRef.current?.getDocument?.()).toBe(doc);
+		expect(options.composerRef.current?.getFileReferences()).toEqual(projection.fileReferences);
+		expect(options.composerRef.current?.restoreInput).not.toHaveBeenCalled();
+		expect(options.composerRef.current?.hideTextForSend).not.toHaveBeenCalled();
+		expect(options.composerRef.current?.commitDraftAfterSend).not.toHaveBeenCalled();
+		expect(options.clearAttachedFilesAndDraft).not.toHaveBeenCalled();
 	});
 	test("pure-text /new projects a new document without retaining the command", async () => {
 		const doc: ComposerDocument = {
@@ -337,8 +331,6 @@ describe("structured send snapshots", () => {
 				ingestingRef,
 				attachedImages: images,
 				attachedTextFiles: textFiles,
-				attachedImagesRef: { current: images },
-				attachedTextFilesRef: { current: textFiles },
 				registerSubmitToNarrator: (submit) => {
 					registeredForward = submit;
 					return undefined;
@@ -384,10 +376,7 @@ describe("structured send snapshots", () => {
 			expect(options.composerRef.current?.clearTextAndDraft).not.toHaveBeenCalled();
 			expect(options.composerRef.current?.commitDraftAfterSend).not.toHaveBeenCalled();
 			expect(options.composerRef.current?.restoreInput).not.toHaveBeenCalled();
-			expect(options.hideAttachedFilesForSend).not.toHaveBeenCalled();
 			expect(options.clearAttachedFilesAndDraft).not.toHaveBeenCalled();
-			expect(options.updateAttachedImages).not.toHaveBeenCalled();
-			expect(options.updateAttachedTextFiles).not.toHaveBeenCalled();
 			expect(options.composerRef.current?.getDocument()).toEqual(doc);
 			expect(options.sendingRef.current).toBe(false);
 			expect(actions.sendingState).toBeNull();
@@ -532,15 +521,18 @@ describe("narrator interrupt send", () => {
 		expect(options.sendingRef.current).toBe(false);
 	});
 
-	test("failed acceptance restores the draft and attachments without retrying or stopping", async () => {
+	test("failed acceptance preserves the draft and attachments without retrying or stopping", async () => {
 		const file = new File(["note"], "note.txt");
 		send.mockRejectedValue(new Error("upload failed"));
 		await render({ attachedTextFiles: [file] });
 		await act(async () => actions.handleSend());
 		expect(send).toHaveBeenCalledTimes(1);
 		expect(options.interruptNarrator.mutateAsync).not.toHaveBeenCalled();
-		expect(options.composerRef.current?.restoreInput).toHaveBeenCalledWith("replace", [reference]);
-		expect(options.updateAttachedTextFiles).toHaveBeenCalledWith([file]);
+		expect(options.composerRef.current?.getText()).toBe("replace");
+		expect(options.composerRef.current?.getFileReferences()).toEqual([reference]);
+		expect(options.attachedTextFiles).toEqual([file]);
+		expect(options.composerRef.current?.hideTextForSend).not.toHaveBeenCalled();
+		expect(options.composerRef.current?.restoreInput).not.toHaveBeenCalled();
 		expect(options.composerRef.current?.commitDraftAfterSend).not.toHaveBeenCalled();
 		expect(queue.map((message) => message.id)).toEqual(["existing"]);
 		expect(options.sendingRef.current).toBe(false);
@@ -636,7 +628,9 @@ describe("modeltrace immediate control", () => {
 				expect(options.interruptNarrator.mutateAsync).not.toHaveBeenCalled();
 				expect(options.setNarratorWorking).not.toHaveBeenCalled();
 				expect(queue.map((message) => message.id)).toEqual(["existing"]);
-				expect(options.hideAttachedFilesForSend).not.toHaveBeenCalled();
+				expect(options.attachedImages).toHaveLength(1);
+				expect(options.attachedTextFiles).toHaveLength(1);
+				expect(options.composerRef.current?.hideTextForSend).not.toHaveBeenCalled();
 				expect(options.clearAttachedFilesAndDraft).not.toHaveBeenCalled();
 				expect(options.composerRef.current?.clearTextAndDraft).not.toHaveBeenCalled();
 				expect(options.composerRef.current?.restoreInput).toHaveBeenCalledWith("", []);
@@ -645,6 +639,37 @@ describe("modeltrace immediate control", () => {
 			});
 		}
 	}
+
+	test.each([
+		"composer",
+		"forward",
+	] as const)("%s ignores a late modeltrace result after switching narrator", async (source) => {
+		let finish!: (value: { id: string }) => void;
+		start.mockImplementationOnce(
+			() =>
+				new Promise((resolve) => {
+					finish = resolve;
+				}),
+		);
+		const onStarted = mock(() => {});
+		await render({ onModelTraceStarted: onStarted });
+		let pending: Promise<void> | undefined;
+		await act(async () => {
+			if (source === "composer") pending = actions.handleSend();
+			else actions.forwardTextToNarrator("/modeltrace");
+		});
+		expect(start).toHaveBeenCalledTimes(1);
+		await render({ narratorId: "other" });
+		await act(async () => {
+			finish({ id: "late-child" });
+			await pending;
+		});
+		expect(onStarted).not.toHaveBeenCalled();
+		expect(options.navigateToNarrator).not.toHaveBeenCalled();
+		expect(options.composerRef.current?.restoreInput).not.toHaveBeenCalled();
+		expect(options.composerRef.current?.clearTextAndDraft).not.toHaveBeenCalled();
+		expect(options.sendingRef.current).toBe(false);
+	});
 
 	test("rich composer keeps attachment nodes and resources when removing only the command", async () => {
 		const image = new File(["image"], "image.png", { type: "image/png" });
@@ -866,8 +891,6 @@ describe("save_dump immediate control", () => {
 				showCompactQueueChoice: state === "compacting",
 				attachedImages: [image],
 				attachedTextFiles: [textFile],
-				attachedImagesRef: { current: [image] },
-				attachedTextFilesRef: { current: [textFile] },
 				onRequestRecordingSaved: onSaved,
 			});
 			const composer = options.composerRef.current as NarratorComposerHandle;
@@ -883,10 +906,7 @@ describe("save_dump immediate control", () => {
 			expect(options.setNarratorWorking).not.toHaveBeenCalled();
 			expect(options.reconcileBufferedMessages).not.toHaveBeenCalled();
 			expect(queue.map((message) => message.id)).toEqual(["existing"]);
-			expect(options.hideAttachedFilesForSend).not.toHaveBeenCalled();
 			expect(options.clearAttachedFilesAndDraft).not.toHaveBeenCalled();
-			expect(options.updateAttachedImages).not.toHaveBeenCalled();
-			expect(options.updateAttachedTextFiles).not.toHaveBeenCalled();
 			expect(composer.clearTextAndDraft).toHaveBeenCalledTimes(1);
 			expect(composer.noteSent).not.toHaveBeenCalled();
 			expect(onSaved).toHaveBeenCalledWith(recording);
@@ -907,7 +927,6 @@ describe("save_dump immediate control", () => {
 		expect(composer.hideTextForSend).not.toHaveBeenCalled();
 		expect(composer.commitDraftAfterSend).not.toHaveBeenCalled();
 		expect(composer.restoreInput).not.toHaveBeenCalled();
-		expect(options.hideAttachedFilesForSend).not.toHaveBeenCalled();
 		expect(options.clearAttachedFilesAndDraft).not.toHaveBeenCalled();
 		expect(send).not.toHaveBeenCalled();
 		expect(options.interruptNarrator.mutateAsync).not.toHaveBeenCalled();
@@ -969,10 +988,7 @@ describe("save_dump immediate control", () => {
 		expect(composer.clearTextAndDraft).not.toHaveBeenCalled();
 		expect(send).not.toHaveBeenCalled();
 		expect(options.interruptNarrator.mutateAsync).not.toHaveBeenCalled();
-		expect(options.hideAttachedFilesForSend).not.toHaveBeenCalled();
 		expect(options.clearAttachedFilesAndDraft).not.toHaveBeenCalled();
-		expect(options.updateAttachedImages).not.toHaveBeenCalled();
-		expect(options.updateAttachedTextFiles).not.toHaveBeenCalled();
 		expect(queue.map((message) => message.id)).toEqual(["existing"]);
 	});
 	test.each(
@@ -986,8 +1002,6 @@ describe("save_dump immediate control", () => {
 		expect(options.interruptNarrator.mutateAsync).not.toHaveBeenCalled();
 		expect(options.composerRef.current?.restoreInput).not.toHaveBeenCalled();
 		expect(options.clearAttachedFilesAndDraft).not.toHaveBeenCalled();
-		expect(options.updateAttachedImages).not.toHaveBeenCalled();
-		expect(options.updateAttachedTextFiles).not.toHaveBeenCalled();
 		expect(onSaved).toHaveBeenCalledWith(recording);
 	});
 	for (const state of ["working", "compacting"] as const) {
@@ -1010,7 +1024,6 @@ describe("save_dump immediate control", () => {
 			expect(save).not.toHaveBeenCalled();
 			expect(send).not.toHaveBeenCalled();
 			expect(options.interruptNarrator.mutateAsync).not.toHaveBeenCalled();
-			expect(options.hideAttachedFilesForSend).not.toHaveBeenCalled();
 			expect(options.clearAttachedFilesAndDraft).not.toHaveBeenCalled();
 			expect(composer.clearTextAndDraft).not.toHaveBeenCalled();
 			expect(composer.restoreInput).not.toHaveBeenCalled();
@@ -1051,7 +1064,6 @@ describe("control slash commands", () => {
 		expect(composer.hideTextForSend).toHaveBeenCalledTimes(1);
 		expect(composer.commitDraftAfterSend).toHaveBeenCalledTimes(1);
 		// Staged attachments survive a control command for the next message.
-		expect(options.hideAttachedFilesForSend).not.toHaveBeenCalled();
 		expect(options.clearAttachedFilesAndDraft).not.toHaveBeenCalled();
 		expect(queue.map((message) => message.id)).toEqual(["existing"]);
 	});
@@ -1098,8 +1110,6 @@ describe("new narrator attachments", () => {
 		return {
 			attachedImages,
 			attachedTextFiles,
-			attachedImagesRef: { current: attachedImages },
-			attachedTextFilesRef: { current: attachedTextFiles },
 		};
 	}
 
@@ -1204,7 +1214,7 @@ describe("new narrator attachments", () => {
 	test.each([
 		"create",
 		"send",
-	] as const)("should restore the command and both attachment types when %s fails", async (failure) => {
+	] as const)("should preserve the command and both attachment types when %s fails", async (failure) => {
 		const files = attachments("mixed");
 		const create = mock(async () => {
 			if (failure === "create") throw new Error("fixture create failed");
@@ -1215,9 +1225,11 @@ describe("new narrator attachments", () => {
 		await act(async () => actions.handleSend());
 		expect(create).toHaveBeenCalledTimes(1);
 		expect(send).toHaveBeenCalledTimes(failure === "send" ? 1 : 0);
-		expect(options.composerRef.current?.restoreInput).toHaveBeenCalledWith("/new", []);
-		expect(options.updateAttachedImages).toHaveBeenCalledWith(files.attachedImages);
-		expect(options.updateAttachedTextFiles).toHaveBeenCalledWith(files.attachedTextFiles);
+		expect(options.composerRef.current?.getText()).toBe("/new");
+		expect(options.attachedImages).toEqual(files.attachedImages);
+		expect(options.attachedTextFiles).toEqual(files.attachedTextFiles);
+		expect(options.composerRef.current?.hideTextForSend).not.toHaveBeenCalled();
+		expect(options.composerRef.current?.restoreInput).not.toHaveBeenCalled();
 		expect(options.composerRef.current?.commitDraftAfterSend).not.toHaveBeenCalled();
 		expect(options.clearAttachedFilesAndDraft).not.toHaveBeenCalled();
 		expect(options.navigateToNarrator).not.toHaveBeenCalled();
@@ -1266,12 +1278,328 @@ describe("new narrator attachments", () => {
 		expect(send).not.toHaveBeenCalled();
 		expect(composer.hideTextForSend).not.toHaveBeenCalled();
 		expect(composer.commitDraftAfterSend).not.toHaveBeenCalled();
-		expect(options.hideAttachedFilesForSend).not.toHaveBeenCalled();
 		expect(options.clearAttachedFilesAndDraft).not.toHaveBeenCalled();
 		expect(options.navigateToNarrator).not.toHaveBeenCalled();
 		expect(notify).toHaveBeenCalledWith(
 			expect.objectContaining({ message: "fileReferences.newSessionFirst", color: "red" }),
 		);
+		expect(options.sendingRef.current).toBe(false);
+	});
+});
+
+describe("send ownership across narrator switches", () => {
+	function deferred<T>() {
+		let resolve!: (value: T) => void;
+		let reject!: (reason: unknown) => void;
+		const promise = new Promise<T>((ok, fail) => {
+			resolve = ok;
+			reject = fail;
+		});
+		return { promise, resolve, reject };
+	}
+
+	test.each([
+		"busy",
+		"idle",
+		"compacting",
+	] as const)("%s cancels on switching, retains files, and ignores late failure while B sends", async (state) => {
+		const first = deferred<{ buffered: boolean; id: string }>();
+		const second = deferred<{ buffered: boolean; id: string }>();
+		send.mockImplementationOnce(() => first.promise).mockImplementationOnce(() => second.promise);
+		const image = new File(["image"], "same.png", { type: "image/png" });
+		const log = new File(["log"], "same.png", { type: "text/plain" });
+		const owner = `switch-${state}`;
+		await render({
+			currentUser: { id: owner },
+			isActive: state === "busy",
+			showCompactQueueChoice: state === "compacting",
+			attachedImages: [image],
+			attachedTextFiles: [log],
+		});
+		let firstSend!: Promise<void>;
+		await act(async () => {
+			firstSend = actions.handleSend();
+		});
+		const firstSignal = send.mock.calls[0]?.[6];
+		const firstProgress = send.mock.calls[0]?.[5];
+		expect(firstSignal?.aborted).toBe(false);
+		const composer = options.composerRef.current;
+		if (!composer) throw new Error("composer was not mounted");
+		const nextComposer = {
+			...composer,
+			restoreInput: mock(() => {}),
+			commitDraftAfterSend: mock(() => {}),
+		};
+		// Real panels can reuse the ref object while swapping the composer handle.
+		options.composerRef.current = nextComposer;
+		await render({ narratorId: "other", attachedImages: [], attachedTextFiles: [] });
+		expect(firstSignal?.aborted).toBe(true);
+		expect(actions.isSending).toBe(false);
+		expect(options.sendingRef.current).toBe(false);
+		const recovered = await loadDraftImageAttachments(owner, "n");
+		expect(recovered.images[0]).toBe(image);
+		expect(recovered.textFiles[0]).toBe(log);
+		let secondSend!: Promise<void>;
+		await act(async () => {
+			secondSend = actions.handleSend();
+		});
+		const secondSignal = send.mock.calls[1]?.[6];
+		await act(async () => {
+			firstProgress?.(0.9);
+			first.reject(new DOMException("Cancelled", "AbortError"));
+			await firstSend;
+		});
+		expect(actions.isSending).toBe(true);
+		expect(actions.sendingState?.progress).toBe(0);
+		expect(options.sendingRef.current).toBe(true);
+		expect(secondSignal?.aborted).toBe(false);
+		expect(nextComposer.restoreInput).not.toHaveBeenCalled();
+		expect(nextComposer.commitDraftAfterSend).not.toHaveBeenCalled();
+		expect(options.clearAttachedFilesAndDraft).not.toHaveBeenCalled();
+		expect(notify).not.toHaveBeenCalled();
+		await act(async () => {
+			second.resolve({ buffered: true, id: "second" });
+			await secondSend;
+		});
+		expect(actions.isSending).toBe(false);
+	});
+
+	test.each([
+		"switch-back",
+		"remount",
+		"account",
+	] as const)("%s does not revive the previous request when it succeeds late", async (change) => {
+		const request = deferred<{ buffered: boolean; id: string }>();
+		send.mockImplementationOnce(() => request.promise);
+		await render({ currentUser: { id: "owner" } });
+		let pending!: Promise<void>;
+		await act(async () => {
+			pending = actions.handleSend();
+		});
+		const signal = send.mock.calls[0]?.[6];
+		if (change === "switch-back") {
+			await render({ narratorId: "other" });
+			await render({ narratorId: "n" });
+		} else if (change === "remount") {
+			await act(async () => root.render(null));
+			await render({ sendingRef: { current: false } });
+		} else {
+			await render({ currentUser: { id: "another-user" } });
+		}
+		expect(signal?.aborted).toBe(true);
+		await act(async () => {
+			request.resolve({ buffered: true, id: "stale" });
+			await pending;
+		});
+		expect(queue.map((entry) => entry.id)).toEqual(["existing"]);
+		expect(options.composerRef.current?.commitDraftAfterSend).not.toHaveBeenCalled();
+		expect(options.clearAttachedFilesAndDraft).not.toHaveBeenCalled();
+		expect(options.reconcileBufferedMessages).not.toHaveBeenCalled();
+		expect(options.setNarratorWorking).not.toHaveBeenCalled();
+		expect(actions.sendingState).toBeNull();
+		expect(notify).not.toHaveBeenCalled();
+	});
+
+	test("unmount aborts the transport and retains Files without waiting for rejection", async () => {
+		const request = deferred<{ buffered: boolean; id: string }>();
+		send.mockImplementationOnce(() => request.promise);
+		const file = new File(["contents"], "log.txt", { type: "text/plain" });
+		await render({ currentUser: { id: "unmount-owner" }, attachedTextFiles: [file] });
+		let pending!: Promise<void>;
+		await act(async () => {
+			pending = actions.handleSend();
+		});
+		const signal = send.mock.calls[0]?.[6];
+		await act(async () => root.render(null));
+		expect(signal?.aborted).toBe(true);
+		expect((await loadDraftImageAttachments("unmount-owner", "n")).textFiles[0]).toBe(file);
+		await act(async () => {
+			request.reject(new Error("late transport failure"));
+			await pending;
+		});
+		expect(notify).not.toHaveBeenCalled();
+	});
+
+	test("a late /new creation cannot start an upload or navigate after switching", async () => {
+		const created = deferred<{ id: string }>();
+		await render({
+			isActive: false,
+			createNarrator: { mutateAsync: mock(() => created.promise) },
+		});
+		Object.assign(options.composerRef.current ?? {}, {
+			getText: () => "/new hello",
+			getFileReferences: () => [],
+		});
+		let pending!: Promise<void>;
+		await act(async () => {
+			pending = actions.handleSend();
+		});
+		await render({ narratorId: "other" });
+		await act(async () => {
+			created.resolve({ id: "created" });
+			await pending;
+		});
+		expect(send).not.toHaveBeenCalled();
+		expect(options.navigateToNarrator).not.toHaveBeenCalled();
+		expect(options.clearAttachedFilesAndDraft).not.toHaveBeenCalled();
+	});
+});
+
+describe("mounted composer visibility during uploads", () => {
+	test.each([
+		"hidden-tab",
+		"workspace-preview",
+	] as const)("%s cancels even though the send hook stays mounted and preserves the full draft", async (host) => {
+		let finish!: (value: { buffered: boolean; id: string }) => void;
+		send.mockImplementationOnce(
+			() =>
+				new Promise((resolve) => {
+					finish = resolve;
+				}),
+		);
+		const file = new File(["contents"], "log.txt", { type: "text/plain" });
+		await render({ currentUser: { id: host }, attachedTextFiles: [file] });
+		const composer = options.composerRef.current;
+		let pending!: Promise<void>;
+		await act(async () => {
+			pending = actions.handleSend();
+		});
+		const signal = send.mock.calls[0]?.[6];
+		expect(composer?.getText()).toBe("replace");
+		expect(options.attachedTextFiles).toEqual([file]);
+		expect(composer?.hideTextForSend).not.toHaveBeenCalled();
+		// Director previews remove only the composer, not the panel/send hook.
+		if (host === "workspace-preview") options.composerRef.current = null;
+		await render({ composerVisible: false });
+		expect(signal?.aborted).toBe(true);
+		expect(actions.isSending).toBe(false);
+		expect(options.sendingRef.current).toBe(false);
+		expect((await loadDraftImageAttachments(host, "n")).textFiles[0]).toBe(file);
+		await act(async () => actions.handleSend());
+		expect(send).toHaveBeenCalledTimes(1);
+		options.composerRef.current = composer;
+		await render({ composerVisible: true });
+		await act(async () => {
+			finish({ buffered: true, id: "stale" });
+			await pending;
+		});
+		expect(composer?.getText()).toBe("replace");
+		expect(composer?.hideTextForSend).not.toHaveBeenCalled();
+		expect(composer?.commitDraftAfterSend).not.toHaveBeenCalled();
+		expect(options.clearAttachedFilesAndDraft).not.toHaveBeenCalled();
+		expect(queue.map((entry) => entry.id)).toEqual(["existing"]);
+	});
+
+	test.each([
+		"busy",
+		"idle",
+		"compacting",
+	] as const)("%s keeps recovery input intact until acceptance, then clears it exactly once", async (state) => {
+		let finish!: (value: { buffered: boolean; id: string }) => void;
+		send.mockImplementationOnce(
+			() =>
+				new Promise((resolve) => {
+					finish = resolve;
+				}),
+		);
+		const file = new File(["contents"], "log.txt", { type: "text/plain" });
+		await render({
+			attachedTextFiles: [file],
+			isActive: state === "busy",
+			showCompactQueueChoice: state === "compacting",
+		});
+		let pending!: Promise<void>;
+		await act(async () => {
+			pending = actions.handleSend();
+		});
+		expect(actions.isSending).toBe(true);
+		expect(options.composerRef.current?.hideTextForSend).not.toHaveBeenCalled();
+		expect(options.composerRef.current?.commitDraftAfterSend).not.toHaveBeenCalled();
+		expect(options.clearAttachedFilesAndDraft).not.toHaveBeenCalled();
+		await act(async () => {
+			finish({ buffered: true, id: "accepted" });
+			await pending;
+		});
+		expect(options.composerRef.current?.hideTextForSend).toHaveBeenCalledTimes(1);
+		expect(options.composerRef.current?.commitDraftAfterSend).toHaveBeenCalledTimes(1);
+		expect(options.clearAttachedFilesAndDraft).toHaveBeenCalledTimes(1);
+		expect(actions.isSending).toBe(false);
+	});
+
+	test("a failed upload never restores its old snapshot over a synchronized newer draft", async () => {
+		let fail!: (reason: unknown) => void;
+		send.mockImplementationOnce(
+			() =>
+				new Promise((_resolve, reject) => {
+					fail = reject;
+				}),
+		);
+		let text = "original";
+		Object.assign(options.composerRef.current ?? {}, { getText: () => text });
+		await render();
+		let pending!: Promise<void>;
+		await act(async () => {
+			pending = actions.handleSend();
+		});
+		text = "newer synchronized draft";
+		await act(async () => {
+			fail(new Error("upload failed"));
+			await pending;
+		});
+		expect(options.composerRef.current?.getText()).toBe(text);
+		expect(options.composerRef.current?.restoreInput).not.toHaveBeenCalled();
+		expect(options.composerRef.current?.hideTextForSend).not.toHaveBeenCalled();
+		expect(options.clearAttachedFilesAndDraft).not.toHaveBeenCalled();
+	});
+});
+
+describe("forwarding never borrows the composer draft", () => {
+	test.each([
+		"success",
+		"failure",
+		"switch",
+		"hidden",
+		"initially-hidden",
+	] as const)("%s leaves the draft untouched both while pending and after settlement", async (outcome) => {
+		let finish!: (value: { buffered: boolean; id: string }) => void;
+		let fail!: (reason: unknown) => void;
+		send.mockImplementationOnce(
+			() =>
+				new Promise((resolve, reject) => {
+					finish = resolve;
+					fail = reject;
+				}),
+		);
+		const file = new File(["contents"], "log.txt", { type: "text/plain" });
+		await render({
+			attachedTextFiles: [file],
+			composerVisible: outcome !== "initially-hidden",
+		});
+		await act(async () => actions.forwardTextToNarrator("forwarded text"));
+		expect(send.mock.calls[0]?.[1]).toBe("forwarded text");
+		expect(send.mock.calls[0]?.[2]).toBeUndefined();
+		expect(send.mock.calls[0]?.[3]).toBeUndefined();
+		expect(send.mock.calls[0]?.[7]).toEqual([]);
+		expect(actions.isSending).toBe(true);
+		expect(options.composerRef.current?.getText()).toBe("replace");
+		expect(options.composerRef.current?.restoreInput).not.toHaveBeenCalled();
+		// Model a remote edit arriving while the independent forward is pending.
+		Object.assign(options.composerRef.current ?? {}, { getText: () => "new remote draft" });
+		if (outcome === "switch") await render({ narratorId: "other" });
+		if (outcome === "hidden") await render({ composerVisible: false });
+		if (outcome === "switch" || outcome === "hidden")
+			expect(send.mock.calls[0]?.[6]?.aborted).toBe(true);
+		await act(async () => {
+			if (outcome === "failure") fail(new Error("forward failed"));
+			else finish({ buffered: true, id: "forwarded" });
+			await Promise.resolve();
+		});
+		expect(options.composerRef.current?.getText()).toBe("new remote draft");
+		expect(options.composerRef.current?.restoreInput).not.toHaveBeenCalled();
+		expect(options.composerRef.current?.hideTextForSend).not.toHaveBeenCalled();
+		expect(options.composerRef.current?.commitDraftAfterSend).not.toHaveBeenCalled();
+		expect(options.clearAttachedFilesAndDraft).not.toHaveBeenCalled();
+		expect(actions.isSending).toBe(false);
 		expect(options.sendingRef.current).toBe(false);
 	});
 });

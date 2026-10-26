@@ -937,19 +937,16 @@ function NarratorPanelBody({
 	);
 
 	// Pending composer attachments (images + text files) + their IndexedDB draft
-	// persistence. The send flow (hide/clear/restore) and drag handlers below
+	// persistence. The send flow (clear after acceptance) and drag handlers below
 	// consume these; see the hook for why both kinds share one version counter.
 	const {
 		attachedImages,
 		attachedTextFiles,
-		attachedImagesRef,
-		attachedTextFilesRef,
 		isDragging,
 		setIsDragging,
 		dragCounterRef,
 		updateAttachedImages,
 		updateAttachedTextFiles,
-		hideAttachedFilesForSend,
 		clearAttachedFilesAndDraft,
 		reconcileDocumentAssets,
 		attachmentsHydrating,
@@ -2584,17 +2581,13 @@ function NarratorPanelBody({
 		handleContinue,
 	} = useNarratorSend({
 		narratorId,
+		composerVisible: !isWorkspacePreview && fileDrawerVisible,
 		composerRef,
 		ingestingRef,
 		attachmentsHydrating,
 		attachmentsRestoreFailed,
 		attachedImages,
 		attachedTextFiles,
-		attachedImagesRef,
-		attachedTextFilesRef,
-		updateAttachedImages,
-		updateAttachedTextFiles,
-		hideAttachedFilesForSend,
 		clearAttachedFilesAndDraft,
 		sendingRef,
 		setQueuedMessages,

@@ -2065,6 +2065,7 @@ export const handleNarratorWS = {
 								msg.narratorId,
 								cmdResult as UnloadToolResult | UnloadToolNotFound,
 								locale,
+								userId,
 							);
 							return;
 						}

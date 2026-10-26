@@ -43,6 +43,7 @@ const settingsState: {
 		name: string;
 		transport: "stdio";
 		command: string;
+		mode?: "disabled" | "auto" | "resident";
 		enabled: boolean;
 	}>;
 } = {
@@ -101,6 +102,27 @@ afterAll(() => {
 });
 
 describe("McpManager.refresh", () => {
+	it("initializes auto/resident and skips disabled even with stale legacy flags", async () => {
+		settingsState.mcpServers = [
+			{ ...serverConfig, id: "auto", mode: "auto", enabled: false },
+			{ ...serverConfig, id: "resident", mode: "resident", enabled: false },
+			{ ...serverConfig, id: "disabled", mode: "disabled", enabled: true },
+		];
+		await mcpManager.initialize();
+		expect(state.connectCalls).toBe(2);
+		expect(
+			mcpManager
+				.getServerStatuses()
+				.filter((s) => s.status === "connected")
+				.map((s) => s.id),
+		).toEqual(["auto", "resident"]);
+		settingsState.mcpServers[0].mode = "disabled";
+		await mcpManager.reload();
+		expect(mcpManager.getServerStatuses().find((s) => s.id === "auto")?.status).toBe(
+			"disconnected",
+		);
+	});
+
 	it("re-lists tools on a live connection without reconnecting", async () => {
 		await mcpManager.connect(serverConfig);
 		const connectCallsAfterConnect = state.connectCalls;

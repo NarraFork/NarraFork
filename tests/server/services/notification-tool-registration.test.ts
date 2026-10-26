@@ -66,7 +66,7 @@ describe("Notification optional tool integration", () => {
 		}
 	});
 
-	test("resident preloads while manual and reserved auto modes stay unloaded", async () => {
+	test("resident preloads while manual and on-demand auto modes start unloaded", async () => {
 		for (const mode of ["manual", "auto", "resident"] as const) {
 			settings.routines = applyToolRoutineMode(settings.routines, "notification", mode);
 			const state = await resolveOptionalToolState(NARRATOR_ID, "Notification");

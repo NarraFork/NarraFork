@@ -1,5 +1,11 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
+import {
+	applyMcpLoadingPatch,
+	hasMcpLoadingConflict,
+	normalizeMcpLoadingConfig,
+	resolveMcpLoadingMode,
+} from "@shared/mcp-loading-mode";
 import { Hono } from "hono";
 import { z } from "zod";
 import { generateShortId } from "../lib/id";
@@ -95,7 +101,8 @@ const mcpServerCreateSchema = z.object({
 	env: mcpSecretMapSchema.optional(),
 	url: z.string().url().max(2000).optional(),
 	headers: mcpSecretMapSchema.optional(),
-	enabled: z.boolean().optional().default(true),
+	mode: z.enum(["disabled", "auto", "resident"]).optional(),
+	enabled: z.boolean().optional(),
 	defaultBehavior: mcpBehaviorSchema.optional(),
 	toolPermissions: z.array(mcpToolPermissionInputSchema).optional(),
 });
@@ -111,6 +118,7 @@ const mcpServerPatchSchema = z.object({
 	url: z.string().url().max(2000).optional(),
 	headers: mcpSecretMapSchema.optional(),
 	headerPatch: mcpSecretMapPatchSchema.optional(),
+	mode: z.enum(["disabled", "auto", "resident"]).optional(),
 	enabled: z.boolean().optional(),
 	// null explicitly clears the server-level override; undefined leaves it unchanged.
 	defaultBehavior: mcpBehaviorSchema.nullable().optional(),
@@ -133,7 +141,7 @@ function applyMcpServerPatch(
 	patch: z.infer<typeof mcpServerPatchSchema>,
 ): McpServerConfig {
 	const { defaultBehavior, toolPermissionPatch, envPatch, headerPatch, ...rest } = patch;
-	const updated: McpServerConfig = { ...server, ...rest };
+	const updated: McpServerConfig = { ...server, ...rest, ...applyMcpLoadingPatch(server, patch) };
 	if (envPatch) {
 		const env = applyMcpSecretMapPatch(updated.env, envPatch);
 		if (env) updated.env = env;
@@ -194,10 +202,12 @@ mcpRoutes.post("/servers", requireAdmin, async (c) => {
 	if (!parsed.success) {
 		return c.json({ error: parsed.error.message }, 400);
 	}
-	const config: McpServerConfig = {
+	if (hasMcpLoadingConflict(parsed.data))
+		return c.json({ error: "MCP mode conflicts with enabled" }, 400);
+	const config: McpServerConfig = normalizeMcpLoadingConfig({
 		id: generateShortId(),
 		...parsed.data,
-	};
+	});
 
 	const servers = [...(Array.isArray(settings.mcpServers) ? settings.mcpServers : []), config];
 	settings.mcpServers = servers;
@@ -223,6 +233,8 @@ mcpRoutes.patch("/servers/:id", requireAdmin, async (c) => {
 	if (!parsed.success) {
 		return c.json({ error: parsed.error.message }, 400);
 	}
+	if (hasMcpLoadingConflict(parsed.data))
+		return c.json({ error: "MCP mode conflicts with enabled" }, 400);
 	const updated = applyMcpServerPatch(servers[idx], parsed.data);
 	servers[idx] = updated;
 	settings.mcpServers = servers;
@@ -268,11 +280,9 @@ mcpRoutes.post("/servers/:id/connect", requireAdmin, async (c) => {
 	const config = servers.find((s) => s.id === id);
 	if (!config) return c.json({ error: "Not found" }, 404);
 
-	if (!config.enabled) {
-		config.enabled = true;
-		settings.mcpServers = servers;
-		saveSettings(settings);
-	}
+	Object.assign(config, applyMcpLoadingPatch(config, { enabled: true }));
+	settings.mcpServers = servers;
+	saveSettings(settings);
 
 	// A failed connection is deliberately NOT rolled back to enabled=false: the
 	// user asked for this server to be up, and the failure is already reported
@@ -295,8 +305,8 @@ mcpRoutes.post("/servers/:id/disconnect", requireAdmin, async (c) => {
 	// off, which now also means "wrote a config change" — worth failing loudly.
 	if (!config) return c.json({ error: "Not found" }, 404);
 
-	if (config.enabled) {
-		config.enabled = false;
+	if (resolveMcpLoadingMode(config) !== "disabled" || config.enabled !== false) {
+		Object.assign(config, applyMcpLoadingPatch(config, { mode: "disabled" }));
 		settings.mcpServers = servers;
 		saveSettings(settings);
 	}
@@ -369,10 +379,14 @@ mcpRoutes.post("/servers/:id/test", requireAdmin, async (c) => {
 	if (!parsed.success) {
 		return c.json({ error: parsed.error.message }, 400);
 	}
+	if (hasMcpLoadingConflict(parsed.data)) {
+		return c.json({ error: "MCP mode conflicts with enabled" }, 400);
+	}
 
 	const config: McpServerConfig = {
 		...applyMcpServerPatch(existing, parsed.data),
 		id: `test-${id}`,
+		mode: "auto",
 		enabled: true,
 	};
 	return c.json(await mcpManager.testConnection(config));
@@ -385,9 +399,13 @@ mcpRoutes.post("/servers/test", requireAdmin, async (c) => {
 	if (!parsed.success) {
 		return c.json({ error: parsed.error.message }, 400);
 	}
+	if (hasMcpLoadingConflict(parsed.data)) {
+		return c.json({ error: "MCP mode conflicts with enabled" }, 400);
+	}
 	const config: McpServerConfig = {
 		id: "test",
 		...parsed.data,
+		mode: "auto",
 		enabled: true,
 	};
 
@@ -475,11 +493,20 @@ mcpRoutes.post("/servers/import", requireAdmin, async (c) => {
 			headers = filtered.length > 0 ? Object.fromEntries(filtered) : undefined;
 		}
 
+		const loading = z
+			.object({
+				mode: z.enum(["disabled", "auto", "resident"]).optional(),
+				enabled: z.boolean().optional(),
+			})
+			.safeParse({ mode: cfg.mode, enabled: cfg.disabled === true ? false : cfg.enabled });
+		if (!loading.success || hasMcpLoadingConflict(loading.data)) {
+			return c.json({ error: `Invalid MCP loading policy for ${name}` }, 400);
+		}
 		const config: McpServerConfig = {
 			id: generateShortId(),
 			name,
 			transport,
-			enabled: cfg.disabled !== true && cfg.enabled !== false,
+			...normalizeMcpLoadingConfig(loading.data),
 			command: cfg.command,
 			args: Array.isArray(cfg.args) ? cfg.args : undefined,
 			cwd: cfg.cwd,

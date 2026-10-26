@@ -460,6 +460,9 @@ async function announceProjectAccessChange(
 	reason: "visibility_changed" | "members_changed" | "owner_changed",
 	affectedUserIds: string[] = [],
 ): Promise<void> {
+	// Server-side caches of access decisions hear about every change, including a visibility
+	// change that names no affected users below.
+	eventBus.emit({ type: "project:access_changed", projectId, reason });
 	const recipients = new Set(affectedUserIds);
 	try {
 		for (const userId of recipients) {

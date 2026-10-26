@@ -239,6 +239,61 @@ integration(
 				]);
 				expect((await store.append(message("filtered-own", "filtered-child"))).seq).toBe(2);
 				bindNarratorMessageRefs({ backend: "postgres", port: store });
+				await client.db
+					.insert(narrators)
+					.values({ id: "tool-load", createdAt: now, updatedAt: now });
+				await narratorPersistence.persistToolChangeMessage(
+					"tool-load",
+					{
+						type: "tool_loaded",
+						toolName: "calendar",
+						toolNames: ["mcp__calendar__read"],
+						text: "loaded",
+					},
+					undefined,
+					["mcp-server:calendar", "mcp__calendar__read"],
+				);
+				expect(
+					(
+						await client.db
+							.select({ tools: narrators.enabledTools })
+							.from(narrators)
+							.where(eq(narrators.id, "tool-load"))
+					)[0]?.tools,
+				).toEqual(["mcp-server:calendar", "mcp__calendar__read"]);
+				await client.sql.unsafe(
+					"CREATE FUNCTION reject_tool_state() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'tool state failure'; END $$",
+				);
+				await client.sql.unsafe(
+					"CREATE TRIGGER reject_tool_state BEFORE UPDATE OF enabled_tools ON narrators FOR EACH ROW EXECUTE FUNCTION reject_tool_state()",
+				);
+				try {
+					await expect(
+						narratorPersistence.persistToolChangeMessage(
+							"tool-load",
+							{
+								type: "tool_unloaded",
+								toolName: "calendar",
+								toolNames: ["mcp__calendar__read"],
+								text: "unloaded",
+							},
+							undefined,
+							[],
+						),
+					).rejects.toThrow("Failed query");
+					expect((await store.page("tool-load")).rows).toHaveLength(1);
+					expect(
+						(
+							await client.db
+								.select({ tools: narrators.enabledTools })
+								.from(narrators)
+								.where(eq(narrators.id, "tool-load"))
+						)[0]?.tools,
+					).toEqual(["mcp-server:calendar", "mcp__calendar__read"]);
+				} finally {
+					await client.sql.unsafe("DROP TRIGGER reject_tool_state ON narrators");
+					await client.sql.unsafe("DROP FUNCTION reject_tool_state()");
+				}
 				const user = await narratorPersistence.persistUserMessage(
 					"entry",
 					"user through real entry",

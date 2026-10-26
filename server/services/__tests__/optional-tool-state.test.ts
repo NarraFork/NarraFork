@@ -147,7 +147,7 @@ describe("resolveOptionalToolState — routine modes", () => {
 		expect(result.state).toBe("loaded");
 	});
 
-	test("auto does not preload — toolsearch is not implemented yet", async () => {
+	test("auto does not preload — ToolSearch loads it on demand", async () => {
 		const narrator = await createStandaloneNarrator();
 		createdNarrators.push(narrator.id);
 		setGlobalToolMode("browser", "auto");

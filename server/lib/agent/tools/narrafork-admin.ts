@@ -1,3 +1,4 @@
+import { applyMcpLoadingPatch } from "@shared/mcp-loading-mode";
 import { z } from "zod/v4";
 import { type NarraForkSettings, SETTING_DOCS } from "../../../lib/settings/index";
 import type { ToolDefinition, ToolResult } from "../types";
@@ -19,6 +20,28 @@ async function getSettingsModule() {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/** Raw settings array replacements use PATCH semantics for matching server IDs. */
+function prepareMcpServersWrite(
+	current: unknown,
+	incoming: unknown,
+): Array<Record<string, unknown>> {
+	if (!Array.isArray(incoming)) throw new Error("MCP servers must be an array");
+	const previous = new Map<string, Record<string, unknown>>();
+	for (const server of Array.isArray(current) ? current : []) {
+		if (server && typeof server === "object" && typeof server.id === "string")
+			previous.set(server.id, server);
+	}
+	return incoming.map((server: unknown) => {
+		if (!server || typeof server !== "object" || Array.isArray(server))
+			throw new Error("Invalid MCP server configuration");
+		const input = server as Record<string, unknown>;
+		const existing = typeof input.id === "string" ? previous.get(input.id) : undefined;
+		// For a new entry, using the entry as its own base both validates the explicit
+		// write and retains creation defaults (notably legacy enabled=true → resident).
+		return { ...input, ...applyMcpLoadingPatch(existing ?? input, input) };
+	});
+}
 
 /** Mask sensitive fields before returning settings to the agent */
 function maskSensitive(obj: Record<string, unknown>): Record<string, unknown> {
@@ -325,7 +348,21 @@ export const narraforkAdminTool: ToolDefinition = {
 					return { output: "Error: 'value' is required for update_settings.", isError: true };
 				}
 				const current = settingsMod.loadSettings();
-				const merged = settingsMod.deepMerge(current as unknown as Record<string, unknown>, value);
+				let patch = value;
+				if (Object.hasOwn(value, "mcpServers")) {
+					try {
+						patch = {
+							...value,
+							mcpServers: prepareMcpServersWrite(current.mcpServers, value.mcpServers),
+						};
+					} catch (error) {
+						return {
+							output: `Error: ${error instanceof Error ? error.message : String(error)}`,
+							isError: true,
+						};
+					}
+				}
+				const merged = settingsMod.deepMerge(current as unknown as Record<string, unknown>, patch);
 				settingsMod.saveSettings(merged as unknown as NarraForkSettings);
 				return {
 					output: `Settings updated successfully. Changed keys: ${Object.keys(value).join(", ")}`,

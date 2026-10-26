@@ -68,6 +68,14 @@ export const MAX_DRAFT_ATTACHMENT_TOTAL_BYTES = 100 * 1024 * 1024;
  */
 export const MAX_DRAFT_ATTACHMENT_RECORDS = 20;
 
+/** Only explicitly interrupted uploads retain Files in this tab, never ordinary drafts. */
+const MAX_INTERRUPTED_DRAFT_RECORDS = 8;
+interface InterruptedDraftAttachments extends DraftAttachmentRecordStat {
+	images: File[];
+	textFiles: File[];
+}
+const interruptedDraftAttachments = new Map<string, InterruptedDraftAttachments>();
+
 const composerAssetIds = new WeakMap<File, string>();
 
 /** Resource identity belongs to the File object, never its (possibly duplicated) name. */
@@ -422,18 +430,67 @@ export function selectDraftAttachmentsToEvict(options: {
 	return [...doomed];
 }
 
+function getInterruptedDraftAttachments(draftKey: string): LoadedDraftAttachments | null {
+	const cutoff = Date.now() - DRAFT_ATTACHMENT_TTL_MS;
+	for (const [key, record] of interruptedDraftAttachments) {
+		if (record.updatedAtMs < cutoff) interruptedDraftAttachments.delete(key);
+	}
+	const record = interruptedDraftAttachments.get(draftKey);
+	// Copy membership only: callers may edit their arrays, but Files (and asset ids)
+	// stay identical across reads and panels. Reading does not extend the TTL.
+	return record
+		? { images: [...record.images], textFiles: [...record.textFiles], droppedCount: 0 }
+		: null;
+}
+
+/**
+ * Synchronously retain a switch-interrupted upload before its composer unmounts.
+ * This is an opt-in recovery snapshot, not another ordinary draft store: it keeps
+ * the original File references without slicing/copying blobs, including files
+ * above the IndexedDB per-file limit. The newest snapshot always survives even
+ * if it alone exceeds the total budget; all older snapshots then make room.
+ */
+export function retainInterruptedDraftAttachments(
+	userId: string,
+	narratorId: string,
+	images: File[],
+	textFiles: File[],
+): void {
+	if (!userId || !narratorId) return;
+	const draftKey = getDraftImageAttachmentKey(userId, narratorId);
+	interruptedDraftAttachments.delete(draftKey);
+	if (images.length === 0 && textFiles.length === 0) return;
+	for (const file of [...images, ...textFiles]) getComposerAssetId(file);
+	interruptedDraftAttachments.set(draftKey, {
+		draftKey,
+		updatedAtMs: Date.now(),
+		totalBytes: [...images, ...textFiles].reduce((sum, file) => sum + file.size, 0),
+		images: [...images],
+		textFiles: [...textFiles],
+	});
+	const doomed = selectDraftAttachmentsToEvict({
+		records: [...interruptedDraftAttachments.values()],
+		now: Date.now(),
+		protectKey: draftKey,
+		maxRecords: MAX_INTERRUPTED_DRAFT_RECORDS,
+	});
+	for (const key of doomed) interruptedDraftAttachments.delete(key);
+}
+
 export async function loadDraftImageAttachments(
 	userId: string,
 	narratorId: string,
 ): Promise<LoadedDraftAttachments> {
 	const empty: LoadedDraftAttachments = { images: [], textFiles: [], droppedCount: 0 };
 	if (!userId || !narratorId) return empty;
+	const draftKey = getDraftImageAttachmentKey(userId, narratorId);
+	const interrupted = getInterruptedDraftAttachments(draftKey);
+	if (interrupted) return interrupted;
 	const db = await openDraftImageAttachmentDb();
 	// Unreadable storage is not evidence that this owner has no stored draft.
 	// Callers must retain the old record rather than autosaving a partial cache.
 	if (!db) throw new Error("IndexedDB draft attachments storage unavailable");
 
-	const draftKey = getDraftImageAttachmentKey(userId, narratorId);
 	// Migrate legacy resource ids atomically with this read; never overwrite a newer record.
 	const transaction = db.transaction(STORE_NAME, "readwrite");
 	const store = transaction.objectStore(STORE_NAME);
@@ -530,8 +587,16 @@ export async function saveDraftImageAttachments(
 	files: File[],
 	textFiles: File[] = [],
 ): Promise<void> {
+	if (!userId || !narratorId) return;
+	const draftKey = getDraftImageAttachmentKey(userId, narratorId);
+	// Update an opted-in snapshot at invocation, before yielding to IndexedDB.
+	// An earlier pending save must not overwrite a later synchronous retain, and
+	// removals/clear must take effect even when IndexedDB is unavailable or fails.
+	if (getInterruptedDraftAttachments(draftKey)) {
+		retainInterruptedDraftAttachments(userId, narratorId, files, textFiles);
+	}
 	const db = await openDraftImageAttachmentDb();
-	if (!db || !userId || !narratorId) return;
+	if (!db) return;
 
 	const transaction = db.transaction(STORE_NAME, "readwrite");
 	const store = transaction.objectStore(STORE_NAME);
@@ -541,8 +606,6 @@ export async function saveDraftImageAttachments(
 	const texts = textFiles
 		.filter((file) => shouldPersistFile(file, "text"))
 		.map((file, index) => fileToEntry(file, index, "text"));
-	const draftKey = getDraftImageAttachmentKey(userId, narratorId);
-
 	if (images.length === 0 && texts.length === 0) {
 		store.delete(draftKey);
 	} else {

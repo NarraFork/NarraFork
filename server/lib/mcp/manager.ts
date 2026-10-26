@@ -2,6 +2,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { Tool } from "@modelcontextprotocol/sdk/types.js";
 import { ToolListChangedNotificationSchema } from "@modelcontextprotocol/sdk/types.js";
+import { type McpLoadingMode, resolveMcpLoadingMode } from "@shared/mcp-loading-mode";
 import { eventBus } from "../event-bus";
 import { logger } from "../logger";
 import type { McpServerConfig } from "../settings";
@@ -35,6 +36,7 @@ export interface McpServerConfigProjection {
 	url?: string;
 	envKeys: string[];
 	headerKeys: string[];
+	mode: McpLoadingMode;
 	enabled: boolean;
 	defaultBehavior?: "readOnly" | "readWrite" | "ask" | "deny";
 	toolPermissions?: Array<{ toolName: string; behavior: string; enabled?: boolean }>;
@@ -65,7 +67,8 @@ export function projectMcpServerConfig(config: McpServerConfig): McpServerConfig
 		...(config.url !== undefined && { url: config.url }),
 		envKeys: Object.keys(config.env ?? {}).sort(),
 		headerKeys: Object.keys(config.headers ?? {}).sort(),
-		enabled: config.enabled,
+		mode: resolveMcpLoadingMode(config),
+		enabled: resolveMcpLoadingMode(config) !== "disabled",
 		...(config.defaultBehavior !== undefined && { defaultBehavior: config.defaultBehavior }),
 		...(config.toolPermissions !== undefined && { toolPermissions: config.toolPermissions }),
 	};
@@ -96,7 +99,7 @@ class McpManager {
 	/** Initialize: connect all enabled servers from settings. */
 	async initialize(): Promise<void> {
 		const servers = Array.isArray(settings.mcpServers) ? settings.mcpServers : [];
-		const enabled = servers.filter((s) => s.enabled);
+		const enabled = servers.filter((s) => resolveMcpLoadingMode(s) !== "disabled");
 		if (enabled.length === 0) return;
 
 		logger.info(`MCP: initializing ${enabled.length} server(s)`);
@@ -269,7 +272,7 @@ class McpManager {
 		if (!config) {
 			return { ok: false, toolCount: 0, error: `MCP server "${serverId}" is not configured` };
 		}
-		if (!config.enabled) {
+		if (resolveMcpLoadingMode(config) === "disabled") {
 			return { ok: false, toolCount: 0, error: `MCP server "${config.name}" is disabled` };
 		}
 
@@ -323,7 +326,7 @@ class McpManager {
 	/** Refresh the tool list of every enabled configured server. */
 	async refreshAll(): Promise<Array<{ serverId: string; name: string } & McpRefreshResult>> {
 		const servers = (Array.isArray(settings.mcpServers) ? settings.mcpServers : []).filter(
-			(s) => s.enabled,
+			(s) => resolveMcpLoadingMode(s) !== "disabled",
 		);
 		const settled = await Promise.allSettled(servers.map((s) => this.refresh(s.id)));
 		return settled.map((result, idx) => {
@@ -349,14 +352,14 @@ class McpManager {
 		// Disconnect removed or disabled servers
 		for (const [id] of this.clients) {
 			const cfg = configMap.get(id);
-			if (!cfg?.enabled) {
+			if (!cfg || resolveMcpLoadingMode(cfg) === "disabled") {
 				await this.disconnect(id);
 			}
 		}
 
 		// Connect new or reconnect changed servers
 		for (const cfg of servers) {
-			if (!cfg.enabled) continue;
+			if (resolveMcpLoadingMode(cfg) === "disabled") continue;
 			const existing = this.clients.get(cfg.id);
 			if (!existing || this.configChanged(existing.config, cfg)) {
 				await this.connect(cfg);
@@ -500,7 +503,12 @@ class McpManager {
 		const current = (Array.isArray(settings.mcpServers) ? settings.mcpServers : []).find(
 			(s) => s.id === config.id,
 		);
-		return !!current?.enabled && config.enabled && !this.configChanged(current, config);
+		return (
+			!!current &&
+			resolveMcpLoadingMode(current) !== "disabled" &&
+			resolveMcpLoadingMode(config) !== "disabled" &&
+			!this.configChanged(current, config)
+		);
 	}
 
 	private configChanged(a: McpServerConfig, b: McpServerConfig): boolean {

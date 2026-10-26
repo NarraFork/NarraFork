@@ -1176,6 +1176,35 @@ describe("real shared orchestrator profile contract", () => {
 		expect(h.calls[0].config.toolFilter?.(write)).toBe(false);
 	});
 
+	test("explicit capability ceiling does not hide auto or resident MCP tools", async () => {
+		const { toolRegistry } = await import("../../lib/agent/tool-registry");
+		const original = settings.mcpServers;
+		const tools = (["auto", "resident"] as const).map((mode) => ({
+			name: `mcp__ceiling_${mode}__read`,
+			description: mode,
+			parameters: {} as never,
+			metadata: { mcpServerId: `ceiling-${mode}`, mcpToolName: "read" },
+			execute: async () => ({ output: "ok" }),
+		}));
+		try {
+			settings.mcpServers = (["auto", "resident"] as const).map((mode) => ({
+				id: `ceiling-${mode}`,
+				name: mode,
+				mode,
+				enabled: true,
+				transport: "stdio",
+				command: "unused",
+			}));
+			for (const tool of tools) toolRegistry.register(tool);
+			const h = fixture(profiles[1], [finished]);
+			expect((await h.run()).hasError).toBe(false);
+			for (const tool of tools) expect(h.calls[0].config.toolFilter?.(tool)).toBe(true);
+		} finally {
+			settings.mcpServers = original;
+			for (const tool of tools) toolRegistry.unregister(tool.name);
+		}
+	});
+
 	test("child stream reaches both audiences through the real event handler with different origin projection", async () => {
 		const ws = await import("../../websocket/narrator-ws");
 		const { processEvent } = await import("../narrator-event-handler");

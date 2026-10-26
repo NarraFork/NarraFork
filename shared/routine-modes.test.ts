@@ -129,11 +129,10 @@ describe("project layer", () => {
 });
 
 describe("isPreloadedMode", () => {
-	test("only resident preloads; auto is not implemented yet", () => {
+	test("only resident preloads; auto is loaded on demand", () => {
 		expect(isPreloadedMode("resident")).toBe(true);
 		expect(isPreloadedMode("manual")).toBe(false);
-		// Toolsearch does not exist, so `auto` must not silently behave like
-		// `resident` and put every optional tool in the model's tool table.
+		// Auto groups enter the tool table through ToolSearch, not session preloading.
 		expect(isPreloadedMode("auto")).toBe(false);
 	});
 });

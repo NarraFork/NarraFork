@@ -8,11 +8,14 @@ import type { FileReference } from "@shared/file-reference";
 import type { SavedRecording } from "@shared/request-recording";
 import type { TFunction } from "i18next";
 import type React from "react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { api, type BufferMessageSummary, isAbortError } from "../../../lib/api";
 import { narratorWSManager } from "../../../lib/narrator-ws-manager";
 import { hasSendableComposerContent } from "../composer/composer-send-gate";
-import { getComposerAssetId } from "../composer/draft-image-attachments";
+import {
+	getComposerAssetId,
+	retainInterruptedDraftAttachments,
+} from "../composer/draft-image-attachments";
 import { editFileReferenceInput, trimFileReferenceInput } from "../composer/file-reference-input";
 import type { NarratorComposerHandle } from "../composer/NarratorComposer";
 import type { QueueMode } from "../composer/SendOptionsSplitButton";
@@ -78,16 +81,13 @@ interface NarratorLike {
 
 export interface UseNarratorSendOptions {
 	narratorId: string;
+	/** False for hidden dock tabs and workspace previews which unmount the composer. */
+	composerVisible?: boolean;
 	composerRef: React.RefObject<NarratorComposerHandle | null>;
 
 	// Attachments (owned by useComposerAttachments, shared with the composer).
 	attachedImages: File[];
 	attachedTextFiles: File[];
-	attachedImagesRef: React.RefObject<File[]>;
-	attachedTextFilesRef: React.RefObject<File[]>;
-	updateAttachedImages: (files: File[]) => void;
-	updateAttachedTextFiles: (files: File[]) => void;
-	hideAttachedFilesForSend: () => void;
 	clearAttachedFilesAndDraft: () => void;
 
 	// Shared send guard (also read by the composer's disabled state).
@@ -180,11 +180,6 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 		composerRef,
 		attachedImages,
 		attachedTextFiles,
-		attachedImagesRef,
-		attachedTextFilesRef,
-		updateAttachedImages,
-		updateAttachedTextFiles,
-		hideAttachedFilesForSend,
 		clearAttachedFilesAndDraft,
 		sendingRef,
 		setQueuedMessages,
@@ -211,16 +206,6 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 		t,
 	} = options;
 
-	const startModelTrace = useCallback(
-		async (command: string) => {
-			if (command.toLowerCase() !== "/modeltrace") throw new Error(t("modelTraceUsage"));
-			const result = await api.startModelTrace(narratorId);
-			if (onModelTraceStarted) onModelTraceStarted(result.id);
-			else navigateToNarrator(result.id);
-		},
-		[narratorId, onModelTraceStarted, navigateToNarrator, t],
-	);
-
 	const ingestingRef = options.ingestingRef;
 	const blockWhileIngesting = useCallback(() => {
 		if (options.attachmentsRestoreFailed) {
@@ -239,19 +224,73 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 	recordingSavedRef.current = options.onRequestRecordingSaved;
 	const [sendingState, setSendingState] = useState<NarratorSendingState | null>(null);
 	const isSending = sendingState !== null;
-	// AbortController for the in-flight send request; used by the cancel button.
+	// A scope is a particular mount/owner, not just an id: A -> B -> A must not
+	// make A's first request current again. It also isolates account switches.
+	const userId = currentUser?.id == null ? null : String(currentUser.id);
+	const composerVisible = options.composerVisible !== false;
+	const sendScope = useMemo(
+		() => ({ narratorId, userId, composerVisible }),
+		[narratorId, userId, composerVisible],
+	);
+	const currentSendScopeRef = useRef<typeof sendScope | null>(sendScope);
+	currentSendScopeRef.current = sendScope;
+	const isCurrentSendScope = useCallback(
+		() => currentSendScopeRef.current === sendScope,
+		[sendScope],
+	);
+	// AbortController for the in-flight send request; used by cancel and unmount.
 	const sendAbortRef = useRef<AbortController | null>(null);
+	const interruptedFilesRef = useRef<{ images: File[]; textFiles: File[] } | null>(null);
+	useLayoutEffect(() => {
+		currentSendScopeRef.current = sendScope;
+		setSendingState(null);
+		sendingRef.current = false;
+		return () => {
+			if (currentSendScopeRef.current === sendScope) currentSendScopeRef.current = null;
+			const controller = sendAbortRef.current;
+			const files = interruptedFilesRef.current;
+			if (controller && files && sendScope.userId) {
+				// IndexedDB intentionally excludes large files. Preserve the live Files
+				// before aborting, so returning to this narrator can recover them too.
+				retainInterruptedDraftAttachments(
+					sendScope.userId,
+					sendScope.narratorId,
+					files.images,
+					files.textFiles,
+				);
+			}
+			sendAbortRef.current = null;
+			interruptedFilesRef.current = null;
+			sendingRef.current = false;
+			controller?.abort();
+		};
+	}, [sendScope, sendingRef]);
 	// Throttle progress updates to whole-percent changes to avoid re-render storms.
 	const lastProgressPercentRef = useRef(-1);
-	const reportUploadProgress = useCallback((fraction: number) => {
-		const percent = Math.min(100, Math.max(0, Math.round(fraction * 100)));
-		if (percent === lastProgressPercentRef.current) return;
-		lastProgressPercentRef.current = percent;
-		setSendingState((prev) => (prev ? { ...prev, progress: fraction } : prev));
-	}, []);
+	const reportUploadProgress = useCallback(
+		(fraction: number) => {
+			if (!isCurrentSendScope() || sendAbortRef.current?.signal.aborted) return;
+			const percent = Math.min(100, Math.max(0, Math.round(fraction * 100)));
+			if (percent === lastProgressPercentRef.current) return;
+			lastProgressPercentRef.current = percent;
+			setSendingState((prev) => (prev ? { ...prev, progress: fraction } : prev));
+		},
+		[isCurrentSendScope],
+	);
 	const cancelSending = useCallback(() => {
 		sendAbortRef.current?.abort();
 	}, []);
+
+	const startModelTrace = useCallback(
+		async (command: string) => {
+			if (command.toLowerCase() !== "/modeltrace") throw new Error(t("modelTraceUsage"));
+			const result = await api.startModelTrace(narratorId);
+			if (!isCurrentSendScope()) return;
+			if (onModelTraceStarted) onModelTraceStarted(result.id);
+			else navigateToNarrator(result.id);
+		},
+		[narratorId, onModelTraceStarted, navigateToNarrator, t, isCurrentSendScope],
+	);
 
 	const applyBufferedSendResult = useCallback(
 		(
@@ -367,6 +406,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 				queueMode,
 				...(composerDocument ? [{ composerDocument }] : []),
 			);
+			if (!isCurrentSendScope()) return;
 			// Handle /load tool response — not a real message, just a tool load confirmation
 			if (result?.loaded) {
 				const toolName = result.toolName ?? "tool";
@@ -430,6 +470,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 		queueMode: QueueMode = interrupt ? "interrupt" : priority ? "tool" : "turn",
 		composerDocument?: ComposerDocument,
 		attachmentSnapshot?: { images: File[]; textFiles: File[] },
+		preserveComposerDraft = false,
 	): Promise<boolean> => {
 		if (interrupt) priority = true;
 		const draft = trimFileReferenceInput({
@@ -446,47 +487,36 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 		if (!files) throw new Error(t("composerMissingAssets"));
 		const images = files.images;
 		const textFiles = files.textFiles;
-		composerRef.current?.hideTextForSend();
-		hideAttachedFilesForSend();
-		try {
-			const result = await api.sendNarratorMessage(
-				narratorId,
-				msg,
-				images.length > 0 ? images : undefined,
-				textFiles.length > 0 ? textFiles : undefined,
-				priority,
-				reportUploadProgress,
-				signal,
-				fileReferences,
-				interrupt,
-				queueMode,
-				...(composerDocument ? [{ composerDocument }] : []),
-			);
-			const buffered = applyBufferedSendResult(
-				result,
-				msg,
-				images.length,
-				priority,
-				fileReferences,
-				queueMode,
-			);
+		const result = await api.sendNarratorMessage(
+			narratorId,
+			msg,
+			images.length > 0 ? images : undefined,
+			textFiles.length > 0 ? textFiles : undefined,
+			priority,
+			reportUploadProgress,
+			signal,
+			fileReferences,
+			interrupt,
+			queueMode,
+			...(composerDocument ? [{ composerDocument }] : []),
+		);
+		if (!isCurrentSendScope()) return false;
+		const buffered = applyBufferedSendResult(
+			result,
+			msg,
+			images.length,
+			priority,
+			fileReferences,
+			queueMode,
+		);
+		if (!preserveComposerDraft) {
+			composerRef.current?.hideTextForSend();
 			composerRef.current?.commitDraftAfterSend();
 			clearAttachedFilesAndDraft();
-			// Whether the message was buffered (202) or the backend fell through
-			// to a direct send (201), scroll so the new content is visible.
-			scrollToBottom(true);
-			return buffered;
-		} catch (err) {
-			// Restore text and its independently tracked file references together.
-			composerRef.current?.restoreInput(
-				msg,
-				fileReferences,
-				...(composerDocument ? [composerDocument] : []),
-			);
-			if (images.length > 0) updateAttachedImages(images);
-			if (textFiles.length > 0) updateAttachedTextFiles(textFiles);
-			throw err; // Re-throw to let caller handle
 		}
+		// Both buffered (202) and direct (201) sends expose accepted content.
+		scrollToBottom(true);
+		return buffered;
 	};
 
 	/**
@@ -520,7 +550,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 	 * narrator should not interrupt the current turn.
 	 */
 	const handleSendWithMode = async (mode: "turn" | "tool" | "interrupt") => {
-		if (blockWhileIngesting()) return;
+		if (!composerVisible || !isCurrentSendScope() || blockWhileIngesting()) return;
 		const composerText = composerRef.current?.getText() ?? "";
 		const liveDocument = composerRef.current?.getDocument?.();
 		const document = liveDocument ? parseComposerDocument(liveDocument) : undefined;
@@ -566,19 +596,13 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 		lastProgressPercentRef.current = -1;
 		const abortController = new AbortController();
 		sendAbortRef.current = abortController;
+		interruptedFilesRef.current = files;
 		// Only offer cancellation when there's an upload worth aborting.
 		setSendingState({
 			attachmentCount,
 			progress: attachmentCount > 0 ? 0 : null,
 			canCancel: attachmentCount > 0,
 		});
-		let restoreOnError: {
-			msg: string;
-			images: File[];
-			textFiles: File[];
-			fileReferences: FileReference[];
-			composerDocument?: ComposerDocument;
-		} | null = null;
 		try {
 			// This one-shot control never becomes parent model input, even while busy.
 			const modelTraceText = composerDocument
@@ -593,6 +617,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 				if (fileReferences.length) throw new Error(t("fileReferences.controlCommand"));
 				setSendingState({ attachmentCount: 0, progress: null, canCancel: false });
 				await startModelTrace(modelTraceText);
+				if (!isCurrentSendScope()) return;
 				// Never clear staged resources or a newer draft, including layout-only edits.
 				if (
 					composerRef.current?.getText() === composerText &&
@@ -629,6 +654,7 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 					narratorId,
 					AbortSignal.any([abortController.signal, AbortSignal.timeout(30_000)]),
 				);
+				if (!isCurrentSendScope()) return;
 				// Do not erase a newer draft typed while the save was pending. Preserve file
 				// reference tokens as well as staged images/text files for the next message.
 				if (composerRef.current?.getText() === composerText) {
@@ -686,9 +712,6 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 				const initialMessage = newMatch[1]?.trim() ?? "";
 				const images = files.images;
 				const textFiles = files.textFiles;
-				restoreOnError = { msg, images, textFiles, fileReferences, composerDocument };
-				composerRef.current?.hideTextForSend();
-				hideAttachedFilesForSend();
 
 				const currentCwd = fetchedNarrator?.cwd ?? narrator?.cwd ?? undefined;
 				const newNarrator = await createNarrator.mutateAsync({
@@ -711,6 +734,8 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 					cwd: currentCwd,
 				});
 
+				if (!isCurrentSendScope()) return;
+				abortController.signal.throwIfAborted();
 				if (initialMessage || images.length > 0 || textFiles.length > 0) {
 					const initialInput = editFileReferenceInput(
 						{ text: msg, fileReferences, composerDocument },
@@ -732,9 +757,10 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 					await api.sendNarratorMessage(...sendArgs);
 				}
 
+				if (!isCurrentSendScope()) return;
+				composerRef.current?.hideTextForSend();
 				composerRef.current?.commitDraftAfterSend();
 				clearAttachedFilesAndDraft();
-				restoreOnError = null;
 				navigateToNarrator(newNarrator.id);
 				return;
 			}
@@ -761,9 +787,6 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 			if (showCompactQueueChoice) {
 				const images = files.images;
 				const textFiles = files.textFiles;
-				restoreOnError = { msg, images, textFiles, fileReferences, composerDocument };
-				composerRef.current?.hideTextForSend();
-				hideAttachedFilesForSend();
 				await submitMessage(
 					msg,
 					images,
@@ -775,18 +798,16 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 					mode,
 					composerDocument,
 				);
+				if (!isCurrentSendScope()) return;
+				composerRef.current?.hideTextForSend();
 				composerRef.current?.commitDraftAfterSend();
 				clearAttachedFilesAndDraft();
-				restoreOnError = null;
 				return;
 			}
 			const images = files.images;
 			const textFiles = files.textFiles;
-			// Remember the draft so a cancelled upload can restore it — submitMessage
-			// clears the input/attachments up-front for the optimistic bubble.
-			restoreOnError = { msg, images, textFiles, fileReferences, composerDocument };
-			composerRef.current?.hideTextForSend();
-			hideAttachedFilesForSend();
+			// Keep the full draft during upload. In-flight draft-save/WS replies
+			// must never persist a temporary empty document as the recovery draft.
 			await submitMessage(
 				msg,
 				images,
@@ -798,22 +819,14 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 				mode,
 				composerDocument,
 			);
+			if (!isCurrentSendScope()) return;
+			composerRef.current?.hideTextForSend();
 			composerRef.current?.commitDraftAfterSend();
 			clearAttachedFilesAndDraft();
-			restoreOnError = null;
 		} catch (err) {
-			// Restore the drafted input/attachments so the user doesn't lose their
-			// message. `doSendBuffered` already restores internally on its own throw;
-			// this covers the `/new` and idle direct-send paths.
-			if (restoreOnError) {
-				composerRef.current?.restoreInput(
-					restoreOnError.msg,
-					restoreOnError.fileReferences,
-					...(restoreOnError.composerDocument ? [restoreOnError.composerDocument] : []),
-				);
-				if (restoreOnError.images.length > 0) updateAttachedImages(restoreOnError.images);
-				if (restoreOnError.textFiles.length > 0) updateAttachedTextFiles(restoreOnError.textFiles);
-			}
+			if (!isCurrentSendScope()) return;
+			// The original draft stays visible and persisted until acceptance. Do not
+			// restore an old snapshot over a newer remotely synchronized draft.
 			// A user-initiated cancel is not a failure — show a gentle notice, not an error.
 			if (isAbortError(err)) {
 				notifications.show({ message: t("sendCancelled"), color: "gray", autoClose: 2000 });
@@ -825,9 +838,13 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 				color: "red",
 			});
 		} finally {
-			sendingRef.current = false;
-			sendAbortRef.current = null;
-			setSendingState(null);
+			// A late completion must not unlock or clear the next owner's send.
+			if (isCurrentSendScope() && sendAbortRef.current === abortController) {
+				sendingRef.current = false;
+				sendAbortRef.current = null;
+				interruptedFilesRef.current = null;
+				setSendingState(null);
+			}
 		}
 	};
 
@@ -854,112 +871,64 @@ export function useNarratorSend(options: UseNarratorSendOptions): UseNarratorSen
 	 *
 	 * ONE implementation shared by both hosts that offer forwarding: the dock
 	 * bridge (`registerSubmitToNarrator`) and the mobile Drawer host's
-	 * `onForwardToNarrator` prop. They must not diverge — a host that skipped the
-	 * save/restore ritual below would send the user's in-progress draft and staged
-	 * attachments out with the forwarded text, then commit an empty draft to the
-	 * server.
+	 * `onForwardToNarrator` prop. An explicit empty attachment snapshot and the
+	 * preserve-draft flag keep both hosts independent of the operator's draft.
 	 */
-	// attachedImagesRef/attachedTextFilesRef are stable RefObjects from
-	// useComposerAttachments; their `.current` reads must not be deps.
 	// biome-ignore lint/correctness/useExhaustiveDependencies: stable refs from hook
 	const forwardTextToNarrator = useCallback(
 		(text: string) => {
-			if (blockWhileIngesting()) return;
+			if (!isCurrentSendScope() || blockWhileIngesting()) return;
 			const trimmed = text.trim();
-			if (!trimmed) return;
-			// Forwarded controls have the same immediate admission as composer controls,
-			// without ever replacing the operator's draft or staging attachments.
-			if (/^\/modeltrace(?:\s|$)/i.test(trimmed)) {
-				if (sendingRef.current) return;
-				sendingRef.current = true;
-				void startModelTrace(trimmed)
-					.catch((err: unknown) => {
-						notifications.show({
-							title: t("sendFailed"),
-							message: err instanceof Error ? err.message : String(err),
-							color: "red",
-						});
-					})
-					.finally(() => {
-						sendingRef.current = false;
-					});
-				return;
-			}
-			if (/^\/save_dump(?:\s|$)/i.test(trimmed)) {
-				if (sendingRef.current) return;
-				sendingRef.current = true;
-				void (async () => {
-					try {
+			if (!trimmed || sendingRef.current) return;
+			sendingRef.current = true;
+			const controller = new AbortController();
+			sendAbortRef.current = controller;
+			setSendingState({ attachmentCount: 0, progress: null, canCancel: false });
+			void (async () => {
+				try {
+					if (/^\/modeltrace(?:\s|$)/i.test(trimmed)) {
+						await startModelTrace(trimmed);
+						return;
+					}
+					if (/^\/save_dump(?:\s|$)/i.test(trimmed)) {
 						if (trimmed.toLowerCase() !== "/save_dump") throw new Error(t("saveDump.usage"));
 						const recording = await api.saveRequestRecording(
 							narratorId,
-							AbortSignal.timeout(30_000),
+							AbortSignal.any([controller.signal, AbortSignal.timeout(30_000)]),
 						);
-						recordingSavedRef.current?.(recording);
-					} catch (err) {
-						notifications.show({
-							title: t("saveDump.failed"),
-							message: err instanceof Error ? err.message : String(err),
-							color: "red",
-						});
-					} finally {
-						sendingRef.current = false;
+						if (isCurrentSendScope()) recordingSavedRef.current?.(recording);
+						return;
 					}
-				})();
-				return;
-			}
-			if (sendingRef.current) return;
-			sendingRef.current = true;
-			setSendingState({ attachmentCount: 0, progress: null, canCancel: false });
-			void (async () => {
-				const preservedDraft = composerRef.current?.getText() ?? "";
-				const preservedFileReferences = composerRef.current?.getFileReferences() ?? [];
-				const preservedDocument = composerRef.current?.getDocument?.();
-				const preservedImages = attachedImagesRef.current;
-				const preservedTextFiles = attachedTextFilesRef.current;
-				try {
-					// Forward-only send: no attachments, and the in-progress draft is put
-					// back afterwards so the operator does not lose what they were typing.
-					composerRef.current?.restoreInput(trimmed, []);
-					updateAttachedImages([]);
-					updateAttachedTextFiles([]);
+					// Forwarding is an independent message. Never temporarily replace the
+					// operator's input: an in-flight draft-save/WS reply can persist it.
 					await doSendBufferedRef.current(
 						trimmed,
 						false,
-						undefined,
+						controller.signal,
 						[],
 						undefined,
 						"turn",
 						undefined,
 						{ images: [], textFiles: [] },
+						true,
 					);
 				} catch (err) {
+					if (!isCurrentSendScope()) return;
 					notifications.show({
 						color: "red",
-						title: t("sendFailed", "Failed to send"),
-						message: err instanceof Error ? err.message : "",
+						title: t(/^\/save_dump(?:\s|$)/i.test(trimmed) ? "saveDump.failed" : "sendFailed"),
+						message: err instanceof Error ? err.message : String(err),
 					});
 				} finally {
-					composerRef.current?.restoreInput(
-						preservedDraft,
-						preservedFileReferences,
-						...(preservedDocument ? [preservedDocument] : []),
-					);
-					if (preservedImages.length > 0) updateAttachedImages(preservedImages);
-					if (preservedTextFiles.length > 0) updateAttachedTextFiles(preservedTextFiles);
-					sendingRef.current = false;
-					setSendingState(null);
+					if (isCurrentSendScope() && sendAbortRef.current === controller) {
+						sendingRef.current = false;
+						sendAbortRef.current = null;
+						setSendingState(null);
+					}
 				}
 			})();
 		},
-		[
-			narratorId,
-			t,
-			updateAttachedImages,
-			updateAttachedTextFiles,
-			blockWhileIngesting,
-			startModelTrace,
-		],
+		[narratorId, t, blockWhileIngesting, isCurrentSendScope, startModelTrace],
 	);
 
 	useEffect(() => {

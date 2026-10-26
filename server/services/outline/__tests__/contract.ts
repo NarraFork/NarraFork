@@ -114,7 +114,7 @@ function versionAt(versions: OutlineVersionRow[], seq: number): OutlineVersionRo
 // Invariant checks over a whole space
 // ─────────────────────────────────────────────────────────────────────────────
 
-function linkSet(links: Array<{ kind: string; targetKind: string; targetRef: string }>) {
+export function linkSet(links: Array<{ kind: string; targetKind: string; targetRef: string }>) {
 	return links
 		.map((l) => linkKey(l as Parameters<typeof linkKey>[0]))
 		.sort()
@@ -249,7 +249,7 @@ interface ModelBlock {
 	pending?: boolean;
 }
 
-interface SnapshotEntry {
+export interface SnapshotEntry {
 	parentId: string | null;
 	pageId: string;
 	index: number;
@@ -263,9 +263,13 @@ interface SnapshotEntry {
  * Random transactions against the store and an independent in-memory model of their meaning.
  * After every commit the live tree in the tables must equal the model; at the end, the tree
  * rebuilt from version rows for every seq (`from_seq <= s < to_seq`) must equal the model's
- * snapshot at that seq, open links included, and the space invariants must hold.
+ * snapshot at that seq, open links included, and the space invariants must hold. Returns the
+ * space and the model's snapshot at every commit seq, for checks built on the same history.
  */
-async function randomizedHistory(ctx: OutlineContractContext, seed: number): Promise<void> {
+export async function randomizedHistory(
+	ctx: OutlineContractContext,
+	seed: number,
+): Promise<{ space: OutlineSpaceRow; snapshots: Map<number, Map<string, SnapshotEntry>> }> {
 	const rnd = mulberry32(seed);
 	const pick = <T>(items: readonly T[]): T => items[Math.floor(rnd() * items.length)] as T;
 	const space = await personalSpace(ctx);
@@ -556,10 +560,11 @@ async function randomizedHistory(ctx: OutlineContractContext, seed: number): Pro
 	for (const [seq, snapshot] of snapshots) expect(treeAt(dump, seq)).toEqual(snapshot);
 	checkSpaceInvariants(dump);
 	checkChangeFlags(dump);
+	return { space, snapshots };
 }
 
 /** The live tree as of `seq`, rebuilt from version and link rows alone. */
-function treeAt(dump: SpaceDump, seq: number): Map<string, SnapshotEntry> {
+export function treeAt(dump: SpaceDump, seq: number): Map<string, SnapshotEntry> {
 	const live = new Map<string, OutlineVersionRow>();
 	const byBlock = new Map<string, OutlineVersionRow[]>();
 	for (const v of dump.versions) {
@@ -603,7 +608,7 @@ function treeAt(dump: SpaceDump, seq: number): Map<string, SnapshotEntry> {
 }
 
 /** Each version's flags describe exactly how it differs from the previous one. */
-function checkChangeFlags(dump: SpaceDump): void {
+export function checkChangeFlags(dump: SpaceDump): void {
 	const byBlock = new Map<string, OutlineVersionRow[]>();
 	for (const v of dump.versions) {
 		const list = byBlock.get(v.blockId);

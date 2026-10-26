@@ -49,6 +49,7 @@ import {
 	type OutlineStore,
 	type OutlineVersionRow,
 } from "./port";
+import { createPostgresOutlineReads } from "./postgres-read";
 
 /** Transaction handle as produced by `db.transaction(async (tx) => …)`. */
 type PgTransaction = Parameters<Parameters<BunSQLDatabase["transaction"]>[0]>[0];
@@ -288,6 +289,7 @@ async function ensureSpaceSection(
 export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 	return {
 		backendId: "postgres",
+		...createPostgresOutlineReads(db),
 
 		async ensureSpace(scope, now) {
 			for (let attempt = 0; attempt < SPACE_KEY_ATTEMPTS; attempt++) {
