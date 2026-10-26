@@ -1,4 +1,4 @@
-<!-- 由 prototypes/outline2/outline.py export 生成（第 455 个提交）。真相源是 data/log.jsonl，不要手改。 -->
+<!-- 由 prototypes/outline2/outline.py export 生成（第 459 个提交）。真相源是 data/log.jsonl，不要手改。 -->
 
 # 大纲总览（事实视图）
 
@@ -90,6 +90,14 @@
       - [p/LS6i6Fu0] D23i P0 编辑器原型补的两条方言规则，负责人 2026-10-26 确认
         - [p/u5U2HQRn] 序列化时处理中文标点紧贴强调。现象（原型已测出）：粗体、斜体的边缘是全角标点、外侧紧跟汉字时（`这是**重点：**内容`、`**「重点」**内容`），CommonMark 的左右侧规则解析不出来，12 种常见全角标点 12/12 失败，开头同理；所见即所得里用户加粗一段带标点的文字就会遇到，随机中英混排段落里约 30% 至少有一处。建议的做法：序列化后立即读回核对，把边缘的标点挪到标记外面（`这是**重点**：内容`，视觉几乎不变），还不行就去掉这段标记，保证文字不丢。三个解析器（micromark、marked@17、marked@18）上都要确认
         - [p/cON76l5Q] 裸网址后面紧跟 `[[…]]` 时补一个空格。现象（原型已测出）：GFM 的裸网址会把紧跟的 `[[…]]` 吞进网址，marked 和 remark-gfm 都这样；方言不认裸链接（网址就是文字），但只读渲染 `frontend/components/narrator/markdown/MarkdownContent.tsx`（remark-gfm）仍会自动链接，两边不一致。建议的做法：序列化时在网址和紧跟的 `[[` 之间补一个空格；另一条路是只读渲染也关掉裸链接
+      - [p/SO8rGupi] 方言已在产品代码里实现：`shared/outline/`（#256，2026-10-26 合并），浏览器和服务端共用，只依赖 marked。三个解析器（marked@18、marked@17、micromark + GFM）对序列化输出的读法一致，5 万个对抗性块体 0 分歧；为此序列化器多了五条转义规则
+        - [p/WisyUvF9] 行首空白写成 `&#32;`：marked 保留行首空白，CommonMark 去掉
+        - [p/c6Khl1nH] GFM 裸网址和邮箱会把后面的转义、分隔符和 `[[…]]` 吞进链接：提及前补空格，其余情况写成 `http\://`、`www\.`、`\@` 打断自动链接，文字不变
+        - [p/NAPgx9ya] `*` 闭合分隔符紧跟 `*` 开启分隔符时 marked 比 CommonMark 宽松：标记按覆盖范围嵌套，剩下的改用 `_` / `__`
+        - [p/wxkaO7vB] 提及后紧跟 `(` 要转义：不认识提及的解析器会把 `[[x]](y)` 读成链接
+        - [p/5oYNYT9y] 有链接时转义标签样的 `<`：链接文字里的 `<x` 配上 `<…>` 目标里的 `>` 会成行内 HTML
+        - [p/j0IAVzpX] 排序键用按长度前缀的分数索引（Greenspan）：字母表 `0-9A-Za-z` 按 ASCII 有序，JS、SQLite BINARY、PG `COLLATE "C"` 排序一致；追加 1 万次不超过 4 个字符。原型的取中点做法每追加约 5 次长一位，不用
+        - [p/l7Q2EzH5] 写入路径要限单块 16 KiB，大块或不可信输入的规范化放到主线程之外：marked 对配不上的 `**` 是平方级的，16 KiB 的块最坏要几秒
     - [p/IXQHBXMH] D24 SpecMarkdownEditor 丢内容：spec 文件源码优先、所见即所得可选；检测到保不住的语法就不让在所见即所得里保存；先在 Tiptap 3.27.1 上补表格，升级另开 PR；非 .md 文件和 `behavior_fence` 用纯文本；离线排查已被吞掉的记录。不等 spec:// 迁移和方言定稿，单独修（丢表格是数据丢失，要尽快修）；已确认（负责人 2026-10-26 全部采纳建议，提问 Q27–Q31）
       - [p/rtynSbRi] D24a spec 文件改成源码优先、所见即所得可选（像文件编辑器的 raw / split / preview）。理由：agent 读写 spec 靠精确字符串匹配（Edit 的 `old_string`），所见即所得一定会改写字节，`spec_vfs_service.ts` 存回去成了 `spec\_vfs\_service.ts`（[[p/RkPWKwO4]]），agent 再拿原文去 Edit 就对不上；而且加了扩展，HTML、脚注、front matter 等照样保不住（[[p/2DjLKIQU]]）。不用「继续以所见即所得为主，补上表格、任务列表、图片扩展，长期保留检测」
       - [p/nBX8s6p9] D24b 检测到编辑器保不住的语法（表格、HTML、图片、任务列表、脚注、front matter）时，不允许在所见即所得里保存（拦住 SpecPanel 的 `handleSave` 和 Ctrl/Cmd+S，或者 `setEditable(false)`），查看改用只读的 MarkdownContent 分支（能正确渲染表格，但现在走不到，见 [[p/1vWHUvmD]]），并默认进源码模式。检测用前端已打包的 marked 跑 lexer（[[p/gpV5F95o]]）。不用确认框：它最弱，用户很容易直接点过去；不用渲染比较当主检测（[[p/xerP7Zg6]]）
