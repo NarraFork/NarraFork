@@ -309,11 +309,15 @@ frontend/lib/api/outline.ts，frontend/hooks/useOutline*.ts，frontend/locales/{
 
 **量不过时的退路**：只给视口里的块做动画、降低导图的可见块上限。还不行就回来问负责人，比如先上只读导图。
 
+**结果**（2026-10-26）：8 项全部通过，数字和由此定下的做法见设计 §6.10「原型结果」和 `prototypes/outline-editor/RESULTS.md`。键位冲突已由负责人定：选中节点时 Enter 加同级、Tab 加子块、Shift+Enter 换行；Alt+方向键沿同级方向移动、沿层级方向聚焦。
+
 ### 10.3 并入产品
 
 - 布局算法放进 `shared/outline/layout/`；视图状态和动画放进 `frontend/components/outline/`。
 - 折叠和方向存进 `outline_view_state`。
-- 原型的验收脚本搬进产品重跑。
+- 原型的验收脚本搬进产品重跑；帧时间在有 GPU 的真机上复核。
+- 照原型的经验做：打开页时在 Worker 里预先测量节点尺寸；聚焦时保留整页的编辑视图、另建聚焦视图；隐藏的视图移出视口；一次切换分两帧。
+- 页实时会话（PR 8）开始时就给整页的块建 Y.Text：原型测出 Y.Text 没建时打字，重做会把字倒过来。
 
 ## 11. PR 拆分
 

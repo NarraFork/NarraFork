@@ -21,6 +21,7 @@ import {
 import type { Client, SelInfo } from "../client/client";
 import {
 	addChild,
+	addSiblingAfter,
 	addTopLevel,
 	caretIn,
 	type DropWhere,
@@ -733,6 +734,19 @@ export class MindMapView {
 		}
 	}
 
+	/** Enter：加下一个同级；视图的根没有同级，按 Tab 处理 */
+	cmdAddSibling(id: string) {
+		if (id === this.rootId) {
+			this.cmdAddChild(id);
+			return;
+		}
+		const nid = this.runCmd(id, (v) => addSiblingAfter(v));
+		if (nid) {
+			this.flush();
+			this.enterEdit(nid, "end");
+		}
+	}
+
 	private runTop(): string | null {
 		const v = this.host.outline;
 		const ok = addTopLevel(v)(v.pm.state, (tr) => v.pm.dispatch(tr));
@@ -923,10 +937,11 @@ export class MindMapView {
 				else this.cmdAddChild(id);
 				return;
 			case "Enter":
-				// 选中节点按 Enter 进入编辑（光标在末尾）；编辑中的 Enter 和大纲一样拆块 / 加下一个同级（同一条 splitBlock）
+				// 选中节点按 Enter 加下一个同级并进入它的编辑（负责人 2026-10-26）；进编辑用直接打字、F2 或双击。
+				// 编辑中的 Enter 和大纲一样拆块（光标在末尾就是加同级），Shift+Enter 块内换行
 				handled();
 				if (e.shiftKey) return;
-				this.enterEdit(id, "end");
+				this.cmdAddSibling(id);
 				return;
 			case "F2":
 				handled();

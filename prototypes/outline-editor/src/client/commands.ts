@@ -448,6 +448,20 @@ export function addChild(host: CmdHost): Command {
 	};
 }
 
+/** 导图里选中节点按 Enter：在当前块（连同子树）后面加一个同级空块，光标进新块。 */
+export function addSiblingAfter(host: CmdHost): Command {
+	return (state, dispatch) => {
+		const $ = state.selection.$from;
+		const d = blockDepth($);
+		if (d < 0) return false;
+		const at = $.before(d) + $.node(d).nodeSize;
+		const tr = state.tr.insert(at, newBlock(host));
+		tr.setSelection(TextSelection.create(tr.doc, at + 2));
+		dispatch?.(tr.scrollIntoView());
+		return true;
+	};
+}
+
 /** 在文档最后加一个顶层空块（导图里在页根上按 Tab）。 */
 export function addTopLevel(host: CmdHost): Command {
 	return (state, dispatch) => {

@@ -38,13 +38,17 @@ async function runScenario(it, kind) {
 			await kb.press("Escape");
 			await snap("Tab 加子块");
 			it.eq("map Esc 回到节点选择", await m.focusWhere(), "map-stage");
-			// 2 Enter 进入编辑，编辑中 Enter 加下一个同级
+			// 2 选中节点按 Enter 加下一个同级并进入编辑；Shift+Enter 块内换行；F2 进入编辑
 			await kb.press("Enter");
-			it.eq("map 选中节点按 Enter 进入编辑", await m.focusWhere(), "map-editor");
-			await kb.press("Enter");
+			it.eq("map 选中节点按 Enter 加同级并进入编辑", await m.focusWhere(), "map-editor");
 			await kb.type("子二");
+			await kb.press("Shift+Enter");
+			await kb.type("换行");
 			await kb.press("Escape");
 			await snap("Enter 加同级");
+			await kb.press("F2");
+			it.eq("map F2 进入编辑", await m.focusWhere(), "map-editor");
+			await kb.press("Escape");
 			// 3 Shift-Tab 提升一级
 			await kb.press("Shift+Tab");
 			await snap("Shift-Tab 提升");
@@ -111,6 +115,8 @@ async function runScenario(it, kind) {
 			await snap("Tab 加子块");
 			await kb.press("Enter");
 			await kb.type("子二");
+			await kb.press("Shift+Enter");
+			await kb.type("换行");
 			await snap("Enter 加同级");
 			await kb.press("Shift+Tab");
 			await snap("Shift-Tab 提升");
@@ -223,7 +229,7 @@ async function concurrent(it) {
 		await m.settle();
 		// Alice 在导图节点里打字，Bob 同时在大纲里改同一块（前面插字、把它下移）
 		await m.select("P1b3");
-		await kb.press("Enter");
+		await kb.press("F2");
 		await kb.type("甲甲");
 		await t.insertVia("B", "P1b3", 0, "乙乙");
 		await kb.type("丙");
@@ -260,7 +266,7 @@ async function concurrent(it) {
 		it.check("并发：新子块在 P1b3 下面", /- 乙乙第三块[^\n]*\n\s+- 新子块/.test(server), server);
 		// 导图里正在编辑的块被 Bob 删掉：编辑器退出，不报错
 		await m.select("P1b9");
-		await kb.press("Enter");
+		await kb.press("F2");
 		await kb.type("x");
 		await t.ev(() => window.proto.deleteBlock("B", "P1b9"));
 		await t.idle();

@@ -240,7 +240,7 @@ export async function run() {
 					true,
 				);
 			});
-			await t.page.keyboard.press("Enter");
+			await t.page.keyboard.press("F2");
 			// 只有不经输入法的字符有 keydown（中文用 insertText，量不到），所以用英文字母量延迟
 			await t.page.keyboard.type("abcdefghijklmnopqrstuvwxyz0123456789".repeat(2), { delay: 30 });
 			await sleep(100);

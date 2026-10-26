@@ -1,11 +1,10 @@
-<!-- 由 prototypes/outline2/outline.py export 生成（第 450 个提交）。真相源是 data/log.jsonl，不要手改。 -->
+<!-- 由 prototypes/outline2/outline.py export 生成（第 453 个提交）。真相源是 data/log.jsonl，不要手改。 -->
 
 # 任务看板
 
-### 进行中（4）
+### 进行中（3）
 - [p/H0a1nXuL] [/] 大纲系统路线图：建成知识、记忆与任务的统一平台
 - [p/DrYdFrth] [/] P-1 Python 原型与自用：先用原型承载这份计划，真实推进，从使用中发现问题 @agent:main ← 路线图
-- [p/EZKMMzR0] [/] PR1 导图与聚焦原型：在 prototypes/outline-editor 上加导图视图、切换动画、聚焦、快速切换，按实施计划 §10.2 验收 @agent:main ← P1a
 - [p/bFHA849C] [/] PR2 shared/outline：方言、markdown 大纲、地址、排序键，从原型移植，加三个解析器的一致性模糊测试 @agent:main ← P1a
 
 ### 待办（20）
@@ -28,9 +27,9 @@
 - [p/7KtDqc4v] [ ] PR6 agent 工具：OutlineRead、OutlineSearch、OutlineEdit，权限名单、界面卡片、截断豁免、知识注入点 B 排除 ‹等前置：PR4 读取与检索：读页,PR5 空间与权限：项目› ← P1a
 - [p/aSzIreyL] [ ] PR7 HTTP 路由、页订阅（只读）、前端只读页：空间列表、读页、时间轴、导航、i18n ‹等前置：PR4 读取与检索：读页,PR5 空间与权限：项目› ← P1a
 - [p/B4WqfZIX] [ ] PR8 页实时会话（单人）和大纲编辑器，P0 验收清单第 1、3、4、7、9 项在产品里重跑 ‹等前置：PR7 HTTP 路由、› ← P1a
-- [p/P1TNP03K] [ ] PR9 导图视图、聚焦、快速切换、每人每页的视图状态，原型验收在产品里重跑 ‹等前置：PR1 导图与聚焦原型：,PR8 页实时会话（单人› ← P1a
+- [p/P1TNP03K] [ ] PR9 导图视图、聚焦、快速切换、每人每页的视图状态，原型验收在产品里重跑 ‹等前置：PR8 页实时会话（单人› ← P1a
 
-### 完成（22）
+### 完成（23）
 - [p/ydKe7oMn] [x] P0 设计与验证 ← 路线图
 - [p/5nB0TYwk] [x] 核实：在 SpecMarkdownEditor 里编辑含表格的 spec 文件并保存，表格会不会丢；属实就给出修复方案（来自 Q6 调研的顺带发现 [[p/f3TO9Yre]]） @agent:w-table ← 现状spec
 - [p/uHnUVJL1] [x] 搭原型：块、链接、提交、时间机器、任务、两档计划、变更请求、断言与锚点 @agent:main ← P-1
@@ -53,4 +52,5 @@
 - [p/LxVmXH4D] [x] 清积压：四个整理 agent 把 12 个旧任务和刚回答的 37 条提问整理进事实树 @agent:main ← P-1
 - [p/1dPpT682] [x] 调研：spec 任务现在被谁用（续跑选任务、提醒注入、插件写入、受保护任务、计划模式），迁移成大纲任务时哪些行为要保留 @agent:w5 ← P2
 - [p/ji6fchWa] [x] 第五轮：原会话自己调研、边做边记、勾完成后接着整理（D15），再测找不找得到 @agent:main ← P-1
+- [p/EZKMMzR0] [x] PR1 导图与聚焦原型：在 prototypes/outline-editor 上加导图视图、切换动画、聚焦、快速切换，按实施计划 §10.2 验收 @agent:main ‹待整理› ← P1a
 
