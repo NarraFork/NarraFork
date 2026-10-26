@@ -122,7 +122,6 @@ export {
 	asyncQuestionDetailQuerySchema,
 	asyncQuestionListQuerySchema,
 	asyncQuestionSupplementSchema,
-	batchDeleteBlocksSchema,
 	browserInteractSchema,
 	bufferQueueModeSchema,
 	codexBrowserCallbackSchema,

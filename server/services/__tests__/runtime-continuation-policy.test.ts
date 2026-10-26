@@ -216,7 +216,7 @@ describe("A3 prompt projections do not classify control grants as roles", () => 
 		for (const locale of ["en", "zh-CN"] as const) {
 			const prompt = runtimeBasePrompt({ systemPrompt: "BASE" }, locale, policy);
 			expect(prompt).toContain("Await(agent)");
-			expect(prompt).toContain("await=true");
+			expect(prompt).not.toContain("await=true");
 			expect(prompt).toContain("AskUserQuestion");
 			expect(prompt).not.toContain("parent");
 		}

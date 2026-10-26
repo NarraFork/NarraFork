@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import type { NarratorMsg } from "../narrator-panel-types";
 import {
 	buildStreamingMsg,
@@ -10,11 +11,13 @@ import {
 
 describe("buildStreamingMsg request identity", () => {
 	test("carries actual identity without inferring it from tool chunks", () => {
-		const toolChunksMsg = {
-			contentJson: [{ type: "tool_use", id: "tool", name: "Read" }],
-			model: "unrelated-model",
-			provider: "unrelated-provider",
-		} as NarratorMsg;
+		const toolChunksMsg = rowWithElements(
+			{
+				model: "unrelated-model",
+				provider: "unrelated-provider",
+			},
+			[{ type: "tool_use", id: "tool", name: "Read" }],
+		) as NarratorMsg;
 		expect(
 			buildStreamingMsg({
 				narratorId: "n",
@@ -32,22 +35,26 @@ describe("buildStreamingMsg request identity", () => {
 describe("resolveAllToolCallsFromMsg", () => {
 	test("accepts numeric tcCreatedAt values", () => {
 		const createdAt = 1_700_000_000_000;
-		const msg = {
-			role: "assistant",
-			contentJson: [{ type: "tool_use", id: "tool-1", name: "Read", tcCreatedAt: createdAt }],
-			toolCalls: [],
-		} as unknown as NarratorMsg;
+		const msg = rowWithElements(
+			{
+				role: "assistant",
+				toolCalls: [],
+			},
+			[{ type: "tool_use", id: "tool-1", name: "Read", tcCreatedAt: createdAt }],
+		) as unknown as NarratorMsg;
 
 		expect(resolveAllToolCallsFromMsg(msg)[0]).toMatchObject({ createdAt, startedAt: createdAt });
 	});
 
 	test("accepts ISO tcCreatedAt values", () => {
 		const createdAt = "2023-11-14T22:13:20.000Z";
-		const msg = {
-			role: "assistant",
-			contentJson: [{ type: "tool_use", id: "tool-1", name: "Read", tcCreatedAt: createdAt }],
-			toolCalls: [],
-		} as unknown as NarratorMsg;
+		const msg = rowWithElements(
+			{
+				role: "assistant",
+				toolCalls: [],
+			},
+			[{ type: "tool_use", id: "tool-1", name: "Read", tcCreatedAt: createdAt }],
+		) as unknown as NarratorMsg;
 
 		expect(resolveAllToolCallsFromMsg(msg)[0]).toMatchObject({
 			createdAt,
@@ -56,12 +63,17 @@ describe("resolveAllToolCallsFromMsg", () => {
 	});
 
 	test("recognizes Send as a subagent card from _subagentActivity without children", () => {
-		const msg = {
-			id: "message-1",
-			narratorId: "narrator-1",
-			parentToolUseId: null,
-			role: "assistant",
-			contentJson: [
+		const msg = rowWithElements(
+			{
+				id: "message-1",
+				narratorId: "narrator-1",
+				parentToolUseId: null,
+				role: "assistant",
+				contentText: null,
+				toolCalls: [{ toolUseId: "send-1", toolName: "Send", status: "running" }],
+				createdAt: "2026-07-18T00:00:00.000Z",
+			},
+			[
 				{
 					type: "tool_use",
 					id: "send-1",
@@ -73,11 +85,7 @@ describe("resolveAllToolCallsFromMsg", () => {
 					},
 				},
 			],
-			contentText: null,
-			toolCalls: [{ toolUseId: "send-1", toolName: "Send", status: "running" }],
-			children: [],
-			createdAt: "2026-07-18T00:00:00.000Z",
-		} as NarratorMsg;
+		) as NarratorMsg;
 		const segments = segmentMessages([msg]);
 		expect(segments[0]).toMatchObject({
 			kind: "tool-run",
@@ -88,12 +96,24 @@ describe("resolveAllToolCallsFromMsg", () => {
 
 describe("segmentMessages", () => {
 	function toolMessage(messageId: string, toolUseId: string, reasoningText: string): NarratorMsg {
-		return {
-			id: messageId,
-			narratorId: "narrator-1",
-			parentToolUseId: null,
-			role: "assistant",
-			contentJson: [
+		return rowWithElements(
+			{
+				id: messageId,
+				narratorId: "narrator-1",
+				parentToolUseId: null,
+				role: "assistant",
+				contentText: null,
+				toolCalls: [
+					{
+						id: `call-${toolUseId}`,
+						toolUseId,
+						toolName: "Read",
+						status: "success",
+					},
+				],
+				createdAt: "2026-07-19T00:00:00.000Z",
+			},
+			[
 				{
 					type: "reasoning",
 					text: reasoningText,
@@ -104,18 +124,7 @@ describe("segmentMessages", () => {
 				},
 				{ type: "tool_use", id: toolUseId, name: "Read", input: { file_path: "a.ts" } },
 			],
-			contentText: null,
-			toolCalls: [
-				{
-					id: `call-${toolUseId}`,
-					toolUseId,
-					toolName: "Read",
-					status: "success",
-				},
-			],
-			children: [],
-			createdAt: "2026-07-19T00:00:00.000Z",
-		} as NarratorMsg;
+		) as NarratorMsg;
 	}
 
 	test("metadata-only empty reasoning does not split consecutive tool runs", () => {
@@ -147,47 +156,55 @@ describe("segmentMessages", () => {
 });
 
 describe("mergeStreamingSnapshotBlocks", () => {
+	const text = (id: string, revision: number, body: string, outputIndex = 0): StreamingBlock => ({
+		type: "text",
+		id,
+		revision,
+		textOffset: 0,
+		text: body,
+		outputIndex,
+	});
+
 	test("fills gaps from a snapshot into empty live blocks", () => {
 		const blocks: StreamingBlock[] = [];
-		const changed = mergeStreamingSnapshotBlocks(blocks, [
-			{ type: "text", text: "hello", outputIndex: 0 },
-		]);
+		const changed = mergeStreamingSnapshotBlocks(blocks, [text("t1", 1, "hello")]);
 		expect(changed).toBe(true);
-		expect(blocks).toEqual([{ type: "text", text: "hello", outputIndex: 0 }]);
+		expect(blocks).toEqual([text("t1", 1, "hello")]);
 	});
 
-	test("never truncates live text with a shorter/older snapshot", () => {
-		const blocks: StreamingBlock[] = [{ type: "text", text: "hello world", outputIndex: 0 }];
-		const changed = mergeStreamingSnapshotBlocks(blocks, [
-			{ type: "text", text: "hello", outputIndex: 0 },
-		]);
+	test("never replaces live text with an older revision", () => {
+		const blocks: StreamingBlock[] = [text("t1", 2, "hello world")];
+		const changed = mergeStreamingSnapshotBlocks(blocks, [text("t1", 1, "hello")]);
 		expect(changed).toBe(false);
-		expect(blocks[0]).toEqual({ type: "text", text: "hello world", outputIndex: 0 });
+		expect(blocks[0]).toEqual(text("t1", 2, "hello world"));
 	});
 
-	test("adopts a longer snapshot for the same text block", () => {
-		const blocks: StreamingBlock[] = [{ type: "text", text: "hel", outputIndex: 0 }];
-		const changed = mergeStreamingSnapshotBlocks(blocks, [
-			{ type: "text", text: "hello", outputIndex: 0 },
-		]);
+	test("adopts a newer revision of the same text block", () => {
+		const blocks: StreamingBlock[] = [text("t1", 1, "hel")];
+		const changed = mergeStreamingSnapshotBlocks(blocks, [text("t1", 2, "hello")]);
 		expect(changed).toBe(true);
-		expect(blocks[0]).toEqual({ type: "text", text: "hello", outputIndex: 0 });
+		expect(blocks[0]).toEqual(text("t1", 2, "hello"));
 	});
 
-	test("merges text snapshots without outputIndex instead of duplicating them", () => {
-		const blocks: StreamingBlock[] = [{ type: "text", text: "hello world" }];
-		const changed = mergeStreamingSnapshotBlocks(blocks, [{ type: "text", text: "hello" }]);
+	test("matches reasoning by id and keeps the newer revision", () => {
+		const reasoning = (revision: number, body: string): StreamingBlock => ({
+			type: "reasoning",
+			id: "r1",
+			revision,
+			textOffset: 0,
+			text: body,
+		});
+		const blocks: StreamingBlock[] = [reasoning(2, "abcd")];
+		const changed = mergeStreamingSnapshotBlocks(blocks, [reasoning(1, "ab")]);
 		expect(changed).toBe(false);
-		expect(blocks).toEqual([{ type: "text", text: "hello world" }]);
+		expect(blocks[0]).toEqual(reasoning(2, "abcd"));
 	});
 
-	test("matches reasoning by id and keeps the longer text", () => {
-		const blocks: StreamingBlock[] = [{ type: "reasoning", id: "r1", text: "abcd" }];
-		const changed = mergeStreamingSnapshotBlocks(blocks, [
-			{ type: "reasoning", id: "r1", text: "ab" },
-		]);
-		expect(changed).toBe(false);
-		expect(blocks[0]).toEqual({ type: "reasoning", id: "r1", text: "abcd" });
+	test("ignores a text lane that does not name its element and revision", () => {
+		const blocks: StreamingBlock[] = [];
+		const unnamed = { type: "text", text: "hello", outputIndex: 0 } as unknown as StreamingBlock;
+		expect(mergeStreamingSnapshotBlocks(blocks, [unnamed])).toBe(false);
+		expect(blocks).toEqual([]);
 	});
 
 	test("refreshes web_search status from the snapshot", () => {
@@ -207,8 +224,8 @@ describe("mergeStreamingSnapshotBlocks", () => {
 	});
 
 	test("keeps blocks ordered by output index when inserting", () => {
-		const blocks: StreamingBlock[] = [{ type: "text", text: "second", outputIndex: 2 }];
-		mergeStreamingSnapshotBlocks(blocks, [{ type: "text", text: "first", outputIndex: 1 }]);
+		const blocks: StreamingBlock[] = [text("t2", 1, "second", 2)];
+		mergeStreamingSnapshotBlocks(blocks, [text("t1", 1, "first", 1)]);
 		expect(blocks.map((b) => (b.type === "text" ? b.text : ""))).toEqual(["first", "second"]);
 	});
 });

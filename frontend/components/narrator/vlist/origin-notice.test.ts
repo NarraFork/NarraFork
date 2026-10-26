@@ -11,7 +11,16 @@
 
 import { beforeAll, describe, expect, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
-import { type AdapterContext, adaptSegment } from "@shared/pretext-layout/segment-adapter";
+import {
+	type MessageBodySource,
+	messageBody,
+	rowWithElements,
+} from "@shared/narrator-blocks/message-blocks";
+import {
+	type AdapterContentBlock,
+	type AdapterContext,
+	adaptSegment,
+} from "@shared/pretext-layout/segment-adapter";
 import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { measureMessageBubble } from "./measure/measure-message-bubble";
@@ -33,16 +42,22 @@ const WIDTH = 600;
 /** Full detail level, matching segment-adapter.test.ts. */
 const CTX: AdapterContext = { lod: 5 };
 
+/** A user row; a body in `extra` is split again as this row's, as the server would. */
 function userMessage(extra: Record<string, unknown>) {
+	const { blocks, ...rest } = extra as Record<string, unknown> & MessageBodySource;
 	return {
 		kind: "message" as const,
-		msg: {
-			id: "m1",
-			role: "user",
-			contentJson: [{ type: "text", text: "continue the task" }],
-			createdAt: "2026-07-28T10:00:00.000Z",
-			...extra,
-		},
+		msg: rowWithElements(
+			{
+				id: "m1",
+				role: "user",
+				createdAt: "2026-07-28T10:00:00.000Z",
+				...rest,
+			},
+			(blocks
+				? messageBody({ blocks })
+				: [{ type: "text", text: "continue the task" }]) as AdapterContentBlock[],
+		),
 	};
 }
 
@@ -59,14 +74,18 @@ describe("structured async question answer projection", () => {
 		items: [{ id: "choice", header: "Which option?", answer: "A" }],
 	};
 	test("human receipts are compact, preserve question identity, and never measure full model text", () => {
-		const specs = adapt({
-			narratorId: "owner",
-			origin: "user",
-			contentJson: [
-				{ type: "text", text: "Model receipt ".repeat(10000) },
-				{ type: "system_injection", source: "async_question_answer", body },
-			],
-		});
+		const specs = adapt(
+			rowWithElements(
+				{
+					narratorId: "owner",
+					origin: "user",
+				},
+				[
+					{ type: "text", text: "Model receipt ".repeat(10000) },
+					{ type: "system_injection", source: "async_question_answer", body },
+				],
+			),
+		);
 		expect(specs).toHaveLength(1);
 		expect((specs[0]?.data as { questionSnapshot?: unknown }).questionSnapshot).toBe(body);
 		expect(specs[0]?.data).toMatchObject({
@@ -77,21 +96,25 @@ describe("structured async question answer projection", () => {
 		});
 		const measured = measureSystemTextCard("origin_notice", specs[0]?.data as never, WIDTH);
 		expect(measured.height).toBe(systemTextChromeHeight("origin_notice") + c.BODY_LINE_HEIGHT);
-		const largerSnapshot = adapt({
-			narratorId: "owner",
-			origin: "user",
-			contentJson: [
+		const largerSnapshot = adapt(
+			rowWithElements(
 				{
-					type: "system_injection",
-					source: "async_question_answer",
-					body: {
-						...body,
-						context: "historical context ".repeat(50),
-						items: [{ ...body.items[0], answer: "historical answer ".repeat(800) }],
-					},
+					narratorId: "owner",
+					origin: "user",
 				},
-			],
-		});
+				[
+					{
+						type: "system_injection",
+						source: "async_question_answer",
+						body: {
+							...body,
+							context: "historical context ".repeat(50),
+							items: [{ ...body.items[0], answer: "historical answer ".repeat(800) }],
+						},
+					},
+				],
+			),
+		);
 		expect(
 			measureSystemTextCard("origin_notice", largerSnapshot[0]?.data as never, WIDTH).height,
 		).toBe(measured.height);
@@ -112,30 +135,38 @@ describe("structured async question answer projection", () => {
 		expect(rendered).not.toContain("Old context");
 	});
 	test("supplements use the same compact geometry and legacy bodies retain their verbatim fallback", () => {
-		const supplemental = adapt({
-			narratorId: "owner",
-			origin: "user",
-			contentJson: [
+		const supplemental = adapt(
+			rowWithElements(
 				{
-					type: "system_injection",
-					source: "async_question_answer",
-					body: { ...body, supplement: "Correction ".repeat(10000) },
+					narratorId: "owner",
+					origin: "user",
 				},
-			],
-		});
+				[
+					{
+						type: "system_injection",
+						source: "async_question_answer",
+						body: { ...body, supplement: "Correction ".repeat(10000) },
+					},
+				],
+			),
+		);
 		expect(supplemental[0]?.data).toMatchObject({ origin: "user", text: "Which option?" });
 		expect((supplemental[0]?.data as { title: string }).title).toContain("Supplemented");
-		const legacy = adapt({
-			origin: "user",
-			contentJson: [
-				{ type: "text", text: "Legacy complete receipt" },
+		const legacy = adapt(
+			rowWithElements(
 				{
-					type: "system_injection",
-					source: "async_question_answer",
-					body: { kind: "asyncQuestionAnswers", outcome: "answered", items: body.items },
+					origin: "user",
 				},
-			],
-		});
+				[
+					{ type: "text", text: "Legacy complete receipt" },
+					{
+						type: "system_injection",
+						source: "async_question_answer",
+						body: { kind: "asyncQuestionAnswers", outcome: "answered", items: body.items },
+					},
+				],
+			),
+		);
 		expect(legacy[0]?.kind).toBe("message-bubble");
 		expect(legacy[0]?.data).toMatchObject({ text: "Legacy complete receipt" });
 	});

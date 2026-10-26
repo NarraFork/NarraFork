@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { buildPretextLayoutIndex, type PretextLayoutManifest } from "@shared/pretext-layout";
 import { NarratorWSManager } from "../../../lib/narrator-ws-manager";
 import { shellModule, shellSource } from "./guard-source";
@@ -173,25 +174,36 @@ describe("PretextExactMessageList", () => {
 		// These markers get the in-place treatment (append at the tail, insert
 		// mid-window, live-patch on the status flip) instead of the deferred reload.
 		expect(
-			isCompactMarkerMessage({
-				contentJson: [{ type: "compact", status: "compacting" }],
-			} as never),
+			isCompactMarkerMessage(
+				rowWithElements({}, [{ type: "compact", status: "compacting" }]) as never,
+			),
 		).toBe(true);
 		expect(
-			isCompactMarkerMessage({
-				contentJson: [{ type: "segment_compact", status: "compacted" }],
-			} as never),
+			isCompactMarkerMessage(
+				rowWithElements({}, [{ type: "segment_compact", status: "compacted" }]) as never,
+			),
 		).toBe(true);
 		// Ordinary messages and the OTHER structural inserts must not take that path.
-		expect(isCompactMarkerMessage({ contentJson: [{ type: "text" }] } as never)).toBe(false);
-		expect(isCompactMarkerMessage({ contentJson: [{ type: "ask_in_passing" }] } as never)).toBe(
+		expect(isCompactMarkerMessage(rowWithElements({}, [{ type: "text" }]) as never)).toBe(false);
+		expect(isCompactMarkerMessage(rowWithElements({}, [{ type: "ask_in_passing" }]) as never)).toBe(
 			false,
 		);
-		expect(isCompactMarkerMessage({ contentJson: [{ type: "context_cleared" }] } as never)).toBe(
-			false,
-		);
+		expect(
+			isCompactMarkerMessage(rowWithElements({}, [{ type: "context_cleared" }]) as never),
+		).toBe(false);
 		expect(isCompactMarkerMessage(undefined)).toBe(false);
-		expect(isCompactMarkerMessage({ contentJson: null } as never)).toBe(false);
+		expect(isCompactMarkerMessage({ blocks: null } as never)).toBe(false);
+	});
+
+	it("keeps a subagent's dual-broadcast row out of this document's revision count", () => {
+		// The parent page receives a subagent row tagged with `parentToolUseId`
+		// (`isForeignSubagentRow`), and it is not a row of THIS document. Counting it as a
+		// structural change left the applied revision behind with nothing to apply — and
+		// that gap is exactly the unread count the scroll-to-bottom badge renders, so a
+		// subagent running beside the parent inflated a badge scrolling could never clear.
+		// Both realtime entry points must decline it, or one path silently keeps counting.
+		const source = shellModule("PretextExactMessageList.tsx");
+		expect(source.match(/isForeignSubagentRow\(message, !!isSubagent\)/g)?.length).toBe(2);
 	});
 
 	it("prefers the synchronous live scroll view when capturing a rebuild anchor", () => {

@@ -20,6 +20,7 @@
  */
 
 import { describe, expect, it } from "bun:test";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { traceRowFoldChannel } from "./vlist-interaction-state";
 
 /** The kinds bound to the trace row toggle in PretextExactMessageList. */
@@ -46,20 +47,21 @@ describe("traceRowFoldChannel", () => {
 });
 
 /** A reasoning message whose text parses into two step rows. */
-const reasoningMessage = {
-	id: "m1",
-	model: "gpt-5.6",
-	seq: 1,
-	role: "assistant",
-	contentJson: [{ type: "reasoning", text: "**A**\n\nfirst body\n\n**B**\n\nsecond body" }],
-	toolCalls: [],
-	children: [],
-};
+const reasoningMessage = rowWithElements(
+	{
+		id: "m1",
+		model: "gpt-5.6",
+		seq: 1,
+		role: "assistant",
+		toolCalls: [],
+	},
+	[{ type: "reasoning", text: "**A**\n\nfirst body\n\n**B**\n\nsecond body" }],
+);
 
 /** A finished tool call, the row an `activity-trace` folds. */
 const toolItem = {
 	kind: "tool" as const,
-	msg: { id: "m3", seq: 3, role: "assistant", contentJson: [], toolCalls: [], children: [] },
+	msg: rowWithElements({ id: "m3", seq: 3, role: "assistant", toolCalls: [] }, []),
 	blockIndex: 0,
 	tc: {
 		toolUseId: "tu-1",

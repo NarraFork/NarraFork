@@ -139,15 +139,19 @@ const testProvider: ProviderAdapter = {
 			return;
 		}
 		if (scenario === "await_send_not_eager") {
-			// An Agent-like tool then Await + Send. We only assert that Await/Send do not
-			// execute eagerly during streaming (their execute() must not run before the
-			// post-stream tool phase, which never arrives because we abort mid-stream).
+			// Await + Send execute while the response is still streaming: the provider only
+			// produces its trailing text (where the test aborts) once both have started, so
+			// the post-stream tool phase never runs.
 			yield {
 				toolUses: [
 					{ toolUseId: "tu_await", name: "Await", input: { type: "bash", id: "x" } },
 					{ toolUseId: "tu_send", name: "Send", input: { id: "y", message: "hi" } },
 				],
 			};
+			while (!executionOrder.includes("Await") || !executionOrder.includes("Send")) {
+				if (params.signal.aborted) throw new Error("Aborted");
+				await new Promise((resolve) => setTimeout(resolve, 1));
+			}
 			yield { text: "trailing text so we can abort mid-stream" };
 			while (!params.signal.aborted) {
 				await new Promise((resolve) => setTimeout(resolve, 1));
@@ -395,7 +399,7 @@ describe("agent loop tool-result settlement", () => {
 		expect(events.some((e) => e.type === "turn_complete")).toBe(true);
 	});
 
-	test("Await and Send are not eager-executed mid-stream", async () => {
+	test("Await and Send execute mid-stream", async () => {
 		scenario = "await_send_not_eager";
 		providerAttempts = 0;
 		executionOrder.length = 0;
@@ -411,10 +415,10 @@ describe("agent loop tool-result settlement", () => {
 			}
 		}
 
-		// Aborting mid-stream means the post-stream tool phase never runs. Because Await/Send
-		// are eager-disabled, their execute() must not have started during streaming.
-		expect(executionOrder).not.toContain("Await");
-		expect(executionOrder).not.toContain("Send");
+		// Aborting mid-stream means the post-stream tool phase never runs: both calls ran
+		// while the provider was still streaming.
+		expect(executionOrder).toContain("Await");
+		expect(executionOrder).toContain("Send");
 		expect(events.at(-1)).toEqual({ type: "error", message: "Aborted" });
 	});
 });

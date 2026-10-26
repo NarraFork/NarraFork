@@ -193,7 +193,7 @@ describe("block FTS index", () => {
 		expect(blockHits(sqlite, "needle")).toEqual(["b1"]);
 	});
 
-	test("a healthy index survives an unclean-shutdown probe", () => {
+	test("an unclean shutdown leaves the index alone; a background finding empties it", () => {
 		const sqlite = fixture();
 		ensureFts(sqlite, { wasClean: true });
 		sqlite.exec(`
@@ -201,7 +201,14 @@ describe("block FTS index", () => {
 			INSERT INTO narrator_blocks (id, message_id) VALUES ('b1', 'm1');
 		`);
 		replaceBlockIndexText(sqlite, "b1", "durable needle");
-		ensureFts(sqlite, { wasClean: false });
+		expect(ensureFts(sqlite, { wasClean: false }).rebuilt).toBe(false);
+		expect(blockHits(sqlite, "needle")).toEqual(["b1"]);
+		// Its text comes from the store, so a corrupt index is recreated empty for the reindex.
+		expect(
+			ensureFts(sqlite, { wasClean: true, repairFtsTables: ["narrator_blocks_fts"] }).rebuilt,
+		).toBe(true);
+		expect(blockHits(sqlite, "needle")).toEqual([]);
+		replaceBlockIndexText(sqlite, "b1", "fresh needle");
 		expect(blockHits(sqlite, "needle")).toEqual(["b1"]);
 	});
 });

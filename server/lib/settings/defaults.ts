@@ -127,7 +127,6 @@ export const DEFAULTS: NarraForkSettings = {
 	narratorBlocks: {
 		write: true,
 		read: true,
-		wsV2: true,
 		compactJson: false,
 	},
 	editor: {
@@ -783,11 +782,6 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	},
 	"narratorBlocks.read": {
 		desc: "读取方（模型历史、消息页、External API、导出）是否从块表读取块格式消息的正文。关闭后全部回到读取 content_json，与块表并存期间两者内容一致。默认 true。",
-		type: "boolean",
-		valid: "true / false，默认 true",
-	},
-	"narratorBlocks.wsV2": {
-		desc: "是否接受以块为单位的消息协议 v2（页面接口返回信封 + 块，WS 推送块级事件）。只有声明支持 v2 的客户端会收到 v2；关闭时所有连接都使用 v1，前端照常工作（回退开关）。默认 true。",
 		type: "boolean",
 		valid: "true / false，默认 true",
 	},

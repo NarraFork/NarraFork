@@ -1,9 +1,9 @@
-/** Shared, bounded raw text/reasoning accumulation. Content ids identify lanes;
- * outputIndex only orders them. Legacy frames retain their coordinate fallback. */
+/** Shared, bounded raw text/reasoning accumulation. Every delta names its element (the
+ * lane), the element's revision and the raw characters before it; outputIndex only
+ * orders lanes. */
 import { normalizeFileReferenceContext } from "@shared/file-reference-context";
 import {
 	findStreamingInsertIndex,
-	getStreamingBlockOutputIndex,
 	mergeStreamingSnapshotBlocks,
 	type StreamingBlock,
 } from "../message/message-segments";
@@ -53,40 +53,30 @@ export function applyStreamingDelta(
 	const id = typeof delta.id === "string" && delta.id ? delta.id : undefined;
 	const revision = nonNegativeInteger(delta.revision);
 	const textOffset = nonNegativeInteger(delta.textOffset);
+	// The server names every delta's element, revision and raw offset.
+	if (!id || revision == null || textOffset == null) return NOT_APPLIED;
 	const outputIndex = nonNegativeInteger(
 		type === "text"
 			? (event.outputIndex ?? delta.outputIndex)
 			: (delta.outputIndex ?? event.outputIndex),
 	);
-	const index = blocks.findIndex((block) => {
-		if (block.type !== type) return false;
-		if (id) return block.id === id;
-		if (block.id) return false;
-		return getStreamingBlockOutputIndex(block) === outputIndex;
-	});
+	const index = blocks.findIndex((block) => block.type === type && block.id === id);
 	if (index !== -1) {
 		const block = blocks[index];
 		if (block.type !== "text" && block.type !== "reasoning") return NOT_APPLIED;
-		if (revision != null && block.revision != null && revision <= block.revision)
-			return NOT_APPLIED;
-		if (textOffset != null && block.textOffset != null) {
-			const end = block.textOffset + block.text.length;
-			if (textOffset >= block.textOffset && textOffset <= end) {
-				const added = delta.text.slice(Math.max(0, end - textOffset));
-				block.text = appendStreamingTextPreview(block.text, added);
-				block.textOffset = Math.max(end, textOffset + delta.text.length) - block.text.length;
-			} else {
-				// Missing raw baseline on reconnect. The snapshot joins these raw windows;
-				// never manufacture a prefix from a cleaned committed display body.
-				block.text = appendStreamingTextPreview("", delta.text);
-				block.textOffset = textOffset + delta.text.length - block.text.length;
-			}
+		if (revision <= block.revision) return NOT_APPLIED;
+		const end = block.textOffset + block.text.length;
+		if (textOffset >= block.textOffset && textOffset <= end) {
+			const added = delta.text.slice(Math.max(0, end - textOffset));
+			block.text = appendStreamingTextPreview(block.text, added);
+			block.textOffset = Math.max(end, textOffset + delta.text.length) - block.text.length;
 		} else {
-			block.text = appendStreamingTextPreview(block.text, delta.text);
-			if (textOffset != null)
-				block.textOffset = Math.max(0, textOffset + delta.text.length - block.text.length);
+			// Missing raw baseline on reconnect. The snapshot joins these raw windows;
+			// never manufacture a prefix from a cleaned committed display body.
+			block.text = appendStreamingTextPreview("", delta.text);
+			block.textOffset = textOffset + delta.text.length - block.text.length;
 		}
-		if (revision != null) block.revision = revision;
+		block.revision = revision;
 		return { applied: true, blockIndex: index };
 	}
 	const insertAt = findStreamingInsertIndex(blocks, outputIndex);
@@ -94,9 +84,9 @@ export function applyStreamingDelta(
 	blocks.splice(insertAt, 0, {
 		type,
 		text,
-		...(id ? { id } : {}),
-		...(revision != null ? { revision } : {}),
-		...(textOffset != null ? { textOffset: textOffset + delta.text.length - text.length } : {}),
+		id,
+		revision,
+		textOffset: textOffset + delta.text.length - text.length,
 		...(outputIndex != null ? { outputIndex } : {}),
 		...(type === "text" && event.fileReferenceContext !== undefined
 			? { fileReferenceContext: normalizeFileReferenceContext(event.fileReferenceContext) }

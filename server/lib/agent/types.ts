@@ -114,6 +114,11 @@ export interface ToolContext {
 	narratorId: string;
 	cwd: string;
 	signal: AbortSignal;
+	/**
+	 * Fires when the user queues guidance for this pass. Ordinary tools ignore it and run
+	 * to completion; only a pure wait (Await) ends early so the guidance is read sooner.
+	 */
+	guidanceSignal?: AbortSignal;
 	/** Provider prefix of the session driving this tool call (e.g. "anthropic"). */
 	provider?: string;
 	/** Model ID of the session driving this tool call (may carry a provider prefix). */
@@ -136,6 +141,8 @@ export interface ToolContext {
 	blockedSkills?: { all: boolean; names: string[] } | null;
 	/** Server-resolved capability ceiling, copied from AgentConfig, never tool input. */
 	runtimePolicy?: RuntimePolicy;
+	/** Copied from `AgentConfig.bot`: a bot's own loop stays free for the conversation. */
+	bot?: boolean;
 	/** Parent narrator ID — set for subagents, used for Team file-change tracking */
 	parentNarratorId?: string;
 	/**
@@ -439,11 +446,14 @@ export type AgentEvent =
 			type: "stream_text";
 			text: string;
 			outputIndex?: number;
-			/** Attempt-scoped identity and revision shared with persisted content. */
-			blockId?: string;
-			blockRevision?: number;
+			/**
+			 * Attempt-scoped identity and revision shared with persisted content: every delta
+			 * names its element, so clients match it to its block (protocol v2).
+			 */
+			blockId: string;
+			blockRevision: number;
 			/** Raw text characters preceding this delta (metadata may also advance revision). */
-			blockTextOffset?: number;
+			blockTextOffset: number;
 	  }
 	| {
 			type: "tool_call";
@@ -715,10 +725,11 @@ export type AgentEvent =
 			text: string;
 			providerMetadata?: ReasoningProviderMetadata;
 			outputIndex?: number;
-			blockId?: string;
-			blockRevision?: number;
+			/** As on `stream_text`: the element this delta extends. */
+			blockId: string;
+			blockRevision: number;
 			/** Raw text characters preceding this delta (metadata may also advance revision). */
-			blockTextOffset?: number;
+			blockTextOffset: number;
 	  }
 	| {
 			type: "context_usage";
@@ -1304,12 +1315,20 @@ export interface AgentConfig {
 	 */
 	getModelOverride?: () => string | null;
 	/**
-	 * Called after each serial tool or complete parallel-safe group. If true,
-	 * the loop exits gracefully and marks later tool calls in the turn as skipped.
+	 * Host-side stop (plan approved, workspace invalidated, reflection decided). Checked
+	 * after each serial tool or complete parallel-safe group. If true, the loop exits
+	 * gracefully and marks later tool calls in the turn as skipped.
 	 */
 	shouldStop?: () => boolean;
-	/** Event-driven immediate guidance: cancel the provider and unstarted preparation,
-	 * but drain actual running tools. Supply a fresh signal for each loop invocation. */
+	/**
+	 * Queued user input wants the model's attention. Never skips a tool call: every call
+	 * the response produced still runs, and the loop ends the turn once the step's tools
+	 * have settled instead of sending the next provider request. One-shot like shouldStop.
+	 */
+	shouldYieldToInput?: () => boolean;
+	/** Event-driven immediate guidance: cut the provider response at the next tool-call
+	 * boundary and end the turn after its tools ran. Only Await stops waiting early.
+	 * Supply a fresh signal for each loop invocation. */
 	guidanceSignal?: AbortSignal;
 	/** Urgent guidance: cancel provider and tool IO, then persist results and soft-stop.
 	 * Unlike signal, this does not mark the whole narrator run as user-interrupted. */

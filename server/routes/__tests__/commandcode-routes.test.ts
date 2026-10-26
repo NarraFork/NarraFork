@@ -4,7 +4,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Hono } from "hono";
 import { AppError } from "../../lib/errors";
-import { invalidateUserCache } from "../../middleware/auth";
 import type { AuthSessionStore } from "../../services/auth/session-store";
 import { authMfaStore, authSessionStore, setAuthStores } from "../../services/auth/store";
 
@@ -37,8 +36,6 @@ beforeEach(() => {
 });
 afterEach(() => {
 	setAuthStores(undefined);
-	invalidateUserCache("admin-id");
-	invalidateUserCache("user-id");
 });
 
 function appForRole(role: "admin" | "user") {

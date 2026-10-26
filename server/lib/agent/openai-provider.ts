@@ -895,6 +895,7 @@ export class OpenAIProvider implements ProviderAdapter {
 			});
 
 			params.onRequestStart?.();
+			params.streamProgress?.beginAttempt();
 			const response = await this.pfetch(endpoint, {
 				method: "POST",
 				headers: requestHeaders,
@@ -914,6 +915,7 @@ export class OpenAIProvider implements ProviderAdapter {
 				turnState = response.headers.get("x-codex-turn-state");
 			}
 
+			params.streamProgress?.onHeaders(response.status);
 			params.requestDump?.setResponseMeta({
 				status: response.status,
 				headers: sanitizeHeaders(response.headers),
@@ -928,7 +930,11 @@ export class OpenAIProvider implements ProviderAdapter {
 				if (attempt === 0 && stripUnsupportedParameter(body, params.model, error)) continue;
 				throw error;
 			}
-			const capture = captureResponseStream(response.body, params.requestDump);
+			const capture = captureResponseStream(
+				response.body,
+				params.requestDump,
+				params.streamProgress,
+			);
 			let yieldedEvent = false;
 			try {
 				if (!response.ok) {

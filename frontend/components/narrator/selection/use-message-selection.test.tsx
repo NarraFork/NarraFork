@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { notifications } from "@mantine/notifications";
 import type { FileChangeRevertApplyResponse } from "@shared/file-change-protocol";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { NodeFilter, parseHTML } from "linkedom";
 import { act, memo, StrictMode, useContext, useEffect } from "react";
@@ -115,7 +116,11 @@ beforeEach(() => {
 		// This test exercises selection, not layout; no shared HTMLElement geometry stubs.
 		viewportRef: { current: null },
 		chunkListRef: {
-			current: { detachFromBottom: mock(() => {}), refreshStructure: mock(() => {}) },
+			current: {
+				detachFromBottom: mock(() => {}),
+				refreshStructure: mock(() => {}),
+				messageOf: (id: string) => namedRow(id),
+			},
 		},
 		navigate: mock(async () => {}),
 		t: (key) => key,
@@ -180,14 +185,15 @@ async function clickToggle() {
 function indexedResolver(ids: string[], prefix = "index"): MessageSelectionResolver {
 	const messages = ids.map(
 		(id, seq) =>
-			({
-				id,
-				seq: seq + 1,
-				role: "user",
-				contentText: `${prefix} ${id}`,
-				contentJson: [{ type: "text", text: `${prefix} ${id}` }],
-				children: [],
-			}) as unknown as NarratorMsg,
+			rowWithElements(
+				{
+					id,
+					seq: seq + 1,
+					role: "user",
+					contentText: `${prefix} ${id}`,
+				},
+				[{ type: "text", text: `${prefix} ${id}` }],
+			) as unknown as NarratorMsg,
 	);
 	const index = buildSelectionIndex(messages);
 	return {
@@ -210,6 +216,26 @@ function deferredRange() {
 		reject = no;
 	});
 	return { promise, resolve, reject };
+}
+
+/** A loaded message whose every element is its own block the server named `<id>/b<index>`. */
+function namedRow(id: string): NarratorMsg {
+	return {
+		id,
+		role: "assistant",
+		blocks: Array.from({ length: 8 }, (_, index) => ({
+			id: `${id}/b${index}`,
+			kind: "output",
+			subtype: null,
+			phase: "done",
+			revision: 0,
+			wireId: null,
+			attemptId: null,
+			hasOriginal: false,
+			named: true,
+			elements: [{ type: "text", text: "" }],
+		})),
+	} as unknown as NarratorMsg;
 }
 
 describe("selection resolver publication", () => {
@@ -293,7 +319,7 @@ describe("selection resolver publication", () => {
 		await act(async () => handler());
 		if (action === "delete") {
 			expect(deleteBlocks).toHaveBeenCalledWith("narrator-a", [
-				{ messageId: "latest-message", blockIndex: 2 },
+				{ messageId: "latest-message", blockIndex: 2, blockId: "latest-message/b2" },
 			]);
 		} else if (action === "fork") {
 			expect(forkMessages).toHaveBeenCalledWith("narrator-a", ["latest-message"]);
@@ -393,7 +419,7 @@ describe("batch-delete rollback feedback", () => {
 		} else {
 			deleteBlocks.mockResolvedValue({ ok: true, deleted: 0, failed: 0, revertResult: result });
 		}
-		const resources = ["messages", "file-tree-status", "tool-calls", "edit-regenerate-preview"];
+		const resources = ["messages", "file-tree-status", "tool-calls"];
 		for (const resource of resources)
 			queryClient.setQueryData(["narrators", "narrator-a", resource], {});
 		await render();

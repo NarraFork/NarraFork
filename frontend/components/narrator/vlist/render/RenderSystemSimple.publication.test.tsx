@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, expect, mock, test } from "bun:test";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { adaptSegment } from "@shared/pretext-layout/segment-adapter";
 import { parseHTML } from "linkedom";
 import { act } from "react";
@@ -146,10 +147,12 @@ test.each([
 	const spec = adaptSegment(
 		{
 			kind: "message",
-			msg: {
-				id: "publication-result:run",
-				role: "disp",
-				contentJson: [
+			msg: rowWithElements(
+				{
+					id: "publication-result:run",
+					role: "disp",
+				},
+				[
 					{
 						type: "text",
 						text: "unique snapshot body",
@@ -161,7 +164,7 @@ test.each([
 						},
 					},
 				],
-			},
+			),
 		},
 		{ lod: 1 },
 	)[0];

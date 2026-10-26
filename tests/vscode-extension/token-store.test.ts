@@ -9,7 +9,7 @@
 import { describe, expect, it } from "bun:test";
 import { looksLikeSessionToken, TokenStore } from "../../vscode-extension/src/token-store";
 
-const TOKEN = "aaaaaaaaaaaa.bbbbbbbbbbbb.cccccccccccc";
+const TOKEN = `nfs_${"a".repeat(43)}`;
 
 function makeStore(): { store: TokenStore; raw: Map<string, string> } {
 	const raw = new Map<string, string>();
@@ -23,8 +23,14 @@ function makeStore(): { store: TokenStore; raw: Map<string, string> } {
 }
 
 describe("looksLikeSessionToken", () => {
-	it("accepts a three-segment base64url token", () => {
+	it("accepts a session token", () => {
 		expect(looksLikeSessionToken(TOKEN)).toBe(true);
+	});
+
+	it("rejects a malformed session token and the retired JWT format", () => {
+		expect(looksLikeSessionToken(`nfs_${"A".repeat(42)}`)).toBe(false);
+		expect(looksLikeSessionToken(`nfs_${"A".repeat(42)}.`)).toBe(false);
+		expect(looksLikeSessionToken("aaaaaaaaaaaa.bbbbbbbbbbbb.cccccccccccc")).toBe(false);
 	});
 
 	it("rejects values that could not be a token", () => {

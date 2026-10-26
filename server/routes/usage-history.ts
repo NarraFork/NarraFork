@@ -1,16 +1,22 @@
 import { ValidationError } from "@server/lib/errors";
 import { decodeUsageHistoryCursor } from "@server/lib/usage-history-cursor";
+import { tokenRecalculationRangeSchema } from "@server/lib/validators/token-recalculation";
 import { requireAdmin, requireAuth } from "@server/middleware/auth";
 import {
 	listProviderCredentialTotals,
 	serializeCredentialUsageTotalsList,
 } from "@server/services/credential-usage-totals";
 import {
+	getTokenRecalculationService,
+	type TokenRecalculationService,
+} from "@server/services/token-recalculation-service";
+import {
 	type UsageHistoryService,
 	usageHistoryService,
 } from "@server/services/usage-history-service";
 import { listUserUsageTotals } from "@server/services/user-usage-totals";
 import { Hono } from "hono";
+import { bodyLimit } from "hono/body-limit";
 import { z } from "zod";
 
 export type UsageHistoryRouteService = Pick<
@@ -30,6 +36,7 @@ interface UsageHistoryRouteOptions {
 	requireAdmin?: typeof requireAdmin;
 	service?: UsageHistoryRouteService;
 	listUserUsageTotals?: typeof listUserUsageTotals;
+	recalculationService?: Pick<TokenRecalculationService, "get" | "start" | "cancel">;
 }
 
 // 查询参数 schema
@@ -132,6 +139,29 @@ export function createUsageHistoryRoutes(options: UsageHistoryRouteOptions = {})
 	const service = options.service ?? usageHistoryService;
 
 	routes.use("*", authMiddleware, adminMiddleware);
+
+	const recalculation = () => options.recalculationService ?? getTokenRecalculationService();
+	routes.get("/token-recalculation", (c) => c.json({ job: recalculation().get() }));
+	routes.post(
+		"/token-recalculation",
+		bodyLimit({
+			maxSize: 1024,
+			onError: (c) =>
+				c.json({ code: "PAYLOAD_TOO_LARGE", message: "Request body exceeds 1024 bytes" }, 413),
+		}),
+		async (c) => {
+			const body = await c.req.json().catch((error: unknown) => {
+				if (error instanceof Error && error.name === "BodyLimitError") throw error;
+				throw new ValidationError("Invalid JSON body");
+			});
+			const range = tokenRecalculationRangeSchema.safeParse(body);
+			if (!range.success) throw new ValidationError("Invalid UTC date range");
+			return c.json({ job: recalculation().start(range.data) }, 202);
+		},
+	);
+	routes.post("/token-recalculation/:id/cancel", (c) =>
+		c.json({ job: recalculation().cancel(c.req.param("id")) }),
+	);
 
 	// Lifetime totals are independent of the date-filtered, removable history.
 	routes.get("/user-totals", (c) => {

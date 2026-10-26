@@ -79,6 +79,23 @@ export function formatSearchTotal(
 	return `${page.total}${page.totalIsLowerBound ? "+" : ""}`;
 }
 
+/** Highest page a link may name; the server accepts the same. */
+const MAX_SEARCH_PAGE = 10_000;
+
+/** A page number from the URL: a whole number from 1, or undefined for the first page. */
+export function normalizeSearchPage(value: unknown): number | undefined {
+	const page = typeof value === "number" ? value : Number(value);
+	return Number.isInteger(page) && page > 1 ? Math.min(page, MAX_SEARCH_PAGE) : undefined;
+}
+
+/** Pages a section's matches fill at `pageSize` per page (at least one). */
+export function searchPageCount(
+	page: Pick<SearchSectionPage<unknown>, "total"> | undefined,
+	pageSize: number,
+): number {
+	return Math.max(1, Math.ceil((page?.total ?? 0) / Math.max(1, pageSize)));
+}
+
 export function normalizeSearchText(value: unknown): string {
 	return String(value ?? "")
 		.toLowerCase()

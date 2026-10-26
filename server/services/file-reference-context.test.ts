@@ -36,7 +36,7 @@ describe("file reference generation contexts", () => {
 		).toBeNull();
 	});
 
-	test("captures each lane only once and retains copies across device/cwd changes", () => {
+	test("captures each element once and retains its copy across device/cwd changes", () => {
 		const tracker = new FileReferenceContextTracker();
 		const current = { deviceId: "A", cwd: "/repo" };
 		let reads = 0;
@@ -44,29 +44,30 @@ describe("file reference generation contexts", () => {
 			reads++;
 			return current;
 		};
-		expect(tracker.capture(0, getter)).toEqual({ deviceId: "A", cwd: "/repo" });
-		const firstId = tracker.blockId(0);
+		expect(tracker.capture("e1", getter)).toEqual({ deviceId: "A", cwd: "/repo" });
 		current.deviceId = "B";
 		current.cwd = "/other";
-		expect(tracker.capture(0, getter)).toEqual({ deviceId: "A", cwd: "/repo" });
+		expect(tracker.capture("e1", getter)).toEqual({ deviceId: "A", cwd: "/repo" });
 		expect(reads).toBe(1);
-		expect(tracker.blockId(0)).toBe(firstId);
-		expect(tracker.capture(1, getter)).toEqual(current);
-		expect(tracker.complete(1)).toEqual(current);
-		expect(tracker.complete(0)).toEqual({ deviceId: "A", cwd: "/repo" });
-		expect(tracker.capture(0, getter)).toEqual(current);
-		expect(tracker.blockId(0)).not.toBe(firstId);
+		// A later element (a reused provider output index) reads its own.
+		expect(tracker.capture("e2", getter)).toEqual(current);
+		expect(tracker.peek("e1")).toEqual({ deviceId: "A", cwd: "/repo" });
+		expect(tracker.peek("e2")).toEqual(current);
+		expect(tracker.peek(undefined)).toBeNull();
+		expect(tracker.fallback()).toBeNull();
 	});
 
-	test("null is captured, not replaced by a later device; reset discards it", () => {
+	test("null is captured, not replaced by a later device; clear discards it", () => {
 		const tracker = new FileReferenceContextTracker();
-		tracker.capture(undefined, () => null);
+		tracker.capture("e1", () => null);
 		const known = { deviceId: "local", cwd: "/repo" };
-		expect(tracker.capture(undefined, () => known)).toBeNull();
-		expect(tracker.complete(undefined)).toBeNull();
-		tracker.capture(0, () => known);
+		expect(tracker.capture("e1", () => known)).toBeNull();
+		expect(tracker.fallback()).toBeNull();
 		tracker.clear();
-		expect(tracker.complete(0)).toBeNull();
+		tracker.capture("e2", () => known);
+		expect(tracker.fallback()).toEqual(known);
+		tracker.clear();
+		expect(tracker.peek("e2")).toBeNull();
 		expect(tracker.fallback()).toBeNull();
 	});
 

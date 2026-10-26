@@ -34,6 +34,12 @@ const injectedSession: AuthSessionStore = {
 	findSessionProfile: () => Promise.resolve(null),
 	findPasswordHash: () => Promise.resolve(null),
 	bumpTokenVersion: () => Promise.resolve(0),
+	createSession: () => Promise.resolve(),
+	findSessionByTokenHash: () => Promise.resolve(null),
+	findSessionById: () => Promise.resolve(null),
+	extendSession: () => Promise.resolve(),
+	revokeSession: () => Promise.resolve(),
+	deleteStaleSessions: () => Promise.resolve(0),
 };
 const injectedMfa: AuthMfaStore = {
 	findTotp: () => Promise.resolve(null),

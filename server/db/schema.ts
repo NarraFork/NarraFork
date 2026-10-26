@@ -1382,6 +1382,12 @@ export const narratorMessages = sqliteTable(
 		 * column holds the complete projection (or is the body, for `body_format = 1`).
 		 */
 		bodyRowsOnly: integer("body_rows_only").notNull().default(0),
+		/**
+		 * Hash of the `content_json` text the block rows were last synced from; null when
+		 * unknown. A queued sync whose column still hashes to it re-derives only the ledger
+		 * columns of the tool blocks whose attempt moved (narrator-block-sync.ts).
+		 */
+		blocksContentHash: text("blocks_content_hash"),
 		createdAt: text("created_at").notNull(),
 	},
 	(table) => [
@@ -1693,6 +1699,12 @@ export const narratorBlocks = sqliteTable(
 		providerMeta: text("provider_meta", { mode: "json" }),
 		/** An output block's body before its first edit. */
 		originalPayload: text("original_payload", { mode: "json" }),
+		/**
+		 * A tool block's adopted ledger attempt as of its last sync (`<tool call id>:<model
+		 * revision>`), null without one: the sync re-derives the ledger columns (model chars,
+		 * assets, binding, search text) only of the tool blocks whose attempt moved.
+		 */
+		ledgerRevision: text("ledger_revision"),
 	},
 	(table) => [
 		uniqueIndex("idx_blocks_message_ordinal").on(table.messageId, table.ordinal),
@@ -1772,6 +1784,21 @@ export const narratorBlockSyncQueue = sqliteTable("narrator_block_sync_queue", {
 	messageId: text("message_id")
 		.primaryKey()
 		.references(() => narratorMessages.id, { onDelete: "cascade" }),
+});
+
+// === narrator_block_index_queue ===
+/**
+ * Sealed blocks whose search index text is owed (narrator-block-index.ts). The sync queues a
+ * block whose body or adopted ledger attempt changed instead of tokenizing its text in the
+ * writer's transaction; a background job computes the text off the main thread and writes it
+ * in short transactions. `version` moves on every re-queue, so text computed from an older
+ * read is never written over a newer change.
+ */
+export const narratorBlockIndexQueue = sqliteTable("narrator_block_index_queue", {
+	blockId: text("block_id")
+		.primaryKey()
+		.references(() => narratorBlocks.id, { onDelete: "cascade" }),
+	version: integer("version").notNull().default(0),
 });
 
 // === narrator_text_snapshots (§7.7) ===
@@ -2347,14 +2374,12 @@ export const users = sqliteTable("users", {
 		.notNull()
 		.default("user"),
 	/**
-	 * Generation counter for this user's session tokens. Every issued JWT carries the value that
-	 * was current at signing time; verification rejects a token whose value is behind.
+	 * Generation counter for this user's sessions. Every session records the value that was
+	 * current when it was issued; verification rejects a session whose value is behind.
 	 *
-	 * This is the only mechanism that can end a session before its `exp`. Session JWTs are
-	 * self-contained, so without it a password change could not evict an already-stolen token and
-	 * "sign out everywhere" was impossible — the credential simply stayed valid for up to its full
-	 * lifetime. Bumping this column invalidates every outstanding token for the user at once,
-	 * across every device, on their next request.
+	 * Bumping this column ends every session of the user at once, across every device, on
+	 * their next request — a password reset or "sign out everywhere". A single session is
+	 * ended through `auth_sessions.revoked_at` instead.
 	 */
 	tokenVersion: integer("token_version").notNull().default(0),
 	avatarColor: text("avatar_color"),
@@ -2371,6 +2396,35 @@ export const users = sqliteTable("users", {
 	mfaEnabled: integer("mfa_enabled", { mode: "boolean" }).notNull().default(false),
 	createdAt: text("created_at").notNull(),
 });
+
+// === auth_sessions ===
+// First-party login sessions. The bearer credential is an opaque random token; only its
+// SHA-256 is stored, so neither a leaked database nor a leaked instance secret yields a
+// usable session. Times are unix seconds, matching the session lifetime constants in
+// `shared/session-auth.ts`.
+export const authSessions = sqliteTable(
+	"auth_sessions",
+	{
+		id: text("id").primaryKey(),
+		userId: text("user_id")
+			.notNull()
+			.references(() => users.id, { onDelete: "cascade" }),
+		tokenHash: text("token_hash").notNull(),
+		/** `users.token_version` at issuance; the session dies once the user's counter passes it. */
+		tokenVersion: integer("token_version").notNull().default(0),
+		/** Original login instant. Sliding renewal never moves it (absolute session ceiling). */
+		sessionStart: integer("session_start").notNull(),
+		createdAt: integer("created_at").notNull(),
+		expiresAt: integer("expires_at").notNull(),
+		revokedAt: integer("revoked_at"),
+	},
+	(table) => [
+		uniqueIndex("idx_auth_sessions_token_hash").on(table.tokenHash),
+		index("idx_auth_sessions_user").on(table.userId),
+		index("idx_auth_sessions_expires").on(table.expiresAt),
+		index("idx_auth_sessions_revoked").on(table.revokedAt),
+	],
+);
 
 // === user_git_identities ===
 // A user's reusable git commit identities (a `user.name` / `user.email` pair).
@@ -3444,6 +3498,8 @@ export const apiRequests = sqliteTable(
 		provider: text("provider"),
 		credentialId: text("credential_id"),
 		model: text("model"),
+		// Null identifies historical accounting; new writes explicitly stamp the current version.
+		tokenAccountingVersion: integer("token_accounting_version"),
 		// Token 使用统计
 		inputTokens: integer("input_tokens").notNull().default(0),
 		outputTokens: integer("output_tokens").notNull().default(0),
@@ -3484,6 +3540,9 @@ export const apiRequests = sqliteTable(
 		index("idx_api_requests_provider").on(table.provider, table.createdAt),
 		index("idx_api_requests_kind").on(table.kind, table.createdAt),
 		index("idx_api_requests_created").on(table.createdAt, table.id),
+		index("idx_api_requests_token_accounting_pending")
+			.on(table.createdAt, table.id)
+			.where(sql`"token_accounting_version" IS NULL`),
 		index("idx_api_requests_user_created").on(table.userId, table.createdAt, table.id),
 		// Usage history rows find their request evidence through this attempt id.
 		index("idx_api_requests_recording").on(table.recordingRequestId),

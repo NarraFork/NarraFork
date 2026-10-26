@@ -13,6 +13,7 @@ import {
 	type SearchSort,
 	type SearchStrategy,
 	type SessionAggregateRow,
+	type SessionHitRef,
 } from "./search/types";
 
 export { sanitizeQuery } from "./search/query";
@@ -507,38 +508,123 @@ function withinTime(time: string | undefined, filters: SearchFilters | undefined
 	return true;
 }
 
+/** A session search's ranked candidates, reused by its pages and expanded cards. */
+interface RankedSessions {
+	ranked: Array<{ candidate: SessionCandidate; score: number }>;
+	capped: boolean;
+	/** The newest hits of each session with message hits, by reference. */
+	latestHits: Map<string, SessionHitRef[]>;
+	recentDays?: number;
+}
+
+/**
+ * How long one search's ranked sessions serve its later requests: the overview, the tab,
+ * each page and each expanded card. A common term matches across most of the corpus, and
+ * re-running the search per page cost a full index scan each time; within this window a
+ * page reads only its own hits by id. New messages show up once it lapses, as with the
+ * client's own cache.
+ */
+const SESSION_CACHE_TTL_MS = 30_000;
+const SESSION_CACHE_ENTRIES = 32;
+/** A session's hits kept for paging its expanded card; further pages query directly. */
+const EXPANDED_HITS_CACHED = 200;
+
+const sessionCache = new Map<string, { at: number; value: Promise<unknown> }>();
+
+/** Forget every cached session search (tests, and anything that must see writes at once). */
+export function clearSessionSearchCache(): void {
+	sessionCache.clear();
+}
+
+/**
+ * The value cached under `key`, computing it at most once per TTL however many requests
+ * ask at the same time. A computation that fails is dropped, and a caller whose own request
+ * is still live retries once when it was another caller's cancellation that failed it.
+ */
+async function cachedSessionSearch<T>(
+	key: string,
+	signal: AbortSignal | undefined,
+	compute: () => Promise<T>,
+): Promise<T> {
+	for (let attempt = 0; ; attempt++) {
+		const now = Date.now();
+		let entry = sessionCache.get(key);
+		if (!entry || now - entry.at > SESSION_CACHE_TTL_MS) {
+			const created = { at: now, value: compute() as Promise<unknown> };
+			created.value.catch(() => {
+				if (sessionCache.get(key) === created) sessionCache.delete(key);
+			});
+			sessionCache.delete(key);
+			sessionCache.set(key, created);
+			for (const [old, value] of sessionCache) {
+				if (sessionCache.size <= SESSION_CACHE_ENTRIES) break;
+				if (value !== created) sessionCache.delete(old);
+			}
+			entry = created;
+		}
+		try {
+			return (await entry.value) as T;
+		} catch (error) {
+			if (attempt > 0 || signal?.aborted) throw error;
+		}
+	}
+}
+
+/** Cache identity of a session search: everything that changes its candidates. */
+function sessionCacheKey(base: Omit<EntitySearchQuery, "limit">): string {
+	return JSON.stringify([
+		base.viewer.userId,
+		base.viewer.isAdmin,
+		base.text,
+		base.strategy,
+		base.sort,
+		base.scope,
+		base.filters ?? null,
+	]);
+}
+
+async function rankedSessions(
+	options: SectionSearchOptions,
+	safeQuery: string,
+): Promise<RankedSessions> {
+	const window = sessionSearchWindow(safeQuery, options.filters, options.fullHistory);
+	const base = entityBase({ ...options, filters: window.filters }, safeQuery);
+	return cachedSessionSearch(`sessions:${sessionCacheKey(base)}`, options.signal, async () => {
+		const [aggregates, titleHits] = await Promise.all([
+			searchStore.searchSessionAggregates({
+				...base,
+				limit: SESSION_AGGREGATE_CAP,
+				latestHits: HITS_PER_SESSION,
+			}),
+			searchStore.searchNarrators({ ...base, limit: SESSION_TITLE_CAP }),
+		]);
+		return {
+			ranked: rankSessions(mergeSessionCandidates(aggregates, titleHits), base.sort ?? "relevance"),
+			capped: aggregates.length >= SESSION_AGGREGATE_CAP || titleHits.length >= SESSION_TITLE_CAP,
+			latestHits: new Map(aggregates.map((row) => [row.narratorId, row.latestHits])),
+			...(window.recentDays ? { recentDays: window.recentDays } : {}),
+		};
+	});
+}
+
 async function searchSessionSection(
 	options: SectionSearchOptions,
 	safeQuery: string,
 	offset: number,
 	limit: number,
 ): Promise<SectionPage<SessionResult>> {
-	const window = sessionSearchWindow(safeQuery, options.filters, options.fullHistory);
-	const base = entityBase({ ...options, filters: window.filters }, safeQuery);
-	const [aggregates, titleHits] = await Promise.all([
-		searchStore.searchSessionAggregates({ ...base, limit: SESSION_AGGREGATE_CAP }),
-		searchStore.searchNarrators({ ...base, limit: SESSION_TITLE_CAP }),
-	]);
-	const ranked = rankSessions(
-		mergeSessionCandidates(aggregates, titleHits),
-		base.sort ?? "relevance",
+	const sessions = await rankedSessions(options, safeQuery);
+	const page = pageOf(sessions.ranked, offset, limit, sessions.capped);
+	const refs = page.items.flatMap(
+		({ candidate }) => sessions.latestHits.get(candidate.narratorId) ?? [],
 	);
-	const page = pageOf(
-		ranked,
-		offset,
-		limit,
-		aggregates.length >= SESSION_AGGREGATE_CAP || titleHits.length >= SESSION_TITLE_CAP,
-	);
-	const withHits = page.items.filter(({ candidate }) => candidate.hitCount > 0);
 	const hitRows =
-		withHits.length === 0
+		refs.length === 0
 			? []
-			: await searchStore.searchSessionHits({
-					...base,
-					sort: SESSION_HIT_ORDER,
-					limit: HITS_PER_SESSION,
-					narratorIds: withHits.map(({ candidate }) => candidate.narratorId),
-					perSession: HITS_PER_SESSION,
+			: await searchStore.searchSessionHitDetails({
+					text: safeQuery,
+					refs,
+					signal: options.signal,
 				});
 	const hitsBySession = new Map<string, SessionHit[]>();
 	for (const row of hitRows) {
@@ -549,7 +635,7 @@ async function searchSessionSection(
 	}
 	return {
 		...page,
-		...(window.recentDays ? { recentDays: window.recentDays } : {}),
+		...(sessions.recentDays ? { recentDays: sessions.recentDays } : {}),
 		items: page.items.map(({ candidate, score }) => ({
 			type: "session" as const,
 			id: candidate.narratorId,
@@ -713,16 +799,26 @@ export const searchService = {
 		if (!safeQuery) return { hits: [], nextCursor: null };
 		const offset = decodeSearchCursor(options.cursor);
 		const limit = Math.max(1, Math.min(options.limit ?? 20, MAX_SESSION_HITS_PAGE));
-		// One extra row tells whether another page exists.
 		const window = sessionSearchWindow(safeQuery, options.filters, options.fullHistory);
-		const rows = await searchStore.searchSessionHits({
-			...entityBase({ ...options, filters: window.filters }, safeQuery),
+		const base = entityBase({ ...options, filters: window.filters }, safeQuery);
+		const query = {
+			...base,
 			sort: SESSION_HIT_ORDER,
 			limit,
 			narratorIds: [options.narratorId],
-			perSession: limit + 1,
-			offset,
-		});
+		};
+		// One extra row tells whether another page exists. The first pages come from one
+		// read of the session's newest hits, so paging an expanded card searches once.
+		const rows =
+			offset + limit < EXPANDED_HITS_CACHED
+				? (
+						await cachedSessionSearch(
+							`hits:${options.narratorId}:${sessionCacheKey(base)}`,
+							options.signal,
+							() => searchStore.searchSessionHits({ ...query, perSession: EXPANDED_HITS_CACHED }),
+						)
+					).slice(offset, offset + limit + 1)
+				: await searchStore.searchSessionHits({ ...query, perSession: limit + 1, offset });
 		const hits = rows.slice(0, limit).map(toSessionHit);
 		return {
 			hits,

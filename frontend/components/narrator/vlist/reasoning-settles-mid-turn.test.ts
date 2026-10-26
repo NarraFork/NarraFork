@@ -21,6 +21,7 @@
 
 import { beforeAll, describe, expect, it } from "bun:test";
 import type { TreeMessage } from "@frontend/lib/api/types";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import type { NarratorMsg } from "../narrator-panel-types";
 import type { MeasuredReasoning } from "./measure/measure-reasoning";
 import { installCanvasStub } from "./measure/test-canvas-stub";
@@ -43,13 +44,15 @@ function liveSegment(
 ): AdapterSegment {
 	return {
 		kind: "message",
-		msg: {
-			id: "__streaming__",
-			model: "gpt-5.6",
-			role: "assistant",
-			contentJson: blocks as never,
-			...(liveBlockIndex != null ? { liveBlockIndex } : {}),
-		},
+		msg: rowWithElements(
+			{
+				id: "__streaming__",
+				model: "gpt-5.6",
+				role: "assistant",
+				...(liveBlockIndex != null ? { liveBlockIndex } : {}),
+			},
+			blocks as never,
+		),
 	};
 }
 
@@ -100,18 +103,20 @@ describe("live reasoning settles once the model produces later content", () => {
 		// position alone would name the wrong run — the accumulator stamp decides.
 		const seg: AdapterSegment = {
 			kind: "message",
-			msg: {
-				id: "__streaming__",
-				model: "gpt-5.6",
-				role: "assistant",
-				contentJson: [
+			msg: rowWithElements(
+				{
+					id: "__streaming__",
+					model: "gpt-5.6",
+					role: "assistant",
+					liveBlockIndex: 2,
+				},
+				[
 					REASONING,
 					{ type: "text", text: "先看第一处。" },
 					{ type: "reasoning", text: "**第二轮**\n\n再确认另一处实现。" },
 					TOOL,
 				] as never,
-				liveBlockIndex: 2,
-			},
+			),
 		};
 		const specs = adaptSegment(seg, { lod: 5 });
 		const runs = specs.filter((s) => s.kind === "reasoning-steps");
@@ -125,7 +130,9 @@ describe("live reasoning settles once the model produces later content", () => {
 	it("keeps a persisted message settled regardless of its shape", () => {
 		const seg: AdapterSegment = {
 			kind: "message",
-			msg: { id: "real-1", model: "gpt-5.6", role: "assistant", contentJson: [REASONING] as never },
+			msg: rowWithElements({ id: "real-1", model: "gpt-5.6", role: "assistant" }, [
+				REASONING,
+			] as never),
 		};
 		const spec = reasoningSpec(seg, 5);
 		const steps = (spec?.data as { steps: { shimmer?: boolean }[] }).steps;
@@ -139,13 +146,15 @@ describe("the folded L1/L2 trace drops the live tail when a run settles", () => 
 		const { adaptRenderUnits } = await import("./segment-adapter");
 		// A long body, so a live row would definitely carry a tail (short ones never do).
 		const longReasoning = { type: "reasoning", text: `**分析步骤**\n\n${"长文本".repeat(120)}` };
-		const msg = {
-			id: "__streaming__",
-			model: "gpt-5.6",
-			role: "assistant",
-			contentJson: [longReasoning, TOOL] as never,
-			liveBlockIndex,
-		};
+		const msg = rowWithElements(
+			{
+				id: "__streaming__",
+				model: "gpt-5.6",
+				role: "assistant",
+				liveBlockIndex,
+			},
+			[longReasoning, TOOL],
+		);
 		const specs = adaptRenderUnits(
 			[
 				{
@@ -180,15 +189,16 @@ describe("the latest sealed empty reasoning stays live at every LOD", () => {
 		it(`shows exactly one waiting shimmer at L${lod} and stops when inactive`, () => {
 			const messages = ["empty-r1", "empty-r2"].map(
 				(id, seq) =>
-					({
-						id,
-						seq,
-						role: "assistant",
-						parentToolUseId: null,
-						contentJson: [{ type: "reasoning", id: `${id}-block`, text: "", revision: 1 }],
-						toolCalls: [],
-						children: [],
-					}) as unknown as TreeMessage,
+					rowWithElements(
+						{
+							id,
+							seq,
+							role: "assistant",
+							parentToolUseId: null,
+							toolCalls: [],
+						},
+						[{ type: "reasoning", id: `${id}-block`, text: "", revision: 1 }],
+					) as unknown as TreeMessage,
 			);
 			const layout = (active: boolean) =>
 				buildPretextDocumentLayout(

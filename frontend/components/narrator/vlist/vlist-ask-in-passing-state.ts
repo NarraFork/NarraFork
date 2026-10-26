@@ -1,3 +1,4 @@
+import { type MessageBodySource, messageBody } from "@shared/narrator-blocks/message-blocks";
 /** List-owned interaction state. Virtual row mounting never creates or destroys drafts. */
 export interface AskInPassingDraft {
 	readonly value: string;
@@ -77,11 +78,11 @@ export class AskInPassingDraftStore {
 		if (hadDraft || !alreadyTerminal) this.emit();
 	}
 	/** Absence from a paged window is NOT deletion. Only explicit terminal data clears. */
-	reconcile(messages: readonly { id?: unknown; contentJson?: unknown }[]): void {
+	reconcile(messages: readonly (MessageBodySource & { id?: unknown })[]): void {
 		for (const message of messages) {
-			if (typeof message.id !== "string" || !Array.isArray(message.contentJson)) continue;
+			if (typeof message.id !== "string") continue;
 			if (
-				message.contentJson.some((block: unknown) => {
+				messageBody(message).some((block: unknown) => {
 					if (!block || typeof block !== "object") return false;
 					const data = block as { type?: unknown; status?: unknown };
 					return data.type === "ask_in_passing" && data.status === "resolved";

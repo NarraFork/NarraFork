@@ -22,6 +22,7 @@
 
 import { beforeAll, describe, expect, it } from "bun:test";
 import type { TreeMessage } from "@frontend/lib/api/types";
+import { messageBody, rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 
 beforeAll(() => {
@@ -46,18 +47,19 @@ const BUILD = {
 // is a plain string, so it carries no content signature in its key.
 function message(seq: number, blocks?: unknown[]): TreeMessage {
 	const text = "词".repeat(80);
-	return {
-		id: `remove-m${seq}`,
-		narratorId: "n1",
-		parentToolUseId: null,
-		role: "assistant",
-		contentJson: blocks ?? [{ type: "text", text }],
-		contentText: text,
-		toolCalls: [],
-		createdAt: "2026-07-28T00:00:00.000Z",
-		children: [],
-		seq,
-	} as unknown as TreeMessage;
+	return rowWithElements(
+		{
+			id: `remove-m${seq}`,
+			narratorId: "n1",
+			parentToolUseId: null,
+			role: "assistant",
+			contentText: text,
+			toolCalls: [],
+			createdAt: "2026-07-28T00:00:00.000Z",
+			seq,
+		},
+		blocks ?? [{ type: "text", text }],
+	) as unknown as TreeMessage;
 }
 
 async function loaded(count = 30) {
@@ -208,7 +210,7 @@ describe("replaceMessage — the other half of a rollback", () => {
 		const landed = snapshot.input?.messages.find((m) => m.id === `remove-m${target}`);
 		// Without this the rolled-back tail block stayed visible on the very card the
 		// reader clicked, until an unrelated reload happened.
-		expect(landed?.contentJson).toHaveLength(1);
+		expect(messageBody(landed)).toHaveLength(1);
 		expect(snapshot.input?.messageVersion).toBe(7);
 	});
 
@@ -223,7 +225,7 @@ describe("replaceMessage — the other half of a rollback", () => {
 		const landed = coordinator
 			.getSnapshot()
 			.input?.messages.find((m) => m.id === `remove-m${target}`);
-		expect(landed?.contentJson).toHaveLength(2);
+		expect(messageBody(landed)).toHaveLength(2);
 	});
 
 	it("refuses a same-length update, a longer one, and a middle-block removal", async () => {

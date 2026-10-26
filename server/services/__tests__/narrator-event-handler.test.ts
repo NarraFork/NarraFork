@@ -237,7 +237,13 @@ describe("reasoning translation output boundary", () => {
 				expect(ctx.pendingReasoningTranslations?.size).toBe(1);
 				const event =
 					boundary === "stream_text"
-						? { type: "stream_text" as const, text: "Answer" }
+						? {
+								type: "stream_text" as const,
+								blockRevision: 1,
+								blockTextOffset: 0,
+								blockId: "text",
+								text: "Answer",
+							}
 						: boundary === "tool_use_chunk"
 							? {
 									type: "tool_use_chunk" as const,
@@ -303,7 +309,16 @@ describe("reasoning translation output boundary", () => {
 				ctx,
 			);
 			expect(ctx.pendingReasoningTranslations.size).toBe(0);
-			await processEvent({ type: "stream_text", text: "new answer" }, ctx);
+			await processEvent(
+				{
+					type: "stream_text",
+					blockRevision: 1,
+					blockTextOffset: 0,
+					blockId: "text-6",
+					text: "new answer",
+				},
+				ctx,
+			);
 			expect(ctx.reasoningTranslations?.size ?? 0).toBe(0);
 		});
 	}
@@ -911,7 +926,17 @@ describe("assistant file-reference provenance", () => {
 			...makeSubagentContext(),
 			getFileReferenceContext: () => ({ deviceId: "ChildDevice", cwd: "/child" }),
 		};
-		await processEvent({ type: "stream_text", text: "src/a.ts", outputIndex: 0 }, ctx);
+		await processEvent(
+			{
+				type: "stream_text",
+				blockRevision: 1,
+				blockTextOffset: 0,
+				blockId: "b0",
+				text: "src/a.ts",
+				outputIndex: 0,
+			},
+			ctx,
+		);
 		expect(getStreamingSnapshot(ctx.narratorId)?.streamingBlocks[0]).toMatchObject({
 			type: "text",
 			fileReferenceContext: { deviceId: "ChildDevice", cwd: "/child" },
@@ -945,9 +970,29 @@ describe("assistant file-reference provenance", () => {
 			},
 		};
 		try {
-			await processEvent({ type: "stream_text", text: "[file]", outputIndex: 0 }, ctx);
+			await processEvent(
+				{
+					type: "stream_text",
+					blockRevision: 2,
+					blockTextOffset: 8,
+					blockId: "b0",
+					text: "[file]",
+					outputIndex: 0,
+				},
+				ctx,
+			);
 			source = { deviceId: "DeviceB", cwd: "/other" };
-			await processEvent({ type: "stream_text", text: "(src/a.ts#L2)", outputIndex: 0 }, ctx);
+			await processEvent(
+				{
+					type: "stream_text",
+					blockRevision: 3,
+					blockTextOffset: 14,
+					blockId: "b0",
+					text: "(src/a.ts#L2)",
+					outputIndex: 0,
+				},
+				ctx,
+			);
 			expect(reads).toBe(1);
 			expect(getStreamingSnapshot(id)?.streamingBlocks[0]).toMatchObject({
 				fileReferenceContext: { deviceId: "DeviceA", cwd: "/repo" },
@@ -961,14 +1006,25 @@ describe("assistant file-reference provenance", () => {
 			await processEvent(
 				{
 					type: "block_complete",
-					block: { type: "text", text: "[file](src/a.ts#L2)", outputIndex: 0 },
+					block: { type: "text", id: "b0", text: "[file](src/a.ts#L2)", outputIndex: 0 },
 				},
 				ctx,
 			);
 			const savedId = partialId;
-			await processEvent({ type: "stream_text", text: "next", outputIndex: 0 }, ctx);
+			// The provider reuses output index 0 for a new element: it reads its own device.
 			await processEvent(
-				{ type: "block_complete", block: { type: "text", text: "next", outputIndex: 0 } },
+				{
+					type: "stream_text",
+					blockRevision: 1,
+					blockTextOffset: 0,
+					blockId: "b1",
+					text: "next",
+					outputIndex: 0,
+				},
+				ctx,
+			);
+			await processEvent(
+				{ type: "block_complete", block: { type: "text", id: "b1", text: "next", outputIndex: 0 } },
 				ctx,
 			);
 			await processEvent(
@@ -992,7 +1048,7 @@ describe("assistant file-reference provenance", () => {
 		}
 	});
 
-	test("a combined provider text block never borrows its last device for earlier text", async () => {
+	test("a text block without an element id never borrows a streamed element's device", async () => {
 		const id = "file-context-mixed";
 		const createdAt = new Date().toISOString();
 		await db.insert(narrators).values({ id, createdAt, updatedAt: createdAt });
@@ -1010,9 +1066,29 @@ describe("assistant file-reference provenance", () => {
 			getFileReferenceContext: () => ({ deviceId, cwd: "/repo" }),
 		};
 		try {
-			await processEvent({ type: "stream_text", text: "first ", outputIndex: 0 }, ctx);
+			await processEvent(
+				{
+					type: "stream_text",
+					blockRevision: 4,
+					blockTextOffset: 27,
+					blockId: "b0",
+					text: "first ",
+					outputIndex: 0,
+				},
+				ctx,
+			);
 			deviceId = "B";
-			await processEvent({ type: "stream_text", text: "second", outputIndex: 1 }, ctx);
+			await processEvent(
+				{
+					type: "stream_text",
+					blockRevision: 2,
+					blockTextOffset: 4,
+					blockId: "b1",
+					text: "second",
+					outputIndex: 1,
+				},
+				ctx,
+			);
 			await processEvent(
 				{ type: "block_complete", block: { type: "text", text: "first second", outputIndex: 1 } },
 				ctx,
@@ -1384,7 +1460,17 @@ describe("完成工具输入传递", () => {
 		sseEmitter.on("event", (event) => sseEvents.push(event));
 		const ctx = makeMainContext(sseEmitter);
 
-		await processEvent({ type: "stream_text", text: "保留的 partial 文本", outputIndex: 0 }, ctx);
+		await processEvent(
+			{
+				type: "stream_text",
+				blockRevision: 1,
+				blockTextOffset: 0,
+				blockId: "text-7",
+				text: "保留的 partial 文本",
+				outputIndex: 0,
+			},
+			ctx,
+		);
 		await processEvent(
 			{
 				type: "tool_call",
@@ -1434,6 +1520,8 @@ describe("完成工具输入传递", () => {
 				text: "保留的 partial 文本",
 				outputIndex: 0,
 				id: expect.any(String),
+				revision: 1,
+				textOffset: 0,
 				fileReferenceContext: null,
 			},
 			{
@@ -1492,7 +1580,17 @@ describe("完成工具输入传递", () => {
 		const sseEvents: unknown[] = [];
 		sseEmitter.on("event", (event) => sseEvents.push(event));
 		const ctx = makeMainContext(sseEmitter);
-		await processEvent({ type: "stream_text", text: "still here", outputIndex: 0 }, ctx);
+		await processEvent(
+			{
+				type: "stream_text",
+				blockRevision: 1,
+				blockTextOffset: 0,
+				blockId: "text-8",
+				text: "still here",
+				outputIndex: 0,
+			},
+			ctx,
+		);
 		await processEvent(
 			{
 				type: "image_generation",
@@ -1534,7 +1632,14 @@ describe("完成工具输入传递", () => {
 	test("子代理 retry 只清自身生图快照，父快照保持不变", async () => {
 		const parentCtx = makeMainContext();
 		await processEvent(
-			{ type: "stream_text", text: "parent live text", outputIndex: 0 },
+			{
+				type: "stream_text",
+				blockRevision: 1,
+				blockTextOffset: 0,
+				blockId: "text-9",
+				text: "parent live text",
+				outputIndex: 0,
+			},
 			parentCtx,
 		);
 
@@ -1563,6 +1668,8 @@ describe("完成工具输入传递", () => {
 				text: "parent live text",
 				outputIndex: 0,
 				id: expect.any(String),
+				revision: 1,
+				textOffset: 0,
 				fileReferenceContext: null,
 			},
 		]);
@@ -1901,6 +2008,86 @@ describe("narrator event handler persistence", () => {
 		}
 	});
 
+	test("EnterPlanMode 在自身 block_complete 落库时准备，assistant_message 不再重复准备", async () => {
+		const narratorId = `enter-plan-prepare-${Date.now()}`;
+		const now = new Date().toISOString();
+		await db.insert(narrators).values({ id: narratorId, createdAt: now, updatedAt: now });
+		let partialId: string | undefined;
+		let savedMessageId: string | undefined;
+		const ctx: EventHandlerContext = {
+			...makeSubagentContext(),
+			narratorId,
+			broadcastTargetId: narratorId,
+			parentToolUseId: undefined,
+			conversationId: `conversation-${narratorId}`,
+			getPartialMessageId: () => partialId,
+			setPartialMessageId: (id) => {
+				partialId = id;
+			},
+			provider: "test",
+			model: "test-model",
+		};
+		const order: string[] = [];
+		const prepared: Array<[string, string]> = [];
+		const hooks = {
+			onPrepareEnterPlanMode: async (toolCallId: string, toolUseId: string) => {
+				order.push("prepare");
+				prepared.push([toolCallId, toolUseId]);
+			},
+			onAssistantMessageFinalized: async () => {
+				order.push("finalized");
+			},
+		};
+
+		try {
+			await processEvent(
+				{
+					type: "block_complete",
+					block: { type: "tool_use", toolUseId: "enter-plan", name: "EnterPlanMode", input: {} },
+					// The loop may start the call once it holds the binding: prepared state
+					// must already exist by then.
+					onToolPersisted: () => {
+						order.push("persisted");
+					},
+				},
+				ctx,
+				hooks,
+			);
+			savedMessageId = partialId;
+			expect(order).toEqual(["prepare", "persisted"]);
+			expect(prepared).toHaveLength(1);
+			expect(prepared[0]?.[1]).toBe("enter-plan");
+			expect(ctx.preparedPlanModeToolCalls?.get("enter-plan")).toBe(prepared[0]?.[0]);
+
+			await processEvent(
+				{
+					type: "assistant_message",
+					text: "",
+					toolUses: [{ toolUseId: "enter-plan", name: "EnterPlanMode", input: {} }],
+				},
+				ctx,
+				hooks,
+			);
+			expect(prepared).toHaveLength(1);
+			expect(order).toEqual(["prepare", "persisted", "finalized"]);
+			expect(partialId).toBeUndefined();
+		} finally {
+			sqlite.run("PRAGMA foreign_keys = OFF");
+			try {
+				if (savedMessageId) {
+					await db.delete(narratorToolCalls).where(eq(narratorToolCalls.messageId, savedMessageId));
+					await db
+						.delete(narratorMessageRefs)
+						.where(eq(narratorMessageRefs.messageId, savedMessageId));
+					await db.delete(narratorMessages).where(eq(narratorMessages.id, savedMessageId));
+				}
+				await db.delete(narrators).where(eq(narrators.id, narratorId));
+			} finally {
+				sqlite.run("PRAGMA foreign_keys = ON");
+			}
+		}
+	});
+
 	test("EnterPlanMode 仅在成功结果落库后按 row id 提交一次", async () => {
 		const ctx = makeSubagentContext();
 		ctx.preparedPlanModeToolCalls = new Map([["reused-call", "tool-row-new"]]);
@@ -2173,7 +2360,16 @@ describe("subagent live output char count", () => {
 	test("counts a subagent's streamed text and ticks the parent's Agent card", async () => {
 		await parentAgentChunk();
 		const sub = makeSubagentContext();
-		await processEvent({ type: "stream_text", text: "Hello", blockId: "blk-1" }, sub);
+		await processEvent(
+			{
+				type: "stream_text",
+				blockRevision: 1,
+				blockTextOffset: 0,
+				text: "Hello",
+				blockId: "blk-1",
+			},
+			sub,
+		);
 		const frames = toolOutputFrames();
 		expect(frames.at(-1)).toMatchObject({
 			type: "tool_output",
@@ -2192,9 +2388,27 @@ describe("subagent live output char count", () => {
 	test("throttled frames keep only the latest cumulative total", async () => {
 		await parentAgentChunk();
 		const sub = makeSubagentContext();
-		await processEvent({ type: "stream_text", text: "Hello", blockId: "blk-1" }, sub);
+		await processEvent(
+			{
+				type: "stream_text",
+				blockRevision: 2,
+				blockTextOffset: 5,
+				text: "Hello",
+				blockId: "blk-1",
+			},
+			sub,
+		);
 		// Inside the throttle window this only arms the trailing flush.
-		await processEvent({ type: "stream_text", text: ", world", blockId: "blk-1" }, sub);
+		await processEvent(
+			{
+				type: "stream_text",
+				blockRevision: 3,
+				blockTextOffset: 10,
+				text: ", world",
+				blockId: "blk-1",
+			},
+			sub,
+		);
 		expect(toolOutputFrames()).toHaveLength(1);
 		// The trailing flush lands the FULL accumulated count ("Hello, world"), not
 		// the last delta.
@@ -2204,10 +2418,25 @@ describe("subagent live output char count", () => {
 	test("an overlapping replay does not double-count", async () => {
 		await parentAgentChunk();
 		const sub = makeSubagentContext();
-		await processEvent({ type: "stream_text", text: "Hello", blockId: "blk-1" }, sub);
+		await processEvent(
+			{
+				type: "stream_text",
+				blockRevision: 4,
+				blockTextOffset: 17,
+				text: "Hello",
+				blockId: "blk-1",
+			},
+			sub,
+		);
 		// A resend with an absolute offset overlapping the streamed prefix (resume).
 		await processEvent(
-			{ type: "stream_text", text: "Hello, world", blockId: "blk-1", blockTextOffset: 0 },
+			{
+				type: "stream_text",
+				blockRevision: 5,
+				text: "Hello, world",
+				blockId: "blk-1",
+				blockTextOffset: 0,
+			},
 			sub,
 		);
 		// "Hello, world".length — never 5 + 12.
@@ -2215,42 +2444,93 @@ describe("subagent live output char count", () => {
 	});
 
 	test("a primary narrator's own text never enters the subagent counter", async () => {
-		await processEvent({ type: "stream_text", text: "mine", blockId: "blk-1" }, makeMainContext());
+		await processEvent(
+			{
+				type: "stream_text",
+				blockRevision: 6,
+				blockTextOffset: 34,
+				text: "mine",
+				blockId: "blk-1",
+			},
+			makeMainContext(),
+		);
 		expect(toolOutputFrames()).toHaveLength(0);
 	});
 
 	test("skips the broadcast while no card tracks the tool, resuming with the full total", async () => {
 		const sub = makeSubagentContext();
 		// No Agent chunk yet: nothing to show the count on, so nothing is sent…
-		await processEvent({ type: "stream_text", text: "Hello", blockId: "blk-1" }, sub);
+		await processEvent(
+			{
+				type: "stream_text",
+				blockRevision: 7,
+				blockTextOffset: 38,
+				text: "Hello",
+				blockId: "blk-1",
+			},
+			sub,
+		);
 		expect(toolOutputFrames()).toHaveLength(0);
 		// …but the counter keeps accumulating, so a card appearing later resumes
 		// from the true total rather than zero.
 		await parentAgentChunk();
-		await processEvent({ type: "stream_text", text: "!", blockId: "blk-1" }, sub);
+		await processEvent(
+			{ type: "stream_text", blockRevision: 8, blockTextOffset: 43, text: "!", blockId: "blk-1" },
+			sub,
+		);
 		await untilOutput("6");
 	});
 
 	test("iteration-level snapshot resets do NOT retire the counter (run-scoped total)", async () => {
 		await parentAgentChunk();
 		const sub = makeSubagentContext();
-		await processEvent({ type: "stream_text", text: "Hello", blockId: "blk-1" }, sub);
+		await processEvent(
+			{
+				type: "stream_text",
+				blockRevision: 9,
+				blockTextOffset: 44,
+				text: "Hello",
+				blockId: "blk-1",
+			},
+			sub,
+		);
 		// A child with no subagents of its own hits `clearStreamingSnapshot` via
 		// `clearAuthorStreamingSnapshot` on EVERY `assistant_message` — the counter
 		// must survive it, or the badge would restart from zero between iterations.
 		clearStreamingSnapshot(SUBAGENT_NARRATOR_ID);
-		await processEvent({ type: "stream_text", text: ", world", blockId: "blk-2" }, sub);
+		await processEvent(
+			{
+				type: "stream_text",
+				blockRevision: 1,
+				blockTextOffset: 0,
+				text: ", world",
+				blockId: "blk-2",
+			},
+			sub,
+		);
 		await untilOutput("12");
 	});
 
 	test("a discarded attempt restarts the count with the replayed stream", async () => {
 		await parentAgentChunk();
 		const sub = makeSubagentContext();
-		await processEvent({ type: "stream_text", text: "Hello", blockId: "blk-1" }, sub);
+		await processEvent(
+			{
+				type: "stream_text",
+				blockRevision: 10,
+				blockTextOffset: 49,
+				text: "Hello",
+				blockId: "blk-1",
+			},
+			sub,
+		);
 		await untilOutput("5");
 		// The dead-turn reset retracts the streamed text; the count starts over.
 		await processEvent({ type: "stream_reset" }, sub);
-		await processEvent({ type: "stream_text", text: "Hi", blockId: "blk-1" }, sub);
+		await processEvent(
+			{ type: "stream_text", blockRevision: 11, blockTextOffset: 54, text: "Hi", blockId: "blk-1" },
+			sub,
+		);
 		await untilOutput("2");
 	});
 
@@ -2258,17 +2538,29 @@ describe("subagent live output char count", () => {
 		await parentAgentChunk();
 		const sub = makeSubagentContext();
 		await processEvent(
-			{ type: "stream_text", text: "x".repeat(100), blockId: "blk-1", blockTextOffset: 0 },
+			{
+				type: "stream_text",
+				blockRevision: 12,
+				text: "x".repeat(100),
+				blockId: "blk-1",
+				blockTextOffset: 0,
+			},
 			sub,
 		);
 		await untilOutput("100");
 		// A resend covering [20, 50) — entirely inside the existing span.
 		await processEvent(
-			{ type: "stream_text", text: "y".repeat(30), blockId: "blk-1", blockTextOffset: 20 },
+			{
+				type: "stream_text",
+				blockRevision: 13,
+				text: "y".repeat(30),
+				blockId: "blk-1",
+				blockTextOffset: 20,
+			},
 			sub,
 		);
 		await processEvent(
-			{ type: "stream_text", text: "z", blockId: "blk-1", blockTextOffset: 100 },
+			{ type: "stream_text", blockRevision: 14, text: "z", blockId: "blk-1", blockTextOffset: 100 },
 			sub,
 		);
 		await untilOutput("101");
@@ -2277,9 +2569,21 @@ describe("subagent live output char count", () => {
 	test("run end flushes the final count and retires the counter", async () => {
 		await parentAgentChunk();
 		const sub = makeSubagentContext();
-		await processEvent({ type: "stream_text", text: "Hello", blockId: "blk-1" }, sub);
+		await processEvent(
+			{
+				type: "stream_text",
+				blockRevision: 15,
+				blockTextOffset: 59,
+				text: "Hello",
+				blockId: "blk-1",
+			},
+			sub,
+		);
 		// Inside the throttle window; the flush happens synchronously on retire.
-		await processEvent({ type: "stream_text", text: "!!", blockId: "blk-1" }, sub);
+		await processEvent(
+			{ type: "stream_text", blockRevision: 16, blockTextOffset: 64, text: "!!", blockId: "blk-1" },
+			sub,
+		);
 		expect(toolOutputFrames()).toHaveLength(1);
 		retireSubagentOutputCharCount(SUBAGENT_NARRATOR_ID);
 		expect(toolOutputFrames().at(-1)?.output).toBe("7");

@@ -6,6 +6,7 @@ import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { ZodError } from "zod";
+import { blockIdAt } from "../../tests/block-ids";
 import {
 	narratorBlacklistDirs,
 	narratorMessageRefs,
@@ -525,35 +526,32 @@ describe("history-only HTTP actions after a workspace switch", () => {
 
 	type Fixture = Awaited<ReturnType<typeof fixture>>;
 	type Action = "rollback" | "message" | "block" | "batch";
-	function request(f: Fixture, action: Action, skipRevert?: boolean) {
+	async function request(f: Fixture, action: Action, skipRevert?: boolean) {
 		const base = `/api/narrators/${id}`;
 		const headers = { "content-type": "application/json" };
 		const opts = skipRevert === undefined ? {} : { skipRevert };
+		if (action === "message")
+			return {
+				path: `${base}/messages/${f.answer}${skipRevert ? "?skipRevert=1" : ""}`,
+				init: { method: "DELETE" },
+			};
 		if (action === "rollback")
 			return {
-				path: `${base}/rollback/${f.user}`,
-				init: { method: "POST", headers, body: JSON.stringify({ blockIndex: 0, ...opts }) },
-			};
-		if (action === "batch")
-			return {
-				path: `${base}/messages/batch-blocks`,
+				path: `${base}/blocks/rollback`,
 				init: {
-					method: "DELETE",
+					method: "POST",
 					headers,
-					body: JSON.stringify({
-						blocks: [
-							{ messageId: f.answer, blockIndex: 1 },
-							{ messageId: f.later, blockIndex: 0 },
-						],
-						...opts,
-					}),
+					body: JSON.stringify({ blockIds: [await blockIdAt(f.user, 0)], ...opts }),
 				},
 			};
-		const path =
-			action === "message"
-				? `${base}/messages/${f.answer}`
-				: `${base}/messages/${f.answer}/blocks/1`;
-		return { path: `${path}${skipRevert ? "?skipRevert=1" : ""}`, init: { method: "DELETE" } };
+		const blockIds =
+			action === "batch"
+				? [await blockIdAt(f.answer, 1), await blockIdAt(f.later, 0)]
+				: [await blockIdAt(f.answer, 1)];
+		return {
+			path: `${base}/blocks`,
+			init: { method: "DELETE", headers, body: JSON.stringify({ blockIds, ...opts }) },
+		};
 	}
 
 	async function forbidFileRollback() {
@@ -596,7 +594,7 @@ describe("history-only HTTP actions after a workspace switch", () => {
 	] as const)("%s with skipRevert changes only history despite missing file evidence", async (action) => {
 		const f = await fixture();
 		const spies = await forbidFileRollback();
-		const req = request(f, action, true);
+		const req = await request(f, action, true);
 		const response = await app(owner).request(req.path, req.init);
 		const body = await response.json();
 		expect(response.status, JSON.stringify(body)).toBe(200);
@@ -633,7 +631,7 @@ describe("history-only HTTP actions after a workspace switch", () => {
 				new Error("must not interrupt"),
 			);
 			restorers.push(() => interrupt.mockRestore());
-			const req = request(f, action, skipRevert);
+			const req = await request(f, action, skipRevert);
 			const response = await app(owner).request(req.path, req.init);
 			expect(response.status).toBe(409);
 			// A file-restoring rollback needs a confirmed plan and HTTP deletions are
@@ -653,7 +651,7 @@ describe("history-only HTTP actions after a workspace switch", () => {
 	] as const)("%s history-only still requires write access", async (action) => {
 		const f = await fixture();
 		const before = await refs();
-		const req = request(f, action, true);
+		const req = await request(f, action, true);
 		const response = await app("unrelated-user").request(req.path, req.init);
 		expect([403, 404]).toContain(response.status);
 		expect(await refs()).toEqual(before);
@@ -663,16 +661,16 @@ describe("history-only HTTP actions after a workspace switch", () => {
 	test("history-only requests do not bypass parameter validation or exclusive history admission", async () => {
 		const f = await fixture();
 		const before = await refs();
-		const invalid = await app(owner).request(`/api/narrators/${id}/rollback/${f.user}`, {
+		const invalid = await app(owner).request(`/api/narrators/${id}/blocks/rollback`, {
 			method: "POST",
 			headers: { "content-type": "application/json" },
-			body: JSON.stringify({ blockIndex: -1, skipRevert: true }),
+			body: JSON.stringify({ blockIds: [], skipRevert: true }),
 		});
 		expect(invalid.status).toBe(400);
 		const { reserveNarratorRevertAdmission } = await import("./narrator-session-state");
 		const reservation = reserveNarratorRevertAdmission(id);
 		try {
-			const req = request(f, "message", true);
+			const req = await request(f, "message", true);
 			const response = await app(owner).request(req.path, req.init);
 			expect(response.status).toBe(409);
 			expect((await response.json()).code).toBe("NARRATOR_REVERT_IN_PROGRESS");

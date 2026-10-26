@@ -17,6 +17,7 @@
 
 import { describe, expect, it } from "bun:test";
 import type { TreeMessage } from "@frontend/lib/api/types";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import {
 	collectMathCandidateTexts,
 	collectNewMathCandidateTexts,
@@ -25,34 +26,36 @@ import {
 
 /** A streaming-shaped row: text lives in blocks, `contentText` is null. */
 function streamingRow(text: string, id = "__streaming__"): TreeMessage {
-	return {
-		id,
-		narratorId: "n1",
-		parentToolUseId: null,
-		role: "assistant",
-		contentJson: [{ type: "text", id: "streaming:text:0", text }],
-		contentText: null,
-		toolCalls: [],
-		createdAt: "2026-07-28T00:00:00.000Z",
-		children: [],
-		seq: 1,
-	} as unknown as TreeMessage;
+	return rowWithElements(
+		{
+			id,
+			narratorId: "n1",
+			parentToolUseId: null,
+			role: "assistant",
+			contentText: null,
+			toolCalls: [],
+			createdAt: "2026-07-28T00:00:00.000Z",
+			seq: 1,
+		},
+		[{ type: "text", id: "streaming:text:0", text }],
+	) as unknown as TreeMessage;
 }
 
 /** A fetched-shaped row: `contentText` carries the whole visible body. */
 function fetchedRow(text: string, id = "m1"): TreeMessage {
-	return {
-		id,
-		narratorId: "n1",
-		parentToolUseId: null,
-		role: "assistant",
-		contentJson: [{ type: "text", text }],
-		contentText: text,
-		toolCalls: [],
-		createdAt: "2026-07-28T00:00:00.000Z",
-		children: [],
-		seq: 1,
-	} as unknown as TreeMessage;
+	return rowWithElements(
+		{
+			id,
+			narratorId: "n1",
+			parentToolUseId: null,
+			role: "assistant",
+			contentText: text,
+			toolCalls: [],
+			createdAt: "2026-07-28T00:00:00.000Z",
+			seq: 1,
+		},
+		[{ type: "text", text }],
+	) as unknown as TreeMessage;
 }
 
 describe("collectMathCandidateTexts", () => {
@@ -62,13 +65,15 @@ describe("collectMathCandidateTexts", () => {
 	});
 
 	it("reads thinking and translated bodies, which are measured as markdown too", () => {
-		const row = {
-			...fetchedRow("正文"),
-			contentJson: [
+		const row = rowWithElements(
+			{
+				...fetchedRow("正文"),
+			},
+			[
 				{ type: "thinking", thinking: "推理 $x$" },
 				{ type: "text", text: "答案", translatedText: "answer $y$" },
 			],
-		} as unknown as TreeMessage;
+		) as unknown as TreeMessage;
 		const texts = collectMathCandidateTexts([row]);
 		expect(texts).toContain("推理 $x$");
 		expect(texts).toContain("answer $y$");

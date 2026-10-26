@@ -620,7 +620,6 @@ export const updateSettingsSchema = z
 			.object({
 				write: z.boolean(),
 				read: z.boolean(),
-				wsV2: z.boolean(),
 				compactJson: z.boolean(),
 			})
 			.partial()

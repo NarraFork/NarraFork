@@ -1,0 +1,55 @@
+/*
+ * row-chrome.css — Mantine's own rules for the primitives a virtual-list row header
+ * paints (see row-chrome.tsx). Copied from @mantine/core 9 so the plain elements
+ * compute to the same boxes: Group (.m_4081bf90), Text (.m_b6d8b162), ThemeIcon
+ * (.m_7341320d) and UnstyledButton (.m_87cf2631).
+ */
+
+.nf-row-flex {
+	display: flex;
+	flex-direction: row;
+	flex-wrap: nowrap;
+	justify-content: flex-start;
+	align-items: center;
+}
+
+.nf-row-text {
+	-webkit-tap-highlight-color: transparent;
+	text-decoration: none;
+	font-size: var(--mantine-font-size-xs);
+	line-height: var(--mantine-line-height-xs);
+	font-weight: var(--mantine-font-weight-regular);
+	text-wrap: var(--mantine-text-wrap);
+	margin: 0;
+	padding: 0;
+}
+
+.nf-row-text[data-truncate] {
+	overflow: hidden;
+	text-overflow: ellipsis;
+	white-space: nowrap;
+}
+
+.nf-row-chip {
+	line-height: 1;
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	position: relative;
+	user-select: none;
+	border-radius: var(--mantine-radius-sm);
+}
+
+.nf-row-button {
+	background-color: transparent;
+	cursor: pointer;
+	border: 0;
+	padding: 0;
+	appearance: none;
+	font-size: var(--mantine-font-size-md);
+	text-align: start;
+	text-decoration: none;
+	color: inherit;
+	touch-action: manipulation;
+	-webkit-tap-highlight-color: transparent;
+}

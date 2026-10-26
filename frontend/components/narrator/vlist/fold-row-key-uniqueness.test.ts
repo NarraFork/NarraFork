@@ -26,6 +26,7 @@
  */
 
 import { beforeAll, describe, expect, it } from "bun:test";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 
 beforeAll(() => {
@@ -39,27 +40,35 @@ function toolMessage(messageId: string, toolUseId: string, status: string, strea
 	const input = streaming
 		? { command: "rg foo", _streamingChars: 12 }
 		: ({ command: "rg foo" } as Record<string, unknown>);
-	return {
-		id: messageId,
-		role: "assistant",
-		contentJson: [{ type: "tool_use", id: toolUseId, name: "Bash", input }],
-		toolCalls: [
-			{ id: `c-${toolUseId}-${messageId}`, toolUseId, toolName: "Bash", status, inputJson: input },
-		],
-		children: [],
-	};
+	return rowWithElements(
+		{
+			id: messageId,
+			role: "assistant",
+			toolCalls: [
+				{
+					id: `c-${toolUseId}-${messageId}`,
+					toolUseId,
+					toolName: "Bash",
+					status,
+					inputJson: input,
+				},
+			],
+		},
+		[{ type: "tool_use", id: toolUseId, name: "Bash", input }],
+	);
 }
 
 /** One assistant message carrying a single reasoning block. */
 function reasoningMessage(messageId: string, text: string) {
-	return {
-		id: messageId,
-		model: "gpt-5.6",
-		role: "assistant",
-		contentJson: [{ type: "reasoning", text }],
-		toolCalls: [],
-		children: [],
-	};
+	return rowWithElements(
+		{
+			id: messageId,
+			model: "gpt-5.6",
+			role: "assistant",
+			toolCalls: [],
+		},
+		[{ type: "reasoning", text }],
+	);
 }
 
 /** Every folded row emitted by the low-LOD pipeline, in order. */
@@ -179,13 +188,15 @@ describe("provider retry keeps BOTH rows", () => {
 
 describe("hand-off across an activity-unit boundary", () => {
 	/** An assistant message carrying visible answer text, which BREAKS the fold. */
-	const textMessage = (messageId: string, text: string) => ({
-		id: messageId,
-		role: "assistant",
-		contentJson: [{ type: "text", text }],
-		toolCalls: [],
-		children: [],
-	});
+	const textMessage = (messageId: string, text: string) =>
+		rowWithElements(
+			{
+				id: messageId,
+				role: "assistant",
+				toolCalls: [],
+			},
+			[{ type: "text", text }],
+		);
 
 	it("does not show the same tool twice when text splits the two copies", async () => {
 		// The dedupe is per-unit (it scans the unit being accumulated), so this is the
@@ -256,29 +267,32 @@ describe("invariant: no folded trace ever holds a duplicate row key", () => {
 			case "pendingA":
 				return toolMessage(`m${counter}`, "tu-P", "pending");
 			case "text":
-				return {
-					id: `m${counter}`,
-					role: "assistant",
-					contentJson: [{ type: "text", text: "答案正文。" }],
-					toolCalls: [],
-					children: [],
-				};
+				return rowWithElements(
+					{
+						id: `m${counter}`,
+						role: "assistant",
+						toolCalls: [],
+					},
+					[{ type: "text", text: "答案正文。" }],
+				);
 			case "user":
-				return {
-					id: `m${counter}`,
-					role: "user",
-					contentJson: [{ type: "text", text: "问题" }],
-					toolCalls: [],
-					children: [],
-				};
+				return rowWithElements(
+					{
+						id: `m${counter}`,
+						role: "user",
+						toolCalls: [],
+					},
+					[{ type: "text", text: "问题" }],
+				);
 			case "reason":
-				return {
-					id: `m${counter}`,
-					role: "assistant",
-					contentJson: [{ type: "reasoning", text: "**一步**\n\n正文。" }],
-					toolCalls: [],
-					children: [],
-				};
+				return rowWithElements(
+					{
+						id: `m${counter}`,
+						role: "assistant",
+						toolCalls: [],
+					},
+					[{ type: "reasoning", text: "**一步**\n\n正文。" }],
+				);
 		}
 	}
 
@@ -338,14 +352,16 @@ describe("invariant: no folded trace ever holds a duplicate row key", () => {
 		const { recentRunSegmentMessageIds } = await import("../trace/run-segments");
 
 		const withSeq = (message: Record<string, unknown>, seq: number) => ({ ...message, seq });
-		const textMessage = (messageId: string, seq: number) => ({
-			id: messageId,
-			seq,
-			role: "assistant",
-			contentJson: [{ type: "text", text: "答案正文。" }],
-			toolCalls: [],
-			children: [],
-		});
+		const textMessage = (messageId: string, seq: number) =>
+			rowWithElements(
+				{
+					id: messageId,
+					seq,
+					role: "assistant",
+					toolCalls: [],
+				},
+				[{ type: "text", text: "答案正文。" }],
+			);
 
 		const shapes: Array<[string, unknown[]]> = [
 			[

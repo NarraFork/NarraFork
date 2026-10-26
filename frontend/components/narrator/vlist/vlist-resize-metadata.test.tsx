@@ -1,5 +1,6 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import type { TreeMessage } from "@frontend/lib/api/types";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { parseHTML } from "linkedom";
 import { act, useMemo, useRef } from "react";
 import { createRoot, type Root } from "react-dom/client";
@@ -220,18 +221,21 @@ const view = () => ({ scrollTop: 0, viewportHeight: 260, pinnedToBottom: false }
 let fixtureId = 0;
 async function fixture() {
 	const narratorId = `metadata-fixture-${++fixtureId}`;
-	const messages: TreeMessage[] = Array.from({ length: 120 }, (_, seq) => ({
-		id: `${narratorId}-m${seq}`,
-		narratorId,
-		parentToolUseId: null,
-		role: "assistant",
-		contentJson: [{ type: "text", text: `Paragraph ${seq}. ${"Wrapping content. ".repeat(20)}` }],
-		contentText: null,
-		toolCalls: [],
-		createdAt: "2026-08-01T00:00:00.000Z",
-		children: [],
-		seq,
-	}));
+	const messages: TreeMessage[] = Array.from({ length: 120 }, (_, seq) =>
+		rowWithElements(
+			{
+				id: `${narratorId}-m${seq}`,
+				narratorId,
+				parentToolUseId: null,
+				role: "assistant",
+				contentText: null,
+				toolCalls: [],
+				createdAt: "2026-08-01T00:00:00.000Z",
+				seq,
+			},
+			[{ type: "text", text: `Paragraph ${seq}. ${"Wrapping content. ".repeat(20)}` }],
+		),
+	);
 	const coordinator = new PretextLayoutCoordinator();
 	await coordinator.load(narratorId, build, {
 		fetchPage: async (_id, options) => {
@@ -358,7 +362,11 @@ describe("width previews retain production semantic metadata", () => {
 		if (!message) throw new Error("Expected first message");
 		const text = "Fresh complete modal bytes after the payload landed.";
 		expect(
-			coordinator.upsertMessage({ ...message, contentJson: [{ type: "text", text }] }, false, view),
+			coordinator.upsertMessage(
+				rowWithElements({ ...message }, [{ type: "text", text }]),
+				false,
+				view,
+			),
 		).toBe(true);
 		const committed = complete(coordinator);
 		expect(committed.semanticItems).not.toBe(baseline.semanticItems);
@@ -420,11 +428,13 @@ it("projects production markers across width/footer frames without reading offsc
 	const previous = messages.at(-2);
 	if (!previous) throw new Error("Missing compact message");
 	coordinator.upsertMessage(
-		{
-			...previous,
-			role: "user",
-			contentJson: [{ type: "segment_compact", status: "failed", error: "Historical failure" }],
-		},
+		rowWithElements(
+			{
+				...previous,
+				role: "user",
+			},
+			[{ type: "segment_compact", status: "failed", error: "Historical failure" }],
+		),
 		false,
 		view,
 	);

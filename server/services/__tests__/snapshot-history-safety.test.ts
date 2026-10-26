@@ -13,7 +13,6 @@ import {
 } from "../../db/schema";
 import { generateId } from "../../lib/id";
 import { logger } from "../../lib/logger";
-import { batchDeleteBlocksSchema } from "../../lib/validators/narrators";
 import * as scopedRevert from "../narrator-scoped-revert";
 import { narratorService } from "../narrator-service";
 import * as snapshotRevert from "../snapshot-revert";
@@ -814,7 +813,7 @@ describe("fixed block selection and shared-message COW", () => {
 		).toBeDefined();
 	});
 
-	test("duplicate indices are removed once by both validator and service", async () => {
+	test("duplicate indices are removed once by the service", async () => {
 		const { narratorId, cwd } = fixture();
 		const toolUseId = generateId();
 		const original: Block[] = [
@@ -830,7 +829,6 @@ describe("fixed block selection and shared-message COW", () => {
 			{ messageId, blockIndex: 0 },
 			{ messageId, blockIndex: 0 },
 		];
-		expect(batchDeleteBlocksSchema.parse({ blocks: selection }).blocks).toHaveLength(1);
 		const result = await narratorService.deleteMessageBlocks(narratorId, selection);
 		expect(result).toMatchObject({ deleted: 1, failed: 0 });
 		expect(result.results).toHaveLength(1);

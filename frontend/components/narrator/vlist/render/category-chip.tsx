@@ -11,8 +11,8 @@
  * supply the inner glyph (shared size 9); the component does no layout of its own.
  */
 
-import { ThemeIcon } from "@mantine/core";
 import type { ReactNode } from "react";
+import { RowChip } from "./row-chrome";
 
 export interface CategoryChipProps {
 	/** Mantine theme colour name from CATEGORY_COLOR (bash → "orange"). */
@@ -31,14 +31,15 @@ export interface CategoryChipProps {
 }
 
 /**
- * Always `ThemeIcon variant="light"` + the category colour + `radius="sm"`.
- * Never mix status colours into this chip — running/fail/cancelled live on the
- * status glyph and text shimmer, not on the category tile.
+ * Always the `ThemeIcon variant="light"` look + the category colour + `radius="sm"`,
+ * painted by `RowChip` (the same theme colour resolver, without a Mantine component
+ * per mounted row). Never mix status colours into this chip — running/fail/cancelled
+ * live on the status glyph and text shimmer, not on the category tile.
  */
 export function CategoryChip({ color, size, children, ...dataAttrs }: CategoryChipProps) {
 	return (
-		<ThemeIcon {...dataAttrs} size={size} variant="light" color={color} radius="sm">
+		<RowChip {...dataAttrs} size={size} color={color}>
 			{children}
-		</ThemeIcon>
+		</RowChip>
 	);
 }

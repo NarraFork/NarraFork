@@ -6,6 +6,7 @@
  */
 
 import { describe, expect, test } from "bun:test";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { findLatestSpecTasksToolUseId } from "../narrator-message-helpers";
 import type { NarratorMsg } from "../narrator-panel-types";
 import {
@@ -39,12 +40,12 @@ describe("findLatestSpecTasksToolUseIdInMessages", () => {
 		id: string,
 		tool: { id: string; name: string; input: unknown } | null,
 	): SpecTasksMessageLike {
-		return {
-			contentJson: tool
-				? [{ type: "tool_use", id: tool.id, name: tool.name, input: tool.input }]
-				: [],
-			toolCalls: tool ? [{ toolUseId: tool.id, toolName: tool.name, inputJson: tool.input }] : [],
-		};
+		return rowWithElements(
+			{
+				toolCalls: tool ? [{ toolUseId: tool.id, toolName: tool.name, inputJson: tool.input }] : [],
+			},
+			tool ? [{ type: "tool_use", id: tool.id, name: tool.name, input: tool.input }] : [],
+		);
 	}
 
 	test("returns null when nothing touched tasks.json", () => {

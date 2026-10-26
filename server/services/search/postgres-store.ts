@@ -44,18 +44,22 @@ import { filterSql, messageScopeSql, narratorScopeSql } from "./scope";
 import {
 	type EntitySearchQuery,
 	GLOBAL_SNIPPET,
+	groupSessionAggregates,
 	KNOWLEDGE_SNIPPET,
 	type KnowledgeDraftSearchQuery,
 	type KnowledgeSearchQuery,
 	type KnowledgeSearchRow,
+	latestHitCount,
 	type MessageSearchRow,
 	type NarratorSearchRow,
+	orderSessionAggregates,
 	PREVIEW_CHARS,
 	RECALL_SNIPPET,
 	type RecallMessageRow,
 	type RecallSearchQuery,
 	type SessionAggregateQuery,
 	type SessionAggregateRow,
+	type SessionHitDetailsQuery,
 	type SessionHitsQuery,
 	type ShadowedEntryQuery,
 	type SnippetFormat,
@@ -430,6 +434,25 @@ function sessionHitsCte(query: EntitySearchQuery, params: Params, extra = ""): s
 	)`;
 }
 
+/** Ceiling on the hits one details read returns, as on SQLite. */
+const MAX_HIT_DETAILS = 500;
+
+/** A session hit row. This backend has no block index, so the excerpt is the text's own. */
+function toHitRow(row: Row, rank: number | null): MessageSearchRow {
+	return {
+		id: strOr(row, "id", ""),
+		narratorId: str(row, "narrator_id"),
+		narratorTitle: str(row, "narrator_title"),
+		projectName: str(row, "project_name"),
+		model: str(row, "model"),
+		messageRole: str(row, "message_role"),
+		createdAt: str(row, "created_at"),
+		snippet: str(row, "snippet") ?? "",
+		preview: str(row, "content_preview") ?? "",
+		rank,
+	};
+}
+
 export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 	const run = async (text: string, params: Params): Promise<Row[]> =>
 		client.unsafe(text, params.list);
@@ -543,40 +566,70 @@ export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 		async searchSessionAggregates(query: SessionAggregateQuery): Promise<SessionAggregateRow[]> {
 			const params = new Params();
 			const cte = sessionHitsCte(query, params);
-			const order =
-				query.sort === "time"
-					? "agg.last_hit_at DESC, agg.narrator_id ASC"
-					: "agg.best_rank IS NULL, agg.best_rank ASC, agg.hit_count DESC, agg.last_hit_at DESC, agg.narrator_id ASC";
+			const latest = latestHitCount(query);
+			// The SQLite store's single pass: counts per narrator plus the newest few hits.
 			const rows = await run(
-				`${cte}, agg AS (
-					SELECT narrator_id, MIN(r) AS best_rank, COUNT(*) AS hit_count, MAX(created_at) AS last_hit_at
-					 FROM per_msg GROUP BY narrator_id
+				`${cte}, ranked AS (
+					SELECT id, narrator_id, created_at, block_id,
+						  ROW_NUMBER() OVER (PARTITION BY narrator_id ORDER BY created_at DESC, id ASC) AS rn,
+						  COUNT(*) OVER (PARTITION BY narrator_id) AS hit_count,
+						  MIN(r) OVER (PARTITION BY narrator_id) AS best_rank,
+						  MAX(created_at) OVER (PARTITION BY narrator_id) AS last_hit_at
+					 FROM per_msg
 				)
-				SELECT agg.narrator_id, agg.best_rank, agg.hit_count, agg.last_hit_at,
+				SELECT ranked.narrator_id, ranked.best_rank, ranked.hit_count, ranked.last_hit_at,
+					  ranked.rn, ranked.id AS hit_id, ranked.block_id AS hit_block_id,
+					  ranked.created_at AS hit_created_at,
 					  n.title, n.type, n.subagent_type, n.status, n.last_message_at,
 					  n.created_at, n.updated_at, p.id AS project_id, p.name AS project_name
-				 FROM agg
-				 JOIN narrators n ON n.id = agg.narrator_id
+				 FROM ranked
+				 JOIN narrators n ON n.id = ranked.narrator_id
 				 ${PROJECT_JOIN}
-				 ORDER BY ${order}
-				 LIMIT ${params.add(query.limit)}`,
+				 WHERE ranked.rn <= ${params.add(Math.max(1, latest))}
+				 ORDER BY ranked.narrator_id ASC, ranked.rn ASC`,
 				params,
 			);
-			return rows.map((row) => ({
-				narratorId: strOr(row, "narrator_id", ""),
-				bestRank: rankOf({ rank_score: row.best_rank }, query.strategy),
-				hitCount: Number(row.hit_count) || 0,
-				lastHitAt: str(row, "last_hit_at"),
-				title: str(row, "title"),
-				type: str(row, "type"),
-				subagentType: str(row, "subagent_type"),
-				status: str(row, "status"),
-				projectId: str(row, "project_id"),
-				projectName: str(row, "project_name"),
-				lastMessageAt: str(row, "last_message_at"),
-				createdAt: str(row, "created_at"),
-				updatedAt: str(row, "updated_at"),
-			}));
+			return orderSessionAggregates(
+				groupSessionAggregates(rows, latest, (row) => ({
+					narratorId: strOr(row, "narrator_id", ""),
+					bestRank: rankOf({ rank_score: row.best_rank }, query.strategy),
+					hitCount: Number(row.hit_count) || 0,
+					lastHitAt: str(row, "last_hit_at"),
+					title: str(row, "title"),
+					type: str(row, "type"),
+					subagentType: str(row, "subagent_type"),
+					status: str(row, "status"),
+					projectId: str(row, "project_id"),
+					projectName: str(row, "project_name"),
+					lastMessageAt: str(row, "last_message_at"),
+					createdAt: str(row, "created_at"),
+					updatedAt: str(row, "updated_at"),
+					latestHits: [],
+				})),
+				query.sort,
+				query.limit,
+			);
+		},
+
+		async searchSessionHitDetails(query: SessionHitDetailsQuery): Promise<MessageSearchRow[]> {
+			const refs = query.refs.slice(0, MAX_HIT_DETAILS);
+			if (refs.length === 0) return [];
+			const params = new Params();
+			const values = refs
+				.map((ref, ord) => `(${params.add(ref.id)}::text, ${params.add(ord)}::int)`)
+				.join(", ");
+			const snippet = snippetSql("m.content_text", globalTerms(query.text), GLOBAL_SNIPPET, params);
+			const rows = await run(
+				`WITH refs(id, ord) AS (VALUES ${values})
+				SELECT ${MESSAGE_COLUMNS}, ${snippet} AS snippet
+				 FROM refs
+				 JOIN narrator_messages m ON m.id = refs.id
+				 JOIN narrators n ON n.id = m.narrator_id
+				 ${PROJECT_JOIN}
+				 ORDER BY refs.ord`,
+				params,
+			);
+			return rows.map((row) => toHitRow(row, null));
 		},
 
 		async searchSessionHits(query: SessionHitsQuery): Promise<MessageSearchRow[]> {
@@ -608,18 +661,7 @@ export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 				 ORDER BY ranked.narrator_id ASC, ranked.rn ASC`,
 				params,
 			);
-			return rows.map((row) => ({
-				id: strOr(row, "id", ""),
-				narratorId: str(row, "narrator_id"),
-				narratorTitle: str(row, "narrator_title"),
-				projectName: str(row, "project_name"),
-				model: str(row, "model"),
-				messageRole: str(row, "message_role"),
-				createdAt: str(row, "created_at"),
-				snippet: str(row, "snippet") ?? "",
-				preview: str(row, "content_preview") ?? "",
-				rank: rankOf(row, query.strategy),
-			}));
+			return rows.map((row) => toHitRow(row, rankOf(row, query.strategy)));
 		},
 
 		async searchTimeline(query: TimelineSearchQuery): Promise<TimelineSearchRow[]> {

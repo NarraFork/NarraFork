@@ -18,6 +18,7 @@
 
 import { beforeAll, describe, expect, it } from "bun:test";
 import type { TreeMessage } from "@frontend/lib/api/types";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 
 beforeAll(() => {
@@ -42,18 +43,19 @@ const BUILD = {
 // "data" is a plain string, so it carries no content signature in its key. Real ids
 // are nanoids, so only fixtures can collide.
 function message(seq: number, role: "user" | "assistant" = "assistant"): TreeMessage {
-	return {
-		id: `append-m${seq}`,
-		narratorId: "n1",
-		parentToolUseId: null,
-		role,
-		contentJson: [{ type: "text", text: "词".repeat(80) }],
-		contentText: "词".repeat(80),
-		toolCalls: [],
-		createdAt: "2026-07-28T00:00:00.000Z",
-		children: [],
-		seq,
-	} as unknown as TreeMessage;
+	return rowWithElements(
+		{
+			id: `append-m${seq}`,
+			narratorId: "n1",
+			parentToolUseId: null,
+			role,
+			contentText: "词".repeat(80),
+			toolCalls: [],
+			createdAt: "2026-07-28T00:00:00.000Z",
+			seq,
+		},
+		[{ type: "text", text: "词".repeat(80) }],
+	) as unknown as TreeMessage;
 }
 
 async function loaded(count = 30) {
@@ -193,21 +195,25 @@ describe("appendMessage — what falls back to a reload", () => {
 		expect(coordinator.appendMessage(message(count), false, atBottom)).toBe(false);
 		expect(coordinator.appendMessage(message(5), false, atBottom)).toBe(false);
 		// A structural marker that still restructures the document keeps the reload.
-		const askMarker = {
-			...message(count + 1),
-			role: "system",
-			contentJson: [{ type: "ask_in_passing" }],
-		} as unknown as TreeMessage;
+		const askMarker = rowWithElements(
+			{
+				...message(count + 1),
+				role: "system",
+			},
+			[{ type: "ask_in_passing" }],
+		) as unknown as TreeMessage;
 		expect(coordinator.appendMessage(askMarker, false, atBottom)).toBe(false);
 	});
 
 	it("appends a tail compact marker in place — deferring it was the reported bug", async () => {
 		const { coordinator, state, count } = await loaded();
-		const compactMarker = {
-			...message(count),
-			role: "system",
-			contentJson: [{ type: "compact", status: "compacting" }],
-		} as unknown as TreeMessage;
+		const compactMarker = rowWithElements(
+			{
+				...message(count),
+				role: "system",
+			},
+			[{ type: "compact", status: "compacting" }],
+		) as unknown as TreeMessage;
 		// Its "history before me is compacted away" meaning belongs to the server's
 		// NEXT load; a reader's already-loaded window simply gains the marker row.
 		expect(coordinator.appendMessage(compactMarker, false, atBottom)).toBe(true);

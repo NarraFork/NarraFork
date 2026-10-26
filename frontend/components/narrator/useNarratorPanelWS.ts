@@ -1,6 +1,7 @@
 import { notifications } from "@mantine/notifications";
 import { quotaProviderLabel } from "@shared/agent-protocol/quota-exhausted";
 import { type ContextUsageSnapshot, parseContextUsageSnapshot } from "@shared/context-usage";
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import type { ProgressSnapshot } from "@shared/progress-phase";
 import { useQueryClient } from "@tanstack/react-query";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
@@ -28,6 +29,7 @@ import {
 } from "./context-management/context-usage-state";
 import { localizeNarratorError } from "./error-localization";
 import { withQueueSubstatus } from "./header/narrator-status-bar";
+import { isForeignSubagentRow } from "./message/nested-rows";
 import type {
 	ContentBlock,
 	NarratorMsg,
@@ -929,7 +931,13 @@ export function useNarratorPanelWS(opts: UseNarratorPanelWSOptions): UseNarrator
 				clearRetryIfActive();
 			},
 			onMessage: (wsData: { message?: NarratorMsg; [key: string]: unknown }) => {
-				const blocks = Array.isArray(wsData.message?.contentJson) ? wsData.message.contentJson : [];
+				// A subagent's row is dual-broadcast to this page too, tagged with
+				// `parentToolUseId` (see `isForeignSubagentRow`). Nothing derived from it may
+				// touch THIS conversation's state — most visibly it used to look like an
+				// assistant answer, so a subagent finishing its turn cleared this panel's
+				// queued-message and retry chips while the parent was still running.
+				if (isForeignSubagentRow(wsData.message, !!isSubagent)) return;
+				const blocks = messageBody(wsData.message);
 				const compactBlock = blocks.find(
 					(b: ContentBlock) =>
 						(b.type === "compact" && b.subtype !== "plan") || b.type === "segment_compact",

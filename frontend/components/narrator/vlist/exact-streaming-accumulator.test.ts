@@ -1,4 +1,5 @@
-import { describe, expect, it } from "bun:test";
+import { beforeEach, describe, expect, it } from "bun:test";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import type { StreamingBlock } from "../message/message-segments";
 import {
 	applyExactStreamDelta,
@@ -7,11 +8,21 @@ import {
 	type StreamDeltaEvent,
 } from "./exact-streaming-accumulator";
 
+/** Each lane's next revision and raw offset, as the server stamps them. */
+const lanes = new Map<string, { revision: number; textOffset: number }>();
+beforeEach(() => lanes.clear());
+function stamp(id: string, text: string): { id: string; revision: number; textOffset: number } {
+	const lane = lanes.get(id) ?? { revision: 0, textOffset: 0 };
+	const next = { id, revision: lane.revision + 1, textOffset: lane.textOffset };
+	lanes.set(id, { revision: next.revision, textOffset: lane.textOffset + text.length });
+	return next;
+}
+
 function textDelta(text: string, outputIndex?: number): StreamDeltaEvent {
 	return {
 		type: "content_block_delta",
 		...(outputIndex != null ? { outputIndex } : {}),
-		delta: { type: "text_delta", text },
+		delta: { type: "text_delta", text, ...stamp(`text:${outputIndex ?? 0}`, text) },
 	};
 }
 
@@ -21,7 +32,7 @@ function reasoningDelta(text: string, id?: string, outputIndex?: number): Stream
 		delta: {
 			type: "reasoning_delta",
 			text,
-			...(id ? { id } : {}),
+			...stamp(id ?? `reasoning:${outputIndex ?? 0}`, text),
 			...(outputIndex != null ? { outputIndex } : {}),
 		},
 	};
@@ -39,7 +50,14 @@ describe("snapshot animation baseline classification", () => {
 		).toEqual({ changed: true, textChanged: false });
 		expect(
 			applyExactStreamingSnapshotUpdate(blocks, [
-				{ type: "text", id: "t", text: "已有内容", revision: 2, fileReferenceContext: null },
+				{
+					type: "text",
+					id: "t",
+					text: "已有内容",
+					revision: 2,
+					textOffset: 0,
+					fileReferenceContext: null,
+				},
 			]),
 		).toEqual({ changed: true, textChanged: false });
 		expect(
@@ -88,7 +106,7 @@ describe("exact-streaming-accumulator", () => {
 		const blocks: StreamingBlock[] = [];
 		expect(applyExactStreamDelta(blocks, textDelta("Hello"), false).applied).toBe(true);
 		expect(applyExactStreamDelta(blocks, textDelta(", world"), false).applied).toBe(true);
-		expect(blocks).toEqual([{ type: "text", text: "Hello, world" }]);
+		expect(blocks).toMatchObject([{ type: "text", text: "Hello, world", revision: 2 }]);
 	});
 
 	it("keeps distinct output indices as separate ordered text blocks", () => {
@@ -96,7 +114,7 @@ describe("exact-streaming-accumulator", () => {
 		applyExactStreamDelta(blocks, textDelta("second", 1), false);
 		applyExactStreamDelta(blocks, textDelta("first", 0), false);
 		applyExactStreamDelta(blocks, textDelta(" more", 0), false);
-		expect(blocks).toEqual([
+		expect(blocks).toMatchObject([
 			{ type: "text", text: "first more", outputIndex: 0 },
 			{ type: "text", text: "second", outputIndex: 1 },
 		]);
@@ -106,7 +124,7 @@ describe("exact-streaming-accumulator", () => {
 		const blocks: StreamingBlock[] = [];
 		expect(applyExactStreamDelta(blocks, reasoningDelta("think", "r1"), false).applied).toBe(true);
 		expect(applyExactStreamDelta(blocks, reasoningDelta("ing", "r1"), false).applied).toBe(true);
-		expect(blocks).toEqual([{ type: "reasoning", text: "thinking", id: "r1" }]);
+		expect(blocks).toMatchObject([{ type: "reasoning", text: "thinking", id: "r1" }]);
 	});
 
 	it("ignores non-delta events and empty deltas", () => {
@@ -121,7 +139,7 @@ describe("exact-streaming-accumulator", () => {
 		const subagentEvent: StreamDeltaEvent = {
 			type: "content_block_delta",
 			subagentToolUseId: "child-tool",
-			delta: { type: "text_delta", text: "child" },
+			delta: { type: "text_delta", text: "child", id: "child:0", revision: 1, textOffset: 0 },
 		};
 		const topLevel: StreamingBlock[] = [];
 		expect(applyExactStreamDelta(topLevel, subagentEvent, false).applied).toBe(false);
@@ -129,53 +147,56 @@ describe("exact-streaming-accumulator", () => {
 
 		const subagentPage: StreamingBlock[] = [];
 		expect(applyExactStreamDelta(subagentPage, subagentEvent, true).applied).toBe(true);
-		expect(subagentPage).toEqual([{ type: "text", text: "child" }]);
+		expect(subagentPage).toMatchObject([{ type: "text", text: "child", id: "child:0" }]);
 	});
 
-	// A relay that streams a text block with NO output index, mixed into a stream
-	// that does carry them (see the note in anthropic-provider's delta decoder). The
-	// un-indexed delta belongs to its own lane: merging it into the last block joined
-	// two different provider outputs into one paragraph.
-	it("keeps an un-indexed text delta out of an INDEXED block", () => {
+	// The server names every delta's element, revision and raw offset; a delta that does
+	// not cannot be placed in a lane exactly, so it is not applied.
+	it("ignores a delta that does not name its element, revision and offset", () => {
 		const blocks: StreamingBlock[] = [];
-		applyExactStreamDelta(blocks, textDelta("indexed", 0), false);
-		applyExactStreamDelta(blocks, textDelta("bare"), false);
-		expect(blocks).toEqual([
-			{ type: "text", text: "indexed", outputIndex: 0 },
-			{ type: "text", text: "bare" },
-		]);
-	});
-
-	it("accumulates further un-indexed deltas into the un-indexed block", () => {
-		const blocks: StreamingBlock[] = [];
-		applyExactStreamDelta(blocks, textDelta("indexed", 0), false);
-		applyExactStreamDelta(blocks, textDelta("bare"), false);
-		applyExactStreamDelta(blocks, textDelta(" more"), false);
-		// ...and the indexed lane keeps growing independently.
-		applyExactStreamDelta(blocks, textDelta(" tail", 0), false);
-		expect(blocks).toEqual([
-			{ type: "text", text: "indexed tail", outputIndex: 0 },
-			{ type: "text", text: "bare more" },
-		]);
+		const bare = (delta: Record<string, unknown>): StreamDeltaEvent => ({
+			type: "content_block_delta",
+			outputIndex: 0,
+			delta: { type: "text_delta", text: "bare", ...delta },
+		});
+		expect(applyExactStreamDelta(blocks, bare({}), false).applied).toBe(false);
+		expect(applyExactStreamDelta(blocks, bare({ id: "t", revision: 1 }), false).applied).toBe(
+			false,
+		);
+		expect(applyExactStreamDelta(blocks, bare({ id: "t", textOffset: 0 }), false).applied).toBe(
+			false,
+		);
+		expect(blocks).toEqual([]);
 	});
 
 	it("merges a reconnect snapshot without regressing already-shown longer text", () => {
-		const blocks: StreamingBlock[] = [{ type: "text", text: "abcdef", outputIndex: 0 }];
-		// A shorter snapshot for the same block must not shrink it.
-		const changed = applyExactStreamingSnapshot(blocks, [
-			{ type: "text", text: "abc", outputIndex: 0 },
-		]);
+		const live = (text: string, revision: number): StreamingBlock => ({
+			type: "text",
+			id: "t",
+			revision,
+			textOffset: 0,
+			text,
+			outputIndex: 0,
+		});
+		const blocks: StreamingBlock[] = [live("abcdef", 2)];
+		// An older snapshot for the same block must not shrink it.
+		const changed = applyExactStreamingSnapshot(blocks, [live("abc", 1)]);
 		expect(changed).toBe(false);
-		expect(blocks).toEqual([{ type: "text", text: "abcdef", outputIndex: 0 }]);
+		expect(blocks).toEqual([live("abcdef", 2)]);
 	});
 
 	it("fills a gap from the snapshot when the block is missing", () => {
 		const blocks: StreamingBlock[] = [];
-		const changed = applyExactStreamingSnapshot(blocks, [
-			{ type: "reasoning", text: "restored", id: "r9" },
-		]);
+		const restored: StreamingBlock = {
+			type: "reasoning",
+			text: "restored",
+			id: "r9",
+			revision: 1,
+			textOffset: 0,
+		};
+		const changed = applyExactStreamingSnapshot(blocks, [restored]);
 		expect(changed).toBe(true);
-		expect(blocks).toEqual([{ type: "reasoning", text: "restored", id: "r9" }]);
+		expect(blocks).toEqual([restored]);
 	});
 
 	it("returns false for an empty snapshot", () => {
@@ -201,11 +222,11 @@ describe("blockIndex — where the delta landed", () => {
 		const blocks: StreamingBlock[] = [];
 		const first = applyExactStreamDelta(blocks, reasoningDelta("think", "r1"), false);
 		expect(first.blockIndex).toBe(0);
-		expect(blocks[first.blockIndex]).toEqual({ type: "reasoning", text: "think", id: "r1" });
+		expect(blocks[first.blockIndex]).toMatchObject({ type: "reasoning", text: "think", id: "r1" });
 
 		const second = applyExactStreamDelta(blocks, textDelta("answer"), false);
 		expect(second.blockIndex).toBe(1);
-		expect(blocks[second.blockIndex]).toEqual({ type: "text", text: "answer" });
+		expect(blocks[second.blockIndex]).toMatchObject({ type: "text", text: "answer" });
 	});
 
 	it("returns the EXISTING index when a delta continues a block", () => {
@@ -215,7 +236,7 @@ describe("blockIndex — where the delta landed", () => {
 		// The reasoning lane reopens: the stamp must point back at index 0, not append.
 		const again = applyExactStreamDelta(blocks, reasoningDelta("c", "r1"), false);
 		expect(again.blockIndex).toBe(0);
-		expect(blocks[0]).toEqual({ type: "reasoning", text: "ac", id: "r1" });
+		expect(blocks[0]).toMatchObject({ type: "reasoning", text: "ac", id: "r1" });
 	});
 
 	// The interleaved case the stamp exists for: reasoning → tool → reasoning, where
@@ -228,7 +249,7 @@ describe("blockIndex — where the delta landed", () => {
 		const reopened = applyExactStreamDelta(blocks, reasoningDelta(" more", undefined, 0), false);
 		expect(reopened.blockIndex).toBe(0);
 		expect(reopened.blockIndex).toBeLessThan(blocks.length - 1);
-		expect(blocks[0]).toEqual({
+		expect(blocks[0]).toMatchObject({
 			type: "reasoning",
 			text: "first round more",
 			outputIndex: 0,
@@ -253,7 +274,11 @@ describe("blockIndex — where the delta landed", () => {
 		const first = applyExactStreamDelta(blocks, textDelta("first", 0), false);
 		expect(first.blockIndex).toBe(0);
 		// The stale stamp now points at the NEW block, not the one it was taken for.
-		expect(blocks[second.blockIndex]).toEqual({ type: "text", text: "first", outputIndex: 0 });
+		expect(blocks[second.blockIndex]).toMatchObject({
+			type: "text",
+			text: "first",
+			outputIndex: 0,
+		});
 		// ...and a fresh delta for the original lane reports its shifted position.
 		const secondAgain = applyExactStreamDelta(blocks, textDelta("!", 1), false);
 		expect(secondAgain.blockIndex).toBe(1);
@@ -268,7 +293,7 @@ describe("blockIndex — where the delta landed", () => {
 		const blocks: StreamingBlock[] = [];
 		applyExactStreamDelta(blocks, reasoningDelta("thinking", undefined, 0), false);
 		const answer = applyExactStreamDelta(blocks, textDelta("answer", 1), false);
-		const msg = { contentJson: blocks, liveBlockIndex: answer.blockIndex };
+		const msg = rowWithElements({ liveBlockIndex: answer.blockIndex }, blocks);
 
 		expect(resolveLiveBlockIndex(true, msg)).toBe(answer.blockIndex);
 		// The reasoning run has settled; only the text lane is live.
@@ -278,7 +303,7 @@ describe("blockIndex — where the delta landed", () => {
 		// Reasoning reopens mid-turn: the stamp moves back to the middle block, and the
 		// consumer follows it rather than the array's tail.
 		const reopened = applyExactStreamDelta(blocks, reasoningDelta("!", undefined, 0), false);
-		const reopenedMsg = { contentJson: blocks, liveBlockIndex: reopened.blockIndex };
+		const reopenedMsg = rowWithElements({ liveBlockIndex: reopened.blockIndex }, blocks);
 		expect(isLiveStreamingBlock(true, reopenedMsg, 0)).toBe(true);
 		expect(isLiveStreamingBlock(true, reopenedMsg, blocks.length - 1)).toBe(false);
 	});

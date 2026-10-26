@@ -192,7 +192,7 @@ describe("anonymous public share fetch boundary", () => {
 		await client.post("hello", "message-1", signal);
 		expect(calls.map((call) => call.url)).toEqual([
 			"/api/public/narrator-shares/share-id",
-			"/api/public/narrator-shares/share-id/pretext-document?beforeSeq=123&limit=50&messageVersion=7&protocol=2",
+			"/api/public/narrator-shares/share-id/pretext-document?beforeSeq=123&limit=50&messageVersion=7",
 			"/api/public/narrator-shares/share-id/discussion?limit=50&beforeSeq=100",
 			"/api/public/narrator-shares/share-id/tool-calls/tool-1",
 			"/api/public/narrator-shares/share-id/message-location/msg-1",

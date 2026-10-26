@@ -38,7 +38,7 @@ import {
 import * as fileEditInterject from "../../services/file-edit-interject";
 import * as sessionState from "../../services/narrator-session-state";
 
-// Actual app, session JWT, application DB, ACL, local backend and journal. The
+// Actual app, session token, application DB, ACL, local backend and journal. The
 // preload owns every file/database here; only faults and synchronization points
 // are injected. Never reset the process coordinator or the default runtime.
 let workspace: string;
@@ -72,7 +72,7 @@ beforeEach(async () => {
 			updatedAt: now,
 		})
 		.run();
-	token = await createToken(userId, "user");
+	token = await createToken(userId);
 	settings.workspace.treeSnapshotsEnabled = false;
 	applyCalls = 0;
 	io = {

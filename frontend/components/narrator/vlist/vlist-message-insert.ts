@@ -44,10 +44,13 @@
  * Pure: no React, no DOM, no network.
  */
 
+import { isNestedRow } from "../message/nested-rows";
+
 /** The subset of a message this module reads. */
 export interface InsertCandidate {
 	id?: unknown;
 	seq?: unknown;
+	parentMessageId?: unknown;
 }
 
 export type InsertRejection =
@@ -100,6 +103,8 @@ export function insertLoadedMessage<T extends InsertCandidate>(
 
 	let insertAt = -1;
 	for (let index = 0; index < loaded.length; index++) {
+		// Never between a row and the rows nested under it.
+		if (isNestedRow(loaded[index])) continue;
 		const existingSeq = seqOf(loaded[index]);
 		if (existingSeq == null) continue;
 		if (existingSeq >= seq) {

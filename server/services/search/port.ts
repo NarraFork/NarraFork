@@ -54,6 +54,7 @@ import type {
 	RecallSearchQuery,
 	SessionAggregateQuery,
 	SessionAggregateRow,
+	SessionHitDetailsQuery,
 	SessionHitsQuery,
 	ShadowedEntryQuery,
 	TimelineSearchQuery,
@@ -77,6 +78,12 @@ export interface SearchStore {
 	 * block counts once), so a session's hit count is exact rather than a window's share.
 	 */
 	searchSessionAggregates(query: SessionAggregateQuery): Promise<SessionAggregateRow[]>;
+
+	/**
+	 * Hits a session search already found, read back by id with their excerpts. Runs no
+	 * search, so a page of sessions costs reads by primary key.
+	 */
+	searchSessionHitDetails(query: SessionHitDetailsQuery): Promise<MessageSearchRow[]>;
 
 	/**
 	 * The top hits of each listed narrator, gated like `searchMessages`: best first for

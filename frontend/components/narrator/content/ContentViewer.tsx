@@ -128,7 +128,7 @@ interface ContentViewerProps {
 	language?: string;
 	/** Optional file-panel budget, applied to both inline and fullscreen source. */
 	maxHighlightChars?: number;
-	/** Block index within the parent message's contentJson array */
+	/** Element index within the parent message's body (`messageBody`) */
 	blockIndex?: number;
 	/** Whether this content is currently being streamed (enables per-char animation) */
 	streaming?: boolean;

@@ -65,7 +65,13 @@ function describeArc(
 	].join(" ");
 }
 
-function formatMetricDisplay(metric: UsageBreakdownMetric, value: number): string {
+function formatMetricDisplay(
+	metric: UsageBreakdownMetric,
+	value: number | null,
+	emptyLabel: string,
+): string {
+	if (value == null) return emptyLabel;
+	if (metric === "cacheHitRate") return `${(value * 100).toFixed(2)}%`;
 	if (metric === "cost") {
 		return formatCompactNumber(value, {
 			prefix: "$",
@@ -116,11 +122,11 @@ export function UsageBreakdownChart({ filters }: UsageBreakdownChartProps) {
 		if (!data?.entries.length) return [];
 		const entries = data.entries;
 		const total = data.total;
-		if (total === 0) return [];
+		if (total == null || total === 0 || data.metric === "cacheHitRate") return [];
 
 		let currentAngle = -Math.PI / 2; // Start from top
 		return entries.map((entry, index) => {
-			const sweep = (entry.value / total) * Math.PI * 2;
+			const sweep = ((entry.value ?? 0) / total) * Math.PI * 2;
 			const startAngle = currentAngle;
 			const endAngle = currentAngle + sweep;
 			currentAngle = endAngle;
@@ -244,8 +250,12 @@ export function UsageBreakdownChart({ filters }: UsageBreakdownChartProps) {
 									fill="var(--mantine-color-text)"
 								>
 									{hoveredEntry
-										? formatMetricDisplay(metric, hoveredEntry.value)
-										: formatMetricDisplay(metric, data.total)}
+										? formatMetricDisplay(
+												metric,
+												hoveredEntry.value,
+												t("usageHistoryCacheHitRateEmpty"),
+											)
+										: formatMetricDisplay(metric, data.total, t("usageHistoryCacheHitRateEmpty"))}
 								</text>
 							</svg>
 						</div>
@@ -278,10 +288,10 @@ export function UsageBreakdownChart({ filters }: UsageBreakdownChartProps) {
 										{usageDimensionLabel(entry.label, dimension, t("usageHistoryUnattributed"))}
 									</Text>
 									<Text size="xs" fw={500} style={{ flexShrink: 0 }}>
-										{formatMetricDisplay(metric, entry.value)}
+										{formatMetricDisplay(metric, entry.value, t("usageHistoryCacheHitRateEmpty"))}
 									</Text>
 									<Text size="xs" c="dimmed" style={{ flexShrink: 0 }}>
-										{entry.percentage.toFixed(1)}%
+										{metric !== "cacheHitRate" && `${entry.percentage.toFixed(1)}%`}
 									</Text>
 								</Group>
 							))}

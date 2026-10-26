@@ -31,6 +31,8 @@ export const searchSectionsQuerySchema = searchBaseQuerySchema.extend({
 	sections: z.string().max(128).optional(),
 	/** Page size for each requested section. */
 	limit: z.coerce.number().int().min(1).max(100).optional(),
+	/** 1-based page of a single section, in place of `cursor`. */
+	page: z.coerce.number().int().min(1).max(10_000).optional(),
 });
 
 export const searchSessionHitsQuerySchema = searchBaseQuerySchema.extend({

@@ -4,12 +4,12 @@ import {
 	type ShikiToken,
 	subscribeShikiTokens,
 } from "@frontend/lib/shiki-token-cache";
-import { useComputedColorScheme } from "@mantine/core";
 import { useSyncExternalStore } from "react";
+import { useSharedComputedColorScheme } from "./useSharedComputedColorScheme";
 
 /** Shared by virtual-list painters and standalone content; no vlist dependency. */
 export function useShikiThemeName(): string {
-	return useComputedColorScheme("dark") === "light"
+	return useSharedComputedColorScheme("dark") === "light"
 		? "github-light-default"
 		: "github-dark-default";
 }

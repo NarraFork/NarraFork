@@ -14,6 +14,7 @@
 
 import { beforeAll, describe, expect, it } from "bun:test";
 import type { TreeMessage } from "@frontend/lib/api/types";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 
 beforeAll(() => {
@@ -46,34 +47,36 @@ const BUILD = {
 };
 
 function message(seq: number, role: "user" | "assistant", text: string): TreeMessage {
-	return {
-		id: `m${seq}`,
-		narratorId: "n1",
-		parentToolUseId: null,
-		role,
-		contentJson: [{ type: "text", text }],
-		contentText: text,
-		toolCalls: [],
-		createdAt: "2026-07-28T00:00:00.000Z",
-		children: [],
-		seq,
-	} as unknown as TreeMessage;
+	return rowWithElements(
+		{
+			id: `m${seq}`,
+			narratorId: "n1",
+			parentToolUseId: null,
+			role,
+			contentText: text,
+			toolCalls: [],
+			createdAt: "2026-07-28T00:00:00.000Z",
+			seq,
+		},
+		[{ type: "text", text }],
+	) as unknown as TreeMessage;
 }
 
 function streamingRow(chars: number): TreeMessage {
 	const text = "词".repeat(chars);
-	return {
-		id: "__streaming__",
-		narratorId: "n1",
-		parentToolUseId: null,
-		role: "assistant",
-		contentJson: [{ type: "text", id: "streaming:text:0", text }],
-		contentText: null,
-		toolCalls: [],
-		createdAt: "2026-07-28T00:00:00.000Z",
-		children: [],
-		seq: 999_999,
-	} as unknown as TreeMessage;
+	return rowWithElements(
+		{
+			id: "__streaming__",
+			narratorId: "n1",
+			parentToolUseId: null,
+			role: "assistant",
+			contentText: null,
+			toolCalls: [],
+			createdAt: "2026-07-28T00:00:00.000Z",
+			seq: 999_999,
+		},
+		[{ type: "text", id: "streaming:text:0", text }],
+	) as unknown as TreeMessage;
 }
 
 /** A tail page whose seqs start at `startSeq` (so a trim has real history above). */

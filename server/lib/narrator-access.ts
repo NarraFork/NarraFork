@@ -17,7 +17,7 @@ import {
 	type NarratorAclRow,
 	type NarratorPrincipal,
 } from "../services/narrator-acl";
-import type { JwtPayload } from "./auth";
+import type { SessionPayload } from "./auth";
 import { NotFoundError } from "./errors";
 
 /**
@@ -27,7 +27,7 @@ import { NotFoundError } from "./errors";
  * and one such slip would make the entire mechanism decorative.
  */
 export function narratorPrincipalOf(c: Context): NarratorPrincipal {
-	const user = c.get("user") as JwtPayload | undefined;
+	const user = c.get("user") as SessionPayload | undefined;
 	// A missing principal means this route was reached without the auth middleware.
 	// Resolving to an id that matches nothing (and no admin flag) makes that mistake
 	// fail closed — the predicates then hide everything private — instead of throwing

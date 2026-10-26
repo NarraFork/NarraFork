@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import type { BaseContentBlock, TreeMessage } from "@frontend/lib/api/types";
+import { messageBody, rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { isLiveStreamingBlock } from "@shared/pretext-layout/streaming-live-blocks";
 import {
 	projectPendingEmptyReasoning,
@@ -8,15 +9,16 @@ import {
 } from "./streaming-handoff";
 
 function message(contentJson: BaseContentBlock[], id = "a1", extra = {}): TreeMessage {
-	return {
-		id,
-		role: "assistant",
-		parentToolUseId: null,
+	return rowWithElements(
+		{
+			id,
+			role: "assistant",
+			parentToolUseId: null,
+			toolCalls: [],
+			...extra,
+		},
 		contentJson,
-		toolCalls: [],
-		children: [],
-		...extra,
-	} as unknown as TreeMessage;
+	) as unknown as TreeMessage;
 }
 const text = (id: string, revision: number, value = "正文") => ({
 	type: "text",
@@ -38,7 +40,7 @@ describe("block identity/revision handoff projection", () => {
 		}
 		const newer = projectStreamingDocument(committed, live([text("global-b", 4, "AB")], 0));
 		expect(newer).toHaveLength(2);
-		expect(newer[0].contentJson).toEqual([text("global-b", 4, "AB")]);
+		expect(messageBody(newer[0])).toEqual([text("global-b", 4, "AB")]);
 	});
 	it("keeps a different block even when the committed assistant ends in identical text", () => {
 		const streaming = live([text("new", 1)]);
@@ -47,9 +49,9 @@ describe("block identity/revision handoff projection", () => {
 	it("retires each tool independently, never the unrelated text-only remainder", () => {
 		const streaming = live([text("r1", 1), tool("t1"), tool("t2")]);
 		const afterFirst = projectStreamingMessage(streaming, [message([tool("t1")])]);
-		expect(afterFirst?.contentJson).toEqual([text("r1", 1), tool("t2")]);
+		expect(messageBody(afterFirst)).toEqual([text("r1", 1), tool("t2")]);
 		expect(
-			projectStreamingMessage(afterFirst, [message([tool("t1"), tool("t2")])])?.contentJson,
+			messageBody(projectStreamingMessage(afterFirst, [message([tool("t1"), tool("t2")])])),
 		).toEqual([text("r1", 1)]);
 	});
 	it("committed revision wins even when citation cleaning changed its text", () => {
@@ -59,9 +61,11 @@ describe("block identity/revision handoff projection", () => {
 			]),
 		).toBeNull();
 		expect(
-			projectStreamingMessage(live([text("b", 4, "RAW marker MORE")], 0), [
-				message([text("b", 3, "RAW")]),
-			])?.contentJson,
+			messageBody(
+				projectStreamingMessage(live([text("b", 4, "RAW marker MORE")], 0), [
+					message([text("b", 3, "RAW")]),
+				]),
+			),
 		).toEqual([text("b", 4, "RAW marker MORE")]);
 	});
 	it("merges a newer live revision into the real block, with no duplicated row or input mutation", () => {
@@ -73,9 +77,9 @@ describe("block identity/revision handoff projection", () => {
 			live([text("b", 2, "正文 continued"), text("new", 1, "NEW")], 0),
 		);
 		expect(document.map((m) => m.id)).toEqual(["a1", "__streaming__"]);
-		expect(document[0].contentJson).toEqual([text("b", 2, "正文 continued")]);
-		expect(document[1].contentJson).toEqual([text("new", 1, "NEW")]);
-		expect(committed[0].contentJson).toEqual([
+		expect(messageBody(document[0])).toEqual([text("b", 2, "正文 continued")]);
+		expect(messageBody(document[1])).toEqual([text("new", 1, "NEW")]);
+		expect(messageBody(committed[0])).toEqual([
 			{ ...text("b", 1), translatedText: "old translation", citations: [] },
 		]);
 	});
@@ -98,22 +102,19 @@ describe("block identity/revision handoff projection", () => {
 		const committed = [message([text("b", 5)])];
 		expect(projectStreamingDocument(committed, live([text("b", 4)]))).toBe(committed);
 	});
-	it("legacy completed blocks retain the conservative suffix and active-lane checks", () => {
+	it("text that only looks the same never covers a lane", () => {
 		const block = { type: "text", text: "suffix", outputIndex: 0 };
 		const committed = [message([{ ...block, text: "prefix suffix" }])];
-		expect(projectStreamingMessage(live([block]), committed)).toBeNull();
-		expect(projectStreamingMessage(live([block], 0), committed)?.contentJson).toEqual([block]);
-		expect(
-			projectStreamingMessage(live([{ ...block, text: "different" }]), committed),
-		).not.toBeNull();
-	});
-	it("does not match legacy blocks across user turns or parent/child boundaries", () => {
-		const block = { type: "text", text: "same" };
 		const streaming = live([block]);
+		expect(projectStreamingMessage(streaming, committed)).toBe(streaming);
+	});
+	it("does not match provider tool blocks across user turns or parent/child boundaries", () => {
+		const search = { type: "web_search", id: "ws_1", status: "completed" };
+		const streaming = live([search]);
 		expect(
-			projectStreamingMessage(streaming, [message([block]), message([], "u", { role: "user" })]),
+			projectStreamingMessage(streaming, [message([search]), message([], "u", { role: "user" })]),
 		).toBe(streaming);
-		const child = message([block], "child", { parentToolUseId: "agent-tool" });
+		const child = message([search], "child", { parentToolUseId: "agent-tool" });
 		expect(projectStreamingMessage(streaming, [child])).toBe(streaming);
 		expect(projectStreamingMessage(streaming, [child], true)).toBeNull();
 	});
@@ -143,7 +144,7 @@ describe("pending empty reasoning display projection", () => {
 		expect(isLive(projected[0])).toBe(false);
 		expect(isLive(projected[1])).toBe(true);
 		expect(isLive(committed[1])).toBe(false);
-		expect(projected[1].contentJson).toBe(committed[1].contentJson);
+		expect(messageBody(projected[1])).toBe(messageBody(committed[1]));
 	});
 
 	it("stops on idle, interruption or failure (inactive session)", () => {

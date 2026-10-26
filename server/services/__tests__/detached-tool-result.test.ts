@@ -356,7 +356,17 @@ describe("detached tool result durable settlement", () => {
 	test("late plan-tool completion does not touch a new turn's snapshots, title, context or plan hooks", async () => {
 		await seed();
 		const ctx = context();
-		await processEvent({ type: "stream_text", text: "new turn in progress", outputIndex: 0 }, ctx);
+		await processEvent(
+			{
+				type: "stream_text",
+				blockRevision: 1,
+				blockTextOffset: 0,
+				blockId: "text-3",
+				text: "new turn in progress",
+				outputIndex: 0,
+			},
+			ctx,
+		);
 		await processEvent(
 			{ type: "tool_use_chunk", toolUseId: "call", toolName: "Write", inputCharsTotal: 9 },
 			ctx,

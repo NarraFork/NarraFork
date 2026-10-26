@@ -36,21 +36,60 @@ export function commandCodeAuthPath(): string {
 }
 
 /**
+ * CLI 凭据的进程内短缓存。
+ *
+ * 这条读取路径已经进了热门路径：`getVisibleModels()`（Agent 工具描述 → 每个叙述者的每次
+ * 模型请求）和 provider 候选推断都会调用 `resolveCommandCodeToken()`，设置里没填 apiKey 时
+ * 每次都会同步读一遍 auth.json。文件很小，但同步 IO 落在主线程上，不值得每次都做；读失败的
+ * 告警日志同理，不该每步刷一条。
+ *
+ * TTL 取得很短，因为 CLI 可能在后台重新登录或换账号：代价最多是几秒内还看到旧状态。
+ * 需要"就现在"的调用方（状态接口）传 `fresh` 跳过缓存。
+ */
+const AUTH_CACHE_TTL_MS = 5_000;
+
+let authCache: { path: string; at: number; state: CommandCodeAuthState } | undefined;
+
+/** 丢弃缓存：测试隔离，或调用方明确知道 auth.json 刚被改写。 */
+export function invalidateCommandCodeAuthCache(): void {
+	authCache = undefined;
+}
+
+/**
  * 取用凭据：设置页手填的 API key 优先，其次才是 CLI 落盘的 auth.json。
  *
  * 这样用户可以完全不用安装 CLI —— 从 Studio 生成一把 key 填进设置即可；
  * 已经用 CLI 登录过的用户也无需重配。
  */
-export function resolveCommandCodeToken(configuredApiKey?: string): CommandCodeAuthState {
+export function resolveCommandCodeToken(
+	configuredApiKey?: string,
+	options?: { fresh?: boolean },
+): CommandCodeAuthState {
 	const apiKey = configuredApiKey?.trim();
 	if (apiKey) return { credential: { token: apiKey, source: "settings" } };
-	return readCommandCodeAuth();
+	return readCommandCodeAuth(options);
 }
 
 /** 读取并校验凭据；任何失败都返回可读原因而不是抛错，调用方直接展示即可。 */
-export function readCommandCodeAuth(): CommandCodeAuthState {
+export function readCommandCodeAuth(options?: { fresh?: boolean }): CommandCodeAuthState {
+	const path = commandCodeAuthPath();
+	const now = Date.now();
+	if (
+		!options?.fresh &&
+		authCache &&
+		authCache.path === path &&
+		now - authCache.at < AUTH_CACHE_TTL_MS
+	) {
+		return authCache.state;
+	}
+	const state = readCommandCodeAuthUncached(path);
+	authCache = { path, at: now, state };
+	return state;
+}
+
+function readCommandCodeAuthUncached(path: string): CommandCodeAuthState {
 	try {
-		const raw = JSON.parse(readFileSync(commandCodeAuthPath(), "utf8")) as {
+		const raw = JSON.parse(readFileSync(path, "utf8")) as {
 			apiKey?: unknown;
 			userName?: unknown;
 			userId?: unknown;

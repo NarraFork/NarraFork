@@ -13,6 +13,7 @@
  * names the authenticated endpoint the render layer resolves.
  */
 
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import type { ChatAttachment, ChatMessage } from "../../lib/api/chat";
 import type { ContentBlock, TreeMessage } from "../../lib/api/types";
 import { buildChatRows, type ChatRowInput } from "./chat-list-layout";
@@ -105,23 +106,22 @@ export function projectChatDeletion(
 function projectChatRow(row: ChatRowInput, labels: ChatTreeProjectionLabels): TreeMessage {
 	const { message } = row;
 	const deleted = message.deletedAt != null;
-	const contentJson: ContentBlock[] = [];
+	const elements: ContentBlock[] = [];
 	// Attachments stack above the body INSIDE the user bubble (the kernel's user
-	// branch reads image/text_file blocks in contentJson order).
+	// branch reads image/text_file elements in body order).
 	if (!deleted) {
 		for (const attachment of message.attachments) {
-			contentJson.push(projectAttachment(attachment));
+			elements.push(projectAttachment(attachment));
 		}
 	}
-	contentJson.push({ type: "text", text: deleted ? "" : message.contentText } as ContentBlock);
+	elements.push({ type: "text", text: deleted ? "" : message.contentText } as ContentBlock);
 
-	return {
+	const projected = {
 		id: message.id,
 		narratorId: message.roomId,
 		parentToolUseId: null,
 		role: "user",
 		bodyFormat: "markdown",
-		contentJson,
 		contentText: deleted ? "" : message.contentText,
 		toolCalls: [],
 		createdAt: message.createdAt,
@@ -136,7 +136,6 @@ function projectChatRow(row: ChatRowInput, labels: ChatTreeProjectionLabels): Tr
 					...(message.sender.isBot ? { isBot: true } : {}),
 				}
 			: null,
-		children: [],
 		editedAt: message.editedAt,
 		// Kernel passthrough (see TreeMessage's projection-only fields).
 		replyQuote: row.reply
@@ -159,7 +158,8 @@ function projectChatRow(row: ChatRowInput, labels: ChatTreeProjectionLabels): Tr
 			: null,
 		omitHeader: row.grouped,
 		...(deleted ? { deletedLabel: labels.messageDeleted } : {}),
-	} as TreeMessage;
+	} as Omit<TreeMessage, "blocks">;
+	return rowWithElements(projected, elements);
 }
 
 /**

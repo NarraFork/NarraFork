@@ -97,7 +97,7 @@ NarraFork 把 AI 会话、开发工具和团队协作放在一个自托管平台
 server/
   index.ts / app.ts   — Bun.serve() 入口 + Hono 路由注册
   db/                 — Drizzle schema/relations、连接、FTS5、迁移
-  middleware/auth.ts  — requireAuth / requireAdmin JWT 中间件
+  middleware/auth.ts  — requireAuth / requireAdmin 会话鉴权中间件
   lib/                — 认证、validators（Zod）、event-bus、settings、errors、id、上传/分享等
   lib/agent/          — 自定义 AI Agent 框架（loop、多提供商、工具注册）
   lib/mcp/            — MCP 集成
@@ -131,7 +131,7 @@ server/
 
 **数据库：** SQLite 位于 `~/.narrafork/narrafork.db`。主键均为 nanoid 文本 ID。FTS5（trigram tokenizer，支持 CJK）用于叙述者标题和消息全文搜索，触发器同步。
 
-**认证：** JWT 经 `Authorization: Bearer` 头（HTTP）或 `?token=` 查询参数（WebSocket）传递。首个注册用户自动获得管理员权限。
+**认证：** 会话令牌是不透明随机串（`nfs_` 前缀），库中 `auth_sessions` 只存其 SHA-256；经 `Authorization: Bearer` 头（HTTP）或 `?token=` 查询参数（WebSocket）传递。滑动续期在服务端延长 `expires_at`，登出 `POST /api/auth/logout` 只吊销当前会话，`users.token_version` 递增吊销该用户全部会话。旧版 HS256 会话 JWT 不再被接受（升级后需重新登录）；`auth.jwtSecret` 仍用于 MFA 挑战令牌和若干 HMAC。首个注册用户自动获得管理员权限。
 
 ### 前端（`frontend/`）
 
@@ -150,7 +150,7 @@ frontend/
 
 ### API 路由
 
-全部位于 `/api/` 下，路由文件在 `server/routes/`（一个文件一组资源，`new Hono()` + `app.route` 注册）。公开接口：`/api/auth/*`、`/api/health`、`/api/auth/status`；其余均需 JWT。
+全部位于 `/api/` 下，路由文件在 `server/routes/`（一个文件一组资源，`new Hono()` + `app.route` 注册）。公开接口：`/api/auth/*`、`/api/health`、`/api/auth/status`；其余均需会话令牌。
 
 **WebSocket：** `/ws/narrator?token=`（订阅模型），`/ws/terminal?terminalId=&token=`（stdin/stdout 管道）
 

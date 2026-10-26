@@ -23,6 +23,7 @@ import {
 	type BackendState,
 	probeServiceHealth,
 	resolveNarraforkHome,
+	SLOW_START_HINT_MS,
 } from "./backend-process";
 import { showCloseDialog } from "./close-dialog";
 import { requestManagedShutdown } from "./control-client";
@@ -111,6 +112,7 @@ import {
 	readScrollPixelPos,
 	readWstr,
 	redrawWindow,
+	releaseSingleInstanceMutex,
 	removeTrayIcon,
 	restoreScrollPixelPos,
 	revealInFolder,
@@ -147,8 +149,13 @@ import {
 const WM_TRAY = WM_APP + 10;
 /** 第二个启动请求：已在托盘运行时，按用户设置打开前端，不把管理器窗口带到前面。 */
 const WM_OPEN_FRONTEND = WM_APP + 6;
+/** 新版本面板请求旧面板让位（更新后由新 exe 接管托盘与服务托管）。 */
+const WM_MANAGER_HANDOVER = WM_APP + 7;
+/** 新面板等待旧面板释放单实例互斥体的上限。 */
+const MANAGER_HANDOVER_WAIT_MS = 20_000;
 /** 窗口标题：单实例聚焦时按它查找已有窗口，必须与创建时一致。 */
 const WINDOW_TITLE = "NarraFork Manager";
+const MANAGER_MUTEX_NAME = "Local\\NarraFork.Manager";
 const TRAY_ID_OPEN = 9101;
 const TRAY_ID_EXIT = 9103;
 
@@ -535,12 +542,24 @@ async function stopSupervised(): Promise<void> {
 	expectRelaunch = false;
 }
 
+/** 认领更新替换进程的总等待上限。 */
+const RELAUNCH_WAIT_MS = 15 * 60_000;
+
 /** 更新替换进程脱离了面板的子进程关系。健康检查通过后按远程托管继续控制它。 */
 async function adoptRelaunch(): Promise<void> {
 	supervision = "reconnecting";
 	applyStatus("starting");
-	const deadline = Date.now() + 90_000;
+	// 替换进程启动时要跑数据库迁移，大库上可能远超一两分钟；没有它的进程句柄可看存活，
+	// 只能宽限等待。超过提示时间只记一次日志，不判失败。
+	const startedAt = Date.now();
+	const deadline = startedAt + RELAUNCH_WAIT_MS;
+	let hinted = false;
 	while (Date.now() < deadline) {
+		if (handingOver) return;
+		if (!hinted && Date.now() - startedAt > SLOW_START_HINT_MS) {
+			hinted = true;
+			appendLog("PREP", t("log.slowStart"));
+		}
 		if (await probeServiceHealth(activeHost(), activePort(), activeTls())) {
 			supervision = "adopted";
 			externalRunning = false;
@@ -788,6 +807,10 @@ function handleMessage(
 			requestOpenFrontend();
 			return 0;
 		}
+		case WM_MANAGER_HANDOVER: {
+			handOverToNewManager(hwnd);
+			return 0;
+		}
 		default:
 			return undefined;
 	}
@@ -914,6 +937,53 @@ function minimizeToTray(hwnd: Pointer): void {
 }
 
 let exiting = false;
+/** 已让位给新版本面板：只等旧服务退出，不再响应状态变化。 */
+let handingOver = false;
+
+/**
+ * 让位给更新拉起的新版本面板。
+ *
+ * 立即交出单实例互斥体、托盘图标和窗口标题，新面板随即接手并拉起新服务；新服务会通过交接
+ * 让本面板托管的旧服务优雅退出。本进程要等旧服务真正退出才能走：子进程挂在本进程上，
+ * 先退出会把它连带结束，旧服务就来不及写完干净关闭标记。交接失败时旧服务会恢复运行，
+ * 这里也不设期限去结束它，宁可多留一个隐藏进程。
+ */
+function handOverToNewManager(hwnd: Pointer): void {
+	if (handingOver || exiting) return;
+	handingOver = true;
+	expectRelaunch = false;
+	awaitingHandover = false;
+	appendLog("RUN", t("log.handingOver"));
+	releaseSingleInstanceMutex();
+	// 再次双击 exe 时按标题找窗口，必须找到新面板而不是这个即将退出的。
+	setText(hwnd, `${WINDOW_TITLE} (retiring)`);
+	if (trayAdded) {
+		removeTrayIcon(hwnd);
+		trayAdded = false;
+	}
+	showWindow(hwnd, SW_HIDE);
+	const timer = setInterval(() => {
+		if (backend?.pid !== undefined) return;
+		clearInterval(timer);
+		process.exit(0);
+	}, 250);
+}
+
+/**
+ * 更新拉起的新版本面板：请旧面板让位并等它释放单实例互斥体。
+ * 旧面板不认识这个消息（更老的版本）或迟迟不让位时返回 false。
+ */
+async function takeOverFromPreviousManager(): Promise<boolean> {
+	const previous = findWindowByTitle(WINDOW_TITLE);
+	if (!previous) return false;
+	postMessage(previous, WM_MANAGER_HANDOVER);
+	const deadline = Date.now() + MANAGER_HANDOVER_WAIT_MS;
+	while (Date.now() < deadline) {
+		await Bun.sleep(250);
+		if (acquireSingleInstanceMutex(MANAGER_MUTEX_NAME)) return true;
+	}
+	return false;
+}
 
 async function exitApplication(hwnd: Pointer): Promise<void> {
 	if (exiting) return;
@@ -1081,14 +1151,17 @@ export async function runManager(): Promise<"done" | "serve"> {
 	}
 
 	// 单实例：再次双击 exe 时通知已有托盘进程打开前端，不把隐藏的管理器窗口显示出来。
-	if (!acquireSingleInstanceMutex("Local\\NarraFork.Manager")) {
-		// 更新拉起的替换进程撞上已有面板：已有面板不知道这次交接，旧服务会一直等到看门狗超时。
-		// 直接以服务身份完成交接，保证更新不中断。
-		if (hasHandoffEnv()) return "serve";
-		const existing = findWindowByTitle(WINDOW_TITLE);
-		if (existing) postMessage(existing, WM_OPEN_FRONTEND);
-		else console.error(t("error.alreadyRunning"));
-		return "done";
+	if (!acquireSingleInstanceMutex(MANAGER_MUTEX_NAME)) {
+		// 更新拉起的新版本：请旧面板让位，由本面板托管新服务，托盘也换成新 exe。
+		// 旧面板不肯让位时，直接以服务身份完成交接，保证更新不中断。
+		if (hasHandoffEnv()) {
+			if (!(await takeOverFromPreviousManager())) return "serve";
+		} else {
+			const existing = findWindowByTitle(WINDOW_TITLE);
+			if (existing) postMessage(existing, WM_OPEN_FRONTEND);
+			else console.error(t("error.alreadyRunning"));
+			return "done";
+		}
 	}
 
 	// 更新交接的一次性环境变量只给接下来那一个替换子进程；留在 process.env 里会被之后每次
@@ -1116,6 +1189,8 @@ export async function runManager(): Promise<"done" | "serve"> {
 		managerToken,
 		onLine: (line) => appendLog(undefined, formatBackendLine(line)),
 		onState: (state, detail) => {
+			// 让位中：旧服务按交接退出是预期结果，不当成崩溃，也不再弹出这个即将退出的窗口。
+			if (handingOver) return;
 			if (state === "stopped" && expectRelaunch) {
 				expectRelaunch = false;
 				void adoptRelaunch();
@@ -1456,6 +1531,7 @@ export async function runManager(): Promise<"done" | "serve"> {
 	// 终端里手动启动的服务面板也要能看见：立即探测一次，之后每 4 秒复查。
 	let firstProbeDone = false;
 	const probeExternal = (): void => {
+		if (handingOver) return;
 		if (backend?.current !== "stopped") return;
 		if (supervision !== "none" || expectRelaunch) return;
 		void probeServiceHealth(settings.host, settings.port, settings.tls).then((alive) => {

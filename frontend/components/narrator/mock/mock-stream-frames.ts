@@ -11,7 +11,9 @@
  * fields and a divergence here would make the harness lie:
  *
  *   - a TEXT delta carries its lane index on `event.outputIndex`
- *   - a REASONING delta carries it on `delta.outputIndex` (plus `delta.id`)
+ *   - a REASONING delta carries it on `delta.outputIndex`
+ *   - every delta names its element (`delta.id`) with the element's revision and the
+ *     raw characters before it (`delta.revision`, `delta.textOffset`), as the server does
  *
  * That asymmetry is real (see `streaming-delta-fold.ts`), not a typo, and it is
  * the single easiest thing to get wrong here — hence the dedicated unit test.
@@ -31,6 +33,9 @@ export type MockFrame = Record<string, unknown>;
 export function mockTextDeltaFrame(opts: {
 	narratorId: string;
 	text: string;
+	id: string;
+	revision: number;
+	textOffset: number;
 	outputIndex?: number;
 }): MockFrame {
 	return {
@@ -39,7 +44,13 @@ export function mockTextDeltaFrame(opts: {
 		event: {
 			type: "content_block_delta",
 			...(opts.outputIndex != null ? { outputIndex: opts.outputIndex } : {}),
-			delta: { type: "text_delta", text: opts.text },
+			delta: {
+				type: "text_delta",
+				text: opts.text,
+				id: opts.id,
+				revision: opts.revision,
+				textOffset: opts.textOffset,
+			},
 		},
 	};
 }
@@ -53,7 +64,9 @@ export function mockTextDeltaFrame(opts: {
 export function mockReasoningDeltaFrame(opts: {
 	narratorId: string;
 	text: string;
-	id?: string;
+	id: string;
+	revision: number;
+	textOffset: number;
 	outputIndex?: number;
 }): MockFrame {
 	return {
@@ -64,7 +77,9 @@ export function mockReasoningDeltaFrame(opts: {
 			delta: {
 				type: "reasoning_delta",
 				text: opts.text,
-				...(opts.id ? { id: opts.id } : {}),
+				id: opts.id,
+				revision: opts.revision,
+				textOffset: opts.textOffset,
 				...(opts.outputIndex != null ? { outputIndex: opts.outputIndex } : {}),
 			},
 		},

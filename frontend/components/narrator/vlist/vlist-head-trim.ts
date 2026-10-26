@@ -28,10 +28,13 @@
  * Pure: no React, no DOM, no timers, no network.
  */
 
+import { isNestedRow } from "../message/nested-rows";
+
 /** The subset of a message this module reads. */
 export interface TrimCandidate {
 	id?: unknown;
 	seq?: unknown;
+	parentMessageId?: unknown;
 }
 
 /**
@@ -232,6 +235,8 @@ export function resolveHeadTrim(input: HeadTrimDecisionInput): HeadTrimDecision 
  * cursor forward would make the next upward page start below the gap it just
  * created — a silent hole in history that no later fetch repairs.
  *
+ * Rows nested under the last dropped row go with it.
+ *
  * Returns the same array identity when nothing is dropped, so a caller can skip
  * the rebuild by identity.
  */
@@ -239,7 +244,8 @@ export function trimLoadedHead<T extends TrimCandidate>(
 	messages: readonly T[],
 	dropCount: number,
 ): { messages: readonly T[]; oldestKeptSeq: number | null } {
-	const drop = Math.trunc(dropCount);
+	let drop = Math.trunc(dropCount);
+	while (drop > 0 && drop < messages.length && isNestedRow(messages[drop])) drop++;
 	if (drop <= 0) return { messages, oldestKeptSeq: oldestSeqOf(messages) };
 	if (drop >= messages.length) {
 		// Never produce an empty document: the shell's load path owns that state.
@@ -253,7 +259,7 @@ function oldestSeqOf(messages: readonly TrimCandidate[]): number | null {
 	let min: number | null = null;
 	for (const message of messages) {
 		const seq = message.seq;
-		if (typeof seq !== "number" || !Number.isFinite(seq)) continue;
+		if (isNestedRow(message) || typeof seq !== "number" || !Number.isFinite(seq)) continue;
 		if (min == null || seq < min) min = seq;
 	}
 	return min;

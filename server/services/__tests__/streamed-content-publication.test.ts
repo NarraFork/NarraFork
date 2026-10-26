@@ -180,7 +180,7 @@ toolRegistry.register({
 const childCeiling = withRuntimePolicyTrait([], {
 	version: 1,
 	tools: ["PublicationHold"],
-	deny: ["spawnAgent", "awaitAgent", "sendAwait", "askUserQuestion"],
+	deny: ["spawnAgent", "awaitAgent", "askUserQuestion"],
 });
 
 function seed(subagent: boolean) {

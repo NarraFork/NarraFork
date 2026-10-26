@@ -1,3 +1,4 @@
+import type { AgentInboxBlockedReason, PendingAgentMessageSummary } from "@shared/agent-inbox";
 import { formatOriginLabel, type MessageOriginOptions } from "@shared/message-origin";
 import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
 import { db } from "../../db";
@@ -172,8 +173,22 @@ export async function enqueueInboxAgent(
 	const binding = delivery.senderToolCallBinding;
 	if (!binding) throw new Error("Agent message requires exact tool execution receipt");
 	const port = getRuntimeQueuePort();
-	if (port) return enqueueInboxAgentPg(port, delivery, modelText, options);
-	return enqueueInboxAgentSqlite(delivery, modelText, options);
+	const result = port
+		? await enqueueInboxAgentPg(port, delivery, modelText, options)
+		: enqueueInboxAgentSqlite(delivery, modelText, options);
+	if (result.status === "accepted") notifyAgentInboxChanged(delivery.recipientNarratorId);
+	return result;
+}
+
+/** Lets the recipient's page show (or drop) its queued agent messages. */
+export function notifyAgentInboxChanged(narratorId: string): void {
+	void import("../../websocket/narrator-ws")
+		.then(({ broadcastToNarrator }) =>
+			broadcastToNarrator(narratorId, { type: "agent_inbox_changed", narratorId }),
+		)
+		.catch((error) =>
+			logger.warn("Agent inbox change broadcast failed", { narratorId, error: String(error) }),
+		);
 }
 
 function enqueueInboxAgentSqlite(
@@ -358,6 +373,100 @@ export async function listInboxRows(
 		.limit(100)
 		.all();
 }
+export const PENDING_AGENT_MESSAGE_PAGE = 20;
+const PENDING_AGENT_MESSAGE_PREVIEW_CHARS = 500;
+
+function summarizePendingAgentMessage(row: {
+	id: string;
+	bufferedAt: string;
+	metadataJson: string | null;
+	text: string;
+}): PendingAgentMessageSummary {
+	let sender: PendingAgentMessageSummary["sender"] = null;
+	try {
+		const value = inboxMetadata<Partial<InboxAgentMetadata>>(row).delivery?.sender;
+		if (value?.id)
+			sender = { id: value.id, label: value.label ?? null, title: value.title ?? null };
+	} catch {
+		// A malformed envelope still lists the row so the user can discard it.
+	}
+	return {
+		id: row.id,
+		sender,
+		preview: row.text.slice(0, PENDING_AGENT_MESSAGE_PREVIEW_CHARS),
+		truncated: row.text.length > PENDING_AGENT_MESSAGE_PREVIEW_CHARS,
+		createdAt: row.bufferedAt,
+	};
+}
+
+/** Queued agent messages for the recipient page: bounded, previews only. */
+export async function listPendingAgentMessages(
+	narratorId: string,
+): Promise<{ messages: PendingAgentMessageSummary[]; hasMore: boolean }> {
+	const port = getRuntimeQueuePort();
+	const rows = port
+		? (
+				await port.mailbox.listPending(narratorId, {
+					kinds: ["agent_message"],
+					limit: PENDING_AGENT_MESSAGE_PAGE + 1,
+				})
+			).map((row) => ({ ...row, text: row.text ?? "" }))
+		: db
+				.select({
+					id: mailbox.id,
+					bufferedAt: mailbox.bufferedAt,
+					metadataJson: mailbox.metadataJson,
+					text: sql<string>`substr(${mailbox.text}, 1, ${PENDING_AGENT_MESSAGE_PREVIEW_CHARS + 1})`,
+				})
+				.from(mailbox)
+				.where(
+					and(
+						eq(mailbox.narratorId, narratorId),
+						eq(mailbox.state, "queued"),
+						eq(mailbox.kind, "agent_message"),
+					),
+				)
+				.orderBy(asc(mailbox.arrivalSeq))
+				.limit(PENDING_AGENT_MESSAGE_PAGE + 1)
+				.all();
+	return {
+		messages: rows.slice(0, PENDING_AGENT_MESSAGE_PAGE).map(summarizePendingAgentMessage),
+		hasMore: rows.length > PENDING_AGENT_MESSAGE_PAGE,
+	};
+}
+
+/** Discard one still-queued agent message; a claimed or consumed row is left alone. */
+export async function discardPendingAgentMessage(
+	narratorId: string,
+	messageId: string,
+	reason: string,
+): Promise<boolean> {
+	const port = getRuntimeQueuePort();
+	const row = port
+		? await port.mailbox.getById(messageId)
+		: db
+				.select({
+					narratorId: mailbox.narratorId,
+					kind: mailbox.kind,
+					state: mailbox.state,
+					deliveryId: mailbox.deliveryId,
+				})
+				.from(mailbox)
+				.where(eq(mailbox.id, messageId))
+				.get();
+	if (
+		!row ||
+		row.narratorId !== narratorId ||
+		row.kind !== "agent_message" ||
+		row.state !== "queued" ||
+		!row.deliveryId
+	)
+		return false;
+	return port
+		? port.mailbox.cancel(row.deliveryId, reason)
+		: runtimeInbox.cancel(row.deliveryId, reason);
+}
+
 export async function peekInbox(narratorId: string): Promise<RuntimeMailboxRow | undefined> {
 	const port = getRuntimeQueuePort();
 	if (port) return port.mailbox.peekQueued(narratorId);
@@ -1109,10 +1218,37 @@ const pendingWakes = hotSafe(
 	"narrafork.runtime-inbox-wakes",
 	() => new Map<string, Promise<boolean>>(),
 );
+
+export type ResumableStopReason = AgentInboxBlockedReason;
+
+/** Whether a session's last turn ended in a way agent traffic alone may not restart. */
+export function blockingStopReason(
+	lastStopReason: string | null | undefined,
+): ResumableStopReason | null {
+	return lastStopReason === "error" || lastStopReason === "user_interrupt" ? lastStopReason : null;
+}
+
+export interface InboxWakeOptions {
+	/**
+	 * Stop reasons an explicit resume may override. Without it, queued agent/notice
+	 * traffic never restarts a session whose last turn failed or was stopped by the user,
+	 * so an upstream failure cannot be re-triggered in a loop by agent messages.
+	 */
+	resumeStopped?: readonly ResumableStopReason[];
+}
+
 /** Coalesced control-plane wake; the only payload authority remains the mailbox table. */
-export function wakeInboxIfEligible(narratorId: string, locale: Locale = "en"): Promise<boolean> {
+export function wakeInboxIfEligible(
+	narratorId: string,
+	locale: Locale = "en",
+	options: InboxWakeOptions = {},
+): Promise<boolean> {
 	const pending = pendingWakes.get(narratorId);
-	if (pending) return pending;
+	if (pending) {
+		if (!options.resumeStopped?.length) return pending;
+		// A coalesced ordinary wake may have been refused by the stop guard.
+		return pending.then((started) => started || wakeInboxIfEligible(narratorId, locale, options));
+	}
 	const wake = Promise.resolve()
 		.then(async () => {
 			await flushInboxPublicationBarrier(narratorId);
@@ -1146,11 +1282,9 @@ export function wakeInboxIfEligible(narratorId: string, locale: Locale = "en"): 
 			if (!row || row.status === "archived") return false;
 			const pendingHead = await peekInbox(narratorId);
 			const hasExplicitUserInput = await hasInboxKind(narratorId, ["user_input"]);
-			if (
-				!hasExplicitUserInput &&
-				"lastStopReason" in row &&
-				(row.lastStopReason === "user_interrupt" || row.lastStopReason === "error")
-			)
+			const stopped =
+				"lastStopReason" in row ? blockingStopReason(row.lastStopReason as string | null) : null;
+			if (!hasExplicitUserInput && stopped && !options.resumeStopped?.includes(stopped))
 				return false;
 			if (
 				!hasExplicitUserInput &&
@@ -1203,7 +1337,11 @@ export function wakeInboxIfEligible(narratorId: string, locale: Locale = "en"): 
 			// delegated reports alone use the notification continuation, also in plan mode.
 			if (first?.kind === "user_input" || (await hasInboxKind(narratorId, ["user_input"])))
 				return (await resumeBufferedMessagesIfIdle(narratorId, locale)).resumed;
-			return (await startParentInboundContinuationIfPossible(narratorId, "en")).started;
+			return (
+				await startParentInboundContinuationIfPossible(narratorId, "en", false, {
+					resumeStopped: options.resumeStopped,
+				})
+			).started;
 		})
 		.catch((error) => {
 			logger.warn("Mailbox wake deferred", { narratorId, error: String(error) });

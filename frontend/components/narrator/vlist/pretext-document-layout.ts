@@ -1,3 +1,4 @@
+import { type MessageBodySource, messageBody } from "@shared/narrator-blocks/message-blocks";
 import type { PretextLayoutIndex, PretextLayoutManifest } from "@shared/pretext-layout";
 import type { MeasureElement } from "@shared/pretext-layout/layout-pipeline";
 import {
@@ -277,12 +278,12 @@ function buildSourceResolver(
  * nothing else uses. Mirrors `reasoningRowIdentity` in the adapter.
  */
 function reasoningRunStartBlockIndex(item: {
-	msg?: { contentJson?: unknown } | null;
+	msg?: MessageBodySource | null;
 	blockIndex?: number;
 }): number | null {
 	const blockIndex = item.blockIndex ?? 0;
-	const blocks = item.msg?.contentJson;
-	if (!Array.isArray(blocks) || blocks.length === 0) return blockIndex;
+	const blocks = messageBody(item.msg);
+	if (blocks.length === 0) return blockIndex;
 	const { runs } = groupReasoningRuns(blocks as ContentBlockLike[]);
 	for (const run of runs) {
 		if (run.indices.includes(blockIndex)) return run.startIndex;

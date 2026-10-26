@@ -288,6 +288,27 @@
 			"when": 1792731579735,
 			"tag": "0040_block_reindex_job",
 			"breakpoints": true
+		},
+		{
+			"idx": 41,
+			"version": "7",
+			"when": 1792778673208,
+			"tag": "0041_auth_sessions",
+			"breakpoints": true
+		},
+		{
+			"idx": 42,
+			"version": "7",
+			"when": 1792828249880,
+			"tag": "0042_block_index_queue",
+			"breakpoints": true
+		},
+		{
+			"idx": 43,
+			"version": "7",
+			"when": 1792983700483,
+			"tag": "0043_token_accounting_version",
+			"breakpoints": true
 		}
   ]
 }

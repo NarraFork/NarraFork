@@ -23,6 +23,7 @@ import { type FileReference, fileReferenceDisplay } from "../file-reference";
 import { normalizeFileReferenceContext } from "../file-reference-context";
 import { knowledgeExcerpt } from "../knowledge-excerpt";
 import { isSubagentModelInheritance } from "../model-inheritance";
+import { blockAtIndex, type MessageWithBody, messageBody } from "../narrator-blocks/message-blocks";
 import {
 	contextBlockViews,
 	injectionBlockViews,
@@ -198,32 +199,23 @@ export interface AdapterContentBlock {
 	[key: string]: unknown;
 }
 
-/** One block of a message in the block-keyed protocol: its id and its elements `[from, to)`. */
-export interface AdapterBlockRef {
-	id: string;
-	from: number;
-	to: number;
-}
-
-export interface AdapterMessage {
-	/**
-	 * The message's blocks, when it arrived in the block-keyed protocol: its elements are
-	 * then keyed by block id (`elementKey`), so a row keeps its key when blocks before it
-	 * are deleted or inserted.
-	 */
-	blockRefs?: readonly AdapterBlockRef[];
+/**
+ * A message as the adapter reads it. Its body is its blocks (`messageBody` /
+ * `messageBlocks`); its elements are keyed by block id (`elementKey`), so a row keeps its
+ * key when blocks before it are deleted or inserted.
+ */
+export interface AdapterMessage extends MessageWithBody<AdapterContentBlock> {
 	/** Actual per-message identity; absent legacy identity must not enable GPT parsing. */
 	model?: string | null;
 	provider?: string | null;
 	id?: string;
 	role: string;
-	contentJson: AdapterContentBlock[];
 	createdAt?: string;
 	/**
 	 * Slash command the user typed, when this user message was produced by one.
 	 *
 	 * The server EXPANDS a command into its full prompt template before storing
-	 * it, so `contentJson`'s text block holds the whole (often multi-thousand
+	 * it, so the body's text element holds the whole (often multi-thousand
 	 * character) expansion while this field keeps the short `/name args` the user
 	 * actually wrote. Rendering the expansion as the bubble body is what turned a
 	 * one-line command into a screen-filling wall of text in the virtual list;
@@ -372,7 +364,7 @@ export interface AdapterToolDetailRef {
 
 export function resolveToolDetailRef(item: AdapterToolItem): AdapterToolDetailRef {
 	const messageId = item.msg?.id ?? item.tc.messageId;
-	const block = item.msg?.contentJson[item.blockIndex];
+	const block = messageBody(item.msg)[item.blockIndex];
 	const attempt =
 		item.tc.executionAttempt ??
 		(block?.type === "tool_use" && block.id === item.tc.toolUseId
@@ -1128,6 +1120,8 @@ const SYSTEM_TEXT_SUBTYPES = new Set([
 	"system_injection",
 ]);
 /** Extra recognized system block types beyond the simple/text sets. */
+/** One ellipsized line is all the resolved card shows; more is wasted payload. */
+const ASK_IN_PASSING_QUOTE_CHARS = 200;
 const SYSTEM_OTHER_TYPES = new Set(["knowledge_hint", "ask_in_passing", "subagent_recovery"]);
 /**
  * Block types that make a role=user message render as a SYSTEM card rather than a
@@ -1453,7 +1447,7 @@ function mediaData(block: AdapterContentBlock, ctx: AdapterContext) {
 
 /** Render native/legacy context blocks independently while preserving physical order. */
 function adaptContextBlocks(
-	blocks: AdapterContentBlock[],
+	blocks: readonly AdapterContentBlock[],
 	idBase: string,
 	msg: AdapterMessage,
 	ctx: AdapterContext,
@@ -1616,15 +1610,15 @@ function longSingleReasoningStep(key: string, text: string): ReasoningSegment[] 
 }
 
 /**
- * The key base of a message's element `index`. A message from the block-keyed protocol
- * keys it by its block — `${idBase}-blk[<blockId>]`, plus `+<offset>` for a later element
- * of a multi-element block — so the key stays put when blocks before it come or go
- * (docs/BLOCK_STORAGE-DESIGN.md §8.3). Otherwise it is the positional `${idBase}-b<index>`.
- * Block ids hold no `[` or `]`, so the id is recoverable from the key
- * (`blockIdFromElementKey`).
+ * The key base of a message's element `index`: its block — `${idBase}-blk[<blockId>]`,
+ * plus `+<offset>` for a later element of a multi-element block — so the key stays put
+ * when blocks before it come or go (docs/BLOCK_STORAGE-DESIGN.md §8.3). The blocks are the
+ * ones the message names, or, for a row built on the client, the ones the server would
+ * split it into (`messageBlocks`). Block ids hold no `[` or `]`, so the id is recoverable
+ * from the key (`blockIdFromElementKey`). An index past the body keeps a positional key.
  */
 export function elementKey(idBase: string, msg: AdapterMessage, index: number): string {
-	const block = msg.blockRefs?.find((ref) => index >= ref.from && index < ref.to);
+	const block = blockAtIndex(msg, index);
 	if (!block) return `${idBase}-b${index}`;
 	const offset = index - block.from;
 	return `${idBase}-blk[${block.id}]${offset ? `+${offset}` : ""}`;
@@ -1644,7 +1638,7 @@ function adaptMessage(
 	ctx: AdapterContext,
 ): ElementSpec[] {
 	const specs: ElementSpec[] = [];
-	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+	const blocks = messageBody(msg);
 	const indices = visibleBlockIndices ?? blocks.map((_, i) => i);
 	const idBase = msg.id ?? "msg";
 
@@ -3263,7 +3257,7 @@ function adaptSystemBlock(
 	// The message's leading text block is the chunk renderer's `contentText`
 	// fallback (goalBlock.task ?? message.contentText, etc.).
 	const contentText =
-		msg.contentJson.find((b) => b.type === "text" && (b.text ?? "").trim().length > 0)?.text ?? "";
+		messageBody(msg).find((b) => b.type === "text" && (b.text ?? "").trim().length > 0)?.text ?? "";
 
 	if (blockType === "compact" && block.subtype === "plan") {
 		return {
@@ -3290,10 +3284,20 @@ function adaptSystemBlock(
 			typeof block.question === "string" && block.question.length > 0
 				? block.question
 				: (block.text ?? "");
+		// A selection-started question records its excerpt; the card shows it on one line.
+		const quote = block.quote as { text?: unknown } | undefined;
+		const quoteText =
+			!pending && typeof quote?.text === "string"
+				? quote.text.replace(/\s+/gu, " ").trim().slice(0, ASK_IN_PASSING_QUOTE_CHARS)
+				: "";
 		return {
 			kind: "ask-in-passing",
 			key: `${idBase}-aip`,
-			data: { kind: pending ? "pending" : "resolved", question },
+			data: {
+				kind: pending ? "pending" : "resolved",
+				question,
+				...(quoteText ? { quoteText } : {}),
+			},
 		};
 	}
 	if (blockType === "subagent_recovery") {
@@ -4564,15 +4568,13 @@ function collectUpstreamPeers(
 	ctx: AdapterContext,
 ): ToolUpstreamPeer[] {
 	const peers: ToolUpstreamPeer[] = [];
-	const blocks = item.msg?.contentJson;
+	const blocks = messageBody(item.msg);
 	const covered = new Set<string>();
-	if (Array.isArray(blocks)) {
-		for (let i = 0; i < item.blockIndex; i++) {
-			const block = blocks[i];
-			if (!block || block.type !== "tool_use") continue;
-			if (typeof block.id === "string" && block.id) covered.add(block.id);
-			peers.push(blockAsToolUpstreamPeer(block, ctx));
-		}
+	for (let i = 0; i < item.blockIndex; i++) {
+		const block = blocks[i];
+		if (!block || block.type !== "tool_use") continue;
+		if (typeof block.id === "string" && block.id) covered.add(block.id);
+		peers.push(blockAsToolUpstreamPeer(block, ctx));
 	}
 	for (const peer of earlier) {
 		// Same-message peers are already in `peers` via blockIndex order.
@@ -5040,11 +5042,11 @@ function reasoningRowIdentity(
 	const messageId = item.msg?.id;
 	if (!messageId || messageId === "__streaming__") return undefined;
 	const blockIndex = item.blockIndex ?? 0;
-	const blocks = item.msg?.contentJson;
-	if (Array.isArray(blocks) && blocks.length > 0) {
+	const blocks = messageBody(item.msg);
+	if (blocks.length > 0) {
 		// AdapterContentBlock allows null on text/thinking, so it is not structurally
 		// assignable to ContentBlockLike; grouping only reads `type`, which matches.
-		const { runs } = groupReasoningRuns(blocks as unknown as ContentBlockLike[]);
+		const { runs } = groupReasoningRuns(blocks as unknown as readonly ContentBlockLike[]);
 		for (const run of runs) {
 			if (run.indices.includes(blockIndex)) {
 				return {

@@ -224,7 +224,7 @@ describe("public share management and HTTP boundary", () => {
 
 	test("missing, wrong, revoked, deleted and session credentials fail uniformly without SessionAuth fallback", async () => {
 		const share = await shared();
-		const jwt = await createToken(owner, "user");
+		const jwt = await createToken(owner);
 		const baseline = sessionGateEntries;
 		for (const authorization of ["", `Share ${"a".repeat(43)}`, `Bearer ${jwt}`, "Share short"]) {
 			const response = await request(share, "", { authorization });
@@ -286,8 +286,8 @@ describe("public share management and HTTP boundary", () => {
 		expect(
 			(await app.request(url, { headers: { Authorization: `Share ${share.token}` } })).status,
 		).toBe(401);
-		const ownerJwt = await createToken(owner, "user");
-		const readerJwt = await createToken(reader, "user");
+		const ownerJwt = await createToken(owner);
+		const readerJwt = await createToken(reader);
 		expect(
 			(await app.request(url, { headers: { Authorization: `Bearer ${ownerJwt}` } })).status,
 		).toBe(200);

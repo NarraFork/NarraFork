@@ -39,7 +39,7 @@ const searchStore = createSqliteSearchStore(async (sql, params) =>
 );
 mock.module("../../../server/services/search/backend", () => ({ searchStore }));
 const { knowledgeService } = await import("../../../server/services/knowledge-service");
-const { searchService, sortSearchResults } = await import(
+const { clearSessionSearchCache, searchService, sortSearchResults } = await import(
 	"../../../server/services/search-service"
 );
 const { searchRoutes } = await import("../../../server/routes/search");
@@ -96,6 +96,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+	clearSessionSearchCache();
 	sqlite.run("PRAGMA foreign_keys = OFF");
 	for (const table of [
 		"narrator_message_refs",

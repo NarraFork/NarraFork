@@ -66,10 +66,40 @@ export interface SessionProfile {
 	gitUsername: string | null;
 	gitEmail: string | null;
 	createdAt: string;
-	/** Internal revocation counter; carried here so session issuance can sign against it. */
+	/** Internal revocation counter; carried here so session issuance can bind to it. */
 	tokenVersion: number;
 	/** The account's UI language preference, or null when no preferences row exists. */
 	language: string | null;
+}
+
+/** A new opaque-token session row. Times are unix seconds. */
+export interface NewAuthSession {
+	id: string;
+	userId: string;
+	/** SHA-256 of the bearer token; the token itself is never stored. */
+	tokenHash: string;
+	tokenVersion: number;
+	sessionStart: number;
+	createdAt: number;
+	expiresAt: number;
+}
+
+/**
+ * A session row joined with its account: everything the gate needs to accept or reject a
+ * presented token in one read. The role and the account's token generation are LIVE values.
+ */
+export interface AuthSessionRecord {
+	id: string;
+	userId: string;
+	role: AccountRole;
+	/** `users.token_version` now. */
+	userTokenVersion: number;
+	/** `users.token_version` when the session was issued. */
+	sessionTokenVersion: number;
+	sessionStart: number;
+	createdAt: number;
+	expiresAt: number;
+	revokedAt: number | null;
 }
 
 export interface AuthSessionStore {
@@ -93,4 +123,22 @@ export interface AuthSessionStore {
 	 * holds. Returns the NEW value; an unknown account returns 0 and changes nothing.
 	 */
 	bumpTokenVersion(userId: string): Promise<number>;
+	/** Persist a freshly issued session. */
+	createSession(session: NewAuthSession): Promise<void>;
+	/** Resolve a session by token hash, joined with its account. Unknown → null. */
+	findSessionByTokenHash(tokenHash: string): Promise<AuthSessionRecord | null>;
+	/** Resolve a session by id, joined with its account (long-lived sockets). Unknown → null. */
+	findSessionById(sessionId: string): Promise<AuthSessionRecord | null>;
+	/**
+	 * Slide a live session's expiry forward. Never revives a revoked session and never
+	 * shortens one (a concurrent renewal that already went further wins).
+	 */
+	extendSession(sessionId: string, expiresAt: number): Promise<void>;
+	/** Mark one session revoked. Idempotent: an already revoked session keeps its timestamp. */
+	revokeSession(sessionId: string, revokedAt: number): Promise<void>;
+	/**
+	 * Delete up to `limit` sessions that expired, or were revoked, before `before`.
+	 * Returns how many rows were deleted, so the caller can keep sweeping in bounded batches.
+	 */
+	deleteStaleSessions(before: number, limit: number): Promise<number>;
 }

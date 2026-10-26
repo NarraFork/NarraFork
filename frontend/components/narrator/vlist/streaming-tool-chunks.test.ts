@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import {
 	createDiffDocument,
 	getDiffRowAnchor,
@@ -447,27 +448,24 @@ describe("collectPersistedToolUseIds", () => {
 	it("reads ids from toolCalls and from tool_use content blocks", () => {
 		const ids = collectPersistedToolUseIds([
 			{ toolCalls: [{ toolUseId: "a" }] },
-			{
-				contentJson: [
-					{ type: "tool_use", id: "b" },
-					{ type: "text", text: "x" },
-				],
-			},
+			rowWithElements({}, [
+				{ type: "tool_use", id: "b" },
+				{ type: "text", text: "x" },
+			]),
 		]);
 		expect([...ids].sort()).toEqual(["a", "b"]);
 	});
 
-	it("walks child messages (a subagent page owns its children's tools)", () => {
-		const ids = collectPersistedToolUseIds([
-			{ toolCalls: [{ toolUseId: "parent" }], children: [{ toolCalls: [{ toolUseId: "child" }] }] },
-		]);
+	it("reads nested rows (a subagent page owns their tools)", () => {
+		const nested = { toolCalls: [{ toolUseId: "child" }], parentMessageId: "parent-row" };
+		const ids = collectPersistedToolUseIds([{ toolCalls: [{ toolUseId: "parent" }] }, nested]);
 		expect([...ids].sort()).toEqual(["child", "parent"]);
 	});
 
 	it("skips malformed entries", () => {
 		const ids = collectPersistedToolUseIds([
 			{ toolCalls: [{ toolUseId: "" }, {}, { toolUseId: 7 }] },
-			{ contentJson: [{ type: "tool_use" }] },
+			rowWithElements({}, [{ type: "tool_use" }]),
 			{},
 		]);
 		expect(ids.size).toBe(0);

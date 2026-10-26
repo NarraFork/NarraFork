@@ -17,6 +17,11 @@ import { fileReferenceApi } from "@frontend/lib/api/file-references";
 import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
 import { MantineProvider } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
+import {
+	type MessageBodySource,
+	messageBody,
+	rowWithElements,
+} from "@shared/narrator-blocks/message-blocks";
 import { parseHTML } from "linkedom";
 import { act, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
@@ -41,6 +46,18 @@ mock.module("@server/websocket/narrator-ws", () => ({ broadcastToNarrator: () =>
 const { enrichToolUseBlocks, stripRedundantToolCallRows, stripProviderMetadata } = await import(
 	"@server/services/narrator-messages"
 );
+
+/** A client row as the server's history projection holds it: its body as `contentJson`. */
+function asServerRow<R extends { blocks?: unknown }>(row: R) {
+	const { blocks: _blocks, ...rest } = row;
+	return { ...rest, contentJson: [...messageBody(row as MessageBodySource)] };
+}
+
+/** A projected server row as the client decodes it from the block protocol. */
+function asClientRow(row: { contentJson?: unknown[] }) {
+	const { contentJson, ...rest } = row;
+	return rowWithElements(rest, contentJson ?? []) as unknown as NarratorMsg;
+}
 
 const closeSwipeMock = mock(() => {});
 const clipboardCopyMock = mock((_value: string) => {});
@@ -629,10 +646,22 @@ describe("Read execution target — real row menu", () => {
 			try {
 				const onOpenFileTarget = mock((..._args: unknown[]) => {});
 				const legacyOpen = mock((_path: string) => {});
-				const message = {
-					id: "read-message",
-					narratorId: "actual-child",
-					contentJson: [
+				const message = rowWithElements(
+					{
+						id: "read-message",
+						narratorId: "actual-child",
+						toolCalls: [
+							{
+								toolUseId: "read-1",
+								toolName: "Read",
+								inputJson: { file_path: item.path },
+								status: "success",
+								executionDeviceId: item.deviceId,
+								executionCwd: item.cwd,
+							},
+						],
+					},
+					[
 						{
 							type: "tool_use",
 							name: "Read",
@@ -640,25 +669,15 @@ describe("Read execution target — real row menu", () => {
 							input: { file_path: item.path, device: "wrong-current-default" },
 						},
 					],
-					toolCalls: [
-						{
-							toolUseId: "read-1",
-							toolName: "Read",
-							inputJson: { file_path: item.path },
-							status: "success",
-							executionDeviceId: item.deviceId,
-							executionCwd: item.cwd,
-						},
-					],
-				} as unknown as NarratorMsg;
+				) as unknown as NarratorMsg;
 				const [historyDto] = JSON.parse(
-					JSON.stringify(stripRedundantToolCallRows(enrichToolUseBlocks([message]))),
+					JSON.stringify(stripRedundantToolCallRows(enrichToolUseBlocks([asServerRow(message)]))),
 				);
 				expect(historyDto.toolCalls).toEqual([]);
 				await renderRow({
 					narratorId: "host-after-cwd-change",
 					toolUseId: "read-1",
-					toolMeta: buildToolMetaIndex([historyDto]).get("read-1"),
+					toolMeta: buildToolMetaIndex([asClientRow(historyDto)]).get("read-1"),
 					handlers: { onOpenFilePanel: legacyOpen },
 					dock: {
 						narratorId: "host-after-device-change",
@@ -693,48 +712,51 @@ describe("Read execution target — real row menu", () => {
 					stripProviderMetadata(
 						stripRedundantToolCallRows(
 							enrichToolUseBlocks([
-								{
-									id: "history",
-									narratorId: "actual-history-child",
-									children: [],
-									contentJson: [
+								asServerRow(
+									rowWithElements(
 										{
-											type: "tool_use",
-											name: "Read",
-											id: "history-read",
-											input: { file_path: "old.txt" },
-											executionAttempt: 1,
-											tcId: "old",
-											executionDeviceId: "stale",
-											executionCwd: "/stale",
-											resolvedFilePath: "/stale/old.txt",
-											executionTarget: { deviceId: "stale", cwd: "/stale" },
+											id: "history",
+											narratorId: "actual-history-child",
+											toolCalls: [
+												{
+													id: "retry",
+													toolUseId: "history-read",
+													toolName: "Read",
+													status: "success",
+													executionAttempt: 2,
+													inputJson: { file_path: relative },
+													executionDeviceId: target.deviceId,
+													executionCwd: cwd,
+													executionTarget: { deviceId: target.deviceId, cwd },
+												},
+												{
+													id: "old",
+													toolUseId: "history-read",
+													toolName: "Read",
+													status: "error",
+													executionAttempt: 1,
+													inputJson: { file_path: "old.txt" },
+													executionDeviceId: "old-device",
+													executionCwd: "/old",
+												},
+											],
 										},
-									],
-									toolCalls: [
-										{
-											id: "retry",
-											toolUseId: "history-read",
-											toolName: "Read",
-											status: "success",
-											executionAttempt: 2,
-											inputJson: { file_path: relative },
-											executionDeviceId: target.deviceId,
-											executionCwd: cwd,
-											executionTarget: { deviceId: target.deviceId, cwd },
-										},
-										{
-											id: "old",
-											toolUseId: "history-read",
-											toolName: "Read",
-											status: "error",
-											executionAttempt: 1,
-											inputJson: { file_path: "old.txt" },
-											executionDeviceId: "old-device",
-											executionCwd: "/old",
-										},
-									],
-								},
+										[
+											{
+												type: "tool_use",
+												name: "Read",
+												id: "history-read",
+												input: { file_path: "old.txt" },
+												executionAttempt: 1,
+												tcId: "old",
+												executionDeviceId: "stale",
+												executionCwd: "/stale",
+												resolvedFilePath: "/stale/old.txt",
+												executionTarget: { deviceId: "stale", cwd: "/stale" },
+											},
+										],
+									),
+								),
 							]),
 						),
 					),
@@ -743,7 +765,7 @@ describe("Read execution target — real row menu", () => {
 			expect(dto.toolCalls).toEqual([]);
 			await renderRow({
 				narratorId: "current-host",
-				toolMeta: buildToolMetaIndex([dto]).get("history-read"),
+				toolMeta: buildToolMetaIndex([asClientRow(dto)]).get("history-read"),
 				dock: {
 					narratorId: "current-host",
 					openFilePanel: onOpenFileTarget,
@@ -876,10 +898,12 @@ describe("Read execution target — real row menu", () => {
 
 	test("UNC input remains copyable but is never joined to a current local directory", async () => {
 		const path = "\\\\server\\share\\中文 空格.png";
-		const message = {
-			id: "m",
-			narratorId: "child",
-			contentJson: [
+		const message = rowWithElements(
+			{
+				id: "m",
+				narratorId: "child",
+			},
+			[
 				{
 					type: "tool_use",
 					name: "Read",
@@ -889,7 +913,7 @@ describe("Read execution target — real row menu", () => {
 					executionCwd: "C:/original",
 				},
 			],
-		} as unknown as NarratorMsg;
+		) as unknown as NarratorMsg;
 		await renderRow({
 			narratorId: "host",
 			toolMeta: buildToolMetaIndex([message]).get("unc"),

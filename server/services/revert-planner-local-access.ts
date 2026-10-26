@@ -72,7 +72,8 @@ export class RevertPlannerLocalAccess implements RevertPlannerAccess {
 			.from(users)
 			.where(eq(users.id, principal.userId))
 			.get();
-		// requireSessionAuth verifies the JWT; this closes its cached-user/stale-role window.
+		// The session gate read the role when the request arrived; this re-reads it at the
+		// point of use, so a role change during a long preview cannot ride along.
 		if (
 			!user ||
 			!["user", "admin"].includes(user.role) ||

@@ -16,16 +16,22 @@
  *
  * Store operations sync the envelopes they write. Everything else converges through
  * `narrator_block_sync_queue`: generated triggers enqueue every block-format envelope whose
- * content or tool ledger changes, and `flushChangedEnvelopes` — run by the store at the end
- * of its writes and by a periodic sweep — syncs whatever is still queued, after a restart
- * too.
+ * content or tool ledger changes. A store transaction ends by syncing what its own writes
+ * queued (`flushQueuedSince`); a sweep drains the rest in short budgeted transactions, after
+ * a restart too, so a write never pays for another writer's backlog.
+ *
+ * A queued envelope whose content is still what its rows were built from (rows-only, or its
+ * column hashes as it did then, `blocks_content_hash`) can only have had its ledger move: only
+ * the tool blocks whose adopted attempt changed (`ledger_revision`) are re-derived, each from
+ * its own elements and attempt. No sync reads a tool output it does not need, and none writes
+ * search index text: it queues the block (narrator-block-index.ts), and a background job
+ * writes the text off the writer's transaction.
  */
 
 import type { DecodableMessage } from "@shared/narrator-blocks/decode";
 import {
 	adoptedLedger,
 	blockAssets,
-	blockIndexText,
 	type PlanLedgerRow,
 	parseStored as parse,
 	planEnvelopeBlocks,
@@ -41,13 +47,19 @@ import {
 } from "@shared/narrator-blocks/storage";
 import type { EnvelopeRole } from "@shared/narrator-blocks/types";
 import * as database from "../db";
-import { removeBlockIndexText, replaceBlockIndexText } from "../db/fts";
+import { removeBlockIndexText } from "../db/fts";
 import { hotSafe } from "../lib/hot-safe";
 import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { bodySql, keepsProjection, readBodies } from "../lib/narrator-bodies";
 import { settings } from "../lib/settings";
 import { blockIdForElement, reassignBlockIdForElement } from "./narrator-block-ids";
+import {
+	queueBlockIndex,
+	recoverBlockIndex,
+	stopBlockIndex,
+	unqueueBlockIndex,
+} from "./narrator-block-index";
 import { blockReadsEnabled, noteRowsOnlyEnvelopes } from "./narrator-block-scans";
 import { activeTurnId } from "./narrator-turns";
 
@@ -122,26 +134,67 @@ function hasBlockSchema(): boolean {
 
 /**
  * Most envelopes a transaction syncs from the queue. A store write queues the few it
- * touched; anything beyond this (a bulk rewrite outside the store) is left to the sweep.
+ * touched; anything beyond this (a bulk copy queued on purpose) is left to the sweep.
  */
 const FLUSH_LIMIT = 64;
 
-/** Sync queued envelopes; the store calls this as the last write of its transactions. */
-export function flushChangedEnvelopes(limit = FLUSH_LIMIT): number {
+/**
+ * The sync queue's high-water mark. A store transaction takes it before its writes: the
+ * envelopes queued after it are the ones its own writes queued (`flushQueuedSince`).
+ */
+export function syncQueueMark(): number {
+	if (!hasBlockSchema()) return 0;
+	return (
+		database.sqlite
+			.prepare("SELECT coalesce(max(rowid), 0) AS mark FROM narrator_block_sync_queue")
+			.get() as { mark: number }
+	).mark;
+}
+
+/**
+ * Sync what the caller's transaction queued since `mark`, as the last write of a store
+ * transaction. An envelope another writer queued earlier is the sweep's, even when this
+ * transaction changed it too (its entry was there already): the sweep drains in short
+ * budgeted transactions, so no write pays for anyone else's backlog. Readers read a queued
+ * envelope from its column meanwhile, as before.
+ */
+export function flushQueuedSince(mark: number, limit = FLUSH_LIMIT): number {
 	if (!hasBlockSchema()) return 0;
 	const ids = (
 		database.sqlite
-			.prepare("SELECT message_id AS id FROM narrator_block_sync_queue LIMIT ?")
-			.all(limit) as Array<{ id: string }>
+			.prepare(
+				"SELECT message_id AS id FROM narrator_block_sync_queue WHERE rowid > ? ORDER BY rowid LIMIT ?",
+			)
+			.all(mark, limit) as Array<{ id: string }>
 	).map((row) => row.id);
 	const done = database.sqlite.prepare(
 		"DELETE FROM narrator_block_sync_queue WHERE message_id = ?",
 	);
 	for (const id of ids) {
-		syncEnvelope(id);
+		syncQueuedEnvelope(id);
 		done.run(id);
 	}
 	return ids.length;
+}
+
+/** Sync the oldest queued envelopes, whoever queued them (tests, maintenance). */
+export function flushChangedEnvelopes(limit = FLUSH_LIMIT): number {
+	return flushQueuedSince(0, limit);
+}
+
+/** Sync one envelope if it is queued, and take it off the queue (a reader about to send it). */
+export function syncQueuedEnvelopeNow(messageId: string): void {
+	if (!hasBlockSchema()) return;
+	if (
+		!database.sqlite
+			.prepare("SELECT 1 FROM narrator_block_sync_queue WHERE message_id = ?")
+			.get(messageId)
+	)
+		return;
+	syncQueuedEnvelope(messageId);
+	database.sqlite
+		.prepare("DELETE FROM narrator_block_sync_queue WHERE message_id = ?")
+		.run(messageId);
 }
 
 /** The envelopes synced since each open `watchSyncs` began. */
@@ -208,39 +261,86 @@ export function resyncFromColumn(messageId: string, stored?: unknown): void {
 }
 
 const SWEEP_INTERVAL_MS = 5_000;
+/** While a backlog remains, the next sweep comes this soon (or later, paced by the last). */
+const SWEEP_BACKLOG_DELAY_MS = 100;
+/** After a sweep of T ms with a backlog left, the next waits at least this many times T. */
+const SWEEP_PACE_FACTOR = 3;
 const SWEEP_BATCH = 20;
 /** Main-thread time one sweep may spend; each batch is its own short transaction. */
 const SWEEP_BUDGET_MS = 25;
-let sweep: ReturnType<typeof setInterval> | undefined;
+/** A single envelope's sync past this is logged (at most once a minute). */
+const SLOW_SYNC_MS = 50;
+let sweep: ReturnType<typeof setTimeout> | undefined;
+const slowSyncLog = hotSafe("narrator-block-sync:slow", () => ({ at: 0, suppressed: 0 }));
 
-/** Drain the queue in small transactions until it is empty or the budget is spent. */
-function drainQueue(budgetMs: number): number {
+/**
+ * Drain the queue, oldest first, in small transactions until it is empty or the budget is
+ * spent; the budget is checked after every envelope. Returns whether entries remain.
+ */
+function drainQueue(budgetMs: number): { synced: number; more: boolean } {
 	const started = performance.now();
 	let synced = 0;
+	const done = database.sqlite.prepare(
+		"DELETE FROM narrator_block_sync_queue WHERE message_id = ?",
+	);
 	for (;;) {
-		const batch = database.sqlite.transaction(() => flushChangedEnvelopes(SWEEP_BATCH))();
-		synced += batch;
-		if (batch < SWEEP_BATCH || performance.now() - started >= budgetMs) return synced;
+		const batch = database.sqlite.transaction(() => {
+			const ids = (
+				database.sqlite
+					.prepare("SELECT message_id AS id FROM narrator_block_sync_queue ORDER BY rowid LIMIT ?")
+					.all(SWEEP_BATCH) as Array<{ id: string }>
+			).map((row) => row.id);
+			let count = 0;
+			for (const id of ids) {
+				syncQueuedEnvelope(id);
+				done.run(id);
+				count++;
+				if (performance.now() - started >= budgetMs) break;
+			}
+			return { count, more: ids.length === SWEEP_BATCH || count < ids.length };
+		})();
+		synced += batch.count;
+		if (!batch.more || performance.now() - started >= budgetMs) return { synced, more: batch.more };
 	}
 }
 
 function startSweep(): void {
 	if (sweep) return;
-	sweep = setInterval(() => {
-		try {
-			const synced = drainQueue(SWEEP_BUDGET_MS);
-			if (synced) logger.debug("Synced queued block rows", { synced });
-		} catch (error) {
-			logger.warn("Block sync sweep failed", { error: String(error) });
-			if (/closed/i.test(String(error))) stopBlockSyncSweep();
-		}
-	}, SWEEP_INTERVAL_MS);
+	scheduleSweep(SWEEP_INTERVAL_MS);
+}
+
+function scheduleSweep(delayMs: number): void {
+	sweep = setTimeout(runSweep, delayMs);
 	sweep.unref?.();
 }
 
+function runSweep(): void {
+	let next = SWEEP_INTERVAL_MS;
+	try {
+		const started = performance.now();
+		const { synced, more } = drainQueue(SWEEP_BUDGET_MS);
+		if (synced) logger.debug("Synced queued block rows", { synced, more });
+		if (more)
+			next = Math.max(
+				SWEEP_BACKLOG_DELAY_MS,
+				Math.ceil((performance.now() - started) * SWEEP_PACE_FACTOR),
+			);
+	} catch (error) {
+		logger.warn("Block sync sweep failed", { error: String(error) });
+		if (/closed/i.test(String(error))) {
+			stopBlockSyncSweep();
+			return;
+		}
+	}
+	// Stopped while it ran.
+	if (sweep === undefined) return;
+	scheduleSweep(next);
+}
+
 export function stopBlockSyncSweep(): void {
-	if (sweep) clearInterval(sweep);
+	if (sweep) clearTimeout(sweep);
 	sweep = undefined;
+	stopBlockIndex();
 }
 
 /**
@@ -259,6 +359,7 @@ export function recoverBlockStorage(): number {
 	drainQueue(SWEEP_BUDGET_MS);
 	auditRecentEnvelopes();
 	startSweep();
+	recoverBlockIndex();
 	return interrupted;
 }
 
@@ -314,6 +415,8 @@ interface EnvelopeRow {
 	origin: string | null;
 	provider: string | null;
 	bodyFormat: number;
+	/** 1: the rows are the body (`body_rows_only`). */
+	rowsOnly: number;
 }
 
 interface BlockRow {
@@ -327,6 +430,8 @@ interface BlockRow {
 	payload: string;
 	state: string | null;
 	revision: number;
+	modelChars: number;
+	ledgerRevision: string | null;
 }
 
 /**
@@ -391,21 +496,55 @@ function newRowId(narratorId: string, key: string, mode: SyncMode): string {
 	return fresh;
 }
 
+/** A ledger attempt as the sync reads it: everything planning reads, and its identity. */
+interface LedgerRow extends PlanLedgerRow {
+	id: string;
+	modelRevision: number;
+}
+
+/**
+ * The output column as planning reads it: whether it marks a broken call (the only thing a
+ * block's columns take from a result), never the result itself, which can be megabytes.
+ * `instr` rules out nearly every output before any JSON is parsed.
+ */
+const BROKEN_OUTPUT_SQL = `CASE WHEN instr(output_json, '"_broken"') > 0 AND json_valid(output_json)
+	AND json_type(output_json, '$._broken') = 'true' THEN '{"_broken":true}' END`;
+
+const LEDGER_COLUMNS = `id, tool_use_id AS toolUseId, tool_name AS toolName, input_json AS inputJson,
+	${BROKEN_OUTPUT_SQL} AS outputJson, status, model_revision AS modelRevision`;
+
 /** Non-internal ledger rows of a message, in the order `adoptedLedger` expects. */
-function ledgerRows(messageId: string): PlanLedgerRow[] {
+function ledgerRows(messageId: string): LedgerRow[] {
 	return database.sqlite
 		.prepare(
-			`SELECT tool_use_id AS toolUseId, tool_name AS toolName, input_json AS inputJson,
-				output_json AS outputJson, status
+			`SELECT ${LEDGER_COLUMNS}
 			 FROM narrator_tool_calls WHERE message_id = ? AND is_internal = 0
 			 ORDER BY tool_use_id, execution_attempt, created_at, id`,
 		)
-		.all(messageId) as PlanLedgerRow[];
+		.all(messageId) as LedgerRow[];
+}
+
+/** A tool block's `ledger_revision`: its adopted attempt and that attempt's model revision. */
+function ledgerRevisionOf(attempt: LedgerRow | { id: string; modelRevision: number } | undefined) {
+	return attempt ? `${attempt.id}:${attempt.modelRevision}` : null;
+}
+
+/** An attempt's stored result, for the assets a tool block references. */
+function ledgerOutput(attemptId: string): unknown {
+	const row = database.sqlite
+		.prepare("SELECT output_json AS output FROM narrator_tool_calls WHERE id = ?")
+		.get(attemptId) as { output: string | null } | null;
+	return row ? parse(row.output) : undefined;
+}
+
+/** The hash `blocks_content_hash` keeps of a column's text. */
+export function contentHash(text: string): string {
+	return Bun.hash(text).toString(36);
 }
 
 const ENVELOPE_COLUMNS = `id, narrator_id AS narratorId, role, content_text AS contentText,
 	parent_tool_use_id AS parentToolUseId, sdk_message_uuid AS messageUuid, origin, provider,
-	body_format AS bodyFormat`;
+	body_format AS bodyFormat, body_rows_only AS rowsOnly`;
 
 function envelopeRow(messageId: string): EnvelopeRow | null {
 	return database.sqlite
@@ -433,19 +572,30 @@ function envelopeBody(messageId: string): unknown {
  * the rows themselves once they are current (a ledger change re-derives a tool block's
  * phase from them). A no-op for legacy-format envelopes and for content that is not an
  * array.
+ *
+ * Records the hash of the column text the rows now stand for (`blocks_content_hash`):
+ * `options.contentHash` when the caller hashed the column, the hash of `given` as the store
+ * serializes it otherwise; none when the content was read from the rows.
  */
 export function syncEnvelope(
 	messageId: string,
 	mode: SyncMode = "keep",
 	stamp: BlockStamp = {},
 	given?: unknown,
-	options: { reindex?: boolean } = {},
+	options: { reindex?: boolean; contentHash?: string | null } = {},
 ): void {
+	const started = performance.now();
 	for (const watch of syncWatches) watch.add(messageId);
 	const row = envelopeRow(messageId);
 	if (!row || row.bodyFormat !== 2) return;
 	const content = given === undefined ? envelopeBody(messageId) : given;
 	if (!Array.isArray(content)) return;
+	const hash =
+		options.contentHash !== undefined
+			? options.contentHash
+			: given !== undefined && !row.rowsOnly
+				? contentHash(JSON.stringify(given))
+				: null;
 
 	const message = {
 		id: row.id,
@@ -457,16 +607,16 @@ export function syncEnvelope(
 		origin: row.origin,
 		provider: row.provider,
 	};
-	const planned = planEnvelopeBlocks(
-		{ ...message, contentJson: content },
-		adoptedLedger(ledgerRows(messageId)),
-		{ streaming: mode === "streaming" },
-	);
+	const adopted = adoptedLedger(ledgerRows(messageId));
+	const attempts = new Map(adopted.map((attempt) => [attempt.toolUseId, attempt]));
+	const planned = planEnvelopeBlocks({ ...message, contentJson: content }, adopted, {
+		streaming: mode === "streaming",
+	});
 
 	const existing = database.sqlite
 		.prepare(
 			`SELECT id, ordinal, kind, subtype, phase, wire_id AS wireId, model_text AS modelText,
-				payload, state, revision
+				payload, state, revision, model_chars AS modelChars, ledger_revision AS ledgerRevision
 			 FROM narrator_blocks WHERE message_id = ? ORDER BY ordinal`,
 		)
 		.all(messageId) as BlockRow[];
@@ -514,15 +664,19 @@ export function syncEnvelope(
 
 	const insert = database.sqlite.prepare(
 		`INSERT INTO narrator_blocks (id, message_id, ordinal, kind, subtype, phase, revision, wire_id,
-			attempt_id, model_chars, byte_size, created_at, completed_at, model_text, payload, state)
-		 VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			attempt_id, model_chars, byte_size, created_at, completed_at, model_text, payload, state,
+			ledger_revision)
+		 VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 	);
 	const update = database.sqlite.prepare(
 		`UPDATE narrator_blocks SET ordinal = ?, kind = ?, subtype = ?, phase = ?, revision = ?,
 			wire_id = ?, model_chars = ?, byte_size = ?,
 			completed_at = CASE WHEN ? = 'open' THEN NULL ELSE coalesce(completed_at, ?) END,
-			model_text = ?, payload = ?, state = ?
+			model_text = ?, payload = ?, state = ?, ledger_revision = ?
 		 WHERE id = ?`,
+	);
+	const setLedgerRevision = database.sqlite.prepare(
+		"UPDATE narrator_blocks SET ledger_revision = ? WHERE id = ?",
 	);
 	const clearAssets = database.sqlite.prepare(
 		"DELETE FROM narrator_block_assets WHERE block_id = ?",
@@ -535,8 +689,12 @@ export function syncEnvelope(
 		 WHERE message_id = ? AND tool_use_id = ? AND is_internal = 0 AND block_id IS NOT ?`,
 	);
 	for (const plan of plans) {
-		const { draft, payload, state, byteSize, output, current } = plan;
+		const { draft, payload, state, byteSize, current } = plan;
 		const chars = plan.modelChars;
+		// A tool block's ledger columns follow its adopted attempt; nothing else reads it.
+		const attempt = draft.kind === "tool" && draft.wireId ? attempts.get(draft.wireId) : undefined;
+		const ledgerRevision = ledgerRevisionOf(attempt);
+		const ledgerMoved = draft.kind === "tool" && current?.ledgerRevision !== ledgerRevision;
 		const bodyChanged =
 			!current || current.payload !== payload || current.modelText !== draft.modelText;
 		const changed =
@@ -546,7 +704,8 @@ export function syncEnvelope(
 			current.subtype !== draft.subtype ||
 			current.phase !== plan.phase ||
 			current.wireId !== draft.wireId ||
-			current.ordinal !== plan.ordinal;
+			current.ordinal !== plan.ordinal ||
+			current.modelChars !== chars;
 		if (!current) {
 			insert.run(
 				plan.id,
@@ -564,6 +723,7 @@ export function syncEnvelope(
 				draft.modelText,
 				payload,
 				state,
+				ledgerRevision,
 			);
 		} else if (changed) {
 			const revision =
@@ -583,11 +743,16 @@ export function syncEnvelope(
 				draft.modelText,
 				payload,
 				state,
+				ledgerRevision,
 				plan.id,
 			);
-		}
-		if (!current || changed || output !== undefined) {
+		} else if (ledgerMoved) setLedgerRevision.run(ledgerRevision, plan.id);
+		// What follows from the block and its attempt: only for a block that changed, or whose
+		// attempt moved. Only then is the attempt's result read.
+		const derive = !current || changed || ledgerMoved || !!options.reindex;
+		if (derive) {
 			clearAssets.run(plan.id);
+			const output = attempt ? ledgerOutput(attempt.id) : undefined;
 			for (const [assetId, role] of blockAssets(draft, output))
 				addAsset.run(plan.id, assetId, role);
 		}
@@ -595,12 +760,185 @@ export function syncEnvelope(
 			bindLedger.run(plan.id, messageId, draft.wireId, plan.id);
 		// Searchable once it stops streaming (§4.6): a step's open items are not indexed yet.
 		if (plan.phase === "open") dropBlockIndex(plan.id);
-		else if (!current || changed || output !== undefined || options.reindex)
-			writeBlockIndex(plan.id, blockIndexText(draft.canonical, output));
+		else if (derive) queueBlockIndex(plan.id);
 	}
 	database.sqlite
 		.prepare("UPDATE narrator_messages SET body_bytes = ? WHERE id = ? AND body_bytes <> ?")
 		.run(planned.bodyBytes, messageId, planned.bodyBytes);
+	database.sqlite
+		.prepare(
+			"UPDATE narrator_messages SET blocks_content_hash = ? WHERE id = ? AND blocks_content_hash IS NOT ?",
+		)
+		.run(hash, messageId, hash);
+	noteSlowSync(messageId, "envelope", performance.now() - started, plans.length);
+}
+
+/** At most one line a minute, for a single envelope's sync past `SLOW_SYNC_MS`. */
+function noteSlowSync(messageId: string, kind: string, elapsedMs: number, blocks: number): void {
+	if (elapsedMs < SLOW_SYNC_MS) return;
+	const now = Date.now();
+	if (now - slowSyncLog.at < 60_000) {
+		slowSyncLog.suppressed++;
+		return;
+	}
+	logger.warn("Slow block sync", {
+		messageId,
+		kind,
+		elapsedMs: Math.round(elapsedMs),
+		blocks,
+		suppressed: slowSyncLog.suppressed,
+	});
+	slowSyncLog.at = now;
+	slowSyncLog.suppressed = 0;
+}
+
+/**
+ * Sync a queued envelope, deciding how much its sync must read. Its content is unchanged
+ * since its rows were built when its rows are its body (rows-only), or when its column still
+ * hashes to what they were built from (`blocks_content_hash`): then only its ledger can have
+ * moved (`syncLedger`). Anything else is a full sync, from the column it was hashed from.
+ */
+function syncQueuedEnvelope(messageId: string): void {
+	const row = database.sqlite
+		.prepare(
+			`SELECT ${ENVELOPE_COLUMNS}, blocks_content_hash AS syncedHash,
+				CASE WHEN body_rows_only = 0 THEN content_json END AS contentJson
+			 FROM narrator_messages WHERE id = ?`,
+		)
+		.get(messageId) as
+		| (EnvelopeRow & { syncedHash: string | null; contentJson: string | null })
+		| null;
+	if (!row || row.bodyFormat !== 2) {
+		syncEnvelope(messageId);
+		return;
+	}
+	if (row.rowsOnly || row.contentJson === null) {
+		if (!syncLedger(row)) syncEnvelope(messageId);
+		return;
+	}
+	const hash = contentHash(row.contentJson);
+	if (hash === row.syncedHash && syncLedger(row)) return;
+	syncEnvelope(messageId, "keep", {}, parse(row.contentJson), { contentHash: hash });
+}
+
+/**
+ * The ledger columns of a queued envelope whose content its rows still match: each tool block
+ * whose adopted attempt moved (`ledger_revision`) is re-derived from its own elements and
+ * attempt, exactly as `syncEnvelope` derives it (a tool block's columns read nothing else),
+ * without reading the envelope's other blocks or any other attempt's result. False when a
+ * block does not decode on its own as a tool block of the same call: the caller then syncs
+ * the whole envelope, which rewrites whatever this wrote.
+ */
+function syncLedger(row: EnvelopeRow): boolean {
+	const started = performance.now();
+	for (const watch of syncWatches) watch.add(row.id);
+	const blocks = database.sqlite
+		.prepare(
+			`SELECT id, phase, subtype, wire_id AS wireId, model_chars AS modelChars, revision,
+				ledger_revision AS ledgerRevision
+			 FROM narrator_blocks WHERE message_id = ? AND kind = 'tool' ORDER BY ordinal`,
+		)
+		.all(row.id) as Array<{
+		id: string;
+		phase: string;
+		subtype: string | null;
+		wireId: string | null;
+		modelChars: number;
+		revision: number;
+		ledgerRevision: string | null;
+	}>;
+	if (!blocks.length) return true;
+	// The attempt identities first: no input or result is read for a block that did not move.
+	const attempts = new Map(
+		adoptedLedger(
+			database.sqlite
+				.prepare(
+					`SELECT id, tool_use_id AS toolUseId, model_revision AS modelRevision
+					 FROM narrator_tool_calls WHERE message_id = ? AND is_internal = 0
+					 ORDER BY tool_use_id, execution_attempt, created_at, id`,
+				)
+				.all(row.id) as Array<{ id: string; toolUseId: string; modelRevision: number }>,
+		).map((attempt) => [attempt.toolUseId, attempt]),
+	);
+	const moved = blocks.filter(
+		(block) =>
+			block.ledgerRevision !==
+			ledgerRevisionOf(block.wireId ? attempts.get(block.wireId) : undefined),
+	);
+	if (!moved.length) return true;
+	const message = {
+		id: row.id,
+		narratorId: row.narratorId,
+		role: row.role,
+		contentText: row.contentText,
+		parentToolUseId: row.parentToolUseId,
+		messageUuid: row.messageUuid,
+		origin: row.origin,
+		provider: row.provider,
+	};
+	const bodyOf = database.sqlite.prepare("SELECT payload, state FROM narrator_blocks WHERE id = ?");
+	const attemptOf = database.sqlite.prepare(
+		`SELECT ${LEDGER_COLUMNS} FROM narrator_tool_calls WHERE id = ?`,
+	);
+	const update = database.sqlite.prepare(
+		`UPDATE narrator_blocks SET subtype = ?, phase = ?, revision = ?, model_chars = ?,
+			completed_at = CASE WHEN ? = 'open' THEN NULL ELSE coalesce(completed_at, ?) END,
+			ledger_revision = ?
+		 WHERE id = ?`,
+	);
+	const clearAssets = database.sqlite.prepare(
+		"DELETE FROM narrator_block_assets WHERE block_id = ?",
+	);
+	const addAsset = database.sqlite.prepare(
+		"INSERT OR IGNORE INTO narrator_block_assets (block_id, asset_id, role) VALUES (?, ?, ?)",
+	);
+	const bindLedger = database.sqlite.prepare(
+		`UPDATE narrator_tool_calls SET block_id = ?
+		 WHERE message_id = ? AND tool_use_id = ? AND is_internal = 0 AND block_id IS NOT ?`,
+	);
+	const now = new Date().toISOString();
+	for (const block of moved) {
+		const known = block.wireId ? attempts.get(block.wireId) : undefined;
+		const attempt = known ? (attemptOf.get(known.id) as LedgerRow | null) : null;
+		const body = bodyOf.get(block.id) as { payload: string; state: string | null };
+		const [plan, ...rest] = planEnvelopeBlocks(
+			{
+				...message,
+				contentJson: assembleContent([{ payload: parse(body.payload), state: parse(body.state) }]),
+			},
+			attempt ? [attempt] : [],
+		).blocks;
+		if (
+			!plan ||
+			rest.length ||
+			plan.draft.kind !== "tool" ||
+			plan.draft.wireId !== block.wireId ||
+			plan.payload !== body.payload ||
+			plan.state !== body.state
+		)
+			return false;
+		const phase = plan.draft.phase;
+		const revision = block.revision + (block.phase === "open" && phase !== "open" ? 1 : 0);
+		update.run(
+			plan.draft.subtype,
+			phase,
+			revision,
+			plan.modelChars,
+			phase,
+			now,
+			ledgerRevisionOf(attempt ?? undefined),
+			block.id,
+		);
+		clearAssets.run(block.id);
+		const output = attempt ? ledgerOutput(attempt.id) : undefined;
+		for (const [assetId, role] of blockAssets(plan.draft, output))
+			addAsset.run(block.id, assetId, role);
+		if (block.wireId) bindLedger.run(block.id, row.id, block.wireId, block.id);
+		if (phase === "open") dropBlockIndex(block.id);
+		else queueBlockIndex(block.id);
+	}
+	noteSlowSync(row.id, "ledger", performance.now() - started, moved.length);
+	return true;
 }
 
 // === State-only writes (§5.4) ===
@@ -856,10 +1194,8 @@ function lineageRows(messageId: string): Array<{
 
 // === Block search index (§4.6) ===
 
-function writeBlockIndex(blockId: string, text: string): void {
-	replaceBlockIndexText(database.sqlite, blockId, text);
-}
-
+/** A block that is streaming again has no search text, and owes none. */
 function dropBlockIndex(blockId: string): void {
 	removeBlockIndexText(database.sqlite, blockId);
+	unqueueBlockIndex(blockId);
 }

@@ -32,6 +32,7 @@
  */
 
 import { beforeAll, describe, expect, it } from "bun:test";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 
 beforeAll(() => {
@@ -41,37 +42,39 @@ beforeAll(() => {
 /** A persisted, finished tool call — a plain folded row. */
 function tool(seq: number, id: string) {
 	const input = { command: `echo ${id}` };
-	return {
-		id: `m${seq}`,
-		seq,
-		role: "assistant",
-		contentJson: [{ type: "tool_use", id, name: "Bash", input }],
-		toolCalls: [
-			{
-				id: `c-${id}`,
-				toolUseId: id,
-				toolName: "Bash",
-				status: "success",
-				inputJson: input,
-				outputJson: { stdout: `out ${id}\nsecond\nthird` },
-				durationMs: 900,
-			},
-		],
-		children: [],
-	};
+	return rowWithElements(
+		{
+			id: `m${seq}`,
+			seq,
+			role: "assistant",
+			toolCalls: [
+				{
+					id: `c-${id}`,
+					toolUseId: id,
+					toolName: "Bash",
+					status: "success",
+					inputJson: input,
+					outputJson: { stdout: `out ${id}\nsecond\nthird` },
+					durationMs: 900,
+				},
+			],
+		},
+		[{ type: "tool_use", id, name: "Bash", input }],
+	);
 }
 
 /** The LIVE row: a reasoning block whose steps arrive one at a time. */
 function live(text: string) {
-	return {
-		id: "__streaming__",
-		model: "gpt-5.6",
-		seq: 999,
-		role: "assistant",
-		contentJson: [{ type: "reasoning", text }],
-		toolCalls: [],
-		children: [],
-	};
+	return rowWithElements(
+		{
+			id: "__streaming__",
+			model: "gpt-5.6",
+			seq: 999,
+			role: "assistant",
+			toolCalls: [],
+		},
+		[{ type: "reasoning", text }],
+	);
 }
 
 const STEPS = ["**甲**\n\n正文。", "**乙**\n\n正文。", "**丙**\n\n正文。", "**丁**\n\n正文。"];

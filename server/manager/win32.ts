@@ -257,6 +257,7 @@ interface Kernel32 {
 	GetModuleHandleW: (name: Pointer) => Pointer;
 	GetLastError: () => number;
 	CreateMutexW: (attrs: Pointer, initialOwner: number, name: Pointer) => Pointer;
+	CloseHandle: (handle: Pointer) => number;
 	GetConsoleWindow: () => Pointer;
 	LoadLibraryW: (name: Pointer) => Pointer;
 	RtlMoveMemory: (destination: Pointer, source: Pointer, length: number) => void;
@@ -443,6 +444,7 @@ export function loadNative(): { user32: User32; gdi32: Gdi32; kernel32: Kernel32
 			GetModuleHandleW: { args: [FFIType.ptr], returns: FFIType.ptr },
 			GetLastError: { args: [], returns: FFIType.u32 },
 			CreateMutexW: { args: [FFIType.ptr, FFIType.i32, FFIType.ptr], returns: FFIType.ptr },
+			CloseHandle: { args: [FFIType.ptr], returns: FFIType.i32 },
 			GetConsoleWindow: { args: [], returns: FFIType.ptr },
 			LoadLibraryW: { args: [FFIType.ptr], returns: FFIType.ptr },
 			RtlMoveMemory: {
@@ -864,12 +866,29 @@ export function isShiftPressed(): boolean {
  *
  * 句柄故意不关闭：进程退出由系统回收，持有它才是整个进程生命周期内"单实例"的依据。
  */
+/** 本进程持有的单实例互斥体句柄；让位给新版本面板时关闭。 */
+let singleInstanceMutex: Pointer | undefined;
+
 export function acquireSingleInstanceMutex(name: string): boolean {
 	const native = loadNative();
 	if (!native) return true; // 非原生环境不限制。
 	const handle = native.kernel32.CreateMutexW(0 as unknown as Pointer, 0, wstr(name));
 	if (!handle) return true; // 创建失败不阻塞启动。
-	return native.kernel32.GetLastError() !== ERROR_ALREADY_EXISTS;
+	if (native.kernel32.GetLastError() === ERROR_ALREADY_EXISTS) {
+		// 打开的是别人的互斥体：必须关掉，否则这个句柄会让它在对方释放后继续存在，重试永远失败。
+		native.kernel32.CloseHandle(handle);
+		return false;
+	}
+	singleInstanceMutex = handle;
+	return true;
+}
+
+/** 释放单实例互斥体，让新版本面板可以接手。 */
+export function releaseSingleInstanceMutex(): void {
+	const native = loadNative();
+	if (!native || !singleInstanceMutex) return;
+	native.kernel32.CloseHandle(singleInstanceMutex);
+	singleInstanceMutex = undefined;
 }
 
 export function isWindow(hwnd: Pointer): boolean {

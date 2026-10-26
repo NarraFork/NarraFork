@@ -17,7 +17,6 @@ export const RUNTIME_POLICY_TRAIT_PREFIX = "custom-runtime-policy:";
 const CAPABILITY_KEYS = [
 	"spawnAgent",
 	"awaitAgent",
-	"sendAwait",
 	"askUserQuestion",
 	"planApproval",
 	"stopHooks",
@@ -25,6 +24,10 @@ const CAPABILITY_KEYS = [
 ] as const;
 
 export type RuntimeCapabilityKey = (typeof CAPABILITY_KEYS)[number];
+
+/** Retired capabilities older stored ceilings may still deny; read and dropped. */
+const RETIRED_CAPABILITY_KEYS = ["sendAwait"] as const;
+const retiredCapability = new Set<string>(RETIRED_CAPABILITY_KEYS);
 
 const toolNames = z.array(z.string().min(1).max(256)).max(512);
 
@@ -44,7 +47,13 @@ const runtimePolicyTraitSchema = z.strictObject({
 	/** Shell is limited to the constrained local read-only Git policy. */
 	readOnlyGitShell: z.boolean().optional(),
 	/** Capabilities explicitly removed by this layer. */
-	deny: z.array(z.enum(CAPABILITY_KEYS)).max(CAPABILITY_KEYS.length).optional(),
+	deny: z
+		.array(z.enum([...CAPABILITY_KEYS, ...RETIRED_CAPABILITY_KEYS]))
+		.max(CAPABILITY_KEYS.length + RETIRED_CAPABILITY_KEYS.length)
+		.transform((keys) =>
+			keys.filter((key): key is RuntimeCapabilityKey => !retiredCapability.has(key)),
+		)
+		.optional(),
 	/** Self-continuation ceiling. Omitted = promote todo, unlimited progress passes. */
 	continuation: z
 		.strictObject({

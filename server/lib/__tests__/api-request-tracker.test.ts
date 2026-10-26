@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, mock, test } from "bun:test";
 import { apiRequests, credentialUsageTotals, userUsageTotals } from "@server/db/schema";
+import { TOKEN_ACCOUNTING_VERSION } from "@shared/token-accounting";
 import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 
@@ -83,6 +84,7 @@ describe("request evidence linkage on the inserted row", () => {
 		const row = db.select().from(apiRequests).where(eq(apiRequests.id, handle.id)).get();
 		expect(row?.recordingRequestId).toBe("rec-linked-1");
 		expect(row?.errorMessage).toBe("upstream 502");
+		expect(row?.tokenAccountingVersion).toBe(TOKEN_ACCOUNTING_VERSION);
 		const diagnosticsJson = row?.diagnosticsJson as string;
 		expect(Buffer.byteLength(diagnosticsJson, "utf8")).toBeLessThanOrEqual(DIAGNOSTICS_MAX_BYTES);
 		expect(JSON.parse(diagnosticsJson)).toMatchObject({ statusCode: 502, requestId: "req-502" });
@@ -162,9 +164,10 @@ describe("request user attribution", () => {
 		};
 		await finishApiRequest(handle, { usage });
 		await finishApiRequest(handle, { usage });
-		expect(db.select().from(apiRequests).where(eq(apiRequests.id, handle.id)).get()).toMatchObject(
-			usage,
-		);
+		expect(db.select().from(apiRequests).where(eq(apiRequests.id, handle.id)).get()).toMatchObject({
+			...usage,
+			tokenAccountingVersion: TOKEN_ACCOUNTING_VERSION,
+		});
 		expect(
 			db.select().from(userUsageTotals).where(eq(userUsageTotals.userId, userId)).get(),
 		).toMatchObject({

@@ -186,14 +186,7 @@ test("network failures remain errors without fabricated file or history outcomes
 
 test("refresh invalidates history and existing file previews, scoped to the narrator", () => {
 	const qc = new QueryClient();
-	const resources = [
-		"messages",
-		"file-tree-status",
-		"tool-calls",
-		"rollback-preview",
-		"block-delete-preview",
-		"edit-regenerate-preview",
-	];
+	const resources = ["messages", "file-tree-status", "tool-calls"];
 	for (const narrator of ["a", "b"]) {
 		for (const resource of resources)
 			qc.setQueryData(["narrators", narrator, resource, "detail"], {});
@@ -225,7 +218,7 @@ describe("HTTP error and success envelope mapping", () => {
 	for (const action of ["delete", "edit"] as const) {
 		const run = () =>
 			action === "delete"
-				? api.deleteMessageBlocks("n", [{ messageId: "m", blockIndex: 0 }])
+				? api.deleteMessageBlocks("n", [{ messageId: "m", blockIndex: 0, blockId: "b0" }])
 				: api.editAndRegenerate("n", "m", "edited", { skipRevert: false });
 
 		test(`${action} maps a real HTTP conflict to an Error retaining every file result`, async () => {

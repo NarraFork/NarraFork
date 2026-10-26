@@ -28,7 +28,10 @@
 - **出站**：`Send({ user, message })` 只对 bot 提供（`AgentConfig.bot` 决定 schema；`sendAsBot` 重新读取 trait 作为权威检查）。按用户名解析（精确匹配优先，其次大小写不敏感的唯一匹配，忽略前导 `@`），写入 `postBotMessage`：`sender_narrator_id` 记作者，`sender_user_id` 为空。**只能发给能打开这个 bot 的人**（与 `resolveBotRoom` 同一门槛）：否则收件人收到一条来自任意名字、既查不到来源也无法回复的消息。权限层对 bot 的 `Send({ user })` 自动放行（`shouldAutoAllowSendWithinScope`）——那是它唯一的声音。
 - **不等没人看得见的人**：没人读 bot 的会话记录，所以创建时给它存一层运行时上限（`BOT_RUNTIME_CEILING`，与委派模板同一机制）：禁用 AskUserQuestion 与计划审批，也不会以计划模式启动。需要问人时用 Send 发问，回答作为对方下一条消息到达。同理，bot 在一轮工具调用（通常就是 Send）之后不再输出任何文字，是正常收尾：Agent Loop 把这种“已服务但无内容”的回复当作 `done`，而不是上游空响应错误（拒答、截断等仍照常报错）。普通叙述者在一轮包含 Agent、后台 Bash 或 Send 的工具调用之后也一样——后续结果会作为新的输入到达，此刻无话可说是正常的。工具权限审批仍会发生，头部会提示能驱动 bot 的人去监控里处理。
 - **提示词**：`runtimeBasePrompt` 在 bot 自身的 system prompt（人设）之后追加 bot 协议段（`server/lib/prompts/bot.ts`）：对方只看得到 Send 的内容、按发送者标记回复谁、每条来自人的消息都要回复、提问也走 Send、多人对话互相隔离（除非作者本人要求转达）。
+- **主循环只做协调**：bot 的主循环同时服务房间里所有人，它一忙谁都等不到回复。所以协议要求它先用一两句话回复、再把耗时工作（搜代码、长命令、改文件、构建测试、网络调研）交给子代理；子代理回报后由 bot 整理成简短结论再 Send 给提问的人。同一个任务的后续追问用 `Send({ id: <别名> })` 交给原来的子代理（保留上下文），只有新任务才新开。代码侧兜底：bot 的 `Agent` 调用一律后台运行（`ToolContext.bot`，见 `tools/task.ts`），模型即便要求前台也不会卡住主循环，结果作为下一条输入到达。
 - **引用**：原生搜索（Codex/Responses）的 `\ue200cite\ue202turn0search0\ue201` 标记只有出现在 assistant 文本里才能借 annotations 还原成链接，写进 Send 参数里的标记没有 URL 可还原。所以照 Codex `web.run` 工具描述的做法，提示词要求 bot 用 `[标题](URL)` 引用、不写内部引用 ID；`sendToUser` 落盘前再用 `cleanAssistantText` 兜底剥掉漏网标记。
+
+**输入框**：bot 对话页的输入框就是叙述者的 `NarratorComposer`（`BotChatComposer`）：内联图片/文件、`#file` 引用 bot 工作目录、@提及、输入历史、提示词优化、全屏编辑、拖放上传都与叙述者一致。发送时文件先上传为聊天附件，再作为普通帖子发出，入站路径不变。两处有意不同：草稿只存本机（按房间，`draft.sessionId` 指向 bot，不会覆盖 bot 监控页输入框的服务端草稿）；不显示斜杠命令菜单，因为聊天文字按原文投递。
 
 ## 3. 访问控制
 
@@ -68,5 +71,7 @@ bot 房间是普通聊天房间，所以分页、实时帧、未读角标（计�
 | `server/services/narrator-service.ts` | `kind: "bot"`（必须独立、必须有名字、不以计划模式启动、存运行时上限）；fork 去掉 `bot` |
 | `server/services/agent-runtime/policy.ts` | `BOT_RUNTIME_CEILING` |
 | `frontend/components/chat/BotChatPage.tsx` | bot 页面：头部（状态、监控）+ `ChatRoomView` |
+| `frontend/components/chat/BotChatComposer.tsx` | bot 对话的输入框：`NarratorComposer`（本地草稿、无斜杠菜单）→ 上传聊天附件 → 发帖 |
+| `server/lib/agent/tools/task.ts` | bot 的 `Agent` 调用强制后台 |
 | `frontend/components/chat/bot-activity.ts` | 头部状态文案的判定 |
 | `frontend/routes/narrators/$narratorId.tsx` | bot 默认显示对话，`?view=monitor` 显示会话记录 |

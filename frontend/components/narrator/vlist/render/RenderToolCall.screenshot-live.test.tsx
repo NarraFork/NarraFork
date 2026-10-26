@@ -21,6 +21,7 @@
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { MantineProvider } from "@mantine/core";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { parseHTML } from "linkedom";
 import { renderToStaticMarkup } from "react-dom/server";
@@ -71,12 +72,28 @@ function renderWithProviders(node: React.ReactNode): Element {
 function runningScreenshotDoc(): NarratorMsg[] {
 	const inputJson = { action: "screenshot", session_id: "xKIoNzQ5" };
 	return [
-		{
-			id: "m-live",
-			narratorId: "n1",
-			parentToolUseId: null,
-			role: "assistant",
-			contentJson: [
+		rowWithElements(
+			{
+				id: "m-live",
+				narratorId: "n1",
+				parentToolUseId: null,
+				role: "assistant",
+				contentText: null,
+				toolCalls: [
+					{
+						id: "tc-tu-live",
+						narratorId: "n1",
+						messageId: "m-live",
+						toolUseId: "tu-live",
+						toolName: "Browser",
+						inputJson,
+						status: "running",
+						createdAt: "2026-01-01T00:00:00.000Z",
+					},
+				],
+				createdAt: "2026-01-01T00:00:00.000Z",
+			},
+			[
 				{
 					type: "tool_use",
 					id: "tu-live",
@@ -86,22 +103,7 @@ function runningScreenshotDoc(): NarratorMsg[] {
 					status: "running",
 				},
 			],
-			contentText: null,
-			toolCalls: [
-				{
-					id: "tc-tu-live",
-					narratorId: "n1",
-					messageId: "m-live",
-					toolUseId: "tu-live",
-					toolName: "Browser",
-					inputJson,
-					status: "running",
-					createdAt: "2026-01-01T00:00:00.000Z",
-				},
-			],
-			createdAt: "2026-01-01T00:00:00.000Z",
-			children: [],
-		} as unknown as NarratorMsg,
+		) as unknown as NarratorMsg,
 	];
 }
 

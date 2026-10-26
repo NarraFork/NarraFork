@@ -46,6 +46,9 @@ mock.module("./interaction/QueuedMessageRow", () => ({
 mock.module("./interaction/NarratorInteractionStatusBar", () => ({
 	NarratorInteractionStatusBar: () => <div data-region="status" />,
 }));
+mock.module("./interaction/PendingAgentMessagesPanel", () => ({
+	PendingAgentMessagesPanel: () => null,
+}));
 mock.module("./interaction/UploadProgressBar", () => ({
 	UploadProgressBar: () => <div data-region="upload" />,
 }));

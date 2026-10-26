@@ -1,9 +1,7 @@
 import { runtimePolicyForContext } from "@server/services/agent-runtime/policy";
-import { SUBAGENT_SEND_ASYNC_ONLY_ERROR } from "@server/services/subagent-communication-policy";
 import { cleanAssistantText } from "@shared/citations";
 import { z } from "zod/v4";
 import type { AgentConfig, ToolContext, ToolDefinition, ToolResult } from "../types";
-import { looseNumber, normalizeNumber } from "./number-param";
 
 /**
  * Offered to bot narrators only (see `buildRawJsonSchema`). The bot protocol itself is
@@ -13,7 +11,19 @@ const USER_TARGET_DESCRIPTION =
 	"Bot only — your voice to people: the username of the person to message (the name in " +
 	"their sender marker). Delivers `message` into your chat with them, the only text of yours " +
 	"they ever see (Markdown renders, up to 32,000 characters). Use it alone: no agent " +
-	"targets, replyTo, doInterrupt or await.";
+	"targets, replyTo, doInterrupt, resume or model.";
+
+const RESUME_DESCRIPTION =
+	"Direct child subagents only: restart a target whose last turn ended with an error. Agent " +
+	"messages alone never restart such a subagent (Send then reports status `blocked` and the " +
+	"message stays queued); set resume=true to deliver this message and start it again. " +
+	"It cannot override a stop the user made.";
+
+const MODEL_DESCRIPTION =
+	"Direct child subagents only: switch each target's model before delivering this message " +
+	'(use "parent" to follow your own model again). Subject to the same allowed subagent model ' +
+	"pool as the Agent call; a running subagent switches at its next model request. Combine with " +
+	"resume=true to retry a subagent that failed on its previous model.";
 
 function buildRawJsonSchema(config?: AgentConfig): Record<string, unknown> {
 	const properties: Record<string, unknown> = {
@@ -38,11 +48,6 @@ function buildRawJsonSchema(config?: AgentConfig): Record<string, unknown> {
 			items: { type: "string" },
 		},
 		message: { description: "Message to send to the target subagent(s).", type: "string" },
-		replyTo: {
-			description:
-				"Request ID from a prior allowed Send(await=true) that this asynchronous message answers; subagents may reply but must not wait.",
-			type: "string",
-		},
 		doInterrupt: {
 			description:
 				"Interrupt an active foreground child subagent after queuing the message. Use only " +
@@ -51,28 +56,18 @@ function buildRawJsonSchema(config?: AgentConfig): Record<string, unknown> {
 		},
 	};
 
+	const policy = runtimePolicyForContext(config);
+	if (policy.capabilities.spawnAgent) {
+		properties.resume = { description: RESUME_DESCRIPTION, type: "boolean" };
+		properties.model = { description: MODEL_DESCRIPTION, type: "string" };
+	}
+
 	// Only a bot speaks to people, so only a bot is offered the person target. An
 	// unassembled config (no runtime, as with the policy ceiling) sees the full schema.
 	if (!config || config.bot) {
 		properties.user = {
 			description: USER_TARGET_DESCRIPTION,
 			type: "string",
-		};
-	}
-
-	// The model-facing schema omits reply-wait parameters for subagents. The Zod
-	// schema remains permissive for post-resolution validation and legacy inputs;
-	// the service layer is the authoritative runtime guard.
-	if (runtimePolicyForContext(config).capabilities.sendAwait) {
-		properties.await = {
-			description:
-				"Primary-narrator-only option: request and wait for target(s) to call Send back. Subagents must omit this or set it false; it does not wait for task completion.",
-			type: "boolean",
-		};
-		properties.timeout = {
-			description:
-				"For primary-narrator await requests only: how long to wait for Send replies. Defaults to 60000 milliseconds.",
-			type: "number",
 		};
 	}
 
@@ -90,7 +85,7 @@ export const sendTool: ToolDefinition = {
 		"Send a message to one or more accessible subagents. " +
 		"Primary narrators may send to their child subagents; subagents may send to sibling subagents. " +
 		'Subagents may also report progress to the narrator that launched them via "parent" (or "main"). Ordinary asynchronous messages may mix parent and sibling targets in one call; aliases for the same recipient are deduplicated. ' +
-		"Foreground reports are durably queued until the parent's safe input boundary; they do not start a second parent loop or guarantee immediate reading. Each target is accepted independently after whole-call authorization and reply validation; partial failures preserve successful deliveries. Explicit replyTo requires a single recipient, and replies cannot mix with ordinary messages. " +
+		"Foreground reports are durably queued until the parent's safe input boundary; they do not start a second parent loop or guarantee immediate reading. Each target is accepted independently after whole-call authorization; partial failures preserve successful deliveries. " +
 		"Messages have a 256 KiB UTF-8 body limit; larger content must use a file reference or summary. " +
 		"Send may wake the recipient's session and trigger an unnecessary extra agent turn, so send messages only when genuinely necessary. " +
 		"Do not send agents courtesy acknowledgements, redundant progress updates, or messages merely to check status. " +
@@ -98,9 +93,8 @@ export const sendTool: ToolDefinition = {
 		"status checks after an Await timeout. Repeated messages can distract a working subagent. " +
 		"Set doInterrupt=true only when the current work must stop immediately; never use it merely " +
 		"because a short wait timed out or you are impatient. " +
-		"Primary narrators may set await=true to request a direct Send reply. Subagents must always " +
-		"use asynchronous Send and their await=true requests are rejected; use a later Send message " +
-		"to report back instead. Await is for task completion where allowed.",
+		"Send never waits for an answer: a recipient answers with its own Send, which arrives as a " +
+		"message and wakes you when idle. After sending, continue other work or end your turn.",
 	parameters: z.object({
 		id: z
 			.string()
@@ -121,12 +115,6 @@ export const sendTool: ToolDefinition = {
 			.describe("Target subagent titles, aliases, or unique ID prefixes."),
 		message: z.string().describe("Message to send to the target subagent(s)."),
 		user: z.string().optional().describe(USER_TARGET_DESCRIPTION),
-		replyTo: z
-			.string()
-			.optional()
-			.describe(
-				"Request ID from a prior allowed Send(await=true) that this asynchronous message explicitly answers. Subagents may use replyTo to reply, but must not wait.",
-			),
 		doInterrupt: z
 			.boolean()
 			.optional()
@@ -134,15 +122,8 @@ export const sendTool: ToolDefinition = {
 				"Interrupt an active foreground child subagent after queuing the message. Use only " +
 					"for an urgent correction that requires stopping current work, never for status polling.",
 			),
-		await: z
-			.boolean()
-			.optional()
-			.describe(
-				"Primary-narrator-only option: request and wait for target(s) to call Send back. Subagents must omit this or set it false; it does not wait for task completion.",
-			),
-		timeout: looseNumber(
-			"For primary-narrator await requests only: how long to wait for Send replies. Defaults to 60000 milliseconds.",
-		),
+		resume: z.boolean().optional().describe(RESUME_DESCRIPTION),
+		model: z.string().optional().describe(MODEL_DESCRIPTION),
 	}),
 	get rawJsonSchema() {
 		return buildRawJsonSchema();
@@ -158,15 +139,11 @@ export const sendTool: ToolDefinition = {
 			names?: string[];
 			message?: string;
 			user?: string;
-			replyTo?: string;
 			doInterrupt?: boolean;
-			await?: boolean;
-			timeout?: number;
+			resume?: boolean;
+			model?: string;
 		};
 		if (raw.user !== undefined) return sendToUser(raw, ctx);
-		if (raw.await === true && !runtimePolicyForContext(ctx).capabilities.sendAwait) {
-			return { output: `Send error: ${SUBAGENT_SEND_ASYNC_ONLY_ERROR}`, isError: true };
-		}
 		if (!raw.message?.trim()) {
 			return { output: "Error: message is required.", isError: true };
 		}
@@ -185,10 +162,9 @@ export const sendTool: ToolDefinition = {
 				name: raw.name,
 				names: raw.names,
 				message: raw.message,
-				replyTo: raw.replyTo,
 				doInterrupt: raw.doInterrupt,
-				shouldAwait: raw.await,
-				timeoutMs: normalizeNumber(raw.timeout, { min: 1 }),
+				resume: raw.resume,
+				model: raw.model,
 				toolUseId: ctx.currentToolUseId,
 				toolCallBinding: ctx.toolCallBinding,
 				signal: ctx.signal,
@@ -223,18 +199,6 @@ export const sendTool: ToolDefinition = {
 						)
 						.catch(() => {});
 				},
-				onTargetResolved: (targetId) => {
-					// Only primaries can wait. Reuse Await's navigation-only event; never
-					// manufacture a result while Send is still awaiting a reply.
-					if (raw.await !== true) return;
-					void import("@server/services/await-agent-resolution")
-						.then(async ({ singleSendSelector }) => {
-							if (!singleSendSelector(raw)) return;
-							const { broadcastAwaitAgentResolved } = await import("./await");
-							await broadcastAwaitAgentResolved(ctx.narratorId, toolUseId, targetId);
-						})
-						.catch(() => {});
-				},
 			});
 			return {
 				output: result.output,
@@ -245,7 +209,6 @@ export const sendTool: ToolDefinition = {
 					targets: result.targets,
 					targetCount: targetCount ?? result.targets.length,
 					doInterrupt: raw.doInterrupt ?? false,
-					await: raw.await ?? false,
 				},
 			};
 		} catch (err) {
@@ -270,18 +233,24 @@ async function sendToUser(
 		ids?: string[];
 		name?: string;
 		names?: string[];
-		replyTo?: string;
 		doInterrupt?: boolean;
-		await?: boolean;
+		resume?: boolean;
+		model?: string;
 	},
 	ctx: ToolContext,
 ): Promise<ToolResult> {
-	if (raw.id || raw.ids?.length || raw.name || raw.names?.length || raw.replyTo) {
+	if (raw.id || raw.ids?.length || raw.name || raw.names?.length) {
 		return { output: "Send error: `user` cannot be combined with agent targets.", isError: true };
 	}
-	if (raw.doInterrupt || raw.await) {
+	if (raw.resume || raw.model !== undefined) {
 		return {
-			output: "Send error: a message to a person cannot interrupt or await a reply.",
+			output: "Send error: `user` cannot be combined with resume or model.",
+			isError: true,
+		};
+	}
+	if (raw.doInterrupt) {
+		return {
+			output: "Send error: a message to a person cannot interrupt.",
 			isError: true,
 		};
 	}
@@ -307,7 +276,6 @@ async function sendToUser(
 				targets: [{ label: result.username, status: "sent" }],
 				targetCount: 1,
 				doInterrupt: false,
-				await: false,
 			},
 		};
 	} catch (err) {

@@ -24,7 +24,6 @@
 	"section_sessions": "Sessions",
 	"section_knowledge": "Knowledge",
 	"viewAll": "View all {{count}}",
-	"loadMore": "Load more",
 	"label_session": "Session",
 	"label_knowledge": "Knowledge",
 	"subagent": "Subagent",
@@ -49,5 +48,6 @@
 	"recentOnly": "Every search term is short, so only the last {{days}} days of sessions were searched.",
 	"searchFullHistory": "Search full history",
 	"toolHit": "Tool",
-	"toolHitNamed": "Tool · {{tool}}"
+	"toolHitNamed": "Tool · {{tool}}",
+	"pagesLowerBound": "Showing the top {{count}} matches; refine the search to see others."
 }

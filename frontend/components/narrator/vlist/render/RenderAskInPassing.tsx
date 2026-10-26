@@ -39,6 +39,8 @@ import {
 	RESOLVED_LABEL_HEIGHT,
 	RESOLVED_PADDING_X,
 	RESOLVED_PADDING_Y,
+	RESOLVED_QUOTE_GAP,
+	RESOLVED_QUOTE_ROW,
 } from "../measure/measure-ask-in-passing";
 import type { MeasuredElement, PreparedFixedBlock, PreparedInlineBlock } from "../prepared-block";
 import { typographyMetrics } from "../pretext-fonts";
@@ -74,6 +76,8 @@ interface RenderAskInPassingProps {
 	pending?: AskInPassingPendingInteraction;
 	/** resolved: click handler for the whole card (navigate to target). */
 	onOpen?: () => void;
+	/** resolved: the selected excerpt the question was about (one line). */
+	quote?: string;
 }
 
 interface AskInPassingLabels {
@@ -99,12 +103,15 @@ export function RenderAskInPassing({
 	labels,
 	pending,
 	onOpen,
+	quote,
 }: RenderAskInPassingProps) {
 	const merged = { ...DEFAULT_LABELS, ...labels };
 	if (kind === "pending") {
 		return <PendingCard measured={measured} labels={merged} pending={pending} />;
 	}
-	return <ResolvedCard measured={measured} label={merged.resolvedLabel} onOpen={onOpen} />;
+	return (
+		<ResolvedCard measured={measured} label={merged.resolvedLabel} onOpen={onOpen} quote={quote} />
+	);
 }
 
 // ── pending: fixed border-box geometry, fully controlled interaction ─────────
@@ -251,10 +258,12 @@ function ResolvedCard({
 	measured,
 	label,
 	onOpen,
+	quote,
 }: {
 	measured: MeasuredElement;
 	label: string;
 	onOpen?: () => void;
+	quote?: string;
 }) {
 	const block = measured.blocks[0] as PreparedInlineBlock | undefined;
 	const questionLines = useMemo(() => {
@@ -318,6 +327,24 @@ function ResolvedCard({
 					<Text size="xs" c="dimmed" style={{ height: RESOLVED_LABEL_HEIGHT }}>
 						{label}
 					</Text>
+					{quote ? (
+						<Text
+							size="xs"
+							c="dimmed"
+							truncate
+							title={quote}
+							data-ask-in-passing-quote
+							style={{
+								height: RESOLVED_QUOTE_ROW,
+								lineHeight: `${RESOLVED_QUOTE_ROW}px`,
+								marginBottom: RESOLVED_QUOTE_GAP,
+								paddingLeft: 6,
+								borderLeft: "2px solid var(--mantine-color-default-border)",
+							}}
+						>
+							{quote}
+						</Text>
+					) : null}
 					<div
 						style={{
 							position: "relative",

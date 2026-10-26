@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { messageBody, rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { type ReplaceCandidate, replaceLoadedMessage } from "./vlist-message-replace";
 
 function block(type: string, text: string, extra: Record<string, unknown> = {}) {
@@ -6,7 +7,7 @@ function block(type: string, text: string, extra: Record<string, unknown> = {}) 
 }
 
 function msg(id: string, blocks: unknown[]): ReplaceCandidate {
-	return { id, contentJson: blocks };
+	return rowWithElements({ id }, blocks);
 }
 
 const target = msg("m2", [
@@ -30,7 +31,7 @@ describe("replaceLoadedMessage — only a trailing truncation may land in place"
 	it("accepts dropping trailing blocks, which is what a rollback does", () => {
 		const result = replaceLoadedMessage(loaded, msg("m2", [block("text", "kept")]));
 		expect(result.replaced).toBe(true);
-		expect(result.messages[1]?.contentJson).toHaveLength(1);
+		expect(messageBody(result.messages[1])).toHaveLength(1);
 		// The untouched neighbours keep their identity so their measurements are reused.
 		expect(result.messages[0]).toBe(loaded[0]);
 		expect(result.messages[2]).toBe(loaded[2]);
@@ -42,7 +43,7 @@ describe("replaceLoadedMessage — only a trailing truncation may land in place"
 			msg("m2", [block("text", "kept"), block("tool_use", "", { id: "tu1", name: "Edit" })]),
 		);
 		expect(result.replaced).toBe(true);
-		expect(result.messages[1]?.contentJson).toHaveLength(2);
+		expect(messageBody(result.messages[1])).toHaveLength(2);
 	});
 
 	it("rejects an edit that rewrites a surviving block's text", () => {
@@ -110,15 +111,15 @@ describe("replaceLoadedMessage — only a trailing truncation may land in place"
 	});
 
 	it("rejects a message with no usable id", () => {
-		expect(replaceLoadedMessage(loaded, { contentJson: [] }).reason).toBe("no-id");
-		expect(replaceLoadedMessage(loaded, { id: "", contentJson: [] }).reason).toBe("no-id");
+		expect(replaceLoadedMessage(loaded, rowWithElements({}, [])).reason).toBe("no-id");
+		expect(replaceLoadedMessage(loaded, rowWithElements({ id: "" }, [])).reason).toBe("no-id");
 	});
 
 	it("rejects a non-array payload on either side", () => {
-		expect(replaceLoadedMessage(loaded, { id: "m2", contentJson: null }).reason).toBe(
+		expect(replaceLoadedMessage(loaded, { id: "m2", blocks: null }).reason).toBe(
 			"not-a-truncation",
 		);
-		const messyLoaded = [{ id: "m2", contentJson: "not an array" }];
+		const messyLoaded: ReplaceCandidate[] = [{ id: "m2", blocks: "not an array" as never }];
 		expect(replaceLoadedMessage(messyLoaded, msg("m2", [block("text", "a")])).reason).toBe(
 			"not-a-truncation",
 		);

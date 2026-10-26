@@ -30,6 +30,7 @@
  */
 
 import { beforeAll, describe, expect, it } from "bun:test";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 
 beforeAll(() => {
@@ -38,11 +39,16 @@ beforeAll(() => {
 
 /** A finished tool call, folded as a plain trace row. */
 function finishedTool(index: number) {
-	return {
-		id: `m${index}`,
-		seq: index,
-		role: "assistant",
-		contentJson: [
+	return rowWithElements(
+		{
+			id: `m${index}`,
+			seq: index,
+			role: "assistant",
+			toolCalls: [
+				{ id: `c${index}`, toolUseId: `tu-${index}`, toolName: "Read", status: "success" },
+			],
+		},
+		[
 			{
 				type: "tool_use",
 				id: `tu-${index}`,
@@ -50,22 +56,21 @@ function finishedTool(index: number) {
 				input: { file_path: `src/f${index}.ts` },
 			},
 		],
-		toolCalls: [{ id: `c${index}`, toolUseId: `tu-${index}`, toolName: "Read", status: "success" }],
-		children: [],
-	};
+	);
 }
 
 /** The live row: one reasoning block whose text grows frame to frame. */
 function streamingMessage(text: string) {
-	return {
-		id: "__streaming__",
-		model: "gpt-5.6",
-		seq: 999,
-		role: "assistant",
-		contentJson: [{ type: "reasoning", text }],
-		toolCalls: [],
-		children: [],
-	};
+	return rowWithElements(
+		{
+			id: "__streaming__",
+			model: "gpt-5.6",
+			seq: 999,
+			role: "assistant",
+			toolCalls: [],
+		},
+		[{ type: "reasoning", text }],
+	);
 }
 
 /**
@@ -74,17 +79,18 @@ function streamingMessage(text: string) {
  * Must take the same incremental parse path as the synthetic streaming row.
  */
 function checkpointProjectionMessage(text: string) {
-	return {
-		id: "msg-checkpoint-1",
-		model: "gpt-5.6",
-		seq: 100,
-		role: "assistant",
-		contentJson: [{ type: "reasoning", id: "r-1", revision: 2, text }],
-		toolCalls: [],
-		children: [],
-		liveBlockIndex: 0,
-		liveContentProjection: true,
-	};
+	return rowWithElements(
+		{
+			id: "msg-checkpoint-1",
+			model: "gpt-5.6",
+			seq: 100,
+			role: "assistant",
+			toolCalls: [],
+			liveBlockIndex: 0,
+			liveContentProjection: true,
+		},
+		[{ type: "reasoning", id: "r-1", revision: 2, text }],
+	);
 }
 
 const HISTORY = Array.from({ length: 12 }, (_, i) => finishedTool(i));

@@ -23,6 +23,7 @@ export const DB_WORKER_PROBE_READY_TIMEOUT_MS = 1_500;
 
 import type {
 	BlockBackfillSliceParams,
+	BlockIndexQueueSliceParams,
 	BlockProjectionSliceParams,
 	BlockReindexSliceParams,
 	BlockVerifySliceParams,
@@ -38,12 +39,14 @@ export type DbReadTaskName =
 	| "storageScanTables"
 	| "storageScanSerial"
 	| "storageScanCleanupSummaries"
+	| "storageScanSessionPreview"
 	| "selectRows"
 	| "displayPageMessages"
 	| "displayPageMessagesPostgres"
 	| "blockBackfillSlice"
 	| "blockVerifySlice"
 	| "blockReindexSlice"
+	| "blockIndexQueueSlice"
 	| "blockProjectionSlice";
 
 /** Shared read-query budgets; importing these must never bootstrap a database. */
@@ -121,6 +124,89 @@ export interface StorageScanCleanupSummariesParams {
 	toolCallCutoffIso: string;
 }
 
+/** Hard task budgets, including duplicated ids across the total and sample groups. */
+export const SESSION_PREVIEW_MAX_SAMPLES = 10;
+export const SESSION_PREVIEW_MAX_ID_ENTRIES = 10_000;
+export const SESSION_PREVIEW_MAX_ID_LENGTH = 64;
+export const SESSION_PREVIEW_MAX_RELATIONS = 32;
+export const SESSION_PREVIEW_MAX_RELATION_FIELD_LENGTH = 64;
+
+export interface StorageScanSessionPreviewParams {
+	kind: "storageScanSessionPreview";
+	narratorIds: string[];
+	sampleNarratorIds: string[][];
+	relations: StorageScanCleanupRelation[];
+}
+
+export class SessionPreviewBudgetError extends Error {
+	readonly code = "DATABASE_CLEANUP_PREVIEW_BUDGET_EXCEEDED";
+
+	constructor(detail: string) {
+		super(`Session cleanup preview ${detail}`);
+		this.name = "SessionPreviewBudgetError";
+	}
+}
+
+/** Pure preflight on both sides of postMessage; reject, never truncate a deletion plan. */
+export function assertSessionPreviewBudget(params: StorageScanSessionPreviewParams): void {
+	if (
+		!Array.isArray(params.sampleNarratorIds) ||
+		params.sampleNarratorIds.length > SESSION_PREVIEW_MAX_SAMPLES
+	) {
+		throw new SessionPreviewBudgetError("sample limit exceeded");
+	}
+	if (
+		!Array.isArray(params.narratorIds) ||
+		!Array.isArray(params.relations) ||
+		params.relations.length > SESSION_PREVIEW_MAX_RELATIONS
+	) {
+		throw new SessionPreviewBudgetError("relation or id list limit exceeded");
+	}
+	let idEntries = params.narratorIds.length;
+	for (const ids of params.sampleNarratorIds) {
+		if (!Array.isArray(ids)) throw new SessionPreviewBudgetError("invalid sample id list");
+		idEntries += ids.length;
+	}
+	if (idEntries > SESSION_PREVIEW_MAX_ID_ENTRIES) {
+		throw new SessionPreviewBudgetError("id entry limit exceeded");
+	}
+	for (const ids of [params.narratorIds, ...params.sampleNarratorIds]) {
+		for (const id of ids) {
+			if (typeof id !== "string" || id.length > SESSION_PREVIEW_MAX_ID_LENGTH) {
+				throw new SessionPreviewBudgetError("id length limit exceeded");
+			}
+		}
+	}
+	for (const relation of params.relations) {
+		if (!relation || typeof relation !== "object") {
+			throw new SessionPreviewBudgetError("invalid relation");
+		}
+		for (const field of [relation.tableName, relation.alias, relation.narratorColumn]) {
+			if (typeof field !== "string" || field.length > SESSION_PREVIEW_MAX_RELATION_FIELD_LENGTH) {
+				throw new SessionPreviewBudgetError("relation field length limit exceeded");
+			}
+		}
+		if (
+			relation.countAs !== undefined &&
+			relation.countAs !== "toolCalls" &&
+			relation.countAs !== "apiRequests"
+		) {
+			throw new SessionPreviewBudgetError("invalid relation counter");
+		}
+	}
+}
+
+export interface StorageScanSessionPreviewResult {
+	aggregate: {
+		narrators: number;
+		messages: number;
+		toolCalls: number;
+		apiRequests: number;
+		approxBytes: number;
+	};
+	sampleBytes: number[];
+}
+
 export interface StorageScanByteSummary {
 	count: number;
 	approxBytes: number;
@@ -164,11 +250,13 @@ export type DbReadTaskParams =
 	| BlockBackfillSliceParams
 	| BlockVerifySliceParams
 	| BlockReindexSliceParams
+	| BlockIndexQueueSliceParams
 	| BlockProjectionSliceParams
 	| StorageScanContextParams
 	| StorageScanTablesParams
 	| StorageScanSerialParams
 	| StorageScanCleanupSummariesParams
+	| StorageScanSessionPreviewParams
 	| SelectRowsParams
 	| DisplayPageMessagesParams
 	| PostgresDisplayPageMessagesParams;

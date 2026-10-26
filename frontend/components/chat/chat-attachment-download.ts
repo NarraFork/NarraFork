@@ -8,7 +8,7 @@
  * implementation.
  */
 
-import { absorbRenewedToken, clearTokenOnSessionFailure, getToken } from "../../lib/api";
+import { clearTokenOnSessionFailure, getToken } from "../../lib/api";
 import { apiUrl } from "../../lib/base-path";
 
 /**
@@ -35,7 +35,6 @@ export async function downloadChatAttachment(fetchUrl: string, filename: string)
 	const headers: Record<string, string> = {};
 	if (token) headers.Authorization = `Bearer ${token}`;
 	const res = await fetch(apiUrl(fetchUrl), { headers });
-	absorbRenewedToken(res, token ?? undefined);
 	if (!res.ok) {
 		await clearTokenOnSessionFailure(res);
 		return false;

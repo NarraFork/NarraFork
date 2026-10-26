@@ -12,6 +12,7 @@
  */
 
 import { afterAll, describe, expect, it } from "bun:test";
+import { messageBody, rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { segmentMessages } from "../message/message-segments";
 import type { NarratorMsg } from "../narrator-panel-types";
 import { groupRenderUnits } from "../trace/render-units";
@@ -38,12 +39,24 @@ const CTX: AdapterContext = { lod: 5 };
 // A realistic assistant message with a tool_use block (mirrors what the backend
 // sends: contentJson carries the enriched tool_use block).
 function toolMessage(): NarratorMsg {
-	return {
-		id: "a-tool",
-		narratorId: "n1",
-		parentToolUseId: null,
-		role: "assistant",
-		contentJson: [
+	return rowWithElements(
+		{
+			id: "a-tool",
+			narratorId: "n1",
+			parentToolUseId: null,
+			role: "assistant",
+			contentText: null,
+			toolCalls: [
+				{
+					toolUseId: "tu-1",
+					toolName: "Read",
+					inputJson: { file_path: "/tmp/x.ts" },
+					status: "completed",
+				},
+			],
+			createdAt: "2026-01-01T00:00:00Z",
+		},
+		[
 			{
 				type: "tool_use",
 				id: "tu-1",
@@ -53,41 +66,34 @@ function toolMessage(): NarratorMsg {
 				status: "completed",
 			},
 		],
-		contentText: null,
-		toolCalls: [
-			{
-				toolUseId: "tu-1",
-				toolName: "Read",
-				inputJson: { file_path: "/tmp/x.ts" },
-				status: "completed",
-			},
-		],
-		createdAt: "2026-01-01T00:00:00Z",
-		children: [],
-	} as unknown as NarratorMsg;
+	) as unknown as NarratorMsg;
 }
 
 function textMessage(id: string, role: string, text: string): NarratorMsg {
-	return {
-		id,
-		narratorId: "n1",
-		parentToolUseId: null,
-		role,
-		contentJson: [{ type: "text", text }],
-		contentText: text,
-		toolCalls: [],
-		createdAt: "2026-01-01T00:00:00Z",
-		children: [],
-	} as unknown as NarratorMsg;
+	return rowWithElements(
+		{
+			id,
+			narratorId: "n1",
+			parentToolUseId: null,
+			role,
+			contentText: text,
+			toolCalls: [],
+			createdAt: "2026-01-01T00:00:00Z",
+		},
+		[{ type: "text", text }],
+	) as unknown as NarratorMsg;
 }
 
 describe("subagent cards default to folded at L1 and expanded at L2–L5", () => {
 	it.each([
 		1, 2, 3, 4, 5,
 	] as const)("L%s keeps multiple finished subagents between their ordinary-tool neighbours", (lod) => {
-		const message = {
-			...toolMessage(),
-			contentJson: ["Read", "Agent", "Agent", "Read"].map((name, index) => ({
+		const message = rowWithElements(
+			{
+				...toolMessage(),
+				toolCalls: [],
+			},
+			["Read", "Agent", "Agent", "Read"].map((name, index) => ({
 				type: "tool_use",
 				id: `call-${index}`,
 				name,
@@ -98,8 +104,7 @@ describe("subagent cards default to folded at L1 and expanded at L2–L5", () =>
 				status: "success",
 				outputJson: { _text: "Finished inspection" },
 			})),
-			toolCalls: [],
-		} as unknown as NarratorMsg;
+		) as unknown as NarratorMsg;
 		const units = groupRenderUnits(segmentMessages([message]), lod <= 2).map((unit, i) =>
 			unit.kind === "activity" ? { ...unit, key: `activity-${i}` } : unit,
 		) as unknown as AdapterRenderUnit[];
@@ -137,11 +142,14 @@ describe("subagent cards default to folded at L1 and expanded at L2–L5", () =>
 
 describe("communication × real messages, manifest and selection", () => {
 	function send(id: string, seq: number, status = "success"): NarratorMsg {
-		return {
-			...toolMessage(),
-			id,
-			seq,
-			contentJson: [
+		return rowWithElements(
+			{
+				...toolMessage(),
+				id,
+				seq,
+				toolCalls: [],
+			},
+			[
 				{
 					type: "tool_use",
 					id: "send-real",
@@ -152,8 +160,7 @@ describe("communication × real messages, manifest and selection", () => {
 					outputJson: { _metadata: { targets: [{ id: "worker-real", label: "worker" }] } },
 				},
 			],
-			toolCalls: [],
-		} as unknown as NarratorMsg;
+		) as unknown as NarratorMsg;
 	}
 	function layout(messages: NarratorMsg[], lod: 1 | 2 | 3 | 4 | 5) {
 		const units = groupRenderUnits(segmentMessages(messages), lod <= 2).map((unit, i) =>
@@ -214,11 +221,17 @@ describe("communication × real messages, manifest and selection", () => {
 	] as const)("L%s maps a real fail completion without errorMessage through adapter and measurement", (lod) => {
 		for (const toolName of ["Send", "TeamStatus"]) {
 			const running = send("live-failure", 1, "running");
-			running.contentJson = running.contentJson.map((block) => ({
-				...block,
-				name: toolName,
-				input: { name: "worker", target_id: "worker", action: "send", message: "**hello**" },
-			}));
+			Object.assign(
+				running,
+				rowWithElements(
+					running,
+					messageBody(running).map((block) => ({
+						...block,
+						name: toolName,
+						input: { name: "worker", target_id: "worker", action: "send", message: "**hello**" },
+					})),
+				),
+			);
 			const before = layout([running], lod).items[0];
 			for (const output of [
 				"Send error: target missing",
@@ -233,7 +246,7 @@ describe("communication × real messages, manifest and selection", () => {
 					durationMs: 123,
 				})([running]);
 				expect(patched.changed).toBe(true);
-				expect(patched.messages[0]?.contentJson[0]?.errorMessage).toBeUndefined();
+				expect(messageBody(patched.messages[0])[0]?.errorMessage).toBeUndefined();
 				const failed = layout([...patched.messages], lod).items[0];
 				if (!before || !failed) throw new Error("missing communication item");
 				const data = failed.spec.data as CommunicationBubbleData;
@@ -306,61 +319,64 @@ describe("adapter × real segmentMessages", () => {
 	it("routes a system knowledge_hint even when it is NOT block[0]", () => {
 		// Real structure (MessageBubble scans blocks.find(type===...)): the
 		// meaningful system block can sit after a leading text block.
-		const sysMsg = {
-			id: "s-kh",
-			narratorId: "n1",
-			parentToolUseId: null,
-			role: "system",
-			contentJson: [
+		const sysMsg = rowWithElements(
+			{
+				id: "s-kh",
+				narratorId: "n1",
+				parentToolUseId: null,
+				role: "system",
+				contentText: null,
+				toolCalls: [],
+				createdAt: "2026-01-01T00:00:00Z",
+			},
+			[
 				{ type: "text", text: "note" },
 				{ type: "knowledge_hint", entries: [{ id: "k1", title: "Doc" }] },
 			],
-			contentText: null,
-			toolCalls: [],
-			createdAt: "2026-01-01T00:00:00Z",
-			children: [],
-		} as unknown as NarratorMsg;
+		) as unknown as NarratorMsg;
 		const segments = segmentMessages([sysMsg]) as unknown as AdapterSegment[];
 		const specs = adaptSegments(segments, CTX);
 		expect(specs.some((s) => s.kind === "knowledge-hint")).toBe(true);
 	});
 
 	it("routes a system compact/plan even when preceded by other blocks", () => {
-		const sysMsg = {
-			id: "s-plan",
-			narratorId: "n1",
-			parentToolUseId: null,
-			role: "system",
-			contentJson: [
+		const sysMsg = rowWithElements(
+			{
+				id: "s-plan",
+				narratorId: "n1",
+				parentToolUseId: null,
+				role: "system",
+				contentText: null,
+				toolCalls: [],
+				createdAt: "2026-01-01T00:00:00Z",
+			},
+			[
 				{ type: "text", text: "x" },
 				{ type: "compact", subtype: "plan", summary: "the plan body" },
 			],
-			contentText: null,
-			toolCalls: [],
-			createdAt: "2026-01-01T00:00:00Z",
-			children: [],
-		} as unknown as NarratorMsg;
+		) as unknown as NarratorMsg;
 		const segments = segmentMessages([sysMsg]) as unknown as AdapterSegment[];
 		const specs = adaptSegments(segments, CTX);
 		expect(specs.some((s) => s.kind === "plan-card")).toBe(true);
 	});
 
 	it("routes assistant media blocks (image / image_generation / text_file) to media", () => {
-		const mediaMsg = {
-			id: "a-media",
-			narratorId: "n1",
-			parentToolUseId: null,
-			role: "assistant",
-			contentJson: [
+		const mediaMsg = rowWithElements(
+			{
+				id: "a-media",
+				narratorId: "n1",
+				parentToolUseId: null,
+				role: "assistant",
+				contentText: null,
+				toolCalls: [],
+				createdAt: "2026-01-01T00:00:00Z",
+			},
+			[
 				{ type: "image", imageId: "img-1", filename: "pic.png" },
 				{ type: "image_generation", status: "completed", width: 1024, height: 512, result: "..." },
 				{ type: "text_file", filename: "notes.txt", mediaType: "text/plain" },
 			],
-			contentText: null,
-			toolCalls: [],
-			createdAt: "2026-01-01T00:00:00Z",
-			children: [],
-		} as unknown as NarratorMsg;
+		) as unknown as NarratorMsg;
 		const segments = segmentMessages([mediaMsg]) as unknown as AdapterSegment[];
 		const specs = adaptSegments(segments, CTX);
 		const mediaSpecs = specs.filter((s) => s.kind === "media");
@@ -373,17 +389,18 @@ describe("adapter × real segmentMessages", () => {
 
 	it("ask_in_passing: pending status → pending, any other → resolved (mirrors MessageBubble)", () => {
 		const mk = (status: string) =>
-			({
-				id: `aip-${status}`,
-				narratorId: "n1",
-				parentToolUseId: null,
-				role: "system",
-				contentJson: [{ type: "ask_in_passing", status, text: "q?" }],
-				contentText: null,
-				toolCalls: [],
-				createdAt: "2026-01-01T00:00:00Z",
-				children: [],
-			}) as unknown as NarratorMsg;
+			rowWithElements(
+				{
+					id: `aip-${status}`,
+					narratorId: "n1",
+					parentToolUseId: null,
+					role: "system",
+					contentText: null,
+					toolCalls: [],
+					createdAt: "2026-01-01T00:00:00Z",
+				},
+				[{ type: "ask_in_passing", status, text: "q?" }],
+			) as unknown as NarratorMsg;
 
 		const pending = adaptSegments(
 			segmentMessages([mk("pending")]) as unknown as AdapterSegment[],
@@ -397,13 +414,46 @@ describe("adapter × real segmentMessages", () => {
 		expect((resolved[0]?.data as { kind?: string }).kind).toBe("resolved");
 	});
 
+	it("ask_in_passing: a resolved selection question carries its excerpt as one line", () => {
+		const mk = (block: Record<string, unknown>) =>
+			adaptSegments(
+				segmentMessages([
+					rowWithElements(
+						{
+							id: "aip-quote",
+							narratorId: "n1",
+							parentToolUseId: null,
+							role: "system",
+							contentText: null,
+							toolCalls: [],
+							createdAt: "2026-01-01T00:00:00Z",
+						},
+						[{ type: "ask_in_passing", question: "Why?", ...block }],
+					) as unknown as NarratorMsg,
+				]) as unknown as AdapterSegment[],
+				CTX,
+			)[0]?.data as { quoteText?: string };
+		const quote = { label: "Assistant", text: "first line\n\n  second   line" };
+		expect(mk({ status: "resolved", quote }).quoteText).toBe("first line second line");
+		expect(
+			mk({ status: "resolved", quote: { label: "A", text: "x".repeat(500) } }).quoteText,
+		).toHaveLength(200);
+		expect(mk({ status: "resolved" })).not.toHaveProperty("quoteText");
+		expect(mk({ status: "pending", quote })).not.toHaveProperty("quoteText");
+	});
+
 	it("subagent card carries height-relevant fields (recentCallCount, isTerminal) + render-only status glyph", () => {
-		const agentMsg = {
-			id: "a-agent",
-			narratorId: "n1",
-			parentToolUseId: null,
-			role: "assistant",
-			contentJson: [
+		const agentMsg = rowWithElements(
+			{
+				id: "a-agent",
+				narratorId: "n1",
+				parentToolUseId: null,
+				role: "assistant",
+				contentText: null,
+				toolCalls: [{ toolUseId: "tu-agent", toolName: "Agent", inputJson: {}, status: "success" }],
+				createdAt: "2026-01-01T00:00:00Z",
+			},
+			[
 				{
 					type: "tool_use",
 					id: "tu-agent",
@@ -418,11 +468,7 @@ describe("adapter × real segmentMessages", () => {
 					},
 				},
 			],
-			contentText: null,
-			toolCalls: [{ toolUseId: "tu-agent", toolName: "Agent", inputJson: {}, status: "success" }],
-			createdAt: "2026-01-01T00:00:00Z",
-			children: [],
-		} as unknown as NarratorMsg;
+		) as unknown as NarratorMsg;
 		const segments = segmentMessages([agentMsg]) as unknown as AdapterSegment[];
 		const specs = adaptSegments(segments, CTX);
 		const sub = specs.find((s) => s.kind === "subagent-card");
@@ -449,12 +495,19 @@ describe("adapter × real segmentMessages", () => {
 	});
 
 	it("subagent card without a child narrator draws no open-session button", () => {
-		const agentMsg = {
-			id: "a-agent-2",
-			narratorId: "n1",
-			parentToolUseId: null,
-			role: "assistant",
-			contentJson: [
+		const agentMsg = rowWithElements(
+			{
+				id: "a-agent-2",
+				narratorId: "n1",
+				parentToolUseId: null,
+				role: "assistant",
+				contentText: null,
+				toolCalls: [
+					{ toolUseId: "tu-agent-2", toolName: "Agent", inputJson: {}, status: "running" },
+				],
+				createdAt: "2026-01-01T00:00:00Z",
+			},
+			[
 				{
 					type: "tool_use",
 					id: "tu-agent-2",
@@ -466,11 +519,7 @@ describe("adapter × real segmentMessages", () => {
 					_subagentActivity: { latestToolCalls: [{ toolName: "Read" }] },
 				},
 			],
-			contentText: null,
-			toolCalls: [{ toolUseId: "tu-agent-2", toolName: "Agent", inputJson: {}, status: "running" }],
-			createdAt: "2026-01-01T00:00:00Z",
-			children: [],
-		} as unknown as NarratorMsg;
+		) as unknown as NarratorMsg;
 		const specs = adaptSegments(segmentMessages([agentMsg]) as unknown as AdapterSegment[], CTX);
 		const data = specs.find((s) => s.kind === "subagent-card")?.data as {
 			recentCallCount?: number;
@@ -495,22 +544,22 @@ describe("adapter × real segmentMessages", () => {
 	// adapter must keep its image/text_file blocks as bubble attachments. Before the
 	// fix they were filtered out and the picture never rendered in the vlist.
 	it("keeps a user message's image + text_file attachments on the bubble", () => {
-		const userMsg = {
-			id: "u-media",
-			narratorId: "n1",
-			parentToolUseId: null,
-			role: "user",
-			// Server block order: attachments first, then the text block.
-			contentJson: [
+		const userMsg = rowWithElements(
+			{
+				id: "u-media",
+				narratorId: "n1",
+				parentToolUseId: null,
+				role: "user",
+				contentText: "have a look",
+				toolCalls: [],
+				createdAt: "2026-01-01T00:00:00Z",
+			},
+			[
 				{ type: "image", imageId: "img-1", filename: "shot.png", mediaType: "image/png" },
 				{ type: "text_file", filename: "notes.txt", size: 12 },
 				{ type: "text", text: "have a look" },
 			],
-			contentText: "have a look",
-			toolCalls: [],
-			createdAt: "2026-01-01T00:00:00Z",
-			children: [],
-		} as unknown as NarratorMsg;
+		) as unknown as NarratorMsg;
 		const segments = segmentMessages([userMsg]) as unknown as AdapterSegment[];
 		const specs = adaptSegments(segments, CTX);
 		// Attachments live INSIDE the bubble — still exactly one element.
@@ -528,22 +577,23 @@ describe("adapter × real segmentMessages", () => {
 
 	it("measures a user image bubble taller than the same caption alone", () => {
 		const mk = (withImage: boolean) =>
-			({
-				id: withImage ? "u-img" : "u-plain",
-				narratorId: "n1",
-				parentToolUseId: null,
-				role: "user",
-				contentJson: withImage
+			rowWithElements(
+				{
+					id: withImage ? "u-img" : "u-plain",
+					narratorId: "n1",
+					parentToolUseId: null,
+					role: "user",
+					contentText: "hi",
+					toolCalls: [],
+					createdAt: "2026-01-01T00:00:00Z",
+				},
+				withImage
 					? [
 							{ type: "image", imageId: "i" },
 							{ type: "text", text: "hi" },
 						]
 					: [{ type: "text", text: "hi" }],
-				contentText: "hi",
-				toolCalls: [],
-				createdAt: "2026-01-01T00:00:00Z",
-				children: [],
-			}) as unknown as NarratorMsg;
+			) as unknown as NarratorMsg;
 		const measure = (withImage: boolean) => {
 			const segments = segmentMessages([mk(withImage)]) as unknown as AdapterSegment[];
 			const spec = adaptSegments(segments, CTX)[0];

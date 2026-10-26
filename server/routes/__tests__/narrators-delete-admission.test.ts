@@ -76,8 +76,13 @@ function app() {
 	return instance;
 }
 
-function del(path: string) {
-	return app().request(`http://localhost/narrators${path}`, { method: "DELETE" });
+function del(path: string, body?: unknown) {
+	return app().request(`http://localhost/narrators${path}`, {
+		method: "DELETE",
+		...(body === undefined
+			? {}
+			: { headers: { "content-type": "application/json" }, body: JSON.stringify(body) }),
+	});
 }
 
 /**
@@ -216,7 +221,7 @@ describe("another narrator running in the same worktree", () => {
 		registerBusyLoop(generateId(), WORKTREE);
 		expect(
 			await admissionError(
-				await del(`/${narratorId}/messages/${generateId()}/blocks/0?skipRevert=1`),
+				await del(`/${narratorId}/blocks`, { blockIds: [generateId()], skipRevert: true }),
 			),
 		).toBeNull();
 	});
@@ -233,11 +238,11 @@ describe("the narrator itself running", () => {
 	});
 
 	test.each([
-		"/messages/m",
-		"/messages/m/blocks/0",
-	])("an unplanned file-restoring deletion (%s) is refused before interrupting", async (path) => {
+		["/messages/m", undefined],
+		["/blocks", { blockIds: ["m:0"] }],
+	] as const)("an unplanned file-restoring deletion (%s) is refused before interrupting", async (path, body) => {
 		const session = registerBusyLoop(narratorId, WORKTREE);
-		const response = await del(`/${narratorId}${path}`);
+		const response = await del(`/${narratorId}${path}`, body);
 		expect(response.status).toBe(409);
 		expect(((await response.json()) as { code?: string }).code).toBe(
 			"REVERT_CONFIRMATION_REQUIRED",

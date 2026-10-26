@@ -23,6 +23,7 @@
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { MantineProvider } from "@mantine/core";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { parseHTML } from "linkedom";
 import { renderToStaticMarkup } from "react-dom/server";
 import {
@@ -132,7 +133,7 @@ function traceRow(tc = BASH_TC): Element {
 		[
 			{
 				kind: "tool",
-				msg: { id: "m1", role: "assistant", contentJson: [] },
+				msg: rowWithElements({ id: "m1", role: "assistant" }, []),
 				blockIndex: 0,
 				isSubagent: false,
 				tc,
@@ -211,7 +212,7 @@ describe("a bash call's duration does not change with the LOD", () => {
 			[
 				{
 					kind: "tool",
-					msg: { id: "m1", role: "assistant", contentJson: [] },
+					msg: rowWithElements({ id: "m1", role: "assistant" }, []),
 					blockIndex: 0,
 					isSubagent: false,
 					tc: BASH_TC,

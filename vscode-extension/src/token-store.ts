@@ -11,9 +11,8 @@
  *
  * WHY IT MUST BE BIDIRECTIONAL
  * ----------------------------
- * ⚠️ The token is not stable. The backend re-signs it as it nears expiry and returns the
- * replacement in the `X-NarraFork-Session-Token` response header, which the SPA absorbs
- * (`frontend/lib/api/client.ts`). A write-only store therefore goes stale on its own, and
+ * ⚠️ The token is not stable: a re-login or sign-out in the panel replaces it. A
+ * write-only store therefore goes stale on its own, and
  * the symptom appears LATER and elsewhere: the next panel injects an expired token and
  * the user is bounced to the login screen for no visible reason. So the SPA reports every
  * change back and this store follows it.
@@ -34,19 +33,18 @@ function secretKey(origin: string): string {
 }
 
 /**
- * Reject anything that is not shaped like the JWT the backend issues.
+ * Reject anything that is not shaped like a session token the backend issues: `nfs_`
+ * followed by 32 random bytes in unpadded base64url.
  *
  * The value arrives from the webview, so it is untrusted input even though the relay
  * checks the sender's origin. Storing an arbitrary string would be harmless in itself but
  * would later be injected as a credential; refusing here keeps the store to values that
- * could plausibly be one.
+ * could plausibly be one. Not verified — only the backend can accept or reject it. A
+ * token stored by an older version in another format is dropped on read, so the panel
+ * simply asks the user to sign in again.
  */
 export function looksLikeSessionToken(value: unknown): value is string {
-	if (typeof value !== "string") return false;
-	if (value.length < 20 || value.length > 8_192) return false;
-	// Three base64url segments. Not verified — the extension has no key and does not need
-	// one; the backend is the only party that can accept or reject it.
-	return /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(value);
+	return typeof value === "string" && /^nfs_[A-Za-z0-9_-]{43}$/.test(value);
 }
 
 export class TokenStore {

@@ -1,8 +1,9 @@
 import { randomUUID } from "node:crypto";
 import { statSync } from "node:fs";
 import { resolve } from "node:path";
+import type { PendingAgentMessagesPage } from "@shared/agent-inbox";
 import { resolveBufferQueueMode } from "@shared/buffer-queue-mode";
-import type { ComposerDocument } from "@shared/composer-document";
+import { type ComposerDocument, composerQuoteBlock } from "@shared/composer-document";
 import { FILE_CHANGE_LIMITS } from "@shared/file-change-protocol";
 import {
 	type FileReference,
@@ -200,7 +201,6 @@ import {
 	restoreNarratorDraftSchema,
 	retryFailedCompactSchema,
 	revertScopeSchema,
-	rollbackToBlockSchema,
 	segmentCompactSchema,
 	sendMessageSchema,
 	sessionExportDownloadQuerySchema,
@@ -297,7 +297,7 @@ import {
 	NARRATOR_ACL_COLUMNS,
 	narratorReadableWhere,
 } from "../services/narrator-acl";
-import { grantsBlockProtocol, toBlockPage } from "../services/narrator-block-page";
+import { toBlockPage, toEnvelopes } from "../services/narrator-block-page";
 import { newEnvelopeColumns } from "../services/narrator-block-sync";
 import {
 	blockDetail,
@@ -407,7 +407,6 @@ import {
 	restoreOutputBlock,
 	retryFailedCompact,
 	retryLastMessage,
-	rollbackToBlock,
 	rollbackToBlocks,
 	runCustomCompact,
 	runSegmentCompact,
@@ -1864,7 +1863,13 @@ narratorRoutes.post("/:id/optimize-prompt", async (c) => {
 
 	// Get system instruction for the chosen style
 	const locale = await getUserLanguage(userId);
-	const systemInstruction = getPromptOptimizeInstruction(style as PromptOptimizeStyle, locale);
+	let systemInstruction = getPromptOptimizeInstruction(style as PromptOptimizeStyle, locale);
+	// Multi-segment drafts wrap each segment in <<<NF_..._n>>> ... <<<NF_..._n_END>>> markers
+	// that the client uses to put results back; the model must echo them verbatim.
+	if (/<<<NF_[^>\n]+>>>/.test(text)) {
+		systemInstruction +=
+			"\n\nSEGMENT MARKERS: The draft contains several segments delimited by marker lines like <<<NF_xxx_0>>> and <<<NF_xxx_0_END>>>. Optimize each segment's content separately, and output every marker line EXACTLY as given, in the original order, each on its own line, with each segment's result between its start and end markers. Never merge, drop, reorder or alter markers, and add nothing outside them. This overrides the instruction to output only the prompt text.";
+	}
 
 	// Load context if requested
 	let contextText = "";
@@ -2733,44 +2738,6 @@ async function allowRetryResponse(c: Context, id: string, toolUseId: string) {
 	return c.json({ ok: true });
 }
 
-// Rollback to a specific block — delete everything after it (no re-run)
-narratorRoutes.post("/:id/rollback/:messageId", async (c) => {
-	const id = c.req.param("id");
-	const messageId = c.req.param("messageId");
-	const { blockIndex, skipRevert, scope, revertPlan } = rollbackToBlockSchema.parse(
-		await c.req.json(),
-	);
-	if (skipRevert !== true && !revertPlan)
-		throw new AppError(
-			"Review a fresh rollback preview before restoring files",
-			409,
-			"REVERT_CONFIRMATION_REQUIRED",
-		);
-	if (skipRevert !== true) await assertWorkspaceHistoryRevertSupported(id);
-
-	const narrator = await narratorService.getById(id);
-
-	// A rollback discards the turn it lands in, so a user asking for one has already
-	// decided the running turn is unwanted: stop it for them instead of refusing and
-	// making them press Stop first. A subagent is included — it used to be the one
-	// case that refused outright, but "the work I am undoing is still running" is not
-	// a reason to keep running it.
-	await prepareHistoryRewrite(id);
-
-	if (narrator.status === "archived") {
-		await narratorService.updateStatus(id, "idle");
-	}
-
-	const result = await rollbackToBlock(id, messageId, blockIndex, {
-		revertPlan,
-		skipRevert: skipRevert === true,
-		principal: narratorPrincipalOf(c),
-		signal: c.req.raw.signal,
-		...(scope ? { scope } : {}),
-	});
-	return c.json(result);
-});
-
 /** Read snapshots only from the message being edited, never from a different session. */
 async function resolveEditedFileReferences(
 	narratorId: string,
@@ -3424,6 +3391,52 @@ narratorRoutes.delete("/:id/buffer/:mid", async (c) => {
 	return c.json({ ok: true });
 });
 
+// Queued agent messages (Send/team traffic) — previews only, for the recipient page.
+narratorRoutes.get("/:id/inbox/agent-messages", async (c) => {
+	const id = c.req.param("id");
+	const [{ listPendingAgentMessages, blockingStopReason }, narrator] = await Promise.all([
+		import("../services/agent-runtime/inbox"),
+		narratorService.getById(id),
+	]);
+	const pending = await listPendingAgentMessages(id);
+	const running =
+		narrator.status === "working" || narrator.status === "waiting" || isLoopRunning(id);
+	return c.json({
+		...pending,
+		running,
+		blockedReason:
+			!running && narrator.status === "idle" ? blockingStopReason(narrator.lastStopReason) : null,
+	} satisfies PendingAgentMessagesPage);
+});
+
+// Explicit user resume: lets queued agent messages restart a failed or user-stopped session.
+narratorRoutes.post("/:id/inbox/resume", async (c) => {
+	const id = c.req.param("id");
+	const narrator = await narratorService.getById(id);
+	if (narrator.status === "archived") throw new ValidationError("Narrator is archived");
+	const { wakeInboxIfEligible, notifyAgentInboxChanged } = await import(
+		"../services/agent-runtime/inbox"
+	);
+	const locale = await getUserLanguage(c.get("user").sub);
+	const resumed = await wakeInboxIfEligible(id, locale, {
+		resumeStopped: ["error", "user_interrupt"],
+	});
+	notifyAgentInboxChanged(id);
+	return c.json({ ok: true, resumed });
+});
+
+narratorRoutes.delete("/:id/inbox/agent-messages/:mid", async (c) => {
+	const id = c.req.param("id");
+	const mid = c.req.param("mid");
+	const { discardPendingAgentMessage, notifyAgentInboxChanged } = await import(
+		"../services/agent-runtime/inbox"
+	);
+	if (!(await discardPendingAgentMessage(id, mid, "Discarded by user")))
+		throw new NotFoundError("Queued agent message", mid);
+	notifyAgentInboxChanged(id);
+	return c.json({ ok: true });
+});
+
 // Reorder queued buffered messages
 narratorRoutes.put("/:id/buffer/reorder", async (c) => {
 	const id = c.req.param("id");
@@ -3493,9 +3506,8 @@ narratorRoutes.get("/:id/pretext-document", async (c) => {
 		columns: { id: true },
 	});
 	if (!narratorMeta) throw new NotFoundError("Narrator", id);
-	// `?protocol=2` asks for envelopes + blocks (§8.1); granted while `narratorBlocks.wsV2`
-	// is on, and the page says so (`protocol: 2`), else it is the v1 page.
-	return c.json(grantsBlockProtocol(c.req.query("protocol")) ? toBlockPage(result) : result);
+	// Envelopes + blocks (§8.1); the page says so (`protocol: 2`).
+	return c.json(toBlockPage(result));
 });
 
 // Resolve a message id to the document coordinate the exact-layout list jumps to.
@@ -3962,26 +3974,10 @@ function requireHistoryOnlyDeletion(historyOnly: boolean): void {
 		);
 }
 
-// Batch-delete multiple content blocks across messages
-narratorRoutes.delete("/:id/messages/batch-blocks", async (c) => {
-	const narratorId = c.req.param("id");
-	const body = await c.req.json();
-	const { batchDeleteBlocksSchema } = await import("../lib/validators");
-	const { blocks, skipRevert } = batchDeleteBlocksSchema.parse(body);
-	requireHistoryOnlyDeletion(skipRevert === true);
-	await prepareHistoryRewrite(narratorId);
-	const result = await narratorService.deleteMessageBlocks(narratorId, blocks, {
-		skipRevert: true,
-		principal: narratorPrincipalOf(c),
-		signal: c.req.raw.signal,
-	});
-	return c.json({ ok: true, ...result });
-});
-
 // === Operations addressed by block id (docs/BLOCK_STORAGE-DESIGN.md §5.5) ===
 // Each target is a whole block: a tool block with every ledger attempt of its call, an
-// input with its attachments, a reasoning run as the ids of all its blocks. The routes
-// above that take message ids and element indexes stay for older clients.
+// input with its attachments, a reasoning run as the ids of all its blocks. They are the
+// only routes that act on part of a message.
 
 // Delete blocks.
 narratorRoutes.delete("/:id/blocks", async (c) => {
@@ -4118,24 +4114,6 @@ narratorRoutes.post("/:id/blocks/:blockId/allow-retry", async (c) => {
 	if (target.kind !== "tool" || !target.wireId)
 		throw new ValidationError("Only a tool block can be re-executed");
 	return allowRetryResponse(c, id, target.wireId);
-});
-
-// Delete a single content block from a message
-narratorRoutes.delete("/:id/messages/:messageId/blocks/:blockIndex", async (c) => {
-	const narratorId = c.req.param("id");
-	const messageId = c.req.param("messageId");
-	const blockIndex = Number.parseInt(c.req.param("blockIndex"), 10);
-	if (Number.isNaN(blockIndex) || blockIndex < 0) {
-		throw new ValidationError("Invalid block index");
-	}
-	requireHistoryOnlyDeletion(c.req.query("skipRevert") === "1");
-	await prepareHistoryRewrite(narratorId);
-	const result = await narratorService.deleteMessageBlock(narratorId, messageId, blockIndex, {
-		skipRevert: true,
-		principal: narratorPrincipalOf(c),
-		signal: c.req.raw.signal,
-	});
-	return c.json({ ok: true, ...result });
 });
 
 // Delete a message and all subsequent messages
@@ -4326,14 +4304,6 @@ narratorRoutes.get("/:id/segment-compact/:messageId", async (c) => {
 	const messageId = c.req.param("messageId");
 	const summary = await narratorService.getSegmentCompactSummary(narratorId, messageId);
 	return c.json({ summary });
-});
-
-// Get messages hidden by a segment compact
-narratorRoutes.get("/:id/segment-compact/:messageId/messages", async (c) => {
-	const narratorId = c.req.param("id");
-	const messageId = c.req.param("messageId");
-	const messages = await narratorService.getSegmentCompactHiddenMessages(narratorId, messageId);
-	return c.json({ messages });
 });
 
 // Delete segment compact (undo)
@@ -5373,7 +5343,8 @@ narratorRoutes.post("/:id/ask-in-passing/start", async (c) => {
 		message: msg,
 	});
 
-	return c.json({ messageId: msgId, message: msg }, 201);
+	// The message in the block protocol, as every other message reaches the client.
+	return c.json({ messageId: msgId, message: toEnvelopes([msg]) }, 201);
 });
 
 // Resolve: fork + send question + update pending message to resolved
@@ -5384,7 +5355,7 @@ narratorRoutes.post("/:id/ask-in-passing", async (c) => {
 	const parsed = askInPassingSchema.safeParse(body);
 	if (!parsed.success) throw new ValidationError(parsed.error.message);
 
-	const { question, pendingMessageId } = parsed.data;
+	const { question, pendingMessageId, quote } = parsed.data;
 
 	// Verify the pending message exists, belongs to this narrator, and is still pending
 	const pendingMsg = fillBody(
@@ -5431,7 +5402,10 @@ narratorRoutes.post("/:id/ask-in-passing", async (c) => {
 	// and left createdBy empty, so the question rendered without its author.
 	const locale = await getUserLanguage(userId);
 	const replyInUserLanguage = await getUserReplyInLanguage(userId);
-	await sendMessage(newNarrator.id, question, [], locale, replyInUserLanguage, null, userId);
+	// A selection-started question carries its excerpt as the composer's quote block,
+	// so the fork sees the context and its bubble renders the quote chip.
+	const sentText = quote ? `${composerQuoteBlock(quote)}${question}` : question;
+	await sendMessage(newNarrator.id, sentText, [], locale, replyInUserLanguage, null, userId);
 
 	// Update the pending message to resolved
 	const resolvedContentJson = [
@@ -5440,6 +5414,8 @@ narratorRoutes.post("/:id/ask-in-passing", async (c) => {
 			status: "resolved",
 			sourceMessageId: sourceMessageId ?? null,
 			question,
+			// Lets the card show what was asked about, not only the question.
+			...(quote ? { quote } : {}),
 			targetNarratorId: newNarrator.id,
 			createdAt: new Date().toISOString(),
 		},
@@ -5469,7 +5445,10 @@ narratorRoutes.post("/:id/ask-in-passing", async (c) => {
 		message: updatedMsg,
 	});
 
-	return c.json({ ...publicNarratorResponse(newNarrator), message: updatedMsg }, 201);
+	return c.json(
+		{ ...publicNarratorResponse(newNarrator), message: toEnvelopes([updatedMsg]) },
+		201,
+	);
 });
 
 // Cancel: delete a pending message
@@ -6082,32 +6061,6 @@ narratorRoutes.get("/:id/file-tree-status", async (c) => {
 });
 
 /**
- * Preview file changes that would be reverted by a rollback-to-block operation.
- *
- * `blockIndex` is optional. Omitting it means "everything after this message",
- * which is the window edit-and-regenerate truncates: it keeps the whole user turn
- * and removes the later ones. That is the same boundary the endpoint already
- * computes for a user message, since `normalizeRollbackBlockIndexForMessage` pins
- * a user message's index to its last block — so the edit dialog can share this
- * preview instead of inventing a block index that only looks meaningful.
- */
-narratorRoutes.get("/:id/rollback-preview", async (c) => {
-	const narratorId = c.req.param("id");
-	const messageId = c.req.query("messageId");
-	const blockIndexStr = c.req.query("blockIndex");
-	if (!messageId) return c.json({ error: "messageId query param is required" }, 400);
-	const requestedBlockIndex =
-		blockIndexStr === undefined ? null : Number.parseInt(blockIndexStr, 10);
-	if (
-		requestedBlockIndex !== null &&
-		(Number.isNaN(requestedBlockIndex) || requestedBlockIndex < 0)
-	) {
-		return c.json({ error: "blockIndex must be a non-negative integer" }, 400);
-	}
-	return rollbackPreviewResponse(c, narratorId, messageId, requestedBlockIndex);
-});
-
-/**
  * What rolling back to `requestedBlockIndex` of a message would delete and restore; a
  * null index keeps the whole message (the edit-and-regenerate preview).
  */
@@ -6203,54 +6156,6 @@ async function rollbackPreviewResponse(
 		deletedMessageCount: preview.historySummary?.deletedMessageCount ?? 0,
 	});
 }
-
-/**
- * Preview the files that deleting a single tool_use block would roll back.
- *
- * A block deletion reverses exactly one recorded call, so its preview
- * has to come from the tool-use scope or it would overstate what is removed.
- *
- * Contents are attached because this response also backs the diff view; without
- * them every file renders as an empty change.
- */
-narratorRoutes.get("/:id/block-delete-preview", async (c) => {
-	const narratorId = c.req.param("id");
-	const messageId = c.req.query("messageId");
-	const blockIndexStr = c.req.query("blockIndex");
-	if (!messageId) return c.json({ error: "messageId query param is required" }, 400);
-	if (!blockIndexStr) return c.json({ error: "blockIndex query param is required" }, 400);
-	const blockIndex = Number.parseInt(blockIndexStr, 10);
-	if (Number.isNaN(blockIndex) || blockIndex < 0) {
-		return c.json({ error: "blockIndex must be a non-negative integer" }, 400);
-	}
-
-	const targetRef = await db.query.narratorMessageRefs.findFirst({
-		where: and(
-			eq(narratorMessageRefs.narratorId, narratorId),
-			eq(narratorMessageRefs.messageId, messageId),
-		),
-		columns: { seq: true },
-	});
-	if (!targetRef) return c.json({ error: "Message not found for this narrator" }, 404);
-
-	const message = fillBody(
-		await db.query.narratorMessages.findFirst({
-			where: eq(narratorMessages.id, messageId),
-			...bodyColumns({ id: true, contentJson: true }),
-		}),
-	);
-	if (!message) return c.json({ error: "Message not found" }, 404);
-
-	const blocks = Array.isArray(message.contentJson)
-		? (message.contentJson as Array<{ type: string; id?: string }>)
-		: [];
-	const block = blocks[blockIndex];
-	if (!block) return c.json({ error: `Block index ${blockIndex} out of range` }, 400);
-
-	// A non-tool block changes no files, so there is nothing to roll back.
-	if (block.type !== "tool_use" || !block.id) return notAToolUse(c);
-	return toolBlockDeletePreviewResponse(c, narratorId, messageId, block.id);
-});
 
 function notAToolUse(c: Context) {
 	return c.json({ available: false, reason: "not_a_tool_use", files: [], conflicts: [] });

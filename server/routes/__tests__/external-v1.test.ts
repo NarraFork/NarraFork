@@ -20,7 +20,6 @@ process.env.NARRAFORK_ALLOW_MULTIPLE = "1";
 
 const [
 	{ Hono },
-	{ sign },
 	drizzle,
 	{ db },
 	schema,
@@ -35,7 +34,6 @@ const [
 	{ integrationAuthorityService },
 ] = await Promise.all([
 	import("hono"),
-	import("hono/jwt"),
 	import("drizzle-orm"),
 	import("../../db"),
 	import("../../db/schema"),
@@ -228,8 +226,8 @@ async function responseCode(response: Response): Promise<string | undefined> {
 }
 
 async function createSessionJwt(userId: string): Promise<string> {
-	const now = Math.floor(Date.now() / 1000);
-	return sign({ sub: userId, role: "user", iat: now, exp: now + 3600 }, settings.auth.jwtSecret);
+	const { createToken } = await import("../../lib/auth");
+	return createToken(userId);
 }
 
 async function createUser(label: string): Promise<string> {
@@ -458,7 +456,7 @@ function expectNoNarratorSecrets(value: unknown): void {
 }
 
 describe("External v1 authentication and scopes", () => {
-	test("rejects session JWTs, grantless bearers, and authority-less grants", async () => {
+	test("rejects session tokens, grantless bearers, and authority-less grants", async () => {
 		const projectId = await createProject("auth-boundary");
 		const client = await createClient("auth-boundary");
 		const userId = await createUser("auth-boundary-session");

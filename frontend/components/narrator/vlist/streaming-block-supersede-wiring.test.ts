@@ -3,53 +3,59 @@
  * surrounding machinery, not just its own decision table.
  *
  * The decision rules are pinned in
- * `frontend/components/narrator/streaming/streaming-block-supersede.test.ts`. What is pinned
- * HERE is what the fix could break elsewhere:
+ * `frontend/components/narrator/streaming/streaming-block-supersede.test.ts`. Here the
+ * live row is published through `projectStreamingMessage`, which leaves out every lane
+ * the document holds at the same id and revision. What is pinned HERE is what the fix
+ * could break elsewhere:
  *
  * 1. Ordinary streaming (no backgrounding) still shows the paragraph exactly once —
  *    the live row must not shrink while the partial row is invisible to clients.
  * 2. The reported bug's timeline ends with ONE copy, and text produced after the
  *    catch-up survives.
- * 3. Dropping display copies never mutates the committed evidence.
+ * 3. Leaving out display copies never mutates the committed evidence or the raw lanes.
  * 4. A mid-turn clear does NOT trigger head trim; an empty row is not turn-end.
  */
 
 import { describe, expect, it } from "bun:test";
-import type { StreamingBlock } from "../message/message-segments";
-import {
-	dropSupersededStreamingBlocks,
-	type SupersedeCandidateMessage,
-} from "../streaming/streaming-block-supersede";
-import type { HandoffMessage } from "./streaming-handoff";
+import type { TreeMessage } from "@frontend/lib/api/types";
+import { messageBody, rowWithElements } from "@shared/narrator-blocks/message-blocks";
+import { buildStreamingMsg, type StreamingBlock } from "../message/message-segments";
+import { type HandoffMessage, projectStreamingMessage } from "./streaming-handoff";
 import { resolveStreamingClearedTrimEdge } from "./vlist-head-trim";
 
 const PARAGRAPH = "确认了根因，这是我的设计错误。";
 
-function persistedRow(blocks: unknown[]): SupersedeCandidateMessage & HandoffMessage {
-	return {
-		id: "m-partial",
-		role: "assistant",
-		parentToolUseId: null,
-		contentJson: blocks,
-	} as SupersedeCandidateMessage & HandoffMessage;
+function persistedRow(blocks: unknown[]): HandoffMessage {
+	return rowWithElements({ id: "m-partial", role: "assistant", parentToolUseId: null }, blocks);
+}
+
+function lane(
+	type: "text" | "reasoning",
+	id: string,
+	revision: number,
+	text: string,
+): StreamingBlock {
+	return { type, id, revision, textOffset: 0, text };
+}
+
+/** The live row as published: the accumulated lanes minus what the document now holds. */
+function published(
+	blocks: StreamingBlock[],
+	committed: readonly HandoffMessage[],
+): TreeMessage | null {
+	return projectStreamingMessage(
+		buildStreamingMsg({ narratorId: "n", streamingBlocks: blocks }) as TreeMessage,
+		committed,
+	);
 }
 
 /** How many times the paragraph is visible across document + live row. */
-function renderedCopies(
-	committed: readonly SupersedeCandidateMessage[],
-	blocks: readonly StreamingBlock[],
-): number {
+function renderedCopies(committed: readonly HandoffMessage[], row: TreeMessage | null): number {
 	let copies = 0;
-	for (const message of committed) {
-		if (!Array.isArray(message.contentJson)) continue;
-		for (const block of message.contentJson) {
+	for (const message of [...committed, ...(row ? [row] : [])]) {
+		for (const block of messageBody(message)) {
 			const text = (block as { text?: unknown }).text;
 			if (typeof text === "string" && text.includes(PARAGRAPH)) copies++;
-		}
-	}
-	for (const block of blocks) {
-		if ((block.type === "text" || block.type === "reasoning") && block.text.includes(PARAGRAPH)) {
-			copies++;
 		}
 	}
 	return copies;
@@ -64,64 +70,49 @@ describe("ordinary streaming — the row does not shrink", () => {
 	 * "writes a paragraph, then the paragraph vanishes".
 	 */
 	it("keeps the paragraph on screen exactly once while the partial row is undelivered", () => {
-		const blocks: StreamingBlock[] = [{ type: "text", text: PARAGRAPH, outputIndex: 0 }];
-		const committed: SupersedeCandidateMessage[] = [];
-
-		expect(dropSupersededStreamingBlocks(blocks, committed, null)).toBe(false);
-		expect(blocks).toHaveLength(1);
-		expect(renderedCopies(committed, blocks)).toBe(1);
-	});
-
-	it("still shows it once after the block settles but before any delivery", () => {
-		// The lane is no longer live (the model moved to a tool call), which is the most
-		// dangerous moment: the guard is off and only "is it in the document" remains.
-		const blocks: StreamingBlock[] = [{ type: "text", text: PARAGRAPH, outputIndex: 0 }];
-		expect(dropSupersededStreamingBlocks(blocks, [], null)).toBe(false);
-		expect(renderedCopies([], blocks)).toBe(1);
+		const blocks = [lane("text", "1:0", 3, PARAGRAPH)];
+		expect(renderedCopies([], published(blocks, []))).toBe(1);
 	});
 });
 
 describe("the reported bug — foreground catch-up delivers the partial row", () => {
 	it("collapses the duplicate to one copy", () => {
-		const blocks: StreamingBlock[] = [
-			{ type: "reasoning", text: "推理内容", id: "rs_1" },
-			{ type: "text", text: PARAGRAPH, outputIndex: 0 },
-		];
-		// Before: the row holds both blocks and the document holds none.
-		expect(renderedCopies([], blocks)).toBe(1);
+		const blocks = [lane("reasoning", "1:0", 2, "推理内容"), lane("text", "1:1", 4, PARAGRAPH)];
+		expect(renderedCopies([], published(blocks, []))).toBe(1);
 
 		// The tab returns to the foreground; catch-up appends the partial row, which
-		// carries the blocks the live row is still holding.
+		// carries the elements the live row is still holding, at the same revisions.
 		const committed = [
 			persistedRow([
-				{ type: "reasoning", text: "推理内容", providerMetadata: { openai: { itemId: "rs_1" } } },
-				{ type: "text", text: PARAGRAPH, outputIndex: 0 },
+				{ type: "reasoning", id: "1:0", revision: 2, text: "推理内容" },
+				{ type: "text", id: "1:1", revision: 4, text: PARAGRAPH },
 			]),
 		];
-		// Both copies are on screen — this is the reported symptom.
-		expect(renderedCopies(committed, blocks)).toBe(2);
-
-		// The model has moved on to a tool call, so no lane is live.
-		expect(dropSupersededStreamingBlocks(blocks, committed, null)).toBe(true);
-		expect(blocks).toHaveLength(0);
-		expect(renderedCopies(committed, blocks)).toBe(1);
+		expect(published(blocks, committed)).toBeNull();
+		expect(renderedCopies(committed, published(blocks, committed))).toBe(1);
+		// The raw accumulator is untouched: a newer revision can still reopen the lane.
+		expect(blocks).toHaveLength(2);
 	});
 
 	it("keeps text produced after the catch-up, which was never persisted", () => {
-		const newOutput: StreamingBlock = { type: "text", text: "接下来我要改的是", outputIndex: 1 };
-		const blocks: StreamingBlock[] = [{ type: "text", text: PARAGRAPH, outputIndex: 0 }, newOutput];
-		const committed = [persistedRow([{ type: "text", text: PARAGRAPH, outputIndex: 0 }])];
+		const blocks = [lane("text", "1:0", 4, PARAGRAPH), lane("text", "1:1", 1, "接下来我要改的是")];
+		const committed = [persistedRow([{ type: "text", id: "1:0", revision: 4, text: PARAGRAPH }])];
 
-		expect(dropSupersededStreamingBlocks(blocks, committed, newOutput)).toBe(true);
-		expect(blocks).toEqual([newOutput]);
-		expect(renderedCopies(committed, blocks)).toBe(1);
+		const row = published(blocks, committed);
+		expect(messageBody(row).map((block) => (block as { id?: unknown }).id)).toEqual(["1:1"]);
+		expect(renderedCopies(committed, row)).toBe(1);
+	});
+
+	it("keeps a lane whose live revision is newer than the persisted one", () => {
+		const blocks = [lane("text", "1:0", 6, `${PARAGRAPH}还在写`)];
+		const committed = [persistedRow([{ type: "text", id: "1:0", revision: 4, text: PARAGRAPH }])];
+		expect(messageBody(published(blocks, committed))).toHaveLength(1);
 	});
 
 	it("does not mutate the persisted messages during display handoff", () => {
-		const committed = [persistedRow([{ type: "text", text: PARAGRAPH, outputIndex: 0 }])];
+		const committed = [persistedRow([{ type: "text", id: "1:0", revision: 4, text: PARAGRAPH }])];
 		const before = structuredClone(committed);
-		const blocks: StreamingBlock[] = [{ type: "text", text: PARAGRAPH, outputIndex: 0 }];
-		expect(dropSupersededStreamingBlocks(blocks, committed, null)).toBe(true);
+		published([lane("text", "1:0", 4, PARAGRAPH)], committed);
 		expect(committed).toEqual(before);
 	});
 });

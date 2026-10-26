@@ -11,7 +11,6 @@ import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { registrationCodes, userPreferences, users } from "../../../server/db/schema";
 import { AppError } from "../../../server/lib/errors";
-import { invalidateUserCache } from "../../../server/middleware/auth";
 import { cleanDb, getTestDb } from "../../setup";
 
 const { db, sqlite } = getTestDb();
@@ -65,14 +64,10 @@ beforeEach(async () => {
 		{ id: ADMIN_ID, username: "root-admin", passwordHash: "x", role: "admin", createdAt: NOW },
 		{ id: NON_ADMIN_ID, username: "plain-user", passwordHash: "x", role: "user", createdAt: NOW },
 	]);
-	invalidateUserCache(ADMIN_ID);
-	invalidateUserCache(NON_ADMIN_ID);
 });
 
 afterEach(() => {
 	cleanDb(sqlite);
-	invalidateUserCache(ADMIN_ID);
-	invalidateUserCache(NON_ADMIN_ID);
 });
 
 afterAll(() => {
@@ -139,10 +134,8 @@ describe("POST /users", () => {
 /**
  * Role changes and the token generation.
  *
- * A session JWT carries its own `role` claim and `assertAdmin` reads that claim, so a
- * demotion that only clears the existence cache leaves the target's already-issued
- * token passing `requireAdmin` until it expires — the version check the cache serves
- * compares `tokenVersion`, not the role.
+ * The role is read live on every request, so a role change takes effect on the next
+ * request by itself and never needs to end the target's sessions.
  */
 describe("PATCH /users/:id role changes", () => {
 	async function seedUser(id: string, role: "admin" | "user") {
@@ -171,14 +164,14 @@ describe("PATCH /users/:id role changes", () => {
 		return row?.tokenVersion ?? -1;
 	}
 
-	test("a demotion revokes the target's existing sessions", async () => {
+	test("a demotion does not revoke sessions", async () => {
 		await seedUser("second-admin", "admin");
 		const before = await tokenVersionOf("second-admin");
 
 		const res = await patch("/users/second-admin", { role: "user" });
 
 		expect(res.status).toBe(200);
-		expect(await tokenVersionOf("second-admin")).toBeGreaterThan(before);
+		expect(await tokenVersionOf("second-admin")).toBe(before);
 	});
 
 	test("a promotion does not revoke sessions", async () => {
@@ -194,8 +187,7 @@ describe("PATCH /users/:id role changes", () => {
 	});
 
 	test("re-applying the same role revokes nothing", async () => {
-		// Not a demotion: there is no stale elevated claim to invalidate, so a no-op
-		// write must not sign the user out.
+		// A no-op write must not sign the user out.
 		await seedUser("plain", "user");
 		const before = await tokenVersionOf("plain");
 

@@ -21,6 +21,7 @@
  */
 
 import { describe, expect, it } from "bun:test";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import {
 	isExternalGeometryChange,
 	isWidthFeedbackCycle,
@@ -661,16 +662,16 @@ describe("scrollbar feedback through the real measure stack", () => {
 	}
 
 	/** A generated-image block whose reserved height grows with the column. */
-	const imageMessage = (id: string, seq: number) => ({
-		id,
-		seq,
-		role: "assistant",
-		contentJson: [
-			{ type: "image_generation", status: "completed", width: 1024, height: 512, result: "x" },
-		],
-		toolCalls: [],
-		children: [],
-	});
+	const imageMessage = (id: string, seq: number) =>
+		rowWithElements(
+			{
+				id,
+				seq,
+				role: "assistant",
+				toolCalls: [],
+			},
+			[{ type: "image_generation", status: "completed", width: 1024, height: 512, result: "x" }],
+		);
 
 	// The counterexample itself, measured through the SAME path the list uses
 	// (segment-adapter classifies image_generation as `media` → registry → measureMedia),
@@ -859,14 +860,17 @@ describe("layout height is monotone in width for TEXT-shaped content", () => {
 		const longWord = `前缀 ${"A".repeat(400)} 后缀`;
 		const bodies = [table, code, prose, math, longWord];
 
-		const messages = Array.from({ length: 15 }, (_, i) => ({
-			id: `m${i}`,
-			seq: i,
-			role: "assistant",
-			contentJson: [{ type: "text", text: bodies[i % bodies.length] }],
-			toolCalls: [],
-			children: [],
-		}));
+		const messages = Array.from({ length: 15 }, (_, i) =>
+			rowWithElements(
+				{
+					id: `m${i}`,
+					seq: i,
+					role: "assistant",
+					toolCalls: [],
+				},
+				[{ type: "text", text: bodies[i % bodies.length] }],
+			),
+		);
 
 		const heightAt = (width: number) =>
 			buildPretextDocumentLayout(messages as never[], {

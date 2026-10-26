@@ -23,6 +23,7 @@
 import { cleanAssistantText } from "@shared/citations";
 import type { FileReference } from "@shared/file-reference";
 import { fileReferenceLabel } from "@shared/file-reference-display";
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import {
 	contextBlockViews,
 	injectionBlockViews,
@@ -35,7 +36,8 @@ import {
 	MAX_COLLECTED_SELECTED_TEXT_CHARS,
 	makeMessageBlockSelectionId,
 } from "../message/MessageSelectionCtx";
-import { filterChildrenByToolUse } from "../message/message-segments";
+import { nestedRowsOfTool } from "../message/message-segments";
+import { isNestedRow, nestedRowsByParent } from "../message/nested-rows";
 import type { ContentBlock, NarratorMsg } from "../narrator-panel-types";
 import { groupReasoningRuns } from "../trace/reasoning-segments";
 
@@ -106,11 +108,10 @@ function getBlockCopyText(block: ContentBlock, assistant = false): string {
 	return stableStringify(block);
 }
 
-function isSubagentTool(msg: NarratorMsg, block: ContentBlock): boolean {
+function isSubagentTool(nestedRows: readonly NarratorMsg[], block: ContentBlock): boolean {
 	if (block.type !== "tool_use" || typeof block.id !== "string") return false;
 	if (block.name === "Agent") return true;
-	const children = filterChildrenByToolUse(msg.children ?? [], block.id);
-	return children.length > 0;
+	return nestedRowsOfTool(nestedRows, block.id).length > 0;
 }
 
 function isSelectableBlock(block: ContentBlock): boolean {
@@ -131,7 +132,7 @@ function getReasoningRunCopyText(blocks: ContentBlock[]): string {
 function getUserMessageCopyText(msg: NarratorMsg): string {
 	if (msg.contentText?.trim()) return msg.contentText;
 	const parts: string[] = [];
-	for (const block of (msg.contentJson ?? []) as ContentBlock[]) {
+	for (const block of messageBody(msg)) {
 		if (block.type === "text" && block.text?.trim()) parts.push(block.text);
 		else if (block.type === "file_reference") parts.push(getBlockCopyText(block));
 	}
@@ -155,10 +156,14 @@ export function buildSelectionIndex(
 	resolveChunkIndex?: (seq: number) => number,
 ): SelectionIndex {
 	const index: SelectionIndex = { entries: [], byBlockId: new Map() };
+	const nestedByParent = nestedRowsByParent(messages);
 	let traversalIndex = 0;
 	for (const msg of messages) {
+		// Nested rows are not shown on their own, so there is nothing of theirs to select.
+		if (isNestedRow(msg)) continue;
 		const seq = getMessageSeq(msg);
-		if (!msg.id || seq == null || !Array.isArray(msg.contentJson)) {
+		const body = messageBody(msg);
+		if (!msg.id || seq == null) {
 			traversalIndex++;
 			continue;
 		}
@@ -167,9 +172,10 @@ export function buildSelectionIndex(
 		// index zero. The paired model text participates in deletion/selection too.
 		const contextViews = Array.from(
 			new Map(
-				[...contextBlockViews(msg.contentJson), ...injectionBlockViews(msg.contentJson)].map(
-					(view) => [view.blockIndex, view],
-				),
+				[...contextBlockViews(body), ...injectionBlockViews(body)].map((view) => [
+					view.blockIndex,
+					view,
+				]),
 			).values(),
 		).sort((a, b) => a.blockIndex - b.blockIndex);
 		const canUseContext =
@@ -203,21 +209,19 @@ export function buildSelectionIndex(
 		}
 		const userCopyText = msg.role === "user" ? getUserMessageCopyText(msg) : "";
 		const reasoningGrouping =
-			msg.role === "user"
-				? { runs: [], skip: new Set<number>() }
-				: groupReasoningRuns(msg.contentJson);
+			msg.role === "user" ? { runs: [], skip: new Set<number>() } : groupReasoningRuns(body);
 		const reasoningRunByStart = new Map(
 			reasoningGrouping.runs.map((run) => [run.startIndex, run] as const),
 		);
-		for (let blockIndex = 0; blockIndex < msg.contentJson.length; blockIndex++) {
+		for (let blockIndex = 0; blockIndex < body.length; blockIndex++) {
 			if (reasoningGrouping.skip.has(blockIndex)) continue;
-			const block = msg.contentJson[blockIndex] as ContentBlock;
+			const block = body[blockIndex];
 			if (!block || typeof block !== "object") continue;
 			if (msg.role === "user" && blockIndex > 0) continue;
 
 			const reasoningRun = reasoningRunByStart.get(blockIndex);
 			const blockIndices = reasoningRun?.indices ?? [blockIndex];
-			const representedBlocks = blockIndices.map((i) => msg.contentJson[i] as ContentBlock);
+			const representedBlocks = blockIndices.map((i) => body[i]);
 			if (
 				msg.role !== "user" &&
 				!(reasoningRun
@@ -228,7 +232,7 @@ export function buildSelectionIndex(
 
 			const isTool = block.type === "tool_use" && typeof block.id === "string";
 			const primaryId = isTool
-				? isSubagentTool(msg, block)
+				? isSubagentTool(nestedByParent.get(msg.id) ?? [], block)
 					? `sa-${block.id}`
 					: `tc-${block.id}`
 				: makeMessageBlockSelectionId(msg.id, blockIndex);

@@ -38,17 +38,19 @@ export function composerOptimizeTarget(editor: InlineComposerEditorHandle | null
 			const replacements: string[] = [];
 			if (plain) replacements.push(result);
 			else {
-				let remainder = result.trim();
+				// Tolerate stray text/fences around the markers and stripped angle brackets,
+				// but still require every marker pair once, in order.
+				const body = result.replace(/^\s*```[^\n]*\n|\n```\s*$/g, "");
+				let cursor = 0;
 				for (let i = 0; i < fragments.length; i++) {
-					const start = marker(i);
-					const end = marker(i, true);
-					if (!remainder.startsWith(start)) return false;
-					const endIndex = remainder.indexOf(end, start.length);
-					if (endIndex < 0) return false;
-					replacements.push(remainder.slice(start.length, endIndex).replace(/^\n|\n$/g, ""));
-					remainder = remainder.slice(endIndex + end.length).trim();
+					const start = new RegExp(`(?:<<<)?NF_${token}_${i}(?:>>>)?`).exec(body.slice(cursor));
+					if (!start) return false;
+					const from = cursor + start.index + start[0].length;
+					const end = new RegExp(`(?:<<<)?NF_${token}_${i}_END(?:>>>)?`).exec(body.slice(from));
+					if (!end) return false;
+					replacements.push(body.slice(from, from + end.index).replace(/^\n|\n$/g, ""));
+					cursor = from + end.index + end[0].length;
 				}
-				if (remainder) return false;
 			}
 			const next: ComposerDocument = {
 				...original,

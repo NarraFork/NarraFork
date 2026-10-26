@@ -6,16 +6,9 @@ import { editorDocumentRegistry } from "./editor-document-registry";
 
 function principalObservation() {
 	try {
-		const token = getToken();
-		if (!token) return null;
-		// Cancellation hint only, never proof of identity or permission.
-		try {
-			return (
-				JSON.parse(atob(token.split(".")[1].replace(/-/g, "+").replace(/_/g, "/"))).sub ?? token
-			);
-		} catch {
-			return token;
-		}
+		// Cancellation hint only, never proof of identity or permission. A session token is
+		// stable for the whole session, so it identifies the session it belongs to.
+		return getToken();
 	} catch {
 		return null;
 	}

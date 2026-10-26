@@ -2,7 +2,7 @@ import { afterAll, afterEach, describe, expect, it, mock } from "bun:test";
 import type { PersistedRecentTab, RecentTabsMutationResult } from "@shared/recent-tabs";
 import { Hono } from "hono";
 import { userPreferences, userRecentTabs, users } from "../../../server/db/schema";
-import type { JwtPayload } from "../../../server/lib/auth";
+import type { SessionPayload } from "../../../server/lib/auth";
 import { updateUserPreferencesSchema } from "../../../server/lib/validators/settings";
 import { cleanDb, getTestDb } from "../../setup";
 
@@ -30,7 +30,7 @@ mock.module("../../../server/websocket/narrator-ws", () => ({
 
 const { userPreferencesRoutes } = await import("../../../server/routes/user-preferences");
 
-const authUser: JwtPayload = {
+const authUser: SessionPayload = {
 	sub: "user-1",
 	role: "user",
 	iat: 1735689600,

@@ -70,7 +70,13 @@ for (const scenario of runtimeContractScenarios) {
 						entered.resolve();
 						return release.promise;
 					},
-					{ type: "stream_text", text: "late text must not be processed" },
+					{
+						type: "stream_text",
+						blockRevision: 1,
+						blockTextOffset: 0,
+						blockId: "text-1",
+						text: "late text must not be processed",
+					},
 					toolResult,
 					{ type: "block_complete", block: { type: "text", text: "partial output" } },
 					{ type: "done" },

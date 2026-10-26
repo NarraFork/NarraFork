@@ -328,6 +328,30 @@
 			"prevId": "3c8f5a32-e1a8-4bc5-99ef-7489da1a1cdc",
 			"version": "7",
 			"snapshotDigest": "2dba7d428fd7926fc02c936fa76436d811253158ef0bb2d6ec82be9ec427526f"
+		},
+		{
+			"idx": 41,
+			"tag": "0041_auth_sessions",
+			"id": "91f6f10c-d8bb-4405-b309-5266d0e4d545",
+			"prevId": "37ee90e1-966f-4646-8711-b18d17576d47",
+			"version": "7",
+			"snapshotDigest": "83f0cabdb8bc32378f567ca096267d392395bc520a222aa130a37f042652e67c"
+		},
+		{
+			"idx": 42,
+			"tag": "0042_block_index_queue",
+			"id": "738f075a-db1e-4d17-ab16-032656d87253",
+			"prevId": "91f6f10c-d8bb-4405-b309-5266d0e4d545",
+			"version": "7",
+			"snapshotDigest": "326fc9d1e9cd8211c5c5de1518452ffc95bcaabedc7eeb78be2b23888d06519a"
+		},
+		{
+			"idx": 43,
+			"tag": "0043_token_accounting_version",
+			"id": "4079ddee-70fe-4250-a6f9-614a7270d6ae",
+			"prevId": "738f075a-db1e-4d17-ab16-032656d87253",
+			"version": "7",
+			"snapshotDigest": "dce20ffffd337aff8dc399f63ae547393c304dee16acac60c01eefed5c0e1004"
 		}
 	]
 }

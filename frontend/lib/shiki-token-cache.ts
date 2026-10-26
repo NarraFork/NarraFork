@@ -29,14 +29,13 @@
  * injection seam `createShikiThemeEnsurer` uses in shiki-loader.ts.
  */
 
-import type { BundledLanguage, ThemedToken } from "shiki";
+import type { BundledLanguage } from "shiki";
+import { getAppBase } from "./base-path";
 import { getCachedShiki, loadShiki } from "./shiki-loader";
+import { createShikiTokenWorkerLoader } from "./shiki-token-worker-client";
+import { normalizeThemedTokens, type ShikiToken } from "./shiki-token-worker-protocol";
 
-/** One Shiki token in DOM form: text plus an optional CSS colour. */
-export interface ShikiToken {
-	content: string;
-	color?: string;
-}
+export { normalizeThemedTokens, type ShikiToken };
 
 /**
  * Resolves tokens for one (code, lang, theme) triple. Returning null means "not
@@ -56,6 +55,12 @@ export interface ShikiTokenCacheLimits {
 	maxBytes?: number;
 	/** Bodies longer than this are never highlighted. */
 	maxCodeChars?: number;
+	/**
+	 * Defers subscriber notification. Highlights land one task at a time; without a
+	 * scheduler every landing re-renders every subscribed painter separately.
+	 * Absent → notify synchronously when tokens land.
+	 */
+	scheduleNotify?: (flush: () => void) => void;
 }
 
 export interface ShikiTokenCache {
@@ -86,22 +91,6 @@ export const MAX_HIGHLIGHT_CODE_CHARS = 20_000;
 const DEFAULT_MAX_ENTRIES = 300;
 const DEFAULT_MAX_BYTES = 4 * 1024 * 1024;
 
-/** Normalize a Shiki theme colour to a CSS string, dropping anything unusable. */
-function normalizeColor(color: string | undefined): string | undefined {
-	if (!color) return undefined;
-	const trimmed = color.trim();
-	return trimmed.length > 0 ? trimmed : undefined;
-}
-
-export function normalizeThemedTokens(lines: ThemedToken[][]): ShikiToken[][] {
-	return lines.map((line) =>
-		line.map((token) => {
-			const color = normalizeColor(token.color);
-			return color === undefined ? { content: token.content } : { content: token.content, color };
-		}),
-	);
-}
-
 /**
  * Rough retained size of one cache entry. Strings count 2 bytes per char plus a
  * flat per-token/per-line object overhead — precise enough to hold a memory
@@ -130,6 +119,21 @@ export function createShikiTokenCache(
 	const listeners = new Set<() => void>();
 	let cacheBytes = 0;
 	let version = 0;
+	let notifyScheduled = false;
+
+	const flush = () => {
+		notifyScheduled = false;
+		for (const listener of listeners) listener();
+	};
+	const announce = () => {
+		if (!limits.scheduleNotify) {
+			flush();
+			return;
+		}
+		if (notifyScheduled) return;
+		notifyScheduled = true;
+		limits.scheduleNotify(flush);
+	};
 
 	const evictOldest = () => {
 		const oldestKey = entries.keys().next().value;
@@ -187,7 +191,7 @@ export function createShikiTokenCache(
 					if (!tokens) return;
 					write(key, tokens);
 					version++;
-					for (const listener of listeners) listener();
+					announce();
 				})
 				.catch(() => {})
 				.finally(() => {
@@ -215,8 +219,8 @@ export function createShikiTokenCache(
 	};
 }
 
-/** The production loader: the shared fine-grained Shiki core. */
-const loadShikiTokens: ShikiTokenLoader = async (code, lang, theme) => {
+/** Main-thread loader: the shared fine-grained Shiki core. Fallback only in a browser. */
+const loadShikiTokensOnMainThread: ShikiTokenLoader = async (code, lang, theme) => {
 	const cachedShiki = getCachedShiki();
 	const shiki = cachedShiki ?? (await loadShiki());
 	if (!shiki || !(lang in shiki.bundledLanguages)) return null;
@@ -224,7 +228,32 @@ const loadShikiTokens: ShikiTokenLoader = async (code, lang, theme) => {
 	return normalizeThemedTokens(result.tokens);
 };
 
-const sharedCache = createShikiTokenCache(loadShikiTokens);
+/**
+ * A Vite build/dev page, not bun test or SSR-shaped tooling: there `Worker` may
+ * exist (Bun has one) but a spawned module Worker would outlive the test process.
+ */
+const canUseTokenWorker =
+	typeof Worker === "function" &&
+	typeof document !== "undefined" &&
+	typeof import.meta.env?.MODE === "string";
+
+/** The production loader: tokenization off the UI thread (see shiki-token-worker-client). */
+const loadShikiTokens: ShikiTokenLoader = canUseTokenWorker
+	? createShikiTokenWorkerLoader({
+			factory: () =>
+				new Worker(new URL("./shiki-token.worker.ts", import.meta.url), { type: "module" }),
+			appBase: () => new URL(getAppBase(), location.href).href,
+			fallback: loadShikiTokensOnMainThread,
+		})
+	: loadShikiTokensOnMainThread;
+
+const sharedCache = createShikiTokenCache(loadShikiTokens, {
+	// One re-render of the subscribed painters per frame, however many highlights landed.
+	scheduleNotify:
+		typeof requestAnimationFrame === "function"
+			? (flush) => requestAnimationFrame(flush)
+			: undefined,
+});
 
 export const getShikiTokens: ShikiTokenCache["get"] = (code, lang, theme, cacheOnly) =>
 	sharedCache.get(code, lang, theme, cacheOnly);

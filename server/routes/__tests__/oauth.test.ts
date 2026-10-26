@@ -2,7 +2,6 @@ import { afterAll, afterEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
 import { eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
-import { sign } from "hono/jwt";
 import { db } from "../../db";
 import {
 	integrationAuthorities,
@@ -23,7 +22,6 @@ import {
 	OAUTH_SUPPORTED_SCOPES,
 } from "../../lib/oauth-provider";
 import { oauthRateLimitTesting } from "../../lib/oauth-rate-limit";
-import { settings } from "../../lib/settings";
 import { requireAuth } from "../../middleware/auth";
 import { integrationAuthorityService } from "../../services/integration-authority-service";
 import { createOAuthGrant } from "../../services/oauth-grant-service";
@@ -92,10 +90,10 @@ function pkceChallenge(verifier: string): string {
 	return base64url(createHash("sha256").update(verifier).digest());
 }
 
-/** Sign a session JWT directly (createToken would pull in passkey/webauthn deps). */
-function createSessionJwt(sub: string): Promise<string> {
-	const now = Math.floor(Date.now() / 1000);
-	return sign({ sub, role: "user", iat: now, exp: now + 3600 }, settings.auth.jwtSecret);
+/** Open a real session for an existing user. */
+async function createSessionJwt(sub: string): Promise<string> {
+	const { createToken } = await import("../../lib/auth");
+	return createToken(sub);
 }
 
 async function ensureUser(): Promise<string> {

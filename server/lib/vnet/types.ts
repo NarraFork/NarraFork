@@ -22,7 +22,7 @@ export interface VNetPeerInfo {
 }
 
 export interface VNetRelayAuth {
-	kind: "jwt" | "relay-token" | "anonymous";
+	kind: "session" | "relay-token" | "anonymous";
 	userId?: string;
 }
 

@@ -9,6 +9,7 @@
  * font shaping, React reconciliation, browser layout or paint.
  */
 import { afterAll, beforeAll, describe, expect, it, spyOn } from "bun:test";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import type { NarratorMsg } from "../narrator-panel-types";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 import type { RenderLod } from "./prepared-block";
@@ -49,28 +50,31 @@ function historyMessages(count: number, fixture: HistoryFixture = "shared"): Nar
 			parentToolUseId: null,
 			contentText: null,
 			createdAt: "2026-01-01T00:00:00.000Z",
-			children: [],
 		};
 		switch (index % 5) {
 			case 0: {
 				const text = marker + "请检查实现并运行相关测试。".repeat(4);
 				text.charCodeAt(0);
-				return {
-					...base,
-					role: "user",
-					contentJson: [{ type: "text", text }],
-					toolCalls: [],
-				};
+				return rowWithElements(
+					{
+						...base,
+						role: "user",
+						toolCalls: [],
+					},
+					[{ type: "text", text }],
+				);
 			}
 			case 1: {
 				const text = `**检查实现**\n\n${marker}${"检查既有数据流和约束。".repeat(20)}\n\n**验证结果**\n\n确认未变化的历史保持稳定。`;
 				text.charCodeAt(0);
-				return {
-					...base,
-					role: "assistant",
-					contentJson: [{ type: "reasoning", text }],
-					toolCalls: [],
-				};
+				return rowWithElements(
+					{
+						...base,
+						role: "assistant",
+						toolCalls: [],
+					},
+					[{ type: "reasoning", text }],
+				);
 			}
 			case 2:
 			case 3: {
@@ -83,31 +87,35 @@ function historyMessages(count: number, fixture: HistoryFixture = "shared"): Nar
 						: { command: `bun test --isolate src/${file}.test.ts` };
 				const content = marker + "已完成的工具输出。".repeat(20);
 				content.charCodeAt(0);
-				return {
-					...base,
-					role: "assistant",
-					contentJson: [{ type: "tool_use", id: toolUseId, name, input }],
-					toolCalls: [
-						{
-							id: `call-${serial}`,
-							toolUseId,
-							toolName: name,
-							status: "success",
-							inputJson: input,
-							outputJson: { content },
-						},
-					],
-				};
+				return rowWithElements(
+					{
+						...base,
+						role: "assistant",
+						toolCalls: [
+							{
+								id: `call-${serial}`,
+								toolUseId,
+								toolName: name,
+								status: "success",
+								inputJson: input,
+								outputJson: { content },
+							},
+						],
+					},
+					[{ type: "tool_use", id: toolUseId, name, input }],
+				);
 			}
 			default: {
 				const text = marker + PROSE;
 				text.charCodeAt(0);
-				return {
-					...base,
-					role: "assistant",
-					contentJson: [{ type: "text", text }],
-					toolCalls: [],
-				};
+				return rowWithElements(
+					{
+						...base,
+						role: "assistant",
+						toolCalls: [],
+					},
+					[{ type: "text", text }],
+				);
 			}
 		}
 	});
@@ -118,18 +126,19 @@ function streamingFrames(historyCount: number): NarratorMsg[] {
 	return Array.from({ length: WARMUP_FRAMES + SAMPLE_FRAMES }, (_, index): NarratorMsg => {
 		const text = TAIL + DELTA.repeat(index + 1);
 		text.charCodeAt(0);
-		return {
-			id: "__streaming__",
-			seq: historyCount + 1,
-			narratorId: "history-bench",
-			parentToolUseId: null,
-			contentText: null,
-			createdAt: "2026-01-01T00:00:00.000Z",
-			role: "assistant",
-			contentJson: [{ type: "reasoning", text }],
-			toolCalls: [],
-			children: [],
-		};
+		return rowWithElements(
+			{
+				id: "__streaming__",
+				seq: historyCount + 1,
+				narratorId: "history-bench",
+				parentToolUseId: null,
+				contentText: null,
+				createdAt: "2026-01-01T00:00:00.000Z",
+				role: "assistant",
+				toolCalls: [],
+			},
+			[{ type: "reasoning", text }],
+		);
 	});
 }
 

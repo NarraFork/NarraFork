@@ -23,6 +23,7 @@
  */
 
 import type { ToolCallRecord } from "@frontend/lib/api";
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import {
 	getPermissionReflectionSuggestion,
 	isReflectionPermissionLike,
@@ -99,7 +100,7 @@ function sourceFromToolCall(tc: ToolCallRecord): VListReflectionSource {
  * reflections at all". A NEWER occurrence of a reused toolUseId that carries no
  * reflection deletes the older entry — the newest occurrence always decides, which
  * is what the chunked newest-first walk resolves to
- * (message-tree-utils.getNewestReflectionToolOccurrenceInTree).
+ * (message-tree-utils.getNewestReflectionToolOccurrence).
  */
 function record(
 	index: Map<string, VListReflectionSource>,
@@ -121,8 +122,7 @@ function collectFromMessage(msg: NarratorMsg, index: Map<string, VListReflection
 	}
 
 	const covered = new Set<string>();
-	const blocks = Array.isArray(msg?.contentJson) ? (msg.contentJson as ContentBlock[]) : [];
-	for (const block of blocks) {
+	for (const block of messageBody(msg)) {
 		if (!block || typeof block !== "object" || block.type !== "tool_use") continue;
 		const toolUseId = nonEmpty(block.id);
 		if (!toolUseId) continue;
@@ -137,11 +137,11 @@ function collectFromMessage(msg: NarratorMsg, index: Map<string, VListReflection
 }
 
 /**
- * Build the `toolUseId → VListReflectionSource` index for a loaded message tree.
+ * Build the `toolUseId → VListReflectionSource` index for the loaded rows.
  *
- * Walk order encodes the chunked precedence (child occurrence beats its parent row,
- * later message beats earlier): each message writes itself first, then recurses into
- * its children, and later writes overwrite earlier ones.
+ * Row order encodes the chunked precedence (a nested occurrence beats its parent row,
+ * later message beats earlier): a row's nested rows follow it, and later writes
+ * overwrite earlier ones.
  *
  * NOTE: duplicate occurrences of one provider toolUseId collapse into a single entry,
  * because a vlist row resolves to a `tool-<toolUseId>` key (the `#dupN` suffix is
@@ -152,14 +152,7 @@ export function buildReflectionSourceIndex(
 ): Map<string, VListReflectionSource> {
 	const index = new Map<string, VListReflectionSource>();
 	if (!Array.isArray(messages)) return index;
-	const walk = (list: readonly NarratorMsg[]): void => {
-		for (const msg of list) {
-			if (!msg) continue;
-			collectFromMessage(msg, index);
-			if (Array.isArray(msg.children) && msg.children.length > 0) walk(msg.children);
-		}
-	};
-	walk(messages);
+	for (const msg of messages) if (msg) collectFromMessage(msg, index);
 	return index;
 }
 

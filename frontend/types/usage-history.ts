@@ -37,7 +37,14 @@ export interface UsageHistoryRecord extends ReferenceCostSummary {
 	recordingRequestId?: string | null;
 }
 
-export interface UsageHistoryStats extends ReferenceCostSummary {
+interface CacheHitRateStats {
+	/** Only requests with cachedInputTokens > 0 participate; ratio is 0–1 or null. */
+	cacheHitRate: number | null;
+	cacheHitRateReadTokens: number;
+	cacheHitRateInputTokens: number;
+}
+
+export interface UsageHistoryStats extends ReferenceCostSummary, CacheHitRateStats {
 	totalRequests: number;
 	totalInputTokens: number;
 	totalOutputTokens: number;
@@ -54,7 +61,7 @@ export interface UsageHistoryStats extends ReferenceCostSummary {
 
 export type UsageHistoryGranularity = "hour" | "day" | "month";
 
-export interface UsageHistoryTimeSeriesPoint extends ReferenceCostSummary {
+export interface UsageHistoryTimeSeriesPoint extends ReferenceCostSummary, CacheHitRateStats {
 	timestamp: string;
 	requestCount: number;
 	totalInputTokens: number;
@@ -195,11 +202,14 @@ export type UsageBreakdownMetric =
 	| "cost"
 	| "inputTokens"
 	| "outputTokens"
+	| "cachedInputTokens"
+	| "cacheCreationTokens"
+	| "cacheHitRate"
 	| "reasoningTokens";
 
 export interface UsageBreakdownEntry {
 	label: string;
-	value: number;
+	value: number | null;
 	percentage: number;
 	count: number;
 }
@@ -208,7 +218,7 @@ export interface UsageBreakdownResponse {
 	dimension: UsageBreakdownDimension;
 	metric: UsageBreakdownMetric;
 	entries: UsageBreakdownEntry[];
-	total: number;
+	total: number | null;
 }
 
 export interface UsageStackedTimeSeriesResponse {
@@ -218,7 +228,7 @@ export interface UsageStackedTimeSeriesResponse {
 	series: Array<{
 		label: string;
 		color: string;
-		data: Array<{ timestamp: string; value: number }>;
+		data: Array<{ timestamp: string; value: number | null }>;
 	}>;
 	timestamps: string[];
 	truncated: boolean;

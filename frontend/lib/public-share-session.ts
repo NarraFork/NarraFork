@@ -57,7 +57,7 @@ export class PublicShareSession {
 		this.active = false;
 		this.generation++;
 		this.abort.abort();
-		// Hand the manager's credential back to the session JWT mode (inert on the
+		// Hand the manager's credential back to the session token mode (inert on the
 		// public page, but the next mount must never inherit this share).
 		setNarratorWSShareAuth(null);
 		this.state = emptyState();

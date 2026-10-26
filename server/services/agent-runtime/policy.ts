@@ -25,7 +25,6 @@ export interface RuntimePolicy {
 	readonly capabilities: {
 		readonly spawnAgent: boolean;
 		readonly awaitAgent: boolean;
-		readonly sendAwait: boolean;
 		readonly askUserQuestion: "sync-or-async" | "disabled";
 		/** Waiting on an existing own question does not grant permission to create one. */
 		readonly awaitOwnQuestion: boolean;
@@ -67,7 +66,6 @@ const SEARCH_TOOLS = Object.freeze([
 const DELEGATED_DENY: NonNullable<RuntimePolicyTrait["deny"]> = [
 	"spawnAgent",
 	"awaitAgent",
-	"sendAwait",
 	"askUserQuestion",
 	"planApproval",
 	"stopHooks",
@@ -195,7 +193,6 @@ export function resolveRuntimePolicy(declarations: readonly RuntimePolicyTrait[]
 		capabilities: Object.freeze({
 			spawnAgent: allowed("spawnAgent"),
 			awaitAgent: allowed("awaitAgent"),
-			sendAwait: allowed("sendAwait"),
 			askUserQuestion: allowed("askUserQuestion") ? "sync-or-async" : "disabled",
 			awaitOwnQuestion: true,
 			planApproval: allowed("planApproval"),
@@ -260,12 +257,6 @@ export function runtimeAwaitTargets(policy: RuntimePolicy): RuntimeAwaitTarget[]
 /** Interaction instructions are a projection of the same finite capability policy. */
 export function runtimeInteractionHint(policy: RuntimePolicy, locale: string): string {
 	const lines: string[] = [];
-	if (!policy.capabilities.sendAwait)
-		lines.push(
-			locale === "zh-CN"
-				? "Send 只能异步发送，不得设置 await=true。"
-				: "Send must be asynchronous; do not set await=true.",
-		);
 	if (!policy.capabilities.awaitAgent)
 		lines.push(
 			locale === "zh-CN"

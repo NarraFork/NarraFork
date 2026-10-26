@@ -1,6 +1,6 @@
+import { useSharedComputedColorScheme } from "@frontend/hooks/useSharedComputedColorScheme";
 import { useShikiTokens } from "@frontend/hooks/useShikiTokens";
 import type { ShikiToken } from "@frontend/lib/shiki-token-cache";
-import { useComputedColorScheme } from "@mantine/core";
 import {
 	buildDiffHighlightPlan,
 	type DiffDocument,
@@ -294,7 +294,7 @@ export const DiffContent = memo(function DiffContent({
 		setContentSize,
 	} = viewport;
 	const { t } = useTranslation("narrator");
-	const dark = useComputedColorScheme("dark") !== "light";
+	const dark = useSharedComputedColorScheme("dark") !== "light";
 	const colors = useMemo(() => palette(dark), [dark]);
 	const typographyRevision = useSyncExternalStore(
 		onTypographyChange,

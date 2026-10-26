@@ -1,7 +1,6 @@
 import { afterAll, afterEach, describe, expect, it, mock } from "bun:test";
 import { Hono } from "hono";
 import { narrators } from "../../../server/db/schema";
-import { invalidateUserCache } from "../../../server/middleware/auth";
 import type { AuthSessionStore } from "../../../server/services/auth/session-store";
 import { authMfaStore, authSessionStore, setAuthStores } from "../../../server/services/auth/store";
 import { cleanDb, getTestDb } from "../../setup";
@@ -63,7 +62,6 @@ afterEach(() => cleanDb(sqlite));
 
 afterAll(() => {
 	setAuthStores(undefined);
-	invalidateUserCache(authUser.sub);
 	for (const [specifier, factory] of Object.entries(realAdminModules)) {
 		mock.module(specifier, factory);
 	}

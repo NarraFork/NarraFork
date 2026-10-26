@@ -1,6 +1,5 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { Hono } from "hono";
-import { invalidateUserCache } from "../../middleware/auth";
 import type { AuthSessionStore } from "../../services/auth/session-store";
 import { authMfaStore, authSessionStore, setAuthStores } from "../../services/auth/store";
 import * as outbound from "../net/outbound-fetch";
@@ -77,8 +76,6 @@ beforeEach(() => {
 afterEach(() => mock.restore());
 afterAll(() => {
 	setAuthStores(undefined);
-	invalidateUserCache(OPENCODE_ADMIN_ID);
-	invalidateUserCache(OPENCODE_USER_ID);
 	settings.customApiProviders = originalProviders;
 	settings.proxy = originalProxy;
 	syncOpencodeUsageCache();

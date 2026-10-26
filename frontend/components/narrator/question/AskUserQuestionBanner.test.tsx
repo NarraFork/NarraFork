@@ -40,6 +40,7 @@ const { buildAsyncQuestionNode, usePermissionSlots } = await import(
 );
 const { buildToolMetaIndex } = await import("../vlist/vlist-tool-meta");
 
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import type { AsyncQuestionSlot, NarratorMsg } from "../narrator-panel-types";
 import type { VListItem } from "../vlist/vlist-pipeline";
 
@@ -204,18 +205,20 @@ test("live Await question hosts one directly submittable menu using tool-call in
 	});
 	writeSession("ask-draft", deferredQuestion.toolCallId, draft);
 	const tools = buildToolMetaIndex([
-		{
-			seq: 9,
-			contentJson: [{ type: "tool_use", id: "wait", name: "Await", input: {} }],
-			toolCalls: [
-				{
-					toolUseId: "wait",
-					toolName: "Await",
-					status: "running",
-					inputJson: { type: "question", id: deferredQuestion.id },
-				},
-			],
-		} as unknown as NarratorMsg,
+		rowWithElements(
+			{
+				seq: 9,
+				toolCalls: [
+					{
+						toolUseId: "wait",
+						toolName: "Await",
+						status: "running",
+						inputJson: { type: "question", id: deferredQuestion.id },
+					},
+				],
+			},
+			[{ type: "tool_use", id: "wait", name: "Await", input: {} }],
+		) as unknown as NarratorMsg,
 	]);
 	const asyncQuestions = new Map([
 		[
@@ -447,15 +450,15 @@ test("fork answer event stays frozen after original actor supplements, even when
 		const spec = adaptSegment(
 			{
 				kind: "message",
-				msg: {
-					id: "inherited-answer",
-					role: "user",
-					origin: "user",
-					narratorId: "original",
-					contentJson: [
-						{ type: "system_injection", source: "async_question_answer", body: snapshot },
-					],
-				},
+				msg: rowWithElements(
+					{
+						id: "inherited-answer",
+						role: "user",
+						origin: "user",
+						narratorId: "original",
+					},
+					[{ type: "system_injection", source: "async_question_answer", body: snapshot }],
+				),
 			},
 			{ lod: 5 },
 		)[0];
@@ -559,15 +562,15 @@ test("the original actor's answer event still opens live details and can submit 
 		const spec = adaptSegment(
 			{
 				kind: "message",
-				msg: {
-					id: "own-answer",
-					role: "user",
-					origin: "user",
-					narratorId: "n1",
-					contentJson: [
-						{ type: "system_injection", source: "async_question_answer", body: snapshot },
-					],
-				},
+				msg: rowWithElements(
+					{
+						id: "own-answer",
+						role: "user",
+						origin: "user",
+						narratorId: "n1",
+					},
+					[{ type: "system_injection", source: "async_question_answer", body: snapshot }],
+				),
 			},
 			{ lod: 5 },
 		)[0];

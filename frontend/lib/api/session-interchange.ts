@@ -7,7 +7,6 @@
 
 import {
 	ApiError,
-	absorbRenewedToken,
 	apiBase,
 	authorizedFetch,
 	getToken,
@@ -170,7 +169,6 @@ export const sessionInterchangeApi = {
 				signal: opts.signal,
 			},
 		);
-		absorbRenewedToken(res, token);
 		if (!res.ok) {
 			const error = await readFetchError(res, "Import failed");
 			throw new ApiError(error.message, res.status, error.data);

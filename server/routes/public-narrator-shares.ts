@@ -10,7 +10,7 @@ import {
 	publicSharePageSchema,
 } from "../lib/validators/public-narrator-shares";
 import { listPublicDiscussion, postPublicDiscussion } from "../services/chat-service";
-import { grantsBlockProtocol, toBlockPage } from "../services/narrator-block-page";
+import { toBlockPage } from "../services/narrator-block-page";
 import { narratorService } from "../services/narrator-service";
 import {
 	isPublicToolSourceAllowed,
@@ -208,7 +208,7 @@ publicNarratorShareRoutes.get("/:shareId/pretext-document", async (c) => {
 	if (!narratorMeta) throw unavailablePublicShare();
 	revalidatePublicShare(auth);
 	const projected = projectPublicNarratorPayload(auth.narratorId, result);
-	return c.json(grantsBlockProtocol(c.req.query("protocol")) ? toBlockPage(projected) : projected);
+	return c.json(toBlockPage(projected));
 });
 publicNarratorShareRoutes.get("/:shareId/tool-calls/:toolUseId/input-document", async (c) => {
 	const auth = c.get("publicShare");

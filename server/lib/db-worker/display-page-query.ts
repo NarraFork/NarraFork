@@ -49,7 +49,7 @@ export const DISPLAY_MESSAGE_COLUMNS = [
 	cacheCreation1hTokens reasoningTokens ttftMs durationMs contextPercent meterUsage meterUnit
 	commitSha treeHashAfter snapshotCommitSha commandText createdBy origin originLabel editedAt
 	editedBy originalContentJson compactPending bodyFormat turnId authorNarratorId causeBlockId
-	providerResponseId bodyBytes stateRevision bodyRowsOnly createdAt`,
+	providerResponseId bodyBytes stateRevision bodyRowsOnly blocksContentHash createdAt`,
 		"contentJson contextCharsJson costMissingFields turnUsageJson originalContentJson",
 	),
 	{ column: "composer_document", field: "hasComposerDocument", json: false, boolean: true },

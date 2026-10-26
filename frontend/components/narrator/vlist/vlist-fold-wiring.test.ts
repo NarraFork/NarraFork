@@ -19,6 +19,7 @@
 import { beforeAll, describe, expect, it } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import type { NarratorMsg } from "../narrator-panel-types";
 import { shellModule } from "./guard-source";
 import { installCanvasStub } from "./measure/test-canvas-stub";
@@ -725,12 +726,25 @@ describe("fold transition: stays out of the height model", () => {
  */
 describe("fold vs LOD morph: the toggle path cannot move the effective LOD", () => {
 	function toolMessage(id: string, seq: number): NarratorMsg {
-		return {
-			id,
-			narratorId: "n1",
-			seq,
-			role: "assistant",
-			contentJson: [
+		return rowWithElements(
+			{
+				id,
+				narratorId: "n1",
+				seq,
+				role: "assistant",
+				contentText: null,
+				toolCalls: [
+					{
+						toolUseId: `tu-${id}`,
+						toolName: "Read",
+						inputJson: { file_path: `/workspace/${id}.ts` },
+						status: "completed",
+					},
+				],
+				parentToolUseId: null,
+				createdAt: "2026-07-23T00:00:00.000Z",
+			},
+			[
 				{
 					type: "tool_use",
 					id: `tu-${id}`,
@@ -740,19 +754,7 @@ describe("fold vs LOD morph: the toggle path cannot move the effective LOD", () 
 					status: "completed",
 				},
 			],
-			contentText: null,
-			toolCalls: [
-				{
-					toolUseId: `tu-${id}`,
-					toolName: "Read",
-					inputJson: { file_path: `/workspace/${id}.ts` },
-					status: "completed",
-				},
-			],
-			children: [],
-			parentToolUseId: null,
-			createdAt: "2026-07-23T00:00:00.000Z",
-		} as unknown as NarratorMsg;
+		) as unknown as NarratorMsg;
 	}
 
 	const MESSAGES = [toolMessage("m0", 0), toolMessage("m1", 1)];

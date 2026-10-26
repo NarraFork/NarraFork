@@ -34,7 +34,6 @@ import { logger } from "../lib/logger";
 import { parseSubstatus } from "../lib/narrator-utils";
 import { nugAvailabilityPoller } from "../lib/nug-availability-poller";
 import { getUserLanguage } from "../lib/prompt-i18n";
-import { settings } from "../lib/settings";
 import { narratorWsMessageSchema } from "../lib/validators";
 import type {
 	BlockAllSkillsResult,
@@ -122,13 +121,6 @@ export interface NarratorWSData {
 	 * sets it, any other kind clears it.
 	 */
 	activityOnlyNarrators?: Set<string>;
-	/**
-	 * Subset of `subscribedNarrators` whose message stream uses the block-keyed protocol
-	 * v2 (docs/BLOCK_STORAGE-DESIGN.md §8.2): message-shaped events reach them as
-	 * envelopes + blocks. A `messages` subscribe sets the protocol it asks for; v2 is
-	 * granted only while `narratorBlocks.wsV2` is on.
-	 */
-	blockProtocolNarrators?: Set<string>;
 	subscribedStats?: boolean;
 	/** narratorId → number of in-flight catch-up queries buffering realtime frames. */
 	catchingUpNarrators: Map<string, number>;
@@ -142,15 +134,16 @@ export interface NarratorWSData {
 	 */
 	subscribedChatRooms: Set<string>;
 	userId?: string;
+	sessionId?: string;
 	sessionExp?: number;
-	sessionTokenVersion?: number;
 	username?: string;
 	avatarColor?: string | null;
 	avatarImageId?: string | null;
 	/**
-	 * Live role captured at upgrade time, for the admin short-circuit in narrator
-	 * authorization. Absent on connections whose user row could not be resolved,
-	 * which are treated as non-admin.
+	 * Live role, for the admin short-circuit in narrator authorization. Captured at
+	 * upgrade and refreshed whenever the user's authorization changes (see
+	 * `revalidateSessionSockets`). Absent on connections whose user row could not be
+	 * resolved, which are treated as non-admin.
 	 */
 	userRole?: string;
 	/**
@@ -718,23 +711,17 @@ export function broadcastToNarrator(narratorId: string, message: NarratorServerM
 			if (!ws.data.subscribedNarrators.has(narratorId)) continue;
 			if (ws.data.activityOnlyNarrators?.has(narratorId)) continue;
 			if (ws.data.publicShare && !projectPublicNarratorEvent(narratorId, message)) continue;
-			if (ws.data.blockProtocolNarrators?.has(narratorId)) {
-				if (opened === undefined) {
-					const frame = toolOpened(
-						message as unknown as Record<string, unknown> & { type: string },
-					);
-					opened = frame ? JSON.stringify(frame) : null;
-				}
-				if (opened && !sendPayload(ws, opened)) continue;
+			if (opened === undefined) {
+				const frame = toolOpened(message as unknown as Record<string, unknown> & { type: string });
+				opened = frame ? JSON.stringify(frame) : null;
 			}
+			if (opened && !sendPayload(ws, opened)) continue;
 			if (!sendToolInputLane(ws, message)) removeConnection(ws);
 		}
 		eventBus.emit({ type: "narrator:message_broadcast", narratorId, message });
 		return;
 	}
-	const payload = JSON.stringify(message);
 	let publicMessage: NarratorServerMessage | null | undefined;
-	let publicPayload: string | undefined;
 	let activityMessage: NarratorServerMessage | null | undefined;
 	let activityPayload: string | undefined;
 	// Protocol v2 frames (§8.2), built once per broadcast for each audience that needs them.
@@ -759,8 +746,6 @@ export function broadcastToNarrator(narratorId: string, message: NarratorServerM
 	for (const ws of connections) {
 		if (ws.data.publicShare && ws.data.publicShare.narratorId !== narratorId) continue;
 		if (!ws.data.subscribedNarrators.has(narratorId)) continue;
-		let outgoing = message;
-		let outgoingPayload = payload;
 		if (ws.data.activityOnlyNarrators?.has(narratorId)) {
 			if (activityMessage === undefined) activityMessage = projectNarratorActivityEvent(message);
 			if (!activityMessage) continue;
@@ -772,18 +757,16 @@ export function broadcastToNarrator(narratorId: string, message: NarratorServerM
 			}
 			continue;
 		}
+		let frames: Array<[NarratorServerMessage, string]>;
 		if (ws.data.publicShare) {
 			if (publicMessage === undefined)
 				publicMessage = projectPublicNarratorEvent(narratorId, message);
 			if (!publicMessage) continue;
-			publicPayload ??= JSON.stringify(publicMessage);
-			outgoing = publicMessage;
-			outgoingPayload = publicPayload;
-		}
-		let frames: Array<[NarratorServerMessage, string]> = [[outgoing, outgoingPayload]];
-		if (ws.data.blockProtocolNarrators?.has(narratorId)) {
-			if (ws.data.publicShare) frames = publicBlockFrames ??= inBlockProtocol(outgoing);
-			else frames = blockFrames ??= inBlockProtocol(outgoing);
+			publicBlockFrames ??= inBlockProtocol(publicMessage);
+			frames = publicBlockFrames;
+		} else {
+			blockFrames ??= inBlockProtocol(message);
+			frames = blockFrames;
 		}
 		if (ws.data.catchingUpNarrators.has(narratorId)) {
 			const buffer = ws.data.catchUpBuffers.get(narratorId);
@@ -1319,7 +1302,7 @@ function sendStreamingSnapshot(ws: NarratorWS, narratorIds: string[], requestId?
 					},
 					requestId,
 				),
-				ws.data.blockProtocolNarrators?.has(id) ? toBlockSnapshot : undefined,
+				toBlockSnapshot,
 			)
 		) {
 			return;
@@ -1382,11 +1365,6 @@ function markCatchUpOverflow(ws: NarratorWS, narratorId: string): void {
 	if (buffer) buffer.overflowed = true;
 }
 
-/** How a catch-up reaches this connection: as is, or in message protocol v2. */
-function catchUpProtocol(ws: NarratorWS, narratorId: string) {
-	return ws.data.blockProtocolNarrators?.has(narratorId) ? toBlockCatchUp : undefined;
-}
-
 async function sendCatchUpForAnchor(
 	ws: NarratorWS,
 	narratorId: string,
@@ -1446,7 +1424,7 @@ async function sendCatchUpForAnchor(
 					},
 					requestId,
 				),
-				catchUpProtocol(ws, narratorId),
+				toBlockCatchUp,
 			);
 		}
 
@@ -1480,7 +1458,7 @@ async function sendCatchUpForAnchor(
 								},
 								requestId,
 							),
-							catchUpProtocol(ws, narratorId),
+							toBlockCatchUp,
 						);
 					}
 				}
@@ -1971,24 +1949,7 @@ export const handleNarratorWS = {
 					await sendStatusSnapshot(ws, allowedIds);
 					sendRuntimeSnapshot(ws, allowedIds, requestId);
 				}
-				if (kind === "messages") {
-					const protocol = msg.protocol === 2 && settings.narratorBlocks.wsV2 ? 2 : 1;
-					if (protocol === 2) ws.data.blockProtocolNarrators ??= new Set();
-					for (const id of allowedIds) {
-						if (protocol === 2) ws.data.blockProtocolNarrators?.add(id);
-						else ws.data.blockProtocolNarrators?.delete(id);
-					}
-					// Only a client that asked learns what it got; v1 clients see no new frame.
-					if (msg.protocol !== undefined)
-						safeSend(
-							ws,
-							withSubscriptionRequestId(
-								{ type: "message_protocol", narratorIds: allowedIds, protocol },
-								requestId,
-							),
-						);
-					sendStreamingSnapshot(ws, allowedIds, requestId);
-				}
+				if (kind === "messages") sendStreamingSnapshot(ws, allowedIds, requestId);
 
 				if (messageNarratorId && msg.version != null) {
 					// The version belongs to the REST snapshot used by THIS subscription,
@@ -2032,7 +1993,6 @@ export const handleNarratorWS = {
 				for (const id of msg.narratorIds) {
 					ws.data.subscribedNarrators.delete(id);
 					ws.data.activityOnlyNarrators?.delete(id);
-					ws.data.blockProtocolNarrators?.delete(id);
 					toolInputLaneSender.clearNarrator(ws, id);
 				}
 				break;

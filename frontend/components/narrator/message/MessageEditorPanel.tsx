@@ -2,10 +2,18 @@
  * assistant messages deliberately remain a plain-text edit. */
 import { useRevertActionPreview } from "@frontend/hooks/useNarrator";
 import { usePromptOptimize } from "@frontend/hooks/usePromptOptimize";
-import { Button, Group, Paper, Stack, Text, Textarea } from "@mantine/core";
+import { Box, Button, Group, Paper, Stack, Text, Textarea } from "@mantine/core";
 import { useDisclosure } from "@mantine/hooks";
 import type { ComposerDocument } from "@shared/composer-document";
-import { useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
+import {
+	type DragEvent,
+	useCallback,
+	useContext,
+	useEffect,
+	useMemo,
+	useRef,
+	useState,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../../lib/api";
 import { type RevertActionConfirmOptions, shouldClearEditDraft } from "../../../lib/api/narrators";
@@ -31,13 +39,19 @@ export {
 	resolveEditorInitialText,
 } from "./message-edit-text";
 
+/** Files dropped anywhere in the edit UI (portals included) belong to this message, never to
+ * the outer composer's pending attachments; unhandled ones are dropped on the floor. */
+function claimFileDrop(event: DragEvent<HTMLDivElement>) {
+	if (event.dataTransfer.types.includes("Files")) event.preventDefault();
+}
+
 export interface MessageEditorPanelProps {
 	messageRole: "user" | "assistant";
 	narratorId?: string;
 	messageId: string;
 	imageNarratorId?: string;
 	// biome-ignore lint/suspicious/noExplicitAny: persisted SDK blocks
-	blocks: any[];
+	blocks: readonly any[];
 	creator?: {
 		id: string;
 		username: string;
@@ -204,7 +218,7 @@ export function MessageEditorPanel({
 
 	if (!isUser)
 		return (
-			<>
+			<Box display="contents" onDrop={claimFileDrop}>
 				<Paper p="sm" radius="md" withBorder>
 					<Stack gap="xs">
 						<Text size="xs" fw={600} c="dimmed">
@@ -298,7 +312,7 @@ export function MessageEditorPanel({
 					narratorId={narratorId}
 					messageId={messageId}
 				/>
-			</>
+			</Box>
 		);
 
 	const attachments: ExistingComposerAttachment[] = [
@@ -329,7 +343,7 @@ export function MessageEditorPanel({
 			})),
 	];
 	return (
-		<>
+		<Box display="contents" onDrop={claimFileDrop}>
 			<Paper p="sm" radius="md" style={{ backgroundColor: "var(--mantine-color-indigo-light)" }}>
 				<Stack gap="xs">
 					<Group gap={6}>
@@ -413,6 +427,6 @@ export function MessageEditorPanel({
 					if (!isSubmittingEdit) setShowConfirmModal(false);
 				}}
 			/>
-		</>
+		</Box>
 	);
 }

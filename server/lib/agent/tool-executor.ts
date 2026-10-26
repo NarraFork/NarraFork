@@ -394,8 +394,7 @@ export function classifyToolUpdateExecution(tu: AgentToolUse): UpdateExecutionKi
 	}
 	if (
 		(tu.name === "Agent" && typeof tu.input.stop !== "string") ||
-		(tu.name === "Await" && tu.input.type === "agent") ||
-		(tu.name === "Send" && tu.input.await === true)
+		(tu.name === "Await" && tu.input.type === "agent")
 	) {
 		return "resumable";
 	}
@@ -1269,6 +1268,7 @@ export async function executeTool(
 			narratorId: config.narratorId,
 			cwd: config.cwd,
 			signal: config.signal,
+			guidanceSignal: config.guidanceSignal,
 			provider: config.provider,
 			model: config.model,
 			pipelineUnusedToolCallThreshold: config.pipelineUnusedToolCallThreshold,
@@ -1281,6 +1281,7 @@ export async function executeTool(
 			blockedSkills: config.blockedSkills,
 			parentNarratorId: config.parentNarratorId,
 			runtimePolicy: config.runtimePolicy,
+			bot: config.bot,
 			userId: config.userId,
 			projectId: config.projectId,
 			requestPermission: (toolName, input, toolUseId) =>

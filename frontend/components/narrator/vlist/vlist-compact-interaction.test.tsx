@@ -22,6 +22,7 @@
 
 import { beforeAll, describe, expect, it } from "bun:test";
 import { MantineProvider } from "@mantine/core";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { type AdapterSegment, adaptSegment } from "@shared/pretext-layout/segment-adapter";
 import { parseHTML } from "linkedom";
 import { act } from "react";
@@ -106,7 +107,7 @@ beforeAll(() => {
 function adaptCompactBlock(block: Record<string, unknown>) {
 	const seg: AdapterSegment = {
 		kind: "message",
-		msg: { id: "compact-msg", role: "system", contentJson: [block as never] },
+		msg: rowWithElements({ id: "compact-msg", role: "system" }, [block as never]),
 	};
 	const spec = adaptSegment(seg, { lod: 5, labels: LABELS })[0];
 	if (!spec) throw new Error("no spec produced");

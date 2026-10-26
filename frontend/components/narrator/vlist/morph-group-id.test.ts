@@ -23,6 +23,7 @@
  */
 
 import { beforeAll, describe, expect, it } from "bun:test";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import type { RenderLod } from "../lod/RenderLodCtx";
 import type { NarratorMsg } from "../narrator-panel-types";
 import { installCanvasStub } from "./measure/test-canvas-stub";
@@ -36,63 +37,64 @@ let seq = 0;
 
 function toolMessage(id: string, toolUseId: string): NarratorMsg {
 	seq += 1;
-	return {
-		id,
-		narratorId: "n1",
-		seq,
-		role: "assistant",
-		contentJson: [
-			{ type: "tool_use", id: toolUseId, name: "Read", input: { file_path: `/${toolUseId}.ts` } },
-		],
-		toolCalls: [
-			{
-				toolUseId,
-				toolName: "Read",
-				status: "success",
-				inputJson: { file_path: `/${toolUseId}.ts` },
-				outputJson: { _text: "line1\nline2\n" },
-			},
-		],
-		children: [],
-		parentToolUseId: null,
-		createdAt: "2026-07-23T00:00:00.000Z",
-	} as unknown as NarratorMsg;
+	return rowWithElements(
+		{
+			id,
+			narratorId: "n1",
+			seq,
+			role: "assistant",
+			toolCalls: [
+				{
+					toolUseId,
+					toolName: "Read",
+					status: "success",
+					inputJson: { file_path: `/${toolUseId}.ts` },
+					outputJson: { _text: "line1\nline2\n" },
+				},
+			],
+			parentToolUseId: null,
+			createdAt: "2026-07-23T00:00:00.000Z",
+		},
+		[{ type: "tool_use", id: toolUseId, name: "Read", input: { file_path: `/${toolUseId}.ts` } }],
+	) as unknown as NarratorMsg;
 }
 
 /** An assistant message holding one reasoning run of `blockCount` blocks. */
 function reasoningMessage(id: string, blockCount: number): NarratorMsg {
 	seq += 1;
-	return {
-		id,
-		model: "gpt-5.6",
-		narratorId: "n1",
-		seq,
-		role: "assistant",
-		contentJson: Array.from({ length: blockCount }, (_v, i) => ({
+	return rowWithElements(
+		{
+			id,
+			model: "gpt-5.6",
+			narratorId: "n1",
+			seq,
+			role: "assistant",
+			toolCalls: [],
+			parentToolUseId: null,
+			createdAt: "2026-07-23T00:00:00.000Z",
+		},
+		Array.from({ length: blockCount }, (_v, i) => ({
 			type: "thinking",
 			thinking: `**步骤 ${i + 1}**\n\n第 ${i + 1} 段推理正文，长到足以产生一个 step。`,
 		})),
-		toolCalls: [],
-		children: [],
-		parentToolUseId: null,
-		createdAt: "2026-07-23T00:00:00.000Z",
-	} as unknown as NarratorMsg;
+	) as unknown as NarratorMsg;
 }
 
 function answerMessage(id: string, text: string): NarratorMsg {
 	seq += 1;
-	return {
-		id,
-		narratorId: "n1",
-		seq,
-		role: "assistant",
-		contentJson: [{ type: "text", text }],
-		contentText: text,
-		toolCalls: [],
-		children: [],
-		parentToolUseId: null,
-		createdAt: "2026-07-23T00:00:00.000Z",
-	} as unknown as NarratorMsg;
+	return rowWithElements(
+		{
+			id,
+			narratorId: "n1",
+			seq,
+			role: "assistant",
+			contentText: text,
+			toolCalls: [],
+			parentToolUseId: null,
+			createdAt: "2026-07-23T00:00:00.000Z",
+		},
+		[{ type: "text", text }],
+	) as unknown as NarratorMsg;
 }
 
 /** `unitId` → `morphGroupId` for every spec carrying an identity, at one level. */

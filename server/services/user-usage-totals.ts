@@ -1,6 +1,7 @@
 import { db as defaultDb } from "@server/db";
 import { apiRequests, users, userUsageTotals } from "@server/db/schema";
 import { aggregateCostStatus } from "@server/lib/cost-estimate";
+import { TOKEN_ACCOUNTING_VERSION } from "@shared/token-accounting";
 import { asc, eq, gt, sql } from "drizzle-orm";
 
 type Db = typeof defaultDb;
@@ -15,6 +16,8 @@ function nonNegative(value: number | null | undefined): number {
  * never an aggregate scan. Duplicate completion cannot charge the user twice.
  * Throw on failure so callers can log/retry; never leave a detail without its rollup.
  * Unknown initiators remain null and do not get attributed to any real user.
+ * Callers supply normalized, disjoint token buckets; stamp only newly inserted rows,
+ * never re-normalize provider usage here or relabel an existing historical row.
  */
 export function insertApiRequestWithUserUsage(
 	record: RequestRecord,
@@ -23,7 +26,7 @@ export function insertApiRequestWithUserUsage(
 	return database.transaction((tx) => {
 		const inserted = tx
 			.insert(apiRequests)
-			.values(record)
+			.values({ ...record, tokenAccountingVersion: TOKEN_ACCOUNTING_VERSION })
 			.onConflictDoNothing({ target: apiRequests.id })
 			.returning({ id: apiRequests.id })
 			.get();

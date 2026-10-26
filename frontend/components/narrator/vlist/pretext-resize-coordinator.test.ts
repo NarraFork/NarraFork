@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import type { PretextDocumentPageResult, TreeMessage } from "@frontend/lib/api/types";
+import { messageBody, rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { restorePretextLayoutAnchor } from "@shared/pretext-layout";
 import type { NarratorMsg } from "../narrator-panel-types";
 import type { MeasuredCollapsibleTrace } from "./measure/measure-tool-run";
@@ -43,18 +44,19 @@ const topView = (): PrependView => ({
 });
 
 function message(narratorId: string, seq: number, text: string): TreeMessage {
-	return {
-		id: `${narratorId}-m${seq}`,
-		narratorId,
-		parentToolUseId: null,
-		role: "assistant",
-		contentJson: [{ type: "text", text }],
-		contentText: text,
-		toolCalls: [],
-		createdAt: "2026-08-01T00:00:00.000Z",
-		children: [],
-		seq,
-	};
+	return rowWithElements(
+		{
+			id: `${narratorId}-m${seq}`,
+			narratorId,
+			parentToolUseId: null,
+			role: "assistant",
+			contentText: text,
+			toolCalls: [],
+			createdAt: "2026-08-01T00:00:00.000Z",
+			seq,
+		},
+		[{ type: "text", text }],
+	);
 }
 
 /** Actual cursor/limit transport contract, not a pre-constructed coordinator snapshot. */
@@ -290,24 +292,27 @@ describe("coordinator width previews with the real paginated document API", () =
 
 	it("refreshes nested LOD2 row geometry after same-height semantic publication with real tool input", async () => {
 		const api = pageAPI(3, "separator");
-		const tools = (seq: number, ids: string[]): TreeMessage => ({
-			...message(api.narratorId, seq, ""),
-			contentText: null,
-			contentJson: ids.map((id) => ({
-				type: "tool_use",
-				id,
-				name: "Bash",
-				input: { command: `pwd # ${id}` },
-				status: "completed",
-			})),
-			toolCalls: ids.map((id) => ({
-				toolUseId: id,
-				toolName: "Bash",
-				inputJson: { command: `pwd # ${id}` },
-				outputJson: null,
-				status: "success",
-			})),
-		});
+		const tools = (seq: number, ids: string[]): TreeMessage =>
+			rowWithElements(
+				{
+					...message(api.narratorId, seq, ""),
+					contentText: null,
+					toolCalls: ids.map((id) => ({
+						toolUseId: id,
+						toolName: "Bash",
+						inputJson: { command: `pwd # ${id}` },
+						outputJson: null,
+						status: "success",
+					})),
+				},
+				ids.map((id) => ({
+					type: "tool_use",
+					id,
+					name: "Bash",
+					input: { command: `pwd # ${id}` },
+					status: "completed",
+				})),
+			);
 		api.messages[0] = tools(0, ["tool-a", "tool-b"]);
 		api.messages[2] = tools(2, ["tool-c", "tool-d"]);
 		const build = { ...BUILD, lod: 2 as const };
@@ -568,17 +573,19 @@ describe("coordinator width previews with the real paginated document API", () =
 		coordinator.previewWidth(420, topView);
 		const old = ready(coordinator);
 		const saved = layoutGeometry(old);
-		const updated: TreeMessage = {
-			...original,
-			contentJson: [
+		const updated: TreeMessage = rowWithElements(
+			{
+				...original,
+			},
+			[
 				{ type: "reasoning", text: "The new canonical reasoning." },
 				{ type: "text", text: "Latest canonical response with changed segmentation. ".repeat(12) },
 			],
-		};
+		);
 		expect(coordinator.upsertMessage(updated, false, topView)).toBe(true);
 		const semantic = ready(coordinator);
 		expect(semantic.resizePreview).toBeUndefined();
-		expect(semantic.input.messages[0]?.contentJson).toEqual(updated.contentJson);
+		expect(messageBody(semantic.input.messages[0])).toEqual(messageBody(updated));
 		expectFullBuild(semantic, BUILD);
 		coordinator.previewWidth(420, topView);
 		const next = ready(coordinator);
@@ -595,12 +602,15 @@ describe("coordinator width previews with the real paginated document API", () =
 
 	it("clears previews on streaming updates and measures the latest live body on the next frame", async () => {
 		const { coordinator, api } = await loaded();
-		const live = (text: string): TreeMessage => ({
-			...message(api.narratorId, 999_999, text),
-			id: "__streaming__",
-			contentText: null,
-			contentJson: [{ type: "text", id: "streaming:text:0", text }],
-		});
+		const live = (text: string): TreeMessage =>
+			rowWithElements(
+				{
+					...message(api.narratorId, 999_999, text),
+					id: "__streaming__",
+					contentText: null,
+				},
+				[{ type: "text", id: "streaming:text:0", text }],
+			);
 		coordinator.setStreamingMessage(live("short"), () => tailView(ready(coordinator)));
 		coordinator.previewWidth(420, () => tailView(ready(coordinator)));
 		const old = ready(coordinator);

@@ -498,6 +498,10 @@ function writeReindexed(
 	const queued = database.sqlite.prepare(
 		"SELECT 1 FROM narrator_block_sync_queue WHERE message_id = ?",
 	);
+	// A block owed its text is the index queue's to write, from what it holds then.
+	const owed = database.sqlite.prepare(
+		"SELECT 1 FROM narrator_block_index_queue WHERE block_id = ?",
+	);
 	const done = { envelopes: 0, blocks: 0, indexChars: 0, resynced: 0 };
 	const spent = () =>
 		done.envelopes + done.blocks > 0 &&
@@ -522,6 +526,7 @@ function writeReindexed(
 				.sort((a, b) => a.rowid - b.rowid);
 			while (at.block < blocks.length && !spent()) {
 				const block = blocks[at.block++];
+				if (owed.get(block.id)) continue;
 				replaceBlockIndexRow(database.sqlite, block.rowid, block.text);
 				done.blocks++;
 				done.indexChars += block.text.length;

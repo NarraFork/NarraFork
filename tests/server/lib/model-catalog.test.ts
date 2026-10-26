@@ -42,7 +42,6 @@ import {
 	settings,
 } from "../../../server/lib/settings";
 import type { NarraForkSettings } from "../../../server/lib/settings/types";
-import { invalidateUserCache } from "../../../server/middleware/auth";
 import { modelCatalogRoutes } from "../../../server/routes/model-catalog";
 import type { AuthSessionStore } from "../../../server/services/auth/session-store";
 import { authMfaStore, authSessionStore, setAuthStores } from "../../../server/services/auth/store";
@@ -81,8 +80,6 @@ beforeEach(() => {
 });
 afterEach(() => {
 	setAuthStores(undefined);
-	invalidateUserCache("catalog-admin");
-	invalidateUserCache("catalog-user");
 	globalThis.fetch = originalFetch;
 	if (restoreVersion && getModelCardSnapshot().catalog.catalogVersion !== restoreVersion)
 		rollbackModelCatalog(restoreVersion);

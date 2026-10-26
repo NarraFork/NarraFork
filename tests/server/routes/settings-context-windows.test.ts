@@ -7,7 +7,6 @@ import { normalizeModelContextWindowOverrides } from "@shared/model-context-wind
 import { Hono } from "hono";
 import { getNarraforkHome } from "../../../server/lib/narrafork-home";
 import { getDefaults, reloadSettings, saveSettings, settings } from "../../../server/lib/settings";
-import { invalidateUserCache } from "../../../server/middleware/auth";
 import { settingsRoutes, updateSettingsSchema } from "../../../server/routes/settings";
 import type { AuthSessionStore } from "../../../server/services/auth/session-store";
 import { authMfaStore, authSessionStore, setAuthStores } from "../../../server/services/auth/store";
@@ -33,7 +32,6 @@ beforeEach(() => {
 });
 afterEach(() => {
 	setAuthStores(undefined);
-	invalidateUserCache(ADMIN_SUB);
 	saveSettings(structuredClone(snapshot));
 	writeFileSync(settingsPath, original);
 });

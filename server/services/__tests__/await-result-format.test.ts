@@ -11,7 +11,7 @@ const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ db, sqlite }));
 
-const { appendSendReplyRequest, formatAgentAwaitResult } = await import("../agent-communication");
+const { formatAgentAwaitResult } = await import("../agent-communication");
 const { formatRecentSubagentActivity, summarizeSubagentToolCall } = await import(
 	"../subagent-activity"
 );
@@ -174,26 +174,6 @@ describe("Await agent result wording", () => {
 		expect(text).toContain("was stopped");
 		expect(text).not.toContain("Await again");
 		expect(text).not.toContain("still running");
-	});
-});
-
-describe("Send reply request wording", () => {
-	test("explicitly asks for a reverse Send without asking the target to stop", () => {
-		const text = appendSendReplyRequest("Please check the API shape.", AGENT_ID, "request-1", "en");
-		expect(text).toContain(
-			`Send({ id: "${AGENT_ID}", message: "<your reply>", replyTo: "request-1" })`,
-		);
-		expect(text).toContain("waiting for your Send reply, not for your task to finish");
-		expect(text).toContain("do not interrupt ongoing work");
-	});
-
-	test("uses a localized reply instruction for Chinese sessions", () => {
-		const text = appendSendReplyRequest("请检查 API。", AGENT_ID, "request-2", "zh-CN");
-		expect(text).toContain("[请求回复 requestId=request-2]");
-		expect(text).toContain(
-			`Send({ id: "${AGENT_ID}", message: "<你的回复>", replyTo: "request-2" })`,
-		);
-		expect(text).toContain("不是等待你结束任务");
 	});
 });
 

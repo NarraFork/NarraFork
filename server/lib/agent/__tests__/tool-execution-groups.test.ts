@@ -364,7 +364,7 @@ describe("selectStreamingToolExecutions", () => {
 		expect(selectStreamingToolExecutions(items)).toEqual([]);
 	});
 
-	test("disabled members block even later members of the same parallel group", () => {
+	test("non-executable members block even later members of the same parallel group", () => {
 		const read = tool("Read");
 		const disabled = tool("Agent");
 		const items = [
@@ -378,13 +378,11 @@ describe("selectStreamingToolExecutions", () => {
 		expect(selectStreamingToolExecutions(items)).toEqual([]);
 	});
 
-	test("deferred Agent blocks Await and Send until it is allowed and settled", () => {
+	test("an Agent blocks Await and Send until it has settled", () => {
 		const agent = tool("Agent");
 		const awaitTool = tool("Await");
 		const send = tool("Send");
-		const items = [entry(agent, { allowed: false }), entry(awaitTool), entry(send)];
-		expect(selectStreamingToolExecutions(items)).toEqual([]);
-		items[0].allowed = true;
+		const items = [entry(agent), entry(awaitTool), entry(send)];
 		expect(selectStreamingToolExecutions(items)).toEqual([agent]);
 		items[0].started = true;
 		expect(selectStreamingToolExecutions(items)).toEqual([]);

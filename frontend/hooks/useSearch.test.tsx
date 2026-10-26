@@ -29,18 +29,26 @@ const notificationTimers = new Map<ReturnType<typeof setTimeout>, () => void>();
 
 const emptyPage = { items: [], total: 0, totalIsLowerBound: false, nextCursor: null };
 
-function Probe({ request, expanded }: { request: SearchRequest; expanded: boolean }) {
+function Probe({
+	request,
+	expanded,
+	page,
+}: {
+	request: SearchRequest;
+	expanded: boolean;
+	page: number;
+}) {
 	overview = useSearchOverview(request);
-	section = useSearchSection(request, "sessions", true);
+	section = useSearchSection(request, "sessions", page, true);
 	hits = useSessionHits("n1", request, expanded);
 	return null;
 }
 
-async function render(request: SearchRequest, expanded = false) {
+async function render(request: SearchRequest, expanded = false, page = 1) {
 	await act(async () => {
 		root.render(
 			<QueryClientProvider client={client}>
-				<Probe request={request} expanded={expanded} />
+				<Probe request={request} expanded={expanded} page={page} />
 			</QueryClientProvider>,
 		);
 	});
@@ -79,7 +87,11 @@ beforeEach(() => {
 		sections: Object.fromEntries(
 			sections.map((name) => [
 				name,
-				{ ...emptyPage, nextCursor: request.cursor ? null : `${name}-page-2` },
+				{
+					...emptyPage,
+					total: 45,
+					nextCursor: request.cursor || request.page ? null : `${name}-page-2`,
+				},
 			]),
 		),
 	}));
@@ -132,23 +144,22 @@ test("loads every section's first page for the overview, and one section's pages
 		expect.any(AbortSignal),
 	);
 	expect(sectionsSpy).toHaveBeenCalledWith(
-		{ q: "kestrel", sort: "time", cursor: undefined, limit: SEARCH_PAGE_LIMIT },
+		{ q: "kestrel", sort: "time", page: 1, limit: SEARCH_PAGE_LIMIT },
 		["sessions"],
 		expect.any(AbortSignal),
 	);
 	expect(overview.data?.sections.sessions?.nextCursor).toBe("sessions-page-2");
 
-	let next: Awaited<ReturnType<typeof section.fetchNextPage>> | undefined;
-	await act(async () => {
-		next = await section.fetchNextPage();
-	});
+	// Jumping to a page asks for it directly, keeping the shown page until it arrives.
+	await render({ q: "kestrel", sort: "time" }, false, 3);
+	expect(section.data?.total).toBe(45);
+	await settle(() => section.isPlaceholderData === false);
 	expect(sectionsSpy).toHaveBeenLastCalledWith(
-		{ q: "kestrel", sort: "time", cursor: "sessions-page-2", limit: SEARCH_PAGE_LIMIT },
+		{ q: "kestrel", sort: "time", page: 3, limit: SEARCH_PAGE_LIMIT },
 		["sessions"],
 		expect.any(AbortSignal),
 	);
-	expect(next?.data?.pages).toHaveLength(2);
-	expect(next?.hasNextPage).toBe(false);
+	expect(section.isPlaceholderData).toBe(false);
 });
 
 test("caches each filter combination separately", async () => {

@@ -17,6 +17,7 @@
  */
 
 import { beforeAll, describe, expect, it } from "bun:test";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import type { MeasuredToolCall } from "./measure/measure-tool-call";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 
@@ -301,26 +302,27 @@ describe("per-tool hand-off leaves exactly one card", () => {
 			input: { command: "npm run build" },
 		});
 		const persisted = [
-			{
-				id: "m1",
-				narratorId: "n1",
-				parentToolUseId: null,
-				role: "assistant",
-				contentJson: [{ type: "tool_use", id: "t1", name: "Bash", input: { command: "x" } }],
-				contentText: null,
-				toolCalls: [
-					{
-						toolUseId: "t1",
-						toolName: "Bash",
-						status: "success",
-						inputJson: { command: "npm run build" },
-						outputJson: { stdout: "ok" },
-					},
-				],
-				createdAt: "2026-07-28T00:00:00.000Z",
-				children: [],
-				seq: 1,
-			},
+			rowWithElements(
+				{
+					id: "m1",
+					narratorId: "n1",
+					parentToolUseId: null,
+					role: "assistant",
+					contentText: null,
+					toolCalls: [
+						{
+							toolUseId: "t1",
+							toolName: "Bash",
+							status: "success",
+							inputJson: { command: "npm run build" },
+							outputJson: { stdout: "ok" },
+						},
+					],
+					createdAt: "2026-07-28T00:00:00.000Z",
+					seq: 1,
+				},
+				[{ type: "tool_use", id: "t1", name: "Bash", input: { command: "x" } }],
+			),
 		];
 		expect(
 			mod.dropPersistedStreamingTools(store, mod.collectPersistedToolUseIds(persisted as never)),

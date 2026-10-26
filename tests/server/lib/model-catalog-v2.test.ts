@@ -18,7 +18,6 @@ import {
 } from "../../../server/lib/model-catalog";
 import { _bindSettings, getDefaults, saveSettings, settings } from "../../../server/lib/settings";
 import type { NarraForkSettings } from "../../../server/lib/settings/types";
-import { invalidateUserCache } from "../../../server/middleware/auth";
 import { modelCatalogRoutes } from "../../../server/routes/model-catalog";
 import type { AuthSessionStore } from "../../../server/services/auth/session-store";
 import { authMfaStore, authSessionStore, setAuthStores } from "../../../server/services/auth/store";
@@ -46,8 +45,6 @@ beforeEach(() => {
 		}),
 	};
 	setAuthStores({ session: store, mfa: authMfaStore });
-	invalidateUserCache(CATALOG_ADMIN_ID);
-	invalidateUserCache(CATALOG_USER_ID);
 	local = getDefaults();
 	local.agent.modelCatalog = {
 		schemaVersion: 2,
@@ -78,8 +75,6 @@ beforeEach(() => {
 });
 afterEach(() => {
 	setAuthStores(undefined);
-	invalidateUserCache(CATALOG_ADMIN_ID);
-	invalidateUserCache(CATALOG_USER_ID);
 	bindModelCatalogSettings(settings, () => saveSettings(settings));
 	_bindSettings(settings);
 });

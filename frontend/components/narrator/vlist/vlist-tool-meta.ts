@@ -26,6 +26,7 @@
  */
 
 import type { FileTarget } from "@shared/file-reference";
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import { extractField, isTruncated, resolveDisplayText } from "@shared/pretext-layout/tool-detail";
 import type { ContentBlock, NarratorMsg } from "../narrator-panel-types";
 import { isRunningForegroundBash } from "../tool-call/tool-display";
@@ -290,9 +291,10 @@ export function deriveToolMeta(block: ContentBlock): VListToolMeta | null {
 export function buildToolMetaIndex(messages: readonly NarratorMsg[]): Map<string, VListToolMeta> {
 	const index = new Map<string, VListToolMeta>();
 	for (const msg of messages) {
-		if (!Array.isArray(msg?.contentJson)) continue;
+		const body = messageBody(msg);
+		if (!body.length) continue;
 		const calls = new Map(msg.toolCalls?.map((call) => [call.toolUseId, call]));
-		for (const raw of msg.contentJson as ContentBlock[]) {
+		for (const raw of body) {
 			if (!raw || typeof raw !== "object" || raw.type !== "tool_use") continue;
 			const toolUseId = typeof raw.id === "string" ? raw.id : undefined;
 			if (!toolUseId) continue;

@@ -37,7 +37,7 @@ const previousGlobals = new Map<string, PropertyDescriptor | undefined>();
 let requests: CapturedRequest[];
 let respond: (request: CapturedRequest) => Response | Promise<Response>;
 let action: "rollback_to_block" | "delete_tool_block";
-let pending: { messageId: string; blockIndex: number } | null;
+let pending: { messageId: string; blockIndex: number; blockId: string } | null;
 let execute: boolean;
 let applyErrors: unknown[];
 
@@ -207,7 +207,7 @@ beforeEach(async () => {
 		defaultOptions: { queries: { retry: false }, mutations: { retry: 3, retryDelay: 0 } },
 	});
 	action = "rollback_to_block";
-	pending = { messageId: "message-1", blockIndex: 3 };
+	pending = { messageId: "message-1", blockIndex: 3, blockId: "block-1" };
 	execute = false;
 	applyErrors = [];
 	notifications.clean();
@@ -448,8 +448,8 @@ function normalResponse(request: CapturedRequest): Response {
 			reason: null,
 		});
 	}
-	if (request.method === "DELETE" || request.url.pathname.includes("/rollback/")) {
-		return reply({ ok: true, messageDeleted: false });
+	if (request.method === "DELETE" || request.url.pathname.endsWith("/blocks/rollback")) {
+		return reply({ ok: true, deleted: 1, failed: 0, results: [] });
 	}
 	throw new Error(`Unexpected fixture request: ${request.url}`);
 }
@@ -693,7 +693,8 @@ describe("fixed action preview HTTP flow", () => {
 		});
 		const post = requestsTo("/revert-action-preview")[0];
 		expect(post.method).toBe("POST");
-		expect(post.body).toMatchObject({ action, messageId: "message-1", blockIndex: 3 });
+		expect(post.url.pathname).toBe("/api/narrators/narrator-test/blocks/revert-action-preview");
+		expect(post.body).toMatchObject({ action, blockIds: ["block-1"] });
 		expect(typeof post.body?.idempotencyKey).toBe("string");
 	});
 
@@ -847,7 +848,7 @@ describe("fixed action preview HTTP flow", () => {
 		respond = () => old.promise;
 		await renderAction();
 		const first = requests[0];
-		pending = { messageId: "new-message", blockIndex: 7 };
+		pending = { messageId: "new-message", blockIndex: 7, blockId: "block-new" };
 		respond = (request) =>
 			request.url.pathname.endsWith("/revert-action-preview")
 				? reply(preparedActionPreview({ id: "new-plan", planHash: "new-hash" }))
@@ -901,7 +902,9 @@ describe("fixed plan apply and history-only branches", () => {
 	test("history-only unknown success payload is a failure, not a successful deletion", async () => {
 		execute = true;
 		respond = (request) =>
-			request.url.pathname.includes("/rollback/") ? reply({ ok: false }) : normalResponse(request);
+			request.url.pathname.endsWith("/blocks/rollback")
+				? reply({ ok: false })
+				: normalResponse(request);
 		await renderAction();
 		await click(button(props.messagesOnlyLabel));
 		expect(applyErrors).toHaveLength(1);
@@ -925,7 +928,8 @@ describe("fixed plan apply and history-only branches", () => {
 		);
 		expect(
 			requests.filter(
-				(request) => request.method === "DELETE" || request.url.pathname.includes("/rollback/"),
+				(request) =>
+					request.method === "DELETE" || request.url.pathname.endsWith("/blocks/rollback"),
 			),
 		).toHaveLength(0);
 		assertUnavailable();
@@ -978,7 +982,8 @@ describe("fixed plan apply and history-only branches", () => {
 			expect(applyErrors).toEqual([]);
 			expect(
 				requests.filter(
-					(request) => request.method === "DELETE" || request.url.pathname.includes("/rollback/"),
+					(request) =>
+						request.method === "DELETE" || request.url.pathname.endsWith("/blocks/rollback"),
 				),
 			).toHaveLength(0);
 			for (const resource of resources) {
@@ -998,7 +1003,7 @@ describe("fixed plan apply and history-only branches", () => {
 			"pagination_loading",
 			"incomplete",
 		] as const) {
-			test(`${selectedAction} keep-files sends only the legacy history operation (${previewState})`, async () => {
+			test(`${selectedAction} keep-files sends only the history operation (${previewState})`, async () => {
 				action = selectedAction;
 				execute = true;
 				const deferred = deferredResponse();
@@ -1033,22 +1038,19 @@ describe("fixed plan apply and history-only branches", () => {
 				expect(confirmations).toEqual([{ skipRevert: true }]);
 				expect(applyErrors).toEqual([]);
 				expect(requestsTo("/apply")).toHaveLength(0);
-				// Clicking history-only adds exactly one independent legacy request:
+				// Clicking history-only adds exactly one independent history request:
 				// no plan apply, preview reload or file-page refetch is permitted.
 				expect(requests).toHaveLength(previewRequests.length + 1);
 				expect(requests.slice(0, -1)).toEqual(previewRequests);
 				const history = requests.at(-1);
 				if (action === "rollback_to_block") {
 					expect(history?.method).toBe("POST");
-					expect(history?.url.pathname).toBe("/api/narrators/narrator-test/rollback/message-1");
-					expect(history?.body).toEqual({ blockIndex: 3, skipRevert: true });
+					expect(history?.url.pathname).toBe("/api/narrators/narrator-test/blocks/rollback");
 				} else {
 					expect(history?.method).toBe("DELETE");
-					expect(history?.url.pathname).toBe(
-						"/api/narrators/narrator-test/messages/message-1/blocks/3",
-					);
-					expect(history?.url.searchParams.get("skipRevert")).toBe("1");
+					expect(history?.url.pathname).toBe("/api/narrators/narrator-test/blocks");
 				}
+				expect(history?.body).toEqual({ blockIds: ["block-1"], skipRevert: true });
 				deferred.resolve(reply({ error: "fixture late preview failure" }, 503));
 				await flush();
 				expect(requests).toHaveLength(previewRequests.length + 1);
@@ -1293,7 +1295,7 @@ describe("explicit historical snapshot recovery", () => {
 				pending = original;
 				await renderAction();
 			} else {
-				pending = { messageId: "message-new", blockIndex: 1 };
+				pending = { messageId: "message-new", blockIndex: 1, blockId: "block-new" };
 				await renderAction();
 			}
 			expect(requestsTo("/revert-action-preview").at(-1)?.body?.recoveryMode).toBeUndefined();
@@ -1368,7 +1370,7 @@ describe("explicit historical snapshot recovery", () => {
 		await renderAction();
 		await click(button(en.revertSnapshotRequest));
 		const snapshotRequest = requestsTo("/revert-action-preview")[1];
-		pending = { messageId: "different-message", blockIndex: 9 };
+		pending = { messageId: "different-message", blockIndex: 9, blockId: "block-different" };
 		await renderAction();
 		expect(snapshotRequest?.signal?.aborted).toBe(true);
 		late.resolve(reply({ ...preparedActionPreview(), recoveryMode: "snapshot" }));

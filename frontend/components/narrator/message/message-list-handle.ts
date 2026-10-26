@@ -7,6 +7,7 @@
  * list component.
  */
 
+import type { BlockSourceMessage } from "@shared/narrator-blocks/message-blocks";
 import type { NarratorMsg } from "../narrator-panel-types";
 
 /** What the reader was looking for when they asked for the jump. */
@@ -39,6 +40,11 @@ export interface MessageListHandle {
 	 * steppers) have no gesture to capture from and call this instead.
 	 */
 	prepareLodChange: (clientY: number) => void;
+	/**
+	 * A loaded message's row, for the blocks an action names (§5.5); undefined when the
+	 * message is not loaded.
+	 */
+	messageOf: (messageId: string) => BlockSourceMessage<unknown> | undefined;
 }
 
 export interface MessageListTailMeta {

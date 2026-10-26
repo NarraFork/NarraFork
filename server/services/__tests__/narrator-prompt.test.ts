@@ -174,7 +174,7 @@ describe("plan mode designated plan file state", () => {
 });
 
 describe("subagent communication guidance", () => {
-	test("requires asynchronous Send and delegates agent dependencies to the parent", () => {
+	test("delegates agent dependencies to the parent", () => {
 		const {
 			compileDelegationPolicy,
 			resolveRuntimePolicy,
@@ -188,11 +188,10 @@ describe("subagent communication guidance", () => {
 			runtimeInteractionHint(policy, "zh-CN") +
 			getRunDeliveryHint("zh-CN", { narratorId: "caller" }, { narratorId: "caller" });
 
-		expect(en).toContain("Send must be asynchronous");
-		expect(en).toContain("do not set await=true");
+		// Send never waits, so there is no await flag left to forbid.
+		expect(en).not.toContain("await=true");
 		expect(en).toContain("Do not use Await(agent)");
 		expect(en).toContain("caller is waiting");
-		expect(zh).toContain("Send 只能异步发送");
 		expect(zh).toContain("不得使用 Await(agent)");
 		expect(zh).toContain("调用方正在等待");
 	});

@@ -88,6 +88,12 @@ export interface ActiveNarrator {
 	/** Set when ExitPlanMode completes — the loop should restart with a user message.
 	 *  "continue" = no compact; "compact" = compact was performed, needs fresh context. */
 	_planApprovedContinue?: "continue" | "compact";
+	/**
+	 * Plan approval that landed while the approving response was still streaming. The
+	 * restart (plan compact + pass abort) runs once that assistant message is finalized,
+	 * so the response is recorded and persisted whole before the pass ends.
+	 */
+	_planApprovalFinish?: () => Promise<void>;
 	/** Cached project ID (set when the narrator has a project context) */
 	_projectId?: string;
 	/** Narrator kind for specialized standalone types (e.g. "knowledge" steward). */

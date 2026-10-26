@@ -1,11 +1,12 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
-import { invalidateUserCache } from "@server/middleware/auth";
+import { buildAppErrorResponse } from "@server/lib/app-error-response";
 import {
 	createUsageHistoryRoutes,
 	type UsageHistoryRouteService,
 } from "@server/routes/usage-history";
 import type { AuthSessionStore } from "@server/services/auth/session-store";
 import { authMfaStore, authSessionStore, setAuthStores } from "@server/services/auth/store";
+import type { TokenRecalculationJob, TokenRecalculationRange } from "@shared/token-recalculation";
 import { Hono } from "hono";
 
 /**
@@ -68,14 +69,12 @@ beforeEach(() => {
 		}),
 	};
 	setAuthStores({ session: store, mfa: authMfaStore });
-	for (const id of SEEN_ACTOR_IDS) invalidateUserCache(id);
 	listUsageHistoryCursor.mockClear();
 	listUsageHistory.mockClear();
 });
 
 afterEach(() => {
 	setAuthStores(undefined);
-	for (const id of SEEN_ACTOR_IDS) invalidateUserCache(id);
 });
 
 function encodeRawCursor(createdAt: string): string {
@@ -218,6 +217,163 @@ describe("usage history user filters and authorization", () => {
 			service,
 		});
 		expect((await guarded.request("/?pagination=cursor&userId=alice-id")).status).toBe(200);
+	});
+});
+
+describe("token recalculation routes", () => {
+	function fixture(actor: "administrator" | "ordinary" | null = "administrator") {
+		const job: TokenRecalculationJob = {
+			id: "recalculation-job",
+			status: "running",
+			startedAt: "2026-10-26T00:00:00.000Z",
+			finishedAt: null,
+			scanned: 10,
+			processed: 8,
+			changed: 6,
+			skipped: 2,
+			fallback: 1,
+			error: null,
+		};
+		const recalculationService = {
+			get: mock((): TokenRecalculationJob | null => job),
+			start: mock((range: TokenRecalculationRange) => ({ ...job, ...range })),
+			cancel: mock((id: string) => ({ ...job, id })),
+		};
+		const getUsageRecord = mock(unexpectedServiceCall);
+		const guarded = new Hono();
+		// Mirror production error serialization instead of masking every thrown error as 400.
+		guarded.onError(
+			(error, c) => buildAppErrorResponse(error, c) ?? c.json({ error: "Internal error" }, 500),
+		);
+		guarded.route(
+			"/",
+			createUsageHistoryRoutes({
+				requireAuth: actor
+					? async (c, next) => {
+							// A claimed admin role must not bypass the live ordinary-user role.
+							c.set("user", { sub: actor, role: "admin", iat: 0, exp: 4_102_444_800 });
+							await next();
+						}
+					: undefined,
+				service: { ...service, getUsageRecord },
+				recalculationService,
+			}),
+		);
+		return { guarded, recalculationService, getUsageRecord, job };
+	}
+
+	test.each([
+		["ordinary", 403],
+		[null, 401],
+	] as const)("%s cannot inspect, start, or cancel jobs", async (actor, status) => {
+		const { guarded, recalculationService, getUsageRecord } = fixture(actor);
+		for (const [path, method] of [
+			["/token-recalculation", "GET"],
+			["/token-recalculation", "POST"],
+			["/token-recalculation/recalculation-job/cancel", "POST"],
+		]) {
+			const response = await guarded.request(path, {
+				method,
+				...(method === "POST"
+					? { headers: { "Content-Type": "application/json" }, body: "{}" }
+					: {}),
+			});
+			expect(response.status).toBe(status);
+		}
+		expect(recalculationService.get).not.toHaveBeenCalled();
+		expect(recalculationService.start).not.toHaveBeenCalled();
+		expect(recalculationService.cancel).not.toHaveBeenCalled();
+		expect(getUsageRecord).not.toHaveBeenCalled();
+	});
+
+	test("administrator reads status and cancels the exact job without hitting /:id", async () => {
+		const { guarded, recalculationService, getUsageRecord, job } = fixture();
+		const response = await guarded.request("/token-recalculation");
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual({ job });
+		expect(recalculationService.get).toHaveBeenCalledTimes(1);
+		recalculationService.get.mockReturnValueOnce(null);
+		expect(await (await guarded.request("/token-recalculation")).json()).toEqual({ job: null });
+		const cancelled = await guarded.request("/token-recalculation/exact-job-id/cancel", {
+			method: "POST",
+		});
+		expect(cancelled.status).toBe(200);
+		expect(await cancelled.json()).toEqual({ job: { ...job, id: "exact-job-id" } });
+		expect(recalculationService.cancel).toHaveBeenCalledWith("exact-job-id");
+		expect(getUsageRecord).not.toHaveBeenCalled();
+	});
+
+	test.each([
+		{},
+		{ startDate: "2026-10-01" },
+		{ endDate: "2026-10-26" },
+		{ startDate: "2026-10-01", endDate: "2026-10-26" },
+		{ startDate: "2024-02-29", endDate: "2024-02-29" },
+	])("administrator starts a valid range with 202: %j", async (range) => {
+		const { guarded, recalculationService, getUsageRecord, job } = fixture();
+		const response = await guarded.request("/token-recalculation", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(range),
+		});
+		expect(response.status).toBe(202);
+		expect(await response.json()).toEqual({ job: { ...job, ...range } });
+		expect(recalculationService.start).toHaveBeenCalledWith(range);
+		expect(recalculationService.start).toHaveBeenCalledTimes(1);
+		expect(getUsageRecord).not.toHaveBeenCalled();
+	});
+
+	test.each([
+		{ startDate: "not-a-date" },
+		{ endDate: "2026-02-30" },
+		{ startDate: "2026-02-29" },
+		{ startDate: "2026-10-01T00:00:00Z" },
+		{ startDate: "2026-10-27", endDate: "2026-10-26" },
+		{ startDate: "2026-10-01", unknown: true },
+		{ startDate: 123 },
+		null,
+		[],
+	])("rejects an invalid range before starting work: %j", async (range) => {
+		const { guarded, recalculationService } = fixture();
+		const response = await guarded.request("/token-recalculation", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: JSON.stringify(range),
+		});
+		expect(response.status).toBe(400);
+		expect(recalculationService.start).not.toHaveBeenCalled();
+	});
+
+	test("rejects malformed JSON before starting work", async () => {
+		const { guarded, recalculationService } = fixture();
+		const response = await guarded.request("/token-recalculation", {
+			method: "POST",
+			headers: { "Content-Type": "application/json" },
+			body: "{",
+		});
+		expect(response.status).toBe(400);
+		expect(recalculationService.start).not.toHaveBeenCalled();
+	});
+
+	test.each([
+		false,
+		true,
+	])("enforces the 1024-byte boundary with Content-Length=%s", async (contentLength) => {
+		const { guarded, recalculationService } = fixture();
+		for (const size of [1024, 1025]) {
+			recalculationService.start.mockClear();
+			const headers = new Headers({ "Content-Type": "application/json" });
+			if (contentLength) headers.set("Content-Length", String(size));
+			const response = await guarded.request("/token-recalculation", {
+				method: "POST",
+				headers,
+				// Whitespace is valid JSON padding, so rejection can only be the body limit.
+				body: `{${" ".repeat(size - 2)}}`,
+			});
+			expect(response.status).toBe(size === 1024 ? 202 : 413);
+			if (size === 1024) expect(recalculationService.start).toHaveBeenCalledWith({});
+			else expect(recalculationService.start).not.toHaveBeenCalled();
+		}
 	});
 });
 

@@ -1,13 +1,13 @@
 import type { EditorFileClientMessage, EditorFileServerMessage } from "@shared/editor-file-events";
+import { resolveLiveSession } from "../lib/auth";
 import { AppError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { editorActorForSubject } from "../routes/editor-documents";
-import { authSessionStore } from "../services/auth/store";
 import { getEditorDocumentService } from "../services/editor-document-runtime";
 import { editorFileSubscriptions } from "../services/editor-file-subscription";
 
 interface Socket {
-	data: { userId?: string; sessionExp?: number; sessionTokenVersion?: number; lastPongAt: number };
+	data: { userId?: string; sessionId?: string; sessionExp?: number; lastPongAt: number };
 	send(frame: string): unknown;
 	getBufferedAmount?(): number;
 	close?(code?: number, reason?: string): void;
@@ -70,8 +70,10 @@ export async function handleEditorFileMessage(ws: Socket, message: EditorFileCli
 	);
 	const authorize = actor.authorize.bind(actor);
 	actor.authorize = async (...args) => {
-		const state = await authSessionStore.findSessionState(actor.userId);
-		if (!live() || !state || state.tokenVersion !== (ws.data.sessionTokenVersion ?? 0))
+		// The session the socket was opened with must still be live: logout, a token
+		// generation bump or expiry all end the subscription.
+		const session = ws.data.sessionId ? await resolveLiveSession(ws.data.sessionId) : null;
+		if (!live() || !session || session.sub !== actor.userId)
 			throw new AppError("Editor authorization expired", 403, "EDITOR_IDENTITY_CHANGED");
 		return authorize(...args);
 	};

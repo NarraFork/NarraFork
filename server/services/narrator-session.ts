@@ -127,6 +127,7 @@ import {
 	claimInboxHead,
 	deliverInboxInjection,
 	flushInboxPublicationBarrier,
+	type InboxWakeOptions,
 	inboxClaim,
 	inboxConsumption,
 	inboxMetadata,
@@ -4811,6 +4812,7 @@ export async function startParentInboundContinuationIfPossible(
 	narratorId: string,
 	locale: Locale = "en",
 	replyInUserLanguage = false,
+	options: InboxWakeOptions = {},
 ): Promise<{ started: boolean }> {
 	return continuationStartLock.acquire(narratorId, async () => {
 		// Recheck inside start admission: publication may have observed an idle
@@ -4824,7 +4826,10 @@ export async function startParentInboundContinuationIfPossible(
 
 		const narrator = await narratorService.getById(narratorId);
 		if (narrator.status !== "idle") return { started: false };
-		if (narrator.lastStopReason === "user_interrupt" || narrator.lastStopReason === "error")
+		if (
+			(narrator.lastStopReason === "user_interrupt" || narrator.lastStopReason === "error") &&
+			!options.resumeStopped?.includes(narrator.lastStopReason)
+		)
 			return { started: false };
 
 		// Restore the recipient's own identity before touching its inbox. Unknown is

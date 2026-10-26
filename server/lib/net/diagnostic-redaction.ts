@@ -42,7 +42,8 @@ export function redactSecretPatterns(value: string): string {
 			/((?:x-api-key|api-key|api[_-]?key|access[_-]?token|refresh[_-]?token|token|secret|password|signature)\s*[:=]\s*)([^\s,;]+)/gi,
 			`$1${REDACTED}`,
 		)
-		.replace(/\beyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\b/g, REDACTED);
+		.replace(/\beyJ[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\.[a-zA-Z0-9_-]+\b/g, REDACTED)
+		.replace(/\bnfs_[a-zA-Z0-9_-]{20,}/g, REDACTED);
 }
 
 /** Remove URL credentials/hash and mask every query value except a small diagnostic allowlist. */

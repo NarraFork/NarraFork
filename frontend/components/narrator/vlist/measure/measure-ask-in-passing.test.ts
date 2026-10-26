@@ -92,6 +92,22 @@ describe("measureAskInPassing — resolved (57~77px, lineClamp=2)", () => {
 		}
 	});
 
+	it("a selection quote adds one fixed 19px row (xs line + gap), at any width", async () => {
+		const { measureAskInPassing } = await import("./measure-ask-in-passing");
+		for (const { question, width } of [
+			{ question: "Hi?", width: 800 },
+			{ question: "word ".repeat(40).trim(), width: 120 },
+		]) {
+			const plain = measureAskInPassing("resolved", { question }, width);
+			const quoted = measureAskInPassing(
+				"resolved",
+				{ question, quoteText: "a long excerpt ".repeat(20) },
+				width,
+			);
+			expect(quoted.height - plain.height).toBe(19);
+		}
+	});
+
 	it("wider width reduces (or keeps) the wrapped question height", async () => {
 		const { measureAskInPassing } = await import("./measure-ask-in-passing");
 		const question = "one two three four five six seven eight nine ten";

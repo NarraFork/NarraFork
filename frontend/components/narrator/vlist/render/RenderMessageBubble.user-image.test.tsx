@@ -12,6 +12,7 @@
 
 import { beforeAll, describe, expect, it } from "bun:test";
 import { MantineProvider } from "@mantine/core";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { type AdapterSegment, adaptSegment } from "@shared/pretext-layout/segment-adapter";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { parseHTML } from "linkedom";
@@ -44,12 +45,14 @@ const USER_BUBBLE_PADDING = 12;
 function renderUserImage(block: Record<string, unknown>): Element {
 	const seg: AdapterSegment = {
 		kind: "message",
-		msg: {
-			id: "u-img",
-			role: "user",
-			narratorId: "nar_1",
-			contentJson: [block as never, { type: "text", text: "look" }],
-		},
+		msg: rowWithElements(
+			{
+				id: "u-img",
+				role: "user",
+				narratorId: "nar_1",
+			},
+			[block as never, { type: "text", text: "look" }],
+		),
 	};
 	const spec = adaptSegment(seg, { lod: 5, labels: {} })[0];
 	if (!spec) throw new Error("no spec produced");

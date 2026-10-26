@@ -35,11 +35,7 @@ import {
 	type RunBindingInput,
 	readRuntimeRegistrationColumn,
 } from "../lib/validators/runtime-registration";
-import {
-	type AgentReplyWaitRunSnapshot,
-	getRunningAgentReplyWaitRunSnapshot,
-	waitForAgentReplyWaitRunStability,
-} from "./agent-reply-waiter";
+import { buildRetiredSendAwaitToolOutput, sendAwaitSnapshotFromPayload } from "./legacy-send-await";
 import {
 	getRecoverySource,
 	getRegisteredRecoverySource,
@@ -114,138 +110,6 @@ function timestampMs(value: string | number | Date | null | undefined): number |
 	const parsed =
 		value instanceof Date ? value.getTime() : typeof value === "number" ? value : Date.parse(value);
 	return Number.isFinite(parsed) ? parsed : null;
-}
-
-export function sendAwaitSnapshotFromPayload(
-	payload: Record<string, unknown> | null,
-): AgentReplyWaitRunSnapshot | null {
-	const value = payload?.sendAwait;
-	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-	const snapshot = value as Partial<AgentReplyWaitRunSnapshot>;
-	if (
-		typeof snapshot.toolUseId !== "string" ||
-		typeof snapshot.requesterId !== "string" ||
-		!Array.isArray(snapshot.waiters) ||
-		!Array.isArray(snapshot.prefixSections) ||
-		!Array.isArray(snapshot.prefixTargets)
-	) {
-		return null;
-	}
-	// Old checkpoints legitimately lack these fields. If present, validate without
-	// inferring revision from a current mailbox row or silently repairing malformed identity.
-	for (const target of [...snapshot.waiters, ...snapshot.prefixTargets]) {
-		if (!target || typeof target !== "object" || Array.isArray(target)) return null;
-		for (const key of ["deliveryId", "recipientRefId"] as const) {
-			const pointer = target[key];
-			if (
-				pointer !== undefined &&
-				(typeof pointer !== "string" || pointer.length === 0 || Buffer.byteLength(pointer) > 512)
-			)
-				return null;
-		}
-		if (
-			target.revision !== undefined &&
-			(!Number.isSafeInteger(target.revision) || target.revision < 1)
-		)
-			return null;
-		if (
-			(target.recipientRefId !== undefined || target.revision !== undefined) &&
-			target.deliveryId === undefined
-		)
-			return null;
-	}
-	return snapshot as AgentReplyWaitRunSnapshot;
-}
-
-function earliestPendingSendAwaitDeadline(snapshot: AgentReplyWaitRunSnapshot): string | null {
-	let earliest = Number.POSITIVE_INFINITY;
-	for (const waiter of snapshot.waiters) {
-		if (waiter.result) continue;
-		const deadline = Date.parse(waiter.deadlineAt);
-		if (Number.isFinite(deadline)) earliest = Math.min(earliest, deadline);
-	}
-	return Number.isFinite(earliest) ? new Date(earliest).toISOString() : null;
-}
-
-export async function waitForStableSendAwaitCheckpoint(
-	input: { toolCallId: string; toolUseId: string },
-	hooks: {
-		loadStatus?: () => Promise<string | null>;
-		pause?: () => Promise<void>;
-	} = {},
-): Promise<AgentReplyWaitRunSnapshot | null> {
-	const loadStatus =
-		hooks.loadStatus ??
-		(async () => {
-			const current = await db.query.narratorToolCalls.findFirst({
-				where: eq(narratorToolCalls.id, input.toolCallId),
-				columns: { status: true },
-			});
-			return current?.status ?? null;
-		});
-	const pause = hooks.pause ?? (() => new Promise<void>((resolve) => setTimeout(resolve, 5)));
-	for (;;) {
-		const snapshot =
-			getRunningAgentReplyWaitRunSnapshot(input.toolUseId) ??
-			(await waitForAgentReplyWaitRunStability(input.toolUseId));
-		if (snapshot) return snapshot;
-		const status = await loadStatus();
-		if (!status || !["initializing", "pending", "running"].includes(status)) return null;
-		// A granted Send await can be between the durable running row and its in-memory
-		// waiter registration. Wait for that setup to stabilize or for the tool to finish;
-		// never classify the possibly-delivered Send as a deferred re-execution.
-		await pause();
-	}
-}
-
-export interface SendAwaitCheckpointVerification {
-	stable: boolean;
-	unstableToolCallIds: string[];
-}
-
-function sameSendAwaitSnapshot(
-	left: AgentReplyWaitRunSnapshot | null,
-	right: AgentReplyWaitRunSnapshot | null,
-): boolean {
-	return JSON.stringify(left) === JSON.stringify(right);
-}
-
-/**
- * Reverse-check every Send await already persisted for this epoch. A terminal tool row is
- * authoritative and atomically advances the continuation to result_written; an active row is
- * stable only while its durable snapshot exactly matches the current process-local waiter run.
- */
-export async function verifySendAwaitCheckpointEpoch(
-	updateEpoch: EpochScope,
-): Promise<SendAwaitCheckpointVerification> {
-	const rows = await toolContinuationService.listSendAwaitCheckpointRows(updateEpoch);
-	const unstableToolCallIds: string[] = [];
-	for (const { record, toolCallStatus } of rows) {
-		if (isToolContinuationOwnerMounted(record) || record.state === "cancelled") continue;
-		if (toolCallStatus === "success" || toolCallStatus === "fail") {
-			await toolContinuationService.reconcileSendAwaitResult(record.toolCallId, record.updateEpoch);
-			continue;
-		}
-		if (hasPersistedToolContinuationResult(record)) continue;
-
-		const currentSnapshot = getRunningAgentReplyWaitRunSnapshot(
-			sendAwaitSnapshotFromPayload(record.payloadJson)?.toolUseId ?? "",
-		);
-		const persistedSnapshot = sendAwaitSnapshotFromPayload(record.payloadJson);
-		if (!currentSnapshot || !sameSendAwaitSnapshot(currentSnapshot, persistedSnapshot)) {
-			unstableToolCallIds.push(record.toolCallId);
-			if (currentSnapshot) {
-				await toolContinuationService.checkpointSendAwait({
-					toolCallId: record.toolCallId,
-					narratorId: record.narratorId,
-					updateEpoch: record.updateEpoch,
-					deadlineAt: earliestPendingSendAwaitDeadline(currentSnapshot),
-					payloadJson: { ...(record.payloadJson ?? {}), sendAwait: currentSnapshot },
-				});
-			}
-		}
-	}
-	return { stable: unstableToolCallIds.length === 0, unstableToolCallIds };
 }
 
 export function resolveAgentExecutionDeadline(input: {
@@ -566,21 +430,6 @@ export async function checkpointPlannedUpdateContinuations(): Promise<PlannedUpd
 			continue;
 		}
 		const input = toolCall.inputJson as Record<string, unknown> | null;
-		if (toolCall.toolName === "Send" && input?.await === true) {
-			const sendAwait = await waitForStableSendAwaitCheckpoint({
-				toolCallId: toolCall.id,
-				toolUseId: toolCall.toolUseId,
-			});
-			if (!sendAwait) continue;
-			await toolContinuationService.checkpointSendAwait({
-				toolCallId: toolCall.id,
-				narratorId: toolCall.narratorId,
-				updateEpoch: snapshot.updateEpoch,
-				deadlineAt: earliestPendingSendAwaitDeadline(sendAwait),
-				payloadJson: { sendAwait },
-			});
-			continue;
-		}
 		if (toolCall.toolName === "Agent") {
 			const subagentId = subagentByOrigin.get(toolCall.toolUseId);
 			if (!subagentId) continue;
@@ -978,19 +827,18 @@ async function finalizeInterruptedRecoveryParent(
 	// already-running task/result row must remain untouched while ordinary interrupted tools
 	// receive their terminal ToolResult below.
 	const interruptedToolResults = cancelled.filter((record) => record.kind !== "background_agent");
+	// A legacy Send await already delivered its message: close it, never fail it.
 	const sendAwaits = interruptedToolResults.filter((record) => record.kind === "send_await");
 	if (sendAwaits.length > 0) {
-		const { formatSendAwaitSnapshotWithFallback } = await import("./agent-communication");
 		for (const record of sendAwaits) {
 			const snapshot = sendAwaitSnapshotFromPayload(record.payloadJson);
 			if (!snapshot) continue;
 			const toolCall = await toolContinuationService.getToolCallResult(record.toolCallId);
 			if (!toolCall || toolCall.status === "success" || toolCall.status === "fail") continue;
-			const result = formatSendAwaitSnapshotWithFallback(snapshot, { status: "aborted" });
 			await narratorPersistence.updateToolCallResultIfActive(
 				toolCall.toolUseId,
 				{
-					output: buildRecoveredSendAwaitToolOutput(snapshot, result),
+					output: buildRetiredSendAwaitToolOutput(snapshot),
 					status: "success",
 					completedAt: Date.now(),
 				},
@@ -1250,21 +1098,6 @@ export function buildRecoveredAwaitToolOutput(
 	};
 }
 
-export function buildRecoveredSendAwaitToolOutput(
-	snapshot: AgentReplyWaitRunSnapshot,
-	result: { output: string; targets: unknown[] },
-): { _text: string; _metadata: Record<string, unknown> } {
-	return {
-		_text: result.output,
-		_metadata: {
-			kind: "send",
-			targets: result.targets,
-			doInterrupt: snapshot.doInterrupt,
-			await: true,
-		},
-	};
-}
-
 async function restoreAwait(
 	record: ToolContinuationRecord,
 	signal: AbortSignal,
@@ -1306,65 +1139,17 @@ async function restoreAwait(
 	);
 }
 
-async function waitForPersistedSendAwaitResult(
-	toolCallId: string,
-	signal: AbortSignal,
-): Promise<"persisted" | "stopped"> {
-	for (;;) {
-		const toolCall = await toolContinuationService.getToolCallResult(toolCallId);
-		if (!toolCall || toolCall.status === "success" || toolCall.status === "fail") {
-			return "persisted";
-		}
-		if (signal.aborted) return "stopped";
-		await new Promise<void>((resolve) => {
-			const onAbort = () => {
-				clearTimeout(timer);
-				resolve();
-			};
-			const timer = setTimeout(() => {
-				signal.removeEventListener("abort", onAbort);
-				resolve();
-			}, 10);
-			signal.addEventListener("abort", onAbort, { once: true });
-		});
-	}
-}
-
+/**
+ * Close a Send await checkpointed by a process from before Send stopped waiting. Its
+ * messages were delivered; the call ends with the outcome the checkpoint recorded.
+ */
 async function restoreSendAwait(
 	record: ToolContinuationRecord,
-	signal: AbortSignal,
 	onMounted: () => void,
 ): Promise<void> {
 	const snapshot = sendAwaitSnapshotFromPayload(record.payloadJson);
 	if (!snapshot) throw new Error("Send await continuation is missing its waiter snapshot");
-	const { restoreSendAwaitFromSnapshot } = await import("./agent-communication");
-	const localAbort = new AbortController();
-	const waiterSignal = AbortSignal.any([signal, localAbort.signal]);
-	// The async function registers every pending request synchronously before its first await.
-	// Marking mounted immediately after the call therefore means responders can safely resume.
-	const { waiting } = await withRecoveryAdvance(record.updateEpoch, () => ({
-		waiting: restoreSendAwaitFromSnapshot(snapshot, waiterSignal),
-	}));
 	onMounted();
-	const persistedResult = waitForPersistedSendAwaitResult(record.toolCallId, localAbort.signal);
-	const winner = await Promise.race([
-		waiting.then((result) => ({ kind: "waiter" as const, result })),
-		persistedResult.then((status) => ({ kind: "database" as const, status })),
-	]);
-	if (winner.kind === "database") {
-		if (winner.status === "persisted") {
-			// The old process won the settlement race after checkpointing. Retire the restored
-			// waiter and trust its already-durable ToolResult instead of writing a second result.
-			localAbort.abort(new Error("Send await ToolResult was persisted by the previous process"));
-			await waiting;
-			return;
-		}
-		throw new Error("Send await ToolResult monitor stopped before waiter completion");
-	}
-	localAbort.abort();
-	if (signal.aborted) {
-		throw signal.reason ?? new Error("Send await continuation recovery was aborted");
-	}
 	const toolCall = await toolContinuationService.getToolCallResult(record.toolCallId);
 	if (!toolCall) throw new Error("Send tool call was deleted before recovery");
 	if (toolCall.status === "success" || toolCall.status === "fail") return;
@@ -1372,7 +1157,7 @@ async function restoreSendAwait(
 	const updated = await narratorPersistence.updateToolCallResultIfActive(
 		toolCall.toolUseId,
 		{
-			output: buildRecoveredSendAwaitToolOutput(snapshot, winner.result),
+			output: buildRetiredSendAwaitToolOutput(snapshot),
 			status: "success",
 			completedAt: Date.now(),
 		},
@@ -1421,7 +1206,7 @@ async function restoreClaimedContinuation(
 			await restoreAwait(record, signal, onMounted);
 			return;
 		case "send_await":
-			await restoreSendAwait(record, signal, onMounted);
+			await restoreSendAwait(record, onMounted);
 	}
 }
 
@@ -1795,7 +1580,6 @@ function restoreRecoveryQueue(
 		rejectMounts: (error: unknown) => void;
 		run: () => Promise<ToolContinuationRecord>;
 		started?: Promise<ToolContinuationRecord>;
-		prestarted?: Promise<ToolContinuationRecord>;
 	};
 	const plans = groupContinuationRecoveryItems(queue).map((messageItems) => {
 		const executionGroups = groupToolExecutions(messageItems);
@@ -1883,39 +1667,16 @@ function restoreRecoveryQueue(
 				if (snapshot.updateEpoch.startsWith("restart-")) markReady();
 				// Queued followers are safe for HTTP readiness even while an Agent is waiting
 				// for human approval. Their executionMounted dependency still prevents actual
-				// Await/Send execution before alias registration. Persisted Send waiters alone
-				// require real installation before responders (including legacy targets) run.
-				if (groupIndex > 0 && item.record.kind !== "send_await") markReady();
+				// Await/Send execution before alias registration.
+				if (groupIndex > 0) markReady();
 			}
 		}
 		return { messageItems, executionGroups, runs };
 	});
 
-	// Globally install every Send await waiter before any Agent/Await continuation can run.
-	// These prestarts perform no delivery and therefore may safely bypass message barriers;
-	// their result promises are still consumed at the original execution-group position.
-	const sendMounts: Promise<void>[] = [];
-	for (const plan of plans) {
-		for (const item of plan.messageItems) {
-			if (item.record.kind !== "send_await" || isToolContinuationOwnerMounted(item.record))
-				continue;
-			const scheduled = plan.runs.get(item);
-			if (!scheduled) throw new Error("Send await recovery item was not scheduled");
-			scheduled.prestarted = scheduled.run();
-			// A prestart failure rejects `mounted`, which fails the barrier below before the
-			// execution loop can reach this item's original position. Observe the run promise now
-			// so the same error is not also reported as an unhandled rejection; the loop still
-			// consumes it (and propagates it) whenever it does get that far.
-			void scheduled.prestarted.catch(() => {});
-			sendMounts.push(scheduled.mounted);
-		}
-	}
-	const sendWaitersMounted = Promise.all(sendMounts).then(() => undefined);
-
 	const messageCompletions = plans.map((plan) =>
 		(async () => {
 			try {
-				await sendWaitersMounted;
 				let activeRuns: Promise<ToolContinuationRecord>[] = [];
 				for (const [groupIndex, executionGroup] of plan.executionGroups.entries()) {
 					const previousGroup = plan.executionGroups[groupIndex - 1];
@@ -1943,7 +1704,7 @@ function restoreRecoveryQueue(
 					for (const item of executionGroup) {
 						const scheduled = plan.runs.get(item);
 						if (!scheduled) throw new Error("Recovery item was not scheduled");
-						const run = scheduled.prestarted ?? scheduled.run();
+						const run = scheduled.run();
 						scheduled.started = run;
 						// Keep errors observed while a later Agent-dependent group is being mounted;
 						// the next normal barrier or final join still propagates the same rejection.
@@ -1967,9 +1728,7 @@ function restoreRecoveryQueue(
 			} finally {
 				// A sibling failure must not release this owner while another execution is live.
 				await Promise.allSettled(
-					[...plan.runs.values()].flatMap((run) =>
-						run.started ? [run.started] : run.prestarted ? [run.prestarted] : [],
-					),
+					[...plan.runs.values()].flatMap((run) => (run.started ? [run.started] : [])),
 				);
 			}
 		})(),
@@ -1981,7 +1740,8 @@ function restoreRecoveryQueue(
 	}
 	return {
 		mounted: Promise.all(mountedPromises).then(() => undefined),
-		sendWaitersSettled: Promise.allSettled(sendMounts).then(() => undefined),
+		// Send no longer installs reply waiters, so nothing gates the legacy work behind it.
+		sendWaitersSettled: Promise.resolve(),
 		completion: Promise.all(messageCompletions).then(() => undefined),
 		ownerCompletions: new Map(
 			[...owners].map(([id, promises]) => [

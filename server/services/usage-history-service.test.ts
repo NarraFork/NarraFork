@@ -1,5 +1,5 @@
 import { Database } from "bun:sqlite";
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -10,7 +10,9 @@ import {
 	shutdownDbWorkerPool,
 } from "@server/lib/db-worker/pool";
 import { decodeUsageHistoryCursor } from "@server/lib/usage-history-cursor";
+import type { SQLWrapper } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
+import { PgDialect } from "drizzle-orm/pg-core";
 import { cleanDb, getTestDb } from "../../tests/setup";
 import { UsageHistoryService } from "./usage-history-service";
 
@@ -146,6 +148,311 @@ test("preserves normalized OpenAI input and cache buckets in history and aggrega
 	expect(series.points[0]).toMatchObject(expectedTotals);
 });
 
+describe("cache hit rate eligibility", () => {
+	const filters = { startDate: "2026-07-17T00:00:00.000Z", endDate: "2026-07-19T23:59:59.999Z" };
+
+	function seedCacheRequests() {
+		db.insert(apiRequests)
+			.values([
+				{
+					id: "cache-large",
+					createdAt,
+					provider: "cached",
+					model: "nug:claude-opus-4.6",
+					inputTokens: 200,
+					cachedInputTokens: 800,
+					cacheCreationInputTokens: 600,
+					outputTokens: 50,
+					costUsd: 1,
+				},
+				{
+					id: "cache-small",
+					createdAt,
+					provider: "cached",
+					model: "claude-opus-4-6-20260514",
+					inputTokens: 0,
+					cachedInputTokens: 100,
+					outputTokens: 50,
+					costUsd: 2,
+				},
+				{
+					id: "zero-cache",
+					createdAt,
+					provider: "cached",
+					model: "nug:claude-opus-4.6",
+					inputTokens: 10000,
+					cachedInputTokens: 0,
+					cacheCreationInputTokens: 3000,
+					outputTokens: 50,
+					costUsd: 3,
+				},
+				{
+					id: "missing-cache",
+					createdAt,
+					provider: "uncached",
+					model: "uncached",
+					inputTokens: 20000,
+					outputTokens: 50,
+					costUsd: 4,
+				},
+				{
+					id: "write-only",
+					createdAt: "2026-07-18T12:00:00.000Z",
+					provider: "uncached",
+					model: "uncached",
+					inputTokens: 30000,
+					cacheCreationInputTokens: 4000,
+					outputTokens: 50,
+					costUsd: 5,
+				},
+			])
+			.run();
+	}
+
+	test("summary and time buckets only use positive cache-read rows without filtering ordinary totals", async () => {
+		seedCacheRequests();
+		const stats = await service.getUsageStats(filters);
+		expect(stats).toMatchObject({
+			totalRequests: 5,
+			totalInputTokens: 60200,
+			totalOutputTokens: 250,
+			totalCacheCreationTokens: 7600,
+			totalCacheReadTokens: 900,
+			totalTokens: 68950,
+			totalCost: 15,
+			cacheHitRateReadTokens: 900,
+			cacheHitRateInputTokens: 1700,
+		});
+		expect(stats.cacheHitRate).toBeCloseTo(900 / 1700);
+		const points = (await service.getUsageTimeSeries(filters)).points;
+		expect(points.map((point) => point.requestCount)).toEqual([4, 1, 0]);
+		expect(points[0].cacheHitRate).toBeCloseTo(900 / 1700);
+		expect(points[1].cacheHitRate).toBeNull();
+		expect(points[2].cacheHitRate).toBeNull();
+		expect(
+			(await service.getUsageStats({ ...filters, provider: "uncached" })).cacheHitRate,
+		).toBeNull();
+		expect(
+			(await service.getUsageStats({ ...filters, provider: "missing" })).cacheHitRate,
+		).toBeNull();
+	});
+
+	for (const dimension of ["provider", "model", "kind", "user"] as const) {
+		test(`keeps ${dimension} breakdown and stacked ratios weighted and null when ineligible`, async () => {
+			seedCacheRequests();
+			const breakdown = await service.getUsageBreakdown(filters, {
+				dimension,
+				metric: "cacheHitRate",
+			});
+			expect(breakdown.total).toBeCloseTo(900 / 1700);
+			expect(breakdown.entries.filter((entry) => entry.value != null)).toHaveLength(1);
+			expect(breakdown.entries.find((entry) => entry.value != null)?.value).toBeCloseTo(900 / 1700);
+			expect(breakdown.entries.reduce((sum, entry) => sum + entry.count, 0)).toBe(5);
+			const stacked = await service.getUsageTimeSeriesStacked(filters, {
+				dimension,
+				metric: "cacheHitRate",
+			});
+			const participating = stacked.series.find((series) => series.data[0].value != null);
+			expect(participating?.data[0].value).toBeCloseTo(900 / 1700);
+			for (const series of stacked.series) {
+				expect(series.data[1].value).toBeNull();
+				expect(series.data[2].value).toBeNull();
+			}
+			const empty = await service.getUsageBreakdown(
+				{ ...filters, provider: "uncached" },
+				{ dimension, metric: "cacheHitRate" },
+			);
+			expect(empty.total).toBeNull();
+			expect(empty.entries.every((entry) => entry.value === null)).toBe(true);
+		});
+	}
+
+	for (const options of [
+		{ dimension: "provider", cluster: false },
+		{ dimension: "model", cluster: false },
+		{ dimension: "model", cluster: true },
+		{ dimension: "user", cluster: false },
+	] as const) {
+		test(`${options.dimension} cluster=${options.cluster} keeps eligible groups before LIMIT and compiles PostgreSQL NULLS LAST`, async () => {
+			// Exceed both the ordinary top-20 and clustered-model top-200 candidate limits.
+			db.insert(apiRequests)
+				.values([
+					...Array.from({ length: 205 }, (_, index) => ({
+						id: `null-rate-${index}`,
+						provider: `a-uncached-${index}`,
+						model: `a-uncached-${index}`,
+						userId: `a-uncached-${index}`,
+						createdAt,
+						inputTokens: 1000,
+						cachedInputTokens: 0,
+					})),
+					{
+						id: "rate-high",
+						provider: "z-cached-high",
+						model: "z-cached-high",
+						userId: "z-cached-high",
+						createdAt,
+						inputTokens: 10,
+						cachedInputTokens: 90,
+					},
+					{
+						id: "rate-low",
+						provider: "z-cached-low",
+						model: "z-cached-low",
+						userId: "z-cached-low",
+						createdAt,
+						inputTokens: 50,
+						cachedInputTokens: 50,
+					},
+				])
+				.run();
+			const inspected = new UsageHistoryService(db);
+			const dialect = new PgDialect();
+			const compiled: ReturnType<PgDialect["sqlToQuery"]>[] = [];
+			// Compile the actual generated query through the PG dialect, then execute only
+			// against the isolated in-memory SQLite fixture (no PostgreSQL connection).
+			const aggregate = spyOn(
+				inspected as unknown as {
+					aggregate(query: SQLWrapper & PromiseLike<unknown[]>): Promise<unknown[]>;
+				},
+				"aggregate",
+			).mockImplementation(async (query) => {
+				compiled.push(dialect.sqlToQuery(query.getSQL()));
+				return await query;
+			});
+			try {
+				const breakdown = await inspected.getUsageBreakdown(filters, {
+					...options,
+					metric: "cacheHitRate",
+				});
+				expect(breakdown.entries.slice(0, 2).map(({ label, value }) => ({ label, value }))).toEqual(
+					[
+						{ label: "z-cached-high", value: 0.9 },
+						{ label: "z-cached-low", value: 0.5 },
+					],
+				);
+				expect(breakdown.total).toBe(0.7);
+				const stacked = await inspected.getUsageTimeSeriesStacked(filters, {
+					...options,
+					metric: "cacheHitRate",
+					topN: 2,
+				});
+				expect(stacked.series.map((series) => series.label)).toEqual([
+					"z-cached-high",
+					"z-cached-low",
+					"other",
+				]);
+				expect(stacked.series[0].data[0].value).toBe(0.9);
+				expect(stacked.series[1].data[0].value).toBe(0.5);
+				expect(stacked.series[2].data.every((point) => point.value === null)).toBe(true);
+				const ranked = compiled.filter((query) => /order by[\s\S]*limit/i.test(query.sql));
+				expect(ranked).toHaveLength(2);
+				for (const query of ranked) {
+					expect(query.sql).toMatch(/order by[\s\S]*DESC NULLS LAST[\s\S]*limit \$\d+/);
+					expect(query.params.at(-1)).toBe(
+						options.dimension === "model" && options.cluster ? 200 : query === ranked[0] ? 20 : 2,
+					);
+				}
+			} finally {
+				aggregate.mockRestore();
+			}
+		});
+	}
+
+	test("recombines other-series numerators and denominators instead of adding percentages", async () => {
+		db.insert(apiRequests)
+			.values([
+				{ id: "top-a", createdAt, provider: "a", model: "a", cachedInputTokens: 100 },
+				{
+					id: "top-b",
+					createdAt,
+					provider: "b",
+					model: "b",
+					cachedInputTokens: 90,
+					inputTokens: 10,
+				},
+				{
+					id: "other-small",
+					createdAt,
+					provider: "c",
+					model: "c",
+					cachedInputTokens: 80,
+					inputTokens: 20,
+				},
+				{
+					id: "other-large",
+					createdAt,
+					provider: "d",
+					model: "d",
+					cachedInputTokens: 200,
+					inputTokens: 800,
+				},
+				{
+					id: "other-excluded",
+					createdAt,
+					provider: "e",
+					model: "e",
+					cachedInputTokens: 0,
+					inputTokens: 999999,
+				},
+			])
+			.run();
+		for (const dimension of ["provider", "model"] as const) {
+			const stacked = await service.getUsageTimeSeriesStacked(filters, {
+				dimension,
+				metric: "cacheHitRate",
+				topN: 2,
+			});
+			expect(stacked.series.find((series) => series.label === "other")?.data[0].value).toBeCloseTo(
+				280 / 1100,
+			);
+		}
+	});
+
+	test("user breakdown other and overall rates use eligible totals beyond the top 20", async () => {
+		db.insert(apiRequests)
+			.values([
+				...Array.from({ length: 20 }, (_, index) => ({
+					id: `cache-top-${index}`,
+					userId: `user-${index}`,
+					createdAt,
+					cachedInputTokens: 1,
+				})),
+				{
+					id: "cache-other-small",
+					userId: "other-small",
+					createdAt,
+					cachedInputTokens: 50,
+					inputTokens: 50,
+				},
+				{
+					id: "cache-other-large",
+					userId: "other-large",
+					createdAt,
+					cachedInputTokens: 100,
+					inputTokens: 900,
+				},
+				{
+					id: "cache-other-excluded",
+					userId: "other-excluded",
+					createdAt,
+					cachedInputTokens: 0,
+					inputTokens: 999999,
+				},
+			])
+			.run();
+		const breakdown = await service.getUsageBreakdown(filters, {
+			dimension: "user",
+			metric: "cacheHitRate",
+		});
+		expect(breakdown.total).toBeCloseTo(170 / 1120);
+		expect(breakdown.entries.find((entry) => entry.label === "other")).toMatchObject({ count: 3 });
+		expect(breakdown.entries.find((entry) => entry.label === "other")?.value).toBeCloseTo(
+			150 / 1100,
+		);
+	});
+});
+
 function seedUsers() {
 	db.insert(users)
 		.values([
@@ -221,7 +528,9 @@ describe("UsageHistoryService user attribution", () => {
 				metric: "requests",
 			});
 			expect(
-				stacked.series.flatMap((item) => item.data).reduce((sum, item) => sum + item.value, 0),
+				stacked.series
+					.flatMap((item) => item.data)
+					.reduce((sum, item) => sum + (item.value ?? 0), 0),
 			).toBe(expectedCount);
 		});
 	}
@@ -269,7 +578,7 @@ describe("UsageHistoryService user attribution", () => {
 			"other",
 		]);
 		expect(
-			stacked.series.map((entry) => entry.data.reduce((sum, point) => sum + point.value, 0)),
+			stacked.series.map((entry) => entry.data.reduce((sum, point) => sum + (point.value ?? 0), 0)),
 		).toEqual([16, 8, 7]);
 	});
 
@@ -328,7 +637,7 @@ describe("UsageHistoryService user attribution", () => {
 			topN: 2,
 		});
 		expect(
-			stacked.series.flatMap((item) => item.data).reduce((sum, item) => sum + item.value, 0),
+			stacked.series.flatMap((item) => item.data).reduce((sum, item) => sum + (item.value ?? 0), 0),
 		).toBe(4);
 		expect(stacked.series.find((item) => item.label === "claude-opus-4-6")?.data[0].value).toBe(2);
 	});
@@ -337,6 +646,7 @@ describe("UsageHistoryService user attribution", () => {
 describe("UsageHistoryService production worker", () => {
 	test("runs all aggregates against the worker DB with the same field mapping", async () => {
 		seedUsers();
+		sqlite.run("UPDATE api_requests SET cached_input_tokens = 100 WHERE id = 'alice-1'");
 		const directory = await mkdtemp(join(tmpdir(), "usage-history-worker-"));
 		const path = join(directory, "usage.db");
 		try {
@@ -368,6 +678,27 @@ describe("UsageHistoryService production worker", () => {
 					topN: 2,
 				}),
 			);
+			for (const dimension of ["provider", "model", "user"] as const) {
+				expect(
+					await workerService.getUsageBreakdown(dateFilters, { dimension, metric: "cacheHitRate" }),
+				).toEqual(
+					await service.getUsageBreakdown(dateFilters, { dimension, metric: "cacheHitRate" }),
+				);
+				expect(
+					await workerService.getUsageTimeSeriesStacked(dateFilters, {
+						dimension,
+						metric: "cacheHitRate",
+						topN: 2,
+					}),
+				).toEqual(
+					await service.getUsageTimeSeriesStacked(dateFilters, {
+						dimension,
+						metric: "cacheHitRate",
+						topN: 2,
+					}),
+				);
+			}
+			expect((await workerService.getUsageStats(filters)).cacheHitRate).toBe(0.5);
 			expect((await workerService.listUsageHistory(filters)).total).toBe(2);
 			expect(await workerService.listProviders()).toEqual(["anthropic", "codex"]);
 			// Clear only the injected main-thread fixture: subsequent totals must still come from disk.

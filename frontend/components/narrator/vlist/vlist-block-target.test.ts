@@ -7,7 +7,7 @@ import { resolveVListBlockTarget, toolUseIdFromBlockId } from "./vlist-block-tar
 const MSG = "abc123def456";
 
 function target(kind: VListElementKind, key: string, ids: string[] = [MSG]) {
-	return resolveVListBlockTarget(kind, key, ids);
+	return resolveVListBlockTarget(kind, key, ids, () => undefined);
 }
 
 describe("resolveVListBlockTarget", () => {

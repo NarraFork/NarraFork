@@ -19,7 +19,7 @@
  */
 
 import { useUploadCapability } from "@frontend/hooks/usePlatform";
-import { absorbRenewedToken, clearTokenOnSessionFailure, getToken } from "@frontend/lib/api";
+import { clearTokenOnSessionFailure, getToken } from "@frontend/lib/api";
 import { apiUrl, resolveServerUrl } from "@frontend/lib/base-path";
 import { useCallback, useEffect, useState } from "react";
 import { useImageViewer } from "../../../common/image-viewer-context";
@@ -213,10 +213,6 @@ export function useResolvedImageSrc(
 		setError(false);
 		fetch(url, { headers })
 			.then(async (res) => {
-				// Pass the token this request actually used: absorbRenewedToken only overwrites
-				// storage when it is still the current one, so a tab that switched accounts
-				// mid-flight cannot have the previous account's renewal written back over it.
-				absorbRenewedToken(res, token ?? undefined);
 				if (!res.ok) {
 					await clearTokenOnSessionFailure(res);
 					throw new Error(`Request failed (${res.status})`);

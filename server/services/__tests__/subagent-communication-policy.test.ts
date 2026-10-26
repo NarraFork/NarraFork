@@ -5,9 +5,7 @@ import type { AgentConfig } from "../../lib/agent/types";
 import { compileDelegationPolicy, resolveRuntimePolicy } from "../agent-runtime/policy";
 import {
 	assertRuntimeCanAwaitAgent,
-	assertRuntimeCanSendAwait,
 	SUBAGENT_AGENT_AWAIT_FORBIDDEN_ERROR,
-	SUBAGENT_SEND_ASYNC_ONLY_ERROR,
 } from "../subagent-communication-policy";
 
 // Capability, not role: a delegated ceiling withholds sync waits, an undeclared one keeps them.
@@ -15,21 +13,6 @@ const delegated = resolveRuntimePolicy([compileDelegationPolicy({ template: "gen
 const undeclared = resolveRuntimePolicy([]);
 
 describe("communication capability policy", () => {
-	test("rejects await=true without the sendAwait capability", () => {
-		expect(() => assertRuntimeCanSendAwait(delegated, true)).toThrow(
-			SUBAGENT_SEND_ASYNC_ONLY_ERROR,
-		);
-	});
-
-	test("allows asynchronous Send without the sendAwait capability", () => {
-		expect(() => assertRuntimeCanSendAwait(delegated, false)).not.toThrow();
-		expect(() => assertRuntimeCanSendAwait(delegated, undefined)).not.toThrow();
-	});
-
-	test("does not change Send behavior when the capability is present", () => {
-		expect(() => assertRuntimeCanSendAwait(undeclared, true)).not.toThrow();
-	});
-
 	test("rejects agent Await without the awaitAgent capability", () => {
 		expect(() => assertRuntimeCanAwaitAgent(delegated)).toThrow(
 			SUBAGENT_AGENT_AWAIT_FORBIDDEN_ERROR,
@@ -53,10 +36,12 @@ describe("communication capability policy", () => {
 		const primaryAwaitProperties = (awaitTool.getRawJsonSchema?.(primaryConfig).properties ??
 			{}) as Record<string, unknown>;
 
-		expect(subagentSendProperties.await).toBeUndefined();
-		expect(subagentSendProperties.timeout).toBeUndefined();
-		expect(primarySendProperties.await).toBeDefined();
-		expect(primarySendProperties.timeout).toBeDefined();
+		// Send never waits for a reply, under any ceiling.
+		for (const properties of [subagentSendProperties, primarySendProperties]) {
+			expect(properties.await).toBeUndefined();
+			expect(properties.timeout).toBeUndefined();
+			expect(properties.replyTo).toBeUndefined();
+		}
 		// The invariant is that "agent" is hidden from subagents — NOT that the list is
 		// exactly one entry. Non-agent wait targets (bash, and a background device
 		// transfer) are deliberately available to subagents: a subagent that starts a

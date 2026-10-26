@@ -9,6 +9,9 @@
  * by the verified narratorId).
  */
 import { beforeAll, describe, expect, test } from "bun:test";
+import type { TreeMessage } from "@frontend/lib/api/types";
+import { decodeBlockPage } from "@frontend/lib/block-protocol";
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../../db";
@@ -140,28 +143,20 @@ describe("public share read-through endpoints", () => {
 		const share = await shared(narratorId);
 		const res = await get(share, "/pretext-document");
 		expect(res.status).toBe(200);
-		const page = (await res.json()) as {
-			messages: Array<{
-				id: string;
-				contentJson: Array<{
-					type: string;
-					text?: string;
-					id?: string;
-					status?: string;
-					inputJson?: unknown;
-					outputJson?: unknown;
-				}>;
-			}>;
+		// The page is envelopes + blocks; the share page renders the rows they decode to.
+		const page = decodeBlockPage(await res.json()) as {
+			messages: TreeMessage[];
 			hasPrev: boolean;
 			messageVersion: number;
 		};
 		const row = page.messages.find((m) => m.id === messageId);
 		expect(row).toBeDefined();
-		// Structure, not flattening: contentJson blocks survive as blocks.
-		expect(row?.contentJson[0]).toEqual({ type: "text", text: "hello **world**" });
+		// Structure, not flattening: the message's elements survive as elements.
+		const body = messageBody(row);
+		expect(body[0]).toEqual({ type: "text", text: "hello **world**" });
 		// The tool_use block is hydrated in place with the call's real payload —
 		// that is exactly the shape the vlist's tool card renders from.
-		const toolBlock = row?.contentJson.find((b) => b.type === "tool_use") as
+		const toolBlock = body.find((b) => b.type === "tool_use") as
 			| { id: string; status?: string; inputJson?: unknown; outputJson?: unknown }
 			| undefined;
 		expect(toolBlock?.id).toBe(toolUseId);
@@ -202,7 +197,7 @@ describe("public share read-through endpoints", () => {
 		message(narratorB, 0, "beta-secret");
 		const shareA = await shared(narratorA);
 		const res = await get(shareA, "/pretext-document");
-		const page = (await res.json()) as { messages: Array<{ contentJson: unknown }> };
+		const page = decodeBlockPage(await res.json()) as { messages: TreeMessage[] };
 		expect(JSON.stringify(page.messages)).toContain("alpha");
 		expect(JSON.stringify(page.messages)).not.toContain("beta-secret");
 	});

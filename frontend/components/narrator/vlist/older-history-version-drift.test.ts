@@ -23,6 +23,7 @@
 
 import { beforeAll, describe, expect, it } from "bun:test";
 import type { TreeMessage } from "@frontend/lib/api/types";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 
 beforeAll(() => {
@@ -54,18 +55,19 @@ const BUILD = {
  * suites independent regardless of run order.
  */
 function message(seq: number): TreeMessage {
-	return {
-		id: `drift-m${seq}`,
-		narratorId: "n1",
-		parentToolUseId: null,
-		role: "assistant",
-		contentJson: [{ type: "text", text: "词".repeat(60) }],
-		contentText: "词".repeat(60),
-		toolCalls: [],
-		createdAt: "2026-07-28T00:00:00.000Z",
-		children: [],
-		seq,
-	} as unknown as TreeMessage;
+	return rowWithElements(
+		{
+			id: `drift-m${seq}`,
+			narratorId: "n1",
+			parentToolUseId: null,
+			role: "assistant",
+			contentText: "词".repeat(60),
+			toolCalls: [],
+			createdAt: "2026-07-28T00:00:00.000Z",
+			seq,
+		},
+		[{ type: "text", text: "词".repeat(60) }],
+	) as unknown as TreeMessage;
 }
 
 /**

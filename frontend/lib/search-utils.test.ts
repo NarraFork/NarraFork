@@ -4,10 +4,12 @@ import {
 	formatSearchTotal,
 	highlightSearchText,
 	normalizeSearchInclude,
+	normalizeSearchPage,
 	normalizeSearchRange,
 	normalizeSearchSort,
 	normalizeSearchTab,
 	searchHighlightTerms,
+	searchPageCount,
 	searchRangeStart,
 } from "./search-utils";
 
@@ -79,6 +81,24 @@ describe("formatSearchTotal", () => {
 		expect(formatSearchTotal({ total: 12, totalIsLowerBound: false })).toBe("12");
 		expect(formatSearchTotal({ total: 1000, totalIsLowerBound: true })).toBe("1000+");
 		expect(formatSearchTotal(undefined)).toBe("0");
+	});
+});
+
+describe("pages", () => {
+	test("read a page number from the URL, the first page as undefined", () => {
+		expect(normalizeSearchPage("3")).toBe(3);
+		expect(normalizeSearchPage(7)).toBe(7);
+		for (const value of [undefined, "", "1", "0", "-2", "2.5", "x"]) {
+			expect(normalizeSearchPage(value)).toBeUndefined();
+		}
+		expect(normalizeSearchPage("99999999")).toBe(10_000);
+	});
+
+	test("count the pages a total fills", () => {
+		expect(searchPageCount(undefined, 20)).toBe(1);
+		expect(searchPageCount({ total: 0 }, 20)).toBe(1);
+		expect(searchPageCount({ total: 20 }, 20)).toBe(1);
+		expect(searchPageCount({ total: 1021 }, 20)).toBe(52);
 	});
 });
 

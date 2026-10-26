@@ -38,8 +38,8 @@ const RAW_BODY_ACCESS: Record<string, { count: number; why: string }> = {
 	// The body layer.
 	"server/services/narrator-body-writes.ts": { count: 6, why: "body writes" },
 	"server/services/narrator-block-sync.ts": {
-		count: 3,
-		why: "the dual-write audit, column resync",
+		count: 4,
+		why: "the dual-write audit, column resync, the queued sync's column hash",
 	},
 	"server/lib/narrator-bodies.ts": { count: 6, why: "body reads off the main thread" },
 	"server/services/narrator-body-reads.ts": { count: 1, why: "envelope row size" },

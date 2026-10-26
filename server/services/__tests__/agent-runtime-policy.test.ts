@@ -12,9 +12,7 @@ import {
 } from "../agent-runtime/policy";
 import {
 	assertRuntimeCanAwaitAgent,
-	assertRuntimeCanSendAwait,
 	SUBAGENT_AGENT_AWAIT_FORBIDDEN_ERROR,
-	SUBAGENT_SEND_ASYNC_ONLY_ERROR,
 } from "../subagent-communication-policy";
 import { resolveToolFilter, runtimeToolFilter } from "../subagent-tools";
 
@@ -92,13 +90,11 @@ describe("shared capability projections", () => {
 			const awaitProperties = awaitTool.getRawJsonSchema?.(config).properties as {
 				type: { enum: string[] };
 			};
-			expect(Boolean(sendProperties.await)).toBe(policy.capabilities.sendAwait);
+			expect(sendProperties.await).toBeUndefined();
 			expect(awaitProperties.type.enum).toEqual(runtimeAwaitTargets(policy));
 			expect(awaitProperties.type.enum).toContain("question");
-			const sendGuard = () => assertRuntimeCanSendAwait(policy, true);
 			const awaitGuard = () => assertRuntimeCanAwaitAgent(policy);
 			if (child) {
-				expect(sendGuard).toThrow(SUBAGENT_SEND_ASYNC_ONLY_ERROR);
 				expect(awaitGuard).toThrow(SUBAGENT_AGENT_AWAIT_FORBIDDEN_ERROR);
 				// Subagents cannot ask the user at all — even a custom definition that
 				// explicitly lists AskUserQuestion (the last profile) is gated off.
@@ -110,7 +106,6 @@ describe("shared capability projections", () => {
 				expect(runtimeInteractionHint(policy, "en")).toContain("AskUserQuestion is unavailable");
 				expect(runtimeInteractionHint(policy, "zh-CN")).toContain("不可调用 AskUserQuestion");
 			} else {
-				expect(sendGuard).not.toThrow();
 				expect(awaitGuard).not.toThrow();
 				expect(runtimeInteractionHint(policy, "en")).toBe("");
 			}
@@ -187,12 +182,6 @@ describe("shared capability projections", () => {
 			runtimePolicy: policyOf(template("general")),
 			signal: new AbortController().signal,
 		} as ToolContext;
-		expect(
-			sendTool.parameters.safeParse({ id: "sibling", message: "hello", await: true }).success,
-		).toBe(true);
-		const send = await sendTool.execute({ id: "sibling", message: "hello", await: true }, ctx);
-		expect(send.isError).toBe(true);
-		expect(send.output).toContain(SUBAGENT_SEND_ASYNC_ONLY_ERROR);
 		expect(awaitTool.parameters.safeParse({ type: "agent", id: "sibling" }).success).toBe(true);
 		const result = await awaitTool.execute({ type: "agent", id: "sibling" }, ctx);
 		expect(result.isError).toBe(true);

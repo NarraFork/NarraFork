@@ -31,9 +31,10 @@ import type { Locale } from "../lib/prompt-i18n";
 import { FOLLOW_DEFAULT_MODEL } from "../lib/settings";
 import { broadcastToNarrator } from "../websocket/narrator-ws";
 import {
-	flushChangedEnvelopes,
+	flushQueuedSince,
 	newEnvelopeColumns,
 	newEnvelopeFormat,
+	syncQueueMark,
 } from "./narrator-block-sync";
 import { bodyColumns, fillBodies } from "./narrator-body-reads";
 import { insertEnvelope, insertEnvelopeQueued } from "./narrator-body-writes";
@@ -182,6 +183,7 @@ export async function extractSubagentToPrimary(
 	const newNarrator = await withWorkspaceAdmission(admissionTargets, async () =>
 		withSeqFloorRaiseScope(() =>
 			db.transaction((tx) => {
+				const queueMark = syncQueueMark();
 				const created = tx
 					.insert(narrators)
 					.values({
@@ -332,7 +334,7 @@ export async function extractSubagentToPrimary(
 				}
 
 				initializeRefSeqFloor(tx, id);
-				flushChangedEnvelopes();
+				flushQueuedSince(queueMark);
 				return created;
 			}),
 		),

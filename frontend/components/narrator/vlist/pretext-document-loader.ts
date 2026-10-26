@@ -1,6 +1,7 @@
 import { narratorsApi } from "@frontend/lib/api/narrators";
 import type { PretextDocumentPageResult, TreeMessage } from "@frontend/lib/api/types";
 import { narratorLoadingMetrics } from "@frontend/lib/narrator-loading-metrics";
+import { isNestedRow } from "../message/nested-rows";
 import { peekCachedPretextDocument } from "./pretext-document-cache";
 import { onPretextSessionChange, pretextSessionEpoch } from "./pretext-session-scope";
 
@@ -101,7 +102,7 @@ function oldestSeqOf(messages: readonly TreeMessage[]): number | null {
 	let min: number | null = null;
 	for (const message of messages) {
 		const seq = typeof message.seq === "number" ? message.seq : null;
-		if (seq == null) continue;
+		if (seq == null || isNestedRow(message)) continue;
 		if (min == null || seq < min) min = seq;
 	}
 	return min;
@@ -426,8 +427,9 @@ export async function refreshPretextDocumentWindow(
 				if (page.messages[0]?.id !== firstId) return undefined;
 				hasPrev = page.hasPrev;
 			}
-			if (!Number.isFinite(pageBytes) || pageBytes < 0 || page.messages.length > 100)
-				return undefined;
+			// The page limit counts the conversation's rows, not the rows nested under them.
+			const pageRows = page.messages.filter((message) => !isNestedRow(message)).length;
+			if (!Number.isFinite(pageBytes) || pageBytes < 0 || pageRows > 100) return undefined;
 			if (
 				page.messages.length > 0 &&
 				(page.minSeq == null ||

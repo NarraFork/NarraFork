@@ -13,6 +13,8 @@ import {
 } from "../narrator-panel-types";
 
 export const COMPOSER_FILE_INGEST_TIMEOUT_MS = 5000;
+/** Browsers repeat dragover while a drag hovers the zone; silence this long means it left. */
+export const COMPOSER_DRAG_IDLE_MS = 1000;
 /** Structural contract: ingestion must not depend on the editor implementation. */
 export type AttachmentInsertionBookmark = { restore(): boolean; cancel(): void };
 export type AttachmentInsertionOrigin = "picker" | "paste" | "drop" | "direct";
@@ -89,10 +91,42 @@ export function useComposerFileIngest(options: UseComposerFileIngestOptions) {
 		}
 	}
 	scopeRef.current.sending = sending;
-	const resetDrag = () => {
+	const dragIdleTimerRef = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+	const resetDragRef = useRef(() => {});
+	resetDragRef.current = () => {
+		clearTimeout(dragIdleTimerRef.current);
+		dragIdleTimerRef.current = undefined;
 		optionsRef.current.dragCounterRef.current = 0;
 		optionsRef.current.setIsDragging(false);
 	};
+	const resetDrag = () => resetDragRef.current();
+	// A dragleave that never reaches the zone (target unmounted, portal, native
+	// stopPropagation, drag cancelled outside the window) must not pin the overlay.
+	const armDragIdle = () => {
+		clearTimeout(dragIdleTimerRef.current);
+		dragIdleTimerRef.current = setTimeout(() => resetDragRef.current(), COMPOSER_DRAG_IDLE_MS);
+	};
+	useEffect(() => {
+		const reset = () => {
+			if (optionsRef.current.dragCounterRef.current || dragIdleTimerRef.current)
+				resetDragRef.current();
+		};
+		const onVisibility = () => {
+			if (document.visibilityState === "hidden") reset();
+		};
+		window.addEventListener("drop", reset, true);
+		window.addEventListener("dragend", reset, true);
+		window.addEventListener("blur", reset);
+		document.addEventListener("visibilitychange", onVisibility);
+		return () => {
+			window.removeEventListener("drop", reset, true);
+			window.removeEventListener("dragend", reset, true);
+			window.removeEventListener("blur", reset);
+			document.removeEventListener("visibilitychange", onVisibility);
+			clearTimeout(dragIdleTimerRef.current);
+			dragIdleTimerRef.current = undefined;
+		};
+	}, []);
 	const alive = (batch: IngestBatch) =>
 		mountedRef.current &&
 		batch.generation === scopeRef.current.generation &&
@@ -274,6 +308,13 @@ export function useComposerFileIngest(options: UseComposerFileIngestOptions) {
 		void ingestRef.current(files, "picker");
 	}, []);
 	const isFileDrag = (event: React.DragEvent) => event.dataTransfer.types.includes("Files");
+	// relatedTarget is the node on the other side of the boundary. Moves between our own
+	// descendants are not boundary crossings; only a null relatedTarget (left the window,
+	// or a browser that omits it) falls back to enter/leave counting.
+	const relatedInside = (event: React.DragEvent) => {
+		const related = event.relatedTarget as Node | null;
+		return !!related && event.currentTarget.contains(related);
+	};
 	return {
 		ingestFiles,
 		addImages,
@@ -288,24 +329,38 @@ export function useComposerFileIngest(options: UseComposerFileIngestOptions) {
 				event.preventDefault();
 				event.stopPropagation();
 				if (optionsRef.current.sendingRef?.current) return;
-				optionsRef.current.dragCounterRef.current++;
+				if (!relatedInside(event) || !optionsRef.current.dragCounterRef.current)
+					optionsRef.current.dragCounterRef.current++;
 				optionsRef.current.setIsDragging(true);
+				armDragIdle();
 			},
 			onDragLeave: (event: React.DragEvent) => {
 				if (!isFileDrag(event)) return;
 				event.preventDefault();
 				event.stopPropagation();
+				if (relatedInside(event)) return;
+				if (event.relatedTarget) {
+					resetDrag();
+					return;
+				}
 				optionsRef.current.dragCounterRef.current = Math.max(
 					0,
 					optionsRef.current.dragCounterRef.current - 1,
 				);
-				if (!optionsRef.current.dragCounterRef.current) optionsRef.current.setIsDragging(false);
+				if (!optionsRef.current.dragCounterRef.current) resetDrag();
 			},
 			onDragOver: (event: React.DragEvent) => {
 				if (!isFileDrag(event)) return;
 				event.preventDefault();
 				event.stopPropagation();
-				event.dataTransfer.dropEffect = optionsRef.current.sendingRef?.current ? "none" : "copy";
+				const locked = !!optionsRef.current.sendingRef?.current;
+				event.dataTransfer.dropEffect = locked ? "none" : "copy";
+				if (locked) return;
+				if (!optionsRef.current.dragCounterRef.current) {
+					optionsRef.current.dragCounterRef.current = 1;
+					optionsRef.current.setIsDragging(true);
+				}
+				armDragIdle();
 			},
 			onDrop: (event: React.DragEvent) => {
 				if (!isFileDrag(event)) return;

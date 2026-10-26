@@ -1,5 +1,5 @@
 import { type QueryClient, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { type ApiError, api, clearToken, getToken, setToken } from "../lib/api";
+import { type ApiError, api, endSession, getToken, setToken } from "../lib/api";
 import { isMfaChallenge, type LoginResult, type LoginSession } from "../lib/api/auth";
 import { assetUrl } from "../lib/base-path";
 import { changeAppLanguage, getNamespacesForPath } from "../lib/i18n";
@@ -79,7 +79,7 @@ export function useLogout() {
 	const qc = useQueryClient();
 	return {
 		logout: () => {
-			clearToken();
+			endSession();
 			qc.clear();
 			// Mount-prefixed: a rooted "/login" leaves the app entirely when NarraFork is
 			// served from a subpath, so logging out would navigate to the proxy's root

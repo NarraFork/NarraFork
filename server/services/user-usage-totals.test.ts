@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { apiRequests, narrators, users, userUsageTotals } from "@server/db/schema";
+import { TOKEN_ACCOUNTING_VERSION } from "@shared/token-accounting";
 import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../tests/setup";
 import { insertApiRequestWithUserUsage, listUserUsageTotals } from "./user-usage-totals";
@@ -19,6 +20,46 @@ function record(
 }
 
 describe("durable user usage", () => {
+	test("new requests stamp the current accounting version without relabeling legacy rows", () => {
+		db.insert(apiRequests)
+			.values({ id: "legacy", createdAt: at, inputTokens: 1000, cachedInputTokens: 800 })
+			.run();
+		expect(record("legacy")).toBe(false);
+		expect(db.select().from(apiRequests).where(eq(apiRequests.id, "legacy")).get()).toMatchObject({
+			tokenAccountingVersion: null,
+			inputTokens: 1000,
+			cachedInputTokens: 800,
+		});
+		for (const version of [undefined, null, 0, 999]) {
+			const id = `current-${version}`;
+			record(id, null, {
+				tokenAccountingVersion: version,
+				inputTokens: 200,
+				cachedInputTokens: 800,
+				cacheCreationInputTokens: 50,
+			});
+			expect(db.select().from(apiRequests).where(eq(apiRequests.id, id)).get()).toMatchObject({
+				tokenAccountingVersion: TOKEN_ACCOUNTING_VERSION,
+				inputTokens: 200,
+				cachedInputTokens: 800,
+				cacheCreationInputTokens: 50,
+			});
+		}
+	});
+
+	test("pending accounting range pagination uses the partial chronological index", () => {
+		const plan = sqlite
+			.query(
+				`EXPLAIN QUERY PLAN SELECT id FROM api_requests
+				 WHERE token_accounting_version IS NULL
+				 AND (created_at, id) > (?, ?) AND created_at <= ?
+				 ORDER BY created_at, id LIMIT 101`,
+			)
+			.all(at, "cursor", "2026-10-01T00:00:00.000Z");
+		expect(JSON.stringify(plan)).toContain("idx_api_requests_token_accounting_pending");
+		expect(JSON.stringify(plan)).not.toContain("USE TEMP B-TREE");
+	});
+
 	test("unknown, partial, and explicit free costs survive rollup", () => {
 		record("unknown", "alice", { costStatus: "unknown", costUsd: null });
 		expect(listUserUsageTotals(50, undefined, db).records[0]?.costStatus).toBe("unknown");

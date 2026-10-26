@@ -16,10 +16,10 @@ NarraFork 可作为 OAuth 2.0 Authorization Server。外部应用通过 Authoriz
 
 | 身份 | 用途 | 可访问范围 |
 |---|---|---|
-| Session JWT | NarraFork 第一方 Web UI 和管理操作 | 普通 `/api/*`、管理员路由、内部 WebSocket |
+| 会话令牌（`nfs_`） | NarraFork 第一方 Web UI 和管理操作 | 普通 `/api/*`、管理员路由、内部 WebSocket |
 | OAuth access token | 第三方应用 | `/api/external/v1/*` |
 
-OAuth token 不能访问普通项目、管理员、设置或内部叙述者 API，也不能用于同意新的 OAuth 授权。Session JWT 不能调用 External API v1。
+OAuth token 不能访问普通项目、管理员、设置或内部叙述者 API，也不能用于同意新的 OAuth 授权。会话令牌不能调用 External API v1。
 
 ### 1.2 授权交集
 

@@ -3,17 +3,16 @@
  * and the second factor.
  *
  * After a password check succeeds for a user who has a second factor enabled,
- * we do NOT issue the real session JWT. Instead we issue an MFA challenge token
+ * we do NOT issue a session token. Instead we issue an MFA challenge token
  * (`stage: "mfa_pending"`) that only authorizes calling `/auth/mfa/verify`.
- * Once the second factor is proven, the real JWT is minted.
+ * Once the second factor is proven, a session token is issued.
  *
  * This module is shared infrastructure: TOTP is the first consumer, but passkey
  * (phase 2) second-factor verification reuses the exact same challenge token.
  *
  * Security properties:
- * - Signed with the same secret as session JWTs, but carries a distinct
- *   `stage` claim so it can never be used as a session token (the main
- *   `verifyToken` rejects any token carrying a `stage` claim).
+ * - A JWT signed with `auth.jwtSecret`, so it can never be used as a session
+ *   token: `verifyToken` only accepts opaque `nfs_` session tokens.
  * - Short TTL (5 minutes).
  * - Single-use: a `jti` is recorded as consumed on successful verify so the
  *   token cannot be replayed.

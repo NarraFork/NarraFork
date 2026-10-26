@@ -1,4 +1,4 @@
-import { useInfiniteQuery, useQuery } from "@tanstack/react-query";
+import { keepPreviousData, useInfiniteQuery, useQuery } from "@tanstack/react-query";
 import { api, type SearchRequest, type SearchSectionName } from "../lib/api";
 import { searchParams } from "../lib/api/misc";
 
@@ -13,7 +13,12 @@ export const SESSION_HITS_PAGE_LIMIT = 20;
 
 /** Cache identity of a request: its query string, without paging. */
 function requestKey(request: SearchRequest): string {
-	return searchParams({ ...request, cursor: undefined, limit: undefined }).toString();
+	return searchParams({
+		...request,
+		cursor: undefined,
+		page: undefined,
+		limit: undefined,
+	}).toString();
 }
 
 const SEARCH_CACHE = { staleTime: 30_000, gcTime: 60_000 } as const;
@@ -34,18 +39,19 @@ export function useSearchOverview(request: SearchRequest) {
 	});
 }
 
-/** One section, paged with its cursor. */
+/** One page (1-based) of one section; the previous page stays shown while the next loads. */
 export function useSearchSection(
 	request: SearchRequest,
 	section: SearchSectionName,
+	page: number,
 	enabled: boolean,
 ) {
 	const q = request.q.trim();
-	return useInfiniteQuery({
-		queryKey: ["search", "section", section, requestKey({ ...request, q })],
-		queryFn: async ({ pageParam, signal }) => {
+	return useQuery({
+		queryKey: ["search", "section", section, requestKey({ ...request, q }), page],
+		queryFn: async ({ signal }) => {
 			const response = await api.searchSections(
-				{ ...request, q, cursor: pageParam, limit: SEARCH_PAGE_LIMIT },
+				{ ...request, q, page, limit: SEARCH_PAGE_LIMIT },
 				[section],
 				signal,
 			);
@@ -58,8 +64,7 @@ export function useSearchSection(
 				}
 			);
 		},
-		initialPageParam: undefined as string | undefined,
-		getNextPageParam: (page) => page.nextCursor ?? undefined,
+		placeholderData: keepPreviousData,
 		enabled: enabled && q.length > 0,
 		...SEARCH_CACHE,
 	});

@@ -1,4 +1,3 @@
-import { randomUUID } from "node:crypto";
 import type { FileReferenceContext } from "@shared/file-reference";
 import { normalizeFileReferenceContext } from "@shared/file-reference-context";
 import { type ExecutionBackend, LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
@@ -27,75 +26,40 @@ export function getAgentFileReferenceContext(
 	});
 }
 
-/** One context per provider text lane, including null when its source was unknown. */
+/**
+ * One context per streamed text element, including null when its source was unknown. Keyed
+ * by the element id every delta carries: ids survive checkpoints, while a provider can reuse
+ * an output index for a later element, which must never inherit an earlier element's device.
+ */
 export class FileReferenceContextTracker {
-	private readonly contexts = new Map<number | undefined, FileReferenceContext | null>();
-	private readonly blockIds = new Map<number | undefined, string>();
-	// Loop IDs survive checkpoints. Provider lane indices can be reused by a later
-	// block/attempt and must never inherit the previous block's device.
-	private readonly identifiedContexts = new Map<string, FileReferenceContext | null>();
+	private readonly contexts = new Map<string, FileReferenceContext | null>();
 
-	/** A new round may reuse the provider index before the UI retires the old lane. */
-	blockId(outputIndex: number | undefined): string | undefined {
-		return this.blockIds.get(outputIndex);
-	}
-
-	capture(
-		outputIndex: number | undefined,
-		getContext?: () => FileReferenceContext | null | undefined,
-		blockId?: string,
-	) {
-		const contexts: Map<string | number | undefined, FileReferenceContext | null> = blockId
-			? this.identifiedContexts
-			: this.contexts;
-		const key = blockId ?? outputIndex;
-		if (!contexts.has(key)) {
+	/** The element's context, read from `getContext` at its first delta only. */
+	capture(blockId: string, getContext?: () => FileReferenceContext | null | undefined) {
+		if (!this.contexts.has(blockId)) {
 			let context: FileReferenceContext | null = null;
 			try {
 				context = normalizeFileReferenceContext(getContext?.());
 			} catch {
 				// Location metadata is optional; an unavailable source must not lose tokens.
 			}
-			contexts.set(key, context ? Object.freeze(context) : null);
-			if (!blockId) this.blockIds.set(outputIndex, randomUUID());
+			this.contexts.set(blockId, context ? Object.freeze(context) : null);
 		}
-		return contexts.get(key) ?? null;
+		return this.contexts.get(blockId) ?? null;
 	}
 
-	/** A provider can emit several output items which the loop later combines. */
-	hasDifferentContexts(): boolean {
-		const first = this.contexts.values().next().value;
-		for (const context of this.contexts.values()) {
-			if (context?.deviceId !== first?.deviceId || context?.cwd !== first?.cwd) return true;
-		}
-		return false;
-	}
-
-	/** Read without retiring a legacy lane before its durable publication succeeds. */
-	peek(outputIndex: number | undefined, blockId?: string): FileReferenceContext | null {
-		return blockId
-			? (this.identifiedContexts.get(blockId) ?? null)
-			: (this.contexts.get(outputIndex) ?? null);
-	}
-
-	complete(outputIndex: number | undefined): FileReferenceContext | null {
-		const context = this.contexts.get(outputIndex) ?? null;
-		this.contexts.delete(outputIndex);
-		this.blockIds.delete(outputIndex);
-		return context;
+	/** A completed element's context; one without an element id has none to claim. */
+	peek(blockId: string | undefined): FileReferenceContext | null {
+		return blockId ? (this.contexts.get(blockId) ?? null) : null;
 	}
 
 	/** Non-streaming/fallback messages cannot safely reconstruct a context at turn end. */
 	fallback(): FileReferenceContext | null {
-		if (this.contexts.size + this.identifiedContexts.size !== 1) return null;
-		return (
-			this.contexts.values().next().value ?? this.identifiedContexts.values().next().value ?? null
-		);
+		if (this.contexts.size !== 1) return null;
+		return this.contexts.values().next().value ?? null;
 	}
 
 	clear(): void {
 		this.contexts.clear();
-		this.blockIds.clear();
-		this.identifiedContexts.clear();
 	}
 }

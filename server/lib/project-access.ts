@@ -15,7 +15,7 @@ import {
 	type ProjectAclRow,
 	type ProjectPrincipal,
 } from "../services/project-acl";
-import type { JwtPayload } from "./auth";
+import type { SessionPayload } from "./auth";
 
 /**
  * The requesting principal, taken from the verified session/OAuth payload.
@@ -26,7 +26,7 @@ import type { JwtPayload } from "./auth";
  * that hides the real problem.
  */
 export function projectPrincipalOf(c: Context): ProjectPrincipal {
-	const user = c.get("user") as JwtPayload | undefined;
+	const user = c.get("user") as SessionPayload | undefined;
 	if (!user?.sub) return { userId: "", isAdmin: false };
 	return { userId: user.sub, isAdmin: user.role === "admin" };
 }

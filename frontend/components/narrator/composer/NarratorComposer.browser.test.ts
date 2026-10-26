@@ -262,14 +262,26 @@ test("20 real message selections keep main composer geometry, message scroll and
 		expect(initial.scrollTop).toBeGreaterThan(0);
 		for (let i = 0; i < 20; i++) {
 			await page.evaluate(() => (window as unknown as FixtureWindow).fixture.selectSource());
-			await page.waitForSelector("[data-inline-quote-candidate]", { visible: true });
+			await page.waitForSelector("[data-quote-candidate]", { visible: true });
 			const selected = await geometry(page);
-			expect(
-				await page.$eval(
-					"[data-inline-quote-candidate]",
-					(node) => !!node.closest('[data-inline-composer] [role="textbox"]'),
-				),
-			).toBe(true);
+			// Floating outside the composer, beside (never over) the selected text.
+			const button = await page.$eval("[data-quote-candidate]", (node) => {
+				const rect = node.getBoundingClientRect();
+				const source = window.getSelection()?.getRangeAt(0).getBoundingClientRect();
+				const composer = document.querySelector("[data-inline-composer]")?.getBoundingClientRect();
+				return {
+					inComposer: !!node.closest("[data-inline-composer]"),
+					position: getComputedStyle(node).position,
+					overlapsSelection: !!source && rect.bottom > source.top && rect.top < source.bottom,
+					aboveComposer: !!composer && rect.bottom <= composer.top,
+				};
+			});
+			expect(button).toEqual({
+				inComposer: false,
+				position: "fixed",
+				overlapsSelection: false,
+				aboveComposer: true,
+			});
 			expect((await snapshot(page)).document).toBeUndefined();
 			expect(Math.abs(selected.rowTop - initial.rowTop)).toBeLessThanOrEqual(1);
 			expect(Math.abs(selected.rowHeight - initial.rowHeight)).toBeLessThanOrEqual(1);
@@ -277,11 +289,11 @@ test("20 real message selections keep main composer geometry, message scroll and
 			expect(selected.scrollTop).toBe(initial.scrollTop);
 			expect(selected.selection).toContain("Select this source text");
 			await page.evaluate(() => (window as unknown as FixtureWindow).fixture.clearSelection());
-			await page.waitForSelector("[data-inline-quote-candidate]", { hidden: true });
+			await page.waitForSelector("[data-quote-candidate]", { hidden: true });
 		}
 		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.selectSource());
-		await page.waitForSelector("[data-inline-quote-candidate]", { visible: true });
-		await page.click("[data-inline-quote-candidate] button");
+		await page.waitForSelector("[data-quote-candidate]", { visible: true });
+		await page.click("[data-quote-candidate] button");
 		await settle(page);
 		expect(
 			(await snapshot(page)).document?.paragraphs[0].children.some((node) => node.type === "quote"),
@@ -937,19 +949,32 @@ function nodeCount(doc: ComposerDocument | undefined, type: string) {
 			.length ?? 0
 	);
 }
+/** Where the floating quote toolbar sits, relative to the selection and composer. */
+function quoteButtonLayout(page: Page) {
+	return page.$eval("[data-quote-candidate]", (node) => {
+		const rect = node.getBoundingClientRect();
+		const composer = document.querySelector("[data-inline-composer]")?.getBoundingClientRect();
+		const selection = window.getSelection()?.getRangeAt(0).getBoundingClientRect();
+		if (!composer || !selection) throw new Error("Missing composer or selection");
+		return {
+			placement: node.getAttribute("data-placement"),
+			gapBelowSelection: Math.round(rect.top - selection.bottom),
+			aboveComposer: rect.bottom <= composer.top,
+			height: rect.height,
+		};
+	});
+}
 async function selectQuotableSource(page: Page) {
 	await page.evaluate(() => (window as unknown as FixtureWindow).fixture.selectSource());
-	await page.waitForSelector("[data-inline-quote-candidate]", { visible: true });
+	await page.waitForSelector("[data-quote-candidate]", { visible: true });
 }
 
 test("a live selected message is quoted once with Tab, not Alt+Q or modified Tab", async () => {
 	const page = await open();
 	try {
 		await selectQuotableSource(page);
-		expect(await page.$eval("[data-inline-quote-candidate] kbd", (node) => node.textContent)).toBe(
-			"Tab",
-		);
-		const shortcut = await page.$eval("[data-inline-quote-candidate]", (candidate) => {
+		expect(await page.$eval("[data-quote-candidate] kbd", (node) => node.textContent)).toBe("Tab");
+		const shortcut = await page.$eval("[data-quote-candidate]", (candidate) => {
 			const button = candidate.querySelector("button");
 			const keycap = button?.querySelector("kbd");
 			const action = button?.querySelector("[data-quote-action]");
@@ -1003,7 +1028,7 @@ test("a live selected message is quoted once with Tab, not Alt+Q or modified Tab
 			type: "quote",
 			anchor: "m:message-source",
 		});
-		expect(await page.$("[data-inline-quote-candidate]")).toBeNull();
+		expect(await page.$("[data-quote-candidate]")).toBeNull();
 		expect(await page.evaluate(() => document.activeElement?.getAttribute("role"))).toBe("textbox");
 		await page.keyboard.press("Tab");
 		await settle(page);
@@ -1012,6 +1037,93 @@ test("a live selected message is quoted once with Tab, not Alt+Q or modified Tab
 		await close(page);
 	}
 });
+
+async function openAsk(page: Page) {
+	await selectQuotableSource(page);
+	await page.click("[data-quote-ask]");
+	await page.waitForSelector('[data-quote-candidate][data-mode="ask"] input', { visible: true });
+	expect(await page.evaluate(() => document.activeElement?.tagName)).toBe("INPUT");
+}
+const askedQuote = {
+	label: "Select this source text to quote without changing the message…",
+	text: "Select this source text to quote without changing the message layout.",
+	anchor: "m:message-source",
+};
+
+test("顺便提问 from a selection forks at the source message with the excerpt quoted", async () => {
+	const page = await open();
+	try {
+		await openAsk(page);
+		// Focus left the message list; the toolbar keeps the question's selection and
+		// paints it in place, since the native highlight went with the focus.
+		await settle(page);
+		expect(await page.$('[data-quote-candidate][data-mode="ask"]')).not.toBeNull();
+		const askedHighlight = () =>
+			page.evaluate(() => {
+				const highlight = CSS.highlights.get("nf-ask-selection");
+				const [range] = highlight ? [...highlight] : [];
+				return range instanceof Range ? range.toString() : null;
+			});
+		expect(await askedHighlight()).toBe(askedQuote.text);
+		await page.keyboard.type("Why does this matter?");
+		await page.keyboard.press("Enter");
+		await page.waitForSelector("[data-quote-candidate]", { hidden: true });
+		expect(await askedHighlight()).toBeNull();
+		const state = await snapshot(page);
+		expect(state.asked).toEqual([
+			{
+				sourceMessageId: "message-source",
+				quote: expect.objectContaining({ text: askedQuote.text, anchor: askedQuote.anchor }),
+				question: "Why does this matter?",
+			},
+		]);
+		// Asking never quotes into the main composer.
+		expect(nodeCount(state.document, "quote")).toBe(0);
+	} finally {
+		await close(page);
+	}
+});
+
+test("an empty 顺便提问 asks about the excerpt directly; Escape and failures keep the composer", async () => {
+	const page = await open();
+	try {
+		await openAsk(page);
+		await page.keyboard.press("Enter");
+		await page.waitForSelector("[data-quote-candidate]", { hidden: true });
+		expect((await snapshot(page)).asked.map((input) => input.question)).toEqual([
+			"Explain this excerpt.",
+		]);
+
+		await openAsk(page);
+		await page.keyboard.type("never sent");
+		// Escape steps back to the still-live selection's actions; ✕ dismisses them.
+		await page.keyboard.press("Escape");
+		await page.waitForSelector('[data-quote-candidate][data-mode="actions"]', { visible: true });
+		await page.click("[data-quote-dismiss]");
+		await page.waitForSelector("[data-quote-candidate]", { hidden: true });
+		expect((await snapshot(page)).asked).toHaveLength(1);
+		// A dismissed selection is offered again only once it changed: let the clear settle.
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.clearSelection());
+		await Bun.sleep(250);
+
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.failAsk("boom"));
+		await openAsk(page);
+		await page.keyboard.type("fails");
+		await page.keyboard.press("Enter");
+		await settle(page);
+		// The question survives a failed request for a retry.
+		expect(
+			await page.$eval(
+				'[data-quote-candidate][data-mode="ask"] input',
+				(input) => (input as HTMLInputElement).value,
+			),
+		).toBe("fails");
+		expect((await snapshot(page)).asked).toHaveLength(2);
+	} finally {
+		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.failAsk(null));
+		await close(page);
+	}
+}, 15_000);
 
 test("normal input Tab is not captured by a stale message quote candidate", async () => {
 	const page = await open();
@@ -1051,33 +1163,39 @@ test("touch and pen selections hide shortcut hints; mouse on the same touch-capa
 		});
 		await page.touchscreen.tap(source.x, source.y);
 		await selectQuotableSource(page);
-		expect(await page.$("[data-inline-quote-candidate] kbd")).toBeNull();
+		expect(await page.$("[data-quote-candidate] kbd")).toBeNull();
 		expect(
-			await page.$eval("[data-inline-quote-candidate]", (element) =>
-				element.getAttribute("aria-label"),
-			),
+			await page.$eval("[data-quote-candidate]", (element) => element.getAttribute("aria-label")),
 		).not.toContain("Tab");
+		// Below the selection, past its handles; the platform menu owns the space above.
+		expect(await quoteButtonLayout(page)).toEqual({
+			placement: "touch",
+			gapBelowSelection: 30,
+			aboveComposer: true,
+			height: 38,
+		});
 		await page.mouse.click(source.x, source.y);
 		await selectQuotableSource(page);
-		await page.waitForSelector("[data-inline-quote-candidate] kbd");
-		expect(
-			await page.$eval("[data-inline-quote-candidate] kbd", (element) => element.textContent),
-		).toBe("Tab");
+		await page.waitForSelector("[data-quote-candidate] kbd");
+		expect(await page.$eval("[data-quote-candidate] kbd", (element) => element.textContent)).toBe(
+			"Tab",
+		);
+		expect((await quoteButtonLayout(page)).placement).toBe("selection");
 		await page.evaluate(() =>
 			document
 				.getElementById("quote-source")
 				?.dispatchEvent(new PointerEvent("pointerdown", { pointerType: "pen", bubbles: true })),
 		);
 		await settle(page);
-		expect(await page.$("[data-inline-quote-candidate] kbd")).toBeNull();
+		expect(await page.$("[data-quote-candidate] kbd")).toBeNull();
 		await page.evaluate(() =>
 			document.body.dispatchEvent(
 				new KeyboardEvent("keydown", { key: "Process", isComposing: true, bubbles: true }),
 			),
 		);
 		await settle(page);
-		expect(await page.$("[data-inline-quote-candidate] kbd")).toBeNull();
-		const button = await page.$eval("[data-inline-quote-candidate] button", (element) => {
+		expect(await page.$("[data-quote-candidate] kbd")).toBeNull();
+		const button = await page.$eval("[data-quote-candidate] button", (element) => {
 			const rect = element.getBoundingClientRect();
 			return { x: rect.x + 20, y: rect.y + rect.height / 2 };
 		});
@@ -1094,7 +1212,7 @@ test("a Monaco selection has no global quote popup and its Tab is never consumed
 	try {
 		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.publishFileSelection());
 		await settle(page);
-		expect(await page.$("[data-inline-quote-candidate]")).toBeNull();
+		expect(await page.$("[data-quote-candidate]")).toBeNull();
 		await page.evaluate(() => {
 			const source = document.getElementById("file-selection-source");
 			source?.addEventListener("keydown", (event) => {
@@ -1154,7 +1272,7 @@ test("file selection metadata still supports explicit #selection completion with
 	try {
 		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.publishFileSelection());
 		await settle(page);
-		expect(await page.$("[data-inline-quote-candidate]")).toBeNull();
+		expect(await page.$("[data-quote-candidate]")).toBeNull();
 		await loadDocument(page, textDocument("#selection"));
 		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.nativeSelection(11));
 		await page.waitForSelector("[data-file-reference-item]");
@@ -1223,9 +1341,9 @@ test("touch-to-mouse dismiss does not move the close target during pointerdown",
 		});
 		await page.touchscreen.tap(source.x, source.y);
 		await selectQuotableSource(page);
-		expect(await page.$("[data-inline-quote-candidate] kbd")).toBeNull();
+		expect(await page.$("[data-quote-candidate] kbd")).toBeNull();
 		const closePoint = () =>
-			page.$eval("[data-inline-quote-candidate] > button:last-child", (element) => {
+			page.$eval("[data-quote-candidate] > button:last-child", (element) => {
 				const rect = element.getBoundingClientRect();
 				return { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 };
 			});
@@ -1236,7 +1354,7 @@ test("touch-to-mouse dismiss does not move the close target during pointerdown",
 		expect(await closePoint()).toEqual(before);
 		await page.mouse.up();
 		await settle(page);
-		expect(await page.$("[data-inline-quote-candidate]")).toBeNull();
+		expect(await page.$("[data-quote-candidate]")).toBeNull();
 		expect(nodeCount((await snapshot(page)).document, "quote")).toBe(0);
 	} finally {
 		await close(page);
@@ -1895,15 +2013,14 @@ test("reusing the mounted composer never exposes the previous account's live or 
 
 for (const width of [1440, 390]) {
 	for (const scheme of ["light", "dark"] as const) {
-		test(`${width}px ${scheme}: quote confirmation keeps chip typography and vertical alignment`, async () => {
+		test(`${width}px ${scheme}: floating quote button keeps the composer still and aligns its content`, async () => {
 			const page = await open();
 			try {
 				await page.setViewport({ width, height: 844 });
 				await page.evaluate((theme) => {
 					document.documentElement.setAttribute("data-mantine-color-scheme", theme);
 				}, scheme);
-				await selectQuotableSource(page);
-				const settleChipLayout = async () => {
+				const settleLayout = async () => {
 					await settle(page);
 					// Measure settled geometry, not an intermediate frame of the adaptive layout.
 					await page.waitForFunction(() =>
@@ -1916,7 +2033,16 @@ for (const width of [1440, 390]) {
 						),
 					);
 				};
-				await settleChipLayout();
+				await settleLayout();
+				const shell = () =>
+					page.$eval("[data-inline-composer]", (element) => {
+						const rect = element.getBoundingClientRect();
+						return { top: rect.top, height: rect.height };
+					});
+				const idle = await shell();
+				await selectQuotableSource(page);
+				await settleLayout();
+				expect(await shell()).toEqual(idle);
 				const measure = (selector: string) =>
 					page.$eval(selector, (chip) => {
 						const body = chip.querySelector("button");
@@ -1924,8 +2050,6 @@ for (const width of [1440, 390]) {
 						const icon = body?.querySelector(":scope > svg");
 						if (!body || !label || !icon) throw new Error("Missing chip content");
 						const box = chip.getBoundingClientRect();
-						const style = getComputedStyle(chip);
-						const textStyle = getComputedStyle(label);
 						const centerOffset = (element: Element) => {
 							const rect = element.getBoundingClientRect();
 							return rect.y + rect.height / 2 - box.y - box.height / 2;
@@ -1934,10 +2058,8 @@ for (const width of [1440, 390]) {
 						const keyText = kbd?.querySelector("span");
 						return {
 							height: box.height,
-							y: box.y,
-							border: style.borderTopWidth,
-							font: textStyle.font,
-							textHeight: label.getBoundingClientRect().height,
+							left: box.left,
+							right: box.right,
 							labelOffset: centerOffset(label),
 							iconOffset: centerOffset(icon),
 							icon: icon.getAttribute("class"),
@@ -1951,29 +2073,25 @@ for (const width of [1440, 390]) {
 						path: `.narrafork/quote-${width}-${scheme}-before.png`,
 						fullPage: true,
 					});
-				const before = await measure("[data-inline-quote-candidate]");
-				expect(before.height).toBe(24);
-				expect(Math.abs(before.keyOffset)).toBeLessThanOrEqual(1);
-				expect(before.keyHeight).toBeLessThanOrEqual(16);
+				const button = await measure("[data-quote-candidate]");
+				expect(button.height).toBe(30);
+				expect(button.label).toBe("Quote");
+				expect(button.left).toBeGreaterThanOrEqual(0);
+				expect(button.right).toBeLessThanOrEqual(width);
+				expect(Math.abs(button.keyOffset)).toBeLessThanOrEqual(1);
+				expect(button.keyHeight).toBeLessThanOrEqual(16);
+				expect(Math.abs(button.labelOffset)).toBeLessThanOrEqual(1);
+				expect(Math.abs(button.iconOffset)).toBeLessThanOrEqual(1);
 				await page.keyboard.press("Tab");
-				await settleChipLayout();
+				await settle(page);
 				if (process.env.NF_COMPOSER_SCREENSHOTS)
 					await page.screenshot({
 						path: `.narrafork/quote-${width}-${scheme}-after.png`,
 						fullPage: true,
 					});
-				const after = await measure('[data-composer-atom="quote"]');
-				expect(after.height).toBe(before.height);
-				expect(after.border).toBe(before.border);
-				expect(after.font).toBe(before.font);
-				expect(after.textHeight).toBe(before.textHeight);
-				expect(after.label).toBe(before.label);
-				expect(after.icon).toBe(before.icon);
-				expect(Math.abs(after.y - before.y)).toBeLessThanOrEqual(1);
-				for (const geometry of [before, after]) {
-					expect(Math.abs(geometry.labelOffset)).toBeLessThanOrEqual(1);
-					expect(Math.abs(geometry.iconOffset)).toBeLessThanOrEqual(1);
-				}
+				expect(await page.$("[data-quote-candidate]")).toBeNull();
+				const chip = await measure('[data-composer-atom="quote"]');
+				expect(chip.icon).toBe(button.icon);
 			} finally {
 				await close(page);
 			}

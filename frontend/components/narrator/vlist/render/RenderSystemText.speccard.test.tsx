@@ -16,6 +16,7 @@
 
 import { beforeAll, describe, expect, it } from "bun:test";
 import { MantineProvider } from "@mantine/core";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { type AdapterSegment, adaptSegment } from "@shared/pretext-layout/segment-adapter";
 import { parseHTML } from "linkedom";
 import { act } from "react";
@@ -77,7 +78,7 @@ function renderSpecCard(
 ): { buttons: HTMLButtonElement[]; unmount: () => void } {
 	const seg: AdapterSegment = {
 		kind: "message",
-		msg: { id: "spec-msg", role: "system", contentJson: [block as never] },
+		msg: rowWithElements({ id: "spec-msg", role: "system" }, [block as never]),
 	};
 	const spec = adaptSegment(seg, { lod: 5 })[0];
 	if (!spec) throw new Error("no spec produced");

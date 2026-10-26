@@ -1,4 +1,5 @@
 import { beforeAll, describe, expect, it } from "bun:test";
+import { messageBody, rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import type { NarratorMsg } from "../narrator-panel-types";
 import type { MeasuredCollapsibleTrace } from "./measure/measure-tool-run";
 import { installCanvasStub } from "./measure/test-canvas-stub";
@@ -21,40 +22,54 @@ beforeAll(() => {
 });
 
 function message(id: string, seq: number, role: "user" | "assistant", text: string): NarratorMsg {
-	return {
-		id,
-		narratorId: "n1",
-		seq,
-		role,
-		contentJson: [{ type: "text", text }],
-		contentText: text,
-		toolCalls: [],
-		children: [],
-		parentToolUseId: null,
-		createdAt: "2026-07-23T00:00:00.000Z",
-	} as unknown as NarratorMsg;
+	return rowWithElements(
+		{
+			id,
+			narratorId: "n1",
+			seq,
+			role,
+			contentText: text,
+			toolCalls: [],
+			parentToolUseId: null,
+			createdAt: "2026-07-23T00:00:00.000Z",
+		},
+		[{ type: "text", text }],
+	) as unknown as NarratorMsg;
 }
 
 function historyFixture(count: number): NarratorMsg[] {
 	return Array.from({ length: count }, (_, index) => {
 		if (index % 17 === 0) {
-			return {
-				...message(`compact-${index}`, index, "assistant", ""),
-				role: "system",
-				contentJson: [
+			return rowWithElements(
+				{
+					...message(`compact-${index}`, index, "assistant", ""),
+					role: "system",
+					contentText: null,
+				},
+				[
 					{
 						type: "compact",
 						subtype: "plan",
 						summary: `Plan checkpoint ${index}\n${"detailed summary ".repeat(30)}`,
 					},
 				],
-				contentText: null,
-			} as unknown as NarratorMsg;
+			) as unknown as NarratorMsg;
 		}
 		if (index % 13 === 0) {
-			return {
-				...message(`tool-${index}`, index, "assistant", ""),
-				contentJson: [
+			return rowWithElements(
+				{
+					...message(`tool-${index}`, index, "assistant", ""),
+					contentText: null,
+					toolCalls: [
+						{
+							toolUseId: `tool-use-${index}`,
+							toolName: "Read",
+							inputJson: { file_path: `/workspace/very/long/path/${index}/file.ts` },
+							status: "completed",
+						},
+					],
+				},
+				[
 					{
 						type: "tool_use",
 						id: `tool-use-${index}`,
@@ -64,16 +79,7 @@ function historyFixture(count: number): NarratorMsg[] {
 						status: "completed",
 					},
 				],
-				contentText: null,
-				toolCalls: [
-					{
-						toolUseId: `tool-use-${index}`,
-						toolName: "Read",
-						inputJson: { file_path: `/workspace/very/long/path/${index}/file.ts` },
-						status: "completed",
-					},
-				],
-			} as unknown as NarratorMsg;
+			) as unknown as NarratorMsg;
 		}
 		const role = index % 3 === 0 ? "user" : "assistant";
 		const text =
@@ -91,17 +97,19 @@ function reasoningBodyMessage(
 	blockId: string | undefined = "reason-body-1",
 	structured = true,
 ): NarratorMsg {
-	return {
-		...message(id, 1, "assistant", ""),
-		...(structured ? { model: "gpt-5.6" } : {}),
-		contentJson: [
+	return rowWithElements(
+		{
+			...message(id, 1, "assistant", ""),
+			...(structured ? { model: "gpt-5.6" } : {}),
+		},
+		[
 			{
 				type: "reasoning",
 				...(blockId ? { id: blockId } : {}),
 				text: `${structured ? "**First**\n\n" : ""}${"long body ".repeat(1000)}`,
 			},
 		],
-	} as unknown as NarratorMsg;
+	) as unknown as NarratorMsg;
 }
 
 function buildReasoningBodyLayout(
@@ -210,10 +218,12 @@ describe("buildPretextDocumentLayout", () => {
 	it("maps each low-LOD step to its own durable run and slot without changing row identities", () => {
 		const long = "long reasoning body ".repeat(600);
 		const messages = [
-			{
-				...message("multi-body", 1, "assistant", ""),
-				model: "gpt-5.6",
-				contentJson: [
+			rowWithElements(
+				{
+					...message("multi-body", 1, "assistant", ""),
+					model: "gpt-5.6",
+				},
+				[
 					{ type: "reasoning", id: "run-a", text: `**A first**\n\n${long}` },
 					{ type: "reasoning", id: "run-a-next", text: `**A second**\n\n${long}` },
 					{
@@ -229,7 +239,7 @@ describe("buildPretextDocumentLayout", () => {
 						text: `**B first**\n\n${long}\n\n**B second**\n\n${long}`,
 					},
 				],
-			},
+			),
 		] as unknown as NarratorMsg[];
 		let state = createVListInteractionState(2);
 		const low = activityBody(messages, state);
@@ -352,9 +362,11 @@ describe("buildPretextDocumentLayout", () => {
 		const messagesFor = (blockId: string) => {
 			const msg = reasoningBodyMessage("same-trace", blockId);
 			return [
-				{
-					...msg,
-					contentJson: [
+				rowWithElements(
+					{
+						...msg,
+					},
+					[
 						{
 							type: "tool_use",
 							id: "leading-tool",
@@ -362,9 +374,9 @@ describe("buildPretextDocumentLayout", () => {
 							input: { file_path: "/a.ts" },
 							status: "completed",
 						},
-						...(msg.contentJson as unknown[]),
+						...messageBody(msg),
 					],
-				},
+				),
 			] as unknown as NarratorMsg[];
 		};
 		let state = createVListInteractionState(2);
@@ -432,18 +444,20 @@ describe("buildPretextDocumentLayout", () => {
 	it("reuses communication measurements on rebuild but invalidates receipt labels on language change", () => {
 		const input = { id: "worker", message: "hello" };
 		const messages = [
-			{
-				...message("communication-label-cache", 0, "assistant", ""),
-				contentJson: [{ type: "tool_use", id: "send-label-cache", name: "Send", input }],
-				toolCalls: [
-					{
-						toolUseId: "send-label-cache",
-						toolName: "Send",
-						status: "success",
-						inputJson: input,
-					},
-				],
-			},
+			rowWithElements(
+				{
+					...message("communication-label-cache", 0, "assistant", ""),
+					toolCalls: [
+						{
+							toolUseId: "send-label-cache",
+							toolName: "Send",
+							status: "success",
+							inputJson: input,
+						},
+					],
+				},
+				[{ type: "tool_use", id: "send-label-cache", name: "Send", input }],
+			),
 		] as unknown as NarratorMsg[];
 		const build = (language: string, receiptLabel: string) => {
 			const result = buildPretextDocumentLayout(messages, {
@@ -574,9 +588,20 @@ describe("buildPretextDocumentLayout", () => {
 	// the document AND (being deliberately kept out of the build deps) never correct
 	// itself. These tests pin the derivation, not a passed-in value.
 	function tasksToolMessage(id: string, seq: number, toolUseId: string): NarratorMsg {
-		return {
-			...message(id, seq, "assistant", ""),
-			contentJson: [
+		return rowWithElements(
+			{
+				...message(id, seq, "assistant", ""),
+				contentText: null,
+				toolCalls: [
+					{
+						toolUseId,
+						toolName: "Write",
+						inputJson: { file_path: "spec://tasks.json" },
+						status: "completed",
+					},
+				],
+			},
+			[
 				{
 					type: "tool_use",
 					id: toolUseId,
@@ -585,16 +610,7 @@ describe("buildPretextDocumentLayout", () => {
 					status: "completed",
 				},
 			],
-			contentText: null,
-			toolCalls: [
-				{
-					toolUseId,
-					toolName: "Write",
-					inputJson: { file_path: "spec://tasks.json" },
-					status: "completed",
-				},
-			],
-		} as unknown as NarratorMsg;
+		) as unknown as NarratorMsg;
 	}
 
 	const PIN_OPTIONS = {
@@ -671,9 +687,26 @@ describe("buildPretextDocumentLayout", () => {
 	 */
 	it("keeps every sibling call addressable at low LOD when one is pinned", () => {
 		// One run: Write(spec://tasks.json) then ShareFile — the reported shape.
-		const runMessage = {
-			...message("m-run", 1, "assistant", ""),
-			contentJson: [
+		const runMessage = rowWithElements(
+			{
+				...message("m-run", 1, "assistant", ""),
+				contentText: null,
+				toolCalls: [
+					{
+						toolUseId: "tu-tasks",
+						toolName: "Write",
+						inputJson: { file_path: "spec://tasks.json" },
+						status: "success",
+					},
+					{
+						toolUseId: "tu-share",
+						toolName: "ShareFile",
+						inputJson: { path: "dist/app.exe" },
+						status: "success",
+					},
+				],
+			},
+			[
 				{
 					type: "tool_use",
 					id: "tu-tasks",
@@ -687,22 +720,7 @@ describe("buildPretextDocumentLayout", () => {
 					input: { path: "dist/app.exe" },
 				},
 			],
-			contentText: null,
-			toolCalls: [
-				{
-					toolUseId: "tu-tasks",
-					toolName: "Write",
-					inputJson: { file_path: "spec://tasks.json" },
-					status: "success",
-				},
-				{
-					toolUseId: "tu-share",
-					toolName: "ShareFile",
-					inputJson: { path: "dist/app.exe" },
-					status: "success",
-				},
-			],
-		} as unknown as NarratorMsg;
+		) as unknown as NarratorMsg;
 
 		for (const lod of [1, 2, 3] as const) {
 			const built = buildPretextDocumentLayout([runMessage], { ...PIN_OPTIONS, lod });

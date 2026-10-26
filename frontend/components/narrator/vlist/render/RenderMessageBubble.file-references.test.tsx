@@ -2,7 +2,12 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
 import type { FileReference, FileReferenceSnapshot, FileTarget } from "@shared/file-reference";
 import { fileReferenceLabel } from "@shared/file-reference-display";
-import { type AdapterMessage, adaptSegments } from "@shared/pretext-layout/segment-adapter";
+import { messageBody, rowWithElements } from "@shared/narrator-blocks/message-blocks";
+import {
+	type AdapterContentBlock,
+	type AdapterMessage,
+	adaptSegments,
+} from "@shared/pretext-layout/segment-adapter";
 import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
@@ -121,23 +126,25 @@ function click(element: Element) {
 
 describe("captured message file references", () => {
 	test("chat opt-in renders Markdown links inside an exact box with quote and attachment actions", async () => {
-		const message: AdapterMessage = {
-			id: "chat",
-			role: "user",
-			bodyFormat: "markdown",
-			omitHeader: true,
-			contentJson: [
+		const message: AdapterMessage = rowWithElements<AdapterMessage, AdapterContentBlock>(
+			{
+				id: "chat",
+				role: "user",
+				bodyFormat: "markdown",
+				omitHeader: true,
+				replyQuote: {
+					authorName: "alice",
+					text: "quoted",
+					state: "quoted",
+					targetId: "target",
+					targetSeq: 1,
+				},
+			},
+			[
 				{ type: "text_file", filename: "notes.txt", fetchUrl: "/chat/attachments/a" },
 				{ type: "text", text: "**bold** [external](https://example.com)" },
 			],
-			replyQuote: {
-				authorName: "alice",
-				text: "quoted",
-				state: "quoted",
-				targetId: "target",
-				targetSeq: 1,
-			},
-		};
+		);
 		const spec = specs(message)[0];
 		const measured = measureElement(spec.kind, spec.data, 700, 4);
 		const downloads: string[][] = [];
@@ -180,7 +187,13 @@ describe("captured message file references", () => {
 				type: "content_block_delta",
 				outputIndex: 0,
 				fileReferenceContext: context,
-				delta: { type: "text_delta", text: "[file](src/a.ts#L2)" },
+				delta: {
+					type: "text_delta",
+					id: "1:0",
+					revision: 1,
+					textOffset: 0,
+					text: "[file](src/a.ts#L2)",
+				},
 			},
 			false,
 		);
@@ -190,7 +203,7 @@ describe("captured message file references", () => {
 				type: "content_block_delta",
 				outputIndex: 0,
 				fileReferenceContext: { deviceId: "ChangedDevice", cwd: "/other" },
-				delta: { type: "text_delta", text: "." },
+				delta: { type: "text_delta", id: "1:0", revision: 2, textOffset: 19, text: "." },
 			},
 			false,
 		);
@@ -203,11 +216,13 @@ describe("captured message file references", () => {
 		}) as NarratorMsg;
 		for (const message of [
 			streamed,
-			{
-				...streamed,
-				id: "reloaded",
-				contentJson: JSON.parse(JSON.stringify(streamed.contentJson)),
-			},
+			rowWithElements(
+				{
+					...streamed,
+					id: "reloaded",
+				},
+				JSON.parse(JSON.stringify(messageBody(streamed))),
+			),
 		]) {
 			const opened: FileTarget[] = [];
 			await renderMessage(message as unknown as AdapterMessage, opened);
@@ -236,7 +251,13 @@ describe("captured message file references", () => {
 						type: "content_block_delta",
 						outputIndex,
 						fileReferenceContext: { deviceId, cwd: "/repo" },
-						delta: { type: "text_delta", id: `lane-${deviceId}`, text: "[same](src/a.ts)" },
+						delta: {
+							type: "text_delta",
+							id: `lane-${deviceId}`,
+							revision: 1,
+							textOffset: 0,
+							text: "[same](src/a.ts)",
+						},
 					},
 					false,
 				);
@@ -259,16 +280,18 @@ describe("captured message file references", () => {
 	test("unknown historic context disables inference but explicit nf-file remains usable", async () => {
 		const opened: FileTarget[] = [];
 		await renderMessage(
-			{
-				id: "unknown",
-				role: "assistant",
-				contentJson: [
+			rowWithElements(
+				{
+					id: "unknown",
+					role: "assistant",
+				},
+				[
 					{
 						type: "text",
 						text: "[old](src/a.ts) [explicit](nf-file://open?device=ExplicitDevice&path=%2Frepo%2Fa.ts#L3)",
 					},
 				],
-			},
+			),
 			opened,
 		);
 		const links = Array.from(container.querySelectorAll("a[href]"));
@@ -279,11 +302,15 @@ describe("captured message file references", () => {
 
 	test("fullscreen markdown inherits the selected block, not the live narrator scope", async () => {
 		for (const fileReferenceContext of [{ deviceId: "HistoryDevice", cwd: "/repo" }, undefined]) {
-			const spec = specs({
-				id: "full",
-				role: "assistant",
-				contentJson: [{ type: "text", text: "[same](src/a.ts)", fileReferenceContext }],
-			})[0];
+			const spec = specs(
+				rowWithElements(
+					{
+						id: "full",
+						role: "assistant",
+					},
+					[{ type: "text", text: "[same](src/a.ts)", fileReferenceContext }],
+				),
+			)[0];
 			const target = resolveRowViewTargets(spec)[0];
 			if (!target) throw new Error("Expected fullscreen markdown target");
 			const opened: FileTarget[] = [];
@@ -311,11 +338,13 @@ describe("captured message file references", () => {
 	});
 
 	test("user references are visible, clickable fixed rows with no snapshot body", async () => {
-		const message: AdapterMessage = {
-			id: "user",
-			role: "user",
-			contentJson: [{ ...snapshot }, { type: "text", text: "please review" }],
-		};
+		const message: AdapterMessage = rowWithElements(
+			{
+				id: "user",
+				role: "user",
+			},
+			[{ ...snapshot }, { type: "text", text: "please review" }],
+		);
 		const opened: FileTarget[] = [];
 		await renderMessage(message, opened);
 		const row = container.querySelector('[role="button"]');
@@ -333,31 +362,39 @@ describe("captured message file references", () => {
 			height: TEXT_FILE_HEIGHT,
 		});
 		expect(Number.parseFloat((row as HTMLElement).style.height)).toBe(TEXT_FILE_HEIGHT);
-		const summarySpec = specs({
-			...message,
-			contentJson: [
-				{ type: "file_reference", reference },
-				{ type: "text", text: "please review" },
-			],
-		})[0];
+		const summarySpec = specs(
+			rowWithElements(
+				{
+					...message,
+				},
+				[
+					{ type: "file_reference", reference },
+					{ type: "text", text: "please review" },
+				],
+			),
+		)[0];
 		expect(measureElement(summarySpec.kind, summarySpec.data, 700, 4)).toEqual(measured);
 		const copy = buildSelectionIndex([
 			{ ...message, seq: 1, contentText: "please review" } as NarratorMsg,
 		]).entries[0]?.copyText;
 		expect(copy).toBe("please review");
 		const refOnly = buildSelectionIndex([
-			{ ...message, seq: 1, contentText: "", contentJson: [snapshot] } as unknown as NarratorMsg,
+			rowWithElements({ ...message, seq: 1, contentText: "" }, [
+				snapshot,
+			]) as unknown as NarratorMsg,
 		]).entries[0]?.copyText;
 		expect(refOnly).toBe(fileReferenceLabel(reference));
 	});
 
 	test("slash-command and reference-only bubbles retain attachment rows", async () => {
-		const message: AdapterMessage = {
-			id: "command-ref",
-			role: "user",
-			commandText: "/review",
-			contentJson: [{ ...snapshot }, { type: "text", text: "expanded command" }],
-		};
+		const message: AdapterMessage = rowWithElements(
+			{
+				id: "command-ref",
+				role: "user",
+				commandText: "/review",
+			},
+			[{ ...snapshot }, { type: "text", text: "expanded command" }],
+		);
 		const opened: FileTarget[] = [];
 		await renderMessage(message, opened);
 		const row = container.querySelector('[role="button"]');
@@ -365,16 +402,20 @@ describe("captured message file references", () => {
 		if (row) click(row);
 		expect(opened).toEqual([reference]);
 		const spec = specs(message)[0];
-		const plain = specs({
-			...message,
-			contentJson: [{ type: "text", text: "expanded command" }],
-		})[0];
+		const plain = specs(
+			rowWithElements(
+				{
+					...message,
+				},
+				[{ type: "text", text: "expanded command" }],
+			),
+		)[0];
 		const measured = measureElement(spec.kind, spec.data, 700, 4, spec.opts);
 		const withoutReference = measureElement(plain.kind, plain.data, 700, 4, plain.opts);
 		expect(measured.height - withoutReference.height).toBe(TEXT_FILE_HEIGHT + 4);
 		expect(measured.frame.blocks[0]?.height).toBe(TEXT_FILE_HEIGHT);
 		expect(container.textContent).not.toContain("HIDDEN_SNAPSHOT_BODY");
-		await renderMessage({ id: "only-ref", role: "user", contentJson: [{ ...snapshot }] }, []);
+		await renderMessage(rowWithElements({ id: "only-ref", role: "user" }, [{ ...snapshot }]), []);
 		expect(container.querySelector('[role="button"]')?.textContent).toContain("/repo/src/a.ts:2-4");
 	});
 

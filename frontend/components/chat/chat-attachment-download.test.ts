@@ -1,10 +1,8 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 
-const absorb = mock(() => {});
 const clear = mock(async () => {});
 mock.module("../../lib/api", () => ({
 	getToken: () => "session-token",
-	absorbRenewedToken: absorb,
 	clearTokenOnSessionFailure: clear,
 }));
 mock.module("../../lib/base-path", () => ({ apiUrl: (path: string) => `/api${path}` }));
@@ -27,7 +25,6 @@ beforeEach(() => {
 	};
 	received = undefined;
 	response = new Response("attachment bytes", { status: 200 });
-	absorb.mockClear();
 	clear.mockClear();
 	Object.assign(globalThis, {
 		document: { createElement: () => anchor },
@@ -45,13 +42,12 @@ afterEach(() => {
 	}
 });
 describe("chat attachment authorized download", () => {
-	test("fetches bytes with Bearer auth, absorbs renewal, and clicks a downloadable blob", async () => {
+	test("fetches bytes with Bearer auth and clicks a downloadable blob", async () => {
 		expect(await downloadChatAttachment("/chat/attachments/a", "notes.txt")).toBe(true);
 		expect(received).toEqual({
 			url: "/api/chat/attachments/a",
 			headers: { Authorization: "Bearer session-token" },
 		});
-		expect(absorb).toHaveBeenCalledWith(response, "session-token");
 		expect(anchor.href).toStartWith("blob:");
 		expect(anchor.download).toBe("notes.txt");
 		expect(clicked).toBe(1);

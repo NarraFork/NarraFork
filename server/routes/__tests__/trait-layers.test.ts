@@ -12,7 +12,6 @@ import { db } from "../../db";
 import { projects, userPreferences } from "../../db/schema";
 import { buildAppErrorResponse } from "../../lib/app-error-response";
 import { generateId } from "../../lib/id";
-import { invalidateUserCache } from "../../middleware/auth";
 import type { AuthSessionStore } from "../../services/auth/session-store";
 import { authMfaStore, authSessionStore, setAuthStores } from "../../services/auth/store";
 import { resetTraitLayerCaches } from "../../services/trait-layer-service";
@@ -77,7 +76,6 @@ beforeEach(() => {
 afterEach(async () => {
 	resetTraitLayerCaches();
 	setAuthStores(undefined);
-	invalidateUserCache();
 	if (createdProjects.length > 0) {
 		await db.delete(projects).where(inArray(projects.id, createdProjects.splice(0)));
 	}

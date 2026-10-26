@@ -1592,12 +1592,22 @@ export const worktreeTreeSnapshot = {
 			const dir = shadowDir(deviceId, worktreePath);
 			// Low space is recoverable on the disk-cache TTL, not the 15-minute warmup
 			// failure cooldown. Refuse before launching a scan or creating a receipt.
-			if (!(await raceBudget(canWriteOptionalDiskData(dir), Math.max(0, deadline - Date.now()))))
+			if (!(await raceBudget(canWriteOptionalDiskData(dir), Math.max(0, deadline - Date.now())))) {
+				logger.warn("Workspace snapshot skipped: low disk space or disk check over budget", {
+					worktreePath,
+				});
 				return null;
+			}
 
 			const cooldownUntil = warmupCooldownUntil.get(dir);
 			if (cooldownUntil !== undefined) {
-				if (Date.now() < cooldownUntil) return null;
+				if (Date.now() < cooldownUntil) {
+					logger.debug("Workspace snapshot skipped: warm-up failure cooldown", {
+						worktreePath,
+						cooldownUntil,
+					});
+					return null;
+				}
 				warmupCooldownUntil.delete(dir);
 			}
 
@@ -1671,7 +1681,14 @@ export const worktreeTreeSnapshot = {
 
 			const outcome = await raceBudget(settled, remainingMs);
 			if (outcome !== undefined) {
-				return outcome.ok ? outcome.hash : null;
+				if (outcome.ok) return outcome.hash;
+				// A fast failure keeps retry-next-time semantics, but its cause must be
+				// visible: the caller only knows the boundary is missing.
+				logger.warn("Workspace snapshot capture failed", {
+					worktreePath,
+					error: outcome.error instanceof Error ? outcome.error.message : String(outcome.error),
+				});
+				return null;
 			}
 			sawBudgetExpiry = true;
 			logger.warn("Workspace snapshot exceeded the hot-path budget; continuing in background", {
@@ -1680,7 +1697,7 @@ export const worktreeTreeSnapshot = {
 			});
 			return null;
 		} catch (error) {
-			logger.debug("Hot-path tree snapshot capture failed", {
+			logger.warn("Hot-path tree snapshot capture failed", {
 				worktreePath,
 				deviceId,
 				error: String(error),

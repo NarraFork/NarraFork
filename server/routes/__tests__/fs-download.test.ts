@@ -131,7 +131,7 @@ describe("GET /api/fs/download", () => {
 	/**
 	 * The route takes an absolute path from the client on purpose, so the one thing it
 	 * must not do is hand over the platform's own credentials: `settings.json` carries
-	 * `auth.jwtSecret` (forge any user's session) and the database carries every
+	 * `auth.jwtSecret` (forge MFA challenges) and the database carries every
 	 * password hash. Asserted through the RESPONSE rather than the predicate, so a
 	 * refactor that keeps `fs-secret-paths.ts` but stops calling it still fails here.
 	 */

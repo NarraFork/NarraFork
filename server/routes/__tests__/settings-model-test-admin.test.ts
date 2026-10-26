@@ -8,7 +8,6 @@ import { AUTO_LAN_HOST } from "../../../shared/server-host";
 import { updateSettingsKey } from "../../../shared/update-settings";
 import { AppError } from "../../lib/errors";
 import { settingsUpdateLock } from "../../lib/settings/write-lock";
-import { invalidateUserCache } from "../../middleware/auth";
 import type { AuthSessionStore } from "../../services/auth/session-store";
 import { authMfaStore, authSessionStore, setAuthStores } from "../../services/auth/store";
 
@@ -44,8 +43,6 @@ setAuthStores({ session: sessionStoreSeam, mfa: authMfaStore });
 
 afterAll(() => {
 	setAuthStores(undefined);
-	invalidateUserCache(ADMIN_ACTOR_ID);
-	invalidateUserCache(NON_ADMIN_ACTOR_ID);
 	if (previousHome === undefined) delete process.env.NARRAFORK_HOME;
 	else process.env.NARRAFORK_HOME = previousHome;
 	rmSync(testHome, { recursive: true, force: true });

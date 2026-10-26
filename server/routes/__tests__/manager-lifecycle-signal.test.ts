@@ -11,7 +11,6 @@ import {
 	resetManagerTokenForTests,
 } from "../../lib/manager-token";
 import { registerOperatorShutdownHandler } from "../../lib/server-restart";
-import { invalidateUserCache } from "../../middleware/auth";
 import { systemLifecycle } from "../../services/system-lifecycle-service";
 import { managerLifecycleRoutes } from "../system-lifecycle";
 
@@ -42,8 +41,7 @@ beforeEach(async () => {
 			passwordHash: "unused",
 			createdAt: new Date().toISOString(),
 		});
-		invalidateUserCache(id);
-		const session = await createToken(id, role);
+		const session = await createToken(id);
 		if (role === "admin") adminToken = session;
 		else memberToken = session;
 	}

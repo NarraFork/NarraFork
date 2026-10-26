@@ -23,6 +23,7 @@ import { worktreeTreeSnapshot } from "@server/services/worktree-tree-snapshot";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { ZodError } from "zod";
+import { blockIdAt } from "../../block-ids";
 
 const ids: string[] = [];
 const dirs: string[] = [];
@@ -235,7 +236,7 @@ describe("M0 rollback route safety", () => {
 	test("single-block preview remains available without advertising unsafe legacy rollback", async () => {
 		const f = await fixture(true);
 		const response = await app.request(
-			`/api/narrators/${f.narratorId}/block-delete-preview?messageId=${f.messageId}&blockIndex=0`,
+			`/api/narrators/${f.narratorId}/blocks/${await blockIdAt(f.messageId, 0)}/delete-preview`,
 		);
 		expect(response.status).toBe(200);
 		expect(await response.json()).toMatchObject({
@@ -252,7 +253,7 @@ describe("M0 rollback route safety", () => {
 	] as const)("an orphaned %s tool reports missing completion evidence without changing its status", async (status) => {
 		const f = await fixture(false, status);
 		const response = await app.request(
-			`/api/narrators/${f.narratorId}/rollback-preview?messageId=${f.previewMessageId}`,
+			`/api/narrators/${f.narratorId}/blocks/${await blockIdAt(f.previewMessageId, 0)}/edit-preview`,
 		);
 		expect(response.status).toBe(200);
 		expect((await response.json()).narratorScope).toMatchObject({
@@ -278,7 +279,7 @@ describe("M0 rollback route safety", () => {
 			_loopRunning: true,
 		} as ActiveNarrator);
 		const response = await app.request(
-			`/api/narrators/${f.narratorId}/rollback-preview?messageId=${f.previewMessageId}`,
+			`/api/narrators/${f.narratorId}/blocks/${await blockIdAt(f.previewMessageId, 0)}/edit-preview`,
 		);
 		expect(response.status).toBe(200);
 		expect((await response.json()).narratorScope).toMatchObject({
@@ -292,7 +293,7 @@ describe("M0 rollback route safety", () => {
 	test("incomplete operation evidence still refuses mutation", async () => {
 		const f = await fixture(false, "success", true);
 		const response = await app.request(
-			`/api/narrators/${f.narratorId}/rollback-preview?messageId=${f.previewMessageId}`,
+			`/api/narrators/${f.narratorId}/blocks/${await blockIdAt(f.previewMessageId, 0)}/edit-preview`,
 		);
 		expect(response.status).toBe(200);
 		expect((await response.json()).narratorScope).toMatchObject({
@@ -317,7 +318,7 @@ describe("M0 rollback route safety", () => {
 	test("preview cannot advertise a legacy workspace snapshot as an available fallback", async () => {
 		const f = await fixture(true);
 		const response = await app.request(
-			`/api/narrators/${f.narratorId}/rollback-preview?messageId=${f.previewMessageId}`,
+			`/api/narrators/${f.narratorId}/blocks/${await blockIdAt(f.previewMessageId, 0)}/edit-preview`,
 		);
 		expect(response.status).toBe(200);
 		const preview = await response.json();

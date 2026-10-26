@@ -11,6 +11,7 @@ import {
 	isRevertHistoryCommitted,
 } from "../../../lib/revert-result";
 import { handleRegistry } from "../content/ContentViewer";
+import { blockTargetOf } from "../message/block-target";
 import {
 	BLOCK_ID_ATTR,
 	collectSelectedText,
@@ -20,6 +21,7 @@ import {
 	resolveSelectedBlockMeta,
 	resolveSelectedMessageIds,
 } from "../message/MessageSelectionCtx";
+import type { MessageListHandle } from "../message/message-list-handle";
 import {
 	getGlobalCloseSwipe,
 	setGlobalOnSelectionRange,
@@ -27,10 +29,7 @@ import {
 	setGlobalToggleBlock,
 } from "../scroll/swipeState";
 
-interface ChunkListLike {
-	detachFromBottom: () => void;
-	refreshStructure: (mode?: "diff" | "full") => void;
-}
+type ChunkListLike = Pick<MessageListHandle, "detachFromBottom" | "refreshStructure" | "messageOf">;
 
 export interface UseMessageSelectionOptions {
 	narratorId: string;
@@ -362,12 +361,14 @@ export function useMessageSelection(options: UseMessageSelectionOptions) {
 		// Confirm
 		const ok = await confirm({ message: t("batchDeleteConfirm", { count: metas.length }) });
 		if (!ok) return;
+		// Only blocks the server named can be deleted; the live row has none yet.
+		const targets = metas.flatMap(
+			(m) => blockTargetOf(chunkListRef.current, m.messageId, m.blockIndex) ?? [],
+		);
 		exitSelection();
+		if (targets.length === 0) return;
 		try {
-			const res = await api.deleteMessageBlocks(
-				narratorId,
-				metas.map((m) => ({ messageId: m.messageId, blockIndex: m.blockIndex })),
-			);
+			const res = await api.deleteMessageBlocks(narratorId, targets);
 			if (
 				!res.ok ||
 				res.failed > 0 ||

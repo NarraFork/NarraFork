@@ -20,12 +20,25 @@ const blockSync = await import("../narrator-block-sync");
 const targets = await import("../narrator-block-targets");
 const page = await import("../narrator-block-page");
 const { decodeBlockPage } = await import("@frontend/lib/block-protocol");
+const { messageBlocks, splitRowBlocks } = await import("@shared/narrator-blocks/message-blocks");
 
 /** A decoded value without the block sidecar the client adds to every row. */
-function withoutBlockRefs<T>(value: T): T {
-	return JSON.parse(JSON.stringify(value), (key, field) =>
-		key === "blockRefs" ? undefined : field,
-	);
+/** The value with each decoded row's body back as the elements its blocks hold. */
+function withBodies<T>(value: T): T {
+	return JSON.parse(JSON.stringify(value), (_key, field) => {
+		if (!field || typeof field !== "object" || !Array.isArray(field.blocks)) return field;
+		const { blocks, ...row } = field as { blocks: Array<{ elements: unknown[] }> };
+		return { ...row, contentJson: blocks.flatMap((block) => block.elements) };
+	});
+}
+
+/** v1 rows as the client keeps them: flat, each row then the rows nested under it. */
+type V1Row = { id: string; children?: V1Row[] };
+function flatRows(rows: readonly V1Row[], parentMessageId?: string): unknown[] {
+	return rows.flatMap(({ children = [], ...row }) => [
+		parentMessageId ? { ...row, parentMessageId } : row,
+		...flatRows(children, row.id),
+	]);
 }
 
 const NOW = "2026-10-01T00:00:00.000Z";
@@ -39,7 +52,6 @@ beforeEach(() => {
 });
 afterEach(() => {
 	settings.narratorBlocks.write = true;
-	settings.narratorBlocks.wsV2 = true;
 });
 afterAll(() => {
 	blockSync.stopBlockSyncSweep();
@@ -130,6 +142,18 @@ describe("the message page in protocol v2", () => {
 		expect(resolved.map((target) => target.to - target.from)).toEqual(
 			stepBlocks.map((block) => block.elements.length),
 		);
+		// A row the client builds itself is split into these same blocks.
+		for (const message of v1.messages)
+			expect(
+				splitRowBlocks(message, message.contentJson).map(({ named: _named, ...block }) => ({
+					...block,
+					elements: [...block.elements] as unknown[],
+				})),
+			).toEqual(
+				v2.blocks
+					.filter((block) => block.messageId === message.id)
+					.map(({ messageId: _messageId, ordinal: _ordinal, ...block }) => block),
+			);
 	});
 
 	test("an envelope rewritten outside the store is synced before its ids are sent", async () => {
@@ -156,28 +180,24 @@ describe("the message page in protocol v2", () => {
 		// The other blocks kept their ids through the sync.
 		expect(ids).toEqual(before.filter((_, index) => index !== 1));
 	});
-
-	test("v2 is granted only to a request that asks while wsV2 is on", () => {
-		settings.narratorBlocks.wsV2 = false;
-		expect(page.grantsBlockProtocol("2")).toBe(false);
-		settings.narratorBlocks.wsV2 = true;
-		expect(page.grantsBlockProtocol("2")).toBe(true);
-		expect(page.grantsBlockProtocol(undefined)).toBe(false);
-		expect(page.grantsBlockProtocol("1")).toBe(false);
-	});
 });
 
 describe("the client's decoder", () => {
-	test("gives back the v1 page, each row's blocks alongside", async () => {
+	test("gives back the page's rows, each holding its named blocks", async () => {
 		const { stepId } = await conversation();
 		const v1 = await narratorService.getPretextDocumentPage("n1");
 		const decoded = decodeBlockPage(
 			page.toBlockPage(structuredClone(v1)) as unknown as PretextDocumentPageResult,
 		);
-		expect(withoutBlockRefs(decoded)).toEqual(JSON.parse(JSON.stringify(v1)));
+		expect(withBodies(decoded)).toEqual(
+			JSON.parse(JSON.stringify({ ...v1, messages: flatRows(v1.messages as V1Row[]) })),
+		);
 		const step = decoded.messages.find((message) => message.id === stepId);
-		expect(step?.blockRefs?.map((block) => block.id)).toEqual(rowIds(stepId));
-		expect(step?.blockRefs?.map((block) => [block.from, block.to])).toEqual([
+		if (!step) throw new Error("step row missing");
+		const blocks = messageBlocks(step);
+		expect(blocks.map((block) => block.id)).toEqual(rowIds(stepId));
+		expect(blocks.every((block) => block.named)).toBe(true);
+		expect(blocks.map((block) => [block.from, block.from + block.elements.length])).toEqual([
 			[0, 1],
 			[1, 2],
 			[2, 3],
@@ -185,7 +205,7 @@ describe("the client's decoder", () => {
 		]);
 	});
 
-	test("rebuilds nested children under the row they belong to", () => {
+	test("lays nested rows out flat after the row they belong to", () => {
 		const child = {
 			id: "c1",
 			narratorId: "n1",
@@ -210,6 +230,7 @@ describe("the client's decoder", () => {
 			hasPrev: false,
 		};
 		const decoded = decodeBlockPage(page.toBlockPage(structuredClone(v1)) as unknown as typeof v1);
-		expect(withoutBlockRefs(decoded)).toEqual(v1);
+		expect(withBodies(decoded) as unknown).toEqual({ ...v1, messages: flatRows(v1.messages) });
+		expect(decoded.messages.map((row) => row.id)).toEqual(["p1", "c1"]);
 	});
 });

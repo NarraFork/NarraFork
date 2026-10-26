@@ -11,6 +11,7 @@
  */
 
 import { beforeAll, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 
 beforeAll(() => {
@@ -94,14 +95,15 @@ describe("mixed action-card append cache locality", () => {
 		const generation = { type: "image_generation", status: "completed", width: 320, height: 160 };
 		const tails = { tool: tool("tail"), search, generation, subagent: tool("tail-agent", "Agent") };
 		function msg(id: string, contentJson: Record<string, unknown>[]) {
-			return {
-				id,
-				role: "assistant",
+			return rowWithElements(
+				{
+					id,
+					role: "assistant",
+					toolCalls: [],
+					parentToolUseId: null,
+				},
 				contentJson,
-				toolCalls: [],
-				children: [],
-				parentToolUseId: null,
-			} as unknown as import("../narrator-panel-types").NarratorMsg;
+			) as unknown as import("../narrator-panel-types").NarratorMsg;
 		}
 		const messages = [
 			msg("stable", [tool("read"), search, generation, tool("agent", "Agent")]),
@@ -149,12 +151,14 @@ describe("chat grouped-header cached measurements", () => {
 			const spec = adaptSegment(
 				{
 					kind: "message",
-					msg: {
-						id: "stable-chat-message",
-						role: "user",
-						contentJson: [{ type: "text", text: "Unchanged body" }],
-						omitHeader,
-					},
+					msg: rowWithElements(
+						{
+							id: "stable-chat-message",
+							role: "user",
+							omitHeader,
+						},
+						[{ type: "text", text: "Unchanged body" }],
+					),
 				},
 				{ lod: 5 },
 			)[0];
@@ -210,11 +214,13 @@ describe("ask-in-passing cached measurements", () => {
 			const spec = adaptSegment(
 				{
 					kind: "message",
-					msg: {
-						id: "stable-aip-message",
-						role: "system",
-						contentJson: [{ type: "ask_in_passing", status, question }],
-					},
+					msg: rowWithElements(
+						{
+							id: "stable-aip-message",
+							role: "system",
+						},
+						[{ type: "ask_in_passing", status, question }],
+					),
 				},
 				{ lod: 5 },
 			)[0];
@@ -286,7 +292,7 @@ describe("trace inspector refs in cached measurements", () => {
 						kind: "tool",
 						blockIndex: 0,
 						isSubagent: false,
-						msg: { id: ref.messageId, role: "assistant", contentJson: [] },
+						msg: rowWithElements({ id: ref.messageId, role: "assistant" }, []),
 						tc: {
 							id: ref.toolCallId,
 							executionAttempt: ref.executionAttempt,
@@ -1835,11 +1841,13 @@ describe("computeVListLayout with cache (performance)", () => {
 		// Build 20 items
 		const segments = Array.from({ length: 20 }, (_, i) => ({
 			kind: "message" as const,
-			msg: {
-				id: `msg-${i}`,
-				role: "user" as const,
-				contentJson: [{ type: "text", text: `Message ${i} with some content` }],
-			},
+			msg: rowWithElements(
+				{
+					id: `msg-${i}`,
+					role: "user" as const,
+				},
+				[{ type: "text", text: `Message ${i} with some content` }],
+			),
 		}));
 
 		// First build: all misses
@@ -1866,11 +1874,13 @@ describe("computeVListLayout with cache (performance)", () => {
 		// Initial window: 10 items
 		const existing = Array.from({ length: 10 }, (_, i) => ({
 			kind: "message" as const,
-			msg: {
-				id: `existing-${i}`,
-				role: "user" as const,
-				contentJson: [{ type: "text", text: `Existing msg ${i}` }],
-			},
+			msg: rowWithElements(
+				{
+					id: `existing-${i}`,
+					role: "user" as const,
+				},
+				[{ type: "text", text: `Existing msg ${i}` }],
+			),
 		}));
 
 		computeVListLayout(existing, { contentWidth: 600, lod: 5 });
@@ -1878,11 +1888,13 @@ describe("computeVListLayout with cache (performance)", () => {
 		// After loadOlder: 5 new + 10 existing
 		const newer = Array.from({ length: 5 }, (_, i) => ({
 			kind: "message" as const,
-			msg: {
-				id: `new-${i}`,
-				role: "user" as const,
-				contentJson: [{ type: "text", text: `New msg ${i}` }],
-			},
+			msg: rowWithElements(
+				{
+					id: `new-${i}`,
+					role: "user" as const,
+				},
+				[{ type: "text", text: `New msg ${i}` }],
+			),
 		}));
 		const combined = [...newer, ...existing];
 
@@ -1902,11 +1914,13 @@ describe("computeVListLayout with cache (performance)", () => {
 		const N = 6500;
 		const segments = Array.from({ length: N }, (_, i) => ({
 			kind: "message" as const,
-			msg: {
-				id: `large-${i}`,
-				role: "user" as const,
-				contentJson: [{ type: "text", text: `Message ${i} content here` }],
-			},
+			msg: rowWithElements(
+				{
+					id: `large-${i}`,
+					role: "user" as const,
+				},
+				[{ type: "text", text: `Message ${i} content here` }],
+			),
 		}));
 
 		// First build: all misses (populates cache with N entries)
@@ -1925,11 +1939,13 @@ describe("computeVListLayout with cache (performance)", () => {
 		// Third build with 500 new items prepended: only new items miss
 		const prepended = Array.from({ length: 500 }, (_, i) => ({
 			kind: "message" as const,
-			msg: {
-				id: `prepend-${i}`,
-				role: "user" as const,
-				contentJson: [{ type: "text", text: `Prepended msg ${i}` }],
-			},
+			msg: rowWithElements(
+				{
+					id: `prepend-${i}`,
+					role: "user" as const,
+				},
+				[{ type: "text", text: `Prepended msg ${i}` }],
+			),
 		}));
 		const combined = [...prepended, ...segments];
 

@@ -1,4 +1,5 @@
 import { MantineProvider } from "@mantine/core";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import {
 	type DockviewApi,
@@ -199,18 +200,17 @@ const fetchMessagePage: PretextDocumentFetchPage = async (narratorId, options) =
 		const text =
 			`## ${narratorId} message ${seq}\n\nReal measured document body for ${narratorId}. ` +
 			"Several words wrap naturally using this panel's actual browser width. ".repeat(8);
-		return {
+		const row = {
 			id: `${narratorId}-message-${seq}`,
 			narratorId,
 			parentToolUseId: null,
 			role: "assistant",
-			contentJson: [{ type: "text", text }],
 			contentText: text,
 			toolCalls: [],
 			createdAt: "2026-10-01T00:00:00.000Z",
-			children: [],
 			seq,
-		} as TreeMessage;
+		} as Omit<TreeMessage, "blocks">;
+		return rowWithElements(row, [{ type: "text", text }]);
 	});
 	return {
 		messages,

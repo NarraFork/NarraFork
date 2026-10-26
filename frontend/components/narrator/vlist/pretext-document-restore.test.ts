@@ -18,6 +18,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { clearToken, setToken } from "@frontend/lib/api/client";
 import type { PretextDocumentPageResult, TreeMessage } from "@frontend/lib/api/types";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { parseHTML } from "linkedom";
 import { createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
@@ -102,18 +103,19 @@ async function settle() {
 }
 
 function message(seq: number, text: string): TreeMessage {
-	return {
-		id: `m-${seq}`,
-		narratorId: "n1",
-		parentToolUseId: null,
-		role: "assistant",
-		contentJson: [{ type: "text", text }],
-		contentText: text,
-		toolCalls: [],
-		createdAt: "2026-07-23T00:00:00.000Z",
-		children: [],
-		seq,
-	} as TreeMessage;
+	return rowWithElements(
+		{
+			id: `m-${seq}`,
+			narratorId: "n1",
+			parentToolUseId: null,
+			role: "assistant",
+			contentText: text,
+			toolCalls: [],
+			createdAt: "2026-07-23T00:00:00.000Z",
+			seq,
+		},
+		[{ type: "text", text }],
+	) as TreeMessage;
 }
 
 function page(seqs: readonly number[], messageVersion = 3): PretextDocumentPageResult {

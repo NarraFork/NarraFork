@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { parseHTML } from "linkedom";
 import { act } from "react";
@@ -164,13 +165,13 @@ describe("chat vlist host binding", () => {
 			["old", 1],
 			["reply", 90],
 		]);
-		expect(upserts[0]?.contentJson).toEqual([{ type: "text", text: "" }]);
+		expect(messageBody(upserts[0])).toEqual([{ type: "text", text: "" }]);
 		expect(upserts[1]?.replyQuote?.state).toBe("deleted");
 		completePage?.({ messages: [old], hasMore: false, nextBeforeSeq: null });
 		const late = await pendingA;
 		expect(late.messages[0]?.deletedLabel).toBeDefined();
 		expect(late.messages[0]?.contentText).toBe("");
-		expect(late.messages[0]?.contentJson).toEqual([{ type: "text", text: "" }]);
+		expect(messageBody(late.messages[0])).toEqual([{ type: "text", text: "" }]);
 		const cache = qc.getQueryData<{ pages: ChatMessagePage[] }>(chatKeys.messages("room"));
 		expect(cache?.pages[0]?.messages[0]?.deletedAt).not.toBeNull();
 		expect(cache?.pages[0]?.messages[0]?.attachments).toEqual([]);
@@ -222,7 +223,7 @@ describe("chat vlist host binding", () => {
 			["reply", 90],
 		]);
 		expect(upserts[0]?.contentText).toBe("");
-		expect(upserts[0]?.contentJson).toEqual([{ type: "text", text: "" }]);
+		expect(messageBody(upserts[0])).toEqual([{ type: "text", text: "" }]);
 		expect(upserts[1]?.replyQuote?.state).toBe("deleted");
 		// A late REST response must not resurrect a deleted body or its attachments.
 		const late = await source?.fetchPage?.("room", { limit: 50, beforeSeq: 90 });

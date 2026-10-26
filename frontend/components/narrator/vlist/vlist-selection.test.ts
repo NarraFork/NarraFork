@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { CHATGPT_CITATION_CLOSE, CHATGPT_CITATION_OPEN } from "@shared/citations";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import type { NarratorMsg } from "../narrator-panel-types";
 import {
 	buildSelectionIndex,
@@ -20,38 +21,49 @@ const CITATION_MARKER = `${CHATGPT_CITATION_OPEN}turn204588view0${CHATGPT_CITATI
 // biome-ignore lint/suspicious/noExplicitAny: test fixtures are structural
 function msg(partial: Record<string, any>): NarratorMsg {
 	return {
-		children: [],
 		contentText: null,
 		...partial,
 	} as unknown as NarratorMsg;
 }
 
-const USER = msg({
-	id: "m-user",
-	role: "user",
-	seq: 1,
-	contentText: "hello there",
-	contentJson: [{ type: "text", text: "hello there" }],
-});
+const USER = msg(
+	rowWithElements(
+		{
+			id: "m-user",
+			role: "user",
+			seq: 1,
+			contentText: "hello there",
+		},
+		[{ type: "text", text: "hello there" }],
+	),
+);
 
-const ASSISTANT = msg({
-	id: "m-asst",
-	role: "assistant",
-	seq: 2,
-	contentJson: [
-		{ type: "text", text: "first answer" },
-		{ type: "tool_use", id: "tool-1", name: "Read", input: { file_path: "/x" } },
-		{ type: "text", text: "" }, // not selectable (empty)
-		{ type: "web_search", query: "cats", status: "completed" },
-	],
-});
+const ASSISTANT = msg(
+	rowWithElements(
+		{
+			id: "m-asst",
+			role: "assistant",
+			seq: 2,
+		},
+		[
+			{ type: "text", text: "first answer" },
+			{ type: "tool_use", id: "tool-1", name: "Read", input: { file_path: "/x" } },
+			{ type: "text", text: "" }, // not selectable (empty)
+			{ type: "web_search", query: "cats", status: "completed" },
+		],
+	),
+);
 
-const AGENT = msg({
-	id: "m-agent",
-	role: "assistant",
-	seq: 3,
-	contentJson: [{ type: "tool_use", id: "agent-1", name: "Agent", input: { description: "go" } }],
-});
+const AGENT = msg(
+	rowWithElements(
+		{
+			id: "m-agent",
+			role: "assistant",
+			seq: 3,
+		},
+		[{ type: "tool_use", id: "agent-1", name: "Agent", input: { description: "go" } }],
+	),
+);
 
 describe("buildSelectionIndex", () => {
 	test("indexes selectable blocks in seq/blockIndex order, skips empty text", () => {
@@ -79,16 +91,20 @@ describe("buildSelectionIndex", () => {
 	});
 
 	test("user message only indexes block 0", () => {
-		const multiBlockUser = msg({
-			id: "u2",
-			role: "user",
-			seq: 5,
-			contentText: "combined",
-			contentJson: [
-				{ type: "text", text: "part a" },
-				{ type: "text", text: "part b" },
-			],
-		});
+		const multiBlockUser = msg(
+			rowWithElements(
+				{
+					id: "u2",
+					role: "user",
+					seq: 5,
+					contentText: "combined",
+				},
+				[
+					{ type: "text", text: "part a" },
+					{ type: "text", text: "part b" },
+				],
+			),
+		);
 		const index = buildSelectionIndex([multiBlockUser]);
 		expect(index.entries.map((e) => e.blockId)).toEqual(["msg-u2-0"]);
 		// user copyText prefers contentText
@@ -96,18 +112,26 @@ describe("buildSelectionIndex", () => {
 	});
 
 	test("skips messages without id / seq / contentJson", () => {
-		const bad = msg({
-			id: "",
-			role: "assistant",
-			seq: 9,
-			contentJson: [{ type: "text", text: "x" }],
-		});
-		const noSeq = msg({
-			id: "n",
-			role: "assistant",
-			seq: null,
-			contentJson: [{ type: "text", text: "x" }],
-		});
+		const bad = msg(
+			rowWithElements(
+				{
+					id: "",
+					role: "assistant",
+					seq: 9,
+				},
+				[{ type: "text", text: "x" }],
+			),
+		);
+		const noSeq = msg(
+			rowWithElements(
+				{
+					id: "n",
+					role: "assistant",
+					seq: null,
+				},
+				[{ type: "text", text: "x" }],
+			),
+		);
 		expect(buildSelectionIndex([bad, noSeq]).entries).toHaveLength(0);
 	});
 
@@ -117,36 +141,48 @@ describe("buildSelectionIndex", () => {
 	 * while a user quoting the same string keeps it — the asymmetry is the point.
 	 */
 	test("assistant copyText drops the exact citation envelope", () => {
-		const withMarker = msg({
-			id: "m-cite",
-			role: "assistant",
-			seq: 7,
-			contentJson: [{ type: "text", text: `已修复${CITATION_MARKER}` }],
-		});
+		const withMarker = msg(
+			rowWithElements(
+				{
+					id: "m-cite",
+					role: "assistant",
+					seq: 7,
+				},
+				[{ type: "text", text: `已修复${CITATION_MARKER}` }],
+			),
+		);
 		const index = buildSelectionIndex([withMarker]);
 		expect(index.entries[0]?.copyText).toBe("已修复");
 	});
 
 	test("assistant copyText keeps ref-shaped text from other protocols", () => {
 		const text = "见 https://example.com/turn0search1 与 turn204588view0";
-		const plain = msg({
-			id: "m-plain",
-			role: "assistant",
-			seq: 9,
-			contentJson: [{ type: "text", text }],
-		});
+		const plain = msg(
+			rowWithElements(
+				{
+					id: "m-plain",
+					role: "assistant",
+					seq: 9,
+				},
+				[{ type: "text", text }],
+			),
+		);
 		expect(buildSelectionIndex([plain]).entries[0]?.copyText).toBe(text);
 	});
 
 	test("user copyText keeps a quoted citation marker verbatim", () => {
 		const quoted = `${CITATION_MARKER} 是什么`;
-		const quoting = msg({
-			id: "u-cite",
-			role: "user",
-			seq: 8,
-			contentText: quoted,
-			contentJson: [{ type: "text", text: quoted }],
-		});
+		const quoting = msg(
+			rowWithElements(
+				{
+					id: "u-cite",
+					role: "user",
+					seq: 8,
+					contentText: quoted,
+				},
+				[{ type: "text", text: quoted }],
+			),
+		);
 		const index = buildSelectionIndex([quoting]);
 		expect(index.entries[0]?.copyText).toBe(quoted);
 	});
@@ -173,12 +209,16 @@ describe("entriesTo* transforms", () => {
 
 	test("entriesToText truncates past the char budget", () => {
 		const huge = "a".repeat(250_000);
-		const bigMsg = msg({
-			id: "big",
-			role: "assistant",
-			seq: 10,
-			contentJson: [{ type: "text", text: huge }],
-		});
+		const bigMsg = msg(
+			rowWithElements(
+				{
+					id: "big",
+					role: "assistant",
+					seq: 10,
+				},
+				[{ type: "text", text: huge }],
+			),
+		);
 		const idx = buildSelectionIndex([bigMsg]);
 		const res = entriesToText(idx.entries, new Set(["msg-big-0"]));
 		expect(res.truncated).toBe(true);

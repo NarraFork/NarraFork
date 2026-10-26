@@ -6,7 +6,7 @@ Two conversation modes are available:
 
 - "fresh": Create a brand-new narrator with no conversation history. Your message becomes its first input. Use this when the new narrator needs a clean slate for a different task.
 
-- "fork": Fork from the current conversation position, inheriting the message history. Your message is sent as a follow-up in the forked context. Use this when the new narrator should continue from where you are but take a different direction.
+- "fork": Fork from the current conversation position, inheriting the message history up to the start of your current response (the response that calls this tool is not inherited, so put anything from it the new narrator needs into your message). Your message is sent as a follow-up in the forked context. Use this when the new narrator should continue from where you are but take a different direction.
 
 Every parent, including an old chapter-bound narrator, creates a standalone conversation (no new chapter, git branch, project or worktree). The child inherits the parent's validated execution device/directory and access restrictions; no filesystem snapshot is restored or copied. Independent conversations may use the same directory, so independence is not filesystem isolation.
 

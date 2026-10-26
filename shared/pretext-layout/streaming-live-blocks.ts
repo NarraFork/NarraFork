@@ -1,3 +1,4 @@
+import { type MessageBodySource, messageBody } from "../narrator-blocks/message-blocks";
 /**
  * streaming-live-blocks.ts — Which block of the LIVE synthetic message is still
  * being written, as opposed to merely un-persisted.
@@ -48,8 +49,7 @@ export interface LiveBlockLike {
  * written, or -1 for "no text lane is open" (the model has moved on to tool calls).
  * Absent when the row was not built by an accumulator that tracks arrival order.
  */
-export interface LiveBlocksMessageLike {
-	contentJson?: unknown;
+export interface LiveBlocksMessageLike extends MessageBodySource {
 	liveBlockIndex?: number | null;
 	/** Frontend-only: a real checkpoint row currently projects a newer live block. */
 	liveContentProjection?: boolean;
@@ -108,8 +108,8 @@ export function resolveLiveBlockIndex(
 	const stamped = msg.liveBlockIndex;
 	if (typeof stamped === "number") return stamped;
 	if (!isStreamingMessage) return -1;
-	const blocks = msg.contentJson;
-	if (!Array.isArray(blocks) || blocks.length === 0) return -1;
+	const blocks = messageBody(msg);
+	if (blocks.length === 0) return -1;
 	return positionalLiveBlockIndex(blocks as readonly LiveBlockLike[]);
 }
 

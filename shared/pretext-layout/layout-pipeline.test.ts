@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { computePretextVListLayout, resolveVisibleWindow } from "./layout-pipeline";
 import type { MeasuredElement } from "./prepared-block";
 import type { AdapterRenderUnit } from "./segment-adapter";
@@ -18,11 +19,13 @@ function messageUnit(id: string): AdapterRenderUnit {
 		kind: "segment",
 		seg: {
 			kind: "message",
-			msg: {
-				id,
-				role: "user",
-				contentJson: [{ type: "text", text: id }],
-			},
+			msg: rowWithElements(
+				{
+					id,
+					role: "user",
+				},
+				[{ type: "text", text: id }],
+			),
 		},
 	};
 }
@@ -72,28 +75,32 @@ describe("shared pretext layout pipeline — adapter context forwarding", () => 
 				kind: "segment",
 				seg: {
 					kind: "message",
-					msg: {
-						id: "in",
-						role: "sys",
-						contentJson: [
+					msg: rowWithElements(
+						{
+							id: "in",
+							role: "sys",
+						},
+						[
 							{
 								type: "system_injection",
 								source: "team_message",
 								body: { kind: "messages", items: [{ fromId: "sender", text: "message body" }] },
 							},
 						],
-					},
+					),
 				},
 			},
 			{
 				kind: "segment",
 				seg: {
 					kind: "message",
-					msg: {
-						id: "reason",
-						role: "assistant",
-						contentJson: [{ type: "reasoning", text: "plain reasoning" }],
-					},
+					msg: rowWithElements(
+						{
+							id: "reason",
+							role: "assistant",
+						},
+						[{ type: "reasoning", text: "plain reasoning" }],
+					),
 				},
 			},
 		];
@@ -123,14 +130,14 @@ describe("shared pretext layout pipeline — adapter context forwarding", () => 
 					kind: "segment",
 					seg: {
 						kind: "message",
-						msg: {
-							id: "steps",
-							model: "gpt-5.6",
-							role: "assistant",
-							contentJson: [
-								{ type: "reasoning", text: "**First**\n\nbody one\n\n**Second**\n\nbody two" },
-							],
-						},
+						msg: rowWithElements(
+							{
+								id: "steps",
+								model: "gpt-5.6",
+								role: "assistant",
+							},
+							[{ type: "reasoning", text: "**First**\n\nbody one\n\n**Second**\n\nbody two" }],
+						),
 					},
 				},
 			],

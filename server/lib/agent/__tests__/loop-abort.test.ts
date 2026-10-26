@@ -24,6 +24,7 @@ let providerScenario:
 	| "enter_plan_prepared_order"
 	| "interleaved_tool_chunk_order" = "abort";
 let providerAttempts = 0;
+let enterPlanPermissionRequested = false;
 let streamingBoundaryClock = 0;
 let streamingBoundaryTool = "Write";
 let streamingBoundaryChunks: Array<{
@@ -298,6 +299,11 @@ const testProvider: ProviderAdapter = {
 			yield {
 				toolUses: [{ toolUseId: "tu_enter_plan", name: "EnterPlanMode", input: {} }],
 			};
+			// Keep the response open until the call asked for permission: it starts mid-stream.
+			while (!enterPlanPermissionRequested) {
+				if (params.signal.aborted) throw new Error("Aborted");
+				await new Promise((resolve) => setTimeout(resolve, 1));
+			}
 			return;
 		}
 		yield {
@@ -542,7 +548,7 @@ describe("agentLoop abort result draining", () => {
 		);
 		expect(toolResults.map((event) => event.toolUseId)).toEqual(["tu_stop_1", "tu_stop_2"]);
 		expect(toolResults.map((event) => event.isError)).toEqual([false, true]);
-		expect(toolResults[1]?.metadata).toEqual({ skippedForSoftStop: true });
+		expect(toolResults[1]?.metadata).toEqual({ skippedForPassEnd: true });
 		expect(events.at(-1)).toEqual({ type: "turn_complete", turnIndex: 0 });
 	});
 
@@ -576,9 +582,9 @@ describe("agentLoop abort result draining", () => {
 		expect(toolResults.map((event) => event.toolUseId)).toEqual(["tu_stop_1", "tu_stop_2"]);
 		// The already-started tool keeps its real success result…
 		expect(toolResults[0]?.isError).toBe(false);
-		expect(toolResults[0]?.metadata?.skippedForSoftStop).toBeUndefined();
+		expect(toolResults[0]?.metadata?.skippedForPassEnd).toBeUndefined();
 		// …while the one that never ran is explicitly reported as skipped.
-		expect(toolResults[1]?.metadata).toEqual({ skippedForSoftStop: true });
+		expect(toolResults[1]?.metadata).toEqual({ skippedForPassEnd: true });
 	});
 
 	test("after-tools 阶段到达的 soft-stop 会阻止下一轮模型请求", async () => {
@@ -640,7 +646,7 @@ describe("agentLoop abort result draining", () => {
 			"tu_read_2",
 			"tu_stop_3",
 		]);
-		expect(toolResults.at(-1)?.metadata).toEqual({ skippedForSoftStop: true });
+		expect(toolResults.at(-1)?.metadata).toEqual({ skippedForPassEnd: true });
 		expect(events.at(-1)).toEqual({ type: "turn_complete", turnIndex: 0 });
 	});
 
@@ -684,7 +690,7 @@ describe("agentLoop abort result draining", () => {
 		);
 		expect(toolResults.find((event) => event.toolUseId === "tu_edit_must_skip")).toMatchObject({
 			isError: true,
-			metadata: { skippedForSoftStop: true },
+			metadata: { skippedForPassEnd: true },
 		});
 		expect(toolResults.map((event) => event.toolUseId)).toEqual([
 			"tu_write_before_stop",
@@ -692,10 +698,10 @@ describe("agentLoop abort result draining", () => {
 			"tu_read_must_skip",
 		]);
 		expect(toolResults[0]).toMatchObject({ isError: false, output: "write:first.txt" });
-		expect(toolResults[0]?.metadata?.skippedForSoftStop).toBeUndefined();
+		expect(toolResults[0]?.metadata?.skippedForPassEnd).toBeUndefined();
 		expect(toolResults[2]).toMatchObject({
 			isError: true,
-			metadata: { skippedForSoftStop: true },
+			metadata: { skippedForPassEnd: true },
 		});
 		expect(events.at(-1)).toEqual({ type: "turn_complete", turnIndex: 0 });
 	});
@@ -859,7 +865,7 @@ describe("agentLoop abort result draining", () => {
 						expect(results[2]).toMatchObject({ isError: true, durationMs: 0 });
 						expect(events.at(-1)).toEqual({ type: "error", message: "Aborted" });
 					} else {
-						expect(results[2]?.metadata).toEqual({ skippedForSoftStop: true });
+						expect(results[2]?.metadata).toEqual({ skippedForPassEnd: true });
 						expect(events.at(-1)).toEqual({ type: "turn_complete", turnIndex: 0 });
 					}
 				} finally {
@@ -914,27 +920,41 @@ describe("agentLoop abort result draining", () => {
 		expect(events.at(-1)).toEqual({ type: "done" });
 	});
 
-	test("EnterPlanMode 在 assistant_message 建立准备态之后才请求执行权限", async () => {
+	test("EnterPlanMode 在自身 block_complete 建立准备态之后、流结束之前请求执行权限", async () => {
 		providerScenario = "enter_plan_prepared_order";
 		providerAttempts = 0;
+		enterPlanPermissionRequested = false;
 		const ac = new AbortController();
 		const order: string[] = [];
 
 		for await (const event of agentLoop(
 			makeConfig(ac.signal, {
-				shouldStop: () => true,
+				maxTurns: 1,
 				permissionHandler: async (toolName) => {
-					if (toolName === "EnterPlanMode") order.push("permission");
+					if (toolName === "EnterPlanMode") {
+						order.push("permission");
+						enterPlanPermissionRequested = true;
+					}
 					return { behavior: "deny" };
 				},
 			}),
 			"enter plan mode",
 			{ rows: [] },
 		)) {
+			// The host prepares plan-mode state while consuming the call's own block_complete
+			// (asynchronously); the loop must not start the call before that returns.
+			if (
+				event.type === "block_complete" &&
+				event.block.type === "tool_use" &&
+				event.block.name === "EnterPlanMode"
+			) {
+				await new Promise((resolve) => setTimeout(resolve, 5));
+				order.push("prepared");
+			}
 			if (event.type === "assistant_message") order.push("assistant_message");
 		}
 
-		expect(order).toEqual(["assistant_message", "permission"]);
+		expect(order).toEqual(["prepared", "permission", "assistant_message"]);
 	});
 
 	test("宽松计划模式下的计划提醒不会污染工具输出，且被中断时不投递", async () => {

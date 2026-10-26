@@ -254,7 +254,6 @@ export function createPublicShareClient(shareId: string, credential: string): Pu
 				query.set("limit", String(opts.limit));
 			if (opts.messageVersion !== undefined && Number.isSafeInteger(opts.messageVersion))
 				query.set("messageVersion", String(opts.messageVersion));
-			query.set("protocol", "2");
 			return json<PretextDocumentPageResult>(`/pretext-document?${query}`, signal).then(
 				decodeBlockPage,
 			);

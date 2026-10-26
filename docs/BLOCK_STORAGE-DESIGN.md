@@ -694,7 +694,8 @@ narrator_block_assets
 
 **块级 FTS（D6，P1 起）**
 - 新建 `narrator_blocks_fts`：FTS5、trigram 分词（与现有三个索引一致，支持 CJK），contentless（`content=''`），rowid 取块行的 rowid。正文不再存一份。
-- 写入时机与 `deriveEnvelope` 相同（D28）：一步封口、工具进入终态、编辑或删除时，在同一个事务里把这一步变化过的块整批删插。流式中途不写，一步只有一次批量写入。
+- 写入时机与 `deriveEnvelope` 相同（D28）：一步封口、工具进入终态、编辑或删除时，变化过的块需要新的索引文本。流式中途不写。
+- P3e 起，同步不在写入者的事务里分词：它把块记进 `narrator_block_index_queue`，后台任务在 db-worker 里算出文本，主线程按预算分批写入（见 P3e）。搜索因此比写入晚几百毫秒。
 - 每块的索引文本：
   - `input`、`output`：`model_text`；
   - `reasoning`：推理分段原文；
@@ -1410,6 +1411,7 @@ reconcile(narrator, target, now):
 - 每个信封自带 `body_format`，读取层（`loadBlocks`、两个 worker）对两种格式都认。没有全库切换日。
 - 任何**修改** `body_format = 1` 信封的操作，都先在同一个事务里把它物化：解码，写入块行，改为 `body_format = 2`。然后再按块 id 执行修改。
 - 前置条件：P0 已经把所有直接改 `content_json` 的旁路写入收口进 store；否则下标身份会在物化之前就被改乱。
+- 这种共存是永久的，不是过渡期：读取时现场解码、写时物化与回填作业一直保留（§10.7）。
 
 ### 10.2 旧数据的确定性解码 `decodeLegacyContent`
 
@@ -1482,10 +1484,22 @@ reconcile(narrator, target, now):
 |---|---|---|
 | `narratorBlocks.write` | store 写块表（双写） | P1 |
 | `narratorBlocks.read` | 读取方读块表 | P2 |
-| `narratorBlocks.wsV2` | WS 协议 v2，与页面 API、前端一起切换（D5）；默认开，关闭即回到 v1（前端两种都处理） | P2 |
+| `narratorBlocks.wsV2` | WS 协议 v2，与页面 API、前端一起切换（D5）；默认开，关闭即回到 v1（前端两种都处理）。P3d 第 7a 步已与 v1 协议一起删除，设置加载时去掉存量的键 | P2 |
 | `narratorBlocks.compactJson` | 新行的 `content_json` 写 `'[]'`（`body_rows_only = 1`）；只在 SQLite 且 `write`、`read` 都开时生效，默认关 | P3b |
 
 每个开关都可以单独关闭。P3 之前，关闭 `narratorBlocks.read` 就完全回到现状；P3b 之后，存在只存行的信封时须先运行 `restore`。
+
+### 10.7 从无块的旧版本直接升级（永久支持）
+
+总会有用户从完全没有块表的旧版本直接升级到最新版本，中间不经过任何一个跑过回填的版本。旧格式的读取与转换因此永久保留，不设「必须先升到某个中间版本」的要求：
+
+- **升级后立即可用**：迁移建好块表后，所有信封仍是 `body_format = 1`。消息页、模型历史、External API、导出经中央正文层读取，旧格式信封现场解码成块（`decodeLegacyContent`）；修改旧格式信封时先物化（§10.1）。前端只收到一种形态。
+- **后台转换**：convert → verify → reindex 照常自动运行，按 §10.3 的节奏和主线程预算（P3c 实现说明），不阻塞启动。
+- **搜索**：信封级 FTS 留到本实例自己的 reindex 完成后才退役（P3c）。回填期间大部分信封还没有块，只读块索引会让旧信封退化成 `content_text` 子串扫描，所以两种搜索模式都保留。
+- **要永久保留的代码**：`decodeLegacyContent`（回填和 project.db 导入本来就要用）、中央正文层里 `body_format = 1` 的读取分支、写时物化、三个回填作业、两种搜索模式及退役条件。这些都已集中在正文层、回填服务与搜索 store 里，体量很小。
+- **PG**：PG 还没有块行，所有信封都是旧格式，同样依赖这条读取路径。
+- **不选「强制中转版本」**：要在启动时拒绝运行并提示先升中转版本，手动安装二进制的用户会绕过更新服务器；为了删掉一小段集中的代码，换来一个可能卡住用户的升级步骤，不值得。
+- **验收**：一个直接升级测试，用 P1 之前的 schema 与各种真实形态的旧数据做库快照，跑完全部迁移后：回填完成前，消息页、模型历史、搜索立即可用且与升级前一致；回填作业依次完成；信封级 FTS 在 reindex 完成后的下次启动时退役；前端按块渲染这些会话。
 
 ## 11. 实施阶段
 
@@ -1686,20 +1700,20 @@ reconcile(narrator, target, now):
 - **传输边界解码**（`frontend/lib/block-protocol.ts`）：
   - 所有 `messages` 订阅都带 `protocol: 2`（服务端按连接、按叙述者只有一种协议，三处订阅必须一致），页面请求带 `?protocol=2`（含公开分享页）。
   - v2 页面与帧在边界还原成 v1 形态：信封 + 块 → 带 `contentJson` 与嵌套 `children` 的 `TreeMessage`；`message_upserted` → 其 `cause` 指名的 v1 帧（按帧计 `messageVersion` 不变）；`block_delta` → v1 `stream_event`；v2 catch-up → `topLevel` / `orphanChildren`。
-  - 每行附 `blockRefs`（块 id 与在 `contentJson` 中的元素区间），解码时同时记入 `frontend/lib/block-refs.ts`。
+  - 每行附 `blockRefs`（块 id 与在 `contentJson` 中的元素区间），解码时同时记入 `frontend/lib/block-refs.ts`（P3d 第 4 步删除这个登记表，操作改从行读块）。
   - 服务端信封带 `parentMessageId`（在 v1 中嵌套于哪一行），v2 catch-up 带 `orphanMessageIds`，客户端据此精确还原 v1 树。往返测试保证"服务端编码 + 客户端解码"得到原来的 v1 页面与帧。
   - 服务端回 v1（`wsV2` 关）时一切照旧，所以 `wsV2` 是回退开关。
 - **按块寻址的操作**：删除（单个、批量）、回滚、回滚与删除预览、文件恢复预览、编辑重生成，在已知块时走 `/blocks` 路由，作用于该元素所在的整块；只从 v1 服务端见过的消息仍走按下标的路由。编辑、恢复 assistant 消息仍按整条消息（编辑器编辑的是整条文本，按块编辑需要编辑器指明块）；allow-retry 按调用 id，本就精确。
 - **账本按块打补丁**：v2 连接上的 `tool_started` / `tool_completed` 带账本 attempt 所属的 tool 块（`blockId`：帧带 `toolCallId` 时取该 attempt 的 `block_id`，否则取该调用最新的 attempt）；前端只写持有该块的那一行，没有块 id 或未加载该块时仍写所有出现处。
 - **元素按块 id 作键**：以块协议到达的消息，其元素键为 `${messageId}-blk[<blockId>]`（多元素块的后续元素加 `+<offset>`），取代按位置的 `${messageId}-b<index>`；删除或插入前面的块不再改变后面行的键（测量高度、折叠、选择随之保留）。v1 消息仍用按位置的键。tool 行仍以调用 id 作键（反思、权限匹配、跳转都按它寻址）。
-- **流式交接**：流式元素与其落库副本已按元素的全局标识（`${attempt}:${order}`，即 v2 的块 id 所对应的元素）配对：supersede 用 id + revision，生命周期动画用 `lifecycleId`。按文本后缀、`outputIndex` 的旧匹配只服务于不带元素 id 的 provider 流与 `wsV2` 关闭时的 v1，因此保留，与 v1 协议和开关一起在 P3 删除。
+- **流式交接**：流式元素与其落库副本已按元素的全局标识（`${attempt}:${order}`，即 v2 的块 id 所对应的元素）配对：supersede 用 id + revision，生命周期动画用 `lifecycleId`。按文本后缀、`outputIndex` 的旧匹配只服务于不带元素 id 的 provider 流与 `wsV2` 关闭时的 v1，因此保留，在 P3d 与 v1 协议和开关一起删除（前提是先确认各 provider 的流都带元素 id）。P3d 第 2、6 步确认了这一前提并删除了旧匹配。
 
 ### P3 退役与新能力
 
 **交付**
 1. 新行的 `content_json` 写 `'[]'`；运行清空旧行的作业。compact 标记保留投影，`compact_pending` 及其读取方不变（见 P3b 实现说明）。
 2. 退役信封级 FTS：删除 `narrator_messages_fts` 及其触发器，搜索只查块级索引。
-3. 解码路径保留一个版本后删除，只留给 project.db 旧归档导入使用。
+3. 解码路径永久保留：读取时现场解码、写时物化、回填作业与 project.db 旧归档导入都用它，跨版本直接升级的实例靠它在后台转换期间照常可用（§10.7）。
 4. 按需开放新能力：
    - 块级永久链接、引用、评论；
    - 按块的保留策略；
@@ -1710,7 +1724,7 @@ reconcile(narrator, target, now):
 - P3a：所有读改写经正文层，不改数据（下文）。
 - P3b：`narratorBlocks.compactJson`（默认关）让新行写 `'[]'`；清空旧行的作业只在回填 verify 之后由管理员显式触发。
 - P3c：退役信封级 FTS（下文）。
-- P3d：删除 v1 解码 / 协议与 `wsV2` 开关。
+- P3d：删除 v1 页面与 WS 协议、`wsV2` 开关和流式交接的旧启发式；前端改为直接按块渲染，去掉入口处转回 v1 形状的那层（P3d 设计见下文）。旧格式的读取与转换不删（§10.7）。这些都与库里存的是什么无关，所以不必等各实例回填完成；`wsV2` 作为回退开关，在 v2 经过一个正式版本后再删。验收包括 §10.7 的直接升级测试。
 
 **P3a 实现说明（正文只经正文层读写）**
 - **正文层**（`server/services/narrator-body-writes.ts`）：写入方把正文交给它，块行由交来的正文建出，不回读 `content_json`，所以列里存什么（P3b）对写入方透明。
@@ -1780,10 +1794,106 @@ reconcile(narrator, target, now):
   - 最初版本在主线程逐条信封组装正文、读账本、规划并重写索引，大信封单片可达数百毫秒；第二版把计算移进 worker，但主线程仍逐条读账本指纹、一片一个事务，实例上每分钟仍有数百个 50–185ms 的事务；第三版拆成按时间截止的短事务，但没计提交时的落段与合并，且把完好索引里的每个条目删了重写（墓碑让 FTS5 把旧段整体重写），单个事务仍达 2.6 秒。已改为上述做法。
   - 存储页列出该作业，暂停对它同样有效。
 - **退役**：`ensureFts` 在启动时，若 reindex 作业已完成，就在一个事务里先删三个触发器、再删 `narrator_messages_fts`，并设定 `isEnvelopeIndexRetired`。退役的判断先于一切信封级索引的处理，非 trigram 检查、缺触发器修复、非正常退出后的探测都跳过已退役的索引。
-- **块索引丢失**：删除触发器缺失（表被迁移重建，rowid 可能已变），或非正常退出后完整性探测失败时，清空块索引并让 reindex 从头开始。信封级索引因此留下，或者经已有的缺触发器修复从 `content_text` 重建回来，直到 reindex 再次完成。旧版本发现索引缺失时也按同样方式重建，所以退役可以回退。
+- **块索引丢失**：删除触发器缺失（表被迁移重建，rowid 可能已变），或后台完整性检查点名它损坏时（下一次启动），清空块索引并让 reindex 从头开始。非正常退出本身不再触发启动探测：FTS5 的 `integrity-check` 要拿写锁、在监听端口前读完整个索引，47 GB 的库上服务因此长时间起不来；而 WAL 下索引变更与它索引的行同一事务提交，崩溃拆不开两者。索引损坏由后台子进程的只读 `quick_check`（SQLite 3.44+ 会跑 FTS5 自带的索引检查）发现，只怪 FTS 索引的报告记入 `fts-repair.json`，下次启动只重建点名的索引，不走整库恢复。信封级索引因此留下，或者经已有的缺触发器修复从 `content_text` 重建回来，直到 reindex 再次完成。旧版本发现索引缺失时也按同样方式重建，所以退役可以回退。
 - **PG**：PG 还没有块行，搜索不变。
 - **存储页**：块索引计入「搜索」分类。
 - **测试**：`block-only-search.test.ts`（删掉信封级索引后覆盖各路径、旧信封、跨块语义）；`narrator-block-backfill.test.ts`（reindex 在 verify 后运行且不动 revision，清空的块索引重建得与写入时一致，覆盖只存行的信封）；`fts-retire.test.ts`（退役前后、退役后再丢块索引的恢复、无块存储的库）。
+
+**P3d 设计（前端按块渲染，删除 v1 协议）**
+
+现状（main，P3c 之后）：
+- **只有一个渲染器**：叙述者面板、聊天、公开分享都挂 `PretextExactMessageList`（vlist）。
+- **入口转回 v1**：页面（`getPretextDocumentPage`、分享页）与 WS（`narrator-ws-manager`）都请求 `protocol=2`。`frontend/lib/block-protocol.ts` 在入口处把信封 + 块拼回带 `contentJson` 的 `TreeMessage`，按 `parentMessageId` 嵌进 `children`，块的范围另存进 `block-refs.ts` 的模块级登记表。
+- **存储与渲染**：`PretextLayoutCoordinator` 持有 `TreeMessage[]`。行由 `message-segments` → `render-units` → `pretext-document-layout` → `segment-adapter`（`shared/pretext-layout`，只有前端用）按 `contentJson` 下标逐元素构建，注入与伴随块的配对在前端用 `contextBlockViews` / `injectionBlockViews` 重做一遍。
+- **已经按块的**：行键（`blk-<blockId>`）、账本补丁（`tool_started` / `tool_completed` 带 `blockId`）、删除与回滚等操作（已知块时走 `/blocks` 路由）。
+- **流式还不按块**：`block_delta` 被转回 v1 的 `stream_event`，块 id 丢掉；`block_opened` 被丢弃。流式副本与落库副本按元素 id + revision 配对，没有元素 id 的流（provider 不带 id 时服务端不发 `block_delta`，原样发 v1 `stream_event`）靠文本后缀与 `outputIndex` 的启发式。
+- **规模**：约 48 个生产文件、5.5–7 千行要改，另有约 1 千行死代码可删（`message-tree-utils` 中 15 个无调用的导出、`narrator-message-helpers` 的几个辅助函数、`TreeMessage._blockOriginalIndices`、没人填充的 React Query 消息缓存）。
+
+目标：前端只认信封 + 块。入口不再转换，`contentJson`、`children`、`blockRefs` 登记表从叙述者消息的前端代码里消失。
+
+- **store**：`PretextDocumentInput` 改为 `{envelopes, blocks}`。
+  - 信封保留现有元数据（role、origin、`toolCalls` 账本行、编辑信息、`parentMessageId`、seq），按 seq 排序，用 `blockIds` 列出自己的块。
+  - 块按 id 存（`BlockDTO`：kind、subtype、phase、revision、wireId、attemptId、elements、hasOriginal）。
+  - 派生索引代替树遍历：`parentMessageId` → 子信封（取代 `children`），`wireId` → tool 块，信封 → 块。
+- **帧的应用**：
+  - `message_upserted` 与 catch-up：信封替换；块按 id + revision 取新；信封不再列出的块删除。
+  - `messages_deleted`：删信封及其块。
+  - `segment_compact_hide`、compact 标记状态：照旧作用于信封。
+  - 现有的 upsert / replace / insert / remove 改写为按块的同一套规则。`message_updated` 只接受截尾或 COW 别名的限制随之消失，因为块按 id 合并，不再按元素下标比对。
+- **流式**：
+  - `block_opened` 在 store 里建一个 open 块（尚无 messageId 时挂在流式尾部）；`block_delta` 按块 id 追加（revision / textOffset 去重）；工具的输入片段按 `block_opened` 给出的块 id 归到 tool 块。
+  - 同一块 id 的落库块（下一次 checkpoint 的 `message_upserted`）到达时直接取代 open 块。
+  - 流式累加器、`streaming-handoff`、`streaming-block-supersede` 的文本后缀与 `outputIndex` 启发式、`streaming-tool-chunks` 里遍历 `contentJson` / `children` 找已落库工具的逻辑全部删除。
+  - 前提：服务端给每个流式元素都配上元素 id（provider 不带时由服务端按 `${attempt}:${order}` 补上），这样每个增量都以 `block_delta` 发出，不再有 v1 `stream_event` 的旁路。
+- **建行**：
+  - 分段、活动单元、`segment-adapter` 改为逐块遍历。一个块是一个渲染来源，多元素块（附件 + 文本的 input、注入 + 伴随的 context）把块内元素交给现有的逐元素适配函数（`adaptSystemBlock`、`adaptReviewCard`、`adaptFramedSystemCard`、`adaptSpokenInjection`、`buildToolCardData` 等）。
+  - 注入与伴随块的配对由块边界给出，服务端解码与同步时已按同样的规则分组，前端不再重做 `contextBlockViews` / `injectionBlockViews`。
+  - tool 卡由 tool 块与信封的 `toolCalls` 按 `wireId` 关联；reasoning 段由相邻的 reasoning 块组成。
+  - 键：叙述者消息一律 `blk-<blockId>`，块内多个可选元素加 `+<offset>`；tool 行仍是 `tool-<toolUseId>`；按位置的 `-b<i>` 键只剩非叙述者行。
+- **补丁与寻址**：
+  - 工具字段：按 `blockId`；只给了 toolUseId 的事件经 `wireId` 索引找块。
+  - 子代理活动：经子信封索引。
+  - 选择、编辑目标、ask-in-passing、工具元信息、反思与 spec 任务索引：从 `(messageId, blockIndex)` 改为块 id（加块内偏移）。
+  - 操作只走 `/blocks` 路由，前端删除按下标的调用；服务端按下标的路由若无其他调用方一并删除。
+  - 「显示原文」按块的 `hasOriginal` 走块详情路由，不再读信封的 `originalContentJson`。
+- **非叙述者行**：聊天（`chat-vlist-adapter`）与分享页讨论区现在拼合成的 `contentJson` 行，改由一个小的辅助函数生成信封 + 块（每个元素一块，合成 id），渲染器只有一种输入形态。
+- **服务端**：
+  - 删除 v1 页面与 v1 消息帧的输出、订阅时的协议协商和 `narratorBlocks.wsV2` 设置（设置迁移去掉这个键）。
+  - 发射方内部仍可产出 v1 形态的帧，经 `narrator-block-protocol.ts` 映射后发出；这个映射成为唯一出口。
+  - 旧格式信封照旧现场解码成块（§10.7），前端只见块。
+- **回退**：前端改造后 v1 路径不可达，所以 `wsV2` 开关与改造在同一个 PR 里删除，回退靠上一个正式版本。P3d 在默认开启 v2 的版本正式发布之后开始，这样 v2 协议本身已在线上跑过。
+
+**P3d 分步**（每步提交后 CI 全绿、应用可用；服务端两步与前端各自成 PR）：
+1. 直接升级测试（§10.7）：P1 之前 schema 的库快照，覆盖迁移、现场解码、回填与退役。只测服务端，先行落地，后面各步都受它保护。（已完成）
+2. 服务端保证每个流式增量都带元素 id：loop 是 `stream_text` / `stream_reasoning` 唯一的产生者，它的 `OutputContentAccumulator` 总给出与落库元素相同的 `${attempt}:${order}`；事件类型改为必填，删掉无 id 的回退（按 lane 的随机 id、OpenAI itemId、`FileReferenceContextTracker` 按输出下标的通道），每个增量都以 `block_delta` 发出。（已完成）
+3. 前端的块访问器 `messageBlocks`（`shared/narrator-blocks/message-blocks.ts`）：协议行按它带的块；客户端自建的行（流式行、聊天与分享页的行、测试数据）按服务端切分旧信封的同一函数 `splitEnvelope` 切块，两边分组一致（块页测试里有对齐检查）。之后读消息正文的代码都经它，不再按 `contentJson` 下标。（已完成）
+4. 身份：所有元素行按块作键（`elementKey` 经访问器）；块目标、选择、编辑目标、ask、各索引与操作改为块 id（加块内偏移），经文档里的行解析，不再查全局登记表。
+   - 已完成：元素行键与 vlist 块目标经访问器；删除（单个、批量）、回滚、文件恢复预览与编辑重生成在操作开始时从列表的行解析块（`MessageListHandle.messageOf` + `message/block-target.ts`），API 直接用块 id。服务端命名过的块（`MessageBlock.named`）才走 `/blocks` 路由，客户端自建的行仍走按下标的路由，直到第 7 步。`block-refs.ts` 与没有调用方的回滚预览、块删除预览查询已删除。
+   - 余下的选择项、编辑目标、ask、工具元信息与反思索引并入第 5 步：它们的 `(messageId, blockIndex)` 来自分段按元素下标的遍历，分段改为逐块后随之得到块 id，单独先改只会多一层下标与块之间的换算。
+5. 正文经访问器：读消息正文的代码一律经 `messageBody`（元素）或 `messageBlocks`（块），不再读行的 `contentJson`。`frontend/lib/narrator-body-access.guard.test.ts` 按文件计数余下的直接使用，只降不升：访问器本身、行类型、构建或改写行的代码（store 的合并与补丁、流式、协议解码、聊天与夹具的行）。（已完成）
+   - 分组不另改写：非 assistant 消息在服务端解码为一个块（input 或 context），注入与伴随块的配对用的是与服务端解码相同的 `contextBlockViews` / `injectionBlockViews`；assistant 消息的分段按元素的类别（正文、工具、相邻 reasoning 成段），块边界只落在元素之间、不跨类别（旧信封每个元素一块）。按元素遍历得到的分组因此与逐块遍历相同，改写不会改变输出。
+   - 元素在消息内的位置只作遍历坐标（选择项、编辑目标、ask、各索引仍以 `(messageId, 位置)` 记），由 `messageBody` 从块推出，第 7 步后含义不变；身份（行键、操作）已按块。
+6. 流式只认元素标识：每个流式增量都带元素 id、revision 与原始偏移，服务端快照块同样（loop 的累加器本来就给出，`stream_text` / `stream_reasoning` 的这两个字段改为必填，事件处理去掉缺偏移的分支）。前端的增量折叠、快照合并与交接只按 id + revision：删除按 `outputIndex` 认道、按文本后缀与 `providerMetadata.openai.itemId` 判断覆盖、合成的 `streaming:*` id，以及只为无版本块保留的丢弃路径；不带标识的增量与快照道不再应用。web_search / image_generation 仍按 id 在本轮落库后退场。开发用的模拟流按服务端的方式给出 id、revision 与偏移。（已完成）
+   - 累加器与交接保留：它们本就以元素 id 为键。交接把更新的 revision 合进同 id 的落库块，把已按该 revision 落库的道从流式行里去掉，这就是"同一块 id 的落库块取代 open 块"。把它们改成 store 里的 open 块只换数据结构，与第 7 步行直接持有块一起做。
+7. 协议与行：
+   - 7a 删除 v1 协议与 `wsV2`：页面接口（含公开分享页）与 WS 只发 v2，消息帧、流式快照、catch-up、工具开启都按 v2 发给每个订阅者；订阅不再协商协议（已加载的旧前端仍会带的 `protocol` 字段照常接受、不起作用），`message_protocol` 帧删除；设置加载时去掉存量的 `narratorBlocks.wsV2`。前端不再请求协议，解码不再放行 v1 页面与 v1 catch-up。服务端内部仍以行的形状（`contentJson`、`children`）构建消息，由 `narrator-block-protocol.ts` / `narrator-block-page.ts` 统一转成 v2 发出。（已完成）
+   - 7b 行改为直接持有块：`messageBody` / `messageBlocks` 改从块读，守卫里列出的改写行的代码改为按块；删除 `contentJson`、`children`、`blockRefs`、`block-protocol.ts` 的回转、按下标的路由与死代码；更新文档。分三个 PR：
+     - 7b-1 行持有块：`TreeMessage.blocks`（`RowBlock`：块的身份 + 元素，服务端命名的块 `named`）取代 `contentJson` + `blockRefs`。解码器直接给出块；客户端自建的行（流式行、子代理流式行、工具分片行、聊天行、夹具）由 `rowWithElements` / `splitRowBlocks` 按 `splitEnvelope` 切块；改写正文一律经 `mapRowElements` / `filterRowElements`，块保持 id，未变的块与行保持引用，空块去掉。`messageBody` 按块数组缓存展平结果，正文身份随块不变。交接从流式行去掉已落库的块后，余下块的 id（与键）不再因重切而移位。守卫只剩访问器与行类型；尚未迁移的夹具仍以 `contentJson` 建行，访问器读它时按服务端规则切块。（已完成）
+     - 7b-2 删除行上的 `contentJson`：`TreeMessage.blocks` 必填，`contentJson` 从行类型与访问器里删除，没有块的行正文为空，访问器不再替任何行切块。顺手问的开始与解答接口原先直接返回带 `contentJson` 的行，改为按块协议返回该消息（`toEnvelopes`），前端在接口层解码（`decodeBlockMessage`）。测试夹具一律经 `rowWithElements` 建行，原地改正文的测试改为替换块。守卫只剩 `splitRowBlocks` 交给服务端切分函数的一处。（已完成）
+     - 7b-3a 按下标的路由与死代码：前端的块操作（回滚、删除块、批量删除、文件恢复预览）只认服务端命名的块，客户端自建的行（流式行）没有可操作的块，不再退回按下标的路由。服务端删除只有旧前端调用的按下标路由：`POST /:id/rollback/:messageId`、`DELETE /:id/messages/:messageId/blocks/:blockIndex`、`DELETE /:id/messages/batch-blocks`、`GET /:id/rollback-preview`、`GET /:id/block-delete-preview`，以及没有调用方的 `GET /:id/segment-compact/:messageId/messages`；路由测试改走 `/blocks` 路由（`tests/block-ids.ts` 按元素位置取块 id）。编辑重生成仍可按消息寻址（整条消息，不是下标）。前端删除没有生产调用方的消息树与流式子行辅助函数（React Query 消息缓存、按 toolUseId 的索引、子代理流式子行、顶层流式分片对账等）及只测它们的用例，失效查询里去掉已无查询的预览键。服务层按下标的函数仍是块路由的实现，保留。（已完成）
+     - 7b-3b 行平铺，删除 `children`：服务端只把一种消息嵌在另一行下面——旧数据里非子代理工具的内联回复（`inlineRows`；Agent / Task / Send 的子会话从不进父树，父行只带活动摘要），前端从不单独渲染它们。解码器不再把信封嵌回 `children`，行按信封顺序平铺：每行之后紧跟嵌在它下面的行，嵌套的行保留 `parentMessageId`（`TreeMessage.children` 删除，`message/nested-rows.ts` 给出判断与索引）。会话主线是不嵌套的行：分段、选择、尾部元信息、catch-up 游标、spec 任务定位与流式交接跳过嵌套的行；工具项的嵌套行（定子代理样式）由分段每轮按 `parentMessageId` + `parentToolUseId` 建索引取得，分段缓存按它浅比较。补丁、反思索引、工具元信息与已落库工具的收集直接扫平铺的行，不再递归。文档操作：追加拒绝嵌套的行，尾部 seq 判断跳过它们；upsert 原地更新已有行（嵌套的行原地不动，不再继承 `children`），新的嵌套行插到父行的嵌套行之后，父行不在则拒绝；中间插入与 ask 卡不插进一行与它的嵌套行之间；删除与裁头连带嵌套的行；COW 替换让嵌套的行改挂到新 id。守卫测试以类型检查保证 `TreeMessage` 没有 `children`。（已完成）
+
+**验收**：
+- §10.7 的直接升级测试通过。
+- 前端生产代码里叙述者消息不再读 `contentJson` / `children`（`narrator-body-access.guard.test.ts`：`contentJson` 按文件计数，`children` 由类型检查保证）。
+- 流式、交接、编辑、删除、回滚、ask、反思、子代理、compact、翻译的现有前端测试改为喂信封 + 块后全部通过。
+- 浏览器测试覆盖一次完整的流式回合：open 块 → 落库块，键不变、无闪烁。
+
+### P3e 同步成本：工具结束不再拖住主线程
+
+**问题**（多个代理并行时主线程卡顿）
+- 工具结束（`updateToolCallResult`）的事务末尾调用 `flushChangedEnvelopes()`，从全局队列取最多 64 条消息同步，不限于本次写入的消息，也不计时间预算。
+- 同步一条消息总是整条重算：读出全部正文与全部工具记录（含完整输出），每个输出解析两次。
+- 条件里有 `output !== undefined`，每个有工具记录的工具块每次同步都要重写附件、重算 `outputToText`，并删插一遍 trigram 索引。
+- 一条消息有 N 个并行工具时，每个工具的每次状态变化都让整条消息重新入队，索引写入总量是 N² 级。实测（Bun，32 个各 50 KiB 输出的工具逐个结束）：第 k 次结束写 k 条索引，单次阻塞从 15ms 涨到 201ms，合计约 2.8s；队列里积压 64 条时，一次小工具结束在单个事务里阻塞 542ms。
+
+**设计**（不改触发器契约，v3 原样保留）
+1. 按工具记账（工具记录轮）
+   - 块行新增 `ledger_revision`：它上次同步时采用的工具记录，记为 `调用 id:model_revision`。`model_revision` 由 v3 触发器在输入、输出、状态、attempt 等列变化时递增，所以它就是"这次调用变了没有"。
+   - 信封新增 `blocks_content_hash`：块行上次所依据的 `content_json` 文本的哈希。store 写正文时由序列化结果算出（drizzle 的 JSON 列即 `JSON.stringify`），队列同步时由列文本算出。
+   - 队列同步先判断正文是否没变：只存块行的信封（块行就是正文），或列文本仍哈希到记录值。没变时只走工具记录轮：读出各工具块的指纹和被采用调用的 id 与 `model_revision`（不读输入输出），只重派生指纹变了的工具块；每块单独解码它自己的元素和它那一次调用，得到 phase、subtype、`model_chars`、附件、账本绑定，并排入索引。工具块的这些列只取决于它自己的元素和这一次调用，所以与整条消息解码的结果相同（测试逐列比对）；单块解码得不到同一个调用的工具块、或 payload 与行不一致时，退回完整同步。
+   - 完整同步也不再读工具输出：输出列只取"是否 `_broken`"（SQL 里先 `instr` 预筛再 `json_type`，与 `isBrokenToolOutput` 等价），附件只为新块、变化的块和指纹变了的块读取它那一次调用的输出。`model_chars` 变化也计入"变化"，从而随工具记录输入的改写更新。
+2. 索引出队（`narrator-block-index.ts`）
+   - 新表 `narrator_block_index_queue (block_id, version)`。同步不写索引文本，只把封闭的块排入队列（再次排入时 `version + 1`）；块回到 `open` 时同步删掉它的索引行并出队。
+   - 后台任务：db-worker（`blockIndexQueueSlice`）从只读连接按 `plannedTexts`（与重建索引任务同一套）算出排队块的文本；主线程按 rowid 顺序写入，每个事务以字符预算和 `APPLY_TARGET_MS` 截止，之后按耗时的 3 倍让出主线程。写入前核对：队列 `version` 未变、所在信封不在同步队列里、块的 rowid 未变，否则留待下次。
+   - 重建索引任务跳过排队中的块，由队列写入。启动时有积压就开始写。
+3. 写入事务只同步自己排入的项
+   - store 事务开头取同步队列的水位线（`syncQueueMark`），结束时只同步水位线之后排入的项（`flushQueuedSince`，上限 64）。别人此前排入的项、批量复制有意留给清扫的项，都交给清扫。
+   - 清扫每处理一条就检查一次 25ms 预算；有积压时按耗时的 3 倍（至少 100ms）后再来，没有积压时 5 秒一次。单条同步超过 50ms 记慢日志（一分钟最多一行）。
+
+**效果**：一个工具结束只读它自己那一次调用、只写它自己的块，与消息里有多少工具、多少代理同时跑无关；分词移到后台、有预算的切片里。
+
+**取舍**：排队中的信封由列读取（已有行为），排队窗口变长不影响正确性；块的派生列（附件、`model_chars`、索引）对非 store 写入最多滞后到下一次清扫；搜索滞后几百毫秒。
 
 ## 12. 风险与成本
 
@@ -1805,9 +1915,9 @@ reconcile(narrator, target, now):
 - 每种 provider 模式都有等价测试，并对真实请求录制做 diff。
 - 每处有意的行为修正（附录 B）单独列出，单独验证。
 
-### 12.4 双格式期的复杂度
-- 解码路径、写时物化、回填作业会同时存在一段时间。
-- 回填完成后再保留一个版本，然后删除解码路径（project.db 旧归档导入除外），避免永久背着两套格式。
+### 12.4 双格式的复杂度
+- 解码路径、写时物化、回填作业永久保留（§10.7）：跨版本直接升级的实例、PG 与 project.db 导入都离不开它们。
+- 代价是一直背着两种存储格式的读取；P3a 之后它们只在中央正文层与回填服务里，其余代码只见块。要删的是协议层的双轨（v1 / v2）和前端入口处的形状转换（P3d），不是存储层的旧格式。
 
 ### 12.5 PG 与迁移工具
 - 新表和触发器要维护两种方言，并由生成器支持 v2 契约。这是 P1 的前置工具改动。
@@ -1945,6 +2055,8 @@ reconcile(narrator, target, now):
 | D26 | Await 回执改写怎样满足只追加 | 推荐：只许 seq 更早的回执缩短更晚的工具结果；后到的回执与更早的结果都保留全文（§7.2）。备选：记录「第一次投影时的判断」，要多一份状态 | **已定** |
 | D27 | plan mode 改写工具描述与前缀保持冲突 | 推荐：纪元内不改描述，限制靠 system 提醒与执行期拦截（权限层已有 `readOnly`，覆盖范围待核，§7.7）。备选：切换 plan mode 视为纪元边界，代价是每次切换一次缓存未命中（即现状） | **已定** |
 | D28 | 派生字段（`content_text` 等）何时重算 | 推荐：只在封口、工具进入终态、编辑或删除时；流式中途的部分文本搜不到（§4.6）。备选：每个 item 封闭时重算，FTS 写入多 N 倍 | **已定** |
+| D29 | 旧格式的读取与转换是否删除 | 永久保留：总有用户从无块的旧版本直接升级到最新版，回填完成前要靠现场解码照常使用；PG 与 project.db 导入也要用。P3d 只删协议层的 v1 与 `wsV2` 开关（§10.7） | **已定** |
+| D30 | 前端是否直接按块渲染 | 是：P3d 去掉入口处把 v2 转回 v1 形状（`contentJson` + `children`）的那层，前端 store 与渲染直接以信封 + 块为准 | **已定** |
 
 ## 附录 A：现有块 type 到 kind 的映射
 

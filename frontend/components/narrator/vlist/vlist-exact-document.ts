@@ -12,8 +12,10 @@
  */
 
 import type { TreeMessage } from "@frontend/lib/api/types";
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import type { CatchUpCursor } from "@shared/narrator-catch-up";
 import type { PretextLayoutIndex } from "@shared/pretext-layout";
+import { isNestedRow } from "../message/nested-rows";
 import { resolveExactReloadDecision } from "./vlist-reload-policy";
 
 /**
@@ -78,9 +80,7 @@ export function hasRenderableExactLayout(
  * the document (ask_in_passing, context_cleared) still answers the reload.
  */
 export function isCompactMarkerMessage(message: TreeMessage | undefined): boolean {
-	const blocks = message?.contentJson;
-	if (!Array.isArray(blocks)) return false;
-	for (const block of blocks) {
+	for (const block of messageBody(message)) {
 		const type = (block as { type?: unknown } | null)?.type;
 		if (type === "compact" || type === "segment_compact") return true;
 	}
@@ -88,17 +88,20 @@ export function isCompactMarkerMessage(message: TreeMessage | undefined): boolea
 }
 
 export function buildExactCatchUpCursor(
-	messages: readonly { id?: unknown }[],
+	messages: readonly { id?: unknown; parentMessageId?: unknown }[],
 ): CatchUpCursor | undefined {
 	for (let index = messages.length - 1; index >= 0; index--) {
-		const id = messages[index]?.id;
+		const message = messages[index];
+		// The cursor names the last row of the conversation, not one nested under it.
+		if (!message || isNestedRow(message)) continue;
+		const id = message.id;
 		if (typeof id === "string" && id.length > 0) return { parentLastMessageId: id };
 	}
 	return undefined;
 }
 
 export function buildExactMessageSnapshot(
-	messages: readonly { id?: unknown }[],
+	messages: readonly { id?: unknown; parentMessageId?: unknown }[],
 	messageVersion: number | undefined,
 ) {
 	if (messageVersion == null) return undefined;

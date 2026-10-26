@@ -3,16 +3,14 @@
  * boundary (docs/BLOCK_STORAGE-DESIGN.md §8, P2c-3).
  *
  * The server sends messages as envelopes that name their blocks, plus the blocks. This
- * module turns pages and WS frames back into the v1 shapes the document store renders —
- * `TreeMessage` rows with `contentJson` and nested `children` — and keeps each row's
- * blocks alongside as `blockRefs`: every block's id and the elements `[from, to)` it holds
- * in `contentJson`, which block-addressed actions use (also recorded in `block-refs.ts`).
- * Anything that is not v2 passes through unchanged, so a server with `narratorBlocks.wsV2`
- * off keeps working.
+ * module turns pages and WS frames into the rows the document store renders: each
+ * `TreeMessage` holds its blocks (`blocks`, read through `messageBlocks`). Rows stay
+ * flat in envelope order; a row the server nests under another one keeps its
+ * `parentMessageId` (`message/nested-rows.ts`). v2 is the only message protocol (P3d);
+ * frames that are not message-shaped pass through.
  */
 
-import type { ContentBlock, MessageBlockRef, TreeMessage } from "./api/types";
-import { rememberBlockRefs } from "./block-refs";
+import type { MessageRowBlock, TreeMessage } from "./api/types";
 
 /** One block as the server sends it. */
 interface BlockDTO {
@@ -33,7 +31,7 @@ interface BlockDTO {
 type EnvelopeDTO = Record<string, unknown> & {
 	id: string;
 	blockIds: string[];
-	/** The row it is nested under (v1 `children`); null at the top. */
+	/** The row it is nested under; null at the top. */
 	parentMessageId: string | null;
 };
 
@@ -44,28 +42,18 @@ const text = (value: unknown) => (typeof value === "string" ? value : undefined)
 const number = (value: unknown) => (typeof value === "number" ? value : undefined);
 
 /**
- * Envelopes + blocks as v1 rows, in envelope order. A row nested under another one in v1
- * goes back into that row's `children`; `withChildren` gives every row a `children` list,
- * as page and catch-up rows have one.
+ * Envelopes + blocks as rows, in envelope order. A nested row keeps its
+ * `parentMessageId`; a row at the top has none.
  */
-function rowsOf(
-	envelopes: EnvelopeDTO[],
-	blocks: BlockDTO[],
-	withChildren: boolean,
-): Array<{ row: TreeMessage; parentMessageId: string | null }> {
+function rowsOf(envelopes: EnvelopeDTO[], blocks: BlockDTO[]): TreeMessage[] {
 	const byBlockId = new Map(blocks.map((block) => [block.id, block]));
-	const rows: Array<{ row: TreeMessage; parentMessageId: string | null }> = [];
-	const byId = new Map<string, TreeMessage>();
-	for (const envelope of envelopes) {
+	return envelopes.map((envelope) => {
 		const { blockIds, parentMessageId, ...fields } = envelope;
-		const contentJson: unknown[] = [];
-		const blockRefs: MessageBlockRef[] = [];
+		const rowBlocks: MessageRowBlock[] = [];
 		for (const blockId of blockIds) {
 			const block = byBlockId.get(blockId);
 			if (!block) continue;
-			const from = contentJson.length;
-			contentJson.push(...block.elements);
-			blockRefs.push({
+			rowBlocks.push({
 				id: block.id,
 				kind: block.kind,
 				subtype: block.subtype,
@@ -74,34 +62,41 @@ function rowsOf(
 				wireId: block.wireId,
 				attemptId: block.attemptId,
 				hasOriginal: block.hasOriginal,
-				from,
-				to: contentJson.length,
+				named: true,
+				elements: block.elements as MessageRowBlock["elements"],
 			});
 		}
-		const row = {
+		return {
 			...fields,
-			contentJson: contentJson as ContentBlock[],
-			blockRefs,
-			...(withChildren ? { children: [] } : {}),
+			...(parentMessageId ? { parentMessageId } : {}),
+			blocks: rowBlocks,
 		} as unknown as TreeMessage;
-		rememberBlockRefs(row.id, blockRefs);
-		const parent = parentMessageId ? byId.get(parentMessageId) : undefined;
-		if (parent) {
-			parent.children ??= [];
-			parent.children.push(row);
-		} else rows.push({ row, parentMessageId: parentMessageId ?? null });
-		byId.set(row.id, row);
-	}
-	return rows;
+	});
 }
 
-/** A page from `pretext-document?protocol=2` as the v1 page; a v1 page as it is. */
+/** A `pretext-document` page (envelopes + blocks) as rows. */
 export function decodeBlockPage<T>(page: T): T {
 	const value = page as unknown as Frame;
-	if (!value || value.protocol !== 2) return page;
+	if (!value) return page;
 	const { protocol: _protocol, messages, blocks, ...rest } = value;
-	const rows = rowsOf(array<EnvelopeDTO>(messages), array<BlockDTO>(blocks), true);
-	return { ...rest, messages: rows.map(({ row }) => row) } as unknown as T;
+	const rows = rowsOf(array<EnvelopeDTO>(messages), array<BlockDTO>(blocks));
+	return { ...rest, messages: rows } as unknown as T;
+}
+
+/** One message as envelopes + blocks, as an action's response carries it. */
+interface BlockMessageDTO {
+	messages: EnvelopeDTO[];
+	blocks: BlockDTO[];
+}
+
+/** A response whose `message` arrived as envelopes + blocks, with that message as a row. */
+export function decodeBlockMessage<T extends { message?: unknown }>(
+	response: T,
+): Omit<T, "message"> & { message?: TreeMessage } {
+	const encoded = response.message as BlockMessageDTO | undefined;
+	if (!encoded) return response as Omit<T, "message">;
+	const [first] = rowsOf(array<EnvelopeDTO>(encoded.messages), array<BlockDTO>(encoded.blocks));
+	return { ...response, message: first };
 }
 
 /**
@@ -144,25 +139,24 @@ export function decodeBlockFrame(frame: Frame): Frame[] {
 	switch (frame.type) {
 		case "message_upserted": {
 			const { type: _type, cause, messages, blocks, ...rest } = frame;
-			const rows = rowsOf(array<EnvelopeDTO>(messages), array<BlockDTO>(blocks), false);
-			return rows.map(({ row }) => ({ ...rest, type: cause, message: row }));
+			const rows = rowsOf(array<EnvelopeDTO>(messages), array<BlockDTO>(blocks));
+			return rows.map((row) => ({ ...rest, type: cause, message: row }));
 		}
 		case "block_delta":
 			return [streamEvent(frame)];
 		// Its id reaches the store with the block's first checkpoint; nothing to render yet.
 		case "block_opened":
-		case "message_protocol":
 			return [];
 		case "catch_up": {
-			if (frame.protocol !== 2) return [frame];
 			const { protocol: _protocol, messages, blocks, orphanMessageIds, ...rest } = frame;
 			const orphans = new Set(array<string>(orphanMessageIds));
-			const rows = rowsOf(array<EnvelopeDTO>(messages), array<BlockDTO>(blocks), true);
+			const rows = rowsOf(array<EnvelopeDTO>(messages), array<BlockDTO>(blocks));
 			return [
 				{
 					...rest,
-					topLevel: rows.filter(({ row }) => !orphans.has(row.id)).map(({ row }) => row),
-					orphanChildren: rows.filter(({ row }) => orphans.has(row.id)).map(({ row }) => row),
+					// The frame's rows, each followed by the rows nested under it.
+					topLevel: rows.filter((row) => !orphans.has(row.id)),
+					orphanChildren: rows.filter((row) => orphans.has(row.id)),
 				},
 			];
 		}

@@ -12,7 +12,7 @@ import { IconFile } from "@tabler/icons-react";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useUploadCapability } from "../../../hooks/usePlatform";
-import { absorbRenewedToken, clearTokenOnSessionFailure, getToken } from "../../../lib/api";
+import { clearTokenOnSessionFailure, getToken } from "../../../lib/api";
 import { apiUrl } from "../../../lib/base-path";
 import { useImageViewer } from "../../common/image-viewer-context";
 import { MAX_IMAGE_CLIPBOARD_BLOB_BYTES } from "./image-clipboard";
@@ -44,7 +44,6 @@ function useUploadedImageBlobUrl(
 		let objectUrl: string | null = null;
 		fetch(apiUrl(`/uploads/${uploadNarratorId}/${imageId}`), { headers })
 			.then(async (res) => {
-				absorbRenewedToken(res, token);
 				if (!res.ok) {
 					await clearTokenOnSessionFailure(res);
 					return null;

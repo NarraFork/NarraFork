@@ -4,7 +4,6 @@ import { AppError } from "../../lib/errors";
 import * as outbound from "../../lib/net/outbound-fetch";
 import { providerBalanceCache } from "../../lib/provider-balance-cache";
 import { type CustomApiProviderConfig, saveSettings, settings } from "../../lib/settings";
-import { invalidateUserCache } from "../../middleware/auth";
 import type { AuthSessionStore } from "../../services/auth/session-store";
 import { authMfaStore, authSessionStore, setAuthStores } from "../../services/auth/store";
 import { providerBalanceRoutes } from "../provider-balances";
@@ -59,8 +58,6 @@ beforeEach(() => {
 });
 afterEach(() => {
 	setAuthStores(undefined);
-	invalidateUserCache("balance-admin");
-	invalidateUserCache("balance-user");
 	settings.customApiProviders = [];
 	providerBalanceCache.sync();
 	mock.restore();

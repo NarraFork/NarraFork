@@ -252,11 +252,6 @@ export interface ToolContinuationToolCallResult {
 	outputJson: unknown;
 }
 
-export interface SendAwaitCheckpointRow {
-	record: ToolContinuationRecord;
-	toolCallStatus: (typeof narratorToolCalls.$inferSelect)["status"];
-}
-
 export interface CheckpointSendAwaitInput {
 	toolCallId: string;
 	narratorId: string;
@@ -1227,32 +1222,6 @@ export const toolContinuationService = {
 			payloadJson: current.payloadJson ?? {},
 			deadlineAt: current.deadlineAt,
 		});
-	},
-
-	async listSendAwaitCheckpointRows(updateEpoch: EpochScope): Promise<SendAwaitCheckpointRow[]> {
-		const records = await readBoundedContinuations(
-			updateEpoch,
-			eq(narratorToolContinuations.kind, "send_await"),
-		);
-		const rows: SendAwaitCheckpointRow[] = [];
-		for (let offset = 0; offset < records.length; offset += METADATA_PAGE_SIZE) {
-			const page = records.slice(offset, offset + METADATA_PAGE_SIZE);
-			const tools = await db
-				.select({ id: narratorToolCalls.id, status: narratorToolCalls.status })
-				.from(narratorToolCalls)
-				.where(
-					inArray(
-						narratorToolCalls.id,
-						page.map((record) => record.toolCallId),
-					),
-				);
-			const statuses = new Map(tools.map((tool) => [tool.id, tool.status]));
-			for (const record of page) {
-				const toolCallStatus = statuses.get(record.toolCallId);
-				if (toolCallStatus) rows.push({ record, toolCallStatus });
-			}
-		}
-		return rows;
 	},
 
 	async bindRecoveryTokenForNarrator(

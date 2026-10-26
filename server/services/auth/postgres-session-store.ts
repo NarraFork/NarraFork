@@ -9,20 +9,23 @@
  * cannot duplicate anything; `bumpTokenVersion` in particular must stay one atomic
  * increment statement, never a read-modify-write spread over two.
  *
- * No unique-violation translation lives in this file because no statement in this port can
- * produce one: the port writes nothing but the guarded increment. Should that ever change,
- * the conflict must cross the boundary as `WriteConflictError` vocabulary (see
+ * No unique-violation translation lives in this file. The only insert is `createSession`,
+ * whose unique key is the SHA-256 of 32 fresh random bytes and whose primary key is a fresh
+ * id, so a conflict is not a reachable outcome. Should a reachable one ever appear, it must
+ * cross the boundary as `WriteConflictError` vocabulary (see
  * `server/db/backend/write-port.ts`), not as a driver error.
  */
 import { withPgRetry } from "@server/db/pg-retry";
-import { userPreferences, users } from "@server/db/postgres-schema";
+import { authSessions, userPreferences, users } from "@server/db/postgres-schema";
 import { ValidationError } from "@server/lib/errors";
-import { eq, sql } from "drizzle-orm";
+import { and, eq, inArray, isNotNull, isNull, lt, or, type SQL, sql } from "drizzle-orm";
 import type { BunSQLDatabase } from "drizzle-orm/bun-sql";
 import type { AccountRole } from "../registration/account-store";
 import type {
+	AuthSessionRecord,
 	AuthSessionStore,
 	LoginCredential,
+	NewAuthSession,
 	SessionProfile,
 	SessionState,
 } from "./session-store";
@@ -38,6 +41,29 @@ function asRole(role: string): AccountRole {
  * decision, and tests supply a handle pointed at a throwaway container.
  */
 export function createPostgresAuthSessionStore(db: BunSQLDatabase): AuthSessionStore {
+	/** One session row joined with its account, by a unique key. */
+	async function findSession(where: SQL): Promise<AuthSessionRecord | null> {
+		const rows = await db
+			.select({
+				id: authSessions.id,
+				userId: authSessions.userId,
+				role: users.role,
+				userTokenVersion: users.tokenVersion,
+				sessionTokenVersion: authSessions.tokenVersion,
+				sessionStart: authSessions.sessionStart,
+				createdAt: authSessions.createdAt,
+				expiresAt: authSessions.expiresAt,
+				revokedAt: authSessions.revokedAt,
+			})
+			.from(authSessions)
+			.innerJoin(users, eq(users.id, authSessions.userId))
+			.where(where)
+			.limit(1);
+		const row = rows[0];
+		if (!row) return null;
+		return { ...row, role: asRole(row.role) };
+	}
+
 	return {
 		async findLoginCredential(username: string): Promise<LoginCredential | null> {
 			return withPgRetry(
@@ -151,6 +177,81 @@ export function createPostgresAuthSessionStore(db: BunSQLDatabase): AuthSessionS
 					return rows[0]?.tokenVersion ?? 0;
 				},
 				{ label: "authSession.bumpTokenVersion" },
+			);
+		},
+
+		async createSession(session: NewAuthSession): Promise<void> {
+			await withPgRetry(
+				async () => {
+					await db.insert(authSessions).values(session);
+				},
+				{ label: "authSession.createSession" },
+			);
+		},
+
+		async findSessionByTokenHash(tokenHash: string): Promise<AuthSessionRecord | null> {
+			return withPgRetry(() => findSession(eq(authSessions.tokenHash, tokenHash)), {
+				label: "authSession.findSessionByTokenHash",
+			});
+		},
+
+		async findSessionById(sessionId: string): Promise<AuthSessionRecord | null> {
+			return withPgRetry(() => findSession(eq(authSessions.id, sessionId)), {
+				label: "authSession.findSessionById",
+			});
+		},
+
+		async extendSession(sessionId: string, expiresAt: number): Promise<void> {
+			await withPgRetry(
+				async () => {
+					// Guarded single statement: replaying it after an abort cannot shorten or revive.
+					await db
+						.update(authSessions)
+						.set({ expiresAt })
+						.where(
+							and(
+								eq(authSessions.id, sessionId),
+								isNull(authSessions.revokedAt),
+								lt(authSessions.expiresAt, expiresAt),
+							),
+						);
+				},
+				{ label: "authSession.extendSession" },
+			);
+		},
+
+		async revokeSession(sessionId: string, revokedAt: number): Promise<void> {
+			await withPgRetry(
+				async () => {
+					await db
+						.update(authSessions)
+						.set({ revokedAt })
+						.where(and(eq(authSessions.id, sessionId), isNull(authSessions.revokedAt)));
+				},
+				{ label: "authSession.revokeSession" },
+			);
+		},
+
+		async deleteStaleSessions(before: number, limit: number): Promise<number> {
+			return withPgRetry(
+				async () => {
+					const stale = db
+						.select({ id: authSessions.id })
+						.from(authSessions)
+						.where(
+							or(
+								lt(authSessions.expiresAt, before),
+								and(isNotNull(authSessions.revokedAt), lt(authSessions.revokedAt, before)),
+							),
+						)
+						.limit(limit);
+					const deleted = await db
+						.delete(authSessions)
+						.where(inArray(authSessions.id, stale))
+						.returning({ id: authSessions.id });
+					return deleted.length;
+				},
+				{ label: "authSession.deleteStaleSessions" },
 			);
 		},
 	};

@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { capturePretextLayoutAnchor, restorePretextLayoutAnchor } from "@shared/pretext-layout";
 import { buildPretextEngineLayout } from "@shared/pretext-layout/engine";
 import {
@@ -38,17 +39,19 @@ function fixture({
 } = {}) {
 	const segments: AdapterSegment[] = Array.from({ length: count }, (_, seq) => ({
 		kind: "message",
-		msg: {
-			id: `resize-${seq}`,
-			role: "assistant",
-			contentJson: [{ type: "text", text }],
-			...(withUsage
-				? {
-						turnUsageJson: { input_tokens: 100, output_tokens: 20, cached_input_tokens: 8 },
-						costUsd: 0.5,
-					}
-				: {}),
-		},
+		msg: rowWithElements(
+			{
+				id: `resize-${seq}`,
+				role: "assistant",
+				...(withUsage
+					? {
+							turnUsageJson: { input_tokens: 100, output_tokens: 20, cached_input_tokens: 8 },
+							costUsd: 0.5,
+						}
+					: {}),
+			},
+			[{ type: "text", text }],
+		),
 	}));
 	const options = {
 		contentWidth: width,

@@ -48,6 +48,7 @@
 	"attachmentNoLongerAvailable": "附件已在服务器过期，请重新添加",
 	"attachmentPreviewFailed": "无法预览",
 	"attachmentLimitTitle": "附件过多",
+	"messageTooLong": "每条消息最多 {{count}} 个字符",
 	"attachmentLimit": "每条消息最多 {{count}} 个附件",
 	"attachmentForwardFailed": "部分附件未能发送给叙述者",
 	"attachmentDownloadFailed": "下载失败",

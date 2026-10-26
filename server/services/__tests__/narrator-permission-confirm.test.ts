@@ -547,6 +547,59 @@ describe("working-directory switch danger reflection", () => {
 	}
 });
 
+describe(".git internal review routing", () => {
+	const input = { file_path: "/workspace/.git/refs/heads/main", content: "0".repeat(40) };
+
+	test.each([
+		"light",
+		"standard",
+		"strict",
+		"off",
+	] as const)("bypassPermissions sends review-tier .git writes to %s reflection or a human", async (level) => {
+		const id = `git-review-${level}`;
+		const callId = `${id}-call`;
+		const useId = `${id}-use`;
+		await seedPermissionRequest({
+			narratorId: id,
+			messageId: `${id}-message`,
+			toolCallId: callId,
+			toolUseId: useId,
+			toolName: "Write",
+			input,
+			permissionMode: "bypassPermissions",
+		});
+		await db.update(narrators).set({ dangerReflectionOverride: level }).where(eq(narrators.id, id));
+		const permissionPromise = handlePermission(
+			id,
+			new AbortController().signal,
+			"Write",
+			input,
+			useId,
+			"/workspace",
+			"en",
+			undefined,
+			{
+				executionBackend: localBackend,
+				executionTarget: frozenTarget(localBackend, { cwd: "/workspace", path: input.file_path }),
+			},
+		);
+		if (level === "off") {
+			// No reflection to answer the review: it must reach a human, never auto-allow.
+			await waitFor(() => pendingPermissions.has(callId));
+			expect(pendingDangerReflections.has(callId)).toBe(false);
+			expect(await resolvePermission(callId, "deny")).toBe(true);
+			expect(await permissionPromise).toMatchObject({ behavior: "deny" });
+			return;
+		}
+		const result = await permissionPromise;
+		expect(result.behavior).toBe("dangerReflection");
+		if (result.behavior !== "dangerReflection") throw new Error("Expected reflection pause");
+		expect(result.danger.details?.join("\n")).toContain(".git/refs/heads/main");
+		expect(await confirmDangerReflection(callId, "Verified the ref update")).toBe(true);
+		expect(await result.decision).toMatchObject({ behavior: "allow" });
+	});
+});
+
 describe("danger fingerprint execution identity", () => {
 	test("changes across target identity, runtime generation, path flavor, and policy revision", () => {
 		const posixBackend = makeRemoteRuntimeBackend({ deviceId: "fingerprint-posix" });

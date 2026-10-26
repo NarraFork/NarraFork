@@ -19,6 +19,7 @@
 
 import { beforeAll, describe, expect, it } from "bun:test";
 import { MantineProvider } from "@mantine/core";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { type AdapterSegment, adaptSegment } from "@shared/pretext-layout/segment-adapter";
 import { parseHTML } from "linkedom";
 import { act } from "react";
@@ -92,13 +93,15 @@ function renderConclusion(block: Record<string, unknown>): {
 } {
 	const seg: AdapterSegment = {
 		kind: "message",
-		msg: {
-			id: "review-msg",
-			role: "user",
-			origin: "system",
-			originLabel: "review",
-			contentJson: [{ type: "text", text: String(block.text ?? "") } as never, block as never],
-		},
+		msg: rowWithElements(
+			{
+				id: "review-msg",
+				role: "user",
+				origin: "system",
+				originLabel: "review",
+			},
+			[{ type: "text", text: String(block.text ?? "") } as never, block as never],
+		),
 	};
 	const spec = adaptSegment(seg, { lod: 5 })[0];
 	if (!spec) throw new Error("no spec produced");

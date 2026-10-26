@@ -38,14 +38,8 @@ export function UsageStatsSummary({ stats }: { stats: UsageHistoryStats }) {
 
 	const cacheWriteTooltip = `5m: ${cacheCreation5mTokens.compact} (${cacheCreation5mTokens.exact}) · 1h: ${cacheCreation1hTokens.compact} (${cacheCreation1hTokens.exact})`;
 
-	// 缓存命中率 = 缓存读取 ÷ (缓存读取 + 缓存写入 + 纯输入)，随筛选条件实时计算。
-	// 大字取整数百分比，小字保留两位小数；分母为 0（该区间没有输入侧 token）时两者都显示占位符。
-	const cacheHitRateDenominator =
-		stats.totalCacheReadTokens + stats.totalCacheCreationTokens + stats.totalInputTokens;
-	const cacheHitRatePercent =
-		cacheHitRateDenominator > 0
-			? (stats.totalCacheReadTokens / cacheHitRateDenominator) * 100
-			: null;
+	// 服务端仅聚合有缓存读取的请求；普通 token 总量不能作为该比率的分母。
+	const cacheHitRatePercent = stats.cacheHitRate == null ? null : stats.cacheHitRate * 100;
 	const cacheHitRate =
 		cacheHitRatePercent === null
 			? t("usageHistoryCacheHitRateEmpty")

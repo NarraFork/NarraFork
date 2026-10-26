@@ -24,6 +24,7 @@
 
 import { beforeAll, describe, expect, it } from "bun:test";
 import { MantineProvider } from "@mantine/core";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot } from "react-dom/client";
@@ -72,17 +73,18 @@ beforeAll(() => {
 
 /** The streaming placeholder message with one growing text lane. */
 function streamingMsg(text: string) {
-	return {
-		id: "__streaming__",
-		narratorId: "n1",
-		parentToolUseId: null,
-		role: "assistant",
-		contentJson: [{ type: "text", id: "streaming:text:0", text }],
-		contentText: null,
-		toolCalls: [],
-		createdAt: "2026-07-28T00:00:00.000Z",
-		children: [],
-	} as never;
+	return rowWithElements(
+		{
+			id: "__streaming__",
+			narratorId: "n1",
+			parentToolUseId: null,
+			role: "assistant",
+			contentText: null,
+			toolCalls: [],
+			createdAt: "2026-07-28T00:00:00.000Z",
+		},
+		[{ type: "text", id: "streaming:text:0", text }],
+	) as never;
 }
 
 /**

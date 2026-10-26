@@ -98,7 +98,7 @@ vscode-extension/src/
 
 **行为不按环境分叉。** 桌面版 / code-server / Remote SSH 全部走 `asExternalUri`，环境识别只用于错误文案与状态栏。分叉会产出只有某种环境才执行的代码路径，那是最容易腐烂的形状，而这个 API 在三种环境下都已经给出正确答案。
 
-**token 必须双向同步。** 后端在 token 接近过期时重新签发，通过 `X-NarraFork-Session-Token` 响应头返回，SPA 的 `absorbRenewedToken` 会写回 localStorage。单向注入会让宿主副本自行过期，而症状出现在**以后、别处**：下一个面板注入过期 token，用户被弹回登录页且没有任何提示。
+**token 必须双向同步。** 面板里重新登录或退出都会替换 token（会话续期在服务端完成，token 本身不变）。单向注入会让宿主副本自行失效，而症状出现在**以后、别处**：下一个面板注入失效 token，用户被弹回登录页且没有任何提示。
 
 **`sign-out` 是独立消息，不能复用 `bootstrap { token: null }`。** 这两者语义不同且不可合并：
 

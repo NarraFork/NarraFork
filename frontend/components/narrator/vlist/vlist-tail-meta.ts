@@ -1,3 +1,5 @@
+import { type MessageWithBody, messageBody } from "@shared/narrator-blocks/message-blocks";
+import { isNestedRow } from "../message/nested-rows";
 /**
  * vlist-tail-meta.ts — Pure replication of ChunkedMessageList's buildChunkTailMeta,
  * operating on a FLAT message list (PretextMessageList already flattens chunks).
@@ -12,12 +14,12 @@
  */
 
 /** Structural subset of NarratorMsg this computation needs. */
-export interface TailMetaMessage {
+export interface TailMetaMessage extends MessageWithBody<{ type?: unknown }> {
 	id?: string;
 	role: string;
+	parentMessageId?: string | null;
 	contextPercent?: number | null;
 	turnUsageJson?: unknown;
-	contentJson?: Array<{ type?: unknown }>;
 }
 
 export interface TailMetaResult {
@@ -39,11 +41,7 @@ export interface TailMetaOptions {
 
 /** True when a message is a system error card (excluded from lastRealMessage). */
 function isErrorSystemMessage(msg: TailMetaMessage): boolean {
-	return (
-		msg.role === "system" &&
-		Array.isArray(msg.contentJson) &&
-		msg.contentJson.some((block) => block?.type === "error")
-	);
+	return msg.role === "system" && messageBody(msg).some((block) => block?.type === "error");
 }
 
 /**
@@ -64,7 +62,7 @@ export function buildTailMeta(
 	for (let i = messages.length - 1; i >= 0; i--) {
 		const msg = messages[i]!;
 		const id = typeof msg.id === "string" ? msg.id : undefined;
-		if (!id) continue;
+		if (!id || isNestedRow(msg)) continue;
 		if (!lastRealMessage && id !== opts.streamingMsgId && !isErrorSystemMessage(msg)) {
 			lastRealMessage = { id, role: msg.role };
 		}

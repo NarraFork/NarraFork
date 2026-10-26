@@ -4,7 +4,6 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Hono } from "hono";
 import { AppError } from "../../lib/errors";
-import { invalidateUserCache } from "../../middleware/auth";
 import type { AuthSessionStore } from "../../services/auth/session-store";
 import { authMfaStore, authSessionStore, setAuthStores } from "../../services/auth/store";
 
@@ -37,8 +36,6 @@ setAuthStores({ session: sessionStoreSeam, mfa: authMfaStore });
 
 afterAll(() => {
 	setAuthStores(undefined);
-	invalidateUserCache(ADMIN_ACTOR_ID);
-	invalidateUserCache(NON_ADMIN_ACTOR_ID);
 	if (previousHome === undefined) delete process.env.NARRAFORK_HOME;
 	else process.env.NARRAFORK_HOME = previousHome;
 	delete process.env.NARRAFORK_CONTRACT_SUPPRESS_RESTART;

@@ -28,6 +28,7 @@
 
 import { beforeAll, describe, expect, it } from "bun:test";
 import { MantineProvider } from "@mantine/core";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { liveTailSignature } from "@shared/pretext-layout/reasoning-live-tail";
 import { parseHTML } from "linkedom";
 import { act, memo } from "react";
@@ -69,24 +70,27 @@ beforeAll(() => {
 
 /** A settled tool call, so the activity unit's key is a cacheable (non-streaming) one. */
 const HISTORY = [
-	{
-		id: "m0",
-		seq: 0,
-		role: "assistant",
-		contentJson: [{ type: "tool_use", id: "tu-0", name: "Read", input: { file_path: "a.ts" } }],
-		toolCalls: [{ id: "c0", toolUseId: "tu-0", toolName: "Read", status: "success" }],
-		children: [],
-	},
+	rowWithElements(
+		{
+			id: "m0",
+			seq: 0,
+			role: "assistant",
+			toolCalls: [{ id: "c0", toolUseId: "tu-0", toolName: "Read", status: "success" }],
+		},
+		[{ type: "tool_use", id: "tu-0", name: "Read", input: { file_path: "a.ts" } }],
+	),
 ];
 
-const streamingMessage = (text: string) => ({
-	id: "__streaming__",
-	seq: 999,
-	role: "assistant",
-	contentJson: [{ type: "reasoning", text }],
-	toolCalls: [],
-	children: [],
-});
+const streamingMessage = (text: string) =>
+	rowWithElements(
+		{
+			id: "__streaming__",
+			seq: 999,
+			role: "assistant",
+			toolCalls: [],
+		},
+		[{ type: "reasoning", text }],
+	);
 
 /** A body long enough that the ordinary title view is lossy (so a tail is produced). */
 const BODY = (chars: number) => `**分析步骤**\n\n${"长文本".repeat(Math.ceil(chars / 3))}`;
@@ -238,14 +242,15 @@ describe("the live tail reaches the DOM across the row memo", () => {
 	it("leaves the signature EMPTY for a settled row, so scroll-time memo hits stand", async () => {
 		// The tail only exists on the live row. A settled document must produce no
 		// signature at all, or every scroll frame would re-render every row.
-		const settled = {
-			id: "real-1",
-			seq: 1,
-			role: "assistant",
-			contentJson: [{ type: "reasoning", text: BODY(600) }],
-			toolCalls: [],
-			children: [],
-		};
+		const settled = rowWithElements(
+			{
+				id: "real-1",
+				seq: 1,
+				role: "assistant",
+				toolCalls: [],
+			},
+			[{ type: "reasoning", text: BODY(600) }],
+		);
 		const { buildPretextDocumentLayout } = await import("./pretext-document-layout");
 		const { recentRunSegmentMessageIds } = await import("../trace/run-segments");
 		const built = buildPretextDocumentLayout([...HISTORY, settled] as never[], {

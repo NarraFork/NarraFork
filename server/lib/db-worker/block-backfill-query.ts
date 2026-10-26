@@ -8,6 +8,8 @@
  *     and names the ones that differ.
  *   - `blockReindexSlice` computes block-format envelopes' block search index text, as the
  *     sync would write it, for the main thread to write (P3c).
+ *   - `blockIndexQueueSlice` computes the index text of the blocks the sync queued
+ *     (`narrator_block_index_queue`), for the main thread to write.
  *   - `blockProjectionSlice` serves the admin-started projection jobs (P3b): `clear` names
  *     the envelopes whose rows assemble to their `content_json`, so the main thread can drop
  *     it; `restore` assembles rows-only envelopes' projections for it to write back.
@@ -62,6 +64,31 @@ export interface ReindexEnvelope {
 	/** Not computed here (queued for its sync, or its rows do not line up with its body):
 	 *  the main thread syncs it itself. */
 	resync: boolean;
+}
+
+export interface BlockIndexQueueSliceParams {
+	kind: "blockIndexQueueSlice";
+	/** Queued blocks a slice reads at most. */
+	maxBlocks: number;
+	/** Index text a slice computes before it stops (at least one envelope's). */
+	maxIndexChars: number;
+	budgetMs: number;
+}
+
+/** A queued block's index text as read: empty when the block has none (still streaming). */
+export interface IndexQueueEntry {
+	blockId: string;
+	messageId: string;
+	rowid: number;
+	/** The queue entry's version when read; text from an older read is never written. */
+	version: number;
+	text: string;
+}
+
+export interface BlockIndexQueueSliceResult {
+	entries: IndexQueueEntry[];
+	/** Whether the queue held more than this slice read. */
+	more: boolean;
 }
 
 export interface BlockReindexSliceResult {
@@ -421,92 +448,159 @@ export function runBlockProjectionSlice(
 }
 
 /**
- * An envelope's blocks with the text the sync's index write gives them, for the blocks whose
- * entry is missing (or, still streaming, should not be there). The store writes a block's
- * entry whenever the block or its adopted ledger result changes, so an entry that exists is
- * right; what can be missing is a lost index's. An envelope with nothing missing is not read
- * further. Otherwise its body is assembled from its rows and planned with its ledger exactly
- * as `syncEnvelope` plans it, each planned block matched to the row at its ordinal. A queued
- * envelope, or one whose plan does not line up with its rows, is left to the main thread's own
- * sync.
+ * The index text the sync gives an envelope's blocks, for the blocks `wanted` picks: its body
+ * assembled from its rows and planned with its ledger exactly as `syncEnvelope` plans it, each
+ * planned block matched to the row at its ordinal. Undefined for an envelope queued for its
+ * sync, or whose plan does not line up with its rows: the main thread's own sync handles it.
  */
-function reindexPlan(
+function plannedTexts(
 	db: Database,
-	rowid: number,
-	indexed: (blockRowid: number) => boolean,
-): ReindexEnvelope {
+	messageId: string,
+	wanted: (row: { rowid: number; id: string; phase: string }) => boolean,
+):
+	| {
+			rows: Array<{ rowid: number; id: string; revision: number; kind: string; phase: string }>;
+			texts: Array<string | null>;
+	  }
+	| undefined {
 	const source = db
 		.query(
 			`SELECT m.id, m.narrator_id AS narratorId, m.role, m.content_text AS contentText,
 				m.parent_tool_use_id AS parentToolUseId, m.sdk_message_uuid AS messageUuid,
 				m.origin, m.provider,
 				EXISTS (SELECT 1 FROM narrator_block_sync_queue q WHERE q.message_id = m.id) AS queued
-			 FROM narrator_messages m WHERE m.rowid = ?`,
+			 FROM narrator_messages m WHERE m.id = ?`,
 		)
-		.get(rowid) as Omit<
-		EnvelopeSource,
-		"rowid" | "contentJson" | "createdAt" | "bodyRevision" | "stateRevision"
-	> & {
-		queued: number;
-	};
-	const envelope = { id: source.id, rowid, blocks: [] as ReindexEnvelope["blocks"], resync: true };
-	if (source.queued) return envelope;
-	// The columns before the payload: no block body is read for an envelope fully indexed.
+		.get(messageId) as
+		| (Omit<
+				EnvelopeSource,
+				"rowid" | "contentJson" | "createdAt" | "bodyRevision" | "stateRevision"
+		  > & { queued: number })
+		| null;
+	if (!source || source.queued) return undefined;
+	// The columns before the payload: no block body is read for an envelope with nothing wanted.
 	const rows = db
 		.query(
 			`SELECT rowid, id, revision, kind, phase FROM narrator_blocks
 			 WHERE message_id = ? ORDER BY ordinal`,
 		)
-		.all(source.id) as Array<{
+		.all(messageId) as Array<{
 		rowid: number;
 		id: string;
 		revision: number;
 		kind: string;
 		phase: string;
 	}>;
-	const missing = rows.map((row) => indexed(row.rowid) === (row.phase === "open"));
-	const block = (row: (typeof rows)[number], text: string | null) => ({
-		rowid: row.rowid,
-		id: row.id,
-		revision: row.revision,
-		text,
-	});
-	if (!missing.includes(true))
-		return { ...envelope, resync: false, blocks: rows.map((row) => block(row, null)) };
+	const picked = rows.map(wanted);
+	if (!picked.includes(true)) return { rows, texts: rows.map(() => null) };
 	const bodies = db
 		.query(
 			"SELECT rowid, payload, state FROM narrator_blocks WHERE message_id = ? ORDER BY ordinal",
 		)
-		.all(source.id) as Array<{ rowid: number; payload: string; state: string | null }>;
+		.all(messageId) as Array<{ rowid: number; payload: string; state: string | null }>;
 	if (bodies.length !== rows.length || bodies.some((body, i) => body.rowid !== rows[i].rowid))
-		return envelope;
+		return undefined;
 	const content = assembleContent(
 		bodies.map((body) => ({ payload: parseStored(body.payload), state: parseStored(body.state) })),
 	);
 	const { queued: _queued, ...message } = source;
 	const planned = planEnvelopeBlocks(
 		{ ...message, contentJson: content },
-		adoptedLedger(ledgerOf(db, source.id)),
+		adoptedLedger(ledgerOf(db, messageId)),
 	).blocks;
 	if (
 		planned.length !== rows.length ||
 		planned.some((plan, ordinal) => plan.draft.kind !== rows[ordinal].kind)
 	)
-		return envelope;
+		return undefined;
+	return {
+		rows,
+		texts: rows.map((row, ordinal) =>
+			!picked[ordinal]
+				? null
+				: row.phase === "open"
+					? ""
+					: blockIndexText(planned[ordinal].draft.canonical, planned[ordinal].output),
+		),
+	};
+}
+
+/**
+ * An envelope's blocks with the text the sync's index write gives them, for the blocks whose
+ * entry is missing (or, still streaming, should not be there). A block whose entry is owed is
+ * queued (`narrator_block_index_queue`) and written by that queue's job, so an entry that
+ * exists is right unless queued; what can be missing is a lost index's. An envelope with
+ * nothing missing is not read further.
+ */
+function reindexPlan(
+	db: Database,
+	rowid: number,
+	indexed: (blockRowid: number) => boolean,
+): ReindexEnvelope {
+	const { id } = db.query("SELECT id FROM narrator_messages WHERE rowid = ?").get(rowid) as {
+		id: string;
+	};
+	const envelope = { id, rowid, blocks: [] as ReindexEnvelope["blocks"], resync: true };
+	const planned = plannedTexts(db, id, (row) => indexed(row.rowid) === (row.phase === "open"));
+	if (!planned) return envelope;
 	return {
 		...envelope,
 		resync: false,
-		blocks: rows.map((row, ordinal) =>
-			block(
-				row,
-				!missing[ordinal]
-					? null
-					: row.phase === "open"
-						? ""
-						: blockIndexText(planned[ordinal].draft.canonical, planned[ordinal].output),
-			),
-		),
+		blocks: planned.rows.map((row, ordinal) => ({
+			rowid: row.rowid,
+			id: row.id,
+			revision: row.revision,
+			text: planned.texts[ordinal],
+		})),
 	};
+}
+
+/**
+ * `blockIndexQueueSlice`: the index text of the next queued blocks, oldest queued first,
+ * computed per envelope as `plannedTexts` computes it. An envelope still queued for its sync
+ * is skipped (its blocks stay queued). Stops at `maxIndexChars` or `budgetMs`, after at
+ * least one envelope.
+ */
+export function runBlockIndexQueueSlice(
+	db: Database,
+	params: BlockIndexQueueSliceParams,
+): BlockIndexQueueSliceResult {
+	const queued = db
+		.query(
+			`SELECT q.block_id AS blockId, q.version, b.message_id AS messageId
+			 FROM narrator_block_index_queue q JOIN narrator_blocks b ON b.id = q.block_id
+			 ORDER BY q.rowid LIMIT ?`,
+		)
+		.all(params.maxBlocks + 1) as Array<{ blockId: string; version: number; messageId: string }>;
+	const more = queued.length > params.maxBlocks;
+	const byMessage = new Map<string, Map<string, number>>();
+	for (const entry of queued.slice(0, params.maxBlocks)) {
+		const versions = byMessage.get(entry.messageId) ?? new Map<string, number>();
+		versions.set(entry.blockId, entry.version);
+		byMessage.set(entry.messageId, versions);
+	}
+	const started = performance.now();
+	const entries: IndexQueueEntry[] = [];
+	let chars = 0;
+	let read = 0;
+	for (const [messageId, versions] of byMessage) {
+		if (
+			read > 0 &&
+			(chars >= params.maxIndexChars || performance.now() - started > params.budgetMs)
+		)
+			return { entries, more: true };
+		read++;
+		const planned = plannedTexts(db, messageId, (row) => versions.has(row.id));
+		if (!planned) continue;
+		planned.rows.forEach((row, ordinal) => {
+			const text = planned.texts[ordinal];
+			const version = versions.get(row.id);
+			if (text === null || version === undefined) return;
+			entries.push({ blockId: row.id, messageId, rowid: row.rowid, version, text });
+			chars += text.length;
+		});
+	}
+	return { entries, more };
 }
 
 /**

@@ -313,6 +313,8 @@ export function buildMockScript(scenario: MockScenario): MockStep[] {
 			if (body) {
 				const lane = outputIndex++;
 				const reasoningId = `mock-reasoning-r${round}`;
+				let revision = 0;
+				let textOffset = 0;
 				for (const chunk of chunkText(body, scenario.charsPerFrame)) {
 					steps.push({
 						kind: "reasoning",
@@ -322,9 +324,12 @@ export function buildMockScript(scenario: MockScenario): MockStep[] {
 							narratorId,
 							text: chunk,
 							id: reasoningId,
+							revision: ++revision,
+							textOffset,
 							outputIndex: lane,
 						}),
 					});
+					textOffset += chunk.length;
 				}
 			}
 		}
@@ -334,13 +339,24 @@ export function buildMockScript(scenario: MockScenario): MockStep[] {
 			if (body) {
 				const lane = outputIndex++;
 				const repeated = repeatBody(body, Math.max(1, Math.floor(scenario.textRepeat)));
+				const textId = `mock-text-r${round}`;
+				let revision = 0;
+				let textOffset = 0;
 				for (const chunk of chunkText(repeated, scenario.charsPerFrame)) {
 					steps.push({
 						kind: "text",
 						round,
 						chars: chunk.length,
-						frame: mockTextDeltaFrame({ narratorId, text: chunk, outputIndex: lane }),
+						frame: mockTextDeltaFrame({
+							narratorId,
+							text: chunk,
+							id: textId,
+							revision: ++revision,
+							textOffset,
+							outputIndex: lane,
+						}),
 					});
+					textOffset += chunk.length;
 				}
 			}
 		}

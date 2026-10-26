@@ -62,8 +62,10 @@ import { consumeCleanShutdownState, ensureFts, markCleanShutdown } from "../fts"
 import {
 	abandonAutomaticRepair,
 	clearPendingDatabaseRepair,
+	clearPendingFtsRepair,
 	MAX_AUTOMATIC_REPAIR_ATTEMPTS,
 	readPendingDatabaseRepair,
+	readPendingFtsRepair,
 	recordAutomaticRepairAttempt,
 	shouldAttemptAutomaticRepair,
 } from "../integrity-state";
@@ -276,11 +278,16 @@ export function createSqliteLifecycle(options: SqliteLifecycleOptions = {}): Sql
 		await options.applyDataBackfills?.(connection());
 
 		// FTS5 virtual tables and triggers — managed outside Drizzle (which cannot express FTS5).
+		// Indexes the background check found corrupt are rebuilt here; startup reads no index to
+		// find out. The marker goes only once the rebuild has run, so a killed rebuild retries.
+		const ftsRepair = isHotReload ? null : readPendingFtsRepair();
 		ensureFts(connection(), {
 			skipUncleanShutdownRebuild: isHotReload,
 			// consumeCleanShutdownState already cleared the marker, so ensureFts cannot re-read it.
 			wasClean,
+			repairFtsTables: ftsRepair?.tables,
 		});
+		if (ftsRepair) clearPendingFtsRepair();
 		state.initialized = true;
 
 		// Refresh query-planner statistics once on a real startup (skip hot reloads — the stats are

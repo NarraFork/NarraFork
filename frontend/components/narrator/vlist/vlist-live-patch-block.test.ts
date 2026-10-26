@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import type { TreeMessage } from "@frontend/lib/api/types";
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import { toolCompletedPatch } from "./vlist-live-events";
 
 /** Two rows holding the same call id (a reused provider id), each in its own tool block. */
@@ -13,9 +14,7 @@ function rows(): TreeMessage[] {
 			contentText: null,
 			createdAt: "2026-10-01T00:00:00.000Z",
 			toolCalls: [],
-			children: [],
-			contentJson: [{ type: "tool_use", id: "call_1", name: "Bash", input: {}, status: "running" }],
-			blockRefs: [
+			blocks: [
 				{
 					id: blockId,
 					kind: "tool",
@@ -25,8 +24,10 @@ function rows(): TreeMessage[] {
 					wireId: "call_1",
 					attemptId: null,
 					hasOriginal: false,
-					from: 0,
-					to: 1,
+					named: true,
+					elements: [
+						{ type: "tool_use", id: "call_1", name: "Bash", input: {}, status: "running" },
+					],
 				},
 			],
 		}) as unknown as TreeMessage;
@@ -34,7 +35,7 @@ function rows(): TreeMessage[] {
 }
 
 const status = (messages: readonly TreeMessage[]) =>
-	messages.map((message) => (message.contentJson[0] as { status?: string }).status);
+	messages.map((message) => (messageBody(message)[0] as { status?: string }).status);
 
 describe("tool lifecycle patches", () => {
 	test("a frame naming its tool block patches only that block's row", () => {

@@ -19,6 +19,7 @@
  */
 
 import { beforeAll, describe, expect, it } from "bun:test";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 
 beforeAll(() => {
@@ -41,18 +42,19 @@ async function load() {
 type Mod = Awaited<ReturnType<typeof load>>;
 type Built = ReturnType<Mod["layout"]["buildPretextDocumentLayout"]>;
 
-const USER = {
-	id: "u1",
-	seq: 1,
-	role: "user",
-	contentJson: [{ type: "text", text: "请帮我构建" }],
-	toolCalls: [],
-	children: [],
-};
+const USER = rowWithElements(
+	{
+		id: "u1",
+		seq: 1,
+		role: "user",
+		toolCalls: [],
+	},
+	[{ type: "text", text: "请帮我构建" }],
+);
 
 /** One persisted assistant message (the partial the server keeps appending to). */
 function persisted(blocks: unknown[]) {
-	return { id: "a1", seq: 2, role: "assistant", contentJson: blocks, toolCalls: [], children: [] };
+	return rowWithElements({ id: "a1", seq: 2, role: "assistant", toolCalls: [] }, blocks);
 }
 
 const REASONING = {
@@ -389,16 +391,16 @@ describe("content blocks carry a hand-off-stable lifecycle id", () => {
 		);
 		const liveCard = live.items.find((item) => item.spec.kind === "reasoning");
 		const settledCard = settled.items.find((item) => item.spec.kind === "reasoning");
-		expect(liveCard?.spec.key).toBe("__streaming__-b0");
-		expect(settledCard?.spec.key).toBe("a1-b0");
+		expect(liveCard?.spec.key).toBe("__streaming__-blk[__streaming__:0]");
+		expect(settledCard?.spec.key).toBe("a1-blk[a1:0]");
 		expect(liveCard?.spec.lifecycleId).toBe("blk:rs-1");
 		expect(settledCard?.spec.lifecycleId).toBe("blk:rs-1");
-		// The trap the id exists for: after the hand-off the STILL-LIVE text block took
-		// over the streaming key the reasoning used to hold.
+		// The STILL-LIVE text block keeps its own block, and so its key, when the reasoning
+		// before it hands off: the hand-off drops the reasoning's block from the live row.
 		const liveText = settled.items.find(
 			(item) => item.spec.kind === "markdown" && item.spec.key.startsWith("__streaming__"),
 		);
-		expect(liveText?.spec.key).toBe("__streaming__-b0");
+		expect(liveText?.spec.key).toBe("__streaming__-blk[__streaming__:1]");
 		expect(liveText?.spec.lifecycleId).toBe("blk:tx-1");
 	});
 

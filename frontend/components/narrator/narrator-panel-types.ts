@@ -6,13 +6,7 @@ import {
 	IconShieldOff,
 } from "@tabler/icons-react";
 import { createElement } from "react";
-import type {
-	ApiEntity,
-	BaseContentBlock,
-	ToolCallRecord,
-	ToolUseContentBlock,
-	TreeMessage,
-} from "../../lib/api";
+import type { ApiEntity, BaseContentBlock, ToolCallRecord, TreeMessage } from "../../lib/api";
 import { MOBILE_VIEWPORT_MEDIA_QUERY } from "../../lib/responsive";
 import type { Question } from "./question/ask-user-question-utils";
 
@@ -58,7 +52,6 @@ export type MessagesPage = {
 export type NarratorMsg = TreeMessage;
 export type ContentBlock = BaseContentBlock;
 export type ToolCallRow = ToolCallRecord;
-export type ToolUseBlock = ToolUseContentBlock;
 
 import type { PendingPermission } from "@frontend/types/narrator";
 
@@ -267,14 +260,6 @@ export const MAX_TEXT_FILE_SIZE = 100 * 1024 * 1024; // 100MB
 export { formatFileSize, isTextFile } from "@shared/text-file-types";
 
 export const STREAMING_CHUNKS_MSG_ID = "__streaming_tool_chunks__";
-
-export function isToolUseBlock(block: ContentBlock): block is ToolUseBlock {
-	return block.type === "tool_use" && typeof block.id === "string";
-}
-
-export function isStreamingChunksMessage(msg: NarratorMsg | null | undefined): boolean {
-	return !!msg && msg.id === STREAMING_CHUNKS_MSG_ID;
-}
 
 export const PERM_MODES = [
 	"default",

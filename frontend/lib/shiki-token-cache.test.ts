@@ -168,6 +168,38 @@ describe("shiki token cache", () => {
 		expect(notifications).toBe(1);
 	});
 
+	it("coalesces notifications through scheduleNotify while the version stays current", async () => {
+		const probe = makeLoader();
+		const scheduled: Array<() => void> = [];
+		const cache = createShikiTokenCache(probe.loader, {
+			scheduleNotify: (flush) => scheduled.push(flush),
+		});
+		let notifications = 0;
+		cache.subscribe(() => {
+			notifications++;
+		});
+
+		cache.get("a", "typescript", THEME);
+		cache.get("b", "typescript", THEME);
+		cache.get("c", "typescript", THEME);
+		await probe.flush();
+		await probe.flush();
+		// Two landings, one pending flush; a render in between already sees both.
+		expect(cache.getVersion()).toBe(2);
+		expect(scheduled).toHaveLength(1);
+		expect(notifications).toBe(0);
+
+		scheduled.shift()?.();
+		expect(notifications).toBe(1);
+
+		// A landing after the flush schedules a fresh one.
+		await probe.flush();
+		expect(scheduled).toHaveLength(1);
+		scheduled.shift()?.();
+		expect(notifications).toBe(2);
+		expect(cache.getVersion()).toBe(3);
+	});
+
 	it("does not bump the version when the loader reports no tokens", async () => {
 		const probe = makeLoader(() => null);
 		const cache = createShikiTokenCache(probe.loader);

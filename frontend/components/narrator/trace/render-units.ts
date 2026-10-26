@@ -36,6 +36,7 @@
  */
 
 import { isCommunicationTool } from "@shared/communication-tool";
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import { isPreferOpenTool } from "@shared/prefer-open-tool";
 import type { RenderSegment, ToolRunItem } from "../message/message-segments";
 import type { ContentBlock, NarratorMsg } from "../narrator-panel-types";
@@ -188,7 +189,7 @@ function splitMessageSegmentForActivity(
 ): MessageActivityPart[] | null {
 	if (seg.msg.role !== "assistant") return null;
 
-	const blocks = Array.isArray(seg.msg.contentJson) ? seg.msg.contentJson : [];
+	const blocks = messageBody(seg.msg);
 	const indices = seg.visibleBlockIndices ?? blocks.map((_, i) => i);
 	if (indices.length === 0 || !indices.some((bi) => blocks[bi] && isReasoningBlock(blocks[bi]))) {
 		return null;

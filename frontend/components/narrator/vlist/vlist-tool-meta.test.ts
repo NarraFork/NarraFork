@@ -1,6 +1,7 @@
 /** vlist-tool-meta.test.ts — unit tests for the per-row tool metadata derivation. */
 
 import { describe, expect, it } from "bun:test";
+import { messageBody, rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import type { ContentBlock, NarratorMsg } from "../narrator-panel-types";
 import { resolveTraceRowIdentity, sameToolMeta } from "./vlist-exact-row-state";
 import { buildToolMetaIndex, deriveToolMeta, readSubagentIdTag } from "./vlist-tool-meta";
@@ -10,7 +11,7 @@ function toolBlock(props: Record<string, unknown>): ContentBlock {
 }
 
 function msg(contentJson: ContentBlock[], id = "m1", seq = 1): NarratorMsg {
-	return { id, seq, role: "assistant", contentJson } as unknown as NarratorMsg;
+	return rowWithElements({ id, seq, role: "assistant" }, contentJson) as unknown as NarratorMsg;
 }
 
 describe("captured file identity projection", () => {
@@ -187,7 +188,7 @@ describe("active question waits", () => {
 			if (status === "success") expect(meta?.awaitQuestionId).toBeUndefined();
 			else expect(meta).toMatchObject({ awaitQuestionId: "q-live", awaitQuestionSeq: 17 });
 		}
-		expect(message.contentJson).toEqual([toolBlock({ name: "Await", input: {} })]);
+		expect(messageBody(message)).toEqual([toolBlock({ name: "Await", input: {} })]);
 	});
 
 	it("carries the owning message seq so concurrent waits can pick the newest", () => {

@@ -142,12 +142,19 @@ describe("FTS recovery after generated content-table migrations", () => {
 		}
 	});
 
-	test("unclean startup probes external content even when all triggers exist", () => {
+	test("an unclean startup reads no index; a background finding rebuilds the one it names", () => {
 		const sqlite = fixture();
 		try {
+			// An index out of step with its content, all triggers in place.
 			sqlite.exec("INSERT INTO narrators_fts(narrators_fts) VALUES('delete-all')");
 			expect(matches(sqlite, "uniqueneedle")).toEqual([]);
+			// Startup does not probe for it: that read the whole index before listening.
 			ensureFts(sqlite, { wasClean: false });
+			expect(matches(sqlite, "uniqueneedle")).toEqual([]);
+			// The background check's finding, handed to the next startup, repairs it.
+			expect(ensureFts(sqlite, { wasClean: true, repairFtsTables: ["narrators_fts"] })).toEqual({
+				rebuilt: true,
+			});
 			expect(matches(sqlite, "uniqueneedle")).toEqual(["first"]);
 			expect(() => checkExternalContent(sqlite)).not.toThrow();
 		} finally {

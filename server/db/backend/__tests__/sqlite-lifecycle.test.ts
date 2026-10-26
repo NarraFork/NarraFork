@@ -359,6 +359,29 @@ describe("repeated initialisation (Bun --hot)", () => {
 		expect(readPendingDatabaseRepair()?.state).toBe("pending");
 	}, 120_000);
 
+	test("a queued index repair runs on the next real startup, never on a hot reload", async () => {
+		const lifecycle = await newLifecycle();
+		await lifecycle.start();
+		const { readPendingFtsRepair, recordFtsRepair } = await import("../../integrity-state");
+		expect(
+			recordFtsRepair({
+				tables: ["narrators_fts"],
+				details: "synthetic index finding",
+				detectedAt: new Date().toISOString(),
+			}).ok,
+		).toBe(true);
+
+		await lifecycle.start();
+		expect(readPendingFtsRepair()?.tables).toEqual(["narrators_fts"]);
+		lifecycle.connection.close();
+
+		resetHotState();
+		const next = await newLifecycle();
+		await next.start();
+		expect(readPendingFtsRepair()).toBeNull();
+		expect(tableNames(next.connection)).toContain("narrators_fts");
+	}, 120_000);
+
 	test("a marker whose repair budget is spent does not block startup", async () => {
 		// The failure this pins: retrying an unrepairable database forever turned one bad file into a
 		// permanently unbootable server, because each attempt costs minutes and a full-size copy.

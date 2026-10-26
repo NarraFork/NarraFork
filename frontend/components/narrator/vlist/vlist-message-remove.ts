@@ -38,9 +38,12 @@
  * Pure: no React, no DOM, no network.
  */
 
+import { withNestedRowIds } from "../message/nested-rows";
+
 /** The subset of a message this module reads. */
 export interface RemoveCandidate {
 	id?: unknown;
+	parentMessageId?: unknown;
 }
 
 export type RemovalRejection =
@@ -65,12 +68,9 @@ export interface RemovalResult<T extends RemoveCandidate> {
  * Remove `deletedIds` from `loaded`, returning the SAME array when nothing must
  * change so the caller can skip a rebuild by identity.
  *
- * Child messages are deliberately not walked: on a parent page a child is not a
- * top-level layout item (the same boundary `resolveMessageAppend` draws with its
- * `child-message` rejection), and the server already includes descendant ids in
- * `deletedMessageIds` (see `deleteMessagesAfter`'s orphan sweep). A subagent page
- * loads its own document, where those messages ARE top-level and this same
- * top-level filter applies.
+ * Rows nested under a removed row go with it. The server already includes descendant
+ * ids in `deletedMessageIds` (see `deleteMessagesAfter`'s orphan sweep); a nested row
+ * is never left without its parent either way.
  */
 export function removeLoadedMessages<T extends RemoveCandidate>(
 	loaded: readonly T[],
@@ -82,10 +82,11 @@ export function removeLoadedMessages<T extends RemoveCandidate>(
 	}
 	if (ids.size === 0) return { messages: loaded, removed: false, reason: "no-ids" };
 
+	const removed = withNestedRowIds(loaded, ids);
 	const kept: T[] = [];
 	for (const message of loaded) {
 		const id = message.id;
-		if (typeof id === "string" && ids.has(id)) continue;
+		if (typeof id === "string" && removed.has(id)) continue;
 		kept.push(message);
 	}
 	if (kept.length === loaded.length) {

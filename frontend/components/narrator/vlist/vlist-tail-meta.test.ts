@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { buildTailMeta, type TailMetaMessage, type TailMetaOptions } from "./vlist-tail-meta";
 
 const OPTS: TailMetaOptions = {
@@ -11,7 +12,7 @@ describe("buildTailMeta", () => {
 	it("finds the last real message (skips streaming + error system)", () => {
 		const messages: TailMetaMessage[] = [
 			{ id: "a1", role: "assistant" },
-			{ id: "s1", role: "system", contentJson: [{ type: "error" }] },
+			rowWithElements({ id: "s1", role: "system" }, [{ type: "error" }]),
 			{ id: "__streaming_tool_chunks__", role: "assistant" },
 		];
 		const meta = buildTailMeta(messages, OPTS);

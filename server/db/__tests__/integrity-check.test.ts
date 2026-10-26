@@ -3,12 +3,14 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { consumeCleanShutdownState, ensureFts, markCleanShutdown } from "../fts";
+import { consumeCleanShutdownState, ensureFts, ftsIndexFindings, markCleanShutdown } from "../fts";
 import {
 	DB_INTEGRITY_REPORT_PREFIX,
 	decodeIntegrityReport,
 	encodeIntegrityReport,
 	type IntegrityProbeReport,
+	MAX_REPORT_DETAIL_CHARS,
+	MAX_REPORT_FINDINGS,
 } from "../integrity-protocol";
 
 /**
@@ -22,7 +24,9 @@ import {
  *     stops, and the background probe keeps running so a hand-repaired DB gets un-flagged,
  *   - a marker write failure still logs the corruption,
  *   - cancellation actually tears down the pending timer and the running subprocess,
- *   - ensureFts trusts the caller-supplied clean flag instead of the already-cleared pragma.
+ *   - ensureFts trusts the caller-supplied clean flag instead of the already-cleared pragma, and
+ *     an unclean shutdown costs startup no index scan: a finding that blames only FTS indexes
+ *     queues those indexes for the next startup instead of a whole-database recovery.
  */
 
 const MARKER_FILE = "db-integrity-state.json";
@@ -69,6 +73,37 @@ describe("integrity report protocol", () => {
 		expect(
 			decodeIntegrityReport(`${DB_INTEGRITY_REPORT_PREFIX}{"status":"weird","mode":"quick"}`),
 		).toBeNull();
+	});
+});
+
+describe("index-only findings", () => {
+	test("name the managed indexes a report blames", () => {
+		expect(
+			ftsIndexFindings(
+				'fts5: corruption found reading blob 137438953473 from table "narrator_blocks_fts"; ' +
+					"malformed inverted index for FTS5 table main.knowledge_entries_fts",
+			),
+		).toEqual(["narrator_blocks_fts", "knowledge_entries_fts"]);
+	});
+
+	test("anything else leaves the database itself suspect", () => {
+		// A b-tree finding beside the index one.
+		expect(
+			ftsIndexFindings(
+				'Tree 12 page 345 cell 3: Rowid 9 out of order; fts5: checksum mismatch for table "narrators_fts"',
+			),
+		).toBeNull();
+		// An FTS5 finding about no index this server manages, or a shadow table's name alone.
+		expect(ftsIndexFindings('fts5: checksum mismatch for table "other_fts"')).toBeNull();
+		expect(ftsIndexFindings("fts5: page 7 of narrators_fts_data is malformed")).toBeNull();
+		expect(ftsIndexFindings("")).toBeNull();
+	});
+
+	test("a report cut at its limit may hide other findings", () => {
+		const finding = 'fts5: checksum mismatch for table "narrators_fts"';
+		const full = Array.from({ length: MAX_REPORT_FINDINGS }, () => finding).join("; ");
+		expect(ftsIndexFindings(full)).toBeNull();
+		expect(ftsIndexFindings(`${finding}; ${"x".repeat(MAX_REPORT_DETAIL_CHARS)}`)).toBeNull();
 	});
 });
 
@@ -535,6 +570,22 @@ describe("background probe bookkeeping", () => {
 		expect(marker?.attempts).toBe(0);
 	});
 
+	test("an index-only finding queues those indexes, not a database repair", async () => {
+		const { readPendingDatabaseRepair, readPendingFtsRepair } = await import("../integrity-state");
+		const details =
+			'fts5: corruption found reading blob 137438953473 from table "narrator_blocks_fts"';
+		await runWithVerdict(report({ status: "corrupt", details }));
+		expect(readPendingDatabaseRepair()).toBeNull();
+		expect(readPendingFtsRepair()).toMatchObject({ tables: ["narrator_blocks_fts"], details });
+		// A second finding (next startup's probe) adds to the queue rather than replacing it.
+		const { cancelBackgroundIntegrityCheck } = await import("../integrity-check");
+		cancelBackgroundIntegrityCheck();
+		await runWithVerdict(
+			report({ status: "corrupt", details: 'fts5: checksum mismatch for table "narrators_fts"' }),
+		);
+		expect(readPendingFtsRepair()?.tables).toEqual(["narrator_blocks_fts", "narrators_fts"]);
+	});
+
 	test("an inconclusive verdict never flags the database", async () => {
 		const { readPendingDatabaseRepair } = await import("../integrity-state");
 		await runWithVerdict(report({ status: "unavailable", details: "probe timed out" }));
@@ -682,12 +733,22 @@ describe("ensureFts clean-shutdown detection", () => {
 		}
 	});
 
-	test("still treats a consumed unclean marker as needing verification", () => {
+	test("leaves an unclean shutdown's index verification to the background probe", () => {
 		const db = createBaseTables();
 		try {
 			const { wasClean } = consumeCleanShutdownState(db);
 			expect(wasClean).toBe(false);
-			expect(ensureFts(db, { wasClean }).rebuilt).toBe(true);
+			const run = spyOn(db, "run");
+			try {
+				// FTS5's integrity-check needs the write lock and reads the whole index: on a large
+				// database startup sat in it before listening. The subprocess quick_check covers it.
+				expect(ensureFts(db, { wasClean }).rebuilt).toBe(false);
+				expect(run.mock.calls.some(([sql]) => /integrity-check|rebuild/.test(String(sql)))).toBe(
+					false,
+				);
+			} finally {
+				run.mockRestore();
+			}
 		} finally {
 			db.close();
 		}

@@ -17,6 +17,8 @@ import {
 	encodeIntegrityReport,
 	type IntegrityProbeMode,
 	type IntegrityProbeReport,
+	MAX_REPORT_DETAIL_CHARS,
+	MAX_REPORT_FINDINGS,
 } from "./integrity-protocol";
 
 function runProbe(): IntegrityProbeReport {
@@ -58,7 +60,9 @@ function runProbe(): IntegrityProbeReport {
 			status: ok ? "ok" : "corrupt",
 			mode,
 			// Bound the payload: integrity_check can emit thousands of lines on a wrecked DB.
-			details: ok ? "ok" : messages.slice(0, 20).join("; ").slice(0, 2000),
+			details: ok
+				? "ok"
+				: messages.slice(0, MAX_REPORT_FINDINGS).join("; ").slice(0, MAX_REPORT_DETAIL_CHARS),
 			durationMs: Date.now() - startedAt,
 		};
 	} catch (err) {

@@ -110,52 +110,12 @@ describe("planned update checkpoint fence", () => {
 				return [...activeToolCallIds];
 			},
 			listCoveredToolCallIds: async () => [...coveredToolCallIds],
-			verifySendAwaitContinuations: async () => ({ stable: true, unstableToolCallIds: [] }),
 		});
 
 		expect(result).toBe(snapshot);
 		expect(checkpointCalls).toBe(3);
 		expect(coveredToolCallIds).toEqual(new Set(["tool-a", "tool-raced"]));
 	});
-
-	for (const settlement of ["reply", "timeout", "abort"] as const) {
-		test(`rechecks a Send await that settles by ${settlement} after the first checkpoint`, async () => {
-			const snapshot = {
-				version: 2 as const,
-				updateEpoch: getUpdateCoordinationStatus().updateEpoch as string,
-				targetVersion: "2.0.0",
-				capturedAt: new Date().toISOString(),
-				narrators: [],
-			};
-			let checkpointCalls = 0;
-			let verificationCalls = 0;
-			let resultWritten = false;
-
-			await checkpointPreparedUpdateFence(snapshot.updateEpoch, {
-				waitForFence: async () => {},
-				checkpoint: async () => {
-					checkpointCalls++;
-					return snapshot;
-				},
-				listActiveToolCallIds: async () => [],
-				listCoveredToolCallIds: async () => ["send-tool"],
-				verifySendAwaitContinuations: async () => {
-					verificationCalls++;
-					if (verificationCalls === 1) {
-						// The old process settles immediately after its first durable snapshot. The
-						// reverse scan must force another round before replacement spawn is allowed.
-						resultWritten = true;
-						return { stable: false, unstableToolCallIds: ["send-tool"] };
-					}
-					return { stable: resultWritten, unstableToolCallIds: [] };
-				},
-			});
-
-			expect(resultWritten).toBe(true);
-			expect(checkpointCalls).toBe(3);
-			expect(verificationCalls).toBe(3);
-		});
-	}
 });
 
 describe("update service failure cleanup", () => {

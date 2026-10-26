@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { MantineProvider } from "@mantine/core";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import i18next from "i18next";
 import { parseHTML } from "linkedom";
@@ -396,24 +397,27 @@ const rowRefs = [1, 2].map((index) => ({
 }));
 
 function toolItems() {
-	const messages = rowRefs.map((ref) => ({
-		id: ref.messageId,
-		role: "assistant",
-		contentJson: [
+	const messages = rowRefs.map((ref) =>
+		rowWithElements(
 			{
-				type: "tool_use",
-				id: ref.toolUseId,
-				tcId: ref.toolCallId,
-				executionAttempt: ref.executionAttempt,
-				name: "Bash",
-				status: "success",
-				inputJson: { command: "same content" },
-				outputJson: "same content",
+				id: ref.messageId,
+				role: "assistant",
+				toolCalls: [],
 			},
-		],
-		toolCalls: [],
-		children: [],
-	})) as unknown as NarratorMsg[];
+			[
+				{
+					type: "tool_use",
+					id: ref.toolUseId,
+					tcId: ref.toolCallId,
+					executionAttempt: ref.executionAttempt,
+					name: "Bash",
+					status: "success",
+					inputJson: { command: "same content" },
+					outputJson: "same content",
+				},
+			],
+		),
+	) as unknown as NarratorMsg[];
 	const segment = segmentMessages(messages)[0];
 	if (segment?.kind !== "tool-run") throw new Error("expected tool segment");
 	return segment.items as unknown as import("../vlist/segment-adapter").AdapterToolItem[];

@@ -2,9 +2,9 @@ import {
 	type DiffWordStyles,
 	DiffWordTokens,
 } from "@frontend/components/narrator/diff/DiffWordTokens";
+import { useSharedComputedColorScheme } from "@frontend/hooks/useSharedComputedColorScheme";
 import { useShikiTokens } from "@frontend/hooks/useShikiTokens";
 import type { ShikiToken } from "@frontend/lib/shiki-token-cache";
-import { useComputedColorScheme } from "@mantine/core";
 import { buildDiffHighlightPlan, type DiffLine } from "@shared/pretext-layout/diff-core";
 import type { ParsedDiffHunk } from "@shared/pretext-layout/parse-unified-diff";
 import { type UIEvent, useEffect, useMemo, useRef } from "react";
@@ -28,7 +28,7 @@ export function GitSplitDiff({
 	onNearBottom?: () => void;
 }) {
 	const { t } = useTranslation("git");
-	const dark = useComputedColorScheme("dark") !== "light";
+	const dark = useSharedComputedColorScheme("dark") !== "light";
 	const wordStyles = useMemo<DiffWordStyles>(
 		() => ({
 			removedWord: {

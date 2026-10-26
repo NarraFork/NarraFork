@@ -11,7 +11,6 @@ import { buildAppErrorResponse } from "../../lib/app-error-response";
 import { generateId } from "../../lib/id";
 import { getDefaults, narraforkDir, saveSettings, settings } from "../../lib/settings";
 import type { NarraForkSettings } from "../../lib/settings/types";
-import { invalidateUserCache } from "../../middleware/auth";
 import type { AuthSessionStore } from "../../services/auth/session-store";
 import { authMfaStore, authSessionStore, setAuthStores } from "../../services/auth/store";
 import { resetTraitLayerCaches } from "../../services/trait-layer-service";
@@ -45,8 +44,6 @@ function installSessionStoreSeam(): void {
 		}),
 	};
 	setAuthStores({ session: store, mfa: authMfaStore });
-	invalidateUserCache(ADMIN);
-	invalidateUserCache(NON_ADMIN);
 }
 
 function appAs(role: "admin" | "user" = "admin") {
@@ -89,8 +86,6 @@ beforeEach(() => {
 
 afterEach(async () => {
 	setAuthStores(undefined);
-	invalidateUserCache(ADMIN);
-	invalidateUserCache(NON_ADMIN);
 	saveSettings(original);
 	resetTraitLayerCaches();
 	if (createdNarrators.length) {

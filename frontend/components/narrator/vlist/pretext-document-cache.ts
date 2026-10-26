@@ -33,6 +33,7 @@
  * `frontend/lib/shiki-token-cache.ts`.
  */
 
+import { isNestedRow } from "../message/nested-rows";
 import type { PretextDocumentInput } from "./pretext-document-loader";
 import { onPretextSessionChange, pretextSessionEpoch } from "./pretext-session-scope";
 
@@ -102,11 +103,14 @@ function isCacheable(input: PretextDocumentInput): boolean {
  */
 function truncateInput(input: PretextDocumentInput, maxMessages: number): PretextDocumentInput {
 	if (input.messages.length <= maxMessages) return input;
-	const messages = input.messages.slice(input.messages.length - maxMessages);
+	let start = input.messages.length - maxMessages;
+	// Never keep rows nested under a row that was cut.
+	while (start < input.messages.length && isNestedRow(input.messages[start])) start++;
+	const messages = input.messages.slice(start);
 	let oldestLoadedSeq: number | null = null;
 	for (const message of messages) {
 		const seq = typeof message.seq === "number" ? message.seq : null;
-		if (seq == null) continue;
+		if (seq == null || isNestedRow(message)) continue;
 		if (oldestLoadedSeq == null || seq < oldestLoadedSeq) oldestLoadedSeq = seq;
 	}
 	return {

@@ -52,7 +52,7 @@ export function parseStored(value: string | null): unknown {
  * The attempt the model sees per tool use: the newest one. `rows` are a message's
  * non-internal ledger rows in (tool_use_id, execution_attempt, created_at, id) order.
  */
-export function adoptedLedger<T extends PlanLedgerRow>(rows: readonly T[]): T[] {
+export function adoptedLedger<T extends Pick<PlanLedgerRow, "toolUseId">>(rows: readonly T[]): T[] {
 	const latest = new Map<string, T>();
 	for (const row of rows) {
 		if (row.toolUseId.startsWith(INTERNAL_READ_TOOL_USE_PREFIX)) continue;

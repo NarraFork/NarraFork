@@ -147,6 +147,84 @@ describe("AuthSessionStore — SQLite", () => {
 		expect(await store.findSessionState(unknown)).toBeNull();
 	});
 
+	test("a session resolves by token hash with the live account facts", async () => {
+		const userId = await makeAccount({ role: "admin" });
+		const session = {
+			id: generateId(),
+			userId,
+			tokenHash: "hash-a",
+			tokenVersion: 0,
+			sessionStart: 1_000,
+			createdAt: 1_000,
+			expiresAt: 2_000,
+		};
+		await store.createSession(session);
+		await store.bumpTokenVersion(userId);
+		expect(await store.findSessionByTokenHash("hash-a")).toEqual({
+			id: session.id,
+			userId,
+			role: "admin",
+			userTokenVersion: 1,
+			sessionTokenVersion: 0,
+			sessionStart: 1_000,
+			createdAt: 1_000,
+			expiresAt: 2_000,
+			revokedAt: null,
+		});
+		expect(await store.findSessionByTokenHash("hash-unknown")).toBeNull();
+		expect(await store.findSessionById(session.id)).toEqual(
+			await store.findSessionByTokenHash("hash-a"),
+		);
+		expect(await store.findSessionById(generateId())).toBeNull();
+	});
+
+	test("an extension only moves a live session's expiry forward", async () => {
+		const userId = await makeAccount();
+		const id = generateId();
+		await store.createSession({
+			id,
+			userId,
+			tokenHash: "hash-b",
+			tokenVersion: 0,
+			sessionStart: 1_000,
+			createdAt: 1_000,
+			expiresAt: 2_000,
+		});
+		await store.extendSession(id, 1_500);
+		expect((await store.findSessionByTokenHash("hash-b"))?.expiresAt).toBe(2_000);
+		await store.extendSession(id, 3_000);
+		expect((await store.findSessionByTokenHash("hash-b"))?.expiresAt).toBe(3_000);
+
+		await store.revokeSession(id, 2_500);
+		await store.revokeSession(id, 2_600);
+		await store.extendSession(id, 4_000);
+		const revoked = await store.findSessionByTokenHash("hash-b");
+		expect(revoked?.revokedAt).toBe(2_500);
+		expect(revoked?.expiresAt).toBe(3_000);
+	});
+
+	test("stale sessions are deleted in bounded batches", async () => {
+		const userId = await makeAccount();
+		const make = (hash: string, expiresAt: number) =>
+			store.createSession({
+				id: generateId(),
+				userId,
+				tokenHash: hash,
+				tokenVersion: 0,
+				sessionStart: 1_000,
+				createdAt: 1_000,
+				expiresAt,
+			});
+		await make("old-1", 1_100);
+		await make("old-2", 1_200);
+		await make("old-3", 1_300);
+		await make("live", 9_000);
+		expect(await store.deleteStaleSessions(5_000, 2)).toBe(2);
+		expect(await store.deleteStaleSessions(5_000, 2)).toBe(1);
+		expect(await store.deleteStaleSessions(5_000, 2)).toBe(0);
+		expect(await store.findSessionByTokenHash("live")).not.toBeNull();
+	});
+
 	test("the session store is wired to the SQLite implementation by default", () => {
 		expect(authSessionStore).toBe(store);
 	});

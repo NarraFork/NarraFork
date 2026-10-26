@@ -1,10 +1,10 @@
 /**
  * narrator-block-page.ts — messages in the block-keyed protocol v2
- * (docs/BLOCK_STORAGE-DESIGN.md §8.1, §8.2, P2c-2).
+ * (docs/BLOCK_STORAGE-DESIGN.md §8.1, §8.2, P2c-2; the only protocol since P3d).
  *
- * Protocol v1 carries each message as a row with its `contentJson` array (a page nests
- * child rows under `children`). v2 carries the same rows as envelopes that name their
- * blocks in order, plus the blocks:
+ * The page and WS emitters build each message as a row with its `contentJson` array (a
+ * page nests child rows under `children`), the shape protocol v1 sent. Clients receive
+ * the same rows as envelopes that name their blocks in order, plus the blocks:
  *
  *   - a block-format envelope's blocks are its rows: each row's `payload.raw` length says
  *     which elements it holds, and its id, kind, phase, revision and attempt come along;
@@ -19,13 +19,7 @@
 import { splitEnvelope } from "@shared/narrator-blocks/storage";
 import type { EnvelopeRole } from "@shared/narrator-blocks/types";
 import * as database from "../db";
-import { settings } from "../lib/settings";
-import { syncEnvelopeNow } from "./narrator-block-sync";
-
-/** Whether a request that asked for `protocol` gets v2: only while `narratorBlocks.wsV2` is on. */
-export function grantsBlockProtocol(protocol: string | number | undefined): boolean {
-	return String(protocol) === "2" && settings.narratorBlocks.wsV2;
-}
+import { syncQueuedEnvelopeNow } from "./narrator-block-sync";
 
 /** One block as protocol v2 sends it. */
 export interface BlockDTO {
@@ -69,7 +63,7 @@ const ID_BATCH = 500;
 
 /** Rebuild a queued envelope's rows (in a transaction of its own, or the caller's). */
 function syncQueued(messageId: string): void {
-	syncEnvelopeNow(messageId);
+	syncQueuedEnvelopeNow(messageId);
 }
 
 /**

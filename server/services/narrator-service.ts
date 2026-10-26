@@ -3028,6 +3028,41 @@ export const narratorService = {
 		});
 	},
 
+	/**
+	 * The message right before the step holding a tool call, in this narrator's refs.
+	 * Undefined when the call's step is not referenced here or nothing precedes it.
+	 */
+	async getMessageIdBeforeToolCallStep(
+		narratorId: string,
+		toolCallId: string,
+	): Promise<string | undefined> {
+		const call = await db.query.narratorToolCalls.findFirst({
+			where: eq(narratorToolCalls.id, toolCallId),
+			columns: { messageId: true },
+		});
+		if (!call) return undefined;
+		const stepRef = await db.query.narratorMessageRefs.findFirst({
+			where: and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessageRefs.messageId, call.messageId),
+			),
+			columns: { seq: true },
+		});
+		if (!stepRef) return undefined;
+		const previous = await db
+			.select({ messageId: narratorMessageRefs.messageId })
+			.from(narratorMessageRefs)
+			.where(
+				and(
+					eq(narratorMessageRefs.narratorId, narratorId),
+					sql`${narratorMessageRefs.seq} < ${stepRef.seq}`,
+				),
+			)
+			.orderBy(sql`${narratorMessageRefs.seq} DESC`)
+			.limit(1);
+		return previous[0]?.messageId;
+	},
+
 	async getLatestMessageUuid(narratorId: string): Promise<string | null> {
 		const latestRef = await db
 			.select({ messageId: narratorMessageRefs.messageId })
@@ -3071,6 +3106,14 @@ export const narratorService = {
 			userId?: string | null;
 			model?: string;
 			locale?: string;
+			/**
+			 * The ForkNarrator call's own tool-call row. The child inherits history up to,
+			 * not including, the response that made the call: that response may still be
+			 * streaming (tools start as soon as their input is complete), and its row is
+			 * shared and appended in place, so including it would hand the child a step
+			 * that keeps changing under it.
+			 */
+			callingToolCallId?: string;
 		},
 	) {
 		return withNarratorWorkAdmission(parentNarratorId, async () => {
@@ -3089,7 +3132,12 @@ export const narratorService = {
 				});
 			}
 
-			const latestMsgUuid = await this.getLatestMessageUuid(parentNarratorId);
+			const forkMessageId = opts?.callingToolCallId
+				? await this.getMessageIdBeforeToolCallStep(parentNarratorId, opts.callingToolCallId)
+				: undefined;
+			const latestMsgUuid = forkMessageId
+				? null
+				: await this.getLatestMessageUuid(parentNarratorId);
 
 			return this.forkNarrator(parentNarratorId, latestMsgUuid, {
 				title: opts?.title,
@@ -3097,6 +3145,7 @@ export const narratorService = {
 				inheritMode: opts?.inheritMode ?? "full",
 				userId: opts?.userId ?? null,
 				locale: opts?.locale,
+				...(forkMessageId ? { forkMessageId } : {}),
 			});
 		});
 	},

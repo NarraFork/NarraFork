@@ -21,6 +21,7 @@
 
 import { beforeAll, beforeEach, describe, expect, it } from "bun:test";
 import type { TreeMessage } from "@frontend/lib/api/types";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 
 beforeAll(() => {
@@ -55,33 +56,35 @@ const BUILD = {
 /** Plain prose only: the loaded document must NOT be what triggers the KaTeX load. */
 function prose(seq: number): TreeMessage {
 	const text = "这一段完全没有公式，只是普通的中文散文内容，用来占据一定的高度。";
-	return {
-		id: `m${seq}`,
-		narratorId: "n1",
-		parentToolUseId: null,
-		role: "assistant",
-		contentJson: [{ type: "text", text }],
-		contentText: text,
-		toolCalls: [],
-		createdAt: "2026-07-28T00:00:00.000Z",
-		children: [],
-		seq,
-	} as unknown as TreeMessage;
+	return rowWithElements(
+		{
+			id: `m${seq}`,
+			narratorId: "n1",
+			parentToolUseId: null,
+			role: "assistant",
+			contentText: text,
+			toolCalls: [],
+			createdAt: "2026-07-28T00:00:00.000Z",
+			seq,
+		},
+		[{ type: "text", text }],
+	) as unknown as TreeMessage;
 }
 
 function mathMessage(id: string, seq: number, text: string): TreeMessage {
-	return {
-		id,
-		narratorId: "n1",
-		parentToolUseId: null,
-		role: "assistant",
-		contentJson: [{ type: "text", id: "streaming:text:0", text }],
-		contentText: text,
-		toolCalls: [],
-		createdAt: "2026-07-28T00:00:00.000Z",
-		children: [],
-		seq,
-	} as unknown as TreeMessage;
+	return rowWithElements(
+		{
+			id,
+			narratorId: "n1",
+			parentToolUseId: null,
+			role: "assistant",
+			contentText: text,
+			toolCalls: [],
+			createdAt: "2026-07-28T00:00:00.000Z",
+			seq,
+		},
+		[{ type: "text", id: "streaming:text:0", text }],
+	) as unknown as TreeMessage;
 }
 
 function page(messages: readonly TreeMessage[]) {

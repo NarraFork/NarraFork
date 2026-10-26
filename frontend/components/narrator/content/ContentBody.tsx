@@ -1,10 +1,11 @@
+import { useSharedComputedColorScheme } from "@frontend/hooks/useSharedComputedColorScheme";
 import { getShikiLang } from "@frontend/lib/shiki-lang";
 import {
 	STRUCT_THEME_DARK,
 	STRUCT_THEME_LIGHT,
 	tokenizeStructViewBody,
 } from "@frontend/lib/struct-view-tokens";
-import { Code, useComputedColorScheme } from "@mantine/core";
+import { Code } from "@mantine/core";
 import type { FileReferenceContext } from "@shared/file-reference";
 import { normalizeFileReferenceContext } from "@shared/file-reference-context";
 import type { DiffDocument } from "@shared/pretext-layout/diff-core";
@@ -43,7 +44,7 @@ export function contentLanguage(language?: string, path?: string): string | unde
 
 /** Report colours for the chunked surface; the vlist has its own copy of this pairing. */
 function CustomHighlightedContent({ text, kind }: { text: string; kind: "struct-view" }) {
-	const dark = useComputedColorScheme("dark") !== "light";
+	const dark = useSharedComputedColorScheme("dark") !== "light";
 	const tokens = useMemo(
 		() =>
 			kind === "struct-view"

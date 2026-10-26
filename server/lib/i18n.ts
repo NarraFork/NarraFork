@@ -256,9 +256,13 @@ You have completed {count} tool call(s) since your last visible text reply. Befo
 		"zh-CN":
 			"工具参数无效或缺失，未执行。请提供完整、有效的 JSON 及全部必填参数后重试。这不一定是输出或 token 上限导致；必要时将大输入拆分为更小的调用。",
 	},
-	"tool.skippedForSoftStop": {
-		en: "Tool not executed: queued user input asked to stop at a safe point before this call started.",
-		"zh-CN": "排队中的用户输入要求在安全点停止，此工具在开始前被跳过，未执行。",
+	"tool.skippedForPassEnd": {
+		en: "Tool not executed: this pass ended (plan approved, workspace changed or decision made) before this call started.",
+		"zh-CN": "本轮在此工具开始前已结束（计划已批准、工作区已变更或已做出决定），此工具未执行。",
+	},
+	"tool.cancelledForInterrupt": {
+		en: "Tool not executed: an interrupting user message cancelled this response before the call started.",
+		"zh-CN": "用户的打断消息在此工具开始前取消了本次回复，此工具未执行。",
 	},
 	"tool.interruptionContinue": {
 		en: "Your previous response was cut off by the completion token limit. Please continue from where you left off.",
@@ -846,7 +850,8 @@ export type ToolMessageKey =
 	| "pipelineExitConfirmation"
 	| "brokenToolCallInputPlaceholder"
 	| "brokenToolCallResult"
-	| "skippedForSoftStop"
+	| "skippedForPassEnd"
+	| "cancelledForInterrupt"
 	| "interruptionContinue"
 	| "resumeAfterTransientError"
 	| "userContinue"

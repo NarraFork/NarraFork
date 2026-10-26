@@ -38,6 +38,7 @@ import type {
 	LearningDoc,
 	LearningIndexResponse,
 	LearningSearchResponse,
+	LegacyRequestDumpClearResult,
 	LicenseManifestResponse,
 	OpencodeUsageCache,
 	PublicCodexQuotaOverview,
@@ -78,6 +79,7 @@ export function searchParams(query: SearchRequest): URLSearchParams {
 	if (query.mine) params.set("mine", "1");
 	if (query.fullHistory) params.set("history", "all");
 	if (query.cursor) params.set("cursor", query.cursor);
+	if (query.page && query.page > 1) params.set("page", String(query.page));
 	if (query.limit) params.set("limit", String(query.limit));
 	return params;
 }
@@ -1432,6 +1434,10 @@ export const miscApi = {
 		request<DatabaseCleanupExecutionResult>("/storage/database/cleanup", {
 			method: "POST",
 			body: JSON.stringify(data),
+		}),
+	clearLegacyRequestDumps: () =>
+		request<LegacyRequestDumpClearResult>("/storage/database/legacy-request-dumps/clear", {
+			method: "POST",
 		}),
 	vacuumDatabase: () =>
 		request<DatabaseVacuumResult>("/storage/database/vacuum", {

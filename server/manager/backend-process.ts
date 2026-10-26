@@ -24,9 +24,9 @@ export interface BackendProcessOptions extends ListenTarget {
 	onState: (state: BackendState, detail?: string) => void;
 }
 
-/** 健康检查间隔与启动超时。 */
+/** 健康检查间隔；超过提示时间仍未就绪只记一次日志（多半在迁移数据库），不判失败。 */
 const READY_POLL_MS = 700;
-const READY_TIMEOUT_MS = 90_000;
+export const SLOW_START_HINT_MS = 90_000;
 /** 等待服务自报监听地址的上限；超过后回退到配置端口探测，避免解析失败时一路悬空。 */
 const ADDRESS_WAIT_MS = 15_000;
 /**
@@ -271,13 +271,22 @@ export class BackendProcess {
 	}
 
 	/**
-	 * 轮询健康检查直到就绪；超时只报状态，不杀进程（服务可能仍在慢启动）。
+	 * 轮询健康检查直到就绪，或子进程退出。
+	 *
+	 * 不设启动期限：数据库迁移在大库上可能要好几分钟，期间服务不监听端口，按时间判失败只会
+	 * 把仍在正常迁移的进程标成故障，引导用户重启——中途结束迁移。进程还活着就继续等，
+	 * 真正的失败表现为进程退出（带退出码）。
 	 * 遇到实例锁冲突时返回持有者 PID，由调用方决定是否等待后重试。
 	 */
 	private async waitUntilReady(): Promise<number | undefined> {
-		const deadline = Date.now() + READY_TIMEOUT_MS;
-		this.addressWaitStartedAt = Date.now();
-		while (Date.now() < deadline) {
+		const startedAt = Date.now();
+		this.addressWaitStartedAt = startedAt;
+		let hinted = false;
+		for (;;) {
+			if (!hinted && Date.now() - startedAt > SLOW_START_HINT_MS) {
+				hinted = true;
+				this.options.onLine(t("log.slowStart"));
+			}
 			// 实例锁冲突：服务会立即退出，直接给出原因，不必等超时。
 			if (this.lockConflictPid !== undefined) return this.lockConflictPid;
 			if (!this.child) return undefined;
@@ -298,8 +307,6 @@ export class BackendProcess {
 			}
 			await this.sleep(READY_POLL_MS);
 		}
-		if (this.child) this.setState("error", t("error.readyTimeout"));
-		return undefined;
 	}
 
 	/** 可中断等待：stop/dispose 会立即唤醒，避免启动流程卡在定时器上。 */

@@ -441,6 +441,7 @@ export function renderElement(
 					labels={extra.labels as never}
 					pending={extra.askInPassingPending as AskInPassingPendingInteraction | undefined}
 					onOpen={extra.onOpenAskInPassingTarget as (() => void) | undefined}
+					quote={(extra.data as { quoteText?: string } | undefined)?.quoteText}
 				/>
 			);
 		case "subagent-recovery":

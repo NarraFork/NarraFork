@@ -1,7 +1,6 @@
 import type { PluginViewSurface } from "../../components/plugins/types";
 import {
 	ApiError,
-	absorbRenewedToken,
 	apiBase,
 	getToken,
 	postFormDataWithProgress,
@@ -309,8 +308,6 @@ export const pluginsApi = {
 			onProgress: options?.onProgress,
 			signal: options?.signal,
 		});
-		// XHR upload cannot go through authorizedFetch, so absorb explicitly.
-		absorbRenewedToken(res, token);
 		if (!res.ok) {
 			const { message, data } = await readFetchError(res, `Upload failed (${res.status})`);
 			throw new ApiError(message, res.status, data);

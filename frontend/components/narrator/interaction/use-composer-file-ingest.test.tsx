@@ -8,6 +8,7 @@ import * as panelTypes from "../narrator-panel-types";
 import {
 	type AttachmentInsertionBookmark,
 	type AttachmentInsertionOrigin,
+	COMPOSER_DRAG_IDLE_MS,
 	COMPOSER_FILE_INGEST_TIMEOUT_MS,
 	type UseComposerFileIngestOptions,
 	useComposerFileIngest,
@@ -322,6 +323,106 @@ test("drop already consumed by an editor is not imported a second time", async (
 	expect(dragCounterRef.current).toBe(0);
 	expect(dragging).toBe(false);
 	expect(event.stopPropagation).toHaveBeenCalledTimes(1);
+});
+
+function dragEvent(currentTarget: Element, relatedTarget: Element | null = null) {
+	return {
+		currentTarget,
+		relatedTarget,
+		defaultPrevented: false,
+		preventDefault: () => {},
+		stopPropagation: () => {},
+		dataTransfer: { types: ["Files"], files: [], dropEffect: "none" },
+	} as unknown as DragEvent;
+}
+function dragZone() {
+	const zone = document.createElement("div");
+	const child = document.createElement("span");
+	const outside = document.createElement("p");
+	zone.append(child);
+	document.body.append(zone, outside);
+	return { zone, child, outside };
+}
+
+for (const [name, fire] of [
+	["window drop", () => window.dispatchEvent(new window.Event("drop"))],
+	["window dragend", () => window.dispatchEvent(new window.Event("dragend"))],
+	["window blur", () => window.dispatchEvent(new window.Event("blur"))],
+	[
+		"document hidden",
+		() => {
+			Object.defineProperty(document, "visibilityState", {
+				configurable: true,
+				value: "hidden",
+			});
+			document.dispatchEvent(new window.Event("visibilitychange"));
+		},
+	],
+] as const) {
+	test(`${name} clears the overlay when the matching dragleave never arrives`, async () => {
+		const { zone, child } = dragZone();
+		await act(async () => {
+			hook.dropZoneProps.onDragEnter(dragEvent(zone));
+			hook.dropZoneProps.onDragEnter(dragEvent(child));
+		});
+		expect(dragging).toBe(true);
+		await act(async () => fire());
+		expect(dragging).toBe(false);
+		expect(dragCounterRef.current).toBe(0);
+	});
+}
+
+test("moving between descendants keeps the overlay; leaving to an outside node always clears it", async () => {
+	const { zone, child, outside } = dragZone();
+	await act(async () => {
+		hook.dropZoneProps.onDragEnter(dragEvent(zone, outside));
+		hook.dropZoneProps.onDragEnter(dragEvent(zone, zone));
+		hook.dropZoneProps.onDragLeave(dragEvent(zone, child));
+	});
+	expect(dragging).toBe(true);
+	// A stale count (enters whose leaves were lost) must not survive a real exit.
+	dragCounterRef.current = 5;
+	await act(async () => hook.dropZoneProps.onDragLeave(dragEvent(zone, outside)));
+	expect(dragging).toBe(false);
+	expect(dragCounterRef.current).toBe(0);
+});
+
+test("null relatedTarget falls back to balanced enter/leave counting", async () => {
+	const { zone } = dragZone();
+	await act(async () => {
+		hook.dropZoneProps.onDragEnter(dragEvent(zone));
+		hook.dropZoneProps.onDragEnter(dragEvent(zone));
+		hook.dropZoneProps.onDragLeave(dragEvent(zone));
+	});
+	expect(dragging).toBe(true);
+	await act(async () => hook.dropZoneProps.onDragLeave(dragEvent(zone)));
+	expect(dragging).toBe(false);
+});
+
+test("drag that stops sending dragover is cleared by the idle watchdog", async () => {
+	const originalTimeout = globalThis.setTimeout;
+	const idle: (() => void)[] = [];
+	spyOn(globalThis, "setTimeout").mockImplementation(((
+		callback: TimerHandler,
+		delay?: number,
+		...args: unknown[]
+	) => {
+		if (delay === COMPOSER_DRAG_IDLE_MS) idle.push(callback as () => void);
+		return originalTimeout(callback, delay, ...args);
+	}) as typeof setTimeout);
+	const { zone } = dragZone();
+	await act(async () => {
+		hook.dropZoneProps.onDragEnter(dragEvent(zone));
+		hook.dropZoneProps.onDragOver(dragEvent(zone));
+	});
+	expect(idle).toHaveLength(2);
+	expect(dragging).toBe(true);
+	await act(async () => idle.at(-1)?.());
+	expect(dragging).toBe(false);
+	expect(dragCounterRef.current).toBe(0);
+	// dragover after a reset (e.g. pointer still over the zone) restores the overlay.
+	await act(async () => hook.dropZoneProps.onDragOver(dragEvent(zone)));
+	expect(dragging).toBe(true);
 });
 
 test("each queued batch restores its own enqueue selection, never a later selection", async () => {

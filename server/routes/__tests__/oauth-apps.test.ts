@@ -1,12 +1,10 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import { eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
-import { sign } from "hono/jwt";
 import { db } from "../../db";
 import { oauthClients, users } from "../../db/schema";
 import { buildAppErrorResponse } from "../../lib/app-error-response";
 import { generateId } from "../../lib/id";
-import { settings } from "../../lib/settings";
 import { requireAuth } from "../../middleware/auth";
 import { oauthAppRoutes } from "../oauth-apps";
 
@@ -120,9 +118,10 @@ async function ensureActors(): Promise<void> {
 	if (!userId) userId = await ensureUser(USER_USERNAME, "user");
 }
 
-async function jwtFor(sub: string, role: "admin" | "user"): Promise<string> {
-	const now = Math.floor(Date.now() / 1000);
-	return sign({ sub, role, iat: now, exp: now + 3600 }, settings.auth.jwtSecret);
+/** Open a real session; the role comes from the account row, as in production. */
+async function jwtFor(sub: string, _role: "admin" | "user"): Promise<string> {
+	const { createToken } = await import("../../lib/auth");
+	return createToken(sub);
 }
 
 async function adminHeader(): Promise<Record<string, string>> {

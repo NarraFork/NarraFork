@@ -1,7 +1,7 @@
-import { SESSION_RENEWAL_HEADER } from "@shared/session-auth";
 import { count } from "drizzle-orm";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
+import type { UnofficialStatusCode } from "hono/utils/http-status";
 import { db } from "./db";
 import { users } from "./db/schema";
 import { buildAppErrorResponse, toErrorPayload } from "./lib/app-error-response";
@@ -212,12 +212,9 @@ app.use(
 				}) ?? undefined
 			);
 		},
-		// The sliding-renewal token rides on a custom response header, which is
-		// invisible to cross-origin readers unless explicitly exposed.
 		// The session export download carries its resume command and warnings in
 		// headers so the body stays a plain file.
 		exposeHeaders: [
-			SESSION_RENEWAL_HEADER,
 			"Content-Disposition",
 			"X-Session-Id",
 			"X-Resume-Command",
@@ -226,20 +223,6 @@ app.use(
 		],
 	}),
 );
-
-// A 401 must never carry a renewed session token. Auth middleware sets the
-// header before the route runs, so a later 401 (a failed second factor, an
-// OAuth-only boundary, a vanished user) would otherwise ship a fresh credential
-// alongside the rejection — and the client would race between storing it and
-// clearing the session it belongs to.
-app.use("/api/*", async (c, next) => {
-	await next();
-	if (c.res.status === 401) {
-		// `c.header(name, undefined)` is the supported delete path and also handles
-		// an already-finalized response.
-		c.header(SESSION_RENEWAL_HEADER, undefined);
-	}
-});
 
 app.use("/api/*", async (c, next) => {
 	const startedAt = performance.now();
@@ -488,6 +471,12 @@ app.onError((err, c) => {
 		: err;
 	const knownErrorResponse = buildAppErrorResponse(storageError, c);
 	if (knownErrorResponse) return knownErrorResponse;
+	// The client went away (closed the page, switched narrators) and the abort surfaced from
+	// whatever the handler awaited. Not a server fault, and nobody receives this response.
+	if (c.req.raw.signal.aborted && (err as Error).name === "AbortError") {
+		logger.debug("Request aborted by client", { path: c.req.path, error: String(err) });
+		return c.body(null, 499 as UnofficialStatusCode);
+	}
 	logger.error("Unhandled error", { error: String(err), stack: (err as Error).stack });
 	// The message stays deliberately generic (an unhandled error may quote internals), but it
 	// still carries a code so the client can localize it rather than print English.

@@ -204,10 +204,36 @@ export const CONVERSATION_MESSAGE_SCOPE: MessageSearchScope = Object.freeze({
  * Message hits rolled up per narrator, for session-level global search.
  *
  * `query.limit` caps the number of narrators returned. Rows come best first: by best hit
- * rank for relevance (then by hit count and recency), by latest hit for time. Every hit the
- * narrator has counts, not only those within a window.
+ * rank for relevance (then by hit count and recency), by latest hit for time (see
+ * {@link orderSessionAggregates}). Every hit the narrator has counts, not only those within
+ * a window. The same pass names each narrator's `latestHits` newest hits, so listing a page
+ * of sessions with their hits needs no second search.
  */
-export type SessionAggregateQuery = EntitySearchQuery;
+export interface SessionAggregateQuery extends EntitySearchQuery {
+	/** Newest hits to name per narrator, at most {@link MAX_LATEST_SESSION_HITS}. */
+	latestHits?: number;
+}
+
+/** Ceiling on {@link SessionAggregateQuery.latestHits}. */
+export const MAX_LATEST_SESSION_HITS = 10;
+
+/** One hit of a session, by reference: what {@link SessionHitDetailsQuery} reads back. */
+export interface SessionHitRef {
+	id: string;
+	/** The matching block when only a block matched; read for its excerpt. */
+	blockId: string | null;
+	createdAt: string | null;
+}
+
+/**
+ * Hits already found by a session search, read back by id for display: no search runs.
+ * `text` picks the excerpt window; rows come back in `refs` order, missing ids dropped.
+ */
+export interface SessionHitDetailsQuery {
+	signal?: AbortSignal;
+	text: string;
+	refs: readonly SessionHitRef[];
+}
 
 /** The top hits of each of a few narrators. */
 export interface SessionHitsQuery extends EntitySearchQuery {
@@ -368,6 +394,37 @@ export interface SessionAggregateRow {
 	lastMessageAt: string | null;
 	createdAt: string | null;
 	updatedAt: string | null;
+	/** The newest hits, newest first, when the query asked for them. */
+	latestHits: SessionHitRef[];
+}
+
+/**
+ * The order {@link SessionAggregateQuery} promises, shared by the stores so both backends
+ * cut the same window: relevance by best rank (unranked last), then hit count, then the
+ * latest hit; time by the latest hit. The narrator id breaks ties.
+ */
+export function orderSessionAggregates(
+	rows: SessionAggregateRow[],
+	sort: SearchSort | undefined,
+	limit: number,
+): SessionAggregateRow[] {
+	const byTime = (a: SessionAggregateRow, b: SessionAggregateRow) => {
+		const x = a.lastHitAt ?? "";
+		const y = b.lastHitAt ?? "";
+		return x < y ? 1 : x > y ? -1 : 0;
+	};
+	const byId = (a: SessionAggregateRow, b: SessionAggregateRow) =>
+		a.narratorId < b.narratorId ? -1 : a.narratorId > b.narratorId ? 1 : 0;
+	const compare =
+		sort === "time"
+			? (a: SessionAggregateRow, b: SessionAggregateRow) => byTime(a, b) || byId(a, b)
+			: (a: SessionAggregateRow, b: SessionAggregateRow) =>
+					(a.bestRank === null ? 1 : 0) - (b.bestRank === null ? 1 : 0) ||
+					(a.bestRank ?? 0) - (b.bestRank ?? 0) ||
+					b.hitCount - a.hitCount ||
+					byTime(a, b) ||
+					byId(a, b);
+	return rows.sort(compare).slice(0, Math.max(0, limit));
 }
 
 export interface TimelineSearchRow {
@@ -414,4 +471,40 @@ export interface KnowledgeSearchRow {
 	fromDraft: boolean;
 	/** True when the draft forked from a revision the committed version has since moved past. */
 	drifted: boolean;
+}
+
+/** The newest-hit count a query asked for, within bounds. */
+export function latestHitCount(query: SessionAggregateQuery): number {
+	return Math.max(0, Math.min(Math.trunc(query.latestHits ?? 0), MAX_LATEST_SESSION_HITS));
+}
+
+/**
+ * Fold a store's per-hit aggregate rows (columns `narrator_id`, `hit_id`, `hit_block_id`,
+ * `hit_created_at`; a narrator's rows contiguous, newest hit first) into one row per narrator
+ * with up to `latest` hit refs. `toAggregate` maps a row's narrator-level columns.
+ */
+export function groupSessionAggregates(
+	rows: readonly Record<string, unknown>[],
+	latest: number,
+	toAggregate: (row: Record<string, unknown>) => SessionAggregateRow,
+): SessionAggregateRow[] {
+	const text = (value: unknown) => (value === null || value === undefined ? null : String(value));
+	const byNarrator = new Map<string, SessionAggregateRow>();
+	for (const row of rows) {
+		const narratorId = String(row.narrator_id ?? "");
+		let aggregate = byNarrator.get(narratorId);
+		if (!aggregate) {
+			aggregate = { ...toAggregate(row), latestHits: [] };
+			byNarrator.set(narratorId, aggregate);
+		}
+		const id = text(row.hit_id);
+		if (id && aggregate.latestHits.length < latest) {
+			aggregate.latestHits.push({
+				id,
+				blockId: text(row.hit_block_id),
+				createdAt: text(row.hit_created_at),
+			});
+		}
+	}
+	return [...byNarrator.values()];
 }

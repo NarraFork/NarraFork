@@ -51,7 +51,7 @@
  * server that mints it; the `nfEmbed` marker is NOT that secret (see guard #2).
  */
 
-import { clearToken, getToken, onTokenChange, setToken } from "@frontend/lib/api/client";
+import { endSession, getToken, onTokenChange, setToken } from "@frontend/lib/api/client";
 
 /** URL parameter through which the embedder declares itself. */
 const EMBED_MARKER_PARAM = "nfEmbed";
@@ -66,16 +66,15 @@ interface HostMessage {
 }
 
 /**
- * Whether a value is shaped like the session JWT the server issues.
+ * Whether a value is shaped like a session token the server issues: `nfs_` followed by
+ * 32 random bytes in unpadded base64url.
  *
- * Not verified — the client has no key, and the backend is the only party that can accept
- * or reject it. This only refuses values that could not possibly be a token, so that an
- * arbitrary string cannot be parked in storage and later sent as a credential.
+ * Not verified — only the backend can accept or reject it. This only refuses values that
+ * could not possibly be a token, so that an arbitrary string cannot be parked in storage
+ * and later sent as a credential.
  */
 export function looksLikeSessionToken(value: unknown): value is string {
-	if (typeof value !== "string") return false;
-	if (value.length < 20 || value.length > 8_192) return false;
-	return /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(value);
+	return typeof value === "string" && /^nfs_[A-Za-z0-9_-]{43}$/.test(value);
 }
 
 /** True when this document is framed AND the embedder supplied the marker. */
@@ -192,7 +191,7 @@ export function installHostBridge(
 		 * silently destroys a live session.
 		 */
 		if (data.type === SIGN_OUT_MESSAGE) {
-			clearToken();
+			endSession();
 			// Reload so the SPA drops in-memory session state (React Query caches, open
 			// WebSockets) and lands on its login screen. Clearing storage alone leaves a
 			// fully-rendered app whose next request 401s, which reads as a crash rather than
@@ -210,7 +209,7 @@ export function installHostBridge(
 
 	win.addEventListener("message", onMessage);
 
-	// Report changes upward so the host's copy follows the server's sliding renewal. Only
+	// Report changes upward so the host's copy follows token replacements. Only
 	// after an origin is pinned — before that there is no verified party to send to, and
 	// `"*"` is never acceptable for a credential.
 	const unsubscribe = onTokenChange((token) => {

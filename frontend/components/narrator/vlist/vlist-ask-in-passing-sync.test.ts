@@ -1,14 +1,17 @@
 import { describe, expect, it } from "bun:test";
 import type { TreeMessage } from "@frontend/lib/api/types";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { syncAskInPassingMessage } from "./vlist-ask-in-passing-sync";
 
-const row = (id: string, seq: number) => ({ id, seq, contentJson: [] }) as unknown as TreeMessage;
+const row = (id: string, seq: number) => rowWithElements({ id, seq }, []) as unknown as TreeMessage;
 const card = (id = "ask", status = "pending", askInsertVersion = 8) =>
-	({
-		...row(id, 2),
-		askInsertVersion,
-		contentJson: [{ type: "ask_in_passing", status, sourceMessageId: "source" }],
-	}) as unknown as TreeMessage;
+	rowWithElements(
+		{
+			...row(id, 2),
+			askInsertVersion,
+		},
+		[{ type: "ask_in_passing", status, sourceMessageId: "source" }],
+	) as unknown as TreeMessage;
 const base = [row("source", 1), row("next", 2), row("tail", 3)];
 function sync(loaded: readonly TreeMessage[], message: TreeMessage, version?: number) {
 	const result = syncAskInPassingMessage(loaded, message, version);

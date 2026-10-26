@@ -364,7 +364,7 @@ export function UsageStackedChart({ filters }: UsageStackedChartProps) {
 										{formatTimestamp(hoveredTimestamp, granularity)}
 									</Text>
 									{data.series.map((series) => {
-										const value = series.data[hoveredIndex ?? 0]?.value ?? 0;
+										const value = series.data[hoveredIndex ?? 0]?.value ?? null;
 										if (value === 0) return null;
 										return (
 											<Group key={series.label} justify="space-between" gap="md" wrap="nowrap">
@@ -386,7 +386,9 @@ export function UsageStackedChart({ filters }: UsageStackedChartProps) {
 													</Text>
 												</Group>
 												<Text size="xs" fw={600}>
-													{formatMetricValue(metric, value)}
+													{value == null
+														? t("usageHistoryCacheHitRateEmpty")
+														: formatMetricValue(metric, value)}
 												</Text>
 											</Group>
 										);

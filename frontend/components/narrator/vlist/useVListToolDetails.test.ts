@@ -20,6 +20,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { QueryClient, QueryClientProvider, replaceEqualDeep } from "@tanstack/react-query";
 import { parseHTML } from "linkedom";
 import { createElement, useEffect, useState } from "react";
@@ -393,10 +394,13 @@ describe("useVListToolDetails", () => {
 // but the enriched SDK block retains tcId + executionAttempt, and the message
 // supplies its own identity. No tool_use.id is ever promoted to a row PK.
 function message(ref: VListToolDetailRequest): NarratorMsg {
-	return {
-		id: ref.messageId,
-		role: "assistant",
-		contentJson: [
+	return rowWithElements(
+		{
+			id: ref.messageId,
+			role: "assistant",
+			toolCalls: [],
+		},
+		[
 			{
 				type: "tool_use",
 				id: ref.toolUseId,
@@ -408,9 +412,7 @@ function message(ref: VListToolDetailRequest): NarratorMsg {
 				outputJson: { stdout: { _truncated: true, preview: "output", fullLength: 9000 } },
 			},
 		],
-		toolCalls: [],
-		children: [],
-	} as unknown as NarratorMsg;
+	) as unknown as NarratorMsg;
 }
 
 function adapted(refs: VListToolDetailRequest[], resolvers?: UseVListToolDetailsResult) {

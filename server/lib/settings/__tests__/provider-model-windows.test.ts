@@ -3,7 +3,6 @@ import { existsSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ModelWindowsResponse } from "@shared/model-catalog/schema/api";
 import { Hono } from "hono";
-import { invalidateUserCache } from "../../../middleware/auth";
 import { modelCatalogRoutes } from "../../../routes/model-catalog";
 import type { AuthSessionStore } from "../../../services/auth/session-store";
 import { authMfaStore, authSessionStore, setAuthStores } from "../../../services/auth/store";
@@ -45,7 +44,6 @@ beforeEach(() => {
 });
 afterEach(() => {
 	setAuthStores(undefined);
-	invalidateUserCache("window-test");
 	deleteNugCachedModels("window-nug");
 	writeFileSync(path, original);
 	reloadSettings();

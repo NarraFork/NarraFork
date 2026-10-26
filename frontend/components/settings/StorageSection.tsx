@@ -289,6 +289,7 @@ export function StorageSection() {
 	const [databasePreviewError, setDatabasePreviewError] = useState<string | null>(null);
 	const [databaseCleaning, setDatabaseCleaning] = useState(false);
 	const [databaseVacuuming, setDatabaseVacuuming] = useState(false);
+	const [legacyDumpsClearing, setLegacyDumpsClearing] = useState(false);
 	// Aborts only the status-polling fetches on unmount. The scan itself is a server-side
 	// background job: leaving this page neither cancels nor restarts it.
 	const pollAbortRef = useRef<AbortController | null>(null);
@@ -607,6 +608,38 @@ export function StorageSection() {
 		}
 	};
 
+	const handleClearLegacyRequestDumps = async () => {
+		if (!storageHealthReady) return;
+		if (
+			!(await confirm({
+				title: t("storageDatabaseLegacyDumpsConfirmTitle"),
+				message: t("storageDatabaseLegacyDumpsConfirm"),
+				confirmLabel: t("storageDatabaseLegacyDumpsClear"),
+				confirmColor: "red",
+			}))
+		) {
+			return;
+		}
+		setLegacyDumpsClearing(true);
+		try {
+			const result = await api.clearLegacyRequestDumps();
+			notifications.show({
+				color: "green",
+				message: t("storageDatabaseLegacyDumpsCleared", { count: result.cleared }),
+			});
+			void handleScan(["database"]);
+		} catch (err) {
+			console.error("Clearing legacy request dumps failed:", err);
+			notifications.show({
+				color: "red",
+				message:
+					err instanceof Error && err.message ? err.message : t("storageDatabaseLegacyDumpsFailed"),
+			});
+		} finally {
+			setLegacyDumpsClearing(false);
+		}
+	};
+
 	const handleDatabaseVacuum = async () => {
 		if (!storageHealthReady || !vacuumSupported) return;
 		if (
@@ -698,6 +731,12 @@ export function StorageSection() {
 						count: cleanedCount,
 						size: formatBytes(result.freedBytes),
 					}),
+				});
+			}
+			if (result.skippedSessions) {
+				notifications.show({
+					color: "yellow",
+					message: t("storageDatabaseCleanupSkippedChanged", { count: result.skippedSessions }),
 				});
 			}
 			closeDatabasePreview();
@@ -1211,6 +1250,28 @@ export function StorageSection() {
 																	})}
 														</Alert>
 													)}
+													{databaseDetails.legacyRequestDumps?.retained && (
+														<Alert
+															color="yellow"
+															variant="light"
+															icon={<IconAlertTriangle size={16} />}
+															title={t("storageDatabaseLegacyDumpsTitle")}
+														>
+															<Stack gap="xs" align="flex-start">
+																<Text size="sm">{t("storageDatabaseLegacyDumpsDesc")}</Text>
+																<Button
+																	size="xs"
+																	variant="light"
+																	color="orange"
+																	loading={legacyDumpsClearing}
+																	disabled={databaseScanRunning}
+																	onClick={handleClearLegacyRequestDumps}
+																>
+																	{t("storageDatabaseLegacyDumpsClear")}
+																</Button>
+															</Stack>
+														</Alert>
+													)}
 													{databaseUsageCategories.length > 0 && (
 														<Stack gap="xs">
 															<Group justify="space-between" align="center" gap="xs">
@@ -1430,6 +1491,12 @@ export function StorageSection() {
 					{databasePreview?.warningCodes.includes("deletesUsageHistory") && (
 						<Alert color="orange" icon={<IconAlertTriangle size={16} />}>
 							{t("storageDatabaseWillDeleteUsageHistory")}
+						</Alert>
+					)}
+
+					{databasePreview?.warningCodes.includes("statisticsUnavailable") && (
+						<Alert color="yellow" icon={<IconAlertTriangle size={16} />}>
+							{t("storageDatabaseStatisticsUnavailable")}
 						</Alert>
 					)}
 

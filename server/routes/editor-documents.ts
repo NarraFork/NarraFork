@@ -109,7 +109,7 @@ export function editorActorForSubject(
 			auth?.type === "session" &&
 			(auth.user.sub !== subject.userId ||
 				auth.user.exp <= Date.now() / 1000 ||
-				(auth.user.sv ?? 0) !== user.tokenVersion)
+				(auth.user.tokenVersion ?? 0) !== user.tokenVersion)
 		)
 			throw new AppError("Editor authorization expired", 403, "EDITOR_IDENTITY_CHANGED");
 		if (auth?.type === "oauth") {

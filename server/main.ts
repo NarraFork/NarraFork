@@ -1,7 +1,6 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { existsSync, rmSync } from "node:fs";
 import { extname, resolve } from "node:path";
-import { isSessionTokenVersionCurrent, SESSION_VERSION_CLAIM } from "@shared/session-auth";
 import { eq } from "drizzle-orm";
 
 // Relative rather than `@frontend/*`: `bun build` (used for the compiled binary) does not
@@ -804,7 +803,7 @@ async function resolveVNetRelayAuth(req: Request, url: URL): Promise<VNetRelayAu
 	if (token) {
 		try {
 			const payload = await verifyToken(token);
-			return { kind: "jwt", userId: payload.sub };
+			return { kind: "session", userId: payload.sub };
 		} catch {
 			// Fall through to anonymous only when explicitly enabled.
 		}
@@ -998,7 +997,7 @@ function startServer(listenPort: number, tlsCfg: typeof settings.server.tls) {
 				// WebSocket upgrade for /ws/narrator and /ws/terminal
 				if (url.pathname.startsWith("/ws")) {
 					// Anonymous public-share reader: `?share=<shareId>&token=<secret>` instead
-					// of a session JWT. Verified once at upgrade, scoped at subscribe time
+					// of a session token. Verified once at upgrade, scoped at subscribe time
 					// (narrator-ws reads `ws.data.publicShare`), and dropped on revocation.
 					const shareId = url.searchParams.get("share");
 					if (shareId && url.pathname === "/ws/narrator") {
@@ -1039,7 +1038,7 @@ function startServer(listenPort: number, tlsCfg: typeof settings.server.tls) {
 						return new Response("WebSocket upgrade failed", { status: 400 });
 					}
 
-					// Verify JWT from query param
+					// Verify the session token from the query param
 					const token = url.searchParams.get("token");
 					if (!token) {
 						return new Response("Authentication required", { status: 401 });
@@ -1059,22 +1058,14 @@ function startServer(listenPort: number, tlsCfg: typeof settings.server.tls) {
 							username: true,
 							avatarColor: true,
 							avatarImageId: true,
-							// Read live rather than taken from the token, so a demotion applies to
-							// the next socket instead of riding along until the JWT expires. The
-							// narrator subscribe path uses it for the admin short-circuit.
+							// Read live, so a demotion applies to the next socket. The narrator
+							// subscribe path uses it for the admin short-circuit.
 							role: true,
-							// The upgrade verifies only the JWT signature, so a revoked token (one left
-							// behind by a `token_version` bump — password change, "sign out everywhere")
-							// would otherwise still open a socket until its `exp`. Enforce the current
-							// generation here, exactly as the HTTP gate does, and fail the upgrade when
-							// it is stale (or the user row is gone).
-							tokenVersion: true,
 						},
 					});
-					if (
-						!user ||
-						!isSessionTokenVersionCurrent(payload[SESSION_VERSION_CLAIM], user.tokenVersion)
-					) {
+					// `verifyToken` already rejected revoked and expired sessions; a user row that
+					// vanished since still fails the upgrade.
+					if (!user) {
 						return new Response("Invalid or expired token", { status: 401 });
 					}
 					const userInfo = user
@@ -1087,11 +1078,11 @@ function startServer(listenPort: number, tlsCfg: typeof settings.server.tls) {
 							}
 						: undefined;
 
-					// Snapshot the credential's expiry so the heartbeat can drop the socket
-					// when it lapses; the upgrade is the only place the token is verified.
+					// Remember the session so the socket can be re-checked when it lapses or
+					// when the user's authorization changes (logout, revocation, role).
 					const wsData = resolveWSData(url, userInfo, undefined, {
 						sessionExp: payload.exp,
-						sessionTokenVersion: payload[SESSION_VERSION_CLAIM] ?? 0,
+						sessionId: payload.sid,
 						sessionUserId: payload.sub,
 					});
 					if (!wsData) {
@@ -1698,6 +1689,11 @@ startSkillCacheCleanupTimer();
 import { startChallengeCleanupTimer } from "./lib/webauthn";
 
 startChallengeCleanupTimer();
+
+// Periodically delete expired and revoked login sessions.
+import { startSessionCleanupTimer } from "./lib/auth";
+
+startSessionCleanupTimer();
 
 // Poll for due scheduled tasks (periodic prompt → narrator). Re-arms on startup.
 import {

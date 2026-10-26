@@ -19,6 +19,7 @@ const { narratorPersistence } = await import("../narrator-persistence");
 const { settings } = await import("../../lib/settings");
 const blockSync = await import("../narrator-block-sync");
 const backfill = await import("../narrator-block-backfill");
+const blockIndex = await import("../narrator-block-index");
 const { runBlockBackfillSlice, runBlockVerifySlice, runBlockReindexSlice } = await import(
 	"../../lib/db-worker/block-backfill-query"
 );
@@ -38,9 +39,12 @@ const inline = {
 		runBlockReindexSlice(sqlite, params),
 };
 
+/** Run the jobs to the end, then write the search text the store and the jobs queued. */
 async function drain(): Promise<number> {
+	await blockIndex.drainBlockIndexQueue();
 	let slices = 0;
 	while (await backfill.runBlockJobSlice(inline)) slices++;
+	await blockIndex.drainBlockIndexQueue();
 	return slices;
 }
 
@@ -366,6 +370,8 @@ describe("block reindex", () => {
 			step.id,
 			toolCallId,
 		);
+		// The store queues the search text; the index job writes it.
+		await blockIndex.drainBlockIndexQueue();
 		return step.id;
 	}
 
@@ -495,6 +501,7 @@ describe("block reindex", () => {
 			},
 		};
 		while (await backfill.runBlockJobSlice(racing));
+		await blockIndex.drainBlockIndexQueue();
 		expect(indexed("persimmons")).toHaveLength(1);
 		expect(indexed("cellar")).toEqual([]);
 		expect(indexed("quince")).toHaveLength(1);
@@ -522,6 +529,7 @@ describe("block reindex", () => {
 			},
 		};
 		while (await backfill.runBlockJobSlice(racing));
+		await blockIndex.drainBlockIndexQueue();
 		expect(indexed("medlar")).toHaveLength(1);
 		expect(indexed("jam/quince")).toEqual([]);
 	});

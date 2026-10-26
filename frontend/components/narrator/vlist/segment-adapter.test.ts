@@ -1,4 +1,5 @@
 import { beforeAll, describe, expect, it } from "bun:test";
+import { messageBody, rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { segmentMessages } from "../message/message-segments";
 import type { NarratorMsg } from "../narrator-panel-types";
 import { installCanvasStub } from "./measure/test-canvas-stub";
@@ -39,7 +40,7 @@ describe("communication bubbles", () => {
 					{
 						blockIndex: 1,
 						isSubagent: true,
-						msg: { id: "message-send", role: "assistant", contentJson: [] },
+						msg: rowWithElements({ id: "message-send", role: "assistant" }, []),
 						tc: {
 							toolName: "Send",
 							toolUseId: "send-1",
@@ -463,11 +464,13 @@ describe("exact detail refs remain independent of LOD/display identity", () => {
 			kind: "tool" as const,
 			blockIndex: 0,
 			isSubagent: toolName === "Agent",
-			msg: {
-				id: `message-${index}`,
-				role: "assistant",
-				contentJson: [{ type: "tool_use", id: "reused-sdk-id", executionAttempt: index }],
-			},
+			msg: rowWithElements(
+				{
+					id: `message-${index}`,
+					role: "assistant",
+				},
+				[{ type: "tool_use", id: "reused-sdk-id", executionAttempt: index }],
+			),
 			tc: {
 				id: `row-${index}`,
 				toolUseId: "reused-sdk-id",
@@ -623,14 +626,16 @@ describe("adaptSegment — user message", () => {
 	it("produces a single message-bubble with joined plain text", () => {
 		const seg: AdapterSegment = {
 			kind: "message",
-			msg: {
-				id: "u1",
-				role: "user",
-				contentJson: [
+			msg: rowWithElements(
+				{
+					id: "u1",
+					role: "user",
+				},
+				[
 					{ type: "text", text: "line1" },
 					{ type: "text", text: "line2" },
 				],
-			},
+			),
 		};
 		const specs = adaptSegment(seg, CTX);
 		expect(specs).toHaveLength(1);
@@ -643,13 +648,15 @@ describe("adaptSegment — user message", () => {
 		const creator = { id: "u1", username: "alice", avatarColor: "#f00", avatarImageId: null };
 		const seg: AdapterSegment = {
 			kind: "message",
-			msg: {
-				id: "u1",
-				role: "user",
-				createdAt: "2026-01-01T12:34:00.000Z",
-				creator,
-				contentJson: [{ type: "text", text: "hi" }],
-			},
+			msg: rowWithElements(
+				{
+					id: "u1",
+					role: "user",
+					createdAt: "2026-01-01T12:34:00.000Z",
+					creator,
+				},
+				[{ type: "text", text: "hi" }],
+			),
 		};
 		const specs = adaptSegment(seg, CTX);
 		const data = specs[0]!.data as {
@@ -665,7 +672,7 @@ describe("adaptSegment — user message", () => {
 	it("defaults creator/createdAt to null when the message omits them", () => {
 		const seg: AdapterSegment = {
 			kind: "message",
-			msg: { id: "u2", role: "user", contentJson: [{ type: "text", text: "hi" }] },
+			msg: rowWithElements({ id: "u2", role: "user" }, [{ type: "text", text: "hi" }]),
 		};
 		const specs = adaptSegment(seg, CTX);
 		const data = specs[0]!.data as { creator: unknown; createdAt: unknown };
@@ -677,14 +684,16 @@ describe("adaptSegment — user message", () => {
 		const specs = adaptSegment(
 			{
 				kind: "message",
-				msg: {
-					id: "queued-user",
-					role: "user",
-					contentJson: [{ type: "text", text: "queued" }],
-					deliveryId: "delivery-1",
-					deliveryKind: "user_input",
-					deliveryState: "claimed",
-				},
+				msg: rowWithElements(
+					{
+						id: "queued-user",
+						role: "user",
+						deliveryId: "delivery-1",
+						deliveryKind: "user_input",
+						deliveryState: "claimed",
+					},
+					[{ type: "text", text: "queued" }],
+				),
 			} as AdapterSegment,
 			CTX,
 		);
@@ -701,15 +710,17 @@ describe("adaptSegment — user message", () => {
 	it("carries image attachments so the bubble can paint them", () => {
 		const seg: AdapterSegment = {
 			kind: "message",
-			msg: {
-				id: "u3",
-				role: "user",
-				narratorId: "nar_1",
-				contentJson: [
+			msg: rowWithElements(
+				{
+					id: "u3",
+					role: "user",
+					narratorId: "nar_1",
+				},
+				[
 					{ type: "image", imageId: "img-1", filename: "shot.png", mediaType: "image/png" },
 					{ type: "text", text: "look at this" },
 				],
-			},
+			),
 		};
 		const specs = adaptSegment(seg, CTX);
 		expect(specs).toHaveLength(1);
@@ -729,11 +740,13 @@ describe("adaptSegment — user message", () => {
 	it("carries the intrinsic dimensions so measure can reserve the aspect box", () => {
 		const seg: AdapterSegment = {
 			kind: "message",
-			msg: {
-				id: "u3b",
-				role: "user",
-				narratorId: "nar_1",
-				contentJson: [
+			msg: rowWithElements(
+				{
+					id: "u3b",
+					role: "user",
+					narratorId: "nar_1",
+				},
+				[
 					{
 						type: "image",
 						imageId: "img-2",
@@ -743,7 +756,7 @@ describe("adaptSegment — user message", () => {
 						height: 100,
 					},
 				],
-			},
+			),
 		};
 		const data = adaptSegment(seg, CTX)[0]!.data as {
 			attachments: Array<Record<string, unknown>>;
@@ -755,11 +768,13 @@ describe("adaptSegment — user message", () => {
 		const noDims = adaptSegment(
 			{
 				kind: "message",
-				msg: {
-					id: "u3c",
-					role: "user",
-					contentJson: [{ type: "image", imageId: "img-3" }],
-				},
+				msg: rowWithElements(
+					{
+						id: "u3c",
+						role: "user",
+					},
+					[{ type: "image", imageId: "img-3" }],
+				),
 			},
 			CTX,
 		)[0]!.data as { attachments: Array<Record<string, unknown>> };
@@ -770,12 +785,14 @@ describe("adaptSegment — user message", () => {
 	it("prefers a block's own uploadNarratorId over the message narrator", () => {
 		const seg: AdapterSegment = {
 			kind: "message",
-			msg: {
-				id: "u4",
-				role: "user",
-				narratorId: "nar_panel",
-				contentJson: [{ type: "image", imageId: "i", uploadNarratorId: "nar_origin" }],
-			},
+			msg: rowWithElements(
+				{
+					id: "u4",
+					role: "user",
+					narratorId: "nar_panel",
+				},
+				[{ type: "image", imageId: "i", uploadNarratorId: "nar_origin" }],
+			),
 		};
 		const data = adaptSegment(seg, CTX)[0]!.data as {
 			attachments: Array<Record<string, unknown>>;
@@ -786,14 +803,16 @@ describe("adaptSegment — user message", () => {
 	it("carries text_file attachments with their size", () => {
 		const seg: AdapterSegment = {
 			kind: "message",
-			msg: {
-				id: "u5",
-				role: "user",
-				contentJson: [
+			msg: rowWithElements(
+				{
+					id: "u5",
+					role: "user",
+				},
+				[
 					{ type: "text_file", filename: "notes.txt", size: 2048 },
 					{ type: "text", text: "see attached" },
 				],
-			},
+			),
 		};
 		const data = adaptSegment(seg, CTX)[0]!.data as {
 			attachments: Array<Record<string, unknown>>;
@@ -806,7 +825,7 @@ describe("adaptSegment — user message", () => {
 	it("omits the attachments field entirely for a plain text message", () => {
 		const seg: AdapterSegment = {
 			kind: "message",
-			msg: { id: "u6", role: "user", contentJson: [{ type: "text", text: "hi" }] },
+			msg: rowWithElements({ id: "u6", role: "user" }, [{ type: "text", text: "hi" }]),
 		};
 		const data = adaptSegment(seg, CTX)[0]!.data as Record<string, unknown>;
 		expect("attachments" in data).toBe(false);
@@ -815,11 +834,13 @@ describe("adaptSegment — user message", () => {
 	it("keeps an image-only message as one bubble with empty text", () => {
 		const seg: AdapterSegment = {
 			kind: "message",
-			msg: {
-				id: "u7",
-				role: "user",
-				contentJson: [{ type: "image", imageId: "img-1" }],
-			},
+			msg: rowWithElements(
+				{
+					id: "u7",
+					role: "user",
+				},
+				[{ type: "image", imageId: "img-1" }],
+			),
 		};
 		const specs = adaptSegment(seg, CTX);
 		expect(specs).toHaveLength(1);
@@ -838,12 +859,14 @@ describe("adaptSegment — user slash command", () => {
 		text = "Expanded prompt body",
 	): AdapterSegment => ({
 		kind: "message",
-		msg: {
-			id: "c1",
-			role: "user",
-			commandText,
-			contentJson: [{ type: "text", text }],
-		},
+		msg: rowWithElements(
+			{
+				id: "c1",
+				role: "user",
+				commandText,
+			},
+			[{ type: "text", text }],
+		),
 	});
 
 	it("carries commandText so the bubble can fold the expansion", () => {
@@ -897,11 +920,13 @@ describe("adaptSegment — user-role system notices", () => {
 		const specs = adaptSegment(
 			{
 				kind: "message",
-				msg: {
-					id: "b1",
-					role: "user",
-					contentJson: [{ type: "bash_command", command: "bun test" }],
-				},
+				msg: rowWithElements(
+					{
+						id: "b1",
+						role: "user",
+					},
+					[{ type: "bash_command", command: "bun test" }],
+				),
 			},
 			CTX,
 		);
@@ -917,11 +942,13 @@ describe("adaptSegment — user-role system notices", () => {
 			const specs = adaptSegment(
 				{
 					kind: "message",
-					msg: {
-						id: `t-${type}`,
-						role: "user",
-						contentJson: [{ type, toolName: "Browser", text: `🔧 ${type}: Browser` }],
-					},
+					msg: rowWithElements(
+						{
+							id: `t-${type}`,
+							role: "user",
+						},
+						[{ type, toolName: "Browser", text: `🔧 ${type}: Browser` }],
+					),
 				},
 				CTX,
 			);
@@ -942,11 +969,13 @@ describe("adaptSegment — user-role system notices", () => {
 			const specs = adaptSegment(
 				{
 					kind: "message",
-					msg: {
-						id: `sc-${status}`,
-						role: "user",
-						contentJson: [{ type: "segment_compact", status, messageCount: 12 }],
-					},
+					msg: rowWithElements(
+						{
+							id: `sc-${status}`,
+							role: "user",
+						},
+						[{ type: "segment_compact", status, messageCount: 12 }],
+					),
 				},
 				CTX,
 			);
@@ -962,11 +991,13 @@ describe("adaptSegment — user-role system notices", () => {
 		const specs = adaptSegment(
 			{
 				kind: "message",
-				msg: {
-					id: "sc-failed",
-					role: "user",
-					contentJson: [{ type: "segment_compact", status: "failed", error: "oom" }],
-				},
+				msg: rowWithElements(
+					{
+						id: "sc-failed",
+						role: "user",
+					},
+					[{ type: "segment_compact", status: "failed", error: "oom" }],
+				),
 			},
 			CTX,
 		);
@@ -985,15 +1016,17 @@ describe("adaptSegment — user-role system notices", () => {
 		const specs = adaptSegment(
 			{
 				kind: "message",
-				msg: {
-					id: "inj",
-					role: "user",
-					contentJson: [
+				msg: rowWithElements(
+					{
+						id: "inj",
+						role: "user",
+					},
+					[
 						{ type: "text", text: "review concluded" },
 						{ type: "system_injection", source: "review" },
 						{ type: "review_feedback", text: "Review done" },
 					],
-				},
+				),
 			},
 			CTX,
 		);
@@ -1004,7 +1037,7 @@ describe("adaptSegment — user-role system notices", () => {
 		const specs = adaptSegment(
 			{
 				kind: "message",
-				msg: { id: "u9", role: "user", contentJson: [{ type: "text", text: "hi" }] },
+				msg: rowWithElements({ id: "u9", role: "user" }, [{ type: "text", text: "hi" }]),
 			},
 			CTX,
 		);
@@ -1017,14 +1050,16 @@ describe("adaptSegment — native context markdown", () => {
 		const specs = adaptSegment(
 			{
 				kind: "message",
-				msg: {
-					id: "ctx-markdown",
-					role: "system",
-					contentJson: [
+				msg: rowWithElements(
+					{
+						id: "ctx-markdown",
+						role: "system",
+					},
+					[
 						{ type: "system_injection", source: "bg_agent", modelText: "model context" },
 						{ type: "text", text: "follow-up **markdown**" },
 					],
-				},
+				),
 			},
 			CTX,
 		);
@@ -1038,16 +1073,18 @@ describe("adaptSegment — assistant message", () => {
 	it("dispatches each visible block to its kind", () => {
 		const seg: AdapterSegment = {
 			kind: "message",
-			msg: {
-				id: "a1",
-				role: "assistant",
-				contentJson: [
+			msg: rowWithElements(
+				{
+					id: "a1",
+					role: "assistant",
+				},
+				[
 					{ type: "reasoning", text: "thinking..." },
 					{ type: "text", text: "Here is the answer." },
 					{ type: "web_search", query: "cats", status: "completed" },
 					{ type: "image" },
 				],
-			},
+			),
 		};
 		const specs = adaptSegment(seg, CTX);
 		expect(specs.map((s) => s.kind)).toEqual(["reasoning", "markdown", "web-search", "media"]);
@@ -1056,7 +1093,7 @@ describe("adaptSegment — assistant message", () => {
 	it("skips blank text blocks", () => {
 		const seg: AdapterSegment = {
 			kind: "message",
-			msg: { id: "a2", role: "assistant", contentJson: [{ type: "text", text: "   " }] },
+			msg: rowWithElements({ id: "a2", role: "assistant" }, [{ type: "text", text: "   " }]),
 		};
 		expect(adaptSegment(seg, CTX)).toHaveLength(0);
 	});
@@ -1070,7 +1107,7 @@ describe("adaptSegment — assistant message", () => {
 			adaptSegment(
 				{
 					kind: "message",
-					msg: { id: "gen", role: "assistant", contentJson: [block as never] },
+					msg: rowWithElements({ id: "gen", role: "assistant" }, [block as never]),
 				},
 				CTX,
 			)[0]!.data as Record<string, unknown>;
@@ -1099,11 +1136,13 @@ describe("adaptSegment — assistant message", () => {
 				adaptSegment(
 					{
 						kind: "message",
-						msg: {
-							id: `gen-${status ?? "none"}`,
-							role: "assistant",
-							contentJson: [{ type: "image_generation", ...(status ? { status } : {}) }],
-						},
+						msg: rowWithElements(
+							{
+								id: `gen-${status ?? "none"}`,
+								role: "assistant",
+							},
+							[{ type: "image_generation", ...(status ? { status } : {}) }],
+						),
 					},
 					ctx,
 				)[0]!.data as { statusText?: string }
@@ -1130,11 +1169,13 @@ describe("adaptSegment — assistant message", () => {
 		const data = adaptSegment(
 			{
 				kind: "message",
-				msg: {
-					id: "img",
-					role: "assistant",
-					contentJson: [{ type: "image", imageId: "i1" }],
-				},
+				msg: rowWithElements(
+					{
+						id: "img",
+						role: "assistant",
+					},
+					[{ type: "image", imageId: "i1" }],
+				),
 			},
 			CTX,
 		)[0]!.data as Record<string, unknown>;
@@ -1144,14 +1185,16 @@ describe("adaptSegment — assistant message", () => {
 	it("honors visibleBlockIndices", () => {
 		const seg: AdapterSegment = {
 			kind: "message",
-			msg: {
-				id: "a3",
-				role: "assistant",
-				contentJson: [
+			msg: rowWithElements(
+				{
+					id: "a3",
+					role: "assistant",
+				},
+				[
 					{ type: "text", text: "first" },
 					{ type: "text", text: "second" },
 				],
-			},
+			),
 			visibleBlockIndices: [1],
 		};
 		const specs = adaptSegment(seg, CTX);
@@ -1162,7 +1205,7 @@ describe("adaptSegment — assistant message", () => {
 	it("passes reasoning expand state via opts", () => {
 		const seg: AdapterSegment = {
 			kind: "message",
-			msg: { id: "a4", role: "assistant", contentJson: [{ type: "reasoning", text: "x" }] },
+			msg: rowWithElements({ id: "a4", role: "assistant" }, [{ type: "reasoning", text: "x" }]),
 		};
 		const expanded = adaptSegment(seg, { lod: 5, isExpanded: () => true });
 		expect((expanded[0]!.opts as { expanded: boolean }).expanded).toBe(true);
@@ -1173,11 +1216,13 @@ describe("adaptSegment — assistant message", () => {
 		// during adaptation — not applied at paint time over a stale height.
 		const seg: AdapterSegment = {
 			kind: "message",
-			msg: {
-				id: "a5",
-				role: "assistant",
-				contentJson: [{ type: "reasoning", text: "raw", translatedText: "翻译" }],
-			},
+			msg: rowWithElements(
+				{
+					id: "a5",
+					role: "assistant",
+				},
+				[{ type: "reasoning", text: "raw", translatedText: "翻译" }],
+			),
 		};
 		const flipped = adaptSegment(seg, { lod: 5, showOriginal: () => true });
 		expect((flipped[0]!.opts as { showOriginal: boolean }).showOriginal).toBe(true);
@@ -1190,7 +1235,7 @@ describe("adaptSegment — assistant message", () => {
 		// measure layer cannot honour.
 		const seg: AdapterSegment = {
 			kind: "message",
-			msg: { id: "a6", role: "assistant", contentJson: [{ type: "reasoning", text: "raw" }] },
+			msg: rowWithElements({ id: "a6", role: "assistant" }, [{ type: "reasoning", text: "raw" }]),
 		};
 		const specs = adaptSegment(seg, { lod: 5, showOriginal: () => true });
 		expect((specs[0]!.opts as { showOriginal: boolean }).showOriginal).toBe(false);
@@ -1201,11 +1246,13 @@ describe("adaptSegment — system message", () => {
 	it("routes plan subtype to plan-card", () => {
 		const seg: AdapterSegment = {
 			kind: "message",
-			msg: {
-				id: "s1",
-				role: "system",
-				contentJson: [{ type: "compact", subtype: "plan", summary: "the plan" }],
-			},
+			msg: rowWithElements(
+				{
+					id: "s1",
+					role: "system",
+				},
+				[{ type: "compact", subtype: "plan", summary: "the plan" }],
+			),
 		};
 		const specs = adaptSegment(seg, CTX);
 		expect(specs[0]!.kind).toBe("plan-card");
@@ -1214,7 +1261,7 @@ describe("adaptSegment — system message", () => {
 	it("routes compact to system-simple", () => {
 		const seg: AdapterSegment = {
 			kind: "message",
-			msg: { id: "s2", role: "system", contentJson: [{ type: "compact" }] },
+			msg: rowWithElements({ id: "s2", role: "system" }, [{ type: "compact" }]),
 		};
 		expect(adaptSegment(seg, CTX)[0]!.kind).toBe("system-simple");
 	});
@@ -1222,7 +1269,7 @@ describe("adaptSegment — system message", () => {
 	it("routes error to system-text", () => {
 		const seg: AdapterSegment = {
 			kind: "message",
-			msg: { id: "s3", role: "system", contentJson: [{ type: "error", text: "boom" }] },
+			msg: rowWithElements({ id: "s3", role: "system" }, [{ type: "error", text: "boom" }]),
 		};
 		expect(adaptSegment(seg, CTX)[0]!.kind).toBe("system-text");
 	});
@@ -1243,7 +1290,7 @@ describe("adaptSegment — system card body composition (height-critical)", () =
 		// biome-ignore lint/suspicious/noExplicitAny: test reads dynamic data shape
 	): any => {
 		const spec = adaptSegment(
-			{ kind: "message", msg: { id: "s", role: "system", contentJson } },
+			{ kind: "message", msg: rowWithElements({ id: "s", role: "system" }, contentJson) },
 			ctx,
 		)[0]!;
 		// biome-ignore lint/suspicious/noExplicitAny: test reads dynamic data shape
@@ -1257,11 +1304,13 @@ describe("adaptSegment — system card body composition (height-critical)", () =
 		const data = adaptSegment(
 			{
 				kind: "message",
-				msg: {
-					id: "d1",
-					role: "disp",
-					contentJson: [{ type: "info", message: "Working directory updated: /a/old → /a/new" }],
-				},
+				msg: rowWithElements(
+					{
+						id: "d1",
+						role: "disp",
+					},
+					[{ type: "info", message: "Working directory updated: /a/old → /a/new" }],
+				),
 			},
 			CTX,
 		)[0]!.data as { kind: string; text: string };
@@ -1321,11 +1370,13 @@ describe("adaptSegment — system card body composition (height-critical)", () =
 		const spec = adaptSegment(
 			{
 				kind: "message",
-				msg: {
-					id: "s",
-					role: "system",
-					contentJson: [{ type: "spec_continuation", task: "Wire the flag", protected: true }],
-				},
+				msg: rowWithElements(
+					{
+						id: "s",
+						role: "system",
+					},
+					[{ type: "spec_continuation", task: "Wire the flag", protected: true }],
+				),
 			},
 			CTX,
 		)[0]!;
@@ -1340,11 +1391,13 @@ describe("adaptSegment — system card body composition (height-critical)", () =
 		const spec = adaptSegment(
 			{
 				kind: "message",
-				msg: {
-					id: "s",
-					role: "system",
-					contentJson: [{ type: "spec_blocked_continuation", task: "Blocked task" }],
-				},
+				msg: rowWithElements(
+					{
+						id: "s",
+						role: "system",
+					},
+					[{ type: "spec_blocked_continuation", task: "Blocked task" }],
+				),
 			},
 			CTX,
 		)[0]!;
@@ -1383,11 +1436,13 @@ describe("adaptSegment — system card body composition (height-critical)", () =
 		const failed = adaptSegment(
 			{
 				kind: "message",
-				msg: {
-					id: "s",
-					role: "system",
-					contentJson: [{ type: "segment_compact", status: "failed", error: "oom" }],
-				},
+				msg: rowWithElements(
+					{
+						id: "s",
+						role: "system",
+					},
+					[{ type: "segment_compact", status: "failed", error: "oom" }],
+				),
 			},
 			CTX,
 		)[0]!;
@@ -1423,7 +1478,11 @@ describe("adaptSegment — compact / segment_compact indicator text (status-synt
 	const compactSpec = (
 		contentJson: Array<{ type: string; [key: string]: unknown }>,
 		ctx: AdapterContext = CTX,
-	) => adaptSegment({ kind: "message", msg: { id: "s", role: "system", contentJson } }, ctx)[0]!;
+	) =>
+		adaptSegment(
+			{ kind: "message", msg: rowWithElements({ id: "s", role: "system" }, contentJson) },
+			ctx,
+		)[0]!;
 
 	// biome-ignore lint/suspicious/noExplicitAny: test reads dynamic data shape
 	const dataOf = (spec: { data: unknown }) => spec.data as any;
@@ -2094,7 +2153,7 @@ describe("adaptActivityUnit", () => {
 	/** One folded tool row owned by `messageId`. */
 	const toolItem = (messageId: string): AdapterActivityInput => ({
 		kind: "tool",
-		msg: { id: messageId, role: "assistant", contentJson: [] },
+		msg: rowWithElements({ id: messageId, role: "assistant" }, []),
 	});
 
 	it("produces an activity-trace; L2 always shows rows", async () => {
@@ -2194,13 +2253,16 @@ describe("live → persisted hand-off is visually inert", () => {
 		const input = streaming
 			? { _streamingChars: 42, _streamingFilePath: "spec://tasks.json" }
 			: { file_path: "spec://tasks.json" };
-		return {
-			id: messageId,
-			role: "assistant",
-			contentJson: [{ type: "tool_use", id: "tu-1", name: "Read", input }],
-			toolCalls: [{ id: "call-1", toolUseId: "tu-1", toolName: "Read", status, inputJson: input }],
-			children: [],
-		} as never;
+		return rowWithElements(
+			{
+				id: messageId,
+				role: "assistant",
+				toolCalls: [
+					{ id: "call-1", toolUseId: "tu-1", toolName: "Read", status, inputJson: input },
+				],
+			},
+			[{ type: "tool_use", id: "tu-1", name: "Read", input }],
+		) as never;
 	};
 
 	const rowsFor = async (messageId: string, status: string, streaming: boolean) => {
@@ -2271,7 +2333,7 @@ describe("live → persisted hand-off is visually inert", () => {
 describe("adaptActivityUnit — folded row identity", () => {
 	const reasoning = (text: string) => ({ type: "reasoning", text });
 	const msgWith = (blocks: unknown[], id = "m1") =>
-		({ id, role: "assistant", contentJson: blocks }) as never;
+		rowWithElements({ id, role: "assistant" }, blocks) as never;
 
 	it("maps every row of an adjacent reasoning run to the run's start index", async () => {
 		const { adaptActivityUnit } = await import("./segment-adapter");
@@ -2381,7 +2443,7 @@ describe("folded tool rows — drill-down payload", () => {
 		outputJson: { _text: "line1\nline2\n" },
 	});
 	const msgWith = (blocks: unknown[], id = "m1", model?: string) =>
-		({ id, role: "assistant", contentJson: blocks, model }) as never;
+		rowWithElements({ id, role: "assistant", model }, blocks) as never;
 	const activityRows = (spec: { data: unknown }): Row[] => (spec.data as { items: Row[] }).items;
 
 	it("a collapsed row carries no card (the fold stays cheap)", async () => {
@@ -2632,18 +2694,20 @@ describe("folded tool rows — drill-down payload", () => {
 
 	it("a folded reasoning row reveals its own step body, keyed by row", async () => {
 		const { adaptActivityUnit } = await import("./segment-adapter");
-		const msg = {
-			id: "m-reason",
-			model: "gpt-5.6",
-			role: "assistant" as const,
-			contentJson: [
+		const msg = rowWithElements(
+			{
+				id: "m-reason",
+				model: "gpt-5.6",
+				role: "assistant" as const,
+			},
+			[
 				{
 					type: "reasoning",
 					text: ["**Check the cache**", "The key folds lod in.", ""].join("\n"),
 				},
 			],
-		};
-		const items = [{ kind: "reasoning" as const, msg, blockIndex: 0, block: msg.contentJson[0] }];
+		);
+		const items = [{ kind: "reasoning" as const, msg, blockIndex: 0, block: messageBody(msg)[0] }];
 		const collapsed = adaptActivityUnit(items, "act-1", { lod: 2 });
 		const collapsedRows = activityRows(collapsed);
 		expect(collapsedRows).toHaveLength(1);
@@ -2663,16 +2727,16 @@ describe("folded tool rows — drill-down payload", () => {
 		// Emitting whole bodies per delta would rebuild a string the size of the reply
 		// every frame; the row gains its chevron the moment the turn persists.
 		const { adaptActivityUnit } = await import("./segment-adapter");
-		const msg = {
-			id: "__streaming__",
-			model: "gpt-5.6",
-			role: "assistant" as const,
-			contentJson: [
-				{ type: "reasoning", text: ["**Check the cache**", "The key folds lod in."].join("\n") },
-			],
-		};
+		const msg = rowWithElements(
+			{
+				id: "__streaming__",
+				model: "gpt-5.6",
+				role: "assistant" as const,
+			},
+			[{ type: "reasoning", text: ["**Check the cache**", "The key folds lod in."].join("\n") }],
+		);
 		const live = adaptActivityUnit(
-			[{ kind: "reasoning", msg, blockIndex: 0, block: msg.contentJson[0] }],
+			[{ kind: "reasoning", msg, blockIndex: 0, block: messageBody(msg)[0] }],
 			"act-live",
 			{ lod: 2, ...openRows("act-live", "r-__streaming__-0-step-0") },
 		);
@@ -2725,7 +2789,7 @@ describe("structured reasoning model gate", () => {
 					`**Plan**\n\n${"body ".repeat(40_000)}`,
 				]) {
 					const block = { type: "reasoning", text };
-					const msg = { id, role: "assistant", model, contentJson: [block] };
+					const msg = rowWithElements({ id, role: "assistant", model }, [block]);
 					let parses = 0;
 					const ctx: AdapterContext = {
 						lod,
@@ -2764,15 +2828,16 @@ describe("structured reasoning model gate", () => {
 		const { groupRenderUnits } = await import("../trace/render-units");
 		const text = "**Plan**\n\nbody\n\n**Check**\n\nnext";
 		for (const liveModel of ["gpt-5.6", "claude-sonnet-4.6", undefined]) {
-			const messages = ["gpt-5.6", "claude-sonnet-4.6", undefined, liveModel].map(
-				(model, index) => ({
-					id: index === 3 ? "__streaming__" : `mixed-${index}`,
-					role: "assistant",
-					model,
-					contentJson: [{ type: "reasoning", text }],
-					toolCalls: [],
-					children: [],
-				}),
+			const messages = ["gpt-5.6", "claude-sonnet-4.6", undefined, liveModel].map((model, index) =>
+				rowWithElements(
+					{
+						id: index === 3 ? "__streaming__" : `mixed-${index}`,
+						role: "assistant",
+						model,
+						toolCalls: [],
+					},
+					[{ type: "reasoning", text }],
+				),
 			);
 			const units = groupRenderUnits(segmentMessages(messages as never), lod <= 2);
 			const specs = adaptRenderUnits(units as never, { lod });
@@ -2801,14 +2866,14 @@ describe("LOD matrix adapter semantics", () => {
 		// `titlesOnly`), so the element and its opts are level-independent here.
 		const seg: AdapterSegment = {
 			kind: "message",
-			msg: {
-				id: "reasoning-1",
-				model: "gpt-5.6",
-				role: "assistant",
-				contentJson: [
-					{ type: "reasoning", text: ["**Plan**", "<!-- -->", "**Check**", "body"].join("\n\n") },
-				],
-			},
+			msg: rowWithElements(
+				{
+					id: "reasoning-1",
+					model: "gpt-5.6",
+					role: "assistant",
+				},
+				[{ type: "reasoning", text: ["**Plan**", "<!-- -->", "**Check**", "body"].join("\n\n") }],
+			),
 		};
 		for (const lod of [3, 4, 5] as const) {
 			const spec = adaptSegment(seg, { lod })[0]!;
@@ -2822,8 +2887,8 @@ describe("LOD matrix adapter semantics", () => {
 
 	it("keeps L5 recent and old cards distinct", () => {
 		const sourceMessages = [
-			{ id: "old", role: "assistant", contentJson: [] },
-			{ id: "recent", role: "assistant", contentJson: [] },
+			rowWithElements({ id: "old", role: "assistant" }, []),
+			rowWithElements({ id: "recent", role: "assistant" }, []),
 		];
 		const seg: AdapterSegment = {
 			kind: "tool-run",
@@ -2851,8 +2916,8 @@ describe("LOD matrix adapter semantics", () => {
 
 	it("preserves full-run geometry and sole-subagent default expansion", () => {
 		const messages = [
-			{ id: "tool-msg", role: "assistant", contentJson: [] },
-			{ id: "agent-msg", role: "assistant", contentJson: [] },
+			rowWithElements({ id: "tool-msg", role: "assistant" }, []),
+			rowWithElements({ id: "agent-msg", role: "assistant" }, []),
 		];
 		const seg: AdapterSegment = {
 			kind: "tool-run",
@@ -2930,18 +2995,20 @@ describe("adaptSegments + registry integration", () => {
 		const segments: AdapterSegment[] = [
 			{
 				kind: "message",
-				msg: { id: "u", role: "user", contentJson: [{ type: "text", text: "hi" }] },
+				msg: rowWithElements({ id: "u", role: "user" }, [{ type: "text", text: "hi" }]),
 			},
 			{
 				kind: "message",
-				msg: {
-					id: "a",
-					role: "assistant",
-					contentJson: [
+				msg: rowWithElements(
+					{
+						id: "a",
+						role: "assistant",
+					},
+					[
 						{ type: "text", text: "yo" },
 						{ type: "reasoning", text: "r" },
 					],
-				},
+				),
 			},
 			{
 				kind: "tool-run",
@@ -2962,20 +3029,22 @@ describe("adaptSegments + registry integration", () => {
 		const segments: AdapterSegment[] = [
 			{
 				kind: "message",
-				msg: { id: "u", role: "user", contentJson: [{ type: "text", text: "hi" }] },
+				msg: rowWithElements({ id: "u", role: "user" }, [{ type: "text", text: "hi" }]),
 			},
 			{
 				// One assistant message that yields multiple content-block specs.
 				kind: "message",
-				msg: {
-					id: "a",
-					role: "assistant",
-					contentJson: [
+				msg: rowWithElements(
+					{
+						id: "a",
+						role: "assistant",
+					},
+					[
 						{ type: "text", text: "yo" },
 						{ type: "web_search", query: "cats", status: "completed" },
 						{ type: "image" },
 					],
-				},
+				),
 			},
 		];
 		const specs = adaptSegments(segments, CTX);
@@ -4018,13 +4087,15 @@ describe("adaptSegment — per-turn usage rows", () => {
 	const USAGE = { input_tokens: 100, output_tokens: 20 };
 	const assistantSeg = (extra: Record<string, unknown> = {}): AdapterSegment => ({
 		kind: "message",
-		msg: {
-			id: "a1",
-			role: "assistant",
-			contentJson: [{ type: "text", text: "hello" }],
-			turnUsageJson: USAGE,
-			...extra,
-		},
+		msg: rowWithElements(
+			{
+				id: "a1",
+				role: "assistant",
+				turnUsageJson: USAGE,
+				...extra,
+			},
+			[{ type: "text", text: "hello" }],
+		),
 	});
 	const usageCtx: AdapterContext = { lod: 5, showTokenUsage: true };
 
@@ -4052,12 +4123,14 @@ describe("adaptSegment — per-turn usage rows", () => {
 		const specs = adaptSegment(
 			{
 				kind: "message",
-				msg: {
-					id: "u1",
-					role: "user",
-					contentJson: [{ type: "text", text: "hi" }],
-					turnUsageJson: USAGE,
-				},
+				msg: rowWithElements(
+					{
+						id: "u1",
+						role: "user",
+						turnUsageJson: USAGE,
+					},
+					[{ type: "text", text: "hi" }],
+				),
 			},
 			usageCtx,
 		);
@@ -4068,12 +4141,14 @@ describe("adaptSegment — per-turn usage rows", () => {
 		const specs = adaptSegment(
 			{
 				kind: "message",
-				msg: {
-					id: "__streaming__",
-					role: "assistant",
-					contentJson: [{ type: "text", text: "partial" }],
-					turnUsageJson: USAGE,
-				},
+				msg: rowWithElements(
+					{
+						id: "__streaming__",
+						role: "assistant",
+						turnUsageJson: USAGE,
+					},
+					[{ type: "text", text: "partial" }],
+				),
 			},
 			usageCtx,
 		);
@@ -4084,7 +4159,7 @@ describe("adaptSegment — per-turn usage rows", () => {
 		const specs = adaptSegment(
 			{
 				kind: "message",
-				msg: { id: "a2", role: "assistant", contentJson: [{ type: "text", text: "x" }] },
+				msg: rowWithElements({ id: "a2", role: "assistant" }, [{ type: "text", text: "x" }]),
 			},
 			usageCtx,
 		);
@@ -4149,16 +4224,17 @@ describe("adaptSegment — per-turn usage rows", () => {
 describe("reasoning steps: one identity across the L2/L3 boundary", () => {
 	/** A persisted assistant turn whose single reasoning block holds two titled steps. */
 	const twoStepMessage = (id = "real-msg", blocks?: unknown[]) =>
-		({
-			id,
-			model: "gpt-5.6",
-			role: "assistant",
-			contentJson: blocks ?? [
+		rowWithElements(
+			{
+				id,
+				model: "gpt-5.6",
+				role: "assistant",
+				toolCalls: [],
+			},
+			blocks ?? [
 				{ type: "reasoning", text: "**第一步**\n\n分析正文。\n\n**第二步**\n\n继续分析。" },
 			],
-			toolCalls: [],
-			children: [],
-		}) as never;
+		) as never;
 
 	/** Step identities as they reach the DOM (`data-nf-unit`) at one level. */
 	const stepUnitIdsAt = async (lod: number, message = twoStepMessage()) => {
@@ -4353,14 +4429,15 @@ describe("reasoning steps: one identity across the L2/L3 boundary", () => {
  */
 describe("mixed action-card display runs from real message segments", () => {
 	function msg(id: string, blocks: Record<string, unknown>[], role = "assistant"): NarratorMsg {
-		return {
-			id,
-			role,
-			contentJson: blocks,
-			toolCalls: [],
-			children: [],
-			parentToolUseId: null,
-		} as unknown as NarratorMsg;
+		return rowWithElements(
+			{
+				id,
+				role,
+				toolCalls: [],
+				parentToolUseId: null,
+			},
+			blocks,
+		) as unknown as NarratorMsg;
 	}
 	function tool(id: string, name = "Read") {
 		return {
@@ -4500,7 +4577,7 @@ describe("adaptSegment — a concluded review", () => {
 			model?: string,
 		): AdapterSegment => ({
 			kind: "message",
-			msg: { id, role, contentJson, model },
+			msg: rowWithElements({ id, role, model }, contentJson),
 		});
 
 		it("preserves durable body expansion across streaming hand-off without reusing it for a new block", async () => {
@@ -4560,7 +4637,7 @@ describe("adaptSegment — a concluded review", () => {
 					message(id, "assistant", [{ type: "reasoning", text: "whole source" }]),
 					{
 						lod: 5,
-						isTextExpanded: (key) => key === `${id}-b0`,
+						isTextExpanded: (key) => key === `${id}-blk[${id}:0]`,
 					},
 				);
 				expect(spec!.opts!.textExpanded).toBe(true);
@@ -4615,7 +4692,7 @@ describe("adaptSegment — a concluded review", () => {
 				{
 					lod: 5,
 					expandedRows: () => [0],
-					isTextExpanded: (key, bodyKey) => key === "steps-b0" && bodyKey === "seg0",
+					isTextExpanded: (key, bodyKey) => key === "steps-blk[steps:0]" && bodyKey === "seg0",
 				},
 			);
 			expect(spec!.kind).toBe("reasoning-steps");
@@ -4705,18 +4782,20 @@ describe("adaptSegment — a concluded review", () => {
 			const specs = adaptSegment(
 				{
 					kind: "message",
-					msg: {
-						id: "publication-result:run",
-						role: "disp",
-						contentJson: [{ type: "text", text: "large result".repeat(1000), publicationResult }],
-					},
+					msg: rowWithElements(
+						{
+							id: "publication-result:run",
+							role: "disp",
+						},
+						[{ type: "text", text: "large result".repeat(1000), publicationResult }],
+					),
 				},
 				{ lod },
 			);
 			expect(specs).toHaveLength(1);
 			expect(specs[0]).toMatchObject({
 				kind: "system-simple",
-				key: "publication-result:run-b0",
+				key: "publication-result:run-blk[publication-result:run:0]",
 				data: {
 					kind: "publication_result",
 					text: "",
@@ -4731,11 +4810,13 @@ describe("adaptSegment — a concluded review", () => {
 			const specs = adaptSegment(
 				{
 					kind: "message",
-					msg: {
-						id: "ordinary",
-						role,
-						contentJson: [{ type: "text", text: "ordinary", publicationResult }],
-					},
+					msg: rowWithElements(
+						{
+							id: "ordinary",
+							role,
+						},
+						[{ type: "text", text: "ordinary", publicationResult }],
+					),
 				},
 				CTX,
 			);
@@ -4748,11 +4829,13 @@ describe("adaptSegment — a concluded review", () => {
 				const specs = adaptSegment(
 					{
 						kind: "message",
-						msg: {
-							id: "ordinary",
-							role: "disp",
-							contentJson: [{ type: "text", text: "ordinary", publicationResult: meta }],
-						},
+						msg: rowWithElements(
+							{
+								id: "ordinary",
+								role: "disp",
+							},
+							[{ type: "text", text: "ordinary", publicationResult: meta }],
+						),
 					},
 					CTX,
 				);
@@ -4771,13 +4854,15 @@ describe("adaptSegment — a concluded review", () => {
 		adaptSegment(
 			{
 				kind: "message",
-				msg: {
-					id: "rf",
-					role: "user",
-					origin: "system",
-					originLabel: "review",
-					contentJson: blocks,
-				},
+				msg: rowWithElements(
+					{
+						id: "rf",
+						role: "user",
+						origin: "system",
+						originLabel: "review",
+					},
+					blocks,
+				),
 			},
 			ctx,
 		);

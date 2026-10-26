@@ -6,6 +6,7 @@ import { startBottomSpacingResize, useBottomSpacing } from "../../hooks/useResiz
 import { NarratorComposerRow, type NarratorComposerRowProps } from "./composer/NarratorComposerRow";
 import { NarratorGitBar } from "./header/NarratorGitBar";
 import { NarratorInteractionStatusBar } from "./interaction/NarratorInteractionStatusBar";
+import { PendingAgentMessagesPanel } from "./interaction/PendingAgentMessagesPanel";
 import { QueuedMessagesPanel } from "./interaction/QueuedMessagesPanel";
 import { UploadProgressBar } from "./interaction/UploadProgressBar";
 import {
@@ -150,6 +151,10 @@ export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
 							: "1px solid var(--mantine-color-default-border)",
 				}}
 			/>
+
+			{!props.common.isWorkspacePreview && (
+				<PendingAgentMessagesPanel narratorId={props.common.narratorId} />
+			)}
 
 			{/* Queued messages indicator */}
 			<QueuedMessagesPanel

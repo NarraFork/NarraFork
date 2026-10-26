@@ -132,14 +132,7 @@ export function formatRevertSuccessWarning(t: Translate, value: unknown): string
 
 /** Refresh after every attempt: a lost response may still have changed files. */
 export function invalidateRevertQueries(qc: QueryClient, narratorId: string): void {
-	for (const resource of [
-		"messages",
-		"file-tree-status",
-		"tool-calls",
-		"rollback-preview",
-		"block-delete-preview",
-		"edit-regenerate-preview",
-	]) {
+	for (const resource of ["messages", "file-tree-status", "tool-calls"]) {
 		void qc.invalidateQueries({ queryKey: ["narrators", narratorId, resource] });
 	}
 }

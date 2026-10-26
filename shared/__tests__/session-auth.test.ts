@@ -1,10 +1,8 @@
 import { describe, expect, test } from "bun:test";
 import {
 	ABSOLUTE_SESSION_MAX_SECONDS,
+	isOpaqueSessionToken,
 	isSessionInvalidResponse,
-	isSessionTokenVersionCurrent,
-	isWithinAbsoluteSessionLimit,
-	resolveSessionStart,
 	SESSION_RENEWAL_THRESHOLD_SECONDS,
 	SESSION_TOKEN_TTL_SECONDS,
 	shouldRenewSessionToken,
@@ -24,7 +22,7 @@ describe("isSessionInvalidResponse", () => {
 		expect(isSessionInvalidResponse({ code: "TOTP_DISABLE_UNVERIFIED" })).toBe(false);
 		// Failed passkey ceremony.
 		expect(isSessionInvalidResponse({ code: "PASSKEY_AUTH_FAILED" })).toBe(false);
-		// An OAuth-only endpoint rejecting a first-party session JWT.
+		// An OAuth-only endpoint rejecting a first-party session token.
 		expect(isSessionInvalidResponse({ code: "OAUTH_REQUIRED" })).toBe(false);
 		// Plugin UI sessions are a separate credential from the user session.
 		expect(isSessionInvalidResponse({ code: "PLUGIN_UI_SESSION_REQUIRED" })).toBe(false);
@@ -83,7 +81,7 @@ describe("shouldRenewSessionToken", () => {
 		for (let d = 0; d < 90; d += 2) {
 			const at = now + d * day;
 			if (!shouldRenewSessionToken(exp, at)) continue;
-			if (!isWithinAbsoluteSessionLimit(sessionStart, at)) continue;
+			if (at - sessionStart >= ABSOLUTE_SESSION_MAX_SECONDS) continue;
 			exp = at + SESSION_TOKEN_TTL_SECONDS;
 			lastRenewalAt = at;
 		}
@@ -97,69 +95,10 @@ describe("shouldRenewSessionToken", () => {
 	});
 });
 
-describe("absolute session ceiling", () => {
-	const now = 1_700_000_000;
-
-	test("permits renewal inside the ceiling and refuses it past the ceiling", () => {
-		expect(isWithinAbsoluteSessionLimit(now, now)).toBe(true);
-		expect(isWithinAbsoluteSessionLimit(now - (ABSOLUTE_SESSION_MAX_SECONDS - 1), now)).toBe(true);
-		expect(isWithinAbsoluteSessionLimit(now - ABSOLUTE_SESSION_MAX_SECONDS, now)).toBe(false);
-		expect(isWithinAbsoluteSessionLimit(now - 2 * ABSOLUTE_SESSION_MAX_SECONDS, now)).toBe(false);
-	});
-
-	test("keeps a real anchor and anchors legacy tokens at the present", () => {
-		const anchor = now - 5 * 24 * 60 * 60;
-		expect(resolveSessionStart(anchor, now)).toBe(anchor);
-		// Tokens issued before the claim existed carry no anchor: they are treated
-		// as starting now, so they get one more full window instead of a logout.
-		expect(resolveSessionStart(undefined, now)).toBe(now);
-		expect(resolveSessionStart(null, now)).toBe(now);
-		expect(resolveSessionStart("not-a-number", now)).toBe(now);
-		expect(resolveSessionStart(Number.NaN, now)).toBe(now);
-		expect(resolveSessionStart(0, now)).toBe(now);
-		expect(resolveSessionStart(-1, now)).toBe(now);
-		// A future anchor would extend the ceiling, so it is not trusted either.
-		expect(resolveSessionStart(now + 3600, now)).toBe(now);
-	});
-
-	test("a legacy token cannot be renewed forever either", () => {
-		// First request re-anchors at the present, and every later renewal inherits
-		// that anchor — so the chain still terminates.
-		const anchored = resolveSessionStart(undefined, now);
-		expect(isWithinAbsoluteSessionLimit(anchored, now)).toBe(true);
-		expect(isWithinAbsoluteSessionLimit(anchored, now + ABSOLUTE_SESSION_MAX_SECONDS)).toBe(false);
-	});
-});
-
-describe("isSessionTokenVersionCurrent", () => {
-	test("accepts a token whose generation matches", () => {
-		expect(isSessionTokenVersionCurrent(0, 0)).toBe(true);
-		expect(isSessionTokenVersionCurrent(3, 3)).toBe(true);
-	});
-
-	test("rejects a token left behind by a bump", () => {
-		expect(isSessionTokenVersionCurrent(0, 1)).toBe(false);
-		expect(isSessionTokenVersionCurrent(2, 5)).toBe(false);
-	});
-
-	test("treats a missing claim as generation 0", () => {
-		// Every token in circulation predates the claim; rejecting them outright would
-		// sign the whole user base out on deploy.
-		expect(isSessionTokenVersionCurrent(undefined, 0)).toBe(true);
-		// ...but they must still be revocable, which is the entire point.
-		expect(isSessionTokenVersionCurrent(undefined, 1)).toBe(false);
-	});
-
-	test("fails closed on a claim that is not a finite number", () => {
-		for (const claim of ["0", null, Number.NaN, Number.POSITIVE_INFINITY, {}, []]) {
-			expect(isSessionTokenVersionCurrent(claim, 0)).toBe(false);
-		}
-	});
-
-	test("rejects a claim ahead of the stored value", () => {
-		// Strict equality: a claim above the stored generation is a forged/inflated version
-		// that must not defeat revocation, so it fails closed exactly like a stale claim.
-		expect(isSessionTokenVersionCurrent(2, 1)).toBe(false);
-		expect(isSessionTokenVersionCurrent(5, 2)).toBe(false);
+describe("isOpaqueSessionToken", () => {
+	test("recognizes the session token prefix only", () => {
+		expect(isOpaqueSessionToken(`nfs_${"A".repeat(43)}`)).toBe(true);
+		expect(isOpaqueSessionToken("nfat_abc")).toBe(false);
+		expect(isOpaqueSessionToken("eyJhbGciOiJIUzI1NiJ9.e30.sig")).toBe(false);
 	});
 });

@@ -21,6 +21,7 @@
 
 import { beforeAll, describe, expect, it } from "bun:test";
 import { MantineProvider } from "@mantine/core";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { type AdapterSegment, adaptSegment } from "@shared/pretext-layout/segment-adapter";
 import { parseHTML } from "linkedom";
 import { act } from "react";
@@ -83,7 +84,7 @@ beforeAll(() => {
 function adaptAskInPassing(block: Record<string, unknown>) {
 	const seg: AdapterSegment = {
 		kind: "message",
-		msg: { id: "aip-msg", role: "system", contentJson: [block as never] },
+		msg: rowWithElements({ id: "aip-msg", role: "system" }, [block as never]),
 	};
 	const spec = adaptSegment(seg, { lod: 5 })[0];
 	if (!spec) throw new Error("no spec produced");
@@ -149,7 +150,7 @@ describe("resolveVListAskInPassingTarget — which rows get which wiring", () =>
 	});
 
 	it("a resolved card reads its target narrator back from the message blocks", () => {
-		const messages = [{ id: "m1", contentJson: [RESOLVED_BLOCK] }];
+		const messages = [rowWithElements({ id: "m1" }, [RESOLVED_BLOCK])];
 		expect(
 			resolveVListAskInPassingTarget(
 				"ask-in-passing",
@@ -166,7 +167,9 @@ describe("resolveVListAskInPassingTarget — which rows get which wiring", () =>
 
 	it("a legacy resolved card with no target stays non-navigable instead of routing nowhere", () => {
 		const messages = [
-			{ id: "m1", contentJson: [{ type: "ask_in_passing", status: "resolved", question: "q?" }] },
+			rowWithElements({ id: "m1" }, [
+				{ type: "ask_in_passing", status: "resolved", question: "q?" },
+			]),
 		];
 		expect(
 			resolveVListAskInPassingTarget("ask-in-passing", { kind: "resolved" }, ["m1"], messages),
@@ -194,8 +197,8 @@ describe("resolveVListAskInPassingTarget — which rows get which wiring", () =>
 
 	it("readAskInPassingTargetNarratorId ignores unrelated messages and blocks", () => {
 		const messages = [
-			{ id: "other", contentJson: [RESOLVED_BLOCK] },
-			{ id: "m1", contentJson: [{ type: "text", text: "hi" }] },
+			rowWithElements({ id: "other" }, [RESOLVED_BLOCK]),
+			rowWithElements({ id: "m1" }, [{ type: "text", text: "hi" }]),
 		];
 		expect(readAskInPassingTargetNarratorId(messages, "m1")).toBeNull();
 		expect(readAskInPassingTargetNarratorId(messages, "missing")).toBeNull();

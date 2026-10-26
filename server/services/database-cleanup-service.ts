@@ -2,6 +2,10 @@ import { stat } from "node:fs/promises";
 import { databaseMaintenance, sqlite } from "@server/db";
 import { describeUnsupported, type ReusableSpaceReport } from "@server/db/backend";
 import { getDbPath } from "@server/db/connection";
+import {
+	clearLegacyRequestDumpBatch,
+	hasRetainedLegacyRequestDump,
+} from "@server/db/legacy-request-storage";
 import { AsyncMutex } from "@server/lib/async-mutex";
 import {
 	runEphemeralReadTask,
@@ -9,7 +13,15 @@ import {
 	shutdownDbWorkerPool,
 	WorkersUnavailableError,
 } from "@server/lib/db-worker/pool";
-import type { StorageScanCleanupSummariesResult } from "@server/lib/db-worker/protocol";
+import {
+	assertSessionPreviewBudget,
+	SESSION_PREVIEW_MAX_SAMPLES,
+	SessionPreviewBudgetError,
+	type StorageScanCleanupSummariesParams,
+	type StorageScanCleanupSummariesResult,
+	type StorageScanSessionPreviewParams,
+	type StorageScanSessionPreviewResult,
+} from "@server/lib/db-worker/protocol";
 import {
 	type ParallelScanOutcome,
 	runParallelObjectStorageScan,
@@ -23,12 +35,12 @@ import {
 	type CleanupPlanRoot,
 	type DatabaseCleanupBlockedReasonCode,
 	type DatabaseCleanupTarget,
+	type NarratorCleanupPlan,
 	type NarratorCleanupRecord,
 } from "./database-cleanup-utils";
 // Storage-scan query primitives live in a DB-singleton-free module so the read worker can import
 // them without re-bootstrapping the database. See storage-scan-queries.ts for why that matters.
 import {
-	collectSessionAggregateStats as collectSessionAggregateStatsOn,
 	type DatabaseStorageCategoryKey,
 	type DatabaseStorageCategorySummary,
 	type DatabaseStorageReadFailures,
@@ -36,7 +48,6 @@ import {
 	type DatabaseTableKind,
 	getDatabaseStorageCategory,
 	numberFromRow,
-	type SessionAggregateStats,
 	type SessionOwnedTableRelation,
 	summarizeToolCallPayloads,
 } from "./storage-scan-queries";
@@ -63,6 +74,18 @@ export const DEFAULT_STALE_SESSION_DAYS = 90;
 export const DEFAULT_TOOL_CALL_PAYLOAD_DAYS = 180;
 const DEFAULT_PREVIEW_SAMPLE_LIMIT = 10;
 const DATABASE_MAINTENANCE_LOCK_KEY = "database-maintenance";
+/** Rows per legacy dump batch. Each row may hold megabytes, so batches stay small. */
+const LEGACY_REQUEST_DUMP_BATCH_ROWS = 32;
+/**
+ * Set once this process cleared every dump. The column stays until the next startup, and probing
+ * an all-NULL column would read every row header on each storage scan.
+ */
+let legacyRequestDumpsCleared = false;
+
+function legacyRequestDumpsRetained(): boolean {
+	if (legacyRequestDumpsCleared) return false;
+	return hasRetainedLegacyRequestDump(sqlite);
+}
 const databaseMaintenanceLock = new AsyncMutex();
 
 const SESSION_OWNED_TABLES: SessionOwnedTableRelation[] = [
@@ -119,9 +142,15 @@ export interface DatabaseStorageBreakdown {
 		staleSessions: DatabaseCleanupCandidateSummary;
 		toolCallPayloads: DatabaseCleanupCandidateSummary;
 	};
+	/** Request dumps kept by an upgrade that deferred migration 0207's column rewrites. */
+	legacyRequestDumps: { retained: boolean };
 }
 
-export type DatabaseCleanupWarningCode = "deletesUsageHistory";
+/**
+ * `statisticsUnavailable`: sizes and message/tool/request counts could not be measured (plan too
+ * large for one read task, or no read worker), so they read 0. Session counts stay exact.
+ */
+export type DatabaseCleanupWarningCode = "deletesUsageHistory" | "statisticsUnavailable";
 
 export interface DatabaseCleanupPreviewCounts {
 	sessions: number;
@@ -181,6 +210,17 @@ export interface DatabaseCleanupExecutionResult extends DatabaseCleanupPreviewRe
 	freedBytes: number;
 	vacuumRan: boolean;
 	changed: boolean;
+	/** Planned sessions left in place because they changed (resumed, new child, ...) mid-cleanup. */
+	skippedSessions: number;
+}
+
+export interface LegacyRequestDumpClearResult {
+	ok: true;
+	cleared: number;
+	beforeBytes: number;
+	afterBytes: number;
+	/** The column drops run on the next startup, once no dump is retained. */
+	restartRequired: boolean;
 }
 
 export interface DatabaseVacuumResult {
@@ -204,6 +244,13 @@ interface CleanupNarratorContext {
 interface SessionPreviewData {
 	preview: DatabaseCleanupPreviewResult;
 	safeRoots: CleanupPlanRoot[];
+}
+
+interface SessionCleanupPlan {
+	target: Extract<DatabaseCleanupTarget, "archivedSessions" | "staleSessions">;
+	normalizedDays: number | undefined;
+	staleCutoffIso: string | undefined;
+	plan: NarratorCleanupPlan;
 }
 
 function minIso(values: Array<string | null | undefined>): string | null {
@@ -297,25 +344,24 @@ function normalizeNarratorCleanupRecord(row: Record<string, unknown>): NarratorC
 	};
 }
 
+const NARRATOR_CLEANUP_COLUMNS = `
+	id,
+	parent_narrator_id AS parentNarratorId,
+	type,
+	variant,
+	traits,
+	title,
+	status,
+	COALESCE(message_count, 0) AS messageCount,
+	created_at AS createdAt,
+	updated_at AS updatedAt,
+	last_message_at AS lastMessageAt,
+	COALESCE(is_background, 0) AS isBackground,
+	background_status AS backgroundStatus`;
+
 async function loadCleanupNarratorContext(): Promise<CleanupNarratorContext> {
 	const narratorRows = sqlite
-		.prepare(
-			`SELECT
-				id,
-				parent_narrator_id AS parentNarratorId,
-				type,
-				variant,
-				traits,
-				title,
-				status,
-				COALESCE(message_count, 0) AS messageCount,
-				created_at AS createdAt,
-				updated_at AS updatedAt,
-				last_message_at AS lastMessageAt,
-				COALESCE(is_background, 0) AS isBackground,
-				background_status AS backgroundStatus
-			 FROM narrators`,
-		)
+		.prepare(`SELECT ${NARRATOR_CLEANUP_COLUMNS} FROM narrators`)
 		.all() as Record<string, unknown>[];
 	const terminalRows = sqlite
 		.prepare(
@@ -330,34 +376,148 @@ async function loadCleanupNarratorContext(): Promise<CleanupNarratorContext> {
 	};
 }
 
-function collectSessionAggregateStats(narratorIds: string[]): SessionAggregateStats {
-	return collectSessionAggregateStatsOn(sqlite, narratorIds, SESSION_OWNED_TABLES);
+/** One root's current subtree and its running terminals, via the parent index. */
+function loadRootSubtreeContext(rootNarratorId: string): CleanupNarratorContext {
+	const subtree = `WITH RECURSIVE subtree(id) AS (
+		SELECT ? UNION SELECT n.id FROM narrators n JOIN subtree s ON n.parent_narrator_id = s.id
+	)`;
+	const narratorRows = sqlite
+		.prepare(
+			`${subtree} SELECT ${NARRATOR_CLEANUP_COLUMNS} FROM narrators
+			 WHERE id IN (SELECT id FROM subtree)`,
+		)
+		.all(rootNarratorId) as Record<string, unknown>[];
+	const terminalRows = sqlite
+		.prepare(
+			`${subtree} SELECT DISTINCT narrator_id AS narratorId FROM terminals
+			 WHERE status = 'running' AND narrator_id IN (SELECT id FROM subtree)`,
+		)
+		.all(rootNarratorId) as Array<{ narratorId: string }>;
+	return {
+		narrators: narratorRows.map(normalizeNarratorCleanupRecord),
+		runningTerminalIds: new Set(terminalRows.map((row) => row.narratorId)),
+	};
 }
 
-function estimateNarratorSampleApproxBytes(root: CleanupPlanRoot): number {
-	return collectSessionAggregateStats(root.deletedNarratorIds).approxBytes;
+/**
+ * Whether a planned root would still be planned with the same subtree. Checked right before each
+ * removal: measuring and every earlier removal yield the main thread, so a session may resume,
+ * gain a child, start a terminal or see new activity in between.
+ */
+function isCleanupRootStillEligible(
+	sessionPlan: SessionCleanupPlan,
+	root: CleanupPlanRoot,
+): boolean {
+	const context = loadRootSubtreeContext(root.rootNarratorId);
+	const [latest] = buildNarratorCleanupPlan(sessionPlan.target, context.narrators, {
+		staleCutoffIso: sessionPlan.staleCutoffIso,
+		runningTerminalIds: context.runningTerminalIds,
+		rootNarratorIds: new Set([root.rootNarratorId]),
+	}).safeRoots;
+	if (!latest) return false;
+	const expectedIds = new Set(root.deletedNarratorIds);
+	return (
+		latest.deletedNarratorIds.length === expectedIds.size &&
+		latest.deletedNarratorIds.every((id) => expectedIds.has(id))
+	);
 }
 
-async function buildSessionPreview(
-	target: Extract<DatabaseCleanupTarget, "archivedSessions" | "staleSessions">,
+/** Never scan payload columns on the HTTP/agent thread, even when both worker paths fail. */
+async function runCleanupReadTask<T>(
+	params: StorageScanCleanupSummariesParams | StorageScanSessionPreviewParams,
+	signal?: AbortSignal,
+): Promise<T> {
+	if (params.kind === "storageScanSessionPreview") {
+		try {
+			assertSessionPreviewBudget(params);
+		} catch (err) {
+			if (err instanceof SessionPreviewBudgetError) {
+				throw new AppError(err.message, 413, err.code);
+			}
+			throw err;
+		}
+	}
+	const dbPath = getDbPath();
+	try {
+		return await runReadTask<T>(dbPath, params, { signal });
+	} catch (err) {
+		if (signal?.aborted) throw err;
+		if (err instanceof WorkersUnavailableError && err.reason === "pool_shutdown") throw err;
+		try {
+			return await runEphemeralReadTask<T>(dbPath, params, { signal });
+		} catch (ephemeralErr) {
+			if (signal?.aborted) throw ephemeralErr;
+			logger.warn("Database cleanup read workers unavailable", {
+				task: params.kind,
+				reason: ephemeralErr instanceof Error ? ephemeralErr.message : String(ephemeralErr),
+			});
+			throw new AppError(
+				"Database cleanup statistics are unavailable: read workers failed",
+				503,
+				"DATABASE_CLEANUP_WORKERS_UNAVAILABLE",
+			);
+		}
+	}
+}
+
+function planSessionCleanup(
+	target: SessionCleanupPlan["target"],
 	olderThanDays: number | undefined,
-	sampleLimit = DEFAULT_PREVIEW_SAMPLE_LIMIT,
-	context?: CleanupNarratorContext,
-): Promise<SessionPreviewData> {
-	const cleanupContext = context ?? (await loadCleanupNarratorContext());
+	context: CleanupNarratorContext,
+): SessionCleanupPlan {
 	const normalizedDays = normalizePreviewDays(target, olderThanDays);
 	const staleCutoffIso =
 		target === "staleSessions" && normalizedDays ? getCutoffIso(normalizedDays) : undefined;
-	const plan = buildNarratorCleanupPlan(target, cleanupContext.narrators, {
+	const plan = buildNarratorCleanupPlan(target, context.narrators, {
 		staleCutoffIso,
-		runningTerminalIds: cleanupContext.runningTerminalIds,
+		runningTerminalIds: context.runningTerminalIds,
 	});
+	return { target, normalizedDays, staleCutoffIso, plan };
+}
+
+/** Failures that only cost the byte/row statistics; the plan itself is still exact. */
+function isStatisticsOnlyFailure(err: unknown): boolean {
+	return (
+		err instanceof AppError &&
+		(err.code === "DATABASE_CLEANUP_PREVIEW_BUDGET_EXCEEDED" ||
+			err.code === "DATABASE_CLEANUP_WORKERS_UNAVAILABLE")
+	);
+}
+
+async function buildSessionPreview(
+	sessionPlan: SessionCleanupPlan,
+	sampleLimit = DEFAULT_PREVIEW_SAMPLE_LIMIT,
+): Promise<SessionPreviewData> {
+	const { target, normalizedDays, plan } = sessionPlan;
 	const allNarratorIds = [...new Set(plan.safeRoots.flatMap((root) => root.deletedNarratorIds))];
-	const aggregate = collectSessionAggregateStats(allNarratorIds);
-	const limitedRoots = plan.safeRoots.slice(0, Math.max(0, sampleLimit));
-	// Synchronous on purpose: these are bun:sqlite aggregates, so Promise.all would only have wrapped
-	// blocking calls in promises without buying any concurrency.
-	const sampleBytes = limitedRoots.map((root) => estimateNarratorSampleApproxBytes(root));
+	const limit = Math.min(SESSION_PREVIEW_MAX_SAMPLES, Math.max(0, sampleLimit));
+	const limitedRoots = plan.safeRoots.slice(0, limit);
+	let measured: StorageScanSessionPreviewResult | null = null;
+	try {
+		measured = await runCleanupReadTask<StorageScanSessionPreviewResult>({
+			kind: "storageScanSessionPreview",
+			narratorIds: allNarratorIds,
+			sampleNarratorIds: limitedRoots.map((root) => root.deletedNarratorIds),
+			relations: SESSION_OWNED_TABLES,
+		});
+	} catch (err) {
+		if (!isStatisticsOnlyFailure(err)) throw err;
+		logger.warn("Session cleanup statistics unavailable; plan counts only", {
+			target,
+			code: (err as AppError).code,
+			narrators: allNarratorIds.length,
+		});
+	}
+	const aggregate = measured?.aggregate ?? {
+		narrators: allNarratorIds.length,
+		messages: 0,
+		toolCalls: 0,
+		apiRequests: 0,
+		approxBytes: 0,
+	};
+	const warningCodes: DatabaseCleanupWarningCode[] = [];
+	if (plan.safeRoots.length > 0) warningCodes.push("deletesUsageHistory");
+	if (!measured) warningCodes.push("statisticsUnavailable");
 	const samples: DatabaseCleanupNarratorSample[] = limitedRoots.map((root, index) => ({
 		type: "narrator",
 		id: root.rootNarratorId,
@@ -366,7 +526,7 @@ async function buildSessionPreview(
 		lastActivityAt: root.lastActivityAt,
 		messageCount: root.rootMessageCount,
 		descendantNarratorCount: root.descendantNarratorCount,
-		approxBytes: sampleBytes[index] ?? 0,
+		approxBytes: measured?.sampleBytes[index] ?? 0,
 	}));
 	return {
 		preview: {
@@ -383,9 +543,9 @@ async function buildSessionPreview(
 				apiRequests: aggregate.apiRequests,
 			},
 			blockedCount: plan.blockedRoots.length,
-			warningCodes: plan.safeRoots.length > 0 ? ["deletesUsageHistory"] : [],
+			warningCodes,
 			samples,
-			blocked: plan.blockedRoots.slice(0, Math.max(0, sampleLimit)).map(toBlockedItem),
+			blocked: plan.blockedRoots.slice(0, limit).map(toBlockedItem),
 		},
 		safeRoots: plan.safeRoots,
 	};
@@ -572,29 +732,12 @@ function cleanupSummariesFromAggregates(
 	};
 }
 
-function measureCleanupCandidatesOnConnection(
-	db: Parameters<typeof collectSessionAggregateStatsOn>[0],
-	archivedNarratorIds: string[],
-	staleNarratorIds: string[],
-): StorageScanCleanupSummariesResult {
-	return {
-		archivedApproxBytes: collectSessionAggregateStatsOn(
-			db,
-			archivedNarratorIds,
-			SESSION_OWNED_TABLES,
-		).approxBytes,
-		staleApproxBytes: collectSessionAggregateStatsOn(db, staleNarratorIds, SESSION_OWNED_TABLES)
-			.approxBytes,
-		toolCalls: summarizeToolCallPayloads(db, getCutoffIso(DEFAULT_TOOL_CALL_PAYLOAD_DAYS)),
-	};
-}
-
 /**
  * Cleanup-candidate byte totals.
  *
  * The plan (which sessions are eligible) is pure data and stays on the main thread. The
- * COUNT/SUM(length) aggregates run on a read worker. If no worker can start, the same queries
- * run here so the settings page still shows a number.
+ * COUNT/SUM(length) aggregates run on a read worker. If neither worker path can run, fail
+ * explicitly instead of blocking the main thread or reporting an unknown total as zero.
  */
 async function measureCleanupCandidatesOffThread(
 	signal?: AbortSignal,
@@ -620,34 +763,8 @@ async function measureCleanupCandidatesOffThread(
 		relations: SESSION_OWNED_TABLES,
 		toolCallCutoffIso: getCutoffIso(DEFAULT_TOOL_CALL_PAYLOAD_DAYS),
 	};
-	const dbPath = getDbPath();
-	try {
-		const aggregates = await runReadTask<StorageScanCleanupSummariesResult>(dbPath, params, {
-			signal,
-		});
-		return cleanupSummariesFromAggregates(archivedPlan, stalePlan, aggregates);
-	} catch (err) {
-		if (signal?.aborted) throw err;
-		if (err instanceof WorkersUnavailableError && err.reason === "pool_shutdown") throw err;
-		try {
-			const aggregates = await runEphemeralReadTask<StorageScanCleanupSummariesResult>(
-				dbPath,
-				params,
-				{ signal },
-			);
-			return cleanupSummariesFromAggregates(archivedPlan, stalePlan, aggregates);
-		} catch (ephemeralErr) {
-			if (signal?.aborted) throw ephemeralErr;
-			logger.warn("Cleanup candidate scan fell back to the main thread", {
-				reason: ephemeralErr instanceof Error ? ephemeralErr.message : String(ephemeralErr),
-			});
-			return cleanupSummariesFromAggregates(
-				archivedPlan,
-				stalePlan,
-				measureCleanupCandidatesOnConnection(sqlite, archivedNarratorIds, staleNarratorIds),
-			);
-		}
-	}
+	const aggregates = await runCleanupReadTask<StorageScanCleanupSummariesResult>(params, signal);
+	return cleanupSummariesFromAggregates(archivedPlan, stalePlan, aggregates);
 }
 
 export const databaseCleanupService = {
@@ -668,6 +785,8 @@ export const databaseCleanupService = {
 		let executedOn: ParallelScanOutcome["executedOn"] = "workers";
 		if (options.signal?.aborted) throw new Error("database storage scan aborted");
 		const cleanup = measureCleanupCandidatesOffThread(options.signal);
+		// It runs concurrently with the object scan, which may outlive a fast worker failure.
+		cleanup.catch(() => {});
 		try {
 			const fileSizes = await getDatabaseFileSizes();
 			const objectStorage = await runParallelObjectStorageScan({
@@ -690,6 +809,7 @@ export const databaseCleanupService = {
 				...fileSizes,
 				...storage,
 				cleanupCandidates,
+				legacyRequestDumps: { retained: legacyRequestDumpsRetained() },
 			};
 		} catch (err) {
 			cleanup.catch(() => {});
@@ -712,13 +832,12 @@ export const databaseCleanupService = {
 					sampleLimit,
 				);
 			}
-			const cleanupContext = await loadCleanupNarratorContext();
-			const { preview } = await buildSessionPreview(
+			const sessionPlan = planSessionCleanup(
 				target,
-				normalizePreviewDays(target, options.olderThanDays),
-				sampleLimit,
-				cleanupContext,
+				options.olderThanDays,
+				await loadCleanupNarratorContext(),
 			);
+			const { preview } = await buildSessionPreview(sessionPlan, sampleLimit);
 			return preview;
 		} finally {
 			logSlowDatabaseStep("previewCleanup", startedAt, { target });
@@ -736,6 +855,7 @@ export const databaseCleanupService = {
 				const beforeBytes = totalDatabaseBytes(beforeSizes);
 				let preview: DatabaseCleanupPreviewResult;
 				let changed = false;
+				let skippedSessions = 0;
 
 				if (target === "toolCallPayloads") {
 					preview = await buildToolCallPayloadPreview(
@@ -759,19 +879,26 @@ export const databaseCleanupService = {
 						changed = numberFromRow(result?.changes) > 0;
 					}
 				} else {
-					const cleanupContext = await loadCleanupNarratorContext();
-					const sessionPreview = await buildSessionPreview(
+					const sessionPlan = planSessionCleanup(
 						target,
-						normalizePreviewDays(target, options.olderThanDays),
-						0,
-						cleanupContext,
+						options.olderThanDays,
+						await loadCleanupNarratorContext(),
 					);
-					preview = sessionPreview.preview;
-					if (sessionPreview.safeRoots.length > 0) {
-						for (const root of sessionPreview.safeRoots) {
-							await narratorService.remove(root.rootNarratorId);
+					// Statistics are best effort here: deleting never depends on a read worker.
+					preview = (await buildSessionPreview(sessionPlan, 0)).preview;
+					for (const root of sessionPlan.plan.safeRoots) {
+						if (!isCleanupRootStillEligible(sessionPlan, root)) {
+							skippedSessions++;
+							continue;
 						}
+						await narratorService.remove(root.rootNarratorId);
 						changed = true;
+					}
+					if (skippedSessions > 0) {
+						logger.warn("Database cleanup skipped sessions that changed after planning", {
+							target,
+							skippedSessions,
+						});
 					}
 				}
 
@@ -786,6 +913,7 @@ export const databaseCleanupService = {
 					freedBytes: Math.max(0, beforeBytes - afterBytes),
 					vacuumRan,
 					changed,
+					skippedSessions,
 				};
 				logger.info("Database cleanup completed", {
 					target,
@@ -799,6 +927,36 @@ export const databaseCleanupService = {
 			});
 		} finally {
 			logSlowDatabaseStep("executeCleanup", startedAt, { target });
+		}
+	},
+
+	/**
+	 * Clear request dumps retained by a deferred 0207, in small batches that yield between them.
+	 * Only NULLs the payload: the column drops run at the next startup, when they no longer copy
+	 * any dump. Freed pages become reusable at once; VACUUM returns them to disk.
+	 */
+	async clearLegacyRequestDumps(): Promise<LegacyRequestDumpClearResult> {
+		const startedAt = performance.now();
+		try {
+			return await databaseMaintenanceLock.acquire(DATABASE_MAINTENANCE_LOCK_KEY, async () => {
+				const beforeBytes = totalDatabaseBytes(await getDatabaseFileSizes());
+				let cleared = 0;
+				let cursor = 0;
+				for (;;) {
+					const batch = clearLegacyRequestDumpBatch(sqlite, cursor, LEGACY_REQUEST_DUMP_BATCH_ROWS);
+					if (!batch) break;
+					cursor = batch.lastRowid;
+					cleared += batch.cleared;
+					await new Promise((resolve) => setTimeout(resolve, 0));
+				}
+				legacyRequestDumpsCleared = true;
+				compactDatabaseIfNeeded(cleared > 0);
+				const afterBytes = totalDatabaseBytes(await getDatabaseFileSizes());
+				logger.info("Legacy request dumps cleared", { cleared, beforeBytes, afterBytes });
+				return { ok: true, cleared, beforeBytes, afterBytes, restartRequired: cleared > 0 };
+			});
+		} finally {
+			logSlowDatabaseStep("clearLegacyRequestDumps", startedAt);
 		}
 	},
 

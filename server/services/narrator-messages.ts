@@ -128,10 +128,7 @@ import {
 } from "./narrator-scoped-revert";
 import { withNarratorWorkAdmission } from "./narrator-session-state";
 import { narratorStore } from "./narrator-store";
-import {
-	attachActiveSendDeliveryTargets,
-	attachSendTargetDetails,
-} from "./send-delivery-resolution";
+import { attachSendTargetDetails } from "./send-delivery-resolution";
 import {
 	assertSnapshotRevertComplete,
 	DEFAULT_REVERT_SCOPE,
@@ -3059,9 +3056,7 @@ async function buildTreeFromTopLevelRefs(
 	// row can open the child's session before the wait returns.
 	const awaitAgentIds = await resolveAwaitAgentIdsForMessages([...topMessages, ...childMessages]);
 	const result = attachTakenOverFlags(
-		await attachSendTargetDetails(
-			attachActiveSendDeliveryTargets(attachAwaitAgentNarratorIds(enriched, awaitAgentIds)),
-		),
+		await attachSendTargetDetails(attachAwaitAgentNarratorIds(enriched, awaitAgentIds)),
 		collectTakenOverToolUseIds(activities, awaitAgentIds),
 	);
 	assertDisplayReadActive(signal, deadlineAt);
@@ -4549,18 +4544,16 @@ const narratorMessageQueriesUnlocked = {
 		attachSubagentActivities(topMsgs, topActivities);
 		const awaitAgentIds = await resolveAwaitAgentIdsForMessages([...topMsgs, ...childMsgs]);
 		const takenOverToolUseIds = collectTakenOverToolUseIds(topActivities, awaitAgentIds);
-		const tree = attachActiveSendDeliveryTargets(
-			attachTakenOverFlags(
-				attachAwaitAgentNarratorIds(
-					enrichToolUseBlocks(
-						filterExitPlanBeforePlanCompact(
-							truncateToolIO(buildMessageTree([...topMsgs, ...childMsgs])),
-						),
+		const tree = attachTakenOverFlags(
+			attachAwaitAgentNarratorIds(
+				enrichToolUseBlocks(
+					filterExitPlanBeforePlanCompact(
+						truncateToolIO(buildMessageTree([...topMsgs, ...childMsgs])),
 					),
-					awaitAgentIds,
 				),
-				takenOverToolUseIds,
+				awaitAgentIds,
 			),
+			takenOverToolUseIds,
 		);
 
 		const newTopToolUseIdSet = new Set(newTopToolUseIds);
@@ -4582,14 +4575,12 @@ const narratorMessageQueriesUnlocked = {
 		return {
 			topLevel: await attachSendTargetDetails(tree),
 			orphanChildren: await attachSendTargetDetails(
-				attachActiveSendDeliveryTargets(
-					attachTakenOverFlags(
-						attachAwaitAgentNarratorIds(
-							enrichToolUseBlocks(truncateToolIO(orphanChildren)),
-							awaitAgentIds,
-						),
-						takenOverToolUseIds,
+				attachTakenOverFlags(
+					attachAwaitAgentNarratorIds(
+						enrichToolUseBlocks(truncateToolIO(orphanChildren)),
+						awaitAgentIds,
 					),
+					takenOverToolUseIds,
 				),
 			),
 			subagentActivities,

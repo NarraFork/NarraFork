@@ -18,6 +18,7 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { fileReferenceApi } from "@frontend/lib/api/file-references";
 import { MantineProvider } from "@mantine/core";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { parseHTML } from "linkedom";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
@@ -287,31 +288,35 @@ test("folded Read menu retains structured execution path and actual child author
 	const resolve = spyOn(fileReferenceApi, "resolve").mockResolvedValue({ targets: [target] });
 	try {
 		const open = mock((..._args: unknown[]) => {});
-		const [call] = resolveAllToolCallsFromMsg({
-			id: "m",
-			narratorId: "child",
-			contentJson: [
+		const [call] = resolveAllToolCallsFromMsg(
+			rowWithElements(
 				{
-					type: "tool_use",
-					id: "read",
-					name: "Read",
-					status: "success",
-					tcId: "tc",
-					input: { file_path: "报告 空格.txt" },
+					id: "m",
+					narratorId: "child",
+					toolCalls: [
+						{
+							id: "tc",
+							toolUseId: "read",
+							executionTarget: {
+								deviceId: target.deviceId,
+								cwd: "C:/原目录",
+								lexicalPath: target.path,
+							},
+						},
+					],
 				},
-			],
-			toolCalls: [
-				{
-					id: "tc",
-					toolUseId: "read",
-					executionTarget: {
-						deviceId: target.deviceId,
-						cwd: "C:/原目录",
-						lexicalPath: target.path,
+				[
+					{
+						type: "tool_use",
+						id: "read",
+						name: "Read",
+						status: "success",
+						tcId: "tc",
+						input: { file_path: "报告 空格.txt" },
 					},
-				},
-			],
-		} as unknown as NarratorMsg);
+				],
+			) as unknown as NarratorMsg,
+		);
 		if (!call) throw new Error("missing tool call");
 		await renderRow({
 			narratorId: "new-host",
@@ -338,28 +343,32 @@ test("folded Read menu retains structured execution path and actual child author
 });
 
 test("an enriched historical Read without row/attempt identity cannot borrow a retry's execution facts", async () => {
-	const [call] = resolveAllToolCallsFromMsg({
-		id: "m",
-		narratorId: "child",
-		contentJson: [
+	const [call] = resolveAllToolCallsFromMsg(
+		rowWithElements(
 			{
-				type: "tool_use",
-				id: "read",
-				name: "Read",
-				status: "success",
-				input: { file_path: "read.txt" },
+				id: "m",
+				narratorId: "child",
+				toolCalls: [
+					{
+						id: "retry",
+						toolUseId: "read",
+						executionAttempt: 2,
+						executionDeviceId: "wrong",
+						executionCwd: "/wrong",
+					},
+				],
 			},
-		],
-		toolCalls: [
-			{
-				id: "retry",
-				toolUseId: "read",
-				executionAttempt: 2,
-				executionDeviceId: "wrong",
-				executionCwd: "/wrong",
-			},
-		],
-	} as unknown as NarratorMsg);
+			[
+				{
+					type: "tool_use",
+					id: "read",
+					name: "Read",
+					status: "success",
+					input: { file_path: "read.txt" },
+				},
+			],
+		) as unknown as NarratorMsg,
+	);
 	if (!call) throw new Error("missing historical call");
 	const open = mock((..._args: unknown[]) => {});
 	await renderRow({
@@ -377,31 +386,35 @@ test("an un-enriched Read cannot borrow a retry's relative input under the origi
 	const resolve = spyOn(fileReferenceApi, "resolve").mockResolvedValue({ targets: [target] });
 	try {
 		const open = mock((..._args: unknown[]) => {});
-		const [call] = resolveAllToolCallsFromMsg({
-			id: "m",
-			narratorId: "child",
-			contentJson: [
+		const [call] = resolveAllToolCallsFromMsg(
+			rowWithElements(
 				{
-					type: "tool_use",
-					id: "read",
-					name: "Read",
-					tcId: "original",
-					executionAttempt: 1,
-					input: { file_path: "original.txt" },
-					executionDeviceId: "Remote",
-					executionCwd: "/original",
+					id: "m",
+					narratorId: "child",
+					toolCalls: [
+						{
+							id: "retry",
+							toolUseId: "read",
+							executionAttempt: 2,
+							inputJson: { file_path: "retry.txt" },
+							status: "success",
+						},
+					],
 				},
-			],
-			toolCalls: [
-				{
-					id: "retry",
-					toolUseId: "read",
-					executionAttempt: 2,
-					inputJson: { file_path: "retry.txt" },
-					status: "success",
-				},
-			],
-		} as unknown as NarratorMsg);
+				[
+					{
+						type: "tool_use",
+						id: "read",
+						name: "Read",
+						tcId: "original",
+						executionAttempt: 1,
+						input: { file_path: "original.txt" },
+						executionDeviceId: "Remote",
+						executionCwd: "/original",
+					},
+				],
+			) as unknown as NarratorMsg,
+		);
 		if (!call) throw new Error("missing original call");
 		await renderRow({
 			narratorId: "host",

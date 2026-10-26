@@ -1,4 +1,5 @@
-import { Code, useComputedColorScheme } from "@mantine/core";
+import { useSharedComputedColorScheme } from "@frontend/hooks/useSharedComputedColorScheme";
+import { Code } from "@mantine/core";
 import { type CSSProperties, memo, useEffect, useMemo, useRef, useState } from "react";
 import type { BundledLanguage } from "shiki";
 import { loadShiki } from "../../../lib/shiki-loader";
@@ -39,7 +40,7 @@ export const HighlightedCode = memo(function HighlightedCode({
 	maxHighlightChars = MAX_CACHEABLE_CODE_CHARS,
 }: HighlightedCodeProps) {
 	const highlightLimit = Math.min(maxHighlightChars, MAX_FILE_HIGHLIGHT_CODE_CHARS);
-	const computedScheme = useComputedColorScheme("dark");
+	const computedScheme = useSharedComputedColorScheme("dark");
 	const theme = computedScheme === "light" ? "github-light-default" : "github-dark-default";
 
 	// We can't synchronously check bundledLanguages before shiki loads,

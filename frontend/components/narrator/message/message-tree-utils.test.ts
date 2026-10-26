@@ -1,34 +1,31 @@
 import { describe, expect, test } from "bun:test";
 import type { TreeMessage } from "@frontend/lib/api";
+import { messageBody, rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import {
-	getDangerReflectionRequestIdInTree,
-	getNewestReflectionToolOccurrenceInTree,
-	insertChildIntoMessages,
-	mergeFieldsIntoNewestToolOccurrenceInTree,
-	mergeToolCallFieldsInTree,
-	removeStreamingChildInMessages,
+	mergeToolCallFieldsInRows,
 	replaceSubagentActivitySnapshot,
 	updateSubagentActivityInMessages,
-	updateToolCallInTree,
-	upsertStreamingChildInMessages,
 	upsertSubagentToolCallHeader,
 } from "./message-tree-utils";
 
+/** A row; a body in `overrides` is split again as this row's, as the server would. */
 function message(overrides: Partial<TreeMessage> = {}): TreeMessage {
-	return {
-		id: "msg-1",
-		narratorId: "narrator-1",
-		parentToolUseId: null,
-		role: "assistant",
-		contentJson: [],
-		contentText: null,
-		toolCalls: [],
-		tokensIn: null,
-		costUsd: null,
-		createdAt: "2026-05-14T00:00:00.000Z",
-		children: [],
-		...overrides,
-	};
+	const { blocks, ...rest } = overrides;
+	return rowWithElements(
+		{
+			id: "msg-1",
+			narratorId: "narrator-1",
+			parentToolUseId: null,
+			role: "assistant",
+			contentText: null,
+			toolCalls: [],
+			tokensIn: null,
+			costUsd: null,
+			createdAt: "2026-05-14T00:00:00.000Z",
+			...rest,
+		},
+		messageBody({ blocks }),
+	);
 }
 
 describe("subagent activity reducers", () => {
@@ -108,10 +105,14 @@ describe("subagent activity reducers", () => {
 	});
 
 	test("replaces snapshots and updates the matching parent tool block", () => {
-		const parent = message({
-			contentJson: [{ type: "tool_use", id: "parent-tool", name: "Agent" }],
-			toolCalls: [{ toolUseId: "parent-tool", toolName: "Agent" }],
-		});
+		const parent = message(
+			rowWithElements(
+				{
+					toolCalls: [{ toolUseId: "parent-tool", toolName: "Agent" }],
+				},
+				[{ type: "tool_use", id: "parent-tool", name: "Agent" }],
+			),
+		);
 		const snapshot = replaceSubagentActivitySnapshot({
 			subagentNarratorId: "sub-1",
 			model: "model-1",
@@ -128,35 +129,39 @@ describe("subagent activity reducers", () => {
 		});
 		const result = updateSubagentActivityInMessages([parent], "parent-tool", () => snapshot);
 		expect(result.changed).toBe(true);
-		expect(result.messages[0].contentJson[0]._subagentActivity).toEqual(snapshot);
+		expect(messageBody(result.messages[0])[0]._subagentActivity).toEqual(snapshot);
 		expect(result.messages[0].toolCalls[0]).toMatchObject({ _subagentActivity: snapshot });
 	});
 });
 
 describe("message-tree-utils tool state parity", () => {
-	test("mergeToolCallFieldsInTree syncs permission fields into enriched content blocks", () => {
+	test("mergeToolCallFieldsInRows syncs permission fields into enriched content blocks", () => {
 		const messages = [
-			message({
-				contentJson: [
-					{ type: "text", text: "before" },
+			message(
+				rowWithElements(
 					{
-						type: "tool_use",
-						id: "tool-1",
-						name: "Edit",
-						status: "permission_pending",
+						toolCalls: [
+							{
+								toolUseId: "tool-1",
+								toolName: "Edit",
+								status: "permission_pending",
+							},
+						],
 					},
-				],
-				toolCalls: [
-					{
-						toolUseId: "tool-1",
-						toolName: "Edit",
-						status: "permission_pending",
-					},
-				],
-			}),
+					[
+						{ type: "text", text: "before" },
+						{
+							type: "tool_use",
+							id: "tool-1",
+							name: "Edit",
+							status: "permission_pending",
+						},
+					],
+				),
+			),
 		];
 
-		const result = mergeToolCallFieldsInTree(messages, "tool-1", {
+		const result = mergeToolCallFieldsInRows(messages, "tool-1", {
 			status: "denied",
 			permissionDenyMessage: "Needs a smaller diff",
 			permissionDecisionReason: "user_feedback",
@@ -168,186 +173,12 @@ describe("message-tree-utils tool state parity", () => {
 			permissionDenyMessage: "Needs a smaller diff",
 			permissionDecisionReason: "user_feedback",
 		});
-		expect(result.messages[0].contentJson[1]).toMatchObject({
+		expect(messageBody(result.messages[0])[1]).toMatchObject({
 			type: "tool_use",
 			id: "tool-1",
 			status: "denied",
 			permissionDenyMessage: "Needs a smaller diff",
 			permissionDecisionReason: "user_feedback",
-		});
-	});
-
-	test("updateToolCallInTree syncs completion output and duration into nested tool blocks", () => {
-		const messages = [
-			message({
-				id: "parent",
-				children: [
-					message({
-						id: "child",
-						contentJson: [
-							{
-								type: "tool_use",
-								id: "tool-nested",
-								name: "Bash",
-								status: "running",
-							},
-						],
-						toolCalls: [
-							{
-								toolUseId: "tool-nested",
-								toolName: "Bash",
-								status: "running",
-							},
-						],
-					}),
-				],
-			}),
-		];
-		const output = { stdout: "ok" };
-
-		const result = updateToolCallInTree(messages, "tool-nested", "success", output, 123);
-
-		expect(result.changed).toBe(true);
-		const child = result.messages[0].children[0];
-		expect(child.toolCalls[0]).toMatchObject({
-			status: "success",
-			outputJson: output,
-			durationMs: 123,
-		});
-		expect(child.contentJson[0]).toMatchObject({
-			type: "tool_use",
-			id: "tool-nested",
-			status: "success",
-			outputJson: output,
-			durationMs: 123,
-		});
-	});
-
-	test("contentJson-only parent accepts and removes persisted child messages", () => {
-		const parent = message({
-			contentJson: [{ type: "tool_use", id: "parent-tool", name: "Agent", input: {} }],
-		});
-		const child = message({ id: "child", parentToolUseId: "parent-tool" });
-
-		const inserted = insertChildIntoMessages([parent], child);
-		expect(inserted.changed).toBe(true);
-		expect(inserted.messages[0].children.map((entry) => entry.id)).toEqual(["child"]);
-	});
-
-	test("contentJson-only parent accepts and removes synthetic streaming children", () => {
-		const parent = message({
-			contentJson: [{ type: "tool_use", id: "parent-tool", name: "Agent", input: {} }],
-		});
-		const inserted = upsertStreamingChildInMessages(
-			[parent],
-			"parent-tool",
-			"synthetic-child",
-			"narrator-1",
-			"child-tool",
-			"Bash",
-			12,
-		);
-		expect(inserted.changed).toBe(true);
-		expect(inserted.messages[0].children).toHaveLength(1);
-
-		const removed = removeStreamingChildInMessages(
-			inserted.messages,
-			"parent-tool",
-			"synthetic-child",
-		);
-		expect(removed.changed).toBe(true);
-		expect(removed.messages[0].children).toHaveLength(0);
-	});
-
-	test("reads the current danger reflection request for a reused toolUseId", () => {
-		const messages = [
-			message({
-				toolCalls: [
-					{
-						toolUseId: "reused-tool-id",
-						toolName: "Bash",
-						permissionSuggestions: [
-							{ type: "danger_reflection", status: "running", requestId: "old-request" },
-							{ type: "danger_reflection", status: "running", requestId: "new-request" },
-						],
-					},
-				],
-			}),
-		];
-
-		expect(getDangerReflectionRequestIdInTree(messages, "reused-tool-id")).toBe("new-request");
-	});
-
-	test("prefers newer top-level and nested reflection requests", () => {
-		const messages = [
-			message({
-				id: "old",
-				toolCalls: [
-					{
-						toolUseId: "reused-tool-id",
-						toolName: "Bash",
-						permissionSuggestions: [{ type: "danger_reflection", requestId: "old-top-level" }],
-					},
-				],
-			}),
-			message({
-				id: "new",
-				children: [
-					message({
-						id: "nested-new",
-						toolCalls: [
-							{
-								toolUseId: "reused-tool-id",
-								toolName: "Bash",
-								permissionSuggestions: [
-									{ type: "danger_reflection", requestId: "nested-new-request" },
-								],
-							},
-						],
-					}),
-				],
-			}),
-		];
-
-		expect(getDangerReflectionRequestIdInTree(messages, "reused-tool-id")).toBe(
-			"nested-new-request",
-		);
-	});
-
-	test("does not fall back to an older reflection when the newest tool has no suggestion", () => {
-		const messages = [
-			message({
-				id: "old",
-				toolCalls: [
-					{
-						toolUseId: "reused-tool-id",
-						toolName: "Bash",
-						permissionSuggestions: [{ type: "danger_reflection", requestId: "old-request" }],
-					},
-				],
-			}),
-			message({
-				id: "new",
-				toolCalls: [{ toolUseId: "reused-tool-id", toolName: "Bash" }],
-			}),
-		];
-
-		expect(getDangerReflectionRequestIdInTree(messages, "reused-tool-id")).toBeUndefined();
-		expect(
-			getNewestReflectionToolOccurrenceInTree(messages, "reused-tool-id", "danger_reflection"),
-		).toEqual({ found: true });
-
-		const merged = mergeFieldsIntoNewestToolOccurrenceInTree(messages, "reused-tool-id", {
-			permissionSuggestions: [
-				{ type: "danger_reflection", status: "running", requestId: "new-request" },
-			],
-		});
-		expect(merged.changed).toBe(true);
-		expect(merged.messages[0].toolCalls?.[0]?.permissionSuggestions?.[0]).toMatchObject({
-			requestId: "old-request",
-		});
-		expect(merged.messages[1].toolCalls?.[0]?.permissionSuggestions?.[0]).toMatchObject({
-			requestId: "new-request",
 		});
 	});
 });

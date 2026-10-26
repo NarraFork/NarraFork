@@ -2,6 +2,7 @@ import { Hono } from "hono";
 import { ValidationError } from "../lib/errors";
 import { searchSectionsQuerySchema, searchSessionHitsQuerySchema } from "../lib/validators/search";
 import {
+	encodeSearchCursor,
 	type MessageSearchScope,
 	SEARCH_SECTIONS,
 	type SearchFilters,
@@ -70,7 +71,8 @@ function baseOptions(query: BaseQuery, user: { sub: string; role: string }, sign
 /**
  * Sectioned global search: `{ sections: { sessions?, knowledge? } }`, each a
  * page `{ items, total, totalIsLowerBound, nextCursor }`. A cursor continues one section, so
- * it is honoured only when `sections` names exactly one.
+ * it is honoured only when `sections` names exactly one; so is `page`, which jumps straight
+ * to that page of `limit` items.
  */
 searchRoutes.get("/", async (c) => {
 	const parsed = searchSectionsQuerySchema.safeParse(c.req.query());
@@ -79,8 +81,10 @@ searchRoutes.get("/", async (c) => {
 	if (!query.q.trim()) return c.json({ sections: {} });
 	const sections = parseSections(query.sections);
 	const limit = query.limit ?? 10;
+	const options = baseOptions(query, c.get("user"), c.req.raw.signal);
 	const result = await searchService.searchSections({
-		...baseOptions(query, c.get("user"), c.req.raw.signal),
+		...options,
+		cursor: query.page ? encodeSearchCursor((query.page - 1) * limit) : options.cursor,
 		sections,
 		limits: Object.fromEntries(sections.map((section) => [section, limit])),
 	});

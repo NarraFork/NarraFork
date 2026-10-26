@@ -72,6 +72,12 @@ import {
 import { ApiRequestDumpCollector } from "./request-dump";
 import { detectShell } from "./shell";
 import {
+	describeFirstTokenTimeout,
+	describeStreamIdleTimeout,
+	StreamProgress,
+} from "./stream-progress";
+import { interleaveWakeups, STREAM_WAKEUP, WakeSignal } from "./stream-wakeups";
+import {
 	groupToolExecutions,
 	isStrictSerialToolExecution,
 	selectStreamingToolExecutions,
@@ -97,7 +103,6 @@ import {
 } from "./tool-loading";
 import { canonicalizeToolName, isBashToolName, isValidToolName } from "./tool-name";
 import { toolRegistry } from "./tool-registry";
-import { SHELL_TOOL_NAME } from "./tools/bash";
 import { DANGER_REFLECTION_TOOLS } from "./tools/danger-reflection";
 import { replace as applyEditReplacement, findReplaceMatch } from "./tools/edit";
 import { readFileText } from "./tools/encoding";
@@ -681,63 +686,39 @@ function normalizeSilentToolCallThreshold(value: number | undefined): number {
 
 const ABORT_EAGER_TOOL_DRAIN_TIMEOUT_MS = 100;
 
-const EAGER_EXECUTION_DISABLED_TOOLS = new Set([
-	"Execute",
-	"Agent",
-	// Await/Send coordinate with spawned agents. Executing them eagerly mid-stream would
-	// let a wait/message run before the group barrier observes the sibling Agent's
-	// registered/running state. Defer them to the ordered post-stream tool phase.
-	"Await",
-	"Send",
-	// Stop can target work launched earlier in the same assistant turn.
-	"Stop",
-	"Browser",
-	"Terminal",
-	"ShareFile",
-	"NarraForkAdmin",
-	// ScheduledTask mutations self-gate via ctx.requestPermission and can launch a
-	// narrator (run_now). Eager mid-stream execution would open an approval prompt —
-	// or dispatch an unattended run — before the assistant message that requested it
-	// is even complete.
-	"ScheduledTask",
-	"PluginInstall",
-	"McpAdmin",
-	"HookAdmin",
-	"ScheduledTaskAdmin",
-	"ForkNarrator",
-	"EnterPlanMode",
-	...DANGER_REFLECTION_TOOLS,
-	...EXIT_PLAN_REFLECTION_TOOLS,
-	...TASK_REFLECTION_TOOLS,
-]);
+/**
+ * Abort reason for a reflection request cut after the reflection already decided: the
+ * request did its job, so it ends as a completion rather than an aborted request.
+ */
+const REFLECTION_DECISION_SETTLED = new Error("Reflection decision settled");
+/** How long a self-decided reflection request may keep streaming before it is cut. */
+const REFLECTION_SELF_DECISION_LINGER_MS = 30_000;
 
+/**
+ * Whether a completed tool call may start while the provider is still streaming.
+ *
+ * Every tool may: a call whose input is complete is independent of anything the model
+ * writes after it (the model cannot condition a call on text it has not produced yet,
+ * and the result only reaches the model in the next request). What a tool needs from
+ * its surroundings is provided per call, not per response:
+ *
+ * - ordering — `selectStreamingToolExecutions` keeps provider order and the grouping
+ *   rules, and a later group starts only after earlier results were consumed;
+ * - its persisted row — execution is bound at `block_complete`, before any start;
+ * - per-call session state — prepared at the call's own persistence (EnterPlanMode),
+ *   never at the end of the response.
+ *
+ * Effects that must not happen while the response is still open are deferred by the
+ * effect itself (plan approval waits for the finalized message before restarting the
+ * pass), not by holding back the tool. The only call that cannot start is one whose
+ * arguments never formed valid input.
+ */
 function shouldEagerExecuteTool(tu: AgentToolUse): boolean {
-	if (EAGER_EXECUTION_DISABLED_TOOLS.has(tu.name)) return false;
-	// Ordinary Bash is ordered, not necessarily deferred until the response ends.
-	// Pipeline/plan transitions still need the complete assistant message.
-	if (isStrictSerial(tu) && tu.name !== SHELL_TOOL_NAME) return false;
-	// Virtual task writes can enter a reflection loop. Keep that decision after
-	// request finalization rather than reflecting against an incomplete response.
-	if (
-		(tu.name === "Write" || tu.name === "Edit") &&
-		typeof tu.input.file_path === "string" &&
-		tu.input.file_path.startsWith("spec://")
-	)
-		return false;
 	// A stopped but malformed argument stream is not executable input.
-	if ("_raw" in tu.input) return false;
-	// Reflection decision tools (TaskReflectConfirm/Revise, ExitPlanConfirm/Revise,
-	// DangerConfirm/Cancel, …) settle a pending decision whose resolution aborts the
-	// reflection loop's own AbortController. Executing them eagerly mid-stream aborts the
-	// reflection provider.chat() while it is still in flight, which records a spurious
-	// "Aborted" API request in usage history. Defer them to the post-stream tool phase so
-	// the reflection request records a clean success (via finishRequest) before the tool
-	// settles the decision and triggers the expected abort.
-	if (toolRegistry.get(tu.name)?.reflectionOnly === true) return false;
-	return true;
+	return !("_raw" in tu.input);
 }
 
-/** Whether a tool use should skip parallel grouping and early execution. */
+/** Whether a tool use forms its own serial group (an ordering barrier for later calls). */
 function isStrictSerial(tu: AgentToolUse): boolean {
 	return isStrictSerialToolExecution(tu);
 }
@@ -1342,13 +1323,38 @@ export async function runReflectionLoop(
 		invalidStates: [],
 		retries: 0,
 	};
-	const onParentAbort = () => abortController.abort();
+	// The nested loop runs on its own signal. `abortController` belongs to the gate: it
+	// fires when the gate's decision settles, whoever made it. When this reflection made
+	// the decision itself — its decision tool ran mid-stream, while the provider was still
+	// streaming — cutting its request would record a spurious "Aborted" API request for a
+	// reflection that succeeded. Then the request is left to finish (shouldStop starts
+	// nothing after the decision) and is only cut, as a clean completion, if it lingers.
+	// A takeover by the user or the parent's abort still cuts it at once.
+	const loopAbort = new AbortController();
+	let selfDecisionInFlight = false;
+	let lingerTimer: ReturnType<typeof setTimeout> | undefined;
+	const onGateAbort = () => {
+		if (!selfDecisionInFlight) {
+			loopAbort.abort();
+			return;
+		}
+		lingerTimer ??= setTimeout(
+			() => loopAbort.abort(REFLECTION_DECISION_SETTLED),
+			REFLECTION_SELF_DECISION_LINGER_MS,
+		);
+	};
+	if (abortController.signal.aborted) onGateAbort();
+	else abortController.signal.addEventListener("abort", onGateAbort, { once: true });
+	const onParentAbort = () => {
+		abortController.abort();
+		loopAbort.abort();
+	};
 	if (parentConfig.signal.aborted) onParentAbort();
 	else parentConfig.signal.addEventListener("abort", onParentAbort, { once: true });
 	try {
 		const reflectionConfig: AgentConfig = {
 			...parentConfig,
-			signal: abortController.signal,
+			signal: loopAbort.signal,
 			maxTurns: Number.isFinite(maxTurns) ? Math.max(1, Math.min(2, Math.floor(maxTurns))) : 2,
 			reflectionLoop,
 			// The parent's system prompt is inherited: the projected request starts as the parent's did.
@@ -1378,9 +1384,12 @@ export async function runReflectionLoop(
 			onCompletedToolCount: undefined,
 			silentToolCallThreshold: -1,
 			shouldStop: () => observed.decisionSucceeded === true,
+			shouldYieldToInput: undefined,
 			guidanceSignal: undefined,
 			urgentGuidanceSignal: undefined,
-			onToolExecutionInvoking: undefined,
+			onToolExecutionInvoking: (toolUse) => {
+				if (allowedTools.has(toolUse.name)) selfDecisionInFlight = true;
+			},
 			// Declaration filtering remains inherited; execution uses the gate's hard ceiling.
 			allowedTools: new Set(reflectionLoop.allowedTools),
 			disabledTools: undefined,
@@ -1449,6 +1458,8 @@ export async function runReflectionLoop(
 				observed.toolCalls.push(event.toolName);
 			} else if (event.type === "tool_result") {
 				if (!event.isError && allowedTools.has(event.toolName)) observed.decisionSucceeded = true;
+				// A rejected decision settled nothing; a later takeover must cut at once.
+				if (event.isError && allowedTools.has(event.toolName)) selfDecisionInFlight = false;
 				observed.toolResults.push({
 					toolName: event.toolName,
 					isError: event.isError,
@@ -1485,7 +1496,7 @@ export async function runReflectionLoop(
 		}
 		if (
 			reflectionLoop.context.purpose === "permissionRuleRequest" &&
-			(abortController.signal.aborted || pendingApiRequests.size > 0)
+			(loopAbort.signal.aborted || pendingApiRequests.size > 0)
 		)
 			observed.errors.push(
 				"Permission rule reflection did not finish its provider request normally",
@@ -1503,8 +1514,10 @@ export async function runReflectionLoop(
 		return observed;
 	} finally {
 		progress.finish();
+		if (lingerTimer) clearTimeout(lingerTimer);
 		await recordUnfinishedReflectionApiRequests(pendingApiRequests, parentConfig, label);
 		parentConfig.signal.removeEventListener("abort", onParentAbort);
+		abortController.signal.removeEventListener("abort", onGateAbort);
 	}
 }
 
@@ -3357,7 +3370,7 @@ async function* agentLoopInMetadataSnapshot(
 		if (guidanceSignal?.aborted) {
 			// FIFO guidance may intentionally enter a pass already stopped. Consume the
 			// host flag and preserve pending input without activating provider/preflight IO.
-			config.shouldStop?.();
+			config.shouldYieldToInput?.();
 			yield { type: "turn_complete", turnIndex };
 			return;
 		}
@@ -3556,24 +3569,34 @@ async function* agentLoopInMetadataSnapshot(
 			 */
 			let gracefulStopRequested = false;
 			/**
-			 * Consume a pending soft-stop request at most once per turn.
+			 * Consume a pending host stop request at most once per turn.
 			 *
 			 * Every boundary asks through here, so the grant is spent exactly once no
 			 * matter which phase observes it first. Asking again after a grant would
 			 * return the *next* request's answer (usually false) and silently resurrect
-			 * the turn the caller already agreed to end.
+			 * the turn the caller already agreed to end. A host stop skips the calls that
+			 * have not started yet.
 			 */
 			const observeSoftStopForTurn = (): boolean => {
-				if (!gracefulStopRequested && guidanceSignal?.aborted) {
-					// Consume the host's one-shot flag too, so the next pass is not stopped again.
-					config.shouldStop?.();
-					gracefulStopRequested = true;
-				}
 				if (!gracefulStopRequested && config.shouldStop?.()) gracefulStopRequested = true;
 				return gracefulStopRequested;
 			};
+			/** Same one-shot contract for queued user input, which never skips a call. */
+			let inputStopRequested = false;
+			const observeInputStopForTurn = (): boolean => {
+				if (!inputStopRequested && guidanceSignal?.aborted) {
+					// Consume the host's one-shot flag too, so the next pass is not stopped again.
+					config.shouldYieldToInput?.();
+					inputStopRequested = true;
+				}
+				if (!inputStopRequested && config.shouldYieldToInput?.()) inputStopRequested = true;
+				return inputStopRequested;
+			};
 			// Map of tool executions started during streaming (toolUseId → Promise)
 			const earlyExecMap = new Map<string, Promise<ToolExecResult>>();
+			// Raised when a started tool settles, so the stream consumer can publish its
+			// result (and release successors) while the provider stream is idle.
+			const toolSettledWake = new WakeSignal();
 			// Synchronously queryable map of settled early-exec results (populated via .then())
 			const settledResults = new Map<string, ToolExecResult>();
 			// Only fully persisted AND announced calls are candidates. A preceding input
@@ -3583,52 +3606,31 @@ async function* agentLoopInMetadataSnapshot(
 			const startToolExecution = (tu: AgentToolUse): Promise<ToolExecResult> => {
 				const existing = earlyExecMap.get(tu.toolUseId);
 				if (existing) return existing;
-				const preparationAbort = new AbortController();
-				const onGuidance = () =>
-					preparationAbort.abort(new Error("Stopped for immediate guidance"));
-				const removeGuidance = () => guidanceSignal?.removeEventListener("abort", onGuidance);
-				if (guidanceSignal?.aborted) onGuidance();
-				else guidanceSignal?.addEventListener("abort", onGuidance, { once: true });
-				const preparationSignal = AbortSignal.any([toolSignal, preparationAbort.signal]);
+				// Queued guidance never cancels a produced call, not even while it waits for
+				// permission: only the run's own signal and urgent input cancel preparation.
 				const invocationConfig = new Proxy(toolConfig, {
 					get(target, key, receiver) {
-						if (key === "signal") return preparationSignal;
 						if (key === "permissionHandler") {
 							return ((name, input, id, options) =>
 								target.permissionHandler(name, input, id, {
 									...options,
-									signal: preparationSignal,
+									signal: toolSignal,
 								})) satisfies AgentConfig["permissionHandler"];
-						}
-						if (key === "onToolExecutionInvoking") {
-							return (tool: AgentToolUse) => {
-								// No await between this synchronous boundary and tool.execute.
-								preparationSignal.throwIfAborted();
-								removeGuidance();
-								target.onToolExecutionInvoking?.(tool);
-							};
 						}
 						return Reflect.get(target, key, receiver);
 					},
 				});
 				const execution = settleToolExecutionResult(
 					executeToolAfterReflections(tu, invocationConfig, requestRows(), locale),
-				)
-					.then((result) =>
-						preparationAbort.signal.aborted
-							? {
-									...result,
-									output: getToolMessage("skippedForSoftStop", locale),
-									isError: true,
-									metadata: { ...result.metadata, skippedForSoftStop: true },
-								}
-							: result,
-					)
-					.finally(removeGuidance);
+				);
 				earlyExecMap.set(tu.toolUseId, execution);
 				void execution.then((result) => {
 					settledResults.set(tu.toolUseId, result);
-					pumpStreamingTools();
+					// Successors wait for this result to be consumed, not merely settled (see
+					// pumpStreamingTools). Wake the stream consumer so it publishes the result
+					// now instead of at the provider's next event, which may be long after the
+					// model stopped producing output.
+					toolSettledWake.notify();
 				});
 				return execution;
 			};
@@ -3667,7 +3669,12 @@ async function* agentLoopInMetadataSnapshot(
 							tool,
 							ready: streamReadyTools.has(identity.toolUseId),
 							started: earlyExecMap.has(identity.toolUseId),
-							settled: result !== undefined,
+							// The barrier is the CONSUMED result, not the settled promise. Some
+							// effects are applied by the event consumer when it processes the
+							// tool_result (plan-mode commit, plan exit, reflection decisions);
+							// a later group must observe them, exactly as the post-stream phase
+							// does by yielding each group's results before starting the next.
+							settled: yieldedToolResults.has(identity.toolUseId),
 							fatal: result?.fatal,
 							allowed: tool !== undefined && shouldEagerExecuteTool(tool),
 						};
@@ -3793,6 +3800,28 @@ async function* agentLoopInMetadataSnapshot(
 			let contentlessEventCount = 0;
 			let lastStopReason: string | undefined;
 			const namelessToolUseIds = new Set<string>();
+
+			/**
+			 * Publish settled-but-unpublished results in call order while the stream is open.
+			 * Returns the first fatal result, after publishing it; the caller ends the request.
+			 */
+			async function* drainSettledStreamingToolResults(): AsyncGenerator<
+				AgentEvent,
+				ToolExecResult | undefined
+			> {
+				for (const tu of toolUses) {
+					const settled = settledResults.get(tu.toolUseId);
+					if (!settled || yieldedToolResults.has(tu.toolUseId)) continue;
+					yieldedToolResults.add(tu.toolUseId);
+					if (settled.broken) brokenToolUseIds.add(tu.toolUseId);
+					if (settled.updatedInput && tu.name !== "AskUserQuestion")
+						tu.input = settled.updatedInput;
+					await processToolResultInjections(tu, settled);
+					yield toolResultEvent(tu, settled);
+					if (settled.fatal) return settled;
+				}
+				return undefined;
+			}
 
 			async function* drainSettledEarlyToolResults(): AsyncGenerator<AgentEvent> {
 				for (const tu of toolUses) {
@@ -4590,9 +4619,9 @@ async function* agentLoopInMetadataSnapshot(
 				let attemptStreamedContent = false;
 				const guidanceCutsNow = () =>
 					config.urgentGuidanceSignal?.aborted === true || !attemptStreamedContent;
+				// Calls already complete keep their eager start; the turn ends after its tools.
 				const onGuidanceAbort = () => {
-					observeSoftStopForTurn();
-					streamExecutionOpen = false;
+					observeInputStopForTurn();
 					if (guidanceCutsNow()) attemptAbort.abort(guidanceStop);
 				};
 				// Urgent guidance can follow live guidance whose combined signal already fired.
@@ -4635,14 +4664,42 @@ async function* agentLoopInMetadataSnapshot(
 				let providerActivitySeen = false;
 				let firstTokenTimer: ReturnType<typeof setTimeout> | undefined;
 				let streamIdleTimer: ReturnType<typeof setTimeout> | undefined;
-				const firstTokenTimeoutMessage = `${effectiveProvider}: First token timeout after ${Math.round(
-					firstTokenTimeoutMs / 1000,
-				)}s without upstream activity`;
+				// Bytes and SSE heartbeats only explain *where* an attempt stalled; they never
+				// cancel or extend the event-based timers below.
+				const streamProgress = new StreamProgress();
+				let firstTokenTimeoutMessage = describeFirstTokenTimeout(
+					effectiveProvider,
+					firstTokenTimeoutMs,
+					undefined,
+				);
 				const streamIdleTimeoutMs =
 					firstTokenTimeoutMs > 0 ? Math.max(firstTokenTimeoutMs * 5, 300_000) : 0;
-				const streamIdleTimeoutMessage = `${effectiveProvider}: Stream idle timeout after ${Math.round(
-					streamIdleTimeoutMs / 1000,
-				)}s without a parsed stream event`;
+				let streamIdleTimeoutMessage = describeStreamIdleTimeout(
+					effectiveProvider,
+					streamIdleTimeoutMs,
+					undefined,
+				);
+				const logStreamTimeout = (reason: string, message: string) => {
+					logger.warn("Provider stream timeout", {
+						narratorId: config.narratorId,
+						provider: effectiveProvider,
+						model: effectiveModel,
+						requestId,
+						reason,
+						message,
+						stallPhase: streamProgress.stallPhase(),
+						...streamProgress.snapshot(),
+					});
+				};
+				const streamTimeoutDiagnostics = () => {
+					const snapshot = streamProgress.snapshot();
+					return {
+						...(snapshot.statusCode !== undefined ? { statusCode: snapshot.statusCode } : {}),
+						...(streamProgress.stallPhase() && !providerActivitySeen
+							? { cause: streamProgress.stallPhase() }
+							: {}),
+					};
+				};
 				const clearFirstTokenTimer = () => {
 					if (firstTokenTimer) {
 						clearTimeout(firstTokenTimer);
@@ -4661,11 +4718,18 @@ async function* agentLoopInMetadataSnapshot(
 					streamIdleTimer = setTimeout(() => {
 						if (config.signal.aborted) return;
 						streamIdleTimeoutTriggered = true;
+						streamIdleTimeoutMessage = describeStreamIdleTimeout(
+							effectiveProvider,
+							streamIdleTimeoutMs,
+							streamProgress,
+						);
+						logStreamTimeout("stream_idle_timeout", streamIdleTimeoutMessage);
 						attemptAbort.abort(new Error(streamIdleTimeoutMessage));
 					}, streamIdleTimeoutMs);
 				};
 				const markProviderActivity = () => {
 					providerActivitySeen = true;
+					streamProgress.markEvent();
 					clearFirstTokenTimer();
 					armStreamIdleTimer();
 				};
@@ -4681,6 +4745,12 @@ async function* agentLoopInMetadataSnapshot(
 					firstTokenTimer = setTimeout(() => {
 						if (config.signal.aborted || providerActivitySeen || sawMeaningfulResponse) return;
 						firstTokenTimeoutTriggered = true;
+						firstTokenTimeoutMessage = describeFirstTokenTimeout(
+							effectiveProvider,
+							firstTokenTimeoutMs,
+							streamProgress,
+						);
+						logStreamTimeout("first_token_timeout", firstTokenTimeoutMessage);
 						attemptAbort.abort(new Error(firstTokenTimeoutMessage));
 					}, firstTokenTimeoutMs);
 				};
@@ -4777,6 +4847,7 @@ async function* agentLoopInMetadataSnapshot(
 						serviceTier: config.serviceTier,
 						metadata: config.metadata,
 						requestDump,
+						streamProgress,
 						resetUpstreamSession,
 						onRequestStart: markRequestStarted,
 						onInputCharacters: async (counts) => {
@@ -4797,7 +4868,22 @@ async function* agentLoopInMetadataSnapshot(
 					});
 
 					streamExecutionOpen = true;
-					for await (const parsed of stream) {
+					for await (const streamItem of interleaveWakeups(stream, toolSettledWake)) {
+						if (streamItem === STREAM_WAKEUP) {
+							// A started tool settled while the provider was idle: publish it and
+							// release the calls queued behind it. Not provider activity.
+							if (updateReasoningInterrupted) throw updateReasoningStop;
+							throwIfUserAborted();
+							const fatal = yield* drainSettledStreamingToolResults();
+							if (fatal) {
+								yield* finishRequest(fatal.output);
+								yield { type: "error", message: fatal.output };
+								return;
+							}
+							pumpStreamingTools();
+							continue;
+						}
+						const parsed = streamItem;
 						if (updateReasoningInterrupted) throw updateReasoningStop;
 						// Once visible text or a tool starts, drain the whole response safely.
 						if (
@@ -5292,26 +5378,18 @@ async function* agentLoopInMetadataSnapshot(
 										};
 										throwIfUserAborted();
 										streamReadyTools.add(id);
-										pumpStreamingTools();
 
-										// Drain any tool results that settled during streaming.
-										// This lets fast tools (Read, Glob, etc.) report completion
+										// Publish results that settled during streaming first: a call
+										// queued behind them may start only once they are consumed.
+										// This also lets fast tools (Read, Glob, etc.) report completion
 										// before the model finishes outputting subsequent tool calls.
-										for (const prevTu of toolUses) {
-											const sr = settledResults.get(prevTu.toolUseId);
-											if (!sr || yieldedToolResults.has(prevTu.toolUseId)) continue;
-											yieldedToolResults.add(prevTu.toolUseId);
-											if (sr.broken) brokenToolUseIds.add(prevTu.toolUseId);
-											if (sr.updatedInput && prevTu.name !== "AskUserQuestion")
-												prevTu.input = sr.updatedInput;
-											await processToolResultInjections(prevTu, sr);
-											yield toolResultEvent(prevTu, sr);
-											if (sr.fatal) {
-												yield* finishRequest(sr.output);
-												yield { type: "error", message: sr.output };
-												return;
-											}
+										const fatal = yield* drainSettledStreamingToolResults();
+										if (fatal) {
+											yield* finishRequest(fatal.output);
+											yield { type: "error", message: fatal.output };
+											return;
 										}
+										pumpStreamingTools();
 									}
 								}
 							}
@@ -5762,9 +5840,9 @@ async function* agentLoopInMetadataSnapshot(
 								// again while the result it already produced is lost.
 								//
 								// Widened from `hasStartedEarlyToolExecution()`: a tool whose input closed
-								// but which was deferred (strict-serial, or an eager-disabled tool such as
-								// Bash/Write/Edit) has no entry in `earlyExecMap`, yet replaying it is just
-								// as lossy.
+								// but which has not started yet (queued behind an earlier call, or held by
+								// a soft stop) has no entry in `earlyExecMap`, yet replaying it is just as
+								// lossy.
 								if (hasIrreplaceableProgress()) {
 									logger.warn("Retryable provider stream error after tool progress landed", {
 										narratorId: config.narratorId,
@@ -5775,8 +5853,8 @@ async function* agentLoopInMetadataSnapshot(
 										startedToolCount: earlyExecMap.size,
 										settledToolCount: settledResults.size,
 									});
-									// Draining eager calls alone strands completed deferred calls (Browser,
-									// strict-serial tools). Execute them normally, but never start another
+									// Draining started calls alone strands completed calls that are still
+									// queued. Execute them normally, but never start another
 									// provider turn here: the caller owns the interruption retry budget.
 									pendingResumableError = {
 										type: "resumable_error",
@@ -5887,6 +5965,13 @@ async function* agentLoopInMetadataSnapshot(
 						// executor finishes cleanup; the detached callback preserves the exact result.
 						// Even on abort, yield block_complete for accumulated content so it can be persisted
 						yield* outputContent.flush();
+						// A reflection that already decided was only cut for lingering: its
+						// request succeeded and is recorded as such.
+						if (config.reflectionLoop && config.signal.reason === REFLECTION_DECISION_SETTLED) {
+							yield* finishRequest();
+							yield { type: "done" };
+							return;
+						}
 						yield* finishRequest("Aborted");
 						yield { type: "error", message: "Aborted" };
 						return;
@@ -5906,7 +5991,7 @@ async function* agentLoopInMetadataSnapshot(
 						continue;
 					}
 					if (guidanceSignal?.aborted) {
-						observeSoftStopForTurn();
+						observeInputStopForTurn();
 						// Guidance is not a transport fault. Finalize this partial turn below,
 						// without replay/retry or cancelling tools whose bodies already began.
 						break;
@@ -5919,6 +6004,7 @@ async function* agentLoopInMetadataSnapshot(
 							message: firstTokenTimeoutMessage,
 							provider: effectiveProvider,
 							model: effectiveModel,
+							...streamTimeoutDiagnostics(),
 						});
 						if (
 							(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
@@ -5982,6 +6068,7 @@ async function* agentLoopInMetadataSnapshot(
 							message: streamIdleTimeoutMessage,
 							provider: effectiveProvider,
 							model: effectiveModel,
+							...streamTimeoutDiagnostics(),
 						});
 						if (
 							(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
@@ -6348,7 +6435,7 @@ async function* agentLoopInMetadataSnapshot(
 				}
 
 				if (guidanceSignal?.aborted) {
-					observeSoftStopForTurn();
+					observeInputStopForTurn();
 					break;
 				}
 				if (firstTokenTimeoutTriggered) {
@@ -6359,6 +6446,7 @@ async function* agentLoopInMetadataSnapshot(
 						message: firstTokenTimeoutMessage,
 						provider: effectiveProvider,
 						model: effectiveModel,
+						...streamTimeoutDiagnostics(),
 					});
 					if (
 						(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
@@ -6414,6 +6502,7 @@ async function* agentLoopInMetadataSnapshot(
 						message: streamIdleTimeoutMessage,
 						provider: effectiveProvider,
 						model: effectiveModel,
+						...streamTimeoutDiagnostics(),
 					});
 					if (
 						(getMaxChatRetries() === -1 || chatRetryCount < getMaxChatRetries()) &&
@@ -7087,15 +7176,21 @@ async function* agentLoopInMetadataSnapshot(
 			// Tool execution may remain paused behind phase two without holding the response fence.
 			responseActivity.release();
 
-			if (guidanceSignal?.aborted) {
-				observeSoftStopForTurn();
+			// Guidance ends the turn here only when nothing remains to run, or when urgent
+			// input has already cancelled tool IO. Otherwise every produced call executes
+			// below and the step boundary ends the turn: a complete call is never skipped.
+			if (
+				guidanceSignal?.aborted &&
+				(toolUses.length === 0 || config.urgentGuidanceSignal?.aborted === true)
+			) {
+				observeInputStopForTurn();
 				yield* drainStartedEarlyToolResults();
 				if (config.signal.aborted) {
 					yield { type: "error", message: "Aborted" };
 					return;
 				}
 				// Still-running detached calls retain their real pending rows. Do not fabricate
-				// skipped results or replay their incomplete pairs into model-facing history.
+				// results or replay their incomplete pairs into model-facing history.
 				const guidanceTools = toolUses.filter((tu) => !detachedToolResults.has(tu.toolUseId));
 				for (const tu of guidanceTools) {
 					if (yieldedToolResults.has(tu.toolUseId)) continue;
@@ -7103,11 +7198,11 @@ async function* agentLoopInMetadataSnapshot(
 					yield toolResultEvent(
 						tu,
 						settledResults.get(tu.toolUseId) ?? {
-							output: getToolMessage("skippedForSoftStop", locale),
+							output: getToolMessage("cancelledForInterrupt", locale),
 							isError: true,
 							durationMs: 0,
 							completedAt: Date.now(),
-							metadata: { skippedForSoftStop: true },
+							metadata: { cancelledForInterrupt: true },
 						},
 					);
 				}
@@ -7213,7 +7308,7 @@ async function* agentLoopInMetadataSnapshot(
 						yield* drainEarlyToolResultsAfterAbort();
 						if (config.signal.aborted) yield { type: "error", message: "Aborted" };
 						else {
-							observeSoftStopForTurn();
+							observeInputStopForTurn();
 							yield { type: "turn_complete", turnIndex };
 						}
 						return;
@@ -7308,7 +7403,7 @@ async function* agentLoopInMetadataSnapshot(
 							yield* drainEarlyToolResultsAfterAbort();
 							if (config.signal.aborted) yield { type: "error", message: "Aborted" };
 							else {
-								observeSoftStopForTurn();
+								observeInputStopForTurn();
 								yield { type: "turn_complete", turnIndex };
 							}
 							return;
@@ -7358,11 +7453,12 @@ async function* agentLoopInMetadataSnapshot(
 					}
 				}
 
-				// Check after every serial tool and complete parallel-safe group. Once a soft
+				// Check after every serial tool and complete parallel-safe group. Once a host
 				// stop is observed, never start another tool: only await promises that were
 				// already registered in earlyExecMap and mark every other remaining call skipped.
+				// Queued user input is not a host stop; it waits for the step boundary below.
 				if (observeSoftStopForTurn()) {
-					const skippedOutput = getToolMessage("skippedForSoftStop", locale);
+					const skippedOutput = getToolMessage("skippedForPassEnd", locale);
 					let fatalOutput: string | undefined;
 					for (const remainingTool of toolUses.slice(toolIndex)) {
 						const earlyPromise = earlyExecMap.get(remainingTool.toolUseId);
@@ -7379,7 +7475,7 @@ async function* agentLoopInMetadataSnapshot(
 									isError: true,
 									durationMs: 0,
 									completedAt: Date.now(),
-									metadata: { skippedForSoftStop: true },
+									metadata: { skippedForPassEnd: true },
 								};
 							}
 							continue;
@@ -7390,7 +7486,7 @@ async function* agentLoopInMetadataSnapshot(
 							yield* drainEarlyToolResultsAfterAbort();
 							if (config.signal.aborted) yield { type: "error", message: "Aborted" };
 							else {
-								observeSoftStopForTurn();
+								observeInputStopForTurn();
 								yield { type: "turn_complete", turnIndex };
 							}
 							return;
@@ -7445,9 +7541,10 @@ async function* agentLoopInMetadataSnapshot(
 			await flushLoopInjections();
 			await collectAfterToolsInjections();
 
-			// Close the small race between the final group boundary and the next provider
-			// request: direct user feedback may arrive while after-tools injections are drained.
-			if (observeSoftStopForTurn()) {
+			// Every call of the step has run: queued user input takes the next turn. This also
+			// closes the race with feedback arriving while after-tools injections are drained.
+			const hostStop = observeSoftStopForTurn();
+			if (observeInputStopForTurn() || hostStop) {
 				yield { type: "turn_complete", turnIndex };
 				return;
 			}

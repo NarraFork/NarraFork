@@ -116,10 +116,10 @@ export function resolveVListEditedMeta(
 	return { editedAt, originalContentJson: msg?.originalContentJson ?? null };
 }
 
-/** True when a message has at least one non-empty text block. */
-export function hasEditableTextBlock(contentJson: unknown): boolean {
-	if (!Array.isArray(contentJson)) return false;
-	return contentJson.some(
+/** True when a message's elements hold at least one text block. */
+export function hasEditableTextBlock(elements: unknown): boolean {
+	if (!Array.isArray(elements)) return false;
+	return elements.some(
 		(block) =>
 			!!block &&
 			typeof block === "object" &&

@@ -3,7 +3,6 @@ import { Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { CodexOAuthError } from "../../../server/lib/codex-auth";
 import { AppError } from "../../../server/lib/errors";
-import { invalidateUserCache } from "../../../server/middleware/auth";
 import type { AuthSessionStore } from "../../../server/services/auth/session-store";
 import { authMfaStore, authSessionStore, setAuthStores } from "../../../server/services/auth/store";
 
@@ -201,7 +200,6 @@ app.onError((err, c) => {
 });
 
 beforeEach(() => {
-	invalidateUserCache(authUser.sub);
 	settingsState.codex.useWebSocket = undefined;
 	settingsState.codex.loadBalancingMode = undefined;
 	settingsState.codex.tierOrder = undefined;
@@ -216,7 +214,6 @@ beforeEach(() => {
 
 afterAll(() => {
 	setAuthStores(undefined);
-	invalidateUserCache(authUser.sub);
 	// Re-point every globally-mocked module back to the real implementation so
 	// settings / manager / logger mocks don't leak into later suites.
 	for (const [specifier, factory] of Object.entries(realCodexModules)) {

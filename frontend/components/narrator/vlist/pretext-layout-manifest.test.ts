@@ -1,4 +1,5 @@
 import { beforeAll, describe, expect, it } from "bun:test";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { segmentMessages } from "../message/message-segments";
 import type { NarratorMsg } from "../narrator-panel-types";
 import { installCanvasStub } from "./measure/test-canvas-stub";
@@ -11,22 +12,23 @@ beforeAll(() => {
 });
 
 function message(id: string, role: "user" | "assistant", text: string): NarratorMsg {
-	return {
-		id,
-		seq: Number(id.slice(1)),
-		role,
-		contentJson: [{ type: "text", text }],
-		contentText: text,
-		toolCalls: [],
-		children: [],
-		parentToolUseId: null,
-		createdAt: "2026-07-23T00:00:00.000Z",
-	} as unknown as NarratorMsg;
+	return rowWithElements(
+		{
+			id,
+			seq: Number(id.slice(1)),
+			role,
+			contentText: text,
+			toolCalls: [],
+			parentToolUseId: null,
+			createdAt: "2026-07-23T00:00:00.000Z",
+		},
+		[{ type: "text", text }],
+	) as unknown as NarratorMsg;
 }
 
 describe("mixed native-card manifest integration", () => {
 	function nativeMessage(id: string, blocks: Record<string, unknown>[]): NarratorMsg {
-		return { ...message(id, "assistant", ""), contentJson: blocks } as unknown as NarratorMsg;
+		return rowWithElements({ ...message(id, "assistant", "") }, blocks) as unknown as NarratorMsg;
 	}
 	function tool(id: string, name = "Read") {
 		return {
@@ -236,18 +238,17 @@ describe("pretext layout manifest deduplication", () => {
 			outputJson: { _text: "line\n" },
 		});
 		const retryMessage = (id: string, seq: number): NarratorMsg =>
-			({
-				id,
-				seq,
-				role: "assistant",
-				contentJson: [
-					{ type: "tool_use", id: "tu-retry", name: "Read", input: { file_path: "/retry.ts" } },
-				],
-				toolCalls: [toolCall("tu-retry")],
-				children: [],
-				parentToolUseId: null,
-				createdAt: "2026-07-23T00:00:00.000Z",
-			}) as unknown as NarratorMsg;
+			rowWithElements(
+				{
+					id,
+					seq,
+					role: "assistant",
+					toolCalls: [toolCall("tu-retry")],
+					parentToolUseId: null,
+					createdAt: "2026-07-23T00:00:00.000Z",
+				},
+				[{ type: "tool_use", id: "tu-retry", name: "Read", input: { file_path: "/retry.ts" } }],
+			) as unknown as NarratorMsg;
 
 		const messages = [retryMessage("m0", 1), retryMessage("m1", 2)];
 		// L5: no activity fold, so both calls render as their own `tool-call` card —
@@ -434,27 +435,26 @@ describe("pretext layout manifest segment gap", () => {
 describe("pretext layout manifest in-run gaps", () => {
 	function toolMessage(id: string, seq: number, name: string, command: string): NarratorMsg {
 		const input = { command };
-		return {
-			id,
-			seq,
-			role: "assistant",
-			contentJson: [
-				{ type: "tool_use", id: `tu-${id}`, name, input, inputJson: input, status: "completed" },
-			],
-			contentText: null,
-			toolCalls: [
-				{
-					toolUseId: `tu-${id}`,
-					toolName: name,
-					inputJson: input,
-					outputJson: null,
-					status: "success",
-				},
-			],
-			children: [],
-			parentToolUseId: null,
-			createdAt: "2026-07-25T00:00:00.000Z",
-		} as unknown as NarratorMsg;
+		return rowWithElements(
+			{
+				id,
+				seq,
+				role: "assistant",
+				contentText: null,
+				toolCalls: [
+					{
+						toolUseId: `tu-${id}`,
+						toolName: name,
+						inputJson: input,
+						outputJson: null,
+						status: "success",
+					},
+				],
+				parentToolUseId: null,
+				createdAt: "2026-07-25T00:00:00.000Z",
+			},
+			[{ type: "tool_use", id: `tu-${id}`, name, input, inputJson: input, status: "completed" }],
+		) as unknown as NarratorMsg;
 	}
 
 	/** One tool-run of `count` consecutive Bash calls, at full-card LOD 5. */

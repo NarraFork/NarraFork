@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { clearToken, setToken } from "@frontend/lib/api/client";
 import type { PretextDocumentPageResult, TreeMessage } from "@frontend/lib/api/types";
+import { messageBody, rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import type { MessageSegmentationCache } from "../message/message-segments";
 import type { NarratorMsg } from "../narrator-panel-types";
 import { installCanvasStub } from "./measure/test-canvas-stub";
@@ -32,18 +33,19 @@ afterAll(() => {
 });
 
 function message(seq: number, text: string): TreeMessage {
-	return {
-		id: `m-${seq}`,
-		narratorId: "n1",
-		parentToolUseId: null,
-		role: "assistant",
-		contentJson: [{ type: "text", text }],
-		contentText: text,
-		toolCalls: [],
-		createdAt: "2026-07-23T00:00:00.000Z",
-		children: [],
-		seq,
-	} as TreeMessage;
+	return rowWithElements(
+		{
+			id: `m-${seq}`,
+			narratorId: "n1",
+			parentToolUseId: null,
+			role: "assistant",
+			contentText: text,
+			toolCalls: [],
+			createdAt: "2026-07-23T00:00:00.000Z",
+			seq,
+		},
+		[{ type: "text", text }],
+	) as TreeMessage;
 }
 
 function page(): PretextDocumentPageResult {
@@ -317,18 +319,19 @@ describe("PretextLayoutCoordinator", () => {
 	it("re-measures a compact marker whose body text changed at an UNCHANGED status", async () => {
 		const coordinator = new PretextLayoutCoordinator();
 		const failedMarker = (error: string): TreeMessage =>
-			({
-				id: "seg-compact-1",
-				narratorId: "n1",
-				parentToolUseId: null,
-				role: "user",
-				contentJson: [{ type: "segment_compact", status: "failed", error, messageCount: 4 }],
-				contentText: "[Segment compact failed]",
-				toolCalls: [],
-				createdAt: "2026-07-23T00:00:00.000Z",
-				children: [],
-				seq: 0,
-			}) as unknown as TreeMessage;
+			rowWithElements(
+				{
+					id: "seg-compact-1",
+					narratorId: "n1",
+					parentToolUseId: null,
+					role: "user",
+					contentText: "[Segment compact failed]",
+					toolCalls: [],
+					createdAt: "2026-07-23T00:00:00.000Z",
+					seq: 0,
+				},
+				[{ type: "segment_compact", status: "failed", error, messageCount: 4 }],
+			) as unknown as TreeMessage;
 		// A short one-line failure, then a long one that must wrap to more lines.
 		const short = "timeout";
 		const long = "压缩失败，模型返回了一段很长的错误说明。".repeat(12);
@@ -841,31 +844,30 @@ describe("PretextLayoutCoordinator", () => {
 
 /** An assistant message with one tool call, enriched exactly as the API does. */
 function toolMessage(seq: number, toolUseId: string, status: string): TreeMessage {
-	return {
-		id: `m-${seq}`,
-		narratorId: "n1",
-		parentToolUseId: null,
-		role: "assistant",
-		contentJson: [
-			{ type: "tool_use", id: toolUseId, name: "Bash", input: {}, status, inputJson: {} },
-		],
-		contentText: null,
-		toolCalls: [
-			{
-				id: `tc-${toolUseId}`,
-				narratorId: "n1",
-				messageId: `m-${seq}`,
-				toolUseId,
-				toolName: "Bash",
-				status,
-				inputJson: {},
-				createdAt: "2026-07-23T00:00:00.000Z",
-			},
-		],
-		createdAt: "2026-07-23T00:00:00.000Z",
-		children: [],
-		seq,
-	} as unknown as TreeMessage;
+	return rowWithElements(
+		{
+			id: `m-${seq}`,
+			narratorId: "n1",
+			parentToolUseId: null,
+			role: "assistant",
+			contentText: null,
+			toolCalls: [
+				{
+					id: `tc-${toolUseId}`,
+					narratorId: "n1",
+					messageId: `m-${seq}`,
+					toolUseId,
+					toolName: "Bash",
+					status,
+					inputJson: {},
+					createdAt: "2026-07-23T00:00:00.000Z",
+				},
+			],
+			createdAt: "2026-07-23T00:00:00.000Z",
+			seq,
+		},
+		[{ type: "tool_use", id: toolUseId, name: "Bash", input: {}, status, inputJson: {} }],
+	) as unknown as TreeMessage;
 }
 
 function toolPage(status: string): PretextDocumentPageResult {
@@ -880,7 +882,7 @@ function toolPage(status: string): PretextDocumentPageResult {
 }
 
 function loadedToolStatus(snapshot: { input?: { messages: TreeMessage[] } }): string | undefined {
-	const block = snapshot.input?.messages[0]?.contentJson?.find((b) => b.type === "tool_use");
+	const block = messageBody(snapshot.input?.messages[0])?.find((b) => b.type === "tool_use");
 	return (block as { status?: string } | undefined)?.status;
 }
 
@@ -897,12 +899,16 @@ describe("PretextLayoutCoordinator.applyLivePatch", () => {
 		expect(loadedToolStatus(coordinator.getSnapshot())).toBe("running");
 
 		const applied = coordinator.applyLivePatch((messages) => ({
-			messages: messages.map((msg) => ({
-				...msg,
-				contentJson: msg.contentJson.map((block) =>
-					block.type === "tool_use" ? { ...block, status: "success" } : block,
+			messages: messages.map((msg) =>
+				rowWithElements(
+					{
+						...msg,
+					},
+					messageBody(msg).map((block) =>
+						block.type === "tool_use" ? { ...block, status: "success" } : block,
+					),
 				),
-			})) as TreeMessage[],
+			) as TreeMessage[],
 			changed: true,
 		}));
 
@@ -960,14 +966,18 @@ describe("PretextLayoutCoordinator.applyLivePatch", () => {
 		);
 		const applied = coordinator.applyLivePatch(
 			(messages) => ({
-				messages: messages.map((msg) => ({
-					...msg,
-					contentJson: msg.contentJson.map((block) =>
-						block.type === "tool_use"
-							? { ...block, status: "success", outputJson: "line\nline\nline" }
-							: block,
+				messages: messages.map((msg) =>
+					rowWithElements(
+						{
+							...msg,
+						},
+						messageBody(msg).map((block) =>
+							block.type === "tool_use"
+								? { ...block, status: "success", outputJson: "line\nline\nline" }
+								: block,
+						),
 					),
-				})) as TreeMessage[],
+				) as TreeMessage[],
 				changed: true,
 			}),
 			() => ({ scrollTop: 0, pinnedToBottom: true, viewportHeight: 720 }),
@@ -1024,12 +1034,16 @@ describe("PretextLayoutCoordinator — scrollTopSmoothFollow stamping", () => {
 		await coordinator.load("n1", buildOptions, { fetchPage: async () => toolPage("running") });
 		coordinator.applyLivePatch(
 			(messages) => ({
-				messages: messages.map((msg) => ({
-					...msg,
-					contentJson: msg.contentJson.map((block) =>
-						block.type === "tool_use" ? { ...block, status: "success" } : block,
+				messages: messages.map((msg) =>
+					rowWithElements(
+						{
+							...msg,
+						},
+						messageBody(msg).map((block) =>
+							block.type === "tool_use" ? { ...block, status: "success" } : block,
+						),
 					),
-				})) as TreeMessage[],
+				) as TreeMessage[],
 				changed: true,
 			}),
 			pinnedView,
@@ -1201,7 +1215,7 @@ describe("transient preparation lifecycle", () => {
 		expect(owned.segments.size).toBe(2);
 		// An in-place edit keeps the message/array identity; a non-stream rebuild
 		// must invalidate rather than trusting reference equality.
-		(historical.contentJson as { text: string }[])[0].text = "edited historical text";
+		(messageBody(historical) as ReadonlyArray<{ text: string }>)[0].text = "edited historical text";
 		coordinator.rebuild(buildOptions);
 		expect(owned.segments.getMaterials(historical)).not.toBe(initial);
 		coordinator.reset();

@@ -22,6 +22,7 @@
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { MantineProvider } from "@mantine/core";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { parseHTML } from "linkedom";
 import { renderToStaticMarkup } from "react-dom/server";
@@ -82,12 +83,25 @@ function screenshotMessage(opts: {
 	metadata: Record<string, unknown>;
 }): NarratorMsg {
 	const outputJson = { _text: opts.text, _metadata: opts.metadata };
-	return {
-		id: `a-${opts.toolName}`,
-		narratorId: "n1",
-		parentToolUseId: null,
-		role: "assistant",
-		contentJson: [
+	return rowWithElements(
+		{
+			id: `a-${opts.toolName}`,
+			narratorId: "n1",
+			parentToolUseId: null,
+			role: "assistant",
+			contentText: null,
+			toolCalls: [
+				{
+					toolUseId: "tu-shot",
+					toolName: opts.toolName,
+					inputJson: opts.inputJson,
+					outputJson,
+					status: "completed",
+				},
+			],
+			createdAt: "2026-01-01T00:00:00Z",
+		},
+		[
 			{
 				type: "tool_use",
 				id: "tu-shot",
@@ -98,19 +112,7 @@ function screenshotMessage(opts: {
 				status: "completed",
 			},
 		],
-		contentText: null,
-		toolCalls: [
-			{
-				toolUseId: "tu-shot",
-				toolName: opts.toolName,
-				inputJson: opts.inputJson,
-				outputJson,
-				status: "completed",
-			},
-		],
-		createdAt: "2026-01-01T00:00:00Z",
-		children: [],
-	} as unknown as NarratorMsg;
+	) as unknown as NarratorMsg;
 }
 
 /** Drive the full chain and return the rendered DOM for the tool-call spec. */

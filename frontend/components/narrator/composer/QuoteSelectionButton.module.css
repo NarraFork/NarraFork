@@ -1,0 +1,140 @@
+.root {
+	position: fixed;
+	display: inline-flex;
+	align-items: center;
+	gap: 2px;
+	max-width: calc(100vw - 8px);
+	height: 30px;
+	padding: 2px;
+	box-sizing: border-box;
+	border: 1px solid var(--mantine-color-default-border);
+	border-radius: var(--mantine-radius-sm);
+	background: var(--mantine-color-body);
+	color: var(--mantine-color-text);
+	box-shadow: var(--mantine-shadow-md);
+	font-size: var(--mantine-font-size-xs);
+	line-height: 18px;
+	white-space: nowrap;
+	/* Never start a text selection or the iOS long-press callout on the toolbar itself. */
+	user-select: none;
+	-webkit-user-select: none;
+	-webkit-touch-callout: none;
+	touch-action: manipulation;
+}
+
+.root[data-mode="ask"] {
+	width: min(340px, calc(100vw - 8px));
+}
+
+/* Finger-sized targets on touch. */
+.root[data-placement="touch"] {
+	height: 38px;
+	font-size: var(--mantine-font-size-sm);
+}
+
+.action,
+.iconAction {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	flex-shrink: 0;
+	gap: 4px;
+	height: 100%;
+	padding: 0 6px;
+	border: 0;
+	border-radius: var(--mantine-radius-xs);
+	background: transparent;
+	font: inherit;
+	color: inherit;
+	cursor: pointer;
+}
+
+.iconAction {
+	width: 24px;
+	padding: 0;
+	color: var(--mantine-color-dimmed);
+}
+
+.root[data-placement="touch"] .action {
+	padding: 0 10px;
+}
+
+.root[data-placement="touch"] .iconAction {
+	width: 32px;
+}
+
+.action > svg {
+	flex-shrink: 0;
+	color: var(--mantine-primary-color-filled);
+}
+
+.action:hover,
+.action:focus-visible,
+.iconAction:hover,
+.iconAction:focus-visible {
+	background: var(--mantine-color-default-hover);
+	color: var(--mantine-color-text);
+}
+
+.action:disabled,
+.iconAction:disabled {
+	opacity: 0.6;
+	cursor: default;
+}
+
+.shortcut {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	flex-shrink: 0;
+	gap: 3px;
+	height: 18px;
+	box-sizing: border-box;
+	padding: 0 4px;
+	border: 1px solid var(--mantine-color-dimmed);
+	border-radius: var(--mantine-radius-xs);
+	background: var(--mantine-color-body);
+	color: var(--mantine-color-text);
+	font-family: var(--mantine-font-family-monospace);
+	font-size: 10px;
+	font-weight: 600;
+	line-height: 14px;
+}
+
+.askForm {
+	display: flex;
+	align-items: center;
+	flex: 1;
+	min-width: 0;
+	height: 100%;
+	gap: 4px;
+	padding-left: 6px;
+}
+
+.askIcon {
+	flex-shrink: 0;
+	color: var(--mantine-primary-color-filled);
+}
+
+.askInput {
+	flex: 1;
+	min-width: 0;
+	height: 100%;
+	padding: 0;
+	border: 0;
+	outline: none;
+	background: transparent;
+	color: inherit;
+	/* 16px keeps iOS Safari from zooming the page when the input takes focus. */
+	font-size: max(16px, 1em);
+	user-select: text;
+	-webkit-user-select: text;
+}
+
+.root:not([data-placement="touch"]) .askInput {
+	font-size: var(--mantine-font-size-sm);
+}
+
+.askInput::placeholder {
+	color: var(--mantine-color-placeholder);
+}

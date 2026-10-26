@@ -2,17 +2,16 @@ import { notifications } from "@mantine/notifications";
 import type React from "react";
 import { useCallback, useState } from "react";
 import { useRevertHistoryAction } from "../../../hooks/useNarrator";
-import type { RevertActionConfirmOptions } from "../../../lib/api/narrators";
+import type { BlockTarget, RevertActionConfirmOptions } from "../../../lib/api/narrators";
+import { blockTargetOf } from "../message/block-target";
 import type { MessageListHandle } from "../message/message-list-handle";
-
-interface RevertTarget {
-	messageId: string;
-	blockIndex: number;
-}
 
 export interface UseMessageRevertConfirmOptions {
 	narratorId: string;
-	/** Ref to the message list, used to refresh structure after a revert. */
+	/**
+	 * Ref to the message list: its rows name the block an action targets, and its
+	 * structure is refreshed after a revert.
+	 */
 	chunkListRef: React.RefObject<MessageListHandle | null>;
 	rollbackEditRegenerateSupported: boolean;
 	rollbackEditRegenerateUnsupportedReason: string | undefined;
@@ -21,12 +20,12 @@ export interface UseMessageRevertConfirmOptions {
 
 export interface UseMessageRevertConfirmResult {
 	revertHistorySubmitting: boolean;
-	pendingBlockDelete: RevertTarget | null;
-	setPendingBlockDelete: React.Dispatch<React.SetStateAction<RevertTarget | null>>;
+	pendingBlockDelete: BlockTarget | null;
+	setPendingBlockDelete: React.Dispatch<React.SetStateAction<BlockTarget | null>>;
 	handleDeleteBlock: (messageId: string, blockIndex: number) => void;
 	confirmBlockDelete: (opts: RevertActionConfirmOptions) => Promise<void>;
-	pendingRollback: RevertTarget | null;
-	setPendingRollback: React.Dispatch<React.SetStateAction<RevertTarget | null>>;
+	pendingRollback: BlockTarget | null;
+	setPendingRollback: React.Dispatch<React.SetStateAction<BlockTarget | null>>;
 	handleRollback: (messageId: string, blockIndex: number) => void;
 	confirmRollback: (opts: RevertActionConfirmOptions) => Promise<void>;
 }
@@ -58,13 +57,14 @@ export function useMessageRevertConfirm(
 
 	// Deleting a block rolls its file changes back, so it asks first rather than
 	// firing straight from the context menu.
-	const [pendingBlockDelete, setPendingBlockDelete] = useState<RevertTarget | null>(null);
+	const [pendingBlockDelete, setPendingBlockDelete] = useState<BlockTarget | null>(null);
 
 	const handleDeleteBlock = useCallback(
 		(messageId: string, blockIndex: number) => {
-			if (!revertHistorySubmitting) setPendingBlockDelete({ messageId, blockIndex });
+			if (!revertHistorySubmitting)
+				setPendingBlockDelete(blockTargetOf(chunkListRef.current, messageId, blockIndex));
 		},
-		[revertHistorySubmitting],
+		[revertHistorySubmitting, chunkListRef],
 	);
 
 	const confirmBlockDelete = useCallback(
@@ -83,7 +83,7 @@ export function useMessageRevertConfirm(
 		[applyHistoryAction, pendingBlockDelete, revertHistorySubmitting, chunkListRef],
 	);
 
-	const [pendingRollback, setPendingRollback] = useState<RevertTarget | null>(null);
+	const [pendingRollback, setPendingRollback] = useState<BlockTarget | null>(null);
 
 	const handleRollback = useCallback(
 		(messageId: string, blockIndex: number) => {
@@ -95,13 +95,15 @@ export function useMessageRevertConfirm(
 				});
 				return;
 			}
-			if (!revertHistorySubmitting) setPendingRollback({ messageId, blockIndex });
+			if (!revertHistorySubmitting)
+				setPendingRollback(blockTargetOf(chunkListRef.current, messageId, blockIndex));
 		},
 		[
 			rollbackEditRegenerateSupported,
 			rollbackEditRegenerateUnsupportedReason,
 			revertHistorySubmitting,
 			t,
+			chunkListRef,
 		],
 	);
 

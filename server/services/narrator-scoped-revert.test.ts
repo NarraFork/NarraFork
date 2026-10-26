@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
+import { blockIdAt } from "../../tests/block-ids";
 import { testEnvironment } from "../../tests/preload";
 import { app } from "../app";
 import { db } from "../db";
@@ -307,7 +308,7 @@ describe("HTTP edit confirmation keeps primary/subagent semantics", () => {
 					.run();
 				const target = userMessage();
 				const call = await write("http-edit.txt");
-				const token = await createToken(userId, "user");
+				const token = await createToken(userId);
 				const headers = { Authorization: `Bearer ${token}` };
 				const previewResponse = await app.request(
 					`/api/narrators/${narratorId}/revert-action-preview`,
@@ -598,7 +599,7 @@ describe("narrator-scoped per-file recovery consumers", () => {
 		const { app } = await import("../app");
 		const { createToken } = await import("../lib/auth");
 		const headers = {
-			authorization: `Bearer ${await createToken(userId, "user")}`,
+			authorization: `Bearer ${await createToken(userId)}`,
 			"content-type": "application/json",
 		};
 		const call = await write("http-revert.txt");
@@ -666,16 +667,14 @@ describe("narrator-scoped per-file recovery consumers", () => {
 				},
 			],
 		};
-		spyOn(narratorService, "deleteMessageBlocks").mockRejectedValue(
-			new SnapshotRevertError(result),
-		);
-		const response = await app.request(`/api/narrators/${narratorId}/messages/batch-blocks`, {
+		spyOn(narratorService, "deleteBlocks").mockRejectedValue(new SnapshotRevertError(result));
+		const response = await app.request(`/api/narrators/${narratorId}/blocks`, {
 			method: "DELETE",
 			headers: {
-				authorization: `Bearer ${await createToken(userId, "user")}`,
+				authorization: `Bearer ${await createToken(userId)}`,
 				"content-type": "application/json",
 			},
-			body: JSON.stringify({ blocks: [{ messageId, blockIndex: 0 }], skipRevert: true }),
+			body: JSON.stringify({ blockIds: [await blockIdAt(messageId, 0)], skipRevert: true }),
 		});
 		expect(response.status).toBe(409);
 		expect(await response.json()).toMatchObject({ code: "SNAPSHOT_REVERT_FAILED", ...result });

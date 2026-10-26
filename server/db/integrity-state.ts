@@ -131,11 +131,14 @@ export function readPendingDatabaseRepair(): PendingDatabaseRepair | null {
  * here used to abort the caller before it could log the corruption it had just confirmed.
  */
 export function writePendingDatabaseRepair(input: PendingDatabaseRepairInput): MarkerWriteResult {
-	const path = statePath();
+	return writeMarker(statePath(), normalize(input));
+}
+
+function writeMarker(path: string, value: unknown): MarkerWriteResult {
 	const tempPath = `${path}.tmp.${process.pid}.${Date.now()}`;
 	try {
 		mkdirSync(dirname(path), { recursive: true });
-		writeFileSync(tempPath, `${JSON.stringify(normalize(input), null, 2)}\n`, "utf8");
+		writeFileSync(tempPath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
 		renameSync(tempPath, path);
 		return { ok: true };
 	} catch (err) {
@@ -148,14 +151,17 @@ export function writePendingDatabaseRepair(input: PendingDatabaseRepairInput): M
 	}
 }
 
-export function clearPendingDatabaseRepair(): void {
-	const path = statePath();
+function removeMarker(path: string): void {
 	if (!existsSync(path)) return;
 	try {
 		unlinkSync(path);
 	} catch {
-		// Best effort: a stale marker only costs one extra repair attempt on the next boot.
+		// Best effort: a stale marker only costs one extra repair on the next boot.
 	}
+}
+
+export function clearPendingDatabaseRepair(): void {
+	removeMarker(statePath());
 }
 
 /** Startup may only run the blocking recovery while the finding is pending and budget remains. */
@@ -238,4 +244,52 @@ export function recordCorruptionFinding(
 	});
 	if (!write.ok) return { action: "failed", state: "pending", error: write.error };
 	return { action: "recorded", state: "pending" };
+}
+
+/**
+ * Search indexes a background check found corrupt, rebuilt on the next startup.
+ *
+ * Apart from the database marker on purpose: an index is rebuilt from the rows it indexes (the
+ * block index is emptied and refilled by a background job), which needs no recovery budget,
+ * while a database finding runs `recoverWithCli` over the whole file.
+ */
+export interface PendingFtsRepair {
+	tables: string[];
+	details: string;
+	detectedAt: string;
+}
+
+function ftsRepairPath(): string {
+	return getNarraforkPath("fts-repair.json");
+}
+
+/** The indexes owed a rebuild, or null. An unreadable marker counts as none. */
+export function readPendingFtsRepair(): PendingFtsRepair | null {
+	const path = ftsRepairPath();
+	if (!existsSync(path)) return null;
+	try {
+		const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<PendingFtsRepair>;
+		const tables = Array.isArray(parsed?.tables)
+			? parsed.tables.filter((table): table is string => typeof table === "string")
+			: [];
+		if (tables.length === 0) return null;
+		return {
+			tables,
+			details: String(parsed.details ?? ""),
+			detectedAt: String(parsed.detectedAt ?? ""),
+		};
+	} catch {
+		return null;
+	}
+}
+
+/** Queue indexes for a rebuild, adding to any already queued. */
+export function recordFtsRepair(repair: PendingFtsRepair): MarkerWriteResult {
+	const queued = readPendingFtsRepair();
+	const tables = [...new Set([...(queued?.tables ?? []), ...repair.tables])];
+	return writeMarker(ftsRepairPath(), { ...repair, tables });
+}
+
+export function clearPendingFtsRepair(): void {
+	removeMarker(ftsRepairPath());
 }

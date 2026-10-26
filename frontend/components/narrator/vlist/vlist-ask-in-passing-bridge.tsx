@@ -4,9 +4,11 @@
  * Rows own neither drafts nor requests: the controller survives virtual row
  * unmounts, while RenderAskInPassing remains the fixed-geometry renderer.
  */
+
 import { useAskInPassing, useCancelAskInPassing } from "@frontend/hooks/useNarrator";
 import { subscribeAskInPassingEvents } from "@frontend/lib/ask-in-passing-events";
 import { notifications } from "@mantine/notifications";
+import type { MessageBodySource } from "@shared/narrator-blocks/message-blocks";
 import { useCallback, useEffect, useMemo, useRef, useSyncExternalStore } from "react";
 import { useOpenAskInPassingNarrator } from "../question/AskInPassingCard";
 import type { AskInPassingPendingInteraction } from "./render/RenderAskInPassing";
@@ -17,9 +19,8 @@ import {
 } from "./vlist-ask-in-passing-target";
 import type { VListItem } from "./vlist-pipeline";
 
-export interface AskInPassingSourceMessage {
+export interface AskInPassingSourceMessage extends MessageBodySource {
 	id?: unknown;
-	contentJson?: unknown;
 }
 
 export interface UseVListAskInPassingArgs {

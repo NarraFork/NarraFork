@@ -159,6 +159,7 @@ import {
 	normalizeDangerReflectionLevel,
 	normalizeDangerReflectionOverride,
 } from "./interaction/reflection-types";
+import { useAskSelectionInPassing } from "./interaction/use-ask-selection-in-passing";
 import { useComposerAttachments } from "./interaction/use-composer-attachments";
 import { useComposerFileIngest } from "./interaction/use-composer-file-ingest";
 import { useInternalFileViewer } from "./interaction/use-internal-file-viewer";
@@ -171,6 +172,7 @@ import { capabilityModelReference, useResolvedModel } from "./interaction/use-re
 import { LodSwitchToast } from "./lod/LodSwitchToast";
 import { type RenderLod, RenderLodCtx } from "./lod/RenderLodCtx";
 import { MobileToolPanelHost, type MobileToolPanelKind } from "./MobileToolPanelHost";
+import { inputBlockIdOf } from "./message/block-target";
 import { EditingMessageCtx, type EditingMessageState } from "./message/EditingMessageCtx";
 import { BLOCK_ID_ATTR, MessageSelectionCtx } from "./message/MessageSelectionCtx";
 import type { MessageListHandle, MessageListTailMeta } from "./message/message-list-handle";
@@ -797,6 +799,7 @@ function NarratorPanelBody({
 				const result = await api.editAndRegenerate(narratorId, messageId, newContent, {
 					...revertOpts,
 					...opts,
+					inputBlockId: inputBlockIdOf(chunkListRef.current, messageId),
 				});
 				if (!result.ok || (result.revertResult && !isRevertHistoryCommitted(result.revertResult))) {
 					throw new ApiError(t("editFailed"), 409, { ...result });
@@ -840,6 +843,9 @@ function NarratorPanelBody({
 		async (messageId: string, newContent: string) => {
 			try {
 				await api.editAssistantMessage(narratorId, messageId, newContent);
+				// The `message_updated` broadcast can be deferred (reader not at the
+				// bottom) or declined as a non-prefix change, so force a refetch.
+				chunkListRef.current?.refreshStructure("full");
 			} catch (err) {
 				const message = err instanceof Error ? err.message : "Failed to edit message";
 				notifications.show({ title: t("editFailed"), message, color: "red" });
@@ -852,6 +858,7 @@ function NarratorPanelBody({
 		async (messageId: string) => {
 			try {
 				await api.restoreAssistantMessage(narratorId, messageId);
+				chunkListRef.current?.refreshStructure("full");
 			} catch (err) {
 				const message = err instanceof Error ? err.message : "Failed to restore message";
 				notifications.show({ title: t("editFailed"), message, color: "red" });
@@ -1831,6 +1838,7 @@ function NarratorPanelBody({
 		navigateToNarrator: (id: string) =>
 			navigate({ to: "/narrators/$narratorId", params: { narratorId: id } }),
 	});
+	const askSelectionInPassing = useAskSelectionInPassing(narratorId);
 
 	// Slash-command handlers for /fork and /compact, mirroring the manual
 	// controls exactly: fork from the latest real message (its right-click fork
@@ -3670,6 +3678,7 @@ function NarratorPanelBody({
 							reflectionSettingsDisabled,
 						}}
 						composerRowProps={{
+							onAskSelection: askSelectionInPassing,
 							fileInputRef,
 							composerRef,
 							sendingRef,

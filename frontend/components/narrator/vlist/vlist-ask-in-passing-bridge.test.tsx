@@ -1,6 +1,7 @@
 import { afterEach, beforeAll, describe, expect, it, mock } from "bun:test";
 import type { TreeMessage } from "@frontend/lib/api/types";
 import { publishAskInPassingEvent } from "@frontend/lib/ask-in-passing-events";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { parseHTML } from "linkedom";
 import { act, StrictMode, useEffect } from "react";
 import { createRoot, type Root } from "react-dom/client";
@@ -115,17 +116,19 @@ if (process.env.NF_AIP_BRIDGE_TEST_CHILD !== "1") {
 		cancel.mockClear();
 		focusCount = 0;
 	});
-	const eventMessage = (): TreeMessage => ({
-		id: "m",
-		narratorId: "n1",
-		parentToolUseId: null,
-		role: "system",
-		contentJson: [],
-		contentText: null,
-		toolCalls: [],
-		createdAt: "2026-01-01",
-		children: [],
-	});
+	const eventMessage = (): TreeMessage =>
+		rowWithElements(
+			{
+				id: "m",
+				narratorId: "n1",
+				parentToolUseId: null,
+				role: "system",
+				contentText: null,
+				toolCalls: [],
+				createdAt: "2026-01-01",
+			},
+			[],
+		);
 	describe("list-owned ask-in-passing bridge", () => {
 		it("real start events request focus once across duplicate acknowledgements and StrictMode", async () => {
 			const args = initial();
@@ -253,12 +256,12 @@ if (process.env.NF_AIP_BRIDGE_TEST_CHILD !== "1") {
 				...args,
 				renderItems: [],
 				messages: [
-					{
-						id: "m",
-						contentJson: [
-							{ type: "ask_in_passing", status: "resolved", targetNarratorId: "answer" },
-						],
-					},
+					rowWithElements(
+						{
+							id: "m",
+						},
+						[{ type: "ask_in_passing", status: "resolved", targetNarratorId: "answer" }],
+					),
 				],
 			});
 			await act(async () => finish({ id: "answer" }));

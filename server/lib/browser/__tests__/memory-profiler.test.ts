@@ -752,7 +752,11 @@ describe("memory profile supervisor", () => {
 		});
 	});
 	test("valid terminal reply after worker cleanup is not discarded at the worker work deadline", async () => {
-		const f = await fixture({ stopMs: 30, workerCleanupMs: 100, replyGraceMs: 40 });
+		// The reply lands after the 30ms work deadline (the 70ms sleep) and must still be accepted
+		// inside the cleanup allowance. Keep that allowance wide: on a loaded CI runner the sleep
+		// plus the fixture's file writes overran a 100+40ms window and the supervisor had already
+		// cleaned the directory up.
+		const f = await fixture({ stopMs: 30, workerCleanupMs: 1_000, replyGraceMs: 400 });
 		try {
 			const started = await f.api.startMemoryProfile(f.session);
 			const stopping = stopMemoryProfile(f.session, required(started.profileId));

@@ -1,7 +1,6 @@
 import { afterAll, describe, expect, test } from "bun:test";
 import { Hono } from "hono";
 import { AppError } from "../lib/errors";
-import { invalidateUserCache } from "../middleware/auth";
 import type { AuthSessionStore } from "../services/auth/session-store";
 import { authMfaStore, authSessionStore, setAuthStores } from "../services/auth/store";
 import { storageRoutes } from "./storage";
@@ -27,8 +26,6 @@ setAuthStores({ session: sessionStoreSeam, mfa: authMfaStore });
 
 afterAll(() => {
 	setAuthStores(undefined);
-	invalidateUserCache(ADMIN_ACTOR_ID);
-	invalidateUserCache(NON_ADMIN_ACTOR_ID);
 });
 
 const app = new Hono();

@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import type { ComposerDocument } from "@shared/composer-document";
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import { ApiError } from "./client";
 import { api } from "./index";
 import {
@@ -35,18 +36,23 @@ describe("narrators API", () => {
 			configurable: true,
 			value: async (url: unknown, init: RequestInit) => {
 				requests.push({ url: String(url), init });
-				return Response.json({ ok: true });
+				return Response.json({ ok: true, deleted: 1, failed: 0, results: [] });
 			},
 		});
 		await api.deleteMessage("n", "m");
-		await api.deleteMessageBlock("n", "m", 2);
-		await api.deleteMessageBlocks("n", [{ messageId: "m", blockIndex: 0 }]);
+		await api.deleteMessageBlock("n", { messageId: "m", blockIndex: 2, blockId: "b2" });
+		await api.deleteMessageBlocks("n", [{ messageId: "m", blockIndex: 0, blockId: "b0" }]);
 		expect(requests[0].url).toEndWith("/narrators/n/messages/m?skipRevert=1");
-		expect(requests[1].url).toEndWith("/narrators/n/messages/m/blocks/2?skipRevert=1");
-		expect(JSON.parse(String(requests[2].init.body))).toEqual({
-			blocks: [{ messageId: "m", blockIndex: 0 }],
-			skipRevert: true,
-		});
+		for (const [index, blockId] of [
+			[1, "b2"],
+			[2, "b0"],
+		] as const) {
+			expect(requests[index].url).toEndWith("/narrators/n/blocks");
+			expect(JSON.parse(String(requests[index].init.body))).toEqual({
+				blockIds: [blockId],
+				skipRevert: true,
+			});
+		}
 	});
 
 	test.each([
@@ -300,7 +306,12 @@ describe("narrators API", () => {
 				return Response.json({});
 			},
 		});
-		const target = { messageId: "m", blockIndex: 2, action: "rollback_to_block" as const };
+		const target = {
+			messageId: "m",
+			blockIndex: 2,
+			blockId: "b2",
+			action: "rollback_to_block" as const,
+		};
 		await api.previewRevertAction("n", { ...target, idempotencyKey: "selective-key" });
 		await api.previewRevertAction("n", {
 			...target,
@@ -310,9 +321,10 @@ describe("narrators API", () => {
 		const plan = { planId: "p", planHash: "h", action: target.action };
 		await api.applyRevertPlan("n", plan);
 		await api.applyRevertPlan("n", { ...plan, acceptSnapshotRestore: true });
-		expect(calls[0]?.body).toEqual({ ...target, idempotencyKey: "selective-key" });
+		const planned = { action: target.action, blockIds: [target.blockId] };
+		expect(calls[0]?.body).toEqual({ ...planned, idempotencyKey: "selective-key" });
 		expect(calls[1]?.body).toEqual({
-			...target,
+			...planned,
 			idempotencyKey: "snapshot-key",
 			recoveryMode: "snapshot",
 		});
@@ -395,9 +407,15 @@ describe("narrators API", () => {
 		});
 		Object.defineProperty(g, "fetch", {
 			value: async () =>
-				new Response(JSON.stringify({ messages: [{ text: "x".repeat(100) }] }), {
-					headers: { "content-type": "application/json" },
-				}),
+				new Response(
+					JSON.stringify({
+						protocol: 2,
+						messages: [],
+						blocks: [],
+						padding: "x".repeat(100),
+					}),
+					{ headers: { "content-type": "application/json" } },
+				),
 			configurable: true,
 		});
 		await expect(api.getPretextDocumentPage("n", { maxResponseBytes: 32 })).rejects.toThrow(
@@ -442,31 +460,65 @@ describe("narrators API", () => {
 		expect((await api.getPretextDocumentPage("n", { maxResponseBytes: 32 })).messages).toEqual([]);
 	});
 
-	test("ask acknowledgements retain legacy fields and expose canonical messages", async () => {
+	test("ask acknowledgements keep their fields and decode the message's blocks", async () => {
 		Object.defineProperty(g, "localStorage", {
 			value: { getItem: () => null },
 			configurable: true,
 		});
-		const message = {
-			id: "ask",
-			seq: 3,
-			contentJson: [{ type: "ask_in_passing", status: "pending" }],
+		const element = { type: "ask_in_passing", status: "pending" };
+		const encoded = {
+			messages: [
+				{
+					id: "ask",
+					seq: 3,
+					role: "assistant",
+					askInsertVersion: 7,
+					blockIds: ["ask:0"],
+					parentMessageId: null,
+				},
+			],
+			blocks: [
+				{
+					id: "ask:0",
+					messageId: "ask",
+					ordinal: 0,
+					kind: "context",
+					subtype: null,
+					phase: "done",
+					revision: 0,
+					wireId: null,
+					attemptId: null,
+					elements: [element],
+					hasOriginal: false,
+				},
+			],
 		};
 		Object.defineProperty(g, "fetch", {
-			value: async () => Response.json({ messageId: "ask", message }),
+			value: async () => Response.json({ messageId: "ask", message: encoded }),
 			configurable: true,
 		});
 		const started = await api.startAskInPassing("n", { sourceMessageId: "source" });
 		expect(started.messageId).toBe("ask");
-		expect(started.message?.id).toBe(message.id);
-		expect(started.message?.seq).toBe(message.seq);
+		expect(started.message?.id).toBe("ask");
+		expect(started.message?.seq).toBe(3);
+		expect(started.message?.askInsertVersion).toBe(7);
+		expect(started.message ? messageBody(started.message) : []).toEqual([element]);
+		expect(started.message?.blocks?.[0]).toMatchObject({ id: "ask:0", named: true });
 		Object.defineProperty(g, "fetch", {
-			value: async () => Response.json({ id: "target", message }),
+			value: async () => Response.json({ id: "target", message: encoded }),
 			configurable: true,
 		});
 		const resolved = await api.askInPassing("n", { question: "why", pendingMessageId: "ask" });
 		expect(resolved.id).toBe("target");
-		expect(resolved.message).toEqual(message);
+		expect(resolved.message?.id).toBe("ask");
+		expect(resolved.message ? messageBody(resolved.message) : []).toEqual([element]);
+		Object.defineProperty(g, "fetch", {
+			value: async () => Response.json({ messageId: "ask" }),
+			configurable: true,
+		});
+		expect((await api.startAskInPassing("n", { sourceMessageId: "source" })).message).toBe(
+			undefined,
+		);
 	});
 
 	test("detaches Bash with an encoded tool endpoint and no request body", async () => {

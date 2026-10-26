@@ -7,7 +7,8 @@
  * filesystem. What must not follow is an escalation from "logged-in reader" to
  * "platform operator", which is exactly what serving three specific files does:
  *
- *   - `settings.json` holds `auth.jwtSecret`, so its bytes forge any user's session;
+ *   - `settings.json` holds `auth.jwtSecret`, whose bytes forge MFA challenges and
+ *     internal signatures;
  *   - `narrafork.db` (and its WAL) holds every password hash and OAuth grant;
  *   - `~/.ssh` holds keys that are not even NarraFork's to leak.
  *

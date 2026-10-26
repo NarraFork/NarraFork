@@ -5,7 +5,7 @@ import { eq } from "drizzle-orm";
 import { testEnvironment } from "../../tests/preload";
 import { db } from "../db";
 import { narrators, users } from "../db/schema";
-import { revokeUserSessions } from "../lib/auth";
+import { createToken, revokeUserSessions, verifyToken } from "../lib/auth";
 import { generateId } from "../lib/id";
 import { editorActorForSubject } from "../routes/editor-documents";
 import { getEditorDocumentService } from "../services/editor-document-runtime";
@@ -51,12 +51,13 @@ test.each([
 	const service = getEditorDocumentService(),
 		frames: Record<string, unknown>[] = [];
 	let buffered = 0;
+	const session = await verifyToken(await createToken(userId));
 	const ws = {
 		data: {
 			userId,
 			lastPongAt: Date.now(),
+			sessionId: session.sid,
 			sessionExp: Date.now() / 1000 + 60,
-			sessionTokenVersion: 0,
 		},
 		send: (frame: string) => {
 			frames.push(JSON.parse(frame));
@@ -70,7 +71,13 @@ test.each([
 			narratorId,
 			auth: {
 				type: "session",
-				user: { sub: userId, role: "user", iat: Date.now() / 1000, exp: ws.data.sessionExp, sv: 0 },
+				user: {
+					sub: userId,
+					role: "user",
+					iat: Date.now() / 1000,
+					exp: ws.data.sessionExp,
+					tokenVersion: 0,
+				},
 			},
 		});
 		const doc = await service.create(actor, {

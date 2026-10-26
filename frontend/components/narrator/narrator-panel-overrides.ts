@@ -17,8 +17,9 @@
  */
 
 import { DEFAULT_CONTEXT_THRESHOLDS } from "@shared/context-thresholds";
+import { type MessageWithBody, messageBody } from "@shared/narrator-blocks/message-blocks";
 import type { AsyncQuestion } from "../../types/narrator";
-import type { ContentBlock, NarratorMsg } from "./narrator-panel-types";
+import type { ContentBlock } from "./narrator-panel-types";
 import { PERM_MODES } from "./narrator-panel-types";
 import type { PaymentRequiredInfo } from "./useNarratorPanelWS";
 
@@ -127,9 +128,9 @@ export const EMPTY_ASYNC_QUESTIONS: AsyncQuestion[] = [];
 export type CompactingMarkerKind = "context" | "segment";
 
 export function _getCompactingMarkerKind(
-	message: Pick<NarratorMsg, "contentJson">,
+	message: MessageWithBody<ContentBlock>,
 ): CompactingMarkerKind | null {
-	const blocks = Array.isArray(message.contentJson) ? message.contentJson : [];
+	const blocks = messageBody(message);
 	const block = blocks.find(
 		(block: ContentBlock) =>
 			(block.type === "compact" || block.type === "segment_compact") &&

@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { messageBody, rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import type { NarratorMsg, PendingPermission } from "../narrator-panel-types";
 import {
 	buildReflectionSourceIndex,
@@ -25,18 +26,21 @@ function toolBlock(overrides: ToolBlockOverrides) {
 	return { type: "tool_use", name: "Bash", ...overrides };
 }
 
+/** A row; a body in `overrides` is split again as this row's, as the server would. */
 function msg(overrides: Partial<NarratorMsg> & { id: string }): NarratorMsg {
-	return {
-		role: "assistant",
-		contentJson: [],
-		contentText: null,
-		toolCalls: [],
-		children: [],
-		narratorId: "n1",
-		parentToolUseId: null,
-		createdAt: "2026-01-01T00:00:00.000Z",
-		...overrides,
-	} as unknown as NarratorMsg;
+	const { blocks, ...rest } = overrides;
+	return rowWithElements(
+		{
+			role: "assistant",
+			contentText: null,
+			toolCalls: [],
+			narratorId: "n1",
+			parentToolUseId: null,
+			createdAt: "2026-01-01T00:00:00.000Z",
+			...rest,
+		},
+		messageBody({ blocks }),
+	) as unknown as NarratorMsg;
 }
 
 function suggestion(type: string, status: string, extra: Record<string, unknown> = {}) {
@@ -57,18 +61,22 @@ const perm = (overrides: Partial<PendingPermission> = {}): PendingPermission => 
 describe("buildReflectionSourceIndex", () => {
 	it("indexes a reflection carried on an enriched tool_use block", () => {
 		const index = buildReflectionSourceIndex([
-			msg({
-				id: "m1",
-				contentJson: [
-					toolBlock({
-						id: "tu-1",
-						tcId: "tc-1",
-						status: "success",
-						permissionDecisionReason: "approved by gate",
-						permissionSuggestions: [suggestion("danger_reflection", "confirmed")],
-					}),
-				],
-			}) as NarratorMsg,
+			msg(
+				rowWithElements(
+					{
+						id: "m1",
+					},
+					[
+						toolBlock({
+							id: "tu-1",
+							tcId: "tc-1",
+							status: "success",
+							permissionDecisionReason: "approved by gate",
+							permissionSuggestions: [suggestion("danger_reflection", "confirmed")],
+						}),
+					],
+				),
+			) as NarratorMsg,
 		]);
 		expect(index.size).toBe(1);
 		const source = index.get("tu-1");
@@ -81,20 +89,24 @@ describe("buildReflectionSourceIndex", () => {
 
 	it("falls back to the toolCalls row for a non-enriched block", () => {
 		const index = buildReflectionSourceIndex([
-			msg({
-				id: "m1",
-				contentJson: [toolBlock({ id: "tu-1" })],
-				toolCalls: [
+			msg(
+				rowWithElements(
 					{
-						id: "tc-1",
-						toolUseId: "tu-1",
-						toolName: "Write",
-						status: "fail",
-						errorMessage: "boom",
-						permissionSuggestions: [suggestion("plan_reflection", "running")],
+						id: "m1",
+						toolCalls: [
+							{
+								id: "tc-1",
+								toolUseId: "tu-1",
+								toolName: "Write",
+								status: "fail",
+								errorMessage: "boom",
+								permissionSuggestions: [suggestion("plan_reflection", "running")],
+							},
+						],
 					},
-				],
-			}) as NarratorMsg,
+					[toolBlock({ id: "tu-1" })],
+				),
+			) as NarratorMsg,
 		]);
 		const source = index.get("tu-1");
 		expect(source?.toolCallId).toBe("tc-1");
@@ -105,86 +117,104 @@ describe("buildReflectionSourceIndex", () => {
 
 	it("indexes a reflection row that has no matching content block", () => {
 		const index = buildReflectionSourceIndex([
-			msg({
-				id: "m1",
-				contentJson: [],
-				toolCalls: [
+			msg(
+				rowWithElements(
 					{
-						id: "tc-9",
-						toolUseId: "tu-9",
-						toolName: "ExitPlanMode",
-						status: "pending",
-						permissionSuggestions: [suggestion("plan_reflection", "awaiting_user")],
+						id: "m1",
+						toolCalls: [
+							{
+								id: "tc-9",
+								toolUseId: "tu-9",
+								toolName: "ExitPlanMode",
+								status: "pending",
+								permissionSuggestions: [suggestion("plan_reflection", "awaiting_user")],
+							},
+						],
 					},
-				],
-			}) as NarratorMsg,
+					[],
+				),
+			) as NarratorMsg,
 		]);
 		expect(index.get("tu-9")?.toolName).toBe("ExitPlanMode");
 	});
 
 	it("omits tool calls that carry no reflection suggestion", () => {
 		const index = buildReflectionSourceIndex([
-			msg({
-				id: "m1",
-				contentJson: [
-					toolBlock({ id: "tu-1", status: "success" }),
-					toolBlock({
-						id: "tu-2",
-						status: "pending",
-						// A plain permission suggestion is not a reflection.
-						permissionSuggestions: [{ type: "permission", status: "awaiting_user" }],
-					}),
-				],
-			}) as NarratorMsg,
+			msg(
+				rowWithElements(
+					{
+						id: "m1",
+					},
+					[
+						toolBlock({ id: "tu-1", status: "success" }),
+						toolBlock({
+							id: "tu-2",
+							status: "pending",
+							// A plain permission suggestion is not a reflection.
+							permissionSuggestions: [{ type: "permission", status: "awaiting_user" }],
+						}),
+					],
+				),
+			) as NarratorMsg,
 		]);
 		expect(index.size).toBe(0);
 	});
 
-	it("walks child messages (subagent tool calls)", () => {
+	it("reads nested rows (subagent tool calls)", () => {
 		const index = buildReflectionSourceIndex([
-			msg({
-				id: "m1",
-				contentJson: [toolBlock({ id: "tu-parent", name: "Agent" })],
-				children: [
-					msg({
+			msg(
+				rowWithElements({ id: "m1" }, [toolBlock({ id: "tu-parent", name: "Agent" })]),
+			) as NarratorMsg,
+			msg(
+				rowWithElements(
+					{
 						id: "m1c",
 						parentToolUseId: "tu-parent",
-						contentJson: [
-							toolBlock({
-								id: "tu-child",
-								status: "success",
-								permissionSuggestions: [suggestion("task_reflection", "confirmed")],
-							}),
-						],
-					}) as NarratorMsg,
-				],
-			}) as NarratorMsg,
+						parentMessageId: "m1",
+					},
+					[
+						toolBlock({
+							id: "tu-child",
+							status: "success",
+							permissionSuggestions: [suggestion("task_reflection", "confirmed")],
+						}),
+					],
+				),
+			) as NarratorMsg,
 		]);
 		expect(index.get("tu-child")?.suggestions).toHaveLength(1);
 	});
 
 	it("keeps the newest occurrence of a reused tool use id", () => {
 		const index = buildReflectionSourceIndex([
-			msg({
-				id: "m1",
-				contentJson: [
-					toolBlock({
-						id: "tu-dup",
-						tcId: "tc-old",
-						permissionSuggestions: [suggestion("danger_reflection", "cancelled")],
-					}),
-				],
-			}) as NarratorMsg,
-			msg({
-				id: "m2",
-				contentJson: [
-					toolBlock({
-						id: "tu-dup",
-						tcId: "tc-new",
-						permissionSuggestions: [suggestion("danger_reflection", "confirmed")],
-					}),
-				],
-			}) as NarratorMsg,
+			msg(
+				rowWithElements(
+					{
+						id: "m1",
+					},
+					[
+						toolBlock({
+							id: "tu-dup",
+							tcId: "tc-old",
+							permissionSuggestions: [suggestion("danger_reflection", "cancelled")],
+						}),
+					],
+				),
+			) as NarratorMsg,
+			msg(
+				rowWithElements(
+					{
+						id: "m2",
+					},
+					[
+						toolBlock({
+							id: "tu-dup",
+							tcId: "tc-new",
+							permissionSuggestions: [suggestion("danger_reflection", "confirmed")],
+						}),
+					],
+				),
+			) as NarratorMsg,
 		]);
 		expect(index.get("tu-dup")?.toolCallId).toBe("tc-new");
 		expect(resolveRowReflection(index.get("tu-dup"), null)?.status).toBe("confirmed");
@@ -192,47 +222,51 @@ describe("buildReflectionSourceIndex", () => {
 
 	it("a newer reflection-less occurrence clears the older entry", () => {
 		const index = buildReflectionSourceIndex([
-			msg({
-				id: "m1",
-				contentJson: [
-					toolBlock({
-						id: "tu-dup",
-						permissionSuggestions: [suggestion("danger_reflection", "confirmed")],
-					}),
-				],
-			}) as NarratorMsg,
-			msg({
-				id: "m2",
-				contentJson: [toolBlock({ id: "tu-dup", status: "success" })],
-			}) as NarratorMsg,
+			msg(
+				rowWithElements(
+					{
+						id: "m1",
+					},
+					[
+						toolBlock({
+							id: "tu-dup",
+							permissionSuggestions: [suggestion("danger_reflection", "confirmed")],
+						}),
+					],
+				),
+			) as NarratorMsg,
+			msg(
+				rowWithElements(
+					{
+						id: "m2",
+					},
+					[toolBlock({ id: "tu-dup", status: "success" })],
+				),
+			) as NarratorMsg,
 		]);
 		expect(index.has("tu-dup")).toBe(false);
 	});
 
-	it("child occurrences override their parent message rows", () => {
+	it("nested occurrences override their parent message rows", () => {
 		const index = buildReflectionSourceIndex([
-			msg({
-				id: "m1",
-				contentJson: [
+			msg(
+				rowWithElements({ id: "m1" }, [
 					toolBlock({
 						id: "tu-1",
 						tcId: "tc-parent",
 						permissionSuggestions: [suggestion("danger_reflection", "running")],
 					}),
-				],
-				children: [
-					msg({
-						id: "m1c",
-						contentJson: [
-							toolBlock({
-								id: "tu-1",
-								tcId: "tc-child",
-								permissionSuggestions: [suggestion("danger_reflection", "confirmed")],
-							}),
-						],
-					}) as NarratorMsg,
-				],
-			}) as NarratorMsg,
+				]),
+			) as NarratorMsg,
+			msg(
+				rowWithElements({ id: "m1c", parentMessageId: "m1" }, [
+					toolBlock({
+						id: "tu-1",
+						tcId: "tc-child",
+						permissionSuggestions: [suggestion("danger_reflection", "confirmed")],
+					}),
+				]),
+			) as NarratorMsg,
 		]);
 		expect(index.get("tu-1")?.toolCallId).toBe("tc-child");
 	});
@@ -240,24 +274,24 @@ describe("buildReflectionSourceIndex", () => {
 	it("tolerates empty / malformed input", () => {
 		expect(buildReflectionSourceIndex([]).size).toBe(0);
 		expect(buildReflectionSourceIndex(undefined as unknown as NarratorMsg[]).size).toBe(0);
-		expect(
-			buildReflectionSourceIndex([
-				msg({ id: "m1", contentJson: null as unknown as [] }) as NarratorMsg,
-			]).size,
-		).toBe(0);
+		expect(buildReflectionSourceIndex([msg({ id: "m1", blocks: null as never })]).size).toBe(0);
 		// A tool_use block without an id cannot be keyed.
 		expect(
 			buildReflectionSourceIndex([
-				msg({
-					id: "m1",
-					contentJson: [
+				msg(
+					rowWithElements(
 						{
-							type: "tool_use",
-							name: "Bash",
-							permissionSuggestions: [suggestion("danger_reflection", "confirmed")],
+							id: "m1",
 						},
-					] as unknown as [],
-				}) as NarratorMsg,
+						[
+							{
+								type: "tool_use",
+								name: "Bash",
+								permissionSuggestions: [suggestion("danger_reflection", "confirmed")],
+							},
+						] as unknown as [],
+					),
+				) as NarratorMsg,
 			]).size,
 		).toBe(0);
 	});

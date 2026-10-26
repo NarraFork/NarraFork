@@ -215,6 +215,11 @@ import { createRuntimeEventContext, createRuntimeMessageWriters } from "./contex
 import { buildRuntimeHistory, questionModelReceipts } from "./history";
 import { createRuntimeRunState, type RuntimeRunOutcome } from "./input";
 import { waitForModelAvailabilityOrChange } from "./model-availability-wait";
+import {
+	applyPlanApproval,
+	dropDeferredPlanApproval,
+	runDeferredPlanApproval,
+} from "./plan-approval-restart";
 import { type RuntimePolicy, runtimeInteractionHint } from "./policy";
 import { countRuntimeSystemCharacters } from "./prompt-characters";
 import type { RuntimeRecoveryState, RuntimeRecoveryTransition } from "./transition";
@@ -1434,25 +1439,36 @@ export async function runAgentLoopUnlocked(
 						});
 					}
 					// Plan compact logic — retrieve plan text from the tool call's inputJson
+					let approval: "compact" | "continue" | undefined;
+					let planText: string | null | undefined;
 					if (pendingPlanCompact.has(narratorId)) {
 						pendingPlanCompact.delete(narratorId);
-						const planText = await narratorService.getToolCallPlanText(toolUseId);
-						if (planText) {
-							await runPlanCompact(narratorId, planText);
-							resetActiveUpstreamSession(narratorId);
-							broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
-							active._planApprovedContinue = "compact";
-							active.abortController.abort();
-						}
+						planText = await narratorService.getToolCallPlanText(toolUseId);
+						if (planText) approval = "compact";
 					} else {
 						// Non-compact: abort the current agent loop and persist a user
 						// message so the next iteration starts with an explicit
 						// "plan approved, begin execution" prompt — this prevents the
 						// model from ignoring the tool result and asking the user again.
-						active._planApprovedContinue = "continue";
-						active.abortController.abort();
+						approval = "continue";
 					}
+					if (!approval) return;
+					// ExitPlanMode runs as soon as its input is complete, so the approval can
+					// land while the same response is still streaming; the restart then waits
+					// for that response to be finalized (see plan-approval-restart.ts).
+					await applyPlanApproval(active, approval, {
+						compact:
+							approval === "compact" && planText
+								? async () => {
+										await runPlanCompact(narratorId, planText);
+										resetActiveUpstreamSession(narratorId);
+										broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
+									}
+								: undefined,
+						abort: () => active.abortController.abort(),
+					});
 				},
+				onAssistantMessageFinalized: () => runDeferredPlanApproval(active),
 				onClearCompactSummary: async () => {
 					if (!active._usedCompactSummary) return;
 					await db
@@ -1541,6 +1557,10 @@ export async function runAgentLoopUnlocked(
 
 				onContextUsage: ctxMgmt.onContextUsage,
 				onErrorCleanup: async (message, diagnostics) => {
+					// A plan approval still waiting for its response to finish never restarted
+					// the pass: this ending is an ordinary interruption or failure, and the
+					// partial response must be kept, not cleaned up as an approval abort.
+					dropDeferredPlanApproval(active);
 					// Execution-owned finally callbacks normally close write claims, including
 					// aborts. Keep the turn-level fallback for interrupted legacy sessions and
 					// errors outside execution; unclosed claims would overlap later writers.
@@ -2009,7 +2029,14 @@ export async function runAgentLoopUnlocked(
 						typeof payload.tool_name === "string" ? payload.tool_name : undefined,
 					);
 				},
+				// Host stops skip every call that has not started yet.
 				shouldStop: () => {
+					if (active._workspacePassInvalidated || active._workspaceInstallFailed) return true;
+					// An approved plan ends this pass; nothing after ExitPlanMode may start.
+					return !!active._planApprovedContinue;
+				},
+				// Queued user input never skips a call: the step's tools all run first.
+				shouldYieldToInput: () => {
 					// Cancellation is irreversible even when the queued guidance has since
 					// been removed/downgraded. Record the actual pass interruption using
 					// its captured signals, independently of whether input remains. This
@@ -2017,7 +2044,6 @@ export async function runAgentLoopUnlocked(
 					if (config.guidanceSignal?.aborted || config.urgentGuidanceSignal?.aborted) {
 						active._bufferSoftStopTaken = true;
 					}
-					if (active._workspacePassInvalidated || active._workspaceInstallFailed) return true;
 					const decision = evaluateSoftStopRequest({
 						feedbackSoftStop: active._feedbackSoftStop,
 						bufferSoftStop: active._bufferSoftStop,

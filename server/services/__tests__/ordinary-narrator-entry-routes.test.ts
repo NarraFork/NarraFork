@@ -1,4 +1,6 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { decodeBlockMessage } from "@frontend/lib/block-protocol";
+import { messageBlocks, messageBody } from "@shared/narrator-blocks/message-blocks";
 import { Hono } from "hono";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import {
@@ -188,6 +190,32 @@ describe("ordinary HTTP conversation forks", () => {
 		expect(child.permissionMode).toBe("readOnly");
 		expect(child.isAskInPassing).toBe(false);
 		expect(counts()).toEqual(before);
+	});
+});
+
+describe("ask-in-passing answers in the block protocol", () => {
+	test("start sends the pending message as envelopes and blocks the client decodes", async () => {
+		await source(false);
+		const response = await post(appFor(), "/narrators/source/ask-in-passing/start", {
+			sourceMessageId: "message",
+		});
+		expect(response.status).toBe(201);
+		const result = await response.json();
+		const [envelope] = result.message.messages;
+		expect(result.message.messages).toHaveLength(1);
+		expect(envelope).toMatchObject({ id: result.messageId, seq: 2, parentMessageId: null });
+		expect(envelope).not.toHaveProperty("contentJson");
+		expect(typeof envelope.askInsertVersion).toBe("number");
+		const { message } = decodeBlockMessage(result);
+		if (!message) throw new Error("expected the pending message");
+		expect(messageBody(message)).toEqual([
+			expect.objectContaining({
+				type: "ask_in_passing",
+				status: "pending",
+				sourceMessageId: "message",
+			}),
+		]);
+		expect(messageBlocks(message).every((block) => block.named)).toBe(true);
 	});
 });
 

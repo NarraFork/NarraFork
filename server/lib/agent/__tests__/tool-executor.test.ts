@@ -483,9 +483,10 @@ describe("executeTool update admission gate", () => {
 			classifyToolUpdateExecution({
 				toolUseId: "classify-send-await",
 				name: "Send",
+				// A legacy await flag no longer makes Send wait.
 				input: { await: true, message: "wait for reply" },
 			}),
-		).toBe("resumable");
+		).toBe("ordinary");
 		expect(
 			classifyToolUpdateExecution({
 				toolUseId: "classify-send-ordinary",

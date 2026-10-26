@@ -8,13 +8,6 @@ import {
 	trackAgentMessageHistory,
 } from "../agent-message-delivery";
 import {
-	beginAgentReplyWaitRun,
-	clearPendingAgentReplyWaits,
-	getActiveSendDeliveryTargets,
-	registerAgentReplyWait,
-	resolvePendingAgentReply,
-} from "../agent-reply-waiter";
-import {
 	drainPendingInjections,
 	projectPendingInjection,
 	runItems,
@@ -252,7 +245,6 @@ async function restart() {
 
 beforeEach(() => {
 	cleanDb(sqlite);
-	clearPendingAgentReplyWaits();
 	clearBufferedMessages("child");
 	drainPendingInjections("parent");
 	clearTeamInbox("child");
@@ -264,7 +256,6 @@ beforeEach(() => {
 	seed("sibling", "parent");
 });
 afterAll(() => {
-	clearPendingAgentReplyWaits();
 	clearBufferedMessages("child");
 	drainPendingInjections("parent");
 	mock.module("../agent-runtime/run", () => runModule);
@@ -831,14 +822,14 @@ describe("Send exact delivery receipts", () => {
 
 	test("a wake that cannot start leaves the Send queued and never labels later human text", async () => {
 		// The recipient's last stop was the user's interrupt: an agent message alone does
-		// not restart it, so the message stays queued for the next eligible turn.
+		// not restart it, so the message stays queued and the sender is told it is blocked.
 		sqlite
 			.prepare(
 				"UPDATE narrators SET status = 'idle', cwd = ?, last_stop_reason = 'user_interrupt' WHERE id = 'child'",
 			)
 			.run(process.env.HOME ?? ".");
 		const result = await send();
-		expect(result.targets[0].status).toBe("queued");
+		expect(result.targets[0]).toMatchObject({ status: "blocked", blockedReason: "user_interrupt" });
 		expect(runStarts).toHaveLength(0);
 		expect(await agentQueued()).toHaveLength(1);
 		const human = await narratorService.persistSubagentUserMessage(
@@ -894,65 +885,6 @@ describe("Send exact delivery receipts", () => {
 		await new Promise((resolve) => setTimeout(resolve, 0));
 		expect(consumedAt(id, "parent")).toBeNumber();
 		expect(broadcasts.filter(({ event }) => event.type === "message")).toHaveLength(1);
-	});
-
-	test("awaiting Send exposes the exact reserved ID live and keeps it in completed metadata", async () => {
-		let live: unknown[] = [];
-		const binding = sourceBinding("parent", "send-call");
-		const result = await send("parent", "child", {
-			toolCallBinding: binding,
-			shouldAwait: true,
-			onDeliveryResolved: () => {
-				live = getActiveSendDeliveryTargets("parent", "send-call", binding);
-				resolvePendingAgentReply({
-					fromNarratorId: "child",
-					toNarratorId: "parent",
-					scope: { type: "parent-child", id: "parent\u0000child" },
-					message: "reply",
-				});
-			},
-		});
-		expect(result.targets[0].status).toBe("completed");
-		expect(live).toEqual([
-			{
-				id: "child",
-				deliveryMessageId: result.targets[0].deliveryMessageId,
-				title: null,
-				deliveryId: result.targets[0].deliveryId,
-				revision: 1,
-			},
-		]);
-		expect((await agentQueued())[0].delivery?.text).toBe("same words");
-		expect((await agentQueued())[0].text).toContain("[Reply requested");
-	});
-
-	test("explicit replies point to the existing waiting Send row without another inbox message", async () => {
-		sqlite
-			.prepare(
-				"INSERT INTO narrator_messages (id, narrator_id, role, content_json, created_at) VALUES ('wait-message', 'parent', 'assistant', '[]', ?)",
-			)
-			.run(now);
-		sqlite
-			.prepare(
-				"INSERT INTO narrator_tool_calls (id, narrator_id, message_id, tool_use_id, tool_name, created_at) VALUES ('wait-tool', 'parent', 'wait-message', 'waiting-send', 'Send', ?)",
-			)
-			.run(now);
-		const run = beginAgentReplyWaitRun({ requesterId: "parent", toolUseId: "waiting-send" });
-		const wait = registerAgentReplyWait({
-			requesterMessageId: "wait-message",
-			requesterId: "parent",
-			responderId: "child",
-			scope: { type: "parent-child", id: "parent\u0000child" },
-			run,
-		});
-		const result = await send("child", "parent", { replyTo: wait.requestId });
-		expect(result.targets[0].deliveryMessageId).toBe("wait-message");
-		expect(await wait.promise).toMatchObject({ status: "replied", message: "same words" });
-		expect(await drainPendingInjections("parent")).toHaveLength(0);
-		expect(
-			sqlite.prepare("SELECT id FROM narrator_messages WHERE id NOT LIKE 'source-message-%'").all(),
-		).toHaveLength(1);
-		run.complete();
 	});
 
 	test("commit followed by parent-version failure still consumes exactly once", async () => {
@@ -1136,58 +1068,6 @@ describe("Send exact delivery receipts", () => {
 	// "a running pass withholds failed bytes, requeues, then delivers once" runs the real
 	// run service, so it lives in agent-message-delivery-running-pass.test.ts (this
 	// file's static imports bind publication before its DB mock is installed).
-
-	test("reused provider tool ID binds a reply to the precise waiting tool row and attempt", async () => {
-		for (const [suffix, attempt] of [
-			["old", 1],
-			["new", 2],
-		] as const) {
-			sqlite
-				.prepare(
-					"INSERT INTO narrator_messages (id, narrator_id, role, content_json, created_at) VALUES (?, 'parent', 'assistant', '[]', ?)",
-				)
-				.run(`wait-${suffix}`, now);
-			sqlite
-				.prepare(
-					"INSERT INTO narrator_tool_calls (id, narrator_id, message_id, tool_use_id, tool_name, execution_attempt, execution_identity_version, created_at) VALUES (?, 'parent', ?, 'reused-send', 'Send', ?, 1, ?)",
-				)
-				.run(`tool-${suffix}`, `wait-${suffix}`, attempt, now);
-		}
-		const binding = { toolCallId: "tool-new", attempt: 2 };
-		let response: ReturnType<typeof send> | undefined;
-		let active: unknown[] = [];
-		let stale: unknown[] = [];
-		const result = await send("parent", "child", {
-			toolUseId: "reused-send",
-			shouldAwait: true,
-			toolCallBinding: binding,
-			onDeliveryResolved: () => {
-				active = getActiveSendDeliveryTargets("parent", "reused-send", binding);
-				stale = getActiveSendDeliveryTargets("parent", "reused-send", {
-					toolCallId: "tool-old",
-					attempt: 1,
-				});
-				response = send("child", "parent");
-			},
-		});
-		const reply = await response;
-		expect(result.targets[0].status).toBe("completed");
-		expect(reply?.targets[0].deliveryMessageId).toBe("wait-new");
-		expect(active).toEqual([
-			{
-				id: "child",
-				deliveryMessageId: result.targets[0].deliveryMessageId,
-				title: null,
-				deliveryId: result.targets[0].deliveryId,
-				revision: 1,
-			},
-		]);
-		expect(stale).toEqual([]);
-		expect(await drainPendingInjections("parent")).toHaveLength(0);
-		expect(
-			sqlite.prepare("SELECT id FROM narrator_messages WHERE id NOT LIKE 'source-message-%'").all(),
-		).toHaveLength(2);
-	});
 
 	test("broadcast rechecks persisted status before admission without requiring a runtime owner", async () => {
 		const message = {

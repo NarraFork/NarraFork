@@ -45,6 +45,7 @@ import {
 } from "./protocol-override";
 import { type ProviderSource, ProviderSourceRegistry } from "./provider-source-registry";
 import type { ApiRequestDumpCollector } from "./request-dump";
+import type { StreamProgress } from "./stream-progress";
 import { TokenDanceProvider } from "./tokendance-provider";
 
 // === Provider stream protocol types ===
@@ -95,6 +96,11 @@ export interface ChatParams extends ProtocolChatParams {
 	metadata?: { user_id: string };
 	/** Optional collector for persisting raw provider request/response dumps. */
 	requestDump?: ApiRequestDumpCollector;
+	/**
+	 * Optional transport-progress tracker (headers, body bytes, SSE heartbeats) for the
+	 * HTTP attempt. Diagnostic only: it never counts as provider activity.
+	 */
+	streamProgress?: StreamProgress;
 	/**
 	 * Reset any reusable upstream transport state before this request. Used when the
 	 * agent loop rebuilt history (e.g. after compact) so WebSocket/previous-response

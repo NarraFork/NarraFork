@@ -13,6 +13,7 @@ import { createRef, useCallback, useRef, useState } from "react";
 import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
+import type { AskSelectionInput } from "../interaction/use-ask-selection-in-passing";
 import { useComposerAttachments } from "../interaction/use-composer-attachments";
 import { useComposerFileIngest } from "../interaction/use-composer-file-ingest";
 import {
@@ -113,6 +114,15 @@ const defaults = {
 	NarratorComposerRowProps,
 	"composerHasText" | "composerHasAttachments" | "setComposerHasText" | "isSending"
 >;
+const asked: AskSelectionInput[] = [];
+let askFailure: string | null = null;
+async function askSelection(input: AskSelectionInput) {
+	asked.push(input);
+	if (askFailure) throw new Error(askFailure);
+}
+export function failAsk(message: string | null) {
+	askFailure = message;
+}
 function PanelBoundary({
 	narratorId,
 	userId,
@@ -225,6 +235,7 @@ function PanelBoundary({
 					attachedTextFiles={textFiles}
 					onAttachmentsChange={changeFiles}
 					isSending={isSending}
+					onAskSelection={askSelection}
 				/>
 			</div>
 		</div>
@@ -284,6 +295,7 @@ export function snapshot() {
 		sends,
 		files: currentFiles.map((file) => file.name),
 		hydrating: attachmentsHydrating,
+		asked: [...asked],
 	};
 }
 export function selectSource() {

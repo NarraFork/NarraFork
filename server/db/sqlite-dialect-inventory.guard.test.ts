@@ -385,6 +385,10 @@ const SQLITE_ONLY_MODULES: ReadonlyMap<string, string> = new Map([
 		"the SQLite maintenance adapter: `PRAGMA wal_checkpoint`/`optimize`, freelist pages, `VACUUM`, `SQLITE_BUSY` classification — none of which a server-managed engine exposes",
 	],
 	["server/db/run-migrations.ts", "applies the SQLite migration SQL in `drizzle/`"],
+	[
+		"server/db/legacy-request-storage.ts",
+		"finishes SQLite migration 0207's deferred column drops and clears its retained dumps",
+	],
 	["server/db/migrate.ts", "the `bun run db:migrate` entry point: opens the file and applies SQL"],
 	["server/db/ensure-columns.ts", "patches columns on SQLite databases from older versions"],
 	[
@@ -405,6 +409,14 @@ const SQLITE_ONLY_MODULES: ReadonlyMap<string, string> = new Map([
 	["server/lib/db-worker/storage-scan-runner.ts", "SQLite storage scan budgets"],
 	["server/services/storage-scan-queries.ts", "`dbstat`/page-level SQLite storage accounting"],
 	["server/services/database-cleanup-service.ts", "SQLite VACUUM / page accounting maintenance"],
+	[
+		"server/services/token-recalculation-sqlite.ts",
+		"SQLite batch adapter; PostgreSQL uses token-recalculation-postgres.ts instead",
+	],
+	[
+		"server/services/token-recalculation-worker.ts",
+		"SQLite-only background writer and short busy timeout; PostgreSQL uses its async client",
+	],
 	[
 		"server/services/file-change-physical-audit-worker.ts",
 		"SQLite-side physical audit in a worker",
@@ -448,6 +460,8 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/db/integrity-probe-worker.ts": ["driver", "pragma"],
 	"server/db/migrate-narrator-drafts.ts": ["driver"],
 	"server/db/migrate.ts": ["connectionModule"],
+	// Deferred half of SQLite migration 0207; rowid batches clear dumps in one ordered pass.
+	"server/db/legacy-request-storage.ts": ["driver", "pragma", "sqliteCatalog", "rowid"],
 	"server/db/run-migrations.ts": [
 		"driver",
 		"pragma",
@@ -525,7 +539,21 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/narrator-panel-state.ts": ["json1"],
 	"server/services/narrator-persistence.ts": ["handle", "rowid", "indexHint"],
 	// Block storage is SQLite-only in P1 (PG envelopes stay legacy-format).
-	"server/services/narrator-block-sync.ts": ["handle", "sqliteCatalog", "insertOr", "rowid"],
+	// The broken-call flag of a tool result is read in SQL so the result itself is not.
+	"server/services/narrator-block-sync.ts": [
+		"handle",
+		"sqliteCatalog",
+		"insertOr",
+		"rowid",
+		"json1",
+	],
+	// The block index job is SQLite-only like block storage: worker reads, rowid writes.
+	"server/services/narrator-block-index.ts": [
+		"handle",
+		"connectionModule",
+		"sqliteCatalog",
+		"rowid",
+	],
 	"server/services/narrator-epochs.ts": ["handle", "json1"],
 	// The block backfill is SQLite-only like block storage: rowid cursor, worker reads.
 	"server/services/narrator-block-backfill.ts": [
@@ -606,6 +634,8 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	],
 	"server/services/subagent-activity.ts": ["json1"],
 	"server/services/subagent-file-changes.ts": ["drizzleDialect"],
+	"server/services/token-recalculation-sqlite.ts": ["driver"],
+	"server/services/token-recalculation-worker.ts": ["connectionModule", "pragma"],
 	"server/services/tool-continuation-service.ts": ["json1"],
 	"server/services/tool-edit-preview.ts": ["json1"],
 	"server/services/workspace-modification-view.ts": ["json1", "rowid"],

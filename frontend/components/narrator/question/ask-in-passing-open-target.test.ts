@@ -20,6 +20,7 @@
 import { describe, expect, it, mock, spyOn } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import * as router from "@tanstack/react-router";
 import { createElement } from "react";
@@ -120,9 +121,13 @@ describe("wiring — every path to the answer goes through the shared opener", (
 					["legacy", ["old"]],
 				]),
 				messages: [
-					{ id: "m1", contentJson: [{ type: "ask_in_passing", targetNarratorId: "answer-one" }] },
-					{ id: "m2", contentJson: [{ type: "ask_in_passing", targetNarratorId: "answer-two" }] },
-					{ id: "old", contentJson: [{ type: "ask_in_passing" }] },
+					rowWithElements({ id: "m1" }, [
+						{ type: "ask_in_passing", targetNarratorId: "answer-one" },
+					]),
+					rowWithElements({ id: "m2" }, [
+						{ type: "ask_in_passing", targetNarratorId: "answer-two" },
+					]),
+					rowWithElements({ id: "old" }, [{ type: "ask_in_passing" }]),
 				],
 			};
 			function Probe() {

@@ -29,6 +29,7 @@ import { envWithAmbientProxy } from "../lib/net/proxy-env";
 import type { DatabaseVerificationPort } from "./backend/lifecycle-port";
 import { sqliteVerificationPort } from "./backend/sqlite-verification";
 import { getDbPath } from "./connection";
+import { ftsIndexFindings } from "./fts";
 import {
 	DB_INTEGRITY_MODE_ENV,
 	DB_INTEGRITY_PATH_ENV,
@@ -41,6 +42,7 @@ import {
 	clearPendingDatabaseRepair,
 	readPendingDatabaseRepair,
 	recordCorruptionFinding,
+	recordFtsRepair,
 	shouldSkipBackgroundProbe,
 } from "./integrity-state";
 
@@ -352,6 +354,28 @@ function handleProbeReport(report: IntegrityProbeReport): void {
 			mode: report.mode,
 			details: report.details,
 		});
+		return;
+	}
+	// Only search indexes are broken: rebuild those on the next startup instead of recovering the
+	// whole database. This check is the only one an index gets; startup reads none (fts.ts).
+	const ftsTables = ftsIndexFindings(report.details);
+	if (ftsTables) {
+		logger.warn("Search index corruption detected — rebuild scheduled for next startup", {
+			mode: report.mode,
+			tables: ftsTables,
+			details: report.details,
+		});
+		const write = recordFtsRepair({
+			tables: ftsTables,
+			details: report.details,
+			detectedAt: new Date().toISOString(),
+		});
+		if (!write.ok) {
+			logger.error("Failed to persist the search index repair — it will not run", {
+				error: write.error,
+				tables: ftsTables,
+			});
+		}
 		return;
 	}
 	// Corruption. Log FIRST and unconditionally: persisting the marker can fail (disk full,

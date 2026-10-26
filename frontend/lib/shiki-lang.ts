@@ -12,6 +12,14 @@ const OVERRIDES: Record<string, string> = {
 };
 
 /**
+ * Resolution depends on the extension alone, and `lang-map` is expensive per call:
+ * each lookup rebuilds its CommonJS interop objects (hundreds of getters), which
+ * cost ~1ms per tool row painted during a fast scroll.
+ */
+const resolved = new Map<string, string>();
+const MAX_RESOLVED_EXTENSIONS = 512;
+
+/**
  * Resolve a shiki-compatible language id from a file path or extension.
  * Returns "text" when no match is found.
  *
@@ -24,7 +32,15 @@ const OVERRIDES: Record<string, string> = {
  */
 export function getShikiLang(filePath: string): string {
 	const ext = filePath.split(".").pop()?.toLowerCase() ?? "";
+	const cached = resolved.get(ext);
+	if (cached !== undefined) return cached;
+	const language = resolveExtension(ext);
+	if (resolved.size >= MAX_RESOLVED_EXTENSIONS) resolved.clear();
+	resolved.set(ext, language);
+	return language;
+}
 
+function resolveExtension(ext: string): string {
 	const override = OVERRIDES[ext];
 	if (override && isKnownLanguage(override)) return override;
 

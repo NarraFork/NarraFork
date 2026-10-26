@@ -5,6 +5,7 @@ import type {
 	RequestRecording,
 } from "@shared/request-recording";
 import { readWithTimeout } from "../stream-timeout";
+import type { StreamProgress } from "./stream-progress";
 
 /** Request metadata a provider reports at the start of each transport attempt. */
 export interface RecordingAttemptRequest extends RecordingRequest {
@@ -82,15 +83,16 @@ export class BoundedUtf8Capture {
 export function captureResponseStream(
 	source: ReadableStream<Uint8Array>,
 	collector?: ApiRequestDumpCollector,
+	progress?: StreamProgress,
 ): { stream: ReadableStream<Uint8Array>; finish: () => void } {
-	if (!collector) return { stream: source, finish: () => {} };
+	if (!collector && !progress) return { stream: source, finish: () => {} };
 	const reader = source.getReader();
 	let complete = false;
 	let finished = false;
 	const finish = () => {
 		if (finished) return;
 		finished = true;
-		collector.finishResponseCapture(complete);
+		collector?.finishResponseCapture(complete);
 		void reader.cancel().catch(() => {});
 	};
 	const stream = new ReadableStream<Uint8Array>(
@@ -107,12 +109,13 @@ export function captureResponseStream(
 						controller.close();
 						finish();
 					} else {
-						collector.appendResponseText(value);
+						progress?.onBytes(value);
+						collector?.appendResponseText(value);
 						controller.enqueue(value);
 					}
 				} catch (error) {
 					if (finished) return;
-					collector.setResponseError(error);
+					collector?.setResponseError(error);
 					controller.error(error);
 					finish();
 				}

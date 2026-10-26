@@ -313,7 +313,8 @@ const MAX_TEXT_PREVIEW_BYTES = 1024 * 1024; // 1 MB (text files — larger paylo
  * the whole filesystem, and the viewer legitimately opens platform files outside any
  * project (request dumps, truncated tool output, subagent conclusions). What must not
  * follow from that is an escalation: `settings.json` carries `auth.jwtSecret` (forge
- * any user's session), `narrafork.db` carries every password hash, and `~/.ssh`
+ * MFA challenges and internal signatures), `narrafork.db` carries every password hash
+ * and session hash, and `~/.ssh`
  * carries the user's keys. See `fs-secret-paths.ts` for why this is a deny-list.
  *
  * A 403 rather than a 404: pretending the file is absent would be a lie the caller

@@ -22,6 +22,7 @@
  */
 
 import { beforeAll, describe, expect, it } from "bun:test";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 
 // The canvas stub must be installed before any pretext-backed module loads.
@@ -444,29 +445,30 @@ describe("live-patch audit: EXHAUSTIVE — a height change always changes the ke
 			...overrides,
 		};
 		return [
-			{
-				id: "m1",
-				narratorId: "n1",
-				parentToolUseId: null,
-				role: "assistant",
-				contentJson: [shared],
-				contentText: null,
-				toolCalls: [
-					{
-						id: "tc-agent",
-						narratorId: "n1",
-						messageId: "m1",
-						toolUseId: "tu-agent",
-						toolName: "Agent",
-						createdAt: "2026-01-01T00:00:00.000Z",
-						...overrides,
-						inputJson: shared.inputJson,
-						status: shared.status,
-					},
-				],
-				createdAt: "2026-01-01T00:00:00.000Z",
-				children: [],
-			} as unknown as Msg,
+			rowWithElements(
+				{
+					id: "m1",
+					narratorId: "n1",
+					parentToolUseId: null,
+					role: "assistant",
+					contentText: null,
+					toolCalls: [
+						{
+							id: "tc-agent",
+							narratorId: "n1",
+							messageId: "m1",
+							toolUseId: "tu-agent",
+							toolName: "Agent",
+							createdAt: "2026-01-01T00:00:00.000Z",
+							...overrides,
+							inputJson: shared.inputJson,
+							status: shared.status,
+						},
+					],
+					createdAt: "2026-01-01T00:00:00.000Z",
+				},
+				[shared],
+			) as unknown as Msg,
 		];
 	}
 
@@ -481,28 +483,29 @@ describe("live-patch audit: EXHAUSTIVE — a height change always changes the ke
 			status: "running",
 		};
 		return [
-			{
-				id: "m1",
-				narratorId: "n1",
-				parentToolUseId: null,
-				role: "assistant",
-				contentJson: [shared],
-				contentText: null,
-				toolCalls: [
-					{
-						id: "tc-bash",
-						narratorId: "n1",
-						messageId: "m1",
-						toolUseId: "tu-bash",
-						toolName: "Bash",
-						inputJson: shared.inputJson,
-						status: "running",
-						createdAt: "2026-01-01T00:00:00.000Z",
-					},
-				],
-				createdAt: "2026-01-01T00:00:00.000Z",
-				children: [],
-			} as unknown as Msg,
+			rowWithElements(
+				{
+					id: "m1",
+					narratorId: "n1",
+					parentToolUseId: null,
+					role: "assistant",
+					contentText: null,
+					toolCalls: [
+						{
+							id: "tc-bash",
+							narratorId: "n1",
+							messageId: "m1",
+							toolUseId: "tu-bash",
+							toolName: "Bash",
+							inputJson: shared.inputJson,
+							status: "running",
+							createdAt: "2026-01-01T00:00:00.000Z",
+						},
+					],
+					createdAt: "2026-01-01T00:00:00.000Z",
+				},
+				[shared],
+			) as unknown as Msg,
 		];
 	}
 
@@ -626,18 +629,19 @@ describe("low-LOD folds: a fold that grows must re-key", () => {
 	type Msg = import("../narrator-panel-types").NarratorMsg;
 
 	function reasoningDoc(): Msg {
-		return {
-			id: "m1",
-			narratorId: "n1",
-			seq: 1,
-			role: "assistant",
-			contentJson: [{ type: "thinking", thinking: "## step\nthinking about it" }],
-			contentText: null,
-			toolCalls: [],
-			children: [],
-			parentToolUseId: null,
-			createdAt: "2026-01-01T00:00:00.000Z",
-		} as unknown as Msg;
+		return rowWithElements(
+			{
+				id: "m1",
+				narratorId: "n1",
+				seq: 1,
+				role: "assistant",
+				contentText: null,
+				toolCalls: [],
+				parentToolUseId: null,
+				createdAt: "2026-01-01T00:00:00.000Z",
+			},
+			[{ type: "thinking", thinking: "## step\nthinking about it" }],
+		) as unknown as Msg;
 	}
 
 	function readToolMsg(id: string, seq: number, toolUseId: string): Msg {
@@ -649,29 +653,30 @@ describe("low-LOD folds: a fold that grows must re-key", () => {
 			inputJson: { file_path: `/a/${toolUseId}.ts` },
 			status: "success",
 		};
-		return {
-			id,
-			narratorId: "n1",
-			seq,
-			role: "assistant",
-			contentJson: [block],
-			contentText: null,
-			toolCalls: [
-				{
-					id: `tc-${toolUseId}`,
-					narratorId: "n1",
-					messageId: id,
-					toolUseId,
-					toolName: "Read",
-					inputJson: block.inputJson,
-					status: "success",
-					createdAt: "2026-01-01T00:00:00.000Z",
-				},
-			],
-			children: [],
-			parentToolUseId: null,
-			createdAt: "2026-01-01T00:00:00.000Z",
-		} as unknown as Msg;
+		return rowWithElements(
+			{
+				id,
+				narratorId: "n1",
+				seq,
+				role: "assistant",
+				contentText: null,
+				toolCalls: [
+					{
+						id: `tc-${toolUseId}`,
+						narratorId: "n1",
+						messageId: id,
+						toolUseId,
+						toolName: "Read",
+						inputJson: block.inputJson,
+						status: "success",
+						createdAt: "2026-01-01T00:00:00.000Z",
+					},
+				],
+				parentToolUseId: null,
+				createdAt: "2026-01-01T00:00:00.000Z",
+			},
+			[block],
+		) as unknown as Msg;
 	}
 
 	/**

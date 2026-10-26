@@ -243,6 +243,16 @@ describe("stripObsoleteSettingsKeys", () => {
 		}
 	});
 
+	it("removes the retired message protocol switch and keeps the other block settings", () => {
+		const value: Record<string, unknown> = {
+			narratorBlocks: { write: true, read: true, wsV2: false, compactJson: true },
+		};
+		expect(stripObsoleteSettingsKeys(value)).toBe(true);
+		expect(value.narratorBlocks).toEqual({ write: true, read: true, compactJson: true });
+		expect(stripObsoleteSettingsKeys(value)).toBe(false);
+		expect(getDefaults().narratorBlocks).not.toHaveProperty("wsV2");
+	});
+
 	it("defaults expose compaction thresholds only", () => {
 		expect(getDefaults().agent.contextThresholds).toEqual({
 			standard: { compactStart: 95 },

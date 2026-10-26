@@ -6,7 +6,6 @@ import { authMfaStore, authSessionStore, setAuthStores } from "../../services/au
 import type { AccountRole } from "../../services/registration/account-store";
 import type { AuthPrincipal } from "../auth";
 import {
-	invalidateUserCache,
 	requireAdmin,
 	requireExternalAuth,
 	requireExternalScope,
@@ -32,7 +31,6 @@ function withLiveSessionRole(role: AccountRole): void {
 
 afterEach(() => {
 	setAuthStores(undefined);
-	invalidateUserCache(adminUser.sub);
 });
 
 function appWithPrincipal(principal: AuthPrincipal): Hono {

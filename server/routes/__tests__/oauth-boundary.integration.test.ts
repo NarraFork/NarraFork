@@ -21,18 +21,14 @@ const [
 	{ db },
 	{ oauthAccessTokens, oauthAuthorizationCodes, oauthClients, users },
 	{ eq },
-	{ sign },
 	{ generateId },
-	{ settings },
 	{ exchangeCodeForToken, issueAuthorizationCode },
 ] = await Promise.all([
 	import("../../app"),
 	import("../../db"),
 	import("../../db/schema"),
 	import("drizzle-orm"),
-	import("hono/jwt"),
 	import("../../lib/id"),
-	import("../../lib/settings"),
 	import("../../lib/oauth-provider"),
 ]);
 
@@ -78,9 +74,10 @@ async function ensureActors(): Promise<void> {
 	});
 }
 
-async function sessionToken(actorId: string, role: "admin" | "user"): Promise<string> {
-	const now = Math.floor(Date.now() / 1000);
-	return sign({ sub: actorId, role, iat: now, exp: now + 3600 }, settings.auth.jwtSecret);
+/** Open a real session; the role comes from the account row, as in production. */
+async function sessionToken(actorId: string, _role: "admin" | "user"): Promise<string> {
+	const { createToken } = await import("../../lib/auth");
+	return createToken(actorId);
 }
 
 async function oauthToken(actorId: string, scopes: string[]): Promise<string> {
@@ -157,7 +154,7 @@ describe("OAuth boundary security matrix", () => {
 		expect(failures).toEqual([]);
 	});
 
-	test("OAuth access tokens cannot execute consent, while session JWTs retain access", async () => {
+	test("OAuth access tokens cannot execute consent, while session tokens retain access", async () => {
 		const token = await oauthToken(userId, ["device.provision"]);
 		const consent = await app.request("/api/oauth/authorize", {
 			method: "POST",

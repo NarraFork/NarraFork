@@ -107,7 +107,7 @@ test.each([
 			updatedAt: now,
 		})
 		.run();
-	const token = await createToken(userId, "user");
+	const token = await createToken(userId);
 	const browserSockets = new Set<Parameters<typeof handleNarratorWS.open>[0]>();
 	const heartbeat = setInterval(() => {
 		for (const socket of browserSockets) socket.send(JSON.stringify({ type: "ping" }));
@@ -191,7 +191,7 @@ test.each([
 						{
 							sessionExp: verified.exp,
 							sessionUserId: verified.sub,
-							sessionTokenVersion: verified.sv ?? 0,
+							sessionId: verified.sid,
 						},
 					);
 					if (data && server.upgrade(request, { data })) return;

@@ -1,5 +1,6 @@
 import type { Database } from "bun:sqlite";
 import { logger } from "../lib/logger";
+import { MAX_REPORT_DETAIL_CHARS, MAX_REPORT_FINDINGS } from "./integrity-protocol";
 
 const CLEAN_SHUTDOWN_MARKER = 0x4e465243; // "NFRC" = NarraFork Clean
 
@@ -60,41 +61,43 @@ export function consumeCleanShutdownState(sqlite: Database): { wasClean: boolean
 	return result;
 }
 
-/** Env flag: force the old behavior of unconditionally rebuilding every FTS index after an
- * unclean shutdown (bypasses the cheaper 'integrity-check' probe). Escape hatch for the rare
- * case where the probe misses a corruption that the full rebuild would have fixed. */
+/** Env flag: rebuild every FTS index after an unclean shutdown, before serving. An operator's
+ * explicit choice of a slow startup; without it, startup reads no index (see `ensureFts`). */
 const FORCE_FULL_FTS_REBUILD =
 	process.env.NARRAFORK_DB_FULL_INTEGRITY_CHECK === "1" ||
 	process.env.NARRAFORK_FTS_FULL_REBUILD === "1";
 
+/** The FTS indexes `ensureFts` manages: the ones it rebuilds when a check finds them broken. */
+export const FTS_INDEX_TABLES = [
+	"narrator_blocks_fts",
+	"narrator_messages_fts",
+	"narrators_fts",
+	"knowledge_entries_fts",
+	"knowledge_drafts_fts",
+] as const;
+
 /**
- * Probe an external-content FTS5 table for corruption without rebuilding it.
+ * The FTS indexes an integrity report blames, when it blames nothing else.
  *
- * `INSERT INTO <t>(<t>, rank) VALUES('integrity-check', 1)` verifies both the index and
- * its external content. Without rank=1, SQLite only checks the index internally and misses
- * rowid drift after a content-table rebuild. This can scan the content, so it is restricted
- * to startup maintenance after an unclean shutdown, never the clean-start fast path.
- *
- * Returns `"ok"` when the probe passes, `"corrupt"` when it throws (SQLITE_CORRUPT_VTAB or a
- * "database disk image is malformed" style error), signalling the caller to rebuild that table.
- *
- * NOTE (safety trade-off): 'integrity-check' catches the vast majority of index/content
- * inconsistencies but is not a 100% guarantee against every edge-case corruption that could
- * later surface as a "malformed" error on UPDATE. The runtime safety net (recoverWithCli in
- * db-resilience.ts) still recovers such cases if they slip through, and its recovery path
- * recreates the FTS tables. Worst case is a delayed fix, not permanent data loss.
+ * `PRAGMA quick_check` runs FTS5's own index check (SQLite 3.44+) and names the table in each
+ * finding. A report made only of such findings needs those indexes rebuilt, not the database
+ * recovered. Anything else returns null, the database itself being suspect: a finding naming
+ * no managed index, or a report cut at its limit, whose dropped findings could be anything.
  */
-function probeFtsIntegrity(sqlite: Database, table: string): "ok" | "corrupt" {
-	try {
-		sqlite.run(`INSERT INTO ${table}(${table}, rank) VALUES ('integrity-check', 1)`);
-		return "ok";
-	} catch (err) {
-		logger.warn("FTS integrity probe failed — table will be rebuilt", {
-			table,
-			error: String(err),
-		});
-		return "corrupt";
+export function ftsIndexFindings(details: string): string[] | null {
+	const findings = details.split("; ").filter((finding) => finding.length > 0);
+	if (findings.length === 0 || findings.length >= MAX_REPORT_FINDINGS) return null;
+	if (details.length >= MAX_REPORT_DETAIL_CHARS) return null;
+	const tables = new Set<string>();
+	for (const finding of findings) {
+		if (!/fts5/i.test(finding)) return null;
+		const named = FTS_INDEX_TABLES.filter((table) =>
+			new RegExp(`(^|[^A-Za-z0-9_])${table}([^A-Za-z0-9_]|$)`).test(finding),
+		);
+		if (named.length === 0) return null;
+		for (const table of named) tables.add(table);
 	}
+	return [...tables];
 }
 
 /**
@@ -278,10 +281,10 @@ function dropRetiredFtsObjects(sqlite: Database): void {
 /**
  * Whether the block index was lost and has been emptied: its delete trigger is gone (a
  * migration rebuilt `narrator_blocks`, so its rowids may have moved and the index may point
- * at the wrong blocks), or after an unclean shutdown it fails the integrity probe. Its text
- * is computed by the store, so it cannot be rebuilt here; see {@link restartReindex}.
+ * at the wrong blocks), or an integrity check found it corrupt. Its text is computed by the
+ * store, so it cannot be rebuilt here; see {@link restartReindex}.
  */
-function repairBlockIndex(sqlite: Database, uncleanShutdown: boolean): boolean {
+function repairBlockIndex(sqlite: Database, corrupt: boolean): boolean {
 	const deleteTrigger = sqlite
 		.prepare(
 			"SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = 'narrator_blocks_fts_delete'",
@@ -292,7 +295,7 @@ function repairBlockIndex(sqlite: Database, uncleanShutdown: boolean): boolean {
 		logger.info("Block FTS index cleared before restoring its missing delete trigger");
 		return true;
 	}
-	if (!uncleanShutdown || probeFtsIntegrity(sqlite, "narrator_blocks_fts") === "ok") return false;
+	if (!corrupt) return false;
 	try {
 		sqlite.run("DROP TABLE narrator_blocks_fts");
 		createBlockIndex(sqlite);
@@ -422,10 +425,15 @@ export function ensureFts(
 		 *
 		 * MUST be passed by the startup path. `consumeCleanShutdownState` resets `application_id`
 		 * to 0 before this function runs, so re-reading the pragma here would report EVERY startup
-		 * as unclean and pay the probe cost (seconds of blocked main thread) even after a clean
-		 * shutdown. Omitted only by callers with no marker to consult (tests, tooling).
+		 * as unclean, and NARRAFORK_FTS_FULL_REBUILD would rebuild every index on every startup.
+		 * Omitted only by callers with no marker to consult (tests, tooling).
 		 */
 		wasClean?: boolean;
+		/**
+		 * Indexes an earlier background integrity check found corrupt (`ftsIndexFindings`), to
+		 * rebuild now. Startup itself reads no index to find out.
+		 */
+		repairFtsTables?: readonly string[];
 	} = {},
 ): { rebuilt: boolean } {
 	// Guard: skip if base tables don't exist yet (fresh DB before first migration)
@@ -449,6 +457,7 @@ export function ensureFts(
 		((sqlite.prepare("PRAGMA application_id").get() as { application_id: number } | undefined)
 			?.application_id ?? 0) === CLEAN_SHUTDOWN_MARKER;
 	const uncleanShutdown = !options.skipUncleanShutdownRebuild && !wasClean;
+	const corruptIndexes = new Set(options.repairFtsTables ?? []);
 
 	// The block index exists once block storage does (migration 0213).
 	const hasNarratorBlocks =
@@ -465,7 +474,11 @@ export function ensureFts(
 	// Its text is computed by the store, so a lost block index cannot be rebuilt here: it is
 	// emptied, the reindex job starts over, and the envelope index stays (or comes back) until
 	// that job has completed.
-	if (hasNarratorBlocks && !blockIndexCreated && repairBlockIndex(sqlite, uncleanShutdown)) {
+	if (
+		hasNarratorBlocks &&
+		!blockIndexCreated &&
+		repairBlockIndex(sqlite, corruptIndexes.has("narrator_blocks_fts"))
+	) {
 		repairedContentIndexes.add("narrator_blocks_fts");
 		restartReindex(sqlite);
 	}
@@ -775,46 +788,41 @@ export function ensureFts(
 	}
 
 	// --- Rebuild FTS indexes if needed ---
-	// Two independent triggers, handled differently:
+	// Three reasons, none of which reads an index to find out:
 	//   1) Migration (tokenizer change / dropped-and-recreated table): the index is empty or
-	//      built with the wrong tokenizer, so an UNCONDITIONAL full 'rebuild' is mandatory.
-	//   2) Unclean shutdown: trigram indexes *can* silently corrupt on crash and later throw
-	//      "malformed" on UPDATE, but usually they are fine. Instead of unconditionally
-	//      rebuilding every table (the previous behavior — slow: full re-tokenization of the
-	//      whole corpus, ~1 min on large narrator_messages), probe each table cheaply with
-	//      'integrity-check' and rebuild ONLY the tables that actually fail. Set
-	//      NARRAFORK_FTS_FULL_REBUILD=1 (or NARRAFORK_DB_FULL_INTEGRITY_CHECK=1) to force the
-	//      old unconditional-rebuild behavior.
+	//      built with the wrong tokenizer, so every index is rebuilt.
+	//   2) A background integrity check found an index corrupt (`repairFtsTables`): that index.
+	//   3) An unclean shutdown with NARRAFORK_FTS_FULL_REBUILD=1: every index, by request.
+	// An unclean shutdown alone probes nothing. FTS5's 'integrity-check' reads the whole index
+	// (and, for external content, the whole content table) on the main thread before the server
+	// listens, and it needs the write lock, so it cannot move off this thread: on a 47 GB database
+	// the server sat unreachable in it. WAL commits an index change with the row it indexes, so a
+	// crash cannot split them; the background `quick_check` (integrity-check.ts) runs FTS5's own
+	// check read-only in a subprocess and names any index it finds broken for the next startup.
 	const migrationForcedRebuild = ftsTablesRecreated.length > 0;
-	const needsRebuild = migrationForcedRebuild || uncleanShutdown;
+	const forcedAfterCrash = uncleanShutdown && FORCE_FULL_FTS_REBUILD;
+	const needsRebuild = migrationForcedRebuild || forcedAfterCrash;
 
-	if (needsRebuild) {
+	const ftsTables = [
+		"narrators_fts",
+		...envelopeIndex,
+		...(hasKnowledgeEntries ? ["knowledge_entries_fts"] : []),
+	];
+	const toRebuild = ftsTables.filter(
+		(table) => !repairedContentIndexes.has(table) && (needsRebuild || corruptIndexes.has(table)),
+	);
+	if (toRebuild.length > 0) {
 		const startedAt = Date.now();
-		// Migration always rebuilds unconditionally. Unclean shutdown only rebuilds tables that
-		// fail the cheap integrity probe (unless the force flag is set).
-		const probeThenRebuild = uncleanShutdown && !migrationForcedRebuild && !FORCE_FULL_FTS_REBUILD;
-		const ftsTables = [
-			"narrators_fts",
-			...envelopeIndex,
-			...(hasKnowledgeEntries ? ["knowledge_entries_fts"] : []),
-		];
-		const rebuilt: string[] = [];
-		const healthy: string[] = [];
 		try {
-			for (const table of ftsTables) {
-				if (repairedContentIndexes.has(table)) continue;
-				if (probeThenRebuild && probeFtsIntegrity(sqlite, table) === "ok") {
-					healthy.push(table);
-					continue;
-				}
+			for (const table of toRebuild)
 				sqlite.run(`INSERT INTO ${table}(${table}) VALUES ('rebuild')`);
-				rebuilt.push(table);
-			}
-			logger.info("FTS indexes checked on startup", {
-				reason: migrationForcedRebuild ? "migration" : "unclean_shutdown",
-				mode: probeThenRebuild ? "probe_then_rebuild" : "full_rebuild",
-				rebuilt,
-				healthy,
+			logger.info("FTS indexes rebuilt on startup", {
+				reason: migrationForcedRebuild
+					? "migration"
+					: forcedAfterCrash
+						? "forced_after_unclean_shutdown"
+						: "integrity_finding",
+				rebuilt: toRebuild,
 				durationMs: Date.now() - startedAt,
 			});
 		} catch (err) {
@@ -833,7 +841,10 @@ export function ensureFts(
 	if (
 		hasKnowledgeDrafts &&
 		!draftsFtsPopulated &&
-		(needsRebuild || draftsFtsFreshlyCreated || repairedContentIndexes.has("knowledge_drafts_fts"))
+		(needsRebuild ||
+			draftsFtsFreshlyCreated ||
+			repairedContentIndexes.has("knowledge_drafts_fts") ||
+			corruptIndexes.has("knowledge_drafts_fts"))
 	) {
 		repopulateKnowledgeDraftsFts(sqlite, hasKnowledgeEntries);
 		draftsFtsPopulated = true;
@@ -844,5 +855,5 @@ export function ensureFts(
 	// process from being misclassified as a crashed previous process.
 	sqlite.run("PRAGMA application_id = 0");
 
-	return { rebuilt: needsRebuild || repairedContentIndexes.size > 0 };
+	return { rebuilt: toRebuild.length > 0 || repairedContentIndexes.size > 0 };
 }

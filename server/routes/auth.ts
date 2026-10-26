@@ -1,7 +1,7 @@
 import type { AuthenticationResponseJSON, RegistrationResponseJSON } from "@simplewebauthn/server";
 import { type Context, Hono } from "hono";
 import QRCode from "qrcode";
-import { buildSessionResult, loginUser, registerUser } from "../lib/auth";
+import { buildSessionResult, loginUser, registerUser, revokeSessionToken } from "../lib/auth";
 import { type AuthAttemptBlocked, authAttemptLimiter } from "../lib/auth-attempt-limiter";
 import { getClientIp } from "../lib/client-ip";
 import { AppError, RateLimitError, ValidationError, zodValidationError } from "../lib/errors";
@@ -291,6 +291,12 @@ authRoutes.get("/me", requireSessionAuth, async (c) => {
 	// revocation counter, the other is delivered by the session result.
 	const { tokenVersion, language, ...user } = profile;
 	return c.json(user);
+});
+
+/** End the session this request authenticated with. Other sessions of the user stay. */
+authRoutes.post("/logout", requireSessionAuth, async (c) => {
+	await revokeSessionToken(c.get("user"));
+	return c.json({ ok: true });
 });
 
 authRoutes.patch("/me", requireSessionAuth, async (c) => {

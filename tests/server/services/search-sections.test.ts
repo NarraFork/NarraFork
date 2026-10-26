@@ -6,7 +6,7 @@
  * an exact hit count, its first few hits, and the rest pageable. Filters (project,
  * time, owner) and the archived scope narrow every section they mean something to.
  */
-import { afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
 import { Hono } from "hono";
 import { narratorMessages, narrators, projects, users } from "../../../server/db/schema";
 import { getTestDb } from "../../setup";
@@ -23,6 +23,7 @@ const searchStore = createSqliteSearchStore(async (sql, params) =>
 );
 mock.module("../../../server/services/search/backend", () => ({ searchStore }));
 const {
+	clearSessionSearchCache,
 	decodeSearchCursor,
 	encodeSearchCursor,
 	mergeSessionCandidates,
@@ -121,6 +122,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+	clearSessionSearchCache();
 	sqlite.run("PRAGMA foreign_keys = OFF");
 	for (const table of ["narrator_messages", "narrators", "projects", "users"]) {
 		sqlite.run(`DELETE FROM "${table}"`);
@@ -235,6 +237,82 @@ describe("session results", () => {
 	});
 });
 
+describe("one search serves its pages", () => {
+	it("lists each session's newest hits on later pages without searching again", async () => {
+		const newest = new Map<string, string[]>();
+		for (const id of ["s1", "s2", "s3", "s4"]) {
+			seedNarrator(id);
+			const ids = Array.from({ length: 5 }, (_, i) => seedMessage(id, `kestrel ${i}`, day(3 + i)));
+			newest.set(id, ids.slice(2).reverse());
+		}
+		const aggregates = spyOn(searchStore, "searchSessionAggregates");
+		const hits = spyOn(searchStore, "searchSessionHits");
+		try {
+			const first = await sessions("kestrel", { limits: { sessions: 2 } });
+			const second = await sessions("kestrel", {
+				limits: { sessions: 2 },
+				cursor: first.nextCursor ?? undefined,
+			});
+			for (const item of [...first.items, ...second.items]) {
+				expect(item.hitCount).toBe(5);
+				expect(item.hits.map((h) => h.id)).toEqual(newest.get(item.id) ?? []);
+				expect(item.hits[0]?.snippet).toContain("kestrel");
+			}
+			// Expanding a card pages through one read of its hits.
+			const base = { query: "kestrel", narratorId: "s1", principal: ADMIN };
+			const firstHits = await searchService.searchSessionHits({ ...base, limit: 2 });
+			const moreHits = await searchService.searchSessionHits({
+				...base,
+				limit: 2,
+				cursor: firstHits.nextCursor ?? undefined,
+			});
+			expect([...firstHits.hits, ...moreHits.hits].map((h) => h.id)).toHaveLength(4);
+			expect(aggregates).toHaveBeenCalledTimes(1);
+			expect(hits).toHaveBeenCalledTimes(1);
+		} finally {
+			aggregates.mockRestore();
+			hits.mockRestore();
+		}
+	});
+
+	it("keeps viewers and filters apart", async () => {
+		seedNarrator("mine", { visibility: "private", owner: OWNER });
+		seedMessage("mine", "kestrel private", day(3));
+		const asAdmin = await sessions("kestrel");
+		const asOther = await sessions("kestrel", { principal: { userId: OTHER, isAdmin: false } });
+		const archived = await sessions("kestrel", {
+			scope: { subagents: false, system: false, tools: false, archived: true },
+		});
+		expect(asAdmin.items.map((s) => s.id)).toEqual(["mine"]);
+		expect(asOther.items).toEqual([]);
+		expect(archived.items.map((s) => s.id)).toEqual(["mine"]);
+	});
+
+	it("jumps to a page through the route", async () => {
+		for (const id of ["s1", "s2", "s3", "s4", "s5"]) {
+			seedNarrator(id);
+			seedMessage(id, "kestrel", day(3));
+		}
+		const app = appFor("admin", "admin");
+		const read = async (page: number) => {
+			const response = await app.request(
+				`/api/search?q=kestrel&sections=sessions&limit=2&page=${page}`,
+			);
+			expect(response.status).toBe(200);
+			const body = (await response.json()) as {
+				sections: { sessions: { items: { id: string }[]; total: number } };
+			};
+			return body.sections.sessions;
+		};
+		const pages = await Promise.all([read(1), read(2), read(3)]);
+		expect(pages.map((p) => p.items.length)).toEqual([2, 2, 1]);
+		expect(new Set(pages.flatMap((p) => p.items.map((i) => i.id))).size).toBe(5);
+		expect((await read(4)).items).toEqual([]);
+		const invalid = await app.request("/api/search?q=kestrel&sections=sessions&page=0");
+		expect(invalid.status).toBe(400);
+	});
+});
+
 describe("filters and scope", () => {
 	beforeEach(() => {
 		seedNarrator("a-mine", { projectId: "proj-a", owner: OWNER });
@@ -329,6 +407,7 @@ describe("session ranking", () => {
 					lastMessageAt: null,
 					createdAt: null,
 					updatedAt: null,
+					latestHits: [],
 					...overrides,
 				},
 			],

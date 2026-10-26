@@ -24,7 +24,6 @@
 	"section_sessions": "会话",
 	"section_knowledge": "知识库",
 	"viewAll": "查看全部 {{count}}",
-	"loadMore": "加载更多",
 	"label_session": "会话",
 	"label_knowledge": "知识库",
 	"subagent": "子代理",
@@ -49,5 +48,6 @@
 	"recentOnly": "搜索词都很短，只搜索了最近 {{days}} 天的会话。",
 	"searchFullHistory": "搜索全部历史",
 	"toolHit": "工具",
-	"toolHitNamed": "工具 · {{tool}}"
+	"toolHitNamed": "工具 · {{tool}}",
+	"pagesLowerBound": "仅列出最相关的前 {{count}} 个结果，可缩小搜索范围查看其余。"
 }

@@ -300,6 +300,7 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 		});
 
 		params.onRequestStart?.();
+		params.streamProgress?.beginAttempt();
 		const response = await this.pfetch(url, {
 			method: "POST",
 			headers,
@@ -310,13 +311,14 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 			params.requestDump?.finishResponseCapture(false);
 			throw error;
 		});
+		params.streamProgress?.onHeaders(response.status);
 		params.requestDump?.setResponseMeta({
 			status: response.status,
 			headers: sanitizeHeaders(response.headers),
 		});
 
 		if (!response.body) throw new Error("Gemini Interactions API returned no body");
-		const tap = captureResponseStream(response.body, params.requestDump);
+		const tap = captureResponseStream(response.body, params.requestDump, params.streamProgress);
 		try {
 			if (!response.ok) {
 				const errorText = await readResponseTextWithLimit(

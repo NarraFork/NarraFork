@@ -31,6 +31,11 @@ export interface IntegrityProbeReport {
 	durationMs: number;
 }
 
+/** A report keeps at most this many findings, joined by "; ". */
+export const MAX_REPORT_FINDINGS = 20;
+/** …and at most this many characters of them. */
+export const MAX_REPORT_DETAIL_CHARS = 2000;
+
 /** Marker line prefix so the parent can find the report even if SQLite writes to stdout. */
 export const DB_INTEGRITY_REPORT_PREFIX = "narrafork-db-integrity-report:";
 

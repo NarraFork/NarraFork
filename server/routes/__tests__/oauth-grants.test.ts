@@ -2,7 +2,6 @@ import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test
 import { createHash } from "node:crypto";
 import { and, eq, inArray, isNull } from "drizzle-orm";
 import { Hono } from "hono";
-import { sign } from "hono/jwt";
 import { db } from "../../db";
 import {
 	integrationAuthorities,
@@ -23,7 +22,6 @@ import {
 	refreshAccessToken,
 	validateAccessToken,
 } from "../../lib/oauth-provider";
-import { settings } from "../../lib/settings";
 import { requireSessionAuth } from "../../middleware/auth";
 import { integrationAuthorityService } from "../../services/integration-authority-service";
 import { oauthGrantRoutes } from "../oauth-grants";
@@ -64,8 +62,8 @@ function bearer(token: string): Record<string, string> {
 }
 
 async function sessionToken(actorId: string): Promise<string> {
-	const now = Math.floor(Date.now() / 1000);
-	return sign({ sub: actorId, role: "user", iat: now, exp: now + 3600 }, settings.auth.jwtSecret);
+	const { createToken } = await import("../../lib/auth");
+	return createToken(actorId);
 }
 
 async function sessionHeaders(actorId: string): Promise<Record<string, string>> {

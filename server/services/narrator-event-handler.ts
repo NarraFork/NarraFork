@@ -555,7 +555,9 @@ export class CriticalEventPersistenceError extends Error {
 export interface EventHooks {
 	/** Title tracking after assistant_message */
 	onTitleCheck?: (savedId: string) => Promise<{ titleUpdate?: boolean } | null>;
-	/** Prepare EnterPlanMode after its assistant message is persisted, without committing state. */
+	/** Runs after an assistant message is finalized, persisted and broadcast. */
+	onAssistantMessageFinalized?: () => Promise<void>;
+	/** Prepare EnterPlanMode once its tool call row is persisted, without committing state. */
 	onPrepareEnterPlanMode?: (
 		toolCallId: string,
 		toolUseId: string,
@@ -754,14 +756,8 @@ async function persistContentCheckpoint(
 function appendRawStreamText(
 	previous: { text: string; textOffset?: number } | undefined,
 	text: string,
-	textOffset?: number,
-): { text: string; textOffset?: number } {
-	if (textOffset == null) {
-		return {
-			text: (previous?.text ?? "") + text,
-			...(previous?.textOffset != null ? { textOffset: previous.textOffset } : {}),
-		};
-	}
+	textOffset: number,
+): { text: string; textOffset: number } {
 	const previousStart = previous?.textOffset ?? 0;
 	const previousEnd = previousStart + (previous?.text.length ?? 0);
 	if (!previous || textOffset > previousEnd || textOffset < previousStart) {
@@ -945,7 +941,7 @@ function noteSubagentOutputText(
 	ctx: EventHandlerContext,
 	blockKey: string,
 	text: string,
-	textOffset?: number,
+	textOffset: number,
 ): void {
 	if (!ctx.parentToolUseId || !text) return;
 	const key = ctx.narratorId;
@@ -964,22 +960,18 @@ function noteSubagentOutputText(
 	// replayed/overlapping prefix (a resume) must not double-count.
 	const previous = counter.blocks.get(blockKey);
 	let span: { start: number; length: number };
-	if (textOffset == null) {
-		span = { start: previous?.start ?? 0, length: (previous?.length ?? 0) + text.length };
+	const previousEnd = (previous?.start ?? 0) + (previous?.length ?? 0);
+	if (!previous || textOffset > previousEnd || textOffset < previous.start) {
+		// A gap/missing prefix cannot be invented — the delta becomes the span.
+		span = { start: textOffset, length: text.length };
 	} else {
-		const previousEnd = (previous?.start ?? 0) + (previous?.length ?? 0);
-		if (!previous || textOffset > previousEnd || textOffset < previous.start) {
-			// A gap/missing prefix cannot be invented — the delta becomes the span.
-			span = { start: textOffset, length: text.length };
-		} else {
-			// Merge, never shrink: a replay fully INSIDE the span adds nothing (the
-			// max keeps the old end), one extending past it grows by exactly the
-			// non-overlapping tail — the length-only form of appendRawStreamText.
-			span = {
-				start: previous.start,
-				length: Math.max(previousEnd, textOffset + text.length) - previous.start,
-			};
-		}
+		// Merge, never shrink: a replay fully INSIDE the span adds nothing (the
+		// max keeps the old end), one extending past it grows by exactly the
+		// non-overlapping tail — the length-only form of appendRawStreamText.
+		span = {
+			start: previous.start,
+			length: Math.max(previousEnd, textOffset + text.length) - previous.start,
+		};
 	}
 	counter.blocks.set(blockKey, span);
 	let total = 0;
@@ -1672,22 +1664,16 @@ export async function processEvent(
 	switch (event.type) {
 		case "stream_text": {
 			ctx.fileReferenceContexts ??= new FileReferenceContextTracker();
+			const textBlockId = event.blockId;
 			const fileReferenceContext = ctx.fileReferenceContexts.capture(
-				event.outputIndex,
+				textBlockId,
 				ctx.getFileReferenceContext,
-				event.blockId,
 			);
-			const textBlockId = event.blockId ?? ctx.fileReferenceContexts.blockId(event.outputIndex);
 			const snap = getOrCreateSnapshot(ctx.parentToolUseId ? narratorId : broadcastTargetId);
 			const existing = snap.streamingBlocks.find((b) => b.type === "text" && b.id === textBlockId);
-			const base = event.blockId ? ctx.committedContentSnapshots?.get(event.blockId) : undefined;
+			const base = ctx.committedContentSnapshots?.get(textBlockId);
 			const latestRevision = existing?.type === "text" ? existing.revision : base?.revision;
-			if (
-				event.blockRevision != null &&
-				latestRevision != null &&
-				event.blockRevision <= latestRevision
-			)
-				return null;
+			if (latestRevision != null && event.blockRevision <= latestRevision) return null;
 			// Clear "reasoning" substatus when text starts (reasoning phase ended)
 			if (ctx.removeSubstatus && ctx.getSubstatus?.().has("reasoning")) {
 				ctx.removeSubstatus("reasoning").catch(() => {});
@@ -1703,12 +1689,7 @@ export async function processEvent(
 			// Track AI output character rate
 			recordOutputChunk(event.text.length);
 			// A subagent's reply length is the parent card's live progress signal.
-			noteSubagentOutputText(
-				ctx,
-				textBlockId ?? `output:${event.outputIndex ?? 0}`,
-				event.text,
-				event.blockTextOffset,
-			);
+			noteSubagentOutputText(ctx, textBlockId, event.text, event.blockTextOffset);
 
 			// Text snapshots belong to the actual author (also on a subagent's own
 			// page), never to a different narrator sharing the parent's subscription.
@@ -1719,7 +1700,7 @@ export async function processEvent(
 			);
 			if (existing?.type === "text") {
 				Object.assign(existing, rawText);
-				if (event.blockRevision != null) existing.revision = event.blockRevision;
+				existing.revision = event.blockRevision;
 			} else {
 				snap.streamingBlocks.splice(
 					findOrderedSnapshotInsertIndex(snap.streamingBlocks, event.outputIndex),
@@ -1727,7 +1708,7 @@ export async function processEvent(
 					{
 						type: "text",
 						id: textBlockId,
-						...(event.blockRevision != null ? { revision: event.blockRevision } : {}),
+						revision: event.blockRevision,
 						...rawText,
 						outputIndex: event.outputIndex,
 						fileReferenceContext,
@@ -1741,8 +1722,8 @@ export async function processEvent(
 					type: "text_delta",
 					text: event.text,
 					id: textBlockId,
-					...(event.blockRevision != null ? { revision: event.blockRevision } : {}),
-					...(event.blockTextOffset != null ? { textOffset: event.blockTextOffset } : {}),
+					revision: event.blockRevision,
+					textOffset: event.blockTextOffset,
 				},
 				fileReferenceContext,
 				...(event.outputIndex != null ? { outputIndex: event.outputIndex } : {}),
@@ -1765,8 +1746,8 @@ export async function processEvent(
 						type: "text_delta",
 						text: event.text,
 						id: textBlockId,
-						...(event.blockRevision != null ? { revision: event.blockRevision } : {}),
-						...(event.blockTextOffset != null ? { textOffset: event.blockTextOffset } : {}),
+						revision: event.blockRevision,
+						textOffset: event.blockTextOffset,
 					},
 					fileReferenceContext,
 					...(event.outputIndex != null ? { outputIndex: event.outputIndex } : {}),
@@ -1966,27 +1947,11 @@ export async function processEvent(
 		case "block_complete": {
 			const { block } = event;
 			const snapshotNarratorId = ctx.parentToolUseId ? narratorId : broadcastTargetId;
-			const textBlockId =
-				block.type === "text"
-					? (block.id ?? ctx.fileReferenceContexts?.blockId(block.outputIndex))
-					: undefined;
-			const mixedTextSources =
-				block.type === "text" && !block.id && ctx.fileReferenceContexts?.hasDifferentContexts();
-			let fileReferenceContext =
-				block.type === "text"
-					? (ctx.fileReferenceContexts?.peek(block.outputIndex, block.id) ?? null)
-					: null;
-			if (mixedTextSources && block.type === "text") {
-				// The loop can combine multiple output items into one block_complete.
-				// Unless this is provably the exact lane, a mixed-device body has no
-				// single trustworthy base. Keep the text; only disable inferred links.
-				const streamed = streamingSnapshots
-					.get(ctx.parentToolUseId ? narratorId : broadcastTargetId)
-					?.streamingBlocks.find(
-						(candidate) => candidate.type === "text" && candidate.id === textBlockId,
-					);
-				if (streamed?.type !== "text" || streamed.text !== block.text) fileReferenceContext = null;
-			}
+			const textBlockId = block.type === "text" ? block.id : undefined;
+			// The element's own context; a text block without an element id names no
+			// device to resolve its links against, so it gets none.
+			const fileReferenceContext =
+				block.type === "text" ? (ctx.fileReferenceContexts?.peek(block.id) ?? null) : null;
 
 			// Capture the exact live object, but keep it visible until BOTH persistence
 			// and publication finish. A later delta may advance it while we await I/O.
@@ -2110,13 +2075,6 @@ export async function processEvent(
 					...(block.citations ? { citations: block.citations } : {}),
 				});
 				retireCompletedSnapshot();
-				if (
-					!block.id &&
-					ctx.fileReferenceContexts?.blockId(block.outputIndex) === textBlockId &&
-					(!completedSnapshot || !snap?.streamingBlocks.includes(completedSnapshot))
-				) {
-					ctx.fileReferenceContexts?.complete(block.outputIndex);
-				}
 			} else if (block.type === "reasoning") {
 				await persistContentCheckpoint(ctx, partialId, {
 					type: "reasoning",
@@ -2177,6 +2135,14 @@ export async function processEvent(
 				ctx.toolCallIdsMap.set(block.toolUseId, toolCallId);
 				ctx.toolExecutionReceipts ??= new Map();
 				ctx.toolExecutionReceipts.set(block.toolUseId, { messageId: partialId, binding });
+				// Prepare plan-mode state at the call's own persistence, before the loop can
+				// start it: tools run as soon as their input is complete, not after the
+				// response ends, and the plan file path must already be in the tool context.
+				if (block.name === "EnterPlanMode" && hooks?.onPrepareEnterPlanMode) {
+					ctx.preparedPlanModeToolCalls ??= new Map();
+					ctx.preparedPlanModeToolCalls.set(block.toolUseId, toolCallId);
+					await hooks.onPrepareEnterPlanMode(toolCallId, block.toolUseId, block.input);
+				}
 				event.onToolPersisted?.(binding);
 				recordTurnToolCall(narratorId);
 				if (block.name === "Write" && typeof block.input.content === "string") {
@@ -2447,6 +2413,13 @@ export async function processEvent(
 							tu.toolUseId,
 							rows[0].id,
 						);
+						// A call bound only now never passed block_complete, so it cannot have
+						// started (execution needs the binding) nor been prepared there.
+						if (tu.name === "EnterPlanMode" && hooks?.onPrepareEnterPlanMode) {
+							ctx.preparedPlanModeToolCalls ??= new Map();
+							ctx.preparedPlanModeToolCalls.set(tu.toolUseId, binding.toolCallId);
+							await hooks.onPrepareEnterPlanMode(binding.toolCallId, tu.toolUseId, tu.input);
+						}
 					}
 					ctx.toolCallIdsMap.set(tu.toolUseId, binding.toolCallId);
 					ctx.toolExecutionReceipts.set(tu.toolUseId, { messageId: savedId, binding });
@@ -2454,29 +2427,6 @@ export async function processEvent(
 					if (tu.name === "Write" && typeof tu.input.content === "string") {
 						await handoffWriteInput(ctx, tu.toolUseId, tu.input.content, savedId, binding);
 					}
-				}
-			}
-
-			if (
-				hooks?.onPrepareEnterPlanMode &&
-				event.toolUses.some((toolUse) => toolUse.name === "EnterPlanMode")
-			) {
-				if (!fullMessage) {
-					throw new Error(
-						`Cannot prepare EnterPlanMode: persisted message ${savedId} was not found.`,
-					);
-				}
-				for (const tu of event.toolUses) {
-					if (tu.name !== "EnterPlanMode") continue;
-					const toolCall = fullMessage.toolCalls.find((tc) => tc.toolUseId === tu.toolUseId);
-					if (!toolCall?.id) {
-						throw new Error(
-							`Cannot prepare EnterPlanMode without an exact tool-call row for ${tu.toolUseId}.`,
-						);
-					}
-					ctx.preparedPlanModeToolCalls ??= new Map();
-					ctx.preparedPlanModeToolCalls.set(tu.toolUseId, toolCall.id);
-					await hooks.onPrepareEnterPlanMode(toolCall.id, tu.toolUseId, tu.input);
 				}
 			}
 
@@ -2532,6 +2482,11 @@ export async function processEvent(
 
 			const savedMsg = fullMessage ?? { id: savedId };
 			ctx.sseEmitter?.emit("event", { type: "assistant_message", data: savedMsg });
+
+			// Effects deferred until the response is persisted whole (plan approval restart).
+			if (hooks?.onAssistantMessageFinalized) {
+				await hooks.onAssistantMessageFinalized();
+			}
 
 			// Main narrator: title tracking
 			if (hooks?.onTitleCheck) {
@@ -3020,25 +2975,16 @@ export async function processEvent(
 		}
 
 		case "stream_reasoning": {
-			// Provider itemId is replay metadata, not the attempt-scoped display ID.
-			// Keep its legacy fallback only when the producer has no loop identity.
-			const reasoningId = event.blockId ?? event.providerMetadata?.openai?.itemId;
+			// The loop's attempt-scoped element id; a provider itemId is replay metadata only.
+			const reasoningId = event.blockId;
 			const reasoningOutputIndex = event.outputIndex;
 			const snap = getOrCreateSnapshot(ctx.parentToolUseId ? narratorId : broadcastTargetId);
-			const existing = snap.streamingBlocks.find((b) => {
-				if (b.type !== "reasoning") return false;
-				if (reasoningId) return b.id === reasoningId;
-				if (reasoningOutputIndex != null) return b.outputIndex === reasoningOutputIndex;
-				return !b.id && b.outputIndex == null;
-			});
-			const base = event.blockId ? ctx.committedContentSnapshots?.get(event.blockId) : undefined;
+			const existing = snap.streamingBlocks.find(
+				(b) => b.type === "reasoning" && b.id === reasoningId,
+			);
+			const base = ctx.committedContentSnapshots?.get(reasoningId);
 			const latestRevision = existing?.type === "reasoning" ? existing.revision : base?.revision;
-			if (
-				event.blockRevision != null &&
-				latestRevision != null &&
-				event.blockRevision <= latestRevision
-			)
-				return null;
+			if (latestRevision != null && event.blockRevision <= latestRevision) return null;
 			// Add "reasoning" substatus on first reasoning chunk
 			if (ctx.addSubstatus && ctx.getSubstatus && !ctx.getSubstatus().has("reasoning")) {
 				ctx.addSubstatus("reasoning").catch(() => {});
@@ -3062,7 +3008,7 @@ export async function processEvent(
 			);
 			if (existing?.type === "reasoning") {
 				Object.assign(existing, rawText);
-				if (event.blockRevision != null) existing.revision = event.blockRevision;
+				existing.revision = event.blockRevision;
 			} else {
 				snap.streamingBlocks.splice(
 					findOrderedSnapshotInsertIndex(snap.streamingBlocks, reasoningOutputIndex),
@@ -3071,7 +3017,7 @@ export async function processEvent(
 						type: "reasoning",
 						...rawText,
 						...(reasoningId ? { id: reasoningId } : {}),
-						...(event.blockRevision != null ? { revision: event.blockRevision } : {}),
+						revision: event.blockRevision,
 						...(reasoningOutputIndex != null ? { outputIndex: reasoningOutputIndex } : {}),
 					},
 				);
@@ -3083,8 +3029,8 @@ export async function processEvent(
 					type: "reasoning_delta",
 					text: event.text,
 					...(reasoningId ? { id: reasoningId } : {}),
-					...(event.blockRevision != null ? { revision: event.blockRevision } : {}),
-					...(event.blockTextOffset != null ? { textOffset: event.blockTextOffset } : {}),
+					revision: event.blockRevision,
+					textOffset: event.blockTextOffset,
 					...(reasoningOutputIndex != null ? { outputIndex: reasoningOutputIndex } : {}),
 				},
 			};
@@ -3106,8 +3052,8 @@ export async function processEvent(
 						type: "reasoning_delta",
 						text: event.text,
 						...(reasoningId ? { id: reasoningId } : {}),
-						...(event.blockRevision != null ? { revision: event.blockRevision } : {}),
-						...(event.blockTextOffset != null ? { textOffset: event.blockTextOffset } : {}),
+						revision: event.blockRevision,
+						textOffset: event.blockTextOffset,
 						...(reasoningOutputIndex != null ? { outputIndex: reasoningOutputIndex } : {}),
 					},
 				},

@@ -1,6 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import type { MiddlewareHandler } from "hono";
-import { invalidateUserCache } from "../../../server/middleware/auth";
 import {
 	createPluginRoutes,
 	type PluginManager,
@@ -34,12 +33,10 @@ beforeEach(() => {
 		}),
 	};
 	setAuthStores({ session: store, mfa: authMfaStore });
-	for (const id of SEEN_ACTOR_IDS) invalidateUserCache(id);
 });
 
 afterEach(() => {
 	setAuthStores(undefined);
-	for (const id of SEEN_ACTOR_IDS) invalidateUserCache(id);
 });
 
 const allowAdmin: MiddlewareHandler = async (_c, next) => {

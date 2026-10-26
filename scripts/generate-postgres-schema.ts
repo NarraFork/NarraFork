@@ -117,6 +117,17 @@ const PG_BYTE_TOTAL_COLUMNS: ReadonlySet<string> = new Set([
 	"file_change_storage_budgets.quota_bytes",
 ]);
 /**
+ * Unix-seconds integer columns. SQLite integers are 64-bit, but PostgreSQL `integer` is
+ * int4 and overflows in January 2038 — and a session's expiry already reaches a week
+ * past "now". PostgreSQL stores them as `bigint`.
+ */
+const PG_UNIX_SECONDS_COLUMNS: ReadonlySet<string> = new Set([
+	"auth_sessions.session_start",
+	"auth_sessions.created_at",
+	"auth_sessions.expires_at",
+	"auth_sessions.revoked_at",
+]);
+/**
  * PostgreSQL-only identity columns: capabilities PostgreSQL needs that SQLite provides
  * implicitly, so the SQLite schema deliberately does not declare them.
  *
@@ -398,7 +409,8 @@ export function generatePostgresSchema(
 						if (
 							c.kind === "integer" &&
 							c.mode !== "boolean" &&
-							PG_BYTE_TOTAL_COLUMNS.has(`${table.name}.${c.name}`)
+							(PG_BYTE_TOTAL_COLUMNS.has(`${table.name}.${c.name}`) ||
+								PG_UNIX_SECONDS_COLUMNS.has(`${table.name}.${c.name}`))
 						) {
 							c.pgType = "bigint";
 						}

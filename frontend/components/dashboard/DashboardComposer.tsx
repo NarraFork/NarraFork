@@ -1,12 +1,18 @@
 import { ActionIcon, Box, Button, Group, Text, Tooltip } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import { composerDocumentText, parseComposerDocument } from "@shared/composer-document";
+import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-effort";
 import { IconAdjustmentsHorizontal, IconFolder, IconPaperclip } from "@tabler/icons-react";
+import { useQuery } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
 import { lazy, Suspense, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../../hooks/useAuth";
 import { useCreateNarrator } from "../../hooks/useNarrator";
+import {
+	useNarratorPermissionsCapability,
+	useNarratorPlanModeCapability,
+} from "../../hooks/usePlatform";
 import { useProjectDirStatus } from "../../hooks/useProjectDirStatus";
 import { addRecentTab } from "../../hooks/useRecentTabs";
 import { api, isAbortError } from "../../lib/api";
@@ -19,6 +25,7 @@ import {
 	NarratorComposer,
 	type NarratorComposerHandle,
 } from "../narrator/composer/NarratorComposer";
+import { PermissionModePickerMenu } from "../narrator/interaction/PermissionModePickerMenu";
 import { UploadProgressBar } from "../narrator/interaction/UploadProgressBar";
 import { useComposerAttachments } from "../narrator/interaction/use-composer-attachments";
 import { useComposerFileIngest } from "../narrator/interaction/use-composer-file-ingest";
@@ -27,6 +34,8 @@ import {
 	snapshotComposerFiles,
 } from "../narrator/interaction/use-narrator-send";
 import { ModelPickerMenu } from "../narrator/model/ModelPickerMenu";
+import { ReasoningEffortPickerMenu } from "../narrator/model/ReasoningEffortPickerMenu";
+import { useDraftReasoningEffort } from "../narrator/model/use-draft-reasoning-effort";
 import { directoryLabel } from "./dashboard-sessions";
 
 const CreateNarratorModal = lazy(() =>
@@ -44,6 +53,12 @@ const COMPOSER_PREFS_KEY = "narrafork_dashboard_composer";
 interface ComposerPrefs {
 	cwd?: string;
 	model?: string;
+	/** Explicit thinking tier for sessions created here; absent = instance default. */
+	reasoningEffort?: string | null;
+	/** Explicit permission mode; absent = instance default. */
+	permissionMode?: string | null;
+	/** Explicit plan-mode start; absent = instance default. */
+	startInPlanMode?: boolean | null;
 }
 
 function readPrefs(): ComposerPrefs {
@@ -84,6 +99,56 @@ export function DashboardComposer() {
 	// `null` = never chosen on this device: follow the instance default directory.
 	const [chosenCwd, setChosenCwd] = useState<string | null>(prefs.cwd || null);
 	const [model, setModel] = useState(prefs.model || FOLLOW_DEFAULT_MODEL);
+	// Same "null = follow the instance default" rule for the create-time session
+	// options, so an untouched composer behaves exactly like a session created
+	// without them (the server then applies its own defaults).
+	const [reasoningEffortOverride, setReasoningEffortOverride] = useState<string | null>(
+		prefs.reasoningEffort ?? null,
+	);
+	const [permissionModeOverride, setPermissionModeOverride] = useState<string | null>(
+		prefs.permissionMode ?? null,
+	);
+	const [startInPlanModeOverride, setStartInPlanModeOverride] = useState<boolean | null>(
+		prefs.startInPlanMode ?? null,
+	);
+	// Same query key as the model menus, so this shares their cache entry instead of
+	// issuing its own request; only the instance defaults are read from it.
+	const { data: settingsData } = useQuery({
+		queryKey: ["settings"],
+		queryFn: api.getSettings,
+		staleTime: 30_000,
+	});
+	const draftReasoning = useDraftReasoningEffort(model);
+	// Show what the created session will actually get: the user's choice clamped
+	// onto the selected model's tiers, or the instance default when untouched.
+	const reasoningEffort = reasoningEffortOverride
+		? clampReasoningEffort(reasoningEffortOverride as ReasoningEffort, draftReasoning.options)
+		: draftReasoning.defaultEffort;
+	const permissionModesCapability = useNarratorPermissionsCapability();
+	const availablePermissionModes = permissionModesCapability.supported
+		? permissionModesCapability.modes
+		: [];
+	const permissionModesUnavailableReason = permissionModesCapability.supported
+		? undefined
+		: (permissionModesCapability.reason ?? tn("permissionModesUnavailable"));
+	const permissionMode =
+		permissionModeOverride ?? settingsData?.agent?.defaultPermissionMode ?? "default";
+	const permissionModeKnown =
+		permissionModeOverride != null || settingsData?.agent?.defaultPermissionMode != null;
+	const planModeCapability = useNarratorPlanModeCapability();
+	const startInPlanMode =
+		startInPlanModeOverride ?? settingsData?.agent?.defaultStartInPlanMode ?? false;
+	// Only send the plan-mode flag once we know what the toggle is showing. Before
+	// settings land the local `false` could silently override an instance default of
+	// `true`; omitting the field lets the server apply that default instead.
+	const startInPlanModeKnown =
+		startInPlanModeOverride != null || settingsData?.agent?.defaultStartInPlanMode != null;
+	// Persisted selections, merged so saving one field never drops the others.
+	const prefsRef = useRef<ComposerPrefs>(prefs);
+	const savePrefs = (patch: ComposerPrefs) => {
+		prefsRef.current = { ...prefsRef.current, ...patch };
+		writePrefs(prefsRef.current);
+	};
 	const cwd = chosenCwd ?? projectDir.usablePath ?? "";
 	// Nothing chosen and the default is unset or gone: the server would refuse the
 	// session, so ask for a directory instead of failing on send.
@@ -134,15 +199,45 @@ export function DashboardComposer() {
 		});
 	const hasAttachments = attachedImages.length + attachedTextFiles.length > 0;
 
+	// Every option below is a create-time one, so changing it invalidates a session
+	// left behind by a failed send — that session already carries the old value.
 	const selectCwd = (path: string) => {
 		pendingSessionRef.current = null;
 		setChosenCwd(path);
-		writePrefs({ cwd: path, model });
+		savePrefs({ cwd: path });
 	};
 	const selectModel = (value: string) => {
 		pendingSessionRef.current = null;
 		setModel(value);
-		writePrefs({ cwd: chosenCwd ?? undefined, model: value });
+		savePrefs({ model: value });
+	};
+	const selectReasoningEffort = (value: string) => {
+		pendingSessionRef.current = null;
+		setReasoningEffortOverride(value);
+		savePrefs({ reasoningEffort: value });
+	};
+	// Without this, a pick would be a one-way door on this device: nothing in the
+	// menu would restore "follow the instance default".
+	const followDefaultReasoningEffort = () => {
+		pendingSessionRef.current = null;
+		setReasoningEffortOverride(null);
+		savePrefs({ reasoningEffort: null });
+	};
+	const selectPermissionMode = (value: string) => {
+		pendingSessionRef.current = null;
+		setPermissionModeOverride(value);
+		savePrefs({ permissionMode: value });
+	};
+	const followDefaultPermissionMode = () => {
+		pendingSessionRef.current = null;
+		setPermissionModeOverride(null);
+		savePrefs({ permissionMode: null });
+	};
+	const togglePlanMode = () => {
+		const next = !startInPlanMode;
+		pendingSessionRef.current = null;
+		setStartInPlanModeOverride(next);
+		savePrefs({ startInPlanMode: next });
 	};
 
 	const openDirectoryChooser = () => setBrowseOpen(true);
@@ -214,6 +309,16 @@ export function DashboardComposer() {
 				const data = await createNarrator.mutateAsync({
 					...(chosenCwd ? { cwd: chosenCwd } : {}),
 					model,
+					// Only an explicit pick is sent: the server keeps the narrator on the
+					// instance defaults when the field is absent (a null reasoningEffort is
+					// exactly "follow the global default", re-clamped per model per turn).
+					...(reasoningEffortOverride ? { reasoningEffort: reasoningEffortOverride } : {}),
+					// Sent when the menu's value is known, so what it shows is what the
+					// session gets; that value is the instance default until the user
+					// touches it. Before settings land, omitting lets the server decide
+					// rather than freezing this device's placeholder over a real default.
+					...(permissionModeKnown ? { permissionMode } : {}),
+					...(startInPlanModeKnown ? { startInPlanMode } : {}),
 				});
 				session = {
 					id: data.id,
@@ -352,6 +457,31 @@ export function DashboardComposer() {
 				</Tooltip>
 				<Box style={{ minWidth: 0, maxWidth: 280 }}>
 					<ModelPickerMenu value={model} onChange={selectModel} />
+				</Box>
+				{draftReasoning.supported && (
+					<Box style={{ minWidth: 0 }}>
+						<ReasoningEffortPickerMenu
+							value={reasoningEffort}
+							options={draftReasoning.options}
+							onChange={selectReasoningEffort}
+							onFollowDefault={reasoningEffortOverride ? followDefaultReasoningEffort : undefined}
+						/>
+					</Box>
+				)}
+				<Box style={{ minWidth: 0 }}>
+					<PermissionModePickerMenu
+						value={permissionMode}
+						availableModes={availablePermissionModes}
+						unavailableReason={permissionModesUnavailableReason}
+						onChange={selectPermissionMode}
+						onFollowDefault={permissionModeOverride ? followDefaultPermissionMode : undefined}
+						planMode={{
+							active: startInPlanMode,
+							supported: planModeCapability.supported,
+							unsupportedReason: planModeCapability.reason ?? tn("planModeUnavailable"),
+							onToggle: togglePlanMode,
+						}}
+					/>
 				</Box>
 				<Tooltip label={t("composer.advanced")}>
 					<ActionIcon

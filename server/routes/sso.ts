@@ -6,7 +6,7 @@
  *   2. GET  /auth/sso/callback           → verify, resolve/provision user,
  *                                          302 back to the frontend with a
  *                                          single-use sso_code
- *   3. POST /auth/sso/exchange {code}     → returns the real session JWT
+ *   3. POST /auth/sso/exchange {code}     → returns a session token
  *
  * The JWT is never placed in a URL; the frontend exchanges a short-lived,
  * single-use code for it. This avoids leaking the session token via browser
@@ -192,7 +192,7 @@ export async function handleSsoCallback(c: Context) {
 	}
 }
 
-/** Public: exchange a one-time SSO code for the real session JWT. */
+/** Public: exchange a one-time SSO code for a session token. */
 ssoRoutes.post("/exchange", async (c) => {
 	const parsed = oidcExchangeSchema.safeParse(await c.req.json());
 	if (!parsed.success) throw zodValidationError(parsed.error);

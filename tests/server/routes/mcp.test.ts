@@ -4,7 +4,6 @@ import type { ContentfulStatusCode } from "hono/utils/http-status";
 import type { ToolContext } from "../../../server/lib/agent/types";
 import { AppError } from "../../../server/lib/errors";
 import type { McpServerConfig } from "../../../server/lib/settings";
-import { invalidateUserCache } from "../../../server/middleware/auth";
 import type { AuthSessionStore } from "../../../server/services/auth/session-store";
 import { authMfaStore, authSessionStore, setAuthStores } from "../../../server/services/auth/store";
 
@@ -163,7 +162,6 @@ beforeEach(() => {
 	role = "user";
 	// The 60s verified-user cache would otherwise freeze the role a prior test left
 	// cached for this actor; drop it so each test re-reads the live `role` via the seam.
-	invalidateUserCache(ACTOR_ID);
 	connectedServerIds.clear();
 	lastTestConfig = null;
 	saveSettingsCalls = 0;
@@ -175,7 +173,6 @@ beforeEach(() => {
 
 afterAll(() => {
 	setAuthStores(undefined);
-	invalidateUserCache(ACTOR_ID);
 	mock.module("../../../server/lib/settings", () => actualSettingsModule);
 	mock.module("../../../server/lib/mcp/manager", () => actualManagerModule);
 	mock.module("../../../server/lib/mcp/tool-bridge", () => actualToolBridgeModule);

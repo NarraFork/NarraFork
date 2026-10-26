@@ -1,6 +1,7 @@
 import { type ChildProcess, execSync } from "node:child_process";
 import path from "node:path";
 import { getHome, IS_WINDOWS, isWslAllowed } from "../platform";
+import { killWindowsProcessTree } from "../spawn";
 
 const SIGKILL_DELAY_MS = 200;
 
@@ -23,17 +24,8 @@ export async function killTree(
 		try {
 			proc.kill();
 			await Bun.sleep(SIGKILL_DELAY_MS);
-			if (!opts?.exited?.()) {
-				try {
-					execSync(`taskkill /T /F /PID ${pid}`, {
-						stdio: "ignore",
-						timeout: 5000,
-						windowsHide: true,
-					});
-				} catch {
-					/* best effort */
-				}
-			}
+			// Awaited, never synchronous: a blocking taskkill holds the event loop.
+			if (!opts?.exited?.()) await killWindowsProcessTree(pid);
 		} catch {
 			// Process already gone
 		}

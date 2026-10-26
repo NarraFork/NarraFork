@@ -15,6 +15,7 @@ import {
 	type WhitelistDir,
 } from "../lib/api";
 import {
+	type BlockTarget,
 	type RevertAction,
 	type RevertActionConfirmOptions,
 	type RevertActionPreview,
@@ -39,7 +40,7 @@ import {
 	invalidateRevertQueries,
 	isRevertHistoryCommitted,
 } from "../lib/revert-result";
-import { RECENT_TABS_QUERY_KEY } from "./useRecentTabs";
+import { removeRecentTabCascade } from "./useRecentTabs";
 
 const FILE_PREVIEW_QUERY_GC_TIME_MS = 30_000;
 const NARRATORS_LIST_GC_TIME_MS = 60_000;
@@ -112,37 +113,6 @@ export function useFileTreeStatus(narratorId: string, enabled = true, root?: str
 		queryKey: ["narrators", narratorId, "file-tree-status", root ?? ""],
 		queryFn: () => api.getFileTreeStatus(narratorId),
 		enabled: enabled && !!narratorId,
-		gcTime: FILE_PREVIEW_QUERY_GC_TIME_MS,
-	});
-}
-
-// --- File rollback previews ---
-
-export function useRollbackPreview(
-	narratorId: string,
-	messageId: string | null,
-	blockIndex: number | null,
-	enabled = false,
-) {
-	return useQuery({
-		queryKey: ["narrators", narratorId, "rollback-preview", messageId, blockIndex],
-		queryFn: () => api.getRollbackPreview(narratorId, messageId as string, blockIndex as number),
-		enabled: enabled && !!messageId && blockIndex != null,
-		gcTime: FILE_PREVIEW_QUERY_GC_TIME_MS,
-	});
-}
-
-/** What deleting one tool_use block would roll back, for its confirm dialog. */
-export function useBlockDeletePreview(
-	narratorId: string,
-	messageId: string | null,
-	blockIndex: number | null,
-	enabled = false,
-) {
-	return useQuery({
-		queryKey: ["narrators", narratorId, "block-delete-preview", messageId, blockIndex],
-		queryFn: () => api.blockDeletePreview(narratorId, messageId as string, blockIndex as number),
-		enabled: enabled && !!messageId && blockIndex != null,
 		gcTime: FILE_PREVIEW_QUERY_GC_TIME_MS,
 	});
 }
@@ -491,16 +461,14 @@ export function useRevertHistoryAction(narratorId: string) {
 			opts,
 		}: {
 			action: "rollback_to_block" | "delete_tool_block";
-			target: { messageId: string; blockIndex: number };
+			target: BlockTarget;
 			opts: RevertActionConfirmOptions;
 		}) => {
 			if (opts.skipRevert) {
 				const result =
 					action === "rollback_to_block"
-						? await api.rollbackToBlock(narratorId, target.messageId, target.blockIndex, {
-								skipRevert: true,
-							})
-						: await api.deleteMessageBlock(narratorId, target.messageId, target.blockIndex);
+						? await api.rollbackToBlock(narratorId, target, { skipRevert: true })
+						: await api.deleteMessageBlock(narratorId, target);
 				if (result.ok !== true) throw new Error(t("deleteMessageFailedDesc"));
 				return { reason: null };
 			}
@@ -613,11 +581,13 @@ export function useAskInPassing() {
 			narratorId,
 			question,
 			pendingMessageId,
+			quote,
 		}: {
 			narratorId: string;
 			question: string;
 			pendingMessageId: string;
-		}) => api.askInPassing(narratorId, { question, pendingMessageId }),
+			quote?: { label: string; text: string; anchor?: string };
+		}) => api.askInPassing(narratorId, { question, pendingMessageId, quote }),
 		// Only the narrator LISTS need refreshing (a new standalone narrator now
 		// exists). Invalidating the whole `["narrators"]` prefix also dropped every
 		// open session's messages/tool-calls/preview caches — including the panel the
@@ -805,26 +775,16 @@ export function useCreateNarrator() {
 
 export function useArchiveNarrator() {
 	const qc = useQueryClient();
+	const { t } = useTranslation("narrator");
 	return useMutation({
 		mutationFn: (id: string) => api.archiveNarrator(id),
 		onSuccess: (_data, narratorId) => {
 			qc.invalidateQueries({ queryKey: ["narrators"] });
-			// Remove all tabs associated with the archived narrator from the sidebar
-			const tabs =
-				qc.getQueryData<{ type: "narrator" | "project"; id: string }[]>(RECENT_TABS_QUERY_KEY) ??
-				[];
-			const isMatch = (t: (typeof tabs)[number]) => t.type === "narrator" && t.id === narratorId;
-			const matched = tabs.filter(isMatch);
-			if (matched.length > 0) {
-				for (const tab of matched) {
-					// Cascade cleanup after archive — no undo token for entities that are gone.
-					api.removeRecentTab(tab.type, tab.id, { cascade: true }).catch(() => {});
-				}
-				qc.setQueryData(
-					RECENT_TABS_QUERY_KEY,
-					tabs.filter((t) => !isMatch(t)),
-				);
-			}
+			// Cascade cleanup after archive — no undo token for entities that are gone.
+			void removeRecentTabCascade(qc, "narrator", narratorId);
+		},
+		onError: () => {
+			notifications.show({ color: "red", message: t("archiveFailed") });
 		},
 	});
 }

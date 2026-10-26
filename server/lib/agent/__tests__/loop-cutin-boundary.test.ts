@@ -9,17 +9,12 @@ import { type AgentConfig, type AgentEvent, type AgentLoopHistory, ApiError } fr
 
 /**
  * A cut-in ("插队 · 下次请求时发送") queued while a tool is already running must be
- * answered by the request that follows THAT tool call.
+ * answered by the request that follows THAT response's tool calls.
  *
- * The regression this pins: `shouldStop` was only consulted in the post-stream tool
- * phase, but the primary narrator eagerly STARTS every tool of the turn as its input
- * finishes streaming. Eagerly started tools are awaited and delivered by the execution
- * phase (never skipped), so every remaining tool of the turn still ran and the queued
- * message effectively waited for the request after next — reported as "下次请求时发送"
- * behaving like "下下次请求时发送".
- *
- * Subagents were unaffected because they pass `deferEagerToolsForSafeStop`, which is
- * why this went unnoticed: the same code with one flag flipped behaved correctly.
+ * Every call the model already produced still runs — a queued message never skips a
+ * complete call — but the loop must not send another provider request before the
+ * queued message is read. The earlier regression let the turn continue past the step,
+ * so the message waited for the request after next ("下下次请求时发送").
  */
 
 const SLOW = "CutInSlowTool";
@@ -27,6 +22,7 @@ const FAST = "CutInFastTool";
 
 const executed: string[] = [];
 let releaseSlow: (() => void) | undefined;
+let chatRequests = 0;
 /** Invoked mid-stream, right after the slow tool's input finishes arriving. */
 let queueCutIn: (() => void) | undefined;
 
@@ -50,6 +46,7 @@ const testProvider: ProviderAdapter = {
 	injectSystemPrompt: () => {},
 	async *chat(params) {
 		params.onRequestStart?.();
+		chatRequests++;
 		// One long-running tool, then three more streamed in the SAME turn — the shape
 		// of a model that keeps working while the user types a cut-in.
 		yield {
@@ -132,7 +129,7 @@ afterAll(() => {
 /**
  * Run one turn, queueing a cut-in while the first tool is still executing.
  *
- * `shouldStop` mirrors the host's one-shot contract (`evaluateSoftStopRequest`):
+ * `shouldYieldToInput` mirrors the host's one-shot contract (`evaluateSoftStopRequest`):
  * the request is consumed by whoever observes it first, so a loop that asks twice
  * and keeps only the second answer would see `false` and carry on.
  */
@@ -140,9 +137,11 @@ async function runTurnWithCutIn(overrides: Partial<AgentConfig> = {}): Promise<{
 	executed: string[];
 	skipped: string[];
 	softStopAsks: number;
+	chatRequests: number;
 }> {
 	executed.length = 0;
 	releaseSlow = undefined;
+	chatRequests = 0;
 	let queued = false;
 	let softStopAsks = 0;
 
@@ -162,7 +161,7 @@ async function runTurnWithCutIn(overrides: Partial<AgentConfig> = {}): Promise<{
 			cwd: "/tmp",
 			signal: new AbortController().signal,
 			permissionHandler: async () => ({ behavior: "allow" }),
-			shouldStop: () => {
+			shouldYieldToInput: () => {
 				softStopAsks++;
 				if (!queued) return false;
 				queued = false; // one-shot, like the real flag
@@ -179,9 +178,10 @@ async function runTurnWithCutIn(overrides: Partial<AgentConfig> = {}): Promise<{
 	return {
 		executed: [...executed],
 		skipped: events
-			.filter((e) => e.type === "tool_result" && e.metadata?.skippedForSoftStop === true)
+			.filter((e) => e.type === "tool_result" && e.isError)
 			.map((e) => (e as Extract<AgentEvent, { type: "tool_result" }>).toolUseId),
 		softStopAsks,
+		chatRequests,
 	};
 }
 
@@ -912,23 +912,25 @@ describe("model input adoption boundary", () => {
 });
 
 describe("cut-in queued while a tool is running", () => {
-	test("no later tool of the turn runs once the cut-in is queued", async () => {
+	const ALL_TOOLS = ["fast:b", "fast:c", "fast:d", "slow:in-flight"];
+
+	test("every produced call still runs, then the turn yields to the cut-in", async () => {
 		const result = await runTurnWithCutIn();
 
-		// The tool that was already in flight completes — a cut-in must never abort it.
-		expect(result.executed).toEqual(["slow:in-flight"]);
-		// Everything the model streamed afterwards is reported as skipped, so the model
-		// sees why it did not run instead of a silently missing tool_result.
-		expect(result.skipped).toEqual(["tu_b", "tu_c", "tu_d"]);
+		// A complete call is never skipped: the in-flight tool and everything the model
+		// streamed after the cut-in all run.
+		expect([...result.executed].sort()).toEqual(ALL_TOOLS);
+		expect(result.skipped).toEqual([]);
+		// No further provider request before the queued message is read.
+		expect(result.chatRequests).toBe(1);
 	});
 
-	test("subagents keep their existing behaviour", async () => {
-		// Subagents already deferred eager execution; this pins that the shared gate did
-		// not change their outcome.
+	test("subagents get the same outcome with deferred eager execution", async () => {
 		const result = await runTurnWithCutIn({ deferEagerToolsForSafeStop: true });
 
-		expect(result.executed).toEqual(["slow:in-flight"]);
-		expect(result.skipped).toEqual(["tu_b", "tu_c", "tu_d"]);
+		expect([...result.executed].sort()).toEqual(ALL_TOOLS);
+		expect(result.skipped).toEqual([]);
+		expect(result.chatRequests).toBe(1);
 	});
 
 	test("a granted soft stop is consumed once, not re-asked per boundary", async () => {
@@ -939,7 +941,7 @@ describe("cut-in queued while a tool is running", () => {
 		let asks = 0;
 		let granted = false;
 		const result = await runTurnWithCutIn({
-			shouldStop: () => {
+			shouldYieldToInput: () => {
 				asks++;
 				if (granted) return false;
 				granted = true;
@@ -949,7 +951,8 @@ describe("cut-in queued while a tool is running", () => {
 		});
 
 		expect(asks).toBeGreaterThan(0);
-		expect(result.executed).toEqual(["slow:in-flight"]);
-		expect(result.skipped).toEqual(["tu_b", "tu_c", "tu_d"]);
+		expect([...result.executed].sort()).toEqual(ALL_TOOLS);
+		expect(result.skipped).toEqual([]);
+		expect(result.chatRequests).toBe(1);
 	});
 });

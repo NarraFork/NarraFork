@@ -11,6 +11,7 @@
  */
 
 import { describe, expect, it } from "bun:test";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { CHATGPT_CITATION_CLOSE, CHATGPT_CITATION_OPEN } from "../citations";
 import {
 	type AdapterContentBlock,
@@ -25,7 +26,7 @@ const CTX: AdapterContext = { lod: 1 };
 const MARKER = `${CHATGPT_CITATION_OPEN}turn204588view0${CHATGPT_CITATION_CLOSE}`;
 
 function assistantMessage(blocks: AdapterContentBlock[], id = "m1"): AdapterMessage {
-	return { id, role: "assistant", contentJson: blocks };
+	return rowWithElements({ id, role: "assistant" }, blocks);
 }
 
 function markdownSpecs(msg: AdapterMessage) {
@@ -89,11 +90,13 @@ describe("assistant markdown citation projection", () => {
 
 describe("user text is never projected", () => {
 	it("keeps a quoted marker verbatim in the user bubble", () => {
-		const msg: AdapterMessage = {
-			id: "u1",
-			role: "user",
-			contentJson: [{ type: "text", text: `为什么会出现 ${MARKER} ？` }],
-		};
+		const msg: AdapterMessage = rowWithElements(
+			{
+				id: "u1",
+				role: "user",
+			},
+			[{ type: "text", text: `为什么会出现 ${MARKER} ？` }],
+		);
 		const specs = adaptSegment({ kind: "message", msg }, CTX);
 		const bubble = specs.find((spec) => spec.kind === "message-bubble");
 

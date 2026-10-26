@@ -9,6 +9,7 @@ import type { FileReference, FileReferenceContext } from "@shared/file-reference
 import type { LocalizedValue } from "@shared/i18n-locales";
 import type { SubagentModelInheritance } from "@shared/model-inheritance";
 import type { NarratorVisibility, NarratorWriteAudience } from "@shared/narrator-access";
+import type { RowBlock } from "@shared/narrator-blocks/message-blocks";
 import type { StorageCategoryKey } from "@shared/storage-categories";
 import type { SubagentToolInputSummary } from "@shared/subagent-tool-summary";
 
@@ -291,6 +292,8 @@ export interface SearchRequest {
 	/** Search all of history even for a query of only short terms. */
 	fullHistory?: boolean;
 	cursor?: string;
+	/** 1-based page of a single section, in place of `cursor`. */
+	page?: number;
 	limit?: number;
 }
 
@@ -412,6 +415,8 @@ export interface DatabaseStorageBreakdown {
 		 */
 		toolCallPayloads: DatabaseCleanupCandidateSummary;
 	};
+	/** Request dumps kept by an upgrade that deferred migration 0207's column rewrites. */
+	legacyRequestDumps?: { retained: boolean };
 }
 
 export type DatabaseCleanupTarget = "archivedSessions" | "staleSessions" | "toolCallPayloads";
@@ -494,6 +499,16 @@ export interface DatabaseCleanupExecutionResult extends DatabaseCleanupPreviewRe
 	freedBytes: number;
 	vacuumRan: boolean;
 	changed: boolean;
+	/** Planned sessions left in place because they changed mid-cleanup. */
+	skippedSessions?: number;
+}
+
+export interface LegacyRequestDumpClearResult {
+	ok: true;
+	cleared: number;
+	beforeBytes: number;
+	afterBytes: number;
+	restartRequired: boolean;
 }
 
 /** One background block job (`server/services/narrator-block-backfill.ts`). */
@@ -1013,23 +1028,8 @@ export interface BufferMessageSummary {
 	queueMode?: "turn" | "tool" | "interrupt";
 }
 
-/**
- * One block of a message as the block-keyed protocol names it (docs/BLOCK_STORAGE-DESIGN.md
- * §8): its id, what it is, and the elements `[from, to)` of `contentJson` it holds.
- */
-export interface MessageBlockRef {
-	id: string;
-	kind: string;
-	subtype: string | null;
-	phase: string;
-	revision: number;
-	wireId: string | null;
-	attemptId: string | null;
-	/** An edited output block keeps its body from before the first edit. */
-	hasOriginal: boolean;
-	from: number;
-	to: number;
-}
+/** One block a message row holds: its identity and its elements (`messageBlocks`). */
+export type MessageRowBlock = RowBlock<ContentBlock>;
 
 export interface TreeMessage {
 	/** Actual model/provider for this message, not the narrator's current selection. */
@@ -1040,7 +1040,11 @@ export interface TreeMessage {
 	parentToolUseId: string | null;
 	messageUuid?: string | null;
 	role: string;
-	contentJson: ContentBlock[];
+	/**
+	 * The message's body as blocks, in order. Read it through `messageBody` (elements) or
+	 * `messageBlocks` (blocks); rewrite it through the helpers next to them.
+	 */
+	blocks: MessageRowBlock[];
 	contentText: string | null;
 	toolCalls: ToolCallRecord[];
 	tokensIn?: number | null;
@@ -1083,14 +1087,11 @@ export interface TreeMessage {
 	deliveryKind?: "user_input" | "agent_message" | "task_notice" | null;
 	deliveryState?: "queued" | "claimed" | "materialized" | "failed" | "cancelled" | null;
 	createdAt: string;
-	children: TreeMessage[];
 	/**
-	 * The message's blocks over `contentJson`, when it arrived in the block-keyed protocol
-	 * (`lib/block-protocol.ts`); absent from a v1 server.
+	 * The row this one is nested under; absent at the top. Rows are flat, each row
+	 * followed by the rows nested under it (`message/nested-rows.ts`).
 	 */
-	blockRefs?: MessageBlockRef[];
-	/** Maps each index in the (possibly filtered/reordered) contentJson back to its index in the original contentJson. */
-	_blockOriginalIndices?: number[];
+	parentMessageId?: string | null;
 	/**
 	 * Synthetic live row only: index of the text/reasoning block still being written,
 	 * or -1 when the model has moved on to tool calls.

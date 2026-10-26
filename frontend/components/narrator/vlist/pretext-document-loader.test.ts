@@ -1,5 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import type { PretextDocumentPageResult, TreeMessage } from "@frontend/lib/api/types";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import {
 	firstScreenPageSizeForLod,
 	loadPretextDocument,
@@ -10,18 +11,19 @@ import {
 } from "./pretext-document-loader";
 
 function message(seq: number): TreeMessage {
-	return {
-		id: `m-${seq}`,
-		narratorId: "n1",
-		parentToolUseId: null,
-		role: "assistant",
-		contentJson: [{ type: "text", text: `message ${seq}` }],
-		contentText: `message ${seq}`,
-		toolCalls: [],
-		createdAt: "2026-07-23T00:00:00.000Z",
-		children: [],
-		seq,
-	} as TreeMessage;
+	return rowWithElements(
+		{
+			id: `m-${seq}`,
+			narratorId: "n1",
+			parentToolUseId: null,
+			role: "assistant",
+			contentText: `message ${seq}`,
+			toolCalls: [],
+			createdAt: "2026-07-23T00:00:00.000Z",
+			seq,
+		},
+		[{ type: "text", text: `message ${seq}` }],
+	) as TreeMessage;
 }
 
 function page(

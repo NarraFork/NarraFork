@@ -16,6 +16,7 @@ import type {
 	TreeMessage,
 } from "@frontend/lib/api";
 import { sha256 as nobleSHA256 } from "@noble/hashes/sha2.js";
+import { messageBody, rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { projectDiffDocument } from "@shared/pretext-layout/diff-core";
 import { classifyToolDetail } from "@shared/pretext-layout/tool-detail";
 import { createStreamingEditOrigin } from "@shared/streaming-edit-origin";
@@ -58,12 +59,28 @@ interface ToolSeed {
 
 /** An assistant message carrying `tool_use` blocks enriched exactly as the API does. */
 function assistantWithTools(id: string, tools: readonly ToolSeed[]): TreeMessage {
-	return {
-		id,
-		narratorId: "n1",
-		parentToolUseId: null,
-		role: "assistant",
-		contentJson: tools.map((tool) => ({
+	return rowWithElements(
+		{
+			id,
+			narratorId: "n1",
+			parentToolUseId: null,
+			role: "assistant",
+			contentText: null,
+			toolCalls: tools.map((tool, index) => ({
+				id: `tc-${tool.toolUseId}-${index}`,
+				narratorId: "n1",
+				messageId: id,
+				toolUseId: tool.toolUseId,
+				toolName: tool.toolName ?? "Bash",
+				status: tool.status ?? "running",
+				inputJson: tool.inputJson,
+				outputJson: tool.outputJson,
+				permissionSuggestions: tool.permissionSuggestions ?? null,
+				createdAt: "2026-01-01T00:00:00.000Z",
+			})) as unknown as TreeMessage["toolCalls"],
+			createdAt: "2026-01-01T00:00:00.000Z",
+		},
+		tools.map((tool) => ({
 			type: "tool_use",
 			id: tool.toolUseId,
 			name: tool.toolName ?? "Bash",
@@ -73,23 +90,8 @@ function assistantWithTools(id: string, tools: readonly ToolSeed[]): TreeMessage
 			inputJson: tool.inputJson,
 			outputJson: tool.outputJson,
 			permissionSuggestions: tool.permissionSuggestions ?? null,
-		})) as TreeMessage["contentJson"],
-		contentText: null,
-		toolCalls: tools.map((tool, index) => ({
-			id: `tc-${tool.toolUseId}-${index}`,
-			narratorId: "n1",
-			messageId: id,
-			toolUseId: tool.toolUseId,
-			toolName: tool.toolName ?? "Bash",
-			status: tool.status ?? "running",
-			inputJson: tool.inputJson,
-			outputJson: tool.outputJson,
-			permissionSuggestions: tool.permissionSuggestions ?? null,
-			createdAt: "2026-01-01T00:00:00.000Z",
-		})) as unknown as TreeMessage["toolCalls"],
-		createdAt: "2026-01-01T00:00:00.000Z",
-		children: [],
-	};
+		})),
+	);
 }
 
 describe("persisted Edit origin handoff", () => {
@@ -125,7 +127,7 @@ describe("persisted Edit origin handoff", () => {
 		];
 		function assertRows(startLine: number) {
 			const row = messages[0].toolCalls?.[0];
-			const block = messages[0].contentJson?.[0] as unknown as typeof row;
+			const block = messageBody(messages[0])?.[0] as unknown as typeof row;
 			for (const record of [row, block]) {
 				if (!record) throw new Error("missing tool representation");
 				const detail = classifyToolDetail({
@@ -224,7 +226,7 @@ describe("persisted Edit origin handoff", () => {
 		if (!streamingEditOrigin) throw new Error("missing fixture origin");
 		function assertOrigin(messages: readonly TreeMessage[], line: number | undefined) {
 			const row = messages[0].toolCalls?.[0];
-			const block = messages[0].contentJson?.[0] as unknown as typeof row;
+			const block = messageBody(messages[0])?.[0] as unknown as typeof row;
 			for (const record of [row, block]) {
 				if (!record) throw new Error("missing tool");
 				const detail = classifyToolDetail({
@@ -299,7 +301,7 @@ describe("persisted Edit origin handoff", () => {
 			input: { file_path: "/a.ts", old_string: "other", new_string: "new" },
 		})(messages).messages;
 		expect(patched[0].toolCalls?.[0].inputJson).not.toHaveProperty("_streamingMetadata");
-		expect(patched[0].contentJson?.[0]).toMatchObject({ inputJson: { old_string: "other" } });
+		expect(messageBody(patched[0])?.[0]).toMatchObject({ inputJson: { old_string: "other" } });
 	});
 });
 
@@ -310,16 +312,12 @@ function readStatuses(
 ): { row?: string; block?: string } {
 	for (const msg of messages) {
 		const row = msg.toolCalls?.find((tc) => tc.toolUseId === toolUseId);
-		const block = msg.contentJson?.find((b) => b.type === "tool_use" && b.id === toolUseId);
+		const block = messageBody(msg)?.find((b) => b.type === "tool_use" && b.id === toolUseId);
 		if (row || block) {
 			return {
 				...(row ? { row: row.status as string } : {}),
 				...(block ? { block: (block as { status?: string }).status } : {}),
 			};
-		}
-		if (msg.children?.length) {
-			const nested = readStatuses(msg.children, toolUseId);
-			if (nested.row || nested.block) return nested;
 		}
 	}
 	return {};
@@ -330,12 +328,8 @@ function findBlock(
 	toolUseId: string,
 ): Record<string, unknown> | undefined {
 	for (const msg of messages) {
-		const block = msg.contentJson?.find((b) => b.type === "tool_use" && b.id === toolUseId);
+		const block = messageBody(msg)?.find((b) => b.type === "tool_use" && b.id === toolUseId);
 		if (block) return block as unknown as Record<string, unknown>;
-		if (msg.children?.length) {
-			const nested = findBlock(msg.children, toolUseId);
-			if (nested) return nested;
-		}
 	}
 	return undefined;
 }
@@ -389,13 +383,14 @@ describe("patchToolCallFields", () => {
 		expect(patchToolCallFields([], "tu-1", { status: "success" }).changed).toBe(false);
 	});
 
-	it("patches a tool call nested in a child (subagent) message tree", () => {
-		const child = assistantWithTools("c1", [{ toolUseId: "tu-child", status: "running" }]);
-		const parent: TreeMessage = {
-			...assistantWithTools("m1", [{ toolUseId: "tu-parent", toolName: "Agent" }]),
-			children: [{ ...child, parentToolUseId: "tu-parent" }],
+	it("patches a tool call in a row nested under another one", () => {
+		const parent = assistantWithTools("m1", [{ toolUseId: "tu-parent", toolName: "Agent" }]);
+		const child: TreeMessage = {
+			...assistantWithTools("c1", [{ toolUseId: "tu-child", status: "running" }]),
+			parentToolUseId: "tu-parent",
+			parentMessageId: "m1",
 		};
-		const result = patchToolCallFields([parent], "tu-child", { status: "fail" });
+		const result = patchToolCallFields([parent, child], "tu-child", { status: "fail" });
 		expect(result.changed).toBe(true);
 		expect(readStatuses(result.messages, "tu-child")).toEqual({ row: "fail", block: "fail" });
 	});
@@ -509,7 +504,7 @@ describe("terminal-status guard", () => {
 		const result = patchToolCallFields([older, newer], "tu-dup", { status: "running" });
 		expect(result.changed).toBe(true);
 		expect(
-			(result.messages[1]?.contentJson[0] as unknown as { status?: string } | undefined)?.status,
+			(messageBody(result.messages[1])[0] as unknown as { status?: string } | undefined)?.status,
 		).toBe("running");
 	});
 
@@ -620,8 +615,8 @@ describe("patchReflection", () => {
 			},
 		);
 		expect(result.changed).toBe(true);
-		expect(result.messages[0]?.contentJson[0]?.permissionSuggestions).toBeNull();
-		expect(result.messages[1]?.contentJson[0]?.permissionSuggestions).toEqual([
+		expect(messageBody(result.messages[0])[0]?.permissionSuggestions).toBeNull();
+		expect(messageBody(result.messages[1])[0]?.permissionSuggestions).toEqual([
 			{ type: "plan_reflection", status: "running", requestId: "req-1" },
 		]);
 	});

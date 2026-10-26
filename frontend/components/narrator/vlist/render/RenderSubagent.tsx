@@ -32,7 +32,6 @@ import {
 	Loader,
 	Paper,
 	Text,
-	ThemeIcon,
 	Tooltip,
 	UnstyledButton,
 } from "@mantine/core";
@@ -92,6 +91,14 @@ import {
 	ToolTimingArea,
 	type ToolTimingLabels,
 } from "./RenderToolCall";
+import {
+	ROW_BUTTON_CLASS,
+	ROW_FLEX_CLASS,
+	ROW_TEXT_CLASS,
+	RowChip,
+	rowFlexStyle,
+	rowSpacing,
+} from "./row-chrome";
 import { subagentFilePathDisplays } from "./subagent-file-paths";
 import {
 	isTerminalToolRowStatus,
@@ -340,6 +347,7 @@ const TRACE_CHEVRON_SLOT_STYLE = {
 
 /** The "•" marker's own metrics (parity with RenderToolRun / CollapsibleTrace). */
 const DOT_STYLE = { opacity: 0.5, lineHeight: 1, fontSize: 10 } as const satisfies CSSProperties;
+const DIMMED = "var(--mantine-color-dimmed)";
 
 /** Glyph inset inside the 14px category chip (parity with the trace row). */
 const TRACE_ROW_GLYPH_SIZE = 9;
@@ -589,10 +597,10 @@ function SubagentInner({
 				cursor: "pointer",
 			}}
 		>
-			<Group gap={5} wrap="nowrap" style={{ height: badgeRowHeight() }}>
-				<ThemeIcon size={THEME_ICON_SIZE} variant="light" color={agentBadgeColor} radius="sm">
+			<div className={ROW_FLEX_CLASS} style={{ ...rowFlexStyle(5), height: badgeRowHeight() }}>
+				<RowChip size={THEME_ICON_SIZE} color={agentBadgeColor}>
 					<IconRobot size={10} />
-				</ThemeIcon>
+				</RowChip>
 				<Badge size="xs" variant="light" color={agentBadgeColor}>
 					{agentType}
 				</Badge>
@@ -624,7 +632,7 @@ function SubagentInner({
 						{withCount(labels.liveOutputChars, liveOutputChars)}
 					</Badge>
 				) : null}
-				<Box style={{ flex: 1, minWidth: 0 }} />
+				<div style={{ flex: 1, minWidth: 0 }} />
 				{active ? (
 					<Loader size={STATUS_ICON_SIZE} color="blue" />
 				) : (
@@ -645,7 +653,7 @@ function SubagentInner({
 				) : (
 					<IconChevronRight size={CHEVRON_SIZE} />
 				)}
-			</Group>
+			</div>
 
 			{/* Description: expanded → wrapped markdown-like inline; collapsed → truncate. */}
 			<div
@@ -658,16 +666,25 @@ function SubagentInner({
 				{measured.effectiveExpanded && measured.descriptionMeasured ? (
 					<RenderMarkdown measured={measured.descriptionMeasured} />
 				) : (
-					<Text size="xs" c="dimmed" truncate>
+					<p className={ROW_TEXT_CLASS} data-truncate="end" style={{ color: DIMMED }}>
 						{description}
-					</Text>
+					</p>
 				)}
 			</div>
 
 			{measured.hasResultPreview ? (
-				<Text size="xs" c="dimmed" mt={2} ml={DESC_LEFT} truncate opacity={0.7}>
+				<p
+					className={ROW_TEXT_CLASS}
+					data-truncate="end"
+					style={{
+						color: DIMMED,
+						marginTop: rowSpacing(2),
+						marginLeft: rowSpacing(DESC_LEFT),
+						opacity: 0.7,
+					}}
+				>
 					→ {resultPreview}
-				</Text>
+				</p>
 			) : null}
 		</Box>
 	);
@@ -723,9 +740,11 @@ function SubagentInner({
 						// clicking opens the child session — disabled (plain surface) when no
 						// child is known, so the affordance never no-ops. Fixed height either
 						// way, so the measured geometry is unaffected.
-						<UnstyledButton
+						<button
 							// biome-ignore lint/suspicious/noArrayIndexKey: recent rows are a stable ordered slice
 							key={i}
+							type="button"
+							className={ROW_BUTTON_CLASS}
 							data-testid="subagent-activity"
 							disabled={!onOpenSession}
 							onClick={
@@ -744,13 +763,16 @@ function SubagentInner({
 								cursor: onOpenSession ? "pointer" : "default",
 							}}
 						>
-							<Group gap={TRACE_ROW_GAP} wrap="nowrap" h="100%" align="center">
+							<div
+								className={ROW_FLEX_CLASS}
+								style={{ ...rowFlexStyle(TRACE_ROW_GAP), height: "100%" }}
+							>
 								{/* Dot, not a chevron: an activity row has nothing to expand. */}
-								<Box style={TRACE_CHEVRON_SLOT_STYLE}>
-									<Text span size="xs" c="dimmed" style={DOT_STYLE}>
+								<div style={TRACE_CHEVRON_SLOT_STYLE}>
+									<span className={ROW_TEXT_CLASS} style={{ color: DIMMED, ...DOT_STYLE }}>
 										•
-									</Text>
-								</Box>
+									</span>
+								</div>
 								<RecentCallCategoryChip
 									category={measured.recentCallCategories[i]}
 									toolName={name}
@@ -758,12 +780,11 @@ function SubagentInner({
 								{/* `flex: 0 1 auto` (not `flex: 1`) keeps the status + duration HUGGING
 								    this label rather than pinned to the row's right edge — see the
 								    trace row, whose layout this mirrors. */}
-								<Text
+								<p
 									data-testid="subagent-activity-label"
-									size="xs"
-									c="dimmed"
-									truncate
-									style={{ flex: "0 1 auto", minWidth: 0 }}
+									className={ROW_TEXT_CLASS}
+									data-truncate="end"
+									style={{ color: DIMMED, flex: "0 1 auto", minWidth: 0 }}
 								>
 									{(() => {
 										const label = recentCallTitle(name, measured.recentCallSummaries[i] ?? null);
@@ -782,7 +803,7 @@ function SubagentInner({
 											</>
 										);
 									})()}
-								</Text>
+								</p>
 								{/* Only DEVIATION is marked (in flight / queued / awaiting / failed /
 								    cancelled); a successful call draws nothing, so the slot is absent
 								    rather than blank — see @shared/tool-row-status.
@@ -793,21 +814,21 @@ function SubagentInner({
 								    `pending` is nonetheless corrected by the shared rule, which is the
 								    case these rows actually hit. */}
 								{statusMarks[i] ? (
-									<Box data-testid="trace-row-status-slot" style={TRACE_ROW_STATUS_SLOT_STYLE}>
+									<div data-testid="trace-row-status-slot" style={TRACE_ROW_STATUS_SLOT_STYLE}>
 										<TraceRowStatusGlyph
 											mark={statusMarks[i] as ToolRowStatusMark}
 											labels={labels.statusMark}
 										/>
-									</Box>
+									</div>
 								) : null}
 								{/* Per-row timing (SubagentCard.tsx:684 parity). `recentCallTimings`
 								    is sliced to the drawn rows by the measure layer, so index i
 								    pairs with this row's name. */}
 								<RecentCallTiming timing={measured.recentCallTimings[i]} labels={labels.timing} />
 								{/* Absorbs the slack so the cells above stay left-packed. */}
-								<Box style={{ flex: 1, minWidth: 0 }} />
-							</Group>
-						</UnstyledButton>
+								<div style={{ flex: 1, minWidth: 0 }} />
+							</div>
+						</button>
 					))}
 				</div>
 			</div>

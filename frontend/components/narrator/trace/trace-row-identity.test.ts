@@ -10,6 +10,7 @@
  */
 
 import { describe, expect, test } from "bun:test";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import type { ContentBlock, NarratorMsg } from "../narrator-panel-types";
 import {
 	reasoningRunIndices,
@@ -58,7 +59,7 @@ test("running Send trace uses resolved id but excludes parent and fanout", () =>
 
 // biome-ignore lint/suspicious/noExplicitAny: structural test fixtures
 function msg(partial: Record<string, any>): NarratorMsg {
-	return { children: [], contentText: null, ...partial } as unknown as NarratorMsg;
+	return { contentText: null, ...partial } as unknown as NarratorMsg;
 }
 
 const reasoning = (text: string): ContentBlock =>
@@ -112,7 +113,7 @@ describe("reasoningRunIndices — run-start mapping", () => {
 describe("reasoningTraceRowIdentity — cross-validated against buildSelectionIndex", () => {
 	test("adjacent reasoning blocks both resolve to a blockId the selection index knows", () => {
 		const blocks = [reasoning("**A**\n\nfirst"), reasoning("**B**\n\nsecond")];
-		const message = msg({ id: MSG_ID, role: "assistant", seq: 1, contentJson: blocks });
+		const message = msg(rowWithElements({ id: MSG_ID, role: "assistant", seq: 1 }, blocks));
 		const known = selectableBlockIds(message);
 
 		const first = reasoningTraceRowIdentity(MSG_ID, blocks, 0);
@@ -137,7 +138,7 @@ describe("reasoningTraceRowIdentity — cross-validated against buildSelectionIn
 			reasoning("second"),
 			reasoning("third"),
 		];
-		const message = msg({ id: MSG_ID, role: "assistant", seq: 1, contentJson: blocks });
+		const message = msg(rowWithElements({ id: MSG_ID, role: "assistant", seq: 1 }, blocks));
 		const known = selectableBlockIds(message);
 
 		for (const blockIndex of [2, 3]) {
@@ -159,7 +160,7 @@ describe("reasoningTraceRowIdentity — cross-validated against buildSelectionIn
 describe("tool row identity", () => {
 	test("encodes tc-/sa- prefixes the selection index registers", () => {
 		const blocks = [toolBlock("tu-9", "Read")];
-		const message = msg({ id: MSG_ID, role: "assistant", seq: 1, contentJson: blocks });
+		const message = msg(rowWithElements({ id: MSG_ID, role: "assistant", seq: 1 }, blocks));
 		const known = selectableBlockIds(message);
 
 		const identity = toolTraceRowIdentity(

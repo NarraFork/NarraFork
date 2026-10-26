@@ -14,6 +14,7 @@
 
 import { beforeAll, describe, expect, it } from "bun:test";
 import { MantineProvider } from "@mantine/core";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { type AdapterSegment, adaptSegment } from "@shared/pretext-layout/segment-adapter";
 import { parseHTML } from "linkedom";
 import { act } from "react";
@@ -82,7 +83,7 @@ function renderCard(onDismiss?: () => void): {
 } {
 	const seg: AdapterSegment = {
 		kind: "message",
-		msg: { id: "recovery-msg", role: "disp", contentJson: RECOVERY_BLOCKS as never },
+		msg: rowWithElements({ id: "recovery-msg", role: "disp" }, RECOVERY_BLOCKS as never),
 	};
 	const spec = adaptSegment(seg, { lod: 5 } as never)[0];
 	if (!spec) throw new Error("no spec produced");

@@ -7,13 +7,13 @@
  * (`composePostgresStores`), so the whole loop runs on the stores production itself would
  * hold:
  *
- *   register → login → session JWT → session-middleware verification → sliding
+ *   register → login → session token → session-middleware verification → sliding
  *   renewal → MFA enrollment/status/enable → MFA-gated login → tokenVersion
  *   revocation — write and read never splitting across engines.
  *
  * The SQLite half of every semantic is pinned by
  * `server/services/auth/__tests__/` (store contracts) and the pre-existing auth
- * suites (`register-with-code`, `session-renewal.integration`, …), which keep
+ * suites (`register-with-code`, `session-gate.integration`, …), which keep
  * running against SQLite unchanged. This suite runs the SAME business facts
  * against the PostgreSQL adapters over a real network connection to a throwaway
  * container.
@@ -24,7 +24,7 @@
  *   - migrations are applied by the production runtime, EXACTLY as the disk journal
  *     specifies (no psql relay, no hand-applied baseline);
  *   - the container is the harness' own random name and only it is cleaned up;
- *   - sensitive values (plaintext password, issued JWTs, backup codes, the TOTP
+ *   - sensitive values (plaintext password, issued tokens, backup codes, the TOTP
  *     secret, the connection URL) must not appear in any captured log line.
  */
 
@@ -32,9 +32,8 @@ import { afterAll, describe, expect, it, mock } from "bun:test";
 import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
-import { SESSION_RENEWAL_HEADER, SESSION_RENEWAL_THRESHOLD_SECONDS } from "@shared/session-auth";
+import { SESSION_RENEWAL_THRESHOLD_SECONDS } from "@shared/session-auth";
 import { Hono } from "hono";
-import { sign } from "hono/jwt";
 import { Secret, TOTP } from "otpauth";
 import {
 	DATABASE_BACKEND_ENV,
@@ -72,8 +71,15 @@ mock.module("../../../../server/db", () => ({
 	sqlite: poisonHandle(sqlite),
 }));
 
-const { buildSessionResult, loginUser, registerUser, revokeUserSessions, verifyToken } =
-	await import("../../../../server/lib/auth");
+const {
+	buildSessionResult,
+	createToken,
+	loginUser,
+	registerUser,
+	revokeSessionToken,
+	revokeUserSessions,
+	verifyToken,
+} = await import("../../../../server/lib/auth");
 const { composePostgresStores } = await import("../../../../server/services/postgres-composition");
 const { setRegistrationAccountStore } = await import(
 	"../../../../server/services/registration/store"
@@ -91,9 +97,7 @@ const { unbindPostgresSearchClientForTests } = await import(
 	"../../../../server/services/search/postgres-store"
 );
 const { mfaService } = await import("../../../../server/services/mfa-service");
-const { invalidateUserCache, requireSessionAuth } = await import(
-	"../../../../server/middleware/auth"
-);
+const { requireSessionAuth } = await import("../../../../server/middleware/auth");
 const { consumeMfaToken, verifyMfaToken } = await import("../../../../server/lib/mfa");
 const { settings } = await import("../../../../server/lib/settings");
 const { logger } = await import("../../../../server/lib/logger");
@@ -255,54 +259,40 @@ async function runLoop(
 			);
 		});
 
-		// ── 3. The session middleware verifies the issued JWT ────────────────
-		await check("the session gate accepts the JWT and rejects non-credentials", async () => {
+		// ── 3. The session middleware verifies the issued session token ──────
+		await check("the session gate accepts the session and rejects non-credentials", async () => {
 			expect((await authGet(adminToken)).status).toBe(200);
 
 			const noHeader = await authGet();
 			expect(noHeader.status).toBe(401);
 
-			// An authentic expired session takes the session-only failure path. Malformed
-			// bearer tokens also probe OAuth, whose storage migration is outside P3.
-			const expired = await sign(
-				{ sub: adminId, role: "admin", exp: Math.floor(Date.now() / 1000) - 60 },
-				settings.auth.jwtSecret,
-			);
-			secrets.push(expired);
-			const rejected = await authGet(expired);
+			// A revoked session (logout) takes the session-only failure path on PG.
+			const second = await createToken(adminId);
+			secrets.push(second);
+			await revokeSessionToken(await verifyToken(second));
+			const rejected = await authGet(second);
 			expect(rejected.status).toBe(401);
 			expect(await rejected.json()).toMatchObject({ code: "TOKEN_EXPIRED" });
 
 			landmarks.middleware = "200+401+401";
 		});
 
-		// ── 4. Sliding renewal re-signs inside the window ────────────────────
-		await check("a near-expiry token is renewed; the renewal authenticates", async () => {
-			const now = Math.floor(Date.now() / 1000);
-			const state = await authStores.authSessionStore.findSessionState(adminId);
-			const nearlyExpired = await sign(
-				{
-					sub: adminId,
-					role: "admin",
-					iat: now - 4 * 24 * 60 * 60,
-					exp: now + (SESSION_RENEWAL_THRESHOLD_SECONDS - 3600),
-					sst: now - 4 * 24 * 60 * 60,
-					sv: state?.tokenVersion ?? 0,
-				},
-				settings.auth.jwtSecret,
-			);
-			secrets.push(nearlyExpired);
+		// ── 4. Sliding renewal extends the session row on PG ────────────────
+		await check("a session inside the renewal window is extended in place", async () => {
+			const { sid } = await verifyToken(adminToken);
+			const nearlyExpired =
+				Math.floor(Date.now() / 1000) + SESSION_RENEWAL_THRESHOLD_SECONDS - 3600;
+			await runtime.executor.unsafe("UPDATE auth_sessions SET expires_at = $1 WHERE id = $2", [
+				nearlyExpired,
+				sid,
+			]);
 
-			const renewed = (await authGet(nearlyExpired)).headers.get(SESSION_RENEWAL_HEADER);
-			expect(renewed).toBeString();
-			secrets.push(renewed as string);
-
-			const payload = await verifyToken(renewed as string);
+			expect((await authGet(adminToken)).status).toBe(200);
+			const payload = await verifyToken(adminToken);
 			expect(payload.sub).toBe(adminId);
-			// The live role, not the presented one; the live generation too.
 			expect(payload.role).toBe("admin");
-			expect((await authGet(renewed as string)).status).toBe(200);
-			landmarks.renewal = "header+200";
+			expect(payload.exp).toBeGreaterThan(nearlyExpired);
+			landmarks.renewal = "extended+200";
 		});
 
 		// ── 5. Revocation: a bumped generation strands the old token ─────────
@@ -312,12 +302,10 @@ async function runLoop(
 
 			const bumped = await revokeUserSessions(adminId);
 			expect(bumped).toBe(1);
-			invalidateUserCache(adminId);
 
 			const after = await authGet(adminToken);
 			expect(after.status).toBe(401);
 			expect(await after.json()).toMatchObject({ code: "TOKEN_EXPIRED" });
-			expect(after.headers.get(SESSION_RENEWAL_HEADER)).toBeNull();
 
 			const relogin = await loginUser("p3-admin", PASSWORD, SOURCE_IP);
 			expect("token" in relogin).toBe(true);
@@ -440,7 +428,6 @@ async function runLoop(
 		setProjectReadAdapter(undefined);
 		setPostgresRuntimeQueue(undefined);
 		unbindPostgresSearchClientForTests();
-		invalidateUserCache(adminId);
 		settings.auth.registrationOpen = registrationOpenBefore;
 		await runtime.close();
 		cleanDb(sqlite);

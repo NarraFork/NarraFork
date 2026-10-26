@@ -2,12 +2,15 @@ import { ActionIcon, Box, Button, Group, Tooltip } from "@mantine/core";
 import { IconPaperclip } from "@tabler/icons-react";
 import type { RefObject } from "react";
 import { useTranslation } from "react-i18next";
+import type { AskSelectionInput } from "../interaction/use-ask-selection-in-passing";
 import { resolveComposerActionSlot } from "./composer-action-slot";
 import { NarratorComposer, type NarratorComposerHandle } from "./NarratorComposer";
 import { type QueueMode, SendOptionsSplitButton } from "./SendOptionsSplitButton";
 import { StableActionLabel } from "./StableActionLabel";
 
 export interface NarratorComposerRowProps {
+	/** 顺便提问 from a message-list selection; absent hides the action. */
+	onAskSelection?: (input: AskSelectionInput) => Promise<void>;
 	// Core refs
 	fileInputRef: RefObject<HTMLInputElement | null>;
 	composerRef: RefObject<NarratorComposerHandle | null>;
@@ -367,6 +370,7 @@ export function NarratorComposerRow(props: NarratorComposerRowProps) {
 				restoredAttachmentResources={props.restoredAttachmentResources}
 				onAttachmentsChange={props.onAttachmentsChange}
 				onDocumentAssetsChange={props.onDocumentAssetsChange}
+				onAskSelection={props.onAskSelection}
 				controls={
 					<Tooltip label={t("attachFile")}>
 						<ActionIcon

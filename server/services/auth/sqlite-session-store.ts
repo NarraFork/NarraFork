@@ -14,13 +14,15 @@
  * module and shares nothing with this file but the port.
  */
 import { db } from "@server/db";
-import { userPreferences, users } from "@server/db/schema";
-import { eq, sql } from "drizzle-orm";
+import { authSessions, userPreferences, users } from "@server/db/schema";
+import { and, eq, inArray, isNotNull, isNull, lt, or, type SQL, sql } from "drizzle-orm";
 import { updateLegacyGitIdentityProfile } from "../git-identities";
 import type { AccountRole } from "../registration/account-store";
 import type {
+	AuthSessionRecord,
 	AuthSessionStore,
 	LoginCredential,
+	NewAuthSession,
 	SessionProfile,
 	SessionState,
 } from "./session-store";
@@ -28,6 +30,29 @@ import type {
 /** The schema stores role as text; the two role names are all it ever holds. */
 function asRole(role: string): AccountRole {
 	return role === "admin" ? "admin" : "user";
+}
+
+/** One session row joined with its account, by a unique key. */
+async function findSession(where: SQL): Promise<AuthSessionRecord | null> {
+	const rows = await db
+		.select({
+			id: authSessions.id,
+			userId: authSessions.userId,
+			role: users.role,
+			userTokenVersion: users.tokenVersion,
+			sessionTokenVersion: authSessions.tokenVersion,
+			sessionStart: authSessions.sessionStart,
+			createdAt: authSessions.createdAt,
+			expiresAt: authSessions.expiresAt,
+			revokedAt: authSessions.revokedAt,
+		})
+		.from(authSessions)
+		.innerJoin(users, eq(users.id, authSessions.userId))
+		.where(where)
+		.limit(1);
+	const row = rows[0];
+	if (!row) return null;
+	return { ...row, role: asRole(row.role) };
 }
 
 export const sqliteAuthSessionStore: AuthSessionStore = {
@@ -101,5 +126,56 @@ export const sqliteAuthSessionStore: AuthSessionStore = {
 			.where(eq(users.id, userId))
 			.returning({ tokenVersion: users.tokenVersion });
 		return row?.tokenVersion ?? 0;
+	},
+
+	async createSession(session: NewAuthSession): Promise<void> {
+		await db.insert(authSessions).values(session);
+	},
+
+	async findSessionByTokenHash(tokenHash: string): Promise<AuthSessionRecord | null> {
+		return findSession(eq(authSessions.tokenHash, tokenHash));
+	},
+
+	async findSessionById(sessionId: string): Promise<AuthSessionRecord | null> {
+		return findSession(eq(authSessions.id, sessionId));
+	},
+
+	async extendSession(sessionId: string, expiresAt: number): Promise<void> {
+		await db
+			.update(authSessions)
+			.set({ expiresAt })
+			.where(
+				and(
+					eq(authSessions.id, sessionId),
+					isNull(authSessions.revokedAt),
+					lt(authSessions.expiresAt, expiresAt),
+				),
+			);
+	},
+
+	async revokeSession(sessionId: string, revokedAt: number): Promise<void> {
+		await db
+			.update(authSessions)
+			.set({ revokedAt })
+			.where(and(eq(authSessions.id, sessionId), isNull(authSessions.revokedAt)));
+	},
+
+	async deleteStaleSessions(before: number, limit: number): Promise<number> {
+		// Bounded by `limit` so one sweep never holds the main thread for a large delete.
+		const stale = db
+			.select({ id: authSessions.id })
+			.from(authSessions)
+			.where(
+				or(
+					lt(authSessions.expiresAt, before),
+					and(isNotNull(authSessions.revokedAt), lt(authSessions.revokedAt, before)),
+				),
+			)
+			.limit(limit);
+		const deleted = await db
+			.delete(authSessions)
+			.where(inArray(authSessions.id, stale))
+			.returning({ id: authSessions.id });
+		return deleted.length;
 	},
 };

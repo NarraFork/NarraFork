@@ -16,6 +16,7 @@
  */
 
 import { beforeAll, describe, expect, it } from "bun:test";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import type { NarratorMsg } from "../narrator-panel-types";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 import { buildPretextDocumentLayout } from "./pretext-document-layout";
@@ -63,7 +64,6 @@ function fixture(opts: {
 }): NarratorMsg[] {
 	const base = {
 		narratorId: "n1",
-		children: [],
 		parentToolUseId: null,
 		createdAt: "2026-07-23T00:00:00.000Z",
 	};
@@ -79,42 +79,52 @@ function fixture(opts: {
 		sideCars: [],
 	};
 	return [
-		{
-			...base,
-			id: "m-text",
-			seq: 0,
-			role: "user",
-			contentJson: [{ type: "text", text: `a user question ${"with more words ".repeat(8)}` }],
-			contentText: "a user question",
-			toolCalls: [],
-		},
-		{
-			...base,
-			id: "m-reasoning-only",
-			seq: 1,
-			role: "assistant",
-			contentJson: [{ type: "reasoning", text: "", providerMetadata: opts.metadata("r-1") }],
-			contentText: null,
-			toolCalls: [],
-		},
-		{
-			...base,
-			id: "m-reasoning-partial",
-			seq: 2,
-			role: "assistant",
-			contentJson: [
+		rowWithElements(
+			{
+				...base,
+				id: "m-text",
+				seq: 0,
+				role: "user",
+				contentText: "a user question",
+				toolCalls: [],
+			},
+			[{ type: "text", text: `a user question ${"with more words ".repeat(8)}` }],
+		),
+		rowWithElements(
+			{
+				...base,
+				id: "m-reasoning-only",
+				seq: 1,
+				role: "assistant",
+				contentText: null,
+				toolCalls: [],
+			},
+			[{ type: "reasoning", text: "", providerMetadata: opts.metadata("r-1") }],
+		),
+		rowWithElements(
+			{
+				...base,
+				id: "m-reasoning-partial",
+				seq: 2,
+				role: "assistant",
+				contentText: null,
+				toolCalls: [],
+			},
+			[
 				{ type: "reasoning", text: `visible reasoning ${"body text ".repeat(20)}` },
 				{ type: "reasoning", text: "", providerMetadata: opts.metadata("r-2") },
 			],
-			contentText: null,
-			toolCalls: [],
-		},
-		{
-			...base,
-			id: "m-reasoning-signed",
-			seq: 3,
-			role: "assistant",
-			contentJson: [
+		),
+		rowWithElements(
+			{
+				...base,
+				id: "m-reasoning-signed",
+				seq: 3,
+				role: "assistant",
+				contentText: null,
+				toolCalls: [],
+			},
+			[
 				{
 					type: "reasoning",
 					text: `signed thinking ${"more words ".repeat(15)}`,
@@ -123,15 +133,17 @@ function fixture(opts: {
 					providerMetadata: opts.signedMetadata,
 				},
 			],
-			contentText: null,
-			toolCalls: [],
-		},
-		{
-			...base,
-			id: "m-tool",
-			seq: 4,
-			role: "assistant",
-			contentJson: [
+		),
+		rowWithElements(
+			{
+				...base,
+				id: "m-tool",
+				seq: 4,
+				role: "assistant",
+				contentText: null,
+				toolCalls: opts.withToolRows ? [toolRow] : [],
+			},
+			[
 				{
 					type: "tool_use",
 					id: "tu-1",
@@ -147,18 +159,18 @@ function fixture(opts: {
 					sideCars: [],
 				},
 			],
-			contentText: null,
-			toolCalls: opts.withToolRows ? [toolRow] : [],
-		},
-		{
-			...base,
-			id: "m-answer",
-			seq: 5,
-			role: "assistant",
-			contentJson: [{ type: "text", text: `## heading\n\n${"answer prose ".repeat(30)}` }],
-			contentText: "answer prose",
-			toolCalls: [],
-		},
+		),
+		rowWithElements(
+			{
+				...base,
+				id: "m-answer",
+				seq: 5,
+				role: "assistant",
+				contentText: "answer prose",
+				toolCalls: [],
+			},
+			[{ type: "text", text: `## heading\n\n${"answer prose ".repeat(30)}` }],
+		),
 	] as unknown as NarratorMsg[];
 }
 

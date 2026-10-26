@@ -16,6 +16,7 @@
 
 import { beforeAll, describe, expect, it } from "bun:test";
 import { MantineProvider } from "@mantine/core";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { type AdapterSegment, adaptSegment } from "@shared/pretext-layout/segment-adapter";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { parseHTML } from "linkedom";
@@ -82,7 +83,7 @@ function renderGenerated(block: Record<string, unknown>): {
 } {
 	const seg: AdapterSegment = {
 		kind: "message",
-		msg: { id: "gen-msg", role: "assistant", contentJson: [block as never] },
+		msg: rowWithElements({ id: "gen-msg", role: "assistant" }, [block as never]),
 	};
 	const spec = adaptSegment(seg, { lod: 5, labels: LABELS })[0];
 	if (!spec) throw new Error("no spec produced");
@@ -115,7 +116,7 @@ function renderGenerated(block: Record<string, unknown>): {
 function renderGeneratedUninjected(block: Record<string, unknown>): Element {
 	const seg: AdapterSegment = {
 		kind: "message",
-		msg: { id: "gen-real", role: "assistant", contentJson: [block as never] },
+		msg: rowWithElements({ id: "gen-real", role: "assistant" }, [block as never]),
 	};
 	const spec = adaptSegment(seg, { lod: 5, labels: LABELS })[0]!;
 	const measured = VLIST_REGISTRY[spec.kind].measure(spec.data, CONTENT_WIDTH, 5, spec.opts);
@@ -292,10 +293,12 @@ describe("generated image reaches the DOM (virtual list)", () => {
 		// box is already the right size before the blob resolves (zero drift).
 		const seg: AdapterSegment = {
 			kind: "message",
-			msg: {
-				id: "gen-h",
-				role: "assistant",
-				contentJson: [
+			msg: rowWithElements(
+				{
+					id: "gen-h",
+					role: "assistant",
+				},
+				[
 					{
 						type: "image_generation",
 						savedPath: "/tmp/gen/wide.png",
@@ -303,7 +306,7 @@ describe("generated image reaches the DOM (virtual list)", () => {
 						height: 500,
 					} as never,
 				],
-			},
+			),
 		};
 		const spec = adaptSegment(seg, { lod: 5, labels: LABELS })[0]!;
 		const measured = VLIST_REGISTRY.media.measure(spec.data, CONTENT_WIDTH, 5, spec.opts);

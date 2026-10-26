@@ -1,11 +1,26 @@
-import { Alert, Button, Group, Loader, SegmentedControl, Stack, Text, Title } from "@mantine/core";
+import {
+	Alert,
+	Button,
+	Group,
+	Loader,
+	Pagination,
+	SegmentedControl,
+	Stack,
+	Text,
+	Title,
+} from "@mantine/core";
 import { createFileRoute } from "@tanstack/react-router";
-import { useMemo } from "react";
+import { useMemo, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { EntityResultCard } from "../components/search/EntityResultCard";
 import { SearchFilterBar, type SearchFilterState } from "../components/search/SearchFilterBar";
 import { SessionResultCard } from "../components/search/SessionResultCard";
-import { SEARCH_SECTION_ORDER, useSearchOverview, useSearchSection } from "../hooks/useSearch";
+import {
+	SEARCH_PAGE_LIMIT,
+	SEARCH_SECTION_ORDER,
+	useSearchOverview,
+	useSearchSection,
+} from "../hooks/useSearch";
 import type {
 	EntitySearchResult,
 	SearchRequest,
@@ -17,11 +32,13 @@ import {
 	DEFAULT_SEARCH_SORT,
 	formatSearchTotal,
 	normalizeSearchInclude,
+	normalizeSearchPage,
 	normalizeSearchRange,
 	normalizeSearchSort,
 	normalizeSearchTab,
 	type SearchTab,
 	type SearchTimeRange,
+	searchPageCount,
 	searchRangeStart,
 } from "../lib/search-utils";
 
@@ -37,6 +54,8 @@ interface SearchParams {
 	mine?: string;
 	/** `all` lifts the recent-days limit on a query of only short terms. */
 	history?: string;
+	/** 1-based page of the open tab. */
+	page?: number;
 }
 
 const optionalId = (value: unknown) =>
@@ -57,6 +76,7 @@ export const Route = createFileRoute("/search")({
 			range: normalizeSearchRange(search.range),
 			mine: search.mine === "1" || search.mine === 1 || search.mine === true ? "1" : undefined,
 			history: search.history === "all" ? "all" : undefined,
+			page: tab === "all" ? undefined : normalizeSearchPage(search.page),
 		};
 	},
 });
@@ -120,29 +140,51 @@ function Overview({
 	);
 }
 
-/** One section, paged with "load more". */
-function SectionList({ section, request }: { section: SearchSectionName; request: SearchRequest }) {
+/** One section, a page at a time, with page numbers below. */
+function SectionList({
+	section,
+	request,
+	page,
+	onPage,
+}: {
+	section: SearchSectionName;
+	request: SearchRequest;
+	page: number;
+	onPage: (page: number) => void;
+}) {
 	const { t } = useTranslation("search");
-	const query = useSearchSection(request, section, true);
-	const items =
-		query.data?.pages.flatMap(
-			(page) => page.items as Array<SessionSearchResult | EntitySearchResult>,
-		) ?? [];
+	const top = useRef<HTMLDivElement>(null);
+	const query = useSearchSection(request, section, page, true);
+	const data = query.data;
+	const items = (data?.items ?? []) as Array<SessionSearchResult | EntitySearchResult>;
 	if (query.isLoading) return <Loader />;
-	if (items.length === 0) return <Text c="dimmed">{t("noResults")}</Text>;
+	if (items.length === 0 && page === 1) return <Text c="dimmed">{t("noResults")}</Text>;
+	const pages = Math.max(page, searchPageCount(data, SEARCH_PAGE_LIMIT));
 	return (
-		<Stack>
+		<Stack ref={top} style={{ opacity: query.isPlaceholderData ? 0.6 : 1 }}>
 			{items.map((result) => (
 				<ResultCard key={`${result.type}-${result.id}`} result={result} request={request} />
 			))}
-			{query.hasNextPage && (
-				<Button
-					variant="light"
-					loading={query.isFetchingNextPage}
-					onClick={() => query.fetchNextPage()}
-				>
-					{t("loadMore")}
-				</Button>
+			{pages > 1 && (
+				<Stack gap={4} align="center" mt="sm">
+					<Pagination
+						total={pages}
+						value={page}
+						onChange={(next) => {
+							onPage(next);
+							// The page scrolls inside the app shell, not the window.
+							top.current?.scrollIntoView({ block: "start" });
+						}}
+						size="sm"
+						siblings={1}
+						boundaries={1}
+					/>
+					{data?.totalIsLowerBound && (
+						<Text size="xs" c="dimmed">
+							{t("pagesLowerBound", { count: data.total })}
+						</Text>
+					)}
+				</Stack>
 			)}
 		</Stack>
 	);
@@ -194,13 +236,15 @@ function SearchPage() {
 	};
 	const openTab = (value: SearchTab) =>
 		navigate({
-			search: (prev) => ({ ...prev, tab: value === "all" ? undefined : value }),
+			search: (prev) => ({ ...prev, tab: value === "all" ? undefined : value, page: undefined }),
 			replace: true,
 		});
+	const openPage = (page: number) =>
+		navigate({ search: (prev) => ({ ...prev, page: page > 1 ? page : undefined }) });
 
 	const recentDays = sections.sessions?.recentDays;
 	const searchFullHistory = () =>
-		navigate({ search: (prev) => ({ ...prev, history: "all" }), replace: true });
+		navigate({ search: (prev) => ({ ...prev, history: "all", page: undefined }), replace: true });
 
 	const tabLabel = (name: SearchSectionName) =>
 		t(`tab_${name}`, { count: formatSearchTotal(sections[name]) });
@@ -246,7 +290,13 @@ function SearchPage() {
 							<Overview sections={sections} request={request} onOpen={openTab} />
 						)
 					) : (
-						<SectionList key={tab} section={tab} request={request} />
+						<SectionList
+							key={tab}
+							section={tab}
+							request={request}
+							page={params.page ?? 1}
+							onPage={openPage}
+						/>
 					)}
 				</>
 			)}

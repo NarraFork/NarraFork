@@ -3,7 +3,6 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Hono } from "hono";
-import { invalidateUserCache } from "../../middleware/auth";
 import type { AuthSessionStore } from "../../services/auth/session-store";
 import { authMfaStore, authSessionStore, setAuthStores } from "../../services/auth/store";
 
@@ -74,8 +73,6 @@ beforeEach(() => {
 		}),
 	};
 	setAuthStores({ session: store, mfa: authMfaStore });
-	invalidateUserCache(ADMIN_ACTOR_ID);
-	invalidateUserCache(NON_ADMIN_ACTOR_ID);
 	Object.assign(settings, structuredClone(snapshot));
 	settings.anthropicProviders = [
 		{
@@ -96,8 +93,6 @@ beforeEach(() => {
 });
 afterEach(() => {
 	setAuthStores(undefined);
-	invalidateUserCache(ADMIN_ACTOR_ID);
-	invalidateUserCache(NON_ADMIN_ACTOR_ID);
 	globalThis.fetch = oldFetch;
 	Object.assign(settings, structuredClone(snapshot));
 });

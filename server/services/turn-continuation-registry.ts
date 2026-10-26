@@ -406,10 +406,10 @@ export const NON_SOURCE_ASYMMETRIES: readonly {
 		verdict: "essential",
 		detail:
 			"Not a gap. The flag disables streaming-time eager tool execution, which is a real " +
-			"throughput cost, and the primary loop does not need it: both eager-start sites are " +
-			"already gated on `observeSoftStopForTurn()`, so a cut-in stops the turn at the right " +
-			"boundary either way. `loop-cutin-boundary.test.ts` pins exactly this — the same " +
-			"scenario produces identical executed/skipped sets with and without the flag. Setting " +
+			"throughput cost, and the primary loop does not need it: a user cut-in never skips a " +
+			"produced call, and host stops gate both eager-start sites on `observeSoftStopForTurn()`, " +
+			"so the turn ends at the right boundary either way. `loop-cutin-boundary.test.ts` pins " +
+			"this — the same scenario executes the same calls with and without the flag. Setting " +
 			"it for the primary would cost parallel-tool latency and buy nothing. The subagent " +
 			"keeps it because it is the stricter guarantee and a subagent's turns are short.",
 	},

@@ -111,16 +111,25 @@ function isPidAlive(pid: number): boolean {
 	}
 }
 
-function getChildPids(pid: number): number[] {
+/*
+ * Killing a process tree spawns helpers (`pgrep`, `taskkill`), and it happens on cancellation
+ * paths: a client switching narrators aborts that narrator's Git requests, each holding a few Git
+ * processes. These helpers must never be `spawnSync` — a synchronous `taskkill` held the event
+ * loop for about half a second per process, so one switch stalled every request and socket for
+ * seconds. They never reject.
+ */
+
+async function getChildPids(pid: number): Promise<number[]> {
 	if (process.platform === "win32") return [];
 	try {
-		const result = Bun.spawnSync(["pgrep", "-P", String(pid)], {
+		const pgrep = Bun.spawn(["pgrep", "-P", String(pid)], {
+			stdin: "ignore",
 			stdout: "pipe",
 			stderr: "ignore",
 			windowsHide: true,
 		});
-		if (result.exitCode !== 0) return [];
-		const text = new TextDecoder().decode(result.stdout);
+		const [text, exitCode] = await Promise.all([new Response(pgrep.stdout).text(), pgrep.exited]);
+		if (exitCode !== 0) return [];
 		return text
 			.split(/\s+/)
 			.map((part) => Number.parseInt(part, 10))
@@ -130,14 +139,30 @@ function getChildPids(pid: number): number[] {
 	}
 }
 
-function killUnixProcessTree(pid: number, signal: NodeJS.Signals = "SIGTERM"): void {
-	for (const childPid of getChildPids(pid)) {
-		killUnixProcessTree(childPid, signal);
+/** Descendants before their parent: once a parent is gone, `pgrep -P` cannot find its children. */
+async function killUnixProcessTree(pid: number, signal: NodeJS.Signals = "SIGTERM"): Promise<void> {
+	for (const childPid of await getChildPids(pid)) {
+		await killUnixProcessTree(childPid, signal);
 	}
 	try {
 		process.kill(pid, signal);
 	} catch {
 		// already gone or not permitted; best effort only
+	}
+}
+
+/** `taskkill /T /F` on `pid`; resolves when taskkill has exited, within 5s. */
+export async function killWindowsProcessTree(pid: number): Promise<void> {
+	try {
+		clearInheritableHandlesBeforeSpawn();
+		const taskkill = Bun.spawn(["taskkill", "/T", "/F", "/PID", String(pid)], {
+			stdio: ["ignore", "ignore", "ignore"],
+			timeout: 5000,
+			windowsHide: true,
+		});
+		await taskkill.exited;
+	} catch {
+		// best effort — the process may already be gone
 	}
 }
 
@@ -178,31 +203,28 @@ export async function safeSpawn(opts: SafeSpawnOptions): Promise<SafeSpawnResult
 	let terminationReason: SafeSpawnResult["terminationReason"];
 	let hardTimer: ReturnType<typeof setTimeout> | undefined;
 	let watchdogTimer: ReturnType<typeof setInterval> | undefined;
+	/** The tree kill in flight; safeSpawn settles only after it, as it did when it was synchronous. */
+	let treeKill: Promise<void> | undefined;
 
-	const kill = (reason: SafeSpawnResult["terminationReason"]) => {
-		if (killed) return;
-		killed = true;
-		terminationReason = reason;
-		if (opts.killProcessTree && process.platform !== "win32" && proc.pid) {
-			killUnixProcessTree(proc.pid);
-		}
+	const killRoot = () => {
 		try {
 			proc.kill();
 		} catch {
 			/* already gone */
 		}
+	};
+	const kill = (reason: SafeSpawnResult["terminationReason"]) => {
+		if (killed) return;
+		killed = true;
+		terminationReason = reason;
+		if (opts.killProcessTree && process.platform !== "win32" && proc.pid) {
+			treeKill = killUnixProcessTree(proc.pid).then(killRoot);
+			return;
+		}
+		killRoot();
 		// Windows: proc.kill() 只终止主进程，不会杀子进程树。
 		// taskkill /T /F 确保整个进程树被清理（如 sh.exe → git.exe 链）。
-		if (process.platform === "win32" && proc.pid) {
-			try {
-				Bun.spawnSync(["taskkill", "/T", "/F", "/PID", String(proc.pid)], {
-					stdio: ["ignore", "ignore", "ignore"],
-					windowsHide: true,
-				});
-			} catch {
-				/* best effort */
-			}
-		}
+		if (process.platform === "win32" && proc.pid) treeKill = killWindowsProcessTree(proc.pid);
 	};
 
 	// --- Hard timeout (unconditional kill) ---
@@ -317,6 +339,7 @@ export async function safeSpawn(opts: SafeSpawnOptions): Promise<SafeSpawnResult
 		if (hardTimer != null) clearTimeout(hardTimer);
 		if (watchdogTimer != null) clearInterval(watchdogTimer);
 		opts.signal?.removeEventListener("abort", abortHandler);
+		await treeKill;
 	}
 }
 

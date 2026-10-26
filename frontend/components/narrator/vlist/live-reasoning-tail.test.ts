@@ -28,6 +28,7 @@
  */
 
 import { beforeAll, describe, expect, it } from "bun:test";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { installCanvasStub } from "./measure/test-canvas-stub";
 
 beforeAll(() => {
@@ -36,35 +37,40 @@ beforeAll(() => {
 
 /** A settled tool call, so the activity unit's key is cacheable (not `__streaming__`). */
 const HISTORY = [
-	{
-		id: "m0",
-		seq: 0,
-		role: "assistant",
-		contentJson: [{ type: "tool_use", id: "tu-0", name: "Read", input: { file_path: "src/a.ts" } }],
-		toolCalls: [{ id: "c0", toolUseId: "tu-0", toolName: "Read", status: "success" }],
-		children: [],
-	},
+	rowWithElements(
+		{
+			id: "m0",
+			seq: 0,
+			role: "assistant",
+			toolCalls: [{ id: "c0", toolUseId: "tu-0", toolName: "Read", status: "success" }],
+		},
+		[{ type: "tool_use", id: "tu-0", name: "Read", input: { file_path: "src/a.ts" } }],
+	),
 ];
 
-const streamingMessage = (text: string) => ({
-	id: "__streaming__",
-	model: "gpt-5.6",
-	seq: 999,
-	role: "assistant",
-	contentJson: [{ type: "reasoning", text }],
-	toolCalls: [],
-	children: [],
-});
+const streamingMessage = (text: string) =>
+	rowWithElements(
+		{
+			id: "__streaming__",
+			model: "gpt-5.6",
+			seq: 999,
+			role: "assistant",
+			toolCalls: [],
+		},
+		[{ type: "reasoning", text }],
+	);
 
-const settledMessage = (text: string) => ({
-	id: "real-1",
-	model: "gpt-5.6",
-	seq: 1,
-	role: "assistant",
-	contentJson: [{ type: "reasoning", text }],
-	toolCalls: [],
-	children: [],
-});
+const settledMessage = (text: string) =>
+	rowWithElements(
+		{
+			id: "real-1",
+			model: "gpt-5.6",
+			seq: 1,
+			role: "assistant",
+			toolCalls: [],
+		},
+		[{ type: "reasoning", text }],
+	);
 
 type Tails = ReadonlyMap<string, { charCount: number; tail: string }> | undefined;
 

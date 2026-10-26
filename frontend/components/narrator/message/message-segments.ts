@@ -7,11 +7,13 @@
 import { mergeSendDeliveryTargetCount, mergeSendDeliveryTargets } from "@shared/communication-tool";
 import type { FileReferenceContext } from "@shared/file-reference";
 import { normalizeFileReferenceContext } from "@shared/file-reference-context";
+import { messageBody, rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { isEmptyReasoningBlock } from "@shared/reasoning-content";
 import { appendStreamingTextPreview } from "../narrator-message-helpers";
 import type { ContentBlock, NarratorMsg, ToolCallRow } from "../narrator-panel-types";
 import type { ToolCallData } from "../tool-call/tool-call-data";
 import { toolExecutionFallback } from "../tool-call/tool-file-target";
+import { isNestedRow, nestedRowsByParent } from "./nested-rows";
 
 // ---------------------------------------------------------------------------
 // Legacy tool name mapping
@@ -38,7 +40,8 @@ export type ToolRunItem = {
 	msg: NarratorMsg;
 	blockIndex: number;
 	tc: ToolCallData;
-	children: NarratorMsg[];
+	/** Rows nested under this tool call (`nested-rows.ts`). */
+	nestedRows: NarratorMsg[];
 	isSubagent: boolean;
 };
 
@@ -71,14 +74,14 @@ function isVisibleContentBlock(b: ContentBlock): boolean {
 
 export function hasToolUse(msg: NarratorMsg): boolean {
 	if (msg.role !== "assistant") return false;
-	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+	const blocks = messageBody(msg);
 	return blocks.some((b: ContentBlock) => b.type === "tool_use");
 }
 
 /** True when every visible block is either tool_use or blank text. */
 export function isToolOnlyMessage(msg: NarratorMsg): boolean {
 	if (msg.role !== "assistant") return false;
-	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+	const blocks = messageBody(msg);
 	return (
 		blocks.length > 0 &&
 		blocks.every(
@@ -93,7 +96,7 @@ export function isToolOnlyMessage(msg: NarratorMsg): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Tool call resolution (from contentJson blocks → ToolCallData)
+// Tool call resolution (from tool_use elements → ToolCallData)
 // ---------------------------------------------------------------------------
 
 function parseToolTimestamp(value: unknown): number | undefined {
@@ -112,7 +115,7 @@ function parseToolTimestamp(value: unknown): number | undefined {
  * synthetic-tool-call path had no remaining consumer and is gone.
  */
 export function resolveAllToolCallsFromMsg(msg: NarratorMsg): ToolCallData[] {
-	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+	const blocks = messageBody(msg);
 	const results: ToolCallData[] = [];
 	for (const block of blocks) {
 		if (block.type !== "tool_use") continue;
@@ -216,12 +219,19 @@ export function resolveAllToolCallsFromMsg(msg: NarratorMsg): ToolCallData[] {
 	return results;
 }
 
-export function filterChildrenByToolUse(
-	children: NarratorMsg[],
+/** The rows among a row's nested rows that answer the tool call `toolUseId`. */
+export function nestedRowsOfTool(
+	nestedRows: readonly NarratorMsg[],
 	toolUseId: string | undefined,
 ): NarratorMsg[] {
 	if (!toolUseId) return [];
-	return children.filter((c) => c.parentToolUseId === toolUseId);
+	return nestedRows.filter((row) => row.parentToolUseId === toolUseId);
+}
+
+const NO_ROWS: readonly NarratorMsg[] = [];
+
+function sameRows(left: readonly NarratorMsg[], right: readonly NarratorMsg[]): boolean {
+	return left.length === right.length && left.every((row, index) => row === right[index]);
 }
 
 // ---------------------------------------------------------------------------
@@ -246,15 +256,15 @@ type MessageMaterials = {
 type CachedMessageMaterials = {
 	msg: NarratorMsg;
 	role: NarratorMsg["role"];
-	contentJson: NarratorMsg["contentJson"];
+	body: readonly unknown[];
 	toolCalls: NarratorMsg["toolCalls"];
-	children: NarratorMsg["children"];
+	nestedRows: readonly NarratorMsg[];
 	materials: MessageMaterials;
 };
 
 /**
  * Owned by one message-list coordinator, never shared globally. Direct message/
- * role/contentJson/toolCalls/children replacement invalidates automatically.
+ * role/body/toolCalls/nested-row replacement invalidates automatically.
  * Nested in-place edits require invalidate(id), or invalidate()/clear() for all.
  * Only per-message materials are retained: runs are assembled afresh each time.
  */
@@ -302,15 +312,15 @@ export class MessageSegmentationCache {
 	}
 
 	/** Internal to segmentMessages; exposed for coordinator-independent ownership. */
-	getMaterials(msg: NarratorMsg): MessageMaterials {
+	getMaterials(msg: NarratorMsg, nestedRows: readonly NarratorMsg[] = NO_ROWS): MessageMaterials {
 		const entry = this.entries.get(msg.id);
 		if (
 			entry &&
 			entry.msg === msg &&
 			entry.role === msg.role &&
-			entry.contentJson === msg.contentJson &&
+			entry.body === messageBody(msg) &&
 			entry.toolCalls === msg.toolCalls &&
-			entry.children === msg.children
+			sameRows(entry.nestedRows, nestedRows)
 		) {
 			return entry.materials;
 		}
@@ -318,7 +328,7 @@ export class MessageSegmentationCache {
 		// A same-id replacement must release the previous version even if the new
 		// materials exceed the budget and therefore cannot be retained.
 		this.invalidate(msg.id);
-		const materials = buildMessageMaterials(msg);
+		const materials = buildMessageMaterials(msg, nestedRows);
 		if (
 			msg.id !== "__streaming__" &&
 			this.entries.size < this.maxMessages &&
@@ -327,9 +337,9 @@ export class MessageSegmentationCache {
 			this.entries.set(msg.id, {
 				msg,
 				role: msg.role,
-				contentJson: msg.contentJson,
+				body: messageBody(msg),
 				toolCalls: msg.toolCalls,
-				children: msg.children,
+				nestedRows,
 				materials,
 			});
 			this.retainedAtoms += materials.atoms.length;
@@ -354,11 +364,14 @@ function classifyBlock(b: ContentBlock): VisualLane | null {
 }
 
 function isEpochMarker(msg: NarratorMsg): boolean {
-	const head = Array.isArray(msg.contentJson) ? msg.contentJson[0] : undefined;
+	const head = messageBody(msg)[0];
 	return !!head && typeof head === "object" && (head as { type?: unknown }).type === "epoch";
 }
 
-function buildMessageMaterials(msg: NarratorMsg): MessageMaterials {
+function buildMessageMaterials(
+	msg: NarratorMsg,
+	nestedRows: readonly NarratorMsg[] = NO_ROWS,
+): MessageMaterials {
 	const atoms: MessageAtom[] = [];
 	const materials: MessageMaterials = { atoms, toolCalls: [] };
 	if (msg.role !== "assistant") {
@@ -369,7 +382,7 @@ function buildMessageMaterials(msg: NarratorMsg): MessageMaterials {
 		return materials;
 	}
 
-	const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+	const blocks = messageBody(msg);
 	let hasTools = false;
 	for (let bi = 0; bi < blocks.length; bi++) {
 		const lane = classifyBlock(blocks[bi]);
@@ -391,19 +404,19 @@ function buildMessageMaterials(msg: NarratorMsg): MessageMaterials {
 			// Preserve first-match behavior for repeated toolUseIds (retry blocks).
 			const tc = materials.toolCalls.find((tool) => tool.toolUseId === block.id);
 			if (!tc) continue;
-			const children = filterChildrenByToolUse(msg.children ?? [], tc.toolUseId);
+			const toolRows = nestedRowsOfTool(nestedRows, tc.toolUseId);
 			atom.item = {
 				kind: "tool",
 				msg,
 				blockIndex: atom.blockIndex,
 				tc,
-				children,
+				nestedRows: toolRows,
 				isSubagent:
 					tc.toolName === "Agent" ||
 					tc.toolName === "Task" ||
 					tc.toolName === "Send" ||
 					!!tc._subagentActivity ||
-					children.length > 0,
+					toolRows.length > 0,
 			};
 		}
 	}
@@ -417,9 +430,15 @@ export function segmentMessages(
 	const { streamingMsg, cache } = opts;
 
 	const effectiveMessages = streamingMsg != null ? [...messages, streamingMsg] : messages;
+	const nestedByParent = nestedRowsByParent(messages);
 	const atoms: MessageAtom[] = [];
 	for (const msg of effectiveMessages) {
-		const materials = cache ? cache.getMaterials(msg) : buildMessageMaterials(msg);
+		// A nested row is read through its parent's tool call, never on its own.
+		if (isNestedRow(msg)) continue;
+		const nestedRows = nestedByParent.get(msg.id) ?? NO_ROWS;
+		const materials = cache
+			? cache.getMaterials(msg, nestedRows)
+			: buildMessageMaterials(msg, nestedRows);
 		// Do not spread arbitrarily large block lists into a function call.
 		for (const atom of materials.atoms) atoms.push(atom);
 	}
@@ -485,25 +504,6 @@ export function segmentMessages(
 }
 
 // ---------------------------------------------------------------------------
-// Target ID collection (for virtualization / scroll-to)
-// ---------------------------------------------------------------------------
-
-export function collectSegmentTargetIds(seg: RenderSegment): string[] {
-	if (seg.kind === "message") return seg.msg.id ? [seg.msg.id] : [];
-	const ids = new Set<string>();
-	for (const item of seg.items) {
-		if (item.msg.id) ids.add(item.msg.id);
-		if (item.tc.toolUseId) ids.add(item.tc.toolUseId);
-	}
-	for (const srcMsg of seg.sourceMessages) {
-		for (const child of srcMsg.children ?? []) {
-			if (child.id) ids.add(child.id);
-		}
-	}
-	return [...ids];
-}
-
-// ---------------------------------------------------------------------------
 // Streaming message builder
 // ---------------------------------------------------------------------------
 
@@ -524,6 +524,11 @@ function trimToolBlockCache() {
 		if (oldestKey === undefined) return;
 		toolBlockCache.delete(oldestKey);
 	}
+}
+
+/** Reset the tool-use block reference cache (between tests). */
+export function clearToolBlockCache(): void {
+	toolBlockCache.clear();
 }
 
 function stabilizeToolUseBlock(block: ContentBlock): ContentBlock {
@@ -551,18 +556,14 @@ function shallowBlockEqual(a: ContentBlock, b: ContentBlock): boolean {
 	return a.type === b.type && a.id === b.id && a.name === b.name && a.input === b.input;
 }
 
-/** Clear the tool-use block reference cache (call when streaming ends). */
-export function clearToolBlockCache(): void {
-	toolBlockCache.clear();
-}
-
 /** A streaming block tracked in temporal order (by event arrival / provider output order). */
 export type StreamingBlock =
 	| {
 			type: "reasoning";
-			id?: string;
-			revision?: number;
-			textOffset?: number;
+			/** The element this lane streams, its revision, and the raw characters before `text`. */
+			id: string;
+			revision: number;
+			textOffset: number;
 			outputIndex?: number;
 			text: string;
 	  }
@@ -590,9 +591,9 @@ export type StreamingBlock =
 	| {
 			type: "text";
 			text: string;
-			id?: string;
-			revision?: number;
-			textOffset?: number;
+			id: string;
+			revision: number;
+			textOffset: number;
 			outputIndex?: number;
 			fileReferenceContext?: FileReferenceContext | null;
 	  };
@@ -717,32 +718,18 @@ function findMatchingStreamingBlockIndex(
 	blocks: StreamingBlock[],
 	incoming: StreamingBlock,
 ): number {
-	if (incoming.type === "web_search" || incoming.type === "image_generation") {
-		return blocks.findIndex((b) => b.type === incoming.type && b.id === incoming.id);
-	}
-	if (incoming.type === "reasoning") {
-		const incomingOutputIndex = getStreamingBlockOutputIndex(incoming);
-		return blocks.findIndex((b) => {
-			if (b.type !== "reasoning") return false;
-			if (incoming.id) return b.id === incoming.id;
-			if (incomingOutputIndex != null)
-				return getStreamingBlockOutputIndex(b) === incomingOutputIndex;
-			return !b.id && getStreamingBlockOutputIndex(b) == null;
-		});
-	}
-	if (incoming.type === "text" && incoming.id) {
-		return blocks.findIndex((b) => b.type === "text" && b.id === incoming.id);
-	}
-	// text — prefer the provider output index, but legacy/providers without one
-	// still keep a single live text block that must merge with a reconnect snapshot
-	// instead of being inserted again and rendered twice.
-	const incomingOutputIndex = getStreamingBlockOutputIndex(incoming);
-	return blocks.findIndex((b) => {
-		if (b.type !== "text") return false;
-		const existingOutputIndex = getStreamingBlockOutputIndex(b);
-		if (incomingOutputIndex != null) return existingOutputIndex === incomingOutputIndex;
-		return existingOutputIndex == null;
-	});
+	return blocks.findIndex((b) => b.type === incoming.type && b.id === incoming.id);
+}
+
+/** A snapshot's text/reasoning lane names its element, revision and raw offset. */
+function isExactLane(block: StreamingBlock): boolean {
+	if (block.type !== "text" && block.type !== "reasoning") return true;
+	return (
+		typeof block.id === "string" &&
+		block.id.length > 0 &&
+		Number.isSafeInteger(block.revision) &&
+		Number.isSafeInteger(block.textOffset)
+	);
 }
 
 /**
@@ -760,14 +747,14 @@ export function mergeStreamingSnapshotBlocks(
 ): boolean {
 	let changed = false;
 	for (const incoming of snapshotBlocks) {
+		if (!isExactLane(incoming)) continue;
 		const idx = findMatchingStreamingBlockIndex(blocks, incoming);
 		if (idx === -1) {
 			const next = { ...incoming };
 			if (next.type === "text" || next.type === "reasoning") {
 				const rawLength = next.text.length;
 				next.text = appendStreamingTextPreview("", next.text);
-				if (next.textOffset != null || rawLength !== next.text.length)
-					next.textOffset = (next.textOffset ?? 0) + rawLength - next.text.length;
+				next.textOffset += rawLength - next.text.length;
 			}
 			blocks.splice(
 				findStreamingInsertIndex(blocks, getStreamingBlockOutputIndex(incoming)),
@@ -795,46 +782,28 @@ export function mergeStreamingSnapshotBlocks(
 				);
 				changed = true;
 			}
-			// Modern snapshots are exact versions, including shorter corrected bodies.
-			if (incoming.id && incoming.revision != null && existing.revision != null) {
-				if (incoming.revision <= existing.revision) {
-					// A delta may precede its reconnect snapshot. Revision guards the
-					// suffix; raw offsets let an older snapshot restore its missing prefix.
-					const start = incoming.textOffset;
-					const currentStart = existing.textOffset;
-					if (
-						start != null &&
-						currentStart != null &&
-						start < currentStart &&
-						start + incoming.text.length >= currentStart
-					) {
-						const end = currentStart + existing.text.length;
-						const prefix = incoming.text.slice(0, currentStart - start);
-						const text = appendStreamingTextPreview(prefix, existing.text);
-						if (text !== existing.text) {
-							existing.text = text;
-							existing.textOffset = end - text.length;
-							changed = true;
-						}
+			// Snapshots are exact versions, including shorter corrected bodies.
+			if (incoming.revision <= existing.revision) {
+				// A delta may precede its reconnect snapshot. Revision guards the
+				// suffix; raw offsets let an older snapshot restore its missing prefix.
+				const start = incoming.textOffset;
+				const currentStart = existing.textOffset;
+				if (start < currentStart && start + incoming.text.length >= currentStart) {
+					const end = currentStart + existing.text.length;
+					const prefix = incoming.text.slice(0, currentStart - start);
+					const text = appendStreamingTextPreview(prefix, existing.text);
+					if (text !== existing.text) {
+						existing.text = text;
+						existing.textOffset = end - text.length;
+						changed = true;
 					}
-					continue;
 				}
-				existing.text = appendStreamingTextPreview("", incoming.text);
-				existing.textOffset =
-					(incoming.textOffset ?? 0) + incoming.text.length - existing.text.length;
-				existing.revision = incoming.revision;
-				changed = true;
 				continue;
 			}
-			if (incoming.revision != null) existing.revision = incoming.revision;
-			// Legacy snapshots have no version; retain their conservative longer preview.
-			if (incoming.text.length > existing.text.length) {
-				existing.text = incoming.text;
-				if (incoming.type === "reasoning" && existing.type === "reasoning" && incoming.id) {
-					existing.id = incoming.id;
-				}
-				changed = true;
-			}
+			existing.text = appendStreamingTextPreview("", incoming.text);
+			existing.textOffset = incoming.textOffset + incoming.text.length - existing.text.length;
+			existing.revision = incoming.revision;
+			changed = true;
 		} else {
 			// web_search / image_generation: adopt the fresher snapshot status/fields.
 			blocks[idx] = { ...existing, ...incoming };
@@ -872,19 +841,15 @@ export function buildStreamingMsg(opts: {
 	const blocks: ContentBlock[] = [];
 
 	if (hasStreamingBlocks) {
-		for (const [index, sb] of streamingBlocks.entries()) {
+		for (const sb of streamingBlocks) {
 			if (sb.type === "reasoning") {
 				blocks.push({
 					type: "reasoning",
-					id:
-						sb.id ??
-						(sb.outputIndex != null
-							? `streaming:reasoning:${sb.outputIndex}`
-							: `streaming:reasoning:${index}`),
+					id: sb.id,
 					text: sb.text,
 					outputIndex: sb.outputIndex,
-					...(sb.revision != null ? { revision: sb.revision } : {}),
-					...(sb.textOffset != null ? { textOffset: sb.textOffset } : {}),
+					revision: sb.revision,
+					textOffset: sb.textOffset,
 				} as ContentBlock);
 			} else if (sb.type === "web_search") {
 				blocks.push({
@@ -910,10 +875,10 @@ export function buildStreamingMsg(opts: {
 			} else if (sb.type === "text") {
 				blocks.push({
 					type: "text",
-					id: sb.id ?? `streaming:text:${index}`,
+					id: sb.id,
 					text: sb.text,
-					...(sb.revision != null ? { revision: sb.revision } : {}),
-					...(sb.textOffset != null ? { textOffset: sb.textOffset } : {}),
+					revision: sb.revision,
+					textOffset: sb.textOffset,
 					outputIndex: sb.outputIndex,
 					...(sb.fileReferenceContext !== undefined
 						? { fileReferenceContext: normalizeFileReferenceContext(sb.fileReferenceContext) }
@@ -924,67 +889,25 @@ export function buildStreamingMsg(opts: {
 	}
 
 	if (toolChunksMsg) {
-		const chunkBlocks = Array.isArray(toolChunksMsg.contentJson) ? toolChunksMsg.contentJson : [];
+		const chunkBlocks = messageBody(toolChunksMsg);
 		for (const raw of chunkBlocks) {
 			blocks.push(stabilizeToolUseBlock(raw));
 		}
 	}
 
-	return {
+	const row = {
 		id: "__streaming__",
 		narratorId,
 		...(opts.model !== undefined ? { model: opts.model } : {}),
 		...(opts.provider !== undefined ? { provider: opts.provider } : {}),
 		parentToolUseId: null,
 		role: "assistant",
-		contentJson: blocks,
 		contentText: null,
 		toolCalls: toolChunksMsg?.toolCalls ?? [],
 		createdAt: toolChunksMsg?.createdAt ?? new Date().toISOString(),
-		children: [],
 		// Text/reasoning blocks are emitted first and in the same order as
 		// `streamingBlocks`, so the accumulator's index carries over unchanged.
 		...(liveBlockIndex != null ? { liveBlockIndex } : {}),
-	} as NarratorMsg;
-}
-
-/**
- * Generate stable React keys for a list of content blocks.
- *
- * Blocks that already carry an `id` (tool_use, web_search from the API,
- * streaming blocks with synthetic ids) use that id directly.
- * For blocks without an id, the block *type* is used as the key since each
- * type typically appears at most once per message.  When multiple blocks
- * share the same type and both lack an id, a dedup counter is appended so
- * every key remains unique.
- */
-// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
-export function generateBlockKeys(blocks: any[]): string[] {
-	const typeCount: Record<string, number> = {};
-	return blocks.map((block) => {
-		if (block.id) return block.id as string;
-		const t = block.type as string;
-		// Known content types typically appear at most once per message,
-		// so the first occurrence uses the bare type name as the key
-		// (e.g. "text") for maximum stability during streaming.
-		// Subsequent occurrences append a dedup counter (e.g. "text-1").
-		if (
-			t === "text" ||
-			t === "reasoning" ||
-			t === "thinking" ||
-			t === "web_search" ||
-			t === "image_generation" ||
-			t === "image" ||
-			t === "text_file"
-		) {
-			const count = typeCount[t] ?? 0;
-			typeCount[t] = count + 1;
-			return count === 0 ? t : `${t}-${count}`;
-		}
-		// Unknown types always include a counter (e.g. "custom-0") since
-		// we cannot assume they appear at most once per message.
-		const count = typeCount[t] ?? 0;
-		typeCount[t] = count + 1;
-		return `${t}-${count}`;
-	});
+	} as Omit<NarratorMsg, "blocks">;
+	return rowWithElements(row, blocks);
 }

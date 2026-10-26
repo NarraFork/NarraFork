@@ -17,9 +17,9 @@ import {
 	looksLikeSessionToken,
 } from "@frontend/lib/host-bridge";
 
-/** A syntactically plausible session JWT (never verified by the client). */
-const TOKEN_A = "aaaaaaaaaaaa.bbbbbbbbbbbb.cccccccccccc";
-const TOKEN_B = "dddddddddddd.eeeeeeeeeeee.ffffffffffff";
+/** Syntactically plausible session tokens (never verified by the client). */
+const TOKEN_A = `nfs_${"a".repeat(43)}`;
+const TOKEN_B = `nfs_${"b".repeat(43)}`;
 const HOST_ORIGIN = "vscode-webview://7803497a-8232-4556-988a-7a1636d48b30";
 
 interface SentMessage {
@@ -99,8 +99,14 @@ afterEach(() => {
 });
 
 describe("looksLikeSessionToken", () => {
-	it("accepts a three-segment base64url token", () => {
+	it("accepts a session token", () => {
 		expect(looksLikeSessionToken(TOKEN_A)).toBe(true);
+	});
+
+	it("rejects a malformed session token and the retired JWT format", () => {
+		expect(looksLikeSessionToken(`nfs_${"A".repeat(42)}`)).toBe(false);
+		expect(looksLikeSessionToken(`nfs_${"A".repeat(42)}.`)).toBe(false);
+		expect(looksLikeSessionToken("aaaaaaaaaaaa.bbbbbbbbbbbb.cccccccccccc")).toBe(false);
 	});
 
 	it("rejects values that could not be a token", () => {
@@ -349,7 +355,7 @@ describe("installHostBridge", () => {
 		});
 
 		it("says nothing when the value did not actually change", () => {
-			// Hydration and `absorbRenewedToken` both re-assert the current value; announcing
+			// Hydration re-asserts the current value; announcing
 			// those would send a message per request.
 			const win = bootstrapped();
 			setToken(TOKEN_A);

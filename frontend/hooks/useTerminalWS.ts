@@ -150,9 +150,9 @@ class TerminalWSManager {
 			this.notifyStatus();
 			this.syncGlobalStatus();
 			if (ev.code === 1001) return;
-			// 4001 = the session token this socket was opened with expired. HTTP
-			// sliding renewal has very likely already stored a fresh one, so retry
-			// immediately with whatever is in localStorage instead of backing off.
+			// 4001 = the session this socket was opened with ended. Retry immediately
+			// with whatever is in localStorage: after a re-login that is the new token,
+			// otherwise the upgrade fails and the app falls back to its login flow.
 			if (ev.code === SESSION_EXPIRED_CLOSE_CODE) {
 				this.reconnectAttempts = 0;
 			}

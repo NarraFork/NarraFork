@@ -9,6 +9,7 @@
  * simply the LAST TWO run segments in the list.
  */
 
+import { isNestedRow } from "../message/nested-rows";
 import type { NarratorMsg } from "../narrator-panel-types";
 
 /**
@@ -30,6 +31,8 @@ export function recentRunSegmentMessageIds(messages: NarratorMsg[], count = 2): 
 	let inRun = false;
 	for (let i = messages.length - 1; i >= 0; i--) {
 		const msg = messages[i];
+		// A nested row is not part of the conversation's runs.
+		if (isNestedRow(msg)) continue;
 		if (msg.role === "assistant") {
 			inRun = true;
 			if (runsCollected < count && msg.id) {

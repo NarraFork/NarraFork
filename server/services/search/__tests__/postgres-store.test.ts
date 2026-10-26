@@ -613,6 +613,39 @@ describe("search parity: SQLite FTS5 vs PostgreSQL pg_trgm", () => {
 						check(`session hits auth ${label} (sqlite)`, ids(a), expected);
 						check(`session hits auth ${label} (postgres)`, ids(b), expected);
 					}
+					// The same pass names each session's newest hits (ties by id), and a page reads
+					// them back by id, in the order asked, skipping ids that no longer exist.
+					{
+						const query = { ...entity("e", "substring", OWNER), latestHits: 2 };
+						const [a, b] = await Promise.all([
+							lite.searchSessionAggregates(query),
+							store.searchSessionAggregates(query),
+						]);
+						const latest = (rows: { narratorId: string; latestHits: { id: string }[] }[]) =>
+							rows
+								.map((row) => `${row.narratorId}:${row.latestHits.map((h) => h.id).join("+")}`)
+								.sort();
+						check("session latest hits (sqlite)", latest(a), ["n1:m1+m4", "n2:m2"]);
+						check("session latest hits (postgres)", latest(b), ["n1:m1+m4", "n2:m2"]);
+						const refs = ["m2", "missing", "m1"].map((id) => ({
+							id,
+							blockId: null,
+							createdAt: null,
+						}));
+						for (const [backend, s] of [
+							["sqlite", lite],
+							["postgres", store],
+						] as const) {
+							const rows = await s.searchSessionHitDetails({ text: "middleware", refs });
+							check(
+								`session hit details (${backend})`,
+								rows.map((row) => row.id),
+								["m2", "m1"],
+							);
+							expect(rows[0]?.snippet, `hit detail excerpt (${backend})`).toContain("middleware");
+							expect(rows[0]?.narratorId, `hit detail narrator (${backend})`).toBe("n2");
+						}
+					}
 					// ── timeline: own refs and an inherited fork scope ────────────────────
 					const timelineCases: [string, TimelineSearchQuery, string[]][] = [
 						[

@@ -15,6 +15,7 @@
  *   │      lineClamp=2 question] + icon(14)                                      │
  *   │  height = py(10)×2 + label(xs 17) + question(clamp[1,2] × sm 20)           │
  *   │         = 57 (1 line) .. 77 (2 lines)                                      │
+ *   │  + quote row (xs 17 + gap 2) when asked from a selection: 76 .. 96         │
  *   └────────────────────────────────────────────────────────────────────────────┘
  *
  * The question text is measured with pretext (rich-inline) so short questions
@@ -61,6 +62,8 @@ export interface AskInPassingResolvedData {
 	question: string;
 	/** Narrator the resolved card navigates to on click. Render-only. */
 	targetNarratorId?: string;
+	/** The selected excerpt the question was about, shown as one ellipsized line. */
+	quoteText?: string;
 }
 
 export type AskInPassingData = AskInPassingPendingData | AskInPassingResolvedData;
@@ -108,6 +111,10 @@ export const RESOLVED_ICON = 14;
 export const RESOLVED_GROUP_GAP = 6;
 /** Fixed label row (Text size="xs" dimmed, single line). */
 export const RESOLVED_LABEL_HEIGHT = XS_LINE_HEIGHT; // 17
+/** Quote row (one ellipsized xs line) between the label and the question. */
+export const RESOLVED_QUOTE_ROW = XS_LINE_HEIGHT; // 17
+/** Space below the quote row. */
+export const RESOLVED_QUOTE_GAP = 2;
 /** Max rendered question lines (DOM lineClamp={2}). */
 export const QUESTION_MAX_LINES = 2;
 /** JS-layer truncation length applied by the card before display. */
@@ -243,7 +250,8 @@ function measureResolved(data: AskInPassingResolvedData, contentWidth: number): 
 	// Frame is computed at the question's available width; the label + padding are
 	// fixed chrome the renderer draws around it (mirrors measure-message-bubble).
 	const frame = accumulateFrame(blocks, questionWidth, clampedInlineResolver(QUESTION_MAX_LINES));
-	const height = RESOLVED_PADDING_Y * 2 + RESOLVED_LABEL_HEIGHT + frame.contentHeight;
+	const quoteHeight = data.quoteText ? RESOLVED_QUOTE_ROW + RESOLVED_QUOTE_GAP : 0;
+	const height = RESOLVED_PADDING_Y * 2 + RESOLVED_LABEL_HEIGHT + quoteHeight + frame.contentHeight;
 
 	return {
 		height,

@@ -18,6 +18,7 @@
  */
 
 import { beforeAll, describe, expect, it } from "bun:test";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import type { AdapterContext, AdapterRenderUnit } from "@shared/pretext-layout/segment-adapter";
 import { MAX_RENDER_LOD, MIN_RENDER_LOD, type RenderLod } from "../lod/RenderLodCtx";
 import { segmentMessages } from "../message/message-segments";
@@ -44,13 +45,14 @@ function toolMessage(id: string, toolUseId: string, status = "success"): Narrato
 		inputJson: { file_path: `/${toolUseId}.ts` },
 		outputJson: { _text: "line1\nline2\n" },
 	};
-	return {
-		id,
-		role: "assistant",
-		contentJson: [{ type: "tool_use", id: toolUseId, name: "Read", input: call.inputJson }],
-		toolCalls: [call],
-		children: [],
-	} as unknown as NarratorMsg;
+	return rowWithElements(
+		{
+			id,
+			role: "assistant",
+			toolCalls: [call],
+		},
+		[{ type: "tool_use", id: toolUseId, name: "Read", input: call.inputJson }],
+	) as unknown as NarratorMsg;
 }
 
 /** Every tool-use id the specs make addressable (own card, or a named trace row). */
@@ -146,13 +148,14 @@ describe("every tool call is addressable at every LOD (protected invariant)", ()
 	});
 
 	it("a batch interleaved with reasoning (the activity fold's real input)", async () => {
-		const reasoning = {
-			id: "r1",
-			role: "assistant",
-			contentJson: [{ type: "reasoning", text: "**Look it up**\n\nchecking the cache" }],
-			toolCalls: [],
-			children: [],
-		} as unknown as NarratorMsg;
+		const reasoning = rowWithElements(
+			{
+				id: "r1",
+				role: "assistant",
+				toolCalls: [],
+			},
+			[{ type: "reasoning", text: "**Look it up**\n\nchecking the cache" }],
+		) as unknown as NarratorMsg;
 		const messages = [toolMessage("m1", "tu-1"), reasoning, toolMessage("m2", "tu-2")];
 		const missing: string[] = [];
 		for (const lod of ALL_LEVELS) {

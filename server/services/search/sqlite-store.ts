@@ -53,19 +53,23 @@ import { executeSqliteSearchQuery, type SearchQueryExecutor } from "./sqlite-wor
 import {
 	type EntitySearchQuery,
 	GLOBAL_SNIPPET,
+	groupSessionAggregates,
 	KNOWLEDGE_SNIPPET,
 	type KnowledgeDraftSearchQuery,
 	type KnowledgeSearchQuery,
 	type KnowledgeSearchRow,
+	latestHitCount,
 	type MessageSearchRow,
 	type MessageSearchScope,
 	type NarratorSearchRow,
+	orderSessionAggregates,
 	PREVIEW_CHARS,
 	RECALL_SNIPPET,
 	type RecallMessageRow,
 	type RecallSearchQuery,
 	type SessionAggregateQuery,
 	type SessionAggregateRow,
+	type SessionHitDetailsQuery,
 	type SessionHitsQuery,
 	type ShadowedEntryQuery,
 	TIMELINE_SNIPPET,
@@ -136,6 +140,8 @@ function mergeBlockHits<T extends { blockId?: string }>(
 const SUBSTRING_LEAD = 60;
 
 /** How much of a block's stored text an excerpt searches; matches the block index's cap. */
+/** Ceiling on the hits one details read returns: a page of sessions' worth. */
+const MAX_HIT_DETAILS = 500;
 const BLOCK_EXCERPT_SOURCE_CHARS = 64 * 1024;
 
 /**
@@ -637,35 +643,6 @@ export function createSqliteSearchStore(
 		};
 	}
 
-	/** Excerpt for a session hit: FTS5's own on the index path, a window around the first
-	 *  term's first occurrence on the substring path. Returns SQL plus its values, in textual
-	 *  order. */
-	function sessionSnippet(
-		query: EntitySearchQuery,
-		blockOnly: boolean,
-	): { sql: string; values: Array<string | number> } {
-		const { match } = globalNeedles(query);
-		// Once only blocks are indexed: the text's own window, NULL where only a block matched.
-		if (match !== null && blockOnly) return textWindowSql(query, PREVIEW_CHARS);
-		if (match !== null) {
-			return {
-				sql: `(SELECT ${snippetCall("narrator_messages_fts", 0, GLOBAL_SNIPPET)}
-				 FROM narrator_messages_fts
-				 WHERE narrator_messages_fts MATCH ? AND narrator_messages_fts.rowid = m.rowid)`,
-				values: [match],
-			};
-		}
-		const { indexed, short } = globalQueryTerms(query.text);
-		const first = [...indexed, ...short][0] ?? query.text;
-		const at = "instr(lower(m.content_text), lower(?))";
-		return {
-			sql: `CASE WHEN ${at} > ${SUBSTRING_LEAD}
-				 THEN '...' || substr(m.content_text, ${at} - ${SUBSTRING_LEAD}, ${PREVIEW_CHARS})
-				 ELSE substr(m.content_text, 1, ${PREVIEW_CHARS}) END`,
-			values: [first, first],
-		};
-	}
-
 	/**
 	 * An excerpt from a matching block, for hits whose message text does not contain the
 	 * term (a tool's input or output, an injected context). The block index is contentless,
@@ -795,6 +772,28 @@ export function createSqliteSearchStore(
 			lastMessageAt: row.last_message_at ?? null,
 			createdAt: row.created_at ?? null,
 			updatedAt: row.updated_at ?? null,
+			latestHits: [],
+		};
+	}
+
+	/** A session hit row: the message text's own excerpt when its text matched, otherwise
+	 *  the matching block's, which is the only place a tool-only hit's term appears. */
+	function toHitRow(row: RawRow, rank: number | null): MessageSearchRow {
+		return {
+			id: row.id,
+			narratorId: row.narrator_id ?? null,
+			narratorTitle: row.narrator_title ?? null,
+			projectName: row.project_name ?? null,
+			model: row.model ?? null,
+			messageRole: row.message_role ?? null,
+			createdAt: row.created_at ?? null,
+			snippet: row.snippet || (row.block_snippet ? jsonExcerptText(row.block_snippet) : ""),
+			preview: row.content_preview ?? "",
+			rank,
+			...(row.block_id ? { blockId: row.block_id } : {}),
+			...(row.block_kind === "tool" && row.tool_use_id
+				? { toolUseId: row.tool_use_id, toolName: row.block_subtype ?? undefined }
+				: {}),
 		};
 	}
 
@@ -920,27 +919,67 @@ export function createSqliteSearchStore(
 		async searchSessionAggregates(query: SessionAggregateQuery): Promise<SessionAggregateRow[]> {
 			const blockOnly = globalNeedles(query).match !== null && mode.blockOnly();
 			const cte = sessionHitsCte(query, blockOnly);
-			const order =
-				query.sort === "time"
-					? "agg.last_hit_at DESC, agg.narrator_id ASC"
-					: "agg.best_rank IS NULL, agg.best_rank ASC, agg.hit_count DESC, agg.last_hit_at DESC, agg.narrator_id ASC";
+			const latest = latestHitCount(query);
+			// One pass: every hit is counted per narrator, and the newest few are kept by id.
+			// Ordering and the narrator cap run in JS (orderSessionAggregates), on one row per
+			// narrator per kept hit.
 			const rows: RawRow[] = await execute(
-				`${cte.sql}, agg AS (
-				SELECT narrator_id, MIN(r) AS best_rank, COUNT(*) AS hit_count, MAX(created_at) AS last_hit_at
-				 FROM per_msg GROUP BY narrator_id
+				`${cte.sql}, ranked AS (
+				SELECT id, narrator_id, created_at, block_id,
+					  ROW_NUMBER() OVER newest AS rn,
+					  COUNT(*) OVER whole AS hit_count,
+					  MIN(r) OVER whole AS best_rank,
+					  MAX(created_at) OVER whole AS last_hit_at
+				 FROM per_msg
+				 WINDOW whole AS (PARTITION BY narrator_id),
+					newest AS (PARTITION BY narrator_id ORDER BY created_at DESC, id ASC)
 			)
-			SELECT agg.narrator_id, agg.best_rank, agg.hit_count, agg.last_hit_at,
+			SELECT ranked.narrator_id, ranked.best_rank, ranked.hit_count, ranked.last_hit_at,
+				  ranked.rn, ranked.id AS hit_id, ranked.block_id AS hit_block_id,
+				  ranked.created_at AS hit_created_at,
 				  n.title, n.type, n.subagent_type, n.status, n.last_message_at,
 				  n.created_at, n.updated_at, p.id AS project_id, p.name AS project_name
-			 FROM agg
-			 JOIN narrators n ON n.id = agg.narrator_id
+			 FROM ranked
+			 JOIN narrators n ON n.id = ranked.narrator_id
 			 ${PROJECT_JOIN}
-			 ORDER BY ${order}
-			 LIMIT ?`,
-				[...cte.values, query.limit],
+			 WHERE ranked.rn <= ?
+			 ORDER BY ranked.narrator_id ASC, ranked.rn ASC`,
+				[...cte.values, Math.max(1, latest)],
 				{ signal: query.signal, operation: "searchSessionAggregates" },
 			);
-			return rows.map((row) => toSessionAggregate(row, query.strategy));
+			return orderSessionAggregates(
+				groupSessionAggregates(rows, latest, (row) => toSessionAggregate(row, query.strategy)),
+				query.sort,
+				query.limit,
+			);
+		},
+
+		async searchSessionHitDetails(query: SessionHitDetailsQuery): Promise<MessageSearchRow[]> {
+			const refs = query.refs.slice(0, MAX_HIT_DETAILS);
+			if (refs.length === 0) return [];
+			// Reads by primary key only; the ids come from a gated search the caller already ran.
+			const snippet = textWindowSql(query, PREVIEW_CHARS);
+			const blockExcerpt = blockExcerptSql(query);
+			const rows: RawRow[] = await execute(
+				`WITH refs(id, block_id, ord) AS (VALUES ${refs.map(() => "(?, ?, ?)").join(", ")})
+			SELECT ${MESSAGE_COLUMNS}, refs.block_id,
+				  ${snippet.sql} AS snippet,
+				  bb.kind AS block_kind, bb.wire_id AS tool_use_id, bb.subtype AS block_subtype,
+				  ${blockExcerpt.sql} AS block_snippet
+			 FROM refs
+			 JOIN narrator_messages m ON m.id = refs.id
+			 JOIN narrators n ON n.id = m.narrator_id
+			 LEFT JOIN narrator_blocks bb ON bb.id = refs.block_id
+			 ${PROJECT_JOIN}
+			 ORDER BY refs.ord`,
+				[
+					...refs.flatMap((ref, ord) => [ref.id, ref.blockId, ord]),
+					...snippet.values,
+					...blockExcerpt.values,
+				],
+				{ signal: query.signal, operation: "searchSessionHitDetails" },
+			);
+			return rows.map((row) => toHitRow(row, null));
 		},
 
 		async searchSessionHits(query: SessionHitsQuery): Promise<MessageSearchRow[]> {
@@ -956,7 +995,7 @@ export function createSqliteSearchStore(
 				query.sort === "time"
 					? "created_at DESC, id ASC"
 					: "r IS NULL, r ASC, created_at DESC, id ASC";
-			const snippet = sessionSnippet(query, blockOnly);
+			const snippet = textWindowSql(query, PREVIEW_CHARS);
 			const blockExcerpt = blockExcerptSql(query);
 			const offset = Math.max(0, Math.trunc(query.offset ?? 0));
 			const rows: RawRow[] = await execute(
@@ -984,24 +1023,7 @@ export function createSqliteSearchStore(
 				],
 				{ signal: query.signal, operation: "searchSessionHits" },
 			);
-			return rows.map((row) => ({
-				id: row.id,
-				narratorId: row.narrator_id ?? null,
-				narratorTitle: row.narrator_title ?? null,
-				projectName: row.project_name ?? null,
-				model: row.model ?? null,
-				messageRole: row.message_role ?? null,
-				createdAt: row.created_at ?? null,
-				// The message text's own excerpt when its text matched; otherwise the matching
-				// block's, which is the only place a tool-only hit's term appears.
-				snippet: row.snippet || (row.block_snippet ? jsonExcerptText(row.block_snippet) : ""),
-				preview: row.content_preview ?? "",
-				rank: rankOf(row, query.strategy),
-				...(row.block_id ? { blockId: row.block_id } : {}),
-				...(row.block_kind === "tool" && row.tool_use_id
-					? { toolUseId: row.tool_use_id, toolName: row.block_subtype ?? undefined }
-					: {}),
-			}));
+			return rows.map((row) => toHitRow(row, rankOf(row, query.strategy)));
 		},
 
 		async searchTimeline(query: TimelineSearchQuery): Promise<TimelineSearchRow[]> {

@@ -38,7 +38,7 @@ import { localBackend } from "../lib/agent/execution/local-backend";
 import { editTool } from "../lib/agent/tools/edit";
 import { writeTool } from "../lib/agent/tools/write";
 import type { ToolContext } from "../lib/agent/types";
-import type { JwtPayload } from "../lib/auth";
+import type { SessionPayload } from "../lib/auth";
 import { generateId } from "../lib/id";
 import { getNarraforkHome } from "../lib/narrafork-home";
 import { safeSpawn } from "../lib/spawn";
@@ -723,7 +723,7 @@ describe("current Git targets matched against recorded writes", () => {
 			createdAt: now,
 			updatedAt: now,
 		});
-		const app = new Hono<{ Variables: { user: JwtPayload } }>();
+		const app = new Hono<{ Variables: { user: SessionPayload } }>();
 		app.use("*", async (c, next) => {
 			c.set("user", { sub: userId, role: "admin", iat: 0, exp: 2_147_483_647 });
 			await next();

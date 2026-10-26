@@ -506,7 +506,7 @@ function UserBubble({
 					}
 					return (
 						<UserAttachmentView
-							// biome-ignore lint/suspicious/noArrayIndexKey: attachment blocks are a stable ordered list (message contentJson order)
+							// biome-ignore lint/suspicious/noArrayIndexKey: attachment blocks are a stable ordered list (message body order)
 							key={index}
 							block={block}
 							top={top}

@@ -1,4 +1,5 @@
 import { beforeAll, describe, expect, it } from "bun:test";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { segmentMessages } from "../message/message-segments";
 import type { NarratorMsg } from "../narrator-panel-types";
 import { groupRenderUnits } from "../trace/render-units";
@@ -12,18 +13,20 @@ beforeAll(() => {
 const SEGMENTS: AdapterSegment[] = [
 	{
 		kind: "message",
-		msg: { id: "u1", role: "user", contentJson: [{ type: "text", text: "hello there" }] },
+		msg: rowWithElements({ id: "u1", role: "user" }, [{ type: "text", text: "hello there" }]),
 	},
 	{
 		kind: "message",
-		msg: {
-			id: "a1",
-			role: "assistant",
-			contentJson: [
+		msg: rowWithElements(
+			{
+				id: "a1",
+				role: "assistant",
+			},
+			[
 				{ type: "reasoning", text: "thinking about it" },
 				{ type: "text", text: "Here is a fairly long answer that should wrap across lines." },
 			],
-		},
+		),
 	},
 	{
 		kind: "tool-run",
@@ -124,11 +127,13 @@ describe("computeVListLayout", () => {
 		const seg: AdapterSegment[] = [
 			{
 				kind: "message",
-				msg: {
-					id: "a2",
-					role: "assistant",
-					contentJson: [{ type: "reasoning", text: "a".repeat(400) }],
-				},
+				msg: rowWithElements(
+					{
+						id: "a2",
+						role: "assistant",
+					},
+					[{ type: "reasoning", text: "a".repeat(400) }],
+				),
 			},
 		];
 		const collapsed = computeVListLayout(seg, {
@@ -148,13 +153,13 @@ describe("computeVListLayout", () => {
 		const seg: AdapterSegment[] = [
 			{
 				kind: "message",
-				msg: {
-					id: "a3",
-					role: "assistant",
-					contentJson: [
-						{ type: "reasoning", text: "short original", translatedText: "翻译".repeat(200) },
-					],
-				},
+				msg: rowWithElements(
+					{
+						id: "a3",
+						role: "assistant",
+					},
+					[{ type: "reasoning", text: "short original", translatedText: "翻译".repeat(200) }],
+				),
 			},
 		];
 		const opts = { contentWidth: 600, lod: 5, isExpanded: () => true } as const;
@@ -188,13 +193,13 @@ describe("L1-L5 render-unit matrix", () => {
 			items: [
 				{
 					kind: "reasoning" as const,
-					msg: { id: "a", role: "assistant", contentJson: [] },
+					msg: rowWithElements({ id: "a", role: "assistant" }, []),
 					blockIndex: 0,
 					block: { type: "reasoning", text: "thought" },
 				},
 				{
 					kind: "tool" as const,
-					msg: { id: "a", role: "assistant", contentJson: [] },
+					msg: rowWithElements({ id: "a", role: "assistant" }, []),
 					blockIndex: 1,
 					tc: { toolName: "Read", status: "success" },
 				},
@@ -234,16 +239,16 @@ describe("L1-L5 render-unit matrix", () => {
 
 	it("keeps reasoning/text/tool order across the shared L1/L2 fold", () => {
 		const messages = [
-			{ id: "a1", role: "assistant", contentJson: [{ type: "reasoning", text: "r" }] },
-			{
-				id: "a2",
-				role: "assistant",
-				contentJson: [
-					{ type: "tool_use", id: "t1", name: "Read", inputJson: {}, status: "success" },
-				],
-				toolCalls: [{ toolUseId: "t1", toolName: "Read", inputJson: {}, status: "success" }],
-			},
-			{ id: "a3", role: "assistant", contentJson: [{ type: "text", text: "answer" }] },
+			rowWithElements({ id: "a1", role: "assistant" }, [{ type: "reasoning", text: "r" }]),
+			rowWithElements(
+				{
+					id: "a2",
+					role: "assistant",
+					toolCalls: [{ toolUseId: "t1", toolName: "Read", inputJson: {}, status: "success" }],
+				},
+				[{ type: "tool_use", id: "t1", name: "Read", inputJson: {}, status: "success" }],
+			),
+			rowWithElements({ id: "a3", role: "assistant" }, [{ type: "text", text: "answer" }]),
 		] as unknown as NarratorMsg[];
 		const units = groupRenderUnits(segmentMessages(messages), true);
 		expect(units.map((unit) => unit.kind)).toEqual(["activity", "segment"]);
@@ -254,12 +259,12 @@ describe("L1-L5 render-unit matrix", () => {
 		const { computeVListLayout } = await import("./vlist-pipeline");
 		const segment: AdapterSegment = {
 			kind: "tool-run",
-			sourceMessages: [{ id: "old-tool", role: "assistant", contentJson: [] }],
+			sourceMessages: [rowWithElements({ id: "old-tool", role: "assistant" }, [])],
 			items: [
 				{
 					blockIndex: 0,
 					isSubagent: false,
-					msg: { id: "old-tool", role: "assistant", contentJson: [] },
+					msg: rowWithElements({ id: "old-tool", role: "assistant" }, []),
 					tc: { toolName: "Read", status: "success", toolUseId: "old-1" },
 				},
 			],
@@ -316,7 +321,7 @@ describe("resolveVisibleWindow", () => {
 		// Many identical segments to build a tall list.
 		const many: AdapterSegment[] = Array.from({ length: 50 }, (_, i) => ({
 			kind: "message" as const,
-			msg: { id: `u${i}`, role: "user", contentJson: [{ type: "text", text: `msg ${i}` }] },
+			msg: rowWithElements({ id: `u${i}`, role: "user" }, [{ type: "text", text: `msg ${i}` }]),
 		}));
 		const { layout } = computeVListLayout(many, { contentWidth: 600, lod: 5 });
 		const win = resolveVisibleWindow(layout, 0, 300, 0);
@@ -330,7 +335,7 @@ describe("resolveVisibleWindow", () => {
 		const { computeVListLayout, resolveVisibleWindow } = await import("./vlist-pipeline");
 		const many: AdapterSegment[] = Array.from({ length: 50 }, (_, i) => ({
 			kind: "message" as const,
-			msg: { id: `u${i}`, role: "user", contentJson: [{ type: "text", text: `msg ${i}` }] },
+			msg: rowWithElements({ id: `u${i}`, role: "user" }, [{ type: "text", text: `msg ${i}` }]),
 		}));
 		const { layout } = computeVListLayout(many, { contentWidth: 600, lod: 5 });
 		const top = resolveVisibleWindow(layout, 0, 300, 0);

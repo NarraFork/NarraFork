@@ -1,3 +1,6 @@
+import { type MessageWithBody, messageBody } from "@shared/narrator-blocks/message-blocks";
+import { isNestedRow } from "../message/nested-rows";
+
 /**
  * vlist-spec-tasks-pin.ts — Pure "latest spec://tasks.json call" identification
  * for the exact virtual list.
@@ -24,15 +27,11 @@ export interface SpecTasksToolCallLike {
 	inputJson?: unknown;
 }
 
-/** Structural minimum of a message (contentJson tool_use blocks + toolCalls). */
-export interface SpecTasksMessageLike {
-	contentJson?: ReadonlyArray<{
-		type?: unknown;
-		id?: unknown;
-		name?: unknown;
-		input?: unknown;
-	}> | null;
+/** Structural minimum of a message (its tool_use elements + toolCalls). */
+export interface SpecTasksMessageLike
+	extends MessageWithBody<{ type?: unknown; id?: unknown; name?: unknown; input?: unknown }> {
 	toolCalls?: readonly SpecTasksToolCallLike[] | null;
+	parentMessageId?: string | null;
 }
 
 /** The path a streaming tool call has extracted so far, if any. */
@@ -65,7 +64,7 @@ export function isSpecTasksToolCall(toolName: unknown, inputJson: unknown): bool
 /**
  * The tool-use id of the LAST spec://tasks.json operation across an ordered
  * message list. Mirrors `findLatestSpecTasksToolUseId`: both the assistant
- * `contentJson` tool_use blocks and the `toolCalls` records are scanned in
+ * tool_use elements and the `toolCalls` records are scanned in
  * message order, and the id seen last wins. Returns null when there is none.
  */
 export function findLatestSpecTasksToolUseIdInMessages(
@@ -73,7 +72,8 @@ export function findLatestSpecTasksToolUseIdInMessages(
 ): string | null {
 	let latest: string | null = null;
 	for (const msg of messages) {
-		for (const block of msg.contentJson ?? []) {
+		if (isNestedRow(msg)) continue;
+		for (const block of messageBody(msg)) {
 			if (block?.type !== "tool_use") continue;
 			const id = typeof block.id === "string" ? block.id : null;
 			if (id && isSpecTasksToolCall(block.name, block.input)) latest = id;

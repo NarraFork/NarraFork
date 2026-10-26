@@ -52,6 +52,10 @@ const AWAIT_TIMEOUT_DESCRIPTION =
 
 export { DEFAULT_TIMEOUT_MS as DEFAULT_AWAIT_TIMEOUT_MS };
 
+const GUIDANCE_ENDED_WAIT_NOTE =
+	"This wait ended early because the user sent new guidance. Read it first; Await again " +
+	"only if the target still blocks what the user now wants.";
+
 // --- Live timeout management ---
 // Tracks running Await waits so the UI can extend their timeout mid-wait, mirroring
 // the Bash tool's runningBashProcesses map. Pinned to globalThis via hotSafe so hot
@@ -286,13 +290,27 @@ export const awaitTool: ToolDefinition = {
 		};
 		if (toolUseId) runningAwaits.set(toolUseId, runningEntry);
 
+		// Await is the one tool queued guidance may cut short: it only waits, so ending
+		// the wait loses nothing and lets the model read the guidance right away.
+		const waitSignal = ctx.guidanceSignal
+			? AbortSignal.any([ctx.signal, ctx.guidanceSignal])
+			: ctx.signal;
 		// Distinguish a timeout abort from a real parent interrupt so we can label the
 		// result correctly: parent abort → "aborted", our timeout → "timeout".
-		const combinedSignal = AbortSignal.any([ctx.signal, timeoutController.signal]);
+		const combinedSignal = AbortSignal.any([waitSignal, timeoutController.signal]);
 		const relabel = (status: string): string =>
-			status === "aborted" && !ctx.signal.aborted && timeoutController.signal.aborted
+			status === "aborted" && !waitSignal.aborted && timeoutController.signal.aborted
 				? "timeout"
 				: status;
+		const endedForGuidance = () => !ctx.signal.aborted && ctx.guidanceSignal?.aborted === true;
+		const withGuidanceNote = (result: ToolResult): ToolResult =>
+			endedForGuidance()
+				? {
+						...result,
+						output: `${result.output}\n\n${GUIDANCE_ENDED_WAIT_NOTE}`,
+						metadata: { ...result.metadata, endedForGuidance: true },
+					}
+				: result;
 
 		try {
 			if (type === "agent") {
@@ -304,7 +322,7 @@ export const awaitTool: ToolDefinition = {
 					// The reschedulable timeoutController drives the deadline; give the inner
 					// waits a large cap so their own timers never win first.
 					timeoutMs: MAX_AWAIT_TIMEOUT_MS,
-					signal: ctx.signal,
+					signal: waitSignal,
 					timeoutSignal: timeoutController.signal,
 					// The wait can last for the whole timeout, and the returned metadata
 					// (which is what normally carries `subagentId`) only lands when it
@@ -325,7 +343,7 @@ export const awaitTool: ToolDefinition = {
 					},
 				});
 				if (!combinedSignal.aborted) await consumeTerminalResult(result);
-				return {
+				return withGuidanceNote({
 					output: result.formatted,
 					metadata: {
 						kind: "await",
@@ -340,7 +358,7 @@ export const awaitTool: ToolDefinition = {
 						subagentId: result.id,
 						status: result.status,
 					},
-				};
+				});
 			}
 
 			if (type === "question") {
@@ -351,7 +369,7 @@ export const awaitTool: ToolDefinition = {
 					// The reschedulable timeoutController owns the deadline (so the UI can
 					// extend the wait mid-flight); the primitive's own timer is left unarmed.
 					timeoutMs: 0,
-					signal: ctx.signal,
+					signal: waitSignal,
 					timeoutSignal: timeoutController.signal,
 				});
 				if (result.status === "not_found") {
@@ -382,7 +400,7 @@ export const awaitTool: ToolDefinition = {
 						output = `<question_answer_fallback event="${result.record.answerMessageId}">\n${receipt}\n</question_answer_fallback>`;
 					}
 				}
-				return {
+				return withGuidanceNote({
 					output,
 					metadata: {
 						kind: "await",
@@ -392,7 +410,7 @@ export const awaitTool: ToolDefinition = {
 						resolvedId: result.record.id,
 						status: result.status,
 					},
-				};
+				});
 			}
 
 			const { backgroundTaskService } = await import("@server/services/background-task-service");
@@ -473,7 +491,7 @@ export const awaitTool: ToolDefinition = {
 			// than inventing a prefix — unlike a subagent id, a task id is looked up by
 			// exact match (`getById`/`getByAlias`), so a prefix would not resolve.
 			const taskLabel = task.alias ?? taskId;
-			return {
+			return withGuidanceNote({
 				output: formatResult(taskLabel, status, result.output),
 				metadata: {
 					kind: "await",
@@ -484,7 +502,7 @@ export const awaitTool: ToolDefinition = {
 					status,
 					waitForText: wait_for_text,
 				},
-			};
+			});
 		} catch (err) {
 			return {
 				output: `Await error: ${err instanceof Error ? err.message : String(err)}`,

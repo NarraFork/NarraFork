@@ -7,6 +7,7 @@
  */
 
 import { spawn as ptySpawn } from "bun-pty";
+import { killWindowsProcessTree } from "../lib/spawn";
 import { clearInheritableHandlesBeforeSpawn } from "../lib/win-handle-guard";
 import type { TerminalRuntime, TerminalSpawnOptions } from "./runtime";
 
@@ -45,17 +46,9 @@ export function spawnPortablePty(opts: TerminalSpawnOptions): TerminalRuntime {
 			pty.kill();
 			// On Windows, pty.kill() only terminates the direct child (ConPTY host).
 			// Shell processes and their children (e.g. cmd.exe → node.exe) may survive.
-			// Use taskkill /T /F to recursively kill the entire process tree.
-			if (process.platform === "win32" && pty.pid) {
-				try {
-					Bun.spawnSync(["taskkill", "/T", "/F", "/PID", String(pty.pid)], {
-						stdio: ["ignore", "ignore", "ignore"],
-						windowsHide: true,
-					});
-				} catch {
-					/* best effort — process may already be gone */
-				}
-			}
+			// Use taskkill /T /F to recursively kill the entire process tree, without waiting on
+			// it: a synchronous taskkill holds the event loop (see `killWindowsProcessTree`).
+			if (process.platform === "win32" && pty.pid) void killWindowsProcessTree(pty.pid);
 		},
 		get pid() {
 			return pty.pid;

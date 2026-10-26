@@ -34,7 +34,6 @@
  * just finished never played.
  */
 
-import { Box, Group, Text, ThemeIcon } from "@mantine/core";
 import {
 	resolveToolShimmerFlash,
 	resolveToolShimmerPhase,
@@ -90,6 +89,7 @@ import { DiffStatsText } from "./diff-stats-text";
 import { activateOnKey, swallowSelectionClick } from "./key-activate";
 import { RenderTextPreview, type TextPreviewLabels } from "./RenderTextPreview";
 import { CATEGORY_COLOR, ToolTimingArea, type ToolTimingLabels } from "./RenderToolCall";
+import { ROW_FLEX_CLASS, ROW_TEXT_CLASS, RowChip, rowFlexStyle, rowSpacing } from "./row-chrome";
 import {
 	isTerminalToolRowStatus,
 	resolveToolRowStatusMark,
@@ -424,11 +424,10 @@ function RenderMeasuredToolRun({
 			    is decoration there, and the measure layer gave it height 0. Painting it
 			    anyway would overlap the first row. See `isTraceHeaderVisible`. */}
 			{header.visible ? (
-				<Group
-					gap={TRACE_ROW_GAP}
-					wrap="nowrap"
-					align="center"
-					py={TRACE_HEADER_PADDING_Y}
+				// biome-ignore lint/a11y/noStaticElementInteractions: role/tabIndex/keyboard handler are set together whenever the row is togglable
+				// biome-ignore lint/a11y/useAriaPropsSupportedByRole: aria-expanded is only emitted alongside role="button"
+				<div
+					className={ROW_FLEX_CLASS}
 					// Selectable surface: the row interaction wrapper ignores role="button"
 					// targets, so mark the header as part of the block's selection region.
 					{...{ [TOOL_HEADER_SELECT_ATTR]: "" }}
@@ -436,6 +435,7 @@ function RenderMeasuredToolRun({
 					tabIndex={header.hasChevron ? 0 : undefined}
 					aria-expanded={header.hasChevron ? header.opened : undefined}
 					style={{
+						...rowFlexStyle(TRACE_ROW_GAP, TRACE_HEADER_PADDING_Y),
 						position: "absolute",
 						top: header.top,
 						left: 0,
@@ -457,30 +457,29 @@ function RenderMeasuredToolRun({
 							<IconChevronRight size={TRACE_CHEVRON} style={{ color: DIMMED }} />
 						)
 					) : null}
-					<ThemeIcon size={TRACE_HEADER_ICON} variant="light" color={headerColor} radius="sm">
+					<RowChip size={TRACE_HEADER_ICON} color={headerColor}>
 						<VariantHeaderIcon variant={variant} />
-					</ThemeIcon>
-					<Text size="xs" c="dimmed" fw={500} style={{ flexShrink: 0 }}>
+					</RowChip>
+					<p className={ROW_TEXT_CLASS} style={{ color: DIMMED, fontWeight: 500, flexShrink: 0 }}>
 						{header.label}
-					</Text>
-					<Text size="xs" c="dimmed" style={{ flexShrink: 0, opacity: 0.5 }}>
+					</p>
+					<p className={ROW_TEXT_CLASS} style={{ color: DIMMED, flexShrink: 0, opacity: 0.5 }}>
 						{header.count}
-					</Text>
-				</Group>
+					</p>
+				</div>
 			) : null}
 
 			{/* ── "Show earlier" toggle ── */}
 			{toggle ? (
-				<Group
-					gap={TRACE_ROW_GAP}
-					wrap="nowrap"
-					align="center"
-					py={TRACE_ROW_PADDING_Y}
+				// biome-ignore lint/a11y/useSemanticElements: a <button> would bring UA button box styles into a measured, fixed-height row
+				<div
+					className={ROW_FLEX_CLASS}
 					{...{ [TOOL_HEADER_SELECT_ATTR]: "" }}
 					role="button"
 					tabIndex={0}
 					aria-expanded={toggle.showEarlier}
 					style={{
+						...rowFlexStyle(TRACE_ROW_GAP, TRACE_ROW_PADDING_Y),
 						position: "absolute",
 						top: toggle.top,
 						left: 0,
@@ -493,15 +492,15 @@ function RenderMeasuredToolRun({
 					onClick={onToggleEarlier ? swallowSelectionClick(onToggleEarlier) : undefined}
 					onKeyDown={onToggleEarlier ? activateOnKey(onToggleEarlier) : undefined}
 				>
-					<Box style={chevronSlotStyle}>
+					<div style={chevronSlotStyle}>
 						<IconDots size={TRACE_CHEVRON} style={{ color: DIMMED, opacity: 0.6 }} />
-					</Box>
-					<Text size="xs" c="dimmed" style={{ opacity: 0.7 }}>
+					</div>
+					<p className={ROW_TEXT_CLASS} style={{ color: DIMMED, opacity: 0.7 }}>
 						{toggle.showEarlier
 							? (labels.hideEarlier ?? "Hide earlier")
 							: (labels.showEarlier?.(toggle.hiddenCount) ?? `Show ${toggle.hiddenCount} earlier`)}
-					</Text>
-				</Group>
+					</p>
+				</div>
 			) : null}
 
 			{/* ── Rows (+ expanded bodies) ── */}
@@ -686,15 +685,15 @@ function TraceRowTitle({
 	const split = splitTraceRowTitle(row.title, row.toolName);
 	const typo = typographyMetrics();
 	return (
-		<Text
+		<p
 			// Keep Mantine's dimmed colour, but paint the LINE BOX from the live
 			// typography snapshot — the same numbers `bareRowMetrics()` reserved.
 			// A bare `size="xs"` stays at 12/1.4 after the appearance panel moved,
 			// so the folded row grew while its title stayed neutral-sized.
-			c="dimmed"
-			truncate
-			className={joinClasses(shimmerClass, fadeIn ? LABEL_FADE_CLASS : undefined)}
+			data-truncate="end"
+			className={joinClasses(ROW_TEXT_CLASS, shimmerClass, fadeIn ? LABEL_FADE_CLASS : undefined)}
 			style={{
+				color: DIMMED,
 				flex: "0 1 auto",
 				minWidth: 0,
 				fontSize: `${typo.size.xs}px`,
@@ -730,7 +729,7 @@ function TraceRowTitle({
 			) : (
 				row.title || "…"
 			)}
-		</Text>
+		</p>
 	);
 }
 
@@ -820,20 +819,21 @@ function LiveTailText({
 			    clipped, since it is what tells the reader the run is still growing.
 			    Monospace keeps digit advances equal so a growing count does not shove
 			    the tail on every digit-width change (streaming jitter). */}
-			<Text
-				size="xs"
-				c="dimmed"
-				ff="monospace"
-				className={fade}
-				style={{ flexShrink: 0, opacity: 0.6 }}
+			<p
+				className={joinClasses(ROW_TEXT_CLASS, fade)}
+				style={{
+					color: DIMMED,
+					fontFamily: "var(--mantine-font-family-monospace)",
+					flexShrink: 0,
+					opacity: 0.6,
+				}}
 			>
 				{prefix}…
-			</Text>
-			<Text
-				size="xs"
-				c="dimmed"
-				className={joinClasses(shimmerClass, fade)}
+			</p>
+			<p
+				className={joinClasses(ROW_TEXT_CLASS, shimmerClass, fade)}
 				style={{
+					color: DIMMED,
 					// `0 1 auto` — HUG the tail's own text, shrinking only under pressure.
 					// The same basis a settled title uses, and for the same reason.
 					//
@@ -863,7 +863,7 @@ function LiveTailText({
 				    right and overflows left) while keeping its own characters in natural
 				    order. See the header note on why plaintext / bdo are both wrong here. */}
 				<span style={{ direction: "ltr", unicodeBidi: "isolate" }}>{tail.tail}</span>
-			</Text>
+			</p>
 		</>
 	);
 }
@@ -990,16 +990,15 @@ function TraceRowView({
 		? activateOnKey(() => onToggleRow?.(row.itemIndex, row.key))
 		: undefined;
 	const titleRow = (
-		<Group
+		// biome-ignore lint/a11y/noStaticElementInteractions: role/tabIndex/keyboard handler are set together whenever the row is togglable
+		// biome-ignore lint/a11y/useAriaPropsSupportedByRole: aria-expanded is only emitted alongside role="button"
+		<div
 			data-nf-trace-titlerow
+			className={ROW_FLEX_CLASS}
 			// Selectable surface: the row interaction wrapper (TraceRowInteraction)
 			// ignores role="button" targets, so mark the title line as part of the
 			// row's selection region — a modified click here selects the row's block.
 			{...{ [TOOL_HEADER_SELECT_ATTR]: "" }}
-			gap={TRACE_ROW_GAP}
-			wrap="nowrap"
-			align="center"
-			py={TRACE_ROW_PADDING_Y}
 			// A div with an onClick is invisible to a keyboard and to a screen reader.
 			// These are ATTRIBUTES ONLY — no box, no font, nothing the measure layer
 			// models — so the row's height is unchanged (asserted in
@@ -1012,6 +1011,7 @@ function TraceRowView({
 			aria-label={shimmerLabel ? `${displayRow.title || "…"} — ${shimmerLabel}` : undefined}
 			title={shimmerLabel}
 			style={{
+				...rowFlexStyle(TRACE_ROW_GAP, TRACE_ROW_PADDING_Y),
 				height: traceMetrics().rowHeight,
 				cursor: togglable ? "pointer" : "default",
 				userSelect: "none",
@@ -1019,7 +1019,7 @@ function TraceRowView({
 			onClick={handleToggle}
 			onKeyDown={handleKeyDown}
 		>
-			<Box style={chevronSlotStyle}>
+			<div style={chevronSlotStyle}>
 				{row.expandable ? (
 					row.expanded ? (
 						<IconChevronDown size={TRACE_CHEVRON} style={{ color: DIMMED }} />
@@ -1027,11 +1027,14 @@ function TraceRowView({
 						<IconChevronRight size={TRACE_CHEVRON} style={{ color: DIMMED }} />
 					)
 				) : (
-					<Text span size="xs" c="dimmed" style={{ opacity: 0.5, lineHeight: 1, fontSize: 10 }}>
+					<span
+						className={ROW_TEXT_CLASS}
+						style={{ color: DIMMED, opacity: 0.5, lineHeight: 1, fontSize: 10 }}
+					>
 						•
-					</Text>
+					</span>
 				)}
-			</Box>
+			</div>
 			{icon ? (
 				// `data-trace-row-chip`: the marker every compact row's category chip
 				// carries, so a parity test can find the SAME lane in a trace row, a
@@ -1088,9 +1091,9 @@ function TraceRowView({
 			    status so it stays adjacent to the path it describes. */}
 			<DiffStatsText stats={row.diffStats} />
 			{statusMark ? (
-				<Box data-testid="trace-row-status-slot" style={TRACE_ROW_STATUS_SLOT_STYLE}>
+				<div data-testid="trace-row-status-slot" style={TRACE_ROW_STATUS_SLOT_STYLE}>
 					<TraceRowStatusGlyph mark={statusMark} labels={statusMarkLabels} />
-				</Box>
+				</div>
 			) : null}
 			{/* ⚠️ `running` is narrowed past "not terminal": a QUEUED or AWAITING row has
 			    not executed for a single millisecond, and an elapsed counter there
@@ -1123,8 +1126,8 @@ function TraceRowView({
 			    and two growing siblings would have split the leftover width between them.
 			    With a zero basis this spacer never competes for SHRINK either — shrink is
 			    weighted by base size, so a long tail still compresses alone. */}
-			<Box style={{ flex: 1, minWidth: 0 }} />
-		</Group>
+			<div style={{ flex: 1, minWidth: 0 }} />
+		</div>
 	);
 
 	/**
@@ -1168,9 +1171,9 @@ function TraceRowView({
 
 			{/* Expanded markdown body (left-bordered, indented). */}
 			{row.expanded && row.body ? (
-				<Box
-					py={TRACE_BODY_PADDING_Y}
+				<div
 					style={{
+						paddingBlock: rowSpacing(TRACE_BODY_PADDING_Y),
 						position: "absolute",
 						top: traceMetrics().rowHeight,
 						left: 0,
@@ -1191,7 +1194,7 @@ function TraceRowView({
 						animKeyBase={animKeyBase}
 						animScope={animScope}
 					/>
-				</Box>
+				</div>
 			) : null}
 
 			{/* Drilled-in tool card. The card fills the WHOLE row block from its top
@@ -1211,7 +1214,7 @@ function TraceRowView({
 			    height and is clipped by that Paper — cropped, never scaled, so no text
 			    deforms. */}
 			{cardToPaint ? (
-				<Box
+				<div
 					style={{
 						position: "absolute",
 						top: 0,
@@ -1242,13 +1245,13 @@ function TraceRowView({
 					}}
 				>
 					{cardToPaint}
-				</Box>
+				</div>
 			) : null}
 		</div>
 	);
 
 	return (
-		<Box
+		<div
 			// LOD-independent identity of this row's content: the same value the full
 			// card carries at L3+, so the two renderings of one tool call can be paired
 			// across a level change. Height-neutral (a data attribute).
@@ -1266,7 +1269,7 @@ function TraceRowView({
 			}}
 		>
 			{(interactive ? rowInteraction?.(row, rowBody) : null) ?? rowBody}
-		</Box>
+		</div>
 	);
 }
 
@@ -1324,16 +1327,16 @@ export function RenderTraceCountLine({
 }: RenderTraceCountLineProps) {
 	const { kind } = measured;
 	return (
-		<Group
-			gap={TRACE_ROW_GAP}
-			wrap="nowrap"
-			align="center"
-			py={TRACE_HEADER_PADDING_Y}
+		// biome-ignore lint/a11y/noStaticElementInteractions: role/tabIndex/keyboard handler are set together whenever the row is togglable
+		// biome-ignore lint/a11y/useAriaPropsSupportedByRole: aria-expanded is only emitted alongside role="button"
+		<div
+			className={ROW_FLEX_CLASS}
 			{...{ [TOOL_HEADER_SELECT_ATTR]: "" }}
 			role={onExpand ? "button" : undefined}
 			tabIndex={onExpand ? 0 : undefined}
 			aria-expanded={onExpand ? false : undefined}
 			style={{
+				...rowFlexStyle(TRACE_ROW_GAP, TRACE_HEADER_PADDING_Y),
 				height: measured.height,
 				cursor: onExpand ? "pointer" : "default",
 				userSelect: "none",
@@ -1342,18 +1345,18 @@ export function RenderTraceCountLine({
 			onClick={onExpand ? swallowSelectionClick(onExpand) : undefined}
 			onKeyDown={onExpand ? activateOnKey(onExpand) : undefined}
 		>
-			<ThemeIcon size={TRACE_HEADER_ICON} variant="light" color={countLineColor(kind)} radius="sm">
+			<RowChip size={TRACE_HEADER_ICON} color={countLineColor(kind)}>
 				<CountLineIcon kind={kind} />
-			</ThemeIcon>
-			<Text size="xs" c="dimmed" fw={500}>
+			</RowChip>
+			<p className={ROW_TEXT_CLASS} style={{ color: DIMMED, fontWeight: 500 }}>
 				{labels.label ?? (kind === "reasoning" ? "Reasoning" : "Tool calls")}
-			</Text>
-			<Text size="xs" c="dimmed" style={{ opacity: 0.5 }}>
+			</p>
+			<p className={ROW_TEXT_CLASS} style={{ color: DIMMED, opacity: 0.5 }}>
 				{labels.count ?? `${measured.count}`}
-			</Text>
-			<Box style={{ flex: 1 }} />
+			</p>
+			<div style={{ flex: 1 }} />
 			{onExpand ? <IconChevronRight size={TRACE_CHEVRON} style={{ color: DIMMED }} /> : null}
-		</Group>
+		</div>
 	);
 }
 

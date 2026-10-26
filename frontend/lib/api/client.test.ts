@@ -1,9 +1,8 @@
 import { afterEach, describe, expect, test } from "bun:test";
-import { SESSION_RENEWAL_HEADER } from "@shared/session-auth";
 import {
-	absorbRenewedToken,
 	authorizedFetch,
 	clearTokenOnSessionFailure,
+	endSession,
 	getErrorMessage,
 	getToken,
 	readFetchError,
@@ -154,7 +153,7 @@ describe("session preservation on non-session 401s", () => {
 		expect(getToken()).toBe("live-session");
 	});
 
-	test("keeps the token when an OAuth-only endpoint rejects a session JWT", async () => {
+	test("keeps the token when an OAuth-only endpoint rejects a session token", async () => {
 		installMapLocalStorage();
 		setToken("live-session");
 		const response = json401({ code: "OAUTH_REQUIRED", error: "OAuth access token required" });
@@ -196,114 +195,10 @@ describe("session preservation on non-session 401s", () => {
 	});
 });
 
-/**
- * Build a session-JWT-shaped string with the given `exp`. Only the payload
- * matters here: the client compares expiries, it never verifies signatures.
- */
-function tokenWithExp(exp: number, label = "t"): string {
-	const encode = (value: object) =>
-		btoa(JSON.stringify(value)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-	return `${encode({ alg: "HS256", typ: "JWT" })}.${encode({ sub: label, exp })}.sig-${label}`;
+/** A session-token-shaped string. */
+function opaqueToken(label = "t"): string {
+	return `nfs_${label.padEnd(43, "x")}`;
 }
-
-const NOW = Math.floor(Date.now() / 1000);
-
-describe("absorbRenewedToken", () => {
-	function withRenewalHeader(token: string, status = 200): Response {
-		return new Response(null, {
-			status,
-			headers: { [SESSION_RENEWAL_HEADER]: token },
-		});
-	}
-
-	test("swaps in the renewed token from the response header", () => {
-		installMapLocalStorage();
-		const older = tokenWithExp(NOW + 3600, "old");
-		const newer = tokenWithExp(NOW + 7 * 24 * 3600, "new");
-		setToken(older);
-		absorbRenewedToken(withRenewalHeader(newer));
-		expect(getToken()).toBe(newer);
-	});
-
-	test("does nothing when the response carries no renewal header", () => {
-		installMapLocalStorage();
-		setToken("old-token");
-		absorbRenewedToken(new Response(null, { status: 200 }));
-		expect(getToken()).toBe("old-token");
-	});
-
-	test("does not resurrect a session that was already cleared", () => {
-		installMapLocalStorage();
-		// Logged out in another tab while a request was still in flight.
-		absorbRenewedToken(withRenewalHeader(tokenWithExp(NOW + 3600)));
-		expect(getToken()).toBeNull();
-	});
-
-	test("refuses a renewal that is not strictly newer than the stored token", () => {
-		installMapLocalStorage();
-		const newer = tokenWithExp(NOW + 7 * 24 * 3600, "new");
-		setToken(newer);
-		// Parallel requests inside the renewal window each get their own token and
-		// the responses can land in any order, so the last writer must not win.
-		absorbRenewedToken(withRenewalHeader(tokenWithExp(NOW + 3 * 24 * 3600, "older")));
-		expect(getToken()).toBe(newer);
-		// Same expiry is not an improvement either.
-		absorbRenewedToken(withRenewalHeader(tokenWithExp(NOW + 7 * 24 * 3600, "equal")));
-		expect(getToken()).toBe(newer);
-	});
-
-	test("does not overwrite a session belonging to a different account", () => {
-		installMapLocalStorage();
-		const accountA = tokenWithExp(NOW + 3600, "a");
-		const accountB = tokenWithExp(NOW + 3600, "b");
-		setToken(accountA);
-		// Request went out as account A; the user switched to B before it returned.
-		setToken(accountB);
-		absorbRenewedToken(withRenewalHeader(tokenWithExp(NOW + 7 * 24 * 3600, "a-renewed")), accountA);
-		expect(getToken()).toBe(accountB);
-	});
-
-	test("absorbs when the stored token still matches the one the request used", () => {
-		installMapLocalStorage();
-		const sent = tokenWithExp(NOW + 3600, "sent");
-		const renewed = tokenWithExp(NOW + 7 * 24 * 3600, "renewed");
-		setToken(sent);
-		absorbRenewedToken(withRenewalHeader(renewed), sent);
-		expect(getToken()).toBe(renewed);
-	});
-
-	test("ignores a renewal header on a failed response", () => {
-		installMapLocalStorage();
-		const current = tokenWithExp(NOW + 3600, "current");
-		setToken(current);
-		// A 401 that also carried a renewal header would otherwise be stored first
-		// and cleared immediately after by readFetchError.
-		absorbRenewedToken(withRenewalHeader(tokenWithExp(NOW + 7 * 24 * 3600, "renewed"), 401));
-		expect(getToken()).toBe(current);
-		absorbRenewedToken(withRenewalHeader(tokenWithExp(NOW + 7 * 24 * 3600, "renewed"), 500));
-		expect(getToken()).toBe(current);
-	});
-
-	test("ignores a malformed renewal header", () => {
-		installMapLocalStorage();
-		const current = tokenWithExp(NOW + 3600, "current");
-		setToken(current);
-		for (const bogus of ["", "not-a-jwt", "a.b", "a.b.c", "a.!!!.c"]) {
-			absorbRenewedToken(withRenewalHeader(bogus));
-			expect(getToken()).toBe(current);
-		}
-	});
-
-	test("accepts a renewal when the stored token has no readable exp", () => {
-		installMapLocalStorage();
-		// Opaque or legacy stored values cannot be ordered, so a well-formed
-		// renewal is preferred over keeping something unreadable.
-		setToken("legacy-opaque-token");
-		const renewed = tokenWithExp(NOW + 7 * 24 * 3600, "renewed");
-		absorbRenewedToken(withRenewalHeader(renewed));
-		expect(getToken()).toBe(renewed);
-	});
-});
 
 describe("authorizedFetch", () => {
 	const originalFetch = globalThis.fetch;
@@ -323,48 +218,22 @@ describe("authorizedFetch", () => {
 		return calls;
 	}
 
-	test("attaches the stored token and absorbs the renewal", async () => {
+	test("attaches the stored token", async () => {
 		installMapLocalStorage();
-		const sent = tokenWithExp(NOW + 3600, "sent");
-		const renewed = tokenWithExp(NOW + 7 * 24 * 3600, "renewed");
+		const sent = opaqueToken("sent");
 		setToken(sent);
-		const calls = stubFetch(
-			() => new Response(null, { status: 200, headers: { [SESSION_RENEWAL_HEADER]: renewed } }),
-		);
+		const calls = stubFetch(() => new Response(null, { status: 200 }));
 
 		await authorizedFetch("/api/anything");
 
 		const headers = new Headers(calls[0].init?.headers);
 		expect(headers.get("Authorization")).toBe(`Bearer ${sent}`);
-		expect(getToken()).toBe(renewed);
-	});
-
-	test("does not absorb a renewal that arrived on a 401", async () => {
-		installMapLocalStorage();
-		const sent = tokenWithExp(NOW + 3600, "sent");
-		setToken(sent);
-		stubFetch(
-			() =>
-				new Response(JSON.stringify({ code: "UNAUTHORIZED" }), {
-					status: 401,
-					headers: {
-						"content-type": "application/json",
-						[SESSION_RENEWAL_HEADER]: tokenWithExp(NOW + 7 * 24 * 3600, "renewed"),
-					},
-				}),
-		);
-
-		const response = await authorizedFetch("/api/anything");
 		expect(getToken()).toBe(sent);
-		// readFetchError is what decides the session verdict; it must not find a
-		// token that this response itself invalidated.
-		await readFetchError(response);
-		expect(getToken()).toBeNull();
 	});
 
 	test("keeps a caller-provided Authorization header and other init fields", async () => {
 		installMapLocalStorage();
-		setToken(tokenWithExp(NOW + 3600, "stored"));
+		setToken(opaqueToken("stored"));
 		const calls = stubFetch(() => new Response(null, { status: 200 }));
 
 		await authorizedFetch("/api/anything", {
@@ -385,5 +254,44 @@ describe("authorizedFetch", () => {
 		const calls = stubFetch(() => new Response(null, { status: 200 }));
 		await authorizedFetch("/api/anything");
 		expect(new Headers(calls[0].init?.headers).get("Authorization")).toBeNull();
+	});
+});
+
+describe("endSession", () => {
+	const originalFetch = globalThis.fetch;
+
+	afterEach(() => {
+		globalThis.fetch = originalFetch;
+	});
+
+	test("asks the server to revoke the stored session, then forgets it", () => {
+		installMapLocalStorage();
+		const calls: Array<{ input: string | URL; init?: RequestInit }> = [];
+		globalThis.fetch = (async (input: string | URL, init?: RequestInit) => {
+			calls.push({ input, init });
+			return new Response(null, { status: 200 });
+		}) as typeof fetch;
+		setToken(opaqueToken("current"));
+
+		endSession();
+
+		expect(getToken()).toBeNull();
+		expect(String(calls[0].input)).toEndWith("/api/auth/logout");
+		expect(calls[0].init?.method).toBe("POST");
+		expect(calls[0].init?.keepalive).toBe(true);
+		expect(new Headers(calls[0].init?.headers).get("Authorization")).toBe(
+			`Bearer ${opaqueToken("current")}`,
+		);
+	});
+
+	test("sends nothing when there is no session", () => {
+		installMapLocalStorage();
+		let called = false;
+		globalThis.fetch = (async () => {
+			called = true;
+			return new Response(null);
+		}) as unknown as typeof fetch;
+		endSession();
+		expect(called).toBe(false);
 	});
 });

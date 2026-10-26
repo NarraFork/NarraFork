@@ -1,4 +1,5 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, mock, spyOn } from "bun:test";
+import { decodeBlockFrame } from "@frontend/lib/block-protocol";
 import { TOOL_IO_BUDGETS } from "@shared/pretext-layout/tool-io-projection";
 import {
 	buildSubagentSummarySqlExpr,
@@ -245,8 +246,9 @@ function captureNarratorEvents(narratorId = "n1") {
 			catchingUpNarrators: new Map(),
 			catchUpBuffers: new Map(),
 		},
+		// Frames as the client's listeners see them, decoded from message protocol v2.
 		send(payload: string) {
-			sent.push(JSON.parse(payload) as Record<string, unknown>);
+			sent.push(...decodeBlockFrame(JSON.parse(payload)));
 		},
 	} as never;
 	const connections = getNarratorConnections();
@@ -1903,7 +1905,7 @@ describe("narratorService message query regressions", () => {
 				catchUpBuffers: new Map(),
 			},
 			send(payload: string) {
-				sent.push(JSON.parse(payload) as { type?: string });
+				sent.push(...(decodeBlockFrame(JSON.parse(payload)) as Array<{ type?: string }>));
 			},
 		} as never;
 		const connections = getNarratorConnections();
@@ -1988,7 +1990,7 @@ describe("narratorService message query regressions", () => {
 				catchUpBuffers: new Map(),
 			},
 			send(payload: string) {
-				sent.push(JSON.parse(payload) as { type?: string });
+				sent.push(...(decodeBlockFrame(JSON.parse(payload)) as Array<{ type?: string }>));
 			},
 		} as never;
 		const connections = getNarratorConnections();

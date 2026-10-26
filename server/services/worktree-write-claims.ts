@@ -263,10 +263,10 @@ export function sealClaim(worktreePath: string, toolUseId: string): boolean {
  * Seal every in-flight claim a narrator holds on a worktree.
  *
  * Called from the loop's error/abort cleanup, which is the one place that knows a
- * turn ended without its remaining tools reporting results. Write/Edit/Bash never
- * execute eagerly, so on an interrupt their `tool_call` has been emitted and their
- * `tool_result` never will be — without this their declarations would outlive the
- * turn.
+ * turn ended without its remaining tools reporting results. A Write/Edit/Bash call
+ * may have emitted its `tool_call` (and even started) when an interrupt lands, and
+ * its `tool_result` then never reaches the turn — without this its declaration would
+ * outlive the turn.
  *
  * Returns how many were sealed, for logging.
  */

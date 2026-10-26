@@ -65,9 +65,8 @@ export const narratorWsMessageSchema = z.discriminatedUnion("type", [
 			// the server version, the subscribe short-circuits to sync_ok instead of
 			// running a full catch-up query (see narrator-ws.ts subscribe handler).
 			version: z.number().int().min(0).optional(),
-			// Message protocol the client speaks for a `messages` subscribe: 2 is the
-			// block-keyed protocol (docs/BLOCK_STORAGE-DESIGN.md §8.2), granted while
-			// `narratorBlocks.wsV2` is on; the reply `message_protocol` says which applies.
+			// Ignored: every subscription gets the block-keyed message protocol
+			// (docs/BLOCK_STORAGE-DESIGN.md §8.2). Clients loaded before P3d still send it.
 			protocol: z.union([z.literal(1), z.literal(2)]).optional(),
 		})
 		.strict(),

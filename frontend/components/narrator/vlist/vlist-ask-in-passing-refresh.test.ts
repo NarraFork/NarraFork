@@ -1,8 +1,9 @@
 import { expect, test } from "bun:test";
 import type { PretextDocumentPageResult, TreeMessage } from "@frontend/lib/api/types";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { refreshPretextDocumentWindow } from "./pretext-document-loader";
 
-const row = (id: string, seq: number) => ({ id, seq, contentJson: [] }) as unknown as TreeMessage;
+const row = (id: string, seq: number) => rowWithElements({ id, seq }, []) as unknown as TreeMessage;
 const previous = {
 	messages: [row("source", 1), row("tail", 2)],
 	messageVersion: 7,

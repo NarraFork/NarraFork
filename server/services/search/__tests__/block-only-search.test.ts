@@ -27,6 +27,7 @@ ensureFts(sqlite, { skipUncleanShutdownRebuild: true });
 await import("../../narrator-service");
 const { narratorStore } = await import("../../narrator-store");
 const blockSync = await import("../../narrator-block-sync");
+const blockIndex = await import("../../narrator-block-index");
 const { createSqliteSearchStore } = await import("../sqlite-store");
 const store = createSqliteSearchStore(
 	async (sql, params) => sqlite.prepare<Record<string, unknown>, typeof params>(sql).all(...params),
@@ -77,6 +78,8 @@ beforeAll(async () => {
 		outputIndex: 2,
 	});
 	blockSync.flushChangedEnvelopes();
+	// The store queues the blocks' search text; the index job writes it.
+	await blockIndex.drainBlockIndexQueue();
 	// A legacy envelope: no blocks, only its text (an import the backfill has not converted).
 	sqlite.run(
 		`INSERT INTO narrator_messages (id, narrator_id, role, content_json, content_text, created_at)

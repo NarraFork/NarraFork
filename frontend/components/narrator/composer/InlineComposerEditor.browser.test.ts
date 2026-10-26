@@ -413,7 +413,7 @@ test("plain-text paste keeps whitespace/HTML literal and Shift+Enter; composing 
 }, 15_000);
 
 for (const width of [1440, 390])
-	test(`${width}px: candidate stays inline, images reserve 64px before decoding, internal scrolling`, async () => {
+	test(`${width}px: images reserve 64px before decoding, internal scrolling`, async () => {
 		const page = await open();
 		try {
 			await page.setViewport({ width, height: 844 });
@@ -421,30 +421,8 @@ for (const width of [1440, 390])
 			const before = await snapshot(page);
 			expect(before.atoms[0].height).toBe(64);
 			expect(before.atoms[0].width).toBe(96);
-			await page.evaluate(() => (window as unknown as FixtureWindow).fixture.showCandidate(true));
-			await page.waitForSelector("[data-inline-quote-candidate]");
-			const candidate = await snapshot(page);
-			if (
-				before.shellHeight === undefined ||
-				before.viewportHeight === undefined ||
-				candidate.shellHeight === undefined ||
-				candidate.viewportHeight === undefined
-			)
+			if (before.shellHeight === undefined || before.viewportHeight === undefined)
 				throw new Error("Missing editor geometry");
-			// A genuine inline preview may occupy one extra visual line on a narrow viewport.
-			expect(candidate.shellHeight - before.shellHeight).toBeGreaterThanOrEqual(0);
-			expect(candidate.shellHeight - before.shellHeight).toBeLessThanOrEqual(25);
-			expect(candidate.shellHeight + candidate.viewportHeight).toBe(
-				before.shellHeight + before.viewportHeight,
-			);
-			expect(
-				await page.$eval(
-					"[data-inline-quote-candidate]",
-					(node) => !!node.closest('[data-inline-composer] [role="textbox"]'),
-				),
-			).toBe(true);
-			expect(candidate.document).toEqual(before.document);
-			expect(candidate.changes).toBe(before.changes);
 			await page.evaluate(() =>
 				(window as unknown as FixtureWindow).fixture.resources([["image-1", "/api/test-image"]]),
 			);
@@ -453,8 +431,8 @@ for (const width of [1440, 390])
 				return image?.complete && image.naturalWidth > 0;
 			});
 			const decoded = await snapshot(page);
-			expect(decoded.shellHeight).toBe(candidate.shellHeight);
-			expect(decoded.viewportHeight).toBe(candidate.viewportHeight);
+			expect(decoded.shellHeight).toBe(before.shellHeight);
+			expect(decoded.viewportHeight).toBe(before.viewportHeight);
 			expect(decoded.atoms[0].height).toBe(64);
 			await page.click("[data-composer-atom] button");
 			expect((await snapshot(page)).opened).toBe(0);
@@ -472,7 +450,7 @@ for (const width of [1440, 390])
 		}
 	}, 15_000);
 
-test("CSS fullscreen retains DOM identity, cursor and undo; candidate portal targets its owner Document", async () => {
+test("CSS fullscreen retains DOM identity, cursor and undo; quote button portal targets its owner Document", async () => {
 	const page = await open();
 	try {
 		await page.click('[role="textbox"]');
@@ -500,13 +478,14 @@ test("CSS fullscreen retains DOM identity, cursor and undo; candidate portal tar
 			() =>
 				!!document
 					.querySelector<HTMLIFrameElement>("#candidate-frame")
-					?.contentDocument?.querySelector("[data-inline-quote-candidate]"),
+					?.contentDocument?.querySelector("body > [data-quote-candidate]"),
 		);
-		expect(await page.$("body > [data-inline-quote-candidate]")).toBeNull();
+		expect(await page.$("[data-quote-candidate]")).toBeNull();
 		const iframe = await page.$("#candidate-frame");
 		const frame = await iframe?.contentFrame();
 		if (!frame) throw new Error("Missing candidate frame");
-		await frame.click("[data-inline-quote-candidate] button");
+		await frame.waitForSelector("[data-quote-candidate]", { visible: true });
+		await frame.click("[data-quote-candidate] button");
 		expect(await frame.evaluate(() => window.getSelection()?.toString())).toBe("Selected source");
 		expect((await snapshot(page)).accepted).toBe(1);
 	} finally {
@@ -627,9 +606,6 @@ test("imperative silent restore survives internal rerenders without a controlled
 		await settle(page);
 		expect((await snapshot(page)).document).toEqual(quoted);
 		expect((await snapshot(page)).changes).toBe(before.changes);
-		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.showCandidate(true));
-		await settle(page);
-		expect((await snapshot(page)).document).toEqual(quoted);
 	} finally {
 		await close(page);
 	}
@@ -1378,17 +1354,6 @@ test("placeholder follows the real document, including restored trailing newline
 			).toBe("none");
 		}
 		await load(page, empty);
-		expect(
-			await page.$eval('[role="textbox"]', (node) => getComputedStyle(node, "::before").content),
-		).toBe('"Message"');
-		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.showCandidate(true));
-		await page.waitForSelector('[role="textbox"] [data-inline-quote-candidate]');
-		expect(
-			await page.$eval('[role="textbox"]', (node) => getComputedStyle(node, "::before").content),
-		).toBe("none");
-		expect((await snapshot(page)).document).toEqual(empty);
-		await page.evaluate(() => (window as unknown as FixtureWindow).fixture.showCandidate(false));
-		await settle(page);
 		expect(
 			await page.$eval('[role="textbox"]', (node) => getComputedStyle(node, "::before").content),
 		).toBe('"Message"');

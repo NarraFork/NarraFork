@@ -19,6 +19,45 @@ describe("usageHistoryApi", () => {
 		}
 	});
 
+	test("preserves dedicated cache ratios and null values in aggregate API responses", async () => {
+		Object.defineProperty(g, "localStorage", {
+			value: { getItem: () => "token-1" },
+			configurable: true,
+		});
+		const stats = {
+			cacheHitRate: 0.8,
+			cacheHitRateReadTokens: 800,
+			cacheHitRateInputTokens: 1000,
+			totalInputTokens: 999999,
+		};
+		const responses = [
+			stats,
+			{ points: [{ cacheHitRate: null }] },
+			{ entries: [{ value: null }], total: null },
+			{ series: [{ data: [{ value: null }] }] },
+		];
+		Object.defineProperty(g, "fetch", {
+			value: async () => Response.json(responses.shift()),
+			configurable: true,
+		});
+		expect(await usageHistoryApi.getStats({})).toMatchObject(stats);
+		expect((await usageHistoryApi.getTimeSeries({})).points[0].cacheHitRate).toBeNull();
+		const breakdown = await usageHistoryApi.getBreakdown(
+			{},
+			{ dimension: "provider", metric: "cacheHitRate" },
+		);
+		expect(breakdown.total).toBeNull();
+		expect(breakdown.entries[0].value).toBeNull();
+		expect(
+			(
+				await usageHistoryApi.getTimeSeriesStacked(
+					{},
+					{ dimension: "provider", metric: "cacheHitRate" },
+				)
+			).series[0].data[0].value,
+		).toBeNull();
+	});
+
 	test("surfaces structured usage history errors", async () => {
 		const store = new Map<string, string>([["narrafork_token", "token-1"]]);
 		Object.defineProperty(g, "localStorage", {

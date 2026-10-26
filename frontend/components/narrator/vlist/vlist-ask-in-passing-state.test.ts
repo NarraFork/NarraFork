@@ -1,4 +1,5 @@
 import { describe, expect, it } from "bun:test";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { AskInPassingDraftStore } from "./vlist-ask-in-passing-state";
 
 describe("AskInPassingDraftStore", () => {
@@ -9,7 +10,7 @@ describe("AskInPassingDraftStore", () => {
 		store.requestFocus("m");
 		unsubscribe();
 		store.reconcile([]);
-		store.reconcile([{ id: "other", contentJson: [] }]);
+		store.reconcile([rowWithElements({ id: "other" }, [])]);
 		expect(store.get("m")).toEqual({
 			value: "unfinished question",
 			phase: "editing",
@@ -59,7 +60,7 @@ describe("AskInPassingDraftStore", () => {
 			if (terminal === "deleted") store.forget("m");
 			else
 				store.reconcile([
-					{ id: "m", contentJson: [{ type: "ask_in_passing", status: "resolved" }] },
+					rowWithElements({ id: "m" }, [{ type: "ask_in_passing", status: "resolved" }]),
 				]);
 			store.fail("m");
 			expect(store.get("m")).toEqual({ value: "", phase: "editing", focusRequested: false });
@@ -70,17 +71,19 @@ describe("AskInPassingDraftStore", () => {
 		const store = new AskInPassingDraftStore();
 		store.setValue("m", "question");
 		store.reconcile([
-			{
-				id: "m",
-				contentJson: [
+			rowWithElements(
+				{
+					id: "m",
+				},
+				[
 					null,
 					{},
 					{ type: "other", status: "resolved" },
 					{ type: "ask_in_passing", status: "pending" },
 				],
-			},
+			),
 			{ id: 1 },
-			{ id: "m", contentJson: "invalid" },
+			{ id: "m", blocks: "invalid" as never },
 		]);
 		expect(store.get("m").value).toBe("question");
 	});

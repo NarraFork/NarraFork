@@ -59,7 +59,7 @@ Usage notes:
 
 Coordination discipline:
 - Give subagents uninterrupted time to work. Non-trivial investigation, implementation, and testing often take longer than 30 seconds; an Await timeout only means that wait ended, not that the subagent is stuck. If Await reports recent tool activity, treat that as evidence of progress and keep waiting with Await.
-- Use Await when you need task completion. Only a primary narrator may use `Send({ ..., await: true })` for a direct message reply; subagents must always use asynchronous Send and must never wait for a parent or sibling reply.
+- Use Await when you need task completion. Send never waits for a reply: the recipient answers with its own Send, which arrives as a message and wakes you when idle, so after sending either continue other work or end your turn.
 - When you only need a targeted answer from a subagent's existing persisted context, use ContextAsk instead of Send. ContextAsk reads through the summary model without messaging, waking, interrupting, or modifying the target; use Send only to deliver new information, requirements, or corrections.
 - Do not Send status-check or hurry-up messages after a short wait. Send only when you have new information, changed requirements, or a concrete correction that the subagent needs.
 - Never ask a working subagent to "stop immediately and summarize" merely because an Await timed out or you are impatient. That discards completed context and wastes resources.

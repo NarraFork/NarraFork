@@ -20,7 +20,9 @@ mock.module("../../../server/services/search/backend", () => ({ searchStore }));
 const { ensureFts, replaceBlockIndexText } = await import("../../../server/db/fts");
 ensureFts(sqlite, { skipUncleanShutdownRebuild: true });
 
-const { searchService } = await import("../../../server/services/search-service");
+const { clearSessionSearchCache, searchService } = await import(
+	"../../../server/services/search-service"
+);
 
 const NOW = "2026-10-22T00:00:00.000Z";
 const ADMIN = { userId: "block-search-admin", isAdmin: true };
@@ -74,6 +76,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+	clearSessionSearchCache();
 	sqlite.run("PRAGMA foreign_keys = OFF");
 	for (const table of [
 		"narrator_tool_calls",

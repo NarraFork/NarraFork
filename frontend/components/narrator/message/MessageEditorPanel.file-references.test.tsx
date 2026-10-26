@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { clearTimeout as clearNativeTimeout, setTimeout as setNativeTimeout } from "node:timers";
-import { MantineProvider } from "@mantine/core";
+import { Box, MantineProvider } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import {
 	type ComposerDocument,
@@ -614,6 +614,40 @@ describe("message reference attachment editor", () => {
 		expect(registered?.canSubmit).toBe(false);
 	});
 
+	test("files dropped on editor controls join this message, never the outer drop zone", async () => {
+		const outer: boolean[] = [];
+		const drop = (target: Element, files: File[]) =>
+			act(async () => {
+				const event = new Event("drop", { bubbles: true, cancelable: true });
+				Object.defineProperty(event, "dataTransfer", { value: { types: ["Files"], files } });
+				target.dispatchEvent(event);
+				await flush();
+			});
+		const save = mock(
+			async (..._args: Parameters<NonNullable<MessageEditorPanelProps["onEditAndRegenerate"]>>) =>
+				false,
+		);
+		const zone = (child: ReactNode) => (
+			<Box onDrop={(event) => outer.push(event.defaultPrevented)}>{child}</Box>
+		);
+		await render(zone(editor({ initialText: "body", onEditAndRegenerate: save })));
+		const dropped = new File(["dropped"], "dropped.txt", { type: "text/plain" });
+		await drop(button(en.attachFile), [dropped]);
+		expect(outer).toEqual([true]);
+		expect(document.body.textContent).toContain("dropped.txt");
+		await click(button(en.editSubmit));
+		expect(save.mock.calls[0][3]?.newTextFiles).toEqual([dropped]);
+		// Outside the inline document (header, buttons) the drop is claimed but not imported.
+		await drop(button(en.editCancel), [new File(["x"], "stray.txt", { type: "text/plain" })]);
+		expect(outer).toEqual([true, true]);
+		expect(document.body.textContent).not.toContain("stray.txt");
+		await render(zone(editor({ messageRole: "assistant", initialText: "plain", blocks: [] })));
+		const textarea = document.querySelector("textarea");
+		if (!textarea) throw new Error("Assistant textarea missing");
+		await drop(textarea, [new File(["y"], "assistant.txt", { type: "text/plain" })]);
+		expect(outer).toEqual([true, true, true]);
+	});
+
 	test("removing all refs from a text message sends [] instead of restoring them", async () => {
 		const save = mock(
 			async (..._args: Parameters<NonNullable<MessageEditorPanelProps["onEditAndRegenerate"]>>) =>
@@ -702,10 +736,6 @@ describe("structured edit layout details", () => {
 			],
 			textFiles: [],
 		});
-		qc.setQueryData(["narrators", owner, "edit-regenerate-preview", "message"], {
-			affectedFiles: [],
-			deletedMessageCount: 0,
-		});
 		const save = mock(
 			async (..._args: Parameters<NonNullable<MessageEditorPanelProps["onEditAndRegenerate"]>>) =>
 				false,
@@ -759,10 +789,6 @@ describe("structured edit layout details", () => {
 				},
 			],
 			textFiles: [],
-		});
-		qc.setQueryData(["narrators", owner, "edit-regenerate-preview", "message"], {
-			affectedFiles: [],
-			deletedMessageCount: 0,
 		});
 		const save = mock(
 			async (..._args: Parameters<NonNullable<MessageEditorPanelProps["onEditAndRegenerate"]>>) =>
@@ -830,10 +856,6 @@ describe("structured edit layout details", () => {
 			images: [],
 			textFiles: [],
 		});
-		qc.setQueryData(["narrators", owner, "edit-regenerate-preview", "message"], {
-			affectedFiles: [],
-			deletedMessageCount: 0,
-		});
 		const save = mock(
 			async (..._args: Parameters<NonNullable<MessageEditorPanelProps["onEditAndRegenerate"]>>) =>
 				false,
@@ -848,10 +870,6 @@ describe("structured edit layout details", () => {
 	});
 	test("a rich layout without its same-snapshot resource detail cannot bind stale attachments", async () => {
 		spyOn(api, "getMessageComposerDocument").mockResolvedValue({ composerDocument: layout });
-		qc.setQueryData(["narrators", owner, "edit-regenerate-preview", "message"], {
-			affectedFiles: [],
-			deletedMessageCount: 0,
-		});
 		await render(editor({ narratorId: owner, initialText: "stale body" }));
 		expect(document.querySelector(".ProseMirror")).toBeNull();
 		expect(button(en.editSubmit).disabled).toBe(true);
@@ -860,10 +878,6 @@ describe("structured edit layout details", () => {
 		const load = spyOn(api, "getMessageComposerDocument").mockRejectedValue(
 			new Error("unavailable"),
 		);
-		qc.setQueryData(["narrators", owner, "edit-regenerate-preview", "message"], {
-			affectedFiles: [],
-			deletedMessageCount: 0,
-		});
 		await render(editor({ narratorId: owner, initialText: "must not overwrite unknown layout" }));
 		expect(document.querySelector(".ProseMirror")).toBeNull();
 		expect(button(en.editSubmit).disabled).toBe(true);

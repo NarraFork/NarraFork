@@ -14,6 +14,7 @@
 
 import { beforeAll, describe, expect, it } from "bun:test";
 import { MantineProvider } from "@mantine/core";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { type AdapterSegment, adaptSegment } from "@shared/pretext-layout/segment-adapter";
 import { parseHTML } from "linkedom";
 import { act } from "react";
@@ -80,10 +81,12 @@ function renderGuardCard(actions?: InjectionGuardActions): {
 } {
 	const seg: AdapterSegment = {
 		kind: "message",
-		msg: {
-			id: "guard-msg",
-			role: "system",
-			contentJson: [
+		msg: rowWithElements(
+			{
+				id: "guard-msg",
+				role: "system",
+			},
+			[
 				{
 					type: "system_injection",
 					source: "interrupt_task_guard",
@@ -95,7 +98,7 @@ function renderGuardCard(actions?: InjectionGuardActions): {
 					},
 				},
 			] as never,
-		},
+		),
 	};
 	const spec = adaptSegment(seg, { lod: 5 } as never)[0];
 	if (!spec) throw new Error("no spec produced");

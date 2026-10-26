@@ -30,7 +30,6 @@ import { redeemExecutorTicket, resetExecutorTickets } from "../../lib/executor-b
 import { generateId } from "../../lib/id";
 import { settings } from "../../lib/settings";
 import { BUILD_EXECUTOR_DISTRIBUTION } from "../../lib/version";
-import { invalidateUserCache } from "../../middleware/auth";
 import type { AuthSessionStore } from "../../services/auth/session-store";
 import { authMfaStore, authSessionStore, setAuthStores } from "../../services/auth/store";
 
@@ -135,7 +134,6 @@ beforeEach(() => {
 afterEach(async () => {
 	globalThis.fetch = originalFetch;
 	setAuthStores(undefined);
-	invalidateUserCache();
 	resetExecutorManifestCache();
 	resetExecutorTickets();
 	if (created.length > 0) {

@@ -785,3 +785,49 @@ for (const producerKind of ["agent", "bash"] as const) {
 		});
 	}
 }
+
+for (const preAborted of [false, true]) {
+	test(`queued guidance ${preAborted ? "already pending" : "arriving mid-wait"} ends a bash Await without touching the task`, async () => {
+		await db
+			.update(backgroundTasks)
+			.set({ status: "running", output: null })
+			.where(eq(backgroundTasks.id, taskId));
+		const guidance = new AbortController();
+		if (preAborted) guidance.abort();
+		const started = Date.now();
+		const pending = awaitTool.execute(
+			{ type: "bash", id: taskId, timeout: 60_000 },
+			{ ...ctx(), guidanceSignal: guidance.signal, currentToolUseId: `guidance-${preAborted}` },
+		);
+		if (!preAborted) {
+			await new Promise((resolve) => setTimeout(resolve, 10));
+			guidance.abort();
+		}
+		const result = await pending;
+		expect(Date.now() - started).toBeLessThan(1000);
+		expect(result.isError).not.toBe(true);
+		expect(result.metadata).toMatchObject({ status: "aborted", endedForGuidance: true });
+		expect(result.output).toContain("still running");
+		expect(result.output).toContain("user sent new guidance");
+		expect((await backgroundTaskService.getById(taskId))?.status).toBe("running");
+		expect(db.select().from(runtimeAwaitedTerminalConsumptions).all()).toHaveLength(0);
+	});
+}
+
+test("Await without guidance keeps its plain interrupt wording", async () => {
+	await db
+		.update(backgroundTasks)
+		.set({ status: "running", output: null })
+		.where(eq(backgroundTasks.id, taskId));
+	const parentAbort = new AbortController();
+	const pending = awaitTool.execute(
+		{ type: "bash", id: taskId, timeout: 60_000 },
+		{ ...ctx(), signal: parentAbort.signal, guidanceSignal: new AbortController().signal },
+	);
+	await new Promise((resolve) => setTimeout(resolve, 10));
+	parentAbort.abort();
+	const result = await pending;
+	expect(result.metadata?.status).toBe("aborted");
+	expect(result.metadata?.endedForGuidance).toBeUndefined();
+	expect(result.output).not.toContain("user sent new guidance");
+});

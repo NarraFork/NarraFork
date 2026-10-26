@@ -35,6 +35,7 @@ import {
 } from "@frontend/lib/smooth-scroll";
 import { Anchor, Box, Group, Loader, Text } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import { resolveVisibleWindow } from "@shared/pretext-layout";
 import { liveTailSignature } from "@shared/pretext-layout/reasoning-live-tail";
 import type { ToolCappedDetail } from "@shared/pretext-layout/tool-detail";
@@ -78,6 +79,7 @@ import { useRenderLod } from "../lod/RenderLodCtx";
 import { type MessageSelectionResolver, useMessageSelection } from "../message/MessageSelectionCtx";
 import { resolveEditorInitialText } from "../message/message-edit-text";
 import type { MessageListHandle, MessageListTailMeta } from "../message/message-list-handle";
+import { isForeignSubagentRow } from "../message/nested-rows";
 import { NarratorMessageListSkeleton } from "../NarratorMessageListSkeleton";
 import { findLatestSpecTasksToolUseId } from "../narrator-message-helpers";
 import type { NarratorMsg, PermissionCallbacks } from "../narrator-panel-types";
@@ -2268,6 +2270,12 @@ export const PretextExactMessageList = memo(
 			// their existing exact insert fast path.
 			const upsertOrReload = useCallback(
 				(message: TreeMessage | undefined) => {
+					// A subagent's row is dual-broadcast here too, but it is never a row of
+					// THIS document (see `isForeignSubagentRow`). Applying it always fails and
+					// yet the revision bump below still counted it, so every subagent message
+					// inflated the "new messages" badge of a parent panel that nothing was
+					// arriving in. Its card is maintained by the live-patch channel instead.
+					if (isForeignSubagentRow(message, !!isSubagent)) return;
 					if (message && upsertMessageRef.current(message)) {
 						appliedMessageRevisionRef.current += 1;
 					} else if (message && askInPassingBlock(message)) {
@@ -2282,7 +2290,7 @@ export const PretextExactMessageList = memo(
 					}
 					bumpMessageRevision();
 				},
-				[bumpMessageRevision, refreshAskInPassingWindow],
+				[bumpMessageRevision, refreshAskInPassingWindow, isSubagent],
 			);
 
 			// A deletion is applied to the loaded window IN PLACE for the same reason an
@@ -2328,6 +2336,10 @@ export const PretextExactMessageList = memo(
 						replacementMessageId?: string;
 					},
 				) => {
+					// Same reasoning as `upsertOrReload`: a subagent row's update is not this
+					// document's business, and every one of them used to leave the applied
+					// revision behind the structural one.
+					if (isForeignSubagentRow(message, !!isSubagent)) return;
 					// Same-id updates (including queued → claimed/materialized/failed and
 					// canonical user edits) use the id+seq upsert path. Alias-bearing COW
 					// replacements still use the legacy replacement guard below.
@@ -2353,7 +2365,7 @@ export const PretextExactMessageList = memo(
 					}
 					bumpMessageRevision();
 				},
-				[bumpMessageRevision, refreshAskInPassingWindow],
+				[bumpMessageRevision, refreshAskInPassingWindow, isSubagent],
 			);
 
 			// The exact shell is stable-state only. Subscribe to the existing message
@@ -4731,6 +4743,7 @@ export const PretextExactMessageList = memo(
 					detachFromBottom,
 					scrollToMessageTarget,
 					prepareLodChange,
+					messageOf: (messageId) => messagesByIdRef.current.get(messageId),
 				}),
 				[
 					detachFromBottom,
@@ -4866,7 +4879,7 @@ export const PretextExactMessageList = memo(
 			}, [semanticItems]);
 
 			// Full messages by id — the inline editor and the original-content modal need
-			// the raw payload (contentJson / creator / narratorId / editedAt), which the
+			// the raw payload (blocks / creator / narratorId / editedAt), which the
 			// measured layout spec deliberately drops.
 			const messagesById = useMemo(() => {
 				const map = new Map<string, TreeMessage>();
@@ -4906,7 +4919,7 @@ export const PretextExactMessageList = memo(
 				(key: string, messageId: string, role: VListEditRole) => {
 					const msg = messagesByIdRef.current.get(messageId);
 					if (!msg) return;
-					const blocks = Array.isArray(msg.contentJson) ? msg.contentJson : [];
+					const blocks = messageBody(msg);
 					const preview = resolveEditorInitialText(blocks, role);
 					if (preview.truncated) {
 						notifications.show({ color: "yellow", message: t("editMessageTooLarge") });
@@ -4969,7 +4982,9 @@ export const PretextExactMessageList = memo(
 					if (!item) continue;
 					const manifestItem = manifestByKey.get(item.spec.key);
 					const sourceIds = manifestItem?.sourceMessageIds ?? [];
-					const target = resolveVListBlockTarget(item.spec.kind, item.spec.key, sourceIds);
+					const target = resolveVListBlockTarget(item.spec.kind, item.spec.key, sourceIds, (id) =>
+						messagesById.get(id),
+					);
 					if (!target) continue;
 					const entry = selectionIndex.byBlockId.get(target.blockId);
 					// Authoritative message id / block index come from the selection entry
@@ -4992,7 +5007,7 @@ export const PretextExactMessageList = memo(
 						{
 							canEditUser,
 							canEditAssistant,
-							hasEditableText: hasEditableTextBlock(msg?.contentJson),
+							hasEditableText: hasEditableTextBlock(messageBody(msg)),
 						},
 					);
 					const specKey = item.spec.key;
@@ -5190,7 +5205,7 @@ export const PretextExactMessageList = memo(
 								narratorId={narratorId}
 								messageId={row.messageId}
 								imageNarratorId={msg.narratorId ?? narratorId}
-								blocks={Array.isArray(msg.contentJson) ? msg.contentJson : []}
+								blocks={messageBody(msg)}
 								creator={msg.creator ?? null}
 								initialText={row.initialText}
 								isLastUserMessage={row.messageId === tailMeta.lastUserMessageId}

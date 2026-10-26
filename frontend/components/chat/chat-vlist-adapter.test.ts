@@ -7,6 +7,7 @@
  */
 
 import { describe, expect, it } from "bun:test";
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
 import type { ChatMessage } from "../../lib/api/chat";
 import {
 	type ChatTreeProjectionLabels,
@@ -125,7 +126,7 @@ describe("projectChatMessagesToTree", () => {
 			["m1", "user", tree[0]?.seq],
 			["m2", "user", tree[1]?.seq],
 		]);
-		expect(tree[0]?.contentJson).toEqual([{ type: "text", text: "text of m1" }]);
+		expect(messageBody(tree[0])).toEqual([{ type: "text", text: "text of m1" }]);
 	});
 
 	it("omits the header on a grouped follow-up (same author, inside the window)", () => {
@@ -203,7 +204,7 @@ describe("projectChatMessagesToTree", () => {
 			LABELS,
 		);
 		expect(tree[0]?.deletedLabel).toBe(LABELS.messageDeleted);
-		expect(tree[0]?.contentJson).toEqual([{ type: "text", text: "" }]);
+		expect(messageBody(tree[0])).toEqual([{ type: "text", text: "" }]);
 	});
 
 	it("carries editedAt so an in-place edit re-keys the measure cache", () => {
@@ -243,7 +244,7 @@ describe("projectChatMessagesToTree", () => {
 			],
 			LABELS,
 		);
-		const blocks = tree[0]?.contentJson as Array<Record<string, unknown>>;
+		const blocks = messageBody(tree[0]) as ReadonlyArray<Record<string, unknown>>;
 		expect(blocks.map((b) => b.type)).toEqual(["image", "text_file", "text"]);
 		expect(blocks[0]).toMatchObject({
 			filename: "shot.png",

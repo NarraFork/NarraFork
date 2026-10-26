@@ -13,6 +13,7 @@ import {
 	COMMUNICATION_PREVIEW_MAX_CHARS,
 	limitCommunicationPreview,
 } from "@shared/communication-tool";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { resetTypographyForTest } from "@shared/pretext-layout/typography";
 import { parseHTML } from "linkedom";
 import type { ReactNode } from "react";
@@ -88,18 +89,19 @@ const BACKGROUND = fixture(11_900);
 
 function message(id: string, role: string, contentJson: unknown[]): NarratorMsg {
 	// Mirrors segment-adapter.integration.test's persisted message shape, not fabricated render data.
-	return {
-		id,
-		narratorId: "large-body-narrator",
-		parentToolUseId: null,
-		role,
+	return rowWithElements(
+		{
+			id,
+			narratorId: "large-body-narrator",
+			parentToolUseId: null,
+			role,
+			contentText: null,
+			toolCalls: [],
+			createdAt: "2026-01-01T00:00:00Z",
+			seq: 1,
+		},
 		contentJson,
-		contentText: null,
-		toolCalls: [],
-		children: [],
-		createdAt: "2026-01-01T00:00:00Z",
-		seq: 1,
-	} as unknown as NarratorMsg;
+	) as unknown as NarratorMsg;
 }
 function tool(
 	name: string,

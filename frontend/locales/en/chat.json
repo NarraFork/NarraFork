@@ -48,6 +48,7 @@
 	"attachmentNoLongerAvailable": "Attachment expired on the server; attach it again",
 	"attachmentPreviewFailed": "Preview unavailable",
 	"attachmentLimitTitle": "Too many attachments",
+	"messageTooLong": "Messages are limited to {{count}} characters",
 	"attachmentLimit": "At most {{count}} attachments per message",
 	"attachmentForwardFailed": "Some attachments could not be sent to the narrator",
 	"attachmentDownloadFailed": "Download failed",

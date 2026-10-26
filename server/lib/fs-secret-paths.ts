@@ -19,7 +19,7 @@
  *
  * ## What this is not
  *
- * Not a sandbox. A reader authenticated with a session JWT can still fetch ordinary
+ * Not a sandbox. A reader authenticated with a session token can still fetch ordinary
  * files anywhere the server process can read, which is the existing (deliberate)
  * trust model of the file browser — `/api/fs/browse` has always listed the whole
  * filesystem. This only ensures that "read any file" cannot be turned into "become
@@ -48,7 +48,7 @@ import { narraforkDir } from "./settings";
  * password hashes and OAuth grants the main file does.
  */
 const SECRET_HOME_FILES: readonly string[] = [
-	"settings.json", // holds auth.jwtSecret — forging any user's session
+	"settings.json", // holds auth.jwtSecret — forging MFA challenges and internal signatures
 	"codex-credentials.json",
 	"update-server.json",
 	"update-server-test.json",

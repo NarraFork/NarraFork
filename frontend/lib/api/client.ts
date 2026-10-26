@@ -1,5 +1,5 @@
 import { apiUrl } from "@frontend/lib/base-path";
-import { isSessionInvalidResponse, SESSION_RENEWAL_HEADER } from "@shared/session-auth";
+import { isSessionInvalidResponse } from "@shared/session-auth";
 
 /**
  * The API root, resolved against the app's mount prefix.
@@ -32,12 +32,12 @@ export class ApiError extends Error {
  * Observers of session-token changes.
  *
  * Exists for the editor-host bridge (`lib/host-bridge.ts`), which mirrors the token into
- * VS Code's SecretStorage. A one-shot injection at panel load is not enough: the server
- * re-signs the token as it nears expiry and `absorbRenewedToken` swaps it mid-session, so
- * a host copy taken at load time goes stale on its own. The staleness surfaces later and
- * somewhere else — the NEXT panel injects an expired token and the user is bounced to the
- * login screen with nothing explaining why — which is why the notification lives at the
- * storage boundary rather than at the call sites that happen to log in.
+ * VS Code's SecretStorage. A one-shot injection at panel load is not enough: a re-login
+ * or sign-out in the panel replaces the token, so a host copy taken at load time goes
+ * stale on its own. The staleness surfaces later and somewhere else — the NEXT panel
+ * injects a dead token and the user is bounced to the login screen with nothing
+ * explaining why — which is why the notification lives at the storage boundary rather
+ * than at the call sites that happen to log in.
  */
 type TokenChangeListener = (token: string | null) => void;
 const tokenChangeListeners = new Set<TokenChangeListener>();
@@ -63,9 +63,8 @@ export function getToken(): string | null {
 }
 
 export function setToken(token: string): void {
-	// Compare first so a no-op write does not announce a change: `absorbRenewedToken` and
-	// hydration paths both re-assert the current value, and the bridge would otherwise
-	// send a redundant message per request.
+	// Compare first so a no-op write does not announce a change: hydration paths re-assert
+	// the current value, and the bridge would otherwise send a redundant message.
 	const changed = localStorage.getItem(TOKEN_KEY) !== token;
 	localStorage.setItem(TOKEN_KEY, token);
 	if (changed) notifyTokenChange(token);
@@ -78,65 +77,21 @@ export function clearToken(): void {
 }
 
 /**
- * Read a JWT's `exp` without verifying it.
+ * Sign out: revoke the stored session on the server, then forget it locally.
  *
- * Only used to order two tokens the server already signed, so no signature check
- * is needed — but the input is still treated as untrusted: anything that is not
- * a three-part token with a numeric `exp` yields null and is refused below.
+ * The revocation is fire-and-forget with `keepalive`, because callers navigate away
+ * immediately. If it never arrives, the session still expires on its own.
  */
-function readTokenExp(token: string): number | null {
-	const parts = token.split(".");
-	if (parts.length !== 3) return null;
-	try {
-		const base64 = parts[1].replace(/-/g, "+").replace(/_/g, "/");
-		const padded = base64.padEnd(base64.length + ((4 - (base64.length % 4)) % 4), "=");
-		const payload = JSON.parse(atob(padded)) as unknown;
-		if (!payload || typeof payload !== "object") return null;
-		const exp = (payload as { exp?: unknown }).exp;
-		return typeof exp === "number" && Number.isFinite(exp) ? exp : null;
-	} catch {
-		return null;
+export function endSession(): void {
+	const token = getToken();
+	if (token) {
+		void fetch(apiUrl("/api/auth/logout"), {
+			method: "POST",
+			headers: { Authorization: `Bearer ${token}` },
+			keepalive: true,
+		}).catch(() => {});
 	}
-}
-
-/**
- * Pick up a slid session token from any authenticated response.
- *
- * The server re-signs the session JWT when it nears expiry and returns it in
- * `SESSION_RENEWAL_HEADER`. Storing it here means every code path that talks to
- * the API — `request`, `authorizedFetch`, SSE and upload helpers — keeps the
- * session alive just by passing its response through.
- *
- * Two orderings have to be defended against, because parallel requests inside
- * the renewal window each get their own independently signed token and the
- * responses can land in any order:
- *  - a token that is not strictly newer than the stored one is discarded, so the
- *    last response to arrive cannot install the earliest-issued token;
- *  - `expectedToken` (the credential the request was actually sent with) turns
- *    the write into a compare-and-swap, so a renewal for account A cannot
- *    overwrite a session that has since been replaced by account B's.
- */
-export function absorbRenewedToken(response: Response, expectedToken?: string | null): void {
-	const renewed = response.headers.get(SESSION_RENEWAL_HEADER);
-	if (!renewed) return;
-	// A renewal only ever accompanies a successful response. The server strips the
-	// header from 401s; refusing it here too keeps a "store then clear" race from
-	// resurrecting a session that the same response invalidated.
-	if (!response.ok) return;
-
-	const current = getToken();
-	// Only replace an existing session. A renewal arriving after the user logged
-	// out in another tab must not silently resurrect the session.
-	if (!current) return;
-	// Compare-and-swap: the session must still be the one this request used.
-	if (expectedToken !== undefined && expectedToken !== null && current !== expectedToken) return;
-
-	const renewedExp = readTokenExp(renewed);
-	if (renewedExp === null) return;
-	const currentExp = readTokenExp(current);
-	if (currentExp !== null && renewedExp <= currentExp) return;
-
-	setToken(renewed);
+	clearToken();
 }
 
 /**
@@ -162,10 +117,7 @@ function resolveApiInput(input: string | URL): string | URL {
  * Authenticated `fetch` for the call sites that cannot use `request` (binary
  * bodies, SSE streams, FormData uploads, callers that need the raw `Response`).
  *
- * Centralizing the Authorization header and the renewal absorption means a new
- * call site is correct by default instead of having to remember three lines —
- * including the compare-and-swap that a hand-rolled `absorbRenewedToken(res)`
- * cannot do, since only this wrapper knows which token was sent.
+ * Centralizing the Authorization header means a new call site is correct by default.
  *
  * It also resolves rooted `/api/…` paths against the app's mount prefix, so the
  * dozens of existing call sites that spell the path as a literal keep working when
@@ -180,9 +132,7 @@ export async function authorizedFetch(input: string | URL, init?: RequestInit): 
 	if (token && !headers.has("Authorization")) {
 		headers.set("Authorization", `Bearer ${token}`);
 	}
-	const response = await fetch(input, { ...init, headers });
-	absorbRenewedToken(response, token);
-	return response;
+	return fetch(input, { ...init, headers });
 }
 
 /**
@@ -190,7 +140,7 @@ export async function authorizedFetch(input: string | URL, init?: RequestInit): 
  *
  * Plenty of 401s are unrelated to the caller's session: a wrong TOTP code while
  * disabling two-factor auth, a failed passkey ceremony, an OAuth-only endpoint
- * rejecting a session JWT, or the consent page reporting `login_required` for a
+ * rejecting a session token, or the consent page reporting `login_required` for a
  * different principal. Treating those as logout was what made NarraFork appear
  * to sign users out at random.
  */
@@ -396,7 +346,6 @@ export async function request<T>(
 		headers.Authorization = `Bearer ${token}`;
 	}
 	const response = await fetch(apiUrl(path), { ...fetchOptions, headers });
-	absorbRenewedToken(response, token);
 	// Apply the same byte budget before parsing either success or error bodies.
 	const boundedText =
 		maxResponseBytes == null

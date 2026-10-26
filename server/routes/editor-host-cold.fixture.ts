@@ -130,7 +130,7 @@ if (config.manifest) {
 	bundle = await manifestFile.json();
 }
 const assets = new Map(bundle.assets);
-const token = await createToken(config.userId, "user");
+const token = await createToken(config.userId);
 let dropReply = false,
 	blockQuery = false,
 	failSettlement = false,
@@ -323,7 +323,7 @@ const server = Bun.serve<WSData>({
 					{
 						sessionExp: verified.exp,
 						sessionUserId: verified.sub,
-						sessionTokenVersion: verified.sv ?? 0,
+						sessionId: verified.sid,
 					},
 				);
 				if (data && server.upgrade(request, { data })) return;

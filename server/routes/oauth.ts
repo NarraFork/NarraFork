@@ -6,6 +6,8 @@
  * /token, /revoke and the well-known document public (before the global auth
  * gate), while POST /authorize runs requireAuth itself.
  */
+
+import { isOpaqueSessionToken } from "@shared/session-auth";
 import { and, eq, inArray, isNull } from "drizzle-orm";
 import type { Context } from "hono";
 import { Hono } from "hono";
@@ -48,7 +50,7 @@ function oauthErrorResponse(c: Context, err: OAuthError) {
 }
 
 /**
- * Resolve the signed-in user from the session JWT without throwing. OAuth
+ * Resolve the signed-in user from the session token without throwing. OAuth
  * access tokens are deliberately NOT accepted on the consent endpoints — a
  * third-party token must never be able to mint new grants.
  */
@@ -56,9 +58,8 @@ async function getSessionUser(c: Context): Promise<{ id: string; username: strin
 	const header = c.req.header("Authorization");
 	if (!header?.startsWith("Bearer ")) return null;
 	const token = header.slice(7);
-	// Session JWTs are compact JWS (three base64url segments). Skip the verify
-	// round-trip for opaque bearer strings like OAuth access tokens.
-	if (!/^[\w-]+\.[\w-]+\.[\w-]+$/.test(token)) return null;
+	// Skip the lookup for anything that is not a session token, like OAuth access tokens.
+	if (!isOpaqueSessionToken(token)) return null;
 	try {
 		const payload = await verifyToken(token);
 		const row = await db.query.users.findFirst({

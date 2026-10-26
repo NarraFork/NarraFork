@@ -1,3 +1,4 @@
+import { messageBody, splitRowBlocks } from "@shared/narrator-blocks/message-blocks";
 import {
 	appendSourceText,
 	createSourceText,
@@ -9,13 +10,8 @@ import {
 } from "@shared/pretext-layout/source-text";
 import { copyStreamingEditInput } from "@shared/streaming-edit-origin";
 import type { ToolProgressPayload } from "@shared/tool-progress";
-import type { SubagentActivitySummary, TreeMessage } from "../../lib/api";
-import {
-	findMsgByToolUseIdInTree,
-	normalizeSubagentModel,
-	normalizeSubagentReasoningEffort,
-	upsertStreamingToolBlock,
-} from "./message/message-tree-utils";
+import { upsertStreamingToolBlock } from "./message/message-tree-utils";
+import { isNestedRow } from "./message/nested-rows";
 import type { ContentBlock, NarratorMsg } from "./narrator-panel-types";
 import { STREAMING_CHUNKS_MSG_ID } from "./narrator-panel-types";
 import { isSpecTasksToolUse } from "./tool-call/tool-display";
@@ -41,7 +37,6 @@ export {
 
 // Re-export functions that moved to message-segments.ts for backward compatibility
 export {
-	filterChildrenByToolUse,
 	hasToolUse,
 	isToolOnlyMessage,
 	resolveAllToolCallsFromMsg,
@@ -80,90 +75,11 @@ export function appendStreamingTextPreview(current: string, delta: string): stri
 export const STREAMING_TOOL_OUTPUT_PREVIEW_MAX_CHARS = 16_000;
 export const STREAMING_TOOL_FIELD_PREVIEW_MAX_CHARS = 16_000;
 
-interface TruncatedToolOutput {
-	_truncated: true;
-	preview: string;
-	fullLength: number;
-}
-
-function isTruncatedToolOutput(value: unknown): value is TruncatedToolOutput {
-	return (
-		!!value &&
-		typeof value === "object" &&
-		(value as { _truncated?: unknown })._truncated === true &&
-		typeof (value as { preview?: unknown }).preview === "string" &&
-		typeof (value as { fullLength?: unknown }).fullLength === "number"
-	);
-}
-
-/**
- * When a tool completes with a truncated output payload but we streamed the
- * complete response live, promote the streamed string into the persisted cache
- * instead of replacing it with the (much shorter) final preview.
- *
- * TWO PAYLOAD SHAPES
- *
- * Truncation is FIELD-LEVEL, so `completedOutput` arrives in one of two forms:
- *
- *   - a bare string output → the whole payload IS the truncated leaf (the common
- *     case, and the only one the original version handled), or
- *   - `{_text, _metadata}` → only `_text` is the leaf, and `_metadata` must be
- *     preserved alongside it.
- *
- * The second shape used to fail SILENTLY: a root-level `_truncated` probe returned
- * false, so the complete streamed output was discarded and the card fell back to
- * the short preview. The wrapper shape never changed, so no type error flagged it.
- *
- * Only the OUTPUT BODY can be restored this way — `streamedOutput` is that body
- * and nothing else — so a payload whose truncated leaf is some other field is left
- * untouched.
- */
-export function preserveCompleteStreamedOutput(
-	completedOutput: unknown,
-	streamedOutput?: string,
-): { output: unknown; preserved: boolean } {
-	if (typeof streamedOutput !== "string") {
-		return { output: completedOutput, preserved: false };
-	}
-	// Shape 1: the payload itself is the truncated leaf.
-	if (isTruncatedToolOutput(completedOutput)) {
-		if (streamedOutput.length < completedOutput.fullLength) {
-			return { output: completedOutput, preserved: false };
-		}
-		return { output: streamedOutput.slice(0, completedOutput.fullLength), preserved: true };
-	}
-	// Shape 2: `{_text, _metadata}` with a truncated `_text` leaf. Restoring it in
-	// place keeps every sibling field (notably `_metadata`, which drives the
-	// structured cards) rather than flattening the payload to a string.
-	if (completedOutput && typeof completedOutput === "object" && !Array.isArray(completedOutput)) {
-		const record = completedOutput as Record<string, unknown>;
-		const textLeaf = record._text;
-		if (isTruncatedToolOutput(textLeaf)) {
-			if (streamedOutput.length < textLeaf.fullLength) {
-				return { output: completedOutput, preserved: false };
-			}
-			return {
-				output: { ...record, _text: streamedOutput.slice(0, textLeaf.fullLength) },
-				preserved: true,
-			};
-		}
-	}
-	return { output: completedOutput, preserved: false };
-}
-
 /** Keep only the trailing window of a streamed tool output preview. */
 export function getToolOutputPreview(output: string): string {
 	if (output.length <= STREAMING_TOOL_OUTPUT_PREVIEW_MAX_CHARS) return output;
 	return output.slice(
 		safeSourceSliceStart(output, output.length - STREAMING_TOOL_OUTPUT_PREVIEW_MAX_CHARS),
-	);
-}
-
-/** Keep only the trailing window of a streamed tool field preview. */
-export function getStreamingFieldPreview(value: string): string {
-	if (value.length <= STREAMING_TOOL_FIELD_PREVIEW_MAX_CHARS) return value;
-	return value.slice(
-		safeSourceSliceStart(value, value.length - STREAMING_TOOL_FIELD_PREVIEW_MAX_CHARS),
 	);
 }
 
@@ -419,141 +335,6 @@ export function topLevelStreamingChunkToToolFields(
 	};
 }
 
-function jsonLikeEqual(left: unknown, right: unknown): boolean {
-	if (Object.is(left, right)) return true;
-	if (typeof left !== "object" || left === null || typeof right !== "object" || right === null) {
-		return false;
-	}
-	try {
-		return JSON.stringify(left) === JSON.stringify(right);
-	} catch {
-		return false;
-	}
-}
-
-function recordMatchesToolFields(
-	record: Record<string, unknown>,
-	fields: Record<string, unknown>,
-): boolean {
-	for (const [key, expected] of Object.entries(fields)) {
-		if (
-			key === "inputJson" &&
-			expected &&
-			typeof expected === "object" &&
-			!Array.isArray(expected)
-		) {
-			const expectedInput = expected as Record<string, unknown>;
-			const hasStreamingMarkers = Object.keys(expectedInput).some((name) =>
-				name.startsWith("_streaming"),
-			);
-			if (hasStreamingMarkers) {
-				const currentInput = record.inputJson;
-				if (!currentInput || typeof currentInput !== "object" || Array.isArray(currentInput)) {
-					return false;
-				}
-				for (const [name, value] of Object.entries(expectedInput)) {
-					if (!jsonLikeEqual((currentInput as Record<string, unknown>)[name], value)) {
-						return false;
-					}
-				}
-				continue;
-			}
-		}
-		if (!jsonLikeEqual(record[key], expected)) return false;
-	}
-	return true;
-}
-
-/** Write document attempts carry a stronger identity than a reusable provider id. */
-function findStreamingChunkMessage(
-	messages: readonly TreeMessage[],
-	chunk: TopLevelStreamingChunk,
-): TreeMessage | undefined {
-	const source = chunk.textDocument?.source;
-	if (!chunk.textDocument)
-		return findMsgByToolUseIdInTree(messages as TreeMessage[], chunk.toolUseId) ?? undefined;
-	if (!source) return undefined;
-	for (const message of messages) {
-		if (message.narratorId === source.narratorId) {
-			const matches = (pk: unknown, attempt: unknown) =>
-				source.toolCallId
-					? pk === source.toolCallId
-					: source.messageId
-						? message.id === source.messageId &&
-							(source.executionAttempt === undefined || attempt === source.executionAttempt)
-						: source.executionAttempt !== undefined && attempt === source.executionAttempt;
-			if (
-				(message.toolCalls ?? []).some(
-					(call) => call.toolUseId === chunk.toolUseId && matches(call.id, call.executionAttempt),
-				) ||
-				message.contentJson.some(
-					(block) =>
-						block.type === "tool_use" &&
-						block.id === chunk.toolUseId &&
-						matches(block.tcId, block.executionAttempt),
-				)
-			)
-				return message;
-		}
-		const child = findStreamingChunkMessage(message.children ?? [], chunk);
-		if (child) return child;
-	}
-	return undefined;
-}
-
-/** Return whether both persisted representations already contain the live chunk fields. */
-export function topLevelStreamingChunkMatchesPersistedTool(
-	messages: TreeMessage[],
-	chunk: TopLevelStreamingChunk,
-): boolean {
-	const message = findStreamingChunkMessage(messages, chunk);
-	if (!message) return false;
-	const records: Array<Record<string, unknown>> = [];
-	for (const toolCall of Array.isArray(message.toolCalls) ? message.toolCalls : []) {
-		if (toolCall.toolUseId === chunk.toolUseId) {
-			records.push(toolCall as unknown as Record<string, unknown>);
-		}
-	}
-	for (const block of Array.isArray(message.contentJson) ? message.contentJson : []) {
-		if (block.type === "tool_use" && block.id === chunk.toolUseId) {
-			records.push(block as unknown as Record<string, unknown>);
-		}
-	}
-	if (records.length === 0) return false;
-	const fields = topLevelStreamingChunkToToolFields(chunk);
-	return records.every((record) => recordMatchesToolFields(record, fields));
-}
-
-/**
- * Partition live top-level chunks by whether their toolUseId is already present
- * in a loaded message tree. Matched chunks can be folded into the persisted card;
- * unmatched chunks must remain synthetic because their message may not be
- * persisted yet (or its chunk may currently be virtualized out).
- */
-export function splitTopLevelStreamingChunksByPersistedToolUse(
-	chunks: TopLevelStreamingChunk[],
-	messages: NarratorMsg[],
-): { matched: TopLevelStreamingChunk[]; unmatched: TopLevelStreamingChunk[] } {
-	const matched: TopLevelStreamingChunk[] = [];
-	const unmatched: TopLevelStreamingChunk[] = [];
-	for (const chunk of chunks) {
-		if (findStreamingChunkMessage(messages, chunk)) matched.push(chunk);
-		else unmatched.push(chunk);
-	}
-	return { matched, unmatched };
-}
-
-export function getSyntheticTopLevelStreamingChunks(
-	chunks: TopLevelStreamingChunk[],
-	messages: NarratorMsg[],
-	reconciledToolUseIds: ReadonlySet<string>,
-): TopLevelStreamingChunk[] {
-	const candidates = chunks.filter(
-		(chunk) => chunk.textDocument || !reconciledToolUseIds.has(chunk.toolUseId),
-	);
-	return splitTopLevelStreamingChunksByPersistedToolUse(candidates, messages).unmatched;
-}
-
 /**
  * Build the synthetic STREAMING_CHUNKS_MSG_ID assistant message that surfaces
  * the currently-streaming top-level tool calls. Pure function shared by the
@@ -665,106 +446,25 @@ export function buildTopLevelStreamingChunksMsg(
 		narratorId,
 		parentToolUseId: null,
 		role: "assistant",
-		contentJson: blocks,
+		blocks: splitRowBlocks({ id: STREAMING_CHUNKS_MSG_ID, role: "assistant" }, blocks),
 		contentText: null,
 		toolCalls,
 		createdAt: createdAt ?? new Date().toISOString(),
-		children: [],
 	} as NarratorMsg;
-}
-
-/**
- * Insert a top-level message into a seq-ascending array at its correct slot.
- * Falls back to appending when seq is missing or it belongs at the tail.
- */
-export function insertTopLevelMessageBySeq(
-	messages: NarratorMsg[],
-	newMsg: NarratorMsg,
-): NarratorMsg[] {
-	const seq =
-		typeof newMsg.seq === "number" && Number.isFinite(newMsg.seq) ? newMsg.seq : undefined;
-	if (seq == null) return [...messages, newMsg];
-
-	const insertIdx = messages.findIndex(
-		(msg) => typeof msg.seq === "number" && Number.isFinite(msg.seq) && msg.seq > seq,
-	);
-	if (insertIdx === -1) return [...messages, newMsg];
-
-	const updated = [...messages];
-	updated.splice(insertIdx, 0, newMsg);
-	return updated;
-}
-
-function mergeSubagentActivity(
-	existing: SubagentActivitySummary | undefined,
-	incoming: SubagentActivitySummary | undefined,
-): SubagentActivitySummary | undefined {
-	if (!existing) return incoming;
-	if (!incoming) return existing;
-	const incomingModel = normalizeSubagentModel(incoming.model);
-	const existingModel = normalizeSubagentModel(existing.model);
-	const model = incomingModel ?? existingModel;
-	const incomingReasoningEffort = normalizeSubagentReasoningEffort(incoming.reasoningEffort);
-	const existingReasoningEffort = normalizeSubagentReasoningEffort(existing.reasoningEffort);
-	const reasoningEffort = incomingReasoningEffort ?? existingReasoningEffort;
-	return model !== incoming.model || reasoningEffort !== incoming.reasoningEffort
-		? { ...incoming, model, reasoningEffort }
-		: incoming;
-}
-
-/** Preserve live subagent activity when a terminal message refresh has sparse model metadata. */
-export function preserveLiveSubagentActivity(
-	existing: NarratorMsg | undefined,
-	incoming: NarratorMsg,
-): NarratorMsg {
-	if (!existing) return incoming;
-	const existingActivities = new Map<string, SubagentActivitySummary>();
-	for (const toolCall of existing.toolCalls ?? []) {
-		if (toolCall._subagentActivity) {
-			existingActivities.set(toolCall.toolUseId, toolCall._subagentActivity);
-		}
-	}
-	for (const block of existing.contentJson ?? []) {
-		if (block.type === "tool_use" && typeof block.id === "string" && block._subagentActivity) {
-			existingActivities.set(block.id, block._subagentActivity);
-		}
-	}
-	if (existingActivities.size === 0) return incoming;
-
-	let changed = false;
-	const toolCalls = (incoming.toolCalls ?? []).map((toolCall) => {
-		const activity = mergeSubagentActivity(
-			existingActivities.get(toolCall.toolUseId),
-			toolCall._subagentActivity,
-		);
-		if (activity === toolCall._subagentActivity) return toolCall;
-		changed = true;
-		return { ...toolCall, _subagentActivity: activity };
-	});
-	const contentJson = (incoming.contentJson ?? []).map((block) => {
-		if (block.type !== "tool_use" || typeof block.id !== "string") return block;
-		const activity = mergeSubagentActivity(
-			existingActivities.get(block.id),
-			block._subagentActivity,
-		);
-		if (activity === block._subagentActivity) return block;
-		changed = true;
-		return { ...block, _subagentActivity: activity };
-	});
-	return changed ? { ...incoming, toolCalls, contentJson } : incoming;
 }
 
 /**
  * Find the tool-use id of the LAST spec://tasks.json operation across an ordered
  * message list (Read/Write/Edit). Only this snapshot reflects the live task
  * state, so SpecTasksDetail animates a "doing" row only on this card. Scans both
- * the assistant `contentJson` tool_use blocks and the `toolCalls` records, in
+ * the assistant's tool_use elements and the `toolCalls` records, in
  * message order, and returns the id seen last. Returns null when there is none.
  */
 export function findLatestSpecTasksToolUseId(messages: NarratorMsg[]): string | null {
 	let latest: string | null = null;
 	for (const msg of messages) {
-		for (const block of msg.contentJson ?? []) {
+		if (isNestedRow(msg)) continue;
+		for (const block of messageBody(msg)) {
 			if (block.type !== "tool_use") continue;
 			const id = typeof block.id === "string" ? block.id : null;
 			const name = typeof block.name === "string" ? block.name : null;

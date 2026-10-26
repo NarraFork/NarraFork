@@ -24,7 +24,6 @@ const realNarratorPersistenceModule = { ...(await import("../narrator-persistenc
 const realContinuationModule = { ...(await import("../tool-continuation-service")) };
 const realNarratorSessionModule = { ...(await import("../narrator-session")) };
 const realAgentCommunicationModule = { ...(await import("../agent-communication")) };
-const realAgentReplyWaiterModule = { ...(await import("../agent-reply-waiter")) };
 const updateCoordinator = await import("../update-coordinator");
 const { setObservedRestartHandoffForTests } = await import("../../lib/restart-handoff");
 
@@ -62,12 +61,6 @@ const resumedAgentCalls: Array<Record<string, unknown>> = [];
 const awaitAgentCalls: Array<Record<string, unknown>> = [];
 let onAwaitMounted: (() => void) | null = null;
 const updatedToolResults: Array<{ args: unknown[] }> = [];
-let expectedPendingReplyProbe: {
-	requesterId: string;
-	responderId: string;
-	scope: import("../agent-reply-waiter").AgentReplyScope;
-} | null = null;
-const replyWaiterPresenceAtAgentResume: boolean[] = [];
 const toolCallResults = new Map<
 	string,
 	import("../tool-continuation-service").ToolContinuationToolCallResult
@@ -376,15 +369,6 @@ mock.module("../narrator-session", () => ({
 	) => {
 		if (continuationRows.some((row) => row.payloadJson?.subagentId === narratorId)) {
 			resumedAgentCalls.push({ narratorId, locale, ...run });
-			if (expectedPendingReplyProbe) {
-				replyWaiterPresenceAtAgentResume.push(
-					realAgentReplyWaiterModule.hasPendingAgentReply(
-						expectedPendingReplyProbe.requesterId,
-						expectedPendingReplyProbe.responderId,
-						expectedPendingReplyProbe.scope,
-					),
-				);
-			}
 			return { ok: true, terminal: resumedAgentCompletion };
 		}
 		continueNarratorCalls += 1;
@@ -404,8 +388,13 @@ mock.module("../narrator-session", () => ({
 	},
 }));
 
+let sendSubagentCalls = 0;
 mock.module("../agent-communication", () => ({
 	...realAgentCommunicationModule,
+	sendSubagentMessageDetailed: async () => {
+		sendSubagentCalls++;
+		throw new Error("recovery must never re-send a message");
+	},
 	awaitAgentResultDetailed: async (input: Record<string, unknown>) => {
 		awaitAgentCalls.push(input);
 		onAwaitMounted?.();
@@ -415,13 +404,11 @@ mock.module("../agent-communication", () => ({
 
 const {
 	buildRecoveredAwaitToolOutput,
-	buildRecoveredSendAwaitToolOutput,
 	getPlannedUpdateStartupProtection,
 	resolveAgentExecutionDeadline,
 	restoreNarratorsAfterPlannedUpdate,
 	runContinuationRecoveryGroups,
 	startContinuationClaimRenewal,
-	waitForStableSendAwaitCheckpoint,
 } = await import("../update-recovery-service");
 type ToolContinuationRecord = import("../tool-continuation-service").ToolContinuationRecord;
 type ToolContinuationRecoveryItem =
@@ -453,10 +440,8 @@ afterEach(() => {
 	resumedAgentCalls.length = 0;
 	awaitAgentCalls.length = 0;
 	onAwaitMounted = null;
+	sendSubagentCalls = 0;
 	updatedToolResults.length = 0;
-	expectedPendingReplyProbe = null;
-	replyWaiterPresenceAtAgentResume.length = 0;
-	realAgentReplyWaiterModule.clearPendingAgentReplyWaits();
 	toolCallResults.clear();
 	resumedAgentCompletion = Promise.resolve("<subagent_id>child</subagent_id>\n\ndone");
 	awaitAgentResult = Promise.resolve({
@@ -623,7 +608,9 @@ function sendAwaitSnapshot(input: {
 	requesterId?: string;
 	responders: string[];
 	deadlineAt?: string;
-}): import("../agent-reply-waiter").AgentReplyWaitRunSnapshot {
+}): import("../legacy-send-await").LegacySendAwaitSnapshot & {
+	waiters: Array<Record<string, unknown>>;
+} {
 	const requesterId = input.requesterId ?? "owner";
 	const deadlineAt = input.deadlineAt ?? new Date(Date.now() + 60_000).toISOString();
 	return {
@@ -820,66 +807,6 @@ describe("planned update recovery snapshot", () => {
 			expect(continueNarratorCalls).toBe(1);
 		});
 	}
-
-	test("v3 installs inherited Send waiters before a legacy responder can start", async () => {
-		loadMode = "working";
-		const snapshot = sendAwaitSnapshot({ toolUseId: "inherited-send", responders: ["legacy"] });
-		const record = continuationRecord("inherited-send-call", "owner", {
-			updateEpoch: "old-source",
-			kind: "send_await",
-			state: "waiting",
-			payloadJson: { sendAwait: snapshot },
-		});
-		continuationRows = [record];
-		recoveryQueue = [recoveryItem(record, "send-message", 0)];
-		toolCallResults.set(record.toolCallId, {
-			id: record.toolCallId,
-			toolUseId: snapshot.toolUseId,
-			messageId: "send-message",
-			status: "running",
-			outputJson: null,
-		});
-		const startup = await prepareRecovery(
-			[{ narratorId: "legacy", locale: "en" }],
-			[
-				{
-					updateEpoch: "old-source",
-					kind: "planned",
-					capturedAt: "2026-10-01T00:00:00.000Z",
-					narrators: [],
-					pendingNarratorIds: [],
-				},
-			],
-		);
-		loadMode = "idle";
-		let responded = false;
-		continueNarratorImpl = async () => {
-			if (!responded) {
-				responded = true;
-				expect(
-					realAgentReplyWaiterModule.hasPendingAgentReply(
-						"owner",
-						"legacy",
-						snapshot.waiters[0].scope,
-					),
-				).toBe(true);
-				expect(
-					realAgentReplyWaiterModule.resolvePendingAgentReply({
-						fromNarratorId: "legacy",
-						toNarratorId: "owner",
-						scope: snapshot.waiters[0].scope,
-						replyTo: snapshot.waiters[0].requestId,
-						message: "restored response",
-					}),
-				).toMatchObject({ matched: true });
-			}
-			return { ok: true };
-		};
-		const handle = await restoreNarratorsAfterPlannedUpdate(startup);
-		await handle?.completion;
-		expect(responded).toBe(true);
-		expect(continueNarratorCalls).toBe(2);
-	});
 
 	test("v3 combines root and source tools into one ordered message and one owner delivery", async () => {
 		loadMode = "idle";
@@ -1197,53 +1124,46 @@ describe("planned update recovery snapshot", () => {
 	});
 });
 
-describe("planned update Send await checkpoint stabilization", () => {
-	test("waits for an active Send setup to publish its waiter snapshot", async () => {
-		const run = realAgentReplyWaiterModule.beginAgentReplyWaitRun({
-			toolUseId: "checkpoint-send-setup",
-			requesterId: "owner",
+describe("retired Send await checkpoints", () => {
+	test("closes a legacy checkpoint with its recorded reply and never re-sends", async () => {
+		loadMode = "idle";
+		const snapshot = sendAwaitSnapshot({ toolUseId: "legacy-send", responders: ["a", "b"] });
+		snapshot.prefixSections.push("Sent to sibling; message queued.");
+		snapshot.prefixTargets.push({ id: "sibling", label: "sibling", status: "queued" });
+		snapshot.waiters[0].result = { status: "replied", message: "the answer" };
+		const record = continuationRecord("tool-legacy-send", "owner", {
+			kind: "send_await",
+			state: "waiting",
+			payloadJson: { sendAwait: snapshot },
 		});
-		const handle = realAgentReplyWaiterModule.registerAgentReplyWait({
-			requesterId: "owner",
-			responderId: "checkpoint-target",
-			scope: { type: "parent-child", id: "owner\u0000checkpoint-target" },
-			deadlineAt: new Date(Date.now() + 60_000).toISOString(),
-			run,
-			deliveryNote: "Delivered before checkpoint.",
+		toolCallResults.set(record.toolCallId, {
+			id: record.toolCallId,
+			toolUseId: snapshot.toolUseId,
+			messageId: "message-legacy-send",
+			status: "running",
+			outputJson: null,
 		});
-		let resolved = false;
-		const checkpoint = waitForStableSendAwaitCheckpoint(
-			{ toolCallId: "tool-checkpoint-setup", toolUseId: run.toolUseId },
-			{ loadStatus: async () => "running", pause: async () => {} },
-		).then((snapshot) => {
-			resolved = true;
-			return snapshot;
-		});
-		await Bun.sleep(0);
-		expect(resolved).toBe(false);
+		continuationRows = [record];
+		recoveryQueue = [recoveryItem(record, "message-legacy-send", 0)];
+		const prepared = await prepareRecovery();
 
-		run.markStable();
-		expect(await checkpoint).toMatchObject({
-			toolUseId: run.toolUseId,
-			waiters: [expect.objectContaining({ requestId: handle.requestId })],
-		});
-		handle.cancel();
-		run.complete();
-	});
+		const recovery = await restoreNarratorsAfterPlannedUpdate(prepared);
+		await recovery?.completion;
 
-	test("waits for an active row with no waiter run to finish instead of deferring or respawning it", async () => {
-		const statuses = ["running", "success"];
-		let statusReads = 0;
-		const snapshot = await waitForStableSendAwaitCheckpoint(
-			{ toolCallId: "tool-checkpoint-window", toolUseId: "send-window-no-run" },
-			{
-				loadStatus: async () => statuses[statusReads++] ?? "success",
-				pause: async () => {},
-			},
-		);
-
-		expect(snapshot).toBeNull();
-		expect(statusReads).toBe(2);
+		expect(updatedToolResults).toHaveLength(1);
+		const [, result] = updatedToolResults[0].args as [
+			string,
+			{ output: { _text: string; _metadata: { targets: Array<{ id: string; status: string }> } } },
+		];
+		expect(result.output._text).toContain("Sent to sibling; message queued.");
+		expect(result.output._text).toContain("the answer");
+		expect(result.output._text).toContain("Send no longer waits for replies");
+		expect(result.output._metadata.targets.map((target) => [target.id, target.status])).toEqual([
+			["sibling", "queued"],
+			["a", "completed"],
+			["b", "queued"],
+		]);
+		expect(sendSubagentCalls).toBe(0);
 	});
 });
 
@@ -2675,347 +2595,6 @@ describe("planned update continuation scheduling", () => {
 				status: "completed",
 			},
 		});
-	});
-
-	test("restores multi-target Send replies in original target order with equivalent output metadata", async () => {
-		const snapshot = sendAwaitSnapshot({
-			toolUseId: "send-multi-order",
-			responders: ["responder-a", "responder-b"],
-		});
-		const waiting = realAgentCommunicationModule.restoreSendAwaitFromSnapshot(
-			snapshot,
-			new AbortController().signal,
-		);
-		await Bun.sleep(0);
-		expect(
-			realAgentReplyWaiterModule.resolvePendingAgentReply({
-				fromNarratorId: "responder-b",
-				toNarratorId: "owner",
-				scope: snapshot.waiters[1].scope,
-				replyTo: snapshot.waiters[1].requestId,
-				message: "second target replied first",
-			}),
-		).toMatchObject({ matched: true });
-		expect(
-			realAgentReplyWaiterModule.resolvePendingAgentReply({
-				fromNarratorId: "responder-a",
-				toNarratorId: "owner",
-				scope: snapshot.waiters[0].scope,
-				replyTo: snapshot.waiters[0].requestId,
-				message: "first target replied second",
-			}),
-		).toMatchObject({ matched: true });
-
-		const result = await waiting;
-		// `id` is the real responder narrator id (the frontend links to it); `label`
-		// is the readable name shown to the model. Order must follow the snapshot.
-		expect(result.targets.map((target) => target.id)).toEqual(["responder-a", "responder-b"]);
-		expect(result.targets.map((target) => target.label)).toEqual(["target-1", "target-2"]);
-		expect(result.output.indexOf("first target replied second")).toBeLessThan(
-			result.output.indexOf("second target replied first"),
-		);
-		expect(buildRecoveredSendAwaitToolOutput(snapshot, result)).toEqual({
-			_text: result.output,
-			_metadata: {
-				kind: "send",
-				targets: result.targets,
-				doInterrupt: false,
-				await: true,
-			},
-		});
-	});
-
-	test("restored Send uses the original absolute deadline and never redelivers its message", async () => {
-		const snapshot = sendAwaitSnapshot({
-			toolUseId: "send-expired-deadline",
-			responders: ["deadline-target"],
-			deadlineAt: new Date(Date.now() - 1).toISOString(),
-		});
-		const result = await realAgentCommunicationModule.restoreSendAwaitFromSnapshot(
-			snapshot,
-			new AbortController().signal,
-		);
-
-		expect(result.targets).toEqual([
-			expect.objectContaining({
-				id: "deadline-target",
-				label: "target-1",
-				status: "timeout",
-				awaited: true,
-			}),
-		]);
-		expect(result.output).toContain("Timed out waiting for a Send reply");
-		// Recovery consumes only the restored waiter. A late reply sees an expired request,
-		// proving no second Send delivery/request id was created.
-		expect(
-			realAgentReplyWaiterModule.resolvePendingAgentReply({
-				fromNarratorId: "deadline-target",
-				toNarratorId: "owner",
-				scope: snapshot.waiters[0].scope,
-				replyTo: snapshot.waiters[0].requestId,
-				message: "late",
-			}),
-		).toMatchObject({ matched: false, error: expect.stringContaining("expired") });
-	});
-
-	for (const oldProcessStatus of ["completed", "timeout", "aborted"] as const) {
-		test(`uses an old-process ${oldProcessStatus} ToolResult that arrives after Send recovery mounts`, async () => {
-			loadMode = "idle";
-			const snapshot = sendAwaitSnapshot({
-				toolUseId: `send-old-process-${oldProcessStatus}`,
-				responders: ["old-process-target"],
-			});
-			const sendRecord = continuationRecord(`tool-old-process-${oldProcessStatus}`, "owner", {
-				kind: "send_await",
-				state: "waiting",
-				payloadJson: { sendAwait: snapshot },
-			});
-			toolCallResults.set(sendRecord.toolCallId, {
-				id: sendRecord.toolCallId,
-				toolUseId: snapshot.toolUseId,
-				messageId: `message-old-process-${oldProcessStatus}`,
-				status: "running",
-				outputJson: null,
-			});
-			continuationRows = [sendRecord];
-			recoveryQueue = [recoveryItem(sendRecord, `message-old-process-${oldProcessStatus}`, 0)];
-			const prepared = await prepareRecovery();
-
-			const recovery = await restoreNarratorsAfterPlannedUpdate(prepared);
-			expect(
-				realAgentReplyWaiterModule.hasPendingAgentReply(
-					"owner",
-					"old-process-target",
-					snapshot.waiters[0].scope,
-				),
-			).toBe(true);
-			toolCallResults.set(sendRecord.toolCallId, {
-				...(toolCallResults.get(sendRecord.toolCallId) as NonNullable<
-					ReturnType<typeof toolCallResults.get>
-				>),
-				status: "success",
-				outputJson: {
-					_text: `old process settled: ${oldProcessStatus}`,
-					_metadata: {
-						kind: "send",
-						targets: [{ id: "target-1", status: oldProcessStatus, awaited: true }],
-						await: true,
-					},
-				},
-			});
-
-			await recovery?.completion;
-			expect(updatedToolResults).toHaveLength(0);
-			expect(continuationRows[0]).toMatchObject({
-				state: "completed",
-				payloadJson: { recoveryPhase: "owner_continuation_started" },
-			});
-			expect(
-				realAgentReplyWaiterModule.hasPendingAgentReply(
-					"owner",
-					"old-process-target",
-					snapshot.waiters[0].scope,
-				),
-			).toBe(false);
-		});
-	}
-
-	test("preserves an old-process terminal Send result written after the final active read", async () => {
-		loadMode = "idle";
-		const snapshot = sendAwaitSnapshot({
-			toolUseId: "send-terminal-write-race",
-			responders: ["terminal-race-target"],
-		});
-		const sendRecord = continuationRecord("tool-terminal-write-race", "owner", {
-			kind: "send_await",
-			state: "waiting",
-			payloadJson: { sendAwait: snapshot },
-		});
-		toolCallResults.set(sendRecord.toolCallId, {
-			id: sendRecord.toolCallId,
-			toolUseId: snapshot.toolUseId,
-			messageId: "message-terminal-write-race",
-			status: "running",
-			outputJson: null,
-		});
-		continuationRows = [sendRecord];
-		recoveryQueue = [recoveryItem(sendRecord, "message-terminal-write-race", 0)];
-		beforeConditionalToolResultWrite = () => {
-			beforeConditionalToolResultWrite = null;
-			const current = toolCallResults.get(sendRecord.toolCallId);
-			if (!current) throw new Error("missing raced Send tool call");
-			toolCallResults.set(sendRecord.toolCallId, {
-				...current,
-				status: "success",
-				outputJson: {
-					_text: "old process terminal reply wins",
-					_metadata: {
-						kind: "send",
-						targets: [{ id: "target-1", status: "completed", awaited: true }],
-						await: true,
-					},
-				},
-			});
-		};
-		const prepared = await prepareRecovery();
-
-		const recovery = await restoreNarratorsAfterPlannedUpdate(prepared);
-		expect(
-			realAgentReplyWaiterModule.resolvePendingAgentReply({
-				fromNarratorId: "terminal-race-target",
-				toNarratorId: "owner",
-				scope: snapshot.waiters[0].scope,
-				replyTo: snapshot.waiters[0].requestId,
-				message: "replacement process reply",
-			}),
-		).toMatchObject({ matched: true });
-		await recovery?.completion;
-
-		expect(updatedToolResults).toHaveLength(0);
-		expect(toolCallResults.get(sendRecord.toolCallId)?.outputJson).toMatchObject({
-			_text: "old process terminal reply wins",
-			_metadata: { targets: [{ status: "completed" }] },
-		});
-		expect(continuationRows[0]).toMatchObject({
-			state: "completed",
-			payloadJson: { recoveryPhase: "owner_continuation_started" },
-		});
-	});
-
-	test("globally mounts Send waiters before resuming any Agent continuation", async () => {
-		loadMode = "idle";
-		const snapshot = sendAwaitSnapshot({
-			toolUseId: "send-priority-use",
-			responders: ["reply-target"],
-		});
-		expectedPendingReplyProbe = {
-			requesterId: "owner",
-			responderId: "reply-target",
-			scope: snapshot.waiters[0].scope,
-		};
-		const sendRecord = continuationRecord("tool-send-priority", "owner", {
-			updateEpoch: "old-source",
-			kind: "send_await",
-			state: "waiting",
-			payloadJson: { sendAwait: snapshot },
-		});
-		const agentRecord = continuationRecord("tool-agent-after-send-mount", "owner", {
-			kind: "foreground_agent",
-			state: "waiting",
-			payloadJson: { subagentId: "agent-after-send-mount" },
-		});
-		toolCallResults.set(sendRecord.toolCallId, {
-			id: sendRecord.toolCallId,
-			toolUseId: snapshot.toolUseId,
-			messageId: "message-send-priority",
-			status: "running",
-			outputJson: null,
-		});
-		continuationRows = [agentRecord, sendRecord];
-		recoveryQueue = [
-			recoveryItem(agentRecord, "message-agent-priority", 0),
-			recoveryItem(sendRecord, "message-send-priority", 0),
-		];
-		const prepared = await prepareRecovery(
-			[],
-			[
-				{
-					updateEpoch: "old-source",
-					kind: "planned",
-					capturedAt: "2026-10-01T00:00:00.000Z",
-					narrators: [],
-					pendingNarratorIds: [],
-				},
-			],
-		);
-
-		const recovery = await restoreNarratorsAfterPlannedUpdate(prepared);
-		expect(replyWaiterPresenceAtAgentResume).toEqual([true]);
-		expect(
-			realAgentReplyWaiterModule.resolvePendingAgentReply({
-				fromNarratorId: "reply-target",
-				toNarratorId: "owner",
-				scope: snapshot.waiters[0].scope,
-				replyTo: snapshot.waiters[0].requestId,
-				message: "mounted before agent",
-			}),
-		).toMatchObject({ matched: true });
-		await recovery?.completion;
-		expect(updatedToolResults).toContainEqual({
-			args: expect.arrayContaining([
-				snapshot.toolUseId,
-				expect.objectContaining({
-					status: "success",
-					output: expect.objectContaining({
-						_metadata: expect.objectContaining({ kind: "send", await: true }),
-					}),
-				}),
-			]),
-		});
-	});
-
-	test("parent interrupt aborts recovered Send wait without stopping its target semantics", async () => {
-		loadMode = "idle";
-		const snapshot = sendAwaitSnapshot({
-			toolUseId: "send-parent-interrupt-use",
-			responders: ["still-running-target"],
-		});
-		const sendRecord = continuationRecord("tool-send-parent-interrupt", "owner", {
-			kind: "send_await",
-			state: "waiting",
-			payloadJson: { sendAwait: snapshot },
-		});
-		toolCallResults.set(sendRecord.toolCallId, {
-			id: sendRecord.toolCallId,
-			toolUseId: snapshot.toolUseId,
-			messageId: "message-send-parent-interrupt",
-			status: "running",
-			outputJson: null,
-		});
-		continuationRows = [sendRecord];
-		recoveryQueue = [recoveryItem(sendRecord, "message-send-parent-interrupt", 0)];
-		let releaseCancellation = () => {};
-		cancelInterruptibleGate = new Promise<void>((resolve) => {
-			releaseCancellation = resolve;
-		});
-		let cancellationStarted = () => {};
-		const cancellationStart = new Promise<void>((resolve) => {
-			cancellationStarted = resolve;
-		});
-		markCancelInterruptibleStarted = cancellationStarted;
-		const prepared = await prepareRecovery();
-
-		const recovery = await restoreNarratorsAfterPlannedUpdate(prepared);
-		expect(
-			realAgentReplyWaiterModule.hasPendingAgentReply(
-				"owner",
-				"still-running-target",
-				snapshot.waiters[0].scope,
-			),
-		).toBe(true);
-		expect(realNarratorSessionModule.interruptNarrator("owner")).toBe(true);
-		await cancellationStart;
-		await expect(
-			Promise.race([
-				recovery?.completion.then(() => "completed" as const),
-				new Promise<"pending">((resolve) => setTimeout(() => resolve("pending"), 20)),
-			]),
-		).resolves.toBe("pending");
-		releaseCancellation();
-		await recovery?.completion;
-		expect(continuationRows[0]?.state).toBe("cancelled");
-		const sendWrites = updatedToolResults
-			.map(({ args }) => args[1] as { output?: { _metadata?: { targets?: unknown[] } } })
-			.filter((result) => result.output?._metadata?.targets);
-		expect(sendWrites.at(-1)?.output?._metadata?.targets).toEqual([
-			expect.objectContaining({
-				id: "still-running-target",
-				label: "target-1",
-				status: "aborted",
-				awaited: true,
-			}),
-		]);
-		expect(resumedAgentCalls).toHaveLength(0);
 	});
 
 	test("mounts pending permission recovery without waiting for the interactive promise", async () => {

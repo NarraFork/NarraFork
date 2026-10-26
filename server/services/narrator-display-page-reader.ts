@@ -186,6 +186,11 @@ function mapReadError(error: unknown): Error {
 		case "DISPLAY_PAGE_READER_UNAVAILABLE":
 			return new AppError(message, 503, code);
 		default:
+			// The client sees a generic 503; keep the real cause in the server log.
+			logger.warn("History display read failed", {
+				error: message,
+				...(code !== null && code !== undefined && { code: String(code) }),
+			});
 			return unavailable("read failed");
 	}
 }

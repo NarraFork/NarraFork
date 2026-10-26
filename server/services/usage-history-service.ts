@@ -60,7 +60,25 @@ export interface UsageHistoryFilters {
 	includeSubagents?: boolean;
 }
 
-export interface UsageHistoryStats extends CostCoverage {
+// Only requests with an actual cache read participate; ordinary totals stay unfiltered.
+const cacheHitRateSelection = {
+	cacheHitRateReadTokens: sql<number>`coalesce(sum(case when ${apiRequests.cachedInputTokens} > 0 then ${apiRequests.cachedInputTokens} else 0 end), 0)`,
+	cacheHitRateInputTokens: sql<number>`coalesce(sum(case when ${apiRequests.cachedInputTokens} > 0 then ${apiRequests.cachedInputTokens} + coalesce(${apiRequests.cacheCreationInputTokens}, 0) + coalesce(${apiRequests.inputTokens}, 0) else 0 end), 0)`,
+};
+
+interface CacheHitRateTotals {
+	cacheHitRateReadTokens: number;
+	cacheHitRateInputTokens: number;
+}
+
+function cacheHitRate(row?: Partial<CacheHitRateTotals>): number | null {
+	const denominator = toNumber(row?.cacheHitRateInputTokens);
+	return denominator > 0 ? toNumber(row?.cacheHitRateReadTokens) / denominator : null;
+}
+
+export interface UsageHistoryStats extends CostCoverage, CacheHitRateTotals {
+	/** Ratio in [0, 1]; null means no participating requests. */
+	cacheHitRate: number | null;
 	totalRequests: number;
 	totalInputTokens: number;
 	totalOutputTokens: number;
@@ -77,7 +95,8 @@ export interface UsageHistoryStats extends CostCoverage {
 
 export type UsageHistoryGranularity = "hour" | "day" | "month";
 
-export interface UsageHistoryTimeSeriesPoint extends CostCoverage {
+export interface UsageHistoryTimeSeriesPoint extends CostCoverage, CacheHitRateTotals {
+	cacheHitRate: number | null;
 	timestamp: string;
 	requestCount: number;
 	totalInputTokens: number;
@@ -128,7 +147,7 @@ export type UsageBreakdownMetric =
 
 export interface UsageBreakdownEntry {
 	label: string;
-	value: number;
+	value: number | null;
 	percentage: number;
 	count: number;
 }
@@ -137,7 +156,7 @@ export interface UsageBreakdownResponse extends CostCoverage {
 	dimension: UsageBreakdownDimension;
 	metric: UsageBreakdownMetric;
 	entries: UsageBreakdownEntry[];
-	total: number;
+	total: number | null;
 }
 
 export interface UsageStackedTimeSeriesResponse extends CostCoverage {
@@ -147,7 +166,7 @@ export interface UsageStackedTimeSeriesResponse extends CostCoverage {
 	series: Array<{
 		label: string;
 		color: string;
-		data: Array<{ timestamp: string; value: number }>;
+		data: Array<{ timestamp: string; value: number | null }>;
 	}>;
 	timestamps: string[];
 	truncated: boolean;
@@ -610,6 +629,7 @@ export class UsageHistoryService {
 				totalOutputTokens: sql<number>`coalesce(sum(${apiRequests.outputTokens}), 0)`,
 				totalCacheCreationTokens: sql<number>`coalesce(sum(${apiRequests.cacheCreationInputTokens}), 0)`,
 				totalCacheReadTokens: sql<number>`coalesce(sum(${apiRequests.cachedInputTokens}), 0)`,
+				...cacheHitRateSelection,
 				totalCacheCreation5mTokens: sql<number>`coalesce(sum(${apiRequests.cacheCreation5mTokens}), 0)`,
 				totalCacheCreation1hTokens: sql<number>`coalesce(sum(${apiRequests.cacheCreation1hTokens}), 0)`,
 				totalReasoningTokens: sql<number>`coalesce(sum(${apiRequests.reasoningTokens}), 0)`,
@@ -631,6 +651,9 @@ export class UsageHistoryService {
 		const totalReasoningTokens = stats?.totalReasoningTokens ?? 0;
 
 		return {
+			cacheHitRate: cacheHitRate(stats),
+			cacheHitRateReadTokens: toNumber(stats?.cacheHitRateReadTokens),
+			cacheHitRateInputTokens: toNumber(stats?.cacheHitRateInputTokens),
 			totalRequests: stats?.totalRequests ?? 0,
 			totalInputTokens,
 			totalOutputTokens,
@@ -671,6 +694,7 @@ export class UsageHistoryService {
 				totalOutputTokens: sql<number>`coalesce(sum(${apiRequests.outputTokens}), 0)`,
 				totalCacheCreationTokens: sql<number>`coalesce(sum(${apiRequests.cacheCreationInputTokens}), 0)`,
 				totalCacheReadTokens: sql<number>`coalesce(sum(${apiRequests.cachedInputTokens}), 0)`,
+				...cacheHitRateSelection,
 				totalCacheCreation5mTokens: sql<number>`coalesce(sum(${apiRequests.cacheCreation5mTokens}), 0)`,
 				totalCacheCreation1hTokens: sql<number>`coalesce(sum(${apiRequests.cacheCreation1hTokens}), 0)`,
 				totalReasoningTokens: sql<number>`coalesce(sum(${apiRequests.reasoningTokens}), 0)`,
@@ -705,6 +729,9 @@ export class UsageHistoryService {
 			const totalCacheReadTokens = toNumber(row?.totalCacheReadTokens);
 			return {
 				timestamp,
+				cacheHitRate: cacheHitRate(row),
+				cacheHitRateReadTokens: toNumber(row?.cacheHitRateReadTokens),
+				cacheHitRateInputTokens: toNumber(row?.cacheHitRateInputTokens),
 				requestCount: toNumber(row?.requestCount),
 				totalInputTokens,
 				totalOutputTokens,
@@ -816,6 +843,7 @@ export class UsageHistoryService {
 			.select({
 				label: dimension === "user" ? this.getDimensionLabel(dimension) : dimensionColumn,
 				value: metricAgg,
+				...cacheHitRateSelection,
 				count: sql<number>`count(*)`,
 				// Window totals are evaluated before LIMIT, so user proportions include all users.
 				overallValue:
@@ -827,56 +855,77 @@ export class UsageHistoryService {
 			.leftJoin(users, eq(apiRequests.userId, users.id))
 			.where(and(...conditions))
 			.groupBy(dimensionColumn)
-			.orderBy(sql`${metricAgg} DESC`)
+			.orderBy(sql`${metricAgg} DESC NULLS LAST`)
 			.limit(queryLimit);
 
 		const rows = await this.aggregate(query, queryLimit, execution);
-		const grouped = new Map<string, { value: number; count: number }>();
-		const entries: UsageBreakdownEntry[] = [];
-		for (const row of rows) {
+		const grouped = new Map<
+			string,
+			{ label: string; value: number; count: number } & CacheHitRateTotals
+		>();
+		for (const [index, row] of rows.entries()) {
 			const label = shouldCluster ? normalizeModelFamily(row.label) : row.label;
-			if (shouldCluster) {
-				const previous = grouped.get(label) ?? { value: 0, count: 0 };
-				previous.value += toNumber(row.value);
-				previous.count += toNumber(row.count);
-				grouped.set(label, previous);
-			} else {
-				entries.push({
-					label,
-					value: toNumber(row.value),
-					count: toNumber(row.count),
-					percentage: 0,
-				});
-			}
+			const key = shouldCluster ? label : String(index);
+			const previous = grouped.get(key) ?? {
+				label,
+				value: 0,
+				count: 0,
+				cacheHitRateReadTokens: 0,
+				cacheHitRateInputTokens: 0,
+			};
+			previous.value += toNumber(row.value);
+			previous.count += toNumber(row.count);
+			previous.cacheHitRateReadTokens += toNumber(row.cacheHitRateReadTokens);
+			previous.cacheHitRateInputTokens += toNumber(row.cacheHitRateInputTokens);
+			grouped.set(key, previous);
 		}
-		if (shouldCluster) {
-			entries.push(
-				...[...grouped.entries()]
-					.sort((a, b) => b[1].value - a[1].value)
-					.slice(0, 20)
-					.map(([label, value]) => ({ label, ...value, percentage: 0 })),
-			);
-		}
+		const entries: UsageBreakdownEntry[] = [...grouped.values()]
+			.map((row) => ({
+				label: row.label,
+				value: metric === "cacheHitRate" ? cacheHitRate(row) : row.value,
+				count: row.count,
+				percentage: 0,
+			}))
+			.sort((a, b) => (b.value ?? -1) - (a.value ?? -1))
+			.slice(0, 20);
 
-		const visibleTotal = entries.reduce((sum, entry) => sum + entry.value, 0);
-		const total = dimension === "user" ? toNumber(rows[0]?.overallValue) : visibleTotal;
+		// Coverage and the overall ratio include the whole filter, not just top-N.
+		const coverage = await this.getUsageStats(filters, execution);
+		const visibleTotal = entries.reduce((sum, entry) => sum + (entry.value ?? 0), 0);
+		const total =
+			metric === "cacheHitRate"
+				? coverage.cacheHitRate
+				: dimension === "user"
+					? toNumber(rows[0]?.overallValue)
+					: visibleTotal;
 		if (dimension === "user") {
 			const otherCount =
 				toNumber(rows[0]?.overallCount) - entries.reduce((sum, entry) => sum + entry.count, 0);
 			if (otherCount > 0)
 				entries.push({
 					label: "other",
-					value: total - visibleTotal,
+					value:
+						metric === "cacheHitRate"
+							? cacheHitRate({
+									cacheHitRateReadTokens:
+										coverage.cacheHitRateReadTokens -
+										rows.reduce((sum, row) => sum + toNumber(row.cacheHitRateReadTokens), 0),
+									cacheHitRateInputTokens:
+										coverage.cacheHitRateInputTokens -
+										rows.reduce((sum, row) => sum + toNumber(row.cacheHitRateInputTokens), 0),
+								})
+							: (total ?? 0) - visibleTotal,
 					count: otherCount,
 					percentage: 0,
 				});
 		}
 		for (const entry of entries) {
-			entry.percentage = total > 0 ? Math.round((entry.value / total) * 10000) / 100 : 0;
+			// Ratios are not additive shares of the overall ratio.
+			entry.percentage =
+				metric !== "cacheHitRate" && total != null && total > 0
+					? Math.round(((entry.value ?? 0) / total) * 10000) / 100
+					: 0;
 		}
-
-		// Coverage is over the whole filter, not merely the visible top-N slice.
-		const coverage = await this.getUsageStats(filters, execution);
 		return { dimension, metric, entries, total, ...costCoverage(coverage) };
 	}
 
@@ -912,20 +961,34 @@ export class UsageHistoryService {
 				label: dimensionColumn,
 				displayLabel: dimension === "user" ? this.getDimensionLabel(dimension) : dimensionColumn,
 				total: metricAgg,
+				...cacheHitRateSelection,
 			})
 			.from(apiRequests)
 			.leftJoin(narrators, eq(apiRequests.narratorId, narrators.id))
 			.leftJoin(users, eq(apiRequests.userId, users.id))
 			.where(and(...conditions))
 			.groupBy(dimensionColumn)
-			.orderBy(sql`${metricAgg} DESC`, dimensionColumn)
+			.orderBy(sql`${metricAgg} DESC NULLS LAST`, dimensionColumn)
 			.limit(shouldCluster ? 200 : topN);
 		const topLabelsRaw = await this.aggregate(topQuery, shouldCluster ? 200 : topN, execution);
 		const familyTotals = new Map<string, number>();
+		const familyCacheTotals = new Map<string, CacheHitRateTotals>();
 		if (shouldCluster) {
 			for (const row of topLabelsRaw) {
 				const family = normalizeModelFamily(row.label);
-				familyTotals.set(family, (familyTotals.get(family) ?? 0) + toNumber(row.total));
+				const totals = familyCacheTotals.get(family) ?? {
+					cacheHitRateReadTokens: 0,
+					cacheHitRateInputTokens: 0,
+				};
+				totals.cacheHitRateReadTokens += toNumber(row.cacheHitRateReadTokens);
+				totals.cacheHitRateInputTokens += toNumber(row.cacheHitRateInputTokens);
+				familyCacheTotals.set(family, totals);
+				familyTotals.set(
+					family,
+					metric === "cacheHitRate"
+						? (cacheHitRate(totals) ?? -1)
+						: (familyTotals.get(family) ?? 0) + toNumber(row.total),
+				);
 			}
 		}
 		const topLabelSet = new Set(
@@ -954,6 +1017,7 @@ export class UsageHistoryService {
 				bucket,
 				label: groupedLabel,
 				value: metricAgg,
+				...cacheHitRateSelection,
 				requestCount: sql<number>`count(*)`,
 				...costCoverageSelection,
 			})
@@ -977,27 +1041,29 @@ export class UsageHistoryService {
 		);
 
 		// Group data by label+bucket
-		const dataMap = new Map<string, Map<string, number>>();
-		const otherMap = new Map<string, number>();
+		type BucketTotals = CacheHitRateTotals & { value: number };
+		const dataMap = new Map<string, Map<string, BucketTotals>>();
+		const otherMap = new Map<string, BucketTotals>();
 
 		for (const row of rows) {
 			const label = shouldCluster ? normalizeModelFamily(row.label) : row.label;
-			const ts = row.bucket;
-			const value = toNumber(row.value);
-
+			let target = otherMap;
 			if (label !== null && topLabelSet.has(label)) {
-				let labelMap = dataMap.get(label);
-				if (!labelMap) {
-					labelMap = new Map();
-					dataMap.set(label, labelMap);
-				}
-				const existing = labelMap.get(ts) ?? 0;
-				labelMap.set(ts, existing + value);
-			} else {
-				const existing = otherMap.get(ts) ?? 0;
-				otherMap.set(ts, existing + value);
+				target = dataMap.get(label) ?? new Map<string, BucketTotals>();
+				dataMap.set(label, target);
 			}
+			const previous = target.get(row.bucket) ?? {
+				value: 0,
+				cacheHitRateReadTokens: 0,
+				cacheHitRateInputTokens: 0,
+			};
+			previous.value += toNumber(row.value);
+			previous.cacheHitRateReadTokens += toNumber(row.cacheHitRateReadTokens);
+			previous.cacheHitRateInputTokens += toNumber(row.cacheHitRateInputTokens);
+			target.set(row.bucket, previous);
 		}
+		const bucketValue = (totals: BucketTotals | undefined) =>
+			metric === "cacheHitRate" ? cacheHitRate(totals) : (totals?.value ?? 0);
 
 		// Build series
 		const STACKED_COLORS = [
@@ -1020,7 +1086,7 @@ export class UsageHistoryService {
 			series.push({
 				label: displayLabels.get(label) ?? label,
 				color: STACKED_COLORS[colorIndex % STACKED_COLORS.length],
-				data: timestamps.map((ts) => ({ timestamp: ts, value: labelData?.get(ts) ?? 0 })),
+				data: timestamps.map((ts) => ({ timestamp: ts, value: bucketValue(labelData?.get(ts)) })),
 			});
 			colorIndex++;
 		}
@@ -1031,7 +1097,7 @@ export class UsageHistoryService {
 			series.push({
 				label: "other",
 				color: "var(--mantine-color-gray-6)",
-				data: timestamps.map((ts) => ({ timestamp: ts, value: otherMap.get(ts) ?? 0 })),
+				data: timestamps.map((ts) => ({ timestamp: ts, value: bucketValue(otherMap.get(ts)) })),
 			});
 		}
 
@@ -1090,11 +1156,11 @@ export class UsageHistoryService {
 				return sql<number>`coalesce(sum(${apiRequests.cachedInputTokens}), 0)`;
 			case "cacheCreationTokens":
 				return sql<number>`coalesce(sum(${apiRequests.cacheCreationInputTokens}), 0)`;
-			// 缓存命中率 = 缓存读取 ÷ (缓存读取 + 缓存写入 + 纯输入)。
-			// 必须先分别求和再相除：按行求比率再平均会让小请求行获得与百万级请求相同的权重。
-			// 分母为 0（该组无任何输入侧 token）时返回 0，避免 NaN 污染图表。
+			// Sum eligible numerators/denominators before division; no participants stays NULL.
 			case "cacheHitRate":
-				return sql<number>`coalesce(sum(${apiRequests.cachedInputTokens}), 0) * 1.0 / nullif(coalesce(sum(${apiRequests.cachedInputTokens}), 0) + coalesce(sum(${apiRequests.cacheCreationInputTokens}), 0) + coalesce(sum(${apiRequests.inputTokens}), 0), 0)`;
+				return sql<
+					number | null
+				>`${cacheHitRateSelection.cacheHitRateReadTokens} * 1.0 / nullif(${cacheHitRateSelection.cacheHitRateInputTokens}, 0)`;
 			case "outputTokens":
 				return sql<number>`coalesce(sum(${apiRequests.outputTokens}), 0)`;
 			case "reasoningTokens":

@@ -3,9 +3,7 @@ import { mkdtempSync, readdirSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { resolve } from "node:path";
 import { Hono } from "hono";
-import { sign } from "hono/jwt";
 import { buildAppErrorResponse } from "../../lib/app-error-response";
-import { settings } from "../../lib/settings";
 import { getAvatarPath, saveAvatarImage, setUploadsDirForTests } from "../../lib/uploads";
 import type { AuthSessionStore } from "../../services/auth/session-store";
 import { authMfaStore, authSessionStore, setAuthStores } from "../../services/auth/store";
@@ -27,13 +25,8 @@ function pngHeader(width: number, height: number): ArrayBuffer {
 	return buffer;
 }
 
-async function sessionToken(userId: string): Promise<string> {
-	const now = Math.floor(Date.now() / 1000);
-	return sign(
-		{ sub: userId, role: "user", iat: now, exp: now + 3600, sv: 0 },
-		settings.auth.jwtSecret,
-	);
-}
+/** Any well-formed session token: the store below resolves every token to the test user. */
+const SESSION_TOKEN = `nfs_${"a".repeat(43)}`;
 
 afterEach(() => {
 	setAuthStores(undefined);
@@ -57,6 +50,17 @@ describe("auth avatar replacement rollback", () => {
 			const failingStore: AuthSessionStore = {
 				...original,
 				findSessionState: async (id) => ({ id, role: "user", tokenVersion: 0 }),
+				findSessionByTokenHash: async () => ({
+					id: "session-1",
+					userId,
+					role: "user",
+					userTokenVersion: 0,
+					sessionTokenVersion: 0,
+					sessionStart: Math.floor(Date.now() / 1000),
+					createdAt: Math.floor(Date.now() / 1000),
+					expiresAt: Math.floor(Date.now() / 1000) + 3600,
+					revokedAt: null,
+				}),
 				findSessionProfile: async (id) => ({
 					id,
 					username: "avatar-user",
@@ -79,7 +83,7 @@ describe("auth avatar replacement rollback", () => {
 			form.set("file", new File([pngHeader(32, 24)], "new.png", { type: "image/png" }));
 			const response = await app.request("/api/auth/me/avatar", {
 				method: "PATCH",
-				headers: { Authorization: `Bearer ${await sessionToken(userId)}` },
+				headers: { Authorization: `Bearer ${SESSION_TOKEN}` },
 				body: form,
 			});
 			expect(response.status).toBe(500);

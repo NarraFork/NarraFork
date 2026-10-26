@@ -436,17 +436,17 @@ describe("Send({ user })", () => {
 		expect(result.output).toContain("Only bot narrators");
 	});
 
-	test("cannot be mixed with agent targets or reply waits", async () => {
+	test("cannot be mixed with agent targets or an interrupt", async () => {
 		const mixed = await sendTool.execute(
 			{ user: aliceName, id: "parent", message: "hi" },
 			ctx(openBot),
 		);
 		expect(mixed.isError).toBe(true);
-		const awaited = await sendTool.execute(
-			{ user: aliceName, await: true, message: "hi" },
+		const interrupting = await sendTool.execute(
+			{ user: aliceName, doInterrupt: true, message: "hi" },
 			ctx(openBot),
 		);
-		expect(awaited.isError).toBe(true);
+		expect(interrupting.isError).toBe(true);
 	});
 
 	test("never asks for approval from a bot, and is not auto-allowed for others", async () => {

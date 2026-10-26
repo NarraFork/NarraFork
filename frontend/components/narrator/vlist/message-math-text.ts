@@ -8,7 +8,7 @@
  * live output do not have it:
  *
  *   - the STREAMING row is built by `buildStreamingMsg`, which sets
- *     `contentText: null` outright and carries its text in `contentJson` blocks;
+ *     `contentText: null` outright and carries its text in its blocks;
  *   - an APPENDED broadcast message carries the same block shape.
  *
  * So a scan keyed on `contentText` reports "no math" for exactly the messages whose
@@ -23,6 +23,7 @@
  */
 
 import type { TreeMessage } from "@frontend/lib/api/types";
+import { messageBody } from "@shared/narrator-blocks/message-blocks";
 
 /**
  * Text fields on a content block that reach a markdown measure.
@@ -50,7 +51,7 @@ function collectFromMessage(message: TreeMessage, out: CandidateText[]): void {
 	// `contentText` first: for a fetched message it is the whole visible body, so the
 	// common case usually finds its math on the first string tested.
 	if (message.contentText) push(message.contentText);
-	const blocks = Array.isArray(message.contentJson) ? message.contentJson : [];
+	const blocks = messageBody(message);
 	for (const block of blocks) {
 		if (block == null || typeof block !== "object") continue;
 		for (const key of TEXT_KEYS) {

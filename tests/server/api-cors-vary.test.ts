@@ -22,7 +22,6 @@
 
 import { describe, expect, test } from "bun:test";
 import { normalizeConfiguredOrigins, resolveAllowedCorsOrigin } from "@server/lib/cors-origin";
-import { SESSION_RENEWAL_HEADER } from "@shared/session-auth";
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 
@@ -56,7 +55,7 @@ function buildApp(): Hono {
 					}) ?? undefined
 				);
 			},
-			exposeHeaders: [SESSION_RENEWAL_HEADER],
+			exposeHeaders: ["Content-Disposition"],
 		}),
 	);
 

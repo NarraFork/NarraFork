@@ -743,6 +743,7 @@ export const narratorMessages = pgTable(
 		bodyBytes: integer("body_bytes").notNull().default(0),
 		stateRevision: integer("state_revision").notNull().default(0),
 		bodyRowsOnly: integer("body_rows_only").notNull().default(0),
+		blocksContentHash: text("blocks_content_hash"),
 		createdAt: text("created_at").notNull(),
 	},
 	(table) => [
@@ -932,6 +933,7 @@ export const narratorBlocks = pgTable(
 		state: jsonText("state"),
 		providerMeta: jsonText("provider_meta"),
 		originalPayload: jsonText("original_payload"),
+		ledgerRevision: text("ledger_revision"),
 	},
 	(table) => [
 		uniqueIndex("idx_blocks_message_ordinal").on(table.messageId, table.ordinal),
@@ -1000,6 +1002,14 @@ export const narratorBlockSyncQueue = pgTable("narrator_block_sync_queue", {
 		.primaryKey()
 		.notNull()
 		.references((): PgColumn => narratorMessages.id, { onDelete: "cascade" }),
+});
+
+export const narratorBlockIndexQueue = pgTable("narrator_block_index_queue", {
+	blockId: text("block_id")
+		.primaryKey()
+		.notNull()
+		.references((): PgColumn => narratorBlocks.id, { onDelete: "cascade" }),
+	version: integer("version").notNull().default(0),
 });
 
 export const narratorTextSnapshots = pgTable("narrator_text_snapshots", {
@@ -1357,6 +1367,28 @@ export const users = pgTable("users", {
 	mfaEnabled: boolean("mfa_enabled").notNull().default(false),
 	createdAt: text("created_at").notNull(),
 });
+
+export const authSessions = pgTable(
+	"auth_sessions",
+	{
+		id: text("id").primaryKey().notNull(),
+		userId: text("user_id")
+			.notNull()
+			.references((): PgColumn => users.id, { onDelete: "cascade" }),
+		tokenHash: text("token_hash").notNull(),
+		tokenVersion: integer("token_version").notNull().default(0),
+		sessionStart: bigint("session_start", { mode: "number" }).notNull(),
+		createdAt: bigint("created_at", { mode: "number" }).notNull(),
+		expiresAt: bigint("expires_at", { mode: "number" }).notNull(),
+		revokedAt: bigint("revoked_at", { mode: "number" }),
+	},
+	(table) => [
+		uniqueIndex("idx_auth_sessions_token_hash").on(table.tokenHash),
+		index("idx_auth_sessions_user").on(table.userId),
+		index("idx_auth_sessions_expires").on(table.expiresAt),
+		index("idx_auth_sessions_revoked").on(table.revokedAt),
+	],
+);
 
 export const userGitIdentities = pgTable(
 	"user_git_identities",
@@ -2039,6 +2071,7 @@ export const apiRequests = pgTable(
 		provider: text("provider"),
 		credentialId: text("credential_id"),
 		model: text("model"),
+		tokenAccountingVersion: integer("token_accounting_version"),
 		inputTokens: integer("input_tokens").notNull().default(0),
 		outputTokens: integer("output_tokens").notNull().default(0),
 		cachedInputTokens: integer("cached_input_tokens").notNull().default(0),
@@ -2066,6 +2099,9 @@ export const apiRequests = pgTable(
 		index("idx_api_requests_provider").on(table.provider, table.createdAt),
 		index("idx_api_requests_kind").on(table.kind, table.createdAt),
 		index("idx_api_requests_created").on(table.createdAt, table.id),
+		index("idx_api_requests_token_accounting_pending")
+			.on(table.createdAt, table.id)
+			.where(sql.raw('"token_accounting_version" IS NULL')),
 		index("idx_api_requests_user_created").on(table.userId, table.createdAt, table.id),
 		index("idx_api_requests_recording").on(table.recordingRequestId),
 		index("idx_api_requests_credential").on(table.credentialId, table.createdAt),
@@ -3857,8 +3893,8 @@ export const notifications = pgTable(
 );
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
-  "tableCount": 124,
-  "columnCount": 1663,
+  "tableCount": 126,
+  "columnCount": 1676,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -8128,6 +8164,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "defaultExpression": "0"
         },
         {
+          "property": "blocksContentHash",
+          "name": "blocks_content_hash",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
           "property": "createdAt",
           "name": "created_at",
           "kind": "text",
@@ -9309,6 +9354,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "notNull": false,
           "primary": false,
           "unique": false
+        },
+        {
+          "property": "ledgerRevision",
+          "name": "ledger_revision",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
         }
       ],
       "indexes": [
@@ -9501,6 +9555,45 @@ export const POSTGRES_SCHEMA_COVERAGE = {
             "constraintName": "narrator_block_sync_queue_message_id_narrator_messages_id_fk"
           },
           "emitAsTableConstraint": false
+        }
+      ],
+      "indexes": [],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "narratorBlockIndexQueue",
+      "name": "narrator_block_index_queue",
+      "columns": [
+        {
+          "property": "blockId",
+          "name": "block_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false,
+          "references": {
+            "table": "narratorBlocks",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "narrator_block_index_queue_block_id_narrator_blocks_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "version",
+          "name": "version",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
         }
       ],
       "indexes": [],
@@ -11617,6 +11710,128 @@ export const POSTGRES_SCHEMA_COVERAGE = {
         }
       ],
       "indexes": [],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "authSessions",
+      "name": "auth_sessions",
+      "columns": [
+        {
+          "property": "id",
+          "name": "id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "userId",
+          "name": "user_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "users",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "auth_sessions_user_id_users_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "tokenHash",
+          "name": "token_hash",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "tokenVersion",
+          "name": "token_version",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
+        },
+        {
+          "property": "sessionStart",
+          "name": "session_start",
+          "kind": "integer",
+          "pgType": "bigint",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "integer",
+          "pgType": "bigint",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "expiresAt",
+          "name": "expires_at",
+          "kind": "integer",
+          "pgType": "bigint",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "revokedAt",
+          "name": "revoked_at",
+          "kind": "integer",
+          "pgType": "bigint",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_auth_sessions_token_hash",
+          "columns": [
+            "tokenHash"
+          ],
+          "unique": true
+        },
+        {
+          "name": "idx_auth_sessions_user",
+          "columns": [
+            "userId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_auth_sessions_expires",
+          "columns": [
+            "expiresAt"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_auth_sessions_revoked",
+          "columns": [
+            "revokedAt"
+          ],
+          "unique": false
+        }
+      ],
       "checks": [],
       "checkDefinitions": [],
       "foreignKeys": [],
@@ -15241,6 +15456,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "property": "tokenAccountingVersion",
+          "name": "token_accounting_version",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
           "property": "inputTokens",
           "name": "input_tokens",
           "kind": "integer",
@@ -15476,6 +15700,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
             "id"
           ],
           "unique": false
+        },
+        {
+          "name": "idx_api_requests_token_accounting_pending",
+          "columns": [
+            "createdAt",
+            "id"
+          ],
+          "unique": false,
+          "predicate": "\"token_accounting_version\" IS NULL"
         },
         {
           "name": "idx_api_requests_user_created",

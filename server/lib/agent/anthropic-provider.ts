@@ -61,6 +61,7 @@ import {
 	sanitizeHeaders,
 } from "./request-dump";
 import { parseJsonResponseWithBody } from "./response-body";
+import type { StreamProgress } from "./stream-progress";
 import { ToolInputStream, toolInputStreamFor } from "./tool-input-stream";
 import type { ToolLoadingChange, ToolLoadingStrategy, ToolLoadingTarget } from "./tool-loading";
 import { resolveToolJsonSchema } from "./tool-registry";
@@ -1454,6 +1455,7 @@ export class AnthropicProvider implements ProviderAdapter {
 		path: string,
 		init: RequestInit,
 		collector?: ApiRequestDumpCollector,
+		progress?: StreamProgress,
 	): Promise<Response> {
 		const baseUrl = this.getBaseUrl();
 		const url = `${baseUrl}${path}`;
@@ -1467,14 +1469,16 @@ export class AnthropicProvider implements ProviderAdapter {
 				headers: sanitizeHeaders(requestInit.headers as Record<string, string>),
 				bodyText: typeof requestInit.body === "string" ? requestInit.body : undefined,
 			});
+			progress?.beginAttempt();
 			try {
 				const response = await this.pfetch(actualUrl, requestInit);
+				progress?.onHeaders(response.status);
 				collector?.setResponseMeta({
 					status: response.status,
 					headers: sanitizeHeaders(response.headers),
 				});
-				if (!collector || !response.body) return response;
-				const tap = captureResponseStream(response.body, collector);
+				if ((!collector && !progress) || !response.body) return response;
+				const tap = captureResponseStream(response.body, collector, progress);
 				return new Response(tap.stream, {
 					status: response.status,
 					statusText: response.statusText,
@@ -1917,6 +1921,7 @@ export class AnthropicProvider implements ProviderAdapter {
 				signal: params.signal,
 			},
 			params.requestDump,
+			params.streamProgress,
 		);
 		try {
 			if (!response.ok) {

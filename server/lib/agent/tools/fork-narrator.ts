@@ -148,6 +148,7 @@ export const forkNarratorTool: ToolDefinition = {
 				userId: ctx.userId ?? null,
 				model,
 				locale: ctx.locale,
+				callingToolCallId: ctx.toolCallBinding?.toolCallId,
 			});
 			const newNarratorId = newNarrator.id;
 			const newTitle = newNarrator.title ?? title ?? "Forked narrator";

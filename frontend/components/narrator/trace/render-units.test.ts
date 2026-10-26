@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { messageBody, rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { segmentMessages } from "../message/message-segments";
 import type { NarratorMsg } from "../narrator-panel-types";
 import { groupRenderUnits, groupToolRunItemsForLod } from "./render-units";
@@ -9,41 +10,43 @@ function toolMessage(
 	reasoningText: string,
 	opts: { status?: string } = {},
 ): NarratorMsg {
-	return {
-		id: messageId,
-		narratorId: "narrator-1",
-		parentToolUseId: null,
-		role: "assistant",
-		contentJson: [
+	return rowWithElements(
+		{
+			id: messageId,
+			narratorId: "narrator-1",
+			parentToolUseId: null,
+			role: "assistant",
+			contentText: null,
+			toolCalls: [
+				{
+					id: `call-${toolUseId}`,
+					toolUseId,
+					toolName: "Read",
+					status: opts.status ?? "success",
+				},
+			],
+			createdAt: "2026-07-19T00:00:00.000Z",
+		},
+		[
 			{ type: "reasoning", text: reasoningText },
 			{ type: "tool_use", id: toolUseId, name: "Read", input: { file_path: "a.ts" } },
 		],
-		contentText: null,
-		toolCalls: [
-			{
-				id: `call-${toolUseId}`,
-				toolUseId,
-				toolName: "Read",
-				status: opts.status ?? "success",
-			},
-		],
-		children: [],
-		createdAt: "2026-07-19T00:00:00.000Z",
-	} as NarratorMsg;
+	) as NarratorMsg;
 }
 
 function userMessage(messageId: string): NarratorMsg {
-	return {
-		id: messageId,
-		narratorId: "narrator-1",
-		parentToolUseId: null,
-		role: "user",
-		contentJson: [{ type: "text", text: "hi" }],
-		contentText: "hi",
-		toolCalls: [],
-		children: [],
-		createdAt: "2026-07-19T00:00:00.000Z",
-	} as NarratorMsg;
+	return rowWithElements(
+		{
+			id: messageId,
+			narratorId: "narrator-1",
+			parentToolUseId: null,
+			role: "user",
+			contentText: "hi",
+			toolCalls: [],
+			createdAt: "2026-07-19T00:00:00.000Z",
+		},
+		[{ type: "text", text: "hi" }],
+	) as NarratorMsg;
 }
 
 function toolRunItems(statuses: string[]) {
@@ -129,12 +132,18 @@ describe("groupToolRunItemsForLod", () => {
 							status: "success",
 						},
 					];
-					(msg.contentJson as unknown[])[1] = {
-						type: "tool_use",
-						id: "ask-1",
-						name: "AskUserQuestion",
-						input: { questions: [{ header: "Approach?", options: [] }] },
-					};
+					Object.assign(
+						msg,
+						rowWithElements(
+							msg,
+							messageBody(msg).with(1, {
+								type: "tool_use",
+								id: "ask-1",
+								name: "AskUserQuestion",
+								input: { questions: [{ header: "Approach?", options: [] }] },
+							}),
+						),
+					);
 					return msg;
 				})(),
 				toolMessage("message-2", "tool-2", "", { status: "success" }),
@@ -163,12 +172,18 @@ describe("groupToolRunItemsForLod", () => {
 				permissionDenyMessage: "please split step two",
 			},
 		];
-		(deniedPlan.contentJson as unknown[])[1] = {
-			type: "tool_use",
-			id: "plan-1",
-			name: "ExitPlanMode",
-			input: { plan: "# Plan\\n\\nThe plan was rejected." },
-		};
+		Object.assign(
+			deniedPlan,
+			rowWithElements(
+				deniedPlan,
+				messageBody(deniedPlan).with(1, {
+					type: "tool_use",
+					id: "plan-1",
+					name: "ExitPlanMode",
+					input: { plan: "# Plan\\n\\nThe plan was rejected." },
+				}),
+			),
+		);
 		const units = groupRenderUnits(
 			segmentMessages([
 				toolMessage("message-0", "tool-0", "", { status: "success" }),
@@ -189,14 +204,17 @@ describe("groupToolRunItemsForLod", () => {
 describe("communication remains chronological conversation content", () => {
 	function communicationMessage(messageId: string, status = "success"): NarratorMsg {
 		const msg = toolMessage(messageId, "send-1", "", { status });
-		msg.contentJson = [
-			{
-				type: "tool_use",
-				id: "send-1",
-				name: "Send",
-				input: { name: "worker", message: "**hello**" },
-			},
-		];
+		Object.assign(
+			msg,
+			rowWithElements(msg, [
+				{
+					type: "tool_use",
+					id: "send-1",
+					name: "Send",
+					input: { name: "worker", message: "**hello**" },
+				},
+			]),
+		);
 		msg.toolCalls = msg.toolCalls.map((tc) => ({ ...tc, toolName: "Send" }));
 		return msg;
 	}
@@ -357,21 +375,24 @@ describe("groupRenderUnits (L1/L2 unified activity fold)", () => {
 	});
 
 	test("text content flushes the activity group (text is NOT folded)", () => {
-		const msgWithText: NarratorMsg = {
-			id: "message-text",
-			narratorId: "narrator-1",
-			parentToolUseId: null,
-			role: "assistant",
-			contentJson: [
+		const msgWithText: NarratorMsg = rowWithElements(
+			{
+				id: "message-text",
+				narratorId: "narrator-1",
+				parentToolUseId: null,
+				role: "assistant",
+				contentText: "answer body",
+				toolCalls: [
+					{ id: "call-tool-x", toolUseId: "tool-x", toolName: "Read", status: "success" },
+				],
+				createdAt: "2026-07-19T00:00:00.000Z",
+			},
+			[
 				{ type: "reasoning", text: "thinking" },
 				{ type: "text", text: "answer body" },
 				{ type: "tool_use", id: "tool-x", name: "Read", input: { file_path: "a.ts" } },
 			],
-			contentText: "answer body",
-			toolCalls: [{ id: "call-tool-x", toolUseId: "tool-x", toolName: "Read", status: "success" }],
-			children: [],
-			createdAt: "2026-07-19T00:00:00.000Z",
-		} as NarratorMsg;
+		) as NarratorMsg;
 		const segments = segmentMessages([
 			toolMessage("message-1", "tool-1", "thought one"),
 			msgWithText,
@@ -393,28 +414,29 @@ describe("groupRenderUnits (L1/L2 unified activity fold)", () => {
 	});
 
 	test("extracts reasoning from a mixed reasoning/text segment without folding the text", () => {
-		const mixedMessage: NarratorMsg = {
-			id: "message-mixed",
-			narratorId: "narrator-1",
-			parentToolUseId: null,
-			role: "assistant",
-			contentJson: [
+		const mixedMessage: NarratorMsg = rowWithElements(
+			{
+				id: "message-mixed",
+				narratorId: "narrator-1",
+				parentToolUseId: null,
+				role: "assistant",
+				contentText: "visible answer body",
+				toolCalls: [
+					{
+						id: "call-tool-mixed",
+						toolUseId: "tool-mixed",
+						toolName: "Read",
+						status: "success",
+					},
+				],
+				createdAt: "2026-07-19T00:00:00.000Z",
+			},
+			[
 				{ type: "reasoning", text: "reasoning before the answer" },
 				{ type: "text", text: "visible answer body" },
 				{ type: "tool_use", id: "tool-mixed", name: "Read", input: { file_path: "a.ts" } },
 			],
-			contentText: "visible answer body",
-			toolCalls: [
-				{
-					id: "call-tool-mixed",
-					toolUseId: "tool-mixed",
-					toolName: "Read",
-					status: "success",
-				},
-			],
-			children: [],
-			createdAt: "2026-07-19T00:00:00.000Z",
-		} as NarratorMsg;
+		) as NarratorMsg;
 
 		const segments = segmentMessages([mixedMessage]);
 		expect(segments.map((segment) => segment.kind)).toEqual(["message", "tool-run"]);
@@ -474,17 +496,18 @@ describe("groupRenderUnits (L1/L2 unified activity fold)", () => {
 		// gains a real id when stored, so an id-derived key would change at the
 		// hand-off and React would rebuild a row whose content merely settled.
 		const reasoningMessage = (id: string): NarratorMsg =>
-			({
-				id,
-				narratorId: "narrator-1",
-				parentToolUseId: null,
-				role: "assistant",
-				contentJson: [{ type: "reasoning", text: "weighing the options" }],
-				contentText: null,
-				toolCalls: [],
-				children: [],
-				createdAt: "2026-07-19T00:00:00.000Z",
-			}) as NarratorMsg;
+			rowWithElements(
+				{
+					id,
+					narratorId: "narrator-1",
+					parentToolUseId: null,
+					role: "assistant",
+					contentText: null,
+					toolCalls: [],
+					createdAt: "2026-07-19T00:00:00.000Z",
+				},
+				[{ type: "reasoning", text: "weighing the options" }],
+			) as NarratorMsg;
 
 		const liveUnits = groupRenderUnits(segmentMessages([reasoningMessage("__streaming__")]), true);
 		const persistedUnits = groupRenderUnits(segmentMessages([reasoningMessage("real-id")]), true);
@@ -535,17 +558,18 @@ describe("groupRenderUnits (L1/L2 unified activity fold)", () => {
 	});
 
 	test("pure reasoning message (no tool) still folds into an activity unit", () => {
-		const reasoningOnly: NarratorMsg = {
-			id: "message-r",
-			narratorId: "narrator-1",
-			parentToolUseId: null,
-			role: "assistant",
-			contentJson: [{ type: "reasoning", text: "just thinking" }],
-			contentText: null,
-			toolCalls: [],
-			children: [],
-			createdAt: "2026-07-19T00:00:00.000Z",
-		} as NarratorMsg;
+		const reasoningOnly: NarratorMsg = rowWithElements(
+			{
+				id: "message-r",
+				narratorId: "narrator-1",
+				parentToolUseId: null,
+				role: "assistant",
+				contentText: null,
+				toolCalls: [],
+				createdAt: "2026-07-19T00:00:00.000Z",
+			},
+			[{ type: "reasoning", text: "just thinking" }],
+		) as NarratorMsg;
 		const segments = segmentMessages([reasoningOnly]);
 		const units = groupRenderUnits(segments, true);
 		expect(units).toHaveLength(1);
@@ -559,7 +583,10 @@ describe("groupRenderUnits (L1/L2 unified activity fold)", () => {
 		for (const status of ["running", "executing", "success"]) {
 			for (const type of ["question", "agent", "bash"]) {
 				const wait = toolMessage("wait-message", "wait", "");
-				wait.contentJson = [{ type: "tool_use", id: "wait", name: "Await", input: {} }];
+				Object.assign(
+					wait,
+					rowWithElements(wait, [{ type: "tool_use", id: "wait", name: "Await", input: {} }]),
+				);
 				const call = wait.toolCalls?.[0];
 				if (!call) throw new Error("Missing fixture tool call");
 				wait.toolCalls = [{ ...call, toolName: "Await", status, inputJson: { type, id: "q1" } }];
@@ -614,25 +641,26 @@ describe("groupRenderUnits (L1/L2 unified activity fold)", () => {
 	 */
 	test("a kept call does NOT drag its sibling calls out of the fold", () => {
 		// One message issuing three calls in a single run; only the middle is kept.
-		const runMessage: NarratorMsg = {
-			id: "message-run",
-			narratorId: "narrator-1",
-			parentToolUseId: null,
-			role: "assistant",
-			contentJson: [
+		const runMessage: NarratorMsg = rowWithElements(
+			{
+				id: "message-run",
+				narratorId: "narrator-1",
+				parentToolUseId: null,
+				role: "assistant",
+				contentText: null,
+				toolCalls: [
+					{ id: "call-a", toolUseId: "tool-a", toolName: "Read", status: "success" },
+					{ id: "call-pinned", toolUseId: "tool-pinned", toolName: "Write", status: "success" },
+					{ id: "call-c", toolUseId: "tool-c", toolName: "Bash", status: "success" },
+				],
+				createdAt: "2026-07-19T00:00:00.000Z",
+			},
+			[
 				{ type: "tool_use", id: "tool-a", name: "Read", input: { file_path: "a.ts" } },
 				{ type: "tool_use", id: "tool-pinned", name: "Write", input: { file_path: "b.ts" } },
 				{ type: "tool_use", id: "tool-c", name: "Bash", input: { command: "ls" } },
 			],
-			contentText: null,
-			toolCalls: [
-				{ id: "call-a", toolUseId: "tool-a", toolName: "Read", status: "success" },
-				{ id: "call-pinned", toolUseId: "tool-pinned", toolName: "Write", status: "success" },
-				{ id: "call-c", toolUseId: "tool-c", toolName: "Bash", status: "success" },
-			],
-			children: [],
-			createdAt: "2026-07-19T00:00:00.000Z",
-		} as NarratorMsg;
+		) as NarratorMsg;
 
 		const units = groupRenderUnits(segmentMessages([runMessage]), true, {
 			keepToolUseIds: new Set(["tool-pinned"]),
@@ -694,12 +722,18 @@ describe("groupRenderUnits (L1/L2 unified activity fold)", () => {
 						status: "success",
 					},
 				];
-				(msg.contentJson as unknown[])[1] = {
-					type: "tool_use",
-					id: "ask-1",
-					name: "AskUserQuestion",
-					input: { questions: [{ header: "Approach?", options: [] }] },
-				};
+				Object.assign(
+					msg,
+					rowWithElements(
+						msg,
+						messageBody(msg).with(1, {
+							type: "tool_use",
+							id: "ask-1",
+							name: "AskUserQuestion",
+							input: { questions: [{ header: "Approach?", options: [] }] },
+						}),
+					),
+				);
 				return msg;
 			})(),
 			toolMessage("message-2", "tool-2", ""),

@@ -48,12 +48,7 @@ describe("delegation templates compile to ordinary ceilings", () => {
 
 		for (const name of ["general", "explore", "plan", "review", "search", "missing"]) {
 			const caps = viaTraits(name).capabilities;
-			expect([caps.spawnAgent, caps.awaitAgent, caps.sendAwait, caps.planApproval]).toEqual([
-				false,
-				false,
-				false,
-				false,
-			]);
+			expect([caps.spawnAgent, caps.awaitAgent, caps.planApproval]).toEqual([false, false, false]);
 			expect(caps.askUserQuestion).toBe("disabled");
 			expect(caps.stopHooks).toBe(false);
 			expect(caps.switchWorkingDirectory).toBe(false);
@@ -233,5 +228,22 @@ describe("run registration", () => {
 		expect(
 			runDeliverToOf({ runtimeRegistrationJson: registerRun(null, "r", { deliverTo }, 0) }),
 		).toEqual(deliverTo);
+	});
+});
+
+describe("retired capabilities", () => {
+	test("a stored ceiling that still denies sendAwait parses and drops it", () => {
+		const stored = `${RUNTIME_POLICY_TRAIT_PREFIX}${Buffer.from(
+			JSON.stringify({ version: 1, deny: ["spawnAgent", "sendAwait", "planApproval"] }),
+			"utf-8",
+		).toString("base64url")}`;
+		const [trait] = parseRuntimePolicyTraits([stored]);
+		expect(trait?.deny).toEqual(["spawnAgent", "planApproval"]);
+		const policy = resolveRuntimePolicy([trait]);
+		expect(policy.capabilities.spawnAgent).toBe(false);
+		expect(policy.capabilities.awaitAgent).toBe(true);
+		// Re-encoding the parsed ceiling writes only current capabilities.
+		const [reparsed] = parseRuntimePolicyTraits(withRuntimePolicyTrait([], trait));
+		expect(reparsed?.deny).toEqual(["spawnAgent", "planApproval"]);
 	});
 });

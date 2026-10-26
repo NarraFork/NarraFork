@@ -23,6 +23,7 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "bun:test";
 import { resetAppBaseForTest, resolveServerUrl } from "@frontend/lib/base-path";
 import { MantineProvider } from "@mantine/core";
+import { rowWithElements } from "@shared/narrator-blocks/message-blocks";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { parseHTML } from "linkedom";
 import type { ReactNode } from "react";
@@ -96,12 +97,25 @@ function shareMessage(): NarratorMsg {
 		},
 	};
 	const inputJson = { path: "/tmp/report" };
-	return {
-		id: "a-share",
-		narratorId: "n1",
-		parentToolUseId: null,
-		role: "assistant",
-		contentJson: [
+	return rowWithElements(
+		{
+			id: "a-share",
+			narratorId: "n1",
+			parentToolUseId: null,
+			role: "assistant",
+			contentText: null,
+			toolCalls: [
+				{
+					toolUseId: "tu-share",
+					toolName: "ShareFile",
+					inputJson,
+					outputJson,
+					status: "completed",
+				},
+			],
+			createdAt: "2026-01-01T00:00:00Z",
+		},
+		[
 			{
 				type: "tool_use",
 				id: "tu-share",
@@ -112,19 +126,7 @@ function shareMessage(): NarratorMsg {
 				status: "completed",
 			},
 		],
-		contentText: null,
-		toolCalls: [
-			{
-				toolUseId: "tu-share",
-				toolName: "ShareFile",
-				inputJson,
-				outputJson,
-				status: "completed",
-			},
-		],
-		createdAt: "2026-01-01T00:00:00Z",
-		children: [],
-	} as unknown as NarratorMsg;
+	) as unknown as NarratorMsg;
 }
 
 function withProviders(node: ReactNode): Element {

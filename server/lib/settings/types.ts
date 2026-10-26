@@ -898,13 +898,6 @@ export interface NarraForkSettings {
 		 */
 		read: boolean;
 		/**
-		 * Whether clients may negotiate the block-keyed message protocol v2: page API
-		 * envelopes + blocks, block-level WS events (§8). A client opts in per
-		 * subscription; off, every connection gets v1 (the client handles both, so this
-		 * is the rollback switch).
-		 */
-		wsV2: boolean;
-		/**
 		 * Whether a block-format envelope written from now on keeps its body only in its
 		 * block rows: `content_json` holds `[]` and `body_rows_only` is set (P3b). Takes
 		 * effect only on SQLite with `write` and `read` on. Off: new envelopes keep the

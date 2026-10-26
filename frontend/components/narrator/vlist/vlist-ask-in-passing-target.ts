@@ -17,6 +17,7 @@
  * chunked card.
  */
 
+import { type MessageBodySource, messageBody } from "@shared/narrator-blocks/message-blocks";
 import type { VListElementKind } from "@shared/pretext-layout/element-kinds";
 
 /** Which sub-card a row is: an open question form, or a link to its answer. */
@@ -35,9 +36,8 @@ export interface VListAskInPassingTarget {
 }
 
 /** The minimal message shape this module reads. */
-interface SourceMessage {
+interface SourceMessage extends MessageBodySource {
 	id?: unknown;
-	contentJson?: unknown;
 }
 
 /**
@@ -63,9 +63,7 @@ export function readAskInPassingTargetNarratorId(
 ): string | null {
 	for (const msg of messages) {
 		if (msg.id !== messageId) continue;
-		const blocks = msg.contentJson;
-		if (!Array.isArray(blocks)) return null;
-		for (const block of blocks) {
+		for (const block of messageBody(msg)) {
 			if (block == null || typeof block !== "object") continue;
 			const candidate = block as { type?: unknown; targetNarratorId?: unknown };
 			if (candidate.type !== "ask_in_passing") continue;

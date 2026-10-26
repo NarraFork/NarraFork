@@ -63,11 +63,12 @@ import type { PgMaterializer } from "./agent-runtime/postgres-runtime-queue";
 import { backgroundOccupancyStore } from "./background-occupancy-store";
 import {
 	contentByAttempt,
-	flushChangedEnvelopes,
+	flushQueuedSince,
 	newEnvelopeColumns,
 	patchEnvelopeState,
 	type SyncMode,
 	syncEnvelopeNow,
+	syncQueueMark,
 } from "./narrator-block-sync";
 import { bodyColumns, fillBodies, fillBody } from "./narrator-body-reads";
 import {
@@ -1328,6 +1329,7 @@ async function appendPersistedMessage(
 	const created = await withDbRetry(
 		async () =>
 			db.transaction((tx) => {
+				const queueMark = syncQueueMark();
 				let seq = 0;
 				// The blocks commit with the envelope and the rows that belong to it.
 				const created = insertEnvelope(
@@ -1345,7 +1347,7 @@ async function appendPersistedMessage(
 						},
 					},
 				);
-				flushChangedEnvelopes();
+				flushQueuedSince(queueMark);
 				return { ...created, seq };
 			}),
 		{ label: "appendPersistedMessage", maxRetries: 5 },
@@ -2518,6 +2520,7 @@ const sqliteNarratorPersistence = {
 		// No await between reading and replacing the JSON body: a concurrent checkpoint
 		// or translation must not overwrite a newer revision read by another consumer.
 		const persisted = db.transaction((tx) => {
+			const queueMark = syncQueueMark();
 			const existing = fillBody(
 				tx.query.narratorMessages
 					.findFirst({
@@ -2657,7 +2660,7 @@ const sqliteNarratorPersistence = {
 				writeLedgerRow();
 				syncEnvelopeNow(messageId, "streaming", stamp);
 			}
-			flushChangedEnvelopes();
+			flushQueuedSince(queueMark);
 			return existing;
 		});
 		if (!persisted) return undefined;
@@ -3738,6 +3741,7 @@ const sqliteNarratorPersistence = {
 				(await findExecutionSegmentParent(narratorId))?.executionSegmentId ?? null;
 			// The new attempt and its execution segment are one transaction.
 			const toolCall = db.transaction((tx) => {
+				const queueMark = syncQueueMark();
 				const latest = tx.query.narratorToolCalls
 					.findFirst({
 						where: and(
@@ -3785,7 +3789,7 @@ const sqliteNarratorPersistence = {
 					.returning()
 					.all();
 				// The new attempt reopens its tool block in the same commit.
-				flushChangedEnvelopes();
+				flushQueuedSince(queueMark);
 				return created;
 			});
 			return {
@@ -4018,6 +4022,7 @@ const sqliteNarratorPersistence = {
 			if (messageId) conditions.push(eq(narratorToolCalls.messageId, messageId));
 		}
 		const affectedToolCalls = db.transaction((tx) => {
+			const queueMark = syncQueueMark();
 			const updated = tx
 				.update(narratorToolCalls)
 				.set({
@@ -4062,7 +4067,7 @@ const sqliteNarratorPersistence = {
 				for (const row of updated) overwriteToolInputTx(tx, row.id, toolUseId, result.input);
 			result.onPersist?.(tx);
 			// The settled tool block (phase, binding, searchable result) commits with it.
-			flushChangedEnvelopes();
+			flushQueuedSince(queueMark);
 			return updated;
 		});
 
@@ -4240,8 +4245,9 @@ const sqliteNarratorPersistence = {
 		const now = new Date().toISOString();
 		const refreshedRecipients: string[] = [];
 		const result = db.transaction((tx) => {
+			const queueMark = syncQueueMark();
 			const id = rewrite(tx);
-			flushChangedEnvelopes();
+			flushQueuedSince(queueMark);
 			options.afterWrite?.(tx, id);
 			return id;
 		});
@@ -4464,16 +4470,18 @@ const sqliteNarratorPersistence = {
 		);
 		// The step is complete: items it left incomplete are interrupted, not streaming.
 		db.transaction((tx) => {
+			const queueMark = syncQueueMark();
 			updateEnvelope(tx, messageId, updates, { mode: "sealed" });
-			flushChangedEnvelopes();
+			flushQueuedSince(queueMark);
 		});
 	},
 
 	/** Seal a step's blocks without changing its metadata (a kept partial after a stop). */
 	sealStepBlocks(messageId: string): void {
 		db.transaction(() => {
+			const queueMark = syncQueueMark();
 			syncEnvelopeNow(messageId, "sealed");
-			flushChangedEnvelopes();
+			flushQueuedSince(queueMark);
 		});
 	},
 
@@ -4485,11 +4493,12 @@ const sqliteNarratorPersistence = {
 		contentText: string | null,
 	): Promise<void> {
 		db.transaction((tx) => {
+			const queueMark = syncQueueMark();
 			writeEnvelopeBody(tx, messageId, content, {
 				set: { contextCharsJson: measureMessageCharacters("assistant", content, contentText) },
 				mode: "sealed",
 			});
-			flushChangedEnvelopes();
+			flushQueuedSince(queueMark);
 		});
 		queueContextCharacterRefresh(narratorId, messageId);
 	},

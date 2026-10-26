@@ -283,7 +283,7 @@ export interface ReasoningGroupingOptions {
  * on the complete message rather than only the currently rendered segment.
  */
 export function groupReasoningRuns(
-	blocks: ContentBlockLike[],
+	blocks: readonly ContentBlockLike[],
 	opts: ReasoningGroupingOptions = {},
 ): ReasoningGrouping {
 	const runs: ReasoningRun[] = [];

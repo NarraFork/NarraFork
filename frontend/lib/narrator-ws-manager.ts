@@ -10,6 +10,7 @@
  * dedicated connection via `useTerminalWS`.
  */
 
+import { type MessageBodySource, messageBody } from "@shared/narrator-blocks/message-blocks";
 import type { CatchUpChildAnchor, CatchUpCursor } from "@shared/narrator-catch-up";
 import { MAX_CATCH_UP_CHILD_ANCHORS } from "@shared/narrator-catch-up";
 import {
@@ -94,12 +95,11 @@ interface ListenerEntry {
 
 type ConnectionChangeCallback = (connected: boolean, isReconnect: boolean) => void;
 
-type MinimalTreeMessage = {
+type MinimalTreeMessage = MessageBodySource & {
 	id?: unknown;
 	narratorId?: unknown;
 	parentToolUseId?: unknown;
 	toolCalls?: unknown;
-	contentJson?: unknown;
 };
 
 /**
@@ -170,12 +170,10 @@ function extractToolUseIds(message: MinimalTreeMessage): string[] {
 			}
 		}
 	}
-	if (Array.isArray(message.contentJson)) {
-		for (const block of message.contentJson) {
-			if (block && typeof block === "object") {
-				const record = block as { type?: unknown; id?: unknown };
-				if (record.type === "tool_use" && typeof record.id === "string") ids.add(record.id);
-			}
+	for (const block of messageBody(message)) {
+		if (block && typeof block === "object") {
+			const record = block as { type?: unknown; id?: unknown };
+			if (record.type === "tool_use" && typeof record.id === "string") ids.add(record.id);
 		}
 	}
 	return [...ids];
@@ -370,12 +368,12 @@ export function decideNarratorForegroundRecovery(opts: {
 // ── Share-auth mode ─────────────────────────────────────────────────────────
 // The anonymous public-share page rides THIS manager (same /ws/narrator channel,
 // same event fan-out) but authenticates with the share credential instead of the
-// session JWT. The mode is process-wide and deliberately trivial: the public
+// session token. The mode is process-wide and deliberately trivial: the public
 // route never mounts the authenticated shell, so the two modes never coexist.
 let shareAuth: { shareId: string; token: string } | null = null;
 
 /**
- * Switch the manager's credential to a public share (or back to the session JWT
+ * Switch the manager's credential to a public share (or back to the session token
  * with `null`). Reconnects so the socket re-opens under the new credential.
  */
 export function setNarratorWSShareAuth(auth: { shareId: string; token: string } | null): void {
@@ -1585,9 +1583,9 @@ export class NarratorWSManager {
 			// supervisor), and it is usually back within seconds, so run a fresh
 			// backoff cycle instead of stranding the client until a visibility or
 			// network event happens to fire.
-			// 4001 = the session token this socket was opened with expired. HTTP
-			// sliding renewal has very likely already stored a fresh one, so retry
-			// immediately with whatever is in localStorage instead of backing off.
+			// 4001 = the session this socket was opened with ended. Retry immediately
+			// with whatever is in localStorage: after a re-login that is the new token,
+			// otherwise the upgrade fails and the app falls back to its login flow.
 			if (
 				ev.code === SESSION_EXPIRED_CLOSE_CODE ||
 				ev.code === SERVER_SHUTDOWN_CLOSE_CODE ||
@@ -1976,9 +1974,6 @@ export class NarratorWSManager {
 				type: "subscribe",
 				narratorIds: activeNarratorIds,
 				kind,
-				// Every message subscribe asks for the block-keyed protocol: the server keeps
-				// one protocol per connection and narrator, so all of them must agree.
-				protocol: 2,
 				...(requestId ? { requestId } : {}),
 			};
 			if (cursor) msg.catchUpCursor = cursor;
@@ -2002,7 +1997,6 @@ export class NarratorWSManager {
 					type: "subscribe",
 					narratorIds,
 					kind,
-					...(kind === "messages" ? { protocol: 2 } : {}),
 					...(requestId ? { requestId } : {}),
 					...(downgrade ? { downgrade: true } : {}),
 				}),

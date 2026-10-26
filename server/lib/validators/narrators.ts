@@ -1,4 +1,4 @@
-import { parseComposerDocument } from "@shared/composer-document";
+import { MAX_COMPOSER_QUOTE_CHARS, parseComposerDocument } from "@shared/composer-document";
 import { FILE_CHANGE_LIMITS } from "@shared/file-change-protocol";
 import {
 	HUMAN_ATTENTION_DEFAULT_PAGE_SIZE,
@@ -572,6 +572,21 @@ export const extractPrimarySchema = z.object({
 export const askInPassingSchema = z.object({
 	question: z.string().min(1).max(10000),
 	pendingMessageId: z.string().min(1),
+	/** Selected excerpt the question is about; sent to the fork ahead of the question. */
+	quote: z
+		.object({
+			label: z
+				.string()
+				.min(1)
+				.max(200)
+				.regex(/^\S[^\r\n]*$/u),
+			text: z.string().min(1).max(MAX_COMPOSER_QUOTE_CHARS),
+			anchor: z
+				.string()
+				.regex(/^[mt]:[A-Za-z0-9_-]{4,}$/u)
+				.optional(),
+		})
+		.optional(),
 });
 
 /** Resume error subagents listed on the post-error recovery card. */
@@ -710,33 +725,6 @@ export const suggestAnswersSchema = z.object({
 });
 
 export const MAX_BATCH_DELETE_BLOCKS = 200;
-
-export const batchDeleteBlocksSchema = z.object({
-	blocks: z
-		.array(
-			z.object({
-				messageId: z.string().min(1),
-				blockIndex: z.number().int().min(0),
-			}),
-		)
-		.min(1)
-		.max(MAX_BATCH_DELETE_BLOCKS)
-		.transform((blocks) => {
-			const seen = new Map<string, Set<number>>();
-			return blocks.filter(({ messageId, blockIndex }) => {
-				const indices = seen.get(messageId) ?? new Set<number>();
-				if (indices.has(blockIndex)) return false;
-				indices.add(blockIndex);
-				seen.set(messageId, indices);
-				return true;
-			});
-		}),
-	// When true, delete the blocks from history only, leaving files/spec untouched.
-	skipRevert: z.boolean().optional(),
-	// The narrator scope is the default and refuses on conflict, so the caller needs
-	// a way to ask for the wider one its error suggests.
-	scope: revertScopeSchema,
-});
 
 /** Block ids of one operation (docs/BLOCK_STORAGE-DESIGN.md §5.5): rows, or decoded ids. */
 export const blockIdsSchema = z

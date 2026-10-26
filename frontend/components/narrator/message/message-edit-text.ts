@@ -18,7 +18,7 @@ export const MAX_ASSISTANT_MESSAGE_EDIT_CHARS = 100_000;
  * open, and the display path shows a truncation notice instead).
  */
 export function collectTextBlocksPreview(
-	blocks: Array<{ type?: string; text?: unknown }>,
+	blocks: ReadonlyArray<{ type?: string; text?: unknown }>,
 	maxChars: number,
 ): { text: string; truncated: boolean } {
 	let result = "";
@@ -48,7 +48,7 @@ export function collectTextBlocksPreview(
  * `editMessageTooLarge` and must not open the editor.
  */
 export function resolveEditorInitialText(
-	blocks: Array<{ type?: string; text?: unknown }>,
+	blocks: ReadonlyArray<{ type?: string; text?: unknown }>,
 	role: "user" | "assistant",
 ): { text: string; truncated: boolean } {
 	const maxChars = role === "user" ? MAX_USER_MESSAGE_EDIT_CHARS : MAX_ASSISTANT_MESSAGE_EDIT_CHARS;

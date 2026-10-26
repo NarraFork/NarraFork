@@ -1095,6 +1095,38 @@ test.each([
 	}
 });
 
+test.each([
+	["error", ["error"], true],
+	["error", [], false],
+	["user_interrupt", ["error"], false],
+	["user_interrupt", ["error", "user_interrupt"], true],
+] as const)("agent message on a %s-stopped session wakes only with explicit resume %j", async (reason, resumeStopped, expected) => {
+	const narratorId = `mailbox-resume-${reason}-${resumeStopped.length}`;
+	seedNarrator(narratorId);
+	db.update(narrators).set({ lastStopReason: reason }).where(eq(narrators.id, narratorId)).run();
+	enqueueDelegatedReport(narratorId, "send");
+	try {
+		expect(await wakeInboxIfEligible(narratorId)).toBe(false);
+		expect(await wakeInboxIfEligible(narratorId, "en", { resumeStopped })).toBe(expected);
+		if (expected) {
+			await waitForIdle(narratorId);
+			expect(providerCalls).toHaveLength(1);
+			expect(db.select().from(narrators).where(eq(narrators.id, narratorId)).get()).toMatchObject({
+				lastStopReason: "normal",
+			});
+		}
+		expect(
+			db
+				.select()
+				.from(narratorBufferedMessages)
+				.where(eq(narratorBufferedMessages.narratorId, narratorId))
+				.get()?.state,
+		).toBe(expected ? "materialized" : "queued");
+	} finally {
+		closeNarrator(narratorId);
+	}
+});
+
 test("gates the synchronous pending-work probe on PostgreSQL", () => {
 	bindRuntimeQueue({ backend: "postgres", queue: {} as RuntimeQueuePort });
 	try {

@@ -193,6 +193,16 @@ storageRoutes.post("/database/cleanup", requireAdmin, async (c) => {
 });
 
 /**
+ * POST /api/storage/database/legacy-request-dumps/clear — Clear request dumps an upgrade kept
+ * when it deferred migration 0207's column rewrites (admin only).
+ */
+storageRoutes.post("/database/legacy-request-dumps/clear", requireAdmin, async (c) => {
+	const result = await databaseCleanupService.clearLegacyRequestDumps();
+	storageService.invalidateStorageCache();
+	return c.json(result);
+});
+
+/**
  * POST /api/storage/database/vacuum — Run SQLite VACUUM to release reusable free pages.
  *
  * This is a deliberate service-wide maintenance window, not ordinary CRUD: the

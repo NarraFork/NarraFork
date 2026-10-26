@@ -7,7 +7,10 @@
 
 import { Hono } from "hono";
 import { z } from "zod";
-import { resolveCommandCodeToken } from "../lib/commandcode-manager";
+import {
+	invalidateCommandCodeAuthCache,
+	resolveCommandCodeToken,
+} from "../lib/commandcode-manager";
 import { invalidateCommandCodeModelsCache, listCommandCodeModels } from "../lib/commandcode-models";
 import { CommandCodeUsageError, fetchCommandCodeUsage } from "../lib/commandcode-usage";
 import { logger } from "../lib/logger";
@@ -32,7 +35,8 @@ function usableDraftKey(value: string | undefined): string | undefined {
 
 /** GET /api/commandcode/status — 凭据是否可用。 */
 commandCodeRoutes.get("/status", (c) => {
-	const auth = resolveCommandCodeToken(settings.commandCode?.apiKey);
+	// 状态查询要能反映"刚在 CLI 里登录"，所以跳过凭据短缓存。
+	const auth = resolveCommandCodeToken(settings.commandCode?.apiKey, { fresh: true });
 	return c.json({
 		loggedIn: !!auth.credential,
 		userName: auth.credential?.userName,
@@ -42,7 +46,8 @@ commandCodeRoutes.get("/status", (c) => {
 
 /** GET /api/commandcode/usage — 额度；同时回报登录状态，让前端一次请求就能渲染。 */
 commandCodeRoutes.get("/usage", async (c) => {
-	const auth = resolveCommandCodeToken(settings.commandCode?.apiKey);
+	// 与 /status 同理：额度面板上的登录状态必须是当前的真实状态。
+	const auth = resolveCommandCodeToken(settings.commandCode?.apiKey, { fresh: true });
 	if (!auth.credential) {
 		return c.json({ loggedIn: false, reason: auth.reason });
 	}
@@ -85,6 +90,8 @@ commandCodeRoutes.post("/models/refresh", requireAdmin, async (c) => {
 	const apiKey = usableDraftKey(draft.apiKey) ?? settings.commandCode?.apiKey;
 	const baseUrl = draft.baseUrl?.trim() || settings.commandCode?.baseUrl;
 	invalidateCommandCodeModelsCache();
+	// 刷新也意味着"现在的凭据"，不要沿用短缓存里的旧 token。
+	invalidateCommandCodeAuthCache();
 	const result = await listCommandCodeModels(apiKey, baseUrl);
 	return c.json({ models: result.models, ok: result.ok }, result.ok ? 200 : 502);
 });

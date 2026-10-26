@@ -22,8 +22,8 @@ import {
 	type InlineComposerEditorHandle,
 	type InlineComposerSelectionBookmark,
 } from "./InlineComposerEditor";
-import { InlineQuoteCandidate } from "./InlineQuoteCandidate";
 import composerClasses from "./NarratorComposer.module.css";
+import { QuoteSelectionButton } from "./QuoteSelectionButton";
 import type { QuoteCandidate } from "./use-quote-candidate";
 
 const instance = i18next.createInstance();
@@ -58,7 +58,6 @@ function attachEditor(handle: InlineComposerEditorHandle | null) {
 	});
 }
 let externalDocument: (document: ComposerDocument) => void;
-let toggleCandidate: (show: boolean) => void;
 let updateResources: (resources: ReadonlyMap<string, File | string>) => void;
 let toggleDisabled: (disabled: boolean) => void;
 let toggleHydrating: (hydrating: boolean) => void;
@@ -74,20 +73,18 @@ let captureNextDrop = false;
 // While set, onChange emissions queue here instead of rendering: a parent lagging behind.
 let heldEchoes: ComposerDocument[] | null = null;
 const removed: string[] = [];
-const candidate: QuoteCandidate = {
+const candidate: Extract<QuoteCandidate, { kind: "text" }> = {
 	kind: "text",
 	key: "test",
 	quote: { label: "Selection", text: "Source text" },
 };
 function Fixture() {
 	const [value, setValue] = useState(initial);
-	const [show, setShow] = useState(false);
 	const [disabled, setDisabled] = useState(false);
 	const [hydrating, setHydrating] = useState(false);
 	toggleHydrating = setHydrating;
 	const [resources, setResources] = useState<ReadonlyMap<string, File | string>>(new Map());
 	externalDocument = setValue;
-	toggleCandidate = setShow;
 	updateResources = setResources;
 	toggleDisabled = setDisabled;
 	useEffect(() => {
@@ -119,26 +116,6 @@ function Fixture() {
 							attachmentsHydrating={hydrating}
 							disabled={disabled}
 							placeholder="Message"
-							candidate={
-								show
-									? {
-											key: candidate.key,
-											content: (
-												<InlineQuoteCandidate
-													candidate={candidate}
-													onAccept={() => {
-														accepted++;
-														setShow(false);
-													}}
-													onDismiss={() => {
-														dismissed++;
-														setShow(false);
-													}}
-												/>
-											),
-										}
-									: undefined
-							}
 							onRemoveAsset={(id) => removed.push(id)}
 							onOpenQuote={() => opened++}
 							onOpenImage={() => opened++}
@@ -203,9 +180,6 @@ export function insert(nodes: ComposerInlineNode[], assets?: ComposerAsset[]) {
 export function selection(start: number, end = start) {
 	editor.current?.setSelection(start, end);
 	editor.current?.focus();
-}
-export function showCandidate(show: boolean) {
-	toggleCandidate(show);
 }
 export function disable(disabled: boolean) {
 	toggleDisabled(disabled);
@@ -378,16 +352,20 @@ export function frameCandidate() {
 	const frameDocument = frame.contentDocument;
 	if (!frameDocument) throw new Error("Frame not ready");
 	const mount = frameDocument.createElement("div");
-	const anchor = frameDocument.createElement("div");
-	anchor.textContent = "Selected source";
-	frameDocument.body.append(anchor, mount);
+	const source = frameDocument.createElement("div");
+	source.textContent = "Selected source";
+	const composer = frameDocument.createElement("div");
+	composer.style.cssText = "margin-top: 80px; height: 40px";
+	frameDocument.body.append(source, composer, mount);
 	const range = frameDocument.createRange();
-	range.selectNodeContents(anchor);
+	range.selectNodeContents(source);
 	frameDocument.getSelection()?.addRange(range);
 	createRoot(mount).render(
 		<I18nextProvider i18n={instance}>
-			<InlineQuoteCandidate
-				candidate={candidate}
+			<QuoteSelectionButton
+				candidate={{ ...candidate, range }}
+				anchor={composer}
+				placement="selection"
 				onAccept={() => accepted++}
 				onDismiss={() => dismissed++}
 			/>

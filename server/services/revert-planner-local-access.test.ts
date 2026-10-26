@@ -170,8 +170,8 @@ async function seedFixture(owner: HttpFixtureLifetime) {
 			})
 			.run();
 	});
-	token = await createToken(userId, "user");
-	otherToken = await createToken(otherId, "user");
+	token = await createToken(userId);
+	otherToken = await createToken(otherId);
 	settings.workspace.treeSnapshotsEnabled = false;
 	runtime = await getDefaultLocalFileChangeRuntime();
 	owner.runtime = runtime;
@@ -2415,15 +2415,6 @@ describe("real requireAuth and conjunctive ACL", () => {
 		for (const endpoint of [`revert-plans/${plan.id}`, `revert-plans/${plan.id}/files`])
 			expect((await http(endpoint, "GET", undefined, otherToken)).status).toBe(404);
 		expect(history()).toBe(before);
-	});
-	test("existing JWT with a changed database role fails even through the session cache", async () => {
-		await fixture();
-		await http("revert-plans", "POST", request({ unexpected: true }));
-		db.update(schema.users).set({ role: "admin" }).where(eq(schema.users.id, userId)).run();
-		restorers.push(() => {
-			db.update(schema.users).set({ role: "user" }).where(eq(schema.users.id, userId)).run();
-		});
-		await refused(await prepare(), "REVERT_PREVIEW_AUTHENTICATION_CHANGED");
 	});
 	test("project gate cannot be bypassed by owning the narrator", async () => {
 		await fixture();
