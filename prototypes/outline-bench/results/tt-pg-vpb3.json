@@ -1,0 +1,3501 @@
+{
+ "label": "pg-vpb3",
+ "meta": {
+  "info": {
+   "blocks": 110000,
+   "pages": 51,
+   "versions": 330007,
+   "commits": 44588,
+   "members": 108520,
+   "versionsPerBlock": {
+    "mean": 3.0000636363636364,
+    "p50": 1,
+    "p90": 6,
+    "p99": 30,
+    "max": 295
+   },
+   "versionsPerCommit": {
+    "mean": 7.401251457791334,
+    "p50": 1,
+    "p95": 19,
+    "max": 9000
+   },
+   "avgContentBytes": 335,
+   "spaceMaxSeq": [
+    9268,
+    6217,
+    13965,
+    6270,
+    8868
+   ],
+   "flagCounts": {
+    "CREATED": 101776,
+    "CONTENT": 199031,
+    "MOVED": 5954,
+    "DELETED": 6526,
+    "RESTORED": 5932,
+    "TASK": 16567,
+    "PAGE": 988
+   }
+  },
+  "params": {
+   "seed": 1,
+   "spaces": 5,
+   "pagesPerSpace": 10,
+   "blocksPerPage": 2000,
+   "giantBlocks": 10000,
+   "vpb": 3,
+   "initialFraction": 0.9
+  }
+ },
+ "sizesBase": {
+  "outline_commits": 10158080,
+  "outline_blocks": 37224448,
+  "outline_block_versions": 136904704,
+  "outline_page_members": 10223616,
+  "outline_block_versions_pkey": 16424960,
+  "v_commit": 3981312,
+  "outline_commits_pkey": 1835008,
+  "c_space_seq": 2244608,
+  "outline_blocks_pkey": 4161536,
+  "outline_block_versions_toast": 52191232
+ },
+ "sizesByVariant": {
+  "A2": {
+   "ix_a2": 17997824
+  },
+  "B3": {
+   "ix_b3": 11739136
+  },
+  "B4": {
+   "ix_b4": 44982272,
+   "ix_b4p": 4497408
+  },
+  "B5": {
+   "ix_b5": 43352064
+  },
+  "C": {
+   "ix_c": 1245184
+  }
+ },
+ "verifyReport": {
+  "p2000:Q2 page@T": {
+   "variants": [
+    "A2",
+    "B3",
+    "B4",
+    "B5",
+    "C"
+   ],
+   "samples": 60,
+   "mismatches": {
+    "A2": 0,
+    "B3": 0,
+    "B4": 0,
+    "B5": 0,
+    "C": 0
+   }
+  }
+ },
+ "plans": {
+  "pg-vpb3/A2/page2000": "Nested Loop (actual rows=1802 loops=1)\n  Buffers: shared hit=11963 read=2361\n  CTE tree\n    ->  Recursive Union (actual rows=1802 loops=1)\n          Buffers: shared hit=5927 read=1189\n          ->  Index Scan using outline_block_versions_pkey on outline_block_versions x (actual rows=1 loops=1)\n                Index Cond: ((block_id = 'Yfw-0tIkNL0fa5k-PN3zS'::text) AND (from_seq <= '1122'::bigint))\n                Filter: ((to_max > '1122'::bigint) AND (deleted = 0))\n                Buffers: shared hit=1 read=3\n          ->  Nested Loop (actual rows=164 loops=11)\n                Buffers: shared hit=5926 read=1186\n                ->  WorkTable Scan on tree tr_1 (actual rows=164 loops=11)\n                      Filter: (depth < 64)\n                ->  Index Scan using ix_a2 on outline_block_versions c (actual rows=1 loops=1802)\n                      Index Cond: ((parent_id = tr_1.block_id) AND (from_seq <= '1122'::bigint) AND (to_max > '1122'::bigint))\n                      Filter: (deleted = 0)\n                      Buffers: shared hit=5926 read=1186\n  ->  CTE Scan on tree tr (actual rows=1802 loops=1)\n        Buffers: shared hit=5927 read=1189\n  ->  Index Scan using outline_block_versions_pkey on outline_block_versions v (actual rows=1 loops=1802)\n        Index Cond: ((block_id = tr.block_id) AND (from_seq = tr.from_seq))\n        Buffers: shared hit=6036 read=1172\nPlanning:\n  Buffers: shared hit=57 read=1\nPlanning Time: 0.503 ms\nExecution Time: 28.948 ms",
+  "pg-vpb3/B3/page2000": "Bitmap Heap Scan on outline_block_versions v (actual rows=1802 loops=1)\n  Recheck Cond: ((page_id = 'Yfw-0tIkNL0fa5k-PN3zS'::text) AND (from_seq <= '1122'::bigint) AND (to_max > '1122'::bigint))\n  Filter: (deleted = 0)\n  Heap Blocks: exact=133\n  Buffers: shared hit=133 read=7\n  ->  Bitmap Index Scan on ix_b3 (actual rows=1802 loops=1)\n        Index Cond: ((page_id = 'Yfw-0tIkNL0fa5k-PN3zS'::text) AND (from_seq <= '1122'::bigint) AND (to_max > '1122'::bigint))\n        Buffers: shared read=7\nPlanning:\n  Buffers: shared hit=50 read=1\nPlanning Time: 0.255 ms\nExecution Time: 0.694 ms",
+  "pg-vpb3/B4/page2000": "Bitmap Heap Scan on outline_block_versions v (actual rows=1802 loops=1)\n  Recheck Cond: ((page_id = 'Yfw-0tIkNL0fa5k-PN3zS'::text) AND (int8range(from_seq, COALESCE(to_seq, '9007199254740991'::bigint), '[)'::text) @> '1122'::bigint))\n  Filter: (deleted = 0)\n  Heap Blocks: exact=133\n  Buffers: shared hit=205\n  ->  Bitmap Index Scan on ix_b4 (actual rows=1802 loops=1)\n        Index Cond: ((page_id = 'Yfw-0tIkNL0fa5k-PN3zS'::text) AND (int8range(from_seq, COALESCE(to_seq, '9007199254740991'::bigint), '[)'::text) @> '1122'::bigint))\n        Buffers: shared hit=72\nPlanning:\n  Buffers: shared hit=51 read=1\nPlanning Time: 0.277 ms\nExecution Time: 1.707 ms",
+  "pg-vpb3/B5/page2000": "Bitmap Heap Scan on outline_block_versions v (actual rows=1802 loops=1)\n  Recheck Cond: ((page_id = 'Yfw-0tIkNL0fa5k-PN3zS'::text) AND (from_seq <= '1122'::bigint) AND (to_max > '1122'::bigint))\n  Filter: (deleted = 0)\n  Heap Blocks: exact=133\n  Buffers: shared hit=133 read=36\n  ->  Bitmap Index Scan on ix_b5 (actual rows=1802 loops=1)\n        Index Cond: ((page_id = 'Yfw-0tIkNL0fa5k-PN3zS'::text) AND (from_seq <= '1122'::bigint) AND (to_max > '1122'::bigint))\n        Buffers: shared read=36\nPlanning:\n  Buffers: shared hit=50 read=1\nPlanning Time: 0.303 ms\nExecution Time: 0.890 ms",
+  "pg-vpb3/C/page2000": "Nested Loop (actual rows=1802 loops=1)\n  Buffers: shared hit=7234 read=5\n  ->  Bitmap Heap Scan on outline_page_members m (actual rows=1802 loops=1)\n        Recheck Cond: ((page_id = 'Yfw-0tIkNL0fa5k-PN3zS'::text) AND (from_seq <= '1122'::bigint) AND (to_max > '1122'::bigint))\n        Heap Blocks: exact=26\n        Buffers: shared hit=26 read=5\n        ->  Bitmap Index Scan on ix_c (actual rows=1802 loops=1)\n              Index Cond: ((page_id = 'Yfw-0tIkNL0fa5k-PN3zS'::text) AND (from_seq <= '1122'::bigint) AND (to_max > '1122'::bigint))\n              Buffers: shared read=5\n  ->  Limit (actual rows=1 loops=1802)\n        Buffers: shared hit=7208\n        ->  Index Scan Backward using outline_block_versions_pkey on outline_block_versions x (actual rows=1 loops=1802)\n              Index Cond: ((block_id = m.block_id) AND (from_seq <= '1122'::bigint))\n              Buffers: shared hit=7208\nPlanning:\n  Buffers: shared hit=61 read=1\nPlanning Time: 0.398 ms\nExecution Time: 7.880 ms"
+ },
+ "results": [
+  {
+   "dialect": "pg-vpb3",
+   "variant": "-",
+   "query": "Q4a commits (space)",
+   "scope": "200/page",
+   "bucket": "all",
+   "rows": 201,
+   "summary": {
+    "n": 150,
+    "p50": 0.4527209999999968,
+    "p95": 0.9343039999999974,
+    "p99": 1.3089979999999741,
+    "max": 1.8568520000000035,
+    "mean": 0.5056688599999999
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "-",
+   "query": "Q4a commits (space)",
+   "scope": "200/page",
+   "bucket": "mid",
+   "rows": 201,
+   "summary": {
+    "n": 150,
+    "p50": 0.4527209999999968,
+    "p95": 0.9343039999999974,
+    "p99": 1.3089979999999741,
+    "max": 1.8568520000000035,
+    "mean": 0.5056688599999999
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "-",
+   "query": "Q4b commits agent only",
+   "scope": "200/page",
+   "bucket": "all",
+   "rows": 201,
+   "summary": {
+    "n": 150,
+    "p50": 0.4108110000000238,
+    "p95": 0.9186919999999645,
+    "p99": 1.481901999999991,
+    "max": 2.2464580000000183,
+    "mean": 0.4756367799999987
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "-",
+   "query": "Q4b commits agent only",
+   "scope": "200/page",
+   "bucket": "mid",
+   "rows": 201,
+   "summary": {
+    "n": 150,
+    "p50": 0.4108110000000238,
+    "p95": 0.9186919999999645,
+    "p99": 1.481901999999991,
+    "max": 2.2464580000000183,
+    "mean": 0.4756367799999987
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "-",
+   "query": "Q4c commits narrator",
+   "scope": "200/page",
+   "bucket": "all",
+   "rows": 11,
+   "summary": {
+    "n": 150,
+    "p50": 0.12906999999995605,
+    "p95": 0.23422600000003513,
+    "p99": 1.3142689999999675,
+    "max": 1.6988039999999955,
+    "mean": 0.1595309666666617
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "-",
+   "query": "Q4c commits narrator",
+   "scope": "200/page",
+   "bucket": "mid",
+   "rows": 11,
+   "summary": {
+    "n": 150,
+    "p50": 0.12906999999995605,
+    "p95": 0.23422600000003513,
+    "p99": 1.3142689999999675,
+    "max": 1.6988039999999955,
+    "mean": 0.1595309666666617
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "A2",
+   "query": "Q2 page@T",
+   "scope": "p2000",
+   "bucket": "all",
+   "rows": 1816,
+   "summary": {
+    "n": 300,
+    "p50": 17.60704900000019,
+    "p95": 23.625495000000228,
+    "p99": 27.190619999999853,
+    "max": 28.741664000000128,
+    "mean": 18.216008080000027
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "A2",
+   "query": "Q2 page@T",
+   "scope": "p2000",
+   "bucket": "early",
+   "rows": 1816,
+   "summary": {
+    "n": 100,
+    "p50": 17.065628999999717,
+    "p95": 22.55345600000055,
+    "p99": 25.7467529999999,
+    "max": 27.003062000000682,
+    "mean": 17.65800111000009
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "A2",
+   "query": "Q2 page@T",
+   "scope": "p2000",
+   "bucket": "mid",
+   "rows": 1816,
+   "summary": {
+    "n": 100,
+    "p50": 17.80507099999977,
+    "p95": 23.282688000000235,
+    "p99": 27.511360000000423,
+    "max": 27.5296800000001,
+    "mean": 18.307707790000048
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "A2",
+   "query": "Q2 page@T",
+   "scope": "p2000",
+   "bucket": "late",
+   "rows": 1816,
+   "summary": {
+    "n": 100,
+    "p50": 18.030681000000186,
+    "p95": 23.627148999999918,
+    "p99": 26.833596999999827,
+    "max": 28.741664000000128,
+    "mean": 18.68231533999998
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "A2",
+   "query": "Q2 page@T",
+   "scope": "p10000",
+   "bucket": "all",
+   "rows": 9040,
+   "summary": {
+    "n": 100,
+    "p50": 81.66223300000092,
+    "p95": 100.10604299999977,
+    "p99": 105.9164010000004,
+    "max": 109.71955200000048,
+    "mean": 83.78733539999998
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "A2",
+   "query": "Q2 page@T",
+   "scope": "p10000",
+   "bucket": "early",
+   "rows": 9040,
+   "summary": {
+    "n": 34,
+    "p50": 80.51919799999996,
+    "p95": 104.22123599999941,
+    "p99": 109.71955200000048,
+    "max": 109.71955200000048,
+    "mean": 83.04657585294117
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "A2",
+   "query": "Q2 page@T",
+   "scope": "p10000",
+   "bucket": "mid",
+   "rows": 9040,
+   "summary": {
+    "n": 33,
+    "p50": 81.97474400000101,
+    "p95": 104.92923999999948,
+    "p99": 105.9164010000004,
+    "max": 105.9164010000004,
+    "mean": 83.614619121212
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "A2",
+   "query": "Q2 page@T",
+   "scope": "p10000",
+   "bucket": "late",
+   "rows": 9040,
+   "summary": {
+    "n": 33,
+    "p50": 84.16985100000056,
+    "p95": 100.06179900000097,
+    "p99": 100.10604299999977,
+    "max": 100.10604299999977,
+    "mean": 84.72325848484853
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "A2",
+   "query": "Q1 vp500 native-bfs",
+   "scope": "p2000",
+   "bucket": "all",
+   "rows": 500,
+   "summary": {
+    "n": 300,
+    "p50": 4.890105999998923,
+    "p95": 5.797077999999601,
+    "p99": 6.469806000000972,
+    "max": 14.719191000000137,
+    "mean": 4.667483253333521
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "A2",
+   "query": "Q1 vp500 native-bfs",
+   "scope": "p2000",
+   "bucket": "early",
+   "rows": 500,
+   "summary": {
+    "n": 100,
+    "p50": 4.86302699999942,
+    "p95": 5.769451999996818,
+    "p99": 6.168678999998519,
+    "max": 14.719191000000137,
+    "mean": 4.669396320000196
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "A2",
+   "query": "Q1 vp500 native-bfs",
+   "scope": "p2000",
+   "bucket": "mid",
+   "rows": 500,
+   "summary": {
+    "n": 100,
+    "p50": 4.91356900000028,
+    "p95": 5.6609280000011495,
+    "p99": 6.01496600000246,
+    "max": 8.820396000002802,
+    "mean": 4.6387394900002255
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "A2",
+   "query": "Q1 vp500 native-bfs",
+   "scope": "p2000",
+   "bucket": "late",
+   "rows": 500,
+   "summary": {
+    "n": 100,
+    "p50": 4.878577999999834,
+    "p95": 5.82665199999974,
+    "p99": 6.469806000000972,
+    "max": 6.690580999998929,
+    "mean": 4.694313950000142
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "A2",
+   "query": "Q1 vp500 native-bfs",
+   "scope": "p10000",
+   "bucket": "all",
+   "rows": 500,
+   "summary": {
+    "n": 100,
+    "p50": 3.6016899999995076,
+    "p95": 4.621602000002895,
+    "p99": 5.382452000001649,
+    "max": 7.138177999997424,
+    "mean": 3.6164507499999674
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "A2",
+   "query": "Q1 vp500 native-bfs",
+   "scope": "p10000",
+   "bucket": "early",
+   "rows": 500,
+   "summary": {
+    "n": 34,
+    "p50": 3.4925180000027467,
+    "p95": 4.621602000002895,
+    "p99": 5.382452000001649,
+    "max": 5.382452000001649,
+    "mean": 3.5663660294119515
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "A2",
+   "query": "Q1 vp500 native-bfs",
+   "scope": "p10000",
+   "bucket": "mid",
+   "rows": 500,
+   "summary": {
+    "n": 33,
+    "p50": 3.5602579999977024,
+    "p95": 5.380834999999934,
+    "p99": 7.138177999997424,
+    "max": 7.138177999997424,
+    "mean": 3.6483390909087383
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "A2",
+   "query": "Q1 vp500 native-bfs",
+   "scope": "p10000",
+   "bucket": "late",
+   "rows": 500,
+   "summary": {
+    "n": 33,
+    "p50": 3.676236000002973,
+    "p95": 4.5910860000003595,
+    "p99": 4.654064999998809,
+    "max": 4.654064999998809,
+    "mean": 3.6361648484849094
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "A2",
+   "query": "Q1 vp500 dfs-sort",
+   "scope": "p2000",
+   "bucket": "all",
+   "rows": 500,
+   "summary": {
+    "n": 300,
+    "p50": 17.60116199999902,
+    "p95": 25.74156900000162,
+    "p99": 32.02796099999978,
+    "max": 39.335032999999385,
+    "mean": 18.72122156999997
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "A2",
+   "query": "Q1 vp500 dfs-sort",
+   "scope": "p2000",
+   "bucket": "early",
+   "rows": 500,
+   "summary": {
+    "n": 100,
+    "p50": 17.410132999997586,
+    "p95": 24.851127000001725,
+    "p99": 26.48022299999866,
+    "max": 29.684940999999526,
+    "mean": 18.03483253000002
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "A2",
+   "query": "Q1 vp500 dfs-sort",
+   "scope": "p2000",
+   "bucket": "mid",
+   "rows": 500,
+   "summary": {
+    "n": 100,
+    "p50": 17.530244000001403,
+    "p95": 25.77241899999717,
+    "p99": 29.204515999997966,
+    "max": 32.02796099999978,
+    "mean": 18.69051988000003
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "A2",
+   "query": "Q1 vp500 dfs-sort",
+   "scope": "p2000",
+   "bucket": "late",
+   "rows": 500,
+   "summary": {
+    "n": 100,
+    "p50": 18.399290999997902,
+    "p95": 26.9954230000003,
+    "p99": 36.41367799999716,
+    "max": 39.335032999999385,
+    "mean": 19.43831229999985
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "A2",
+   "query": "Q3 diff W=1",
+   "scope": "p2000",
+   "bucket": "all",
+   "rows": 1,
+   "summary": {
+    "n": 150,
+    "p50": 38.40298400000029,
+    "p95": 55.60746999999901,
+    "p99": 61.32258200000069,
+    "max": 62.926855000001524,
+    "mean": 40.00960465333333
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "A2",
+   "query": "Q3 diff W=1",
+   "scope": "p2000",
+   "bucket": "early",
+   "rows": 1,
+   "summary": {
+    "n": 50,
+    "p50": 37.60089700000026,
+    "p95": 55.99978700000065,
+    "p99": 60.439657999999326,
+    "max": 60.439657999999326,
+    "mean": 39.51114889999975
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "A2",
+   "query": "Q3 diff W=1",
+   "scope": "p2000",
+   "bucket": "mid",
+   "rows": 1,
+   "summary": {
+    "n": 50,
+    "p50": 38.70132899999953,
+    "p95": 55.65375000000131,
+    "p99": 62.926855000001524,
+    "max": 62.926855000001524,
+    "mean": 40.64045558000005
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "A2",
+   "query": "Q3 diff W=1",
+   "scope": "p2000",
+   "bucket": "late",
+   "rows": 1,
+   "summary": {
+    "n": 50,
+    "p50": 38.16981900000246,
+    "p95": 51.5114530000028,
+    "p99": 56.952306000002864,
+    "max": 56.952306000002864,
+    "mean": 39.87720948000017
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "A2",
+   "query": "Q3 diff W=100",
+   "scope": "p2000",
+   "bucket": "all",
+   "rows": 25,
+   "summary": {
+    "n": 150,
+    "p50": 37.437409999998636,
+    "p95": 50.37678500000038,
+    "p99": 54.926940000004834,
+    "max": 69.71448399999645,
+    "mean": 39.14687562000021
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "A2",
+   "query": "Q3 diff W=100",
+   "scope": "p2000",
+   "bucket": "early",
+   "rows": 25,
+   "summary": {
+    "n": 50,
+    "p50": 36.35902799999894,
+    "p95": 54.7208040000005,
+    "p99": 69.71448399999645,
+    "max": 69.71448399999645,
+    "mean": 39.485515679999956
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "A2",
+   "query": "Q3 diff W=100",
+   "scope": "p2000",
+   "bucket": "mid",
+   "rows": 25,
+   "summary": {
+    "n": 50,
+    "p50": 38.174808000003395,
+    "p95": 48.253795000004175,
+    "p99": 49.29727400000411,
+    "max": 49.29727400000411,
+    "mean": 39.27143294000009
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "A2",
+   "query": "Q3 diff W=100",
+   "scope": "p2000",
+   "bucket": "late",
+   "rows": 25,
+   "summary": {
+    "n": 50,
+    "p50": 37.47014499999932,
+    "p95": 51.2224950000018,
+    "p99": 54.202807000001485,
+    "max": 54.202807000001485,
+    "mean": 38.68367824000059
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "A2",
+   "query": "Q3 diff W=5000",
+   "scope": "p2000",
+   "bucket": "all",
+   "rows": 460,
+   "summary": {
+    "n": 150,
+    "p50": 44.32778600000165,
+    "p95": 60.155580999999074,
+    "p99": 75.55757199999789,
+    "max": 75.980475999997,
+    "mean": 45.251052320000305
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "A2",
+   "query": "Q3 diff W=5000",
+   "scope": "p2000",
+   "bucket": "early",
+   "rows": 460,
+   "summary": {
+    "n": 50,
+    "p50": 43.07230900000286,
+    "p95": 57.82468599999993,
+    "p99": 75.980475999997,
+    "max": 75.980475999997,
+    "mean": 44.731812260000154
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "A2",
+   "query": "Q3 diff W=5000",
+   "scope": "p2000",
+   "bucket": "mid",
+   "rows": 460,
+   "summary": {
+    "n": 50,
+    "p50": 43.6491010000027,
+    "p95": 59.63935700000002,
+    "p99": 75.55757199999789,
+    "max": 75.55757199999789,
+    "mean": 45.55390146000034
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "A2",
+   "query": "Q3 diff W=5000",
+   "scope": "p2000",
+   "bucket": "late",
+   "rows": 460,
+   "summary": {
+    "n": 50,
+    "p50": 44.32778600000165,
+    "p95": 60.591128000000026,
+    "p99": 67.05427100000088,
+    "max": 67.05427100000088,
+    "mean": 45.46744324000043
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B3",
+   "query": "Q2 page@T",
+   "scope": "p2000",
+   "bucket": "all",
+   "rows": 1816,
+   "summary": {
+    "n": 300,
+    "p50": 3.4963470000002417,
+    "p95": 5.466939999998431,
+    "p99": 5.8401840000005905,
+    "max": 7.224033999998937,
+    "mean": 3.675218496666494
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B3",
+   "query": "Q2 page@T",
+   "scope": "p2000",
+   "bucket": "early",
+   "rows": 1816,
+   "summary": {
+    "n": 100,
+    "p50": 3.4652060000007623,
+    "p95": 5.063133999996353,
+    "p99": 5.579665999997815,
+    "max": 5.8401840000005905,
+    "mean": 3.614188709999653
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B3",
+   "query": "Q2 page@T",
+   "scope": "p2000",
+   "bucket": "mid",
+   "rows": 1816,
+   "summary": {
+    "n": 100,
+    "p50": 3.424501000001328,
+    "p95": 5.466939999998431,
+    "p99": 5.711145000001125,
+    "max": 5.7354619999969145,
+    "mean": 3.622859519999838
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B3",
+   "query": "Q2 page@T",
+   "scope": "p2000",
+   "bucket": "late",
+   "rows": 1816,
+   "summary": {
+    "n": 100,
+    "p50": 3.696714999998221,
+    "p95": 5.557379000005312,
+    "p99": 6.526384000004327,
+    "max": 7.224033999998937,
+    "mean": 3.78860725999999
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B3",
+   "query": "Q2 page@T",
+   "scope": "p10000",
+   "bucket": "all",
+   "rows": 9040,
+   "summary": {
+    "n": 100,
+    "p50": 14.684733999994933,
+    "p95": 18.739083999993454,
+    "p99": 22.45872000000236,
+    "max": 23.296228999999585,
+    "mean": 14.853299510000216
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B3",
+   "query": "Q2 page@T",
+   "scope": "p10000",
+   "bucket": "early",
+   "rows": 9040,
+   "summary": {
+    "n": 34,
+    "p50": 15.066075000002456,
+    "p95": 18.41727499999979,
+    "p99": 19.17151400000148,
+    "max": 19.17151400000148,
+    "mean": 14.70828976470597
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B3",
+   "query": "Q2 page@T",
+   "scope": "p10000",
+   "bucket": "mid",
+   "rows": 9040,
+   "summary": {
+    "n": 33,
+    "p50": 14.838855000001786,
+    "p95": 19.488086999997904,
+    "p99": 23.296228999999585,
+    "max": 23.296228999999585,
+    "mean": 14.877559515152385
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B3",
+   "query": "Q2 page@T",
+   "scope": "p10000",
+   "bucket": "late",
+   "rows": 9040,
+   "summary": {
+    "n": 33,
+    "p50": 14.484393999999156,
+    "p95": 19.07014799999888,
+    "p99": 22.45872000000236,
+    "max": 22.45872000000236,
+    "mean": 14.978443484848178
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B3",
+   "query": "Q2 page@T no-content",
+   "scope": "p2000",
+   "bucket": "all",
+   "rows": 1816,
+   "summary": {
+    "n": 300,
+    "p50": 1.850313000002643,
+    "p95": 3.1152129999973113,
+    "p99": 3.765454000000318,
+    "max": 6.134974000000511,
+    "mean": 1.997117523333242
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B3",
+   "query": "Q2 page@T no-content",
+   "scope": "p2000",
+   "bucket": "early",
+   "rows": 1816,
+   "summary": {
+    "n": 100,
+    "p50": 1.689554999997199,
+    "p95": 2.7345040000000154,
+    "p99": 3.782593000003544,
+    "max": 6.134974000000511,
+    "mean": 1.8731758699999772
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B3",
+   "query": "Q2 page@T no-content",
+   "scope": "p2000",
+   "bucket": "mid",
+   "rows": 1816,
+   "summary": {
+    "n": 100,
+    "p50": 1.8284759999951348,
+    "p95": 2.9396919999999227,
+    "p99": 3.6341019999963464,
+    "max": 4.206873000002815,
+    "mean": 1.943160840000128
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B3",
+   "query": "Q2 page@T no-content",
+   "scope": "p2000",
+   "bucket": "late",
+   "rows": 1816,
+   "summary": {
+    "n": 100,
+    "p50": 2.1153590000030817,
+    "p95": 3.153630000000703,
+    "p99": 3.7432340000013937,
+    "max": 3.765454000000318,
+    "mean": 2.175015859999621
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B3",
+   "query": "Q1 vp500 read+js-order",
+   "scope": "p2000",
+   "bucket": "all",
+   "rows": 500,
+   "summary": {
+    "n": 300,
+    "p50": 3.6458930000007967,
+    "p95": 5.819446000001335,
+    "p99": 7.1127550000019255,
+    "max": 9.5011599999998,
+    "mean": 3.8325771166667013
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B3",
+   "query": "Q1 vp500 read+js-order",
+   "scope": "p2000",
+   "bucket": "early",
+   "rows": 500,
+   "summary": {
+    "n": 100,
+    "p50": 3.526732999998785,
+    "p95": 5.366600000001199,
+    "p99": 6.31375300000218,
+    "max": 8.259540999999444,
+    "mean": 3.6785735099999872
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B3",
+   "query": "Q1 vp500 read+js-order",
+   "scope": "p2000",
+   "bucket": "mid",
+   "rows": 500,
+   "summary": {
+    "n": 100,
+    "p50": 3.6274259999991045,
+    "p95": 5.9861889999956475,
+    "p99": 7.024778000006336,
+    "max": 8.695087000000058,
+    "mean": 3.877411179999981
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B3",
+   "query": "Q1 vp500 read+js-order",
+   "scope": "p2000",
+   "bucket": "late",
+   "rows": 500,
+   "summary": {
+    "n": 100,
+    "p50": 3.8017220000037923,
+    "p95": 5.819446000001335,
+    "p99": 7.1127550000019255,
+    "max": 9.5011599999998,
+    "mean": 3.941746660000135
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B3",
+   "query": "Q1 vp500 read+js-order",
+   "scope": "p10000",
+   "bucket": "all",
+   "rows": 500,
+   "summary": {
+    "n": 100,
+    "p50": 15.831913999994867,
+    "p95": 22.170015000003332,
+    "p99": 23.938120999999228,
+    "max": 24.192971000004036,
+    "mean": 16.63396750999964
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B3",
+   "query": "Q1 vp500 read+js-order",
+   "scope": "p10000",
+   "bucket": "early",
+   "rows": 500,
+   "summary": {
+    "n": 34,
+    "p50": 15.052735999997822,
+    "p95": 23.938120999999228,
+    "p99": 24.192971000004036,
+    "max": 24.192971000004036,
+    "mean": 16.088130441176926
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B3",
+   "query": "Q1 vp500 read+js-order",
+   "scope": "p10000",
+   "bucket": "mid",
+   "rows": 500,
+   "summary": {
+    "n": 33,
+    "p50": 15.605500999998185,
+    "p95": 21.80251600000338,
+    "p99": 22.94966099999874,
+    "max": 22.94966099999874,
+    "mean": 16.511299121211668
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B3",
+   "query": "Q1 vp500 read+js-order",
+   "scope": "p10000",
+   "bucket": "late",
+   "rows": 500,
+   "summary": {
+    "n": 33,
+    "p50": 17.286781999995583,
+    "p95": 23.075153999998292,
+    "p99": 23.797237999999197,
+    "max": 23.797237999999197,
+    "mean": 17.319013484847375
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B3",
+   "query": "Q3 diff W=1 flags",
+   "scope": "p2000",
+   "bucket": "all",
+   "rows": 1,
+   "summary": {
+    "n": 150,
+    "p50": 0.10272700000496116,
+    "p95": 0.20094699999754084,
+    "p99": 0.25391799999488285,
+    "max": 0.4616549999991548,
+    "mean": 0.11708758000012798
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B3",
+   "query": "Q3 diff W=1 flags",
+   "scope": "p2000",
+   "bucket": "early",
+   "rows": 1,
+   "summary": {
+    "n": 50,
+    "p50": 0.10793700000067474,
+    "p95": 0.16937899999902584,
+    "p99": 0.4616549999991548,
+    "max": 0.4616549999991548,
+    "mean": 0.12059183999968809
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B3",
+   "query": "Q3 diff W=1 flags",
+   "scope": "p2000",
+   "bucket": "mid",
+   "rows": 1,
+   "summary": {
+    "n": 50,
+    "p50": 0.10154899999906775,
+    "p95": 0.20147900000301888,
+    "p99": 0.21481299999868497,
+    "max": 0.21481299999868497,
+    "mean": 0.11391826000035507
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B3",
+   "query": "Q3 diff W=1 flags",
+   "scope": "p2000",
+   "bucket": "late",
+   "rows": 1,
+   "summary": {
+    "n": 50,
+    "p50": 0.10003400000277907,
+    "p95": 0.20094699999754084,
+    "p99": 0.25391799999488285,
+    "max": 0.25391799999488285,
+    "mean": 0.11675264000034076
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B3",
+   "query": "Q3 diff W=1 join",
+   "scope": "p2000",
+   "bucket": "all",
+   "rows": 1,
+   "summary": {
+    "n": 150,
+    "p50": 0.16528599999583093,
+    "p95": 0.6111180000007153,
+    "p99": 1.7047470000034082,
+    "max": 2.727145999997447,
+    "mean": 0.23572017333339318
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B3",
+   "query": "Q3 diff W=1 join",
+   "scope": "p2000",
+   "bucket": "early",
+   "rows": 1,
+   "summary": {
+    "n": 50,
+    "p50": 0.16649499999766704,
+    "p95": 0.6111180000007153,
+    "p99": 0.8859620000002906,
+    "max": 0.8859620000002906,
+    "mean": 0.21594514000040363
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B3",
+   "query": "Q3 diff W=1 join",
+   "scope": "p2000",
+   "bucket": "mid",
+   "rows": 1,
+   "summary": {
+    "n": 50,
+    "p50": 0.16426700000010896,
+    "p95": 0.5702220000021043,
+    "p99": 2.727145999997447,
+    "max": 2.727145999997447,
+    "mean": 0.24860495999993873
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B3",
+   "query": "Q3 diff W=1 join",
+   "scope": "p2000",
+   "bucket": "late",
+   "rows": 1,
+   "summary": {
+    "n": 50,
+    "p50": 0.16301899999962188,
+    "p95": 0.6615769999989425,
+    "p99": 1.7047470000034082,
+    "max": 1.7047470000034082,
+    "mean": 0.24261041999983718
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B3",
+   "query": "Q3 diff W=100 flags",
+   "scope": "p2000",
+   "bucket": "all",
+   "rows": 28,
+   "summary": {
+    "n": 150,
+    "p50": 0.22361600000294857,
+    "p95": 0.7163169999985257,
+    "p99": 0.8942790000000969,
+    "max": 1.0376410000026226,
+    "mean": 0.2778123599998556
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B3",
+   "query": "Q3 diff W=100 flags",
+   "scope": "p2000",
+   "bucket": "early",
+   "rows": 28,
+   "summary": {
+    "n": 50,
+    "p50": 0.2186950000032084,
+    "p95": 0.7307940000027884,
+    "p99": 0.7953550000020186,
+    "max": 0.7953550000020186,
+    "mean": 0.2865843199995288
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B3",
+   "query": "Q3 diff W=100 flags",
+   "scope": "p2000",
+   "bucket": "mid",
+   "rows": 28,
+   "summary": {
+    "n": 50,
+    "p50": 0.2566740000038408,
+    "p95": 0.7163169999985257,
+    "p99": 0.8942790000000969,
+    "max": 0.8942790000000969,
+    "mean": 0.296595559999987
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B3",
+   "query": "Q3 diff W=100 flags",
+   "scope": "p2000",
+   "bucket": "late",
+   "rows": 28,
+   "summary": {
+    "n": 50,
+    "p50": 0.17898199999763165,
+    "p95": 0.5953950000039185,
+    "p99": 1.0376410000026226,
+    "max": 1.0376410000026226,
+    "mean": 0.2502572000000509
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B3",
+   "query": "Q3 diff W=100 join",
+   "scope": "p2000",
+   "bucket": "all",
+   "rows": 28,
+   "summary": {
+    "n": 150,
+    "p50": 0.3936279999979888,
+    "p95": 1.6928839999964111,
+    "p99": 2.4045210000040242,
+    "max": 2.458416000001307,
+    "mean": 0.6163051199997911
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B3",
+   "query": "Q3 diff W=100 join",
+   "scope": "p2000",
+   "bucket": "early",
+   "rows": 28,
+   "summary": {
+    "n": 50,
+    "p50": 0.3840150000032736,
+    "p95": 1.7864950000002864,
+    "p99": 1.9573509999972885,
+    "max": 1.9573509999972885,
+    "mean": 0.6426040199997078
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B3",
+   "query": "Q3 diff W=100 join",
+   "scope": "p2000",
+   "bucket": "mid",
+   "rows": 28,
+   "summary": {
+    "n": 50,
+    "p50": 0.5026989999969373,
+    "p95": 1.5849469999957364,
+    "p99": 2.458416000001307,
+    "max": 2.458416000001307,
+    "mean": 0.6754687200000626
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B3",
+   "query": "Q3 diff W=100 join",
+   "scope": "p2000",
+   "bucket": "late",
+   "rows": 28,
+   "summary": {
+    "n": 50,
+    "p50": 0.3416800000049989,
+    "p95": 1.5298370000018622,
+    "p99": 2.4045210000040242,
+    "max": 2.4045210000040242,
+    "mean": 0.5308426199996029
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B3",
+   "query": "Q3 diff W=5000 flags",
+   "scope": "p2000",
+   "bucket": "all",
+   "rows": 836,
+   "summary": {
+    "n": 150,
+    "p50": 1.5077600000004168,
+    "p95": 10.962957999996434,
+    "p99": 25.50848099999712,
+    "max": 33.07730199999787,
+    "mean": 3.4166763866665617
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B3",
+   "query": "Q3 diff W=5000 flags",
+   "scope": "p2000",
+   "bucket": "early",
+   "rows": 836,
+   "summary": {
+    "n": 50,
+    "p50": 1.2088349999976344,
+    "p95": 8.40240900000208,
+    "p99": 8.888417999995,
+    "max": 8.888417999995,
+    "mean": 2.650299919999816
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B3",
+   "query": "Q3 diff W=5000 flags",
+   "scope": "p2000",
+   "bucket": "mid",
+   "rows": 836,
+   "summary": {
+    "n": 50,
+    "p50": 1.7273730000015348,
+    "p95": 11.567386999995506,
+    "p99": 25.50848099999712,
+    "max": 25.50848099999712,
+    "mean": 4.026181400000205
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B3",
+   "query": "Q3 diff W=5000 flags",
+   "scope": "p2000",
+   "bucket": "late",
+   "rows": 836,
+   "summary": {
+    "n": 50,
+    "p50": 1.3992269999944256,
+    "p95": 11.42615300000034,
+    "p99": 33.07730199999787,
+    "max": 33.07730199999787,
+    "mean": 3.5735478399996645
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B3",
+   "query": "Q3 diff W=5000 join",
+   "scope": "p2000",
+   "bucket": "all",
+   "rows": 836,
+   "summary": {
+    "n": 150,
+    "p50": 5.25446699999884,
+    "p95": 39.18618299999798,
+    "p99": 88.47230200000195,
+    "max": 93.46267200000148,
+    "mean": 11.75605032000002
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B3",
+   "query": "Q3 diff W=5000 join",
+   "scope": "p2000",
+   "bucket": "early",
+   "rows": 836,
+   "summary": {
+    "n": 50,
+    "p50": 3.66871700000047,
+    "p95": 24.412510999994993,
+    "p99": 28.287739999999758,
+    "max": 28.287739999999758,
+    "mean": 7.953858899999904
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B3",
+   "query": "Q3 diff W=5000 join",
+   "scope": "p2000",
+   "bucket": "mid",
+   "rows": 836,
+   "summary": {
+    "n": 50,
+    "p50": 5.715869999999995,
+    "p95": 44.99629200000345,
+    "p99": 93.46267200000148,
+    "max": 93.46267200000148,
+    "mean": 14.515637500000302
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B3",
+   "query": "Q3 diff W=5000 join",
+   "scope": "p2000",
+   "bucket": "late",
+   "rows": 836,
+   "summary": {
+    "n": 50,
+    "p50": 4.06045499999891,
+    "p95": 43.22328600000037,
+    "p99": 85.13872799999808,
+    "max": 85.13872799999808,
+    "mean": 12.79865455999985
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B3",
+   "query": "Q4d commits of page",
+   "scope": "200/page",
+   "bucket": "all",
+   "rows": 201,
+   "summary": {
+    "n": 150,
+    "p50": 1.6265480000001844,
+    "p95": 2.5838020000010147,
+    "p99": 4.705647999995563,
+    "max": 7.385972000003676,
+    "mean": 1.7743619933328592
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B3",
+   "query": "Q4d commits of page",
+   "scope": "200/page",
+   "bucket": "mid",
+   "rows": 201,
+   "summary": {
+    "n": 150,
+    "p50": 1.6265480000001844,
+    "p95": 2.5838020000010147,
+    "p99": 4.705647999995563,
+    "max": 7.385972000003676,
+    "mean": 1.7743619933328592
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B4",
+   "query": "Q2 page@T",
+   "scope": "p2000",
+   "bucket": "all",
+   "rows": 1816,
+   "summary": {
+    "n": 300,
+    "p50": 4.2548099999985425,
+    "p95": 7.013996000001498,
+    "p99": 8.359498999998323,
+    "max": 12.057279000000563,
+    "mean": 4.506608669999938
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B4",
+   "query": "Q2 page@T",
+   "scope": "p2000",
+   "bucket": "early",
+   "rows": 1816,
+   "summary": {
+    "n": 100,
+    "p50": 3.81213199999911,
+    "p95": 5.30691300000035,
+    "p99": 5.837291999996523,
+    "max": 5.939120999995794,
+    "mean": 3.9389852400002563
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B4",
+   "query": "Q2 page@T",
+   "scope": "p2000",
+   "bucket": "mid",
+   "rows": 1816,
+   "summary": {
+    "n": 100,
+    "p50": 4.403277000004891,
+    "p95": 6.719782000000123,
+    "p99": 7.826977999997325,
+    "max": 8.847831999999471,
+    "mean": 4.529119379999901
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B4",
+   "query": "Q2 page@T",
+   "scope": "p2000",
+   "bucket": "late",
+   "rows": 1816,
+   "summary": {
+    "n": 100,
+    "p50": 4.590924999996787,
+    "p95": 7.5455240000010235,
+    "p99": 8.414741000000504,
+    "max": 12.057279000000563,
+    "mean": 5.051721389999657
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B4",
+   "query": "Q2 page@T",
+   "scope": "p10000",
+   "bucket": "all",
+   "rows": 9040,
+   "summary": {
+    "n": 100,
+    "p50": 16.47660100000212,
+    "p95": 22.88610799999151,
+    "p99": 27.421648000003188,
+    "max": 29.31186699999671,
+    "mean": 16.95434911999997
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B4",
+   "query": "Q2 page@T",
+   "scope": "p10000",
+   "bucket": "early",
+   "rows": 9040,
+   "summary": {
+    "n": 34,
+    "p50": 14.427766000000702,
+    "p95": 22.919549999991432,
+    "p99": 27.421648000003188,
+    "max": 27.421648000003188,
+    "mean": 15.595853529411269
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B4",
+   "query": "Q2 page@T",
+   "scope": "p10000",
+   "bucket": "mid",
+   "rows": 9040,
+   "summary": {
+    "n": 33,
+    "p50": 16.120467000000644,
+    "p95": 22.47250200000417,
+    "p99": 25.738272000002326,
+    "max": 25.738272000002326,
+    "mean": 16.74072669697004
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B4",
+   "query": "Q2 page@T",
+   "scope": "p10000",
+   "bucket": "late",
+   "rows": 9040,
+   "summary": {
+    "n": 33,
+    "p50": 17.633262000003015,
+    "p95": 26.75678299998981,
+    "p99": 29.31186699999671,
+    "max": 29.31186699999671,
+    "mean": 18.567633666666744
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B4",
+   "query": "Q1 vp500 read+js-order",
+   "scope": "p2000",
+   "bucket": "all",
+   "rows": 500,
+   "summary": {
+    "n": 300,
+    "p50": 4.592969999997877,
+    "p95": 8.32332999999926,
+    "p99": 10.789034999994328,
+    "max": 14.610464999990654,
+    "mean": 5.121975426666467
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B4",
+   "query": "Q1 vp500 read+js-order",
+   "scope": "p2000",
+   "bucket": "early",
+   "rows": 500,
+   "summary": {
+    "n": 100,
+    "p50": 4.260560999988229,
+    "p95": 6.198188000009395,
+    "p99": 7.625003000008292,
+    "max": 8.278974999993807,
+    "mean": 4.381498029999348
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B4",
+   "query": "Q1 vp500 read+js-order",
+   "scope": "p2000",
+   "bucket": "mid",
+   "rows": 500,
+   "summary": {
+    "n": 100,
+    "p50": 4.890601000006427,
+    "p95": 7.7858609999966575,
+    "p99": 9.010796999995364,
+    "max": 10.115623000005144,
+    "mean": 5.248067250000458
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B4",
+   "query": "Q1 vp500 read+js-order",
+   "scope": "p2000",
+   "bucket": "late",
+   "rows": 500,
+   "summary": {
+    "n": 100,
+    "p50": 4.995571999999811,
+    "p95": 8.947723999997834,
+    "p99": 14.349357999992208,
+    "max": 14.610464999990654,
+    "mean": 5.736360999999597
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B4",
+   "query": "Q1 vp500 read+js-order",
+   "scope": "p10000",
+   "bucket": "all",
+   "rows": 500,
+   "summary": {
+    "n": 100,
+    "p50": 19.10950399999274,
+    "p95": 25.947070000009262,
+    "p99": 30.31177200000093,
+    "max": 32.68826399999671,
+    "mean": 19.61016349999976
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B4",
+   "query": "Q1 vp500 read+js-order",
+   "scope": "p10000",
+   "bucket": "early",
+   "rows": 500,
+   "summary": {
+    "n": 34,
+    "p50": 16.44310200000473,
+    "p95": 22.61290700000245,
+    "p99": 25.947070000009262,
+    "max": 25.947070000009262,
+    "mean": 17.131168852939
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B4",
+   "query": "Q1 vp500 read+js-order",
+   "scope": "p10000",
+   "bucket": "mid",
+   "rows": 500,
+   "summary": {
+    "n": 33,
+    "p50": 19.30007100000512,
+    "p95": 30.31177200000093,
+    "p99": 32.68826399999671,
+    "max": 32.68826399999671,
+    "mean": 20.075262303030645
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B4",
+   "query": "Q1 vp500 read+js-order",
+   "scope": "p10000",
+   "bucket": "late",
+   "rows": 500,
+   "summary": {
+    "n": 33,
+    "p50": 21.03523999999743,
+    "p95": 26.174316000004183,
+    "p99": 29.549497999993037,
+    "max": 29.549497999993037,
+    "mean": 21.699180393940576
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B4",
+   "query": "Q3 diff W=1 flags",
+   "scope": "p2000",
+   "bucket": "all",
+   "rows": 1,
+   "summary": {
+    "n": 150,
+    "p50": 0.06349799998861272,
+    "p95": 0.11269400001037866,
+    "p99": 0.19692099999519996,
+    "max": 0.23385000000416767,
+    "mean": 0.07190215999968738
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B4",
+   "query": "Q3 diff W=1 flags",
+   "scope": "p2000",
+   "bucket": "early",
+   "rows": 1,
+   "summary": {
+    "n": 50,
+    "p50": 0.06319900001108181,
+    "p95": 0.11781499999051448,
+    "p99": 0.13791400000627618,
+    "max": 0.13791400000627618,
+    "mean": 0.07125526000047103
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B4",
+   "query": "Q3 diff W=1 flags",
+   "scope": "p2000",
+   "bucket": "mid",
+   "rows": 1,
+   "summary": {
+    "n": 50,
+    "p50": 0.06415399999241345,
+    "p95": 0.09808799999882467,
+    "p99": 0.19692099999519996,
+    "max": 0.19692099999519996,
+    "mean": 0.06935385999968276
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B4",
+   "query": "Q3 diff W=1 flags",
+   "scope": "p2000",
+   "bucket": "late",
+   "rows": 1,
+   "summary": {
+    "n": 50,
+    "p50": 0.06613799999468029,
+    "p95": 0.11507200000050943,
+    "p99": 0.23385000000416767,
+    "max": 0.23385000000416767,
+    "mean": 0.07509735999890836
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B4",
+   "query": "Q3 diff W=1 join",
+   "scope": "p2000",
+   "bucket": "all",
+   "rows": 1,
+   "summary": {
+    "n": 150,
+    "p50": 0.0753030000050785,
+    "p95": 0.21974200000113342,
+    "p99": 0.7750450000021374,
+    "max": 1.2097070000017993,
+    "mean": 0.11270180000050459
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B4",
+   "query": "Q3 diff W=1 join",
+   "scope": "p2000",
+   "bucket": "early",
+   "rows": 1,
+   "summary": {
+    "n": 50,
+    "p50": 0.08034900001075584,
+    "p95": 0.21907999999530148,
+    "p99": 0.5864940000028582,
+    "max": 0.5864940000028582,
+    "mean": 0.10192642000067281
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B4",
+   "query": "Q3 diff W=1 join",
+   "scope": "p2000",
+   "bucket": "mid",
+   "rows": 1,
+   "summary": {
+    "n": 50,
+    "p50": 0.0722890000033658,
+    "p95": 0.18722500000149012,
+    "p99": 0.5150870000070427,
+    "max": 0.5150870000070427,
+    "mean": 0.09331706000055419
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B4",
+   "query": "Q3 diff W=1 join",
+   "scope": "p2000",
+   "bucket": "late",
+   "rows": 1,
+   "summary": {
+    "n": 50,
+    "p50": 0.0741390000039246,
+    "p95": 0.5896599999978207,
+    "p99": 1.2097070000017993,
+    "max": 1.2097070000017993,
+    "mean": 0.14286192000028677
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B4",
+   "query": "Q3 diff W=100 flags",
+   "scope": "p2000",
+   "bucket": "all",
+   "rows": 28,
+   "summary": {
+    "n": 150,
+    "p50": 0.1274989999947138,
+    "p95": 0.3788070000009611,
+    "p99": 0.5121610000060173,
+    "max": 0.5355520000011893,
+    "mean": 0.16217258666671114
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B4",
+   "query": "Q3 diff W=100 flags",
+   "scope": "p2000",
+   "bucket": "early",
+   "rows": 28,
+   "summary": {
+    "n": 50,
+    "p50": 0.11924099999305326,
+    "p95": 0.3958379999967292,
+    "p99": 0.5043410000071162,
+    "max": 0.5043410000071162,
+    "mean": 0.17087577999947826
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B4",
+   "query": "Q3 diff W=100 flags",
+   "scope": "p2000",
+   "bucket": "mid",
+   "rows": 28,
+   "summary": {
+    "n": 50,
+    "p50": 0.1436190000094939,
+    "p95": 0.3174329999892507,
+    "p99": 0.49783999999635853,
+    "max": 0.49783999999635853,
+    "mean": 0.16232234000082826
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B4",
+   "query": "Q3 diff W=100 flags",
+   "scope": "p2000",
+   "bucket": "late",
+   "rows": 28,
+   "summary": {
+    "n": 50,
+    "p50": 0.10543199999665376,
+    "p95": 0.3591749999905005,
+    "p99": 0.5355520000011893,
+    "max": 0.5355520000011893,
+    "mean": 0.1533196399998269
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B4",
+   "query": "Q3 diff W=100 join",
+   "scope": "p2000",
+   "bucket": "all",
+   "rows": 28,
+   "summary": {
+    "n": 150,
+    "p50": 0.2924990000028629,
+    "p95": 1.564139999987674,
+    "p99": 2.3600140000053216,
+    "max": 2.6412379999965196,
+    "mean": 0.4798578866667231
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B4",
+   "query": "Q3 diff W=100 join",
+   "scope": "p2000",
+   "bucket": "early",
+   "rows": 28,
+   "summary": {
+    "n": 50,
+    "p50": 0.2348070000007283,
+    "p95": 1.5788349999929778,
+    "p99": 1.7013550000119722,
+    "max": 1.7013550000119722,
+    "mean": 0.5264715800006524
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B4",
+   "query": "Q3 diff W=100 join",
+   "scope": "p2000",
+   "bucket": "mid",
+   "rows": 28,
+   "summary": {
+    "n": 50,
+    "p50": 0.3766290000057779,
+    "p95": 1.4305779999995138,
+    "p99": 2.3600140000053216,
+    "max": 2.3600140000053216,
+    "mean": 0.5040828400003374
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B4",
+   "query": "Q3 diff W=100 join",
+   "scope": "p2000",
+   "bucket": "late",
+   "rows": 28,
+   "summary": {
+    "n": 50,
+    "p50": 0.1869250000017928,
+    "p95": 1.5102610000030836,
+    "p99": 2.6412379999965196,
+    "max": 2.6412379999965196,
+    "mean": 0.4090192399991793
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B4",
+   "query": "Q3 diff W=5000 flags",
+   "scope": "p2000",
+   "bucket": "all",
+   "rows": 836,
+   "summary": {
+    "n": 150,
+    "p50": 1.4748400000098627,
+    "p95": 11.650378999998793,
+    "p99": 21.240544000000227,
+    "max": 24.635391000003438,
+    "mean": 3.177425546666879
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B4",
+   "query": "Q3 diff W=5000 flags",
+   "scope": "p2000",
+   "bucket": "early",
+   "rows": 836,
+   "summary": {
+    "n": 50,
+    "p50": 1.6135429999994813,
+    "p95": 6.340782999992371,
+    "p99": 9.809619999999995,
+    "max": 9.809619999999995,
+    "mean": 2.183242859999882
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B4",
+   "query": "Q3 diff W=5000 flags",
+   "scope": "p2000",
+   "bucket": "mid",
+   "rows": 836,
+   "summary": {
+    "n": 50,
+    "p50": 1.505358000009437,
+    "p95": 14.070823000001837,
+    "p99": 24.635391000003438,
+    "max": 24.635391000003438,
+    "mean": 3.883699280001165
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B4",
+   "query": "Q3 diff W=5000 flags",
+   "scope": "p2000",
+   "bucket": "late",
+   "rows": 836,
+   "summary": {
+    "n": 50,
+    "p50": 1.2729249999974854,
+    "p95": 13.520975000006729,
+    "p99": 21.240544000000227,
+    "max": 21.240544000000227,
+    "mean": 3.4653344999995896
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B4",
+   "query": "Q3 diff W=5000 join",
+   "scope": "p2000",
+   "bucket": "all",
+   "rows": 836,
+   "summary": {
+    "n": 150,
+    "p50": 4.8916600000084145,
+    "p95": 37.157359999997425,
+    "p99": 80.12261099999887,
+    "max": 83.68264800000179,
+    "mean": 10.87095332000007
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B4",
+   "query": "Q3 diff W=5000 join",
+   "scope": "p2000",
+   "bucket": "early",
+   "rows": 836,
+   "summary": {
+    "n": 50,
+    "p50": 4.02251699999033,
+    "p95": 22.446404000002076,
+    "p99": 29.83156799999415,
+    "max": 29.83156799999415,
+    "mean": 7.555843179999502
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B4",
+   "query": "Q3 diff W=5000 join",
+   "scope": "p2000",
+   "bucket": "mid",
+   "rows": 836,
+   "summary": {
+    "n": 50,
+    "p50": 5.622218000004068,
+    "p95": 39.67202699999325,
+    "p99": 80.12261099999887,
+    "max": 80.12261099999887,
+    "mean": 13.023608360000072
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B4",
+   "query": "Q3 diff W=5000 join",
+   "scope": "p2000",
+   "bucket": "late",
+   "rows": 836,
+   "summary": {
+    "n": 50,
+    "p50": 4.038169999999809,
+    "p95": 41.32193199999165,
+    "p99": 83.68264800000179,
+    "max": 83.68264800000179,
+    "mean": 12.033408420000633
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B4",
+   "query": "Q4d commits of page",
+   "scope": "200/page",
+   "bucket": "all",
+   "rows": 201,
+   "summary": {
+    "n": 150,
+    "p50": 1.4827509999886388,
+    "p95": 2.2415410000103293,
+    "p99": 2.9607839999953285,
+    "max": 6.252359999998589,
+    "mean": 1.589103639999327
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B4",
+   "query": "Q4d commits of page",
+   "scope": "200/page",
+   "bucket": "mid",
+   "rows": 201,
+   "summary": {
+    "n": 150,
+    "p50": 1.4827509999886388,
+    "p95": 2.2415410000103293,
+    "p99": 2.9607839999953285,
+    "max": 6.252359999998589,
+    "mean": 1.589103639999327
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q2 page@T",
+   "scope": "p2000",
+   "bucket": "all",
+   "rows": 1816,
+   "summary": {
+    "n": 300,
+    "p50": 3.486774000004516,
+    "p95": 5.646890999996685,
+    "p99": 7.994588999994448,
+    "max": 16.09312800000771,
+    "mean": 3.690318030000247
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q2 page@T",
+   "scope": "p2000",
+   "bucket": "early",
+   "rows": 1816,
+   "summary": {
+    "n": 100,
+    "p50": 3.194170999995549,
+    "p95": 4.946624000003794,
+    "p99": 6.832787000006647,
+    "max": 16.09312800000771,
+    "mean": 3.463562240000465
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q2 page@T",
+   "scope": "p2000",
+   "bucket": "mid",
+   "rows": 1816,
+   "summary": {
+    "n": 100,
+    "p50": 3.4835539999912726,
+    "p95": 5.49318599999242,
+    "p99": 8.138406999991275,
+    "max": 8.908226999992621,
+    "mean": 3.639526419999602
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q2 page@T",
+   "scope": "p2000",
+   "bucket": "late",
+   "rows": 1816,
+   "summary": {
+    "n": 100,
+    "p50": 3.857222999999067,
+    "p95": 6.073398000007728,
+    "p99": 7.71734099999594,
+    "max": 7.994588999994448,
+    "mean": 3.967865430000675
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q2 page@T",
+   "scope": "p10000",
+   "bucket": "all",
+   "rows": 9040,
+   "summary": {
+    "n": 100,
+    "p50": 12.11609199999657,
+    "p95": 20.373500000001513,
+    "p99": 25.446930999998585,
+    "max": 34.11363499998697,
+    "mean": 13.362728159999243
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q2 page@T",
+   "scope": "p10000",
+   "bucket": "early",
+   "rows": 9040,
+   "summary": {
+    "n": 34,
+    "p50": 11.627267999996548,
+    "p95": 20.702132999998867,
+    "p99": 25.446930999998585,
+    "max": 25.446930999998585,
+    "mean": 12.764363823530456
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q2 page@T",
+   "scope": "p10000",
+   "bucket": "mid",
+   "rows": 9040,
+   "summary": {
+    "n": 33,
+    "p50": 12.11609199999657,
+    "p95": 23.6592779999919,
+    "p99": 34.11363499998697,
+    "max": 34.11363499998697,
+    "mean": 13.693507242423507
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q2 page@T",
+   "scope": "p10000",
+   "bucket": "late",
+   "rows": 9040,
+   "summary": {
+    "n": 33,
+    "p50": 12.878369999991264,
+    "p95": 20.373500000001513,
+    "p99": 21.42925999998988,
+    "max": 21.42925999998988,
+    "mean": 13.64844566666403
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q1 vp500 read+js-order",
+   "scope": "p2000",
+   "bucket": "all",
+   "rows": 500,
+   "summary": {
+    "n": 300,
+    "p50": 3.690520000003744,
+    "p95": 5.983445000005304,
+    "p99": 7.025051999997231,
+    "max": 7.917770000000019,
+    "mean": 3.8899503400005537
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q1 vp500 read+js-order",
+   "scope": "p2000",
+   "bucket": "early",
+   "rows": 500,
+   "summary": {
+    "n": 100,
+    "p50": 3.471075000008568,
+    "p95": 5.60172400000738,
+    "p99": 7.025051999997231,
+    "max": 7.103273000000627,
+    "mean": 3.68045317000011
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q1 vp500 read+js-order",
+   "scope": "p2000",
+   "bucket": "mid",
+   "rows": 500,
+   "summary": {
+    "n": 100,
+    "p50": 3.7152550000027986,
+    "p95": 5.324669000008726,
+    "p99": 6.593744999991031,
+    "max": 7.146225000004051,
+    "mean": 3.8604298300012307
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q1 vp500 read+js-order",
+   "scope": "p2000",
+   "bucket": "late",
+   "rows": 500,
+   "summary": {
+    "n": 100,
+    "p50": 3.882642999989912,
+    "p95": 6.250157999995281,
+    "p99": 6.994261999992887,
+    "max": 7.917770000000019,
+    "mean": 4.12896802000032
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q1 vp500 read+js-order",
+   "scope": "p10000",
+   "bucket": "all",
+   "rows": 500,
+   "summary": {
+    "n": 100,
+    "p50": 16.138151999999536,
+    "p95": 23.148933000004035,
+    "p99": 26.010267999998177,
+    "max": 26.7453600000008,
+    "mean": 17.220841330000113
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q1 vp500 read+js-order",
+   "scope": "p10000",
+   "bucket": "early",
+   "rows": 500,
+   "summary": {
+    "n": 34,
+    "p50": 14.909163999996963,
+    "p95": 20.46723200000997,
+    "p99": 24.418642999997246,
+    "max": 24.418642999997246,
+    "mean": 15.575077058823595
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q1 vp500 read+js-order",
+   "scope": "p10000",
+   "bucket": "mid",
+   "rows": 500,
+   "summary": {
+    "n": 33,
+    "p50": 16.687273000003188,
+    "p95": 23.148933000004035,
+    "p99": 24.000190999999177,
+    "max": 24.000190999999177,
+    "mean": 17.762229878788332
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q1 vp500 read+js-order",
+   "scope": "p10000",
+   "bucket": "late",
+   "rows": 500,
+   "summary": {
+    "n": 33,
+    "p50": 17.896252000005916,
+    "p95": 26.010267999998177,
+    "p99": 26.7453600000008,
+    "max": 26.7453600000008,
+    "mean": 18.375088696969517
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q2s structure only",
+   "scope": "p2000",
+   "bucket": "all",
+   "rows": 1816,
+   "summary": {
+    "n": 300,
+    "p50": 1.131836000000476,
+    "p95": 2.2556729999923846,
+    "p99": 3.124207999993814,
+    "max": 5.60079099998984,
+    "mean": 1.2744267099994855
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q2s structure only",
+   "scope": "p2000",
+   "bucket": "early",
+   "rows": 1816,
+   "summary": {
+    "n": 100,
+    "p50": 1.0226840000104858,
+    "p95": 1.9797639999887906,
+    "p99": 2.2556729999923846,
+    "max": 2.4000620000006165,
+    "mean": 1.131404079999047
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q2s structure only",
+   "scope": "p2000",
+   "bucket": "mid",
+   "rows": 1816,
+   "summary": {
+    "n": 100,
+    "p50": 1.099728999994113,
+    "p95": 2.064660999996704,
+    "p99": 2.4918239999969956,
+    "max": 3.18935600000259,
+    "mean": 1.2213364700000966
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q2s structure only",
+   "scope": "p2000",
+   "bucket": "late",
+   "rows": 1816,
+   "summary": {
+    "n": 100,
+    "p50": 1.3121070000051986,
+    "p95": 2.4676310000068042,
+    "p99": 3.942382000008365,
+    "max": 5.60079099998984,
+    "mean": 1.470539579999313
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q1 vp500 two-step",
+   "scope": "p2000",
+   "bucket": "all",
+   "rows": 500,
+   "summary": {
+    "n": 300,
+    "p50": 5.996027999994112,
+    "p95": 8.32883800000127,
+    "p99": 9.760551999992458,
+    "max": 11.145336000001407,
+    "mean": 6.224354510000121
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q1 vp500 two-step",
+   "scope": "p2000",
+   "bucket": "early",
+   "rows": 500,
+   "summary": {
+    "n": 100,
+    "p50": 6.488031000000774,
+    "p95": 8.912450999996508,
+    "p99": 10.635170000008657,
+    "max": 11.145336000001407,
+    "mean": 6.728624450001371
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q1 vp500 two-step",
+   "scope": "p2000",
+   "bucket": "mid",
+   "rows": 500,
+   "summary": {
+    "n": 100,
+    "p50": 5.70716099999845,
+    "p95": 7.882138999993913,
+    "p99": 9.401928000006592,
+    "max": 9.760551999992458,
+    "mean": 6.006601499999524
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q1 vp500 two-step",
+   "scope": "p2000",
+   "bucket": "late",
+   "rows": 500,
+   "summary": {
+    "n": 100,
+    "p50": 5.642128999999841,
+    "p95": 7.78754599999229,
+    "p99": 8.32883800000127,
+    "max": 8.435893999994732,
+    "mean": 5.937837579999468
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q2s structure only",
+   "scope": "p10000",
+   "bucket": "all",
+   "rows": 9040,
+   "summary": {
+    "n": 100,
+    "p50": 4.4682469999970635,
+    "p95": 6.549595000004047,
+    "p99": 7.861571999994339,
+    "max": 8.007226000001538,
+    "mean": 4.716166020000092
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q2s structure only",
+   "scope": "p10000",
+   "bucket": "early",
+   "rows": 9040,
+   "summary": {
+    "n": 34,
+    "p50": 3.901579999990645,
+    "p95": 6.037242999998853,
+    "p99": 6.549595000004047,
+    "max": 6.549595000004047,
+    "mean": 4.428586500000058
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q2s structure only",
+   "scope": "p10000",
+   "bucket": "mid",
+   "rows": 9040,
+   "summary": {
+    "n": 33,
+    "p50": 4.3534359999903245,
+    "p95": 6.242436000000453,
+    "p99": 6.431991000004928,
+    "max": 6.431991000004928,
+    "mean": 4.562351454544996
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q2s structure only",
+   "scope": "p10000",
+   "bucket": "late",
+   "rows": 9040,
+   "summary": {
+    "n": 33,
+    "p50": 4.946317000009003,
+    "p95": 7.861571999994339,
+    "p99": 8.007226000001538,
+    "max": 8.007226000001538,
+    "mean": 5.166274636364313
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q1 vp500 two-step",
+   "scope": "p10000",
+   "bucket": "all",
+   "rows": 500,
+   "summary": {
+    "n": 100,
+    "p50": 11.351954999990994,
+    "p95": 15.205312999998569,
+    "p99": 16.946660999994492,
+    "max": 21.069089999989956,
+    "mean": 11.496470249999547
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q1 vp500 two-step",
+   "scope": "p10000",
+   "bucket": "early",
+   "rows": 500,
+   "summary": {
+    "n": 34,
+    "p50": 10.86602899999707,
+    "p95": 13.912215999996988,
+    "p99": 21.069089999989956,
+    "max": 21.069089999989956,
+    "mean": 11.109512882354252
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q1 vp500 two-step",
+   "scope": "p10000",
+   "bucket": "mid",
+   "rows": 500,
+   "summary": {
+    "n": 33,
+    "p50": 11.351954999990994,
+    "p95": 16.72530900000129,
+    "p99": 16.946660999994492,
+    "max": 16.946660999994492,
+    "mean": 11.485879363634123
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q1 vp500 two-step",
+   "scope": "p10000",
+   "bucket": "late",
+   "rows": 500,
+   "summary": {
+    "n": 33,
+    "p50": 11.947099999990314,
+    "p95": 15.205312999998569,
+    "p99": 16.13642299998901,
+    "max": 16.13642299998901,
+    "mean": 11.905744484848004
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q3 diff W=1 flags",
+   "scope": "p2000",
+   "bucket": "all",
+   "rows": 1,
+   "summary": {
+    "n": 150,
+    "p50": 0.06729599999380298,
+    "p95": 0.26972399999795016,
+    "p99": 0.6936589999968419,
+    "max": 3.086678000006941,
+    "mean": 0.11971433999967607
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q3 diff W=1 flags",
+   "scope": "p2000",
+   "bucket": "early",
+   "rows": 1,
+   "summary": {
+    "n": 50,
+    "p50": 0.06849799999326933,
+    "p95": 0.26972399999795016,
+    "p99": 0.37533899999107234,
+    "max": 0.37533899999107234,
+    "mean": 0.09636027999920771
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q3 diff W=1 flags",
+   "scope": "p2000",
+   "bucket": "mid",
+   "rows": 1,
+   "summary": {
+    "n": 50,
+    "p50": 0.06643500000063796,
+    "p95": 0.15760500000033062,
+    "p99": 0.22602899999765214,
+    "max": 0.22602899999765214,
+    "mean": 0.0785621999995783
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q3 diff W=1 flags",
+   "scope": "p2000",
+   "bucket": "late",
+   "rows": 1,
+   "summary": {
+    "n": 50,
+    "p50": 0.0672119999944698,
+    "p95": 0.6770499999984168,
+    "p99": 3.086678000006941,
+    "max": 3.086678000006941,
+    "mean": 0.18422054000024218
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q3 diff W=1 join",
+   "scope": "p2000",
+   "bucket": "all",
+   "rows": 1,
+   "summary": {
+    "n": 150,
+    "p50": 0.08770999999251217,
+    "p95": 0.3946060000016587,
+    "p99": 1.1156580000097165,
+    "max": 2.773589999997057,
+    "mean": 0.1417043399998996
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q3 diff W=1 join",
+   "scope": "p2000",
+   "bucket": "early",
+   "rows": 1,
+   "summary": {
+    "n": 50,
+    "p50": 0.08813099999679253,
+    "p95": 0.21977500000502914,
+    "p99": 0.8126510000001872,
+    "max": 0.8126510000001872,
+    "mean": 0.12553561999899102
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q3 diff W=1 join",
+   "scope": "p2000",
+   "bucket": "mid",
+   "rows": 1,
+   "summary": {
+    "n": 50,
+    "p50": 0.08344499999657273,
+    "p95": 0.2839850000018487,
+    "p99": 1.1156580000097165,
+    "max": 1.1156580000097165,
+    "mean": 0.12328606000082801
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q3 diff W=1 join",
+   "scope": "p2000",
+   "bucket": "late",
+   "rows": 1,
+   "summary": {
+    "n": 50,
+    "p50": 0.09141799999633804,
+    "p95": 0.5158030000020517,
+    "p99": 2.773589999997057,
+    "max": 2.773589999997057,
+    "mean": 0.1762913399998797
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q3 diff W=100 flags",
+   "scope": "p2000",
+   "bucket": "all",
+   "rows": 28,
+   "summary": {
+    "n": 150,
+    "p50": 0.15672099999210332,
+    "p95": 0.8328770000080112,
+    "p99": 3.1357830000051763,
+    "max": 4.055468000005931,
+    "mean": 0.279943566666916
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q3 diff W=100 flags",
+   "scope": "p2000",
+   "bucket": "early",
+   "rows": 28,
+   "summary": {
+    "n": 50,
+    "p50": 0.16434400000434835,
+    "p95": 0.9080200000025798,
+    "p99": 1.6747279999981401,
+    "max": 1.6747279999981401,
+    "mean": 0.2784250800005975
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q3 diff W=100 flags",
+   "scope": "p2000",
+   "bucket": "mid",
+   "rows": 28,
+   "summary": {
+    "n": 50,
+    "p50": 0.19000499999674503,
+    "p95": 0.6423890000005485,
+    "p99": 4.055468000005931,
+    "max": 4.055468000005931,
+    "mean": 0.31064580000005665
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q3 diff W=100 flags",
+   "scope": "p2000",
+   "bucket": "late",
+   "rows": 28,
+   "summary": {
+    "n": 50,
+    "p50": 0.13643100000626873,
+    "p95": 0.5429609999991953,
+    "p99": 3.1357830000051763,
+    "max": 3.1357830000051763,
+    "mean": 0.2507598200000939
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q3 diff W=100 join",
+   "scope": "p2000",
+   "bucket": "all",
+   "rows": 28,
+   "summary": {
+    "n": 150,
+    "p50": 0.31975799999781884,
+    "p95": 1.5323210000060499,
+    "p99": 2.6645580000040354,
+    "max": 2.750115000002552,
+    "mean": 0.5482531399996757
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q3 diff W=100 join",
+   "scope": "p2000",
+   "bucket": "early",
+   "rows": 28,
+   "summary": {
+    "n": 50,
+    "p50": 0.291813000003458,
+    "p95": 1.8499989999982063,
+    "p99": 2.750115000002552,
+    "max": 2.750115000002552,
+    "mean": 0.6124232999997912
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q3 diff W=100 join",
+   "scope": "p2000",
+   "bucket": "mid",
+   "rows": 28,
+   "summary": {
+    "n": 50,
+    "p50": 0.39415800001006573,
+    "p95": 1.5035010000137845,
+    "p99": 2.6645580000040354,
+    "max": 2.6645580000040354,
+    "mean": 0.5725054599999566
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q3 diff W=100 join",
+   "scope": "p2000",
+   "bucket": "late",
+   "rows": 28,
+   "summary": {
+    "n": 50,
+    "p50": 0.2190919999993639,
+    "p95": 1.3320529999909922,
+    "p99": 2.499470000009751,
+    "max": 2.499470000009751,
+    "mean": 0.4598306599992793
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q3 diff W=5000 flags",
+   "scope": "p2000",
+   "bucket": "all",
+   "rows": 836,
+   "summary": {
+    "n": 150,
+    "p50": 1.8909319999947911,
+    "p95": 12.252953999995952,
+    "p99": 20.48137300000235,
+    "max": 32.26921900000889,
+    "mean": 3.761928053332958
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q3 diff W=5000 flags",
+   "scope": "p2000",
+   "bucket": "early",
+   "rows": 836,
+   "summary": {
+    "n": 50,
+    "p50": 1.5812050000095041,
+    "p95": 8.929923000003328,
+    "p99": 10.294819999995525,
+    "max": 10.294819999995525,
+    "mean": 2.509181900000549
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q3 diff W=5000 flags",
+   "scope": "p2000",
+   "bucket": "mid",
+   "rows": 836,
+   "summary": {
+    "n": 50,
+    "p50": 1.8734569999942323,
+    "p95": 17.684181000004173,
+    "p99": 32.26921900000889,
+    "max": 32.26921900000889,
+    "mean": 4.726705399999045
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q3 diff W=5000 flags",
+   "scope": "p2000",
+   "bucket": "late",
+   "rows": 836,
+   "summary": {
+    "n": 50,
+    "p50": 1.8909319999947911,
+    "p95": 14.364177999988897,
+    "p99": 20.126900000002934,
+    "max": 20.126900000002934,
+    "mean": 4.04989685999928
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q3 diff W=5000 join",
+   "scope": "p2000",
+   "bucket": "all",
+   "rows": 836,
+   "summary": {
+    "n": 150,
+    "p50": 5.0573589999985415,
+    "p95": 35.92931900000258,
+    "p99": 84.56440400000429,
+    "max": 87.89571500000602,
+    "mean": 11.093971800000581
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q3 diff W=5000 join",
+   "scope": "p2000",
+   "bucket": "early",
+   "rows": 836,
+   "summary": {
+    "n": 50,
+    "p50": 4.597294999999576,
+    "p95": 23.205744000006234,
+    "p99": 28.414982000002055,
+    "max": 28.414982000002055,
+    "mean": 7.565975700000709
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q3 diff W=5000 join",
+   "scope": "p2000",
+   "bucket": "mid",
+   "rows": 836,
+   "summary": {
+    "n": 50,
+    "p50": 5.578406999993604,
+    "p95": 39.09819499999867,
+    "p99": 87.89571500000602,
+    "max": 87.89571500000602,
+    "mean": 13.506852400000499
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q3 diff W=5000 join",
+   "scope": "p2000",
+   "bucket": "late",
+   "rows": 836,
+   "summary": {
+    "n": 50,
+    "p50": 4.267125999991549,
+    "p95": 51.3914810000133,
+    "p99": 84.56440400000429,
+    "max": 84.56440400000429,
+    "mean": 12.209087300000538
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q4d commits of page",
+   "scope": "200/page",
+   "bucket": "all",
+   "rows": 201,
+   "summary": {
+    "n": 150,
+    "p50": 1.5047040000063134,
+    "p95": 3.2817080000095302,
+    "p99": 6.220803000003798,
+    "max": 7.380658999987645,
+    "mean": 1.7456187866673767
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "B5",
+   "query": "Q4d commits of page",
+   "scope": "200/page",
+   "bucket": "mid",
+   "rows": 201,
+   "summary": {
+    "n": 150,
+    "p50": 1.5047040000063134,
+    "p95": 3.2817080000095302,
+    "p99": 6.220803000003798,
+    "max": 7.380658999987645,
+    "mean": 1.7456187866673767
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "C",
+   "query": "Q2 page@T",
+   "scope": "p2000",
+   "bucket": "all",
+   "rows": 1816,
+   "summary": {
+    "n": 300,
+    "p50": 9.589003000000957,
+    "p95": 14.08577299999888,
+    "p99": 17.066909000001033,
+    "max": 18.611006999999518,
+    "mean": 10.242716680000353
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "C",
+   "query": "Q2 page@T",
+   "scope": "p2000",
+   "bucket": "early",
+   "rows": 1816,
+   "summary": {
+    "n": 100,
+    "p50": 9.065127000008943,
+    "p95": 14.159436999994796,
+    "p99": 14.871727000005194,
+    "max": 17.066909000001033,
+    "mean": 9.851242980000825
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "C",
+   "query": "Q2 page@T",
+   "scope": "p2000",
+   "bucket": "mid",
+   "rows": 1816,
+   "summary": {
+    "n": 100,
+    "p50": 9.32917300000554,
+    "p95": 13.833538999999291,
+    "p99": 17.323948000004748,
+    "max": 17.86549599999853,
+    "mean": 10.198974999999919
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "C",
+   "query": "Q2 page@T",
+   "scope": "p2000",
+   "bucket": "late",
+   "rows": 1816,
+   "summary": {
+    "n": 100,
+    "p50": 10.121408999999403,
+    "p95": 14.246931000001496,
+    "p99": 16.2560780000058,
+    "max": 18.611006999999518,
+    "mean": 10.677932060000312
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "C",
+   "query": "Q2 page@T",
+   "scope": "p10000",
+   "bucket": "all",
+   "rows": 9040,
+   "summary": {
+    "n": 100,
+    "p50": 42.15354100000695,
+    "p95": 60.3711270000058,
+    "p99": 66.37526600000274,
+    "max": 68.11666600000171,
+    "mean": 44.00230992000041
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "C",
+   "query": "Q2 page@T",
+   "scope": "p10000",
+   "bucket": "early",
+   "rows": 9040,
+   "summary": {
+    "n": 34,
+    "p50": 40.765632000009646,
+    "p95": 52.14190500001132,
+    "p99": 59.65570399998978,
+    "max": 59.65570399998978,
+    "mean": 42.000497823530594
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "C",
+   "query": "Q2 page@T",
+   "scope": "p10000",
+   "bucket": "mid",
+   "rows": 9040,
+   "summary": {
+    "n": 33,
+    "p50": 42.07465900000534,
+    "p95": 61.638795999999274,
+    "p99": 68.11666600000171,
+    "max": 68.11666600000171,
+    "mean": 44.73112215151548
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "C",
+   "query": "Q2 page@T",
+   "scope": "p10000",
+   "bucket": "late",
+   "rows": 9040,
+   "summary": {
+    "n": 33,
+    "p50": 43.195905000000494,
+    "p95": 63.45311100000981,
+    "p99": 66.37526600000274,
+    "max": 66.37526600000274,
+    "mean": 45.33597075757544
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "C",
+   "query": "Q1 vp500 read+js-order",
+   "scope": "p2000",
+   "bucket": "all",
+   "rows": 500,
+   "summary": {
+    "n": 300,
+    "p50": 9.334117999998853,
+    "p95": 11.984792000002926,
+    "p99": 12.896928999994998,
+    "max": 15.362091000002692,
+    "mean": 9.594562300000737
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "C",
+   "query": "Q1 vp500 read+js-order",
+   "scope": "p2000",
+   "bucket": "early",
+   "rows": 500,
+   "summary": {
+    "n": 100,
+    "p50": 8.929420000000391,
+    "p95": 11.571058000001358,
+    "p99": 12.122315999993589,
+    "max": 12.804052000006777,
+    "mean": 9.294639349999779
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "C",
+   "query": "Q1 vp500 read+js-order",
+   "scope": "p2000",
+   "bucket": "mid",
+   "rows": 500,
+   "summary": {
+    "n": 100,
+    "p50": 9.363561000005575,
+    "p95": 11.790254999999888,
+    "p99": 12.76980100000219,
+    "max": 13.288776999994298,
+    "mean": 9.580232710001292
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "C",
+   "query": "Q1 vp500 read+js-order",
+   "scope": "p2000",
+   "bucket": "late",
+   "rows": 500,
+   "summary": {
+    "n": 100,
+    "p50": 9.738656000001356,
+    "p95": 12.084057999993092,
+    "p99": 13.038295000005746,
+    "max": 15.362091000002692,
+    "mean": 9.908814840001142
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "C",
+   "query": "Q1 vp500 read+js-order",
+   "scope": "p10000",
+   "bucket": "all",
+   "rows": 500,
+   "summary": {
+    "n": 100,
+    "p50": 47.54056200000923,
+    "p95": 72.252238999994,
+    "p99": 78.55861799999548,
+    "max": 81.55702300000121,
+    "mean": 50.35973728000041
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "C",
+   "query": "Q1 vp500 read+js-order",
+   "scope": "p10000",
+   "bucket": "early",
+   "rows": 500,
+   "summary": {
+    "n": 34,
+    "p50": 44.9828889999917,
+    "p95": 77.95846500000334,
+    "p99": 78.55861799999548,
+    "max": 78.55861799999548,
+    "mean": 48.8792168235283
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "C",
+   "query": "Q1 vp500 read+js-order",
+   "scope": "p10000",
+   "bucket": "mid",
+   "rows": 500,
+   "summary": {
+    "n": 33,
+    "p50": 47.81498599999759,
+    "p95": 74.17649800000072,
+    "p99": 81.55702300000121,
+    "max": 81.55702300000121,
+    "mean": 51.830926787879434
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "C",
+   "query": "Q1 vp500 read+js-order",
+   "scope": "p10000",
+   "bucket": "late",
+   "rows": 500,
+   "summary": {
+    "n": 33,
+    "p50": 48.19491500000004,
+    "p95": 68.0211879999988,
+    "p99": 77.55082800000673,
+    "max": 77.55082800000673,
+    "mean": 50.41393248485022
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "C",
+   "query": "Q3 diff W=1",
+   "scope": "p2000",
+   "bucket": "all",
+   "rows": 1,
+   "summary": {
+    "n": 150,
+    "p50": 4.66284099999757,
+    "p95": 7.078366999994614,
+    "p99": 55.40092300000833,
+    "max": 95.24219099999755,
+    "mean": 5.91075570666629
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "C",
+   "query": "Q3 diff W=1",
+   "scope": "p2000",
+   "bucket": "early",
+   "rows": 1,
+   "summary": {
+    "n": 50,
+    "p50": 4.668074999994133,
+    "p95": 7.523845999996411,
+    "p99": 7.721045999991475,
+    "max": 7.721045999991475,
+    "mean": 5.074857919998467
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "C",
+   "query": "Q3 diff W=1",
+   "scope": "p2000",
+   "bucket": "mid",
+   "rows": 1,
+   "summary": {
+    "n": 50,
+    "p50": 4.643823000005796,
+    "p95": 7.078366999994614,
+    "p99": 55.40092300000833,
+    "max": 55.40092300000833,
+    "mean": 5.916899080000585
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "C",
+   "query": "Q3 diff W=1",
+   "scope": "p2000",
+   "bucket": "late",
+   "rows": 1,
+   "summary": {
+    "n": 50,
+    "p50": 4.6450110000005225,
+    "p95": 6.856864000001224,
+    "p99": 95.24219099999755,
+    "max": 95.24219099999755,
+    "mean": 6.740510119999817
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "C",
+   "query": "Q3 diff W=100",
+   "scope": "p2000",
+   "bucket": "all",
+   "rows": 28,
+   "summary": {
+    "n": 150,
+    "p50": 5.287742000000435,
+    "p95": 7.9305809999932535,
+    "p99": 8.477065999992192,
+    "max": 8.657726999997976,
+    "mean": 5.559144913333003
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "C",
+   "query": "Q3 diff W=100",
+   "scope": "p2000",
+   "bucket": "early",
+   "rows": 28,
+   "summary": {
+    "n": 50,
+    "p50": 5.371331000002101,
+    "p95": 7.287446000002092,
+    "p99": 8.388925999999628,
+    "max": 8.388925999999628,
+    "mean": 5.600427339999879
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "C",
+   "query": "Q3 diff W=100",
+   "scope": "p2000",
+   "bucket": "mid",
+   "rows": 28,
+   "summary": {
+    "n": 50,
+    "p50": 5.121652999994694,
+    "p95": 7.559095000004163,
+    "p99": 8.657726999997976,
+    "max": 8.657726999997976,
+    "mean": 5.550803159999777
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "C",
+   "query": "Q3 diff W=100",
+   "scope": "p2000",
+   "bucket": "late",
+   "rows": 28,
+   "summary": {
+    "n": 50,
+    "p50": 5.406784999999218,
+    "p95": 7.971753999998327,
+    "p99": 8.477065999992192,
+    "max": 8.477065999992192,
+    "mean": 5.526204239999352
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "C",
+   "query": "Q3 diff W=5000",
+   "scope": "p2000",
+   "bucket": "all",
+   "rows": 975,
+   "summary": {
+    "n": 150,
+    "p50": 7.837720000010449,
+    "p95": 23.081737999993493,
+    "p99": 56.44032900000457,
+    "max": 60.0432909999945,
+    "mean": 11.111269253333933
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "C",
+   "query": "Q3 diff W=5000",
+   "scope": "p2000",
+   "bucket": "early",
+   "rows": 975,
+   "summary": {
+    "n": 50,
+    "p50": 8.084140999999363,
+    "p95": 17.2132539999875,
+    "p99": 20.124760999999125,
+    "max": 20.124760999999125,
+    "mean": 9.106373940000195
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "C",
+   "query": "Q3 diff W=5000",
+   "scope": "p2000",
+   "bucket": "mid",
+   "rows": 975,
+   "summary": {
+    "n": 50,
+    "p50": 7.340263000005507,
+    "p95": 33.02476499999466,
+    "p99": 60.0432909999945,
+    "max": 60.0432909999945,
+    "mean": 12.580380560000485
+   }
+  },
+  {
+   "dialect": "pg-vpb3",
+   "variant": "C",
+   "query": "Q3 diff W=5000",
+   "scope": "p2000",
+   "bucket": "late",
+   "rows": 975,
+   "summary": {
+    "n": 50,
+    "p50": 7.784425999998348,
+    "p95": 31.699413000009372,
+    "p99": 55.992679999995744,
+    "max": 55.992679999995744,
+    "mean": 11.64705326000112
+   }
+  }
+ ]
+}

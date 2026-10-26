@@ -4,9 +4,9 @@
  * Run: bun vector/bench.ts --db=<file> --n=200000 --dim=1024 --dtype=i8 [--queries=100] [--budget=20000]
  *        [--k=50] [--scenarios=resident,sqlite] [--out=results/vec-....json]
  */
-import { mkdirSync, readFileSync, writeFileSync, existsSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { arg, argNum, fmt, summarize, DATA_ROOT } from "../time-travel/lib";
+import { arg, argNum, DATA_ROOT, fmt, summarize } from "../time-travel/lib";
 import { genVector, makeGen, quantize, SPACES } from "./common";
 import type { InitMsg, QueryMsg } from "./worker";
 
@@ -71,8 +71,11 @@ interface Row {
 	extra?: Record<string, unknown>;
 }
 const rows: Row[] = [];
+const kernelResults = new Map<string, { kernel: string; got: number[][] }>();
 const loads: Record<string, unknown>[] = [];
-const truth: Record<string, number[][]> = existsSync(truthPath) ? JSON.parse(readFileSync(truthPath, "utf8")) : {};
+const truth: Record<string, number[][]> = existsSync(truthPath)
+	? JSON.parse(readFileSync(truthPath, "utf8"))
+	: {};
 const saveTruth = dtype === "f32";
 const newTruth: Record<string, number[][]> = {};
 
@@ -121,9 +124,23 @@ async function runQueries(
 	for (let j = 0; j < Q; j++) {
 		const qq = queries[j] as (typeof queries)[number];
 		const buf = (dtype === "i8" ? qq.i8 : qq.f32).slice().buffer;
-		const msg: QueryMsg = { type: "query", id: j, q: buf, qscale: qq.scale, kernel, filter, space: qq.space };
+		const msg: QueryMsg = {
+			type: "query",
+			id: j,
+			q: buf,
+			qscale: qq.scale,
+			kernel,
+			filter,
+			space: qq.space,
+		};
 		const t0 = performance.now();
-		const r = await call<{ scanMs: number; ids: Int32Array; scores: Float32Array; rows?: number; bytes?: number }>(w, msg, [buf]);
+		const r = await call<{
+			scanMs: number;
+			ids: Int32Array;
+			scores: Float32Array;
+			rows?: number;
+			bytes?: number;
+		}>(w, msg, [buf]);
 		const dt = performance.now() - t0;
 		if (j >= 3) {
 			times.push(dt);
@@ -156,10 +173,23 @@ async function runQueries(
 	};
 	// recall against float32 exact (range filter, same space)
 	const tkey = `${filter}`;
-	if (saveTruth && (filter === "range" || filter === "r2" || filter === "r3") && kernel !== undefined) {
+	if (
+		saveTruth &&
+		(filter === "range" || filter === "r2" || filter === "r3") &&
+		kernel !== undefined
+	) {
 		if (!newTruth.range) newTruth.range = got;
 	}
-	if (!saveTruth && truth.range && (filter === "range" || filter === "tag" || filter === "ids" || filter === "r2" || filter === "r3" || filter === "r1")) {
+	if (
+		!saveTruth &&
+		truth.range &&
+		(filter === "range" ||
+			filter === "tag" ||
+			filter === "ids" ||
+			filter === "r2" ||
+			filter === "r3" ||
+			filter === "r1")
+	) {
 		const t = truth.range as number[][];
 		let r10 = 0;
 		let r50 = 0;
@@ -173,10 +203,26 @@ async function runQueries(
 		row.extra = { ...row.extra, recallAt10: r10 / c, recallAt50: r50 / c };
 	}
 	void tkey;
+	// the two kernels must return the same ids (exact for float32, near-exact for int8: only fp rounding differs)
+	const agreeKey = `${layout}:${filter}`;
+	const prev = kernelResults.get(agreeKey);
+	if (prev && prev.kernel !== kernel) {
+		let same = 0;
+		let tot = 0;
+		for (let j = 0; j < got.length; j++) {
+			if (!got[j] || !prev.got[j]) continue;
+			tot++;
+			if (JSON.stringify(got[j]) === JSON.stringify(prev.got[j])) same++;
+		}
+		row.extra = { ...row.extra, kernelAgreement: `${same}/${tot}` };
+	} else kernelResults.set(agreeKey, { kernel, got });
 	rows.push(row);
-	const mb = row.extra && typeof row.extra.mbPerQuery === "number" ? ` read ${fmt(row.extra.mbPerQuery as number, 1)}MB` : "";
+	const mb =
+		row.extra && typeof row.extra.mbPerQuery === "number"
+			? ` read ${fmt(row.extra.mbPerQuery as number, 1)}MB`
+			: "";
 	console.log(
-		`  ${scenario.padEnd(9)} ${(layout ?? "").padEnd(11)} ${filter.padEnd(8)} ${kernel.padEnd(4)} scanned~${String(nCandidates).padStart(8)}  p50 ${fmt(s.p50).padStart(8)}  p95 ${fmt(s.p95).padStart(8)}  p99 ${fmt(s.p99).padStart(8)} ms (scan p50 ${fmt(sc.p50)})  n=${times.length}  lag99 ${fmt(lagP99)}ms${mb}${row.extra?.recallAt50 !== undefined ? `  recall@10 ${fmt(row.extra.recallAt10 as number, 3)} @50 ${fmt(row.extra.recallAt50 as number, 3)}` : ""}`,
+		`  ${scenario.padEnd(9)} ${(layout ?? "").padEnd(11)} ${filter.padEnd(8)} ${kernel.padEnd(4)} scanned~${String(nCandidates).padStart(8)}  p50 ${fmt(s.p50).padStart(8)}  p95 ${fmt(s.p95).padStart(8)}  p99 ${fmt(s.p99).padStart(8)} ms (scan p50 ${fmt(sc.p50)})  n=${times.length}  lag99 ${fmt(lagP99)}ms${mb}${row.extra?.kernelAgreement !== undefined ? `  js/wasm identical ${row.extra.kernelAgreement}` : ""}${row.extra?.recallAt50 !== undefined ? `  recall@10 ${fmt(row.extra.recallAt10 as number, 3)} @50 ${fmt(row.extra.recallAt50 as number, 3)}` : ""}`,
 	);
 }
 
@@ -186,25 +232,50 @@ const rss0 = process.memoryUsage().rss;
 if (scenarios.includes("resident")) {
 	for (const layout of ["clustered", "interleaved"] as const) {
 		const w = spawn();
-		const init: InitMsg = { type: "init", mode: "resident", dbPath, dtype, dim, n, layout, loadFrom: "r2", k: K };
-		const r = await call<{ loadMs: number; bytes: number }>(w, init);
-		const rss = process.memoryUsage().rss;
-		const load = { layout, loadFrom: "r2", loadMs: r.loadMs, matrixBytes: r.bytes, rssDeltaMB: (rss - rss0) / 1e6, vmRssMB: vmKb("VmRSS") / 1024, vmHwmMB: vmKb("VmHWM") / 1024 };
-		loads.push(load);
-		console.log(`  resident ${layout}: loaded ${fmt(r.loadMs / 1000, 1)}s from r2, matrix ${fmt(r.bytes / 1e6, 0)}MB, RSS +${fmt((rss - rss0) / 1e6, 0)}MB, VmHWM ${fmt(vmKb("VmHWM") / 1024, 0)}MB`);
-		const per = n / SPACES;
-		if (layout === "clustered") {
-			for (const kernel of ["wasm", "js"] as const) {
-				await runQueries(w, "resident", layout, "range", kernel, per);
-				await runQueries(w, "resident", layout, "none", kernel, n);
+		try {
+			const init: InitMsg = {
+				type: "init",
+				mode: "resident",
+				dbPath,
+				dtype,
+				dim,
+				n,
+				layout,
+				loadFrom: "r2",
+				k: K,
+			};
+			const r = await call<{ loadMs: number; bytes: number }>(w, init);
+			const rss = process.memoryUsage().rss;
+			const load = {
+				layout,
+				loadFrom: "r2",
+				loadMs: r.loadMs,
+				matrixBytes: r.bytes,
+				rssDeltaMB: (rss - rss0) / 1e6,
+				vmRssMB: vmKb("VmRSS") / 1024,
+				vmHwmMB: vmKb("VmHWM") / 1024,
+			};
+			loads.push(load);
+			console.log(
+				`  resident ${layout}: loaded ${fmt(r.loadMs / 1000, 1)}s from r2, matrix ${fmt(r.bytes / 1e6, 0)}MB, RSS +${fmt((rss - rss0) / 1e6, 0)}MB, VmHWM ${fmt(vmKb("VmHWM") / 1024, 0)}MB`,
+			);
+			const per = n / SPACES;
+			if (layout === "clustered") {
+				for (const kernel of ["wasm", "js"] as const) {
+					await runQueries(w, "resident", layout, "range", kernel, per);
+					await runQueries(w, "resident", layout, "none", kernel, n);
+				}
+			} else {
+				for (const kernel of ["wasm", "js"] as const) {
+					await runQueries(w, "resident", layout, "tag", kernel, per);
+					await runQueries(w, "resident", layout, "ids", kernel, per);
+				}
 			}
-		} else {
-			for (const kernel of ["wasm", "js"] as const) {
-				await runQueries(w, "resident", layout, "tag", kernel, per);
-				await runQueries(w, "resident", layout, "ids", kernel, per);
-			}
+			await call(w, { type: "close" });
+		} catch (e) {
+			console.log(`  resident ${layout} FAILED: ${String(e).slice(0, 200)}`);
+			loads.push({ layout, error: String(e).slice(0, 300) });
 		}
-		await call(w, { type: "close" });
 		w.terminate();
 		await Bun.sleep(300);
 	}
@@ -212,7 +283,17 @@ if (scenarios.includes("resident")) {
 	if (wantTables.includes("r3")) {
 		try {
 			const w = spawn();
-			const init: InitMsg = { type: "init", mode: "resident", dbPath, dtype, dim, n, layout: "clustered", loadFrom: "r3", k: K };
+			const init: InitMsg = {
+				type: "init",
+				mode: "resident",
+				dbPath,
+				dtype,
+				dim,
+				n,
+				layout: "clustered",
+				loadFrom: "r3",
+				k: K,
+			};
 			const r = await call<{ loadMs: number; bytes: number }>(w, init);
 			loads.push({ layout: "clustered", loadFrom: "r3", loadMs: r.loadMs, matrixBytes: r.bytes });
 			console.log(`  resident clustered: loaded ${fmt(r.loadMs / 1000, 1)}s from r3 (chunk packs)`);
@@ -225,7 +306,17 @@ if (scenarios.includes("resident")) {
 
 if (scenarios.includes("sqlite")) {
 	const w = spawn();
-	const init: InitMsg = { type: "init", mode: "sqlite", dbPath, dtype, dim, n, layout: "clustered", loadFrom: "r2", k: K };
+	const init: InitMsg = {
+		type: "init",
+		mode: "sqlite",
+		dbPath,
+		dtype,
+		dim,
+		n,
+		layout: "clustered",
+		loadFrom: "r2",
+		k: K,
+	};
 	await call(w, init);
 	const per = n / SPACES;
 	for (const f of ["r2-read", "r2", "r3-read", "r3", "r1-read", "r1"] as const) {
@@ -245,6 +336,11 @@ if (saveTruth && newTruth.range) {
 	writeFileSync(truthPath, JSON.stringify(cur));
 }
 mkdirSync(dirname(outPath), { recursive: true });
-writeFileSync(outPath, JSON.stringify({ n, dim, dtype, k: K, loads, rows, peakRssMB: vmKb("VmHWM") / 1024 }, null, 1));
-console.log(`peak RSS (main process incl. worker) ${fmt(vmKb("VmHWM") / 1024, 0)} MB; wrote ${outPath}`);
+writeFileSync(
+	outPath,
+	JSON.stringify({ n, dim, dtype, k: K, loads, rows, peakRssMB: vmKb("VmHWM") / 1024 }, null, 1),
+);
+console.log(
+	`peak RSS (main process incl. worker) ${fmt(vmKb("VmHWM") / 1024, 0)} MB; wrote ${outPath}`,
+);
 process.exit(0);

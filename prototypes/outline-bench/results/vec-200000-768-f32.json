@@ -1,0 +1,325 @@
+{
+ "n": 200000,
+ "dim": 768,
+ "dtype": "f32",
+ "k": 50,
+ "loads": [
+  {
+   "layout": "clustered",
+   "loadFrom": "r2",
+   "loadMs": 2093.9517650000003,
+   "matrixBytes": 617145024,
+   "rssDeltaMB": 1290.235904,
+   "vmRssMB": 1264.8203125,
+   "vmHwmMB": 1264.94921875
+  },
+  {
+   "layout": "interleaved",
+   "loadFrom": "r2",
+   "loadMs": 1256.504294,
+   "matrixBytes": 617145024,
+   "rssDeltaMB": 1297.383424,
+   "vmRssMB": 1271.51953125,
+   "vmHwmMB": 1271.453125
+  },
+  {
+   "layout": "clustered",
+   "loadFrom": "r3",
+   "loadMs": 1182.0720259999998,
+   "matrixBytes": 617145024
+  }
+ ],
+ "rows": [
+  {
+   "scenario": "resident",
+   "layout": "clustered",
+   "filter": "range",
+   "kernel": "wasm",
+   "n": 200000,
+   "dim": 768,
+   "dtype": "f32",
+   "queries": 97,
+   "p50": 10.352812000000085,
+   "p95": 14.864342000000306,
+   "p99": 24.178784000000178,
+   "max": 24.178784000000178,
+   "scanP50": 10.04752899999994,
+   "scanned": 20000,
+   "extra": {
+    "eventLoopLagP99Ms": 1.2688520000001517,
+    "eventLoopLagMaxMs": 4.804157000000032
+   }
+  },
+  {
+   "scenario": "resident",
+   "layout": "clustered",
+   "filter": "none",
+   "kernel": "wasm",
+   "n": 200000,
+   "dim": 768,
+   "dtype": "f32",
+   "queries": 97,
+   "p50": 84.24572799999987,
+   "p95": 106.54572200000075,
+   "p99": 122.37821100000065,
+   "max": 122.37821100000065,
+   "scanP50": 83.91003500000079,
+   "scanned": 200000,
+   "extra": {
+    "eventLoopLagP99Ms": 1.1347370000003139,
+    "eventLoopLagMaxMs": 9.394740000000183
+   }
+  },
+  {
+   "scenario": "resident",
+   "layout": "clustered",
+   "filter": "range",
+   "kernel": "js",
+   "n": 200000,
+   "dim": 768,
+   "dtype": "f32",
+   "queries": 97,
+   "p50": 16.560453999998572,
+   "p95": 33.70517800000016,
+   "p99": 34.81956299999911,
+   "max": 34.81956299999911,
+   "scanP50": 16.167284999999538,
+   "scanned": 20000,
+   "extra": {
+    "eventLoopLagP99Ms": 2.038973000000624,
+    "eventLoopLagMaxMs": 5.376161999998658,
+    "kernelAgreement": "40/40"
+   }
+  },
+  {
+   "scenario": "resident",
+   "layout": "clustered",
+   "filter": "none",
+   "kernel": "js",
+   "n": 200000,
+   "dim": 768,
+   "dtype": "f32",
+   "queries": 97,
+   "p50": 165.72063700000217,
+   "p95": 214.13004700000056,
+   "p99": 239.4435709999998,
+   "max": 239.4435709999998,
+   "scanP50": 165.41093700000056,
+   "scanned": 200000,
+   "extra": {
+    "eventLoopLagP99Ms": 1.6157600000005914,
+    "eventLoopLagMaxMs": 11.237348000002385,
+    "kernelAgreement": "40/40"
+   }
+  },
+  {
+   "scenario": "resident",
+   "layout": "interleaved",
+   "filter": "tag",
+   "kernel": "wasm",
+   "n": 200000,
+   "dim": 768,
+   "dtype": "f32",
+   "queries": 97,
+   "p50": 11.040108000001055,
+   "p95": 16.62740499999927,
+   "p99": 27.803852999997616,
+   "max": 27.803852999997616,
+   "scanP50": 10.845525999999836,
+   "scanned": 20000,
+   "extra": {
+    "eventLoopLagP99Ms": 0.46857900000031805,
+    "eventLoopLagMaxMs": 3.3803479999987758
+   }
+  },
+  {
+   "scenario": "resident",
+   "layout": "interleaved",
+   "filter": "ids",
+   "kernel": "wasm",
+   "n": 200000,
+   "dim": 768,
+   "dtype": "f32",
+   "queries": 97,
+   "p50": 11.468808000005083,
+   "p95": 13.962700999996741,
+   "p99": 14.611832000002323,
+   "max": 14.611832000002323,
+   "scanP50": 11.1716550000001,
+   "scanned": 20000,
+   "extra": {
+    "eventLoopLagP99Ms": 0.534920999998576,
+    "eventLoopLagMaxMs": 1.773642000000109
+   }
+  },
+  {
+   "scenario": "resident",
+   "layout": "interleaved",
+   "filter": "tag",
+   "kernel": "js",
+   "n": 200000,
+   "dim": 768,
+   "dtype": "f32",
+   "queries": 97,
+   "p50": 22.31221899999946,
+   "p95": 29.126303999997617,
+   "p99": 38.11646800000017,
+   "max": 38.11646800000017,
+   "scanP50": 22.03698599999916,
+   "scanned": 20000,
+   "extra": {
+    "eventLoopLagP99Ms": 0.5258279999980005,
+    "eventLoopLagMaxMs": 2.285115999999107,
+    "kernelAgreement": "40/40"
+   }
+  },
+  {
+   "scenario": "resident",
+   "layout": "interleaved",
+   "filter": "ids",
+   "kernel": "js",
+   "n": 200000,
+   "dim": 768,
+   "dtype": "f32",
+   "queries": 97,
+   "p50": 26.098744000002625,
+   "p95": 37.67085799999768,
+   "p99": 44.012957999999344,
+   "max": 44.012957999999344,
+   "scanP50": 25.830776000000697,
+   "scanned": 20000,
+   "extra": {
+    "eventLoopLagP99Ms": 2.4086019999958808,
+    "eventLoopLagMaxMs": 4.992571999995562,
+    "kernelAgreement": "40/40"
+   }
+  },
+  {
+   "scenario": "sqlite",
+   "filter": "r2-read",
+   "kernel": "js",
+   "n": 200000,
+   "dim": 768,
+   "dtype": "f32",
+   "queries": 97,
+   "p50": 55.93895699999848,
+   "p95": 68.29151799999818,
+   "p99": 77.83682199999748,
+   "max": 77.83682199999748,
+   "scanP50": 55.64037600000006,
+   "scanned": 20000,
+   "extra": {
+    "rowsPerQuery": 20000,
+    "mbPerQuery": 61.44,
+    "eventLoopLagP99Ms": 1.1543689999962226,
+    "eventLoopLagMaxMs": 4.813685000000987
+   }
+  },
+  {
+   "scenario": "sqlite",
+   "filter": "r2",
+   "kernel": "js",
+   "n": 200000,
+   "dim": 768,
+   "dtype": "f32",
+   "queries": 97,
+   "p50": 120.35578800000076,
+   "p95": 162.81269800000155,
+   "p99": 184.21731400000135,
+   "max": 184.21731400000135,
+   "scanP50": 119.89701600000262,
+   "scanned": 20000,
+   "extra": {
+    "rowsPerQuery": 20000,
+    "mbPerQuery": 61.44,
+    "eventLoopLagP99Ms": 1.3921639999971376,
+    "eventLoopLagMaxMs": 12.4102489999932
+   }
+  },
+  {
+   "scenario": "sqlite",
+   "filter": "r3-read",
+   "kernel": "js",
+   "n": 200000,
+   "dim": 768,
+   "dtype": "f32",
+   "queries": 97,
+   "p50": 49.72098800000094,
+   "p95": 64.49458900000172,
+   "p99": 70.42997800000012,
+   "max": 70.42997800000012,
+   "scanP50": 49.34135800000149,
+   "scanned": 20000,
+   "extra": {
+    "rowsPerQuery": 20000,
+    "mbPerQuery": 61.44,
+    "eventLoopLagP99Ms": 0.3337000000028638,
+    "eventLoopLagMaxMs": 6.600564000000304
+   }
+  },
+  {
+   "scenario": "sqlite",
+   "filter": "r3",
+   "kernel": "js",
+   "n": 200000,
+   "dim": 768,
+   "dtype": "f32",
+   "queries": 97,
+   "p50": 65.4389530000044,
+   "p95": 93.07736999999906,
+   "p99": 100.47371199999179,
+   "max": 100.47371199999179,
+   "scanP50": 65.0337389999986,
+   "scanned": 20000,
+   "extra": {
+    "rowsPerQuery": 20000,
+    "mbPerQuery": 61.44,
+    "eventLoopLagP99Ms": 1.5875340000056894,
+    "eventLoopLagMaxMs": 7.120297000001301
+   }
+  },
+  {
+   "scenario": "sqlite",
+   "filter": "r1-read",
+   "kernel": "js",
+   "n": 200000,
+   "dim": 768,
+   "dtype": "f32",
+   "queries": 97,
+   "p50": 142.97238000000652,
+   "p95": 223.16140299999097,
+   "p99": 258.7486750000098,
+   "max": 258.7486750000098,
+   "scanP50": 142.68506300000445,
+   "scanned": 20000,
+   "extra": {
+    "rowsPerQuery": 20000,
+    "mbPerQuery": 61.44,
+    "eventLoopLagP99Ms": 1.2697669999906793,
+    "eventLoopLagMaxMs": 7.277521000010893
+   }
+  },
+  {
+   "scenario": "sqlite",
+   "filter": "r1",
+   "kernel": "js",
+   "n": 200000,
+   "dim": 768,
+   "dtype": "f32",
+   "queries": 97,
+   "p50": 152.96542500000214,
+   "p95": 181.72278499999084,
+   "p99": 192.53210700000636,
+   "max": 192.53210700000636,
+   "scanP50": 152.60941199999797,
+   "scanned": 20000,
+   "extra": {
+    "rowsPerQuery": 20000,
+    "mbPerQuery": 61.44,
+    "eventLoopLagP99Ms": 1.406647999989218,
+    "eventLoopLagMaxMs": 9.980930000005173
+   }
+  }
+ ],
+ "peakRssMB": 1271.3203125
+}

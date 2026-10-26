@@ -1,0 +1,343 @@
+{
+ "n": 200000,
+ "dim": 768,
+ "dtype": "i8",
+ "k": 50,
+ "loads": [
+  {
+   "layout": "clustered",
+   "loadFrom": "r2",
+   "loadMs": 594.975981,
+   "matrixBytes": 156345024,
+   "rssDeltaMB": 510.427136,
+   "vmRssMB": 521.828125,
+   "vmHwmMB": 521.953125
+  },
+  {
+   "layout": "interleaved",
+   "loadFrom": "r2",
+   "loadMs": 591.1382570000001,
+   "matrixBytes": 156345024,
+   "rssDeltaMB": 510.181376,
+   "vmRssMB": 521.22265625,
+   "vmHwmMB": 524.89453125
+  },
+  {
+   "layout": "clustered",
+   "loadFrom": "r3",
+   "loadMs": 251.997883,
+   "matrixBytes": 156345024
+  }
+ ],
+ "rows": [
+  {
+   "scenario": "resident",
+   "layout": "clustered",
+   "filter": "range",
+   "kernel": "wasm",
+   "n": 200000,
+   "dim": 768,
+   "dtype": "i8",
+   "queries": 97,
+   "p50": 3.640015000000062,
+   "p95": 4.704825000000028,
+   "p99": 11.095691999999985,
+   "max": 11.095691999999985,
+   "scanP50": 3.4679419999999936,
+   "scanned": 20000,
+   "extra": {
+    "eventLoopLagP99Ms": 0.4025169999999889,
+    "eventLoopLagMaxMs": 0.6035359999999628,
+    "recallAt10": 0.9674999999999997,
+    "recallAt50": 0.9889999999999999
+   }
+  },
+  {
+   "scenario": "resident",
+   "layout": "clustered",
+   "filter": "none",
+   "kernel": "wasm",
+   "n": 200000,
+   "dim": 768,
+   "dtype": "i8",
+   "queries": 97,
+   "p50": 35.96198800000002,
+   "p95": 39.81544499999973,
+   "p99": 42.95443599999999,
+   "max": 42.95443599999999,
+   "scanP50": 35.50224300000082,
+   "scanned": 200000,
+   "extra": {
+    "eventLoopLagP99Ms": 0.2799129999998513,
+    "eventLoopLagMaxMs": 23.56021499999997
+   }
+  },
+  {
+   "scenario": "resident",
+   "layout": "clustered",
+   "filter": "range",
+   "kernel": "js",
+   "n": 200000,
+   "dim": 768,
+   "dtype": "i8",
+   "queries": 97,
+   "p50": 14.275697000000036,
+   "p95": 24.289824999999837,
+   "p99": 41.034977000000254,
+   "max": 41.034977000000254,
+   "scanP50": 14.026608999999553,
+   "scanned": 20000,
+   "extra": {
+    "eventLoopLagP99Ms": 0.7674310000002151,
+    "eventLoopLagMaxMs": 1.8252449999999953,
+    "recallAt10": 0.9674999999999997,
+    "recallAt50": 0.9889999999999999,
+    "kernelAgreement": "40/40"
+   }
+  },
+  {
+   "scenario": "resident",
+   "layout": "clustered",
+   "filter": "none",
+   "kernel": "js",
+   "n": 200000,
+   "dim": 768,
+   "dtype": "i8",
+   "queries": 97,
+   "p50": 144.3522069999999,
+   "p95": 217.7469999999994,
+   "p99": 264.2375780000002,
+   "max": 264.2375780000002,
+   "scanP50": 143.95253499999944,
+   "scanned": 200000,
+   "extra": {
+    "eventLoopLagP99Ms": 0.4161070000000109,
+    "eventLoopLagMaxMs": 49.52360299999964,
+    "kernelAgreement": "40/40"
+   }
+  },
+  {
+   "scenario": "resident",
+   "layout": "interleaved",
+   "filter": "tag",
+   "kernel": "wasm",
+   "n": 200000,
+   "dim": 768,
+   "dtype": "i8",
+   "queries": 97,
+   "p50": 10.4902519999996,
+   "p95": 13.941135999997641,
+   "p99": 18.458041999998386,
+   "max": 18.458041999998386,
+   "scanP50": 10.259701999999947,
+   "scanned": 20000,
+   "extra": {
+    "eventLoopLagP99Ms": 0.41605100000015227,
+    "eventLoopLagMaxMs": 2.054877000002307,
+    "recallAt10": 0.9674999999999997,
+    "recallAt50": 0.9889999999999999
+   }
+  },
+  {
+   "scenario": "resident",
+   "layout": "interleaved",
+   "filter": "ids",
+   "kernel": "wasm",
+   "n": 200000,
+   "dim": 768,
+   "dtype": "i8",
+   "queries": 97,
+   "p50": 10.752517000000807,
+   "p95": 14.616807999998855,
+   "p99": 18.156332999998995,
+   "max": 18.156332999998995,
+   "scanP50": 10.523560000000089,
+   "scanned": 20000,
+   "extra": {
+    "eventLoopLagP99Ms": 0.3216339999999036,
+    "eventLoopLagMaxMs": 1.0315799999989395,
+    "recallAt10": 0.9674999999999997,
+    "recallAt50": 0.9889999999999999
+   }
+  },
+  {
+   "scenario": "resident",
+   "layout": "interleaved",
+   "filter": "tag",
+   "kernel": "js",
+   "n": 200000,
+   "dim": 768,
+   "dtype": "i8",
+   "queries": 97,
+   "p50": 22.64510099999825,
+   "p95": 35.23752400000012,
+   "p99": 42.11327100000199,
+   "max": 42.11327100000199,
+   "scanP50": 22.380170000000362,
+   "scanned": 20000,
+   "extra": {
+    "eventLoopLagP99Ms": 0.4425200000005134,
+    "eventLoopLagMaxMs": 2.4728979999999865,
+    "recallAt10": 0.9674999999999997,
+    "recallAt50": 0.9889999999999999,
+    "kernelAgreement": "40/40"
+   }
+  },
+  {
+   "scenario": "resident",
+   "layout": "interleaved",
+   "filter": "ids",
+   "kernel": "js",
+   "n": 200000,
+   "dim": 768,
+   "dtype": "i8",
+   "queries": 97,
+   "p50": 22.362280000001192,
+   "p95": 34.17295400000148,
+   "p99": 91.47739300000103,
+   "max": 91.47739300000103,
+   "scanP50": 21.971929999999702,
+   "scanned": 20000,
+   "extra": {
+    "eventLoopLagP99Ms": 0.35645900000235997,
+    "eventLoopLagMaxMs": 3.0970329999981914,
+    "recallAt10": 0.9674999999999997,
+    "recallAt50": 0.9889999999999999,
+    "kernelAgreement": "40/40"
+   }
+  },
+  {
+   "scenario": "sqlite",
+   "filter": "r2-read",
+   "kernel": "js",
+   "n": 200000,
+   "dim": 768,
+   "dtype": "i8",
+   "queries": 97,
+   "p50": 15.245367999999871,
+   "p95": 22.138162999999622,
+   "p99": 23.80337999999756,
+   "max": 23.80337999999756,
+   "scanP50": 15.044510000000002,
+   "scanned": 20000,
+   "extra": {
+    "rowsPerQuery": 20000,
+    "mbPerQuery": 15.36,
+    "eventLoopLagP99Ms": 0.9500460000017483,
+    "eventLoopLagMaxMs": 3.4205820000024687
+   }
+  },
+  {
+   "scenario": "sqlite",
+   "filter": "r2",
+   "kernel": "js",
+   "n": 200000,
+   "dim": 768,
+   "dtype": "i8",
+   "queries": 97,
+   "p50": 37.699972999995225,
+   "p95": 69.76095299999724,
+   "p99": 76.10010299999703,
+   "max": 76.10010299999703,
+   "scanP50": 37.333212,
+   "scanned": 20000,
+   "extra": {
+    "rowsPerQuery": 20000,
+    "mbPerQuery": 15.36,
+    "eventLoopLagP99Ms": 0.30894199999966077,
+    "eventLoopLagMaxMs": 1.7502960000056191,
+    "recallAt10": 0.9674999999999997,
+    "recallAt50": 0.9889999999999999
+   }
+  },
+  {
+   "scenario": "sqlite",
+   "filter": "r3-read",
+   "kernel": "js",
+   "n": 200000,
+   "dim": 768,
+   "dtype": "i8",
+   "queries": 97,
+   "p50": 7.578967000001285,
+   "p95": 12.346457999999984,
+   "p99": 15.736375000000407,
+   "max": 15.736375000000407,
+   "scanP50": 7.298471000000063,
+   "scanned": 20000,
+   "extra": {
+    "rowsPerQuery": 20000,
+    "mbPerQuery": 15.36,
+    "eventLoopLagP99Ms": 0.20775000000139698,
+    "eventLoopLagMaxMs": 0.2737849999975879
+   }
+  },
+  {
+   "scenario": "sqlite",
+   "filter": "r3",
+   "kernel": "js",
+   "n": 200000,
+   "dim": 768,
+   "dtype": "i8",
+   "queries": 97,
+   "p50": 23.126743000000715,
+   "p95": 34.20098300000245,
+   "p99": 38.58388599999307,
+   "max": 38.58388599999307,
+   "scanP50": 22.7238269999998,
+   "scanned": 20000,
+   "extra": {
+    "rowsPerQuery": 20000,
+    "mbPerQuery": 15.36,
+    "eventLoopLagP99Ms": 0.3118010000034701,
+    "eventLoopLagMaxMs": 11.093620999999985,
+    "recallAt10": 0.9674999999999997,
+    "recallAt50": 0.9889999999999999
+   }
+  },
+  {
+   "scenario": "sqlite",
+   "filter": "r1-read",
+   "kernel": "js",
+   "n": 200000,
+   "dim": 768,
+   "dtype": "i8",
+   "queries": 97,
+   "p50": 99.99862199999916,
+   "p95": 128.76245899999776,
+   "p99": 143.31909900000028,
+   "max": 143.31909900000028,
+   "scanP50": 99.64018599999872,
+   "scanned": 20000,
+   "extra": {
+    "rowsPerQuery": 20000,
+    "mbPerQuery": 15.36,
+    "eventLoopLagP99Ms": 0.5311069999952451,
+    "eventLoopLagMaxMs": 10.082885999996506
+   }
+  },
+  {
+   "scenario": "sqlite",
+   "filter": "r1",
+   "kernel": "js",
+   "n": 200000,
+   "dim": 768,
+   "dtype": "i8",
+   "queries": 97,
+   "p50": 140.78681499999948,
+   "p95": 173.63586999999825,
+   "p99": 194.59573700000328,
+   "max": 194.59573700000328,
+   "scanP50": 140.48234299999967,
+   "scanned": 20000,
+   "extra": {
+    "rowsPerQuery": 20000,
+    "mbPerQuery": 15.36,
+    "eventLoopLagP99Ms": 0.28236199999810196,
+    "eventLoopLagMaxMs": 20.096174000005703,
+    "recallAt10": 0.9674999999999997,
+    "recallAt50": 0.9889999999999999
+   }
+  }
+ ],
+ "peakRssMB": 524.89453125
+}
