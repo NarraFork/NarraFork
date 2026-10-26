@@ -1764,8 +1764,9 @@ def cmd_settle(args) -> None:
 		if b["kind"] != "task" or b["props"].get("status") not in ("done", "cancelled"):
 			raise OutlineError(f"{t} 不是完成或取消了的任务")
 		tx = Tx(st, actor, args.message or f"整理完 {b['props'].get('alias') or t}")
+		since = b["version"]  # 任务完成（或上次整理）之后加的出处才算这次整理的
+		out = [lk for lk in st.links_to(t, "source") if lk["created_seq"] > since and lk["from"] in st.blocks and not st.blocks[lk["from"]]["deleted"]]
 		tx.push({"op": "block.update", "addr": t, "props": {"settled": tx.seq}})
-		out = [lk for lk in st.links_to(t, "source") if lk["from"] in st.blocks and not st.blocks[lk["from"]]["deleted"]]
 		new = sum(1 for lk in out if st.blocks[lk["from"]]["created_seq"] == lk["created_seq"])
 		for par in dict.fromkeys(st.blocks[lk["from"]]["parent"] for lk in out):
 			if par and not is_process(st, par):
