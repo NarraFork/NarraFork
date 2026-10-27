@@ -1618,6 +1618,75 @@ export const OUTLINE_STORE_CONTRACT: ContractCase[] = [
 		},
 	},
 	{
+		name: "live update log: append, page through, compact, list epochs, delete",
+		async run(ctx) {
+			const space = await personalSpace(ctx);
+			const r = await write(ctx, space, [
+				{ op: "insert", parent: null, content: "live page one" },
+				{ op: "insert", parent: null, content: "live page two" },
+			]);
+			const [one, two] = r.results.map((x) => x.blockId) as [string, string];
+			const row = (page: string, epoch: number, seq: number) => ({
+				pageBlockId: page,
+				epoch,
+				seq,
+				updateB64: Buffer.from(`update ${page} ${epoch} ${seq}`).toString("base64"),
+				actorKind: "human" as const,
+				actorId: "user-contract",
+				createdAt: NOW,
+			});
+			// More rows than one insert statement takes, in one call.
+			await ctx.store.appendLiveUpdates(Array.from({ length: 130 }, (_, i) => row(one, 7, i + 1)));
+			await ctx.store.appendLiveUpdates([row(one, 9, 1), row(two, 3, 1), row(two, 3, 2)]);
+			const first = await ctx.store.listLiveUpdates(one, 7, { limit: 50 });
+			expect(first.map((x) => x.seq)).toEqual(Array.from({ length: 50 }, (_, i) => i + 1));
+			expect(first[0]).toEqual(row(one, 7, 1));
+			const rest = await ctx.store.listLiveUpdates(one, 7, { afterSeq: 50, limit: 500 });
+			expect(rest.map((x) => x.seq)).toEqual(Array.from({ length: 80 }, (_, i) => i + 51));
+			// A seq is written once.
+			await expect(ctx.store.appendLiveUpdates([row(one, 7, 3)])).rejects.toThrow();
+			expect((await ctx.store.listLiveUpdates(one, 7, { limit: 500 })).length).toBe(130);
+
+			// Compaction replaces an epoch's rows at once and leaves the others.
+			await ctx.store.replaceLiveUpdates(one, 7, [row(one, 7, 1), row(one, 7, 131)]);
+			expect((await ctx.store.listLiveUpdates(one, 7, { limit: 500 })).map((x) => x.seq)).toEqual([
+				1, 131,
+			]);
+			expect((await ctx.store.listLiveUpdates(one, 9, { limit: 500 })).length).toBe(1);
+
+			// Epochs in page then epoch order, paged by the last one seen.
+			const ours = (list: Array<{ pageBlockId: string; epoch: number }>) =>
+				list.filter((e) => e.pageBlockId === one || e.pageBlockId === two);
+			const all = ours(await ctx.store.listLiveEpochs({ limit: 10_000 }));
+			const expected = [
+				{ pageBlockId: one, epoch: 7 },
+				{ pageBlockId: one, epoch: 9 },
+				{ pageBlockId: two, epoch: 3 },
+			].sort((a, b) =>
+				a.pageBlockId === b.pageBlockId
+					? a.epoch - b.epoch
+					: a.pageBlockId < b.pageBlockId
+						? -1
+						: 1,
+			);
+			expect(all).toEqual(expected);
+			const firstEpoch = expected[0] as { pageBlockId: string; epoch: number };
+			const after = ours(await ctx.store.listLiveEpochs({ after: firstEpoch, limit: 10_000 }));
+			expect(after).toEqual(expected.slice(1));
+			expect(await ctx.store.listLiveEpochs({ after: firstEpoch, limit: 1 })).toHaveLength(1);
+
+			// Deleting an epoch removes only its rows; a deleted page's rows go with it.
+			expect(await ctx.store.deleteLiveUpdates(one, 7)).toBe(2);
+			expect(await ctx.store.deleteLiveUpdates(one, 7)).toBe(0);
+			expect(ours(await ctx.store.listLiveEpochs({ limit: 10_000 }))).toEqual(
+				expected.filter((e) => !(e.pageBlockId === one && e.epoch === 7)),
+			);
+			expect(await ctx.store.deleteLiveUpdates(one, 9)).toBe(1);
+			expect(await ctx.store.deleteLiveUpdates(two, 3)).toBe(2);
+			expect(ours(await ctx.store.listLiveEpochs({ limit: 10_000 }))).toEqual([]);
+		},
+	},
+	{
 		name: "randomized: every seq's tree rebuilt from versions equals the model",
 		async run(ctx) {
 			for (const seed of [1, 2, 3]) await randomizedHistory(ctx, seed);

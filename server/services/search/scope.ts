@@ -21,7 +21,7 @@ export function scopeKey(scope: MessageSearchScope = FULL_MESSAGE_SCOPE): string
 
 /** Clauses restricting a narrators row aliased `n`. */
 function narratorClauses(scope: MessageSearchScope): string[] {
-	const clauses: string[] = [];
+	const clauses: string[] = [`COALESCE(n.traits, '[]') NOT LIKE '%"modeltrace"%'`];
 	if (!scope.subagents) clauses.push("n.type <> 'subagent'");
 	if (!scope.archived) clauses.push("n.status <> 'archived'");
 	return clauses;
@@ -31,7 +31,7 @@ function and(clauses: readonly string[]): string {
 	return clauses.length === 0 ? "" : `AND ${clauses.join(" AND ")}`;
 }
 
-/** `AND …` restricting a narrators row aliased `n`; empty when nothing is excluded. */
+/** `AND …` restricting a narrators row aliased `n`; model traces are always excluded. */
 export function narratorScopeSql(scope: MessageSearchScope = FULL_MESSAGE_SCOPE): string {
 	return and(narratorClauses(scope));
 }

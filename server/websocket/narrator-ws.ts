@@ -103,6 +103,7 @@ import {
 	type NarratorListStateSnapshotItem,
 	type NarratorServerMessage,
 } from "./narrator-ws-types";
+import { releaseOutlineLive } from "./outline-live-ws";
 import { handleOutlinePageMessage, releaseOutlinePageSubscriptions } from "./outline-page-ws";
 import type { WSData } from "./ws-handler";
 
@@ -258,6 +259,7 @@ function removeConnection(ws: NarratorWS): void {
 	releaseGitWorkspaceSubscriptions(ws);
 	releaseEditorFileSubscriptions(ws);
 	releaseOutlinePageSubscriptions(ws);
+	releaseOutlineLive(ws);
 	const removed = connections.delete(ws);
 	if (removed && ws.data.publicShare) {
 		try {

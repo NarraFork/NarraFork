@@ -453,6 +453,8 @@ export class NarratorWSManager {
 
 	// --- Connection change callbacks ---
 	private connectionChangeCallbacks = new Set<ConnectionChangeCallback>();
+	/** Receivers of binary frames (outline live sessions); text frames never reach them. */
+	private binaryListeners = new Set<(bytes: Uint8Array) => void>();
 
 	// --- Microtask dispatch batching ---
 	// Non-latency-sensitive messages are queued and flushed in a single
@@ -814,6 +816,19 @@ export class NarratorWSManager {
 		if (this.ws?.readyState !== WebSocket.OPEN) return false;
 		this.ws.send(JSON.stringify(message));
 		return true;
+	}
+
+	/** Send a binary frame (outline live sessions). False when the socket is not open. */
+	sendBinary(bytes: Uint8Array): boolean {
+		if (this.ws?.readyState !== WebSocket.OPEN) return false;
+		this.ws.send(bytes as Uint8Array<ArrayBuffer>);
+		return true;
+	}
+
+	/** Receive every binary frame of the socket. */
+	addBinaryListener(listener: (bytes: Uint8Array) => void): () => void {
+		this.binaryListeners.add(listener);
+		return () => this.binaryListeners.delete(listener);
 	}
 
 	// -----------------------------------------------------------------------
@@ -1445,6 +1460,8 @@ export class NarratorWSManager {
 			? `share=${encodeURIComponent(shareAuth.shareId)}&token=${encodeURIComponent(shareAuth.token)}`
 			: `token=${encodeURIComponent(token ?? "")}`;
 		const ws = new WebSocket(buildWsUrl("/ws/narrator", tokenQuery));
+		// Binary frames (outline live sessions) arrive as bytes, not Blobs.
+		ws.binaryType = "arraybuffer";
 		this.ws = ws;
 
 		ws.onopen = () => {
@@ -1471,6 +1488,17 @@ export class NarratorWSManager {
 			// Any inbound frame proves the socket still delivers, including a
 			// heartbeat `ping` on an otherwise idle narrator.
 			this._clearSyncProbe();
+			if (typeof event.data !== "string") {
+				const bytes = new Uint8Array(event.data as ArrayBuffer);
+				for (const listener of this.binaryListeners) {
+					try {
+						listener(bytes);
+					} catch (error) {
+						console.error("[NarratorWS] binary listener error", error);
+					}
+				}
+				return;
+			}
 			try {
 				const data = JSON.parse(event.data);
 				if (data.type === "ping") {

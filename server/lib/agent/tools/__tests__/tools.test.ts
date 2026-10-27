@@ -1157,6 +1157,20 @@ describe("zodToJsonSchema", () => {
 		});
 	});
 
+	test("keeps any and unknown values permissive", () => {
+		const schema = z.object({
+			value: z.record(z.string(), z.unknown()),
+			items: z.array(z.any()),
+		});
+
+		expect(zodToJsonSchema(schema)).toMatchObject({
+			properties: {
+				value: { type: "object", additionalProperties: {} },
+				items: { type: "array", items: {} },
+			},
+		});
+	});
+
 	test("converts preprocess schemas using the output object", () => {
 		const schema = z.preprocess((input) => input, z.object({ command: z.string() }));
 		expect(zodToJsonSchema(schema)).toMatchObject({

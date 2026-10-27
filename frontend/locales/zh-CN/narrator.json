@@ -1,5 +1,8 @@
 {
+	"modelTraceReturn": "返回",
 	"modelTraceUsage": "用法：/modeltrace（不接受参数）",
+	"modelTraceFootnote": "统计结果仅供参考。",
+	"modelTraceUnavailable": "ModelTrace 结果暂不可用。",
 	"composerAttachmentInsertionExpired": "附件处理期间草稿已切换，未插入任何附件，请重新添加。",
 	"composerAttachmentsProcessing": "附件仍在处理中，请稍后发送。",
 	"composerMissingAssets": "附件资源缺失，请重新选择文件或移除对应节点。",

@@ -156,6 +156,7 @@ import type { NarratorToolbarHost } from "./header/narrator-toolbar-items";
 import { useHeaderToolbar } from "./header/use-header-toolbar";
 import { DropOverlay } from "./interaction/DropOverlay";
 import { buildMobileToolbarActions } from "./interaction/mobile-toolbar-actions";
+import { returnFromModelTrace } from "./interaction/model-trace-return";
 import {
 	normalizeBooleanOverride,
 	normalizeDangerReflectionLevel,
@@ -303,6 +304,17 @@ function NarratorPanelBody({
 	const preloadStateRef = useRef({ narratorId, detailReady: !!fetchedNarrator });
 	preloadStateRef.current = { narratorId, detailReady: !!fetchedNarrator };
 	const narrator = narratorProp ?? fetchedNarrator;
+	const isModelTrace = Array.isArray(narrator?.traits) && narrator.traits.includes("modeltrace");
+	const handleModelTraceReturn = useCallback(() => {
+		if (!narrator) return;
+		returnFromModelTrace({
+			narrator,
+			onClose,
+			navigateToNarrator: (id) =>
+				navigate({ to: "/narrators/$narratorId", params: { narratorId: id } }),
+			navigateToDefault: () => navigate({ to: "/narrators" }),
+		});
+	}, [narrator, onClose, navigate]);
 	const relaxedPlanForced = narrator?.permissionMode === "bypassPermissions";
 	const relaxedPlanEnabled = relaxedPlanForced || narrator?.relaxedPlan === true;
 
@@ -3514,6 +3526,7 @@ function NarratorPanelBody({
 
 					{/* ═══════════════════ Bottom Interaction Area ═══════════════════ */}
 					<NarratorInteractionArea
+						onModelTraceReturn={isModelTrace ? handleModelTraceReturn : undefined}
 						common={{ narratorId, narrator, isWorkspacePreview, isMobileViewport }}
 						attachedImages={attachedImages}
 						attachedTextFiles={attachedTextFiles}

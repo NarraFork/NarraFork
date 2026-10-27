@@ -86,12 +86,18 @@ export function useOutlinePages(spaceId: string, enabled = true) {
 export function useOutlineBlock(
 	spaceId: string,
 	blockId: string,
-	options: { asOf?: number; view: OutlineViewMode; enabled?: boolean },
+	options: {
+		asOf?: number;
+		view: OutlineViewMode;
+		/** Block budget: the live editor shows the blocks itself and reads only the root. */
+		blocks?: number;
+		enabled?: boolean;
+	},
 ) {
-	const { asOf, view } = options;
+	const { asOf, view, blocks } = options;
 	return useQuery({
-		queryKey: outlineKeys.block(spaceId, blockId, asOf ?? null, view),
-		queryFn: () => api.getOutlineBlock(spaceId, blockId, { asOf, view }),
+		queryKey: [...outlineKeys.block(spaceId, blockId, asOf ?? null, view), blocks ?? null],
+		queryFn: () => api.getOutlineBlock(spaceId, blockId, { asOf, view, blocks }),
 		enabled: options.enabled ?? true,
 		retry: false,
 		// A view as of a commit never changes; the current one is refreshed by the subscription.

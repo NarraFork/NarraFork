@@ -1,4 +1,5 @@
 import { Buffer } from "node:buffer";
+import { isLiveFrame } from "@shared/outline-live-protocol";
 import type { ServerWebSocket } from "bun";
 import { isChunkFrame } from "../lib/agent/execution/rpc-types";
 import { resolveLiveSession } from "../lib/auth";
@@ -32,6 +33,7 @@ import {
 	getExternalNarratorConnections,
 	sendExternalNarratorFrame,
 } from "./oauth-connection-registry";
+import { drainOutlineLive, handleOutlineLiveBinary } from "./outline-live-ws";
 import { getTerminalConnections, handleTerminalWS, type TerminalWSData } from "./terminal-ws";
 import { getVNetConnections, handleVNetWS, type VNetWSData } from "./vnet-ws";
 
@@ -541,6 +543,22 @@ export const wsHandlers = {
 			return;
 		}
 
+		// Narrator channel: binary frames carrying the outline magic byte are outline live
+		// session frames (Yjs updates as raw bytes), routed without the JSON parse below.
+		if (channel === "narrator" && typeof message !== "string") {
+			const bytes = new Uint8Array(message.buffer, message.byteOffset, message.byteLength);
+			if (isLiveFrame(bytes)) {
+				const narratorWs = ws as ServerWebSocket<WSData & { channel: "narrator" }>;
+				narratorWs.data.lastPongAt = Date.now();
+				try {
+					handleOutlineLiveBinary(narratorWs, bytes);
+				} catch (error) {
+					logger.warn("Outline live frame handler error", { error: String(error) });
+				}
+				return;
+			}
+		}
+
 		// Device channel: binary messages are file-transfer chunk frames. Route
 		// them straight to the transfer receiver without JSON parsing. A binary
 		// message is one Bun delivers as a Buffer whose first byte is the frame
@@ -716,6 +734,13 @@ export const wsHandlers = {
 				handleDeviceWS.message(ws as ServerWebSocket<WSData & { channel: "device" }>, parsed),
 				(err) => logger.warn("Device WS message handler error", { error: String(err) }),
 			);
+		}
+	},
+
+	/** The socket's send buffer drained: outline live sessions resume a participant that lagged. */
+	drain(ws: ServerWebSocket<WSData>) {
+		if (ws.data.channel === "narrator") {
+			drainOutlineLive(ws as ServerWebSocket<WSData & { channel: "narrator" }>);
 		}
 	},
 

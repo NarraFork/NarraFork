@@ -21,6 +21,10 @@
  *      from fresh reads (a few times, then `OutlineBusyError`).
  *   4. After the commit, emit `outline:committed` on the event bus.
  *
+ * A write runs behind the live session barrier of its space (`live-barrier.ts`): while a page is
+ * edited live, its unflushed edits are committed before this write plans, and this write is
+ * pushed into the session afterwards.
+ *
  * The invariants this maintains are listed in `model.ts`.
  *
  * A version conflict (`baseVersionSeq` no longer matches) rejects the whole transaction with
@@ -66,6 +70,7 @@ import {
 	TASK_LINK_KINDS,
 	tagLinks,
 } from "./links";
+import { withOutlineLiveBarrier } from "./live-barrier";
 import {
 	OUTLINE_CHANGE,
 	OUTLINE_LIMITS,
@@ -1602,9 +1607,19 @@ export async function writeOutline(
 	input: OutlineWriteInput,
 	options: OutlineWriteOptions = {},
 ): Promise<OutlineWriteResult> {
+	const prepared = prepareOps(input.ops, options.compensating !== undefined, options.canonical);
+	// A page of the space may be open in a live session: its unflushed edits are written first
+	// and this write reaches the session as a remote change (`live-barrier.ts`).
+	return await withOutlineLiveBarrier(input.spaceId, () => writePrepared(input, options, prepared));
+}
+
+async function writePrepared(
+	input: OutlineWriteInput,
+	options: OutlineWriteOptions,
+	prepared: Array<PreparedContent | null>,
+): Promise<OutlineWriteResult> {
 	const store = options.store ?? outlineStore;
 	const compensating = options.compensating;
-	const prepared = prepareOps(input.ops, compensating !== undefined, options.canonical);
 	const attempts = options.maxAttempts ?? DEFAULT_ATTEMPTS;
 	for (let attempt = 0; attempt < attempts; attempt++) {
 		const space = await store.getSpace(input.spaceId);

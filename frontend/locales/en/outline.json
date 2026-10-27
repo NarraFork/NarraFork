@@ -131,5 +131,26 @@
 			"later-children": "blocks were added under it later",
 			"cycle": "it would end up under itself"
 		}
+	},
+	"editor": {
+		"changeStatus": "Change status",
+		"hiddenUnder_one": "+{{count}} under a task",
+		"hiddenUnder_other": "+{{count}} under tasks",
+		"tooLarge": "A block can hold at most 16 KB. Split it into more blocks.",
+		"rootKept": "The block in focus stays; go up a level to delete it.",
+		"peerEditing": "{{name}} is editing",
+		"peerViewing": "{{name}} is viewing",
+		"someone": "Someone",
+		"readOnly": "Read only",
+		"connecting": "Connecting…",
+		"offline": "Offline: changes are kept and sent when the connection is back",
+		"stalled": "Too many unsent changes: waiting for the server",
+		"deletedBy": "{{name}} deleted the block you were in.",
+		"deletedBySomeone": "Someone deleted the block you were in.",
+		"restore": "Restore",
+		"dismiss": "Dismiss",
+		"tooLargePage": "This page is too large to edit live (over 2000 blocks or 4 MB). It is shown read only; focus on a part of it or split it.",
+		"unavailable": "Live editing is not available right now; the page is shown read only.",
+		"retry": "Try again"
 	}
 }

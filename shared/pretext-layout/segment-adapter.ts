@@ -1122,7 +1122,12 @@ const SYSTEM_TEXT_SUBTYPES = new Set([
 /** Extra recognized system block types beyond the simple/text sets. */
 /** One ellipsized line is all the resolved card shows; more is wasted payload. */
 const ASK_IN_PASSING_QUOTE_CHARS = 200;
-const SYSTEM_OTHER_TYPES = new Set(["knowledge_hint", "ask_in_passing", "subagent_recovery"]);
+const SYSTEM_OTHER_TYPES = new Set([
+	"knowledge_hint",
+	"ask_in_passing",
+	"subagent_recovery",
+	"modeltrace_result",
+]);
 /**
  * Block types that make a role=user message render as a SYSTEM card rather than a
  * chat bubble.
@@ -3264,6 +3269,13 @@ function adaptSystemBlock(
 			kind: "plan-card",
 			key: `${idBase}-plan`,
 			data: { summary: block.summary ?? block.text ?? "" },
+		};
+	}
+	if (blockType === "modeltrace_result") {
+		return {
+			kind: "modeltrace-result",
+			key: `${keyBase}-modeltrace`,
+			data: block,
 		};
 	}
 	if (blockType === "knowledge_hint") {

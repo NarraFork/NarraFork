@@ -439,9 +439,9 @@ export function createSqliteSearchStore(
 	function recallSource(global: boolean) {
 		return {
 			source: global
-				? `JOIN narrators n ON n.id = m.narrator_id`
+				? `JOIN narrators n ON n.id = m.narrator_id ${narratorScopeSql()}`
 				: `JOIN narrator_message_refs r ON r.message_id = m.id
-		 JOIN narrators n ON n.id = r.narrator_id`,
+		 JOIN narrators n ON n.id = r.narrator_id ${narratorScopeSql()}`,
 			narratorIdColumn: global ? "n.id AS narrator_id" : "r.narrator_id",
 			scopeFilter: global ? "" : " AND r.narrator_id = ?",
 		};
@@ -1028,6 +1028,13 @@ export function createSqliteSearchStore(
 
 		async searchTimeline(query: TimelineSearchQuery): Promise<TimelineSearchRow[]> {
 			const options = { signal: query.signal, operation: "searchTimeline" };
+			// Gate the requested timeline, not the owner of its fork-shared messages.
+			const target = await execute(
+				`SELECT n.id FROM narrators n WHERE n.id = ? ${narratorScopeSql()}`,
+				[query.narratorId],
+				options,
+			);
+			if (target.length === 0) return [];
 			// The same term rules as global search: a term too short for the trigram index
 			// would silently match nothing in MATCH, so it filters the indexed rows instead.
 			const { match, likes } = globalNeedles(query);

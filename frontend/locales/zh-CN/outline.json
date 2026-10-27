@@ -131,5 +131,26 @@
 			"later-children": "之后有块加到了它下面",
 			"cycle": "恢复后会挂到自己下面"
 		}
+	},
+	"editor": {
+		"changeStatus": "切换状态",
+		"hiddenUnder_one": "任务下还有 {{count}} 块",
+		"hiddenUnder_other": "任务下还有 {{count}} 块",
+		"tooLarge": "一个块最多 16 KB，请拆成几个块。",
+		"rootKept": "正在聚焦的块不能在这里删除；退到上一层再删。",
+		"peerEditing": "{{name}} 正在编辑",
+		"peerViewing": "{{name}} 正在查看",
+		"someone": "有人",
+		"readOnly": "只读",
+		"connecting": "正在连接…",
+		"offline": "离线：修改会保留，连上后发出",
+		"stalled": "未发出的修改太多，等待服务器",
+		"deletedBy": "{{name}} 删除了你正在编辑的块。",
+		"deletedBySomeone": "有人删除了你正在编辑的块。",
+		"restore": "恢复",
+		"dismiss": "知道了",
+		"tooLargePage": "这一页太大（超过 2000 块或 4 MB），不能实时编辑，先以只读显示；可以聚焦到其中一部分，或把页拆开。",
+		"unavailable": "现在不能实时编辑，先以只读显示这一页。",
+		"retry": "重试"
 	}
 }

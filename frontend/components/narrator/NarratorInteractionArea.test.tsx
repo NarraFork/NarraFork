@@ -1,7 +1,14 @@
 import { expect, mock, test } from "bun:test";
 import type { CSSProperties, ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
+import { returnFromModelTrace } from "./interaction/model-trace-return";
 import type { NarratorInteractionAreaProps } from "./NarratorInteractionArea";
+
+const returnButton: { click: () => void } = {
+	click: () => {
+		throw new Error("Return button was not rendered");
+	},
+};
 
 const MenuStub = Object.assign(({ children }: { children?: ReactNode }) => <div>{children}</div>, {
 	Target: ({ children }: { children?: ReactNode }) => <div>{children}</div>,
@@ -20,7 +27,10 @@ mock.module("@mantine/core", () => ({
 	),
 	Group: ({ children }: { children?: ReactNode }) => <div>{children}</div>,
 	Badge: ({ children }: { children?: ReactNode }) => <span>{children}</span>,
-	Button: ({ children }: { children?: ReactNode }) => <button type="button">{children}</button>,
+	Button: ({ children, onClick }: { children?: ReactNode; onClick?: () => void }) => {
+		if (onClick) returnButton.click = onClick;
+		return <button type="button">{children}</button>;
+	},
 }));
 mock.module("react-i18next", () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
 let resizeEnabled = false;
@@ -65,6 +75,63 @@ mock.module("./permission/PermissionRuleResultNotice", () => ({
 	PermissionRulePolicySync: () => null,
 }));
 const { NarratorInteractionArea } = await import("./NarratorInteractionArea");
+
+function renderModelTraceReturn(options: Parameters<typeof returnFromModelTrace>[0]) {
+	returnButton.click = () => {
+		throw new Error("Return button was not rendered");
+	};
+	// No editable props are supplied: the modeltrace branch must not mount them or their hooks.
+	const props = {
+		onModelTraceReturn: () => returnFromModelTrace(options),
+	} as NarratorInteractionAreaProps;
+	const html = renderToStaticMarkup(<NarratorInteractionArea {...props} />);
+	expect(html).toContain("modelTraceReturn");
+	expect(html.match(/<button/g)).toHaveLength(1);
+	expect(html).not.toContain("data-region");
+	returnButton.click();
+}
+
+test("modeltrace return closes exactly its desktop dock panel without navigating to its parent", () => {
+	const closeTrace = mock(() => {});
+	const navigateToNarrator = mock(() => {});
+	const navigateToDefault = mock(() => {});
+	renderModelTraceReturn({
+		narrator: { parentNarratorId: "source" },
+		onClose: closeTrace,
+		navigateToNarrator,
+		navigateToDefault,
+	});
+	expect(closeTrace).toHaveBeenCalledTimes(1);
+	expect(navigateToNarrator).not.toHaveBeenCalled();
+	expect(navigateToDefault).not.toHaveBeenCalled();
+});
+
+test("modeltrace return on mobile without a dock navigates to the source narrator", () => {
+	const navigateToNarrator = mock((_id: string) => {});
+	const navigateToDefault = mock(() => {});
+	renderModelTraceReturn({
+		narrator: { parentNarratorId: "source" },
+		navigateToNarrator,
+		navigateToDefault,
+	});
+	expect(navigateToNarrator).toHaveBeenCalledWith("source");
+	expect(navigateToDefault).not.toHaveBeenCalled();
+});
+
+test("modeltrace return respects authorized navigation metadata and deleted-parent fallback", () => {
+	const navigateToNarrator = mock((_id: string) => {});
+	const navigateToDefault = mock(() => {});
+	renderModelTraceReturn({
+		narrator: {
+			parentNarratorId: "deleted-source",
+			navigationSummary: { parentNarratorId: null },
+		},
+		navigateToNarrator,
+		navigateToDefault,
+	});
+	expect(navigateToNarrator).not.toHaveBeenCalled();
+	expect(navigateToDefault).toHaveBeenCalledTimes(1);
+});
 
 test("passes image/file resources into the composer without an external attachment strip", () => {
 	// Control hooks and leaf panels are mocked: only the real area's composition is under test.

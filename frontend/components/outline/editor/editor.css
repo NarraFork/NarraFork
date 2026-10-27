@@ -1,0 +1,312 @@
+/*
+ * The live outline editor. Block frames are native DOM (`chrome.ts`), so this is plain CSS
+ * scoped under `.nf-outline-editor`. Mobile first: indentation and the frame shrink when the
+ * editor is narrow (a phone, or a dock panel: a container query on the editor's own width), and
+ * nothing may widen it past its container.
+ */
+.nf-outline-editor {
+	--ob-line: var(--mantine-color-default-border);
+	--ob-muted: var(--mantine-color-dimmed);
+	--ob-accent: var(--mantine-primary-color-filled, var(--mantine-color-indigo-filled));
+	--ob-code-bg: var(--mantine-color-default-hover);
+	--ob-indent: 22px;
+	min-width: 0;
+	max-width: 100%;
+	container: nf-outline-editor / inline-size;
+}
+
+.nf-outline-editor-bar {
+	min-height: 26px;
+	margin-bottom: 4px;
+}
+
+.nf-outline-editor-host {
+	min-width: 0;
+	overflow-wrap: anywhere;
+}
+
+.nf-outline-editor .ProseMirror {
+	outline: none;
+	white-space: pre-wrap;
+	word-wrap: break-word;
+	min-height: 40px;
+	padding-left: 18px;
+	line-height: 1.55;
+}
+
+.nf-outline-editor .ProseMirror[contenteditable="false"] {
+	cursor: default;
+}
+
+.nf-outline-editor .ob-block {
+	position: relative;
+	padding-left: var(--ob-indent);
+}
+
+.nf-outline-editor .ob-children {
+	border-left: 1px solid var(--ob-line);
+	margin-left: -15px;
+	padding-left: 14px;
+}
+
+.nf-outline-editor .ob-content p,
+.nf-outline-editor .ob-content h1,
+.nf-outline-editor .ob-content h2,
+.nf-outline-editor .ob-content h3,
+.nf-outline-editor .ob-content blockquote,
+.nf-outline-editor .ob-content pre,
+.nf-outline-editor .ob-content table {
+	margin: 0;
+	min-height: 1.55em;
+}
+
+/* The frame: folding arrow (left of the bullet), bullet (focus), checkbox. */
+.nf-outline-editor .ob-gutter {
+	position: absolute;
+	left: -16px;
+	top: 0;
+	width: 38px;
+	height: 1.55em;
+	display: flex;
+	align-items: center;
+	user-select: none;
+}
+
+.nf-outline-editor .ob-arrow {
+	width: 16px;
+	flex: none;
+	text-align: center;
+	cursor: pointer;
+	color: var(--ob-muted);
+	font-size: 11px;
+}
+
+.nf-outline-editor .has-kids > .ob-gutter .ob-arrow::before {
+	content: "▾";
+}
+
+.nf-outline-editor .collapsed > .ob-gutter .ob-arrow::before {
+	content: "▸";
+}
+
+.nf-outline-editor .ob-bullet {
+	width: 22px;
+	flex: none;
+	text-align: center;
+	cursor: pointer;
+	color: var(--ob-muted);
+}
+
+.nf-outline-editor .ob-bullet::before {
+	content: "•";
+}
+
+.nf-outline-editor .collapsed > .ob-gutter .ob-bullet::before {
+	content: "◉";
+}
+
+.nf-outline-editor .ob-block.collapsed > .ob-content > .ob-children {
+	display: none;
+}
+
+.nf-outline-editor .ob-block[data-task]:not([data-task=""]) {
+	padding-left: 40px;
+}
+
+.nf-outline-editor .ob-block[data-task]:not([data-task=""]) > .ob-gutter {
+	width: 56px;
+}
+
+.nf-outline-editor .ob-check {
+	width: 18px;
+	flex: none;
+	cursor: pointer;
+}
+
+.nf-outline-editor .ob-peers {
+	display: none;
+}
+
+.nf-outline-editor .ob-hidden {
+	position: absolute;
+	right: 0;
+	top: 0.15em;
+	font-size: 11px;
+	color: var(--ob-muted);
+	border: 1px solid var(--ob-line);
+	border-radius: 8px;
+	padding: 0 5px;
+	user-select: none;
+	pointer-events: none;
+}
+
+/* The focused block is the root: its first line is the title. */
+.nf-outline-editor .ProseMirror > .ob-block {
+	padding-left: 0;
+}
+
+.nf-outline-editor .ProseMirror > .ob-block > .ob-gutter {
+	display: none;
+}
+
+.nf-outline-editor .ProseMirror > .ob-block > .ob-content > :first-child {
+	font-size: 1.5em;
+	font-weight: 700;
+	margin-bottom: 6px;
+}
+
+.nf-outline-editor .ProseMirror > .ob-block > .ob-content > .ob-children {
+	margin-left: 0;
+	border-left: 0;
+	padding-left: 0;
+}
+
+.nf-outline-editor .ProseMirror > .ob-block > .ob-hidden {
+	display: none;
+}
+
+.nf-outline-editor .ob-block[data-task="x"] > .ob-content > p {
+	color: var(--ob-muted);
+	text-decoration: line-through;
+}
+
+.nf-outline-editor .ob-content h1 {
+	font-size: 1.5em;
+}
+
+.nf-outline-editor .ob-content h2 {
+	font-size: 1.25em;
+}
+
+.nf-outline-editor .ob-content h3 {
+	font-size: 1.1em;
+}
+
+.nf-outline-editor .ob-content blockquote {
+	border-left: 3px solid var(--ob-line);
+	padding-left: 8px;
+	color: var(--ob-muted);
+}
+
+.nf-outline-editor .ob-content pre {
+	background: var(--ob-code-bg);
+	padding: 4px 8px;
+	border-radius: 4px;
+	font: 13px / 1.5 var(--mantine-font-family-monospace);
+	overflow-x: auto;
+	white-space: pre;
+}
+
+.nf-outline-editor .ob-content code {
+	background: var(--ob-code-bg);
+	border-radius: 3px;
+	padding: 0 3px;
+	font-family: var(--mantine-font-family-monospace);
+	font-size: 0.9em;
+}
+
+.nf-outline-editor .ob-content pre code {
+	padding: 0;
+	background: none;
+}
+
+.nf-outline-editor .ob-content table {
+	border-collapse: collapse;
+	display: block;
+	max-width: 100%;
+	overflow-x: auto;
+}
+
+.nf-outline-editor .ob-content td {
+	border: 1px solid var(--ob-line);
+	padding: 2px 8px;
+	min-width: 40px;
+}
+
+.nf-outline-editor .ob-content tr:first-child td {
+	font-weight: 600;
+}
+
+.nf-outline-editor .ob-mention {
+	color: var(--ob-accent);
+	background: color-mix(in srgb, var(--ob-accent) 12%, transparent);
+	border-radius: 3px;
+	padding: 0 3px;
+}
+
+.nf-outline-editor .ob-embed {
+	border: 1px dashed var(--ob-accent);
+	border-radius: 6px;
+	padding: 2px 8px 4px;
+	margin: 2px 0;
+}
+
+.nf-outline-editor .ob-embed.selected {
+	outline: 2px solid var(--ob-accent);
+}
+
+.nf-outline-editor .ob-embed-head {
+	font-size: 11px;
+	color: var(--ob-muted);
+}
+
+/* Block selection (Esc): own, and peers'. */
+.nf-outline-editor .ProseMirror .ob-bsel > .ob-content > :first-child {
+	background: color-mix(in srgb, var(--ob-accent) 18%, transparent);
+	border-radius: 3px;
+}
+
+.nf-outline-editor .ob-blockmode ::selection {
+	background: transparent;
+}
+
+.nf-outline-editor .ProseMirror .ob-peer-bsel > .ob-content > :first-child {
+	box-shadow: inset 3px 0 0 var(--peer);
+	background: color-mix(in srgb, var(--peer) 10%, transparent);
+}
+
+/* Peers: the block their cursor is in, their selection, their caret with a name. */
+.nf-outline-editor .ob-peer > .ob-gutter {
+	box-shadow: inset 3px 0 0 var(--peer);
+}
+
+.nf-outline-editor .ob-peer-range {
+	background: color-mix(in srgb, var(--peer) 22%, transparent);
+}
+
+.nf-outline-editor .ob-peer-caret {
+	border-left: 2px solid var(--peer);
+	margin-left: -1px;
+	margin-right: -1px;
+	position: relative;
+	pointer-events: none;
+}
+
+.nf-outline-editor .ob-peer-caret::after {
+	content: attr(data-user);
+	position: absolute;
+	top: -1.15em;
+	left: -1px;
+	font-size: 10px;
+	line-height: 1.2;
+	color: #fff;
+	background: var(--peer);
+	padding: 0 3px;
+	border-radius: 2px;
+	white-space: nowrap;
+}
+
+@container nf-outline-editor (max-width: 48em) {
+	.nf-outline-editor-host {
+		--ob-indent: 18px;
+	}
+
+	.nf-outline-editor .ProseMirror {
+		padding-left: 14px;
+	}
+
+	.nf-outline-editor .ob-children {
+		margin-left: -12px;
+		padding-left: 8px;
+	}
+}

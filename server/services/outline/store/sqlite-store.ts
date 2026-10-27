@@ -21,6 +21,7 @@ import {
 	outlineBlockVersions,
 	outlineCommits,
 	outlineLinks,
+	outlineLiveUpdates,
 	outlineSpaces,
 } from "../../../db/schema";
 import { withDbRetry } from "../../../lib/db-resilience";
@@ -39,6 +40,7 @@ import {
 	type OutlineCommitPlan,
 	type OutlineCommitRow,
 	type OutlineLinkRow,
+	type OutlineLiveUpdateRow,
 	type OutlineSpaceRow,
 	type OutlineSpaceScope,
 	OutlineStaleWriteError,
@@ -89,6 +91,7 @@ type BlockSelect = typeof outlineBlocks.$inferSelect;
 type VersionSelect = typeof outlineBlockVersions.$inferSelect;
 type LinkSelect = typeof outlineLinks.$inferSelect;
 type CommitSelect = typeof outlineCommits.$inferSelect;
+type LiveUpdateSelect = typeof outlineLiveUpdates.$inferSelect;
 
 function toSpace(row: SpaceSelect): OutlineSpaceRow {
 	return { ...row, kind: row.kind as OutlineSpaceKind };
@@ -117,6 +120,13 @@ function toCommit(row: CommitSelect): OutlineCommitRow {
 		actorKind: row.actorKind as OutlineActorKind,
 	};
 }
+
+function toLiveUpdate(row: LiveUpdateSelect): OutlineLiveUpdateRow {
+	return { ...row, actorKind: row.actorKind as OutlineActorKind };
+}
+
+/** Rows per multi-row INSERT of the live log (7 columns each). */
+const LIVE_INSERT_CHUNK = 50;
 
 const metaColumns = {
 	id: outlineBlocks.id,
@@ -484,6 +494,84 @@ export const sqliteOutlineStore: OutlineStore = {
 			.limit(options.limit)
 			.all();
 		return rows.map(toCommit);
+	},
+
+	async appendLiveUpdates(rows) {
+		if (rows.length === 0) return;
+		await withDbRetry(
+			async () =>
+				db.transaction((tx) => {
+					for (const chunk of chunked(rows, LIVE_INSERT_CHUNK)) {
+						tx.insert(outlineLiveUpdates).values(chunk).run();
+					}
+				}),
+			{ label: "outline.appendLiveUpdates", maxRetries: 3 },
+		);
+	},
+
+	async replaceLiveUpdates(pageBlockId, epoch, rows) {
+		await withDbRetry(
+			async () =>
+				db.transaction((tx) => {
+					tx.delete(outlineLiveUpdates)
+						.where(
+							and(
+								eq(outlineLiveUpdates.pageBlockId, pageBlockId),
+								eq(outlineLiveUpdates.epoch, epoch),
+							),
+						)
+						.run();
+					for (const chunk of chunked(rows, LIVE_INSERT_CHUNK)) {
+						tx.insert(outlineLiveUpdates).values(chunk).run();
+					}
+				}),
+			{ label: "outline.replaceLiveUpdates", maxRetries: 3 },
+		);
+	},
+
+	async listLiveUpdates(pageBlockId, epoch, options) {
+		const rows = db
+			.select()
+			.from(outlineLiveUpdates)
+			.where(
+				and(
+					eq(outlineLiveUpdates.pageBlockId, pageBlockId),
+					eq(outlineLiveUpdates.epoch, epoch),
+					options.afterSeq === undefined ? undefined : gt(outlineLiveUpdates.seq, options.afterSeq),
+				),
+			)
+			.orderBy(asc(outlineLiveUpdates.seq))
+			.limit(options.limit)
+			.all();
+		return rows.map(toLiveUpdate);
+	},
+
+	async deleteLiveUpdates(pageBlockId, epoch) {
+		return db
+			.delete(outlineLiveUpdates)
+			.where(
+				and(eq(outlineLiveUpdates.pageBlockId, pageBlockId), eq(outlineLiveUpdates.epoch, epoch)),
+			)
+			.returning({ seq: outlineLiveUpdates.seq })
+			.all().length;
+	},
+
+	async listLiveEpochs(options) {
+		const after = options.after;
+		// GROUP BY the primary key's prefix walks the key in order without a sort.
+		const rows = db
+			.select({ pageBlockId: outlineLiveUpdates.pageBlockId, epoch: outlineLiveUpdates.epoch })
+			.from(outlineLiveUpdates)
+			.where(
+				after
+					? sql`(${outlineLiveUpdates.pageBlockId}, ${outlineLiveUpdates.epoch}) > (${after.pageBlockId}, ${after.epoch})`
+					: undefined,
+			)
+			.groupBy(outlineLiveUpdates.pageBlockId, outlineLiveUpdates.epoch)
+			.orderBy(asc(outlineLiveUpdates.pageBlockId), asc(outlineLiveUpdates.epoch))
+			.limit(options.limit)
+			.all();
+		return rows;
 	},
 
 	async applyCommit(plan) {

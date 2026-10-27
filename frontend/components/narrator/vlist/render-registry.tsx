@@ -29,6 +29,7 @@ import { RenderInjectionBubble } from "./render/RenderInjectionBubble";
 import { RenderMarkdown } from "./render/RenderMarkdown";
 import { RenderMedia } from "./render/RenderMedia";
 import { RenderMessageBubble } from "./render/RenderMessageBubble";
+import { RenderModelTraceResult } from "./render/RenderModelTraceResult";
 import { RenderAskUserQuestion, RenderInlinePermission } from "./render/RenderPermission";
 import { RenderPlanCard } from "./render/RenderPlanCard";
 import { RenderReasoning } from "./render/RenderReasoning";
@@ -414,6 +415,8 @@ export function renderElement(
 		}
 		case "knowledge-hint":
 			return <RenderSystemList measured={m} onOpenEntry={extra.onOpenEntry as never} />;
+		case "modeltrace-result":
+			return <RenderModelTraceResult measured={m} />;
 		case "plan-card":
 			return (
 				<RenderPlanCard

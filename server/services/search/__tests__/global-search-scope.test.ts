@@ -147,6 +147,98 @@ describe("narrator search scope", () => {
 	});
 });
 
+describe("modeltrace sessions are never searchable", () => {
+	for (const [id, type, traits] of [
+		["trace-source", "primary", "[]"],
+		["trace-fork", "primary", '["other"]'],
+		["trace-sub", "subagent", "[]"],
+		["trace-hidden", "primary", '["other","modeltrace"]'],
+	] as const) {
+		run(
+			`INSERT INTO narrators (id, title, type, traits, parent_narrator_id, created_at, updated_at)
+			 VALUES (?, 'tracefish session', ?, ?, ?, ?, ?)`,
+			[id, type, traits, id === "trace-source" ? null : "trace-source", NOW, NOW],
+		);
+		run(
+			`INSERT INTO narrator_messages (id, narrator_id, role, content_json, content_text, created_at)
+			 VALUES (?, ?, 'assistant', '[]', 'tracefish history', ?)`,
+			[`${id}-message`, id, NOW],
+		);
+		run(
+			`INSERT INTO narrator_message_refs (id, narrator_id, message_id, seq)
+			 VALUES (?, ?, ?, 1)`,
+			[`${id}-ref`, id, `${id}-message`],
+		);
+		run(
+			`INSERT INTO narrator_blocks (id, message_id, ordinal, kind, created_at, payload)
+			 VALUES (?, ?, 0, 'output', ?, '{}')`,
+			[`${id}-block`, `${id}-message`, NOW],
+		);
+		replaceBlockIndexText(sqlite, `${id}-block`, "tracefish history");
+	}
+	for (const id of ["trace-hidden", "trace-fork"]) {
+		run(
+			`INSERT INTO narrator_message_refs (id, narrator_id, message_id, seq)
+			 VALUES (?, ?, 'trace-source-message', 0)`,
+			[`${id}-shared`, id],
+		);
+	}
+	const visible = ["trace-fork", "trace-source", "trace-sub"];
+	for (const blockOnly of [false, true]) {
+		const traceStore = createSqliteSearchStore(
+			async (sql, params) =>
+				sqlite.prepare<Record<string, unknown>, typeof params>(sql).all(...params),
+			{ blockOnly: () => blockOnly },
+		);
+		for (const strategy of ["index", "substring"] as const) {
+			test(`${strategy}, blockOnly=${blockOnly}: filters before LIMIT and retains source/forks/subagents`, async () => {
+				const q = { ...query(FULL_MESSAGE_SCOPE, "tracefish"), strategy, limit: 3 };
+				expect((await traceStore.searchNarrators(q)).map((r) => r.id).sort()).toEqual(visible);
+				expect((await traceStore.searchMessages(q)).map((r) => r.narratorId).sort()).toEqual(
+					visible,
+				);
+				expect(
+					(await traceStore.searchSessionAggregates(q)).map((r) => r.narratorId).sort(),
+				).toEqual(visible);
+				const recall = { text: q.text, strategy, limit: 3, previewChars: 200 };
+				expect(
+					(await traceStore.searchRecallMessages({ ...recall, narratorId: null }))
+						.map((r) => r.narratorId)
+						.sort(),
+				).toEqual(visible);
+				expect(
+					await traceStore.searchRecallMessages({ ...recall, narratorId: "trace-hidden" }),
+				).toEqual([]);
+				expect(
+					(await traceStore.searchRecallMessages({ ...recall, narratorId: "trace-fork" }))
+						.map((r) => r.messageId)
+						.sort(),
+				).toEqual(["trace-fork-message", "trace-source-message"]);
+				const timeline = { text: q.text, strategy, limit: 3, inheritedScopes: [] };
+				for (const inheritedScopes of [[], [{ narratorId: "trace-source", upperBoundSeq: 2 }]]) {
+					expect(
+						await traceStore.searchTimeline({
+							...timeline,
+							inheritedScopes,
+							narratorId: "trace-hidden",
+						}),
+					).toEqual([]);
+				}
+				expect(
+					(await traceStore.searchTimeline({ ...timeline, narratorId: "trace-source" })).map(
+						(r) => r.messageId,
+					),
+				).toEqual(["trace-source-message"]);
+				expect(
+					(await traceStore.searchTimeline({ ...timeline, narratorId: "trace-fork" })).map(
+						(r) => r.messageId,
+					),
+				).toEqual(["trace-fork-message", "trace-source-message"]);
+			});
+		}
+	}
+});
+
 function row(id: string, narratorId: string | null): MessageSearchRow {
 	return {
 		id,

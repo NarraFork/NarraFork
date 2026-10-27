@@ -64,6 +64,7 @@ export function parseSubstatus(raw: unknown): string[] {
 export type NarratorTrait =
 	| "standalone"
 	| "ask-in-passing"
+	| "modeltrace"
 	| "background"
 	| "plan"
 	| "knowledge-steward"

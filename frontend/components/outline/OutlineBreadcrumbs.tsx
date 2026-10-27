@@ -1,10 +1,10 @@
 import { Anchor, Breadcrumbs, Text } from "@mantine/core";
 import type { OutlineBlockViewResponse } from "@shared/outline-api";
-import { Link } from "@tanstack/react-router";
 import { useTranslation } from "react-i18next";
 import type { OutlineBlockSearch } from "../../lib/outline-view";
 import classes from "./Outline.module.css";
 import { useOutlineSpaceName } from "./OutlineSpaceName";
+import { OutlineLink, outlineBlockTarget } from "./outline-nav";
 
 /**
  * Outline › space › page › … › the focused block. Every ancestor is a link that focuses it,
@@ -23,14 +23,18 @@ export function OutlineBreadcrumbs({
 	const spaceName = useOutlineSpaceName();
 	return (
 		<Breadcrumbs separatorMargin={4} className={classes.breadcrumbs} style={{ flexWrap: "wrap" }}>
-			<Anchor component={Link} to="/outline" size="sm" className={classes.crumb}>
+			<Anchor
+				size="sm"
+				className={classes.crumb}
+				renderRoot={(props) => <OutlineLink {...props} to={{ kind: "home" }} />}
+			>
 				{t("title")}
 			</Anchor>
 			<Anchor
 				size="sm"
 				className={classes.crumb}
 				renderRoot={(props) => (
-					<Link {...props} to="/outline/$spaceId" params={{ spaceId: view.space.id }} />
+					<OutlineLink {...props} to={{ kind: "space", spaceId: view.space.id }} />
 				)}
 			>
 				{spaceName(view.space)}
@@ -42,11 +46,9 @@ export function OutlineBreadcrumbs({
 					className={classes.crumb}
 					title={ancestor.title}
 					renderRoot={(props) => (
-						<Link
+						<OutlineLink
 							{...props}
-							to="/outline/$spaceId/$blockId"
-							params={{ spaceId: view.space.id, blockId: ancestor.id }}
-							search={search}
+							to={outlineBlockTarget(view.space.id, ancestor.id, search.view, search.asOf)}
 						/>
 					)}
 				>

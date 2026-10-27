@@ -119,6 +119,21 @@ export interface OutlineCommitRow {
 	summary: string;
 }
 
+/**
+ * One row of a page's live session log (`outline_live_updates`): a Yjs update as base64. Seq 0 of
+ * an epoch, or the first row after a compaction, is a full snapshot of the session's document;
+ * the rows after it are increments. Replaying an epoch's rows in seq order rebuilds the document.
+ */
+export interface OutlineLiveUpdateRow {
+	pageBlockId: string;
+	epoch: number;
+	seq: number;
+	updateB64: string;
+	actorKind: OutlineActorKind;
+	actorId: string;
+	createdAt: string;
+}
+
 /** The space a project, a user or a narrator owns. */
 export type OutlineSpaceScope =
 	| { kind: "project"; projectId: string }
@@ -249,6 +264,33 @@ export interface OutlineStore extends WritePortIdentity, OutlineReadPort {
 
 	/** Write one commit atomically; see {@link OutlineCommitPlan} and the header contract. */
 	applyCommit(plan: OutlineCommitPlan): Promise<void>;
+
+	// ── live session log (`services/outline/live/`) ─────────────────────────────────────
+	// Not part of a page's history: rows are written while a page is edited live and deleted
+	// once the session's text is committed. Each call is one small indexed statement or one
+	// short transaction; callers bound the row counts.
+
+	/** Append rows (at most a handful per call). */
+	appendLiveUpdates(rows: readonly OutlineLiveUpdateRow[]): Promise<void>;
+	/** Replace every row of an epoch with `rows`, atomically (a compaction). */
+	replaceLiveUpdates(
+		pageBlockId: string,
+		epoch: number,
+		rows: readonly OutlineLiveUpdateRow[],
+	): Promise<void>;
+	/** Rows of an epoch by seq, after `afterSeq`, at most `limit`. */
+	listLiveUpdates(
+		pageBlockId: string,
+		epoch: number,
+		options: { afterSeq?: number; limit: number },
+	): Promise<OutlineLiveUpdateRow[]>;
+	/** Delete every row of an epoch; returns how many went. */
+	deleteLiveUpdates(pageBlockId: string, epoch: number): Promise<number>;
+	/** Epochs that have rows, ordered by page then epoch, after `after`, at most `limit`. */
+	listLiveEpochs(options: {
+		after?: { pageBlockId: string; epoch: number };
+		limit: number;
+	}): Promise<Array<{ pageBlockId: string; epoch: number }>>;
 }
 
 /** Ids per `IN (…)` list, well under every engine's bound-parameter limit. */

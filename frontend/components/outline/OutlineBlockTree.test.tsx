@@ -15,6 +15,7 @@ mock.module("react-i18next", () => ({
 	}),
 }));
 mock.module("@tanstack/react-router", () => ({
+	useNavigate: () => () => {},
 	Link: ({
 		to,
 		params,
@@ -46,6 +47,8 @@ mock.module("../narrator/markdown/MarkdownContent", () => ({
 
 const { OutlineBlockTree } = await import("./OutlineBlockTree");
 const { needsMarkdown } = await import("./OutlineBlockBody");
+const { OutlineNavProvider } = await import("./outline-nav");
+const { outlineRouterLink } = await import("../../lib/outline-router");
 
 function block(id: string, childIds: string[] = [], extra: Partial<OutlineViewBlock> = {}) {
 	return {
@@ -92,8 +95,17 @@ function view(blocks: OutlineViewBlock[], extra: Partial<OutlineBlockViewRespons
 	} satisfies OutlineBlockViewResponse;
 }
 
-function render(node: ReactNode): string {
-	return renderToStaticMarkup(<MantineProvider>{node}</MantineProvider>);
+function render(node: ReactNode, routed = true): string {
+	return renderToStaticMarkup(
+		<MantineProvider>
+			<OutlineNavProvider
+				onNavigate={() => {}}
+				{...(routed ? { renderLink: outlineRouterLink } : {})}
+			>
+				{node}
+			</OutlineNavProvider>
+		</MantineProvider>,
+	);
 }
 
 describe("OutlineBlockTree", () => {
@@ -138,6 +150,20 @@ describe("OutlineBlockTree", () => {
 		expect(html).not.toContain("Block b");
 		expect(html).not.toContain("page.more");
 		expect(html).toContain('aria-expanded="false"');
+	});
+
+	test("without a link renderer (a dock panel), focus links are plain anchors", () => {
+		const html = render(
+			<OutlineBlockTree
+				view={view([block("root", ["a"]), block("a")])}
+				collapsed={new Set()}
+				search={{ view: "all" }}
+				onToggle={() => {}}
+			/>,
+			false,
+		);
+		expect(html).toContain('href="#outline/space/a"');
+		expect(html).not.toContain('href="/outline/space/a');
 	});
 
 	test("an empty facts view says the process is hidden", () => {

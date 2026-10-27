@@ -30,6 +30,7 @@
  */
 import { NotFoundError } from "@server/lib/errors";
 import { OutlineBusyError } from "./errors";
+import { withOutlineLiveBarrier } from "./live-barrier";
 import { OUTLINE_TEXT, type OutlineRevertSkipReason } from "./messages";
 import {
 	OUTLINE_CHANGE,
@@ -457,6 +458,19 @@ export async function revertCommit(
 	const store = options.store ?? outlineStore;
 	const commit = await store.getCommit(input.commitId);
 	if (!commit) throw new NotFoundError("Outline commit", input.commitId);
+	// Behind the live session barrier: edits still in a page's live session are committed first,
+	// so the analysis sees them as "changed later" and leaves those blocks alone.
+	return await withOutlineLiveBarrier(commit.spaceId, () =>
+		revertAttempts(input, options, store, commit),
+	);
+}
+
+async function revertAttempts(
+	input: OutlineRevertInput,
+	options: OutlineRevertOptions,
+	store: OutlineStore,
+	commit: OutlineCommitRow,
+): Promise<OutlineRevertResult> {
 	const attempts = options.maxAttempts ?? DEFAULT_ATTEMPTS;
 	for (let attempt = 0; attempt < attempts; attempt++) {
 		const space = await store.getSpace(commit.spaceId);

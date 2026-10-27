@@ -16,6 +16,8 @@
  *      `alias:: Q?` takes the next free number of that prefix in the space.
  *   4. Check what the agent read: a block it is changing that someone else changed after the
  *      agent last read it is a conflict, reported with its current text; nothing is written.
+ *      This and the write run behind the live session barrier (`live-barrier.ts`), so edits
+ *      still in a page's live session count as changes.
  *   5. Write one transaction with provenance (this narrator as actor, the turn's person as
  *      responsible, the message and tool call), content handed over already normalized.
  *
@@ -49,6 +51,7 @@ import { OutlineEditTextError, processEditText } from "./edit-text-runner";
 import { OutlineBusyError, OutlineConflictError, OutlineWriteError } from "./errors";
 import { newOutlineSid } from "./keys";
 import { linkDisplayTitle } from "./link-display";
+import { withOutlineLiveBarrier } from "./live-barrier";
 import { OUTLINE_TOOL_TEXT } from "./messages";
 import { OUTLINE_LIMITS } from "./model";
 import { forgetOutlineReads, recordOutlineReads, seenOutlineVersion } from "./read-ledger";
@@ -605,193 +608,8 @@ export async function outlineEdit(
 		}
 	}
 
-	// 4. What the agent read.
-	const existingIds = [
-		...new Set(
-			edits.flatMap((edit) => (edit.located?.kind === "block" ? [edit.located.block.id] : [])),
-		),
-	];
-	const current = new Map(
-		(await scope.store.getBlockMetas(space.id, { ids: existingIds })).map((m) => [m.id, m]),
-	);
-	const stale = [...current.values()].filter((m) => {
-		const seen = seenOutlineVersion(scope.narratorId, m.id);
-		return seen !== undefined && m.versionSeq > seen;
-	});
-	if (stale.length > 0) {
-		const commits = new Map(
-			(
-				await scope.store.getCommitsBySeqs(space.id, [...new Set(stale.map((m) => m.versionSeq))])
-			).map((c) => [c.seq, c]),
-		);
-		const conflicts = stale.filter((m) => {
-			const commit = commits.get(m.versionSeq);
-			return !(commit?.actorKind === "agent" && commit.actorId === scope.narratorId);
-		});
-		if (conflicts.length > 0) {
-			return await conflictOutput(
-				scope,
-				space,
-				conflicts.map((m) => ({
-					blockId: m.id,
-					sid: m.sid,
-					seen: seenOutlineVersion(scope.narratorId, m.id) as number,
-					now: m.versionSeq,
-					by: commits.get(m.versionSeq),
-				})),
-				meta,
-			);
-		}
-	}
-	const base = (blockId: string) => current.get(blockId)?.versionSeq;
-
-	// 5. Operations.
-	const ops: OutlineOp[] = [];
-	const canonical: Array<OutlineCanonicalContent | undefined> = [];
-	const opEdit: number[] = [];
-	const push = (edit: EditState, op: OutlineOp, content?: OutlineCanonicalContent) => {
-		edit.opIndexes.push(ops.length);
-		opEdit.push(edit.index);
-		canonical.push(content);
-		ops.push(op);
-	};
-	const taskOf = (edit: EditState, item: EditTextItem): OutlineTaskInput | null => {
-		const depends = dependsOf(item);
-		if (!item.task) {
-			if (depends?.length || item.props.due)
-				edit.notes.push(OUTLINE_TOOL_TEXT.edit.taskPropsIgnored(edit.index + 1));
-			return null;
-		}
-		return {
-			status: item.task.status,
-			assignee: item.task.assignee,
-			...(depends?.length ? { depends } : {}),
-			...(item.props.due ? { due: item.props.due } : {}),
-		};
-	};
-	const insertTree = (
-		edit: EditState,
-		p: PlannedItem,
-		parent: OutlineBlockRef | null,
-		position: OutlinePosition | undefined,
-	): string => {
-		const tempId = `n${ops.length}`;
-		push(
-			edit,
-			{
-				op: "insert",
-				tempId,
-				sid: p.sid,
-				parent,
-				...(position ? { position } : {}),
-				content: p.content,
-				task: taskOf(edit, p.item),
-				...(p.alias ? { alias: p.alias } : {}),
-				...(p.item.props.tags?.length ? { tags: p.item.props.tags.map((t) => t.target) } : {}),
-			},
-			{ content: p.content, links: p.links },
-		);
-		for (const child of p.children) insertTree(edit, child, { tempId }, undefined);
-		return tempId;
-	};
-	for (const edit of edits) {
-		const r = edit.request;
-		if ("add" in r) {
-			const parent = edit.parent?.kind === "block" ? { id: edit.parent.block.id } : null;
-			let previous: string | null = null;
-			for (const p of edit.items ?? []) {
-				const position: OutlinePosition | undefined = previous
-					? { after: { tempId: previous } }
-					: edit.after
-						? { after: { id: edit.after.id } }
-						: undefined;
-				previous = insertTree(edit, p, parent, position);
-			}
-		} else if ("replace" in r) {
-			const block = (edit.located as { block: OutlineResolvedBlock }).block;
-			const p = (edit.items as PlannedItem[])[0] as PlannedItem;
-			const props = p.item.props;
-			push(
-				edit,
-				{
-					op: "update",
-					block: { id: block.id },
-					content: p.content,
-					baseVersionSeq: base(block.id),
-					...(p.alias !== undefined ? { alias: p.alias } : {}),
-					...(props.tags?.length ? { tags: props.tags.map((t) => t.target) } : {}),
-				},
-				{ content: p.content, links: p.links },
-			);
-			const depends = dependsOf(p.item);
-			if (p.item.task || depends?.length || props.due) {
-				const task: OutlineTaskPatch = {
-					...(p.item.task ? { status: p.item.task.status } : {}),
-					...(p.item.task?.assignee ? { assignee: p.item.task.assignee } : {}),
-					...(depends?.length ? { depends } : {}),
-					...(props.due ? { due: props.due } : {}),
-				};
-				push(edit, {
-					op: "setTask",
-					block: { id: block.id },
-					task,
-					baseVersionSeq: base(block.id),
-				});
-			}
-			let previous: string | null = null;
-			for (const child of p.children) {
-				previous = insertTree(
-					edit,
-					child,
-					{ id: block.id },
-					previous ? { after: { tempId: previous } } : { first: true },
-				);
-			}
-		} else if ("move" in r) {
-			const block = (edit.located as { block: OutlineResolvedBlock }).block;
-			push(edit, {
-				op: "move",
-				block: { id: block.id },
-				parent: edit.parent?.kind === "block" ? { id: edit.parent.block.id } : null,
-				...(edit.after ? { position: { after: { id: edit.after.id } } } : {}),
-				baseVersionSeq: base(block.id),
-			});
-		} else if ("delete" in r) {
-			const block = (edit.located as { block: OutlineResolvedBlock }).block;
-			push(edit, { op: "delete", block: { id: block.id }, baseVersionSeq: base(block.id) });
-		} else {
-			const block = (edit.located as { block: OutlineResolvedBlock }).block;
-			const assignee = normalizeAssignee(r.assignee);
-			if (r.checkbox === "none") {
-				push(edit, {
-					op: "setTask",
-					block: { id: block.id },
-					task: null,
-					baseVersionSeq: base(block.id),
-				});
-			} else if (r.checkbox !== undefined || assignee !== undefined) {
-				push(edit, {
-					op: "setTask",
-					block: { id: block.id },
-					task: {
-						...(r.checkbox !== undefined ? { status: STATUS_OF[r.checkbox] } : {}),
-						...(assignee !== undefined ? { assignee } : {}),
-					},
-					baseVersionSeq: base(block.id),
-				});
-			}
-			if (edit.alias !== undefined) {
-				push(edit, {
-					op: "update",
-					block: { id: block.id },
-					alias: edit.alias,
-					baseVersionSeq: base(block.id),
-				});
-			}
-		}
-	}
-
-	// Hints: a new page whose title another page of the space already has.
+	// Hints, read before the barrier (it holds the space's live sessions while it runs): a new
+	// page whose title another page of the space already has.
 	const hints: string[] = [];
 	let hinted = 0;
 	for (const edit of edits) {
@@ -813,78 +631,285 @@ export async function outlineEdit(
 		}
 	}
 
-	// Write.
-	let result: OutlineWriteResult;
+	// 4–5 run behind the live session barrier: unflushed live edits of the space are committed
+	// first, so a block someone is typing into counts as changed since the agent read it, and
+	// nothing lands in the space between these checks and the write. Only the checks and the
+	// write run there; reporting a conflict reads afterwards.
+	type Conflict = Parameters<typeof conflictOutput>[2][number];
+	let outcome:
+		| { conflicts: Conflict[] }
+		| { writeConflict: OutlineConflictError }
+		| { output: OutlineToolOutput };
 	try {
-		result = await writeOutline(
-			{
-				spaceId: space.id,
-				ops,
-				actor: { kind: "agent", id: scope.narratorId },
-				responsibleUserId: scope.ctx.userId,
-				narratorId: scope.narratorId,
-				messageId: provenance.messageId,
-				toolCallId: provenance.toolCallId,
-				...(input.message?.trim() ? { summary: input.message.trim() } : {}),
-			},
-			{ canonical },
-		);
+		outcome = await withOutlineLiveBarrier(space.id, async () => {
+			// 4. What the agent read.
+			const existingIds = [
+				...new Set(
+					edits.flatMap((edit) => (edit.located?.kind === "block" ? [edit.located.block.id] : [])),
+				),
+			];
+			const current = new Map(
+				(await scope.store.getBlockMetas(space.id, { ids: existingIds })).map((m) => [m.id, m]),
+			);
+			const stale = [...current.values()].filter((m) => {
+				const seen = seenOutlineVersion(scope.narratorId, m.id);
+				return seen !== undefined && m.versionSeq > seen;
+			});
+			if (stale.length > 0) {
+				const commits = new Map(
+					(
+						await scope.store.getCommitsBySeqs(space.id, [
+							...new Set(stale.map((m) => m.versionSeq)),
+						])
+					).map((c) => [c.seq, c]),
+				);
+				const conflicts = stale.filter((m) => {
+					const commit = commits.get(m.versionSeq);
+					return !(commit?.actorKind === "agent" && commit.actorId === scope.narratorId);
+				});
+				if (conflicts.length > 0) {
+					return {
+						conflicts: conflicts.map((m) => ({
+							blockId: m.id,
+							sid: m.sid,
+							seen: seenOutlineVersion(scope.narratorId, m.id) as number,
+							now: m.versionSeq,
+							by: commits.get(m.versionSeq),
+						})),
+					};
+				}
+			}
+			const base = (blockId: string) => current.get(blockId)?.versionSeq;
+
+			// 5. Operations.
+			const ops: OutlineOp[] = [];
+			const canonical: Array<OutlineCanonicalContent | undefined> = [];
+			const opEdit: number[] = [];
+			const push = (edit: EditState, op: OutlineOp, content?: OutlineCanonicalContent) => {
+				edit.opIndexes.push(ops.length);
+				opEdit.push(edit.index);
+				canonical.push(content);
+				ops.push(op);
+			};
+			const taskOf = (edit: EditState, item: EditTextItem): OutlineTaskInput | null => {
+				const depends = dependsOf(item);
+				if (!item.task) {
+					if (depends?.length || item.props.due)
+						edit.notes.push(OUTLINE_TOOL_TEXT.edit.taskPropsIgnored(edit.index + 1));
+					return null;
+				}
+				return {
+					status: item.task.status,
+					assignee: item.task.assignee,
+					...(depends?.length ? { depends } : {}),
+					...(item.props.due ? { due: item.props.due } : {}),
+				};
+			};
+			const insertTree = (
+				edit: EditState,
+				p: PlannedItem,
+				parent: OutlineBlockRef | null,
+				position: OutlinePosition | undefined,
+			): string => {
+				const tempId = `n${ops.length}`;
+				push(
+					edit,
+					{
+						op: "insert",
+						tempId,
+						sid: p.sid,
+						parent,
+						...(position ? { position } : {}),
+						content: p.content,
+						task: taskOf(edit, p.item),
+						...(p.alias ? { alias: p.alias } : {}),
+						...(p.item.props.tags?.length ? { tags: p.item.props.tags.map((t) => t.target) } : {}),
+					},
+					{ content: p.content, links: p.links },
+				);
+				for (const child of p.children) insertTree(edit, child, { tempId }, undefined);
+				return tempId;
+			};
+			for (const edit of edits) {
+				const r = edit.request;
+				if ("add" in r) {
+					const parent = edit.parent?.kind === "block" ? { id: edit.parent.block.id } : null;
+					let previous: string | null = null;
+					for (const p of edit.items ?? []) {
+						const position: OutlinePosition | undefined = previous
+							? { after: { tempId: previous } }
+							: edit.after
+								? { after: { id: edit.after.id } }
+								: undefined;
+						previous = insertTree(edit, p, parent, position);
+					}
+				} else if ("replace" in r) {
+					const block = (edit.located as { block: OutlineResolvedBlock }).block;
+					const p = (edit.items as PlannedItem[])[0] as PlannedItem;
+					const props = p.item.props;
+					push(
+						edit,
+						{
+							op: "update",
+							block: { id: block.id },
+							content: p.content,
+							baseVersionSeq: base(block.id),
+							...(p.alias !== undefined ? { alias: p.alias } : {}),
+							...(props.tags?.length ? { tags: props.tags.map((t) => t.target) } : {}),
+						},
+						{ content: p.content, links: p.links },
+					);
+					const depends = dependsOf(p.item);
+					if (p.item.task || depends?.length || props.due) {
+						const task: OutlineTaskPatch = {
+							...(p.item.task ? { status: p.item.task.status } : {}),
+							...(p.item.task?.assignee ? { assignee: p.item.task.assignee } : {}),
+							...(depends?.length ? { depends } : {}),
+							...(props.due ? { due: props.due } : {}),
+						};
+						push(edit, {
+							op: "setTask",
+							block: { id: block.id },
+							task,
+							baseVersionSeq: base(block.id),
+						});
+					}
+					let previous: string | null = null;
+					for (const child of p.children) {
+						previous = insertTree(
+							edit,
+							child,
+							{ id: block.id },
+							previous ? { after: { tempId: previous } } : { first: true },
+						);
+					}
+				} else if ("move" in r) {
+					const block = (edit.located as { block: OutlineResolvedBlock }).block;
+					push(edit, {
+						op: "move",
+						block: { id: block.id },
+						parent: edit.parent?.kind === "block" ? { id: edit.parent.block.id } : null,
+						...(edit.after ? { position: { after: { id: edit.after.id } } } : {}),
+						baseVersionSeq: base(block.id),
+					});
+				} else if ("delete" in r) {
+					const block = (edit.located as { block: OutlineResolvedBlock }).block;
+					push(edit, { op: "delete", block: { id: block.id }, baseVersionSeq: base(block.id) });
+				} else {
+					const block = (edit.located as { block: OutlineResolvedBlock }).block;
+					const assignee = normalizeAssignee(r.assignee);
+					if (r.checkbox === "none") {
+						push(edit, {
+							op: "setTask",
+							block: { id: block.id },
+							task: null,
+							baseVersionSeq: base(block.id),
+						});
+					} else if (r.checkbox !== undefined || assignee !== undefined) {
+						push(edit, {
+							op: "setTask",
+							block: { id: block.id },
+							task: {
+								...(r.checkbox !== undefined ? { status: STATUS_OF[r.checkbox] } : {}),
+								...(assignee !== undefined ? { assignee } : {}),
+							},
+							baseVersionSeq: base(block.id),
+						});
+					}
+					if (edit.alias !== undefined) {
+						push(edit, {
+							op: "update",
+							block: { id: block.id },
+							alias: edit.alias,
+							baseVersionSeq: base(block.id),
+						});
+					}
+				}
+			}
+
+			// Write.
+			let result: OutlineWriteResult;
+			try {
+				result = await writeOutline(
+					{
+						spaceId: space.id,
+						ops,
+						actor: { kind: "agent", id: scope.narratorId },
+						responsibleUserId: scope.ctx.userId,
+						narratorId: scope.narratorId,
+						messageId: provenance.messageId,
+						toolCallId: provenance.toolCallId,
+						...(input.message?.trim() ? { summary: input.message.trim() } : {}),
+					},
+					{ canonical },
+				);
+			} catch (error) {
+				if (error instanceof OutlineConflictError) return { writeConflict: error };
+				if (error instanceof OutlineWriteError) {
+					const at = error.opIndex === null ? undefined : edits[opEdit[error.opIndex] as number];
+					const message = error.message.replace(/^operation \d+: /, "");
+					return { output: failed([at ? `${label(at)}: ${message}` : message]) };
+				}
+				if (error instanceof OutlineBusyError)
+					return { output: failed([OUTLINE_TOOL_TEXT.edit.busy]) };
+				if (error instanceof NotFoundError) return { output: failed([error.message]) };
+				throw error;
+			}
+
+			// The read ledger follows the agent's own writes.
+			const commit = result.commit;
+			if (commit) {
+				const written: Array<readonly [string, number]> = [];
+				const deleted: string[] = [];
+				result.results.forEach((r, i) => {
+					if (!r) return;
+					if (ops[i]?.op === "delete") deleted.push(r.blockId);
+					else written.push([r.blockId, commit.seq]);
+					for (const s of r.split) written.push([s.blockId, commit.seq]);
+				});
+				recordOutlineReads(scope.narratorId, written);
+				forgetOutlineReads(scope.narratorId, deleted);
+			}
+
+			return {
+				output: successOutput(space, spaceText, edits, result, { globalNotes, hints, meta }),
+			};
+		});
 	} catch (error) {
-		if (error instanceof OutlineConflictError) {
-			const metas = new Map(
-				(
-					await scope.store.getBlockMetas(space.id, {
-						ids: error.conflicts.map((c) => c.blockId),
-					})
-				).map((m) => [m.id, m]),
-			);
-			const commits = new Map(
-				(
-					await scope.store.getCommitsBySeqs(
-						space.id,
-						error.conflicts.map((c) => c.actualVersionSeq),
-					)
-				).map((c) => [c.seq, c]),
-			);
-			return await conflictOutput(
-				scope,
-				space,
-				error.conflicts.map((c) => ({
-					blockId: c.blockId,
-					sid: metas.get(c.blockId)?.sid ?? c.sid,
-					seen: seenOutlineVersion(scope.narratorId, c.blockId) ?? c.expectedVersionSeq,
-					now: c.actualVersionSeq,
-					by: commits.get(c.actualVersionSeq),
-				})),
-				meta,
-			);
-		}
-		if (error instanceof OutlineWriteError) {
-			const at = error.opIndex === null ? undefined : edits[opEdit[error.opIndex] as number];
-			const message = error.message.replace(/^operation \d+: /, "");
-			return failed([at ? `${label(at)}: ${message}` : message]);
-		}
+		// The space's live text could not be committed first: try again shortly.
 		if (error instanceof OutlineBusyError) return failed([OUTLINE_TOOL_TEXT.edit.busy]);
-		if (error instanceof NotFoundError) return failed([error.message]);
 		throw error;
 	}
-
-	// The read ledger follows the agent's own writes.
-	const commit = result.commit;
-	if (commit) {
-		const written: Array<readonly [string, number]> = [];
-		const deleted: string[] = [];
-		result.results.forEach((r, i) => {
-			if (!r) return;
-			if (ops[i]?.op === "delete") deleted.push(r.blockId);
-			else written.push([r.blockId, commit.seq]);
-			for (const s of r.split) written.push([s.blockId, commit.seq]);
-		});
-		recordOutlineReads(scope.narratorId, written);
-		forgetOutlineReads(scope.narratorId, deleted);
-	}
-
-	return successOutput(space, spaceText, edits, result, { globalNotes, hints, meta });
+	if ("output" in outcome) return outcome.output;
+	if ("conflicts" in outcome) return await conflictOutput(scope, space, outcome.conflicts, meta);
+	const error = outcome.writeConflict;
+	const metas = new Map(
+		(
+			await scope.store.getBlockMetas(space.id, {
+				ids: error.conflicts.map((c) => c.blockId),
+			})
+		).map((m) => [m.id, m]),
+	);
+	const commits = new Map(
+		(
+			await scope.store.getCommitsBySeqs(
+				space.id,
+				error.conflicts.map((c) => c.actualVersionSeq),
+			)
+		).map((c) => [c.seq, c]),
+	);
+	return await conflictOutput(
+		scope,
+		space,
+		error.conflicts.map((c) => ({
+			blockId: c.blockId,
+			sid: metas.get(c.blockId)?.sid ?? c.sid,
+			seen: seenOutlineVersion(scope.narratorId, c.blockId) ?? c.expectedVersionSeq,
+			now: c.actualVersionSeq,
+			by: commits.get(c.actualVersionSeq),
+		})),
+		meta,
+	);
 }
 
 async function conflictOutput(

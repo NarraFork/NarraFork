@@ -5,9 +5,12 @@ import {
 } from "@server/lib/agent/modeltrace-request";
 import type { ChatParams, ParsedStreamEvent, ProviderAdapter } from "@server/lib/agent/provider";
 import { buildModelTracePrompt } from "@server/lib/modeltrace";
+import type { ModelTraceResultBlock } from "@shared/modeltrace-result";
 
 const latestRef = mock(async () => ({ messageId: "latest-parent-message" }));
-const fork = mock(async (..._args: unknown[]) => ({ id: "probe" }));
+const fork = mock(async (..._args: unknown[]) => ({ id: "probe", traits: ["standalone"] }));
+const updateWhere = mock(async (..._args: unknown[]) => {});
+const updateSet = mock((_values: unknown) => ({ where: updateWhere }));
 const persistUser = mock(async (..._args: unknown[]) => ({
 	id: "user-row",
 	seq: 20,
@@ -42,7 +45,10 @@ const claim = mock((_id: string, _kind: string) => {
 	return { release, isCurrent: () => true };
 });
 mock.module("@server/db", () => ({
-	db: { query: { narratorMessageRefs: { findFirst: latestRef } } },
+	db: {
+		query: { narratorMessageRefs: { findFirst: latestRef } },
+		update: () => ({ set: updateSet }),
+	},
 }));
 mock.module("./narrator-service", () => ({ narratorService: { forkNarrator: fork } }));
 mock.module("./narrator-persistence", () => ({
@@ -80,6 +86,8 @@ beforeEach(() => {
 	];
 	for (const fn of [
 		latestRef,
+		updateSet,
+		updateWhere,
 		fork,
 		persistUser,
 		persistAssistant,
@@ -122,6 +130,10 @@ afterEach(() => {
 	forgetModelTraceRequest("parent");
 	cancelModelTrace("probe");
 });
+
+function reportedResult(): ModelTraceResultBlock {
+	return (persistDisplay.mock.calls[0]?.[2] as ModelTraceResultBlock[])[0];
+}
 
 async function complete() {
 	const result = await startModelTrace("parent", "operator", "en");
@@ -174,12 +186,15 @@ describe("ModelTrace independent single-request probe", () => {
 			outputTokens: 99,
 			message: { usage: { input_tokens: 42, output_tokens: 99 } },
 		});
-		expect(persistDisplay).toHaveBeenCalledTimes(2);
-		expect(persistDisplay.mock.calls.map((call) => call[0])).toEqual(["probe", "parent"]);
-		expect(persistDisplay.mock.calls[0]?.[1]).toContain("TOP 5");
-		expect(persistDisplay.mock.calls[0]?.[2]).toEqual([
-			{ type: "text", text: persistDisplay.mock.calls[0]?.[1] },
-		]);
+		expect(persistDisplay).toHaveBeenCalledTimes(1);
+		expect(persistDisplay.mock.calls.map((call) => call[0])).toEqual(["probe"]);
+		expect(reportedResult().type).toBe("modeltrace_result");
+		expect(reportedResult().results).toHaveLength(5);
+		expect(reportedResult().error).toBeUndefined();
+		expect(updateSet).toHaveBeenCalledWith({
+			traits: ["standalone", "modeltrace"],
+			parentNarratorId: "parent",
+		});
 		expect(broadcast).toHaveBeenCalledTimes(2);
 		expect(claim).toHaveBeenCalledWith("probe", "run");
 		expect(status.mock.calls.map((call) => call.slice(0, 2))).toEqual([
@@ -224,8 +239,10 @@ describe("ModelTrace independent single-request probe", () => {
 			events = [event, { text: JSON.stringify(Array(300).fill(17)) }];
 			await complete();
 			expect(chat).toHaveBeenCalledTimes(1);
-			expect(persistDisplay.mock.calls[0]?.[1]).toContain("no result");
-			expect(persistDisplay.mock.calls[0]?.[1]).not.toContain("TOP 5");
+			expect(reportedResult().error).toBeTruthy();
+			expect(reportedResult().results).toEqual([]);
+			expect(persistDisplay.mock.calls.map((call) => call[0])).toEqual(["probe"]);
+
 			expect(persistAssistant).not.toHaveBeenCalled();
 			expect(release).toHaveBeenCalledTimes(1);
 		});
@@ -259,10 +276,10 @@ describe("ModelTrace independent single-request probe", () => {
 					usage: { input_tokens: 42, output_tokens: 99 },
 				},
 			});
-			expect(persistDisplay.mock.calls[0]?.[1]).toContain("no result");
-			expect(persistDisplay.mock.calls[0]?.[1]).toContain("existing transport retry policy");
-			expect(persistDisplay.mock.calls[0]?.[1]).not.toContain("No retry was performed");
-			expect(persistDisplay.mock.calls[0]?.[1]).not.toContain("TOP 5");
+			expect(reportedResult().error).toBeTruthy();
+			expect(reportedResult().results).toEqual([]);
+			expect(persistDisplay.mock.calls.map((call) => call[0])).toEqual(["probe"]);
+
 			expect(chat).toHaveBeenCalledTimes(1);
 		});
 	}
@@ -276,13 +293,15 @@ describe("ModelTrace independent single-request probe", () => {
 	])("accepts provider success reason %s", async (stopReason) => {
 		events[2] = { stopReason };
 		await complete();
-		expect(persistDisplay.mock.calls[0]?.[1]).toContain("TOP 5");
+		expect(reportedResult().results).toHaveLength(5);
 	});
 
 	test.each(["error", "outputTruncated"])("rejects explicit provider %s flags", async (key) => {
 		events = [{ [key]: true } as ParsedStreamEvent];
 		await complete();
-		expect(persistDisplay.mock.calls[0]?.[1]).toContain("no result");
+		expect(reportedResult().error).toBeTruthy();
+		expect(reportedResult().results).toEqual([]);
+		expect(persistDisplay.mock.calls.map((call) => call[0])).toEqual(["probe"]);
 		expect(chat).toHaveBeenCalledTimes(1);
 	});
 
@@ -301,14 +320,16 @@ describe("ModelTrace independent single-request probe", () => {
 		expect(persistAssistant.mock.calls[0]?.[1]).toMatchObject({
 			message: { content: [{ type: "text", text: "I cannot comply." }] },
 		});
-		expect(persistDisplay.mock.calls[0]?.[1]).toContain("no result");
+		expect(reportedResult().error).toBeTruthy();
+		expect(reportedResult().results).toEqual([]);
+		expect(persistDisplay.mock.calls.map((call) => call[0])).toEqual(["probe"]);
 		expect(chat).toHaveBeenCalledTimes(1);
 	});
 
 	test("oversized output stops at the character cap", async () => {
 		events = [{ text: "x".repeat(10_001) }];
 		await complete();
-		expect(persistDisplay.mock.calls[0]?.[1]).toContain("10,000");
+		expect(reportedResult().error).toContain("10,000");
 		expect(persistAssistant).not.toHaveBeenCalled();
 	});
 
@@ -330,7 +351,7 @@ describe("ModelTrace independent single-request probe", () => {
 		expect(received?.signal.aborted).toBe(true);
 		expect(parentController.signal.aborted).toBe(false);
 		expect(release).toHaveBeenCalledTimes(1);
-		expect(persistDisplay.mock.calls[0]?.[1]).toContain("canceled");
+		expect(reportedResult().error).toContain("canceled");
 	});
 
 	test("the total timeout is independent of upstream signal compliance", async () => {
@@ -348,7 +369,7 @@ describe("ModelTrace independent single-request probe", () => {
 					}) as unknown as AsyncGenerator<ParsedStreamEvent>,
 			);
 			await complete();
-			expect(persistDisplay.mock.calls[0]?.[1]).toContain("timed out");
+			expect(reportedResult().error).toContain("timed out");
 			expect(release).toHaveBeenCalledTimes(1);
 		} finally {
 			timer.mockRestore();

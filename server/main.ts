@@ -1788,6 +1788,14 @@ void startupReadiness.barrier.then((recovery) => {
 		});
 });
 
+// Outline pages edited live when the previous process ended: commit what their logs hold.
+void startupReadiness.barrier.then((recovery) => {
+	if (!shouldStartGatedBackgroundWork(recovery)) return;
+	import("./services/outline/live/registry")
+		.then(({ startLiveReplay }) => startLiveReplay())
+		.catch((err) => logger.warn("Outline live log replay failed", { error: String(err) }));
+});
+
 // Backfill legacy RecentTabs in bounded background batches. Membership consumers await this
 // process-wide singleton before querying the authoritative indexes.
 ensureAllRecentTabsMigrated()
@@ -1942,6 +1950,17 @@ async function performGracefulShutdown(
 			await shutdownStep(tracker, "restartRecovery.prepare", prepareSignalRestartRecovery, 5_000);
 		}
 		const shutdownRequestId = httpRequestContext.getStore();
+		// Outline pages being edited live: log what arrived and acknowledge it while the sockets
+		// are still open, so the editors forget it instead of replaying it after the restart.
+		await shutdownStep(
+			tracker,
+			"outlineLive.persist",
+			async () => {
+				const live = await import("./services/outline/live/registry");
+				await live.persistAllLiveSessions();
+			},
+			2_000,
+		);
 		closeAllConnections();
 		// A short budget is honest here: stopHttpListener() is synchronous by design
 		// (it never awaits stop()'s promise), so anything beyond a moment means the
@@ -1968,6 +1987,16 @@ async function performGracefulShutdown(
 			tracker.markDrainComplete();
 		}
 
+		// Outline pages being edited live: commit their text, end the sessions.
+		await shutdownStep(
+			tracker,
+			"outlineLive.close",
+			async () => {
+				const live = await import("./services/outline/live/registry");
+				await live.closeAllLiveSessions("ended");
+			},
+			5_000,
+		);
 		getCodexManager().stopUsageRefreshScheduler();
 		stopScheduledTaskScheduler();
 		await shutdownStep(tracker, "notificationFanout.stop", stopNotificationFanout);

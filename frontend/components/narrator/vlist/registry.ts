@@ -28,6 +28,7 @@ import { measureInjectionBubble } from "./measure/measure-injection-bubble";
 import { measureMarkdown } from "./measure/measure-markdown";
 import { measureMedia } from "./measure/measure-media";
 import { measureMessageBubble } from "./measure/measure-message-bubble";
+import { measureModelTraceResult } from "./measure/measure-modeltrace-result";
 import { measureAskUserQuestion, measureInlinePermission } from "./measure/measure-permission";
 import { measurePlanCard } from "./measure/measure-plan-card";
 import {
@@ -160,6 +161,12 @@ export const VLIST_REGISTRY: Record<VListElementKind, VListMeasureEntry> = {
 		label: "Knowledge hint list",
 		lodSensitive: false,
 		measure: (d, w, l) => measureKnowledgeHint(d as AnyData, w, l),
+	},
+	"modeltrace-result": {
+		kind: "modeltrace-result",
+		label: "ModelTrace result",
+		lodSensitive: false,
+		measure: (d, w) => measureModelTraceResult(d as AnyData, w),
 	},
 	"plan-card": {
 		kind: "plan-card",

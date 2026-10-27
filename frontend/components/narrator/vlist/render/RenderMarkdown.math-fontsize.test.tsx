@@ -172,7 +172,7 @@ describe("inline math font size (virtual list)", () => {
 });
 
 describe("a formula never wraps inside its host box", () => {
-	// KaTeX deliberately splits a formula into SEVERAL `.base` spans, cutting after
+	// KaTeX deliberately splits a formula into SEVERAL `.katex-base` spans, cutting after
 	// binary/relation operators so a browser can break a long formula there. Those
 	// cuts are real line-break opportunities. The host box is width-pinned to the
 	// measured width with no slack, so any sub-pixel rounding lets the box wrap at
@@ -199,7 +199,9 @@ describe("a formula never wraps inside its host box", () => {
 				throwOnError: false,
 				output: "html",
 			});
-			expect((html.match(/class="base"/g) ?? []).length).toBeGreaterThan(1);
+			const markup = document.createElement("div");
+			markup.innerHTML = html;
+			expect(markup.querySelectorAll(".katex-base").length).toBeGreaterThan(1);
 		}
 	});
 
@@ -208,7 +210,7 @@ describe("a formula never wraps inside its host box", () => {
 			const view = await renderMarkdownBody(`prose $${latex}$ tail`);
 			const host = inlineMathHost(view.container);
 			expect(host).not.toBeNull();
-			// `nowrap` is what removes the break opportunity between `.base` spans.
+			// `nowrap` is what removes the break opportunity between `.katex-base` spans.
 			expect(host?.style.whiteSpace).toBe("nowrap");
 			view.unmount();
 		}

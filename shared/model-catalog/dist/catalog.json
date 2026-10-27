@@ -1,8 +1,8 @@
 {
   "schemaVersion": 2,
-  "catalogVersion": "v2:bundled-b57cca20de6ca318228f034e7fecced365cf2cf94bb5aa7e401e143746970a87",
-  "sourceVersion": "bundled-b57cca20de6ca318228f034e7fecced365cf2cf94bb5aa7e401e143746970a87",
-  "publishedAt": "2026-10-21T10:54:22+08:00",
+  "catalogVersion": "v2:bundled-4efc524956c3414de027f023610537a370ef6a26e108770b316d46c3bc94de4b",
+  "sourceVersion": "bundled-4efc524956c3414de027f023610537a370ef6a26e108770b316d46c3bc94de4b",
+  "publishedAt": "2026-10-27T08:55:35+08:00",
   "models": [
     {
       "id": "auto-smart",
@@ -297,6 +297,16 @@
       "family": "claude",
       "status": "verified",
       "notes": "Thinking can be disabled only with low, medium or high effort. In sub2api's Responses bridge, none maps to disabled thinking with low effort; xhigh/max require adaptive thinking.",
+      "matches": {
+        "aliases": [
+          "claude-haiku-5.5"
+        ],
+        "prefixes": [
+          "claude-haiku-5-5",
+          "claude-haiku-5.5"
+        ],
+        "volatileSuffixes": true
+      },
       "sources": [
         {
           "label": "sub2api: backend/resources/model-pricing/model_prices_and_context_window.json [claude-haiku-5-5] @ 8f2cbb53d9d1c40e1865b07ac460571f7d4c48de",
@@ -1248,7 +1258,11 @@
       "name": "Claude Sonnet 5.5",
       "family": "claude",
       "status": "verified",
+      "notes": "sub2api accepts low/medium/high/xhigh/max and defaults to high in its Responses bridge. The bridge maps none to between_tools thinking with low effort, not disabled thinking; a full reasoning-off toggle must not be advertised. USD pricing is verified against the official Claude pricing table and Sonnet 5.5 launch announcement; cached input is $0.10 per MTok, not the older upstream table's $0.20.",
       "matches": {
+        "aliases": [
+          "claude-sonnet-5.5"
+        ],
         "prefixes": [
           "claude-sonnet-5-5"
         ],
@@ -1256,15 +1270,35 @@
       },
       "sources": [
         {
+          "label": "Claude official pricing: USD per MTok base input 2 / 5m cache writes 2.50 / 1h cache writes 4 / cache hits 0.10 / output 10; supersedes older sub2api cache-read rate",
+          "url": "https://platform.claude.com/docs/en/about-claude/pricing.md",
+          "verifiedAt": "2026-10-24T00:00:00Z"
+        },
+        {
+          "label": "Anthropic Sonnet 5.5 announcement: USD per MTok input 2 / output 10 / cache reads 0.10; Claude Platform defaults to high effort",
+          "url": "https://www.anthropic.com/news/claude-sonnet-5-5",
+          "verifiedAt": "2026-10-24T00:00:00Z"
+        },
+        {
           "label": "sub2api: backend/resources/model-pricing/model_prices_and_context_window.json [claude-sonnet-5-5] @ 3040209f205472038c1ba745a1bedd2edd9053b1",
           "url": "https://github.com/Wei-Shaw/sub2api/blob/3040209f205472038c1ba745a1bedd2edd9053b1/backend/resources/model-pricing/model_prices_and_context_window.json#L924",
           "verifiedAt": "2026-10-02T12:21:34Z"
+        },
+        {
+          "label": "sub2api: Sonnet 5.5 low/medium/high/xhigh/max effort and dotted-ID normalization @ 5c185c5c5d4f5e409e2139806e0964ae944e03e8",
+          "url": "https://github.com/Wei-Shaw/sub2api/blob/5c185c5c5d4f5e409e2139806e0964ae944e03e8/backend/internal/pkg/claude/effort_catalog.go",
+          "verifiedAt": "2026-10-24T00:00:00Z"
+        },
+        {
+          "label": "sub2api: TestSonnet55ResponsesThinkingAndSampling defaults to high; none maps to between_tools with low effort, not disabled thinking",
+          "url": "https://github.com/Wei-Shaw/sub2api/blob/5c185c5c5d4f5e409e2139806e0964ae944e03e8/backend/internal/pkg/apicompat/anthropic_responses_test.go#L1885-L1918",
+          "verifiedAt": "2026-10-24T00:00:00Z"
         }
       ],
       "metadata": {
         "cache_creation_input_token_cost": 0.0000025,
         "cache_creation_input_token_cost_above_1hr": 0.000004,
-        "cache_read_input_token_cost": 2e-7,
+        "cache_read_input_token_cost": 1e-7,
         "input_cost_per_token": 0.000002,
         "litellm_provider": "anthropic",
         "max_input_tokens": 1000000,
@@ -1282,6 +1316,17 @@
         "supports_pdf_input": true,
         "supports_prompt_caching": true,
         "supports_reasoning": true,
+        "reasoning_effort_levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "default_reasoning_effort": "high",
+        "can_disable_reasoning": false,
+        "supports_none_reasoning_effort": false,
+        "supports_minimal_reasoning_effort": false,
         "supports_response_schema": true,
         "supports_sampling_params": false,
         "supports_tool_choice": true,
@@ -4146,6 +4191,165 @@
       "family": "glm",
       "status": "unverified",
       "metadata": {}
+    },
+    {
+      "id": "glm-5.3-flash",
+      "name": "GLM-5.3-Flash",
+      "family": "glm",
+      "status": "verified",
+      "sources": [
+        {
+          "label": "Z.AI GLM-5.3-Flash/FlashX: text/image/video/file input, text output, 1M context (exact integer not stated); always-on reasoning, streaming, function calling and context caching; file input is not represented as a separate modality by this catalog",
+          "url": "https://docs.z.ai/guides/vlm/glm-5.3-flash",
+          "verifiedAt": "2026-10-24T00:00:00Z"
+        },
+        {
+          "label": "Z.AI Chat Completion OpenAPI: Vision request explicitly includes glm-5.3-flash and glm-5.3-flashx; max_tokens maximum 131072; reasoning_effort enum low/high/max with default max",
+          "url": "https://docs.z.ai/api-reference/llm/chat-completion",
+          "verifiedAt": "2026-10-24T00:00:00Z"
+        },
+        {
+          "label": "Z.AI pricing: USD per 1M tokens, input $0.15 / cached input $0.03 / output $0.50; storage is only temporarily free and is not recorded as a permanent zero price",
+          "url": "https://docs.z.ai/guides/overview/pricing",
+          "verifiedAt": "2026-10-24T00:00:00Z"
+        }
+      ],
+      "metadata": {
+        "max_output_tokens": 131072,
+        "max_tokens": 131072,
+        "input_cost_per_token": 1.5e-7,
+        "cache_read_input_token_cost": 3e-8,
+        "output_cost_per_token": 5e-7,
+        "supported_modalities": [
+          "text",
+          "image",
+          "video"
+        ],
+        "supported_output_modalities": [
+          "text"
+        ],
+        "supports_vision": true,
+        "supports_reasoning": true,
+        "reasoning_effort_levels": [
+          "low",
+          "high",
+          "max"
+        ],
+        "default_reasoning_effort": "max",
+        "can_disable_reasoning": false,
+        "supports_none_reasoning_effort": false,
+        "supports_low_reasoning_effort": true,
+        "supports_max_reasoning_effort": true,
+        "supports_minimal_reasoning_effort": false,
+        "supports_xhigh_reasoning_effort": false,
+        "supports_function_calling": true,
+        "supports_native_streaming": true,
+        "supports_prompt_caching": true
+      }
+    },
+    {
+      "id": "glm-5.3-flashx",
+      "name": "GLM-5.3-FlashX",
+      "family": "glm",
+      "status": "verified",
+      "sources": [
+        {
+          "label": "Z.AI GLM-5.3-Flash/FlashX: text/image/video/file input, text output, 1M context (exact integer not stated); always-on reasoning, streaming, function calling and context caching; file input is not represented as a separate modality by this catalog",
+          "url": "https://docs.z.ai/guides/vlm/glm-5.3-flash",
+          "verifiedAt": "2026-10-24T00:00:00Z"
+        },
+        {
+          "label": "Z.AI Chat Completion OpenAPI: Vision request explicitly includes glm-5.3-flash and glm-5.3-flashx; max_tokens maximum 131072; reasoning_effort enum low/high/max with default max",
+          "url": "https://docs.z.ai/api-reference/llm/chat-completion",
+          "verifiedAt": "2026-10-24T00:00:00Z"
+        },
+        {
+          "label": "Z.AI pricing: USD per 1M tokens, input $0.37 / cached input $0.075 / output $1.25; storage is only temporarily free and is not recorded as a permanent zero price",
+          "url": "https://docs.z.ai/guides/overview/pricing",
+          "verifiedAt": "2026-10-24T00:00:00Z"
+        }
+      ],
+      "metadata": {
+        "max_output_tokens": 131072,
+        "max_tokens": 131072,
+        "input_cost_per_token": 3.7e-7,
+        "cache_read_input_token_cost": 7.5e-8,
+        "output_cost_per_token": 0.00000125,
+        "supported_modalities": [
+          "text",
+          "image",
+          "video"
+        ],
+        "supported_output_modalities": [
+          "text"
+        ],
+        "supports_vision": true,
+        "supports_reasoning": true,
+        "reasoning_effort_levels": [
+          "low",
+          "high",
+          "max"
+        ],
+        "default_reasoning_effort": "max",
+        "can_disable_reasoning": false,
+        "supports_none_reasoning_effort": false,
+        "supports_low_reasoning_effort": true,
+        "supports_max_reasoning_effort": true,
+        "supports_minimal_reasoning_effort": false,
+        "supports_xhigh_reasoning_effort": false,
+        "supports_function_calling": true,
+        "supports_native_streaming": true,
+        "supports_prompt_caching": true
+      }
+    },
+    {
+      "id": "glm-5.3",
+      "name": "GLM-5.3",
+      "family": "glm",
+      "status": "verified",
+      "sources": [
+        {
+          "label": "Zhipu GLM-5.3: text-only, 1M context (exact integer not stated); always-on reasoning with low/high/max, default max; streaming, function calling and context caching",
+          "url": "https://docs.bigmodel.cn/cn/guide/models/text/glm-5.3",
+          "verifiedAt": "2026-10-24T00:00:00Z"
+        },
+        {
+          "label": "Z.AI Chat Completion OpenAPI: GLM-5.3 max_tokens maximum is 131072",
+          "url": "https://docs.z.ai/api-reference/llm/chat-completion",
+          "verifiedAt": "2026-10-24T00:00:00Z"
+        },
+        {
+          "label": "Z.AI pricing: USD per 1M tokens, input $1.4 / cached input $0.26 / output $4.4; storage is only temporarily free and is not recorded as a permanent zero price",
+          "url": "https://docs.z.ai/guides/overview/pricing",
+          "verifiedAt": "2026-10-24T00:00:00Z"
+        }
+      ],
+      "metadata": {
+        "max_output_tokens": 131072,
+        "max_tokens": 131072,
+        "input_cost_per_token": 0.0000014,
+        "cache_read_input_token_cost": 2.6e-7,
+        "output_cost_per_token": 0.0000044,
+        "supported_modalities": [
+          "text"
+        ],
+        "supports_reasoning": true,
+        "reasoning_effort_levels": [
+          "low",
+          "high",
+          "max"
+        ],
+        "default_reasoning_effort": "max",
+        "can_disable_reasoning": false,
+        "supports_none_reasoning_effort": false,
+        "supports_low_reasoning_effort": true,
+        "supports_max_reasoning_effort": true,
+        "supports_minimal_reasoning_effort": false,
+        "supports_xhigh_reasoning_effort": false,
+        "supports_function_calling": true,
+        "supports_native_streaming": true,
+        "supports_prompt_caching": true
+      }
     },
     {
       "id": "gpt-3.5-turbo-0125",
@@ -8202,6 +8406,84 @@
       }
     },
     {
+      "id": "gpt-6.1-terra",
+      "name": "GPT-6.1 Terra",
+      "family": "gpt",
+      "status": "verified",
+      "notes": "Tool calling requires the Responses API; Chat Completions support does not imply tool support on that endpoint. Cache-write price uses 30-minute retention; 12-hour retention costs $2.50/MTok. Above 272K input tokens, the full request uses 2x input/cache rates and 1.5x output rates. Batch/Flex are 50% below Standard; Fast mode is 2x Standard; regional processing adds 10% where available.",
+      "sources": [
+        {
+          "label": "OpenAI GPT-6.1 Terra model reference: exact ID, token limits, effort levels/default, modalities, endpoints, tools and USD pricing including retention and long-context adjustments",
+          "url": "https://developers.openai.com/api/docs/models/gpt-6.1-terra",
+          "verifiedAt": "2026-10-27T00:37:54Z"
+        },
+        {
+          "label": "OpenAI GPT-6.1 Terra announcement: API ID and Standard USD/MTok input 1 / cached input 0.05 / output 5",
+          "url": "https://openai.com/index/introducing-gpt-6-1-terra/",
+          "verifiedAt": "2026-10-27T00:37:54Z"
+        }
+      ],
+      "metadata": {
+        "input_cost_per_token": 0.000001,
+        "cache_read_input_token_cost": 5e-8,
+        "cache_creation_input_token_cost": 0.00000125,
+        "output_cost_per_token": 0.000005,
+        "input_cost_per_token_batches": 5e-7,
+        "cache_read_input_token_cost_batches": 2.5e-8,
+        "cache_creation_input_token_cost_batches": 6.25e-7,
+        "output_cost_per_token_batches": 0.0000025,
+        "input_cost_per_token_flex": 5e-7,
+        "cache_read_input_token_cost_flex": 2.5e-8,
+        "cache_creation_input_token_cost_flex": 6.25e-7,
+        "output_cost_per_token_flex": 0.0000025,
+        "long_context_input_token_threshold": 272000,
+        "long_context_input_cost_multiplier": 2,
+        "long_context_output_cost_multiplier": 1.5,
+        "litellm_provider": "openai",
+        "context_window": 1050000,
+        "max_input_tokens": 922000,
+        "max_output_tokens": 128000,
+        "max_tokens": 128000,
+        "mode": "chat",
+        "supported_endpoints": [
+          "/v1/chat/completions",
+          "/v1/responses",
+          "/v1/batch"
+        ],
+        "supported_modalities": [
+          "text",
+          "image"
+        ],
+        "supported_output_modalities": [
+          "text"
+        ],
+        "supports_reasoning": true,
+        "reasoning_effort_levels": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "default_reasoning_effort": "medium",
+        "can_disable_reasoning": true,
+        "supports_none_reasoning_effort": true,
+        "supports_low_reasoning_effort": true,
+        "supports_minimal_reasoning_effort": false,
+        "supports_xhigh_reasoning_effort": true,
+        "supports_max_reasoning_effort": true,
+        "supports_vision": true,
+        "supports_audio_input": false,
+        "supports_video_input": false,
+        "supports_native_streaming": true,
+        "supports_response_schema": true,
+        "supports_function_calling": true,
+        "supports_computer_use": true,
+        "supports_web_search": true,
+        "supports_prompt_caching": true
+      }
+    },
+    {
       "id": "gpt-audio-1.5",
       "name": "gpt-audio-1.5",
       "status": "verified",
@@ -9087,6 +9369,32 @@
       }
     },
     {
+      "id": "grok-4.7-fast",
+      "name": "Grok 4.7 Fast",
+      "family": "grok",
+      "status": "verified",
+      "notes": "Rates and context limit verified against sub2api's pricing table, not a direct xAI API probe. Kept separate from Grok 4.7 because its rates differ. Output limit and reasoning controls are unconfirmed and omitted.",
+      "sources": [
+        {
+          "label": "sub2api pricing table: grok-4.7-fast @ 5c185c5c5d4f5e409e2139806e0964ae944e03e8",
+          "url": "https://github.com/Wei-Shaw/sub2api/blob/5c185c5c5d4f5e409e2139806e0964ae944e03e8/backend/resources/model-pricing/model_prices_and_context_window.json",
+          "verifiedAt": "2026-10-24T00:00:00Z"
+        }
+      ],
+      "metadata": {
+        "cache_read_input_token_cost": 0.000001,
+        "cache_read_input_token_cost_above_200k_tokens": 0.0000015,
+        "input_cost_per_token": 0.000004,
+        "input_cost_per_token_above_200k_tokens": 0.000006,
+        "litellm_provider": "xai",
+        "max_input_tokens": 500000,
+        "mode": "chat",
+        "output_cost_per_token": 0.000012,
+        "output_cost_per_token_above_200k_tokens": 0.000018,
+        "supports_prompt_caching": true
+      }
+    },
+    {
       "id": "grok-4.7",
       "name": "Grok 4.7",
       "family": "grok",
@@ -9141,6 +9449,140 @@
       "family": "kimi",
       "status": "unverified",
       "metadata": {}
+    },
+    {
+      "id": "kimi-k3.1-pro-highspeed",
+      "name": "Kimi K3.1 Pro Highspeed",
+      "family": "kimi",
+      "status": "verified",
+      "notes": "High-speed K3.1 Pro with the same capabilities. Always thinks; low/high/max effort defaults to max. Sampling parameters are fixed. Open Platform completion limit is 1048576 tokens (default 131072). Open Platform USD pricing is verified from the official pricing page's embedded DocTable data (the rendered text extraction omits its rows). Kimi Coding context is membership-dependent; its unconfirmed output limit and subscription billing must not inherit Open Platform limits or per-token rates.",
+      "matches": {
+        "aliases": [
+          "k3.1-pro-highspeed"
+        ]
+      },
+      "sources": [
+        {
+          "label": "Kimi K3.1 Pro quickstart: kimi-k3.1-pro-highspeed is the high-speed variant with the K3.1 Pro API contract",
+          "url": "https://platform.kimi.ai/docs/guide/kimi-k3-1-pro-quickstart",
+          "verifiedAt": "2026-10-24T00:00:00Z"
+        },
+        {
+          "label": "Kimi official pricing embedded DocTable: USD per MTok input 4 / output 20 / cached input 0.20 / 5m writes 4 / 1h writes 8; K3 context 1048576",
+          "url": "https://platform.kimi.ai/docs/pricing/chat",
+          "verifiedAt": "2026-10-24T00:00:00Z"
+        }
+      ],
+      "metadata": {
+        "input_cost_per_token": 0.000004,
+        "output_cost_per_token": 0.00002,
+        "cache_read_input_token_cost": 2e-7,
+        "cache_creation_input_token_cost": 0.000004,
+        "cache_creation_input_token_cost_above_1hr": 0.000008,
+        "max_input_tokens": 1048576,
+        "max_output_tokens": 1048576,
+        "max_tokens": 1048576,
+        "mode": "chat",
+        "supported_endpoints": [
+          "/v1/chat/completions"
+        ],
+        "supported_modalities": [
+          "text",
+          "image",
+          "video"
+        ],
+        "supported_output_modalities": [
+          "text"
+        ],
+        "supports_vision": true,
+        "supports_video_input": true,
+        "supports_function_calling": true,
+        "supports_tool_choice": true,
+        "supports_response_schema": true,
+        "supports_native_streaming": true,
+        "supports_prompt_caching": true,
+        "supports_reasoning": true,
+        "reasoning_effort_levels": [
+          "low",
+          "high",
+          "max"
+        ],
+        "default_reasoning_effort": "max",
+        "can_disable_reasoning": false,
+        "supports_none_reasoning_effort": false,
+        "supports_low_reasoning_effort": true,
+        "supports_max_reasoning_effort": true,
+        "supports_minimal_reasoning_effort": false,
+        "supports_xhigh_reasoning_effort": false,
+        "supports_sampling_params": false
+      }
+    },
+    {
+      "id": "kimi-k3.1-pro",
+      "name": "Kimi K3.1 Pro",
+      "family": "kimi",
+      "status": "verified",
+      "notes": "Always thinks; low/high/max effort defaults to max. Sampling parameters are fixed. The Open Platform maximum completion is 1048576 tokens (default 131072). Open Platform USD pricing is verified from the official pricing page's embedded DocTable data (the rendered text extraction omits its rows). Kimi Coding uses k3.1-pro and membership-dependent context; its unconfirmed output limit and subscription billing must not inherit Open Platform limits or per-token rates.",
+      "matches": {
+        "aliases": [
+          "k3.1-pro"
+        ]
+      },
+      "sources": [
+        {
+          "label": "Kimi K3.1 Pro quickstart: API ID, reasoning, completion limits, vision, tools and structured output",
+          "url": "https://platform.kimi.ai/docs/guide/kimi-k3-1-pro-quickstart",
+          "verifiedAt": "2026-10-24T00:00:00Z"
+        },
+        {
+          "label": "Kimi official pricing embedded DocTable: USD per MTok input 2 / output 10 / cached input 0.20 / 5m writes 2 / 1h writes 4; K3 context 1048576",
+          "url": "https://platform.kimi.ai/docs/pricing/chat",
+          "verifiedAt": "2026-10-24T00:00:00Z"
+        }
+      ],
+      "metadata": {
+        "input_cost_per_token": 0.000002,
+        "output_cost_per_token": 0.00001,
+        "cache_read_input_token_cost": 2e-7,
+        "cache_creation_input_token_cost": 0.000002,
+        "cache_creation_input_token_cost_above_1hr": 0.000004,
+        "max_input_tokens": 1048576,
+        "max_output_tokens": 1048576,
+        "max_tokens": 1048576,
+        "mode": "chat",
+        "supported_endpoints": [
+          "/v1/chat/completions"
+        ],
+        "supported_modalities": [
+          "text",
+          "image",
+          "video"
+        ],
+        "supported_output_modalities": [
+          "text"
+        ],
+        "supports_vision": true,
+        "supports_video_input": true,
+        "supports_function_calling": true,
+        "supports_tool_choice": true,
+        "supports_response_schema": true,
+        "supports_native_streaming": true,
+        "supports_prompt_caching": true,
+        "supports_reasoning": true,
+        "reasoning_effort_levels": [
+          "low",
+          "high",
+          "max"
+        ],
+        "default_reasoning_effort": "max",
+        "can_disable_reasoning": false,
+        "supports_none_reasoning_effort": false,
+        "supports_low_reasoning_effort": true,
+        "supports_max_reasoning_effort": true,
+        "supports_minimal_reasoning_effort": false,
+        "supports_xhigh_reasoning_effort": false,
+        "supports_sampling_params": false
+      }
     },
     {
       "id": "kimi-k3",
@@ -10851,6 +11293,86 @@
       "metadata": {},
       "status": "unverified",
       "modelId": "kimi-k2.7-code"
+    },
+    {
+      "id": "kimi-k3.1-pro-highspeed@kimi-coding",
+      "name": "Kimi Coding K3.1 Pro Highspeed",
+      "providerKey": "kimi-coding",
+      "upstreamModelIds": [
+        "k3.1-pro-highspeed"
+      ],
+      "status": "verified",
+      "sources": [
+        {
+          "label": "Kimi Code model table: k3.1-pro-highspeed, same K3.1 Pro capabilities with faster output and higher quota consumption",
+          "url": "https://www.kimi.com/code/docs/en/kimi-code/models.html",
+          "verifiedAt": "2026-10-24T00:00:00Z"
+        }
+      ],
+      "metadata": {
+        "input_cost_per_token": null,
+        "output_cost_per_token": null,
+        "cache_read_input_token_cost": null,
+        "cache_creation_input_token_cost": null,
+        "cache_creation_input_token_cost_above_1hr": null,
+        "max_input_tokens": 1048576,
+        "max_output_tokens": null,
+        "max_tokens": null,
+        "supported_endpoints": [
+          "/v1/responses",
+          "/v1/chat/completions",
+          "/v1/messages"
+        ],
+        "reasoning_effort_levels": [
+          "low",
+          "high",
+          "max"
+        ],
+        "default_reasoning_effort": "max",
+        "can_disable_reasoning": false,
+        "supports_none_reasoning_effort": false
+      },
+      "modelId": "kimi-k3.1-pro-highspeed"
+    },
+    {
+      "id": "kimi-k3.1-pro@kimi-coding",
+      "name": "Kimi Coding K3.1 Pro",
+      "providerKey": "kimi-coding",
+      "upstreamModelIds": [
+        "k3.1-pro"
+      ],
+      "status": "verified",
+      "sources": [
+        {
+          "label": "Kimi Code model table: k3.1-pro, up to 1M tier-gated context, image/video input and always-on low/high/max effort (default max)",
+          "url": "https://www.kimi.com/code/docs/en/kimi-code/models.html",
+          "verifiedAt": "2026-10-24T00:00:00Z"
+        }
+      ],
+      "metadata": {
+        "input_cost_per_token": null,
+        "output_cost_per_token": null,
+        "cache_read_input_token_cost": null,
+        "cache_creation_input_token_cost": null,
+        "cache_creation_input_token_cost_above_1hr": null,
+        "max_input_tokens": 1048576,
+        "max_output_tokens": null,
+        "max_tokens": null,
+        "supported_endpoints": [
+          "/v1/responses",
+          "/v1/chat/completions",
+          "/v1/messages"
+        ],
+        "reasoning_effort_levels": [
+          "low",
+          "high",
+          "max"
+        ],
+        "default_reasoning_effort": "max",
+        "can_disable_reasoning": false,
+        "supports_none_reasoning_effort": false
+      },
+      "modelId": "kimi-k3.1-pro"
     },
     {
       "id": "kimi-k3@cursor",

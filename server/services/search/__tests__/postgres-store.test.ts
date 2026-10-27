@@ -310,6 +310,53 @@ function expectRankOrdered(rows: readonly { rank: number | null }[], label: stri
 	}
 }
 
+describe("PostgreSQL modeltrace exclusion SQL", () => {
+	for (const strategy of ["index", "substring"] as const) {
+		test(`${strategy} excludes traces in every search path before LIMIT`, async () => {
+			const statements: string[] = [];
+			let targetVisible = true;
+			const store = createPostgresSearchStore({
+				async unsafe(sql) {
+					statements.push(sql);
+					return sql.startsWith("SELECT n.id FROM narrators n") && targetVisible
+						? [{ id: "source" }]
+						: [];
+				},
+			});
+			const exclusion = `COALESCE(n.traits, '[]') NOT LIKE '%"modeltrace"%'`;
+			const q = {
+				text: "needle",
+				strategy,
+				limit: 2,
+				viewer: { userId: "u-owner", isAdmin: true },
+			};
+			await store.searchNarrators(q);
+			await store.searchMessages(q);
+			await store.searchSessionAggregates(q);
+			await store.searchSessionHits({ ...q, narratorIds: ["source"], perSession: 2 });
+			for (const narratorId of [null, "source"]) {
+				await store.searchRecallMessages({ ...q, narratorId, previewChars: 200 });
+			}
+			for (const sql of statements) {
+				expect(sql).toContain(exclusion);
+				if (sql.includes("LIMIT"))
+					expect(sql.indexOf(exclusion)).toBeLessThan(sql.lastIndexOf("LIMIT"));
+			}
+			statements.length = 0;
+			targetVisible = false;
+			expect(
+				await store.searchTimeline({
+					...q,
+					narratorId: "trace",
+					inheritedScopes: [{ narratorId: "source", upperBoundSeq: 3 }],
+				}),
+			).toEqual([]);
+			expect(statements).toHaveLength(1);
+			expect(statements[0]).toContain(exclusion);
+		});
+	}
+});
+
 describe("PostgreSQL standalone search SQL", () => {
 	for (const strategy of ["index", "substring"] as const) {
 		test(`${strategy} binds owner and target scope and preserves standalone identity`, async () => {

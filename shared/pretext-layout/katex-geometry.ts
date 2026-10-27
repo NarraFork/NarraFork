@@ -212,6 +212,7 @@ const SIZE_MULTIPLIERS = [0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.2, 1.44, 1.728, 2.074,
 const ZERO_WIDTH_CLASSES = new Set([
 	// `.strut` / `.pstrut` only reserve vertical space.
 	"strut",
+	"katex-strut",
 	"pstrut",
 	// `.llap`/`.rlap`/`.clap` are `width: 0` with absolutely-positioned content.
 	"llap",
@@ -276,7 +277,15 @@ function parseEm(value: string | undefined): number | null {
  * (katex.css emits `font-size: <ratio>em` for every N/M pair).
  */
 export function sizingScale(classes: readonly string[]): number {
-	if (!classes.includes("sizing") && !classes.includes("fontsize-ensurer")) return 1;
+	// KaTeX 0.18 namespaces layout classes; keep the legacy spelling for injected
+	// runtimes and previously prepared trees.
+	if (
+		!classes.includes("katex-sizing") &&
+		!classes.includes("sizing") &&
+		!classes.includes("fontsize-ensurer")
+	) {
+		return 1;
+	}
 	let from: number | null = null;
 	let to: number | null = null;
 	for (const cls of classes) {

@@ -72,10 +72,10 @@ describe("strict sample parsing", () => {
 	]) {
 		test(`rejects ${name} without inventing results`, () => {
 			expect(() => parseModelTraceOutput(text)).toThrow(ModelTraceOutputError);
-			const report = analyzeModelTrace(text, "gpt-5.4");
-			expect(report).toContain("无法评分");
-			expect(report).not.toContain("TOP5");
-			expect(report).not.toContain("%");
+			const report = analyzeModelTrace(text);
+			expect(report.type).toBe("modeltrace_result");
+			expect(report.results).toEqual([]);
+			expect(report.error).toBeTruthy();
 		});
 	}
 
@@ -104,60 +104,30 @@ describe("prompt and local report", () => {
 		expect(prompt).not.toMatch(/\[\s*\d/);
 	});
 
-	test("reports count, TOP5, families, configured rank and limitations", () => {
-		const report = analyzeModelTrace(sample, "gpt-5.4");
-		for (const token of [
-			"数字数：300",
-			"TOP5",
-			"家族概率",
-			"GPT",
-			"Claude",
-			"候选库排名",
-			"闭集",
-			"上下文偏差",
-			"单样本",
-		]) {
-			expect(report).toContain(token);
-		}
-		expect(report.match(/^\d\. /gm)?.length).toBe(5);
+	test("returns only five ranked model probabilities for a compact result card", () => {
+		const report = analyzeModelTrace(sample);
+		const expected = scoreModelTrace(numbers)
+			.results.slice(0, 5)
+			.map(({ model, displayName, probability }) => ({ model, displayName, probability }));
+		expect(report).toEqual({ type: "modeltrace_result", results: expected });
+		expect(report.results).toHaveLength(5);
+		expect(report).not.toHaveProperty("families");
+		expect(report).not.toHaveProperty("configuredModel");
+		expect(report).not.toHaveProperty("sampleCount");
 	});
 
-	test("unknown and alias IDs are not guessed; user model names are escaped and bounded", () => {
-		const report = analyzeModelTrace(sample, "provider/gpt-5.4\n<script>|".repeat(1_000));
-		expect(report).toContain("未收录");
-		expect(report).not.toContain("<script>");
-		expect(report.length).toBeLessThan(3_000);
+	test("failure has a short localized reason and no invented probabilities", () => {
+		const en = analyzeModelTrace("refused", "en-US");
+		expect(en.type).toBe("modeltrace_result");
+		expect(en.error).toContain("not complete JSON");
+		expect(en.results).toEqual([]);
+		const zh = analyzeModelTrace("refused", "zh-CN");
+		expect(zh.error).toContain("不是完整JSON");
+		expect(zh.error?.length).toBeLessThan(100);
+		expect(zh.results).toEqual([]);
 	});
 
-	test("case-insensitive exact candidate matching", () => {
-		expect(analyzeModelTrace(sample, " GPT-5.4 ")).toContain("候选库排名");
-	});
-
-	test("supports English report and rejection messages", () => {
-		const report = analyzeModelTrace(sample, "unknown", "en-US");
-		expect(report).toContain("Numbers: 300");
-		expect(report).toContain("not included");
-		expect(report).toContain("closed-set");
-		expect(report).toContain("context bias");
-		expect(analyzeModelTrace("refused", "unknown", "en")).toContain("no result");
-	});
-
-	test("single-round reports do not promise to disable provider transport retries", () => {
-		for (const text of [sample, "refused"]) {
-			const en = analyzeModelTrace(text, "unknown", "en");
-			expect(en).toContain("Only one sampling round was scheduled");
-			expect(en).toContain("existing transport retry policy");
-			expect(en).not.toContain("No retry");
-			const zh = analyzeModelTrace(text, "unknown", "zh-CN");
-			expect(zh).toContain("仅安排一轮采样");
-			expect(zh).toContain("现有重试策略");
-			expect(zh).not.toContain("未重试");
-		}
-	});
-
-	test("short accepted sample is labeled cautiously", () => {
-		expect(analyzeModelTrace(JSON.stringify(numbers.slice(0, 165)), "unknown")).toContain(
-			"样本少于请求数量",
-		);
+	test("an accepted short sample still yields five candidates without verbose metadata", () => {
+		expect(analyzeModelTrace(JSON.stringify(numbers.slice(0, 165))).results).toHaveLength(5);
 	});
 });

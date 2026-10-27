@@ -1,4 +1,5 @@
-import { bank, scoreModelTrace } from "./scoring";
+import type { ModelTraceResultBlock } from "@shared/modeltrace-result";
+import { scoreModelTrace } from "./scoring";
 
 export const MODELTRACE_EXPECTED_COUNT = 300;
 export const MODELTRACE_MAX_TEXT_LENGTH = 10_000;
@@ -45,16 +46,6 @@ export function buildModelTracePrompt(): string {
 	return `现在仅执行一次数字指纹采样，不要继续之前的任务。直接选择 ${MODELTRACE_EXPECTED_COUNT} 个 1 到 355（含边界）的整数。允许重复；不要排序、平衡频数、修复重复，也不要刻意构造等差规律。必须由当前模型直接逐个生成，不得使用旧样本或委托其他模型、子代理。只输出一个完整 JSON 整数数组，不要解释或 Markdown 代码块。不要调用工具、读文件或运行代码；输出数组后立即结束。`;
 }
 
-function safeLabel(value: string): string {
-	return value
-		.slice(0, 200)
-		.replace(/[\r\n\t]/g, " ")
-		.replace(/&/g, "&amp;")
-		.replace(/</g, "&lt;")
-		.replace(/>/g, "&gt;")
-		.replace(/[\\`*_{}[\]()#+.!|~-]/g, "\\$&");
-}
-
 const errors: Record<ParseError, [string, string]> = {
 	too_long: ["回答超过10000字符上限。", "The answer exceeds the 10,000-character limit."],
 	empty: ["回答为空或没有文本。", "The answer is empty or contains no text."],
@@ -78,62 +69,27 @@ const errors: Record<ParseError, [string, string]> = {
 	],
 };
 
-/** Local, bounded, single-sample analysis. No network, retries or follow-up prompts. */
-export function analyzeModelTrace(text: string, configuredModel: string, locale = "zh-CN"): string {
-	const en = !locale.toLowerCase().startsWith("zh");
+/** Local single-sample analysis, containing only the five ranked candidates. */
+export function analyzeModelTrace(text: string, locale = "zh-CN"): ModelTraceResultBlock {
 	let numbers: number[];
 	try {
 		numbers = parseModelTraceOutput(text);
 	} catch (error) {
 		if (!(error instanceof ModelTraceOutputError)) throw error;
-		return en
-			? `## ModelTrace: no result\n\n${errors[error.reason][1]}\n\nNo model probabilities were calculated. Only one sampling round was scheduled; the provider's existing transport retry policy still applies.`
-			: `## ModelTrace：无法评分\n\n${errors[error.reason][0]}\n\n未计算模型概率。仅安排一轮采样；底层请求沿用提供商现有重试策略。`;
+		return {
+			type: "modeltrace_result",
+			results: [],
+			error: errors[error.reason][locale.toLowerCase().startsWith("zh") ? 0 : 1],
+		};
 	}
-	const { results, families } = scoreModelTrace(numbers);
-	// Exact, case-insensitive candidate ID matching only: aliases must not imply identity.
-	const configured = configuredModel.trim().toLowerCase();
-	const rank = results.findIndex((item) => item.model.toLowerCase() === configured);
-	const percent = (probability: number) => `${(probability * 100).toFixed(2)}%`;
-	const label = safeLabel(configuredModel) || (en ? "(unspecified)" : "（未指定）");
-	const configuration =
-		rank < 0
-			? en
-				? `Configured model: ${label} — not included in this candidate bank (exact ID matching; aliases are not inferred).`
-				: `当前配置模型：${label} — 候选库未收录（精确ID匹配，不推断别名）。`
-			: en
-				? `Configured model: ${label} — rank ${rank + 1}/${results.length}, probability ${percent(results[rank].probability)}.`
-				: `当前配置模型：${label} — 候选库排名 ${rank + 1}/${results.length}，概率 ${percent(results[rank].probability)}。`;
-	const lines = [
-		en ? "## ModelTrace local statistical report" : "## ModelTrace 本地统计报告",
-		"",
-		en
-			? `Numbers: ${numbers.length} (target: 300); samples: 1; calibration: single-sample (1); candidates: ${bank.models.length}.`
-			: `数字数：${numbers.length}（目标300）；样本数：1；校准：单样本（1）；候选模型：${bank.models.length}。`,
-		"",
-		configuration,
-		"",
-		en ? "### TOP 5 model probabilities" : "### TOP5 模型概率",
-		"",
-		...results
-			.slice(0, 5)
-			.map((item, index) => `${index + 1}. ${item.displayName} — ${percent(item.probability)}`),
-		"",
-		en ? "### Family probabilities" : "### 家族概率",
-		"",
-		...families.map((item) => `- ${item.displayName} — ${percent(item.probability)}`),
-		"",
-		en
-			? "> These are closed-set relative probabilities within the bundled candidate bank, not proof of model identity or a provider audit. Unlisted models may resemble a listed candidate. The probe inherits the current conversation: instructions, history, sampling settings and context bias can alter the result. A single sample cannot establish model substitution. Only one sampling round was scheduled; the provider's existing transport retry policy still applies."
-			: "> 这些是内置候选库内的闭集相对概率，不是模型身份的证明，也不是服务商审计。未收录模型也可能与某个候选相似。采样继承当前会话，指令、历史、采样参数及上下文偏差都可能影响结果；单次样本不足以认定模型替换。仅安排一轮采样；底层请求沿用提供商现有重试策略。",
-	];
-	if (numbers.length < MODELTRACE_EXPECTED_COUNT) {
-		lines.push(
-			"",
-			en
-				? "Sample is shorter than requested; interpret with extra caution."
-				: "样本少于请求数量，请更加谨慎解读。",
-		);
-	}
-	return lines.join("\n");
+	return {
+		type: "modeltrace_result",
+		results: scoreModelTrace(numbers)
+			.results.slice(0, 5)
+			.map(({ model, displayName, probability }) => ({
+				model,
+				displayName,
+				probability,
+			})),
+	};
 }

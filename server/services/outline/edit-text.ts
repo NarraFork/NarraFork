@@ -4,8 +4,8 @@
  * when the input is large (`edit-text-runner.ts`): normalizing a block costs tens of
  * milliseconds per 16 KiB, and agent input is untrusted.
  *
- * TWO JOBS
- * --------
+ * THREE JOBS
+ * ----------
  *   - `parse`: a markdown outline (an `add`) or the text of one block (a `replace`) becomes
  *     items with canonical content. Read annotations (`‹…›` lines) are dropped first, and the
  *     labels a read puts after each bullet (`[Ab3dEf9Q]`) are taken off again, but only labels
@@ -15,15 +15,20 @@
  *   - `rewrite`: once the caller has resolved the references, contents get them in stored form:
  *     `[[Q17]]` becomes `[[key/sid]]`, and a display text that only repeats the target's title
  *     (as a read renders it) is dropped, so stored links never carry a title that goes stale.
+ *   - `normalize`: contents become canonical the way `writeOutline` would make them, with their
+ *     links and anything split off: a page's live session commits what people typed this way
+ *     (typed text is untrusted too).
  *
  * Every content returned is canonical (`normalizeBlock(content).content === content`), with the
  * links `contentLinks` would read from it: what `writeOutline` takes as `canonical` content.
  */
 import {
+	type BlockNode,
 	type Body,
 	type BodyRef,
 	bodyRefs,
 	type Inline,
+	normalizeBlock,
 	type OutlineItem,
 	type OutlineNote,
 	type OutlineProps,
@@ -31,6 +36,7 @@ import {
 	parseBlock,
 	parseMarkdownOutline,
 	serializeBody,
+	type TaskStatus,
 	titleOfBody,
 } from "@shared/outline";
 import { bodyLinks, type ExtractedLink } from "./links";
@@ -90,7 +96,29 @@ export interface EditTextRewritten {
 	title: string;
 }
 
+/** A block split off content that did not fit one block (canonical content, see below). */
+export interface EditTextSplit {
+	content: string;
+	links: ExtractedLink[];
+	task: TaskStatus | null;
+	children: EditTextSplit[];
+}
+
+/** One content normalized for writing (a live session's text before it is committed). */
+export interface EditTextNormalized {
+	/** Canonical dialect markdown. */
+	content: string;
+	links: ExtractedLink[];
+	/** Out-of-dialect structure split off as child blocks, in order. */
+	split: EditTextSplit[];
+}
+
 export type EditTextJob =
+	| {
+			/** Contents to normalize as `writeOutline` would (`normalizeBlock`). */
+			kind: "normalize";
+			contents: string[];
+	  }
 	| {
 			kind: "parse";
 			inputs: EditTextInput[];
@@ -106,7 +134,9 @@ export type EditTextJob =
 
 export type EditTextResult<J extends EditTextJob> = J extends { kind: "parse" }
 	? EditTextParsed[]
-	: EditTextRewritten[];
+	: J extends { kind: "normalize" }
+		? EditTextNormalized[]
+		: EditTextRewritten[];
 
 /** UTF-8 bytes of the text a job carries. */
 export function editTextJobBytes(job: EditTextJob): number {
@@ -121,11 +151,34 @@ function utf8(text: string): number {
 }
 
 export function runEditTextJob<J extends EditTextJob>(job: J): EditTextResult<J> {
+	if (job.kind === "normalize") {
+		return job.contents.map((content) => normalizeContent(content)) as EditTextResult<J>;
+	}
 	if (job.kind === "parse") {
 		const labels = new Set(job.labels);
 		return job.inputs.map((input) => parseEditText(input, labels)) as EditTextResult<J>;
 	}
 	return job.contents.map((content) => rewriteContent(content, job.targets)) as EditTextResult<J>;
+}
+
+function splitNode(node: BlockNode): EditTextSplit {
+	const content = serializeBody(node.body);
+	return {
+		content,
+		links: bodyLinks(parseBlock(content).body),
+		task: node.task,
+		children: node.children.map(splitNode),
+	};
+}
+
+/** `normalizeBlock` with the links of the result, as `writeOutline` takes canonical content. */
+function normalizeContent(src: string): EditTextNormalized {
+	const normalized = normalizeBlock(src);
+	return {
+		content: normalized.content,
+		links: bodyLinks(parseBlock(normalized.content).body),
+		split: normalized.children.map(splitNode),
+	};
 }
 
 /**

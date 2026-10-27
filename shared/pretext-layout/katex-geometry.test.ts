@@ -53,6 +53,12 @@ describe("sizingScale", () => {
 		expect(sizingScale(["sizing", "reset-size3", "size6"])).toBeCloseTo(1 / 0.7, 10);
 	});
 
+	it("recognizes the namespaced KaTeX 0.18 sizing class", () => {
+		expect(sizingScale(["katex-sizing", "reset-size6", "size3"])).toBeCloseTo(0.7, 10);
+		expect(sizingScale(["katex-sizing", "reset-size3", "size6"])).toBeCloseTo(1 / 0.7, 10);
+		expect(sizingScale(["fontsize-ensurer", "reset-size6", "size3"])).toBeCloseTo(0.7, 10);
+	});
+
 	it("ignores an incomplete pair", () => {
 		expect(sizingScale(["sizing", "size3"])).toBe(1);
 		expect(sizingScale(["sizing", "reset-size6"])).toBe(1);
@@ -253,6 +259,20 @@ describe("measureKatex — CJK via the injected resolver", () => {
 	});
 });
 
+describe("KaTeX runtime security", () => {
+	it("does not trust inherited options when rendering a JavaScript link", () => {
+		const options = Object.assign(Object.create({ trust: true }), {
+			throwOnError: false,
+			output: "html" as const,
+		});
+		const html = katexModule.renderToString("\\href{javascript:alert(1)}{x}", options);
+		expect(html).toContain("katex");
+		expect(html).toContain("\\href");
+		expect(html).not.toMatch(/<a\b/i);
+		expect(html).not.toMatch(/href\s*=/i);
+	});
+});
+
 describe("measureKatex — degradation", () => {
 	it("flags unparseable input but still returns geometry", () => {
 		const geo = measure("\\frac{");
@@ -282,8 +302,9 @@ describe("measureKatex — degradation", () => {
 	});
 
 	it("matches Chrome-measured widths for representative formulas", () => {
-		// Ground truth captured by rendering each formula in real headless Chrome
-		// (KaTeX 0.16.45, 14px base, fonts loaded) and reading the `.base` boxes.
+		// Ground truth captured with KaTeX 0.16.45, revalidated with KaTeX 0.18.2
+		// in Chrome 146 (14px base, fonts loaded), summing top-level `.katex-base`
+		// boxes. The namespace changed, but the original pixel baselines did not.
 		// These pin the four corrections the walker makes: combined glyphs, the
 		// sqrt radical min-width, script-size scaling, and stacked-vlist max-width.
 		const groundTruth: Array<[latex: string, chromeWidth: number]> = [

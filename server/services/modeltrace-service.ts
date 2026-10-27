@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { db } from "@server/db";
-import { narratorMessageRefs } from "@server/db/schema";
+import { narratorMessageRefs, narrators } from "@server/db/schema";
 import { getModelTraceRequest, type ModelTraceRequest } from "@server/lib/agent/modeltrace-request";
 import type { ChatParams, ParsedStreamEvent } from "@server/lib/agent/provider";
 import { ValidationError } from "@server/lib/errors";
@@ -10,7 +10,9 @@ import {
 	buildModelTracePrompt,
 	MODELTRACE_MAX_TEXT_LENGTH,
 } from "@server/lib/modeltrace";
+import { addTrait, parseTraits } from "@server/lib/narrator-utils";
 import { normalizeLocale } from "@shared/i18n-locales";
+import type { ModelTraceResultBlock } from "@shared/modeltrace-result";
 import { desc, eq } from "drizzle-orm";
 import { type ExecutionOwner, tryClaimExecution } from "./agent-runtime/ownership";
 
@@ -55,23 +57,18 @@ function probeParams(
 	};
 }
 
-function failureReport(error: unknown, locale: string): string {
-	const detail = error instanceof Error ? error.message.slice(0, 1000) : "Probe failed";
-	return locale.toLowerCase().startsWith("zh")
-		? `## ModelTrace：无法评分\n\n${detail}\n\n未计算模型概率。仅安排一轮采样；底层请求沿用提供商现有重试策略。`
-		: `## ModelTrace: no result\n\n${detail}\n\nNo model probabilities were calculated. Only one sampling round was scheduled; the provider's existing transport retry policy still applies.`;
+function failureReport(error: unknown): ModelTraceResultBlock {
+	return {
+		type: "modeltrace_result",
+		results: [],
+		error: error instanceof Error ? error.message.slice(0, 300) : "ModelTrace failed",
+	};
 }
 
-async function report(parentId: string, id: string, text: string): Promise<void> {
+async function report(id: string, result: ModelTraceResultBlock): Promise<void> {
 	const { narratorPersistence } = await import("./narrator-persistence");
-	const writes = await Promise.allSettled([
-		narratorPersistence.persistDisplayMessage(id, text, [{ type: "text", text }]),
-		narratorPersistence.persistDisplayMessage(parentId, text, [{ type: "text", text }]),
-	]);
-	for (const result of writes) {
-		if (result.status === "rejected")
-			console.error("[modeltrace] Unable to persist report", result.reason);
-	}
+	const summary = result.error ?? `ModelTrace: ${result.results[0]?.displayName ?? ""}`;
+	await narratorPersistence.persistDisplayMessage(id, summary, [result]);
 }
 
 async function releaseProbe(id: string, owner: ExecutionOwner, locale: string): Promise<void> {
@@ -82,7 +79,6 @@ async function releaseProbe(id: string, owner: ExecutionOwner, locale: string): 
 }
 
 async function runProbe(
-	parentId: string,
 	id: string,
 	snapshot: NonNullable<ReturnType<typeof getModelTraceRequest>>,
 	params: ChatParams,
@@ -193,12 +189,10 @@ async function runProbe(
 				message: { ...saved, children: [] },
 			});
 		}
-		const result = failure
-			? failureReport(failure, locale)
-			: analyzeModelTrace(text, snapshot.params.model, locale);
-		await report(parentId, id, result);
+		const result = failure ? failureReport(failure) : analyzeModelTrace(text, locale);
+		await report(id, result);
 	} catch (error) {
-		await report(parentId, id, failureReport(error, locale));
+		await report(id, failureReport(error));
 	} finally {
 		try {
 			await narratorPersistence.updateStatus(id, "idle");
@@ -233,6 +227,13 @@ export async function startModelTrace(
 		userId,
 		locale,
 	});
+	await db
+		.update(narrators)
+		.set({
+			traits: addTrait(parseTraits(child.traits), "modeltrace"),
+			parentNarratorId: parentId,
+		})
+		.where(eq(narrators.id, child.id));
 	const owner = tryClaimExecution(child.id, "run");
 	if (!owner) throw new ValidationError("ModelTrace child already has an active execution");
 	const controller = new AbortController();
@@ -255,11 +256,9 @@ export async function startModelTrace(
 			narratorId: child.id,
 			message: { ...saved, children: [] },
 		});
-		void runProbe(parentId, child.id, snapshot, params, controller, owner, locale).catch(
-			(error) => {
-				console.error("[modeltrace] Finalization failed", error);
-			},
-		);
+		void runProbe(child.id, snapshot, params, controller, owner, locale).catch((error) => {
+			console.error("[modeltrace] Finalization failed", error);
+		});
 		return { id: child.id };
 	} catch (error) {
 		controller.abort();

@@ -11,7 +11,6 @@ import {
 } from "@mantine/core";
 import type { OutlineBlockViewResponse } from "@shared/outline-api";
 import { IconHistory, IconLink } from "@tabler/icons-react";
-import { Link } from "@tanstack/react-router";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useOutlineBacklinks, useOutlineBlockHistory } from "../../hooks/useOutline";
@@ -19,6 +18,7 @@ import { formatFullLocaleDateTime, formatSmartTime } from "../../lib/format";
 import type { OutlineBlockSearch } from "../../lib/outline-view";
 import classes from "./Outline.module.css";
 import { commitActorLabel } from "./OutlineTimeline";
+import { OutlineLink, outlineBlockTarget } from "./outline-nav";
 
 type SideTab = "backlinks" | "history";
 
@@ -70,11 +70,9 @@ export function OutlineSidePanel({
 				)}
 				<Stack gap={2}>
 					{backlinks.data?.links.map((link) => (
-						<Link
+						<OutlineLink
 							key={`${link.blockId}:${link.kind}`}
-							to="/outline/$spaceId/$blockId"
-							params={{ spaceId: link.spaceId, blockId: link.blockId }}
-							search={{ view: search.view }}
+							to={outlineBlockTarget(link.spaceId, link.blockId, search.view)}
 							className={classes.listItem}
 						>
 							<Group gap={6} wrap="nowrap">
@@ -88,7 +86,7 @@ export function OutlineSidePanel({
 							<Text size="xs" c="dimmed" className={classes.ellipsis}>
 								{link.address}
 							</Text>
-						</Link>
+						</OutlineLink>
 					))}
 				</Stack>
 				{backlinks.data?.truncated && (

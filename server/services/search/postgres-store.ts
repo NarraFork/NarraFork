@@ -665,6 +665,13 @@ export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 		},
 
 		async searchTimeline(query: TimelineSearchQuery): Promise<TimelineSearchRow[]> {
+			// Gate the requested timeline, not the owner of its fork-shared messages.
+			const targetParams = new Params();
+			const target = await run(
+				`SELECT n.id FROM narrators n WHERE n.id = ${targetParams.add(query.narratorId)} ${narratorScopeSql()}`,
+				targetParams,
+			);
+			if (target.length === 0) return [];
 			const params = new Params();
 			const scopeSql = timelineScopeSql(query, params);
 			let rows: Row[];
@@ -718,9 +725,9 @@ export function createPostgresSearchStore(client: PgExecutor): SearchStore {
 			const params = new Params();
 			const global = query.narratorId === null;
 			const source = global
-				? `JOIN narrators n ON n.id = m.narrator_id`
+				? `JOIN narrators n ON n.id = m.narrator_id ${narratorScopeSql()}`
 				: `JOIN narrator_message_refs r ON r.message_id = m.id
-			 JOIN narrators n ON n.id = r.narrator_id`;
+			 JOIN narrators n ON n.id = r.narrator_id ${narratorScopeSql()}`;
 			const narratorIdColumn = global ? "n.id AS narrator_id" : "r.narrator_id";
 			const scopeFilter = global ? "" : ` AND r.narrator_id = ${params.add(query.narratorId)}`;
 			let timeSuffix = "";

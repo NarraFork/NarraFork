@@ -17,6 +17,7 @@ export type VListElementKind =
 	| "system-text"
 	| "knowledge-hint"
 	| "plan-card"
+	| "modeltrace-result"
 	/**
 	 * A concluded code review: a header row over a maxHeight-capped scroll box holding a
 	 * markdown body. Shaped like a tool card because the content is the same species as a

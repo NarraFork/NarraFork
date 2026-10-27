@@ -101,6 +101,46 @@ describe("request-local narrator loading", () => {
 		expect(summary).toHaveBeenCalledTimes(1);
 	});
 
+	test("ModelTrace detail returns an authorized source for mobile Return, not a hidden or deleted parent", async () => {
+		const { returnFromModelTrace } = await import(
+			"../../../frontend/components/narrator/interaction/model-trace-return"
+		);
+		narrator("source");
+		narrator("trace", "viewer", null, "source");
+		sqlite
+			.prepare("UPDATE narrators SET traits = ? WHERE id = 'trace'")
+			.run(JSON.stringify(["modeltrace"]));
+		const app = new Hono();
+		app.use("*", async (c, next) => {
+			c.set("user", { sub: "viewer", role: "user", iat: 0, exp: Number.MAX_SAFE_INTEGER });
+			await next();
+		});
+		app.route("/api/narrators", narratorRoutes);
+		async function detailAndReturn() {
+			const response = await app.request("/api/narrators/trace");
+			expect(response.status).toBe(200);
+			const detail = await response.json();
+			const navigateToNarrator = mock(() => {});
+			const navigateToDefault = mock(() => {});
+			returnFromModelTrace({ narrator: detail, navigateToNarrator, navigateToDefault });
+			return { detail, navigateToNarrator, navigateToDefault };
+		}
+		const readable = await detailAndReturn();
+		expect(readable.detail.navigationSummary.parentNarratorId).toBe("source");
+		expect(readable.navigateToNarrator).toHaveBeenCalledWith("source");
+		expect(readable.navigateToDefault).not.toHaveBeenCalled();
+		sqlite.prepare("UPDATE narrators SET owner_user_id = 'other' WHERE id = 'source'").run();
+		const hidden = await detailAndReturn();
+		expect(hidden.detail.navigationSummary.parentNarratorId).toBeNull();
+		expect(hidden.navigateToNarrator).not.toHaveBeenCalled();
+		expect(hidden.navigateToDefault).toHaveBeenCalledTimes(1);
+		sqlite.prepare("UPDATE narrators SET parent_narrator_id = NULL WHERE id = 'trace'").run();
+		sqlite.prepare("DELETE FROM narrators WHERE id = 'source'").run();
+		const deleted = await detailAndReturn();
+		expect(deleted.detail.navigationSummary.parentNarratorId).toBeNull();
+		expect(deleted.navigateToDefault).toHaveBeenCalledTimes(1);
+	});
+
 	test("actual display page retains creator/avatar and encrypted reasoning presence after repeated projection", async () => {
 		narrator("n1");
 		message("creator", 1, [

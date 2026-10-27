@@ -1,4 +1,21 @@
-/* Read-only outline pages. Mobile first: nothing here may widen the page past the viewport. */
+/*
+ * Outline pages. Mobile first: nothing here may widen the surface past its container. Layout
+ * follows the surface's own width (a container query), not the viewport's, so a dock panel of
+ * 320 px lays out like a phone while the window is wide.
+ */
+
+.surface {
+	position: relative;
+	min-width: 0;
+	max-width: 100%;
+	container: outline-surface / inline-size;
+}
+
+/* A dock panel: fill it and scroll inside it, so a drawer can cover just the surface. */
+.surface[data-layout="panel"] {
+	height: 100%;
+	overflow: hidden;
+}
 
 .page {
 	display: flex;
@@ -6,8 +23,18 @@
 	gap: var(--mantine-spacing-sm);
 	min-width: 0;
 	max-width: 100%;
-	/* Fill the viewport so the timeline sits at its bottom even on a short page. */
+}
+
+/* The app's page: fill the viewport so the timeline sits at its bottom even on a short page. */
+.surface[data-layout="page"] > .page {
 	min-height: calc(100dvh - var(--app-shell-header-height, 60px) - 2 * var(--mantine-spacing-md));
+}
+
+.surface[data-layout="panel"] > .page {
+	height: 100%;
+	min-height: 0;
+	overflow-y: auto;
+	padding: var(--mantine-spacing-xs);
 }
 
 .toolbar {
@@ -43,7 +70,7 @@
 	min-width: 0;
 }
 
-@media (min-width: 62em) {
+@container outline-surface (min-width: 62em) {
 	.bodyWithSide {
 		grid-template-columns: minmax(0, 1fr) 20rem;
 	}
@@ -59,6 +86,11 @@
 	top: calc(var(--app-shell-header-height, 56px) + var(--mantine-spacing-md));
 	max-height: calc(100dvh - var(--app-shell-header-height, 56px) - 10rem);
 	overflow-y: auto;
+}
+
+.surface[data-layout="panel"] .side {
+	top: 0;
+	max-height: none;
 }
 
 .rootTitle {

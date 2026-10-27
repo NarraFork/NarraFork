@@ -12,13 +12,13 @@ import {
 	IconSquareHalf,
 	IconSquareX,
 } from "@tabler/icons-react";
-import { Link } from "@tanstack/react-router";
 import { memo, useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import type { OutlineBlockSearch } from "../../lib/outline-view";
 import { visibleRows } from "../../lib/outline-view";
 import classes from "./Outline.module.css";
 import { OutlineBlockBody } from "./OutlineBlockBody";
+import { OutlineLink, outlineBlockTarget } from "./outline-nav";
 
 /** Indentation stops growing past this depth so deep outlines stay inside a phone's width. */
 const MAX_INDENT_DEPTH = 8;
@@ -67,15 +67,13 @@ const OutlineRow = memo(function OutlineRow({
 	const { t } = useTranslation("outline");
 	const done = block.task?.status === "done" || block.task?.status === "cancelled";
 	const focusLink = (children: React.ReactNode, className: string, label?: string) => (
-		<Link
-			to="/outline/$spaceId/$blockId"
-			params={{ spaceId, blockId: block.id }}
-			search={search}
+		<OutlineLink
+			to={outlineBlockTarget(spaceId, block.id, search.view, search.asOf)}
 			className={className}
 			aria-label={label}
 		>
 			{children}
-		</Link>
+		</OutlineLink>
 	);
 	return (
 		<div className={classes.row} data-block-id={block.id}>

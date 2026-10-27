@@ -57,7 +57,7 @@
 		"i18next": "^25.10.10",
 		"i18next-browser-languagedetector": "^8.2.1",
 		"iconv-lite": "^0.7.2",
-		"katex": "^0.16.45",
+		"katex": "^0.18.2",
 		"lang-map": "^0.4.0",
 		"linkedom": "^0.18.12",
 		"marked": "^18.0.7",
@@ -67,6 +67,12 @@
 		"node-telegram-bot-api": "^0.67.0",
 		"otpauth": "^9.5.1",
 		"pixi.js": "^8.18.1",
+		"prosemirror-commands": "1.7.1",
+		"prosemirror-keymap": "1.2.3",
+		"prosemirror-model": "1.25.9",
+		"prosemirror-state": "1.4.4",
+		"prosemirror-transform": "1.12.0",
+		"prosemirror-view": "1.42.0",
 		"puppeteer-core": "24.41.0",
 		"qrcode": "^1.5.4",
 		"react": "^19.2.5",
@@ -83,9 +89,10 @@
 		"tldts": "6.1.86",
 		"tree-sitter-bash": "0.25.0",
 		"tweetnacl": "^0.14.5",
-		"undici": "6.24.1",
+		"undici": "6.29.1",
 		"web-tree-sitter": "0.25.10",
 		"ws": "^8.20.0",
+		"yjs": "13.6.33",
 		"zod": "^4.3.6"
 	},
 	"devDependencies": {
@@ -155,6 +162,10 @@
 		"@parcel/watcher",
 		"tree-sitter-bash"
 	],
+	"overrides": {
+		"katex": "0.18.2",
+		"undici": "6.29.1"
+	},
 	"patchedDependencies": {
 		"@cypress/request-promise@5.0.0": "patches/@cypress%2Frequest-promise@5.0.0.patch"
 	}

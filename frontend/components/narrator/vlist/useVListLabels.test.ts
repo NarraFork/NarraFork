@@ -60,6 +60,7 @@ const NO_LABELS_KINDS: Record<string, string> = {
 	"system-simple": "card text composed by the adapter (ctx.labels)",
 	"system-text": "card text composed by the adapter (ctx.labels)",
 	"knowledge-hint": "entry titles come from measured content",
+	"modeltrace-result": "renderer localizes footnote and empty fallback with useTranslation",
 	// Localized through a dedicated shell branch instead of a `labels` bundle.
 	"plan-card": "shell injects extra.label",
 	// Header chrome (verdict / revision / action label) is composed by the adapter

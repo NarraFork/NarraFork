@@ -177,8 +177,9 @@ function convertNode(schema: z.ZodType): Record<string, unknown> {
 			additionalProperties: convertNode(def.valueType),
 		};
 	} else if (schema instanceof z.ZodAny || schema instanceof z.ZodUnknown) {
-		// z.any() / z.unknown() — emit a permissive type so providers don't reject
-		result = { type: "string" };
+		// An empty schema accepts any JSON value; narrowing this to string corrupts
+		// structured arguments such as record values and arbitrary array items.
+		result = {};
 	} else if (schema instanceof z.ZodNullable) {
 		// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 		const inner = convertNode((schema as any).unwrap());
