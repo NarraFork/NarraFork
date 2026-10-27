@@ -13,6 +13,7 @@ import {
 	MODEL_MENU_POSITIONING,
 	modelMenuSelection,
 	modelProviderPrefix,
+	orderModelGroupEntries,
 	shouldAutoFocusModelFilter,
 } from "./model-menu-selection";
 
@@ -48,6 +49,85 @@ describe("model menu selection", () => {
 			"__agg__:group",
 		);
 		expect(modelMenuSelection("__agg__:group:a:model", []).targetValue).toBe("__agg__:group");
+	});
+});
+
+describe("model menu group ordering", () => {
+	const labelOf = (provider: string) =>
+		({ a: "Provider A", codex: "Codex", zeta: "Zeta Gateway", xiaomi: "Xiaomi" })[provider] ??
+		provider;
+
+	test("keeps default and summary pinned above the sorted providers", () => {
+		const entries = [
+			["zeta", 1],
+			["__summary__", 2],
+			["codex", 3],
+			["__default__", 4],
+			["a", 5],
+		] as const;
+		expect(orderModelGroupEntries(entries, labelOf).map(([provider]) => provider)).toEqual([
+			"__default__",
+			"__summary__",
+			"codex",
+			"a",
+			"zeta",
+		]);
+	});
+
+	test("pins aggregations after summary even when its label would sort last", () => {
+		const labelOfAggLast = (provider: string) =>
+			provider === "__agg__" ? "Zzz Aggregations" : labelOf(provider);
+		const entries = [
+			["zeta", 1],
+			["__agg__", 2],
+			["__summary__", 3],
+			["a", 4],
+			["__default__", 5],
+		] as const;
+		// "Zzz Aggregations" sorts after every provider label below. Pinning is
+		// what keeps the group next to Summary.
+		expect(orderModelGroupEntries(entries, labelOfAggLast).map(([provider]) => provider)).toEqual([
+			"__default__",
+			"__summary__",
+			"__agg__",
+			"a",
+			"zeta",
+		]);
+	});
+
+	test("sorts remaining groups by display label, not by raw provider prefix", () => {
+		const entries = [
+			["zeta", 1],
+			["codex", 2],
+			["a", 3],
+		] as const;
+		// Labels: Codex < Provider A < Zeta Gateway — prefix order would differ.
+		expect(orderModelGroupEntries(entries, labelOf).map(([provider]) => provider)).toEqual([
+			"codex",
+			"a",
+			"zeta",
+		]);
+	});
+
+	test("sorts a list without role groups and leaves the input untouched", () => {
+		const entries = [
+			["zeta", 1],
+			["a", 2],
+		] as const;
+		const ordered = orderModelGroupEntries(entries, labelOf);
+		expect(ordered.map(([provider]) => provider)).toEqual(["a", "zeta"]);
+		expect(entries.map(([provider]) => provider)).toEqual(["zeta", "a"]);
+	});
+
+	test("falls back to the provider prefix when no label is known", () => {
+		const entries = [
+			["unknown-b", 1],
+			["unknown-a", 2],
+		] as const;
+		expect(orderModelGroupEntries(entries, labelOf).map(([provider]) => provider)).toEqual([
+			"unknown-a",
+			"unknown-b",
+		]);
 	});
 });
 

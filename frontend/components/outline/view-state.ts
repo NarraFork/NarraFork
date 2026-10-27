@@ -1,35 +1,51 @@
 /**
- * View state of an outline page, shared by its views (design §6.10): the outline editor and the
- * read-only tree now, the mind map in PR9. One object per page per surface (`OutlineSurface`),
- * kept across focus changes: two surfaces showing one page (the outline page and a dock panel)
- * fold, select and scroll independently, while they share the page's live session.
+ * View state of an outline page, shared by its views (design §6.10): the outline editor, the mind
+ * map and the read-only tree. One object per page per surface (`OutlineSurface`), kept across
+ * focus changes and across the editor being unmounted (a dock panel in the background): two
+ * surfaces showing one page (the outline page and a dock panel) fold, select and scroll
+ * independently, while they share the page's live session.
  *
  *   - `focus`: the focused block (the route's block; the page itself when unfocused);
- *   - `collapsed`: folded blocks — personal, never part of the block model or a commit (PR9
- *     stores them per person and page in `outline_view_state`);
- *   - `caret`: where the cursor is (block and offsets in the block's editor content), or the
- *     selected node in the mind map;
- *   - `blocks`: the block selection (Esc), in order; empty outside block selection;
- *   - `anchor`: the viewport anchor, the block nearest the viewport's middle and where it sits,
- *     so switching views keeps it on screen.
+ *   - `collapsed`: folded blocks — personal, never part of the block model or a commit; stored
+ *     per person and page in `outline_view_state` (`useOutlineViewStateSync`);
+ *   - `caret`: where the cursor is (block and offsets in the block's editor content; -1 for the
+ *     whole block), or the selected node in the mind map (offsets -2: only the block is known);
+ *   - `blocks`: the block selection (Esc in the outline, Shift-click in the map), in order;
+ *   - `anchor`: the viewport anchor, the block nearest the viewport's middle and where its body
+ *     sits in the editor's frame, so switching views keeps it on screen;
+ *   - `view`: the outline or the mind map (this surface's own, not stored on the server);
+ *   - `layout`: the mind map's direction, rightward or downward — stored with the folding.
  *
  * Listeners hear which part changed. Pure state; no DOM.
  */
+import type { OutlineMapLayout } from "@shared/outline-api";
 
 export interface OutlineCaret {
 	blockId: string;
-	/** Offsets in the block's editor content; -1 for the whole block. */
+	/** Offsets in the block's editor content; -1 for the whole block; -2 only the block known. */
 	anchor: number;
 	head: number;
 }
 
 export interface OutlineViewportAnchor {
 	blockId: string;
-	/** The block's top relative to the viewport's top, in CSS pixels. */
-	top: number;
+	/** The block body's top-left corner relative to the editor frame, in CSS pixels. */
+	x: number;
+	y: number;
 }
 
-export type OutlineViewStatePart = "focus" | "collapsed" | "caret" | "blocks" | "anchor";
+export type OutlineViewKind = "outline" | "map";
+
+export type OutlineViewStatePart =
+	| "focus"
+	| "collapsed"
+	| "caret"
+	| "blocks"
+	| "anchor"
+	| "view"
+	| "layout"
+	/** Folding and direction were replaced by the stored ones (not a person's change). */
+	| "stored";
 
 export class OutlineViewState {
 	focus: string;
@@ -37,6 +53,8 @@ export class OutlineViewState {
 	caret: OutlineCaret | null = null;
 	blocks: string[] = [];
 	anchor: OutlineViewportAnchor | null = null;
+	view: OutlineViewKind = "outline";
+	layout: OutlineMapLayout = "right";
 	private readonly listeners = new Set<(part: OutlineViewStatePart) => void>();
 
 	constructor(readonly pageId: string) {
@@ -48,7 +66,7 @@ export class OutlineViewState {
 		return () => this.listeners.delete(listener);
 	}
 
-	private emit(part: OutlineViewStatePart): void {
+	emit(part: OutlineViewStatePart): void {
 		for (const l of this.listeners) l(part);
 	}
 
@@ -96,7 +114,27 @@ export class OutlineViewState {
 		this.emit("anchor");
 	}
 
-	/** Serializable copy (tests, and PR9's transitions). */
+	setView(view: OutlineViewKind): void {
+		if (this.view === view) return;
+		this.view = view;
+		this.emit("view");
+	}
+
+	setLayout(layout: OutlineMapLayout): void {
+		if (this.layout === layout) return;
+		this.layout = layout;
+		this.emit("layout");
+	}
+
+	/** Folding and direction as stored for the person (replaces both; one "stored" event). */
+	applyStored(collapsed: Iterable<string>, layout: OutlineMapLayout): void {
+		this.collapsed.clear();
+		for (const id of collapsed) this.collapsed.add(id);
+		this.layout = layout;
+		this.emit("stored");
+	}
+
+	/** Serializable copy (tests, and the transitions). */
 	snapshot() {
 		return {
 			focus: this.focus,
@@ -104,6 +142,8 @@ export class OutlineViewState {
 			caret: this.caret ? { ...this.caret } : null,
 			blocks: [...this.blocks],
 			anchor: this.anchor ? { ...this.anchor } : null,
+			view: this.view,
+			layout: this.layout,
 		};
 	}
 }

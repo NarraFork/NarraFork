@@ -44,6 +44,28 @@ function seedRecipient(id: string, reason: "normal" | "user_interrupt" | "error"
 	activeIds.add(id);
 }
 
+function seedAssistant(
+	narratorId: string,
+	id: string,
+	body: { text?: string | null; json?: unknown } = {},
+) {
+	const messageId = `assistant-${id}`;
+	db.insert(narratorMessages)
+		.values({
+			id: messageId,
+			narratorId,
+			role: "assistant",
+			contentText: body.text ?? null,
+			contentJson: body.json ?? (body.text ? [{ type: "text", text: body.text }] : []),
+			createdAt: time,
+		})
+		.run();
+	db.insert(narratorMessageRefs)
+		.values({ id: `ref-assistant-${id}`, narratorId, messageId, seq: ++nextSeq })
+		.run();
+	return messageId;
+}
+
 function seedReply(narratorId: string, id: string) {
 	const messageId = `answer-${id}`;
 	const text = `Complete user receipt ${id}: original context and selected option.`;
@@ -140,6 +162,54 @@ describe("pending question startup recovery", () => {
 				.all()
 				.map((row) => row.narratorId),
 		).toEqual(["normal"]);
+	});
+
+	test("does not redeliver an answer a later assistant reply already followed", async () => {
+		seedRecipient("continued");
+		seedReply("continued", "continued-reply");
+		seedAssistant("continued", "continued-reply", { text: "Sampling choice A is recorded." });
+		expect(await recoverPendingQuestionAnswerDeliveries()).toBe(0);
+		expect(db.select().from(narratorBufferedMessages).all()).toHaveLength(0);
+	});
+
+	test("still redelivers when the only later assistant row is an empty shell or reasoning", async () => {
+		seedRecipient("shell");
+		seedRecipient("thinking");
+		seedReply("shell", "shell-reply");
+		seedAssistant("shell", "shell-reply");
+		seedReply("thinking", "thinking-reply");
+		seedAssistant("thinking", "thinking-reply", {
+			json: [{ type: "reasoning", text: "still thinking" }],
+		});
+		expect(await recoverPendingQuestionAnswerDeliveries()).toBe(2);
+		expect(
+			db
+				.select()
+				.from(narratorBufferedMessages)
+				.all()
+				.map((row) => row.narratorId)
+				.sort(),
+		).toEqual(["shell", "thinking"]);
+	});
+
+	test("treats a later tool call with no text as a reply", async () => {
+		seedRecipient("tool");
+		seedReply("tool", "tool-reply");
+		const messageId = seedAssistant("tool", "tool-reply");
+		db.insert(narratorToolCalls)
+			.values({
+				id: "follow-call-tool",
+				narratorId: "tool",
+				messageId,
+				toolUseId: "follow-tool-tool",
+				toolName: "Read",
+				status: "success",
+				inputJson: {},
+				createdAt: time,
+			})
+			.run();
+		expect(await recoverPendingQuestionAnswerDeliveries()).toBe(0);
+		expect(db.select().from(narratorBufferedMessages).all()).toHaveLength(0);
 	});
 
 	test("background traversal accepts cancellation", async () => {

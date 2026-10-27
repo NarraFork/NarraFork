@@ -3,6 +3,7 @@ import { IconX, IconZoomIn, IconZoomOut, IconZoomReset } from "@tabler/icons-rea
 import { type ReactNode, useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { Z } from "../../lib/z-index";
+import { pinchStep as pinchMath, wheelZoomFactor, zoomAround } from "./pan-zoom-math";
 
 /**
  * A fullscreen overlay or embedded pan/zoom stage shared by the image viewer
@@ -11,11 +12,13 @@ import { Z } from "../../lib/z-index";
  * and renders arbitrary `children` as the zoomable content. Feature-specific
  * toolbar buttons are supplied via `renderToolbarExtra`, which receives imperative
  * controls (zoom/reset/rotate) so consumers can wire their own actions.
+ *
+ * The zoom-around-a-point and pinch math lives in `pan-zoom-math.ts`, shared with the outline
+ * mind map (which draws its own native-DOM stage and keeps its transform imperatively).
  */
 
 const MIN_SCALE = 0.1;
 const MAX_SCALE = 12;
-const WHEEL_ZOOM_STEP = 0.0015;
 const BUTTON_ZOOM_FACTOR = 1.25;
 /**
  * Max pointer travel (px) still treated as a click rather than a drag. Beyond
@@ -107,15 +110,8 @@ export function PanZoomStage({
 			const container = containerRef.current;
 			if (!container) return prev;
 			const rect = container.getBoundingClientRect();
-			const cx = rect.left + rect.width / 2;
-			const cy = rect.top + rect.height / 2;
-			const clamped = clampScale(nextScale);
-			const ratio = clamped / prev.scale;
-			const originX = cx + prev.tx;
-			const originY = cy + prev.ty;
-			const tx = prev.tx + (anchorX - originX) * (1 - ratio);
-			const ty = prev.ty + (anchorY - originY) * (1 - ratio);
-			return { ...prev, scale: clamped, tx, ty };
+			const origin = { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+			return zoomAround(prev, clampScale(nextScale), { x: anchorX, y: anchorY }, origin);
 		});
 	}, []);
 
@@ -128,15 +124,15 @@ export function PanZoomStage({
 				const container = containerRef.current;
 				if (!container) return prev;
 				const rect = container.getBoundingClientRect();
-				const cx = rect.left + rect.width / 2;
-				const cy = rect.top + rect.height / 2;
-				const clamped = clampScale(prev.scale * scaleRatio);
-				const ratio = clamped / prev.scale;
-				const originX = cx + prev.tx;
-				const originY = cy + prev.ty;
-				const tx = prev.tx + (midX - originX) * (1 - ratio) + panDx;
-				const ty = prev.ty + (midY - originY) * (1 - ratio) + panDy;
-				return { ...prev, scale: clamped, tx, ty };
+				const origin = { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+				return pinchMath(
+					prev,
+					scaleRatio,
+					{ x: midX, y: midY },
+					{ x: panDx, y: panDy },
+					origin,
+					clampScale,
+				);
 			});
 		},
 		[],
@@ -210,7 +206,7 @@ export function PanZoomStage({
 			e.preventDefault();
 			// Wheel-zoom is an interaction, not a click — never close afterwards.
 			backdropClickCandidate.current = false;
-			const factor = Math.exp(-e.deltaY * WHEEL_ZOOM_STEP);
+			const factor = wheelZoomFactor(e.deltaY);
 			zoomAt(transformRef.current.scale * factor, e.clientX, e.clientY);
 		},
 		[zoomAt],

@@ -17,14 +17,28 @@ describe("outline view state", () => {
 		a.setFocus("x");
 		a.setCaret({ blockId: "x", anchor: 0, head: 2 });
 		a.setBlocks(["y", "z"]);
-		a.setAnchor({ blockId: "y", top: 120 });
-		expect(heard).toEqual(["collapsed", "collapsed", "focus", "caret", "blocks", "anchor"]);
+		a.setAnchor({ blockId: "y", x: 30, y: 120 });
+		a.setView("map");
+		a.setView("map");
+		a.setLayout("down");
+		expect(heard).toEqual([
+			"collapsed",
+			"collapsed",
+			"focus",
+			"caret",
+			"blocks",
+			"anchor",
+			"view",
+			"layout",
+		]);
 		expect(a.snapshot()).toEqual({
 			focus: "x",
 			collapsed: ["x", "y", "z"],
 			caret: { blockId: "x", anchor: 0, head: 2 },
 			blocks: ["y", "z"],
-			anchor: { blockId: "y", top: 120 },
+			anchor: { blockId: "y", x: 30, y: 120 },
+			view: "map",
+			layout: "down",
 		});
 		expect(b.snapshot()).toEqual({
 			focus: "p1",
@@ -32,7 +46,20 @@ describe("outline view state", () => {
 			caret: null,
 			blocks: [],
 			anchor: null,
+			view: "outline",
+			layout: "right",
 		});
+	});
+
+	test("the stored folding and direction replace the surface's in one event", () => {
+		const state = new OutlineViewStates().of("p1");
+		state.toggleCollapsed("local");
+		const heard: string[] = [];
+		state.on((part) => heard.push(part));
+		state.applyStored(["a", "b"], "down");
+		expect(heard).toEqual(["stored"]);
+		expect([...state.collapsed]).toEqual(["a", "b"]);
+		expect(state.layout).toBe("down");
 	});
 
 	test("a surface keeps the most recent pages", () => {

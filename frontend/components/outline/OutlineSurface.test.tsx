@@ -8,6 +8,7 @@ import { readdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { MantineProvider } from "@mantine/core";
 import type { OutlineBlockViewResponse, OutlineViewBlock } from "@shared/outline-api";
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 
@@ -18,6 +19,7 @@ mock.module("../narrator/markdown/MarkdownContent", () => ({
 	MarkdownContent: ({ text }: { text: string }) => <div data-markdown="">{text}</div>,
 }));
 mock.module("./editor/OutlineEditor", () => ({
+	seedLiveSession: () => {},
 	OutlineEditor: (props: { pageId: string; focusId: string; lens: string; canWrite: boolean }) => (
 		<div
 			data-editor={props.pageId}
@@ -38,6 +40,10 @@ mock.module("../../hooks/useOutline", () => ({
 		return { data: shown, isLoading: false, error: null };
 	},
 	useOutlinePageLive: () => {},
+	useOutlineViewStateSync: () => {},
+	useOutlineSearch: () => idle,
+	useOutlineSeed: () => idle,
+	prefetchOutlineSeed: () => {},
 	useOutlineBacklinks: () => idle,
 	useOutlineBlockHistory: () => ({ ...idle, hasNextPage: false }),
 	useOutlineTimeline: () => ({ ...idle, hasNextPage: false }),
@@ -87,12 +93,17 @@ function pageView(extra: Partial<OutlineBlockViewResponse> = {}): OutlineBlockVi
 		hiddenByBudget: 0,
 		hiddenByView: 0,
 		pageTruncated: false,
+		pageBlocks: 3,
 		...extra,
 	};
 }
 
 function render(node: ReactNode): string {
-	return renderToStaticMarkup(<MantineProvider>{node}</MantineProvider>);
+	return renderToStaticMarkup(
+		<QueryClientProvider client={new QueryClient()}>
+			<MantineProvider>{node}</MantineProvider>
+		</QueryClientProvider>,
+	);
 }
 
 describe("OutlineSurface", () => {

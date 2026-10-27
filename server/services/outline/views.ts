@@ -270,6 +270,7 @@ export async function readBlockView(
 		hiddenByBudget: (size.get(root) ?? 1) - shown.length,
 		hiddenByView,
 		pageTruncated: state.truncated,
+		pageBlocks: state.nodes.size,
 	};
 }
 

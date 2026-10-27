@@ -150,7 +150,11 @@ describe("subscribing", () => {
 				seq: current.nextSeq - 1,
 			},
 		]);
-		const commits = [await edit(pageA, "A1"), await edit(pageA, "A2"), await edit(pageA, "A3")];
+		const commits = [
+			await edit(pageA, "A1"),
+			await edit(pageA, "A2"),
+			await edit(pageA, "A3 body"),
+		];
 		await edit(pageB, "B1");
 		await settle(() => ws.frames.length === 2);
 		await quiet();
@@ -162,8 +166,8 @@ describe("subscribing", () => {
 			seq: commits[2]?.seq as number,
 			commitIds: commits.map((c) => c.id),
 		});
-		// Ids and seqs only: no content travels.
-		expect(JSON.stringify(ws.frames)).not.toContain("A3");
+		// Ids and seqs only: no content travels (the space keeps it from matching a random id).
+		expect(JSON.stringify(ws.frames)).not.toContain("A3 body");
 	});
 
 	test("a page that does not exist and a page one may not read answer alike", async () => {

@@ -91,6 +91,7 @@ function view(blocks: OutlineViewBlock[], extra: Partial<OutlineBlockViewRespons
 		hiddenByBudget: 0,
 		hiddenByView: 0,
 		pageTruncated: false,
+		pageBlocks: 3,
 		...extra,
 	} satisfies OutlineBlockViewResponse;
 }

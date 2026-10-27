@@ -36,6 +36,7 @@ import {
 	centerModelMenuSelection,
 	modelMenuSelection,
 	modelProviderPrefix,
+	orderModelGroupEntries,
 	shouldAutoFocusModelFilter,
 } from "./model-menu-selection";
 import { QuotaWindowBars } from "./QuotaWindowBars";
@@ -196,7 +197,9 @@ export function ModelMenuItems({
 		__summary__: t("modelGroupSummary"),
 		__agg__: t("modelGroupAggregations"),
 	};
-	const entries = [...groups.entries()];
+	// Default, Summary, and Aggregations stay pinned at the top. Every provider
+	// group is sorted alphabetically by its display label.
+	const entries = orderModelGroupEntries([...groups.entries()], (prov) => provLabels[prov] ?? prov);
 	const normalizedFilter = filter.trim().toLowerCase();
 	const filteredEntries = normalizedFilter
 		? entries

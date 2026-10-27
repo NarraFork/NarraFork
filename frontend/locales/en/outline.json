@@ -145,6 +145,24 @@
 		"someone": "Someone",
 		"readOnly": "Read only",
 		"connecting": "Connecting…",
+		"connectingHint": "Connecting: typing is kept and sent once live; adding, moving or deleting blocks waits.",
+		"unsavedTitle_one": "What you typed here did not reach the page. It is kept in this tab only, until you dismiss it:",
+		"unsavedTitle_other": "What you typed here in {{count}} places did not reach the page. It is kept in this tab only, until you dismiss it:",
+		"unsavedRefused": "The page could not go live (too large, or no access).",
+		"unsavedReadOnly": "You can no longer edit this page.",
+		"unsavedNotSent": "The page was closed before the server confirmed this text. Check the page: it may be missing.",
+		"unsavedMovedAway": "The block you typed in is no longer on this page (deleted or moved). If it was moved elsewhere, adding it back here makes a second copy.",
+		"restoreUnsaved": "Add as a new block",
+		"restoreNotPossible": "This cannot be restored here now; copy it instead.",
+		"unsavedDropped_one": "{{count}} earlier unsaved text of this page was dropped: this tab keeps at most {{entries}} texts and {{kb}} KB.",
+		"unsavedDropped_other": "{{count}} earlier unsaved texts of this page were dropped: this tab keeps at most {{entries}} texts and {{kb}} KB.",
+		"unsavedMaybeAdded": "Adding it back was sent, but the page closed before confirming it: it may be on the page already. Check before adding it again.",
+		"unsavedAdding": "Adding…",
+		"restoreUnsavedAgain": "Add again anyway",
+		"tabLimitWaiting_one": "{{count}} of them is a hidden page still waiting for the server to confirm what you typed; its place frees up within {{seconds}} s at the latest.",
+		"tabLimitWaiting_other": "{{count}} of them are hidden pages still waiting for the server to confirm what you typed; the first place frees up within {{seconds}} s at the latest.",
+		"copyUnsaved": "Copy text",
+		"unsavedCopied": "Copied",
 		"offline": "Offline: changes are kept and sent when the connection is back",
 		"stalled": "Too many unsent changes: waiting for the server",
 		"deletedBy": "{{name}} deleted the block you were in.",
@@ -155,6 +173,37 @@
 		"unavailable": "Live editing is not available right now; the page is shown read only.",
 		"retry": "Try again",
 		"tabLimit": "Shown read only: this tab already has {{count}} outline pages open for live editing. Close or hide one of them, then try again."
+	},
+	"map": {
+		"viewLabel": "View",
+		"outline": "Outline",
+		"map": "Mind map",
+		"right": "Grow rightward",
+		"down": "Grow downward",
+		"fit": "Fit to window",
+		"stage": "Mind map of the page",
+		"more_one": "… {{count}} more",
+		"more_other": "… {{count}} more"
+	},
+	"switcher": {
+		"open": "Quick switcher (Ctrl/⌘ K)",
+		"placeholder": "Jump to a block: title, alias or text",
+		"label": "Find a block to jump to",
+		"empty": "No matches.",
+		"noRecent": "Blocks you focus appear here.",
+		"searching": "Searching other pages…",
+		"via": {
+			"title": "Title",
+			"alias": "Alias",
+			"body": "Text",
+			"recent": "Recent"
+		},
+		"thisPage": "This page",
+		"otherSpace": "Another space"
+	},
+	"history": {
+		"back": "Back (Ctrl/⌘ [)",
+		"forward": "Forward (Ctrl/⌘ ])"
 	},
 	"link": {
 		"notFound": "This outline link points to something that does not exist, or that you cannot read."

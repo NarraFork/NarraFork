@@ -12,6 +12,8 @@ import type {
 	OutlineSpaceResolveResponse,
 	OutlineTimelineResponse,
 	OutlineViewMode,
+	OutlineViewStatePutRequest,
+	OutlineViewStateResponse,
 } from "@shared/outline-api";
 import { request } from "./client";
 
@@ -80,6 +82,14 @@ export const outlineApi = {
 	/** Where a reference (`ref`, within `space` when bare) or a commit seq of `space` points. */
 	resolveOutline: (params: { ref?: string; space?: string; commit?: number }) =>
 		request<OutlineResolveResponse>(`/outline/resolve${query(params)}`),
+	/** The caller's folding and mind-map direction of a page (defaults when never written). */
+	getOutlineViewState: (pageId: string) =>
+		request<OutlineViewStateResponse>(`/outline/view-state/${enc(pageId)}`),
+	putOutlineViewState: (pageId: string, body: OutlineViewStatePutRequest) =>
+		request<OutlineViewStateResponse>(`/outline/view-state/${enc(pageId)}`, {
+			method: "PUT",
+			body: JSON.stringify(body),
+		}),
 	revertOutlineCommit: (commitId: string) =>
 		request<OutlineRevertResponse>(`/outline/commits/${enc(commitId)}/revert`, {
 			method: "POST",

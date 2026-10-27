@@ -25,10 +25,23 @@ import {
 	outlineLinks,
 	outlineLiveUpdates,
 	outlineSpaces,
+	outlineViewState,
 } from "@server/db/postgres-schema";
 import type { OutlineTaskJson } from "@server/db/schema";
 import { generateId } from "@server/lib/id";
-import { and, asc, eq, gt, inArray, isNull, type SQL, sql } from "drizzle-orm";
+import {
+	and,
+	asc,
+	desc,
+	eq,
+	gt,
+	inArray,
+	isNull,
+	ne,
+	notInArray,
+	type SQL,
+	sql,
+} from "drizzle-orm";
 import type { BunSQLDatabase } from "drizzle-orm/bun-sql";
 import { newOutlineKey } from "../keys";
 import type {
@@ -50,6 +63,7 @@ import {
 	OutlineStaleWriteError,
 	type OutlineStore,
 	type OutlineVersionRow,
+	type OutlineViewStateRow,
 } from "./port";
 import { createPostgresOutlineReads } from "./postgres-read";
 
@@ -122,6 +136,63 @@ function toLiveUpdate(row: LiveUpdateSelect): OutlineLiveUpdateRow {
 
 /** Rows per multi-row INSERT of the live log (7 columns each). */
 const LIVE_INSERT_CHUNK = 50;
+
+type ViewStateSelect = typeof outlineViewState.$inferSelect;
+
+function toViewState(row: ViewStateSelect): OutlineViewStateRow {
+	const collapsed = row.collapsedJson;
+	return {
+		userId: row.userId,
+		pageBlockId: row.pageBlockId,
+		collapsed: Array.isArray(collapsed)
+			? collapsed.filter((id): id is string => typeof id === "string")
+			: [],
+		layout: row.layout === "down" ? "down" : "right",
+		updatedAt: row.updatedAt,
+	};
+}
+
+/** Write a person's view state of a page and drop their oldest pages beyond the cap. */
+async function putViewStateSection(
+	tx: PgTransaction,
+	row: OutlineViewStateRow,
+	keepPerUser: number,
+): Promise<void> {
+	await tx
+		.insert(outlineViewState)
+		.values({
+			userId: row.userId,
+			pageBlockId: row.pageBlockId,
+			collapsedJson: row.collapsed,
+			layout: row.layout,
+			updatedAt: row.updatedAt,
+		})
+		.onConflictDoUpdate({
+			target: [outlineViewState.userId, outlineViewState.pageBlockId],
+			set: { collapsedJson: row.collapsed, layout: row.layout, updatedAt: row.updatedAt },
+		});
+	// The person's oldest pages beyond the cap (found by the primary key's prefix, at most
+	// `keepPerUser + 2` rows).
+	await tx.delete(outlineViewState).where(
+		and(
+			eq(outlineViewState.userId, row.userId),
+			// Never the page just written (a clock stepping back could make it the oldest).
+			ne(outlineViewState.pageBlockId, row.pageBlockId),
+			notInArray(
+				outlineViewState.pageBlockId,
+				tx
+					.select({ id: outlineViewState.pageBlockId })
+					.from(outlineViewState)
+					.where(eq(outlineViewState.userId, row.userId))
+					.orderBy(
+						desc(outlineViewState.updatedAt),
+						sql`${outlineViewState.pageBlockId} COLLATE "C" DESC`,
+					)
+					.limit(keepPerUser),
+			),
+		),
+	);
+}
 
 /** Append live log rows; one transaction so a chunked append lands whole. */
 async function appendLiveSection(
@@ -587,6 +658,24 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 				.groupBy(outlineLiveUpdates.pageBlockId, outlineLiveUpdates.epoch)
 				.orderBy(sql`${outlineLiveUpdates.pageBlockId} COLLATE "C"`, asc(outlineLiveUpdates.epoch))
 				.limit(options.limit);
+		},
+
+		async getViewState(userId, pageBlockId) {
+			const rows = await db
+				.select()
+				.from(outlineViewState)
+				.where(
+					and(eq(outlineViewState.userId, userId), eq(outlineViewState.pageBlockId, pageBlockId)),
+				)
+				.limit(1);
+			const row = rows[0];
+			return row ? toViewState(row) : null;
+		},
+
+		async putViewState(row, keepPerUser) {
+			await withPgRetry(() => db.transaction((tx) => putViewStateSection(tx, row, keepPerUser)), {
+				label: "outline.putViewState",
+			});
 		},
 
 		async applyCommit(plan) {

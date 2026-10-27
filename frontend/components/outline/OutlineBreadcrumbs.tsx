@@ -8,16 +8,19 @@ import { OutlineLink, outlineBlockTarget } from "./outline-nav";
 
 /**
  * Outline › space › page › … › the focused block. Every ancestor is a link that focuses it,
- * keeping the view and the time the page is shown at.
+ * keeping the view and the time the page is shown at. While the page is edited live, `path`
+ * comes from the live page (it follows focus at once, before the read of the block lands).
  */
 export function OutlineBreadcrumbs({
 	view,
 	rootTitle,
 	search,
+	path,
 }: {
 	view: OutlineBlockViewResponse;
 	rootTitle: string;
 	search: OutlineBlockSearch;
+	path?: OutlineBlockViewResponse["path"];
 }) {
 	const { t } = useTranslation("outline");
 	const spaceName = useOutlineSpaceName();
@@ -39,7 +42,7 @@ export function OutlineBreadcrumbs({
 			>
 				{spaceName(view.space)}
 			</Anchor>
-			{view.path.map((ancestor) => (
+			{(path ?? view.path).map((ancestor) => (
 				<Anchor
 					key={ancestor.id}
 					size="sm"
@@ -55,7 +58,13 @@ export function OutlineBreadcrumbs({
 					{ancestor.title || ancestor.sid}
 				</Anchor>
 			))}
-			<Text size="sm" fw={500} className={classes.crumb} title={rootTitle}>
+			<Text
+				size="sm"
+				fw={500}
+				className={classes.crumb}
+				title={rootTitle}
+				data-testid="outline-crumb-here"
+			>
 				{rootTitle}
 			</Text>
 		</Breadcrumbs>

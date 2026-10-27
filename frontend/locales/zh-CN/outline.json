@@ -145,6 +145,24 @@
 		"someone": "有人",
 		"readOnly": "只读",
 		"connecting": "正在连接…",
+		"connectingHint": "正在连接：输入会保留，连上后发送；新增、移动、删除块要等连上。",
+		"unsavedTitle_one": "你在这里输入的文字没有写进这一页。它只保存在这个标签页里，直到你关掉提示：",
+		"unsavedTitle_other": "你在这里 {{count}} 处输入的文字没有写进这一页。它们只保存在这个标签页里，直到你关掉提示：",
+		"unsavedRefused": "这一页无法实时编辑（太大，或没有权限）。",
+		"unsavedReadOnly": "你已不能编辑这一页。",
+		"unsavedNotSent": "服务器确认这段文字之前这一页已关闭。请检查页面，它可能没写进去。",
+		"unsavedMovedAway": "你输入时所在的块已不在这一页（被删除或移走）。如果它只是被移到了别处，在这里加回会多出一份。",
+		"restoreUnsaved": "作为新块加回",
+		"restoreNotPossible": "现在无法在这里恢复，请复制文字。",
+		"unsavedDropped_one": "这一页有 {{count}} 条较早的未保存文字因上限被丢弃：每个标签页最多保留 {{entries}} 条、{{kb}}KB。",
+		"unsavedDropped_other": "这一页有 {{count}} 条较早的未保存文字因上限被丢弃：每个标签页最多保留 {{entries}} 条、{{kb}}KB。",
+		"unsavedMaybeAdded": "加回的请求已发出，但页面在确认前关闭了：它可能已经在页面上。再加一次之前请先检查。",
+		"unsavedAdding": "正在加回…",
+		"restoreUnsavedAgain": "仍然再加一次",
+		"tabLimitWaiting_one": "其中 {{count}} 个是已隐藏、仍在等待服务器确认输入的页面，最迟 {{seconds}} 秒后空出名额。",
+		"tabLimitWaiting_other": "其中 {{count}} 个是已隐藏、仍在等待服务器确认输入的页面，最迟 {{seconds}} 秒后空出第一个名额。",
+		"copyUnsaved": "复制文字",
+		"unsavedCopied": "已复制",
 		"offline": "离线：修改会保留，连上后发出",
 		"stalled": "未发出的修改太多，等待服务器",
 		"deletedBy": "{{name}} 删除了你正在编辑的块。",
@@ -155,6 +173,37 @@
 		"unavailable": "现在不能实时编辑，先以只读显示这一页。",
 		"retry": "重试",
 		"tabLimit": "当前为只读：这个标签页已经有 {{count}} 个大纲页处于实时编辑状态。关闭或隐藏其中一个后再重试。"
+	},
+	"map": {
+		"viewLabel": "视图",
+		"outline": "大纲",
+		"map": "导图",
+		"right": "向右展开",
+		"down": "向下展开",
+		"fit": "适应窗口",
+		"stage": "这一页的导图",
+		"more_one": "…还有 {{count}} 项",
+		"more_other": "…还有 {{count}} 项"
+	},
+	"switcher": {
+		"open": "快速切换（Ctrl/⌘ K）",
+		"placeholder": "跳到一个块：标题、别名或正文",
+		"label": "找一个块跳过去",
+		"empty": "没有匹配的块。",
+		"noRecent": "聚焦过的块会出现在这里。",
+		"searching": "正在搜其他页…",
+		"via": {
+			"title": "标题",
+			"alias": "别名",
+			"body": "正文",
+			"recent": "最近"
+		},
+		"thisPage": "这一页",
+		"otherSpace": "其他空间"
+	},
+	"history": {
+		"back": "后退（Ctrl/⌘ [）",
+		"forward": "前进（Ctrl/⌘ ]）"
 	},
 	"link": {
 		"notFound": "这个大纲链接指向的内容不存在，或你无权阅读。"

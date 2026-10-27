@@ -13,6 +13,9 @@
  *   4. Resolving a reference or a commit (`/resolve`) consults one space, and answers 404 alike
  *      for a space or block that does not exist, one the person cannot read, and a reference
  *      that names several blocks.
+ *   5. A person's view state of a page (`/view-state/:pageId`: folding and the mind map's
+ *      direction) needs only read access: it is their own view, never a commit. A page they
+ *      cannot read, a block that is not a page, and a deleted page are 404.
  * Access is decided per person by `services/outline/access.ts`, against current permissions:
  * reading a page as of an older commit uses today's access, not the access at the time.
  */
@@ -20,6 +23,7 @@
 import { blockTitle, isSpaceKey } from "@shared/outline";
 import {
 	OUTLINE_VIEW_LIMITS,
+	OUTLINE_VIEW_STATE_LIMITS,
 	type OutlineBacklinksResponse,
 	type OutlineBlockHistoryResponse,
 	type OutlineBlockViewResponse,
@@ -32,8 +36,10 @@ import {
 	type OutlineSpaceResolveResponse,
 	type OutlineSpaceSummary,
 	type OutlineTimelineResponse,
+	type OutlineViewStateResponse,
 } from "@shared/outline-api";
 import { type Context, Hono } from "hono";
+import { bodyLimit } from "hono/body-limit";
 import { ForbiddenError, NotFoundError, ValidationError } from "../lib/errors";
 import {
 	outlineBacklinksQuerySchema,
@@ -44,6 +50,7 @@ import {
 	outlineResolveQuerySchema,
 	outlineSearchQuerySchema,
 	outlineSpaceListQuerySchema,
+	outlineViewStatePutSchema,
 } from "../lib/validators/outline";
 import {
 	canReadSpace,
@@ -75,6 +82,7 @@ import {
 } from "../services/outline/spaces";
 import { outlineStore } from "../services/outline/store";
 import type { OutlineBlockRow, OutlineSpaceRow } from "../services/outline/store/port";
+import { readViewState, writeViewState } from "../services/outline/view-state";
 import {
 	describeSpaces,
 	listSpacePages,
@@ -496,3 +504,44 @@ outlineRoutes.post("/commits/:commitId/revert", async (c) => {
 	};
 	return c.json(body);
 });
+
+// ─────────────────────────────────────────────────────────────────────────────
+// View state
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** The person's folding and mind-map direction of a page; the defaults when never written. */
+outlineRoutes.get("/view-state/:pageId", async (c) => {
+	const principal = principalOf(c);
+	const pageId = idParam(c, "pageId");
+	const body: OutlineViewStateResponse | null = await readViewState(principal, pageId);
+	if (!body) throw new NotFoundError("Outline page", pageId);
+	return c.json(body);
+});
+
+/** Replace the person's folding and mind-map direction of a page (the client debounces). */
+outlineRoutes.put(
+	"/view-state/:pageId",
+	bodyLimit({
+		maxSize: OUTLINE_VIEW_STATE_LIMITS.maxBodyBytes,
+		onError: (c) =>
+			c.json(
+				{
+					code: "PAYLOAD_TOO_LARGE",
+					message: `Request body exceeds ${OUTLINE_VIEW_STATE_LIMITS.maxBodyBytes} bytes`,
+				},
+				413,
+			),
+	}),
+	async (c) => {
+		const principal = principalOf(c);
+		const pageId = idParam(c, "pageId");
+		const raw = await c.req.json().catch((error: unknown) => {
+			if (error instanceof Error && error.name === "BodyLimitError") throw error;
+			throw new ValidationError("Invalid JSON body");
+		});
+		const input = parse(outlineViewStatePutSchema, raw);
+		const body: OutlineViewStateResponse | null = await writeViewState(principal, pageId, input);
+		if (!body) throw new NotFoundError("Outline page", pageId);
+		return c.json(body);
+	},
+);

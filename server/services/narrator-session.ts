@@ -20,7 +20,7 @@ import {
 	MAX_EDIT_TEXT_FILES_PER_MESSAGE,
 	MAX_NARRATOR_ATTACHMENT_BYTES,
 } from "@shared/text-file-types";
-import { and, asc, desc, eq, exists, gt, inArray, isNotNull, isNull, sql } from "drizzle-orm";
+import { and, asc, desc, eq, exists, gt, inArray, isNotNull, isNull, or, sql } from "drizzle-orm";
 import { db, sqlite } from "../db";
 import {
 	narratorBufferedMessages,
@@ -373,7 +373,13 @@ import {
 	resolveBlockTargets,
 	rowAt,
 } from "./narrator-block-targets";
-import { bodyColumns, fillBodies, fillBody } from "./narrator-body-reads";
+import {
+	bodyColumns,
+	contentJsonSql,
+	fillBodies,
+	fillBody,
+	storedBodyBytesSql,
+} from "./narrator-body-reads";
 import { readEnvelopeBody, writeEnvelopeBody } from "./narrator-body-writes";
 import {
 	cleanupBufferedTextFilesAsync,
@@ -2986,6 +2992,33 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 }
 
 /**
+ * Session catch for a thrown run. `executeRun` already settles a foreground failure
+ * (idle, and error / interrupted / timeout). Writing again would replace that
+ * classification and broadcast a second `narrator_error`. Throws that never reached
+ * the finalizer — registration rejected, or the run still working/waiting — still
+ * report here.
+ */
+async function reportUnsettledRunLoopError(
+	narratorId: string,
+	err: unknown,
+	diagnostics?: ReturnType<typeof diagnosticsFromError>,
+): Promise<void> {
+	const current = await narratorService.getById(narratorId).catch(() => null);
+	if (!current || (current.status !== "working" && current.status !== "waiting")) return;
+	await narratorService.updateStatus(narratorId, "idle", {
+		substatus: ["error"],
+		errorMessage: String(err),
+		...(diagnostics ? { diagnostics } : {}),
+	});
+	broadcastToNarrator(narratorId, {
+		type: "narrator_error",
+		narratorId,
+		error: String(err),
+		...(diagnostics ? { diagnostics } : {}),
+	});
+}
+
+/**
  * Start a run of this prepared session through the single run service.
  *
  * Returns `{ started: false }` when another execution owns the narrator. Every
@@ -3362,17 +3395,7 @@ async function feedMessageUnlocked(
 		terminal.catch(async (err) => {
 			const diagnostics = diagnosticsFromError(err);
 			logger.error("runAgentLoop unhandled error", { narratorId, error: String(err), diagnostics });
-			await narratorService.updateStatus(narratorId, "idle", {
-				substatus: ["error"],
-				errorMessage: String(err),
-				diagnostics,
-			});
-			broadcastToNarrator(narratorId, {
-				type: "narrator_error",
-				narratorId,
-				error: String(err),
-				diagnostics,
-			});
+			await reportUnsettledRunLoopError(narratorId, err, diagnostics);
 		});
 
 		return { active, userMsg, userBroadcasted: !!preBashCommand, terminal };
@@ -4314,15 +4337,7 @@ export async function startSpecContinuationIfPossible(
 				narratorId,
 				error: String(err),
 			});
-			await narratorService.updateStatus(narratorId, "idle", {
-				substatus: ["error"],
-				errorMessage: String(err),
-			});
-			broadcastToNarrator(narratorId, {
-				type: "narrator_error",
-				narratorId,
-				error: String(err),
-			});
+			await reportUnsettledRunLoopError(narratorId, err);
 		});
 		return { started: true };
 	});
@@ -4390,6 +4405,81 @@ export function isQuestionAnswerWakeEligible(recipient: {
 			(tag) => tag === "error" || tag === "waiting_permission",
 		)
 	);
+}
+
+/**
+ * The answer is already in the transcript and a later assistant turn actually
+ * replied. Empty shells (`createPartialAssistantMessage`) and reasoning-only
+ * tails are not replies: a crash can leave them after the answer without the
+ * model having continued, and treating them as delivered would drop the wake
+ * forever. Text or a tool call is enough; other non-reasoning bodies count too.
+ */
+function assistantReplyFollowsAnswer(narratorId: string, answerSeq: number): boolean {
+	const substantive = db
+		.select({ id: narratorMessageRefs.id })
+		.from(narratorMessageRefs)
+		.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
+		.where(
+			and(
+				eq(narratorMessageRefs.narratorId, narratorId),
+				eq(narratorMessages.role, "assistant"),
+				gt(narratorMessageRefs.seq, answerSeq),
+				or(
+					sql`length(trim(coalesce(${narratorMessages.contentText}, ''))) > 0`,
+					exists(
+						db
+							.select({ one: sql`1` })
+							.from(narratorToolCalls)
+							.where(eq(narratorToolCalls.messageId, narratorMessages.id)),
+					),
+				),
+			),
+		)
+		.limit(1)
+		.get();
+	if (substantive) return true;
+
+	let cursor = answerSeq;
+	for (;;) {
+		// Body bytes and the body itself go through the block-aware readers. The column
+		// is only a projection once rows are current, and a direct read is refused.
+		const bodies = fillBodies(
+			db
+				.select({
+					id: narratorMessages.id,
+					seq: narratorMessageRefs.seq,
+					contentJson: contentJsonSql(),
+				})
+				.from(narratorMessageRefs)
+				.innerJoin(narratorMessages, eq(narratorMessages.id, narratorMessageRefs.messageId))
+				.where(
+					and(
+						eq(narratorMessageRefs.narratorId, narratorId),
+						eq(narratorMessages.role, "assistant"),
+						gt(narratorMessageRefs.seq, cursor),
+						sql`coalesce(${storedBodyBytesSql()}, 0) > 2`,
+					),
+				)
+				.orderBy(asc(narratorMessageRefs.seq))
+				.limit(8)
+				.all(),
+		);
+		if (!bodies.length) return false;
+		for (const body of bodies) {
+			if (
+				!isDanglingReasoningOnlyAssistantMessage({
+					role: "assistant",
+					contentJson: body.contentJson,
+					contentText: null,
+					toolCalls: [],
+				})
+			)
+				return true;
+		}
+		const next = bodies[bodies.length - 1]?.seq;
+		if (next == null || next <= cursor || bodies.length < 8) return false;
+		cursor = next;
+	}
 }
 
 async function canWakeQuestionAnswer(
@@ -4476,6 +4566,22 @@ export async function recoverPendingQuestionAnswerDeliveries(
 					options.signal?.throwIfAborted();
 					if (!question.messageId) continue;
 					try {
+						// `resolution_json` 是模型写的「解决备注」，不是送达凭据。回答已经在
+						// refs 里、并且后面有一次真正的 assistant 回复，才说明会话继续过。
+						// 没有 ref 时仍交给下面的 schedule：它会抛出并记
+						// "Pending question recovery deferred"，下一次启动再试。
+						const answerRef = db
+							.select({ seq: narratorMessageRefs.seq })
+							.from(narratorMessageRefs)
+							.where(
+								and(
+									eq(narratorMessageRefs.narratorId, recipient.id),
+									eq(narratorMessageRefs.messageId, question.messageId),
+								),
+							)
+							.limit(1)
+							.get();
+						if (answerRef && assistantReplyFollowsAnswer(recipient.id, answerRef.seq)) continue;
 						const principal = await getAsyncQuestionExecutionPrincipal(question.id, recipient.id);
 						if (!principal) continue;
 						const receipt = await getBoundedQuestionReceipt(question.messageId, recipient.id);
@@ -4778,15 +4884,7 @@ export async function startInjectionContinuationIfPossible(
 					narratorId,
 					error: String(err),
 				});
-				await narratorService.updateStatus(narratorId, "idle", {
-					substatus: ["error"],
-					errorMessage: String(err),
-				});
-				broadcastToNarrator(narratorId, {
-					type: "narrator_error",
-					narratorId,
-					error: String(err),
-				});
+				await reportUnsettledRunLoopError(narratorId, err);
 			},
 		);
 		return { started: true };
@@ -4926,15 +5024,7 @@ export async function startParentInboundContinuationIfPossible(
 				narratorId,
 				error: String(err),
 			});
-			await narratorService.updateStatus(narratorId, "idle", {
-				substatus: ["error"],
-				errorMessage: String(err),
-			});
-			broadcastToNarrator(narratorId, {
-				type: "narrator_error",
-				narratorId,
-				error: String(err),
-			});
+			await reportUnsettledRunLoopError(narratorId, err);
 		});
 		return { started: true };
 	});
@@ -5166,15 +5256,7 @@ async function retryLastMessageUnlocked(
 		principal: userId,
 	}).catch(async (err) => {
 		logger.error("runAgentLoop unhandled error (retry)", { narratorId, error: String(err) });
-		await narratorService.updateStatus(narratorId, "idle", {
-			substatus: ["error"],
-			errorMessage: String(err),
-		});
-		broadcastToNarrator(narratorId, {
-			type: "narrator_error",
-			narratorId,
-			error: String(err),
-		});
+		await reportUnsettledRunLoopError(narratorId, err);
 	});
 
 	return { ok: true };
@@ -5411,15 +5493,7 @@ async function continueNarratorUnlocked(
 	});
 	terminal.catch(async (err) => {
 		logger.error("runAgentLoop unhandled error (continue)", { narratorId, error: String(err) });
-		await narratorService.updateStatus(narratorId, "idle", {
-			substatus: ["error"],
-			errorMessage: String(err),
-		});
-		broadcastToNarrator(narratorId, {
-			type: "narrator_error",
-			narratorId,
-			error: String(err),
-		});
+		await reportUnsettledRunLoopError(narratorId, err);
 	});
 
 	return { ok: true, terminal };
@@ -6924,15 +6998,7 @@ async function editAndRegenerateUnlocked(
 			narratorId,
 			error: String(err),
 		});
-		await narratorService.updateStatus(narratorId, "idle", {
-			substatus: ["error"],
-			errorMessage: String(err),
-		});
-		broadcastToNarrator(narratorId, {
-			type: "narrator_error",
-			narratorId,
-			error: String(err),
-		});
+		await reportUnsettledRunLoopError(narratorId, err);
 	});
 
 	return { ok: true, ...warnings };

@@ -323,6 +323,39 @@ describe("provider group header", () => {
 	});
 });
 
+describe("group ordering", () => {
+	test("pins default, summary, and aggregations, then sorts providers by label", async () => {
+		// zh-CN titles put 聚合 after every Latin provider label under the default
+		// collation, so this header position only holds when the group is pinned.
+		// Insertion order is scrambled and is neither prefix order nor label order.
+		await instance.changeLanguage("zh-CN");
+		const scrambled: ModelOption[] = [
+			{ value: "zeta:z1", label: "Z1", provider: "zeta" },
+			{ value: "__agg__:group", label: "Group", provider: "__agg__" },
+			{ value: "__summary__", label: "Follow summary", provider: "__summary__" },
+			{ value: "codex:gpt", label: "gpt", provider: "codex" },
+			{ value: "__default__", label: "Follow default", provider: "__default__" },
+			{ value: "a:one", label: "One", provider: "a" },
+		];
+		await render("a:one", scrambled, true, true, {
+			extraProps: {
+				providerLabels: { a: "Provider A", codex: "Codex", zeta: "Zeta Gateway" },
+			},
+		});
+		const headers = Array.from(host.querySelectorAll(".mantine-Menu-label")).map(
+			(header) => header.textContent?.trim() ?? "",
+		);
+		expect(headers).toEqual([
+			narratorZhLocale.modelGroupDefault,
+			narratorZhLocale.modelGroupSummary,
+			narratorZhLocale.modelGroupAggregations,
+			"Codex",
+			"Provider A",
+			"Zeta Gateway",
+		]);
+	});
+});
+
 describe("per-model global role actions", () => {
 	test("hides the three-dot control when handlers are not provided", async () => {
 		await render("a:one");

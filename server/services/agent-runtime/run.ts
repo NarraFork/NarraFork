@@ -17,6 +17,7 @@ import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { and, eq } from "drizzle-orm";
 import { db } from "../../db";
 import { narrators, narratorToolCalls } from "../../db/schema";
+import { diagnosticsFromError } from "../../lib/agent/error-diagnostics";
 import { withDbRetry } from "../../lib/db-resilience";
 import { AppError } from "../../lib/errors";
 import { eventBus } from "../../lib/event-bus";
@@ -353,6 +354,8 @@ async function executeRun(
 	let allowInboxWake = false;
 	let active: ActiveNarrator | undefined;
 	let deliverTo: RunDeliverTo | undefined;
+	/** False until `prepareLogicalRun` has returned the destination, including "none". */
+	let deliverToResolved = false;
 	let publicationRun: PublicationRun | undefined;
 	let finished = false;
 	try {
@@ -386,12 +389,16 @@ async function executeRun(
 		const prepared = await prepareLogicalRun(id, source, req, principal);
 		const binding = prepared.binding;
 		publicationRun = prepared.publicationRun;
+		// Known as soon as registration returns, including a primary run with no destination.
+		// Throws before this must not look like a foreground failure: a subagent whose
+		// startRun failed still has to stay `working` for restart recovery.
+		deliverTo = binding.deliverTo;
+		deliverToResolved = true;
 		run.binding = binding;
 		run.logicalRunId = binding.logicalRunId;
 		if (!binding.principal) throw new Error("Run registration requires an execution principal");
 		run.principal = binding.principal.userId;
 		session._currentUserId = run.principal;
-		deliverTo = binding.deliverTo;
 		run.deliverTo = deliverTo;
 		run.cancelWith = binding.cancelWith;
 		run.deadlineAt = binding.deadlineAt;
@@ -577,6 +584,7 @@ async function executeRun(
 		// do not auto-start queued work over a retained same-run terminal checkpoint.
 		allowInboxWake = false;
 		if (active) active._resumeBufferedAfterLoop = false;
+		const failureText = error instanceof Error ? error.message : String(error);
 		// A run that threw still ends exactly once at its destination (the same
 		// finalizer); the error then reaches the session's own error reporting.
 		if (!finished && deliverTo && publicationRun)
@@ -585,12 +593,32 @@ async function executeRun(
 				run,
 				deliverTo,
 				publicationRun,
-				{ hasError: true, finalText: error instanceof Error ? error.message : String(error) },
+				{ hasError: true, finalText: failureText },
 				req,
 			).catch((finalizeError) =>
 				logger.warn("Run finalization after failure failed", {
 					id,
 					error: String(finalizeError),
+				}),
+			);
+		else if (deliverToResolved && !deliverTo)
+			// 前台 run 没有交付目标，收尾只能在这里做：漏掉它 status 会停在 working，
+			// 下次重启被当成「被上个进程切断的 run」再次续跑，于是空输入重放上一轮。
+			// 截止时间到了也会 abort，超时必须压过 interrupted，和 finishRun 一致。
+			await settleStatus(
+				id,
+				undefined,
+				{
+					hasError: true,
+					interrupted: !run.timedOut && run.cancel.signal.aborted,
+					timedOut: run.timedOut,
+					finalText: failureText,
+				},
+				{ skipErrorMessage: false, diagnostics: diagnosticsFromError(error) },
+			).catch((statusError) =>
+				logger.warn("Run status settle after failure failed", {
+					id,
+					error: String(statusError),
 				}),
 			);
 		throw error;
@@ -865,6 +893,11 @@ async function settleStatus(
 		RunResult,
 		"hasError" | "interrupted" | "timedOut" | "finalText" | "terminalStatus"
 	>,
+	options?: {
+		/** Foreground throws record one error row here. finishRun keeps the default. */
+		skipErrorMessage?: boolean;
+		diagnostics?: ReturnType<typeof diagnosticsFromError>;
+	},
 ): Promise<void> {
 	const { narratorService } = await import("../narrator-service");
 	const failure =
@@ -886,7 +919,11 @@ async function settleStatus(
 		errorMessage:
 			failure?.errorMessage ??
 			(outcome.hasError && !outcome.interrupted ? outcome.finalText : undefined),
-		skipErrorMessage: true,
+		// `failure` already carries the loop's diagnostics. Only a foreground throw,
+		// which has no terminal status, supplies them here — an explicit undefined
+		// would wipe the ones just spread.
+		...(options?.diagnostics ? { diagnostics: options.diagnostics } : {}),
+		skipErrorMessage: options?.skipErrorMessage ?? true,
 		unlessArchived: true,
 	});
 	if (changed === false) return;

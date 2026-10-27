@@ -35,12 +35,12 @@ const realDb = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDb, db, sqlite }));
 const provider = await import("../../lib/agent/provider");
 const executor = await import("../narrator-executor");
-const { isGitCommandToolResult, runAgentLoopUnlocked } = await import(
-	"../agent-runtime/orchestrator"
-);
+const orchestrator = await import("../agent-runtime/orchestrator");
+const { isGitCommandToolResult, runAgentLoopUnlocked } = orchestrator;
 const {
 	tryClaimExecution,
 	getExecutionOwner,
+	getRunControl,
 	getRunHold,
 	isExecutionSuspended,
 	setRunControl,
@@ -1553,3 +1553,78 @@ for (const profile of profiles) {
 		}
 	});
 }
+
+describe("foreground run failure status", () => {
+	function tags(id: string): string[] {
+		const row = db.select().from(narrators).where(eq(narrators.id, id)).get();
+		return row?.substatus ? (JSON.parse(row.substatus) as string[]) : [];
+	}
+
+	test("a primary throw settles idle with error instead of staying working", async () => {
+		db.update(narrators)
+			.set({ status: "working" })
+			.where(eq(narrators.id, "contract-primary"))
+			.run();
+		// The loop converts its own failures into a result. This is the infrastructure
+		// throw that used to leave `narrators.status` at working.
+		spyOn(orchestrator, "runAgentLoopUnlocked").mockRejectedValue(new Error("model exploded"));
+		const handle = await startNarratorRun({
+			narratorId: "contract-primary",
+			locale: "en",
+			text: "hello",
+			principal: null,
+			active: active("contract-primary"),
+		});
+		await expect(handle.completion).rejects.toThrow("model exploded");
+		expect(
+			db.select().from(narrators).where(eq(narrators.id, "contract-primary")).get()?.status,
+		).toBe("idle");
+		expect(tags("contract-primary")).toContain("error");
+		expect(tags("contract-primary")).not.toContain("interrupted");
+	});
+
+	test("a throw before registration does not settle a delivering session", async () => {
+		db.update(narrators).set({ status: "working" }).where(eq(narrators.id, "contract-child")).run();
+		const { getRuntimePublicationService } = await import("../agent-runtime/publication");
+		spyOn(getRuntimePublicationService(), "startRun").mockRejectedValue(
+			new Error("registration unavailable"),
+		);
+		const handle = await startNarratorRun({
+			narratorId: "contract-child",
+			locale: "en",
+			text: "",
+			principal: null,
+			active: active("contract-child"),
+		});
+		await expect(handle.completion).rejects.toThrow("registration unavailable");
+		expect(
+			db.select().from(narrators).where(eq(narrators.id, "contract-child")).get()?.status,
+		).toBe("working");
+		expect(tags("contract-child")).not.toContain("error");
+	});
+
+	test("a timed-out throw is timeout rather than interrupted", async () => {
+		db.update(narrators)
+			.set({ status: "working" })
+			.where(eq(narrators.id, "contract-primary"))
+			.run();
+		spyOn(orchestrator, "runAgentLoopUnlocked").mockImplementation(async () => {
+			const run = getRunControl("contract-primary");
+			if (!run) throw new Error("missing run control");
+			run.timedOut = true;
+			run.cancel.abort("Run deadline reached");
+			throw new Error("deadline blew up");
+		});
+		const handle = await startNarratorRun({
+			narratorId: "contract-primary",
+			locale: "en",
+			text: "hello",
+			principal: null,
+			active: active("contract-primary"),
+		});
+		await expect(handle.completion).rejects.toThrow("deadline blew up");
+		expect(tags("contract-primary")).toContain("timeout");
+		expect(tags("contract-primary")).not.toContain("interrupted");
+		expect(tags("contract-primary")).not.toContain("error");
+	});
+});

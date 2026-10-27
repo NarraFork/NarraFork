@@ -310,3 +310,46 @@
 		padding-left: 8px;
 	}
 }
+
+/* A structural edit refused while the page connects: the "connecting" badge nudges once. */
+.nf-outline-editor .nf-outline-nudge {
+	animation: nf-outline-nudge 360ms ease-out;
+}
+
+@keyframes nf-outline-nudge {
+	0% {
+		transform: translateX(0);
+	}
+	25% {
+		transform: translateX(-3px);
+	}
+	75% {
+		transform: translateX(3px);
+	}
+	100% {
+		transform: translateX(0);
+	}
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.nf-outline-editor .nf-outline-nudge {
+		animation: none;
+	}
+}
+
+/* Typing that did not reach the page (UnsavedTextsNotice): shown to copy or add back. */
+.nf-outline-unsaved-entry + .nf-outline-unsaved-entry {
+	margin-top: 8px;
+}
+
+.nf-outline-unsaved-notice .nf-outline-unsaved {
+	margin: 0;
+	max-height: 10em;
+	overflow: auto;
+	white-space: pre-wrap;
+	word-break: break-word;
+	font-size: var(--mantine-font-size-xs);
+	padding: 4px 6px;
+	border-radius: var(--mantine-radius-xs);
+	background: var(--mantine-color-default);
+}

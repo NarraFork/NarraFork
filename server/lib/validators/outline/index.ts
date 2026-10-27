@@ -1,4 +1,9 @@
-import { OUTLINE_RESOLVE_REQUEST_LIMITS, OUTLINE_VIEW_LIMITS } from "@shared/outline-api";
+import {
+	OUTLINE_BLOCK_ID_RE,
+	OUTLINE_RESOLVE_REQUEST_LIMITS,
+	OUTLINE_VIEW_LIMITS,
+	OUTLINE_VIEW_STATE_LIMITS,
+} from "@shared/outline-api";
 import { z } from "zod";
 
 /**
@@ -75,3 +80,12 @@ export const outlineResolveQuerySchema = z
 	.refine((query) => query.commit === undefined || query.space !== undefined, {
 		message: "commit needs space",
 	});
+
+/** One person's folding and mind-map direction of a page (`PUT /view-state/:pageId`). */
+export const outlineViewStatePutSchema = z.object({
+	// Block ids only: not free text (a reader may write this for every page they can read).
+	collapsed: z
+		.array(z.string().regex(OUTLINE_BLOCK_ID_RE).max(OUTLINE_VIEW_STATE_LIMITS.maxIdChars))
+		.max(OUTLINE_VIEW_STATE_LIMITS.maxCollapsed),
+	layout: z.enum(["right", "down"]),
+});

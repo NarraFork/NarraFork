@@ -14,7 +14,19 @@
  * `errno`) and cross the port as `WriteConflictError`.
  */
 import { WriteConflictError } from "@server/db/backend/write-port";
-import { and, asc, eq, gt, inArray, isNull, type SQL, sql } from "drizzle-orm";
+import {
+	and,
+	asc,
+	desc,
+	eq,
+	gt,
+	inArray,
+	isNull,
+	ne,
+	notInArray,
+	type SQL,
+	sql,
+} from "drizzle-orm";
 import { db } from "../../../db";
 import {
 	outlineBlocks,
@@ -23,6 +35,7 @@ import {
 	outlineLinks,
 	outlineLiveUpdates,
 	outlineSpaces,
+	outlineViewState,
 } from "../../../db/schema";
 import { withDbRetry } from "../../../lib/db-resilience";
 import { generateId } from "../../../lib/id";
@@ -46,6 +59,7 @@ import {
 	OutlineStaleWriteError,
 	type OutlineStore,
 	type OutlineVersionRow,
+	type OutlineViewStateRow,
 } from "./port";
 import { sqliteOutlineReads } from "./sqlite-read";
 
@@ -126,6 +140,18 @@ function toLiveUpdate(row: LiveUpdateSelect): OutlineLiveUpdateRow {
 }
 
 /** Rows per multi-row INSERT of the live log (7 columns each). */
+type ViewStateSelect = typeof outlineViewState.$inferSelect;
+
+function toViewState(row: ViewStateSelect): OutlineViewStateRow {
+	return {
+		userId: row.userId,
+		pageBlockId: row.pageBlockId,
+		collapsed: Array.isArray(row.collapsedJson) ? row.collapsedJson : [],
+		layout: row.layout === "down" ? "down" : "right",
+		updatedAt: row.updatedAt,
+	};
+}
+
 const LIVE_INSERT_CHUNK = 50;
 
 const metaColumns = {
@@ -572,6 +598,60 @@ export const sqliteOutlineStore: OutlineStore = {
 			.limit(options.limit)
 			.all();
 		return rows;
+	},
+
+	async getViewState(userId, pageBlockId) {
+		const row = db
+			.select()
+			.from(outlineViewState)
+			.where(
+				and(eq(outlineViewState.userId, userId), eq(outlineViewState.pageBlockId, pageBlockId)),
+			)
+			.limit(1)
+			.get();
+		return row ? toViewState(row) : null;
+	},
+
+	async putViewState(row, keepPerUser) {
+		await withDbRetry(
+			async () =>
+				db.transaction((tx) => {
+					tx.insert(outlineViewState)
+						.values({
+							userId: row.userId,
+							pageBlockId: row.pageBlockId,
+							collapsedJson: row.collapsed,
+							layout: row.layout,
+							updatedAt: row.updatedAt,
+						})
+						.onConflictDoUpdate({
+							target: [outlineViewState.userId, outlineViewState.pageBlockId],
+							set: { collapsedJson: row.collapsed, layout: row.layout, updatedAt: row.updatedAt },
+						})
+						.run();
+					// The person's oldest pages beyond the cap: their rows are found by the primary
+					// key's prefix, at most `keepPerUser + 2` of them.
+					tx.delete(outlineViewState)
+						.where(
+							and(
+								eq(outlineViewState.userId, row.userId),
+								// Never the page just written (a clock stepping back could make it the oldest).
+								ne(outlineViewState.pageBlockId, row.pageBlockId),
+								notInArray(
+									outlineViewState.pageBlockId,
+									tx
+										.select({ id: outlineViewState.pageBlockId })
+										.from(outlineViewState)
+										.where(eq(outlineViewState.userId, row.userId))
+										.orderBy(desc(outlineViewState.updatedAt), desc(outlineViewState.pageBlockId))
+										.limit(keepPerUser),
+								),
+							),
+						)
+						.run();
+				}),
+			{ label: "outline.putViewState", maxRetries: 3 },
+		);
 	},
 
 	async applyCommit(plan) {

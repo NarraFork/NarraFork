@@ -1,0 +1,312 @@
+/*
+ * The live editor's frame, where the outline and the mind map sit on top of each other
+ * (`edit-surface.ts`), and the mind map's nodes (`mindmap.ts`). Plain CSS under
+ * `.nf-outline-editor`, like the editor's own (`editor/editor.css`).
+ *
+ * How the hidden view is hidden decides frame times (the prototype's measurements): the outline
+ * behind the map is transparent and translated out of the frame (layout stays valid, painting is
+ * clipped), never `pointer-events` (inherited: restyles the whole outline) and never
+ * `content-visibility` (unlocking it repaints the whole page). A parked page view (a block is
+ * focused) skips layout and paint with `content-visibility: hidden`.
+ */
+
+.nf-outline-editor .nf-outline-frame {
+	position: relative;
+	flex: 1 1 auto;
+	min-height: 240px;
+	overflow: clip;
+	border-radius: var(--mantine-radius-sm);
+	/* The frame is a panel's scroll area: no browser scroll anchoring inside. */
+	overflow-anchor: none;
+}
+
+.nf-outline-editor .nf-outline-scroller {
+	position: absolute;
+	inset: 0;
+	overflow: auto;
+	overscroll-behavior: contain;
+	padding: 2px 4px 96px;
+	/* Its own compositing layer: showing and hiding change two composited values only. */
+	will-change: opacity, transform;
+}
+
+.nf-outline-editor .nf-outline-frame[data-view="map"] .nf-outline-scroller,
+.nf-outline-editor .nf-outline-frame.morphing .nf-outline-scroller {
+	opacity: 0;
+}
+
+.nf-outline-editor .nf-outline-frame[data-view="map"]:not(.morphing) .nf-outline-scroller {
+	transform: translateX(-30000px);
+}
+
+.nf-outline-editor .nf-outline-host.nf-outline-parked {
+	content-visibility: hidden;
+}
+
+/* The map shown since the page arrived: the outline behind it is out of layout until first shown. */
+.nf-outline-editor .nf-outline-scroller.nf-outline-cold {
+	display: none;
+}
+
+/* ── The map ─────────────────────────────────────────────────────────────── */
+
+.nf-outline-editor .mm-stage {
+	position: absolute;
+	inset: 0;
+	/* clip, not hidden: the stage must never be scrolled by the browser (focus, caret). */
+	overflow: clip;
+	visibility: hidden;
+	touch-action: none;
+	outline: none;
+	background: var(--mantine-color-body);
+	user-select: none;
+	-webkit-user-select: none;
+	font-family: var(--nf-mm-font);
+}
+
+.nf-outline-editor .mm-stage:focus-visible {
+	box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--ob-accent) 35%, transparent);
+}
+
+.nf-outline-editor .mm-stage.active,
+.nf-outline-editor .nf-outline-frame.morphing .mm-stage {
+	visibility: visible;
+}
+
+/* A switch's first frame: the stage takes keys and its nodes are drawn, still transparent. */
+.nf-outline-editor .mm-stage.pre {
+	visibility: visible;
+	opacity: 0;
+}
+
+.nf-outline-editor .mm-world {
+	position: absolute;
+	left: 0;
+	top: 0;
+	transform-origin: 0 0;
+}
+
+.nf-outline-editor .mm-edges {
+	position: absolute;
+	left: 0;
+	top: 0;
+	width: 1px;
+	height: 1px;
+	overflow: visible;
+	pointer-events: none;
+}
+
+.nf-outline-editor .mm-edges path {
+	fill: none;
+	stroke: var(--ob-muted);
+	stroke-opacity: 0.6;
+	stroke-width: 1.2;
+}
+
+.nf-outline-editor .mm-node {
+	position: absolute;
+	left: 0;
+	top: 0;
+	transform-origin: 0 0;
+	display: flex;
+	align-items: flex-start;
+	box-sizing: border-box;
+	padding: 4px 8px;
+	border: 1px solid var(--ob-line);
+	border-radius: 6px;
+	background: var(--mantine-color-body);
+	font-size: 15px;
+	line-height: 1.5;
+	font-family: var(--nf-mm-font);
+	white-space: normal;
+	overflow-wrap: break-word;
+	cursor: default;
+}
+
+.nf-outline-editor .mm-node > .ob-gutter {
+	position: static;
+	flex: none;
+	width: 28px;
+	height: 22.5px;
+}
+
+.nf-outline-editor .mm-node[data-task]:not([data-task=""]) > .ob-gutter {
+	width: 46px;
+}
+
+.nf-outline-editor .mm-node .ob-arrow,
+.nf-outline-editor .mm-node .ob-bullet {
+	width: 14px;
+}
+
+.nf-outline-editor .mm-node .mm-body {
+	flex: none;
+	min-width: 0;
+}
+
+.nf-outline-editor .mm-node .mm-body p,
+.nf-outline-editor .mm-node .mm-body h1,
+.nf-outline-editor .mm-node .mm-body h2,
+.nf-outline-editor .mm-node .mm-body h3,
+.nf-outline-editor .mm-node .mm-body blockquote,
+.nf-outline-editor .mm-node .mm-body pre,
+.nf-outline-editor .mm-node .mm-body table {
+	margin: 0;
+	min-height: 0;
+}
+
+.nf-outline-editor .mm-node .mm-body h1 {
+	font-size: 1.5em;
+	line-height: 1.5;
+}
+
+.nf-outline-editor .mm-node .mm-body h2 {
+	font-size: 1.25em;
+	line-height: 1.5;
+}
+
+.nf-outline-editor .mm-node .mm-body h3 {
+	font-size: 1.1em;
+	line-height: 1.5;
+}
+
+.nf-outline-editor .mm-node .mm-body code {
+	font-family: var(--nf-mm-mono);
+	font-size: 13px;
+}
+
+.nf-outline-editor .mm-node .mm-body pre {
+	font: 13px / 1.5 var(--nf-mm-mono);
+	white-space: pre;
+	overflow: hidden;
+	max-height: calc(6 * 19.5px + 8px);
+}
+
+.nf-outline-editor .mm-node .mm-body table {
+	table-layout: fixed;
+	width: 100%;
+	display: table;
+}
+
+.nf-outline-editor .mm-node .mm-body td {
+	white-space: nowrap;
+	overflow: hidden;
+	text-overflow: ellipsis;
+	min-width: 0;
+}
+
+.nf-outline-editor .mm-node .mm-body tr:nth-child(n + 7) {
+	display: none;
+}
+
+.nf-outline-editor .mm-node .mm-body .ob-embed {
+	height: 48px;
+	box-sizing: border-box;
+	overflow: hidden;
+	margin: 0;
+}
+
+.nf-outline-editor .mm-node.is-root {
+	background: color-mix(in srgb, var(--ob-accent) 8%, var(--mantine-color-body));
+}
+
+.nf-outline-editor .mm-node.is-root > .ob-gutter .ob-bullet::before {
+	content: "◎";
+}
+
+.nf-outline-editor .mm-node.sel {
+	border-color: var(--ob-accent);
+	box-shadow: 0 0 0 2px color-mix(in srgb, var(--ob-accent) 40%, transparent);
+}
+
+.nf-outline-editor .mm-node.msel {
+	background: color-mix(in srgb, var(--ob-accent) 16%, var(--mantine-color-body));
+}
+
+.nf-outline-editor .mm-node.editing {
+	width: max-content;
+	max-width: 330px;
+	z-index: 1;
+	user-select: text;
+	-webkit-user-select: text;
+}
+
+.nf-outline-editor .mm-node.editing .mm-body {
+	flex: 0 1 auto;
+	min-width: 8px;
+}
+
+.nf-outline-editor .mm-node.editing .ProseMirror {
+	min-height: 0;
+	padding-left: 0;
+	line-height: 1.5;
+}
+
+/* A node's editor shows one body: no frame, no title styling. */
+.nf-outline-editor .mm-node.editing .ProseMirror > .ob-block {
+	padding-left: 0;
+}
+
+.nf-outline-editor .mm-node.editing .ProseMirror > .ob-block > .ob-content > :first-child {
+	font-size: inherit;
+	font-weight: inherit;
+	margin-bottom: 0;
+}
+
+.nf-outline-editor .mm-node.dragging {
+	opacity: 0.75;
+	z-index: 2;
+	pointer-events: none;
+}
+
+.nf-outline-editor .mm-node.ob-peer {
+	box-shadow: inset 3px 0 0 var(--peer);
+}
+
+.nf-outline-editor .mm-more {
+	position: absolute;
+	right: -12px;
+	top: 50%;
+	transform: translateY(-50%);
+	font-size: 10px;
+	line-height: 14px;
+	padding: 0 4px;
+	border-radius: 7px;
+	background: var(--ob-accent);
+	color: #fff;
+}
+
+.nf-outline-editor .mm-more:empty {
+	display: none;
+}
+
+.nf-outline-editor .nf-outline-frame[data-layout="down"] .mm-more {
+	right: auto;
+	left: 50%;
+	top: auto;
+	bottom: -10px;
+	transform: translateX(-50%);
+}
+
+.nf-outline-editor .mm-node.mm-more-node {
+	justify-content: center;
+	color: var(--ob-muted);
+	border-style: dashed;
+	cursor: pointer;
+	font-size: 13px;
+}
+
+.nf-outline-editor .mm-drop {
+	position: absolute;
+	left: 0;
+	top: 0;
+	display: none;
+	pointer-events: none;
+	background: var(--ob-accent);
+	border-radius: 2px;
+}
+
+.nf-outline-editor .mm-drop[data-where="child"] {
+	background: color-mix(in srgb, var(--ob-accent) 15%, transparent);
+	outline: 2px dashed var(--ob-accent);
+}

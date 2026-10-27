@@ -10,7 +10,11 @@ import type { ReactNode } from "react";
 import { OutlineGate } from "./OutlineGate";
 import { OutlineHome } from "./OutlineHome";
 import { OutlineSpaceHome } from "./OutlineSpaceHome";
-import { OutlineSurface, type OutlineSurfaceLoaded } from "./OutlineSurface";
+import {
+	OutlineSurface,
+	type OutlineSurfaceHistory,
+	type OutlineSurfaceLoaded,
+} from "./OutlineSurface";
 import { type OutlineLinkRenderer, OutlineNavProvider, type OutlineTarget } from "./outline-nav";
 
 export interface OutlineViewProps {
@@ -27,6 +31,8 @@ export interface OutlineViewProps {
 	onMissing?: () => void;
 	/** The host's controls in the page's toolbar (or beside the space's badges). */
 	actions?: ReactNode;
+	/** The host's own back and forward (a dock panel's history; see `OutlineSurface`). */
+	history?: OutlineSurfaceHistory;
 }
 
 export function OutlineView({
@@ -39,6 +45,7 @@ export function OutlineView({
 	onSpaceLoaded,
 	onMissing,
 	actions,
+	history,
 }: OutlineViewProps) {
 	if (target.kind === "block") {
 		return (
@@ -54,6 +61,7 @@ export function OutlineView({
 				onLoaded={onLoaded}
 				onMissing={onMissing}
 				actions={actions}
+				history={history}
 			/>
 		);
 	}

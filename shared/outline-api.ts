@@ -152,6 +152,11 @@ export interface OutlineBlockViewResponse {
 	hiddenByView: number;
 	/** The page has more blocks than one read loads; some were left out. */
 	pageTruncated: boolean;
+	/**
+	 * Live blocks of the page, the page included, as the read counted them (at least this many
+	 * with `pageTruncated`): whether it can be edited live (PR8's limits) is known before joining.
+	 */
+	pageBlocks: number;
 }
 
 export interface OutlineCommitSummary {
@@ -266,4 +271,45 @@ export interface OutlineResolveResponse {
 	deleted: boolean;
 	/** Set for a commit: show the page as of this seq. */
 	asOf?: number;
+}
+
+/** The mind map's direction (design §6.10): rightward (the default) or downward. */
+export type OutlineMapLayout = "right" | "down";
+
+/**
+ * Limits of `GET/PUT /api/outline/view-state/:pageId`: one person's folding and mind-map
+ * direction of one page (design §7.1 `outline_view_state`). Folding is personal and never part
+ * of the block model; a page shows at most `maxCollapsed` blocks per view (design §7.2), so more
+ * folded ids than that are never needed.
+ */
+export const OUTLINE_VIEW_STATE_LIMITS = {
+	maxCollapsed: 2000,
+	/** Characters of one block id. */
+	maxIdChars: 64,
+	/**
+	 * Pages one person keeps a view state for: writing another drops the least recently written
+	 * (one bounded statement per write).
+	 */
+	maxPagesPerUser: 500,
+	/** Bytes of a PUT body. */
+	maxBodyBytes: 160 * 1024,
+	/** The client waits this long after the last change before writing. */
+	writeDebounceMs: 800,
+} as const;
+
+/** A block id as servers and clients make them (`generateId`, the live editor's ids). */
+export const OUTLINE_BLOCK_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
+
+/** One person's view state of one page; defaults when they never changed it. */
+export interface OutlineViewStateResponse {
+	pageId: string;
+	collapsed: string[];
+	layout: OutlineMapLayout;
+	/** When it was last written; null for the defaults. */
+	updatedAt: string | null;
+}
+
+export interface OutlineViewStatePutRequest {
+	collapsed: string[];
+	layout: OutlineMapLayout;
 }
