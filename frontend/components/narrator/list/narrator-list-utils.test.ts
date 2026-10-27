@@ -9,7 +9,11 @@
 
 import { describe, expect, test } from "bun:test";
 import type { NarratorListItem } from "./NarratorListCard";
-import { applyNarratorListEvent, type NarratorsInfiniteData } from "./narrator-list-utils";
+import {
+	applyNarratorListEvent,
+	isNarratorMutationPendingFor,
+	type NarratorsInfiniteData,
+} from "./narrator-list-utils";
 
 /** Minimal list row; the reducer only reads `id` unless it is patching. */
 function item(id: string, extra: Partial<NarratorListItem> = {}): NarratorListItem {
@@ -135,5 +139,16 @@ describe("applyNarratorListEvent — patching", () => {
 
 		expect(next?.pages[0].items.map((i) => i.id)).toEqual(["a", "b"]);
 		expect(next?.pages[0].items[0].status).toBe("idle");
+	});
+});
+
+describe("isNarratorMutationPendingFor", () => {
+	test("marks only the row that owns the pending mutation", () => {
+		const mutation = { isPending: true, variables: "narrator-a" };
+		expect(isNarratorMutationPendingFor(mutation, "narrator-a")).toBe(true);
+		expect(isNarratorMutationPendingFor(mutation, "narrator-b")).toBe(false);
+		expect(isNarratorMutationPendingFor({ ...mutation, isPending: false }, "narrator-a")).toBe(
+			false,
+		);
 	});
 });

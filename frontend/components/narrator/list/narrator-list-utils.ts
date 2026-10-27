@@ -98,6 +98,14 @@ export function filterNarratorsByLocalQuery<T extends NarratorListSearchable>(
 	);
 }
 
+/** A shared mutation observer may be pending, but only for the row that started it. */
+export function isNarratorMutationPendingFor(
+	mutation: { isPending: boolean; variables: unknown },
+	narratorId: string,
+): boolean {
+	return mutation.isPending && mutation.variables === narratorId;
+}
+
 export function useNarratorInfiniteScroll({
 	disabled,
 	hasNextPage,

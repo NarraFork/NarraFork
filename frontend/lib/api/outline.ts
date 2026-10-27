@@ -3,6 +3,7 @@ import type {
 	OutlineBlockHistoryResponse,
 	OutlineBlockViewResponse,
 	OutlinePageListResponse,
+	OutlineResolveResponse,
 	OutlineRevertResponse,
 	OutlineSearchResponse,
 	OutlineSpaceDetailResponse,
@@ -76,6 +77,9 @@ export const outlineApi = {
 		),
 	searchOutline: (params: { q: string; spaceId?: string; limit?: number }) =>
 		request<OutlineSearchResponse>(`/outline/search${query(params)}`),
+	/** Where a reference (`ref`, within `space` when bare) or a commit seq of `space` points. */
+	resolveOutline: (params: { ref?: string; space?: string; commit?: number }) =>
+		request<OutlineResolveResponse>(`/outline/resolve${query(params)}`),
 	revertOutlineCommit: (commitId: string) =>
 		request<OutlineRevertResponse>(`/outline/commits/${enc(commitId)}/revert`, {
 			method: "POST",

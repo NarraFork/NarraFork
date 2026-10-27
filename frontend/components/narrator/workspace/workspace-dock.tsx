@@ -36,6 +36,12 @@ import {
 	useMemo,
 	useSyncExternalStore,
 } from "react";
+import type { OutlineOpener, OutlineOpenOptions } from "../../../lib/outline-opener";
+import {
+	nextOutlinePanelId,
+	normalizeOutlinePanelState,
+	type OutlinePanelState,
+} from "../../../lib/outline-panel";
 import type { PluginContributionPick } from "../../plugins/PluginContributionPicker";
 import { buildPluginDockPanelOpenRequest } from "../../plugins/PluginContributionPicker";
 import type { PluginUiSessionContext } from "../../plugins/PluginUiSurfaceContext";
@@ -46,6 +52,7 @@ import {
 	resolveFilePanel,
 } from "../dock/dock-panel-types";
 import type { NarratorBrowserInfo, NarratorDockContextValue } from "../dock/NarratorDockContext";
+import { findOutlinePanel, navigateOutlinePanel } from "../dock/outline-dock";
 import type { MessageJumpOptions, ScrollToMessageFn } from "../message/message-list-handle";
 import type { NarratorDetailsPanelExternalProps } from "../narrator-panel-types";
 import { focusMessagePanel } from "../panels/focus-message-panel";
@@ -1027,6 +1034,39 @@ export class WorkspaceDockStore {
 		);
 	}
 
+	/**
+	 * Open an outline place for one narrator's cluster: the panel that already shows its page
+	 * (a member or another cluster's resource alike: one per space and page on the surface) is
+	 * navigated there and revealed; otherwise, or when a new panel is asked for, a new resource
+	 * of this narrator opens like a knowledge entry. False when the narrator has no cell here.
+	 */
+	openOutlinePanel(
+		hostNarratorId: string,
+		request: OutlinePanelState,
+		options: OutlineOpenOptions = {},
+		sourcePanelId?: string,
+	): boolean {
+		const api = this.apiRef.current;
+		if (!api || !this.narratorPanel(hostNarratorId)) return false;
+		const existing = options.newPanel ? undefined : findOutlinePanel(api.panels, request);
+		if (existing) {
+			navigateOutlinePanel(existing, request);
+			this.activateResource(existing);
+			return true;
+		}
+		this.openResource(
+			hostNarratorId,
+			{
+				id: nextOutlinePanelId(`woutline_${hostNarratorId}_`),
+				component: PANEL_COMPONENT.outline,
+				params: { panelType: "outline", hostNarratorId, ...normalizeOutlinePanelState(request) },
+				...(request.title ? { title: request.title } : {}),
+			},
+			sourcePanelId,
+		);
+		return true;
+	}
+
 	closeToolPanel(narratorId: string, type: NarratorToolPanelType) {
 		this.apiRef.current?.getPanel(workspaceToolPanelId(narratorId, type))?.api.close();
 	}
@@ -1064,6 +1104,11 @@ export function workspaceResourceOwner(params: WorkspacePanelParams | undefined)
 		params.panelType === "knowledge"
 	)
 		return params.hostNarratorId;
+	// An outline page is a resource when a session opened it, a member when added on its own.
+	if (params.panelType === "outline")
+		return "hostNarratorId" in params && typeof params.hostNarratorId === "string"
+			? params.hostNarratorId
+			: null;
 	if (params.panelType === "plugin" && params.binding?.kind === "workspace-narrator")
 		return params.binding.ownerNarratorId;
 	return null;
@@ -1239,4 +1284,25 @@ export function useWorkspaceNarratorDockValue(
 			...methods,
 		};
 	}, [store, methods, narratorId, shard]);
+}
+
+/**
+ * The outline opener of one narrator's cluster: places open as that narrator's resources (or in
+ * the panel already showing their page). Null outside a workspace surface.
+ */
+export function useWorkspaceOutlineOpener(
+	narratorId: string,
+	sourcePanelId?: string,
+): OutlineOpener | null {
+	const store = useWorkspaceDock();
+	return useMemo(
+		() =>
+			store && narratorId
+				? {
+						open: (state: OutlinePanelState, options?: OutlineOpenOptions) =>
+							store.openOutlinePanel(narratorId, state, options, sourcePanelId),
+					}
+				: null,
+		[store, narratorId, sourcePanelId],
+	);
 }

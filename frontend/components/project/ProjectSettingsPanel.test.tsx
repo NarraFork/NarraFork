@@ -8,7 +8,9 @@ import { renderToStaticMarkup } from "react-dom/server";
 let canManage = false;
 let projectUnavailable = false;
 let accessUnavailable = false;
+const reactI18next = await import("react-i18next");
 mock.module("react-i18next", () => ({
+	...reactI18next,
 	useTranslation: () => ({
 		t: (key: string, options?: { name?: string; path?: string }) =>
 			options?.name || options?.path ? `${key}:${options.name || options.path}` : key,

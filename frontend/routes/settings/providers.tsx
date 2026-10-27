@@ -1,5 +1,15 @@
 import { MOBILE_VIEWPORT_MEDIA_QUERY } from "@frontend/lib/responsive";
-import { Affix, Alert, Box, Button, Group, Loader, Stack, Title, Transition } from "@mantine/core";
+import {
+	Affix,
+	Alert,
+	Box,
+	Button,
+	Group,
+	Skeleton,
+	Stack,
+	Title,
+	Transition,
+} from "@mantine/core";
 import { useMediaQuery } from "@mantine/hooks";
 import { notifications } from "@mantine/notifications";
 import type { TokenDancePublicConnection } from "@shared/tokendance";
@@ -1127,7 +1137,28 @@ function SettingsProvidersPage() {
 	autoFetchAndFillRef.current = autoFetchAndFill;
 
 	if (isTokenDanceCallback) return <Outlet />;
-	if (isLoading) return <Loader />;
+	if (isLoading) {
+		return (
+			<Stack gap="md" p="md" aria-busy="true" data-testid="providers-settings-skeleton">
+				<Group justify="space-between">
+					<Title order={2}>{t(isAddingProvider ? "addProvider" : "providersTitle")}</Title>
+					{isAddingProvider && (
+						<Button
+							variant="subtle"
+							onClick={() =>
+								void navigate({ to: "/settings/providers", search: {}, replace: true })
+							}
+						>
+							{t("addProviderBack")}
+						</Button>
+					)}
+				</Group>
+				<Skeleton height={42} />
+				<Skeleton height={180} />
+				<Skeleton height={240} />
+			</Stack>
+		);
+	}
 
 	if (isAddingProvider) {
 		return (

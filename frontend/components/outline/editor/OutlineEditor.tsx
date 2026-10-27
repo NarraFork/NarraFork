@@ -3,10 +3,12 @@
  * (`live-client.ts`), an editor view rooted at the focused block (`view.ts`), who else is here,
  * and the notices a live page needs (connecting, offline, read only, deleted by someone else).
  *
- * The session lives per page and socket, not per mount: every editor of a page in this tab (the
- * outline page, dock panels) shares one session client, so one socket session and one undo stack
- * per person and page; moving the focus keeps it; it closes a little after the last editor of
- * the page unmounts. What is folded, selected and on screen is the surface's own (`viewState`).
+ * The session lives per page and socket, not per mount (`live-sessions.ts`): every editor of a
+ * page in this tab (the outline page, dock panels) shares one session client, so one socket
+ * session and one undo stack per person and page; moving the focus keeps it; it closes a little
+ * after the last editor of the page unmounts. A page the tab has no room for (the socket's
+ * session limit, every session in use) is not joined: the surface shows it read only and says
+ * why. What is folded, selected and on screen is the surface's own (`viewState`).
  * Keys are the editor's own (its ProseMirror keymap): nothing listens on the document, so a
  * composer next to the editor keeps its keys.
  */
@@ -17,69 +19,16 @@ import { useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import type { OutlineViewState } from "../view-state";
 import { chromeText } from "./chrome";
-import { LiveClient, type LiveTransport } from "./live-client";
+import type { LiveClient, LiveTransport } from "./live-client";
+import {
+	acquireLiveSession,
+	releaseLiveSession,
+	retainLiveSession,
+	type SharedLiveSession,
+} from "./live-sessions";
 import { liveTransport } from "./transport";
 import { type OutlineLens, OutlineView } from "./view";
 import "./editor.css";
-
-interface Shared {
-	client: LiveClient;
-	refs: number;
-	timer: ReturnType<typeof setTimeout> | null;
-	drop: () => void;
-}
-
-/** How long a page's session outlives its last editor (focus changes remount quickly). */
-const KEEP_MS = 5_000;
-const sessionsBySocket = new WeakMap<LiveTransport, Map<string, Shared>>();
-
-/**
- * The page's shared session client on this socket, created on first use. Rendering only looks
- * it up; mounted editors hold it (`retain`/`release`), and one nobody holds is dropped after
- * `KEEP_MS`, so a render that never mounts (or strict mode's extra one) leaks nothing.
- */
-function sharedClient(transport: LiveTransport, pageId: string, mode: "edit" | "view"): Shared {
-	let sessions = sessionsBySocket.get(transport);
-	if (!sessions) {
-		sessions = new Map();
-		sessionsBySocket.set(transport, sessions);
-	}
-	const key = `${pageId}\u0000${mode}`;
-	const existing = sessions.get(key);
-	if (existing && existing.client.status !== "closed") return existing;
-	if (existing) {
-		if (existing.timer) clearTimeout(existing.timer);
-		existing.client.dispose();
-	}
-	const map = sessions;
-	const shared: Shared = {
-		client: new LiveClient(transport, pageId, mode),
-		refs: 0,
-		timer: null,
-		drop: () => {
-			shared.timer = null;
-			if (shared.refs > 0) return;
-			shared.client.dispose();
-			if (map.get(key) === shared) map.delete(key);
-		},
-	};
-	map.set(key, shared);
-	shared.timer = setTimeout(shared.drop, KEEP_MS);
-	return shared;
-}
-
-function retain(shared: Shared): void {
-	if (shared.timer) clearTimeout(shared.timer);
-	shared.timer = null;
-	shared.refs++;
-}
-
-function release(shared: Shared): void {
-	shared.refs--;
-	if (shared.refs > 0) return;
-	if (shared.timer) clearTimeout(shared.timer);
-	shared.timer = setTimeout(shared.drop, KEEP_MS);
-}
 
 /** How long the editor waits for its first snapshot before the page shows the read-only view. */
 const CONNECT_TIMEOUT_MS = 8_000;
@@ -97,8 +46,11 @@ export interface OutlineEditorProps {
 	viewState: OutlineViewState;
 	/** Focus a block (the surface's host navigates). */
 	onFocus: (blockId: string) => void;
-	/** Live editing is not possible here; the page falls back to the read-only view. */
-	onUnavailable: (reason: LiveCloseCode | "timeout") => void;
+	/**
+	 * Live editing is not possible here; the page falls back to the read-only view. `tab_limit`:
+	 * this tab already has as many pages open live as its socket takes, all on screen.
+	 */
+	onUnavailable: (reason: OutlineLiveUnavailable) => void;
 	/** Blocks the facts view leaves out, for the page's hint. */
 	onHiddenChange?: (count: number) => void;
 	/** Tests: the transport to use instead of the narrator socket. */
@@ -107,16 +59,33 @@ export interface OutlineEditorProps {
 	onClient?: (client: LiveClient, view: () => OutlineView | null) => void;
 }
 
+/** Why a page shows read only instead of the live editor. */
+export type OutlineLiveUnavailable = LiveCloseCode | "timeout" | "tab_limit";
+
 export function OutlineEditor(props: OutlineEditorProps) {
-	const { pageId, focusId, canWrite, lens, spaceKey, viewState } = props;
-	const { t } = useTranslation("outline");
+	const { pageId, canWrite } = props;
 	const mode = canWrite ? "edit" : "view";
 	const transport = props.transport ?? liveTransport();
-	const shared = useMemo(() => sharedClient(transport, pageId, mode), [transport, pageId, mode]);
+	const shared = useMemo(
+		() => acquireLiveSession(transport, pageId, mode),
+		[transport, pageId, mode],
+	);
+	const onUnavailable = useRef(props.onUnavailable);
+	onUnavailable.current = props.onUnavailable;
+	useEffect(() => {
+		if (!shared) onUnavailable.current("tab_limit");
+	}, [shared]);
+	if (!shared) return null;
+	return <LiveOutlineEditor {...props} shared={shared} />;
+}
+
+function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSession }) {
+	const { focusId, lens, spaceKey, viewState, shared } = props;
+	const { t } = useTranslation("outline");
 	const client = shared.client;
 	useEffect(() => {
-		retain(shared);
-		return () => release(shared);
+		retainLiveSession(shared);
+		return () => releaseLiveSession(shared);
 	}, [shared]);
 	const [, rerender] = useReducer((n: number) => n + 1, 0);
 	const mount = useRef<HTMLDivElement | null>(null);

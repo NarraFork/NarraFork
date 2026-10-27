@@ -17,6 +17,7 @@ import {
 	buildNarratorListQueryOptions,
 	filterNarratorsByLocalQuery,
 	getNarratorListState,
+	isNarratorMutationPendingFor,
 	type NarratorListSearchParams,
 	normalizeNarratorListSearchPatch,
 	useNarratorInfiniteScroll,
@@ -164,7 +165,7 @@ function ArchivedNarratorsPage() {
 							narrator={narrator}
 							localQuery={localQuery}
 							defaultModelValue={defaultModelValue}
-							unarchiveLoading={unarchiveNarrator.isPending}
+							unarchiveLoading={isNarratorMutationPendingFor(unarchiveNarrator, narrator.id)}
 							deleteSupported={deleteSupported}
 							deleteUnsupportedReason={deleteUnsupportedReason}
 							onUnarchive={(narratorId) => unarchiveNarrator.mutate(narratorId)}

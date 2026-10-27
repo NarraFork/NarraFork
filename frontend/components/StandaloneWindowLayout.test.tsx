@@ -18,6 +18,7 @@ let cleared = 0;
 let retries = 0;
 let shellMounts = 0;
 let appearanceCalls = 0;
+let namespacePromise: Promise<void> = Promise.resolve();
 let auth = {
 	data: { id: "user" } as { id: string } | undefined,
 	isLoading: false,
@@ -41,6 +42,11 @@ mock.module("../hooks/useAuth", () => ({
 			retries++;
 		},
 	}),
+}));
+const i18nModule = await import("../lib/i18n");
+mock.module("../lib/i18n", () => ({
+	...i18nModule,
+	ensureI18nNamespaces: () => namespacePromise,
 }));
 mock.module("../hooks/useUserPreferences", () => ({
 	useUserPreferences: () => ({ data: undefined }),
@@ -105,6 +111,7 @@ beforeEach(() => {
 		Object.defineProperty(globalThis, key, { configurable: true, writable: true, value });
 	}
 	token = "test-token";
+	namespacePromise = Promise.resolve();
 	cleared = retries = shellMounts = appearanceCalls = 0;
 	auth = {
 		data: { id: "user" },
@@ -211,6 +218,20 @@ test("private window renders only target and cleans up viewport ownership", asyn
 	root.unmount();
 	expect(document.documentElement.hasAttribute("data-nf-authenticated-app-shell")).toBe(false);
 	root = createRoot(container);
+});
+
+test("slow translations keep window chrome mounted without exposing panel content", async () => {
+	let resolveNamespaces!: () => void;
+	namespacePromise = new Promise<void>((resolve) => {
+		resolveNamespaces = resolve;
+	});
+	await render("/windows/target");
+	await waitFor(() => !!container.querySelector("[data-standalone-window]"));
+	expect(container.querySelector(".nf-wco-window-strip")).not.toBeNull();
+	expect(container.querySelector("[data-target]")).toBeNull();
+	resolveNamespaces();
+	await waitFor(() => !!container.querySelector("[data-target]"));
+	expect(container.querySelector("[data-standalone-window]")).not.toBeNull();
 });
 
 test("ordinary pages still mount navigation", async () => {

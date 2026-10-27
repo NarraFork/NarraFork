@@ -22,7 +22,7 @@ import {
 } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
-import { lazy, Suspense, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { loadedHumanAttentionItems, useHumanAttention } from "../../hooks/useHumanAttention";
 import { api } from "../../lib/api";
@@ -30,6 +30,10 @@ import { formatSmartTime } from "../../lib/format";
 import { getEffectiveNarratorDisplay } from "../../lib/status-registry";
 import { subagentRecentCallSummary, traceRowTitle } from "../narrator/tool-call/tool-display";
 import { NarratorStatusIcon } from "../nav/NarratorStatusIcon";
+import {
+	NotificationCenterLazyDrawer,
+	preloadNotificationCenterDrawer,
+} from "../notifications/NotificationCenterLazyDrawer";
 import type { ActivityToolRow, NarratorActivity } from "./dashboard-activity";
 import {
 	buildDashboardSessions,
@@ -38,12 +42,6 @@ import {
 	directoryLabel,
 } from "./dashboard-sessions";
 import { useNarratorActivity } from "./useNarratorActivity";
-
-const NotificationCenterDrawer = lazy(() =>
-	import("../notifications/NotificationCenterDrawer").then((m) => ({
-		default: m.NotificationCenterDrawer,
-	})),
-);
 
 const SESSIONS_QUERY_GC_TIME_MS = 30_000;
 const LIVE_REFETCH_INTERVAL_MS = 15_000;
@@ -154,7 +152,14 @@ export function DashboardSessions({ data }: { data: ReturnType<typeof useDashboa
 					count={groups.attention.length}
 					more={attention.hasNextPage}
 					action={
-						<Button size="compact-sm" variant="subtle" onClick={() => setInboxOpened(true)}>
+						<Button
+							size="compact-sm"
+							variant="subtle"
+							onPointerEnter={preloadNotificationCenterDrawer}
+							onFocus={preloadNotificationCenterDrawer}
+							onPointerDown={preloadNotificationCenterDrawer}
+							onClick={() => setInboxOpened(true)}
+						>
 							{t("openInbox")}
 						</Button>
 					}
@@ -200,15 +205,11 @@ export function DashboardSessions({ data }: { data: ReturnType<typeof useDashboa
 				</Section>
 			)}
 
-			{inboxOpened && (
-				<Suspense fallback={null}>
-					<NotificationCenterDrawer
-						opened
-						onClose={() => setInboxOpened(false)}
-						initialTab="attention"
-					/>
-				</Suspense>
-			)}
+			<NotificationCenterLazyDrawer
+				opened={inboxOpened}
+				onClose={() => setInboxOpened(false)}
+				initialTab="attention"
+			/>
 		</Stack>
 	);
 }

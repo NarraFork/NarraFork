@@ -2925,6 +2925,76 @@ describe("classifyToolDetail — outline", () => {
 			].join("\n"),
 		);
 		expect((sectionBody(d, "result") as ToolCappedDetail).text).toBe("Committed #4 to Kx81mPqa");
-		expect(metaBadgeLabels(d)).toEqual(["Kx81mPqa", "commit #4"]);
+		// The commit is a link to the page it changed (as of the commit), not a badge.
+		expect(metaBadgeLabels(d)).toEqual(["Kx81mPqa"]);
+		expect(metaTexts(d)).toEqual(["commit #4"]);
+		expect(metaRowsOf(d).rows.find((row) => row.text === "commit #4")?.href).toBe(
+			"/outline/ref?space=Kx81mPqa&commit=4",
+		);
+	});
+
+	it("links an OutlineEdit's targets to the blocks it changed or created", () => {
+		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
+			toolName: "OutlineEdit",
+			category: "outline",
+			inputJson: {
+				edits: [
+					{ add: "/", markdown: "- new" },
+					{ set: "Ab3dEf9Q", checkbox: "x" },
+					{ delete: "Q1" },
+				],
+			},
+			outputJson: "Committed #5",
+			metadata: {
+				space: { key: "Kx81mPqa" },
+				commit: { id: "c2", seq: 5 },
+				edits: [
+					{ op: "add", created: ["Kx81mPqa/Nw1Blk00"] },
+					{ op: "set", address: "Kx81mPqa/Ab3dEf9Q" },
+					{ op: "delete", address: "Kx81mPqa/Qq1Sid00" },
+				],
+			},
+		});
+		const input = sectionBody(d, "input") as ToolCappedDetail;
+		expect(input.text).toBe(
+			[
+				"**add** [/](/outline/ref?a=Kx81mPqa%2FNw1Blk00)",
+				"",
+				"- new",
+				"",
+				'**set** [Ab3dEf9Q](/outline/ref?a=Kx81mPqa%2FAb3dEf9Q): checkbox "x"',
+				"**delete** [Q1](/outline/ref?a=Kx81mPqa%2FQq1Sid00)",
+			].join("\n"),
+		);
+	});
+
+	it("links OutlineRead's address and each OutlineSearch hit, but not a space read", () => {
+		const read = classifyToolDetail({
+			previewId: "classifier-fixture",
+			toolName: "OutlineRead",
+			category: "outline",
+			outputJson: "- [Ab3dEf9Q] Auth",
+			metadata: { address: "Kx81mPqa/Ab3dEf9Q", space: { key: "Kx81mPqa" } },
+		});
+		expect(metaRowsOf(read).rows[0]?.href).toBe("/outline/ref?a=Kx81mPqa%2FAb3dEf9Q");
+		const spaceRead = classifyToolDetail({
+			previewId: "classifier-fixture",
+			toolName: "OutlineRead",
+			category: "outline",
+			outputJson: "pages",
+			metadata: { address: "Kx81mPqa/", space: { key: "Kx81mPqa" } },
+		});
+		expect(metaRowsOf(spaceRead).rows[0]?.href).toBeUndefined();
+		const search = bodyOfKind(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "OutlineSearch",
+				category: "outline",
+				metadata: { results: [{ address: "Kx81mPqa/Ab3dEf9Q", title: "Auth" }] },
+			}),
+			"structured",
+		);
+		expect(search.entries?.[0]?.href).toBe("/outline/ref?a=Kx81mPqa%2FAb3dEf9Q");
 	});
 });

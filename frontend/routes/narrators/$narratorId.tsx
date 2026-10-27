@@ -17,6 +17,7 @@ import { NarratorPanelSkeleton } from "../../components/narrator/NarratorPanelSk
 import { serializeSeedEnvelope } from "../../components/narrator/panels/layout-envelope";
 import { twoNarratorWorkspaceSeed } from "../../components/narrator/workspace/dockview-layout";
 import { readOpeningLod } from "../../hooks/useNarratorLod";
+import { lazyWithRetry } from "../../lib/lazy-with-retry";
 import { narratorLoadingMetrics } from "../../lib/narrator-loading-metrics";
 import { clearShikiTokenCache } from "../../lib/shiki-token-cache";
 
@@ -31,7 +32,7 @@ const SpecPanel = lazy(() =>
 		default: m.SpecPanel,
 	})),
 );
-const NarratorPanel = lazy(() =>
+const NarratorPanel = lazyWithRetry(() =>
 	import("../../components/narrator/NarratorPanel").then((m) => ({
 		default: memo(m.NarratorPanel),
 	})),

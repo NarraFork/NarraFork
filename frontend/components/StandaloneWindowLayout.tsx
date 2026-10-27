@@ -1,7 +1,14 @@
 import { Alert, Button, Center, Loader, Stack } from "@mantine/core";
 import { resolveBranding } from "@shared/branding";
 import { Navigate, Outlet, useRouterState } from "@tanstack/react-router";
-import { createContext, useContext, useEffect, useState, useSyncExternalStore } from "react";
+import {
+	createContext,
+	Suspense,
+	useContext,
+	useEffect,
+	useState,
+	useSyncExternalStore,
+} from "react";
 import { useTranslation } from "react-i18next";
 import { useAuthenticatedAppearance } from "../hooks/useAuthenticatedAppearance";
 import { useAuthenticatedSession } from "../hooks/useAuthenticatedSession";
@@ -9,10 +16,12 @@ import { useUserPreferences } from "../hooks/useUserPreferences";
 import { clearToken } from "../lib/api";
 import { useBrowserLayoutEffect } from "../lib/app-shell-scroll";
 import { getCurrentBranding, onBrandingChange } from "../lib/branding";
+import { getNamespacesForPath } from "../lib/i18n";
 import { installAppViewportTracking, installAuthenticatedAppShellRootLock } from "../lib/safe-area";
 import { isStandaloneWindowPath } from "../lib/standalone-window";
 import { installThemeColorSync } from "../lib/theme-color-sync";
 import { installWcoTracking } from "../lib/wco";
+import { I18nNamespaceGate } from "./common/I18nNamespaceGate";
 import classes from "./StandaloneWindowLayout.module.css";
 
 /**
@@ -79,6 +88,7 @@ export function StandaloneWindowLayout() {
 
 function StandaloneWindowContent() {
 	const { data: prefs } = useUserPreferences();
+	const pathname = useRouterState({ select: (state) => state.location.pathname });
 	// Read the branded name from the module store instead of useBranding(): the
 	// standalone layout is mounted without the main app's QueryClient, and the boot
 	// script already applied the last known branding before React attaches.
@@ -118,7 +128,17 @@ function StandaloneWindowContent() {
 				<div className="nf-wco-window-strip" aria-hidden>
 					<span className="nf-wco-window-strip-title">{windowTitle ?? brandName}</span>
 				</div>
-				<Outlet />
+				<Suspense
+					fallback={
+						<Center h="100%">
+							<Loader />
+						</Center>
+					}
+				>
+					<I18nNamespaceGate namespaces={getNamespacesForPath(pathname)}>
+						<Outlet />
+					</I18nNamespaceGate>
+				</Suspense>
 			</main>
 		</WindowTitleSetterContext.Provider>
 	);

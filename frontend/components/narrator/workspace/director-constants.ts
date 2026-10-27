@@ -55,6 +55,7 @@ export function isDirectorRenderablePanel(params: WorkspacePanelParams): boolean
 		params.panelType === "narrator" ||
 		params.panelType === "terminal" ||
 		params.panelType === "webview" ||
+		params.panelType === "outline" ||
 		params.panelType === "plugin"
 	);
 }

@@ -40,6 +40,7 @@ import { useNarrator } from "../../../hooks/useNarrator";
 import { addSubagentRecentTab, shouldAddSubagentRecentTab } from "../../../hooks/useRecentTabs";
 import { useUserPreferences } from "../../../hooks/useUserPreferences";
 import { NARRATOR_STATUS_COLORS } from "../../../lib/constants";
+import { lazyWithRetry } from "../../../lib/lazy-with-retry";
 import type { PluginDockPanelProps } from "../../plugins/types";
 import { FileReferenceScopeProvider } from "../composer/FileReferenceScope";
 import {
@@ -62,11 +63,12 @@ import { toolEditReferenceKey } from "../tool-call/tool-edit-reference";
 import type { NarratorDockPanelType } from "./dock-panel-types";
 import { FocusChatSlot } from "./FocusChatHost";
 import { NarratorDockContext, useNarratorDockContext } from "./NarratorDockContext";
+import { OutlineDockPanel } from "./OutlineDockPanel";
 
 const NarratorTerminal = lazy(() =>
 	import("../../terminal/NarratorTerminal").then((m) => ({ default: m.NarratorTerminal })),
 );
-const NarratorPanel = lazy(() =>
+const NarratorPanel = lazyWithRetry(() =>
 	import("../NarratorPanel").then((m) => ({ default: m.NarratorPanel })),
 );
 const NarratorDetailsPanel = lazy(() =>
@@ -1169,6 +1171,7 @@ export const narratorDockComponents: Record<
 	filetree: FileTreeDockPanel,
 	file: FileDockPanel,
 	knowledge: KnowledgeDockPanel,
+	outline: OutlineDockPanel,
 	plugin: PluginDockPanel,
 	// TEMPORARY (see ../mock/README-REMOVAL.md).
 	mock: MockDockPanel,

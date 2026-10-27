@@ -66,7 +66,7 @@ export interface CreateNarratorResult {
 	status: string;
 }
 
-interface CreateNarratorModalProps {
+export interface CreateNarratorModalProps {
 	opened: boolean;
 	onClose: () => void;
 	onCreated?: (narrator: CreateNarratorResult) => void;
@@ -155,7 +155,7 @@ function SortableFavoriteItem({
 	);
 }
 
-export function CreateNarratorModal({
+export function CreateNarratorModalBody({
 	opened,
 	onClose,
 	onCreated,
@@ -413,8 +413,7 @@ export function CreateNarratorModal({
 		);
 	};
 
-	const handleClose = () => {
-		onClose();
+	const resetForm = useCallback(() => {
 		setCwd("");
 		setSelectedModel("");
 		// Reset to "follow settings" — not a hard false preference. The next open
@@ -428,7 +427,17 @@ export function CreateNarratorModal({
 		setHandle("");
 		setSessionTitle("");
 		setGitIdentityId(FOLLOW_DEFAULT_GIT_IDENTITY);
+	}, []);
+
+	const handleClose = () => {
+		onClose();
+		resetForm();
 	};
+
+	// The shell may close from its own title bar, bypassing the body's cancel button.
+	useEffect(() => {
+		if (!opened) resetForm();
+	}, [opened, resetForm]);
 
 	// Wide screens get a two-column layout: the left column is dedicated entirely to
 	// directory + favorites, the right column holds model/session options.
@@ -672,20 +681,7 @@ export function CreateNarratorModal({
 	);
 
 	return (
-		<Modal
-			opened={opened}
-			onClose={handleClose}
-			title={t("newNarratorModal")}
-			size={isWide ? 880 : "md"}
-			styles={{
-				body: {
-					maxHeight: "85vh",
-					display: "flex",
-					flexDirection: "column",
-					overflow: "hidden",
-				},
-			}}
-		>
+		<>
 			{isWide ? (
 				// Two columns: left dedicated to directory + favorites, right to options.
 				// Use an explicit viewport height (not a flex chain through Modal body, which
@@ -742,6 +738,30 @@ export function CreateNarratorModal({
 					{t("createNarrator")}
 				</Button>
 			</Group>
+		</>
+	);
+}
+
+/** Compatibility wrapper for callers that still own the Mantine modal. */
+export function CreateNarratorModal(props: CreateNarratorModalProps) {
+	const { t } = useTranslation("narrators");
+	const isWide = useMediaQuery("(min-width: 62em)") ?? false;
+	return (
+		<Modal
+			opened={props.opened}
+			onClose={props.onClose}
+			title={t("newNarratorModal")}
+			size={isWide ? 880 : "md"}
+			styles={{
+				body: {
+					maxHeight: "85vh",
+					display: "flex",
+					flexDirection: "column",
+					overflow: "hidden",
+				},
+			}}
+		>
+			<CreateNarratorModalBody {...props} />
 		</Modal>
 	);
 }

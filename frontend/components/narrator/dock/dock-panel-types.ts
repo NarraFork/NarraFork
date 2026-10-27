@@ -12,6 +12,7 @@ import {
 	type FilePanelParams,
 	type KnowledgePanelParams,
 	type NarratorBoundPanelParams,
+	type OutlinePanelParams,
 	PANEL_COMPONENT,
 	PANEL_DEFAULT_TITLE,
 	type PanelKind,
@@ -33,6 +34,7 @@ export type NarratorDockPanelParams =
 	| SubagentPanelParams
 	| FilePanelParams
 	| KnowledgePanelParams
+	| OutlinePanelParams
 	| PluginDockPanelParams;
 
 /** Dockview component registry name for each panel type (kept === the type). */
@@ -51,13 +53,14 @@ export const NARRATOR_DOCK_COMPONENT: Record<NarratorDockPanelType, string> = {
 	subagent: PANEL_COMPONENT.subagent,
 	file: PANEL_COMPONENT.file,
 	knowledge: PANEL_COMPONENT.knowledge,
+	outline: PANEL_COMPONENT.outline,
 	plugin: PANEL_COMPONENT.plugin,
 	mock: PANEL_COMPONENT.mock,
 };
 
 /** Stable dockview panel id for a singleton panel type within one narrator surface. */
 export function dockPanelId(
-	type: Exclude<NarratorDockPanelType, "subagent" | "file" | "knowledge">,
+	type: Exclude<NarratorDockPanelType, "subagent" | "file" | "knowledge" | "outline">,
 ): string {
 	return sharedDockPanelId(type);
 }
@@ -170,6 +173,13 @@ export function knowledgeDockPanelId(entryId: string): string {
 	return `ndock-knowledge-${entryId}`;
 }
 
+/**
+ * Prefix of outline panel ids in the focus dock. Outline panels are multi-instance and several
+ * may show one page (Ctrl/Cmd-click), so each id is fresh (`nextOutlinePanelId`); which panel a
+ * request opens in is decided from the params (`isSameOutlinePanel`), not from the id.
+ */
+export const OUTLINE_DOCK_PANEL_PREFIX = "ndock-outline-";
+
 /** Human-facing default title per panel type (i18n applied at render time). */
 export const NARRATOR_DOCK_DEFAULT_TITLE: Record<NarratorDockPanelType, string> = {
 	chat: PANEL_DEFAULT_TITLE.chat,
@@ -186,6 +196,7 @@ export const NARRATOR_DOCK_DEFAULT_TITLE: Record<NarratorDockPanelType, string> 
 	subagent: PANEL_DEFAULT_TITLE.subagent,
 	file: PANEL_DEFAULT_TITLE.file,
 	knowledge: PANEL_DEFAULT_TITLE.knowledge,
+	outline: PANEL_DEFAULT_TITLE.outline,
 	plugin: PANEL_DEFAULT_TITLE.plugin,
 	mock: PANEL_DEFAULT_TITLE.mock,
 };

@@ -104,6 +104,12 @@ import {
 	formatFullLocaleDateTime,
 } from "../../lib/format";
 import { knowledgePersonalEntryDestination } from "../../lib/knowledge-review-nav";
+import {
+	type OutlineOpener,
+	OutlineOpenerProvider,
+	useOutlineOpener,
+} from "../../lib/outline-opener";
+import type { OutlinePanelState } from "../../lib/outline-panel";
 import { formatProviderBalance } from "../../lib/provider-balance-format";
 import {
 	formatRevertFailure,
@@ -197,6 +203,7 @@ import { NarratorMessageListSkeleton } from "./NarratorMessageListSkeleton";
 import { NarratorPanelSkeleton } from "./NarratorPanelSkeleton";
 import type { NarratorPanelProps } from "./narrator-panel-types";
 import { useNarratorPanelVisible } from "./narrator-panel-visibility";
+import { OutlineDrawerHost } from "./OutlineDrawerHost";
 import {
 	createResponsiveNarratorPanel,
 	NarratorPanelCompactContext,
@@ -1986,12 +1993,34 @@ function NarratorPanelBody({
 	const compatibilityProjectId = workspaceContext?.contextProjectId ?? projectId;
 	/** Stable identity so HeaderToolbar's memo is not busted every render. */
 	const openCompatibility = useCallback(() => setCompatibilityOpen(true), []);
-	/** The session's outline space, offered in the overflow menu while the outline is on. */
+	/**
+	 * Outline places this session opens (its menu, its tool cards' addresses and commits, links in
+	 * its messages): in the surrounding dock when there is one (the session page's side dock, the
+	 * workspace cluster, the outline page), else in this panel's own drawer (a phone, a detached
+	 * window). Null while the outline is off, so nothing is intercepted and no entry is shown.
+	 */
 	const outlineEnabled = useOutlineEnabled().enabled;
+	const hostOutlineOpener = useOutlineOpener();
+	const [outlineDrawer, setOutlineDrawer] = useState<OutlinePanelState | null>(null);
+	const outlineOpener = useMemo<OutlineOpener | null>(
+		() =>
+			outlineEnabled && !isWorkspacePreview
+				? {
+						open: (state, options) => {
+							if (hostOutlineOpener?.open(state, options)) return true;
+							setOutlineDrawer(state);
+							return true;
+						},
+					}
+				: null,
+		[outlineEnabled, isWorkspacePreview, hostOutlineOpener],
+	);
+	/** The session's outline space, offered in the overflow menu while the outline is on. */
 	const { open: openOutlineSpace } = useOpenOutlineSpace({
 		onMissing: () => notifications.show({ color: "gray", message: t("outlineNotCreated") }),
 		onError: (error) =>
 			notifications.show({ color: "red", message: describeApiError(error, t).message }),
+		onOpen: (space) => outlineOpener?.open({ spaceId: space.id }),
 	});
 	const openOutline = useCallback(
 		() => openOutlineSpace("narrator", narratorId),
@@ -3079,7 +3108,7 @@ function NarratorPanelBody({
 		renderLod,
 	].join(":");
 
-	return (
+	const body = (
 		<PermEnterHintCtx.Provider value={permEnterHintCtxValue}>
 			<ContentViewerEnvironmentProvider
 				value={contentViewerEnvironment}
@@ -3841,6 +3870,18 @@ function NarratorPanelBody({
 							</Suspense>
 						</Drawer>
 					)}
+					{/* The outline's off-dock host: opened only when no dock took the place. */}
+					{outlineDrawer && (
+						<OutlineDrawerHost
+							state={outlineDrawer}
+							onChange={setOutlineDrawer}
+							onClose={() => setOutlineDrawer(null)}
+							onOpenSession={(sessionId) => {
+								setOutlineDrawer(null);
+								handleVlistViewSubagentSession(sessionId);
+							}}
+						/>
+					)}
 					{/*
 					 * Off-dock hosts for the entries that previously had NO mobile entry
 					 * point. Mounted only when this panel has no dock to put panels in, so
@@ -3911,4 +3952,5 @@ function NarratorPanelBody({
 			/>
 		</PermEnterHintCtx.Provider>
 	);
+	return <OutlineOpenerProvider value={outlineOpener}>{body}</OutlineOpenerProvider>;
 }

@@ -194,6 +194,7 @@ let warnings: Array<{ color?: string; title?: unknown }>;
 let saveError: Error | undefined;
 let refreshError: Error | undefined;
 let saveGate: Promise<void> | undefined;
+let settingsGate: Promise<void> | undefined;
 let persistBeforeError = false;
 const freshModels = [{ id: "fresh-model", name: "Fresh model" }];
 const clone = <T,>(value: T): T => JSON.parse(JSON.stringify(value));
@@ -261,6 +262,7 @@ beforeEach(() => {
 	saveError = undefined;
 	refreshError = undefined;
 	saveGate = undefined;
+	settingsGate = undefined;
 	persistBeforeError = false;
 	// Fail closed: every network operation used by the real fixture must be mocked.
 	const fetchSpy = spyOn(globalThis, "fetch").mockImplementation((async () => {
@@ -291,6 +293,7 @@ beforeEach(() => {
 	} as unknown as ReturnType<typeof models.useAllModels>);
 	const getSpy = spyOn(api, "getSettings").mockImplementation(async (options) => {
 		requestOptions.push(options);
+		if (settingsGate) await settingsGate;
 		return clone(serverSettings);
 	});
 	const saveSpy = spyOn(api, "updateSettings").mockImplementation(async (payload, options) => {
@@ -1258,6 +1261,29 @@ describe("provider add nested route", () => {
 			(savedPayloads.at(-1)?.agent as { disabledProviders?: string[] }).disabledProviders,
 		).toContain("codex");
 		expect(cardIndex("codex")).toBeGreaterThan(cardIndex("CommandCode"));
+	});
+
+	test("slow settings keep the add-page title and back navigation visible", async () => {
+		let release!: () => void;
+		settingsGate = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		queryClient.removeQueries({ queryKey: ["admin", "settings"] });
+		await mount("/settings/providers/add");
+		expect(container.querySelector('[data-testid="providers-settings-skeleton"]')).not.toBeNull();
+		expect(container.textContent).toContain(text("addProvider"));
+		expect(button("addProviderBack")).toBeDefined();
+		expect(container.textContent).not.toContain(text("addProviderContinue"));
+
+		await act(async () => {
+			release();
+			await settingsGate;
+		});
+		await act(async () => {
+			await new Promise((resolve) => setTimeout(resolve, 0));
+		});
+		expect(container.querySelector('[data-testid="providers-settings-skeleton"]')).toBeNull();
+		expect(button("addProviderCancel")).toBeDefined();
 	});
 
 	test("direct entry to add initializes the parent and cancellation returns to providers", async () => {

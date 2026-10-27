@@ -109,14 +109,16 @@ describe("membership panels cannot be created without a row", () => {
 describe("plugin panels are resources, not membership", () => {
 	// A workspace plugin panel binds to an owning narrator, so no row is ever created for
 	// it. Listing it as a membership kind made the sync close every live plugin panel.
+	// `outline` joined the vocabulary as a member kind (an outline page added on its own);
+	// plugin stays out.
 	it("the shared vocabulary excludes plugin", () => {
 		expect(sharedVocabulary()).toContain(
-			'export const WORKSPACE_PANEL_KINDS = ["narrator", "terminal", "webview"] as const',
+			'export const WORKSPACE_PANEL_KINDS = ["narrator", "terminal", "webview", "outline"] as const',
 		);
 	});
 
 	it("the create schema rejects plugin", () => {
-		expect(panelValidators()).toContain('kind: z.enum(["terminal", "webview"])');
+		expect(panelValidators()).toContain('kind: z.enum(["terminal", "webview", "outline"])');
 	});
 
 	// `isDirectorRenderablePanel` includes plugin, so the sync must NOT use it to decide

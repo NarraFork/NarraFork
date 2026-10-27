@@ -70,6 +70,7 @@ import {
 	useBrowserLayoutEffect,
 } from "../lib/app-shell-scroll";
 import { APP_HISTORY_SENTINEL, pushHistorySentinel } from "../lib/history-state";
+import { getNamespacesForPath } from "../lib/i18n";
 import { narratorWSManager } from "../lib/narrator-ws-manager";
 import {
 	APP_SHELL_CLASSNAME,
@@ -90,8 +91,14 @@ import {
 import { installThemeColorSync } from "../lib/theme-color-sync";
 import { installWcoTracking } from "../lib/wco";
 import { BrandTitle } from "./common/BrandTitle";
+import { I18nNamespaceGate } from "./common/I18nNamespaceGate";
 import { LazyOverlayBoundary } from "./common/LazyOverlayBoundary";
+import { RoutePendingIndicator } from "./common/RouteChunkErrorBoundary";
 import { GitMissingAlert } from "./GitMissingAlert";
+import {
+	CreateNarratorLazyModal,
+	preloadCreateNarratorModal,
+} from "./narrator/CreateNarratorLazyModal";
 import type { CreateNarratorResult } from "./narrator/CreateNarratorModal";
 import { HeaderPullToRefresh } from "./nav/HeaderPullToRefresh";
 import { HeaderSearchBox } from "./nav/HeaderSearchBox";
@@ -114,12 +121,6 @@ import { TokenDanceRecoveryHost } from "./settings/TokenDanceRecoveryHost";
 import { UpdateBadge } from "./UpdateBadge";
 import { VersionUpdateBanner } from "./VersionUpdateBanner";
 import { WSConnectionAlert } from "./WSConnectionAlert";
-
-const CreateNarratorModal = lazy(() =>
-	import("./narrator/CreateNarratorModal").then((m) => ({
-		default: m.CreateNarratorModal,
-	})),
-);
 
 const SetupWizard = lazy(() =>
 	import("./settings/SetupWizard").then((m) => ({
@@ -359,6 +360,7 @@ export function AuthenticatedLayout() {
 	const [createNarratorOpened, setCreateNarratorOpened] = useState(false);
 	const requireSetup = useSetupWizardGuard();
 	const openCreateNarrator = useCallback(() => {
+		preloadCreateNarratorModal();
 		if (!requireSetup()) return;
 		setCreateNarratorOpened(true);
 	}, [requireSetup]);
@@ -705,6 +707,9 @@ export function AuthenticatedLayout() {
 														size={28}
 														variant="subtle"
 														color="gray"
+														onPointerEnter={preloadCreateNarratorModal}
+														onFocus={preloadCreateNarratorModal}
+														onPointerDown={preloadCreateNarratorModal}
 														onClick={(e: React.MouseEvent) => {
 															e.preventDefault();
 															e.stopPropagation();
@@ -862,7 +867,11 @@ export function AuthenticatedLayout() {
 				 */}
 				<GitMissingAlert />
 				<StartupRecoveryAlert />
-				<Outlet />
+				<Suspense fallback={<RoutePendingIndicator />}>
+					<I18nNamespaceGate namespaces={getNamespacesForPath(pathname)}>
+						<Outlet />
+					</I18nNamespaceGate>
+				</Suspense>
 			</AppShell.Main>
 
 			<Modal
@@ -889,17 +898,11 @@ export function AuthenticatedLayout() {
 			<BrokenModelMigrationHost />
 			<PluginPermissionRequestHost />
 
-			{createNarratorOpened && (
-				<LazyOverlayBoundary resetKey={createNarratorOpened} label={t("newNarrator")}>
-					<Suspense fallback={null}>
-						<CreateNarratorModal
-							opened={createNarratorOpened}
-							onClose={() => setCreateNarratorOpened(false)}
-							onCreated={handleNarratorCreated}
-						/>
-					</Suspense>
-				</LazyOverlayBoundary>
-			)}
+			<CreateNarratorLazyModal
+				opened={createNarratorOpened}
+				onClose={() => setCreateNarratorOpened(false)}
+				onCreated={handleNarratorCreated}
+			/>
 
 			{/*
 			 * The two fixed top banners are rendered LAST on purpose.

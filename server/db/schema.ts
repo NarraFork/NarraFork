@@ -3442,9 +3442,10 @@ export const workspacePanels = sqliteTable(
 		 * it is that narrator's resource, not a standalone member. No code ever wrote such
 		 * a row, so narrowing this needs no data migration — and SQLite does not enforce
 		 * the enum anyway; it is a TypeScript-level constraint that keeps a non-membership
-		 * kind from being inserted.
+		 * kind from being inserted. `outline` (an outline page added on its own) was added the
+		 * same way: a TypeScript-only widening, with no migration.
 		 */
-		kind: text("kind", { enum: ["narrator", "terminal", "webview"] }).notNull(),
+		kind: text("kind", { enum: ["narrator", "terminal", "webview", "outline"] }).notNull(),
 		/**
 		 * Set only when `kind = "narrator"`.
 		 *
@@ -3455,8 +3456,9 @@ export const workspacePanels = sqliteTable(
 		narratorId: text("narrator_id").references(() => narrators.id, { onDelete: "cascade" }),
 		/**
 		 * Panel params for terminal / webview / plugin kinds (including a plugin's
-		 * `viewState`). Bounded per row by the service, which is also why moving
-		 * plugin panels out of the blob shrinks the layout back to a skeleton.
+		 * `viewState`), and `{ spaceId, blockId, view }` for an outline page. Bounded per
+		 * row by the service, which is also why moving plugin panels out of the blob
+		 * shrinks the layout back to a skeleton.
 		 */
 		configJson: text("config_json"),
 		/** Stable member order, used to place members the layout does not mention. */

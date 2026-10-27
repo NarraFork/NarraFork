@@ -5,7 +5,7 @@ import { clampReasoningEffort, type ReasoningEffort } from "@shared/reasoning-ef
 import { IconAdjustmentsHorizontal, IconFolder, IconPaperclip } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";
 import { useNavigate } from "@tanstack/react-router";
-import { lazy, Suspense, useRef, useState } from "react";
+import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useCurrentUser } from "../../hooks/useAuth";
 import { useCreateNarrator } from "../../hooks/useNarrator";
@@ -18,6 +18,10 @@ import { addRecentTab } from "../../hooks/useRecentTabs";
 import { api, isAbortError } from "../../lib/api";
 import { FOLLOW_DEFAULT_MODEL } from "../../lib/constants";
 import { DirectoryBrowserModal } from "../common/DirectoryPicker";
+import {
+	CreateNarratorLazyModal,
+	preloadCreateNarratorModal,
+} from "../narrator/CreateNarratorLazyModal";
 import type { CreateNarratorResult } from "../narrator/CreateNarratorModal";
 import { hasSendableComposerContent } from "../narrator/composer/composer-send-gate";
 import { trimFileReferenceInput } from "../narrator/composer/file-reference-input";
@@ -37,10 +41,6 @@ import { ModelPickerMenu } from "../narrator/model/ModelPickerMenu";
 import { ReasoningEffortPickerMenu } from "../narrator/model/ReasoningEffortPickerMenu";
 import { useDraftReasoningEffort } from "../narrator/model/use-draft-reasoning-effort";
 import { directoryLabel } from "./dashboard-sessions";
-
-const CreateNarratorModal = lazy(() =>
-	import("../narrator/CreateNarratorModal").then((m) => ({ default: m.CreateNarratorModal })),
-);
 
 /**
  * Local key for the dashboard composer's draft, input history and staged
@@ -488,6 +488,9 @@ export function DashboardComposer() {
 						variant="subtle"
 						color="gray"
 						aria-label={t("composer.advanced")}
+						onPointerEnter={preloadCreateNarratorModal}
+						onFocus={preloadCreateNarratorModal}
+						onPointerDown={preloadCreateNarratorModal}
 						onClick={() => setAdvancedOpen(true)}
 					>
 						<IconAdjustmentsHorizontal size={16} />
@@ -511,16 +514,12 @@ export function DashboardComposer() {
 				}}
 			/>
 
-			{advancedOpen && (
-				<Suspense fallback={null}>
-					<CreateNarratorModal
-						opened
-						onClose={() => setAdvancedOpen(false)}
-						initialCwd={cwd || undefined}
-						onCreated={openSession}
-					/>
-				</Suspense>
-			)}
+			<CreateNarratorLazyModal
+				opened={advancedOpen}
+				onClose={() => setAdvancedOpen(false)}
+				initialCwd={cwd || undefined}
+				onCreated={openSession}
+			/>
 		</Box>
 	);
 }

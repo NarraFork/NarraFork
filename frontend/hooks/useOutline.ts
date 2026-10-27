@@ -218,16 +218,18 @@ export function useOutlinePageLive(
 
 /**
  * Open the outline space of a project or a session: resolves it (creating it when the caller
- * may write it) and navigates there. `onMissing` runs when the space does not exist yet and
- * the caller may not create it; `onError` when resolving fails.
+ * may write it) and navigates there, or hands it to `onOpen` (a session opens it in a panel).
+ * `onMissing` runs when the space does not exist yet and the caller may not create it;
+ * `onError` when resolving fails.
  */
 export function useOpenOutlineSpace(callbacks: {
 	onMissing: () => void;
 	onError: (error: unknown) => void;
+	onOpen?: (space: OutlineSpaceSummary) => void;
 }) {
 	const navigate = useNavigate();
 	const queryClient = useQueryClient();
-	const { onMissing, onError } = callbacks;
+	const { onMissing, onError, onOpen } = callbacks;
 	const mutation = useMutation({
 		mutationFn: (target: { kind: "project" | "narrator"; id: string }) =>
 			target.kind === "project"
@@ -240,7 +242,8 @@ export function useOpenOutlineSpace(callbacks: {
 				return;
 			}
 			if (result.created) void queryClient.invalidateQueries({ queryKey: outlineKeys.spaces() });
-			void navigate({ to: "/outline/$spaceId", params: { spaceId: space.id } });
+			if (onOpen) onOpen(space);
+			else void navigate({ to: "/outline/$spaceId", params: { spaceId: space.id } });
 		},
 		onError,
 	});

@@ -174,6 +174,39 @@ test("caches each filter combination separately", async () => {
 	expect(keys).toEqual(["q=kestrel", "q=kestrel&include=subagents&projectId=p1"]);
 });
 
+test("overview keeps the previous result while a new filter request is pending", async () => {
+	await render({ q: "first" });
+	await settle(() => overview.data !== undefined);
+	const firstData = overview.data;
+	expect(firstData).toBeDefined();
+
+	let release!: () => void;
+	const gate = new Promise<void>((resolve) => {
+		release = resolve;
+	});
+	sectionsSpy.mockImplementation(async (request, sectionNames) => {
+		if (request.q === "second") await gate;
+		return {
+			sections: Object.fromEntries(
+				sectionNames.map((name) => [
+					name,
+					{ ...emptyPage, total: request.q === "second" ? 99 : 45 },
+				]),
+			),
+		};
+	});
+
+	await render({ q: "second" });
+	expect(overview.data).toBe(firstData);
+	expect(overview.isPlaceholderData).toBe(true);
+	expect(overview.isLoading).toBe(false);
+
+	release();
+	await settle(() => overview.data?.sections.sessions?.total === 99);
+	expect(overview.isPlaceholderData).toBe(false);
+	expect(overview.data).not.toBe(firstData);
+});
+
 test("reads a session's further hits only once its card is expanded", async () => {
 	await render({ q: "kestrel" });
 	await settle();

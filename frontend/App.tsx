@@ -120,6 +120,7 @@ function createAppRouter(history: RouterHistory) {
 		defaultPendingComponent: RoutePendingIndicator,
 		defaultPendingMs: 400,
 		defaultPendingMinMs: 300,
+		defaultPreload: "intent",
 	});
 }
 

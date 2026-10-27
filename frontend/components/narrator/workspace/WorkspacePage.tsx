@@ -18,12 +18,14 @@ import {
 	IconCheck,
 	IconLayoutGrid,
 	IconLayoutSidebarRight,
+	IconListTree,
 	IconPencil,
 } from "@tabler/icons-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Link, useNavigate } from "@tanstack/react-router";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useOutlineEnabled } from "../../../hooks/useOutlineEnabled";
 import {
 	recordRecentTabVisit,
 	refreshRecentTabsLoadedWindow,
@@ -36,12 +38,16 @@ import {
 	workspaceQueryKey,
 } from "../../../hooks/useWorkspace";
 import { APP_SHELL_FULL_BLEED_HEIGHT } from "../../../lib/safe-area";
-import type { PluginDockPanelParams } from "../../plugins/protocol";
 import type { WebviewLeafConfig } from "../split-tree";
 import { DirectorLayout } from "./DirectorLayout";
 import { type DirectorControl, DockviewWorkspace } from "./DockviewWorkspace";
 import { DEFAULT_DIRECTOR_PRIMARY_RATIO, type DirectorLeaf } from "./director-constants";
 import type { WorkspaceDirectorState } from "./dockview-layout";
+import type { WorkspacePanelParams } from "./panel-types";
+
+const AddOutlinePanelModal = lazy(() =>
+	import("./AddOutlinePanelModal").then((m) => ({ default: m.AddOutlinePanelModal })),
+);
 
 /** Height below the WCO drag strip in a standalone window; 100% elsewhere. */
 const WINDOW_CONTENT_HEIGHT = "calc(100% - var(--nf-wco-strip-height, 0px))";
@@ -169,9 +175,13 @@ export function WorkspacePage({
 		directorControlRef.current?.updateWebviewConfig(panelId, config);
 	}, []);
 
-	const handleUpdatePluginParams = useCallback((panelId: string, params: PluginDockPanelParams) => {
+	const handleUpdatePluginParams = useCallback((panelId: string, params: WorkspacePanelParams) => {
 		directorControlRef.current?.updatePanelParams(panelId, params);
 	}, []);
+
+	// ── Outline pages as members (hidden while the outline is off) ──
+	const outlineEnabled = useOutlineEnabled().enabled;
+	const [addingOutline, setAddingOutline] = useState(false);
 
 	const handleSetPanelTitle = useCallback((panelId: string, title: string) => {
 		directorControlRef.current?.updatePanelTitle(panelId, title);
@@ -275,6 +285,19 @@ export function WorkspacePage({
 				)}
 				<Box style={{ flex: 1 }} />
 				<Group gap={4}>
+					{outlineEnabled && (
+						<Tooltip label={t("workspaceAddOutline")}>
+							<ActionIcon
+								size="sm"
+								variant="subtle"
+								aria-label={t("workspaceAddOutline")}
+								data-testid="workspace-add-outline"
+								onClick={() => setAddingOutline(true)}
+							>
+								<IconListTree size={16} />
+							</ActionIcon>
+						</Tooltip>
+					)}
 					<Tooltip label={t("workspaceSplitMode")}>
 						<ActionIcon
 							size="sm"
@@ -363,6 +386,15 @@ export function WorkspacePage({
 					/>
 				</Box>
 			</Box>
+			{outlineEnabled && addingOutline && (
+				<Suspense fallback={null}>
+					<AddOutlinePanelModal
+						workspaceId={workspaceId}
+						opened
+						onClose={() => setAddingOutline(false)}
+					/>
+				</Suspense>
+			)}
 		</Box>
 	);
 }

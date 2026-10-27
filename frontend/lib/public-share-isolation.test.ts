@@ -51,9 +51,11 @@ describe("public narrator share entry isolation", () => {
 		expect(root).toContain(
 			'pathname === "/login" || pathname === "/oauth/authorize" || isPublicNarratorSharePath(pathname)',
 		);
+		expect(root).toContain("if (publicSurface || (publicPage && !getToken()))");
 		expect(root).toMatch(
-			/if \(publicSurface \|\| isStandaloneWindowPath\(pathname\) \|\| \(publicPage && !getToken\(\)\)\)\s*return <Outlet \/>;/,
+			/<I18nNamespaceGate namespaces=\{getNamespacesForPath\(pathname\)\}>\s*<Outlet \/>\s*<\/I18nNamespaceGate>/,
 		);
+		expect(root).toContain("if (isStandaloneWindowPath(pathname)) return <Outlet />;");
 		expect(root).not.toContain("isPublicNarratorSharePath(pathname) && !getToken()");
 	});
 	test("public bootstrap does not install authenticated hosts", () => {

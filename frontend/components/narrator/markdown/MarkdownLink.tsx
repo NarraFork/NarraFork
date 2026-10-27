@@ -11,6 +11,8 @@ import {
 	localFileHref,
 } from "@shared/markdown-file-path";
 import type { ComponentPropsWithoutRef } from "react";
+import { isOutlineReferenceHref } from "../../../lib/outline-href";
+import { useOutlineLinkProps } from "../../../lib/outline-opener";
 import { useFileReferenceScope } from "../composer/FileReferenceScope";
 
 /** Shared by flowing markdown and every measured visual fragment of a vlist link. */
@@ -31,6 +33,32 @@ export function MarkdownLink({
 	lineNumbersInChildren?: boolean;
 }) {
 	const scope = useFileReferenceScope();
+	// An outline link inside a host that opens outline panels (a session surface, the outline
+	// page): open it beside, never as a page navigation or as a file. Elsewhere a page link stays
+	// an ordinary link, and a tool card's reference (which only an outline host can open) is
+	// plain text. Checked before files because `/outline/…` also reads as an absolute path.
+	const outlineLink = useOutlineLinkProps(href);
+	if (outlineLink) {
+		return (
+			<a
+				href={outlineLink.href}
+				className={linkClassName ?? className}
+				style={style}
+				title={title}
+				data-outline-link=""
+				onClick={outlineLink.onClick}
+			>
+				{children}
+			</a>
+		);
+	}
+	if (outlineLink === null && isOutlineReferenceHref(href)) {
+		return (
+			<span className={className?.replace(/\bis-link\b/g, "").trim()} style={style}>
+				{children}
+			</span>
+		);
+	}
 	const target = fileTargetFromHref(href, scope.context);
 	const fileCandidate = filePathFromHref(href) !== null;
 	const fileScoped = scope.context !== undefined || !!scope.narratorId || !!scope.openFile;

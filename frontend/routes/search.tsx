@@ -194,6 +194,7 @@ function SearchPage() {
 	const params = Route.useSearch();
 	const navigate = Route.useNavigate();
 	const { t } = useTranslation("search");
+	const { t: tc } = useTranslation("common");
 	const tab: SearchTab = normalizeSearchTab(params.tab);
 	const filters: SearchFilterState = useMemo(
 		() => ({
@@ -218,7 +219,8 @@ function SearchPage() {
 		[params.q, params.history, filters],
 	);
 	const overview = useSearchOverview(request);
-	const sections = overview.data?.sections ?? {};
+	// A failed new query must not label the previous query's placeholder rows as current.
+	const sections = overview.isError ? {} : (overview.data?.sections ?? {});
 
 	const setFilters = (patch: Partial<SearchFilterState>) => {
 		const next = { ...filters, ...patch };
@@ -284,10 +286,29 @@ function SearchPage() {
 						</Alert>
 					)}
 					{tab === "all" ? (
-						overview.isLoading ? (
+						overview.isError ? (
+							<Alert color="red" role="alert">
+								<Group justify="space-between" wrap="wrap">
+									<Text size="sm">{tc("operationFailed")}</Text>
+									<Button
+										size="compact-sm"
+										variant="light"
+										loading={overview.isRefetching}
+										onClick={() => void overview.refetch()}
+									>
+										{tc("retry")}
+									</Button>
+								</Group>
+							</Alert>
+						) : overview.isLoading ? (
 							<Loader />
 						) : (
-							<Overview sections={sections} request={request} onOpen={openTab} />
+							<div
+								aria-busy={overview.isPlaceholderData}
+								style={{ opacity: overview.isPlaceholderData ? 0.6 : 1 }}
+							>
+								<Overview sections={sections} request={request} onOpen={openTab} />
+							</div>
 						)
 					) : (
 						<SectionList

@@ -58,16 +58,27 @@ export function stripIdentityFromLayout(layout: SerializedDockview): SerializedD
 	return clone;
 }
 
-/** Workspace membership needs narrator ids, but no surface should replay navigation. */
+/**
+ * Workspace membership needs narrator ids, but no surface should replay navigation.
+ *
+ * An outline panel's tab title is the title of a page, which is content: it is not kept (a
+ * layout can outlive its author in a shared browser), and the panel names its tab again after
+ * it has read its place.
+ */
 export function stripNavigationFromLayout(layout: SerializedDockview): SerializedDockview {
 	const clone = structuredClone(layout);
-	const panels = (clone as { panels?: Record<string, { params?: Record<string, unknown> }> })
-		.panels;
+	const panels = (
+		clone as { panels?: Record<string, { params?: Record<string, unknown>; title?: string }> }
+	).panels;
 	for (const panel of Object.values(panels ?? {})) {
 		if (!panel?.params) continue;
 		delete panel.params.highlightMessageId;
 		delete panel.params.highlightRequestId;
 		if (panel.params.panelType === "file") delete panel.params.selection;
+		if (panel.params.panelType === "outline") {
+			delete panel.params.title;
+			delete panel.title;
+		}
 	}
 	return clone;
 }

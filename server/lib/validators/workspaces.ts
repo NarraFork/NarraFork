@@ -99,8 +99,9 @@ export const createWorkspacePanelSchema = z.discriminatedUnion("kind", [
 		.object({
 			// `plugin` is deliberately absent: a workspace plugin panel binds to an owning
 			// narrator, making it that narrator's resource rather than membership. See
-			// `NON_MEMBERSHIP_DIRECTOR_PANEL_TYPES`.
-			kind: z.enum(["terminal", "webview"]),
+			// `NON_MEMBERSHIP_DIRECTOR_PANEL_TYPES`. An `outline` config is checked by the
+			// service (`normalizeWorkspaceOutlineConfig`).
+			kind: z.enum(["terminal", "webview", "outline"]),
 			config: z.unknown(),
 		})
 		.strict(),

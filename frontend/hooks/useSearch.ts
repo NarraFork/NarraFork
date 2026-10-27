@@ -34,6 +34,7 @@ export function useSearchOverview(request: SearchRequest) {
 				SEARCH_SECTION_ORDER,
 				signal,
 			),
+		placeholderData: keepPreviousData,
 		enabled: q.length > 0,
 		...SEARCH_CACHE,
 	});

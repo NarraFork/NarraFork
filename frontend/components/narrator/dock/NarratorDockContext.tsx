@@ -29,6 +29,17 @@ import {
 	useRef,
 	useState,
 } from "react";
+import { useOutlineEnabledInCache } from "../../../hooks/useOutlineEnabled";
+import {
+	type OutlineOpener,
+	OutlineOpenerProvider,
+	type OutlineOpenOptions,
+} from "../../../lib/outline-opener";
+import {
+	nextOutlinePanelId,
+	normalizeOutlinePanelState,
+	type OutlinePanelState,
+} from "../../../lib/outline-panel";
 import {
 	type PluginUiHostSurface,
 	PluginUiSurfaceProvider,
@@ -53,9 +64,11 @@ import {
 	NARRATOR_DOCK_COMPONENT,
 	type NarratorDockPanelParams,
 	type NarratorToolPanelType,
+	OUTLINE_DOCK_PANEL_PREFIX,
 	resolveFilePanel,
 	subagentDockPanelId,
 } from "./dock-panel-types";
+import { findOutlinePanel, navigateOutlinePanel } from "./outline-dock";
 
 export interface NarratorBrowserInfo {
 	sessionCount: number;
@@ -590,6 +603,65 @@ export function NarratorDockProvider({
 		[],
 	);
 
+	// Outline panels: one per (space, page) unless a new one is asked for (Ctrl/Cmd-click);
+	// an existing one is navigated there. Same placement as the other secondary panels. False
+	// while no dock is mounted (the phone layout), so the session falls back to its drawer.
+	const openOutlinePanel = useCallback(
+		(request: OutlinePanelState, options: OutlineOpenOptions = {}): boolean => {
+			const api = apiRef.current;
+			if (!api) return false;
+			const existing = options.newPanel ? undefined : findOutlinePanel(api.panels, request);
+			if (existing) {
+				navigateOutlinePanel(existing, request);
+				existing.api.setActive();
+				return true;
+			}
+			const id = nextOutlinePanelId(OUTLINE_DOCK_PANEL_PREFIX);
+			// The place only: a known title names the tab, it is not stored with the panel.
+			const params: NarratorDockPanelParams = {
+				panelType: "outline",
+				...normalizeOutlinePanelState(request),
+			};
+			const existingSecondary = api.panels.find((panel) => {
+				const panelParams = panel.params as NarratorDockPanelParams | undefined;
+				return panelParams?.panelType !== "chat";
+			});
+			const chatPanel = api.getPanel(dockPanelId("chat"));
+			const placement = resolveToolPlacement({
+				hasSecondaryGroup: !!existingSecondary?.group,
+				hasChatPanel: !!chatPanel,
+				surfaceWidth: api.width,
+			});
+			const base = {
+				id,
+				component: NARRATOR_DOCK_COMPONENT.outline,
+				params,
+				...(request.title ? { title: request.title } : {}),
+			};
+			if (placement.mode === "within-secondary" && existingSecondary?.group) {
+				api.addPanel<NarratorDockPanelParams>({
+					...base,
+					position: { referenceGroup: existingSecondary.group },
+				});
+			} else if (placement.mode === "split-right" && chatPanel) {
+				api.addPanel<NarratorDockPanelParams>({
+					...base,
+					initialWidth: placement.initialWidth,
+					position: { referencePanel: chatPanel.id, direction: "right" },
+				});
+			} else {
+				api.addPanel<NarratorDockPanelParams>(base);
+			}
+			return true;
+		},
+		[],
+	);
+	const outlineEnabled = useOutlineEnabledInCache();
+	const outlineOpener = useMemo<OutlineOpener | null>(
+		() => (outlineEnabled ? { open: openOutlinePanel } : null),
+		[outlineEnabled, openOutlinePanel],
+	);
+
 	const closeToolPanel = useCallback((type: NarratorToolPanelType) => {
 		apiRef.current?.getPanel(dockPanelId(type))?.api.close();
 	}, []);
@@ -732,7 +804,9 @@ export function NarratorDockProvider({
 	);
 	return (
 		<PluginUiSurfaceProvider hostContext={pluginHostContext}>
-			<NarratorDockContext.Provider value={value}>{children}</NarratorDockContext.Provider>
+			<NarratorDockContext.Provider value={value}>
+				<OutlineOpenerProvider value={outlineOpener}>{children}</OutlineOpenerProvider>
+			</NarratorDockContext.Provider>
 		</PluginUiSurfaceProvider>
 	);
 }

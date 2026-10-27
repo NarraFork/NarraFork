@@ -16,7 +16,7 @@ import {
 
 interface RecalculationDependencies {
 	createStore(signal: AbortSignal): Promise<TokenRecalculationStore>;
-	createResolver(): (row: TokenRecalculationRow) => TokenProtocolResolution;
+	createResolver(): Promise<(row: TokenRecalculationRow) => TokenProtocolResolution>;
 }
 
 export class TokenRecalculationService {
@@ -75,7 +75,7 @@ export class TokenRecalculationService {
 			await runTokenRecalculation(
 				job,
 				store,
-				this.dependencies.createResolver(),
+				await this.dependencies.createResolver(),
 				signal,
 				(milliseconds, rows) => {
 					logger.warn("Slow token recalculation batch", {
@@ -130,11 +130,12 @@ export function getTokenRecalculationService(): TokenRecalculationService {
 					);
 					return createTokenRecalculationWorkerStore(getDbPath(), signal);
 				},
-				createResolver() {
+				async createResolver() {
 					// This resolver only reads local configuration/catalog caches; it never calls providers.
-					const { createTokenRecalculationProtocolResolver } =
-						require("./token-recalculation-protocol") as typeof import("./token-recalculation-protocol");
-					return createTokenRecalculationProtocolResolver();
+					const { createRuntimeTokenRecalculationProtocolResolver } = await import(
+						"./token-recalculation-protocol"
+					);
+					return createRuntimeTokenRecalculationProtocolResolver();
 				},
 			}),
 	);

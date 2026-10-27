@@ -21,7 +21,7 @@
 
 import { Box } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
-import type { WorkspacePanel } from "@shared/workspace-panels";
+import { normalizeWorkspaceOutlineConfig, type WorkspacePanel } from "@shared/workspace-panels";
 import { useQueryClient } from "@tanstack/react-query";
 import {
 	type DockviewApi,
@@ -48,6 +48,7 @@ import {
 	serializeWorkspaceLayout,
 	type WorkspaceDirectorState,
 } from "./dockview-layout";
+import { isOutlineMemberParams } from "./panel-types";
 import { type WorkspacePanelParams, workspacePanelComponents } from "./panels";
 import {
 	createWorkspaceDockStore,
@@ -165,7 +166,10 @@ function isMembershipPanel(params: WorkspacePanelParams): boolean {
 	return (
 		params.panelType === "narrator" ||
 		params.panelType === "terminal" ||
-		params.panelType === "webview"
+		params.panelType === "webview" ||
+		// An outline page is a member only when added on its own; one a session opened is
+		// that session's resource.
+		(params.panelType === "outline" && isOutlineMemberParams(params))
 	);
 }
 
@@ -180,6 +184,11 @@ function isMembershipPanel(params: WorkspacePanelParams): boolean {
 function paramsForMember(member: WorkspacePanel): WorkspacePanelParams | null {
 	if (member.kind === "narrator") {
 		return member.narratorId ? { panelType: "narrator", narratorId: member.narratorId } : null;
+	}
+	if (member.kind === "outline") {
+		// Only the place is row state; a malformed row renders nothing rather than an empty panel.
+		const config = normalizeWorkspaceOutlineConfig(member.config);
+		return config ? { ...config, panelType: "outline", panelRowId: member.id } : null;
 	}
 	const config = member.config;
 	if (!config || typeof config !== "object") return null;

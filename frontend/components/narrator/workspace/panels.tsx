@@ -14,9 +14,12 @@ import { lazy, Suspense, useCallback, useLayoutEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useNarrator } from "../../../hooks/useNarrator";
 import { api as apiClient } from "../../../lib/api";
+import { OutlineOpenerProvider } from "../../../lib/outline-opener";
+import { OutlineHostProvider } from "../../outline/outline-host";
 import { PluginDockPanel } from "../../plugins/PluginDockPanel";
 import { WebviewPanel } from "../browser/WebviewPanel";
 import { NarratorDockContext } from "../dock/NarratorDockContext";
+import { OutlineDockPanel } from "../dock/OutlineDockPanel";
 import {
 	BrowserDockPanel as BrowserToolAdapter,
 	DetailsDockPanel as DetailsToolAdapter,
@@ -39,10 +42,12 @@ import type {
 	FilePanelParams,
 	KnowledgePanelParams,
 	NarratorBoundPanelParams,
+	OutlinePanelParams,
 } from "../panels/panel-kind";
 import { usePanelCompact, usePanelGeometryReady, usePanelHeaderDrag } from "../panels/shared";
 import type { WebviewLeafConfig } from "../split-tree";
 import {
+	isOutlineMemberParams,
 	type NarratorPanelParams,
 	type NarratorToolPanelParams,
 	PANEL_COMPONENT,
@@ -51,6 +56,8 @@ import {
 	type WebviewPanelParams,
 	type WorkspaceFilePanelParams,
 	type WorkspaceKnowledgePanelParams,
+	type WorkspaceOutlineMemberParams,
+	type WorkspaceOutlinePanelParams,
 	type WorkspacePanelParams,
 } from "./panel-types";
 import { WorkspaceResourceFrame } from "./WorkspaceResourceFrame";
@@ -58,8 +65,10 @@ import {
 	useWorkspaceDirectorActive,
 	useWorkspaceId,
 	useWorkspaceNarratorDockValue,
+	useWorkspaceOutlineOpener,
 	workspaceResourceOwner,
 } from "./workspace-dock";
+import { useOutlineMemberActions, usePersistOutlineMember } from "./workspace-outline";
 
 export type {
 	NarratorPanelParams,
@@ -94,6 +103,7 @@ function NarratorDockPanel(props: IDockviewPanelProps<NarratorPanelParams>) {
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON entity
 	const narratorTitle = (narratorData as any)?.title as string | undefined;
 	const dockValue = useWorkspaceNarratorDockValue(narratorId, props.api.id);
+	const outlineOpener = useWorkspaceOutlineOpener(narratorId, props.api.id);
 
 	useLayoutEffect(() => {
 		const title = narratorTitle?.trim();
@@ -118,7 +128,11 @@ function NarratorDockPanel(props: IDockviewPanelProps<NarratorPanelParams>) {
 	);
 
 	if (!dockValue) return content;
-	return <NarratorDockContext.Provider value={dockValue}>{content}</NarratorDockContext.Provider>;
+	return (
+		<NarratorDockContext.Provider value={dockValue}>
+			<OutlineOpenerProvider value={outlineOpener}>{content}</OutlineOpenerProvider>
+		</NarratorDockContext.Provider>
+	);
 }
 
 function SubagentDockPanel(props: IDockviewPanelProps<SubagentPanelParams>) {
@@ -126,6 +140,7 @@ function SubagentDockPanel(props: IDockviewPanelProps<SubagentPanelParams>) {
 		props.params;
 	const { ref, compact } = usePanelCompact();
 	const dockValue = useWorkspaceNarratorDockValue(hostNarratorId, props.api.id);
+	const outlineOpener = useWorkspaceOutlineOpener(hostNarratorId, props.api.id);
 	const openFilePanel = useFilePanelSourceOpener(
 		dockValue?.openFilePanel,
 		props.api.id,
@@ -142,17 +157,19 @@ function SubagentDockPanel(props: IDockviewPanelProps<SubagentPanelParams>) {
 
 	return (
 		<Box ref={ref} style={{ height: "100%", overflow: "hidden" }}>
-			<SubagentSessionPanelContent
-				subagentNarratorId={subagentNarratorId}
-				compact={compact}
-				onClose={close}
-				onHeaderPointerDown={onHeaderPointerDown}
-				onViewSubagentSession={dockValue?.openSubagentPanel}
-				onOpenFilePanel={openFilePanel}
-				onTitleChange={handleTitleChange}
-				highlightMessageId={highlightMessageId}
-				highlightRequestId={highlightRequestId}
-			/>
+			<OutlineOpenerProvider value={outlineOpener}>
+				<SubagentSessionPanelContent
+					subagentNarratorId={subagentNarratorId}
+					compact={compact}
+					onClose={close}
+					onHeaderPointerDown={onHeaderPointerDown}
+					onViewSubagentSession={dockValue?.openSubagentPanel}
+					onOpenFilePanel={openFilePanel}
+					onTitleChange={handleTitleChange}
+					highlightMessageId={highlightMessageId}
+					highlightRequestId={highlightRequestId}
+				/>
+			</OutlineOpenerProvider>
 		</Box>
 	);
 }
@@ -360,6 +377,57 @@ function WorkspaceKnowledgeDockPanel(props: IDockviewPanelProps<WorkspaceKnowled
 	return <KnowledgePanelAdapter {...knowledgeProps} />;
 }
 
+/**
+ * An outline page in the workspace. A session's resource (opened from its cluster) reuses the
+ * dock's panel inside that narrator's context, so Ctrl/Cmd-click and "open the session that
+ * wrote this" stay in the cluster. A member (added on its own) has no session: Ctrl/Cmd-click
+ * and opening a session add members, and the page it shows is written to its row so a
+ * workspace restored without its layout still opens it there.
+ */
+function WorkspaceOutlineDockPanel(props: IDockviewPanelProps<WorkspaceOutlinePanelParams>) {
+	if (isOutlineMemberParams(props.params)) {
+		return (
+			<WorkspaceOutlineMemberPanel
+				{...(props as IDockviewPanelProps<WorkspaceOutlineMemberParams>)}
+			/>
+		);
+	}
+	return <WorkspaceOutlineResourcePanel {...props} />;
+}
+
+function WorkspaceOutlineResourcePanel(props: IDockviewPanelProps<WorkspaceOutlinePanelParams>) {
+	const host = (props.params as { hostNarratorId: string }).hostNarratorId;
+	const dockValue = useWorkspaceNarratorDockValue(host, props.api.id);
+	const outlineOpener = useWorkspaceOutlineOpener(host, props.api.id);
+	const outlineProps = props as unknown as IDockviewPanelProps<OutlinePanelParams>;
+	return (
+		<NarratorDockContext.Provider value={dockValue}>
+			<OutlineOpenerProvider value={outlineOpener}>
+				<OutlineDockPanel {...outlineProps} />
+			</OutlineOpenerProvider>
+		</NarratorDockContext.Provider>
+	);
+}
+
+function WorkspaceOutlineMemberPanel(props: IDockviewPanelProps<WorkspaceOutlineMemberParams>) {
+	const workspaceId = useWorkspaceId();
+	const directorActive = useWorkspaceDirectorActive();
+	const memberActions = useOutlineMemberActions(workspaceId, props.containerApi);
+	usePersistOutlineMember(workspaceId, props.params);
+	// The Director overlay hosts the live cell while it is active.
+	if (directorActive) return null;
+	const outlineProps = props as unknown as IDockviewPanelProps<OutlinePanelParams>;
+	return (
+		<NarratorDockContext.Provider value={null}>
+			<OutlineOpenerProvider value={memberActions.opener}>
+				<OutlineHostProvider openSession={memberActions.openSession}>
+					<OutlineDockPanel {...outlineProps} />
+				</OutlineHostProvider>
+			</OutlineOpenerProvider>
+		</NarratorDockContext.Provider>
+	);
+}
+
 function WorkspacePluginDockPanel(props: Parameters<typeof PluginDockPanel>[0]) {
 	const directorActive = useWorkspaceDirectorActive();
 	const owner = workspaceResourceOwner(props.params);
@@ -404,6 +472,7 @@ export const workspacePanelComponents = {
 	[PANEL_COMPONENT.subagent]: withResourceFrame(SubagentDockPanel),
 	[PANEL_COMPONENT.file]: withResourceFrame(WorkspaceFileDockPanel),
 	[PANEL_COMPONENT.knowledge]: withResourceFrame(WorkspaceKnowledgeDockPanel),
+	[PANEL_COMPONENT.outline]: withResourceFrame(WorkspaceOutlineDockPanel),
 	[PANEL_COMPONENT.plugin]: withResourceFrame(WorkspacePluginDockPanel),
 	// biome-ignore lint/suspicious/noExplicitAny: dockview panel registry is heterogeneous
 } satisfies Record<string, React.FunctionComponent<IDockviewPanelProps<any>>>;

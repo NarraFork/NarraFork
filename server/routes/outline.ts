@@ -10,16 +10,21 @@
  *      and so does everything inside it (blocks, pages, commits): nothing tells whether it
  *      exists. A block or page asked for under the wrong space is also 404.
  *   3. Readable but not writable answers 403 where writing is asked for (revert).
+ *   4. Resolving a reference or a commit (`/resolve`) consults one space, and answers 404 alike
+ *      for a space or block that does not exist, one the person cannot read, and a reference
+ *      that names several blocks.
  * Access is decided per person by `services/outline/access.ts`, against current permissions:
  * reading a page as of an older commit uses today's access, not the access at the time.
  */
 
+import { blockTitle, isSpaceKey } from "@shared/outline";
 import {
 	OUTLINE_VIEW_LIMITS,
 	type OutlineBacklinksResponse,
 	type OutlineBlockHistoryResponse,
 	type OutlineBlockViewResponse,
 	type OutlinePageListResponse,
+	type OutlineResolveResponse,
 	type OutlineRevertResponse,
 	type OutlineSearchResponse,
 	type OutlineSpaceDetailResponse,
@@ -36,6 +41,7 @@ import {
 	outlineHistoryQuerySchema,
 	outlineIdSchema,
 	outlinePageListQuerySchema,
+	outlineResolveQuerySchema,
 	outlineSearchQuerySchema,
 	outlineSpaceListQuerySchema,
 } from "../lib/validators/outline";
@@ -56,7 +62,7 @@ import {
 } from "../services/outline/access-reads";
 import { isOutlineEnabled } from "../services/outline/feature";
 import { commitSeqAt } from "../services/outline/read";
-import { listBacklinks } from "../services/outline/resolve";
+import { listBacklinks, resolveAddress } from "../services/outline/resolve";
 import { revertCommit } from "../services/outline/revert";
 import { OUTLINE_SEARCH_LIMITS, searchOutline } from "../services/outline/search";
 import {
@@ -381,6 +387,77 @@ outlineRoutes.get("/search", async (c) => {
 			path: hit.path,
 			process: hit.process,
 		})),
+	};
+	return c.json(body);
+});
+
+/** A space named by key or by id, if the person may read it; null otherwise. */
+async function readableSpaceNamed(
+	principal: OutlinePrincipal,
+	name: string,
+): Promise<OutlineSpaceRow | null> {
+	const byKey = isSpaceKey(name) ? await outlineStore.getSpaceByKey(name) : null;
+	const space = byKey ?? (await outlineStore.getSpace(name));
+	return space && (await canReadSpace(principal, space)) ? space : null;
+}
+
+/**
+ * Where a reference or a commit points, for opening it (tool cards name blocks by address and
+ * commits by seq). `ref` resolves within the space its `key/` prefix names, else within `space`;
+ * `commit` is a seq of `space` and answers the first page it changed, to show as of it. Bounded:
+ * one space, one resolution (or one commit and one of its versions), and one block read.
+ *
+ * Every miss is the same 404 — no such space, a space the person cannot read, no such block or
+ * commit, a reference naming several blocks — so the answer never tells which.
+ */
+outlineRoutes.get("/resolve", async (c) => {
+	const principal = principalOf(c);
+	const query = parse(outlineResolveQuerySchema, c.req.query());
+	const missing = () =>
+		new NotFoundError("Outline reference", query.ref ?? `${query.space}#${query.commit}`);
+	if (query.commit !== undefined) {
+		const space = await readableSpaceNamed(principal, query.space as string);
+		if (!space) throw missing();
+		const [commit] = await outlineStore.getCommitsBySeqs(space.id, [query.commit]);
+		const [version] = commit ? await outlineStore.listCommitVersions(commit.id, 1) : [];
+		const page = version ? await outlineStore.getBlock(version.pageId) : null;
+		if (!commit || !page || page.spaceId !== space.id) throw missing();
+		const body: OutlineResolveResponse = {
+			spaceId: space.id,
+			spaceKey: space.key,
+			blockId: page.id,
+			pageId: page.id,
+			isPage: true,
+			address: `${space.key}/${page.sid}`,
+			title: blockTitle(page.content),
+			deleted: page.deleted,
+			asOf: commit.seq,
+		};
+		return c.json(body);
+	}
+	const ref = query.ref as string;
+	// A `key/…` reference names its own space; otherwise the reference is read within `space`.
+	const slash = ref.indexOf("/");
+	const prefix = slash > 0 ? ref.slice(0, slash) : "";
+	let space: OutlineSpaceRow | null = null;
+	if (prefix && isSpaceKey(prefix)) {
+		const named = await outlineStore.getSpaceByKey(prefix);
+		if (named && (await canReadSpace(principal, named))) space = named;
+	}
+	if (!space && query.space) space = await readableSpaceNamed(principal, query.space);
+	if (!space) throw missing();
+	const resolution = await resolveAddress(ref, { spaceId: space.id, readableSpaceIds: [space.id] });
+	if (resolution.status !== "found") throw missing();
+	const block = resolution.block;
+	const body: OutlineResolveResponse = {
+		spaceId: block.spaceId,
+		spaceKey: block.spaceKey,
+		blockId: block.id,
+		pageId: block.pageId,
+		isPage: block.isPage,
+		address: block.address,
+		title: block.title,
+		deleted: block.deleted,
 	};
 	return c.json(body);
 });

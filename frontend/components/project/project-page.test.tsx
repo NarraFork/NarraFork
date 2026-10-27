@@ -4,6 +4,7 @@ import { act, type ComponentType, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 
 let canWrite = true;
+let projectLoading = false;
 let projectError = false;
 let settingsError = false;
 let outlineEnabled = false;
@@ -21,6 +22,7 @@ mock.module("@mantine/core", () => ({
 	Stack: box,
 	Text: box,
 	Title: box,
+	Skeleton: () => <div data-skeleton />,
 	Loader: () => <div data-loader />,
 	Button: ({
 		children,
@@ -83,14 +85,16 @@ mock.module("@tanstack/react-router", () => ({
 }));
 mock.module("../../hooks/useProjects", () => ({
 	useProject: () => ({
-		isLoading: false,
+		isLoading: projectLoading,
 		isError: projectError,
-		data: {
-			name: "My project",
-			gitPath: "/project-directory",
-			description: "Description",
-			canWrite,
-		},
+		data: projectLoading
+			? undefined
+			: {
+					name: "My project",
+					gitPath: "/project-directory",
+					description: "Description",
+					canWrite,
+				},
 	}),
 }));
 const fullAccess = mock(() => {
@@ -147,6 +151,7 @@ let container: HTMLDivElement;
 const saved = new Map<string, PropertyDescriptor | undefined>();
 beforeEach(() => {
 	canWrite = true;
+	projectLoading = false;
 	projectError = false;
 	settingsError = false;
 	outlineEnabled = false;
@@ -219,6 +224,21 @@ test("project shows directory and sessions, but does not mount tools on read", a
 	});
 	await click("compatibility.loadMore");
 	expect(fetchNextPage).toHaveBeenCalledTimes(1);
+});
+test("project and sessions start together while the loading shell stays visible", async () => {
+	projectLoading = true;
+	await act(async () => root.render(<Page />));
+	expect(container.querySelector("[data-skeleton]")).not.toBeNull();
+	expect(container.textContent).toContain("compatibility.sessions");
+	expect(list).toHaveBeenCalledWith({
+		projectId: "original-project",
+		limit: 30,
+		cursor: "cursor",
+	});
+	const create = Array.from(container.querySelectorAll("button")).find(
+		(node) => node.textContent === "newSession",
+	);
+	expect(create?.disabled).toBe(true);
 });
 test("write-only members can create with explicit project/default cwd then invalidate and navigate", async () => {
 	await act(async () => root.render(<Page />));

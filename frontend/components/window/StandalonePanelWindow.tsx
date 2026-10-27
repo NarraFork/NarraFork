@@ -20,12 +20,15 @@ import type { FileTarget } from "@shared/file-reference";
 import { useNavigate } from "@tanstack/react-router";
 import { lazy, Suspense, useCallback, useEffect, useLayoutEffect, useMemo, useState } from "react";
 import { useNarrator } from "../../hooks/useNarrator";
+import { lazyWithRetry } from "../../lib/lazy-with-retry";
 import { narratorWSManager } from "../../lib/narrator-ws-manager";
+import type { OutlinePanelState } from "../../lib/outline-panel";
 import { FileReferenceScopeProvider } from "../narrator/composer/FileReferenceScope";
 import { NarratorDockContext } from "../narrator/dock/NarratorDockContext";
 import { SubagentSessionPanelContent } from "../narrator/dock/panels";
 import { FilePanelContent } from "../narrator/file-panel/FilePanelContent";
 import type { TerminalLeafConfig, WebviewLeafConfig } from "../narrator/split-tree";
+import { OutlineHostProvider } from "../outline/outline-host";
 import {
 	type PluginUiSessionContext,
 	PluginUiSurfaceProvider,
@@ -41,7 +44,7 @@ import {
 	pluginPanelWindowHostContext,
 } from "./panel-window";
 
-const NarratorPanel = lazy(() =>
+const NarratorPanel = lazyWithRetry(() =>
 	import("../narrator/NarratorPanel").then((m) => ({ default: m.NarratorPanel })),
 );
 const NarratorTerminal = lazy(() =>
@@ -91,6 +94,9 @@ const ToolEditFileViewer = lazy(() =>
 );
 const PluginDockPanelView = lazy(() =>
 	import("../plugins/PluginDockPanel").then((m) => ({ default: m.PluginDockPanelView })),
+);
+const OutlinePanelContent = lazy(() =>
+	import("../outline/OutlinePanelContent").then((m) => ({ default: m.OutlinePanelContent })),
 );
 
 function PanelBoundary({ children }: { children: React.ReactNode }) {
@@ -204,6 +210,8 @@ function PanelContent({ descriptor }: { descriptor: PanelWindowDescriptor }) {
 			);
 		case "plugin":
 			return <PluginWindow descriptor={descriptor} />;
+		case "outline":
+			return <OutlineWindow descriptor={descriptor} />;
 		default:
 			return <NarratorBoundWindow descriptor={descriptor} />;
 	}
@@ -399,6 +407,49 @@ function FileWindow({
 				)}
 			</PanelBoundary>
 		</FileReferenceScopeProvider>
+	);
+}
+
+/**
+ * Outline window: the panel's content, navigated in place. Each navigation replaces the
+ * window's descriptor in its URL (no history entry), so a reload shows the same place; a
+ * Ctrl/Cmd-click opens another window, and an agent commit's session opens in a chat window.
+ */
+function OutlineWindow({
+	descriptor,
+}: {
+	descriptor: Extract<PanelWindowDescriptor, { panelType: "outline" }>;
+}) {
+	const [state, setState] = useState<OutlinePanelState>(() => {
+		const { panelType: _panelType, ...initial } = descriptor;
+		return initial;
+	});
+	const navigate = useCallback((next: OutlinePanelState) => {
+		setState(next);
+		const replaced = normalizePanelWindowDescriptor({ panelType: "outline", ...next });
+		if (!replaced) return;
+		try {
+			const url = new URL(window.location.href);
+			url.searchParams.set("d", JSON.stringify(replaced));
+			window.history.replaceState(window.history.state, "", url.toString());
+		} catch {
+			// The place still shows; only a reload would lose it.
+		}
+	}, []);
+	const openNew = useCallback(
+		(next: OutlinePanelState) => openPanelInWindow({ panelType: "outline", ...next }),
+		[],
+	);
+	const openSession = useCallback(
+		(narratorId: string) => openPanelInWindow({ panelType: "chat", narratorId }),
+		[],
+	);
+	return (
+		<OutlineHostProvider openSession={openSession}>
+			<PanelBoundary>
+				<OutlinePanelContent state={state} onChange={navigate} onOpenNew={openNew} />
+			</PanelBoundary>
+		</OutlineHostProvider>
 	);
 }
 

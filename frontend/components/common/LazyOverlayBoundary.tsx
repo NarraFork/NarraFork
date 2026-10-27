@@ -1,5 +1,6 @@
+import { Drawer, type DrawerProps, Group, Loader, Modal, type ModalProps } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
-import { Component, type ReactNode } from "react";
+import { Component, type ReactNode, Suspense, useEffect, useRef, useState } from "react";
 import i18n from "../../lib/i18n";
 
 interface Props {
@@ -11,6 +12,8 @@ interface Props {
 	resetKey?: unknown;
 	/** Identifies the overlay in the failure notification. */
 	label?: string;
+	/** Optional replacement for a failed body. The historical default is an empty body. */
+	fallback?: ReactNode;
 }
 
 interface State {
@@ -74,7 +77,119 @@ export class LazyOverlayBoundary extends Component<Props, State> {
 	}
 
 	render(): ReactNode {
-		if (this.state.failed) return null;
+		if (this.state.failed) return this.props.fallback ?? null;
 		return this.props.children;
 	}
+}
+
+type LazyOverlayShellBaseProps = {
+	opened: boolean;
+	onClose: () => void;
+	children: ReactNode;
+	/** Keep the shell visible without mounting the body (for example while resolving context). */
+	busy?: boolean;
+	/** Identifies the body in a chunk-load failure notification. */
+	label?: string;
+	loadingFallback?: ReactNode;
+};
+
+export type LazyOverlayShellProps = LazyOverlayShellBaseProps &
+	(
+		| ({ type: "modal" } & Omit<ModalProps, "opened" | "onClose" | "children">)
+		| ({ type: "drawer" } & Omit<DrawerProps, "opened" | "onClose" | "children">)
+	);
+
+const defaultLoadingFallback = (
+	<Group justify="center" py="md" aria-busy="true">
+		<Loader size="sm" />
+	</Group>
+);
+
+/** Owns the single Mantine overlay while only its body is lazy-loaded. */
+export function LazyOverlayShell(props: LazyOverlayShellProps) {
+	const { opened, onClose, children, busy = false, label, loadingFallback, type } = props;
+	const [mounted, setMounted] = useState(opened);
+	const openedRef = useRef(opened);
+	const previousOpenedRef = useRef(opened);
+	const openGenerationRef = useRef(0);
+	openedRef.current = opened;
+	if (opened && !previousOpenedRef.current) openGenerationRef.current += 1;
+	previousOpenedRef.current = opened;
+
+	useEffect(() => {
+		if (opened) setMounted(true);
+	}, [opened]);
+
+	if (!opened && !mounted) return null;
+
+	const handleExitTransitionEnd = () => {
+		// Mantine may finish an old exit after a rapid reopen. Only that still-closed
+		// generation is allowed to release the body and its local state.
+		if (!openedRef.current) setMounted(false);
+	};
+	const body = (
+		// Closing must preserve the failed boundary: resetting it here would rethrow the
+		// cached lazy rejection during the exit transition. Only a fresh open retries it.
+		<LazyOverlayBoundary
+			resetKey={openGenerationRef.current}
+			label={label}
+			fallback={loadingFallback}
+		>
+			<Suspense fallback={loadingFallback ?? defaultLoadingFallback}>
+				{busy ? (loadingFallback ?? defaultLoadingFallback) : children}
+			</Suspense>
+		</LazyOverlayBoundary>
+	);
+
+	if (type === "modal") {
+		const {
+			opened: _opened,
+			onClose: _onClose,
+			children: _children,
+			busy: _busy,
+			label: _label,
+			loadingFallback: _loadingFallback,
+			type: _type,
+			onExitTransitionEnd,
+			...modalProps
+		} = props;
+		return (
+			<Modal
+				{...modalProps}
+				opened={opened}
+				onClose={onClose}
+				onExitTransitionEnd={() => {
+					onExitTransitionEnd?.();
+					handleExitTransitionEnd();
+				}}
+			>
+				{body}
+			</Modal>
+		);
+	}
+
+	const {
+		opened: _opened,
+		onClose: _onClose,
+		children: _children,
+		busy: _busy,
+		label: _label,
+		loadingFallback: _loadingFallback,
+		type: _type,
+		onExitTransitionEnd,
+		...drawerProps
+	} = props;
+	return (
+		<Drawer
+			{...drawerProps}
+			opened={opened}
+			onClose={onClose}
+			onExitTransitionEnd={() => {
+				onExitTransitionEnd?.();
+				handleExitTransitionEnd();
+			}}
+		>
+			{body}
+		</Drawer>
+	);
 }

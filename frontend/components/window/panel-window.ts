@@ -15,6 +15,7 @@
  */
 
 import { assetUrl } from "@frontend/lib/base-path";
+import { normalizeOutlinePanelState, type OutlinePanelState } from "@frontend/lib/outline-panel";
 import { z } from "zod";
 import type { NarratorToolPanelType } from "../narrator/dock/dock-panel-types";
 import { isNarratorToolPanelType } from "../narrator/dock/dock-panel-types";
@@ -94,6 +95,8 @@ export type PanelWindowDescriptor =
 			scope: KnowledgeEntryScope;
 			hostNarratorId?: string;
 	  }
+	/** An outline place; the window navigates it in place (and keeps it in its URL). */
+	| ({ panelType: "outline" } & OutlinePanelState)
 	| {
 			panelType: Exclude<NarratorToolPanelType, "terminal" | "mock">;
 			narratorId: string;
@@ -184,6 +187,9 @@ function normalizeDescriptor(value: unknown): PanelWindowDescriptor | null {
 				...(hostNarratorId ? { hostNarratorId } : {}),
 			};
 		}
+		case "outline":
+			// Host and membership bookkeeping (`hostNarratorId`, `panelRowId`) stay behind.
+			return { panelType: "outline", ...normalizeOutlinePanelState(value) };
 		case "webview": {
 			const config = isRecord(value.webviewConfig) ? value.webviewConfig : null;
 			const url = str(config?.url);
@@ -334,6 +340,8 @@ export function panelWindowTitle(descriptor: PanelWindowDescriptor): string {
 			return descriptor.webviewConfig.title?.trim() || descriptor.webviewConfig.url;
 		case "plugin":
 			return descriptor.fallback?.title?.trim() || PANEL_DEFAULT_TITLE.plugin;
+		case "outline":
+			return descriptor.title?.trim() || PANEL_DEFAULT_TITLE.outline;
 		default:
 			return PANEL_DEFAULT_TITLE[descriptor.panelType] ?? "Panel";
 	}

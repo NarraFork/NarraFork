@@ -114,6 +114,7 @@ async function bootstrap() {
 	// Sweep focus-dock layouts unopened for >30 days (best-effort, never throws).
 	if (!isPublicShare) cleanupStaleNarratorDockLayouts();
 
+	// Wait only for global common/errors copy; localized route gates load the rest.
 	await initI18n(getInitialNamespaces(window.location.pathname));
 	if (!isPublicShare) void syncPluginUiContributions().catch(() => {});
 

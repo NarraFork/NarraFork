@@ -5,6 +5,7 @@
 import { Link, useNavigate } from "@tanstack/react-router";
 import { useCallback } from "react";
 import type { OutlineLinkProps, OutlineTarget } from "../components/outline/outline-nav";
+import { type OutlinePanelState, outlinePanelTarget } from "./outline-panel";
 import type { OutlineBlockSearch } from "./outline-view";
 
 function blockSearch(to: Extract<OutlineTarget, { kind: "block" }>): OutlineBlockSearch {
@@ -48,4 +49,10 @@ export function useOutlineRouterNavigate(): (to: OutlineTarget) => void {
 		},
 		[navigate],
 	);
+}
+
+/** Leave for the outline page of a panel's state ("open in outline page"). */
+export function useOpenOutlinePage(): (state: OutlinePanelState) => void {
+	const navigate = useOutlineRouterNavigate();
+	return useCallback((state: OutlinePanelState) => navigate(outlinePanelTarget(state)), [navigate]);
 }

@@ -6,12 +6,12 @@ import {
 	Card,
 	Code,
 	Group,
-	Loader,
 	Modal,
 	PasswordInput,
 	Progress,
 	SegmentedControl,
 	SimpleGrid,
+	Skeleton,
 	Stack,
 	Text,
 	TextInput,
@@ -42,6 +42,23 @@ const PROJECT_LIST_RENDER_LIMIT = 200;
 export const Route = createFileRoute("/projects/")({
 	component: ProjectListPage,
 });
+
+function ProjectGridSkeleton() {
+	return (
+		<SimpleGrid
+			cols={{ base: 1, sm: 2, lg: 3 }}
+			aria-busy="true"
+			data-testid="project-list-skeleton"
+		>
+			{["first", "second", "third"].map((key) => (
+				<Card key={key} padding="lg" radius="md" withBorder>
+					<Skeleton height={22} width="62%" />
+					<Skeleton height={14} mt="md" width="88%" />
+				</Card>
+			))}
+		</SimpleGrid>
+	);
+}
 
 function ProjectListPage() {
 	const { data: projects, isLoading } = useProjects();
@@ -179,8 +196,6 @@ function ProjectListPage() {
 	// Unified error from either mutation
 	const mutationError = createProjectStream.error ?? createProject.error;
 
-	if (isLoading) return <Loader />;
-
 	return (
 		<Stack>
 			<Group justify="space-between">
@@ -188,7 +203,9 @@ function ProjectListPage() {
 				<Button onClick={guardedOpen}>{t("newProject")}</Button>
 			</Group>
 
-			{!projects?.length ? (
+			{isLoading ? (
+				<ProjectGridSkeleton />
+			) : !projects?.length ? (
 				// Two different empty states: telling a user who simply has not been added to
 				// any project to "create one" sends them down the wrong path.
 				<Text c="dimmed">

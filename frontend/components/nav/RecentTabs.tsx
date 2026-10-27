@@ -90,6 +90,10 @@ import {
 	updateAsyncQuestionAttention,
 } from "../../lib/notification";
 import { LeftTruncatedPathText } from "../common/TruncatedPath";
+import {
+	CreateNarratorLazyModal,
+	preloadCreateNarratorModal,
+} from "../narrator/CreateNarratorLazyModal";
 import type { CreateNarratorResult } from "../narrator/CreateNarratorModal";
 import { UserAvatar } from "../UserAvatar";
 import { PANEL_WINDOW_FEATURES, recentTabWindowHref } from "../window/panel-window";
@@ -118,12 +122,6 @@ import {
 import { TabGitIdentityMenu } from "./TabGitIdentityMenu";
 import { useRecentTabExternalDrop } from "./useRecentTabExternalDrop";
 import { useRecentTabsDrag } from "./useRecentTabsDrag";
-
-const CreateNarratorModal = React.lazy(() =>
-	import("../narrator/CreateNarratorModal").then((m) => ({
-		default: m.CreateNarratorModal,
-	})),
-);
 
 const QUERY_KEY = ["user-preferences", "recent-tabs"];
 
@@ -543,8 +541,14 @@ export function RecentTabList({
 
 	// Workspace "add narrator" modal state
 	const [wsCreateTarget, setWsCreateTarget] = useState<string | null>(null);
-	// "New narrator in this directory" modal state (cwd pre-filled from a tab)
-	const [newNarratorCwd, setNewNarratorCwd] = useState<string | null>(null);
+	// Open the shell before resolving cwd; only a resolved target mounts the form body.
+	const [newNarratorTarget, setNewNarratorTarget] = useState<{
+		narratorId: string;
+		cwd?: string;
+	} | null>(null);
+	const newNarratorTargetRef = useRef(newNarratorTarget);
+	newNarratorTargetRef.current = newNarratorTarget;
+	const newNarratorRequestRef = useRef(0);
 
 	const listBoxRef = useRef<HTMLDivElement | null>(null);
 	// Collapse is a user/view preference, never a temporary drag state.
@@ -687,18 +691,34 @@ export function RecentTabList({
 	 * when the tab has no
 	 * directory (workspace, project) or the lookup fails.
 	 */
-	const resolveTabDirectory = useCallback(async (tab: RecentTab): Promise<string | null> => {
-		try {
-			const narratorId = getRecentTabNarratorId(tab);
-			if (narratorId) {
-				const narrator = await api.getNarrator(narratorId);
+	const resolveTabDirectory = useCallback(
+		async (tabOrNarratorId: RecentTab | string): Promise<string | null> => {
+			try {
+				const narratorId =
+					typeof tabOrNarratorId === "string"
+						? tabOrNarratorId
+						: getRecentTabNarratorId(tabOrNarratorId);
+				if (!narratorId) return null;
+				// Directory actions must see cwd changes made in other windows, even with cached data.
+				const narrator = await qc.fetchQuery({
+					queryKey: ["narrators", narratorId],
+					queryFn: () => api.getNarrator(narratorId),
+					staleTime: 0,
+					gcTime: PREFETCH_QUERY_GC_TIME_MS,
+				});
 				// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 				return ((narrator as any)?.cwd as string | undefined) ?? null;
+			} catch {
+				return null;
 			}
-		} catch {
-			return null;
-		}
-		return null;
+		},
+		[qc],
+	);
+
+	const closeNewNarratorHere = useCallback(() => {
+		newNarratorRequestRef.current += 1;
+		newNarratorTargetRef.current = null;
+		setNewNarratorTarget(null);
 	}, []);
 
 	const handleNewNarratorHere = useCallback(async () => {
@@ -706,17 +726,32 @@ export function RecentTabList({
 		const { tab } = ctxMenu;
 		setCtxMenu(null);
 		if (!requireSetup()) return;
-		const dir = await resolveTabDirectory(tab);
-		if (!dir) {
+		const narratorId = getRecentTabNarratorId(tab);
+		if (!narratorId) {
 			notifications.show({ color: "red", message: t("newNarratorHereNoDir") });
 			return;
 		}
-		setNewNarratorCwd(dir);
-	}, [ctxMenu, requireSetup, resolveTabDirectory, t]);
+		const request = ++newNarratorRequestRef.current;
+		const target = { narratorId };
+		newNarratorTargetRef.current = target;
+		setNewNarratorTarget(target);
+		const dir = await resolveTabDirectory(narratorId);
+		if (request !== newNarratorRequestRef.current || newNarratorTargetRef.current !== target) {
+			return;
+		}
+		if (!dir) {
+			closeNewNarratorHere();
+			notifications.show({ color: "red", message: t("newNarratorHereNoDir") });
+			return;
+		}
+		const resolved = { narratorId, cwd: dir };
+		newNarratorTargetRef.current = resolved;
+		setNewNarratorTarget(resolved);
+	}, [ctxMenu, requireSetup, resolveTabDirectory, closeNewNarratorHere, t]);
 
 	const handleNewNarratorHereCreated = useCallback(
 		(data: CreateNarratorResult) => {
-			setNewNarratorCwd(null);
+			closeNewNarratorHere();
 			addRecentTab({
 				type: "narrator",
 				id: data.id,
@@ -727,7 +762,7 @@ export function RecentTabList({
 			navigate({ to: `/narrators/${data.id}` });
 			onNavigate?.();
 		},
-		[navigate, onNavigate],
+		[navigate, onNavigate, closeNewNarratorHere],
 	);
 
 	const fsRevealCapability = useFsRevealCapability();
@@ -1272,25 +1307,18 @@ export function RecentTabList({
 							</Button>
 						</Group>
 					</Modal>
-					{wsCreateTarget !== null && (
-						<React.Suspense fallback={null}>
-							<CreateNarratorModal
-								opened={wsCreateTarget !== null}
-								onClose={() => setWsCreateTarget(null)}
-								onCreated={handleWsNarratorCreated}
-							/>
-						</React.Suspense>
-					)}
-					{newNarratorCwd !== null && (
-						<React.Suspense fallback={null}>
-							<CreateNarratorModal
-								opened={newNarratorCwd !== null}
-								initialCwd={newNarratorCwd}
-								onClose={() => setNewNarratorCwd(null)}
-								onCreated={handleNewNarratorHereCreated}
-							/>
-						</React.Suspense>
-					)}
+					<CreateNarratorLazyModal
+						opened={wsCreateTarget !== null}
+						onClose={() => setWsCreateTarget(null)}
+						onCreated={handleWsNarratorCreated}
+					/>
+					<CreateNarratorLazyModal
+						opened={newNarratorTarget !== null}
+						busy={newNarratorTarget?.cwd == null}
+						initialCwd={newNarratorTarget?.cwd}
+						onClose={closeNewNarratorHere}
+						onCreated={handleNewNarratorHereCreated}
+					/>
 				</Box>
 				{/* Keep preview rows outside the measured source container. */}
 				<DragOverlay dropAnimation={null} style={{ pointerEvents: "none" }}>
@@ -1871,7 +1899,12 @@ function TabItemBody({
 									size="xs"
 									variant="subtle"
 									onClick={(e: React.MouseEvent) => onWsAddClick(e, tab.id)}
-									onPointerDown={(e: React.PointerEvent) => e.stopPropagation()}
+									onPointerEnter={preloadCreateNarratorModal}
+									onFocus={preloadCreateNarratorModal}
+									onPointerDown={(e: React.PointerEvent) => {
+										e.stopPropagation();
+										preloadCreateNarratorModal();
+									}}
 								>
 									<IconPlus size={14} />
 								</ActionIcon>
@@ -2244,7 +2277,15 @@ function TabContextMenu({
 						</UnstyledButton>
 					)}{" "}
 					{canNewNarratorHere && (
-						<UnstyledButton px="xs" py={4} onClick={onNewNarratorHere} style={{ borderRadius: 4 }}>
+						<UnstyledButton
+							px="xs"
+							py={4}
+							onPointerEnter={preloadCreateNarratorModal}
+							onFocus={preloadCreateNarratorModal}
+							onPointerDown={preloadCreateNarratorModal}
+							onClick={onNewNarratorHere}
+							style={{ borderRadius: 4 }}
+						>
 							<Group gap={8} wrap="nowrap">
 								<IconFolderPlus size={14} />
 								<Text size="sm">{t("newNarratorHere")}</Text>

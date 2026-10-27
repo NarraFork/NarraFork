@@ -321,7 +321,7 @@ describe("single in-memory job", () => {
 		insert(db, "a");
 		const service = new TokenRecalculationService({
 			createStore: async () => createSqliteTokenRecalculationStore(db),
-			createResolver: () => resolver,
+			createResolver: async () => resolver,
 		});
 		const started = service.start({});
 		started.scanned = 999;
@@ -338,7 +338,7 @@ describe("single in-memory job", () => {
 			createStore: async () => {
 				throw new Error("secret postgres credentials");
 			},
-			createResolver: () => resolver,
+			createResolver: async () => resolver,
 		});
 		service.start({});
 		await service.wait();

@@ -13,8 +13,8 @@
  *
  *   - a layout entry naming a panel that is not a member is dropped;
  *   - a member the layout does not mention is appended (the caller adds it live);
- *   - a dependent panel (tool / subagent / file / knowledge) survives only while its
- *     host narrator is still a member.
+ *   - a dependent panel (tool / subagent / file / knowledge, an outline page a session
+ *     opened) survives only while its host narrator is still a member.
  *
  * So a damaged layout costs POSITIONS, never a panel. This module is deliberately free
  * of React and dockview imports so that guarantee can be tested directly.
@@ -79,6 +79,11 @@ function layoutEntryIdentity(params: Record<string, unknown>, panelId: string): 
 		// only handle is the dockview panel id it was stored under.
 		return `panel:${stripPanelIdPrefix(panelId)}`;
 	}
+	// An outline member is added under its row's dom id like the kinds above; an outline
+	// resource (with a host) is a dependent and never reaches here in the reconcile path.
+	if (panelType === "outline" && typeof params.hostNarratorId !== "string") {
+		return `panel:${stripPanelIdPrefix(panelId)}`;
+	}
 	return null;
 }
 
@@ -101,6 +106,11 @@ function dependentHostNarratorId(params: Record<string, unknown>): string | null
 		return typeof narratorId === "string" ? narratorId : null;
 	}
 	if (panelType === "subagent" || panelType === "file" || panelType === "knowledge") {
+		const hostNarratorId = params.hostNarratorId;
+		return typeof hostNarratorId === "string" ? hostNarratorId : null;
+	}
+	if (panelType === "outline") {
+		// A session's outline resource lives and dies with its host; a member does not.
 		const hostNarratorId = params.hostNarratorId;
 		return typeof hostNarratorId === "string" ? hostNarratorId : null;
 	}

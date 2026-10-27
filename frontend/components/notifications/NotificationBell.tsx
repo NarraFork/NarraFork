@@ -1,17 +1,15 @@
 import { ActionIcon, Indicator, Tooltip } from "@mantine/core";
 import { IconBell } from "@tabler/icons-react";
-import { lazy, Suspense, useState } from "react";
+import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { loadedHumanAttentionItems, useHumanAttention } from "../../hooks/useHumanAttention";
 import { useMyKnowledgeSubmissionOutcomes, useReviewInboxCount } from "../../hooks/useKnowledge";
+import {
+	NotificationCenterLazyDrawer,
+	preloadNotificationCenterDrawer,
+} from "./NotificationCenterLazyDrawer";
 import { formatUnreadBadge, type NotificationCenterTab } from "./types";
 import { useNotificationUnreadCounts } from "./useNotificationCenter";
-
-const NotificationCenterDrawer = lazy(() =>
-	import("./NotificationCenterDrawer").then((module) => ({
-		default: module.NotificationCenterDrawer,
-	})),
-);
 
 export function NotificationBell() {
 	const { t } = useTranslation("nav");
@@ -74,6 +72,9 @@ export function NotificationBell() {
 						color={hasAttention ? "yellow" : reviewBadge ? "indigo" : "gray"}
 						aria-label={badgeAria}
 						data-testid="notification-bell"
+						onPointerEnter={preloadNotificationCenterDrawer}
+						onFocus={preloadNotificationCenterDrawer}
+						onPointerDown={preloadNotificationCenterDrawer}
 						onClick={() => {
 							setInitialTab(hasAttention || attention.isError ? "attention" : "activity");
 							setOpened(true);
@@ -83,17 +84,13 @@ export function NotificationBell() {
 					</ActionIcon>
 				</Indicator>
 			</Tooltip>
-			{opened && (
-				<Suspense fallback={null}>
-					<NotificationCenterDrawer
-						opened
-						onClose={() => setOpened(false)}
-						initialTab={initialTab}
-						summaryError={counts.isError}
-						onRetrySummary={() => void counts.refetch()}
-					/>
-				</Suspense>
-			)}
+			<NotificationCenterLazyDrawer
+				opened={opened}
+				onClose={() => setOpened(false)}
+				initialTab={initialTab}
+				summaryError={counts.isError}
+				onRetrySummary={() => void counts.refetch()}
+			/>
 		</>
 	);
 }

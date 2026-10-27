@@ -338,6 +338,90 @@ describe("non-narrator panels", () => {
 	});
 });
 
+describe("outline pages as members", () => {
+	it("stores an outline page with only its place, and lists it back", async () => {
+		seedWorkspace("ws");
+		const { panel } = await addWorkspacePanel(USER, "ws", {
+			kind: "outline",
+			config: {
+				panelType: "outline",
+				spaceId: "space1",
+				blockId: "page1",
+				view: "all",
+				asOf: 12,
+				title: "Kept out of the row",
+				hostNarratorId: "n1",
+			},
+		});
+		expect(panel.kind).toBe("outline");
+		expect(panel.config).toEqual({ spaceId: "space1", blockId: "page1", view: "all" });
+		expect(JSON.parse(panelRows("ws")[0]?.configJson ?? "null")).toEqual({
+			spaceId: "space1",
+			blockId: "page1",
+			view: "all",
+		});
+		// Two pages, or the same page twice, are two members.
+		await addWorkspacePanel(USER, "ws", { kind: "outline", config: { spaceId: "space1" } });
+		const listed = await listWorkspacePanels(USER, "ws");
+		expect(listed.map((member) => [member.kind, member.config])).toEqual([
+			["outline", { spaceId: "space1", blockId: "page1", view: "all" }],
+			["outline", { spaceId: "space1" }],
+		]);
+	});
+
+	it("accepts the kind at the API boundary and refuses a config naming no space", async () => {
+		seedWorkspace("ws");
+		expect(
+			createWorkspacePanelSchema.safeParse({ kind: "outline", config: { spaceId: "s" } }).success,
+		).toBe(true);
+		for (const config of [null, {}, { spaceId: "" }, { spaceId: "bad/id" }, { spaceId: 3 }]) {
+			await expect(addWorkspacePanel(USER, "ws", { kind: "outline", config })).rejects.toThrow(
+				/spaceId/,
+			);
+		}
+		expect(panelRows("ws")).toHaveLength(0);
+	});
+
+	it("updates the place in place and refuses to clear it", async () => {
+		seedWorkspace("ws");
+		const { panel } = await addWorkspacePanel(USER, "ws", {
+			kind: "outline",
+			config: { spaceId: "space1", blockId: "page1" },
+		});
+		const updated = await updateWorkspacePanelConfig(USER, "ws", panel.id, {
+			spaceId: "space1",
+			blockId: "block7",
+			pageId: "page1",
+		});
+		expect(updated.config).toEqual({ spaceId: "space1", blockId: "block7" });
+		await expect(updateWorkspacePanelConfig(USER, "ws", panel.id, {})).rejects.toThrow(/spaceId/);
+		expect(JSON.parse(panelRows("ws")[0]?.configJson ?? "null")).toEqual({
+			spaceId: "space1",
+			blockId: "block7",
+		});
+	});
+
+	it("backfills an outline member from an old layout, but not a session's outline resource", () => {
+		const layout = dockviewLayout(["n1"], {
+			wsp_row1: {
+				id: "wsp_row1",
+				params: { panelType: "outline", spaceId: "space1", blockId: "page1", panelRowId: "row1" },
+			},
+			woutline_n1_x: {
+				id: "woutline_n1_x",
+				params: { panelType: "outline", spaceId: "space1", blockId: "page2", hostNarratorId: "n1" },
+			},
+		});
+		const recovered = recoverPanelsFromLayout(layout);
+		expect(recovered).toContainEqual({
+			kind: "outline",
+			narratorId: null,
+			config: { spaceId: "space1", blockId: "page1" },
+		});
+		expect(recovered.filter((panel) => panel.kind === "outline")).toHaveLength(1);
+	});
+});
+
 describe("ownership", () => {
 	it("treats another user's workspace as missing and writes nothing", async () => {
 		seedWorkspace("ws");

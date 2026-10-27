@@ -240,3 +240,30 @@ export interface OutlineRevertResponse {
 	/** Blocks put back with an adjustment (an alias dropped, a position moved). */
 	adjusted: number;
 }
+
+/**
+ * Limits of `GET /api/outline/resolve`: what a tool card or a link names, turned into a place to
+ * open. One space is consulted per request.
+ */
+export const OUTLINE_RESOLVE_REQUEST_LIMITS = {
+	/** Characters of a reference (`key/sid`, `key/alias`, a bare sid, alias or title). */
+	maxRef: 300,
+} as const;
+
+/**
+ * Where a reference or a commit points: the block to focus and the page it is on. For a commit,
+ * the first page it changed, shown as of the commit (`asOf`).
+ */
+export interface OutlineResolveResponse {
+	spaceId: string;
+	spaceKey: string;
+	blockId: string;
+	pageId: string;
+	isPage: boolean;
+	/** `key/sid` of the block. */
+	address: string;
+	title: string;
+	deleted: boolean;
+	/** Set for a commit: show the page as of this seq. */
+	asOf?: number;
+}

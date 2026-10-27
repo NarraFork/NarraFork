@@ -272,6 +272,8 @@ export function componentForParams(params: WorkspacePanelParams): string {
 			return PANEL_COMPONENT.subagent;
 		case "file":
 			return PANEL_COMPONENT.file;
+		case "outline":
+			return PANEL_COMPONENT.outline;
 		case "plugin":
 			return PANEL_COMPONENT.plugin;
 		default:

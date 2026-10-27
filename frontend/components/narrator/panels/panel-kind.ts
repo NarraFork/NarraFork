@@ -18,6 +18,7 @@
 
 import type { FileSelection } from "@shared/file-reference";
 import { localFileDirectory } from "@shared/markdown-file-path";
+import type { OutlinePanelState } from "../../../lib/outline-panel";
 import type { PluginDockPanelParams } from "../../plugins/protocol";
 import type { TerminalLeafConfig, WebviewLeafConfig } from "../split-tree";
 import { isToolEditReference, type ToolEditReference } from "../tool-call/tool-edit-reference";
@@ -37,6 +38,8 @@ import { isToolEditReference, type ToolEditReference } from "../tool-call/tool-e
  * - `file`     — a multi-instance read-only file viewer in the secondary area.
  * - `filetree` — a singleton browser of the narrator's cwd, which opens `file` panels.
  * - `webview`  — a standalone webview (workspace only).
+ * - `outline`  — a multi-instance outline page (or a space's pages, or the outline home):
+ *   the router-free outline view, navigated inside the panel.
  * - `mock`     — TEMPORARY streaming harness (see `../mock/README-REMOVAL.md`).
  */
 export type PanelKind =
@@ -54,6 +57,7 @@ export type PanelKind =
 	| "subagent"
 	| "file"
 	| "knowledge"
+	| "outline"
 	| "webview"
 	| "plugin"
 	| "mock";
@@ -67,7 +71,7 @@ export type PanelKind =
  */
 export type ResourcePanelKind = Exclude<
 	PanelKind,
-	"chat" | "subagent" | "file" | "knowledge" | "webview" | "plugin"
+	"chat" | "subagent" | "file" | "knowledge" | "outline" | "webview" | "plugin"
 >;
 
 /**
@@ -238,6 +242,19 @@ export interface KnowledgePanelParams {
 	hostNarratorId?: string;
 }
 
+/**
+ * Params carried by an outline panel (multi-instance). Like `knowledge`, the resource identity
+ * — the space and the page, plus what the panel shows of it (focus, view, time) — lives in the
+ * params and survives serialization, so a reload restores the same focus, view and time.
+ * `stripIdentityFromLayout` only removes host identity. See `lib/outline-panel.ts` for the
+ * fields and for which panel a request opens in.
+ */
+export interface OutlinePanelParams extends OutlinePanelState {
+	panelType: "outline";
+	/** Owning root narrator cluster (workspace resources; absent for workspace members). */
+	hostNarratorId?: string;
+}
+
 /** Params carried by a standalone terminal panel (workspace). */
 export interface StandaloneTerminalPanelParams {
 	panelType: "terminal";
@@ -261,6 +278,7 @@ export type AnyPanelParams =
 	| SubagentPanelParams
 	| FilePanelParams
 	| KnowledgePanelParams
+	| OutlinePanelParams
 	| StandaloneTerminalPanelParams
 	| StandaloneWebviewPanelParams
 	| PluginDockPanelParams;
@@ -288,6 +306,7 @@ export const PANEL_COMPONENT: Record<PanelKind, string> = {
 	subagent: "subagent",
 	file: "file",
 	knowledge: "knowledge",
+	outline: "outline",
 	webview: "webview",
 	plugin: "plugin",
 	mock: "mock",
@@ -315,6 +334,7 @@ export const PANEL_DEFAULT_TITLE: Record<PanelKind, string> = {
 	subagent: "Subagent",
 	file: "File",
 	knowledge: "Knowledge",
+	outline: "Outline",
 	webview: "Webview",
 	plugin: "Plugin",
 	mock: "Mock stream",

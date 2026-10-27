@@ -20,7 +20,9 @@ import { lazy, Suspense } from "react";
 import { useTranslation } from "react-i18next";
 import { getToken } from "../lib/api";
 import { isPublicNarratorSharePath } from "../lib/app-path-classify";
+import { APP_SHELL_NAMESPACES, getNamespacesForPath } from "../lib/i18n";
 import { isStandaloneWindowPath } from "../lib/standalone-window";
+import { I18nNamespaceGate } from "./common/I18nNamespaceGate";
 
 const AuthenticatedLayout = lazy(() =>
 	import("./AuthenticatedAppLayout").then((module) => ({ default: module.AuthenticatedLayout })),
@@ -96,8 +98,15 @@ export function RootLayout() {
 		pathname === "/licenses" ||
 		pathname === "/changelog" ||
 		(import.meta.env.DEV && pathname === "/dev-vlist-harness");
-	if (publicSurface || isStandaloneWindowPath(pathname) || (publicPage && !getToken()))
-		return <Outlet />;
+	// Window chrome owns its local gate so slow panel resources never delay the frame.
+	if (isStandaloneWindowPath(pathname)) return <Outlet />;
+	if (publicSurface || (publicPage && !getToken())) {
+		return (
+			<I18nNamespaceGate namespaces={getNamespacesForPath(pathname)}>
+				<Outlet />
+			</I18nNamespaceGate>
+		);
+	}
 	return (
 		<Suspense
 			fallback={
@@ -106,7 +115,9 @@ export function RootLayout() {
 				</Center>
 			}
 		>
-			<AuthenticatedLayout />
+			<I18nNamespaceGate namespaces={APP_SHELL_NAMESPACES}>
+				<AuthenticatedLayout />
+			</I18nNamespaceGate>
 		</Suspense>
 	);
 }

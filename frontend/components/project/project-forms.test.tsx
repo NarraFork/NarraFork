@@ -40,6 +40,7 @@ mock.module("@mantine/core", () => ({
 	Title: box,
 	ScrollArea: box,
 	SimpleGrid: box,
+	Skeleton: box,
 	Tooltip: box,
 	Loader: box,
 	Progress: box,

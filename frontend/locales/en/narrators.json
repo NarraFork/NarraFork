@@ -168,5 +168,6 @@
 	"botNarrator": "Bot",
 	"botNarratorHint": "People chat with it and see only what it sends them. Its replies and tool calls stay in the transcript, which you can open as a monitor.",
 	"botName": "Bot name",
-	"botNameHint": "Required. Shown on every message the bot sends."
+	"botNameHint": "Required. Shown on every message the bot sends.",
+	"workspaceAddOutline": "Add an outline page"
 }

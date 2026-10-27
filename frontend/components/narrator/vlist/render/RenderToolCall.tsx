@@ -35,6 +35,7 @@ import { GenUICard } from "@frontend/components/gen-ui/GenUICard";
 import { DiffContent } from "@frontend/components/narrator/diff/DiffContent";
 import { resolveServerUrl } from "@frontend/lib/base-path";
 import { formatDurationText, formatFullLocaleDateTime } from "@frontend/lib/format";
+import { useOutlineLinkProps } from "@frontend/lib/outline-opener";
 import { getShikiLang } from "@frontend/lib/shiki-lang";
 import {
 	STRUCT_THEME_DARK,
@@ -339,23 +340,32 @@ function InlineLines({
 	frame,
 	availableWidth,
 	color,
+	unlinkedColor,
 	leadingSlot,
-	href,
+	href: rawHref,
 }: {
 	block: PreparedInlineBlock;
 	frame: BlockFrame;
 	availableWidth: number;
 	color?: string;
+	/** The colour when `href` turns out not to be a link here (an outline link nothing opens). */
+	unlinkedColor?: string;
 	/** Optional glyph drawn in the reserved indent lane (spec-task status icon). */
 	leadingSlot?: React.ReactNode;
 	/**
 	 * When set, the whole measured line box becomes an external link. Drawn as an
 	 * overlay so the pretext line geometry stays the single source of truth (an
 	 * <a> wrapper would let the browser re-lay out the fragments).
+	 *
+	 * An outline link (a block address, a commit) opens an outline panel beside the
+	 * session instead, and is plain text where nothing can open it.
 	 */
 	href?: string | null;
 }) {
 	const lines = useInlineLines(block, availableWidth);
+	const outlineLink = useOutlineLinkProps(rawHref);
+	const href = outlineLink === null ? null : (outlineLink?.href ?? rawHref);
+	if (outlineLink === null && unlinkedColor !== undefined) color = unlinkedColor;
 	return (
 		<div
 			style={{
@@ -369,8 +379,9 @@ function InlineLines({
 			{href ? (
 				<a
 					href={href}
-					target="_blank"
-					rel="noopener noreferrer"
+					{...(outlineLink
+						? { onClick: outlineLink.onClick, "data-outline-link": "" }
+						: { target: "_blank", rel: "noopener noreferrer" })}
 					title={href}
 					style={{
 						position: "absolute",
@@ -1696,6 +1707,7 @@ function DetailBlocks({
 							frame={bf}
 							availableWidth={availableWidth}
 							color={href ? "var(--mantine-color-teal-text)" : lineColor}
+							unlinkedColor={lineColor}
 							leadingSlot={iconSlot}
 							href={href}
 						/>

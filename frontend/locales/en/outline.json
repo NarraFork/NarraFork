@@ -130,7 +130,9 @@
 			"parent-gone": "the block it belonged under is deleted",
 			"later-children": "blocks were added under it later",
 			"cycle": "it would end up under itself"
-		}
+		},
+		"openSession": "Open the session",
+		"sessionUnavailable": "You cannot open the session that wrote this."
 	},
 	"editor": {
 		"changeStatus": "Change status",
@@ -151,6 +153,25 @@
 		"dismiss": "Dismiss",
 		"tooLargePage": "This page is too large to edit live (over 2000 blocks or 4 MB). It is shown read only; focus on a part of it or split it.",
 		"unavailable": "Live editing is not available right now; the page is shown read only.",
-		"retry": "Try again"
+		"retry": "Try again",
+		"tabLimit": "Shown read only: this tab already has {{count}} outline pages open for live editing. Close or hide one of them, then try again."
+	},
+	"link": {
+		"notFound": "This outline link points to something that does not exist, or that you cannot read."
+	},
+	"panel": {
+		"openPage": "Open in the outline page"
+	},
+	"dock": {
+		"sessions": "Sessions",
+		"recentSessions": "Recent sessions of this space",
+		"noSessions": "No sessions here yet.",
+		"discuss": "Discuss this page in a session",
+		"discussTitle": "Discuss this page in a session",
+		"discussHint": "A link to this page is put in the session's message box.",
+		"newSession": "New session…"
+	},
+	"workspace": {
+		"addTitle": "Add an outline page"
 	}
 }

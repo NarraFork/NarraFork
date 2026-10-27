@@ -4,6 +4,10 @@ import { useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
+import {
+	CreateNarratorLazyModal,
+	preloadCreateNarratorModal,
+} from "../../components/narrator/CreateNarratorLazyModal";
 import type { CreateNarratorResult } from "../../components/narrator/CreateNarratorModal";
 import {
 	NarratorListCard,
@@ -33,17 +37,15 @@ import { useNarratorsListWS } from "../../hooks/useNarratorWS";
 import { addRecentTab } from "../../hooks/useRecentTabs";
 import { useSetupWizardGuard } from "../../hooks/useSetupWizardGuard";
 
-const CreateNarratorModal = lazy(() =>
-	import("../../components/narrator/CreateNarratorModal").then((m) => ({
-		default: m.CreateNarratorModal,
-	})),
+const importImportSessionModal = () =>
+	import("../../components/narrator/session-interchange/ImportSessionModal");
+const ImportSessionModal = lazy(() =>
+	importImportSessionModal().then((m) => ({ default: m.ImportSessionModal })),
 );
 
-const ImportSessionModal = lazy(() =>
-	import("../../components/narrator/session-interchange/ImportSessionModal").then((m) => ({
-		default: m.ImportSessionModal,
-	})),
-);
+function preloadImportSessionModal(): void {
+	void importImportSessionModal().catch(() => {});
+}
 
 interface NarratorSearchParams extends NarratorListSearchParams {
 	create?: boolean;
@@ -181,10 +183,23 @@ function NarratorsPage() {
 					<Button variant="subtle" component={Link} to="/narrators/archived">
 						{t("viewArchived")}
 					</Button>
-					<Button variant="default" onClick={openImport}>
+					<Button
+						variant="default"
+						onPointerEnter={preloadImportSessionModal}
+						onFocus={preloadImportSessionModal}
+						onPointerDown={preloadImportSessionModal}
+						onClick={openImport}
+					>
 						{t("sessionInterchange.importButton")}
 					</Button>
-					<Button onClick={guardedOpen}>{t("newNarrator")}</Button>
+					<Button
+						onPointerEnter={preloadCreateNarratorModal}
+						onFocus={preloadCreateNarratorModal}
+						onPointerDown={preloadCreateNarratorModal}
+						onClick={guardedOpen}
+					>
+						{t("newNarrator")}
+					</Button>
 				</Group>
 			</Group>
 
@@ -194,10 +209,23 @@ function NarratorsPage() {
 					<Title order={3}>{t("title")}</Title>
 					<Group gap="xs">
 						<NarratorListExtraFiltersButton state={listState} onChange={setSearch} />
-						<Button size="xs" variant="default" onClick={openImport}>
+						<Button
+							size="xs"
+							variant="default"
+							onPointerEnter={preloadImportSessionModal}
+							onFocus={preloadImportSessionModal}
+							onPointerDown={preloadImportSessionModal}
+							onClick={openImport}
+						>
 							{t("sessionInterchange.importButton")}
 						</Button>
-						<Button size="xs" onClick={guardedOpen}>
+						<Button
+							size="xs"
+							onPointerEnter={preloadCreateNarratorModal}
+							onFocus={preloadCreateNarratorModal}
+							onPointerDown={preloadCreateNarratorModal}
+							onClick={guardedOpen}
+						>
 							{t("newNarrator")}
 						</Button>
 					</Group>
@@ -266,11 +294,7 @@ function NarratorsPage() {
 				</Stack>
 			)}
 
-			{opened && (
-				<Suspense fallback={null}>
-					<CreateNarratorModal opened={opened} onClose={close} onCreated={handleCreated} />
-				</Suspense>
-			)}
+			<CreateNarratorLazyModal opened={opened} onClose={close} onCreated={handleCreated} />
 
 			{importOpened && (
 				<Suspense fallback={null}>
@@ -284,23 +308,31 @@ function NarratorsPage() {
 
 			<Modal
 				opened={!!confirmArchiveId}
-				onClose={() => setConfirmArchiveId(null)}
+				onClose={() => {
+					if (!archiveNarrator.isPending) setConfirmArchiveId(null);
+				}}
 				title={tn("archiveConfirmTitle")}
 				centered
 			>
 				<Stack>
 					<Text size="sm">{tn("archiveActiveWarning")}</Text>
 					<Group justify="flex-end">
-						<Button variant="default" onClick={() => setConfirmArchiveId(null)}>
+						<Button
+							variant="default"
+							disabled={archiveNarrator.isPending}
+							onClick={() => setConfirmArchiveId(null)}
+						>
 							{tn("cancel")}
 						</Button>
 						<Button
 							color="orange"
+							loading={archiveNarrator.isPending}
 							onClick={() => {
 								if (confirmArchiveId) {
-									archiveNarrator.mutate(confirmArchiveId);
+									archiveNarrator.mutate(confirmArchiveId, {
+										onSuccess: () => setConfirmArchiveId(null),
+									});
 								}
-								setConfirmArchiveId(null);
 							}}
 						>
 							{tn("confirmArchive")}

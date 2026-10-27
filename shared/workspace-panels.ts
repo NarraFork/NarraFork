@@ -17,8 +17,13 @@
  * NOT here: each exists only as a resource of a member (identified by its
  * `hostNarratorId`), the sidebar never lists them, and reopening one is a single
  * click. They remain in the layout blob.
+ *
+ * `outline` is both: an outline page added to the workspace on its own is a member
+ * (a row, config `{ spaceId, blockId, view }`), while one opened from a session's tool
+ * card or link is that session's resource (it carries `hostNarratorId` and stays in the
+ * layout blob, like `knowledge`).
  */
-export const WORKSPACE_PANEL_KINDS = ["narrator", "terminal", "webview"] as const;
+export const WORKSPACE_PANEL_KINDS = ["narrator", "terminal", "webview", "outline"] as const;
 
 /**
  * Why `plugin` is NOT a membership kind, despite being director-renderable.
@@ -86,6 +91,47 @@ export interface WorkspacePanel {
 export type WorkspacePanelInput =
 	| { kind: "narrator"; narratorId: string }
 	| { kind: Exclude<WorkspacePanelKind, "narrator">; config: unknown };
+
+/**
+ * The config of an `outline` member: the space, the focused block (absent: the space's page
+ * list) and the view. Time (`asOf`) is not membership; the layout keeps it.
+ */
+export interface WorkspaceOutlineConfig {
+	spaceId: string;
+	blockId?: string;
+	view?: "all";
+}
+
+/** Longest id an outline member config may carry (nanoids are 21 characters). */
+const OUTLINE_CONFIG_ID_MAX = 64;
+const OUTLINE_CONFIG_ID = /^[A-Za-z0-9_-]+$/;
+
+function outlineConfigId(value: unknown): string | null {
+	return typeof value === "string" &&
+		value.length > 0 &&
+		value.length <= OUTLINE_CONFIG_ID_MAX &&
+		OUTLINE_CONFIG_ID.test(value)
+		? value
+		: null;
+}
+
+/**
+ * Normalize an outline member's config: keep `spaceId`, `blockId` and `view: "all"`, drop
+ * anything else (a whole panel's params, recovered from an old layout, carry more). Null when
+ * there is no valid space id. Shared so the service stores and the surface reads one shape.
+ */
+export function normalizeWorkspaceOutlineConfig(value: unknown): WorkspaceOutlineConfig | null {
+	if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+	const record = value as Record<string, unknown>;
+	const spaceId = outlineConfigId(record.spaceId);
+	if (!spaceId) return null;
+	const blockId = outlineConfigId(record.blockId);
+	return {
+		spaceId,
+		...(blockId ? { blockId } : {}),
+		...(record.view === "all" ? { view: "all" as const } : {}),
+	};
+}
 
 /**
  * Stable dockview panel id for a membership row.

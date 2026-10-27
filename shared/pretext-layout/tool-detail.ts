@@ -18,6 +18,7 @@ import { type GenUiFileReference, readGenUiFileReference } from "../gen-ui-files
 import { type GenUiKitNotice, readGenUiKitNotice } from "../gen-ui-kit";
 import { GEN_UI_PUBLIC_SUMMARY, GEN_UI_PUBLIC_SUMMARY_CODE } from "../gen-ui-public";
 import { GEN_UI_INLINE_HEIGHTS, readGenUiInlineSize } from "../gen-ui-tool-policy";
+import { outlineAddressPath, outlineCommitPath } from "../outline-links";
 import { hasUsablePlanBody } from "../plan-reference";
 import { classifySharePreview, type SharePreviewRef, sharePreviewHeight } from "../share-preview";
 import { readBackgroundTaskId, stripAwaitAgentEnvelope } from "../subagent-result-text";
@@ -3398,6 +3399,11 @@ function classifyKnowledge(
  * The outline tools. A read is a markdown outline (rendered as markdown, under a header naming
  * the address, its space and size); a search lists its hits; an edit shows what it wrote (its
  * input is kept whole, see `SKIP_INPUT_TRUNCATE_TOOLS`) and what came of it.
+ *
+ * Block addresses and the commit link to the outline (`outline-links.ts`): the read's address,
+ * each hit, each edit's target (the block the edit changed or created, from the result) and the
+ * edit's commit. The render layer opens them in an outline panel beside the session, and shows
+ * them as plain text where nothing can open them.
  */
 function classifyOutline(
 	toolName: string,
@@ -3415,8 +3421,10 @@ function classifyOutline(
 			const address = readLeafText(r.address) ?? "";
 			const path = stringArray(r.path);
 			const snippet = readLeafText(r.snippet) ?? "";
+			const href = outlineAddressPath(address);
 			entries.push({
 				title: readLeafText(r.title) || address,
+				...(href ? { href } : {}),
 				...(address || path.length > 0
 					? { meta: [address, path.join(" › ")].filter(Boolean).join(" · ") }
 					: {}),
@@ -3440,8 +3448,9 @@ function classifyOutline(
 		const address = (metadata ? readLeafText(metadata.address) : undefined) || "";
 		const blocks = typeof metadata?.blocks === "number" ? metadata.blocks : undefined;
 		const asOf = typeof metadata?.asOf === "number" ? metadata.asOf : undefined;
+		const addressHref = outlineAddressPath(address);
 		const header = metaRows([
-			pathRow(address),
+			pathRow(address, addressHref ? { href: addressHref } : {}),
 			badgeRow(
 				chips([
 					chip(spaceKey, "teal"),
@@ -3463,13 +3472,15 @@ function classifyOutline(
 	}
 	if (toolName === "OutlineEdit") {
 		const edits = asObject(inputJson)?.edits;
+		// What each edit touched, once committed: one summary per edit, in order.
+		const done = Array.isArray(metadata?.edits) ? (metadata.edits as unknown[]) : [];
 		const lines: string[] = [];
 		if (Array.isArray(edits)) {
-			for (const raw of edits) {
+			edits.forEach((raw, index) => {
 				const edit = asObject(raw);
-				if (!edit) continue;
+				if (!edit) return;
 				const kind = ["add", "replace", "move", "delete", "set"].find((k) => k in edit);
-				if (!kind) continue;
+				if (!kind) return;
 				const target = readLeafText(edit[kind]) ?? "";
 				const extra =
 					kind === "move"
@@ -3477,15 +3488,30 @@ function classifyOutline(
 						: kind === "set"
 							? setText(edit)
 							: "";
-				lines.push(`**${kind}** \`${target}\`${extra}`);
+				const result = asObject(done[index]);
+				const touched =
+					result?.op === kind
+						? kind === "add"
+							? stringArray(result.created)[0]
+							: readLeafText(result.address)
+						: undefined;
+				const href = outlineAddressPath(touched);
+				// Link text without code spans: the brackets of a markdown link must not be split.
+				const label = target.replace(/[[\]`]/g, "");
+				lines.push(
+					href && label
+						? `**${kind}** [${label}](${href})${extra}`
+						: `**${kind}** \`${target}\`${extra}`,
+				);
 				const text = readLeafText(
 					kind === "add" ? edit.markdown : kind === "replace" ? edit.text : undefined,
 				);
 				if (text) lines.push("", text, "");
-			}
+			});
 		}
 		const commit = asObject(metadata?.commit);
 		const seq = commit && typeof commit.seq === "number" ? commit.seq : undefined;
+		const commitHref = spaceKey && seq !== undefined ? outlineCommitPath(spaceKey, seq) : null;
 		const input = lines.join("\n").trim();
 		return sections([
 			section(
@@ -3495,9 +3521,10 @@ function classifyOutline(
 					badgeRow(
 						chips([
 							chip(spaceKey, "teal"),
-							chip(seq === undefined ? undefined : `commit #${seq}`, "green"),
+							chip(seq === undefined || commitHref ? undefined : `commit #${seq}`, "green"),
 						]),
 					),
+					commitHref ? pathRow(`commit #${seq}`, { href: commitHref, dimmed: false }) : null,
 				]),
 			),
 			input

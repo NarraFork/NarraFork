@@ -61,9 +61,19 @@ export function createLiveTransport(socket: Socketish): LiveTransport {
 }
 
 let shared: LiveTransport | null = null;
+let override: LiveTransport | null = null;
 
 /** The app's transport over the narrator socket. */
 export function liveTransport(): LiveTransport {
+	if (override) return override;
 	shared ??= createLiveTransport(narratorWSManager);
 	return shared;
+}
+
+/**
+ * Browser fixtures: carry every editor's frames over this transport instead of the narrator
+ * socket (null restores it). Only test entry points call this.
+ */
+export function overrideLiveTransportForTests(transport: LiveTransport | null): void {
+	override = transport;
 }

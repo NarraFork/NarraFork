@@ -29,6 +29,7 @@ import { useInputHistory, writeInputHistoryEntries } from "../../../hooks/useInp
 import { useNamedNarrators } from "../../../hooks/useNamedNarrator";
 import { usePromptOptimize } from "../../../hooks/usePromptOptimize";
 import { api } from "../../../lib/api";
+import { listenComposerAppend } from "../../../lib/composer-append-queue";
 import { useFullscreenEscape } from "../../../lib/fullscreen-escape";
 import { formatLocaleNumber } from "../../../lib/intl-format";
 import { shouldFallbackPanelState } from "../../../lib/narrator-panel-state";
@@ -1579,6 +1580,14 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 				unregister?.();
 			};
 		}, [appendInputRef, dock, appendText]);
+
+		// Text another surface asked to add here (a link to an outline page to discuss), taken
+		// only once the draft has loaded so the draft cannot overwrite it.
+		const draftSettled = draftSyncState !== "loading";
+		useEffect(() => {
+			if (!draftSettled) return;
+			return listenComposerAppend(narratorId, appendText);
+		}, [draftSettled, narratorId, appendText]);
 
 		// Report the empty↔non-empty transition upward (the panel's send-button
 		// gating and permission Enter-hint need it), never the text itself.

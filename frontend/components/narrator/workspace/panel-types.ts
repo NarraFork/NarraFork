@@ -7,7 +7,7 @@
 
 import type { PluginDockPanelParams } from "../../plugins/protocol";
 import type { NarratorToolPanelType } from "../dock/dock-panel-types";
-import type { FilePanelParams } from "../panels/panel-kind";
+import type { FilePanelParams, OutlinePanelParams } from "../panels/panel-kind";
 import type { TerminalLeafConfig, WebviewLeafConfig } from "../split-tree";
 
 /** Panel type discriminator stored on each Dockview panel's params. */
@@ -19,6 +19,7 @@ export type WorkspacePanelType =
 	| "subagent"
 	| "file"
 	| "knowledge"
+	| "outline"
 	| "plugin";
 
 /** Params carried by a narrator panel. */
@@ -105,6 +106,33 @@ export interface WorkspaceKnowledgePanelParams {
 	scope: "global" | "personal";
 }
 
+/**
+ * An outline page added to the workspace on its own: a member, with a row (config
+ * `{ spaceId, blockId, view }`). It renders as a top-level cell in both presentation modes.
+ */
+export interface WorkspaceOutlineMemberParams
+	extends Omit<OutlinePanelParams, "hostNarratorId">,
+		WorkspaceMemberRowRef {}
+
+/**
+ * An outline page opened from a session (a tool card, a link, the session menu): that
+ * narrator cluster's resource, like `knowledge`; the host is explicit for orphan pruning.
+ */
+export interface WorkspaceOutlineResourceParams extends OutlinePanelParams {
+	hostNarratorId: string;
+}
+
+export type WorkspaceOutlinePanelParams =
+	| WorkspaceOutlineMemberParams
+	| WorkspaceOutlineResourceParams;
+
+/** Whether outline params name a member (a row) rather than a session's resource. */
+export function isOutlineMemberParams(
+	params: WorkspaceOutlinePanelParams,
+): params is WorkspaceOutlineMemberParams {
+	return typeof (params as { hostNarratorId?: unknown }).hostNarratorId !== "string";
+}
+
 export type WorkspacePanelParams =
 	| NarratorPanelParams
 	| TerminalPanelParams
@@ -113,6 +141,7 @@ export type WorkspacePanelParams =
 	| SubagentPanelParams
 	| WorkspaceFilePanelParams
 	| WorkspaceKnowledgePanelParams
+	| WorkspaceOutlinePanelParams
 	| PluginDockPanelParams;
 
 /** Component registry name for each panel type. */
@@ -124,5 +153,6 @@ export const PANEL_COMPONENT = {
 	subagent: "subagent",
 	file: "file",
 	knowledge: "knowledge",
+	outline: "outline",
 	plugin: "plugin",
 } as const;

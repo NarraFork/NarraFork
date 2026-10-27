@@ -20,17 +20,20 @@ import type {
 import {
 	IconArrowBackUp,
 	IconChevronsLeft,
+	IconMessageCircle,
 	IconPlayerTrackNext,
 	IconPlayerTrackPrev,
 } from "@tabler/icons-react";
 import type { TFunction } from "i18next";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useNarratorReadable } from "../../hooks/useNarratorReadable";
 import { useOutlineTimeline, useRevertOutlineCommit } from "../../hooks/useOutline";
 import { describeApiError } from "../../lib/api-error";
 import { formatFullLocaleDateTime, formatSmartTime } from "../../lib/format";
 import { timelineOldestFirst, timelinePosition } from "../../lib/outline-view";
 import classes from "./Outline.module.css";
+import { useOutlineHost } from "./outline-host";
 
 /** Who wrote a commit, as a short label. */
 export function commitActorLabel(commit: OutlineCommitSummary, t: TFunction): string {
@@ -73,6 +76,41 @@ function revertMessage(result: OutlineRevertResponse, t: TFunction): string {
 }
 
 /**
+ * Open the session that wrote an agent's commit, beside the outline. Offered only where the host
+ * can open sessions, and enabled only when the person can read that session (its detail route
+ * answers); otherwise disabled, saying why.
+ */
+function OpenCommitSession({
+	narratorId,
+	open,
+}: {
+	narratorId: string;
+	open: (narratorId: string) => void;
+}) {
+	const { t } = useTranslation("outline");
+	const { readable, loading } = useNarratorReadable(narratorId);
+	const button = (
+		<Button
+			size="compact-xs"
+			variant="subtle"
+			leftSection={<IconMessageCircle size={12} />}
+			disabled={!readable}
+			loading={loading}
+			onClick={() => open(narratorId)}
+			data-testid="outline-open-commit-session"
+		>
+			{t("timeline.openSession")}
+		</Button>
+	);
+	if (readable || loading) return button;
+	return (
+		<Tooltip label={t("timeline.sessionUnavailable")}>
+			<span>{button}</span>
+		</Tooltip>
+	);
+}
+
+/**
  * The strip at the bottom of a page: every commit that touched the page, oldest to newest
  * (older ones loaded on demand). Picking one shows the page as of it; "Now" goes back to the
  * current state. People who may write the space can revert the picked commit.
@@ -87,6 +125,7 @@ export function OutlineTimeline({
 	onSelect: (seq: number | undefined) => void;
 }) {
 	const { t } = useTranslation("outline");
+	const host = useOutlineHost();
 	const timeline = useOutlineTimeline(view.space.id, view.pageId);
 	const commits = useMemo(() => timelineOldestFirst(timeline.data?.pages ?? []), [timeline.data]);
 	const { selected, previous, next } = timelinePosition(commits, asOf);
@@ -215,17 +254,22 @@ export function OutlineTimeline({
 							selected.summary,
 						].join(" · ")}
 					</Text>
-					{view.space.canWrite && (
-						<Button
-							size="compact-xs"
-							variant="subtle"
-							color="orange"
-							leftSection={<IconArrowBackUp size={12} />}
-							onClick={() => setConfirming(selected)}
-						>
-							{t("timeline.revert")}
-						</Button>
-					)}
+					<Group gap={4} wrap="nowrap" style={{ flexShrink: 0 }}>
+						{host.openSession && selected.actorKind === "agent" && selected.narratorId && (
+							<OpenCommitSession narratorId={selected.narratorId} open={host.openSession} />
+						)}
+						{view.space.canWrite && (
+							<Button
+								size="compact-xs"
+								variant="subtle"
+								color="orange"
+								leftSection={<IconArrowBackUp size={12} />}
+								onClick={() => setConfirming(selected)}
+							>
+								{t("timeline.revert")}
+							</Button>
+						)}
+					</Group>
 				</Group>
 			)}
 			<Modal

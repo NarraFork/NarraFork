@@ -1,4 +1,4 @@
-import { OUTLINE_VIEW_LIMITS } from "@shared/outline-api";
+import { OUTLINE_RESOLVE_REQUEST_LIMITS, OUTLINE_VIEW_LIMITS } from "@shared/outline-api";
 import { z } from "zod";
 
 /**
@@ -58,3 +58,20 @@ export const outlineSearchQuerySchema = z.object({
 	spaceId: outlineIdSchema.optional(),
 	limit: limitSchema(OUTLINE_VIEW_LIMITS.maxSearch).optional(),
 });
+
+/**
+ * What to resolve: a block reference (`ref`), or a commit (`commit`, a seq) of `space`. `space` is
+ * a space key or id; a reference written as `key/…` names its own space and needs none.
+ */
+export const outlineResolveQuerySchema = z
+	.object({
+		ref: z.string().trim().min(1).max(OUTLINE_RESOLVE_REQUEST_LIMITS.maxRef).optional(),
+		space: outlineIdSchema.optional(),
+		commit: seqSchema.optional(),
+	})
+	.refine((query) => (query.ref === undefined) !== (query.commit === undefined), {
+		message: "exactly one of ref and commit",
+	})
+	.refine((query) => query.commit === undefined || query.space !== undefined, {
+		message: "commit needs space",
+	});

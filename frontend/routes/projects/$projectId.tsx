@@ -1,4 +1,4 @@
-import { Alert, Button, Card, Group, Loader, Stack, Text, Title } from "@mantine/core";
+import { Alert, Button, Card, Group, Loader, Skeleton, Stack, Text, Title } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import { IconListTree } from "@tabler/icons-react";
 import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
@@ -60,16 +60,20 @@ function ProjectPage() {
 			api.listNarratorsPaginated({ projectId, limit: 30, cursor: pageParam }),
 		initialPageParam: undefined as string | undefined,
 		getNextPageParam: (page) => page.nextCursor ?? undefined,
-		enabled: !!project.data && !project.isError,
+		// The request needs only projectId; start it in parallel with the project detail.
+		enabled: !project.isError,
 		gcTime: 60_000,
 	});
-	if (project.isLoading) return <Loader />;
-	if (project.isError || !project.data)
+	if (project.isError || (!project.isLoading && !project.data))
 		return <Alert color="red">{t("compatibility.unavailable")}</Alert>;
 	return (
 		<Stack>
 			<Group justify="space-between">
-				<Title order={3}>{project.data.name}</Title>
+				{project.data ? (
+					<Title order={3}>{project.data.name}</Title>
+				) : (
+					<Skeleton height={28} width={220} />
+				)}
 				<Group gap="xs">
 					{outline.enabled && (
 						<Button
@@ -86,10 +90,16 @@ function ProjectPage() {
 					</Button>
 				</Group>
 			</Group>
-			<Text size="sm" c="dimmed">
-				{project.data.gitPath}
-			</Text>
-			{project.data.description && <Text>{project.data.description}</Text>}
+			{project.data ? (
+				<>
+					<Text size="sm" c="dimmed">
+						{project.data.gitPath}
+					</Text>
+					{project.data.description && <Text>{project.data.description}</Text>}
+				</>
+			) : (
+				<Skeleton height={18} width="70%" />
+			)}
 			<Title order={4}>{t("compatibility.sessions")}</Title>
 			{sessions.isLoading && <Loader size="sm" />}
 			{sessions.isError && <Alert color="red">{t("compatibility.sessionsUnavailable")}</Alert>}
@@ -141,7 +151,7 @@ function ProjectPage() {
 					</ProjectToolsBoundary>
 				)}
 			</details>
-			{creating && canWrite && (
+			{creating && canWrite && project.data && (
 				<ProjectToolsBoundary fallback={<Alert color="red">{t("createFailed")}</Alert>}>
 					<Suspense fallback={<Loader size="sm" />}>
 						<CreateNarratorModal

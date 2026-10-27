@@ -130,7 +130,9 @@
 			"parent-gone": "它原来所在的块已被删除",
 			"later-children": "之后有块加到了它下面",
 			"cycle": "恢复后会挂到自己下面"
-		}
+		},
+		"openSession": "打开写入它的会话",
+		"sessionUnavailable": "你无法打开写入它的会话。"
 	},
 	"editor": {
 		"changeStatus": "切换状态",
@@ -151,6 +153,25 @@
 		"dismiss": "知道了",
 		"tooLargePage": "这一页太大（超过 2000 块或 4 MB），不能实时编辑，先以只读显示；可以聚焦到其中一部分，或把页拆开。",
 		"unavailable": "现在不能实时编辑，先以只读显示这一页。",
-		"retry": "重试"
+		"retry": "重试",
+		"tabLimit": "当前为只读：这个标签页已经有 {{count}} 个大纲页处于实时编辑状态。关闭或隐藏其中一个后再重试。"
+	},
+	"link": {
+		"notFound": "这个大纲链接指向的内容不存在，或你无权阅读。"
+	},
+	"panel": {
+		"openPage": "在大纲页打开"
+	},
+	"dock": {
+		"sessions": "会话",
+		"recentSessions": "这个空间最近的会话",
+		"noSessions": "这里还没有会话。",
+		"discuss": "在会话里讨论这一页",
+		"discussTitle": "在会话里讨论这一页",
+		"discussHint": "会在会话的输入框里放入这一页的链接。",
+		"newSession": "新建会话…"
+	},
+	"workspace": {
+		"addTitle": "添加大纲页"
 	}
 }

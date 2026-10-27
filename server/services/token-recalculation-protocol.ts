@@ -35,20 +35,26 @@ export interface TokenRecalculationProtocolDependencies {
 	getCachedCommandCodeModel(model: string): { endpoints: string[] } | undefined;
 }
 
-function runtimeDependencies(): TokenRecalculationProtocolDependencies {
-	// Keep settings initialization out of the pure/injected path. All module paths are literal
-	// so Bun's executable bundler can include them; none of these getters refreshes a catalog.
-	const config: typeof import("../lib/settings") = require("../lib/settings");
-	const nug: typeof import("../lib/nug-model-cache") = require("../lib/nug-model-cache");
-	const tokenDance: typeof import("../lib/tokendance-runtime") = require("../lib/tokendance-runtime");
-	const commandCode: typeof import("../lib/commandcode-models") = require("../lib/commandcode-models");
-	return {
+/**
+ * Runtime dependencies for production: settings and catalog caches are loaded on demand.
+ * `import()` specifiers are literal, so the executable bundler still bundles all four;
+ * `require` is not an option because this graph transitively reaches modules with a
+ * top-level await (settings → codex-manager → codex-pat → user-agent → version).
+ */
+export async function createRuntimeTokenRecalculationProtocolResolver() {
+	const [config, nug, tokenDance, commandCode] = await Promise.all([
+		import("../lib/settings"),
+		import("../lib/nug-model-cache"),
+		import("../lib/tokendance-runtime"),
+		import("../lib/commandcode-models"),
+	]);
+	return createTokenRecalculationProtocolResolver({
 		getSettings: () => config.settings,
 		resolveModelProtocol: config.resolveModelProtocol,
 		resolveNugModelMeta: nug.resolveNugModelMeta,
 		getTokenDanceCatalogModels: tokenDance.getTokenDanceCatalogModels,
 		getCachedCommandCodeModel: commandCode.getCachedCommandCodeModel,
-	};
+	});
 }
 
 function protocolFamily(protocol: string | undefined): TokenRecalculationProtocol | undefined {
@@ -75,9 +81,8 @@ const MAX_CACHE_ENTRIES = 4096;
 
 /** One resolver/cache per recalculation job; never creates providers or requests model catalogs. */
 export function createTokenRecalculationProtocolResolver(
-	dependencies?: TokenRecalculationProtocolDependencies,
+	deps: TokenRecalculationProtocolDependencies,
 ): (row: HistoricalProtocolRow) => TokenProtocolResolution {
-	const deps = dependencies ?? runtimeDependencies();
 	const settings = deps.getSettings();
 	// Do not filter disabled connections: they still identify historical traffic. Canonical
 	// custom connections win over their derived legacy copies, even after a protocol switch.

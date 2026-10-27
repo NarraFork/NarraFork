@@ -389,6 +389,20 @@ describe("new center integration", () => {
 		expect(document.body.textContent).not.toContain(narratorEn.humanAttentionEmpty);
 	});
 
+	test("a retained drawer adopts the latest initial tab on reopen", async () => {
+		const view = (opened: boolean, initialTab: "activity" | "attention") => (
+			<NotificationCenterDrawer opened={opened} initialTab={initialTab} onClose={() => {}} />
+		);
+		await renderWithProviders(view(true, "activity"));
+		expect(document.querySelector('[data-testid="notification-mark-all-read"]')).not.toBeNull();
+		await clickText(navEn.notificationTabAttention);
+		expect(document.querySelector('[data-testid="notification-mark-all-read"]')).toBeNull();
+
+		await renderWithProviders(view(false, "activity"));
+		await renderWithProviders(view(true, "activity"));
+		expect(document.querySelector('[data-testid="notification-mark-all-read"]')).not.toBeNull();
+	});
+
 	test("activity bulk read uses server boundary/current kind, preserves pending authority and shows errors", async () => {
 		attentionPayload = { items: [pendingItem("still-pending")], nextCursor: null };
 		listPayload = {
