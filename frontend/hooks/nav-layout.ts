@@ -86,21 +86,34 @@ export function mergeNavLayout(persisted: unknown): NavLayoutEntry[] {
 	];
 }
 
-/** Presentation only: keep retired ids in stored preferences, never expose canvas entry points. */
-export function projectNavLayout(entries: readonly NavLayoutEntry[]): NavLayoutEntry[] {
-	return entries.filter((entry) => entry.kind === "divider" || entry.id !== "projects");
+/** Ids kept in stored preferences but never shown: retired canvas entry points. */
+const RETIRED_NAV_IDS: ReadonlySet<CustomizableNavId> = new Set<CustomizableNavId>(["projects"]);
+const NO_IDS: ReadonlySet<CustomizableNavId> = new Set();
+
+function isWithheld(entry: NavLayoutEntry, hidden: ReadonlySet<CustomizableNavId>): boolean {
+	return entry.kind === "item" && (RETIRED_NAV_IDS.has(entry.id) || hidden.has(entry.id));
 }
 
-/** Preserve retired preferences when the reader reorders the visible navigation. */
+/**
+ * Presentation only: keep retired ids in stored preferences, never expose canvas entry points.
+ * `hidden` withholds entries of features switched off on this server (they keep their place).
+ */
+export function projectNavLayout(
+	entries: readonly NavLayoutEntry[],
+	hidden: ReadonlySet<CustomizableNavId> = NO_IDS,
+): NavLayoutEntry[] {
+	return entries.filter((entry) => !isWithheld(entry, hidden));
+}
+
+/** Preserve retired and withheld entries when the reader reorders the visible navigation. */
 export function restoreRetiredNavEntries(
 	projected: readonly NavLayoutEntry[],
 	stored: readonly NavLayoutEntry[],
+	hidden: ReadonlySet<CustomizableNavId> = NO_IDS,
 ): NavLayoutEntry[] {
-	const next = projectNavLayout(projected);
+	const next = projectNavLayout(projected, hidden);
 	for (const [index, entry] of stored.entries()) {
-		if (entry.kind === "item" && entry.id === "projects") {
-			next.splice(Math.min(index, next.length), 0, entry);
-		}
+		if (isWithheld(entry, hidden)) next.splice(Math.min(index, next.length), 0, entry);
 	}
 	return next;
 }

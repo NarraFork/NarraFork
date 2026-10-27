@@ -60,7 +60,12 @@ import {
 	type OutlineLinkRow,
 	type OutlineVersionRow,
 } from "./port";
-import type { OutlineReadPort, OutlineSearchRow, OutlineStructureRow } from "./read-port";
+import {
+	OUTLINE_PAGE_HEAD_CHARS,
+	type OutlineReadPort,
+	type OutlineSearchRow,
+	type OutlineStructureRow,
+} from "./read-port";
 
 /** Live blocks of a page read on the main thread; a larger page is read on the worker pool. */
 export const MAIN_THREAD_PAGE_ROWS = 2000;
@@ -397,6 +402,26 @@ export const sqliteOutlineReads: OutlineReadPort = {
 		return out;
 	},
 
+	async listAliasRange(spaceId, range, limit) {
+		// Text compares bytewise here; the `deleted = 0` literal lets the planner range-scan the
+		// partial unique alias index.
+		const rows = db
+			.select({ alias: outlineBlocks.alias })
+			.from(outlineBlocks)
+			.where(
+				and(
+					eq(outlineBlocks.spaceId, spaceId),
+					sql`${outlineBlocks.alias} >= ${range.from}`,
+					sql`${outlineBlocks.alias} < ${range.to}`,
+					sql`${outlineBlocks.deleted} = 0`,
+				),
+			)
+			.orderBy(asc(outlineBlocks.alias))
+			.limit(limit)
+			.all();
+		return rows.map((row) => row.alias as string);
+	},
+
 	async searchBlocks(query) {
 		const out: OutlineSearchRow[] = [];
 		const likes = query.short.map(() => `AND b.content LIKE ? ESCAPE '\\'`).join(" ");
@@ -455,5 +480,60 @@ export const sqliteOutlineReads: OutlineReadPort = {
 			for (const row of rows) out.push(toLink(row));
 		}
 		return out;
+	},
+
+	async listSpacePages(spaceId, { after, limit }) {
+		const b = outlineBlocks;
+		const rows = db
+			.select({
+				id: b.id,
+				sid: b.sid,
+				orderKey: b.orderKey,
+				alias: b.alias,
+				contentHead: sql<string>`substr(${b.content}, 1, ${OUTLINE_PAGE_HEAD_CHARS})`,
+				hasTask: sql<number>`${b.taskJson} IS NOT NULL`,
+			})
+			.from(b)
+			.where(
+				and(
+					eq(b.spaceId, spaceId),
+					isNull(b.parentId),
+					eq(b.deleted, false),
+					after
+						? or(
+								gt(b.orderKey, after.orderKey),
+								and(eq(b.orderKey, after.orderKey), gt(b.id, after.id)),
+							)
+						: undefined,
+				),
+			)
+			// SQLite compares text bytewise (BINARY), which is the order-key order.
+			.orderBy(asc(b.orderKey), asc(b.id))
+			.limit(limit)
+			.all();
+		return rows.map(({ hasTask, ...row }) => ({ ...row, isTask: Boolean(hasTask) }));
+	},
+
+	async listBlockHistory(blockId, { before, limit }) {
+		const v = outlineBlockVersions;
+		return db
+			.select({
+				fromSeq: v.fromSeq,
+				toSeq: v.toSeq,
+				commitId: v.commitId,
+				pageId: v.pageId,
+				changeFlags: v.changeFlags,
+				deleted: v.deleted,
+			})
+			.from(v)
+			.where(
+				and(
+					eq(v.blockId, blockId),
+					before === undefined || before === null ? undefined : lt(v.fromSeq, before),
+				),
+			)
+			.orderBy(desc(v.fromSeq))
+			.limit(limit)
+			.all();
 	},
 };

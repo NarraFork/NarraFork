@@ -1,0 +1,135 @@
+{
+	"title": "大纲",
+	"subtitle": "用大纲记下项目、会话和个人的笔记、结论与计划。",
+	"unavailable": "此服务器没有开启大纲功能。",
+	"notFound": "这一页不存在，或者你没有权限查看。",
+	"notAtTime": "历史上的这个时间点还没有这个块。",
+	"loadFailed": "加载失败，请稍后再试。",
+	"loadMore": "加载更多",
+	"home": {
+		"searchPlaceholder": "在你能读的所有大纲中搜索",
+		"noResults": "没有匹配的内容。",
+		"process": "过程",
+		"recent": "最近访问",
+		"noRecent": "打开过的页面会出现在这里。",
+		"spaces": "空间",
+		"noSpaces": "还没有空间。"
+	},
+	"space": {
+		"personalMine": "我的笔记",
+		"personalOther": "个人笔记",
+		"project": "{{name}}",
+		"projectUnnamed": "已删除的项目",
+		"session": "{{name}}",
+		"sessionUnnamed": "未命名会话",
+		"kind": {
+			"project": "项目",
+			"personal": "个人",
+			"session": "会话"
+		},
+		"orphaned": "所有者已删除",
+		"commits_one": "{{count}} 次提交",
+		"commits_other": "{{count}} 次提交",
+		"readOnly": "只读",
+		"searchPlaceholder": "在这个空间中搜索",
+		"pages": "页面",
+		"noPages": "还没有页面。agent 和编辑器写入的页面会出现在这里。"
+	},
+	"page": {
+		"task": {
+			"todo": "待办",
+			"doing": "进行中",
+			"done": "完成",
+			"cancelled": "已取消"
+		},
+		"expand": "展开",
+		"collapse": "折叠",
+		"focus": "聚焦到这个块",
+		"due": "截止 {{date}}",
+		"alias": "别名 {{alias}}",
+		"inProgress_one": "进行中 · {{count}}",
+		"inProgress_other": "进行中 · {{count}}",
+		"inProgressHint": "这个块下面有未完成的任务。切到「全部」可以看到。",
+		"more_one": "… 还有 {{count}} 项",
+		"more_other": "… 还有 {{count}} 项",
+		"moreAtRoot_one": "… 还有 {{count}} 个块放不下，请聚焦到其中一部分。",
+		"moreAtRoot_other": "… 还有 {{count}} 个块放不下，请聚焦到其中一部分。",
+		"factsEmpty": "这里只有任务和进展。切到「全部」可以看到。",
+		"empty": "这个块下面还没有内容。",
+		"view": {
+			"facts": "事实",
+			"all": "全部"
+		},
+		"viewLabel": "显示范围",
+		"sidePanel": "反链与历史",
+		"asOfBanner": "正在查看提交 #{{seq}} 时的页面（只读）。",
+		"backToCurrent": "回到现在",
+		"truncated": "这一页太大，无法一次读完；请聚焦到其中一部分。",
+		"processHidden_one": "任务下的 {{count}} 个块没有显示。",
+		"processHidden_other": "任务下的 {{count}} 个块没有显示。",
+		"showAll": "显示全部"
+	},
+	"side": {
+		"backlinks": "反链",
+		"history": "历史",
+		"noBacklinks": "没有链接到这里的内容。",
+		"backlinksTruncated_one": "只显示前 {{count}} 条。",
+		"backlinksTruncated_other": "只显示前 {{count}} 条。",
+		"noHistory": "没有历史。",
+		"linkKind": {
+			"link": "链接",
+			"embed": "嵌入",
+			"depends": "前置",
+			"tag": "标签"
+		},
+		"change": {
+			"create": "创建",
+			"content": "修改",
+			"move": "移动",
+			"delete": "删除",
+			"restore": "恢复",
+			"task": "任务",
+			"page": "换页",
+			"props": "别名或标签"
+		},
+		"viewAt": "查看提交 #{{seq}} 时的页面"
+	},
+	"timeline": {
+		"label": "时间轴",
+		"previous": "上一次提交",
+		"next": "下一次提交",
+		"older": "加载更早的提交",
+		"empty": "还没有提交。",
+		"now": "现在",
+		"commit": "#{{seq}}",
+		"kind": {
+			"edit": "编辑",
+			"revert": "撤销",
+			"import": "导入"
+		},
+		"actor": {
+			"unknown": "某人",
+			"agent": "agent",
+			"agentFor": "agent（代 {{name}}）",
+			"system": "系统"
+		},
+		"revert": "撤销",
+		"revertTitle": "撤销提交 #{{seq}}？",
+		"revertConfirm": "会新建一个提交，把这次提交改动的内容恢复原样。之后又被改过的块保持不变。",
+		"cancel": "取消",
+		"revertAction": "撤销",
+		"reverted": "已撤销 #{{seq}}",
+		"revertFailed": "撤销失败",
+		"revertChanged_one": "恢复了 {{count}} 个块。",
+		"revertChanged_other": "恢复了 {{count}} 个块。",
+		"revertedNothing": "没有可以恢复的内容。",
+		"revertSkipped_one": "{{count}} 个块保持不变：",
+		"revertSkipped_other": "{{count}} 个块保持不变：",
+		"skipReason": {
+			"changed-later": "之后的提交又改过它",
+			"parent-gone": "它原来所在的块已被删除",
+			"later-children": "之后有块加到了它下面",
+			"cycle": "恢复后会挂到自己下面"
+		}
+	}
+}

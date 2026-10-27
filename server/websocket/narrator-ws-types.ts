@@ -85,6 +85,7 @@ export type NarratorServerMessage =
 	| import("@shared/permission-policy-events").PermissionPolicyChangedEvent
 	| import("@shared/git-workspace-events").GitWorkspaceServerMessage
 	| import("@shared/editor-file-events").EditorFileServerMessage
+	| import("@shared/outline-page-events").OutlinePageServerMessage
 	/** No narrator identifiers or payloads; clients re-fetch their ACL-filtered inbox. */
 	| { type: "human_attention_changed" }
 	/** Per-user activity invalidation; no titles, previews or source identifiers. */

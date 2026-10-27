@@ -24,6 +24,7 @@
  * template.
  */
 
+import { formatLocaleDateTime } from "@frontend/lib/intl-format";
 import {
 	Badge,
 	Box,
@@ -148,9 +149,11 @@ export interface SubagentLabels {
 	moreFiles?: string;
 	/** Overflow row: `{count}` files touched by shell commands. */
 	shellTouched?: string;
-	/** Legacy churn is neither exact per-attempt ownership nor net contribution. */
+	/** Hover text: legacy churn is neither exact per-attempt ownership nor net contribution. */
 	fileChangeLegacy?: string;
-	/** A requested execution window is not a verified attempt boundary. */
+	/** Short inline hint on the title row for legacy-only attribution. */
+	fileChangeLegacyBadge?: string;
+	/** Hover-text prefix for the requested window (not a verified attempt boundary). */
 	fileChangeWindow?: string;
 	unknownDevice?: string;
 	unknownWorkspace?: string;
@@ -193,8 +196,10 @@ const DEFAULT_LABELS: Required<Omit<SubagentLabels, "timing" | "statusMark">> = 
 	moreFiles: "{count} more files",
 	shellTouched: "{count} touched by shell",
 	outsideWorkspace: "outside this workspace",
-	fileChangeLegacy: "Legacy/unscoped · not per-attempt or net changes",
-	fileChangeWindow: "Requested boundary only; not verified attempt evidence",
+	fileChangeLegacy:
+		"Collected per subagent and time window, not linked to this exact run. Line counts add up every edit; they are not the net change.",
+	fileChangeLegacyBadge: "approximate",
+	fileChangeWindow: "Time window",
 	unknownDevice: "unknown device",
 	unknownWorkspace: "unknown workspace",
 	unknownCoverage: "parent workspace coverage unknown",
@@ -230,6 +235,16 @@ function overflowSummary(
 	}
 	if (changes.countsTruncated) parts.push(labels.countsTruncated);
 	return parts.join(" · ");
+}
+
+/** Hover text for legacy-only attribution: what the figures are, and the window used. */
+function legacyAttributionTitle(
+	scope: SubagentFileChangesData["scope"],
+	labels: ResolvedSubagentLabels,
+): string {
+	const time = (iso: string | null | undefined) => (iso && formatLocaleDateTime(iso)) || "…";
+	if (!scope?.startedAt && !scope?.completedAt) return labels.fileChangeLegacy;
+	return `${labels.fileChangeLegacy}\n${labels.fileChangeWindow}: ${time(scope.startedAt)} → ${time(scope.completedAt)}`;
 }
 
 /** Labels may use i18next's {{count}} or the renderer's {count} fallback. */
@@ -1081,9 +1096,13 @@ function SubagentBody({
 			height: measured.fileChangeRowHeight,
 			lineHeight: `${measured.fileChangeRowHeight}px`,
 		};
-		const scopeDescription = fileChanges.scope
-			? `${labels.fileChangeWindow} · ${JSON.stringify(fileChanges.scope)}`
-			: "";
+		// Legacy-only attribution is a caveat, not news: one quiet hint on the title
+		// row, with the explanation and requested window in its hover text.
+		const legacyHint =
+			(fileChanges.attributionScope ?? "legacy_unscoped") === "legacy_unscoped" &&
+			fileChanges.files.length > 0
+				? legacyAttributionTitle(fileChanges.scope, labels)
+				: null;
 		parts.push(
 			<div
 				key={`file-changes:${scopeKey}`}
@@ -1101,33 +1120,27 @@ function SubagentBody({
 					boxSizing: "border-box",
 				}}
 			>
-				<Text size="xs" c="dimmed" fw={500} truncate style={rowStyle}>
-					{labels.fileChanges} · {fileChanges.totalFiles}
-				</Text>
-				{measured.fileChangeNoticeRowCount > 0 ? (
-					<Text
-						data-testid="subagent-file-changes-legacy"
-						size="xs"
-						c="yellow"
-						truncate
-						style={rowStyle}
-						title={labels.fileChangeLegacy}
-					>
-						{labels.fileChangeLegacy}
+				<Group gap={6} wrap="nowrap" style={{ ...rowStyle, overflow: "hidden" }}>
+					<Text size="xs" c="dimmed" fw={500} truncate style={{ minWidth: 0 }}>
+						{labels.fileChanges} · {fileChanges.totalFiles}
 					</Text>
-				) : null}
-				{measured.fileChangeNoticeRowCount > 1 ? (
-					<Text
-						data-testid="subagent-file-changes-window"
-						size="xs"
-						c="dimmed"
-						truncate
-						style={rowStyle}
-						title={scopeDescription}
-					>
-						{scopeDescription}
-					</Text>
-				) : null}
+					{legacyHint ? (
+						<Text
+							data-testid="subagent-file-changes-legacy"
+							size="xs"
+							c="dimmed"
+							title={legacyHint}
+							style={{
+								flexShrink: 0,
+								opacity: 0.7,
+								cursor: "help",
+								textDecoration: "underline dotted",
+							}}
+						>
+							· {labels.fileChangeLegacyBadge}
+						</Text>
+					) : null}
+				</Group>
 				<div style={{ display: "flex", flexDirection: "column", gap: FILE_CHANGE_STACK_GAP }}>
 					{rows.map((file, index) => (
 						<Group

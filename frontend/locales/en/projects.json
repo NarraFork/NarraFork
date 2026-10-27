@@ -23,6 +23,8 @@
 	},
 	"title": "Projects",
 	"newSession": "New session",
+	"openOutline": "Outline",
+	"outlineNotCreated": "This project has no outline yet. Someone who can edit the project creates it by opening it.",
 	"advancedSettings": "Advanced project settings",
 	"projectDescription": "Description",
 	"defaultDirectoryHint": "Default directory for new sessions only. Existing session directories stay unchanged.",

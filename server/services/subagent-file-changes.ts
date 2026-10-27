@@ -5,7 +5,10 @@
  * Exact rows come only from settled v2 effects within the current execution segment; a
  * provider tool-use id or timestamp alone is never treated as an attempt receipt.
  */
-import type { FileChangeIdentity } from "@shared/file-change-protocol";
+import {
+	FILE_CHANGE_EVIDENCE_VERSION,
+	type FileChangeIdentity,
+} from "@shared/file-change-protocol";
 import { and, asc, eq, inArray, like, or, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/sqlite-core";
 import { db } from "../db";
@@ -394,7 +397,8 @@ async function addExactChanges(
 					children.map((child) => child.id),
 				),
 				eq(fileChangeOperations.sourceKind, "tool"),
-				eq(fileChangeOperations.evidenceVersion, 2),
+				// v3 only changed the execution binding check, which this query does not use.
+				inArray(fileChangeOperations.evidenceVersion, [2, FILE_CHANGE_EVIDENCE_VERSION]),
 				inArray(fileChangeOperations.executionSegmentId, [...segmentIds]),
 			),
 		)

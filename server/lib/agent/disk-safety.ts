@@ -10,6 +10,7 @@ import {
 import type { DiskSafetySettings } from "../disk-safety-config";
 import { logger } from "../logger";
 import { getNarraforkHome } from "../narrafork-home";
+import { OUTLINE_READ_TOOLS } from "./tools/outline-names";
 import type { ToolContext } from "./types";
 
 const READ_ONLY_TOOLS = new Set([
@@ -23,6 +24,7 @@ const READ_ONLY_TOOLS = new Set([
 	"TeamStatus",
 	"Await",
 	"Recall",
+	...OUTLINE_READ_TOOLS,
 ]);
 const warnedAt = new Map<string, number>();
 /** Operator log throttle, separate so diagnostics can never evict model-notice keys. */

@@ -1183,6 +1183,8 @@ function classifyByCategory(
 			return classifyBrowser(status, inputJson, outputJson, metadata);
 		case "knowledge":
 			return classifyKnowledge(toolName, inputJson, outputJson, metadata);
+		case "outline":
+			return classifyOutline(toolName, inputJson, outputJson, metadata);
 		case "contextAsk":
 			return classifyContextAsk(inputJson, outputJson, metadata, status);
 		case "workspace":
@@ -3390,6 +3392,137 @@ function classifyKnowledge(
 		]);
 	}
 	return classifyGeneric(inputJson, outputJson);
+}
+
+/**
+ * The outline tools. A read is a markdown outline (rendered as markdown, under a header naming
+ * the address, its space and size); a search lists its hits; an edit shows what it wrote (its
+ * input is kept whole, see `SKIP_INPUT_TRUNCATE_TOOLS`) and what came of it.
+ */
+function classifyOutline(
+	toolName: string,
+	inputJson: unknown,
+	outputJson: unknown,
+	metadata: Record<string, unknown> | null,
+): ToolDetailData | null {
+	const space = asObject(metadata?.space);
+	const spaceKey = space ? readLeafText(space.key) : undefined;
+	if (toolName === "OutlineSearch" && metadata && Array.isArray(metadata.results)) {
+		const results = metadata.results as unknown[];
+		const entries: ToolStructuredEntry[] = [];
+		for (const raw of results.slice(0, 50)) {
+			const r = asObject(raw) ?? {};
+			const address = readLeafText(r.address) ?? "";
+			const path = stringArray(r.path);
+			const snippet = readLeafText(r.snippet) ?? "";
+			entries.push({
+				title: readLeafText(r.title) || address,
+				...(address || path.length > 0
+					? { meta: [address, path.join(" › ")].filter(Boolean).join(" · ") }
+					: {}),
+				badges: chips([
+					chip(readLeafText(r.alias), "teal"),
+					chip(r.process === true ? "process" : undefined, "gray"),
+				]),
+				...(snippet ? { snippet: snippet.slice(0, 300) } : {}),
+			});
+		}
+		return single("output.results", {
+			kind: "structured",
+			badgeRows: 1,
+			badges: chips([chip(`${results.length} results`, "teal")]),
+			bodyLines: [],
+			entries,
+		});
+	}
+	if (toolName === "OutlineRead") {
+		const body = resolveDisplayText(outputJson);
+		const address = (metadata ? readLeafText(metadata.address) : undefined) || "";
+		const blocks = typeof metadata?.blocks === "number" ? metadata.blocks : undefined;
+		const asOf = typeof metadata?.asOf === "number" ? metadata.asOf : undefined;
+		const header = metaRows([
+			pathRow(address),
+			badgeRow(
+				chips([
+					chip(spaceKey, "teal"),
+					chip(blocks === undefined ? undefined : `${blocks} blocks`, "gray"),
+					chip(asOf === undefined ? undefined : `as of #${asOf}`, "yellow"),
+					chip(metadata?.truncated === true ? "more not shown" : undefined, "orange"),
+				]),
+			),
+		]);
+		return sections([
+			section("meta.read", undefined, header),
+			textSection("output.main", outputJson ?? "", undefined, {
+				cap: "knowledge",
+				contentLines: countLines(body) + 2,
+				text: body,
+				...(body ? { format: "markdown" as const } : {}),
+			}),
+		]);
+	}
+	if (toolName === "OutlineEdit") {
+		const edits = asObject(inputJson)?.edits;
+		const lines: string[] = [];
+		if (Array.isArray(edits)) {
+			for (const raw of edits) {
+				const edit = asObject(raw);
+				if (!edit) continue;
+				const kind = ["add", "replace", "move", "delete", "set"].find((k) => k in edit);
+				if (!kind) continue;
+				const target = readLeafText(edit[kind]) ?? "";
+				const extra =
+					kind === "move"
+						? ` → ${readLeafText(edit.to) ?? ""}`
+						: kind === "set"
+							? setText(edit)
+							: "";
+				lines.push(`**${kind}** \`${target}\`${extra}`);
+				const text = readLeafText(
+					kind === "add" ? edit.markdown : kind === "replace" ? edit.text : undefined,
+				);
+				if (text) lines.push("", text, "");
+			}
+		}
+		const commit = asObject(metadata?.commit);
+		const seq = commit && typeof commit.seq === "number" ? commit.seq : undefined;
+		const input = lines.join("\n").trim();
+		return sections([
+			section(
+				"meta.edit",
+				undefined,
+				metaRows([
+					badgeRow(
+						chips([
+							chip(spaceKey, "teal"),
+							chip(seq === undefined ? undefined : `commit #${seq}`, "green"),
+						]),
+					),
+				]),
+			),
+			input
+				? textSection("input.edits", inputJson, "input", {
+						cap: "knowledge",
+						contentLines: countLines(input) + 2,
+						text: input,
+						format: "markdown",
+					})
+				: null,
+			outputJson != null
+				? textSection("output.main", outputJson, "result", { format: "markdown" })
+				: null,
+		]);
+	}
+	return classifyGeneric(inputJson, outputJson);
+}
+
+function setText(edit: Record<string, unknown>): string {
+	const parts: string[] = [];
+	const checkbox = readLeafText(edit.checkbox);
+	if (checkbox !== undefined) parts.push(`checkbox ${JSON.stringify(checkbox)}`);
+	if ("assignee" in edit) parts.push(`assignee ${readLeafText(edit.assignee) ?? "none"}`);
+	if ("alias" in edit) parts.push(`alias ${readLeafText(edit.alias) ?? "none"}`);
+	return parts.length > 0 ? `: ${parts.join(", ")}` : "";
 }
 
 /** In-app link to a knowledge entry (the chunked EntryLink target). */

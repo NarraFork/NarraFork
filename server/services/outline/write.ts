@@ -7,7 +7,8 @@
  *   1. Validate and prepare, with no database access: operation shapes and limits, content
  *      normalized to the block dialect (`normalizeBlock`; out-of-dialect structure becomes
  *      child blocks and is reported in the result's notes), content hashes and the links each
- *      content holds.
+ *      content holds. A caller may hand over content it normalized off the main thread
+ *      (`OutlineWriteOptions.canonical`); only hashing is left then.
  *   2. Plan against current state: read the space's commit counter, then only the rows the
  *      operations need (referenced blocks, sibling lists, subtrees of deleted or re-paged
  *      blocks, alias owners, open links), apply the operations to an in-memory working copy and
@@ -38,6 +39,7 @@ import {
 	type DialectNote,
 	isAlias,
 	isOrderKey,
+	isShortId,
 	isValidMention,
 	keyBetween,
 	keysBetween,
@@ -136,6 +138,11 @@ export type OutlineOp =
 			tempId?: string;
 			/** Caller-chosen id (a live editing client creates ids before the server sees them). */
 			id?: string;
+			/**
+			 * Caller-chosen sid, so content written in the same transaction can link to the block
+			 * by its address. Must be free in the space.
+			 */
+			sid?: string;
 			/** `null`: a new page of the space. */
 			parent: OutlineBlockRef | null;
 			position?: OutlinePosition;
@@ -251,6 +258,21 @@ export interface OutlineWriteOptions {
 	 * the history was read) the write rejects with `OutlineStaleWriteError`, writing nothing.
 	 */
 	compensating?: { expectNextSeq: number };
+	/**
+	 * Content the caller normalized itself, by operation index: normalization costs tens of
+	 * milliseconds per large block, so a caller handling untrusted input runs it off the main
+	 * thread (`edit-text.ts`) and hands over the result. Each entry's `content` must equal the
+	 * operation's content and be canonical already (`normalizeBlock(content).content ===
+	 * content`, so nothing is split off); `links` are what `contentLinks(content)` reads. The
+	 * writer hashes it and takes it as is.
+	 */
+	canonical?: ReadonlyArray<OutlineCanonicalContent | null | undefined>;
+}
+
+/** Content normalized before `writeOutline` was called; see `OutlineWriteOptions.canonical`. */
+export interface OutlineCanonicalContent {
+	content: string;
+	links: ExtractedLink[];
 }
 
 const DEFAULT_ATTEMPTS = 5;
@@ -330,6 +352,25 @@ function prepareStoredContent(content: string, opIndex: number): PreparedContent
 	const links = contentLinks(content);
 	checkLinkCount(links, opIndex);
 	return { content, contentHash: hashContent(content), links, notes: [], split: [] };
+}
+
+/** Content normalized by the caller (see `OutlineWriteOptions.canonical`). */
+function prepareCanonicalContent(
+	given: OutlineCanonicalContent,
+	content: string,
+	opIndex: number,
+): PreparedContent {
+	if (given.content !== content) {
+		throw new Error(`outline operation ${opIndex}: canonical content does not match the operation`);
+	}
+	checkLinkCount(given.links, opIndex);
+	return {
+		content,
+		contentHash: hashContent(content),
+		links: given.links,
+		notes: [],
+		split: [],
+	};
 }
 
 function prepareContent(src: string, opIndex: number): PreparedContent {
@@ -442,7 +483,11 @@ function checkBase(op: { baseVersionSeq?: number; block: OutlineBlockRef }, opIn
  * oversized transaction never reaches the database. `stored`: a compensating commit's content,
  * read from history (see `OutlineWriteOptions.compensating`).
  */
-function prepareOps(ops: readonly OutlineOp[], stored = false): Array<PreparedContent | null> {
+function prepareOps(
+	ops: readonly OutlineOp[],
+	stored = false,
+	canonical?: OutlineWriteOptions["canonical"],
+): Array<PreparedContent | null> {
 	if (!Array.isArray(ops) || ops.length === 0)
 		throw invalid("a transaction needs at least one operation", null);
 	const maxOps = stored ? OUTLINE_LIMITS.maxRowsTouched * 4 : OUTLINE_LIMITS.maxOps;
@@ -454,6 +499,7 @@ function prepareOps(ops: readonly OutlineOp[], stored = false): Array<PreparedCo
 	}
 	let totalBytes = 0;
 	const tempIds = new Set<string>();
+	const sids = new Set<string>();
 	const sized: Array<string | null> = ops.map((op, i) => {
 		if (!op || typeof op !== "object" || !OP_KINDS.has((op as { op: string }).op))
 			throw invalid("unknown operation", i);
@@ -494,6 +540,12 @@ function prepareOps(ops: readonly OutlineOp[], stored = false): Array<PreparedCo
 				}
 				if (op.id !== undefined && (typeof op.id !== "string" || !CLIENT_ID_RE.test(op.id)))
 					throw invalid("id must be 8-64 characters of [A-Za-z0-9_-]", i);
+				if (op.sid !== undefined) {
+					if (typeof op.sid !== "string" || !isShortId(op.sid))
+						throw invalid(`${JSON.stringify(op.sid)} is not a valid sid`, i);
+					if (sids.has(op.sid)) throw invalid(`sid ${op.sid} is used twice`, i);
+					sids.add(op.sid);
+				}
 				if (op.tempId !== undefined) {
 					if (typeof op.tempId !== "string" || op.tempId === "")
 						throw invalid("tempId must be a non-empty string", i);
@@ -539,13 +591,12 @@ function prepareOps(ops: readonly OutlineOp[], stored = false): Array<PreparedCo
 				break;
 		}
 	});
-	return sized.map((content, i) =>
-		content === null
-			? null
-			: stored
-				? prepareStoredContent(content, i)
-				: prepareContent(content, i),
-	);
+	return sized.map((content, i) => {
+		if (content === null) return null;
+		if (stored) return prepareStoredContent(content, i);
+		const given = canonical?.[i];
+		return given ? prepareCanonicalContent(given, content, i) : prepareContent(content, i);
+	});
 }
 
 function canonicalTask(task: {
@@ -603,6 +654,8 @@ interface WorkingBlock {
 	base: OutlineBlockMeta | null;
 	/** Whether the id was chosen by the caller. */
 	callerId: boolean;
+	/** Whether the sid was chosen by the caller. */
+	callerSid?: boolean;
 	parentId: string | null;
 	pageId: string;
 	orderKey: string;
@@ -922,6 +975,9 @@ class OutlinePlanner {
 	private newBlock(fields: {
 		id: string;
 		callerId: boolean;
+		/** Caller-chosen sid; drawn when absent. */
+		sid?: string;
+		opIndex?: number;
 		parentId: string | null;
 		pageId: string;
 		orderKey: string;
@@ -930,13 +986,21 @@ class OutlinePlanner {
 		links: ExtractedLink[];
 		task: OutlineTaskJson | null;
 	}): WorkingBlock {
-		let sid = newOutlineSid();
+		let sid = fields.sid ?? newOutlineSid();
+		if (fields.sid !== undefined && this.bySid.has(sid)) {
+			throw new OutlineWriteError(
+				`sid ${sid} is already in use`,
+				"OUTLINE_ID_TAKEN",
+				fields.opIndex ?? null,
+			);
+		}
 		while (this.bySid.has(sid)) sid = newOutlineSid();
 		const block: WorkingBlock = {
 			id: fields.id,
 			sid,
 			base: null,
 			callerId: fields.callerId,
+			...(fields.sid !== undefined ? { callerSid: true } : {}),
 			parentId: fields.parentId,
 			pageId: fields.pageId,
 			orderKey: fields.orderKey,
@@ -1095,6 +1159,7 @@ class OutlinePlanner {
 		const block = this.newBlock({
 			id,
 			callerId: op.id !== undefined,
+			...(op.sid !== undefined ? { sid: op.sid, opIndex: i } : {}),
 			parentId,
 			pageId: parent ? parent.pageId : id,
 			orderKey,
@@ -1386,12 +1451,24 @@ class OutlinePlanner {
 		};
 	}
 
-	/** Sids drawn for new blocks must be free in the space; caller-chosen ids free anywhere. */
+	/**
+	 * Sids of new blocks must be free in the space (a drawn one that is not is drawn again, a
+	 * caller-chosen one fails the write); caller-chosen ids must be free anywhere.
+	 */
 	private async checkNewIdentities(created: WorkingBlock[]): Promise<void> {
 		if (created.length === 0) return;
 		const taken = await this.store.getBlockMetas(this.space.id, {
 			sids: created.map((b) => b.sid),
 		});
+		const takenSids = new Set(taken.map((b) => b.sid));
+		const chosen = created.find((b) => b.callerSid && takenSids.has(b.sid));
+		if (chosen) {
+			throw new OutlineWriteError(
+				`sid ${chosen.sid} is already in use`,
+				"OUTLINE_ID_TAKEN",
+				this.input.ops.findIndex((op) => op.op === "insert" && op.sid === chosen.sid),
+			);
+		}
 		if (taken.length > 0) throw new SidCollision();
 		const callerIds = created.filter((b) => b.callerId).map((b) => b.id);
 		if (callerIds.length === 0) return;
@@ -1527,7 +1604,7 @@ export async function writeOutline(
 ): Promise<OutlineWriteResult> {
 	const store = options.store ?? outlineStore;
 	const compensating = options.compensating;
-	const prepared = prepareOps(input.ops, compensating !== undefined);
+	const prepared = prepareOps(input.ops, compensating !== undefined, options.canonical);
 	const attempts = options.maxAttempts ?? DEFAULT_ATTEMPTS;
 	for (let attempt = 0; attempt < attempts; attempt++) {
 		const space = await store.getSpace(input.spaceId);

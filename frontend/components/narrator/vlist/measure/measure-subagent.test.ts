@@ -671,7 +671,6 @@ describe("measureSubagent — file changes", () => {
 		);
 		expect(measured.fileChangeRowCount).toBe(0);
 		expect(measured.hasFileChangeOverflowRow).toBe(true);
-		expect(measured.fileChangeNoticeRowCount).toBe(0);
 		// Title + summary, and NO seam between nonexistent files.
 		expect(measured.fileChangesHeight).toBeCloseTo(
 			2 * measured.fileChangeRowHeight + BLOCK_PADDING_BOTTOM,
@@ -679,7 +678,7 @@ describe("measureSubagent — file changes", () => {
 		);
 	});
 
-	it("reserves legacy and optional boundary notices, including old payloads", async () => {
+	it("reserves no extra rows for legacy attribution or its window", async () => {
 		const { measureSubagentCard } = await import("./measure-subagent");
 		const oldPayload = measureSubagentCard({ ...baseCard(), fileChanges: changes(1) }, 600, 5);
 		const scoped = measureSubagentCard(
@@ -693,12 +692,13 @@ describe("measureSubagent — file changes", () => {
 			600,
 			5,
 		);
-		expect(oldPayload.fileChangeNoticeRowCount).toBe(1);
-		expect(scoped.fileChangeNoticeRowCount).toBe(2);
-		expect(scoped.fileChangesHeight - oldPayload.fileChangesHeight).toBeCloseTo(
-			scoped.fileChangeRowHeight,
+		const exact = measureSubagentCard(
+			{ ...baseCard(), fileChanges: changes(1, { attributionScope: "exact_attempt" }) },
+			600,
 			5,
 		);
+		expect(oldPayload.fileChangesHeight).toBeCloseTo(exact.fileChangesHeight, 5);
+		expect(scoped.fileChangesHeight).toBeCloseTo(exact.fileChangesHeight, 5);
 	});
 
 	it("keeps a collapse affordance after expanding every file", async () => {

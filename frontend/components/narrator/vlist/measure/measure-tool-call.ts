@@ -208,6 +208,7 @@ export type ToolCategory =
 	| "skill"
 	| "browser"
 	| "knowledge"
+	| "outline"
 	| "contextAsk"
 	| "workspace"
 	| "generic";

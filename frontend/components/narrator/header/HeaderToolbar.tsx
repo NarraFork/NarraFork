@@ -20,6 +20,8 @@ export interface HeaderToolbarProps extends Omit<NarratorToolbarItemProps, "def"
 	/** Opens the compatibility modal, which the caller renders outside the menu. */
 	onOpenCompatibility?: () => void;
 	onOpenSavedRecordings?: () => void;
+	/** Opens the session's outline space; absent while the outline is switched off. */
+	onOpenOutline?: () => void;
 	onClose?: () => void;
 	/**
 	 * How many surfaced tools fit AFTER the full pretext-measured title reserved
@@ -106,6 +108,7 @@ export const HeaderToolbar = memo(function HeaderToolbar(props: HeaderToolbarPro
 				archiveLoading={archiveMutation.isPending}
 				onOpenCompatibility={props.onOpenCompatibility}
 				onOpenSavedRecordings={props.onOpenSavedRecordings}
+				onOpenOutline={props.onOpenOutline}
 			/>
 			{onClose && controls?.pinAction && (
 				<Box

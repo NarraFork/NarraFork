@@ -8,6 +8,7 @@ import {
 	IconClock,
 	IconDatabase,
 	IconFolders,
+	IconListTree,
 	IconMessages,
 	IconWand,
 } from "@tabler/icons-react";
@@ -97,6 +98,13 @@ const NAV_ITEM_DETAILS: Record<CustomizableNavId, Omit<NavItemDef, "id">> = {
 		to: "/knowledge",
 		icon: IconDatabase,
 		badge: "knowledgeReviewInbox",
+	},
+	// Hidden while `outline.enabled` is off (see useNavLayout).
+	outline: {
+		labelKey: "outline",
+		to: "/outline",
+		icon: IconListTree,
+		activePrefix: "/outline",
 	},
 };
 

@@ -18,7 +18,7 @@
  * Spaces the caller may not read are never looked at, so a reference into one is simply not
  * found: nothing tells whether it exists.
  */
-import { addressCandidates, isAlias, isTitleSyntax, titleOf } from "@shared/outline";
+import { addressCandidates, blockTitle, isAlias, isTitleSyntax } from "@shared/outline";
 import { globalQueryTerms, sanitizeQuery } from "../search/query";
 import type { OutlineLinkKind } from "./model";
 import { outlineStore } from "./store";
@@ -105,7 +105,7 @@ class Resolver {
 			address: `${key}/${block.sid}`,
 			pageId: block.pageId,
 			isPage: block.parentId === null,
-			title: titleOf(block.content),
+			title: blockTitle(block.content),
 			alias: block.alias,
 			deleted: block.deleted,
 		};
@@ -150,10 +150,11 @@ class Resolver {
 			short,
 			limit: OUTLINE_RESOLVE_LIMITS.titleCandidates,
 		});
-		let matches = rows.filter((row) => titleOf(row.content) === wanted);
+		const titles = new Map(rows.map((row) => [row, blockTitle(row.content)]));
+		let matches = rows.filter((row) => titles.get(row) === wanted);
 		if (matches.length === 0) {
 			const lower = wanted.toLowerCase();
-			matches = rows.filter((row) => titleOf(row.content).toLowerCase() === lower);
+			matches = rows.filter((row) => titles.get(row)?.toLowerCase() === lower);
 		}
 		if (matches.length === 0) return [];
 		const pages = matches.filter((row) => row.parentId === null);
@@ -299,7 +300,7 @@ export async function listBacklinks(
 				targets.push({ targetKind: "text", targetRef: block.alias, spaceId: space.id });
 			}
 		}
-		const title = titleOf(block.content);
+		const title = blockTitle(block.content);
 		if (title !== block.alias && isTitleSyntax(title) && (await resolvesHere(title))) {
 			targets.push({ targetKind: "text", targetRef: title, spaceId: space.id });
 		}
@@ -319,7 +320,7 @@ export async function listBacklinks(
 		links.push({
 			blockId: from.id,
 			address: `${fromSpace.key}/${from.sid}`,
-			title: titleOf(from.content),
+			title: blockTitle(from.content),
 			pageId: from.pageId,
 			spaceId: from.spaceId,
 			kind: link.kind,

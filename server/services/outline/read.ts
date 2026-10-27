@@ -21,12 +21,13 @@
  * reports the space's last seq at the time of the read as its seq.
  */
 import { AppError, NotFoundError, ValidationError } from "@server/lib/errors";
-import { titleOf } from "@shared/outline";
+import { blockTitle } from "@shared/outline";
 import { OUTLINE_TEXT } from "./messages";
 import { OUTLINE_LIMITS } from "./model";
 import {
 	clampBudget,
 	type OutlineBudget,
+	type OutlineDisplay,
 	type OutlineLabel,
 	type OutlineRenderResult,
 	renderOutline,
@@ -254,6 +255,14 @@ export interface OutlineReadRequest extends OutlineReadOptions {
 	view?: OutlineView;
 	budget?: Partial<OutlineBudget>;
 	label?: OutlineLabel;
+	/**
+	 * Prepares what each block renders as (see `OutlineRenderOptions.display`), once the
+	 * content of the blocks the read may show (`nodes`, the root first) is loaded.
+	 */
+	display?: (
+		state: OutlinePageState,
+		nodes: readonly OutlineNode[],
+	) => Promise<OutlineDisplay | undefined>;
 }
 
 export interface OutlineReadResult extends OutlineRenderResult {
@@ -280,12 +289,20 @@ export async function readOutline(request: OutlineReadRequest): Promise<OutlineR
 	const { state, root, path } = subtree;
 	const view = effectiveView(root, request.view ?? "facts");
 	const budget = clampBudget(request.budget);
-	await loadBodiesWithin(state, breadthFirst(root, view, budget.blocks), budget.bytes, { store });
+	const order = breadthFirst(root, view, budget.blocks);
+	await loadBodiesWithin(state, order, budget.bytes, { store });
 	await loadBodies(state, path, { store });
+	const display = request.display
+		? await request.display(
+				state,
+				order.filter((node) => node.content !== null),
+			)
+		: undefined;
 	const rendered = renderOutline(root, {
 		view,
 		budget,
 		label: request.label,
+		display,
 		truncatedRead: state.truncated ? { blocksRead: state.nodes.size } : undefined,
 	});
 	return {
@@ -296,7 +313,11 @@ export async function readOutline(request: OutlineReadRequest): Promise<OutlineR
 		seq: state.seq,
 		current: state.current,
 		truncated: rendered.hiddenByBudget > 0 || state.truncated,
-		path: path.map((node) => ({ id: node.id, sid: node.sid, title: titleOf(node.content ?? "") })),
+		path: path.map((node) => ({
+			id: node.id,
+			sid: node.sid,
+			title: blockTitle(node.content ?? ""),
+		})),
 	};
 }
 

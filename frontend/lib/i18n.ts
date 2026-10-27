@@ -31,6 +31,7 @@ export const namespaces = [
 	"terminal",
 	"routines",
 	"knowledge",
+	"outline",
 	"scheduledTasks",
 	"plugins",
 	"chat",
@@ -174,6 +175,9 @@ function getRouteNamespaces(path: string): Namespace[] {
 		return ["common", "nav", "knowledge"];
 	}
 	if (path === "/search") return ["common", "nav", "search"];
+	if (path === "/outline" || path.startsWith("/outline/")) {
+		return ["common", "nav", "outline"];
+	}
 
 	return ["common", "nav"];
 }

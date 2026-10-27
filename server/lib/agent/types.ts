@@ -11,6 +11,7 @@ import type { StreamingEditOrigin } from "@shared/streaming-edit-origin";
 import type { ToolProgressPayload } from "@shared/tool-progress";
 import type { z } from "zod/v4";
 import type { PathFlavor } from "./execution/backend";
+import { OUTLINE_EDIT_TOOL, OUTLINE_READ_TOOLS } from "./tools/outline-names";
 
 // === API error and bounded diagnostics ===
 
@@ -916,6 +917,9 @@ export const PLAN_MODE_ALLOWED_TOOLS = new Set([
 	"LearningGuide",
 	// Visibility only: narrator-permission admits show, never create.
 	"GenUI",
+	...OUTLINE_READ_TOOLS,
+	// Planning writes the outline: OutlineEdit then writes only the session's own space.
+	OUTLINE_EDIT_TOOL,
 ]);
 
 // === Agent config ===

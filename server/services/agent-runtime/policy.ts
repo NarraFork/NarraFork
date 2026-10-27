@@ -1,4 +1,5 @@
 import { BASH_TOOL_NAME } from "@server/lib/agent/tool-name";
+import { OUTLINE_EDIT_TOOL, OUTLINE_READ_TOOLS } from "@server/lib/agent/tools/outline-names";
 import type { RuntimePolicyTrait } from "@server/lib/runtime-policy-trait";
 
 /**
@@ -50,8 +51,9 @@ const READ_TOOLS = Object.freeze([
 	"Send",
 	// Only show passes a read-only execution policy; create remains gated.
 	"GenUI",
+	...OUTLINE_READ_TOOLS,
 ]);
-const GENERAL_TOOLS = Object.freeze([...READ_TOOLS, "Write", "Edit", "Skill"]);
+const GENERAL_TOOLS = Object.freeze([...READ_TOOLS, "Write", "Edit", "Skill", OUTLINE_EDIT_TOOL]);
 const SEARCH_TOOLS = Object.freeze([
 	"WebSearch",
 	"WebFetch",

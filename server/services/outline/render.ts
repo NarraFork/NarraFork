@@ -68,11 +68,19 @@ export function clampBudget(budget?: Partial<OutlineBudget>): OutlineBudget {
 /** Text to put before an item (after its bullet); null for none. */
 export type OutlineLabel = (node: OutlineNode) => string | null | undefined;
 
+/** The outline item a block renders as, given the one its stored state makes. */
+export type OutlineDisplay = (node: OutlineNode, item: OutlineItem) => OutlineItem;
+
 export interface OutlineRenderOptions {
 	/** Default `facts`. */
 	view?: OutlineView;
 	budget?: Partial<OutlineBudget>;
 	label?: OutlineLabel;
+	/**
+	 * What a block renders as, when it differs from its stored state (links shown with their
+	 * targets' titles, say). Content must stay canonical dialect markdown.
+	 */
+	display?: OutlineDisplay;
 	/**
 	 * The tree was read cut short (a page with more blocks than one read loads): a note says so,
 	 * with the number of blocks that were read.
@@ -185,7 +193,8 @@ export function renderOutline(
 		let cached = lines.get(node);
 		if (!cached) {
 			const label = options.label?.(node);
-			const text = serializeMarkdownOutline([outlineItem(node)], {
+			const item = outlineItem(node);
+			const text = serializeMarkdownOutline([options.display?.(node, item) ?? item], {
 				label: () => label ?? null,
 			});
 			cached = indented(text.split("\n"), depth.get(node) ?? 0);
@@ -260,8 +269,11 @@ function countSubtree(root: OutlineNode): number {
 
 const MORE_LINE = /^ *‹… \d+ more›$/;
 const NOTE_LINE = /^‹[^\n]*›$/;
-/** A code fence opening a line, or right after an item's bullet and checkbox. */
-const FENCE = /^ *(?:(?:[-*+]|\d{1,9}[.)]) +(?:\[[ xX/-]\] +)?)?(`{3,}|~{3,})/;
+/**
+ * A code fence opening a line, or right after an item's bullet, its label (`[Ab3dEf9Q]`, when
+ * the read put one there) and its checkbox.
+ */
+const FENCE = /^ *(?:(?:[-*+]|\d{1,9}[.)]) +(?:\[[^\]\n]*\] +)?(?:\[[ xX/-]\] +)?)?(`{3,}|~{3,})/;
 
 /** Whether a line of a rendered outline is an annotation rather than content. */
 export function isReadAnnotation(line: string): boolean {

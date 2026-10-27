@@ -18,6 +18,7 @@
  */
 
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
+import { FILE_CHANGE_EVIDENCE_VERSION } from "@shared/file-change-protocol";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import {
 	fileAttributions,
@@ -157,6 +158,7 @@ async function exactEffect(over: {
 	filePath?: string;
 	linesAdded?: number;
 	linesRemoved?: number;
+	evidenceVersion?: number;
 }) {
 	const now = new Date().toISOString();
 	const filePath = over.filePath ?? "src/current.ts";
@@ -184,7 +186,8 @@ async function exactEffect(over: {
 	await db.insert(fileChangeOperations).values({
 		id: over.operationId,
 		executionSegmentId: over.segmentId,
-		evidenceVersion: 2,
+		// Default to what the live runtime writes, so a stale version filter cannot pass.
+		evidenceVersion: over.evidenceVersion ?? FILE_CHANGE_EVIDENCE_VERSION,
 		sourceInstanceId: `runtime-${over.segmentId}`,
 		sourceKind: "tool",
 		sourceId: `source-${over.operationId}`,
@@ -660,6 +663,35 @@ describe("getFileChangesBySubagent — the card projection", () => {
 		const wrongActor = await getChildSubagentFileChanges(options);
 		expect(wrongActor.attributionScope).toBe("legacy_unscoped");
 		expect(wrongActor.totalFiles).toBe(0);
+	});
+
+	test("current and v2 evidence both qualify as exact attempt evidence", async () => {
+		await exactEffect({ segmentId: "current", operationId: "current-op", linesAdded: 4 });
+		await exactEffect({
+			segmentId: "current-v2",
+			operationId: "v2-op",
+			filePath: "src/v2.ts",
+			linesAdded: 2,
+			evidenceVersion: 2,
+		});
+		sqlite.run("UPDATE file_change_execution_segments SET parent_segment_id = ? WHERE id = ?", [
+			"current",
+			"current-v2",
+		]);
+		await parentExecutionCall("current");
+		const exact = await getChildSubagentFileChanges({
+			parentNarratorId: PARENT,
+			childNarratorId: "sub-a",
+			scope: { sourceToolUseId: "parent-tool-use", startedAt: null, completedAt: null },
+			executionBoundary: {
+				sourceToolCallId: "parent-call",
+				executionAttempt: 1,
+				executionIdentityVersion: 1,
+				executionSegmentId: "current",
+			},
+		});
+		expect(exact.attributionScope).toBe("exact_attempt");
+		expect(exact.totalFiles).toBe(2);
 	});
 
 	test("child results deduplicate receipts, not entire files, and reject previous-round projections", async () => {

@@ -10,7 +10,7 @@
  * into block addresses is resolution, which needs the database and happens elsewhere.
  * Pure functions; no database access.
  */
-import { bodyRefs, formatAddress, parseAddress, parseBlock } from "@shared/outline";
+import { type Body, bodyRefs, formatAddress, parseAddress, parseBlock } from "@shared/outline";
 import type { OutlineLinkKind, OutlineLinkTargetKind, OutlineTaskJson } from "./model";
 
 export interface ExtractedLink {
@@ -44,8 +44,13 @@ function dedupe(links: ExtractedLink[]): ExtractedLink[] {
 
 /** `link` and `embed` rows of canonical block content, deduplicated, in document order. */
 export function contentLinks(content: string): ExtractedLink[] {
+	return bodyLinks(parseBlock(content).body);
+}
+
+/** {@link contentLinks} of a body already parsed. */
+export function bodyLinks(body: Body): ExtractedLink[] {
 	return dedupe(
-		bodyRefs(parseBlock(content).body).map((ref) => ({
+		bodyRefs(body).map((ref) => ({
 			kind: ref.kind === "embed" ? "embed" : "link",
 			...linkTarget(ref.ref),
 		})),

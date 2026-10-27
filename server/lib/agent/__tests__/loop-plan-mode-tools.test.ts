@@ -283,3 +283,12 @@ describe("plan mode tool descriptions", () => {
 		expect(formatToolsCalls).toHaveLength(1);
 	});
 });
+
+describe("outline tools in strict plan mode", () => {
+	test("keep their descriptions: planning reads and writes the outline", async () => {
+		const { PLAN_MODE_ALLOWED_TOOLS } = await import("../types");
+		for (const name of ["OutlineRead", "OutlineSearch", "OutlineEdit"]) {
+			expect(PLAN_MODE_ALLOWED_TOOLS.has(name)).toBe(true);
+		}
+	});
+});

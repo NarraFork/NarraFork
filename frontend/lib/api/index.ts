@@ -13,6 +13,7 @@ import { narratorsApi } from "./narrators";
 import { notificationsApi } from "./notifications";
 import { oauthAppsApi } from "./oauth-apps";
 import { oauthGrantsApi } from "./oauth-grants";
+import { outlineApi } from "./outline";
 import { pluginsApi } from "./plugins";
 import { projectsApi } from "./projects";
 import { providerImportApi } from "./provider-import";
@@ -52,6 +53,7 @@ export const api = {
 	...tokendanceApi,
 	...oauthAppsApi,
 	...oauthGrantsApi,
+	...outlineApi,
 	...scheduledTasksApi,
 	...pluginsApi,
 	...sessionInterchangeApi,

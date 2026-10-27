@@ -1,0 +1,135 @@
+{
+	"title": "Outline",
+	"subtitle": "Notes, decisions and plans as outlines, for projects, sessions and yourself.",
+	"unavailable": "The outline is not turned on for this server.",
+	"notFound": "This page does not exist, or you cannot read it.",
+	"notAtTime": "This block did not exist at that point in the history.",
+	"loadFailed": "Could not load this. Try again in a moment.",
+	"loadMore": "Load more",
+	"home": {
+		"searchPlaceholder": "Search all outlines you can read",
+		"noResults": "No matches.",
+		"process": "Process",
+		"recent": "Recently visited",
+		"noRecent": "Pages you open appear here.",
+		"spaces": "Spaces",
+		"noSpaces": "No spaces yet."
+	},
+	"space": {
+		"personalMine": "My notes",
+		"personalOther": "Personal notes",
+		"project": "{{name}}",
+		"projectUnnamed": "Removed project",
+		"session": "{{name}}",
+		"sessionUnnamed": "Untitled session",
+		"kind": {
+			"project": "Project",
+			"personal": "Personal",
+			"session": "Session"
+		},
+		"orphaned": "Owner removed",
+		"commits_one": "{{count}} commit",
+		"commits_other": "{{count}} commits",
+		"readOnly": "Read only",
+		"searchPlaceholder": "Search this space",
+		"pages": "Pages",
+		"noPages": "No pages yet. Agents and editors add them here."
+	},
+	"page": {
+		"task": {
+			"todo": "To do",
+			"doing": "In progress",
+			"done": "Done",
+			"cancelled": "Cancelled"
+		},
+		"expand": "Expand",
+		"collapse": "Collapse",
+		"focus": "Focus on this block",
+		"due": "Due {{date}}",
+		"alias": "Alias {{alias}}",
+		"inProgress_one": "In progress · {{count}}",
+		"inProgress_other": "In progress · {{count}}",
+		"inProgressHint": "Open tasks under this block. Switch to All to see them.",
+		"more_one": "… {{count}} more",
+		"more_other": "… {{count}} more",
+		"moreAtRoot_one": "… {{count}} more block does not fit on this page; focus on a part of it.",
+		"moreAtRoot_other": "… {{count}} more blocks do not fit on this page; focus on a part of it.",
+		"factsEmpty": "Only tasks and their progress are here. Switch to All to see them.",
+		"empty": "No blocks under this one yet.",
+		"view": {
+			"facts": "Facts",
+			"all": "All"
+		},
+		"viewLabel": "What to show",
+		"sidePanel": "Backlinks and history",
+		"asOfBanner": "Viewing the page as of commit #{{seq}} (read only).",
+		"backToCurrent": "Back to now",
+		"truncated": "This page is too large to read at once; focus on a part of it.",
+		"processHidden_one": "{{count}} block under tasks is not shown.",
+		"processHidden_other": "{{count}} blocks under tasks are not shown.",
+		"showAll": "Show all"
+	},
+	"side": {
+		"backlinks": "Backlinks",
+		"history": "History",
+		"noBacklinks": "Nothing links here.",
+		"backlinksTruncated_one": "Showing the first {{count}}.",
+		"backlinksTruncated_other": "Showing the first {{count}}.",
+		"noHistory": "No history.",
+		"linkKind": {
+			"link": "Link",
+			"embed": "Embed",
+			"depends": "Depends on",
+			"tag": "Tag"
+		},
+		"change": {
+			"create": "Created",
+			"content": "Edited",
+			"move": "Moved",
+			"delete": "Deleted",
+			"restore": "Restored",
+			"task": "Task",
+			"page": "Page changed",
+			"props": "Alias or tags"
+		},
+		"viewAt": "View the page as of commit #{{seq}}"
+	},
+	"timeline": {
+		"label": "Timeline",
+		"previous": "Previous commit",
+		"next": "Next commit",
+		"older": "Load older commits",
+		"empty": "No commits yet.",
+		"now": "Now",
+		"commit": "#{{seq}}",
+		"kind": {
+			"edit": "Edit",
+			"revert": "Revert",
+			"import": "Import"
+		},
+		"actor": {
+			"unknown": "Someone",
+			"agent": "Agent",
+			"agentFor": "Agent for {{name}}",
+			"system": "System"
+		},
+		"revert": "Revert",
+		"revertTitle": "Revert commit #{{seq}}?",
+		"revertConfirm": "A new commit puts back what this commit changed. Blocks changed since then are left as they are.",
+		"cancel": "Cancel",
+		"revertAction": "Revert",
+		"reverted": "Reverted #{{seq}}",
+		"revertFailed": "Revert failed",
+		"revertChanged_one": "{{count}} block put back.",
+		"revertChanged_other": "{{count}} blocks put back.",
+		"revertedNothing": "Nothing could be put back.",
+		"revertSkipped_one": "{{count}} block left as it is:",
+		"revertSkipped_other": "{{count}} blocks left as they are:",
+		"skipReason": {
+			"changed-later": "changed by a later commit",
+			"parent-gone": "the block it belonged under is deleted",
+			"later-children": "blocks were added under it later",
+			"cycle": "it would end up under itself"
+		}
+	}
+}

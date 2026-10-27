@@ -24,6 +24,9 @@ import {
 	IconHelpCircle,
 	IconHistory,
 	IconListCheck,
+	IconListDetails,
+	IconListSearch,
+	IconListTree,
 	IconMap,
 	IconMessageQuestion,
 	IconPencil,
@@ -63,6 +66,18 @@ function knowledgeIcon(toolName?: string): ComponentType<IconProps> {
 			return IconShieldLock;
 		default:
 			return IconBook;
+	}
+}
+
+/** Per-tool icon for the outline family: reading a tree, searching it, writing to it. */
+function outlineIcon(toolName?: string): ComponentType<IconProps> {
+	switch (toolName) {
+		case "OutlineSearch":
+			return IconListSearch;
+		case "OutlineEdit":
+			return IconListDetails;
+		default:
+			return IconListTree;
 	}
 }
 
@@ -131,6 +146,8 @@ export function categoryIcon(cat: ToolCategory, toolName?: string): ComponentTyp
 			return IconWorldWww;
 		case "knowledge":
 			return knowledgeIcon(toolName);
+		case "outline":
+			return outlineIcon(toolName);
 		// Help-circle, not send's IconMessageQuestion: ContextAsk queries another
 		// session's context rather than delivering a message, and the two sit next
 		// to each other in multi-agent runs.

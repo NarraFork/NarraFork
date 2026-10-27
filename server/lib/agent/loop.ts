@@ -117,6 +117,7 @@ import {
 	isExitPlanReflectionWaitingForUser,
 	markExitPlanReflectionStarted,
 } from "./tools/exit-plan-reflection";
+import { isOutlineTool } from "./tools/outline-names";
 import {
 	broadcastTaskReflectionProgress,
 	cleanupTaskReflection,
@@ -3071,9 +3072,10 @@ async function* agentLoopInMetadataSnapshot(
 			});
 		}
 		// Point B: scan this tool's output for relevant knowledge and inject a reminder.
-		// Skip the knowledge tools themselves to avoid self-amplification.
+		// Skip the knowledge and outline tools themselves to avoid self-amplification.
 		if (
 			!tu.name.startsWith("Knowledge") &&
+			!isOutlineTool(tu.name) &&
 			typeof result.output === "string" &&
 			result.output.length > 0
 		) {

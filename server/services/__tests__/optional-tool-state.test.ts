@@ -78,6 +78,7 @@ async function createNarratorInProject(projectId: string): Promise<string> {
 
 afterEach(async () => {
 	setGlobalToolMode("browser", null);
+	setGlobalToolMode("outline_edit", null);
 	// Narrators reference the project via contextProjectId, so they go first or
 	// the project delete trips the foreign key.
 	if (createdNarrators.length > 0) {
@@ -203,5 +204,23 @@ describe("resolveOptionalToolState — routine modes", () => {
 
 		const result = await resolveOptionalToolState(narrator.id, "Browser");
 		expect(result.state).toBe("disabled_by_trait");
+	});
+});
+
+describe("resolveOptionalToolState — OutlineEdit", () => {
+	test("is loaded with its routine; the outline reads are core tools", async () => {
+		const narrator = await createStandaloneNarrator();
+		createdNarrators.push(narrator.id);
+		// Not preloaded by default: loaded on demand, or made resident by its routine.
+		const byDefault = await resolveOptionalToolState(narrator.id, "OutlineEdit");
+		expect(byDefault.mode).not.toBe("resident");
+		expect(byDefault.state).toBe("not_loaded");
+		setGlobalToolMode("outline_edit", "resident");
+		const resident = await resolveOptionalToolState(narrator.id, "OutlineEdit");
+		expect(resident.mode).toBe("resident");
+		expect(resident.state).toBe("loaded");
+		for (const core of ["OutlineRead", "OutlineSearch"]) {
+			expect((await resolveOptionalToolState(narrator.id, core)).state).toBe("unknown_tool");
+		}
 	});
 });

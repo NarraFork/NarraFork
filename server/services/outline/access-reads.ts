@@ -172,6 +172,18 @@ export async function readProject(id: string): Promise<ProjectAccessRow | null> 
 	};
 }
 
+/** A project's name, for naming its space to people and agents. */
+export async function readProjectName(id: string): Promise<string | null> {
+	const rows = await all(sql`select name from projects where id = ${id} limit 1`);
+	return rows[0] ? textOrNull(rows[0], "name") : null;
+}
+
+/** A narrator's title, for naming its session space to people and agents. */
+export async function readNarratorTitle(id: string): Promise<string | null> {
+	const rows = await all(sql`select title from narrators where id = ${id} limit 1`);
+	return rows[0] ? textOrNull(rows[0], "title") : null;
+}
+
 export async function readUserExists(id: string): Promise<boolean> {
 	const rows = await all(sql`select id from users where id = ${id} limit 1`);
 	return rows.length > 0;
@@ -275,6 +287,50 @@ export async function readNonAdminGrantees(
 		limit ${limit}
 	`);
 	return rows.map((row) => text(row, "principal_id"));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Display names
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Names to show for ids the caller has already been allowed to see: project names, narrator
+ * titles and usernames, by id. Not access facts; they live here because they are read through
+ * the same executor. Missing ids (deleted rows) are simply absent from the result.
+ */
+export async function readDisplayNames(ids: {
+	projectIds?: readonly string[];
+	narratorIds?: readonly string[];
+	userIds?: readonly string[];
+}): Promise<{
+	projects: Map<string, string>;
+	narrators: Map<string, string | null>;
+	users: Map<string, string>;
+}> {
+	const out = {
+		projects: new Map<string, string>(),
+		narrators: new Map<string, string | null>(),
+		users: new Map<string, string>(),
+	};
+	for (const chunk of chunked([...new Set(ids.projectIds ?? [])])) {
+		const rows = await all(sql`
+			select id, name from projects where id in (${idList(chunk)}) limit ${chunk.length}
+		`);
+		for (const row of rows) out.projects.set(text(row, "id"), text(row, "name"));
+	}
+	for (const chunk of chunked([...new Set(ids.narratorIds ?? [])])) {
+		const rows = await all(sql`
+			select id, title from narrators where id in (${idList(chunk)}) limit ${chunk.length}
+		`);
+		for (const row of rows) out.narrators.set(text(row, "id"), textOrNull(row, "title"));
+	}
+	for (const chunk of chunked([...new Set(ids.userIds ?? [])])) {
+		const rows = await all(sql`
+			select id, username from users where id in (${idList(chunk)}) limit ${chunk.length}
+		`);
+		for (const row of rows) out.users.set(text(row, "id"), text(row, "username"));
+	}
+	return out;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

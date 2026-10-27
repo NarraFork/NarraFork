@@ -12,7 +12,7 @@
  * Links in content are `[[target]]` / `[[target|display]]`, embeds `![[…]]`; inside a GFM table
  * cell the separator is written `\|`.
  */
-import { type Inline, isValidMention, parseBlock, refSource } from "./dialect";
+import { type Body, type Inline, isValidMention, parseBlock, refSource } from "./dialect";
 
 /** Space keys and short ids: ASCII letters, digits, `_` and `-`, starting with a letter or digit. */
 const TOKEN_RE = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
@@ -186,9 +186,28 @@ export function formatLinkList(links: LinkTarget[]): string {
 	return links.map((l) => formatLink(l)).join(", ");
 }
 
+/**
+ * Characters of a block's content {@link blockTitle} reads. A title is the block's first line,
+ * and lexing a whole 16 KiB block to find it costs tens of milliseconds.
+ */
+export const TITLE_SCAN_CHARS = 2048;
+
+/**
+ * {@link titleOf}, reading only the start of the content: the same title for every block whose
+ * first line (with any marks open on it) fits in {@link TITLE_SCAN_CHARS}. Use it where many
+ * blocks are titled at once.
+ */
+export function blockTitle(content: string): string {
+	return titleOf(content.length > TITLE_SCAN_CHARS ? content.slice(0, TITLE_SCAN_CHARS) : content);
+}
+
 /** The plain text of a block's first line: what title lookups compare against. */
 export function titleOf(content: string): string {
-	const body = parseBlock(content).body;
+	return titleOfBody(parseBlock(content).body);
+}
+
+/** {@link titleOf} of a body already parsed. */
+export function titleOfBody(body: Body): string {
 	const firstLine = (inl: Inline[]): string => {
 		let out = "";
 		for (const n of inl) {

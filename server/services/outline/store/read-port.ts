@@ -52,6 +52,31 @@ export interface OutlineSearchRow {
 	rank: number;
 }
 
+/** Characters of a page's content a page list reads: enough for its title. */
+export const OUTLINE_PAGE_HEAD_CHARS = 400;
+
+/** A live page of a space with the start of its content: what a list of pages shows. */
+export interface OutlinePageListRow {
+	id: string;
+	sid: string;
+	orderKey: string;
+	alias: string | null;
+	/** The first {@link OUTLINE_PAGE_HEAD_CHARS} characters of the content. */
+	contentHead: string;
+	/** The page is a task. */
+	isTask: boolean;
+}
+
+/** One version of a block without its content: an entry of the block's history. */
+export interface OutlineBlockHistoryRow {
+	fromSeq: number;
+	toSeq: number | null;
+	commitId: string;
+	pageId: string;
+	changeFlags: number;
+	deleted: boolean;
+}
+
 /** A link target to look up backlinks for. */
 export interface OutlineLinkTargetRef {
 	targetKind: OutlineLinkTargetKind;
@@ -120,6 +145,16 @@ export interface OutlineReadPort {
 		by: { sid: string } | { alias: string },
 		limit: number,
 	): Promise<OutlineBlockRow[]>;
+	/**
+	 * Aliases of live blocks of a space from `from` (inclusive) to `to` (exclusive) in byte order,
+	 * in that order, at most `limit`: every alias made of a prefix and a digit lies in
+	 * `[prefix + "0", prefix + ":")`, which is how the next number of a `Q?` alias is found.
+	 */
+	listAliasRange(
+		spaceId: string,
+		range: { from: string; to: string },
+		limit: number,
+	): Promise<string[]>;
 	/** Live blocks matching a full-text query, best first, at most `query.limit`. */
 	searchBlocks(query: OutlineSearchQuery): Promise<OutlineSearchRow[]>;
 	/** Open links to any of the targets, written in one of `spaceIds`, at most `limit`. */
@@ -128,4 +163,17 @@ export interface OutlineReadPort {
 		spaceIds: readonly string[],
 		limit: number,
 	): Promise<OutlineLinkRow[]>;
+	/**
+	 * Live pages of a space in sibling order (order key, then id, bytewise), after the page
+	 * `after` names when given, at most `limit`. Reads only the head of each page's content.
+	 */
+	listSpacePages(
+		spaceId: string,
+		options: { after?: { orderKey: string; id: string } | null; limit: number },
+	): Promise<OutlinePageListRow[]>;
+	/** A block's versions without content, newest first, `from_seq < before`, at most `limit`. */
+	listBlockHistory(
+		blockId: string,
+		options: { before?: number | null; limit: number },
+	): Promise<OutlineBlockHistoryRow[]>;
 }

@@ -934,6 +934,80 @@ export const OUTLINE_STORE_CONTRACT: ContractCase[] = [
 		},
 	},
 	{
+		name: "caller-chosen sids and content normalized by the caller",
+		async run(ctx) {
+			const space = await personalSpace(ctx);
+			const r = await write(ctx, space, [
+				{ op: "insert", tempId: "a", sid: "Chosen01", parent: null, content: "page" },
+				{
+					op: "insert",
+					sid: "Chosen02",
+					parent: { tempId: "a" },
+					content: `see [[${space.key}/Chosen01]]`,
+				},
+			]);
+			expect(r.results.map((x) => x.sid)).toEqual(["Chosen01", "Chosen02"]);
+			expect((await ctx.store.getBlockBySid(space.id, "Chosen02"))?.content).toBe(
+				`see [[${space.key}/Chosen01]]`,
+			);
+			await rejects(
+				write(ctx, space, [{ op: "insert", sid: "Chosen01", parent: null, content: "again" }]),
+				"OUTLINE_ID_TAKEN",
+			);
+			await rejects(
+				write(ctx, space, [
+					{ op: "insert", sid: "Twice001", parent: null, content: "x" },
+					{ op: "insert", sid: "Twice001", parent: null, content: "y" },
+				]),
+				"OUTLINE_INVALID_OP",
+			);
+			await rejects(
+				write(ctx, space, [{ op: "insert", sid: "bad/sid", parent: null, content: "x" }]),
+				"OUTLINE_INVALID_OP",
+			);
+			// Another space may use the same sid.
+			const other = await personalSpace(ctx);
+			expect(
+				(await write(ctx, other, [{ op: "insert", sid: "Chosen01", parent: null, content: "x" }]))
+					.results[0]?.sid,
+			).toBe("Chosen01");
+
+			// Canonical content is taken as is: not normalized again, its links as handed over.
+			const content = "**bold** and [[Some page]]";
+			const canonical = await writeOutline(
+				{
+					spaceId: space.id,
+					ops: [{ op: "insert", parent: null, content }],
+					actor: ACTOR,
+					responsibleUserId: null,
+				},
+				{
+					store: ctx.store,
+					canonical: [
+						{ content, links: [{ kind: "link", targetKind: "text", targetRef: "Some page" }] },
+					],
+				},
+			);
+			const id = canonical.results[0]?.blockId as string;
+			expect((await ctx.store.getBlock(id))?.content).toBe(content);
+			expect(
+				(await ctx.store.listOpenLinks([id], 10)).map((l) => [l.kind, l.targetKind, l.targetRef]),
+			).toEqual([["link", "text", "Some page"]]);
+			await expect(
+				writeOutline(
+					{
+						spaceId: space.id,
+						ops: [{ op: "insert", parent: null, content: "other" }],
+						actor: ACTOR,
+						responsibleUserId: null,
+					},
+					{ store: ctx.store, canonical: [{ content: "not the same", links: [] }] },
+				),
+			).rejects.toThrow("canonical content does not match");
+			checkSpaceInvariants(await ctx.dump(space.id));
+		},
+	},
+	{
 		name: "delete: a tombstone version for every descendant, links closed",
 		async run(ctx) {
 			const space = await personalSpace(ctx);

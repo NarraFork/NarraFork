@@ -114,6 +114,11 @@ describe("SQLite specifics", () => {
 		).toContain("uq_outline_blocks_space_alias");
 		expect(
 			plan(
+				`SELECT alias FROM outline_blocks WHERE space_id = 'x' AND alias >= 'Q0' AND alias < 'Q:' AND "outline_blocks"."deleted" = 0 ORDER BY alias LIMIT 5`,
+			),
+		).toContain("uq_outline_blocks_space_alias");
+		expect(
+			plan(
 				"SELECT block_id FROM outline_block_versions WHERE page_id = 'p' AND from_seq <= 5 AND (to_seq IS NULL OR to_seq > 5)",
 			),
 		).toContain("idx_outline_versions_page_range");

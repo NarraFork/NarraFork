@@ -17,7 +17,7 @@
  * Snippets and paths are cut here, the same way on both backends.
  */
 import { ValidationError } from "@server/lib/errors";
-import { isAlias, titleOf } from "@shared/outline";
+import { blockTitle, isAlias } from "@shared/outline";
 import { globalQueryTerms, sanitizeQuery } from "../search/query";
 import { OUTLINE_TEXT } from "./messages";
 import { outlineStore } from "./store";
@@ -80,7 +80,7 @@ interface Ancestry {
 
 /** Candidates that match better sort first; see the module header. */
 function matchTier(row: OutlineSearchRow, query: string, terms: readonly string[]): number {
-	const title = titleOf(row.content).toLowerCase();
+	const title = blockTitle(row.content).toLowerCase();
 	if (row.alias === query || title === query.toLowerCase()) return 0;
 	if (terms.every((term) => title.includes(term))) return 1;
 	if (row.content.toLowerCase().includes(query.toLowerCase())) return 2;
@@ -121,7 +121,7 @@ export function searchSnippet(
 }
 
 function shortTitle(content: string): string {
-	const title = titleOf(content);
+	const title = blockTitle(content);
 	const chars = Array.from(title);
 	return chars.length <= OUTLINE_SEARCH_LIMITS.titleChars
 		? title

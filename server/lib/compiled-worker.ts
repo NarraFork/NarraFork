@@ -38,6 +38,7 @@ export const COMPILED_WORKER_ENTRIES = [
 	"lib/request-recorder-worker.ts",
 	"services/editor-document-worker.ts",
 	"services/editor-document-stream-worker.ts",
+	"services/outline/edit-text-worker.ts",
 	"services/git-untracked-line-worker.ts",
 	"services/git-current-baseline-worker.ts",
 	"services/agent-runtime/model-history-worker.ts",

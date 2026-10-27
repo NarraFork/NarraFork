@@ -11,6 +11,7 @@ import {
 	resolveRuntimePolicy,
 } from "../../../services/agent-runtime/policy";
 import {
+	classifyDanger,
 	extractToolPaths,
 	MAX_PLAN_FILE_BYTES,
 	resolveExitPlanModeInput,
@@ -1191,6 +1192,54 @@ describe("executeTool permission guard", () => {
 				cwd: "/tmp/project",
 			}),
 		).toBe("deny");
+	});
+
+	test("outline reads are reads; OutlineEdit needs no approval in any mode", () => {
+		for (const toolName of ["OutlineRead", "OutlineSearch"]) {
+			expect(
+				resolvePermissionDecision({
+					toolName,
+					input: { address: "Q17" },
+					permMode: "readOnly",
+					cwd: "/tmp/project",
+				}),
+			).toBe("allow");
+		}
+		// Where it may write (the session's own space only, in read-only and strict plan mode)
+		// is the tool's decision: it resolves the addresses.
+		const edit = { edits: [{ add: "/", markdown: "- note" }] };
+		for (const permMode of ["default", "acceptEdits", "readOnly", "dontAsk", "bypassPermissions"]) {
+			expect(
+				resolvePermissionDecision({
+					toolName: "OutlineEdit",
+					input: edit,
+					permMode,
+					cwd: "/tmp/project",
+				}),
+			).toBe("allow");
+		}
+		expect(
+			resolvePermissionDecision({
+				toolName: "OutlineEdit",
+				input: edit,
+				permMode: "default",
+				cwd: "/tmp/project",
+				planMode: true,
+			}),
+		).toBe("allow");
+	});
+
+	test("under bypass, outline deletes and moves are a medium danger, other edits low", () => {
+		const add = classifyDanger("OutlineEdit", { edits: [{ add: "/", markdown: "- x" }] }, "/tmp");
+		expect(add?.severity).toBe("low");
+		const restructure = classifyDanger(
+			"OutlineEdit",
+			{ edits: [{ delete: "Ab3dEf9Q" }, { move: "Q1", to: "Q2" }] },
+			"/tmp",
+		);
+		expect(restructure?.severity).toBe("medium");
+		expect(restructure?.summary).toContain("2 outline block(s)");
+		expect(classifyDanger("OutlineRead", { address: "Q1" }, "/tmp")).toBeNull();
 	});
 
 	test("does not execute unresolved dangerReflection permission results", async () => {

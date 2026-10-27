@@ -73,6 +73,7 @@ import {
 } from "../../hooks/useNarrator";
 import { readOpeningLod, useNarratorLod } from "../../hooks/useNarratorLod";
 import { useOpencodeUsage } from "../../hooks/useOpencodeUsage";
+import { useOpenOutlineSpace, useOutlineEnabled } from "../../hooks/useOutline";
 import {
 	useNarratorBrowserSessionsCapability,
 	useNarratorCompactCapability,
@@ -94,6 +95,7 @@ import {
 } from "../../hooks/useWorkspaceContext";
 import { ApiError, api } from "../../lib/api";
 import type { RevertActionConfirmOptions } from "../../lib/api/narrators";
+import { describeApiError } from "../../lib/api-error";
 import { statusRegistry } from "../../lib/constants";
 import { collectElementTextPreview, compactWhitespacePreview } from "../../lib/dom-text";
 import {
@@ -1972,6 +1974,17 @@ function NarratorPanelBody({
 	const compatibilityProjectId = workspaceContext?.contextProjectId ?? projectId;
 	/** Stable identity so HeaderToolbar's memo is not busted every render. */
 	const openCompatibility = useCallback(() => setCompatibilityOpen(true), []);
+	/** The session's outline space, offered in the overflow menu while the outline is on. */
+	const outlineEnabled = useOutlineEnabled().enabled;
+	const { open: openOutlineSpace } = useOpenOutlineSpace({
+		onMissing: () => notifications.show({ color: "gray", message: t("outlineNotCreated") }),
+		onError: (error) =>
+			notifications.show({ color: "red", message: describeApiError(error, t).message }),
+	});
+	const openOutline = useCallback(
+		() => openOutlineSpace("narrator", narratorId),
+		[openOutlineSpace, narratorId],
+	);
 	useMobileDrawerHistory(useInternalSpec && internalSpecOpen, () => setInternalSpecOpen(false));
 
 	// File opening (dock file panel when hosted in a dock, else an off-dock right
@@ -3199,6 +3212,7 @@ function NarratorPanelBody({
 										dock={dock}
 										mockStreamEnabled={mockStreamEnabled}
 										onOpenCompatibility={compatibilityProjectId ? openCompatibility : undefined}
+										onOpenOutline={outlineEnabled ? openOutline : undefined}
 										onClose={onClose}
 										visibleToolCount={headerLayout.visibleToolCount}
 										unmeasured={headerLayout.unmeasured}

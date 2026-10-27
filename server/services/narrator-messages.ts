@@ -52,6 +52,7 @@ import {
 	narratorToolCalls,
 	narratorToolContinuations,
 } from "../db/schema";
+import { OUTLINE_EDIT_TOOL } from "../lib/agent/tools/outline-names";
 import {
 	measureMessageCharacters,
 	measureSummaryCharacters,
@@ -1987,8 +1988,11 @@ export const EXACT_TOOL_IO_BUDGET = TOOL_IO_BUDGETS.leaf;
 /** Tool names whose inputJson/outputJson should never be truncated in message lists */
 const SKIP_TRUNCATE_TOOLS = new Set(["ExitPlanMode"]);
 
-/** Tool names whose inputJson should not be truncated */
-const SKIP_INPUT_TRUNCATE_TOOLS = new Set(["Agent", "Task", "Send"]);
+/**
+ * Tool names whose inputJson should not be truncated. OutlineEdit's input is the markdown it
+ * writes, bounded by the tool (200 edits, 256 KiB of text), and its card renders it whole.
+ */
+const SKIP_INPUT_TRUNCATE_TOOLS = new Set(["Agent", "Task", "Send", OUTLINE_EDIT_TOOL]);
 
 const SPEC_TASKS_URI = "spec://tasks.json";
 

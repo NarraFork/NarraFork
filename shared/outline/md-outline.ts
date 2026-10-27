@@ -162,11 +162,11 @@ function stripColumns(line: string, n: number): string {
 }
 
 /**
- * Ranges of code spans in one line, matched the CommonMark way: a backslash can escape an
- * opening backtick but not a closing one (escapes do not work inside code spans), and a span
- * closes at the next backtick string of exactly the same length.
+ * Ranges of code spans in a line (or a block's inline text), matched the CommonMark way: a
+ * backslash can escape an opening backtick but not a closing one (escapes do not work inside
+ * code spans), and a span closes at the next backtick string of exactly the same length.
  */
-function codeSpans(line: string): Array<[number, number]> {
+export function codeSpans(line: string): Array<[number, number]> {
 	// Starts of maximal backtick strings, grouped by length (ascending).
 	const byLength = new Map<number, number[]>();
 	for (let i = 0; i < line.length; ) {

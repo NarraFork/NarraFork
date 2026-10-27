@@ -15,6 +15,7 @@
  */
 import { NotFoundError } from "@server/lib/errors";
 import { canAgentWriteSpace, canReadSpace, canWriteSpace, listReadableSpaces } from "../access";
+import { readNarratorTitle, readProjectName } from "../access-reads";
 import {
 	canSessionReadSpace,
 	getSessionReadScope,
@@ -235,6 +236,19 @@ export function accessCases(world: AccessWorld): AccessCase[] {
 	// ── Spaces ────────────────────────────────────────────────────────────────
 	const spaceCase = (label: string, expected: unknown, actual: () => Promise<unknown>) =>
 		cases.push({ group: "spaces", label, expected, actual });
+	spaceCase(
+		"spaces are named by their project's name and their session's title",
+		{
+			project: `outline-access-${world.projects.main}`,
+			session: "outline access",
+			missing: [null, null],
+		},
+		async () => ({
+			project: await readProjectName(world.projects.main),
+			session: await readNarratorTitle(sessions.grantA),
+			missing: [await readProjectName("missing"), await readNarratorTitle("missing")],
+		}),
+	);
 	spaceCase("get-or-create returns the same project space", spaces.main.id, async () => {
 		return (await ensureProjectSpace(world.projects.main)).id;
 	});

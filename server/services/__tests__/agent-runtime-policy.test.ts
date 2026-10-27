@@ -129,6 +129,18 @@ describe("shared capability projections", () => {
 		expect(isRuntimeToolAllowed(policyOf(null), "Stop")).toBe(true);
 	});
 
+	test("outline reads go to every reading delegate, outline writes only to general ones", () => {
+		for (const subagentType of ["general", "explore", "plan", "review", "missing-custom"]) {
+			const policy = policyOf(template(subagentType));
+			expect(isRuntimeToolAllowed(policy, "OutlineRead")).toBe(true);
+			expect(isRuntimeToolAllowed(policy, "OutlineSearch")).toBe(true);
+			expect(isRuntimeToolAllowed(policy, "OutlineEdit")).toBe(subagentType === "general");
+		}
+		const search = policyOf(template("search"));
+		expect(isRuntimeToolAllowed(search, "OutlineRead")).toBe(false);
+		expect(isRuntimeToolAllowed(policyOf(null), "OutlineEdit")).toBe(true);
+	});
+
 	test("inherited readOnly narrows custom MCP and file access without widening its allowlist", () => {
 		// The read-only ceiling may come from any layer (here: a policy source).
 		const policy = resolveRuntimePolicy([

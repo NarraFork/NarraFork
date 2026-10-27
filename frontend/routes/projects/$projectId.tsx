@@ -1,11 +1,15 @@
 import { Alert, Button, Card, Group, Loader, Stack, Text, Title } from "@mantine/core";
+import { notifications } from "@mantine/notifications";
+import { IconListTree } from "@tabler/icons-react";
 import { useInfiniteQuery, useQueryClient } from "@tanstack/react-query";
 import { createFileRoute, Link, useNavigate } from "@tanstack/react-router";
 import { Component, lazy, type ReactNode, Suspense, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { useOpenOutlineSpace, useOutlineEnabled } from "../../hooks/useOutline";
 import { installProjectAccessListener } from "../../hooks/useProjectAccess";
 import { useProject } from "../../hooks/useProjects";
 import { api } from "../../lib/api";
+import { describeApiError } from "../../lib/api-error";
 
 const CreateNarratorModal = lazy(() =>
 	import("../../components/narrator/CreateNarratorModal").then((m) => ({
@@ -44,6 +48,12 @@ function ProjectPage() {
 	const canWrite = !project.isError && project.data?.canWrite === true;
 	const [creating, setCreating] = useState(false);
 	const [settingsOpen, setSettingsOpen] = useState(false);
+	const outline = useOutlineEnabled();
+	const openOutline = useOpenOutlineSpace({
+		onMissing: () => notifications.show({ color: "gray", message: t("outlineNotCreated") }),
+		onError: (error) =>
+			notifications.show({ color: "red", message: describeApiError(error, t).message }),
+	});
 	const sessions = useInfiniteQuery({
 		queryKey: ["narrators", "project", projectId],
 		queryFn: ({ pageParam }) =>
@@ -60,9 +70,21 @@ function ProjectPage() {
 		<Stack>
 			<Group justify="space-between">
 				<Title order={3}>{project.data.name}</Title>
-				<Button disabled={!canWrite} onClick={() => setCreating(true)}>
-					{t("newSession")}
-				</Button>
+				<Group gap="xs">
+					{outline.enabled && (
+						<Button
+							variant="light"
+							leftSection={<IconListTree size={16} />}
+							loading={openOutline.pending}
+							onClick={() => openOutline.open("project", projectId)}
+						>
+							{t("openOutline")}
+						</Button>
+					)}
+					<Button disabled={!canWrite} onClick={() => setCreating(true)}>
+						{t("newSession")}
+					</Button>
+				</Group>
 			</Group>
 			<Text size="sm" c="dimmed">
 				{project.data.gitPath}

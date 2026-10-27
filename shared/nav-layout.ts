@@ -19,6 +19,7 @@ export const CUSTOMIZABLE_NAV_IDS = [
 	"scheduled-tasks",
 	"learn",
 	"knowledge",
+	"outline",
 ] as const;
 
 export type CustomizableNavId = (typeof CUSTOMIZABLE_NAV_IDS)[number];

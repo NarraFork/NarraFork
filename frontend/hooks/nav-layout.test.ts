@@ -99,7 +99,14 @@ describe("nav layout merge", () => {
 	});
 
 	it("drops retired tutorial entries without moving the remaining custom layout", () => {
-		const currentIds = ["knowledge", "projects", "messages", "routines", "scheduled-tasks"];
+		const currentIds = [
+			"knowledge",
+			"projects",
+			"messages",
+			"routines",
+			"scheduled-tasks",
+			"outline",
+		];
 		for (const hidden of [undefined, true]) {
 			const entries = mergeNavLayout({
 				items: [
@@ -198,5 +205,26 @@ describe("retired navigation presentation, shared by desktop and mobile", () => 
 		const saved = restoreRetiredNavEntries(reordered, stored);
 		expect(saved[0]).toEqual({ kind: "item", id: "projects" });
 		expect(projectNavLayout(saved)).toEqual(reordered);
+	});
+
+	it("withholds the entry of a switched-off feature and keeps its place on save", () => {
+		const stored = mergeNavLayout({
+			items: [{ id: "messages" }, { id: "outline" }, { id: "knowledge" }, { id: NAV_DIVIDER_ID }],
+		});
+		const hidden = new Set(["outline"] as const);
+		const projected = projectNavLayout(stored, hidden);
+		expect(split(projected).visible).not.toContain("outline");
+		expect(split(projected).tucked).not.toContain("outline");
+		expect(restoreRetiredNavEntries(projected, stored, hidden)).toEqual(stored);
+		const reordered = [projected[1], projected[0], ...projected.slice(2)];
+		const saved = restoreRetiredNavEntries(reordered, stored, hidden);
+		expect(saved[1]).toEqual({ kind: "item", id: "outline" });
+		expect(projectNavLayout(saved, hidden)).toEqual(reordered);
+		// Switched on, it shows where it was.
+		expect(split(projectNavLayout(saved)).visible.slice(0, 3)).toEqual([
+			"knowledge",
+			"outline",
+			"messages",
+		]);
 	});
 });

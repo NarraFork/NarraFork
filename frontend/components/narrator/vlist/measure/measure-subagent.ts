@@ -506,12 +506,10 @@ export interface MeasuredSubagent extends MeasuredElement {
 	resultBlockHeight: number;
 	/** Background launch protocol text is suppressed; no notice row is drawn. */
 	hasBackgroundNotice: boolean;
-	/** File-changes block height (title + attribution notices + rows + overflow). */
+	/** File-changes block height (title + rows + overflow). */
 	fileChangesHeight: number;
-	/** Shared title/notice/file/overflow line height at the measured typography. */
+	/** Shared title/file/overflow line height at the measured typography. */
 	fileChangeRowHeight: number;
-	/** Legacy notice, plus a requested-boundary notice when a scope was supplied. */
-	fileChangeNoticeRowCount: number;
 	/** How many file rows are DRAWN (capped unless the reader expanded the list). */
 	fileChangeRowCount: number;
 	/** Whether the trailing "N more / N touched by shell" row is drawn. */
@@ -687,13 +685,6 @@ export function measureSubagentCard(
 		data.fileChanges?.countsTruncated === true;
 	const hasFileChanges = fileChangeRowCount > 0 || hasFileChangeOverflowRow;
 	const fileChangeRowHeight = bareRowMetrics().height;
-	// Only legacy-only file rows need the long attribution warning. Exact v2 and
-	// mixed/Bash-best-effort cards should not reserve a warning row by default.
-	const hasLegacyFileNotice =
-		hasFileChanges &&
-		(data.fileChanges?.attributionScope ?? "legacy_unscoped") === "legacy_unscoped" &&
-		fileChangeTotal > 0;
-	const fileChangeNoticeRowCount = hasLegacyFileNotice ? 1 + (data.fileChanges?.scope ? 1 : 0) : 0;
 	let fileChangesHeight = 0;
 
 	// ── Recent Calls (always shown when there are activity calls) ───────────────
@@ -771,13 +762,12 @@ export function measureSubagentCard(
 			expandedHeight += resolveOverrideHeight;
 		}
 
-		// Title + explicit legacy/boundary notices + file rows + optional summary.
+		// Title (legacy attribution is an inline hint on it) + file rows + optional summary.
 		// Every row is single-line and truncating. Clamp seams at zero: summary-only
 		// blocks must not acquire a negative gap when no file rows were returned.
 		if (hasFileChanges) {
 			fileChangesHeight =
-				(1 + fileChangeNoticeRowCount + fileChangeRowCount + (hasFileChangeOverflowRow ? 1 : 0)) *
-					fileChangeRowHeight +
+				(1 + fileChangeRowCount + (hasFileChangeOverflowRow ? 1 : 0)) * fileChangeRowHeight +
 				Math.max(0, fileChangeRowCount - 1) * FILE_CHANGE_STACK_GAP +
 				BLOCK_PADDING_BOTTOM;
 			expandedHeight += fileChangesHeight;
@@ -833,7 +823,6 @@ export function measureSubagentCard(
 		hasBackgroundNotice,
 		fileChangesHeight,
 		fileChangeRowHeight,
-		fileChangeNoticeRowCount,
 		fileChangeRowCount,
 		hasFileChangeOverflowRow,
 		selfPermissionMeasured,

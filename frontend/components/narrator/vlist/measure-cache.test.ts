@@ -1635,7 +1635,8 @@ describe("subagent file-change cache identity", () => {
 			const scope = { sourceToolUseId: "same-tool", startedAt: null, completedAt: null };
 			const scoped = measure(data({ scope }));
 			expect(scoped).not.toBe(baseline);
-			expect(scoped.height).toBeGreaterThan(baseline.height);
+			// The window lives in hover text: a new identity, but no extra row.
+			expect(scoped.height).toBe(baseline.height);
 			const updatedScope = measure(data({ scope: { ...scope, completedAt: "end" } }));
 			expect(updatedScope).not.toBe(scoped);
 			expect(updatedScope.height).toBe(scoped.height);

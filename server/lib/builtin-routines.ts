@@ -256,6 +256,19 @@ export const BUILTIN_ROUTINES: BuiltinRoutine[] = [
 		},
 	},
 
+	{
+		id: "outline_edit",
+		type: "tool",
+		category: "tools",
+		tool: {
+			toolName: "OutlineEdit",
+			descriptionEn:
+				"Outline edit — write the block outline with markdown outlines: add, replace, move, delete, check off tasks (needs the outline turned on)",
+			descriptionZh:
+				"大纲编辑 — 用 markdown 大纲写块大纲：新增、改写、移动、删除、勾选任务（需开启大纲）",
+		},
+	},
+
 	// ── Skills (materialized as SKILL.md when enabled) ──────────────────
 	{
 		id: "skill-creator",

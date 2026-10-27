@@ -120,6 +120,7 @@ export function summarizeSubagentToolCall(
 		case "Browser":
 			return joinParts(action || undefined, url || undefined);
 		case "KnowledgeSearch":
+		case "OutlineSearch":
 			return query || undefined;
 		case "KnowledgeRead":
 		case "KnowledgeLibrary":

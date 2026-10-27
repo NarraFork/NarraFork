@@ -23,6 +23,8 @@
 	},
 	"title": "项目",
 	"newSession": "新建会话",
+	"openOutline": "大纲",
+	"outlineNotCreated": "这个项目还没有大纲。能编辑项目的人打开它时会创建。",
 	"advancedSettings": "项目高级设置",
 	"projectDescription": "说明",
 	"defaultDirectoryHint": "仅作为新会话的默认目录，不会修改已有会话的工作目录。",

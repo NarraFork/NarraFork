@@ -26,6 +26,7 @@ import { learningGuideTool } from "./learning-guide";
 import { mcpAdminTool } from "./mcp-admin";
 import { narraforkAdminTool } from "./narrafork-admin";
 import { notificationTool } from "./notification";
+import { outlineEditTool, outlineReadTool, outlineSearchTool } from "./outline";
 import { packActivateTool, packDeactivateTool, packListTool } from "./pack";
 import { extractPipelineTool, startPipelineTool } from "./pipeline";
 import { enterPlanModeTool, exitPlanModeTool } from "./plan-mode";
@@ -84,6 +85,7 @@ export const OPTIONAL_TOOLS: ReadonlyMap<string, ToolDefinition> = new Map([
 	["KnowledgeEdit", knowledgeEditTool],
 	["KnowledgeAdmin", knowledgeAdminTool],
 	["KnowledgeReview", knowledgeReviewTool],
+	["OutlineEdit", outlineEditTool],
 	["StartPipeline", startPipelineTool],
 	["ExtractPipeline", extractPipelineTool],
 ]);
@@ -142,6 +144,8 @@ const coreProvider: ToolProvider = {
 			knowledgeSearchTool,
 			knowledgeReadTool,
 			knowledgeLibraryTool,
+			outlineReadTool,
+			outlineSearchTool,
 			switchDeviceTool,
 			switchWorkingDirectoryTool,
 			worktreeTool,

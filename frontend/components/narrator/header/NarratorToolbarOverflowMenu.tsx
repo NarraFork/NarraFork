@@ -52,6 +52,7 @@ import {
 	IconChevronDown,
 	IconDotsVertical,
 	IconGripVertical,
+	IconListTree,
 } from "@tabler/icons-react";
 import { Fragment, type ReactNode, useCallback, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -291,6 +292,8 @@ export interface NarratorToolbarOverflowMenuProps {
 	 */
 	onOpenCompatibility?: () => void;
 	onOpenSavedRecordings?: () => void;
+	/** Opens the session's outline space; absent while the outline is switched off. */
+	onOpenOutline?: () => void;
 }
 
 export function NarratorToolbarOverflowMenu({
@@ -306,6 +309,7 @@ export function NarratorToolbarOverflowMenu({
 	archiveLoading,
 	onOpenCompatibility,
 	onOpenSavedRecordings,
+	onOpenOutline,
 }: NarratorToolbarOverflowMenuProps) {
 	const { t } = useTranslation("narrator");
 	const { t: tp } = useTranslation("projects");
@@ -518,6 +522,17 @@ export function NarratorToolbarOverflowMenu({
 							{tp("compatibility.title")}
 						</Menu.Item>
 					</>
+				)}
+				{onOpenOutline && (
+					<Menu.Item
+						leftSection={<IconListTree size={14} />}
+						onClick={() => {
+							closeMenu();
+							onOpenOutline();
+						}}
+					>
+						{t("openOutline")}
+					</Menu.Item>
 				)}
 				{onOpenSavedRecordings && (
 					<Menu.Item

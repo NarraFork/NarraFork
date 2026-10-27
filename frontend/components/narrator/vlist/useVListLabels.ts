@@ -206,6 +206,7 @@ export interface VListRenderLabels {
 		/** Marker for a file a revert here will not restore (changed in another worktree). */
 		outsideWorkspace: string;
 		fileChangeLegacy: string;
+		fileChangeLegacyBadge: string;
 		fileChangeWindow: string;
 		unknownDevice: string;
 		unknownWorkspace: string;
@@ -726,6 +727,7 @@ export function useVListLabels(): VListLabels {
 				shellTouched: t("subagentShellTouched"),
 				outsideWorkspace: t("subagentOutsideWorkspace"),
 				fileChangeLegacy: t("subagentFileChangesLegacy"),
+				fileChangeLegacyBadge: t("subagentFileChangesLegacyBadge"),
 				fileChangeWindow: t("subagentFileChangesWindow"),
 				unknownDevice: t("subagentFileChangesUnknownDevice"),
 				unknownWorkspace: t("subagentFileChangesUnknownWorkspace"),

@@ -11,6 +11,7 @@ import {
 	restoreRetiredNavEntries,
 	toPersistedNavLayout,
 } from "./nav-layout";
+import { useOutlineEnabled } from "./useOutlineEnabled";
 import { useUpdateUserPreferences, useUserPreferences } from "./useUserPreferences";
 
 /**
@@ -44,7 +45,13 @@ export function useNavLayout() {
 		() => (prefs ? mergeNavLayout(prefs.navLayout) : DEFAULT_NAV_ENTRIES),
 		[prefs],
 	);
-	const entries = useMemo(() => projectNavLayout(storedEntries), [storedEntries]);
+	// Entries of features switched off on this server are withheld, not removed.
+	const { enabled: outlineEnabled } = useOutlineEnabled();
+	const hidden = useMemo<ReadonlySet<CustomizableNavId>>(
+		() => new Set<CustomizableNavId>(outlineEnabled ? [] : ["outline"]),
+		[outlineEnabled],
+	);
+	const entries = useMemo(() => projectNavLayout(storedEntries, hidden), [storedEntries, hidden]);
 
 	const dividerIndex = useMemo(
 		() => entries.findIndex((entry) => entry.kind === "divider"),
@@ -61,7 +68,9 @@ export function useNavLayout() {
 
 	const saveLayout = useCallback(
 		(nextEntries: NavLayoutEntry[]) => {
-			const persisted = toPersistedNavLayout(restoreRetiredNavEntries(nextEntries, storedEntries));
+			const persisted = toPersistedNavLayout(
+				restoreRetiredNavEntries(nextEntries, storedEntries, hidden),
+			);
 			const previous = queryClient.getQueryData<Preferences>(["user-preferences"]);
 			// Optimistic update
 			if (previous) {
@@ -81,7 +90,7 @@ export function useNavLayout() {
 				},
 			);
 		},
-		[queryClient, updatePrefs, storedEntries],
+		[queryClient, updatePrefs, storedEntries, hidden],
 	);
 
 	return { entries, visibleItems, dividerIndex, saveLayout };

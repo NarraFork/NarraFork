@@ -2840,3 +2840,91 @@ describe("resolveFileDiffStats — non-file tools", () => {
 		expect(resolveFileDiffStats("Read", { file_path: "/a.ts" }, null)).toBeUndefined();
 	});
 });
+
+describe("classifyToolDetail — outline", () => {
+	it("renders an OutlineRead as markdown under its address, space and size", () => {
+		const outline = "‹space Kx81mPqa · project›\n- [Ab3dEf9Q] Auth\n  - [Pq83nXcB] refresh";
+		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
+			toolName: "OutlineRead",
+			category: "outline",
+			inputJson: { address: "Ab3dEf9Q" },
+			outputJson: outline,
+			metadata: {
+				address: "Kx81mPqa/Ab3dEf9Q",
+				space: { key: "Kx81mPqa", kind: "project" },
+				blocks: 2,
+				truncated: true,
+			},
+		});
+		const body = cappedSectionBody(d, "knowledge");
+		expect(body.format).toBe("markdown");
+		expect(body.text).toBe(outline);
+		expect(metaTexts(d)).toEqual(["Kx81mPqa/Ab3dEf9Q"]);
+		expect(metaBadgeLabels(d)).toEqual(["Kx81mPqa", "2 blocks", "more not shown"]);
+	});
+
+	it("lists OutlineSearch hits with their address, path and process mark", () => {
+		const d = bodyOfKind(
+			classifyToolDetail({
+				previewId: "classifier-fixture",
+				toolName: "OutlineSearch",
+				category: "outline",
+				metadata: {
+					results: [
+						{
+							address: "Kx81mPqa/Ab3dEf9Q",
+							title: "Token refresh",
+							path: ["Auth", "Tokens"],
+							snippet: "refresh has a race",
+							alias: "Q7",
+							process: true,
+						},
+					],
+				},
+			}),
+			"structured",
+		);
+		expect(d.badges).toEqual([{ label: "1 results", color: "teal" }]);
+		expect(d.entries?.[0]).toMatchObject({
+			title: "Token refresh",
+			meta: "Kx81mPqa/Ab3dEf9Q · Auth › Tokens",
+			snippet: "refresh has a race",
+			badges: [
+				{ label: "Q7", color: "teal" },
+				{ label: "process", color: "gray" },
+			],
+		});
+	});
+
+	it("shows what an OutlineEdit wrote and its commit", () => {
+		const d = classifyToolDetail({
+			previewId: "classifier-fixture",
+			toolName: "OutlineEdit",
+			category: "outline",
+			inputJson: {
+				edits: [
+					{ add: "/", markdown: "- [ ] step one\n- step two" },
+					{ set: "Ab3dEf9Q", checkbox: "x" },
+					{ move: "Q1", to: "Kx81mPqa/" },
+				],
+			},
+			outputJson: "Committed #4 to Kx81mPqa",
+			metadata: { space: { key: "Kx81mPqa" }, commit: { id: "c1", seq: 4 } },
+		});
+		const input = sectionBody(d, "input") as ToolCappedDetail;
+		expect(input.format).toBe("markdown");
+		expect(input.text).toBe(
+			[
+				"**add** `/`",
+				"",
+				"- [ ] step one\n- step two",
+				"",
+				'**set** `Ab3dEf9Q`: checkbox "x"',
+				"**move** `Q1` → Kx81mPqa/",
+			].join("\n"),
+		);
+		expect((sectionBody(d, "result") as ToolCappedDetail).text).toBe("Committed #4 to Kx81mPqa");
+		expect(metaBadgeLabels(d)).toEqual(["Kx81mPqa", "commit #4"]);
+	});
+});

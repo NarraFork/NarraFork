@@ -59,6 +59,11 @@ import {
 	KNOWLEDGE_MERGE_ACTION_SET,
 } from "../lib/agent/tools/knowledge-actions";
 import {
+	OUTLINE_EDIT_TOOL,
+	OUTLINE_READ_TOOL,
+	OUTLINE_SEARCH_TOOL,
+} from "../lib/agent/tools/outline-names";
+import {
 	EXIT_PLAN_MODE_FILE,
 	EXIT_PLAN_MODE_INLINE,
 	readDeclaredExitPlanMode,
@@ -827,6 +832,12 @@ export function resolvePermissionDecision(
 	// available in read-only/exploration flows just like the legacy TaskCreate/TodoWrite path.
 	if (isTaskStateMaintenanceTool(toolName, input)) return "allow";
 
+	// Outline writes touch no files: each is a commit recorded with this session as its author and
+	// can be reverted, so they need no approval. The tool decides where it may write: the acting
+	// person's write permission, and in read-only and strict plan mode only the session's own
+	// space. Under bypassPermissions the danger classification below still applies.
+	if (toolName === OUTLINE_EDIT_TOOL) return "allow";
+
 	const planFileCandidates = planFileWriteCandidates(planFileId, designatedPlanFilePath);
 	if (planMode && (toolName === "Write" || toolName === "Edit")) {
 		if (planFileCandidates.length > 0) {
@@ -1282,6 +1293,8 @@ const READ_ONLY_TOOLS = [
 	"KnowledgeSearch",
 	"KnowledgeRead",
 	"KnowledgeLibrary",
+	OUTLINE_READ_TOOL,
+	OUTLINE_SEARCH_TOOL,
 ];
 
 /**
@@ -3020,6 +3033,33 @@ function classifyToolDanger(
 			],
 			[`Tool: KnowledgeEdit`, `Action: ${action}`],
 			writesGlobal ? "high" : "medium",
+		);
+	}
+
+	// Outline writes, like knowledge writes, touch no files, so the path heuristics below never
+	// flag them. Every one is a commit that can be reverted: adding and rewriting blocks is low,
+	// deleting or moving subtrees medium, so the standard level reflects on those.
+	if (toolName === OUTLINE_EDIT_TOOL) {
+		const edits = Array.isArray(input.edits) ? (input.edits as Array<Record<string, unknown>>) : [];
+		const restructures = edits.filter(
+			(edit) => edit && typeof edit === "object" && ("delete" in edit || "move" in edit),
+		).length;
+		return danger(
+			restructures > 0
+				? `OutlineEdit deletes or moves ${restructures} outline block(s) and their subtrees.`
+				: `OutlineEdit writes ${edits.length} edit(s) to the outline.`,
+			[
+				"Outline pages may be shared with the project; others read what is written there.",
+				restructures > 0
+					? "Deleting or moving a block takes everything under it along."
+					: "Added and rewritten blocks are attributed to this session.",
+			],
+			[
+				"Each OutlineEdit call is one commit that can be reverted from the outline timeline.",
+				"Write process notes to the session's own space (session/) when unsure.",
+			],
+			[`Tool: ${OUTLINE_EDIT_TOOL}`, `Edits: ${edits.length}`, `Deletes or moves: ${restructures}`],
+			restructures > 0 ? "medium" : "low",
 		);
 	}
 

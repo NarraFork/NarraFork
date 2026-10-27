@@ -53,6 +53,7 @@ export type ToolCategory =
 	| "skill"
 	| "browser"
 	| "knowledge"
+	| "outline"
 	| "schedule"
 	| "contextAsk"
 	| "workspace"
@@ -141,6 +142,9 @@ const KNOWLEDGE_TOOLS = new Set([
 	"KnowledgeAdmin",
 ]);
 
+/** The block outline: reads, searches and edits of the team's versioned notes. */
+const OUTLINE_TOOLS = new Set(["OutlineRead", "OutlineSearch", "OutlineEdit"]);
+
 export function getCategory(name: string, input?: unknown): ToolCategory {
 	// Spec task-queue file operations render as a task list, not a raw file diff.
 	if (input !== undefined && isSpecTasksToolUse(name, input)) return "tasks";
@@ -168,6 +172,7 @@ export function getCategory(name: string, input?: unknown): ToolCategory {
 	if (SKILL_TOOLS.has(name)) return "skill";
 	if (BROWSER_TOOLS.has(name)) return "browser";
 	if (KNOWLEDGE_TOOLS.has(name)) return "knowledge";
+	if (OUTLINE_TOOLS.has(name)) return "outline";
 	if (CONTEXT_ASK_TOOLS.has(name)) return "contextAsk";
 	if (
 		[
@@ -252,6 +257,10 @@ export function getCategoryColor(cat: ToolCategory): ToolDisplayColor {
 			return "grape";
 		case "knowledge":
 			return "grape";
+		// Teal like the spec task list: the outline is where plans and tasks are written, and
+		// the glyph tells it from a web step.
+		case "outline":
+			return "teal";
 		case "pipeline":
 			return "indigo";
 		case "terminal":
@@ -452,6 +461,55 @@ export function knowledgeSummary(
 		case "KnowledgeAdmin": {
 			const action = extractField(input, "action") || (meta.action as string) || "admin";
 			return action;
+		}
+		default:
+			return toolName;
+	}
+}
+
+/**
+ * Header summary for the outline tools, shared by every renderer: the address read, the query,
+ * or the edits made, completed from persisted metadata (block and result counts, the commit).
+ */
+export function outlineSummary(
+	toolName: string,
+	input: unknown,
+	metadata?: Record<string, unknown>,
+): string {
+	const meta = metadata ?? {};
+	switch (toolName) {
+		case "OutlineRead": {
+			const address = extractField(input, "address") || readLeafText(meta.address) || "";
+			const asOf = extractField(input, "asOf") || String(extractNumericField(input, "asOf") ?? "");
+			const blocks = typeof meta.blocks === "number" ? meta.blocks : undefined;
+			const parts = [address ? short(address, 48) : "spaces"];
+			if (asOf) parts.push(`as of ${short(asOf, 24)}`);
+			if (blocks != null) parts.push(`${blocks} blocks`);
+			return parts.join(" · ");
+		}
+		case "OutlineSearch": {
+			const query = extractField(input, "query") || readLeafText(meta.query) || "";
+			const count = typeof meta.resultCount === "number" ? meta.resultCount : undefined;
+			if (!query) return count != null ? `${count} results` : "Search";
+			return count != null ? `${short(query, 48)} · ${count}` : short(query, 60);
+		}
+		case "OutlineEdit": {
+			const raw =
+				input && !isTruncated(input) && typeof input === "object"
+					? (input as Record<string, unknown>).edits
+					: undefined;
+			const edits = Array.isArray(raw) ? raw : [];
+			const commit = meta.commit && typeof meta.commit === "object" ? meta.commit : null;
+			const seq = commit ? (commit as Record<string, unknown>).seq : undefined;
+			const kinds = new Map<string, number>();
+			for (const edit of edits) {
+				if (!edit || typeof edit !== "object") continue;
+				const kind = ["add", "replace", "move", "delete", "set"].find((k) => k in edit);
+				if (kind) kinds.set(kind, (kinds.get(kind) ?? 0) + 1);
+			}
+			const parts = [...kinds].map(([kind, n]) => (n === 1 ? kind : `${kind} ×${n}`));
+			if (typeof seq === "number") parts.push(`#${seq}`);
+			return parts.length > 0 ? parts.join(" · ") : "Edit";
 		}
 		default:
 			return toolName;
@@ -753,6 +811,8 @@ export function getSummary(
 		}
 		case "knowledge":
 			return knowledgeSummary(toolName, input, metadata);
+		case "outline":
+			return outlineSummary(toolName, input, metadata);
 		case "contextAsk": {
 			const target = contextAskTargetLabel(input, metadata);
 			const questionCount = contextAskQuestionCount(input, metadata);

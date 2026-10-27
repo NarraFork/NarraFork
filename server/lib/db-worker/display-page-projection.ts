@@ -1,10 +1,12 @@
 import { fileReferenceContentForDisplay } from "../../../shared/file-reference";
 import { projectToolIO } from "../../../shared/pretext-layout/tool-io-projection";
+import { OUTLINE_EDIT_TOOL } from "../agent/tools/outline-names";
 import { toolCallWithExecutionTargets } from "../tool-execution-target-projection";
 import type { NarratorDisplayMessage, NarratorDisplayToolCall } from "./display-page-protocol";
 
 const PRESERVE_ALL = new Set(["ExitPlanMode"]);
-const PRESERVE_INPUT = new Set(["Agent", "Task", "Send"]);
+/** Kept whole like `SKIP_INPUT_TRUNCATE_TOOLS` in `narrator-messages.ts`. */
+const PRESERVE_INPUT = new Set(["Agent", "Task", "Send", OUTLINE_EDIT_TOOL]);
 
 function preserveInput(toolName: string, input: unknown): boolean {
 	if (PRESERVE_ALL.has(toolName) || PRESERVE_INPUT.has(toolName)) return true;
