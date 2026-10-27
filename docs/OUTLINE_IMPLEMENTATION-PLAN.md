@@ -324,6 +324,7 @@ frontend/lib/api/outline.ts，frontend/hooks/useOutline*.ts，frontend/locales/{
 
 - 布局算法放进 `shared/outline/layout/`；视图状态和动画放进 `frontend/components/outline/`。
 - 折叠和方向存进 `outline_view_state`。
+- 快速切换器（D35）：先列当前空间的结果（本地索引），再补上其他可读空间的服务端检索结果；跳到别的空间时在当前面板里切过去。
 - 原型的验收脚本搬进产品重跑；帧时间在有 GPU 的真机上复核。
 - 照原型的经验做：打开页时在 Worker 里预先测量节点尺寸；聚焦时保留整页的编辑视图、另建聚焦视图；隐藏的视图移出视口；一次切换分两帧。
 - 页实时会话（PR 8）开始时就给整页的块建 Y.Text：原型测出 Y.Text 没建时打字，重做会把字倒过来。
