@@ -55,6 +55,20 @@
 	"errorCode": "Error code",
 	"messageCode": "Message code",
 
+	"IMPORT_FILE_REQUIRED": "Choose a .zip file exported from NarraFork",
+	"IMPORT_FILE_TOO_LARGE": "The import file exceeds the {{limit}} limit",
+	"IMPORT_ZIP_INVALID": "The uploaded file is not a valid ZIP archive",
+	"IMPORT_ENTRY_MISSING": "The import archive is missing {{name}}; it may not be a NarraFork export",
+	"IMPORT_TABLE_MISSING": "The import archive is missing core table {{table}}; it may not be a complete NarraFork export",
+	"IMPORT_VERSION_TOO_NEW": "Import version {{version}} is newer than the supported version {{supported}}",
+	"IMPORT_PARAMS_INVALID": "The import request is invalid",
+	"IMPORT_PREVIEW_EXPIRED": "The import preview expired. Choose the file again",
+	"IMPORT_SNAPSHOT_EXPIRED": "The import snapshot is no longer available. Choose the file again",
+	"CLEAR_PARAMS_INVALID": "The clear request is invalid",
+	"CLEAR_USER_UNKNOWN": "Cannot identify the current user",
+	"CLEAR_PASSWORD_NOT_SET": "This account has no password, so data cannot be cleared",
+	"CLEAR_PASSWORD_INVALID": "The password is incorrect. No data was cleared",
+
 	"entity": {
 		"Narrator": "Narrator",
 		"Project": "Project",

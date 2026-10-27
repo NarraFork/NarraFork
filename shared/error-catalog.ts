@@ -178,6 +178,75 @@ export const ERROR_CATALOG = {
 		code: "LOGIN_THROTTLED",
 		en: "Too many attempts. Please try again later.",
 	},
+
+	// --- storage data portability ----------------------------------------------
+	IMPORT_FILE_REQUIRED: {
+		status: 400,
+		code: "VALIDATION_ERROR",
+		en: "Choose a .zip file exported from NarraFork",
+	},
+	IMPORT_FILE_TOO_LARGE: {
+		status: 413,
+		code: "IMPORT_FILE_TOO_LARGE",
+		en: "The import file exceeds the {limit} limit",
+	},
+	IMPORT_ZIP_INVALID: {
+		status: 400,
+		code: "VALIDATION_ERROR",
+		en: "The uploaded file is not a valid ZIP archive",
+	},
+	IMPORT_ENTRY_MISSING: {
+		status: 400,
+		code: "VALIDATION_ERROR",
+		en: "The import archive is missing {name}; it may not be a NarraFork export",
+	},
+	IMPORT_TABLE_MISSING: {
+		status: 400,
+		code: "VALIDATION_ERROR",
+		en: "The import archive is missing core table {table}; it may not be a complete NarraFork export",
+	},
+	IMPORT_VERSION_TOO_NEW: {
+		status: 400,
+		code: "VALIDATION_ERROR",
+		en: "Import version {version} is newer than the supported version {supported}",
+	},
+	IMPORT_PARAMS_INVALID: {
+		status: 400,
+		code: "VALIDATION_ERROR",
+		en: "The import request is invalid",
+	},
+	/** 410: the preview snapshot is gone, so the request can never succeed unchanged. */
+	IMPORT_PREVIEW_EXPIRED: {
+		status: 410,
+		code: "IMPORT_PREVIEW_EXPIRED",
+		en: "The import preview expired. Choose the file again",
+	},
+	IMPORT_SNAPSHOT_EXPIRED: {
+		status: 410,
+		code: "IMPORT_SNAPSHOT_EXPIRED",
+		en: "The import snapshot is no longer available. Choose the file again",
+	},
+	CLEAR_PARAMS_INVALID: {
+		status: 400,
+		code: "VALIDATION_ERROR",
+		en: "The clear request is invalid",
+	},
+	CLEAR_USER_UNKNOWN: {
+		status: 401,
+		code: "UNAUTHORIZED",
+		en: "Cannot identify the current user",
+	},
+	CLEAR_PASSWORD_NOT_SET: {
+		status: 400,
+		code: "CLEAR_PASSWORD_NOT_SET",
+		en: "This account has no password, so data cannot be cleared",
+	},
+	/** 403 rather than 400: the request is well-formed, the caller is not authorized for it. */
+	CLEAR_PASSWORD_INVALID: {
+		status: 403,
+		code: "CLEAR_PASSWORD_INVALID",
+		en: "The password is incorrect. No data was cleared",
+	},
 } as const satisfies Record<string, ErrorCatalogEntry>;
 
 export type ErrorMessageCode = keyof typeof ERROR_CATALOG;

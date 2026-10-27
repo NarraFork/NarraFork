@@ -55,6 +55,20 @@
 	"errorCode": "错误码",
 	"messageCode": "文案码",
 
+	"IMPORT_FILE_REQUIRED": "请选择 NarraFork 导出的 .zip 文件",
+	"IMPORT_FILE_TOO_LARGE": "导入文件超过 {{limit}} 上限",
+	"IMPORT_ZIP_INVALID": "上传的文件不是有效的 ZIP 包",
+	"IMPORT_ENTRY_MISSING": "导入包缺少 {{name}}，可能不是 NarraFork 导出的文件",
+	"IMPORT_TABLE_MISSING": "导入包缺少核心表 {{table}}，可能不是完整的 NarraFork 导出",
+	"IMPORT_VERSION_TOO_NEW": "导入文件版本 {{version}} 高于当前支持版本 {{supported}}",
+	"IMPORT_PARAMS_INVALID": "导入参数不合法",
+	"IMPORT_PREVIEW_EXPIRED": "导入预览已过期，请重新选择文件",
+	"IMPORT_SNAPSHOT_EXPIRED": "导入快照已失效，请重新选择文件",
+	"CLEAR_PARAMS_INVALID": "清空参数不合法",
+	"CLEAR_USER_UNKNOWN": "无法确认当前用户",
+	"CLEAR_PASSWORD_NOT_SET": "当前账号未设置密码，无法执行清空操作",
+	"CLEAR_PASSWORD_INVALID": "密码不正确，清空操作已取消",
+
 	"entity": {
 		"Narrator": "叙述者",
 		"Project": "项目",

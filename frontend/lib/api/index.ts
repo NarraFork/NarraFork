@@ -21,6 +21,7 @@ import { scheduledTasksApi } from "./scheduled-tasks";
 import { sessionInterchangeApi } from "./session-interchange";
 import { settingsApi } from "./settings";
 import { specApi } from "./spec";
+import { storageTransferApi } from "./storage-transfer";
 import { systemLifecycleApi } from "./system-lifecycle";
 import { terminalsApi } from "./terminals";
 import { tokendanceApi } from "./tokendance";
@@ -58,6 +59,7 @@ export const api = {
 	...pluginsApi,
 	...sessionInterchangeApi,
 	...commandCodeApi,
+	...storageTransferApi,
 	...providerImportApi,
 };
 
