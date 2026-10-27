@@ -12,6 +12,7 @@ import {
 } from "../frontend/plugin-runtime/paths";
 import { CHROMIUM_PATHS } from "../shared/browser-paths";
 import { urlHost } from "../shared/server-host";
+import { MAX_IMPORT_BYTES } from "../shared/storage-transfer";
 import { app } from "./app";
 import "./db"; // Ensure DB is initialized early
 import {
@@ -1137,6 +1138,9 @@ function startServer(
 					port: listenPort,
 					hostname: host,
 					idleTimeout: 255,
+					// 数据导入上传的是整份导出包（GB 级）；服务端流式落盘，真正的大小上限
+					// 由 MAX_IMPORT_BYTES 在读取过程中逐块校验。
+					maxRequestBodySize: MAX_IMPORT_BYTES,
 					tls,
 					fetch: fetchRequest,
 					websocket: wsHandlers,
