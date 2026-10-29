@@ -32,6 +32,7 @@ import {
 	type CiReleaseTarget,
 } from "./ci-release-types";
 import type { GhRunner } from "./github-release";
+import { restoreRemotePeerReleasePlan } from "./remote-peer-release-prepare";
 
 const TIMEOUT = 15 * 60_000;
 const CONTROL_LIMIT = 4 * 1024 ** 2;
@@ -477,7 +478,14 @@ export async function prepareCiReleaseBuild(
 		})),
 	};
 	bounded.signal.throwIfAborted();
-	return validateCiReleasePlan({ ...verified, ...result.dispatch, buildSource });
+	return validateCiReleasePlan({
+		...verified,
+		...result.dispatch,
+		buildSource,
+		...(verified.remotePeer
+			? { remotePeer: restoreRemotePeerReleasePlan(verified.remotePeer, result.original) }
+			: {}),
+	});
 }
 
 function productIdentity(plan: CiReleasePlan) {

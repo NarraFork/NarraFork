@@ -14,6 +14,7 @@ import { compiledWorkerBuildEntrypoints } from "../server/lib/compiled-worker";
 import { buildLicenseManifestFromDisk } from "../server/lib/licenses/manifest";
 import { createHelperDistributionDependencies } from "../shared/helper-distribution";
 import type { LocalizedValue } from "../shared/i18n-locales";
+import { REMOTE_PEER_DISTRIBUTION } from "../shared/remote-peer-distribution";
 import { CURRENT_RECOVERY_MANIFEST_VERSIONS } from "../shared/update-identity";
 import type { BinaryMetadata } from "./lib/binary-metadata";
 import { resolveBuildGitHubRepository } from "./lib/build-repository";
@@ -307,6 +308,8 @@ export const buildVersion = ${JSON.stringify(VERSION)};
 export const buildCommit = ${JSON.stringify(commitHash)};
 export const buildPlatform = "unknown";
 export const buildHelperDistribution = ${JSON.stringify(HELPER_DISTRIBUTION)};
+// Optional RTC component metadata only; its executable is never a main build asset.
+export const buildRemotePeerDistribution = ${JSON.stringify(REMOTE_PEER_DISTRIBUTION)};
 `;
 writeFileSync(GENERATED_BUILD_INFO_FILE, buildInfoCode);
 console.log(
@@ -428,6 +431,8 @@ export const buildCommit = ${JSON.stringify(commitHash)};
 export const buildPlatform = ${JSON.stringify(platform.platformId)};
 export const buildRepository = ${JSON.stringify(BUILD_REPOSITORY)};
 export const buildHelperDistribution = ${JSON.stringify(HELPER_DISTRIBUTION)};
+// Optional RTC component metadata only; its executable is never a main build asset.
+export const buildRemotePeerDistribution = ${JSON.stringify(REMOTE_PEER_DISTRIBUTION)};
 `,
 	);
 

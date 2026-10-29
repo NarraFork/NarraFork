@@ -24,6 +24,10 @@ import {
 } from "./component-release-inputs";
 import { type GhRunner, releaseChannel } from "./github-release";
 import { listGitHubReleaseSummaries } from "./github-release-summary";
+import {
+	remotePeerReleasePlanSchema,
+	validateRemotePeerReleasePlan,
+} from "./remote-peer-release-prepare";
 
 export const CI_API_TIMEOUT_MS = 30_000;
 export const CI_API_MAX_BYTES = 1024 * 1024;
@@ -120,6 +124,7 @@ const planSchema = z
 		runAttempt: id,
 		buildSource: buildSourceSchema.optional(),
 		componentEvidence: componentEvidenceSchema.optional(),
+		remotePeer: remotePeerReleasePlanSchema.optional(),
 		baselines: z
 			.array(
 				z
@@ -256,6 +261,11 @@ export function validateCiReleasePlan(value: unknown): CiReleasePlan {
 		plan.channel !== releaseChannel(plan.version)
 	)
 		throw new Error("Release plan version/channel mismatch");
+	if (plan.remotePeer) {
+		const peer = validateRemotePeerReleasePlan(plan.remotePeer);
+		if (peer.action !== "absent" && peer.action !== "reuse" && peer.sourceCommit !== plan.commit)
+			throw new Error("Peer build must use the frozen NF source commit");
+	}
 	if (plan.componentEvidence) {
 		const executor = plan.componentEvidence.executor;
 		if (

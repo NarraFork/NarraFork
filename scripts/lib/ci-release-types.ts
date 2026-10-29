@@ -1,5 +1,6 @@
 import { OFFICIAL_GITHUB_REPOSITORY } from "../../shared/github-repository";
 import type { BinaryMetadata } from "./binary-metadata";
+import type { RemotePeerReleasePlan } from "./remote-peer-release-prepare";
 
 /** Compatibility default only; live CI derives identity from validated GITHUB_REPOSITORY. */
 export const CI_RELEASE_REPOSITORY = OFFICIAL_GITHUB_REPOSITORY;
@@ -120,6 +121,8 @@ export interface CiReleasePlan {
 	baselines: CiReleaseBaseline[];
 	/** Read-only component identities, collected only by an online publisher control plan. */
 	componentEvidence?: CiReleaseComponentEvidence;
+	/** Optional for historical bundles; frozen before either NF or peer compilation. */
+	remotePeer?: RemotePeerReleasePlan;
 	/** Present only for native re-verification of byte-identical original builds. */
 	buildSource?: CiReleaseBuildSource;
 }

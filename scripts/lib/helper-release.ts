@@ -13,7 +13,10 @@ import {
 	parseHelperManifest,
 } from "../../shared/helper-distribution";
 import { EXECUTOR_MANIFEST_FILENAME } from "../../shared/remote-executor";
+import { REMOTE_PEER_LICENSE_FILES, REMOTE_PEER_MANIFEST_FILENAME } from "../../shared/remote-peer";
+import { parseRemotePeerReleaseManifest } from "../../shared/remote-peer-manifest";
 import { updateServerChildEnvironment } from "../../shared/update-server-child-env";
+import { PublicationGhApiError } from "./ci-publication-runtime";
 import { type GhRunner, validateGitHubRepository } from "./github-release";
 import {
 	type GitHubReleaseSummary,
@@ -37,7 +40,46 @@ export const EXECUTOR_LICENSE_FILES = [
 	"go-x-sys.txt",
 	"go-purego.txt",
 ] as const;
-export type HelperReleaseKind = "helpers" | "executor";
+export type HelperReleaseKind = "helpers" | "executor" | "remote-peer";
+export function helperReleaseManifestFilename(kind: HelperReleaseKind): string {
+	switch (kind) {
+		case "helpers":
+			return HELPER_MANIFEST_FILENAME;
+		case "executor":
+			return EXECUTOR_MANIFEST_FILENAME;
+		case "remote-peer":
+			return REMOTE_PEER_MANIFEST_FILENAME;
+		default:
+			throw new Error("Unknown helper release kind");
+	}
+}
+export function helperReleaseIsPrerelease(kind: HelperReleaseKind, version: string): boolean {
+	return kind === "remote-peer" && version.includes("-");
+}
+export function helperReleaseTag(kind: HelperReleaseKind, version: string): string {
+	switch (kind) {
+		case "helpers":
+			return HELPER_RELEASE_TAG;
+		case "executor":
+			return `executor-v${version}`;
+		case "remote-peer":
+			return `remote-peer-v${version}`;
+		default:
+			throw new Error("Unknown helper release kind");
+	}
+}
+export function helperReleaseLicenseFiles(kind: HelperReleaseKind): readonly string[] {
+	switch (kind) {
+		case "helpers":
+			return HELPER_LICENSE_FILES;
+		case "executor":
+			return EXECUTOR_LICENSE_FILES;
+		case "remote-peer":
+			return REMOTE_PEER_LICENSE_FILES;
+		default:
+			throw new Error("Unknown helper release kind");
+	}
+}
 export interface HelperReleaseOptions {
 	repository: string;
 	kind: HelperReleaseKind;
@@ -101,15 +143,19 @@ function describe(
 			manifestName: HELPER_MANIFEST_FILENAME,
 			files: [...manifest.files, ...manifest.licenses],
 		};
-	} else {
-		const outer = parseExecutorReleaseManifest(value, {
+	} else if (options.kind === "executor" || options.kind === "remote-peer") {
+		const parse =
+			options.kind === "remote-peer"
+				? parseRemotePeerReleaseManifest
+				: parseExecutorReleaseManifest;
+		const outer = parse(value, {
 			...identity,
 			version: options.version,
 			protocolVersion: options.protocolVersion,
 		});
 		result = {
 			tag: outer.tag,
-			manifestName: EXECUTOR_MANIFEST_FILENAME,
+			manifestName: helperReleaseManifestFilename(options.kind),
 			files: [
 				...Object.values(outer.manifest.platforms).map((entry) => ({
 					name: entry.filename,
@@ -119,8 +165,8 @@ function describe(
 				...outer.licenses,
 			],
 		};
-	}
-	const required = options.kind === "helpers" ? HELPER_LICENSE_FILES : EXECUTOR_LICENSE_FILES;
+	} else throw new Error("Unknown helper release kind");
+	const required = helperReleaseLicenseFiles(options.kind);
 	if (required.some((name) => !result.files.some((file) => file.name === name)))
 		throw new Error("Incomplete helper license materials");
 	return result;
@@ -179,7 +225,10 @@ export async function resolveHelperTagCommit(
 	tag: string,
 ): Promise<string> {
 	validateGitHubRepository(options.repository);
-	if (tag !== HELPER_RELEASE_TAG && !/^executor-v\d+\.\d+\.\d+(?:-[A-Za-z0-9._-]+)?$/.test(tag))
+	if (
+		tag !== HELPER_RELEASE_TAG &&
+		!/^(?:executor|remote-peer)-v\d+\.\d+\.\d+(?:-[A-Za-z0-9._-]+)?$/.test(tag)
+	)
 		throw new Error("Invalid fixed helper release tag");
 	const parseObject = (raw: string): { type: string; sha: string } => {
 		const object = (JSON.parse(raw) as { object?: { type?: unknown; sha?: unknown } }).object;
@@ -297,17 +346,49 @@ function assertRemoteFiles(
 			throw new Error(`Remote helper size/SHA-256 mismatch: ${remote.name}`);
 	}
 }
+export function isMissingPeerRemote(error: unknown): boolean {
+	if (error instanceof PublicationGhApiError) return error.status === 404;
+	if (error instanceof Error && error.name === "AbortError") return false;
+	const message = String(error);
+	return (
+		/^(?:Error: )?(?:gh failed: )?gh: Not Found \(HTTP 404\)(?:\r?\n|$)/.test(message) &&
+		!message
+			.split(/\r?\n/)
+			.slice(1)
+			.some((line) => /^gh:/.test(line) || /\bHTTP\s+\d/.test(line))
+	);
+}
+
+/** A new peer pin needs no pre-created tag; only authenticated Not Found is absence. */
+export async function findPublishedRemotePeerRelease(
+	options: Omit<HelperReleaseOptions, "bundleDir" | "commit" | "kind">,
+): Promise<{ commit: string; manifestSha256: string } | undefined> {
+	const peer = { ...options, kind: "remote-peer" as const };
+	let release: RemoteRelease | undefined;
+	try {
+		release = await getRelease(peer, helperReleaseTag(peer.kind, peer.version));
+	} catch (error) {
+		if (!isMissingPeerRemote(error)) throw error;
+		return undefined;
+	}
+	if (release?.draft) return undefined;
+	return verifyOne(peer);
+}
+
 async function verifyOne(
 	options: Omit<HelperReleaseOptions, "bundleDir" | "commit">,
 ): Promise<{ commit: string; manifestSha256: string }> {
 	validateGitHubRepository(options.repository);
-	const tag = options.kind === "helpers" ? HELPER_RELEASE_TAG : `executor-v${options.version}`;
+	const tag = helperReleaseTag(options.kind, options.version);
 	const commit = await resolveHelperTagCommit(options, tag);
 	const release = await getRelease(options, tag);
-	if (!release || release.draft || release.prerelease)
-		throw new Error("Helper dependency is not public and stable");
-	const manifestName =
-		options.kind === "helpers" ? HELPER_MANIFEST_FILENAME : EXECUTOR_MANIFEST_FILENAME;
+	if (
+		!release ||
+		release.draft ||
+		release.prerelease !== helperReleaseIsPrerelease(options.kind, options.version)
+	)
+		throw new Error("Helper dependency is not public with the expected release channel");
+	const manifestName = helperReleaseManifestFilename(options.kind);
 	const asset = release.assets.find((entry) => entry.name === manifestName);
 	if (!asset || asset.size > HELPER_MANIFEST_MAX_BYTES)
 		throw new Error("Missing/oversized helper manifest");
@@ -363,8 +444,7 @@ export async function verifyPublishedHelperDependencies(options: {
 export async function validateHelperReleaseBundle(
 	options: HelperReleaseOptions,
 ): Promise<ReleaseDescription> {
-	const manifestName =
-		options.kind === "helpers" ? HELPER_MANIFEST_FILENAME : EXECUTOR_MANIFEST_FILENAME;
+	const manifestName = helperReleaseManifestFilename(options.kind);
 	await helperFileIdentity(join(options.bundleDir, manifestName), HELPER_MANIFEST_MAX_BYTES);
 	const description = describe(
 		JSON.parse(await readFile(join(options.bundleDir, manifestName), "utf8")),
@@ -412,11 +492,14 @@ export async function publishHelperRelease(
 			options.repository,
 			"--verify-tag",
 			"--draft",
+			...(helperReleaseIsPrerelease(options.kind, options.version) ? ["--prerelease"] : []),
 			"--latest=false",
 			"--title",
 			description.tag,
 			"--notes",
-			"Immutable auxiliary binaries and license materials. Linux ARM64 ripgrep requires glibc; Alpine/Termux are not supported.",
+			options.kind === "remote-peer"
+				? "Immutable optional remote-peer binaries and license materials. Distribution infrastructure only; not a production NF remote-access feature."
+				: "Immutable auxiliary binaries and license materials. Linux ARM64 ripgrep requires glibc; Alpine/Termux are not supported.",
 		]);
 		// Retry reads only after a complete authenticated listing proves absence.
 		// Four post-create reads at most; API/validation errors escape immediately.
@@ -428,7 +511,11 @@ export async function publishHelperRelease(
 		}
 		if (!release) throw new Error("Created helper draft not visible in authenticated REST lookup");
 	}
-	if (!release?.draft || release.prerelease) throw new Error("Expected stable helper draft");
+	if (
+		!release?.draft ||
+		release.prerelease !== helperReleaseIsPrerelease(options.kind, options.version)
+	)
+		throw new Error("Expected helper draft with the pinned release channel");
 	assertRemoteFiles(release, description.files, false);
 	const draft = release;
 	if (description.files.some((file) => !draft.assets.some((asset) => asset.name === file.name)))

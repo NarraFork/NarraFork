@@ -81,6 +81,16 @@ scripts/lib/*
 # executor, and its manifest builder is imported by scripts/lib/__tests__ and by
 # tests/executor-bootstrap-e2e.test.ts, so both must be in the repo.
 !scripts/release-executor.ts
+# Optional RTC component release sources; binaries stay outside the NF main bundle.
+!scripts/lib/remote-peer-build.ts
+!scripts/lib/remote-peer-release-inputs.ts
+!scripts/lib/remote-peer-release-prepare.ts
+!scripts/lib/main-release-dispatch.ts
+remote-peer/dist/
+# WebRTC M1 entry points are source; private prototype runtime state is not.
+!scripts/webrtc-prototype.ts
+!scripts/generate-webrtc-vectors.ts
+.webrtc-prototype-*/
 # Native Windows ARM64 helper acquisition/cross-build must survive a fresh clone.
 !scripts/prepare-windows-arm64-helpers.ts
 !scripts/prepare-ripgrep-helpers.ts

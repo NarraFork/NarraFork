@@ -16,6 +16,15 @@ import {
 import { assembleReleaseBundle, verifyReleaseBundle } from "./lib/ci-release-bundle";
 import { timeReleasePhase } from "./lib/ci-release-io";
 import {
+	assembleMainReleasePeer,
+	buildMainReleasePeer,
+	PEER_NATIVE_MATRIX,
+	publishMainReleasePeer,
+	restoreMainReleasePeer,
+	smokeMainReleasePeer,
+	verifyMainPeerBuildInputs,
+} from "./lib/ci-release-peer";
+import {
 	createCiReleasePlan,
 	revalidateCiReleasePlan,
 	validateCiReleasePlan,
@@ -26,6 +35,10 @@ import { readTargetComponentDependencies } from "./lib/component-release-inputs"
 import { type GhRunner, publishGitHubRelease, runGh } from "./lib/github-release";
 import { selectGitHubBaselines } from "./lib/github-release-baseline";
 import { type PublicationBuildSource, writePublicationReceipt } from "./lib/publication-receipt";
+import {
+	prepareRemotePeerRelease,
+	restoreRemotePeerReleasePlan,
+} from "./lib/remote-peer-release-prepare";
 import { prepareUpdateIndexRelease } from "./lib/update-index";
 import { preparePublishedUpdateIndexRelease, publishUpdateIndex } from "./lib/update-index-github";
 
@@ -41,6 +54,10 @@ const FLAGS: Record<string, readonly string[]> = {
 		"smoke-target",
 	],
 	"restore-platform": ["plan", "target", "platform-dir"],
+	"peer-build": ["plan", "platform", "output"],
+	"peer-smoke": ["plan", "platform", "output"],
+	"peer-assemble": ["plan", "native-dir", "output"],
+	"peer-restore": ["plan", "output"],
 	assemble: ["plan", "platforms-dir", "smoke-dir", "bundle-dir", "preview-dir"],
 	restore: ["tag", "source-run-id", "bundle-dir"],
 	"prepare-bridge": [],
@@ -117,6 +134,16 @@ export function assertReleaseGate(env: NodeJS.ProcessEnv) {
 		throw new Error("Invalid release mode");
 	if (env.PUBLISH_REQUESTED !== "true" && env.PUBLISH_REQUESTED !== "false")
 		throw new Error("Invalid publish mode");
+	if (env.PEER_ACTION !== undefined) {
+		if (!["absent", "reuse", "build", "restore"].includes(env.PEER_ACTION))
+			throw new Error("Invalid frozen peer action");
+		for (const stage of ["BUILD", "SMOKE", "ASSEMBLE", "RESTORE"]) {
+			const expected =
+				env.PEER_ACTION === (stage === "RESTORE" ? "restore" : "build") ? "success" : "skipped";
+			if (env[`PEER_${stage}_RESULT`] !== expected)
+				throw new Error(`Unexpected peer ${stage} result`);
+		}
+	}
 	const restoring = env.RESTORE_MODE === "true";
 	const reverify = env.BUILD_REUSE_MODE === "true";
 	const diagnostic = env.SMOKE_ONLY === "true";
@@ -319,16 +346,46 @@ export async function runCiRelease(argv: string[]) {
 								target: recovery.smokeTarget,
 								signal,
 							})
-						: await createCiReleasePlan({
-								root,
-								tag,
-								publish: publish === "true",
-								sourceRunId,
-								indexOnly: indexOnly === "true",
-								signal,
-							});
-					if (!recovery.buildRunId && !sourceRunId && indexOnly === "false")
+						: sourceRunId && indexOnly === "false"
+							? await (async () => {
+									await mkdir(resolve(".ci-release"), { recursive: true });
+									const original = await restoreCiReleaseBundle({
+										root,
+										tag,
+										sourceRunId,
+										destination: resolve(".ci-release/preflight-original"),
+										signal,
+										run,
+									});
+									return {
+										...original.plan,
+										remotePeer: restoreRemotePeerReleasePlan(
+											original.plan.remotePeer,
+											original.plan,
+										),
+									};
+								})()
+							: await createCiReleasePlan({
+									root,
+									tag,
+									publish: publish === "true",
+									sourceRunId,
+									indexOnly: indexOnly === "true",
+									signal,
+								});
+					if (!recovery.buildRunId && !sourceRunId && indexOnly === "false") {
+						// Freeze peer decisions for build-only as well as publish, before any compilation.
+						plan.remotePeer = await prepareRemotePeerRelease({
+							root,
+							commit: plan.commit,
+							repository: plan.repository,
+							run,
+							signal,
+						});
+						if (plan.remotePeer.action === "build")
+							await verifyMainPeerBuildInputs(root, plan, signal);
 						plan.baselines = await selectGitHubBaselines(plan, { signal });
+					}
 					validateCiReleasePlan(plan);
 					const path = resolve(required(values, "plan"));
 					await mkdir(dirname(path), { recursive: true });
@@ -339,6 +396,16 @@ export async function runCiRelease(argv: string[]) {
 						repository: plan.repository,
 						"default-branch": plan.defaultBranch ?? "main",
 						matrix: JSON.stringify(releaseMatrix(plan)),
+						"peer-action":
+							indexOnly === "true" || recovery.smokeTarget
+								? "absent"
+								: (plan.remotePeer?.action ?? "absent"),
+						"peer-matrix": JSON.stringify({
+							include:
+								plan.remotePeer && plan.remotePeer.action !== "absent"
+									? plan.remotePeer.nativeContract
+									: PEER_NATIVE_MATRIX,
+						}),
 						"index-only": indexOnly,
 						"restore-mode": String(!!sourceRunId || indexOnly === "true"),
 						"build-reuse-mode": String(!!plan.buildSource),
@@ -352,6 +419,31 @@ export async function runCiRelease(argv: string[]) {
 					await summary(
 						`Release ${plan.repository}@${plan.tag}; source ${plan.commit}; control ${plan.workflowCommit}; index-only=${indexOnly}; publish=${publish}.`,
 					);
+					return;
+				}
+				if (command.startsWith("peer-")) {
+					const plan = await readPlan(required(values, "plan"));
+					const destination = resolve(required(values, "output"));
+					if (command === "peer-build")
+						await buildMainReleasePeer(
+							root,
+							plan,
+							required(values, "platform"),
+							destination,
+							signal,
+						);
+					else if (command === "peer-smoke")
+						await smokeMainReleasePeer(plan, required(values, "platform"), destination, signal);
+					else if (command === "peer-assemble")
+						await assembleMainReleasePeer(
+							root,
+							plan,
+							resolve(required(values, "native-dir")),
+							destination,
+							signal,
+						);
+					else if (command === "peer-restore")
+						await restoreMainReleasePeer({ root, plan, output: destination, run, signal });
 					return;
 				}
 				if (command === "restore-platform") {
@@ -582,6 +674,14 @@ export async function runCiRelease(argv: string[]) {
 				const options = githubOptions(publisherPlan, join(destination, "dist"));
 				// Validate the bounded record before making the Release public.
 				const prepared = await prepareUpdateIndexRelease(options);
+				// A required new peer must be public and read back before NF can become public.
+				await publishMainReleasePeer({
+					root,
+					plan: publisherPlan,
+					run,
+					output: resolve(".ci-release/publish-peer"),
+					signal,
+				});
 				const result = await timeReleasePhase(
 					"core.publish.github",
 					{ version: publisherPlan.version },

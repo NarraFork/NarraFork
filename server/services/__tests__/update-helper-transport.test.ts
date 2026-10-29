@@ -160,7 +160,12 @@ beforeEach(() => {
 		async (...args: Parameters<typeof fetch>) => {
 			const url = String(args[0]);
 			wireRequests.push({ url, init: args[1] ?? {} });
-			if (!url.startsWith(`https://github.com/${repository}/releases/download/`))
+			const mirroredHelper = helpers.some(
+				({ spec, options }) =>
+					options.context?.source.source === "update-server" &&
+					distributionAssetUrl(options.context.source, HELPER_RELEASE_TAG, spec.toolName) === url,
+			);
+			if (!url.startsWith(`https://github.com/${repository}/releases/download/`) && !mirroredHelper)
 				throw new Error("Unexpected source or real network call");
 			return new Response(url.endsWith(".zstd-patch") ? patchPayload : payload);
 		},
@@ -232,7 +237,7 @@ describe("main downloadUpdate helper/transport wiring", () => {
 		expect(JSON.stringify(result.preparedIdentity)).not.toContain("secret");
 	});
 
-	test("explicit mirror sourceIdentity still freezes configured GitHub helper source and full fallback", async () => {
+	test("explicit mirror helper source is frozen without changing main-program full delivery", async () => {
 		if (!settings.update) throw new Error("Missing update settings");
 		settings.update.source = "update-server";
 		const info = {
@@ -244,12 +249,10 @@ describe("main downloadUpdate helper/transport wiring", () => {
 			expect(options.release.sourceIdentity?.source).toBe("update-server");
 			expect(await dependencies.resolveZstd(options.signal)).toBe("/mock/verified/zstd");
 			expect(helpers[0]?.options.context?.source).toEqual({
-				source: "github",
+				source: "update-server",
 				repository,
-				mirror: {
-					serverUrl: settings.update?.serverUrl ?? "https://narrafork-update.b.domexie.cn",
-					product: settings.update?.product ?? "narrafork",
-				},
+				serverUrl: settings.update?.serverUrl ?? "https://narrafork-update.b.domexie.cn",
+				product: settings.update?.product ?? "narrafork",
 			});
 			await dependencies.downloadFull(options.release, options.outputPath, {
 				signal: options.signal,
@@ -259,9 +262,11 @@ describe("main downloadUpdate helper/transport wiring", () => {
 		const result = await downloadUpdate(info, undefined, { signal: parent.signal });
 		expect(result.success).toBe(true);
 		expect(result.preparedIdentity?.sourceIdentity?.source).toBe("update-server");
-		expect(
-			wireRequests.every(({ url }) => url.startsWith(`https://github.com/${repository}/`)),
-		).toBe(true);
+		expect(wireRequests).toHaveLength(2);
+		expect(wireRequests[0].url).toContain(
+			`${settings.update.serverUrl}/api/v3/products/narrafork/mirror/tools/helpers/${HELPER_RELEASE_TAG}/assets/`,
+		);
+		expect(wireRequests[1].url).toBe(info._github?.downloadUrl ?? "");
 	});
 
 	test("helper unavailability reaches real patch executor's same-GitHub full fallback", async () => {

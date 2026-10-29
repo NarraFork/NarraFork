@@ -1,0 +1,304 @@
+name: Remote peer release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing remote-peer-vX.Y.Z tag matching the source component pin
+        required: true
+        type: string
+      publish:
+        description: Publish only after all native smoke jobs and release Environment approval
+        required: true
+        type: boolean
+        default: false
+      source_run_id:
+        description: Restore the original immutable bundle without rebuilding
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: remote-peer-release
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  preflight:
+    name: Remote peer preflight
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      commit: ${{ steps.plan.outputs.commit }}
+      source-run-id: ${{ steps.plan.outputs.source-run-id }}
+    steps:
+      - name: Require trusted default-branch dispatch
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          WORKFLOW_REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          test "$EVENT_NAME" = workflow_dispatch
+          test -n "$DEFAULT_BRANCH"
+          test "$WORKFLOW_REF" = "refs/heads/$DEFAULT_BRANCH"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.3
+      - name: Install trusted control dependencies without lifecycle scripts
+        run: bun install --frozen-lockfile --ignore-scripts
+      - name: Freeze exact tag, component pin, source protocol and independent recipe
+        id: plan
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          PUBLISH_REQUESTED: ${{ inputs.publish }}
+        run: >-
+          bun scripts/release-helpers.ts preflight --kind=remote-peer
+          --tag="$RELEASE_TAG" --source-run-id="$SOURCE_RUN_ID" --publish="$PUBLISH_REQUESTED"
+      - name: Bundle trusted control code
+        run: bun build scripts/release-helpers.ts --target=bun --outfile=.helper-release/control/control.js
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: helper-control-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .helper-release/control/
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 30
+
+  build:
+    name: Build (${{ matrix.platform }})
+    needs: preflight
+    if: ${{ needs.preflight.outputs.source-run-id == '' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [linux-amd64, linux-arm64, darwin-amd64, darwin-arm64, windows-amd64, windows-arm64]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          ref: ${{ needs.preflight.outputs.commit }}
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.3
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: 1.26.1
+          check-latest: false
+          cache: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: helper-control-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .helper-release/control/
+      - name: Build tag sources with the trusted pinned Go recipe
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: >-
+          bun .helper-release/control/control.js build
+          --platform="$PLATFORM" --output=.helper-release/binaries
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: helper-build-${{ matrix.platform }}
+          path: .helper-release/binaries/
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 30
+
+  smoke:
+    name: Native smoke (${{ matrix.platform }})
+    needs: [preflight, build]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux-amd64, runner: ubuntu-24.04 }
+          - { platform: linux-arm64, runner: ubuntu-24.04-arm }
+          - { platform: darwin-amd64, runner: macos-26-intel }
+          - { platform: darwin-arm64, runner: macos-26 }
+          - { platform: windows-amd64, runner: windows-2025 }
+          - { platform: windows-arm64, runner: windows-11-arm }
+    steps:
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.3
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: helper-control-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .helper-release/control/
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: helper-build-${{ matrix.platform }}
+          path: .helper-release/binaries/
+      - name: Check original binary version, protocol, side-effect-free query and local shutdown
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: bun .helper-release/control/control.js smoke --platform="$PLATFORM" --output=.helper-release/binaries
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: helper-native-${{ matrix.platform }}
+          path: .helper-release/binaries/
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 30
+
+  assemble:
+    name: Assemble exact remote peer bundle
+    needs: [preflight, smoke]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          ref: ${{ needs.preflight.outputs.commit }}
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.3
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: helper-control-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .helper-release/control/
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          pattern: helper-native-*
+          path: .helper-release/native/
+      - name: Bind all native receipts and real production license attachment
+        run: bun .helper-release/control/control.js assemble --output=.helper-release/bundle
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: helper-bundle-remote-peer-${{ needs.preflight.outputs.commit }}
+          path: .helper-release/bundle/
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 30
+
+  restore:
+    name: Verify original immutable remote peer bundle
+    needs: preflight
+    if: ${{ needs.preflight.outputs.source-run-id != '' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.3
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: helper-control-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .helper-release/control/
+      - name: Verify fixed peer workflow, all original native jobs and archive digest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bun .helper-release/control/control.js restore --output=.helper-release/bundle
+      - name: Offline preview only
+        run: bun .helper-release/control/control.js preview --output=.helper-release/bundle
+
+  publisher:
+    name: Publish approved remote peer draft
+    needs: [preflight, assemble, restore]
+    if: >-
+      ${{ always() && !cancelled() && inputs.publish && needs.preflight.result == 'success' &&
+      ((needs.assemble.result == 'success' && needs.restore.result == 'skipped') ||
+      (needs.restore.result == 'success' && needs.assemble.result == 'skipped')) }}
+    environment: release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - name: Freeze one publication deadline with cleanup reserve
+        run: printf 'NF_RELEASE_DEADLINE_MS=%s\n' "$(( $(date +%s) * 1000 + 25 * 60 * 1000 ))" >> "$GITHUB_ENV"
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.3
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: helper-control-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .helper-release/control/
+      - name: Recheck exact original immutable bundle after Environment approval
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ORIGIN_RUN_ID: ${{ inputs.source_run_id || github.run_id }}
+        run: >-
+          bun .helper-release/control/control.js restore
+          --source-run-id="$ORIGIN_RUN_ID" --output=.helper-release/bundle
+      - name: Draft, upload without clobber, verify complete assets, publish
+        id: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ATTEMPT: ${{ steps.source.outputs.source-run-attempt }}
+          BUNDLE_ARTIFACT_ID: ${{ steps.source.outputs.bundle-artifact-id }}
+        run: >-
+          bun .helper-release/control/control.js publish --output=.helper-release/bundle
+          --source-run-attempt="$SOURCE_RUN_ATTEMPT" --bundle-artifact-id="$BUNDLE_ARTIFACT_ID"
+      - name: Record verified GitHub publication
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: auxiliary-publication-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/publication/publication-receipt.json
+          if-no-files-found: error
+          retention-days: 30
+
+  gate:
+    name: Remote Peer Release Gate
+    if: ${{ always() }}
+    needs: [preflight, build, smoke, assemble, restore, publisher]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Reject failed preflight
+        env:
+          PREFLIGHT_RESULT: ${{ needs.preflight.result }}
+        run: test "$PREFLIGHT_RESULT" = success
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.3
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: helper-control-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .helper-release/control/
+      - name: Require every original native job or exact restore and requested publication
+        env:
+          PREFLIGHT_RESULT: ${{ needs.preflight.result }}
+          SOURCE_RUN_ID: ${{ inputs.source_run_id }}
+          PUBLISH_REQUESTED: ${{ inputs.publish }}
+          BUILD_RESULT: ${{ needs.build.result }}
+          SMOKE_RESULT: ${{ needs.smoke.result }}
+          ASSEMBLE_RESULT: ${{ needs.assemble.result }}
+          RESTORE_RESULT: ${{ needs.restore.result }}
+          PUBLISH_RESULT: ${{ needs.publisher.result }}
+        run: bun .helper-release/control/control.js gate

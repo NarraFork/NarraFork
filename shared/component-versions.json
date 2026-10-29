@@ -2,5 +2,9 @@
 	"executor": {
 		"version": "0.9.5",
 		"protocolVersion": 1
+	},
+	"remotePeer": {
+		"version": "0.1.0-alpha.1",
+		"protocolVersion": 1
 	}
 }

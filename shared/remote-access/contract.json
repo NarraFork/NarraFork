@@ -1,0 +1,230 @@
+{
+	"version": 1,
+	"appVersion": "prototype-1",
+	"limits": {
+		"frameBytes": 16384,
+		"headerBytes": 24,
+		"controlBytes": 16384,
+		"signalBytes": 98304,
+		"sdpBytes": 65536,
+		"candidateBytes": 2048,
+		"candidates": 128,
+		"windowBytes": 65536,
+		"queueBytes": 4194304,
+		"globalQueueBytes": 33554432,
+		"jsonBytes": 1048576,
+		"fileBytes": 8388608,
+		"streams": 32,
+		"sockets": 8,
+		"peers": 4
+	},
+	"frame": {
+		"magicHex": "4e464443",
+		"endianness": "big",
+		"fields": [
+			"magic:u32",
+			"version:u8",
+			"kind:u8",
+			"flags:u16",
+			"streamId:u32",
+			"sequence:u32",
+			"payloadBytes:u32",
+			"reserved:u32"
+		],
+		"kinds": { "data": 1, "end": 2 },
+		"flags": 0,
+		"reserved": 0
+	},
+	"crypto": {
+		"curve": "P-256",
+		"publicKey": "SEC1 uncompressed 65 bytes lowercase hex",
+		"signature": "64 bytes r||s lowercase hex ECDSA SHA-256",
+		"hash": "SHA-256 lowercase hex",
+		"instanceId": "lowercase base32 no padding of SHA256(public key bytes)",
+		"transcript": "UTF8(narrafork-remote-v1\\0) followed by uint32 big-endian length-prefixed UTF8(label), then length-prefixed UTF8(each field)",
+		"labels": {
+			"register": ["challenge", "publicKey"],
+			"offer": ["instanceId", "targetId", "clientPublicKey", "offerHash"],
+			"ticket": [
+				"instanceId",
+				"leaseEpoch",
+				"sessionId",
+				"clientPublicKey",
+				"offerHash",
+				"expiresAt",
+				"targetKind",
+				"targetId"
+			],
+			"answer": ["instanceId", "sessionId", "clientPublicKey", "offerHash", "answerHash"],
+			"hello": ["instanceId", "sessionId", "offerHash", "answerHash", "nonce", "clientPublicKey"]
+		}
+	},
+	"signal": {
+		"challenge": { "type": "challenge", "challenge": "random hex", "coordinatorPublicKey": "hex" },
+		"register": {
+			"type": "register",
+			"publicKey": "hex",
+			"signature": "hex",
+			"discoveries": [
+				{
+					"hash": "sha256 hex of discovery capability UTF8",
+					"kind": "invite|grant",
+					"id": "opaque id",
+					"expiresAt": "unix seconds integer"
+				}
+			]
+		},
+		"registered": {
+			"type": "registered",
+			"instanceId": "fingerprint",
+			"leaseEpoch": "opaque string"
+		},
+		"discoveries": {
+			"type": "discoveries",
+			"discoveries": "same list as register; replace entire bounded list"
+		},
+		"ping": { "type": "ping" },
+		"pong": { "type": "pong" },
+		"connect": {
+			"type": "connect",
+			"instanceId": "fingerprint",
+			"discoveryCapability": "opaque string",
+			"clientPublicKey": "hex",
+			"offer": "SDP string with gathered candidates",
+			"offerSignature": "hex"
+		},
+		"offer": {
+			"type": "offer",
+			"ticket": {
+				"instanceId": "fingerprint",
+				"leaseEpoch": "opaque string",
+				"sessionId": "opaque string",
+				"clientPublicKey": "hex",
+				"offerHash": "sha256",
+				"expiresAt": "unix seconds integer",
+				"targetKind": "invite|grant",
+				"targetId": "opaque string",
+				"signature": "hex"
+			},
+			"offer": "SDP",
+			"offerSignature": "hex"
+		},
+		"answer": {
+			"type": "answer",
+			"sessionId": "opaque string",
+			"answer": "SDP with gathered candidates",
+			"signature": "hex"
+		},
+		"connected": {
+			"type": "connected",
+			"sessionId": "opaque string",
+			"ticket": "same ticket",
+			"answer": "SDP",
+			"signature": "hex"
+		},
+		"candidate": {
+			"type": "candidate",
+			"sessionId": "opaque string",
+			"candidate": "RTCIceCandidateInit or null"
+		},
+		"cancel": { "type": "cancel", "sessionId": "opaque string" },
+		"error": { "type": "error", "code": "bounded code", "sessionId": "optional" }
+	},
+	"channels": ["nf.control.v1", "nf.realtime.v1", "nf.bulk.v1"],
+	"control": {
+		"hello": {
+			"type": "hello",
+			"nonce": "random hex",
+			"signature": "hello transcript signature",
+			"pairingSecret": "first pair only"
+		},
+		"hello.ready": {
+			"type": "hello.ready",
+			"grantId": "opaque string",
+			"discoveryCapability": "new grant capability on first pair",
+			"expiresAt": "unix seconds integer"
+		},
+		"auth": { "type": "auth", "token": "B JWT" },
+		"ready": { "type": "ready", "version": 1, "apiVersion": 1, "appVersion": "prototype-1" },
+		"request.open": {
+			"type": "request.open",
+			"streamId": "uint32",
+			"method": "HTTP method",
+			"path": "relative /api/ path",
+			"headers": "array of [name,value]",
+			"hasBody": "boolean"
+		},
+		"request.accept": { "type": "request.accept", "streamId": "uint32" },
+		"response.open": {
+			"type": "response.open",
+			"streamId": "uint32",
+			"status": "integer HTTP status",
+			"headers": "array of [name,value]"
+		},
+		"window.update": {
+			"type": "window.update",
+			"streamId": "uint32",
+			"bytes": "positive integer consumed bytes"
+		},
+		"stream.cancel": { "type": "stream.cancel", "streamId": "uint32" },
+		"stream.error": { "type": "stream.error", "streamId": "uint32", "code": "bounded code" },
+		"socket.open": {
+			"type": "socket.open",
+			"streamId": "uint32",
+			"path": "/ws/narrator",
+			"token": "B JWT"
+		},
+		"socket.ready": { "type": "socket.ready", "streamId": "uint32" },
+		"socket.send": {
+			"type": "socket.send",
+			"streamId": "uint32",
+			"message": "bounded existing JSON string"
+		},
+		"socket.message": {
+			"type": "socket.message",
+			"streamId": "uint32",
+			"message": "bounded existing JSON string"
+		},
+		"socket.close": {
+			"type": "socket.close",
+			"streamId": "uint32",
+			"code": "close code",
+			"reason": "bounded string"
+		},
+		"peer.error": { "type": "peer.error", "code": "bounded code" }
+	},
+	"ordering": "request.accept is mandatory before C sends request body on bulk. C creates response stream state before request.open; response bytes may arrive before response.open. Every opened body direction has independent sequence and credit; end carries next sequence, zero payload. hasBody=false means implicit request EOF: C sends no request bulk frames (including no END). window.update grants consumed bytes, never exceeds initial window outstanding. Socket messages use reliable realtime channel as bounded JSON controls and its bufferedAmount; no silent dropping.",
+	"peerConfig": {
+		"signalUrl": "ws(s)://A/signal/instance",
+		"bridgeUrl": "http://127.0.0.1:port",
+		"bridgeSecret": "private capability",
+		"statePath": "isolated private state JSON",
+		"stunUrls": "array of stun(s) only URLs",
+		"allowLocalhost": "explicit boolean development only",
+		"leaseSeconds": "optional test value"
+	},
+	"peerStdout": {
+		"ready": {
+			"type": "ready",
+			"instanceId": "id",
+			"publicKey": "hex",
+			"pairId": "opaque",
+			"pairingSecret": "private invitation only, supervisor must not log",
+			"discoveryCapability": "private invitation only"
+		}
+	},
+	"peerStdin": {
+		"revoke": { "type": "revoke", "grantId": "specific ID or all" },
+		"revoke-session": {
+			"type": "revoke-session",
+			"token": "private B session token; only matching peers close, connect grant remains"
+		},
+		"shutdown": { "type": "shutdown" }
+	},
+	"bridge": {
+		"secretHeader": "X-NarraFork-Bridge",
+		"auth": "GET /api/auth/me with B Bearer token -> {role:admin|user,expiresAt:unixSeconds}",
+		"socket": "/ws/narrator?token=BJWT with secret header",
+		"body": "all HTTP requests carry secret header and preserve filtered Authorization"
+	}
+}

@@ -7,6 +7,9 @@ import {
 	parseHelperDistributionDependencies,
 } from "../../shared/helper-distribution";
 
+import type { RemotePeerDistribution } from "../../shared/remote-peer";
+import { REMOTE_PEER_DISTRIBUTION } from "../../shared/remote-peer-distribution";
+import { parseRemotePeerDistribution } from "../../shared/remote-peer-manifest";
 import { DEVICE_PROTOCOL_VERSION } from "./agent/execution/rpc-types";
 
 export { BUILD_GITHUB_REPOSITORY } from "../../shared/build-repository";
@@ -16,6 +19,8 @@ let commitHash = "";
 let platform = "";
 let helperDistribution: HelperDistributionDependencies | undefined;
 let embeddedHelperDistribution: unknown;
+let remotePeerDistribution: Readonly<RemotePeerDistribution> | undefined;
+let embeddedRemotePeerDistribution: unknown;
 
 // Dev mode: read from package.json + git directly
 const pkgPath = resolve(import.meta.dir, "../../package.json");
@@ -23,6 +28,7 @@ if (existsSync(pkgPath)) {
 	const pkg = JSON.parse(readFileSync(pkgPath, "utf-8"));
 	version = pkg.version ?? "0.0.0";
 	helperDistribution = createHelperDistributionDependencies();
+	remotePeerDistribution = REMOTE_PEER_DISTRIBUTION;
 
 	try {
 		commitHash = execSync("git rev-parse --short HEAD", {
@@ -41,11 +47,13 @@ if (existsSync(pkgPath)) {
 			buildCommit: string;
 			buildPlatform?: string;
 			buildHelperDistribution?: unknown;
+			buildRemotePeerDistribution?: unknown;
 		};
 		version = mod.buildVersion;
 		commitHash = mod.buildCommit;
 		platform = mod.buildPlatform ?? "";
 		embeddedHelperDistribution = mod.buildHelperDistribution;
+		embeddedRemotePeerDistribution = mod.buildRemotePeerDistribution;
 	} catch {
 		// no build info either
 	}
@@ -54,6 +62,10 @@ if (existsSync(pkgPath)) {
 // An explicit but malformed declaration is not a legacy build: fail closed.
 if (embeddedHelperDistribution !== undefined)
 	helperDistribution = parseHelperDistributionDependencies(embeddedHelperDistribution);
+if (embeddedRemotePeerDistribution !== undefined)
+	remotePeerDistribution = Object.freeze(
+		parseRemotePeerDistribution(embeddedRemotePeerDistribution),
+	);
 
 export const APP_VERSION: string = version;
 export const GIT_COMMIT: string = commitHash;
@@ -61,6 +73,8 @@ export const GIT_COMMIT: string = commitHash;
 export const BUILD_PLATFORM: string = platform;
 /** Undefined only for a compiled legacy build which never advertised helper dependencies. */
 export const BUILD_HELPER_DISTRIBUTION = helperDistribution;
+/** Metadata only; absent legacy pin disables this optional download, never APP_VERSION fallback. */
+export const BUILD_REMOTE_PEER_DISTRIBUTION = remotePeerDistribution;
 /** Exact component identity; only undeclared legacy binaries track the application version. */
 export const BUILD_EXECUTOR_DISTRIBUTION = Object.freeze(
 	helperDistribution?.executor ?? {

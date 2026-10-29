@@ -1,4 +1,5 @@
 name: Release
+run-name: Release ${{ inputs.tag }} (${{ inputs.publish && 'publish' || 'verify' }})
 
 on:
   workflow_dispatch:
@@ -72,6 +73,8 @@ jobs:
       source-run-id: ${{ steps.plan.outputs.source-run-id }}
       build-reuse-mode: ${{ steps.plan.outputs.build-reuse-mode }}
       smoke-only: ${{ steps.plan.outputs.smoke-only }}
+      peer-action: ${{ steps.plan.outputs.peer-action }}
+      peer-matrix: ${{ steps.plan.outputs.peer-matrix }}
     steps:
       - name: Require the trusted dispatch entry
         env:
@@ -118,6 +121,140 @@ jobs:
           path: .ci-release/control/
           if-no-files-found: error
           retention-days: 30
+
+  peer-build:
+    name: Peer Build (${{ matrix.platform }})
+    needs: [preflight]
+    if: ${{ needs.preflight.outputs.peer-action == 'build' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.preflight.outputs.peer-matrix) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ needs.preflight.outputs.commit }}
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.3
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version: 1.26.1
+          check-latest: false
+          cache: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-control-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .ci-release/control/
+          digest-mismatch: error
+      - name: Build only the frozen peer source and pinned recipe
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: bun .ci-release/control/control.js peer-build --plan=.ci-release/control/plan.json --platform="$PLATFORM" --output=.ci-release/peer-binaries
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-peer-build-${{ matrix.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .ci-release/peer-binaries/
+          if-no-files-found: error
+          retention-days: 30
+
+  peer-smoke:
+    name: Peer Native Smoke (${{ matrix.platform }})
+    needs: [preflight, peer-build]
+    if: ${{ needs.preflight.outputs.peer-action == 'build' }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.preflight.outputs.peer-matrix) }}
+    steps:
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.3
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-control-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .ci-release/control/
+          digest-mismatch: error
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-peer-build-${{ matrix.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .ci-release/peer-binaries/
+          digest-mismatch: error
+      - name: Native version, protocol, side-effect-free queries and local shutdown
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: bun .ci-release/control/control.js peer-smoke --plan=.ci-release/control/plan.json --platform="$PLATFORM" --output=.ci-release/peer-binaries
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-peer-native-${{ matrix.platform }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .ci-release/peer-binaries/
+          if-no-files-found: error
+          retention-days: 30
+
+  peer-assemble:
+    name: Peer Assemble
+    needs: [preflight, peer-smoke]
+    if: ${{ needs.preflight.outputs.peer-action == 'build' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ needs.preflight.outputs.commit }}
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.3
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-control-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .ci-release/control/
+          digest-mismatch: error
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-peer-native-*-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .ci-release/peer-native/
+          digest-mismatch: error
+      - name: Bind all six native proofs and the real production licenses
+        run: bun .ci-release/control/control.js peer-assemble --plan=.ci-release/control/plan.json --native-dir=.ci-release/peer-native --output=.ci-release/peer-bundle
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-peer-bundle-${{ needs.preflight.outputs.commit }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .ci-release/peer-bundle/
+          if-no-files-found: error
+          retention-days: 30
+
+  peer-restore:
+    name: Restore original peer bundle
+    needs: [preflight]
+    if: ${{ needs.preflight.outputs.peer-action == 'restore' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: 1.4.3
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-control-${{ github.run_id }}-${{ github.run_attempt }}
+          path: .ci-release/control/
+          digest-mismatch: error
+      - name: Recover original peer plan and bundle without rebuilding or reselecting pin
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: bun .ci-release/control/control.js peer-restore --plan=.ci-release/control/plan.json --output=.ci-release/restored-peer
 
   verify:
     name: Verify release source
@@ -373,10 +510,13 @@ jobs:
 
   publish:
     name: Publish verified release
-    needs: [preflight, verify, build, restore-platform, smoke, assemble, restore]
+    needs: [preflight, verify, build, restore-platform, smoke, assemble, restore, peer-build, peer-smoke, peer-assemble, peer-restore]
     if: >-
       ${{ always() && !cancelled() && inputs.publish && needs.preflight.result == 'success' &&
       needs.preflight.outputs.smoke-only == 'false' &&
+      ((needs.preflight.outputs.peer-action != 'build' && needs.preflight.outputs.peer-action != 'restore') ||
+      (needs.preflight.outputs.peer-action == 'build' && needs.peer-build.result == 'success' && needs.peer-smoke.result == 'success' && needs.peer-assemble.result == 'success') ||
+      (needs.preflight.outputs.peer-action == 'restore' && needs.peer-restore.result == 'success')) &&
       ((needs.preflight.outputs.restore-mode == 'true' && needs.restore.result == 'success') ||
       (needs.preflight.outputs.restore-mode == 'false' && needs.smoke.result == 'success' && needs.assemble.result == 'success' &&
       ((needs.preflight.outputs.build-reuse-mode == 'false' && needs.verify.result == 'success' && needs.build.result == 'success') ||
@@ -419,6 +559,14 @@ jobs:
           else
             bun .ci-release/control/control.js publish --source-run-id="$SOURCE_RUN_ID" --tag="$RELEASE_TAG" --bundle-dir=.ci-release/publish-bundle
           fi
+      - name: Retain independent peer publication evidence even if NF later fails
+        if: ${{ always() && hashFiles('artifacts/publication/remote-peer-publication-receipt.json') != '' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: remote-peer-publication-receipt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: artifacts/publication/remote-peer-publication-receipt.json
+          if-no-files-found: error
+          retention-days: 30
       - name: Record verified GitHub publication
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -430,7 +578,7 @@ jobs:
   gate:
     name: Release Gate
     if: ${{ always() }}
-    needs: [preflight, verify, build, restore-platform, smoke, assemble, restore, publish]
+    needs: [preflight, verify, build, restore-platform, smoke, assemble, restore, publish, peer-build, peer-smoke, peer-assemble, peer-restore]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
@@ -460,6 +608,11 @@ jobs:
           RESTORE_RESULT: ${{ needs.restore.result }}
           PUBLISH_RESULT: ${{ needs.publish.result }}
           INDEX_ONLY: ${{ inputs.index_only }}
+          PEER_ACTION: ${{ needs.preflight.outputs.peer-action }}
+          PEER_BUILD_RESULT: ${{ needs.peer-build.result }}
+          PEER_SMOKE_RESULT: ${{ needs.peer-smoke.result }}
+          PEER_ASSEMBLE_RESULT: ${{ needs.peer-assemble.result }}
+          PEER_RESTORE_RESULT: ${{ needs.peer-restore.result }}
           INDEX_COMMIT: ${{ needs.publish.outputs.index-commit }}
           INDEX_GENERATION: ${{ needs.publish.outputs.index-generation }}
         run: bun .ci-release/control/control.js gate

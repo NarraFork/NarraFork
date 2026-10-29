@@ -83,17 +83,26 @@ function selectSource(source: HelperSource) {
 function sourceA(kind: "github" | "update-server"): HelperSource {
 	return kind === "github"
 		? { source: "github", repository: "fork/repo-a" }
-		: { source: "update-server", serverUrl: "https://server-a.example" };
+		: {
+				source: "update-server",
+				serverUrl: "https://server-a.example",
+				product: "narrafork",
+				repository: "fork/repo-a",
+			};
 }
 function sourceB(kind: "github" | "update-server"): HelperSource {
 	return kind === "github"
 		? { source: "github", repository: "fork/repo-b" }
-		: { source: "update-server", serverUrl: "https://server-b.example" };
+		: {
+				source: "update-server",
+				serverUrl: "https://server-b.example",
+				product: "narrafork",
+				repository: "fork/repo-b",
+			};
 }
 function offlineFixture(_source: HelperSource) {
 	const tag = `executor-v${EXECUTOR_VERSION}`;
 	const canonical = distribution.captureHelperSource();
-	if (canonical.source !== "github") throw new Error("Expected GitHub authority");
 	const value = {
 		schemaVersion: 1,
 		repository: canonical.repository,

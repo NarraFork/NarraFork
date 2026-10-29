@@ -20,8 +20,8 @@
 
 ## GitHub 权威发布与独立更新服务器
 
-- **GitHub 是共同权威，默认直接交付**：官方包默认 `NarraFork/NarraFork`；fork 自行构建的包采用构建时注入的仓库，已有显式仓库不覆盖。运行时不依据 cwd/项目 origin 偷换仓库，公开分发需公开仓库。设置页可选择独立更新服务器交付 metadata/patch 及 helper/executor 二进制；两种模式共享明确的 GitHub authority，主程序全量包仍取 GitHub。**脚本默认 `update-server` 参数保留，但只表示已公开版本镜像**。
-- **配置与迁移**：已有来源与服务器地址保留，不删除用户历史配置。GitHub 仓库在直连和独立镜像模式都明确展示并生效；镜像 snapshot 必须匹配它，不能从响应自建信任。切换镜像/仓库需重新检查；rg/zstd/executor 始终使用该 canonical GitHub 仓库的固定组件 tag 与 GitHub manifest 校验；镜像只交付匹配 size/SHA256 的字节，不使用 unsigned 旧 tools 接口。
+- **发布与客户端下载选源分开**：官方包默认发布仓库为 `NarraFork/NarraFork`；fork 采用构建时注入或明确配置的仓库，不依据运行时 cwd 偷换。辅助组件（rg/zstd/executor/remote-peer）选择 GitHub 时从该仓库获取 manifest 和程序；选择独立更新服务器时，二者均从该服务器的精确 tag 端点获取，**客户端无需访问 GitHub，也不会在镜像失败时回落 GitHub**。发布/制作镜像的机器仍可使用 GitHub；不要把它变成下载主机的在线校验依赖。脚本默认 `update-server` 仍指镜像已公开产物；主程序 updater 的现有 metadata/patch/全量包策略与辅助组件此规则分开。
+- **配置与信任**：已有服务器地址保留；选择镜像表示信任管理员配置的镜像提供发布清单。repository 只作为冻结的组件命名空间做离线等值校验，不向 GitHub查询。镜像程序仍必须符合清单的精确版本、协议、文件名、大小、SHA-256和架构；哈希只证明与清单一致，不防御被选镜像本身恶意替换清单。缓存、下载中任务与票据按 mode/serverUrl/product/repository 隔离，来源变更需重新选择，不复活 unsigned 旧 tools 接口。
 - **检测与下载**：stable 排除 draft/prerelease，beta 同时考虑 stable 与 prerelease，按语义版本排序；精确匹配平台（包括 x64-baseline），校验 sidecar 中的 SHA512 和大小。检测失败、限流、无 Release 和平台缺失不会显示为“已经最新”；元数据单请求 10 秒、检测总预算 30 秒，最多 5 页，每页 100 条。完整二进制流式下载最大 1 GiB、最长 15 分钟，可取消；下载前重新检查可信元数据，源/仓库或版本改变要求重新检测。
 - **配置与准备包身份**：检测开始冻结 GitHub repository、metadata delivery 方式、镜像 server/product、channel/platform；下载前及写入准备记录前再次核对。变化要求重新检查，不能把旧通道/产品/仓库的结果下载成新配置的包。保存设置不删除已准备包或取消调度；历史元数据缺 repository/来源时明确未知，不用当前配置补造身份。
 - **应用 API**：`GET /api/update/status` 的 `preparedIdentity.id` 绑定已验证文件及其来源；`POST /api/update/apply` 必须提交该 `preparedId`（可同时提交 `version`）。缺失或过期选择器返回 409，不再仅凭版本号选择文件。旧包仍可通过查询所得的选择器显式应用；已进入调度的准备包不能被另一次下载替换。选择器不是授权令牌，接口仍要求管理员权限。
@@ -30,7 +30,7 @@
 - GitHub 使用**完整主程序二进制 + 可选 zstd patch 对**；没有 patch 仍可公开并全量升级。独立服务器只复制当前 canonical metadata/patch，历史版本或 patch 缺失不能要求补包。helper/executor 使用同仓库独立辅助 Release，不混入主程序资产；历史 tools 数据保留读兼容，新客户端只通过新的 canonical 精确 tag 路由下载辅助二进制。
 - 每个选定平台必须有 `dist/narrafork-<version>-<suffix>`（Windows 带 `.exe`）、同名 `.metadata.json`，以及版本化 `narrafork-<version>-SHA256SUMS`、`narrafork-<version>-checksums.txt`。缺少任何必需文件、size/hash 不一致、版本/平台/target/commit provenance 不符都会失败。sha256 为十六进制，sha512 为 base64，与构建的 binary-metadata schema 一致。
 - 上传前读取并验证原 `dist/`；只上传 `--platform` 选定的平台及其 patch 对（未指定则要求全部平台）。过滤后的聚合 checksum 只在独占临时 staging 生成，**不修改原构建产物**；上传使用校验后的 staging 快照。完整二进制最大 1 GiB、patch 最大 512 MiB、文本最大 1 MiB（binary/patch sidecar 各 64 KiB），哈希流式计算；每次发布最多 64 对 patch、200 个资产，目录扫描最多 4096 项。单次 `gh` 调用超时 5 分钟、stdout/stderr 各最多 1 MiB。
-- GitHub 的 `v<version>` tag 必须已存在，且解析出的 commit 与本地 tag 一致（支持 annotated tag）；脚本不会自动 push，也不会从 GitHub 默认分支偷偷创建 tag。仍保留 bump → build → tag 的原顺序；初次本地构建/tag 后若缺远端 tag，脚本安全失败，显式 push 后用 `--upload-only` 重试。
+- GitHub 的主程序 `v<version>` tag 必须已推送且与本地 source commit 一致（支持 annotated tag），脚本不自动 push 主 tag。声明 remote-peer 的真实本地发布会自动委托同一主 Release CI，编译/原生 smoke 和 peer 发布由 CI 完成；不把本机 dist 当成多平台原生证据。缺远端主 tag 时明确失败，操作者按原流程推送主 tag 后重试即可，**不需要单独推送或发布 peer tag**。未声明 peer 的旧版和本地预览保留既有构建路径。
 - 发布顺序为 **create draft → upload → 验证完整资产集合及 hash → 最后 publish**。失败保留 draft；重试可复用完全一致的已有资产，绝不 `--clobber`。已公开版本只有 tag/commit、通道、双语 changelog 和全部必需资产一致时才视作成功，不能替换或补传公开版本。tag 查询未找到时，通过认证后的 Release 列表寻找 draft，再按 ID 读取；最多扫描 10 页、每页 100 条，无法完整排除既有 draft 时安全失败，不盲目创建。
 - 版本严格匹配 `x.y.0` 时为 stable，其他版本为 beta；beta 映射为 GitHub prerelease，不标记 latest。双语 changelog 写入 Release body。
 - 普通发布的 `--dry-run` 不进行任何 GitHub 调用；仍构建并验证本地产物和有界索引记录，不 commit/tag/upload/publish。可加 `--upload-only --dry-run` 只验证已有构建。`--index-only` 是独立的只读在线修复预览：读取已公开 Release，不依赖本地 dist，不 build/upload/publish；只有额外指定 `--publish-index` 才更新元数据分支，不能与 `--dry-run` 同用。
@@ -41,7 +41,7 @@
 
 一次检查/下载冻结传输策略，重定向每跳重新应用 NO_PROXY/loopback 豁免。代理变更后可以立即重试，不复用旧失败或 in-flight；不改来源身份或 preparedId，不删除已准备包，也不取消已调度更新。TLS 验证不能关闭，代理凭据不写入产物、票据、来源身份或诊断日志。独立更新服务器的响应体也受请求 deadline/父取消约束；检查 JSON 限 1 MiB、patch metadata 限 64 KiB，只允许同 origin 的有界重定向。
 
-公开仓库必须**先完成 GitHub Release/index，再由独立 workflow 镜像 metadata/patch**；镜像不参与主发布成功条件。辅助组件只有 pin 变化且尚未公开时才单独发布；普通主程序复用已发布组件。示例（版本、平台按实际替换）：
+公开仓库先发布 GitHub 产物，再由独立 workflow 镜像 metadata/patch/组件；镜像不参与主发布成功条件。remote-peer 随正常 NF 发布自动处理：输入未变复用，新的组件 pin 尚未公开则由同次主发布构建并发布，不另行手动发 peer。helpers/executor 保持既有版本声明与发布约束。示例（版本、平台按实际替换）：
 
 ```bash
 # 主仓库中准备好版本提交、构建和本地 tag；仅显式推送已经核对的 tag
@@ -55,24 +55,40 @@ bun scripts/release.ts 0.6.0 --target=github --upload-only
 # 不需要dist、不再次bump/build/tag，也不生成兼容补丁
 bun scripts/release.ts 0.6.0 --target=update-server
 
-# 仅发布/验证一个平台；对同一版本所有重试保持相同平台集合
-bun scripts/release.ts 0.6.1 --target=github --platform=windows-x64
+# 单平台仅作本地构建/只读验证，不绕过正式发布的完整原生 CI
+bun scripts/release.ts 0.6.1 --target=github --platform=windows-x64 --dry-run
 bun scripts/release.ts 0.6.1 --target=github --platform=windows-x64 --upload-only --dry-run
+# 正常发布由主 CI 自动处理更新的 peer，无需独立 peer 命令
+bun scripts/release.ts 0.6.1 --target=github --upload-only
 ```
+
+## 可选 WebRTC 组件的独立分发
+
+`remote-peer` 继续使用 Go/Pion，但不嵌入 NF 主程序、不在普通启动时下载或运行。`shared/component-versions.json` 的可选 `remotePeer` 与 NF/executor 版本独立；主构建仅生成独立 `buildRemotePeerDistribution` 元数据，未声明 pin 的历史包不能猜测 APP_VERSION 来下载组件。该可选组件不进入主程序发布的 helpers/executor 必需公开依赖集合。
+
+- 独立 tag 为 `remote-peer-v<version>`，资产名为 `narrafork-remote-peer-<version>-<os>-<arch>[.exe]`，manifest 为 `narrafork-remote-peer-manifest.json`；发布需要完整六平台及 `remote-peer-LICENSES.txt`。Go 本地构建只写 `remote-peer/dist/`，不进入 NF 主 release 文件集合。
+- 正常入口是 `.github/workflows/release.yml`：从 NF 目标提交冻结 peer pin 和生产输入指纹，输入未变则复用；新 pin 尚未公开时自动运行 Peer Build/Native smoke/Assemble。沿用主发布的一次 release Environment 审批，受保护 publisher 先创建缺失且 SHA 固定的 peer tag、发布并读回组件，再公开 NF。peer 失败不公开新的 NF；peer 已成功而 NF 失败时，重试校验复用，不覆盖资产。
+- 组件版本仍正常受评审：若 Go 源码/依赖/协议/构建输入变了但沿用已公开的旧 pin，编译前要求同步更新组件版本，不能覆写旧 tag。独立 `.github/workflows/remote-peer-release.yml` 保留诊断和旧 bundle 恢复用途，不是正常发布时需要人工多跑的步骤。alpha 等组件仍是 prerelease、不标 latest。
+- 本地 `release.ts --target=github` 在目标源码声明 peer 时自动 dispatch 同一主 CI 并等待明确成功，严格绑定默认分支、控制 SHA、tag、操作者和 dispatch 响应中的精确 runId（不搜索并发运行列表）；不伪造 GITHUB_*。`--platform`/自定义 `--changelog`/`--skip-build` 仅可用于本地预览或旧版路径，不将单平台请求悄悄变成完整正式发布；`--upload-only` 在此路径只保留跳过本地准备的含义，不绕过 CI 上传本机 dist。index-only、镜像和 dry-run 不补发 peer。
+- 主发布恢复携带原 NF/peer 封存计划及原生证据，不用今天的 pin 重选；旧独立 peer bundle 仍通过原固定 workflow/job/receipt 验证，executor workflow/工具链/输入指纹不变。未声明 peer 的历史目标不增加该阶段。
+- 后续启用通过 `ensureRemotePeerBinary` 显式获取组件。GitHub直连从其 manifest/asset 下载；镜像模式从所选 serverUrl/product 获取二者，冷缓存也不请求 GitHub。按精确命名空间/tag/version/protocol/platform 及 size/SHA-256/架构验证；镜像失败只用同来源已验证缓存或明确失败，不回落 GitHub/官方仓库。
+- 同次主发布为新 peer 和 NF 保存各自 receipt；自动镜像先校验完整 receipt 集合，再分别同步，避免只镜像 NF 或互相覆盖。制作镜像的发布端可访问 GitHub，不要求下载主机具备此能力。镜像入库保留 metadata-only→binary 单调补齐与所有大小/数量限制。
+
+代码实现本身不触发发布；操作者照常发布 NF 时会自动处理所需 peer。真实发布仍只能在主仓库工作区或其受保护 CI 进行。当前 RTC 业务/安装 UI 尚未接入，独立包及发布能力不等于完整远程功能已上线。
 
 ## GitHub Release CI
 
-`.github/workflows/release.yml` 是主程序专用入口，仅支持从当前仓库的真实默认分支手动触发（不再硬编码上游仓库或 main）。先把版本号和双语 `changelogs/v<version>.json` 提交到默认分支，再由维护者显式创建和推送 tag。CI 不修改源码分支、版本或 tag；仅受保护 publisher 可为生成的索引创建元数据分支提交。不改变本地发布脚本默认的独立更新服务器目标。
+`.github/workflows/release.yml` 是主程序专用入口，仅支持从当前仓库的真实默认分支手动触发（不再硬编码上游仓库或 main）。先把版本号和双语 `changelogs/v<version>.json` 提交到默认分支，再由维护者显式创建和推送 tag。CI 不修改源码分支、版本或主程序 tag；受保护 publisher 可为自动准备的 peer 创建缺失且指向冻结 source SHA 的独立组件 tag，并为生成的索引创建元数据分支提交。不改变本地发布脚本默认的独立更新服务器目标。
 
 主入口保留 `tag`、默认 `false` 的 `publish`、可选 `source_run_id` 和 `index_only`，以及原始构建重验参数。镜像转到独立 workflow，不再接受主发布前 `prepare-bridge` / `mirror_only` / `bridge_run_id`。默认 `publish=false` 只验收、保存索引预览，不创建或公开 Release；必须明确 `publish=true` 才进入受保护发布：
 
 ```text
-preflight（固定 tag SHA、版本、changelog、基线）
+preflight（固定 NF tag SHA、版本、changelog、基线与 peer action/pin/输入指纹）
   → 可复用 CI（静态、build/typecheck、前后端全仓四片、CI Gate）
-  → 八平台严格构建 → 八平台原生 smoke
-  → 基线 patch、统一 checksum、离线 publisher 校验 → 不可变 bundle
-  → publish=true 时等待 release Environment 审批
-  → 再验 tag 与 bundle → draft → 上传 → 远端完整校验 → publish
+  → NF 八平台构建/原生 smoke；需要新 peer 时六平台 Peer Build/Native smoke/Assemble
+  → 基线 patch、统一 checksum、离线 publisher 校验 → NF/peer 不可变 bundle
+  → publish=true 时等待同一次 release Environment 审批
+  → 再验 tag 与 bundle → 按需先发布并核验 peer → NF draft/上传/完整核验/publish
   → 原子提交 narrafork-updates 索引与 notes → 读回确认 commit/generation
 ```
 
