@@ -3283,7 +3283,8 @@ export async function runAgentLoopUnlocked(
 		runState.hadError = true;
 		active.events.emit("event", { type: "error", data: { message: errorMsg } });
 	} finally {
-		outlineLeases?.stop();
+		// A subagent's claims pass to its root as its run ends (not waited for).
+		void outlineLeases?.stop();
 		if (run && !freshInput && (!getRunHold(narratorId) || getRunHold(narratorId)?.released))
 			run.finalizing = true;
 		unregisterUpdateLoop();

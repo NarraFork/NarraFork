@@ -1,11 +1,13 @@
 /**
  * Outline task pieces that need no second dialect: the in-process rebuild stopping for shutdown,
- * and the block the lease expiry job writes. The claim and lease rules themselves are in the
- * store contract (`task-contract.ts`, both dialects).
+ * the block the lease expiry job writes, and the lease keeper backing off a failing database.
+ * The claim and lease rules themselves are in the store contract (`task-contract.ts`, both
+ * dialects).
  *
  * ISOLATION: the isolated database from `tests/preload.ts`.
  */
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { logger } from "@server/lib/logger";
 import { parseBlock } from "@shared/outline";
 import { eq } from "drizzle-orm";
 import { db } from "../../../db";
@@ -19,7 +21,9 @@ import {
 	runOutlineInProcessRebuild,
 	stopOutlineInProcessRebuild,
 } from "../in-process";
+import { keepOutlineTaskLeases, OUTLINE_LEASE_RETRY } from "../lease-keeper";
 import { contentLinks } from "../links";
+import { OUTLINE_TASK_LEASE } from "../model";
 import type { OutlineStore } from "../store/port";
 import { sqliteOutlineStore as store } from "../store/sqlite-store";
 import { outlineLeaseExpiredNote } from "../tasks";
@@ -132,5 +136,66 @@ describe("the lease expiry note", () => {
 		// Only the session id is code.
 		const code = inlines.filter((n) => n.type === "text" && n.marks.some((m) => m.type === "code"));
 		expect(code.map((n) => (n.type === "text" ? n.text : ""))).toEqual(["narrator_id-1"]);
+	});
+});
+
+describe("lease renewal against a failing database", () => {
+	test("retries after a growing back-off rather than at every boundary, and warns at most every ten minutes", async () => {
+		let down = true;
+		const attempts: number[] = [];
+		const flaky: OutlineStore = {
+			...store,
+			async renewTaskClaims(narratorId, expiresAt) {
+				attempts.push(clock);
+				if (down) throw new Error("database is locked");
+				return store.renewTaskClaims(narratorId, expiresAt);
+			},
+		};
+		const warn = spyOn(logger, "warn");
+		const info = spyOn(logger, "info");
+		const start = Date.parse(NOW);
+		let clock = start;
+		const keeper = keepOutlineTaskLeases(generateId(), {
+			store: flaky,
+			now: () => clock,
+			enabled: () => true,
+			intervalMs: 0,
+		});
+		try {
+			await new Promise((r) => setTimeout(r, 0));
+			// A tool boundary every second for twenty minutes.
+			for (let second = 1; second <= 20 * 60; second++) {
+				clock = start + second * 1000;
+				await keeper.touch();
+			}
+			const gaps = attempts.slice(1).map((t, i) => (t - (attempts[i] as number)) / 1000);
+			const cap = OUTLINE_TASK_LEASE.renewEveryMs / 1000;
+			const first = OUTLINE_LEASE_RETRY.firstMs / 1000;
+			expect(gaps.slice(0, 4)).toEqual([first, first * 2, first * 4, Math.min(cap, first * 8)]);
+			expect(gaps.every((g) => g <= cap)).toBe(true);
+			expect(attempts.length).toBeLessThan(20);
+			const warned = warn.mock.calls.filter(
+				([message]) => message === "Outline task leases could not be renewed",
+			);
+			// At the first failure and once more ten minutes on, not once per attempt.
+			expect(warned.length).toBe(2);
+
+			// The database is back: renewed at the next retry, said once, then every two minutes.
+			down = false;
+			const before = attempts.length;
+			for (let second = 1; second <= 5 * 60; second++) {
+				clock = start + (20 * 60 + second) * 1000;
+				await keeper.touch();
+			}
+			expect(attempts.length - before).toBeGreaterThanOrEqual(2);
+			expect(attempts.length - before).toBeLessThanOrEqual(4);
+			expect(
+				info.mock.calls.filter(([message]) => message === "Outline task leases renewed again"),
+			).toHaveLength(1);
+		} finally {
+			await keeper.stop();
+			warn.mockRestore();
+			info.mockRestore();
+		}
 	});
 });

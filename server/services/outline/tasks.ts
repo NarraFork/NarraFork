@@ -11,7 +11,11 @@
  *   - EXPIRY: a background job ({@link expireOutlineTaskLeases}) reopens tasks whose session's
  *     lease ran out: back to to-do, a block under the task records why, the progress under it
  *     stays. One system commit per space and batch, bounded per run; a lease renewed in between
- *     is left alone.
+ *     is left alone. The same job reopens tasks in progress that nobody holds
+ *     ({@link reopenUnclaimedOutlineTasks}: written before claims existed), a bounded slice of
+ *     the in-progress index per run.
+ *   - HAND-BACK: a subagent's claims pass to its root when its run ends
+ *     ({@link handBackOutlineTaskClaims}), so the session carries on with them.
  *   - WAITING (read time, never stored): a task waits for its prerequisites (`depends::`) until
  *     each is done or cancelled, and for people while a question under it is unanswered.
  *   - CONTINUATION CANDIDATES (§4.8): the open tasks a session may continue with.
@@ -49,6 +53,10 @@ export const OUTLINE_TASK_LIMITS = {
 	expiryBatch: 100,
 	/** Tasks one expiry commit reopens (two operations each). */
 	expiryPerCommit: 50,
+	/** Tasks in progress one run reads looking for those nobody holds. */
+	unclaimedScan: 200,
+	/** Tasks nobody holds one run reopens. */
+	unclaimedBatch: 50,
 } as const;
 
 /** The system actor of the lease expiry job's commits. */
@@ -71,6 +79,22 @@ export async function renewOutlineTaskLeases(
 	const store = options.store ?? outlineStore;
 	const now = (options.now ?? new Date()).toISOString();
 	return await store.renewTaskClaims(narratorId, outlineLeaseEnd(now));
+}
+
+/**
+ * A subagent's run ended: the claims it holds pass to its root (with a new lease), so the
+ * session it belongs to carries on with what it was doing and the root's runs renew them. Does
+ * nothing for a session that is not a subagent. Returns how many claims moved.
+ */
+export async function handBackOutlineTaskClaims(
+	narratorId: string,
+	options: { store?: OutlineStore; now?: Date } = {},
+): Promise<number> {
+	const store = options.store ?? outlineStore;
+	const root = (await store.getNarratorRoots([narratorId])).get(narratorId);
+	if (root === undefined || root === narratorId) return 0;
+	const now = (options.now ?? new Date()).toISOString();
+	return await store.handOverTaskClaims(narratorId, root, outlineLeaseEnd(now));
 }
 
 /** The claim rows of tasks (released ones included), by task block id. */
@@ -108,6 +132,14 @@ async function holderNames(narratorIds: readonly string[]): Promise<Map<string, 
 		logger.warn("Outline lease expiry: session names unavailable", { error: String(error) });
 	}
 	return out;
+}
+
+/** The block written under a reopened task nobody was holding. */
+export function outlineUnclaimedNote(): string {
+	return serializeBody({
+		type: "paragraph",
+		content: [{ type: "text", text: OUTLINE_TEXT.unclaimedReopened, marks: [] }],
+	});
 }
 
 /**
@@ -175,32 +207,105 @@ export async function expireOutlineTaskLeases(
 ): Promise<OutlineLeaseExpiryResult> {
 	const store = options.store ?? outlineStore;
 	const nowDate = options.now ?? new Date();
-	const now = nowDate.toISOString();
-	const nowMs = nowDate.getTime();
 	const limit = options.limit ?? OUTLINE_TASK_LIMITS.expiryBatch;
-	const resting = (id: string) => (expiryBackoff.get(id)?.until ?? 0) > nowMs;
+	const nowMs = nowDate.getTime();
 	// Tasks being left alone are read past, not in place of, the ones that are due.
 	const listed = await store.listExpiredTaskClaims(
-		now,
+		nowDate.toISOString(),
 		limit + Math.min(expiryBackoff.size, limit),
 	);
-	const expired = listed.filter((e) => !resting(e.claim.taskBlockId)).slice(0, limit);
-	const result: OutlineLeaseExpiryResult = { reopened: 0, skipped: 0, failed: 0 };
-	if (expired.length === 0) return result;
+	const expired = listed.filter((e) => !resting(e.claim.taskBlockId, nowMs)).slice(0, limit);
+	if (expired.length === 0) return { reopened: 0, skipped: 0, failed: 0 };
 	const names = await holderNames([
 		...new Set(expired.map((e) => e.claim.holderNarratorId as string)),
 	]);
+	return await reopenTasks(
+		store,
+		expired.map(({ claim, spaceId }) => {
+			const holder = claim.holderNarratorId as string;
+			return {
+				taskBlockId: claim.taskBlockId,
+				spaceId,
+				note: outlineLeaseExpiredNote(holder, names.get(holder) ?? null),
+			};
+		}),
+		nowDate,
+	);
+}
+
+/** Where the next scan for tasks nobody holds starts (in memory; a restart starts over). */
+let unclaimedCursor: string | null = null;
+
+/**
+ * Reopen tasks in progress that nobody holds (no claim, or a released one: written before
+ * claims existed, or any hole in the rule that a task in progress has a holder), as if their
+ * lease had run out: back to to-do with a note saying why. Each run reads at most `scan` tasks
+ * of the in-progress index, continuing where the last run stopped, and reopens at most `limit`
+ * of those it finds; one claimed in between is left alone. Bounded like the lease expiry.
+ */
+export async function reopenUnclaimedOutlineTasks(
+	options: { store?: OutlineStore; now?: Date; limit?: number; scan?: number } = {},
+): Promise<OutlineLeaseExpiryResult> {
+	const store = options.store ?? outlineStore;
+	const nowDate = options.now ?? new Date();
+	const nowMs = nowDate.getTime();
+	const limit = options.limit ?? OUTLINE_TASK_LIMITS.unclaimedBatch;
+	const found = await store.listUnclaimedDoingTasks({
+		after: unclaimedCursor,
+		scan: options.scan ?? OUTLINE_TASK_LIMITS.unclaimedScan,
+	});
+	unclaimedCursor = found.next;
+	const due = found.tasks.filter((t) => !resting(t.blockId, nowMs)).slice(0, limit);
+	if (due.length === 0) return { reopened: 0, skipped: 0, failed: 0 };
+	const note = outlineUnclaimedNote();
+	return await reopenTasks(
+		store,
+		due.map((t) => ({ taskBlockId: t.blockId, spaceId: t.spaceId, note })),
+		nowDate,
+	);
+}
+
+/** Test hook: start the next scan for unclaimed tasks from the beginning. */
+export function resetOutlineUnclaimedScanForTests(): void {
+	unclaimedCursor = null;
+}
+
+function resting(taskId: string, nowMs: number): boolean {
+	return (expiryBackoff.get(taskId)?.until ?? 0) > nowMs;
+}
+
+interface Reopening {
+	taskBlockId: string;
+	spaceId: string;
+	/** The block written last under the task: why it is open again. */
+	note: string;
+}
+
+/**
+ * Reopen tasks for the lease job: one system commit per space and batch of
+ * {@link OUTLINE_TASK_LIMITS.expiryPerCommit}. A task the planner finds held after all (renewed or
+ * claimed in between) is left out and counted in `skipped`; a batch failing for another reason
+ * is written task by task, a task that cannot take its note is reopened without it, and one that
+ * cannot be reopened at all is left alone for a while (`failed`, logged once).
+ */
+async function reopenTasks(
+	store: OutlineStore,
+	items: readonly Reopening[],
+	nowDate: Date,
+): Promise<OutlineLeaseExpiryResult> {
+	const now = nowDate.toISOString();
+	const nowMs = nowDate.getTime();
+	const result: OutlineLeaseExpiryResult = { reopened: 0, skipped: 0, failed: 0 };
 
 	const reopen = async (
 		spaceId: string,
-		claims: readonly OutlineTaskClaimRow[],
+		batch: readonly Reopening[],
 		withNote: boolean,
 	): Promise<void> => {
-		const ops: OutlineOp[] = claims.flatMap((claim): OutlineOp[] => {
-			const holder = claim.holderNarratorId as string;
+		const ops: OutlineOp[] = batch.flatMap((item): OutlineOp[] => {
 			const setTodo: OutlineOp = {
 				op: "setTask",
-				block: { id: claim.taskBlockId },
+				block: { id: item.taskBlockId },
 				task: { status: "todo" },
 			};
 			if (!withNote) return [setTodo];
@@ -208,9 +313,9 @@ export async function expireOutlineTaskLeases(
 				setTodo,
 				{
 					op: "insert",
-					parent: { id: claim.taskBlockId },
+					parent: { id: item.taskBlockId },
 					position: { last: true },
-					content: outlineLeaseExpiredNote(holder, names.get(holder) ?? null),
+					content: item.note,
 				},
 			];
 		});
@@ -220,28 +325,28 @@ export async function expireOutlineTaskLeases(
 				ops,
 				actor: { kind: "system", id: OUTLINE_LEASE_ACTOR },
 				responsibleUserId: null,
-				summary: OUTLINE_TEXT.leaseExpiredSummary(claims.length),
+				summary: OUTLINE_TEXT.leaseExpiredSummary(batch.length),
 			},
-			{ store, leaseExpiry: { blockIds: claims.map((c) => c.taskBlockId), now } },
+			{ store, leaseExpiry: { blockIds: batch.map((c) => c.taskBlockId), now } },
 		);
 	};
-	/** Reopen `claims`, leaving out those found renewed; true when done, false on another error. */
+	/** Reopen `batch`, leaving out those found held; true when done, false on another error. */
 	const attempt = async (
 		spaceId: string,
-		claims: OutlineTaskClaimRow[],
+		batch: Reopening[],
 		withNote: boolean,
 	): Promise<{ done: boolean; error?: unknown }> => {
-		let pending = claims;
+		let pending = batch;
 		while (pending.length > 0) {
 			try {
 				await reopen(spaceId, pending, withNote);
 				result.reopened += pending.length;
-				for (const claim of pending) expiryBackoff.delete(claim.taskBlockId);
+				for (const item of pending) expiryBackoff.delete(item.taskBlockId);
 				return { done: true };
 			} catch (error) {
 				if (!(error instanceof OutlineLeaseNotExpiredError)) return { done: false, error };
-				const renewed = new Set(error.blockIds);
-				const left = pending.filter((c) => !renewed.has(c.taskBlockId));
+				const held = new Set(error.blockIds);
+				const left = pending.filter((c) => !held.has(c.taskBlockId));
 				result.skipped += pending.length - left.length;
 				// Nothing named that was pending: do not loop on it.
 				if (left.length === pending.length) return { done: false, error };
@@ -251,22 +356,22 @@ export async function expireOutlineTaskLeases(
 		return { done: true };
 	};
 
-	const bySpace = new Map<string, OutlineTaskClaimRow[]>();
-	for (const { claim, spaceId } of expired) {
-		const list = bySpace.get(spaceId);
-		if (list) list.push(claim);
-		else bySpace.set(spaceId, [claim]);
+	const bySpace = new Map<string, Reopening[]>();
+	for (const item of items) {
+		const list = bySpace.get(item.spaceId);
+		if (list) list.push(item);
+		else bySpace.set(item.spaceId, [item]);
 	}
-	for (const [spaceId, claims] of bySpace) {
-		for (const batch of chunked(claims, OUTLINE_TASK_LIMITS.expiryPerCommit)) {
+	for (const [spaceId, list] of bySpace) {
+		for (const batch of chunked(list, OUTLINE_TASK_LIMITS.expiryPerCommit)) {
 			if ((await attempt(spaceId, batch, true)).done) continue;
 			// Something in the batch keeps the commit from being written: one task at a time.
-			for (const claim of batch) {
-				if ((await attempt(spaceId, [claim], true)).done) continue;
-				const bare = await attempt(spaceId, [claim], false);
+			for (const item of batch) {
+				if ((await attempt(spaceId, [item], true)).done) continue;
+				const bare = await attempt(spaceId, [item], false);
 				if (bare.done) continue;
 				result.failed++;
-				backOff(claim.taskBlockId, nowMs, bare.error);
+				backOff(item.taskBlockId, nowMs, bare.error);
 			}
 		}
 	}
@@ -283,11 +388,15 @@ const leaseJob: { timer: ReturnType<typeof setInterval> | null; running: Promise
 
 function runLeaseExpiry(): void {
 	if (leaseJob.running || !isOutlineEnabled()) return;
-	leaseJob.running = expireOutlineTaskLeases()
-		.then((result) => {
-			if (result.reopened || result.skipped || result.failed)
-				logger.info("Outline task leases expired", { ...result });
-		})
+	const run = async () => {
+		const expired = await expireOutlineTaskLeases();
+		if (expired.reopened || expired.skipped || expired.failed)
+			logger.info("Outline task leases expired", { ...expired });
+		const unclaimed = await reopenUnclaimedOutlineTasks();
+		if (unclaimed.reopened || unclaimed.skipped || unclaimed.failed)
+			logger.info("Outline tasks nobody was doing reopened", { ...unclaimed });
+	};
+	leaseJob.running = run()
 		.catch((error) => logger.warn("Outline lease expiry failed", { error: String(error) }))
 		.finally(() => {
 			leaseJob.running = null;

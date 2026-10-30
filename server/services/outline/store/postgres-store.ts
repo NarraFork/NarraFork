@@ -19,6 +19,7 @@ import { WriteConflictError } from "@server/db/backend/write-port";
 import { isPgUniqueViolation } from "@server/db/pg-errors";
 import { withPgRetry } from "@server/db/pg-retry";
 import {
+	narrators,
 	outlineBlocks,
 	outlineBlockVersions,
 	outlineCommits,
@@ -42,6 +43,7 @@ import {
 	lte,
 	ne,
 	notInArray,
+	or,
 	type SQL,
 	sql,
 } from "drizzle-orm";
@@ -61,6 +63,7 @@ import {
 	type OutlineBlockMeta,
 	type OutlineBlockRow,
 	OutlineClaimsMovedError,
+	type OutlineClaimWrite,
 	type OutlineCommitPlan,
 	type OutlineCommitRow,
 	type OutlineLinkRow,
@@ -72,6 +75,7 @@ import {
 	type OutlineTaskClaimRow,
 	type OutlineVersionRow,
 	type OutlineViewStateRow,
+	writesAsExpected,
 } from "./port";
 import { createPostgresOutlineReads } from "./postgres-read";
 
@@ -310,18 +314,8 @@ async function applyCommitSection(
 	// takeover wrong). Their rows are locked first, in id order, so a renewal waits for this
 	// commit and every commit takes claim rows before the space row.
 	const expected = expectedClaimIds(plan);
-	if (expected.length > 0) {
-		const found = new Map<string, OutlineTaskClaimRow>();
-		for (const ids of chunked(expected)) {
-			const rows = await tx
-				.select()
-				.from(outlineTaskClaims)
-				.where(inArray(outlineTaskClaims.taskBlockId, ids))
-				.orderBy(sql`${outlineTaskClaims.taskBlockId} COLLATE "C"`)
-				.for("update");
-			for (const row of rows) found.set(row.taskBlockId, row);
-		}
-		if (!claimsAsExpected(plan, found)) return "claims";
+	if (expected.length > 0 && !claimsAsExpected(plan, await lockClaims(tx, expected))) {
+		return "claims";
 	}
 	// The counter and the in-process epoch are claimed together; a commit that cannot keep its
 	// in-process answers marks the space for the rebuild in the same statement.
@@ -337,7 +331,9 @@ async function applyCommitSection(
 			and(
 				eq(outlineSpaces.id, plan.spaceId),
 				eq(outlineSpaces.nextSeq, seq),
-				eq(outlineSpaces.inProcessEpoch, plan.inProcessEpoch),
+				plan.inProcessEpoch === null
+					? undefined
+					: eq(outlineSpaces.inProcessEpoch, plan.inProcessEpoch),
 			),
 		)
 		.returning({ nextSeq: outlineSpaces.nextSeq });
@@ -418,28 +414,68 @@ async function applyCommitSection(
 
 	const released = [...plan.claims.release, ...plan.claims.expire.map((e) => e.expect.taskBlockId)];
 	for (const ids of chunked(released)) {
+		// The holder moves into `last_holder_*` (the right-hand sides read the row as it was).
 		await tx
 			.update(outlineTaskClaims)
-			.set({ holderNarratorId: null, holderUserId: null, expiresAt: null })
-			.where(inArray(outlineTaskClaims.taskBlockId, ids));
+			.set({
+				lastHolderNarratorId: sql`"holder_narrator_id"`,
+				lastHolderUserId: sql`"holder_user_id"`,
+				holderNarratorId: null,
+				holderUserId: null,
+				expiresAt: null,
+			})
+			.where(
+				and(
+					inArray(outlineTaskClaims.taskBlockId, ids),
+					or(
+						isNotNull(outlineTaskClaims.holderNarratorId),
+						isNotNull(outlineTaskClaims.holderUserId),
+					),
+				),
+			);
 	}
-	for (const { row } of plan.claims.put) {
-		await tx
-			.insert(outlineTaskClaims)
-			.values(row)
-			.onConflictDoUpdate({
-				target: outlineTaskClaims.taskBlockId,
-				set: {
-					holderNarratorId: row.holderNarratorId,
-					holderUserId: row.holderUserId,
-					epoch: row.epoch,
-					taskVersionAtClaim: row.taskVersionAtClaim,
-					claimedAt: row.claimedAt,
-					expiresAt: row.expiresAt,
-				},
-			});
-	}
+	for (const { row } of plan.claims.put) await putClaim(tx, row);
 	return "applied";
+}
+
+async function putClaim(tx: PgTransaction, row: OutlineTaskClaimRow): Promise<void> {
+	const { taskBlockId: _, ...columns } = row;
+	await tx
+		.insert(outlineTaskClaims)
+		.values(row)
+		.onConflictDoUpdate({ target: outlineTaskClaims.taskBlockId, set: columns });
+}
+
+/** Claim rows of the given tasks, locked in task id order (the order every writer locks them). */
+async function lockClaims(
+	tx: PgTransaction,
+	taskIds: readonly string[],
+): Promise<Map<string, OutlineTaskClaimRow>> {
+	const found = new Map<string, OutlineTaskClaimRow>();
+	for (const ids of chunked([...new Set(taskIds)].sort())) {
+		const rows = await tx
+			.select()
+			.from(outlineTaskClaims)
+			.where(inArray(outlineTaskClaims.taskBlockId, ids))
+			.orderBy(sql`${outlineTaskClaims.taskBlockId} COLLATE "C"`)
+			.for("update");
+		for (const row of rows) found.set(row.taskBlockId, row);
+	}
+	return found;
+}
+
+/** Claim rows written outside a commit, only while each is still the row expected. */
+async function updateClaimsSection(
+	tx: PgTransaction,
+	writes: readonly OutlineClaimWrite[],
+): Promise<boolean> {
+	const found = await lockClaims(
+		tx,
+		writes.map((w) => w.row.taskBlockId),
+	);
+	if (!writesAsExpected(writes, found)) return false;
+	for (const { row } of writes) await putClaim(tx, row);
+	return true;
 }
 
 /** Set `in_process` of a space's blocks while the space is still at `expectNextSeq`. */
@@ -489,13 +525,15 @@ async function setInProcessSection(
 }
 
 /**
- * Renew a session's claims: their rows are locked in task id order first, the order a commit
- * locks the claim rows it checks, so the two never wait on each other in a cycle.
+ * Renew a session's claims (or, with `toNarratorId`, hand them to another session): their rows
+ * are locked in task id order first, the order a commit locks the claim rows it checks, so the
+ * two never wait on each other in a cycle.
  */
 async function renewSection(
 	tx: PgTransaction,
 	narratorId: string,
 	expiresAt: string,
+	toNarratorId: string = narratorId,
 ): Promise<number> {
 	const rows = await tx
 		.select({ id: outlineTaskClaims.taskBlockId })
@@ -512,7 +550,7 @@ async function renewSection(
 	if (rows.length === 0) return 0;
 	const updated = await tx
 		.update(outlineTaskClaims)
-		.set({ expiresAt })
+		.set({ holderNarratorId: toNarratorId, expiresAt })
 		.where(
 			and(
 				inArray(
@@ -925,6 +963,67 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 				() => db.transaction((tx) => renewSection(tx, narratorId, expiresAt)),
 				{ label: "outline.renewTaskClaims" },
 			);
+		},
+
+		async updateTaskClaims(writes) {
+			if (writes.length === 0) return true;
+			return await withPgRetry(() => db.transaction((tx) => updateClaimsSection(tx, writes)), {
+				label: "outline.updateTaskClaims",
+			});
+		},
+
+		async handOverTaskClaims(fromNarratorId, toNarratorId, expiresAt) {
+			return await withPgRetry(
+				() => db.transaction((tx) => renewSection(tx, fromNarratorId, expiresAt, toNarratorId)),
+				{ label: "outline.handOverTaskClaims" },
+			);
+		},
+
+		async listUnclaimedDoingTasks({ after, scan }) {
+			// The literal predicate is the in-progress index's own; ids compare in the index's
+			// collation, so the cursor and the order agree.
+			const doing = await db
+				.select({ id: outlineBlocks.id, spaceId: outlineBlocks.spaceId })
+				.from(outlineBlocks)
+				.where(
+					and(
+						sql`("task_json"::jsonb #>> '{status}') = 'doing' AND "deleted" = FALSE`,
+						after ? gt(outlineBlocks.id, after) : undefined,
+					),
+				)
+				.orderBy(asc(outlineBlocks.id))
+				.limit(scan);
+			const claims = new Map<string, OutlineTaskClaimRow>();
+			for (const ids of chunked(doing.map((b) => b.id))) {
+				for (const row of await db
+					.select()
+					.from(outlineTaskClaims)
+					.where(inArray(outlineTaskClaims.taskBlockId, ids)))
+					claims.set(row.taskBlockId, row);
+			}
+			const tasks = doing.flatMap((b) => {
+				const claim = claims.get(b.id) ?? null;
+				if (claim && (claim.holderNarratorId !== null || claim.holderUserId !== null)) return [];
+				return [{ blockId: b.id, spaceId: b.spaceId, claim }];
+			});
+			return { tasks, next: doing.length < scan ? null : (doing.at(-1)?.id ?? null) };
+		},
+
+		async getNarratorRoots(narratorIds) {
+			const out = new Map<string, string>();
+			for (const ids of chunked([...new Set(narratorIds)])) {
+				const rows = await db
+					.select({
+						id: narrators.id,
+						type: narrators.type,
+						root: narrators.aclRootNarratorId,
+					})
+					.from(narrators)
+					.where(inArray(narrators.id, ids));
+				for (const row of rows)
+					out.set(row.id, row.type === "subagent" && row.root ? row.root : row.id);
+			}
+			return out;
 		},
 
 		async getInProcessState(spaceIds) {

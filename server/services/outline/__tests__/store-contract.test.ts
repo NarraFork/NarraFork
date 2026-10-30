@@ -15,6 +15,7 @@ import {
 	outlineCommits,
 	outlineLinks,
 	outlineSpaces,
+	outlineTaskClaims,
 	projects,
 	users,
 } from "../../../db/schema";
@@ -47,9 +48,21 @@ const ctx: OutlineContractContext = {
 		await db.insert(projects).values({ id, name: `outline-${id}`, createdAt: NOW, updatedAt: NOW });
 		return id;
 	},
-	async seedNarrator() {
+	async seedNarrator(subagent) {
 		const id = generateId();
-		await db.insert(narrators).values({ id, title: "outline", createdAt: NOW, updatedAt: NOW });
+		await db.insert(narrators).values({
+			id,
+			title: "outline",
+			createdAt: NOW,
+			updatedAt: NOW,
+			...(subagent
+				? {
+						type: "subagent" as const,
+						parentNarratorId: subagent.parentId,
+						aclRootNarratorId: subagent.rootId,
+					}
+				: {}),
+		});
 		return id;
 	},
 	async dump(spaceId) {
@@ -88,6 +101,11 @@ const ctx: OutlineContractContext = {
 			.update(outlineBlocks)
 			.set({ inProcess: false })
 			.where(eq(outlineBlocks.spaceId, spaceId));
+	},
+	async forgetClaims(taskBlockIds) {
+		await db
+			.delete(outlineTaskClaims)
+			.where(inArray(outlineTaskClaims.taskBlockId, [...taskBlockIds]));
 	},
 	async searchContent(needle) {
 		const rows = sqlite
@@ -171,6 +189,14 @@ describe("SQLite specifics", () => {
 				`SELECT id FROM outline_spaces WHERE ("in_process_ready" = 0 AND id > 'a') ORDER BY id LIMIT 5`,
 			),
 		).toContain("idx_outline_spaces_in_process_pending");
+		expect(
+			plan(
+				`SELECT "id", "space_id" FROM "outline_blocks" WHERE (json_extract("task_json", '$.status') = 'doing' AND "deleted" = 0 AND "outline_blocks"."id" > 'a') ORDER BY "outline_blocks"."id" ASC LIMIT 5`,
+			),
+		).toContain("idx_outline_blocks_doing_tasks");
+		expect(
+			plan(`SELECT id, type, acl_root_narrator_id FROM narrators WHERE id IN ('a', 'b')`),
+		).toMatch(/PRIMARY KEY|sqlite_autoindex_narrators/);
 	});
 
 	test("a page past the main-thread size is read on the workers, truncation exact", async () => {

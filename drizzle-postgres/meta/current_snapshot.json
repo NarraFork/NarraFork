@@ -1,5 +1,5 @@
 {
-  "id": "f7c0d895-4821-42ac-8b28-8b8bc0b8fa60",
+  "id": "87e33132-68f8-41ad-9605-925309958431",
   "prevId": "b47d28e4-7316-4e38-9be4-f1a8e6511385",
   "version": "7",
   "dialect": "postgresql",
@@ -17639,6 +17639,22 @@
           "concurrently": false,
           "method": "btree",
           "with": {}
+        },
+        "idx_outline_blocks_doing_tasks": {
+          "name": "idx_outline_blocks_doing_tasks",
+          "columns": [
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "(\"task_json\"::jsonb #>> '{status}') = 'doing' AND \"deleted\" = FALSE",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
         }
       },
       "foreignKeys": {
@@ -18289,6 +18305,18 @@
         },
         "expires_at": {
           "name": "expires_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "last_holder_narrator_id": {
+          "name": "last_holder_narrator_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "last_holder_user_id": {
+          "name": "last_holder_user_id",
           "type": "text",
           "primaryKey": false,
           "notNull": false

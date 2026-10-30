@@ -97,11 +97,21 @@ describe("PostgreSQL outline store", () => {
 							.values({ id, name: `outline-${id}`, createdAt: NOW, updatedAt: NOW });
 						return id;
 					},
-					async seedNarrator() {
+					async seedNarrator(subagent) {
 						const id = generateId();
-						await pgDb
-							.insert(pgSchema.narrators)
-							.values({ id, title: "outline", createdAt: NOW, updatedAt: NOW });
+						await pgDb.insert(pgSchema.narrators).values({
+							id,
+							title: "outline",
+							createdAt: NOW,
+							updatedAt: NOW,
+							...(subagent
+								? {
+										type: "subagent" as const,
+										parentNarratorId: subagent.parentId,
+										aclRootNarratorId: subagent.rootId,
+									}
+								: {}),
+						});
 						return id;
 					},
 					async dump(spaceId): Promise<SpaceDump> {
@@ -150,6 +160,11 @@ describe("PostgreSQL outline store", () => {
 							.update(pgSchema.outlineBlocks)
 							.set({ inProcess: false })
 							.where(eq(pgSchema.outlineBlocks.spaceId, spaceId));
+					},
+					async forgetClaims(taskBlockIds) {
+						await pgDb
+							.delete(pgSchema.outlineTaskClaims)
+							.where(inArray(pgSchema.outlineTaskClaims.taskBlockId, [...taskBlockIds]));
 					},
 					async searchContent(needle) {
 						const rows = await client.sql.unsafe(

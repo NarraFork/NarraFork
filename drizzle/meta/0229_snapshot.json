@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "04804a6f-a3ab-4272-b7f5-03556eda9e07",
+  "id": "09b3e729-52e0-428a-b1ca-57ba9f807ecb",
   "prevId": "e2d2045b-1196-467c-9ac0-dc34403d1f01",
   "tables": {
     "acl_events": {
@@ -14564,6 +14564,14 @@
           ],
           "isUnique": false,
           "where": "json_extract(\"task_json\", '$.status') IN ('todo', 'doing') AND \"deleted\" = 0"
+        },
+        "idx_outline_blocks_doing_tasks": {
+          "name": "idx_outline_blocks_doing_tasks",
+          "columns": [
+            "id"
+          ],
+          "isUnique": false,
+          "where": "json_extract(\"task_json\", '$.status') = 'doing' AND \"deleted\" = 0"
         }
       },
       "foreignKeys": {
@@ -15121,6 +15129,20 @@
         },
         "expires_at": {
           "name": "expires_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "last_holder_narrator_id": {
+          "name": "last_holder_narrator_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "last_holder_user_id": {
+          "name": "last_holder_user_id",
           "type": "text",
           "primaryKey": false,
           "notNull": false,

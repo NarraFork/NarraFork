@@ -55,7 +55,11 @@ export interface OutlineContractContext {
 	store: OutlineStore;
 	seedUser(): Promise<string>;
 	seedProject(): Promise<string>;
-	seedNarrator(): Promise<string>;
+	/**
+	 * A session; with `subagent`, a subagent as the runtime records one: its parent, and its root
+	 * as `acl_root_narrator_id`.
+	 */
+	seedNarrator(subagent?: { parentId: string; rootId: string }): Promise<string>;
 	/** Every row of one space, read straight from the tables. */
 	dump(spaceId: string): Promise<SpaceDump>;
 	/** Ids of blocks whose indexed content contains `needle` (3+ characters). */
@@ -67,6 +71,8 @@ export interface OutlineContractContext {
 	 * space not marked derived (what the migration leaves behind).
 	 */
 	resetInProcess(spaceId: string): Promise<void>;
+	/** Delete the claim rows of tasks (a task in progress written before claims existed). */
+	forgetClaims(taskBlockIds: readonly string[]): Promise<void>;
 }
 
 export interface ContractCase {

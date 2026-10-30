@@ -38,27 +38,38 @@
  * Starting a task claims it, in the same commit (design §2.2, §4.5): a `setTask` naming the
  * status `doing`, or a task that is in progress after the commit and was not before (an insert,
  * a split-off task, a restore, a revert). The claimer is the writer: the session for an agent's
- * write (or a system write made for a session, `narratorId`), the person for a person's write,
- * a compensating commit's included (whoever reverts a task into progress is doing it).
+ * write (or a system write made for a session, `narratorId`), the person for a person's write.
+ *
+ * A session is one holder with its subagents: a subagent and its root (`acl_root_narrator_id`,
+ * the store's `getNarratorRoots`) never refuse each other, and a subagent's claims pass to its
+ * root when its run ends (`lease-keeper.ts`).
  *
  *   - Nobody holds it (no row, released, or a session's lease ran out): the writer takes it, and
  *     the claim generation (`epoch`) grows by one. A takeover that changes nothing else is a
  *     commit whose summary says so.
- *   - The writer holds it already: nothing changes (a session's lapsed lease is renewed, without
- *     a commit).
- *   - A session whose lease is running, or a person, holds it: the whole transaction is refused
- *     with `OutlineTaskClaimedError`, naming the holder.
+ *   - The writer (or its session) holds it already: nothing changes. A lapsed lease runs again,
+ *     held by the writer: in the same atomic section as the commit, or on its own when the write
+ *     changes nothing (`updateTaskClaims`), and only while the claim is still as read, so the
+ *     expiry job reopening the task first makes the write plan again (and claim it afresh).
+ *   - Another session whose lease is running, or a person, holds it: the whole transaction is
+ *     refused with `OutlineTaskClaimedError`, naming the holder.
+ *
+ * A compensating commit (a revert) puts a task back to whoever was doing it when it was ended
+ * (the claim's `last_holder_narrator_id`, their session's root, with a new lease); only when that
+ * was a person, or nobody is known (or the session is gone), is the writer the claimer.
  *
  * A system write for no session cannot claim, so a task it would start is left to do (reported
  * as a `task-not-started` adjustment): no task is in progress with nobody holding it.
  *
  * Ending a task (done, cancelled, back to to-do, no longer a task, deleted with its subtree)
- * releases its claim in that commit. A session may not end a task someone else is doing (the
- * transaction is refused, naming them); a person may, and the commit's summary and the result's
- * `ended` say whose work it ended. A session's decision rests on the claim rows as it read them,
- * so a takeover landing before its commit makes it plan again. Rewriting a task that stays in
- * progress (its text, its place) neither claims nor ends it. Which late result to accept by its
- * claim generation is the delegation's to decide (plan PR 9).
+ * releases its claim in that commit (the holder moves into `last_holder_*`). A session may not
+ * end a task someone else is doing (the transaction is refused, naming them), except a task its
+ * own person (`responsibleUserId`) is doing; a person may end anyone's. Ending someone else's
+ * work is recorded: the commit's summary and the result's `ended` say whose work it ended. A
+ * session's decision rests on the claim rows as it read them, so a takeover landing before its
+ * commit makes it plan again. Rewriting a task that stays in progress (its text, its place)
+ * neither claims nor ends it. Which late result to accept by its claim generation is the
+ * delegation's to decide (plan PR 9).
  *
  * IN PROCESS
  * ----------
@@ -129,6 +140,7 @@ import {
 	type OutlineBlockPatch,
 	type OutlineBlockRow,
 	type OutlineClaimPlan,
+	type OutlineClaimWrite,
 	type OutlineCommitPlan,
 	type OutlineLinkRow,
 	type OutlineSpaceRow,
@@ -311,7 +323,10 @@ export type OutlineAdjustment =
 	 */
 	| { kind: "task-not-started"; blockId: string };
 
-/** A task someone else was doing that a person's (or a system) commit finished or reopened. */
+/**
+ * A task someone else was doing that this commit finished or reopened: a person's commit, or a
+ * session's acting for the person who was doing it.
+ */
 export interface OutlineEndedClaim {
 	blockId: string;
 	address: string;
@@ -335,7 +350,10 @@ export interface OutlineWriteResult {
 	pageIds: string[];
 	/** One per operation, in order. */
 	results: OutlineOpResult[];
-	/** Tasks someone else was doing that this write ended (a person may; the commit says so). */
+	/**
+	 * Tasks someone else was doing that this write ended (a person may, and a session for its own
+	 * person; the commit says so).
+	 */
 	ended?: OutlineEndedClaim[];
 }
 
@@ -367,10 +385,11 @@ export interface OutlineWriteOptions {
 	canonical?: ReadonlyArray<OutlineCanonicalContent | null | undefined>;
 	/**
 	 * Internal to the lease expiry job (`tasks.ts`): this commit reopens these tasks because their
-	 * session's lease ran out. Each must still be in progress before the commit, back to to-do
-	 * after it, and held by a session whose lease ended by `now` (ISO time); otherwise the write
-	 * rejects with `OutlineLeaseNotExpiredError`, writing nothing. The claims are released only if
-	 * they are still exactly as read (a renewal in between makes the write plan again).
+	 * session's lease ran out, or nobody holds them. Each must still be in progress before the
+	 * commit, back to to-do after it, and held by a session whose lease ended by `now` (ISO time)
+	 * or by nobody; otherwise the write rejects with `OutlineLeaseNotExpiredError`, writing
+	 * nothing. The claims are released only if they are still exactly as read (a renewal or a
+	 * claim in between makes the write plan again).
 	 */
 	leaseExpiry?: { blockIds: readonly string[]; now: string };
 }
@@ -819,21 +838,32 @@ function claimerOf(input: OutlineWriteInput): OutlineClaimer | null {
 	return input.narratorId ? { narratorId: input.narratorId } : null;
 }
 
-function holdsClaim(row: OutlineTaskClaimRow, claimer: OutlineClaimer): boolean {
-	return claimer.narratorId !== undefined
-		? row.holderNarratorId === claimer.narratorId
-		: row.holderUserId === claimer.userId;
-}
-
-/** Someone other than `claimer` (anyone, when null) holds the claim and it counts at `now`. */
-function heldByOther(
+/**
+ * The claim is the writer's: the person's own, or for a session its own or another of its
+ * session's (its root's or a fellow subagent's, by `roots`), lease running or not.
+ */
+function ownClaim(
 	row: OutlineTaskClaimRow,
 	claimer: OutlineClaimer | null,
-	now: string,
+	roots: ReadonlyMap<string, string>,
 ): boolean {
-	if (claimer && holdsClaim(row, claimer)) return false;
+	if (!claimer) return false;
+	if (claimer.userId !== undefined) return row.holderUserId === claimer.userId;
+	if (row.holderNarratorId === null) return false;
+	if (row.holderNarratorId === claimer.narratorId) return true;
+	const session = roots.get(claimer.narratorId);
+	return session !== undefined && roots.get(row.holderNarratorId) === session;
+}
+
+/** Someone holds the claim at `now`: a person, or a session whose lease is running. */
+function liveClaim(row: OutlineTaskClaimRow, now: string): boolean {
 	if (row.holderUserId !== null) return true;
 	return row.holderNarratorId !== null && (row.expiresAt === null || row.expiresAt > now);
+}
+
+/** A session's lease that ran out (the expiry job has not reopened the task yet). */
+function lapsedLease(row: OutlineTaskClaimRow, now: string): boolean {
+	return row.holderNarratorId !== null && row.expiresAt !== null && row.expiresAt <= now;
 }
 
 /** The block was a live task in progress before this transaction. */
@@ -880,10 +910,15 @@ class OutlinePlanner {
 	private readonly claimer: OutlineClaimer | null;
 	/** Blocks whose task an operation changed (or deleted), with that operation's index. */
 	private readonly taskOp = new Map<string, number>();
-	/** Tasks someone else was doing that this (person's or system) commit ended. */
+	/** Tasks someone else was doing that this commit ended (a person's, or for its person). */
 	readonly ended: OutlineEndedClaim[] = [];
-	/** The writer set its own task in progress again after its lease lapsed: renew its leases. */
-	renewOwnLeases = false;
+	/**
+	 * Claim writes that do not make a commit of their own (the writer's session's lapsed lease
+	 * running again): written with the commit, or alone when the write changes nothing.
+	 */
+	quietClaims: OutlineClaimWrite[] = [];
+	/** `planInProcess` read stored in-process answers: the plan is tied to the space's epoch. */
+	private readsInProcess = false;
 
 	/** A compensating commit drops taken aliases instead of failing. */
 	private get compensating(): boolean {
@@ -1696,11 +1731,13 @@ class OutlinePlanner {
 			(b) => !b.deleted && b.inProcess !== (b.base as OutlineBlockMeta).inProcess,
 		);
 		const claims = await this.planClaims(versionedIds, seq);
-		const claimRows = claims.put.length + claims.release.length + claims.expire.length;
+		const claimRows =
+			claims.put.length + claims.release.length + claims.expire.length + this.quietClaims.length;
 
 		const touched = closeVersionIds.length + insertBlocks.length;
 		// A claim taken over without the task changing (it was in progress already) is a commit
-		// of its own: it changes who is doing the task.
+		// of its own: it changes who is doing the task. A lapsed lease of the writer's own running
+		// again is not (`quietClaims`, written by the caller when there is no commit).
 		if (touched === 0 && claims.put.length === 0 && claims.expire.length === 0) return null;
 		const rows = touched + closeLinkIds.length + insertLinks.length + claimRows;
 		if (rows > OUTLINE_LIMITS.maxRowsTouched) throw this.tooManyRows(null);
@@ -1738,11 +1775,14 @@ class OutlinePlanner {
 			0,
 			OUTLINE_LIMITS.maxSummaryChars,
 		);
+		// The writer's own lapsed leases run again in the same atomic section.
+		claims.put.push(...this.quietClaims);
+		this.quietClaims = [];
 		return {
 			plan: {
 				spaceId: this.space.id,
 				seq,
-				inProcessEpoch: this.space.inProcessEpoch,
+				inProcessEpoch: this.readsInProcess ? this.space.inProcessEpoch : null,
 				commit: {
 					id: generateId(),
 					spaceId: this.space.id,
@@ -1797,6 +1837,7 @@ class OutlinePlanner {
 				(b.base.taskJson !== null) !== isTask(b),
 		);
 		if (roots.length === 0) return;
+		this.readsInProcess = true;
 		if (roots.every((b) => b.base === null)) {
 			// Only new blocks (the common insert): no existing block's answer changes, so a parent
 			// that existed already keeps its stored answer. (Before a space's one-time rebuild that
@@ -1930,7 +1971,7 @@ class OutlinePlanner {
 	 * What this commit does to task claims (see TASK CLAIMS in the header): take the claims of
 	 * tasks set to (or becoming) in progress, refuse a session that would take or end a task
 	 * someone else is doing, release the claims of tasks that leave in progress, and, for a lease
-	 * expiry, check the claims are still the expired ones listed.
+	 * expiry, check the claims are still the expired (or missing) ones listed.
 	 */
 	private async planClaims(versioned: ReadonlySet<string>, seq: number): Promise<OutlineClaimPlan> {
 		const doingNow = (b: WorkingBlock) => !b.deleted && b.taskJson?.status === "doing";
@@ -1951,6 +1992,8 @@ class OutlinePlanner {
 		const rows = new Map(
 			(ids.length > 0 ? await this.store.getTaskClaims(ids) : []).map((r) => [r.taskBlockId, r]),
 		);
+		const roots = await this.sessionRoots(rows.values());
+		const own = (row: OutlineTaskClaimRow) => ownClaim(row, claimer, roots);
 		const plan: OutlineClaimPlan = { put: [], release: [], expire: [], verify: [] };
 		const holderOf = (row: OutlineTaskClaimRow): OutlineClaimHolder =>
 			row.holderUserId !== null
@@ -1962,35 +2005,36 @@ class OutlinePlanner {
 			const notExpired: string[] = [];
 			for (const id of expiring) {
 				const block = this.blocks.get(id);
-				const row = rows.get(id);
-				if (
-					!block ||
-					!doingBefore(block) ||
-					doingNow(block) ||
-					!row ||
-					row.holderNarratorId === null ||
-					row.expiresAt === null ||
-					row.expiresAt > expiryNow
-				) {
-					notExpired.push(id);
-				} else plan.expire.push({ expect: row });
+				const row = rows.get(id) ?? null;
+				if (!block || !doingBefore(block) || doingNow(block)) notExpired.push(id);
+				else if (!row || (row.holderNarratorId === null && row.holderUserId === null)) {
+					// In progress with nobody holding it (written before claims existed): reopened as
+					// if a lease had run out, while still nobody holds it.
+					plan.verify.push({ taskBlockId: id, expect: row });
+				} else if (lapsedLease(row, expiryNow)) plan.expire.push({ expect: row });
+				else notExpired.push(id);
 			}
 			if (notExpired.length > 0) throw new OutlineLeaseNotExpiredError(notExpired);
 		}
 
-		// Ending a task: a session may not end one someone else is doing; a person may, and the
-		// commit says so.
+		// Ending a task: a session may not end one someone else is doing, except for its own
+		// person; a person may. Ending someone else's work is recorded.
 		for (const block of ending) {
 			if (expiring.has(block.id)) continue;
 			const row = rows.get(block.id) ?? null;
-			if (row && heldByOther(row, claimer, this.now)) {
+			if (row && !own(row) && liveClaim(row, this.now)) {
 				if (claimer?.narratorId !== undefined) {
-					throw new OutlineTaskClaimedError(
-						block.id,
-						this.address(block.sid),
-						holderOf(row),
-						this.taskOp.get(block.id) ?? null,
-					);
+					const forItsPerson =
+						row.holderUserId !== null && row.holderUserId === this.input.responsibleUserId;
+					if (!forItsPerson) {
+						throw new OutlineTaskClaimedError(
+							block.id,
+							this.address(block.sid),
+							holderOf(row),
+							this.taskOp.get(block.id) ?? null,
+						);
+					}
+					plan.verify.push({ taskBlockId: block.id, expect: row });
 				}
 				this.ended.push({
 					blockId: block.id,
@@ -2008,29 +2052,75 @@ class OutlinePlanner {
 		for (const [id, opIndex] of started) {
 			const block = this.block(id);
 			const row = rows.get(id) ?? null;
-			const fresh = (epoch: number): OutlineTaskClaimRow => ({
-				taskBlockId: id,
-				holderNarratorId: claimer.narratorId ?? null,
-				holderUserId: claimer.userId ?? null,
-				epoch,
-				taskVersionAtClaim: versioned.has(id) ? seq : (block.base?.versionSeq ?? seq),
-				claimedAt: this.now,
-				expiresAt: claimer.narratorId !== undefined ? outlineLeaseEnd(this.now) : null,
-			});
-			if (!row) {
-				plan.put.push({ row: fresh(1), expect: null });
-			} else if (holdsClaim(row, claimer)) {
-				// Its own claim: a session's lapsed lease is renewed after the write, without a
-				// commit of its own.
-				if (row.holderNarratorId !== null && row.expiresAt !== null && row.expiresAt <= this.now)
-					this.renewOwnLeases = true;
-			} else if (heldByOther(row, claimer, this.now)) {
-				throw new OutlineTaskClaimedError(id, this.address(block.sid), holderOf(row), opIndex);
-			} else {
-				plan.put.push({ row: fresh(row.epoch + 1), expect: row });
+			if (row && own(row)) {
+				// Its own (or its session's): a running lease stays as it is; a lapsed one runs
+				// again, held by the writer, only while the row is still as read.
+				if (lapsedLease(row, this.now) && claimer.narratorId !== undefined) {
+					this.quietClaims.push({
+						row: {
+							...row,
+							holderNarratorId: claimer.narratorId,
+							expiresAt: outlineLeaseEnd(this.now),
+						},
+						expect: row,
+					});
+				}
+				continue;
 			}
+			if (row && liveClaim(row, this.now)) {
+				throw new OutlineTaskClaimedError(id, this.address(block.sid), holderOf(row), opIndex);
+			}
+			// A revert puts the task back to whoever was doing it; otherwise the writer takes it.
+			const holder = (this.compensating ? this.previousHolder(row, roots) : null) ?? claimer;
+			plan.put.push({
+				row: {
+					taskBlockId: id,
+					holderNarratorId: holder.narratorId ?? null,
+					holderUserId: holder.userId ?? null,
+					epoch: row ? row.epoch + 1 : 1,
+					taskVersionAtClaim: versioned.has(id) ? seq : (block.base?.versionSeq ?? seq),
+					claimedAt: this.now,
+					expiresAt: holder.narratorId !== undefined ? outlineLeaseEnd(this.now) : null,
+					lastHolderNarratorId: null,
+					lastHolderUserId: null,
+				},
+				expect: row,
+			});
 		}
 		return plan;
+	}
+
+	/**
+	 * The session each narrator the claims name belongs to (see `ownClaim`), read only when a
+	 * claim names a session other than the writer.
+	 */
+	private async sessionRoots(rows: Iterable<OutlineTaskClaimRow>): Promise<Map<string, string>> {
+		const self = this.claimer?.narratorId;
+		// Only a session's claims, and a revert's choice of holder, depend on sessions.
+		if (self === undefined && !this.compensating) return new Map();
+		const others = new Set<string>();
+		for (const row of rows) {
+			for (const id of [row.holderNarratorId, this.compensating ? row.lastHolderNarratorId : null])
+				if (id !== null && id !== self) others.add(id);
+		}
+		if (others.size === 0) return new Map();
+		return await this.store.getNarratorRoots(self ? [self, ...others] : [...others]);
+	}
+
+	/**
+	 * Who a revert gives a task back to: the session that was doing it when it was ended (its
+	 * root), with a new lease. Null (the writer takes it) when that was a person, nobody is
+	 * known, or the session no longer exists.
+	 */
+	private previousHolder(
+		row: OutlineTaskClaimRow | null,
+		roots: ReadonlyMap<string, string>,
+	): OutlineClaimer | null {
+		if (!row) return null;
+		const session =
+			row.holderNarratorId ?? (row.holderUserId === null ? row.lastHolderNarratorId : null);
+		const root = session === null ? undefined : roots.get(session);
+		return root === undefined ? null : { narratorId: root };
 	}
 
 	/**
@@ -2241,7 +2331,10 @@ async function writePrepared(
 			throw error;
 		}
 		if (!planned) {
-			await renewOwnLeases(store, planner, input, now);
+			// Nothing to commit, but the writer's lapsed lease runs again (unless the expiry job
+			// got there first: then plan again, and the reopened task is claimed afresh).
+			const quiet = planner.quietClaims;
+			if (quiet.length > 0 && !(await store.updateTaskClaims(quiet))) continue;
 			return { spaceId: space.id, commit: null, pageIds: [], results: planner.results };
 		}
 		try {
@@ -2271,7 +2364,6 @@ async function writePrepared(
 			actorKind: commit.actorKind,
 			actorId: commit.actorId,
 		});
-		await renewOwnLeases(store, planner, input, now);
 		return {
 			spaceId: space.id,
 			commit: { id: commit.id, seq: commit.seq },
@@ -2281,16 +2373,4 @@ async function writePrepared(
 		};
 	}
 	throw new OutlineBusyError(input.spaceId, attempts);
-}
-
-/** A session that started its own task again after its lease lapsed: its leases run on. */
-async function renewOwnLeases(
-	store: OutlineStore,
-	planner: OutlinePlanner,
-	input: OutlineWriteInput,
-	now: string,
-): Promise<void> {
-	if (!planner.renewOwnLeases) return;
-	const narratorId = input.narratorId ?? (input.actor.kind === "agent" ? input.actor.id : null);
-	if (narratorId) await store.renewTaskClaims(narratorId, outlineLeaseEnd(now));
 }

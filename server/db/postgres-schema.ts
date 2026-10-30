@@ -3511,6 +3511,9 @@ export const outlineBlocks = pgTable(
 					"(\"task_json\"::jsonb #>> '{status}') IN ('todo', 'doing') AND \"deleted\" = FALSE",
 				),
 			),
+		index("idx_outline_blocks_doing_tasks")
+			.on(table.id)
+			.where(sql.raw("(\"task_json\"::jsonb #>> '{status}') = 'doing' AND \"deleted\" = FALSE")),
 	],
 );
 
@@ -3599,6 +3602,8 @@ export const outlineTaskClaims = pgTable(
 		taskVersionAtClaim: integer("task_version_at_claim").notNull(),
 		claimedAt: text("claimed_at").notNull(),
 		expiresAt: text("expires_at"),
+		lastHolderNarratorId: text("last_holder_narrator_id"),
+		lastHolderUserId: text("last_holder_user_id"),
 	},
 	(table) => [
 		index("idx_outline_task_claims_holder")
@@ -4103,7 +4108,7 @@ export const notifications = pgTable(
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
   "tableCount": 134,
-  "columnCount": 1755,
+  "columnCount": 1757,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -24332,6 +24337,14 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           ],
           "unique": false,
           "predicate": "(\"task_json\"::jsonb #>> '{status}') IN ('todo', 'doing') AND \"deleted\" = FALSE"
+        },
+        {
+          "name": "idx_outline_blocks_doing_tasks",
+          "columns": [
+            "id"
+          ],
+          "unique": false,
+          "predicate": "(\"task_json\"::jsonb #>> '{status}') = 'doing' AND \"deleted\" = FALSE"
         }
       ],
       "checks": [],
@@ -24830,6 +24843,24 @@ export const POSTGRES_SCHEMA_COVERAGE = {
         {
           "property": "expiresAt",
           "name": "expires_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "lastHolderNarratorId",
+          "name": "last_holder_narrator_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "lastHolderUserId",
+          "name": "last_holder_user_id",
           "kind": "text",
           "pgType": "text",
           "notNull": false,

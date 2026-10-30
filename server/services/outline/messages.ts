@@ -51,6 +51,9 @@ export const OUTLINE_TEXT = {
 			`The previous executor's lease expired (session ${title ? `"${title}" ` : ""}`,
 		tail: "); the task is open again.",
 	},
+	/** The block the lease job writes under a task in progress that nobody was holding. */
+	unclaimedReopened:
+		"This task was in progress, but no session or person was holding it; it is open again.",
 	/** Summary of a commit that only hands tasks over (their lease had run out). */
 	claimTakenOver: (addresses: readonly string[]) =>
 		`took over ${addresses.join(", ")} (the previous lease had run out)`,

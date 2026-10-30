@@ -8,22 +8,41 @@
  * run starts, at each tool boundary and on a timer while a long tool call runs, never more often
  * than once per `renewEveryMs` for a session. A renewal is one indexed, bounded UPDATE of the
  * session's claims (nothing when it holds none), fired without waiting for it.
+ *
+ * A renewal that fails is tried again after a back-off (from {@link OUTLINE_LEASE_RETRY.firstMs},
+ * doubling up to `renewEveryMs`), not at every tool boundary, and a failing database is reported
+ * once per {@link OUTLINE_LEASE_RETRY.warnEveryMs} per session, not once per attempt.
+ *
+ * When a subagent's run ends, its claims pass to its root (`handBackOutlineTaskClaims`): the work
+ * belongs to the session, and the root's runs renew it from then on.
  */
 import { logger } from "@server/lib/logger";
 import { isOutlineEnabled } from "./feature";
 import { OUTLINE_TASK_LEASE } from "./model";
 import type { OutlineStore } from "./store/port";
-import { renewOutlineTaskLeases } from "./tasks";
+import { handBackOutlineTaskClaims, renewOutlineTaskLeases } from "./tasks";
+
+export const OUTLINE_LEASE_RETRY = {
+	/** First wait after a failed renewal; doubles up to `renewEveryMs`. */
+	firstMs: 15_000,
+	/** A session's failing renewals are reported at most this often. */
+	warnEveryMs: 10 * 60_000,
+};
 
 export interface OutlineLeaseKeeper {
 	/** Renew now unless the session renewed within `renewEveryMs`; resolves when done. */
 	touch(): Promise<void>;
-	/** Stop renewing (the run ended); its leases then run out unless another run renews them. */
-	stop(): void;
+	/**
+	 * Stop renewing (the run ended); its leases then run out unless another run renews them. A
+	 * subagent's claims pass to its root; resolves when that is done.
+	 */
+	stop(): Promise<void>;
 }
 
 /** When each session last renewed (ms), shared by its runs. */
 const lastRenewal = new Map<string, number>();
+/** Sessions whose renewals are failing: how often, when to try next, when last reported. */
+const failing = new Map<string, { count: number; retryAt: number; warnedAt: number }>();
 /** Keepers running, by session: for tests and diagnostics. */
 const running = new Map<string, number>();
 
@@ -44,25 +63,46 @@ export function keepOutlineTaskLeases(
 ): OutlineLeaseKeeper {
 	const clock = options.now ?? Date.now;
 	const enabled = options.enabled ?? isOutlineEnabled;
+	const store = options.store ? { store: options.store } : {};
 	let stopped = false;
 	const touch = async (): Promise<void> => {
 		if (stopped || !enabled()) return;
 		const at = clock();
+		const failed = failing.get(narratorId);
+		if (failed && at < failed.retryAt) return;
 		const last = lastRenewal.get(narratorId);
-		if (last !== undefined && at - last < OUTLINE_TASK_LEASE.renewEveryMs) return;
+		if (!failed && last !== undefined && at - last < OUTLINE_TASK_LEASE.renewEveryMs) return;
 		lastRenewal.set(narratorId, at);
 		try {
-			await renewOutlineTaskLeases(narratorId, {
-				now: new Date(at),
-				...(options.store ? { store: options.store } : {}),
-			});
+			await renewOutlineTaskLeases(narratorId, { now: new Date(at), ...store });
+			if (failed) {
+				failing.delete(narratorId);
+				logger.info("Outline task leases renewed again", {
+					narratorId,
+					failedAttempts: failed.count,
+				});
+			}
 		} catch (error) {
-			// Try again at the next boundary rather than waiting out the interval.
 			lastRenewal.delete(narratorId);
-			logger.warn("Outline task leases could not be renewed", {
-				narratorId,
-				error: String(error),
+			const count = (failed?.count ?? 0) + 1;
+			const waitMs = Math.min(
+				OUTLINE_TASK_LEASE.renewEveryMs,
+				OUTLINE_LEASE_RETRY.firstMs * 2 ** (count - 1),
+			);
+			const warn = !failed || at - failed.warnedAt >= OUTLINE_LEASE_RETRY.warnEveryMs;
+			failing.set(narratorId, {
+				count,
+				retryAt: at + waitMs,
+				warnedAt: warn ? at : (failed?.warnedAt ?? at),
 			});
+			if (warn) {
+				logger.warn("Outline task leases could not be renewed", {
+					narratorId,
+					failedAttempts: count,
+					retryInMs: waitMs,
+					error: String(error),
+				});
+			}
 		}
 	};
 	const intervalMs = options.intervalMs ?? OUTLINE_TASK_LEASE.renewEveryMs;
@@ -77,15 +117,27 @@ export function keepOutlineTaskLeases(
 	void touch();
 	return {
 		touch,
-		stop() {
+		async stop() {
 			if (stopped) return;
 			stopped = true;
 			if (timer) clearInterval(timer);
 			const left = (running.get(narratorId) ?? 1) - 1;
-			if (left > 0) running.set(narratorId, left);
-			else {
-				running.delete(narratorId);
-				lastRenewal.delete(narratorId);
+			if (left > 0) {
+				running.set(narratorId, left);
+				return;
+			}
+			running.delete(narratorId);
+			lastRenewal.delete(narratorId);
+			failing.delete(narratorId);
+			if (!enabled()) return;
+			try {
+				await handBackOutlineTaskClaims(narratorId, { now: new Date(clock()), ...store });
+			} catch (error) {
+				// Its leases then run out as any stopped session's do.
+				logger.warn("Outline task claims of a subagent could not be handed to its root", {
+					narratorId,
+					error: String(error),
+				});
 			}
 		},
 	};

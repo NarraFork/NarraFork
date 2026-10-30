@@ -8,6 +8,8 @@ CREATE TABLE `outline_task_claims` (
 	`task_version_at_claim` integer NOT NULL,
 	`claimed_at` text NOT NULL,
 	`expires_at` text,
+	`last_holder_narrator_id` text,
+	`last_holder_user_id` text,
 	FOREIGN KEY (`task_block_id`) REFERENCES `outline_blocks`(`id`) ON UPDATE no action ON DELETE cascade
 );
 --> statement-breakpoint
@@ -18,6 +20,8 @@ CREATE INDEX `idx_outline_task_claims_expiry` ON `outline_task_claims` (`expires
 ALTER TABLE `outline_blocks` ADD `in_process` integer DEFAULT false NOT NULL;
 --> statement-breakpoint
 CREATE INDEX `idx_outline_blocks_open_tasks` ON `outline_blocks` (`space_id`) WHERE json_extract("task_json", '$.status') IN ('todo', 'doing') AND "deleted" = 0;
+--> statement-breakpoint
+CREATE INDEX `idx_outline_blocks_doing_tasks` ON `outline_blocks` (`id`) WHERE json_extract("task_json", '$.status') = 'doing' AND "deleted" = 0;
 --> statement-breakpoint
 ALTER TABLE `outline_spaces` ADD `in_process_ready` integer DEFAULT false NOT NULL;
 --> statement-breakpoint

@@ -159,7 +159,7 @@ export interface OutlineViewStateRow {
 /**
  * Who is doing a task (`outline_task_claims`). Held by a session (`holderNarratorId`, with a
  * lease until `expiresAt`), by a person (`holderUserId`, no lease) or by nobody (both null: the
- * claim was released and only `epoch` still counts).
+ * claim was released; `epoch` still counts, and `lastHolder*` say who held it last).
  */
 export interface OutlineTaskClaimRow {
 	taskBlockId: string;
@@ -172,6 +172,9 @@ export interface OutlineTaskClaimRow {
 	claimedAt: string;
 	/** End of a session's lease (ISO time); null for a person's claim and a released one. */
 	expiresAt: string | null;
+	/** Who held it when it was last released; null while it is held. */
+	lastHolderNarratorId: string | null;
+	lastHolderUserId: string | null;
 }
 
 /** The space a project, a user or a narrator owns. */
@@ -214,9 +217,12 @@ export interface OutlineClaimWrite {
 
 /** What a commit does to `outline_task_claims`; see {@link OutlineCommitPlan}. */
 export interface OutlineClaimPlan {
-	/** Claims taken or taken over. */
+	/** Claims taken, taken over, or (a session's own) renewed or passed within its session. */
 	put: OutlineClaimWrite[];
-	/** Tasks that left in progress (or were deleted): released whatever they hold now. */
+	/**
+	 * Tasks that left in progress (or were deleted): released whatever they hold now, the holder
+	 * moving into `lastHolder*`.
+	 */
 	release: string[];
 	/** Lease expiries: released only while the claim is still exactly the row read (`expect`). */
 	expire: Array<{ expect: OutlineTaskClaimRow }>;
@@ -244,19 +250,21 @@ export interface OutlineClaimPlan {
  *      (`in_process_ready` false) for the background rebuild;
  *   8. write `claims`.
  *
- * Step 1 claims `next_seq` and `in_process_epoch` together. Before it the section checks that
- * every claim row `claims` expects (`put`, `expire`, `verify`) is still as read; when one is
- * not, it writes nothing and rejects with {@link OutlineClaimsMovedError}.
+ * Step 1 claims `next_seq`, and `in_process_epoch` with it when the plan names one. Before it the
+ * section checks that every claim row `claims` expects (`put`, `expire`, `verify`) is still as
+ * read; when one is not, it writes nothing and rejects with {@link OutlineClaimsMovedError}.
  */
 export interface OutlineCommitPlan {
 	spaceId: string;
 	/** The space's `next_seq` the plan was computed against; becomes the commit's seq. */
 	seq: number;
 	/**
-	 * The space's `in_process_epoch` the plan was computed against: claimed together with `seq`,
-	 * so a plan that read in-process answers the rebuild has since rewritten is stale.
+	 * The space's `in_process_epoch` the plan's in-process answers were computed from: claimed
+	 * together with `seq`, so a plan that read answers the rebuild has since rewritten is stale.
+	 * Null when the plan read none (it writes none either): the epoch does not matter to it, and
+	 * a rebuild running meanwhile does not send it round again.
 	 */
-	inProcessEpoch: number;
+	inProcessEpoch: number | null;
 	commit: OutlineCommitRow;
 	/** Existing blocks that get a new version: exactly the non-inserted blocks in `versions`. */
 	closeVersionIds: string[];
@@ -319,7 +327,9 @@ export function sameClaimRow(
 		a.epoch === b.epoch &&
 		a.taskVersionAtClaim === b.taskVersionAtClaim &&
 		a.claimedAt === b.claimedAt &&
-		a.expiresAt === b.expiresAt
+		a.expiresAt === b.expiresAt &&
+		a.lastHolderNarratorId === b.lastHolderNarratorId &&
+		a.lastHolderUserId === b.lastHolderUserId
 	);
 }
 
@@ -338,9 +348,7 @@ export function claimsAsExpected(
 	plan: OutlineCommitPlan,
 	found: ReadonlyMap<string, OutlineTaskClaimRow>,
 ): boolean {
-	for (const write of plan.claims.put) {
-		if (!sameClaimRow(found.get(write.row.taskBlockId) ?? null, write.expect)) return false;
-	}
+	if (!writesAsExpected(plan.claims.put, found)) return false;
 	for (const expiry of plan.claims.expire) {
 		if (!sameClaimRow(found.get(expiry.expect.taskBlockId) ?? null, expiry.expect)) return false;
 	}
@@ -348,6 +356,25 @@ export function claimsAsExpected(
 		if (!sameClaimRow(found.get(check.taskBlockId) ?? null, check.expect)) return false;
 	}
 	return true;
+}
+
+/** Whether the claim rows found (by task id) are the ones each write expects. */
+export function writesAsExpected(
+	writes: readonly OutlineClaimWrite[],
+	found: ReadonlyMap<string, OutlineTaskClaimRow>,
+): boolean {
+	for (const write of writes) {
+		if (!sameClaimRow(found.get(write.row.taskBlockId) ?? null, write.expect)) return false;
+	}
+	return true;
+}
+
+/** A task in progress that nobody holds, as the lease job finds it. */
+export interface OutlineUnclaimedTask {
+	blockId: string;
+	spaceId: string;
+	/** Its claim row (released), or null when it never had one (written before claims existed). */
+	claim: OutlineTaskClaimRow | null;
 }
 
 /** A task a session holds a claim on, with the task's block. */
@@ -417,8 +444,10 @@ export interface OutlineStore extends WritePortIdentity, OutlineReadPort {
 	applyCommit(plan: OutlineCommitPlan): Promise<void>;
 
 	// ── tasks (`services/outline/tasks.ts`) ─────────────────────────────────────────────
-	// Claims are written only by `applyCommit`, except a session renewing its own leases. Every
-	// read is one indexed statement (or one per chunk of ids) with a limit.
+	// Claims are written by `applyCommit`, and outside a commit only by a session renewing its own
+	// leases (`renewTaskClaims`, `updateTaskClaims`) and handing a subagent's claims to its root
+	// (`handOverTaskClaims`). Every read is one indexed statement (or one per chunk of ids) with a
+	// limit.
 
 	/** Claim rows of the given task blocks (released ones included). */
 	getTaskClaims(blockIds: readonly string[]): Promise<OutlineTaskClaimRow[]>;
@@ -442,6 +471,38 @@ export interface OutlineStore extends WritePortIdentity, OutlineReadPort {
 	 * `expiresAt`; returns how many. Rows are locked in task id order, as a commit locks them.
 	 */
 	renewTaskClaims(narratorId: string, expiresAt: string): Promise<number>;
+	/**
+	 * Write claim rows outside a commit (a session renewing its own lapsed lease, or taking over
+	 * one within its session, without changing a block), atomically and only while every row is
+	 * still exactly the one `expect` names. Returns false, having written nothing, otherwise.
+	 * Rows are locked in task id order, as a commit locks them.
+	 */
+	updateTaskClaims(writes: readonly OutlineClaimWrite[]): Promise<boolean>;
+	/**
+	 * Move the claims `fromNarratorId` holds (at most {@link OUTLINE_RENEW_LIMIT}) to
+	 * `toNarratorId`, with a lease until `expiresAt`: a subagent's run ended and its root takes
+	 * over what it was doing. Returns how many. Rows are locked in task id order.
+	 */
+	handOverTaskClaims(
+		fromNarratorId: string,
+		toNarratorId: string,
+		expiresAt: string,
+	): Promise<number>;
+	/**
+	 * Live tasks in progress that nobody holds (no claim row, or a released one), found among at
+	 * most `scan` tasks in progress by id after `after` (the in-progress index). `next` is where
+	 * the following scan starts, null once the end was reached.
+	 */
+	listUnclaimedDoingTasks(options: {
+		after: string | null;
+		scan: number;
+	}): Promise<{ tasks: OutlineUnclaimedTask[]; next: string | null }>;
+	/**
+	 * The session each narrator belongs to: a subagent's root (`acl_root_narrator_id`, the one
+	 * authority on it), anyone else's own id. Narrators that do not exist are left out. One
+	 * primary-key read per chunk of ids.
+	 */
+	getNarratorRoots(narratorIds: readonly string[]): Promise<Map<string, string>>;
 
 	/** Of the given spaces: whether their `in_process` answers are derived, and their epoch. */
 	getInProcessState(

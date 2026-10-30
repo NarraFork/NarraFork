@@ -5532,6 +5532,10 @@ export const outlineBlocks = sqliteTable(
 		index("idx_outline_blocks_open_tasks")
 			.on(table.spaceId)
 			.where(sql`json_extract("task_json", '$.status') IN ('todo', 'doing') AND "deleted" = 0`),
+		// Live tasks in progress, across spaces: the lease job finds those nobody holds.
+		index("idx_outline_blocks_doing_tasks")
+			.on(table.id)
+			.where(sql`json_extract("task_json", '$.status') = 'doing' AND "deleted" = 0`),
 	],
 );
 
@@ -5652,6 +5656,9 @@ export const outlineLinks = sqliteTable(
  * older epoch arrived after the task changed hands. `task_version_at_claim` is the task block's
  * `version_seq` right after the claiming commit.
  *
+ * A release moves the holder into `last_holder_*`: undoing the commit that ended a task gives it
+ * back to whoever was doing it.
+ *
  * The holder ids carry no foreign key, like the commit's actor ids: a claim of a session that is
  * gone simply runs out.
  */
@@ -5667,6 +5674,9 @@ export const outlineTaskClaims = sqliteTable(
 		taskVersionAtClaim: integer("task_version_at_claim").notNull(),
 		claimedAt: text("claimed_at").notNull(),
 		expiresAt: text("expires_at"),
+		/** Who held the claim when it was last released (null while held, or never released). */
+		lastHolderNarratorId: text("last_holder_narrator_id"),
+		lastHolderUserId: text("last_holder_user_id"),
 	},
 	(table) => [
 		// A session's claims: continuation candidates and lease renewal.
