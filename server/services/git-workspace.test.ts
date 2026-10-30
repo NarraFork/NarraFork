@@ -11,6 +11,7 @@ import {
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import type { GitBranches } from "@shared/git-branches";
 import type { GitCommitDetail, GitCommitPatch } from "@shared/git-commit-preview";
 import type { GitLineStats } from "@shared/git-line-stats";
 import type { GitWorkspace } from "@shared/git-workspace";
@@ -833,6 +834,9 @@ describe("authenticated Git management", () => {
 			"stash",
 			"reset",
 			"ai-commit-message",
+			"checkout",
+			"push",
+			"fetch",
 		])
 			expect(
 				(await request(suffix, { workspaceKey: ws.workspaceKey, all: true }, narratorId, reader))
@@ -958,6 +962,80 @@ describe("authenticated Git management", () => {
 		expect((await summary())?.workspace.state).toBe("access_denied");
 		expect((await summary())?.branch).toBeNull();
 		expect(probes).toBe(2);
+	});
+});
+
+describe("branch management routes", () => {
+	test("GET branches reports the current branch and its refs", async () => {
+		const ws = await workspace();
+		await git(repo, "branch", "side");
+		const response = await request(`branches?workspaceKey=${ws.workspaceKey}`);
+		expect(response.status).toBe(200);
+		const listing = (await response.json()) as GitBranches;
+		expect(listing.branch).toBe("main");
+		expect(listing.detached).toBe(false);
+		expect(listing.headSha).toBe(await git(repo, "rev-parse", "HEAD"));
+		expect(listing.local.map((entry) => entry.name)).toEqual(["main", "side"]);
+		expect(listing.remote).toEqual([]);
+		expect(listing.remotes).toEqual([]);
+		expect(listing.defaultRemote).toBeNull();
+	});
+
+	test("a stale or missing workspace key never reaches the branch operations", async () => {
+		// A write without a key cannot be attributed to a workspace at all.
+		expect((await request("checkout", { branch: "side" })).status).toBe(400);
+		expect((await request("push", {})).status).toBe(400);
+		expect((await request("fetch", {})).status).toBe(400);
+		// A key pinned to a different target is rejected before any Git runs.
+		expect((await request("checkout", { branch: "side", workspaceKey: "obsolete" })).status).toBe(
+			409,
+		);
+	});
+
+	test("checkout creates a branch and returns the refreshed status", async () => {
+		const ws = await workspace();
+		const response = await request("checkout", {
+			branch: "feature/http",
+			create: true,
+			workspaceKey: ws.workspaceKey,
+		});
+		expect(response.status).toBe(200);
+		const body = (await response.json()) as { status: { branch: string } };
+		expect(body.status.branch).toBe("feature/http");
+		expect(await git(repo, "symbolic-ref", "--short", "HEAD")).toBe("feature/http");
+		// Switching back to an existing local branch needs no `create`.
+		expect(
+			(
+				await request("checkout", {
+					branch: "main",
+					workspaceKey: ws.workspaceKey,
+				})
+			).status,
+		).toBe(200);
+		expect(await git(repo, "symbolic-ref", "--short", "HEAD")).toBe("main");
+		// A rejected name is a validation error, not a git failure.
+		expect(
+			(
+				await request("checkout", {
+					branch: "bad..name",
+					workspaceKey: ws.workspaceKey,
+				})
+			).status,
+		).toBe(400);
+	});
+
+	test("push and fetch without a configured remote fail before touching the network", async () => {
+		const ws = await workspace();
+		const push = await request("push", { workspaceKey: ws.workspaceKey });
+		expect(push.status).toBe(422);
+		expect(((await push.json()) as { code: string }).code).toBe("GIT_NO_REMOTE");
+		const fetchRemote = await request("fetch", { workspaceKey: ws.workspaceKey });
+		expect(fetchRemote.status).toBe(422);
+		expect(((await fetchRemote.json()) as { code: string }).code).toBe("GIT_NO_REMOTE");
+		// A remote name the repository does not have is refused, not passed to git.
+		expect(
+			(await request("fetch", { remote: "elsewhere", workspaceKey: ws.workspaceKey })).status,
+		).toBe(400);
 	});
 });
 

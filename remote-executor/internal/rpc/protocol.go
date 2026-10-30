@@ -66,6 +66,23 @@ const FeatureGitLineStatsV1 = "git.workspace.line-stats.v1"
 // for missing commits. Historical file names must be UTF-8.
 const FeatureGitCommitPreviewV1 = "git.workspace.commit-preview.v1"
 
+// FeatureGitBranchesV1 adds the read-only `branches` operation. It returns the raw
+// for-each-ref and worktree listings in outputs under the keys the server's parser
+// already knows, so a server that predates branch management simply never asks.
+// Older executors lack it and are refused per operation, not per workspace.
+const FeatureGitBranchesV1 = "git.workspace.branches.v1"
+
+// FeatureGitBranchSwitchV1 adds the `checkout` write operation: switch to a local
+// branch, create one from a start point, or check out a remote branch with
+// --track. It runs under the same repository write lock as the other mutations.
+const FeatureGitBranchSwitchV1 = "git.workspace.branch-switch.v1"
+
+// FeatureGitRemoteSyncV1 adds the `push` and `fetch` write operations. Both talk to
+// a configured remote, so an executor started with --disable-shell refuses them:
+// credential helpers and pre-push hooks are external programs. There is no force
+// variant — a non-fast-forward is reported to the user, never overridden.
+const FeatureGitRemoteSyncV1 = "git.workspace.remote-sync.v1"
+
 // ── Frame envelope ────────────────────────────────────────────────────────────
 
 // Frame is the common shape used to peek at a message's type before decoding
@@ -136,6 +153,9 @@ func (c Capabilities) MarshalJSON() ([]byte, error) {
 		FeatureGitWorkspaceStatusV1,
 		FeatureGitLineStatsV1,
 		FeatureGitCommitPreviewV1,
+		FeatureGitBranchesV1,
+		FeatureGitBranchSwitchV1,
+		FeatureGitRemoteSyncV1,
 		FeatureEditorRawReadV1,
 	} {
 		seen := false
