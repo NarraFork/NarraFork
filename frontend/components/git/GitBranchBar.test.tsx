@@ -183,11 +183,13 @@ const originals = {
 function stubApi() {
 	api.getGitStatus = async () => status();
 	api.getGitBranches = async () => listing([branch("main")]);
-	api.gitPushBranch = async (_target, body) => {
+	// The API signatures make the body optional (it has a default). Giving these
+	// stubs the same default narrows `body` back to the recorded type inside them.
+	api.gitPushBranch = async (_target, body = {}) => {
 		pushed.push(body);
 		return {};
 	};
-	api.gitFetchRemote = async (_target, body) => {
+	api.gitFetchRemote = async (_target, body = {}) => {
 		fetched.push(body);
 		return {};
 	};

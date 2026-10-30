@@ -98,20 +98,20 @@ describe("parseGitBranches", () => {
 		const partial = "half\0aaa111\0origin/half";
 		const truncated = parseGitBranches({
 			heads: `${complete}\n${partial}`,
-			branch: null,
-			headSha: null,
+			branch: "",
+			headSha: "",
 			truncated: true,
 		});
 		expect(truncated.local.map((entry) => entry.name)).toEqual(["kept"]);
 		expect(truncated.truncated).toBe(true);
 		// A cut inside the only record lists nothing rather than a guess.
-		const onlyPartial = parseGitBranches({ heads: partial, branch: null, truncated: true });
+		const onlyPartial = parseGitBranches({ heads: partial, branch: "", truncated: true });
 		expect(onlyPartial.local).toEqual([]);
 		// Without the truncation flag the short record still fails the field count.
 		const notTruncated = parseGitBranches({
 			heads: `${complete}\n${partial}`,
-			branch: null,
-			headSha: null,
+			branch: "",
+			headSha: "",
 		});
 		expect(notTruncated.local.map((entry) => entry.name)).toEqual(["kept"]);
 	});
