@@ -76,6 +76,7 @@ const ctx: OutlineContractContext = {
 				.from(outlineCommits)
 				.where(eq(outlineCommits.spaceId, spaceId))
 				.orderBy(outlineCommits.seq),
+			claims: await sqliteOutlineStore.getTaskClaims(blocks.map((b) => b.id)),
 		};
 	},
 	async resetInProcess(spaceId) {

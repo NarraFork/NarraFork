@@ -19,7 +19,7 @@
  * Every read is indexed and bounded; nothing here scans a space.
  */
 import { logger } from "@server/lib/logger";
-import { compareOrderKeys, isAlias, parseAddress } from "@shared/outline";
+import { compareOrderKeys, isAlias, parseAddress, serializeBody } from "@shared/outline";
 import { readDisplayNames } from "./access-reads";
 import { OutlineLeaseNotExpiredError } from "./errors";
 import { isOutlineEnabled } from "./feature";
@@ -95,7 +95,7 @@ export interface OutlineLeaseExpiryResult {
 	reopened: number;
 	/** Expired leases found renewed (or their task changed) by the time they were written. */
 	skipped: number;
-	/** Spaces whose commit failed for another reason (logged; tried again next run). */
+	/** Tasks that could not be reopened (logged once; left alone for a while, then tried again). */
 	failed: number;
 }
 
@@ -111,11 +111,64 @@ async function holderNames(narratorIds: readonly string[]): Promise<Map<string, 
 }
 
 /**
+ * The block written under a reopened task: why it is open again. Built as a body, so a session
+ * title that holds outline syntax (`[[…]]`, emphasis, …) is written as plain text.
+ */
+export function outlineLeaseExpiredNote(narratorId: string, title: string | null): string {
+	return serializeBody({
+		type: "paragraph",
+		content: [
+			{ type: "text", text: OUTLINE_TEXT.leaseExpired.lead(title), marks: [] },
+			{ type: "text", text: narratorId, marks: [{ type: "code" }] },
+			{ type: "text", text: OUTLINE_TEXT.leaseExpired.tail, marks: [] },
+		],
+	});
+}
+
+/**
+ * Tasks the expiry job could not reopen, by task id: left alone until `until`, with the delay
+ * doubling each time (in memory; a restart tries them again). Bounded: the oldest entry goes
+ * when it is full.
+ */
+const expiryBackoff = new Map<string, { until: number; delayMs: number }>();
+const EXPIRY_BACKOFF = { firstMs: 10 * 60_000, maxMs: 6 * 60 * 60_000, entries: 1000 } as const;
+
+function backOff(taskId: string, nowMs: number, error: unknown): void {
+	const previous = expiryBackoff.get(taskId);
+	const delayMs = previous
+		? Math.min(EXPIRY_BACKOFF.maxMs, previous.delayMs * 2)
+		: EXPIRY_BACKOFF.firstMs;
+	expiryBackoff.delete(taskId);
+	if (expiryBackoff.size >= EXPIRY_BACKOFF.entries) {
+		const oldest = expiryBackoff.keys().next().value;
+		if (oldest !== undefined) expiryBackoff.delete(oldest);
+	}
+	expiryBackoff.set(taskId, { until: nowMs + delayMs, delayMs });
+	// Said once per task, not every run.
+	if (!previous)
+		logger.warn("Outline lease expiry: a task could not be reopened; trying again later", {
+			taskBlockId: taskId,
+			retryInMs: delayMs,
+			error: String(error),
+		});
+}
+
+/** Test hook: forget the tasks the expiry job is leaving alone. */
+export function resetOutlineLeaseExpiryBackoffForTests(): void {
+	expiryBackoff.clear();
+}
+
+/**
  * Reopen tasks whose session's lease ran out (the background job, also callable directly): at
  * most `limit` expired claims, oldest first, one system commit per space and batch. Each task
  * goes back to to-do, keeps everything under it, and gets a last child recording that the
- * previous executor's lease expired; its claim is released. A claim renewed between the read
- * and the commit is left alone (the commit is written again without it).
+ * previous executor's lease expired; its claim is released. `now` decides what has expired; the
+ * commit is dated when it is written.
+ *
+ * A claim renewed between the read and the commit is left alone (counted in `skipped`). A batch
+ * that fails for another reason is written task by task, so one bad task does not hold up the
+ * others; a task that cannot take the note is reopened without it, and one that cannot be
+ * reopened at all is left alone for a while (counted in `failed`, logged once).
  */
 export async function expireOutlineTaskLeases(
 	options: { store?: OutlineStore; now?: Date; limit?: number } = {},
@@ -123,15 +176,80 @@ export async function expireOutlineTaskLeases(
 	const store = options.store ?? outlineStore;
 	const nowDate = options.now ?? new Date();
 	const now = nowDate.toISOString();
-	const expired = await store.listExpiredTaskClaims(
+	const nowMs = nowDate.getTime();
+	const limit = options.limit ?? OUTLINE_TASK_LIMITS.expiryBatch;
+	const resting = (id: string) => (expiryBackoff.get(id)?.until ?? 0) > nowMs;
+	// Tasks being left alone are read past, not in place of, the ones that are due.
+	const listed = await store.listExpiredTaskClaims(
 		now,
-		options.limit ?? OUTLINE_TASK_LIMITS.expiryBatch,
+		limit + Math.min(expiryBackoff.size, limit),
 	);
+	const expired = listed.filter((e) => !resting(e.claim.taskBlockId)).slice(0, limit);
 	const result: OutlineLeaseExpiryResult = { reopened: 0, skipped: 0, failed: 0 };
 	if (expired.length === 0) return result;
 	const names = await holderNames([
 		...new Set(expired.map((e) => e.claim.holderNarratorId as string)),
 	]);
+
+	const reopen = async (
+		spaceId: string,
+		claims: readonly OutlineTaskClaimRow[],
+		withNote: boolean,
+	): Promise<void> => {
+		const ops: OutlineOp[] = claims.flatMap((claim): OutlineOp[] => {
+			const holder = claim.holderNarratorId as string;
+			const setTodo: OutlineOp = {
+				op: "setTask",
+				block: { id: claim.taskBlockId },
+				task: { status: "todo" },
+			};
+			if (!withNote) return [setTodo];
+			return [
+				setTodo,
+				{
+					op: "insert",
+					parent: { id: claim.taskBlockId },
+					position: { last: true },
+					content: outlineLeaseExpiredNote(holder, names.get(holder) ?? null),
+				},
+			];
+		});
+		await writeOutline(
+			{
+				spaceId,
+				ops,
+				actor: { kind: "system", id: OUTLINE_LEASE_ACTOR },
+				responsibleUserId: null,
+				summary: OUTLINE_TEXT.leaseExpiredSummary(claims.length),
+			},
+			{ store, leaseExpiry: { blockIds: claims.map((c) => c.taskBlockId), now } },
+		);
+	};
+	/** Reopen `claims`, leaving out those found renewed; true when done, false on another error. */
+	const attempt = async (
+		spaceId: string,
+		claims: OutlineTaskClaimRow[],
+		withNote: boolean,
+	): Promise<{ done: boolean; error?: unknown }> => {
+		let pending = claims;
+		while (pending.length > 0) {
+			try {
+				await reopen(spaceId, pending, withNote);
+				result.reopened += pending.length;
+				for (const claim of pending) expiryBackoff.delete(claim.taskBlockId);
+				return { done: true };
+			} catch (error) {
+				if (!(error instanceof OutlineLeaseNotExpiredError)) return { done: false, error };
+				const renewed = new Set(error.blockIds);
+				const left = pending.filter((c) => !renewed.has(c.taskBlockId));
+				result.skipped += pending.length - left.length;
+				// Nothing named that was pending: do not loop on it.
+				if (left.length === pending.length) return { done: false, error };
+				pending = left;
+			}
+		}
+		return { done: true };
+	};
 
 	const bySpace = new Map<string, OutlineTaskClaimRow[]>();
 	for (const { claim, spaceId } of expired) {
@@ -141,53 +259,14 @@ export async function expireOutlineTaskLeases(
 	}
 	for (const [spaceId, claims] of bySpace) {
 		for (const batch of chunked(claims, OUTLINE_TASK_LIMITS.expiryPerCommit)) {
-			let pending = batch;
-			// Once more without the claims found renewed; a second refusal skips the batch.
-			for (let attempt = 0; attempt < 2 && pending.length > 0; attempt++) {
-				const ops: OutlineOp[] = pending.flatMap((claim): OutlineOp[] => {
-					const holder = claim.holderNarratorId as string;
-					return [
-						{ op: "setTask", block: { id: claim.taskBlockId }, task: { status: "todo" } },
-						{
-							op: "insert",
-							parent: { id: claim.taskBlockId },
-							position: { last: true },
-							content: OUTLINE_TEXT.leaseExpired(holder, names.get(holder) ?? null),
-						},
-					];
-				});
-				try {
-					await writeOutline(
-						{
-							spaceId,
-							ops,
-							actor: { kind: "system", id: OUTLINE_LEASE_ACTOR },
-							responsibleUserId: null,
-							summary: OUTLINE_TEXT.leaseExpiredSummary(pending.length),
-						},
-						{
-							store,
-							now: () => nowDate,
-							leaseExpiry: { blockIds: pending.map((c) => c.taskBlockId) },
-						},
-					);
-					result.reopened += pending.length;
-					pending = [];
-				} catch (error) {
-					if (error instanceof OutlineLeaseNotExpiredError) {
-						const renewed = new Set(error.blockIds);
-						result.skipped += renewed.size;
-						pending = pending.filter((c) => !renewed.has(c.taskBlockId));
-						continue;
-					}
-					result.failed++;
-					logger.warn("Outline lease expiry failed for a space", {
-						spaceId,
-						tasks: pending.length,
-						error: String(error),
-					});
-					pending = [];
-				}
+			if ((await attempt(spaceId, batch, true)).done) continue;
+			// Something in the batch keeps the commit from being written: one task at a time.
+			for (const claim of batch) {
+				if ((await attempt(spaceId, [claim], true)).done) continue;
+				const bare = await attempt(spaceId, [claim], false);
+				if (bare.done) continue;
+				result.failed++;
+				backOff(claim.taskBlockId, nowMs, bare.error);
 			}
 		}
 	}

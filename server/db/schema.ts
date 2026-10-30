@@ -5454,6 +5454,13 @@ export const outlineSpaces = sqliteTable(
 		 * readers compute the answer from the tree instead of reading the column.
 		 */
 		inProcessReady: integer("in_process_ready", { mode: "boolean" }).notNull().default(false),
+		/**
+		 * Grows whenever the in-process answers of the space change outside an ordinary commit
+		 * (a rebuild writing rows or marking the space derived, a commit marking it not derived).
+		 * A commit is planned against it as against `next_seq`, so a plan that read answers the
+		 * rebuild has since rewritten is refused as stale and planned again.
+		 */
+		inProcessEpoch: integer("in_process_epoch").notNull().default(0),
 	},
 	(table) => [
 		uniqueIndex("uq_outline_spaces_key").on(table.key),

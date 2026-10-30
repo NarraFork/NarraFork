@@ -2011,8 +2011,10 @@ async function performGracefulShutdown(
 			async () => {
 				const tasks = await import("./services/outline/tasks");
 				const inProcess = await import("./services/outline/in-process");
-				inProcess.stopOutlineInProcessRebuild();
-				await tasks.stopOutlineTaskLeaseJob();
+				await Promise.all([
+					inProcess.stopOutlineInProcessRebuild(),
+					tasks.stopOutlineTaskLeaseJob(),
+				]);
 			},
 			5_000,
 		);

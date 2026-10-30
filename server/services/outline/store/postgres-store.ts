@@ -57,6 +57,7 @@ import {
 	chunked,
 	claimsAsExpected,
 	expectedClaimIds,
+	OUTLINE_RENEW_LIMIT,
 	type OutlineBlockMeta,
 	type OutlineBlockRow,
 	OutlineClaimsMovedError,
@@ -322,10 +323,23 @@ async function applyCommitSection(
 		}
 		if (!claimsAsExpected(plan, found)) return "claims";
 	}
+	// The counter and the in-process epoch are claimed together; a commit that cannot keep its
+	// in-process answers marks the space for the rebuild in the same statement.
 	const claimed = await tx
 		.update(outlineSpaces)
-		.set({ nextSeq: sql`${outlineSpaces.nextSeq} + 1` })
-		.where(and(eq(outlineSpaces.id, plan.spaceId), eq(outlineSpaces.nextSeq, seq)))
+		.set({
+			nextSeq: sql`${outlineSpaces.nextSeq} + 1`,
+			...(plan.inProcessStale
+				? { inProcessReady: false, inProcessEpoch: sql`${outlineSpaces.inProcessEpoch} + 1` }
+				: {}),
+		})
+		.where(
+			and(
+				eq(outlineSpaces.id, plan.spaceId),
+				eq(outlineSpaces.nextSeq, seq),
+				eq(outlineSpaces.inProcessEpoch, plan.inProcessEpoch),
+			),
+		)
 		.returning({ nextSeq: outlineSpaces.nextSeq });
 	if (claimed.length === 0) return "stale";
 
@@ -401,12 +415,6 @@ async function applyCommitSection(
 				.where(inArray(outlineBlocks.id, ids));
 		}
 	}
-	if (plan.inProcessStale) {
-		await tx
-			.update(outlineSpaces)
-			.set({ inProcessReady: false })
-			.where(eq(outlineSpaces.id, plan.spaceId));
-	}
 
 	const released = [...plan.claims.release, ...plan.claims.expire.map((e) => e.expect.taskBlockId)];
 	for (const ids of chunked(released)) {
@@ -448,12 +456,13 @@ async function setInProcessSection(
 		.where(eq(outlineSpaces.id, spaceId))
 		.for("share");
 	if (rows[0]?.nextSeq !== expectNextSeq) return false;
+	let changed = 0;
 	for (const [value, list] of [
 		[true, values.inProcess],
 		[false, values.notInProcess],
 	] as const) {
 		for (const ids of chunked(list)) {
-			await tx
+			const updated = await tx
 				.update(outlineBlocks)
 				.set({ inProcess: value })
 				.where(
@@ -462,16 +471,59 @@ async function setInProcessSection(
 						inArray(outlineBlocks.id, ids),
 						ne(outlineBlocks.inProcess, value),
 					),
-				);
+				)
+				.returning({ id: outlineBlocks.id });
+			changed += updated.length;
 		}
 	}
-	if (values.ready) {
+	if (changed > 0 || values.ready) {
 		await tx
 			.update(outlineSpaces)
-			.set({ inProcessReady: true })
+			.set({
+				inProcessEpoch: sql`${outlineSpaces.inProcessEpoch} + 1`,
+				...(values.ready ? { inProcessReady: true } : {}),
+			})
 			.where(eq(outlineSpaces.id, spaceId));
 	}
 	return true;
+}
+
+/**
+ * Renew a session's claims: their rows are locked in task id order first, the order a commit
+ * locks the claim rows it checks, so the two never wait on each other in a cycle.
+ */
+async function renewSection(
+	tx: PgTransaction,
+	narratorId: string,
+	expiresAt: string,
+): Promise<number> {
+	const rows = await tx
+		.select({ id: outlineTaskClaims.taskBlockId })
+		.from(outlineTaskClaims)
+		.where(
+			and(
+				eq(outlineTaskClaims.holderNarratorId, narratorId),
+				isNotNull(outlineTaskClaims.holderNarratorId),
+			),
+		)
+		.orderBy(sql`${outlineTaskClaims.taskBlockId} COLLATE "C"`)
+		.limit(OUTLINE_RENEW_LIMIT)
+		.for("update");
+	if (rows.length === 0) return 0;
+	const updated = await tx
+		.update(outlineTaskClaims)
+		.set({ expiresAt })
+		.where(
+			and(
+				inArray(
+					outlineTaskClaims.taskBlockId,
+					rows.map((r) => r.id),
+				),
+				eq(outlineTaskClaims.holderNarratorId, narratorId),
+			),
+		)
+		.returning({ id: outlineTaskClaims.taskBlockId });
+	return updated.length;
 }
 
 /** Get-or-create, as one section: the insert does nothing when another writer won the race. */
@@ -869,40 +921,42 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 		},
 
 		async renewTaskClaims(narratorId, expiresAt) {
-			const rows = await withPgRetry(
-				() =>
-					db
-						.update(outlineTaskClaims)
-						.set({ expiresAt })
-						.where(
-							and(
-								eq(outlineTaskClaims.holderNarratorId, narratorId),
-								isNotNull(outlineTaskClaims.holderNarratorId),
-							),
-						)
-						.returning({ id: outlineTaskClaims.taskBlockId }),
+			return await withPgRetry(
+				() => db.transaction((tx) => renewSection(tx, narratorId, expiresAt)),
 				{ label: "outline.renewTaskClaims" },
 			);
-			return rows.length;
 		},
 
-		async getInProcessReady(spaceIds) {
-			const out = new Map<string, boolean>();
+		async getInProcessState(spaceIds) {
+			const out = new Map<string, { ready: boolean; epoch: number }>();
 			for (const ids of chunked(spaceIds)) {
 				const rows = await db
-					.select({ id: outlineSpaces.id, ready: outlineSpaces.inProcessReady })
+					.select({
+						id: outlineSpaces.id,
+						ready: outlineSpaces.inProcessReady,
+						epoch: outlineSpaces.inProcessEpoch,
+					})
 					.from(outlineSpaces)
 					.where(inArray(outlineSpaces.id, ids));
-				for (const row of rows) out.set(row.id, row.ready);
+				for (const row of rows) out.set(row.id, { ready: row.ready, epoch: row.epoch });
 			}
 			return out;
 		},
 
-		async hasChangesSince(spaceId, afterSeq, flags) {
+		async hasChangesSince(spaceId, afterSeq, flags, maxCommits) {
+			const beyond = await db
+				.select({ seq: outlineCommits.seq })
+				.from(outlineCommits)
+				.where(
+					and(eq(outlineCommits.spaceId, spaceId), gt(outlineCommits.seq, afterSeq + maxCommits)),
+				)
+				.limit(1);
+			if (beyond.length > 0) return true;
 			const rows = await db.execute(sql`
 				SELECT 1 AS hit FROM outline_commits c
 				JOIN outline_block_versions v ON v.commit_id = c.id
 				WHERE c.space_id = ${spaceId} AND c.seq > CAST(${afterSeq} AS integer)
+					AND c.seq <= CAST(${afterSeq + maxCommits} AS integer)
 					AND (v.change_flags & CAST(${flags} AS integer)) <> 0
 				LIMIT 1
 			`);

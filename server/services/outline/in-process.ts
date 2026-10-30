@@ -24,12 +24,15 @@
  *     tasks (a commit may have moved blocks between a page already visited and one not yet
  *     visited). Spaces left pending (still changing, a page over the page limit, an error) are
  *     tried again later, backing off from {@link OUTLINE_IN_PROCESS_TIMING.retryMinMs}.
- * Between pages it yields to the event loop; nothing here runs on a request path.
+ * Between pages it yields to the event loop; nothing here runs on a request path. A shutdown
+ * ({@link stopOutlineInProcessRebuild}) stops it after the page it is on.
  *
  * READING WHILE A SPACE IS NOT DERIVED
  * ------------------------------------
  * The column of such a space may be wrong either way, so it is not used: {@link readInProcess}
  * computes the answer from the tree (the blocks' ancestors, read level by level), which is exact.
+ * It uses the column only when the space was derived both before and after the blocks were read,
+ * at the same `in_process_epoch` (no rebuild wrote in between).
  * Nothing process is then shown or injected as a fact, and no fact is hidden, whatever the
  * column holds. A reader that filters on the column in SQL does so only for the spaces
  * {@link outlineSpacesWithInProcess} returns, and asks {@link readInProcess} about the others.
@@ -58,6 +61,8 @@ export const OUTLINE_IN_PROCESS_REBUILD = {
 	passes: 3,
 	/** Blocks one {@link readInProcess} answers. */
 	maxRead: OUTLINE_LIMITS.maxPageBlocks,
+	/** Commits a "did structure change since" check looks at; more counts as a change. */
+	maxCommitsChecked: 50,
 } as const;
 
 /** Timings of the rebuild scheduler. Mutable only so tests can change them. */
@@ -123,6 +128,26 @@ export function inProcessOfPage(
 	return { inProcess, notInProcess };
 }
 
+/** Whether a commit since `seq` (the counter then) changed what in-process answers follow from. */
+function structureChangedSince(
+	store: OutlineStore,
+	spaceId: string,
+	seq: number,
+): Promise<boolean> {
+	return store.hasChangesSince(
+		spaceId,
+		seq - 1,
+		STRUCTURAL_CHANGES,
+		OUTLINE_IN_PROCESS_REBUILD.maxCommitsChecked,
+	);
+}
+
+/** Spaces already reported as holding a page too large to rebuild (reported once a process). */
+const reportedTooLarge = new Set<string>();
+
+/** Shutdown asked the rebuild to stop: no new run, no new page. */
+let stopping = false;
+
 /**
  * Write a page's answers against the counter they were computed at. A commit that landed since
  * and changed only text leaves them right: they are written again against the new counter.
@@ -138,8 +163,7 @@ async function writeGuarded(
 	for (let attempt = 0; attempt < OUTLINE_IN_PROCESS_REBUILD.pageAttempts * 2; attempt++) {
 		if (await store.setInProcess(spaceId, at, values)) return true;
 		const now = (await store.getSpace(spaceId))?.nextSeq;
-		if (now === undefined || (await store.hasChangesSince(spaceId, seq - 1, STRUCTURAL_CHANGES)))
-			return false;
+		if (now === undefined || (await structureChangedSince(store, spaceId, seq))) return false;
 		at = now;
 	}
 	return false;
@@ -194,13 +218,18 @@ async function rebuildSpace(
 				limit: OUTLINE_IN_PROCESS_REBUILD.pageBatch,
 			});
 			for (const page of pages) {
+				if (stopping) return false;
 				const outcome = await rebuildPage(store, space, page.id);
 				counts.pages++;
 				if (outcome === "too-large") {
-					logger.warn("Outline in-process rebuild: page too large, space left", {
-						spaceId: space.id,
-						pageId: page.id,
-					});
+					// Said once: the space is tried again later, and readers compute from the tree.
+					if (!reportedTooLarge.has(space.id)) {
+						reportedTooLarge.add(space.id);
+						logger.warn("Outline in-process rebuild: page too large, space left", {
+							spaceId: space.id,
+							pageId: page.id,
+						});
+					}
 					return false;
 				}
 				await yieldToEventLoop();
@@ -213,9 +242,7 @@ async function rebuildSpace(
 		// marked the space again). The mark itself is guarded by the counter the check saw.
 		const endSeq = (await store.getSpace(space.id))?.nextSeq;
 		if (endSeq === undefined) return false;
-		const quiet =
-			endSeq === startSeq ||
-			!(await store.hasChangesSince(space.id, startSeq - 1, STRUCTURAL_CHANGES));
+		const quiet = endSeq === startSeq || !(await structureChangedSince(store, space.id, startSeq));
 		if (
 			quiet &&
 			(await store.setInProcess(space.id, endSeq, { inProcess: [], notInProcess: [], ready: true }))
@@ -238,6 +265,7 @@ export async function rebuildOutlineInProcess(
 			limit: OUTLINE_IN_PROCESS_REBUILD.spaceBatch,
 		});
 		for (const space of spaces) {
+			if (stopping) return result;
 			try {
 				if (await rebuildSpace(store, space, result)) result.spaces++;
 				else result.left++;
@@ -250,7 +278,7 @@ export async function rebuildOutlineInProcess(
 			}
 		}
 		const last = spaces.at(-1);
-		if (!last || spaces.length < OUTLINE_IN_PROCESS_REBUILD.spaceBatch) break;
+		if (!last || spaces.length < OUTLINE_IN_PROCESS_REBUILD.spaceBatch || stopping) break;
 		after = last.id;
 	}
 	return result;
@@ -272,6 +300,8 @@ interface Scheduler {
 
 const schedulers = new WeakMap<OutlineStore, Scheduler>();
 const timers = new Set<ReturnType<typeof setTimeout>>();
+/** Runs in progress, of every store: what a stop waits for. */
+const runs = new Set<Promise<OutlineInProcessRebuildResult | null>>();
 
 function schedulerOf(store: OutlineStore): Scheduler {
 	let s = schedulers.get(store);
@@ -291,6 +321,7 @@ function clearTimer(s: Scheduler): void {
 
 /** Fire a run in `delayMs`, unless one is due sooner already. */
 function runIn(store: OutlineStore, s: Scheduler, delayMs: number): void {
+	if (stopping) return;
 	const at = Date.now() + delayMs;
 	if (s.timer && s.timerAt <= at) return;
 	clearTimer(s);
@@ -314,11 +345,12 @@ export function runOutlineInProcessRebuild(
 ): Promise<OutlineInProcessRebuildResult | null> {
 	const s = schedulerOf(store);
 	clearTimer(s);
+	if (stopping) return s.running ?? Promise.resolve(null);
 	if (s.running) {
 		s.again = true;
 		return s.running;
 	}
-	s.running = (async () => {
+	const run = (async () => {
 		let result: OutlineInProcessRebuildResult | null = null;
 		do {
 			s.again = false;
@@ -330,8 +362,8 @@ export function runOutlineInProcessRebuild(
 				result = null;
 				logger.warn("Outline in-process rebuild failed", { error: String(error) });
 			}
-		} while (s.again);
-		if (result === null || result.left > 0) {
+		} while (s.again && !stopping);
+		if (!stopping && (result === null || result.left > 0)) {
 			s.retryMs = Math.min(
 				OUTLINE_IN_PROCESS_TIMING.retryMaxMs,
 				s.retryMs > 0 ? s.retryMs * 2 : OUTLINE_IN_PROCESS_TIMING.retryMinMs,
@@ -341,8 +373,11 @@ export function runOutlineInProcessRebuild(
 		return result;
 	})().finally(() => {
 		s.running = null;
+		runs.delete(run);
 	});
-	return s.running;
+	s.running = run;
+	runs.add(run);
+	return run;
 }
 
 /**
@@ -350,6 +385,7 @@ export function runOutlineInProcessRebuild(
  * {@link OUTLINE_IN_PROCESS_TIMING.requestDelayMs}, or once more after the run in progress.
  */
 export function requestOutlineInProcessRebuild(store: OutlineStore = outlineStore): void {
+	if (stopping) return;
 	const s = schedulerOf(store);
 	if (s.running) {
 		s.again = true;
@@ -363,10 +399,20 @@ export function scheduleOutlineInProcessRebuild(): Promise<OutlineInProcessRebui
 	return runOutlineInProcessRebuild(outlineStore);
 }
 
-/** Cancel scheduled runs (shutdown); a run in progress finishes its current page and ends. */
-export function stopOutlineInProcessRebuild(): void {
+/**
+ * Stop for shutdown: no run starts or is scheduled from now on, scheduled ones are cancelled,
+ * and a run in progress ends after the page it is on. Resolves when the runs have ended.
+ */
+export async function stopOutlineInProcessRebuild(): Promise<void> {
+	stopping = true;
 	for (const timer of timers) clearTimeout(timer);
 	timers.clear();
+	await Promise.allSettled([...runs]);
+}
+
+/** Test hook: allow runs again after a stop. */
+export function resumeOutlineInProcessRebuildForTests(): void {
+	stopping = false;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -379,8 +425,9 @@ export async function outlineSpacesWithInProcess(
 	options: { store?: OutlineStore } = {},
 ): Promise<Set<string>> {
 	const store = options.store ?? outlineStore;
-	const ready = spaceIds.length > 0 ? await store.getInProcessReady(spaceIds) : new Map();
-	return new Set([...ready].filter(([, v]) => v).map(([id]) => id));
+	if (spaceIds.length === 0) return new Set();
+	const state = await store.getInProcessState(spaceIds);
+	return new Set([...state].filter(([, v]) => v.ready).map(([id]) => id));
 }
 
 /**
@@ -400,12 +447,16 @@ export async function readInProcess(
 	const ids = [...new Set(blockIds)].slice(0, OUTLINE_IN_PROCESS_REBUILD.maxRead);
 	const space = await store.getSpace(spaceId);
 	if (!space || ids.length === 0) return out;
-	const metas = await store.getBlockMetas(spaceId, { ids });
 	if (space.kind === "session") {
-		for (const meta of metas) out.set(meta.id, true);
+		for (const meta of await store.getBlockMetas(spaceId, { ids })) out.set(meta.id, true);
 		return out;
 	}
-	if ((await store.getInProcessReady([spaceId])).get(spaceId) === true) {
+	// The column is used only if the space was derived before the blocks were read and still is,
+	// with no rebuild writing in between (the epoch did not move): otherwise from the tree.
+	const before = (await store.getInProcessState([spaceId])).get(spaceId);
+	const metas = await store.getBlockMetas(spaceId, { ids });
+	const after = (await store.getInProcessState([spaceId])).get(spaceId);
+	if (before?.ready && after?.ready && before.epoch === after.epoch) {
 		for (const meta of metas) out.set(meta.id, meta.inProcess);
 		return out;
 	}

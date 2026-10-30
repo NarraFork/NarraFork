@@ -10,6 +10,7 @@ CREATE TABLE "outline_task_claims" (
 --> statement-breakpoint
 ALTER TABLE "outline_blocks" ADD COLUMN "in_process" boolean DEFAULT false NOT NULL;--> statement-breakpoint
 ALTER TABLE "outline_spaces" ADD COLUMN "in_process_ready" boolean DEFAULT false NOT NULL;--> statement-breakpoint
+ALTER TABLE "outline_spaces" ADD COLUMN "in_process_epoch" integer DEFAULT 0 NOT NULL;--> statement-breakpoint
 ALTER TABLE "outline_task_claims" ADD CONSTRAINT "outline_task_claims_task_block_id_outline_blocks_id_fk" FOREIGN KEY ("task_block_id") REFERENCES "public"."outline_blocks"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
 CREATE INDEX "idx_outline_task_claims_holder" ON "outline_task_claims" USING btree ("holder_narrator_id") WHERE "holder_narrator_id" IS NOT NULL;--> statement-breakpoint
 CREATE INDEX "idx_outline_task_claims_expiry" ON "outline_task_claims" USING btree ("expires_at") WHERE "expires_at" IS NOT NULL;--> statement-breakpoint

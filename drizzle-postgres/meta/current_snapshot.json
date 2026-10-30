@@ -1,5 +1,5 @@
 {
-  "id": "ac1876da-16ca-4589-b449-ee48ba4ebea4",
+  "id": "f7c0d895-4821-42ac-8b28-8b8bc0b8fa60",
   "prevId": "b47d28e4-7316-4e38-9be4-f1a8e6511385",
   "version": "7",
   "dialect": "postgresql",
@@ -18065,6 +18065,13 @@
           "primaryKey": false,
           "notNull": true,
           "default": false
+        },
+        "in_process_epoch": {
+          "name": "in_process_epoch",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
         }
       },
       "indexes": {

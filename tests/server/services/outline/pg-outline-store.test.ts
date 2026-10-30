@@ -138,7 +138,8 @@ describe("PostgreSQL outline store", () => {
 								.where(eq(pgSchema.outlineCommits.spaceId, spaceId))
 								.orderBy(pgSchema.outlineCommits.seq)
 						).map((c) => c as SpaceDump["commits"][number]);
-						return { space, blocks, versions, links, commits };
+						const claims = await store.getTaskClaims(blocks.map((b) => b.id));
+						return { space, blocks, versions, links, commits, claims };
 					},
 					async resetInProcess(spaceId) {
 						await pgDb

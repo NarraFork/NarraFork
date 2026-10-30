@@ -20,6 +20,7 @@ import {
 import { OutlineConflictError, OutlineWriteError, type OutlineWriteErrorCode } from "../errors";
 import { contentLinks, dependsLinks, linkKey, tagLinks } from "../links";
 import { OUTLINE_CHANGE, OUTLINE_LIMITS, type OutlineTaskJson } from "../model";
+import { revertCommit } from "../revert";
 import {
 	type OutlineBlockRow,
 	type OutlineCommitPlan,
@@ -28,6 +29,7 @@ import {
 	type OutlineSpaceRow,
 	OutlineStaleWriteError,
 	type OutlineStore,
+	type OutlineTaskClaimRow,
 	type OutlineVersionRow,
 } from "../store/port";
 import {
@@ -45,6 +47,8 @@ export interface SpaceDump {
 	versions: OutlineVersionRow[];
 	links: OutlineLinkRow[];
 	commits: OutlineCommitRow[];
+	/** Claim rows of the space's blocks. */
+	claims: OutlineTaskClaimRow[];
 }
 
 export interface OutlineContractContext {
@@ -214,6 +218,7 @@ export function checkSpaceInvariants(dump: SpaceDump): void {
 	}
 
 	checkInProcess(dump);
+	checkClaims(dump);
 
 	// Open links: exactly what the current state produces (tags are only in the links table,
 	// so they are taken from the open tag rows themselves).
@@ -232,6 +237,35 @@ export function checkSpaceInvariants(dump: SpaceDump): void {
 	// Link rows: open ranges never start after they end.
 	for (const link of links) {
 		if (link.toSeq !== null) expect(link.toSeq).toBeGreaterThan(link.fromSeq);
+	}
+}
+
+/**
+ * Claims follow the tasks: a claim with a holder is on a live task in progress, and every live
+ * task in progress has a holder (outside tests, tasks in progress written before claims existed
+ * have none; tests write none of those).
+ */
+export function checkClaims(dump: SpaceDump): void {
+	const byId = new Map(dump.blocks.map((b) => [b.id, b]));
+	const held = new Set<string>();
+	for (const claim of dump.claims) {
+		if (claim.holderNarratorId === null && claim.holderUserId === null) continue;
+		const block = byId.get(claim.taskBlockId);
+		expect({
+			claim: claim.taskBlockId,
+			deleted: block?.deleted,
+			status: block?.taskJson?.status,
+		}).toEqual({ claim: claim.taskBlockId, deleted: false, status: "doing" });
+		// One holder at a time: a session or a person.
+		expect(claim.holderNarratorId === null || claim.holderUserId === null).toBe(true);
+		held.add(claim.taskBlockId);
+	}
+	for (const block of dump.blocks) {
+		if (block.deleted || block.taskJson?.status !== "doing") continue;
+		expect({ inProgress: block.id, held: held.has(block.id) }).toEqual({
+			inProgress: block.id,
+			held: true,
+		});
 	}
 }
 
@@ -307,6 +341,17 @@ export async function randomizedHistory(
 	const pick = <T>(items: readonly T[]): T => items[Math.floor(rnd() * items.length)] as T;
 	const space = await personalSpace(ctx);
 	const model = new Map<string, ModelBlock>();
+	/** Blocks deleted by earlier transactions, as they were: what a `restore` brings back. */
+	const graveyard = new Map<
+		string,
+		{
+			sid: string;
+			content: string;
+			task: OutlineTaskJson | null;
+			alias: string | null;
+			tags: string[];
+		}
+	>();
 	const pages: string[] = [];
 	const snapshots = new Map<number, Map<string, SnapshotEntry>>();
 	const words = ["alpha", "beta", "gamma", "delta", "omega", "kappa", "sigma", "tau"];
@@ -385,6 +430,7 @@ export async function randomizedHistory(
 	for (let t = 0; t < ctx.randomTransactions; t++) {
 		const before = structuredClone([...model.entries()]);
 		const beforePages = [...pages];
+		const beforeGraveyard = structuredClone([...graveyard.entries()]);
 		const ops: OutlineOp[] = [];
 		/** New blocks of this transaction: the insert itself, or the n-th block its content split off. */
 		const created: Array<{ op: number; handle: string; split?: number }> = [];
@@ -506,7 +552,45 @@ export async function randomizedHistory(
 				});
 				const from = childrenOf(target.parent);
 				from.splice(from.indexOf(target.handle), 1);
-				for (const handle of subtree(target.handle)) model.delete(handle);
+				for (const handle of subtree(target.handle)) {
+					const gone = model.get(handle) as ModelBlock;
+					// Restorable later: blocks that existed before this transaction.
+					if (!handle.startsWith("tmp:") && !gone.pending && gone.sid)
+						graveyard.set(handle, {
+							sid: gone.sid,
+							content: gone.content,
+							task: gone.task,
+							alias: gone.alias,
+							tags: gone.tags,
+						});
+					model.delete(handle);
+				}
+			} else if (roll < 0.92 && graveyard.size > 0) {
+				// Brought back as it was (its descendants stay deleted), under a live block or as a
+				// page; its alias only if no live block holds it now.
+				const [id, gone] = pick([...graveyard.entries()]);
+				const parents = live();
+				const parent = parents.length === 0 || rnd() < 0.3 ? null : pick(parents).handle;
+				ops.push({
+					op: "restore",
+					block: { id },
+					parent: parent === null ? null : ref(parent),
+					position: { last: true },
+				});
+				const alias =
+					gone.alias !== null && !live().some((b) => b.alias === gone.alias) ? gone.alias : null;
+				model.set(id, {
+					handle: id,
+					parent,
+					children: [],
+					content: gone.content,
+					task: gone.task,
+					alias,
+					tags: gone.tags,
+					sid: gone.sid,
+				});
+				childrenOf(parent).push(id);
+				graveyard.delete(id);
 			} else {
 				const target = pick(blocks);
 				const task = rnd() < 0.25 ? null : randomTask();
@@ -529,6 +613,8 @@ export async function randomizedHistory(
 				model.clear();
 				for (const [handle, block] of before) model.set(handle, block);
 				pages.splice(0, pages.length, ...beforePages);
+				graveyard.clear();
+				for (const [handle, gone] of beforeGraveyard) graveyard.set(handle, gone);
 				continue;
 			}
 			throw new Error(
@@ -567,33 +653,57 @@ export async function randomizedHistory(
 			}
 		}
 
-		// The tables' live tree equals the model, and the derived in-process flags follow it.
-		const dump = await ctx.dump(space.id);
-		checkInProcess(dump);
-		const snapshot = new Map<string, SnapshotEntry>();
-		for (const block of model.values()) {
-			const siblings = childrenOf(block.parent);
-			snapshot.set(block.handle, {
-				parentId: block.parent,
-				pageId: pageOf(block.handle),
-				index: siblings.indexOf(block.handle),
-				content: block.content,
-				task: block.task,
-				alias: block.alias,
-				links: linkSet([
-					...contentLinks(block.content),
-					...dependsLinks(block.task),
-					...tagLinks(block.tags),
-				]),
-			});
-		}
-		const current = treeAt(dump, Number.MAX_SAFE_INTEGER);
-		if (!Bun.deepEquals(current, snapshot)) {
-			throw new Error(
-				`seed ${seed}, transaction ${t}: the tables differ from the model after\n${JSON.stringify(ops, null, 1)}\nresults ${JSON.stringify(result.results)}\nmodel ${JSON.stringify([...snapshot])}\ntables ${JSON.stringify([...current])}`,
-			);
-		}
+		// The tables' live tree equals the model, and the derived in-process flags and the claims
+		// follow it.
+		const compare = async (what: string): Promise<Map<string, SnapshotEntry>> => {
+			const dump = await ctx.dump(space.id);
+			checkInProcess(dump);
+			checkClaims(dump);
+			const snapshot = new Map<string, SnapshotEntry>();
+			for (const block of model.values()) {
+				const siblings = childrenOf(block.parent);
+				snapshot.set(block.handle, {
+					parentId: block.parent,
+					pageId: pageOf(block.handle),
+					index: siblings.indexOf(block.handle),
+					content: block.content,
+					task: block.task,
+					alias: block.alias,
+					links: linkSet([
+						...contentLinks(block.content),
+						...dependsLinks(block.task),
+						...tagLinks(block.tags),
+					]),
+				});
+			}
+			const current = treeAt(dump, Number.MAX_SAFE_INTEGER);
+			if (!Bun.deepEquals(current, snapshot)) {
+				throw new Error(
+					`seed ${seed}, transaction ${t}: the tables differ from the model ${what}\n${JSON.stringify(ops, null, 1)}\nresults ${JSON.stringify(result.results)}\nmodel ${JSON.stringify([...snapshot])}\ntables ${JSON.stringify([...current])}`,
+				);
+			}
+			return snapshot;
+		};
+		const snapshot = await compare("after");
 		if (result.commit) snapshots.set(result.commit.seq, snapshot);
+
+		// Now and then the commit is reverted right away: everything is as before it.
+		if (result.commit && rnd() < 0.12) {
+			const reverted = await revertCommit(
+				{ commitId: result.commit.id, actor: ACTOR, responsibleUserId: null },
+				{ store: ctx.store },
+			);
+			if (reverted.skipped.length > 0 || !reverted.commit)
+				throw new Error(
+					`seed ${seed}, transaction ${t}: reverting the last commit left ${JSON.stringify(reverted.skipped)}`,
+				);
+			model.clear();
+			for (const [handle, block] of before) model.set(handle, block);
+			pages.splice(0, pages.length, ...beforePages);
+			graveyard.clear();
+			for (const [handle, gone] of beforeGraveyard) graveyard.set(handle, gone);
+			snapshots.set(reverted.commit.seq, await compare("after reverting it"));
+		}
 	}
 
 	// History: every seq's tree rebuilt from version rows equals the model at that seq.
@@ -1601,7 +1711,8 @@ export const OUTLINE_STORE_CONTRACT: ContractCase[] = [
 				insertLinks: [],
 				inProcess: [],
 				inProcessStale: false,
-				claims: { put: [], release: [], expire: [] },
+				inProcessEpoch: 0,
+				claims: { put: [], release: [], expire: [], verify: [] },
 			};
 			await expect(ctx.store.applyCommit(stale)).rejects.toBeInstanceOf(OutlineStaleWriteError);
 			expect(await ctx.store.listCommits(space.id, { limit: 10 })).toHaveLength(1);

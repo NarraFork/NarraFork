@@ -3454,6 +3454,7 @@ export const outlineSpaces = pgTable(
 		nextSeq: integer("next_seq").notNull().default(1),
 		createdAt: text("created_at").notNull(),
 		inProcessReady: boolean("in_process_ready").notNull().default(false),
+		inProcessEpoch: integer("in_process_epoch").notNull().default(0),
 	},
 	(table) => [
 		uniqueIndex("uq_outline_spaces_key").on(table.key),
@@ -4102,7 +4103,7 @@ export const notifications = pgTable(
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
   "tableCount": 134,
-  "columnCount": 1754,
+  "columnCount": 1755,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -24055,6 +24056,17 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false,
           "defaultValue": "false",
           "defaultExpression": "false"
+        },
+        {
+          "property": "inProcessEpoch",
+          "name": "in_process_epoch",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "0",
+          "defaultExpression": "0"
         }
       ],
       "indexes": [

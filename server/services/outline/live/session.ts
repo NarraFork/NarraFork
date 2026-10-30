@@ -58,6 +58,7 @@ import {
 	LIVE_STATUS_OF_TASK,
 	type LiveActor,
 	type LiveBatchHead,
+	type LiveClaimedWire,
 	type LiveCloseCode,
 	type LiveCommitWire,
 	type LiveJoinedHead,
@@ -66,13 +67,20 @@ import {
 	type LivePeerWire,
 	type LivePresenceDown,
 	type LiveRejectCode,
+	type LiveRejectHead,
 	type LiveSelWire,
 	type LiveTaskChar,
 	OUTLINE_LIVE_LIMITS,
 } from "@shared/outline-live-protocol";
 import * as Y from "yjs";
+import { readDisplayNames } from "../access-reads";
 import { OutlineEditTextError } from "../edit-text-runner";
-import { OutlineBusyError, OutlineConflictError, OutlineWriteError } from "../errors";
+import {
+	OutlineBusyError,
+	OutlineConflictError,
+	OutlineTaskClaimedError,
+	OutlineWriteError,
+} from "../errors";
 import { OUTLINE_LIMITS, type OutlineTaskJson } from "../model";
 import { outlineStore } from "../store";
 import type { OutlineVersionRow } from "../store/port";
@@ -996,13 +1004,14 @@ export class LivePage {
 	// Text updates
 	// ─────────────────────────────────────────────────────────────────────────
 
-	private reject(p: Participant, n: number, code: LiveRejectCode): void {
+	private reject(p: Participant, n: number, code: LiveRejectCode, claimed?: LiveClaimedWire): void {
 		this.stats.txRejected++;
 		p.blocked = true;
 		// Everything up to the refused frame is acknowledged first, in order.
 		this.flushBroadcast();
+		const head: LiveRejectHead = claimed ? { code, claimed } : { code };
 		this.deliver(p, "control", () =>
-			encodeLiveFrame({ kind: LIVE_FRAME.reject, handle: p.handle, n, head: { code } }),
+			encodeLiveFrame({ kind: LIVE_FRAME.reject, handle: p.handle, n, head }),
 		);
 	}
 
@@ -1546,7 +1555,11 @@ export class LivePage {
 		const mark = this.pendingRows.length;
 		let held: PendingRow[] = [];
 		const intents = new Map<string, string>();
-		const refuse = (code: LiveRejectCode, committed: readonly OutlineWriteResult[] = []) => {
+		const refuse = (
+			code: LiveRejectCode,
+			committed: readonly OutlineWriteResult[] = [],
+			claimed?: LiveClaimedWire,
+		) => {
 			const before = this.pendingRows.length;
 			undo.undo();
 			undo.destroy();
@@ -1554,7 +1567,7 @@ export class LivePage {
 			this.pendingRows.splice(before);
 			held = [];
 			this.cancelIntents(intents.keys());
-			this.reject(p, n, code);
+			this.reject(p, n, code, claimed);
 			return committed;
 		};
 		// While the transaction's change is held back, no snapshot of the document (a
@@ -1610,9 +1623,13 @@ export class LivePage {
 					);
 				} catch (error) {
 					const cause = error instanceof LiveChunkError ? error.cause : error;
+					// A task someone else is doing: the refusal says who, for the editor to show.
+					const claimed =
+						cause instanceof OutlineTaskClaimedError ? await claimedWire(cause) : undefined;
 					const committed = refuse(
 						isConflict(cause) ? "conflict" : "failed",
 						error instanceof LiveChunkError ? error.committed : [],
+						claimed,
 					);
 					// Part of it was written (a large paste over several transactions): the session
 					// takes what the page now holds, as it would a write from outside.
@@ -2638,6 +2655,22 @@ function socketBuffered(socket: LiveSocket): number {
 	} catch {
 		return 0;
 	}
+}
+
+/** Who is doing the task a refused change touched, as the reject frame carries it. */
+async function claimedWire(error: OutlineTaskClaimedError): Promise<LiveClaimedWire> {
+	const holder = error.holder;
+	const id = holder.kind === "agent" ? holder.narratorId : holder.userId;
+	let name: string | null = null;
+	try {
+		const names = await readDisplayNames(
+			holder.kind === "agent" ? { narratorIds: [id] } : { userIds: [id] },
+		);
+		name = (holder.kind === "agent" ? names.narrators.get(id) : names.users.get(id)) ?? null;
+	} catch {
+		// The id alone still says who.
+	}
+	return { address: error.address, holder: { kind: holder.kind, id, name } };
 }
 
 /**

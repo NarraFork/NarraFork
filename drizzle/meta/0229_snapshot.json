@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "69b3cb0c-7b98-45b9-9880-4838b8d08a1a",
+  "id": "04804a6f-a3ab-4272-b7f5-03556eda9e07",
   "prevId": "e2d2045b-1196-467c-9ac0-dc34403d1f01",
   "tables": {
     "acl_events": {
@@ -14957,6 +14957,14 @@
           "notNull": true,
           "autoincrement": false,
           "default": false
+        },
+        "in_process_epoch": {
+          "name": "in_process_epoch",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
         }
       },
       "indexes": {

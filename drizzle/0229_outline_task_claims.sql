@@ -21,6 +21,8 @@ CREATE INDEX `idx_outline_blocks_open_tasks` ON `outline_blocks` (`space_id`) WH
 --> statement-breakpoint
 ALTER TABLE `outline_spaces` ADD `in_process_ready` integer DEFAULT false NOT NULL;
 --> statement-breakpoint
+ALTER TABLE `outline_spaces` ADD `in_process_epoch` integer DEFAULT 0 NOT NULL;
+--> statement-breakpoint
 CREATE INDEX `idx_outline_spaces_in_process_pending` ON `outline_spaces` (`id`) WHERE "in_process_ready" = 0;
 --> statement-breakpoint
 PRAGMA foreign_keys=ON;

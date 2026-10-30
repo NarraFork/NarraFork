@@ -54,6 +54,11 @@ export interface OutlineSpaceRow {
 	ownerUserId: string | null;
 	nextSeq: number;
 	createdAt: string;
+	/**
+	 * Generation of the space's in-process answers (`outline_spaces.in_process_epoch`): moves when
+	 * the background rebuild rewrites them. A commit is planned against it as against `nextSeq`.
+	 */
+	inProcessEpoch: number;
 }
 
 export interface OutlineBlockRow {
@@ -209,12 +214,18 @@ export interface OutlineClaimWrite {
 
 /** What a commit does to `outline_task_claims`; see {@link OutlineCommitPlan}. */
 export interface OutlineClaimPlan {
-	/** Claims taken, taken over or renewed. */
+	/** Claims taken or taken over. */
 	put: OutlineClaimWrite[];
 	/** Tasks that left in progress (or were deleted): released whatever they hold now. */
 	release: string[];
 	/** Lease expiries: released only while the claim is still exactly the row read (`expect`). */
 	expire: Array<{ expect: OutlineTaskClaimRow }>;
+	/**
+	 * Claim rows a decision of the plan rests on without writing them in `put` or `expire` (a
+	 * session ending a task nobody else was holding): the commit is written only while each is
+	 * still exactly as read (null: no row).
+	 */
+	verify: Array<{ taskBlockId: string; expect: OutlineTaskClaimRow | null }>;
 }
 
 /**
@@ -233,13 +244,19 @@ export interface OutlineClaimPlan {
  *      (`in_process_ready` false) for the background rebuild;
  *   8. write `claims`.
  *
- * Before step 1 the section checks that every claim row `claims` expects is still as read; when
- * one is not, it writes nothing and rejects with {@link OutlineClaimsMovedError}.
+ * Step 1 claims `next_seq` and `in_process_epoch` together. Before it the section checks that
+ * every claim row `claims` expects (`put`, `expire`, `verify`) is still as read; when one is
+ * not, it writes nothing and rejects with {@link OutlineClaimsMovedError}.
  */
 export interface OutlineCommitPlan {
 	spaceId: string;
 	/** The space's `next_seq` the plan was computed against; becomes the commit's seq. */
 	seq: number;
+	/**
+	 * The space's `in_process_epoch` the plan was computed against: claimed together with `seq`,
+	 * so a plan that read in-process answers the rebuild has since rewritten is stale.
+	 */
+	inProcessEpoch: number;
 	commit: OutlineCommitRow;
 	/** Existing blocks that get a new version: exactly the non-inserted blocks in `versions`. */
 	closeVersionIds: string[];
@@ -311,6 +328,7 @@ export function expectedClaimIds(plan: OutlineCommitPlan): string[] {
 	const ids = [
 		...plan.claims.put.map((w) => w.row.taskBlockId),
 		...plan.claims.expire.map((e) => e.expect.taskBlockId),
+		...plan.claims.verify.map((v) => v.taskBlockId),
 	];
 	return [...new Set(ids)].sort();
 }
@@ -325,6 +343,9 @@ export function claimsAsExpected(
 	}
 	for (const expiry of plan.claims.expire) {
 		if (!sameClaimRow(found.get(expiry.expect.taskBlockId) ?? null, expiry.expect)) return false;
+	}
+	for (const check of plan.claims.verify) {
+		if (!sameClaimRow(found.get(check.taskBlockId) ?? null, check.expect)) return false;
 	}
 	return true;
 }
@@ -416,17 +437,28 @@ export interface OutlineStore extends WritePortIdentity, OutlineReadPort {
 		now: string,
 		limit: number,
 	): Promise<Array<{ claim: OutlineTaskClaimRow; spaceId: string }>>;
-	/** Move the lease of every claim a session holds to `expiresAt`; returns how many. */
+	/**
+	 * Move the lease of the claims a session holds (at most {@link OUTLINE_RENEW_LIMIT}) to
+	 * `expiresAt`; returns how many. Rows are locked in task id order, as a commit locks them.
+	 */
 	renewTaskClaims(narratorId: string, expiresAt: string): Promise<number>;
 
-	/** Of the given spaces, which have their `in_process` answers derived (`in_process_ready`). */
-	getInProcessReady(spaceIds: readonly string[]): Promise<Map<string, boolean>>;
+	/** Of the given spaces: whether their `in_process` answers are derived, and their epoch. */
+	getInProcessState(
+		spaceIds: readonly string[],
+	): Promise<Map<string, { ready: boolean; epoch: number }>>;
 	/**
 	 * Whether a commit of the space after `afterSeq` changed anything an in-process answer
 	 * depends on (a version with a change flag in `flags`: creation, move, deletion, restore,
-	 * task, page). Text-only commits do not count. One indexed query, stops at the first match.
+	 * task, page). Text-only commits do not count. Looks at no more than `maxCommits` commits:
+	 * more than that counts as a change. Indexed, stops at the first match.
 	 */
-	hasChangesSince(spaceId: string, afterSeq: number, flags: number): Promise<boolean>;
+	hasChangesSince(
+		spaceId: string,
+		afterSeq: number,
+		flags: number,
+		maxCommits: number,
+	): Promise<boolean>;
 
 	// ── in-process rebuild (`services/outline/in-process.ts`) ──────────────────────────
 
@@ -441,8 +473,9 @@ export interface OutlineStore extends WritePortIdentity, OutlineReadPort {
 	/**
 	 * Set `in_process` of live blocks of a space (only rows that differ are written), atomically
 	 * and only while the space is still at `expectNextSeq` (no commit landed since the blocks were
-	 * read). `ready` also marks the space as derived. Returns false, having written nothing, when
-	 * the space moved.
+	 * read). `ready` also marks the space as derived. When it writes a row or the mark, the
+	 * space's `in_process_epoch` grows by one. Returns false, having written nothing, when the
+	 * space moved.
 	 */
 	setInProcess(
 		spaceId: string,
@@ -490,6 +523,9 @@ export interface OutlineStore extends WritePortIdentity, OutlineReadPort {
 	 */
 	putViewState(row: OutlineViewStateRow, keepPerUser: number): Promise<void>;
 }
+
+/** Claims one renewal moves at most. */
+export const OUTLINE_RENEW_LIMIT = 1000;
 
 /** Ids per `IN (…)` list, well under every engine's bound-parameter limit. */
 export const OUTLINE_SQL_CHUNK = 500;

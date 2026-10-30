@@ -585,9 +585,25 @@ describe("task claims", () => {
 		struct(a, [{ t: "k", id: busy, task: "/" }]);
 		await waitFor(() => a.stats.rejects === 1, 3000, "refused");
 		await settle();
+		// The refusal says who is doing it (an old client reads only the code: `conflict`).
+		expect(a.lastReject).toEqual({
+			code: "conflict",
+			claimed: {
+				address: `${space.key}/${(await outlineStore.getBlock(busy))?.sid}`,
+				holder: { kind: "agent", id: session, name: null },
+			},
+		});
 		expect((await outlineStore.getTaskClaims([busy]))[0]).toMatchObject({
 			holderNarratorId: session,
 			epoch: 1,
+		});
+		// A person may end it, though: ticked done, the session's claim is released.
+		struct(a, [{ t: "k", id: busy, task: "x" }]);
+		await settle(60);
+		expect((await outlineStore.getBlock(busy))?.taskJson?.status).toBe("done");
+		expect((await outlineStore.getTaskClaims([busy]))[0]).toMatchObject({
+			holderNarratorId: null,
+			holderUserId: null,
 		});
 		struct(a, [{ t: "k", id: free, task: "/" }]);
 		await settle(60);

@@ -394,6 +394,43 @@ describe("tool Git status refresh", () => {
 	});
 });
 
+describe("outline task leases", () => {
+	test("a run keeps its session's leases alive from its start through its tool boundaries, and stops at its end", async () => {
+		const tasks = await import("../outline/tasks");
+		const { outlineLeaseKeepersOf } = await import("../outline/lease-keeper");
+		const renew = spyOn(tasks, "renewOutlineTaskLeases").mockResolvedValue(0);
+		const enabled = settings.outline.enabled;
+		settings.outline.enabled = true;
+		let during = -1;
+		const h = fixture(profiles[0], [
+			async (options) => {
+				during = outlineLeaseKeepersOf(h.session.narratorId);
+				// A tool result is a boundary: the keeper is touched (renewing at most every two
+				// minutes, so not again right after the start).
+				await options.hooks?.onToolResult?.({
+					type: "tool_result",
+					toolUseId: "read-1",
+					toolName: "Read",
+					output: "",
+					isError: false,
+				} as never);
+				return { ...finished };
+			},
+		]);
+		try {
+			await h.run();
+		} finally {
+			settings.outline.enabled = enabled;
+		}
+		expect(during).toBe(1);
+		expect(outlineLeaseKeepersOf(h.session.narratorId)).toBe(0);
+		expect(renew).toHaveBeenCalled();
+		expect(renew.mock.calls.every(([narratorId]) => narratorId === h.session.narratorId)).toBe(
+			true,
+		);
+	});
+});
+
 describe("subagent signed source projection", () => {
 	function seed() {
 		// cleanDb deletes fixture data, including the installation marker, but not shipped triggers.

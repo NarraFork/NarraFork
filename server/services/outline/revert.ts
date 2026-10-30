@@ -539,7 +539,9 @@ async function revertAttempts(
 							adjustment.alias,
 							holders.get(adjustment.heldBy) ?? adjustment.heldBy,
 						)
-					: OUTLINE_TEXT.orderKeyMoved(adjustment.wanted),
+					: adjustment.kind === "order-key-moved"
+						? OUTLINE_TEXT.orderKeyMoved(adjustment.wanted)
+						: OUTLINE_TEXT.taskNotStarted,
 		}));
 		return {
 			...base,

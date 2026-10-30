@@ -53,6 +53,7 @@ import {
 	chunked,
 	claimsAsExpected,
 	expectedClaimIds,
+	OUTLINE_RENEW_LIMIT,
 	type OutlineBlockMeta,
 	type OutlineBlockRow,
 	OutlineClaimsMovedError,
@@ -247,10 +248,23 @@ function applyCommitSection(tx: Tx, plan: OutlineCommitPlan): "applied" | "stale
 		}
 		if (!claimsAsExpected(plan, found)) return "claims";
 	}
+	// The counter and the in-process epoch are claimed together; a commit that cannot keep its
+	// in-process answers marks the space for the rebuild in the same statement.
 	const claimed = tx
 		.update(outlineSpaces)
-		.set({ nextSeq: sql`${outlineSpaces.nextSeq} + 1` })
-		.where(and(eq(outlineSpaces.id, plan.spaceId), eq(outlineSpaces.nextSeq, seq)))
+		.set({
+			nextSeq: sql`${outlineSpaces.nextSeq} + 1`,
+			...(plan.inProcessStale
+				? { inProcessReady: false, inProcessEpoch: sql`${outlineSpaces.inProcessEpoch} + 1` }
+				: {}),
+		})
+		.where(
+			and(
+				eq(outlineSpaces.id, plan.spaceId),
+				eq(outlineSpaces.nextSeq, seq),
+				eq(outlineSpaces.inProcessEpoch, plan.inProcessEpoch),
+			),
+		)
 		.returning({ nextSeq: outlineSpaces.nextSeq })
 		.get();
 	if (!claimed) return "stale";
@@ -326,12 +340,6 @@ function applyCommitSection(tx: Tx, plan: OutlineCommitPlan): "applied" | "stale
 				.where(inArray(outlineBlocks.id, ids))
 				.run();
 		}
-	}
-	if (plan.inProcessStale) {
-		tx.update(outlineSpaces)
-			.set({ inProcessReady: false })
-			.where(eq(outlineSpaces.id, plan.spaceId))
-			.run();
 	}
 
 	const released = [...plan.claims.release, ...plan.claims.expire.map((e) => e.expect.taskBlockId)];
@@ -808,9 +816,18 @@ export const sqliteOutlineStore: OutlineStore = {
 					.update(outlineTaskClaims)
 					.set({ expiresAt })
 					.where(
-						and(
-							eq(outlineTaskClaims.holderNarratorId, narratorId),
-							isNotNull(outlineTaskClaims.holderNarratorId),
+						inArray(
+							outlineTaskClaims.taskBlockId,
+							db
+								.select({ id: outlineTaskClaims.taskBlockId })
+								.from(outlineTaskClaims)
+								.where(
+									and(
+										eq(outlineTaskClaims.holderNarratorId, narratorId),
+										isNotNull(outlineTaskClaims.holderNarratorId),
+									),
+								)
+								.limit(OUTLINE_RENEW_LIMIT),
 						),
 					)
 					.returning({ id: outlineTaskClaims.taskBlockId })
@@ -819,24 +836,38 @@ export const sqliteOutlineStore: OutlineStore = {
 		);
 	},
 
-	async getInProcessReady(spaceIds) {
-		const out = new Map<string, boolean>();
+	async getInProcessState(spaceIds) {
+		const out = new Map<string, { ready: boolean; epoch: number }>();
 		for (const ids of chunked(spaceIds)) {
 			for (const row of db
-				.select({ id: outlineSpaces.id, ready: outlineSpaces.inProcessReady })
+				.select({
+					id: outlineSpaces.id,
+					ready: outlineSpaces.inProcessReady,
+					epoch: outlineSpaces.inProcessEpoch,
+				})
 				.from(outlineSpaces)
 				.where(inArray(outlineSpaces.id, ids))
 				.all())
-				out.set(row.id, row.ready);
+				out.set(row.id, { ready: row.ready, epoch: row.epoch });
 		}
 		return out;
 	},
 
-	async hasChangesSince(spaceId, afterSeq, flags) {
+	async hasChangesSince(spaceId, afterSeq, flags, maxCommits) {
+		const beyond = db
+			.select({ seq: outlineCommits.seq })
+			.from(outlineCommits)
+			.where(
+				and(eq(outlineCommits.spaceId, spaceId), gt(outlineCommits.seq, afterSeq + maxCommits)),
+			)
+			.limit(1)
+			.get();
+		if (beyond) return true;
 		const row = db.get<{ hit: number }>(sql`
 			SELECT 1 AS hit FROM outline_commits c
 			JOIN outline_block_versions v ON v.commit_id = c.id
-			WHERE c.space_id = ${spaceId} AND c.seq > ${afterSeq} AND (v.change_flags & ${flags}) != 0
+			WHERE c.space_id = ${spaceId} AND c.seq > ${afterSeq} AND c.seq <= ${afterSeq + maxCommits}
+				AND (v.change_flags & ${flags}) != 0
 			LIMIT 1
 		`);
 		return row !== undefined && row !== null;
@@ -864,12 +895,14 @@ export const sqliteOutlineStore: OutlineStore = {
 						.where(eq(outlineSpaces.id, spaceId))
 						.get();
 					if (!space || space.nextSeq !== expectNextSeq) return false;
+					let changed = 0;
 					for (const [value, list] of [
 						[true, values.inProcess],
 						[false, values.notInProcess],
 					] as const) {
 						for (const ids of chunked(list)) {
-							tx.update(outlineBlocks)
+							changed += tx
+								.update(outlineBlocks)
 								.set({ inProcess: value })
 								.where(
 									and(
@@ -878,12 +911,16 @@ export const sqliteOutlineStore: OutlineStore = {
 										ne(outlineBlocks.inProcess, value),
 									),
 								)
-								.run();
+								.returning({ id: outlineBlocks.id })
+								.all().length;
 						}
 					}
-					if (values.ready) {
+					if (changed > 0 || values.ready) {
 						tx.update(outlineSpaces)
-							.set({ inProcessReady: true })
+							.set({
+								inProcessEpoch: sql`${outlineSpaces.inProcessEpoch} + 1`,
+								...(values.ready ? { inProcessReady: true } : {}),
+							})
 							.where(eq(outlineSpaces.id, spaceId))
 							.run();
 					}

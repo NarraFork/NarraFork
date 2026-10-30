@@ -35,6 +35,9 @@ export const OUTLINE_TEXT = {
 	/** A restored or moved-back block whose old place among its siblings is taken. */
 	orderKeyMoved: (wanted: string) =>
 		`its old position (${wanted}) is taken; it was placed right after the block holding it`,
+	/** A write by no session or person left a task to do instead of in progress. */
+	taskNotStarted:
+		"it would be in progress with nobody doing it (a write by no session), so it was left to do",
 	/** Summary of a compensating commit. */
 	revertSummary: (seq: number, summary: string) => `revert #${seq}: ${summary}`,
 
@@ -42,8 +45,18 @@ export const OUTLINE_TEXT = {
 	 * The block the lease expiry job writes under a task it reopens (design §4.5: the progress
 	 * under the task stays, and this records why it is open again).
 	 */
-	leaseExpired: (narratorId: string, title: string | null) =>
-		`The previous executor's lease expired (session ${title ? `${quoted(title)}, ` : ""}\`${narratorId}\`); the task is open again.`,
+	leaseExpired: {
+		/** Text before the session id (which is written as code). */
+		lead: (title: string | null) =>
+			`The previous executor's lease expired (session ${title ? `"${title}" ` : ""}`,
+		tail: "); the task is open again.",
+	},
+	/** Summary of a commit that only hands tasks over (their lease had run out). */
+	claimTakenOver: (addresses: readonly string[]) =>
+		`took over ${addresses.join(", ")} (the previous lease had run out)`,
+	/** Added to the summary of a commit that ended tasks someone else was doing. */
+	endedClaims: (addresses: readonly string[]) =>
+		`ended work someone else was doing on ${addresses.join(", ")}`,
 	/** Summary of the lease expiry job's commit. */
 	leaseExpiredSummary: (n: number) =>
 		n === 1 ? "lease expired: 1 task reopened" : `lease expired: ${n} tasks reopened`,

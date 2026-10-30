@@ -90,6 +90,7 @@ function space(fields: Partial<OutlineSpaceRow> & Pick<OutlineSpaceRow, "kind">)
 		ownerUserId: null,
 		nextSeq: 1,
 		createdAt: NOW,
+		inProcessEpoch: 0,
 		...fields,
 	};
 }
