@@ -292,6 +292,9 @@ export const CATEGORY_COLOR: Record<ToolCategory, string> = {
 	browser: "teal",
 	knowledge: "grape",
 	outline: "teal",
+	// Mirrors getCategoryColor's terminal yellow. A missing key here made the header
+	// chip receive `undefined`, which Mantine's colour parser throws on.
+	schedule: "yellow",
 	workspace: "gray",
 	generic: "gray",
 };

@@ -209,6 +209,7 @@ export type ToolCategory =
 	| "browser"
 	| "knowledge"
 	| "outline"
+	| "schedule"
 	| "contextAsk"
 	| "workspace"
 	| "generic";
