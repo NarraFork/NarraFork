@@ -29,7 +29,9 @@ export type OutlineWriteErrorCode =
 	/** Another live block of the space already has the alias. */
 	| "OUTLINE_ALIAS_TAKEN"
 	/** A caller-chosen block id is already in use. */
-	| "OUTLINE_ID_TAKEN";
+	| "OUTLINE_ID_TAKEN"
+	/** The task is being done by someone else (a live claim); see `OutlineTaskClaimedError`. */
+	| "OUTLINE_TASK_CLAIMED";
 
 /** The transaction is invalid as written. `opIndex` is the offending operation, when one is. */
 export class OutlineWriteError extends ValidationError {
@@ -79,5 +81,45 @@ export class OutlineBusyError extends AppError {
 			"OUTLINE_SPACE_BUSY",
 		);
 		this.name = "OutlineBusyError";
+	}
+}
+
+/** Who holds a claim: a session (with its lease end) or a person. */
+export type OutlineClaimHolder =
+	| { kind: "agent"; narratorId: string; expiresAt: string | null }
+	| { kind: "human"; userId: string };
+
+/**
+ * Setting a task to in progress claims it, and someone else is doing it: a session whose lease
+ * is still running, or a person. The whole transaction is refused; `holder` says who.
+ */
+export class OutlineTaskClaimedError extends OutlineWriteError {
+	constructor(
+		readonly blockId: string,
+		readonly address: string,
+		readonly holder: OutlineClaimHolder,
+		opIndex: number | null,
+	) {
+		super(
+			`task ${address} is being done by ${
+				holder.kind === "agent"
+					? `session ${holder.narratorId}${holder.expiresAt ? ` (lease until ${holder.expiresAt})` : ""}`
+					: `user ${holder.userId}`
+			}`,
+			"OUTLINE_TASK_CLAIMED",
+			opIndex,
+		);
+		this.name = "OutlineTaskClaimedError";
+	}
+}
+
+/**
+ * A lease expiry found claims that are no longer expired (renewed since they were listed) or no
+ * longer in progress. Nothing was written; `blockIds` are the tasks to leave alone.
+ */
+export class OutlineLeaseNotExpiredError extends Error {
+	constructor(readonly blockIds: string[]) {
+		super(`outline task leases no longer expired: ${blockIds.join(", ")}`);
+		this.name = "OutlineLeaseNotExpiredError";
 	}
 }

@@ -368,6 +368,14 @@
 			"prevId": "30f5ec4d-b57c-40b3-a85d-a69332fe44bf",
 			"version": "7",
 			"snapshotDigest": "0df0c95a008f04c6ee8417d09a6ae3b6f45ad319cec11796dbfe9c8200fa6ef1"
+		},
+		{
+			"idx": 46,
+			"tag": "0046_outline_task_claims",
+			"id": "ac1876da-16ca-4589-b449-ee48ba4ebea4",
+			"prevId": "b47d28e4-7316-4e38-9be4-f1a8e6511385",
+			"version": "7",
+			"snapshotDigest": "429a58deb2a6b34fe5a65a1ffa6d774193bdf1f092a54258d08cdd43ff3a01a9"
 		}
 	]
 }

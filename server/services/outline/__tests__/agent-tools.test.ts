@@ -1158,6 +1158,68 @@ describe("OutlineEdit merges changes made after the read", () => {
 	});
 });
 
+describe("OutlineEdit and task claims", () => {
+	test("starting a task claims it; another session is told who is doing it", async () => {
+		const w = await world();
+		const a = ctx(w.session, w.alice);
+		const otherSession = await narrator(w.alice, w.projectId, { title: "second session" });
+		const b = ctx(otherSession, w.alice);
+		const [t] = await readBlocksOf(w, a, ["[ ] fix the login bug"]);
+		if (!t) throw new Error("no block");
+
+		const started = await call(outlineEditTool, { edits: [{ set: t.sid, checkbox: "/" }] }, a);
+		expect(started.isError).toBeUndefined();
+		const claim = async () => (await outlineStore.getTaskClaims([t.id]))[0];
+		expect(await claim()).toMatchObject({ holderNarratorId: w.session, epoch: 1 });
+
+		// Another session reads it and tries to start it: refused, with who is doing it.
+		await call(outlineReadTool, { address: `${w.space.key}/${t.sid}` }, b);
+		const commitsBefore = (await outlineStore.getSpace(w.space.id))?.nextSeq;
+		const refused = await call(
+			outlineEditTool,
+			{
+				edits: [
+					{ add: "/", markdown: "- would be written with it" },
+					{ set: t.sid, checkbox: "/" },
+				],
+			},
+			b,
+		);
+		expect(refused.isError).toBe(true);
+		expect(refused.output).toContain(`${w.space.key}/${t.sid} is already being done by`);
+		expect(refused.output).toContain('"outline tools"');
+		expect(refused.output).toContain(w.session);
+		expect((await outlineStore.getSpace(w.space.id))?.nextSeq).toBe(commitsBefore);
+
+		// Rewriting its text, checkbox as it is, is not starting it: written, the claim stays.
+		const reworded = await call(
+			outlineEditTool,
+			{ edits: [{ replace: t.sid, text: "[/] fix the login bug on mobile" }] },
+			b,
+		);
+		expect(reworded.isError).toBeUndefined();
+		expect((await stored(w.space)).get(t.sid)?.content).toBe("fix the login bug on mobile");
+		expect(await claim()).toMatchObject({ holderNarratorId: w.session, epoch: 1 });
+
+		// A task added in progress is the adder's.
+		const added = await call(
+			outlineEditTool,
+			{ edits: [{ add: "/", markdown: "- [/] another bug" }] },
+			b,
+		);
+		const sid = ids(added.output)[0] as string;
+		const id = (await stored(w.space)).get(sid)?.id as string;
+		expect((await outlineStore.getTaskClaims([id]))[0]).toMatchObject({
+			holderNarratorId: otherSession,
+		});
+		// Its manager is the session that wrote it.
+		expect((await stored(w.space)).get(sid)?.taskJson?.manager).toEqual({
+			kind: "agent",
+			id: otherSession,
+		});
+	});
+});
+
 describe("OutlineEdit of blocks the agent has not read", () => {
 	/** A page of blocks a person wrote; their sids and ids, the page first. */
 	async function personPage(w: World, texts: string[]) {

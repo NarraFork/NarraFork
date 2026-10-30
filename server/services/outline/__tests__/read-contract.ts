@@ -1044,6 +1044,7 @@ export const OUTLINE_READ_CONTRACT: ContractCase[] = [
 				status: "todo",
 				assignee: null,
 				depends: [{ target: "Topic", label: null }],
+				manager: { kind: "human", id: ACTOR.id },
 			});
 			const children = await ctx.store.listChildren(space.id, p, 10);
 			expect(children.map((c) => c.content)).toEqual(["squatter", "X", "Y"]);

@@ -58,6 +58,11 @@ export interface OutlineContractContext {
 	searchContent(needle: string): Promise<string[]>;
 	/** Transactions in the randomized history check. */
 	randomTransactions: number;
+	/**
+	 * Make a space look written before `in_process` existed: every block's flag false and the
+	 * space not marked derived (what the migration leaves behind).
+	 */
+	resetInProcess(spaceId: string): Promise<void>;
 }
 
 export interface ContractCase {
@@ -67,6 +72,14 @@ export interface ContractCase {
 
 const NOW = "2026-10-26T00:00:00.000Z";
 const ACTOR = { kind: "human" as const, id: "user-contract" };
+
+/** A task as the write path stores it when `ACTOR` makes a block a task: managed by them. */
+export function managedBy(
+	task: OutlineTaskJson,
+	actor: { kind: "human" | "agent" | "system"; id: string } = ACTOR,
+): OutlineTaskJson {
+	return { ...task, manager: { kind: actor.kind, id: actor.id } };
+}
 
 async function personalSpace(ctx: OutlineContractContext): Promise<OutlineSpaceRow> {
 	return ctx.store.ensureSpace({ kind: "personal", ownerUserId: await ctx.seedUser() }, NOW);
@@ -200,6 +213,8 @@ export function checkSpaceInvariants(dump: SpaceDump): void {
 		}
 	}
 
+	checkInProcess(dump);
+
 	// Open links: exactly what the current state produces (tags are only in the links table,
 	// so they are taken from the open tag rows themselves).
 	const openLinks = links.filter((l) => l.toSeq === null);
@@ -217,6 +232,24 @@ export function checkSpaceInvariants(dump: SpaceDump): void {
 	// Link rows: open ranges never start after they end.
 	for (const link of links) {
 		if (link.toSeq !== null) expect(link.toSeq).toBeGreaterThan(link.fromSeq);
+	}
+}
+
+/**
+ * `in_process` (a derived cache) of every live block: a task, under one, or anywhere in a
+ * session space.
+ */
+export function checkInProcess(dump: SpaceDump): void {
+	const byId = new Map(dump.blocks.map((b) => [b.id, b]));
+	for (const block of dump.blocks) {
+		if (block.deleted) continue;
+		const parent = block.parentId === null ? null : byId.get(block.parentId);
+		const want =
+			dump.space.kind === "session" || block.taskJson !== null || (parent?.inProcess ?? false);
+		expect({ block: block.id, inProcess: block.inProcess }).toEqual({
+			block: block.id,
+			inProcess: want,
+		});
 	}
 }
 
@@ -368,7 +401,7 @@ export async function randomizedHistory(
 						parent,
 						children: [],
 						content: serializeBody(node.body),
-						task: node.task ? { status: node.task, assignee: null } : null,
+						task: node.task ? managedBy({ status: node.task, assignee: null }) : null,
 						alias: null,
 						tags: [],
 						pending: true,
@@ -412,7 +445,15 @@ export async function randomizedHistory(
 					...(alias ? { alias } : {}),
 					...(tags.length ? { tags } : {}),
 				});
-				model.set(handle, { handle, parent, children: [], content, task, alias, tags });
+				model.set(handle, {
+					handle,
+					parent,
+					children: [],
+					content,
+					task: task && managedBy(task),
+					alias,
+					tags,
+				});
 				siblings.splice(place.index, 0, handle);
 				created.push({ op: k, handle });
 				addSplit(handle, split, k);
@@ -476,7 +517,7 @@ export async function randomizedHistory(
 					task: task && { ...task, depends: task.depends ?? null, due: null },
 					...(target.handle.startsWith("tmp:") ? {} : base()),
 				});
-				target.task = task;
+				target.task = task && managedBy(task);
 			}
 		}
 
@@ -526,8 +567,9 @@ export async function randomizedHistory(
 			}
 		}
 
-		// The tables' live tree equals the model.
+		// The tables' live tree equals the model, and the derived in-process flags follow it.
 		const dump = await ctx.dump(space.id);
+		checkInProcess(dump);
 		const snapshot = new Map<string, SnapshotEntry>();
 		for (const block of model.values()) {
 			const siblings = childrenOf(block.parent);
@@ -1461,6 +1503,8 @@ export const OUTLINE_STORE_CONTRACT: ContractCase[] = [
 					{ target: "Step two", label: "the second" },
 				],
 				due: "2026-11-01",
+				// The writer made it a task: they manage it.
+				manager: { kind: "human", id: ACTOR.id },
 			});
 			const open = async () =>
 				(await ctx.store.listOpenLinks([task.blockId], 100))
@@ -1555,6 +1599,8 @@ export const OUTLINE_STORE_CONTRACT: ContractCase[] = [
 				versions: [],
 				closeLinkIds: [],
 				insertLinks: [],
+				inProcess: [],
+				claims: { put: [], release: [], expire: [] },
 			};
 			await expect(ctx.store.applyCommit(stale)).rejects.toBeInstanceOf(OutlineStaleWriteError);
 			expect(await ctx.store.listCommits(space.id, { limit: 10 })).toHaveLength(1);

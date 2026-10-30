@@ -32,6 +32,29 @@
  *
  * A compensating commit (`revert.ts`) is written through the same planner, so it keeps the same
  * invariants; see `OutlineWriteOptions.compensating` for what differs.
+ *
+ * TASK CLAIMS
+ * -----------
+ * Setting a task to in progress claims it, in the same commit (design §2.2, §4.5): an insert of a
+ * task in progress, a `setTask` naming the status `doing`, or a split-off task in progress. The
+ * claimer is the writer: the session for an agent's write (or a system write made for a
+ * session, `narratorId`), the person for a person's write; a compensating commit and a system
+ * write for no session claim nothing.
+ *
+ *   - Nobody holds it (no row, released, or a session's lease ran out): the writer takes it, and
+ *     the claim generation (`epoch`) grows by one.
+ *   - The writer holds it already: nothing changes (a session's lapsed lease is renewed).
+ *   - A session whose lease is running, or a person, holds it: the whole transaction is refused
+ *     with `OutlineTaskClaimedError`, naming the holder.
+ *
+ * A task that leaves in progress in a commit (done, cancelled, back to to-do, no longer a task,
+ * deleted) has its claim released in that commit. Rewriting a task that stays in progress (its
+ * text, its place) does not claim it.
+ *
+ * IN PROCESS
+ * ----------
+ * `outline_blocks.in_process` (a task, under a task, or in a session space) is derived in the
+ * commit that changes it: see `planInProcess`. It is not part of a block's versions.
  */
 import { createHash } from "node:crypto";
 import { NotFoundError } from "@server/lib/errors";
@@ -56,6 +79,8 @@ import {
 import {
 	OutlineBusyError,
 	OutlineConflictError,
+	OutlineLeaseNotExpiredError,
+	OutlineTaskClaimedError,
 	type OutlineVersionConflict,
 	OutlineWriteError,
 } from "./errors";
@@ -72,25 +97,32 @@ import {
 } from "./links";
 import { withOutlineLiveBarrier } from "./live-barrier";
 import {
+	OUTLINE_ACTOR_KINDS,
 	OUTLINE_CHANGE,
 	OUTLINE_LIMITS,
 	type OutlineActorKind,
 	type OutlineCommitKind,
 	type OutlineLinkKind,
+	type OutlineTaskActorRef,
 	type OutlineTaskJson,
+	type OutlineTaskLockJson,
+	outlineLeaseEnd,
 } from "./model";
 import { outlineStore } from "./store";
 import {
 	type OutlineBlockMeta,
 	type OutlineBlockPatch,
 	type OutlineBlockRow,
+	type OutlineClaimPlan,
 	type OutlineCommitPlan,
 	type OutlineLinkRow,
 	type OutlineSpaceRow,
 	OutlineStaleWriteError,
 	type OutlineStore,
+	type OutlineTaskClaimRow,
 	WriteConflictError,
 } from "./store/port";
+import { canonicalTaskJson, sameTaskJson, sameTaskLock } from "./task-json";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Input
@@ -114,7 +146,34 @@ export type OutlinePosition =
 	| { last: true }
 	| { orderKey: string };
 
-export interface OutlineTaskInput {
+/**
+ * A lock as a writer gives it: who locks (the writer by default) and the agent that may confirm
+ * on the locker's behalf. The version is stamped by the write path (the commit's seq) whenever
+ * the lock is new or changes; a compensating commit restores the one it read from history.
+ */
+export interface OutlineTaskLockInput {
+	by?: OutlineTaskActorRef;
+	delegate?: string | null;
+	/** Honoured only in a compensating commit (`revert.ts`), which restores a lock as it was. */
+	versionSeq?: number;
+}
+
+/** The fields of a task besides its checkbox (P2): stored only, enforced elsewhere. */
+interface OutlineTaskExtraInput {
+	/**
+	 * Who created the task. Default: the writer, when the block becomes a task (an agent's
+	 * session, a person); an existing task keeps its manager.
+	 */
+	manager?: OutlineTaskActorRef | null;
+	/** Created by a person through `/goal` or the interface. */
+	humanCreated?: boolean | null;
+	/** Lock the task tree (`null` unlocks). */
+	lock?: OutlineTaskLockInput | null;
+	/** Put the task in the claimable pool. */
+	claimable?: boolean | null;
+}
+
+export interface OutlineTaskInput extends OutlineTaskExtraInput {
 	status: TaskStatus;
 	/** `agent:name` or `human:name`, without the `@`. */
 	assignee?: string | null;
@@ -124,7 +183,7 @@ export interface OutlineTaskInput {
 }
 
 /** Changes to a task; omitted fields keep their value, `null` clears. */
-export interface OutlineTaskPatch {
+export interface OutlineTaskPatch extends OutlineTaskExtraInput {
 	status?: TaskStatus;
 	assignee?: string | null;
 	depends?: LinkTarget[] | null;
@@ -277,6 +336,14 @@ export interface OutlineWriteOptions {
 	 * writer hashes it and takes it as is.
 	 */
 	canonical?: ReadonlyArray<OutlineCanonicalContent | null | undefined>;
+	/**
+	 * Internal to the lease expiry job (`tasks.ts`): this commit reopens these tasks because their
+	 * session's lease ran out. Each must still be in progress before the commit, back to to-do
+	 * after it, and held by a session whose lease ended at the commit's time; otherwise the write
+	 * rejects with `OutlineLeaseNotExpiredError`, writing nothing. The claims are released only if
+	 * they are still exactly as read (a renewal in between makes the write plan again).
+	 */
+	leaseExpiry?: { blockIds: readonly string[] };
 }
 
 /** Content normalized before `writeOutline` was called; see `OutlineWriteOptions.canonical`. */
@@ -446,7 +513,54 @@ function checkLinkTargets(links: unknown, what: string, opIndex: number): void {
 	}
 }
 
+const ACTOR_KINDS: ReadonlySet<string> = new Set(OUTLINE_ACTOR_KINDS);
+const MAX_ACTOR_ID = 128;
+
+function checkActorRef(ref: unknown, what: string, opIndex: number): void {
+	const r = ref as Partial<OutlineTaskActorRef> | null;
+	if (
+		!r ||
+		typeof r !== "object" ||
+		typeof r.kind !== "string" ||
+		!ACTOR_KINDS.has(r.kind) ||
+		typeof r.id !== "string" ||
+		r.id === "" ||
+		r.id.length > MAX_ACTOR_ID
+	) {
+		throw invalid(`${what} must be { kind: human | agent | system, id }`, opIndex);
+	}
+}
+
+function checkFlag(value: unknown, what: string, opIndex: number): void {
+	if (value !== undefined && value !== null && typeof value !== "boolean")
+		throw invalid(`task ${what} must be a boolean`, opIndex);
+}
+
 function checkTaskFields(task: OutlineTaskPatch, opIndex: number): void {
+	if (task.manager !== undefined && task.manager !== null)
+		checkActorRef(task.manager, "task manager", opIndex);
+	checkFlag(task.humanCreated, "humanCreated", opIndex);
+	checkFlag(task.claimable, "claimable", opIndex);
+	if (task.lock !== undefined && task.lock !== null) {
+		const lock = task.lock as Partial<OutlineTaskLockInput>;
+		if (typeof lock !== "object") throw invalid("task lock must be an object", opIndex);
+		if (lock.by !== undefined) checkActorRef(lock.by, "task lock.by", opIndex);
+		if (
+			lock.delegate !== undefined &&
+			lock.delegate !== null &&
+			(typeof lock.delegate !== "string" ||
+				lock.delegate === "" ||
+				lock.delegate.length > MAX_ACTOR_ID)
+		) {
+			throw invalid("task lock.delegate must be a narrator id", opIndex);
+		}
+		if (
+			lock.versionSeq !== undefined &&
+			(!Number.isSafeInteger(lock.versionSeq) || lock.versionSeq < 1)
+		) {
+			throw invalid("task lock.versionSeq must be a positive integer", opIndex);
+		}
+	}
 	if (task.status !== undefined && !TASK_STATUSES.has(task.status))
 		throw invalid(`unknown task status ${JSON.stringify(task.status)}`, opIndex);
 	if (
@@ -611,35 +725,7 @@ function prepareOps(
 	});
 }
 
-function canonicalTask(task: {
-	status: TaskStatus;
-	assignee?: string | null;
-	depends?: LinkTarget[] | null;
-	due?: string | null;
-}): OutlineTaskJson {
-	const out: OutlineTaskJson = { status: task.status, assignee: task.assignee ?? null };
-	if (task.depends?.length) {
-		const seen = new Set<string>();
-		out.depends = task.depends
-			.map((d) => ({ target: d.target.trim(), label: d.label ?? null }))
-			.filter((d) => {
-				const key = `${d.target}|${d.label ?? ""}`;
-				return !seen.has(key) && !!seen.add(key);
-			});
-	}
-	if (task.due) out.due = task.due;
-	return out;
-}
-
-function sameTask(a: OutlineTaskJson | null, b: OutlineTaskJson | null): boolean {
-	if (a === null || b === null) return a === b;
-	return (
-		a.status === b.status &&
-		a.assignee === b.assignee &&
-		(a.due ?? null) === (b.due ?? null) &&
-		JSON.stringify(a.depends ?? []) === JSON.stringify(b.depends ?? [])
-	);
-}
+const sameTask = sameTaskJson;
 
 function canonicalTags(tags: readonly string[]): string[] {
 	return [...new Set(tags.map((t) => t.trim()))];
@@ -684,6 +770,33 @@ interface WorkingBlock {
 	restored?: boolean;
 	/** Written by a merged `update` (`OUTLINE_CHANGE.MERGE`). */
 	merged?: boolean;
+	/** `in_process` after this transaction (the stored value until `planInProcess` runs). */
+	inProcess: boolean;
+}
+
+/** Who a commit's claims go to; see TASK CLAIMS in the header. */
+type OutlineClaimer =
+	| { narratorId: string; userId?: undefined }
+	| { userId: string; narratorId?: undefined };
+
+function claimerOf(input: OutlineWriteInput, compensating: boolean): OutlineClaimer | null {
+	if (compensating) return null;
+	if (input.actor.kind === "agent") return { narratorId: input.narratorId ?? input.actor.id };
+	if (input.actor.kind === "human") return { userId: input.actor.id };
+	return input.narratorId ? { narratorId: input.narratorId } : null;
+}
+
+function holdsClaim(row: OutlineTaskClaimRow, claimer: OutlineClaimer): boolean {
+	return claimer.narratorId !== undefined
+		? row.holderNarratorId === claimer.narratorId
+		: row.holderUserId === claimer.userId;
+}
+
+/** Someone other than `claimer` holds the claim and it still counts at `now`. */
+function heldByOther(row: OutlineTaskClaimRow, claimer: OutlineClaimer, now: string): boolean {
+	if (holdsClaim(row, claimer)) return false;
+	if (row.holderUserId !== null) return true;
+	return row.holderNarratorId !== null && (row.expiresAt === null || row.expiresAt > now);
 }
 
 /** Key of the children list of a parent; the space's pages are under `null`. */
@@ -701,6 +814,8 @@ class OutlinePlanner {
 	private readonly children = new Map<string, string[]>();
 	private readonly aliasOwner = new Map<string, string | null>();
 	private readonly temp = new Map<string, string>();
+	/** Blocks an operation set to in progress, with the operation's index: claim attempts. */
+	private readonly claimIntent = new Map<string, number>();
 	readonly results: OutlineOpResult[] = [];
 
 	constructor(
@@ -710,7 +825,12 @@ class OutlinePlanner {
 		private readonly prepared: ReadonlyArray<PreparedContent | null>,
 		private readonly now: string,
 		private readonly commitKind: OutlineCommitKind = "edit",
-	) {}
+		private readonly leaseExpiry: readonly string[] = [],
+	) {
+		this.claimer = claimerOf(input, commitKind === "revert");
+	}
+
+	private readonly claimer: OutlineClaimer | null;
 
 	/** A compensating commit drops taken aliases instead of failing. */
 	private get compensating(): boolean {
@@ -765,8 +885,71 @@ class OutlinePlanner {
 			alias: meta.alias,
 			taskJson: meta.taskJson,
 			contentHash: meta.contentHash,
+			inProcess: meta.inProcess,
 		});
 		this.bySid.set(meta.sid, meta.id);
+	}
+
+	// ── tasks ────────────────────────────────────────────────────────────────
+
+	/** The writer as a task field names it. */
+	private get writer(): OutlineTaskActorRef {
+		return { kind: this.input.actor.kind, id: this.input.actor.id };
+	}
+
+	/**
+	 * The task a block gets from `given`: over `current` (a `setTask` patch) or in its place
+	 * (`whole`: an insert or a restore). A block that becomes a task gets the writer as its
+	 * manager unless the input names one; a compensating commit restores exactly what it read.
+	 */
+	private taskFrom(
+		current: OutlineTaskJson | null,
+		given: OutlineTaskPatch,
+		whole: boolean,
+		opIndex: number,
+	): OutlineTaskJson {
+		const base = whole ? null : current;
+		const status = given.status ?? base?.status;
+		if (status === undefined) throw invalid("a new task needs a status", opIndex);
+		const pick = <T>(value: T | undefined, fallback: T): T =>
+			value !== undefined ? value : fallback;
+		return canonicalTaskJson({
+			status,
+			assignee: pick(given.assignee, base?.assignee ?? null),
+			depends: pick(given.depends, base?.depends ?? null),
+			due: pick(given.due, base?.due ?? null),
+			manager: pick(
+				given.manager,
+				base ? (base.manager ?? null) : this.compensating ? null : this.writer,
+			),
+			humanCreated: pick(given.humanCreated, base?.humanCreated ?? null),
+			lock:
+				given.lock !== undefined
+					? this.lockFrom(given.lock, base?.lock ?? null)
+					: (base?.lock ?? null),
+			claimable: pick(given.claimable, base?.claimable ?? null),
+		});
+	}
+
+	/** A lock as stored: the version is this commit's seq unless the lock is unchanged. */
+	private lockFrom(
+		given: OutlineTaskLockInput | null,
+		current: OutlineTaskLockJson | null,
+	): OutlineTaskLockJson | null {
+		if (given === null) return null;
+		const by = given.by ? { kind: given.by.kind, id: given.by.id } : this.writer;
+		const delegate = given.delegate ?? null;
+		if (this.compensating && given.versionSeq !== undefined)
+			return { by, delegate, versionSeq: given.versionSeq };
+		const candidate = { by, delegate, versionSeq: current?.versionSeq ?? 0 };
+		return current && sameTaskLock(candidate, current)
+			? current
+			: { by, delegate, versionSeq: this.space.nextSeq };
+	}
+
+	/** Record that operation `opIndex` set `block` to in progress (a claim attempt). */
+	private noteClaim(block: WorkingBlock, opIndex: number): void {
+		if (block.taskJson?.status === "doing") this.claimIntent.set(block.id, opIndex);
 	}
 
 	private async load(by: { ids?: string[]; sids?: string[] }): Promise<void> {
@@ -861,7 +1044,7 @@ class OutlinePlanner {
 	private async ensureChildren(
 		parentIds: ReadonlyArray<string | null>,
 		purpose: "siblings" | "subtree",
-		opIndex: number,
+		opIndex: number | null,
 	): Promise<void> {
 		const missing = [...new Set(parentIds)].filter((p) => !this.children.has(listKey(p)));
 		if (missing.length === 0) return;
@@ -1024,6 +1207,7 @@ class OutlinePlanner {
 			contentHash: fields.contentHash,
 			content: fields.content,
 			contentLinks: fields.links,
+			inProcess: false,
 		};
 		this.blocks.set(block.id, block);
 		this.bySid.set(sid, block.id);
@@ -1032,7 +1216,11 @@ class OutlinePlanner {
 	}
 
 	/** Create `nodes` (and their descendants) as the first children of `parent`. */
-	private insertSplit(parent: WorkingBlock, nodes: PreparedNode[]): OutlineBlockAddressed[] {
+	private insertSplit(
+		parent: WorkingBlock,
+		nodes: PreparedNode[],
+		opIndex: number,
+	): OutlineBlockAddressed[] {
 		const created: OutlineBlockAddressed[] = [];
 		const walk = (under: WorkingBlock, list: PreparedNode[]) => {
 			if (list.length === 0) return;
@@ -1049,8 +1237,9 @@ class OutlinePlanner {
 					content: node.content,
 					contentHash: node.contentHash,
 					links: node.links,
-					task: node.task,
+					task: node.task ? this.taskFrom(null, node.task, true, opIndex) : null,
 				});
+				this.noteClaim(block, opIndex);
 				siblings.splice(k, 0, block.id);
 				created.push({ blockId: block.id, sid: block.sid, address: this.address(block.sid) });
 				walk(block, node.children);
@@ -1180,13 +1369,14 @@ class OutlinePlanner {
 			content: prep.content,
 			contentHash: prep.contentHash,
 			links: prep.links,
-			task: op.task ? canonicalTask(op.task) : null,
+			task: op.task ? this.taskFrom(null, op.task, true, i) : null,
 		});
+		this.noteClaim(block, i);
 		list.splice(index, 0, block.id);
 		if (op.tempId !== undefined) this.temp.set(op.tempId, block.id);
 		if (op.alias) await this.setAlias(block, op.alias, i);
 		if (op.tags !== undefined) block.tags = canonicalTags(op.tags);
-		const split = this.insertSplit(block, prep.split);
+		const split = this.insertSplit(block, prep.split, i);
 		this.results[i] = this.result(block, { split, notes: prep.notes }, [
 			this.keyAdjustment(op.position, orderKey),
 		]);
@@ -1204,7 +1394,7 @@ class OutlinePlanner {
 			notes = prep.notes;
 			if (prep.split.length > 0) {
 				await this.ensureChildren([block.id], "siblings", i);
-				split = this.insertSplit(block, prep.split);
+				split = this.insertSplit(block, prep.split, i);
 			}
 		}
 		const aliasDropped =
@@ -1266,15 +1456,9 @@ class OutlinePlanner {
 		const block = await this.resolveLive(op.block, i);
 		if (op.task === null) block.taskJson = null;
 		else {
-			const current = block.taskJson;
-			const status = op.task.status ?? current?.status;
-			if (status === undefined) throw invalid("a new task needs a status", i);
-			block.taskJson = canonicalTask({
-				status,
-				assignee: op.task.assignee !== undefined ? op.task.assignee : (current?.assignee ?? null),
-				depends: op.task.depends !== undefined ? op.task.depends : current?.depends,
-				due: op.task.due !== undefined ? op.task.due : current?.due,
-			});
+			block.taskJson = this.taskFrom(block.taskJson, op.task, false, i);
+			// Naming the status `doing` is starting the task, even when it was in progress already.
+			if (op.task.status === "doing") this.noteClaim(block, i);
 		}
 		this.results[i] = this.result(block);
 	}
@@ -1317,14 +1501,15 @@ class OutlinePlanner {
 			notes = prep.notes;
 			if (prep.split.length > 0) {
 				await this.ensureChildren([block.id], "siblings", i);
-				split = this.insertSplit(block, prep.split);
+				split = this.insertSplit(block, prep.split, i);
 			}
 		} else if (block.contentLinks === undefined) {
 			// The row keeps the content a deleted block had; its links are what it produces.
 			const row = (await this.store.getBlocks([block.id]))[0];
 			block.contentLinks = contentLinks(row?.content ?? "");
 		}
-		if (op.task !== undefined) block.taskJson = op.task ? canonicalTask(op.task) : null;
+		if (op.task !== undefined)
+			block.taskJson = op.task ? this.taskFrom(null, op.task, true, i) : null;
 		if (op.tags !== undefined) block.tags = canonicalTags(op.tags);
 		else if (block.base?.deleted) {
 			// The tags it had just before it was deleted.
@@ -1350,6 +1535,8 @@ class OutlinePlanner {
 	// ── the commit ───────────────────────────────────────────────────────────
 
 	private async assemble(): Promise<Planned | null> {
+		// May load more blocks (ancestors, children whose in-process changes): before `all`.
+		await this.planInProcess();
 		const all = [...this.blocks.values()];
 		const created = all.filter((b) => b.base === null);
 		await this.checkNewIdentities(created);
@@ -1427,9 +1614,28 @@ class OutlinePlanner {
 			else patches.set(key, { ids: [block.id], patch });
 		}
 
+		const versionedIds = new Set([...closeVersionIds, ...insertBlocks.map((b) => b.id)]);
+		const inProcess = new Map<boolean, string[]>();
+		for (const block of existing) {
+			if (block.deleted || block.inProcess === (block.base as OutlineBlockMeta).inProcess) continue;
+			const list = inProcess.get(block.inProcess);
+			if (list) list.push(block.id);
+			else inProcess.set(block.inProcess, [block.id]);
+		}
+		const inProcessOnly = [...inProcess.values()]
+			.flat()
+			.filter((id) => !versionedIds.has(id)).length;
+		const claims = await this.planClaims(versionedIds, seq);
+		const claimRows = claims.put.length + claims.release.length + claims.expire.length;
+
 		const touched = closeVersionIds.length + insertBlocks.length;
-		if (touched === 0) return null;
-		if (touched + closeLinkIds.length + insertLinks.length > OUTLINE_LIMITS.maxRowsTouched) {
+		// A claim taken over without the task changing (it was in progress already) is a commit
+		// of its own: it changes who is doing the task.
+		if (touched === 0 && claims.put.length === 0 && claims.expire.length === 0) return null;
+		if (
+			touched + closeLinkIds.length + insertLinks.length + inProcessOnly + claimRows >
+			OUTLINE_LIMITS.maxRowsTouched
+		) {
 			throw this.tooManyRows(null);
 		}
 
@@ -1462,9 +1668,231 @@ class OutlinePlanner {
 				versions: [...versions].map(([flags, ids]) => ({ ids, flags })),
 				closeLinkIds,
 				insertLinks,
+				inProcess: [...inProcess].map(([value, ids]) => ({ ids, value })),
+				claims,
 			},
 			pageIds: [...pageIds],
 		};
+	}
+
+	/**
+	 * Derive `in_process` (design §2.1: a task, under a task, or in a session space) for every
+	 * live block whose answer this transaction may change: new and restored blocks, moved
+	 * blocks, blocks that became or stopped being tasks, and, under any of them whose answer
+	 * changed, the descendants it changes. When an existing block is among them, the answer of
+	 * each on the way is computed from the page down (its ancestors loaded level by level), so
+	 * another change of the same commit above it, or a stale stored value (before the one-time
+	 * rebuild), does not leak in. Walking down stops where the answer does not change; the blocks
+	 * it visits count against the commit's row limit.
+	 */
+	private async planInProcess(): Promise<void> {
+		const live = [...this.blocks.values()].filter((b) => !b.deleted);
+		if (this.space.kind === "session") {
+			for (const block of live) block.inProcess = true;
+			return;
+		}
+		const isTask = (b: WorkingBlock) => b.taskJson !== null;
+		const roots = live.filter(
+			(b) =>
+				b.base === null ||
+				b.restored === true ||
+				b.base.deleted ||
+				b.parentId !== b.base.parentId ||
+				(b.base.taskJson !== null) !== isTask(b),
+		);
+		if (roots.length === 0) return;
+		if (roots.every((b) => b.base === null)) {
+			// Only new blocks (the common insert): no existing block's answer changes, so a parent
+			// that existed already keeps its stored answer. (Before a space's one-time rebuild that
+			// answer may be stale; the rebuild rewrites the page afterwards.)
+			const known = new Map<string, boolean>();
+			const newAnswer = (block: WorkingBlock): boolean => {
+				if (block.base !== null) return block.inProcess;
+				const memo = known.get(block.id);
+				if (memo !== undefined) return memo;
+				const parent = block.parentId === null ? undefined : this.blocks.get(block.parentId);
+				if (block.parentId !== null && !parent)
+					throw new Error(`outline planner lost the parent of ${block.id}`);
+				const answer = isTask(block) || (parent ? newAnswer(parent) : false);
+				known.set(block.id, answer);
+				return answer;
+			};
+			for (const root of roots) root.inProcess = newAnswer(root);
+			return;
+		}
+
+		// Every ancestor of every root, loaded level by level.
+		const complete = new Set<string>();
+		for (let round = 0; ; round++) {
+			const missing = new Set<string>();
+			for (const root of roots) {
+				const path: string[] = [];
+				let current: WorkingBlock = root;
+				for (;;) {
+					if (complete.has(current.id) || current.parentId === null) {
+						for (const id of path) complete.add(id);
+						complete.add(current.id);
+						break;
+					}
+					path.push(current.id);
+					const parent = this.blocks.get(current.parentId);
+					if (!parent) {
+						missing.add(current.parentId);
+						break;
+					}
+					current = parent;
+					if (path.length > OUTLINE_LIMITS.maxDepth) throw this.tooDeep();
+				}
+			}
+			if (missing.size === 0) break;
+			if (round > OUTLINE_LIMITS.maxDepth) throw this.tooDeep();
+			await this.load({ ids: [...missing] });
+			for (const id of missing) {
+				if (!this.blocks.has(id))
+					throw new Error(`outline block ${id} has a parent outside its space`);
+			}
+		}
+
+		// The answer along each chain, from the page down.
+		const value = new Map<string, boolean>();
+		const answerOf = (block: WorkingBlock): boolean => {
+			const path: WorkingBlock[] = [];
+			let current: WorkingBlock | undefined = block;
+			while (current && !value.has(current.id)) {
+				path.push(current);
+				current = current.parentId === null ? undefined : this.blocks.get(current.parentId);
+			}
+			let above = current ? (value.get(current.id) as boolean) : false;
+			for (let i = path.length - 1; i >= 0; i--) {
+				const b = path[i] as WorkingBlock;
+				above = isTask(b) || above;
+				value.set(b.id, above);
+			}
+			return value.get(block.id) as boolean;
+		};
+		for (const root of roots) answerOf(root);
+
+		// Down from every root whose answer changed, while it keeps changing. Only the roots and
+		// what this walk reaches are written: an ancestor whose stored answer is merely stale (a
+		// space the one-time rebuild has not reached) is left to the rebuild, so stale data never
+		// makes a write walk, or refuse, a subtree it did not change.
+		const answers = new Map<string, boolean>();
+		for (const root of roots) answers.set(root.id, value.get(root.id) as boolean);
+		const differs = (b: WorkingBlock) => b.base !== null && b.base.inProcess !== answers.get(b.id);
+		const queued = new Set(roots.map((b) => b.id));
+		let frontier = roots.filter(differs);
+		let visited = 0;
+		while (frontier.length > 0) {
+			await this.ensureChildren(
+				frontier.map((b) => b.id),
+				"subtree",
+				null,
+			);
+			const next: WorkingBlock[] = [];
+			for (const parent of frontier) {
+				const above = answers.get(parent.id) as boolean;
+				for (const id of this.list(parent.id)) {
+					const child = this.block(id);
+					// A root below has its own answer, computed from the page down.
+					if (child.deleted || queued.has(id)) continue;
+					answers.set(id, isTask(child) || above);
+					if (++visited > OUTLINE_LIMITS.maxRowsTouched) throw this.tooManyRows(null);
+					if (differs(child)) {
+						queued.add(id);
+						next.push(child);
+					}
+				}
+			}
+			frontier = next;
+		}
+		for (const [id, v] of answers) this.block(id).inProcess = v;
+	}
+
+	private tooDeep(): OutlineWriteError {
+		return new OutlineWriteError(
+			`the outline is deeper than ${OUTLINE_LIMITS.maxDepth} levels`,
+			"OUTLINE_TOO_DEEP",
+		);
+	}
+
+	/**
+	 * What this commit does to task claims (see TASK CLAIMS at the top): release the claims of
+	 * tasks that leave in progress, take or refuse the claims operations asked for, and, for a
+	 * lease expiry, check the claims are still the expired ones listed.
+	 */
+	private async planClaims(versioned: ReadonlySet<string>, seq: number): Promise<OutlineClaimPlan> {
+		const doingNow = (b: WorkingBlock) => !b.deleted && b.taskJson?.status === "doing";
+		const doingBefore = (b: WorkingBlock) =>
+			b.base !== null && !b.base.deleted && b.base.taskJson?.status === "doing";
+		const claimer = this.claimer;
+		const intents = claimer ? [...this.claimIntent].filter(([id]) => doingNow(this.block(id))) : [];
+		const expiring = new Set(this.leaseExpiry);
+		const ids = [...new Set([...intents.map(([id]) => id), ...expiring])];
+		const rows = new Map(
+			(ids.length > 0 ? await this.store.getTaskClaims(ids) : []).map((r) => [r.taskBlockId, r]),
+		);
+		const plan: OutlineClaimPlan = { put: [], release: [], expire: [] };
+
+		const notExpired: string[] = [];
+		for (const id of expiring) {
+			const block = this.blocks.get(id);
+			const row = rows.get(id);
+			if (
+				!block ||
+				!doingBefore(block) ||
+				doingNow(block) ||
+				!row ||
+				row.holderNarratorId === null ||
+				row.expiresAt === null ||
+				row.expiresAt > this.now
+			) {
+				notExpired.push(id);
+			} else plan.expire.push({ expect: row });
+		}
+		if (notExpired.length > 0) throw new OutlineLeaseNotExpiredError(notExpired);
+
+		for (const block of this.blocks.values()) {
+			if (doingBefore(block) && !doingNow(block) && !expiring.has(block.id))
+				plan.release.push(block.id);
+		}
+
+		if (!claimer) return plan;
+		for (const [id, opIndex] of intents) {
+			const block = this.block(id);
+			const row = rows.get(id) ?? null;
+			const fresh = (epoch: number): OutlineTaskClaimRow => ({
+				taskBlockId: id,
+				holderNarratorId: claimer.narratorId ?? null,
+				holderUserId: claimer.userId ?? null,
+				epoch,
+				taskVersionAtClaim: versioned.has(id) ? seq : (block.base?.versionSeq ?? seq),
+				claimedAt: this.now,
+				expiresAt: claimer.narratorId !== undefined ? outlineLeaseEnd(this.now) : null,
+			});
+			if (!row) {
+				plan.put.push({ row: fresh(1), expect: null });
+			} else if (holdsClaim(row, claimer)) {
+				// Its own claim: only a session's lapsed lease needs anything (a renewal).
+				if (row.holderNarratorId !== null && row.expiresAt !== null && row.expiresAt <= this.now)
+					plan.put.push({ row: { ...row, expiresAt: outlineLeaseEnd(this.now) }, expect: row });
+			} else if (heldByOther(row, claimer, this.now)) {
+				throw new OutlineTaskClaimedError(
+					id,
+					this.address(block.sid),
+					row.holderUserId !== null
+						? { kind: "human", userId: row.holderUserId }
+						: {
+								kind: "agent",
+								narratorId: row.holderNarratorId as string,
+								expiresAt: row.expiresAt,
+							},
+					opIndex,
+				);
+			} else {
+				plan.put.push({ row: fresh(row.epoch + 1), expect: row });
+			}
+		}
+		return plan;
 	}
 
 	/**
@@ -1601,6 +2029,7 @@ class OutlinePlanner {
 			authorId: this.input.actor.id,
 			versionSeq: seq,
 			deleted: block.deleted,
+			inProcess: block.inProcess,
 		};
 	}
 }
@@ -1646,6 +2075,7 @@ async function writePrepared(
 			prepared,
 			now,
 			compensating ? "revert" : "edit",
+			options.leaseExpiry?.blockIds ?? [],
 		);
 		let planned: Planned | null;
 		try {

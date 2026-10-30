@@ -23,9 +23,9 @@
  *      transaction as the rows it writes. Nothing writes outline rows outside a commit, so a
  *      writer that planned against an older counter value knows the space changed under it.
  */
-import type { OutlineTaskJson } from "@server/db/schema";
+import type { OutlineTaskActorRef, OutlineTaskJson, OutlineTaskLockJson } from "@server/db/schema";
 
-export type { OutlineTaskJson };
+export type { OutlineTaskActorRef, OutlineTaskJson, OutlineTaskLockJson };
 
 /** What a version changed relative to the previous one. A bitmask: several can be set. */
 export const OUTLINE_CHANGE = {
@@ -107,3 +107,19 @@ export const OUTLINE_LIMITS = {
 	/** Blocks of one page a current-state read returns. */
 	maxPageBlocks: 10_000,
 } as const;
+
+/**
+ * Task claims (design §4.5, §7.2): a session's claim is a lease it renews while it runs; one that
+ * is not renewed runs out and a background job reopens the task.
+ */
+export const OUTLINE_TASK_LEASE = {
+	/** How long a session's claim lasts without a renewal. */
+	leaseMs: 10 * 60_000,
+	/** How often a running session renews its claims. */
+	renewEveryMs: 2 * 60_000,
+} as const;
+
+/** The end of a lease taken or renewed at `now` (ISO time). */
+export function outlineLeaseEnd(now: string): string {
+	return new Date(Date.parse(now) + OUTLINE_TASK_LEASE.leaseMs).toISOString();
+}

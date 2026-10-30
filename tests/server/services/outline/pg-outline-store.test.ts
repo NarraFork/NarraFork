@@ -26,6 +26,7 @@ import {
 	type SpaceDump,
 } from "../../../../server/services/outline/__tests__/contract";
 import { OUTLINE_READ_CONTRACT } from "../../../../server/services/outline/__tests__/read-contract";
+import { OUTLINE_TASK_CONTRACT } from "../../../../server/services/outline/__tests__/task-contract";
 import type { OutlineTaskJson } from "../../../../server/services/outline/model";
 import {
 	chunked,
@@ -139,6 +140,16 @@ describe("PostgreSQL outline store", () => {
 						).map((c) => c as SpaceDump["commits"][number]);
 						return { space, blocks, versions, links, commits };
 					},
+					async resetInProcess(spaceId) {
+						await pgDb
+							.update(pgSchema.outlineSpaces)
+							.set({ inProcessReady: false })
+							.where(eq(pgSchema.outlineSpaces.id, spaceId));
+						await pgDb
+							.update(pgSchema.outlineBlocks)
+							.set({ inProcess: false })
+							.where(eq(pgSchema.outlineBlocks.spaceId, spaceId));
+					},
 					async searchContent(needle) {
 						const rows = await client.sql.unsafe(
 							"SELECT id FROM search_outline_blocks WHERE content ILIKE $1",
@@ -151,7 +162,11 @@ describe("PostgreSQL outline store", () => {
 				const problems: string[] = [];
 				const passed: string[] = [];
 				try {
-					for (const contractCase of [...OUTLINE_STORE_CONTRACT, ...OUTLINE_READ_CONTRACT]) {
+					for (const contractCase of [
+						...OUTLINE_STORE_CONTRACT,
+						...OUTLINE_TASK_CONTRACT,
+						...OUTLINE_READ_CONTRACT,
+					]) {
 						try {
 							await contractCase.run(ctx);
 							passed.push(contractCase.name);
@@ -174,7 +189,7 @@ describe("PostgreSQL outline store", () => {
 			}
 			expect(outcome.problems).toEqual([]);
 			expect(outcome.passed).toHaveLength(
-				OUTLINE_STORE_CONTRACT.length + OUTLINE_READ_CONTRACT.length,
+				OUTLINE_STORE_CONTRACT.length + OUTLINE_TASK_CONTRACT.length + OUTLINE_READ_CONTRACT.length,
 			);
 		},
 		RUN_TIMEOUT_MS,

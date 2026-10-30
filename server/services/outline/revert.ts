@@ -47,6 +47,7 @@ import {
 	type OutlineStore,
 	type OutlineVersionRow,
 } from "./store/port";
+import { sameTaskJson } from "./task-json";
 import {
 	type OutlineAdjustment,
 	type OutlineBlockAddressed,
@@ -121,22 +122,19 @@ interface Plan {
 	metas: Map<string, OutlineBlockMeta>;
 }
 
-function sameTask(a: OutlineTaskJson | null, b: OutlineTaskJson | null): boolean {
-	if (a === null || b === null) return a === b;
-	return (
-		a.status === b.status &&
-		a.assignee === b.assignee &&
-		(a.due ?? null) === (b.due ?? null) &&
-		JSON.stringify(a.depends ?? []) === JSON.stringify(b.depends ?? [])
-	);
-}
+const sameTask = sameTaskJson;
 
+/** A task as it was, every field spelled out, so the write puts back exactly that. */
 function taskInput(task: OutlineTaskJson): OutlineTaskInput {
 	return {
 		status: task.status,
 		assignee: task.assignee,
 		depends: task.depends ?? [],
 		due: task.due ?? null,
+		manager: task.manager ?? null,
+		humanCreated: task.humanCreated === true,
+		lock: task.lock ?? null,
+		claimable: task.claimable === true,
 	};
 }
 

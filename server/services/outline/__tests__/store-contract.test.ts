@@ -24,6 +24,7 @@ import { MAIN_THREAD_PAGE_ROWS } from "../store/sqlite-read";
 import { sqliteOutlineStore } from "../store/sqlite-store";
 import { OUTLINE_STORE_CONTRACT, type OutlineContractContext } from "./contract";
 import { OUTLINE_READ_CONTRACT } from "./read-contract";
+import { OUTLINE_TASK_CONTRACT } from "./task-contract";
 
 const NOW = "2026-10-26T00:00:00.000Z";
 
@@ -77,6 +78,16 @@ const ctx: OutlineContractContext = {
 				.orderBy(outlineCommits.seq),
 		};
 	},
+	async resetInProcess(spaceId) {
+		await db
+			.update(outlineSpaces)
+			.set({ inProcessReady: false })
+			.where(eq(outlineSpaces.id, spaceId));
+		await db
+			.update(outlineBlocks)
+			.set({ inProcess: false })
+			.where(eq(outlineBlocks.spaceId, spaceId));
+	},
 	async searchContent(needle) {
 		const rows = sqlite
 			.prepare(
@@ -91,6 +102,12 @@ const ctx: OutlineContractContext = {
 
 describe("outline store contract (SQLite)", () => {
 	for (const contractCase of OUTLINE_STORE_CONTRACT) {
+		test(contractCase.name, () => contractCase.run(ctx), 120_000);
+	}
+});
+
+describe("outline task contract (SQLite)", () => {
+	for (const contractCase of OUTLINE_TASK_CONTRACT) {
 		test(contractCase.name, () => contractCase.run(ctx), 120_000);
 	}
 });
@@ -125,6 +142,34 @@ describe("SQLite specifics", () => {
 		expect(
 			plan("SELECT id FROM outline_links WHERE from_block_id IN ('a', 'b') AND to_seq IS NULL"),
 		).toContain("idx_outline_links_from");
+	});
+
+	test("task claims, open tasks and the in-process rebuild use their indexes", () => {
+		const plan = (query: string) =>
+			(sqlite.prepare(`EXPLAIN QUERY PLAN ${query}`).all() as Array<{ detail: string }>)
+				.map((r) => r.detail)
+				.join("\n");
+		// The store's statements, as drizzle renders them.
+		expect(
+			plan(
+				`SELECT "id" FROM "outline_blocks" WHERE ("outline_blocks"."space_id" = 's' AND json_extract("task_json", '$.status') IN ('todo', 'doing') AND "deleted" = 0) LIMIT 5`,
+			),
+		).toContain("idx_outline_blocks_open_tasks");
+		expect(
+			plan(
+				`SELECT c.task_block_id FROM outline_task_claims c JOIN outline_blocks b ON b.id = c.task_block_id WHERE (c.holder_narrator_id = 'n' AND c.holder_narrator_id IS NOT NULL) ORDER BY c.claimed_at LIMIT 5`,
+			),
+		).toContain("idx_outline_task_claims_holder");
+		expect(
+			plan(
+				`SELECT c.task_block_id FROM outline_task_claims c JOIN outline_blocks b ON b.id = c.task_block_id WHERE (c.expires_at IS NOT NULL AND c.expires_at <= 'x' AND c.holder_narrator_id IS NOT NULL) ORDER BY c.expires_at, c.task_block_id LIMIT 5`,
+			),
+		).toContain("idx_outline_task_claims_expiry");
+		expect(
+			plan(
+				`SELECT id FROM outline_spaces WHERE ("in_process_ready" = 0 AND id > 'a') ORDER BY id LIMIT 5`,
+			),
+		).toContain("idx_outline_spaces_in_process_pending");
 	});
 
 	test("a page past the main-thread size is read on the workers, truncation exact", async () => {

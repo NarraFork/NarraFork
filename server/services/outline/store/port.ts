@@ -71,6 +71,11 @@ export interface OutlineBlockRow {
 	authorId: string;
 	versionSeq: number;
 	deleted: boolean;
+	/**
+	 * Derived cache: the block is process (a task, under a task, or in a session space). Not part
+	 * of the block's versions; kept in step by the write path (see `outline_blocks`).
+	 */
+	inProcess: boolean;
 }
 
 /** A block without its content and author: what planning a write needs. */
@@ -146,6 +151,24 @@ export interface OutlineViewStateRow {
 	updatedAt: string;
 }
 
+/**
+ * Who is doing a task (`outline_task_claims`). Held by a session (`holderNarratorId`, with a
+ * lease until `expiresAt`), by a person (`holderUserId`, no lease) or by nobody (both null: the
+ * claim was released and only `epoch` still counts).
+ */
+export interface OutlineTaskClaimRow {
+	taskBlockId: string;
+	holderNarratorId: string | null;
+	holderUserId: string | null;
+	/** Claim generation: grows by one whenever the task is claimed by someone new. */
+	epoch: number;
+	/** The task block's `version_seq` right after the claiming commit. */
+	taskVersionAtClaim: number;
+	claimedAt: string;
+	/** End of a session's lease (ISO time); null for a person's claim and a released one. */
+	expiresAt: string | null;
+}
+
 /** The space a project, a user or a narrator owns. */
 export type OutlineSpaceScope =
 	| { kind: "project"; projectId: string }
@@ -173,6 +196,27 @@ export type OutlineBlockPatch = Partial<
 	>
 >;
 
+/** One claim the commit writes, taken from the row the plan read. */
+export interface OutlineClaimWrite {
+	row: OutlineTaskClaimRow;
+	/**
+	 * The claim as the plan read it (null: there was no row). The section writes only if the row
+	 * still is exactly that: a session may have renewed its lease since, which changes whether
+	 * the plan's takeover was allowed.
+	 */
+	expect: OutlineTaskClaimRow | null;
+}
+
+/** What a commit does to `outline_task_claims`; see {@link OutlineCommitPlan}. */
+export interface OutlineClaimPlan {
+	/** Claims taken, taken over or renewed. */
+	put: OutlineClaimWrite[];
+	/** Tasks that left in progress (or were deleted): released whatever they hold now. */
+	release: string[];
+	/** Lease expiries: released only while the claim is still exactly the row read (`expect`). */
+	expire: Array<{ expect: OutlineTaskClaimRow }>;
+}
+
 /**
  * Everything one commit writes, already decided. Applied in this order inside one atomic
  * section:
@@ -183,7 +227,12 @@ export type OutlineBlockPatch = Partial<
  *      (deletions first), so an alias can move between blocks within one commit;
  *   4. insert `insertBlocks`;
  *   5. open one version per block in `versions`, copied from the block's new row;
- *   6. close `closeLinkIds`, insert `insertLinks`.
+ *   6. close `closeLinkIds`, insert `insertLinks`;
+ *   7. set `in_process` of the blocks in `inProcess` (no version: it is a derived cache);
+ *   8. write `claims`.
+ *
+ * Before step 1 the section checks that every claim row `claims` expects is still as read; when
+ * one is not, it writes nothing and rejects with {@link OutlineClaimsMovedError}.
  */
 export interface OutlineCommitPlan {
 	spaceId: string;
@@ -201,6 +250,9 @@ export interface OutlineCommitPlan {
 	closeLinkIds: string[];
 	/** New link rows, `fromSeq` = `seq`, `toSeq` null. */
 	insertLinks: OutlineLinkRow[];
+	/** Existing blocks whose `in_process` changes (new blocks carry it in their row). */
+	inProcess: Array<{ ids: string[]; value: boolean }>;
+	claims: OutlineClaimPlan;
 }
 
 /**
@@ -215,6 +267,65 @@ export class OutlineStaleWriteError extends Error {
 		super(`outline space ${spaceId} moved past seq ${expectedSeq} while the write was planned`);
 		this.name = "OutlineStaleWriteError";
 	}
+}
+
+/**
+ * A claim the plan read changed before the commit was written (a session renewed its lease).
+ * Nothing was written; plan again. A kind of stale write, so callers that re-plan on one re-plan
+ * on this too.
+ */
+export class OutlineClaimsMovedError extends OutlineStaleWriteError {
+	constructor(spaceId: string, expectedSeq: number) {
+		super(spaceId, expectedSeq);
+		this.message = `a task claim in outline space ${spaceId} changed while the write was planned`;
+		this.name = "OutlineClaimsMovedError";
+	}
+}
+
+/** Whether a claim row is exactly the one expected (null: no row). */
+export function sameClaimRow(
+	a: OutlineTaskClaimRow | null | undefined,
+	b: OutlineTaskClaimRow | null | undefined,
+): boolean {
+	if (!a || !b) return !a && !b;
+	return (
+		a.taskBlockId === b.taskBlockId &&
+		a.holderNarratorId === b.holderNarratorId &&
+		a.holderUserId === b.holderUserId &&
+		a.epoch === b.epoch &&
+		a.taskVersionAtClaim === b.taskVersionAtClaim &&
+		a.claimedAt === b.claimedAt &&
+		a.expiresAt === b.expiresAt
+	);
+}
+
+/** Ids of the claim rows a plan expects to find as read, sorted (the order rows are locked in). */
+export function expectedClaimIds(plan: OutlineCommitPlan): string[] {
+	const ids = [
+		...plan.claims.put.map((w) => w.row.taskBlockId),
+		...plan.claims.expire.map((e) => e.expect.taskBlockId),
+	];
+	return [...new Set(ids)].sort();
+}
+
+/** Whether the claim rows found (by task id) are what the plan expects. */
+export function claimsAsExpected(
+	plan: OutlineCommitPlan,
+	found: ReadonlyMap<string, OutlineTaskClaimRow>,
+): boolean {
+	for (const write of plan.claims.put) {
+		if (!sameClaimRow(found.get(write.row.taskBlockId) ?? null, write.expect)) return false;
+	}
+	for (const expiry of plan.claims.expire) {
+		if (!sameClaimRow(found.get(expiry.expect.taskBlockId) ?? null, expiry.expect)) return false;
+	}
+	return true;
+}
+
+/** A task a session holds a claim on, with the task's block. */
+export interface OutlineClaimedTask {
+	claim: OutlineTaskClaimRow;
+	block: OutlineBlockMeta;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -276,6 +387,52 @@ export interface OutlineStore extends WritePortIdentity, OutlineReadPort {
 
 	/** Write one commit atomically; see {@link OutlineCommitPlan} and the header contract. */
 	applyCommit(plan: OutlineCommitPlan): Promise<void>;
+
+	// ── tasks (`services/outline/tasks.ts`) ─────────────────────────────────────────────
+	// Claims are written only by `applyCommit`, except a session renewing its own leases. Every
+	// read is one indexed statement (or one per chunk of ids) with a limit.
+
+	/** Claim rows of the given task blocks (released ones included). */
+	getTaskClaims(blockIds: readonly string[]): Promise<OutlineTaskClaimRow[]>;
+	/**
+	 * Tasks a session holds a claim on (lease running or not), with their blocks, at most
+	 * `limit`, oldest claim first.
+	 */
+	listClaimedTasks(narratorId: string, limit: number): Promise<OutlineClaimedTask[]>;
+	/** Live open tasks (to do or in progress) of a space, unordered, at most `limit`. */
+	listOpenTasks(spaceId: string, limit: number): Promise<OutlineBlockMeta[]>;
+	/**
+	 * Session claims whose lease ended at or before `now`, oldest first, at most `limit`, with the
+	 * space of the task.
+	 */
+	listExpiredTaskClaims(
+		now: string,
+		limit: number,
+	): Promise<Array<{ claim: OutlineTaskClaimRow; spaceId: string }>>;
+	/** Move the lease of every claim a session holds to `expiresAt`; returns how many. */
+	renewTaskClaims(narratorId: string, expiresAt: string): Promise<number>;
+
+	// ── in-process rebuild (`services/outline/in-process.ts`) ──────────────────────────
+
+	/**
+	 * Spaces whose blocks' `in_process` has not been derived yet
+	 * (`outline_spaces.in_process_ready`), by id (bytewise) after `after`, at most `limit`.
+	 */
+	listSpacesPendingInProcess(options: {
+		after?: string | null;
+		limit: number;
+	}): Promise<OutlineSpaceRow[]>;
+	/**
+	 * Set `in_process` of live blocks of a space (only rows that differ are written), atomically
+	 * and only while the space is still at `expectNextSeq` (no commit landed since the blocks were
+	 * read). `ready` also marks the space as derived. Returns false, having written nothing, when
+	 * the space moved.
+	 */
+	setInProcess(
+		spaceId: string,
+		expectNextSeq: number,
+		values: { inProcess: readonly string[]; notInProcess: readonly string[]; ready?: boolean },
+	): Promise<boolean>;
 
 	// ── live session log (`services/outline/live/`) ─────────────────────────────────────
 	// Not part of a page's history: rows are written while a page is edited live and deleted

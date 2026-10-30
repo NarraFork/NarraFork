@@ -2640,7 +2640,11 @@ function socketBuffered(socket: LiveSocket): number {
 	}
 }
 
-/** Errors of the write path that mean "the structure moved under this transaction". */
+/**
+ * Errors of the write path that mean "the structure moved under this transaction", or someone
+ * else got there first (a task another session or person is doing: setting it to in progress
+ * is refused).
+ */
 export function isConflict(error: unknown): boolean {
 	return (
 		error instanceof OutlineConflictError ||
@@ -2651,6 +2655,7 @@ export function isConflict(error: unknown): boolean {
 				"OUTLINE_BLOCK_DELETED",
 				"OUTLINE_CYCLE",
 				"OUTLINE_ID_TAKEN",
+				"OUTLINE_TASK_CLAIMED",
 			].includes(error.code))
 	);
 }

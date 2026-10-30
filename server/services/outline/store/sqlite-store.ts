@@ -21,7 +21,9 @@ import {
 	eq,
 	gt,
 	inArray,
+	isNotNull,
 	isNull,
+	lte,
 	ne,
 	notInArray,
 	type SQL,
@@ -35,6 +37,7 @@ import {
 	outlineLinks,
 	outlineLiveUpdates,
 	outlineSpaces,
+	outlineTaskClaims,
 	outlineViewState,
 } from "../../../db/schema";
 import { withDbRetry } from "../../../lib/db-resilience";
@@ -48,8 +51,11 @@ import type {
 } from "../model";
 import {
 	chunked,
+	claimsAsExpected,
+	expectedClaimIds,
 	type OutlineBlockMeta,
 	type OutlineBlockRow,
+	OutlineClaimsMovedError,
 	type OutlineCommitPlan,
 	type OutlineCommitRow,
 	type OutlineLinkRow,
@@ -58,6 +64,7 @@ import {
 	type OutlineSpaceScope,
 	OutlineStaleWriteError,
 	type OutlineStore,
+	type OutlineTaskClaimRow,
 	type OutlineVersionRow,
 	type OutlineViewStateRow,
 } from "./port";
@@ -108,7 +115,9 @@ type CommitSelect = typeof outlineCommits.$inferSelect;
 type LiveUpdateSelect = typeof outlineLiveUpdates.$inferSelect;
 
 function toSpace(row: SpaceSelect): OutlineSpaceRow {
-	return { ...row, kind: row.kind as OutlineSpaceKind };
+	// `in_process_ready` is bookkeeping of the in-process rebuild, not part of a space's row.
+	const { inProcessReady: _ready, ...space } = row;
+	return { ...space, kind: row.kind as OutlineSpaceKind };
 }
 
 function toBlock(row: BlockSelect): OutlineBlockRow {
@@ -166,6 +175,7 @@ const metaColumns = {
 	taskJson: outlineBlocks.taskJson,
 	versionSeq: outlineBlocks.versionSeq,
 	deleted: outlineBlocks.deleted,
+	inProcess: outlineBlocks.inProcess,
 };
 
 function toMeta(row: {
@@ -180,6 +190,7 @@ function toMeta(row: {
 	taskJson: BlockSelect["taskJson"];
 	versionSeq: number;
 	deleted: boolean;
+	inProcess: boolean;
 }): OutlineBlockMeta {
 	return { ...row, taskJson: row.taskJson ?? null };
 }
@@ -219,15 +230,30 @@ function idList(ids: readonly string[]): SQL {
  * at the plan's seq; returning (rather than throwing) keeps an expected outcome out of the retry
  * wrapper's error log.
  */
-function applyCommitSection(tx: Tx, plan: OutlineCommitPlan): boolean {
+function applyCommitSection(tx: Tx, plan: OutlineCommitPlan): "applied" | "stale" | "claims" {
 	const { seq } = plan;
+	// The claims the plan read must still be as read (a lease renewed since may have made a
+	// takeover wrong). Nothing writes inside this synchronous section but this section.
+	const expected = expectedClaimIds(plan);
+	if (expected.length > 0) {
+		const found = new Map<string, OutlineTaskClaimRow>();
+		for (const ids of chunked(expected)) {
+			for (const row of tx
+				.select()
+				.from(outlineTaskClaims)
+				.where(inArray(outlineTaskClaims.taskBlockId, ids))
+				.all())
+				found.set(row.taskBlockId, row);
+		}
+		if (!claimsAsExpected(plan, found)) return "claims";
+	}
 	const claimed = tx
 		.update(outlineSpaces)
 		.set({ nextSeq: sql`${outlineSpaces.nextSeq} + 1` })
 		.where(and(eq(outlineSpaces.id, plan.spaceId), eq(outlineSpaces.nextSeq, seq)))
 		.returning({ nextSeq: outlineSpaces.nextSeq })
 		.get();
-	if (!claimed) return false;
+	if (!claimed) return "stale";
 
 	tx.insert(outlineCommits).values(plan.commit).run();
 
@@ -292,7 +318,40 @@ function applyCommitSection(tx: Tx, plan: OutlineCommitPlan): boolean {
 	for (const rows of chunked(plan.insertLinks, INSERT_CHUNK)) {
 		tx.insert(outlineLinks).values(rows).run();
 	}
-	return true;
+
+	for (const group of plan.inProcess) {
+		for (const ids of chunked(group.ids)) {
+			tx.update(outlineBlocks)
+				.set({ inProcess: group.value })
+				.where(inArray(outlineBlocks.id, ids))
+				.run();
+		}
+	}
+
+	const released = [...plan.claims.release, ...plan.claims.expire.map((e) => e.expect.taskBlockId)];
+	for (const ids of chunked(released)) {
+		tx.update(outlineTaskClaims)
+			.set({ holderNarratorId: null, holderUserId: null, expiresAt: null })
+			.where(inArray(outlineTaskClaims.taskBlockId, ids))
+			.run();
+	}
+	for (const { row } of plan.claims.put) {
+		tx.insert(outlineTaskClaims)
+			.values(row)
+			.onConflictDoUpdate({
+				target: outlineTaskClaims.taskBlockId,
+				set: {
+					holderNarratorId: row.holderNarratorId,
+					holderUserId: row.holderUserId,
+					epoch: row.epoch,
+					taskVersionAtClaim: row.taskVersionAtClaim,
+					claimedAt: row.claimedAt,
+					expiresAt: row.expiresAt,
+				},
+			})
+			.run();
+	}
+	return "applied";
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -318,6 +377,8 @@ export const sqliteOutlineStore: OutlineStore = {
 						ownerUserId: scope.kind === "personal" ? scope.ownerUserId : null,
 						nextSeq: 1,
 						createdAt: now,
+						// Every block of a new space is written by a path that derives it.
+						inProcessReady: true,
 					})
 					.onConflictDoNothing()
 					.run();
@@ -655,15 +716,151 @@ export const sqliteOutlineStore: OutlineStore = {
 	},
 
 	async applyCommit(plan) {
-		let applied: boolean;
+		let outcome: "applied" | "stale" | "claims";
 		try {
-			applied = await withDbRetry(
+			outcome = await withDbRetry(
 				async () => db.transaction((tx) => applyCommitSection(tx, plan)),
 				{ label: "outline.applyCommit", maxRetries: 3 },
 			);
 		} catch (error) {
 			rethrowAsPortError(error);
 		}
-		if (!applied) throw new OutlineStaleWriteError(plan.spaceId, plan.seq);
+		if (outcome === "stale") throw new OutlineStaleWriteError(plan.spaceId, plan.seq);
+		if (outcome === "claims") throw new OutlineClaimsMovedError(plan.spaceId, plan.seq);
+	},
+
+	async getTaskClaims(blockIds) {
+		const out: OutlineTaskClaimRow[] = [];
+		for (const ids of chunked(blockIds)) {
+			out.push(
+				...db
+					.select()
+					.from(outlineTaskClaims)
+					.where(inArray(outlineTaskClaims.taskBlockId, ids))
+					.all(),
+			);
+		}
+		return out;
+	},
+
+	async listClaimedTasks(narratorId, limit) {
+		const rows = db
+			.select({ claim: outlineTaskClaims, block: metaColumns })
+			.from(outlineTaskClaims)
+			.innerJoin(outlineBlocks, eq(outlineBlocks.id, outlineTaskClaims.taskBlockId))
+			// The literal `IS NOT NULL` lets the planner use the partial holder index.
+			.where(
+				and(
+					eq(outlineTaskClaims.holderNarratorId, narratorId),
+					isNotNull(outlineTaskClaims.holderNarratorId),
+				),
+			)
+			.orderBy(asc(outlineTaskClaims.claimedAt), asc(outlineTaskClaims.taskBlockId))
+			.limit(limit)
+			.all();
+		return rows.map((r) => ({ claim: r.claim, block: toMeta(r.block) }));
+	},
+
+	async listOpenTasks(spaceId, limit) {
+		// The predicate is the open-task index's own, word for word, so the index serves it.
+		const rows = db
+			.select(metaColumns)
+			.from(outlineBlocks)
+			.where(
+				and(
+					eq(outlineBlocks.spaceId, spaceId),
+					sql`json_extract("task_json", '$.status') IN ('todo', 'doing') AND "deleted" = 0`,
+				),
+			)
+			.limit(limit)
+			.all();
+		return rows.map(toMeta);
+	},
+
+	async listExpiredTaskClaims(now, limit) {
+		const rows = db
+			.select({ claim: outlineTaskClaims, spaceId: outlineBlocks.spaceId })
+			.from(outlineTaskClaims)
+			.innerJoin(outlineBlocks, eq(outlineBlocks.id, outlineTaskClaims.taskBlockId))
+			.where(
+				and(
+					isNotNull(outlineTaskClaims.expiresAt),
+					lte(outlineTaskClaims.expiresAt, now),
+					isNotNull(outlineTaskClaims.holderNarratorId),
+				),
+			)
+			.orderBy(asc(outlineTaskClaims.expiresAt), asc(outlineTaskClaims.taskBlockId))
+			.limit(limit)
+			.all();
+		return rows;
+	},
+
+	async renewTaskClaims(narratorId, expiresAt) {
+		return await withDbRetry(
+			async () =>
+				db
+					.update(outlineTaskClaims)
+					.set({ expiresAt })
+					.where(
+						and(
+							eq(outlineTaskClaims.holderNarratorId, narratorId),
+							isNotNull(outlineTaskClaims.holderNarratorId),
+						),
+					)
+					.returning({ id: outlineTaskClaims.taskBlockId })
+					.all().length,
+			{ label: "outline.renewTaskClaims", maxRetries: 3 },
+		);
+	},
+
+	async listSpacesPendingInProcess({ after, limit }) {
+		// The literal predicate is the pending index's own.
+		const rows = db
+			.select()
+			.from(outlineSpaces)
+			.where(and(sql`"in_process_ready" = 0`, after ? gt(outlineSpaces.id, after) : undefined))
+			.orderBy(asc(outlineSpaces.id))
+			.limit(limit)
+			.all();
+		return rows.map(toSpace);
+	},
+
+	async setInProcess(spaceId, expectNextSeq, values) {
+		return await withDbRetry(
+			async () =>
+				db.transaction((tx) => {
+					const space = tx
+						.select({ nextSeq: outlineSpaces.nextSeq })
+						.from(outlineSpaces)
+						.where(eq(outlineSpaces.id, spaceId))
+						.get();
+					if (!space || space.nextSeq !== expectNextSeq) return false;
+					for (const [value, list] of [
+						[true, values.inProcess],
+						[false, values.notInProcess],
+					] as const) {
+						for (const ids of chunked(list)) {
+							tx.update(outlineBlocks)
+								.set({ inProcess: value })
+								.where(
+									and(
+										eq(outlineBlocks.spaceId, spaceId),
+										inArray(outlineBlocks.id, ids),
+										ne(outlineBlocks.inProcess, value),
+									),
+								)
+								.run();
+						}
+					}
+					if (values.ready) {
+						tx.update(outlineSpaces)
+							.set({ inProcessReady: true })
+							.where(eq(outlineSpaces.id, spaceId))
+							.run();
+					}
+					return true;
+				}),
+			{ label: "outline.setInProcess", maxRetries: 3 },
+		);
 	},
 };
