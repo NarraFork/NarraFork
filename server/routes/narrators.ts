@@ -5265,6 +5265,14 @@ narratorRoutes.post("/:id/modeltrace", async (c) => {
 	return c.json(result, 201);
 });
 
+// Retry one sampling round in the same diagnostic session.
+narratorRoutes.post("/:id/modeltrace/retry", async (c) => {
+	const userId = c.get("user").sub;
+	const { retryModelTrace } = await import("../services/modeltrace-service");
+	const result = await retryModelTrace(c.req.param("id"), userId, await getUserLanguage(userId));
+	return c.json(result);
+});
+
 // Start: create a persistent pending message in the source narrator's chat
 narratorRoutes.post("/:id/ask-in-passing/start", async (c) => {
 	const id = c.req.param("id");

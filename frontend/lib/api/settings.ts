@@ -364,6 +364,9 @@ export const settingsApi = {
 			};
 			/** 大纲标签排布（JSON: { [narratorId]: { order, pinned } }）。 */
 			specTabLayout: Record<string, unknown>;
+			/** 提交身份入口的显示位置：会话右键菜单 / 新建会话弹窗（跟账号走）。 */
+			gitIdentityContextMenu: boolean;
+			gitIdentityCreateModal: boolean;
 		}>("/user-preferences"),
 	updateUserPreferences: (data: {
 		autoLoadOlderMessages?: boolean;
@@ -432,6 +435,8 @@ export const settingsApi = {
 		narratorToolbarLayout?: {
 			items: Array<{ id: string }>;
 		};
+		gitIdentityContextMenu?: boolean;
+		gitIdentityCreateModal?: boolean;
 	}) =>
 		request<ApiEntity>("/user-preferences", {
 			method: "PATCH",

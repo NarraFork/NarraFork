@@ -893,9 +893,11 @@ describe("real shared orchestrator profile contract", () => {
 				.from(narratorMessages)
 				.where(eq(narratorMessages.narratorId, h.session.narratorId))
 				.all();
-			expect(rows.filter((row) => row.role === "user")).toHaveLength(1);
-			expect(rows[0].origin).toBe("system");
-			const content = rows[0].contentText;
+			// An epoch marker may precede the continuation; assert the actual prompt row.
+			const prompts = rows.filter((row) => row.role === "user");
+			expect(prompts).toHaveLength(1);
+			expect(prompts[0].origin).toBe("system");
+			const content = prompts[0].contentText;
 			if (!content) throw new Error("Continuation must persist nonempty prompt text");
 			expect(JSON.stringify(h.calls[1].history)).toContain(content);
 			expect(h.calls[1].config.model).toBe(h.calls[0].config.model);

@@ -179,7 +179,12 @@ function pause(signal: AbortSignal | undefined, ms: number) {
 		if (signal?.aborted) abort();
 	});
 }
-function concurrencyProbe(f: ReturnType<typeof fixture>) {
+function concurrencyProbe(f: ReturnType<typeof fixture>, limit: number) {
+	let releaseFirstBatch: () => void = () => {};
+	const firstBatch = new Promise<void>((resolve) => {
+		releaseFirstBatch = resolve;
+	});
+	let arrivals = 0;
 	const live = new Map<string, string>();
 	const paths: string[] = [];
 	let peakFiles = 0;
@@ -192,7 +197,6 @@ function concurrencyProbe(f: ReturnType<typeof fixture>) {
 		paths.push(o.outputPath);
 		peakFiles = Math.max(peakFiles, live.size);
 		try {
-			await pause(o.signal, 5);
 			await download(o);
 		} catch (error) {
 			live.delete(hash);
@@ -216,10 +220,20 @@ function concurrencyProbe(f: ReturnType<typeof fixture>) {
 			if (!live.has(hash)) return action();
 			active++;
 			peak = Math.max(peak, active);
+			// Hold only the first batch: fixed delays depend on IO scheduling, and
+			// later batches may have fewer than limit binaries remaining.
+			if (++arrivals === limit) releaseFirstBatch();
+			let abort: () => void = () => {};
 			try {
-				await pause(signal, 10);
+				await new Promise<void>((resolve, reject) => {
+					abort = () => reject(signal?.reason);
+					signal?.addEventListener("abort", abort, { once: true });
+					if (signal?.aborted) abort();
+					else firstBatch.then(resolve);
+				});
 				return await action();
 			} finally {
+				signal?.removeEventListener("abort", abort);
 				active--;
 				live.delete(hash);
 			}
@@ -349,7 +363,12 @@ describe("canonical auxiliary binary mirror", () => {
 						const ingest = new MirrorIngestService(storage);
 						const app = createApp(storage, ingest);
 						const f = fixture(kind);
-						const probe = concurrencyProbe(f);
+						const limit = Math.min(
+							concurrency ?? (transport === "direct" ? 2 : 3),
+							f.assets.filter((a) => a.name !== "LICENSE-test.txt" && !a.name.endsWith(".json"))
+								.length,
+						);
+						const probe = concurrencyProbe(f, limit);
 						const dav = createWebDavFixture();
 						const webdav = { url: dav.baseUrl, feed: "default", auth: { bearerToken: "fixture" } };
 						const signingKey = Buffer.alloc(32, 2).toString("base64");
@@ -413,12 +432,7 @@ describe("canonical auxiliary binary mirror", () => {
 							expect(result.verified).toHaveLength(f.assets.length);
 							expect(requests).not.toContain("GET");
 						}
-						probe.verify(
-							Math.min(
-								concurrency ?? (transport === "direct" ? 2 : 3),
-								kind === "helpers" ? 12 : 6,
-							),
-						);
+						probe.verify(limit);
 						const projection = await ingest.readTools("narrafork", kind, f.options.tag);
 						expect(projection?.binaries?.length).toBe(kind === "helpers" ? 12 : 6);
 						for (const binary of projection?.binaries ?? []) {

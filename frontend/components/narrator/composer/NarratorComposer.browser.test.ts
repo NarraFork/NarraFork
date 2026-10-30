@@ -1285,6 +1285,9 @@ test("file selection metadata still supports explicit #selection completion with
 	}
 });
 
+// Page boot/hydration and two completion openings share this deadline. Under four-core CPU
+// contention, opening/hydrating a page can take ~4.7s; keep each UI wait bounded at 5s and allow
+// the complete focus/Tab round trip the same 15s budget as the neighboring browser flows.
 for (const target of ["search", "monaco"] as const) {
 	test(`blurred mention completion cannot steal ${target} Tab and reopens only for its own editor`, async () => {
 		const page = await open();
@@ -1326,7 +1329,7 @@ for (const target of ["search", "monaco"] as const) {
 		} finally {
 			await close(page);
 		}
-	});
+	}, 15_000);
 }
 
 test("touch-to-mouse dismiss does not move the close target during pointerdown", async () => {

@@ -15,6 +15,7 @@ import { bindRecordingRequest } from "./request-recorder";
 
 export type ApiRequestKind =
 	| "narrator"
+	| "modeltrace"
 	| "compact"
 	| "context_ask"
 	| "fork_summary"

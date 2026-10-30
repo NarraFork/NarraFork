@@ -12,9 +12,9 @@ import {
 	formatRequestTools,
 	latestToolLoadingEpoch,
 	projectToolLoadingHistory,
+	resolveLoadableToolDefinition,
 	resolveToolLoadingStrategy,
 	selectRequestTools,
-	snapshotToolDefinitions,
 	type ToolLoadingState,
 	type ToolLoadingStrategy,
 	toolLoadingChangeOf,
@@ -76,16 +76,39 @@ describe("frozen tool definitions", () => {
 		expect(projected[0].contentText).toContain('"old"');
 	});
 
-	test("snapshot helper resolves current only from the supplied raw candidate view", () => {
+	test("projection uses the same candidates and never fills missing ones from the registry", () => {
 		const name = "CandidateOnly";
 		const candidate = { ...tool(name), description: "candidate view" };
-		const other = tool("OtherCandidate");
+		const message = notice("tool_loaded", [name]);
 		toolRegistry.register({ ...candidate, description: "registry view" });
 		try {
-			const snapshots = snapshotToolDefinitions([name], [candidate, other]);
-			expect(snapshots.map((snapshot) => snapshot.name)).toEqual([name]);
-			expect(snapshots[0]?.description).toBe("candidate view");
-			expect(snapshotToolDefinitions([name], [])).toEqual([]);
+			for (const candidates of [[candidate], []]) {
+				const state = deriveToolLoadingState(
+					[message],
+					new Set([name]),
+					[name],
+					undefined,
+					candidates,
+				);
+				expect(state.candidates).toBe(candidates);
+				let registryReads = 0;
+				const projected = projectToolLoadingHistory(
+					[message],
+					state,
+					"custom_injection",
+					(toolName) => {
+						registryReads++;
+						return resolveLoadableToolDefinition(toolName);
+					},
+				);
+				expect(registryReads).toBe(0);
+				expect(projected[0].contentText).not.toContain("registry view");
+				if (candidates.length) {
+					expect(projected[0].contentText).toContain('"description":"candidate view"');
+				} else {
+					expect(projected[0]).toBe(message);
+				}
+			}
 		} finally {
 			toolRegistry.unregister(name);
 		}

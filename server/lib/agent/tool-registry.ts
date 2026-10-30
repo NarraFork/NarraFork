@@ -1,3 +1,4 @@
+import { generateId } from "@server/lib/id";
 import { z } from "zod/v4";
 import { canonicalizeToolName } from "./tool-name";
 import type { ToolDefinition } from "./types";
@@ -21,6 +22,14 @@ export interface ToolProvider {
  * Registry for agent tools.
  */
 export class ToolRegistry {
+	private readonly instanceId = generateId();
+	private generation = 0;
+
+	/** Cache lifecycle only: registration or restart opens a new tool epoch, not new authority. */
+	get revision(): string {
+		return `${this.instanceId}:${this.generation}`;
+	}
+
 	/** Tools registered individually (not via a provider). */
 	private directTools = new Map<string, ToolDefinition>();
 	private providers = new Map<string, ToolProvider>();
@@ -41,11 +50,13 @@ export class ToolRegistry {
 	register(tool: ToolDefinition): void {
 		this.directTools.set(tool.name, tool);
 		this.materialized = null;
+		this.generation++;
 	}
 
 	unregister(name: string): void {
 		this.directTools.delete(name);
 		this.materialized = null;
+		this.generation++;
 	}
 
 	private ensureMaterialized(): Map<string, ToolDefinition> {
@@ -87,6 +98,7 @@ export class ToolRegistry {
 		provider.initialize?.();
 		// Do NOT call provider.tools() here — see `materialized` doc comment.
 		this.materialized = null;
+		this.generation++;
 	}
 
 	unregisterProvider(name: string): void {
@@ -95,6 +107,7 @@ export class ToolRegistry {
 		provider.dispose?.();
 		this.providers.delete(name);
 		this.materialized = null;
+		this.generation++;
 	}
 }
 

@@ -18,13 +18,13 @@
  * The output is bounded by the read's budget, so the agent loop must not cut it again (its cut
  * keeps the tail and would lose the top of the outline).
  */
-import { blockTitle, TASK_BOX } from "@shared/outline";
+import { blockTitle, serializeMarkdownOutline, TASK_BOX } from "@shared/outline";
 import { type OutlineAgentScope, spaceRootName } from "./agent-scope";
 import { LINK_DISPLAY_LIMITS, linkTitles, withLinkTitles } from "./link-display";
 import { OUTLINE_TOOL_TEXT } from "./messages";
 import { commitSeqAt, readOutline } from "./read";
 import { recordOutlineReads } from "./read-ledger";
-import { OUTLINE_READ_LIMITS, type OutlineDisplay } from "./render";
+import { OUTLINE_READ_LIMITS, type OutlineDisplay, outlineItem } from "./render";
 import type { OutlineResolvedBlock } from "./resolve";
 import { OUTLINE_SEARCH_LIMITS, searchOutline } from "./search";
 import type { OutlineSpaceRow } from "./store/port";
@@ -104,10 +104,7 @@ async function pageLines(
 	const limit = OUTLINE_AGENT_READ_LIMITS.maxPagesListed;
 	const rows = await scope.store.listChildren(space.id, null, limit + 1);
 	const pages = rows.slice(0, limit);
-	recordOutlineReads(
-		scope.narratorId,
-		pages.map((page) => [page.id, page.versionSeq] as const),
-	);
+	// Only titles, clipped: not a read of the pages (their edits need one).
 	const lines = pages.map((page) => {
 		const box = page.taskJson ? `[${TASK_BOX[page.taskJson.status]}] ` : "";
 		return `- [${page.sid}] ${box}${clip(blockTitle(page.content)) || OUTLINE_TOOL_TEXT.untitled}`;
@@ -244,6 +241,27 @@ function displayFor(scope: OutlineAgentScope, seen: Map<string, number>) {
 			};
 		};
 	};
+}
+
+/**
+ * Blocks as a current read shows them, each on its own without children: the short id after
+ * the bullet, links with their targets' titles where the session may read them. An edit's
+ * result shows the blocks it merged this way, so they can be copied back like a read.
+ */
+export async function blockLinesForAgent(
+	scope: OutlineAgentScope,
+	nodes: readonly OutlineNode[],
+): Promise<Map<string, string>> {
+	const display = await displayFor(scope, new Map())({ current: true, seq: 0 }, nodes);
+	const out = new Map<string, string>();
+	for (const node of nodes) {
+		const item = outlineItem(node);
+		out.set(
+			node.id,
+			serializeMarkdownOutline([display?.(node, item) ?? item], { label: () => `[${node.sid}]` }),
+		);
+	}
+	return out;
 }
 
 export async function outlineRead(

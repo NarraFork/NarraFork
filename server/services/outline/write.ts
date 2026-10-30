@@ -165,6 +165,11 @@ export type OutlineOp =
 			alias?: string | null;
 			/** Replaces the block's tags. */
 			tags?: string[];
+			/**
+			 * The update is a three-way merge of the caller's change over changes others made after
+			 * the caller read the block: the version records `OUTLINE_CHANGE.MERGE`.
+			 */
+			merged?: boolean;
 	  } & BaseVersioned)
 	| ({
 			op: "move";
@@ -563,6 +568,8 @@ function prepareOps(
 				checkBase(op, i);
 				checkAlias(op.alias, i);
 				if (op.tags !== undefined) checkTags(op.tags, i);
+				if (op.merged !== undefined && typeof op.merged !== "boolean")
+					throw invalid("merged must be a boolean", i);
 				break;
 			case "move":
 				checkRef(op.block, "block", i);
@@ -675,6 +682,8 @@ interface WorkingBlock {
 	tags?: string[];
 	/** Brought back by a `restore` operation of this transaction. */
 	restored?: boolean;
+	/** Written by a merged `update` (`OUTLINE_CHANGE.MERGE`). */
+	merged?: boolean;
 }
 
 /** Key of the children list of a parent; the space's pages are under `null`. */
@@ -1203,6 +1212,7 @@ class OutlinePlanner {
 				? await this.setAlias(block, op.alias, i, this.compensating ? "drop" : "reject")
 				: null;
 		if (op.tags !== undefined) block.tags = canonicalTags(op.tags);
+		if (op.merged) block.merged = true;
 		this.results[i] = this.result(block, { split, notes }, [aliasDropped]);
 	}
 
@@ -1386,6 +1396,7 @@ class OutlinePlanner {
 					: this.baseFlags(block);
 			if (block.base !== null && linkChange.tagsChanged) flags |= OUTLINE_CHANGE.PROPS;
 			if (flags === 0) continue;
+			if (block.merged) flags |= OUTLINE_CHANGE.MERGE;
 
 			const ids = versions.get(flags);
 			if (ids) ids.push(block.id);

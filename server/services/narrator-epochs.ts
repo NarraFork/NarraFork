@@ -1,22 +1,9 @@
 /**
- * narrator-epochs.ts — epochs of a narrator's request prefix (docs/BLOCK_STORAGE-DESIGN.md
- * §7.7, P1 scope).
- *
- * Within an epoch the request's tool array only grows by appended history, so the
- * provider's prompt cache survives tool loads. An epoch opens at a compact (the compact
- * element records `epoch`) or at an epoch marker row the runtime writes when the target
- * changes or its cache has certainly gone cold. Either one records the optional tools
- * loaded when it opened; that set, not a backwards derivation, is then the array's share.
- *
- * `reconcileEpoch` runs before each pass's history is built and writes what the
- * request must say, as rows:
- *   - at a boundary, a new epoch marker, but only when rebuilding would actually change
- *     the tool layout (otherwise the bytes are the same and the cache is kept anyway);
- *   - inside a frozen epoch, a system notice for every tool loaded or unloaded without
- *     one (resident mode, preloads), so the array never shifts under the cache.
- *
- * P1 freezes the tool set only. Frozen tool definitions, frozen system sections with
- * reminders, and the prefix check are the rest of §7.7.
+ * Tool epochs preserve loading order and the provider's append-only prefix.
+ * Store names, not schemas: a registry change or restart opens a new epoch and
+ * accepts a cache miss instead of persisting/comparing the entire tool catalog.
+ * Within one registry lifecycle, loads remain notices and existing provider
+ * additions/custom-injection strategies keep their original ordering.
  */
 
 import type { DbMessage } from "@shared/agent-protocol/types";
@@ -29,7 +16,7 @@ import {
 	type EpochRecord,
 	epochRecordOf,
 	latestToolLoadingEpoch,
-	snapshotToolDefinitions,
+	ToolEpochError,
 	type ToolLoadingEpoch,
 	toolLoadingDrift,
 } from "../lib/agent/tool-loading";
@@ -67,7 +54,7 @@ export function compactEpochRecord(
 		reason: "compact",
 		target: resolveEpochTarget(active.model, active.provider).fingerprint,
 		toolNames: [...active._enabledOptionalTools].sort(),
-		definitionSnapshots: snapshotToolDefinitions(active._enabledOptionalTools),
+		// A compact is already a cache boundary. The next request captures its registry view.
 	};
 }
 
@@ -98,6 +85,7 @@ export function compactToolLoadingEpoch(narratorId: string): ToolLoadingEpoch | 
 	return epoch
 		? {
 				toolNames: epoch.toolNames,
+				registryRevision: epoch.registryRevision,
 				definitionSnapshots: epoch.definitionSnapshots,
 				...(epoch.target ? { target: epoch.target } : {}),
 			}
@@ -127,6 +115,7 @@ export async function toolLoadingEpochOf(
 	return epoch
 		? {
 				toolNames: epoch.toolNames,
+				registryRevision: epoch.registryRevision,
 				definitionSnapshots: epoch.definitionSnapshots,
 				...(epoch.target ? { target: epoch.target } : {}),
 			}
@@ -177,6 +166,8 @@ const sameSet = (a: ReadonlySet<string>, b: ReadonlySet<string>) =>
 
 export interface ReconciledEpoch {
 	changed: boolean;
+	/** A new prefix boundary also resets upstream continuation. */
+	opened?: boolean;
 	epoch: ToolLoadingEpoch | undefined;
 }
 
@@ -186,32 +177,26 @@ const EMPTY_RECONCILED_EPOCH: ReconciledEpoch = Object.freeze({
 	epoch: undefined,
 });
 
-/**
- * Write what this pass's request must carry before its history is built. `changed` says
- * whether rows were written; `epoch` is the exact already-read/opened epoch for history.
- * A failed freeze aborts assembly: current definitions must never rewrite history.
- */
+/** Keep loading order within one registry lifecycle; start a small new epoch when it changes. */
 export async function reconcileEpoch(input: {
 	narratorId: string;
 	messages: readonly DbMessage[];
 	managed: ReadonlySet<string>;
 	current: Iterable<string>;
-	/** Full candidates from the caller's current registry view (legacy callers may omit). */
+	/** Candidates and revision are captured synchronously by the request owner. */
 	candidates?: readonly ToolDefinition[];
+	registryRevision?: string;
 	model: string;
 	provider: string;
-	/** Notice text for a reconciled load or unload of `toolName`. */
 	noticeText: (kind: "tool_loaded" | "tool_unloaded", toolName: string) => string;
 	now?: number;
 	resolveTarget?: typeof resolveEpochTarget;
 }): Promise<ReconciledEpoch> {
 	const { narratorId, messages, managed } = input;
 	if (managed.size === 0) return EMPTY_RECONCILED_EPOCH;
+	// Never stamp a captured view with a generation read after awaiting storage.
+	const registryRevision = input.registryRevision ?? toolRegistry.revision;
 	try {
-		// Production always supplies this view. The fallback keeps standalone legacy callers
-		// working without ever mixing two registry arrays inside one reconcile.
-		const candidates = input.candidates ?? toolRegistry.all();
-		const snapshots = (current: Iterable<string>) => snapshotToolDefinitions(current, candidates);
 		const resolveTarget = input.resolveTarget ?? resolveEpochTarget;
 		const target = resolveTarget(input.model, input.provider);
 		const epoch = await toolLoadingEpochOf(narratorId, messages);
@@ -227,56 +212,34 @@ export async function reconcileEpoch(input: {
 			!!last &&
 			(input.now ?? Date.now()) - Date.parse(last.createdAt) > target.cacheTtlMs;
 		const layoutChanges = state.loaded.length > 0 || !sameSet(state.base, state.current);
-		const liveSnapshots = new Map(
-			snapshots(state.definitionSnapshots?.map((item) => item.name) ?? []).map((item) => [
-				item.name,
-				item,
-			]),
-		);
-		const definitionsChanged =
-			state.definitionSnapshots?.some(
-				(item) => JSON.stringify(item) !== JSON.stringify(liveSnapshots.get(item.name)),
-			) ?? false;
-		const frozenNames = new Set(state.definitionSnapshots?.map((item) => item.name));
-		const missingMcpSnapshots =
-			snapshots(
-				(epoch?.toolNames ?? []).filter(
-					(name) => name.startsWith("mcp__") && managed.has(name) && !frozenNames.has(name),
-				),
-			).length > 0;
 		if (
-			(!epoch && [...managed].some((name) => name.startsWith("mcp__"))) ||
-			missingMcpSnapshots ||
-			definitionsChanged ||
+			epoch?.registryRevision !== registryRevision ||
 			((targetChanged || cold) && layoutChanges)
 		) {
-			const definitionSnapshots = snapshots(state.current);
 			const opened: EpochRecord = {
-				reason: definitionsChanged ? "manual" : targetChanged ? "target" : cold ? "cold" : "manual",
+				reason: targetChanged ? "target" : cold ? "cold" : "manual",
 				target: target.fingerprint,
 				toolNames: [...state.current].sort(),
-				...(definitionSnapshots.length ? { definitionSnapshots } : {}),
+				registryRevision,
 			};
 			const marker = await narratorStore.openEpoch(narratorId, opened);
 			return {
 				changed: true,
+				opened: true,
 				epoch: {
 					markerId: marker.id,
 					toolNames: opened.toolNames,
-					...(opened.definitionSnapshots
-						? { definitionSnapshots: opened.definitionSnapshots }
-						: {}),
-					...(opened.target ? { target: opened.target } : {}),
+					registryRevision,
+					target: opened.target,
 				},
 			};
 		}
-		if (!epoch) return { changed: false, epoch };
 		const drift = toolLoadingDrift(messages, state);
 		for (const [type, names] of [
 			["tool_loaded", drift.loads],
 			["tool_unloaded", drift.unloads],
-		] as const)
-			for (const toolName of names)
+		] as const) {
+			for (const toolName of names) {
 				await narratorStore.appendToolChange(
 					narratorId,
 					{
@@ -284,25 +247,14 @@ export async function reconcileEpoch(input: {
 						toolName,
 						toolNames: [toolName],
 						text: input.noticeText(type, toolName),
-						...(type === "tool_loaded" ? { definitionSnapshots: snapshots([toolName]) } : {}),
 					},
 					"system",
 				);
-		return {
-			changed: drift.loads.length > 0 || drift.unloads.length > 0,
-			epoch,
-		};
+			}
+		}
+		return { changed: drift.loads.length > 0 || drift.unloads.length > 0, epoch };
 	} catch (error) {
-		logger.warn(
-			"Epoch reconcile failed; request assembly stopped to preserve frozen tool definitions",
-			{
-				narratorId,
-				error: String(error),
-			},
-		);
-		throw new Error(
-			"Tool epoch could not be saved or its definitions exceed the snapshot budget; retry after correcting the tool configuration or storage error.",
-			{ cause: error },
-		);
+		logger.warn("Tool epoch could not be saved", { narratorId, error: String(error) });
+		throw new ToolEpochError(error);
 	}
 }

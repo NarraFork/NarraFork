@@ -89,7 +89,7 @@ mock.module("../../lib/browser", () => ({
 	}),
 	restoreSessionFromHandoff: mock(
 		async (_browser: unknown, handoff: BrowserSessionHandoff) =>
-			restoreOutcomes.get(handoff.contextId) ?? { ok: true },
+			restoreOutcomes.get(handoff.contextId ?? "") ?? { ok: true },
 	),
 }));
 

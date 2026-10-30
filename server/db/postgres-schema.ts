@@ -1328,6 +1328,8 @@ export const userPreferences = pgTable("user_preferences", {
 	gatewayConfig: text("gateway_config").notNull().default("{}"),
 	navLayout: text("nav_layout").notNull().default("{}"),
 	narratorToolbarLayout: text("narrator_toolbar_layout").notNull().default("{}"),
+	gitIdentityContextMenu: boolean("git_identity_context_menu").notNull().default(false),
+	gitIdentityCreateModal: boolean("git_identity_create_modal").notNull().default(false),
 	specTabLayout: text("spec_tab_layout").notNull().default("{}"),
 	traits: jsonText("traits").notNull().default(sql.raw("'[]'::text")),
 	tutorialProgress: text("tutorial_progress").notNull().default("{}"),
@@ -4064,7 +4066,7 @@ export const notifications = pgTable(
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
   "tableCount": 133,
-  "columnCount": 1743,
+  "columnCount": 1745,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -11606,6 +11608,30 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false,
           "defaultValue": "\"{}\"",
           "defaultExpression": "\"{}\""
+        },
+        {
+          "property": "gitIdentityContextMenu",
+          "name": "git_identity_context_menu",
+          "kind": "integer",
+          "mode": "boolean",
+          "pgType": "boolean",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "false",
+          "defaultExpression": "false"
+        },
+        {
+          "property": "gitIdentityCreateModal",
+          "name": "git_identity_create_modal",
+          "kind": "integer",
+          "mode": "boolean",
+          "pgType": "boolean",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "false",
+          "defaultExpression": "false"
         },
         {
           "property": "specTabLayout",

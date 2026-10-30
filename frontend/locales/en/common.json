@@ -691,6 +691,7 @@
 	"usageHistorySystemRequest": "System internal request",
 	"usageHistoryExternalAgent": "External agent request",
 	"usageHistoryKind_external": "External",
+	"usageHistoryKind_modeltrace": "ModelTrace",
 	"usageHistoryKind_narrator": "Narrator",
 	"usageHistoryKind_compact": "Compact",
 	"usageHistoryKind_context_ask": "Context ask",

@@ -2278,13 +2278,20 @@ export async function processEvent(
 			const partialId = ctx.getPartialMessageId();
 
 			if (partialId) {
-				// Partial message was already created incrementally via block_complete —
-				// just update final metadata (messageUuid + token usage).
+				// Seal the existing streamed step with the same final metadata as a whole reply.
 				savedId = partialId;
+				const turnStartedAt = ctx.getTurnStartedAt?.();
 				await narratorStore.sealStepMeta(savedId, {
 					messageUuid: event.messageId || undefined,
 					credentialId: event.credentialId || undefined,
 					turnUsageJson: turnUsage,
+					ttftMs: ctx.getTtftMs?.(),
+					durationMs: turnStartedAt
+						? Math.max(0, Date.now() - new Date(turnStartedAt).getTime())
+						: undefined,
+					contextPercent: ctx.getContextUsagePct(),
+					meterUsage: ctx.getMeterUsage(),
+					meterUnit: ctx.getMeterUnit(),
 				});
 				const usageData = buildUsageDataFromSnapshot(tokenUsage);
 				if (usageData && ctx.provider && ctx.model) {
@@ -2349,6 +2356,8 @@ export async function processEvent(
 						: undefined,
 				});
 				savedId = saved.id;
+				// Retain the durable receipt even if sealing/usage metadata fails next.
+				ctx.setPartialMessageId(savedId);
 				await narratorStore.sealStepMeta(savedId, { turnUsageJson: turnUsage });
 				if (usageData && ctx.provider && ctx.model) {
 					await updateMessageUsage(savedId, usageData, ctx.provider, ctx.model);

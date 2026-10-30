@@ -3,10 +3,17 @@
  * applied over someone else's newer change.
  *
  * `OutlineRead` records the version of every block it shows; `OutlineEdit` records the version
- * it wrote. Before an edit changes an existing block, the version the agent saw is compared with
- * the block's current one: newer, and written by anyone but this agent, is a conflict, reported
- * with the current text and resolved by reading again. A block the agent never read (or read
- * before a restart: the ledger lives in memory) is edited as is.
+ * it wrote (and, for a block it merged, the version its result shows). Before an edit changes an
+ * existing block, the version the agent saw is compared with the block's current one: newer, and
+ * written by anyone but this agent, means someone changed it since. A `replace` is then merged
+ * from that version (`agent-merge.ts`: the version is the merge's base, read back from the
+ * block's history); anything else, or a merge that overlaps, is a conflict, reported with the
+ * current text and resolved by reading again. A delete checks the blocks under the block the
+ * same way. A block the agent never read (or read before a restart: the ledger lives in memory)
+ * is the design's "cache gone" case: a replace or delete of it refuses when someone else wrote
+ * its latest version, and the refusal shows its current text in full and records that version
+ * here, so the edit goes through once the agent has seen it. What the agent wrote itself is
+ * never refused for not having been read.
  *
  * Bounded: {@link MAX_BLOCKS_PER_NARRATOR} blocks per narrator and {@link MAX_NARRATORS}
  * narrators, least recently used dropped first.

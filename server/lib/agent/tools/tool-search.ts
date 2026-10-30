@@ -6,7 +6,7 @@ import type { ToolDefinition } from "../types";
 export const toolSearchTool: ToolDefinition = {
 	name: "ToolSearch",
 	description:
-		"Find and load optional tools by capability. Searches only authorized auto-mode tool groups (including MCP servers), not manual or resident tools. Describe what you need in English or Chinese. A matching member loads its whole group; limit counts groups. Newly loaded tools are declared on the next model request and may execute immediately after loading, including parallel calls in the current response. Already loaded matches are reported without duplicate notices. Use this tool to discover capabilities; do not simulate unavailable tools through shell commands or internal service calls.",
+		"Find and load optional tools by capability. Searches only authorized auto-mode tools, not manual or resident tools. Describe what you need in English or Chinese. Each MCP match loads only that tool; built-in matches load their routine group. Limit counts these selections. Newly loaded tools are declared on the next model request and may execute immediately after loading, including parallel calls in the current response. Already loaded matches are reported without duplicate notices. Use this tool to discover capabilities; do not simulate unavailable tools through shell commands or internal service calls.",
 	parameters: z.object({
 		query: z.string().trim().min(1).max(512),
 		limit: z.number().int().min(1).max(5).default(3),
@@ -35,7 +35,7 @@ export const toolSearchTool: ToolDefinition = {
 			if (!group.searchTexts)
 				return [{ id: group.id, text: group.description, exactNames: exactGroup }];
 			return [
-				// Index the group description once, then each member's own description/schema.
+				// Index group and member metadata without materializing parameter schemas.
 				{ id: group.id, text: group.description, exactNames: exactGroup },
 				...group.searchTexts.map((text, index) => ({
 					id: group.id,

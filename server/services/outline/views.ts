@@ -287,6 +287,7 @@ const CHANGE_NAMES: ReadonlyArray<[number, OutlineChange]> = [
 	[OUTLINE_CHANGE.TASK, "task"],
 	[OUTLINE_CHANGE.PAGE, "page"],
 	[OUTLINE_CHANGE.PROPS, "props"],
+	[OUTLINE_CHANGE.MERGE, "merge"],
 ];
 
 /** The change flags of a version, by name. */

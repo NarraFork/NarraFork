@@ -203,7 +203,7 @@ import { resolvePlanApprovalAttribution } from "../plan-approval-attribution";
 import { subagentRetryRecoveredBroadcast } from "../subagent-executor";
 import { isMcpToolAllowedForNarrator, runtimeToolFilter } from "../subagent-tools";
 import { buildFinalToolStartAuthorization } from "../tool-final-start-authorization";
-import { parseMcpServerMarker } from "../tool-load-markers";
+import { mcpToolMarker, parseMcpServerMarker, parseMcpToolMarker } from "../tool-load-markers";
 import { resolveNarratorCapabilities } from "../trait-layer-service";
 import { buildTreeSnapshotExecutionHooks, FILE_MUTATING_TOOLS } from "../tree-snapshot-loop-hooks";
 import {
@@ -951,8 +951,10 @@ export async function runAgentLoopUnlocked(
 			// explicit ceiling has no managed loading and needs no MCP grant DB read.
 			const managedOptionalTools = new Set<string>();
 			let toolCandidates: readonly ToolDefinition[] = [];
+			let toolRegistryRevision = toolRegistry.revision;
 			const refreshMcpToolLoading = async () => {
 				const candidates = toolRegistry.all();
+				toolRegistryRevision = toolRegistry.revision;
 				toolCandidates = candidates;
 				managedOptionalTools.clear();
 				if (runtimePolicy.tools.builtin !== "all") return;
@@ -971,6 +973,7 @@ export async function runAgentLoopUnlocked(
 					.from(narrators)
 					.where(eq(narrators.id, narratorId))
 					.limit(1);
+				const explicitTools = new Set(latestNarrator?.enabledTools ?? []);
 				const loadedMcpServers = new Set(
 					(latestNarrator?.enabledTools ?? []).flatMap((value) => {
 						const id = parseMcpServerMarker(value);
@@ -983,11 +986,12 @@ export async function runAgentLoopUnlocked(
 					if (name.startsWith("mcp__")) managedOptionalTools.delete(name);
 				}
 				for (const name of active._enabledOptionalTools) {
-					if (name.startsWith("mcp__") || parseMcpServerMarker(name))
+					if (name.startsWith("mcp__") || parseMcpServerMarker(name) || parseMcpToolMarker(name))
 						active._enabledOptionalTools.delete(name);
 				}
 				for (const value of latestNarrator?.enabledTools ?? []) {
-					if (parseMcpServerMarker(value)) active._enabledOptionalTools.add(value);
+					if (parseMcpServerMarker(value) || parseMcpToolMarker(value))
+						active._enabledOptionalTools.add(value);
 				}
 				const servers = new Map((settings.mcpServers ?? []).map((server) => [server.id, server]));
 				for (const tool of candidates) {
@@ -1003,7 +1007,11 @@ export async function runAgentLoopUnlocked(
 					)
 						continue;
 					managedOptionalTools.add(tool.name);
-					if (resolveMcpLoadingMode(server) === "resident" || loadedMcpServers.has(server.id))
+					if (
+						resolveMcpLoadingMode(server) === "resident" ||
+						loadedMcpServers.has(server.id) ||
+						explicitTools.has(mcpToolMarker(server.id, tool.name))
+					)
 						active._enabledOptionalTools.add(tool.name);
 					else active._enabledOptionalTools.delete(tool.name);
 				}
@@ -1014,6 +1022,7 @@ export async function runAgentLoopUnlocked(
 				managed: new Set(managedOptionalTools),
 				current: new Set(active._enabledOptionalTools),
 				candidates: toolCandidates,
+				registryRevision: toolRegistryRevision,
 			});
 
 			// Preserve the original signed array. buildRuntimeHistory drops the placement under
@@ -1107,6 +1116,7 @@ export async function runAgentLoopUnlocked(
 							})
 						: getToolMessageWithParams("toolUnloaded", locale, { toolName }),
 			});
+			if (reconciled.opened) active._resetUpstreamSessionOnNextRequest = true;
 			if (reconciled.changed)
 				rawMessages = await narratorService.getModelHistorySinceLastCompact(narratorId, undefined, {
 					signal: active.abortController.signal,

@@ -691,6 +691,7 @@
 	"usageHistorySystemRequest": "系统内部请求",
 	"usageHistoryExternalAgent": "外部Agent请求",
 	"usageHistoryKind_external": "外部",
+	"usageHistoryKind_modeltrace": "ModelTrace",
 	"usageHistoryKind_narrator": "叙述者",
 	"usageHistoryKind_compact": "压缩",
 	"usageHistoryKind_context_ask": "上下文问答",

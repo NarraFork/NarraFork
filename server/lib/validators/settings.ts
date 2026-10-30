@@ -200,6 +200,9 @@ export const updateUserPreferencesSchema = z.object({
 	navLayout: navLayoutSchema.optional(),
 	// Narrator header toolbar layout: order = priority, position vs divider = surfaced or tucked
 	narratorToolbarLayout: narratorToolbarLayoutSchema.optional(),
+	// 提交身份入口的显示位置。跟账号走，不是浏览器本地偏好；默认关，叙述者详情里始终能选身份。
+	gitIdentityContextMenu: z.boolean().optional(),
+	gitIdentityCreateModal: z.boolean().optional(),
 });
 
 /**

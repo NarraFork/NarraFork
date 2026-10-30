@@ -87,6 +87,9 @@ const DEFAULTS = {
 	navLayout: "{}",
 	// Narrator header toolbar layout
 	narratorToolbarLayout: "{}",
+	// Git 提交身份入口的显示位置（跟账号走）
+	gitIdentityContextMenu: false,
+	gitIdentityCreateModal: false,
 };
 
 /** Mask a secret/webhook URL for safe display (show last 4 chars). */
@@ -169,6 +172,8 @@ const INSERT_COLUMNS = [
 	"gateway_config",
 	"nav_layout",
 	"narrator_toolbar_layout",
+	"git_identity_context_menu",
+	"git_identity_create_modal",
 	"created_at",
 	"updated_at",
 ] as const;
@@ -435,6 +440,8 @@ userPreferencesRoutes.patch("/", async (c) => {
 		   gateway_config = COALESCE(?, gateway_config),
 		   nav_layout = COALESCE(?, nav_layout),
 		   narrator_toolbar_layout = COALESCE(?, narrator_toolbar_layout),
+		   git_identity_context_menu = COALESCE(?, git_identity_context_menu),
+		   git_identity_create_modal = COALESCE(?, git_identity_create_modal),
 		   updated_at = ?`,
 			[
 				// INSERT values
@@ -480,6 +487,8 @@ userPreferencesRoutes.patch("/", async (c) => {
 				gatewayConfigJson ?? DEFAULTS.gatewayConfig,
 				navLayoutJson ?? DEFAULTS.navLayout,
 				narratorToolbarLayoutJson ?? DEFAULTS.narratorToolbarLayout,
+				(d.gitIdentityContextMenu ?? DEFAULTS.gitIdentityContextMenu) ? 1 : 0,
+				(d.gitIdentityCreateModal ?? DEFAULTS.gitIdentityCreateModal) ? 1 : 0,
 				now,
 				now,
 				// ON CONFLICT UPDATE values (null = keep existing)
@@ -523,6 +532,8 @@ userPreferencesRoutes.patch("/", async (c) => {
 				gatewayConfigJson,
 				navLayoutJson,
 				narratorToolbarLayoutJson,
+				d.gitIdentityContextMenu != null ? (d.gitIdentityContextMenu ? 1 : 0) : null,
+				d.gitIdentityCreateModal != null ? (d.gitIdentityCreateModal ? 1 : 0) : null,
 				now,
 			],
 		);

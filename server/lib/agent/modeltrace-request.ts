@@ -3,6 +3,8 @@ import type { ChatParams, ProviderAdapter } from "./provider";
 
 export interface ModelTraceRequest {
 	adapter: ProviderAdapter;
+	/** Effective routing provider captured with the adapter, never re-resolved on retry. */
+	provider: string;
 	params: Pick<
 		ChatParams,
 		| "conversationId"
@@ -29,11 +31,13 @@ const MAX_REQUESTS = 64;
 export function rememberModelTraceRequest(
 	narratorId: string,
 	adapter: ProviderAdapter,
-	params: ChatParams,
+	params: ModelTraceRequest["params"],
+	provider: string,
 ): void {
 	requests.delete(narratorId);
 	requests.set(narratorId, {
 		adapter,
+		provider,
 		params: {
 			conversationId: params.conversationId,
 			stickySessionKey: params.stickySessionKey,

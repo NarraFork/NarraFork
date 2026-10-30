@@ -1,4 +1,8 @@
-import { isAdminToolExecutionAllowed, mcpServerMarker } from "@server/services/tool-load-markers";
+import {
+	isAdminToolExecutionAllowed,
+	mcpServerMarker,
+	mcpToolMarker,
+} from "@server/services/tool-load-markers";
 import {
 	beginToolStartAdmission,
 	convertToolStartGrantToExecution,
@@ -908,7 +912,8 @@ export async function executeTool(
 				(config.toolFilter && !config.toolFilter(tool)) ||
 				(config.toolLoading?.managed.size !== 0 &&
 					resolveMcpLoadingMode(server) === "auto" &&
-					config.isToolLoaded?.(mcpServerMarker(server.id)) !== true)
+					config.isToolLoaded?.(mcpServerMarker(server.id)) !== true &&
+					config.isToolLoaded?.(mcpToolMarker(server.id, tool.name)) !== true)
 			) {
 				return {
 					output: `MCP tool is disabled or not loaded: ${tu.name}`,

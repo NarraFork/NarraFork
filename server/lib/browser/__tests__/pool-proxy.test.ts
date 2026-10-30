@@ -41,7 +41,7 @@ mock.module("puppeteer-core", () => ({
 	...realPuppeteer,
 	default: { ...realPuppeteer.default, connect: async () => fakeBrowser },
 }));
-const { connectBrowser, closeBrowser, createContext, fetchPage } = await import("../pool");
+const { connectBrowser, closeBrowser, fetchPage, openTab } = await import("../pool");
 
 beforeEach(async () => {
 	contexts.length = 0;
@@ -64,7 +64,7 @@ afterAll(() => {
 });
 
 test("shared process creates independent Browser and WebFetch contexts", async () => {
-	await createContext();
+	await openTab();
 	const page = await fetchPage("https://example.test");
 	expect(contexts[0]?.options).toMatchObject({ proxyServer: "http://browser:8082" });
 	expect(contexts[1]?.options).toMatchObject({ proxyServer: "http://fetch:8081" });
@@ -74,9 +74,9 @@ test("shared process creates independent Browser and WebFetch contexts", async (
 });
 
 test("new sessions pick up changes without closing an existing session", async () => {
-	await createContext();
+	await openTab();
 	settings.agent.browserProxy = { mode: "direct" };
-	await createContext();
+	await openTab();
 	expect(contexts[0]?.options).toMatchObject({ proxyServer: "http://browser:8082" });
 	expect(contexts[1]?.options).toMatchObject({ proxyServer: "direct://" });
 	expect(contexts[0]?.close).not.toHaveBeenCalled();

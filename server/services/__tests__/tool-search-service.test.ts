@@ -13,6 +13,7 @@ import { generateId } from "../../lib/id";
 import { DISABLED_TOOLS_TRAIT_PREFIX, upsertEncodedTrait } from "../../lib/narrator-custom-traits";
 import { settings } from "../../lib/settings";
 import { handleLoadToolCommand, narratorService } from "../narrator-service";
+import { mcpToolMarker, parseMcpToolMarker } from "../tool-load-markers";
 import { changeLoadedToolGroup, getToolSearchCandidates } from "../tool-loading-service";
 import { resetTraitLayerCaches } from "../trait-layer-service";
 
@@ -22,6 +23,7 @@ const savedRoutines = settings.routines;
 const created: string[] = [];
 const NAMES = ["mcp__search_fixture__calendar", "mcp__search_fixture__events"];
 const marker = "mcp-server:search-fixture";
+const selectedMarker = mcpToolMarker("search-fixture", NAMES[0]);
 let calls = 0;
 let parallelSearches = false;
 let requests: ChatParams[] = [];
@@ -34,9 +36,9 @@ const provider: ProviderAdapter = {
 		if (requests.length === 1)
 			yield {
 				toolUses: [
-					{ toolUseId: "search", name: "ToolSearch", input: { query: "calendar" } },
+					{ toolUseId: "search", name: "ToolSearch", input: { query: NAMES[0], limit: 1 } },
 					...(parallelSearches
-						? [{ toolUseId: "search-2", name: "ToolSearch", input: { query: "calendar" } }]
+						? [{ toolUseId: "search-2", name: "ToolSearch", input: { query: NAMES[0], limit: 1 } }]
 						: []),
 				],
 			};
@@ -121,7 +123,7 @@ afterAll(() => {
 	mock.restore();
 });
 
-test("real ToolSearch loads an MCP group and deduplicates concurrent repeat searches", async () => {
+test("real ToolSearch loads only one MCP tool and deduplicates concurrent repeat searches", async () => {
 	const id = await fixture();
 	const websocket = await import("../../websocket/narrator-ws");
 	const broadcasts: unknown[] = [];
@@ -130,19 +132,20 @@ test("real ToolSearch loads an MCP group and deduplicates concurrent repeat sear
 	});
 	try {
 		const results = await Promise.all([
-			toolSearchTool.execute({ query: "calendar" }, context(id)),
-			toolSearchTool.execute({ query: "calendar" }, context(id)),
+			toolSearchTool.execute({ query: NAMES[0], limit: 1 }, context(id)),
+			toolSearchTool.execute({ query: NAMES[0], limit: 1 }, context(id)),
 		]);
 		expect(results.map((r) => JSON.parse(r.output).results[0].status).sort()).toEqual([
 			"already_loaded",
 			"loaded",
 		]);
 		const row = await db.query.narrators.findFirst({ where: eq(narrators.id, id) });
-		expect(row?.enabledTools).toEqual([marker]);
+		expect(row?.enabledTools).toEqual([selectedMarker]);
 		const rows = await notices(id);
 		expect(rows).toHaveLength(1);
-		expect(JSON.stringify(rows[0]?.contentJson)).toContain("definitionSnapshots");
+		expect(JSON.stringify(rows[0]?.contentJson)).not.toContain("definitionSnapshots");
 		expect(JSON.stringify(rows[0]?.contentJson)).toContain(NAMES[0]);
+		expect(JSON.stringify(rows[0]?.contentJson)).not.toContain(NAMES[1]);
 		expect(
 			broadcasts.filter((event) => (event as { type?: string }).type === "user_message"),
 		).toHaveLength(1);
@@ -157,7 +160,7 @@ test("marker plus legacy concrete names is normalized even on an already-loaded 
 		.update(narrators)
 		.set({ enabledTools: [marker, ...NAMES] })
 		.where(eq(narrators.id, id));
-	const result = await toolSearchTool.execute({ query: "calendar" }, context(id));
+	const result = await toolSearchTool.execute({ query: NAMES[0], limit: 1 }, context(id));
 	expect(JSON.parse(result.output).results[0].status).toBe("already_loaded");
 	expect(
 		(await db.query.narrators.findFirst({ where: eq(narrators.id, id) }))?.enabledTools,
@@ -165,17 +168,22 @@ test("marker plus legacy concrete names is normalized even on an already-loaded 
 	expect(await notices(id)).toHaveLength(0);
 });
 
-test("legacy concrete names without a durable marker do not authorize a group", async () => {
+test("legacy resident concrete names do not become explicit selections after switching to auto", async () => {
 	const id = await fixture();
+	const server = settings.mcpServers?.[0];
+	if (!server) throw new Error("Missing fixture server");
+	settings.mcpServers = [{ ...server, mode: "resident" }];
 	await db.update(narrators).set({ enabledTools: NAMES }).where(eq(narrators.id, id));
-	const result = await toolSearchTool.execute({ query: "calendar" }, context(id));
+	expect((await getToolSearchCandidates(id)).some((group) => group.id === NAMES[0])).toBe(false);
+	settings.mcpServers = [{ ...server, mode: "auto" }];
+	const result = await toolSearchTool.execute({ query: NAMES[0], limit: 1 }, context(id));
 	expect(JSON.parse(result.output).results[0].status).toBe("loaded");
 	expect(
 		(await db.query.narrators.findFirst({ where: eq(narrators.id, id) }))?.enabledTools,
-	).toEqual([marker]);
+	).toEqual([selectedMarker]);
 	const rows = await notices(id);
 	expect(rows).toHaveLength(1);
-	expect((rows[0]?.contentJson as { toolNames?: string[] }[])[0]?.toolNames).toEqual(NAMES);
+	expect((rows[0]?.contentJson as { toolNames?: string[] }[])[0]?.toolNames).toEqual([NAMES[0]]);
 });
 
 test("mode, live deny, trait and unavailable tools stay out of search", async () => {
@@ -183,7 +191,7 @@ test("mode, live deny, trait and unavailable tools stay out of search", async ()
 	const server = settings.mcpServers?.[0];
 	if (!server) throw new Error("Missing fixture server");
 	settings.mcpServers = [{ ...server, mode: "resident" }];
-	expect((await getToolSearchCandidates(id)).some((group) => group.id === marker)).toBe(false);
+	expect((await getToolSearchCandidates(id)).some((group) => group.id === NAMES[0])).toBe(false);
 	settings.mcpServers = [
 		{
 			...settings.mcpServers[0],
@@ -192,7 +200,7 @@ test("mode, live deny, trait and unavailable tools stay out of search", async ()
 		},
 	];
 	expect(
-		(await getToolSearchCandidates(id)).find((group) => group.id === marker)?.toolNames,
+		(await getToolSearchCandidates(id)).find((group) => group.id === NAMES[0])?.toolNames,
 	).toEqual([NAMES[0]]);
 	await db
 		.update(narrators)
@@ -204,7 +212,7 @@ test("mode, live deny, trait and unavailable tools stay out of search", async ()
 		})
 		.where(eq(narrators.id, id));
 	resetTraitLayerCaches();
-	expect((await getToolSearchCandidates(id)).some((group) => group.id === marker)).toBe(false);
+	expect((await getToolSearchCandidates(id)).some((group) => group.id === NAMES[0])).toBe(false);
 });
 
 test("SQLite failure rolls back both notice and state", async () => {
@@ -250,21 +258,23 @@ test("builtin modes, availability and runtime ceilings are applied before rankin
 	if (!tool) throw new Error("missing fixture tool");
 	toolRegistry.register({ ...tool, isAvailable: () => false });
 	expect(
-		(await getToolSearchCandidates(id)).find((group) => group.id === marker)?.toolNames,
+		(await getToolSearchCandidates(id))
+			.filter((group) => NAMES.includes(group.id))
+			.map((group) => group.id),
 	).toEqual([NAMES[1]]);
 	const { resolveRuntimePolicy, compileDelegationPolicy } = await import("../agent-runtime/policy");
 	const ctx = {
 		...context(id),
 		runtimePolicy: resolveRuntimePolicy([compileDelegationPolicy({ template: "explore" })]),
 	};
-	expect((await getToolSearchCandidates(id, null, ctx)).some((group) => group.id === marker)).toBe(
-		false,
-	);
+	expect(
+		(await getToolSearchCandidates(id, null, ctx)).some((group) => group.id === NAMES[0]),
+	).toBe(false);
 });
 
 test("a stale search hit is reauthorized against one fresh commit catalog", async () => {
 	const id = await fixture();
-	const stale = (await getToolSearchCandidates(id)).find((group) => group.id === marker);
+	const stale = (await getToolSearchCandidates(id)).find((group) => group.id === NAMES[0]);
 	if (!stale) throw new Error("missing stale candidate");
 	const server = settings.mcpServers?.[0];
 	if (!server) throw new Error("missing fixture server");
@@ -294,7 +304,7 @@ test("final execution authorization precedes the atomic notice and state commit"
 				authorized = true;
 			},
 		};
-		const result = await toolSearchTool.execute({ query: "calendar" }, ctx);
+		const result = await toolSearchTool.execute({ query: NAMES[0], limit: 1 }, ctx);
 		expect(JSON.parse(result.output).results[0].status).toBe("loaded");
 		expect(recheckAuthorization).toHaveBeenCalledTimes(2);
 		expect(append).toHaveBeenCalledTimes(1);
@@ -314,54 +324,91 @@ test("ToolSearch propagates cancellation instead of converting it to a hit error
 			if (++checks === 2) controller.abort(new Error("cancelled tool search"));
 		},
 	};
-	await expect(toolSearchTool.execute({ query: "calendar" }, ctx)).rejects.toThrow(
+	await expect(toolSearchTool.execute({ query: NAMES[0], limit: 1 }, ctx)).rejects.toThrow(
 		"cancelled tool search",
 	);
 	expect(await notices(id)).toHaveLength(0);
 });
 
-test("bounded snapshots reject oversized schemas before cloning and protect the final epoch budget", async () => {
+test("explicit server load accepts 281 realistic tool schemas without snapshot budgets", async () => {
 	const id = await fixture();
-	const { snapshotToolDefinitions } = await import("../../lib/agent/tool-loading");
-	const server = settings.mcpServers?.[0];
-	if (!server) throw new Error("missing fixture server");
-	const secondMarker = "mcp-server:search-fixture-second";
-	settings.mcpServers = [server, { ...server, id: "search-fixture-second", name: "Calendar 2" }];
-	for (const [index, name] of NAMES.entries()) {
-		const tool = toolRegistry.get(name);
-		if (!tool) throw new Error("missing fixture tool");
-		toolRegistry.register({
-			...tool,
-			metadata: {
-				...tool.metadata,
-				mcpServerId: index === 0 ? server.id : "search-fixture-second",
-			},
-			rawJsonSchema: { type: "object", description: "x".repeat(100_000) },
-		});
-	}
-	expect(snapshotToolDefinitions([NAMES[0]])).toHaveLength(1);
-	expect(() => snapshotToolDefinitions(NAMES)).toThrow("serialization budget");
-	await changeLoadedToolGroup(
-		id,
-		{ id: marker, marker, description: "calendar", toolNames: [NAMES[0]] },
-		true,
+	const names = Array.from(
+		{ length: 279 },
+		(_, index) => `mcp__search_fixture__operation_${index}`,
 	);
-	await expect(
-		changeLoadedToolGroup(
-			id,
-			{
-				id: secondMarker,
-				marker: secondMarker,
-				description: "calendar",
-				toolNames: [NAMES[1]],
-			},
-			true,
+	const rawJsonSchema = {
+		type: "object",
+		properties: Object.fromEntries(
+			["project", "path", "query", "language", "cursor", "sort", "scope", "filter"].map((name) => [
+				name,
+				{
+					type: "string",
+					description: `The ${name} to use when querying project resources and returning matching records.`,
+				},
+			]),
 		),
-	).rejects.toThrow("serialization budget");
-	expect(await notices(id)).toHaveLength(1);
-	expect(
-		(await db.query.narrators.findFirst({ where: eq(narrators.id, id) }))?.enabledTools,
-	).toEqual([marker]);
+	};
+	try {
+		for (const name of names) {
+			toolRegistry.register({
+				name,
+				description: "Query project resources",
+				parameters: z.object({}),
+				rawJsonSchema,
+				metadata: { mcpServerId: "search-fixture", mcpToolName: name },
+				execute: async () => ({ output: "ok" }),
+			});
+		}
+		expect(JSON.stringify(rawJsonSchema).length * names.length).toBeGreaterThan(192 * 1024);
+		expect(
+			await changeLoadedToolGroup(
+				id,
+				{ id: marker, marker, description: "calendar", toolNames: [...NAMES, ...names] },
+				true,
+			),
+		).toBe("loaded");
+		const rows = await notices(id);
+		expect(rows).toHaveLength(1);
+		expect((rows[0]?.contentJson as { toolNames?: string[] }[])[0]?.toolNames).toHaveLength(281);
+		expect(JSON.stringify(rows[0]?.contentJson)).not.toContain("definitionSnapshots");
+	} finally {
+		for (const name of names) toolRegistry.unregister(name);
+	}
+});
+
+test("a catalog beyond 4096 tools remains searchable and explicitly loadable using metadata only", async () => {
+	const id = await fixture();
+	const names = Array.from({ length: 4100 }, (_, index) => `mcp__search_fixture__catalog_${index}`);
+	const schema = z.object({});
+	try {
+		for (const name of names) {
+			toolRegistry.register({
+				name,
+				description: "Project resource query",
+				parameters: schema,
+				get rawJsonSchema(): Record<string, unknown> {
+					throw new Error("Discovery must not read schemas");
+				},
+				metadata: { mcpServerId: "search-fixture", mcpToolName: name },
+				execute: async () => ({ output: "ok" }),
+			});
+		}
+		const target = names[names.length - 1];
+		const result = await toolSearchTool.execute({ query: target, limit: 1 }, context(id));
+		expect(JSON.parse(result.output).results).toEqual([{ group: target, status: "loaded" }]);
+		expect(
+			(await db.query.narrators.findFirst({ where: eq(narrators.id, id) }))?.enabledTools,
+		).toEqual([mcpToolMarker("search-fixture", target)]);
+		expect(
+			await changeLoadedToolGroup(
+				id,
+				{ id: marker, marker, description: "calendar", toolNames: [...NAMES, ...names] },
+				true,
+			),
+		).toBe("loaded");
+	} finally {
+		for (const name of names) toolRegistry.unregister(name);
+	}
 });
 
 test("failed notice transaction leaves persisted load state unchanged", async () => {
@@ -475,6 +522,8 @@ test("ToolSearch schemas appear on the next request in the same agent turn, then
 			for (const name of row?.enabledTools ?? []) {
 				current.add(name);
 				if (name === marker) for (const member of NAMES) current.add(member);
+				const selection = parseMcpToolMarker(name);
+				if (selection) current.add(selection.canonicalName);
 			}
 			return {
 				history: [],
@@ -502,13 +551,14 @@ test("ToolSearch schemas appear on the next request in the same agent turn, then
 		NAMES[0],
 	);
 	expect(requests[1]?.toolLoadingStrategy).toBe("replace_tools");
-	expect((requests[1]?.tools as { name: string }[]).map((tool) => tool.name)).toEqual(
-		expect.arrayContaining(NAMES),
+	expect((requests[1]?.tools as { name: string }[]).map((tool) => tool.name)).toContain(NAMES[0]);
+	expect((requests[1]?.tools as { name: string }[]).map((tool) => tool.name)).not.toContain(
+		NAMES[1],
 	);
 	expect(calls).toBe(1);
 	expect(outputs.some((output) => output.includes("calendar executed"))).toBe(true);
 	expect(await notices(id)).toHaveLength(1);
 	expect(
 		(await db.query.narrators.findFirst({ where: eq(narrators.id, id) }))?.enabledTools,
-	).toEqual([marker]);
+	).toEqual([selectedMarker]);
 });

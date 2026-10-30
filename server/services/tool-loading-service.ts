@@ -3,8 +3,7 @@ import { type RoutineModeConfig, resolveEffectiveToolRoutineMode } from "@shared
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { narrators, projects, users } from "../db/schema";
-import { snapshotToolDefinitions } from "../lib/agent/tool-loading";
-import { resolveToolJsonSchema, toolRegistry } from "../lib/agent/tool-registry";
+import { toolRegistry } from "../lib/agent/tool-registry";
 import type { ToolContext, ToolDefinition } from "../lib/agent/types";
 import { getBuiltinToolNames, getBuiltinToolRoutines } from "../lib/builtin-routines";
 import { getDisabledToolSet } from "../lib/narrator-custom-traits";
@@ -15,7 +14,13 @@ import { broadcastToNarrator } from "../websocket/narrator-ws";
 import { narratorStore } from "./narrator-store";
 import { assertOAuthNarratorRuntimeActive } from "./oauth-narrator-runtime-policy";
 import { runtimeToolFilter } from "./subagent-tools";
-import { ADMIN_ONLY_LOAD_TOOLS, mcpServerMarker, parseMcpServerMarker } from "./tool-load-markers";
+import {
+	ADMIN_ONLY_LOAD_TOOLS,
+	mcpServerMarker,
+	mcpToolMarker,
+	parseMcpServerMarker,
+	parseMcpToolMarker,
+} from "./tool-load-markers";
 import {
 	resolveEffectiveTraits,
 	resolveNarratorProjectId,
@@ -24,25 +29,8 @@ import {
 
 function toolDescription(tool: ToolDefinition | undefined): string {
 	if (!tool) return "";
-	const description = typeof tool.description === "string" ? tool.description : "";
-	const schema = resolveToolJsonSchema(tool);
-	const properties =
-		schema.properties && typeof schema.properties === "object" ? schema.properties : {};
-	const fields = Object.entries(properties)
-		.slice(0, 64)
-		.map(([name, value]) => {
-			const detail =
-				value &&
-				typeof value === "object" &&
-				"description" in value &&
-				typeof value.description === "string"
-					? value.description.slice(0, 128)
-					: "";
-			return `${name.slice(0, 128)} ${detail}`;
-		})
-		.join(" ")
-		.slice(0, 2048);
-	return `${description.slice(0, 2048)} ${fields}`;
+	// Discovery needs only metadata, never schema resolution or serialization.
+	return typeof tool.description === "string" ? tool.description.slice(0, 2048) : "";
 }
 
 export interface LoadableToolGroup {
@@ -135,29 +123,19 @@ async function buildCandidates(view: CatalogView): Promise<LoadableToolGroup[]> 
 			.filter((server) => resolveMcpLoadingMode(server) === "auto")
 			.map((server) => [server.id, server]),
 	);
-	const serverTools = new Map<string, ToolDefinition[]>();
 	for (const [index, tool] of tools.entries()) {
-		if (index >= 4096) throw new Error("Tool catalog exceeds 4096 entries");
 		if (index % 32 === 0) {
 			await new Promise<void>((resolve) => setImmediate(resolve));
 			signal?.throwIfAborted();
 		}
 		const serverId = tool.metadata?.mcpServerId;
-		if (!serverId || !autoServers.has(serverId) || !allowed(tool)) continue;
-		const group = serverTools.get(serverId) ?? [];
-		group.push(tool);
-		serverTools.set(serverId, group);
-	}
-	for (const [serverId, server] of autoServers) {
-		const members = serverTools.get(serverId) ?? [];
-		if (!members.length) continue;
-		const marker = mcpServerMarker(serverId);
+		const server = serverId ? autoServers.get(serverId) : undefined;
+		if (!server || !allowed(tool)) continue;
 		groups.push({
-			id: marker,
-			marker,
-			toolNames: members.map((tool) => tool.name),
-			description: server.name.slice(0, 2048),
-			searchTexts: members.map((tool) => `${tool.name} ${describe(tool.name)}`),
+			id: tool.name,
+			marker: mcpToolMarker(server.id, tool.name),
+			toolNames: [tool.name],
+			description: `${tool.name} ${server.name.slice(0, 512)} ${describe(tool.name)}`,
 		});
 	}
 	return groups;
@@ -215,7 +193,13 @@ async function resolveLoadCatalog(
 	const user = userId
 		? await db.query.users.findFirst({ where: eq(users.id, userId), columns: { role: true } })
 		: undefined;
+	const enabledMcpServers = new Set(
+		(settings.mcpServers ?? [])
+			.filter((server) => resolveMcpLoadingMode(server) !== "disabled")
+			.map((server) => server.id),
+	);
 	const allowed = (tool: ToolDefinition) =>
+		(!tool.metadata?.mcpServerId || enabledMcpServers.has(tool.metadata.mcpServerId)) &&
 		(!tool.isAvailable || tool.isAvailable()) &&
 		!disabled.has(tool.name) &&
 		runtimeFilter(tool) &&
@@ -236,7 +220,6 @@ async function resolveLoadCatalog(
 		/* Same malformed-settings fallback as session assembly. */
 	}
 	const tools = toolRegistry.all();
-	if (tools.length > 4096) throw new Error("Tool catalog exceeds 4096 entries");
 	const view: CatalogView = {
 		tools,
 		byName: new Map(tools.map((tool) => [tool.name, tool])),
@@ -296,7 +279,7 @@ function denialReason(catalog: CatalogView, toolNames: readonly string[]): ToolG
 
 type ResolvedLoadCatalog = Awaited<ReturnType<typeof resolveLoadCatalog>>;
 
-/** One serialized, notice-free cleanup for the pre-marker persisted representation. */
+/** Reconcile canonical single-tool selections and explicit server-group markers. */
 async function normalizePersistedToolState(
 	narratorId: string,
 	catalog: ResolvedLoadCatalog,
@@ -323,20 +306,22 @@ async function normalizePersistedToolState(
 				return (
 					serverId &&
 					catalog.allowed(tool) &&
-					(current.has(mcpServerMarker(serverId)) || catalog.resident.has(tool.name))
+					(current.has(mcpToolMarker(serverId, tool.name)) ||
+						current.has(mcpServerMarker(serverId)) ||
+						catalog.resident.has(tool.name))
 				);
 			})
 			.map((tool) => tool.name),
 	);
 	const stale = [...active].filter((name) => {
 		if (name.startsWith("mcp__")) return !authorized.has(name);
-		const marker = parseMcpServerMarker(name);
+		const marker = parseMcpServerMarker(name) || parseMcpToolMarker(name);
 		return marker ? !current.has(name) : false;
 	});
 	updateActiveLoadedTools(narratorId, stale, false);
 	updateActiveLoadedTools(
 		narratorId,
-		[...current].filter((name) => !!parseMcpServerMarker(name)),
+		[...current].filter((name) => !!parseMcpServerMarker(name) || !!parseMcpToolMarker(name)),
 		true,
 	);
 	updateActiveLoadedTools(narratorId, authorized, true);
@@ -361,11 +346,28 @@ export async function changeLoadedToolGroup(
 				narratorId,
 				userId,
 				context,
-				!!context || !!group.marker,
+				!!context && !group.marker,
 			);
-			const fresh = catalog.candidates.find((item) => item.id === group.id);
-			if (fresh && (context || group.marker)) group = fresh;
-			else if (loaded && (context || group.marker)) return denialReason(catalog, group.toolNames);
+			if (group.marker) {
+				const selection = parseMcpToolMarker(group.marker);
+				const serverId = selection?.serverId ?? parseMcpServerMarker(group.marker);
+				const server = catalog.mcpServers.find((item) => item.id === serverId);
+				const members = selection
+					? [catalog.byName.get(selection.canonicalName)].filter(
+							(tool): tool is ToolDefinition => !!tool,
+						)
+					: catalog.tools;
+				const toolNames = members
+					.filter((tool) => tool.metadata?.mcpServerId === serverId && catalog.allowed(tool))
+					.map((tool) => tool.name);
+				if (loaded && (!server || resolveMcpLoadingMode(server) !== "auto" || !toolNames.length))
+					return denialReason(catalog, group.toolNames);
+				group = { ...group, toolNames };
+			} else if (context) {
+				const fresh = catalog.candidates.find((item) => item.id === group.id);
+				if (fresh) group = fresh;
+				else if (loaded) return denialReason(catalog, group.toolNames);
+			}
 			const containsMcpTool = group.toolNames.some(
 				(name) => name.startsWith("mcp__") || !!catalog.byName.get(name)?.metadata?.mcpServerId,
 			);
@@ -389,7 +391,10 @@ export async function changeLoadedToolGroup(
 			if (group.marker) {
 				// Only durable markers authorize a group. Active concrete names are derived
 				// runtime state and can never suppress the commit that persists a missing marker.
-				const exists = current.has(group.marker);
+				const selection = parseMcpToolMarker(group.marker);
+				const exists =
+					current.has(group.marker) ||
+					(loaded && !!selection && current.has(mcpServerMarker(selection.serverId)));
 				if (exists !== loaded) changed = [...group.toolNames];
 			} else {
 				for (const name of group.toolNames) {
@@ -409,40 +414,6 @@ export async function changeLoadedToolGroup(
 				}
 			}
 
-			let definitionSnapshots: ReturnType<typeof snapshotToolDefinitions> | undefined;
-			if (loaded) {
-				// Derive the exact next concrete current set from the post-change markers and
-				// current group. Legacy MCP names and marker strings never enter an epoch.
-				const nextCurrent = new Set(
-					[...current, ...active].filter(
-						(name) => !name.startsWith("mcp__") && !parseMcpServerMarker(name),
-					),
-				);
-				for (const name of catalog.resident) nextCurrent.add(name);
-				for (const tool of catalog.tools) {
-					const serverId = tool.metadata?.mcpServerId;
-					if (
-						serverId &&
-						(current.has(mcpServerMarker(serverId)) || catalog.resident.has(tool.name))
-					)
-						nextCurrent.add(tool.name);
-				}
-				if (!group.marker) for (const name of group.toolNames) nextCurrent.add(name);
-				const nextSnapshots = snapshotToolDefinitions(
-					[...nextCurrent].filter((name) => {
-						const tool = catalog.byName.get(name);
-						return tool && catalog.allowed(tool);
-					}),
-					catalog.tools,
-				);
-				// Reuse the one bounded next-current serialization for this notice.
-				const snapshots = new Map(nextSnapshots.map((snapshot) => [snapshot.name, snapshot]));
-				definitionSnapshots = changed.flatMap((name) => {
-					const snapshot = snapshots.get(name);
-					if (!snapshot) throw new Error("Tool group definitions are unavailable");
-					return [snapshot];
-				});
-			}
 			const noticeLocale: Locale = (context?.locale ?? locale) === "zh-CN" ? "zh-CN" : "en";
 			const block = {
 				type: loaded ? ("tool_loaded" as const) : ("tool_unloaded" as const),
@@ -454,16 +425,18 @@ export async function changeLoadedToolGroup(
 							toolDescription: localizedGroupDescription(group, noticeLocale).slice(0, 2048),
 						})
 					: getToolMessageWithParams("toolUnloaded", noticeLocale, { toolName: group.id }),
-				...(loaded ? { definitionSnapshots } : {}),
 			};
 			context?.signal.throwIfAborted();
 			context?.assertFinalExecutionPermission?.();
 			const msg = await narratorStore.appendToolChange(narratorId, block, undefined, [...current]);
 			if (group.marker) {
+				const selection = parseMcpToolMarker(group.marker);
 				const serverId = parseMcpServerMarker(group.marker);
-				const previousNames = catalog.tools
-					.filter((tool) => tool.metadata?.mcpServerId === serverId)
-					.map((tool) => tool.name);
+				const previousNames = selection
+					? [selection.canonicalName]
+					: catalog.tools
+							.filter((tool) => tool.metadata?.mcpServerId === serverId)
+							.map((tool) => tool.name);
 				updateActiveLoadedTools(narratorId, [group.marker, ...previousNames], false);
 				if (loaded) updateActiveLoadedTools(narratorId, [group.marker, ...group.toolNames], true);
 			} else {

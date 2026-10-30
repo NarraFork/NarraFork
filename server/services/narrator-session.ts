@@ -210,7 +210,7 @@ import { appendSubagentFileChanges } from "./subagent-file-changes";
 import { agentResultTag, resolveAgentLabel } from "./subagent-label";
 import { resolveSubagentModelForRun, subagentRunReasoningEffort } from "./subagent-model";
 import { buildFinalToolStartAuthorization } from "./tool-final-start-authorization";
-import { parseMcpServerMarker } from "./tool-load-markers";
+import { mcpToolMarker, parseMcpServerMarker } from "./tool-load-markers";
 import { resolveEffectiveTraits, resolveNarratorRuntimePolicy } from "./trait-layer-service";
 import {
 	buildSpecContinuationPrompt,
@@ -1423,6 +1423,7 @@ async function createNarrator(
 	}
 
 	if (!initialOAuthRuntime) {
+		const explicitlyLoaded = new Set(narrator.enabledTools ?? []);
 		const loadedServers = new Set(
 			(narrator.enabledTools ?? []).flatMap((value) => {
 				const id = parseMcpServerMarker(value);
@@ -1434,7 +1435,9 @@ async function createNarrator(
 			if (
 				server &&
 				resolveMcpLoadingMode(server) !== "disabled" &&
-				(resolveMcpLoadingMode(server) === "resident" || loadedServers.has(server.id))
+				(resolveMcpLoadingMode(server) === "resident" ||
+					loadedServers.has(server.id) ||
+					explicitlyLoaded.has(mcpToolMarker(server.id, tool.name)))
 			)
 				active._enabledOptionalTools.add(tool.name);
 		}

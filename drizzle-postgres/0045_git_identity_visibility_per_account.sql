@@ -1,0 +1,2 @@
+ALTER TABLE "user_preferences" ADD COLUMN "git_identity_context_menu" boolean DEFAULT false NOT NULL;--> statement-breakpoint
+ALTER TABLE "user_preferences" ADD COLUMN "git_identity_create_modal" boolean DEFAULT false NOT NULL;

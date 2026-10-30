@@ -674,6 +674,10 @@ export const narratorsApi = {
 		request<{ id: string }>(`/narrators/${encodeURIComponent(narratorId)}/modeltrace`, {
 			method: "POST",
 		}),
+	retryModelTrace: (narratorId: string) =>
+		request<{ id: string }>(`/narrators/${encodeURIComponent(narratorId)}/modeltrace/retry`, {
+			method: "POST",
+		}),
 	saveRequestRecording: (narratorId: string, signal?: AbortSignal) =>
 		request<SavedRecording>(`/narrators/${encodeURIComponent(narratorId)}/request-recordings`, {
 			method: "POST",

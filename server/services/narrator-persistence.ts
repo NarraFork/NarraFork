@@ -4477,7 +4477,16 @@ const sqliteNarratorPersistence = {
 	/** Final metadata of a sealed step (upstream id, credential, turn usage). */
 	async patchStepMeta(
 		messageId: string,
-		meta: { messageUuid?: string; credentialId?: string; turnUsageJson?: Record<string, unknown> },
+		meta: {
+			messageUuid?: string;
+			credentialId?: string;
+			turnUsageJson?: Record<string, unknown>;
+			ttftMs?: number;
+			durationMs?: number;
+			contextPercent?: number;
+			meterUsage?: number;
+			meterUnit?: string;
+		},
 	): Promise<void> {
 		const updates = Object.fromEntries(
 			Object.entries(meta).filter(([, value]) => value !== undefined),

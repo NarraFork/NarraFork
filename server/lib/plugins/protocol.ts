@@ -16,6 +16,15 @@ export const NARRAFORK_RPC_PROTOCOL = "narrafork.rpc/1" as const;
 export const PROVIDER_PROTOCOL_VERSION = "1.0" as const;
 /** Full UTF-8 JSON-RPC request body budget, including base64 images; inbound limits stay small. */
 export const PROVIDER_REQUEST_MAX_BYTES = 64 * 1024 * 1024;
+/** Tool business payloads; schema limits and model-visible output previews are independent. */
+export const PLUGIN_TOOL_INPUT_MAX_BYTES = 8 * 1024 * 1024;
+export const PLUGIN_TOOL_OUTPUT_MAX_BYTES = 16 * 1024 * 1024;
+// Retain the former control-frame allowance for RPC IDs, invocation context and envelope.
+const TOOL_RPC_ENVELOPE_BYTES = 1024 * 1024;
+export const PLUGIN_TOOL_INPUT_FRAME_MAX_BYTES =
+	PLUGIN_TOOL_INPUT_MAX_BYTES + TOOL_RPC_ENVELOPE_BYTES;
+export const PLUGIN_TOOL_OUTPUT_FRAME_MAX_BYTES =
+	PLUGIN_TOOL_OUTPUT_MAX_BYTES + TOOL_RPC_ENVELOPE_BYTES;
 /**
  * Dump budget the host advertises to a plugin in `ProviderChatParams.requestDump.maxBytes`.
  * What crosses the RPC boundary stays bounded independently from model output. Exceeding
@@ -399,13 +408,15 @@ export const hostInitializeParamsSchema = z
 					.int()
 					.positive()
 					.max(64 * 1024 * 1024),
-				maxInFlight: z.number().int().positive().max(1_024),
-				maxQueuedBytes: z
+				maxOutboundFrameBytes: z
 					.number()
 					.int()
 					.positive()
-					.max(64 * 1024 * 1024)
+					.max(PROVIDER_REQUEST_MAX_BYTES)
 					.optional(),
+				maxInFlight: z.number().int().positive().max(1_024),
+				// A queue also reserves framing/control space; it can exceed one maximum frame.
+				maxQueuedBytes: z.number().int().positive().max(Number.MAX_SAFE_INTEGER).optional(),
 			})
 			.strict(),
 	})

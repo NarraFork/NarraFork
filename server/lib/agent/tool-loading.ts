@@ -216,39 +216,6 @@ export interface ToolDefinitionSnapshot {
 	parameters: Record<string, unknown>;
 }
 
-export function snapshotToolDefinitions(
-	names: Iterable<string>,
-	candidates?: readonly ToolDefinition[],
-): ToolDefinitionSnapshot[] {
-	const byName = candidates ? new Map(candidates.map((tool) => [tool.name, tool])) : undefined;
-	const snapshots: ToolDefinitionSnapshot[] = [];
-	let remaining = 1024 * 1024;
-	for (const name of names) {
-		if (snapshots.length >= 2048) throw new Error("Tool definition group exceeds 2048 tools");
-		// A supplied candidate view is authoritative: a missing name must not leak back
-		// into a second registry lookup with potentially different filters or metadata.
-		const tool = byName
-			? staticLoadableToolDefinition(byName.get(name))
-			: resolveLoadableToolDefinition(name);
-		if (!tool) continue;
-		// The replacer charges a conservative escaped-JSON budget BEFORE each value
-		// is serialized. Never clone an entire oversized group and measure afterwards.
-		const encoded = JSON.stringify(
-			{ name, description: tool.description, parameters: resolveToolJsonSchema(tool) },
-			(key, value: unknown) => {
-				remaining -= key.length * 6 + 4;
-				remaining -=
-					typeof value === "string" ? value.length * 6 + 2 : typeof value === "number" ? 32 : 8;
-				if (remaining < 0)
-					throw new Error("Tool definition group exceeds 1 MiB serialization budget");
-				return value;
-			},
-		);
-		snapshots.push(JSON.parse(encoded) as ToolDefinitionSnapshot);
-	}
-	return snapshots;
-}
-
 function snapshotDefinition(snapshot: ToolDefinitionSnapshot): ResolvedToolDefinition {
 	return {
 		name: snapshot.name,
@@ -295,6 +262,10 @@ export interface ToolLoadingState {
 	loaded: readonly string[];
 	/** Managed tools loaded right now. */
 	current: ReadonlySet<string>;
+	/** Same request's candidates, never persisted or read from a later registry view. */
+	candidates?: readonly ToolDefinition[];
+	registryRevision?: string;
+	/** Legacy inline definitions; new epochs keep only names and registryRevision. */
 	definitionSnapshots?: ToolDefinitionSnapshot[];
 }
 
@@ -304,16 +275,26 @@ export interface ToolLoadingEpoch {
 	markerId?: string;
 	/** Optional tools loaded when the epoch opened (any tool; managed ones are kept). */
 	toolNames: readonly string[];
+	/** Cache lifecycle identifier, not an execution identity. */
+	registryRevision?: string;
 	definitionSnapshots?: ToolDefinitionSnapshot[];
 	/** The request target the epoch opened for (`resolveEpochTarget`), when recorded. */
 	target?: string;
 }
 
+/** A persisted epoch boundary failed; do not fall back to a transcript from the old epoch. */
+export class ToolEpochError extends Error {
+	constructor(cause: unknown) {
+		super("Could not save the tool epoch. Retry when message storage is available.", { cause });
+		this.name = "ToolEpochError";
+	}
+}
 /** What an epoch marker records (§7.7); a compact element carries the same as `epoch`. */
 export interface EpochRecord {
 	reason: "compact" | "target" | "cold" | "manual";
 	target?: string;
 	toolNames: string[];
+	registryRevision?: string;
 	definitionSnapshots?: ToolDefinitionSnapshot[];
 }
 
@@ -328,6 +309,9 @@ export function epochRecordOf(block: unknown): EpochRecord | undefined {
 		reason: (typeof epoch.reason === "string" ? epoch.reason : "manual") as EpochRecord["reason"],
 		...(typeof epoch.target === "string" ? { target: epoch.target } : {}),
 		toolNames: epoch.toolNames.filter((name): name is string => typeof name === "string"),
+		...(typeof epoch.registryRevision === "string"
+			? { registryRevision: epoch.registryRevision }
+			: {}),
 		definitionSnapshots: readSnapshots(epoch.definitionSnapshots),
 	};
 }
@@ -344,6 +328,7 @@ export function latestToolLoadingEpoch(
 			return {
 				markerId: message.id,
 				toolNames: epoch.toolNames,
+				registryRevision: epoch.registryRevision,
 				definitionSnapshots: epoch.definitionSnapshots,
 				...(epoch.target ? { target: epoch.target } : {}),
 			};
@@ -398,6 +383,7 @@ export function deriveToolLoadingState(
 	managed: ReadonlySet<string>,
 	current: Iterable<string>,
 	epoch?: ToolLoadingEpoch,
+	candidates?: readonly ToolDefinition[],
 ): ToolLoadingState {
 	const events = epochRows(messages, epoch?.markerId).flatMap(
 		(message) => toolLoadingEventOf(message, managed) ?? [],
@@ -425,6 +411,8 @@ export function deriveToolLoadingState(
 		base,
 		loaded,
 		current: currentSet,
+		...(candidates ? { candidates } : {}),
+		registryRevision: epoch?.registryRevision,
 		definitionSnapshots: [
 			...(epoch?.definitionSnapshots ?? []),
 			...epochRows(messages, epoch?.markerId).flatMap((message) => {
@@ -617,7 +605,12 @@ export function projectToolLoadingHistory(
 	resolveDefinition: (name: string) => ResolvedToolDefinition | null,
 ): DbMessage[] {
 	if (strategy === "replace_tools") return [...messages];
-	const liveDefinition = resolveDefinition;
+	const byName = state.candidates
+		? new Map(state.candidates.map((tool) => [tool.name, tool]))
+		: undefined;
+	const liveDefinition = byName
+		? (name: string) => staticLoadableToolDefinition(byName.get(name))
+		: resolveDefinition;
 	const frozen = new Map(
 		state.definitionSnapshots?.map((snapshot) => [snapshot.name, snapshotDefinition(snapshot)]),
 	);

@@ -10,7 +10,12 @@
  *
  * This file imports nothing dialect-specific.
  */
-import type { OutlineLinkKind, OutlineLinkTargetKind, OutlineTaskJson } from "../model";
+import type {
+	OutlineActorKind,
+	OutlineLinkKind,
+	OutlineLinkTargetKind,
+	OutlineTaskJson,
+} from "../model";
 import type { OutlineBlockRow, OutlineCommitRow, OutlineLinkRow, OutlineVersionRow } from "./port";
 
 /** A live block of a page at some seq, without its content: what the tree is built from. */
@@ -51,6 +56,9 @@ export interface OutlineSearchRow {
 	 */
 	rank: number;
 }
+
+/** Versions of one block `findLastWrites` looks at, at most, newest first. */
+export const OUTLINE_LAST_WRITES_SCAN = 64;
 
 /** Characters of a page's content a page list reads: enough for its title. */
 export const OUTLINE_PAGE_HEAD_CHARS = 400;
@@ -107,6 +115,27 @@ export interface OutlineReadPort {
 	listVersionContents(
 		keys: ReadonlyArray<{ blockId: string; fromSeq: number }>,
 	): Promise<Array<{ blockId: string; fromSeq: number; content: string | null }>>;
+	/**
+	 * The whole version of each block valid at its own seq (`from_seq <= seq < to_seq`, or open):
+	 * the version an agent read, which its edit is merged from. Blocks with no version then are
+	 * left out. Each key is one backward seek on the primary key (`block_id`, `from_seq`).
+	 */
+	listVersionsAtSeqs(
+		keys: ReadonlyArray<{ blockId: string; seq: number }>,
+	): Promise<OutlineVersionRow[]>;
+	/**
+	 * For each block, its latest version after `afterSeq` that counts, with its change flags.
+	 * Left out: `except.actor`'s versions whose change flags lie within `except.flags` (every
+	 * flag: none of the actor's versions count; a move's flags: its moves do not), and anyone's
+	 * whose flags lie within `except.anyoneFlags` (default none). Blocks without one are left out.
+	 * At most {@link OUTLINE_LAST_WRITES_SCAN} of a block's newest versions after `afterSeq` are
+	 * looked at, backwards on the primary key and joined to their commits by id: a block with
+	 * more, none of which counts, comes back with `fromSeq` null (unknown: assume the worst).
+	 */
+	findLastWrites(
+		keys: ReadonlyArray<{ blockId: string; afterSeq: number }>,
+		except: { actorKind: OutlineActorKind; actorId: string; flags: number; anyoneFlags?: number },
+	): Promise<Array<{ blockId: string; fromSeq: number | null; changeFlags: number | null }>>;
 	/** Links of the given blocks and kinds valid at `seq` (`null`: open links), at most `limit`. */
 	listLinksAt(
 		blockIds: readonly string[],

@@ -154,7 +154,9 @@ export const browserTool: ToolDefinition = {
 		"- capture_network (optional): For launch only, start network capture before initial navigation (default: false)\n" +
 		"- file_path (optional): For screenshot only, save the PNG to this path; relative paths resolve against cwd\n" +
 		"- headless (optional): Set to false to launch a visible browser window with GUI (default: true). " +
-		"Useful for debugging, visual inspection, or interacting with pages that require a display.\n" +
+		"Useful for debugging, visual inspection, or interacting with pages that require a display. " +
+		"Headed sessions open as a new tab in the user's own Edge/Chrome when its remote debugging is enabled " +
+		"and the user allows the connection; otherwise in one separate browser window.\n" +
 		"- categories (optional): Array of Chrome trace categories for perf_start (uses sensible defaults if omitted)",
 	rawJsonSchema: {
 		type: "object",
@@ -483,6 +485,13 @@ function formatDurationMs(ms: number): string {
 	return `${Math.round(ms / 86_400_000)}d`;
 }
 
+function describeHeadedWindow(inUserBrowser: boolean): string {
+	return inUserBrowser
+		? "new tab in the user's own browser"
+		: "separate browser window. To open tabs in the user's own Edge/Chrome instead, the user can " +
+				"enable remote debugging at edge://inspect/#remote-debugging (chrome://inspect for Chrome) " +
+				"and allow the connection when prompted";
+}
 async function handleLaunch(
 	narratorId: string,
 	url?: string,
@@ -509,10 +518,11 @@ async function handleLaunch(
 
 	const session = await createSession(narratorId, url, headless, ttlMs, captureNetwork);
 	const { title } = await actions.getPageSnapshot(session.page);
-
 	return {
 		output:
 			`Browser session started (${headless ? "headless" : "headed/GUI"}).\n` +
+			`Session ID: ${session.id}\n` +
+			(headless ? "" : `Window: ${describeHeadedWindow(session.inUserBrowser)}\n`) +
 			`Session ID: ${session.id}\n` +
 			`Auto-close TTL: ${session.ttlMs}ms (${formatDurationMs(session.ttlMs)} of inactivity)\n` +
 			`Network capture: ${session.networkCaptureEnabled ? "enabled" : "disabled"}\n` +

@@ -1,5 +1,8 @@
 {
 	"modelTraceReturn": "Return",
+	"modelTraceSampling": "Sampling…",
+	"modelTraceRetry": "Retry",
+	"modelTraceRetryFailed": "Could not retry ModelTrace.",
 	"modelTraceUsage": "Usage: /modeltrace (no arguments)",
 	"modelTraceFootnote": "Statistical estimates, for reference only.",
 	"modelTraceUnavailable": "ModelTrace result unavailable.",

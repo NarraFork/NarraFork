@@ -61,6 +61,8 @@ export interface RuntimeHistoryOptions {
 		current: Iterable<string>;
 		/** The request's already-materialized registry candidates; never re-read the registry. */
 		candidates?: readonly ToolDefinition[];
+		/** Captured with candidates before any asynchronous work. */
+		registryRevision?: string;
 		/** A reconciled epoch. Property presence suppresses the legacy compact query, even if empty. */
 		epoch?: ToolLoadingEpoch;
 	};
@@ -255,6 +257,7 @@ export async function buildRuntimeHistory(
 				loading.managed,
 				loading.current,
 				epoch,
+				loading.candidates,
 			)
 		: undefined;
 	const toolLoadingStrategy = usesToolLoading(toolLoadingState)

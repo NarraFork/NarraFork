@@ -35,9 +35,10 @@ function request(): ChatParams {
 describe("ModelTrace frozen request prefix", () => {
 	test("preserves upstream identity and original system, tool and input prefix", () => {
 		const params = request();
-		rememberModelTraceRequest(id, adapter, params);
+		rememberModelTraceRequest(id, adapter, params, "frozen-provider");
 		const snapshot = getModelTraceRequest(id);
 		expect(snapshot?.adapter).toBe(adapter);
+		expect(snapshot?.provider).toBe("frozen-provider");
 		expect(snapshot?.params).toMatchObject({
 			conversationId: params.conversationId,
 			stickySessionKey: params.stickySessionKey,
@@ -56,7 +57,7 @@ describe("ModelTrace frozen request prefix", () => {
 
 	test("later appended turns and tools do not extend the frozen prefix", () => {
 		const params = request();
-		rememberModelTraceRequest(id, adapter, params);
+		rememberModelTraceRequest(id, adapter, params, "frozen-provider");
 		params.history.push({ role: "assistant", content: "later answer" });
 		params.tools.push({ name: "new tool" });
 		params.toolResults.push({ content: "later result" });
@@ -72,7 +73,7 @@ describe("ModelTrace frozen request prefix", () => {
 
 	test("never inherits a parent signal, callback or request-dump collector", () => {
 		const params = request();
-		rememberModelTraceRequest(id, adapter, params);
+		rememberModelTraceRequest(id, adapter, params, "frozen-provider");
 		const snapshot = getModelTraceRequest(id);
 		for (const key of [
 			"signal",
@@ -86,8 +87,13 @@ describe("ModelTrace frozen request prefix", () => {
 	});
 
 	test("replaces the latest snapshot and can release retained history", () => {
-		rememberModelTraceRequest(id, adapter, request());
-		rememberModelTraceRequest(id, adapter, { ...request(), content: "latest input" });
+		rememberModelTraceRequest(id, adapter, request(), "frozen-provider");
+		rememberModelTraceRequest(
+			id,
+			adapter,
+			{ ...request(), content: "latest input" },
+			"new-provider",
+		);
 		expect(getModelTraceRequest(id)?.params.content).toBe("latest input");
 		forgetModelTraceRequest(id);
 		expect(getModelTraceRequest(id)).toBeUndefined();
@@ -95,9 +101,10 @@ describe("ModelTrace frozen request prefix", () => {
 
 	test("bounds retained request count and refreshes recently used keys", () => {
 		try {
-			for (let i = 0; i < 64; i++) rememberModelTraceRequest(`${id}-${i}`, adapter, request());
-			rememberModelTraceRequest(`${id}-0`, adapter, request());
-			rememberModelTraceRequest(id, adapter, request());
+			for (let i = 0; i < 64; i++)
+				rememberModelTraceRequest(`${id}-${i}`, adapter, request(), "frozen-provider");
+			rememberModelTraceRequest(`${id}-0`, adapter, request(), "frozen-provider");
+			rememberModelTraceRequest(id, adapter, request(), "frozen-provider");
 			expect(getModelTraceRequest(`${id}-0`)).toBeDefined();
 			expect(getModelTraceRequest(`${id}-1`)).toBeUndefined();
 		} finally {

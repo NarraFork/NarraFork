@@ -240,6 +240,27 @@ describe("ModelTrace HTTP entry", () => {
 		expect(start).toHaveBeenCalledTimes(1);
 		expect(start.mock.calls[0]?.slice(0, 2)).toEqual(["source", "owner"]);
 	});
+
+	test("retry requires write access to the diagnostic child", async () => {
+		await source(false, { visibility: "public", traits: ["modeltrace"] });
+		const service = await import("../modeltrace-service");
+		const retry = spyOn(service, "retryModelTrace").mockResolvedValue({ id: "source" });
+		spies.push(retry);
+		expect((await post(appFor("reader"), "/narrators/source/modeltrace/retry")).status).toBe(404);
+		expect(retry).not.toHaveBeenCalled();
+	});
+
+	test("retry passes the same child and authenticated user without creating a fork", async () => {
+		await source(false, { traits: ["modeltrace"] });
+		const service = await import("../modeltrace-service");
+		const retry = spyOn(service, "retryModelTrace").mockResolvedValue({ id: "source" });
+		spies.push(retry);
+		const response = await post(appFor(), "/narrators/source/modeltrace/retry");
+		expect(response.status).toBe(200);
+		expect(await response.json()).toEqual({ id: "source" });
+		expect(retry).toHaveBeenCalledTimes(1);
+		expect(retry.mock.calls[0]?.slice(0, 2)).toEqual(["source", "owner"]);
+	});
 });
 
 describe("project creation creates context only, no sessions", () => {

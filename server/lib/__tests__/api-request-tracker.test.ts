@@ -1,8 +1,9 @@
 import { afterEach, describe, expect, mock, test } from "bun:test";
-import { apiRequests, credentialUsageTotals, userUsageTotals } from "@server/db/schema";
+import { apiRequests, credentialUsageTotals, narrators, userUsageTotals } from "@server/db/schema";
 import { TOKEN_ACCOUNTING_VERSION } from "@shared/token-accounting";
 import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
+import { buildUsageDataFromSnapshot } from "../usage-tracking";
 
 const { db, sqlite } = getTestDb();
 const realDbModule = { ...(await import("@server/db")) };
@@ -146,6 +147,84 @@ describe("request occupancy snapshot persistence", () => {
 });
 
 describe("request user attribution", () => {
+	test.each([
+		undefined,
+		"ModelTrace canceled",
+		"Invalid diagnostic answer",
+	])("ModelTrace %s remains queryable with operator, child and cache attribution exactly once", async (errorMessage) => {
+		const childId = "modeltrace-child";
+		const userId = "modeltrace-operator";
+		const now = new Date().toISOString();
+		db.insert(narrators).values({ id: childId, createdAt: now, updatedAt: now }).run();
+		const handle = startApiRequest({
+			kind: "modeltrace",
+			userId,
+			narratorId: childId,
+			provider: "nug",
+			model: "frozen-model",
+		});
+		const options = {
+			usage: buildUsageDataFromSnapshot({
+				inputTokens: 100,
+				completionTokens: 20,
+				cachedInputTokens: 800,
+				cacheCreationInputTokens: 50,
+				cacheCreation5mTokens: 10,
+				cacheCreation1hTokens: 40,
+				reasoningTokens: 5,
+			}),
+			credentialId: "modeltrace-credential",
+			ttftMs: 12,
+			durationMs: 80,
+			meterUsage: 1.5,
+			meterUnit: "credit",
+			errorMessage,
+		};
+		await finishApiRequest(handle, options);
+		await finishApiRequest(handle, options);
+		expect(db.select().from(apiRequests).where(eq(apiRequests.narratorId, childId)).all()).toEqual([
+			expect.objectContaining({
+				kind: "modeltrace",
+				userId,
+				narratorId: childId,
+				provider: "nug",
+				model: "frozen-model",
+				inputTokens: 100,
+				outputTokens: 20,
+				cachedInputTokens: 800,
+				cacheCreationInputTokens: 50,
+				cacheCreation5mTokens: 10,
+				cacheCreation1hTokens: 40,
+				reasoningTokens: 5,
+				errorMessage: errorMessage ?? null,
+				ttftMs: 12,
+				durationMs: 80,
+				meterUsage: 1.5,
+				meterUnit: "credit",
+			}),
+		]);
+		expect(
+			db.select().from(userUsageTotals).where(eq(userUsageTotals.userId, userId)).get(),
+		).toMatchObject({
+			requestCount: 1,
+			inputTokens: 100,
+			cachedInputTokens: 800,
+			cacheCreationTokens: 50,
+		});
+		expect(
+			db
+				.select()
+				.from(credentialUsageTotals)
+				.where(eq(credentialUsageTotals.credentialId, "modeltrace-credential"))
+				.get(),
+		).toMatchObject({
+			requestCount: 1,
+			inputTokens: 100,
+			cachedInputTokens: 800,
+			cacheCreationTokens: 50,
+		});
+	});
+
 	test.each([
 		"openai",
 		"codex",

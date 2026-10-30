@@ -1,5 +1,8 @@
 {
 	"modelTraceReturn": "返回",
+	"modelTraceSampling": "采样中…",
+	"modelTraceRetry": "重试",
+	"modelTraceRetryFailed": "ModelTrace 重试失败。",
 	"modelTraceUsage": "用法：/modeltrace（不接受参数）",
 	"modelTraceFootnote": "统计结果仅供参考。",
 	"modelTraceUnavailable": "ModelTrace 结果暂不可用。",

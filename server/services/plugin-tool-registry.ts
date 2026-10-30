@@ -6,7 +6,12 @@ import {
 	safeParseManifest,
 } from "@server/lib/plugins/manifest";
 import type { Capability, InvocationScope } from "@server/lib/plugins/permissions";
-import { type JsonValue, jsonValueSchema } from "@server/lib/plugins/protocol";
+import {
+	type JsonValue,
+	jsonValueSchema,
+	PLUGIN_TOOL_INPUT_MAX_BYTES,
+	PLUGIN_TOOL_OUTPUT_MAX_BYTES,
+} from "@server/lib/plugins/protocol";
 import { z } from "zod";
 import {
 	type AuthorizationResult,
@@ -22,8 +27,6 @@ import type { PluginPublicApi } from "./plugin-public-api";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
 const DEFAULT_MAX_TIMEOUT_MS = 5 * 60_000;
-const DEFAULT_MAX_INPUT_BYTES = 256 * 1024;
-const DEFAULT_MAX_OUTPUT_BYTES = 1024 * 1024;
 const DEFAULT_MAX_SCHEMA_BYTES = 256 * 1024;
 const DEFAULT_MAX_SCHEMA_DEPTH = 24;
 const DEFAULT_MAX_AUDIT_ENTRIES = 1_000;
@@ -702,13 +705,10 @@ function validateSchemaShape(
 	return root;
 }
 
-function validateInput(input: unknown, schema: Record<string, unknown>): Record<string, JsonValue> {
-	if (!jsonValueSchema.safeParse(input).success || !isRecord(input)) {
-		throw new PluginToolRegistryError(
-			"INVALID_PARAMS",
-			"Tool input must be a restricted JSON object",
-		);
-	}
+function validateInput(
+	input: Record<string, unknown>,
+	schema: Record<string, unknown>,
+): Record<string, JsonValue> {
 	const issues: ValidationIssue[] = [];
 	validateAgainstSchema(input, schema, schema, "", issues, new Set());
 	if (issues.length > 0) {
@@ -777,10 +777,13 @@ export class PluginToolRegistry {
 			this.maxTimeoutMs,
 			Math.max(1, Math.floor(options.defaultTimeoutMs ?? DEFAULT_TIMEOUT_MS)),
 		);
-		this.maxInputBytes = Math.max(1, Math.floor(options.maxInputBytes ?? DEFAULT_MAX_INPUT_BYTES));
+		this.maxInputBytes = Math.max(
+			1,
+			Math.floor(options.maxInputBytes ?? PLUGIN_TOOL_INPUT_MAX_BYTES),
+		);
 		this.maxOutputBytes = Math.max(
 			1,
-			Math.floor(options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES),
+			Math.floor(options.maxOutputBytes ?? PLUGIN_TOOL_OUTPUT_MAX_BYTES),
 		);
 		this.maxSchemaBytes = Math.max(
 			1,
@@ -925,11 +928,18 @@ export class PluginToolRegistry {
 					true,
 				);
 			}
-			const parsedInput = validateInput(input, entry.schema);
-			requestBytes = jsonBytes(parsedInput);
+			if (!jsonValueSchema.safeParse(input).success || !isRecord(input)) {
+				throw new PluginToolRegistryError(
+					"INVALID_PARAMS",
+					"Tool input must be a restricted JSON object",
+				);
+			}
+			// Reject oversized JSON before schema branches, regular expressions or cloning.
+			requestBytes = jsonBytes(input);
 			if (requestBytes > this.maxInputBytes) {
 				throw new PluginToolRegistryError("PAYLOAD_TOO_LARGE", "Tool input exceeds byte limit");
 			}
+			const parsedInput = validateInput(input, entry.schema);
 			const parsedInvocation = invocationPrincipalSchema.safeParse(
 				options.context?.invocation ?? options.invocation,
 			);
@@ -1065,7 +1075,7 @@ export class PluginToolRegistry {
 			if (responseBytes > this.maxOutputBytes) {
 				throw new PluginToolRegistryError(
 					"PAYLOAD_TOO_LARGE",
-					"Plugin tool output exceeds byte limit",
+					"Plugin tool returned a result exceeding the output byte limit. The operation may already have changed state; do not automatically retry it.",
 				);
 			}
 			await this.audit({
@@ -1195,8 +1205,9 @@ export class PluginToolRegistry {
 			);
 		});
 		try {
+			// validateInput already detached this invocation's input from the caller.
 			const execution = handler
-				? Promise.resolve(handler(clone(input), context))
+				? Promise.resolve(handler(input, context))
 				: this.requestRuntime(entry, input, context, timeoutMs);
 			const value = await Promise.race([execution, timeoutPromise, abortPromise]);
 			return normalizeResult(value);
@@ -1229,7 +1240,7 @@ export class PluginToolRegistry {
 			this.runtimeMethod,
 			{
 				contributionId: entry.descriptor.contributionId,
-				input: clone(input),
+				input,
 				// RPC params must be strictly JSON (jsonValueSchema): strip any
 				// undefined fields (e.g. deadlineAt when absent) that would fail
 				// the outbound envelope validation ("Cannot enqueue an invalid

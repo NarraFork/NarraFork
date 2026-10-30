@@ -1,4 +1,5 @@
 import { afterAll, afterEach, beforeEach, describe, expect, it, mock } from "bun:test";
+import { StreamableHTTPError } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
 /**
  * Unit tests for McpManager.refresh — the manual tool-list re-fetch that covers
@@ -7,11 +8,15 @@ import { afterAll, afterEach, beforeEach, describe, expect, it, mock } from "bun
  */
 
 type FakeTool = { name: string; description?: string };
+type FakePage = { tools: FakeTool[]; nextCursor?: string };
 
 const state = {
 	beforeListTools: null as null | (() => Promise<void>),
 	listToolsCalls: 0,
-	listToolsResult: { tools: [{ name: "tool-a" }] as FakeTool[] },
+	listToolsResult: { tools: [{ name: "tool-a" }] } as FakePage,
+	pages: null as Map<string | undefined, FakePage | Error> | null,
+	cursors: [] as (string | undefined)[],
+	onToolsChanged: null as (() => Promise<void>) | null,
 	/** Fail the next N listTools calls, then succeed. */
 	listToolsFailuresRemaining: 0,
 	listToolsErrorMessage: "stale connection",
@@ -22,15 +27,20 @@ class FakeClient {
 	async connect(_transport: unknown): Promise<void> {
 		state.connectCalls++;
 	}
-	setNotificationHandler(): void {}
-	async listTools(): Promise<{ tools: FakeTool[] }> {
+	setNotificationHandler(_schema: unknown, handler: () => Promise<void>): void {
+		state.onToolsChanged = handler;
+	}
+	async listTools(params?: { cursor?: string }): Promise<FakePage> {
 		state.listToolsCalls++;
+		state.cursors.push(params?.cursor);
 		await state.beforeListTools?.();
 		if (state.listToolsFailuresRemaining > 0) {
 			state.listToolsFailuresRemaining--;
 			throw new Error(state.listToolsErrorMessage);
 		}
-		return { tools: state.listToolsResult.tools };
+		const page = state.pages?.get(params?.cursor) ?? state.listToolsResult;
+		if (page instanceof Error) throw page;
+		return page;
 	}
 	async callTool(): Promise<{ content: [] }> {
 		return { content: [] };
@@ -41,8 +51,9 @@ const settingsState: {
 	mcpServers: Array<{
 		id: string;
 		name: string;
-		transport: "stdio";
+		transport: "stdio" | "streamable-http";
 		command: string;
+		url?: string;
 		mode?: "disabled" | "auto" | "resident";
 		enabled: boolean;
 	}>;
@@ -82,6 +93,9 @@ const serverConfig = {
 
 beforeEach(() => {
 	state.beforeListTools = null;
+	state.pages = null;
+	state.cursors = [];
+	state.onToolsChanged = null;
 	state.listToolsCalls = 0;
 	state.listToolsResult = { tools: [{ name: "tool-a" }] };
 	state.listToolsFailuresRemaining = 0;
@@ -147,19 +161,87 @@ describe("McpManager.refresh", () => {
 		expect(status?.tools.map((t) => t.name)).toEqual(["tool-b", "tool-c"]);
 	});
 
-	it("falls back to reconnect when listTools fails on the live connection", async () => {
+	it("retains the previous directory and connection when a refresh fails", async () => {
 		await mcpManager.connect(serverConfig);
 		const connectCallsAfterConnect = state.connectCalls;
-		const listCallsAfterConnect = state.listToolsCalls;
-
-		// Only the in-place re-list fails; the reconnected client's discovery succeeds.
-		state.listToolsFailuresRemaining = 1;
+		state.pages = new Map<string | undefined, FakePage | Error>([
+			[undefined, { tools: [{ name: "partial" }], nextCursor: "second" }],
+			["second", new Error("page unavailable")],
+		]);
 		const result = await mcpManager.refresh("srv1");
-		expect(result.ok).toBe(true);
-		expect(result.toolCount).toBe(1);
-		// One failed re-list + one successful list inside the reconnect.
-		expect(state.listToolsCalls).toBe(listCallsAfterConnect + 2);
-		expect(state.connectCalls).toBe(connectCallsAfterConnect + 1);
+		expect(result).toEqual({ ok: false, toolCount: 1, error: "page unavailable" });
+		expect(state.connectCalls).toBe(connectCallsAfterConnect);
+		expect(mcpManager.getServerStatuses()[0]?.tools.map((tool) => tool.name)).toEqual(["tool-a"]);
+	});
+
+	it("reconnects an expired HTTP session instead of repeatedly refreshing the dead session", async () => {
+		const config = {
+			...serverConfig,
+			transport: "streamable-http" as const,
+			url: "https://mcp.invalid",
+		};
+		settingsState.mcpServers = [config];
+		await mcpManager.connect(config);
+		let expired = true;
+		state.beforeListTools = async () => {
+			if (expired) {
+				expired = false;
+				throw new StreamableHTTPError(404, "session expired");
+			}
+		};
+		state.listToolsResult = { tools: [{ name: "after-restart" }] };
+		expect(await mcpManager.refresh("srv1")).toEqual({ ok: true, toolCount: 1 });
+		expect(state.connectCalls).toBe(2);
+		expect(mcpManager.getAvailableTools().map((tool) => tool.tool.name)).toEqual(["after-restart"]);
+	});
+
+	it("follows three discovery pages on connect and notification refresh", async () => {
+		state.pages = new Map<string | undefined, FakePage | Error>([
+			[undefined, { tools: [{ name: "first" }], nextCursor: "second" }],
+			["second", { tools: [{ name: "second" }], nextCursor: "third" }],
+			["third", { tools: [{ name: "third" }] }],
+		]);
+		await mcpManager.connect(serverConfig);
+		expect(state.cursors).toEqual([undefined, "second", "third"]);
+		expect(mcpManager.getServerStatuses()[0]?.tools.map((tool) => tool.name)).toEqual([
+			"first",
+			"second",
+			"third",
+		]);
+		let updates = 0;
+		mcpManager.onToolsChanged = () => {
+			updates++;
+		};
+		state.pages.set("third", { tools: [{ name: "replacement" }] });
+		await state.onToolsChanged?.();
+		expect(updates).toBe(1);
+		expect(mcpManager.getServerStatuses()[0]?.tools.map((tool) => tool.name)).toEqual([
+			"first",
+			"second",
+			"replacement",
+		]);
+	});
+
+	it("a repeated cursor fails only that refresh and preserves its last complete directory", async () => {
+		await mcpManager.connect(serverConfig);
+		state.pages = new Map<string | undefined, FakePage | Error>([
+			[undefined, { tools: [{ name: "partial" }], nextCursor: "repeat" }],
+			["repeat", { tools: [], nextCursor: "repeat" }],
+		]);
+		const result = await mcpManager.refresh("srv1");
+		expect(result.ok).toBe(false);
+		expect(result.error).toContain("repeated cursor");
+		expect(mcpManager.getServerStatuses()[0]?.tools.map((tool) => tool.name)).toEqual(["tool-a"]);
+		expect(state.connectCalls).toBe(1);
+		state.pages = new Map<string | undefined, FakePage | Error>([
+			[undefined, { tools: [], nextCursor: "second" }],
+			["second", { tools: [], nextCursor: "third" }],
+			["third", { tools: [{ name: "recovered" }] }],
+		]);
+		expect(await mcpManager.refresh("srv1")).toEqual({ ok: true, toolCount: 1 });
+		expect(mcpManager.getServerStatuses()[0]?.tools.map((tool) => tool.name)).toEqual([
+			"recovered",
+		]);
 	});
 
 	it("reconnects a missing live client when the server is enabled", async () => {

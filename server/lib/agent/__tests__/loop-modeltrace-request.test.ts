@@ -67,6 +67,7 @@ test("captures the actual post-injection provider prefix, before later answer tu
 	}
 	const snapshot = getModelTraceRequest(id);
 	expect(snapshot?.adapter).toBe(adapter);
+	expect(snapshot?.provider).toBe("test");
 	expect(snapshot?.params.conversationId).toBe("parent-session-id");
 	expect(snapshot?.params.stickySessionKey).toBe(id);
 	// Public builds the full current user turn into history, not ChatParams.content.

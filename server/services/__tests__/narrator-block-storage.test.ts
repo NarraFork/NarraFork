@@ -20,6 +20,7 @@ const { narratorPersistence } = await import("../narrator-persistence");
 const blockSync = await import("../narrator-block-sync");
 const turns = await import("../narrator-turns");
 const epochs = await import("../narrator-epochs");
+const { toolRegistry } = await import("../../lib/agent/tool-registry");
 
 const NOW = "2026-10-01T00:00:00.000Z";
 
@@ -323,6 +324,7 @@ describe("epoch reconcile", () => {
 
 	test("a cold cache opens an epoch only when the rebuild changes the tools", async () => {
 		await stepAt("2026-10-01T00:00:00.000Z");
+		expect(await reconcile([], "t", Date.parse("2026-10-01T00:00:01.000Z"))).toBe(true);
 		const later = Date.parse("2026-10-01T01:00:00.000Z");
 		// Nothing was loaded inside the epoch: rebuilding gives the same bytes.
 		expect(await reconcile([], "t", later)).toBe(false);
@@ -336,7 +338,15 @@ describe("epoch reconcile", () => {
 		expect(await reconcile(["WebFetch"], "t", later)).toBe(true);
 		const marker = (await rows()).at(-1);
 		expect(marker?.contentJson).toEqual([
-			{ type: "epoch", epoch: { reason: "cold", target: "t", toolNames: ["WebFetch"] } },
+			{
+				type: "epoch",
+				epoch: {
+					reason: "cold",
+					target: "t",
+					toolNames: ["WebFetch"],
+					registryRevision: toolRegistry.revision,
+				},
+			},
 		]);
 		// The new epoch froze the set; with the cache warm again nothing more is written.
 		expect(await reconcile(["WebFetch"], "t", Date.parse("2026-10-01T00:00:01.000Z"))).toBe(false);
@@ -372,7 +382,7 @@ describe("epoch reconcile", () => {
 						resolveTarget: target("t"),
 					})
 				).changed;
-			// A legacy SQLite epoch gets one explicit snapshot boundary, not repeated rewrites.
+			// A legacy SQLite epoch gets one names-only boundary, not repeated rewrites.
 			expect(await upgrade()).toBe(true);
 			expect(await upgrade()).toBe(false);
 			toolRegistry.register({ ...definition, description: "new" });
@@ -393,7 +403,7 @@ describe("epoch reconcile", () => {
 			expect((await rows()).at(-1)?.contentJson).toMatchObject([
 				{
 					type: "epoch",
-					epoch: { reason: "manual", definitionSnapshots: [{ name, description: "new" }] },
+					epoch: { reason: "manual", toolNames: [name], registryRevision: toolRegistry.revision },
 				},
 			]);
 		} finally {
@@ -430,6 +440,7 @@ describe("epoch reconcile", () => {
 						options.toolLoading.managed,
 						options.toolLoading.current,
 						options.toolLoading.epoch,
+						options.toolLoading.candidates,
 					),
 					toolCandidates: options.toolLoading.candidates,
 				};
@@ -454,22 +465,26 @@ describe("epoch reconcile", () => {
 					managed: new Set([name]),
 					current: new Set([name]),
 					candidates: toolRegistry.all(),
+					registryRevision: toolRegistry.revision,
 				}),
 			});
 			const first = await hooks.rebuildRequestHistory();
-			expect(first?.toolLoading?.definitionSnapshots).toMatchObject([
-				{ name, parameters: definition.rawJsonSchema },
-			]);
+			expect(first.toolLoading?.definitionSnapshots).toEqual([]);
+			expect(first.toolCandidates?.find((tool) => tool.name === name)?.rawJsonSchema).toBe(
+				definition.rawJsonSchema,
+			);
 			const firstRows = await rows();
 			const replacement = { type: "object", properties: { updated: { type: "number" } } };
 			toolRegistry.register({ ...definition, rawJsonSchema: replacement });
 			const second = await hooks.rebuildRequestHistory();
-			expect(second?.toolLoading?.definitionSnapshots).toMatchObject([
-				{ name, parameters: replacement },
-			]);
+			expect(second.toolLoading?.definitionSnapshots).toEqual([]);
+			expect(second.toolCandidates?.find((tool) => tool.name === name)?.rawJsonSchema).toBe(
+				replacement,
+			);
+			expect(second.toolLoading?.epochMarkerId).not.toBe(first.toolLoading?.epochMarkerId);
 			expect((await rows()).length).toBeGreaterThan(firstRows.length);
 			expect((await rows()).at(-1)?.contentJson).toMatchObject([
-				{ type: "epoch", epoch: { definitionSnapshots: [{ name, parameters: replacement }] } },
+				{ type: "epoch", epoch: { toolNames: [name], registryRevision: toolRegistry.revision } },
 			]);
 		} finally {
 			toolRegistry.unregister(name);
@@ -479,7 +494,12 @@ describe("epoch reconcile", () => {
 	});
 
 	test("inside a frozen epoch, a load that bypassed /load becomes a system notice", async () => {
-		await narratorStore.openEpoch("n1", { reason: "manual", target: "t", toolNames: [] });
+		await narratorStore.openEpoch("n1", {
+			reason: "manual",
+			target: "t",
+			toolNames: [],
+			registryRevision: toolRegistry.revision,
+		});
 		await stepAt(new Date().toISOString());
 		expect(await reconcile(["Knowledge"], "t", Date.now())).toBe(true);
 		const notice = (await rows()).at(-1);

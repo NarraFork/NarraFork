@@ -1,4 +1,5 @@
 import type { BrowserContext, CDPSession, Target } from "puppeteer-core";
+import { isOpenedFrom, lineage, rememberTargetLineage } from "./tab-scope";
 
 const DIALOG_TIMEOUT_MS = 3_000;
 const MAX_DIALOG_TEXT = 2_000;
@@ -7,12 +8,24 @@ interface Protection {
 	ready: Promise<void>;
 	attach: (target: Target) => Promise<void>;
 }
-const protections = new WeakMap<BrowserContext, Protection>();
+/** 隔离 context 以 context 为键；共享 context 以会话的根标签为键，只管它和从它打开的弹窗。 */
+const protections = new WeakMap<BrowserContext | Target, Protection>();
 const hookedManagers = new WeakSet<object>();
+
+function protectionOf(target: Target): Protection | undefined {
+	const isolated = protections.get(target.browserContext());
+	if (isolated) return isolated;
+	for (const ancestor of lineage(target)) {
+		const rooted = protections.get(ancestor);
+		if (rooted) return rooted;
+	}
+	return undefined;
+}
 
 // One browser-level hook, with only weak context lookups: closed sessions must not be retained.
 function onTargetAvailable(target: Target): void {
-	const state = protections.get(target.browserContext());
+	rememberTargetLineage(target);
+	const state = protectionOf(target);
 	if (!state) return;
 	void state.attach(target).catch((error) => {
 		state.record(
@@ -37,12 +50,17 @@ function dialogClient(target: Target): CDPSession {
 	return client;
 }
 
-/** Install before navigation and before resolving popup Page objects. */
+/**
+ * Install before navigation and before resolving popup Page objects.
+ * 共享 context 里必须给出 root：那里可能有用户自己的标签，它们的弹框不归我们处理。
+ */
 export function installDialogProtection(
 	context: BrowserContext,
 	record: (text: string) => void,
+	root?: Target,
 ): Promise<void> {
-	const existing = protections.get(context);
+	const key = root ?? context;
+	const existing = protections.get(key);
 	if (existing) {
 		existing.record = record;
 		return existing.ready;
@@ -59,16 +77,25 @@ export function installDialogProtection(
 		return Promise.reject(new Error("Puppeteer target manager unavailable for dialog protection"));
 	}
 	const state: Protection = { record, ready: Promise.resolve(), attach: () => Promise.resolve() };
-	protections.set(context, state);
+	protections.set(key, state);
 	const attached = new WeakMap<Target, Promise<void>>();
 	const cleanups = new Set<() => void>();
 	const targetCleanups = new WeakMap<Target, () => void>();
+	const release = () => {
+		context.off("targetdestroyed", onTargetDestroyed);
+		for (const cleanup of cleanups) cleanup();
+		cleanups.clear();
+		protections.delete(key);
+	};
 	const onTargetDestroyed = (target: Target) => {
 		const cleanup = targetCleanups.get(target);
-		if (!cleanup) return;
-		cleanup();
-		cleanups.delete(cleanup);
-		targetCleanups.delete(target);
+		if (cleanup) {
+			cleanup();
+			cleanups.delete(cleanup);
+			targetCleanups.delete(target);
+		}
+		// 共享 context 比会话活得久：根标签一关就摘掉监听，避免随会话数累积。
+		if (target === root) release();
 	};
 	context.on("targetdestroyed", onTargetDestroyed);
 	const attach = (target: Target): Promise<void> => {
@@ -130,13 +157,13 @@ export function installDialogProtection(
 		manager.on("targetAvailable", onTargetAvailable);
 		hookedManagers.add(manager);
 	}
-	state.ready = Promise.all(context.targets().map(attach)).then(
+	const initial = root
+		? context.targets().filter((target) => isOpenedFrom(target, root))
+		: context.targets();
+	state.ready = Promise.all(initial.map(attach)).then(
 		() => {},
 		(error: unknown) => {
-			context.off("targetdestroyed", onTargetDestroyed);
-			for (const cleanup of cleanups) cleanup();
-			cleanups.clear();
-			protections.delete(context);
+			release();
 			throw new Error(
 				`Native dialog protection could not be initialized. Dismiss any existing browser dialog and retry. ${String(error).slice(0, MAX_DIALOG_TEXT)}`,
 			);

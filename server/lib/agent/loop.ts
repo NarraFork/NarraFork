@@ -98,6 +98,7 @@ import { ToolInputStream } from "./tool-input-stream";
 import {
 	formatRequestTools,
 	resolveAdapterToolLoadingStrategy,
+	ToolEpochError,
 	type ToolLoadingStrategy,
 	usesToolLoading,
 } from "./tool-loading";
@@ -3252,7 +3253,9 @@ async function* agentLoopInMetadataSnapshot(
 		historyReplacements++;
 		// A per-request rebuild continues the same conversation; only a replacement that
 		// changes what was already sent (compact, model switch) starts a new upstream session.
-		if (!options.sameUpstreamSession) resetUpstreamSessionOnNextRequest = true;
+		const epochChanged =
+			replacement.toolLoading?.epochMarkerId !== config.toolLoading?.epochMarkerId;
+		if (!options.sameUpstreamSession || epochChanged) resetUpstreamSessionOnNextRequest = true;
 		// The builder's array is the receipt identity; the system prompt goes into a copy.
 		sourceInputHistory = replacement.history;
 		replayedInjectionMessageIds = new Set(replacement.replayedInjectionMessageIds ?? []);
@@ -3363,6 +3366,7 @@ async function* agentLoopInMetadataSnapshot(
 				cause,
 			};
 		} catch (err) {
+			if (err instanceof ToolEpochError) throw err;
 			logger.warn("Failed to switch runtime settings during agent loop", {
 				narratorId: config.narratorId,
 				cause,
@@ -3430,6 +3434,14 @@ async function* agentLoopInMetadataSnapshot(
 							yield { type: "error", message: "Aborted" };
 							return;
 						}
+						// Storage failed at a prefix boundary, or the old view is no longer current.
+						// Reusing that transcript would disguise changed definitions as the old epoch.
+						if (
+							error instanceof ToolEpochError ||
+							(config.toolLoading?.registryRevision &&
+								config.toolLoading.registryRevision !== toolRegistry.revision)
+						)
+							throw error;
 						logger.warn("Request history rebuild failed; projecting the loop's transcript", {
 							narratorId: config.narratorId,
 							turnIndex,
@@ -4863,7 +4875,12 @@ async function* agentLoopInMetadataSnapshot(
 						resetUpstreamSession,
 						onRequestStart: (info) => {
 							if (!config.reflectionLoop) {
-								rememberModelTraceRequest(config.narratorId, provider, requestParams);
+								rememberModelTraceRequest(
+									config.narratorId,
+									provider,
+									requestParams,
+									effectiveProvider,
+								);
 							}
 							markRequestStarted(info);
 						},

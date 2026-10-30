@@ -1,14 +1,14 @@
 // Browser module — browser pool, session management, and actions.
 
 export * as actions from "./actions";
-export type { FetchPageOptions } from "./pool";
+export type { BrowserTab, FetchPageOptions } from "./pool";
 export {
 	closeBrowser,
 	connectBrowser,
-	createContext,
 	fetchPage,
 	getBrowser,
 	getBrowserWsEndpoints,
+	openTab,
 	setBrowserPreserveMode,
 } from "./pool";
 export type { BrowserSession, BrowserSessionHandoff } from "./session";
@@ -18,6 +18,7 @@ export {
 	closeSession,
 	createSession,
 	DEFAULT_SESSION_TTL_MS,
+	discardHandoffTab,
 	getSession,
 	listSessions,
 	MAX_SESSION_TTL_MS,

@@ -37,12 +37,17 @@ import type {
 import { generateId } from "../../../lib/id";
 import { settings } from "../../../lib/settings";
 import "../../../lib/agent/tools";
+import { OUTLINE_EDIT_LIMITS } from "../agent-edit";
+import { AGENT_MERGE_HOOKS, AGENT_MERGE_LIMITS } from "../agent-merge";
 import { OUTLINE_EDIT_TEXT_LIMITS, stopEditTextWorker } from "../edit-text-runner";
-import { clearOutlineReads } from "../read-ledger";
+import { OUTLINE_CHANGE } from "../model";
+import { clearOutlineReads, recordOutlineReads, seenOutlineVersion } from "../read-ledger";
+import { revertCommit } from "../revert";
 import { invalidateSessionReadScopes } from "../session-scope";
 import { ensureProjectSpace, ensureSessionSpace } from "../spaces";
 import { outlineStore } from "../store";
 import type { OutlineSpaceRow } from "../store/port";
+import { OUTLINE_LAST_WRITES_SCAN } from "../store/read-port";
 import { type OutlineOp, writeOutline } from "../write";
 
 const NOW = "2026-10-26T00:00:00.000Z";
@@ -151,6 +156,16 @@ async function world(name = "Atlas"): Promise<World> {
 	const session = await narrator(alice, projectId);
 	const space = await ensureProjectSpace(projectId);
 	return { alice, projectId, session, space };
+}
+
+/** A page of blocks the agent wrote and then read; their sids and ids. */
+async function readBlocksOf(w: World, c: ToolContext, texts: string[]) {
+	const markdown = ["- Notes", ...texts.map((t) => `  - ${t}`)].join("\n");
+	const added = await call(outlineEditTool, { edits: [{ add: "/", markdown }] }, c);
+	const created = ids(added.output);
+	await call(outlineReadTool, { address: created[0] as string, view: "all" }, c);
+	const rows = await stored(w.space);
+	return created.slice(1).map((sid) => ({ sid, id: rows.get(sid)?.id as string }));
 }
 
 beforeEach(() => {
@@ -644,6 +659,948 @@ describe("OutlineEdit", () => {
 		);
 		expect(result.isError).toBe(true);
 		expect(result.output).toContain("one OutlineEdit call writes one space");
+	});
+});
+
+describe("OutlineEdit merges changes made after the read", () => {
+	/** A page of blocks the agent wrote and then read; their sids and ids. */
+	async function readBlocks(w: World, c: ToolContext, texts: string[]) {
+		const markdown = ["- Notes", ...texts.map((t) => `  - ${t}`)].join("\n");
+		const added = await call(outlineEditTool, { edits: [{ add: "/", markdown }] }, c);
+		const created = ids(added.output);
+		await call(outlineReadTool, { address: created[0] as string, view: "all" }, c);
+		const rows = await stored(w.space);
+		return created.slice(1).map((sid) => ({ sid, id: rows.get(sid)?.id as string }));
+	}
+
+	test("a person's change and the agent's elsewhere in the text both stay", async () => {
+		const w = await world();
+		const c = ctx(w.session, w.alice);
+		const [b] = await readBlocks(w, c, ["Tokens expire after an hour."]);
+		if (!b) throw new Error("no block");
+		const theirs = "Tokens expire after an hour. Refresh them early.";
+		await humanWrite(w.space, w.alice, [{ op: "update", block: { id: b.id }, content: theirs }]);
+
+		const result = await call(
+			outlineEditTool,
+			{ edits: [{ replace: b.sid, text: "Access tokens expire after an hour." }] },
+			c,
+		);
+		expect(result.isError).toBeUndefined();
+		const merged = "Access tokens expire after an hour. Refresh them early.";
+		expect(result.output).toContain(
+			`replaced [${b.sid}], merged with changes made after you read it`,
+		);
+		expect(result.output).toMatch(
+			new RegExp(
+				`‹\\[${b.sid}\\] changed by a person in commit #\\d+ after you read it as of #\\d+; merged:›`,
+			),
+		);
+		expect(result.output).toContain(`\n- [${b.sid}] ${merged}`);
+		expect(result.metadata?.merged).toEqual([`${w.space.key}/${b.sid}`]);
+		const row = (await stored(w.space)).get(b.sid);
+		expect(row?.content).toBe(merged);
+
+		// The version says it is a merge, and the ledger holds it: the text shown is what was read.
+		const [latest] = await outlineStore.listBlockHistory(b.id, { limit: 1 });
+		expect((latest?.changeFlags ?? 0) & OUTLINE_CHANGE.MERGE).toBe(OUTLINE_CHANGE.MERGE);
+		expect(seenOutlineVersion(w.session, b.id)).toBe(row?.versionSeq);
+
+		// The time machine replays it, and reverting it puts the person's text back.
+		const commit = result.metadata?.commit as { id: string; seq: number };
+		const before = await call(outlineReadTool, { address: b.sid, asOf: commit.seq - 1 }, c);
+		expect(before.output).toContain(theirs);
+		const at = await call(outlineReadTool, { address: b.sid, asOf: commit.seq }, c);
+		expect(at.output).toContain(merged);
+		const reverted = await revertCommit({
+			commitId: commit.id,
+			actor: { kind: "human", id: w.alice },
+			responsibleUserId: w.alice,
+		});
+		expect(reverted.commit).not.toBeNull();
+		expect((await stored(w.space)).get(b.sid)?.content).toBe(theirs);
+	});
+
+	test("one overlap refuses the whole call, naming the block and where", async () => {
+		const w = await world();
+		const c = ctx(w.session, w.alice);
+		const [a, b] = await readBlocks(w, c, ["one two three", "alpha beta"]);
+		if (!a || !b) throw new Error("no blocks");
+		await humanWrite(w.space, w.alice, [
+			{ op: "update", block: { id: a.id }, content: "one deux three" },
+			{ op: "update", block: { id: b.id }, content: "alpha beta gamma" },
+		]);
+		const commitsBefore = (
+			await db.select().from(outlineCommits).where(eq(outlineCommits.spaceId, w.space.id))
+		).length;
+
+		const result = await call(
+			outlineEditTool,
+			{
+				edits: [
+					{ replace: a.sid, text: "one TWO three" },
+					{ replace: b.sid, text: "ALPHA beta" },
+				],
+			},
+			c,
+		);
+		expect(result.isError).toBe(true);
+		expect(result.output).toContain("Nothing was written");
+		expect(result.output).toContain(`[${a.sid}] was changed by a person`);
+		expect(result.output).toContain("your change and theirs overlap at «two»");
+		expect(result.output).toContain("it now reads: one deux three");
+		// The block that would have merged is not named, and not written either.
+		expect(result.output).not.toContain(`[${b.sid}] was changed`);
+		expect(result.metadata?.conflicts).toEqual([`${w.space.key}/${a.sid}`]);
+		const rows = await stored(w.space);
+		expect(rows.get(a.sid)?.content).toBe("one deux three");
+		expect(rows.get(b.sid)?.content).toBe("alpha beta gamma");
+		expect(
+			(await db.select().from(outlineCommits).where(eq(outlineCommits.spaceId, w.space.id))).length,
+		).toBe(commitsBefore);
+	});
+
+	test("fields merge one by one: kept ones are not written, both changed is a conflict", async () => {
+		const w = await world();
+		const c = ctx(w.session, w.alice);
+		const [t] = await readBlocks(w, c, ["[ ] write the docs"]);
+		if (!t) throw new Error("no block");
+		await humanWrite(w.space, w.alice, [
+			{ op: "setTask", block: { id: t.id }, task: { status: "done" } },
+		]);
+		// The agent copies the checkbox it read and changes the text: the person's check stays.
+		const kept = await call(
+			outlineEditTool,
+			{ edits: [{ replace: t.sid, text: "[ ] write the docs for v2" }] },
+			c,
+		);
+		expect(kept.isError).toBeUndefined();
+		expect(kept.output).toContain(`- [${t.sid}] [x] write the docs for v2`);
+		let row = (await stored(w.space)).get(t.sid);
+		expect(row?.content).toBe("write the docs for v2");
+		expect(row?.taskJson?.status).toBe("done");
+
+		// A field only the agent changed is written.
+		await humanWrite(w.space, w.alice, [
+			{ op: "update", block: { id: t.id }, content: "write the docs for v2, today" },
+		]);
+		const own = await call(
+			outlineEditTool,
+			{ edits: [{ replace: t.sid, text: "[/] write all the docs for v2 @human:ann" }] },
+			c,
+		);
+		expect(own.isError).toBeUndefined();
+		row = (await stored(w.space)).get(t.sid);
+		expect(row?.content).toBe("write all the docs for v2, today");
+		expect(row?.taskJson).toMatchObject({ status: "doing", assignee: "human:ann" });
+
+		// Both change the checkbox, differently: refused.
+		await humanWrite(w.space, w.alice, [
+			{ op: "setTask", block: { id: t.id }, task: { status: "cancelled" } },
+		]);
+		const both = await call(
+			outlineEditTool,
+			{ edits: [{ replace: t.sid, text: "[x] write all the docs for v2 @human:ann" }] },
+			c,
+		);
+		expect(both.isError).toBe(true);
+		expect(both.output).toContain("you and they both changed its checkbox");
+		expect((await stored(w.space)).get(t.sid)?.taskJson?.status).toBe("cancelled");
+	});
+
+	test("tags and aliases merge the same way", async () => {
+		const w = await world();
+		const c = ctx(w.session, w.alice);
+		const added = await call(
+			outlineEditTool,
+			{ edits: [{ add: "/", markdown: "- Notes\n  - Tagged\n    tags:: [[T1]]\n    alias:: K1" }] },
+			c,
+		);
+		const sid = ids(added.output)[1] as string;
+		await call(outlineReadTool, { address: ids(added.output)[0] as string }, c);
+		const id = (await stored(w.space)).get(sid)?.id as string;
+		const tagsOf = async () =>
+			(await outlineStore.listOpenLinks([id], 10))
+				.filter((l) => l.kind === "tag")
+				.map((l) => l.targetRef);
+
+		await humanWrite(w.space, w.alice, [{ op: "update", block: { id }, tags: ["T2"] }]);
+		// The agent keeps the tags it read and changes the alias: their tags stay, its alias goes in.
+		const kept = await call(
+			outlineEditTool,
+			{ edits: [{ replace: sid, text: "Tagged, edited\ntags:: [[T1]]\nalias:: K2" }] },
+			c,
+		);
+		expect(kept.isError).toBeUndefined();
+		expect(await tagsOf()).toEqual(["T2"]);
+		expect((await stored(w.space)).get(sid)).toMatchObject({
+			content: "Tagged, edited",
+			alias: "K2",
+		});
+
+		await humanWrite(w.space, w.alice, [{ op: "update", block: { id }, alias: "K3" }]);
+		const both = await call(
+			outlineEditTool,
+			{ edits: [{ replace: sid, text: "Tagged, edited\nalias:: K4" }] },
+			c,
+		);
+		expect(both.isError).toBe(true);
+		expect(both.output).toContain("you and they both changed its alias");
+		expect((await stored(w.space)).get(sid)?.alias).toBe("K3");
+
+		// Tags only the agent changes (the person changed the text) are written; tags both
+		// changed, differently, refuse the call.
+		await call(outlineReadTool, { address: sid }, c);
+		await humanWrite(w.space, w.alice, [
+			{ op: "update", block: { id }, content: "Tagged, edited by a person" },
+		]);
+		const ownTags = await call(
+			outlineEditTool,
+			{ edits: [{ replace: sid, text: "Tagged, edited\ntags:: [[T3]]" }] },
+			c,
+		);
+		expect(ownTags.isError).toBeUndefined();
+		expect(await tagsOf()).toEqual(["T3"]);
+		expect((await stored(w.space)).get(sid)?.content).toBe("Tagged, edited by a person");
+		await humanWrite(w.space, w.alice, [{ op: "update", block: { id }, tags: ["T4"] }]);
+		const bothTags = await call(
+			outlineEditTool,
+			{ edits: [{ replace: sid, text: "Tagged, edited by a person\ntags:: [[T5]]" }] },
+			c,
+		);
+		expect(bothTags.isError).toBe(true);
+		expect(bothTags.output).toContain("you and they both changed its tags");
+		expect(await tagsOf()).toEqual(["T4"]);
+	});
+
+	test("a move, delete or set of a block changed since the read is still refused", async () => {
+		const w = await world();
+		const c = ctx(w.session, w.alice);
+		const [a, b] = await readBlocks(w, c, ["first", "second"]);
+		if (!a || !b) throw new Error("no blocks");
+		await humanWrite(w.space, w.alice, [
+			{ op: "update", block: { id: a.id }, content: "first, edited" },
+		]);
+		for (const edits of [
+			[{ delete: a.sid }],
+			[{ set: a.sid, checkbox: "x" }],
+			[{ move: a.sid, to: b.sid }],
+			[
+				{ replace: a.sid, text: "first!" },
+				{ set: a.sid, checkbox: "x" },
+			],
+		]) {
+			const result = await call(outlineEditTool, { edits }, c);
+			expect(result.isError).toBe(true);
+			expect(result.output).toContain(`[${a.sid}] was changed by a person`);
+			expect(result.output).toContain("a move, delete or set");
+		}
+		const row = (await stored(w.space)).get(a.sid);
+		expect(row).toMatchObject({ content: "first, edited", deleted: false, taskJson: null });
+	});
+
+	test("a read recorded between two versions merges from the version valid then", async () => {
+		const w = await world();
+		const c = ctx(w.session, w.alice);
+		const [a] = await readBlocks(w, c, ["kept as is"]);
+		if (!a) throw new Error("no block");
+		const other = await humanWrite(w.space, w.alice, [
+			{ op: "insert", parent: null, content: "another page" },
+		]);
+		await humanWrite(w.space, w.alice, [
+			{ op: "update", block: { id: a.id }, content: "kept as is, edited" },
+		]);
+		// A seq of the space at which this block has no version of its own: the one before holds.
+		recordOutlineReads(w.session, [[a.id, other.commit?.seq as number]]);
+		const result = await call(
+			outlineEditTool,
+			{ edits: [{ replace: a.sid, text: "Kept as is" }] },
+			c,
+		);
+		expect(result.isError).toBeUndefined();
+		expect((await stored(w.space)).get(a.sid)?.content).toBe("Kept as is, edited");
+	});
+
+	test("the agent's own commit that left a block unchanged still merges later", async () => {
+		const w = await world();
+		const c = ctx(w.session, w.alice);
+		const [b] = await readBlocks(w, c, ["Block B is here."]);
+		if (!b) throw new Error("no block");
+		// Same text plus a child: the commit adds the child; B itself keeps its version.
+		const withChild = await call(
+			outlineEditTool,
+			{ edits: [{ replace: b.sid, text: "Block B is here.\n  - a child" }] },
+			c,
+		);
+		expect(withChild.isError).toBeUndefined();
+		const row = (await stored(w.space)).get(b.sid);
+		expect(row?.versionSeq).toBeLessThan((withChild.metadata?.commit as { seq: number }).seq);
+		await humanWrite(w.space, w.alice, [
+			{ op: "update", block: { id: b.id }, content: "Block B is here. A person added this." },
+		]);
+		const merged = await call(
+			outlineEditTool,
+			{ edits: [{ replace: b.sid, text: "Agent: Block B is here." }] },
+			c,
+		);
+		expect(merged.isError).toBeUndefined();
+		expect((await stored(w.space)).get(b.sid)?.content).toBe(
+			"Agent: Block B is here. A person added this.",
+		);
+	});
+
+	test("a read from before the block existed is refused, not guessed", async () => {
+		const w = await world();
+		const c = ctx(w.session, w.alice);
+		await humanWrite(w.space, w.alice, [{ op: "insert", parent: null, content: "first page" }]);
+		const [a] = await readBlocks(w, c, ["kept as is"]);
+		if (!a) throw new Error("no block");
+		const created = (await stored(w.space)).get(a.sid)?.versionSeq as number;
+		await humanWrite(w.space, w.alice, [
+			{ op: "update", block: { id: a.id }, content: "kept as is, edited" },
+		]);
+		recordOutlineReads(w.session, [[a.id, created - 1]]);
+		const result = await call(outlineEditTool, { edits: [{ replace: a.sid, text: "agent" }] }, c);
+		expect(result.isError).toBe(true);
+		expect(result.output).toContain("the version you read is no longer in its history");
+		expect((await stored(w.space)).get(a.sid)?.content).toBe("kept as is, edited");
+	});
+
+	test("merged blocks past what a result shows are not taken as read", async () => {
+		const w = await world();
+		const c = ctx(w.session, w.alice);
+		const [a, b] = await readBlocks(w, c, ["Alpha text.", "Beta text."]);
+		if (!a || !b) throw new Error("no blocks");
+		const seenB = seenOutlineVersion(w.session, b.id);
+		await humanWrite(w.space, w.alice, [
+			{ op: "update", block: { id: a.id }, content: "Alpha text. Human A." },
+			{ op: "update", block: { id: b.id }, content: "Beta text. Human B." },
+		]);
+		const limits = OUTLINE_EDIT_LIMITS as { maxMergedBytes: number };
+		const saved = limits.maxMergedBytes;
+		limits.maxMergedBytes = 1;
+		let output = "";
+		try {
+			const merged = await call(
+				outlineEditTool,
+				{
+					edits: [
+						{ replace: b.sid, text: "Agent: Beta text." },
+						{ replace: a.sid, text: "Agent: Alpha text." },
+					],
+				},
+				c,
+			);
+			expect(merged.isError).toBeUndefined();
+			output = merged.output;
+		} finally {
+			limits.maxMergedBytes = saved;
+		}
+		// The first in the call's order is shown and read; the second is named, and not read.
+		expect(output).toContain(
+			`1. replaced [${b.sid}], merged with changes made after you read it (shown below)`,
+		);
+		expect(output).toContain(`\n- [${b.sid}] Agent: Beta text. Human B.`);
+		expect(output).toContain(
+			`2. replaced [${a.sid}], merged with changes made after you read it; not shown: read it before changing it again`,
+		);
+		expect(output).toContain(`also merged, not shown here: [${a.sid}]`);
+		expect(output).not.toContain("Agent: Alpha text. Human A.");
+		const rows = await stored(w.space);
+		expect(seenOutlineVersion(w.session, b.id)).toBe(rows.get(b.sid)?.versionSeq);
+		expect(seenOutlineVersion(w.session, b.id)).not.toBe(seenB);
+		expect(seenOutlineVersion(w.session, a.id)).toBeLessThan(rows.get(a.sid)?.versionSeq as number);
+		// Its next edit from the text it read merges again: the person's sentence stays (and an
+		// edit at the place its own merge wrote overlaps it, so it is refused, not written over).
+		const overlap = await call(
+			outlineEditTool,
+			{ edits: [{ replace: a.sid, text: "Agent v2: Alpha text." }] },
+			c,
+		);
+		expect(overlap.isError).toBe(true);
+		const again = await call(
+			outlineEditTool,
+			{ edits: [{ replace: a.sid, text: "Alfa text." }] },
+			c,
+		);
+		expect(again.isError).toBeUndefined();
+		expect((await stored(w.space)).get(a.sid)?.content).toBe("Agent: Alfa text. Human A.");
+	});
+
+	test("the agent's own move does not hide a person's change of a block under it", async () => {
+		const w = await world();
+		const c = ctx(w.session, w.alice);
+		const added = await call(
+			outlineEditTool,
+			{
+				edits: [
+					{ add: "/", markdown: "- Page one\n  - Section\n    - child text" },
+					{ add: "/", markdown: "- Page two" },
+				],
+			},
+			c,
+		);
+		const [p1, section, child, p2] = ids(added.output) as [string, string, string, string];
+		await call(outlineReadTool, { address: p1 }, c);
+		const childId = (await stored(w.space)).get(child)?.id as string;
+		await humanWrite(w.space, w.alice, [
+			{ op: "update", block: { id: childId }, content: "child text, and a person's note" },
+		]);
+		// The move writes a page change of the child, by the agent, over the person's edit.
+		const moved = await call(outlineEditTool, { edits: [{ move: section, to: p2 }] }, c);
+		expect(moved.isError).toBeUndefined();
+		const deleted = await call(outlineEditTool, { edits: [{ delete: section }] }, c);
+		expect(deleted.isError).toBe(true);
+		expect(deleted.output).toContain(`[${child}] was changed by a person`);
+		expect((await stored(w.space)).get(section)?.deleted).toBe(false);
+		// Shown in full by the refusal, the child now counts as read: a replace from that text
+		// merges with what the person writes next.
+		await humanWrite(w.space, w.alice, [
+			{ op: "update", block: { id: childId }, content: "child text, and a person's note. More." },
+		]);
+		const replaced = await call(
+			outlineEditTool,
+			{ edits: [{ replace: child, text: "Child text, and a person's note" }] },
+			c,
+		);
+		expect(replaced.isError).toBeUndefined();
+		expect((await stored(w.space)).get(child)?.content).toBe(
+			"Child text, and a person's note. More.",
+		);
+	});
+
+	test("the agent's own move, then a replace from its earlier read, merges", async () => {
+		const w = await world();
+		const c = ctx(w.session, w.alice);
+		const added = await call(
+			outlineEditTool,
+			{
+				edits: [
+					{ add: "/", markdown: "- Page one\n  - Section\n    - child text" },
+					{ add: "/", markdown: "- Page two" },
+				],
+			},
+			c,
+		);
+		const [p1, section, child, p2] = ids(added.output) as [string, string, string, string];
+		await call(outlineReadTool, { address: p1 }, c);
+		const childId = (await stored(w.space)).get(child)?.id as string;
+		await humanWrite(w.space, w.alice, [
+			{ op: "update", block: { id: childId }, content: "child text, and a person's note" },
+		]);
+		await call(outlineEditTool, { edits: [{ move: section, to: p2 }] }, c);
+		const replaced = await call(
+			outlineEditTool,
+			{ edits: [{ replace: child, text: "Child text" }] },
+			c,
+		);
+		expect(replaced.isError).toBeUndefined();
+		expect(replaced.output).toContain("merged with changes made after you read it");
+		expect((await stored(w.space)).get(child)?.content).toBe("Child text, and a person's note");
+	});
+
+	test("merges are bounded before they start: text, block size and time", async () => {
+		const w = await world();
+		const c = ctx(w.session, w.alice);
+		const [a] = await readBlocks(w, c, ["Short."]);
+		if (!a) throw new Error("no block");
+		await humanWrite(w.space, w.alice, [
+			{ op: "update", block: { id: a.id }, content: `Short. ${"Long text. ".repeat(1400)}` },
+		]);
+		// The block's current text plus the call's other text is more than one write takes.
+		const big = `${"Other text. ".repeat(1300)}`;
+		const tooMuch = await call(
+			outlineEditTool,
+			{
+				edits: [
+					{ replace: a.sid, text: "Shorter." },
+					...Array.from({ length: 9 }, () => ({ add: "/", markdown: `- ${big}` })),
+				],
+			},
+			c,
+		);
+		expect(tooMuch.isError).toBe(true);
+		expect(tooMuch.output).toContain("one call can merge and write besides its other text");
+		// No time left for merging: refused, nothing written.
+		const saved = AGENT_MERGE_LIMITS.timeMs;
+		AGENT_MERGE_LIMITS.timeMs = 0;
+		try {
+			const slow = await call(
+				outlineEditTool,
+				{ edits: [{ replace: a.sid, text: "Shorter." }] },
+				c,
+			);
+			expect(slow.isError).toBe(true);
+			expect(slow.output).toContain("took longer than");
+		} finally {
+			AGENT_MERGE_LIMITS.timeMs = saved;
+		}
+		expect((await stored(w.space)).get(a.sid)?.content?.startsWith("Short. Long text.")).toBe(true);
+	});
+
+	test("long texts merge on the text worker", async () => {
+		const w = await world();
+		const c = ctx(w.session, w.alice);
+		const long = `${"A sentence about refresh tokens and their lifetime. ".repeat(40)}End.`;
+		expect(Buffer.byteLength(long)).toBeGreaterThan(OUTLINE_EDIT_TEXT_LIMITS.inlineBytes);
+		const [b] = await readBlocks(w, c, [long]);
+		if (!b) throw new Error("no block");
+		await humanWrite(w.space, w.alice, [
+			{ op: "update", block: { id: b.id }, content: `${long} Reviewed.` },
+		]);
+		const result = await call(
+			outlineEditTool,
+			{ edits: [{ replace: b.sid, text: `Summary first. ${long}` }] },
+			c,
+		);
+		expect(result.isError).toBeUndefined();
+		expect((await stored(w.space)).get(b.sid)?.content).toBe(`Summary first. ${long} Reviewed.`);
+	});
+});
+
+describe("OutlineEdit of blocks the agent has not read", () => {
+	/** A page of blocks a person wrote; their sids and ids, the page first. */
+	async function personPage(w: World, texts: string[]) {
+		const r = await humanWrite(w.space, w.alice, [
+			{ op: "insert", tempId: "p", parent: null, content: "Their page" },
+			...texts.map((content, i) => ({
+				op: "insert" as const,
+				tempId: `b${i}`,
+				parent: { tempId: "p" },
+				content,
+			})),
+		]);
+		return r.results.map((x) => ({ sid: x.sid, id: x.blockId }));
+	}
+
+	test("a replace or delete of someone's unread block writes nothing and shows it whole", async () => {
+		const w = await world();
+		const c = ctx(w.session, w.alice);
+		const [, a, b] = await personPage(w, ["first, as they wrote it", "second"]);
+		if (!a || !b) throw new Error("no blocks");
+		const refused = await call(
+			outlineEditTool,
+			{
+				edits: [{ replace: a.sid, text: "first, by the agent" }, { delete: b.sid }],
+			},
+			c,
+		);
+		expect(refused.isError).toBe(true);
+		expect(refused.output).toContain("Nothing was written");
+		expect(refused.output).toMatch(
+			new RegExp(
+				`\\[${a.sid}\\] was last written by a person in commit #\\d+, and you have not read it`,
+			),
+		);
+		expect(refused.output).toContain(`[${b.sid}] was last written by a person`);
+		expect(refused.output).toContain("its current text is shown in full below");
+		expect(refused.output).toContain(`\n- [${a.sid}] first, as they wrote it`);
+		expect(refused.output).toContain(`\n- [${b.sid}] second`);
+		expect(refused.output).not.toContain("Read those blocks again");
+		const rows = await stored(w.space);
+		expect(rows.get(a.sid)?.content).toBe("first, as they wrote it");
+		expect(rows.get(b.sid)?.deleted).toBe(false);
+		// Shown in full, they count as read: the same edit goes through now.
+		expect(seenOutlineVersion(w.session, a.id)).toBe(rows.get(a.sid)?.versionSeq);
+		const again = await call(
+			outlineEditTool,
+			{
+				edits: [{ replace: a.sid, text: "first, by the agent" }, { delete: b.sid }],
+			},
+			c,
+		);
+		expect(again.isError).toBeUndefined();
+		const after = await stored(w.space);
+		expect(after.get(a.sid)?.content).toBe("first, by the agent");
+		expect(after.get(b.sid)?.deleted).toBe(true);
+	});
+
+	test("after a restart reads are gone: someone's blocks need a read again, its own do not", async () => {
+		const w = await world();
+		const c = ctx(w.session, w.alice);
+		const [, theirs] = await personPage(w, ["they wrote this"]);
+		if (!theirs) throw new Error("no block");
+		const added = await call(outlineEditTool, { edits: [{ add: "/", markdown: "- mine" }] }, c);
+		const mine = ids(added.output)[0] as string;
+		await call(outlineReadTool, { address: theirs.sid }, c);
+		// The server restarts (the ledger is in memory), and the person edits meanwhile.
+		clearOutlineReads();
+		await humanWrite(w.space, w.alice, [
+			{ op: "update", block: { id: theirs.id }, content: "they wrote this, then more" },
+		]);
+		const own = await call(outlineEditTool, { edits: [{ replace: mine, text: "mine, v2" }] }, c);
+		expect(own.isError).toBeUndefined();
+		const stale = await call(
+			outlineEditTool,
+			{ edits: [{ replace: theirs.sid, text: "agent text from before" }] },
+			c,
+		);
+		expect(stale.isError).toBe(true);
+		expect(stale.output).toContain("you have not read it");
+		expect(stale.output).toContain("forgotten when the server restarts");
+		expect(stale.output).toContain(`- [${theirs.sid}] they wrote this, then more`);
+		expect((await stored(w.space)).get(theirs.sid)?.content).toBe("they wrote this, then more");
+		// Redone on the text shown, it goes in; a later change by the person merges again.
+		const redone = await call(
+			outlineEditTool,
+			{ edits: [{ replace: theirs.sid, text: "They wrote this, then more" }] },
+			c,
+		);
+		expect(redone.isError).toBeUndefined();
+		await humanWrite(w.space, w.alice, [
+			{ op: "update", block: { id: theirs.id }, content: "They wrote this, then more. And more." },
+		]);
+		const merged = await call(
+			outlineEditTool,
+			{ edits: [{ replace: theirs.sid, text: "THEY wrote this, then more" }] },
+			c,
+		);
+		expect(merged.isError).toBeUndefined();
+		expect((await stored(w.space)).get(theirs.sid)?.content).toBe(
+			"THEY wrote this, then more. And more.",
+		);
+	});
+
+	test("a move or set of an unread block is written as before", async () => {
+		const w = await world();
+		const c = ctx(w.session, w.alice);
+		const [page, a, b] = await personPage(w, ["a", "b"]);
+		if (!page || !a || !b) throw new Error("no blocks");
+		const result = await call(
+			outlineEditTool,
+			{
+				edits: [
+					{ set: a.sid, checkbox: "x" },
+					{ move: b.sid, to: a.sid },
+				],
+			},
+			c,
+		);
+		expect(result.isError).toBeUndefined();
+		const rows = await stored(w.space);
+		expect(rows.get(a.sid)?.taskJson?.status).toBe("done");
+		expect(rows.get(b.sid)?.parentId).toBe(a.id);
+		// Neither counts as reading them: their text still needs a read before a replace.
+		expect(seenOutlineVersion(w.session, a.id)).toBeUndefined();
+		const replaced = await call(outlineEditTool, { edits: [{ replace: a.sid, text: "agent" }] }, c);
+		expect(replaced.isError).toBe(true);
+		expect(replaced.output).toContain("you have not read it");
+		expect((await stored(w.space)).get(a.sid)?.content).toBe("a");
+	});
+
+	test("a page list shows titles only: it does not count as reading the pages", async () => {
+		const w = await world();
+		const c = ctx(w.session, w.alice);
+		const long = `Plan: ${"the part after the title that a page list never shows. ".repeat(6)}END`;
+		const r = await humanWrite(w.space, w.alice, [{ op: "insert", parent: null, content: long }]);
+		const sid = r.results[0]?.sid as string;
+		const list = await call(outlineReadTool, { address: `${w.space.key}/` }, c);
+		expect(list.output).toContain(`[${sid}]`);
+		expect(list.output).not.toContain("END");
+		const refused = await call(outlineEditTool, { edits: [{ replace: sid, text: "Plan" }] }, c);
+		expect(refused.isError).toBe(true);
+		expect(refused.output).toContain("you have not read it");
+		expect(refused.output).toContain("END");
+		expect((await stored(w.space)).get(sid)?.content).toBe(long);
+	});
+});
+
+describe("OutlineEdit delete and what is under the block", () => {
+	test("blocks under it changed or added by someone since the read refuse the delete", async () => {
+		const w = await world();
+		const c = ctx(w.session, w.alice);
+		const added = await call(
+			outlineEditTool,
+			{ edits: [{ add: "/", markdown: "- Plan\n  - Section\n    - detail\n    - agent's note" }] },
+			c,
+		);
+		const [, section, detail, note] = ids(added.output) as [string, string, string, string];
+		await call(outlineReadTool, { address: section }, c);
+		const rows = await stored(w.space);
+		const id = (sid: string) => rows.get(sid)?.id as string;
+		await humanWrite(w.space, w.alice, [
+			{ op: "update", block: { id: id(detail) }, content: "detail, worked out by a person" },
+			{ op: "insert", tempId: "n", parent: { id: id(section) }, content: "a person's new block" },
+			{ op: "insert", parent: { tempId: "n" }, content: "and one under it" },
+		]);
+		const refused = await call(outlineEditTool, { edits: [{ delete: section }] }, c);
+		expect(refused.isError).toBe(true);
+		expect(refused.output).toContain(`[${detail}] was changed by a person`);
+		expect(refused.output).toContain(`it is under [${section}], which you are deleting with it`);
+		expect(refused.output).toMatch(
+			/\] was last written by a person in commit #\d+, and you have not read it/,
+		);
+		expect(refused.output).toContain(`- [${detail}] detail, worked out by a person`);
+		expect(refused.output).toContain("- [");
+		expect(refused.output).toContain("a person's new block");
+		expect(refused.output).toContain("and one under it");
+		// The section itself and the agent's own note are not in question.
+		expect(refused.output).not.toContain(`[${section}] was`);
+		expect(refused.output).not.toContain(`[${note}] was`);
+		expect((await stored(w.space)).get(section)?.deleted).toBe(false);
+		// Shown in full, they count as read: the same delete goes through now.
+		const again = await call(outlineEditTool, { edits: [{ delete: section }] }, c);
+		expect(again.isError).toBeUndefined();
+		const after = await stored(w.space);
+		expect([section, detail, note].map((sid) => after.get(sid)?.deleted)).toEqual([
+			true,
+			true,
+			true,
+		]);
+	});
+
+	test("with several deletes, each is judged on what is left to check", async () => {
+		const w = await world();
+		const c = ctx(w.session, w.alice);
+		const added = await call(
+			outlineEditTool,
+			{
+				edits: [
+					{ add: "/", markdown: "- Big\n  - 1\n  - 2\n  - 3\n  - 4" },
+					{ add: "/", markdown: "- Small\n  - s" },
+				],
+			},
+			c,
+		);
+		const got = ids(added.output);
+		const big = got[0] as string;
+		const small = got[5] as string;
+		const limits = OUTLINE_EDIT_LIMITS as { maxDeletedChecked: number };
+		const saved = limits.maxDeletedChecked;
+		limits.maxDeletedChecked = 3;
+		try {
+			const r = await call(outlineEditTool, { edits: [{ delete: big }, { delete: small }] }, c);
+			expect(r.isError).toBe(true);
+			expect(r.output).toContain(`[${big}] has more than 3 blocks under it`);
+			expect(r.output).not.toContain(`[${small}]`);
+			// The small one first: it fits, and the big one gets what is left, said as such.
+			const r2 = await call(outlineEditTool, { edits: [{ delete: small }, { delete: big }] }, c);
+			expect(r2.output).toContain(
+				`[${big}] has more than 2 blocks under it, which is what was left to check`,
+			);
+			expect(r2.output).not.toContain(`[${small}] has`);
+		} finally {
+			limits.maxDeletedChecked = saved;
+		}
+	});
+
+	test("more blocks under it than are checked refuse the delete and say so", async () => {
+		const w = await world();
+		const c = ctx(w.session, w.alice);
+		const markdown = ["- Big", ...Array.from({ length: 4 }, (_, i) => `  - part ${i}`)].join("\n");
+		const added = await call(outlineEditTool, { edits: [{ add: "/", markdown }] }, c);
+		const big = ids(added.output)[0] as string;
+		const limits = OUTLINE_EDIT_LIMITS as { maxDeletedChecked: number };
+		const saved = limits.maxDeletedChecked;
+		limits.maxDeletedChecked = 3;
+		try {
+			const refused = await call(outlineEditTool, { edits: [{ delete: big }] }, c);
+			expect(refused.isError).toBe(true);
+			expect(refused.output).toContain(`[${big}] has more than 3 blocks under it`);
+			expect((await stored(w.space)).get(big)?.deleted).toBe(false);
+			limits.maxDeletedChecked = 4;
+			const fits = await call(outlineEditTool, { edits: [{ delete: big }] }, c);
+			expect(fits.isError).toBeUndefined();
+		} finally {
+			limits.maxDeletedChecked = saved;
+		}
+	});
+
+	test("a move takes the whole subtree along and is not checked below the block", async () => {
+		const w = await world();
+		const c = ctx(w.session, w.alice);
+		const added = await call(
+			outlineEditTool,
+			{ edits: [{ add: "/", markdown: "- A\n  - under A\n- B" }] },
+			c,
+		);
+		const [a, child, b] = ids(added.output) as [string, string, string];
+		await call(outlineReadTool, { address: a }, c);
+		const rows = await stored(w.space);
+		await humanWrite(w.space, w.alice, [
+			{ op: "update", block: { id: rows.get(child)?.id as string }, content: "under A, edited" },
+		]);
+		const moved = await call(outlineEditTool, { edits: [{ move: a, to: b }] }, c);
+		expect(moved.isError).toBeUndefined();
+		expect((await stored(w.space)).get(child)?.content).toBe("under A, edited");
+	});
+});
+
+describe("OutlineEdit read rules at their edges", () => {
+	test("a set of an unread block under a block the call deletes does not hide it", async () => {
+		const w = await world();
+		const c = ctx(w.session, w.alice);
+		const added = await call(
+			outlineEditTool,
+			{ edits: [{ add: "/", markdown: "- Agent page\n  - Agent section" }] },
+			c,
+		);
+		const section = ids(added.output)[1] as string;
+		const sectionId = (await stored(w.space)).get(section)?.id as string;
+		const r = await humanWrite(w.space, w.alice, [
+			{ op: "insert", parent: { id: sectionId }, content: "a person's careful notes" },
+		]);
+		const theirs = r.results[0]?.sid as string;
+		const both = await call(
+			outlineEditTool,
+			{
+				edits: [{ set: theirs, checkbox: "x" }, { delete: section }],
+			},
+			c,
+		);
+		expect(both.isError).toBe(true);
+		expect(both.output).toContain(`[${theirs}] was last written by a person`);
+		expect(both.output).toContain(`it is under [${section}], which you are deleting with it`);
+		expect((await stored(w.space)).get(theirs)?.deleted).toBe(false);
+	});
+
+	test("after a restart, the agent's own merge is not taken as text it wrote", async () => {
+		const w = await world();
+		const c = ctx(w.session, w.alice);
+		const [a, b] = await readBlocksOf(w, c, ["Alpha text.", "Beta text."]);
+		await humanWrite(w.space, w.alice, [
+			{ op: "update", block: { id: a.id }, content: "Alpha text. Human A." },
+			{ op: "update", block: { id: b.id }, content: "Beta text. Human B." },
+		]);
+		const limits = OUTLINE_EDIT_LIMITS as { maxMergedBytes: number };
+		const saved = limits.maxMergedBytes;
+		limits.maxMergedBytes = 1;
+		try {
+			const merged = await call(
+				outlineEditTool,
+				{
+					edits: [
+						{ replace: a.sid, text: "Agent: Alpha text." },
+						{ replace: b.sid, text: "Agent: Beta text." },
+					],
+				},
+				c,
+			);
+			expect(merged.output).toContain(`also merged, not shown here: [${b.sid}]`);
+		} finally {
+			limits.maxMergedBytes = saved;
+		}
+		clearOutlineReads(); // a restart
+		const again = await call(
+			outlineEditTool,
+			{ edits: [{ replace: b.sid, text: "Agent v2: Beta text." }] },
+			c,
+		);
+		expect(again.isError).toBe(true);
+		expect(again.output).toContain(`[${b.sid}] was last written by someone`);
+		expect(again.output).toContain(`- [${b.sid}] Agent: Beta text. Human B.`);
+		expect((await stored(w.space)).get(b.sid)?.content).toBe("Agent: Beta text. Human B.");
+	});
+
+	test("after a restart, a person's move of the agent's blocks is not their text", async () => {
+		const w = await world();
+		const c = ctx(w.session, w.alice);
+		const added = await call(
+			outlineEditTool,
+			{
+				edits: [
+					{ add: "/", markdown: "- Agent page\n  - Section\n    - one\n    - two" },
+					{ add: "/", markdown: "- Other page" },
+				],
+			},
+			c,
+		);
+		const [, section, one, two, other] = ids(added.output) as [
+			string,
+			string,
+			string,
+			string,
+			string,
+		];
+		const rows = await stored(w.space);
+		await humanWrite(w.space, w.alice, [
+			{
+				op: "move",
+				block: { id: rows.get(section)?.id as string },
+				parent: { id: rows.get(other)?.id as string },
+			},
+		]);
+		clearOutlineReads(); // a restart
+		// A checkbox the person set is theirs, though: that block needs a read.
+		await humanWrite(w.space, w.alice, [
+			{ op: "setTask", block: { id: rows.get(two)?.id as string }, task: { status: "done" } },
+		]);
+		const refused = await call(outlineEditTool, { edits: [{ delete: section }] }, c);
+		expect(refused.isError).toBe(true);
+		expect(refused.output).toContain(`[${two}] was last written by a person`);
+		expect(refused.output).not.toContain(`[${one}] was`);
+		expect(refused.output).not.toContain(`[${section}] was`);
+		const del = await call(outlineEditTool, { edits: [{ delete: section }] }, c);
+		expect(del.isError).toBeUndefined();
+	});
+
+	test("past the scan of a block's versions, someone else is assumed to have written it", async () => {
+		const w = await world();
+		const c = ctx(w.session, w.alice);
+		const added = await call(
+			outlineEditTool,
+			{
+				edits: [
+					{ add: "/", markdown: "- Page one\n  - Section\n    - child" },
+					{ add: "/", markdown: "- Page two" },
+				],
+			},
+			c,
+		);
+		const [p1, section, child, p2] = ids(added.output) as [string, string, string, string];
+		await call(outlineReadTool, { address: p1 }, c);
+		// The agent moves the section between pages again and again: every move writes a page
+		// change of the child, by the agent, past what one check looks through.
+		for (let i = 0; i <= OUTLINE_LAST_WRITES_SCAN; i++) {
+			const moved = await call(
+				outlineEditTool,
+				{ edits: [{ move: section, to: i % 2 ? p1 : p2 }] },
+				c,
+			);
+			expect(moved.isError).toBeUndefined();
+		}
+		const refused = await call(outlineEditTool, { edits: [{ delete: section }] }, c);
+		expect(refused.isError).toBe(true);
+		expect(refused.output).toContain(`[${child}] was changed by someone`);
+		expect((await stored(w.space)).get(child)?.deleted).toBe(false);
+	});
+
+	test("the merge's time budget covers waiting for the text runner", async () => {
+		const w = await world();
+		const c = ctx(w.session, w.alice);
+		const [a] = await readBlocksOf(w, c, ["Short text."]);
+		await humanWrite(w.space, w.alice, [
+			{ op: "update", block: { id: a.id }, content: "Short text. More." },
+		]);
+		const saved = { run: AGENT_MERGE_HOOKS.run, timeMs: AGENT_MERGE_LIMITS.timeMs };
+		let cancelled = false;
+		// A runner busy with other jobs: this one would start only after a while.
+		AGENT_MERGE_HOOKS.run = (job, options) =>
+			new Promise((resolve, reject) => {
+				const t = setTimeout(() => resolve(saved.run(job, options)), 400);
+				options.signal?.addEventListener("abort", () => {
+					cancelled = true;
+					clearTimeout(t);
+					reject(new Error("cancelled"));
+				});
+			});
+		AGENT_MERGE_LIMITS.timeMs = 50;
+		try {
+			const started = Date.now();
+			const slow = await call(
+				outlineEditTool,
+				{ edits: [{ replace: a.sid, text: "Short text!" }] },
+				c,
+			);
+			expect(Date.now() - started).toBeLessThan(350);
+			expect(slow.isError).toBe(true);
+			expect(slow.output).toContain("took longer than");
+			expect(cancelled).toBe(true);
+		} finally {
+			AGENT_MERGE_HOOKS.run = saved.run;
+			AGENT_MERGE_LIMITS.timeMs = saved.timeMs;
+		}
+		expect((await stored(w.space)).get(a.sid)?.content).toBe("Short text. More.");
 	});
 });
 

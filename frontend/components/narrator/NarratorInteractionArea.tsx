@@ -1,8 +1,12 @@
-import { Box, Button } from "@mantine/core";
+import { Box, Button, Group, Loader, Text } from "@mantine/core";
+import { notifications } from "@mantine/notifications";
+import { useQueryClient } from "@tanstack/react-query";
 import type React from "react";
+import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useLocalPref } from "../../hooks/useLocalPref";
 import { startBottomSpacingResize, useBottomSpacing } from "../../hooks/useResizableBottomSpacing";
+import { api } from "../../lib/api";
 import { NarratorComposerRow, type NarratorComposerRowProps } from "./composer/NarratorComposerRow";
 import { NarratorGitBar } from "./header/NarratorGitBar";
 import { NarratorInteractionStatusBar } from "./interaction/NarratorInteractionStatusBar";
@@ -28,7 +32,10 @@ import { PermissionRulePolicySync } from "./permission/PermissionRuleResultNotic
  */
 export interface NarratorInteractionCommon {
 	narratorId: string;
-	narrator: UseStatusBarPropsOptions["narrator"];
+	narrator: UseStatusBarPropsOptions["narrator"] & {
+		status?: string;
+		substatus?: string[];
+	};
 	isWorkspacePreview: boolean;
 	isMobileViewport: boolean;
 }
@@ -36,7 +43,7 @@ export interface NarratorInteractionCommon {
 export interface NarratorInteractionAreaProps {
 	// ── Shared context, passed once (see NarratorInteractionCommon). ──
 	common: NarratorInteractionCommon;
-	/** Model traces expose only a return control, with no composer or status tools. */
+	/** Model traces expose read-only sampling/retry controls, never the composer. */
 	onModelTraceReturn?: () => void;
 
 	// ── Attachments ──
@@ -96,20 +103,71 @@ export interface NarratorInteractionAreaProps {
 }
 
 export function NarratorInteractionArea(props: NarratorInteractionAreaProps) {
-	const { t } = useTranslation("narrator");
 	if (props.onModelTraceReturn) {
 		return (
-			<Box
-				p="xs"
-				style={{ flexShrink: 0, borderTop: "1px solid var(--mantine-color-default-border)" }}
-			>
-				<Button fullWidth variant="subtle" onClick={props.onModelTraceReturn}>
-					{t("modelTraceReturn")}
-				</Button>
-			</Box>
+			<ModelTraceInteraction
+				key={props.common.narratorId}
+				common={props.common}
+				onReturn={props.onModelTraceReturn}
+			/>
 		);
 	}
 	return <NarratorEditableInteractionArea {...props} />;
+}
+
+function ModelTraceInteraction({
+	common: { narratorId, narrator },
+	onReturn,
+}: {
+	common: NarratorInteractionCommon;
+	onReturn: () => void;
+}) {
+	const { t } = useTranslation("narrator");
+	const queryClient = useQueryClient();
+	const submitting = useRef(false);
+	const [pending, setPending] = useState(false);
+	const sampling = narrator?.status === "working" || narrator?.status === "waiting";
+	const failed = narrator?.status === "idle" && narrator.substatus?.includes("error");
+	const retry = async () => {
+		if (submitting.current || sampling || !failed) return;
+		submitting.current = true;
+		setPending(true);
+		try {
+			await api.retryModelTrace(narratorId);
+			await queryClient.invalidateQueries({ queryKey: ["narrators", narratorId] });
+		} catch (error) {
+			notifications.show({
+				color: "red",
+				message: error instanceof Error ? error.message : t("modelTraceRetryFailed"),
+			});
+		} finally {
+			submitting.current = false;
+			setPending(false);
+		}
+	};
+	return (
+		<Box
+			p="xs"
+			style={{ flexShrink: 0, borderTop: "1px solid var(--mantine-color-default-border)" }}
+		>
+			{sampling && (
+				<Group gap="xs" justify="center" role="status">
+					<Loader size="xs" />
+					<Text size="xs" c="dimmed">
+						{t("modelTraceSampling")}
+					</Text>
+				</Group>
+			)}
+			{failed && (
+				<Button fullWidth variant="light" loading={pending} disabled={pending} onClick={retry}>
+					{t("modelTraceRetry")}
+				</Button>
+			)}
+			<Button fullWidth variant="subtle" onClick={onReturn}>
+				{t("modelTraceReturn")}
+			</Button>
+		</Box>
+	);
 }
 
 function NarratorEditableInteractionArea(props: NarratorInteractionAreaProps) {

@@ -360,6 +360,14 @@
 			"prevId": "4079ddee-70fe-4250-a6f9-614a7270d6ae",
 			"version": "7",
 			"snapshotDigest": "8f5daccf0d27fa16385d9de26e353e15fd162de8ca4b99e24c286f6f399ecae5"
+		},
+		{
+			"idx": 45,
+			"tag": "0045_git_identity_visibility_per_account",
+			"id": "b47d28e4-7316-4e38-9be4-f1a8e6511385",
+			"prevId": "30f5ec4d-b57c-40b3-a85d-a69332fe44bf",
+			"version": "7",
+			"snapshotDigest": "0df0c95a008f04c6ee8417d09a6ae3b6f45ad319cec11796dbfe9c8200fa6ef1"
 		}
 	]
 }

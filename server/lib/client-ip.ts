@@ -1,5 +1,7 @@
 import { BlockList, isIP } from "node:net";
+import { networkInterfaces } from "node:os";
 import type { Context } from "hono";
+import { isLoopbackHostname } from "./public-origin";
 
 const MAX_FORWARDED_HEADER_CHARS = 2_048;
 const MAX_FORWARDED_HOPS = 20;
@@ -170,4 +172,43 @@ export function resolveClientIp(input: ResolveClientIpInput): string {
 export function getClientIp(c: Context): string {
 	const env = c.env as { clientIp?: unknown } | undefined;
 	return typeof env?.clientIp === "string" ? (normalizeIp(env.clientIp) ?? "unknown") : "unknown";
+}
+
+const LOCAL_ADDRESS_TTL_MS = 5_000;
+
+/** Cached local-interface address set; enumerating interfaces is a syscall, not a hot-path read. */
+let localAddressCache: { bucket: number; addresses: Set<string> } | null = null;
+
+function localInterfaceAddresses(now: number): Set<string> {
+	const bucket = Math.floor(now / LOCAL_ADDRESS_TTL_MS);
+	if (localAddressCache?.bucket === bucket) return localAddressCache.addresses;
+
+	const addresses = new Set<string>();
+	for (const entries of Object.values(networkInterfaces())) {
+		for (const entry of entries ?? []) {
+			// Same normalization as the incoming address, so representation differences
+			// (IPv6 compression, case, zone index, IPv4-mapped form) cannot hide a match.
+			const address = normalizeIp(entry.address);
+			if (address) addresses.add(address);
+		}
+	}
+	localAddressCache = { bucket, addresses };
+	return addresses;
+}
+
+/**
+ * 发起请求的浏览器是否就在这台机器上：回环，或本机任一网卡地址。
+ *
+ * 用 Tailscale / 局域网 IP 访问自己机器上的服务时，`clientIp` 是本机网卡地址而不是
+ * 127.0.0.1。它和回环一样由**本机**浏览器发起，必须同等对待——否则会被当成远端浏览器，
+ * 例如 `POST /fs/reveal` 会退化成由服务进程自己 spawn explorer，那个进程没有前台权限，
+ * 打开的资源管理器窗口会被应用窗口挡在后面。
+ *
+ * 判据是"这个地址属于本机网卡"，与"是否能从外部访问"无关：局域网里其它机器发来的
+ * 请求，其源地址不在本机网卡列表里。
+ */
+export function isLocalMachineAddress(raw: string | null | undefined, now = Date.now()): boolean {
+	const ip = normalizeIp(raw);
+	if (!ip) return false;
+	return isLoopbackHostname(ip) || localInterfaceAddresses(now).has(ip);
 }

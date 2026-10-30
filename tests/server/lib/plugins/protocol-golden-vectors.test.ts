@@ -12,6 +12,7 @@ import {
 	PLUGIN_TO_HOST_NOTIFICATION_METHODS,
 	PLUGIN_TO_HOST_REQUEST_METHODS,
 	PROVIDER_PROTOCOL_VERSION,
+	PROVIDER_REQUEST_MAX_BYTES,
 	pluginHelloParamsSchema,
 	pluginToHostEnvelopeSchema,
 	pluginToHostFeatureListSchema,
@@ -203,6 +204,14 @@ describe("Plugin -> Host protocol golden vectors", () => {
 			limits: { maxInboundFrameBytes: 1_048_576, maxInFlight: 16 },
 		});
 		expect(initialized.features).toEqual([]);
+		// Provider/tool runtimes advertise both directions. Queue capacity includes
+		// framing and cancellation reserve, rather than sharing the single-frame cap.
+		const limits = {
+			...initialized.limits,
+			maxOutboundFrameBytes: PROVIDER_REQUEST_MAX_BYTES,
+			maxQueuedBytes: PROVIDER_REQUEST_MAX_BYTES + 1024 * 1024,
+		};
+		expect(hostInitializeParamsSchema.parse({ ...initialized, limits }).limits).toEqual(limits);
 	});
 
 	test("allowlists the first Host API request surface and its required features", () => {
