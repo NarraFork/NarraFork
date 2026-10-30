@@ -401,6 +401,12 @@ async function applyCommitSection(
 				.where(inArray(outlineBlocks.id, ids));
 		}
 	}
+	if (plan.inProcessStale) {
+		await tx
+			.update(outlineSpaces)
+			.set({ inProcessReady: false })
+			.where(eq(outlineSpaces.id, plan.spaceId));
+	}
 
 	const released = [...plan.claims.release, ...plan.claims.expire.map((e) => e.expect.taskBlockId)];
 	for (const ids of chunked(released)) {
@@ -878,6 +884,29 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 				{ label: "outline.renewTaskClaims" },
 			);
 			return rows.length;
+		},
+
+		async getInProcessReady(spaceIds) {
+			const out = new Map<string, boolean>();
+			for (const ids of chunked(spaceIds)) {
+				const rows = await db
+					.select({ id: outlineSpaces.id, ready: outlineSpaces.inProcessReady })
+					.from(outlineSpaces)
+					.where(inArray(outlineSpaces.id, ids));
+				for (const row of rows) out.set(row.id, row.ready);
+			}
+			return out;
+		},
+
+		async hasChangesSince(spaceId, afterSeq, flags) {
+			const rows = await db.execute(sql`
+				SELECT 1 AS hit FROM outline_commits c
+				JOIN outline_block_versions v ON v.commit_id = c.id
+				WHERE c.space_id = ${spaceId} AND c.seq > CAST(${afterSeq} AS integer)
+					AND (v.change_flags & CAST(${flags} AS integer)) <> 0
+				LIMIT 1
+			`);
+			return (rows as unknown as unknown[]).length > 0;
 		},
 
 		async listSpacesPendingInProcess({ after, limit }) {

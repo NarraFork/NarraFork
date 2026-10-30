@@ -228,7 +228,9 @@ export interface OutlineClaimPlan {
  *   4. insert `insertBlocks`;
  *   5. open one version per block in `versions`, copied from the block's new row;
  *   6. close `closeLinkIds`, insert `insertLinks`;
- *   7. set `in_process` of the blocks in `inProcess` (no version: it is a derived cache);
+ *   7. set `in_process` of the blocks in `inProcess` (no version: it is a derived cache); with
+ *      `inProcessStale`, mark the space's in-process answers as not derived
+ *      (`in_process_ready` false) for the background rebuild;
  *   8. write `claims`.
  *
  * Before step 1 the section checks that every claim row `claims` expects is still as read; when
@@ -252,6 +254,11 @@ export interface OutlineCommitPlan {
 	insertLinks: OutlineLinkRow[];
 	/** Existing blocks whose `in_process` changes (new blocks carry it in their row). */
 	inProcess: Array<{ ids: string[]; value: boolean }>;
+	/**
+	 * Some answers this commit changes are not in `inProcess` (they did not fit the row limit):
+	 * the space goes back to "not derived" until the background rebuild has run.
+	 */
+	inProcessStale: boolean;
 	claims: OutlineClaimPlan;
 }
 
@@ -411,6 +418,15 @@ export interface OutlineStore extends WritePortIdentity, OutlineReadPort {
 	): Promise<Array<{ claim: OutlineTaskClaimRow; spaceId: string }>>;
 	/** Move the lease of every claim a session holds to `expiresAt`; returns how many. */
 	renewTaskClaims(narratorId: string, expiresAt: string): Promise<number>;
+
+	/** Of the given spaces, which have their `in_process` answers derived (`in_process_ready`). */
+	getInProcessReady(spaceIds: readonly string[]): Promise<Map<string, boolean>>;
+	/**
+	 * Whether a commit of the space after `afterSeq` changed anything an in-process answer
+	 * depends on (a version with a change flag in `flags`: creation, move, deletion, restore,
+	 * task, page). Text-only commits do not count. One indexed query, stops at the first match.
+	 */
+	hasChangesSince(spaceId: string, afterSeq: number, flags: number): Promise<boolean>;
 
 	// ── in-process rebuild (`services/outline/in-process.ts`) ──────────────────────────
 

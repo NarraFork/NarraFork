@@ -54,7 +54,10 @@
  * IN PROCESS
  * ----------
  * `outline_blocks.in_process` (a task, under a task, or in a session space) is derived in the
- * commit that changes it: see `planInProcess`. It is not part of a block's versions.
+ * commit that changes it: see `planInProcess`. It is not part of a block's versions. When the
+ * answers a commit changes do not fit in the commit's row limit (a checkbox on a block with a
+ * huge subtree), the write still goes through: the commit marks the space for the background
+ * rebuild (`in-process.ts`), and until it has run, readers compute the answer from the tree.
  */
 import { createHash } from "node:crypto";
 import { NotFoundError } from "@server/lib/errors";
@@ -84,6 +87,7 @@ import {
 	type OutlineVersionConflict,
 	OutlineWriteError,
 } from "./errors";
+import { requestOutlineInProcessRebuild } from "./in-process";
 import { newOutlineSid } from "./keys";
 import {
 	CONTENT_LINK_KINDS,
@@ -816,6 +820,11 @@ class OutlinePlanner {
 	private readonly temp = new Map<string, string>();
 	/** Blocks an operation set to in progress, with the operation's index: claim attempts. */
 	private readonly claimIntent = new Map<string, number>();
+	/**
+	 * The in-process answers this commit changes do not all fit in it: the space is marked for
+	 * the background rebuild instead (see `planInProcess`).
+	 */
+	private inProcessStale = false;
 	readonly results: OutlineOpResult[] = [];
 
 	constructor(
@@ -1062,6 +1071,24 @@ class OutlinePlanner {
 					)
 				: this.tooManyRows(opIndex);
 		}
+		this.installChildren(missing, rows);
+	}
+
+	/**
+	 * Like `ensureChildren` for a walk that may give up: false, loading nothing, when the lists
+	 * not loaded yet hold more than `budget` blocks.
+	 */
+	private async loadChildrenWithin(parentIds: readonly string[], budget: number): Promise<boolean> {
+		const missing = [...new Set(parentIds)].filter((p) => !this.children.has(listKey(p)));
+		if (missing.length === 0) return true;
+		if (budget < 0) return false;
+		const rows = await this.store.listChildMetas(this.space.id, missing, budget + 1);
+		if (rows.length > budget) return false;
+		this.installChildren(missing, rows);
+		return true;
+	}
+
+	private installChildren(missing: ReadonlyArray<string | null>, rows: OutlineBlockMeta[]): void {
 		const lists = new Map<string, string[]>(missing.map((p) => [listKey(p), []]));
 		for (const row of rows) {
 			this.adopt(row);
@@ -1615,16 +1642,9 @@ class OutlinePlanner {
 		}
 
 		const versionedIds = new Set([...closeVersionIds, ...insertBlocks.map((b) => b.id)]);
-		const inProcess = new Map<boolean, string[]>();
-		for (const block of existing) {
-			if (block.deleted || block.inProcess === (block.base as OutlineBlockMeta).inProcess) continue;
-			const list = inProcess.get(block.inProcess);
-			if (list) list.push(block.id);
-			else inProcess.set(block.inProcess, [block.id]);
-		}
-		const inProcessOnly = [...inProcess.values()]
-			.flat()
-			.filter((id) => !versionedIds.has(id)).length;
+		const changedInProcess = existing.filter(
+			(b) => !b.deleted && b.inProcess !== (b.base as OutlineBlockMeta).inProcess,
+		);
 		const claims = await this.planClaims(versionedIds, seq);
 		const claimRows = claims.put.length + claims.release.length + claims.expire.length;
 
@@ -1632,11 +1652,23 @@ class OutlinePlanner {
 		// A claim taken over without the task changing (it was in progress already) is a commit
 		// of its own: it changes who is doing the task.
 		if (touched === 0 && claims.put.length === 0 && claims.expire.length === 0) return null;
-		if (
-			touched + closeLinkIds.length + insertLinks.length + inProcessOnly + claimRows >
-			OUTLINE_LIMITS.maxRowsTouched
-		) {
-			throw this.tooManyRows(null);
+		const rows = touched + closeLinkIds.length + insertLinks.length + claimRows;
+		if (rows > OUTLINE_LIMITS.maxRowsTouched) throw this.tooManyRows(null);
+		let inProcessOnly = changedInProcess.filter((b) => !versionedIds.has(b.id));
+		if (rows + inProcessOnly.length > OUTLINE_LIMITS.maxRowsTouched) {
+			// The rows the in-process cache alone would add do not fit: the write still goes
+			// through, and the space is left to the background rebuild.
+			for (const block of inProcessOnly)
+				block.inProcess = (block.base as OutlineBlockMeta).inProcess;
+			inProcessOnly = [];
+			this.inProcessStale = true;
+		}
+		const inProcess = new Map<boolean, string[]>();
+		for (const block of changedInProcess) {
+			if (block.inProcess === (block.base as OutlineBlockMeta).inProcess) continue;
+			const list = inProcess.get(block.inProcess);
+			if (list) list.push(block.id);
+			else inProcess.set(block.inProcess, [block.id]);
 		}
 
 		const { input } = this;
@@ -1669,6 +1701,7 @@ class OutlinePlanner {
 				closeLinkIds,
 				insertLinks,
 				inProcess: [...inProcess].map(([value, ids]) => ({ ids, value })),
+				inProcessStale: this.inProcessStale,
 				claims,
 			},
 			pageIds: [...pageIds],
@@ -1782,12 +1815,19 @@ class OutlinePlanner {
 		const queued = new Set(roots.map((b) => b.id));
 		let frontier = roots.filter(differs);
 		let visited = 0;
-		while (frontier.length > 0) {
-			await this.ensureChildren(
-				frontier.map((b) => b.id),
-				"subtree",
-				null,
-			);
+		const budget = OUTLINE_LIMITS.maxRowsTouched;
+		walk: while (frontier.length > 0) {
+			// Past the commit's row limit the walk gives up: the write goes through and the space
+			// is left to the background rebuild (the cache must never stand in a person's way).
+			if (
+				!(await this.loadChildrenWithin(
+					frontier.map((b) => b.id),
+					budget - visited,
+				))
+			) {
+				this.inProcessStale = true;
+				break;
+			}
 			const next: WorkingBlock[] = [];
 			for (const parent of frontier) {
 				const above = answers.get(parent.id) as boolean;
@@ -1796,7 +1836,10 @@ class OutlinePlanner {
 					// A root below has its own answer, computed from the page down.
 					if (child.deleted || queued.has(id)) continue;
 					answers.set(id, isTask(child) || above);
-					if (++visited > OUTLINE_LIMITS.maxRowsTouched) throw this.tooManyRows(null);
+					if (++visited > budget) {
+						this.inProcessStale = true;
+						break walk;
+					}
 					if (differs(child)) {
 						queued.add(id);
 						next.push(child);
@@ -1804,6 +1847,11 @@ class OutlinePlanner {
 				}
 			}
 			frontier = next;
+		}
+		// Given up: only the roots' own answers (exact) are written; the rest is the rebuild's.
+		if (this.inProcessStale) {
+			const rootIds = new Set(roots.map((b) => b.id));
+			for (const id of [...answers.keys()]) if (!rootIds.has(id)) answers.delete(id);
 		}
 		for (const [id, v] of answers) this.block(id).inProcess = v;
 	}
@@ -2103,6 +2151,8 @@ async function writePrepared(
 			throw error;
 		}
 		const { commit } = planned.plan;
+		// Derived answers this commit could not hold: the background rebuild catches up soon.
+		if (planned.plan.inProcessStale) requestOutlineInProcessRebuild(store);
 		eventBus.emit({
 			type: "outline:committed",
 			spaceId: space.id,

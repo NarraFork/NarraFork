@@ -9,8 +9,14 @@
  * so the expiry job, which lists expired leases of the whole database, sees only its own.
  */
 import { expect } from "bun:test";
-import { OutlineTaskClaimedError, OutlineWriteError } from "../errors";
-import { rebuildOutlineInProcess } from "../in-process";
+import { OutlineTaskClaimedError } from "../errors";
+import {
+	OUTLINE_IN_PROCESS_TIMING,
+	outlineSpacesWithInProcess,
+	readInProcess,
+	rebuildOutlineInProcess,
+	runOutlineInProcessRebuild,
+} from "../in-process";
 import { OUTLINE_LIMITS, OUTLINE_TASK_LEASE } from "../model";
 import { revertCommit } from "../revert";
 import type { OutlineSpaceRow, OutlineStore, OutlineTaskClaimRow } from "../store/port";
@@ -32,6 +38,7 @@ import {
 	checkInProcess,
 	checkSpaceInvariants,
 	type OutlineContractContext,
+	type SpaceDump,
 } from "./contract";
 
 const NOW = "2026-10-26T00:00:00.000Z";
@@ -89,6 +96,27 @@ async function refused(promise: Promise<unknown>): Promise<OutlineTaskClaimedErr
 }
 
 const at = (base: string, minutes: number) => new Date(Date.parse(base) + minutes * MINUTE);
+
+/** What `in_process` of every live block of a space should be, from its tree. */
+function expectedInProcess(dump: SpaceDump): Map<string, boolean> {
+	const byId = new Map(dump.blocks.map((b) => [b.id, b]));
+	const out = new Map<string, boolean>();
+	const of = (id: string): boolean => {
+		const known = out.get(id);
+		if (known !== undefined) return known;
+		const block = byId.get(id);
+		if (!block) return false;
+		const value =
+			dump.space.kind === "session" ||
+			block.taskJson !== null ||
+			(block.parentId !== null && of(block.parentId));
+		out.set(id, value);
+		return value;
+	};
+	for (const block of dump.blocks) if (!block.deleted) of(block.id);
+	for (const block of dump.blocks) if (block.deleted) out.delete(block.id);
+	return out;
+}
 
 /** A personal space (facts unless under a task) and a few agent sessions to write it. */
 async function setup(ctx: OutlineContractContext) {
@@ -713,32 +741,6 @@ export const OUTLINE_TASK_CONTRACT: ContractCase[] = [
 			flags = await check(session);
 			for (const res of s.results) expect(flags.get(res.blockId)).toBe(true);
 
-			// A subtree past the row limit cannot change its answer in one commit.
-			const big = await write(ctx, space, n1, [
-				{ op: "insert", parent: null, content: "big", task: { status: "todo" } },
-			]);
-			const bigId = big.results[0]?.blockId as string;
-			for (let made = 0; made <= OUTLINE_LIMITS.maxRowsTouched; made += OUTLINE_LIMITS.maxOps) {
-				await write(
-					ctx,
-					space,
-					n1,
-					Array.from({ length: OUTLINE_LIMITS.maxOps }, (_, i) => ({
-						op: "insert" as const,
-						parent: { id: bigId },
-						content: `row ${made + i}`,
-					})),
-				);
-			}
-			await check(space);
-			try {
-				await write(ctx, space, n1, [{ op: "setTask", block: { id: bigId }, task: null }]);
-				throw new Error("expected the row limit");
-			} catch (error) {
-				expect(error).toBeInstanceOf(OutlineWriteError);
-				expect((error as OutlineWriteError).code).toBe("OUTLINE_TOO_MANY_ROWS");
-			}
-
 			const loose = (
 				await write(ctx, space, n1, [{ op: "insert", parent: null, content: "a loose fact" }])
 			).results[0]?.blockId as string;
@@ -747,10 +749,20 @@ export const OUTLINE_TASK_CONTRACT: ContractCase[] = [
 			for (const sp of [space, session]) await ctx.resetInProcess(sp.id);
 			// A stale answer above a block a commit moves is not the commit's to fix: the move is
 			// written (its own answer computed from the page down), the rest left to the rebuild.
-			const row = (await ctx.store.listChildren(space.id, bigId, 1))[0]?.id as string;
-			await write(ctx, space, n1, [{ op: "move", block: { id: loose }, parent: { id: row } }]);
+			await write(ctx, space, n1, [
+				{ op: "move", block: { id: loose }, parent: { id: n as string } },
+			]);
 			expect((await ctx.store.getBlock(loose))?.inProcess).toBe(true);
-			expect((await ctx.store.getBlock(row))?.inProcess).toBe(false);
+			expect((await ctx.store.getBlock(n as string))?.inProcess).toBe(false);
+			// Meanwhile reads answer from the tree, not from the stale column.
+			const meanwhile = await readInProcess(space.id, [n as string, loose, p as string], {
+				store: ctx.store,
+			});
+			expect(Object.fromEntries(meanwhile)).toEqual({
+				[n as string]: true,
+				[loose]: true,
+				[p as string]: false,
+			});
 
 			// The rebuild derives them and marks the spaces done.
 			const pending = await ctx.store.listSpacesPendingInProcess({ limit: 1000 });
@@ -772,6 +784,119 @@ export const OUTLINE_TASK_CONTRACT: ContractCase[] = [
 				}),
 			).toBe(false);
 			expect((await ctx.store.getBlock(p as string))?.inProcess).toBe(false);
+		},
+	},
+	{
+		name: "in process: a change past the row limit is written; the background rebuild catches up, reads use the tree meanwhile",
+		async run(ctx) {
+			const { space, n1 } = await setup(ctx);
+			const big = await write(ctx, space, n1, [
+				{ op: "insert", tempId: "p", parent: null, content: "plan" },
+				{ op: "insert", parent: { tempId: "p" }, content: "big", task: { status: "todo" } },
+				{ op: "insert", parent: { tempId: "p" }, content: "a fact beside it" },
+			]);
+			const [, bigId, beside] = big.results.map((x) => x.blockId) as [string, string, string];
+			for (let made = 0; made <= OUTLINE_LIMITS.maxRowsTouched; made += OUTLINE_LIMITS.maxOps) {
+				await write(
+					ctx,
+					space,
+					n1,
+					Array.from({ length: OUTLINE_LIMITS.maxOps }, (_, i) => ({
+						op: "insert" as const,
+						parent: { id: bigId },
+						content: `row ${made + i}`,
+					})),
+				);
+			}
+			checkInProcess(await ctx.dump(space.id));
+			const children = (await ctx.store.listChildren(space.id, bigId, 3000)).map((b) => b.id);
+			expect(children.length).toBeGreaterThan(OUTLINE_LIMITS.maxRowsTouched);
+
+			const saved = { ...OUTLINE_IN_PROCESS_TIMING };
+			// Hold the background run back so the state in between can be looked at.
+			OUTLINE_IN_PROCESS_TIMING.requestDelayMs = 3_600_000;
+			try {
+				// The checkbox comes off a block with more children than one commit may write: the
+				// write goes through; the space is marked for the rebuild.
+				const off = await write(ctx, space, n1, [
+					{ op: "setTask", block: { id: bigId }, task: null },
+					{ op: "update", block: { id: beside }, content: "a fact beside it, edited" },
+				]);
+				expect(off.commit).not.toBeNull();
+				expect((await ctx.store.getBlock(bigId))?.taskJson).toBeNull();
+				expect((await ctx.store.getBlock(bigId))?.inProcess).toBe(false);
+				expect((await ctx.store.getBlock(beside))?.content).toBe("a fact beside it, edited");
+				// The children keep the stale answer until the rebuild…
+				expect((await ctx.store.getBlock(children[0] as string))?.inProcess).toBe(true);
+				expect((await ctx.store.getInProcessReady([space.id])).get(space.id)).toBe(false);
+				expect(await outlineSpacesWithInProcess([space.id], { store: ctx.store })).toEqual(
+					new Set(),
+				);
+				// …but a read does not use it: computed from the tree, every answer is right.
+				const want = expectedInProcess(await ctx.dump(space.id));
+				const read = await readInProcess(space.id, [...want.keys()], { store: ctx.store });
+				expect(read.size).toBe(want.size);
+				for (const [id, value] of want) expect([id, read.get(id)]).toEqual([id, value]);
+				// Smaller changes go on being written as usual meanwhile.
+				const t2 = await write(ctx, space, n1, [
+					{ op: "insert", parent: { id: beside }, content: "small task", task: { status: "todo" } },
+				]);
+				expect((await ctx.store.getBlock(t2.results[0]?.blockId as string))?.inProcess).toBe(true);
+
+				// The run the commit asked for.
+				const result = await runOutlineInProcessRebuild(ctx.store);
+				expect(result?.left).toBe(0);
+				expect(await outlineSpacesWithInProcess([space.id], { store: ctx.store })).toEqual(
+					new Set([space.id]),
+				);
+				checkInProcess(await ctx.dump(space.id));
+				const after = await readInProcess(space.id, children.slice(0, 50), { store: ctx.store });
+				expect([...after.values()].every((v) => v === false)).toBe(true);
+
+				// A commit landing during a rebuild that changes only text does not hold it up; one
+				// that changes structure makes it look again before calling the space done.
+				for (const kind of ["text", "structure"] as const) {
+					await ctx.resetInProcess(space.id);
+					let injected = false;
+					const busy: OutlineStore = {
+						...ctx.store,
+						async setInProcess(spaceId, expectNextSeq, values) {
+							if (!injected && spaceId === space.id && values.inProcess.length > 0) {
+								injected = true;
+								await write(
+									ctx,
+									space,
+									n1,
+									kind === "text"
+										? [
+												{
+													op: "update",
+													block: { id: beside },
+													content: `edited during the ${kind} run`,
+												},
+											]
+										: [
+												{
+													op: "insert",
+													parent: { id: beside },
+													content: "new",
+													task: { status: "todo" },
+												},
+											],
+								);
+							}
+							return ctx.store.setInProcess(spaceId, expectNextSeq, values);
+						},
+					};
+					const run = await rebuildOutlineInProcess({ store: busy });
+					expect(injected).toBe(true);
+					expect(run).toMatchObject({ spaces: 1, left: 0 });
+					checkInProcess(await ctx.dump(space.id));
+					expect((await ctx.store.getInProcessReady([space.id])).get(space.id)).toBe(true);
+				}
+			} finally {
+				Object.assign(OUTLINE_IN_PROCESS_TIMING, saved);
+			}
 		},
 	},
 	{

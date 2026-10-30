@@ -2010,6 +2010,8 @@ async function performGracefulShutdown(
 			"outlineTaskLeases.stop",
 			async () => {
 				const tasks = await import("./services/outline/tasks");
+				const inProcess = await import("./services/outline/in-process");
+				inProcess.stopOutlineInProcessRebuild();
 				await tasks.stopOutlineTaskLeaseJob();
 			},
 			5_000,

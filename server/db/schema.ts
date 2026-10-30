@@ -5448,8 +5448,10 @@ export const outlineSpaces = sqliteTable(
 		createdAt: text("created_at").notNull(),
 		/**
 		 * Whether every live block's `outline_blocks.in_process` has been derived. Spaces created
-		 * after the column existed are written true; older ones wait for the one-time background
-		 * rebuild (`services/outline/in-process.ts`), which sets it once a space is done.
+		 * after the column existed are written true; older ones, and a space whose commit changed
+		 * more answers than the commit's row limit, wait for the background rebuild
+		 * (`services/outline/in-process.ts`), which sets it once the space is done. Until then
+		 * readers compute the answer from the tree instead of reading the column.
 		 */
 		inProcessReady: integer("in_process_ready", { mode: "boolean" }).notNull().default(false),
 	},
@@ -5482,9 +5484,10 @@ export const outlineSpaces = sqliteTable(
  *
  * `in_process` is a derived cache, not history: whether the block is process (a task, under a
  * task, or in a session space; design §2.1). The write path keeps it in step for every live
- * block in the commit that changes it (a checkbox, a move, an insert), bounded by the commit's
- * row limit; it is not part of a version, because the same answer as of any seq follows from
- * that seq's tree. Deleted blocks keep whatever they had.
+ * block in the commit that changes it (a checkbox, a move, an insert); when that would pass the
+ * commit's row limit, the commit is written anyway and marks its space for the background
+ * rebuild (`outline_spaces.in_process_ready`). It is not part of a version, because the same
+ * answer as of any seq follows from that seq's tree. Deleted blocks keep whatever they had.
  */
 export const outlineBlocks = sqliteTable(
 	"outline_blocks",

@@ -1600,6 +1600,7 @@ export const OUTLINE_STORE_CONTRACT: ContractCase[] = [
 				closeLinkIds: [],
 				insertLinks: [],
 				inProcess: [],
+				inProcessStale: false,
 				claims: { put: [], release: [], expire: [] },
 			};
 			await expect(ctx.store.applyCommit(stale)).rejects.toBeInstanceOf(OutlineStaleWriteError);
