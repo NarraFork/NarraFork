@@ -26,6 +26,10 @@ import { nanoid } from "nanoid";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useConfirmDialog } from "../../components/common/confirm-dialog-context";
+import {
+	AddPlatformInstanceModal,
+	type NewPlatformInstance,
+} from "../../components/providers/AddPlatformInstanceModal";
 import { CodexSection } from "../../components/providers/CodexSection";
 import { CommandCodeSection } from "../../components/providers/CommandCodeSection";
 import {
@@ -39,6 +43,18 @@ import { NUGProvidersSection } from "../../components/providers/NUGProvidersSect
 import { PluginProviderSection } from "../../components/providers/PluginProviderSection";
 import { ProviderConfigView } from "../../components/providers/ProviderConfigView";
 import { ProviderOverviewView } from "../../components/providers/ProviderOverviewView";
+
+/** 「平台集成」实例（与 server 侧 `agent.platformInstances` 形状一致）。 */
+interface PlatformInstanceRow {
+	id: string;
+	platform: "codex" | "CommandCode" | "tokendance";
+	name: string;
+	suffix: string;
+	prefix: string;
+	disabled: boolean;
+	config: Record<string, unknown>;
+}
+
 import {
 	ProviderAddContext,
 	ProviderImportContext,
@@ -386,6 +402,33 @@ function SettingsProvidersPage() {
 			});
 		},
 	});
+	// ── 平台实例（同一平台的第二个及以后）──
+	// 直接读 settings.agent.platformInstances：为空表示还在用旧的三个单例。
+	const platformInstances = useMemo(() => {
+		const list = (
+			settings?.agent as unknown as { platformInstances?: PlatformInstanceRow[] } | undefined
+		)?.platformInstances;
+		return list ?? [];
+	}, [settings?.agent]);
+	const [addPlatformOpen, setAddPlatformOpen] = useState(false);
+	const addPlatformInstance = useCallback(
+		(instance: NewPlatformInstance) => {
+			const next: PlatformInstanceRow[] = [
+				...platformInstances,
+				{
+					id: `platform-${instance.prefix}-${Date.now().toString(36)}`,
+					platform: instance.platform,
+					name: instance.name,
+					suffix: instance.suffix,
+					prefix: instance.prefix,
+					disabled: false,
+					config: {},
+				},
+			];
+			updateMutation.mutate({ agent: { platformInstances: next } });
+		},
+		[platformInstances, updateMutation],
+	);
 	const handleDiscard = useCallback(() => {
 		dispatch({ type: "RESTORE_FROM_SNAPSHOT", snapshot: savedSnapshot.current });
 	}, []);
@@ -856,6 +899,8 @@ function SettingsProvidersPage() {
 		const byPrefix = new Map<string, ModelOption[]>();
 		const platformPrefixes = new Set(["codex", "CommandCode"]);
 		if (tokenDance?.connected) platformPrefixes.add("tokendance");
+		// 额外平台实例与内置平台同栏展示，卡片上可以改开关；前缀由实例决定（如 codex-2）。
+		for (const instance of platformInstances) platformPrefixes.add(instance.prefix);
 		// Executable-plugin providers, keyed by prefix. They are presented like platform
 		// providers (single instance, not user-addable) but need their own lookup because
 		// the detail area has to reach the owning plugin rather than a builtin section.
@@ -1243,23 +1288,36 @@ function SettingsProvidersPage() {
 		}
 
 		return (
-			<ProviderOverviewView
-				groups={providerGroups}
-				hiddenModels={state.hiddenModels}
-				onToggleProviderDisabled={(prefix) => {
-					// 平台集成（codex / Command Code / TokenDance）的开关一律写成草稿，
-					// 由底部保存条统一提交 —— 见 PLATFORM_PROVIDER_PREFIXES 的约定。
-					if (isPlatformProviderPrefix(prefix)) {
-						const group = providerGroups.find((item) => item.prefix === prefix);
-						if (!group) return;
-						dispatchers.setPlatformDisabled(prefix, !group.disabled);
-						return;
-					}
-					dispatchers.toggleProviderDisabled(prefix);
-				}}
-				onOpenProviderConfig={setSelectedProvider}
-				selectedProvider={selectedProvider}
-			/>
+			<>
+				<ProviderOverviewView
+					groups={providerGroups}
+					hiddenModels={state.hiddenModels}
+					onAddPlatform={() => setAddPlatformOpen(true)}
+					onToggleProviderDisabled={(prefix) => {
+						// 平台集成（codex / Command Code / TokenDance）的开关一律写成草稿，
+						// 由底部保存条统一提交 —— 见 PLATFORM_PROVIDER_PREFIXES 的约定。
+						if (isPlatformProviderPrefix(prefix)) {
+							const group = providerGroups.find((item) => item.prefix === prefix);
+							if (!group) return;
+							dispatchers.setPlatformDisabled(prefix, !group.disabled);
+							return;
+						}
+						dispatchers.toggleProviderDisabled(prefix);
+					}}
+					onOpenProviderConfig={setSelectedProvider}
+					selectedProvider={selectedProvider}
+				/>
+				<AddPlatformInstanceModal
+					opened={addPlatformOpen}
+					onClose={() => setAddPlatformOpen(false)}
+					existingPrefixes={[
+						...platformInstances.map((instance) => instance.prefix),
+						...providerGroups.filter((group) => group.isPlatform).map((group) => group.prefix),
+					]}
+					existingNames={platformInstances.map((instance) => instance.name)}
+					onSubmit={addPlatformInstance}
+				/>
+			</>
 		);
 	};
 
