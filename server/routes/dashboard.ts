@@ -46,6 +46,7 @@ dashboardRoutes.get("/summary", async (c) => {
 	// on) and leak activity from private work.
 	const narratorBaseCondition = and(
 		eq(narrators.variant, "primary"),
+		eq(narrators.hiddenFromLists, false),
 		ne(narrators.status, "archived"),
 		narratorReadableWhere(narratorPrincipalOf(c)),
 	);

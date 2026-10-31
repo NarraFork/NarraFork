@@ -308,6 +308,13 @@ export const narrators = sqliteTable(
 			.notNull()
 			.default("primary"),
 		subagentType: text("subagent_type"),
+		/**
+		 * 系统内部叙述者不进叙述者列表、最近标签与搜索，只能凭 id 从自己的入口打开。
+		 * 目前只有 ModelTrace 舱（每个模型一个）用它。
+		 */
+		hiddenFromLists: integer("hidden_from_lists", { mode: "boolean" }).notNull().default(false),
+		/** ModelTrace 舱的不透明绑定键；NULL 表示还没有收编。 */
+		modeltraceKey: text("modeltrace_key"),
 		title: text("title"),
 		inheritMode: text("inherit_mode", { enum: ["full", "compressed", "fresh"] })
 			.notNull()
@@ -652,6 +659,8 @@ export const narrators = sqliteTable(
 		index("idx_narrators_variant_updated").on(table.variant, table.updatedAt, table.id),
 		index("idx_narrators_handle").on(table.handle),
 		uniqueIndex("idx_narrators_handle_fold").on(table.handleFold),
+		// 一个模型只有一个 ModelTrace 舱；SQLite 的唯一索引允许多个 NULL。
+		uniqueIndex("idx_narrators_modeltrace_key").on(table.modeltraceKey),
 		index("idx_narrators_context_project").on(table.contextProjectId),
 		index("idx_narrators_oauth_owner").on(table.oauthOwnerGrantId),
 		uniqueIndex("idx_narrators_oauth_provision").on(

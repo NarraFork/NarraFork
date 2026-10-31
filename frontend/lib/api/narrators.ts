@@ -678,6 +678,11 @@ export const narratorsApi = {
 		request<{ id: string }>(`/narrators/${encodeURIComponent(narratorId)}/modeltrace/retry`, {
 			method: "POST",
 		}),
+	/** 该模型是否已经有 ModelTrace 舱；没有跑过时为 null。 */
+	getModelTraceNarrator: (model: string) =>
+		request<{ narratorId: string | null }>(
+			`/narrators/modeltrace/lookup?model=${encodeURIComponent(model)}`,
+		),
 	saveRequestRecording: (narratorId: string, signal?: AbortSignal) =>
 		request<SavedRecording>(`/narrators/${encodeURIComponent(narratorId)}/request-recordings`, {
 			method: "POST",

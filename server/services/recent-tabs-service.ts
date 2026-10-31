@@ -1172,6 +1172,26 @@ function insertNewTab(
 	tabs.splice(getPinnedSectionEndIndex(tabs), 0, tab);
 }
 
+/** 列表里看不见的叙述者（ModelTrace 舱）也不进侧边栏。 */
+function withoutHiddenNarratorTabs(inputs: RecentTabUpsertInput[]): RecentTabUpsertInput[] {
+	const narratorIds = inputs
+		.filter((input) => input.type === "narrator" || input.type === "subagent")
+		.map((input) => input.id);
+	if (narratorIds.length === 0) return inputs;
+	const hidden = new Set(
+		db
+			.select({ id: narrators.id })
+			.from(narrators)
+			.where(and(inArray(narrators.id, narratorIds), eq(narrators.hiddenFromLists, true)))
+			.all()
+			.map((row) => row.id),
+	);
+	if (hidden.size === 0) return inputs;
+	return inputs.filter(
+		(input) => (input.type !== "narrator" && input.type !== "subagent") || !hidden.has(input.id),
+	);
+}
+
 export async function upsertRecentTabsBatch(
 	userId: string,
 	inputs: RecentTabUpsertInput[],
@@ -1179,14 +1199,18 @@ export async function upsertRecentTabsBatch(
 	if (inputs.length === 0 || inputs.length > RECENT_TABS_WS_BATCH_SIZE) {
 		throw new ValidationError(`Recent-tabs batch must contain 1-${RECENT_TABS_WS_BATCH_SIZE} tabs`);
 	}
+	const visible = withoutHiddenNarratorTabs(inputs);
 	return userPreferencesLock.acquire(userId, async () => {
 		const baseRevision = ensureMigratedLocked(userId);
+		if (visible.length === 0) {
+			return { changed: false, baseRevision, revision: baseRevision, operations: [] };
+		}
 		const oldRows = readRows(userId);
 		const before = oldRows.map(rowToTab);
 		let after = before.map(cloneTab);
 		const orderedInputs = [
-			...inputs.filter((input) => input.type === "workspace" && !input.workspaceId),
-			...inputs.filter((input) => input.type !== "workspace" || !!input.workspaceId),
+			...visible.filter((input) => input.type === "workspace" && !input.workspaceId),
+			...visible.filter((input) => input.type !== "workspace" || !!input.workspaceId),
 		];
 		for (const input of orderedInputs) after = applyRecentTabUpsert(after, input);
 		return persistMutationLocked(userId, oldRows, before, after, baseRevision);
