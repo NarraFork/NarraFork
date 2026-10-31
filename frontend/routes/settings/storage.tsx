@@ -2,6 +2,7 @@ import { Stack, Title } from "@mantine/core";
 import { createFileRoute } from "@tanstack/react-router";
 import { useTranslation } from "react-i18next";
 import { BlockBackfillCard } from "../../components/settings/BlockBackfillCard";
+import { DataPortabilityCard } from "../../components/settings/DataPortabilityCard";
 import { StorageSection } from "../../components/settings/StorageSection";
 
 export const Route = createFileRoute("/settings/storage")({
@@ -15,6 +16,7 @@ function SettingsStoragePage() {
 		<Stack>
 			<Title order={3}>{t("storageSection")}</Title>
 			<StorageSection />
+			<DataPortabilityCard />
 			<BlockBackfillCard />
 		</Stack>
 	);

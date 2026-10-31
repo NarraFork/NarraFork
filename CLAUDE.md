@@ -60,6 +60,7 @@ NarraFork 把 AI 会话、开发工具和团队协作放在一个自托管平台
 - **代码评审特殊规则：** 如果评审中的改动修改了 `server/db/schema.ts` 但尚未生成对应迁移，**不要**把“未生成迁移”列为阻塞项或必须修复项；最多作为非阻塞提醒说明“合并/发布前需要生成迁移”。评审应优先确认 schema 设计和业务逻辑正确，迁移可在评审通过后再生成。
 - **⚠️ 禁止自行删除数据库文件（`~/.narrafork/narrafork.db*`）或 `drizzle/` 目录** — 数据库包含用户数据，删除不可逆。迁移失败时应先尝试修复（如关闭外键检查、调整迁移顺序等），必须由用户明确授权后才能执行删除操作
 - 如用户明确要求全新迁移：删除 `drizzle/` 目录和数据库文件（`~/.narrafork/narrafork.db*`），再运行 `bun run db:generate` + `bun run db:migrate`
+- **⚠️ schema 变更必须同步「数据导入 / 导出」兼容**（`server/services/data-portability.ts`）：导出是整库 `VACUUM INTO` 快照（新表自动包含），导入只合并显式列举的表（`api_requests` / `narrators` / `narrator_messages` / `narrator_message_refs` / `narrator_tool_calls` + providers）并按列交集拷贝。新增需要迁移的表 → 在 `applyImport` 补 `copyTable`；新增 NOT NULL 且无默认值的列 → 旧快照导入会缺列失败，需补默认值或拒绝旧版本；新增需清空的数据 → 在 `clearData` 处理。详见 [docs/DATA_PORTABILITY.md](docs/DATA_PORTABILITY.md)，改动后跑 `bun test --isolate server/services/__tests__/data-portability*.test.ts`
 
 **PostgreSQL 迁移元数据规则：**
 - `drizzle-postgres/` 保留全部增量SQL和journal，但全量schema只保留固定的 `meta/current_snapshot.json`；`meta/_snapshot_history.json` 保存小型谱系记录，不增加历史全量快照或压缩归档。
