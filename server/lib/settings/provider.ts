@@ -860,11 +860,16 @@ export function isPlatformInstanceUsable(instance: {
 		}
 		case "CommandCode":
 			return !!resolveCommandCodeToken(instance.config.apiKey as string | undefined).credential;
-		case "tokendance":
+		case "tokendance": {
 			// 默认前缀的连接记录在 settings.tokendance 里；额外实例只认自己的 apiKey。
-			return instance.prefix === PLATFORM_DEFAULTS.tokendance.prefix
-				? !!getTokenDanceRuntimeConfig(instance.prefix)
-				: !!String(instance.config.apiKey ?? "").trim();
+			if (instance.prefix !== PLATFORM_DEFAULTS.tokendance.prefix) {
+				return (
+					!!String(instance.config.apiKey ?? "").trim() && instance.config.disabled !== true
+				);
+			}
+			const config = getTokenDanceRuntimeConfig(instance.prefix);
+			return !!config && !config.disabled;
+		}
 		default:
 			return false;
 	}

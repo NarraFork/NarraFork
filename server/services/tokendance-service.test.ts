@@ -804,7 +804,8 @@ describe("TokenDance backend", () => {
 		expect(JSON.stringify(service.getTokenDanceConnection())).not.toContain("secret-never-return");
 		const source = readFileSync(new URL("../routes/settings.ts", import.meta.url), "utf8");
 		expect(source).toContain("tokendance: getTokenDanceConnection()");
-		expect(source).toContain('new Set(["codex", "tokendance"])');
+		// 保留前缀来自平台实例清单：删掉实例后同名前缀可以给自定义供应商复用。
+		expect(source).toContain("validated.agent?.platformInstances");
 	});
 	test.each([
 		"not-a-url",

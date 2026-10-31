@@ -37,6 +37,7 @@ import { OpenAIProvider } from "./openai-provider";
 import {
 	currentPlatformInstances,
 	listPlatformInstanceReadiness,
+	platformPrefixConflicts,
 	resolvePlatformInstanceAdapter,
 } from "./platform-instance-providers";
 import {
@@ -414,6 +415,8 @@ registerCredentialProviderSource(
 export async function listProviderReadiness(): Promise<ProviderReadiness[]> {
 	const disabled = new Set(settings.agent.disabledProviders ?? []);
 	disabled.add("tutorial");
+	// 前缀撞车时双方都不算就绪：解析阶段本来就会报错，向导不能先放行。
+	for (const prefix of platformPrefixConflicts()) disabled.add(prefix);
 	const builtin = await builtinProviderSources.listReadiness(disabled);
 	const external = await externalProviderSources.listReadiness(disabled);
 	// 平台前缀由实例清单决定：删掉实例后，同名的自定义供应商才能正常出现。

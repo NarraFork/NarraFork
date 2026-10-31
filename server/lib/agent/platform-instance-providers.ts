@@ -52,23 +52,29 @@ function codexOptions(config: Record<string, unknown>) {
 }
 
 /**
- * TokenDance 与自定义 API 供应商共用前缀空间，撞车时直接报错。
+ * 这个前缀是否已被自定义 API 供应商占用。
  *
- * 静默选错上游会把密钥发到别的服务，代价远高于一次明确的配置错误。
+ * TokenDance 与它们共用前缀空间；撞车时静默选错上游会把密钥发到别的服务，代价远高于
+ * 一次明确的配置错误，所以解析直接报错、就绪判断也一律不通过。
  */
-function assertNoPrefixConflict(prefix: string): void {
-	const conflict = [
+export function hasProviderPrefixConflict(prefix: string): boolean {
+	return [
 		...(settings.customApiProviders ?? []),
 		...(settings.openaiProviders ?? []),
 		...(settings.anthropicProviders ?? []),
 		...(settings.geminiProviders ?? []),
 		...(settings.nugProviders ?? []),
 	].some((entry) => entry.prefix === prefix);
-	if (conflict) {
-		throw new Error(
-			"TokenDance prefix conflicts with an existing API provider. Rename the existing provider prefix before using TokenDance.",
-		);
-	}
+}
+
+/** 与 API 供应商撞车的 TokenDance 实例前缀。 */
+export function platformPrefixConflicts(
+	instances: readonly PlatformInstance[] = currentPlatformInstances(),
+): string[] {
+	return instances
+		.filter((instance) => instance.platform === "tokendance")
+		.map((instance) => instance.prefix)
+		.filter(hasProviderPrefixConflict);
 }
 
 /**
@@ -93,7 +99,11 @@ export function resolvePlatformInstanceAdapter(
 		case "tokendance":
 			// 没连接就不接管这个前缀，让同名的自定义供应商继续用；有连接才不允许冲突。
 			if (!hasTokenDanceConnection(instance)) return null;
-			assertNoPrefixConflict(prefix);
+			if (hasProviderPrefixConflict(prefix)) {
+				throw new Error(
+					"TokenDance prefix conflicts with an existing API provider. Rename the existing provider prefix before using TokenDance.",
+				);
+			}
 			return new TokenDanceProvider(prefix);
 		default:
 			return null;
