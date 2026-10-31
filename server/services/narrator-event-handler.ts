@@ -2666,8 +2666,8 @@ export async function processEvent(
 			// plan-mode file path) the input actually used. Either rides with the result.
 			const settledInput = event.brokenInputOverride ?? event.updatedInput;
 			if (!shouldCommitEnterPlanModeAtomically && resultToolCallId) {
-				try {
-					await narratorStore.settleTool(
+				const settle = () =>
+					narratorStore.settleTool(
 						event.toolUseId,
 						{
 							output: persistedOutput,
@@ -2682,41 +2682,22 @@ export async function processEvent(
 						undefined,
 						resultToolCallId,
 					);
+				try {
+					// 与其它写路径一致：SQLITE_BUSY 交给带退避的 withDbRetry。
+					// 此前这里是「立即重试一次」，而实测锁窗口可达 0.6–1.5 秒
+					// （checkpoint / 大批量写 / 读 worker 占着快照），立即重试必然再失败，
+					// 于是把一次瞬时争用升级成 CriticalEventPersistenceError、直接终止 loop。
+					await withDbRetry(settle, { label: "tool_result.settle", maxRetries: 4 });
 					toolResultPersisted = true;
 				} catch (err) {
-					logger.error("Failed to persist tool result", {
+					logger.error("CRITICAL: tool_result persist failed", {
 						narratorId,
 						toolUseId: event.toolUseId,
 						error: String(err),
 					});
-					// Retry once — transient DB lock / busy errors are common with SQLite
-					try {
-						await narratorStore.settleTool(
-							event.toolUseId,
-							{
-								output: persistedOutput,
-								status,
-								errorMessage: event.isError ? event.output : undefined,
-								durationMs: event.durationMs,
-								permissionStartedAt: event.permissionStartedAt,
-								executionStartedAt: event.executionStartedAt,
-								completedAt: event.completedAt,
-								input: settledInput,
-							},
-							undefined,
-							resultToolCallId,
-						);
-						toolResultPersisted = true;
-					} catch (retryErr) {
-						logger.error("CRITICAL: tool_result persist failed after retry", {
-							narratorId,
-							toolUseId: event.toolUseId,
-							error: String(retryErr),
-						});
-						throw new CriticalEventPersistenceError("Tool result could not be persisted", {
-							cause: retryErr,
-						});
-					}
+					throw new CriticalEventPersistenceError("Tool result could not be persisted", {
+						cause: err,
+					});
 				}
 			}
 
