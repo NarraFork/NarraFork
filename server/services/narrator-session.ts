@@ -874,7 +874,32 @@ export async function isOutlineSessionGoal(
 async function refuseQueuedOutlineGoal(narratorId: string, buffered: BufferedMessage) {
 	const refusal = catalogError("GOAL_IN_OUTLINE_SESSION");
 	try {
-		await dropBufferedMessage(narratorId, buffered, refusal.message);
+		await withInboxOwner(narratorId, async () => {
+			let message = buffered;
+			if (!message._mailboxClaim) {
+				// Claim the exact row first, as the consumers do, so what is dropped is what was read.
+				const row = await claimInboxHead(
+					narratorId,
+					(candidate) => candidate.id === buffered.id && candidate.kind === "user_input",
+				);
+				// Not at the queue's head (or gone): its consumer will meet it and refuse it then.
+				if (!row) return;
+				message = projectMailboxUserMessage(row);
+				// Edited since it was read into something that is no /goal: not ours to drop.
+				if (
+					!parseQueuedGoalCommand(
+						message.text,
+						message.commandText,
+						message.composerDocument,
+						message.executionIntent,
+					)
+				) {
+					await releaseInboxClaim(row, "Edited before a refused /goal was dropped");
+					return;
+				}
+			}
+			await dropBufferedMessage(narratorId, message, refusal.message);
+		});
 	} catch (error) {
 		logger.warn("Failed to drop a queued /goal refused for an outline session", {
 			narratorId,

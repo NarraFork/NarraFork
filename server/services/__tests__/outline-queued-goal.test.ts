@@ -21,7 +21,11 @@ import { handleNarratorWS } from "../../websocket/narrator-ws";
 import * as inbox from "../agent-runtime/inbox";
 import { getExecutionOwner } from "../agent-runtime/ownership";
 import { startNarratorRun } from "../agent-runtime/run";
-import { enqueueBufferedMessage, getBufferedMessagesAsync } from "../narrator-buffer";
+import {
+	enqueueBufferedMessage,
+	getBufferedMessagesAsync,
+	updateBufferedMessage,
+} from "../narrator-buffer";
 import type { ExecuteLoopResult } from "../narrator-executor";
 import * as executor from "../narrator-executor";
 import { narratorService } from "../narrator-service";
@@ -98,6 +102,31 @@ describe("the queue consumers drop an outline session's /goal unsaved", () => {
 		});
 		expect(await savedMessages(id)).toEqual([]);
 		expect(await queued(id)).toEqual([]);
+	});
+
+	test("a row edited into something else before the drop is claimed, seen, and left queued", async () => {
+		const id = await session();
+		await enqueueBufferedMessage(id, "/goal ship it");
+		const [read] = await getBufferedMessagesAsync(id);
+		if (!read) throw new Error("expected a queued message");
+		// The person edits it after the consumer read it, before the refusal drops it.
+		expect(await updateBufferedMessage(id, read.id, "fix the build instead")).toBe(true);
+		expect(await executeQueuedGoalCommand(id, read, "ship it")).toEqual({ refused: true });
+		const [left] = await getBufferedMessagesAsync(id);
+		expect(left?.text).toBe("fix the build instead");
+		expect(left?.state).toBe("queued");
+		expect(await savedMessages(id)).toEqual([]);
+	});
+
+	test("a /goal not at the head is left for its consumer to meet", async () => {
+		const id = await session();
+		await enqueueBufferedMessage(id, "first, a plain message");
+		await enqueueBufferedMessage(id, "/goal ship it");
+		const goal = (await getBufferedMessagesAsync(id))[1];
+		if (!goal) throw new Error("expected a queued /goal");
+		expect(await executeQueuedGoalCommand(id, goal, "ship it")).toEqual({ refused: true });
+		expect(await queued(id)).toEqual(["first, a plain message", "/goal ship it"]);
+		expect(await savedMessages(id)).toEqual([]);
 	});
 
 	test("the post-interrupt resume drops it and drains on to the next message", async () => {

@@ -132,6 +132,7 @@ afterEach(() => {
 
 describeTaskSourceContract({
 	backend: "outline",
+	digestStamp: { taskBackend: "outline" },
 	createNarrator: () => session(),
 	seedTasks: async (narratorId, tasks) => {
 		await seedOutlineTasks(narratorId, tasks);

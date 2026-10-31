@@ -11,10 +11,12 @@
  * resolves to (its session, the session's column) is kept in memory after the first read and
  * served from there: a turn costs no read for it, a failing database does not flip an outline
  * session to spec for a pass, and the outline source does not read the row a second time. Whatever
- * changes the column calls {@link invalidateTaskBackend}. `outline.enabled` is applied on every
- * call, never cached.
+ * changes the column calls {@link invalidateTaskBackend}; a deleted narrator is dropped on
+ * `narrator:deleted`. The cache holds at most {@link MAX_CACHED} narrators, the least recently
+ * used dropped first. `outline.enabled` is applied on every call, never cached.
  */
-import { hotSafe } from "@server/lib/hot-safe";
+import { eventBus } from "@server/lib/event-bus";
+import { hotOnce, hotSafe } from "@server/lib/hot-safe";
 import { catalogError } from "../../lib/errors";
 import { readNarratorTaskBackend } from "../outline/access-reads";
 import { isOutlineEnabled } from "../outline/feature";
@@ -39,7 +41,12 @@ const cache = hotSafe("narrafork.taskBackend.sessions", () => new Map<string, Ta
  */
 export async function readTaskSession(narratorId: string): Promise<TaskSession | null> {
 	const cached = cache.get(narratorId);
-	if (cached) return cached;
+	if (cached) {
+		// Most recently used last.
+		cache.delete(narratorId);
+		cache.set(narratorId, cached);
+		return cached;
+	}
 	const row = await readNarratorTaskBackend(narratorId);
 	if (!row) return null;
 	const session: TaskSession = {
@@ -69,6 +76,11 @@ export function invalidateTaskBackend(narratorId?: string): void {
 	for (const [id, session] of cache) {
 		if (id === narratorId || session.sessionNarratorId === narratorId) cache.delete(id);
 	}
+}
+
+if (hotOnce("narrafork.taskBackend.listeners")) {
+	// A deleted narrator (and, for a deleted session, its subagents' link to it) is forgotten.
+	eventBus.on("narrator:deleted", (event) => invalidateTaskBackend(event.narratorId));
 }
 
 /**

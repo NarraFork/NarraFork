@@ -18,6 +18,7 @@ import { grantBehaviorFenceEdit } from "../../lib/agent/tools/behavior-fence-gra
 import { isOutlineTool } from "../../lib/agent/tools/outline-names";
 import type { AgentConfig, AgentToolUse } from "../../lib/agent/types";
 import { AppError } from "../../lib/errors";
+import { eventBus } from "../../lib/event-bus";
 import { generateId } from "../../lib/id";
 import { logger } from "../../lib/logger";
 import { getDynamicSpecSystemReminder, getOutlineTaskSystemReminder } from "../../lib/prompt-i18n";
@@ -396,6 +397,33 @@ describe("the task backend cache", () => {
 		expect(await resolveTaskBackend(id)).toBe("outline");
 		invalidateTaskBackend(id);
 		expect(await resolveTaskBackend(id)).toBe("spec");
+		expect(await resolveTaskBackend(sub)).toBe("spec");
+	});
+
+	test("a deleted narrator is forgotten, with its subagents' link to it", async () => {
+		const id = await session();
+		const sub = generateId();
+		await db.insert(narrators).values({
+			id: sub,
+			type: "subagent",
+			variant: "subagent:general",
+			parentNarratorId: id,
+			aclRootNarratorId: id,
+			status: "idle",
+			createdAt: NOW,
+			updatedAt: NOW,
+		});
+		expect(await resolveTaskBackend(id)).toBe("outline");
+		expect(await resolveTaskBackend(sub)).toBe("outline");
+		// What deleting the session leaves: no row, and a subagent without its root.
+		await db
+			.update(narrators)
+			.set({ aclRootNarratorId: null, parentNarratorId: null })
+			.where(eq(narrators.id, sub));
+		await db.delete(narrators).where(eq(narrators.id, id));
+		eventBus.emit({ type: "narrator:deleted", narratorId: id, title: null });
+		expect(await resolveTaskBackend(id)).toBe("spec");
+		// Its own column (spec by default) once its root is gone.
 		expect(await resolveTaskBackend(sub)).toBe("spec");
 	});
 });
