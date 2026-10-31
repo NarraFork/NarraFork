@@ -161,7 +161,14 @@ function platformInstance(
 	suffix = "",
 	config: Record<string, unknown> = {},
 ) {
-	return { id: `platform-${platform}`, platform, suffix, prefix: platform, disabled: false, config };
+	return {
+		id: `platform-${platform}`,
+		platform,
+		suffix,
+		prefix: platform,
+		disabled: false,
+		config,
+	};
 }
 
 const initialSettings = {

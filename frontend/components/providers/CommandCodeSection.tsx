@@ -10,17 +10,7 @@
 
 import { formatCompactNumber } from "@frontend/lib/compact-number";
 import { formatCountdown } from "@frontend/lib/relative-time";
-import {
-	Alert,
-	Badge,
-	Button,
-	Divider,
-	Group,
-	Loader,
-	Progress,
-	Stack,
-	Text,
-} from "@mantine/core";
+import { Alert, Badge, Button, Divider, Group, Loader, Progress, Stack, Text } from "@mantine/core";
 import { notifications } from "@mantine/notifications";
 import { IconRefresh } from "@tabler/icons-react";
 import { useQuery } from "@tanstack/react-query";

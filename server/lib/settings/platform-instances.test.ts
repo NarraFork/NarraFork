@@ -4,11 +4,7 @@ import { initialPlatformInstances } from "./platform-instances";
 describe("平台实例的初始清单", () => {
 	test("每个平台一条，后缀为空、前缀用平台默认值", () => {
 		const instances = initialPlatformInstances({});
-		expect(instances.map((entry) => entry.prefix)).toEqual([
-			"codex",
-			"CommandCode",
-			"tokendance",
-		]);
+		expect(instances.map((entry) => entry.prefix)).toEqual(["codex", "CommandCode", "tokendance"]);
 		expect(instances.map((entry) => entry.platform)).toEqual([
 			"codex",
 			"CommandCode",

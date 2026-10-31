@@ -1,9 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import {
-	instanceCardName,
-	nextInstanceSuffix,
-	resolveInstancePrefix,
-} from "./platform-instances";
+import { instanceCardName, nextInstanceSuffix, resolveInstancePrefix } from "./platform-instances";
 
 describe("平台实例命名", () => {
 	test("卡片名：默认那一条用平台显示名，带后缀时用 前缀-后缀", () => {

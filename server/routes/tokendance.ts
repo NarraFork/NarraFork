@@ -134,10 +134,7 @@ tokendanceRoutes.get("/connection", (c) =>
 );
 tokendanceRoutes.post("/models/refresh", async (c) =>
 	c.json({
-		models: await refreshTokenDanceModels(
-			c.req.raw.signal,
-			c.req.query("prefix") || undefined,
-		),
+		models: await refreshTokenDanceModels(c.req.raw.signal, c.req.query("prefix") || undefined),
 	}),
 );
 tokendanceRoutes.patch("/connection", async (c) => {

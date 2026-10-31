@@ -730,8 +730,7 @@ export function usesStatefulModel(prefix?: string, model?: string): boolean {
 		const catalog = getTokenDanceCatalogModels(prefix).find((m) => m.id === rawModel);
 		if (!catalog) return false;
 		const protocol =
-			resolveModelProtocol(prefix, model) ??
-			selectTokenDanceProtocol(catalog.supported_protocols);
+			resolveModelProtocol(prefix, model) ?? selectTokenDanceProtocol(catalog.supported_protocols);
 		return protocol === "openai-responses";
 	}
 	if (usesStatefulApi(prefix)) return true;

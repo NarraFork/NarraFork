@@ -57,20 +57,14 @@ export function PlatformInstancesModal({
 	const [platform, setPlatform] = useState<PlatformInstanceKind>("codex");
 	const [suffix, setSuffix] = useState("");
 	const [prefix, setPrefix] = useState("");
-	const [config, setConfig] = useState<Record<string, unknown>>(() =>
-		emptyInstanceConfig("codex"),
-	);
+	const [config, setConfig] = useState<Record<string, unknown>>(() => emptyInstanceConfig("codex"));
 
 	const cardNames = useMemo(
 		() => instances.map((instance) => instanceCardName(instance.platform, instance.suffix)),
 		[instances],
 	);
 	const taken = useMemo(
-		() => [
-			...instances.map((instance) => instance.prefix),
-			...cardNames,
-			...takenPrefixes,
-		],
+		() => [...instances.map((instance) => instance.prefix), ...cardNames, ...takenPrefixes],
 		[instances, cardNames, takenPrefixes],
 	);
 
@@ -162,11 +156,7 @@ export function PlatformInstancesModal({
 					</Text>
 					<Code>{`${effectivePrefix}:model`}</Code>
 				</Group>
-				<PlatformInstanceFields
-					platform={platform}
-					config={config}
-					onChange={setConfig}
-				/>
+				<PlatformInstanceFields platform={platform} config={config} onChange={setConfig} />
 				<Group justify="flex-end" gap="xs">
 					<Button variant="default" onClick={onClose}>
 						{t("common:cancel")}

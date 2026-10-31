@@ -211,11 +211,8 @@ function SettingsProvidersPage() {
 	// 平台集成的实例清单：清单是唯一事实来源，卡片与解析都以它为准。
 	const platformInstances = useMemo(
 		() =>
-			(
-				settings?.agent as unknown as
-					| { platformInstances?: PlatformInstanceRow[] }
-					| undefined
-			)?.platformInstances ?? [],
+			(settings?.agent as unknown as { platformInstances?: PlatformInstanceRow[] } | undefined)
+				?.platformInstances ?? [],
 		[settings?.agent],
 	);
 	const [addPlatformOpen, setAddPlatformOpen] = useState(false);
@@ -1001,7 +998,9 @@ function SettingsProvidersPage() {
 						? commandcodeModels
 						: tokenDanceModelsOf(instance);
 			for (const model of source) {
-				const bare = model.value.includes(":") ? model.value.slice(model.value.indexOf(":") + 1) : model.value;
+				const bare = model.value.includes(":")
+					? model.value.slice(model.value.indexOf(":") + 1)
+					: model.value;
 				addModel(instance.prefix, {
 					...model,
 					value: `${instance.prefix}:${bare}`,
@@ -1333,9 +1332,8 @@ function SettingsProvidersPage() {
 								<CommandCodeSection
 									prefix={selectedPlatformInstance.prefix}
 									models={
-										providerGroups.find(
-											(group) => group.prefix === selectedPlatformInstance.prefix,
-										)?.models ?? []
+										providerGroups.find((group) => group.prefix === selectedPlatformInstance.prefix)
+											?.models ?? []
 									}
 									hiddenModels={state.hiddenModels}
 									onToggleHidden={dispatchers.toggleHidden}

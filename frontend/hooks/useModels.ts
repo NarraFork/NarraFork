@@ -1,7 +1,4 @@
-import {
-	instanceCardName,
-	type PlatformInstanceRow,
-} from "@shared/platform-instances";
+import { instanceCardName, type PlatformInstanceRow } from "@shared/platform-instances";
 import type { TokenDancePublicConnection } from "@shared/tokendance";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useMemo } from "react";

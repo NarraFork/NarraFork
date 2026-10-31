@@ -15,10 +15,7 @@ import {
 	type TokenDancePublicConnection,
 	type TokenDanceRecoveryAction,
 } from "@shared/tokendance";
-import {
-	PLATFORM_DEFAULTS,
-	type PlatformInstanceRow,
-} from "../../shared/platform-instances";
+import { PLATFORM_DEFAULTS, type PlatformInstanceRow } from "../../shared/platform-instances";
 import { maskSecretValues } from "../lib/agent/request-dump";
 import { normalizeConfiguredOrigins, resolveAllowedCorsOrigin } from "../lib/cors-origin";
 import { AppError } from "../lib/errors";
@@ -130,9 +127,7 @@ function tokenDanceInstances(): PlatformInstanceRow[] {
  */
 export function defaultTokenDancePrefix(): string | undefined {
 	const instances = tokenDanceInstances();
-	const preferred = instances.find(
-		(entry) => entry.prefix === PLATFORM_DEFAULTS.tokendance.prefix,
-	);
+	const preferred = instances.find((entry) => entry.prefix === PLATFORM_DEFAULTS.tokendance.prefix);
 	return (preferred ?? instances[0])?.prefix;
 }
 

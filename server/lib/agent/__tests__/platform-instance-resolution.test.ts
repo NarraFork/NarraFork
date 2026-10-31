@@ -57,8 +57,7 @@ describe("平台实例的解析（清单驱动）", () => {
 
 	test("Codex 实例没有选中可用凭据时不算就绪，也不借用账号池", () => {
 		expect(
-			listPlatformInstanceReadiness([instance({ config: { credentialIds: ["gone"] } })])[0]
-				?.ready,
+			listPlatformInstanceReadiness([instance({ config: { credentialIds: ["gone"] } })])[0]?.ready,
 		).toBe(false);
 		expect(
 			listPlatformInstanceReadiness([instance({ config: { credentialIds: [] } })])[0]?.ready,
