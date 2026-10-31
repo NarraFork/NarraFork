@@ -1484,7 +1484,12 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 
 		// Validate provider prefix conflicts — reserved prefixes and cross-provider duplicates
 		{
-			const RESERVED_PREFIXES = new Set(["codex", "tokendance"]);
+			// 保留前缀属于平台实例本身：删掉实例后，同一个前缀就能给自定义供应商复用。
+			const RESERVED_PREFIXES = new Set(
+				(validated.agent?.platformInstances ?? current.agent?.platformInstances ?? []).map(
+					(instance) => instance.prefix,
+				),
+			);
 			const allPrefixes: Array<{ prefix: string; source: string; legacyTokenDance?: boolean }> = [];
 			const previousCustomProviders = [
 				...(current.customApiProviders ?? []),
@@ -1537,6 +1542,16 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 					);
 				}
 				seen.set(prefix, source);
+			}
+			// 反向检查：平台实例的前缀也不能撞上已有供应商。
+			for (const instance of validated.agent?.platformInstances ?? []) {
+				const owner = seen.get(instance.prefix);
+				if (owner) {
+					throw new ValidationError(
+						`Platform instance prefix "${instance.prefix}" conflicts with ${owner}. ` +
+							`Each provider must have a unique prefix.`,
+					);
+				}
 			}
 		}
 

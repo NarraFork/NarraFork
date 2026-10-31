@@ -17,6 +17,23 @@ import {
 const ownWindow = (value: typeof liveSettings, model: string) =>
 	value.agent.modelCatalog?.local.connections?.[model]?.working_context_tokens;
 
+/** TokenDance 的连接记录现在存在平台实例自己的 config 上。 */
+function tokenDanceInstance(config: Record<string, unknown>) {
+	return {
+		id: "platform-tokendance",
+		platform: "tokendance" as const,
+		suffix: "",
+		prefix: "tokendance",
+		disabled: false,
+		config,
+	};
+}
+
+const tokenDanceConfig = (value: typeof liveSettings) =>
+	value.agent.platformInstances?.find((instance) => instance.platform === "tokendance")?.config as
+		| { modelCollectionInitialized?: boolean; models?: unknown }
+		| undefined;
+
 describe("TokenDance collection persistence", () => {
 	it("initializes legacy connections once and preserves manual choices across save and reload", () => {
 		const path = resolve(getNarraforkHome(), "settings.json");
@@ -24,13 +41,15 @@ describe("TokenDance collection persistence", () => {
 		const snapshot = structuredClone(liveSettings);
 		try {
 			const raw = getDefaults();
-			raw.tokendance = { apiKey: "collection-test-key", disabled: false, generation: 4 };
+			(raw.agent as Record<string, unknown>).platformInstances = [
+				tokenDanceInstance({ apiKey: "collection-test-key", disabled: false, generation: 4 }),
+			];
 			raw.agent.hiddenModels = [];
 			// A pre-catalog file: its window map is imported as the entry's own window.
 			(raw.agent as Record<string, unknown>).modelContextWindows = { "tokendance:glm-5": 64000 };
 			writeFileSync(path, JSON.stringify(raw));
 			const loaded = reloadSettings();
-			expect(loaded.tokendance?.modelCollectionInitialized).toBe(true);
+			expect(tokenDanceConfig(loaded)?.modelCollectionInitialized).toBe(true);
 			expect(loaded.agent.hiddenModels).toHaveLength(66);
 			expect(loaded.agent.hiddenModels).not.toContain("tokendance:kimi-k3");
 			expect(loaded.agent.hiddenModels).toContain("tokendance:glm-5");
@@ -40,14 +59,21 @@ describe("TokenDance collection persistence", () => {
 				(id) => id !== "tokendance:glm-5",
 			);
 			edited.agent.hiddenModels?.push("tokendance:kimi-k3");
-			if (!edited.tokendance) throw new Error("Expected connected TokenDance settings");
-			edited.tokendance.models = [
-				{
-					id: "future-new-model",
-					name: "Future",
-					context_length: 64000,
-					supported_protocols: ["openai:responses"],
-				},
+			edited.agent.platformInstances = [
+				tokenDanceInstance({
+					apiKey: "collection-test-key",
+					disabled: false,
+					generation: 4,
+					modelCollectionInitialized: true,
+					models: [
+						{
+							id: "future-new-model",
+							name: "Future",
+							context_length: 64000,
+							supported_protocols: ["openai:responses"],
+						},
+					],
+				}),
 			];
 			saveSettings(edited);
 			const again = reloadSettings();
@@ -55,9 +81,10 @@ describe("TokenDance collection persistence", () => {
 			expect(again.agent.hiddenModels).toContain("tokendance:kimi-k3");
 			expect(again.agent.hiddenModels).not.toContain("tokendance:future-new-model");
 			expect(ownWindow(again, "tokendance:glm-5")).toBe(64000);
-			expect(JSON.parse(readFileSync(path, "utf8")).tokendance.modelCollectionInitialized).toBe(
-				true,
-			);
+			const persisted = JSON.parse(readFileSync(path, "utf8")) as {
+				agent: { platformInstances: Array<{ config: { modelCollectionInitialized?: boolean } }> };
+			};
+			expect(persisted.agent.platformInstances[0]?.config.modelCollectionInitialized).toBe(true);
 		} finally {
 			saveSettings(snapshot);
 			writeFileSync(path, original);
@@ -68,9 +95,11 @@ describe("TokenDance collection persistence", () => {
 		const snapshot = structuredClone(liveSettings);
 		try {
 			const fresh = getDefaults();
-			fresh.tokendance = { apiKey: "collection-test-key", disabled: false, generation: 1 };
+			fresh.agent.platformInstances = [
+				tokenDanceInstance({ apiKey: "collection-test-key", disabled: false, generation: 1 }),
+			];
 			saveSettings(fresh);
-			expect(liveSettings.tokendance?.modelCollectionInitialized).toBe(true);
+			expect(tokenDanceConfig(liveSettings)?.modelCollectionInitialized).toBe(true);
 			expect(liveSettings.agent.hiddenModels).toContain("tokendance:glm-5");
 			expect(liveSettings.agent.hiddenModels).not.toContain("tokendance:glm-5.3");
 		} finally {
