@@ -2684,10 +2684,11 @@ export async function processEvent(
 					);
 				try {
 					// 与其它写路径一致：SQLITE_BUSY 交给带退避的 withDbRetry。
-					// 此前这里是「立即重试一次」，而实测锁窗口可达 0.6–1.5 秒
-					// （checkpoint / 大批量写 / 读 worker 占着快照），立即重试必然再失败，
+					// 此前这里是「立即重试一次」，而实测锁窗口可达 0.6–2.5 秒（并发工具调用
+					// 同时落库 + 块索引/状态写入 + WAL checkpoint），立即重试必然再失败，
 					// 于是把一次瞬时争用升级成 CriticalEventPersistenceError、直接终止 loop。
-					await withDbRetry(settle, { label: "tool_result.settle", maxRetries: 4 });
+					// 5 次 ≈ 1.5s 退避 + 5×250ms 忙等，足够穿过观测到的最长窗口。
+					await withDbRetry(settle, { label: "tool_result.settle", maxRetries: 5 });
 					toolResultPersisted = true;
 				} catch (err) {
 					logger.error("CRITICAL: tool_result persist failed", {
