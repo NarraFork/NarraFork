@@ -7,6 +7,7 @@ import { ERROR_CATALOG } from "@shared/error-catalog";
 import { modelProfile } from "@shared/model-catalog/profile";
 import { parseModelId } from "@shared/model-id";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
+import type { PlatformInstanceRow } from "@shared/platform-instances";
 import { selectTokenDanceProtocol } from "@shared/tokendance";
 import { getCodexManager } from "../codex-manager";
 import { resolveCommandCodeToken } from "../commandcode-manager";
@@ -690,7 +691,7 @@ export function getOpenaiProviderConfig(prefix?: string): OpenAIProviderConfig |
 
 export function usesCodexApiMode(prefix?: string): boolean {
 	if (!prefix) return false;
-	if (prefix === "codex") return true;
+	if (platformInstanceForPrefix(prefix)?.platform === "codex") return true;
 	return getOpenaiProviderConfig(prefix)?.apiMode === "codex";
 }
 
@@ -712,18 +713,24 @@ export function usesCodexModel(prefix?: string, model?: string): boolean {
 
 export function usesStatefulApi(prefix?: string): boolean {
 	if (!prefix) return false;
-	if (prefix === "codex") return true;
+	if (platformInstanceForPrefix(prefix)?.platform === "codex") return true;
 	const mode = getOpenaiProviderConfig(prefix)?.apiMode;
 	return mode === "codex" || mode === "responses";
 }
 
 export function usesStatefulModel(prefix?: string, model?: string): boolean {
-	if (prefix === "tokendance" && getTokenDanceRuntimeConfig()) {
-		const rawModel = model?.startsWith("tokendance:") ? model.slice("tokendance:".length) : model;
-		const catalog = getTokenDanceCatalogModels().find((m) => m.id === rawModel);
+	// 没连接的 TokenDance 前缀不接管判断，继续走通用规则。
+	if (
+		prefix &&
+		platformInstanceForPrefix(prefix)?.platform === "tokendance" &&
+		getTokenDanceRuntimeConfig(prefix)
+	) {
+		const head = `${prefix}:`;
+		const rawModel = model?.startsWith(head) ? model.slice(head.length) : model;
+		const catalog = getTokenDanceCatalogModels(prefix).find((m) => m.id === rawModel);
 		if (!catalog) return false;
 		const protocol =
-			resolveModelProtocol("tokendance", model) ??
+			resolveModelProtocol(prefix, model) ??
 			selectTokenDanceProtocol(catalog.supported_protocols);
 		return protocol === "openai-responses";
 	}
@@ -820,19 +827,55 @@ function hasConfiguredAnthropicProvider(): boolean {
 	return providers.some((p) => !p.disabled && !!p.apiKey);
 }
 
-function hasConfiguredCodexProvider(): boolean {
-	if (!s().codex) return false;
-	try {
-		return getCodexManager().availableCount > 0;
-	} catch {
-		return false;
+/** 前缀对应的平台实例（清单驱动）；不是平台前缀就返回 undefined。 */
+export function platformInstanceForPrefix(prefix?: string): PlatformInstanceRow | undefined {
+	if (!prefix) return undefined;
+	return s().agent?.platformInstances?.find((entry) => entry.prefix === prefix);
+}
+
+/**
+ * 一个平台实例是否真的能用：连接与凭据按实例自己的 config 判断。
+ *
+ * 就绪信息与「已配置的供应商」候选共用这一处判断，避免出现「卡片显示未就绪，却仍被
+ * 当成可用供应商选中」。删掉的实例不在清单里，自然也不会再被算进来。
+ */
+export function isPlatformInstanceUsable(instance: PlatformInstanceRow): boolean {
+	if (instance.disabled) return false;
+	switch (instance.platform) {
+		case "codex": {
+			const ids = Array.isArray(instance.config.credentialIds)
+				? instance.config.credentialIds.filter((id): id is string => typeof id === "string")
+				: undefined;
+			try {
+				const manager = getCodexManager();
+				return ids ? manager.hasAvailableCredentialsAmong(ids) : manager.hasAvailableCredentials;
+			} catch {
+				// 账号池读不出来只影响就绪判断，不能让解析链路跟着失败。
+				return false;
+			}
+		}
+		case "CommandCode":
+			return !!resolveCommandCodeToken(instance.config.apiKey as string | undefined).credential;
+		case "tokendance": {
+			const config = getTokenDanceRuntimeConfig(instance.prefix);
+			return !!config && !config.disabled;
+		}
+		default:
+			return false;
 	}
 }
 
 /** Command Code 的凭据可以来自设置页手填的 API key，或 CLI 落盘的 auth.json。 */
 export function hasConfiguredCommandCodeProvider(): boolean {
 	const config = s().commandCode;
-	return !config?.disabled && !!resolveCommandCodeToken(config?.apiKey).credential;
+	if (!config?.disabled && resolveCommandCodeToken(config?.apiKey).credential) return true;
+	// 模型目录整个平台共用：只要还有一条可用的 Command Code 实例就算可用。
+	return (s().agent?.platformInstances ?? []).some(
+		(instance) =>
+			instance.platform === "CommandCode" &&
+			!instance.disabled &&
+			!!resolveCommandCodeToken(instance.config.apiKey as string | undefined).credential,
+	);
 }
 
 /**
@@ -871,8 +914,10 @@ export function getFirstNugProvider(): NUGProviderConfig | undefined {
 
 function getConfiguredProviderCandidates(): string[] {
 	const available = new Set<string>();
-	const tokenDance = getTokenDanceRuntimeConfig();
-	if (tokenDance && !tokenDance.disabled) available.add("tokendance");
+	// 平台集成的候选取自实例清单：删掉的实例不会再被当成「已配置」。
+	for (const instance of s().agent?.platformInstances ?? []) {
+		if (isPlatformInstanceUsable(instance)) available.add(instance.prefix);
+	}
 	if (hasConfiguredOpenaiProvider()) {
 		for (const p of s().openaiProviders ?? []) {
 			if (!p.disabled && p.apiKey) available.add(p.prefix || "openai");
@@ -882,12 +927,6 @@ function getConfiguredProviderCandidates(): string[] {
 		for (const p of s().anthropicProviders ?? []) {
 			if (!p.disabled && p.apiKey) available.add(p.prefix || "anthropic");
 		}
-	}
-	if (hasConfiguredCodexProvider()) {
-		available.add("codex");
-	}
-	if (hasConfiguredCommandCodeProvider()) {
-		available.add("CommandCode");
 	}
 	if (hasConfiguredNugProvider()) {
 		for (const p of s().nugProviders ?? []) {
@@ -1095,15 +1134,19 @@ export function resolveModelContextWindow(
 		}
 	}
 
-	const bareModel =
-		provider === "tokendance" && getTokenDanceRuntimeConfig()
-			? model.startsWith("tokendance:")
-				? model.slice("tokendance:".length)
-				: model
-			: parseModelId(model).model;
+	const tokenDance =
+		provider && platformInstanceForPrefix(provider)?.platform === "tokendance"
+			? getTokenDanceRuntimeConfig(provider)
+			: undefined;
+	const tokenDanceHead = `${provider}:`;
+	const bareModel = tokenDance
+		? model.startsWith(tokenDanceHead)
+			? model.slice(tokenDanceHead.length)
+			: model
+		: parseModelId(model).model;
 	const fullModelValue = provider ? `${provider}:${bareModel}` : model;
 
-	if (provider === "tokendance" && getTokenDanceRuntimeConfig()) {
+	if (tokenDance) {
 		const user = getEffectiveModelProfile(fullModelValue, options);
 		if (
 			typeof user.contextWindow === "number" &&
@@ -1117,7 +1160,7 @@ export function resolveModelContextWindow(
 						? "card"
 						: "user",
 			};
-		const catalog = getTokenDanceCatalogModels().find((m) => m.id === bareModel);
+		const catalog = getTokenDanceCatalogModels(provider).find((m) => m.id === bareModel);
 		if (catalog && catalog.context_length > 0)
 			return { contextWindow: catalog.context_length, source: "catalog" };
 		return { contextWindow: DEFAULT_CONTEXT_WINDOW, source: "fallback" };

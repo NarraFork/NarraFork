@@ -33,11 +33,11 @@ export interface PlatformInstanceRow {
 	config: Record<string, unknown>;
 }
 
-/** 卡片名：平台默认前缀 + 后缀；后缀为空就是平台默认名。 */
+/** 卡片名：默认那一条用平台的显示名，带后缀时用 `平台前缀-后缀`（`codex-1`）。 */
 export function instanceCardName(platform: PlatformInstanceKind, suffix: string): string {
-	const base = PLATFORM_DEFAULTS[platform].prefix;
+	const { prefix, label } = PLATFORM_DEFAULTS[platform];
 	const trimmed = suffix.trim();
-	return trimmed ? `${base}-${trimmed}` : base;
+	return trimmed ? `${prefix}-${trimmed}` : label;
 }
 
 /**

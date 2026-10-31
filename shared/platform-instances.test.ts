@@ -6,11 +6,12 @@ import {
 } from "./platform-instances";
 
 describe("平台实例命名", () => {
-	test("卡片名 = 平台默认前缀 + 后缀，后缀空就是默认名", () => {
-		expect(instanceCardName("codex", "")).toBe("codex");
+	test("卡片名：默认那一条用平台显示名，带后缀时用 前缀-后缀", () => {
+		expect(instanceCardName("codex", "")).toBe("Codex");
 		expect(instanceCardName("codex", "1")).toBe("codex-1");
 		expect(instanceCardName("codex", "teamA")).toBe("codex-teamA");
 		expect(instanceCardName("CommandCode", "2")).toBe("CommandCode-2");
+		expect(instanceCardName("tokendance", "")).toBe("TokenDance");
 	});
 
 	test("默认后缀从 1 开始，跳过已占用的卡片名与前缀", () => {
