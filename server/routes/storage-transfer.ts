@@ -1,7 +1,9 @@
 /**
  * 数据导入 / 导出 / 清空（仅管理员）。
  *
- * - GET  /api/storage/export          导出 ZIP（清单 + 请求历史 + 会话 + 供应商）
+ * - GET  /api/storage/export          导出 ZIP（带会话，供 File System Access 流式写入）
+ * - POST /api/storage/export/ticket   签发一次性下载票据
+ * - GET  /api/storage/export/download 凭票据下载（挂在全局会话认证之前）
  * - POST /api/storage/import/preview  上传 ZIP，返回统计与会话冲突清单
  * - POST /api/storage/import          按预览 token + 冲突决策执行导入
  * - POST /api/storage/clear           清空指定类别（必须携带当前登录用户密码）
@@ -15,9 +17,12 @@ import { authSessionStore } from "../services/auth/store";
 import {
 	applyImport,
 	clearData,
+	consumeExportTicket,
+	createExportTicket,
 	exportData,
 	previewImport,
 	previewImportFromStream,
+	type TransferSelection,
 } from "../services/data-portability";
 
 export const storageTransferRoutes = new Hono();
@@ -44,25 +49,27 @@ const clearSchema = z.object({
 	password: z.string().min(1),
 });
 
-/**
- * GET /api/storage/export
- * 导出 ZIP；`?requests=0&sessions=0&providers=0` 用于排除某类数据（缺省全选）。
- * 响应流式发送，结束时清理临时文件。
- */
-storageTransferRoutes.get("/export", requireAdmin, async (c) => {
-	const { zipPath, counts } = await exportData({
-		requests: c.req.query("requests") !== "0",
-		sessions: c.req.query("sessions") !== "0",
-		providers: c.req.query("providers") !== "0",
-	});
+function selectionFromQuery(url: URL): TransferSelection {
+	return {
+		requests: url.searchParams.get("requests") !== "0",
+		sessions: url.searchParams.get("sessions") !== "0",
+		providers: url.searchParams.get("providers") !== "0",
+	};
+}
+
+function exportFilename(): string {
+	return `narrafork-export-${new Date().toISOString().slice(0, 10)}.zip`;
+}
+
+/** 打包并流式返回 ZIP。调用方负责已经完成管理员或票据鉴权。 */
+async function sendExport(selection: TransferSelection): Promise<Response> {
+	const { zipPath, counts } = await exportData(selection);
 	const file = Bun.file(zipPath);
-	const body = file.stream();
-	const response = new Response(body, {
+	const response = new Response(file.stream(), {
 		headers: {
 			"Content-Type": "application/zip",
-			"Content-Disposition": `attachment; filename="narrafork-export-${new Date()
-				.toISOString()
-				.slice(0, 10)}.zip"`,
+			"Content-Disposition": `attachment; filename="${exportFilename()}"`,
+			"Cache-Control": "no-store",
 			"X-Export-Counts": JSON.stringify(counts),
 		},
 	});
@@ -75,6 +82,38 @@ storageTransferRoutes.get("/export", requireAdmin, async (c) => {
 		Math.max(60_000, Math.min(600_000, Math.ceil(size / 1_000_000) * 10_000)),
 	);
 	return response;
+}
+
+/**
+ * GET /api/storage/export
+ * 导出 ZIP；`?requests=0&sessions=0&providers=0` 用于排除某类数据（缺省全选）。
+ * 响应流式发送。浏览器应把 body 直接写入用户选定的文件，不要先读成 Blob。
+ */
+storageTransferRoutes.get("/export", requireAdmin, async (c) => {
+	return sendExport(selectionFromQuery(new URL(c.req.url)));
+});
+
+/** POST /api/storage/export/ticket — 给无法流式写文件的浏览器换一张下载票据。 */
+storageTransferRoutes.post("/export/ticket", requireAdmin, async (c) => {
+	const parsed = selectionSchema.safeParse(await c.req.json());
+	if (!parsed.success) throw catalogError("EXPORT_PARAMS_INVALID");
+	if (!parsed.data.requests && !parsed.data.sessions && !parsed.data.providers) {
+		throw catalogError("EXPORT_PARAMS_INVALID");
+	}
+	return c.json({ ticket: createExportTicket(parsed.data) });
+});
+
+/**
+ * GET /api/storage/export/download?ticket=
+ * 必须在 `app.ts` 里挂到全局会话认证之前：`<a href>` 带不上 Authorization。
+ * 票据是唯一凭证，用过即废。
+ */
+export const exportTicketDownloadRoutes = new Hono();
+
+exportTicketDownloadRoutes.get("/", async (c) => {
+	const selection = consumeExportTicket(c.req.query("ticket") ?? "");
+	if (!selection) throw catalogError("EXPORT_TICKET_INVALID");
+	return sendExport(selection);
 });
 
 /**

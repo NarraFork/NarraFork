@@ -1,7 +1,7 @@
 /**
  * 设置 · 存储空间：数据导入 / 导出 / 清空。
  *
- * - 导出：直接下载 ZIP（无需确认）。
+ * - 导出：先选保存位置再流式写入；没有该 API 的浏览器改走一次性下载链接。
  * - 导入：选择文件 → 预检（统计 + 会话 id 冲突清单）→ 选择覆盖/跳过策略 → 执行。
  * - 清空：分项（请求历史 / 会话 / 供应商）与全量；先确认弹窗，再输入当前登录密码。
  */
@@ -136,14 +136,8 @@ export function DataPortabilityCard() {
 		setExporting(true);
 		setExportError(null);
 		try {
-			const blob = await api.downloadExport(exportSelection);
-			const url = URL.createObjectURL(blob);
-			const anchor = document.createElement("a");
-			anchor.href = url;
-			anchor.download = `narrafork-export-${new Date().toISOString().slice(0, 10)}.zip`;
-			anchor.click();
-			URL.revokeObjectURL(url);
-			setExportOpen(false);
+			const result = await api.saveExport(exportSelection);
+			if (result === "saved") setExportOpen(false);
 		} catch (error) {
 			setExportError(describeApiError(error, t).message);
 		} finally {

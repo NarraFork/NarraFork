@@ -17,7 +17,14 @@ process.env.NARRAFORK_HOME = testHome;
 
 const { sqlite } = await import("../../db");
 const { saveSettings, settings } = await import("../../lib/settings");
-const { applyImport, clearData, exportData, previewImport } = await import("../data-portability");
+const {
+	applyImport,
+	clearData,
+	consumeExportTicket,
+	createExportTicket,
+	exportData,
+	previewImport,
+} = await import("../data-portability");
 
 afterAll(() => {
 	if (previousHome === undefined) delete process.env.NARRAFORK_HOME;
@@ -340,5 +347,33 @@ describe("data portability · 数据安全", () => {
 		// 性能护栏：5000 行全链路应远快于「逐行 JSON」方案
 		expect(elapsed).toBeLessThan(10_000);
 		expect(count("api_requests")).toBe(5000);
+	});
+});
+
+describe("export download ticket", () => {
+	const selection = { requests: true, sessions: false, providers: true };
+
+	test("一次性有效，调用方之后改选择不影响已签发的票据", () => {
+		const chosen = { ...selection };
+		const token = createExportTicket(chosen, 1_000);
+		chosen.requests = false;
+		expect(consumeExportTicket(token, 1_000)).toEqual(selection);
+		expect(consumeExportTicket(token, 1_000)).toBeNull();
+	});
+
+	test("过期、伪造的票据不能下载", () => {
+		const token = createExportTicket(selection, 1_000);
+		expect(consumeExportTicket(token, 1_000 + 2 * 60 * 1000)).toBeNull();
+		expect(consumeExportTicket("not-a-ticket", 1_000)).toBeNull();
+	});
+
+	test("超过上限时丢掉最早的一张", () => {
+		// 先把前面用例留下的票据全部过期掉，再发出这一批。
+		const base = 10_000_000_000;
+		createExportTicket(selection, base);
+		const tokens: string[] = [];
+		for (let i = 0; i < 33; i += 1) tokens.push(createExportTicket(selection, base + i));
+		expect(consumeExportTicket(tokens[0] ?? "", base + 100)).toBeNull();
+		expect(consumeExportTicket(tokens[32] ?? "", base + 100)).toEqual(selection);
 	});
 });

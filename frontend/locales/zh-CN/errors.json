@@ -55,6 +55,8 @@
 	"errorCode": "错误码",
 	"messageCode": "文案码",
 
+	"EXPORT_PARAMS_INVALID": "导出参数不合法",
+	"EXPORT_TICKET_INVALID": "下载链接已失效，请重新导出",
 	"IMPORT_FILE_REQUIRED": "请选择 NarraFork 导出的 .zip 文件",
 	"IMPORT_FILE_TOO_LARGE": "导入文件超过 {{limit}} 上限",
 	"IMPORT_ZIP_INVALID": "上传的文件不是有效的 ZIP 包",
