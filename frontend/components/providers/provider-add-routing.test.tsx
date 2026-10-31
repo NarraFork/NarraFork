@@ -397,7 +397,7 @@ async function mount(href = "/settings/providers") {
 	});
 }
 function button(key: string) {
-	const found = [...container.querySelectorAll<HTMLButtonElement>("button")].find(
+	const found = [...document.body.querySelectorAll<HTMLButtonElement>("button")].find(
 		(node) => node.textContent?.trim() === text(key),
 	);
 	if (!found) throw new Error(`Missing button: ${key}`);
@@ -1325,5 +1325,38 @@ describe("provider add nested route", () => {
 		// codex + CommandCode + TokenDance + existing：平台卡只来自实例清单。
 		expect(container.querySelectorAll('[role="button"]').length).toBe(4);
 		expectNoSave();
+	});
+
+	test("添加平台：后缀与前缀留空时自动取第一个空闲数字", async () => {
+		await mount();
+		await click(button("platformInstanceAddButton"));
+		// codex / CommandCode / tokendance 已占用，所以自动编号从 1 开始。
+		expect(document.body.textContent).toContain("codex-1:model");
+		await click(button("platformInstanceAdd"));
+		expect(saveCalls).toBe(1);
+		const saved = (
+			savedPayloads.at(-1)?.agent as {
+				platformInstances?: Array<{ platform: string; suffix: string; prefix: string }>;
+			}
+		).platformInstances;
+		expect(saved).toHaveLength(4);
+		expect(saved?.at(-1)).toMatchObject({ platform: "codex", suffix: "1", prefix: "codex-1" });
+	});
+
+	test("删除平台实例：弹窗列表里删掉后清单少一条", async () => {
+		await mount();
+		await click(button("platformInstanceAddButton"));
+		// 弹窗里每个已有实例一行，右侧是删除按钮。
+		const rows = [...document.body.querySelectorAll<HTMLButtonElement>("button")].filter(
+			(node) => node.getAttribute("aria-label") === text("platformInstanceDelete"),
+		);
+		expect(rows).toHaveLength(3);
+		// 第一行是 codex 那条。
+		await click(rows[0] as HTMLButtonElement);
+		expect(saveCalls).toBe(1);
+		const saved = (
+			savedPayloads.at(-1)?.agent as { platformInstances?: Array<{ platform: string }> }
+		).platformInstances;
+		expect(saved?.map((entry) => entry.platform)).toEqual(["CommandCode", "tokendance"]);
 	});
 });
