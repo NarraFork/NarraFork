@@ -3069,13 +3069,14 @@ function adaptSpokenInjection(
 		const tasks = Array.isArray(body.tasks) ? body.tasks : [];
 		// Empty / over-threshold digests have no rows to draw; they carry the same
 		// localized sentence the markdown projection used as its headline.
+		const outline = body.taskBackend === "outline";
 		const emptyLabel =
 			variant === "current" && tasks.length > 0
 				? null
 				: variant === "emptyNever"
-					? sysLabel(ctx, "tasksEmptyNever")
+					? sysLabel(ctx, outline ? "outlineTasksEmptyNever" : "tasksEmptyNever")
 					: variant === "emptyDone"
-						? sysLabel(ctx, "tasksEmptyDone")
+						? sysLabel(ctx, outline ? "outlineTasksEmptyDone" : "tasksEmptyDone")
 						: variant === "tooMany"
 							? // `tasksTooMany` carries an `{n}` placeholder; sysLabel has no
 								// interpolation, so substitute here (same as the markdown path).

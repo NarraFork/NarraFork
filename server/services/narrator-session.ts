@@ -1777,6 +1777,12 @@ async function readContinuationTarget(
 	}
 }
 
+/**
+ * The task a turn-budget continuation is planned for (`ContinuationTarget.turnBudgetOnly`): the
+ * narrator has none of its own, so the prompt names none (`turnBudgetOnly` on the prompt input).
+ */
+const TURN_BUDGET_TASK = Object.freeze({ text: "", protected: false, status: "doing" as const });
+
 /** Read only this narrator's tasks; promotion is granted by the policy, not its relationships. */
 export async function readSpecContinuationState(
 	narratorId: string,
@@ -1824,10 +1830,17 @@ async function maybeStartSpecContinuation(
 	};
 	const taskSource = await taskSourceForNarrator(active.narratorId);
 	const spec = await readContinuationTarget(taskSource, policy.continuation.promoteTodo);
+	const cause = options?.cause ?? "spec";
+	// A narrator without tasks of its own (an outline subagent, D27c) continues only when a pass
+	// spent its turn budget before the final reply: the mode's task conditions do not apply to
+	// it (only `off` still stops it), the pass ceiling and stall rules do.
+	const budgetOnly = spec.turnBudgetOnly === true;
+	if (budgetOnly) state.turnBudgetOnly = true;
 	const plan = planSpecContinuation({
-		cause: options?.cause ?? "spec",
-		mode: effectiveMode,
-		...spec,
+		cause,
+		mode: budgetOnly && effectiveMode !== "off" ? "always" : effectiveMode,
+		openTask: budgetOnly ? (cause === "maxTurns" ? TURN_BUDGET_TASK : null) : spec.openTask,
+		protectedOpenCount: spec.protectedOpenCount,
 		previous: state,
 		maxPasses: policy.continuation.maxPasses,
 		explicitStart: options?.explicitStart,
@@ -1842,7 +1855,7 @@ async function maybeStartSpecContinuation(
 	state.passes = plan.passes;
 	const task = plan.task;
 	const canAskUserQuestion = policy.capabilities.askUserQuestion !== "disabled";
-	if (policy.continuation.maxPasses !== null || !canAskUserQuestion) {
+	if (policy.continuation.maxPasses !== null || !canAskUserQuestion || budgetOnly) {
 		const content = taskSource.continuationPrompt({
 			form: "bounded",
 			cause: plan.cause,
@@ -1851,6 +1864,7 @@ async function maybeStartSpecContinuation(
 			maxPasses: policy.continuation.maxPasses,
 			canAskUserQuestion,
 			locale: active.locale,
+			...(budgetOnly ? { turnBudgetOnly: true } : {}),
 		});
 		await deliverInjection(active.narratorId, {
 			content,
@@ -2523,6 +2537,9 @@ export async function drainInjectionsIntoHistory(
 		// continuation (which lists the same tasks but for a different reason).
 		if (tasksBody.kind === "tasks") {
 			tasksBody.cadenceInterval = active._tasksReminderInterval ?? 15;
+			// And the backend it came from, so both projections word it for that backend.
+			const backend = taskSource?.backend;
+			if (backend && backend !== "spec") tasksBody.taskBackend = backend;
 		}
 		const { body, content } = sideCarBodyWithText("living_work_spec", tasksBody, locale);
 		const { messageId, turnText } = await deliverInjection(narratorId, {

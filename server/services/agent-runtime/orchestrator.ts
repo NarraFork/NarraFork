@@ -478,7 +478,9 @@ export async function runAgentLoopUnlocked(
 		});
 		continuationStopNote =
 			deliverTo && continuationState.stop
-				? specContinuationStopNote(continuationState.stop, locale)
+				? specContinuationStopNote(continuationState.stop, locale, {
+						turnBudgetOnly: continuationState.turnBudgetOnly,
+					})
 				: null;
 		return content;
 	};

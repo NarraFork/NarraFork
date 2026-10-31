@@ -61,6 +61,8 @@ export interface SideCarTaskEntry {
 	role: "doing" | "next" | "todo" | "blocked";
 	text: string;
 	protected?: boolean;
+	/** The task's address in its backend, when it has one (outline: `key/sid`). */
+	ref?: string;
 }
 
 /** One knowledge-base entry the injection surfaced. */
@@ -190,6 +192,12 @@ export type SideCarBody =
 	| {
 			kind: "tasks";
 			variant: "current" | "emptyNever" | "emptyDone" | "tooMany";
+			/**
+			 * Where the tasks live, when not Dynamic Spec: `outline` digests are worded for the
+			 * outline (checkboxes, OutlineEdit, the person who set a task) on both projections.
+			 * Absent on every spec digest, so those render exactly as before.
+			 */
+			taskBackend?: "outline";
 			tasks?: SideCarTaskEntry[];
 			/** `tooMany` only: how many tasks tripped the threshold. */
 			taskCount?: number;
@@ -355,6 +363,11 @@ export const SIDECAR_PRESENTATION_FALLBACKS: Readonly<Record<string, string>> = 
 	tasksEmptyNever: "Dynamic Spec — no tasks created yet",
 	tasksEmptyDone: "Dynamic Spec — all tasks done, time to reorganize",
 	tasksTooMany: "Dynamic Spec — {n} tasks, over the reorganize threshold",
+	// Outline task digests (`taskBackend: "outline"`).
+	outlineTasksCurrent: "Outline tasks — {n} open",
+	outlineTasksEmptyNever: "Outline tasks — none written yet",
+	outlineTasksEmptyDone: "Outline tasks — none open",
+	outlineTaskHumanCreated: "set by a person",
 	taskRoleDoing: "doing",
 	taskRoleNext: "next",
 	taskRoleTodo: "todo",
@@ -551,14 +564,18 @@ function projectSideCarBody(
 
 		case "tasks": {
 			const tasks = body.tasks ?? [];
+			const outline = body.taskBackend === "outline";
 			const headline =
 				body.variant === "current"
-					? labelWith(labels, "tasksCurrent", { n: tasks.length })
+					? labelWith(labels, outline ? "outlineTasksCurrent" : "tasksCurrent", {
+							n: tasks.length,
+						})
 					: body.variant === "emptyNever"
-						? label(labels, "tasksEmptyNever")
+						? label(labels, outline ? "outlineTasksEmptyNever" : "tasksEmptyNever")
 						: body.variant === "emptyDone"
-							? label(labels, "tasksEmptyDone")
+							? label(labels, outline ? "outlineTasksEmptyDone" : "tasksEmptyDone")
 							: labelWith(labels, "tasksTooMany", { n: body.taskCount ?? 0 });
+			const protectedLabel = label(labels, outline ? "outlineTaskHumanCreated" : "taskProtected");
 			// Only the tasks are projected. The digest's other half — "keep tasks.json to
 			// only text/status/protected", "do not add IDs" — is instruction aimed at the
 			// model; showing it to the reader is the noise this redesign removes.
@@ -570,7 +587,7 @@ function projectSideCarBody(
 			const lines: SideCarLine[] = tasks.slice(0, SIDECAR_PROJECTION_MAX_LINES).map((task) => ({
 				kind: "bullet" as const,
 				text: `${label(labels, taskRoleKey(task.role))}: ${task.text}${
-					task.protected ? ` · ${label(labels, "taskProtected")}` : ""
+					task.protected ? ` · ${protectedLabel}` : ""
 				}`,
 			}));
 			return { headline, lines };
@@ -919,6 +936,7 @@ function renderTasksToText(
 	body: Extract<SideCarBody, { kind: "tasks" }>,
 	templates: SideCarModelTemplates,
 ): string {
+	if (body.taskBackend === "outline") return renderOutlineTasksToText(body, templates);
 	const lines: string[] = [];
 	switch (body.variant) {
 		case "current": {
@@ -950,6 +968,47 @@ function renderTasksToText(
 					threshold: body.threshold ?? 0,
 				}),
 				tpl(templates, "tasksTooManyReorganize"),
+			);
+			break;
+	}
+	return lines.join("\n");
+}
+
+/**
+ * An outline task digest (`taskBackend: "outline"`): the same shape in outline words. Each task
+ * carries its address (`key/sid`), which is what OutlineRead and OutlineEdit take; a task a
+ * person set is marked, since the agent may not drop it on its own. There is no `tooMany`: tasks
+ * are blocks, and how many there are is no reason to rewrite them.
+ */
+function renderOutlineTasksToText(
+	body: Extract<SideCarBody, { kind: "tasks" }>,
+	templates: SideCarModelTemplates,
+): string {
+	const lines: string[] = [];
+	switch (body.variant) {
+		case "current":
+		case "tooMany": {
+			lines.push(tpl(templates, "outlineTasksCurrentHeading"));
+			for (const task of body.tasks ?? []) {
+				const ref = task.ref ? ` \`${task.ref}\`` : "";
+				const mark = task.protected ? tpl(templates, "outlineTaskHumanCreatedMark") : "";
+				const role = task.role === "blocked" ? "waiting" : task.role;
+				lines.push(`- ${role}:${ref} ${task.text}${mark}`);
+			}
+			lines.push(tpl(templates, "outlineTasksCurrentUpdateNote"));
+			break;
+		}
+		case "emptyNever":
+			lines.push(
+				tpl(templates, "outlineTasksEmptyHeading"),
+				tpl(templates, "outlineTasksEmptyNeverCreate"),
+				tpl(templates, "tasksEmptyNeverSkip"),
+			);
+			break;
+		case "emptyDone":
+			lines.push(
+				tpl(templates, "outlineTasksEmptyHeading"),
+				tpl(templates, "outlineTasksEmptyDoneNext"),
 			);
 			break;
 	}

@@ -16,6 +16,15 @@ export { getBotModePrompt } from "./prompts/bot";
 export type { PromptKey } from "./prompts/core";
 export { getPrompt } from "./prompts/core";
 export { buildKnowledgeStewardSystemPrompt } from "./prompts/knowledge-steward";
+export type { OutlineTaskPromptTask } from "./prompts/outline-tasks";
+export {
+	getOutlineBoundedContinuationPrompt,
+	getOutlineCompactContext,
+	getOutlineContinuationPrompt,
+	getOutlineInterruptNote,
+	getOutlineSpecUnavailableHint,
+	getOutlineTaskSystemReminder,
+} from "./prompts/outline-tasks";
 export type {
 	SetupAuthorization,
 	SetupAuthorizationResolution,

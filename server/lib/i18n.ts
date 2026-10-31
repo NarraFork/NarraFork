@@ -611,6 +611,33 @@ Retry with complete, valid JSON containing all required parameters. If a large i
 		en: "- Refresh the list before continuing.",
 		"zh-CN": "- 整理完再继续。",
 	},
+	// tasks, outline wording (`taskBackend: "outline"`, a session whose tasks live in the outline).
+	// Same budget as above: the live state plus one action line. Each task line carries the
+	// task's address, which OutlineRead and OutlineEdit take as is.
+	"sidecar.outlineTasksCurrentHeading": {
+		en: "Outline — excerpt of this session's open tasks (not the full list; OutlineRead shows a task with what is under it):",
+		"zh-CN": "大纲：本会话未完成任务节选（非完整列表；用 OutlineRead 查看任务及其下的内容）：",
+	},
+	"sidecar.outlineTasksCurrentUpdateNote": {
+		en: "When a task's state changes, tick its checkbox with OutlineEdit: [/] when you start it, [x] when it is done.",
+		"zh-CN": "任务状态有变化时，用 OutlineEdit 勾选它的复选框：开始做勾成 [/]，做完勾成 [x]。",
+	},
+	"sidecar.outlineTaskHumanCreatedMark": {
+		en: " [set by a person]",
+		"zh-CN": " [人建任务]",
+	},
+	"sidecar.outlineTasksEmptyHeading": {
+		en: "Outline — this session has no open tasks.",
+		"zh-CN": "大纲：本会话当前没有未完成的任务。",
+	},
+	"sidecar.outlineTasksEmptyNeverCreate": {
+		en: "- Multi-step work? Write it as tasks (checkbox blocks) in this session's space with OutlineEdit.",
+		"zh-CN": "- 如果是多步骤工作，请用 OutlineEdit 在本会话的空间里写成任务（带复选框的块）。",
+	},
+	"sidecar.outlineTasksEmptyDoneNext": {
+		en: "- If more work follows, write its tasks with OutlineEdit before you continue.",
+		"zh-CN": "- 如果还有后续工作，请先用 OutlineEdit 写好它的任务再继续。",
+	},
 	"sidecar.tasksTooManyHeading": {
 		en: "Dynamic Spec — {count} tasks in spec://tasks.json, over the {threshold} threshold.",
 		"zh-CN": `Dynamic Spec 当前有 {count} 条任务（spec://tasks.json），超过 {threshold} 条。`,
