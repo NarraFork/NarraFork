@@ -193,6 +193,27 @@ function normalizeCatalog(entries: unknown): TokenDanceCatalogModel[] {
 function generation(): number {
 	return settings.tokendance?.generation ?? 0;
 }
+
+/**
+ * 某个前缀对应的 TokenDance 连接配置：没有前缀就是内置连接，有前缀则必须是该平台实例
+ * 自己的 config（实例绝不回落到内置记录）。
+ */
+function configForPrefix(prefix?: string) {
+	if (!prefix || prefix === "tokendance") return settings.tokendance;
+	const instance = settings.agent?.platformInstances?.find(
+		(entry) => entry.prefix === prefix && entry.platform === "tokendance",
+	);
+	const config = instance?.config as
+		| { apiKey?: unknown; generation?: unknown; disabled?: unknown; models?: unknown }
+		| undefined;
+	if (!config || typeof config.apiKey !== "string" || !config.apiKey.trim()) return undefined;
+	return {
+		apiKey: config.apiKey.trim(),
+		generation: typeof config.generation === "number" ? config.generation : 0,
+		disabled: config.disabled === true,
+		models: config.models,
+	};
+}
 function cleanup(): void {
 	for (const [key, entry] of payments) {
 		if (entry.retireAt <= Date.now()) {
@@ -209,16 +230,29 @@ function cleanup(): void {
 const cleanupTimer = setInterval(cleanup, 60_000);
 cleanupTimer.unref();
 
-export function getTokenDanceRuntimeConfig():
-	| { apiKey: string; generation: number; disabled: boolean }
-	| undefined {
-	const config = settings.tokendance;
+export function getTokenDanceRuntimeConfig(
+	prefix?: string,
+): { apiKey: string; generation: number; disabled: boolean } | undefined {
+	const config = configForPrefix(prefix);
 	return config?.apiKey
 		? { apiKey: config.apiKey, generation: config.generation, disabled: config.disabled }
 		: undefined;
 }
-export function getTokenDanceCatalogModels(): TokenDanceCatalogModel[] {
-	if (!getTokenDanceRuntimeConfig()) return [];
+export function getTokenDanceCatalogModels(prefix?: string): TokenDanceCatalogModel[] {
+	if (!getTokenDanceRuntimeConfig(prefix)) return [];
+	if (prefix && prefix !== "tokendance") {
+		// 实例没有自己的目录缓存：用实例 key 归一化它自己的目录，没有再共用平台目录。
+		const own = configForPrefix(prefix)?.models;
+		return own ? normalizeCatalog(own) : builtinCatalog();
+	}
+	if (modelsGeneration !== generation()) {
+		models = normalizeCatalog(settings.tokendance?.models ?? []);
+		modelsGeneration = generation();
+	}
+	return structuredClone(models);
+}
+/** 内置目录本身（不再做前缀判断），供实例回退共用。 */
+function builtinCatalog(): TokenDanceCatalogModel[] {
 	if (modelsGeneration !== generation()) {
 		models = normalizeCatalog(settings.tokendance?.models ?? []);
 		modelsGeneration = generation();
@@ -243,8 +277,8 @@ export function getTokenDanceConnection(): TokenDancePublicConnection {
 		...(recoveryAction && settings.tokendance?.apiKey ? { recoveryAction } : {}),
 	};
 }
-export function assertTokenDanceConnection(expected: number): void {
-	const config = getTokenDanceRuntimeConfig();
+export function assertTokenDanceConnection(expected: number, prefix?: string): void {
+	const config = getTokenDanceRuntimeConfig(prefix);
 	if (!config || config.disabled || config.generation !== expected) {
 		throw fail("TokenDance connection changed or is disabled", 409);
 	}
@@ -252,8 +286,9 @@ export function assertTokenDanceConnection(expected: number): void {
 export function registerTokenDanceRequest(
 	controller: AbortController,
 	expected: number,
+	prefix?: string,
 ): () => void {
-	assertTokenDanceConnection(expected);
+	assertTokenDanceConnection(expected, prefix);
 	requests.add(controller);
 	return () => requests.delete(controller);
 }

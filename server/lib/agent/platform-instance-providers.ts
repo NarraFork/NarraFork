@@ -69,7 +69,7 @@ export function resolvePlatformInstanceAdapter(
 			);
 		case "tokendance":
 			// 每个实例必须有自己的 apiKey；没配置就没有 adapter，不借用全局连接。
-			return instanceTokenDanceApiKey(instance) ? new TokenDanceProvider() : null;
+			return instanceTokenDanceApiKey(instance) ? new TokenDanceProvider(instance.prefix) : null;
 		default:
 			return null;
 	}

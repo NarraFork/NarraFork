@@ -24,7 +24,11 @@ import { maskSecretValues } from "./request-dump";
 import { ApiError } from "./types";
 
 /** Redacts before delegates, request dumps, SSE parsing and logging see any upstream bytes. */
-export function tokenDanceTransport(apiKey: string, generation: number): ProviderTransport {
+export function tokenDanceTransport(
+	apiKey: string,
+	generation: number,
+	prefix?: string,
+): ProviderTransport {
 	const patterns = [
 		apiKey,
 		JSON.stringify(apiKey).slice(1, -1),
@@ -40,9 +44,9 @@ export function tokenDanceTransport(apiKey: string, generation: number): Provide
 			headers.set("X-App-URL", TOKENDANCE_APP_URL);
 		},
 		async fetch(input, init, next) {
-			assertTokenDanceConnection(generation);
+			assertTokenDanceConnection(generation, prefix);
 			const controller = new AbortController();
-			const unregister = registerTokenDanceRequest(controller, generation);
+			const unregister = registerTokenDanceRequest(controller, generation, prefix);
 			const signal = init?.signal;
 			const abort = () => controller.abort(signal?.reason);
 			if (signal?.aborted) abort();
@@ -204,19 +208,23 @@ export class TokenDanceProvider implements ProviderAdapter {
 	private delegate?: ProviderAdapter;
 	private model?: string;
 	private protocol?: string;
-	private readonly config = (() => {
-		const config = getTokenDanceRuntimeConfig();
-		return config ? { ...config } : undefined;
-	})();
+	private config?: { apiKey: string; generation: number; disabled: boolean };
+
+	/** `prefix` 是平台实例的模型前缀；不传就是内置 TokenDance 连接。 */
+	constructor(private readonly prefix?: string) {}
 
 	prepareForModel(model: string): void {
+		const runtimeConfig = getTokenDanceRuntimeConfig(this.prefix);
+		this.config = runtimeConfig ? { ...runtimeConfig } : undefined;
 		if (!this.config || this.config.disabled)
 			throw new Error("TokenDance connection is not configured or is disabled.");
-		assertTokenDanceConnection(this.config.generation);
+		assertTokenDanceConnection(this.config.generation, this.prefix);
 		const parsed = parseModelId(model);
 		if (parsed.provider && parsed.provider !== "tokendance")
 			throw new Error("Invalid TokenDance model namespace.");
-		const catalog = getTokenDanceCatalogModels().find((entry) => entry.id === parsed.model);
+		const catalog = getTokenDanceCatalogModels(this.prefix).find(
+			(entry) => entry.id === parsed.model,
+		);
 		// 设置页为这个模型显式选的协议优先于目录推荐。模型仍必须在目录里，否则没有上下文长度。
 		const override = resolveModelProtocol("tokendance", model);
 		const recommended = catalog && selectTokenDanceProtocol(catalog.supported_protocols);
@@ -241,7 +249,7 @@ export class TokenDanceProvider implements ProviderAdapter {
 			defaultContextWindow: catalog.context_length,
 			baseUrl: `${TOKENDANCE_ORIGIN}/gateway/v1`,
 		};
-		const transport = tokenDanceTransport(this.config.apiKey, this.config.generation);
+		const transport = tokenDanceTransport(this.config.apiKey, this.config.generation, this.prefix);
 		const source = `tokendance:${protocol}`;
 		if (protocol === "anthropic-messages") {
 			const delegate = new AnthropicProvider({ ...config, officialApi: false }, transport);

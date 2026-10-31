@@ -2,12 +2,16 @@ import type { TokenDanceCatalogModel, TokenDanceRecoveryAction } from "@shared/t
 
 /** Dependency-free runtime bridge: service binds it without importing settings into providers. */
 export interface TokenDanceRuntime {
-	getTokenDanceRuntimeConfig():
-		| { apiKey: string; generation: number; disabled: boolean }
-		| undefined;
-	assertTokenDanceConnection(generation: number): void;
-	registerTokenDanceRequest(controller: AbortController, generation: number): () => void;
-	getTokenDanceCatalogModels(): TokenDanceCatalogModel[];
+	getTokenDanceRuntimeConfig(
+		prefix?: string,
+	): { apiKey: string; generation: number; disabled: boolean } | undefined;
+	assertTokenDanceConnection(generation: number, prefix?: string): void;
+	registerTokenDanceRequest(
+		controller: AbortController,
+		generation: number,
+		prefix?: string,
+	): () => void;
+	getTokenDanceCatalogModels(prefix?: string): TokenDanceCatalogModel[];
 	setTokenDanceRecoveryAction?(
 		action: TokenDanceRecoveryAction | undefined,
 		generation: number,
@@ -20,11 +24,11 @@ export function registerTokenDanceRuntime(value: TokenDanceRuntime): () => void 
 		if (runtime === value) runtime = undefined;
 	};
 }
-export function getTokenDanceRuntimeConfig() {
-	return runtime?.getTokenDanceRuntimeConfig();
+export function getTokenDanceRuntimeConfig(prefix?: string) {
+	return runtime?.getTokenDanceRuntimeConfig(prefix);
 }
-export function getTokenDanceCatalogModels(): TokenDanceCatalogModel[] {
-	return runtime?.getTokenDanceCatalogModels() ?? [];
+export function getTokenDanceCatalogModels(prefix?: string): TokenDanceCatalogModel[] {
+	return runtime?.getTokenDanceCatalogModels(prefix) ?? [];
 }
 export function setTokenDanceRecoveryAction(
 	action: TokenDanceRecoveryAction | undefined,
@@ -32,15 +36,16 @@ export function setTokenDanceRecoveryAction(
 ): void {
 	runtime?.setTokenDanceRecoveryAction?.(action, generation);
 }
-export function assertTokenDanceConnection(generation: number): void {
+export function assertTokenDanceConnection(generation: number, prefix?: string): void {
 	if (!runtime) throw new Error("TokenDance connection is not configured.");
-	runtime.assertTokenDanceConnection(generation);
+	runtime.assertTokenDanceConnection(generation, prefix);
 }
 export function registerTokenDanceRequest(
 	controller: AbortController,
 	generation: number,
+	prefix?: string,
 ): () => void {
-	assertTokenDanceConnection(generation);
+	assertTokenDanceConnection(generation, prefix);
 	if (!runtime) throw new Error("TokenDance connection is not configured.");
-	return runtime.registerTokenDanceRequest(controller, generation);
+	return runtime.registerTokenDanceRequest(controller, generation, prefix);
 }
