@@ -1,6 +1,6 @@
 {
-  "id": "87e33132-68f8-41ad-9605-925309958431",
-  "prevId": "b47d28e4-7316-4e38-9be4-f1a8e6511385",
+  "id": "bd8f3b5a-6c96-4b74-bff1-338684760faf",
+  "prevId": "87e33132-68f8-41ad-9605-925309958431",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -14883,6 +14883,13 @@
           "primaryKey": false,
           "notNull": true,
           "default": "'inherit'"
+        },
+        "task_backend": {
+          "name": "task_backend",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "default": "'spec'"
         },
         "message_count": {
           "name": "message_count",

@@ -1,0 +1,1 @@
+ALTER TABLE "narrators" ADD COLUMN "task_backend" text DEFAULT 'spec' NOT NULL;

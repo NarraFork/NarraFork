@@ -376,6 +376,14 @@
 			"prevId": "b47d28e4-7316-4e38-9be4-f1a8e6511385",
 			"version": "7",
 			"snapshotDigest": "a1bccd52e606b667f8ccbcc44ffe135c3c9339b242019b0bfb1a8e8c621c2c26"
+		},
+		{
+			"idx": 47,
+			"tag": "0047_narrator_task_backend",
+			"id": "bd8f3b5a-6c96-4b74-bff1-338684760faf",
+			"prevId": "87e33132-68f8-41ad-9605-925309958431",
+			"version": "7",
+			"snapshotDigest": "8814ae9752c2474cb733a303cf7cadf94923fca6eaae2eff6b57a82c15bc02df"
 		}
 	]
 }
