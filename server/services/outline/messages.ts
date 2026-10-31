@@ -63,6 +63,9 @@ export const OUTLINE_TEXT = {
 	/** Summary of the lease expiry job's commit. */
 	leaseExpiredSummary: (n: number) =>
 		n === 1 ? "lease expired: 1 task reopened" : `lease expired: ${n} tasks reopened`,
+	/** Summary of the lease job's commit that reopens tasks in progress nobody was holding. */
+	unclaimedReopenedSummary: (n: number) =>
+		`nobody was doing it: ${n === 1 ? "1 task" : `${n} tasks`} reopened`,
 	/**
 	 * The block written under a task reopened because the session doing it (or the session its
 	 * subagent belongs to) was archived or deleted.

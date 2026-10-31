@@ -18,7 +18,12 @@ import {
 	runOutlineInProcessRebuild,
 } from "../in-process";
 import { keepOutlineTaskLeases, outlineLeaseKeepersOf } from "../lease-keeper";
-import { OUTLINE_LIMITS, OUTLINE_TASK_IDLE_LEASE_MS, OUTLINE_TASK_LEASE } from "../model";
+import {
+	OUTLINE_LIMITS,
+	OUTLINE_TASK_IDLE_LEASE_MS,
+	OUTLINE_TASK_LEASE,
+	type OutlineTaskJson,
+} from "../model";
 import { revertCommit } from "../revert";
 import type { OutlineSpaceRow, OutlineStore, OutlineTaskClaimRow } from "../store/port";
 import {
@@ -35,6 +40,7 @@ import {
 } from "../tasks";
 import {
 	type OutlineOp,
+	type OutlineTaskPatch,
 	type OutlineWriteInput,
 	type OutlineWriteResult,
 	writeOutline,
@@ -969,6 +975,380 @@ export const OUTLINE_TASK_CONTRACT: ContractCase[] = [
 			expect(await expireOutlineTaskLeases({ store: ctx.store, now: at(t0, 3 * 24 * 60) })).toEqual(
 				{ reopened: 0, skipped: 0, failed: 0 },
 			);
+			checkSpaceInvariants(await ctx.dump(space.id));
+		},
+	},
+	{
+		name: "revert: undoing a change of only a task's due date, assignee or prerequisites puts that back and claims nothing",
+		async run(ctx) {
+			const { space, n1, ids } = await setup(ctx);
+			const user = await ctx.seedUser();
+			const t0 = "2008-01-01T00:00:00.000Z";
+			const undo = (commitId: string, minute: number) =>
+				revertCommit(
+					{ commitId, actor: { kind: "human", id: user }, responsibleUserId: user },
+					{ store: ctx.store, now: () => at(t0, minute) },
+				);
+			const dep = await write(
+				ctx,
+				space,
+				n1,
+				[{ op: "insert", parent: null, content: "before it", task: { status: "todo" } }],
+				at(t0, 0),
+			);
+			const depAddress = `${space.key}/${dep.results[0]?.sid}`;
+			const changes: Array<[string, OutlineTaskPatch]> = [
+				["due", { due: "2008-02-01" }],
+				["assignee", { assignee: "agent:helper" }],
+				["depends", { depends: [{ target: depAddress, label: null }] }],
+			];
+			const lapsed: string[] = [];
+			for (const [field, patch] of changes) {
+				// The session is doing two tasks; it changes only this field of each.
+				const r = await write(
+					ctx,
+					space,
+					n1,
+					[
+						{ op: "insert", parent: null, content: `${field} live`, task: { status: "doing" } },
+						{ op: "insert", parent: null, content: `${field} lapsed`, task: { status: "doing" } },
+					],
+					at(t0, 0),
+				);
+				const [live, late] = r.results.map((x) => x.blockId) as [string, string];
+				const before = new Map<string, OutlineTaskClaimRow>();
+				for (const id of [live, late])
+					before.set(id, (await claimOf(ctx, id)) as OutlineTaskClaimRow);
+				const tasksBefore = new Map<string, OutlineTaskJson | null | undefined>();
+				for (const id of [live, late])
+					tasksBefore.set(id, (await ctx.store.getBlock(id))?.taskJson);
+				// A person undoes the change while the session's lease runs: written, the claim
+				// untouched (no refusal: putting a field back is not starting the task).
+				const changed = await write(
+					ctx,
+					space,
+					n1,
+					[{ op: "setTask", block: { id: live }, task: patch }],
+					at(t0, 1),
+				);
+				const undone = await undo(changed.commit?.id as string, 2);
+				expect(undone.commit).not.toBeNull();
+				expect((await ctx.store.getBlock(live))?.taskJson).toEqual(tasksBefore.get(live));
+				expect(await claimOf(ctx, live)).toEqual(before.get(live) as OutlineTaskClaimRow);
+				// Undone after the session's lease lapsed (the expiry job has not run yet): the task
+				// is not handed back to the session on a new lease; the lapsed one is the expiry
+				// job's to end.
+				const late1 = await write(
+					ctx,
+					space,
+					n1,
+					[{ op: "setTask", block: { id: late }, task: patch }],
+					at(t0, 4),
+				);
+				await undo(late1.commit?.id as string, 15);
+				expect((await ctx.store.getBlock(late))?.taskJson).toEqual(tasksBefore.get(late));
+				expect(await claimOf(ctx, late)).toEqual(before.get(late) as OutlineTaskClaimRow);
+				lapsed.push(live, late);
+			}
+			// Every lease ran out at minute 10: the expiry job reopens all six, as for any session
+			// that went away.
+			expect(await expireOutlineTaskLeases({ store: ctx.store, now: at(t0, 16) })).toEqual({
+				reopened: 6,
+				skipped: 0,
+				failed: 0,
+			});
+			for (const id of lapsed)
+				expect(await claimOf(ctx, id)).toMatchObject({
+					holderNarratorId: null,
+					lastHolderNarratorId: ids.n1,
+				});
+			checkSpaceInvariants(await ctx.dump(space.id));
+		},
+	},
+	{
+		name: "session end: nothing is handed back to an archived session, whichever comes first, a run's end or the archiving",
+		async run(ctx) {
+			resetOutlineLeaseExpiryBackoffForTests();
+			const { space } = await setup(ctx);
+			const user = await ctx.seedUser();
+			const person: Writer = { kind: "human", userId: user };
+			const t0 = "2010-01-01T00:00:00.000Z";
+			const stopRun = async (narratorId: string, minute: number) => {
+				const run = keepOutlineTaskLeases(narratorId, {
+					store: ctx.store,
+					now: () => at(t0, minute).getTime(),
+					enabled: () => true,
+					intervalMs: 0,
+				});
+				await run.touch();
+				await run.stop();
+			};
+			const released = async (task: string) => {
+				expect((await ctx.store.getBlock(task))?.taskJson?.status).toBe("todo");
+				expect(await claimOf(ctx, task)).toMatchObject({
+					holderNarratorId: null,
+					holderUserId: null,
+					expiresAt: null,
+				});
+				expect((await ctx.store.listChildren(space.id, task, 10)).at(-1)?.content).toContain(
+					"was archived",
+				);
+			};
+
+			// A background subagent goes on after its root was archived; it starts the task again
+			// and its run ends: released, not handed to the archived root.
+			const root = await ctx.seedNarrator();
+			const sub = await ctx.seedNarrator({ parentId: root, rootId: root });
+			const S: Writer = { kind: "agent", narratorId: sub };
+			const r = await write(
+				ctx,
+				space,
+				S,
+				[{ op: "insert", parent: null, content: "background", task: { status: "doing" } }],
+				at(t0, 0),
+			);
+			const bg = r.results[0]?.blockId as string;
+			await ctx.archiveNarrator(root);
+			expect(
+				(
+					await releaseOutlineSessionTaskClaims(root, "archived", {
+						store: ctx.store,
+						now: at(t0, 1),
+					})
+				).reopened,
+			).toBe(1);
+			await write(ctx, space, S, [doing(bg)], at(t0, 2));
+			await stopRun(sub, 3);
+			await released(bg);
+			expect((await claimOf(ctx, bg))?.lastHolderNarratorId).toBe(sub);
+			// The run of the archived root itself ending holds nothing either.
+			await stopRun(root, 3);
+			await released(bg);
+
+			// Undoing that release: the archived session is as gone; the person undoing it does it.
+			const release = (await ctx.store.listCommits(space.id, { limit: 100 })).at(-1);
+			expect(release?.summary).toBe("session archived: 1 task reopened");
+			await revertCommit(
+				{
+					commitId: release?.id as string,
+					actor: { kind: "human", id: user },
+					responsibleUserId: user,
+				},
+				{ store: ctx.store, now: () => at(t0, 4) },
+			);
+			expect((await ctx.store.getBlock(bg))?.taskJson?.status).toBe("doing");
+			expect(await claimOf(ctx, bg)).toMatchObject({
+				holderUserId: user,
+				holderNarratorId: null,
+				expiresAt: null,
+			});
+			await write(ctx, space, person, [status(bg, "done")], at(t0, 5));
+
+			// A subagent archived during its run (its root goes on): released whether its run's
+			// end or the archiving's release comes first; nothing goes to the root.
+			const live = await ctx.seedNarrator();
+			const first = await ctx.seedNarrator({ parentId: live, rootId: live });
+			const second = await ctx.seedNarrator({ parentId: live, rootId: live });
+			const tasks: string[] = [];
+			for (const narratorId of [first, second]) {
+				const w = await write(
+					ctx,
+					space,
+					{ kind: "agent", narratorId },
+					[{ op: "insert", parent: null, content: "step", task: { status: "doing" } }],
+					at(t0, 6),
+				);
+				tasks.push(w.results[0]?.blockId as string);
+				await ctx.archiveNarrator(narratorId);
+			}
+			const [one, two] = tasks as [string, string];
+			// The archiving's release first, then the run's end.
+			expect(
+				(
+					await releaseOutlineSessionTaskClaims(first, "archived", {
+						store: ctx.store,
+						now: at(t0, 7),
+					})
+				).reopened,
+			).toBe(1);
+			await stopRun(first, 8);
+			await released(one);
+			// The run's end first, then the archiving's release (which finds nothing left).
+			await stopRun(second, 7);
+			await released(two);
+			expect(
+				(
+					await releaseOutlineSessionTaskClaims(second, "archived", {
+						store: ctx.store,
+						now: at(t0, 8),
+					})
+				).reopened,
+			).toBe(0);
+			for (const task of tasks) expect((await claimOf(ctx, task))?.holderNarratorId).toBeNull();
+			// Nothing of this case is left held.
+			expect(await expireOutlineTaskLeases({ store: ctx.store, now: at(t0, 3 * 24 * 60) })).toEqual(
+				{ reopened: 0, skipped: 0, failed: 0 },
+			);
+			checkSpaceInvariants(await ctx.dump(space.id));
+		},
+	},
+	{
+		name: "revert: work of the writer's own session goes back to the writer itself, on the running lease",
+		async run(ctx) {
+			const { space, n2, ids } = await setup(ctx);
+			const root = await ctx.seedNarrator();
+			const sub = await ctx.seedNarrator({ parentId: root, rootId: root });
+			const R: Writer = { kind: "agent", narratorId: root };
+			const S: Writer = { kind: "agent", narratorId: sub };
+			const t0 = "2012-01-01T00:00:00.000Z";
+			const undo = (commitId: string, narratorId: string, minute: number) =>
+				revertCommit(
+					{
+						commitId,
+						actor: { kind: "agent", id: narratorId },
+						narratorId,
+						responsibleUserId: null,
+					},
+					{ store: ctx.store, now: () => at(t0, minute) },
+				);
+			const r = await write(
+				ctx,
+				space,
+				R,
+				[
+					{ op: "insert", parent: null, content: "root's", task: { status: "doing" } },
+					{ op: "insert", parent: null, content: "own", task: { status: "todo" } },
+					{ op: "insert", parent: null, content: "other's", task: { status: "todo" } },
+				],
+				at(t0, 0),
+			);
+			const [rootTask, own, others] = r.results.map((x) => x.blockId) as [string, string, string];
+			// The root finished its task; its subagent undoes that: the subagent does it now.
+			const finished = await write(ctx, space, R, [status(rootTask, "done")], at(t0, 1));
+			await undo(finished.commit?.id as string, sub, 2);
+			expect(await claimOf(ctx, rootTask)).toMatchObject({
+				holderNarratorId: sub,
+				expiresAt: at(t0, 12).toISOString(),
+			});
+			// The subagent's own "done", undone by itself in a commit that also gives another
+			// session's task back: its own goes to itself (running lease), the other's to that
+			// session (idle lease).
+			await write(ctx, space, S, [doing(own)], at(t0, 3));
+			await write(ctx, space, n2, [doing(others)], at(t0, 3));
+			const both = await write(
+				ctx,
+				space,
+				S,
+				[status(own, "done"), status(others, "done")],
+				at(t0, 14),
+			);
+			await undo(both.commit?.id as string, sub, 15);
+			expect(await claimOf(ctx, own)).toMatchObject({
+				holderNarratorId: sub,
+				expiresAt: at(t0, 25).toISOString(),
+			});
+			expect(await claimOf(ctx, others)).toMatchObject({
+				holderNarratorId: ids.n2,
+				expiresAt: at(t0, 15 + OUTLINE_TASK_IDLE_LEASE_MS / MINUTE).toISOString(),
+			});
+			// Cleaned up: nothing of this case is left held.
+			await write(ctx, space, S, [status(rootTask, "done"), status(own, "done")], at(t0, 16));
+			await write(ctx, space, n2, [status(others, "done")], at(t0, 16));
+			checkSpaceInvariants(await ctx.dump(space.id));
+		},
+	},
+	{
+		name: "claims: a fork is a session of its own, not one holder with the session it was forked from",
+		async run(ctx) {
+			const { space } = await setup(ctx);
+			const original = await ctx.seedNarrator();
+			const fork = await ctx.seedNarrator({ forkOf: original });
+			const O: Writer = { kind: "agent", narratorId: original };
+			const F: Writer = { kind: "agent", narratorId: fork };
+			const t0 = "2014-01-01T00:00:00.000Z";
+			const r = await write(
+				ctx,
+				space,
+				O,
+				[
+					{ op: "insert", parent: null, content: "original's", task: { status: "doing" } },
+					{ op: "insert", parent: null, content: "fork's", task: { status: "todo" } },
+				],
+				at(t0, 0),
+			);
+			const [mine, theirs] = r.results.map((x) => x.blockId) as [string, string];
+			// The fork can neither start nor end what the original is doing.
+			const taken = await refused(write(ctx, space, F, [doing(mine)], at(t0, 1)));
+			expect(taken.holder).toMatchObject({ kind: "agent", narratorId: original });
+			await refused(write(ctx, space, F, [status(mine, "done")], at(t0, 1)));
+			await write(ctx, space, F, [doing(theirs)], at(t0, 1));
+			// The fork's run ends: what it holds stays its own (not handed to the original).
+			const run = keepOutlineTaskLeases(fork, {
+				store: ctx.store,
+				now: () => at(t0, 2).getTime(),
+				enabled: () => true,
+				intervalMs: 0,
+			});
+			await run.stop();
+			expect(await claimOf(ctx, theirs)).toMatchObject({
+				holderNarratorId: fork,
+				expiresAt: at(t0, 2 + OUTLINE_TASK_IDLE_LEASE_MS / MINUTE).toISOString(),
+			});
+			// Archiving the original lets go of its own work only.
+			expect(
+				(
+					await releaseOutlineSessionTaskClaims(original, "archived", {
+						store: ctx.store,
+						now: at(t0, 3),
+					})
+				).reopened,
+			).toBe(1);
+			expect((await claimOf(ctx, mine))?.holderNarratorId).toBeNull();
+			expect((await claimOf(ctx, theirs))?.holderNarratorId).toBe(fork);
+			await write(ctx, space, F, [status(theirs, "done")], at(t0, 4));
+			checkSpaceInvariants(await ctx.dump(space.id));
+		},
+	},
+	{
+		name: "concurrency: people ending a session's tasks while it renews and writes: every write lands",
+		async run(ctx) {
+			const { space, n1, ids } = await setup(ctx);
+			const users = await Promise.all([ctx.seedUser(), ctx.seedUser()]);
+			const rnd = mulberry32(11);
+			for (let round = 0; round < 6; round++) {
+				const r = await write(
+					ctx,
+					space,
+					n1,
+					Array.from({ length: 4 }, (_, i) => ({
+						op: "insert" as const,
+						parent: null,
+						content: `r${round} t${i}`,
+						task: { status: "doing" as const },
+					})),
+				);
+				const tasks = r.results.map((x) => x.blockId) as string[];
+				const jobs: Array<Promise<unknown>> = [
+					renewOutlineTaskLeases(ids.n1, { store: ctx.store }),
+					write(ctx, space, n1, [{ op: "insert", parent: null, content: `r${round} note` }]),
+				];
+				for (const [i, task] of tasks.entries()) {
+					const userId = users[i % 2] as string;
+					jobs.push(
+						(async () => {
+							await new Promise((resolve) => setTimeout(resolve, Math.floor(rnd() * 3)));
+							return await write(ctx, space, { kind: "human", userId }, [status(task, "done")]);
+						})(),
+					);
+				}
+				for (const outcome of await Promise.allSettled(jobs))
+					expect(outcome.status).toBe("fulfilled");
+				for (const task of tasks)
+					expect(await claimOf(ctx, task)).toMatchObject({
+						holderNarratorId: null,
+						lastHolderNarratorId: ids.n1,
+					});
+			}
 			checkSpaceInvariants(await ctx.dump(space.id));
 		},
 	},

@@ -56,10 +56,15 @@ export interface OutlineContractContext {
 	seedUser(): Promise<string>;
 	seedProject(): Promise<string>;
 	/**
-	 * A session; with `subagent`, a subagent as the runtime records one: its parent, and its root
-	 * as `acl_root_narrator_id`.
+	 * A session; with `parentId` and `rootId`, a subagent as the runtime records one: its parent,
+	 * and its root as `acl_root_narrator_id`; with `forkOf`, a fork as an ordinary fork records
+	 * one: a session of its own whose parent is the session it was forked from.
 	 */
-	seedNarrator(subagent?: { parentId: string; rootId: string }): Promise<string>;
+	seedNarrator(
+		related?: { parentId: string; rootId: string } | { forkOf: string },
+	): Promise<string>;
+	/** Mark a narrator archived (its row's status, as archiving it writes it). */
+	archiveNarrator(narratorId: string): Promise<void>;
 	/** Every row of one space, read straight from the tables. */
 	dump(spaceId: string): Promise<SpaceDump>;
 	/** Ids of blocks whose indexed content contains `needle` (3+ characters). */

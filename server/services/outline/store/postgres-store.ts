@@ -58,7 +58,9 @@ import type {
 import {
 	chunked,
 	claimsAsExpected,
-	expectedClaimIds,
+	lockedClaimIds,
+	type NarratorStateRow,
+	narratorSessions,
 	OUTLINE_RENEW_LIMIT,
 	type OutlineBlockMeta,
 	type OutlineBlockRow,
@@ -312,10 +314,11 @@ async function applyCommitSection(
 ): Promise<"applied" | "stale" | "claims"> {
 	const { seq } = plan;
 	// The claims the plan read must still be as read (a lease renewed since may have made a
-	// takeover wrong). Their rows are locked first, in id order, so a renewal waits for this
-	// commit and every commit takes claim rows before the space row.
-	const expected = expectedClaimIds(plan);
-	if (expected.length > 0 && !claimsAsExpected(plan, await lockClaims(tx, expected))) {
+	// takeover wrong). Their rows, and those it releases without checking (a person ending
+	// someone else's task), are locked first, in id order, so a renewal waits for this commit
+	// and every commit takes claim rows before the space row.
+	const locked = lockedClaimIds(plan);
+	if (locked.length > 0 && !claimsAsExpected(plan, await lockClaims(tx, locked))) {
 		return "claims";
 	}
 	// The counter and the in-process epoch are claimed together; a commit that cannot keep its
@@ -1039,20 +1042,42 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 		},
 
 		async getNarratorRoots(narratorIds) {
-			const out = new Map<string, string>();
-			for (const ids of chunked([...new Set(narratorIds)])) {
-				const rows = await db
-					.select({
-						id: narrators.id,
-						type: narrators.type,
-						root: narrators.aclRootNarratorId,
-					})
-					.from(narrators)
-					.where(inArray(narrators.id, ids));
-				for (const row of rows)
-					out.set(row.id, row.type === "subagent" && row.root ? row.root : row.id);
-			}
-			return out;
+			const read = async (ids: readonly string[]): Promise<NarratorStateRow[]> => {
+				const rows: NarratorStateRow[] = [];
+				for (const chunk of chunked([...new Set(ids)])) {
+					rows.push(
+						...(await db
+							.select({
+								id: narrators.id,
+								type: narrators.type,
+								root: narrators.aclRootNarratorId,
+								status: narrators.status,
+							})
+							.from(narrators)
+							.where(inArray(narrators.id, chunk))),
+					);
+				}
+				return rows;
+			};
+			return await narratorSessions(await read(narratorIds), read);
+		},
+
+		async listTaskClaimHolders({ after, limit }) {
+			// The literal `IS NOT NULL` lets the planner use the partial holder index; ids compare
+			// in the index's collation, so the cursor and the order agree.
+			const rows = await db
+				.selectDistinct({ holder: outlineTaskClaims.holderNarratorId })
+				.from(outlineTaskClaims)
+				.where(
+					and(
+						isNotNull(outlineTaskClaims.holderNarratorId),
+						after ? gt(outlineTaskClaims.holderNarratorId, after) : undefined,
+					),
+				)
+				.orderBy(asc(outlineTaskClaims.holderNarratorId))
+				.limit(limit);
+			const holders = rows.map((r) => r.holder as string);
+			return { holders, next: holders.length < limit ? null : (holders.at(-1) ?? null) };
 		},
 
 		async getInProcessState(spaceIds) {

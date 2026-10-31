@@ -333,6 +333,16 @@ export function sameClaimRow(
 	);
 }
 
+/**
+ * Ids of the claim rows a commit locks before the space row (PostgreSQL), sorted: those it
+ * expects to find as read and those it releases without checking (a person ending someone else's
+ * task), so a commit never takes a claim row after the space row and never waits in a cycle
+ * with a writer that took them in the other order.
+ */
+export function lockedClaimIds(plan: OutlineCommitPlan): string[] {
+	return [...new Set([...expectedClaimIds(plan), ...plan.claims.release])].sort();
+}
+
 /** Ids of the claim rows a plan expects to find as read, sorted (the order rows are locked in). */
 export function expectedClaimIds(plan: OutlineCommitPlan): string[] {
 	const ids = [
@@ -375,6 +385,49 @@ export interface OutlineUnclaimedTask {
 	spaceId: string;
 	/** Its claim row (released), or null when it never had one (written before claims existed). */
 	claim: OutlineTaskClaimRow | null;
+}
+
+/** The session a narrator belongs to (`getNarratorRoots`). */
+export interface OutlineNarratorSession {
+	/** A subagent's root; anyone else's own id. */
+	root: string;
+	/** The narrator itself is archived. */
+	archived: boolean;
+	/** The session it belongs to is archived (for a session, the same as `archived`). */
+	sessionArchived: boolean;
+}
+
+/** What `getNarratorRoots` reads of a narrator. */
+export interface NarratorStateRow {
+	id: string;
+	type: string;
+	root: string | null;
+	status: string;
+}
+
+/**
+ * Sessions of the narrators read (`rows`), reading the roots not among them with `readRoots`
+ * (primary keys): the store-independent half of `getNarratorRoots`.
+ */
+export async function narratorSessions(
+	rows: readonly NarratorStateRow[],
+	readRoots: (ids: string[]) => NarratorStateRow[] | Promise<NarratorStateRow[]>,
+): Promise<Map<string, OutlineNarratorSession>> {
+	const known = new Map(rows.map((r) => [r.id, r]));
+	const rootOf = (r: NarratorStateRow) => (r.type === "subagent" && r.root ? r.root : r.id);
+	const missing = [...new Set(rows.map(rootOf))].filter((id) => !known.has(id));
+	if (missing.length > 0) for (const r of await readRoots(missing)) known.set(r.id, r);
+	const out = new Map<string, OutlineNarratorSession>();
+	for (const r of rows) {
+		const root = rootOf(r);
+		const archived = r.status === "archived";
+		out.set(r.id, {
+			root,
+			archived,
+			sessionArchived: root === r.id ? archived : known.get(root)?.status === "archived",
+		});
+	}
+	return out;
 }
 
 /** A task a session holds a claim on, with the task's block. */
@@ -509,10 +562,20 @@ export interface OutlineStore extends WritePortIdentity, OutlineReadPort {
 	}): Promise<{ tasks: OutlineUnclaimedTask[]; next: string | null }>;
 	/**
 	 * The session each narrator belongs to: a subagent's root (`acl_root_narrator_id`, the one
-	 * authority on it), anyone else's own id. Narrators that do not exist are left out. One
-	 * primary-key read per chunk of ids.
+	 * authority on it), anyone else's own id; and whether it or that session is archived.
+	 * Narrators that do not exist are left out. Primary-key reads: one per chunk of ids, and one
+	 * per chunk of roots not among them.
 	 */
-	getNarratorRoots(narratorIds: readonly string[]): Promise<Map<string, string>>;
+	getNarratorRoots(narratorIds: readonly string[]): Promise<Map<string, OutlineNarratorSession>>;
+	/**
+	 * Distinct sessions holding claims, by id after `after`, at most `limit` (the holder index,
+	 * read in order): the lease job's sweep for claims of sessions that ended while nobody was
+	 * listening. `next` is where the following sweep starts, null once the end was reached.
+	 */
+	listTaskClaimHolders(options: {
+		after: string | null;
+		limit: number;
+	}): Promise<{ holders: string[]; next: string | null }>;
 
 	/** Of the given spaces: whether their `in_process` answers are derived, and their epoch. */
 	getInProcessState(

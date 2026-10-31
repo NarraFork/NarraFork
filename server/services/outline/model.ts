@@ -110,7 +110,10 @@ export const OUTLINE_LIMITS = {
 
 /**
  * Task claims (design §4.5, §7.2): a session's claim is a lease it renews while it runs; one that
- * is not renewed runs out and a background job reopens the task.
+ * is not renewed runs out and a background job reopens the task. The short running lease is what
+ * gives a crashed server's tasks back soon. A run that hangs without crashing keeps renewing (its
+ * keeper's timer runs until the run ends), so it keeps its tasks: a watchdog for that is left
+ * for later.
  */
 export const OUTLINE_TASK_LEASE = {
 	/** How long a running session's claim lasts without a renewal. */

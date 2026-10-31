@@ -55,6 +55,8 @@ import {
 	chunked,
 	claimsAsExpected,
 	expectedClaimIds,
+	type NarratorStateRow,
+	narratorSessions,
 	OUTLINE_RENEW_LIMIT,
 	type OutlineBlockMeta,
 	type OutlineBlockRow,
@@ -958,20 +960,43 @@ export const sqliteOutlineStore: OutlineStore = {
 	},
 
 	async getNarratorRoots(narratorIds) {
-		const out = new Map<string, string>();
-		for (const ids of chunked([...new Set(narratorIds)])) {
-			for (const row of db
-				.select({
-					id: narrators.id,
-					type: narrators.type,
-					root: narrators.aclRootNarratorId,
-				})
-				.from(narrators)
-				.where(inArray(narrators.id, ids))
-				.all())
-				out.set(row.id, row.type === "subagent" && row.root ? row.root : row.id);
-		}
-		return out;
+		const read = (ids: readonly string[]): NarratorStateRow[] => {
+			const rows: NarratorStateRow[] = [];
+			for (const chunk of chunked([...new Set(ids)])) {
+				rows.push(
+					...db
+						.select({
+							id: narrators.id,
+							type: narrators.type,
+							root: narrators.aclRootNarratorId,
+							status: narrators.status,
+						})
+						.from(narrators)
+						.where(inArray(narrators.id, chunk))
+						.all(),
+				);
+			}
+			return rows;
+		};
+		return await narratorSessions(read(narratorIds), read);
+	},
+
+	async listTaskClaimHolders({ after, limit }) {
+		// The literal `IS NOT NULL` lets the planner use the partial holder index, in its order.
+		const rows = db
+			.selectDistinct({ holder: outlineTaskClaims.holderNarratorId })
+			.from(outlineTaskClaims)
+			.where(
+				and(
+					isNotNull(outlineTaskClaims.holderNarratorId),
+					after ? gt(outlineTaskClaims.holderNarratorId, after) : undefined,
+				),
+			)
+			.orderBy(asc(outlineTaskClaims.holderNarratorId))
+			.limit(limit)
+			.all();
+		const holders = rows.map((r) => r.holder as string);
+		return { holders, next: holders.length < limit ? null : (holders.at(-1) ?? null) };
 	},
 
 	async getInProcessState(spaceIds) {

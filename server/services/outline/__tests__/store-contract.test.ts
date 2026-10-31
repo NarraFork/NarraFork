@@ -48,22 +48,27 @@ const ctx: OutlineContractContext = {
 		await db.insert(projects).values({ id, name: `outline-${id}`, createdAt: NOW, updatedAt: NOW });
 		return id;
 	},
-	async seedNarrator(subagent) {
+	async seedNarrator(related) {
 		const id = generateId();
 		await db.insert(narrators).values({
 			id,
 			title: "outline",
 			createdAt: NOW,
 			updatedAt: NOW,
-			...(subagent
-				? {
-						type: "subagent" as const,
-						parentNarratorId: subagent.parentId,
-						aclRootNarratorId: subagent.rootId,
-					}
-				: {}),
+			...(related && "forkOf" in related
+				? { parentNarratorId: related.forkOf }
+				: related
+					? {
+							type: "subagent" as const,
+							parentNarratorId: related.parentId,
+							aclRootNarratorId: related.rootId,
+						}
+					: {}),
 		});
 		return id;
+	},
+	async archiveNarrator(narratorId) {
+		await db.update(narrators).set({ status: "archived" }).where(eq(narrators.id, narratorId));
 	},
 	async dump(spaceId) {
 		const space = await sqliteOutlineStore.getSpace(spaceId);
@@ -205,6 +210,15 @@ describe("SQLite specifics", () => {
 		expect(subagents).toContain("idx_outline_task_claims_holder");
 		expect(subagents).toContain("idx_narrators_acl_root");
 		expect(subagents).not.toMatch(/SCAN (c|narrators|outline_task_claims)\b/);
+		// The lease job's sweep of claim holders: the holder index, in its order, no sort.
+		const holders = plan(
+			`SELECT DISTINCT "holder_narrator_id" FROM "outline_task_claims" WHERE ("outline_task_claims"."holder_narrator_id" IS NOT NULL AND "outline_task_claims"."holder_narrator_id" > 'a') ORDER BY "outline_task_claims"."holder_narrator_id" ASC LIMIT 5`,
+		);
+		expect(holders).toContain("idx_outline_task_claims_holder");
+		expect(holders).not.toContain("TEMP B-TREE");
+		expect(
+			plan(`SELECT id, type, acl_root_narrator_id, status FROM narrators WHERE id IN ('a', 'b')`),
+		).toMatch(/PRIMARY KEY|sqlite_autoindex_narrators/);
 	});
 
 	test("a page past the main-thread size is read on the workers, truncation exact", async () => {

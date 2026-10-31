@@ -1,8 +1,9 @@
 /**
  * Keeping a running session's task leases alive (design §4.5, §7.2): a session that set a task in
  * progress holds it on a lease of {@link OUTLINE_TASK_LEASE.leaseMs}; while the session runs, its
- * leases are renewed every {@link OUTLINE_TASK_LEASE.renewEveryMs}, so a run that crashed or hangs
- * loses its tasks to the expiry job soon.
+ * leases are renewed every {@link OUTLINE_TASK_LEASE.renewEveryMs}, so the runs of a server that
+ * crashed lose their tasks to the expiry job soon. The timer renews until the run ends, so a run
+ * that hangs without ending keeps its tasks (no watchdog yet).
  *
  * The agent runtime keeps one keeper per run (`agent-runtime/orchestrator.ts`): it renews when the
  * run starts, at each tool boundary and on a timer while a long tool call runs, never more often
@@ -18,7 +19,8 @@
  * `OUTLINE_TASK_IDLE_LEASE_MS` (D41), and a subagent's pass to its root on that lease
  * (`idleOutlineTaskClaims`): the work belongs to the session, and the root's next run renews it
  * back to the running lease. A server that crashes stops no keeper: its leases run out after
- * `leaseMs`, as a hung run's do.
+ * `leaseMs`. An archived session (or one whose session is) holds nothing: its end lets go of
+ * its claims instead.
  */
 import { logger } from "@server/lib/logger";
 import { isOutlineEnabled } from "./feature";
@@ -36,7 +38,7 @@ export const OUTLINE_LEASE_RETRY = {
 export interface OutlineLeaseKeeper {
 	/**
 	 * Renew now unless the session renewed within `renewEveryMs`; resolves when done (or, when it
-	 * does not renew, once this keeper's renewal still on its way is).
+	 * does not renew, once the session's renewals still on their way are).
 	 */
 	touch(): Promise<void>;
 	/**
@@ -52,6 +54,31 @@ const lastRenewal = new Map<string, number>();
 const failing = new Map<string, { count: number; retryAt: number; warnedAt: number }>();
 /** Keepers running, by session: for tests and diagnostics. */
 const running = new Map<string, number>();
+/**
+ * Renewals on their way, by session, whichever of its keepers fired them: the last keeper to
+ * stop waits for all of them before the idle lease, so none lands after it and cuts it back to
+ * the running lease.
+ */
+const inFlight = new Map<string, Set<Promise<void>>>();
+
+function track(narratorId: string, renewal: Promise<void>): void {
+	let set = inFlight.get(narratorId);
+	if (!set) {
+		set = new Set();
+		inFlight.set(narratorId, set);
+	}
+	set.add(renewal);
+	void renewal.finally(() => {
+		set.delete(renewal);
+		if (set.size === 0 && inFlight.get(narratorId) === set) inFlight.delete(narratorId);
+	});
+}
+
+/** Wait until the session has no renewal on its way. */
+async function settle(narratorId: string): Promise<void> {
+	for (let set = inFlight.get(narratorId); set && set.size > 0; set = inFlight.get(narratorId))
+		await Promise.all([...set]);
+}
 
 export interface OutlineLeaseKeeperOptions {
 	store?: OutlineStore;
@@ -72,8 +99,6 @@ export function keepOutlineTaskLeases(
 	const enabled = options.enabled ?? isOutlineEnabled;
 	const store = options.store ? { store: options.store } : {};
 	let stopped = false;
-	/** This keeper's renewal on its way, if any: `stop` waits for it (see there). */
-	let inflight: Promise<void> | null = null;
 	const touch = async (): Promise<void> => {
 		if (stopped || !enabled()) return;
 		const at = clock();
@@ -81,14 +106,13 @@ export function keepOutlineTaskLeases(
 		if (failed && at < failed.retryAt) return;
 		const last = lastRenewal.get(narratorId);
 		if (!failed && last !== undefined && at - last < OUTLINE_TASK_LEASE.renewEveryMs) {
-			await inflight;
+			await settle(narratorId);
 			return;
 		}
 		lastRenewal.set(narratorId, at);
 		const renewal = renew(at, failed);
-		inflight = renewal;
+		track(narratorId, renewal);
 		await renewal;
-		if (inflight === renewal) inflight = null;
 	};
 	/** One renewal; never rejects (a failure is backed off and reported). */
 	const renew = async (
@@ -149,9 +173,10 @@ export function keepOutlineTaskLeases(
 				return;
 			}
 			running.delete(narratorId);
-			// A renewal still on its way (fired without waiting, at the last tool boundary) would
-			// land after the idle lease and cut it back to the running one: it goes first.
-			await inflight;
+			// Renewals still on their way (fired without waiting, at a tool boundary, by this or
+			// another run of the session that stopped before) would land after the idle lease and
+			// cut it back to the running one: they go first.
+			await settle(narratorId);
 			lastRenewal.delete(narratorId);
 			failing.delete(narratorId);
 			if (!enabled()) return;

@@ -56,10 +56,12 @@
  *
  * A compensating commit (a revert) puts a task back to whoever was doing it when it was ended
  * (the claim's `last_holder_narrator_id`, their session's root). Given back to a session other
- * than the writer, the claim is on the idle lease (`OUTLINE_TASK_IDLE_LEASE_MS`, D41), as every
+ * than the writer's, the claim is on the idle lease (`OUTLINE_TASK_IDLE_LEASE_MS`, D41), as every
  * hand-back: that session is most likely not running, and a run of it renews the lease back to
- * the running one. Only when that was a person, or nobody is known (or the session is gone), is
- * the writer the claimer.
+ * the running one. Work of the writer's own session goes to the writer itself (running lease).
+ * When that was a person, nobody is known, or the session is gone or archived, the writer is the
+ * claimer. A revert that puts back a task in progress already (only its other fields change)
+ * claims nothing.
  *
  * A system write for no session cannot claim, so a task it would start is left to do (reported
  * as a `task-not-started` adjustment): no task is in progress with nobody holding it.
@@ -895,6 +897,8 @@ class OutlinePlanner {
 	private readonly temp = new Map<string, string>();
 	/** Blocks an operation set to in progress, with the operation's index: claim attempts. */
 	private readonly claimIntent = new Map<string, number>();
+	/** Narrators `sessionRoots` found archived, themselves or their session. */
+	private readonly endedSessions = new Set<string>();
 	/**
 	 * The in-process answers this commit changes do not all fit in it: the space is marked for
 	 * the background rebuild instead (see `planInProcess`).
@@ -1573,8 +1577,11 @@ class OutlinePlanner {
 		if (op.task === null) block.taskJson = null;
 		else {
 			block.taskJson = this.taskFrom(block.taskJson, op.task, false, i);
-			// Naming the status `doing` is starting the task, even when it was in progress already.
-			if (op.task.status === "doing") this.noteClaim(block, i);
+			// Naming the status `doing` is starting the task, even when it was in progress already:
+			// of two writers starting it at once, the later plans again and must still be refused.
+			// A revert putting back a task that is in progress already starts nothing.
+			if (op.task.status === "doing" && !(this.compensating && doingBefore(block)))
+				this.noteClaim(block, i);
 		}
 		this.results[i] = this.result(block);
 	}
@@ -2082,11 +2089,17 @@ class OutlinePlanner {
 				throw new OutlineTaskClaimedError(id, this.address(block.sid), holderOf(row), opIndex);
 			}
 			// A revert puts the task back to whoever was doing it; otherwise the writer takes it.
+			// Work of the writer's own session goes to the writer itself, which is running.
 			const previous = this.compensating ? this.previousHolder(row, roots) : null;
-			const holder = previous ?? claimer;
+			const ownSession =
+				previous !== null &&
+				claimer.narratorId !== undefined &&
+				(previous.narratorId === claimer.narratorId ||
+					previous.narratorId === roots.get(claimer.narratorId));
+			const holder = previous !== null && !ownSession ? previous : claimer;
 			// Given back to another session, which is most likely not running: on the idle lease,
 			// as every hand-back (D41); a run of it renews that back to the running lease.
-			const handedBack = previous !== null && previous.narratorId !== claimer.narratorId;
+			const handedBack = holder !== claimer;
 			plan.put.push({
 				row: {
 					taskBlockId: id,
@@ -2124,13 +2137,21 @@ class OutlinePlanner {
 				if (id !== null && id !== self) others.add(id);
 		}
 		if (others.size === 0) return new Map();
-		return await this.store.getNarratorRoots(self ? [self, ...others] : [...others]);
+		const roots = new Map<string, string>();
+		for (const [id, session] of await this.store.getNarratorRoots(
+			self ? [self, ...others] : [...others],
+		)) {
+			roots.set(id, session.root);
+			if (session.archived || session.sessionArchived) this.endedSessions.add(id);
+		}
+		return roots;
 	}
 
 	/**
 	 * Who a revert gives a task back to: the session that was doing it when it was ended (its
-	 * root), on the idle lease unless that is the writer itself. Null (the writer takes it) when
-	 * that was a person, nobody is known, or the session no longer exists.
+	 * root), on the idle lease unless that is the writer's own session. Null (the writer takes it)
+	 * when that was a person, nobody is known, or the session no longer exists or is archived
+	 * (itself or the session it belongs to: an archived session holds nothing).
 	 */
 	private previousHolder(
 		row: OutlineTaskClaimRow | null,
@@ -2139,7 +2160,8 @@ class OutlinePlanner {
 		if (!row) return null;
 		const session =
 			row.holderNarratorId ?? (row.holderUserId === null ? row.lastHolderNarratorId : null);
-		const root = session === null ? undefined : roots.get(session);
+		if (session === null || this.endedSessions.has(session)) return null;
+		const root = roots.get(session);
 		return root === undefined ? null : { narratorId: root };
 	}
 

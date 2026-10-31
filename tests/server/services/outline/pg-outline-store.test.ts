@@ -97,22 +97,30 @@ describe("PostgreSQL outline store", () => {
 							.values({ id, name: `outline-${id}`, createdAt: NOW, updatedAt: NOW });
 						return id;
 					},
-					async seedNarrator(subagent) {
+					async seedNarrator(related) {
 						const id = generateId();
 						await pgDb.insert(pgSchema.narrators).values({
 							id,
 							title: "outline",
 							createdAt: NOW,
 							updatedAt: NOW,
-							...(subagent
-								? {
-										type: "subagent" as const,
-										parentNarratorId: subagent.parentId,
-										aclRootNarratorId: subagent.rootId,
-									}
-								: {}),
+							...(related && "forkOf" in related
+								? { parentNarratorId: related.forkOf }
+								: related
+									? {
+											type: "subagent" as const,
+											parentNarratorId: related.parentId,
+											aclRootNarratorId: related.rootId,
+										}
+									: {}),
 						});
 						return id;
+					},
+					async archiveNarrator(narratorId) {
+						await pgDb
+							.update(pgSchema.narrators)
+							.set({ status: "archived" })
+							.where(eq(pgSchema.narrators.id, narratorId));
 					},
 					async dump(spaceId): Promise<SpaceDump> {
 						const space = await store.getSpace(spaceId);
