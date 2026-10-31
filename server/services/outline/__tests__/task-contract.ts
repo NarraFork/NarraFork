@@ -18,14 +18,16 @@ import {
 	runOutlineInProcessRebuild,
 } from "../in-process";
 import { keepOutlineTaskLeases, outlineLeaseKeepersOf } from "../lease-keeper";
-import { OUTLINE_LIMITS, OUTLINE_TASK_LEASE } from "../model";
+import { OUTLINE_LIMITS, OUTLINE_TASK_IDLE_LEASE_MS, OUTLINE_TASK_LEASE } from "../model";
 import { revertCommit } from "../revert";
 import type { OutlineSpaceRow, OutlineStore, OutlineTaskClaimRow } from "../store/port";
 import {
 	deriveOutlineTaskWaits,
 	expireOutlineTaskLeases,
 	findContinuationCandidates,
+	idleOutlineTaskClaims,
 	OUTLINE_LEASE_ACTOR,
+	releaseOutlineSessionTaskClaims,
 	renewOutlineTaskLeases,
 	reopenUnclaimedOutlineTasks,
 	resetOutlineLeaseExpiryBackoffForTests,
@@ -687,7 +689,7 @@ export const OUTLINE_TASK_CONTRACT: ContractCase[] = [
 		},
 	},
 	{
-		name: "leases: a running session keeps its tasks past the lease; only one that stopped loses them",
+		name: "leases: a running session keeps its tasks past the lease; between turns it keeps them a day (idle lease); its next run is back on the running lease",
 		async run(ctx) {
 			const { space, n1, ids } = await setup(ctx);
 			const t0 = "2022-03-01T00:00:00.000Z";
@@ -695,10 +697,20 @@ export const OUTLINE_TASK_CONTRACT: ContractCase[] = [
 				ctx,
 				space,
 				n1,
-				[{ op: "insert", parent: null, content: "long job", task: { status: "doing" } }],
+				[
+					{
+						op: "insert",
+						tempId: "t",
+						parent: null,
+						content: "long job",
+						task: { status: "doing" },
+					},
+					{ op: "insert", parent: { tempId: "t" }, content: "progress so far" },
+				],
 				at(t0, 0),
 			);
-			const task = r.results[0]?.blockId as string;
+			const [task, progress] = r.results.map((x) => x.blockId) as [string, string];
+			const before = (await claimOf(ctx, task)) as OutlineTaskClaimRow;
 			let clock = Date.parse(t0);
 			const keeper = keepOutlineTaskLeases(ids.n1, {
 				store: ctx.store,
@@ -720,17 +732,243 @@ export const OUTLINE_TASK_CONTRACT: ContractCase[] = [
 				expect((await ctx.store.getBlock(task))?.taskJson?.status).toBe("doing");
 				expect((await claimOf(ctx, task))?.expiresAt).toBe(at(t0, 40).toISOString());
 			} finally {
-				keeper.stop();
+				// The turn ends at minute 30 (say the agent asked its person something and waits).
+				await keeper.stop();
 			}
 			expect(outlineLeaseKeepersOf(ids.n1)).toBe(0);
-			// Stopped at minute 30: the lease runs to minute 40, then the task is reopened.
-			expect((await expireOutlineTaskLeases({ store: ctx.store, now: at(t0, 39) })).reopened).toBe(
-				0,
-			);
-			expect((await expireOutlineTaskLeases({ store: ctx.store, now: at(t0, 41) })).reopened).toBe(
-				1,
-			);
+			const DAY = OUTLINE_TASK_IDLE_LEASE_MS / MINUTE;
+			expect(DAY).toBe(24 * 60);
+			// Idle: the lease runs a day from the end of the run; the task stays the session's.
+			expect(await claimOf(ctx, task)).toEqual({
+				...before,
+				expiresAt: at(t0, 30 + DAY).toISOString(),
+			});
+			for (const minute of [41, 3 * 60, 30 + DAY - 1]) {
+				expect(
+					(await expireOutlineTaskLeases({ store: ctx.store, now: at(t0, minute) })).reopened,
+				).toBe(0);
+				expect((await ctx.store.getBlock(task))?.taskJson?.status).toBe("doing");
+				expect((await claimOf(ctx, task))?.holderNarratorId).toBe(ids.n1);
+			}
+
+			// The person answers after three hours: the next run renews back to the running lease
+			// (ten minutes from then, nothing else changes), and its end puts it on the idle one again.
+			clock = at(t0, 180).getTime();
+			const next = keepOutlineTaskLeases(ids.n1, {
+				store: ctx.store,
+				now: () => clock,
+				enabled: () => true,
+				intervalMs: 0,
+			});
+			clock = at(t0, 182).getTime();
+			await next.touch();
+			expect(await claimOf(ctx, task)).toEqual({ ...before, expiresAt: at(t0, 192).toISOString() });
+			clock = at(t0, 200).getTime();
+			await next.touch();
+			await next.stop();
+			expect(await claimOf(ctx, task)).toEqual({
+				...before,
+				expiresAt: at(t0, 200 + DAY).toISOString(),
+			});
+
+			// No activity for a day: the expiry job reopens it, as for any lease that ran out.
+			expect(
+				(await expireOutlineTaskLeases({ store: ctx.store, now: at(t0, 200 + DAY - 1) })).reopened,
+			).toBe(0);
+			expect(
+				await expireOutlineTaskLeases({ store: ctx.store, now: at(t0, 200 + DAY + 1) }),
+			).toEqual({ reopened: 1, skipped: 0, failed: 0 });
 			expect((await ctx.store.getBlock(task))?.taskJson?.status).toBe("todo");
+			expect(await claimOf(ctx, task)).toMatchObject({
+				holderNarratorId: null,
+				expiresAt: null,
+				lastHolderNarratorId: ids.n1,
+			});
+			const children = await ctx.store.listChildren(space.id, task, 10);
+			expect(children.map((c) => c.id)[0]).toBe(progress);
+			expect(children[1]?.content).toContain("lease expired");
+			expect(children[1]?.content).toContain(ids.n1);
+			checkSpaceInvariants(await ctx.dump(space.id));
+		},
+	},
+	{
+		name: "leases: a run that crashed (its keeper never stopped) loses its tasks when the running lease runs out",
+		async run(ctx) {
+			const { space, n1, ids } = await setup(ctx);
+			const t0 = "2004-01-01T00:00:00.000Z";
+			const r = await write(
+				ctx,
+				space,
+				n1,
+				[{ op: "insert", parent: null, content: "job", task: { status: "doing" } }],
+				at(t0, 0),
+			);
+			const task = r.results[0]?.blockId as string;
+			let clock = Date.parse(t0);
+			const crashed = keepOutlineTaskLeases(ids.n1, {
+				store: ctx.store,
+				now: () => clock,
+				enabled: () => true,
+				intervalMs: 0,
+			});
+			// It renews up to minute 4, then the process dies: no `stop`, so no idle lease.
+			for (let minute = 1; minute <= 5; minute++) {
+				clock = at(t0, minute).getTime();
+				await crashed.touch();
+			}
+			expect((await claimOf(ctx, task))?.expiresAt).toBe(at(t0, 14).toISOString());
+			expect(await expireOutlineTaskLeases({ store: ctx.store, now: at(t0, 13) })).toEqual({
+				reopened: 0,
+				skipped: 0,
+				failed: 0,
+			});
+			expect(await expireOutlineTaskLeases({ store: ctx.store, now: at(t0, 15) })).toEqual({
+				reopened: 1,
+				skipped: 0,
+				failed: 0,
+			});
+			expect((await ctx.store.getBlock(task))?.taskJson?.status).toBe("todo");
+			const note = (await ctx.store.listChildren(space.id, task, 10)).at(-1);
+			expect(note?.content).toContain("lease expired");
+			checkSpaceInvariants(await ctx.dump(space.id));
+		},
+	},
+	{
+		name: "session end: archiving or deleting a session releases what it and its subagents hold at once",
+		async run(ctx) {
+			resetOutlineLeaseExpiryBackoffForTests();
+			const { space, n2, ids } = await setup(ctx);
+			const user = await ctx.seedUser();
+			const root = await ctx.seedNarrator();
+			const sub = await ctx.seedNarrator({ parentId: root, rootId: root });
+			const nested = await ctx.seedNarrator({ parentId: sub, rootId: root });
+			const R: Writer = { kind: "agent", narratorId: root };
+			const S: Writer = { kind: "agent", narratorId: sub };
+			const N: Writer = { kind: "agent", narratorId: nested };
+			const t0 = "2006-01-01T00:00:00.000Z";
+			const r = await write(
+				ctx,
+				space,
+				R,
+				[
+					{ op: "insert", tempId: "a", parent: null, content: "A", task: { status: "doing" } },
+					{ op: "insert", parent: { tempId: "a" }, content: "progress on A" },
+					{ op: "insert", parent: null, content: "B", task: { status: "todo" } },
+					{ op: "insert", parent: null, content: "C", task: { status: "todo" } },
+					{ op: "insert", parent: null, content: "D", task: { status: "todo" } },
+					{ op: "insert", parent: null, content: "E", task: { status: "todo" } },
+					{ op: "insert", parent: null, content: "F", task: { status: "todo" } },
+				],
+				at(t0, 0),
+			);
+			const [a, progress, b, c, d, e, f] = r.results.map((x) => x.blockId) as string[];
+			await write(ctx, space, S, [doing(b as string)], at(t0, 1));
+			await write(ctx, space, N, [doing(c as string)], at(t0, 1));
+			await write(ctx, space, S, [doing(f as string)], at(t0, 1));
+			// Outside the session: another session's task and a person's.
+			await write(ctx, space, n2, [doing(d as string)], at(t0, 1));
+			await write(ctx, space, { kind: "human", userId: user }, [doing(e as string)], at(t0, 1));
+			// The root's turn ended: it waits for its person, its claims on the idle lease.
+			expect(await idleOutlineTaskClaims(root, { store: ctx.store, now: at(t0, 2) })).toBe(1);
+			expect((await claimOf(ctx, a as string))?.expiresAt).toBe(
+				at(t0, 2 + OUTLINE_TASK_IDLE_LEASE_MS / MINUTE).toISOString(),
+			);
+			expect(
+				(await ctx.store.listSessionTaskClaims(root, 100)).map((x) => x.claim.taskBlockId).sort(),
+			).toEqual([a, b, c, f].sort());
+			expect((await ctx.store.listSessionTaskClaims(root, 2)).length).toBe(2);
+			expect(
+				(await ctx.store.listSessionTaskClaims(sub, 100)).map((x) => x.claim.taskBlockId).sort(),
+			).toEqual([b, f].sort());
+
+			// Archived at minute 5 (an hour of idle lease left): all four reopened at once. The
+			// subagent hands its claims to the root between the listing and the commit (its run
+			// ending as the session is archived): they are let go all the same.
+			const before = new Map<string, OutlineTaskClaimRow>();
+			for (const id of [a, b, c, f])
+				before.set(id as string, (await claimOf(ctx, id as string)) as OutlineTaskClaimRow);
+			let handed = false;
+			const racing: OutlineStore = {
+				...ctx.store,
+				async listSessionTaskClaims(narratorId, limit) {
+					const rows = await ctx.store.listSessionTaskClaims(narratorId, limit);
+					if (!handed) {
+						handed = true;
+						expect(
+							await ctx.store.handOverTaskClaims(sub, root, at(t0, 5 + 24 * 60).toISOString()),
+						).toBe(2);
+					}
+					return rows;
+				},
+			};
+			expect(
+				await releaseOutlineSessionTaskClaims(root, "archived", { store: racing, now: at(t0, 5) }),
+			).toEqual({ reopened: 4, skipped: 0, failed: 0 });
+			for (const id of [a, b, c, f] as string[]) {
+				expect((await ctx.store.getBlock(id))?.taskJson?.status).toBe("todo");
+				const claim = await claimOf(ctx, id);
+				expect(claim).toMatchObject({
+					holderNarratorId: null,
+					holderUserId: null,
+					expiresAt: null,
+					epoch: before.get(id)?.epoch,
+				});
+				const note = (await ctx.store.listChildren(space.id, id, 10)).at(-1);
+				expect(note?.content).toContain("was archived");
+				expect(note?.content).toContain(root);
+				expect(note?.authorKind).toBe("system");
+			}
+			expect((await claimOf(ctx, a as string))?.lastHolderNarratorId).toBe(root);
+			expect((await claimOf(ctx, c as string))?.lastHolderNarratorId).toBe(nested);
+			// The progress under the task stays, before the note.
+			expect((await ctx.store.listChildren(space.id, a as string, 10)).map((x) => x.id)[0]).toBe(
+				progress,
+			);
+			const commit = (await ctx.store.listCommits(space.id, { limit: 100 })).at(-1);
+			expect(commit).toMatchObject({ actorKind: "system", actorId: OUTLINE_LEASE_ACTOR });
+			expect(commit?.summary).toBe("session archived: 4 tasks reopened");
+			// Outside the session: untouched.
+			expect(await claimOf(ctx, d as string)).toMatchObject({ holderNarratorId: ids.n2 });
+			expect(await claimOf(ctx, e as string)).toMatchObject({ holderUserId: user });
+			// Nothing left: a second release reads and writes nothing.
+			expect(
+				await releaseOutlineSessionTaskClaims(root, "archived", {
+					store: ctx.store,
+					now: at(t0, 6),
+				}),
+			).toEqual({
+				reopened: 0,
+				skipped: 0,
+				failed: 0,
+			});
+
+			// Deleted: the same, the note says so.
+			expect(
+				await releaseOutlineSessionTaskClaims(ids.n2, "deleted", {
+					store: ctx.store,
+					now: at(t0, 7),
+				}),
+			).toEqual({ reopened: 1, skipped: 0, failed: 0 });
+			expect((await ctx.store.getBlock(d as string))?.taskJson?.status).toBe("todo");
+			const deleted = (await ctx.store.listChildren(space.id, d as string, 10)).at(-1);
+			expect(deleted?.content).toContain("was deleted");
+			expect(deleted?.content).toContain(ids.n2);
+			expect((await ctx.store.listCommits(space.id, { limit: 100 })).at(-1)?.summary).toBe(
+				"session deleted: 1 task reopened",
+			);
+
+			// The person's task is the person's to end.
+			await write(
+				ctx,
+				space,
+				{ kind: "human", userId: user },
+				[status(e as string, "done")],
+				at(t0, 8),
+			);
+			expect(await expireOutlineTaskLeases({ store: ctx.store, now: at(t0, 3 * 24 * 60) })).toEqual(
+				{ reopened: 0, skipped: 0, failed: 0 },
+			);
+			checkSpaceInvariants(await ctx.dump(space.id));
 		},
 	},
 	{
@@ -1531,12 +1769,14 @@ export const OUTLINE_TASK_CONTRACT: ContractCase[] = [
 				intervalMs: 0,
 			});
 			await subRun.stop();
-			expect(await claimOf(ctx, step)).toMatchObject({
+			// On the idle lease (D41): the root may be waiting for its person too.
+			const idleUntil = at(t0, 11 + OUTLINE_TASK_IDLE_LEASE_MS / MINUTE).toISOString();
+			expect(await claimOf(ctx, step)).toEqual({
+				...before,
 				holderNarratorId: root,
-				epoch: before.epoch,
-				expiresAt: at(t0, 21).toISOString(),
+				expiresAt: idleUntil,
 			});
-			// A root's run ending moves nothing.
+			// A root's run ending moves nothing; what it holds goes on the idle lease.
 			const rootRun = keepOutlineTaskLeases(root, {
 				store: ctx.store,
 				now: () => clock,
@@ -1544,8 +1784,11 @@ export const OUTLINE_TASK_CONTRACT: ContractCase[] = [
 				intervalMs: 0,
 			});
 			await rootRun.stop();
-			expect((await claimOf(ctx, step))?.holderNarratorId).toBe(root);
-			expect((await claimOf(ctx, deep))?.holderNarratorId).toBe(root);
+			for (const id of [step, deep])
+				expect(await claimOf(ctx, id)).toMatchObject({
+					holderNarratorId: root,
+					expiresAt: idleUntil,
+				});
 
 			// A subagent whose lease lapsed without a hand-back (it crashed): its session starting the
 			// task again holds it, on a new lease, without a commit or a new epoch.

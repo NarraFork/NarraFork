@@ -76,6 +76,11 @@ export type NarraForkEvent =
 	// Narrator lifecycle
 	| { type: "narrator:message"; narratorId: string; role: string }
 	| { type: "narrator:status_changed"; narratorId: string; status: string; substatus?: string[] }
+	/**
+	 * A narrator's row was deleted (`narratorService.remove`): once per narrator, a session's
+	 * subagents each before the session itself. Ids only; emitted after the delete committed.
+	 */
+	| { type: "narrator:deleted"; narratorId: string }
 	| {
 			type: "spec:changed";
 			narratorId: string;

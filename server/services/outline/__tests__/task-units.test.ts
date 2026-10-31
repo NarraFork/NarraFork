@@ -1,12 +1,14 @@
 /**
  * Outline task pieces that need no second dialect: the in-process rebuild stopping for shutdown,
- * the block the lease expiry job writes, and the lease keeper backing off a failing database.
- * The claim and lease rules themselves are in the store contract (`task-contract.ts`, both
- * dialects).
+ * the block the lease expiry job writes, the lease keeper backing off a failing database, and
+ * the release of a session's claims hooked to its archiving and deletion through the narrator
+ * service. The claim and lease rules themselves are in the store contract (`task-contract.ts`,
+ * both dialects).
  *
  * ISOLATION: the isolated database from `tests/preload.ts`.
  */
 import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { eventBus } from "@server/lib/event-bus";
 import { logger } from "@server/lib/logger";
 import { parseBlock } from "@shared/outline";
 import { eq } from "drizzle-orm";
@@ -26,8 +28,8 @@ import { contentLinks } from "../links";
 import { OUTLINE_TASK_LEASE } from "../model";
 import type { OutlineStore } from "../store/port";
 import { sqliteOutlineStore as store } from "../store/sqlite-store";
-import { outlineLeaseExpiredNote } from "../tasks";
-import { writeOutline } from "../write";
+import { outlineLeaseExpiredNote, watchOutlineSessionEnds } from "../tasks";
+import { type OutlineOp, writeOutline } from "../write";
 
 const NOW = "2026-10-26T00:00:00.000Z";
 const saved = { ...OUTLINE_IN_PROCESS_TIMING };
@@ -196,6 +198,153 @@ describe("lease renewal against a failing database", () => {
 			await keeper.stop();
 			warn.mockRestore();
 			info.mockRestore();
+		}
+	});
+});
+
+async function seedSession(subagentOf?: string): Promise<string> {
+	const id = generateId();
+	await db.insert(narrators).values({
+		id,
+		title: "session",
+		createdAt: NOW,
+		updatedAt: NOW,
+		...(subagentOf
+			? { type: "subagent" as const, parentNarratorId: subagentOf, aclRootNarratorId: subagentOf }
+			: {}),
+	});
+	return id;
+}
+
+async function personalSpace(): Promise<string> {
+	const user = generateId();
+	await db
+		.insert(users)
+		.values({ id: user, username: `u-${user}`, passwordHash: "x", role: "user", createdAt: NOW });
+	return (await store.ensureSpace({ kind: "personal", ownerUserId: user }, NOW)).id;
+}
+
+/** A task in progress, claimed by `narratorId` (on the running lease, from now). */
+async function startTask(spaceId: string, narratorId: string, content: string): Promise<string> {
+	const ops: OutlineOp[] = [{ op: "insert", parent: null, content, task: { status: "doing" } }];
+	const r = await writeOutline(
+		{ spaceId, ops, actor: { kind: "agent", id: narratorId }, narratorId, responsibleUserId: null },
+		{ store },
+	);
+	return r.results[0]?.blockId as string;
+}
+
+/** Every method of the store, counted. */
+function countingStore(): { store: OutlineStore; calls: () => number } {
+	let calls = 0;
+	const counted = new Proxy(store, {
+		get(target, key, receiver) {
+			const value = Reflect.get(target, key, receiver);
+			if (typeof value !== "function") return value;
+			return (...args: unknown[]) => {
+				calls++;
+				return value.apply(target, args);
+			};
+		},
+	});
+	return { store: counted, calls: () => calls };
+}
+
+describe("a session's end releases its outline tasks (D41)", () => {
+	test("archived or deleted through the narrator service: its tasks and its subagents' are reopened at once, with a note", async () => {
+		const { narratorService } = await import("../../narrator-service");
+		const { interruptAndArchiveSubagent } = await import("../../subagent-lifecycle");
+		const spaceId = await personalSpace();
+		const archived = await seedSession();
+		const archivedSub = await seedSession(archived);
+		const deleted = await seedSession();
+		const deletedSub = await seedSession(deleted);
+		const bystander = await seedSession();
+		const a = await startTask(spaceId, archived, "A");
+		const b = await startTask(spaceId, archivedSub, "B");
+		const c = await startTask(spaceId, deleted, "C");
+		const d = await startTask(spaceId, deletedSub, "D");
+		const e = await startTask(spaceId, bystander, "E");
+		const watch = watchOutlineSessionEnds({ store, enabled: () => true });
+		try {
+			// The way the archive route and the agent tool archive a session.
+			const result = await interruptAndArchiveSubagent(archived);
+			expect(result).toMatchObject({ ok: true, archived: true });
+			await watch.settled();
+			for (const [task, holder] of [
+				[a, archived],
+				[b, archivedSub],
+			] as const) {
+				expect((await store.getBlock(task))?.taskJson?.status).toBe("todo");
+				expect((await store.getTaskClaims([task]))[0]).toMatchObject({
+					holderNarratorId: null,
+					expiresAt: null,
+					lastHolderNarratorId: holder,
+				});
+				const note = (await store.listChildren(spaceId, task, 10)).at(-1);
+				expect(note?.content).toContain("was archived");
+				expect(note?.content).toContain(archived);
+			}
+			expect((await store.getBlock(c))?.taskJson?.status).toBe("doing");
+
+			// Deleted: the service removes the subagent first, then the session; each is let go.
+			await narratorService.remove(deleted);
+			await watch.settled();
+			for (const [task, session] of [
+				[c, deleted],
+				[d, deletedSub],
+			] as const) {
+				expect((await store.getBlock(task))?.taskJson?.status).toBe("todo");
+				expect((await store.getTaskClaims([task]))[0]?.holderNarratorId).toBeNull();
+				const note = (await store.listChildren(spaceId, task, 10)).at(-1);
+				expect(note?.content).toContain("was deleted");
+				expect(note?.content).toContain(session);
+			}
+			// Someone else's work is not touched.
+			expect((await store.getBlock(e))?.taskJson?.status).toBe("doing");
+			expect((await store.getTaskClaims([e]))[0]?.holderNarratorId).toBe(bystander);
+		} finally {
+			await watch.stop();
+		}
+		// No longer listening once stopped.
+		await interruptAndArchiveSubagent(bystander);
+		expect((await store.getBlock(e))?.taskJson?.status).toBe("doing");
+	});
+
+	test("with the outline switched off, a run's end and a session's end read nothing", async () => {
+		const narratorId = await seedSession();
+		const off = countingStore();
+		const keeper = keepOutlineTaskLeases(narratorId, {
+			store: off.store,
+			enabled: () => false,
+			intervalMs: 0,
+		});
+		await keeper.touch();
+		await keeper.stop();
+		const watchOff = watchOutlineSessionEnds({ store: off.store, enabled: () => false });
+		try {
+			eventBus.emit({ type: "narrator:status_changed", narratorId, status: "archived" });
+			eventBus.emit({ type: "narrator:deleted", narratorId });
+			await watchOff.settled();
+		} finally {
+			await watchOff.stop();
+		}
+		expect(off.calls()).toBe(0);
+
+		// Switched on, a status other than archived reads nothing either.
+		const on = countingStore();
+		const watchOn = watchOutlineSessionEnds({ store: on.store, enabled: () => true });
+		try {
+			for (const status of ["working", "waiting", "idle"])
+				eventBus.emit({ type: "narrator:status_changed", narratorId, status });
+			await watchOn.settled();
+			expect(on.calls()).toBe(0);
+			// Archived: the session's claims are read, once (it holds none: nothing is written).
+			eventBus.emit({ type: "narrator:status_changed", narratorId, status: "archived" });
+			await watchOn.settled();
+			expect(on.calls()).toBe(1);
+		} finally {
+			await watchOn.stop();
 		}
 	});
 });

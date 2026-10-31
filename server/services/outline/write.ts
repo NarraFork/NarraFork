@@ -390,8 +390,11 @@ export interface OutlineWriteOptions {
 	 * or by nobody; otherwise the write rejects with `OutlineLeaseNotExpiredError`, writing
 	 * nothing. The claims are released only if they are still exactly as read (a renewal or a
 	 * claim in between makes the write plan again).
+	 *
+	 * With `sessions` (a session archived or deleted, and its subagents), a claim one of them holds
+	 * is released whatever its lease.
 	 */
-	leaseExpiry?: { blockIds: readonly string[]; now: string };
+	leaseExpiry?: { blockIds: readonly string[]; now: string; sessions?: readonly string[] };
 }
 
 /** Content normalized before `writeOutline` was called; see `OutlineWriteOptions.canonical`. */
@@ -2002,6 +2005,10 @@ class OutlinePlanner {
 
 		if (this.leaseExpiry) {
 			const expiryNow = this.leaseExpiry.now;
+			const ended = new Set(this.leaseExpiry.sessions ?? []);
+			const released = (row: OutlineTaskClaimRow) =>
+				lapsedLease(row, expiryNow) ||
+				(row.holderNarratorId !== null && ended.has(row.holderNarratorId));
 			const notExpired: string[] = [];
 			for (const id of expiring) {
 				const block = this.blocks.get(id);
@@ -2011,7 +2018,7 @@ class OutlinePlanner {
 					// In progress with nobody holding it (written before claims existed): reopened as
 					// if a lease had run out, while still nobody holds it.
 					plan.verify.push({ taskBlockId: id, expect: row });
-				} else if (lapsedLease(row, expiryNow)) plan.expire.push({ expect: row });
+				} else if (released(row)) plan.expire.push({ expect: row });
 				else notExpired.push(id);
 			}
 			if (notExpired.length > 0) throw new OutlineLeaseNotExpiredError(notExpired);

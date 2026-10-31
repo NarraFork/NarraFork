@@ -63,6 +63,19 @@ export const OUTLINE_TEXT = {
 	/** Summary of the lease expiry job's commit. */
 	leaseExpiredSummary: (n: number) =>
 		n === 1 ? "lease expired: 1 task reopened" : `lease expired: ${n} tasks reopened`,
+	/**
+	 * The block written under a task reopened because the session doing it (or the session its
+	 * subagent belongs to) was archived or deleted.
+	 */
+	sessionEnded: {
+		/** Text before the session id (which is written as code). */
+		lead: (reason: "archived" | "deleted", title: string | null) =>
+			`The previous executor's session was ${reason} (session ${title ? `"${title}" ` : ""}`,
+		tail: "); the task is open again.",
+	},
+	/** Summary of the commit that reopens the tasks of a session archived or deleted. */
+	sessionEndedSummary: (reason: "archived" | "deleted", n: number) =>
+		`session ${reason}: ${n === 1 ? "1 task" : `${n} tasks`} reopened`,
 
 	/** Why a read or search was refused. */
 	errors: {

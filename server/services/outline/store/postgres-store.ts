@@ -75,6 +75,7 @@ import {
 	type OutlineTaskClaimRow,
 	type OutlineVersionRow,
 	type OutlineViewStateRow,
+	oldestClaimsFirst,
 	writesAsExpected,
 } from "./port";
 import { createPostgresOutlineReads } from "./postgres-read";
@@ -956,6 +957,34 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 					sql`${outlineTaskClaims.taskBlockId} COLLATE "C"`,
 				)
 				.limit(limit);
+		},
+
+		async listSessionTaskClaims(narratorId, limit) {
+			const held = (holder: SQL) =>
+				db
+					.select({ claim: outlineTaskClaims, spaceId: outlineBlocks.spaceId })
+					.from(outlineTaskClaims)
+					.innerJoin(outlineBlocks, eq(outlineBlocks.id, outlineTaskClaims.taskBlockId))
+					// The literal `IS NOT NULL` lets the planner use the partial holder index.
+					.where(and(holder, isNotNull(outlineTaskClaims.holderNarratorId)))
+					.orderBy(
+						asc(outlineTaskClaims.claimedAt),
+						sql`${outlineTaskClaims.taskBlockId} COLLATE "C"`,
+					)
+					.limit(limit);
+			const own = await held(eq(outlineTaskClaims.holderNarratorId, narratorId));
+			const subagents = await held(
+				inArray(
+					outlineTaskClaims.holderNarratorId,
+					db
+						.select({ id: narrators.id })
+						.from(narrators)
+						.where(
+							and(eq(narrators.aclRootNarratorId, narratorId), eq(narrators.type, "subagent")),
+						),
+				),
+			);
+			return oldestClaimsFirst([...own, ...subagents], limit);
 		},
 
 		async renewTaskClaims(narratorId, expiresAt) {

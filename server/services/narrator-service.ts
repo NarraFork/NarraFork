@@ -2318,6 +2318,9 @@ export const narratorService = {
 		backgroundOccupancyStore.refreshNarrators(survivingForks.map((child) => child.id));
 		// FK cascades remove durable questions without emitting their own lifecycle frames.
 		eventBus.emit({ type: "human_attention:changed" });
+		// Rows that only name the narrator (no FK), such as outline task claims, are let go by
+		// their owners' listeners.
+		eventBus.emit({ type: "narrator:deleted", narratorId });
 		if (bindingTransition) {
 			await integrationResourceBindingService.recordTransitionAudit(
 				"resource_binding.delete",

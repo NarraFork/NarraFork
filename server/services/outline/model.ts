@@ -113,13 +113,23 @@ export const OUTLINE_LIMITS = {
  * is not renewed runs out and a background job reopens the task.
  */
 export const OUTLINE_TASK_LEASE = {
-	/** How long a session's claim lasts without a renewal. */
+	/** How long a running session's claim lasts without a renewal. */
 	leaseMs: 10 * 60_000,
 	/** How often a running session renews its claims. */
 	renewEveryMs: 2 * 60_000,
 } as const;
 
-/** The end of a lease taken or renewed at `now` (ISO time). */
-export function outlineLeaseEnd(now: string): string {
-	return new Date(Date.parse(now) + OUTLINE_TASK_LEASE.leaseMs).toISOString();
+/**
+ * How long a session's claims last once a run of it ended (D41): between turns the session is
+ * idle, often waiting for its person to answer, and a task waiting for people stays in progress
+ * (D27b). Its next run renews them back to {@link OUTLINE_TASK_LEASE.leaseMs}; archiving or
+ * deleting the session releases them at once; a session that never runs again loses them to the
+ * expiry job once this runs out. A server that crashes ends no run: its sessions' leases run out
+ * after `leaseMs`, as before.
+ */
+export const OUTLINE_TASK_IDLE_LEASE_MS = 24 * 60 * 60_000;
+
+/** The end of a lease taken or renewed at `now` (ISO time): a running session's by default. */
+export function outlineLeaseEnd(now: string, leaseMs: number = OUTLINE_TASK_LEASE.leaseMs): string {
+	return new Date(Date.parse(now) + leaseMs).toISOString();
 }

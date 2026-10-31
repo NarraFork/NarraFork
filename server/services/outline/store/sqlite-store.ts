@@ -71,6 +71,7 @@ import {
 	type OutlineTaskClaimRow,
 	type OutlineVersionRow,
 	type OutlineViewStateRow,
+	oldestClaimsFirst,
 	writesAsExpected,
 } from "./port";
 import { sqliteOutlineReads } from "./sqlite-read";
@@ -837,6 +838,30 @@ export const sqliteOutlineStore: OutlineStore = {
 			.limit(limit)
 			.all();
 		return rows;
+	},
+
+	async listSessionTaskClaims(narratorId, limit) {
+		const held = (holder: SQL) =>
+			db
+				.select({ claim: outlineTaskClaims, spaceId: outlineBlocks.spaceId })
+				.from(outlineTaskClaims)
+				.innerJoin(outlineBlocks, eq(outlineBlocks.id, outlineTaskClaims.taskBlockId))
+				// The literal `IS NOT NULL` lets the planner use the partial holder index.
+				.where(and(holder, isNotNull(outlineTaskClaims.holderNarratorId)))
+				.orderBy(asc(outlineTaskClaims.claimedAt), asc(outlineTaskClaims.taskBlockId))
+				.limit(limit)
+				.all();
+		const own = held(eq(outlineTaskClaims.holderNarratorId, narratorId));
+		const subagents = held(
+			inArray(
+				outlineTaskClaims.holderNarratorId,
+				db
+					.select({ id: narrators.id })
+					.from(narrators)
+					.where(and(eq(narrators.aclRootNarratorId, narratorId), eq(narrators.type, "subagent"))),
+			),
+		);
+		return oldestClaimsFirst([...own, ...subagents], limit);
 	},
 
 	async renewTaskClaims(narratorId, expiresAt) {

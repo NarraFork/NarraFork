@@ -7,28 +7,41 @@
  * commit:
  *
  *   - RENEWAL: a running session moves the lease of its claims on
- *     ({@link renewOutlineTaskLeases}, every {@link OUTLINE_TASK_LEASE.renewEveryMs}).
+ *     ({@link renewOutlineTaskLeases}, every {@link OUTLINE_TASK_LEASE.renewEveryMs}), a lease of
+ *     {@link OUTLINE_TASK_LEASE.leaseMs}: a run that crashes or hangs loses them soon.
+ *   - IDLE (D41): when a run ends, the session's claims go on the idle lease
+ *     ({@link OUTLINE_TASK_IDLE_LEASE_MS}), so a session waiting between turns (for its person to
+ *     answer, D27b) keeps what it is doing; a subagent's claims pass to its root on that lease
+ *     ({@link idleOutlineTaskClaims}). Its next run renews them back to the running lease.
  *   - EXPIRY: a background job ({@link expireOutlineTaskLeases}) reopens tasks whose session's
  *     lease ran out: back to to-do, a block under the task records why, the progress under it
  *     stays. One system commit per space and batch, bounded per run; a lease renewed in between
  *     is left alone. The same job reopens tasks in progress that nobody holds
  *     ({@link reopenUnclaimedOutlineTasks}: written before claims existed), a bounded slice of
  *     the in-progress index per run.
- *   - HAND-BACK: a subagent's claims pass to its root when its run ends
- *     ({@link handBackOutlineTaskClaims}), so the session carries on with them.
+ *   - SESSION END: a session archived or deleted lets go of what it and its subagents hold at
+ *     once ({@link releaseOutlineSessionTaskClaims}, on the narrator events), reopened the way
+ *     the expiry job reopens a task.
  *   - WAITING (read time, never stored): a task waits for its prerequisites (`depends::`) until
  *     each is done or cancelled, and for people while a question under it is unanswered.
  *   - CONTINUATION CANDIDATES (§4.8): the open tasks a session may continue with.
  *
  * Every read is indexed and bounded; nothing here scans a space.
  */
+import { eventBus } from "@server/lib/event-bus";
 import { logger } from "@server/lib/logger";
 import { compareOrderKeys, isAlias, parseAddress, serializeBody } from "@shared/outline";
 import { readDisplayNames } from "./access-reads";
 import { OutlineLeaseNotExpiredError } from "./errors";
 import { isOutlineEnabled } from "./feature";
 import { OUTLINE_TEXT } from "./messages";
-import { OUTLINE_LIMITS, OUTLINE_TASK_LEASE, type OutlineTaskJson, outlineLeaseEnd } from "./model";
+import {
+	OUTLINE_LIMITS,
+	OUTLINE_TASK_IDLE_LEASE_MS,
+	OUTLINE_TASK_LEASE,
+	type OutlineTaskJson,
+	outlineLeaseEnd,
+} from "./model";
 import { outlineStore } from "./store";
 import {
 	chunked,
@@ -57,6 +70,10 @@ export const OUTLINE_TASK_LIMITS = {
 	unclaimedScan: 200,
 	/** Tasks nobody holds one run reopens. */
 	unclaimedBatch: 50,
+	/** Claims of an archived or deleted session one round reads and releases. */
+	releaseBatch: 100,
+	/** Rounds one archived or deleted session gets; what is left runs out as a lease. */
+	releaseRounds: 10,
 } as const;
 
 /** The system actor of the lease expiry job's commits. */
@@ -82,19 +99,27 @@ export async function renewOutlineTaskLeases(
 }
 
 /**
- * A subagent's run ended: the claims it holds pass to its root (with a new lease), so the
- * session it belongs to carries on with what it was doing and the root's runs renew them. Does
- * nothing for a session that is not a subagent. Returns how many claims moved.
+ * A run of a session ended (D41): the claims it holds go on the idle lease
+ * ({@link OUTLINE_TASK_IDLE_LEASE_MS} from now), so the session keeps what it is doing while it
+ * waits for its next turn. A subagent's claims pass to its root on that lease instead, so the
+ * session it belongs to carries on with them. Its next run renews them back to the running
+ * lease: a renewal sets the lease to {@link OUTLINE_TASK_LEASE.leaseMs} from then, whatever it
+ * was, and changes nothing else. Two indexed statements (the session's root by primary key,
+ * then its claims); nothing for a session that no longer exists. Returns how many claims.
  */
-export async function handBackOutlineTaskClaims(
+export async function idleOutlineTaskClaims(
 	narratorId: string,
 	options: { store?: OutlineStore; now?: Date } = {},
 ): Promise<number> {
 	const store = options.store ?? outlineStore;
 	const root = (await store.getNarratorRoots([narratorId])).get(narratorId);
-	if (root === undefined || root === narratorId) return 0;
-	const now = (options.now ?? new Date()).toISOString();
-	return await store.handOverTaskClaims(narratorId, root, outlineLeaseEnd(now));
+	if (root === undefined) return 0;
+	const until = outlineLeaseEnd(
+		(options.now ?? new Date()).toISOString(),
+		OUTLINE_TASK_IDLE_LEASE_MS,
+	);
+	if (root === narratorId) return await store.renewTaskClaims(narratorId, until);
+	return await store.handOverTaskClaims(narratorId, root, until);
 }
 
 /** The claim rows of tasks (released ones included), by task block id. */
@@ -147,12 +172,33 @@ export function outlineUnclaimedNote(): string {
  * title that holds outline syntax (`[[…]]`, emphasis, …) is written as plain text.
  */
 export function outlineLeaseExpiredNote(narratorId: string, title: string | null): string {
+	return sessionNote(
+		OUTLINE_TEXT.leaseExpired.lead(title),
+		narratorId,
+		OUTLINE_TEXT.leaseExpired.tail,
+	);
+}
+
+/** The block written under a task reopened because its session was archived or deleted. */
+export function outlineSessionEndedNote(
+	narratorId: string,
+	title: string | null,
+	reason: OutlineSessionEnd,
+): string {
+	return sessionNote(
+		OUTLINE_TEXT.sessionEnded.lead(reason, title),
+		narratorId,
+		OUTLINE_TEXT.sessionEnded.tail,
+	);
+}
+
+function sessionNote(lead: string, narratorId: string, tail: string): string {
 	return serializeBody({
 		type: "paragraph",
 		content: [
-			{ type: "text", text: OUTLINE_TEXT.leaseExpired.lead(title), marks: [] },
+			{ type: "text", text: lead, marks: [] },
 			{ type: "text", text: narratorId, marks: [{ type: "code" }] },
-			{ type: "text", text: OUTLINE_TEXT.leaseExpired.tail, marks: [] },
+			{ type: "text", text: tail, marks: [] },
 		],
 	});
 }
@@ -230,6 +276,7 @@ export async function expireOutlineTaskLeases(
 			};
 		}),
 		nowDate,
+		{ summary: OUTLINE_TEXT.leaseExpiredSummary },
 	);
 }
 
@@ -262,7 +309,65 @@ export async function reopenUnclaimedOutlineTasks(
 		store,
 		due.map((t) => ({ taskBlockId: t.blockId, spaceId: t.spaceId, note })),
 		nowDate,
+		{ summary: OUTLINE_TEXT.leaseExpiredSummary },
 	);
+}
+
+export type OutlineSessionEnd = "archived" | "deleted";
+
+/**
+ * A session was archived or deleted: what it and its subagents hold is let go at once, not when
+ * the lease runs out. Each task goes back to to-do the way the expiry job reopens one (the
+ * progress under it stays, a last child says the session was archived or deleted, one system
+ * commit per space and batch, through the write path and its live barrier), whatever its lease.
+ * Bounded: rounds of {@link OUTLINE_TASK_LIMITS.releaseBatch} claims, at most
+ * {@link OUTLINE_TASK_LIMITS.releaseRounds} of them; a task the rounds do not reach, or that
+ * cannot be written, keeps its lease and is reopened by the expiry job when it runs out.
+ *
+ * A subagent of the session passing its claims to the session meanwhile changes nothing: both
+ * are let go. A claim someone else took in between is left alone (`skipped`).
+ */
+export async function releaseOutlineSessionTaskClaims(
+	narratorId: string,
+	reason: OutlineSessionEnd,
+	options: { store?: OutlineStore; now?: Date } = {},
+): Promise<OutlineLeaseExpiryResult> {
+	const store = options.store ?? outlineStore;
+	const nowDate = options.now ?? new Date();
+	const nowMs = nowDate.getTime();
+	const batch = OUTLINE_TASK_LIMITS.releaseBatch;
+	const result: OutlineLeaseExpiryResult = { reopened: 0, skipped: 0, failed: 0 };
+	let note: string | null = null;
+	for (let round = 0; round < OUTLINE_TASK_LIMITS.releaseRounds; round++) {
+		// Tasks being left alone are read past, as the expiry job does.
+		const listed = await store.listSessionTaskClaims(
+			narratorId,
+			batch + Math.min(expiryBackoff.size, batch),
+		);
+		const held = listed.filter((e) => !resting(e.claim.taskBlockId, nowMs)).slice(0, batch);
+		if (held.length === 0) break;
+		if (note === null) {
+			// A deleted session has no title left: its id is enough.
+			const title = (await holderNames([narratorId])).get(narratorId) ?? null;
+			note = outlineSessionEndedNote(narratorId, title, reason);
+		}
+		const sessions = [narratorId, ...new Set(held.map((e) => e.claim.holderNarratorId as string))];
+		const done = await reopenTasks(
+			store,
+			held.map(({ claim, spaceId }) => ({
+				taskBlockId: claim.taskBlockId,
+				spaceId,
+				note: note as string,
+			})),
+			nowDate,
+			{ sessions, summary: (n) => OUTLINE_TEXT.sessionEndedSummary(reason, n) },
+		);
+		result.reopened += done.reopened;
+		result.skipped += done.skipped;
+		result.failed += done.failed;
+		if (done.reopened === 0 || listed.length < batch) break;
+	}
+	return result;
 }
 
 /** Test hook: start the next scan for unclaimed tasks from the beginning. */
@@ -292,6 +397,11 @@ async function reopenTasks(
 	store: OutlineStore,
 	items: readonly Reopening[],
 	nowDate: Date,
+	how: {
+		/** Sessions whose claims are released whatever their lease (archived or deleted). */
+		sessions?: readonly string[];
+		summary: (n: number) => string;
+	},
 ): Promise<OutlineLeaseExpiryResult> {
 	const now = nowDate.toISOString();
 	const nowMs = nowDate.getTime();
@@ -325,9 +435,16 @@ async function reopenTasks(
 				ops,
 				actor: { kind: "system", id: OUTLINE_LEASE_ACTOR },
 				responsibleUserId: null,
-				summary: OUTLINE_TEXT.leaseExpiredSummary(batch.length),
+				summary: how.summary(batch.length),
 			},
-			{ store, leaseExpiry: { blockIds: batch.map((c) => c.taskBlockId), now } },
+			{
+				store,
+				leaseExpiry: {
+					blockIds: batch.map((c) => c.taskBlockId),
+					now,
+					...(how.sessions ? { sessions: how.sessions } : {}),
+				},
+			},
 		);
 	};
 	/** Reopen `batch`, leaving out those found held; true when done, false on another error. */
@@ -381,9 +498,14 @@ async function reopenTasks(
 /** Interval of the expiry job. */
 const EXPIRY_INTERVAL_MS = 60_000;
 
-const leaseJob: { timer: ReturnType<typeof setInterval> | null; running: Promise<void> | null } = {
+const leaseJob: {
+	timer: ReturnType<typeof setInterval> | null;
+	running: Promise<void> | null;
+	sessionEnds: OutlineSessionEndWatch | null;
+} = {
 	timer: null,
 	running: null,
+	sessionEnds: null,
 };
 
 function runLeaseExpiry(): void {
@@ -405,20 +527,91 @@ function runLeaseExpiry(): void {
 
 /**
  * Start the lease expiry job: a run every minute while the outline is switched on, each bounded
- * by {@link OUTLINE_TASK_LIMITS.expiryBatch}; runs never overlap. Idempotent.
+ * by {@link OUTLINE_TASK_LIMITS.expiryBatch}; runs never overlap. Also starts letting go of the
+ * claims of sessions archived or deleted ({@link watchOutlineSessionEnds}). Idempotent.
  */
 export function startOutlineTaskLeaseJob(): void {
 	if (leaseJob.timer) return;
 	leaseJob.timer = setInterval(runLeaseExpiry, EXPIRY_INTERVAL_MS);
 	leaseJob.timer.unref?.();
+	leaseJob.sessionEnds = watchOutlineSessionEnds();
 	runLeaseExpiry();
 }
 
-/** Stop the job and wait for a run in progress (shutdown). */
+/** Stop the job and wait for a run (and session releases) in progress (shutdown). */
 export async function stopOutlineTaskLeaseJob(): Promise<void> {
 	if (leaseJob.timer) clearInterval(leaseJob.timer);
 	leaseJob.timer = null;
-	await leaseJob.running;
+	const sessionEnds = leaseJob.sessionEnds;
+	leaseJob.sessionEnds = null;
+	await Promise.all([leaseJob.running, sessionEnds?.stop()]);
+}
+
+export interface OutlineSessionEndWatch {
+	/** Releases started and not finished yet, settled (tests). */
+	settled(): Promise<void>;
+	/** Stop listening, then wait for the releases in progress. */
+	stop(): Promise<void>;
+}
+
+/**
+ * Let go of the claims of a session when it is archived (`narrator:status_changed` to
+ * `archived`) or deleted (`narrator:deleted`, which comes once per narrator removed, so a
+ * session's subagents each get theirs): the one place the outline hooks into the end of a
+ * session, whichever way it was archived or deleted. Each release
+ * ({@link releaseOutlineSessionTaskClaims}) runs after the event, not inside the request that
+ * archived or deleted the session; one that fails is logged, and the claims run out as leases.
+ * With the outline switched off, an event reads nothing.
+ */
+export function watchOutlineSessionEnds(
+	options: { store?: OutlineStore; enabled?: () => boolean; now?: () => Date } = {},
+): OutlineSessionEndWatch {
+	const enabled = options.enabled ?? isOutlineEnabled;
+	const store = options.store ? { store: options.store } : {};
+	const pending = new Set<Promise<void>>();
+	const release = (narratorId: string, reason: OutlineSessionEnd) => {
+		if (!enabled()) return;
+		const run: Promise<void> = releaseOutlineSessionTaskClaims(narratorId, reason, {
+			...store,
+			...(options.now ? { now: options.now() } : {}),
+		})
+			.then((result) => {
+				if (result.reopened || result.skipped || result.failed)
+					logger.info("Outline tasks of an ended session reopened", {
+						narratorId,
+						reason,
+						...result,
+					});
+			})
+			.catch((error) =>
+				logger.warn("Outline tasks of an ended session could not be released", {
+					narratorId,
+					reason,
+					error: String(error),
+				}),
+			)
+			.finally(() => {
+				pending.delete(run);
+			});
+		pending.add(run);
+	};
+	const onStatus = (event: { narratorId: string; status: string }) => {
+		if (event.status === "archived") release(event.narratorId, "archived");
+	};
+	const onDeleted = (event: { narratorId: string }) => release(event.narratorId, "deleted");
+	eventBus.on("narrator:status_changed", onStatus);
+	eventBus.on("narrator:deleted", onDeleted);
+	const settled = async () => {
+		while (pending.size > 0) await Promise.allSettled([...pending]);
+	};
+	return {
+		settled,
+		async stop() {
+			eventBus.off("narrator:status_changed", onStatus);
+			eventBus.off("narrator:deleted", onDeleted);
+			await settled();
+		},
+	};
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -467,6 +467,16 @@ export interface OutlineStore extends WritePortIdentity, OutlineReadPort {
 		limit: number,
 	): Promise<Array<{ claim: OutlineTaskClaimRow; spaceId: string }>>;
 	/**
+	 * Claims held by a session or by one of its subagents (`acl_root_narrator_id` is the session),
+	 * whatever their lease, oldest claim first, at most `limit`, with the space of the task: what
+	 * archiving or deleting the session releases. Two indexed reads (the session's own claims,
+	 * its subagents' through the narrators' root index), each with the limit.
+	 */
+	listSessionTaskClaims(
+		narratorId: string,
+		limit: number,
+	): Promise<Array<{ claim: OutlineTaskClaimRow; spaceId: string }>>;
+	/**
 	 * Move the lease of the claims a session holds (at most {@link OUTLINE_RENEW_LIMIT}) to
 	 * `expiresAt`; returns how many. Rows are locked in task id order, as a commit locks them.
 	 */
@@ -595,4 +605,26 @@ export function chunked<T>(items: readonly T[], size = OUTLINE_SQL_CHUNK): T[][]
 	const out: T[][] = [];
 	for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size));
 	return out;
+}
+
+/**
+ * Claims read by several queries, as one list: oldest claim first (then by task id), each task
+ * once, at most `limit`.
+ */
+export function oldestClaimsFirst<T extends { claim: OutlineTaskClaimRow }>(
+	rows: readonly T[],
+	limit: number,
+): T[] {
+	const byTask = new Map(rows.map((row) => [row.claim.taskBlockId, row]));
+	return [...byTask.values()]
+		.sort((a, b) =>
+			a.claim.claimedAt !== b.claim.claimedAt
+				? a.claim.claimedAt < b.claim.claimedAt
+					? -1
+					: 1
+				: a.claim.taskBlockId < b.claim.taskBlockId
+					? -1
+					: 1,
+		)
+		.slice(0, limit);
 }

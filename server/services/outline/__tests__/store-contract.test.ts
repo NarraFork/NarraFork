@@ -197,6 +197,14 @@ describe("SQLite specifics", () => {
 		expect(
 			plan(`SELECT id, type, acl_root_narrator_id FROM narrators WHERE id IN ('a', 'b')`),
 		).toMatch(/PRIMARY KEY|sqlite_autoindex_narrators/);
+		// A session's subagents' claims (archived or deleted): the narrators' root index, then
+		// the holder index, never a scan of either table.
+		const subagents = plan(
+			`SELECT c.task_block_id FROM outline_task_claims c JOIN outline_blocks b ON b.id = c.task_block_id WHERE (c.holder_narrator_id IN (SELECT "id" FROM "narrators" WHERE ("narrators"."acl_root_narrator_id" = 'r' AND "narrators"."type" = 'subagent')) AND c.holder_narrator_id IS NOT NULL) ORDER BY c.claimed_at, c.task_block_id LIMIT 5`,
+		);
+		expect(subagents).toContain("idx_outline_task_claims_holder");
+		expect(subagents).toContain("idx_narrators_acl_root");
+		expect(subagents).not.toMatch(/SCAN (c|narrators|outline_task_claims)\b/);
 	});
 
 	test("a page past the main-thread size is read on the workers, truncation exact", async () => {

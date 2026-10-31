@@ -395,10 +395,11 @@ describe("tool Git status refresh", () => {
 });
 
 describe("outline task leases", () => {
-	test("a run keeps its session's leases alive from its start through its tool boundaries, and stops at its end", async () => {
+	test("a run keeps its session's leases alive from its start through its tool boundaries, and puts them on the idle lease at its end", async () => {
 		const tasks = await import("../outline/tasks");
 		const { outlineLeaseKeepersOf } = await import("../outline/lease-keeper");
 		const renew = spyOn(tasks, "renewOutlineTaskLeases").mockResolvedValue(0);
+		const idle = spyOn(tasks, "idleOutlineTaskClaims").mockResolvedValue(0);
 		const enabled = settings.outline.enabled;
 		settings.outline.enabled = true;
 		let during = -1;
@@ -428,6 +429,12 @@ describe("outline task leases", () => {
 		expect(renew.mock.calls.every(([narratorId]) => narratorId === h.session.narratorId)).toBe(
 			true,
 		);
+		// The run's end (between turns, D41): once, for this session (not waited for by the run).
+		await new Promise((resolve) => setTimeout(resolve, 0));
+		expect(idle).toHaveBeenCalledTimes(1);
+		expect(idle.mock.calls[0]?.[0]).toBe(h.session.narratorId);
+		renew.mockRestore();
+		idle.mockRestore();
 	});
 });
 
