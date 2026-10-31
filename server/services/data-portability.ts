@@ -37,6 +37,8 @@ import type { NarraForkSettings } from "@server/lib/settings/types";
 import { MAX_IMPORT_BYTES, MAX_IMPORT_LABEL } from "@shared/storage-transfer";
 import archiver from "archiver";
 import { sqlite } from "../db";
+import { getDbPath } from "../db/connection";
+import { buildSnapshotInSubprocess } from "../db/snapshot-build";
 
 const EXPORT_VERSION = 1;
 const PREVIEW_TTL_MS = 30 * 60 * 1000;
@@ -231,32 +233,8 @@ export const ALL_DATA_KINDS: TransferSelection = {
 };
 
 /**
- * 按选择裁剪快照：`VACUUM INTO` 只能整库复制，未勾选的类别在这里删掉。
- *
- * 快照是临时文件，删行不涉及主库；关掉外键只为免去删表顺序的约束。
- */
-function pruneSnapshot(snapshotPath: string, selection: TransferSelection): void {
-	if (selection.requests && selection.sessions) return;
-	const snapshot = new Database(snapshotPath);
-	try {
-		snapshot.run("PRAGMA foreign_keys = OFF");
-		snapshot.transaction(() => {
-			if (!selection.requests) snapshot.run("DELETE FROM api_requests");
-			if (!selection.sessions) {
-				snapshot.run("DELETE FROM narrator_message_refs");
-				snapshot.run("DELETE FROM narrator_tool_calls");
-				snapshot.run("DELETE FROM narrator_messages");
-				snapshot.run("DELETE FROM narrators");
-			}
-		})();
-	} finally {
-		snapshot.close();
-	}
-}
-
-/**
- * 导出一份 ZIP：`VACUUM INTO` 生成一致快照（SQLite 原生，不经过 JS 逐行序列化），
- * 再压缩进 ZIP。供应商配置与清单是小的 JSON 文件。
+ * 导出一份 ZIP：先在子进程里把导入需要的表复制成原生 SQLite 快照，再压缩进 ZIP。
+ * 供应商配置与清单是小的 JSON 文件。
  */
 export async function exportData(
 	selection: TransferSelection = ALL_DATA_KINDS,
@@ -271,16 +249,20 @@ export async function exportData(
 	const needsSnapshot = selection.requests || selection.sessions;
 	try {
 		if (needsSnapshot) {
-			// 原生快照：包含全部已提交数据（WAL 内容一并固化），单条 SQL、毫秒级。
-			// `VACUUM INTO` 只读主库，导出失败不会对主库留下任何改动。
-			sqlite.run("VACUUM INTO ?", [snapshotPath]);
-			pruneSnapshot(snapshotPath, selection);
+			// 只把导入需要的表复制进快照，且整段 O(数据量) 的工作放在子进程里，
+			// 不让 INSERT…SELECT / VACUUM 占住服务器的单一线程。
+			await buildSnapshotInSubprocess({
+				sourcePath: getDbPath(),
+				outputPath: snapshotPath,
+				requests: selection.requests,
+				sessions: selection.sessions,
+			});
 		}
 
 		const providers = selection.providers
 			? collectProviders(settings)
 			: ({} as Partial<Record<ProviderKey, unknown>>);
-		// 计数从裁剪后的快照读，与实际导出的内容一致；没有快照时这两类必然是 0。
+		// 计数从快照读，与实际导出的内容一致；没有快照时这两类必然是 0。
 		const counts: ExportCounts = {
 			requests: needsSnapshot ? countRowsIn(snapshotPath, "api_requests") : 0,
 			sessions: needsSnapshot ? countRowsIn(snapshotPath, "narrators") : 0,
