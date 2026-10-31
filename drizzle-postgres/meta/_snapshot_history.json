@@ -368,6 +368,14 @@
 			"prevId": "30f5ec4d-b57c-40b3-a85d-a69332fe44bf",
 			"version": "7",
 			"snapshotDigest": "0df0c95a008f04c6ee8417d09a6ae3b6f45ad319cec11796dbfe9c8200fa6ef1"
+		},
+		{
+			"idx": 46,
+			"tag": "0046_modeltrace_narrator",
+			"id": "8e517568-b17c-423a-bcd0-57c2f4892da2",
+			"prevId": "b47d28e4-7316-4e38-9be4-f1a8e6511385",
+			"version": "7",
+			"snapshotDigest": "5252adc5aa329a97fb88628cee8555b1f6f81b28b003345d629e050e715dd0e7"
 		}
 	]
 }
