@@ -47,11 +47,13 @@ import {
 	type OutlineStore,
 	type OutlineVersionRow,
 } from "./store/port";
+import { sameTaskJson } from "./task-json";
 import {
 	type OutlineAdjustment,
 	type OutlineBlockAddressed,
 	type OutlineOp,
 	type OutlineTaskInput,
+	type OutlineTaskPatch,
 	writeOutline,
 } from "./write";
 
@@ -121,23 +123,30 @@ interface Plan {
 	metas: Map<string, OutlineBlockMeta>;
 }
 
-function sameTask(a: OutlineTaskJson | null, b: OutlineTaskJson | null): boolean {
-	if (a === null || b === null) return a === b;
-	return (
-		a.status === b.status &&
-		a.assignee === b.assignee &&
-		(a.due ?? null) === (b.due ?? null) &&
-		JSON.stringify(a.depends ?? []) === JSON.stringify(b.depends ?? [])
-	);
-}
+const sameTask = sameTaskJson;
 
+/** A task as it was, every field spelled out, so the write puts back exactly that. */
 function taskInput(task: OutlineTaskJson): OutlineTaskInput {
 	return {
 		status: task.status,
 		assignee: task.assignee,
 		depends: task.depends ?? [],
 		due: task.due ?? null,
+		manager: task.manager ?? null,
+		humanCreated: task.humanCreated === true,
+		lock: task.lock ?? null,
+		claimable: task.claimable === true,
 	};
+}
+
+/**
+ * A task put back over the task as it is (`now`): as {@link taskInput}, with the status only when
+ * it changed. Putting back the other fields of a task in progress is not starting it, so it
+ * claims nothing (a `setTask` naming `doing` would).
+ */
+function taskPatch(task: OutlineTaskJson, now: OutlineTaskJson | null): OutlineTaskPatch {
+	const { status, ...rest } = taskInput(task);
+	return now?.status === status ? rest : { status, ...rest };
 }
 
 class RevertAnalysis {
@@ -432,7 +441,7 @@ class RevertAnalysis {
 					{
 						op: "setTask",
 						block: { id: t.id },
-						task: before.taskJson ? taskInput(before.taskJson) : null,
+						task: before.taskJson ? taskPatch(before.taskJson, t.meta.taskJson) : null,
 					},
 					t.id,
 				);
@@ -541,7 +550,9 @@ async function revertAttempts(
 							adjustment.alias,
 							holders.get(adjustment.heldBy) ?? adjustment.heldBy,
 						)
-					: OUTLINE_TEXT.orderKeyMoved(adjustment.wanted),
+					: adjustment.kind === "order-key-moved"
+						? OUTLINE_TEXT.orderKeyMoved(adjustment.wanted)
+						: OUTLINE_TEXT.taskNotStarted,
 		}));
 		return {
 			...base,

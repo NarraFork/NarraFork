@@ -2167,6 +2167,14 @@ export const narratorService = {
 	},
 
 	async remove(narratorId: string) {
+		// What names it once the row is gone (the `narrator:deleted` event below).
+		const title =
+			(
+				await db.query.narrators.findFirst({
+					where: eq(narrators.id, narratorId),
+					columns: { title: true },
+				})
+			)?.title ?? null;
 		const children = await db.query.narrators.findMany({
 			where: eq(narrators.parentNarratorId, narratorId),
 			columns: { id: true, type: true, variant: true },
@@ -2318,6 +2326,9 @@ export const narratorService = {
 		backgroundOccupancyStore.refreshNarrators(survivingForks.map((child) => child.id));
 		// FK cascades remove durable questions without emitting their own lifecycle frames.
 		eventBus.emit({ type: "human_attention:changed" });
+		// Rows that only name the narrator (no FK), such as outline task claims, are let go by
+		// their owners' listeners.
+		eventBus.emit({ type: "narrator:deleted", narratorId, title });
 		if (bindingTransition) {
 			await integrationResourceBindingService.recordTransitionAudit(
 				"resource_binding.delete",

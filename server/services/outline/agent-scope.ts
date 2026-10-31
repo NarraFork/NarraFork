@@ -109,6 +109,7 @@ function pendingSpace(
 		ownerUserId: scope.kind === "personal" ? scope.ownerUserId : null,
 		nextSeq: 1,
 		createdAt: "",
+		inProcessEpoch: 0,
 	};
 }
 

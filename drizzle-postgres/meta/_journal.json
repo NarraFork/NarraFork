@@ -323,6 +323,13 @@
 			"when": 1793322259064,
 			"tag": "0045_git_identity_visibility_per_account",
 			"breakpoints": true
+		},
+		{
+			"idx": 46,
+			"version": "7",
+			"when": 1793383934682,
+			"tag": "0046_outline_task_claims",
+			"breakpoints": true
 		}
   ]
 }

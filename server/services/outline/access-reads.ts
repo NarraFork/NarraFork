@@ -354,6 +354,7 @@ function toSpace(row: Row): OutlineSpaceRow {
 		ownerUserId: textOrNull(row, "owner_user_id"),
 		nextSeq: Number(row.next_seq),
 		createdAt: text(row, "created_at"),
+		inProcessEpoch: Number(row.in_process_epoch ?? 0),
 	};
 }
 
@@ -390,6 +391,7 @@ export async function readReadableSpacePage(
 			)`;
 	const rows = await all(sql`
 		select s.id, s.key, s.kind, s.project_id, s.narrator_id, s.owner_user_id, s.next_seq,
+			s.in_process_epoch,
 			s.created_at
 		from outline_spaces s
 		where ${visible}

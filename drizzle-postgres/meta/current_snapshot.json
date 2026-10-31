@@ -1,6 +1,6 @@
 {
-  "id": "b47d28e4-7316-4e38-9be4-f1a8e6511385",
-  "prevId": "30f5ec4d-b57c-40b3-a85d-a69332fe44bf",
+  "id": "87e33132-68f8-41ad-9605-925309958431",
+  "prevId": "b47d28e4-7316-4e38-9be4-f1a8e6511385",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -17529,6 +17529,13 @@
           "primaryKey": false,
           "notNull": true,
           "default": false
+        },
+        "in_process": {
+          "name": "in_process",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
         }
       },
       "indexes": {
@@ -17613,6 +17620,38 @@
             }
           ],
           "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_outline_blocks_open_tasks": {
+          "name": "idx_outline_blocks_open_tasks",
+          "columns": [
+            {
+              "expression": "space_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "(\"task_json\"::jsonb #>> '{status}') IN ('todo', 'doing') AND \"deleted\" = FALSE",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_outline_blocks_doing_tasks": {
+          "name": "idx_outline_blocks_doing_tasks",
+          "columns": [
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "(\"task_json\"::jsonb #>> '{status}') = 'doing' AND \"deleted\" = FALSE",
           "concurrently": false,
           "method": "btree",
           "with": {}
@@ -18035,6 +18074,20 @@
           "type": "text",
           "primaryKey": false,
           "notNull": true
+        },
+        "in_process_ready": {
+          "name": "in_process_ready",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
+        },
+        "in_process_epoch": {
+          "name": "in_process_epoch",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "default": 0
         }
       },
       "indexes": {
@@ -18049,6 +18102,22 @@
             }
           ],
           "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_outline_spaces_in_process_pending": {
+          "name": "idx_outline_spaces_in_process_pending",
+          "columns": [
+            {
+              "expression": "id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"in_process_ready\" = FALSE",
           "concurrently": false,
           "method": "btree",
           "with": {}
@@ -18185,6 +18254,120 @@
             "id"
           ],
           "onDelete": "set null",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "policies": {},
+      "checkConstraints": {},
+      "isRLSEnabled": false
+    },
+    "public.outline_task_claims": {
+      "name": "outline_task_claims",
+      "schema": "",
+      "columns": {
+        "task_block_id": {
+          "name": "task_block_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true
+        },
+        "holder_narrator_id": {
+          "name": "holder_narrator_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "holder_user_id": {
+          "name": "holder_user_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "epoch": {
+          "name": "epoch",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "task_version_at_claim": {
+          "name": "task_version_at_claim",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "claimed_at": {
+          "name": "claimed_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "expires_at": {
+          "name": "expires_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "last_holder_narrator_id": {
+          "name": "last_holder_narrator_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "last_holder_user_id": {
+          "name": "last_holder_user_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        }
+      },
+      "indexes": {
+        "idx_outline_task_claims_holder": {
+          "name": "idx_outline_task_claims_holder",
+          "columns": [
+            {
+              "expression": "holder_narrator_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"holder_narrator_id\" IS NOT NULL",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_outline_task_claims_expiry": {
+          "name": "idx_outline_task_claims_expiry",
+          "columns": [
+            {
+              "expression": "expires_at",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": false,
+          "where": "\"expires_at\" IS NOT NULL",
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        }
+      },
+      "foreignKeys": {
+        "outline_task_claims_task_block_id_outline_blocks_id_fk": {
+          "name": "outline_task_claims_task_block_id_outline_blocks_id_fk",
+          "tableFrom": "outline_task_claims",
+          "tableTo": "outline_blocks",
+          "columnsFrom": [
+            "task_block_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
           "onUpdate": "no action"
         }
       },

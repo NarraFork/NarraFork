@@ -718,6 +718,34 @@ describe("OutlineEdit and other spaces", () => {
 		expect((await call(outlineReadTool, { address: ownLabel }, c)).isError).toBeUndefined();
 	});
 
+	test("a task of another space someone else is doing is refused by its address", async () => {
+		const w = await world();
+		const key = w.billing.key;
+		const [task] = await write(w.billing, w.alice, [
+			{ op: "insert", parent: null, content: "Reconcile", task: { status: "todo" } },
+		]);
+		const doer = ctx(w.otherSession, w.alice);
+		await call(outlineReadTool, { address: `${key}/${task}` }, doer);
+		const started = await call(
+			outlineEditTool,
+			{ edits: [{ set: `${key}/${task}`, checkbox: "/" }] },
+			doer,
+		);
+		expect(started.isError).toBeUndefined();
+		const c = ctx(w.session, w.alice);
+		await call(outlineReadTool, { address: `${key}/${task}` }, c);
+		const refused = await call(
+			outlineEditTool,
+			{ edits: [{ set: `${key}/${task}`, checkbox: "/" }] },
+			c,
+		);
+		expect(refused.isError).toBe(true);
+		// The label a read of that space shows, so the agent can use it as is.
+		expect(refused.output).toContain(`[${key}/${task}] is already being done by`);
+		expect(refused.output).toContain('"Login bug"');
+		expect((await blockBySid(w.billing, task as string)).taskJson?.status).toBe("doing");
+	});
+
 	test("a subagent reads across spaces as its root does", async () => {
 		const w = await world();
 		const [invoices] = await write(w.billing, w.alice, [

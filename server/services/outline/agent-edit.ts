@@ -44,9 +44,11 @@ import {
 	type BodyRef,
 	isAlias,
 	type OutlineNote,
+	parseAddress,
 	parseAliasValue,
 	TASK_BOX,
 } from "@shared/outline";
+import { readDisplayNames } from "./access-reads";
 import {
 	type AgentMerge,
 	AgentMergeLimitError,
@@ -67,7 +69,12 @@ import {
 	type EditTextTarget,
 } from "./edit-text";
 import { OutlineEditTextError, processEditText } from "./edit-text-runner";
-import { OutlineBusyError, OutlineConflictError, OutlineWriteError } from "./errors";
+import {
+	OutlineBusyError,
+	OutlineConflictError,
+	OutlineTaskClaimedError,
+	OutlineWriteError,
+} from "./errors";
 import { newOutlineSid } from "./keys";
 import { linkDisplayTitle } from "./link-display";
 import { withOutlineLiveBarrier } from "./live-barrier";
@@ -971,6 +978,18 @@ export async function outlineEdit(
 					const merge = merges.get(block.id)?.merge;
 					const fields = merge ?? replaceFields(p);
 					const content = merge ? merge.content : p.content;
+					// The checkbox as it already is is not a change: rewriting the text of a task in
+					// progress does not claim it (only setting it to in progress does). A merge keeps
+					// the checkbox only when the agent changed it from what it read, so it stays.
+					let task = fields.task;
+					if (
+						!merge &&
+						task?.status !== undefined &&
+						task.status === current.get(block.id)?.taskJson?.status
+					) {
+						const { status: _unchanged, ...rest } = task;
+						task = Object.keys(rest).length > 0 ? rest : undefined;
+					}
 					push(
 						edit,
 						{
@@ -984,11 +1003,11 @@ export async function outlineEdit(
 						},
 						{ content, links: merge ? merge.links : p.links },
 					);
-					if (fields.task) {
+					if (task) {
 						push(edit, {
 							op: "setTask",
 							block: { id: block.id },
-							task: fields.task,
+							task,
 							baseVersionSeq: base(block.id),
 						});
 					}
@@ -1063,6 +1082,17 @@ export async function outlineEdit(
 				);
 			} catch (error) {
 				if (error instanceof OutlineConflictError) return { writeConflict: error };
+				if (error instanceof OutlineTaskClaimedError) {
+					const at = error.opIndex === null ? undefined : edits[opEdit[error.opIndex] as number];
+					// The task named as a read of the space labels it: `[sid]` in an own space,
+					// `[key/sid]` in any other.
+					const sid = parseAddress(error.address)?.sid;
+					const message = OUTLINE_TOOL_TEXT.edit.taskClaimed(
+						sid === undefined ? error.address : scope.labelIn(space)(sid),
+						await claimHolderName(error),
+					);
+					return { output: failed([at ? `${label(at)}: ${message}` : message]) };
+				}
 				if (error instanceof OutlineWriteError) {
 					const at = error.opIndex === null ? undefined : edits[opEdit[error.opIndex] as number];
 					const message = error.message.replace(/^operation \d+: /, "");
@@ -1183,6 +1213,23 @@ interface ChangedSinceRead {
 	 * goes through once the agent has seen it: a block never read, or under a deleted one.
 	 */
 	shown?: boolean;
+}
+
+/** Who holds a claim, as a refusal names them: the session's title or the person's name. */
+async function claimHolderName(error: OutlineTaskClaimedError): Promise<string> {
+	const holder = error.holder;
+	const names = await readDisplayNames(
+		holder.kind === "agent" ? { narratorIds: [holder.narratorId] } : { userIds: [holder.userId] },
+	).catch(() => null);
+	return holder.kind === "agent"
+		? OUTLINE_TOOL_TEXT.edit.claimHolderSession(
+				names?.narrators.get(holder.narratorId) ?? null,
+				holder.narratorId,
+			)
+		: OUTLINE_TOOL_TEXT.edit.claimHolderPerson(
+				names?.users.get(holder.userId) ?? null,
+				holder.userId,
+			);
 }
 
 /**

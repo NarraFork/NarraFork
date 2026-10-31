@@ -595,6 +595,9 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	// the reads on every page read's path. The PostgreSQL store answers the same port (search
 	// from its pg_trgm shadow table).
 	"server/services/outline/store/sqlite-read.ts": ["handle", "rowid", "fts5"],
+	// The open-task read names the partial index's own predicate (`json_extract` of the task
+	// status) so SQLite uses it; the PostgreSQL store spells the same predicate with `#>>`.
+	"server/services/outline/store/sqlite-store.ts": ["json1"],
 	"server/services/parent-injection-queue.ts": ["json1"],
 	"server/services/revert-history-commit.ts": [
 		"driver",

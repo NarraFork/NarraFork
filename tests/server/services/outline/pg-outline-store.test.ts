@@ -26,6 +26,7 @@ import {
 	type SpaceDump,
 } from "../../../../server/services/outline/__tests__/contract";
 import { OUTLINE_READ_CONTRACT } from "../../../../server/services/outline/__tests__/read-contract";
+import { OUTLINE_TASK_CONTRACT } from "../../../../server/services/outline/__tests__/task-contract";
 import type { OutlineTaskJson } from "../../../../server/services/outline/model";
 import {
 	chunked,
@@ -96,12 +97,30 @@ describe("PostgreSQL outline store", () => {
 							.values({ id, name: `outline-${id}`, createdAt: NOW, updatedAt: NOW });
 						return id;
 					},
-					async seedNarrator() {
+					async seedNarrator(related) {
 						const id = generateId();
-						await pgDb
-							.insert(pgSchema.narrators)
-							.values({ id, title: "outline", createdAt: NOW, updatedAt: NOW });
+						await pgDb.insert(pgSchema.narrators).values({
+							id,
+							title: "outline",
+							createdAt: NOW,
+							updatedAt: NOW,
+							...(related && "forkOf" in related
+								? { parentNarratorId: related.forkOf }
+								: related
+									? {
+											type: "subagent" as const,
+											parentNarratorId: related.parentId,
+											aclRootNarratorId: related.rootId,
+										}
+									: {}),
+						});
 						return id;
+					},
+					async archiveNarrator(narratorId) {
+						await pgDb
+							.update(pgSchema.narrators)
+							.set({ status: "archived" })
+							.where(eq(pgSchema.narrators.id, narratorId));
 					},
 					async dump(spaceId): Promise<SpaceDump> {
 						const space = await store.getSpace(spaceId);
@@ -137,7 +156,23 @@ describe("PostgreSQL outline store", () => {
 								.where(eq(pgSchema.outlineCommits.spaceId, spaceId))
 								.orderBy(pgSchema.outlineCommits.seq)
 						).map((c) => c as SpaceDump["commits"][number]);
-						return { space, blocks, versions, links, commits };
+						const claims = await store.getTaskClaims(blocks.map((b) => b.id));
+						return { space, blocks, versions, links, commits, claims };
+					},
+					async resetInProcess(spaceId) {
+						await pgDb
+							.update(pgSchema.outlineSpaces)
+							.set({ inProcessReady: false })
+							.where(eq(pgSchema.outlineSpaces.id, spaceId));
+						await pgDb
+							.update(pgSchema.outlineBlocks)
+							.set({ inProcess: false })
+							.where(eq(pgSchema.outlineBlocks.spaceId, spaceId));
+					},
+					async forgetClaims(taskBlockIds) {
+						await pgDb
+							.delete(pgSchema.outlineTaskClaims)
+							.where(inArray(pgSchema.outlineTaskClaims.taskBlockId, [...taskBlockIds]));
 					},
 					async searchContent(needle) {
 						const rows = await client.sql.unsafe(
@@ -151,7 +186,11 @@ describe("PostgreSQL outline store", () => {
 				const problems: string[] = [];
 				const passed: string[] = [];
 				try {
-					for (const contractCase of [...OUTLINE_STORE_CONTRACT, ...OUTLINE_READ_CONTRACT]) {
+					for (const contractCase of [
+						...OUTLINE_STORE_CONTRACT,
+						...OUTLINE_TASK_CONTRACT,
+						...OUTLINE_READ_CONTRACT,
+					]) {
 						try {
 							await contractCase.run(ctx);
 							passed.push(contractCase.name);
@@ -174,7 +213,7 @@ describe("PostgreSQL outline store", () => {
 			}
 			expect(outcome.problems).toEqual([]);
 			expect(outcome.passed).toHaveLength(
-				OUTLINE_STORE_CONTRACT.length + OUTLINE_READ_CONTRACT.length,
+				OUTLINE_STORE_CONTRACT.length + OUTLINE_TASK_CONTRACT.length + OUTLINE_READ_CONTRACT.length,
 			);
 		},
 		RUN_TIMEOUT_MS,

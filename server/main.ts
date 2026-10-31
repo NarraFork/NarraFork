@@ -1802,6 +1802,15 @@ void startupReadiness.barrier.then((recovery) => {
 	import("./services/outline/live/registry")
 		.then(({ startLiveReplay }) => startLiveReplay())
 		.catch((err) => logger.warn("Outline live log replay failed", { error: String(err) }));
+	// Outline tasks: reopen tasks whose session's lease ran out (every minute, bounded) or whose
+	// session was archived or deleted (on those events), and derive the in-process flag of
+	// blocks written before it existed (once, page by page).
+	import("./services/outline/tasks")
+		.then(({ startOutlineTaskLeaseJob }) => startOutlineTaskLeaseJob())
+		.catch((err) => logger.warn("Outline lease job failed to start", { error: String(err) }));
+	import("./services/outline/in-process")
+		.then(({ scheduleOutlineInProcessRebuild }) => scheduleOutlineInProcessRebuild())
+		.catch((err) => logger.warn("Outline in-process rebuild failed", { error: String(err) }));
 });
 
 // Backfill legacy RecentTabs in bounded background batches. Membership consumers await this
@@ -2002,6 +2011,19 @@ async function performGracefulShutdown(
 			async () => {
 				const live = await import("./services/outline/live/registry");
 				await live.closeAllLiveSessions("ended");
+			},
+			5_000,
+		);
+		await shutdownStep(
+			tracker,
+			"outlineTaskLeases.stop",
+			async () => {
+				const tasks = await import("./services/outline/tasks");
+				const inProcess = await import("./services/outline/in-process");
+				await Promise.all([
+					inProcess.stopOutlineInProcessRebuild(),
+					tasks.stopOutlineTaskLeaseJob(),
+				]);
 			},
 			5_000,
 		);
