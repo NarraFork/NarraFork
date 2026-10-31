@@ -18,6 +18,19 @@ import (
 const gitWorkspaceMaxBytes int64 = 2 * 1024 * 1024
 const gitWorkspaceMaxTimeout int64 = 120000
 
+// gitBranchListLimit mirrors GIT_BRANCH_LIST_LIMIT in shared/git-branches.ts. The
+// ref walk asks for one extra record so the server can tell "exactly at the limit"
+// from "there are more"; the count also bounds the for-each-ref output, which is
+// what keeps this listing cheap on a repository with thousands of refs.
+const gitBranchListLimit = 300
+
+// gitBranchRefFormat is byte-for-byte the format the local server uses. Both ends
+// feed the same parser, so a remote workspace and a local one cannot disagree about
+// upstream tracking, the current branch, or symbolic refs. The separator is `%00`
+// (ref-filter hex escape), not `%x00` (pretty-format spelling) — for-each-ref prints
+// the latter literally.
+const gitBranchRefFormat = "%(refname:lstrip=2)%00%(objectname)%00%(upstream:short)%00%(upstream:track)%00%(committerdate:iso-strict)%00%(contents:subject)%00%(HEAD)%00%(symref)"
+
 // Only active repository writes occupy entries. Shared stash/refs are serialized
 // across worktrees and connections, not just within a narrator or transport.
 var gitWorkspaceWrites = struct {
@@ -436,7 +449,7 @@ func (h *Handlers) GitWorkspace(ctx context.Context, params map[string]any) (any
 	}
 	g.remaining, g.truncated = maxBytes, false
 	// Whole-worktree reads must not let supplied file actions add per-file processes.
-	if _, present := params["files"]; (op == "watch" || op == "status" || op == "lineStats") && present {
+	if _, present := params["files"]; (op == "watch" || op == "status" || op == "lineStats" || op == "branches") && present {
 		return nil, fmt.Errorf("%s does not accept files", op)
 	}
 	if op == "commitDetail" || op == "commitDiff" {
@@ -456,9 +469,10 @@ func (h *Handlers) GitWorkspace(ctx context.Context, params map[string]any) (any
 	}
 	write := false
 	switch op {
-	case "stage", "unstage", "commit", "discard", "stashPush", "stashPop", "stashDrop", "reset":
+	case "stage", "unstage", "commit", "discard", "stashPush", "stashPop", "stashDrop", "reset",
+		"checkout", "push", "fetch":
 		write = true
-	case "watch", "status", "lineStats", "diff", "fullDiff", "log", "stashList":
+	case "watch", "status", "lineStats", "diff", "fullDiff", "log", "stashList", "branches":
 	default:
 		return nil, fmt.Errorf("unknown Git workspace operation")
 	}
@@ -667,12 +681,242 @@ func (h *Handlers) GitWorkspace(ctx context.Context, params map[string]any) (any
 			return nil, fmt.Errorf("invalid reset target or mode")
 		}
 		out, err = run("reset", "--"+mode, target, "--")
+	case "branches":
+		return h.gitWorkspaceBranches(g, head, hasHead)
+	case "checkout":
+		out, err = h.gitWorkspaceCheckout(g, params)
+	case "push":
+		if h.disableShell {
+			// A push runs the credential helper and pre-push hooks: both are external
+			// programs, which --disable-shell exists to prevent.
+			return nil, fmt.Errorf("shell execution is disabled; Git push may run credential helpers or hooks")
+		}
+		if !hasHead {
+			return nil, fmt.Errorf("cannot push from a repository with no commits")
+		}
+		branch, branchCode, branchErr := g.run("symbolic-ref", "--quiet", "--short", "HEAD")
+		if g.ctx.Err() != nil {
+			return nil, g.ctx.Err()
+		}
+		name := strings.TrimSpace(branch)
+		if branchErr != nil || name == "" {
+			if branchErr != nil && branchCode != 1 {
+				return nil, branchErr
+			}
+			return nil, errDetachedHead
+		}
+		remote, remoteErr := h.gitRemote(g, params)
+		if remoteErr != nil {
+			return nil, remoteErr
+		}
+		args := []string{"push", "--porcelain"}
+		if boolParam(params, "setUpstream") {
+			args = append(args, "--set-upstream")
+		}
+		// Explicit refspec and never "+": a non-fast-forward must be reported.
+		refspec := "refs/heads/" + name + ":refs/heads/" + name
+		out, err = run(append(args, remote, refspec)...)
+	case "fetch":
+		if h.disableShell {
+			return nil, fmt.Errorf("shell execution is disabled; Git fetch may run credential helpers")
+		}
+		remote, remoteErr := h.gitRemote(g, params)
+		if remoteErr != nil {
+			return nil, remoteErr
+		}
+		args := []string{"fetch"}
+		if boolParam(params, "prune") {
+			args = append(args, "--prune")
+		}
+		out, err = run(append(args, remote)...)
 	}
 	if err != nil {
 		return nil, err
 	}
 	result["stdout"], result["truncated"] = out, g.truncated
 	return result, nil
+}
+
+var errDetachedHead = fmt.Errorf("cannot push from a detached HEAD; check out a branch first")
+
+// metadata runs one short Git command against a temporary byte budget, then
+// restores the user-visible allowance. Branch identity, remote names and ref lookups
+// are all a few hundred bytes; letting them spend the operation budget would turn a
+// large listing into a misleading "truncated".
+func (g *workspaceGit) metadata(budget int64, args ...string) (string, int, error) {
+	remaining, truncated := g.remaining, g.truncated
+	g.remaining, g.truncated = budget, false
+	out, code, err := g.run(args...)
+	hit := g.lastTruncated
+	g.remaining, g.truncated = remaining, truncated
+	if hit {
+		return "", code, fmt.Errorf("%s output exceeds metadata budget", args[0])
+	}
+	return out, code, err
+}
+
+func containsString(values []string, wanted string) bool {
+	for _, value := range values {
+		if value == wanted {
+			return true
+		}
+	}
+	return false
+}
+
+func validGitRemoteName(name string) bool {
+	return name != "" && len(name) <= 100 && !strings.HasPrefix(name, "-") &&
+		!strings.Contains(name, "..") && !strings.ContainsAny(name, " \t\r\n\x00~^:?*[\\")
+}
+
+// gitRemote picks the configured remote a push/fetch may use, mirroring the local
+// resolver: the caller's choice must be a remote git itself lists, otherwise the
+// current branch's upstream, then "origin", then a repository with one remote.
+// Only names are ever accepted, so no URL, flag or refspec can reach the command.
+func (h *Handlers) gitRemote(g *workspaceGit, params map[string]any) (string, error) {
+	out, _, err := g.metadata(4096, "remote")
+	if err != nil {
+		if g.ctx.Err() != nil {
+			return "", g.ctx.Err()
+		}
+		return "", err
+	}
+	var remotes []string
+	for _, line := range strings.Split(out, "\n") {
+		if name := strings.TrimSpace(line); name != "" {
+			remotes = append(remotes, name)
+		}
+	}
+	if requested := stringParam(params, "remote"); requested != "" {
+		if !validGitRemoteName(requested) {
+			return "", fmt.Errorf("invalid Git remote name")
+		}
+		if !containsString(remotes, requested) {
+			return "", fmt.Errorf("Git remote is not configured: %s", requested)
+		}
+		return requested, nil
+	}
+	// Exit 128 is the ordinary "no upstream configured" answer, not a failure.
+	if upstream, _, upErr := g.metadata(4096, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"); upErr == nil {
+		if first, _, ok := strings.Cut(strings.TrimSpace(upstream), "/"); ok && containsString(remotes, first) {
+			return first, nil
+		}
+	}
+	if g.ctx.Err() != nil {
+		return "", g.ctx.Err()
+	}
+	if containsString(remotes, "origin") {
+		return "origin", nil
+	}
+	if len(remotes) == 1 {
+		return remotes[0], nil
+	}
+	if len(remotes) == 0 {
+		return "", fmt.Errorf("this repository has no Git remote configured")
+	}
+	return "", fmt.Errorf("cannot choose a Git remote; configure an upstream or pass a remote")
+}
+
+// gitBranchTarget resolves a branch that is not being created: an existing local
+// branch is switched to directly, a remote-tracking ref is checked out with
+// --track (which also sets its upstream). show-ref exit code 1 means "no such ref".
+func gitBranchTarget(g *workspaceGit, branch string) ([]string, error) {
+	_, localCode, localErr := g.metadata(4096, "show-ref", "--verify", "--quiet", "refs/heads/"+branch)
+	if g.ctx.Err() != nil {
+		return nil, g.ctx.Err()
+	}
+	if localErr == nil {
+		return []string{branch}, nil
+	}
+	if localCode != 1 {
+		return nil, localErr
+	}
+	_, remoteCode, remoteErr := g.metadata(4096, "show-ref", "--verify", "--quiet", "refs/remotes/"+branch)
+	if g.ctx.Err() != nil {
+		return nil, g.ctx.Err()
+	}
+	if remoteErr == nil {
+		return []string{"--track", branch}, nil
+	}
+	if remoteCode != 1 {
+		return nil, remoteErr
+	}
+	return nil, fmt.Errorf("Git branch not found: %s", branch)
+}
+
+func (h *Handlers) gitWorkspaceCheckout(g *workspaceGit, params map[string]any) (string, error) {
+	branch := stringParam(params, "branch")
+	if !validGitRevision(branch) {
+		return "", fmt.Errorf("invalid Git branch name")
+	}
+	// git owns the naming rules; a name that passes the schema can still be refused.
+	if _, _, err := g.metadata(4096, "check-ref-format", "--branch", branch); err != nil {
+		if g.ctx.Err() != nil {
+			return "", g.ctx.Err()
+		}
+		return "", fmt.Errorf("invalid Git branch name")
+	}
+	args := []string{"checkout"}
+	if boolParam(params, "create") {
+		args = append(args, "-b", branch)
+		if start := stringParam(params, "startPoint"); start != "" {
+			if !validGitRevision(start) {
+				return "", fmt.Errorf("invalid Git start point")
+			}
+			args = append(args, start)
+		}
+	} else {
+		target, err := gitBranchTarget(g, branch)
+		if err != nil {
+			return "", err
+		}
+		args = append(args, target...)
+	}
+	out, _, err := g.run(append(args, "--")...)
+	return out, err
+}
+
+// gitWorkspaceBranches returns the two raw ref listings plus the metadata the
+// server cannot derive from them; the server parses everything with the same
+// parser it uses for a local workspace.
+func (h *Handlers) gitWorkspaceBranches(g *workspaceGit, head string, hasHead bool) (any, error) {
+	outputs := map[string]string{"headSha": "", "branch": ""}
+	if hasHead {
+		outputs["headSha"] = strings.TrimSpace(head)
+	}
+	branch, code, err := g.metadata(4096, "symbolic-ref", "--quiet", "--short", "HEAD")
+	if g.ctx.Err() != nil {
+		return nil, g.ctx.Err()
+	}
+	if err == nil {
+		outputs["branch"] = strings.TrimSpace(branch)
+	} else if code != 1 {
+		return nil, err
+	}
+	for _, listing := range []struct{ key, ref string }{
+		{"heads", "refs/heads"},
+		{"remoteRefs", "refs/remotes"},
+	} {
+		// The format is `--format=…`; a bare argument is read as a ref pattern and
+		// git then prints its default columns instead of this format.
+		out, _, runErr := g.run("for-each-ref", "--sort=-committerdate",
+			fmt.Sprintf("--count=%d", gitBranchListLimit+1), "--format="+gitBranchRefFormat, listing.ref)
+		if runErr != nil {
+			return nil, runErr
+		}
+		outputs[listing.key] = out
+	}
+	if out, _, runErr := g.run("worktree", "list", "--porcelain"); runErr != nil {
+		return nil, runErr
+	} else {
+		outputs["worktrees"] = out
+	}
+	if out, _, runErr := g.run("remote"); runErr != nil {
+		return nil, runErr
+	} else {
+		outputs["remoteNames"] = out
+	}
+	return map[string]any{"outputs": outputs, "truncated": g.truncated}, nil
 }
 
 func (h *Handlers) workspaceFileDiff(g *workspaceGit, path string, staged bool) (string, error) {

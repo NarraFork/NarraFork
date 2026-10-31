@@ -130,6 +130,72 @@ describe("git APIs", () => {
 		);
 	});
 
+	test("branch reads and writes pin the workspace and send their bodies", async () => {
+		installLocalStorage();
+		setToken("git-token");
+		const calls: Array<{
+			url: string;
+			method?: string;
+			body?: string;
+			signal?: AbortSignal | null;
+		}> = [];
+		Object.defineProperty(g, "fetch", {
+			configurable: true,
+			value: async (input: RequestInfo | URL, init?: RequestInit) => {
+				calls.push({
+					url: String(input),
+					method: init?.method,
+					body: typeof init?.body === "string" ? init.body : undefined,
+					signal: init?.signal,
+				});
+				return Response.json({});
+			},
+		});
+		const target: GitTarget = {
+			narratorId: "branch-narrator",
+			workspaceKey: "device-a:/repo",
+			repositoryKey: "device-a:/repo/.git",
+			canWrite: true,
+		};
+		const controller = new AbortController();
+		await api.getGitBranches(target, controller.signal);
+		await api.gitCheckoutBranch(target, {
+			branch: "feature/x",
+			create: true,
+			startPoint: "origin/feature/x",
+		});
+		await api.gitPushBranch(target, { remote: "origin", setUpstream: true });
+		await api.gitFetchRemote(target, { remote: "origin", prune: true });
+
+		const urls = calls.map(({ url }) => new URL(url, "http://localhost"));
+		expect(urls.map((url) => url.pathname)).toEqual([
+			"/api/narrators/branch-narrator/git/branches",
+			"/api/narrators/branch-narrator/git/checkout",
+			"/api/narrators/branch-narrator/git/push",
+			"/api/narrators/branch-narrator/git/fetch",
+		]);
+		// The listing is a read: identity travels in the query string, not in a body.
+		expect(urls[0]?.searchParams.get("workspaceKey")).toBe("device-a:/repo");
+		expect(calls[0]?.method).toBeUndefined();
+		expect(calls[0]?.body).toBeUndefined();
+		controller.abort();
+		expect(calls[0]?.signal?.aborted).toBe(true);
+		// Every write carries the same pinned workspace key plus its own options.
+		expect(calls.slice(1).every((call) => call.method === "POST")).toBe(true);
+		expect(calls.slice(1).map((call) => JSON.parse(call.body ?? "{}"))).toEqual([
+			{
+				branch: "feature/x",
+				create: true,
+				startPoint: "origin/feature/x",
+				workspaceKey: "device-a:/repo",
+			},
+			{ remote: "origin", setUpstream: true, workspaceKey: "device-a:/repo" },
+			{ remote: "origin", prune: true, workspaceKey: "device-a:/repo" },
+		]);
+		expect(() => api.gitPushBranch({ ...target, canWrite: false })).toThrow("read-only");
+		clearToken();
+	});
+
 	test("commit preview reads pin and encode workspace, paths and route identities without writes", async () => {
 		installLocalStorage();
 		setToken("git-token");

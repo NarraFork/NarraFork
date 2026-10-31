@@ -5,13 +5,16 @@ import { resolveUserGitIdentityEnv } from "../lib/git-identity";
 import { logger } from "../lib/logger";
 import { narratorPrincipalOf, requireNarratorAccess } from "../lib/narrator-access";
 import {
+	gitCheckoutSchema,
 	gitCommitDiffQuerySchema,
 	gitCommitSchema,
 	gitCommitShaSchema,
 	gitDiffQuerySchema,
 	gitDiscardSchema,
+	gitFetchSchema,
 	gitLogQuerySchema,
 	gitModificationsQuerySchema,
+	gitPushSchema,
 	gitResetSchema,
 	gitStageSchema,
 	gitStashSchema,
@@ -369,6 +372,38 @@ function createGitRoutes() {
 		else await git.resetSoft(path, ref);
 		changed(c);
 		return c.json(await summary(c));
+	});
+	// === Branch management ===
+	routes.get(`${prefix}/branches`, async (c) => {
+		const { path, git } = access(c);
+		return c.json(await git.getBranches(path));
+	});
+	routes.post(`${prefix}/checkout`, async (c) => {
+		const { path, git } = access(c);
+		// safeParse + zodValidationError: a bare `.parse()` rejection is not an
+		// AppError, so it would surface as a 500 rather than a 400.
+		const parsed = gitCheckoutSchema.safeParse(await c.req.json());
+		if (!parsed.success) throw zodValidationError(parsed.error);
+		await git.checkoutBranch(path, parsed.data);
+		changed(c);
+		return c.json({ status: await summary(c) });
+	});
+	routes.post(`${prefix}/push`, async (c) => {
+		const { path, git } = access(c);
+		const parsed = gitPushSchema.safeParse(await c.req.json());
+		if (!parsed.success) throw zodValidationError(parsed.error);
+		// Never `--force`: a non-fast-forward comes back as git's own refusal text.
+		await git.push(path, parsed.data);
+		changed(c);
+		return c.json({ status: await summary(c) });
+	});
+	routes.post(`${prefix}/fetch`, async (c) => {
+		const { path, git } = access(c);
+		const parsed = gitFetchSchema.safeParse(await c.req.json());
+		if (!parsed.success) throw zodValidationError(parsed.error);
+		await git.fetch(path, parsed.data);
+		changed(c);
+		return c.json({ status: await summary(c) });
 	});
 	routes.post(`${prefix}/ai-commit-message`, async (c) => {
 		const { path, git } = access(c);

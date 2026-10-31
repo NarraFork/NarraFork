@@ -157,6 +157,7 @@ export const GIT_FACT_QUERIES = [
 	"gitDiff",
 	"gitLog",
 	"gitStashList",
+	"gitBranches",
 	"gitCommitDetail",
 	"gitCommitDiff",
 ];
@@ -165,9 +166,16 @@ export const GIT_FACT_QUERIES = [
  * Live facts invalidated by a WS `git_status` push. Derived from
  * GIT_FACT_QUERIES so a new live fact cannot drift out of the push path;
  * commit previews are immutable and excluded.
+ *
+ * `gitBranches` is excluded too, and for a different reason: a push arrives up to
+ * once a second, while one listing is five git processes. Re-listing at that rate
+ * would be the panel's most expensive idle behaviour. A branch that changes under
+ * an open panel is caught by the bar, which refetches once when `status.branch` or
+ * `status.headSha` changes — the status poll is the cheap thing that already runs.
  */
 export const GIT_LIVE_FACT_QUERIES = GIT_FACT_QUERIES.filter(
-	(prefix) => prefix !== "gitCommitDetail" && prefix !== "gitCommitDiff",
+	(prefix) =>
+		prefix !== "gitCommitDetail" && prefix !== "gitCommitDiff" && prefix !== "gitBranches",
 );
 
 export function gitWorkspaceTarget(narratorId: string, workspace?: GitWorkspace): GitTarget | null {
@@ -402,6 +410,7 @@ async function readWorkspace<T>(
 		// Re-probing would unmount/reopen its consumer and repeat the same failure.
 		const unsupportedOperation =
 			(failure?.status === 409 && failure.data?.code === GIT_COMMIT_PREVIEW_UNSUPPORTED) ||
+			(failure?.status === 409 && failure.data?.code === "GIT_BRANCHES_UNSUPPORTED") ||
 			failure?.data?.code === "GIT_LINE_STATS_UNSUPPORTED";
 		if (
 			target &&
@@ -761,6 +770,31 @@ export function useGitStatus<V extends GitWorkspaceView = "details">(
 }
 
 /**
+ * The branch listing behind the panel's branch bar and picker.
+ *
+ * Read on demand only: it costs five git processes (two ref walks, worktree list,
+ * remote list, HEAD identity), which is acceptable once when the panel opens and
+ * far too much on the ~1/s `git_status` push. It is therefore absent from
+ * {@link GIT_LIVE_FACT_QUERIES} and is refreshed by an explicit write instead.
+ */
+export function useGitBranches(target: GitTarget | undefined | null, enabled = true) {
+	const qc = useQueryClient();
+	const key = gitTargetKey(target);
+	return useQuery({
+		queryKey: ["gitBranches", key],
+		queryFn: ({ signal }) =>
+			readWorkspace(qc, target, () => api.getGitBranches(target as GitTarget, signal)),
+		enabled: Boolean(target && key) && enabled,
+		// Short enough that reopening the panel re-reads, long enough that the bar and
+		// the picker share one response instead of racing each other.
+		staleTime: 10_000,
+		gcTime: GIT_QUERY_GC_TIME_MS,
+		refetchOnWindowFocus: false,
+		retry: false,
+	});
+}
+
+/**
  * Minimum interval between two badge refreshes (ms). `focus` and
  * `visibilitychange` co-fire on a single return gesture, and a foreground return
  * usually also triggers the WS reconnect that raises the second signal
@@ -963,4 +997,20 @@ export function useGitReset(target: GitTarget) {
 }
 export function useGitAiCommitMessage(target: GitTarget) {
 	return useGitMutation<void, { message: string }>(target, () => api.gitAiCommitMessage(target));
+}
+/** Switch, create (`create` + `startPoint`), or track a remote branch by name. */
+export function useGitCheckoutBranch(target: GitTarget) {
+	return useGitMutation(target, (body: { branch: string; create?: boolean; startPoint?: string }) =>
+		api.gitCheckoutBranch(target, body),
+	);
+}
+export function useGitPushBranch(target: GitTarget) {
+	return useGitMutation(target, (body: { remote?: string; setUpstream?: boolean }) =>
+		api.gitPushBranch(target, body),
+	);
+}
+export function useGitFetchRemote(target: GitTarget) {
+	return useGitMutation(target, (body: { remote?: string; prune?: boolean }) =>
+		api.gitFetchRemote(target, body),
+	);
 }
