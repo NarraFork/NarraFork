@@ -435,6 +435,32 @@ export const updateSettingsSchema = z
 					)
 					.optional(),
 				maxTurns: z.number().int().min(1).max(1000),
+				/**
+				 * 「平台集成」的实例清单：同一平台可有多个实例，靠 `prefix` 区分
+				 * （模型 ID 为 `<prefix>:<model>`）。为空时回退旧的单例字段。
+				 */
+				platformInstances: z
+					.array(
+						z.object({
+							id: z.string().min(1).max(64),
+							platform: z.enum(["codex", "CommandCode", "tokendance"]),
+							name: z.string().min(1).max(80),
+							suffix: z.string().max(40),
+							prefix: z
+								.string()
+								.min(1)
+								.max(40)
+								.regex(/^[A-Za-z0-9_-]+$/, "prefix 只能包含字母、数字、下划线与连字符"),
+							disabled: z.boolean(),
+							config: z.record(z.string(), z.unknown()),
+						}),
+					)
+					.max(20)
+					.refine(
+						(entries) => new Set(entries.map((entry) => entry.prefix)).size === entries.length,
+						{ message: "平台实例的 prefix 必须唯一" },
+					)
+					.optional(),
 				subagentModels: z
 					.object({
 						explore: z.string(),

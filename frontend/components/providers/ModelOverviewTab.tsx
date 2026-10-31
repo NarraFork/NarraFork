@@ -37,6 +37,8 @@ export interface ProviderGroup {
 	models: ModelOption[];
 	disabled: boolean;
 	isPlatform: boolean;
+	/** 平台实例是否已配置；内置平台不带这个字段。 */
+	configured?: boolean;
 	/**
 	 * Owning plugin, when this provider comes from an executable plugin rather than a
 	 * builtin adapter. Present together with `contributionId` so the detail area can

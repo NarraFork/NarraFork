@@ -91,6 +91,7 @@ export const DEFAULTS: NarraForkSettings = {
 			review: [],
 		},
 		subagentModelReasoningEfforts: {},
+		platformInstances: [],
 		legacyEncoding: false,
 		freshShellEnv: false,
 		translateReasoning: false,
@@ -554,6 +555,11 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 		desc: "叙述者会话的最大轮次。达到后 agent loop 停止。范围 1-1000。在 80% 时会发送 wrap-up 提醒。",
 		type: "number",
 		valid: "1-1000, 默认 1000",
+	},
+	"agent.platformInstances": {
+		desc: "「平台集成」的实例清单：同一平台可有多个实例，靠 prefix 区分（模型 ID 为 prefix:model）。为空时回退旧的单例字段。",
+		type: "array",
+		valid: "默认 []；prefix 必须唯一且只含 [A-Za-z0-9_-]",
 	},
 	"agent.subagentModels.explore": {
 		desc: "explore 子代理的默认模型。空字符串表示使用全局 defaultModel。",

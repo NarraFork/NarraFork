@@ -14,6 +14,8 @@ export interface ProviderOverviewViewProps {
 	onOpenProviderConfig: (prefix: string) => void;
 	selectedProvider: string | null;
 	pendingProvider?: string;
+	/** 平台集成分区的「添加」：新建同平台的另一个实例。 */
+	onAddPlatform?: () => void;
 }
 
 export const ProviderOverviewView = React.memo(function ProviderOverviewView({
@@ -23,6 +25,7 @@ export const ProviderOverviewView = React.memo(function ProviderOverviewView({
 	onOpenProviderConfig,
 	selectedProvider,
 	pendingProvider,
+	onAddPlatform,
 }: ProviderOverviewViewProps) {
 	const { t } = useTranslation("settings");
 
@@ -42,6 +45,7 @@ export const ProviderOverviewView = React.memo(function ProviderOverviewView({
 
 	const getProviderStatus = (group: ProviderGroup): ProviderStatus => {
 		if (group.disabled) return "disabled";
+		if (group.configured === false) return "unverified";
 		if (group.prefix === "tokendance" && group.isPlatform) return "connected";
 		if (group.models.length === 0) return "unverified";
 		return "connected";
@@ -127,9 +131,19 @@ export const ProviderOverviewView = React.memo(function ProviderOverviewView({
 			{/* Platform providers */}
 			{platformGroups.length > 0 && (
 				<Box style={{ overflow: "hidden" }}>
-					<Title order={4} mb="xs">
-						{t("providerSectionPlatform")}
-					</Title>
+					<Group justify="space-between" align="center" mb="xs">
+						<Title order={4}>{t("providerSectionPlatform")}</Title>
+						{onAddPlatform && (
+							<Button
+								size="xs"
+								variant="light"
+								leftSection={<IconPlus size={14} />}
+								onClick={onAddPlatform}
+							>
+								{t("addPlatform")}
+							</Button>
+						)}
+					</Group>
 					<Grid>{platformGroups.map(renderProviderCard)}</Grid>
 				</Box>
 			)}

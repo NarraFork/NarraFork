@@ -39,6 +39,10 @@ import { GeminiProvider } from "./gemini-provider";
 import { NugProvider } from "./nug-provider";
 import { OpenAIProvider } from "./openai-provider";
 import {
+	listPlatformInstanceReadiness,
+	resolvePlatformInstanceAdapter,
+} from "./platform-instance-providers";
+import {
 	connectionForProtocolSwitch,
 	type ProtocolConnectionFields,
 	protocolMatchesConnection,
@@ -389,6 +393,13 @@ builtinProviderSources.register("CommandCode", {
 				!!resolveCommandCodeToken(settings.commandCode?.apiKey).credential,
 		},
 	],
+});
+
+// 同一平台的额外实例（第二个及以后）：前缀由用户决定，如 `codex-2`。
+// 内置前缀仍由上面三个注册解析，所以升级前后的行为完全一致。
+builtinProviderSources.register("platform-instances", {
+	resolve: (provider, model) => resolvePlatformInstanceAdapter(provider, model),
+	listReadiness: () => listPlatformInstanceReadiness(),
 });
 
 /** API families expose the same instances used to construct their adapters. */

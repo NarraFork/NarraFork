@@ -142,6 +142,8 @@ export interface CodexProviderOptions {
 	useWebSearch?: boolean;
 	/** Allow the native image_generation tool to be sent to Codex models. */
 	useImageGeneration?: boolean;
+	/** 平台实例选中的凭据；为空表示不限制（沿用内置平台的凭据池）。 */
+	credentialIds?: readonly string[];
 }
 
 /**
@@ -156,6 +158,7 @@ export class CodexProvider implements ProviderAdapter {
 	private useWebSocket: boolean;
 	private useWebSearch: boolean;
 	private useImageGeneration: boolean;
+	private credentialIds?: readonly string[];
 
 	constructor(options?: CodexProviderOptions) {
 		const mode = settings.codex?.loadBalancingMode;
@@ -166,6 +169,7 @@ export class CodexProvider implements ProviderAdapter {
 		this.useWebSocket = options?.useWebSocket ?? true;
 		this.useWebSearch = options?.useWebSearch ?? true;
 		this.useImageGeneration = options?.useImageGeneration ?? true;
+		this.credentialIds = options?.credentialIds;
 	}
 
 	/** Get or acquire a valid credential context. */
@@ -182,7 +186,10 @@ export class CodexProvider implements ProviderAdapter {
 				}
 			}
 		}
-		this.context = await this.manager.acquireContext(sessionKey);
+		this.context = await this.manager.acquireContext(
+			sessionKey,
+			this.credentialIds?.length ? { credentialIds: this.credentialIds } : undefined,
+		);
 		this.contextSessionKey = sessionKey;
 		return this.context;
 	}
