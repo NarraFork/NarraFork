@@ -68,8 +68,6 @@ const clearTrace = mock(async (..._args: unknown[]) => {});
 mock.module("./modeltrace-store", () => ({
 	ensureTraceNarrator: ensureTrace,
 	clearTraceHistory: clearTrace,
-	modelTraceKey: (provider: string, model: string) => `${provider}::${model}`,
-	findModelTraceNarrator: mock(async () => null),
 }));
 mock.module("./narrator-persistence", () => ({
 	narratorPersistence: {
@@ -311,6 +309,14 @@ describe("ModelTrace independent single-request probe", () => {
 		expect(startRequest).not.toHaveBeenCalled();
 	});
 
+	test("a busy cabin is claimed before its history can be cleared", async () => {
+		claimed = true;
+		await expect(startModelTrace("parent", "operator")).rejects.toThrow("active execution");
+		expect(ensureTrace).toHaveBeenCalledTimes(1);
+		expect(clearTrace).not.toHaveBeenCalled();
+		expect(chat).not.toHaveBeenCalled();
+	});
+
 	test("rejects busy retries without another launch or fork", async () => {
 		await complete();
 		childRow.mockResolvedValueOnce({ traits: ["modeltrace"], status: "working" });
@@ -392,7 +398,7 @@ describe("ModelTrace independent single-request probe", () => {
 		expect(await complete()).toEqual({ id: "probe" });
 		expect(ensureTrace).toHaveBeenCalledWith({
 			parentId: "parent",
-			key: "frozen-provider::gpt-5.4",
+			provider: "frozen-provider",
 			title: "ModelTrace: gpt-5.4",
 			model: "gpt-5.4",
 			userId: "operator",

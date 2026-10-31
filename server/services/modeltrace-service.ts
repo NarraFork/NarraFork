@@ -25,7 +25,7 @@ import type { ModelTraceResultBlock } from "@shared/modeltrace-result";
 import { eq } from "drizzle-orm";
 import { createRuntimeEventContext } from "./agent-runtime/context";
 import { type ExecutionOwner, tryClaimExecution } from "./agent-runtime/ownership";
-import { clearTraceHistory, ensureTraceNarrator, modelTraceKey } from "./modeltrace-store";
+import { clearTraceHistory, ensureTraceNarrator } from "./modeltrace-store";
 
 // Session interrupt imports cancelModelTrace synchronously. Load persistence, websocket
 // and narrator-service only on execution to avoid their session dependency cycles.
@@ -342,8 +342,9 @@ async function launchProbe(
 	snapshot: ModelTraceRequest,
 	userId: string,
 	locale: string,
+	claimed?: ExecutionOwner,
 ): Promise<{ id: string }> {
-	const owner = tryClaimExecution(id, "run");
+	const owner = claimed ?? tryClaimExecution(id, "run");
 	if (!owner) throw new ValidationError("ModelTrace child already has an active execution");
 	const controller = new AbortController();
 	controllers.set(id, controller);
@@ -391,19 +392,26 @@ export async function startModelTrace(
 	locale = "en",
 ): Promise<{ id: string }> {
 	const snapshot = requireSnapshot(parentId);
-	// 一个模型一个舱：同一个模型再次 /modeltrace 只清空它自己的历史再重跑。
+	// 每个用户、每个模型一个舱。先占住执行锁再清历史，重叠的一次运行不能删掉正在用的记录。
 	const traceId = await ensureTraceNarrator({
 		parentId,
-		key: modelTraceKey(snapshot.provider, snapshot.params.model),
-		title: `ModelTrace: ${snapshot.params.model}`,
-		model: snapshot.params.model,
 		userId,
+		provider: snapshot.provider,
+		model: snapshot.params.model,
+		title: `ModelTrace: ${snapshot.params.model}`,
 		locale,
 	});
-	await clearTraceHistory(traceId);
-	// Keep the original prefix, not the probe params with the diagnostic prompt appended.
-	rememberModelTraceRequest(traceId, snapshot.adapter, snapshot.params, snapshot.provider);
-	return launchProbe(traceId, snapshot, userId, locale);
+	const owner = tryClaimExecution(traceId, "run");
+	if (!owner) throw new ValidationError("ModelTrace child already has an active execution");
+	try {
+		await clearTraceHistory(traceId);
+		// Keep the original prefix, not the probe params with the diagnostic prompt appended.
+		rememberModelTraceRequest(traceId, snapshot.adapter, snapshot.params, snapshot.provider);
+	} catch (error) {
+		owner.release();
+		throw error;
+	}
+	return launchProbe(traceId, snapshot, userId, locale, owner);
 }
 
 export async function retryModelTrace(
