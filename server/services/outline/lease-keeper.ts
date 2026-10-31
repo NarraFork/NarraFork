@@ -34,7 +34,10 @@ export const OUTLINE_LEASE_RETRY = {
 };
 
 export interface OutlineLeaseKeeper {
-	/** Renew now unless the session renewed within `renewEveryMs`; resolves when done. */
+	/**
+	 * Renew now unless the session renewed within `renewEveryMs`; resolves when done (or, when it
+	 * does not renew, once this keeper's renewal still on its way is).
+	 */
 	touch(): Promise<void>;
 	/**
 	 * Stop renewing (the run ended). Unless another run of the session is still going, its claims
@@ -77,7 +80,10 @@ export function keepOutlineTaskLeases(
 		const failed = failing.get(narratorId);
 		if (failed && at < failed.retryAt) return;
 		const last = lastRenewal.get(narratorId);
-		if (!failed && last !== undefined && at - last < OUTLINE_TASK_LEASE.renewEveryMs) return;
+		if (!failed && last !== undefined && at - last < OUTLINE_TASK_LEASE.renewEveryMs) {
+			await inflight;
+			return;
+		}
 		lastRenewal.set(narratorId, at);
 		const renewal = renew(at, failed);
 		inflight = renewal;

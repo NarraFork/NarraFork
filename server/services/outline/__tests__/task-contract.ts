@@ -655,7 +655,8 @@ export const OUTLINE_TASK_CONTRACT: ContractCase[] = [
 			});
 
 			// The lease expiry reverted by a person: back in progress, given back to the session
-			// whose lease ran out, on a new lease (it runs out again if that session stays away).
+			// whose lease ran out, on the idle lease (it runs out again if that session stays away
+			// for a day).
 			await write(ctx, space, person, [status(task, "todo")], at(t0, 4));
 			await write(ctx, space, n1, [doing(task)], at(t0, 5));
 			expect(
@@ -676,9 +677,9 @@ export const OUTLINE_TASK_CONTRACT: ContractCase[] = [
 			expect(await claimOf(ctx, task)).toMatchObject({
 				holderUserId: null,
 				holderNarratorId: ids.n1,
-				expiresAt: at(t0, 27).toISOString(),
+				expiresAt: at(t0, 17 + OUTLINE_TASK_IDLE_LEASE_MS / MINUTE).toISOString(),
 			});
-			// A session restoring one gets a lease.
+			// A session restoring one gets the running lease.
 			await write(ctx, space, person, [{ op: "delete", block: { id: task } }], at(t0, 20));
 			await write(ctx, space, n1, [{ op: "restore", block: { id: task } }], at(t0, 21));
 			expect(await claimOf(ctx, task)).toMatchObject({
@@ -1891,15 +1892,17 @@ export const OUTLINE_TASK_CONTRACT: ContractCase[] = [
 			);
 			const [t, u] = r.results.map((x) => x.blockId) as [string, string];
 
-			// The session's own "done", undone by the person: the session has it again, on a lease
-			// from the revert, in a new generation; it can carry on and finish it.
+			// The session's own "done", undone by the person: the session has it again, on the idle
+			// lease from the revert (a hand-back: it is most likely not running), in a new
+			// generation; it can carry on and finish it.
+			const DAY = OUTLINE_TASK_IDLE_LEASE_MS / MINUTE;
 			const done = await write(ctx, space, n1, [status(t, "done")], at(t0, 1));
 			await undo(done.commit?.id as string, user, 2);
 			expect(await claimOf(ctx, t)).toMatchObject({
 				holderNarratorId: ids.n1,
 				holderUserId: null,
 				epoch: 2,
-				expiresAt: at(t0, 12).toISOString(),
+				expiresAt: at(t0, 2 + DAY).toISOString(),
 				lastHolderNarratorId: null,
 			});
 			const found = await findContinuationCandidates({
@@ -1915,7 +1918,39 @@ export const OUTLINE_TASK_CONTRACT: ContractCase[] = [
 			const ticked = await write(ctx, space, person, [status(u, "done")], at(t0, 4));
 			expect(ticked.ended?.map((e) => e.blockId)).toEqual([u]);
 			await undo(ticked.commit?.id as string, user, 5);
-			expect(await claimOf(ctx, u)).toMatchObject({ holderNarratorId: ids.n1, holderUserId: null });
+			expect(await claimOf(ctx, u)).toMatchObject({
+				holderNarratorId: ids.n1,
+				holderUserId: null,
+				expiresAt: at(t0, 5 + DAY).toISOString(),
+			});
+			// Its next run renews it back to the running lease (at its start); its end, to the idle
+			// one.
+			const nextRun = keepOutlineTaskLeases(ids.n1, {
+				store: ctx.store,
+				now: () => at(t0, 6).getTime(),
+				enabled: () => true,
+				intervalMs: 0,
+			});
+			await nextRun.touch();
+			expect((await claimOf(ctx, u))?.expiresAt).toBe(at(t0, 16).toISOString());
+			await nextRun.stop();
+			expect((await claimOf(ctx, u))?.expiresAt).toBe(at(t0, 6 + DAY).toISOString());
+			// A session undoing its own "done" takes it back itself: it is running, on the running
+			// lease.
+			const again = await write(ctx, space, n1, [status(u, "done")], at(t0, 6));
+			await revertCommit(
+				{
+					commitId: again.commit?.id as string,
+					actor: { kind: "agent", id: ids.n1 },
+					narratorId: ids.n1,
+					responsibleUserId: null,
+				},
+				{ store: ctx.store, now: () => at(t0, 6) },
+			);
+			expect(await claimOf(ctx, u)).toMatchObject({
+				holderNarratorId: ids.n1,
+				expiresAt: at(t0, 16).toISOString(),
+			});
 
 			// A subagent's work goes back to its session's root.
 			const root = await ctx.seedNarrator();
@@ -1931,7 +1966,10 @@ export const OUTLINE_TASK_CONTRACT: ContractCase[] = [
 			const step = s.results[0]?.blockId as string;
 			const subDone = await write(ctx, space, S, [status(step, "done")], at(t0, 7));
 			await undo(subDone.commit?.id as string, user, 8);
-			expect((await claimOf(ctx, step))?.holderNarratorId).toBe(root);
+			expect(await claimOf(ctx, step)).toMatchObject({
+				holderNarratorId: root,
+				expiresAt: at(t0, 8 + DAY).toISOString(),
+			});
 
 			// A person's own task undone by someone else, and a session that no longer exists: the
 			// one who undoes it is doing it.

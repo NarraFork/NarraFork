@@ -42,7 +42,7 @@
  *
  * A session is one holder with its subagents: a subagent and its root (`acl_root_narrator_id`,
  * the store's `getNarratorRoots`) never refuse each other, and a subagent's claims pass to its
- * root when its run ends (`lease-keeper.ts`).
+ * root, on the idle lease, when its run ends (`lease-keeper.ts`).
  *
  *   - Nobody holds it (no row, released, or a session's lease ran out): the writer takes it, and
  *     the claim generation (`epoch`) grows by one. A takeover that changes nothing else is a
@@ -55,8 +55,11 @@
  *     refused with `OutlineTaskClaimedError`, naming the holder.
  *
  * A compensating commit (a revert) puts a task back to whoever was doing it when it was ended
- * (the claim's `last_holder_narrator_id`, their session's root, with a new lease); only when that
- * was a person, or nobody is known (or the session is gone), is the writer the claimer.
+ * (the claim's `last_holder_narrator_id`, their session's root). Given back to a session other
+ * than the writer, the claim is on the idle lease (`OUTLINE_TASK_IDLE_LEASE_MS`, D41), as every
+ * hand-back: that session is most likely not running, and a run of it renews the lease back to
+ * the running one. Only when that was a person, or nobody is known (or the session is gone), is
+ * the writer the claimer.
  *
  * A system write for no session cannot claim, so a task it would start is left to do (reported
  * as a `task-not-started` adjustment): no task is in progress with nobody holding it.
@@ -126,6 +129,7 @@ import {
 	OUTLINE_ACTOR_KINDS,
 	OUTLINE_CHANGE,
 	OUTLINE_LIMITS,
+	OUTLINE_TASK_IDLE_LEASE_MS,
 	type OutlineActorKind,
 	type OutlineCommitKind,
 	type OutlineLinkKind,
@@ -2078,7 +2082,11 @@ class OutlinePlanner {
 				throw new OutlineTaskClaimedError(id, this.address(block.sid), holderOf(row), opIndex);
 			}
 			// A revert puts the task back to whoever was doing it; otherwise the writer takes it.
-			const holder = (this.compensating ? this.previousHolder(row, roots) : null) ?? claimer;
+			const previous = this.compensating ? this.previousHolder(row, roots) : null;
+			const holder = previous ?? claimer;
+			// Given back to another session, which is most likely not running: on the idle lease,
+			// as every hand-back (D41); a run of it renews that back to the running lease.
+			const handedBack = previous !== null && previous.narratorId !== claimer.narratorId;
 			plan.put.push({
 				row: {
 					taskBlockId: id,
@@ -2087,7 +2095,12 @@ class OutlinePlanner {
 					epoch: row ? row.epoch + 1 : 1,
 					taskVersionAtClaim: versioned.has(id) ? seq : (block.base?.versionSeq ?? seq),
 					claimedAt: this.now,
-					expiresAt: holder.narratorId !== undefined ? outlineLeaseEnd(this.now) : null,
+					expiresAt:
+						holder.narratorId === undefined
+							? null
+							: handedBack
+								? outlineLeaseEnd(this.now, OUTLINE_TASK_IDLE_LEASE_MS)
+								: outlineLeaseEnd(this.now),
 					lastHolderNarratorId: null,
 					lastHolderUserId: null,
 				},
@@ -2116,8 +2129,8 @@ class OutlinePlanner {
 
 	/**
 	 * Who a revert gives a task back to: the session that was doing it when it was ended (its
-	 * root), with a new lease. Null (the writer takes it) when that was a person, nobody is
-	 * known, or the session no longer exists.
+	 * root), on the idle lease unless that is the writer itself. Null (the writer takes it) when
+	 * that was a person, nobody is known, or the session no longer exists.
 	 */
 	private previousHolder(
 		row: OutlineTaskClaimRow | null,
