@@ -257,10 +257,10 @@ function formatPlanSource(template: string, file: string): string {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Category → colour (mirrors ToolCallCard getCategoryColor). Kept local to the
-// vlist render layer so it never imports the heavy ToolCallCard module; exported
-// so a subagent card's recent-call rows tint their chips from the same table the
-// tool header and the trace rows use.
+// Category → colour (mirrors getCategoryColor in tool-display.ts). Kept local so
+// the vlist render layer does not import the classifier; exported so a subagent
+// card's recent-call rows tint their chips from the same table the tool header
+// and the trace rows use.
 // ─────────────────────────────────────────────────────────────────────────────
 export const CATEGORY_COLOR: Record<ToolCategory, string> = {
 	read: "lime",
@@ -292,9 +292,26 @@ export const CATEGORY_COLOR: Record<ToolCategory, string> = {
 	browser: "teal",
 	knowledge: "grape",
 	outline: "teal",
+	// Mirrors getCategoryColor's terminal yellow. A missing key here made the header
+	// chip receive `undefined`, which Mantine's colour parser throws on.
+	schedule: "yellow",
 	workspace: "gray",
 	generic: "gray",
 };
+
+/**
+ * Chip tint for a category string coming off the adapter.
+ *
+ * `CATEGORY_COLOR` is complete for `ToolCategory`, but the registry casts the
+ * adapter's plain string through `AnyData`. A value the table does not know must
+ * still paint: `undefined` reaches Mantine's colour parser, which throws
+ * "Failed to parse color" and the root error boundary replaces the narrator view.
+ * Unknown or absent → gray, the same tint `generic` already uses.
+ */
+export function categoryColor(category: string | null | undefined): string {
+	if (!category) return "gray";
+	return CATEGORY_COLOR[category as ToolCategory] ?? "gray";
+}
 
 const STATUS_COLOR: Record<ToolCallStatus, string> = {
 	pending: "yellow",
@@ -517,7 +534,7 @@ function ToolHeaderRow({
 	onTerminate,
 	terminateLabel,
 }: ToolHeaderRowProps) {
-	const color = CATEGORY_COLOR[category];
+	const color = categoryColor(category);
 	const statusColor = STATUS_COLOR[status];
 	const statusMark = resolveToolRowStatusMark(status, { reflectionStatus, queuedBehindUpstream });
 	const running = isRunningStatus(status);
@@ -2727,7 +2744,7 @@ export function RenderToolCallGroup({
 	const { expanded, headerHeight, childCount, children, bodyLeft, contentWidth } = measured;
 	// Child colour + glyph follow the first child's category (same as chunk mode).
 	const firstChild = children[0];
-	const groupColor = firstChild ? CATEGORY_COLOR[firstChild.category] : "gray";
+	const groupColor = categoryColor(firstChild?.category);
 	const Icon =
 		icon ?? (firstChild ? categoryIcon(firstChild.category, firstChild.toolName) : IconTool);
 

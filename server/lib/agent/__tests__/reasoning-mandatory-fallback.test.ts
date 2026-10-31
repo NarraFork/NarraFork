@@ -20,6 +20,9 @@ import { ApiError } from "../types";
 
 const MANDATORY_MESSAGE =
 	"Anthropic API error 400: Reasoning is mandatory for this endpoint and cannot be disabled.";
+const ADAPTIVE_ONLY_MESSAGE =
+	"Anthropic API error 400: claude-opus-5-5 requires adaptive thinking; " +
+	"omit thinking or use thinking.type=adaptive and output_config.effort";
 
 beforeEach(() => {
 	resetReasoningMandatoryModels();
@@ -28,6 +31,10 @@ beforeEach(() => {
 describe("isReasoningMandatoryError", () => {
 	test("matches the observed Anthropic 400", () => {
 		expect(isReasoningMandatoryError(new ApiError(400, MANDATORY_MESSAGE))).toBe(true);
+	});
+
+	test("matches a Claude model that only accepts adaptive thinking", () => {
+		expect(isReasoningMandatoryError(new ApiError(400, ADAPTIVE_ONLY_MESSAGE))).toBe(true);
 	});
 
 	test("matches the phrase through diagnostics text", () => {
@@ -77,6 +84,23 @@ describe("withReasoningMandatoryFallback", () => {
 		// since we know nothing about which tiers this endpoint accepts.
 		expect(seen[1]).toEqual({ maxOutputTokens: 64 });
 		expect("reasoningEffort" in (seen[1] ?? {})).toBe(false);
+	});
+
+	test("retries an adaptive-thinking-only Claude model without the none preference", async () => {
+		const seen: Array<GenerateOptions | undefined> = [];
+		const result = await withReasoningMandatoryFallback(
+			"anthropic:claude-opus-5-5",
+			{ reasoningEffort: "none", maxOutputTokens: 64 },
+			async (options) => {
+				seen.push(options);
+				if (options?.reasoningEffort === "none") throw new ApiError(400, ADAPTIVE_ONLY_MESSAGE);
+				return "Session title";
+			},
+		);
+
+		expect(result).toBe("Session title");
+		expect(seen).toHaveLength(2);
+		expect(seen[1]).toEqual({ maxOutputTokens: 64 });
 	});
 
 	test("skips the doomed first attempt for a model already known to require reasoning", async () => {

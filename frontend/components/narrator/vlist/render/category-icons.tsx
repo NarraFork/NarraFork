@@ -12,6 +12,7 @@
 import {
 	IconBook,
 	IconBookUpload,
+	IconCalendarTime,
 	IconClock,
 	IconCode,
 	IconDatabaseEdit,
@@ -148,12 +149,24 @@ export function categoryIcon(cat: ToolCategory, toolName?: string): ComponentTyp
 			return knowledgeIcon(toolName);
 		case "outline":
 			return outlineIcon(toolName);
+		// Not await's plain clock: a scheduled task is a recurring cron, not a wait.
+		case "schedule":
+			return IconCalendarTime;
 		// Help-circle, not send's IconMessageQuestion: ContextAsk queries another
 		// session's context rather than delivering a message, and the two sit next
 		// to each other in multi-agent runs.
 		case "contextAsk":
 			return IconHelpCircle;
-		default:
+		case "generic":
 			return IconCode;
+		default:
+			// Compile-time: a new ToolCategory without a case fails tsgo here.
+			// Runtime: a category string cast past the union still gets a glyph,
+			// so a chip never mounts with an undefined component.
+			return uncoveredCategoryIcon(cat);
 	}
+}
+
+function uncoveredCategoryIcon(_category: never): ComponentType<IconProps> {
+	return IconCode;
 }
