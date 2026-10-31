@@ -26,10 +26,6 @@ import { nanoid } from "nanoid";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useConfirmDialog } from "../../components/common/confirm-dialog-context";
-import {
-	AddPlatformInstanceModal,
-	type NewPlatformInstance,
-} from "../../components/providers/AddPlatformInstanceModal";
 import { CodexSection } from "../../components/providers/CodexSection";
 import { CommandCodeSection } from "../../components/providers/CommandCodeSection";
 import {
@@ -40,20 +36,14 @@ import {
 } from "../../components/providers/CustomApiProviderSection";
 import { ModelTestDialog } from "../../components/providers/ModelTestDialog";
 import { NUGProvidersSection } from "../../components/providers/NUGProvidersSection";
+import {
+	type NewPlatformInstance,
+	type PlatformInstanceRow,
+	PlatformInstancesModal,
+} from "../../components/providers/PlatformInstancesModal";
 import { PluginProviderSection } from "../../components/providers/PluginProviderSection";
 import { ProviderConfigView } from "../../components/providers/ProviderConfigView";
 import { ProviderOverviewView } from "../../components/providers/ProviderOverviewView";
-
-/** 「平台集成」实例（与 server 侧 `agent.platformInstances` 形状一致）。 */
-interface PlatformInstanceRow {
-	id: string;
-	platform: "codex" | "CommandCode" | "tokendance";
-	name: string;
-	suffix: string;
-	prefix: string;
-	disabled: boolean;
-	config: Record<string, unknown>;
-}
 
 import {
 	ProviderAddContext,
@@ -411,9 +401,15 @@ function SettingsProvidersPage() {
 		return list ?? [];
 	}, [settings?.agent]);
 	const [addPlatformOpen, setAddPlatformOpen] = useState(false);
+	const savePlatformInstances = useCallback(
+		(next: PlatformInstanceRow[]) => {
+			updateMutation.mutate({ agent: { platformInstances: next } });
+		},
+		[updateMutation],
+	);
 	const addPlatformInstance = useCallback(
 		(instance: NewPlatformInstance) => {
-			const next: PlatformInstanceRow[] = [
+			savePlatformInstances([
 				...platformInstances,
 				{
 					id: `platform-${instance.prefix}-${Date.now().toString(36)}`,
@@ -424,10 +420,26 @@ function SettingsProvidersPage() {
 					disabled: false,
 					config: {},
 				},
-			];
-			updateMutation.mutate({ agent: { platformInstances: next } });
+			]);
 		},
-		[platformInstances, updateMutation],
+		[platformInstances, savePlatformInstances],
+	);
+	// 只改显示名：前缀是模型 ID 的一部分，改了会让已选中的模型失效。
+	const renamePlatformInstance = useCallback(
+		(id: string, name: string) => {
+			savePlatformInstances(
+				platformInstances.map((instance) =>
+					instance.id === id ? { ...instance, name } : instance,
+				),
+			);
+		},
+		[platformInstances, savePlatformInstances],
+	);
+	const deletePlatformInstance = useCallback(
+		(id: string) => {
+			savePlatformInstances(platformInstances.filter((instance) => instance.id !== id));
+		},
+		[platformInstances, savePlatformInstances],
 	);
 	const handleDiscard = useCallback(() => {
 		dispatch({ type: "RESTORE_FROM_SNAPSHOT", snapshot: savedSnapshot.current });
@@ -770,6 +782,7 @@ function SettingsProvidersPage() {
 		providerLabels,
 		codexModels,
 		commandcodeModels,
+		instanceModelGroups,
 		openaiByProvider,
 		anthropicByProvider,
 		geminiByProvider,
@@ -949,6 +962,9 @@ function SettingsProvidersPage() {
 				});
 		for (const m of codexModels) addModel("codex", m);
 		for (const m of commandcodeModels) addModel("CommandCode", m);
+		// 额外平台实例共用平台模型目录，只是前缀不同。
+		for (const group of instanceModelGroups)
+			for (const m of group.models) addModel(group.prefix, m);
 		for (const g of openaiByProvider) for (const m of g.models) addModel(g.prefix, m);
 		for (const g of anthropicByProvider) for (const m of g.models) addModel(g.prefix, m);
 		for (const g of geminiByProvider) for (const m of g.models) addModel(g.prefix, m);
@@ -1307,15 +1323,16 @@ function SettingsProvidersPage() {
 					onOpenProviderConfig={setSelectedProvider}
 					selectedProvider={selectedProvider}
 				/>
-				<AddPlatformInstanceModal
+				<PlatformInstancesModal
 					opened={addPlatformOpen}
 					onClose={() => setAddPlatformOpen(false)}
-					existingPrefixes={[
-						...platformInstances.map((instance) => instance.prefix),
-						...providerGroups.filter((group) => group.isPlatform).map((group) => group.prefix),
-					]}
-					existingNames={platformInstances.map((instance) => instance.name)}
-					onSubmit={addPlatformInstance}
+					instances={platformInstances}
+					reservedPrefixes={providerGroups
+						.filter((group) => group.isPlatform)
+						.map((group) => group.prefix)}
+					onAdd={addPlatformInstance}
+					onRename={renamePlatformInstance}
+					onDelete={deletePlatformInstance}
 				/>
 			</>
 		);

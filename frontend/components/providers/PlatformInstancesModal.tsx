@@ -1,4 +1,15 @@
-import { Button, Group, Modal, Select, Stack, Text, TextInput } from "@mantine/core";
+import {
+	ActionIcon,
+	Button,
+	Divider,
+	Group,
+	Modal,
+	Select,
+	Stack,
+	Text,
+	TextInput,
+} from "@mantine/core";
+import { IconTrash } from "@tabler/icons-react";
 import { useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import {
@@ -21,6 +32,16 @@ const PLATFORM_OPTIONS = [
 
 export type PlatformInstanceKindValue = (typeof PLATFORM_OPTIONS)[number]["value"];
 
+export interface PlatformInstanceRow {
+	id: string;
+	platform: PlatformInstanceKindValue;
+	name: string;
+	suffix: string;
+	prefix: string;
+	disabled: boolean;
+	config: Record<string, unknown>;
+}
+
 export interface NewPlatformInstance {
 	platform: PlatformInstanceKindValue;
 	name: string;
@@ -28,25 +49,40 @@ export interface NewPlatformInstance {
 	prefix: string;
 }
 
-export function AddPlatformInstanceModal({
+/**
+ * 平台实例管理：上半部分是已有实例（改名 / 删除），下半部分添加同平台的另一个实例。
+ *
+ * 后缀与前缀在创建时确定、之后不可改：前缀是模型 ID 的一部分，改了会让已选中的模型失效。
+ */
+export function PlatformInstancesModal({
 	opened,
 	onClose,
-	existingPrefixes,
-	existingNames,
-	onSubmit,
+	instances,
+	reservedPrefixes,
+	onAdd,
+	onRename,
+	onDelete,
 }: {
 	opened: boolean;
 	onClose: () => void;
-	existingPrefixes: readonly string[];
-	existingNames: readonly string[];
-	onSubmit: (instance: NewPlatformInstance) => void;
+	instances: readonly PlatformInstanceRow[];
+	reservedPrefixes: readonly string[];
+	onAdd: (instance: NewPlatformInstance) => void;
+	onRename: (id: string, name: string) => void;
+	onDelete: (id: string) => void;
 }) {
 	const { t } = useTranslation("settings");
 	const [platform, setPlatform] = useState<PlatformInstanceKindValue>("codex");
 	const [suffix, setSuffix] = useState("");
 	const option = PLATFORM_OPTIONS.find((entry) => entry.value === platform) ?? PLATFORM_OPTIONS[0];
 
-	// 每打开一次都重新给默认后缀：用户在别处删过实例时，默认值要跟着变。
+	const existingPrefixes = useMemo(
+		() => [...reservedPrefixes, ...instances.map((instance) => instance.prefix)],
+		[reservedPrefixes, instances],
+	);
+	const existingNames = useMemo(() => instances.map((instance) => instance.name), [instances]);
+
+	// 每次打开或切换平台都重新给默认后缀：删过实例后，默认值要跟着变。
 	useEffect(() => {
 		if (!opened) return;
 		const naming = defaultInstanceNaming({
@@ -62,7 +98,7 @@ export function AddPlatformInstanceModal({
 	const name = suffix ? `${option.baseName}-${suffix}` : option.baseName;
 	const suffixValid = suffix === "" || isValidInstanceSuffix(suffix);
 	const prefixTaken = existingPrefixes.includes(prefix);
-	const canSubmit = suffixValid && !prefixTaken;
+	const canAdd = suffixValid && !prefixTaken;
 
 	const hint = useMemo(() => {
 		if (!suffixValid) return t("platformInstanceSuffixInvalid");
@@ -71,8 +107,41 @@ export function AddPlatformInstanceModal({
 	}, [suffixValid, prefixTaken, prefix, name, t]);
 
 	return (
-		<Modal opened={opened} onClose={onClose} title={t("platformInstanceModalTitle")} size="sm">
+		<Modal opened={opened} onClose={onClose} title={t("platformInstanceModalTitle")} size="md">
 			<Stack gap="sm">
+				{instances.length > 0 && (
+					<>
+						<Text size="xs" c="dimmed">
+							{t("platformInstanceExistingHint")}
+						</Text>
+						{instances.map((instance) => (
+							<Group key={instance.id} gap="xs" wrap="nowrap">
+								<Text size="xs" c="dimmed" w={140} style={{ flexShrink: 0 }}>
+									{instance.prefix}
+								</Text>
+								<TextInput
+									size="xs"
+									style={{ flex: 1 }}
+									defaultValue={instance.name}
+									onBlur={(event) => {
+										const next = event.currentTarget.value.trim();
+										if (next && next !== instance.name) onRename(instance.id, next);
+									}}
+								/>
+								<ActionIcon
+									size="sm"
+									color="red"
+									variant="subtle"
+									aria-label={t("platformInstanceDelete")}
+									onClick={() => onDelete(instance.id)}
+								>
+									<IconTrash size={14} />
+								</ActionIcon>
+							</Group>
+						))}
+						<Divider my="xs" />
+					</>
+				)}
 				<Select
 					label={t("platformInstancePlatform")}
 					data={PLATFORM_OPTIONS.map((entry) => ({ value: entry.value, label: entry.label }))}
@@ -87,7 +156,7 @@ export function AddPlatformInstanceModal({
 					onChange={(event) => setSuffix(event.currentTarget.value.trim())}
 					error={!suffixValid}
 				/>
-				<Text size="xs" c={canSubmit ? "dimmed" : "red"}>
+				<Text size="xs" c={canAdd ? "dimmed" : "red"}>
 					{hint}
 				</Text>
 				<Group justify="flex-end" gap="xs">
@@ -95,9 +164,9 @@ export function AddPlatformInstanceModal({
 						{t("common:cancel")}
 					</Button>
 					<Button
-						disabled={!canSubmit}
+						disabled={!canAdd}
 						onClick={() => {
-							onSubmit({ platform, name, suffix, prefix });
+							onAdd({ platform, name, suffix, prefix });
 							onClose();
 						}}
 					>

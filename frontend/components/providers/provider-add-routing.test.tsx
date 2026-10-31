@@ -285,6 +285,7 @@ beforeEach(() => {
 		providerLabels: { existing: "Existing provider", draft: "New draft" },
 		codexModels: [],
 		commandcodeModels: [],
+		instanceModelGroups: [],
 		openaiByProvider: [],
 		anthropicByProvider: [],
 		geminiByProvider: [],
@@ -517,6 +518,7 @@ describe("provider deep link resolution", () => {
 			providerLabels: { xiaomi: "Xiaomi" },
 			codexModels: [],
 			commandcodeModels: [],
+			instanceModelGroups: [],
 			openaiByProvider: [
 				{
 					prefix: "xiaomi",

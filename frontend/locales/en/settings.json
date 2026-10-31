@@ -2276,6 +2276,8 @@
 	"platformInstanceSuffixInvalid": "The suffix may only contain letters, digits, underscores and hyphens",
 	"platformInstancePrefixTaken": "Prefix {{prefix}} is already taken",
 	"platformInstancePrefixPreview": "Name: {{name}}, model prefix: {{prefix}}",
+	"platformInstanceExistingHint": "Existing instances: renaming only affects the display name; the prefix is fixed after creation, otherwise already-selected models would break",
+	"platformInstanceDelete": "Delete instance",
 	"providerSectionCustom": "API Key Integrations",
 	"providerStatsTotal": "Total providers",
 	"providerStatsEnabled": "Enabled",

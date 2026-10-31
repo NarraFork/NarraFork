@@ -2278,6 +2278,8 @@
 	"platformInstanceSuffixInvalid": "后缀只能包含字母、数字、下划线与连字符",
 	"platformInstancePrefixTaken": "前缀 {{prefix}} 已被占用",
 	"platformInstancePrefixPreview": "名称：{{name}}，模型前缀：{{prefix}}",
+	"platformInstanceExistingHint": "已有实例：改名只影响显示名；前缀创建后不可改，否则已选中的模型会失效",
+	"platformInstanceDelete": "删除实例",
 	"providerSectionCustom": "API key 接入",
 	"providerStatsTotal": "供应商总数",
 	"providerStatsEnabled": "已启用",

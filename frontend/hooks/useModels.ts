@@ -503,6 +503,49 @@ export function useAllModels() {
 				}))
 			: [];
 
+		// --- 额外平台实例（codex-2 / CommandCode-2 …）---
+		// 同一平台共用模型目录，只是模型 value 换成实例前缀；停用的实例不贡献模型。
+		const platformInstances =
+			(
+				settingsData?.agent as unknown as
+					| {
+							platformInstances?: Array<{
+								prefix: string;
+								name: string;
+								platform: "codex" | "CommandCode" | "tokendance";
+								disabled: boolean;
+							}>;
+					  }
+					| undefined
+			)?.platformInstances ?? [];
+		const instanceModelGroups = platformInstances
+			.filter((instance) => !disabledProviders.has(instance.prefix))
+			.map((instance) => {
+				const ids =
+					instance.platform === "codex"
+						? settingsData?.codexAvailable
+							? codexModelIds
+							: []
+						: instance.platform === "CommandCode"
+							? settingsData?.commandcodeAvailable
+								? commandcodeModelIds
+								: []
+							: [];
+				return {
+					prefix: instance.prefix,
+					name: instance.name,
+					agentProviderType:
+						instance.platform === "codex" ? ("codex" as ProviderCapabilityKey) : undefined,
+					models: ids.map((id) => ({
+						value: modelValue(instance.prefix, id),
+						label: id,
+						provider: instance.prefix,
+						bareModel: id,
+					})),
+				};
+			})
+			.filter((group) => group.models.length > 0);
+
 		// --- Plugin provider models (from the host provider registry) ---
 		// Values are already `prefix:modelId`. Models from a disabled plugin arrive with
 		// `available: false` so the picker can show them as temporarily unusable rather
@@ -605,6 +648,10 @@ export function useAllModels() {
 			);
 		if (codexModels.length > 0) addGroup("codex", codexModels, "codex");
 		if (commandcodeModels.length > 0) addGroup("CommandCode", commandcodeModels, "CommandCode");
+		for (const group of instanceModelGroups) {
+			providerLabels[group.prefix] = group.name;
+			addGroup(group.prefix, group.models, group.agentProviderType);
+		}
 		// Executable-plugin providers, after every builtin so a plugin never reorders
 		// the familiar provider list. Each group already carries fully-prefixed values.
 		for (const group of pluginProviderGroups) {
@@ -803,6 +850,8 @@ export function useAllModels() {
 			/** Codex models only. */
 			codexModels,
 			commandcodeModels,
+			/** 额外平台实例的模型分组（前缀 → 模型），供总览按实例渲染卡片。 */
+			instanceModelGroups,
 			/** OpenAI models grouped by provider. */
 			openaiByProvider,
 			/** Anthropic models grouped by provider. */
