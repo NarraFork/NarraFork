@@ -46,6 +46,7 @@ import {
 } from "../settings-manager-fields";
 import { normalizeCustomApiProviderSettings } from "./custom-api-providers";
 import { DEFAULTS } from "./defaults";
+import { initialPlatformInstances } from "./platform-instances";
 import { _bindSettings } from "./provider";
 import { initializeTokenDanceModelCollection } from "./tokendance-model-collection";
 import type { NarraForkSettings } from "./types";
@@ -623,6 +624,17 @@ function loadSettingsFromDisk(): NarraForkSettings {
 	}
 
 	if (initializeTokenDanceModelCollection(merged)) needsSave = true;
+
+	// 「平台集成」实例清单：旧单例落成每个平台的初始实例，只在文件里还没有清单时执行一次。
+	// 之后清单就是唯一事实来源，删光实例也不会再生成。
+	if (raw.agent?.platformInstances === undefined) {
+		merged.agent.platformInstances = initialPlatformInstances({
+			codex: merged.codex as Record<string, unknown> | undefined,
+			commandCode: merged.commandCode as Record<string, unknown> | undefined,
+			tokendance: merged.tokendance as Record<string, unknown> | undefined,
+		});
+		needsSave = true;
+	}
 
 	lastDiskManagerFields = managerFieldsFromSettings(merged);
 	if (needsSave) saveSettings(merged);
