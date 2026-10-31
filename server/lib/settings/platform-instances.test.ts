@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import {
 	duplicateInstancePrefixes,
+	migrationPayloadForPlatformInstances,
 	PLATFORM_DEFAULTS,
 	resolvePlatformInstances,
 } from "./platform-instances";
@@ -51,5 +52,36 @@ describe("platform instance resolution", () => {
 		expect(duplicateInstancePrefixes([{ prefix: "codex" }, { prefix: "codex" }])).toEqual([
 			"codex",
 		]);
+	});
+});
+
+describe("platform instance migration payload", () => {
+	test("已有实例清单时不再迁移", () => {
+		expect(
+			migrationPayloadForPlatformInstances({
+				instances: [
+					{
+						id: "a",
+						platform: "codex",
+						name: "Codex",
+						suffix: "",
+						prefix: "codex",
+						disabled: false,
+						config: {},
+					},
+				],
+			}),
+		).toBeNull();
+	});
+
+	test("旧单例存在时生成待落库的实例，prefix 与旧版一致", () => {
+		const payload = migrationPayloadForPlatformInstances({
+			legacy: { codex: { loadBalancingMode: "tier-balanced" } },
+		});
+		expect(payload?.map((instance) => instance.prefix)).toEqual(["codex"]);
+	});
+
+	test("没有旧配置时不写空数组", () => {
+		expect(migrationPayloadForPlatformInstances({ legacy: {} })).toBeNull();
 	});
 });

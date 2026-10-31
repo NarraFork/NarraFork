@@ -91,3 +91,17 @@ export function duplicateInstancePrefixes(
 	}
 	return [...duplicates];
 }
+
+/**
+ * 启动迁移的载荷：把旧单例落库成 `platformInstances`。
+ *
+ * 返回 null 表示不需要写：已经有实例清单（迁移过了），或旧字段本来就没配置过。
+ * 只做计算，落库由调用方一次性保存，便于测试与回滚。
+ */
+export function migrationPayloadForPlatformInstances(
+	source: PlatformInstanceSource,
+): PlatformInstance[] | null {
+	if ((source.instances ?? []).length > 0) return null;
+	const resolved = resolvePlatformInstances(source);
+	return resolved.length > 0 ? resolved : null;
+}
