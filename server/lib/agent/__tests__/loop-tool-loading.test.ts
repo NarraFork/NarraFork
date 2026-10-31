@@ -13,7 +13,7 @@ import { settings } from "../../settings";
 import type { ChatParams, ProviderAdapter } from "../provider";
 import { DEFERRED_TOOL_PLACEHOLDER, ToolEpochError, type ToolLoadingState } from "../tool-loading";
 import { toolRegistry } from "../tool-registry";
-import type { AgentConfig } from "../types";
+import { type AgentConfig, ApiError } from "../types";
 
 const CORE = "TlCoreTool";
 const BASE = "TlBaseTool";
@@ -298,6 +298,107 @@ describe("loop tool loading", () => {
 				strategy: "anthropic_tool_addition",
 			},
 		]);
+		expect(upstreamResets).toEqual([false, true]);
+	});
+
+	test("same-epoch prompt updates keep frozen declarations and upstream continuation", async () => {
+		reset([callTool(CORE), callTool(CORE)]);
+		const disabled = new Set<string>();
+		const candidates = toolRegistry.all().filter((tool) => OWN.has(tool.name));
+		const loading: ToolLoadingState = {
+			...state([BASE], [], [BASE]),
+			epochMarkerId: "stable-prefix",
+			baseToolNames: [CORE, BASE],
+			definitionSnapshots: candidates.map((tool) => ({
+				name: tool.name,
+				description: tool.description,
+				parameters: { type: "object", properties: {} },
+			})),
+		};
+		const config = makeConfig({
+			systemPrompt: "frozen system",
+			toolLoading: loading,
+			toolCandidates: candidates,
+			planMode: false,
+			toolFilter: (tool) => !disabled.has(tool.name),
+			rebuildRequestHistory: async () => {
+				config.planMode = true;
+				disabled.add(BASE);
+				return {
+					history: [],
+					rows: [],
+					systemPrompt: "frozen system",
+					toolLoading: loading,
+					toolCandidates: candidates.map((tool) => ({
+						...tool,
+						description: "changed registry",
+						isAvailable: () => false,
+					})),
+				};
+			},
+		});
+		await drain(config);
+		expect(config.planMode).toBe(true);
+		expect(upstreamResets).toEqual([false, false, false]);
+		expect(toolPayloads[1]).toEqual(toolPayloads[0]);
+		expect(toolPayloads[2]).toEqual(toolPayloads[0]);
+		expect(toolPayloads[2]?.find((tool) => tool.name === BASE)?.description).toBe(
+			`${BASE} description`,
+		);
+	});
+
+	test("a retried provider attempt reconciles its prefix without changing cache identity", async () => {
+		reset([
+			() => {
+				throw new ApiError(502, "upstream unavailable");
+			},
+		]);
+		let rebuilds = 0;
+		const loading: ToolLoadingState = {
+			...state([], [], []),
+			epochMarkerId: "retry-prefix",
+			baseToolNames: [CORE],
+			definitionSnapshots: [
+				{ name: CORE, description: "frozen declaration", parameters: { type: "object" } },
+			],
+		};
+		await drain(
+			makeConfig({
+				systemPrompt: "frozen retry system",
+				toolLoading: loading,
+				toolCandidates: toolRegistry.all(),
+				retryBackoffCeilMs: 1,
+				maxTransientRetries: 3,
+				rebuildRequestHistory: async () => {
+					rebuilds++;
+					return {
+						history: [],
+						rows: [],
+						systemPrompt: "frozen retry system",
+						toolLoading: loading,
+						toolCandidates: toolRegistry.all(),
+					};
+				},
+			}),
+		);
+		expect(rebuilds).toBe(1);
+		expect(requests).toHaveLength(2);
+		expect(upstreamResets).toEqual([false, false]);
+		expect(toolPayloads[1]).toEqual(toolPayloads[0]);
+	});
+
+	test("a changed frozen system breaks transport continuation", async () => {
+		reset([callTool(CORE)]);
+		await drain(
+			makeConfig({
+				systemPrompt: "before compact",
+				rebuildRequestHistory: async () => ({
+					history: [],
+					rows: [],
+					systemPrompt: "after compact",
+				}),
+			}),
+		);
 		expect(upstreamResets).toEqual([false, true]);
 	});
 

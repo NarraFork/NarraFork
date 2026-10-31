@@ -96,6 +96,12 @@ bun server/index.ts --no-auto-resume
 - 镜像每个进程只构建一次，定义集合与原先的回放查询相同（同样排除 FTS 表、不含任何行）。连接级 PRAGMA（WAL、synchronous、foreign_keys、busy_timeout）不在文件镜像里，调用方照旧在自己的句柄上设置。
 - `tests/sqlite-schema-image.test.ts` 守护：sqlite_master 定义、`user_version`/`application_id`、文件库 WAL PRAGMA 与逐条回放一致，且副本之间互不共享行。
 
+### 请求准备与工具加载的快照夹具
+
+会走真实 Prefix Epoch 请求准备或工具加载的集成测试，必须使用文件数据库：快照 worker 通过独立连接读写，不能访问 `getTestDb()` 的 `:memory:` 连接。可直接使用 preload 隔离的 `server/db`，保留真实持久化链路；不要仅为通过测试 mock 掉快照或修改生产实现支持内存库。
+
+每次 `cleanDb(sqlite)` / 全表重置以及测试结束前，先 `await closePrefixSnapshotStore()`，等待 worker 退出并清理缓存。否则旧 manifest 缓存仍引用已删快照，后续用例会在进入 provider 前失败，表现为 token、发送者、中断或回调断言连锁失败。只测试纯查询的内存夹具无需迁移，不能全局修改 `getTestDb()` 的默认模式。
+
 ### 等待生产超时的用例
 
 单例耗时紧贴整秒（如 15.01s、30.9s）通常是在等一个生产超时或预算，而不是在干活。测的是“预算到期后的行为”时，用 spy 把真实函数包一层、只把预算参数调小，并断言 spy 确实被调用，避免缩短失效后悄悄退回长等待。已这样处理：`interruptAndWaitForIdle` 的 15s、`tryCaptureHot` 的 4s、`RevertTransactionService` 的 30s cleanup 预算。

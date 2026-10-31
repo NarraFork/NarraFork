@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "node:events";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
 	narratorBufferedMessages,
 	narratorMessageRefs,
@@ -16,9 +16,9 @@ import type { ActiveNarrator } from "../narrator-session-state";
 
 // Real durable question -> answer injection -> scheduler -> resume -> runner ->
 // orchestrator. Model I/O, knowledge contents and device enumeration are observed seams.
-const { db, sqlite } = getTestDb();
-const realDb = { ...(await import("../../db")) };
-mock.module("../../db", () => ({ ...realDb, db, sqlite }));
+// Share the preload-isolated file-backed DB with the real prefix/history workers.
+const { db, sqlite } = await import("../../db");
+const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
 const questions = await import("../narrator-question-service");
 const { activeNarrators, waitForNarratorAdmissionWork } = await import("../narrator-session-state");
 const { getExecutionOwner } = await import("../agent-runtime/ownership");
@@ -70,7 +70,8 @@ function parentActive(userId: string): ActiveNarrator {
 	};
 }
 
-beforeEach(() => {
+beforeEach(async () => {
+	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
 	const now = new Date().toISOString();
 	for (const id of [A, B, C])
@@ -135,9 +136,9 @@ afterEach(async () => {
 	}
 	mock.restore();
 });
-afterAll(() => {
+afterAll(async () => {
+	await closePrefixSnapshotStore();
 	unregister();
-	mock.module("../../db", () => realDb);
 });
 
 /** Wait for the session's run to finish (owner released) and an optional condition. */

@@ -2,7 +2,8 @@
  * Outline spaces and access against a real PostgreSQL: the cases of
  * `server/services/outline/__tests__/access-matrix.ts` (run on SQLite by `access.test.ts`), with
  * the PostgreSQL outline store and access executor injected, on a database that has every
- * `drizzle-postgres` migration applied verbatim.
+ * `drizzle-postgres` migration applied verbatim plus the pg_trgm search catalog (`ensurePgFts`:
+ * the agent cases search what each session may read).
  *
  * Sessions get their project from `context_project_id` here: the working-directory link index is
  * SQLite-only so far, and `resolveNarratorProjectId` reads only the explicit project on
@@ -16,6 +17,7 @@
 import { describe, expect, it } from "bun:test";
 import { eq } from "drizzle-orm";
 import type { BunSQLDatabase } from "drizzle-orm/bun-sql";
+import { ensurePgFts } from "../../../../server/db/pg-fts";
 import { createPostgresClient } from "../../../../server/db/postgres-client";
 import * as pgSchema from "../../../../server/db/postgres-schema";
 import { generateId } from "../../../../server/lib/id";
@@ -111,6 +113,16 @@ function postgresFixtures(pg: BunSQLDatabase): AccessFixtures {
 		async deleteUser(id) {
 			await pg.delete(pgSchema.users).where(eq(pgSchema.users.id, id));
 		},
+		async linkProject(narratorId, projectId) {
+			await pg.insert(pgSchema.narratorProjectLinks).values({
+				narratorId,
+				projectId,
+				role: "primary",
+				source: "cwd",
+				directory: `/tmp/${narratorId}`,
+				updatedAt: NOW,
+			});
+		},
 	};
 }
 
@@ -138,6 +150,7 @@ describe("PostgreSQL outline access", () => {
 					max: 4,
 					connectTimeout: 10,
 				});
+				await ensurePgFts(client.sql);
 				setOutlineStore(createPostgresOutlineStore(client.db));
 				setOutlineAccessExecutor(createPostgresOutlineAccessExecutor(client.db));
 				invalidateSessionReadScopes();

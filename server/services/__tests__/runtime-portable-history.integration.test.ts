@@ -1,4 +1,4 @@
-import { afterAll, afterEach, beforeEach, expect, mock, test } from "bun:test";
+import { afterAll, afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,7 +6,7 @@ import type { InterchangeSession } from "@shared/session-interchange/model";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { z } from "zod";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
 	fileChangeExecutionSegments,
 	narratorBufferedMessages,
@@ -19,9 +19,9 @@ import {
 import { AnthropicProvider } from "../../lib/agent/anthropic-provider";
 import type { ChatParams, ParsedStreamEvent, ProviderAdapter } from "../../lib/agent/provider";
 
-const { db, sqlite } = getTestDb();
-const realDb = { ...(await import("../../db")) };
-mock.module("../../db", () => ({ ...realDb, db, sqlite }));
+// The snapshot worker shares the preload-isolated file-backed database.
+const { db, sqlite } = await import("../../db");
+const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
 const { registerExternalProviderResolver } = await import("../../lib/agent/provider");
 const { toolRegistry } = await import("../../lib/agent/tool-registry");
 const { settings } = await import("../../lib/settings");
@@ -92,7 +92,8 @@ toolRegistry.register({
 	parameters: z.object({}),
 	execute: async () => ({ output: "boundary completed" }),
 });
-beforeEach(() => {
+beforeEach(async () => {
+	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
 	cwd = mkdtempSync(join(tmpdir(), "nf-portable-history-"));
 	ids = [];
@@ -114,18 +115,19 @@ beforeEach(() => {
 		)
 		.run();
 });
-afterEach(() => {
+afterEach(async () => {
 	for (const id of ids) {
 		getExecutionOwner(id)?.release();
 		activeNarrators.delete(id);
 	}
 	rmSync(cwd, { recursive: true, force: true });
+	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
 });
-afterAll(() => {
+afterAll(async () => {
+	await closePrefixSnapshotStore();
 	unregister();
 	toolRegistry.unregister(TOOL);
-	mock.module("../../db", () => realDb);
 });
 function narrator(id: string, extra: Partial<typeof narrators.$inferInsert> = {}) {
 	ids.push(id);

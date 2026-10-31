@@ -17,7 +17,8 @@
  * working-directory link index lives in SQLite so far.
  *
  * The space listing reuses the dialect-neutral readability predicates of `read/acl-sql.ts`, the
- * same text the project and narrator list queries are built from.
+ * same text the project and narrator list queries are built from; so does the candidate listing
+ * a session's readable spaces are judged from (`session-scope.ts`).
  *
  * THE EXECUTOR
  * ------------
@@ -33,7 +34,13 @@
 import { type SQL, sql } from "drizzle-orm";
 import type { BunSQLDatabase } from "drizzle-orm/bun-sql";
 import { activeDatabaseBackend, db } from "../../db";
-import { bindPlaceholders, narratorReadableText, projectReadableForIdText } from "../read/acl-sql";
+import {
+	bindPlaceholders,
+	narratorProjectIdText,
+	narratorReadableText,
+	projectReadableForIdText,
+	projectReadableText,
+} from "../read/acl-sql";
 import type { OutlineSpaceKind } from "./model";
 import { chunked, type OutlineSpaceRow } from "./store/port";
 
@@ -389,6 +396,126 @@ export async function readReadableSpacePage(
 		from outline_spaces s
 		where ${visible}
 			${options.kind ? sql`and s.kind = ${options.kind}` : sql``}
+			${options.afterId !== undefined ? sql`and ${id} > ${options.afterId}` : sql``}
+		order by ${id}
+		limit ${options.limit}
+	`);
+	return rows.map(toSpace);
+}
+
+/**
+ * Where the spaces a session might read are looked for (`session-scope.ts` judges each one):
+ *
+ *   - `reader`: what one reader of the session might read (see {@link readSpaceCandidatePage});
+ *   - `open`: project spaces every signed-in user can read (public, or granted to the `user`
+ *     role); never a session space;
+ *   - `all`: every space of the kind with an owner left (sessions only admins read).
+ */
+export type OutlineSpaceCandidates =
+	| { kind: "reader"; userId: string }
+	| { kind: "open" }
+	| { kind: "all" };
+
+/** A project every signed-in user can read: the rule of `projectOpenToEveryone`. */
+function openProjectText(projectAlias: string): string {
+	return `(
+		${projectAlias}.visibility = 'public'
+		or exists (
+			select 1 from acl_grants rg
+			where rg.scope_type = 'project' and rg.scope_id = ${projectAlias}.id
+				and rg.domain_kind is null and rg.principal_type = 'role' and rg.principal_id = 'user'
+				and rg.capability in ('read','write','manage')
+		)
+	)`;
+}
+
+/**
+ * The narrator of session space `s` (judged on its root, as every decision about a subagent is),
+ * when the person (every `?`) might read it: `narratorUsersWith` widened so that it never leaves
+ * out a narrator that rule admits. The owner; a public narrator; otherwise past the project gate,
+ * a narrator visible to its project or granted to the person or to the `user` role. The gate
+ * passes a project the person reads or every signed-in user reads (a grant to the `user` role
+ * opens it in the rule, though not in the per-person list predicates).
+ *
+ * The gate's project is the one `resolveNarratorProjectId` gives on each backend
+ * (`gateProject`): on SQLite the explicit project, else the primary working-directory link
+ * (`narratorProjectIdText`), so sessions filed under someone's private project by their working
+ * directory, the usual way, are not offered to everyone; on PostgreSQL, which knows only the
+ * explicit project so far, that one alone.
+ */
+function sessionCandidateText(gateProject: string): string {
+	return `exists (
+		select 1 from narrators n
+		join narrators jn
+			on jn.id = case when n.type = 'subagent' then n.acl_root_narrator_id else n.id end
+		where n.id = s.narrator_id
+			and (
+				jn.owner_user_id = ?
+				or jn.visibility = 'public'
+				or (
+					not exists (
+						select 1 from projects gp
+						where gp.id = ${gateProject}
+							and not (${projectReadableText("gp")} or ${openProjectText("gp")})
+					)
+					and (
+						jn.visibility = 'project'
+						or exists (
+							select 1 from acl_grants ng
+							where ng.scope_type = 'narrator' and ng.scope_id = jn.id
+								and ng.domain_kind is null and ng.capability in ('read','write')
+								and (
+									(ng.principal_type = 'user' and ng.principal_id = ?)
+									or (ng.principal_type = 'role' and ng.principal_id = 'user')
+								)
+						)
+					)
+				)
+			)
+	)`;
+}
+
+/**
+ * A page of project or session spaces a session might read, in id order after `afterId`. The
+ * filter runs in SQL, before the LIMIT. Candidates only, and always a SUPERSET of what the
+ * verdicts of `session-scope.ts` admit (the access matrix holds it to that): a session reads
+ * only what each of its readers reads, so what one reader (`reader`) might read covers it.
+ *   - project spaces: projects the reader reads by the per-person predicate (owner, public, a
+ *     user grant), and projects every signed-in user reads (a grant to the `user` role);
+ *   - session spaces: {@link sessionCandidateText}.
+ */
+export async function readSpaceCandidatePage(
+	from: OutlineSpaceCandidates,
+	options: { kind: "project" | "session"; afterId?: string; limit: number },
+): Promise<OutlineSpaceRow[]> {
+	const pg = executor().dialect === "postgres";
+	const id = pg ? sql.raw(`s.id collate "C"`) : sql.raw("s.id");
+	let filter: SQL;
+	if (options.kind === "project") {
+		const open = sql.raw(
+			`exists (select 1 from projects op where op.id = s.project_id and ${openProjectText("op")})`,
+		);
+		filter =
+			from.kind === "all"
+				? sql`s.project_id is not null`
+				: from.kind === "open"
+					? open
+					: sql`(${bindPlaceholders(projectReadableForIdText("s.project_id"), from.userId)} or ${open})`;
+	} else {
+		if (from.kind === "open") return [];
+		filter =
+			from.kind === "all"
+				? sql`s.narrator_id is not null`
+				: bindPlaceholders(
+						sessionCandidateText(pg ? "jn.context_project_id" : narratorProjectIdText("jn")),
+						from.userId,
+					);
+	}
+	const rows = await all(sql`
+		select s.id, s.key, s.kind, s.project_id, s.narrator_id, s.owner_user_id, s.next_seq,
+			s.created_at
+		from outline_spaces s
+		where s.kind = ${options.kind} and ${filter}
 			${options.afterId !== undefined ? sql`and ${id} > ${options.afterId}` : sql``}
 		order by ${id}
 		limit ${options.limit}

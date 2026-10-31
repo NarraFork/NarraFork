@@ -5,7 +5,9 @@
  *
  *   - READ: what the session may read (`session-scope.ts`): everyone who can read the session
  *     can read whatever the agent reads. The person running the turn decides only the personal
- *     space, and a turn with no person behind it reads nothing personal.
+ *     space, and a turn with no person behind it reads nothing personal. That covers other
+ *     spaces too (other projects', other sessions'): the agent names them by key, finds them in
+ *     the overview of every readable space, or searches them all.
  *   - WRITE: what the person running the turn may write (`access.ts`), in spaces the session may
  *     also read (an edit resolves its addresses there and reports back from there). A turn with
  *     no person behind it writes nothing. In read-only and strict plan mode only the session's
@@ -16,7 +18,9 @@
  * A space is named by its key (`Kx81mPqa`) or by one of three words for the session's own
  * spaces: `project` (its main project's), `session` (its working notes; a subagent shares its
  * root's) and `personal` (the acting person's own). A space the session may not read is never
- * found by either, so a reference into it reads as "nothing matches".
+ * found by either, so a reference into it reads as "nothing matches", exactly like a reference
+ * to nothing. Bare ids, aliases and titles are looked up in the own spaces only; a block of any
+ * other space is addressed as `key/sid`, which is how reads label it.
  *
  * One scope serves one tool call; verdicts are memoized for its length only (the session read
  * scope caches across calls itself).
@@ -30,7 +34,7 @@ import {
 } from "./access-reads";
 import { OUTLINE_TOOL_TEXT } from "./messages";
 import { type OutlineResolution, resolveAddress } from "./resolve";
-import { canSessionReadSpace } from "./session-scope";
+import { canSessionReadSpace, listSessionReadableSpaces } from "./session-scope";
 import {
 	ensurePersonalSpace,
 	ensureProjectSpace,
@@ -60,6 +64,12 @@ function isSpaceWord(name: string): name is OutlineSpaceWord {
 
 /** Why an agent may not write a space. */
 export type OutlineWriteRefusal = "no-person" | "plan-or-read-only" | "no-permission";
+
+/** A readable space and, for one of the session's own, the word that names it. */
+export interface OutlineReadableSpace {
+	space: OutlineSpaceRow;
+	word: OutlineSpaceWord | null;
+}
 
 /** A reference to a space as a whole: `key/`, `project/`, or `/` for the default space. */
 export function spaceRootName(ref: string): string | null {
@@ -121,6 +131,11 @@ export class OutlineAgentScope {
 
 	static async open(ctx: OutlineAgentContext): Promise<OutlineAgentScope> {
 		return new OutlineAgentScope(ctx, await resolveNarratorSpaces(ctx.narratorId));
+	}
+
+	/** The same turn's scope opened afresh, with nothing memoized: after access changed. */
+	async reopen(): Promise<OutlineAgentScope> {
+		return await OutlineAgentScope.open(this.ctx);
 	}
 
 	get narratorId(): string {
@@ -201,6 +216,52 @@ export class OutlineAgentScope {
 		if (!isSpaceWord(name)) return await this.spaceByKey(name);
 		const own = await this.ownSpaces();
 		return own.find((entry) => entry.word === name)?.space ?? null;
+	}
+
+	/**
+	 * Whether the space is one of the session's own: its main project's, its session space (its
+	 * root's) or the acting person's personal space. Bare names are looked up only in them, so
+	 * reads label blocks of any other space `key/sid`.
+	 */
+	isOwnSpace(space: OutlineSpaceRow): boolean {
+		switch (space.kind) {
+			case "project":
+				return space.projectId !== null && space.projectId === this.projectId;
+			case "session":
+				return space.narratorId !== null && space.narratorId === this.rootNarratorId;
+			case "personal":
+				return space.ownerUserId !== null && space.ownerUserId === this.ctx.userId;
+			default:
+				return false;
+		}
+	}
+
+	/**
+	 * Every space the session may read, at most `limit`: its own first (as {@link ownSpaces}
+	 * orders them), then other projects' and other sessions' (`listSessionReadableSpaces`).
+	 * `cut` says why the list stopped short: `limit`, more are readable; `candidates`, the
+	 * listing judged all it may and cannot tell.
+	 */
+	async readableSpaces(limit: number): Promise<{
+		spaces: OutlineReadableSpace[];
+		cut: "limit" | "candidates" | null;
+		complete: boolean;
+	}> {
+		const own = await this.ownSpaces();
+		const listed = await listSessionReadableSpaces(this.ctx.narratorId, {
+			executingUserId: this.ctx.userId,
+			limit,
+		});
+		const ownIds = new Set(own.map((entry) => entry.space.id));
+		const spaces: OutlineReadableSpace[] = own.map((entry) => ({ ...entry }));
+		for (const space of listed.spaces) {
+			if (ownIds.has(space.id)) continue;
+			// A verdict the listing reached is the one a read by key gets: remember it.
+			this.readable.set(space.id, Promise.resolve(true));
+			spaces.push({ space, word: null });
+		}
+		const cut = spaces.length > limit ? "limit" : listed.cut;
+		return { spaces: spaces.slice(0, limit), cut, complete: cut === null };
 	}
 
 	/**
@@ -306,6 +367,21 @@ export class OutlineAgentScope {
 	/** How the space is named to the agent: its key and what it is. */
 	async describe(space: OutlineSpaceRow): Promise<string> {
 		return `${space.key} · ${await this.spaceName(space)}`;
+	}
+
+	/**
+	 * How a block of the space is addressed to the agent: its sid in an own space (where a bare
+	 * id is looked up), `key/sid` in any other.
+	 */
+	addressIn(space: OutlineSpaceRow): (sid: string) => string {
+		const prefix = this.isOwnSpace(space) ? "" : `${space.key}/`;
+		return (sid) => `${prefix}${sid}`;
+	}
+
+	/** What a read or an edit's result puts after a block's bullet: `[` its address `]`. */
+	labelIn(space: OutlineSpaceRow): (sid: string) => string {
+		const address = this.addressIn(space);
+		return (sid) => `[${address(sid)}]`;
 	}
 
 	private async spaceName(space: OutlineSpaceRow): Promise<string> {

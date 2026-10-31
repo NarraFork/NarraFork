@@ -1,5 +1,6 @@
 import type { Locale, LocalizedValue } from "@shared/i18n-locales";
 import { pickLocalizedValue } from "@shared/i18n-locales";
+import { z } from "zod";
 
 /**
  * Prompt optimization styles.
@@ -227,4 +228,85 @@ export function getPromptOptimizeInstruction(
 	locale: Locale = "en",
 ): string {
 	return pickLocalizedValue(OPTIMIZE_INSTRUCTIONS[style], locale);
+}
+
+/** Stable schema name; OpenAI echoes it back and relays may log it. */
+export const OPTIMIZE_OUTPUT_SCHEMA_NAME = "prompt_optimize_result";
+
+/**
+ * Schema field carrying the one-line rationale. Named here so the route and the
+ * provider-layer `summaryField` cannot drift apart.
+ */
+export const OPTIMIZE_SUMMARY_FIELD = "reasoningSummary";
+
+/**
+ * Output schema for structured prompt optimization.
+ *
+ *  - `optimizedPrompt` is the only thing that may ever reach the composer, so
+ *    the schema makes that the only thing the model can produce as body text.
+ *  - `reasoningSummary` is a one-line rationale for the UI. It is declared in
+ *    `required` because OpenAI's strict mode demands every declared property be
+ *    required — an "optional" field there is a contradiction. The *reader* below
+ *    still accepts a missing/blank value, so a model that declines to explain
+ *    itself does not fail the call.
+ *  - `additionalProperties: false` is the structural guarantee that no
+ *    `thinking` / `analysis` / `explanation` field can ride along.
+ */
+export function getOptimizeOutputSchema(): Record<string, unknown> {
+	return {
+		type: "object",
+		properties: {
+			optimizedPrompt: {
+				type: "string",
+				description:
+					"The rewritten prompt text only — no explanations, commentary, quotes or code fences.",
+			},
+			reasoningSummary: {
+				type: "string",
+				description:
+					"One sentence (about 100 characters max) naming the key trade-off you made in this rewrite. Never restate or quote the optimized prompt. Empty string if there is nothing worth saying.",
+			},
+		},
+		required: ["optimizedPrompt", "reasoningSummary"],
+		additionalProperties: false,
+	};
+}
+
+const optimizeOutputSchema = z
+	.object({
+		// Non-empty after trimming: a blank string is not a usable optimization and
+		// must fall through to the text path rather than blank the composer.
+		optimizedPrompt: z.string().trim().min(1),
+		// Optional on purpose: the schema requires the field, but a model that
+		// sends "" or omits it must still yield a usable result. A blank value is
+		// accepted and then normalized to undefined, so `min(1)` cannot reject the
+		// whole payload over a missing rationale.
+		reasoningSummary: z
+			.string()
+			.trim()
+			.optional()
+			.transform((value) => value || undefined),
+	})
+	// Unknown keys are dropped, never surfaced: this is the trust boundary between
+	// model output and the user's input box.
+	.strip();
+
+export interface OptimizeResult {
+	/** Text that may be written to the composer. */
+	optimizedPrompt: string;
+	/** One-line rationale for the UI, or undefined when absent/blank. */
+	reasoningSummary?: string;
+}
+
+/**
+ * Read the structured result, or `undefined` when the payload does not satisfy
+ * the schema. Only the two whitelisted fields can ever come out of here.
+ */
+export function readOptimizeResult(structured: unknown): OptimizeResult | undefined {
+	const parsed = optimizeOutputSchema.safeParse(structured);
+	if (!parsed.success) return undefined;
+	return {
+		optimizedPrompt: parsed.data.optimizedPrompt,
+		...(parsed.data.reasoningSummary ? { reasoningSummary: parsed.data.reasoningSummary } : {}),
+	};
 }

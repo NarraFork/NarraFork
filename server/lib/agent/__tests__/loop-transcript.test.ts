@@ -4,14 +4,201 @@
  */
 
 import { describe, expect, test } from "bun:test";
+import { assembleContent, splitEnvelope } from "@shared/narrator-blocks/storage";
 import { AnthropicProvider } from "../anthropic-provider";
+import { GeminiInteractionsProvider } from "../gemini-interactions-provider";
+import { GeminiProvider } from "../gemini-provider";
 import { buildAdapterHistory, historyTail } from "../history-build";
 import { LoopTranscript } from "../loop-transcript";
+import { OpenAIProvider } from "../openai-provider";
 import { projectHistory } from "../projection";
+import type { DbMessage, ProviderAdapter } from "../provider";
+import { RemoteProviderAdapter } from "../remote-provider-adapter";
 
 const PNG =
 	"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/iZk9HQAAAABJRU5ErkJggg==";
 const TARGET = { strict: false };
+const UPDATE_TEXT = "<context_update>\n[workspace]\n/repo/b\n</context_update>";
+const UPDATE: DbMessage = {
+	id: "context-update-1",
+	role: "sys",
+	contentText: UPDATE_TEXT,
+	contentJson: [
+		{ type: "text", text: UPDATE_TEXT },
+		{
+			type: "context_update",
+			epochId: "epoch-1",
+			changes: [{ key: "workspace", value: "/repo/b" }],
+		},
+	],
+	parentToolUseId: null,
+	messageUuid: null,
+};
+const CONFIG = {
+	id: "context-update",
+	name: "Context update",
+	prefix: "context-update",
+	apiKey: "unused",
+	baseUrl: "https://example.invalid/v1",
+	defaultModel: "test-model",
+};
+
+function projectionProviders(): Array<[string, ProviderAdapter, string]> {
+	return [
+		["Anthropic native", new AnthropicProvider({ ...CONFIG, officialApi: true }), "claude-opus-5"],
+		[
+			"Anthropic compatible",
+			new AnthropicProvider({ ...CONFIG, officialApi: false }),
+			"claude-opus-5",
+		],
+		["Responses", new OpenAIProvider({ ...CONFIG, apiMode: "responses" }), "gpt-5"],
+		["Codex wire adapter", new OpenAIProvider({ ...CONFIG, apiMode: "codex" }), "gpt-5"],
+		["Completions", new OpenAIProvider({ ...CONFIG, apiMode: "completions" }), "kimi-k2.5"],
+		["Gemini", new GeminiProvider(CONFIG), "gemini-2.5-pro"],
+		["Gemini interactions", new GeminiInteractionsProvider(CONFIG), "gemini-2.5-pro"],
+		[
+			"Remote",
+			new RemoteProviderAdapter({
+				providerTypeId: "test",
+				providerInstanceId: "test",
+				providerPrefix: "test",
+				config: {},
+				modelCatalog: [],
+				rpc: {
+					chat: async () => {
+						throw new Error("No network in projection test");
+					},
+					generate: async () => {
+						throw new Error("No network in projection test");
+					},
+				},
+			}),
+			"test-model",
+		],
+	];
+}
+
+/** Exercise the same split/assembly codec that durable message blocks use. */
+function restoredRows(rows: DbMessage[]): DbMessage[] {
+	return rows.map((row) => ({
+		...structuredClone(row),
+		contentJson: assembleContent(splitEnvelope(row).blocks),
+	}));
+}
+
+for (const [name, provider, model] of projectionProviders()) {
+	test(`${name}: typed updates append once and rebuild identically after a tool result`, async () => {
+		const transcript = new LoopTranscript([
+			{
+				id: "user-1",
+				role: "user",
+				contentText: "read file",
+				contentJson: [{ type: "text", text: "read file" }],
+				parentToolUseId: null,
+				messageUuid: null,
+			},
+		]);
+		toolStep(transcript, ["read"]);
+		transcript.settleTool("read", { output: "file contents" });
+		const build = (rows: DbMessage[]) =>
+			buildAdapterHistory(provider, rows, { provider: "test", model });
+		const before = await build(transcript.rows);
+		transcript.replace([...transcript.rows, UPDATE]);
+		const live = await build(transcript.rows);
+		const rebuilt = await build(restoredRows(transcript.rows));
+		expect(live.history).toEqual(rebuilt.history);
+		expect(live.history.slice(0, before.history.length)).toEqual(before.history);
+		const last = live.history.at(-1) as { role?: string; type?: string };
+		expect(last.role ?? last.type).toBe(name === "Gemini interactions" ? "user_input" : "user");
+		const encoded = JSON.stringify(live.history);
+		expect(encoded.split("<context_update>")).toHaveLength(2);
+		expect(encoded).not.toContain("epoch-1");
+		expect(encoded).not.toContain('"changes"');
+		const neutral = await projectHistory(transcript.rows, TARGET);
+		expect(neutral.turns.at(-1)).toMatchObject({
+			kind: "input",
+			items: [
+				{
+					text: UPDATE_TEXT,
+					contextUpdate: {
+						epochId: "epoch-1",
+						changes: [{ key: "workspace", value: "/repo/b" }],
+					},
+				},
+			],
+		});
+		transcript.replace([
+			...transcript.rows,
+			{
+				id: "user-2",
+				role: "user",
+				contentText: "continue after update",
+				contentJson: [{ type: "text", text: "continue after update" }],
+				parentToolUseId: null,
+				messageUuid: null,
+			},
+		]);
+		const next = await build(transcript.rows);
+		expect(next.history.slice(0, live.history.length)).toEqual(live.history);
+		expect(next.history).toEqual((await build(restoredRows(transcript.rows))).history);
+	});
+}
+
+for (const apiMode of ["responses", "codex"] as const) {
+	test(`${apiMode}: outgoing instructions remain the baseline; update stays in input`, async () => {
+		const provider = new OpenAIProvider({ ...CONFIG, apiMode });
+		const requests: Array<{ instructions: string; input: unknown[] }> = [];
+		const originalFetch = globalThis.fetch;
+		globalThis.fetch = (async (_input, init) => {
+			requests.push(JSON.parse(String(init?.body)));
+			return new Response(
+				'event: response.completed\ndata: {"type":"response.completed","response":{"status":"completed","output":[]}}\n\n',
+				{ headers: { "Content-Type": "text/event-stream" } },
+			);
+		}) as typeof fetch;
+		try {
+			const original: DbMessage[] = [
+				{
+					id: "first",
+					role: "user",
+					contentText: "first",
+					contentJson: [{ type: "text", text: "first" }],
+					parentToolUseId: null,
+					messageUuid: null,
+				},
+			];
+			for (const rows of [original, [...original, UPDATE], restoredRows([...original, UPDATE])]) {
+				const { history } = await buildAdapterHistory(provider, rows, {
+					provider: "test",
+					model: "gpt-5",
+				});
+				provider.injectSystemPrompt(history, "frozen-baseline", "gpt-5");
+				for await (const _event of provider.chat({
+					conversationId: "context-update",
+					content: "",
+					model: "gpt-5",
+					cwd: ".",
+					history,
+					tools: [],
+					toolResults: [],
+					signal: new AbortController().signal,
+				})) {
+					/* consume */
+				}
+			}
+		} finally {
+			globalThis.fetch = originalFetch;
+		}
+		expect(requests).toHaveLength(3);
+		expect(requests[1].instructions).toBe(requests[0].instructions);
+		expect(requests[1].instructions).toContain("frozen-baseline");
+		expect(requests[1].instructions).not.toContain("<context_update>");
+		expect(requests[1].input.slice(0, requests[0].input.length)).toEqual(requests[0].input);
+		expect(requests[1].input).toEqual(requests[2].input);
+		expect(JSON.stringify(requests[1].input).split("<context_update>")).toHaveLength(2);
+		expect(JSON.stringify(requests[1].input)).not.toContain("epoch-1");
+	});
+}
 
 function toolStep(transcript: LoopTranscript, ids: string[]) {
 	transcript.appendStep([

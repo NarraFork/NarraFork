@@ -7,7 +7,7 @@ import { db } from "../../../../db";
 import { narrators } from "../../../../db/schema";
 import type { ExecutionBackend } from "../../execution/backend";
 import { targetPathSemantics } from "../../execution/path-semantics";
-import type { AgentConfig, ToolContext, ToolDefinition } from "../../types";
+import type { ToolContext, ToolDefinition } from "../../types";
 import { askUserQuestionTool } from "../ask-user-question";
 import {
 	bashTool,
@@ -886,29 +886,15 @@ describe("Grep schema validation", () => {
 // ============================================================
 
 describe("Bash", () => {
-	test("exposes review-only Git guidance and forbidden control parameters", () => {
-		const reviewConfig = { reviewReadOnlyBash: true } as AgentConfig;
-		const description =
-			typeof bashTool.description === "function"
-				? bashTool.description(reviewConfig)
-				: bashTool.description;
-		const schema = bashTool.getRawJsonSchema?.(reviewConfig);
-		const properties = schema?.properties as Record<string, { description?: string }>;
-		expect(description).toContain("local Git inspection");
-		expect(properties.command.description).toContain("read-only git invocation");
-		expect(properties.command.description).toContain("exactly one git command");
-		expect(properties.command.description).toContain("environment variable assignments");
-		expect(properties.run_in_background.description).toContain("Forbidden");
+	test("exposes a static schema without embedding review-only restrictions", () => {
+		const properties = bashTool.rawJsonSchema?.properties as Record<
+			string,
+			{ description?: string }
+		>;
+		expect(bashTool.description).toContain("Executes a given bash command");
+		expect(properties.command.description).toContain("non-empty command");
+		expect(properties.run_in_background.description).not.toContain("Forbidden");
 		expect(properties).not.toHaveProperty("stop");
-	});
-
-	test("keeps the normal Bash description for ordinary sessions", () => {
-		const normalConfig = {} as AgentConfig;
-		const description =
-			typeof bashTool.description === "function"
-				? bashTool.description(normalConfig)
-				: bashTool.description;
-		expect(description).toContain("Executes a given bash command");
 	});
 
 	test("executes simple command", async () => {
@@ -1289,10 +1275,11 @@ describe("Agent tool rawJsonSchema", () => {
 		);
 	});
 
-	test("model description includes available models list", () => {
+	test("model description preserves selection rules without dynamic candidates", () => {
 		const schema = requireRawJsonSchema(agentTool);
 		const props = schema.properties ?? {};
-		expect(props.model?.description).toContain("Available models:");
+		expect(props.model?.description).toContain("Explicit models must also be allowed by the pool");
+		expect(props.model?.description).not.toContain("Available models:");
 	});
 
 	test("rawJsonSchema no longer includes resume parameter", () => {
@@ -1301,12 +1288,11 @@ describe("Agent tool rawJsonSchema", () => {
 		expect(props.resume).toBeUndefined();
 	});
 
-	test("rawJsonSchema is dynamic (getter, not static)", () => {
-		// Accessing rawJsonSchema twice should return equal but not identical objects
+	test("rawJsonSchema is a reusable static object", () => {
 		const a = agentTool.rawJsonSchema;
 		const b = agentTool.rawJsonSchema;
-		expect(a).toEqual(b);
-		expect(a).not.toBe(b);
+		expect(a).toBe(b);
+		expect(Object.getOwnPropertyDescriptor(agentTool, "rawJsonSchema")?.get).toBeUndefined();
 	});
 
 	test("resolveToolJsonSchema uses rawJsonSchema over Zod", () => {

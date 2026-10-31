@@ -1,10 +1,11 @@
 import { afterAll, beforeAll, describe, expect, mock, spyOn, test } from "bun:test";
 import { settings } from "../../../settings";
 import { delegationRegistration } from "../../../validators/runtime-registration";
-import type { AgentConfig, ToolContext, ToolUpdateExecutionLease } from "../../types";
+import type { ToolContext, ToolUpdateExecutionLease } from "../../types";
 
 const runCalls: Array<Record<string, unknown>> = [];
 let agentTool: typeof import("../task").agentTool;
+let buildSubagentModelContext: typeof import("../task").buildSubagentModelContext;
 let realNarratorSubagent: typeof import("@server/services/narrator-subagent");
 
 beforeAll(async () => {
@@ -17,7 +18,7 @@ beforeAll(async () => {
 			return "<subagent_id>inspect-lease</subagent_id>\n\ndone";
 		}),
 	}));
-	({ agentTool } = await import("../task"));
+	({ agentTool, buildSubagentModelContext } = await import("../task"));
 });
 
 afterAll(() => {
@@ -26,7 +27,7 @@ afterAll(() => {
 });
 
 describe("Agent task tool", () => {
-	test("schema advertises fixed global tiers but never invents one for unconfigured models", () => {
+	test("prompt context advertises fixed tiers while the schema remains static", () => {
 		// Pool entries must also be *visible* models, or filterSubagentModels drops them
 		// from the schema description (which is the behaviour under test, not a bug).
 		settings.agent.customModels = [
@@ -51,9 +52,11 @@ describe("Agent task tool", () => {
 		const schema = agentTool.rawJsonSchema as {
 			properties: Record<string, { description: string }>;
 		};
-		expect(schema.properties.model.description).toContain("p:review [fixed reasoning_effort=high]");
-		expect(schema.properties.model.description).toContain("p:search [fixed reasoning_effort=none]");
-		expect(schema.properties.model.description).not.toContain("p:legacy [fixed");
+		const context = buildSubagentModelContext();
+		expect(context).toContain("p:review [fixed reasoning_effort=high]");
+		expect(context).toContain("p:search [fixed reasoning_effort=none]");
+		expect(context).not.toContain("p:legacy [fixed");
+		expect(schema.properties.model.description).not.toContain("p:review");
 		// A fixed effort for a model outside its type pool must not be advertised as a
 		// pool tier. The id may still appear in the unrestricted-types dump below.
 		expect(schema.properties.model.description).not.toContain("p:not-in-pool [fixed");
@@ -70,11 +73,9 @@ describe("Agent task tool", () => {
 		settings.agent.subagentAllowedModels = { explore: ["p:global"], plan: [], general: [] };
 		settings.agent.subagentModelReasoningEfforts = { explore: { "p:global": "high" } };
 		const custom = "explore: p:custom [fixed reasoning_effort=medium]";
-		const schema = agentTool.getRawJsonSchema?.({
-			subagentModelRestrictionDescription: custom,
-		} as AgentConfig) as { properties: Record<string, { description: string }> };
-		expect(schema.properties.model.description).toContain(custom);
-		expect(schema.properties.model.description).not.toContain("p:global");
+		const context = buildSubagentModelContext({ subagentModelRestrictionDescription: custom });
+		expect(context).toContain(custom);
+		expect(context).not.toContain("p:global");
 	});
 
 	test("passes the executeTool lease into the subagent runner for transfer", async () => {
@@ -287,7 +288,7 @@ describe("Agent archive / unarchive commands", () => {
 		spyOn(traitLayers, "resolveNarratorRuntimePolicy").mockResolvedValue(
 			UNRESTRICTED_RUNTIME_POLICY,
 		);
-		({ agentTool } = await import("../task"));
+		({ agentTool, buildSubagentModelContext } = await import("../task"));
 	});
 
 	afterAll(() => {

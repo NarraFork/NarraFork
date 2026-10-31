@@ -26,7 +26,7 @@ import { and, eq, isNull } from "drizzle-orm";
 import { db } from "../../db";
 import { chatAttachments, chatMessages, chatRooms, narrators, users } from "../../db/schema";
 import { sendTool } from "../../lib/agent/tools/send";
-import type { AgentConfig, ToolContext } from "../../lib/agent/types";
+import type { ToolContext } from "../../lib/agent/types";
 import { ForbiddenError, NotFoundError, ValidationError } from "../../lib/errors";
 import { generateId } from "../../lib/id";
 import { BOT_TRAIT, isBotNarrator } from "../../lib/narrator-utils";
@@ -370,14 +370,9 @@ describe("Send({ user })", () => {
 	const ctx = (narratorId: string) =>
 		({ narratorId, currentToolUseId: generateId(), locale: "en" }) as ToolContext;
 
-	test("is offered to bots only", () => {
-		const policy = resolveRuntimePolicy([]);
-		const props = (config: Partial<AgentConfig>) =>
-			(sendTool.getRawJsonSchema?.({ runtimePolicy: policy, ...config } as AgentConfig)
-				.properties ?? {}) as Record<string, unknown>;
-		expect(props({ bot: true }).user).toBeDefined();
-		expect(props({ bot: false }).user).toBeUndefined();
-		expect(props({}).user).toBeUndefined();
+	test("statically advertises the bot-only target without granting access", () => {
+		const props = sendTool.rawJsonSchema?.properties as Record<string, { description: string }>;
+		expect(props.user.description).toContain("Bot only");
 	});
 
 	test("delivers into the person's conversation, found by username", async () => {

@@ -3,9 +3,8 @@ import type { ToolDefinition } from "../types";
 
 export const switchWorkingDirectoryTool: ToolDefinition = {
 	name: "SwitchWorkingDirectory",
-	description: (config) =>
-		"Switch the local working directory of this ordinary primary narrator. Supply the current workspace revision and a unique requestId. Non-Git directories are supported. Remote arbitrary directories are unsupported. This is a strict serial barrier: after a successful change the current pass ends; only the next pass uses the new cwd, skills and permissions. Already started background tools, subagents and terminals retain their original targets.\n" +
-		`Current authoritative workspace context: ${JSON.stringify(config.workspaceContext ?? { supported: false })}`,
+	description:
+		"Switch the local working directory of this ordinary primary narrator. Supply the current workspace revision and a unique requestId. Non-Git directories are supported. Remote arbitrary directories are unsupported. This is a strict serial barrier: after a successful change the current pass ends; only the next pass uses the new cwd, skills and permissions. Already started background tools, subagents and terminals retain their original targets. Consult the current workspace context for the authoritative revision and switching support.",
 	parameters: switchWorkingDirectorySchema,
 	async execute(args, ctx) {
 		if (!ctx.switchWorkingDirectory)

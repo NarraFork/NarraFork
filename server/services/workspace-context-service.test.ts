@@ -83,6 +83,7 @@ beforeEach(async () => {
 		variant: "primary",
 		traits: [],
 		status: "idle",
+		apiConversationId: "stable-cache-identity",
 	};
 	events = [];
 	displayMessages.length = 0;
@@ -170,6 +171,7 @@ describe("local authoritative workspace context", () => {
 		expect(row.workspaceRevision).toBe(1);
 		expect(row.workspaceContext).toEqual(result.current);
 		expect(row.contextProjectId).toBe("same-project");
+		expect(row.apiConversationId).toBe("stable-cache-identity");
 		expect(events).toHaveLength(1);
 		expect(await workspaceContextService.get("narrator")).toEqual(result.current);
 	});
@@ -248,6 +250,8 @@ describe("local authoritative workspace context", () => {
 	test("agent switch commits while its own loop is running, leaving existing children bound", async () => {
 		const active = {
 			alive: true,
+			conversationId: "stable-cache-identity",
+			_persistedConversationId: "stable-cache-identity",
 			cwd: row.cwd,
 			_loopRunning: true,
 			abortController: new AbortController(),
@@ -274,6 +278,10 @@ describe("local authoritative workspace context", () => {
 			expect(active.cwd).toBe(join(root, "new"));
 			expect(child.cwd).toBe(join(root, "old"));
 			expect(active._workspacePassInvalidated).toBe(true);
+			expect(active.conversationId).toBe("stable-cache-identity");
+			expect(active._persistedConversationId).toBe("stable-cache-identity");
+			expect(active._resetUpstreamSessionOnNextRequest).toBeUndefined();
+			expect(row.apiConversationId).toBe("stable-cache-identity");
 			// Agent origin injects the pass-continuation text instead of a display card.
 			expect(displayMessages).toEqual([]);
 		} finally {

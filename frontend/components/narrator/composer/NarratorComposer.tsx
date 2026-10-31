@@ -742,8 +742,9 @@ export const NarratorComposer = forwardRef<NarratorComposerHandle, NarratorCompo
 		// Prompt optimization hook
 		const optimizeHook = usePromptOptimize({
 			narratorId: draft?.sessionId ?? narratorId,
+			ready: draftHydrated && draftOwnerScopeRef.current === currentDraftScope,
 			textareaRef: useRef<HTMLTextAreaElement>(null),
-			target: () => composerOptimizeTarget(editorRef.current),
+			target: (snapshot) => composerOptimizeTarget(editorRef.current, snapshot),
 			onOptimized: (text) => {
 				// Fallback: if execCommand fails, update state directly
 				setBodyText(text);

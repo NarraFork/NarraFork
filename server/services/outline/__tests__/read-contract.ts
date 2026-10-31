@@ -772,6 +772,64 @@ export const OUTLINE_READ_CONTRACT: ContractCase[] = [
 		},
 	},
 	{
+		name: "pages structure: several pages in one read, each page's rows together, a cut leaves one page short",
+		async run(ctx) {
+			const space = await personalSpace(ctx);
+			const r = await write(ctx, space, [
+				{ op: "insert", tempId: "p1", parent: null, content: "page 1" },
+				{ op: "insert", tempId: "a", parent: { tempId: "p1" }, content: "a" },
+				{ op: "insert", parent: { tempId: "a" }, content: "a.1" },
+				{ op: "insert", tempId: "p2", parent: null, content: "page 2" },
+				{ op: "insert", parent: { tempId: "p2" }, content: "b", task: { status: "todo" } },
+				{ op: "insert", tempId: "gone", parent: { tempId: "p2" }, content: "gone" },
+				{ op: "insert", parent: { tempId: "p2" }, content: "c", alias: "Q1" },
+				{ op: "insert", tempId: "p3", parent: null, content: "page 3" },
+			]);
+			const [p1, , , p2, , gone, , p3] = ids(r) as string[];
+			await write(ctx, space, [{ op: "delete", block: { id: gone as string } }]);
+			const pages = [p1, p2, p3] as string[];
+			const whole = new Map<string, string[]>();
+			for (const page of pages) {
+				const one = await ctx.store.listPageStructure(page, { asOf: null, limit: 100 });
+				whole.set(page, one.rows.map((row) => row.id).sort());
+			}
+			const all = await ctx.store.listPagesStructure([...pages, "missing-page", p1 as string], 100);
+			expect(all.truncated).toBe(false);
+			expect(all.rows).toHaveLength(7);
+			const grouped = (rows: typeof all.rows) => {
+				const order: string[] = [];
+				const byPage = new Map<string, string[]>();
+				for (const row of rows) {
+					if (order.at(-1) !== row.pageId) order.push(row.pageId);
+					byPage.set(row.pageId, [...(byPage.get(row.pageId) ?? []), row.id]);
+				}
+				// Each page's rows come together.
+				expect(new Set(order).size).toBe(order.length);
+				return { order, byPage };
+			};
+			const { byPage } = grouped(all.rows);
+			for (const page of pages) expect(byPage.get(page)?.sort()).toEqual(whole.get(page));
+			const p2Rows = all.rows.filter((row) => row.pageId === p2);
+			expect(p2Rows.find((row) => row.alias === "Q1")).toBeDefined();
+			expect(p2Rows.find((row) => row.taskJson?.status === "todo")).toBeDefined();
+			expect(p2Rows.every((row) => row.id !== gone)).toBe(true);
+			for (let limit = 0; limit < 7; limit++) {
+				const cut = await ctx.store.listPagesStructure(pages, limit);
+				expect(cut.truncated).toBe(true);
+				expect(cut.rows).toHaveLength(limit);
+				const { order, byPage: got } = grouped(cut.rows);
+				// Every page but the last one read is whole.
+				for (const page of order.slice(0, -1))
+					expect(got.get(page)?.sort()).toEqual(whole.get(page));
+				const last = order.at(-1);
+				if (last) {
+					for (const id of got.get(last) ?? []) expect(whole.get(last)).toContain(id);
+				}
+			}
+			expect(await ctx.store.listPagesStructure([], 10)).toEqual({ rows: [], truncated: false });
+		},
+	},
+	{
 		name: "resolve: addresses, aliases and titles in order, ambiguity, unreadable spaces",
 		async run(ctx) {
 			const space = await personalSpace(ctx);

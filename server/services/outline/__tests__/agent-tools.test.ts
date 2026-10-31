@@ -196,7 +196,7 @@ describe("availability", () => {
 	test("descriptions are static, so a loaded tool keeps the prompt cache", () => {
 		for (const tool of [outlineReadTool, outlineSearchTool, outlineEditTool]) {
 			expect(typeof tool.description).toBe("string");
-			expect(tool.getRawJsonSchema).toBeUndefined();
+			expect(tool).not.toHaveProperty("getRawJsonSchema");
 		}
 	});
 });
@@ -1186,7 +1186,8 @@ describe("OutlineEdit and task claims", () => {
 			b,
 		);
 		expect(refused.isError).toBe(true);
-		expect(refused.output).toContain(`${w.space.key}/${t.sid} is already being done by`);
+		// Named as a read of its own space labels it.
+		expect(refused.output).toContain(`[${t.sid}] is already being done by`);
 		expect(refused.output).toContain('"outline tools"');
 		expect(refused.output).toContain(w.session);
 		expect((await outlineStore.getSpace(w.space.id))?.nextSeq).toBe(commitsBefore);

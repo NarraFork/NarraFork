@@ -78,7 +78,7 @@ export const writeTool: ToolDefinition = {
 		"- spec://behavior_fence is normally read-only for the assistant; durable behavior constraints belong there, but only write it when the user explicitly asks you to record a behavior, and only as the first tool call of that user turn.\n" +
 		"- NEVER create documentation files (*.md) or README files unless explicitly requested by the User.\n" +
 		"- Only use emojis if the user explicitly requests it. Avoid writing emojis to files unless asked.",
-	rawJsonSchema: {
+	rawJsonSchema: withDeviceParam({
 		type: "object",
 		properties: {
 			file_path: {
@@ -93,10 +93,7 @@ export const writeTool: ToolDefinition = {
 		},
 		required: ["file_path", "content"],
 		additionalProperties: false,
-	},
-	getRawJsonSchema(config) {
-		return withDeviceParam(writeTool.rawJsonSchema as Record<string, unknown>, config);
-	},
+	}),
 	parameters: z.object({
 		file_path: z
 			.string()

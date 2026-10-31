@@ -183,6 +183,16 @@ async function settle(page: Page) {
 			),
 	);
 }
+async function waitForCaretMove(page: Page, previousHead: number) {
+	// Rendering two frames does not guarantee that the browser's selectionchange
+	// has reached the editor state. Wait for the observable keyboard result instead.
+	await page.waitForFunction(
+		(head) => (window as unknown as FixtureWindow).fixture.caretProbe().head !== head,
+		{},
+		previousHead,
+	);
+	await settle(page);
+}
 async function open() {
 	if (!browser || !server) throw new Error("Fixture unavailable");
 	const page = await browser.newPage();
@@ -562,12 +572,15 @@ test("arrow keys change visual lines before recalling input history", async () =
 			linesDocument(["older history"]),
 		);
 		await loadDocument(page, linesDocument(["line1", "line2", "line3"]));
-		const middle = await page.evaluate(() =>
+		await page.evaluate(() =>
 			(window as unknown as FixtureWindow).fixture.placeCaretAt("line2", 2),
 		);
 		await settle(page);
+		const middle = await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.caretProbe(),
+		);
 		await page.keyboard.press("ArrowUp");
-		await settle(page);
+		await waitForCaretMove(page, middle.head);
 		const moved = await page.evaluate(() =>
 			(window as unknown as FixtureWindow).fixture.caretProbe(),
 		);
@@ -607,14 +620,14 @@ test("arrow keys change visual lines before recalling input history", async () =
 			(window as unknown as FixtureWindow).fixture.caretProbe(),
 		);
 		await page.keyboard.press("ArrowUp");
-		await settle(page);
+		await waitForCaretMove(page, recalledEnd.head);
 		const recalledUp = await page.evaluate(() =>
 			(window as unknown as FixtureWindow).fixture.caretProbe(),
 		);
 		expect(recalledUp.text).toBe("hist1\nhist2\nhist3");
 		expect(recalledUp.top).toBeLessThan(recalledEnd.top - 4);
 		await page.keyboard.press("ArrowDown");
-		await settle(page);
+		await waitForCaretMove(page, recalledUp.head);
 		const recalledDown = await page.evaluate(() =>
 			(window as unknown as FixtureWindow).fixture.caretProbe(),
 		);
@@ -630,12 +643,15 @@ test("arrow keys change visual lines before recalling input history", async () =
 		);
 
 		await loadDocument(page, paragraphsDocument(["para1", "para2"]));
-		const second = await page.evaluate(() =>
+		await page.evaluate(() =>
 			(window as unknown as FixtureWindow).fixture.placeCaretAt("para2", 0),
 		);
 		await settle(page);
+		const second = await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.caretProbe(),
+		);
 		await page.keyboard.press("ArrowUp");
-		await settle(page);
+		await waitForCaretMove(page, second.head);
 		const previousParagraph = await page.evaluate(() =>
 			(window as unknown as FixtureWindow).fixture.caretProbe(),
 		);

@@ -44,6 +44,7 @@ import {
 	type BodyRef,
 	isAlias,
 	type OutlineNote,
+	parseAddress,
 	parseAliasValue,
 	TASK_BOX,
 } from "@shared/outline";
@@ -1083,8 +1084,11 @@ export async function outlineEdit(
 				if (error instanceof OutlineConflictError) return { writeConflict: error };
 				if (error instanceof OutlineTaskClaimedError) {
 					const at = error.opIndex === null ? undefined : edits[opEdit[error.opIndex] as number];
+					// The task named as a read of the space labels it: `[sid]` in an own space,
+					// `[key/sid]` in any other.
+					const sid = parseAddress(error.address)?.sid;
 					const message = OUTLINE_TOOL_TEXT.edit.taskClaimed(
-						error.address,
+						sid === undefined ? error.address : scope.labelIn(space)(sid),
 						await claimHolderName(error),
 					);
 					return { output: failed([at ? `${label(at)}: ${message}` : message]) };
@@ -1152,9 +1156,10 @@ export async function outlineEdit(
 		return successOutput(
 			space,
 			spaceText,
+			scope.addressIn(space),
 			edits,
 			outcome.written,
-			await mergedSection(scope, outcome.merged, scope.narratorId),
+			await mergedSection(scope, space, outcome.merged, scope.narratorId),
 			{ globalNotes, hints, meta },
 		);
 	}
@@ -1347,6 +1352,8 @@ async function conflictOutput(
 	meta: Record<string, unknown>,
 ): Promise<OutlineToolOutput> {
 	const text = OUTLINE_TOOL_TEXT.edit;
+	// Blocks are named as a read of the space labels them: an address the agent can use as is.
+	const id = scope.addressIn(space);
 	const listed = conflicts.slice(0, OUTLINE_EDIT_LIMITS.maxConflictsListed);
 	const blocks = new Map(
 		(await scope.store.getBlocks(listed.map((c) => c.blockId))).map((b) => [b.id, b]),
@@ -1363,6 +1370,7 @@ async function conflictOutput(
 	);
 	const rendered = await blockLinesForAgent(
 		scope,
+		space,
 		full.map((row) => rowNode(row, tags.get(row.id) ?? [])),
 	);
 	const shown: OutlineBlockRow[] = [];
@@ -1381,14 +1389,14 @@ async function conflictOutput(
 		const who = whoChanged(c.by);
 		if (c.tooLarge !== undefined) {
 			lines.push(
-				`- ${text.tooLargeToDelete(c.sid, c.tooLarge, OUTLINE_EDIT_LIMITS.maxDeletedChecked)}`,
+				`- ${text.tooLargeToDelete(id(c.sid), c.tooLarge, OUTLINE_EDIT_LIMITS.maxDeletedChecked)}`,
 			);
 			continue;
 		}
 		lines.push(
-			`- ${c.seen === null ? text.notRead(c.sid, who, c.now) : text.conflict(c.sid, who, c.now, c.seen)}`,
+			`- ${c.seen === null ? text.notRead(id(c.sid), who, c.now) : text.conflict(id(c.sid), who, c.now, c.seen)}`,
 		);
-		if (c.under) lines.push(`  ${text.underDeleted(c.under)}`);
+		if (c.under) lines.push(`  ${text.underDeleted(id(c.under))}`);
 		for (const detail of c.detail ?? []) lines.push(`  ${detail}`);
 		const block = blocks.get(c.blockId);
 		if (shownIds.has(c.blockId)) lines.push(`  ${text.shownBelow}`);
@@ -1418,29 +1426,37 @@ async function conflictOutput(
 	};
 }
 
-function itemLines(items: readonly PlannedItem[], depth: number, out: string[]): void {
+function itemLines(
+	items: readonly PlannedItem[],
+	depth: number,
+	out: string[],
+	id: (sid: string) => string,
+): void {
 	for (const p of items) {
 		const box = p.item.task ? `[${TASK_BOX[p.item.task.status]}] ` : "";
 		const who = p.item.task?.assignee ? ` @${p.item.task.assignee}` : "";
 		const alias = p.alias ? OUTLINE_TOOL_TEXT.aliasMark(p.alias) : "";
 		const title = clip(p.item.title) || OUTLINE_TOOL_TEXT.untitled;
-		out.push(`${"  ".repeat(depth)}- [${p.sid}] ${box}${title}${who}${alias}`);
-		itemLines(p.children, depth + 1, out);
+		out.push(`${"  ".repeat(depth)}- [${id(p.sid)}] ${box}${title}${who}${alias}`);
+		itemLines(p.children, depth + 1, out, id);
 	}
 }
 
 /**
- * The merged blocks as a read shows them (the short id after the bullet, links with their
+ * The merged blocks as a read shows them (the label after the bullet, links with their
  * targets' titles), within {@link OUTLINE_EDIT_LIMITS.maxMergedBytes}; the rest are only named.
  */
 async function mergedSection(
 	scope: OutlineAgentScope,
+	space: OutlineSpaceRow,
 	merged: readonly MergedBlock[],
 	narratorId: string,
 ): Promise<MergedSection> {
 	if (merged.length === 0) return { lines: [], sids: new Set(), shown: new Set() };
+	const id = scope.addressIn(space);
 	const rendered = await blockLinesForAgent(
 		scope,
+		space,
 		merged.map((m) => rowNode(m.row, m.tags)),
 	);
 	const lines: string[] = [OUTLINE_TOOL_TEXT.edit.mergedHeader];
@@ -1451,14 +1467,14 @@ async function mergedSection(
 		const text = rendered.get(m.row.id) ?? "";
 		const size = Buffer.byteLength(text, "utf8");
 		if (bytes > 0 && bytes + size > OUTLINE_EDIT_LIMITS.maxMergedBytes) {
-			unshown.push(`[${m.row.sid}]`);
+			unshown.push(`[${id(m.row.sid)}]`);
 			continue;
 		}
 		bytes += size;
 		shown.push(m);
 		const { why } = m;
 		lines.push(
-			`‹${OUTLINE_TOOL_TEXT.edit.mergedBlock(why.sid, whoChanged(why.by), why.now, why.seen ?? 0)}›`,
+			`‹${OUTLINE_TOOL_TEXT.edit.mergedBlock(id(why.sid), whoChanged(why.by), why.now, why.seen ?? 0)}›`,
 		);
 		lines.push(text);
 	}
@@ -1479,6 +1495,8 @@ async function mergedSection(
 function successOutput(
 	space: OutlineSpaceRow,
 	spaceText: string,
+	/** How a block of the space is named: its sid in an own space, `key/sid` elsewhere. */
+	id: (sid: string) => string,
 	edits: readonly EditState[],
 	result: OutlineWriteResult,
 	merged: MergedSection,
@@ -1499,10 +1517,10 @@ function successOutput(
 		const r = edit.request;
 		const firstResult = result.results[edit.opIndexes[0] as number];
 		const where = (l: Located | undefined) =>
-			l?.kind === "block" ? `[${l.block.sid}] ${clip(l.block.title, 60)}` : null;
+			l?.kind === "block" ? `[${id(l.block.sid)}] ${clip(l.block.title, 60)}` : null;
 		if ("add" in r) {
 			lines.push(`${n}. ${OUTLINE_TOOL_TEXT.edit.added(where(edit.parent))}`);
-			itemLines(edit.items ?? [], 1, lines);
+			itemLines(edit.items ?? [], 1, lines, id);
 			const created: string[] = [];
 			walkPlanned(edit.items ?? [], (p) => created.push(`${space.key}/${p.sid}`));
 			summary.push({ op: "add", created });
@@ -1511,23 +1529,23 @@ function successOutput(
 			lines.push(
 				`${n}. ${
 					merged.shown.has(sid)
-						? OUTLINE_TOOL_TEXT.edit.replacedMerged(sid)
+						? OUTLINE_TOOL_TEXT.edit.replacedMerged(id(sid))
 						: merged.sids.has(sid)
-							? OUTLINE_TOOL_TEXT.edit.replacedMergedUnshown(sid)
-							: OUTLINE_TOOL_TEXT.edit.replaced(sid)
+							? OUTLINE_TOOL_TEXT.edit.replacedMergedUnshown(id(sid))
+							: OUTLINE_TOOL_TEXT.edit.replaced(id(sid))
 				}`,
 			);
 			const children = (edit.items?.[0]?.children ?? []) as PlannedItem[];
-			if (children.length > 0) itemLines(children, 1, lines);
+			if (children.length > 0) itemLines(children, 1, lines, id);
 			summary.push({ op: "replace", address: `${space.key}/${sid}` });
 		} else if ("move" in r) {
 			const sid = firstResult?.sid ?? "";
 			const to = where(edit.parent) ?? OUTLINE_TOOL_TEXT.edit.topLevel;
-			lines.push(`${n}. ${OUTLINE_TOOL_TEXT.edit.moved(sid, to)}`);
+			lines.push(`${n}. ${OUTLINE_TOOL_TEXT.edit.moved(id(sid), to)}`);
 			summary.push({ op: "move", address: `${space.key}/${sid}` });
 		} else if ("delete" in r) {
 			const sid = firstResult?.sid ?? "";
-			lines.push(`${n}. ${OUTLINE_TOOL_TEXT.edit.deleted(sid)}`);
+			lines.push(`${n}. ${OUTLINE_TOOL_TEXT.edit.deleted(id(sid))}`);
 			summary.push({ op: "delete", address: `${space.key}/${sid}` });
 		} else {
 			const sid = firstResult?.sid ?? "";
@@ -1543,7 +1561,7 @@ function successOutput(
 						? OUTLINE_TOOL_TEXT.aliasMark(edit.alias).trim()
 						: OUTLINE_TOOL_TEXT.edit.noAlias,
 				);
-			lines.push(`${n}. ${OUTLINE_TOOL_TEXT.edit.set(sid, parts)}`);
+			lines.push(`${n}. ${OUTLINE_TOOL_TEXT.edit.set(id(sid), parts)}`);
 			summary.push({ op: "set", address: `${space.key}/${sid}` });
 		}
 	}
