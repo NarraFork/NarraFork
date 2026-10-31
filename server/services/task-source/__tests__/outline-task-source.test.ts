@@ -9,13 +9,20 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { db } from "../../../db";
-import { narrators } from "../../../db/schema";
+import { narrators, specFileRevisions, specNamespaces, users } from "../../../db/schema";
+import { outlineEditTool } from "../../../lib/agent/tools/outline";
+import type { ToolContext } from "../../../lib/agent/types";
 import { generateId } from "../../../lib/id";
 import { withRuntimePolicyTrait } from "../../../lib/runtime-policy-trait";
 import { settings } from "../../../lib/settings";
+import { startNarratorRun } from "../../agent-runtime/run";
 import { compileDelegationCeiling } from "../../custom-subagent-service";
+import type { ExecuteLoopResult } from "../../narrator-executor";
+import * as executor from "../../narrator-executor";
+import { narratorService } from "../../narrator-service";
 import { maybeStartContinuation, readSpecContinuationState } from "../../narrator-session";
 import type { ActiveNarrator } from "../../narrator-session-state";
+import { ensureSessionSpace } from "../../outline/spaces";
 import { outlineStore } from "../../outline/store";
 import * as outlineWrite from "../../outline/write";
 import { specVfsService, writeSpecFile } from "../../spec-vfs-service";
@@ -38,6 +45,14 @@ const NOW = "2026-10-31T00:00:00.000Z";
 beforeEach(() => {
 	settings.outline.enabled = true;
 });
+
+async function user(): Promise<string> {
+	const id = generateId();
+	await db
+		.insert(users)
+		.values({ id, username: `outline-ts-${id}`, passwordHash: "x", role: "user", createdAt: NOW });
+	return id;
+}
 
 async function session(
 	options: {
@@ -79,7 +94,10 @@ async function subagent(
 		subagentType: "general",
 		parentNarratorId: rootId,
 		aclRootNarratorId: rootId,
-		traits: withRuntimePolicyTrait(["standalone"], await compileDelegationCeiling("general")),
+		traits: withRuntimePolicyTrait(
+			["standalone"],
+			await compileDelegationCeiling("general", { outlineSession: true }),
+		),
 		model: "default",
 		permissionMode: "default",
 		status: "idle",
@@ -390,5 +408,114 @@ describe("outline continuation (D27c: subagents continue on their turn budget on
 
 		const off = await subagent(root, { mode: "off" });
 		expect(await maybeStartContinuation(activeOf(off), false, { cause: "maxTurns" })).toBeNull();
+	});
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// End to end: an outline session writes a task, continuation starts and continues it, the task
+// is ticked done, continuation stops.
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe("an outline session end to end", () => {
+	beforeEach(() => {
+		settings.anthropicProviders = [
+			{
+				id: "outline-continuation-test",
+				name: "Outline continuation test",
+				prefix: "outlinecontinuationtest",
+				apiKey: "test-only",
+				baseUrl: "https://example.invalid/v1",
+				defaultModel: "claude-sonnet-4",
+			},
+		];
+	});
+
+	test("task written, claimed by continuation, continued, done, continuation stops", async () => {
+		const owner = await user();
+		const created = await narratorService.create({
+			ownerUserId: owner,
+			model: "outlinecontinuationtest:claude-sonnet-4",
+			autoContinuationOverride: "always",
+			startInPlanMode: false,
+			cwd: "/",
+		});
+		const id = created.id;
+		expect(created.taskBackend).toBe("outline");
+		const ctx = {
+			narratorId: id,
+			cwd: "/",
+			signal: new AbortController().signal,
+			locale: "en",
+			userId: owner,
+			requestPermission: async () => ({ behavior: "allow" }),
+		} as unknown as ToolContext;
+
+		let passes = 0;
+		const seen: Array<{ taskBackend?: string; outlineEdit: boolean; input: string }> = [];
+		const model = spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
+			passes++;
+			const tool = options.config.toolFilter?.(outlineEditTool) ?? false;
+			seen.push({
+				taskBackend: options.config.taskBackend,
+				outlineEdit: tool && !options.config.toolLoading?.managed.has("OutlineEdit"),
+				input: JSON.stringify(options.history).slice(-4000),
+			});
+			if (passes === 1) {
+				const written = await outlineEditTool.execute(
+					{ edits: [{ add: "session/", markdown: "- Plan\n  - [ ] Write the parser" }] },
+					ctx,
+				);
+				expect(written.isError).toBeFalsy();
+			} else if (passes === 2) {
+				const { address } = await taskState(id, "Write the parser");
+				const done = await outlineEditTool.execute(
+					{ edits: [{ set: address, checkbox: "x" }] },
+					ctx,
+				);
+				expect(done.isError).toBeFalsy();
+			}
+			const result: ExecuteLoopResult = {
+				finalText: passes === 1 ? "planned" : "parser written",
+				hasError: false,
+				shouldUpdateTitle: false,
+				hadToolUses: true,
+				completedNaturally: true,
+			};
+			return result;
+		});
+		restores.push(() => model.mockRestore());
+
+		const run = await startNarratorRun({
+			narratorId: id,
+			text: "Write a parser",
+			locale: "en",
+			principal: owner,
+			foreground: true,
+		});
+		expect((await run.terminal).hasError).toBe(false);
+		expect(passes).toBe(2);
+
+		// Each pass ran as an outline session with OutlineEdit as a core tool.
+		for (const pass of seen) {
+			expect(pass.taskBackend).toBe("outline");
+			expect(pass.outlineEdit).toBe(true);
+		}
+		// The continuation pass was sent for the task, by its address.
+		const { block, claim, address } = await taskState(id, "Write the parser");
+		expect(seen[1]?.input).toContain(address);
+		// Claimed by the continuation (epoch 1), released when it was ticked done.
+		expect(block.taskJson?.status).toBe("done");
+		expect(claim?.epoch).toBe(1);
+		expect(claim?.holderNarratorId).toBeNull();
+		expect(claim?.lastHolderNarratorId).toBe(id);
+		// Nothing went to Dynamic Spec.
+		const space = await ensureSessionSpace(id);
+		expect(space.narratorId).toBe(id);
+		const revisions = await db
+			.select({ id: specFileRevisions.id })
+			.from(specFileRevisions)
+			.innerJoin(specNamespaces, eq(specNamespaces.id, specFileRevisions.namespaceId))
+			.where(eq(specNamespaces.narratorId, id));
+		expect(revisions).toEqual([]);
 	});
 });

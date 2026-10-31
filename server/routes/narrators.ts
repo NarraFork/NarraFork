@@ -95,7 +95,13 @@ import {
 	validateComposerAssets,
 	validateComposerProjection,
 } from "../lib/composer-document";
-import { AppError, NotFoundError, ValidationError, zodValidationError } from "../lib/errors";
+import {
+	AppError,
+	catalogError,
+	NotFoundError,
+	ValidationError,
+	zodValidationError,
+} from "../lib/errors";
 import { resolveFastModeForUser } from "../lib/fast-mode";
 import {
 	parseFileReferenceInput,
@@ -484,6 +490,7 @@ import {
 	resolveSubagentModelInheritance,
 } from "../services/subagent-model";
 import { broadcastSubagentTakeoverChanged } from "../services/subagent-takeover-broadcast";
+import { resolveTaskBackend } from "../services/task-source";
 import { getToolEditPreview } from "../services/tool-edit-preview";
 import {
 	parseHistoricalWriteDocumentReference,
@@ -2330,6 +2337,12 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		// queue the command and append/start it once the buffer consumer reaches it;
 		// this avoids mutating tasks.json in the middle of the current turn.
 		if (cmdResult.resolved && "specGoal" in cmdResult) {
+			// A session whose tasks live in the outline has no tasks.json to add the goal to; its
+			// `/goal` (a person-created, locked task) arrives with the task board (plan PR 5).
+			// Refused before anything is persisted, so nothing lands where the session cannot see.
+			if ((await resolveTaskBackend(id)) === "outline") {
+				throw catalogError("GOAL_IN_OUTLINE_SESSION");
+			}
 			const { objective, rawCommand } = cmdResult as SpecGoalCommandResult;
 			// A compacting narrator counts as busy here for the same reason a running one
 			// does: appending the protected task now and starting its Spec turn would run

@@ -1079,6 +1079,9 @@ export async function provisionExternalNarrator(
 				// surface itself keeps authorizing purely on the integration binding —
 				// `requireOwnedExternalNarrator` is unchanged and does not consult this.
 				ownerUserId: ctx.userId,
+				// Externally provisioned sessions are not offered the outline tools, so their
+				// tasks stay in Dynamic Spec, which their clients already drive.
+				taskBackend: "spec",
 			});
 			const committed = db.transaction((tx) => {
 				const narrator = createPreparedNarratorInTransaction(tx, prepared);

@@ -26,6 +26,7 @@ import {
 } from "../../lib/agent/tools/bash";
 import { clearBehaviorFenceEditGrant } from "../../lib/agent/tools/behavior-fence-grant";
 import { KNOWLEDGE_KIND_DENY_CORE, OPTIONAL_TOOLS } from "../../lib/agent/tools/index";
+import { OUTLINE_EDIT_TOOL } from "../../lib/agent/tools/outline-names";
 import { buildSkillsContext } from "../../lib/agent/tools/skill";
 import { buildSubagentModelContext } from "../../lib/agent/tools/task";
 import type { ToolDefinition } from "../../lib/agent/types";
@@ -137,6 +138,7 @@ import {
 	exitNarratorPlanMode,
 	prepareNarratorPlanMode,
 } from "../narrator-plan-mode";
+import { taskSectionFor } from "../narrator-prompt";
 import {
 	getContextOverflowFailureError,
 	getFirstTokenTimeoutMs,
@@ -211,6 +213,7 @@ import { keepOutlineTaskLeases, type OutlineLeaseKeeper } from "../outline/lease
 import { resolvePlanApprovalAttribution } from "../plan-approval-attribution";
 import { subagentRetryRecoveredBroadcast } from "../subagent-executor";
 import { isMcpToolAllowedForNarrator, runtimeToolFilter } from "../subagent-tools";
+import { resolveTaskBackend, type TaskBackend } from "../task-source";
 import { buildFinalToolStartAuthorization } from "../tool-final-start-authorization";
 import { mcpToolMarker, parseMcpServerMarker, parseMcpToolMarker } from "../tool-load-markers";
 import { resolveNarratorCapabilities } from "../trait-layer-service";
@@ -927,6 +930,20 @@ export async function runAgentLoopUnlocked(
 			);
 			const runtimePolicy = passCapabilities.policy;
 			const profileToolFilter = runtimeToolFilter(runtimePolicy);
+			// Where the session's tasks live, once per pass (one indexed read). An outline root
+			// session has OutlineEdit as a core tool (plan §5): never managed by loading, so it
+			// cannot be unloaded and needs no routine. Subagents get no outline tools by default
+			// (R16): their ceiling decides, as for every built-in.
+			const taskBackend: TaskBackend = await resolveTaskBackend(narratorId).catch(
+				(error: unknown) => {
+					logger.warn("Failed to resolve task backend for pass; using spec", {
+						narratorId,
+						error: String(error),
+					});
+					return "spec" as const;
+				},
+			);
+			const outlineEditCore = taskBackend === "outline" && freshNarrator.type !== "subagent";
 			{
 				if (active._workspaceInstallFailed)
 					throw new Error("Workspace context installation requires session recovery");
@@ -970,6 +987,7 @@ export async function runAgentLoopUnlocked(
 				managedOptionalTools.clear();
 				if (runtimePolicy.tools.builtin !== "all") return;
 				for (const tool of candidates) {
+					if (outlineEditCore && tool.name === OUTLINE_EDIT_TOOL) continue;
 					if (
 						OPTIONAL_TOOLS.has(tool.name) &&
 						(!tool.isAvailable || tool.isAvailable()) &&
@@ -1052,6 +1070,7 @@ export async function runAgentLoopUnlocked(
 					);
 				}
 				if (runtimePolicy.tools.builtin !== "all") return true;
+				if (outlineEditCore && tool.name === OUTLINE_EDIT_TOOL) return true;
 				if (OPTIONAL_TOOLS.has(tool.name)) return managedOptionalTools.has(tool.name);
 				return active._narratorKind !== "knowledge" || !KNOWLEDGE_KIND_DENY_CORE.has(tool.name);
 			};
@@ -1186,6 +1205,7 @@ export async function runAgentLoopUnlocked(
 					// Legacy resumed plan paths cannot be reconstructed from the identity.
 					active._planFilePath,
 					{
+						taskSection: taskSectionFor(taskBackend, current.type),
 						workspaceContext: JSON.stringify(workspace),
 						skillsContext: buildSkillsContext({
 							cwd: active.cwd,
@@ -1777,6 +1797,7 @@ export async function runAgentLoopUnlocked(
 				// Freeze this logical run's segment across every retry/compact pass.
 				executionSegmentId: run?.executionSegmentId,
 				runtimePolicy,
+				taskBackend,
 				bot: isBotNarrator(freshNarrator.traits),
 				narratorId,
 				conversationId: active.conversationId,

@@ -211,6 +211,8 @@ export async function extractSubagentToPrimary(
 						autoContinuationOverride: source.autoContinuationOverride ?? "inherit",
 						behaviorFenceIntervalOverride: source.behaviorFenceIntervalOverride ?? null,
 						behaviorFenceAttachOverride: source.behaviorFenceAttachOverride ?? "inherit",
+						// The work it carries on is its session's: same task backend (D31).
+						taskBackend: source.taskBackend,
 						// Independence: never join the source/parent deletion cascade.
 						parentNarratorId: null,
 						refsInheritedFrom: null,

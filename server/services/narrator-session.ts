@@ -181,7 +181,7 @@ import type { InjectionRecipientPlacement } from "./narrator-injection";
 import { deliverInjection } from "./narrator-injection";
 import { isFirstUserTurn } from "./narrator-message-count";
 import { resolveNarratorProjectId as resolveSharedNarratorProjectId } from "./narrator-project";
-import { buildEffectiveSystemPrompt } from "./narrator-prompt";
+import { buildEffectiveSystemPrompt, taskSectionFor } from "./narrator-prompt";
 import type { QuestionExecutionPrincipal } from "./narrator-question-service";
 import { getNarratorMessageRefsPort } from "./narrator-refs/store";
 import { enrichToolUseBlocks, narratorService, truncateToolIO } from "./narrator-service";
@@ -208,6 +208,7 @@ import { resolveSubagentModelForRun, subagentRunReasoningEffort } from "./subage
 import {
 	type ContinuationTarget,
 	type NarratorTaskSource,
+	resolveTaskBackend,
 	taskSourceForNarrator,
 } from "./task-source";
 import { buildFinalToolStartAuthorization } from "./tool-final-start-authorization";
@@ -1171,7 +1172,12 @@ export async function buildSystemPrompt(
 	planFilePath?: string,
 	context?: Pick<
 		import("./narrator-prompt").BuildPromptOptions,
-		"workspaceContext" | "skillsContext" | "modelsContext" | "modeContext" | "runtimeHints"
+		| "workspaceContext"
+		| "skillsContext"
+		| "modelsContext"
+		| "modeContext"
+		| "runtimeHints"
+		| "taskSection"
 	>,
 ): Promise<import("./narrator-prompt").BuildPromptResult> {
 	return buildEffectiveSystemPrompt({
@@ -1312,6 +1318,12 @@ async function createNarrator(
 			allowLocalExecution: initialOAuthRuntime?.allowLocalExecution ?? true,
 		},
 		planFilePath,
+		{
+			taskSection: taskSectionFor(
+				await resolveTaskBackend(narratorId).catch(() => "spec" as const),
+				narrator.type,
+			),
+		},
 	);
 
 	// Resolve and warm skill summaries for the Skill tool. This is context-based:
@@ -5812,6 +5824,7 @@ async function reExecuteDeniedToolCallUnlocked(
 				const config: import("../lib/agent").AgentConfig = {
 					narratorId,
 					runtimePolicy,
+					taskBackend: await resolveTaskBackend(narratorId).catch(() => "spec" as const),
 					systemPrompt: active.systemPrompt ?? undefined,
 					permissionMode: oauthRuntime?.permissionMode ?? narrator.permissionMode ?? "default",
 					planMode: !oauthRuntime && isPlanModeTrait(narrator.traits),

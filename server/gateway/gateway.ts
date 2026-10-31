@@ -30,6 +30,7 @@ import type { ImageRef } from "../lib/uploads";
 import { sendMessage } from "../services/narrator-session";
 import { pendingPermissions } from "../services/narrator-session-state";
 import { getRecentTabUserIdsForNarrator, listAllRecentTabs } from "../services/recent-tabs-service";
+import { defaultTaskBackendForNewSession } from "../services/task-source";
 import { RateLimiter } from "./base-adapter";
 import { loadGatewayConfig } from "./config";
 import { GatewayStreamConsumer } from "./stream-consumer";
@@ -664,6 +665,8 @@ class Gateway {
 			isAskInPassing: false,
 			variant: "primary",
 			traits: ["standalone"],
+			// A new root session like any other: the outline's while it is switched on.
+			taskBackend: defaultTaskBackendForNewSession(),
 			messageVersion: 0,
 			// Access control: the auto-resolved deployment user owns the session, the
 			// same id already used for attribution and knowledge-base reads below. It

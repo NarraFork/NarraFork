@@ -997,6 +997,12 @@ export interface AgentConfig {
 	/** Resolved by server runtime assembly; DB authorization remains the final authority. */
 	runtimePolicy?: RuntimePolicy;
 	/**
+	 * Where this session's tasks live (`services/task-source`), resolved once per pass. Under
+	 * `outline` every tool route to `spec://` answers with a hint to use the outline tools
+	 * instead, and taskReflection never runs. Absent means spec.
+	 */
+	taskBackend?: "spec" | "outline";
+	/**
 	 * This narrator is a bot: people see only what it delivers with `Send({ user })`, so
 	 * Send offers that target. Shapes the offered schema only; the bot trait is re-read
 	 * when the message is delivered.
