@@ -313,7 +313,7 @@ export const narrators = sqliteTable(
 		 * 目前只有 ModelTrace 舱（每个模型一个）用它。
 		 */
 		hiddenFromLists: integer("hidden_from_lists", { mode: "boolean" }).notNull().default(false),
-		/** ModelTrace 舱的绑定键 `provider::model`；NULL 表示这个叙述者不是 trace 舱。 */
+		/** ModelTrace 舱的不透明绑定键；NULL 表示还没有收编。 */
 		modeltraceKey: text("modeltrace_key"),
 		title: text("title"),
 		inheritMode: text("inherit_mode", { enum: ["full", "compressed", "fresh"] })

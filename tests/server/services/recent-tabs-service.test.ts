@@ -85,6 +85,54 @@ afterAll(() => {
 	mock.restore();
 });
 
+describe("hidden narrators", () => {
+	it("leaves a ModelTrace cabin out of the sidebar", async () => {
+		seedUser();
+		db.insert(narrators)
+			.values([
+				{
+					id: "cabin",
+					title: "ModelTrace",
+					hiddenFromLists: true,
+					createdAt: NOW,
+					updatedAt: NOW,
+				},
+				{
+					id: "sub-cabin",
+					title: "ModelTrace sub",
+					hiddenFromLists: true,
+					createdAt: NOW,
+					updatedAt: NOW,
+				},
+				{
+					id: "visible",
+					title: "Visible",
+					hiddenFromLists: false,
+					createdAt: NOW,
+					updatedAt: NOW,
+				},
+			])
+			.run();
+
+		const saved = await recentTabs.upsertRecentTabsBatch("user-1", [
+			makeTab("cabin"),
+			makeTab("sub-cabin", { type: "subagent" }),
+			makeTab("visible"),
+		]);
+		expect(saved.changed).toBe(true);
+		expect(storedKeys()).toEqual(["narrator:visible"]);
+
+		const skipped = await recentTabs.upsertRecentTab("user-1", makeTab("cabin"));
+		expect(skipped).toEqual({
+			changed: false,
+			baseRevision: saved.revision,
+			revision: saved.revision,
+			operations: [],
+		});
+		expect(storedKeys()).toEqual(["narrator:visible"]);
+	});
+});
+
 describe("recent-tabs indexed side paths", () => {
 	it("promotes a draft tab without disturbing the pinned zone", async () => {
 		seedLegacyTabs([

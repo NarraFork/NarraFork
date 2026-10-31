@@ -260,18 +260,4 @@ export async function applySqliteDataBackfills(
 	// Historical token semantics cannot be inferred from counter sizes or provider names.
 	// Keep accounting rows unchanged at startup; administrators review bounded evidence
 	// and explicitly confirm corrections on the dedicated usage repair page.
-
-	// 旧的 ModelTrace 每次 /modeltrace 都 fork 一个新的 primary 叙述者，没有 hidden 标记，
-	// 于是残留在叙述者列表里。它们没有绑定键、无法从模型的入口重新打开，直接隐藏即可。
-	{
-		const result = sqlite
-			.prepare(
-				`UPDATE narrators SET hidden_from_lists = 1
-				 WHERE hidden_from_lists = 0 AND COALESCE(traits, '[]') LIKE '%"modeltrace"%'`,
-			)
-			.run();
-		if (result.changes > 0) {
-			logger.info("Hid legacy ModelTrace narrators", { count: result.changes });
-		}
-	}
 }

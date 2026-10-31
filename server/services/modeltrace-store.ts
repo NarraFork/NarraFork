@@ -1,41 +1,64 @@
-// ModelTrace 舱的存取：一个模型一个叙述者，它不进叙述者列表，只能凭 id 打开。
+// ModelTrace 舱的存取：每个用户、每个模型一个叙述者。它不进列表，只能凭 id 打开。
 //
-// 单独成模块是为了把 SQL 与探测流程分开：探测侧要能在没有真实数据库的测试里跑，
-// 这里的每条语句都是围绕 narrators / narrator_message_refs 的短事务。
+// 单独成模块是为了把 SQL 与探测流程分开：探测侧要能在没有真实数据库的测试里跑。
 
 import { db } from "@server/db";
-import { narratorMessageRefs, narratorMessages, narrators } from "@server/db/schema";
+import {
+	aclGrants,
+	narratorMessageRefs,
+	narratorMessages,
+	narrators,
+	narratorToolCalls,
+} from "@server/db/schema";
 import { resolveProviderAndModel } from "@server/lib/agent/provider";
 import { addTrait, parseTraits } from "@server/lib/narrator-utils";
-import { eq, inArray } from "drizzle-orm";
+import { and, eq, inArray, ne, notExists, sql } from "drizzle-orm";
+import { alias } from "drizzle-orm/sqlite-core";
 
-/** 绑定键：探测实际使用的 provider 与解析后的模型名。 */
-export function modelTraceKey(provider: string, model: string): string {
-	return `${provider}::${model}`;
+const otherRefs = alias(narratorMessageRefs, "other_refs");
+
+/** 不透明绑定键。调用方不要拆它；同一身份只通过 `modelTraceKeyFor` 生成。 */
+export function modelTraceKey(userId: string, provider: string, model: string): string {
+	return ["v1", userId, provider, model].map((part) => encodeURIComponent(part)).join("/");
+}
+
+/** 写入、收编、查找共用这一次解析，避免模型串的两种写法对上两个舱。 */
+export function modelTraceKeyFor(userId: string, model: string, stickyProvider?: string): string {
+	const resolved = resolveProviderAndModel(model, stickyProvider);
+	return modelTraceKey(userId, resolved.provider, resolved.model);
+}
+
+async function narratorIdForKey(key: string): Promise<string | null> {
+	const row = await db.query.narrators.findFirst({
+		where: eq(narrators.modeltraceKey, key),
+		columns: { id: true },
+	});
+	return row?.id ?? null;
+}
+
+function isKeyConflict(error: unknown): boolean {
+	return error instanceof Error && error.message.includes("narrators.modeltrace_key");
 }
 
 /**
- * 取该模型的舱，没有就建一个。
+ * 取该用户这个模型的舱，没有就建一个。
  *
- * 首次创建沿用 `forkNarrator`：它会把源会话的工作目录、系统提示词、权限模式与模型
- * 一起带过来，探测的请求快照也因此和源会话一致。之后同一模型只复用，不再新建。
+ * 首次创建沿用 `forkNarrator`，带上源会话的工作目录、系统提示词、权限模式与模型。
+ * 舱本身收成所有者私有：源会话后来被分享时，诊断记录不跟着公开。
  */
 export async function ensureTraceNarrator(input: {
 	parentId: string;
-	key: string;
-	title: string;
-	model: string;
 	userId: string;
+	provider: string;
+	model: string;
+	title: string;
 	locale: string;
 }): Promise<string> {
-	const existing = await db.query.narrators.findFirst({
-		where: eq(narrators.modeltraceKey, input.key),
-		columns: { id: true },
-	});
+	const key = modelTraceKeyFor(input.userId, input.model, input.provider);
+	const existing = await narratorIdForKey(key);
 	if (existing) {
-		// 同一个键下模型名可能只是大小写或前缀写法不同，跟着最近一次请求更新。
-		await db.update(narrators).set({ model: input.model }).where(eq(narrators.id, existing.id));
-		return existing.id;
+		await retarget(existing, input);
+		return existing;
 	}
 
 	const { narratorService } = await import("./narrator-service");
@@ -47,82 +70,120 @@ export async function ensureTraceNarrator(input: {
 		userId: input.userId,
 		locale: input.locale,
 	});
-	await db
-		.update(narrators)
-		.set({
-			traits: addTrait(parseTraits(created.traits), "modeltrace"),
-			parentNarratorId: input.parentId,
-			hiddenFromLists: true,
-			modeltraceKey: input.key,
-		})
-		.where(eq(narrators.id, created.id));
+	try {
+		seal(created.id, key, input.userId, input.parentId, created.traits);
+	} catch (error) {
+		if (!isKeyConflict(error)) throw error;
+		await narratorService.remove(created.id);
+		const winner = await narratorIdForKey(key);
+		if (!winner) throw error;
+		await retarget(winner, input);
+		return winner;
+	}
 	return created.id;
 }
 
-/**
- * 清空舱的历史，只保留下一次探测的结果。
- *
- * 消息行可能与 fork 出去的其它叙述者共享：先删自己的 refs，再删没有任何 ref 的消息行，
- * 这样别的会话不会因为这里清历史而丢内容。
- */
-export async function clearTraceHistory(id: string): Promise<void> {
+function seal(id: string, key: string, userId: string, parentId: string, traits: unknown): void {
 	db.transaction((tx) => {
-		const messageIds = new Set(
-			tx
-				.select({ messageId: narratorMessageRefs.messageId })
-				.from(narratorMessageRefs)
-				.where(eq(narratorMessageRefs.narratorId, id))
-				.all()
-				.map((row) => row.messageId),
-		);
-		tx.delete(narratorMessageRefs).where(eq(narratorMessageRefs.narratorId, id)).run();
-		for (const messageId of messageIds) {
-			const otherRef = tx
-				.select({ id: narratorMessageRefs.id })
-				.from(narratorMessageRefs)
-				.where(eq(narratorMessageRefs.messageId, messageId))
-				.limit(1)
-				.all();
-			if (otherRef.length === 0) {
-				tx.delete(narratorMessages).where(eq(narratorMessages.id, messageId)).run();
-			}
-		}
+		tx.delete(aclGrants)
+			.where(and(eq(aclGrants.scopeType, "narrator"), eq(aclGrants.scopeId, id)))
+			.run();
 		tx.update(narrators)
 			.set({
-				nextSeq: 0,
-				apiConversationId: null,
-				contextUsageSnapshotJson: null,
-				status: "idle",
+				traits: addTrait(parseTraits(traits), "modeltrace"),
+				parentNarratorId: parentId,
+				ownerUserId: userId,
+				visibility: "private",
+				writeAudience: "owner",
+				hiddenFromLists: true,
+				modeltraceKey: key,
 			})
 			.where(eq(narrators.id, id))
 			.run();
 	});
 }
 
-/** 该模型的舱 id；没有跑过 /modeltrace 时为 null，按钮据此提示先运行一次。 */
-export async function findModelTraceNarrator(rawModel: string): Promise<string | null> {
-	// 写入侧用的是「路由 provider + 探测时的模型串」，而模型串在解析前后可能是两种写法
-	// （例如 `反代:cn:xxx` 与 `cn:xxx`）。查找侧把几种可能的键都试一遍，
-	// 免得因为解析差异让按钮永远找不到已有舱。
-	const candidates = new Set<string>();
-	const add = (provider: string | undefined, model: string | undefined) => {
-		if (provider && model) candidates.add(modelTraceKey(provider, model));
-	};
-	const separator = rawModel.indexOf(":");
-	const prefix = separator > 0 ? rawModel.slice(0, separator) : undefined;
-	try {
-		const resolved = resolveProviderAndModel(rawModel);
-		add(resolved.provider, rawModel);
-		add(resolved.provider, resolved.model);
-		add(prefix, resolved.model);
-	} catch {
-		// 模型已无法解析时只按字面前缀兜底。
-	}
-	add(prefix, rawModel);
-	if (candidates.size === 0) return null;
-	const row = await db.query.narrators.findFirst({
-		where: inArray(narrators.modeltraceKey, [...candidates]),
-		columns: { id: true },
+async function retarget(
+	id: string,
+	input: { parentId: string; model: string; title: string },
+): Promise<void> {
+	const parent = await db.query.narrators.findFirst({
+		where: eq(narrators.id, input.parentId),
+		columns: { cwd: true, contextProjectId: true },
 	});
-	return row?.id ?? null;
+	await db
+		.update(narrators)
+		.set({
+			model: input.model,
+			title: input.title,
+			parentNarratorId: input.parentId,
+			cwd: parent?.cwd ?? null,
+			contextProjectId: parent?.contextProjectId ?? null,
+		})
+		.where(eq(narrators.id, id));
+}
+
+/**
+ * 清空舱的历史。别的叙述者还引用着的消息只去掉本舱的 ref。
+ *
+ * 独占消息上的 tool call 没有级联删除，要先于消息行删掉。
+ */
+export async function clearTraceHistory(id: string): Promise<void> {
+	db.transaction((tx) => {
+		const exclusive = tx
+			.select({ messageId: narratorMessageRefs.messageId })
+			.from(narratorMessageRefs)
+			.where(
+				and(
+					eq(narratorMessageRefs.narratorId, id),
+					notExists(
+						tx
+							.select({ one: sql`1` })
+							.from(otherRefs)
+							.where(
+								and(
+									eq(otherRefs.messageId, narratorMessageRefs.messageId),
+									ne(otherRefs.narratorId, id),
+								),
+							),
+					),
+				),
+			)
+			.all()
+			.map((row) => row.messageId);
+
+		if (exclusive.length > 0) {
+			tx.update(narrators)
+				.set({ forkMessageId: null })
+				.where(inArray(narrators.forkMessageId, exclusive))
+				.run();
+			tx.delete(narratorToolCalls).where(inArray(narratorToolCalls.messageId, exclusive)).run();
+		}
+		tx.delete(narratorMessageRefs).where(eq(narratorMessageRefs.narratorId, id)).run();
+		if (exclusive.length > 0) {
+			tx.delete(narratorMessages).where(inArray(narratorMessages.id, exclusive)).run();
+		}
+		tx.update(narrators)
+			.set({
+				nextSeq: 0,
+				apiConversationId: null,
+				contextUsageSnapshotJson: null,
+				errorMessage: null,
+				substatus: "[]",
+			})
+			.where(eq(narrators.id, id))
+			.run();
+	});
+}
+
+/** 当前用户这个模型的舱；没有跑过时为 null。模型解析不了也是 null。 */
+export async function findModelTraceNarrator(
+	userId: string,
+	rawModel: string,
+): Promise<string | null> {
+	try {
+		return await narratorIdForKey(modelTraceKeyFor(userId, rawModel));
+	} catch {
+		return null;
+	}
 }

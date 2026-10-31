@@ -5282,17 +5282,14 @@ function getAskInPassingPendingBlock(
 	return null;
 }
 
-/**
- * 模型资料弹窗的入口用：该模型是否已经有 ModelTrace 舱。
- *
- * 键在 store 里按多种写法尝试（`provider::原始模型串` 与解析后的写法），所以这里只把
- * 下拉框的值原样传进去。
- */
+/** 模型资料弹窗的入口：当前用户这个模型有没有舱。 */
 narratorRoutes.get("/modeltrace/lookup", async (c) => {
 	const model = c.req.query("model")?.trim();
 	if (!model || model.length > 200) throw new ValidationError("Invalid model");
 	const { findModelTraceNarrator } = await import("../services/modeltrace-store");
-	return c.json({ narratorId: await findModelTraceNarrator(model) });
+	return c.json({
+		narratorId: await findModelTraceNarrator(c.get("user").sub, model),
+	});
 });
 
 // A one-shot sampling fork reuses the parent's frozen upstream request prefix.
