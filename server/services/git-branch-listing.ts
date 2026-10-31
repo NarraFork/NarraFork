@@ -3,6 +3,7 @@ import {
 	GIT_BRANCH_SUBJECT_MAX_CHARS,
 	type GitBranchEntry,
 	type GitBranches,
+	matchingRemoteName,
 } from "@shared/git-branches";
 
 /**
@@ -204,8 +205,8 @@ function limitEntries(
  */
 function pickDefaultRemote(remotes: string[], upstream: string | null): string | null {
 	if (upstream) {
-		const [first] = upstream.split("/");
-		if (first && remotes.includes(first)) return first;
+		const tracked = matchingRemoteName(remotes, upstream);
+		if (tracked) return tracked;
 	}
 	if (remotes.includes("origin")) return "origin";
 	return remotes.length === 1 ? (remotes[0] ?? null) : null;

@@ -157,7 +157,6 @@ export const GIT_FACT_QUERIES = [
 	"gitDiff",
 	"gitLog",
 	"gitStashList",
-	"gitBranches",
 	"gitCommitDetail",
 	"gitCommitDiff",
 ];
@@ -167,15 +166,13 @@ export const GIT_FACT_QUERIES = [
  * GIT_FACT_QUERIES so a new live fact cannot drift out of the push path;
  * commit previews are immutable and excluded.
  *
- * `gitBranches` is excluded too, and for a different reason: a push arrives up to
- * once a second, while one listing is five git processes. Re-listing at that rate
- * would be the panel's most expensive idle behaviour. A branch that changes under
- * an open panel is caught by the bar, which refetches once when `status.branch` or
- * `status.headSha` changes — the status poll is the cheap thing that already runs.
+ * The branch listing is not a fact query. One listing is six git processes, and
+ * every stage, discard, or commit-message request flows through this list. HEAD
+ * changes refetch it from the branch bar; checkout, push, and fetch invalidate
+ * it themselves because a push does not move HEAD.
  */
 export const GIT_LIVE_FACT_QUERIES = GIT_FACT_QUERIES.filter(
-	(prefix) =>
-		prefix !== "gitCommitDetail" && prefix !== "gitCommitDiff" && prefix !== "gitBranches",
+	(prefix) => prefix !== "gitCommitDetail" && prefix !== "gitCommitDiff",
 );
 
 export function gitWorkspaceTarget(narratorId: string, workspace?: GitWorkspace): GitTarget | null {
@@ -772,10 +769,11 @@ export function useGitStatus<V extends GitWorkspaceView = "details">(
 /**
  * The branch listing behind the panel's branch bar and picker.
  *
- * Read on demand only: it costs five git processes (two ref walks, worktree list,
- * remote list, HEAD identity), which is acceptable once when the panel opens and
- * far too much on the ~1/s `git_status` push. It is therefore absent from
- * {@link GIT_LIVE_FACT_QUERIES} and is refreshed by an explicit write instead.
+ * Read on demand only: it costs six git processes (two ref walks, worktree list,
+ * remote list, and two HEAD reads), which is acceptable once when the panel opens
+ * and far too much on the ~1/s `git_status` push. It stays out of
+ * {@link GIT_FACT_QUERIES}. Checkout, push, and fetch invalidate it; other git
+ * writes do not.
  */
 export function useGitBranches(target: GitTarget | undefined | null, enabled = true) {
 	const qc = useQueryClient();
@@ -956,13 +954,20 @@ export function useGitCommitDiff(
 	});
 }
 
-function useGitMutation<T, R>(target: GitTarget, run: (value: T) => Promise<R>) {
+function useGitMutation<T, R>(
+	target: GitTarget,
+	run: (value: T) => Promise<R>,
+	options?: { refreshBranches?: boolean },
+) {
 	const qc = useQueryClient();
 	return useMutation({
 		mutationFn: run,
 		retry: false,
 		onSettled: () => {
 			invalidateWorkspaceQueries(qc, target, false);
+			if (!options?.refreshBranches) return;
+			const key = gitTargetKey(target);
+			if (key) void qc.invalidateQueries({ queryKey: ["gitBranches", key] });
 		},
 	});
 }
@@ -1000,17 +1005,24 @@ export function useGitAiCommitMessage(target: GitTarget) {
 }
 /** Switch, create (`create` + `startPoint`), or track a remote branch by name. */
 export function useGitCheckoutBranch(target: GitTarget) {
-	return useGitMutation(target, (body: { branch: string; create?: boolean; startPoint?: string }) =>
-		api.gitCheckoutBranch(target, body),
+	return useGitMutation(
+		target,
+		(body: { branch: string; create?: boolean; startPoint?: string }) =>
+			api.gitCheckoutBranch(target, body),
+		{ refreshBranches: true },
 	);
 }
 export function useGitPushBranch(target: GitTarget) {
-	return useGitMutation(target, (body: { remote?: string; setUpstream?: boolean }) =>
-		api.gitPushBranch(target, body),
+	return useGitMutation(
+		target,
+		(body: { remote?: string; setUpstream?: boolean }) => api.gitPushBranch(target, body),
+		{ refreshBranches: true },
 	);
 }
 export function useGitFetchRemote(target: GitTarget) {
-	return useGitMutation(target, (body: { remote?: string; prune?: boolean }) =>
-		api.gitFetchRemote(target, body),
+	return useGitMutation(
+		target,
+		(body: { remote?: string; prune?: boolean }) => api.gitFetchRemote(target, body),
+		{ refreshBranches: true },
 	);
 }

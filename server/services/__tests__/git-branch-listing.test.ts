@@ -193,6 +193,11 @@ describe("parseGitBranches", () => {
 			parseGitBranches({ heads, remoteNames: "fork\nother\n", branch: "main" }).defaultRemote,
 		).toBeNull();
 		expect(parseGitBranches({ heads, remoteNames: "", branch: "main" }).defaultRemote).toBeNull();
+		const nested = ref({ name: "main", upstream: "foo/bar/main", head: "*" });
+		expect(
+			parseGitBranches({ heads: nested, remoteNames: "foo\nfoo/bar\n", branch: "main" })
+				.defaultRemote,
+		).toBe("foo/bar");
 	});
 
 	test("detached and unborn HEADs are different states", () => {

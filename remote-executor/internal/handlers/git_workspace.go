@@ -714,7 +714,12 @@ func (h *Handlers) GitWorkspace(ctx context.Context, params map[string]any) (any
 			args = append(args, "--set-upstream")
 		}
 		// Explicit refspec and never "+": a non-fast-forward must be reported.
-		refspec := "refs/heads/" + name + ":refs/heads/" + name
+		// The destination follows branch.<name>.merge, so `main` tracking
+		// `origin/master` updates master rather than creating origin/main.
+		refspec, refspecErr := pushRefspec(g, name, remote)
+		if refspecErr != nil {
+			return nil, refspecErr
+		}
 		out, err = run(append(args, remote, refspec)...)
 	case "fetch":
 		if h.disableShell {
@@ -753,6 +758,62 @@ func (g *workspaceGit) metadata(budget int64, args ...string) (string, int, erro
 		return "", code, fmt.Errorf("%s output exceeds metadata budget", args[0])
 	}
 	return out, code, err
+}
+
+func matchingRemote(remotes []string, upstream string) string {
+	best := ""
+	upstream = strings.TrimSpace(upstream)
+	for _, remote := range remotes {
+		if remote == upstream || strings.HasPrefix(upstream, remote+"/") {
+			if len(remote) > len(best) {
+				best = remote
+			}
+		}
+	}
+	return best
+}
+
+func safeBranchDest(name string) bool {
+	return name != "" && len(name) <= 200 && !strings.HasPrefix(name, "-") &&
+		!strings.HasPrefix(name, "/") && !strings.HasSuffix(name, "/") &&
+		!strings.Contains(name, "..") && !strings.Contains(name, "//") &&
+		!strings.ContainsAny(name, " \t\r\n\x00~^:?*[\\")
+}
+
+// pushRefspec is `refs/heads/<local>:refs/heads/<dest>` with no leading "+".
+// dest is the configured upstream branch when this remote is the one the
+// branch tracks, and the local name otherwise.
+func pushRefspec(g *workspaceGit, branch, remote string) (string, error) {
+	dest := branch
+	configured, code, err := g.metadata(4096, "config", "--get", "branch."+branch+".remote")
+	if g.ctx.Err() != nil {
+		return "", g.ctx.Err()
+	}
+	if err == nil && strings.TrimSpace(configured) == remote {
+		merge, mergeCode, mergeErr := g.metadata(4096, "config", "--get", "branch."+branch+".merge")
+		if g.ctx.Err() != nil {
+			return "", g.ctx.Err()
+		}
+		if mergeErr == nil {
+			const prefix = "refs/heads/"
+			ref := strings.TrimSpace(merge)
+			if strings.HasPrefix(ref, prefix) {
+				candidate := strings.TrimPrefix(ref, prefix)
+				if !safeBranchDest(candidate) {
+					return "", fmt.Errorf("invalid Git branch name")
+				}
+				dest = candidate
+			}
+		} else if mergeCode != 1 {
+			return "", mergeErr
+		}
+	} else if err != nil && code != 1 {
+		return "", err
+	}
+	if !safeBranchDest(branch) || !safeBranchDest(dest) {
+		return "", fmt.Errorf("invalid Git branch name")
+	}
+	return "refs/heads/" + branch + ":refs/heads/" + dest, nil
 }
 
 func containsString(values []string, wanted string) bool {
@@ -798,8 +859,8 @@ func (h *Handlers) gitRemote(g *workspaceGit, params map[string]any) (string, er
 	}
 	// Exit 128 is the ordinary "no upstream configured" answer, not a failure.
 	if upstream, _, upErr := g.metadata(4096, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"); upErr == nil {
-		if first, _, ok := strings.Cut(strings.TrimSpace(upstream), "/"); ok && containsString(remotes, first) {
-			return first, nil
+		if remote := matchingRemote(remotes, upstream); remote != "" {
+			return remote, nil
 		}
 	}
 	if g.ctx.Err() != nil {
@@ -863,7 +924,19 @@ func (h *Handlers) gitWorkspaceCheckout(g *workspaceGit, params map[string]any) 
 			if !validGitRevision(start) {
 				return "", fmt.Errorf("invalid Git start point")
 			}
-			args = append(args, start)
+			// A remote-tracking start point is checked out with --track so the new
+			// branch records its upstream even when branch.autoSetupMerge is false.
+			_, remoteCode, remoteErr := g.metadata(4096, "show-ref", "--verify", "--quiet", "refs/remotes/"+start)
+			if g.ctx.Err() != nil {
+				return "", g.ctx.Err()
+			}
+			if remoteErr == nil {
+				args = append(args, "--track", start)
+			} else if remoteCode != 1 {
+				return "", remoteErr
+			} else {
+				args = append(args, start)
+			}
 		}
 	} else {
 		target, err := gitBranchTarget(g, branch)

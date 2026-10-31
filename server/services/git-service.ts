@@ -2,7 +2,14 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { GIT_BRANCH_LIST_LIMIT, type GitBranches } from "@shared/git-branches";
+import {
+	GIT_BRANCH_LIST_LIMIT,
+	type GitBranches,
+	isValidGitBranchName,
+	isValidGitRemoteName,
+	isValidGitStartPoint,
+	matchingRemoteName,
+} from "@shared/git-branches";
 import {
 	GIT_COMMIT_PREVIEW_PATCH_MAX_BYTES,
 	GIT_COMMIT_SHA_PATTERN,
@@ -330,18 +337,25 @@ function clampNetworkFailureOutput(output: string): string {
  * Exported for its own unit test: the interesting inputs are git's several credential
  * phrasings, which a fixture repository cannot produce without a real network.
  */
+/** Credential failure, or null when the text is some other git refusal. */
+export function gitAuthFailure(output: string): GitAuthError | null {
+	const lowered = output.toLowerCase();
+	if (!NETWORK_AUTH_FAILURE_MARKERS.some((marker) => lowered.includes(marker))) return null;
+	const fatal = output
+		.split("\n")
+		.map((line) => line.trim())
+		.find((line) => /^fatal:/i.test(line));
+	return new GitAuthError(clampNetworkFailureOutput(fatal ?? output) || undefined);
+}
+
 export function gitNetworkFailure(prefix: string, result: ExecResult): AppError {
 	const output = combinedCommandOutput(result);
-	const lowered = output.toLowerCase();
-	if (NETWORK_AUTH_FAILURE_MARKERS.some((marker) => lowered.includes(marker))) {
-		const fatal = output
-			.split("\n")
-			.map((line) => line.trim())
-			.find((line) => /^fatal:/i.test(line));
-		return new GitAuthError(clampNetworkFailureOutput(fatal ?? output) || undefined);
-	}
-	if (!output) return new GitError(`${prefix} (exit code ${result.exitCode})`);
-	return new GitError(`${prefix}: ${clampNetworkFailureOutput(output)}`);
+	return (
+		gitAuthFailure(output) ??
+		(output
+			? new GitError(`${prefix}: ${clampNetworkFailureOutput(output)}`)
+			: new GitError(`${prefix} (exit code ${result.exitCode})`))
+	);
 }
 
 function normalizeExecOptions(options: boolean | ExecOptions = {}): ExecOptions {
@@ -364,9 +378,18 @@ function normalizeExecOptions(options: boolean | ExecOptions = {}): ExecOptions 
  * prompt guard is not cosmetic: with a credential helper asking for input, the
  * command would sit there until the 120 s write budget killed it, and the user
  * would see a timeout instead of "authentication failed".
+ *
+ * `LC_ALL=C` keeps that refusal in the English phrasing {@link gitAuthFailure}
+ * matches. Push and fetch are the only commands that take this environment, so
+ * the rest of git's user-facing text stays in the process locale.
  */
 function networkGitEnv(identity?: GitIdentityEnv | null): Record<string, string | undefined> {
-	return envWithAmbientProxy({ GIT_TERMINAL_PROMPT: "0", ...(identity ?? {}) });
+	return envWithAmbientProxy({
+		GIT_TERMINAL_PROMPT: "0",
+		LC_ALL: "C",
+		LANG: "C",
+		...(identity ?? {}),
+	});
 }
 
 /**
@@ -676,13 +699,48 @@ async function resolveNetworkRemote(worktreePath: string, requested?: string): P
 		worktreePath,
 		true,
 	);
-	const upstreamRemote =
-		upstream.exitCode === 0 ? (upstream.stdout.trim().split("/")[0] ?? "") : "";
-	if (upstreamRemote && remotes.includes(upstreamRemote)) return upstreamRemote;
+	const upstreamName = upstream.exitCode === 0 ? upstream.stdout.trim() : "";
+	const upstreamRemote = upstreamName ? matchingRemoteName(remotes, upstreamName) : null;
+	if (upstreamRemote) return upstreamRemote;
 	if (remotes.includes("origin")) return "origin";
 	const [sole] = remotes;
 	if (remotes.length === 1 && sole) return sole;
-	throw new AppError("This repository has no Git remote configured", 422, "GIT_NO_REMOTE");
+	if (remotes.length === 0)
+		throw new AppError("This repository has no Git remote configured", 422, "GIT_NO_REMOTE");
+	throw new AppError(
+		"Cannot choose a Git remote; configure an upstream or pass a remote",
+		422,
+		"GIT_REMOTE_AMBIGUOUS",
+	);
+}
+
+/**
+ * Where a push of `branch` should land when `remote` is the one it tracks.
+ *
+ * `branch.<name>.merge` is the upstream branch (`refs/heads/master` while the
+ * local branch is `main`). Without that config the remote branch keeps the
+ * local name. A destination that is not a branch name is refused rather than
+ * spliced into the refspec.
+ */
+async function trackedPushDestination(
+	worktreePath: string,
+	branch: string,
+	remote: string,
+): Promise<string> {
+	const configuredRemote = await execRead(
+		["config", "--get", `branch.${branch}.remote`],
+		worktreePath,
+		true,
+	);
+	if (configuredRemote.exitCode !== 0 || configuredRemote.stdout.trim() !== remote) return branch;
+	const merge = await execRead(["config", "--get", `branch.${branch}.merge`], worktreePath, true);
+	if (merge.exitCode !== 0) return branch;
+	const ref = merge.stdout.trim();
+	if (!ref.startsWith("refs/heads/")) return branch;
+	const dest = ref.slice("refs/heads/".length);
+	if (!isValidGitBranchName(dest) || !isValidGitRemoteName(remote))
+		throw new ValidationError("Invalid Git branch name");
+	return dest;
 }
 
 export const gitService = {
@@ -1395,7 +1453,7 @@ export const gitService = {
 	 * Every local and remote branch with upstream tracking and worktree occupancy.
 	 *
 	 * Not cached and not part of the status poll: the panel reads it when it opens,
-	 * and one listing is five git processes — repeating that at the 1/s `git_status`
+	 * and one listing is six git processes — repeating that at the 1/s `git_status`
 	 * push rate would be the single most expensive thing the panel does.
 	 */
 	async getBranches(worktreePath: string): Promise<GitBranches> {
@@ -1457,10 +1515,22 @@ export const gitService = {
 			);
 			if (format.exitCode !== 0) throw new ValidationError("Invalid Git branch name");
 			if (options.create) {
-				const result = await exec(
-					["checkout", "-b", options.branch, options.startPoint ?? "HEAD"],
-					worktreePath,
-				);
+				const start = options.startPoint ?? "HEAD";
+				if (!isValidGitStartPoint(start)) throw new ValidationError("Invalid Git start point");
+				// `--track` forces the upstream even when branch.autoSetupMerge is false.
+				// A plain revision (`HEAD`, `main~1`) is not a remote-tracking ref.
+				const tracksRemote =
+					(
+						await exec(
+							["show-ref", "--verify", "--quiet", `refs/remotes/${start}`],
+							worktreePath,
+							true,
+						)
+					).exitCode === 0;
+				const args = tracksRemote
+					? ["checkout", "-b", options.branch, "--track", start, "--"]
+					: ["checkout", "-b", options.branch, start, "--"];
+				const result = await exec(args, worktreePath);
 				if (result.exitCode !== 0)
 					throw new GitError(gitFailureMessage("git checkout failed", result));
 				return;
@@ -1485,8 +1555,10 @@ export const gitService = {
 	 * Push the current branch to its remote, optionally establishing the upstream.
 	 *
 	 * The refspec is spelled out and always without `+`, so a non-fast-forward is
-	 * reported to the user instead of being forced. `silent` keeps git's output out of
-	 * the log: an HTTPS remote prints its URL there, which can carry a user name.
+	 * reported to the user instead of being forced. When the branch tracks a
+	 * differently named upstream (`main` → `origin/master`), the destination is
+	 * that upstream branch. `silent` keeps git's output out of the log: an HTTPS
+	 * remote prints its URL there, which can carry a user name.
 	 */
 	async push(
 		worktreePath: string,
@@ -1506,9 +1578,10 @@ export const gitService = {
 					"GIT_DETACHED_HEAD",
 				);
 			const remote = await resolveNetworkRemote(worktreePath, options.remote);
+			const dest = await trackedPushDestination(worktreePath, branch, remote);
 			const args = ["push", "--porcelain"];
 			if (options.setUpstream) args.push("--set-upstream");
-			args.push(remote, `refs/heads/${branch}:refs/heads/${branch}`);
+			args.push(remote, `refs/heads/${branch}:refs/heads/${dest}`);
 			const result = await exec(args, worktreePath, { network: true, silent: true });
 			if (result.exitCode !== 0) throw gitNetworkFailure("git push failed", result);
 		});

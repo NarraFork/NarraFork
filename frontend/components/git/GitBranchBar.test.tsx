@@ -362,8 +362,10 @@ describe("GitBranchBar", () => {
 	});
 
 	test("a branch without an upstream asks before creating it on the remote", async () => {
+		// ahead stays 0 until an upstream exists; that is the real listing, and the
+		// button still has to offer the first push.
 		api.getGitBranches = async () =>
-			listing([branch("main", { ahead: 1, upstream: null })], { branch: "main" });
+			listing([branch("main", { ahead: 0, upstream: null })], { branch: "main" });
 		const container = renderBar();
 		await waitFor(() => !buttonByLabel(container, "Push").disabled, "push enabled");
 		await click(buttonByLabel(container, "Push"));
@@ -449,7 +451,7 @@ describe("GitBranchBar", () => {
 		expect(checkedOut[1]).toEqual({ branch: "feature/new", create: true });
 	});
 
-	test("a remote row creates its local branch from the remote ref", async () => {
+	test("a remote row asks the server to track the remote ref", async () => {
 		api.getGitBranches = async () =>
 			listing([branch("main")], {
 				branch: "main",
@@ -464,11 +466,28 @@ describe("GitBranchBar", () => {
 		);
 		await click(remoteRow ?? null);
 		await waitFor(() => checkedOut.length === 1, "remote switch");
-		expect(checkedOut[0]).toEqual({
-			branch: "feature/x",
-			create: true,
-			startPoint: "origin/feature/x",
-		});
+		expect(checkedOut[0]).toEqual({ branch: "origin/feature/x" });
+	});
+
+	test("a remote row does not switch to a local branch that tracks something else", async () => {
+		api.getGitBranches = async () =>
+			listing([branch("main", { upstream: "origin/main" })], {
+				branch: "main",
+				remotes: ["origin", "upstream"],
+				defaultRemote: "origin",
+				remote: [branch("upstream/main", { upstream: null })],
+			});
+		const container = renderBar();
+		await waitFor(() => container.textContent?.includes("main") === true, "branch chip");
+		await click(container.querySelector('[aria-label="Open branch panel"]'));
+		await waitFor(() => branchRows().length === 2, "remote row");
+		const remoteRow = branchRows().find(
+			(row) => row.getAttribute("data-branch-name") === "upstream/main",
+		);
+		expect((remoteRow as HTMLButtonElement | undefined)?.disabled).toBe(true);
+		await click(remoteRow ?? null);
+		await flushRender();
+		expect(checkedOut).toEqual([]);
 	});
 
 	test("a dirty worktree asks before a switch and cancelling changes nothing", async () => {

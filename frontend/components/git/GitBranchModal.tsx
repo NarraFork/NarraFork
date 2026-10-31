@@ -74,7 +74,7 @@ export function GitBranchModal({
 	const detached = listing ? listing.detached : !branch && !!headSha;
 	const local = useMemo(() => listing?.local ?? [], [listing]);
 	const remoteEntries = useMemo(() => listing?.remote ?? [], [listing]);
-	const localNames = useMemo(() => new Set(local.map((entry) => entry.name)), [local]);
+	const remotes = listing?.remotes;
 	const shownLocal = useMemo(() => filterBranches(local, search), [local, search]);
 	const shownRemote = useMemo(() => filterBranches(remoteEntries, search), [remoteEntries, search]);
 	const trimmedName = newName.trim();
@@ -92,9 +92,30 @@ export function GitBranchModal({
 		return confirm({ message: t("branches.dirtySwitch", { branch: request.branch }) });
 	}
 
+	function remotePlan(entry: GitBranchEntry) {
+		if (!canWrite) return { request: null, reason: "readOnly" as const, localName: "" };
+		const request = branchSwitchRequest(entry, { local, remote: true, remotes });
+		if ("blocked" in request)
+			return { request: null, reason: "nameTaken" as const, localName: request.localName };
+		const target = local.find((item) => item.name === request.branch);
+		if (target?.name === branch)
+			return { request: null, reason: "current" as const, localName: "" };
+		if (target?.worktreePath)
+			return {
+				request: null,
+				reason: "worktree" as const,
+				localName: "",
+				worktreePath: target.worktreePath,
+			};
+		return { request, reason: null, localName: "" };
+	}
+
 	async function switchTo(entry: GitBranchEntry, fromRemote: boolean) {
 		if (!canWrite || checkout.isPending) return;
-		const request = branchSwitchRequest(entry, { localNames, remote: fromRemote });
+		const request = fromRemote
+			? remotePlan(entry).request
+			: branchSwitchRequest(entry, { local, remote: false, remotes });
+		if (!request || "blocked" in request) return;
 		if (!(await confirmDirty(request))) return;
 		checkout.mutate(request, { onSuccess: () => onClose() });
 	}
@@ -238,7 +259,22 @@ export function GitBranchModal({
 							{t("branches.remote")}
 						</Text>
 						{shownRemote.map((entry) => {
-							const reason = canWrite ? null : t("branches.readOnly");
+							const plan = remotePlan(entry);
+							const reason =
+								plan.reason === "current"
+									? t("branches.current")
+									: plan.reason === "worktree"
+										? t("branches.inWorktree", { path: plan.worktreePath ?? "" })
+										: plan.reason === "nameTaken"
+											? t("branches.nameTaken", {
+													branch: plan.localName,
+													remote: entry.name,
+												})
+											: plan.reason === "readOnly"
+												? t("branches.readOnly")
+												: null;
+							const trackingLocal =
+								plan.request !== null && local.some((item) => item.name === plan.request?.branch);
 							return (
 								<Button
 									key={`remote:${entry.name}`}
@@ -250,7 +286,12 @@ export function GitBranchModal({
 									justify="flex-start"
 									styles={{ label: { display: "block", width: "100%", textAlign: "left" } }}
 									disabled={reason !== null}
-									title={reason ?? t("branches.trackRemote", { branch: entry.name })}
+									title={
+										reason ??
+										(trackingLocal
+											? t("branches.switchTo", { branch: plan.request?.branch ?? entry.name })
+											: t("branches.trackRemote", { branch: entry.name }))
+									}
 									onClick={() => void switchTo(entry, true)}
 								>
 									<Group gap={6} wrap="nowrap" justify="space-between">
@@ -349,8 +390,9 @@ export function GitBranchModal({
 						<Button
 							size="compact-xs"
 							variant="light"
-							disabled={!canWrite}
+							disabled={!canWrite || (!!listing && !remote)}
 							loading={fetch.isPending}
+							title={t("branches.fetchHint")}
 							onClick={() => fetch.mutate(remote ? { remote, prune } : { prune })}
 						>
 							{t("branches.fetch")}

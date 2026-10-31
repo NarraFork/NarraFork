@@ -1,7 +1,9 @@
 import {
 	GIT_BRANCH_NAME_MAX,
+	GIT_START_POINT_MAX,
 	isValidGitBranchName,
 	isValidGitRemoteName,
+	isValidGitStartPoint,
 } from "@shared/git-branches";
 import { GIT_COMMIT_SHA_PATTERN } from "@shared/git-commit-preview";
 import { z } from "zod";
@@ -121,11 +123,24 @@ export const gitRemoteNameSchema = z
 	.max(100)
 	.refine(isValidGitRemoteName, "Invalid Git remote");
 
+/**
+ * A checkout start point is a branch name or a revision.
+ *
+ * `gitRef` alone rejects `+` and non-ASCII, which are legal in `origin/功能` and
+ * `origin/feature+x` — the values the picker sends when it tracks a remote branch.
+ * Revisions such as `HEAD~2` stay accepted.
+ */
+export const gitStartPointSchema = z
+	.string()
+	.min(1)
+	.max(GIT_START_POINT_MAX)
+	.refine(isValidGitStartPoint, "Invalid Git start point");
+
 export const gitCheckoutSchema = z.object({
 	branch: gitBranchNameSchema,
 	create: z.boolean().optional(),
 	/** With `create`: the revision the new branch starts from (rev syntax allowed). */
-	startPoint: gitRef.optional(),
+	startPoint: gitStartPointSchema.optional(),
 });
 
 export const gitPushSchema = z.object({

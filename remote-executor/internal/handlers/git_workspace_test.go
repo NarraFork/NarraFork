@@ -774,6 +774,53 @@ func TestGitWorkspacePushAndFetch(t *testing.T) {
 	}
 }
 
+func TestGitWorkspacePushFollowsConfiguredUpstream(t *testing.T) {
+	root, h := newOpenGitFixture(t)
+	gitTestWrite(t, root, "seed.txt", "seed\n")
+	gitCall(t, h, root, "stage", map[string]any{"all": true})
+	gitCall(t, h, root, "commit", map[string]any{"message": "seed", "identity": gitTestIdentity()})
+	remote := filepath.Join(canonicalFixturePath(t, t.TempDir()), "origin.git")
+	gitTestRun(t, root, "init", "--bare", "-b", "main", remote)
+	gitTestRun(t, root, "remote", "add", "origin", remote)
+	gitCall(t, h, root, "push", map[string]any{"setUpstream": true})
+	gitTestRun(t, root, "branch", "-m", "main", "develop")
+	gitTestWrite(t, root, "more.txt", "more\n")
+	gitCall(t, h, root, "stage", map[string]any{"all": true})
+	gitCall(t, h, root, "commit", map[string]any{"message": "more", "identity": gitTestIdentity()})
+	gitCall(t, h, root, "push", nil)
+	if gitTestRun(t, remote, "rev-parse", "refs/heads/main") != gitTestRun(t, root, "rev-parse", "HEAD") {
+		t.Fatal("push did not update the tracked upstream branch")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := testgit.CommandContext(ctx, "rev-parse", "--verify", "refs/heads/develop")
+	cmd.Dir = remote
+	if out, err := cmd.CombinedOutput(); err == nil {
+		t.Fatalf("push created the local branch name on the remote: %s", out)
+	}
+}
+
+func TestGitWorkspacePushRefusesAmbiguousRemote(t *testing.T) {
+	root, h := newOpenGitFixture(t)
+	gitTestWrite(t, root, "seed.txt", "seed\n")
+	gitCall(t, h, root, "stage", map[string]any{"all": true})
+	gitCall(t, h, root, "commit", map[string]any{"message": "seed", "identity": gitTestIdentity()})
+	remote := filepath.Join(canonicalFixturePath(t, t.TempDir()), "origin.git")
+	gitTestRun(t, root, "init", "--bare", "-b", "main", remote)
+	gitTestRun(t, root, "remote", "add", "origin", remote)
+	gitTestRun(t, root, "remote", "rename", "origin", "upstream")
+	fork := filepath.Join(canonicalFixturePath(t, t.TempDir()), "fork.git")
+	gitTestRun(t, root, "init", "--bare", "-b", "main", fork)
+	gitTestRun(t, root, "remote", "add", "fork", fork)
+	gitTestRun(t, root, "checkout", "-b", "feature")
+	_, err := h.GitWorkspace(context.Background(), map[string]any{
+		"cwd": root, "expectedRoot": root, "operation": "push",
+	})
+	if err == nil || !strings.Contains(err.Error(), "cannot choose a Git remote") {
+		t.Fatalf("ambiguous remote: %v", err)
+	}
+}
+
 func TestGitWorkspaceDisableShellRefusesNetworkWrites(t *testing.T) {
 	root, h := newGitFixture(t) // --disable-shell
 	gitTestWrite(t, root, "seed.txt", "seed\n")

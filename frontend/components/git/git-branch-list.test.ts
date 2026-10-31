@@ -6,6 +6,7 @@ import {
 	branchSwitchRequest,
 	filterBranches,
 	localNameForRemote,
+	publishBranchName,
 } from "./git-branch-list";
 
 function entry(name: string, overrides: Partial<GitBranchEntry> = {}): GitBranchEntry {
@@ -54,30 +55,38 @@ describe("localNameForRemote", () => {
 		expect(localNameForRemote("origin/feature/x")).toBe("feature/x");
 		expect(localNameForRemote("origin/main")).toBe("main");
 		expect(localNameForRemote("main")).toBe("main");
+		expect(localNameForRemote("foo/bar/main", ["foo", "foo/bar"])).toBe("main");
 	});
 });
 
 describe("branchSwitchRequest", () => {
-	const localNames = new Set(["main", "feature/login"]);
+	const local = [
+		entry("main", { upstream: "origin/main" }),
+		entry("feature/login", { upstream: "origin/feature/login" }),
+	];
 
 	test("a local row switches to its own name", () => {
-		expect(branchSwitchRequest(entry("main"), { localNames, remote: false })).toEqual({
+		expect(branchSwitchRequest(entry("main"), { local, remote: false })).toEqual({
 			branch: "main",
 		});
 	});
 
-	test("a remote row is a plain switch when the local branch already exists", () => {
-		// `checkout --track origin/feature/login` would refuse: the local name is taken.
-		expect(
-			branchSwitchRequest(entry("origin/feature/login"), { localNames, remote: true }),
-		).toEqual({ branch: "feature/login" });
+	test("a remote row switches to the local branch that already tracks it", () => {
+		expect(branchSwitchRequest(entry("origin/feature/login"), { local, remote: true })).toEqual({
+			branch: "feature/login",
+		});
 	});
 
-	test("a remote row without a local counterpart creates it from the remote ref", () => {
-		expect(branchSwitchRequest(entry("origin/feature/new"), { localNames, remote: true })).toEqual({
-			branch: "feature/new",
-			create: true,
-			startPoint: "origin/feature/new",
+	test("a remote row is blocked when the local name tracks a different upstream", () => {
+		expect(branchSwitchRequest(entry("upstream/main"), { local, remote: true })).toEqual({
+			blocked: "nameTaken",
+			localName: "main",
+		});
+	});
+
+	test("a remote row without a local counterpart asks the server to track the remote ref", () => {
+		expect(branchSwitchRequest(entry("origin/feature/new"), { local, remote: true })).toEqual({
+			branch: "origin/feature/new",
 		});
 	});
 });
@@ -100,6 +109,20 @@ describe("branchRowDisabledReason", () => {
 		// Being on the branch is still the more useful explanation there.
 		expect(branchRowDisabledReason(entry("main"), { canWrite: false, current: true })).toBe(
 			"current",
+		);
+	});
+});
+
+describe("publishBranchName", () => {
+	test("uses the upstream branch when this remote is the one being tracked", () => {
+		expect(publishBranchName({ branch: "main", upstream: "origin/master", remote: "origin" })).toBe(
+			"master",
+		);
+		expect(publishBranchName({ branch: "feature", upstream: null, remote: "origin" })).toBe(
+			"feature",
+		);
+		expect(publishBranchName({ branch: "main", upstream: "foo/bar/main", remote: "foo/bar" })).toBe(
+			"main",
 		);
 	});
 });

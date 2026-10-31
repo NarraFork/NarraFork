@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AppError, GitAuthError, GitError } from "../../lib/errors";
 import { safeSpawn } from "../../lib/spawn";
+import { gitCheckoutSchema } from "../../lib/validators/git";
 import { gitNetworkFailure, gitService } from "../git-service";
 
 const tempDirs: string[] = [];
@@ -153,6 +154,47 @@ describe("checkoutBranch", () => {
 		);
 	});
 
+	test("a remote start point sets upstream even when autoSetupMerge is off", async () => {
+		const { remote, work } = await createRemoteClone("checkout-track-force");
+		const other = await cloneInto(remote, "checkout-track-force-other");
+		await gitOut(other, ["checkout", "-b", "remote-only"]);
+		await commitFile(other, "remote-only");
+		await gitOut(other, ["push", "-u", "origin", "remote-only"]);
+		await gitService.fetch(work);
+		await gitOut(work, ["config", "branch.autoSetupMerge", "false"]);
+		await gitService.checkoutBranch(work, {
+			branch: "remote-only",
+			create: true,
+			startPoint: "origin/remote-only",
+		});
+		expect(await gitOut(work, ["rev-parse", "--abbrev-ref", "@{upstream}"])).toBe(
+			"origin/remote-only",
+		);
+	});
+
+	test("accepts plus and non-ASCII start points, and ordinary revisions", () => {
+		expect(
+			gitCheckoutSchema.safeParse({
+				branch: "from-cjk",
+				create: true,
+				startPoint: "origin/功能",
+			}).success,
+		).toBe(true);
+		expect(
+			gitCheckoutSchema.safeParse({
+				branch: "from-plus",
+				create: true,
+				startPoint: "origin/feature+x",
+			}).success,
+		).toBe(true);
+		expect(
+			gitCheckoutSchema.safeParse({ branch: "next", create: true, startPoint: "HEAD~1" }).success,
+		).toBe(true);
+		expect(
+			gitCheckoutSchema.safeParse({ branch: "bad", create: true, startPoint: "--force" }).success,
+		).toBe(false);
+	});
+
 	test("tracks a remote branch under its short name", async () => {
 		const { remote, work } = await createRemoteClone("checkout-track");
 		const other = await cloneInto(remote, "checkout-track-other");
@@ -218,6 +260,32 @@ describe("push", () => {
 		await commitFile(bare, "lonely");
 		const noRemote = await errorOf(() => gitService.push(bare));
 		expect([noRemote.statusCode, noRemote.code]).toEqual([422, "GIT_NO_REMOTE"]);
+	});
+
+	test("updates the tracked upstream branch when its name differs from the local branch", async () => {
+		const { remote, work } = await createRemoteClone("push-renamed");
+		await gitOut(work, ["branch", "-m", "main", "develop"]);
+		expect(await gitOut(work, ["config", "--get", "branch.develop.merge"])).toBe("refs/heads/main");
+		await commitFile(work, "develop-work");
+		await gitService.push(work);
+		expect(await gitOut(remote, ["rev-parse", "--verify", "refs/heads/main"])).toBe(
+			await gitOut(work, ["rev-parse", "HEAD"]),
+		);
+		const created = await git(remote, ["rev-parse", "--verify", "refs/heads/develop"], true);
+		expect(created.exitCode).not.toBe(0);
+	});
+
+	test("refuses to guess among several remotes when the branch has no upstream", async () => {
+		const { work } = await createRemoteClone("push-ambiguous");
+		await gitOut(work, ["remote", "rename", "origin", "upstream"]);
+		const fork = tempDir("push-ambiguous-fork");
+		await gitOut(fork, ["init", "--bare", "-b", "main"]);
+		await gitOut(work, ["remote", "add", "fork", fork]);
+		await gitOut(work, ["checkout", "-b", "feature"]);
+		const error = await errorOf(() => gitService.push(work));
+		expect([error.statusCode, error.code]).toEqual([422, "GIT_REMOTE_AMBIGUOUS"]);
+		expect(error.message).toContain("Cannot choose a Git remote");
+		expect(await gitOut(work, ["remote"])).toContain("upstream");
 	});
 
 	test("rejects a remote that is not configured", async () => {

@@ -8,6 +8,11 @@
 
 /** Longest branch name we accept; git itself has no hard cap, we bound the argv. */
 export const GIT_BRANCH_NAME_MAX = 200;
+/**
+ * A checkout start point may be `origin/<branch>`, so it is allowed to run past a
+ * single branch name. Still bounded: it is one git argument.
+ */
+export const GIT_START_POINT_MAX = 300;
 /** Per-kind listing cap. A repository with more branches gets a truncated list. */
 export const GIT_BRANCH_LIST_LIMIT = 300;
 /** Commit subject is display text; long ones are cut rather than shipped whole. */
@@ -43,8 +48,8 @@ function hasForbiddenRefChar(name: string): boolean {
  * The server still runs `git check-ref-format --branch` before touching a ref, so
  * this can only ever be stricter than git (and is what the UI shows inline).
  */
-export function isValidGitBranchName(name: string): boolean {
-	if (!name || name.length > GIT_BRANCH_NAME_MAX) return false;
+export function isValidGitBranchName(name: string, maxLength = GIT_BRANCH_NAME_MAX): boolean {
+	if (!name || name.length > maxLength) return false;
 	// A lone "@" is shorthand for HEAD, not a name.
 	if (name === "@") return false;
 	// A leading dash would be read as a flag; trailing/leading slashes have no ref.
@@ -70,6 +75,52 @@ export function isValidGitRemoteName(name: string): boolean {
 	if (!name || name.length > 100) return false;
 	if (name.startsWith("-") || name.includes("..")) return false;
 	return !hasForbiddenRefChar(name);
+}
+
+/**
+ * Revision punctuation `gitRef` accepts and a branch name does not.
+ * Kept beside the branch-name rules so a start point can be either `HEAD~2` or
+ * `origin/功能+登录` without importing the server validator.
+ */
+const GIT_REVISION_PATTERN = /^[A-Za-z0-9_./@~^{][A-Za-z0-9._/~^@{}-]*$/;
+
+/**
+ * `git checkout -b <name> <start>`'s start point.
+ *
+ * A branch name (including `+` and non-ASCII, and a remote ref such as
+ * `origin/feature+x`) or a revision (`HEAD~2`). A leading dash is rejected in both
+ * shapes because git would read it as a flag.
+ */
+export function isValidGitStartPoint(value: string): boolean {
+	if (!value || value.length > GIT_START_POINT_MAX || value.startsWith("-") || value.includes(".."))
+		return false;
+	if (isValidGitBranchName(value, GIT_START_POINT_MAX)) return true;
+	return GIT_REVISION_PATTERN.test(value);
+}
+
+/**
+ * The configured remote named by an upstream short ref (`origin/main`, or
+ * `foo/bar/main` when the remote itself is `foo/bar`).
+ *
+ * The longest matching remote wins, so a remote named `foo` does not swallow
+ * `foo/bar/main`.
+ */
+export function matchingRemoteName(remotes: readonly string[], upstream: string): string | null {
+	let best: string | null = null;
+	for (const remote of remotes) {
+		if (upstream === remote || upstream.startsWith(`${remote}/`)) {
+			if (!best || remote.length > best.length) best = remote;
+		}
+	}
+	return best;
+}
+
+/** Branch on `remote` that `upstream` (`remote/topic`) names, when it is a legal branch. */
+export function upstreamBranchName(upstream: string, remote: string): string | null {
+	const prefix = `${remote}/`;
+	if (!upstream.startsWith(prefix)) return null;
+	const dest = upstream.slice(prefix.length);
+	return dest && isValidGitBranchName(dest) ? dest : null;
 }
 
 export interface GitBranchEntry {

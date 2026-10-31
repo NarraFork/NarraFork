@@ -19,6 +19,7 @@ import { useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useConfirmDialog } from "../common/confirm-dialog-context";
 import { GitBranchModal } from "./GitBranchModal";
+import { publishBranchName } from "./git-branch-list";
 
 /** Detached HEADs are identified by the commit, so the short form is enough. */
 const SHORT_SHA_LENGTH = 7;
@@ -61,13 +62,21 @@ export function GitBranchBar({
 	// Without the listing there is no trustworthy target branch/remote to name, and
 	// an old executor does not offer these operations at all.
 	const known = listing !== undefined;
-	const pushable = canWrite && known && !detached && !!remote && (ahead > 0 || upstreamGone);
-	const fetchable = canWrite && !fetch.isPending;
+	// No upstream means ahead stays 0 — git has nothing to compare — but the branch
+	// can still be published. A gone upstream is the same publish, onto the old name.
+	const needsPublish = !upstream || upstreamGone;
+	const remoteCount = listing?.remotes.length ?? 0;
+	const remoteAmbiguous = known && !remote && remoteCount > 1;
+	const destination = branch ? publishBranchName({ branch, upstream, remote }) : "";
+	const pushable = canWrite && known && !detached && !!remote && (ahead > 0 || needsPublish);
+	// A failed listing still lets the server pick the remote. A loaded listing with
+	// no single choice must not fire a request that can only come back as an error.
+	const fetchable = canWrite && !fetch.isPending && (!known || !!remote);
 
 	const label = branch ?? (headSha ? headSha.slice(0, SHORT_SHA_LENGTH) : t("branches.detached"));
 
 	// The status poll is the cheap signal that HEAD moved (a terminal checkout, a
-	// worktree action). Re-listing on every WS push would be five git processes a
+	// worktree action). Re-listing on every WS push would be six git processes a
 	// second; re-listing once per HEAD change is not.
 	const observedHead = useRef<string | null>(null);
 	const refetchBranches = useRef(branches.refetch);
@@ -80,29 +89,37 @@ export function GitBranchBar({
 		if (previous && previous !== headIdentity) void refetchBranches.current();
 	}, [headIdentity]);
 
+	const remoteHint = remoteAmbiguous
+		? t("branches.remoteAmbiguous")
+		: known && !remote
+			? t("branches.noRemote")
+			: null;
 	const pushHint = !canWrite
 		? t("branches.readOnly")
 		: detached
 			? t("branches.detachedPush")
 			: !known
 				? (branches.error?.message ?? t("branches.loadFailed"))
-				: !remote
-					? t("branches.noRemote")
-					: ahead === 0 && !upstreamGone
-						? t("branches.pushUpToDate")
-						: t("branches.pushAhead", {
-								count: ahead,
-								remote,
-								branch: branch ?? "",
-							});
+				: remoteHint
+					? remoteHint
+					: needsPublish && ahead === 0
+						? t("branches.pushNoUpstream", { branch: destination, remote: remote ?? "" })
+						: ahead === 0
+							? t("branches.pushUpToDate")
+							: t("branches.pushAhead", {
+									count: ahead,
+									remote,
+									branch: destination,
+								});
+	const fetchHint = !canWrite ? t("branches.readOnly") : (remoteHint ?? t("branches.fetchHint"));
 
 	async function handlePush() {
 		if (!pushable || !remote || !branch) return;
-		const setUpstream = !upstream || upstreamGone;
+		const setUpstream = needsPublish;
 		// No upstream yet means the push creates the remote branch; say so first.
 		if (setUpstream) {
 			const confirmed = await confirm({
-				message: t("branches.pushNewConfirm", { branch, remote }),
+				message: t("branches.pushNewConfirm", { branch: destination, remote }),
 			});
 			if (!confirmed) return;
 		}
@@ -176,14 +193,14 @@ export function GitBranchBar({
 					</Tooltip>
 				)}
 				{upstreamGone && (
-					<Tooltip label={t("branches.staleRemote")}>
+					<Tooltip label={t("branches.upstreamGoneHint")}>
 						<Badge size="xs" variant="light" color="yellow" style={{ flexShrink: 0 }}>
 							{t("branches.upstreamGone")}
 						</Badge>
 					</Tooltip>
 				)}
 				<Box style={{ flex: 1, minWidth: 0 }} />
-				<Tooltip label={canWrite ? t("branches.fetch") : t("branches.readOnly")}>
+				<Tooltip label={fetchHint} multiline maw={280}>
 					<ActionIcon
 						variant="subtle"
 						size="sm"
@@ -224,7 +241,7 @@ export function GitBranchBar({
 			)}
 			{push.isSuccess && !error && remote && branch && (
 				<Text c="green" size="xs" px="xs" pt={4}>
-					{t("branches.pushSuccess", { remote, branch })}
+					{t("branches.pushSuccess", { remote, branch: destination || branch })}
 				</Text>
 			)}
 			<GitBranchModal

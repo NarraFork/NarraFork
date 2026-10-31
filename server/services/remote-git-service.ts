@@ -26,6 +26,7 @@ import {
 } from "./git-commit-preview-parse";
 import { invalidateGitLineStats } from "./git-line-stats-cache";
 import type { GitCommitIdentity, GitStatusFile, GitStatusSummary } from "./git-service";
+import { gitAuthFailure } from "./git-service";
 import { coordinateGitStatusQuery, invalidateGitStatusQuery } from "./git-status-query";
 
 const WRITES = new Set<GitWorkspaceOperation>([
@@ -210,6 +211,14 @@ export function createRemoteGitService(
 			);
 		} catch (error) {
 			const detail = error instanceof Error ? error.message : String(error);
+			// Branch sync either updates the ref or git reports that it did not. The
+			// "uncertain write" suffix is for index/worktree mutations whose failure
+			// can land halfway; attaching it to a rejected push reads as data loss.
+			if (operation === "push" || operation === "fetch" || operation === "checkout") {
+				const auth = operation === "checkout" ? null : gitAuthFailure(detail);
+				if (auth) throw auth;
+				throw new GitError(detail);
+			}
 			if (write)
 				throw new GitError(
 					`${detail}. Remote Git write result may be uncertain; refresh status/history before retrying.`,
