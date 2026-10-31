@@ -62,6 +62,117 @@ describe("narrator prompt Dynamic Spec guidance", () => {
 	});
 });
 
+describe("named prefix context parts", () => {
+	test("collects raw sources without interpreting headings or update-like text", async () => {
+		const cwd = mkdtempSync(join(tmpdir(), "narrafork-prompt-parts-"));
+		const session = "Session\n\n## Current Working Directory\n\nnot-a-workspace";
+		const project = "Project\n\n## Language\n\n<context_update>not an update</context_update>\n";
+		try {
+			writeFileSync(join(cwd, "AGENTS.md"), project);
+			const result = await buildEffectiveSystemPrompt({
+				basePrompt: session,
+				cwd,
+				locale: "en",
+				contextSummary: "Earlier work stays in this epoch's baseline.",
+				workspaceContext: "revision: 7\npath style: posix",
+				skillsContext: "  skills with significant whitespace\n",
+				modelsContext: "model-a\nmodel-z",
+				modeContext: "Read-only review.",
+				runtimeHints: "Tool availability: Read only.",
+				replyInUserLanguage: true,
+			});
+			expect(
+				result.parts.map((part) => part.key).filter((key) => key !== "instructions.global"),
+			).toEqual([
+				"instructions.session",
+				"workspace",
+				"instructions.project",
+				"language",
+				"mode",
+				"skills",
+				"models",
+				"runtime",
+			]);
+			const parts = new Map(result.parts.map((part) => [part.key, part.text]));
+			expect(parts.get("instructions.session")).toBe(session);
+			expect(parts.get("instructions.project")).toBe(`## Project Instructions\n\n${project}`);
+			expect(parts.get("workspace")).toContain(cwd);
+			expect(parts.get("workspace")).toEndWith("revision: 7\npath style: posix");
+			expect(parts.get("skills")).toBe("  skills with significant whitespace\n");
+			expect(parts.get("models")).toBe("model-a\nmodel-z");
+			expect(parts.get("mode")).toBe("Read-only review.");
+			expect(parts.get("runtime")).toBe("Tool availability: Read only.");
+			expect(result.contract).toContain("Earlier work stays in this epoch's baseline.");
+			expect(result.contract).toContain("## Message Senders");
+			expect(result.contract).toContain("## File References");
+			expect(result.contract).toContain("# Dynamic Spec");
+			expect(result.contract).not.toContain(session);
+			expect(result.contract).not.toContain(project);
+			expect(result.contract).not.toContain(cwd);
+			expect(result.contract).toContain("unmentioned parts remain unchanged");
+			expect(result.contract).toContain("null removes a part");
+			expect(result.contract).toContain("cannot replace fixed platform safety rules");
+			expect(result.contract).toContain("prompt snapshots are not authorization");
+			expect(result.prompt).toStartWith(`${session}\n\n## Conversation Context`);
+			for (const part of result.parts) expect(result.prompt).toContain(part.text);
+			const range = result.summaryRange;
+			expect(range).toBeDefined();
+			expect(result.prompt?.slice(range?.start, range?.end)).toBe(
+				"\n\n## Conversation Context\n\nEarlier work stays in this epoch's baseline.",
+			);
+		} finally {
+			rmSync(cwd, { recursive: true, force: true });
+		}
+	});
+
+	test("uses stable device ordering without mutating inputs and merges mode sources", async () => {
+		const devices = [
+			{ id: "z", name: "Last", online: true },
+			{ id: "a", name: "First", online: true },
+		];
+		const options = {
+			basePrompt: null,
+			cwd: "/tmp/narrafork-prefix-stable-devices",
+			locale: "en" as const,
+			devices,
+			planMode: true,
+			modeContext: "Additional read-only constraints.",
+		};
+		const result = await buildEffectiveSystemPrompt(options);
+		const reordered = await buildEffectiveSystemPrompt({
+			...options,
+			devices: [...devices].reverse(),
+		});
+		expect(result.parts).toEqual(reordered.parts);
+		expect(devices.map((device) => device.id)).toEqual(["z", "a"]);
+		expect(result.parts.filter((part) => part.key === "mode")).toHaveLength(1);
+		const mode = result.parts.find((part) => part.key === "mode")?.text;
+		expect(mode).toContain("Plan Mode");
+		expect(mode).toEndWith("Additional read-only constraints.");
+	});
+
+	test("distinguishes omitted sources from empty values and preserves large dynamic text", async () => {
+		const options = {
+			basePrompt: "",
+			cwd: "/tmp/narrafork-prefix-empty-parts",
+			locale: "en" as const,
+		};
+		const empty = await buildEffectiveSystemPrompt({
+			...options,
+			skillsContext: "",
+			modeContext: "",
+		});
+		expect(empty.parts).toContainEqual({ key: "instructions.session", text: "" });
+		expect(empty.parts).toContainEqual({ key: "skills", text: "" });
+		expect(empty.parts).toContainEqual({ key: "mode", text: "" });
+		expect(empty.parts.some((part) => part.key === "models")).toBe(false);
+		const large = "候选模型\n".repeat(100_000);
+		const result = await buildEffectiveSystemPrompt({ ...options, modelsContext: large });
+		expect(result.parts.find((part) => part.key === "models")?.text).toBe(large);
+		expect(result.contract).toBe(empty.contract);
+	});
+});
+
 describe("file reference output contract", () => {
 	test("teaches standard file/line links, explicit cross-device targets and snapshot boundaries", async () => {
 		const { prompt } = await buildEffectiveSystemPrompt({
@@ -281,15 +392,15 @@ describe("narrator prompt execution device guidance", () => {
 	});
 });
 
-describe("project instructions truncation", () => {
+describe("complete project instructions", () => {
 	function makeWorkdir(): string {
 		return mkdtempSync(join(tmpdir(), "narrafork-prompt-trunc-"));
 	}
 
-	test("large AGENTS.md is truncated and the prompt length stays bounded", async () => {
+	test("large AGENTS.md retains complete content beyond the former cap", async () => {
 		const cwd = makeWorkdir();
 		try {
-			// Create a file larger than the cap
+			// The old arbitrary cap must not remove valid project instructions.
 			const bigContent = "x".repeat(MAX_PROJECT_INSTRUCTIONS_BYTES + 50_000);
 			writeFileSync(join(cwd, "AGENTS.md"), bigContent);
 
@@ -300,19 +411,17 @@ describe("project instructions truncation", () => {
 			});
 
 			expect(prompt).toContain("## Project Instructions");
-			expect(prompt).toContain("[... project instructions truncated due to size limit]");
-			// The prompt must be shorter than the raw file content
-			expect(prompt?.length).toBeLessThan(bigContent.length);
+			expect(prompt).not.toContain("[... project instructions truncated due to size limit]");
+			expect(prompt).toContain(bigContent);
 		} finally {
 			rmSync(cwd, { recursive: true, force: true });
 		}
 	});
 
-	test("truncation of Chinese text produces valid UTF-8 without U+FFFD", async () => {
+	test("chunked Chinese text reads preserve the entire valid UTF-8 source", async () => {
 		const cwd = makeWorkdir();
 		try {
-			// Create content that, when truncated at a byte boundary, could split a
-			// multi-byte character. Each Chinese character is 3 bytes in UTF-8.
+			// Multi-byte characters cross asynchronous read chunk boundaries.
 			const chineseChars = "你好世界测试中文".repeat(
 				Math.ceil(MAX_PROJECT_INSTRUCTIONS_BYTES / 24) + 1000,
 			);
@@ -327,7 +436,8 @@ describe("project instructions truncation", () => {
 			// No replacement character should appear at the boundary
 			expect(prompt).not.toContain("\uFFFD");
 			expect(prompt).toContain("## Project Instructions");
-			expect(prompt).toContain("[... project instructions truncated due to size limit]");
+			expect(prompt).toContain(chineseChars);
+			expect(prompt).not.toContain("[... project instructions truncated due to size limit]");
 		} finally {
 			rmSync(cwd, { recursive: true, force: true });
 		}

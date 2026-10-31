@@ -48,6 +48,7 @@ import {
 import {
 	OUTLINE_LAST_WRITES_SCAN,
 	OUTLINE_PAGE_HEAD_CHARS,
+	type OutlinePageStructureRow,
 	type OutlineReadPort,
 	type OutlineSearchRow,
 } from "./read-port";
@@ -178,6 +179,32 @@ export function createPostgresOutlineReads(db: BunSQLDatabase): OutlineReadPort 
 				rows: rows.slice(0, limit).map((r) => ({ ...r, taskJson: taskOf(r.taskJson) })),
 				truncated: rows.length > limit,
 			};
+		},
+
+		async listPagesStructure(pageIds, limit) {
+			const out: OutlinePageStructureRow[] = [];
+			const max = Math.max(0, Math.floor(limit));
+			for (const chunk of chunked([...new Set(pageIds)])) {
+				// Ordered by page, so a page's rows come together and a cut leaves one page short.
+				const rows = await db
+					.select({
+						id: outlineBlocks.id,
+						sid: outlineBlocks.sid,
+						parentId: outlineBlocks.parentId,
+						orderKey: outlineBlocks.orderKey,
+						alias: outlineBlocks.alias,
+						taskJson: outlineBlocks.taskJson,
+						versionSeq: outlineBlocks.versionSeq,
+						pageId: outlineBlocks.pageId,
+					})
+					.from(outlineBlocks)
+					.where(and(inArray(outlineBlocks.pageId, chunk), eq(outlineBlocks.deleted, false)))
+					.orderBy(outlineBlocks.pageId)
+					.limit(max - out.length + 1);
+				for (const r of rows) out.push({ ...r, taskJson: taskOf(r.taskJson) });
+				if (out.length > max) return { rows: out.slice(0, max), truncated: true };
+			}
+			return { rows: out, truncated: false };
 		},
 
 		async listVersionsAt(blockIds, seq) {

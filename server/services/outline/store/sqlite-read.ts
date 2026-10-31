@@ -63,6 +63,7 @@ import {
 import {
 	OUTLINE_LAST_WRITES_SCAN,
 	OUTLINE_PAGE_HEAD_CHARS,
+	type OutlinePageStructureRow,
 	type OutlineReadPort,
 	type OutlineSearchRow,
 	type OutlineStructureRow,
@@ -250,6 +251,27 @@ export const sqliteOutlineReads: OutlineReadPort = {
 		return asOf === null
 			? boundedStructure(STRUCTURE_CURRENT, [pageId], limit)
 			: boundedStructure(STRUCTURE_AS_OF, [pageId, asOf, asOf], limit);
+	},
+
+	async listPagesStructure(pageIds, limit) {
+		const rows: OutlinePageStructureRow[] = [];
+		const max = Math.max(0, Math.floor(limit));
+		for (const chunk of chunked([...new Set(pageIds)])) {
+			// `page_id IN (…) ORDER BY page_id` walks the page index in order: a page's rows come
+			// together, and the read stops one row past what is left of the limit.
+			const values = inlineValues(
+				`SELECT id, sid, parent_id, order_key, alias, task_json, version_seq, page_id
+				 FROM outline_blocks
+				 WHERE page_id IN (${chunk.map(() => "?").join(", ")}) AND deleted = 0
+				 ORDER BY page_id LIMIT ?`,
+				[...chunk, max - rows.length + 1],
+			) as Array<[...StructureValues, string]>;
+			for (const row of values) {
+				rows.push({ ...toStructure(row.slice(0, 7) as StructureValues), pageId: row[7] });
+			}
+			if (rows.length > max) return { rows: rows.slice(0, max), truncated: true };
+		}
+		return { rows, truncated: false };
 	},
 
 	async listVersionsAt(blockIds, seq) {

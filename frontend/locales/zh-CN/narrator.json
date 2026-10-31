@@ -2340,6 +2340,8 @@
 	"optimizeContextMessageCount": "上下文消息数量",
 	"optimizeContextMessageCountHint": "范围 1-50，更多上下文提升效果但消耗更多 token",
 	"optimizeSuccess": "提示词已优化",
+	"optimizeSummaryTitle": "本次改写说明",
+	"optimizeInProgress": "提示词优化中",
 	"optimizeUndo": "撤销",
 	"optimizeFailed": "优化失败",
 	"optimizeFailedGeneric": "优化提示词时发生错误",

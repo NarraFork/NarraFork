@@ -72,25 +72,13 @@ export function resolveHistoryToolLoadingStrategy(
 	return resolveAdapterToolLoadingStrategy(resolved.adapter, resolved.model);
 }
 
-/** How long an Anthropic prompt cache entry certainly lives (the default 5-minute tier). */
-const ANTHROPIC_CACHE_TTL_MS = 5 * 60_000;
-
-/**
- * The target a request for `model` on `provider` goes to, for epoch boundaries
- * (docs/BLOCK_STORAGE-DESIGN.md §7.7): the routed model with the tool loading strategy
- * it implies, and how long its prompt cache certainly lives (null when unknown).
- */
+/** Cache age and tool strategy are not model identity and never open an epoch. */
 export function resolveEpochTarget(
 	model: string,
 	provider: string,
 ): { fingerprint: string; cacheTtlMs: number | null } {
 	const resolved = resolveProviderAndModel(prefixedHistoryModel(model, provider));
-	const strategy = resolveAdapterToolLoadingStrategy(resolved.adapter, resolved.model);
-	const protocol = resolved.adapter.toolLoadingTarget?.(resolved.model)?.protocol;
-	return {
-		fingerprint: `${resolved.model}#${strategy}`,
-		cacheTtlMs: protocol === "anthropic-messages" ? ANTHROPIC_CACHE_TTL_MS : null,
-	};
+	return { fingerprint: `${resolved.provider}:${resolved.model}`, cacheTtlMs: null };
 }
 
 /**
@@ -460,6 +448,15 @@ export async function summaryGenerate(
 	onReasoningDelta?: GenerateOptions["onReasoningDelta"],
 	onRetryProgress?: () => void,
 	onRetryScheduled?: (info: SummaryRetryInfo) => void,
+	/**
+	 * Extra {@link GenerateOptions} layered on top of the fixed summary options.
+	 * A trailing bag rather than another positional flag: this signature is
+	 * already deep, and callers that need one more capability should not have to
+	 * re-count parameters. Only additive options belong here — `signal` and the
+	 * delta callbacks keep their dedicated slots so retries and progress stay
+	 * connected to the caller's request.
+	 */
+	extraOptions?: Partial<Pick<GenerateOptions, "responseFormat" | "onGenerationProgress">>,
 ): Promise<import("./provider").GenerateMetaResult> {
 	const model = modelOverride?.trim() || settings.agent.summaryModel;
 	// Retries belong to the original invocation, even if the caller reuses its options.
@@ -470,6 +467,9 @@ export async function summaryGenerate(
 		...(onTextDelta ? { onTextDelta } : {}),
 		...(onReasoningDelta ? { onReasoningDelta } : {}),
 		...(maxOutputTokens !== undefined ? { maxOutputTokens } : {}),
+		// Last, so an explicit per-call constraint is never shadowed by the
+		// fixed auxiliary defaults above.
+		...extraOptions,
 	};
 	return withSummaryRetry(
 		() => agentGenerateWithMeta(text, model, systemInstruction, generateOptions, requestTracking),

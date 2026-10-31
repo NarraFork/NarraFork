@@ -2343,6 +2343,8 @@
 	"optimizeContextMessageCount": "Context message count",
 	"optimizeContextMessageCountHint": "Range 1-50, more context improves quality but uses more tokens",
 	"optimizeSuccess": "Prompt optimized",
+	"optimizeSummaryTitle": "What changed",
+	"optimizeInProgress": "Optimizing prompt",
 	"optimizeUndo": "Undo",
 	"optimizeFailed": "Optimization failed",
 	"optimizeFailedGeneric": "An error occurred while optimizing the prompt",

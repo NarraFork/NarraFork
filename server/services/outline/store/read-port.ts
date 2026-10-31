@@ -30,6 +30,11 @@ export interface OutlineStructureRow {
 	versionSeq: number;
 }
 
+/** A structure row with the page it is on (`listPagesStructure`). */
+export interface OutlinePageStructureRow extends OutlineStructureRow {
+	pageId: string;
+}
+
 /** One full-text query against the blocks of some spaces. */
 export interface OutlineSearchQuery {
 	spaceIds: readonly string[];
@@ -102,6 +107,17 @@ export interface OutlineReadPort {
 		pageId: string,
 		options: { asOf: number | null; limit: number },
 	): Promise<{ rows: OutlineStructureRow[]; truncated: boolean }>;
+	/**
+	 * The current live blocks of several pages in one read, without content, each with its page:
+	 * the rows of one page are contiguous (they come in page order). At most `limit` rows;
+	 * `truncated` when there are more, and then only the page of the last row may be cut short:
+	 * every other page in the result is whole, and a page missing from it was not reached (or
+	 * has no live blocks). One statement per 500 pages (`OUTLINE_SQL_CHUNK`), bounded by `limit`.
+	 */
+	listPagesStructure(
+		pageIds: readonly string[],
+		limit: number,
+	): Promise<{ rows: OutlinePageStructureRow[]; truncated: boolean }>;
 	/**
 	 * The version of each block valid at `seq` (`from_seq <= seq < to_seq`), or its open version
 	 * when `seq` is null. Blocks with no version at `seq` (created later) are left out.

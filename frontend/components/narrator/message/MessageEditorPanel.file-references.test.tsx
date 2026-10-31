@@ -18,6 +18,11 @@ import { createRoot, type Root } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
 import { api, type BufferMessageSummary } from "../../../lib/api";
 import type { RevertActionPreview } from "../../../lib/api/narrators";
+import {
+	getPromptOptimizeTask,
+	resetPromptOptimizeTasksForTest,
+	startPromptOptimizeTask,
+} from "../../../lib/prompt-optimize-tasks";
 import en from "../../../locales/en/narrator.json";
 import zh from "../../../locales/zh-CN/narrator.json";
 import { ImageViewerContext } from "../../common/image-viewer-context";
@@ -272,6 +277,7 @@ async function cleanupDom() {
 			else Reflect.deleteProperty(globalThis, key);
 		}
 		previousGlobals.clear();
+		resetPromptOptimizeTasksForTest();
 		mock.restore();
 	}
 }
@@ -700,6 +706,48 @@ describe("message reference attachment editor", () => {
 	});
 });
 
+test("a pending optimization reaches both the remounted real editor and its submitted snapshot", async () => {
+	const original: ComposerDocument = {
+		version: 1,
+		paragraphs: [{ children: [{ type: "text", text: "original draft" }] }],
+		assets: [],
+	};
+	const retries: Array<() => void> = [];
+	const schedule = globalThis.setTimeout;
+	spyOn(globalThis, "setTimeout").mockImplementation(((...args: Parameters<typeof schedule>) => {
+		if (args[1] === 250) {
+			retries.push(args[0] as () => void);
+			return 0;
+		}
+		return schedule(...args);
+	}) as typeof schedule);
+	startPromptOptimizeTask({
+		narratorId: "narrator",
+		messageId: "message",
+		text: "original draft",
+		snapshot: { document: original, selection: { start: 0, end: 0 }, token: "pending" },
+		style: "clarify",
+		withContext: false,
+		request: async () => ({ text: "optimized draft" }),
+	});
+	await flush();
+	const save = mock(
+		async (..._args: Parameters<NonNullable<MessageEditorPanelProps["onEditAndRegenerate"]>>) =>
+			false,
+	);
+	await render(editor({ blocks: [], composerDocument: original, onEditAndRegenerate: save }));
+	await act(async () => {
+		for (const retry of retries.splice(0)) retry();
+		await flush();
+	});
+	expect(getPromptOptimizeTask("narrator::message")).toBeUndefined();
+	expect(composerDocumentText(inlineDocument()).text).toBe("optimized draft");
+	await click(button(en.editSubmit));
+	expect(save.mock.calls[0][1]).toBe("optimized draft");
+	expect(save.mock.calls[0][3]?.composerDocument?.paragraphs).toEqual([
+		{ children: [{ type: "text", text: "optimized draft" }] },
+	]);
+});
 describe("structured edit layout details", () => {
 	const owner = "layout-owner";
 	const layout: ComposerDocument = {

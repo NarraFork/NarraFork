@@ -60,7 +60,20 @@ import {
 } from "./provider-model-metadata";
 import { type ProviderTransport, runProviderTransport } from "./provider-transport";
 import { BoundedUtf8Capture, captureResponseStream, sanitizeHeaders } from "./request-dump";
+import { createRequestBodyEncoder, stringifyRequestBody } from "./request-json";
 import { parseJsonTextWithBody } from "./response-body";
+import {
+	openAIChatResponseFormat,
+	openAIResponsesTextFormat,
+	structuredResult,
+} from "./response-format";
+import {
+	isStructuredOutputRejection,
+	modelLacksNativeStructuredOutput,
+	rememberMissingNativeStructuredOutput,
+	structuredOutputRelayKey,
+	withSchemaInstruction,
+} from "./structured-output-fallback";
 import { finalToolInput, ToolInputStream, toolInputStreamFor } from "./tool-input-stream";
 import type { ToolLoadingChange, ToolLoadingTarget } from "./tool-loading";
 import { resolveToolJsonSchema } from "./tool-registry";
@@ -245,7 +258,10 @@ export function appendCodexNativeTools(
 		removeNativeTool(tools, "image_generation");
 		return;
 	}
-	if (!supportsCodexImageGeneration(model)) return;
+	if (!supportsCodexImageGeneration(model)) {
+		removeNativeTool(tools, "image_generation");
+		return;
+	}
 	if (!hasNativeTool(tools, "image_generation")) {
 		tools.push({
 			type: "image_generation",
@@ -255,6 +271,31 @@ export function appendCodexNativeTools(
 		return;
 	}
 	applyCodexImageGenerationDefaults(tools);
+}
+
+/**
+ * Hosted capability revocation is an explicit prefix exception: this Codex adapter
+ * has no verified execution allow-list separate from its declarations. Remove a
+ * disabled hosted tool even when that changes the prefix; never mutate epoch tools.
+ */
+export function withCodexNativeTools(
+	baseline: readonly unknown[],
+	model: string,
+	options: { webSearch?: boolean; imageGeneration?: boolean },
+): unknown[] {
+	const tools = baseline.map((tool) => {
+		if (!tool || typeof tool !== "object") return tool;
+		const type = (tool as { type?: string }).type;
+		return type === "web_search" || type === "image_generation" ? { ...tool } : tool;
+	});
+	appendCodexNativeTools(tools, model, options);
+	logger.debug("Codex native capability policy may change the cached prefix", {
+		protocol: "codex-responses",
+		prefixException: "native-capability-policy",
+		webSearch: hasNativeTool(tools, "web_search"),
+		imageGeneration: hasNativeTool(tools, "image_generation"),
+	});
+	return tools;
 }
 
 /** Declared catalog tiers constrain requests; unknown models keep the selected effort. */
@@ -802,14 +843,12 @@ export class OpenAIProvider implements ProviderAdapter {
 
 			// Codex: inject native server-side tools only when the selected model supports them.
 			if (this.apiMode === "codex") {
-				const toolsArr = (body.tools ?? []) as unknown[];
-				appendCodexNativeTools(toolsArr, params.model, {
+				body.tools = withCodexNativeTools(tools, params.model, {
 					webSearch:
 						this.codexWebSearchEnabled &&
 						isNativeSearchChannelFirstEnabled(undefined, this.config.prefix, params.model),
 					imageGeneration: this.codexImageGenerationEnabled,
 				});
-				body.tools = toolsArr;
 			}
 
 			const normalizedCodexReasoningEffort =
@@ -880,12 +919,13 @@ export class OpenAIProvider implements ProviderAdapter {
 		// (observed: NUG Responses relays refusing `max_output_tokens`). Only safe
 		// before any stream event has been yielded — after that the consumer has
 		// already seen partial output and a silent re-send would duplicate it.
+		const encodeBody = createRequestBodyEncoder();
 		for (let attempt = 0; ; attempt++) {
 			if (turnState && this.apiMode === "codex") {
 				requestHeaders["x-codex-turn-state"] = turnState;
 			}
 			await reportInputCharacters(params, body);
-			const bodyText = JSON.stringify(body);
+			const bodyText = await encodeBody(body, params.signal);
 			params.requestDump?.beginResponseAttempt({
 				transport: "http",
 				method: "POST",
@@ -1030,6 +1070,90 @@ export class OpenAIProvider implements ProviderAdapter {
 
 		const bareModel = parseModelId(model).model;
 
+		// Native structured output first. A relay that has already proven it
+		// rejects or ignores the constraint is downgraded to restating the schema in the
+		// instruction instead — the fields are still recoverable, but the strict
+		// guarantee is gone.
+		const relayKey = structuredOutputRelayKey(this.apiMode, model);
+		const useNativeFormat =
+			!!options?.responseFormat && !modelLacksNativeStructuredOutput(relayKey);
+		const instruction =
+			options?.responseFormat && !useNativeFormat
+				? withSchemaInstruction(systemInstruction, options.responseFormat)
+				: systemInstruction;
+		/** Learn from a native attempt that came back without structure. */
+		const learnFrom = (result: GenerateMetaResult): GenerateMetaResult => {
+			if (useNativeFormat && result.responseFormatDegraded && !result.outputTruncated) {
+				rememberMissingNativeStructuredOutput(relayKey);
+			}
+			return result;
+		};
+		const requestWithFallback = async (
+			body: Record<string, unknown>,
+			run: (body: Record<string, unknown>) => Promise<GenerateMetaResult>,
+		) => {
+			const responseFormat = options?.responseFormat;
+			if (!responseFormat) return withUnsupportedParameterFallback(model, body, run);
+			let nativeFormat = useNativeFormat;
+			const responses = usesResponsesEndpoint(this.apiMode);
+			const downgrade = () => {
+				options?.signal?.throwIfAborted();
+				nativeFormat = false;
+				rememberMissingNativeStructuredOutput(relayKey);
+				const fallbackInstruction = withSchemaInstruction(instruction, responseFormat);
+				if (responses) {
+					const textOptions = body.text as Record<string, unknown> | undefined;
+					if (textOptions) {
+						delete textOptions.format;
+						if (Object.keys(textOptions).length === 0) delete body.text;
+					}
+					body.instructions = fallbackInstruction;
+				} else {
+					delete body.response_format;
+					body.messages = [
+						{ role: "system", content: fallbackInstruction },
+						{ role: "user", content: text },
+					];
+				}
+			};
+			const attempt = async () => {
+				options?.signal?.throwIfAborted();
+				// The generic fallback may already have stripped this field, including
+				// from a previous request. Preserve the schema as an instruction then too.
+				const format = responses
+					? (body.text as Record<string, unknown> | undefined)?.format
+					: body.response_format;
+				if (nativeFormat && !format) downgrade();
+				try {
+					return await run(body);
+				} catch (error) {
+					if (
+						!nativeFormat ||
+						!isStructuredOutputRejection(error, responses ? "text.format" : "response_format")
+					) {
+						throw error;
+					}
+					downgrade();
+					return run(body);
+				}
+			};
+			omitUnsupportedParameters(body, model);
+			try {
+				return await attempt();
+			} catch (error) {
+				options?.signal?.throwIfAborted();
+				// Reuse the generic parameter recovery, but do not let it turn a
+				// non-400 or callback error into a schema capability downgrade.
+				if (
+					!(error instanceof ApiError) ||
+					error.status !== 400 ||
+					!stripUnsupportedParameter(body, model, error)
+				)
+					throw error;
+				return attempt();
+			}
+		};
+
 		if (usesResponsesEndpoint(this.apiMode)) {
 			const body: Record<string, unknown> = {
 				model: bareModel,
@@ -1037,8 +1161,8 @@ export class OpenAIProvider implements ProviderAdapter {
 				store: false,
 			};
 			const codexIdentity = this.apiMode === "codex" ? createCodexRequestIdentity() : undefined;
-			if (systemInstruction) {
-				body.instructions = systemInstruction;
+			if (instruction) {
+				body.instructions = instruction;
 			} else if (this.apiMode === "codex") {
 				// Codex gateway requires non-empty instructions on /responses.
 				body.instructions = CODEX_DEFAULT_INSTRUCTIONS;
@@ -1054,12 +1178,23 @@ export class OpenAIProvider implements ProviderAdapter {
 				applyGenerateReasoningOptions(body, this.apiMode, model, options);
 			}
 			applyOpenAIModelMetadata(body, model, this.apiMode, options?.maxOutputTokens);
+			// The Responses API carries the output constraint as `text.format`,
+			// not `response_format`. Merge rather than assign so a future
+			// `text.verbosity` survives.
+			if (useNativeFormat && options?.responseFormat) {
+				body.text = {
+					...(body.text && typeof body.text === "object"
+						? (body.text as Record<string, unknown>)
+						: {}),
+					...openAIResponsesTextFormat(options.responseFormat),
+				};
+			}
 			const conversationId = codexIdentity?.conversationId;
 			// Per-turn x-codex-turn-state slot: the fallback retry below is a later
 			// request of the SAME turn and must replay the token the first
 			// response handed back (codex-rs sends it as an HTTP header here).
 			const turnState: { value: string | null } = { value: null };
-			return withUnsupportedParameterFallback(model, body, (retryBody) =>
+			const result = await requestWithFallback(body, (retryBody) =>
 				this.requestResponsesTextWithMeta(
 					baseUrl,
 					apiKey,
@@ -1070,12 +1205,13 @@ export class OpenAIProvider implements ProviderAdapter {
 					turnState,
 				),
 			);
+			return learnFrom(result);
 		}
 
 		// Completions: POST /chat/completions
 		const messages: Array<{ role: "system" | "user"; content: string }> = [];
-		if (systemInstruction) {
-			messages.push({ role: "system", content: systemInstruction });
+		if (instruction) {
+			messages.push({ role: "system", content: instruction });
 		}
 		messages.push({ role: "user", content: text });
 		const body: Record<string, unknown> = {
@@ -1086,9 +1222,13 @@ export class OpenAIProvider implements ProviderAdapter {
 		};
 		applyGenerateReasoningOptions(body, this.apiMode, model, options);
 		applyOpenAIModelMetadata(body, model, this.apiMode, options?.maxOutputTokens);
-		return withUnsupportedParameterFallback(model, body, (retryBody) =>
+		if (useNativeFormat && options?.responseFormat) {
+			body.response_format = openAIChatResponseFormat(options.responseFormat);
+		}
+		const result = await requestWithFallback(body, (retryBody) =>
 			this.requestChatCompletionsTextWithMeta(baseUrl, apiKey, retryBody, options?.signal, options),
 		);
+		return learnFrom(result);
 	}
 
 	async generateWithHistory(
@@ -1198,7 +1338,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		const response = await this.pfetch(`${baseUrl}/responses`, {
 			method: "POST",
 			headers,
-			body: JSON.stringify(body),
+			body: await stringifyRequestBody(body, signal),
 			signal,
 		});
 		// Capture the turn's sticky-routing token before status handling so even
@@ -1232,6 +1372,7 @@ export class OpenAIProvider implements ProviderAdapter {
 				text,
 				...(outputTruncated && { outputTruncated }),
 				usage: json.usage ? extractOpenAIUsage(json.usage) : null,
+				...structuredResult(options, text, "OpenAI Responses"),
 			};
 		}
 
@@ -1261,7 +1402,12 @@ export class OpenAIProvider implements ProviderAdapter {
 				);
 			}
 		}
-		return { text, usage, ...(outputTruncated && { outputTruncated }) };
+		return {
+			text,
+			usage,
+			...(outputTruncated && { outputTruncated }),
+			...structuredResult(options, text, "OpenAI Responses"),
+		};
 	}
 
 	private async requestChatCompletionsTextWithMeta(
@@ -1277,7 +1423,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		const response = await this.pfetch(`${baseUrl}/chat/completions`, {
 			method: "POST",
 			headers: this.buildHeaders(apiKey),
-			body: JSON.stringify(body),
+			body: await stringifyRequestBody(body, signal),
 			signal,
 		});
 
@@ -1322,6 +1468,7 @@ export class OpenAIProvider implements ProviderAdapter {
 				...(outputTruncated && { outputTruncated }),
 				contextPercent: undefined,
 				usage: json.usage ? extractOpenAIUsage(json.usage) : null,
+				...structuredResult(options, text, "OpenAI Chat Completions"),
 			};
 		}
 
@@ -1351,7 +1498,13 @@ export class OpenAIProvider implements ProviderAdapter {
 				);
 			}
 		}
-		return { text, contextPercent: undefined, usage, ...(outputTruncated && { outputTruncated }) };
+		return {
+			text,
+			contextPercent: undefined,
+			usage,
+			...(outputTruncated && { outputTruncated }),
+			...structuredResult(options, text, "OpenAI Chat Completions"),
+		};
 	}
 
 	/**
@@ -1558,8 +1711,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		};
 		request.instructions = instructions || CODEX_DEFAULT_INSTRUCTIONS;
 		if (!instructions) markRuntimeInstructions(request);
-		const tools = Array.isArray(params.tools) ? [...params.tools] : [];
-		appendCodexNativeTools(tools, params.model, {
+		const tools = withCodexNativeTools(params.tools, params.model, {
 			webSearch:
 				this.codexWebSearchEnabled &&
 				isNativeSearchChannelFirstEnabled(undefined, this.config.prefix, params.model),

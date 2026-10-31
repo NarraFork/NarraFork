@@ -196,7 +196,7 @@ describe("availability", () => {
 	test("descriptions are static, so a loaded tool keeps the prompt cache", () => {
 		for (const tool of [outlineReadTool, outlineSearchTool, outlineEditTool]) {
 			expect(typeof tool.description).toBe("string");
-			expect(tool.getRawJsonSchema).toBeUndefined();
+			expect(tool).not.toHaveProperty("getRawJsonSchema");
 		}
 	});
 });

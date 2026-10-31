@@ -135,9 +135,15 @@ describe("real SQLite workspace CAS", () => {
 					})
 				: null,
 		);
+		await db
+			.update(narrators)
+			.set({ apiConversationId: "stable-device-cache" })
+			.where(eq(narrators.id, id));
 		const initial = await workspaceContextService.get(id);
 		const active = {
 			alive: true,
+			conversationId: "stable-device-cache",
+			_persistedConversationId: "stable-device-cache",
 			cwd: initial.cwd,
 			_defaultDeviceId: null,
 			_workspaceContext: initial,
@@ -207,10 +213,15 @@ describe("real SQLite workspace CAS", () => {
 					defaultDeviceId: true,
 					workspaceRevision: true,
 					workspaceContext: true,
+					apiConversationId: true,
 				},
 			});
 			expect(persisted?.cwd).toBe(initial.cwd);
 			expect(persisted?.workspaceRevision).toBe(4);
+			expect(persisted?.apiConversationId).toBe("stable-device-cache");
+			expect(active.conversationId).toBe("stable-device-cache");
+			expect(active._persistedConversationId).toBe("stable-device-cache");
+			expect(active._resetUpstreamSessionOnNextRequest).toBeUndefined();
 			expect(persisted?.workspaceContext).toEqual(active._workspaceContext);
 			expect(broadcasts).toHaveLength(4);
 			expect(

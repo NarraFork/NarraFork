@@ -30,7 +30,9 @@ import {
 } from "./provider-model-metadata";
 import { type ProviderTransport, runProviderTransport } from "./provider-transport";
 import { captureResponseStream, sanitizeHeaders } from "./request-dump";
+import { stringifyRequestBody } from "./request-json";
 import { parseJsonTextWithBody } from "./response-body";
+import { geminiResponseSchema, structuredResult } from "./response-format";
 import type { ToolLoadingTarget } from "./tool-loading";
 import { resolveToolJsonSchema } from "./tool-registry";
 import { type AgentToolUse, ApiError, type ResolvedToolDefinition } from "./types";
@@ -329,8 +331,7 @@ export class GeminiProvider implements ProviderAdapter {
 		});
 
 		await reportInputCharacters(params, body);
-		const bodyText = JSON.stringify(body);
-		assertByteLimit(bodyText, GEMINI_GENERATE_MAX_STREAM_BYTES, "request body");
+		const bodyText = await stringifyRequestBody(body, params.signal);
 		params.requestDump?.beginResponseAttempt({
 			transport: "http",
 			method: "POST",
@@ -398,6 +399,7 @@ export class GeminiProvider implements ProviderAdapter {
 			maxOutputTokens: options?.maxOutputTokens,
 			onTextDelta: options?.onTextDelta,
 			onReasoningDelta: options?.onReasoningDelta,
+			responseFormat: options?.responseFormat,
 		});
 	}
 
@@ -449,6 +451,7 @@ export class GeminiProvider implements ProviderAdapter {
 		maxOutputTokens?: number;
 		onTextDelta?: GenerateOptions["onTextDelta"];
 		onReasoningDelta?: GenerateOptions["onReasoningDelta"];
+		responseFormat?: GenerateOptions["responseFormat"];
 	}): Promise<GenerateMetaResult> {
 		const apiKey = this.getApiKey();
 		const baseUrl = this.baseUrl();
@@ -466,14 +469,23 @@ export class GeminiProvider implements ProviderAdapter {
 			metadata.reasoning?.mode,
 		);
 		const maxOutputTokens = resolveOutputTokenLimit(metadata, opts.maxOutputTokens);
-		if (thinkingConfig || maxOutputTokens !== undefined)
+		// Gemini expresses the constraint inside generationConfig, with a schema
+		// dialect that rejects unknown keywords — hence the projection through
+		// `geminiResponseSchema` rather than sending the caller's JSON Schema raw.
+		const responseConfig = opts.responseFormat
+			? {
+					responseMimeType: "application/json",
+					responseSchema: geminiResponseSchema(opts.responseFormat.schema),
+				}
+			: {};
+		if (thinkingConfig || maxOutputTokens !== undefined || opts.responseFormat)
 			body.generationConfig = {
 				...(thinkingConfig && { thinkingConfig }),
 				...(maxOutputTokens !== undefined && { maxOutputTokens }),
+				...responseConfig,
 			};
 
-		const bodyText = JSON.stringify(body);
-		assertByteLimit(bodyText, GEMINI_GENERATE_MAX_STREAM_BYTES, "request body");
+		const bodyText = await stringifyRequestBody(body, opts.signal);
 		const url = `${baseUrl}/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`;
 		const response = await this.pfetch(url, {
 			method: "POST",
@@ -495,7 +507,8 @@ export class GeminiProvider implements ProviderAdapter {
 				response,
 				GEMINI_GENERATE_MAX_STREAM_BYTES,
 			);
-			return parseGenerateJsonFallback(responseText, opts.onTextDelta);
+			const parsed = await parseGenerateJsonFallback(responseText, opts.onTextDelta);
+			return { ...parsed, ...structuredResult(opts, parsed.text, "Gemini") };
 		}
 
 		let text = "";
@@ -519,7 +532,12 @@ export class GeminiProvider implements ProviderAdapter {
 				);
 			}
 		}
-		return { text, usage, ...(outputTruncated && { outputTruncated }) };
+		return {
+			text,
+			usage,
+			...(outputTruncated && { outputTruncated }),
+			...structuredResult(opts, text, "Gemini"),
+		};
 	}
 
 	/**

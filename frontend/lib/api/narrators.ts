@@ -2320,14 +2320,17 @@ export const narratorsApi = {
 			signal?: AbortSignal;
 		},
 	) =>
-		request<{ text: string; model: string }>(`/narrators/${narratorId}/optimize-prompt`, {
-			method: "POST",
-			body: JSON.stringify({
-				text,
-				style,
-				withContext: options?.withContext,
-				messageId: options?.messageId,
-			}),
-			signal: options?.signal,
-		}),
+		request<{ text: string; model: string; reasoningSummary?: string }>(
+			`/narrators/${narratorId}/optimize-prompt`,
+			{
+				method: "POST",
+				body: JSON.stringify({
+					text,
+					style,
+					withContext: options?.withContext,
+					messageId: options?.messageId,
+				}),
+				signal: options?.signal,
+			},
+		),
 };

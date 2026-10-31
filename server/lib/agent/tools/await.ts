@@ -11,7 +11,7 @@ import {
 import { SUBAGENT_AGENT_AWAIT_FORBIDDEN_ERROR } from "@server/services/subagent-communication-policy";
 import { z } from "zod/v4";
 import { hotSafe } from "../../hot-safe";
-import type { AgentConfig, ToolDefinition, ToolResult } from "../types";
+import type { ToolDefinition, ToolResult } from "../types";
 import { looseNumber, normalizeNumber } from "./number-param";
 
 async function consumeTerminalResult(result: {
@@ -144,7 +144,7 @@ export function updateAwaitTimeout(toolUseId: string, newTimeoutMs: number): num
  *
  * Imported lazily and never awaited by the caller: this is a UI affordance, so it
  * must not add latency to the wait or fail it. `type: "agent"` is rejected for
- * subagents (see `buildRawJsonSchema`), so the owning narrator is always the
+ * subagents by the execution policy, so the owning narrator is always the
  * top-level one and no `parentToolUseId` routing is needed.
  */
 export async function broadcastAwaitAgentResolved(
@@ -167,23 +167,15 @@ export async function broadcastAwaitAgentResolved(
 	}
 }
 
-function buildRawJsonSchema(config?: AgentConfig): Record<string, unknown> {
-	const policy = runtimePolicyForContext(config);
-	const targets = runtimeAwaitTargets(policy);
-	const questionHint =
-		policy.capabilities.askUserQuestion === "disabled"
-			? "question waits only on an existing own question; AskUserQuestion is unavailable."
-			: "question waits on an async AskUserQuestion belonging to this session.";
+function buildRawJsonSchema(): Record<string, unknown> {
 	return {
 		type: "object",
 		properties: {
 			type: {
-				description: `What to await: ${targets.join(", ")}. ${questionHint}${
-					policy.capabilities.awaitAgent ? "" : " Subagents cannot await other agents."
-				}`,
+				description:
+					'What to await: "agent" (primary narrator only), "bash", "transfer", or "question" (an existing own async question). Current runtime capabilities are enforced at execution.',
 				type: "string",
-				// Legacy own-question waits remain available independently of question creation.
-				enum: targets,
+				enum: ["agent", "bash", "transfer", "question"],
 			},
 			id: {
 				description: "The task/subagent ID, alias, accessible subagent name, or async question id.",
@@ -238,12 +230,7 @@ export const awaitTool: ToolDefinition = {
 			.optional()
 			.describe('For type="bash" only: return early when this text appears in output.'),
 	}),
-	get rawJsonSchema() {
-		return buildRawJsonSchema();
-	},
-	getRawJsonSchema(config?: AgentConfig) {
-		return buildRawJsonSchema(config);
-	},
+	rawJsonSchema: buildRawJsonSchema(),
 	async execute(args, ctx): Promise<ToolResult> {
 		const { type, id, wait_for_text } = args as {
 			type: AwaitTargetType;

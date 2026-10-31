@@ -1,5 +1,4 @@
 import { AsyncLocalStorage } from "node:async_hooks";
-import { randomUUID } from "node:crypto";
 import type { EventEmitter } from "node:events";
 import type { FileReferenceSnapshot } from "@shared/file-reference";
 import type { DangerInfo, PermissionResult, ReasoningEffort } from "../lib/agent";
@@ -460,20 +459,20 @@ export const knowledgeInjectionCycleStates = hotSafe<Map<string, KnowledgeInject
  * Reset reusable upstream provider/session state for the active narrator before
  * its next model request. Returns false when the narrator is not currently active.
  *
- * Every caller reaches here right after an operation that cleared the persisted
- * `apiConversationId` (compact finalize, plan compact, clear-context), so the
- * teardown CAS baseline is moved to null in step. Without that, teardown would
- * compare against the pre-compact id, lose the CAS, and never persist the fresh
- * id — costing the next activation a needless cold upstream session. Claiming the
- * empty column is safe here precisely because the new id belongs to a session
- * that has only ever carried post-compact history.
+ * Breaking transport continuation is not a new cache identity. Compact and
+ * replay can require a full request while retaining the same conversation key.
+ * Callers that explicitly cleared persisted identity must opt into moving the
+ * teardown CAS baseline. Existing compact writers clear the stored id, so their
+ * callers pass persistedIdentityCleared while preserving the live conversation key.
  */
-export function resetActiveUpstreamSession(narratorId: string): boolean {
+export function resetActiveUpstreamSession(
+	narratorId: string,
+	options: { persistedIdentityCleared?: boolean } = {},
+): boolean {
 	const active = activeNarrators.get(narratorId);
 	if (!active?.alive) return false;
-	active.conversationId = randomUUID();
 	active._resetUpstreamSessionOnNextRequest = true;
-	active._persistedConversationId = null;
+	if (options.persistedIdentityCleared) active._persistedConversationId = null;
 	return true;
 }
 

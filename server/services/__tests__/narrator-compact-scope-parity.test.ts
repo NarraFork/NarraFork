@@ -16,7 +16,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
 	narratorMessageRefs,
 	narratorMessages,
@@ -26,9 +26,8 @@ import {
 } from "../../db/schema";
 import type { ProviderAdapter } from "../../lib/agent/provider";
 
-const { db, sqlite } = getTestDb();
-const realDb = { ...(await import("../../db")) };
-mock.module("../../db", () => ({ ...realDb, db, sqlite }));
+// Prefix/history workers need the same file-backed database as the run/compact paths.
+const { db, sqlite } = await import("../../db");
 const { registerExternalProviderResolver } = await import("../../lib/agent/provider");
 const { settings } = await import("../../lib/settings");
 const executor = await import("../narrator-executor");
@@ -38,6 +37,7 @@ const { compactLocks, runCustomCompact } = await import("../narrator-compact");
 const { startNarratorRun } = await import("../agent-runtime/run");
 const { getExecutionOwner } = await import("../agent-runtime/ownership");
 const { activeNarrators } = await import("../narrator-session-state");
+const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
 
 const provider: ProviderAdapter = {
 	formatTools: () => [],
@@ -73,24 +73,25 @@ const shapes = [
 ] as const;
 type Shape = (typeof shapes)[number];
 
-beforeEach(() => {
+beforeEach(async () => {
+	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
 	compactLocks.clear();
 	seq = 0;
 	settings.agent.autoContinuationMode = "off";
 	cwd = mkdtempSync(join(tmpdir(), "nf-compact-parity-"));
 });
-afterEach(() => {
+afterEach(async () => {
 	getExecutionOwner(ID)?.release();
 	activeNarrators.delete(ID);
 	narratorContext.generateCompactSummary = realSummary;
 	mock.restore();
+	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
 	rmSync(cwd, { recursive: true, force: true });
 });
 afterAll(() => {
 	unregisterProvider();
-	mock.module("../../db", () => realDb);
 });
 
 function message(

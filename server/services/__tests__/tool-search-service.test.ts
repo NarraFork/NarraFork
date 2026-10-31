@@ -107,11 +107,38 @@ async function notices(id: string) {
 		await db.select().from(narratorMessages).where(eq(narratorMessages.narratorId, id))
 	).filter((row) => JSON.stringify(row.contentJson).includes('"type":"tool_loaded"'));
 }
+async function openPrefixEpoch(
+	id: string,
+	strategy: "replace_tools" | "custom_injection",
+	baseToolNames: string[] = [],
+) {
+	const { snapshotToolDefinitions } = await import("../narrator-epochs");
+	const { putPrefixToolDefinitions, putPrefixText } = await import("../narrator-prefix-snapshots");
+	const { narratorStore } = await import("../narrator-store");
+	const definitions = baseToolNames.map((name) => {
+		const tool = toolRegistry.get(name);
+		if (!tool) throw new Error(`Missing fixture tool ${name}`);
+		return tool;
+	});
+	return narratorStore.openEpoch(id, {
+		reason: "initial",
+		toolNames: baseToolNames,
+		baseToolNames,
+		strategy,
+		prefix: {
+			contract: await putPrefixText("Frozen tool load fixture"),
+			parts: [],
+			tools: await putPrefixToolDefinitions(snapshotToolDefinitions(definitions)),
+		},
+	});
+}
+
 afterEach(async () => {
 	settings.mcpServers = savedServers;
 	settings.routines = savedRoutines;
 	resetTraitLayerCaches();
 	for (const name of NAMES) toolRegistry.unregister(name);
+	await (await import("../narrator-prefix-snapshots")).closePrefixSnapshotStore();
 	cleanDb(sqlite);
 	created.length = 0;
 	calls = 0;
@@ -144,6 +171,18 @@ test("real ToolSearch loads only one MCP tool and deduplicates concurrent repeat
 		const rows = await notices(id);
 		expect(rows).toHaveLength(1);
 		expect(JSON.stringify(rows[0]?.contentJson)).not.toContain("definitionSnapshots");
+		const snapshotRef = (rows[0]?.contentJson as { definitionSnapshotRef?: string }[])[0]
+			?.definitionSnapshotRef;
+		expect(typeof snapshotRef).toBe("string");
+		if (!snapshotRef) throw new Error("Missing persisted tool definition snapshot");
+		const { getPrefixToolDefinitions } = await import("../narrator-prefix-snapshots");
+		const definitions = await getPrefixToolDefinitions(snapshotRef);
+		expect(definitions).toHaveLength(1);
+		expect(definitions[0]).toMatchObject({
+			name: NAMES[0],
+			description: "calendar meetings 日历",
+			parameters: { type: "object", properties: { timezone: { type: "string" } } },
+		});
 		expect(JSON.stringify(rows[0]?.contentJson)).toContain(NAMES[0]);
 		expect(JSON.stringify(rows[0]?.contentJson)).not.toContain(NAMES[1]);
 		expect(
@@ -152,6 +191,219 @@ test("real ToolSearch loads only one MCP tool and deduplicates concurrent repeat
 	} finally {
 		broadcast.mockRestore();
 	}
+});
+
+test("pre-baseline load events retain their snapshots after registry replacement", async () => {
+	const id = await fixture();
+	const group = (await getToolSearchCandidates(id)).find((candidate) => candidate.id === NAMES[0]);
+	if (!group) throw new Error("Missing candidate");
+	const snapshots = await import("../narrator-prefix-snapshots");
+	expect(await changeLoadedToolGroup(id, group, true)).toBe("loaded");
+	const firstRows = await notices(id);
+	const firstBlock = (firstRows[0]?.contentJson as { definitionSnapshotRef?: string }[])[0];
+	if (!firstBlock?.definitionSnapshotRef) throw new Error("Missing first snapshot");
+	const original = await snapshots.getPrefixToolDefinitions(firstBlock.definitionSnapshotRef);
+	const tool = toolRegistry.get(NAMES[0]);
+	if (!tool) throw new Error("Missing registered tool");
+	toolRegistry.register({
+		...tool,
+		description: "Updated calendar definition",
+		rawJsonSchema: { type: "object", properties: { month: { type: "integer" } } },
+	});
+	expect(await changeLoadedToolGroup(id, group, false)).toBe("unloaded");
+	expect(await changeLoadedToolGroup(id, group, true)).toBe("loaded");
+	const rows = await notices(id);
+	expect(rows).toHaveLength(2);
+	const newRef = (rows[1]?.contentJson as { definitionSnapshotRef?: string }[])[0]
+		?.definitionSnapshotRef;
+	if (!newRef) throw new Error("Missing second snapshot");
+	expect(newRef).not.toBe(firstBlock.definitionSnapshotRef);
+	expect(await snapshots.getPrefixToolDefinitions(firstBlock.definitionSnapshotRef)).toEqual(
+		original,
+	);
+	expect(await snapshots.getPrefixToolDefinitions(newRef)).toMatchObject([
+		{ name: NAMES[0], description: "Updated calendar definition" },
+	]);
+	expect(rows[0]?.contentJson).toEqual(firstRows[0]?.contentJson);
+});
+
+test.each([
+	"base",
+	"addition",
+] as const)("same-epoch reload keeps the first %s definition in persisted and recovered declarations", async (origin) => {
+	const id = await fixture();
+	const group = (await getToolSearchCandidates(id)).find((candidate) => candidate.id === NAMES[0]);
+	if (!group) throw new Error("Missing candidate");
+	const { snapshotToolDefinitions, toolLoadingEpochOf } = await import("../narrator-epochs");
+	const { deriveToolLoadingState, projectToolLoadingHistory, selectRequestTools } = await import(
+		"../../lib/agent/tool-loading"
+	);
+	const strategy = origin === "base" ? "replace_tools" : "custom_injection";
+	if (origin === "addition") await openPrefixEpoch(id, strategy);
+	expect(await changeLoadedToolGroup(id, group, true)).toBe("loaded");
+	if (origin === "base") await openPrefixEpoch(id, strategy, [NAMES[0]]);
+	const firstRows = await notices(id);
+	const firstRef = (firstRows[0]?.contentJson as { definitionSnapshotRef?: string }[])[0]
+		?.definitionSnapshotRef;
+	if (!firstRef) throw new Error("Missing first snapshot");
+	const beforeHistory = await narratorService.getModelHistorySinceLastCompact(id);
+	const beforeEpoch = await toolLoadingEpochOf(id, beforeHistory);
+	const beforeState = deriveToolLoadingState(
+		beforeHistory,
+		new Set(NAMES),
+		[NAMES[0]],
+		beforeEpoch,
+		[],
+	);
+	const beforeDeclarations = snapshotToolDefinitions(
+		selectRequestTools([], beforeState, strategy).tools,
+	);
+	const beforeProjection = projectToolLoadingHistory(
+		beforeHistory,
+		beforeState,
+		strategy,
+		() => null,
+	);
+	const tool = toolRegistry.get(NAMES[0]);
+	if (!tool) throw new Error("Missing tool");
+	toolRegistry.register({
+		...tool,
+		description: "Updated incompatible calendar definition",
+		rawJsonSchema: {
+			type: "object",
+			properties: { month: { type: "integer" } },
+			required: ["month"],
+		},
+	});
+	expect(await changeLoadedToolGroup(id, group, false)).toBe("unloaded");
+	expect(await changeLoadedToolGroup(id, group, true)).toBe("loaded");
+	const loadRows = await notices(id);
+	const reloadedRef = (loadRows[1]?.contentJson as { definitionSnapshotRef?: string }[])[0]
+		?.definitionSnapshotRef;
+	expect(reloadedRef).toBe(firstRef);
+
+	// Recovery has no live definition to fall back to and must still use the original wire declaration.
+	toolRegistry.unregister(NAMES[0]);
+	const recoveredHistory = await narratorService.getModelHistorySinceLastCompact(id);
+	const recoveredEpoch = await toolLoadingEpochOf(id, recoveredHistory);
+	const recoveredState = deriveToolLoadingState(
+		recoveredHistory,
+		new Set(NAMES),
+		[NAMES[0]],
+		recoveredEpoch,
+		[],
+	);
+	expect(snapshotToolDefinitions(selectRequestTools([], recoveredState, strategy).tools)).toEqual(
+		beforeDeclarations,
+	);
+	expect(recoveredEpoch?.definitionSnapshots).toEqual(beforeEpoch?.definitionSnapshots);
+	const recoveredProjection = projectToolLoadingHistory(
+		recoveredHistory,
+		recoveredState,
+		strategy,
+		() => null,
+	);
+	for (const row of beforeProjection) {
+		expect(recoveredProjection.find((candidate) => candidate.id === row.id)).toEqual(row);
+	}
+	expect(JSON.stringify(recoveredProjection)).not.toContain(
+		"Updated incompatible calendar definition",
+	);
+	if (origin === "addition") expect(JSON.stringify(recoveredProjection)).toContain("timezone");
+});
+
+test("snapshot persistence failure cannot publish a load or change enabled tools", async () => {
+	const id = await fixture();
+	const snapshots = await import("../narrator-prefix-snapshots");
+	const put = spyOn(snapshots, "putPrefixToolDefinitions").mockRejectedValue(
+		new Error("snapshot write failed"),
+	);
+	try {
+		await expect(
+			changeLoadedToolGroup(
+				id,
+				{
+					id: marker,
+					marker,
+					description: "calendar",
+					toolNames: NAMES,
+				},
+				true,
+			),
+		).rejects.toThrow("snapshot write failed");
+		expect(await notices(id)).toHaveLength(0);
+		expect(
+			(await db.query.narrators.findFirst({ where: eq(narrators.id, id) }))?.enabledTools ?? [],
+		).toEqual([]);
+	} finally {
+		put.mockRestore();
+	}
+});
+
+test("replace-tools prefix refuses new declarations without changing state or opening an epoch", async () => {
+	const id = await fixture();
+	const epoch = await openPrefixEpoch(id, "replace_tools");
+	const result = await toolSearchTool.execute({ query: NAMES[0], limit: 1 }, context(id));
+	const output = JSON.parse(result.output);
+	expect(output.results[0].status).toBe("error");
+	expect(output.results[0].error).toContain("cannot append new tool definitions");
+	expect(output.results[0].error).toContain("Compact the conversation or switch models");
+	expect(await notices(id)).toHaveLength(0);
+	expect(
+		(await db.query.narrators.findFirst({ where: eq(narrators.id, id) }))?.enabledTools ?? [],
+	).toEqual([]);
+	const messages = await narratorService.getModelHistorySinceLastCompact(id);
+	expect(
+		messages
+			.filter((message) => (message.contentJson as { type?: string }[])[0]?.type === "epoch")
+			.map((message) => message.id),
+	).toEqual([epoch.id]);
+});
+
+test("replace-tools prefix permits unloading and reloading an already declared base tool", async () => {
+	const id = await fixture();
+	const group = (await getToolSearchCandidates(id)).find((candidate) => candidate.id === NAMES[0]);
+	if (!group) throw new Error("Missing candidate");
+	expect(await changeLoadedToolGroup(id, group, true)).toBe("loaded");
+	await openPrefixEpoch(id, "replace_tools", [NAMES[0]]);
+	expect(await changeLoadedToolGroup(id, group, false)).toBe("unloaded");
+	expect(await changeLoadedToolGroup(id, group, true)).toBe("loaded");
+});
+
+test("a blocked new tool does not prevent another search hit from re-enabling its base declaration", async () => {
+	const id = await fixture();
+	await openPrefixEpoch(id, "replace_tools", [NAMES[0]]);
+	const result = await toolSearchTool.execute({ query: "calendar", limit: 2 }, context(id));
+	const results = JSON.parse(result.output).results as {
+		group: string;
+		status: string;
+		error?: string;
+	}[];
+	expect(results.find((item) => item.group === NAMES[0])?.status).toBe("loaded");
+	expect(results.find((item) => item.group === NAMES[1])).toMatchObject({
+		status: "error",
+		error: expect.stringContaining(NAMES[1]),
+	});
+	expect(
+		(await db.query.narrators.findFirst({ where: eq(narrators.id, id) }))?.enabledTools,
+	).toEqual([selectedMarker]);
+	const rows = await notices(id);
+	expect(rows).toHaveLength(1);
+	expect((rows[0]?.contentJson as { toolNames: string[] }[])[0]?.toolNames).toEqual([NAMES[0]]);
+});
+
+test("explicit custom-injection epoch accepts additions without replacing the baseline", async () => {
+	const id = await fixture();
+	const epoch = await openPrefixEpoch(id, "custom_injection");
+	const result = await toolSearchTool.execute({ query: NAMES[0], limit: 1 }, context(id));
+	expect(JSON.parse(result.output).results[0].status).toBe("loaded");
+	const messages = await narratorService.getModelHistorySinceLastCompact(id);
+	const epochs = messages.filter(
+		(message) => (message.contentJson as { type?: string }[])[0]?.type === "epoch",
+	);
+	expect(epochs.map((message) => message.id)).toEqual([epoch.id]);
+	expect(epochs[0]?.contentJson).toEqual(epoch.contentJson);
+	expect(await notices(id)).toHaveLength(1);
 });
 
 test("marker plus legacy concrete names is normalized even on an already-loaded hit", async () => {
@@ -376,10 +628,11 @@ test("explicit server load accepts 281 realistic tool schemas without snapshot b
 	}
 });
 
-test("a catalog beyond 4096 tools remains searchable and explicitly loadable using metadata only", async () => {
+test("large catalogs use metadata for discovery and materialize only selected definitions", async () => {
 	const id = await fixture();
 	const names = Array.from({ length: 4100 }, (_, index) => `mcp__search_fixture__catalog_${index}`);
 	const schema = z.object({});
+	let schemaReads = 0;
 	try {
 		for (const name of names) {
 			toolRegistry.register({
@@ -387,15 +640,19 @@ test("a catalog beyond 4096 tools remains searchable and explicitly loadable usi
 				description: "Project resource query",
 				parameters: schema,
 				get rawJsonSchema(): Record<string, unknown> {
-					throw new Error("Discovery must not read schemas");
+					schemaReads++;
+					return { type: "object", properties: {} };
 				},
 				metadata: { mcpServerId: "search-fixture", mcpToolName: name },
 				execute: async () => ({ output: "ok" }),
 			});
 		}
+		await getToolSearchCandidates(id);
+		expect(schemaReads).toBe(0);
 		const target = names[names.length - 1];
 		const result = await toolSearchTool.execute({ query: target, limit: 1 }, context(id));
 		expect(JSON.parse(result.output).results).toEqual([{ group: target, status: "loaded" }]);
+		expect(schemaReads).toBe(1);
 		expect(
 			(await db.query.narrators.findFirst({ where: eq(narrators.id, id) }))?.enabledTools,
 		).toEqual([mcpToolMarker("search-fixture", target)]);
@@ -481,6 +738,30 @@ test("manual /load displays a localized trait denial and never reports success",
 	expect(rows.some((row) => row.contentText?.includes("自定义 trait"))).toBe(true);
 	expect(rows.some((row) => row.contentText?.includes("工具加载成功"))).toBe(false);
 	expect(await notices(id)).toHaveLength(0);
+});
+
+test("manual /load reports a client-visible error when the prefix cannot append tools", async () => {
+	const id = await fixture();
+	await openPrefixEpoch(id, "replace_tools");
+	// Await normally: Bun's promise matcher can starve an already-running worker's messages.
+	let failure: unknown;
+	try {
+		await handleLoadToolCommand(
+			id,
+			{ resolved: true, loadTool: "Recall", rawCommand: "/load Recall" },
+			"en",
+		);
+	} catch (error) {
+		failure = error;
+	}
+	expect(failure).toMatchObject({
+		statusCode: 400,
+		message: expect.stringContaining("cannot append new tool definitions"),
+	});
+	expect(await notices(id)).toHaveLength(0);
+	expect(
+		(await db.query.narrators.findFirst({ where: eq(narrators.id, id) }))?.enabledTools ?? [],
+	).toEqual([]);
 });
 
 test("manual /load writes a localized model notice and description", async () => {

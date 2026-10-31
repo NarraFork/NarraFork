@@ -82,12 +82,7 @@ import {
 import { normalizeLegacyPlanPreviousPermissionMode } from "../lib/permission-modes";
 import { resolveExistingPlanFileRelPath } from "../lib/plan-file-path";
 import { getHome } from "../lib/platform";
-import {
-	getBlockedTaskActionInstruction,
-	getToolMessage,
-	getToolMessageWithParams,
-	type Locale,
-} from "../lib/prompt-i18n";
+import { getBlockedTaskActionInstruction, getToolMessage, type Locale } from "../lib/prompt-i18n";
 import {
 	executionPrincipalOf,
 	type OwnTurnPlacement,
@@ -159,6 +154,10 @@ import {
 } from "./agent-runtime/ownership";
 import type { RuntimePolicy } from "./agent-runtime/policy";
 import {
+	preparePrefixRequest,
+	type RequestModelIdentity,
+} from "./agent-runtime/prepare-prefix-request";
+import {
 	type RuntimeMailboxRow,
 	resolveRuntimeQueueBackend,
 } from "./agent-runtime/runtime-queue-port";
@@ -171,7 +170,6 @@ import {
 import { gitService } from "./git-service";
 import { cancelModelTrace } from "./modeltrace-service";
 import { isFormerChapterSessionWithoutDirectory, resolveNarratorSessionCwd } from "./narrator-cwd";
-import { optionalToolDescription, reconcileEpoch } from "./narrator-epochs";
 import {
 	clearStreamingSnapshot,
 	type EventHooks,
@@ -1169,6 +1167,10 @@ export async function buildSystemPrompt(
 		allowLocalExecution?: boolean;
 	},
 	planFilePath?: string,
+	context?: Pick<
+		import("./narrator-prompt").BuildPromptOptions,
+		"workspaceContext" | "skillsContext" | "modelsContext" | "modeContext" | "runtimeHints"
+	>,
 ): Promise<import("./narrator-prompt").BuildPromptResult> {
 	return buildEffectiveSystemPrompt({
 		basePrompt: narrator.systemPrompt,
@@ -1184,6 +1186,7 @@ export async function buildSystemPrompt(
 		devices: deviceContext?.devices,
 		defaultDeviceId: deviceContext?.defaultDeviceId,
 		allowLocalExecution: deviceContext?.allowLocalExecution,
+		...context,
 	});
 }
 
@@ -2752,17 +2755,25 @@ export interface ContextManagementOptions {
 	/** Server-local cwd for restoring model-visible attachment copies. */
 	getAttachmentCwd?: () => string | undefined;
 	/** Optional tool loading input for rebuilt histories (see `RuntimeHistoryOptions`). */
-	getToolLoading?: () => import("./agent-runtime/history").RuntimeHistoryOptions["toolLoading"];
+	getToolLoading?: (
+		identity: RequestModelIdentity,
+	) => import("./agent-runtime/history").RuntimeHistoryOptions["toolLoading"];
 	/** Refresh registry membership and explicit MCP server grants before every request. */
-	refreshToolLoading?: () => Promise<void>;
+	refreshToolLoading?: (identity: RequestModelIdentity) => Promise<void>;
 	attachmentSignal?: AbortSignal;
-	/** Called after compact completes (e.g. reset conversationId, set restart flag) */
+	/** Called after compact completes (e.g. mark transport restart without rotating cache identity). */
 	onCompactDone?: () => void;
 	/** Check whether a compact just finished and the next turn needs a full rebuild */
 	isCompactDone?: () => boolean;
 	/** Clear the compact-done flag after the rebuild has been applied */
 	clearCompactDone?: () => void;
-	/** Rebuild the system prompt with the latest contextSummary from DB */
+	/** Collect current dynamic parts before each provider request; reconcile freezes the baseline. */
+	buildPrefixPrompt?: (identity: RequestModelIdentity) => Promise<{
+		contract: string;
+		parts: import("../../shared/prefix-context").PromptPart[];
+		compactMessageId?: string | null;
+	}>;
+	/** Compatibility path for callers not yet supplying named prompt parts. */
 	rebuildSystemPrompt?: () => Promise<string | null>;
 }
 
@@ -2820,59 +2831,38 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 	};
 
 	const rebuildHistoryForCurrentContext = async (includeSystemPrompt: boolean) => {
-		const deadline = Date.now() + 10_000;
 		const signal = opts.attachmentSignal;
-		signal?.throwIfAborted();
-		if (opts.refreshToolLoading) await opts.refreshToolLoading();
-		let rawMsgs = await narratorService.getModelHistorySinceLastCompact(narratorId, undefined, {
+		const preparedPrefix = await preparePrefixRequest({
+			narratorId,
+			locale,
+			getModel,
+			getProvider,
 			signal,
-			deadline,
+			getToolLoading: opts.getToolLoading,
+			refreshToolLoading: opts.refreshToolLoading,
+			buildPrefixPrompt: opts.buildPrefixPrompt,
 		});
-		let toolLoading = opts.getToolLoading?.();
-		if (toolLoading) {
-			const reconciled = await reconcileEpoch({
-				narratorId,
-				messages: rawMsgs,
-				...toolLoading,
-				model: getModel(),
-				provider: getProvider(),
-				noticeText: (kind, toolName) =>
-					kind === "tool_loaded"
-						? getToolMessageWithParams("toolLoaded", locale, {
-								toolName,
-								toolDescription: optionalToolDescription(toolName, locale),
-							})
-						: getToolMessageWithParams("toolUnloaded", locale, { toolName }),
-			});
-			if (reconciled.changed) {
-				rawMsgs = await narratorService.getModelHistorySinceLastCompact(narratorId, undefined, {
-					signal,
-					deadline,
-				});
-			}
-			toolLoading = { ...toolLoading, epoch: reconciled.epoch };
-		}
+		const { prompt: prefixPrompt, toolLoading, sourceMessages: rawMsgs } = preparedPrefix;
+		let systemPrompt = preparedPrefix.reconciled?.systemPrompt;
 		// The in-memory history is now rebuilt from the latest (post-compact)
 		// messages, so any pending-compact guard can be released.
 		clearActiveHistoryCompactPending(narratorId);
 		const result = await buildRuntimeHistory({
 			narratorId,
-			model: getModel(),
-			provider: getProvider(),
+			model: preparedPrefix.model,
+			provider: preparedPrefix.provider,
 			sourceMessages: rawMsgs,
 			attachmentCwd: opts.getAttachmentCwd?.(),
 			attachmentSignal: signal,
-			deadline,
 			toolLoading,
 		});
 		if (result.toolLoading && !result.toolCandidates) {
 			throw new Error("A tool-loading history rebuild must include tool candidates");
 		}
-		const systemPrompt = includeSystemPrompt
-			? ((await rebuildSystemPrompt?.()) ?? undefined)
-			: undefined;
+		if (!prefixPrompt && includeSystemPrompt) {
+			systemPrompt = (await rebuildSystemPrompt?.()) ?? undefined;
+		}
 		signal?.throwIfAborted();
-		if (Date.now() >= deadline) throw new Error("Model history preparation exceeded 10s budget");
 		return {
 			history: result.history,
 			rows: result.modelMessages,

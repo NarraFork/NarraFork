@@ -29,7 +29,6 @@ import {
 	streamCodexResponsesWebSocket,
 } from "./codex-websocket";
 import {
-	appendCodexNativeTools,
 	applyOpenAIModelMetadata,
 	CODEX_DEFAULT_INSTRUCTIONS,
 	convertHistoryToResponsesApi,
@@ -39,6 +38,7 @@ import {
 	OpenAIProvider,
 	resolveCodexRequestReasoningEffort,
 	stampReasoningSource,
+	withCodexNativeTools,
 } from "./openai-provider";
 import type {
 	BuiltHistory,
@@ -858,8 +858,7 @@ export class CodexProvider implements ProviderAdapter {
 		};
 		request.instructions = instructions || CODEX_DEFAULT_INSTRUCTIONS;
 		if (!instructions) markRuntimeInstructions(request);
-		const tools = Array.isArray(params.tools) ? [...params.tools] : [];
-		appendCodexNativeTools(tools, params.model, {
+		const tools = withCodexNativeTools(params.tools, params.model, {
 			webSearch:
 				this.useWebSearch && isNativeSearchChannelFirstEnabled(undefined, "codex", params.model),
 			imageGeneration: this.useImageGeneration,

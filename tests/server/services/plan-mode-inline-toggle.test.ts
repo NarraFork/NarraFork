@@ -20,15 +20,14 @@ function makeConfig(planAllowInlinePlan?: boolean): AgentConfig {
 	} as AgentConfig;
 }
 
-function resolveDescription(config: AgentConfig): string {
-	const { description } = exitPlanModeTool;
-	return typeof description === "function" ? description(config) : description;
+function resolveDescription(_config: AgentConfig): string {
+	return exitPlanModeTool.description;
 }
 
 describe("ExitPlanMode inline-plan toggle", () => {
 	it("offers both modes and the inline plan param when inline is allowed", () => {
 		const config = makeConfig(true);
-		const schema = exitPlanModeTool.getRawJsonSchema?.(config) as {
+		const schema = exitPlanModeTool.rawJsonSchema as {
 			properties: Record<string, unknown>;
 			required?: string[];
 		};
@@ -44,31 +43,30 @@ describe("ExitPlanMode inline-plan toggle", () => {
 		const desc = resolveDescription(config);
 		expect(desc).toContain('`mode: "inline"`');
 		expect(desc).toContain('`mode: "file"`');
-		expect(desc).toContain("`inline_plan` parameter");
+		expect(desc).toContain("complete actual plan body in `inline_plan`");
 	});
 
-	it("drops the inline plan param and narrows mode when inline is disabled", () => {
+	it("keeps the static union even when runtime inline submission is disabled", () => {
 		const config = makeConfig(false);
-		const schema = exitPlanModeTool.getRawJsonSchema?.(config) as {
+		const schema = exitPlanModeTool.rawJsonSchema as {
 			properties: Record<string, unknown>;
 			required?: string[];
 		};
-		expect(schema.properties.inline_plan).toBeUndefined();
+		expect(schema.properties.inline_plan).toBeDefined();
+		expect(schema.properties.plan_file_path).toBeDefined();
 		expect(schema.properties.plan).toBeUndefined();
 		expect(schema.properties.allowedPrompts).toBeUndefined();
 		expect(schema.required).toEqual(["mode"]);
-		// A mode the resolution layer would always reject is not advertised.
-		expect((schema.properties.mode as { enum?: string[] }).enum).toEqual(["file"]);
-
+		expect((schema.properties.mode as { enum?: string[] }).enum).toEqual(["inline", "file"]);
 		const desc = resolveDescription(config);
-		expect(desc).not.toContain('`mode: "inline"`');
-		expect(desc).toContain("only the file-based plan flow is supported");
+		expect(desc).toBe(resolveDescription(makeConfig(true)));
+		expect(desc).toContain("runtime validates these restrictions");
 	});
 
 	it("keeps mode required but never lets it be promoted away by NUG padding", () => {
 		// `ensureNonEmptySchema` only injects its dummy when nothing is required;
 		// a real `mode` means ExitPlanMode no longer needs that crutch.
-		const schema = exitPlanModeTool.getRawJsonSchema?.(makeConfig(true)) as {
+		const schema = exitPlanModeTool.rawJsonSchema as {
 			properties: Record<string, unknown>;
 			required?: string[];
 		};
@@ -78,8 +76,7 @@ describe("ExitPlanMode inline-plan toggle", () => {
 	});
 
 	it("treats undefined inline setting as allowed (backward compatible)", () => {
-		const config = makeConfig(undefined);
-		const schema = exitPlanModeTool.getRawJsonSchema?.(config) as {
+		const schema = exitPlanModeTool.rawJsonSchema as {
 			properties: Record<string, unknown>;
 		};
 		expect(schema.properties.inline_plan).toBeDefined();

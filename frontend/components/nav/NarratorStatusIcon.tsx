@@ -10,6 +10,7 @@ import {
 	IconMessageCircleFilled,
 	IconPencil,
 	IconShield,
+	IconWand,
 } from "@tabler/icons-react";
 import type { ReactNode } from "react";
 import {
@@ -117,6 +118,15 @@ export interface NarratorStatusIconProps extends NarratorStatusSource {
 	/** Corner markers; omit (or pass falsy) on surfaces that do not track them. */
 	hasDraft?: boolean | null;
 	isScheduled?: boolean | null;
+	/**
+	 * A prompt optimization is running for this narrator.
+	 *
+	 * Takes over the draft badge's corner because it is a stronger statement about
+	 * the SAME draft: you cannot optimize an empty composer, so wherever this is
+	 * true a draft necessarily exists. Showing both would need two markers in one
+	 * corner and say less than either alone.
+	 */
+	isOptimizingPrompt?: boolean | null;
 }
 
 /**
@@ -148,11 +158,12 @@ export function NarratorStatusIcon(props: NarratorStatusIconProps) {
 		icon = <IconMessageCircle size={size} color={iconColor} />;
 	}
 
-	const showDraft = !!props.hasDraft;
+	const showDraft = !!props.hasDraft && !props.isOptimizingPrompt;
+	const showOptimizing = !!props.isOptimizingPrompt;
 	const showReasoning = !!props.substatus?.includes("reasoning");
 	const showScheduled = !!props.isScheduled;
 	const shape = filledStatus ? getNarratorStatusShape(props) : undefined;
-	if (!showDraft && !showReasoning && !showScheduled && !shape) return icon;
+	if (!showDraft && !showOptimizing && !showReasoning && !showScheduled && !shape) return icon;
 
 	return (
 		<Box component="span" pos="relative" style={{ display: "inline-flex", lineHeight: 0 }}>
@@ -199,6 +210,36 @@ export function NarratorStatusIcon(props: NarratorStatusIconProps) {
 					}}
 				>
 					<IconBrain size={7} stroke={2.5} />
+				</Box>
+			)}
+			{/* Optimization in progress. Same corner and amber body as the draft
+			    marker it replaces, plus Tabler's wand and the app's established
+			    `pulse-dot` beat so it reads as running rather than as a state that
+			    simply "is". The pencil says "you have typing here"; the wand says
+			    "something is being done to it", which is the distinction that
+			    matters while a request is in flight. */}
+			{showOptimizing && (
+				<Box
+					component="span"
+					data-tab-optimizing-prompt="true"
+					style={{
+						position: "absolute",
+						right: -4,
+						top: -4,
+						width: 11,
+						height: 11,
+						borderRadius: "50%",
+						background: "var(--mantine-color-yellow-6)",
+						border: "1px solid var(--mantine-color-body)",
+						display: "inline-flex",
+						alignItems: "center",
+						justifyContent: "center",
+						color: "var(--mantine-color-dark-9)",
+						pointerEvents: "none",
+						animation: "pulse-dot 1.2s ease-in-out infinite",
+					}}
+				>
+					<IconWand size={7} stroke={2.5} />
 				</Box>
 			)}
 			{showDraft && (
