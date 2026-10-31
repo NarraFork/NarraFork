@@ -82,7 +82,7 @@ import {
 import { normalizeLegacyPlanPreviousPermissionMode } from "../lib/permission-modes";
 import { resolveExistingPlanFileRelPath } from "../lib/plan-file-path";
 import { getHome } from "../lib/platform";
-import { getBlockedTaskActionInstruction, getToolMessage, type Locale } from "../lib/prompt-i18n";
+import { getToolMessage, type Locale } from "../lib/prompt-i18n";
 import {
 	executionPrincipalOf,
 	type OwnTurnPlacement,
@@ -199,19 +199,21 @@ import {
 } from "./parent-injection-queue";
 import { syncNarratorProjectLinksSafely } from "./project-index";
 import { broadcastSpecChanged } from "./spec-broadcast";
-import { buildBehaviorFenceBody, buildSpecTaskDigestBody } from "./spec-reminder";
-import { compileSpecTasks, parseSpecTasksDocument } from "./spec-task-service";
 import { drainSpecUpdatesForNarrator } from "./spec-update-queue";
 import { specVfsService } from "./spec-vfs-service";
 import { readSubagentExecutionBoundary } from "./subagent-execution-boundary";
 import { appendSubagentFileChanges } from "./subagent-file-changes";
 import { agentResultTag, resolveAgentLabel } from "./subagent-label";
 import { resolveSubagentModelForRun, subagentRunReasoningEffort } from "./subagent-model";
+import {
+	type ContinuationTarget,
+	type NarratorTaskSource,
+	taskSourceForNarrator,
+} from "./task-source";
 import { buildFinalToolStartAuthorization } from "./tool-final-start-authorization";
 import { mcpToolMarker, parseMcpServerMarker } from "./tool-load-markers";
 import { resolveEffectiveTraits, resolveNarratorRuntimePolicy } from "./trait-layer-service";
 import {
-	buildSpecContinuationPrompt,
 	createSpecContinuationState,
 	planSpecContinuation,
 	type SpecContinuationCause,
@@ -1603,10 +1605,11 @@ export async function finalizeInterruptedRun(
 // === Interrupt task guard ===
 
 /**
- * Dedupe key for the interrupt task guard: narratorId → tasks.json revisionId the
- * guard last fired for. `hotSafe` so a dev hot-reload does not re-arm every guard.
- * When the spec has not changed since the last injection there is nothing new to
- * tell the model, so repeated interrupts stay quiet instead of stacking cards.
+ * Dedupe key for the interrupt task guard: narratorId → the task source revision key
+ * (spec: the tasks.json revisionId) the guard last fired for. `hotSafe` so a dev
+ * hot-reload does not re-arm every guard. When the tasks have not changed since the last
+ * injection there is nothing new to tell the model, so repeated interrupts stay quiet
+ * instead of stacking cards.
  */
 const interruptTaskGuardRevisions = hotSafe<Map<string, string | null>>(
 	"narrafork.interruptTaskGuardRevisions",
@@ -1630,9 +1633,12 @@ const suppressSpecContinuationOnce = hotSafe<Set<string>>(
 	() => new Set(),
 );
 
+/** How many open tasks the interrupt guard lists; the rest stay in the task source. */
+const INTERRUPT_TASK_GUARD_MAX_TASKS = 8;
+
 /**
- * After an interrupt, if spec://tasks.json still has open tasks, suppress the next
- * auto-continuation once and persist a system note telling the model to reconcile
+ * After an interrupt, if the narrator's task source still has open tasks, suppress the
+ * next auto-continuation once and persist a system note telling the model to reconcile
  * the open tasks against the user's next message before resuming anything.
  *
  * Best-effort: any failure is logged and swallowed so interrupt cleanup can never
@@ -1643,11 +1649,8 @@ async function maybeDeliverInterruptTaskGuard(
 	narratorId: string,
 ): Promise<void> {
 	try {
-		const file = await specVfsService.readTasksFileForNarrator(narratorId);
-		const compiled = compileSpecTasks(parseSpecTasksDocument(file.content));
-		const openTasks = compiled.tasks.filter(
-			(task) => task.status === "doing" || task.status === "todo" || task.status === "blocked",
-		);
+		const taskSource = await taskSourceForNarrator(narratorId);
+		const { tasks: openTasks, revision } = await taskSource.openTasks();
 		if (openTasks.length === 0) return;
 
 		// One-shot suppression: the user's next turn decides the direction; a stale
@@ -1656,32 +1659,13 @@ async function maybeDeliverInterruptTaskGuard(
 		// (see suppressSpecContinuationOnce).
 		suppressSpecContinuationOnce.add(narratorId);
 
-		const revisionId = file.revisionId ?? null;
-		if (interruptTaskGuardRevisions.get(narratorId) === revisionId) return;
-		interruptTaskGuardRevisions.set(narratorId, revisionId);
+		if (interruptTaskGuardRevisions.get(narratorId) === revision) return;
+		interruptTaskGuardRevisions.set(narratorId, revision);
 
-		const isZh = active.locale === "zh-CN";
-		const taskLines = openTasks
-			.slice(0, 8)
-			.map((task) => `- [${task.status}] ${task.text}${task.protected ? " [protected]" : ""}`)
-			.join("\n");
-		const content = isZh
-			? `刚才的运行被用户中断，这通常意味着方向有变化。当前 spec://tasks.json 中仍有以下开放任务：\n\n${taskLines}\n\n这些任务可能已经过期或与用户最新意图不一致。回复用户的下一条消息时，以用户消息为准；如需调整计划，先更新/删除过期任务（protected 任务变更会触发 taskReflection），再继续执行。不要无视用户新指令而直接恢复旧任务。`
-			: `The run was just interrupted by the user, which usually means the direction changed. spec://tasks.json still has these open tasks:\n\n${taskLines}\n\nThey may be stale or no longer match the user's latest intent. When the user's next message arrives, treat it as the source of truth; update or remove outdated tasks first if the plan changed (protected task changes trigger taskReflection), then continue. Do not resume an old task over the user's new instruction.`;
-		const body = {
-			kind: "tasks" as const,
-			variant: "current" as const,
-			tasks: openTasks.slice(0, 8).map((task) => ({
-				role:
-					task.status === "doing"
-						? ("doing" as const)
-						: task.status === "blocked"
-							? ("blocked" as const)
-							: ("todo" as const),
-				text: task.text,
-				...(task.protected ? { protected: true as const } : {}),
-			})),
-		};
+		const { content, body } = taskSource.interruptGuardNote(
+			openTasks.slice(0, INTERRUPT_TASK_GUARD_MAX_TASKS),
+			active.locale,
+		);
 
 		// deliverInjection is statically imported at module top; the circularity with
 		// narrator-injection is already handled by that module's lazy scheduler seam.
@@ -1778,49 +1762,27 @@ export interface SpecContinuationOptions {
 	placement?: InjectionRecipientPlacement;
 }
 
-async function loadCompiledSpecForContinuation(narratorId: string, promoteTodo = true) {
-	const file = await specVfsService.readTasksFileForNarrator(narratorId);
-	let document = parseSpecTasksDocument(file.content);
-	let compiled = compileSpecTasks(document);
-	if (promoteTodo && !compiled.currentTask && compiled.nextTask) {
-		let promoted = false;
-		document = {
-			tasks: document.tasks.map((task) => {
-				if (!promoted && task.status === "todo") {
-					promoted = true;
-					return { ...task, status: "doing" as const };
-				}
-				return task;
-			}),
-		};
-		const content = `${JSON.stringify(document, null, "\t")}\n`;
-		await specVfsService.writeSpecFile(narratorId, "spec://tasks.json", content, {
-			createdBy: "system",
-			allowProtectedTaskMutation: true,
-		});
-		compiled = compileSpecTasks(document);
-	}
-	return compiled;
-}
-
-/** Read only this narrator's spec; promotion is granted by the policy, not its relationships. */
-export async function readSpecContinuationState(narratorId: string, promoteTodo = true) {
+/**
+ * The continuation input from one narrator's task source, promoting the first todo when
+ * the policy allows. An unreadable source means nothing to continue.
+ */
+async function readContinuationTarget(
+	taskSource: NarratorTaskSource,
+	promoteTodo: boolean,
+): Promise<ContinuationTarget> {
 	try {
-		const compiled = await loadCompiledSpecForContinuation(narratorId, promoteTodo);
-		const chosen = compiled.currentTask ?? compiled.tasks.find((task) => task.status === "blocked");
-		return {
-			openTask: chosen
-				? {
-						text: chosen.text,
-						protected: chosen.protected === true,
-						status: chosen === compiled.currentTask ? ("doing" as const) : ("blocked" as const),
-					}
-				: null,
-			protectedOpenCount: compiled.protectedOpenCount,
-		};
+		return await taskSource.prepareContinuation({ promoteTodo });
 	} catch {
 		return { openTask: null, protectedOpenCount: 0 };
 	}
+}
+
+/** Read only this narrator's tasks; promotion is granted by the policy, not its relationships. */
+export async function readSpecContinuationState(
+	narratorId: string,
+	promoteTodo = true,
+): Promise<ContinuationTarget> {
+	return readContinuationTarget(await taskSourceForNarrator(narratorId), promoteTodo);
 }
 
 async function maybeStartSpecContinuation(
@@ -1860,7 +1822,8 @@ async function maybeStartSpecContinuation(
 		key: active._continuationStallKey,
 		suppressed: active._continuationSuppressed === true,
 	};
-	const spec = await readSpecContinuationState(active.narratorId, policy.continuation.promoteTodo);
+	const taskSource = await taskSourceForNarrator(active.narratorId);
+	const spec = await readContinuationTarget(taskSource, policy.continuation.promoteTodo);
 	const plan = planSpecContinuation({
 		cause: options?.cause ?? "spec",
 		mode: effectiveMode,
@@ -1880,7 +1843,8 @@ async function maybeStartSpecContinuation(
 	const task = plan.task;
 	const canAskUserQuestion = policy.capabilities.askUserQuestion !== "disabled";
 	if (policy.continuation.maxPasses !== null || !canAskUserQuestion) {
-		const content = buildSpecContinuationPrompt({
+		const content = taskSource.continuationPrompt({
+			form: "bounded",
 			cause: plan.cause,
 			task,
 			passes: plan.passes,
@@ -1902,15 +1866,11 @@ async function maybeStartSpecContinuation(
 	const current = task.status === "doing" ? task : null;
 	if (!current) {
 		const blocked = task;
-		const actionInstruction = getBlockedTaskActionInstruction(active.locale);
-		// `actionInstruction` already classifies the blocker and covers both branches, so
-		// this copy only adds what it cannot: that the message is system-generated, the tool
-		// name for asking, and that a stale entry may be rewritten. Restating its branches
-		// here (an earlier revision did) just made the prompt longer and self-repeating.
-		const prompt =
-			active.locale === "zh-CN"
-				? `Dynamic Spec blocked 任务续跑（系统消息，不是用户发言）。\n\n系统在 spec://tasks.json 有 blocked 条目时自动发出这条消息。\n\nblocked 任务（仅这一条，不是完整任务列表；其余任务仍在 spec://tasks.json 中）：${blocked.text}${blocked.protected ? " [protected]" : ""}\n\n${actionInstruction}\n\n需要用户介入时，用 AskUserQuestion 提问并结束回合；不要靠反复改写 tasks.json 或重跑同样的调查来绕开。如果该条目已不符合当前实际，可在保留用户原意图的前提下改写或删除它，并说明原因。改动 tasks.json 时先读取再就地修改，不要按本消息重写整个文件。`
-				: `Dynamic Spec blocked-task continuation (system message, not the user speaking).\n\nThe system emits this whenever spec://tasks.json has a \`blocked\` entry.\n\nBlocked task (this one only — not the full task list; your other tasks are still in spec://tasks.json): ${blocked.text}${blocked.protected ? " [protected]" : ""}\n\n${actionInstruction}\n\nWhen the blocker needs the user, ask with AskUserQuestion and end the turn; do not work around it by rewriting tasks.json or re-running the same investigation. If the entry no longer matches reality, rewrite or remove it while preserving the user's original intent, and say why. When you change tasks.json, read it first and edit in place; do not rewrite the file from this message.`;
+		const prompt = taskSource.continuationPrompt({
+			form: "open",
+			task: blocked,
+			locale: active.locale,
+		});
 		if (options?.placement) {
 			await deliverInjection(active.narratorId, {
 				content: prompt,
@@ -1948,35 +1908,11 @@ async function maybeStartSpecContinuation(
 		active._continuationTurn = "blocked";
 		return prompt;
 	}
-	const protectedNote = current.protected
-		? active.locale === "zh-CN"
-			? "\n- protected：只有具备具体验收证据才能标记 done，该变更会触发 taskReflection。"
-			: "\n- Protected: mark it done only with concrete completion evidence; that change runs taskReflection."
-		: "";
-	// ⚠️ Compiled from tasks.json, not written by the user, and emitted purely because a
-	// `doing` entry is still open — so it has to say so.
-	//
-	// The wording it replaces restated the task and ordered the model to continue ("Do not
-	// ask the user whether to continue"), which is indistinguishable from the user insisting
-	// the work is unfinished. Three observed failure modes came from that:
-	//
-	//  1. Work done, tasks.json not yet updated → the model reads the restated task as "you
-	//     are not done" and reworks code that was already correct.
-	//  2. The task needs the user (one was titled "需用户跑") → being told to act rather than
-	//     ask, the model edited tasks and got nudged again, 37 times in one session.
-	//  3. The task no longer matches reality → with no licence to say so, it grinds a stale
-	//     objective.
-	//
-	// Hence: state provenance, then enumerate the legitimate outcomes. The list must not be
-	// framed as "ways to END the turn" — "keep working" is one of the branches.
-	//
-	// It also names ONE task while tasks.json may hold many, so it says so. A model that
-	// reads this single line as the whole file concludes its other entries were lost and
-	// "restores" them by rewriting tasks.json — destroying the entries that were fine.
-	const prompt =
-		active.locale === "zh-CN"
-			? `Dynamic Spec 自动续跑（系统消息，不是用户发言）。\n\n系统在 spec://tasks.json 仍有 doing 条目时自动发出这条消息。它只说明该条目尚未标记完成 —— 不代表系统判断你没做完，条目内容也可能已经过时。\n\n当前任务（仅这一条，不是完整任务列表；其余任务仍在 spec://tasks.json 中）：${current.text}${current.protected ? " [protected]" : ""}\n\n请先判断该任务的真实状态，再按实际情况选择其一：\n- 已经完成：在 spec://tasks.json 标记 done。这就是本回合的有效结果，不要因为这条提醒去返工已经正确的改动。\n- 未完成且能自主推进：继续执行。\n- 需要用户提供信息、权限、决策，或需要用户亲自操作：先做完不受阻的部分，再用 AskUserQuestion 提出一个精确问题并结束回合。\n- 已不符合当前实际：在保留用户原意图的前提下改写或删除该条目，并说明原因。\n\n改动 spec://tasks.json 时先读取再就地修改，不要按本消息重写整个文件。${protectedNote}`
-			: `Dynamic Spec auto-continuation (system message, not the user speaking).\n\nThe system emits this whenever spec://tasks.json still has a \`doing\` entry. It only means the entry is not marked finished — not that the system judged your work incomplete, and its content may be out of date.\n\nCurrent task (this one only — not the full task list; your other tasks are still in spec://tasks.json): ${current.text}${current.protected ? " [protected]" : ""}\n\nDecide what is actually true of this task, then take exactly one of these paths:\n- Already done: mark it done in spec://tasks.json. That is a valid result for this turn; do not rework a change that was already correct.\n- Unfinished and you can advance it: keep working.\n- Needs the user's information, permission, decision, or an action only they can perform: finish every unblocked part, then ask one precise question with AskUserQuestion and end the turn.\n- No longer matches reality: rewrite or remove the entry while preserving the user's original intent, and say why.\n\nWhen you change spec://tasks.json, read it first and edit in place; do not rewrite the file from this message.${protectedNote}`;
+	const prompt = taskSource.continuationPrompt({
+		form: "open",
+		task: current,
+		locale: active.locale,
+	});
 	if (options?.placement) {
 		await deliverInjection(active.narratorId, {
 			content: prompt,
@@ -2570,7 +2506,17 @@ export async function drainInjectionsIntoHistory(
 		() => active._fenceInterval ?? -1,
 	).due(count);
 
-	const tasksBody = atTasksCadence ? await buildSpecTaskDigestBody(narratorId) : null;
+	// Both bodies come from the narrator's task source, resolved only when a cadence is due
+	// and at most once per drain. Injection reads resolve to null rather than reject; the
+	// catch keeps it that way for any source, since nothing above this drain catches.
+	let taskSource: NarratorTaskSource | undefined;
+	const getTaskSource = async () => {
+		taskSource ??= await taskSourceForNarrator(narratorId);
+		return taskSource;
+	};
+	const tasksBody = atTasksCadence
+		? await (await getTaskSource()).taskDigest().catch(() => null)
+		: null;
 	if (tasksBody) {
 		// Stamp the cadence that raised this digest so the reader-facing header can say
 		// "每 N 次工具调用", distinguishing a routine digest from a turn-end
@@ -2593,7 +2539,7 @@ export async function drainInjectionsIntoHistory(
 	// The fence goes out on its own cadence, or alongside a tasks reminder when the
 	// narrator is configured to attach the two.
 	if (atFenceCadence || (!!active._fenceAttach && !!tasksBody)) {
-		const fenceBody = await buildBehaviorFenceBody(narratorId);
+		const fenceBody = await (await getTaskSource()).behaviorFence().catch(() => null);
 		if (fenceBody) {
 			const { body, content } = sideCarBodyWithText("behavior_fence", fenceBody, locale);
 			const { messageId, turnText } = await deliverInjection(narratorId, {
