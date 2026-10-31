@@ -5,8 +5,9 @@
 
 import { db } from "@server/db";
 import { narratorMessageRefs, narratorMessages, narrators } from "@server/db/schema";
+import { resolveProviderAndModel } from "@server/lib/agent/provider";
 import { addTrait, parseTraits } from "@server/lib/narrator-utils";
-import { and, eq } from "drizzle-orm";
+import { eq, inArray } from "drizzle-orm";
 
 /** 绑定键：探测实际使用的 provider 与解析后的模型名。 */
 export function modelTraceKey(provider: string, model: string): string {
@@ -99,12 +100,28 @@ export async function clearTraceHistory(id: string): Promise<void> {
 }
 
 /** 该模型的舱 id；没有跑过 /modeltrace 时为 null，按钮据此提示先运行一次。 */
-export async function findModelTraceNarrator(
-	provider: string,
-	model: string,
-): Promise<string | null> {
+export async function findModelTraceNarrator(rawModel: string): Promise<string | null> {
+	// 写入侧用的是「路由 provider + 探测时的模型串」，而模型串在解析前后可能是两种写法
+	// （例如 `反代:cn:xxx` 与 `cn:xxx`）。查找侧把几种可能的键都试一遍，
+	// 免得因为解析差异让按钮永远找不到已有舱。
+	const candidates = new Set<string>();
+	const add = (provider: string | undefined, model: string | undefined) => {
+		if (provider && model) candidates.add(modelTraceKey(provider, model));
+	};
+	const separator = rawModel.indexOf(":");
+	const prefix = separator > 0 ? rawModel.slice(0, separator) : undefined;
+	try {
+		const resolved = resolveProviderAndModel(rawModel);
+		add(resolved.provider, rawModel);
+		add(resolved.provider, resolved.model);
+		add(prefix, resolved.model);
+	} catch {
+		// 模型已无法解析时只按字面前缀兜底。
+	}
+	add(prefix, rawModel);
+	if (candidates.size === 0) return null;
 	const row = await db.query.narrators.findFirst({
-		where: and(eq(narrators.modeltraceKey, modelTraceKey(provider, model))),
+		where: inArray(narrators.modeltraceKey, [...candidates]),
 		columns: { id: true },
 	});
 	return row?.id ?? null;
