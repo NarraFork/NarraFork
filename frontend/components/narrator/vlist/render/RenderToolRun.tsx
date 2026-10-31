@@ -88,7 +88,7 @@ import { categoryIcon } from "./category-icons";
 import { DiffStatsText } from "./diff-stats-text";
 import { activateOnKey, swallowSelectionClick } from "./key-activate";
 import { RenderTextPreview, type TextPreviewLabels } from "./RenderTextPreview";
-import { CATEGORY_COLOR, ToolTimingArea, type ToolTimingLabels } from "./RenderToolCall";
+import { categoryColor, ToolTimingArea, type ToolTimingLabels } from "./RenderToolCall";
 import { ROW_FLEX_CLASS, ROW_TEXT_CLASS, RowChip, rowFlexStyle, rowSpacing } from "./row-chrome";
 import {
 	isTerminalToolRowStatus,
@@ -114,12 +114,6 @@ const LABEL_FADE_CLASS = "vlist-trace-label-in";
 function joinClasses(...classes: (string | undefined)[]): string | undefined {
 	const joined = classes.filter(Boolean).join(" ");
 	return joined.length > 0 ? joined : undefined;
-}
-
-/** A row's chip tint from its category, via the vlist render layer's own table. */
-function categoryColor(category: string | undefined): string {
-	if (!category) return "gray";
-	return CATEGORY_COLOR[category as ToolCategory] ?? "gray";
 }
 
 /** Header visual per variant (icon + tint). Tool traces gray, reasoning grape. */
