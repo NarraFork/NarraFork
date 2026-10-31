@@ -1059,6 +1059,8 @@ function SettingsProvidersPage() {
 	}, [
 		codexModels,
 		commandcodeModels,
+		instanceModelGroups,
+		platformInstances,
 		openaiByProvider,
 		anthropicByProvider,
 		geminiByProvider,
