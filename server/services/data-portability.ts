@@ -266,19 +266,24 @@ export async function exportData(
 	const zipPath = join(dir, "narrafork-export.zip");
 	const output = createWriteStream(zipPath);
 	const archive = archiver("zip", { zlib: { level: 1 } });
+	// 只导出供应商时不需要快照：供应商配置在 settings.json 里，整库快照只会把
+	// 与选择无关的数据（用户、知识库、认证会话……）带出几百 MB。
+	const needsSnapshot = selection.requests || selection.sessions;
 	try {
-		// 原生快照：包含全部已提交数据（WAL 内容一并固化），单条 SQL、毫秒级。
-		// `VACUUM INTO` 只读主库，导出失败不会对主库留下任何改动。
-		sqlite.run("VACUUM INTO ?", [snapshotPath]);
-		pruneSnapshot(snapshotPath, selection);
+		if (needsSnapshot) {
+			// 原生快照：包含全部已提交数据（WAL 内容一并固化），单条 SQL、毫秒级。
+			// `VACUUM INTO` 只读主库，导出失败不会对主库留下任何改动。
+			sqlite.run("VACUUM INTO ?", [snapshotPath]);
+			pruneSnapshot(snapshotPath, selection);
+		}
 
 		const providers = selection.providers
 			? collectProviders(settings)
 			: ({} as Partial<Record<ProviderKey, unknown>>);
-		// 计数从裁剪后的快照读，与实际导出的内容一致。
+		// 计数从裁剪后的快照读，与实际导出的内容一致；没有快照时这两类必然是 0。
 		const counts: ExportCounts = {
-			requests: countRowsIn(snapshotPath, "api_requests"),
-			sessions: countRowsIn(snapshotPath, "narrators"),
+			requests: needsSnapshot ? countRowsIn(snapshotPath, "api_requests") : 0,
+			sessions: needsSnapshot ? countRowsIn(snapshotPath, "narrators") : 0,
 			providers: countProviders(providers),
 		};
 
@@ -288,7 +293,7 @@ export async function exportData(
 			archive.on("error", reject);
 		});
 		archive.pipe(output);
-		archive.file(snapshotPath, { name: "snapshot.db" });
+		if (needsSnapshot) archive.file(snapshotPath, { name: "snapshot.db" });
 		archive.append(JSON.stringify(providers, null, 2), {
 			name: "providers.json",
 		});
@@ -434,12 +439,43 @@ export async function previewImport(upload: ArrayBuffer, fileName: string): Prom
 	}
 }
 
+/**
+ * 只导出供应商的包里没有快照：造一个只有列结构的空库顶替。
+ *
+ * 这样 ATTACH 与合并语句照常执行、结果为空，导入流程不需要为「无快照」再分叉一条路径。
+ */
+function createEmptySnapshot(snapshotPath: string): void {
+	const attachName = `empty_${randomBytes(4).toString("hex")}`;
+	sqlite.run(`ATTACH DATABASE ? AS ${attachName}`, [snapshotPath]);
+	try {
+		for (const table of [
+			"api_requests",
+			"narrators",
+			"narrator_messages",
+			"narrator_message_refs",
+			"narrator_tool_calls",
+		]) {
+			sqlite.run(`CREATE TABLE ${attachName}.${table} AS SELECT * FROM main.${table} LIMIT 0`);
+		}
+	} finally {
+		sqlite.run(`DETACH DATABASE ${attachName}`);
+	}
+}
+
 async function buildImportPreview(zipPath: string, dir: string): Promise<ImportPreview> {
 	const index = await readZipIndex(zipPath);
 	const snapshotEntry = index.get("snapshot.db");
-	if (!snapshotEntry) {
+	const providersEntry = index.get("providers.json");
+	const snapshotPath = join(dir, "snapshot.db");
+	if (snapshotEntry) {
+		await extractEntryToFile(zipPath, snapshotEntry, snapshotPath);
+	} else if (providersEntry) {
+		// 只导出了供应商的包：包里本来就没有快照。用一个空库顶替，让后面的
+		// ATTACH/合并逻辑自然空跑，只应用 providers.json。
+		createEmptySnapshot(snapshotPath);
+	} else {
 		// 空索引通常意味着请求体不是 ZIP（例如旧前端发的 multipart 包装）。
-		logger.warn("Import archive has no snapshot.db", {
+		logger.warn("Import archive has neither snapshot.db nor providers.json", {
 			entries: [...index.keys()].slice(0, 10),
 			entryCount: index.size,
 		});
@@ -454,15 +490,11 @@ async function buildImportPreview(zipPath: string, dir: string): Promise<ImportP
 			>)
 		: undefined;
 	assertVersion(manifest);
-	const providersEntry = index.get("providers.json");
 	const providers = providersEntry
 		? (JSON.parse((await readSmallEntry(zipPath, providersEntry)).toString("utf8")) as Partial<
 				Record<ProviderKey, unknown>
 			>)
 		: {};
-
-	const snapshotPath = join(dir, "snapshot.db");
-	await extractEntryToFile(zipPath, snapshotEntry, snapshotPath);
 
 	// ATTACH 快照到主库连接，联查冲突（单条 SQL，不把 id 集合搬进 JS）
 	const attachName = `imp_${randomBytes(4).toString("hex")}`;

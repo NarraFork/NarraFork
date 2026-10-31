@@ -265,6 +265,27 @@ describe("data portability · 数据安全", () => {
 		expect(snapshotCounts()).toEqual(before);
 	});
 
+	test("只导出供应商：不生成快照，导入只应用供应商", async () => {
+		const before = snapshotCounts();
+		const exported = await exportData({ requests: false, sessions: false, providers: true });
+		expect(exported.counts).toMatchObject({ requests: 0, sessions: 0 });
+		const zip = await readFile(exported.zipPath);
+		// 只勾供应商时不应把整库快照打进包（那是几百 MB 的无关数据）。
+		expect(zip.includes(Buffer.from("snapshot.db"))).toBe(false);
+		expect(zip.includes(Buffer.from("providers.json"))).toBe(true);
+
+		const preview = await previewImport(toArrayBuffer(zip), "providers-only.zip");
+		expect(preview.counts).toMatchObject({ requests: 0, sessions: 0 });
+		expect(preview.conflicts).toHaveLength(0);
+		const result = await applyImport(preview.token, { conflictDefault: "skip" });
+		expect(result.requestsInserted).toBe(0);
+		expect(result.sessionsInserted).toBe(0);
+		// 主库的请求与会话没有被这次导入动过。
+		const after = snapshotCounts();
+		expect(after.requests).toBe(before.requests);
+		expect(after.sessions).toBe(before.sessions);
+	});
+
 	test("重复导入幂等：数据行数不变、事务不重复插入", async () => {
 		const zip = await readFile((await exportData()).zipPath);
 		const first = await previewImport(toArrayBuffer(zip), "export.zip");
