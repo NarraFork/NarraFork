@@ -84,7 +84,7 @@ import { skillRoutes } from "./routes/skills";
 import { specRoutes } from "./routes/spec";
 import { handleSsoCallback, ssoRoutes } from "./routes/sso";
 import { storageRoutes } from "./routes/storage";
-import { storageTransferRoutes } from "./routes/storage-transfer";
+import { exportTicketDownloadRoutes, storageTransferRoutes } from "./routes/storage-transfer";
 import { managerLifecycleRoutes, systemLifecycleRoutes } from "./routes/system-lifecycle";
 import { terminalRoutes } from "./routes/terminals";
 import { tlsRoutes } from "./routes/tls";
@@ -360,6 +360,11 @@ app.post(`${REVEAL_CLAIM_PATH}/:token`, (c) => {
 // Hono 按注册顺序匹配，挂载点晚于 requireSessionAuth 就永远轮不到这里。
 app.route("/api/update", localPeerUpdateRoutes);
 app.route("/api/system/lifecycle", managerLifecycleRoutes);
+
+// 导出包可能有数 GB。没有 File System Access API 的浏览器只能用普通导航下载，
+// `<a href>` 带不上 Authorization，所以这张一次性票据必须挂在会话认证之前。
+// 票据由已登录的管理员签发，本身就是凭证。
+app.route("/api/storage/export/download", exportTicketDownloadRoutes);
 
 // All ordinary routes below require a first-party session. OAuth access tokens
 // must opt into an explicitly mounted external route and can never fall through

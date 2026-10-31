@@ -55,6 +55,8 @@
 	"errorCode": "Error code",
 	"messageCode": "Message code",
 
+	"EXPORT_PARAMS_INVALID": "The export request is invalid",
+	"EXPORT_TICKET_INVALID": "This download link has expired. Start the export again",
 	"IMPORT_FILE_REQUIRED": "Choose a .zip file exported from NarraFork",
 	"IMPORT_FILE_TOO_LARGE": "The import file exceeds the {{limit}} limit",
 	"IMPORT_ZIP_INVALID": "The uploaded file is not a valid ZIP archive",
