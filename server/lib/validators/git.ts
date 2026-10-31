@@ -1,3 +1,10 @@
+import {
+	GIT_BRANCH_NAME_MAX,
+	GIT_START_POINT_MAX,
+	isValidGitBranchName,
+	isValidGitRemoteName,
+	isValidGitStartPoint,
+} from "@shared/git-branches";
 import { GIT_COMMIT_SHA_PATTERN } from "@shared/git-commit-preview";
 import { z } from "zod";
 
@@ -89,6 +96,61 @@ export const gitCommitShaSchema = z
 export const gitCommitDiffQuerySchema = z.object({
 	file: z.string().min(1).max(4096),
 	oldPath: z.string().min(1).max(4096).optional(),
+});
+
+// === branch management ===
+
+/**
+ * A branch NAME, not a revision.
+ *
+ * Deliberately not `gitRef`: that pattern models revision syntax and therefore
+ * allows `~`, `^` and `@{}` (all illegal in a branch name), while it rejects legal
+ * non-ASCII names and `+`. It is also not `common.ts`'s `gitBranchName`, which is
+ * ASCII-only for the same reason. The server still runs
+ * `git check-ref-format --branch` before creating a ref, so this is the stricter
+ * of the two checks by construction.
+ */
+export const gitBranchNameSchema = z
+	.string()
+	.min(1)
+	.max(GIT_BRANCH_NAME_MAX)
+	.refine(isValidGitBranchName, "Invalid Git branch name");
+
+/** A remote name: no leading dash, no whitespace/control/ref punctuation. */
+export const gitRemoteNameSchema = z
+	.string()
+	.min(1)
+	.max(100)
+	.refine(isValidGitRemoteName, "Invalid Git remote");
+
+/**
+ * A checkout start point is a branch name or a revision.
+ *
+ * `gitRef` alone rejects `+` and non-ASCII, which are legal in `origin/功能` and
+ * `origin/feature+x` — the values the picker sends when it tracks a remote branch.
+ * Revisions such as `HEAD~2` stay accepted.
+ */
+export const gitStartPointSchema = z
+	.string()
+	.min(1)
+	.max(GIT_START_POINT_MAX)
+	.refine(isValidGitStartPoint, "Invalid Git start point");
+
+export const gitCheckoutSchema = z.object({
+	branch: gitBranchNameSchema,
+	create: z.boolean().optional(),
+	/** With `create`: the revision the new branch starts from (rev syntax allowed). */
+	startPoint: gitStartPointSchema.optional(),
+});
+
+export const gitPushSchema = z.object({
+	remote: gitRemoteNameSchema.optional(),
+	setUpstream: z.boolean().optional(),
+});
+
+export const gitFetchSchema = z.object({
+	remote: gitRemoteNameSchema.optional(),
+	prune: z.boolean().optional(),
 });
 
 // === modification view ===

@@ -8,6 +8,15 @@ export const FEATURE_GIT_WORKSPACE_STATUS_V1 = "git.workspace.status.v1";
 export const FEATURE_GIT_LINE_STATS_V1 = "git.workspace.line-stats.v1";
 /** Read-only `commitDetail`/`commitDiff` operations; older executors lack them. */
 export const FEATURE_GIT_COMMIT_PREVIEW_V1 = "git.workspace.commit-preview.v1";
+/**
+ * `branches` returns the raw `for-each-ref`/`worktree list` listings under the keys
+ * in GIT_BRANCH_OUTPUT_KEYS; the server parses them, so this stays a pure read.
+ */
+export const FEATURE_GIT_BRANCHES_V1 = "git.workspace.branches.v1";
+/** The `checkout` write operation (switch, create, or track a remote branch). */
+export const FEATURE_GIT_BRANCH_SWITCH_V1 = "git.workspace.branch-switch.v1";
+/** The `push`/`fetch` write operations; both talk to a configured remote. */
+export const FEATURE_GIT_REMOTE_SYNC_V1 = "git.workspace.remote-sync.v1";
 export const GIT_WORKSPACE_TIMEOUT_MS = 30_000;
 export const GIT_WORKSPACE_WRITE_TIMEOUT_MS = 120_000;
 export const GIT_WORKSPACE_MAX_BYTES = 2 * 1024 * 1024;
@@ -31,7 +40,11 @@ export type GitWorkspaceOperation =
 	| "stashDrop"
 	| "reset"
 	| "commitDetail"
-	| "commitDiff";
+	| "commitDiff"
+	| "branches"
+	| "checkout"
+	| "push"
+	| "fetch";
 
 export interface GitWorkspaceRequest {
 	cwd: string;
@@ -45,7 +58,18 @@ export interface GitWorkspaceRequest {
 	identity?: Record<string, string>;
 	limit?: number;
 	skip?: number;
+	/** log: revision to walk. checkout: existing local branch, or the ref to track. */
 	branch?: string;
+	/** checkout: create `branch` instead of switching to an existing one. */
+	create?: boolean;
+	/** checkout with create: revision the new branch starts from; defaults to HEAD. */
+	startPoint?: string;
+	/** push/fetch: configured remote name; the executor rejects an unknown one. */
+	remote?: string;
+	/** push: pass `--set-upstream` for a branch that has no upstream yet. */
+	setUpstream?: boolean;
+	/** fetch: pass `--prune` to drop remote-tracking refs the remote no longer has. */
+	prune?: boolean;
 	index?: number;
 	target?: string;
 	mode?: "soft" | "hard";
