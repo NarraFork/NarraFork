@@ -90,7 +90,8 @@
 			"restore": "Restored",
 			"task": "Task",
 			"page": "Page changed",
-			"props": "Alias or tags"
+			"props": "Alias or tags",
+			"merge": "Merged"
 		},
 		"viewAt": "View the page as of commit #{{seq}}"
 	},

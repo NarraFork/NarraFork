@@ -50,9 +50,10 @@ if (process.env[CHILD_ENV] !== "1") {
 	}, 50_000);
 } else {
 	const { eq } = await import("drizzle-orm");
-	const { getTestDb, cleanDb } = await import("../../../tests/setup");
-	const { db, sqlite } = getTestDb();
-	mock.module("../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
+	const { cleanDb } = await import("../../../tests/setup");
+	// The snapshot worker shares the preload-isolated file-backed database.
+	const { db, sqlite } = await import("../../db");
+	const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
 
 	const configs: AgentConfig[] = [];
 	const executions: ExecuteLoopOptions[] = [];
@@ -118,6 +119,7 @@ if (process.env[CHILD_ENV] !== "1") {
 	const TOOL = "follow-parent-agent-tool";
 
 	beforeEach(async () => {
+		await closePrefixSnapshotStore();
 		cleanDb(sqlite);
 		clearAliasRegistry(PARENT);
 		agentCalls = 0;
@@ -152,9 +154,9 @@ if (process.env[CHILD_ENV] !== "1") {
 		});
 	});
 
-	afterAll(() => {
+	afterAll(async () => {
+		await closePrefixSnapshotStore();
 		mock.restore();
-		sqlite.close();
 	});
 
 	/** A real persisted Agent attempt on the parent that a delegated run can deliver into. */

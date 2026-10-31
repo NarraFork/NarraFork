@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "node:events";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { backgroundTasks, narratorMessages, narrators } from "../../db/schema";
 import type { RunControl } from "../agent-runtime/ownership";
 import { runtimePolicyForContext } from "../agent-runtime/policy";
@@ -10,9 +10,9 @@ import type { ActiveNarrator } from "../narrator-session-state";
 
 // Real configured provider classification, real provider history and the real outer
 // runtime; only model I/O and its bounded delay are replaced. Run in an isolated process.
-const { db, sqlite } = getTestDb();
-const realDb = { ...(await import("../../db")) };
-mock.module("../../db", () => ({ ...realDb, db, sqlite }));
+// Share the preload-isolated file-backed DB with the real prefix/history workers.
+const { db, sqlite } = await import("../../db");
+const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
 const { settings, usesStatefulModel } = await import("../../lib/settings");
 const { runAgentLoopUnlocked } = await import("../agent-runtime/orchestrator");
 const { tryClaimExecution, getExecutionOwner, setRunControl } = await import(
@@ -47,6 +47,7 @@ const delegatedTraits = withRuntimePolicyTrait([], await compileDelegationCeilin
 
 beforeEach(async () => {
 	backgroundOccupancyStore.resetForTests();
+	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
 	await backgroundOccupancyStore.start();
 });
@@ -61,9 +62,9 @@ afterEach(async () => {
 	await backgroundOccupancyStore.flush();
 	mock.restore();
 });
-afterAll(() => {
+afterAll(async () => {
+	await closePrefixSnapshotStore();
 	backgroundOccupancyStore.resetForTests();
-	mock.module("../../db", () => realDb);
 });
 
 // Direct SQL fixtures must publish the same entity-specific maintenance as production writes.

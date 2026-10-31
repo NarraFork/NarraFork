@@ -1,6 +1,6 @@
 import { describe, expect, mock, spyOn, test } from "bun:test";
 import * as subagent from "@server/services/narrator-subagent";
-import type { AgentConfig, ToolContext } from "../../types";
+import type { ToolContext } from "../../types";
 import { agentTool } from "../task";
 
 function context(): ToolContext {
@@ -29,7 +29,7 @@ describe("Agent takeover_by_user tool contract", () => {
 		}
 		expect(agentTool.parameters.safeParse({}).success).toBe(true);
 		expect(agentTool.parameters.safeParse({ takeover_by_user: "true" }).success).toBe(false);
-		const schemas = [agentTool.rawJsonSchema, agentTool.getRawJsonSchema?.({} as AgentConfig)];
+		const schemas = [agentTool.rawJsonSchema];
 		for (const raw of schemas) {
 			const schema = raw as {
 				properties: Record<string, { type: string; description: string }>;

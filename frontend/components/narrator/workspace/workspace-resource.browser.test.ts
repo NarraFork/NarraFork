@@ -291,6 +291,43 @@ async function expectReadyDocuments(page: Page, panelIds: string[]) {
 	return messageState(page);
 }
 
+/**
+ * `ready` alone does not mean a revealed tab's layout is settled. Right after activation the
+ * always-rendered panel DOM is still the whole row wide (1392 px in the three-group fixture)
+ * while Dockview already sizes the panel at 464 px; the hook commits a ready document at 1392 px
+ * and rebuilds once the DOM reaches 464 px. Hiding the tab between that resize commit and the
+ * rebuild effect lets the rebuild (measured while visible) commit into the parked viewport, which
+ * the probe counts as a zero-size adoption. So wait until the DOM matches Dockview's width and the
+ * items are laid out at it.
+ */
+async function expectSettledDocument(page: Page, panelId: string) {
+	await expectReadyDocuments(page, [panelId]);
+	try {
+		await page.waitForFunction(
+			(id) => {
+				const entry = (window as unknown as FixtureWindow).fixture
+					.messageSnapshot()
+					.documents.find((document) => document.panelId === id);
+				return (
+					!!entry &&
+					entry.width > 0 &&
+					entry.width === entry.apiWidth &&
+					entry.itemWidths.length > 0 &&
+					entry.itemWidths.every((width) => width === entry.width)
+				);
+			},
+			{ timeout: 3_000 },
+			panelId,
+		);
+	} catch (error) {
+		const actual = await messageState(page);
+		throw new Error(
+			`Document ${panelId} was not laid out at its panel width within 3000ms: ${JSON.stringify(actual)}; ${String(error)}`,
+		);
+	}
+	return messageState(page);
+}
+
 function expectBuiltDocument(snapshot: MessageSnapshot, panelId: string, narratorId: string) {
 	const entry = snapshot.documents.find((document) => document.panelId === panelId);
 	if (!entry) throw new Error(`Missing measured document ${panelId}`);
@@ -483,7 +520,8 @@ browserTest(
 						.getPanel("hidden-tab")
 						?.api.setActive();
 				});
-				const shown = await expectReadyDocuments(page, ["hidden-tab"]);
+				// The re-hide below must start from the reveal's final layout, not a transient one.
+				const shown = await expectSettledDocument(page, "hidden-tab");
 				expectBuiltDocument(shown, "hidden-tab", "narrator-hidden");
 				expect(
 					shown.requests.filter((request) => request.narratorId === "narrator-hidden"),

@@ -13,7 +13,7 @@
 1. **side-car**（`narrator_sidecars` 表）—— 一行挂在**别人**的消息上的记录，在 API 调用时由七份 `buildHistory` 各自的手写状态机重新拼进 `tool_result` 输出或下一个 user turn。
 2. **消息行**（`persistSystemMessage`）—— 一条普通 `role: "sys"` 行，每个 provider 本来就知道怎么回放。
 
-路 1 解决的问题路 2 也能解决。NarraFork 每次请求都发送**完整历史**（`store: false`，见 `openai-provider.ts` 的注释），所以模型收到什么是消息行的纯函数——同样字节的 side-car 和 `sys` 行在线上是一样的，side-car 只是为此额外付出了一张表、一个 `body_json` 列、七份 flush 状态机和一层 `<side_car>` 包装。
+路 1 解决的问题路 2 也能解决。NarraFork 从有序持久历史统一投影模型输入；Codex WS 可在前缀相容时续写 delta，断链时重放完整历史。传输是否增量不改变历史记录的语义，也不触发重建基线。side-car 为相同的注入语义额外付出了一张表、一个 `body_json` 列、七份 flush 状态机和一层 `<side_car>` 包装。
 
 **路 1 已完全移除**（表、列、状态机、包装全部删除）。下文描述的是唯一剩下的路。
 
@@ -27,8 +27,8 @@
 
 | 值 | 语义 | provider 映射 |
 |---|---|---|
-| `sys`（默认） | 系统事实（容器起来了、任务完成了） | Anthropic 官方 API 上是**真正的**对话中 `system` 消息；其他 provider 映射成 `user` |
-| `user` | 代表用户说话 | 权重更高，而且理应如此 |
+| `sys`（默认） | 宿主发布的事实或上下文 | 普通注入沿 Anthropic 既有中途 system 门控，其余映射为 user；结构化 `context_update` 在所有当前适配器都用 user 载体，保持追加位置 |
+| `user` | 代表用户说话 | 按用户输入投影；不能仅凭正文标签获得宿主更新身份 |
 
 `user` 的存在有具体理由：`taskReflection` 读父历史，只有当请求以 user turn 形式到达时，它才能识别出这是用户真正要求的任务。这是 `spec-edit-interject.ts` 存在的全部原因。
 
@@ -51,7 +51,7 @@
 
 它在投递这个动作里被消费掉了。持久化它会让 fork 或历史回放**重新触发几个月前就已发生的唤醒**。行是永久的，意图不是。
 
-> 遗留：这没有动 provider 的"末尾 `user` 行即当前 turn"规则——`buildHistory` 仍从行的形状推断调度。去掉这层推断需要一个持久化标记，刻意留在范围外。
+> 模型历史与调度分开：统一投影保留末尾输入，不再由 provider 弹出末尾 `user` 来猜测调度。`context_update` 是每次真实 provider 请求前的持久化协调结果，不另触发一轮回答，也不走第二份 live 文本注入。
 
 ---
 
@@ -64,7 +64,36 @@
 | `text` | **模型** | 模型向文案原样保留，指令 boilerplate 全在里面（"tasks.json 只保留 text/status/protected"、"不要添加 ID"） |
 | `system_injection` | **读者** | 刻意携带**结构化 body**（`SideCarBody`），而非预先措辞好的文本 |
 
-这个拆分是承重的。provider 只投影 text block，所以第一块必须是模型向原文。
+这个拆分是承重的。普通注入的第一块直接保存模型向原文；下述外置 `context_update` 则先由模型历史准备路径恢复完整 text，provider 不把持久摘要当作更新正文。
+
+### 具名动态上下文更新
+
+动态初始值在每代基线中声明，后续更新仍用已有 `sys` 消息/块存储，不另建 side-car 或日志。大更新已外置，持久行只保存摘要和快照引用：
+
+```ts
+[
+  { type: "text", text: "Context updated: workspace" },
+  { type: "context_update", epochId, changes: [], snapshotRef },
+]
+// snapshotRef → 既有 narrator_text_snapshots 中的冻结 JSON 载荷：
+// { changes: [{ key: "workspace", value: "/repo/b" }], modelText: frozenModelText }
+```
+
+- `buildRuntimeHistory` 在进入 provider 投影前调用 `hydrateContextUpdates`，从快照恢复完整 text 与 changes。`narrator-prefix-state` 增量归并本代新增的相关更新/工具事件；相同历史源或仅增加无关消息不重放旧更新，修订/非追加变化则重建。同一请求的协调与水合共享载荷，避免重复读取。持久行不内联全文，列表不展开正文；`snapshotRef` 登记块资产引用。
+- 旧版 `[{type:"text",text:frozenModelText},{type:"context_update",epochId,changes}]` 内联双块仍可读。恢复/重试使用原快照，不能根据实时配置重新生成模型正文。
+- 恢复后的 `changes` 是同名部分的完整替换；`null` 删除，空字符串合法，未提及的 key 保持当前值。引用行上的 `changes:[]` 只是载荷外置的占位，不能当作无变化。正文生成一次后冻结，元数据不再渲染成第二份文本。
+- 只有宿主 `sys` 行的结构化元素会解码成 `ContextBlock.contextUpdate`，并传入 `NeutralInputItem.contextUpdate`；普通用户文本中的 `<context_update>` 或同名结构不会变成可信宿主更新。
+- 基线明确授权这种具名动态状态替换，但不修改固定安全规则、不授予权限。权限、设备和 cwd 在执行端实时检查，不能由 prompt 快照反向决定。
+- provider 使用已有 user 宿主载体。Responses/Codex 不把更新抽进 `instructions`；Anthropic 不让 `ensureAlternating` 把更新移到后续 user 输入后。其余适配器复用同一份冻结正文，不各自生成文案。
+- 首次请求、后续轮次、重试共用 `preparePrefixRequest`：每次实际请求前协调当前状态，先持久化再进入统一历史构建。整条 prefix 准备链没有固定 10 秒总超时，历史源读取各有查询预算，真实 signal 可取消；失败重试和恢复重放原记录。已经发布 B 后再回 A 要追加 A，不删除 B；两次请求之间未发布的 A→B→A 不产生更新。
+- publication lease 保护“快照已写、历史引用尚未发布”的窗口；工具快照 manifest 引用逐定义 hash，分批读写并复用未变定义。后台 GC 按完整标记、宽限期和活动保护做保守清理，不在失败或畸形载荷时猜测无引用；关闭维护/存储会等待取消、队列收束和 worker 退出后才报告完成。
+- `senders` 部分保存同代首次见到的具名 human 用户名，未知名称以空值冻结；同代改名不改写模型历史，新身份可追加。显示名投影不改变持久行、身份或消息角色，不能将这一实现扩大描述成已冻结所有 agent 标题。
+- 显式加载与自动工具对账共用 `classifyToolAdditions`。replace-only/缺失策略不暗中升级成兼容注入：未声明的新工具只在 `tools.availability` 表明不可用，不写虚假 loaded 事件、不阻断其他工具。Anthropic 的卸载同样不发 removal；本代重新加载不重复声明 schema。
+- 首次初始化、清空上下文后的初始化建立基线；运行中只有 compact 成功和实际模型切换换代。cwd/device、配置、registry generation、工具加载、重启及缓存过期不换代。工具 description/schema 静态，动态候选与状态放在这些具名部分中。
+
+行为围栏、任务、知识命中等既有追加链保留单一来源，不同时写入另一份 `context_update`。这是本地状态与投影契约，不宣称 user 角色等同 system，也不保证上游缓存命中。
+
+两项边界仍然存在：Codex hosted 原生工具必须实时撤权，必要时移除声明并改变前缀，不能为了缓存继续授权；大请求没有总量业务门槛，但最终 wire 仍需物化字符串，并非完全流式。已测 83MB×3 并发出站 body 的 RSS 峰增为 873MiB、最大心跳间隔为 267ms，不能据此宣称上游接受此体积。普通小请求保持简单 JSON 构建，详细方法与观测见 [AGENT_PROVIDERS.md](AGENT_PROVIDERS.md)。
 
 ### 3.1 为什么 block 存 `body` 而不是 Markdown
 

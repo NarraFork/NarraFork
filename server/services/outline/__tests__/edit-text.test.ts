@@ -149,6 +149,62 @@ describe("link titles in reads", () => {
 	});
 });
 
+describe("merge", () => {
+	const merge = (base: string, mine: string, theirs: string) =>
+		runEditTextJob({ kind: "merge", merges: [{ base, mine, theirs }] })[0];
+
+	test("changes in different places both stay, with the links of the result", () => {
+		const m = merge(
+			"Intro. Tokens expire after an hour.",
+			"Intro, see [[Kx81mPqa/Ab3dEf9Q]]. Tokens expire after an hour.",
+			"Intro. Tokens expire after an hour. Refresh them early.",
+		);
+		expect(m).toEqual({
+			ok: true,
+			content: "Intro, see [[Kx81mPqa/Ab3dEf9Q]]. Tokens expire after an hour. Refresh them early.",
+			links: contentLinks(
+				"Intro, see [[Kx81mPqa/Ab3dEf9Q]]. Tokens expire after an hour. Refresh them early.",
+			),
+		});
+		// Nobody else changed the text: mine as it is; nothing changed by me: theirs as it is.
+		expect(merge("a b", "a c", "a b")).toMatchObject({ ok: true, content: "a c" });
+		expect(merge("a b", "a b", "a b c")).toMatchObject({ ok: true, content: "a b c" });
+	});
+
+	test("overlapping changes are refused with where they overlap in the base", () => {
+		const base = "one two three four";
+		const m = merge(base, "one TWO three FOUR", "one deux three four, five");
+		expect(m).toEqual({ ok: false, reason: "overlap", overlaps: [{ start: 4, end: 7 }] });
+		// Both inserting at one place overlap too (an empty range there).
+		const at = merge("a b", "a x b", "a y b");
+		expect(at).toMatchObject({ ok: false, reason: "overlap" });
+		if (!at.ok && at.reason === "overlap") expect(at.overlaps[0]?.start).toBe(at.overlaps[0]?.end);
+	});
+
+	test("a merged text that would not keep its form is refused", () => {
+		// Each side is canonical and the changes do not overlap, but together the escape before
+		// the bracket is no longer needed: the merged text would not be stored as merged.
+		for (const text of ["[", "x\\[[", "\\_"]) expect(normalizeBlock(text).content).toBe(text);
+		expect(normalizeBlock("x\\[\\_").content).toBe("x[\\_");
+		expect(merge("[", "x\\[[", "\\_")).toEqual({ ok: false, reason: "unstable" });
+	});
+
+	test("on the worker, merges give what they give inline", async () => {
+		const long = `${"A sentence about the design. ".repeat(60)}End.`;
+		const job: EditTextJob = {
+			kind: "merge",
+			merges: [
+				{ base: long, mine: `Start. ${long}`, theirs: `${long} Later.` },
+				{ base: "x y", mine: "x z", theirs: "x w" },
+			],
+		};
+		const inline = runEditTextJob(job);
+		expect(inline[0]).toMatchObject({ ok: true, content: `Start. ${long} Later.` });
+		expect(inline[1]).toMatchObject({ ok: false, reason: "overlap" });
+		expect(await processEditText(job, { worker: true })).toEqual(inline);
+	});
+});
+
 describe("runner", () => {
 	const big = serializeMarkdownOutline(
 		Array.from({ length: 60 }, (_, i) => ({

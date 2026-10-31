@@ -59,16 +59,22 @@ export function ComposerFullscreenModal({
 	const modalOptimize = usePromptOptimize({
 		narratorId: narratorId ?? "",
 		messageId,
+		ready: opened,
 		withContext: optimizeHook?.withContext,
 		textareaRef,
 		onOptimized: setText,
 	});
 	const cancelModalOptimize = modalOptimize.cancelOptimize;
+	const releaseModalOptimize = modalOptimize.releaseSurface;
+	// Closing the fullscreen view must NOT abort the optimization: the same draft is
+	// still open in the inline composer behind it, and the result belongs to that
+	// draft. Releasing only gives up this view's claim on the result — the explicit
+	// cancel button still calls `cancelOptimize`.
 	useEffect(() => {
-		if (!opened) cancelModalOptimize();
-	}, [opened, cancelModalOptimize]);
+		if (!opened) releaseModalOptimize();
+	}, [opened, releaseModalOptimize]);
 	const handleClose = () => {
-		cancelModalOptimize();
+		releaseModalOptimize();
 		onClose();
 	};
 

@@ -502,7 +502,6 @@ export const workspaceContextService = {
 									defaultDeviceId: deviceId,
 									workspaceRevision: current.revision,
 									workspaceContext: current,
-									apiConversationId: null,
 									updatedAt: new Date().toISOString(),
 								})
 								.where(and(eq(narrators.id, id), eq(narrators.workspaceRevision, old.revision)))
@@ -522,8 +521,6 @@ export const workspaceContextService = {
 					active._bashBeforeStatus?.clear();
 					if (active._gitTrackTimer) clearTimeout(active._gitTrackTimer);
 					active._gitTrackTimer = undefined;
-					active.conversationId = randomUUID();
-					active._resetUpstreamSessionOnNextRequest = true;
 				},
 				pause: () => {
 					const active = activeNarrators.get(id);
@@ -602,7 +599,6 @@ export const workspaceContextService = {
 								cwd: current.cwd,
 								workspaceRevision: current.revision,
 								workspaceContext: current,
-								apiConversationId: null,
 							})
 							.where(and(eq(narrators.id, id), eq(narrators.workspaceRevision, previous.revision)))
 							.returning({ id: narrators.id });
@@ -624,8 +620,6 @@ export const workspaceContextService = {
 				await updateActiveNarratorCwdAndSkillContext(id, current.cwd);
 				active._workspaceContext = current;
 				active._workspaceInstallFailed = false;
-				active.conversationId = randomUUID();
-				active._resetUpstreamSessionOnNextRequest = true;
 			},
 			pause: () => {
 				const active = activeNarrators.get(id);

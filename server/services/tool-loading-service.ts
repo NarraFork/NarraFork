@@ -3,9 +3,11 @@ import { type RoutineModeConfig, resolveEffectiveToolRoutineMode } from "@shared
 import { eq } from "drizzle-orm";
 import { db } from "../db";
 import { narrators, projects, users } from "../db/schema";
+import { classifyToolAdditions, type ToolDefinitionSnapshot } from "../lib/agent/tool-loading";
 import { toolRegistry } from "../lib/agent/tool-registry";
 import type { ToolContext, ToolDefinition } from "../lib/agent/types";
 import { getBuiltinToolNames, getBuiltinToolRoutines } from "../lib/builtin-routines";
+import { ValidationError } from "../lib/errors";
 import { getDisabledToolSet } from "../lib/narrator-custom-traits";
 import { getToolMessageWithParams, type Locale } from "../lib/prompt-i18n";
 import { policySourceIdOf } from "../lib/runtime-source";
@@ -403,6 +405,49 @@ export async function changeLoadedToolGroup(
 				}
 			}
 			if (!changed.length) return loaded ? "already_loaded" : "not_loaded";
+
+			// Freeze only the newly authorized definitions, before publishing their notice.
+			// Old load events keep their own snapshot; never rebuild them from the registry.
+			let definitionSnapshotRef: string | undefined;
+			if (loaded) {
+				const { snapshotToolDefinitions, toolLoadingEpochOf } = await import("./narrator-epochs");
+				const { narratorService } = await import("./narrator-service");
+				const history = await narratorService.getModelHistorySinceLastCompact(
+					narratorId,
+					undefined,
+					{ signal: context?.signal },
+				);
+				const epoch = await toolLoadingEpochOf(narratorId, history);
+				const { blocked } = classifyToolAdditions(epoch, changed);
+				if (blocked.length) {
+					throw new ValidationError(
+						`This model's current prefix epoch cannot append new tool definitions: ${blocked.join(", ")}. ` +
+							"Compact the conversation or switch models before loading these tools. No tools were loaded.",
+					);
+				}
+				const { putPrefixToolDefinitions } = await import("./narrator-prefix-snapshots");
+				const frozenByName = new Map<string, ToolDefinitionSnapshot>();
+				if (epoch?.prefix) {
+					for (const definition of epoch.definitionSnapshots ?? []) {
+						if (!frozenByName.has(definition.name)) frozenByName.set(definition.name, definition);
+					}
+				}
+				const definitions = changed.map((name) => {
+					const tool = catalog.byName.get(name);
+					if (!tool || !catalog.allowed(tool)) {
+						throw new Error(`Tool "${name}" is no longer available for loading.`);
+					}
+					return tool;
+				});
+				definitionSnapshotRef = await putPrefixToolDefinitions(
+					definitions.flatMap((tool) => {
+						// Authorization is live, but reloading a name cannot revise its first declaration.
+						const frozen = frozenByName.get(tool.name);
+						return frozen ? [frozen] : snapshotToolDefinitions([tool]);
+					}),
+					context?.signal,
+				);
+			}
 			if (group.marker) {
 				if (loaded) current.add(group.marker);
 				else current.delete(group.marker);
@@ -419,6 +464,7 @@ export async function changeLoadedToolGroup(
 				type: loaded ? ("tool_loaded" as const) : ("tool_unloaded" as const),
 				toolName: group.id,
 				toolNames: changed,
+				...(definitionSnapshotRef ? { definitionSnapshotRef } : {}),
 				text: loaded
 					? getToolMessageWithParams("toolLoaded", noticeLocale, {
 							toolName: group.id,
@@ -428,7 +474,15 @@ export async function changeLoadedToolGroup(
 			};
 			context?.signal.throwIfAborted();
 			context?.assertFinalExecutionPermission?.();
-			const msg = await narratorStore.appendToolChange(narratorId, block, undefined, [...current]);
+			const { withPrefixSnapshotPublication } = await import("./narrator-prefix-snapshots");
+			const msg = await withPrefixSnapshotPublication(
+				definitionSnapshotRef ? [definitionSnapshotRef] : [],
+				() => {
+					context?.assertFinalExecutionPermission?.();
+					return narratorStore.appendToolChange(narratorId, block, undefined, [...current]);
+				},
+				context?.signal,
+			);
 			if (group.marker) {
 				const selection = parseMcpToolMarker(group.marker);
 				const serverId = parseMcpServerMarker(group.marker);

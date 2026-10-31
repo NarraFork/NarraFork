@@ -12,6 +12,8 @@ import {
 	OUTLINE_READ_LIMITS,
 	outlineItem,
 	renderOutline,
+	renderOutlineSections,
+	sectionsBreadthFirst,
 	stripReadAnnotations,
 } from "../render";
 import { searchSnippet } from "../search";
@@ -280,6 +282,189 @@ describe("budgeted breadth-first rendering", () => {
 		});
 		expect(clampBudget({ blocks: 0, bytes: -5 })).toEqual({ blocks: 1, bytes: 1 });
 		expect(clampBudget({ blocks: Number.NaN })).toEqual(OUTLINE_READ_LIMITS.defaultBudget);
+	});
+});
+
+describe("sectioned rendering (the overview of several spaces)", () => {
+	const more = OUTLINE_TEXT.more;
+	/** Two pages: P1 with two blocks under it, P2 with one. */
+	const pages = (p: string) => [
+		tree({ content: `${p}1`, children: [leaf(`${p}1a`), leaf(`${p}1b`)] }).root,
+		tree({ content: `${p}2`, children: [leaf(`${p}2a`)] }).root,
+	];
+
+	test("every section's top level first, then the next level of all of them", () => {
+		const r = renderOutlineSections(
+			[
+				{ header: ["‹one›"], roots: pages("A"), footer: ["‹end of one›"] },
+				{ header: ["‹two›"], roots: pages("B") },
+				{ header: ["‹three›"], roots: [], footer: ["‹no pages yet›"] },
+			],
+			{ budget: { blocks: 5 }, notes: ["‹note›"] },
+		);
+		expect(r.markdown).toBe(
+			[
+				"‹one›",
+				"- A1",
+				"  - A1a",
+				`  ${more(1)}`,
+				"- A2",
+				`  ${more(1)}`,
+				"‹end of one›",
+				"‹two›",
+				"- B1",
+				`  ${more(2)}`,
+				"- B2",
+				`  ${more(1)}`,
+				"‹three›",
+				"‹no pages yet›",
+				"‹note›",
+			].join("\n"),
+		);
+		expect(r.hiddenByBudget).toBe(5);
+		expect(r.blockIds).toHaveLength(5);
+		// The order the content loader walks is the order the budget is spent in.
+		const order = sectionsBreadthFirst(
+			[
+				{ header: [], roots: pages("A") },
+				{ header: [], roots: pages("B") },
+			],
+			{ limit: 5 },
+		);
+		expect(order.map((n) => n.content)).toEqual(["A1", "A2", "B1", "B2", "A1a"]);
+	});
+
+	test("top-level blocks that do not fit are counted after a section's shown ones", () => {
+		const r = renderOutlineSections(
+			[
+				{ header: ["‹one›"], roots: pages("A") },
+				{ header: ["‹two›"], roots: pages("B") },
+			],
+			{ budget: { blocks: 3 } },
+		);
+		expect(r.markdown).toBe(
+			[
+				"‹one›",
+				"- A1",
+				`  ${more(2)}`,
+				"- A2",
+				`  ${more(1)}`,
+				"‹two›",
+				"- B1",
+				`  ${more(2)}`,
+				more(2),
+			].join("\n"),
+		);
+		expect(isReadAnnotation(more(2))).toBe(true);
+		expect(stripReadAnnotations(r.markdown)).toBe("- A1\n- A2\n- B1");
+	});
+
+	test("nothing is forced: what does not fit is only counted; headers always show", () => {
+		const r = renderOutlineSections([{ header: ["‹one›"], roots: pages("A") }], {
+			budget: { bytes: 1 },
+		});
+		expect(r.markdown).toBe(["‹one›", more(5)].join("\n"));
+		expect(r.blockIds).toEqual([]);
+	});
+
+	test("the byte budget holds past what always shows, and the counts add up", () => {
+		const sections = () => [
+			{ header: ["‹一›"], roots: pages("设计") },
+			{ header: ["‹二›"], roots: pages("文档") },
+		];
+		const full = renderOutlineSections(sections(), { budget: { blocks: 100, bytes: 100_000 } });
+		expect(full.hiddenByBudget).toBe(0);
+		// Headers and the lines counting what is left out are always there.
+		const fixed = renderOutlineSections(sections(), { budget: { bytes: 1 } }).bytes;
+		let previous = -1;
+		for (let bytes = fixed; bytes <= full.bytes + 10; bytes++) {
+			const r = renderOutlineSections(sections(), { budget: { blocks: 100, bytes } });
+			expect(r.bytes).toBeLessThanOrEqual(bytes);
+			expect(r.blockIds.length).toBeGreaterThanOrEqual(previous);
+			previous = r.blockIds.length;
+			expect(r.blockIds.length + r.hiddenByBudget).toBe(10);
+		}
+	});
+
+	test("round-robin: a small budget takes the top of every section first", () => {
+		const sections = () => [
+			{ header: ["‹one›"], roots: pages("A") },
+			{ header: ["‹two›"], roots: pages("B") },
+			{ header: ["‹three›"], roots: pages("C") },
+		];
+		const r = renderOutlineSections(sections(), { budget: { blocks: 4 }, interleave: true });
+		expect(r.markdown).toBe(
+			[
+				"‹one›",
+				"- A1",
+				`  ${more(2)}`,
+				"- A2",
+				`  ${more(1)}`,
+				"‹two›",
+				"- B1",
+				`  ${more(2)}`,
+				more(2),
+				"‹three›",
+				"- C1",
+				`  ${more(2)}`,
+				more(2),
+			].join("\n"),
+		);
+		expect(
+			sectionsBreadthFirst(sections(), { interleave: true, limit: 7 }).map((n) => n.content),
+		).toEqual(["A1", "B1", "C1", "A2", "B2", "C2", "A1a"]);
+		// The byte budget holds under interleaving too.
+		const full = renderOutlineSections(sections(), {
+			budget: { blocks: 100, bytes: 100_000 },
+			interleave: true,
+		});
+		const fixed = renderOutlineSections(sections(), { budget: { bytes: 1 }, interleave: true });
+		for (let bytes = fixed.bytes; bytes <= full.bytes; bytes++) {
+			const cut = renderOutlineSections(sections(), {
+				budget: { blocks: 100, bytes },
+				interleave: true,
+			});
+			expect(cut.bytes).toBeLessThanOrEqual(bytes);
+			expect(cut.blockIds.length + cut.hiddenByBudget).toBe(15);
+		}
+	});
+
+	test("a section can word the line about its top-level blocks left out", () => {
+		const moreTops = (hidden: { roots: number; blocks: number }) =>
+			`‹${hidden.roots + 3} more pages›`;
+		const r = renderOutlineSections([{ header: ["‹one›"], roots: pages("A"), moreTops }], {
+			budget: { blocks: 1 },
+		});
+		expect(r.markdown).toBe(["‹one›", "- A1", `  ${more(2)}`, "‹4 more pages›"].join("\n"));
+		expect(r.hiddenByBudget).toBe(4);
+		// Shown in full, the line still stands when the section says so, and fits the budget.
+		const all = renderOutlineSections([{ header: [], roots: pages("A"), moreTops }], {
+			budget: { blocks: 100 },
+		});
+		expect(all.markdown.endsWith("‹3 more pages›")).toBe(true);
+		const none = renderOutlineSections(
+			[{ header: [], roots: pages("A"), moreTops: (h) => (h.roots > 0 ? "‹more›" : null) }],
+			{ budget: { blocks: 100 } },
+		);
+		expect(none.markdown).not.toContain("more");
+	});
+
+	test("the facts view leaves out top-level tasks; labels are per section", () => {
+		const task = tree({ content: "A task page", task: "todo", children: [leaf("step")] }).root;
+		const r = renderOutlineSections(
+			[
+				{ header: ["‹one›"], roots: [task, ...pages("A")], label: (n) => `[${n.sid}]` },
+				{ header: ["‹two›"], roots: pages("B"), label: (n) => `[K/${n.sid}]` },
+			],
+			{ budget: { blocks: 4 } },
+		);
+		expect(r.hiddenByView).toBe(2);
+		expect(r.markdown).toContain("- [sb0] A1");
+		expect(r.markdown).toContain("- [K/sb0] B1");
+		expect(r.markdown).not.toContain("A task page");
+		expect(r.markdown.endsWith(OUTLINE_TEXT.factsOnly(2))).toBe(true);
+		const all = renderOutlineSections([{ header: [], roots: [task] }], { view: "all" });
+		expect(all.markdown).toBe("- [ ] A task page\n  - step");
 	});
 });
 

@@ -2,7 +2,6 @@ import { REASONING_EFFORT_VALUES, type ReasoningEffort } from "@shared/reasoning
 import { isSubagentReasoningEffort, SUBAGENT_POOL_TYPES } from "@shared/subagent-model-policy";
 import { z } from "zod/v4";
 import { resolvePath } from "../../platform-path";
-import { shouldUseNativeSearch } from "../../search/native";
 import { expandAllowedPoolForDisplay, getSubagentVisibleModels, settings } from "../../settings";
 import type { AgentConfig, ToolDefinition, ToolResult } from "../types";
 import { looseNumber, normalizeNumber } from "./number-param";
@@ -24,7 +23,7 @@ import baseDescription from "./task.txt" with { type: "text" };
 
 /** Build a dynamic model list string from all visible models. */
 function getAvailableModelsList(): string {
-	const models = getSubagentVisibleModels();
+	const models = getSubagentVisibleModels().slice().sort();
 	if (models.length > 0) {
 		return models.join(", ");
 	}
@@ -39,7 +38,10 @@ function filterSubagentModels(models: string[]): string[] {
 const MODEL_PARAM_BASE =
 	"Override the model for this subagent. Without an explicit model, a configured allowed model pool selects its first entry and pins the child independently. Without a pool, a selected per-type/custom model preference pins the child; otherwise it follows the parent narrator's current model, including later switches when resumed or before the next model request. Explicit models must also be allowed by the pool.";
 
-function getModelParameterDescription(config?: AgentConfig): string {
+/** Dynamic prompt context only; never used to construct tool definitions. */
+export function buildSubagentModelContext(
+	config?: Pick<AgentConfig, "subagentModelRestrictionDescription">,
+): string {
 	// Per-narrator custom restriction trait takes precedence and already describes the pools.
 	if (config?.subagentModelRestrictionDescription) {
 		return `${MODEL_PARAM_BASE}\n\n${config.subagentModelRestrictionDescription}`;
@@ -122,7 +124,7 @@ function buildParameters() {
 			timeout: looseNumber(
 				"Optional execution timeout for this subagent in milliseconds. Background runs default to 5 hours when omitted; use 0 for no wall-clock limit or provide any positive safe integer. This controls the Agent run itself, not Await waiting.",
 			),
-			model: z.string().optional().describe(getModelParameterDescription()),
+			model: z.string().optional().describe(MODEL_PARAM_BASE),
 			reasoning_effort: z
 				.enum(REASONING_EFFORT_VALUES)
 				.optional()
@@ -165,11 +167,7 @@ function buildParameters() {
 	);
 }
 
-function usesNativeWebSearch(config: AgentConfig): boolean {
-	return shouldUseNativeSearch(config.provider, config.model);
-}
-
-function buildRawJsonSchema(config?: AgentConfig): Record<string, unknown> {
+function buildRawJsonSchema(): Record<string, unknown> {
 	return {
 		type: "object" as const,
 		properties: {
@@ -198,7 +196,7 @@ function buildRawJsonSchema(config?: AgentConfig): Record<string, unknown> {
 				type: "number",
 			},
 			model: {
-				description: getModelParameterDescription(config),
+				description: MODEL_PARAM_BASE,
 				type: "string",
 			},
 			reasoning_effort: {
@@ -270,21 +268,9 @@ async function resolveArchiveTargetId(callerNarratorId: string, selector: string
 
 export const agentTool: ToolDefinition = {
 	name: "Agent",
-	description(config: AgentConfig) {
-		const description = `${baseDescription}\nTo cancel a running background agent, use Stop({ type: "agent", id }). Agent only launches, archives, or unarchives agents; it does not accept stop.`;
-		return usesNativeWebSearch(config)
-			? description.replaceAll("WebSearch", "web_search (native)")
-			: description;
-	},
-	get parameters() {
-		return buildParameters();
-	},
-	get rawJsonSchema() {
-		return buildRawJsonSchema();
-	},
-	getRawJsonSchema(config?: AgentConfig) {
-		return buildRawJsonSchema(config);
-	},
+	description: `${baseDescription}\nTo cancel a running background agent, use Stop({ type: "agent", id }). Agent only launches, archives, or unarchives agents; it does not accept stop. Consult the current model and tool-availability context for available models, search tools and runtime restrictions.`,
+	parameters: buildParameters(),
+	rawJsonSchema: buildRawJsonSchema(),
 	async execute(args, ctx): Promise<ToolResult> {
 		const raw = args as {
 			prompt?: string;

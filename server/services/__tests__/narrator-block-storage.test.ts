@@ -5,11 +5,30 @@
  */
 
 import { afterAll, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { assembleContent } from "@shared/narrator-blocks/storage";
+import { drizzle } from "drizzle-orm/bun-sqlite";
 import { z } from "zod/v4";
 import { cleanDb, getTestDb } from "../../../tests/setup";
+import { openSchemaCopyAt } from "../../../tests/sqlite-schema-image";
+import * as relations from "../../db/relations";
+import * as schema from "../../db/schema";
 
-const { db, sqlite } = getTestDb();
+const databaseRoot = mkdtempSync(join(tmpdir(), "nf-block-storage-database-"));
+const template = getTestDb();
+const sqlite = openSchemaCopyAt(template.sqlite, join(databaseRoot, "blocks.sqlite"));
+// Schema images omit triggers; dual-write and history invalidation need the real triggers.
+for (const trigger of template.sqlite
+	.query<{ sql: string }, []>(
+		"SELECT sql FROM sqlite_master WHERE type = 'trigger' AND sql IS NOT NULL",
+	)
+	.all())
+	sqlite.exec(trigger.sql);
+template.sqlite.close();
+sqlite.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 100");
+const db = drizzle({ client: sqlite, schema: { ...schema, ...relations } });
 const realDbModule = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 
@@ -21,10 +40,15 @@ const blockSync = await import("../narrator-block-sync");
 const turns = await import("../narrator-turns");
 const epochs = await import("../narrator-epochs");
 const { toolRegistry } = await import("../../lib/agent/tool-registry");
+const { clearModelHistorySourceCacheForTest } = await import(
+	"../agent-runtime/model-history-source"
+);
 
 const NOW = "2026-10-01T00:00:00.000Z";
 
-beforeEach(() => {
+beforeEach(async () => {
+	await (await import("../narrator-prefix-snapshots")).closePrefixSnapshotStore();
+	clearModelHistorySourceCacheForTest();
 	cleanDb(sqlite);
 	for (const id of ["n1", "n2"])
 		sqlite.run("INSERT INTO narrators (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)", [
@@ -34,10 +58,13 @@ beforeEach(() => {
 			NOW,
 		]);
 });
-afterAll(() => {
+afterAll(async () => {
+	await (await import("../narrator-prefix-snapshots")).closePrefixSnapshotStore();
 	blockSync.stopBlockSyncSweep();
+	clearModelHistorySourceCacheForTest();
 	mock.module("../../db", () => realDbModule);
 	sqlite.close();
+	rmSync(databaseRoot, { recursive: true, force: true });
 });
 
 interface BlockRow {
@@ -322,37 +349,36 @@ describe("epoch reconcile", () => {
 			})
 		).changed;
 
-	test("a cold cache opens an epoch only when the rebuild changes the tools", async () => {
+	test("cache age and tool loads never open another epoch", async () => {
 		await stepAt("2026-10-01T00:00:00.000Z");
 		expect(await reconcile([], "t", Date.parse("2026-10-01T00:00:01.000Z"))).toBe(true);
+		const baseline = await rows();
+		const initial = baseline.at(-1);
+		if (!initial) throw new Error("Expected the initial epoch marker");
+		expect(initial.contentJson).toMatchObject([
+			{ type: "epoch", epoch: { reason: "initial", target: "t", toolNames: [] } },
+		]);
 		const later = Date.parse("2026-10-01T01:00:00.000Z");
-		// Nothing was loaded inside the epoch: rebuilding gives the same bytes.
 		expect(await reconcile([], "t", later)).toBe(false);
-
 		await narratorStore.appendToolChange("n1", {
 			type: "tool_loaded",
 			toolName: "WebFetch",
 			toolNames: ["WebFetch"],
 			text: "loaded",
 		});
-		expect(await reconcile(["WebFetch"], "t", later)).toBe(true);
-		const marker = (await rows()).at(-1);
-		expect(marker?.contentJson).toEqual([
-			{
-				type: "epoch",
-				epoch: {
-					reason: "cold",
-					target: "t",
-					toolNames: ["WebFetch"],
-					registryRevision: toolRegistry.revision,
-				},
-			},
-		]);
-		// The new epoch froze the set; with the cache warm again nothing more is written.
+		const withLoad = await rows();
+		expect(await reconcile(["WebFetch"], "t", later)).toBe(false);
+		expect(await rows()).toEqual(withLoad);
+		expect(withLoad.slice(0, baseline.length)).toEqual(baseline);
+		expect(
+			withLoad
+				.filter((row) => (row.contentJson as { type?: string }[])[0]?.type === "epoch")
+				.map((row) => row.id),
+		).toEqual([initial.id]);
 		expect(await reconcile(["WebFetch"], "t", Date.parse("2026-10-01T00:00:01.000Z"))).toBe(false);
 	});
 
-	test("a same-name schema change opens a new epoch rather than rewriting its prefix", async () => {
+	test("legacy epoch recovery and same-name registry changes do not open epochs", async () => {
 		const { toolRegistry } = await import("../../lib/agent/tool-registry");
 		const name = "mcp__epoch_test__run";
 		const definition = {
@@ -382,8 +408,9 @@ describe("epoch reconcile", () => {
 						resolveTarget: target("t"),
 					})
 				).changed;
-			// A legacy SQLite epoch gets one names-only boundary, not repeated rewrites.
-			expect(await upgrade()).toBe(true);
+			const initialRows = await rows();
+			// Recovery preserves a legacy boundary rather than manufacturing a registry epoch.
+			expect(await upgrade()).toBe(false);
 			expect(await upgrade()).toBe(false);
 			toolRegistry.register({ ...definition, description: "new" });
 			expect(
@@ -399,23 +426,20 @@ describe("epoch reconcile", () => {
 						resolveTarget: target("t"),
 					})
 				).changed,
-			).toBe(true);
-			expect((await rows()).at(-1)?.contentJson).toMatchObject([
-				{
-					type: "epoch",
-					epoch: { reason: "manual", toolNames: [name], registryRevision: toolRegistry.revision },
-				},
-			]);
+			).toBe(false);
+			expect(await rows()).toEqual(initialRows);
 		} finally {
 			toolRegistry.unregister(name);
 		}
 	});
 
-	test("request history rebuild reconciles same-name schema changes before projecting definitions", async () => {
+	test("request history rebuild preserves the first schema despite a live registry replacement", async () => {
 		const { toolRegistry } = await import("../../lib/agent/tool-registry");
 		const { buildContextManagementHooks } = await import("../narrator-session");
 		const runtimeHistory = await import("../agent-runtime/history");
-		const { deriveToolLoadingState } = await import("../../lib/agent/tool-loading");
+		const { deriveToolLoadingState, selectRequestTools } = await import(
+			"../../lib/agent/tool-loading"
+		);
 		const realReconcile = epochs.reconcileEpoch;
 		const reconcileSpy = spyOn(epochs, "reconcileEpoch").mockImplementation((input) =>
 			realReconcile({ ...input, resolveTarget: target("request-test") }),
@@ -469,7 +493,14 @@ describe("epoch reconcile", () => {
 				}),
 			});
 			const first = await hooks.rebuildRequestHistory();
-			expect(first.toolLoading?.definitionSnapshots).toEqual([]);
+			const firstSnapshot = first.toolLoading?.definitionSnapshots?.find(
+				(tool) => tool.name === name,
+			);
+			expect(firstSnapshot).toEqual({
+				name,
+				description: definition.description,
+				parameters: definition.rawJsonSchema,
+			});
 			expect(first.toolCandidates?.find((tool) => tool.name === name)?.rawJsonSchema).toBe(
 				definition.rawJsonSchema,
 			);
@@ -477,15 +508,31 @@ describe("epoch reconcile", () => {
 			const replacement = { type: "object", properties: { updated: { type: "number" } } };
 			toolRegistry.register({ ...definition, rawJsonSchema: replacement });
 			const second = await hooks.rebuildRequestHistory();
-			expect(second.toolLoading?.definitionSnapshots).toEqual([]);
+			expect(second.toolLoading?.definitionSnapshots).toEqual(
+				first.toolLoading?.definitionSnapshots,
+			);
+			// Execution sees the live implementation, but the wire declaration stays frozen.
 			expect(second.toolCandidates?.find((tool) => tool.name === name)?.rawJsonSchema).toBe(
 				replacement,
 			);
-			expect(second.toolLoading?.epochMarkerId).not.toBe(first.toolLoading?.epochMarkerId);
-			expect((await rows()).length).toBeGreaterThan(firstRows.length);
-			expect((await rows()).at(-1)?.contentJson).toMatchObject([
-				{ type: "epoch", epoch: { toolNames: [name], registryRevision: toolRegistry.revision } },
-			]);
+			const firstWire = selectRequestTools(
+				first.toolCandidates ?? [],
+				first.toolLoading,
+				"replace_tools",
+			).tools;
+			const secondWire = selectRequestTools(
+				second.toolCandidates ?? [],
+				second.toolLoading,
+				"replace_tools",
+			).tools;
+			expect(epochs.snapshotToolDefinitions(secondWire)).toEqual(
+				epochs.snapshotToolDefinitions(firstWire),
+			);
+			expect(secondWire.find((tool) => tool.name === name)?.rawJsonSchema).toEqual(
+				definition.rawJsonSchema,
+			);
+			expect(second.toolLoading?.epochMarkerId).toBe(first.toolLoading?.epochMarkerId);
+			expect(await rows()).toEqual(firstRows);
 		} finally {
 			toolRegistry.unregister(name);
 			reconcileSpy.mockRestore();

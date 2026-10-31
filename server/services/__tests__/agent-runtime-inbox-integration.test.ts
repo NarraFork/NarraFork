@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import type { ComposerDocument } from "@shared/composer-document";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
 	backgroundTasks,
 	fileChangeExecutionSegments,
@@ -14,8 +14,9 @@ import {
 import { projectMessageSenderText } from "../../lib/agent/sender-projection";
 import { delegationRegistration } from "../../lib/validators/runtime-registration";
 
-const { db, sqlite } = getTestDb();
-mock.module("../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
+// Share the preload-isolated file-backed DB with the real prefix/history workers.
+const { db, sqlite } = await import("../../db");
+const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
 const ws = { ...(await import("../../websocket/narrator-ws")) };
 let failBroadcast = false;
 mock.module("../../websocket/narrator-ws", () => ({
@@ -104,6 +105,7 @@ beforeEach(async () => {
 		activeNarrators.delete(id);
 	}
 	backgroundOccupancyStore.resetForTests();
+	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
 	await backgroundOccupancyStore.start();
 	failBroadcast = false;
@@ -127,10 +129,10 @@ beforeEach(async () => {
 afterEach(async () => {
 	await backgroundOccupancyStore.flush();
 });
-afterAll(() => {
+afterAll(async () => {
 	for (const id of ["parent", "child", "sender"]) getExecutionOwner(id)?.release();
+	await closePrefixSnapshotStore();
 	backgroundOccupancyStore.resetForTests();
-	sqlite.close();
 });
 function delivery(recipient = "child", text = "same words") {
 	const id = `source-${++serial}`;

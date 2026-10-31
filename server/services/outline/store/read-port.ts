@@ -10,7 +10,12 @@
  *
  * This file imports nothing dialect-specific.
  */
-import type { OutlineLinkKind, OutlineLinkTargetKind, OutlineTaskJson } from "../model";
+import type {
+	OutlineActorKind,
+	OutlineLinkKind,
+	OutlineLinkTargetKind,
+	OutlineTaskJson,
+} from "../model";
 import type { OutlineBlockRow, OutlineCommitRow, OutlineLinkRow, OutlineVersionRow } from "./port";
 
 /** A live block of a page at some seq, without its content: what the tree is built from. */
@@ -23,6 +28,11 @@ export interface OutlineStructureRow {
 	taskJson: OutlineTaskJson | null;
 	/** `from_seq` of the version this row comes from (the block's `version_seq` when current). */
 	versionSeq: number;
+}
+
+/** A structure row with the page it is on (`listPagesStructure`). */
+export interface OutlinePageStructureRow extends OutlineStructureRow {
+	pageId: string;
 }
 
 /** One full-text query against the blocks of some spaces. */
@@ -51,6 +61,9 @@ export interface OutlineSearchRow {
 	 */
 	rank: number;
 }
+
+/** Versions of one block `findLastWrites` looks at, at most, newest first. */
+export const OUTLINE_LAST_WRITES_SCAN = 64;
 
 /** Characters of a page's content a page list reads: enough for its title. */
 export const OUTLINE_PAGE_HEAD_CHARS = 400;
@@ -95,6 +108,17 @@ export interface OutlineReadPort {
 		options: { asOf: number | null; limit: number },
 	): Promise<{ rows: OutlineStructureRow[]; truncated: boolean }>;
 	/**
+	 * The current live blocks of several pages in one read, without content, each with its page:
+	 * the rows of one page are contiguous (they come in page order). At most `limit` rows;
+	 * `truncated` when there are more, and then only the page of the last row may be cut short:
+	 * every other page in the result is whole, and a page missing from it was not reached (or
+	 * has no live blocks). One statement per 500 pages (`OUTLINE_SQL_CHUNK`), bounded by `limit`.
+	 */
+	listPagesStructure(
+		pageIds: readonly string[],
+		limit: number,
+	): Promise<{ rows: OutlinePageStructureRow[]; truncated: boolean }>;
+	/**
 	 * The version of each block valid at `seq` (`from_seq <= seq < to_seq`), or its open version
 	 * when `seq` is null. Blocks with no version at `seq` (created later) are left out.
 	 */
@@ -107,6 +131,27 @@ export interface OutlineReadPort {
 	listVersionContents(
 		keys: ReadonlyArray<{ blockId: string; fromSeq: number }>,
 	): Promise<Array<{ blockId: string; fromSeq: number; content: string | null }>>;
+	/**
+	 * The whole version of each block valid at its own seq (`from_seq <= seq < to_seq`, or open):
+	 * the version an agent read, which its edit is merged from. Blocks with no version then are
+	 * left out. Each key is one backward seek on the primary key (`block_id`, `from_seq`).
+	 */
+	listVersionsAtSeqs(
+		keys: ReadonlyArray<{ blockId: string; seq: number }>,
+	): Promise<OutlineVersionRow[]>;
+	/**
+	 * For each block, its latest version after `afterSeq` that counts, with its change flags.
+	 * Left out: `except.actor`'s versions whose change flags lie within `except.flags` (every
+	 * flag: none of the actor's versions count; a move's flags: its moves do not), and anyone's
+	 * whose flags lie within `except.anyoneFlags` (default none). Blocks without one are left out.
+	 * At most {@link OUTLINE_LAST_WRITES_SCAN} of a block's newest versions after `afterSeq` are
+	 * looked at, backwards on the primary key and joined to their commits by id: a block with
+	 * more, none of which counts, comes back with `fromSeq` null (unknown: assume the worst).
+	 */
+	findLastWrites(
+		keys: ReadonlyArray<{ blockId: string; afterSeq: number }>,
+		except: { actorKind: OutlineActorKind; actorId: string; flags: number; anyoneFlags?: number },
+	): Promise<Array<{ blockId: string; fromSeq: number | null; changeFlags: number | null }>>;
 	/** Links of the given blocks and kinds valid at `seq` (`null`: open links), at most `limit`. */
 	listLinksAt(
 		blockIds: readonly string[],

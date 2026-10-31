@@ -16,6 +16,9 @@
 import type { TextCitation } from "../citations";
 import type { FileReference } from "../file-reference";
 import type { MessageOrigin } from "../message-origin";
+import type { ContextUpdate } from "../prefix-context";
+
+export type { ContextUpdate } from "../prefix-context";
 
 /** Who wrote a block and how it came to be (§3.3). */
 export type BlockKind = "input" | "output" | "reasoning" | "tool" | "context";
@@ -197,6 +200,8 @@ export interface ContextBlock extends BlockBase {
 	 * carries for the current tool loading strategy (see server tool-loading).
 	 */
 	toolChange?: ToolChange;
+	/** Typed host update; its frozen model text is stored separately, exactly once. */
+	contextUpdate?: ContextUpdate;
 }
 
 /** Tools surfaced or withdrawn at one history position. */

@@ -23,6 +23,7 @@ import { getExecutionOwner } from "../agent-runtime/ownership";
 import { getRuntimePublicationService, runtimePublication } from "../agent-runtime/publication";
 import { listDeliveringRuns, startNarratorRun } from "../agent-runtime/run";
 import { backgroundTaskService } from "../background-task-service";
+import { closePrefixSnapshotStore } from "../narrator-prefix-snapshots";
 import * as session from "../narrator-session";
 import { activeNarrators } from "../narrator-session-state";
 
@@ -44,12 +45,13 @@ const unregisterProvider = registerExternalProviderResolver({
 
 runtimePublication.stop();
 const created: string[] = [];
-afterEach(() => {
+afterEach(async () => {
 	for (const id of created.splice(0)) {
 		getExecutionOwner(id)?.release();
 		activeNarrators.delete(id);
 	}
 	runtimePublication.setWake(undefined);
+	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
 });
 afterAll(() => unregisterProvider());

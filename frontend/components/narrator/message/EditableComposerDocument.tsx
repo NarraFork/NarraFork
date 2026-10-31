@@ -95,12 +95,13 @@ export function EditableComposerDocument(props: EditableComposerDocumentProps) {
 		narratorId: props.narratorId ?? "",
 		messageId: props.messageId,
 		textareaRef: unusedTextarea,
-		target: () => {
+		ready: !!document,
+		target: (snapshot) => {
 			if (latest.current.disabled || inserting.current) return null;
-			const target = composerOptimizeTarget(editor.current);
+			const target = composerOptimizeTarget(editor.current, snapshot);
 			return target
 				? {
-						text: target.text,
+						...target,
 						apply: (text) => !latest.current.disabled && !inserting.current && target.apply(text),
 					}
 				: null;

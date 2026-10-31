@@ -6,9 +6,15 @@ import * as requestTracker from "../../lib/api-request-tracker";
 import * as prompts from "../../lib/prompt-i18n";
 import { settings } from "../../lib/settings";
 import { narratorService } from "../narrator-service";
-import * as specReminder from "../spec-reminder";
+import type { NarratorTaskSource } from "../task-source";
+import * as taskSource from "../task-source";
 
 const { narratorContext } = await import("../narrator-context");
+
+/** Compact reads only `compactContext` from the narrator's task source. */
+function compactOnlyTaskSource(compactContext: () => Promise<string | null>): NarratorTaskSource {
+	return { compactContext } as unknown as NarratorTaskSource;
+}
 
 const originalSummarizeChunk = narratorContext._summarizeChunk.bind(narratorContext);
 const summaryCalls: number[] = [];
@@ -145,7 +151,7 @@ describe("question inputs in actual summary provider requests", () => {
 	let history: ReturnType<typeof spyOn<typeof narratorService, "getModelHistorySinceLastCompact">>;
 	let resolve: ReturnType<typeof spyOn<typeof provider, "resolveProviderAndModel">>;
 	let tracking: ReturnType<typeof spyOn<typeof requestTracker, "trackApiRequest">>;
-	let spec: ReturnType<typeof spyOn<typeof specReminder, "buildSpecCompactContext">>;
+	let spec: ReturnType<typeof spyOn<typeof taskSource, "taskSourceForNarrator">>;
 
 	function sourceRows(sdkOriginal: boolean, legacyString = false) {
 		const executionInput = {
@@ -224,7 +230,9 @@ describe("question inputs in actual summary provider requests", () => {
 		tracking = spyOn(requestTracker, "trackApiRequest").mockImplementation(async (_options, fn) =>
 			fn(),
 		);
-		spec = spyOn(specReminder, "buildSpecCompactContext").mockResolvedValue("");
+		spec = spyOn(taskSource, "taskSourceForNarrator").mockResolvedValue(
+			compactOnlyTaskSource(async () => ""),
+		);
 	});
 
 	afterEach(() => {
@@ -392,7 +400,7 @@ describe("compact small positive budgets use actual request capacity", () => {
 	let getNarrator: ReturnType<typeof spyOn<typeof narratorService, "getById">>;
 	let prompt: ReturnType<typeof spyOn<typeof prompts, "getPrompt">>;
 	let toolHint: ReturnType<typeof spyOn<typeof prompts, "getToolMessage">>;
-	let spec: ReturnType<typeof spyOn<typeof specReminder, "buildSpecCompactContext">>;
+	let spec: ReturnType<typeof spyOn<typeof taskSource, "taskSourceForNarrator">>;
 
 	beforeEach(() => {
 		previousSummary = "";
@@ -405,8 +413,8 @@ describe("compact small positive budgets use actual request capacity", () => {
 		})) as never);
 		prompt = spyOn(prompts, "getPrompt").mockReturnValue("Compact instructions");
 		toolHint = spyOn(prompts, "getToolMessage").mockReturnValue("");
-		spec = spyOn(specReminder, "buildSpecCompactContext").mockImplementation(
-			async () => specContext,
+		spec = spyOn(taskSource, "taskSourceForNarrator").mockImplementation(async () =>
+			compactOnlyTaskSource(async () => specContext),
 		);
 		generate = spyOn(agent, "summaryGenerate").mockResolvedValue({ text: "Retained summary" });
 	});

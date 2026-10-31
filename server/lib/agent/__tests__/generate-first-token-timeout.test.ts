@@ -35,6 +35,20 @@ describe("generation first-token timeout", () => {
 		});
 	}
 
+	test("tool-output progress clears the timer without inventing text", async () => {
+		const result = await generateWithFirstTokenTimeout(
+			async (options) => {
+				await options.onGenerationProgress?.();
+				await wait(40);
+				expect(options.signal?.aborted).toBe(false);
+				return "tool result";
+			},
+			10,
+			new AbortController().signal,
+		);
+		expect(result).toBe("tool result");
+	});
+
 	test("empty output does not clear the first-token deadline", async () => {
 		await expect(
 			generateWithFirstTokenTimeout(
