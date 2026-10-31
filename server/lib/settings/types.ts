@@ -678,6 +678,21 @@ export interface NarraForkSettings {
 		 * 键同样是带前缀的完整模型 ID；删除键即恢复继承 provider 层写的协议。
 		 */
 		modelProtocolOverrides?: Record<string, ModelProtocol>;
+		/**
+		 * 「平台集成」的实例清单。同一平台可以有多个实例，靠 `prefix` 区分（模型 ID 为
+		 * `<prefix>:<model>`）；为空时回退到旧的单例字段（codex / commandCode / TokenDance）。
+		 * `prefix` 全局唯一，`suffix` 是用户可改的后缀（空串表示沿用平台默认前缀）。
+		 */
+		platformInstances?: Array<{
+			id: string;
+			platform: "codex" | "CommandCode" | "tokendance";
+			name: string;
+			suffix: string;
+			prefix: string;
+			disabled: boolean;
+			/** 各平台原有的配置形状；迁移时从旧单例复制。 */
+			config: Record<string, unknown>;
+		}>;
 		maxTurns: number;
 		subagentModels: {
 			explore: string;
