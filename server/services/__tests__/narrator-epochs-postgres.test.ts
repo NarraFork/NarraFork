@@ -1,12 +1,36 @@
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import type { DbMessage } from "@shared/agent-protocol/types";
 import { z } from "zod/v4";
-import type { EpochRecord } from "../../lib/agent/tool-loading";
+import type { EpochRecord, ToolDefinitionSnapshot } from "../../lib/agent/tool-loading";
 import { toolRegistry } from "../../lib/agent/tool-registry";
 
 const realDb = { ...(await import("../../db")) };
 await import("../narrator-service");
 const realStore = { ...(await import("../narrator-store")) };
+const realSnapshots = { ...(await import("../narrator-prefix-snapshots")) };
+const snapshots = new Map<string, ToolDefinitionSnapshot[]>();
+// This suite mocks PG query/publication behavior, not a connection. Real PG snapshot
+// roundtrips and GC are covered by narrator-prefix-tool-snapshots.test.ts.
+mock.module("../narrator-prefix-snapshots", () => ({
+	...realSnapshots,
+	putPrefixToolDefinitions: async (definitions: readonly ToolDefinitionSnapshot[]) => {
+		const hash = new Bun.CryptoHasher("sha256").update(JSON.stringify(definitions)).digest("hex");
+		snapshots.set(hash, structuredClone([...definitions]));
+		return hash;
+	},
+	getPrefixToolDefinitions: async (hash: string) => {
+		const definitions = snapshots.get(hash);
+		if (!definitions) throw new Error(`Missing test snapshot: ${hash}`);
+		return definitions;
+	},
+	withPrefixSnapshotPublication: async <T>(
+		hashes: readonly string[],
+		publish: () => Promise<T>,
+	) => {
+		for (const hash of hashes) expect(snapshots.has(hash)).toBe(true);
+		return publish();
+	},
+}));
 let compactEpoch: EpochRecord | undefined;
 let markers: EpochRecord[] = [];
 let failWrite = false;
@@ -67,7 +91,7 @@ const input = (messages: DbMessage[] = [], candidates = [definition]) => ({
 	model: "test",
 	provider: "test",
 	noticeText: () => "notice",
-	resolveTarget: () => ({ fingerprint: "test", cacheTtlMs: null }),
+	resolveTarget: (model: string) => ({ fingerprint: model, cacheTtlMs: null }),
 });
 const changed = async (...args: Parameters<typeof reconcileEpoch>) =>
 	(await reconcileEpoch(...args)).changed;
@@ -85,12 +109,14 @@ beforeEach(() => {
 	failWrite = false;
 	markers = [];
 	reads = [];
+	snapshots.clear();
 	toolRegistry.register(definition);
 });
 afterAll(() => {
 	toolRegistry.unregister(name);
 	mock.module("../../db", () => realDb);
 	mock.module("../narrator-store", () => realStore);
+	mock.module("../narrator-prefix-snapshots", () => realSnapshots);
 	mock.restore();
 });
 
@@ -98,31 +124,32 @@ describe("PostgreSQL MCP epochs", () => {
 	test("failed epoch writes stop assembly without changing the saved boundary", async () => {
 		await reconcileEpoch(input());
 		const history = markerRows();
-		const changedCandidates = [{ ...definition, description: "changed" }];
-		toolRegistry.register(changedCandidates[0]);
+		const switched = { ...input(history), model: "new-model" };
 		failWrite = true;
-		await expect(reconcileEpoch(input(history, changedCandidates))).rejects.toThrow(
-			"Could not save the tool epoch",
-		);
+		await expect(reconcileEpoch(switched)).rejects.toThrow("Could not save the tool epoch");
 		expect(markers).toHaveLength(1);
 		failWrite = false;
-		expect(await changed(input(history, changedCandidates))).toBe(true);
+		expect(await changed(switched)).toBe(true);
+		expect(markers[1]).toMatchObject({ reason: "target", target: "new-model" });
 	});
 
-	test("resident tools keep a small stable epoch until the registry changes", async () => {
+	test("registry changes preserve the epoch and its frozen definitions", async () => {
 		const opened = await reconcileEpoch(input());
 		expect(opened).toMatchObject({ changed: true, opened: true, epoch: { markerId: "epoch-0" } });
-		expect(markers[0]).toEqual({
-			reason: "manual",
+		expect(markers[0]).toMatchObject({
+			reason: "initial",
 			target: "test",
 			toolNames: [name],
 			registryRevision: toolRegistry.revision,
 		});
 		expect(await changed(input(markerRows()))).toBe(false);
 		toolRegistry.register({ ...definition, description: "updated schema" });
-		expect(await changed(input(markerRows()))).toBe(true);
-		expect(await changed(input(markerRows()))).toBe(false);
-		expect(markers[1].definitionSnapshots).toBeUndefined();
+		const resumed = await reconcileEpoch(input(markerRows()));
+		expect(resumed.changed).toBe(false);
+		expect(markers).toHaveLength(1);
+		expect(resumed.epoch?.definitionSnapshots).toEqual([
+			{ name, description: "original", parameters: definition.rawJsonSchema },
+		]);
 	});
 
 	test("the request's captured revision is not replaced after an async boundary", async () => {
@@ -131,10 +158,10 @@ describe("PostgreSQL MCP epochs", () => {
 		await reconcileEpoch(captured);
 		expect(markers[0].registryRevision).toBe(captured.registryRevision);
 		expect(markers[0].registryRevision).not.toBe(toolRegistry.revision);
-		expect(await changed(input(markerRows()))).toBe(true);
+		expect(await changed(input(markerRows()))).toBe(false);
 	});
 
-	test("legacy compact snapshots remain readable, then migrate once to a names-only epoch", async () => {
+	test("legacy compact snapshots remain readable without dropping frozen content", async () => {
 		compactEpoch = {
 			reason: "compact",
 			target: "test",
@@ -146,29 +173,36 @@ describe("PostgreSQL MCP epochs", () => {
 		expect((await toolLoadingEpochOf("pg-narrator", []))?.definitionSnapshots).toEqual(
 			compactEpoch.definitionSnapshots,
 		);
-		expect(await changed(input())).toBe(true);
-		expect(markers[0].definitionSnapshots).toBeUndefined();
-		expect(await changed(input(markerRows()))).toBe(false);
+		const resumed = await reconcileEpoch(input());
+		expect(resumed.changed).toBe(false);
+		expect(resumed.epoch?.definitionSnapshots).toEqual(compactEpoch.definitionSnapshots);
+		expect(markers).toHaveLength(0);
 	});
 
-	test("restart opens one new epoch even when tool names are unchanged", async () => {
+	test("restart and cache expiry do not open another epoch", async () => {
 		compactEpoch = {
 			reason: "compact",
 			target: "test",
 			toolNames: [name],
 			registryRevision: "previous-process:7",
 		};
-		expect(await changed(input())).toBe(true);
-		expect(await changed(input(markerRows()))).toBe(false);
-		expect(markers).toHaveLength(1);
+		expect(await changed(input())).toBe(false);
+		expect(
+			await changed({
+				...input(),
+				now: Number.MAX_SAFE_INTEGER,
+				resolveTarget: () => ({ fingerprint: "test", cacheTtlMs: 1 }),
+			}),
+		).toBe(false);
+		expect(markers).toHaveLength(0);
 	});
 
-	test("empty managed tools share one result without epoch reads or writes", async () => {
+	test("empty managed tools still establish and reuse a baseline epoch", async () => {
 		const empty = { ...input(), managed: new Set<string>(), current: [] };
 		const first = await reconcileEpoch(empty);
-		expect(await reconcileEpoch(empty)).toBe(first);
-		expect(first).toEqual({ changed: false, epoch: undefined });
-		expect(reads).toEqual([]);
-		expect(markers).toEqual([]);
+		expect(first).toMatchObject({ changed: true, opened: true, epoch: { toolNames: [] } });
+		expect(await changed({ ...empty, messages: markerRows() })).toBe(false);
+		expect(reads).toContain("epoch");
+		expect(markers).toHaveLength(1);
 	});
 });

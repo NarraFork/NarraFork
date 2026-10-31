@@ -28,7 +28,8 @@ export type OutlineChange =
 	| "restore"
 	| "task"
 	| "page"
-	| "props";
+	| "props"
+	| "merge";
 
 /** Why a revert left a block as it is. */
 export type OutlineRevertSkipReason = "changed-later" | "parent-gone" | "later-children" | "cycle";

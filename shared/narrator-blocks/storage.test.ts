@@ -74,6 +74,17 @@ const SHAPES: Record<string, DecodableMessage> = {
 		],
 		{ contentText: "Spec changed" },
 	),
+	"context update with frozen text and typed metadata": message("sys", [
+		{ type: "text", text: "frozen update" },
+		{
+			type: "context_update",
+			epochId: "epoch-1",
+			changes: [
+				{ key: "workspace", value: "/repo/b" },
+				{ key: "removed", value: null },
+			],
+		},
+	]),
 	"malformed elements": message("assistant", [null, "stray", { type: "text", text: "ok" }, 7]),
 	"assistant without decodable blocks": message("assistant", [{ type: "info", message: "x" }]),
 	"empty assistant step": message("assistant", []),

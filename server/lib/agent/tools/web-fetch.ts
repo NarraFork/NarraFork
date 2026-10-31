@@ -3,9 +3,8 @@ import { resolve } from "node:path";
 import { z } from "zod/v4";
 import { generateShortId } from "../../id";
 import { logger } from "../../logger";
-import { shouldUseNativeSearch } from "../../search/native";
 import { createShare, getShareDir, SCREENSHOT_PREVIEW_EXPIRY_HOURS } from "../../shares";
-import type { AgentConfig, ToolDefinition, ToolResult } from "../types";
+import type { ToolDefinition, ToolResult } from "../types";
 import { looseNumber, normalizeNumber } from "./number-param";
 
 const MODES = ["readability", "screenshot", "dom", "smart"] as const;
@@ -27,12 +26,7 @@ const WEB_FETCH_BODY =
 
 export const webFetchTool: ToolDefinition = {
 	name: "WebFetch",
-	description(config: AgentConfig) {
-		const intro = shouldUseNativeSearch(config.provider, config.model)
-			? "Fetch and extract content from a web page URL. Use this after the native web_search tool to get detailed content from specific URLs."
-			: "Fetch and extract content from a web page URL. Use this after WebSearch to get detailed content from specific URLs.";
-		return `${intro}\n\n${WEB_FETCH_BODY}`;
-	},
+	description: `Fetch and extract content from a web page URL. Use this after an available web search tool to get detailed content from specific URLs.\n\n${WEB_FETCH_BODY}`,
 	rawJsonSchema: {
 		type: "object",
 		properties: {

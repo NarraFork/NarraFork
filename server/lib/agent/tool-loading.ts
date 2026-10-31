@@ -18,22 +18,22 @@
  *   - `custom_injection` — the JSON schema is written into the load notice itself,
  *     for endpoints that do not validate tool names against the declared list.
  *
- * Everything else (`replace_tools`) keeps the old behaviour: the array follows the
- * loaded set and the cache is lost. A new epoch (a compact, or an epoch marker row the
- * runtime writes when the target changes or the cache has gone cold) folds the loads
- * before it into the array.
+ * `replace_tools` remains readable for legacy callers; a persisted prefix epoch never
+ * rewrites its declared array, including on targets without additive loading. Only
+ * compact or a model change folds accumulated declarations into a new baseline.
  *
  * An epoch that recorded its loaded set (`ToolLoadingEpoch`) fixes the array's share for
  * its whole length; a change that bypassed `/load` is reconciled into the history as a
  * notice row instead (docs/BLOCK_STORAGE-DESIGN.md §7.7). Without one, the share is
  * derived backwards from the current set.
  *
- * Unloading never shrinks the array within an epoch; the executor rejects a call to
- * an unloaded tool instead, and the Anthropic modes also send a `tool_removal` block.
+ * Unloading never shrinks or removes a declaration within an epoch. Its notice changes
+ * availability and the executor rejects unloaded tools; reloading does not repeat schemas.
  */
 
 import type { DbMessage } from "@shared/agent-protocol/types";
 import { parseModelId } from "@shared/model-id";
+import type { PrefixSnapshot } from "@shared/prefix-context";
 import {
 	bareModelForEffort,
 	claudeVersionAtLeast,
@@ -200,7 +200,7 @@ function staticLoadableToolDefinition(
 	tool: ToolDefinition | undefined,
 ): ResolvedToolDefinition | null {
 	if (!tool || (tool.isAvailable && !tool.isAvailable())) return null;
-	if (typeof tool.description !== "string" || tool.getRawJsonSchema) return null;
+	if (typeof tool.description !== "string") return null;
 	return { ...tool, description: tool.description };
 }
 
@@ -251,6 +251,8 @@ export interface ToolLoadingEvent {
  */
 export interface ToolLoadingState {
 	managed: ReadonlySet<string>;
+	/** Transport declarations include formerly unavailable built-ins; execution loading stays separate. */
+	eventTools?: ReadonlySet<string>;
 	/**
 	 * The epoch marker row the history's epoch opened at; rows up to and including it
 	 * belong to an earlier epoch, whose loads only keep their notice text.
@@ -265,12 +267,18 @@ export interface ToolLoadingState {
 	/** Same request's candidates, never persisted or read from a later registry view. */
 	candidates?: readonly ToolDefinition[];
 	registryRevision?: string;
-	/** Legacy inline definitions; new epochs keep only names and registryRevision. */
+	/** Frozen declarations, hydrated from shared content-addressed snapshots. */
 	definitionSnapshots?: ToolDefinitionSnapshot[];
+	/** Exact declaration order captured at the beginning of a prefix epoch. */
+	baseToolNames?: readonly string[];
+	strategy?: ToolLoadingStrategy;
+	/** Process-local keepalive for shared prefix cache state; never an authorization grant. */
+	prefixState?: object;
 }
 
 /** The loaded set an epoch froze when it opened, and where it opened. */
 export interface ToolLoadingEpoch {
+	reason?: EpochRecord["reason"];
 	/** The marker row inside the history; absent when the epoch opens at its start. */
 	markerId?: string;
 	/** Optional tools loaded when the epoch opened (any tool; managed ones are kept). */
@@ -278,8 +286,34 @@ export interface ToolLoadingEpoch {
 	/** Cache lifecycle identifier, not an execution identity. */
 	registryRevision?: string;
 	definitionSnapshots?: ToolDefinitionSnapshot[];
+	prefix?: PrefixSnapshot;
+	compactMessageId?: string | null;
+	baseToolNames?: readonly string[];
+	strategy?: ToolLoadingStrategy;
+	/** Process-local keepalive; deliberately absent from the persisted EpochRecord. */
+	prefixState?: object;
 	/** The request target the epoch opened for (`resolveEpochTarget`), when recorded. */
 	target?: string;
+}
+
+/**
+ * Classify proposed loads against the strategy already published for this prefix.
+ * Missing/replace strategies cannot gain implicit custom injection: they may reflect
+ * an explicit tool_loading_modes=[] policy. Existing declarations can still be re-enabled.
+ * Return per-tool results so automatic reconciliation can continue unrelated work.
+ */
+export function classifyToolAdditions(
+	epoch: Pick<ToolLoadingEpoch, "prefix" | "strategy" | "baseToolNames" | "toolNames"> | undefined,
+	names: readonly string[],
+): { allowed: string[]; blocked: string[] } {
+	if (!epoch?.prefix || (epoch.strategy && epoch.strategy !== "replace_tools")) {
+		return { allowed: [...names], blocked: [] };
+	}
+	const declared = new Set(epoch.baseToolNames ?? epoch.toolNames);
+	const allowed: string[] = [];
+	const blocked: string[] = [];
+	for (const name of names) (declared.has(name) ? allowed : blocked).push(name);
+	return { allowed, blocked };
 }
 
 /** A persisted epoch boundary failed; do not fall back to a transcript from the old epoch. */
@@ -291,11 +325,16 @@ export class ToolEpochError extends Error {
 }
 /** What an epoch marker records (§7.7); a compact element carries the same as `epoch`. */
 export interface EpochRecord {
-	reason: "compact" | "target" | "cold" | "manual";
+	/** cold/manual remain readable for legacy rows; new boundaries use initial/compact/target. */
+	reason: "initial" | "compact" | "target" | "cold" | "manual";
 	target?: string;
 	toolNames: string[];
 	registryRevision?: string;
 	definitionSnapshots?: ToolDefinitionSnapshot[];
+	prefix?: PrefixSnapshot;
+	compactMessageId?: string | null;
+	baseToolNames?: string[];
+	strategy?: ToolLoadingStrategy;
 }
 
 /** The epoch a stored element opens: a marker `{type:"epoch"}` or a compact with `epoch`. */
@@ -313,6 +352,16 @@ export function epochRecordOf(block: unknown): EpochRecord | undefined {
 			? { registryRevision: epoch.registryRevision }
 			: {}),
 		definitionSnapshots: readSnapshots(epoch.definitionSnapshots),
+		...(epoch.compactMessageId === null || typeof epoch.compactMessageId === "string"
+			? { compactMessageId: epoch.compactMessageId }
+			: {}),
+		...(epoch.prefix && typeof epoch.prefix === "object"
+			? { prefix: epoch.prefix as PrefixSnapshot }
+			: {}),
+		...(Array.isArray(epoch.baseToolNames) ? { baseToolNames: epoch.baseToolNames } : {}),
+		...(typeof epoch.strategy === "string"
+			? { strategy: epoch.strategy as ToolLoadingStrategy }
+			: {}),
 	};
 }
 
@@ -326,10 +375,15 @@ export function latestToolLoadingEpoch(
 		const epoch = epochRecordOf(message.contentJson[0]);
 		if (epoch)
 			return {
+				reason: epoch.reason,
 				markerId: message.id,
 				toolNames: epoch.toolNames,
 				registryRevision: epoch.registryRevision,
 				definitionSnapshots: epoch.definitionSnapshots,
+				prefix: epoch.prefix,
+				compactMessageId: epoch.compactMessageId,
+				baseToolNames: epoch.baseToolNames,
+				strategy: epoch.strategy,
 				...(epoch.target ? { target: epoch.target } : {}),
 			};
 	}
@@ -370,14 +424,6 @@ function epochRows(messages: readonly DbMessage[], markerId: string | undefined)
 	return index === -1 ? messages : messages.slice(index + 1);
 }
 
-/**
- * The loading state of the history's current epoch.
- *
- * With an epoch that froze its loaded set, that set is the array's share. Without one,
- * the epoch's events are replayed backwards from the current set to find what was
- * loaded when it opened, so loads with no notice row (resident tools, creation-time
- * preloads, fork inheritance) land in `base`.
- */
 export function deriveToolLoadingState(
 	messages: readonly DbMessage[],
 	managed: ReadonlySet<string>,
@@ -385,47 +431,57 @@ export function deriveToolLoadingState(
 	epoch?: ToolLoadingEpoch,
 	candidates?: readonly ToolDefinition[],
 ): ToolLoadingState {
-	const events = epochRows(messages, epoch?.markerId).flatMap(
-		(message) => toolLoadingEventOf(message, managed) ?? [],
-	);
+	const rows = epochRows(messages, epoch?.markerId);
+	const eventTools = epoch?.baseToolNames
+		? new Set([
+				...managed,
+				...epoch.baseToolNames,
+				...(candidates?.map((tool) => tool.name) ?? []),
+				...(epoch.definitionSnapshots?.map((tool) => tool.name) ?? []),
+			])
+		: managed;
+	const events = rows.flatMap((message) => toolLoadingEventOf(message, eventTools) ?? []);
 	const currentSet = new Set([...current].filter((name) => managed.has(name)));
-	const base = epoch
-		? new Set(epoch.toolNames.filter((name) => managed.has(name)))
-		: new Set(currentSet);
-	if (!epoch)
+	if (epoch?.baseToolNames) {
+		for (const tool of candidates ?? []) if (!managed.has(tool.name)) currentSet.add(tool.name);
+	}
+	const base = epoch?.baseToolNames
+		? new Set(epoch.baseToolNames)
+		: epoch
+			? new Set(epoch.toolNames.filter((name) => managed.has(name)))
+			: new Set(currentSet);
+	if (!epoch) {
 		for (let index = events.length - 1; index >= 0; index--) {
-			const event = events[index];
-			for (const name of event.tools) {
-				if (event.kind === "load") base.delete(name);
+			for (const name of events[index].tools) {
+				if (events[index].kind === "load") base.delete(name);
 				else base.add(name);
 			}
 		}
-	const loaded: string[] = [];
+	}
+	const loaded = new Set<string>();
+	const definitions = new Map<string, ToolDefinitionSnapshot>();
+	for (const definition of epoch?.definitionSnapshots ?? []) {
+		if (!definitions.has(definition.name)) definitions.set(definition.name, definition);
+	}
 	for (const event of events) {
-		if (event.kind !== "load") continue;
-		for (const name of event.tools) if (!loaded.includes(name)) loaded.push(name);
+		if (event.kind === "load") for (const name of event.tools) loaded.add(name);
+		for (const definition of event.definitionSnapshots ?? []) {
+			if (!definitions.has(definition.name)) definitions.set(definition.name, definition);
+		}
 	}
 	return {
 		managed,
+		eventTools,
 		...(epoch?.markerId ? { epochMarkerId: epoch.markerId } : {}),
 		base,
-		loaded,
+		loaded: [...loaded],
 		current: currentSet,
 		...(candidates ? { candidates } : {}),
 		registryRevision: epoch?.registryRevision,
-		definitionSnapshots: [
-			...(epoch?.definitionSnapshots ?? []),
-			...epochRows(messages, epoch?.markerId).flatMap((message) => {
-				const block = Array.isArray(message.contentJson)
-					? (message.contentJson[0] as Record<string, unknown>)
-					: undefined;
-				return message.role === "user" && !message.parentToolUseId && block?.type === "tool_loaded"
-					? (readSnapshots(block.definitionSnapshots) ?? [])
-					: [];
-			}),
-		].filter(
-			(snapshot, index, all) => all.findIndex((item) => item.name === snapshot.name) === index,
-		),
+		definitionSnapshots: [...definitions.values()],
+		baseToolNames: epoch?.baseToolNames,
+		strategy: epoch?.strategy,
+		prefixState: epoch?.prefixState,
 	};
 }
 
@@ -440,7 +496,7 @@ export function toolLoadingDrift(
 ): { loads: string[]; unloads: string[] } {
 	const expected = new Set(state.base);
 	for (const message of epochRows(messages, state.epochMarkerId)) {
-		const event = toolLoadingEventOf(message, state.managed);
+		const event = toolLoadingEventOf(message, state.eventTools ?? state.managed);
 		if (!event) continue;
 		for (const name of event.tools) {
 			if (event.kind === "load") expected.add(name);
@@ -459,7 +515,7 @@ export function toolLoadingDrift(
  * never carries a placeholder tool or a tool-change beta.
  */
 export function usesToolLoading(state: ToolLoadingState | undefined): state is ToolLoadingState {
-	return !!state && state.managed.size > 0;
+	return !!state && (state.managed.size > 0 || state.baseToolNames !== undefined);
 }
 
 // === Request tools ===
@@ -476,35 +532,35 @@ export const DEFERRED_TOOL_PLACEHOLDER = {
 	defer_loading: true,
 } as const;
 
-/**
- * Split the candidate tools into the request's `tools` array.
- *
- * `candidates` must already be filtered for everything except loading state. Order is
- * preserved, so the array only depends on which managed tools it keeps.
- */
 export function selectRequestTools(
 	candidates: readonly ResolvedToolDefinition[],
 	state: ToolLoadingState | undefined,
 	strategy: ToolLoadingStrategy,
 ): { tools: ResolvedToolDefinition[]; deferred: ResolvedToolDefinition[] } {
 	if (!state) return { tools: [...candidates], deferred: [] };
-	const keep =
-		strategy === "replace_tools"
-			? (name: string) => state.current.has(name)
-			: (name: string) => state.base.has(name);
 	const frozen = new Map(
 		state.definitionSnapshots?.map((snapshot) => [snapshot.name, snapshotDefinition(snapshot)]),
 	);
-	const definitions =
-		strategy === "replace_tools"
-			? candidates
-			: candidates.map((tool) => frozen.get(tool.name) ?? tool);
-	const tools = definitions.filter((tool) => !state.managed.has(tool.name) || keep(tool.name));
+	const byName = new Map(candidates.map((tool) => [tool.name, tool]));
+	for (const [name, definition] of frozen) byName.set(name, definition);
+	// A prefix epoch owns the declared list, not today's registry/availability view.
+	const tools = state.baseToolNames
+		? state.baseToolNames.flatMap((name) => {
+				const tool = byName.get(name);
+				return tool ? [tool] : [];
+			})
+		: candidates
+				.filter(
+					(tool) =>
+						!state.managed.has(tool.name) ||
+						(strategy === "replace_tools" ? state.current : state.base).has(tool.name),
+				)
+				.map((tool) => frozen.get(tool.name) ?? tool);
 	if (strategy !== "anthropic_deferred_tail") return { tools, deferred: [] };
-	const byName = new Map(definitions.map((tool) => [tool.name, tool]));
+	const declared = new Set(tools.map((tool) => tool.name));
 	const deferred = state.loaded.flatMap((name) => {
 		const tool = byName.get(name);
-		return tool && !state.base.has(name) ? [tool] : [];
+		return tool && !declared.has(name) ? [tool] : [];
 	});
 	return { tools, deferred };
 }
@@ -625,52 +681,30 @@ export function projectToolLoadingHistory(
 			if (message.id === state.epochMarkerId) inEpoch = true;
 			return message;
 		}
-		const event = toolLoadingEventOf(message, state.managed);
-		if (!event) return message;
-		if (
-			strategy === "custom_injection" ||
-			strategy === "openai_additional_tools" ||
-			strategy === "kimi_system_tools"
-		) {
-			if (event.kind !== "load") return message;
-			const fresh = event.tools.flatMap((name) => {
-				if (declared.has(name)) return [];
-				const definition = resolveDefinition(name);
-				if (!definition) return [];
-				declared.add(name);
-				return [definition];
-			});
-			if (fresh.length === 0) return message;
-			if (strategy === "custom_injection")
-				return withNoticeText(message, renderInjectedToolDefinitions(fresh));
-			const projected = { ...message };
-			toolLoadingChanges.set(projected, {
-				mode: strategy,
-				additions: fresh.map((definition) => ({ name: definition.name, definition })),
-				removals: [],
-			});
-			return projected;
-		}
-		// Anthropic modes surface every load (a removed tool needs re-adding). Inline definitions are self-contained; the deferred tail names
-		// tools the request's array declares. Both reject a reference to a name that was
-		// never declared, so a tool that cannot be resolved is skipped on both sides.
-		const additions: ToolLoadingAddition[] = [];
-		const removals: string[] = [];
-		for (const name of event.tools) {
-			if (event.kind === "unload") {
-				// Only the inline mode sends removals: the deferred-tail endpoints are only
-				// known to read additions (deepseek-harness `addition-only`).
-				if (strategy === "anthropic_tool_addition" && declared.has(name)) removals.push(name);
-				continue;
-			}
+		const event = toolLoadingEventOf(message, state.eventTools ?? state.managed);
+		// Unload/reload changes execution availability, not declarations. In particular,
+		// do not remove an Anthropic tool then re-emit its schema to enable it again.
+		if (!event || event.kind !== "load") return message;
+		const fresh = event.tools.flatMap((name) => {
+			if (declared.has(name)) return [];
 			const definition = resolveDefinition(name);
-			if (!definition) continue;
+			if (!definition) return [];
 			declared.add(name);
-			additions.push(strategy === "anthropic_deferred_tail" ? { name } : { name, definition });
-		}
-		if (additions.length === 0 && removals.length === 0) return message;
+			return [definition];
+		});
+		if (fresh.length === 0) return message;
+		if (strategy === "custom_injection")
+			return withNoticeText(message, renderInjectedToolDefinitions(fresh));
 		const projected = { ...message };
-		toolLoadingChanges.set(projected, { mode: strategy, additions, removals });
+		toolLoadingChanges.set(projected, {
+			mode: strategy,
+			additions: fresh.map((definition) =>
+				strategy === "anthropic_deferred_tail"
+					? { name: definition.name }
+					: { name: definition.name, definition },
+			),
+			removals: [],
+		});
 		return projected;
 	});
 }

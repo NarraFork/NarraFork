@@ -15,6 +15,7 @@ import { afterEach, expect, spyOn, test } from "bun:test";
 import type { RecordingFrame, RecordingRequest, RequestRecording } from "@shared/request-recording";
 import type { ServerWebSocket } from "bun";
 import {
+	type CodexResponsesRequestBody,
 	CodexWebSocketRetryableError,
 	clearCodexResponsesWebSocketSessions,
 	streamCodexResponsesWebSocket,
@@ -150,7 +151,13 @@ function userMessage(text: string) {
 
 async function runStream(
 	server: TestServer,
-	overrides: { sessionKey?: string; input?: string[]; requestDump?: ApiRequestDumpCollector } = {},
+	overrides: {
+		sessionKey?: string;
+		input?: string[];
+		requestDump?: ApiRequestDumpCollector;
+		request?: CodexResponsesRequestBody;
+		signal?: AbortSignal;
+	} = {},
 ): Promise<ParsedStreamEvent[]> {
 	const events: ParsedStreamEvent[] = [];
 	for await (const event of streamCodexResponsesWebSocket({
@@ -161,13 +168,13 @@ async function runStream(
 		conversationId: "conv-1",
 		credentialId: "cred-1",
 		model: "gpt-5.3-codex",
-		request: {
+		request: overrides.request ?? {
 			model: "gpt-5.3-codex",
 			input: (overrides.input ?? ["hello"]).map(userMessage) as never,
 			stream: true,
 			instructions: "base",
 		},
-		signal: new AbortController().signal,
+		signal: overrides.signal ?? new AbortController().signal,
 	})) {
 		events.push(event);
 	}
@@ -218,6 +225,108 @@ function responseTranscript(frames: RecordingFrame[]): string {
 		)
 		.join("\n");
 }
+
+test("cached signatures survive caller mutation and preserve unknown output item fields", async () => {
+	const item = {
+		type: "message",
+		id: "output-original",
+		role: "assistant",
+		content: [{ type: "output_text", text: "first output", annotations: [] }],
+		provider_extension: { opaque: "preserve-output" },
+	};
+	activeServer = startServer(({ requestIndex, send }) => {
+		const responseId = `signature-${requestIndex}`;
+		send(JSON.stringify({ type: "response.created", response: { id: responseId } }));
+		if (requestIndex === 0)
+			send(JSON.stringify({ type: "response.output_item.done", output_index: 0, item }));
+		send(JSON.stringify({ type: "response.completed", response: { id: responseId } }));
+	});
+	const request = (input: unknown[]): CodexResponsesRequestBody => ({
+		model: "gpt-5.3-codex",
+		stream: true,
+		instructions: "base",
+		input: input as CodexResponsesRequestBody["input"],
+		future_request_field: { version: 1, opaque: ["keep", null] },
+	});
+	const originalMessage = userMessage("hello");
+	const originalRequest = request([originalMessage]);
+	await runStream(activeServer, { request: originalRequest });
+	expect(originalMessage.content[0].text).toBe("hello");
+	// The caller may recycle its own object after completion; no session baseline may alias it.
+	originalMessage.content[0].text = "caller changed its old request";
+	(originalRequest.future_request_field as { version: number }).version = 2;
+	await runStream(activeServer, {
+		request: request([userMessage("hello"), item, userMessage("next")]),
+	});
+	expect(activeServer.requests[1].body.previous_response_id).toBe("signature-0");
+	expect(activeServer.requests[1].body.input).toEqual([userMessage("next")]);
+	expect(activeServer.requests[1].body.future_request_field).toEqual({
+		version: 1,
+		opaque: ["keep", null],
+	});
+	const changedItem = { ...item, provider_extension: { opaque: "changed-output" } };
+	const fullInput = [userMessage("hello"), changedItem, userMessage("next"), userMessage("again")];
+	await runStream(activeServer, { request: request(fullInput) });
+	expect(activeServer.requests[2].body.previous_response_id).toBeUndefined();
+	expect(activeServer.requests[2].body.input).toEqual(fullInput);
+});
+
+test("large WS retries reuse async encoding and preserve the complete wire body", async () => {
+	activeServer = startServer(({ requestIndex, send }) => {
+		if (requestIndex === 0) send(CONNECTION_LIMIT_FRAME);
+		else for (const frame of completedFrames("large-retry", "done")) send(frame);
+	});
+	const large = 'quote" slash\\ unicode汉字\n'.repeat(32 * 1024);
+	const request: CodexResponsesRequestBody = {
+		model: "gpt-5.3-codex",
+		stream: true,
+		instructions: large,
+		input: [userMessage(large)] as CodexResponsesRequestBody["input"],
+		future_request_field: { preserved: true, nested: [large] },
+	};
+	const stringify = spyOn(JSON, "stringify");
+	try {
+		expect(collectText(await runStream(activeServer, { request }))).toBe("done");
+		const synchronousWholeRequests = stringify.mock.calls.filter(
+			([value]) => value && typeof value === "object" && "model" in value && "input" in value,
+		);
+		expect(synchronousWholeRequests).toHaveLength(0);
+	} finally {
+		stringify.mockRestore();
+	}
+	expect(activeServer.requests).toHaveLength(2);
+	expect(activeServer.requests[1].body).toEqual(activeServer.requests[0].body);
+	expect(activeServer.requests[0].body.input).toEqual(request.input);
+	expect(activeServer.requests[0].body.future_request_field).toEqual(request.future_request_field);
+	expect(activeServer.requests[0].body.instructions).toBe(large);
+	expect(request).not.toHaveProperty("type");
+	expect(request).not.toHaveProperty("previous_response_id");
+});
+
+test("abort during large preparation dispatches nothing and leaves the session reusable", async () => {
+	activeServer = startServer(({ send }) => {
+		for (const frame of completedFrames("after-abort", "ok")) send(frame);
+	});
+	const controller = new AbortController();
+	const request: CodexResponsesRequestBody = {
+		model: "gpt-5.3-codex",
+		stream: true,
+		instructions: "x".repeat(2 * 1024 * 1024),
+		input: [userMessage("hello")] as CodexResponsesRequestBody["input"],
+	};
+	const cancel = setTimeout(() => controller.abort(new Error("cancel large WS preparation")), 0);
+	try {
+		await expect(runStream(activeServer, { request, signal: controller.signal })).rejects.toThrow(
+			"cancel large WS preparation",
+		);
+	} finally {
+		clearTimeout(cancel);
+	}
+	expect(activeServer.requests).toHaveLength(0);
+	expect(collectText(await runStream(activeServer))).toBe("ok");
+	expect(activeServer.requests).toHaveLength(1);
+	expect(activeServer.requests[0].body.previous_response_id).toBeUndefined();
+});
 
 test("live WS evidence preserves upgrade, reuse, exact outgoing delta and incoming message boundaries", async () => {
 	activeServer = startServer(({ requestIndex, send }) => {

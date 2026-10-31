@@ -14,6 +14,7 @@ import { outputToText } from "@shared/agent-protocol/tool-output";
 import type { WebSearchAction } from "@shared/agent-protocol/types";
 import {
 	type CanonicalEnvelope,
+	type ContextUpdate,
 	isModelVisible,
 	type ToolChange,
 } from "@shared/narrator-blocks/types";
@@ -59,6 +60,8 @@ export interface NeutralInputItem {
 	/** Index-aligned with `[image #N]` placeholders; null keeps the slot of an unreadable image. */
 	images: ReadonlyArray<ResolvedImage | null>;
 	toolChange?: ToolChange;
+	/** Host state replacement, not a new top-level system prompt. */
+	contextUpdate?: ContextUpdate;
 }
 
 export interface NeutralInputGroup {
@@ -304,6 +307,9 @@ export function toTurns(
 			text: block.modelText ?? "",
 			images: block.kind === "input" ? (assets.inputImages.get(block.id) ?? []) : [],
 			...(block.kind === "context" && block.toolChange ? { toolChange: block.toolChange } : {}),
+			...(block.kind === "context" && block.contextUpdate
+				? { contextUpdate: block.contextUpdate }
+				: {}),
 		};
 		if (!group) {
 			group = { kind: "input", items: [] };

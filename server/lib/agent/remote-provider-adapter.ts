@@ -30,6 +30,7 @@ import {
 	type RecordingAttemptRequest,
 	sanitizeHeaders,
 } from "./request-dump";
+import { unsupportedResponseFormatReason } from "./response-format";
 import { resolveToolJsonSchema } from "./tool-registry";
 import type {
 	ApiRequestDiagnostics,
@@ -356,11 +357,18 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 		systemInstruction?: string,
 		options?: GenerateOptions,
 	): Promise<GenerateMetaResult> {
-		return this.runGenerate({
+		const result = await this.runGenerate({
 			model,
 			request: { mode: "prompt", text, ...(systemInstruction ? { systemInstruction } : {}) },
 			options,
 		});
+		// The remote-executor protocol carries no schema constraint, so a
+		// requested responseFormat is reported as degraded rather than dropped.
+		if (!options?.responseFormat || result.responseFormatDegraded) return result;
+		return {
+			...result,
+			responseFormatDegraded: unsupportedResponseFormatReason("Remote executor"),
+		};
 	}
 
 	async generateWithHistory(

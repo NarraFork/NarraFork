@@ -25,7 +25,7 @@ export class ToolRegistry {
 	private readonly instanceId = generateId();
 	private generation = 0;
 
-	/** Cache lifecycle only: registration or restart opens a new tool epoch, not new authority. */
+	/** Catalog invalidation only: registration/restart changes neither prefix epoch nor authority. */
 	get revision(): string {
 		return `${this.instanceId}:${this.generation}`;
 	}

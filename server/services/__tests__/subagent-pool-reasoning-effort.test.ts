@@ -54,9 +54,10 @@ if (process.env[CHILD_ENV] !== "1") {
 	}, 50_000);
 } else {
 	const { eq } = await import("drizzle-orm");
-	const { getTestDb, cleanDb } = await import("../../../tests/setup");
-	const { db, sqlite } = getTestDb();
-	mock.module("../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
+	const { cleanDb } = await import("../../../tests/setup");
+	// The snapshot worker shares the preload-isolated file-backed database.
+	const { db, sqlite } = await import("../../db");
+	const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
 
 	const configs: AgentConfig[] = [];
 	const broadcasts: Array<{ target: string; event: Record<string, unknown> }> = [];
@@ -124,7 +125,8 @@ if (process.env[CHILD_ENV] !== "1") {
 	const PARENT = "reasoning-effort-parent";
 	const TOOL = "reasoning-effort-agent-tool";
 
-	beforeEach(() => {
+	beforeEach(async () => {
+		await closePrefixSnapshotStore();
 		cleanDb(sqlite);
 		clearAliasRegistry(PARENT);
 		configs.length = 0;
@@ -149,9 +151,9 @@ if (process.env[CHILD_ENV] !== "1") {
 		settings.agent.subagentModelReasoningEfforts = {};
 	});
 
-	afterAll(() => {
+	afterAll(async () => {
+		await closePrefixSnapshotStore();
 		mock.restore();
-		sqlite.close();
 	});
 
 	async function seedParent(effort: ReasoningEffort | null = null, traits: string[] = []) {

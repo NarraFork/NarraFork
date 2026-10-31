@@ -53,6 +53,7 @@ import {
 import { summaryGenerate } from "../lib/agent";
 import { getFileReferenceSnapshots } from "../lib/agent/file-reference-projection";
 import { generateWithFirstTokenTimeout } from "../lib/agent/generate-first-token-timeout";
+import type { ResponseFormat } from "../lib/agent/provider";
 import { takeOverExitPlanReflection } from "../lib/agent/tools/exit-plan-reflection";
 import { previewStructSedChange } from "../lib/agent/tools/struct-sed";
 import { takeOverTaskReflection } from "../lib/agent/tools/task-reflection";
@@ -149,9 +150,14 @@ import {
 	selectActionableDependencies,
 } from "../lib/prompt-i18n";
 import {
+	getOptimizeOutputSchema,
 	getPromptOptimizeInstruction,
+	OPTIMIZE_OUTPUT_SCHEMA_NAME,
+	OPTIMIZE_SUMMARY_FIELD,
 	type PromptOptimizeStyle,
+	readOptimizeResult,
 } from "../lib/prompts/prompt-optimize";
+import { normalizeOptimizedPrompt } from "../lib/prompts/prompt-optimize-output";
 import { saveRequestRecording } from "../lib/request-recorder";
 import { policySourceIdOf } from "../lib/runtime-source";
 import {
@@ -1895,6 +1901,19 @@ narratorRoutes.post("/:id/optimize-prompt", async (c) => {
 	// Resolve the model (default follows summaryModel via __summary__)
 	const model = resolveEffectiveModel(settings.agent.promptOptimizeModel);
 
+	// Ask for the optimized text as a schema-constrained object when the resolved
+	// adapter can express one. `responseFormatDegraded` reports adapters that
+	// cannot (they must not silently ignore it), and the text path below is then
+	// the only source of truth.
+	const responseFormat: ResponseFormat = {
+		type: "json_schema",
+		name: OPTIMIZE_OUTPUT_SCHEMA_NAME,
+		schema: getOptimizeOutputSchema(),
+		strict: true,
+		// Lets the provider layer lift the rationale without knowing field names.
+		summaryField: OPTIMIZE_SUMMARY_FIELD,
+	};
+
 	// Follow the configured first-token budget; output clears the timer. Request
 	// cancellation remains connected to the provider throughout generation.
 	const generated = await generateWithFirstTokenTimeout(
@@ -1909,6 +1928,9 @@ narratorRoutes.post("/:id/optimize-prompt", async (c) => {
 				undefined,
 				false,
 				options.onReasoningDelta,
+				undefined,
+				undefined,
+				{ responseFormat, onGenerationProgress: options.onGenerationProgress },
 			),
 		settings.agent.firstTokenTimeoutMs,
 		c.req.raw.signal,
@@ -1918,31 +1940,29 @@ narratorRoutes.post("/:id/optimize-prompt", async (c) => {
 		}
 		throw err;
 	});
-	let result = generated.text;
 
-	// Post-process: trim, remove wrapping quotes/code fences
-	result = result.trim();
-	// Remove wrapping quotes
-	if (
-		(result.startsWith('"') && result.endsWith('"')) ||
-		(result.startsWith("'") && result.endsWith("'"))
-	) {
-		result = result.slice(1, -1).trim();
-	}
-	// Remove code fences
-	if (result.startsWith("```") && result.endsWith("```")) {
-		const lines = result.split("\n");
-		if (lines.length > 2) {
-			result = lines.slice(1, -1).join("\n").trim();
-		}
+	if (generated.responseFormatDegraded) {
+		// Log loss of native schema enforcement; validated fields remain usable.
+		logger.warn("Prompt optimize fell back to text parsing", {
+			narratorId,
+			model,
+			reason: generated.responseFormatDegraded,
+		});
 	}
 
-	// Fallback to original if result is empty
-	if (!result) {
-		result = text;
+	const structured = readOptimizeResult(generated.structured);
+	// Failed or incomplete schema output is not prompt text. Keep the draft rather
+	// than leaking the raw JSON envelope (or a partial rewrite) into the composer.
+	if (generated.outputTruncated || (generated.structured !== undefined && !structured)) {
+		return c.json({ text, model });
 	}
+	// The validated field is already the payload; only plaintext fallback needs
+	// wrapper removal. Its examples, headings and literal thinking tags are content.
+	const result = structured?.optimizedPrompt ?? normalizeOptimizedPrompt(generated.text, text);
+	if (!structured && result.startsWith("{")) return c.json({ text, model });
+	const reasoningSummary = structured?.reasoningSummary ?? generated.reasoningSummary;
 
-	return c.json({ text: result, model });
+	return c.json({ text: result, model, ...(reasoningSummary ? { reasoningSummary } : {}) });
 });
 
 // Get usage stats for this narrator, optionally including direct subagents.

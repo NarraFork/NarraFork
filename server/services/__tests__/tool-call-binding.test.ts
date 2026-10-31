@@ -2,7 +2,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "b
 import { join } from "node:path";
 import { and, eq } from "drizzle-orm";
 import { z } from "zod/v4";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
 	fileChangeOperations,
 	narratorMessageRefs,
@@ -13,9 +13,9 @@ import {
 import type { ProviderAdapter } from "../../lib/agent/provider";
 import type { AgentConfig, ToolCallBinding, ToolContext } from "../../lib/agent/types";
 
-const { db, sqlite } = getTestDb();
-const realDb = { ...(await import("../../db")) };
-mock.module("../../db", () => ({ ...realDb, db, sqlite }));
+// The snapshot worker shares the preload-isolated file-backed database.
+const { db, sqlite } = await import("../../db");
+const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
 const realProvider = { ...(await import("../../lib/agent/provider")) };
 let providerTurn = 0;
 let scenario: "eager" | "write" | "streaming" = "eager";
@@ -218,7 +218,8 @@ async function untilPending(id: string) {
 	}
 	throw new Error("permission did not become pending");
 }
-beforeEach(() => {
+beforeEach(async () => {
+	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
 	executed.length = 0;
 	order.length = 0;
@@ -233,15 +234,14 @@ afterEach(async () => {
 	sqlite.run("DROP TRIGGER IF EXISTS reject_permission_update");
 	sqlite.run("DROP TRIGGER IF EXISTS reject_start_update");
 });
-afterAll(() => {
+afterAll(async () => {
+	await closePrefixSnapshotStore();
 	toolRegistry.unregister("TestBoundRead");
 	toolRegistry.unregister("TestBoundAsk");
 	toolRegistry.unregister("Write");
 	if (originalWrite) toolRegistry.register(originalWrite);
 	mock.module("../../lib/agent/provider", () => realProvider);
-	mock.module("../../db", () => realDb);
 	mock.restore();
-	sqlite.close();
 });
 
 describe("真实工具行执行绑定", () => {

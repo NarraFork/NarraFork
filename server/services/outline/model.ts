@@ -45,6 +45,12 @@ export const OUTLINE_CHANGE = {
 	PAGE: 64,
 	/** Its alias or tags changed. */
 	PROPS: 128,
+	/**
+	 * The writer's change was three-way merged over changes others made after the writer read
+	 * the block (an agent's `OutlineEdit`, `agent-merge.ts`): the version holds both. Set only
+	 * together with what the write changed.
+	 */
+	MERGE: 256,
 } as const;
 
 export type OutlineChangeFlag = (typeof OUTLINE_CHANGE)[keyof typeof OUTLINE_CHANGE];

@@ -5,6 +5,7 @@ import { AnthropicProvider } from "../anthropic-provider";
 import { OpenAIProvider } from "../openai-provider";
 import type { ChatParams, DbMessage, ProviderAdapter } from "../provider";
 import {
+	classifyToolAdditions,
 	DEFERRED_TOOL_PLACEHOLDER,
 	defaultToolLoadingModes,
 	deriveToolLoadingState,
@@ -114,7 +115,7 @@ describe("frozen tool definitions", () => {
 		}
 	});
 
-	test("epoch base uses frozen JSON while replacement uses current registry", () => {
+	test("epoch base uses frozen JSON even with the legacy replacement strategy", () => {
 		const state = deriveToolLoadingState([], MANAGED, ["Eval"], {
 			toolNames: ["Eval"],
 			definitionSnapshots: [
@@ -130,7 +131,70 @@ describe("frozen tool definitions", () => {
 			selectRequestTools(CANDIDATES, state, "replace_tools").tools.find(
 				(item) => item.name === "Eval",
 			)?.description,
-		).toBe("Eval tool");
+		).toBe("frozen");
+	});
+});
+
+describe("prefix tool addition admission", () => {
+	const prefix = { contract: "contract-ref", parts: [], tools: "tools-ref" };
+
+	test("initial and legacy loading remain available before a unified baseline", () => {
+		expect(classifyToolAdditions(undefined, ["SwitchDevice", "Terminal"])).toEqual({
+			allowed: ["SwitchDevice", "Terminal"],
+			blocked: [],
+		});
+		expect(
+			classifyToolAdditions({ toolNames: [], strategy: "replace_tools" }, ["Terminal"]),
+		).toEqual({
+			allowed: ["Terminal"],
+			blocked: [],
+		});
+	});
+
+	test("replacement strategy reports only undeclared names, not unrelated base tools", () => {
+		const epoch = {
+			prefix,
+			toolNames: [],
+			baseToolNames: ["Read", "Terminal"],
+			strategy: "replace_tools" as const,
+		};
+		expect(classifyToolAdditions(epoch, ["Terminal", "SwitchDevice", "Read", "WebFetch"])).toEqual({
+			allowed: ["Terminal", "Read"],
+			blocked: ["SwitchDevice", "WebFetch"],
+		});
+		expect(classifyToolAdditions({ ...epoch, strategy: undefined }, ["SwitchDevice"])).toEqual({
+			allowed: [],
+			blocked: ["SwitchDevice"],
+		});
+	});
+
+	test.each([
+		"anthropic_tool_addition",
+		"anthropic_deferred_tail",
+		"openai_additional_tools",
+		"kimi_system_tools",
+		"custom_injection",
+	] as const)("published compatible strategy %s permits automatic device and resident additions", (strategy) => {
+		expect(
+			classifyToolAdditions({ prefix, toolNames: [], baseToolNames: ["Read"], strategy }, [
+				"SwitchDevice",
+				"Terminal",
+			]),
+		).toEqual({
+			allowed: ["SwitchDevice", "Terminal"],
+			blocked: [],
+		});
+	});
+
+	test("an explicit empty mode list never gains custom injection as a fallback", () => {
+		const target = { protocol: "completions-compatible" as const };
+		const enabled = resolveToolLoadingStrategy("glm-5.1", target);
+		const disabled = resolveToolLoadingStrategy("glm-5.1", target, []);
+		expect(enabled).toBe("custom_injection");
+		expect(disabled).toBe("replace_tools");
+		expect(
+			classifyToolAdditions({ prefix, toolNames: [], strategy: disabled }, ["Terminal"]).blocked,
+		).toEqual(["Terminal"]);
 	});
 });
 
@@ -273,6 +337,30 @@ describe("request tool array", () => {
 		]);
 	});
 
+	test("a unified baseline ignores registry additions, removals and replacement loading", () => {
+		const snapshots = [
+			{ name: "Read", description: "frozen Read", parameters: { type: "object" } },
+			{ name: "Eval", description: "frozen Eval", parameters: { type: "object" } },
+		];
+		const state = deriveToolLoadingState([], MANAGED, ["Terminal"], {
+			toolNames: ["Eval"],
+			baseToolNames: ["Read", "Eval"],
+			definitionSnapshots: snapshots,
+		});
+		const changedCandidates = [{ ...EVAL, description: "registry replacement" }, TERMINAL];
+		for (const strategy of [
+			"replace_tools",
+			"custom_injection",
+			"openai_additional_tools",
+		] as const) {
+			const selected = selectRequestTools(changedCandidates, state, strategy);
+			expect(selected.tools.map(({ name, description }) => ({ name, description }))).toEqual([
+				{ name: "Read", description: "frozen Read" },
+				{ name: "Eval", description: "frozen Eval" },
+			]);
+		}
+	});
+
 	test("additive modes keep only the base set", () => {
 		for (const strategy of ["openai_additional_tools", "custom_injection"] as const) {
 			expect(formatRequestTools(format, CANDIDATES, state, strategy)).toEqual([
@@ -332,18 +420,22 @@ describe("history projection", () => {
 		return projectToolLoadingHistory(messages, state(messages), strategy, resolveDefinition);
 	}
 
-	test("inline additions define every load and remove every unload", () => {
-		const changes = project("anthropic_tool_addition").map(toolLoadingChangeOf);
+	test("inline additions declare once; unload and reload are availability notices", () => {
+		const projected = project("anthropic_tool_addition");
+		const changes = projected.map(toolLoadingChangeOf);
 		expect(changes[0]?.additions.map((a) => [a.name, !!a.definition])).toEqual([["Eval", true]]);
-		expect(changes[1]?.removals).toEqual(["Eval"]);
-		expect(changes[2]?.additions.map((a) => a.name)).toEqual(["Eval"]);
+		expect(changes[0]?.removals).toEqual([]);
+		expect(changes[1]).toBeUndefined();
+		expect(changes[2]).toBeUndefined();
+		expect(projected[1].contentText).toBe("[tool_unloaded Eval]");
+		expect(projected[2].contentText).toBe("[tool_loaded Eval]");
 	});
 
 	test("the deferred tail references tools by name and sends no removals", () => {
 		const changes = project("anthropic_deferred_tail").map(toolLoadingChangeOf);
 		expect(changes[0]?.additions).toEqual([{ name: "Eval" }]);
 		expect(changes[1]).toBeUndefined();
-		expect(changes[2]?.additions).toEqual([{ name: "Eval" }]);
+		expect(changes[2]).toBeUndefined();
 	});
 
 	test("a removal never names a base tool that no longer resolves", () => {
@@ -534,7 +626,88 @@ describe("anthropic_tool_addition wire", () => {
 		expect(next.body.tools).toEqual(before.body.tools);
 	});
 
-	test("a removal is sent by reference", async () => {
+	test("a unified baseline survives load, unload and reload with one declaration", async () => {
+		captureFetch();
+		const provider = new AnthropicProvider(config);
+		const model = "tl_anthropic:claude-opus-5-5";
+		const baseline = row("system", "", {
+			contentJson: [
+				{
+					type: "epoch",
+					epoch: {
+						reason: "initial",
+						toolNames: [],
+						baseToolNames: ["Read"],
+						strategy: "anthropic_tool_addition",
+						prefix: { contract: "fixture-contract", parts: [], tools: "fixture-tools" },
+						definitionSnapshots: [
+							{
+								name: "Read",
+								description: READ.description,
+								parameters: { type: "object", properties: { value: { type: "string" } } },
+							},
+						],
+					},
+				},
+			],
+		});
+		const first = row("user", "Inspect first");
+		const reply = row("assistant", "Ready");
+		const initial = await request(
+			provider,
+			model,
+			"anthropic_tool_addition",
+			[baseline, first],
+			[],
+		);
+		const loaded = notice("tool_loaded", ["Eval"]);
+		(loaded.contentJson as Record<string, unknown>[])[0].definitionSnapshots = [
+			{
+				name: "Eval",
+				description: "first Eval declaration",
+				parameters: { type: "object", properties: { old: { type: "string" } } },
+			},
+		];
+		const loadedRows = [baseline, first, reply, loaded, row("user", "Use Eval")];
+		const load = await request(provider, model, "anthropic_tool_addition", loadedRows, ["Eval"]);
+		const unloadedRows = [
+			...loadedRows,
+			row("assistant", "Done"),
+			notice("tool_unloaded", ["Eval"]),
+		];
+		const unload = await request(provider, model, "anthropic_tool_addition", unloadedRows, []);
+		const reloaded = notice("tool_loaded", ["Eval"]);
+		(reloaded.contentJson as Record<string, unknown>[])[0].definitionSnapshots = [
+			{
+				name: "Eval",
+				description: "replacement should not be published",
+				parameters: { type: "object", properties: { updated: { type: "number" } } },
+			},
+		];
+		const reload = await request(
+			provider,
+			model,
+			"anthropic_tool_addition",
+			[...unloadedRows, row("assistant", "Unavailable"), reloaded, row("user", "Use Eval again")],
+			["Eval"],
+		);
+		for (const sent of [load, unload, reload]) {
+			expect(sent.body.tools).toEqual(initial.body.tools);
+			const wire = JSON.stringify(stripCache(sent.body.messages));
+			expect(wire.match(/"type":"tool_addition"/g)).toHaveLength(1);
+			expect(wire).not.toContain('"type":"tool_removal"');
+			expect(wire).toContain("first Eval declaration");
+			expect(wire).not.toContain("replacement should not be published");
+		}
+		const loadMessages = stripCache(load.body.messages) as unknown[];
+		const unloadMessages = stripCache(unload.body.messages) as unknown[];
+		const reloadMessages = stripCache(reload.body.messages) as unknown[];
+		expect(unloadMessages.slice(0, loadMessages.length)).toEqual(loadMessages);
+		expect(reloadMessages.slice(0, unloadMessages.length)).toEqual(unloadMessages);
+		expect(JSON.stringify(unloadMessages)).toContain("tool_unloaded Eval");
+	});
+
+	test("an unload is an availability notice, never a native declaration removal", async () => {
 		captureFetch();
 		const provider = new AnthropicProvider(config);
 		const sent = await request(
@@ -545,10 +718,8 @@ describe("anthropic_tool_addition wire", () => {
 			[],
 		);
 		const messages = stripCache(sent.body.messages) as Array<{ role: string; content: unknown }>;
-		expect(messages.at(-1)).toEqual({
-			role: "system",
-			content: [{ type: "tool_removal", tool: { type: "tool_reference", name: "Terminal" } }],
-		});
+		expect(JSON.stringify(messages)).toContain("tool_unloaded Terminal");
+		expect(JSON.stringify(messages)).not.toContain('"type":"tool_removal"');
 		// The unloaded tool stays declared within the epoch.
 		expect((sent.body.tools as Array<{ name: string }>).map((t) => t.name)).toContain("Terminal");
 	});
@@ -809,4 +980,26 @@ describe("kimi_system_tools wire", () => {
 		const declarations = (later.body.messages as Array<{ tools?: unknown }>).filter((m) => m.tools);
 		expect(declarations).toEqual([message]);
 	});
+});
+
+test("newly available built-ins append declarations without becoming optional execution grants", () => {
+	const epoch = { toolNames: [], baseToolNames: [READ.name] };
+	const candidates = [READ, TERMINAL];
+	const before = deriveToolLoadingState([], new Set(), [], epoch, candidates);
+	expect(before.managed.size).toBe(0);
+	expect(toolLoadingDrift([], before)).toEqual({ loads: [TERMINAL.name], unloads: [] });
+	expect(selectRequestTools(candidates, before, "custom_injection").tools).toEqual([READ]);
+	const loaded = notice("tool_loaded", [TERMINAL.name]);
+	const after = deriveToolLoadingState([loaded], new Set(), [], epoch, candidates);
+	expect(after.managed.size).toBe(0);
+	expect(toolLoadingDrift([loaded], after)).toEqual({ loads: [], unloads: [] });
+	expect(selectRequestTools(candidates, after, "custom_injection").tools).toEqual([READ]);
+	const projected = projectToolLoadingHistory(
+		[loaded],
+		after,
+		"custom_injection",
+		resolveDefinition,
+	);
+	expect(projected[0].contentText).toContain("<tool_definitions>");
+	expect(projected[0].contentText).toContain(TERMINAL.name);
 });

@@ -329,6 +329,46 @@ describe("decodeLegacyContent: single-block envelopes", () => {
 		).toMatchObject({ subtype: "merge_summary", modelText: "merged", state: { isLatest: true } });
 	});
 
+	test("typed context updates keep frozen text separate from metadata and require a host row", () => {
+		const contextUpdate = {
+			epochId: "epoch-1",
+			changes: [
+				{ key: "workspace", value: "/repo/b" },
+				{ key: "empty", value: "" },
+				{ key: "removed", value: null },
+			],
+		};
+		const contentJson = [
+			{ type: "text", text: "frozen update" },
+			{ type: "context_update", ...contextUpdate },
+		];
+		const host = row({ role: "sys", contentJson, contentText: "must not replace frozen text" });
+		expect(decodeLegacyContent(host).blocks[0]).toMatchObject({
+			kind: "context",
+			subtype: "context_update",
+			modelText: "frozen update",
+			contextUpdate,
+		});
+		const user = decodeLegacyContent({ ...host, role: "user" }).blocks[0];
+		expect(user).toMatchObject({ kind: "input", modelText: "frozen update" });
+		expect(user).not.toHaveProperty("contextUpdate");
+		const pasted = decodeLegacyContent(
+			row({
+				role: "user",
+				contentJson: [{ type: "text", text: "<context_update>workspace=/repo/b</context_update>" }],
+			}),
+		).blocks[0];
+		expect(pasted).not.toHaveProperty("contextUpdate");
+		const invalid = decodeLegacyContent({
+			...host,
+			contentJson: [
+				contentJson[0],
+				{ type: "context_update", epochId: "epoch-1", changes: [{ key: "x", value: 5 }] },
+			],
+		}).blocks[0];
+		expect(invalid).not.toHaveProperty("contextUpdate");
+	});
+
 	test("tool notices, bash, review, segment compact", () => {
 		expect(
 			decodeLegacyContent(

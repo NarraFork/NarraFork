@@ -16,7 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
 import { modelInputText, rowsAsHistory } from "../../../tests/fixtures/model-input";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
 	backgroundTasks,
 	narratorBufferedMessages,
@@ -29,9 +29,9 @@ import {
 } from "../../db/schema";
 import type { ProviderAdapter } from "../../lib/agent/provider";
 
-const { db, sqlite } = getTestDb();
-const realDb = { ...(await import("../../db")) };
-mock.module("../../db", () => ({ ...realDb, db, sqlite }));
+// The snapshot worker shares the preload-isolated file-backed database.
+const { db, sqlite } = await import("../../db");
+const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
 const { registerExternalProviderResolver } = await import("../../lib/agent/provider");
 const { settings } = await import("../../lib/settings");
 const executor = await import("../narrator-executor");
@@ -77,7 +77,8 @@ const passes: string[] = [];
 /** Scripted pass outcomes, consumed in order; default: one reply "done". */
 let script: Array<() => Promise<{ finalText: string; hasError?: boolean }>> = [];
 
-beforeEach(() => {
+beforeEach(async () => {
+	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
 	seq = 0;
 	passes.length = 0;
@@ -85,7 +86,8 @@ beforeEach(() => {
 	settings.agent.autoContinuationMode = "off";
 	cwd = mkdtempSync(join(tmpdir(), "nf-resume-"));
 });
-afterEach(() => {
+afterEach(async () => {
+	await closePrefixSnapshotStore();
 	for (const id of [PARENT, CHILD]) {
 		getExecutionOwner(id)?.release();
 		activeNarrators.delete(id);
@@ -95,9 +97,9 @@ afterEach(() => {
 	cleanDb(sqlite);
 	rmSync(cwd, { recursive: true, force: true });
 });
-afterAll(() => {
+afterAll(async () => {
+	await closePrefixSnapshotStore();
 	unregisterProvider();
-	mock.module("../../db", () => realDb);
 });
 
 const shapes = [

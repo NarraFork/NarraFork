@@ -120,6 +120,41 @@ export interface ChatParams extends ProtocolChatParams {
 	onInputCharacters?: (counts: ContextInputCharacters | null) => void | Promise<void>;
 }
 
+/**
+ * A JSON-Schema constraint on the model's output channel.
+ *
+ * Only the JSON-Schema form is modelled because that is the one shape every
+ * adapters' native mechanism can express: OpenAI's `response_format`,
+ * Anthropic's forced tool `input_schema`, and Gemini's `responseSchema` are all
+ * JSON Schema. There is deliberately no `text`/freeform variant — callers that
+ * do not need structure simply leave `responseFormat` unset.
+ */
+export interface ResponseFormatJsonSchema {
+	type: "json_schema";
+	/** Stable schema name. OpenAI requires one; other adapters ignore or echo it. */
+	name: string;
+	/** JSON Schema object the model's output must satisfy. */
+	schema: Record<string, unknown>;
+	/**
+	 * Ask for strict enforcement where the adapter supports it (OpenAI does).
+	 * Strict mode requires every property to be listed in `required` and
+	 * `additionalProperties: false` on every object in the schema.
+	 */
+	strict?: boolean;
+	/**
+	 * Optional name of a string field in `schema` carrying a short, user-facing
+	 * rationale. When set, adapters lift it into
+	 * {@link GenerateMetaResult.reasoningSummary} so a caller does not have to
+	 * know the schema's field names.
+	 *
+	 * It stays in `schema` (and in `required`, for strict mode) and is never
+	 * merged into the payload body.
+	 */
+	summaryField?: string;
+}
+
+export type ResponseFormat = ResponseFormatJsonSchema;
+
 export interface GenerateOptions {
 	/** Optional reasoning/thinking effort for lightweight generation helpers. */
 	reasoningEffort?: ChatParams["reasoningEffort"];
@@ -145,6 +180,18 @@ export interface GenerateOptions {
 	 * contract as `onTextDelta`: deltas only, keep it lightweight.
 	 */
 	onReasoningDelta?: (delta: string) => void | Promise<void>;
+	/** Actual model output outside text/reasoning (e.g. tool arguments), never transport heartbeats. */
+	onGenerationProgress?: () => void | Promise<void>;
+	/**
+	 * Constrain the output channel to a JSON Schema.
+	 *
+	 * Adapters that can express this natively (OpenAI, Anthropic, Gemini) map it
+	 * to their own mechanism and return the parsed payload as
+	 * `GenerateMetaResult.structured`. Adapters that cannot MUST report
+	 * `responseFormatDegraded` instead of silently ignoring the field, so a
+	 * caller can never mistake unconstrained prose for schema-valid output.
+	 */
+	responseFormat?: ResponseFormat;
 }
 
 export interface GenerateMetaResult {
@@ -156,6 +203,29 @@ export interface GenerateMetaResult {
 	credentialId?: string;
 	meterUsage?: number;
 	meterUnit?: string;
+	/**
+	 * Parsed JSON payload when `responseFormat` was requested AND the adapter got
+	 * schema-shaped output back. Absent when no format was requested, or when the
+	 * response could not be parsed — always inspect this together with
+	 * {@link responseFormatDegraded} before trusting `text`.
+	 */
+	structured?: unknown;
+	/**
+	 * Short, user-facing rationale lifted from the field named by
+	 * {@link ResponseFormat.summaryField}. Absent when no format was requested,
+	 * when the field was missing/blank, or when the response degraded to text —
+	 * it is never synthesized from the body text.
+	 */
+	reasoningSummary?: string;
+	/**
+	 * Why a requested `responseFormat` could not be honoured (adapter has no
+	 * native mechanism, the upstream rejected the parameter, or the model
+	 * answered with something that is not the requested JSON shape).
+	 *
+	 * This is a *reported* degradation, not a silent one: callers are expected to
+	 * switch to their text-parsing fallback rather than assume structure.
+	 */
+	responseFormatDegraded?: string;
 }
 
 // === The adapter interface ===

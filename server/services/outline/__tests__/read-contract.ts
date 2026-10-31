@@ -21,7 +21,7 @@ import { listBacklinks, resolveAddress } from "../resolve";
 import { revertCommit } from "../revert";
 import { searchOutline } from "../search";
 import type { OutlineSpaceRow, OutlineVersionRow } from "../store/port";
-import { OUTLINE_PAGE_HEAD_CHARS } from "../store/read-port";
+import { OUTLINE_LAST_WRITES_SCAN, OUTLINE_PAGE_HEAD_CHARS } from "../store/read-port";
 import { type OutlineNode, subtreeNodes } from "../tree";
 import type { OutlineOp, OutlineWriteInput, OutlineWriteResult } from "../write";
 import { writeOutline } from "../write";
@@ -536,6 +536,184 @@ export const OUTLINE_READ_CONTRACT: ContractCase[] = [
 		},
 	},
 	{
+		name: "versions at seqs; a merged update says so on its version and reverts like any",
+		async run(ctx) {
+			const space = await personalSpace(ctx);
+			const created = await write(ctx, space, [
+				{ op: "insert", parent: null, content: "v1", task: { status: "todo" }, alias: "K1" },
+			]);
+			const id = a0(created);
+			const s1 = created.commit?.seq as number;
+			const s2 = (await write(ctx, space, [{ op: "update", block: { id }, content: "v2" }])).commit
+				?.seq as number;
+			const merged = await write(ctx, space, [
+				{ op: "update", block: { id }, content: "v3", merged: true },
+			]);
+			const s3 = merged.commit?.seq as number;
+			// A merged update that changes nothing writes nothing.
+			const same = await write(ctx, space, [
+				{ op: "update", block: { id }, content: "v3", merged: true },
+			]);
+			expect(same.commit).toBeNull();
+			const reverted = await revert(ctx, merged.commit?.id as string);
+			const s4 = reverted.commit?.seq as number;
+			const s5 = (await write(ctx, space, [{ op: "delete", block: { id } }])).commit?.seq as number;
+			expect((await ctx.store.getBlock(id))?.content).toBe("v2");
+
+			// The version valid at each seq: exact, in between, tombstone, before the block existed.
+			const other = a0(await write(ctx, space, [{ op: "insert", parent: null, content: "other" }]));
+			const atSeq = async (seq: number) =>
+				(await ctx.store.listVersionsAtSeqs([{ blockId: id, seq }]))[0];
+			expect(await atSeq(s1 - 1)).toBeUndefined();
+			const at = new Map<number, OutlineVersionRow>();
+			for (const seq of [s1, s2, s3, s4, s5]) {
+				const v = await atSeq(seq);
+				expect(v?.fromSeq).toBe(seq);
+				at.set(seq, v as OutlineVersionRow);
+			}
+			const later = (await ctx.store.getSpace(space.id))?.nextSeq as number;
+			expect((await atSeq(later + 10))?.fromSeq).toBe(s5);
+			expect(at.get(s1)).toMatchObject({
+				toSeq: s2,
+				content: "v1",
+				taskJson: { status: "todo", assignee: null },
+				alias: "K1",
+				deleted: false,
+				commitId: created.commit?.id,
+			});
+			expect(at.get(s5)).toMatchObject({ content: null, deleted: true, toSeq: null });
+			// Many keys at once, unknown blocks left out.
+			const many = await ctx.store.listVersionsAtSeqs([
+				{ blockId: id, seq: s3 },
+				{ blockId: other, seq: later },
+				...Array.from({ length: 300 }, (_, i) => ({ blockId: `missing-${i}`, seq: s1 })),
+			]);
+			expect(many.map((v) => [v.blockId, v.fromSeq]).sort()).toEqual(
+				[
+					[id, s3],
+					[other, later - 1],
+				].sort(),
+			);
+			const isMerge = (seq: number) =>
+				((at.get(seq)?.changeFlags ?? 0) & OUTLINE_CHANGE.MERGE) !== 0;
+			expect([s1, s2, s3, s4, s5].map(isMerge)).toEqual([false, false, true, false, false]);
+			expect((at.get(s3)?.changeFlags ?? 0) & OUTLINE_CHANGE.CONTENT).toBe(OUTLINE_CHANGE.CONTENT);
+			expect(at.get(s4)?.content).toBe("v2");
+			const dump = await ctx.dump(space.id);
+			checkSpaceInvariants(dump);
+			checkChangeFlags(dump);
+		},
+	},
+	{
+		name: "last writes: the latest version that counts, leaving out an actor's own or its moves",
+		async run(ctx) {
+			const space = await personalSpace(ctx);
+			const agent = { kind: "agent" as const, id: "agent-last-writes" };
+			const pages = ids(
+				await write(ctx, space, [
+					{ op: "insert", tempId: "a", parent: null, content: "page A" },
+					{ op: "insert", tempId: "b", parent: null, content: "page B" },
+					{ op: "insert", tempId: "x", parent: { tempId: "a" }, content: "x by a person" },
+				]),
+			);
+			const [pageA, pageB, x] = pages as [string, string, string];
+			const s1 = (await ctx.store.getBlock(x))?.versionSeq as number;
+			const seq = async (ops: OutlineOp[], actor: OutlineWriteInput["actor"] = agent) =>
+				(await write(ctx, space, ops, { actor })).commit?.seq as number;
+			const s2 = await seq([{ op: "update", block: { id: x }, content: "x by the agent" }]);
+			const s3 = await seq([{ op: "move", block: { id: x }, parent: { id: pageB } }]);
+			const s4 = await seq(
+				[{ op: "update", block: { id: x }, content: "x by a person again" }],
+				ACTOR,
+			);
+			const s5 = await seq([{ op: "move", block: { id: x }, parent: { id: pageA } }]);
+			expect(new Set([s1, s2, s3, s4, s5]).size).toBe(5);
+			const ALL = 0x7fffffff;
+			const MOVES = OUTLINE_CHANGE.MOVE | OUTLINE_CHANGE.PAGE;
+			const last = async (afterSeq: number, flags: number, actorId = agent.id) =>
+				(
+					await ctx.store.findLastWrites([{ blockId: x, afterSeq }], {
+						actorKind: "agent",
+						actorId,
+						flags,
+					})
+				)[0]?.fromSeq;
+			// Someone else's latest version after a seq; none after the person's last one.
+			expect(await last(s1, ALL)).toBe(s4);
+			expect(await last(0, ALL)).toBe(s4);
+			expect(await last(s4, ALL)).toBeUndefined();
+			// Leaving out only the agent's moves: the person's edit under the agent's later move.
+			expect(await last(0, MOVES)).toBe(s4);
+			expect(await last(s4, MOVES)).toBeUndefined();
+			expect(await last(s2, MOVES, "someone-else")).toBe(s5);
+			// The agent's own content write counts when only moves are left out.
+			const own = a0(
+				await write(ctx, space, [{ op: "insert", parent: null, content: "by the agent" }], {
+					actor: agent,
+				}),
+			);
+			const ownSeq = (await ctx.store.getBlock(own))?.versionSeq as number;
+			const both = await ctx.store.findLastWrites(
+				[
+					{ blockId: x, afterSeq: 0 },
+					{ blockId: own, afterSeq: 0 },
+					...Array.from({ length: 300 }, (_, i) => ({ blockId: `missing-${i}`, afterSeq: 0 })),
+				],
+				{ actorKind: "agent", actorId: agent.id, flags: MOVES },
+			);
+			expect(both.map((r) => [r.blockId, r.fromSeq]).sort()).toEqual(
+				[
+					[x, s4],
+					[own, ownSeq],
+				].sort(),
+			);
+			expect(
+				await ctx.store.findLastWrites([{ blockId: own, afterSeq: 0 }], {
+					actorKind: "agent",
+					actorId: agent.id,
+					flags: ALL,
+				}),
+			).toEqual([]);
+
+			// With its change flags; anyone's moves left out on request.
+			const full = await ctx.store.findLastWrites([{ blockId: x, afterSeq: 0 }], {
+				actorKind: "agent",
+				actorId: "someone-else",
+				flags: ALL,
+				anyoneFlags: MOVES,
+			});
+			expect(full).toEqual([
+				{
+					blockId: x,
+					fromSeq: s4,
+					changeFlags: (await ctx.store.listVersionsAtSeqs([{ blockId: x, seq: s4 }]))[0]
+						?.changeFlags as number,
+				},
+			]);
+
+			// The scan stops after the newest versions: past them, unknown (fromSeq null) unless
+			// one of those counts.
+			const many = a0(
+				await write(ctx, space, [{ op: "insert", parent: { id: pageA }, content: "moved a lot" }]),
+			);
+			for (let i = 0; i < OUTLINE_LAST_WRITES_SCAN + 2; i++) {
+				await seq([{ op: "move", block: { id: many }, parent: { id: i % 2 ? pageA : pageB } }]);
+			}
+			const scanned = (flags: number) =>
+				ctx.store.findLastWrites([{ blockId: many, afterSeq: 0 }], {
+					actorKind: "agent",
+					actorId: agent.id,
+					flags,
+				});
+			expect(await scanned(ALL)).toEqual([{ blockId: many, fromSeq: null, changeFlags: null }]);
+			const latest = await seq(
+				[{ op: "update", block: { id: many }, content: "moved a lot, then edited" }],
+				ACTOR,
+			);
+			expect((await scanned(ALL))[0]?.fromSeq).toBe(latest);
+		},
+	},
+	{
 		name: "page lists and block history: sibling order, cursors, heads, newest first",
 		async run(ctx) {
 			const space = await personalSpace(ctx);
@@ -591,6 +769,64 @@ export const OUTLINE_READ_CONTRACT: ContractCase[] = [
 			const older = await ctx.store.listBlockHistory(x, { before: history[1]?.fromSeq, limit: 2 });
 			expect(older.map((h) => h.fromSeq)).toEqual(history.slice(2, 4).map((h) => h.fromSeq));
 			expect(await ctx.store.listBlockHistory("missing-block", { limit: 5 })).toEqual([]);
+		},
+	},
+	{
+		name: "pages structure: several pages in one read, each page's rows together, a cut leaves one page short",
+		async run(ctx) {
+			const space = await personalSpace(ctx);
+			const r = await write(ctx, space, [
+				{ op: "insert", tempId: "p1", parent: null, content: "page 1" },
+				{ op: "insert", tempId: "a", parent: { tempId: "p1" }, content: "a" },
+				{ op: "insert", parent: { tempId: "a" }, content: "a.1" },
+				{ op: "insert", tempId: "p2", parent: null, content: "page 2" },
+				{ op: "insert", parent: { tempId: "p2" }, content: "b", task: { status: "todo" } },
+				{ op: "insert", tempId: "gone", parent: { tempId: "p2" }, content: "gone" },
+				{ op: "insert", parent: { tempId: "p2" }, content: "c", alias: "Q1" },
+				{ op: "insert", tempId: "p3", parent: null, content: "page 3" },
+			]);
+			const [p1, , , p2, , gone, , p3] = ids(r) as string[];
+			await write(ctx, space, [{ op: "delete", block: { id: gone as string } }]);
+			const pages = [p1, p2, p3] as string[];
+			const whole = new Map<string, string[]>();
+			for (const page of pages) {
+				const one = await ctx.store.listPageStructure(page, { asOf: null, limit: 100 });
+				whole.set(page, one.rows.map((row) => row.id).sort());
+			}
+			const all = await ctx.store.listPagesStructure([...pages, "missing-page", p1 as string], 100);
+			expect(all.truncated).toBe(false);
+			expect(all.rows).toHaveLength(7);
+			const grouped = (rows: typeof all.rows) => {
+				const order: string[] = [];
+				const byPage = new Map<string, string[]>();
+				for (const row of rows) {
+					if (order.at(-1) !== row.pageId) order.push(row.pageId);
+					byPage.set(row.pageId, [...(byPage.get(row.pageId) ?? []), row.id]);
+				}
+				// Each page's rows come together.
+				expect(new Set(order).size).toBe(order.length);
+				return { order, byPage };
+			};
+			const { byPage } = grouped(all.rows);
+			for (const page of pages) expect(byPage.get(page)?.sort()).toEqual(whole.get(page));
+			const p2Rows = all.rows.filter((row) => row.pageId === p2);
+			expect(p2Rows.find((row) => row.alias === "Q1")).toBeDefined();
+			expect(p2Rows.find((row) => row.taskJson?.status === "todo")).toBeDefined();
+			expect(p2Rows.every((row) => row.id !== gone)).toBe(true);
+			for (let limit = 0; limit < 7; limit++) {
+				const cut = await ctx.store.listPagesStructure(pages, limit);
+				expect(cut.truncated).toBe(true);
+				expect(cut.rows).toHaveLength(limit);
+				const { order, byPage: got } = grouped(cut.rows);
+				// Every page but the last one read is whole.
+				for (const page of order.slice(0, -1))
+					expect(got.get(page)?.sort()).toEqual(whole.get(page));
+				const last = order.at(-1);
+				if (last) {
+					for (const id of got.get(last) ?? []) expect(whole.get(last)).toContain(id);
+				}
+			}
+			expect(await ctx.store.listPagesStructure([], 10)).toEqual({ rows: [], truncated: false });
 		},
 	},
 	{

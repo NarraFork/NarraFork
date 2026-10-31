@@ -60,7 +60,9 @@ import {
 	readResponsePrefix,
 	sanitizeHeaders,
 } from "./request-dump";
+import { stringifyRequestBody } from "./request-json";
 import { parseJsonResponseWithBody } from "./response-body";
+import { extractReasoningSummary, parseToolArguments } from "./response-format";
 import type { StreamProgress } from "./stream-progress";
 import { ToolInputStream, toolInputStreamFor } from "./tool-input-stream";
 import type { ToolLoadingChange, ToolLoadingStrategy, ToolLoadingTarget } from "./tool-loading";
@@ -1038,7 +1040,7 @@ function createAnthropicApiError(response: Response, rawBody: string): ApiError 
 }
 
 type AnthropicGenerateJsonResponse = {
-	content?: Array<{ type?: string; text?: string }>;
+	content?: Array<{ type?: string; text?: string; name?: string; input?: unknown }>;
 	usage?: AnthropicUsagePayload;
 	stop_reason?: string | null;
 	error?: { type?: string; code?: string | number; message?: string };
@@ -1063,7 +1065,29 @@ async function parseAnthropicGenerateResponse(
 	model: string,
 	config: AnthropicProviderConfig,
 	options?: GenerateOptions,
+	structuredInfo?: { responseFormatDeclined?: string },
 ): Promise<GenerateMetaResult> {
+	const forcedToolName = options?.responseFormat?.name;
+	/** Tool-call arguments accumulated per tool-use id (forced-tool structured output). */
+	const toolArgs = new Map<string, string>();
+	/** Degradation to report even when the payload happens to parse. */
+	const declined = structuredInfo?.responseFormatDeclined;
+	const structuralFields = (
+		args: string | undefined,
+	): Pick<GenerateMetaResult, "structured" | "responseFormatDegraded" | "reasoningSummary"> => {
+		if (!options?.responseFormat) return {};
+		if (declined) return { responseFormatDegraded: declined };
+		const structured = parseToolArguments(args);
+		if (structured !== undefined) {
+			// Same reporting rule as the other adapters: the summary is lifted from
+			// the named field and never synthesized from anything else.
+			const reasoningSummary = extractReasoningSummary(structured, options.responseFormat);
+			return { structured, ...(reasoningSummary ? { reasoningSummary } : {}) };
+		}
+		return {
+			responseFormatDegraded: "Anthropic returned no tool call matching the requested schema",
+		};
+	};
 	const contentType = response.headers.get("content-type")?.toLowerCase() ?? "";
 	if (contentType.includes("text/event-stream")) {
 		if (!response.body) {
@@ -1082,6 +1106,21 @@ async function parseAnthropicGenerateResponse(
 				await options?.onTextDelta?.(event.text);
 			}
 			if (event.reasoning) await options?.onReasoningDelta?.(event.reasoning);
+			// Forced-tool structured output: the payload arrives as tool-call
+			// arguments rather than visible text, so collect it here. Deltas are
+			// append-only per tool-use id, matching how the stream is emitted.
+			const toolChunk = forcedToolName ? event.toolUseChunk : undefined;
+			if (toolChunk && toolChunk.name === forcedToolName) {
+				if (toolChunk.input || toolChunk.finalInput) await options?.onGenerationProgress?.();
+				if (toolChunk.finalInput !== undefined) {
+					toolArgs.set(toolChunk.toolUseId, toolChunk.finalInput);
+				} else if (toolChunk.input) {
+					toolArgs.set(
+						toolChunk.toolUseId,
+						(toolArgs.get(toolChunk.toolUseId) ?? "") + toolChunk.input,
+					);
+				}
+			}
 			if (event.usage) {
 				usage = parsedAnthropicUsageToUsageData(event.usage);
 				const promptTokens = event.usage.promptTokens;
@@ -1109,7 +1148,13 @@ async function parseAnthropicGenerateResponse(
 				);
 			}
 		}
-		return { text, contextPercent, usage, ...(outputTruncated && { outputTruncated }) };
+		return {
+			text,
+			contextPercent,
+			usage,
+			...(outputTruncated && { outputTruncated }),
+			...structuralFields([...toolArgs.values()][0]),
+		};
 	}
 
 	// Compatibility fallback for relays that ignore stream=true and still return
@@ -1157,11 +1202,21 @@ async function parseAnthropicGenerateResponse(
 		});
 	}
 	if (text) await options?.onTextDelta?.(text);
+	// Forced-tool structured output in the non-streaming compatibility path: the
+	// payload is a `tool_use` block rather than text.
+	const forcedToolBlock = forcedToolName
+		? json.content?.find(
+				(content) => content.type === "tool_use" && content.name === forcedToolName,
+			)
+		: undefined;
 	return {
 		text,
 		...(outputTruncated && { outputTruncated }),
 		contextPercent: calculateAnthropicContextPercent(json.usage, model, config),
 		usage: json.usage ? extractAnthropicUsage(json.usage) : null,
+		...structuralFields(
+			forcedToolBlock?.input === undefined ? undefined : JSON.stringify(forcedToolBlock.input),
+		),
 	};
 }
 
@@ -1909,7 +1964,7 @@ export class AnthropicProvider implements ProviderAdapter {
 		});
 
 		await reportInputCharacters(params, body);
-		const bodyStr = JSON.stringify(body);
+		const bodyStr = await stringifyRequestBody(body, params.signal);
 
 		params.onRequestStart?.();
 		const response = await this.fetchWithV1Fallback(
@@ -1972,6 +2027,8 @@ export class AnthropicProvider implements ProviderAdapter {
 			thinking?: ReturnType<typeof buildThinkingConfig>;
 			output_config?: { effort: string };
 			metadata?: Record<string, unknown>;
+			tools?: Array<Record<string, unknown>>;
+			tool_choice?: Record<string, unknown>;
 		} = {
 			model: bareModel,
 			max_tokens:
@@ -1997,6 +2054,28 @@ export class AnthropicProvider implements ProviderAdapter {
 				};
 			}
 		}
+		// Structured output: Anthropic has no `response_format` field, so the
+		// schema is expressed as a tool the model is forced to call. Forcing
+		// `tool_choice` is rejected while extended thinking is on, so that
+		// combination declines the constraint explicitly (reported through
+		// `responseFormatDegraded`) instead of failing the whole request.
+		// `{type:"disabled"}` is an explicit "no thinking" instruction, not active
+		// thinking, so only enabled/adaptive modes block the forced tool.
+		const thinkingActive = body.thinking !== undefined && body.thinking.type !== "disabled";
+		const responseFormatDeclined =
+			options?.responseFormat && thinkingActive
+				? "Anthropic structured output is unavailable while extended thinking is enabled"
+				: undefined;
+		if (options?.responseFormat && !responseFormatDeclined) {
+			body.tools = [
+				{
+					name: options.responseFormat.name,
+					description: "Return the result as structured JSON matching the provided schema.",
+					input_schema: options.responseFormat.schema,
+				},
+			];
+			body.tool_choice = { type: "tool", name: options.responseFormat.name };
+		}
 		const metadata = this.buildRequestMetadata(isOfficial);
 		if (metadata) body.metadata = metadata;
 
@@ -2007,7 +2086,7 @@ export class AnthropicProvider implements ProviderAdapter {
 			{
 				method: "POST",
 				headers,
-				body: JSON.stringify(body),
+				body: await stringifyRequestBody(body, options?.signal),
 				signal: options?.signal,
 			},
 		);
@@ -2017,7 +2096,9 @@ export class AnthropicProvider implements ProviderAdapter {
 			throw createAnthropicApiError(response, errText);
 		}
 
-		return parseAnthropicGenerateResponse(response, bareModel, this.config, options);
+		return parseAnthropicGenerateResponse(response, bareModel, this.config, options, {
+			responseFormatDeclined,
+		});
 	}
 
 	async generateWithHistory(
@@ -2103,7 +2184,7 @@ export class AnthropicProvider implements ProviderAdapter {
 			{
 				method: "POST",
 				headers: genHeaders,
-				body: JSON.stringify(body),
+				body: await stringifyRequestBody(body, options?.signal),
 				signal: options?.signal,
 			},
 		);
@@ -2185,7 +2266,7 @@ export class AnthropicProvider implements ProviderAdapter {
 			{
 				method: "POST",
 				headers,
-				body: JSON.stringify(body),
+				body: await stringifyRequestBody(body, params.signal),
 				signal: params.signal,
 			},
 		);
@@ -2971,7 +3052,13 @@ function anthropicWireHistory(
 					});
 				} else if (item.text) {
 					history.push({
-						role: item.role === "sys" && options.midConversationSystem ? "system" : "user",
+						// Typed updates use the existing user carrier even on the native path:
+						// ensureAlternating would move a system entry past later user input.
+						// The frozen baseline explicitly grants named-part replacement semantics.
+						role:
+							item.role === "sys" && options.midConversationSystem && !item.contextUpdate
+								? "system"
+								: "user",
 						content: item.text,
 					});
 				}

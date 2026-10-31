@@ -1133,7 +1133,7 @@ async function doRunCustomCompact({
 			);
 		}
 
-		resetActiveUpstreamSession(narratorId);
+		resetActiveUpstreamSession(narratorId, { persistedIdentityCleared: true });
 		// Record that a history compact has completed but the active agent loop
 		// has not yet rebuilt its in-memory history from the new summary. This
 		// guards against a second background compact firing on the same (stale)

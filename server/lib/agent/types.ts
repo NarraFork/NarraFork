@@ -347,15 +347,13 @@ export interface ToolResult {
 
 export interface ToolDefinition {
 	name: string;
-	description: string | ((config: AgentConfig) => string);
+	description: string;
 	parameters: z.ZodType;
 	/** Optional bounded, actionable validation feedback; never includes raw tool input. */
 	formatValidationError?: (error: z.ZodError) => string;
 	/** Pre-built JSON Schema to send to providers, bypassing zodToJsonSchema conversion.
 	 *  Used by MCP tools to preserve the original inputSchema without lossy Zod round-tripping. */
 	rawJsonSchema?: Record<string, unknown>;
-	/** Optional dynamic schema override for tools that depend on current agent config. */
-	getRawJsonSchema?: (config: AgentConfig) => Record<string, unknown>;
 	/** Declarative execution routing; absent means the tool is not filesystem/device routed. */
 	executionRouting?: ToolExecutionRouting;
 	execute: (args: Record<string, unknown>, ctx: ToolContext) => Promise<ToolResult>;
@@ -376,8 +374,8 @@ export interface ToolDefinition {
 	};
 }
 
-/** ToolDefinition with description resolved to a plain string (after dynamic evaluation) */
-export type ResolvedToolDefinition = ToolDefinition & { description: string };
+/** Compatibility alias: tool definitions are already static. */
+export type ResolvedToolDefinition = ToolDefinition;
 
 // === Permission ===
 

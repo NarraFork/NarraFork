@@ -69,7 +69,7 @@ describe("Codex Responses WebSocket helpers", () => {
 		);
 	});
 
-	test("reuses previous_response_id when input extends last request baseline", () => {
+	test("reuses previous_response_id when input extends last request baseline", async () => {
 		const lastRequest = makeRequest([makeUserMessage("hello")]);
 		const lastCompleted = makeCompleted("resp-1", [makeAssistantMessage("assistant output")]);
 		const nextRequest = makeRequest([
@@ -78,13 +78,17 @@ describe("Codex Responses WebSocket helpers", () => {
 			makeUserMessage("second"),
 		]);
 
-		const envelope = buildCodexResponsesWebSocketRequest(nextRequest, lastRequest, lastCompleted);
+		const envelope = await buildCodexResponsesWebSocketRequest(
+			nextRequest,
+			lastRequest,
+			lastCompleted,
+		);
 		expect(envelope.type).toBe("response.create");
 		expect(envelope.previous_response_id).toBe("resp-1");
 		expect(envelope.input).toEqual([makeUserMessage("second")]);
 	});
 
-	test("falls back to full create when non-input request fields change", () => {
+	test("falls back to full create when non-input request fields change", async () => {
 		const lastRequest = makeRequest([makeUserMessage("hello")], "base one");
 		const lastCompleted = makeCompleted("resp-1", []);
 		const nextRequest = makeRequest(
@@ -92,12 +96,16 @@ describe("Codex Responses WebSocket helpers", () => {
 			"base two",
 		);
 
-		const envelope = buildCodexResponsesWebSocketRequest(nextRequest, lastRequest, lastCompleted);
+		const envelope = await buildCodexResponsesWebSocketRequest(
+			nextRequest,
+			lastRequest,
+			lastCompleted,
+		);
 		expect(envelope.previous_response_id).toBeUndefined();
 		expect(envelope.input).toEqual(nextRequest.input);
 	});
 
-	test("falls back to full create when reasoning settings change", () => {
+	test("falls back to full create when reasoning settings change", async () => {
 		const lastRequest = makeRequest([makeUserMessage("hello")]);
 		lastRequest.reasoning = { effort: "medium", summary: "auto" };
 		const lastCompleted = makeCompleted("resp-1", [makeAssistantMessage("assistant output")]);
@@ -108,17 +116,25 @@ describe("Codex Responses WebSocket helpers", () => {
 		]);
 		nextRequest.reasoning = { effort: "high", summary: "auto" };
 
-		const envelope = buildCodexResponsesWebSocketRequest(nextRequest, lastRequest, lastCompleted);
+		const envelope = await buildCodexResponsesWebSocketRequest(
+			nextRequest,
+			lastRequest,
+			lastCompleted,
+		);
 		expect(envelope.previous_response_id).toBeUndefined();
 		expect(envelope.input).toEqual(nextRequest.input);
 	});
 
-	test("falls back to full create when input is not a baseline extension", () => {
+	test("falls back to full create when input is not a baseline extension", async () => {
 		const lastRequest = makeRequest([makeUserMessage("hello")]);
 		const lastCompleted = makeCompleted("resp-1", []);
 		const nextRequest = makeRequest([makeUserMessage("different")]);
 
-		const envelope = buildCodexResponsesWebSocketRequest(nextRequest, lastRequest, lastCompleted);
+		const envelope = await buildCodexResponsesWebSocketRequest(
+			nextRequest,
+			lastRequest,
+			lastCompleted,
+		);
 		expect(envelope.previous_response_id).toBeUndefined();
 		expect(envelope.input).toEqual(nextRequest.input);
 	});
@@ -131,7 +147,7 @@ describe("Codex Responses WebSocket helpers", () => {
 	 * resends and the prompt cache is lost, with no error anywhere. codex-rs draws the
 	 * same line in responses_request_properties_match ("ignores metadata").
 	 */
-	test("still continues when only client_metadata differs", () => {
+	test("still continues when only client_metadata differs", async () => {
 		const lastRequest = makeRequest([makeUserMessage("hello")]);
 		lastRequest.client_metadata = { session_id: "conv-1", thread_id: "conv-1" };
 		const lastCompleted = makeCompleted("resp-1", [makeAssistantMessage("assistant output")]);
@@ -147,9 +163,80 @@ describe("Codex Responses WebSocket helpers", () => {
 			"x-codex-turn-state": "turn-state-token",
 		};
 
-		const envelope = buildCodexResponsesWebSocketRequest(nextRequest, lastRequest, lastCompleted);
+		const envelope = await buildCodexResponsesWebSocketRequest(
+			nextRequest,
+			lastRequest,
+			lastCompleted,
+		);
 		expect(envelope.previous_response_id).toBe("resp-1");
 		expect(envelope.input).toEqual([makeUserMessage("second")]);
+	});
+
+	test("large prefix comparison yields without changing input or unknown wire fields", async () => {
+		const payload = 'quote" slash\\ newline\n'.repeat(32 * 1024);
+		const first = makeUserMessage(payload);
+		const lastRequest = makeRequest([first]);
+		const nextRequest = makeRequest([first, makeUserMessage("next")]);
+		const extension = { opaque: { keep: [true, null, "future field"] } };
+		lastRequest.future_wire_field = extension;
+		nextRequest.future_wire_field = extension;
+		Object.freeze(extension.opaque.keep);
+		Object.freeze(extension.opaque);
+		Object.freeze(extension);
+		Object.freeze(first);
+		Object.freeze(lastRequest.input);
+		Object.freeze(lastRequest);
+		Object.freeze(nextRequest.input);
+		Object.freeze(nextRequest);
+		let yielded = false;
+		const heartbeat = setTimeout(() => {
+			yielded = true;
+		}, 0);
+		try {
+			const result = await buildCodexResponsesWebSocketRequest(
+				nextRequest,
+				lastRequest,
+				makeCompleted("large-prefix", []),
+			);
+			expect(yielded).toBe(true);
+			expect(result.previous_response_id).toBe("large-prefix");
+			expect(result.input).toEqual([makeUserMessage("next")]);
+			expect(result.future_wire_field).toEqual(extension);
+			expect(lastRequest.input).toEqual([first]);
+			expect(nextRequest.input).toHaveLength(2);
+		} finally {
+			clearTimeout(heartbeat);
+		}
+	});
+
+	test("large signature preparation is cancellable", async () => {
+		const request = makeRequest([makeUserMessage("x".repeat(2 * 1024 * 1024))]);
+		const controller = new AbortController();
+		const cancel = setTimeout(() => controller.abort(new Error("cancel signature preparation")), 0);
+		try {
+			await expect(
+				buildCodexResponsesWebSocketRequest(
+					request,
+					request,
+					makeCompleted("cancelled", []),
+					controller.signal,
+				),
+			).rejects.toThrow("cancel signature preparation");
+		} finally {
+			clearTimeout(cancel);
+		}
+	});
+
+	test("unknown item fields participate in continuation matching", async () => {
+		const old = { ...makeUserMessage("hello"), provider_extension: { opaque: "first" } };
+		const changed = { ...makeUserMessage("hello"), provider_extension: { opaque: "changed" } };
+		const result = await buildCodexResponsesWebSocketRequest(
+			makeRequest([changed, makeUserMessage("next")]),
+			makeRequest([old]),
+			makeCompleted("not-compatible", []),
+		);
+		expect(result.previous_response_id).toBeUndefined();
+		expect(result.input).toEqual([changed, makeUserMessage("next")]);
 	});
 
 	test("treats narrator activity within five minutes as recent", () => {

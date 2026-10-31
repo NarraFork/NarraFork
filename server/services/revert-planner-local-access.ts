@@ -719,7 +719,8 @@ export async function applyLocalRevertPlan(
 			for (const path of outcome.worktreePaths ?? [])
 				refresh(() => invalidateWorkspaceTreeCache(path));
 			const affected = new Set(outcome.historyResult?.affectedNarratorIds ?? []);
-			for (const id of affected) refresh(() => resetActiveUpstreamSession(id));
+			for (const id of affected)
+				refresh(() => resetActiveUpstreamSession(id, { persistedIdentityCleared: true }));
 			// The fixed root also refreshes for file-only operations and terminal retries.
 			affected.add(narratorId);
 			// Senders of removed deliveries only gain a message version; their upstream
