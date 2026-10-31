@@ -22,7 +22,9 @@ function instance(overrides: Partial<PlatformInstance> = {}): PlatformInstance {
 describe("platform instance providers", () => {
 	test("默认前缀的实例和额外实例走同一条解析路径", () => {
 		const builtin = instance({ id: "platform-codex", prefix: "codex", suffix: "", name: "Codex" });
-		expect(resolvePlatformInstanceAdapter("codex", "gpt-5", [builtin])).toBeInstanceOf(CodexProvider);
+		expect(resolvePlatformInstanceAdapter("codex", "gpt-5", [builtin])).toBeInstanceOf(
+			CodexProvider,
+		);
 		expect(resolvePlatformInstanceAdapter("codex-2", "gpt-5", [instance()])).toBeInstanceOf(
 			CodexProvider,
 		);
@@ -39,7 +41,9 @@ describe("platform instance providers", () => {
 
 	test("删掉的内置实例前缀可以给新实例复用", () => {
 		const reused = instance({ id: "later", prefix: "codex", suffix: "", name: "第二个 Codex" });
-		expect(resolvePlatformInstanceAdapter("codex", "gpt-5", [reused])).toBeInstanceOf(CodexProvider);
+		expect(resolvePlatformInstanceAdapter("codex", "gpt-5", [reused])).toBeInstanceOf(
+			CodexProvider,
+		);
 		expect(listPlatformInstanceReadiness([reused])).toHaveLength(1);
 	});
 

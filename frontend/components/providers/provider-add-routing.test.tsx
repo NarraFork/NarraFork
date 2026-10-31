@@ -1361,9 +1361,11 @@ describe("provider add nested route", () => {
 		await click(card);
 		await click(button("platformInstanceDelete"));
 		expect(saveCalls).toBe(1);
-		const saved = (savedPayloads.at(-1)?.agent as {
-			platformInstances?: Array<{ prefix: string }>;
-		}).platformInstances;
+		const saved = (
+			savedPayloads.at(-1)?.agent as {
+				platformInstances?: Array<{ prefix: string }>;
+			}
+		).platformInstances;
 		// 清单是唯一事实来源：删掉之后这条实例不再出现，平台卡也跟着消失。
 		expect(saved?.map((instance) => instance.prefix)).toEqual(["codex"]);
 		await act(async () => {

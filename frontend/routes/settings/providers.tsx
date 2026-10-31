@@ -1312,9 +1312,8 @@ function SettingsProvidersPage() {
 								<CommandCodeSection
 									prefix={selectedPlatformInstance.prefix}
 									models={
-										providerGroups.find(
-											(group) => group.prefix === selectedPlatformInstance.prefix,
-										)?.models ?? []
+										providerGroups.find((group) => group.prefix === selectedPlatformInstance.prefix)
+											?.models ?? []
 									}
 									hiddenModels={state.hiddenModels}
 									onToggleHidden={dispatchers.toggleHidden}

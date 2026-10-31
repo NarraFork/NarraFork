@@ -637,7 +637,6 @@ export const CodexSection = React.memo(function CodexSection({
 		archivedPage,
 	]);
 
-
 	useEffect(() => {
 		if (statusTierOrder === null) return;
 		const nextTierOrder = getCodexDisplayTierOrder(statusTierOrder);

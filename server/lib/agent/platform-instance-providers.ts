@@ -18,7 +18,9 @@ export function currentPlatformInstances(): PlatformInstance[] {
 }
 
 function stringList(value: unknown): string[] | undefined {
-	return Array.isArray(value) ? value.filter((id): id is string => typeof id === "string") : undefined;
+	return Array.isArray(value)
+		? value.filter((id): id is string => typeof id === "string")
+		: undefined;
 }
 
 /** 额外实例自己的 TokenDance apiKey；没配置就没有连接。 */
