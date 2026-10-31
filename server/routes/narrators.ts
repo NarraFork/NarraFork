@@ -764,6 +764,9 @@ const NARRATOR_ID_GATE_EXEMPT_SEGMENTS = new Set([
 	"human-attention",
 	// Session-less dashboard composer: resolves user-level commands and cwd skills only.
 	"draft-composer",
+	// 模型级 ModelTrace 舱的查询入口（`/modeltrace/lookup`）：第一个路径段是字面量，
+	// 没有可鉴权的叙述者 id；查询本身只返回「该模型是否已有舱」。
+	"modeltrace",
 	"whitelist-dirs",
 	"blacklist-dirs",
 	"cmd-whitelist",
@@ -5262,23 +5265,14 @@ function getAskInPassingPendingBlock(
 /**
  * 模型资料弹窗的入口用：该模型是否已经有 ModelTrace 舱。
  *
- * 解析走与探测请求完全相同的 `resolveProviderAndModel`，所以按钮查到的键和 /modeltrace
- * 写进叙述者的键一致。
+ * 键在 store 里按多种写法尝试（`provider::原始模型串` 与解析后的写法），所以这里只把
+ * 下拉框的值原样传进去。
  */
 narratorRoutes.get("/modeltrace/lookup", async (c) => {
 	const model = c.req.query("model")?.trim();
 	if (!model || model.length > 200) throw new ValidationError("Invalid model");
-	const { resolveProviderAndModel } = await import("../lib/agent/provider");
-	let resolved: ReturnType<typeof resolveProviderAndModel>;
-	try {
-		resolved = resolveProviderAndModel(model);
-	} catch {
-		// 供应商已删除或模型不再可解析：按钮按“还没有 trace”处理。
-		return c.json({ narratorId: null });
-	}
 	const { findModelTraceNarrator } = await import("../services/modeltrace-store");
-	const narratorId = await findModelTraceNarrator(resolved.provider, resolved.model);
-	return c.json({ narratorId });
+	return c.json({ narratorId: await findModelTraceNarrator(model) });
 });
 
 // A one-shot sampling fork reuses the parent's frozen upstream request prefix.
