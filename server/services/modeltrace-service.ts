@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { db } from "@server/db";
-import { narratorMessageRefs, narrators } from "@server/db/schema";
+import { narrators } from "@server/db/schema";
 import {
 	getModelTraceRequest,
 	type ModelTraceRequest,
@@ -18,13 +18,14 @@ import {
 	buildModelTracePrompt,
 	MODELTRACE_MAX_TEXT_LENGTH,
 } from "@server/lib/modeltrace";
-import { addTrait, parseTraits } from "@server/lib/narrator-utils";
+import { parseTraits } from "@server/lib/narrator-utils";
 import { buildUsageDataFromSnapshot } from "@server/lib/usage-tracking";
 import { normalizeLocale } from "@shared/i18n-locales";
 import type { ModelTraceResultBlock } from "@shared/modeltrace-result";
-import { desc, eq } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import { createRuntimeEventContext } from "./agent-runtime/context";
 import { type ExecutionOwner, tryClaimExecution } from "./agent-runtime/ownership";
+import { clearTraceHistory, ensureTraceNarrator, modelTraceKey } from "./modeltrace-store";
 
 // Session interrupt imports cancelModelTrace synchronously. Load persistence, websocket
 // and narrator-service only on execution to avoid their session dependency cycles.
@@ -390,31 +391,19 @@ export async function startModelTrace(
 	locale = "en",
 ): Promise<{ id: string }> {
 	const snapshot = requireSnapshot(parentId);
-	const { narratorService } = await import("./narrator-service");
-	const latest = await db.query.narratorMessageRefs.findFirst({
-		where: eq(narratorMessageRefs.narratorId, parentId),
-		orderBy: [desc(narratorMessageRefs.seq)],
-		columns: { messageId: true },
-	});
-	if (!latest) throw new ValidationError("请先发送一条消息，再运行 /modeltrace");
-	const child = await narratorService.forkNarrator(parentId, null, {
-		title: "ModelTrace",
-		inheritMode: "full",
-		specCarryover: "clear",
-		forkMessageId: latest.messageId,
+	// 一个模型一个舱：同一个模型再次 /modeltrace 只清空它自己的历史再重跑。
+	const traceId = await ensureTraceNarrator({
+		parentId,
+		key: modelTraceKey(snapshot.provider, snapshot.params.model),
+		title: `ModelTrace: ${snapshot.params.model}`,
+		model: snapshot.params.model,
 		userId,
 		locale,
 	});
-	await db
-		.update(narrators)
-		.set({
-			traits: addTrait(parseTraits(child.traits), "modeltrace"),
-			parentNarratorId: parentId,
-		})
-		.where(eq(narrators.id, child.id));
+	await clearTraceHistory(traceId);
 	// Keep the original prefix, not the probe params with the diagnostic prompt appended.
-	rememberModelTraceRequest(child.id, snapshot.adapter, snapshot.params, snapshot.provider);
-	return launchProbe(child.id, snapshot, userId, locale);
+	rememberModelTraceRequest(traceId, snapshot.adapter, snapshot.params, snapshot.provider);
+	return launchProbe(traceId, snapshot, userId, locale);
 }
 
 export async function retryModelTrace(

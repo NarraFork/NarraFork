@@ -225,6 +225,8 @@ export const narrators = pgTable(
 		forkMessageId: text("fork_message_id").references((): PgColumn => narratorMessages.id, {}),
 		type: text("type").notNull().default("primary"),
 		subagentType: text("subagent_type"),
+		hiddenFromLists: boolean("hidden_from_lists").notNull().default(false),
+		modeltraceKey: text("modeltrace_key"),
 		title: text("title"),
 		inheritMode: text("inherit_mode").notNull().default("fresh"),
 		parentNarratorId: text("parent_narrator_id").references((): PgColumn => narrators.id, {}),
@@ -328,6 +330,7 @@ export const narrators = pgTable(
 		index("idx_narrators_variant_updated").on(table.variant, table.updatedAt, table.id),
 		index("idx_narrators_handle").on(table.handle),
 		uniqueIndex("idx_narrators_handle_fold").on(table.handleFold),
+		uniqueIndex("idx_narrators_modeltrace_key").on(table.modeltraceKey),
 		index("idx_narrators_context_project").on(table.contextProjectId),
 		index("idx_narrators_oauth_owner").on(table.oauthOwnerGrantId),
 		uniqueIndex("idx_narrators_oauth_provision").on(
@@ -4066,7 +4069,7 @@ export const notifications = pgTable(
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
   "tableCount": 133,
-  "columnCount": 1745,
+  "columnCount": 1747,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -5144,6 +5147,27 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "property": "hiddenFromLists",
+          "name": "hidden_from_lists",
+          "kind": "integer",
+          "mode": "boolean",
+          "pgType": "boolean",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "false",
+          "defaultExpression": "false"
+        },
+        {
+          "property": "modeltraceKey",
+          "name": "modeltrace_key",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
           "property": "title",
           "name": "title",
           "kind": "text",
@@ -5983,6 +6007,13 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "name": "idx_narrators_handle_fold",
           "columns": [
             "handleFold"
+          ],
+          "unique": true
+        },
+        {
+          "name": "idx_narrators_modeltrace_key",
+          "columns": [
+            "modeltraceKey"
           ],
           "unique": true
         },

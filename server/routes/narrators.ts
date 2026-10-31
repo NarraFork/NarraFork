@@ -1020,6 +1020,8 @@ narratorRoutes.get("/", async (c) => {
 	// undefined for admins, which `and(...)` treats as no extra restriction.
 	const conditions = [
 		eq(narrators.variant, "primary"),
+		// 系统内部叙述者（ModelTrace 舱）不进列表，只能从自己的入口凭 id 打开。
+		eq(narrators.hiddenFromLists, false),
 		narratorReadableWhere(narratorPrincipalOf(c)),
 	];
 
@@ -5257,6 +5259,28 @@ function getAskInPassingPendingBlock(
 	return null;
 }
 
+/**
+ * 模型资料弹窗的入口用：该模型是否已经有 ModelTrace 舱。
+ *
+ * 解析走与探测请求完全相同的 `resolveProviderAndModel`，所以按钮查到的键和 /modeltrace
+ * 写进叙述者的键一致。
+ */
+narratorRoutes.get("/modeltrace/lookup", async (c) => {
+	const model = c.req.query("model")?.trim();
+	if (!model || model.length > 200) throw new ValidationError("Invalid model");
+	const { resolveProviderAndModel } = await import("../lib/agent/provider");
+	let resolved: ReturnType<typeof resolveProviderAndModel>;
+	try {
+		resolved = resolveProviderAndModel(model);
+	} catch {
+		// 供应商已删除或模型不再可解析：按钮按“还没有 trace”处理。
+		return c.json({ narratorId: null });
+	}
+	const { findModelTraceNarrator } = await import("../services/modeltrace-store");
+	const narratorId = await findModelTraceNarrator(resolved.provider, resolved.model);
+	return c.json({ narratorId });
+});
+
 // A one-shot sampling fork reuses the parent's frozen upstream request prefix.
 narratorRoutes.post("/:id/modeltrace", async (c) => {
 	const userId = c.get("user").sub;
@@ -5264,7 +5288,6 @@ narratorRoutes.post("/:id/modeltrace", async (c) => {
 	const result = await startModelTrace(c.req.param("id"), userId, await getUserLanguage(userId));
 	return c.json(result, 201);
 });
-
 // Retry one sampling round in the same diagnostic session.
 narratorRoutes.post("/:id/modeltrace/retry", async (c) => {
 	const userId = c.get("user").sub;
