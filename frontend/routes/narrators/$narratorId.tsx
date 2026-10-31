@@ -172,6 +172,11 @@ function NarratorDetailPage() {
 		? // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 			((narrator as any).traits as string[]).includes("bot")
 		: false;
+	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+	const isModelTrace = Array.isArray((narrator as any)?.traits)
+		? // biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
+			((narrator as any).traits as string[]).includes("modeltrace")
+		: false;
 	const monitoring = search?.view === "monitor" || !!highlightMessageId;
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const legacyParentNarratorId = (narrator as any)?.parentNarratorId as string | null | undefined;
@@ -210,6 +215,7 @@ function NarratorDetailPage() {
 		// flips its status here, and re-running this effect would resurrect the tab that
 		// the archive just removed. Interacting auto-unarchives it, which re-registers.
 		if (narratorStatus === "archived") return;
+		if (isModelTrace) return;
 		if (isSubagent) {
 			if (
 				!shouldAddSubagentRecentTab({
@@ -244,6 +250,7 @@ function NarratorDetailPage() {
 		narratorCwd,
 		narratorStatus,
 		isSubagent,
+		isModelTrace,
 		isScheduled,
 		parentNarratorId,
 		userPrefs?.addSubagentToRecentTabs,

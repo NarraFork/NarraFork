@@ -2667,6 +2667,7 @@ function NarratorPanelBody({
 		onForkCommand: handleForkCommand,
 		onCompactCommand: handleCompactCommand,
 		onModelTraceStarted: (id) => {
+			void qc.invalidateQueries({ queryKey: ["modeltrace-narrator"] });
 			if (dock?.openSubagentPanel) dock.openSubagentPanel(id);
 			else navigate({ to: "/narrators/$narratorId", params: { narratorId: id } });
 		},

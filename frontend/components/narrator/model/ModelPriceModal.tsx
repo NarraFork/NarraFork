@@ -161,6 +161,27 @@ export function ModelPriceModal({
 			zIndex={Z.modal}
 		>
 			<Stack gap="sm" mb="md">
+				{model?.value && (
+					<Tooltip label={t("modelTrace.openHistoryHint")} disabled={Boolean(traceNarratorId)}>
+						<span style={{ display: "inline-flex" }}>
+							<Button
+								size="xs"
+								variant="subtle"
+								disabled={!traceNarratorId}
+								onClick={() => {
+									if (!traceNarratorId) return;
+									onClose();
+									navigate({
+										to: "/narrators/$narratorId",
+										params: { narratorId: traceNarratorId },
+									});
+								}}
+							>
+								{t("modelTrace.openHistory")}
+							</Button>
+						</span>
+					</Tooltip>
+				)}
 				{actual.isFetching && <Loader size="sm" />}
 				{actual.error && <Alert color="red">{actual.error.message}</Alert>}
 				{actual.data && (
@@ -197,23 +218,6 @@ export function ModelPriceModal({
 							>
 								{ts("catalog.editBinding")}
 							</Button>
-							<Tooltip label={t("modelTrace.openHistoryHint")} disabled={Boolean(traceNarratorId)}>
-								<Button
-									size="xs"
-									variant="subtle"
-									disabled={!traceNarratorId}
-									onClick={() => {
-										if (!traceNarratorId) return;
-										onClose();
-										navigate({
-											to: "/narrators/$narratorId",
-											params: { narratorId: traceNarratorId },
-										});
-									}}
-								>
-									{t("modelTrace.openHistory")}
-								</Button>
-							</Tooltip>
 							{actual.data.variantId && (
 								<Button
 									size="xs"
