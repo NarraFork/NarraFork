@@ -530,7 +530,13 @@ export function useAllModels() {
 							? settingsData?.commandcodeAvailable
 								? commandcodeModelIds
 								: []
-							: [];
+							: // TokenDance 实例仍用平台目录，凭据由实例自己提供。
+								(settingsData?.tokendance as TokenDancePublicConnection | undefined)?.connected
+								? (
+										(settingsData?.tokendance as TokenDancePublicConnection | undefined)?.models ??
+										[]
+									).map((m) => m.id)
+								: [];
 				return {
 					prefix: instance.prefix,
 					name: instance.name,

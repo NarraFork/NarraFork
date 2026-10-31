@@ -762,13 +762,28 @@ export class CodexManager {
 
 	// ==================== Credential Selection ====================
 
-	async acquireContext(sessionKey?: string): Promise<CallContext> {
+	async acquireContext(
+		sessionKey?: string,
+		options?: { credentialIds?: readonly string[] },
+	): Promise<CallContext> {
 		this.reviveQuotaResetCredentials();
 		this.applyCachedQuotaStates();
 		this.pruneSessionAffinity();
+		// 平台实例可以把自己的候选限定在选中的凭据上；为空表示不限制（内置平台的路径不变）。
+		const allowed =
+			options?.credentialIds && options.credentialIds.length > 0
+				? new Set(options.credentialIds)
+				: undefined;
+		if (allowed) {
+			const usable = this.poolEntries.some((entry) => allowed.has(entry.id));
+			// 选中的凭据一个都不存在时直接失败，绝不回落到其它平台的凭据。
+			if (!usable) throw new Error("No usable Codex credential is selected for this instance");
+		}
 		// Archived credentials are retired: they never participate in selection, so
 		// the retry budget must only count the pool that can actually serve.
-		const total = this.poolEntries.length;
+		const total = allowed
+			? this.poolEntries.filter((entry) => allowed.has(entry.id)).length
+			: this.poolEntries.length;
 		const triedIds = new Set<string>();
 		const stickyEnabled =
 			(this.loadBalancingMode === "balanced" || this.loadBalancingMode === "tier-balanced") &&
@@ -778,7 +793,12 @@ export class CodexManager {
 			const sticky = this.sessionAffinity.get(sessionKey);
 			if (sticky) {
 				const stickyEntry = this.entries.find((e) => e.id === sticky.credentialId);
-				if (!stickyEntry || stickyEntry.disabled || isArchivedCodexCredential(stickyEntry)) {
+				if (
+					!stickyEntry ||
+					stickyEntry.disabled ||
+					isArchivedCodexCredential(stickyEntry) ||
+					(allowed !== undefined && !allowed.has(stickyEntry.id))
+				) {
 					this.unbindSession(sessionKey);
 				} else {
 					const ctx = await this.tryEnsureToken(stickyEntry);
@@ -793,12 +813,12 @@ export class CodexManager {
 		}
 
 		while (triedIds.size < total) {
-			const entry = this.selectEntry(triedIds);
+			const entry = this.selectEntry(triedIds, allowed);
 
 			if (!entry) {
 				// Try self-healing
 				if (this.trySelfHeal()) {
-					const healed = this.selectEntry(triedIds);
+					const healed = this.selectEntry(triedIds, allowed);
 					if (healed) {
 						const ctx = await this.tryEnsureToken(healed);
 						if (ctx) {
@@ -831,11 +851,15 @@ export class CodexManager {
 		return this.entries.filter((e) => !isArchivedCodexCredential(e));
 	}
 
-	private selectEntry(excludeIds?: Set<string>): CodexCredential | null {
+	private selectEntry(
+		excludeIds?: Set<string>,
+		allowedIds?: ReadonlySet<string>,
+	): CodexCredential | null {
 		const available = this.entries.filter((e) => {
 			if (e.disabled) return false;
 			if (isArchivedCodexCredential(e)) return false;
 			if (excludeIds?.has(e.id)) return false;
+			if (allowedIds && !allowedIds.has(e.id)) return false;
 			return true;
 		});
 

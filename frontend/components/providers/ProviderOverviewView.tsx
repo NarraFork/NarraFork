@@ -45,6 +45,7 @@ export const ProviderOverviewView = React.memo(function ProviderOverviewView({
 
 	const getProviderStatus = (group: ProviderGroup): ProviderStatus => {
 		if (group.disabled) return "disabled";
+		if (group.configured === false) return "unverified";
 		if (group.prefix === "tokendance" && group.isPlatform) return "connected";
 		if (group.models.length === 0) return "unverified";
 		return "connected";
@@ -139,7 +140,7 @@ export const ProviderOverviewView = React.memo(function ProviderOverviewView({
 								leftSection={<IconPlus size={14} />}
 								onClick={onAddPlatform}
 							>
-								{t("addProvider")}
+								{t("addPlatform")}
 							</Button>
 						)}
 					</Group>

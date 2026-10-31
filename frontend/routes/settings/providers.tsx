@@ -36,6 +36,7 @@ import {
 } from "../../components/providers/CustomApiProviderSection";
 import { ModelTestDialog } from "../../components/providers/ModelTestDialog";
 import { NUGProvidersSection } from "../../components/providers/NUGProvidersSection";
+import { PlatformInstanceSection } from "../../components/providers/PlatformInstanceSection";
 import {
 	type NewPlatformInstance,
 	type PlatformInstanceRow,
@@ -418,9 +419,21 @@ function SettingsProvidersPage() {
 					suffix: instance.suffix,
 					prefix: instance.prefix,
 					disabled: false,
-					config: {},
+					// 只写表单里的值：新实例与已有平台互不共享凭据。
+					config: instance.config,
 				},
 			]);
+		},
+		[platformInstances, savePlatformInstances],
+	);
+	/** 保存某个实例自己的配置（只替换这一条，不碰其它实例与内置平台）。 */
+	const savePlatformInstanceConfig = useCallback(
+		(id: string, config: Record<string, unknown>) => {
+			savePlatformInstances(
+				platformInstances.map((instance) =>
+					instance.id === id ? { ...instance, config } : instance,
+				),
+			);
 		},
 		[platformInstances, savePlatformInstances],
 	);
@@ -996,6 +1009,8 @@ function SettingsProvidersPage() {
 					// Plugin providers sit in the platform column: like the builtins they are single
 					// instance and cannot be added or removed from this page.
 					const isPlatform = platformPrefixes.has(prefix) || plugin !== undefined;
+					// 平台实例：只有 config 非空才算配置过（新建实例从空白开始，不继承任何凭据）。
+					const instanceConfig = platformInstances.find((entry) => entry.prefix === prefix)?.config;
 
 					// Find provider config for multi-instance providers so local detail toggles
 					// (provider.disabled) and overview toggles (disabledProviders) agree immediately.
@@ -1049,6 +1064,9 @@ function SettingsProvidersPage() {
 						disabled,
 						inactive,
 						isPlatform,
+						...(instanceConfig === undefined
+							? {}
+							: { configured: Object.keys(instanceConfig).length > 0 }),
 						...(plugin?.pluginId ? { pluginId: plugin.pluginId } : {}),
 						...(plugin?.contributionId ? { contributionId: plugin.contributionId } : {}),
 					};
@@ -1087,6 +1105,11 @@ function SettingsProvidersPage() {
 		if (!target) return null;
 		if (target === "tokendance") return tokenDance?.connected ? "tokendance" : null;
 		if (target === "codex" || target === "CommandCode") return target;
+		// 平台实例：以实例 id 选中（兼容旧的 prefix 深链）。
+		const instance = platformInstances.find(
+			(entry) => entry.id === target || entry.prefix === target,
+		);
+		if (instance) return instance.id;
 		const configured = [...state.customApiProviders, ...state.nugProviders];
 		const byId = configured.find((p) => p.id === target);
 		if (byId) return byId.id;
@@ -1102,6 +1125,7 @@ function SettingsProvidersPage() {
 		state.customApiProviders,
 		state.nugProviders,
 		pluginProviderGroups,
+		platformInstances,
 	]);
 
 	// ── Provider label for detail panel ──
@@ -1119,6 +1143,12 @@ function SettingsProvidersPage() {
 		return map;
 	}, [pluginProviderGroups]);
 
+	/** 选中的平台实例（实例 id 命中时才有），用于渲染该实例自己的配置。 */
+	const selectedPlatformInstance = useMemo(
+		() => platformInstances.find((entry) => entry.id === selectedProvider),
+		[platformInstances, selectedProvider],
+	);
+
 	/**
 	 * Owning plugin for the selected provider, or undefined for builtins.
 	 *
@@ -1134,6 +1164,8 @@ function SettingsProvidersPage() {
 
 	const selectedProviderLabel = useMemo(() => {
 		if (!selectedProvider) return "";
+		const instance = platformInstances.find((entry) => entry.id === selectedProvider);
+		if (instance) return instance.name;
 		// Platform providers: selectedProvider is the prefix
 		if (["codex", "CommandCode", "tokendance"].includes(selectedProvider)) {
 			return providerLabels[selectedProvider] ?? selectedProvider;
@@ -1155,6 +1187,7 @@ function SettingsProvidersPage() {
 		state.customApiProviders,
 		state.nugProviders,
 		providerLabels,
+		platformInstances,
 	]);
 
 	// ── Auto-fetch models after a manual save ──
@@ -1261,7 +1294,16 @@ function SettingsProvidersPage() {
 					providerLabel={selectedProviderLabel}
 					onClose={() => setSelectedProvider(null)}
 				>
-					{selectedProvider === "tokendance" && tokenDance?.connected ? (
+					{selectedPlatformInstance ? (
+						<PlatformInstanceSection
+							key={selectedPlatformInstance.id}
+							instance={selectedPlatformInstance}
+							onSave={(config) => {
+								savePlatformInstanceConfig(selectedPlatformInstance.id, config);
+								notifications.show({ message: t("platformInstanceConfigSaved"), color: "green" });
+							}}
+						/>
+					) : selectedProvider === "tokendance" && tokenDance?.connected ? (
 						<TokenDanceSection
 							connection={tokenDance}
 							enabled={!tokenDanceDisabled}
