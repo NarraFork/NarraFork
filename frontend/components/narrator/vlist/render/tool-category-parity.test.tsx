@@ -10,11 +10,13 @@
  * taking the whole narrator view down with the root error boundary.
  *
  * The compile-time check below fails `tsgo` the moment the two unions drift; the
- * runtime cases cover the tables and a real card render for the category that broke.
+ * runtime cases cover the tables, the chip a ScheduledTask card actually paints,
+ * and the gray fallback that keeps an unknown category from throwing.
  */
 
 import { afterAll, beforeAll, describe, expect, it } from "bun:test";
 import { MantineProvider } from "@mantine/core";
+import { parseHTML } from "linkedom";
 import type { ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import {
@@ -25,7 +27,7 @@ import {
 import type { ToolCategory as MeasureCategory, ToolCallData } from "../measure/measure-tool-call";
 import { installCanvasStub } from "../measure/test-canvas-stub";
 import { categoryIcon } from "./category-icons";
-import { CATEGORY_COLOR, RenderToolCall } from "./RenderToolCall";
+import { CATEGORY_COLOR, categoryColor, RenderToolCall } from "./RenderToolCall";
 
 // Compile-time: the two unions must be identical in both directions.
 type Exact<A, B> = [A] extends [B] ? ([B] extends [A] ? true : false) : false;
@@ -92,25 +94,53 @@ describe("tool category parity — classifier vs vlist render tables", () => {
 	it("classifies ScheduledTask as schedule and paints it yellow with its own glyph", () => {
 		expect(getCategory("ScheduledTask", { action: "create" })).toBe("schedule");
 		expect(CATEGORY_COLOR.schedule).toBe("yellow");
+		expect(categoryColor("schedule")).toBe("yellow");
 		expect(categoryIcon("schedule")).not.toBe(categoryIcon("generic"));
 		expect(categoryIcon("schedule")).not.toBe(categoryIcon("await"));
+		expect(categoryIcon("schedule")).not.toBe(categoryIcon("terminal"));
 	});
 
-	it("renders a ScheduledTask card header without throwing", () => {
-		const measured = measureToolCall(
-			{
-				toolName: "ScheduledTask",
-				summary: "create · Nightly report",
-				category: "schedule",
-				status: "success",
-			} as ToolCallData,
-			600,
-			5,
-		);
-		const render = (node: ReactNode) =>
-			renderToStaticMarkup(<MantineProvider forceColorScheme="dark">{node}</MantineProvider>);
-		const html = render(<RenderToolCall measured={measured} />);
-		expect(html).toContain("data-nf-card-header-chip");
-		expect(html).toContain("yellow");
+	it("gives every classifier category a glyph, and unknown strings a neutral one", () => {
+		for (const category of CLASSIFIER_CATEGORIES) {
+			// Tabler icons are forwardRef objects, not bare functions.
+			expect(categoryIcon(category), category).toBeTruthy();
+		}
+		expect(categoryIcon("nope" as MeasureCategory)).toBe(categoryIcon("generic"));
+		expect(categoryColor(undefined)).toBe("gray");
+		expect(categoryColor("nope")).toBe("gray");
+	});
+
+	it("renders a ScheduledTask card header yellow with the calendar glyph", () => {
+		const chip = headerChip("ScheduledTask", "schedule", "create · Nightly report");
+		expect(chip.getAttribute("style") ?? "").toContain("yellow");
+		expect(glyphName(chip)).toContain("calendar-time");
+	});
+
+	it("renders an unknown category as gray instead of throwing", () => {
+		const chip = headerChip("ScheduledTask", "nope" as MeasureCategory, "create");
+		const style = chip.getAttribute("style") ?? "";
+		expect(style).toContain("gray");
+		expect(style).not.toContain("undefined");
 	});
 });
+
+function headerChip(toolName: string, category: MeasureCategory, summary: string): HTMLElement {
+	const measured = measureToolCall(
+		{ toolName, summary, category, status: "success" } as ToolCallData,
+		600,
+		5,
+	);
+	const html = renderCard(<RenderToolCall measured={measured} />);
+	const { document } = parseHTML(`<!doctype html><html><body><div id="r">${html}</div></body>`);
+	const el = document.querySelector("[data-nf-card-header-chip]");
+	if (!el) throw new Error("card header chip not found");
+	return el as unknown as HTMLElement;
+}
+
+function glyphName(chip: HTMLElement): string {
+	return String(chip.querySelector("svg")?.getAttribute("class") ?? "");
+}
+
+function renderCard(node: ReactNode): string {
+	return renderToStaticMarkup(<MantineProvider forceColorScheme="dark">{node}</MantineProvider>);
+}

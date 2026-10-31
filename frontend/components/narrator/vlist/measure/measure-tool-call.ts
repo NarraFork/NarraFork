@@ -178,10 +178,10 @@ import {
 import { pretextLineMetrics } from "./pretext-metrics";
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Tool category — a LOCAL copy of ToolCallCard.tsx's ToolCategory union. We do
-// NOT import from ToolCallCard.tsx: it is a heavy React/Mantine module and the
-// measure layer must stay pure/arithmetic (mirrors measure-web-search.ts not
-// importing i18n). The dispatch/registry layer maps a live tool call to this.
+// Tool category — a LOCAL copy of `ToolCategory` in tool-call/tool-display.ts.
+// Not imported from there: that module pulls the detail classifier, and this
+// file must stay pure arithmetic. tool-category-parity.test.tsx fails tsgo when
+// the two unions drift. The registry casts a live category string onto this.
 // ─────────────────────────────────────────────────────────────────────────────
 export type ToolCategory =
 	| "read"

@@ -87,7 +87,7 @@ import { swallowSelectionClick } from "./key-activate";
 import { RenderMarkdown } from "./RenderMarkdown";
 import { RenderInlinePermission } from "./RenderPermission";
 import {
-	CATEGORY_COLOR,
+	categoryColor,
 	RenderToolBody,
 	ToolTimingArea,
 	type ToolTimingLabels,
@@ -421,11 +421,11 @@ function RecentCallCategoryChip({
 	return (
 		// Same `data-trace-row-chip` marker a folded trace row's chip carries — the two
 		// rows are one shape, so a parity test must be able to find both the same way.
-		// Shared CategoryChip: ThemeIcon light + CATEGORY_COLOR, identical to the card header.
+		// Shared CategoryChip: ThemeIcon light + categoryColor, identical to the card header.
 		<CategoryChip
 			data-trace-row-chip
 			size={TRACE_ROW_ICON}
-			color={CATEGORY_COLOR[resolved] ?? "gray"}
+			color={categoryColor(resolved)}
 			data-testid="subagent-activity-category-chip"
 		>
 			<Icon size={TRACE_ROW_GLYPH_SIZE} />
