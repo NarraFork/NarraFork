@@ -42,7 +42,7 @@ export type TurnInterruptionPlan =
 			action: "prompt";
 			retries: number;
 			reason: NonNullable<ExecuteLoopResult["interruptedReason"]>;
-			promptKey: "interruptionContinue" | "resumeAfterTransientError";
+			promptKey: "interruptionContinue" | "resumeAfterTransientError" | "thinkingExhaustedContinue";
 	  };
 
 /**
@@ -54,6 +54,13 @@ export type TurnInterruptionPlan =
  * produced). Defaulting the reason to `completion_limit` matches the flag's own
  * documented default for callers that only ever checked `interrupted`.
  *
+ * A completion limit with NOTHING visible to resume (no text, no tool call) is its own
+ * case: the whole output budget went into internal reasoning. "Continue from where you
+ * left off" is meaningless there — there is no interruption point, and re-sending it just
+ * lets the model spend another full output budget thinking. It gets one targeted nudge
+ * ("answer directly, do not keep reasoning") and a second identical outcome stops the
+ * turn instead of burning another pass.
+ *
  * `suppressed` folds together the two ways a caller declines to continue at all — the
  * primary loop's `!active.alive` and the subagent's `signal.aborted`. Both mean the same
  * thing here: something else owns the run's ending, so reset the counter and let the
@@ -63,7 +70,11 @@ export type TurnInterruptionPlan =
 export function planTurnInterruption(
 	result: Pick<
 		ExecuteLoopResult,
-		"interrupted" | "interruptedReason" | "shouldReplayInterruptedToolResultTurn"
+		| "interrupted"
+		| "interruptedReason"
+		| "shouldReplayInterruptedToolResultTurn"
+		| "hadToolUses"
+		| "finalText"
 	>,
 	previousRetries: number,
 	options?: { suppressed?: boolean; maxRetries?: number },
@@ -72,6 +83,15 @@ export function planTurnInterruption(
 	const maxRetries = options?.maxRetries ?? MAX_TURN_INTERRUPTION_RETRIES;
 	const reason = result.interruptedReason ?? "completion_limit";
 	const retries = previousRetries + 1;
+	const thinkingOnly =
+		reason === "completion_limit" &&
+		result.hadToolUses === false &&
+		result.finalText !== undefined &&
+		!result.finalText.trim();
+	if (thinkingOnly) {
+		if (previousRetries >= 1) return { action: "stop", retries, reason };
+		return { action: "prompt", retries, reason, promptKey: "thinkingExhaustedContinue" };
+	}
 	if (retries > maxRetries) return { action: "stop", retries, reason };
 	if (result.shouldReplayInterruptedToolResultTurn) return { action: "replay", retries, reason };
 	return {

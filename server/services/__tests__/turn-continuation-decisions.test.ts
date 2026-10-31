@@ -16,7 +16,7 @@ import {
 
 describe("planTurnInterruption", () => {
 	test("a pass that was not interrupted resets the counter", () => {
-		expect(planTurnInterruption({ interrupted: false }, 2)).toEqual({
+		expect(planTurnInterruption({ interrupted: false, finalText: "partial output" }, 2)).toEqual({
 			action: "none",
 			retries: 0,
 		});
@@ -24,7 +24,7 @@ describe("planTurnInterruption", () => {
 
 	test("defaults a missing reason to completion_limit", () => {
 		// The flag's documented default, relied on by callers that only checked `interrupted`.
-		expect(planTurnInterruption({ interrupted: true }, 0)).toEqual({
+		expect(planTurnInterruption({ interrupted: true, finalText: "partial output" }, 0)).toEqual({
 			action: "prompt",
 			retries: 1,
 			reason: "completion_limit",
@@ -32,9 +32,49 @@ describe("planTurnInterruption", () => {
 		});
 	});
 
+	test("a completion limit with nothing visible nudges once, then stops", () => {
+		// 思考耗尽：整个输出预算花在内部思考上，既无文本也无工具调用。"从中断处继续"没有中断处可续，
+		// 再想一轮只会再次撞上限并烧掉一整轮预算，所以只给一次针对性指令，第二次零产出直接停。
+		const thinkingOnly = {
+			interrupted: true,
+			interruptedReason: "completion_limit" as const,
+			hadToolUses: false,
+			finalText: "",
+		};
+		expect(planTurnInterruption(thinkingOnly, 0)).toEqual({
+			action: "prompt",
+			retries: 1,
+			reason: "completion_limit",
+			promptKey: "thinkingExhaustedContinue",
+		});
+		expect(planTurnInterruption(thinkingOnly, 1)).toEqual({
+			action: "stop",
+			retries: 2,
+			reason: "completion_limit",
+		});
+	});
+
+	test("partial text or a tool call keeps the ordinary resume prompt", () => {
+		// 有可见产出时"从中断处继续"才是对的：确实存在可续的中断处。
+		for (const visible of [
+			{ hadToolUses: false, finalText: "half an answer" },
+			{ hadToolUses: true, finalText: "" },
+		]) {
+			expect(
+				planTurnInterruption(
+					{ interrupted: true, interruptedReason: "completion_limit", ...visible },
+					0,
+				),
+			).toMatchObject({ action: "prompt", promptKey: "interruptionContinue" });
+		}
+	});
+
 	test("a resumable error asks for the transient-resume prompt", () => {
 		expect(
-			planTurnInterruption({ interrupted: true, interruptedReason: "resumable_error" }, 0),
+			planTurnInterruption(
+				{ interrupted: true, interruptedReason: "resumable_error", finalText: "partial output" },
+				0,
+			),
 		).toEqual({
 			action: "prompt",
 			retries: 1,
@@ -46,12 +86,24 @@ describe("planTurnInterruption", () => {
 	test("a replayable tool-result turn is replayed rather than prompted", () => {
 		// Replaying preserves the original packet shape; a synthetic prompt would change it.
 		expect(
-			planTurnInterruption({ interrupted: true, shouldReplayInterruptedToolResultTurn: true }, 0),
+			planTurnInterruption(
+				{
+					interrupted: true,
+					shouldReplayInterruptedToolResultTurn: true,
+					finalText: "partial output",
+				},
+				0,
+			),
 		).toEqual({ action: "replay", retries: 1, reason: "completion_limit" });
 	});
 
 	test("the retry budget is bounded and the overshoot is reported", () => {
-		expect(planTurnInterruption({ interrupted: true }, MAX_TURN_INTERRUPTION_RETRIES)).toEqual({
+		expect(
+			planTurnInterruption(
+				{ interrupted: true, finalText: "partial output" },
+				MAX_TURN_INTERRUPTION_RETRIES,
+			),
+		).toEqual({
 			action: "stop",
 			retries: MAX_TURN_INTERRUPTION_RETRIES + 1,
 			reason: "completion_limit",
@@ -62,7 +114,11 @@ describe("planTurnInterruption", () => {
 		// Otherwise an endlessly replayable turn would never stop.
 		expect(
 			planTurnInterruption(
-				{ interrupted: true, shouldReplayInterruptedToolResultTurn: true },
+				{
+					interrupted: true,
+					shouldReplayInterruptedToolResultTurn: true,
+					finalText: "partial output",
+				},
 				MAX_TURN_INTERRUPTION_RETRIES,
 			).action,
 		).toBe("stop");
@@ -71,31 +127,45 @@ describe("planTurnInterruption", () => {
 	test("the counter advances by exactly one per interrupted pass", () => {
 		let retries = 0;
 		for (let i = 1; i <= MAX_TURN_INTERRUPTION_RETRIES; i++) {
-			const plan = planTurnInterruption({ interrupted: true }, retries);
+			const plan = planTurnInterruption(
+				{ interrupted: true, finalText: "partial output" },
+				retries,
+			);
 			retries = plan.retries;
 			expect(retries).toBe(i);
 			expect(plan.action).not.toBe("stop");
 		}
-		expect(planTurnInterruption({ interrupted: true }, retries).action).toBe("stop");
+		expect(
+			planTurnInterruption({ interrupted: true, finalText: "partial output" }, retries).action,
+		).toBe("stop");
 	});
 
 	test("suppressed reproduces the primary loop's `&& active.alive` guard", () => {
 		// A dead session (or an aborted subagent run) must reset the counter and fall through
 		// to the normal termination path, NOT preserve a partial count into the next turn.
-		expect(planTurnInterruption({ interrupted: true }, 2, { suppressed: true })).toEqual({
+		expect(
+			planTurnInterruption({ interrupted: true, finalText: "partial output" }, 2, {
+				suppressed: true,
+			}),
+		).toEqual({
 			action: "none",
 			retries: 0,
 		});
 	});
 
 	test("suppression wins over an exhausted budget", () => {
-		expect(planTurnInterruption({ interrupted: true }, 99, { suppressed: true }).action).toBe(
-			"none",
-		);
+		expect(
+			planTurnInterruption({ interrupted: true, finalText: "partial output" }, 99, {
+				suppressed: true,
+			}).action,
+		).toBe("none");
 	});
 
 	test("an explicit maxRetries overrides the shared default", () => {
-		expect(planTurnInterruption({ interrupted: true }, 0, { maxRetries: 0 }).action).toBe("stop");
+		expect(
+			planTurnInterruption({ interrupted: true, finalText: "partial output" }, 0, { maxRetries: 0 })
+				.action,
+		).toBe("stop");
 	});
 });
 
@@ -108,10 +178,18 @@ describe("shared interruption defaults preserve the delegated behavior", () => {
 
 	test("agrees with the shared function on every branch", () => {
 		const cases = [
-			{ interrupted: false },
-			{ interrupted: true },
-			{ interrupted: true, interruptedReason: "resumable_error" as const },
-			{ interrupted: true, shouldReplayInterruptedToolResultTurn: true },
+			{ interrupted: false, finalText: "partial output" },
+			{ interrupted: true, finalText: "partial output" },
+			{
+				interrupted: true,
+				interruptedReason: "resumable_error" as const,
+				finalText: "partial output",
+			},
+			{
+				interrupted: true,
+				shouldReplayInterruptedToolResultTurn: true,
+				finalText: "partial output",
+			},
 		];
 		for (const result of cases) {
 			for (const retries of [0, 1, MAX_TURN_INTERRUPTION_RETRIES]) {
