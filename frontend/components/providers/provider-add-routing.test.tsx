@@ -155,6 +155,15 @@ const { Route: callbackFileRoute } = await import(
 const tokenDanceFlow = await import("./tokendance-flow");
 restoreDom();
 
+/** 迁移出来的平台实例：卡片只来自这份清单。 */
+function platformInstance(
+	platform: "codex" | "CommandCode" | "tokendance",
+	suffix = "",
+	config: Record<string, unknown> = {},
+) {
+	return { id: `platform-${platform}`, platform, suffix, prefix: platform, disabled: false, config };
+}
+
 const initialSettings = {
 	customApiProviders: [
 		{
@@ -168,7 +177,15 @@ const initialSettings = {
 		},
 	],
 	nugProviders: [],
-	agent: { disabledProviders: [], hiddenModels: [] },
+	agent: {
+		disabledProviders: [],
+		hiddenModels: [],
+		platformInstances: [
+			platformInstance("codex"),
+			platformInstance("CommandCode"),
+			platformInstance("tokendance"),
+		],
+	},
 };
 const i18n = createInstance();
 await i18n.init({
@@ -301,7 +318,17 @@ beforeEach(() => {
 		savedPayloads.push(clone(payload));
 		requestOptions.push(options);
 		if (saveGate) await saveGate;
-		if (!saveError || persistBeforeError) serverSettings = { ...serverSettings, ...clone(payload) };
+		if (!saveError || persistBeforeError) {
+			const patch = clone(payload) as Record<string, unknown>;
+			// 服务端对 `agent` 是浅合并：只带部分字段的补丁不会清掉平台实例清单等设置。
+			if (patch.agent && typeof patch.agent === "object") {
+				patch.agent = {
+					...(serverSettings.agent as Record<string, unknown>),
+					...(patch.agent as Record<string, unknown>),
+				};
+			}
+			serverSettings = { ...serverSettings, ...patch };
+		}
 		if (saveError) throw saveError;
 		return clone(serverSettings);
 	});
@@ -588,8 +615,8 @@ describe("provider add nested route", () => {
 				});
 			expect(router.state.location.pathname).toBe("/settings/providers");
 			expectOriginalDisabled();
-			// codex + CommandCode + existing: CommandCode 平台卡加入概览后多一张。
-			expect(container.querySelectorAll('[role="button"]').length).toBe(3);
+			// codex + CommandCode + TokenDance + existing：平台卡只来自实例清单。
+			expect(container.querySelectorAll('[role="button"]').length).toBe(4);
 			expect(container.textContent).not.toContain("Discard this draft");
 			expectNoSave();
 		});
@@ -634,8 +661,8 @@ describe("provider add nested route", () => {
 			await leaveDetail();
 			expectOriginalDisabled();
 			expect(container.textContent).toContain(text("unsavedSave"));
-			// codex + CommandCode + existing + 新增的 draft。
-			expect(container.querySelectorAll('[role="button"]').length).toBe(4);
+			// codex + CommandCode + TokenDance + existing + 新增的 draft。
+			expect(container.querySelectorAll('[role="button"]').length).toBe(5);
 		});
 	}
 
@@ -994,7 +1021,7 @@ describe("provider add nested route", () => {
 		restorers.push(() => deleteSpy.mockRestore());
 		await mount();
 		const card = [...container.querySelectorAll('[role="button"]')].find((node) =>
-			node.textContent?.includes("TokenDance fresh"),
+			node.textContent?.includes("TokenDance"),
 		);
 		if (!card) throw new Error("Missing connected TokenDance");
 		expect(card.textContent).toContain(text("providerTypePlatform"));
@@ -1021,7 +1048,11 @@ describe("provider add nested route", () => {
 	test("successful TokenDance callback opens its detail with unified hide/show model controls", async () => {
 		serverSettings = {
 			...clone(initialSettings),
-			agent: { hiddenModels: ["existing:keep"], disabledProviders: [] },
+			agent: {
+				...clone(initialSettings).agent,
+				hiddenModels: ["existing:keep"],
+				disabledProviders: [],
+			},
 			tokendance: {
 				connected: true,
 				name: "TokenDance fresh",
@@ -1114,7 +1145,7 @@ describe("provider add nested route", () => {
 		restorers.push(() => refreshSpy.mockRestore());
 		await mount();
 		const card = [...container.querySelectorAll('[role="button"]')].find((node) =>
-			node.textContent?.includes("TokenDance fresh"),
+			node.textContent?.includes("TokenDance"),
 		);
 		if (!card) throw new Error("Missing TokenDance card");
 		await click(card);
@@ -1159,7 +1190,7 @@ describe("provider add nested route", () => {
 		restorers.push(() => updateSpy.mockRestore());
 		await mount();
 		const card = [...container.querySelectorAll('[role="button"]')].find((node) =>
-			node.textContent?.includes("TokenDance fresh"),
+			node.textContent?.includes("TokenDance"),
 		);
 		const toggle = card?.querySelector<HTMLInputElement>('input[type="checkbox"]');
 		if (!toggle) throw new Error("Missing platform switch");
@@ -1171,14 +1202,13 @@ describe("provider add nested route", () => {
 		expect(saveCalls).toBe(0);
 		expect(container.textContent).toContain(text("unsavedSave"));
 		expect(container.textContent).toContain(text("unsavedDiscard"));
-		// 保存条是唯一的提交点：点「保存更改」后才写连接与 settings。
+		// 保存条是唯一的提交点：平台实例的开关只写 disabledProviders，不碰连接记录。
 		await click(button("unsavedSave"));
-		expect(updateSpy).toHaveBeenCalledTimes(1);
-		expect(updateSpy.mock.calls[0]?.[0]).toBe(true);
+		expect(updateSpy).toHaveBeenCalledTimes(0);
 		expect(saveCalls).toBe(1);
 		expect(
 			(savedPayloads.at(-1)?.agent as { disabledProviders?: string[] }).disabledProviders,
-		).not.toContain("tokendance");
+		).toContain("tokendance");
 	});
 
 	test("TokenDance detail enable switch drafts locally too", async () => {
@@ -1212,7 +1242,7 @@ describe("provider add nested route", () => {
 		restorers.push(() => updateSpy.mockRestore());
 		await mount();
 		const card = [...container.querySelectorAll('[role="button"]')].find((node) =>
-			node.textContent?.includes("TokenDance fresh"),
+			node.textContent?.includes("TokenDance"),
 		);
 		if (!card) throw new Error("Missing TokenDance card");
 		await click(card);
@@ -1240,10 +1270,10 @@ describe("provider add nested route", () => {
 			[...container.querySelectorAll('[role="button"]')].findIndex((node) =>
 				node.textContent?.includes(needle),
 			);
-		// 两者都启用：按插入序 codex 在 CommandCode 前。
-		expect(cardIndex("codex")).toBeLessThan(cardIndex("CommandCode"));
+		// 两者都启用：按插入序 Codex 在 Command Code 前。
+		expect(cardIndex("Codex")).toBeLessThan(cardIndex("Command Code"));
 		const codexCard = [...container.querySelectorAll('[role="button"]')].find((node) =>
-			node.textContent?.includes("codex"),
+			node.textContent?.includes("Codex"),
 		);
 		const toggle = codexCard?.querySelector<HTMLInputElement>('input[type="checkbox"]');
 		if (!toggle) throw new Error("Missing codex platform switch");
@@ -1253,14 +1283,14 @@ describe("provider add nested route", () => {
 		});
 		expect(saveCalls).toBe(0);
 		expect(container.textContent).toContain(text("unsavedSave"));
-		expect(cardIndex("codex")).toBeLessThan(cardIndex("CommandCode"));
+		expect(cardIndex("Codex")).toBeLessThan(cardIndex("Command Code"));
 		// 保存后才重排一次：codex 在平台分区内沉底。
 		await click(button("unsavedSave"));
 		expect(saveCalls).toBe(1);
 		expect(
 			(savedPayloads.at(-1)?.agent as { disabledProviders?: string[] }).disabledProviders,
 		).toContain("codex");
-		expect(cardIndex("codex")).toBeGreaterThan(cardIndex("CommandCode"));
+		expect(cardIndex("Codex")).toBeGreaterThan(cardIndex("Command Code"));
 	});
 
 	test("slow settings keep the add-page title and back navigation visible", async () => {
@@ -1292,8 +1322,8 @@ describe("provider add nested route", () => {
 		await click(button("addProviderCancel"));
 		expect(router.state.location.pathname).toBe("/settings/providers");
 		expect(container.textContent).toContain("Existing provider");
-		// codex + CommandCode + existing：CommandCode 平台卡加入概览后多一张。
-		expect(container.querySelectorAll('[role="button"]').length).toBe(3);
+		// codex + CommandCode + TokenDance + existing：平台卡只来自实例清单。
+		expect(container.querySelectorAll('[role="button"]').length).toBe(4);
 		expectNoSave();
 	});
 });
