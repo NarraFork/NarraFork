@@ -7,9 +7,15 @@
  * `outline.enabled` is switched on before each case (the preload restores settings after it).
  */
 import { afterEach, beforeEach, describe, expect, spyOn, test } from "bun:test";
-import { eq } from "drizzle-orm";
+import { desc, eq } from "drizzle-orm";
 import { db } from "../../../db";
-import { narrators, specFileRevisions, specNamespaces, users } from "../../../db/schema";
+import {
+	narrators,
+	outlineCommits,
+	specFileRevisions,
+	specNamespaces,
+	users,
+} from "../../../db/schema";
 import { outlineEditTool } from "../../../lib/agent/tools/outline";
 import type { ToolContext } from "../../../lib/agent/types";
 import { generateId } from "../../../lib/id";
@@ -31,6 +37,7 @@ import {
 	specContinuationStopNote,
 } from "../../turn-continuation-decisions";
 import { taskSourceForNarrator } from "../index";
+import { OUTLINE_TASK_START_ACTOR } from "../outline";
 import {
 	finishPrerequisite,
 	OUTLINE_TASK_SOURCE_SCENARIOS,
@@ -361,6 +368,108 @@ describe("outline continuation (D27b: waiting replaces blocked)", () => {
 		expect(await readSpecContinuationState(id)).toEqual({ openTask: null, protectedOpenCount: 0 });
 		expect(write).toHaveBeenCalledTimes(1);
 		expect((await taskState(id, "Contested step")).claim?.holderNarratorId).toBe(other);
+	});
+});
+
+describe("starting the next task", () => {
+	test("a refused start moves on to the next to-do", async () => {
+		const id = await session({ mode: "always" });
+		const other = await session();
+		await seedOutlineTasks(id, [
+			{ text: "Contested step", status: "todo" },
+			{ text: "Free step", status: "todo" },
+		]);
+		const { block } = await taskState(id, "Contested step");
+		const real = outlineWrite.writeOutline;
+		const write = spyOn(outlineWrite, "writeOutline").mockImplementationOnce(async (input) => {
+			// Another session starts the first to-do between the read and the claim.
+			await real({
+				spaceId: block.spaceId,
+				ops: [{ op: "setTask", block: { id: block.id }, task: { status: "doing" } }],
+				actor: { kind: "agent", id: other },
+				narratorId: other,
+				responsibleUserId: null,
+			});
+			return await real(input);
+		});
+		restores.push(() => write.mockRestore());
+		expect((await readSpecContinuationState(id)).openTask).toEqual({
+			text: "Free step",
+			protected: false,
+			status: "doing",
+		});
+		expect((await taskState(id, "Free step")).claim?.holderNarratorId).toBe(id);
+		expect((await taskState(id, "Contested step")).claim?.holderNarratorId).toBe(other);
+	});
+
+	test("the start is the system's for the session, whether or not a continuation follows", async () => {
+		const owner = await user();
+		const id = await session({ mode: "protectedOnly", owner });
+		await seedOutlineTasks(id, [{ text: "Plain step", status: "todo" }]);
+		// protectedOnly with no person-created task: started, but not continued.
+		expect(await maybeStartContinuation(activeOf(id), false)).toBeNull();
+		const { block, address } = await taskState(id, "Plain step");
+		const [commit] = await db
+			.select()
+			.from(outlineCommits)
+			.where(eq(outlineCommits.spaceId, block.spaceId))
+			.orderBy(desc(outlineCommits.seq))
+			.limit(1);
+		expect(commit).toMatchObject({
+			actorKind: "system",
+			actorId: OUTLINE_TASK_START_ACTOR,
+			narratorId: id,
+			responsibleUserId: owner,
+			summary: `started ${address} for session ${id}`,
+		});
+		expect(commit?.summary).not.toContain("continuation");
+	});
+});
+
+describe("what the outline source lists and marks", () => {
+	test("openTasks lists the first twenty; its revision covers every task read", async () => {
+		const id = await session();
+		const tasks = Array.from({ length: 25 }, (_, i) => ({
+			text: `Step ${String(i + 1).padStart(2, "0")}`,
+			status: "todo" as const,
+		}));
+		await seedOutlineTasks(id, tasks);
+		const source = await taskSourceForNarrator(id);
+		const first = await source.openTasks();
+		expect(first.tasks.map((t) => t.text)).toEqual(tasks.slice(0, 20).map((t) => t.text));
+		// A change to a task past the listed ones still moves the key.
+		const { block } = await taskState(id, "Step 25");
+		await outlineWrite.writeOutline({
+			spaceId: block.spaceId,
+			ops: [{ op: "update", block: { id: block.id }, content: "Step 25, reworded" }],
+			actor: { kind: "agent", id },
+			narratorId: id,
+			responsibleUserId: null,
+		});
+		const second = await source.openTasks();
+		expect(second.tasks.map((t) => t.text)).toEqual(first.tasks.map((t) => t.text));
+		expect(second.revision).not.toBe(first.revision);
+	});
+
+	test("the source marks its digest outline, empty variants included, as its interrupt note", async () => {
+		const empty = await session();
+		expect(await (await taskSourceForNarrator(empty)).taskDigest()).toEqual({
+			kind: "tasks",
+			variant: "emptyNever",
+			taskBackend: "outline",
+		});
+		const id = await session();
+		await seedOutlineTasks(id, [{ text: "Write the parser", status: "doing" }]);
+		const source = await taskSourceForNarrator(id);
+		expect(await source.taskDigest()).toMatchObject({ variant: "current", taskBackend: "outline" });
+		const { tasks } = await source.openTasks();
+		expect(source.interruptGuardNote(tasks, "en").body).toMatchObject({ taskBackend: "outline" });
+		await seedOutlineTasks(id, [{ text: "Write the parser", status: "done" }]);
+		expect(await source.taskDigest()).toEqual({
+			kind: "tasks",
+			variant: "emptyDone",
+			taskBackend: "outline",
+		});
 	});
 });
 

@@ -406,6 +406,7 @@ import {
 	isCompactInProgress,
 	isLoopRunning,
 	isNarratorActive,
+	isOutlineSessionGoal,
 	normalizeRollbackBlockIndexForMessage,
 	persistGoalAddedNotice,
 	readSessionDeliverTo,
@@ -3207,6 +3208,18 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 		)
 	) {
 		throw new ValidationError("File references are not supported by queued /new or /goal commands");
+	}
+	// Nor the outline session's refusal of /goal: an edit must not turn a queued message into one.
+	if (
+		await isOutlineSessionGoal(
+			id,
+			text,
+			located.message.commandText,
+			composerDocument,
+			located.message.executionIntent,
+		)
+	) {
+		throw catalogError("GOAL_IN_OUTLINE_SESSION");
 	}
 	const snapshots = await replaceFileReferenceSnapshots(
 		located.message.fileReferences ?? [],

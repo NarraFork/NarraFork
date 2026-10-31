@@ -149,6 +149,7 @@ import { syncNarratorProjectLinksSafely } from "./project-index";
 import { resolveSkillContextForNarrator } from "./skill-service";
 import { specVfsService } from "./spec-vfs-service";
 import { defaultTaskBackendForNewSession } from "./task-source";
+import { readTaskBackend } from "./task-source/backend";
 import { removeTabFromAllUsers } from "./user-preferences-service";
 import {
 	assertWorkspaceAdmission,
@@ -1099,6 +1100,9 @@ async function applySpecForkCarryover(
 	carryover: SpecForkCarryover,
 ): Promise<void> {
 	try {
+		// A fork of an outline session keeps its tasks in the outline: there are no spec tasks to
+		// clear or offer a card for (and clearing them would be refused).
+		if ((await readTaskBackend(childNarratorId)) === "outline") return;
 		if (carryover === "clear") {
 			await specVfsService.clearSpecTasks(childNarratorId);
 			return;

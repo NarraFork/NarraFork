@@ -54,8 +54,12 @@ export const OUTLINE_TEXT = {
 	/** The block the lease job writes under a task in progress that nobody was holding. */
 	unclaimedReopened:
 		"This task was in progress, but no session or person was holding it; it is open again.",
-	/** Summary of the commit that starts a session's next task for its continuation (§4.8). */
-	continuationStarted: (address: string) => `continuation started ${address}`,
+	/**
+	 * Summary of the commit that starts a session's next task when nothing of it is in progress
+	 * (§4.8). Written at the end of a turn whether or not a continuation follows.
+	 */
+	startedForSession: (address: string, narratorId: string) =>
+		`started ${address} for session ${narratorId}`,
 	/** Summary of a commit that only hands tasks over (their lease had run out). */
 	claimTakenOver: (addresses: readonly string[]) =>
 		`took over ${addresses.join(", ")} (the previous lease had run out)`,

@@ -366,15 +366,21 @@ export function describeTaskSourceContract(harness: TaskSourceContractHarness): 
 				expect(digest.tasks?.[0]).toMatchObject({ role: "doing", text: "Write the parser" });
 			});
 
+			// A backend may mark the body with itself (`taskBackend`); spec pins its exact body in
+			// its own test.
 			test("without open tasks the digest is an empty variant, never null", async () => {
 				const never = await sourceWith();
-				expect(await never.source.taskDigest()).toEqual({ kind: "tasks", variant: "emptyNever" });
+				const neverDigest = await never.source.taskDigest();
+				expect(neverDigest).toMatchObject({ kind: "tasks", variant: "emptyNever" });
+				expect(neverDigest).not.toHaveProperty("tasks");
 
 				const done = await sourceWith([
 					{ text: "Write the parser", status: "done" },
 					{ text: "Write the printer", status: "done" },
 				]);
-				expect(await done.source.taskDigest()).toEqual({ kind: "tasks", variant: "emptyDone" });
+				const doneDigest = await done.source.taskDigest();
+				expect(doneDigest).toMatchObject({ kind: "tasks", variant: "emptyDone" });
+				expect(doneDigest).not.toHaveProperty("tasks");
 			});
 		});
 

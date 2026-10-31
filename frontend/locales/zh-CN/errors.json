@@ -37,7 +37,7 @@
 	"GIT_NOT_INSTALLED": "未安装 Git。请安装 git 后重试此操作。",
 	"DEFAULT_MODEL_NOT_CONFIGURED": "尚未配置默认模型。请在「设置 → 模型」中选择一个后重试。",
 	"PODMAN_NOT_FOUND": "未安装 Podman",
-	"SPEC_IN_OUTLINE_SESSION": "本会话的任务在大纲里，这里不能再修改 Dynamic Spec 的任务和笔记，只有行为护栏仍然生效。",
+	"SPEC_IN_OUTLINE_SESSION": "本会话的任务在大纲里，不再使用 Dynamic Spec 的任务和笔记，只有行为护栏仍然生效。",
 	"GOAL_IN_OUTLINE_SESSION": "任务在大纲里的会话暂时不能用 /goal。请让 agent 把目标写成一个任务。",
 	"GIT_AUTH_REQUIRED": "需要 Git 认证",
 	"AUTH_REQUIRED": "请先登录",

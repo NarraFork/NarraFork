@@ -122,13 +122,13 @@ export const ERROR_CATALOG = {
 
 	// --- outline tasks (outline P2: sessions whose tasks live in the outline) -----------
 	/**
-	 * A Dynamic Spec write (a task, a note, a reset) for a session whose tasks live in the
-	 * outline: it would land where neither the session nor its continuation look any more.
+	 * A Dynamic Spec task or note (a write, a reset, a plugin's task read) for a session whose tasks
+	 * live in the outline: neither the session nor its continuation look there any more.
 	 */
 	SPEC_IN_OUTLINE_SESSION: {
 		status: 409,
 		code: "SPEC_OUTLINE_SESSION",
-		en: "This session keeps its tasks in the outline, so Dynamic Spec tasks and notes cannot be changed here. Only the behavior fence still applies.",
+		en: "This session keeps its tasks in the outline, so its Dynamic Spec tasks and notes are not used. Only the behavior fence still applies.",
 	},
 	/** `/goal` in such a session: its outline form arrives with the task board. */
 	GOAL_IN_OUTLINE_SESSION: {

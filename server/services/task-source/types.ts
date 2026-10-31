@@ -54,7 +54,11 @@ export interface OpenTaskView extends TaskView {
 }
 
 export interface OpenTaskList {
-	/** Unfinished tasks in the source's own order (spec: array order; outline: document order). */
+	/**
+	 * Unfinished tasks in the source's own order (spec: array order; outline: document order).
+	 * A backend may list only a leading part of a long list (outline: the first 20); readers
+	 * show a prefix anyway (the interrupt guard eight).
+	 */
 	tasks: OpenTaskView[];
 	/**
 	 * Must change whenever the open tasks change, and stay put while nothing is written;
@@ -188,8 +192,8 @@ export interface NarratorTaskSource {
 	 * would drop the fence too. A backend that retires this digest must deliver the fence some
 	 * other way first.
 	 *
-	 * The reader stamps the backend on a non-spec digest (`taskBackend`), so the text the model
-	 * reads and the reader's heading use that backend's words.
+	 * A non-spec source marks its digest with its backend (`taskBackend`, as on its interrupt
+	 * note), so the text the model reads and the reader's heading use that backend's words.
 	 */
 	taskDigest(): Promise<SideCarBody | null>;
 	/** The behavior fence (`behavior_fence`); null when empty or unreadable, never injected. */

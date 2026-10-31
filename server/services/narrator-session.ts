@@ -3,6 +3,7 @@ import { EventEmitter } from "node:events";
 import { isAbsolute } from "node:path";
 import { encodeToolOutput } from "@shared/agent-protocol/tool-output";
 import { resolveBufferQueueMode } from "@shared/buffer-queue-mode";
+import { serializeCatalogErrorMessage } from "@shared/error-catalog";
 import { resolveMcpLoadingMode } from "@shared/mcp-loading-mode";
 import type { MessageOriginOptions } from "@shared/message-origin";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
@@ -64,7 +65,7 @@ import {
 	queueContextCharacterRefresh,
 } from "../lib/context-characters";
 import { resolveInjectedDevices } from "../lib/device-injection-trait";
-import { AppError, NotFoundError, ValidationError } from "../lib/errors";
+import { AppError, catalogError, NotFoundError, ValidationError } from "../lib/errors";
 import { hotSafe } from "../lib/hot-safe";
 import { t } from "../lib/i18n";
 import { InjectionCadence } from "../lib/injection-cadence";
@@ -384,6 +385,7 @@ import {
 import { readEnvelopeBody, writeEnvelopeBody } from "./narrator-body-writes";
 import {
 	cleanupBufferedTextFilesAsync,
+	dropBufferedMessage,
 	enqueueBufferedMessage,
 	getBufferedMessages,
 	getBufferedMessagesAsync,
@@ -777,7 +779,12 @@ export async function executeQueuedGoalCommand(
 	narratorId: string,
 	buffered: BufferedMessage,
 	objective: string,
-): Promise<void> {
+): Promise<{ refused: boolean }> {
+	// Before anything is saved: a session whose tasks live in the outline has no tasks.json.
+	if ((await resolveTaskBackend(narratorId)) === "outline") {
+		await refuseQueuedOutlineGoal(narratorId, buffered);
+		return { refused: true };
+	}
 	const rawCommand = buffered.commandText?.trim() || buffered.text;
 	const userMsg = await withInboxOwner(narratorId, async () => {
 		const row = buffered._mailboxClaim
@@ -838,6 +845,60 @@ export async function executeQueuedGoalCommand(
 			error: String(err),
 		});
 	});
+	return { refused: false };
+}
+
+/**
+ * Whether this input is a `/goal` the queue consumer would run, for a session whose tasks live in
+ * the outline (outline P2). Such a session has no tasks.json to add the goal to; its `/goal` (a
+ * person-created, locked task) arrives with the task board (plan PR 5). Every entry point that
+ * queues input refuses it before anything is queued or saved.
+ */
+export async function isOutlineSessionGoal(
+	narratorId: string,
+	message: string,
+	commandText?: string | null,
+	composerDocument?: import("@shared/composer-document").ComposerDocument,
+	intent?: BufferedExecutionIntent,
+): Promise<boolean> {
+	if (!parseQueuedGoalCommand(message, commandText, composerDocument, intent)) return false;
+	return (await resolveTaskBackend(narratorId)) === "outline";
+}
+
+/**
+ * The consumers' backstop for a queued `/goal` that reached an outline session anyway (queued
+ * while the outline was switched off, say): the row is dropped from the queue without its message
+ * ever being saved, the person is told why, and the caller drains on as after any terminal
+ * command. Never throws: a refusal must not stall the queue.
+ */
+async function refuseQueuedOutlineGoal(narratorId: string, buffered: BufferedMessage) {
+	const refusal = catalogError("GOAL_IN_OUTLINE_SESSION");
+	try {
+		await dropBufferedMessage(narratorId, buffered, refusal.message);
+	} catch (error) {
+		logger.warn("Failed to drop a queued /goal refused for an outline session", {
+			narratorId,
+			error: String(error),
+		});
+	}
+	broadcastToNarrator(narratorId, {
+		type: "narrator_error",
+		narratorId,
+		error: serializeCatalogErrorMessage(refusal),
+		errorCode: refusal.code,
+	});
+	try {
+		broadcastToNarrator(narratorId, {
+			type: "buffer_set",
+			narratorId,
+			messages: toBufferSummary(await getBufferedMessagesAsync(narratorId)),
+		});
+	} catch (error) {
+		logger.warn("Failed to broadcast the queue after a refused /goal", {
+			narratorId,
+			error: String(error),
+		});
+	}
 }
 
 /**
@@ -1038,8 +1099,13 @@ async function resumeNextBufferedMessageUnlocked(
 			// Queued /goal: persist the protected task, then launch its first Spec turn.
 			// If plan mode or another guard prevents starting, keep draining as before.
 			await executeQueuedGoalCommand(narratorId, first, goalCommand.objective)
-				.then(async () => {
+				.then(async ({ refused }) => {
 					inputOwner.release();
+					// Refused for an outline session: nothing to start, drain on.
+					if (refused) {
+						await settleAfterTerminalCommand();
+						return;
+					}
 					const result = await startSpecContinuationIfPossible(
 						narratorId,
 						locale,
@@ -2549,9 +2615,6 @@ export async function drainInjectionsIntoHistory(
 		// continuation (which lists the same tasks but for a different reason).
 		if (tasksBody.kind === "tasks") {
 			tasksBody.cadenceInterval = active._tasksReminderInterval ?? 15;
-			// And the backend it came from, so both projections word it for that backend.
-			const backend = taskSource?.backend;
-			if (backend && backend !== "spec") tasksBody.taskBackend = backend;
 		}
 		const { body, content } = sideCarBodyWithText("living_work_spec", tasksBody, locale);
 		const { messageId, turnText } = await deliverInjection(narratorId, {
@@ -4075,6 +4138,10 @@ export async function createNarratorForPlugin(
 		cwd: input.cwd,
 		permissionMode: input.permissionMode,
 		planReflectionAutoApproveOverride: input.planReflectionAutoApproveOverride,
+		// The recruiting plugin drives its members through the Dynamic Spec commands (dispatch,
+		// read, write), which an outline session refuses; members stay spec until the block-based
+		// commands exist (plan PR 12, D27d), as OAuth-provisioned sessions do.
+		taskBackend: "spec",
 	});
 	return {
 		narratorId: narrator.id,
@@ -4097,6 +4164,10 @@ export async function deleteNarratorForPlugin(narratorId: string): Promise<void>
  * to track the shared task queue it maintains for each member.
  */
 export async function readSpecTasksForPlugin(narratorId: string) {
+	// An outline session's tasks are not in Dynamic Spec: an empty list would read as an idle
+	// member to a plugin that then dispatches to it (refused too). Refused like the writes.
+	const { assertSpecTasksUsed } = await import("./task-source/backend");
+	await assertSpecTasksUsed(narratorId);
 	const { readTasksFileForNarrator } = await import("./spec-vfs-service");
 	const { parseSpecTasksDocument, compileSpecTasks } = await import("./spec-task-service");
 	const file = await readTasksFileForNarrator(narratorId);

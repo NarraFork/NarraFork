@@ -715,7 +715,26 @@ export async function runAgentLoopUnlocked(
 				buffered.executionIntent,
 			);
 			if (goalCommand) {
-				await executeQueuedGoalCommand(narratorId, buffered, goalCommand.objective);
+				const { refused } = await executeQueuedGoalCommand(
+					narratorId,
+					buffered,
+					goalCommand.objective,
+				);
+				if (refused) {
+					// An outline session's queued /goal was dropped unsaved; drain on.
+					pendingBufferedDelivery = undefined;
+					if ((await getBufferedMessagesAsync(narratorId)).length > 0) {
+						runState.wasInterrupted = true;
+					} else {
+						await narratorService.compareAndSetStatus(
+							narratorId,
+							["working", "waiting"],
+							restingStatus(),
+							{ substatus: ["unread"] },
+						);
+					}
+					return "break";
+				}
 				active._continuationSuppressed = false;
 				active._continuationStallCount = 0;
 				active._continuationStallKey = undefined;

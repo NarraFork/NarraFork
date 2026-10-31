@@ -5,7 +5,9 @@ import { type Locale, type LocalizedValue, pickLocalizedValue } from "@shared/i1
 // The model-facing text of a session whose tasks live in the outline (task backend `outline`,
 // `services/task-source/outline.ts`): the system-prompt section that replaces the Dynamic Spec
 // instructions, the continuation prompts, the interrupt note, the compact task list and the
-// hint a `spec://` path gets. No `spec://` vocabulary: an outline session cannot reach it.
+// hint a `spec://` path gets. No `spec://` vocabulary, except the behavior fence: until the
+// outline has its behavior-fence page (plan PR 4), `spec://behavior_fence` is the one `spec://`
+// file an outline session keeps.
 //
 // The system-prompt section is part of the frozen contract of a prefix epoch, so it holds only
 // what does not change while a session runs (design §0, the three conventions); live task state
@@ -29,6 +31,8 @@ This session keeps its notes and tasks in the outline: read with OutlineRead and
 1. Write what will be needed later into the outline: conclusions, decisions, pitfalls, plans. Writing it under the task at hand is enough.
 2. When you start a task, tick it in progress; when it is done, tick it done. When a person has to decide something, ask them and give your recommendation.
 3. When a tool says a change was handed to someone for confirmation, do the parts it does not affect first.
+
+Standing rules of behavior are not tasks. When the user asks you to record one, write it to \`spec://behavior_fence\`, and only as the first tool call of that user turn; the system shows that file to you as your behavior fence. It is the only \`spec://\` file this session uses: the other \`spec://\` paths the file tools mention do not apply here.
 </system-reminder>`,
 	"zh-CN": `<system-reminder>
 # 大纲
@@ -37,6 +41,8 @@ This session keeps its notes and tasks in the outline: read with OutlineRead and
 1. 以后还用得到的写进大纲：结论、决定、坑、计划。写在手头的任务下面就行。
 2. 开始做一个任务就把它勾成进行中，做完勾成完成；需要人决定的，提问并附上你的建议。
 3. 工具说改动「已交给某人确认」时，先做不受影响的部分。
+
+长期的行为规则不是任务。用户要求你记下一条时，写进 \`spec://behavior_fence\`，而且只能作为该用户回合的第一个工具调用；系统会把这个文件作为行为护栏展示给你。它是本会话唯一使用的 \`spec://\` 文件：文件工具说明里提到的其他 \`spec://\` 路径在这里不适用。
 </system-reminder>`,
 };
 
@@ -177,9 +183,9 @@ export function getOutlineCompactContext(
 }
 
 const specUnavailable: LocalizedValue<string> = {
-	en: "spec:// is not available in this session: its tasks and notes live in the outline. Read with OutlineRead or OutlineSearch and write with OutlineEdit (a task is a checkbox block; your own go in this session's space, session/). Nothing was read or written.",
+	en: "spec:// is not available in this session (except spec://behavior_fence): its tasks and notes live in the outline. Read with OutlineRead or OutlineSearch and write with OutlineEdit (a task is a checkbox block; your own go in this session's space, session/). Nothing was read or written.",
 	"zh-CN":
-		"本会话不能使用 spec://：它的任务和笔记都在大纲里。请用 OutlineRead 或 OutlineSearch 读、用 OutlineEdit 写（任务是带复选框的块，你自己的任务写在本会话的空间 session/ 里）。本次没有读写任何内容。",
+		"本会话不能使用 spec://（spec://behavior_fence 除外）：它的任务和笔记都在大纲里。请用 OutlineRead 或 OutlineSearch 读、用 OutlineEdit 写（任务是带复选框的块，你自己的任务写在本会话的空间 session/ 里）。本次没有读写任何内容。",
 };
 
 /** What a tool call naming a `spec://` path gets in an outline session. */

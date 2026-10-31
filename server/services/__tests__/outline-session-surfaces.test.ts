@@ -8,16 +8,18 @@
  * ISOLATION: the isolated database from `tests/preload.ts`; every case makes its own sessions.
  * `outline.enabled` is set before each case (the preload restores settings after it).
  */
-import { beforeEach, describe, expect, test } from "bun:test";
+import { beforeEach, describe, expect, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { db } from "../../db";
 import { narrators } from "../../db/schema";
 import { shouldRunTaskReflection } from "../../lib/agent/loop";
 import { executeTool, getOutlineSpecRejection } from "../../lib/agent/tool-executor";
+import { grantBehaviorFenceEdit } from "../../lib/agent/tools/behavior-fence-grant";
 import { isOutlineTool } from "../../lib/agent/tools/outline-names";
 import type { AgentConfig, AgentToolUse } from "../../lib/agent/types";
 import { AppError } from "../../lib/errors";
 import { generateId } from "../../lib/id";
+import { logger } from "../../lib/logger";
 import { getDynamicSpecSystemReminder, getOutlineTaskSystemReminder } from "../../lib/prompt-i18n";
 import { settings } from "../../lib/settings";
 import { toolNamesSpecPath } from "../../lib/spec-uri";
@@ -28,9 +30,11 @@ import { narratorService } from "../narrator-service";
 import {
 	addSpecTaskForPlugin,
 	createNarratorForPlugin,
+	readSpecTasksForPlugin,
 	setSpecBehaviorFenceForPlugin,
 	writeSpecForPlugin,
 } from "../narrator-session";
+import * as accessReads from "../outline/access-reads";
 import {
 	appendProtectedSpecTask,
 	clearSpecTasks,
@@ -39,6 +43,7 @@ import {
 	resetSpecNamespace,
 	writeSpecFile,
 } from "../spec-vfs-service";
+import { invalidateTaskBackend, resolveTaskBackend } from "../task-source";
 
 const NOW = "2026-10-31T00:00:00.000Z";
 
@@ -90,7 +95,9 @@ describe("system prompt: the task section", () => {
 		const outline = await buildEffectiveSystemPrompt({ ...base, taskSection: "outline" });
 		expect(outline.contract).toContain(getOutlineTaskSystemReminder("en"));
 		expect(outline.contract).not.toContain("Dynamic Spec");
-		expect(outline.contract).not.toContain("spec://");
+		expect(outline.contract).not.toContain("tasks.json");
+		// The one spec:// path it names is the behavior fence (until plan PR 4).
+		expect(outline.contract.match(/spec:\/\/[\w./-]+/g)).toEqual(["spec://behavior_fence"]);
 		// The section takes the same place: everything around it is identical.
 		expect(outline.contract.replace(getOutlineTaskSystemReminder("en"), "")).toBe(
 			plain.contract.replace(getDynamicSpecSystemReminder("en"), ""),
@@ -107,7 +114,9 @@ describe("system prompt: the task section", () => {
 			const text = getOutlineTaskSystemReminder(locale);
 			expect(text).toContain("OutlineEdit");
 			expect(text).toContain("session/");
-			expect(text).not.toContain("spec://");
+			// Where a rule the user asks to record goes, until the behavior-fence page exists.
+			expect(text.match(/spec:\/\/[\w./-]+/g)).toEqual(["spec://behavior_fence"]);
+			expect(text).not.toContain("tasks.json");
 		}
 		expect(getOutlineTaskSystemReminder("zh-CN")).toContain("三条约定");
 		expect(taskSectionFor("spec", "primary")).toBe("spec");
@@ -182,6 +191,50 @@ describe("spec:// in an outline session", () => {
 		expect((await readTasksFileForNarrator(id)).content).toBe(before.content);
 	});
 
+	test("the behavior fence stays reachable; writing it still needs the user-turn grant", async () => {
+		const outline = { taskBackend: "outline" as const, locale: "en" };
+		for (const tu of [
+			call("Read", { file_path: "spec://behavior_fence" }),
+			call("Write", { file_path: "spec://behavior_fence", content: "x" }),
+			call("Edit", { file_path: "spec://behavior_fence", old_string: "a", new_string: "b" }),
+		]) {
+			expect(getOutlineSpecRejection(tu, outline)).toBeUndefined();
+		}
+		expect(
+			getOutlineSpecRejection(
+				call("Grep", { pattern: "x", path: "spec://behavior_fence" }),
+				outline,
+			)?.isError,
+		).toBe(true);
+
+		const id = await session();
+		const config = {
+			narratorId: id,
+			taskBackend: "outline",
+			locale: "en",
+			cwd: "/tmp",
+			model: "test",
+			provider: "test",
+			signal: new AbortController().signal,
+			permissionHandler: async () => ({ behavior: "allow" }),
+		} as unknown as AgentConfig;
+		const write = () =>
+			executeTool(
+				call("Write", { file_path: "spec://behavior_fence", content: "Never force-push main." }),
+				config,
+			);
+		// No grant (not the first tool call of a user turn): the fence's own rule answers.
+		const denied = await write();
+		expect(denied.isError).toBe(true);
+		expect(denied.output).not.toContain("spec:// is not available");
+		expect((await readSpecFile(id, "spec://behavior_fence")).content).not.toContain("force-push");
+		// A real user turn opened the grant: the rule is recorded, as in a spec session.
+		grantBehaviorFenceEdit(id);
+		const recorded = await write();
+		expect(recorded.isError).toBeFalsy();
+		expect((await readSpecFile(id, "spec://behavior_fence")).content).toContain("force-push");
+	});
+
 	test("taskReflection never runs for an outline session", () => {
 		expect(shouldRunTaskReflection({})).toBe(true);
 		expect(shouldRunTaskReflection({ taskBackend: "spec" })).toBe(true);
@@ -214,6 +267,8 @@ describe("Dynamic Spec writes from other paths", () => {
 		const id = await session();
 		expectRefused(await refusal(addSpecTaskForPlugin(id, "Report back")));
 		expectRefused(await refusal(writeSpecForPlugin(id, "spec://tasks.json", '{"tasks":[]}')));
+		// Reading the task list too: an empty list would read as an idle member.
+		expectRefused(await refusal(readSpecTasksForPlugin(id)));
 		await setSpecBehaviorFenceForPlugin(id, "Report to the lead.", "upsert");
 		expect((await readSpecFile(id, "spec://behavior_fence")).content).toContain(
 			"Report to the lead.",
@@ -238,6 +293,32 @@ describe("the task backend each creation path gives", () => {
 		settings.outline.enabled = false;
 		const off = await narratorService.create({ cwd: "/tmp" });
 		expect(off.taskBackend).toBe("spec");
+	});
+
+	test("a session a plugin recruits stays spec, so the plugin can dispatch to it", async () => {
+		const { narratorId } = await createNarratorForPlugin({ title: "member", cwd: "/tmp" });
+		expect((await narratorService.getById(narratorId)).taskBackend).toBe("spec");
+		expect((await addSpecTaskForPlugin(narratorId, "Review PR 12")).added).toBe(true);
+		expect((await readSpecTasksForPlugin(narratorId)).compiled.tasks.map((t) => t.text)).toEqual([
+			"Review PR 12",
+		]);
+	});
+
+	test("a read-only fork of an outline session skips the spec carryover quietly", async () => {
+		const outline = await narratorService.create({ cwd: "/tmp" });
+		const warn = spyOn(logger, "warn");
+		try {
+			const fork = await narratorService.forkNarrator(outline.id, null, {
+				inheritMode: "fresh",
+				specCarryover: "clear",
+			});
+			expect(fork.taskBackend).toBe("outline");
+			expect(warn.mock.calls.some((args) => String(args[0]).includes("spec fork carryover"))).toBe(
+				false,
+			);
+		} finally {
+			warn.mockRestore();
+		}
 	});
 
 	test("a fork keeps its parent's backend", async () => {
@@ -277,6 +358,45 @@ describe("the task backend each creation path gives", () => {
 			cwd: "/tmp",
 		});
 		expect((await narratorService.getById(specSub)).taskBackend).toBe("spec");
+	});
+});
+
+describe("the task backend cache", () => {
+	test("kept per narrator: a failed read keeps it, the switch applies at once, invalidation reads again", async () => {
+		const id = await session();
+		const sub = generateId();
+		await db.insert(narrators).values({
+			id: sub,
+			type: "subagent",
+			variant: "subagent:general",
+			parentNarratorId: id,
+			aclRootNarratorId: id,
+			status: "idle",
+			createdAt: NOW,
+			updatedAt: NOW,
+		});
+		expect(await resolveTaskBackend(id)).toBe("outline");
+		expect(await resolveTaskBackend(sub)).toBe("outline");
+		const read = spyOn(accessReads, "readNarratorTaskBackend").mockRejectedValue(
+			new Error("database unavailable"),
+		);
+		try {
+			// No read, so a failing database cannot flip the session to spec for a pass.
+			expect(await resolveTaskBackend(id)).toBe("outline");
+			expect(await resolveTaskBackend(sub)).toBe("outline");
+			expect(read).not.toHaveBeenCalled();
+			settings.outline.enabled = false;
+			expect(await resolveTaskBackend(id)).toBe("spec");
+			settings.outline.enabled = true;
+		} finally {
+			read.mockRestore();
+		}
+		// The column changes only at import, which invalidates: the session and its subagents.
+		await db.update(narrators).set({ taskBackend: "spec" }).where(eq(narrators.id, id));
+		expect(await resolveTaskBackend(id)).toBe("outline");
+		invalidateTaskBackend(id);
+		expect(await resolveTaskBackend(id)).toBe("spec");
+		expect(await resolveTaskBackend(sub)).toBe("spec");
 	});
 });
 

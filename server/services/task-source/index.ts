@@ -22,6 +22,8 @@ import { createOutlineTaskSource } from "./outline";
 import { createSpecTaskSource } from "./spec";
 import type { NarratorTaskSource, TaskBackend } from "./types";
 
+/** For whatever moves a session to the outline (the import, plan PR 12). */
+export { invalidateTaskBackend } from "./backend";
 export type {
 	ContinuationCause,
 	ContinuationPromptInput,
@@ -51,11 +53,12 @@ export function defaultTaskBackendForNewSession(): TaskBackend {
 }
 
 /**
- * The narrator's task backend: its session's `task_backend` (a subagent's root's), one small
- * indexed read that runs every turn. `spec` for a narrator that does not exist, and for every
- * narrator while the outline is switched off: an outline session then reads as a spec one (its
- * outline tasks wait, untouched, until the outline is back), rather than as one whose task tools
- * are gone.
+ * The narrator's task backend: its session's `task_backend` (a subagent's root's). Read once per
+ * narrator with one small indexed read and then served from memory (`backend.ts`; the column only
+ * changes at import, which invalidates it). `spec` for a narrator that does not exist, and for
+ * every narrator while the outline is switched off: an outline session then reads as a spec one
+ * (its outline tasks wait, untouched, until the outline is back), rather than as one whose task
+ * tools are gone.
  */
 export async function resolveTaskBackend(narratorId: string): Promise<TaskBackend> {
 	return await readTaskBackend(narratorId);

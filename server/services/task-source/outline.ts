@@ -20,10 +20,13 @@
  * ------------
  * With `promoteTodo` and nothing in progress, the first `todo` of the session space is started:
  * a real commit through the write path (`setTask` to in progress, based on the version read),
- * so the claim is atomic and leased like any other. A claim the write path refuses (someone
- * took or changed the task meanwhile) is not an error: the tasks are read again and the choice
- * made from what is there. With nothing in progress the target is the first waiting task, and
- * the prompt then asks to split out an unblocking task or ask a person (D27b).
+ * so the claim is atomic and leased like any other. It lands at the end of the turn whether or
+ * not a continuation follows (as in spec), so its commit does not speak of a continuation. A
+ * claim the write path refuses (someone took or changed the task meanwhile) is not an error: the
+ * tasks are read again and the next to-do is tried, a few times at most
+ * ({@link OUTLINE_TASK_SOURCE_LIMITS.promotionAttempts}). With nothing in progress the target is
+ * the first waiting task, and the prompt then asks to split out an unblocking task or ask a
+ * person (D27b).
  *
  * A subagent has no tasks of its own (D27c): every read is empty, it continues on its turn
  * budget only (`turnBudgetOnly`), it gets no digest, and its fence is its root's.
@@ -31,13 +34,16 @@
  * INJECTIONS UNTIL PLAN PR 4
  * --------------------------
  * The digest, the fence and the compact context are minimal until the built-in views replace
- * them (plan PR 4): the digest lists the open tasks with their addresses in outline words; the
- * compact context lists the open tasks; the fence is the session's `spec://behavior_fence`,
- * which the person and plugins still write (the agent cannot: `spec://` is closed to an outline
- * session, and the fence was never the agent's to write), until the behavior-fence page exists.
+ * them (plan PR 4): the digest lists the open tasks with their addresses in outline words (the
+ * source marks it `taskBackend: "outline"`, as it marks the interrupt note); the compact context
+ * lists the open tasks; the fence is the session's `spec://behavior_fence`, the one `spec://`
+ * file an outline session keeps until the behavior-fence page exists. The person writes it in
+ * the Spec panel, plugins write their SOP into it, and the agent writes it as in a spec session:
+ * once per real user turn, when the user asks it to record a rule (the one-shot grant).
  *
- * Every read is bounded and indexed (the candidate query's own limits, plus one primary-key read
- * of the narrator, one of the session space and one of the task blocks' content).
+ * Every read is bounded and indexed: the candidate query's own limits, the session (cached after
+ * the first read, `backend.ts`), the session space, and the content of the tasks shown. The
+ * session's owner is read only when a task is started for it.
  */
 import { createHash } from "node:crypto";
 import { blockTitle } from "@shared/outline";
@@ -51,7 +57,7 @@ import {
 	type Locale,
 	type OutlineTaskPromptTask,
 } from "../../lib/prompt-i18n";
-import { readNarratorTaskBackend } from "../outline/access-reads";
+import { readNarrator } from "../outline/access-reads";
 import {
 	OutlineBusyError,
 	OutlineConflictError,
@@ -69,6 +75,7 @@ import {
 } from "../outline/tasks";
 import { writeOutline } from "../outline/write";
 import { buildBehaviorFenceBody } from "../spec-reminder";
+import { readTaskSession } from "./backend";
 import type {
 	ContinuationPromptInput,
 	ContinuationTarget,
@@ -84,14 +91,20 @@ import type {
 export const OUTLINE_TASK_SOURCE_LIMITS = {
 	/** Candidates, and waiting tasks, one read takes (each). */
 	tasks: 50,
+	/** Open tasks `openTasks()` lists (and reads the titles of); its readers show fewer. */
+	openTasks: 20,
+	/** Open tasks the compact context lists. */
+	compact: 50,
 	/** Tasks the digest names. */
 	digest: 4,
 	/** Waiting tasks the digest names. */
 	digestWaiting: 3,
+	/** To-dos tried in turn when the write path refuses to start one. */
+	promotionAttempts: 3,
 } as const;
 
-/** The system actor of the commit that starts a task for a continuation. */
-export const OUTLINE_CONTINUATION_ACTOR = "outline-continuation";
+/** The system actor of the commit that starts a session's next task. */
+export const OUTLINE_TASK_START_ACTOR = "outline-task-start";
 
 /** The narrator a source is bound to, and the session its tasks belong to. */
 interface OutlineSession {
@@ -100,13 +113,12 @@ interface OutlineSession {
 	subagent: boolean;
 	/** The session (the narrator, or a subagent's root); null when a subagent's root is gone. */
 	sessionNarratorId: string | null;
-	ownerUserId: string | null;
 	/** The session space; null until something was written to it. */
 	spaceId: string | null;
 }
 
 async function readSession(narratorId: string): Promise<OutlineSession> {
-	const row = await readNarratorTaskBackend(narratorId);
+	const row = await readTaskSession(narratorId);
 	const sessionNarratorId = row ? row.sessionNarratorId : narratorId;
 	const space =
 		sessionNarratorId === null
@@ -116,7 +128,6 @@ async function readSession(narratorId: string): Promise<OutlineSession> {
 		narratorId,
 		subagent: row?.subagent === true,
 		sessionNarratorId,
-		ownerUserId: row?.sessionOwnerUserId ?? null,
 		spaceId: space?.id ?? null,
 	};
 }
@@ -257,6 +268,10 @@ export function createOutlineTaskSource(narratorId: string): NarratorTaskSource 
 
 	async function claim(current: OutlineSession, entry: OpenEntry): Promise<boolean> {
 		try {
+			// The person accountable for the commit: the session's owner.
+			const owner = current.sessionNarratorId
+				? ((await readNarrator(current.sessionNarratorId))?.ownerUserId ?? null)
+				: null;
 			const result = await writeOutline({
 				spaceId: entry.ref.spaceId,
 				ops: [
@@ -267,10 +282,13 @@ export function createOutlineTaskSource(narratorId: string): NarratorTaskSource 
 						baseVersionSeq: entry.ref.versionSeq,
 					},
 				],
-				actor: { kind: "system", id: OUTLINE_CONTINUATION_ACTOR },
-				responsibleUserId: current.ownerUserId,
+				actor: { kind: "system", id: OUTLINE_TASK_START_ACTOR },
+				responsibleUserId: owner,
 				narratorId: current.sessionNarratorId,
-				summary: OUTLINE_TEXT.continuationStarted(entry.ref.address),
+				summary: OUTLINE_TEXT.startedForSession(
+					entry.ref.address,
+					current.sessionNarratorId ?? narratorId,
+				),
 			});
 			if (!result.commit) return false;
 			// The claim changed only the checkbox, and the continuation prompt tells the session
@@ -299,15 +317,26 @@ export function createOutlineTaskSource(narratorId: string): NarratorTaskSource 
 		const current = await session();
 		if (current.subagent) return { openTask: null, protectedOpenCount: 0, turnBudgetOnly: true };
 		let read = await readOpen(current);
-		if (promoteTodo && !firstOf(read, "doing")) {
+		if (promoteTodo) {
 			// Only a task of the session's own space is started on its behalf: anything else it
-			// may continue it holds already.
-			const next = read.entries.find(
-				(entry) => entry.status === "todo" && entry.ref.spaceId === current.spaceId,
-			);
-			if (next) {
-				if (await claim(current, next)) next.status = "doing";
-				else read = await readOpen(current);
+			// may continue it holds already. A refused start moves on to the next to-do (a task
+			// changed meanwhile may be tried again at its new version), a few times at most.
+			const tried = new Set<string>();
+			for (let attempt = 0; attempt < OUTLINE_TASK_SOURCE_LIMITS.promotionAttempts; attempt++) {
+				if (firstOf(read, "doing")) break;
+				const next = read.entries.find(
+					(entry) =>
+						entry.status === "todo" &&
+						entry.ref.spaceId === current.spaceId &&
+						!tried.has(`${entry.ref.blockId}@${entry.ref.versionSeq}`),
+				);
+				if (!next) break;
+				tried.add(`${next.ref.blockId}@${next.ref.versionSeq}`);
+				if (await claim(current, next)) {
+					next.status = "doing";
+					break;
+				}
+				read = await readOpen(current);
 			}
 		}
 		const chosen = firstOf(read, "doing") ?? firstOf(read, "blocked");
@@ -355,7 +384,11 @@ export function createOutlineTaskSource(narratorId: string): NarratorTaskSource 
 			const pages = current.spaceId
 				? await outlineStore.listChildMetas(current.spaceId, [null], 1)
 				: [];
-			return { kind: "tasks", variant: pages.length > 0 ? "emptyDone" : "emptyNever" };
+			return {
+				kind: "tasks",
+				variant: pages.length > 0 ? "emptyDone" : "emptyNever",
+				taskBackend: "outline",
+			};
 		}
 		const picked: Array<{ role: SideCarTaskEntry["role"]; entry: OpenEntry }> = [];
 		const lead = firstOf(read, "doing");
@@ -377,6 +410,7 @@ export function createOutlineTaskSource(narratorId: string): NarratorTaskSource 
 		return {
 			kind: "tasks",
 			variant: "current",
+			taskBackend: "outline",
 			tasks: picked.map(({ role, entry }) => ({
 				role,
 				text: titles.get(entry.ref.blockId) ?? entry.ref.sid,
@@ -393,9 +427,12 @@ export function createOutlineTaskSource(narratorId: string): NarratorTaskSource 
 		nextTask: () => single("todo"),
 		async openTasks(): Promise<OpenTaskList> {
 			const read = await readOpen(await session());
-			const titles = await titlesOf(read.entries);
+			// The list is a prefix in document order (its readers show fewer: the interrupt guard
+			// eight); the revision key still covers every task read.
+			const listed = read.entries.slice(0, OUTLINE_TASK_SOURCE_LIMITS.openTasks);
+			const titles = await titlesOf(listed);
 			return {
-				tasks: read.entries.map((entry) => toView(entry, titles)),
+				tasks: listed.map((entry) => toView(entry, titles)),
 				revision: revisionOf(read),
 			};
 		},
@@ -420,9 +457,10 @@ export function createOutlineTaskSource(narratorId: string): NarratorTaskSource 
 			try {
 				const read = await readOpen(await session());
 				if (read.entries.length === 0) return null;
-				const titles = await titlesOf(read.entries);
+				const listed = read.entries.slice(0, OUTLINE_TASK_SOURCE_LIMITS.compact);
+				const titles = await titlesOf(listed);
 				return getOutlineCompactContext(
-					read.entries.map((entry) => ({
+					listed.map((entry) => ({
 						text: titles.get(entry.ref.blockId) ?? entry.ref.sid,
 						address: entry.ref.address,
 						humanCreated: isProtected(entry),
