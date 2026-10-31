@@ -78,3 +78,8 @@
   `EXPORT_VERSION` 并在 `assertVersion` 里拒绝旧版本包，或提供专门的迁移脚本。
 - 快照是**单文件**：导入期间快照被 ATTACH 使用，预览 token 30 分钟过期后自动清理临时文件。
 - 供应商配置里的凭据（API key）是**明文**导出，导出文件请按敏感文件保管。
+- **下载不进页面内存。** 支持 File System Access API 的浏览器先选保存位置，再把
+  `GET /api/storage/export` 的响应体直接写入该文件。其它浏览器由已登录管理员
+  `POST /api/storage/export/ticket` 换一张两分钟、一次有效的票据，再用普通链接请求
+  `GET /api/storage/export/download?ticket=`，由浏览器下载管理器写盘。这条路径挂在
+  全局会话认证之前，因为 `<a href>` 带不上 `Authorization`。

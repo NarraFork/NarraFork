@@ -233,6 +233,63 @@ export const ALL_DATA_KINDS: TransferSelection = {
 };
 
 /**
+ * 没有 File System Access API 的浏览器不能把 fetch 流直接存成用户文件。
+ * 管理员会话换一张短期票据，浏览器再用普通导航下载，下载管理器自己写盘。
+ * 票据挂在全局会话认证之前，本身就是凭证，所以必须短、一次有效、数量有上限。
+ */
+export const EXPORT_TICKET_TTL_MS = 2 * 60 * 1000;
+const EXPORT_TICKET_LIMIT = 32;
+
+interface ExportTicket {
+	selection: TransferSelection;
+	expiresAt: number;
+}
+
+const exportTickets = new Map<string, ExportTicket>();
+
+function copySelection(selection: TransferSelection): TransferSelection {
+	return {
+		requests: selection.requests,
+		sessions: selection.sessions,
+		providers: selection.providers,
+	};
+}
+
+function pruneExportTickets(now: number) {
+	for (const [token, ticket] of exportTickets) {
+		if (now >= ticket.expiresAt) exportTickets.delete(token);
+	}
+	while (exportTickets.size >= EXPORT_TICKET_LIMIT) {
+		const oldest = exportTickets.keys().next().value;
+		if (oldest === undefined) break;
+		exportTickets.delete(oldest);
+	}
+}
+
+/** 签发一张导出下载票据。`now` 只给测试注入时钟。 */
+export function createExportTicket(selection: TransferSelection, now = Date.now()): string {
+	pruneExportTickets(now);
+	const token = randomBytes(18).toString("base64url");
+	exportTickets.set(token, {
+		selection: copySelection(selection),
+		expiresAt: now + EXPORT_TICKET_TTL_MS,
+	});
+	return token;
+}
+
+/**
+ * 取出并作废一张票据。过期、伪造、用过第二次都返回 null。
+ * 先删除再判断过期，避免时钟回拨后同一张票据还能用。
+ */
+export function consumeExportTicket(token: string, now = Date.now()): TransferSelection | null {
+	const ticket = exportTickets.get(token);
+	if (!ticket) return null;
+	exportTickets.delete(token);
+	if (now >= ticket.expiresAt) return null;
+	return ticket.selection;
+}
+
+/**
  * 导出一份 ZIP：先在子进程里把导入需要的表复制成原生 SQLite 快照，再压缩进 ZIP。
  * 供应商配置与清单是小的 JSON 文件。
  */

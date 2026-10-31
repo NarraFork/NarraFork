@@ -180,6 +180,17 @@ export const ERROR_CATALOG = {
 	},
 
 	// --- storage data portability ----------------------------------------------
+	EXPORT_PARAMS_INVALID: {
+		status: 400,
+		code: "VALIDATION_ERROR",
+		en: "The export request is invalid",
+	},
+	/** 401: the ticket is the credential, and this one can never succeed unchanged. */
+	EXPORT_TICKET_INVALID: {
+		status: 401,
+		code: "EXPORT_TICKET_INVALID",
+		en: "This download link has expired. Start the export again",
+	},
 	IMPORT_FILE_REQUIRED: {
 		status: 400,
 		code: "VALIDATION_ERROR",
