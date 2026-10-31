@@ -1332,33 +1332,42 @@ async function appendPersistedMessage(
 	}
 	const created = await withDbRetry(
 		async () =>
-			db.transaction((tx) => {
-				const queueMark = syncQueueMark();
-				let seq = 0;
-				// The blocks commit with the envelope and the rows that belong to it.
-				const created = insertEnvelope(
-					tx,
-					{
-						...newEnvelopeColumns(message.narratorId),
-						...message,
-						authorNarratorId: message.authorNarratorId ?? message.narratorId,
-					},
-					{
-						mode: options?.blockMode,
-						rows: () => {
-							seq = appendMessageRefSync(tx, message.narratorId, message.id, 0, bumpMessageVersion);
-							options?.withRows?.(tx);
-							if (options?.enabledTools)
-								tx.update(narrators)
-									.set({ enabledTools: options.enabledTools })
-									.where(eq(narrators.id, message.narratorId))
-									.run();
+			db.transaction(
+				(tx) => {
+					const queueMark = syncQueueMark();
+					let seq = 0;
+					// The blocks commit with the envelope and the rows that belong to it.
+					const created = insertEnvelope(
+						tx,
+						{
+							...newEnvelopeColumns(message.narratorId),
+							...message,
+							authorNarratorId: message.authorNarratorId ?? message.narratorId,
 						},
-					},
-				);
-				flushQueuedSince(queueMark);
-				return { ...created, seq };
-			}),
+						{
+							mode: options?.blockMode,
+							rows: () => {
+								seq = appendMessageRefSync(
+									tx,
+									message.narratorId,
+									message.id,
+									0,
+									bumpMessageVersion,
+								);
+								options?.withRows?.(tx);
+								if (options?.enabledTools)
+									tx.update(narrators)
+										.set({ enabledTools: options.enabledTools })
+										.where(eq(narrators.id, message.narratorId))
+										.run();
+							},
+						},
+					);
+					flushQueuedSince(queueMark);
+					return { ...created, seq };
+				},
+				{ behavior: "immediate" },
+			),
 		{ label: "appendPersistedMessage", maxRetries: 5 },
 	);
 	if (message.role !== "disp") queueContextCharacterRefresh(message.narratorId, message.id);
@@ -2534,150 +2543,153 @@ const sqliteNarratorPersistence = {
 		let toolCallId: string | undefined;
 		// No await between reading and replacing the JSON body: a concurrent checkpoint
 		// or translation must not overwrite a newer revision read by another consumer.
-		const persisted = db.transaction((tx) => {
-			const queueMark = syncQueueMark();
-			const existing = fillBody(
-				tx.query.narratorMessages
-					.findFirst({
-						where: eq(narratorMessages.id, messageId),
-						...bodyColumns({ id: true, contentJson: true, parentToolUseId: true }),
-					})
-					.sync(),
-			);
-			if (!existing) throw new NotFoundError("Assistant message", messageId);
+		const persisted = db.transaction(
+			(tx) => {
+				const queueMark = syncQueueMark();
+				const existing = fillBody(
+					tx.query.narratorMessages
+						.findFirst({
+							where: eq(narratorMessages.id, messageId),
+							...bodyColumns({ id: true, contentJson: true, parentToolUseId: true }),
+						})
+						.sync(),
+				);
+				if (!existing) throw new NotFoundError("Assistant message", messageId);
 
-			type StoredAssistantBlock =
-				| {
-						type: "text";
-						text: string;
-						outputIndex?: number;
-						citations?: import("@shared/citations").TextCitation[];
-						fileReferenceContext?: import("@shared/file-reference").FileReferenceContext;
-						id?: string;
-						revision?: number;
-						rawTextLength?: number;
-						completed?: boolean;
-				  }
-				| {
-						type: "reasoning";
-						text: string;
-						id?: string;
-						revision?: number;
-						rawTextLength?: number;
-						completed?: boolean;
-						providerMetadata?: import("@server/lib/agent/types").ReasoningProviderMetadata;
-						outputIndex?: number;
-				  }
-				| {
-						type: "redacted_thinking";
-						data: string;
-						outputIndex?: number;
-						signatureSource?: string;
-				  }
-				| {
-						type: "tool_use";
-						id: string;
-						name: string;
-						input: Record<string, unknown>;
-						streamStartedAt?: number;
-						streamCompletedAt?: number;
-						outputIndex?: number;
-						thoughtSignature?: string;
-						thoughtSignatureSource?: string;
-				  }
-				| {
-						type: "web_search";
-						id: string;
-						query?: string;
-						queries?: string[];
-						outputIndex?: number;
-				  }
-				| { type: string; text?: unknown; outputIndex?: unknown; [key: string]: unknown };
-			const current = (
-				Array.isArray(existing.contentJson) ? existing.contentJson : []
-			) as StoredAssistantBlock[];
-			let content: StoredAssistantBlock[];
-			const matchingIndex =
-				(block.type === "text" || block.type === "reasoning") && block.id
-					? current.findIndex((entry) => entry.type === block.type && entry.id === block.id)
-					: -1;
-			if (matchingIndex !== -1 && (block.type === "text" || block.type === "reasoning")) {
-				const previous = current[matchingIndex] as Record<string, unknown>;
-				const stale =
-					typeof previous.revision === "number" &&
-					(block.revision == null || block.revision < previous.revision);
-				const next: Record<string, unknown> = {
-					...previous,
-					...Object.fromEntries(Object.entries(block).filter(([, value]) => value !== undefined)),
-				};
-				if (block.type === "reasoning" && block.providerMetadata) {
-					next.providerMetadata = mergeReasoningMetadata(
-						previous.providerMetadata as ReasoningProviderMetadata | undefined,
-						block.providerMetadata,
-					);
-				}
-				if (previous.text !== block.text) delete next.translatedText;
-				if (stale || isDeepStrictEqual(previous, next)) {
-					content = current;
-				} else {
-					// A checkpoint updates the original chronological slot, even when its
-					// metadata arrives after a tool has already been committed.
-					content = [...current];
-					content[matchingIndex] = next as StoredAssistantBlock;
-				}
-			} else if (typeof (block as { outputIndex?: unknown }).outputIndex === "number") {
-				const getOutputIndex = (entry: StoredAssistantBlock): number | undefined => {
-					const outputIndex = (entry as { outputIndex?: unknown }).outputIndex;
-					return typeof outputIndex === "number" ? outputIndex : undefined;
-				};
-				// ECMAScript's stable sort preserves arrival order for ties/unindexed blocks;
-				// avoid the former wrapper object + two extra arrays for every checkpoint.
-				content = [...current, block as StoredAssistantBlock];
-				content.sort((a, b) => {
-					const aOrder = getOutputIndex(a) ?? Number.POSITIVE_INFINITY;
-					const bOrder = getOutputIndex(b) ?? Number.POSITIVE_INFINITY;
-					return aOrder === bOrder ? 0 : aOrder - bOrder;
-				});
-			} else {
-				// Unindexed providers/checkpoints already arrive in occurrence order. Do not
-				// pull later reasoning in front of text/tools that were actually seen first.
-				content = [...current, block];
-			}
-			if (content === current && !options?.republishUnchanged) return undefined;
-			const writeLedgerRow = () => {
-				if (block.type === "tool_use")
-					toolCallId = insertToolCallRowTx(tx, {
-						narratorId,
-						messageId,
-						parentSegmentId: toolParentSegmentId,
-						block,
-						createdAt: toolCreatedAt,
+				type StoredAssistantBlock =
+					| {
+							type: "text";
+							text: string;
+							outputIndex?: number;
+							citations?: import("@shared/citations").TextCitation[];
+							fileReferenceContext?: import("@shared/file-reference").FileReferenceContext;
+							id?: string;
+							revision?: number;
+							rawTextLength?: number;
+							completed?: boolean;
+					  }
+					| {
+							type: "reasoning";
+							text: string;
+							id?: string;
+							revision?: number;
+							rawTextLength?: number;
+							completed?: boolean;
+							providerMetadata?: import("@server/lib/agent/types").ReasoningProviderMetadata;
+							outputIndex?: number;
+					  }
+					| {
+							type: "redacted_thinking";
+							data: string;
+							outputIndex?: number;
+							signatureSource?: string;
+					  }
+					| {
+							type: "tool_use";
+							id: string;
+							name: string;
+							input: Record<string, unknown>;
+							streamStartedAt?: number;
+							streamCompletedAt?: number;
+							outputIndex?: number;
+							thoughtSignature?: string;
+							thoughtSignatureSource?: string;
+					  }
+					| {
+							type: "web_search";
+							id: string;
+							query?: string;
+							queries?: string[];
+							outputIndex?: number;
+					  }
+					| { type: string; text?: unknown; outputIndex?: unknown; [key: string]: unknown };
+				const current = (
+					Array.isArray(existing.contentJson) ? existing.contentJson : []
+				) as StoredAssistantBlock[];
+				let content: StoredAssistantBlock[];
+				const matchingIndex =
+					(block.type === "text" || block.type === "reasoning") && block.id
+						? current.findIndex((entry) => entry.type === block.type && entry.id === block.id)
+						: -1;
+				if (matchingIndex !== -1 && (block.type === "text" || block.type === "reasoning")) {
+					const previous = current[matchingIndex] as Record<string, unknown>;
+					const stale =
+						typeof previous.revision === "number" &&
+						(block.revision == null || block.revision < previous.revision);
+					const next: Record<string, unknown> = {
+						...previous,
+						...Object.fromEntries(Object.entries(block).filter(([, value]) => value !== undefined)),
+					};
+					if (block.type === "reasoning" && block.providerMetadata) {
+						next.providerMetadata = mergeReasoningMetadata(
+							previous.providerMetadata as ReasoningProviderMetadata | undefined,
+							block.providerMetadata,
+						);
+					}
+					if (previous.text !== block.text) delete next.translatedText;
+					if (stale || isDeepStrictEqual(previous, next)) {
+						content = current;
+					} else {
+						// A checkpoint updates the original chronological slot, even when its
+						// metadata arrives after a tool has already been committed.
+						content = [...current];
+						content[matchingIndex] = next as StoredAssistantBlock;
+					}
+				} else if (typeof (block as { outputIndex?: unknown }).outputIndex === "number") {
+					const getOutputIndex = (entry: StoredAssistantBlock): number | undefined => {
+						const outputIndex = (entry as { outputIndex?: unknown }).outputIndex;
+						return typeof outputIndex === "number" ? outputIndex : undefined;
+					};
+					// ECMAScript's stable sort preserves arrival order for ties/unindexed blocks;
+					// avoid the former wrapper object + two extra arrays for every checkpoint.
+					content = [...current, block as StoredAssistantBlock];
+					content.sort((a, b) => {
+						const aOrder = getOutputIndex(a) ?? Number.POSITIVE_INFINITY;
+						const bOrder = getOutputIndex(b) ?? Number.POSITIVE_INFINITY;
+						return aOrder === bOrder ? 0 : aOrder - bOrder;
 					});
-			};
-			// One item changed: its block row (and the tool's ledger binding) follows.
-			const stamp = { attemptId: options?.attemptId };
-			if (content !== current) {
-				const textParts: string[] = [];
-				for (const entry of content)
-					if (entry.type === "text" && typeof entry.text === "string") textParts.push(entry.text);
-				const contentText = textParts.join("\n");
-				writeEnvelopeBody(tx, messageId, content, {
-					set: {
-						contextCharsJson: measureMessageCharacters("assistant", content),
-						contentText: contentText || null,
-					},
-					mode: "streaming",
-					stamp,
-					rows: writeLedgerRow,
-				});
-				queueContextCharacterRefresh(narratorId, messageId);
-			} else {
-				writeLedgerRow();
-				syncEnvelopeNow(messageId, "streaming", stamp);
-			}
-			flushQueuedSince(queueMark);
-			return existing;
-		});
+				} else {
+					// Unindexed providers/checkpoints already arrive in occurrence order. Do not
+					// pull later reasoning in front of text/tools that were actually seen first.
+					content = [...current, block];
+				}
+				if (content === current && !options?.republishUnchanged) return undefined;
+				const writeLedgerRow = () => {
+					if (block.type === "tool_use")
+						toolCallId = insertToolCallRowTx(tx, {
+							narratorId,
+							messageId,
+							parentSegmentId: toolParentSegmentId,
+							block,
+							createdAt: toolCreatedAt,
+						});
+				};
+				// One item changed: its block row (and the tool's ledger binding) follows.
+				const stamp = { attemptId: options?.attemptId };
+				if (content !== current) {
+					const textParts: string[] = [];
+					for (const entry of content)
+						if (entry.type === "text" && typeof entry.text === "string") textParts.push(entry.text);
+					const contentText = textParts.join("\n");
+					writeEnvelopeBody(tx, messageId, content, {
+						set: {
+							contextCharsJson: measureMessageCharacters("assistant", content),
+							contentText: contentText || null,
+						},
+						mode: "streaming",
+						stamp,
+						rows: writeLedgerRow,
+					});
+					queueContextCharacterRefresh(narratorId, messageId);
+				} else {
+					writeLedgerRow();
+					syncEnvelopeNow(messageId, "streaming", stamp);
+				}
+				flushQueuedSince(queueMark);
+				return existing;
+			},
+			{ behavior: "immediate" },
+		);
 		if (!persisted) return undefined;
 		const existing = persisted;
 
@@ -3755,58 +3767,61 @@ const sqliteNarratorPersistence = {
 			const parentSegmentId =
 				(await findExecutionSegmentParent(narratorId))?.executionSegmentId ?? null;
 			// The new attempt and its execution segment are one transaction.
-			const toolCall = db.transaction((tx) => {
-				const queueMark = syncQueueMark();
-				const latest = tx.query.narratorToolCalls
-					.findFirst({
-						where: and(
-							eq(narratorToolCalls.messageId, messageId),
-							eq(narratorToolCalls.toolUseId, source.toolUseId),
-						),
-						orderBy: [desc(narratorToolCalls.executionAttempt)],
-						columns: { id: true, executionAttempt: true },
-					})
-					.sync();
-				// Repeating an old request must not allocate a second successor attempt.
-				if (latest && latest.executionAttempt > source.executionAttempt) {
-					throw new ValidationError("This tool call already has a newer execution attempt");
-				}
-				const id = generateId();
-				const createdAt = new Date().toISOString();
-				const executionAttempt = Math.max(
-					1,
-					(latest?.executionAttempt ?? source.executionAttempt) + 1,
-				);
-				const executionSegmentId = insertExecutionSegmentTx(tx, {
-					narratorId,
-					parentSegmentId,
-					toolCallId: id,
-					attempt: executionAttempt,
-					createdAt,
-				});
-				const [created] = tx
-					.insert(narratorToolCalls)
-					.values({
-						id,
+			const toolCall = db.transaction(
+				(tx) => {
+					const queueMark = syncQueueMark();
+					const latest = tx.query.narratorToolCalls
+						.findFirst({
+							where: and(
+								eq(narratorToolCalls.messageId, messageId),
+								eq(narratorToolCalls.toolUseId, source.toolUseId),
+							),
+							orderBy: [desc(narratorToolCalls.executionAttempt)],
+							columns: { id: true, executionAttempt: true },
+						})
+						.sync();
+					// Repeating an old request must not allocate a second successor attempt.
+					if (latest && latest.executionAttempt > source.executionAttempt) {
+						throw new ValidationError("This tool call already has a newer execution attempt");
+					}
+					const id = generateId();
+					const createdAt = new Date().toISOString();
+					const executionAttempt = Math.max(
+						1,
+						(latest?.executionAttempt ?? source.executionAttempt) + 1,
+					);
+					const executionSegmentId = insertExecutionSegmentTx(tx, {
 						narratorId,
-						messageId,
-						toolUseId: source.toolUseId,
-						toolName: source.toolName,
-						inputJson: source.inputJson,
-						inputChars: source.inputChars,
-						executionIdentityVersion: 1,
-						executionAttempt,
-						executionSegmentId,
-						status: "initializing",
+						parentSegmentId,
+						toolCallId: id,
+						attempt: executionAttempt,
 						createdAt,
-						// Deliberately no operation, approval, timing, result, token accounting or tree data.
-					})
-					.returning()
-					.all();
-				// The new attempt reopens its tool block in the same commit.
-				flushQueuedSince(queueMark);
-				return created;
-			});
+					});
+					const [created] = tx
+						.insert(narratorToolCalls)
+						.values({
+							id,
+							narratorId,
+							messageId,
+							toolUseId: source.toolUseId,
+							toolName: source.toolName,
+							inputJson: source.inputJson,
+							inputChars: source.inputChars,
+							executionIdentityVersion: 1,
+							executionAttempt,
+							executionSegmentId,
+							status: "initializing",
+							createdAt,
+							// Deliberately no operation, approval, timing, result, token accounting or tree data.
+						})
+						.returning()
+						.all();
+					// The new attempt reopens its tool block in the same commit.
+					flushQueuedSince(queueMark);
+					return created;
+				},
+				{ behavior: "immediate" },
+			);
 			return {
 				toolCall,
 				requiresFreshPermission: shared || source.narratorId !== narratorId,
@@ -4036,55 +4051,60 @@ const sqliteNarratorPersistence = {
 			);
 			if (messageId) conditions.push(eq(narratorToolCalls.messageId, messageId));
 		}
-		const affectedToolCalls = db.transaction((tx) => {
-			const queueMark = syncQueueMark();
-			const updated = tx
-				.update(narratorToolCalls)
-				.set({
-					outputJson: result.output ?? null,
-					outputChars: measureSerializedCharacters(result.output ?? result.errorMessage ?? null),
-					status: result.status,
-					errorMessage: result.errorMessage ?? null,
-					permissionStartedAt:
-						typeof result.permissionStartedAt === "number"
-							? new Date(result.permissionStartedAt).toISOString()
-							: undefined,
-					executionStartedAt:
-						typeof result.executionStartedAt === "number"
-							? new Date(result.executionStartedAt).toISOString()
-							: undefined,
-					...(result.preserveTiming
-						? {}
-						: {
-								durationMs: result.durationMs ?? null,
-								completedAt:
-									typeof result.completedAt === "number"
-										? new Date(result.completedAt).toISOString()
-										: new Date().toISOString(),
-							}),
-					...(result.resultMessageId != null && { resultMessageId: result.resultMessageId }),
-				})
-				.where(and(...conditions))
-				.returning({
-					id: narratorToolCalls.id,
-					narratorId: narratorToolCalls.narratorId,
-					messageId: narratorToolCalls.messageId,
-					toolUseId: narratorToolCalls.toolUseId,
-					toolName: narratorToolCalls.toolName,
-					executionDeviceId: narratorToolCalls.executionDeviceId,
-				})
-				.all();
-			if (expected && updated.length !== 1) {
-				throw new ValidationError("Tool execution binding is stale or belongs to another narrator");
-			}
-			// A redirected or sanitized input is stored with the result it produced.
-			if (result.input !== undefined)
-				for (const row of updated) overwriteToolInputTx(tx, row.id, toolUseId, result.input);
-			result.onPersist?.(tx);
-			// The settled tool block (phase, binding, searchable result) commits with it.
-			flushQueuedSince(queueMark);
-			return updated;
-		});
+		const affectedToolCalls = db.transaction(
+			(tx) => {
+				const queueMark = syncQueueMark();
+				const updated = tx
+					.update(narratorToolCalls)
+					.set({
+						outputJson: result.output ?? null,
+						outputChars: measureSerializedCharacters(result.output ?? result.errorMessage ?? null),
+						status: result.status,
+						errorMessage: result.errorMessage ?? null,
+						permissionStartedAt:
+							typeof result.permissionStartedAt === "number"
+								? new Date(result.permissionStartedAt).toISOString()
+								: undefined,
+						executionStartedAt:
+							typeof result.executionStartedAt === "number"
+								? new Date(result.executionStartedAt).toISOString()
+								: undefined,
+						...(result.preserveTiming
+							? {}
+							: {
+									durationMs: result.durationMs ?? null,
+									completedAt:
+										typeof result.completedAt === "number"
+											? new Date(result.completedAt).toISOString()
+											: new Date().toISOString(),
+								}),
+						...(result.resultMessageId != null && { resultMessageId: result.resultMessageId }),
+					})
+					.where(and(...conditions))
+					.returning({
+						id: narratorToolCalls.id,
+						narratorId: narratorToolCalls.narratorId,
+						messageId: narratorToolCalls.messageId,
+						toolUseId: narratorToolCalls.toolUseId,
+						toolName: narratorToolCalls.toolName,
+						executionDeviceId: narratorToolCalls.executionDeviceId,
+					})
+					.all();
+				if (expected && updated.length !== 1) {
+					throw new ValidationError(
+						"Tool execution binding is stale or belongs to another narrator",
+					);
+				}
+				// A redirected or sanitized input is stored with the result it produced.
+				if (result.input !== undefined)
+					for (const row of updated) overwriteToolInputTx(tx, row.id, toolUseId, result.input);
+				result.onPersist?.(tx);
+				// The settled tool block (phase, binding, searchable result) commits with it.
+				flushQueuedSince(queueMark);
+				return updated;
+			},
+			{ behavior: "immediate" },
+		);
 
 		// Announce the terminal state with bounded metadata only. External clients need to see
 		// "which tool ran on which device, how long it took, did it fail" to follow along; without
@@ -4259,13 +4279,16 @@ const sqliteNarratorPersistence = {
 		}
 		const now = new Date().toISOString();
 		const refreshedRecipients: string[] = [];
-		const result = db.transaction((tx) => {
-			const queueMark = syncQueueMark();
-			const id = rewrite(tx);
-			flushQueuedSince(queueMark);
-			options.afterWrite?.(tx, id);
-			return id;
-		});
+		const result = db.transaction(
+			(tx) => {
+				const queueMark = syncQueueMark();
+				const id = rewrite(tx);
+				flushQueuedSince(queueMark);
+				options.afterWrite?.(tx, id);
+				return id;
+			},
+			{ behavior: "immediate" },
+		);
 		function rewrite(tx: DbTx): string {
 			const original = readEnvelope(tx, messageId);
 			if (!original) throw new NotFoundError("Message", messageId);
@@ -4493,20 +4516,26 @@ const sqliteNarratorPersistence = {
 			Object.entries(meta).filter(([, value]) => value !== undefined),
 		);
 		// The step is complete: items it left incomplete are interrupted, not streaming.
-		db.transaction((tx) => {
-			const queueMark = syncQueueMark();
-			updateEnvelope(tx, messageId, updates, { mode: "sealed" });
-			flushQueuedSince(queueMark);
-		});
+		db.transaction(
+			(tx) => {
+				const queueMark = syncQueueMark();
+				updateEnvelope(tx, messageId, updates, { mode: "sealed" });
+				flushQueuedSince(queueMark);
+			},
+			{ behavior: "immediate" },
+		);
 	},
 
 	/** Seal a step's blocks without changing its metadata (a kept partial after a stop). */
 	sealStepBlocks(messageId: string): void {
-		db.transaction(() => {
-			const queueMark = syncQueueMark();
-			syncEnvelopeNow(messageId, "sealed");
-			flushQueuedSince(queueMark);
-		});
+		db.transaction(
+			() => {
+				const queueMark = syncQueueMark();
+				syncEnvelopeNow(messageId, "sealed");
+				flushQueuedSince(queueMark);
+			},
+			{ behavior: "immediate" },
+		);
 	},
 
 	/** Put a sealed step's tool_use blocks into the model's call order. */
@@ -4516,14 +4545,17 @@ const sqliteNarratorPersistence = {
 		content: unknown[],
 		contentText: string | null,
 	): Promise<void> {
-		db.transaction((tx) => {
-			const queueMark = syncQueueMark();
-			writeEnvelopeBody(tx, messageId, content, {
-				set: { contextCharsJson: measureMessageCharacters("assistant", content, contentText) },
-				mode: "sealed",
-			});
-			flushQueuedSince(queueMark);
-		});
+		db.transaction(
+			(tx) => {
+				const queueMark = syncQueueMark();
+				writeEnvelopeBody(tx, messageId, content, {
+					set: { contextCharsJson: measureMessageCharacters("assistant", content, contentText) },
+					mode: "sealed",
+				});
+				flushQueuedSince(queueMark);
+			},
+			{ behavior: "immediate" },
+		);
 		queueContextCharacterRefresh(narratorId, messageId);
 	},
 
