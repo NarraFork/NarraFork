@@ -161,6 +161,19 @@ describe("metadata policy", () => {
 			),
 		).toBe("none");
 	});
+	test("a declared empty tier list means no tier is sent", () => {
+		// A gateway reporting `effortLevels: []` says "this model has no thinking tiers".
+		// Sending any named tier then 400s with "not supported by model metadata".
+		expect(resolveMetadataReasoning({ reasoning: { levels: [] } }, "xhigh")).toBeUndefined();
+		expect(resolveMetadataReasoning({ reasoning: { levels: [] } }, "low")).toBeUndefined();
+		expect(
+			resolveMetadataReasoning({ reasoning: { levels: [], defaultLevel: "high" } }, undefined),
+		).toBeUndefined();
+		// Explicitly disabling thinking is still expressible without a tier ladder.
+		expect(resolveMetadataReasoning({ reasoning: { levels: [] } }, "none")).toBe("none");
+		// Declared-unknown (`null`) and never-declared stay "no claim": the tier is kept.
+		expect(resolveMetadataReasoning({ reasoning: { levels: null } }, "xhigh")).toBe("xhigh");
+	});
 	test("output image capability does not imply input image capability", () => {
 		expect(() =>
 			assertModelInputModalities(
@@ -369,6 +382,84 @@ describe("actual provider request bodies", () => {
 			}
 		});
 	}
+	for (const channelType of ["openai", "responses", "codex", "anthropic"]) {
+		test(`NUG ${channelType} model reporting no thinking tiers sends no effort`, async () => {
+			// The bug this guards: the frontend hides the tier menu for such a model, but
+			// the cached narrator effort (`xhigh`) was still sent, and the gateway answered
+			// `400 reasoning effort "xhigh" is not supported by model metadata`.
+			const nugConfig = { ...config, id: "tierless-nug", prefix: "tierless-nug" };
+			settings.nugProviders = [...(savedNug ?? []), nugConfig];
+			setNugCachedModels(nugConfig.id, [
+				{
+					id: "channel:gemini-3.8-flash-high",
+					channel: "channel",
+					channelType,
+					model: "gemini-3.8-flash-high",
+					effortLevels: [],
+				},
+			]);
+			const body = await captureChat(new NugProvider(nugConfig), {
+				model: "tierless-nug:channel:gemini-3.8-flash-high",
+				reasoningEffort: "xhigh",
+			});
+			if (channelType === "anthropic") {
+				expect(body.output_config).toBeUndefined();
+			} else if (channelType === "responses") {
+				expect(body.reasoning).toBeUndefined();
+			} else if (channelType === "openai") {
+				expect(body.reasoning_effort).toBeUndefined();
+			} else {
+				// A Codex body must carry an effort value; "no tier" degrades to "none"
+				// rather than naming one the model declared it does not have.
+				expect(body.reasoning.effort).toBe("none");
+			}
+		});
+	}
+	test("NUG legacy metadata envelope declaring no tiers drops the effort", async () => {
+		// The shape current gateways actually send: a grouped v1 envelope instead of a
+		// complete card. Its `reasoning.levels: []` has to reach request building.
+		const nugConfig = { ...config, id: "envelope-nug", prefix: "envelope-nug" };
+		settings.nugProviders = [...(savedNug ?? []), nugConfig];
+		setNugCachedModels(nugConfig.id, [
+			{
+				id: "antigravity:gemini-3.8-flash-high",
+				channel: "antigravity",
+				channelType: "anthropic",
+				model: "gemini-3.8-flash-high",
+				effortLevels: [],
+				metadata: { schemaVersion: 1, metadata: { reasoning: { levels: [] } } },
+			},
+		]);
+		const body = await captureChat(new NugProvider(nugConfig), {
+			model: "envelope-nug:antigravity:gemini-3.8-flash-high",
+			reasoningEffort: "xhigh",
+		});
+		expect(body.output_config).toBeUndefined();
+		// Thinking itself stays enabled: only the tier ladder is declared absent.
+		expect(body.thinking?.type).not.toBe("disabled");
+	});
+	test("NUG complete card without reasoning keys still honors the gateway tier list", async () => {
+		// A new gateway may send a complete card that says nothing about reasoning while
+		// its top-level `effortLevels` states "no tiers". The discovery layer has to carry
+		// that claim, otherwise menu and request disagree again.
+		const nugConfig = { ...config, id: "card-nug", prefix: "card-nug" };
+		settings.nugProviders = [...(savedNug ?? []), nugConfig];
+		setNugCachedModels(nugConfig.id, [
+			{
+				id: "channel:gemini-3.8-flash-high",
+				channel: "channel",
+				channelType: "anthropic",
+				model: "gemini-3.8-flash-high",
+				effortLevels: [],
+				modelCard: { schemaVersion: 2, metadata: { max_output_tokens: 4000 } },
+			},
+		]);
+		const body = await captureChat(new NugProvider(nugConfig), {
+			model: "card-nug:channel:gemini-3.8-flash-high",
+			reasoningEffort: "xhigh",
+		});
+		expect(body.output_config).toBeUndefined();
+	});
 	for (const channelType of ["openai", "responses", "codex", "anthropic"]) {
 		test(`NUG ${channelType} delegate retains channel binding capabilities`, async () => {
 			const nugConfig = { ...config, id: "runtime-nug", prefix: "runtime-nug" };

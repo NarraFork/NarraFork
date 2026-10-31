@@ -127,6 +127,15 @@ export function resolveMetadataReasoning(
 				? reasoning.defaultLevel
 				: levels?.[0];
 	if (!effort) return undefined;
+	// An explicitly declared empty tier list is a positive claim — "this model has no
+	// selectable thinking intensity" — not missing information. Gateway-discovered
+	// metadata reports exactly this (`effortLevels: []`), and the upstream then rejects
+	// any named tier with `reasoning effort "xhigh" is not supported by model metadata`.
+	// Returning undefined drops the effort from the request instead. An explicit "none"
+	// already returned above, so "turn thinking off" keeps working. `Array.isArray`
+	// keeps the three states apart: [] = no tiers, null = declared unknown, absent =
+	// never declared (both of the latter keep the caller's tier).
+	if (Array.isArray(reasoning?.levels) && reasoning.levels.length === 0) return undefined;
 	if (levels?.length && !levels.includes(effort)) {
 		const known = levels.filter((level): level is ReasoningEffort =>
 			REASONING_EFFORT_VALUES.includes(level as ReasoningEffort),
