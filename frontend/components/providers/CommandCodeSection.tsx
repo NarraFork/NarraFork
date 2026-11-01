@@ -122,13 +122,10 @@ export function CommandCodeSection({
 	onRefreshModels,
 }: CommandCodeSectionProps) {
 	const { t } = useTranslation("settings");
-	// 额度走内置连接，只对默认前缀展示。
-	const showUsage = prefix === "CommandCode";
 	const { data, isLoading } = useQuery({
-		queryKey: ["commandcode", "usage"],
-		queryFn: () => api.commandCodeUsage(),
+		queryKey: ["commandcode", "usage", prefix],
+		queryFn: () => api.commandCodeUsage(prefix),
 		refetchInterval: 60_000,
-		enabled: showUsage,
 	});
 	const [refreshing, setRefreshing] = useState(false);
 	const handleRefreshModels = useCallback(async () => {
@@ -182,65 +179,61 @@ export function CommandCodeSection({
 					{commandCodeReasonText(t, data?.reason)}
 				</Alert>
 			)}
-			{showUsage && data?.error === "usage_unavailable" && (
+			{data?.error === "usage_unavailable" && (
 				<Alert color="red" variant="light">
 					{t("commandcode.usageFailed")}
 				</Alert>
 			)}
 
-			{showUsage && (
-				<>
-					<Divider />
-					<Stack gap="xs">
-						<Text size="sm" fw={500}>
-							{t("commandcode.usageTitle")}
-						</Text>
-						<Text size="xs" c="dimmed">
-							{t("commandcode.usageDesc")}
-						</Text>
+			<Divider />
+			<Stack gap="xs">
+				<Text size="sm" fw={500}>
+					{t("commandcode.usageTitle")}
+				</Text>
+				<Text size="xs" c="dimmed">
+					{t("commandcode.usageDesc")}
+				</Text>
 
-						{credits ? (
-							<Stack gap="sm" maw="100%">
-								{monthlyUsed !== undefined && monthlyTotal !== undefined && (
-									<UsageMeter
-										label={t("commandcode.monthlyCredits")}
-										used={monthlyUsed}
-										cap={monthlyTotal}
-									/>
-								)}
-								{data?.windowLimits?.fiveHour && (
-									<UsageMeter
-										label={t("commandcode.fiveHour")}
-										used={data.windowLimits.fiveHour.used}
-										cap={data.windowLimits.fiveHour.cap}
-										resetAt={data.windowLimits.fiveHour.resetAt}
-									/>
-								)}
-								{data?.windowLimits?.weekly && (
-									<UsageMeter
-										label={t("commandcode.weekly")}
-										used={data.windowLimits.weekly.used}
-										cap={data.windowLimits.weekly.cap}
-										resetAt={data.windowLimits.weekly.resetAt}
-									/>
-								)}
-								{summary && (
-									<Text size="xs" c="dimmed">
-										{t("commandcode.requests")}: {summary.totalCount} ·{" "}
-										{formatCompactNumber(summary.totalTokens).compact} · {summary.successRate}%
-									</Text>
-								)}
-							</Stack>
-						) : (
-							!isLoading && (
-								<Text size="xs" c="dimmed">
-									{t("commandcode.usageUnavailable")}
-								</Text>
-							)
+				{credits ? (
+					<Stack gap="sm" maw="100%">
+						{monthlyUsed !== undefined && monthlyTotal !== undefined && (
+							<UsageMeter
+								label={t("commandcode.monthlyCredits")}
+								used={monthlyUsed}
+								cap={monthlyTotal}
+							/>
+						)}
+						{data?.windowLimits?.fiveHour && (
+							<UsageMeter
+								label={t("commandcode.fiveHour")}
+								used={data.windowLimits.fiveHour.used}
+								cap={data.windowLimits.fiveHour.cap}
+								resetAt={data.windowLimits.fiveHour.resetAt}
+							/>
+						)}
+						{data?.windowLimits?.weekly && (
+							<UsageMeter
+								label={t("commandcode.weekly")}
+								used={data.windowLimits.weekly.used}
+								cap={data.windowLimits.weekly.cap}
+								resetAt={data.windowLimits.weekly.resetAt}
+							/>
+						)}
+						{summary && (
+							<Text size="xs" c="dimmed">
+								{t("commandcode.requests")}: {summary.totalCount} ·{" "}
+								{formatCompactNumber(summary.totalTokens).compact} · {summary.successRate}%
+							</Text>
 						)}
 					</Stack>
-				</>
-			)}
+				) : (
+					!isLoading && (
+						<Text size="xs" c="dimmed">
+							{t("commandcode.usageUnavailable")}
+						</Text>
+					)
+				)}
+			</Stack>
 
 			<Divider />
 			<Stack gap="xs">

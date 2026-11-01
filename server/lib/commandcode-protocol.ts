@@ -9,9 +9,14 @@
  *   两把 key、Bearer 与 x-api-key 两种认证都如此，而同一 key 的其它端点均 200），属上游问题。
  */
 
-export const COMMAND_CODE_API_BASE = "https://api.commandcode.ai";
+import {
+	COMMAND_CODE_API_BASE as SHARED_COMMAND_CODE_API_BASE,
+	COMMAND_CODE_PROVIDER_BASE as SHARED_COMMAND_CODE_PROVIDER_BASE,
+} from "@shared/commandcode";
+
+export const COMMAND_CODE_API_BASE = SHARED_COMMAND_CODE_API_BASE;
 /** Provider API 根：各推理端点挂在其下（`/messages`、`/chat/completions`、`/responses`、`/models`）。 */
-export const COMMAND_CODE_PROVIDER_BASE = `${COMMAND_CODE_API_BASE}/provider/v1`;
+export const COMMAND_CODE_PROVIDER_BASE = SHARED_COMMAND_CODE_PROVIDER_BASE;
 /**
  * 平台 provider 的前缀。
  *

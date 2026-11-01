@@ -11,6 +11,7 @@ import {
 	TextInput,
 	Title,
 } from "@mantine/core";
+import { COMMAND_CODE_PROVIDER_BASE } from "@shared/commandcode";
 import { useQuery } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
@@ -30,7 +31,8 @@ export function emptyInstanceConfig(platform: PlatformInstanceKind): Record<stri
 				credentialIds: [],
 			};
 		case "CommandCode":
-			return { apiKey: "", baseUrl: "" };
+			// baseUrl 预填官方地址：留空会被当成"没配置"，用户还得自己去查默认值。
+			return { apiKey: "", baseUrl: COMMAND_CODE_PROVIDER_BASE };
 		case "tokendance":
 			return { apiKey: "" };
 	}

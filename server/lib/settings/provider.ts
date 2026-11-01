@@ -9,6 +9,7 @@ import { parseModelId } from "@shared/model-id";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import type { PlatformInstanceRow } from "@shared/platform-instances";
 import { selectTokenDanceProtocol } from "@shared/tokendance";
+import type { CommandCodeProviderSettings } from "../agent/commandcode-provider";
 import { getCodexManager } from "../codex-manager";
 import { resolveCommandCodeToken } from "../commandcode-manager";
 import { peekCommandCodeModels } from "../commandcode-models";
@@ -864,16 +865,44 @@ export function isPlatformInstanceUsable(instance: PlatformInstanceRow): boolean
 	}
 }
 
+/**
+ * 某个 Command Code 实例的连接配置。
+ *
+ * 不传前缀时取「默认前缀那条」，没有就取第一条实例；一条实例都没有时回落到旧的单例字段
+ * （迁移前的安装）。额度、状态与模型刷新都按实例自己的 key/baseUrl 走。
+ */
+export function commandCodeConfigForPrefix(
+	prefix?: string,
+): CommandCodeProviderSettings | undefined {
+	const instances = (s().agent?.platformInstances ?? []).filter(
+		(entry) => entry.platform === "CommandCode",
+	);
+	if (instances.length === 0) return s().commandCode;
+	const instance = prefix
+		? instances.find((entry) => entry.prefix === prefix)
+		: (instances.find((entry) => entry.prefix === COMMAND_CODE_PREFIX) ?? instances[0]);
+	return instance?.config as CommandCodeProviderSettings | undefined;
+}
+
 /** Command Code 的凭据可以来自设置页手填的 API key，或 CLI 落盘的 auth.json。 */
 export function hasConfiguredCommandCodeProvider(): boolean {
-	const config = s().commandCode;
-	if (!config?.disabled && resolveCommandCodeToken(config?.apiKey).credential) return true;
 	// 模型目录整个平台共用：只要还有一条可用的 Command Code 实例就算可用。
-	return (s().agent?.platformInstances ?? []).some(
-		(instance) =>
-			instance.platform === "CommandCode" &&
-			!instance.disabled &&
-			!!resolveCommandCodeToken(instance.config.apiKey as string | undefined).credential,
+	const instances = (s().agent?.platformInstances ?? []).filter(
+		(entry) => entry.platform === "CommandCode",
+	);
+	const legacy = s().commandCode;
+	const candidates: Array<{ disabled: boolean; config: CommandCodeProviderSettings }> =
+		instances.length
+			? instances.map((entry) => ({
+					disabled: entry.disabled,
+					config: entry.config as CommandCodeProviderSettings,
+				}))
+			: legacy
+				? [{ disabled: legacy.disabled === true, config: legacy }]
+				: [];
+	return candidates.some(
+		(candidate) =>
+			!candidate.disabled && !!resolveCommandCodeToken(candidate.config.apiKey).credential,
 	);
 }
 

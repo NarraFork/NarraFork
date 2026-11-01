@@ -534,26 +534,19 @@ function SettingsProvidersPage() {
 	 * 刷新 Command Code 模型。未保存的新 API key 只随这次请求带上，不把整份设置草稿一起提交。
 	 * 已保存的 key 则等服务端缓存更新后重新读取设置。
 	 */
-	const refreshCommandCodeModels = useCallback(async () => {
-		const draftKey = state.commandCode.apiKey.trim();
-		const savedKey = savedSnapshot.current.commandCode.apiKey.trim();
-		const unsavedKey =
-			draftKey && draftKey !== savedKey && !draftKey.startsWith("*") ? draftKey : undefined;
-		const models = await api.commandCodeRefreshModels(
-			unsavedKey ? { apiKey: unsavedKey } : undefined,
-		);
-		if (unsavedKey) {
+	// 平台实例的凭据在实例 config 里，不在页面草稿里：刷新直接按前缀取实例的配置。
+	const refreshCommandCodeModels = useCallback(
+		async (prefix?: string) => {
+			const models = await api.commandCodeRefreshModels(prefix ? { prefix } : undefined);
 			const patch = (current: unknown) =>
 				current && typeof current === "object"
 					? { ...current, commandcodeModels: models, commandcodeModelsPending: false }
 					: current;
 			qc.setQueryData(["settings"], patch);
 			qc.setQueryData(["admin", "settings"], patch);
-			return;
-		}
-		await qc.invalidateQueries({ queryKey: ["settings"] });
-		await qc.invalidateQueries({ queryKey: ["admin", "settings"] });
-	}, [state.commandCode.apiKey, qc]);
+		},
+		[qc],
+	);
 
 	// ── UI state ──
 	const [highlight, setHighlight] = useState(false);
@@ -1343,7 +1336,7 @@ function SettingsProvidersPage() {
 									modelProtocols={state.modelProtocols}
 									onModelProtocolChange={dispatchers.setModelProtocol}
 									onTestModel={setTestingModel}
-									onRefreshModels={refreshCommandCodeModels}
+									onRefreshModels={() => refreshCommandCodeModels(selectedPlatformInstance.prefix)}
 								/>
 							)}
 							{selectedPlatformInstance.platform === "tokendance" && tokenDance?.connected && (
