@@ -60,6 +60,7 @@ import {
 	type SubagentPanelParams,
 } from "../panels/panel-kind";
 import { usePanelCompact, usePanelGeometryReady, usePanelHeaderDrag } from "../panels/shared";
+import { fitWidePanelHeight } from "../panels/tool-placement";
 import { toolEditReferenceKey } from "../tool-call/tool-edit-reference";
 import type { NarratorDockPanelType } from "./dock-panel-types";
 import { FocusChatSlot } from "./FocusChatHost";
@@ -839,6 +840,49 @@ export function TimelineDockPanel(props: IDockviewPanelProps<NarratorBoundPanelP
 		if (title && title !== props.api.title) props.api.setTitle(title);
 	}, [t, props.api]);
 
+	// The group is sized to its content (one lane needs far less than five) until the
+	// reader drags the divider; from then on their height is kept.
+	const fitRef = useRef<{ applied: number | null; userSized: boolean }>({
+		applied: null,
+		userSized: false,
+	});
+	useEffect(() => {
+		// Compare group to group height: the event reports the panel body, which excludes
+		// the tab strip that the fitted size includes. A whole-dock resize also moves the
+		// group, so only a change while the dock itself kept its height counts as a drag.
+		let dockHeight = props.containerApi.height;
+		const disposable = props.api.onDidDimensionsChange(() => {
+			const fit = fitRef.current;
+			const dockNow = props.containerApi.height;
+			const dockResized = Math.abs(dockNow - dockHeight) > 1;
+			dockHeight = dockNow;
+			if (dockResized || fit.applied === null) return;
+			if (Math.abs(props.api.group.height - fit.applied) > 4) fit.userSized = true;
+		});
+		return () => disposable.dispose();
+	}, [props.api, props.containerApi]);
+	const bodyRef = useRef<HTMLDivElement>(null);
+	const fitToContent = useCallback(
+		(contentHeight: number) => {
+			const fit = fitRef.current;
+			// Only a group stacked in the dock's vertical split can be resized this way.
+			if (fit.userSized || props.api.location.type !== "grid") return;
+			const body = bodyRef.current;
+			if (!body) return;
+			const groupHeight = props.api.group.height;
+			// Everything in the group that is not the scrollable body: tab strip + panel header.
+			const chrome = Math.max(0, groupHeight - body.getBoundingClientRect().height);
+			const target = fitWidePanelHeight(contentHeight, chrome, props.containerApi.height);
+			if (Math.abs(target - groupHeight) <= 4) {
+				fit.applied = target;
+				return;
+			}
+			fit.applied = target;
+			props.api.group.api.setSize({ height: target });
+		},
+		[props.api, props.containerApi],
+	);
+
 	return (
 		<ToolPanelShell
 			title={t("timeline.title")}
@@ -847,9 +891,11 @@ export function TimelineDockPanel(props: IDockviewPanelProps<NarratorBoundPanelP
 			subjectId="__timeline__"
 			detachKind="timeline"
 		>
-			<LazyPanelBoundary>
-				<NarratorTimelinePanel narratorId={narratorId} />
-			</LazyPanelBoundary>
+			<Box ref={bodyRef} style={{ height: "100%" }}>
+				<LazyPanelBoundary>
+					<NarratorTimelinePanel narratorId={narratorId} onContentHeight={fitToContent} />
+				</LazyPanelBoundary>
+			</Box>
 		</ToolPanelShell>
 	);
 }

@@ -121,7 +121,17 @@ function TurnSelectLabel(turn: TimelineTurnSummary, t: (key: string, o?: object)
 	return parts.join(" · ");
 }
 
-export function NarratorTimelinePanel({ narratorId }: { narratorId: string }) {
+export function NarratorTimelinePanel({
+	narratorId,
+	onContentHeight,
+}: {
+	narratorId: string;
+	/**
+	 * Natural height of the panel content, reported whenever it changes, so a host
+	 * (the dock group) can shrink to fit instead of leaving blank space under one lane.
+	 */
+	onContentHeight?: (height: number) => void;
+}) {
 	const { t } = useTranslation("narrator");
 	const dock = useNarratorDockContext();
 	const [selectedTurnId, setSelectedTurnId] = useState<string | null>(null);
@@ -129,7 +139,18 @@ export function NarratorTimelinePanel({ narratorId }: { narratorId: string }) {
 	const [pxPerSec, setPxPerSec] = useState<number | null>(null);
 	const [selection, setSelection] = useState<Selection | null>(null);
 	const viewportRef = useRef<HTMLDivElement>(null);
+	const rootRef = useRef<HTMLDivElement>(null);
 	const [viewportWidth, setViewportWidth] = useState(0);
+
+	useEffect(() => {
+		const node = rootRef.current;
+		if (!node || !onContentHeight) return;
+		const report = () => onContentHeight(Math.ceil(node.getBoundingClientRect().height));
+		const observer = new ResizeObserver(report);
+		observer.observe(node);
+		report();
+		return () => observer.disconnect();
+	}, [onContentHeight]);
 
 	useEffect(() => {
 		const node = viewportRef.current;
@@ -214,7 +235,7 @@ export function NarratorTimelinePanel({ narratorId }: { narratorId: string }) {
 	}
 
 	return (
-		<Stack gap={6} p="xs" h="100%" style={{ minHeight: 0 }} data-testid="narrator-timeline">
+		<Stack ref={rootRef} gap={6} p="xs" data-testid="narrator-timeline">
 			<Group gap={6} wrap="nowrap">
 				<ActionIcon
 					variant="subtle"

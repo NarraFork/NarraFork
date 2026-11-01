@@ -75,3 +75,26 @@ export function resolveToolPlacement(
 	}
 	return { mode: "standalone" };
 }
+
+/** Smallest height a fitted wide panel shrinks to (keeps the toolbar and one lane). */
+export const WIDE_TOOL_PANEL_MIN_HEIGHT = 140;
+
+/**
+ * Height a wide panel's group should take to show `contentHeight` of content under a
+ * `chromeHeight` header, without passing the surface share used when opening it.
+ */
+export function fitWidePanelHeight(
+	contentHeight: number,
+	chromeHeight: number,
+	surfaceHeight: number,
+): number {
+	const wanted = Math.ceil(contentHeight + chromeHeight);
+	const cap =
+		surfaceHeight > 0
+			? Math.round(surfaceHeight * WIDE_TOOL_PANEL_MAX_SHARE)
+			: WIDE_TOOL_PANEL_HEIGHT;
+	return Math.max(
+		WIDE_TOOL_PANEL_MIN_HEIGHT,
+		Math.min(wanted, Math.max(cap, WIDE_TOOL_PANEL_MIN_HEIGHT)),
+	);
+}

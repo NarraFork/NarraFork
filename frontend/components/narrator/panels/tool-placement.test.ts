@@ -1,6 +1,11 @@
 import { describe, expect, test } from "bun:test";
 import type { DockviewApi } from "dockview-react";
-import { resolveFileBrowserPosition, resolveToolPlacement } from "./tool-placement";
+import {
+	fitWidePanelHeight,
+	resolveFileBrowserPosition,
+	resolveToolPlacement,
+	WIDE_TOOL_PANEL_MIN_HEIGHT,
+} from "./tool-placement";
 
 describe("resolveFileBrowserPosition", () => {
 	const browser = { id: "tree", group: { id: "left" }, params: { panelType: "filetree" } };
@@ -113,5 +118,16 @@ describe("resolveToolPlacement wide panels", () => {
 				wide: true,
 			}),
 		).toEqual({ mode: "standalone" });
+	});
+});
+
+describe("fitWidePanelHeight", () => {
+	test("fits content plus chrome", () => {
+		expect(fitWidePanelHeight(150, 70, 900)).toBe(220);
+	});
+	test("never shrinks below the minimum or grows past the surface share", () => {
+		expect(fitWidePanelHeight(10, 20, 900)).toBe(WIDE_TOOL_PANEL_MIN_HEIGHT);
+		expect(fitWidePanelHeight(2000, 70, 900)).toBe(495);
+		expect(fitWidePanelHeight(2000, 70, 100)).toBe(WIDE_TOOL_PANEL_MIN_HEIGHT);
 	});
 });
