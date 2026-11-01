@@ -29,6 +29,7 @@ import {
 	IconSearch,
 	IconTerminal2,
 	IconTextSize,
+	IconTimeline,
 	IconWorldWww,
 	IconX,
 } from "@tabler/icons-react";
@@ -93,6 +94,9 @@ const NarratorUserChatPanel = lazy(() =>
 const GitPanel = lazy(() => import("../../git/GitPanel").then((m) => ({ default: m.GitPanel })));
 const FileTreePanel = lazy(() =>
 	import("../file-tree/FileTreePanel").then((m) => ({ default: m.FileTreePanel })),
+);
+const NarratorTimelinePanel = lazy(() =>
+	import("../timeline/NarratorTimelinePanel").then((m) => ({ default: m.NarratorTimelinePanel })),
 );
 // Both dock and drawer defer the same editor / binary-preview entry.
 const FilePanelContent = lazy(() =>
@@ -823,6 +827,33 @@ export function AppearanceDockPanel(props: IDockviewPanelProps<NarratorBoundPane
 	);
 }
 
+// ── Timeline (per-turn lanes of this agent and its subagents) ──
+export function TimelineDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams>) {
+	const { t } = useTranslation("narrator");
+	const dock = useNarratorDockContext();
+	// Live context is the source of truth (see ChatDockPanel note).
+	const narratorId = dock?.narratorId ?? props.params.narratorId;
+
+	useLayoutEffect(() => {
+		const title = t("timeline.title");
+		if (title && title !== props.api.title) props.api.setTitle(title);
+	}, [t, props.api]);
+
+	return (
+		<ToolPanelShell
+			title={t("timeline.title")}
+			icon={<IconTimeline size={16} color="var(--mantine-color-cyan-5)" />}
+			props={props}
+			subjectId="__timeline__"
+			detachKind="timeline"
+		>
+			<LazyPanelBoundary>
+				<NarratorTimelinePanel narratorId={narratorId} />
+			</LazyPanelBoundary>
+		</ToolPanelShell>
+	);
+}
+
 // ── Mock stream harness (TEMPORARY, see ../mock/README-REMOVAL.md) ──
 export function MockDockPanel(props: IDockviewPanelProps<NarratorBoundPanelParams>) {
 	const dock = useNarratorDockContext();
@@ -1167,6 +1198,7 @@ export const narratorDockComponents: Record<
 	search: SearchDockPanel,
 	userchat: UserChatDockPanel,
 	appearance: AppearanceDockPanel,
+	timeline: TimelineDockPanel,
 	subagent: SubagentDockPanel,
 	filetree: FileTreeDockPanel,
 	file: FileDockPanel,

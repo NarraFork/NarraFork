@@ -81,3 +81,37 @@ describe("resolveToolPlacement", () => {
 		expect(p).toEqual({ mode: "standalone" });
 	});
 });
+
+describe("resolveToolPlacement wide panels", () => {
+	test("a wide panel splits below chat even when a secondary group exists", () => {
+		expect(
+			resolveToolPlacement({
+				hasSecondaryGroup: true,
+				hasChatPanel: true,
+				surfaceWidth: 1200,
+				surfaceHeight: 900,
+				wide: true,
+			}),
+		).toEqual({ mode: "split-below", initialHeight: 300 });
+		expect(
+			resolveToolPlacement({
+				hasSecondaryGroup: false,
+				hasChatPanel: true,
+				surfaceWidth: 1200,
+				surfaceHeight: 400,
+				wide: true,
+			}),
+		).toEqual({ mode: "split-below", initialHeight: 180 });
+	});
+
+	test("without chat a wide panel falls back to the normal rules", () => {
+		expect(
+			resolveToolPlacement({
+				hasSecondaryGroup: false,
+				hasChatPanel: false,
+				surfaceWidth: 0,
+				wide: true,
+			}),
+		).toEqual({ mode: "standalone" });
+	});
+});
