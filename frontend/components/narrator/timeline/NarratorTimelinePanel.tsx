@@ -145,6 +145,17 @@ export function NarratorTimelinePanel({ narratorId }: { narratorId: string }) {
 	const turnList = turns.data?.turns ?? [];
 	const activeTurnId = data?.turn?.id ?? null;
 
+	// Escape closes the detail popover. Focus stays on the segment (no focus trap, so the
+	// timeline keeps scrolling and zooming), which is outside the dropdown Mantine listens on.
+	useEffect(() => {
+		if (!selection) return;
+		const onKey = (event: KeyboardEvent) => {
+			if (event.key === "Escape") setSelection(null);
+		};
+		document.addEventListener("keydown", onKey);
+		return () => document.removeEventListener("keydown", onKey);
+	}, [selection]);
+
 	// Switching turns resets the zoom (fit) and the selection.
 	// biome-ignore lint/correctness/useExhaustiveDependencies: reset keyed on the turn id
 	useEffect(() => {
