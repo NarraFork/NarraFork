@@ -18,6 +18,7 @@ import {
 	Group,
 	Loader,
 	Paper,
+	Popover,
 	ScrollArea,
 	Select,
 	Stack,
@@ -200,14 +201,6 @@ export function NarratorTimelinePanel({ narratorId }: { narratorId: string }) {
 			</Center>
 		);
 	}
-
-	const selected =
-		selection && data
-			? {
-					lane: data.lanes[selection.laneIndex],
-					segment: data.lanes[selection.laneIndex]?.segments[selection.segmentIndex],
-				}
-			: null;
 
 	return (
 		<Stack gap={6} p="xs" h="100%" style={{ minHeight: 0 }} data-testid="narrator-timeline">
@@ -446,25 +439,62 @@ export function NarratorTimelinePanel({ narratorId }: { narratorId: string }) {
 												style.outline = "2px solid var(--mantine-color-text)";
 												style.zIndex = 1;
 											}
+											const button = (
+												<Box
+													component="button"
+													type="button"
+													aria-label={t(`timeline.category.${segment.category}`)}
+													aria-expanded={isSelected}
+													data-category={segment.category}
+													style={{ ...style, border: "none", padding: 0 }}
+													onClick={() =>
+														setSelection(isSelected ? null : { laneIndex, segmentIndex })
+													}
+												/>
+											);
+											const key = `${segment.startMs}-${segment.category}`;
+											if (isSelected) {
+												// The detail floats over the page instead of growing the panel.
+												return (
+													<Popover
+														key={key}
+														opened
+														onChange={(opened) => !opened && setSelection(null)}
+														onDismiss={() => setSelection(null)}
+														position="bottom"
+														withArrow
+														shadow="md"
+														width={340}
+														withinPortal
+														closeOnEscape
+														trapFocus={false}
+														middlewares={{ flip: true, shift: true }}
+													>
+														<Popover.Target>{button}</Popover.Target>
+														<Popover.Dropdown p="xs">
+															<ScrollArea.Autosize mah={360} type="auto">
+																<SegmentDetail
+																	lane={lane}
+																	segment={segment}
+																	items={data.items}
+																	onClose={() => setSelection(null)}
+																	onOpenSubagent={dock?.openSubagentPanel}
+																/>
+															</ScrollArea.Autosize>
+														</Popover.Dropdown>
+													</Popover>
+												);
+											}
 											return (
 												<Tooltip
-													key={`${segment.startMs}-${segment.category}`}
+													key={key}
 													label={`${t(`timeline.category.${segment.category}`)} · ${formatSpan(
 														segment.endMs - segment.startMs,
 													)}${segmentTitle(segment, data.items, t)}`}
 													openDelay={150}
 													withinPortal
 												>
-													<Box
-														component="button"
-														type="button"
-														aria-label={t(`timeline.category.${segment.category}`)}
-														data-category={segment.category}
-														style={{ ...style, border: "none", padding: 0 }}
-														onClick={() =>
-															setSelection(isSelected ? null : { laneIndex, segmentIndex })
-														}
-													/>
+													{button}
 												</Tooltip>
 											);
 										})}
@@ -499,24 +529,11 @@ export function NarratorTimelinePanel({ narratorId }: { narratorId: string }) {
 				</Text>
 			)}
 
-			<ScrollArea style={{ flex: 1, minHeight: 0 }} type="auto">
-				{selected?.lane && selected.segment ? (
-					<SegmentDetail
-						lane={selected.lane}
-						segment={selected.segment}
-						items={data?.items ?? {}}
-						onClose={() => setSelection(null)}
-						onOpenSubagent={dock?.openSubagentPanel}
-					/>
-				) : (
-					data &&
-					data.lanes.length > 0 && (
-						<Text size="xs" c="dimmed">
-							{t("timeline.clickHint")}
-						</Text>
-					)
-				)}
-			</ScrollArea>
+			{data && data.lanes.length > 0 && !selection && (
+				<Text size="xs" c="dimmed">
+					{t("timeline.clickHint")}
+				</Text>
+			)}
 		</Stack>
 	);
 }
