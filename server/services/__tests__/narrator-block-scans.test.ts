@@ -206,7 +206,13 @@ describe("compact epoch", () => {
 		await convert();
 		expect(bodyFormat("k2")).toBe(2);
 		const { off, on } = await both(() => compactToolLoadingEpoch("n1"));
-		expect(off).toEqual({ toolNames: ["Grep", "WebFetch"], target: "anthropic:model" });
+		expect(off).toEqual({
+			markerId: "k2",
+			reason: "compact",
+			toolNames: ["Grep", "WebFetch"],
+			target: "anthropic:model",
+			definitionSnapshots: undefined,
+		});
 		expect(on).toEqual(off);
 
 		diverge("k2", compact(["Read"]));

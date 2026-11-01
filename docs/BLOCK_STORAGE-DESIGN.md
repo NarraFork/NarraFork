@@ -598,7 +598,7 @@ narrator_block_assets
 
 - store 写入含 `image` 或 `file` part 的块、或纪元标记块（§7.7）时，在同一事务里维护这张表。
 - 孤儿上传回收与保留策略改为按 `asset_id` 查，替代 `LIKE '%"type":"image"%'` 全表扫描（`storage-service.ts:826-835`），而且能覆盖工具结果截图与生成的图片。
-- `epoch_snapshot` 行的 `asset_id` 是 `narrator_text_snapshots` 的 sha256（§7.7）。两种 asset 共用这张引用表，回收逻辑相同：没有引用行即可回收。
+- `epoch_snapshot` 行的 `asset_id` 是 `narrator_text_snapshots` 的 sha256（§7.7）。快照复用这张引用表，但不能仅凭当前没有直接引用就删除：还要展开工具 manifest 子定义、检查 publication lease/活动保护和宽限期，由后台完整标记后的保守 GC 回收。
 
 说明：
 - **不设 `narrator_id` 列。** 块属于哪个叙述者，一律经 refs → 信封判定。块的作者就是信封的作者。
@@ -989,7 +989,7 @@ interface HistoryView {
 		markerId: string | null; // 最近一个开启纪元的块（compact 或 epoch）；旧数据为 null
 		tools: NeutralToolDefinition[] | null; // 纪元开始时冻结的工具定义；旧数据为 null，按 §7.8 倒推
 		system: SystemSections;   // 纪元开始时冻结的 system 各节（§7.7）
-		senders: Record<string, string>; // 纪元开始时冻结的作者标题
+		senders: Record<string, string>; // 当前由具名 senders 部分承载首次见到的 human 用户名
 	};
 	tools: { managed: ReadonlySet<string>; current: ReadonlySet<string> }; // 工具加载的输入（§7.8）
 }
@@ -1021,7 +1021,7 @@ toWire(turns: NeutralTurn[], target: ProjectionTarget): ProviderWireHistory // �
 - **内容**
   - `input` 投成 `model_text` 加图片 part。图片按 `[image #N]` 占位符就位，规则沿用 `user-content-order.ts:15-56`。
   - file_ref 展开为引用文本。
-  - 按信封作者加 sender 标记，标题取 `epoch.senders`，纪元内第一次出现的作者取写入时的标题（§7.7）。
+  - 按信封作者加 sender 标记。当前 `projectFrozenSenders` 从具名 `senders` 部分投影同代首次见到的 human 用户名；未知名也冻结为空，新身份追加；不改持久身份/角色，不宣称已冻结所有 agent 标题（§7.7）。
   - 旧行里的 `citeturn…` 标记由解码一次性清掉（§10.2），新数据本来就没有，投影不再处理。
   - tool 结果 = `outputToText(账本输出)` + `appendix` + 结果图片。
 - **取舍**：每块按携带策略（§7.4）决定原生回放、降级为文本或丢弃。strict 只由裸 model 名计算一次。
@@ -1092,7 +1092,7 @@ toWire(turns: NeutralTurn[], target: ProjectionTarget): ProviderWireHistory // �
 | 类别 | 内容 | 处理 |
 |---|---|---|
 | 写入时冻结进块 | 附件提示与路径；`/bash` 等命令的模型文本；wire-safe 工具 id；上游 item 骨架；turn nudge（作为 `context` 块）；broken 提醒与 loop 自造文本；工具加载事件与前缀提醒（`context` 块）；ExitPlanMode 计划正文的引用形态（随进入 `done` 冻结，现在随账本 status 变化，`strip-plan-body.ts:30-60`）；被采用的 attempt | 投影只读数据 |
-| 写入纪元标记 | 纪元开始时的工具定义、system 各节、作者标题（§7.7） | 投影读最近一个纪元标记 |
+| 写入纪元标记 | 工具 manifest、具名 prompt 部分快照；`senders` 部分含 human 用户名（§7.7） | 投影读本代基线和追加更新 |
 | 投影的显式输入 | target（协议、裸 model、strict、官方或中转、能力、工具加载策略）；asset 字节是否可读 | 进 `targetFingerprint` 或 view |
 | 投影之后的传输层 | NUG 的图片 sha256 引用与网关 ack 剥离（`nug-provider.ts:444-507`）；Codex WS 的续写判定 | 不影响投影结果的缓存 |
 
@@ -1105,30 +1105,28 @@ toWire(turns: NeutralTurn[], target: ProjectionTarget): ProviderWireHistory // �
 
 **原则**：在一个纪元内，发给模型的请求前缀只追加、不改写。存储可以修改，但模型看到的那份按日志对待：派生数据变了，就在末尾追加一个事件，而不是回头改已经发过的字节。换纪元时，按最新数据完整重建一次。
 
-这样 prompt cache 只在换纪元时失效。前缀包含三层，按 Anthropic 的拼接顺序依次是工具定义、system prompt、历史（D15）。
+这保证应用不会因普通环境变化任意回写已发前缀，**不保证上游缓存永久命中**：过期、路由、请求参数等仍可能影响缓存。前缀包含工具定义、system prompt、历史三层（D15）。本节按统一前缀纪元契约修订；旧阶段记录中的 cold/registry/工具策略换代规则不再有效。
 
 **纪元边界**（D16）
 - compact 成功。
-- 切换 provider 或模型（`targetFingerprint` 变化）。
-- 缓存肯定已冷：距上次请求的空闲时间超过该 target 的缓存有效期。例如 Anthropic 按所用的缓存档位（5 分钟或 1 小时）判断。有效期不确定的 provider 不按这条换纪元，保守处理。
-  - 「上次请求」取本叙述者可见历史中最后一个 assistant 信封的 `created_at`，不另存时间戳。
-  - 误判的代价有限：开启新纪元是「按最新数据重建」，最新数据与冻结值相同时，重建出的字节不变，缓存照样命中。
-- 已实现的工具加载只把 compact 当作边界（`tool-loading.ts` 文件头注释，`95c68304`）。另外两种边界由本节的纪元标记块补上（§7.8）。
+- 实际切换模型目标（按解析后的 provider/model 身份判断，不把任意 `targetFingerprint` 变化都视为换代）。
+- 首次会话或显式清空上下文后的首次基线属于初始化。
+- **不换代**：缓存过期、重启、registry generation/instanceId 变化、cwd/device 切换、计划模式或配置变化、工具加载/卸载、工具策略变化。压缩失败也不换代，不为保持缓存额外触发 compact。
 
 **现在会改写前缀的来源，以及纪元内的处理**
 
 | 层 | 来源 | 纪元内的处理 |
 |---|---|---|
-| 工具定义 | `/load` 加载工具 | 按模型在 catalog 里声明的策略追加，前缀不变；没有可用策略时直接改 tools[] 并开启新纪元（§7.8） |
+| 工具定义 | `/load` 加载工具 | 沿既有协议/兼容策略追加；不得用 `replace_tools` 同代重写顶层或另起纪元（§7.8） |
 | 工具定义 | 绕过 `/load` 改变已加载集合：resident 模式变化、重启后预加载、知识或设置预加载 | 对账时补写一条 system 来源的 `tool_loaded` / `tool_unloaded`，按上一行处理（§7.8） |
-| 工具定义 | plan mode 把禁用工具的描述换成「已禁用」（`loop.ts:2801-2816`），现在每次切换都重新格式化 tools[] | 纪元内不改描述；plan mode 的限制由 system 段的提醒表达，执行期由权限层拦截：plan mode 下有效权限模式为 `readOnly`，Write / Edit 另有专门处理（`narrator-permission.ts:806,841`）。`readOnly` 是否覆盖 `PLAN_MODE_ALLOWED_TOOLS` 之外的全部工具待核；不覆盖的部分在执行器补一条与「未加载工具」同样的拒绝。下个纪元按当时状态重建（D27） |
+| 工具定义 | 目录、设备/模型候选、plan mode 等曾进入工具描述或 schema | description、schema 与参数说明改为静态；动态候选、模式和可用性归入具名 prompt 部分，变化以 `context_update` 完整替换，执行端权限门禁实时生效（D27） |
 | 工具定义 | `/unload` 卸载工具、MCP 工具消失 | 纪元内只增不减：定义留在前缀里（工具表取自纪元快照，见下文「存储」），追加一条 `tool_unloaded` 说明该工具已不可用，执行器拒绝调用（未加载的 managed 工具被拒，注册表里已没有的工具返回 Unknown tool）；下个纪元再移除 |
-| 工具定义 | 纪元中途出现的新工具（新连上的 MCP、插件工具） | 对账时写一条 system 来源的 `tool_loaded`，按策略送达；策略 5 则开启新纪元 |
-| system prompt | 在线设备列表、默认设备是否可用（`narrator-prompt.ts:176-200`） | 冻结纪元开始时的文本；变化追加提醒，如「设备 X 已离线」 |
-| system prompt | AGENTS.md 等项目说明（`narrator-prompt.ts:248-262`） | 冻结；文件变化时追加提醒，说明已更新，并附新内容或差异（体积受同样的上限约束） |
-| system prompt | plan mode 开关、计划文件字节数（`narrator-prompt.ts:300-316`） | 冻结；进入或退出 plan mode、计划文件写入时追加提醒 |
-| system prompt | cwd | 冻结；cwd 变化追加提醒 |
-| 历史 | 叙述者标题、用户名（sender 标记） | 纪元内沿用旧值，**不提醒**（纯展示性变化，D17）；下个纪元生效 |
+| 工具定义 | 纪元中途出现的新工具（新连上的 MCP、插件工具） | 先经 classifyToolAdditions：允许的新增写 tool_loaded；replace-only 未声明工具只更新 tools.availability，不写虚假 loaded、不阻断无关工具。同名不兼容升级沿实际不可用/参数错误处理，下一合法边界吸收新定义 |
+| system prompt | 在线设备、模型/技能候选和工具可用性 | 冻结初始部分；变化追加具名部分的完整替换值 |
+| system prompt | AGENTS.md 等项目说明 | 冻结初始部分；变化发送完整替换而非依赖旧版本才能应用的差异 |
+| system prompt | plan mode、反思/只读状态、计划位置、语言 | 模式部分变化通过 `context_update` 发布，不改工具说明 |
+| system prompt | cwd、workspace revision 与默认设备 | 冻结初始部分；变化追加完整 workspace 部分，不轮换 conversationId |
+| 历史 | human 用户名（sender 标记） | `senders` 部分冻结同代首次见到的名称，后续改名不回写；新身份追加。agent 标题的全面冻结不在当前实现保证内 |
 | 历史 | Await 问答回执的改写（`question-model-input.ts:112-165`） | 改为只许更早的回执缩短更晚的结果（§7.2 跨块规则），天然只追加，不需要记录状态 |
 | 历史 | ExitPlanMode 计划正文的引用形态 | 已在工具进入 `done` 时冻结（§7.5） |
 | 历史 | 历史图片读不到、附件路径变成 unavailable | 附件路径已在写入时冻结（§3.4）。图片 part 带 sha256；字节被保留策略或用户删除之后读不到，投成固定的占位文本。这是存储治理的显式操作，归入「不受约束的情况」，前缀核对记一次违例 |
@@ -1136,49 +1134,55 @@ toWire(turns: NeutralTurn[], target: ProjectionTarget): ProviderWireHistory // �
 
 **不受约束的情况**（本来就改变前缀，接受缓存失效）
 - 用户显式的编辑、删除、回滚、段压缩。
-- 用户手动「按最新数据重建上下文」：斜杠命令 `/refresh-context`（D19）。执行时调用 `openEpoch(reason = "manual")`，下一次请求按最新数据完整重建；不加界面入口。
+- Codex hosted 原生能力的实时撤权：当前通道未验证独立于工具声明的执行 allow-list，因此 `web_search` / `image_generation` 禁用时移除出站声明，允许改变 tools 前缀并记录 `native-capability-policy` 例外；不回写冻结的本地函数工具、不换代或轮换 conversationId。不能用文本提示替代上游执行撤权，也不能宣称所有 provider 的原生能力切换都保持前缀。
+- 不再设计 `/refresh-context` 手动换代旁路（D19）；显式清空上下文后的首次请求按初始化处理。
 
 **提醒的分级**（D17）
 - 影响模型行为的变化追加提醒：设备、项目说明、plan mode、cwd、工具可用性、消息修订。
-- 纯展示性的变化不提醒，纪元内静默沿用旧值：叙述者改名、用户改昵称。
-- 提醒是 `context` 块，`subtype = reminder`，`body.topic` 标明类别（如 `system:devices`），`model_text` 简短。工具可用性的变化不走 `reminder`，走 `tool_loaded` / `tool_unloaded`（§7.8）。
+- 已实现的显示冻结针对 human 用户名：同代沿用首次值（含未知空名）；新身份通过 `senders` 追加，不因已有用户改名改写历史。不要将此扩大为所有 agent 标题都已冻结。
+- 动态部分替换是 `context/context_update`，不另引入通用 `reminder` 框架。大更新已外置：持久 `sys` 行为 `[{type:"text",text:"Context updated: keys"},{type:"context_update",epochId,changes:[],snapshotRef}]`；快照载荷 `{changes,modelText}` 存在既有 `narrator_text_snapshots`，不在每条历史行内联全文。
+- `buildRuntimeHistory` 调用 `hydrateContextUpdates`，恢复完整 text 与 changes 后再进入 provider 投影；列表只读摘要。旧的全文 text + 内联 changes 双块仍可读。引用行的 `changes:[]` 不能视为无更新；实际 changes 中 `null` 删除、空字符串有效，未提及的 key 保持当前状态。工具加载/卸载继续走既有事件（§7.8），已有行为围栏/任务/知识注入不重复发送。
+- `ContextBlock.contextUpdate` 与 `NeutralInputItem.contextUpdate` 保留元数据，wire 只发送冻结正文一次。只识别宿主 `sys` 行，用户粘贴标签不改变信任级别。
+- 基线声明具名动态部分可以由宿主更新替换，但固定安全规则和执行权限不在其内。所有当前适配器用已有 user 宿主载体：Responses/Codex 不抽进顶层 instructions；Anthropic 不把 typed 更新变成可被 `ensureAlternating` 后移的 system。其他 sys 注入与原生工具变更保留既有协议路径。这不宣称低角色文本获得 system 权限，也不推断上游支持任意中途 developer 文本。
 
 **对账：每次请求前一次，差异写成块**
 
 纪元内的「冻结值 + 已发提醒」与「当前实时值」不一致，就是要追加提醒的时候。把这件事收成一个动作：
 
 ```
-reconcile(narrator, target, now):
-  if 纪元边界成立（target 变化 / 缓存肯定已冷 / 工具策略为 replace_tools 且集合变了）:
-      openEpoch(...)                    // 写纪元标记块，冻结最新值；之后不需要提醒
+reconcile(narrator, resolvedModel, currentParts):
+  if 首次初始化 / compact 已成功 / 实际模型切换:
+      publishBaseline(...)             // 冻结初始部分、工具定义及模型身份
   else:
-      for 每个被冻结的对象（system 各节、工具加载集合）:
-          expected = 纪元冻结值 ⊕ 纪元内已写的提醒 / 工具变更块
-          if expected != live: 写一条 reminder 或 tool 变更块
+      expected = 基线 ⊕ 本代已发布的 context_update / 工具变更
+      if expected != currentParts:
+          persist(context_update 或既有工具变更)  // 先落库，再进入本次请求历史
 ```
 
-- loop 在每次 provider 请求之前调用它，与 §7.3 的「store 写块 → 追加进 view」走同一条路，所以写下的块马上出现在这次请求里，实时与重建一致。
+- 首次、后续轮次和重试统一经 [prepare-prefix-request.ts](../server/services/agent-runtime/prepare-prefix-request.ts) 协调工具刷新、prompt 和权威历史；每次真实 provider 请求前先持久化，再走统一历史投影。整条 prefix 准备链不套固定 10 秒总超时，仍响应真实 signal；每次历史源读取保留独立查询预算。
+- [narrator-prefix-state.ts](../server/services/narrator-prefix-state.ts) 按历史源身份和相关事件版本复用已归并状态，追加路径只重放新增的本代 context_update/工具事件；无关普通消息不导致旧更新重新归并。非追加修订或 compact 边界变化会重建，不以 row id 单独猜测稳定。请求内共享已读载荷，后续 hydrate 使用同一份快照结果，避免同一请求对长更新链二次读取。
 - 规则「idle 时的变化随下一次运行的第一条请求发出」「同一对象变化多次只保留最后一条未发送的提醒」由此自然成立：对账只在请求前做，两次请求之间的多次变化只比较一次。
-- 比较只用哈希，没有差异时不写库，开销是每次请求几次内存比较。
-- 提醒带上它所属的纪元（标记块 id 写进 `body.epoch`）。进入新纪元后，正文已按最新数据重建，旧纪元的 `reminder` 在投影时跳过，但不删除。
+- 比较当前生效状态，不一直与初始基线比较；无变化不写。B 已发布后回 A 要追加 A，不能删除 B；请求间未发布的 A→B→A 无需更新。
+- 更新携带 `epochId`。恢复、重试和 fork 重放原始已发布记录，不用当前配置重写旧正文；新基线吸收当前生效状态，compact 摘要随新代进入基线。
+- 沿现有 admission/历史版本校验并发发布，复用 worker 分页、增量与 ack 背压；不新增 previous/nextStateHash 链或整份 wire 请求快照。
 
 **存储：纪元是历史里的一个标记块**（D25）
 
 前两轮设计用两张旁表记纪元：`narrator_projection_epochs`（冻结的 system 与工具）和 `narrator_projection_overrides`（逐对象的冻结值）。改为不建旁表：
 
-- **开启纪元 = 在历史末尾写一个 `context` 块。** compact 成功时就是那个 compact 块本身；其他原因（切换 target、缓存已冷、`replace_tools`）写 subtype `epoch` 的块，所在信封 role=system，对模型不可见。
+- **开启纪元 = 发布已有 epoch/compact 标记与快照引用。** compact 成功时利用 compact payload；首次初始化或实际模型切换使用 epoch 标记。标记本身对模型不可见；cold、registry、工具策略不产生新代。
 - **块的 `payload.epoch` 存冻结值：**
 
   ```
   epoch: {
-    reason: "compact" | "target" | "cold" | "tools_replaced" | "manual",
-    target: string,                          // targetFingerprint
+    reason: "initial" | "compact" | "model", // 生命周期示意，旧 reason 仅兼容读取
+    target: string,                          // 实际模型身份，不含环境/registry generation
     tools: sha256,                           // 纪元开始时的工具定义（中立形态：名称、描述、schema）
     system: [{ key, sha256 }],               // system 各节的哈希；正文在快照表
-    senders: { [narratorId]: title }         // 纪元开始时历史中各作者的标题
+    // human 用户名不另建标题表：由上述具名 system 部分中的 senders 承载
   }
   ```
-- **工具定义与 system 正文按内容寻址存一次：**
+- **工具定义、system 正文与更新载荷的快照存储已实现，按内容寻址复用：**
 
   ```
   narrator_text_snapshots
@@ -1187,32 +1191,38 @@ reconcile(narrator, target, now):
     byte_size   integer NOT NULL
     created_at  text NOT NULL
   ```
-  纪元标记块经 `narrator_block_assets(role = 'epoch_snapshot', asset_id = sha256)` 引用它。内容不变的纪元（最常见的是「缓存已冷」）不新增快照行；回收按 `asset_id` 判断有没有引用，与上传文件同一套。
+  已实现的快照服务复用既有 `narrator_text_snapshots`；更新正文与完整 changes 以 `{changes,modelText}` JSON 载荷写入，历史行只保存摘要和 `snapshotRef`。`blockAssets` 同时登记 snapshotRef 的块资产引用，回收沿已有引用生命周期。模型准备时按引用恢复冻结载荷，列表不读取大正文；legacy 内联更新仍兼容。
+
+  工具目录现在存 `{format:"narrafork.prefix-tools.v1",definitions:[hash,...]}` manifest；`putPrefixToolDefinitions` / `getPrefixToolDefinitions` 按定义单元分批读写，并通过不可变参数身份、名称/说明与定义 hash 复用未变化内容，不在每代或每个 caller 重存整包定义。旧整包快照仍可读取，读出的冻结定义可共享。
+
+  `withPrefixSnapshotPublication` 在发布历史引用前持有并刷新 lease，保护根与 manifest 子定义；后台 GC 分批扫描引用并展开 manifest，仅在完整标记之后删除过宽限期的无根载荷。活动保护、近期写入与发布宽限期避免清理正在发布的快照；畸形载荷或错误中止本轮，不以“无引用”继续删除。关闭维护会取消并等待本次 GC；store `close()` 清缓存、取消未完操作并等待队列/worker 退出后返回。
+
+  内容未变时复用载荷，不新增历史日志或整份 wire 存储。大文本序列化/哈希/读写交给 worker，分页、分批与背压限制单批资源，不设置总工具数或总定义大小的业务硬上限。单项可以超出批次目标，目标限制批量资源而非拒绝合法定义。
 - **工具表取自快照。** 纪元内 tools[] 由快照里的定义按 target 格式化，再加上 §7.8 的占位与 deferred 尾部；注册表、MCP、描述文案的变化都不会改动它。纪元内的一切增减都是追加的 `tool_loaded` / `tool_unloaded` 块。
-  - 已实现的版本不存基线，而是从当前集合沿可见历史倒推（§7.8）。块存储下倒推保留两个用途：没有 `payload.epoch` 的旧 compact 标记（回填前的数据）用它算基线；有快照时用它做一致性检查，不一致记前缀违例。
+  - 旧版本曾从当前集合沿可见历史倒推（§7.8）；兼容没有快照的旧历史时仍可沿用。已有快照时直接复用，不每次请求全量倒推或重新序列化所有工具。
   - 前两轮考虑过只靠倒推、不存快照。倒推依赖「当前集合」与「managed 集合」都只经由提示行变化，而 resident 模式、预加载、能力天花板、MCP 都会绕过提示行；system 正文更是无法从历史倒推。
-- **作者标题**：纪元内，`senders` 里有的作者用冻结值；纪元内第一次出现的作者用它第一个信封写入时的标题。两者都不随改名变化，换纪元时重取（D14）。
+- **发送者显示名**：当前 `senders` 具名部分收集首次见到的 human 用户 ID→用户名，未知名也冻结为空；同代改名不改旧投影，新身份追加。`projectFrozenSenders` 只在投影副本替换显示名，不改持久行、身份、role 或 origin；所有 agent 标题的冻结不是当前实现保证（D14）。
 
 这样做的好处：
 - **fork 不需要额外动作。** 纪元标记块就在历史里，fork 复制 ref 时一起带上，子叙述者第一次请求的前缀与父叙述者逐字节相同，可以命中父叙述者的缓存。前两轮的旁表要在 fork、惰性 fork、提取时各复制一遍。
 - **compact 与纪元是同一个概念的两种来源**，读取时都是「最近一个开启纪元的块」，一次部分索引查询（`(subtype) WHERE kind = 'context'`）。
 - **删除、回滚自动正确。** 回滚到纪元开始之前，纪元标记块随之被删，投影退回到更早的纪元或按最新数据重建，不会留下指向不存在位置的旁表行。
 
-**前缀核对**
-- 每次请求记录各段投影字节的哈希：工具定义、system 各节、每个信封。
-- 下一次请求时比对。纪元没换、已发送部分的哈希却变了，就记为前缀违例，写进慢操作日志与请求证据，附上是哪一段、哪个信封。
-- 这同时是测试网（§13），也是诊断缓存失效原因的工具。
-- Codex WS 增量续写本来就要求逐项前缀相同（§7.3），前缀保持直接提高它的命中率。
+**前缀验证与诊断**
+- 用连续请求与恢复后的 wire 对比测试守住追加语义；同角色合并可以向尾部增加内容块，但不能改写前面已有正文。请求级 cache-control 标记与冻结内容分别核对。
+- 不每次请求全量验证历史哈希，不为诊断保存整份 wire 快照；日志仅记变化 key、规模、耗时和必要摘要，不记录敏感正文，也不把普通缓存诊断升级为请求阻断。
+- Codex WS 在满足既有前缀条件时继续 delta，断链可全量重放，不因此重建基线或轮换 conversationId。测试验证的是本地请求形状，不承诺上游缓存命中。
 
 **代价**
-- 模型在纪元内会看到旧的标题、旧的 system 文本，靠追加的提醒获知变化。纪元越长，提醒越多。compact 与冷缓存会定期截断这种积累。
+- 模型在纪元内保留原始基线与历史，靠具名替换更新获知当前状态；只有成功 compact 或实际模型切换吸收成新基线，冷缓存不截断积累。
 - 工具「只增不减」会让卸载后的定义继续占用 token，直到下个纪元。
+- 大请求使用有界遍历/worker 转义，普通小请求仍走简单 JSON 构建，不设置总量业务门槛；最终 wire 字符串物化仍有成本。已测 83MB×3 并发 body 的 RSS 峰增 873MiB、最大心跳间隔 267ms，不能称为完全流式或全程低于 50ms，也不能推断上游接受该体积。复现参数和完整观测见 [AGENT_PROVIDERS.md](AGENT_PROVIDERS.md)。
 
 ### 7.8 纪元内加载工具：五种策略
 
 `/load` 在纪元内加载工具时，按模型声明的能力与当前线上协议选一种策略（D20）。
 
-> 这部分已先于块存储重构，在现有消息结构上实现（`95c68304`，主文件 `server/lib/agent/tool-loading.ts`）：纪元边界取最近一次 compact，加载事件来自现有的 `tool_loaded` / `tool_unloaded` 提示行。实现与线上字段见 `docs/AGENT_PROVIDERS.md`「会话中加载工具时保持缓存前缀」。块存储怎样接住这份实现，见本节末尾「从已实现形态到块」。
+> 加载事件与协议追加机制先于块存储重构实现（`95c68304`），统一前缀纪元继续复用它们。当前边界与静态定义契约见 §7.7；具体策略和门控见 [AGENT_PROVIDERS.md](AGENT_PROVIDERS.md)。下表保留旧编号便于阅读，但 `replace_tools` 只说明历史行为，不是当前换代条件。
 
 | # | 策略 id | 做法 | 适用 | 参考实现 | 前缀 |
 |---|---|---|---|---|---|
@@ -1220,7 +1230,9 @@ reconcile(narrator, target, now):
 | 2 | `anthropic_deferred_tail` | 精简版的 1：同样要占位工具；新增工具不在 system 消息里放完整定义，而是把定义放到 tools[] 末尾并加上 `defer_loading` | DeepSeek 模型，`anthropic-messages` 协议 | deepseek-harness | 保持 |
 | 3 | `openai_additional_tools` | Responses 的 additional tools 方式 | GPT 模型，`openai-responses` 协议 | codex 开源实现 | 保持 |
 | 4 | `custom_injection` | 注入一条自定义消息提供新工具的 schema，tools[] 不变 | 推理设施对 schema 校验不严格的其他模型，任意协议 | — | 保持 |
-| 5 | `replace_tools` | 直接改 tools[] | 都不支持时的兜底 | — | 失效；立即开启新纪元 |
+| 5（遗留） | `replace_tools` | 旧行为直接替换 tools[] | 仅描述历史策略解析结果；本代协调不得据此改顶层/换代 | — | 不作为新契约的 fallback |
+
+Kimi 的 `kimi_system_tools` 是已存在的另一种原生追加方式，字段和选择门控见 [AGENT_PROVIDERS.md](AGENT_PROVIDERS.md)。原生工具追加能力不等于中途 developer 文本能力；`context_update` 仍走 §7.7 的 user 宿主载体。
 
 各策略的线上字段（占位工具的形状、追加方式、模型调用新工具时的 id 与结果回传）以参考实现为准，实现前逐一核实。
 
@@ -1244,7 +1256,7 @@ reconcile(narrator, target, now):
 **选择规则**
 - 每种策略有它要求的协议：策略 1、2 要求 `anthropic-messages`，策略 3 要求 `openai-responses`，策略 4 与 5 不限。
 - 加载时，在模型声明的列表里按顺序取第一个与当前 target 协议相容的策略。
-- 都不相容就用策略 5。例如经 Chat Completions 协议访问的 Claude 模型，默认的 `anthropic_tool_addition` 不相容，会落到策略 5；需要的话可以在本地覆盖里给它加上 `custom_injection`。
+- 解析器在全部不相容时返回 `replace_tools`。所有显式加载与自动对账统一调用 `classifyToolAdditions`，不会悄悄改成 custom injection：本代已声明工具可以重新启用，未声明新工具被分类为 blocked。显式加载返回协议限制；自动变化不写虚假的 tool_loaded，只通过 `tools.availability` 告知该工具不可用，无关工具继续工作。新定义等合法 compact/模型切换边界吸收，不重写顶层或额外换代。
 - 同一个模型经不同通道（例如 NUG 的 anthropic 通道与 responses 通道）可能走不同协议，所以选择发生在投影时，按当时的 target 判断，而不是在加载时写死。
 
 **存储与投影**
@@ -1252,16 +1264,16 @@ reconcile(narrator, target, now):
   - `body = { toolNames: string[], label: string, definitions?: NeutralToolDefinition[] }`：`toolNames` 是这次实际变化的注册表工具名；`label` 是给人看的名字（可能是例程 id）；`definitions` 只在加载时有，是写入时的中立定义（名称、描述、schema）。
   - `model_text` 是提示原文，写入时冻结。
   - **存定义，不存策略。** 定义写入时冻结，与纪元快照里的工具同等对待，所以纪元内即使跨了一次发布，已发送的定义字节也不变。策略是 target 的属性，在投影时选（上面「选择规则」）；纪元内 target 不变，所以策略也不变。前两轮写的「payload 存工具定义与加载时选定的策略」与「选择发生在投影时」自相矛盾，以后者为准。
-  - 已实现的版本在投影时从注册表解析定义，并且只接受静态描述的工具（`resolveLoadableToolDefinition`，`tool-loading.ts:171-176`）；现有 `OPTIONAL_TOOLS` 都是静态描述（`grep` 核对：动态描述只出现在 Bash、ExitPlanMode、SwitchWorkingDirectory 等核心工具）。块存储下改为写入时冻结，这条限制随之只作用于写入那一刻。
+  - 所有工具 description、schema 与参数说明都静态，不再有动态 description/getRawJsonSchema 入口；动态候选和模式由 prompt 部分承担。首次发布时冻结定义，重放旧事件不查询最新 registry 文案。同一定义卸载再加载不重复发布 schema。
 - 写入走 `changeTools`：改 `narrators.enabledTools` 与写块在同一事务。现在两者分开写，ref 还单独开事务追加（`narrator-persistence.ts:654-667`）。
-- **第一段**为每个 `tool_loaded` / `tool_unloaded` 块产出两样东西：提示文本，以及一个中立的工具变更项 `{additions: [{name, definition?}], removals: [name]}`。按策略：
-  - 策略 1：additions 带定义；removals 照发。
-  - 策略 2：additions 只带名字，定义进本次请求工具表的 `deferredTail`。removals 不发：deepseek-harness 给 DeepSeek 声明的是只认加载的 `addition-only`。`cf036d13` 已按此实现。
+- **第一段**保留加载/卸载提示文本，仅首次声明的 tool_loaded 产生中立工具变更项 `{additions: [{name, definition?}], removals: []}`。卸载改变执行可用性，不撤声明；本代重载不重发 schema。按策略：
+  - 策略 1：首次 additions 带定义；Anthropic 卸载不发 tool_removal，重载也不重复内联定义。
+  - 策略 2：首次 additions 只带名字，定义进本次请求工具表的 `deferredTail`；不发 removals。
   - 策略 3：additions 带定义；每个工具每纪元只声明一次；removals 不发，靠提示文本。
   - 策略 4：不产出变更项，把 schema 文本拼到提示文本后面；每个工具每纪元只拼一次。
-  - 策略 5：不产出变更项；工具表直接跟随当前集合，并开启新纪元。
+  - 策略 5 不允许在本代替换工具表，也不自动转成兼容追加；按 classifyToolAdditions 区分可重启用声明与受限的新工具，后者只更新 availability。
 - **第二段**只放置：
-  - Anthropic：本组 user 消息之后紧跟一条 `role: "system"` 消息，内容是 `tool_removal` / `tool_addition` 块，可以与同组的中途 system 文本合在一条里；请求头带策略对应的 beta。位置天然满足「紧跟 user、后面是 assistant 或末尾」。
+  - Anthropic：首次工具声明的 `tool_addition` 走既有 system 载体与 beta，位置由已有规范化处理；卸载不发 removal、重载不重复 schema。typed context_update 仍走 user 载体，不能与工具追加混为一种能力。
   - Responses：提示文本那条 user 项之前插入一项 `additional_tools`。
 - **工具表**也在第一段算出：`active`（纪元快照里的工具，顺序同快照）、`deferredTail`（策略 2：纪元内加载过的工具，按首次加载顺序）、`placeholder`（策略 1、2，且 `active` 非空）。三者都只随追加的块增长，所以纪元内已发送的字节不变。
 - 卸载按 §7.7：纪元内定义不撤，执行器拒绝调用未加载的 managed 工具（`tool-executor.ts:891-899`）。
@@ -1269,7 +1281,7 @@ reconcile(narrator, target, now):
 **换纪元：完全重新构建**
 - 新纪元开始时，工具表按当时已加载的全部工具重新生成，直接放进 tools[]。
 - 旧纪元里的 `tool_loaded` / `tool_unloaded` 块在新纪元只投提示文本，不再产出变更项或 schema 文本。提示文本保留，因为它记录的是用户真的执行过的命令；它与工具表一致，不会误导模型。
-- 策略 5 改了 tools[]，本身就是一次失效，所以同时开启新纪元，按上述方式完全重建。
+- 不因工具策略、加载集合、registry 或缓存状态变化开启新代；只在 §7.7 的合法边界吸收最新定义。
 
 **切换模型或 provider**：本来就开启新纪元（D16），新 target 不需要兼容旧策略的线上形态。
 
@@ -1279,14 +1291,14 @@ reconcile(narrator, target, now):
 |---|---|---|
 | 提示行 `contentJson[0] = {type, toolName, toolNames, text}`（`narrator-service.ts:540-545,619-624`） | `context/tool_loaded`、`tool_unloaded`，`body.toolNames`、`body.label`、`model_text` | 解码一对一（§10.2） |
 | 旧提示行没有 `toolNames`，读时按例程展开（`tool-loading.ts:202-208`） | 回填作业在服务端展开一次，写进 `body.toolNames` | 解码保持纯函数，不依赖运行期注册表 |
-| `deriveToolLoadingState`：从当前集合沿可见历史倒推纪元基线（`tool-loading.ts:231-252`） | 基线取自纪元快照（§7.7）；倒推只用于没有快照的旧 compact 标记，以及一致性检查。窗口从「最近一次 compact 之后」改为「最近一个开启纪元的块之后」 | 补上 target 切换与缓存已冷两种边界 |
+| 旧 `deriveToolLoadingState` 从当前集合倒推基线 | 有快照时直接恢复；倒推仅兼容没有快照的旧历史 | 实际模型切换是边界；cold/registry 不是 |
 | 基线可能漂移：resident、预加载等没有提示行的变化会让倒推结果在纪元中途改变，tools[] 随之改变 | 对账（§7.7）把每次漂移补写成一个 system 来源的 `tool_loaded` / `tool_unloaded`；tools[] 只取快照 | 漂移变成追加，前缀不变 |
 | 定义在投影时从注册表解析（`tool-loading.ts:171-176`） | 写入时冻结进 `body.definitions` | 跨发布也不改已发送字节 |
 | `managed` 只含可选工具（`orchestrator.ts:924-943`） | 快照覆盖全部工具；MCP、插件工具的增减同样走工具变更块 | D15 的工具层完整覆盖 |
 | `ToolLoadingChange` 经 `WeakMap` 挂在投影出的行对象旁（`tool-loading.ts:346-361`），构造器用 `toolLoadingChangeOf` 读 | 第一段产出的中立变更项，是 `NeutralTurn` 的一等成员 | 旁路通道消失 |
 | 构造器弹出当前轮时单独保留它的变更（`anthropic-provider.ts:3171-3176`；`openai-provider.ts:4109-4114`） | 不再弹出当前轮（§7.3） | 特例消失 |
 | `custom_injection` 在 `buildRuntimeHistory` 里改写提示行文本（`agent-runtime/history.ts:240-247`） | 第一段拼接 | 与其他策略同一处处理 |
-| 策略在每次组装时按适配器解析（`tool-loading.ts:153-164`） | `ProjectionTarget` 的一个字段，进 `targetFingerprint` | 策略变化即 target 变化，开启新纪元 |
+| 策略按模型与适配器解析 | 保留既有适配器分支，不另建全局能力框架 | 同代策略/配置变化不是换代条件，不重写已发布定义 |
 | 占位工具与 deferred 尾部在 `formatRequestTools` 里拼接（`tool-loading.ts:315-336`） | 第一段给出 `{active, deferredTail, placeholder}`，第二段格式化 | — |
 | 执行器拒绝未加载的 managed 工具（`tool-executor.ts:891-899`） | 不变 | — |
 
@@ -1314,9 +1326,9 @@ reconcile(narrator, target, now):
 
 | 协议 / 通道 | sys 项（`context` 的 role=sys 信封） | 缓存 | 工具加载默认 | 引用 citations |
 |---|---|---|---|---|
-| Anthropic 官方 | 模型支持时投成对话中途的 `role: "system"`（`anthropic-provider.ts:1635`），否则并入 user | system 三块：首块是由首条 user 文本派生的计费头（`anthropic-provider.ts:269-272`，纪元内首条不变，所以稳定），第二、三块带断点；末条消息末块一个断点 | 策略 1（Claude 新版本） | text 块的 `citations` 在骨架里，同源原样回放 |
+| Anthropic 官方 | 普通 sys 沿既有中途 system 门控；typed `context_update` 始终用 user 保持位置 | system 三块：首块是由首条 user 文本派生的计费头（`anthropic-provider.ts:269-272`，纪元内首条不变，所以稳定），第二、三块带断点；末条消息末块一个断点 | 策略 1（Claude 新版本） | text 块的 `citations` 在骨架里，同源原样回放 |
 | Anthropic 中转 | 并入 user；带工具变更的 system 消息不降级 | 不加 `cache_control` | 策略 1（Claude）、2（DeepSeek）、其余 4 | 同上 |
-| Responses / Codex HTTP | role=sys 投成 user `input_text`；system 与 developer 汇入 `instructions` | `prompt_cache_key = conversationId`（`codex-request.ts:78`） | 策略 3（GPT 新版本） | `annotations` 在骨架里 |
+| Responses / Codex HTTP | sys/context_update 投成 user `input_text` 并留在 input；基线仍由既有 systemPrompt 注入 instructions | `prompt_cache_key = conversationId`（`codex-request.ts:78`） | 策略 3（GPT 新版本） | `annotations` 在骨架里 |
 | Codex WS | 同上 | 去掉 input 后请求相同、且 input 是上次 input 加上游 item 的逐项前缀，才发增量（`codex-websocket.ts:741-773`） | 策略 3；`additional_tools` 在 input 里，不破坏续写 | 同上 |
 | Chat Completions | 并入 user | 由上游隐式前缀缓存 | 策略 4（GPT 名称会选 3，但协议不相容，落到 5） | 纯文本 |
 | Gemini generateContent | 并入 user content | 无显式缓存 | 策略 4 | 纯文本 |
@@ -1325,7 +1337,7 @@ reconcile(narrator, target, now):
 
 **几条贯穿规则**
 - **同源才用骨架。** `carryPolicy` 返回 `native` 时第二段把 part 填回 `wire`；其余情况只用 part。外源骨架里的字段（item id、step id、签名、annotations）一律不出现在请求里。
-- **图片的放置由能力位决定。** 第一段只给出「这个结果带这些图片」；第二段按 target 的能力选 tool_result 内、output 数组、随后的 user 消息三处之一。能力位进 `targetFingerprint`，所以能力变化等同于换纪元。
+- **图片放置沿现有适配器分支。** 第一段提供结果与图片，第二段映射为 tool_result、output 或后续 user 内容。投影参数变化不自动等同于模型切换，不凭能力位变化开启新代。
 - **工具 id 只在写入时处理一次。** 任何协议都直接用 `wire_id`；Responses 的 64 字符限制、DeepSeek 一类重复 id（`call_go_0`）都在写入时解决。
 - **并行调用。** 一步内多个 tool 块按 ordinal 排列，结果按同一顺序投放；并行组只是 `state.execGroup` 上的展示信息，不影响投影。
 
@@ -1544,7 +1556,7 @@ reconcile(narrator, target, now):
 5. 流式按 provider item 写入（§5.2）；按 `attemptId` 丢弃 attempt。WS 仍发旧事件，由块派生（D5）。
 6. tool 块合并调用与结果，采用两段生命周期（§3.5、§3.7）；`state` 写入（§5.4）；`phase` 统一。
 7. 只保留一个 COW 实现；作者与属主分开。
-9. 纪元标记块与请求前对账（§7.7）：compact 成功写 `payload.epoch`，target 切换与缓存已冷写 `epoch` 块；工具表改为取自纪元快照，已实现的倒推降为兜底。
+9. 统一纪元与每请求协调（§7.7）：compact 成功或实际模型切换换代；首次请求初始化，cold/registry/工具集合变化不换代。基线取快照，动态变化追加持久 `context_update`，旧历史倒推仅作兼容。
 
 **退出条件**
 - 新会话全部是原生块；关闭开关能回到现状。
@@ -1567,12 +1579,11 @@ reconcile(narrator, target, now):
   - 每次 `runAgentLoopUnlocked` 写一行。
   - `trigger_message_id` 取运行开始时历史里最新、且尚未归属任何轮的 user 行，并把这行的 `turn_id` 一并补上。
   - `cause_block_id`、`provider_response_id` 列已建，P1 不写。
-- **纪元。** P1 只冻结工具集合：
-  - compact 成功时，compact 元素里写 `epoch`。
-  - 对账在每个 pass 开始时做，而不是每次请求：
-    - target 变化或缓存已冷，而且重建确实会改变工具布局时，写一行 role=system 的 `epoch` 标记（模型不可见，前端隐藏）；
-    - 冻结纪元内绕过 `/load` 的变化，写成 origin=system 的 `tool_loaded` / `tool_unloaded` 提示。
-  - 冻结工具定义、system 分节快照与提醒、前缀核对，以及 `narrator_text_snapshots` 的写入，留到后续阶段。
+- **纪元。** 历史 P1 只冻结工具集合、每 pass 对账；该阶段设计已由 §7.7 的统一前缀纪元取代：
+  - 基线冻结工具定义与具名动态 prompt 部分，每次真实 provider 请求前协调。
+  - compact 成功或实际模型切换换代；首次初始化单独处理，不保留 cold/registry/工具布局换代旁路。
+  - 绕过 `/load` 的工具变化仍沿既有工具事件发布；动态部分变化发布 `context_update`，先写入再投影。
+  - 复用已有 snapshot/块存储与 worker，不新增通用前缀哈希链或每请求全量核对。
 - **双写校验。** 启动时审计最近 50 个块格式信封（`auditRecentEnvelopes`）。有差异就记日志并重新同步。
 
 ### P2 切换读取与回填
@@ -2012,9 +2023,9 @@ reconcile(narrator, target, now):
 | compact 与段压缩 | 生命周期与现状等价；CAS 不再使用 JSON 路径 | 现有 compact 测试迁移 |
 | 回退与块删除 | 以块 id 寻址；重跑过的工具也能删除并回退文件；预算按块字节计算；共享信封走 COW | 现有回退测试迁移 |
 | Codex WS | 有 assistant 输出之后的下一次请求仍能增量续写 | 用上游原始 item 的录制做测试 |
-| 工具加载策略 | 五种策略各自的线上形态与参考实现一致；按协议选择正确；策略 5 开启新纪元；新纪元里旧的 `tool_loaded` / `tool_unloaded` 只投提示文本；已实现版本的测试（`tool-loading.test.ts`、`loop-tool-loading.test.ts`）在两段投影上不改即过 | 单测 + 请求录制 |
+| 工具加载策略 | 既有原生/兼容追加形状正确；工具变化不触发换代，不重渲染旧定义；每代同一定义只声明一次；新代吸收当前有效状态 | 隔离单测 + 请求录制 |
 | 对账 | 绕过 `/load` 的集合变化（resident、预加载）在下一次请求前补写一个工具变更块，纪元基线不变；system 各节变化写 `reminder`；没有差异时不写库 | 单测 |
-| 前缀保持 | 纪元内，已发送的工具定义、system 各节、信封投影哈希不变；违例被记录并带上原因；换纪元的三种条件都能触发重建；fork 的第一次请求与父叙述者前缀相同 | 前缀核对 + 单测 |
+| 前缀保持 | 基线保持，具名动态部分只追加替换；cold/registry/重启不换代；工具结果后与末尾更新保持顺序；实时与恢复 wire 一致，typed 元数据不重复正文；只在成功 compact/实际模型切换换代 | 连续请求与恢复隔离测试，不宣称上游缓存命中 |
 | External API v1 | 现有契约测试不修改即通过 | 契约测试 |
 | project.db | 导出再导入，内容相等；旧归档可以导入 | 往返测试 |
 | 搜索 | 结果与现状一致（content_text 规则逐条复刻） | 搜索测试 |
@@ -2040,18 +2051,18 @@ reconcile(narrator, target, now):
 | D11 | broken 调用在历史中的形态 | tool 块 `failed`、不可见，另加一条 `context` 说明，与实时路径一致 | **已定** |
 | D12 | turn nudge 放在哪里 | 单独一条 `context` 块（subtype `turn_nudge`），排在该步工具结果之后；不再拼进工具结果。这会改变发给模型的内容，列入 §12.6 | **已定** |
 | D13 | 引用锚点是否写进模型可见正文 | 保持写在正文里；锚点改为块 id（`b:<blockId>`），COW 后靠 lineage 解析 | **已定** |
-| D14 | sender 标记里的标题与用户名在改名后的处理 | 纪元内沿用旧值、不提醒；换纪元时按最新数据重建（§7.7） | **已定** |
+| D14 | sender 改名后的处理 | 已实现 senders 具名部分冻结同代首次 human 用户名，未知空名也保留，新身份追加；只投影显示名，不改身份/role/origin。不宣称已冻结所有 agent 标题（§7.7） | **已实现 human 用户名冻结** |
 | D15 | 前缀保持覆盖哪几层 | 工具定义、system prompt、历史三层都覆盖（§7.7） | **已定** |
-| D16 | 纪元边界 | compact 成功、切换 provider 或模型、缓存肯定已冷 | **已定** |
+| D16 | 纪元边界 | 运行中仅 compact 成功或实际模型目标切换；首次/清空后初始化另计。cold、registry、配置和工具变化不换代 | **统一前缀纪元修订** |
 | D17 | 哪些变化追加提醒 | 只对影响模型行为的变化提醒；纯展示性变化静默沿用旧值 | **已定** |
 | D18 | mailbox 语义编辑 | 未被接收方采纳的原地改写；已采纳的追加修订通知 | **已定** |
-| D19 | 是否提供「按最新数据重建上下文」的手动操作 | 只提供斜杠命令 `/refresh-context`，执行 `openEpoch(reason = "manual")`；不加界面入口（§7.7） | **已定** |
-| D20 | 纪元内加载工具 | 五种策略，由模型在 catalog 里声明（可多种），按当前协议选用；都不适用时直接改 tools[] 并开启新纪元；新纪元完全重新构建（§7.8） | **已定** |
+| D19 | 是否提供手动换代旁路 | 不新增 `/refresh-context` 换代；明确清空后按初始化处理（§7.7） | **统一前缀纪元修订** |
+| D20 | 纪元内加载工具 | 复用既有原生/兼容追加策略；不以 `replace_tools`、registry 或工具集合变化重写顶层并换代（§7.8） | **统一前缀纪元修订** |
 | D21 | 工具加载策略的默认值 | 按裸模型名匹配：含 gpt 用 `openai_additional_tools`，含 claude 用 `anthropic_tool_addition`，含 deepseek 用 `anthropic_deferred_tail`，其他用 `custom_injection`；catalog 声明可覆盖，用户可禁用（§7.8） | **已定** |
 | D22 | kind 是否从 7 种收为 5 种 | 推荐收：`marker`、`notice` 并入 `context`，按 subtype 分族；可见性统一为「`done` 且 `model_text` 非空」（§3.3）。备选：保留 7 种，代价是三处 kind 分支与三套可见性规则 | **已定** |
 | D23 | phase 是否从 6 个收为 4 个 | 推荐收：tool 的 `called`、`settled` 分别并入 `open`、`done`；输入流式阶段不落行，不需要名字（§3.5）。备选：保留，代价是部分索引、触发器、共享判定都要比较两个值 | **已定** |
 | D24 | `provider_meta` 的形状 | 推荐「来源 + 上游原样骨架」：正文换成 part 引用，其余字段原样；同源回放把 part 填回（§3.4）。备选：按协议的字段白名单，每遇上游新字段都要改 schema，Codex WS 续写只能靠测试补字段 | **已定** |
-| D25 | 纪元状态存在哪里 | 推荐：开启纪元写一个 `context` 标记块（compact 块兼任），工具定义与 system 正文按内容寻址存 `narrator_text_snapshots`；纪元内一切变化由每次请求前的对账写成追加的块（§7.7、§7.8）。已实现的倒推保留为旧数据的兜底与一致性检查。备选 A：前两轮的两张旁表，fork / 提取要另外复制；备选 B：全部倒推（即已实现的做法），绕过提示行的变化会漂移，system 正文也无法倒推 | **已定** |
+| D25 | 纪元状态存在哪里 | 已实现复用 epoch/compact 标记和 `narrator_text_snapshots`，冻结工具定义、system 部分及 `{changes,modelText}` 更新载荷；context_update 行仅存摘要与 snapshotRef，并登记块资产引用。模型准备 hydrate 后投影，旧内联更新与无快照历史保留兼容路径（§7.7、§7.8），不新增旁表日志 | **已实现快照存储** |
 | D26 | Await 回执改写怎样满足只追加 | 推荐：只许 seq 更早的回执缩短更晚的工具结果；后到的回执与更早的结果都保留全文（§7.2）。备选：记录「第一次投影时的判断」，要多一份状态 | **已定** |
 | D27 | plan mode 改写工具描述与前缀保持冲突 | 推荐：纪元内不改描述，限制靠 system 提醒与执行期拦截（权限层已有 `readOnly`，覆盖范围待核，§7.7）。备选：切换 plan mode 视为纪元边界，代价是每次切换一次缓存未命中（即现状） | **已定** |
 | D28 | 派生字段（`content_text` 等）何时重算 | 推荐：只在封口、工具进入终态、编辑或删除时；流式中途的部分文本搜不到（§4.6）。备选：每个 item 封闭时重算，FTS 写入多 N 倍 | **已定** |

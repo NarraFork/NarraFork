@@ -85,7 +85,7 @@ export const grepTool: ToolDefinition = {
 		},
 	},
 	description: DESCRIPTION,
-	rawJsonSchema: {
+	rawJsonSchema: withDeviceParam({
 		type: "object",
 		properties: {
 			pattern: {
@@ -158,10 +158,7 @@ export const grepTool: ToolDefinition = {
 		},
 		required: ["pattern"],
 		additionalProperties: false,
-	},
-	getRawJsonSchema(config) {
-		return withDeviceParam(grepTool.rawJsonSchema as Record<string, unknown>, config);
-	},
+	}),
 	parameters: z.object({
 		pattern: z.string().describe("The regular expression pattern to search for in file contents"),
 		path: z

@@ -34,19 +34,6 @@ export const stopTool: ToolDefinition = {
 		required: ["type", "id"],
 		additionalProperties: false,
 	},
-	getRawJsonSchema(config) {
-		const schema = stopTool.rawJsonSchema as Record<string, unknown>;
-		// Stopping an agent is orchestration; a ceiling without it can only stop own Bash.
-		if (config.runtimePolicy?.capabilities.spawnAgent !== false) return schema;
-		const properties = schema.properties as Record<string, Record<string, unknown>>;
-		return {
-			...schema,
-			properties: {
-				...properties,
-				type: { ...properties.type, enum: ["bash"] },
-			},
-		};
-	},
 	async execute(args, ctx): Promise<ToolResult> {
 		// The executor validates input but passes the original, untransformed object.
 		const parsed = parameters.safeParse(args);

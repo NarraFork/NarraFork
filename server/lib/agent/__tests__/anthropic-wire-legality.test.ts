@@ -8,9 +8,12 @@
  *   messages.N: role 'system' must precede an 'assistant' message or end the array
  */
 import { afterEach, describe, expect, test } from "bun:test";
+import { assembleContent, splitEnvelope } from "@shared/narrator-blocks/storage";
 import type { AnthropicProviderConfig } from "../../settings";
 import { AnthropicProvider } from "../anthropic-provider";
-import type { ChatParams } from "../provider";
+import { buildAdapterHistory } from "../history-build";
+import { LoopTranscript } from "../loop-transcript";
+import type { ChatParams, DbMessage } from "../provider";
 
 const ORIGINAL_FETCH = globalThis.fetch;
 const MODEL = "claude-opus-5";
@@ -110,6 +113,73 @@ const ASSISTANT = (text: string) => ({ role: "assistant", content: [{ type: "tex
 const SYSTEM = (text: string) => ({ role: "system", content: text });
 
 describe("mid-conversation system placement", () => {
+	test("typed context update stays after tool results as later user text is appended", async () => {
+		const provider = new AnthropicProvider({
+			id: "legality",
+			name: "Legality",
+			prefix: "legality",
+			apiKey: "sk-test",
+			baseUrl: "https://example.invalid/v1",
+			defaultModel: MODEL,
+			officialApi: true,
+		});
+		const transcript = new LoopTranscript([
+			{
+				id: "first-user",
+				role: "user",
+				contentText: "first",
+				contentJson: [{ type: "text", text: "first" }],
+				parentToolUseId: null,
+				messageUuid: null,
+			},
+		]);
+		transcript.appendStep([{ type: "tool_use", toolUseId: "read", name: "Read", input: {} }]);
+		transcript.settleTool("read", { output: "result-before-update" });
+		const update: DbMessage = {
+			id: "update",
+			role: "sys",
+			parentToolUseId: null,
+			messageUuid: null,
+			contentText: "frozen-update",
+			contentJson: [
+				{ type: "text", text: "frozen-update" },
+				{
+					type: "context_update",
+					epochId: "epoch-1",
+					changes: [{ key: "workspace", value: "/b" }],
+				},
+			],
+		};
+		transcript.replace([...transcript.rows, update]);
+		const build = async (rows: DbMessage[]) =>
+			(await buildAdapterHistory(provider, rows, { provider: "legality", model: MODEL })).history;
+		const history = await build(transcript.rows);
+		const before = await wireMessages({ history, content: "" });
+		const after = await wireMessages({ history, content: "later-user-input" });
+		const restored = transcript.rows.map((row) => ({
+			...structuredClone(row),
+			contentJson: assembleContent(splitEnvelope(row).blocks),
+		}));
+		expect(after).toEqual(
+			await wireMessages({ history: await build(restored), content: "later-user-input" }),
+		);
+		expect(before.some((message) => message.role === "system")).toBe(false);
+		expect(after.some((message) => message.role === "system")).toBe(false);
+		// Same-role merging appends content blocks; it does not rewrite the existing
+		// tool result or update. Cache-control markers are request-local, not content.
+		const withoutCache = (value: unknown) =>
+			JSON.parse(
+				JSON.stringify(value, (key, entry) => (key === "cache_control" ? undefined : entry)),
+			);
+		expect(withoutCache(after.slice(0, -1))).toEqual(withoutCache(before.slice(0, -1)));
+		const oldTail = before.at(-1)?.content as WireBlock[];
+		const newTail = after.at(-1)?.content as WireBlock[];
+		expect(withoutCache(newTail.slice(0, oldTail.length))).toEqual(withoutCache(oldTail));
+		const encoded = JSON.stringify(after);
+		expect(encoded.split("frozen-update")).toHaveLength(2);
+		expect(encoded.indexOf("result-before-update")).toBeLessThan(encoded.indexOf("frozen-update"));
+		expect(encoded.indexOf("frozen-update")).toBeLessThan(encoded.indexOf("later-user-input"));
+	});
 	test("a sys row landing in front of a user turn is moved behind it", async () => {
 		// `sys` rows are injected asynchronously (container events, review feedback,
 		// merge summaries), so this is the ordinary case, not an edge case.

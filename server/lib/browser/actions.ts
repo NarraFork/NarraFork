@@ -9,6 +9,7 @@ import { finishPerformanceTrace, startPerformanceTrace } from "./performance-tra
 import { serializeBrowserValue } from "./serialization";
 import type { BrowserConsoleMessage, BrowserNetworkRequest, BrowserSession } from "./session";
 import { drainConsoleCaptures, touchSession, touchSessionVisual } from "./session";
+import { isSharedContext } from "./tab-scope";
 
 const DEFAULT_MAX_LENGTH = 20_000;
 const DEFAULT_ACTION_TIMEOUT = 10_000;
@@ -174,12 +175,22 @@ function filterNetworkRequests(
 	});
 }
 
+/**
+ * 准备一次会改变页面的交互。窗口只渲染当前标签，后台标签里点击、悬停等会一直等不到渲染帧；
+ * 共享窗口里会话的标签不在前台时先把它切到前台。
+ */
+async function prepareInteraction(session: BrowserSession): Promise<void> {
+	touchSessionVisual(session);
+	if (!isSharedContext(session.context)) return;
+	const hidden = await session.page.evaluate(() => document.visibilityState === "hidden");
+	if (hidden) await session.page.bringToFront();
+}
 /** Navigate to a URL or go back/forward. */
 export async function navigate(
 	session: BrowserSession,
 	opts: { url?: string; direction?: "back" | "forward" },
 ): Promise<{ snapshot: PageSnapshot }> {
-	touchSessionVisual(session);
+	await prepareInteraction(session);
 	const { page } = session;
 
 	if (opts.direction === "back") {
@@ -199,7 +210,7 @@ export async function click(
 	selector: string,
 	opts?: { coordinate?: { x: number; y: number }; timeout?: number },
 ): Promise<{ snapshot: PageSnapshot }> {
-	touchSessionVisual(session);
+	await prepareInteraction(session);
 	const { page } = session;
 
 	// Set up a navigation listener BEFORE clicking — if the click triggers a
@@ -230,7 +241,7 @@ export async function fill(
 	value: string,
 	_opts?: { timeout?: number },
 ): Promise<{ snapshot: PageSnapshot }> {
-	touchSessionVisual(session);
+	await prepareInteraction(session);
 	// Click to focus, Ctrl+A to select all (works for both inputs and textareas),
 	// then Backspace to clear, then type new value.
 	await session.page.click(selector);
@@ -249,7 +260,7 @@ export async function select(
 	value: string,
 	_opts?: { timeout?: number },
 ): Promise<{ snapshot: PageSnapshot }> {
-	touchSessionVisual(session);
+	await prepareInteraction(session);
 	await session.page.select(selector, value);
 	return { snapshot: await getPageSnapshot(session.page) };
 }
@@ -259,7 +270,7 @@ export async function type(
 	session: BrowserSession,
 	opts: { selector?: string; value?: string; key?: string; timeout?: number },
 ): Promise<{ snapshot: PageSnapshot }> {
-	touchSessionVisual(session);
+	await prepareInteraction(session);
 	const { page } = session;
 
 	if (opts.key) {
@@ -286,7 +297,7 @@ export async function hover(
 	selector: string,
 	_opts?: { timeout?: number },
 ): Promise<{ snapshot: PageSnapshot }> {
-	touchSessionVisual(session);
+	await prepareInteraction(session);
 	await session.page.hover(selector);
 	return { snapshot: await getPageSnapshot(session.page) };
 }
@@ -636,7 +647,7 @@ export async function wait(
 	session: BrowserSession,
 	opts: { selector?: string; state?: "visible" | "hidden" | "attached"; timeout?: number },
 ): Promise<{ snapshot: PageSnapshot }> {
-	touchSessionVisual(session);
+	await prepareInteraction(session);
 	const { page } = session;
 	const timeout = opts.timeout ?? DEFAULT_ACTION_TIMEOUT;
 
@@ -666,7 +677,7 @@ export async function scroll(
 		coordinate?: { x: number; y: number };
 	},
 ): Promise<{ snapshot: PageSnapshot }> {
-	touchSessionVisual(session);
+	await prepareInteraction(session);
 	const { page } = session;
 	const amount = opts.amount ?? 500;
 	const deltaY = opts.direction === "up" ? -amount : amount;

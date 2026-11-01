@@ -1,4 +1,4 @@
-import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { afterAll, beforeEach, describe, expect, test } from "bun:test";
 import { getBuiltinRoutine, getBuiltinToolNames } from "../../../server/lib/builtin-routines";
 import { settings } from "../../../server/lib/settings";
 import {
@@ -6,11 +6,14 @@ import {
 	isPreloadedMode,
 	resolveEffectiveToolRoutineMode,
 } from "../../../shared/routine-modes";
-import { cleanDb, getTestDb } from "../../setup";
+import { cleanDb } from "../../setup";
 
-const { db, sqlite } = getTestDb();
-const realDbModule = { ...(await import("../../../server/db")) };
-mock.module("../../../server/db", () => ({ ...realDbModule, db, sqlite }));
+// The snapshot worker shares the preload-isolated file-backed database.
+const { sqlite } = await import("../../../server/db");
+const { closePrefixSnapshotStore } = await import(
+	"../../../server/services/narrator-prefix-snapshots"
+);
+const savedRoutines = settings.routines;
 const { OPTIONAL_TOOLS } = await import("../../../server/lib/agent/tools/index");
 const { toolRegistry } = await import("../../../server/lib/agent/tool-registry");
 const { loadOptionalTool, unloadOptionalTool, resolveOptionalToolState } = await import(
@@ -18,7 +21,8 @@ const { loadOptionalTool, unloadOptionalTool, resolveOptionalToolState } = await
 );
 const NARRATOR_ID = "notification-registration-test";
 
-beforeEach(() => {
+beforeEach(async () => {
+	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
 	settings.routines = { disabledRoutines: [], enabledRoutines: [], toolModes: {} };
 	sqlite.run("INSERT INTO narrators (id, title, created_at, updated_at) VALUES (?, ?, ?, ?)", [
@@ -28,7 +32,10 @@ beforeEach(() => {
 		"2026-01-01",
 	]);
 });
-afterAll(() => sqlite.close());
+afterAll(async () => {
+	await closePrefixSnapshotStore();
+	settings.routines = savedRoutines;
+});
 
 describe("Notification optional tool integration", () => {
 	test("registry and routine expose the same optional tool", () => {

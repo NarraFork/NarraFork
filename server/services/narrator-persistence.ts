@@ -1741,6 +1741,7 @@ const sqliteNarratorPersistence = {
 			toolNames: string[];
 			text: string;
 			definitionSnapshots?: import("../lib/agent/tool-loading").ToolDefinitionSnapshot[];
+			definitionSnapshotRef?: string;
 		},
 		/** `system` for a change the runtime reconciled rather than a `/load` someone typed. */
 		origin?: "system",

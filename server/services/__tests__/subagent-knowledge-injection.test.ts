@@ -22,12 +22,20 @@
  * the keyword matcher all exercised for real). No `mock.module`: the seams used here are
  * ordinary arguments, and Bun's module mocks are process-wide.
  */
-import { beforeAll, describe, expect, spyOn, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { knowledgeGrantRows } from "../../../tests/fixtures/knowledge-grants";
 import { historyStrings, sentHistory } from "../../../tests/fixtures/model-input";
 import { db } from "../../db";
-import { aclGrants, knowledgeTags, narrators, users } from "../../db/schema";
+import {
+	aclGrants,
+	knowledgeTags,
+	narratorMessageRefs,
+	narratorMessages,
+	narrators,
+	narratorToolCalls,
+	users,
+} from "../../db/schema";
 import { projectSenderText } from "../../lib/agent/sender-projection";
 import { generateId } from "../../lib/id";
 import { settings } from "../../lib/settings";
@@ -37,6 +45,7 @@ import { knowledgeBranchService } from "../knowledge-branch-service";
 import { knowledgeService } from "../knowledge-service";
 import { clearBufferedMessages, enqueueBufferedMessage } from "../narrator-buffer";
 import * as narratorExecutor from "../narrator-executor";
+import { closePrefixSnapshotStore } from "../narrator-prefix-snapshots";
 import { narratorService } from "../narrator-service";
 import { resumeBufferedMessagesIfIdle } from "../narrator-session";
 import { activeNarrators } from "../narrator-session-state";
@@ -145,6 +154,10 @@ beforeAll(async () => {
 		keywords: [PUBLIC_KW],
 	});
 	publicEntryId = open.id;
+});
+
+afterAll(async () => {
+	await closePrefixSnapshotStore();
 });
 
 /** Run one scan with a fresh cycle, so de-dup never hides a result under test. */
@@ -417,6 +430,7 @@ describe("nothing to say produces no row", () => {
 });
 
 describe("buffered knowledge hint reaches the resumed executor input", () => {
+	let deliverySeq = 0;
 	async function resumeBufferedMessage(
 		officialApi: boolean,
 		keyword: string,
@@ -438,6 +452,34 @@ describe("buffered knowledge hint reaches the resumed executor input", () => {
 		];
 		const narratorId = generateId();
 		const toolUseId = generateId();
+		const toolCallId = generateId();
+		const messageId = generateId();
+		// A delegated run must have a real persisted delivery slot, including its exact row id.
+		await db.insert(narratorMessages).values({
+			id: messageId,
+			narratorId: parentNarratorId,
+			role: "assistant",
+			contentJson: [{ type: "tool_use", id: toolUseId, name: "Agent", input: {} }],
+			createdAt: nowIso(),
+		});
+		await db.insert(narratorMessageRefs).values({
+			id: generateId(),
+			narratorId: parentNarratorId,
+			messageId,
+			seq: ++deliverySeq,
+		});
+		await db.insert(narratorToolCalls).values({
+			id: toolCallId,
+			narratorId: parentNarratorId,
+			messageId,
+			toolUseId,
+			toolName: "Agent",
+			executionAttempt: 1,
+			executionIdentityVersion: 1,
+			status: "success",
+			outputJson: "Previous run result",
+			createdAt: nowIso(),
+		});
 		await db.insert(narrators).values({
 			id: narratorId,
 			type: "subagent",
@@ -453,7 +495,7 @@ describe("buffered knowledge hint reaches the resumed executor input", () => {
 				version: 1,
 				run: {
 					logicalRunId: `knowledge-${narratorId}`,
-					deliverTo: { narratorId: parentNarratorId, toolUseId },
+					deliverTo: { narratorId: parentNarratorId, toolUseId, toolCallId },
 				},
 			},
 			createdAt: nowIso(),
@@ -508,7 +550,16 @@ describe("buffered knowledge hint reaches the resumed executor input", () => {
 			const historyText = historyStrings(request.history);
 			const rows = await narratorService.getModelHistorySinceLastCompact(narratorId);
 			expect(rows.find((row) => row.role === "user")?.contentText).toBe(text);
-			const hint = rows.find((row) => row.role === "sys");
+			// Prefix context updates are also sys rows; identify the knowledge hint by its block.
+			const hints = rows.filter(
+				(row) =>
+					row.role === "sys" &&
+					(row.contentJson as Array<{ type: string }> | null)?.some(
+						(block) => block.type === "knowledge_hint",
+					),
+			);
+			expect(hints).toHaveLength(authorized ? 1 : 0);
+			const hint = hints[0];
 			if (authorized) {
 				expect(hint?.contentText).toContain(secretEntryId);
 				expect(hint?.parentToolUseId).toBe(toolUseId);

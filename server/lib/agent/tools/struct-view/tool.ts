@@ -160,10 +160,7 @@ export const structViewTool: ToolDefinition = {
 		},
 	},
 	description: DESCRIPTION,
-	rawJsonSchema,
-	getRawJsonSchema(config) {
-		return withDeviceParam(rawJsonSchema, config);
-	},
+	rawJsonSchema: withDeviceParam(rawJsonSchema),
 	parameters: z.object({
 		file_path: z
 			.string()

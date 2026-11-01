@@ -2,7 +2,7 @@ import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } 
 import { EventEmitter } from "node:events";
 import { eq } from "drizzle-orm";
 import { z } from "zod/v4";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
 	backgroundTasks,
 	fileChangeExecutionSegments,
@@ -20,9 +20,9 @@ import {
 import type { ExecuteLoopResult } from "../narrator-executor";
 import type { ActiveNarrator } from "../narrator-session-state";
 
-const { db, sqlite } = getTestDb();
-const realDb = { ...(await import("../../db")) };
-mock.module("../../db", () => ({ ...realDb, db, sqlite }));
+// Share the preload-isolated file-backed DB with the real prefix/history workers.
+const { db, sqlite } = await import("../../db");
+const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
 // Context now imports publication services; load it only after binding the isolated DB.
 const { createRuntimeEventContext } = await import("../agent-runtime/context");
 const { createRuntimeMapView, getExecutionOwner, setExecutionSuspended, tryClaimExecution } =
@@ -58,7 +58,8 @@ const CHILD = "runtime-owner-child";
 const SIBLING = "runtime-owner-sibling";
 const ids = [ROOT, CHILD, SIBLING];
 
-beforeEach(() => {
+beforeEach(async () => {
+	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
 	settings.agent.autoContinuationMode = "off";
 	const now = new Date().toISOString();
@@ -97,9 +98,9 @@ afterEach(() => {
 	}
 	mock.restore();
 });
-afterAll(() => {
+afterAll(async () => {
+	await closePrefixSnapshotStore();
 	unregisterProvider();
-	mock.module("../../db", () => realDb);
 });
 
 function active(narratorId: string): ActiveNarrator {

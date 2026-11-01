@@ -1,13 +1,12 @@
 import { afterAll, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { requestInput, rowsAsHistory } from "../../../tests/fixtures/model-input";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { narrators, users } from "../../db/schema";
 import type { ProviderAdapter } from "../../lib/agent/provider";
 
-const { db, sqlite } = getTestDb();
-const realDb = { ...(await import("../../db")) };
-mock.module("../../db", () => ({ ...realDb, db, sqlite }));
+// Exercise real prefix snapshots against the same isolated on-disk DB as their worker.
+const { db, sqlite } = await import("../../db");
 const { registerExternalProviderResolver } = await import("../../lib/agent/provider");
 const session = await import("../narrator-session");
 const { bashTool } = await import("../../lib/agent/tools/bash");
@@ -15,6 +14,7 @@ const { interruptManualBash } = await import("../narrator-service");
 const { getExecutionOwner, getRunControl } = await import("../agent-runtime/ownership");
 const { enqueueBufferedMessage } = await import("../narrator-buffer");
 const { activeNarrators } = await import("../narrator-session-state");
+const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
 const { settings } = await import("../../lib/settings");
 const providerCalls: string[] = [];
 let observedNarratorId: string | undefined;
@@ -63,6 +63,7 @@ test.each([
 	current,
 	expected,
 }) => {
+	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
 	settings.agent.autoContinuationMode = "off";
 	const id = `principal-${name.replaceAll(" ", "-")}`;
@@ -108,14 +109,15 @@ test.each([
 	}
 });
 
-afterAll(() => {
+afterAll(async () => {
 	unregisterProvider();
-	mock.module("../../db", () => realDb);
 	mock.restore();
+	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
 });
 
 test("concurrent idle pre-Bash admission accepts interrupt and aborts Bash before natural completion", async () => {
+	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
 	settings.agent.autoContinuationMode = "off";
 	const id = "idle-pre-bash-interrupt";

@@ -16,7 +16,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
 	backgroundTasks,
 	fileChangeExecutionSegments,
@@ -29,9 +29,9 @@ import {
 import type { ProviderAdapter } from "../../lib/agent/provider";
 import type { ExecuteLoopOptions, ExecuteLoopResult } from "../narrator-executor";
 
-const { db, sqlite } = getTestDb();
-const realDb = { ...(await import("../../db")) };
-mock.module("../../db", () => ({ ...realDb, db, sqlite }));
+// The snapshot worker shares the preload-isolated file-backed database.
+const { db, sqlite } = await import("../../db");
+const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
 const { registerExternalProviderResolver } = await import("../../lib/agent/provider");
 const { settings } = await import("../../lib/settings");
 const executor = await import("../narrator-executor");
@@ -85,25 +85,27 @@ const shapes: Array<{
 ];
 type Shape = (typeof shapes)[number];
 
-beforeEach(() => {
+beforeEach(async () => {
+	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
 	seq = 0;
 	settings.agent.autoContinuationMode = "off";
 	cwd = mkdtempSync(join(tmpdir(), "nf-run-contract-"));
 });
-afterEach(() => {
+afterEach(async () => {
 	for (const id of ids) {
 		getExecutionOwner(id)?.release();
 		activeNarrators.delete(id);
 		setRunHold(id, undefined);
 	}
 	mock.restore();
+	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
 	rmSync(cwd, { recursive: true, force: true });
 });
-afterAll(() => {
+afterAll(async () => {
+	await closePrefixSnapshotStore();
 	unregisterProvider();
-	mock.module("../../db", () => realDb);
 });
 
 function callerCall(narratorId: string, toolUseId: string, toolCallId: string) {

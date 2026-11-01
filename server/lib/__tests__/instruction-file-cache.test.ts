@@ -27,7 +27,10 @@ function fixture(options: { maxEntries?: number; maxBytes?: number; ttlMs?: numb
 		},
 		readFile: async (_path, maxBytes) => {
 			reads++;
-			return { content: text.slice(0, maxBytes), truncated: text.length > maxBytes };
+			return {
+				content: text.slice(0, maxBytes),
+				truncated: maxBytes !== undefined && text.length > maxBytes,
+			};
 		},
 	});
 	return {
@@ -80,7 +83,15 @@ describe("static instruction file cache", () => {
 		expect(await f.cache.read("AGENTS.md", 2)).toEqual({ content: "fi", truncated: true });
 		expect(await f.cache.read("AGENTS.md", 5)).toEqual({ content: "first", truncated: false });
 		expect(f.reads()).toBe(2);
-		await expect(f.cache.read("AGENTS.md", 200_001)).rejects.toBeInstanceOf(RangeError);
+		expect(await f.cache.read("AGENTS.md", 200_001)).toEqual({
+			content: "first",
+			truncated: false,
+		});
+		expect(await f.cache.read("AGENTS.md")).toEqual({ content: "first", truncated: false });
+		expect(f.reads()).toBe(4);
+		for (const invalid of [-1, 0.5, Number.NaN, Number.POSITIVE_INFINITY]) {
+			await expect(f.cache.read("AGENTS.md", invalid)).rejects.toBeInstanceOf(RangeError);
+		}
 	});
 
 	test("expires unchanged content and respects entry/decoded-byte bounds", async () => {
@@ -101,6 +112,33 @@ describe("static instruction file cache", () => {
 		const f = fixture({ maxBytes: 10 });
 		expect((await f.cache.read("one"))?.content).toBe("first");
 		expect(f.cache.stats()).toEqual({ entries: 0, bytes: 0 });
+	});
+
+	test("oversized reads do not evict unrelated cache entries", async () => {
+		const f = fixture({ maxBytes: 600 });
+		await f.cache.read("small");
+		const before = f.cache.stats();
+		f.change("x".repeat(1000));
+		expect((await f.cache.read("large"))?.content).toBe("x".repeat(1000));
+		expect(f.cache.stats()).toEqual(before);
+	});
+
+	test("reads complete multi-chunk UTF-8 files above the residency budget", async () => {
+		const cwd = await mkdtemp(join(tmpdir(), "narrafork-instruction-full-"));
+		const path = join(cwd, "AGENTS.md");
+		const content = "你好😀\n".repeat(40_000);
+		const cache = new InstructionFileCache({ maxBytes: 1024 });
+		try {
+			await writeFile(path, content);
+			expect(await cache.read(path)).toEqual({ content, truncated: false });
+			expect(cache.stats()).toEqual({ entries: 0, bytes: 0 });
+			expect(await cache.read(path, 3)).toEqual({ content: "你", truncated: true });
+			expect(cache.stats().entries).toBe(1);
+			// The cached explicit prefix must never stand in for a full default read.
+			expect(await cache.read(path)).toEqual({ content, truncated: false });
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
 	});
 
 	test("shares concurrent reads but a changed signature cannot cache old facts", async () => {

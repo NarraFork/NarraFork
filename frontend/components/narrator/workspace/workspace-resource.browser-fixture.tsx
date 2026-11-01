@@ -343,6 +343,8 @@ export function messageSnapshot() {
 				height: node?.clientHeight ?? 0,
 				apiVisible: panel?.api.isVisible,
 				apiActive: panel?.api.isActive,
+				/** Dockview's own size for the panel; the always-rendered DOM can lag it. */
+				apiWidth: panel?.api.width,
 			};
 		}),
 	};

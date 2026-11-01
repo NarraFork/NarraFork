@@ -120,6 +120,22 @@ export function blockAssets(
 	for (const element of draft.payload.raw) {
 		if (!element || typeof element !== "object") continue;
 		const raw = element as Record<string, unknown>;
+		if (raw.type === "tool_loaded" && typeof raw.definitionSnapshotRef === "string")
+			assets.push([raw.definitionSnapshotRef, "epoch_snapshot"]);
+		if (raw.type === "context_update" && typeof raw.snapshotRef === "string")
+			assets.push([raw.snapshotRef, "epoch_snapshot"]);
+		const epoch = raw.epoch;
+		if (epoch && typeof epoch === "object") {
+			const prefix = (epoch as Record<string, unknown>).prefix;
+			if (prefix && typeof prefix === "object") {
+				const refs = prefix as Record<string, unknown>;
+				for (const hash of [refs.contract, refs.tools])
+					if (typeof hash === "string") assets.push([hash, "epoch_snapshot"]);
+				if (Array.isArray(refs.parts))
+					for (const part of refs.parts)
+						if (part && typeof part.hash === "string") assets.push([part.hash, "epoch_snapshot"]);
+			}
+		}
 		if (raw.type === "image" && typeof raw.imageId === "string")
 			assets.push([raw.imageId, "input_image"]);
 		else if (raw.type === "text_file" && typeof raw.fileId === "string")

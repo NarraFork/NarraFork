@@ -17,7 +17,7 @@ import {
 import type { ExecHandle, ExecutionBackend } from "../../execution/backend";
 import { localBackend } from "../../execution/local-backend";
 import { toolRegistry } from "../../tool-registry";
-import { type AgentConfig, PLAN_MODE_ALLOWED_TOOLS, type ToolContext } from "../../types";
+import { PLAN_MODE_ALLOWED_TOOLS, type ToolContext } from "../../types";
 import "../index";
 import { bashTool, resolveBashTimeoutMs } from "../bash";
 import { stopTool } from "../stop";
@@ -422,7 +422,7 @@ function seed() {
 
 describe("Bash background kinds", () => {
 	test("public and normal-session raw schemas expose background_kind", () => {
-		for (const schema of [bashTool.rawJsonSchema, bashTool.getRawJsonSchema?.({} as AgentConfig)]) {
+		for (const schema of [bashTool.rawJsonSchema]) {
 			expect(schema?.additionalProperties).toBe(false);
 			const properties = schema?.properties as Record<string, unknown>;
 			expect(properties.background_kind).toMatchObject({
@@ -437,16 +437,16 @@ describe("Bash background kinds", () => {
 		}
 	});
 
-	test("read-only raw schema retains kind metadata but forbids background execution", () => {
-		const schema = bashTool.getRawJsonSchema?.({ reviewReadOnlyBash: true } as AgentConfig);
+	test("static raw schema retains background metadata regardless of runtime restrictions", () => {
+		const schema = bashTool.rawJsonSchema;
 		const properties = schema?.properties as Record<string, { description: string }>;
 		expect(properties.background_kind).toMatchObject({
 			type: "string",
 			enum: ["task", "service"],
 			default: "task",
 		});
-		expect(properties.background_kind.description).toContain("forbidden");
-		expect(properties.run_in_background.description).toContain("Forbidden");
+		expect(properties.background_kind.description).toContain("service");
+		expect(properties.run_in_background.description).not.toContain("Forbidden");
 		expect(properties).not.toHaveProperty("stop");
 	});
 	test("services do not implicitly opt out of the background timeout", () => {

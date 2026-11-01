@@ -345,11 +345,8 @@ describe("asynchronous question integration", () => {
 			expect(filter?.(askUserQuestionTool)).toBe(false);
 			expect(filter?.(awaitTool)).toBe(true);
 		}
-		for (const config of [{ parentNarratorId: PARENT } as AgentConfig, {} as AgentConfig]) {
-			const schema = (askUserQuestionTool.getRawJsonSchema?.(config) ??
-				askUserQuestionTool.rawJsonSchema) as Record<string, unknown>;
-			for (const key of ["anyOf", "oneOf", "allOf"]) expect(schema[key]).toBeUndefined();
-		}
+		const schema = askUserQuestionTool.rawJsonSchema as Record<string, unknown>;
+		for (const key of ["anyOf", "oneOf", "allOf"]) expect(schema[key]).toBeUndefined();
 	});
 
 	test("an explicit custom allowlist cannot re-enable asking", async () => {

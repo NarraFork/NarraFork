@@ -2312,6 +2312,18 @@ export const userPreferences = sqliteTable("user_preferences", {
 	// desktop and mobile; how many actually fit is decided per host at render time.
 	narratorToolbarLayout: text("narrator_toolbar_layout").notNull().default("{}"),
 	/**
+	 * 哪些界面显示 Git 提交身份入口：会话右键菜单、新建会话弹窗。
+	 *
+	 * 这是「本人想看到什么」的显示偏好，但按账号存而不是按浏览器存：同一个账号在多台设备上
+	 * 应该看到一致的界面，浏览器本地偏好会在换设备后静默回落成默认关闭。
+	 */
+	gitIdentityContextMenu: integer("git_identity_context_menu", { mode: "boolean" })
+		.notNull()
+		.default(false),
+	gitIdentityCreateModal: integer("git_identity_create_modal", { mode: "boolean" })
+		.notNull()
+		.default(false),
+	/**
 	 * 大纲标签排布，按叙述者记录：`{ [narratorId]: { order: string[], pinned: string[] } }`。
 	 * order = 普通文档的展示序，pinned = 置顶文档的展示序；内置的
 	 * tasks.json / behavior_fence / index.md 不参与记录，始终固定在最前。

@@ -17,6 +17,7 @@ import {
 } from "../lib/agent/execution/git-workspace-rpc";
 import { AppError, GitError, ValidationError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
+import { parseGitBranches } from "./git-branch-listing";
 import {
 	assertSingleFilePatch,
 	buildCommitDetail,
@@ -25,6 +26,7 @@ import {
 } from "./git-commit-preview-parse";
 import { invalidateGitLineStats } from "./git-line-stats-cache";
 import type { GitCommitIdentity, GitStatusFile, GitStatusSummary } from "./git-service";
+import { gitAuthFailure } from "./git-service";
 import { coordinateGitStatusQuery, invalidateGitStatusQuery } from "./git-status-query";
 
 const WRITES = new Set<GitWorkspaceOperation>([
@@ -36,6 +38,9 @@ const WRITES = new Set<GitWorkspaceOperation>([
 	"stashPop",
 	"stashDrop",
 	"reset",
+	"checkout",
+	"push",
+	"fetch",
 ]);
 
 export function supportsRemoteGitWorkspace(backend: ExecutionBackend): boolean {
@@ -206,6 +211,14 @@ export function createRemoteGitService(
 			);
 		} catch (error) {
 			const detail = error instanceof Error ? error.message : String(error);
+			// Branch sync either updates the ref or git reports that it did not. The
+			// "uncertain write" suffix is for index/worktree mutations whose failure
+			// can land halfway; attaching it to a rejected push reads as data loss.
+			if (operation === "push" || operation === "fetch" || operation === "checkout") {
+				const auth = operation === "checkout" ? null : gitAuthFailure(detail);
+				if (auth) throw auth;
+				throw new GitError(detail);
+			}
 			if (write)
 				throw new GitError(
 					`${detail}. Remote Git write result may be uncertain; refresh status/history before retrying.`,
@@ -314,6 +327,37 @@ export function createRemoteGitService(
 		stashDrop: (cwd: string, index: number) => mutate(cwd, "stashDrop", { index }),
 		resetSoft: (cwd: string, target: string) => mutate(cwd, "reset", { mode: "soft", target }),
 		resetHard: (cwd: string, target: string) => mutate(cwd, "reset", { mode: "hard", target }),
+		/** The executor returns the raw listings; parsing is shared with the local backend. */
+		async getBranches(cwd: string) {
+			requireBranches();
+			const result = await request(cwd, "branches");
+			return parseGitBranches({ ...result.outputs, truncated: result.truncated === true });
+		},
+		async checkoutBranch(
+			cwd: string,
+			input: { branch: string; create?: boolean; startPoint?: string },
+		) {
+			requireBranchSwitch();
+			await mutate(cwd, "checkout", {
+				branch: input.branch,
+				...(input.create ? { create: true } : {}),
+				...(input.startPoint ? { startPoint: input.startPoint } : {}),
+			});
+		},
+		async push(cwd: string, input: { remote?: string; setUpstream?: boolean } = {}) {
+			requireRemoteSync();
+			await mutate(cwd, "push", {
+				...(input.remote ? { remote: input.remote } : {}),
+				...(input.setUpstream ? { setUpstream: true } : {}),
+			});
+		},
+		async fetch(cwd: string, input: { remote?: string; prune?: boolean } = {}) {
+			requireRemoteSync();
+			await mutate(cwd, "fetch", {
+				...(input.remote ? { remote: input.remote } : {}),
+				...(input.prune ? { prune: true } : {}),
+			});
+		},
 		/**
 		 * The executor returns the three raw listings; parsing is shared with the local
 		 * backend so both answer identically. `outputs.<key>Truncated` = "1" marks a
@@ -379,6 +423,33 @@ export function createRemoteGitService(
 				"The device executor is too old to preview commits; upgrade it",
 				409,
 				GIT_COMMIT_PREVIEW_UNSUPPORTED,
+			);
+	}
+	// The three branch capabilities are separate because they shipped separately: a
+	// device may list branches without being able to switch or sync. Each gates only
+	// its own operations and none of them falls back to local execution.
+	function requireBranches() {
+		if (backend.supportsGitBranches !== true)
+			throw new AppError(
+				"The device executor is too old to list branches; upgrade it to manage branches here",
+				409,
+				"GIT_BRANCHES_UNSUPPORTED",
+			);
+	}
+	function requireBranchSwitch() {
+		if (backend.supportsGitBranchSwitch !== true)
+			throw new AppError(
+				"The device executor is too old to switch branches; upgrade it to manage branches here",
+				409,
+				"GIT_BRANCH_SWITCH_UNSUPPORTED",
+			);
+	}
+	function requireRemoteSync() {
+		if (backend.supportsGitRemoteSync !== true)
+			throw new AppError(
+				"The device executor is too old to push or fetch; upgrade it to sync with the remote",
+				409,
+				"GIT_REMOTE_SYNC_UNSUPPORTED",
 			);
 	}
 }

@@ -8,6 +8,7 @@ import type {
 	HTTPRequest,
 	HTTPResponse,
 	Page,
+	Target,
 } from "puppeteer-core";
 import { eventBus } from "../event-bus";
 import { generateShortId } from "../id";
@@ -16,9 +17,10 @@ import { installDialogProtection } from "./dialogs";
 import { type BrowserMemoryJob, cancelMemoryJob } from "./memory-job";
 import type { MemoryProfileHandle } from "./memory-profiler";
 import { finishPerformanceTrace, type PerformanceTracingState } from "./performance-tracing";
-import { createContext, DEFAULT_VIEWPORT, USER_AGENT } from "./pool";
+import { DEFAULT_VIEWPORT, openTab, USER_AGENT } from "./pool";
 import { redactHeaders, redactPostData, redactUrl } from "./redaction";
 import { serializeBrowserValue } from "./serialization";
+import { closeTab, isSharedContext, targetIdOf } from "./tab-scope";
 
 /** Default session TTL: 10 minutes of inactivity. */
 export const DEFAULT_SESSION_TTL_MS = 10 * 60 * 1000;
@@ -82,6 +84,8 @@ export interface BrowserSession {
 	ttlMs: number;
 	/** Whether this session uses headless (true) or headed/GUI (false) browser. */
 	headless: boolean;
+	/** 是否开在用户自己的浏览器里（而不是我们启动的窗口）。 */
+	inUserBrowser: boolean;
 	/** Whether network request capture is currently enabled for this session. */
 	networkCaptureEnabled: boolean;
 	/** Recent console output and page errors captured from the page. */
@@ -116,8 +120,10 @@ export interface BrowserSessionHandoff {
 	url: string;
 	/** Current page URL at snapshot time (best-effort, for matching/logging). */
 	currentPageUrl: string;
-	/** puppeteer BrowserContext.id, used to re-resolve the context after reconnect. */
-	contextId: string;
+	/** 隔离 context 的 BrowserContext.id，重连后据此找回会话。 */
+	contextId?: string;
+	/** 共享 context 里根标签的 CDP target id（默认 context 没有 id）。 */
+	targetId?: string;
 	/** Only an interruption marker; no recorder, endpoint, summary or artifact is persisted. */
 	interruptedProfileId?: string;
 	headless: boolean;
@@ -150,6 +156,10 @@ function isSessionExpired(session: BrowserSession, now = Date.now()): boolean {
 	return now - session.lastActivity > session.ttlMs;
 }
 
+function closeSessionTab(session: BrowserSession): Promise<void> {
+	return closeTab(session.context, session.page.target());
+}
+
 function expireSession(
 	narratorId: string,
 	map: Map<string, BrowserSession>,
@@ -159,7 +169,7 @@ function expireSession(
 	logger.info("Browser session expired", { narratorId, sessionId, ttlMs: session.ttlMs });
 	if (session.tracing?.active) void finishPerformanceTrace(session).catch(() => {});
 	void cancelMemoryJob(session)
-		.then(() => session.context.close())
+		.then(() => closeSessionTab(session))
 		.catch(() => {});
 	map.delete(sessionId);
 	if (map.size === 0) sessions.delete(narratorId);
@@ -417,14 +427,7 @@ export async function createSession(
 	captureNetwork = false,
 ): Promise<BrowserSession> {
 	const normalizedTtlMs = normalizeSessionTtlMs(ttlMs);
-	const context = await createContext(headless);
-	const page = await context.newPage();
-
-	// Puppeteer doesn't support viewport/userAgent at context level (unlike Playwright),
-	// so we set them per-page to match fetchPage() defaults.
-	await page.setViewport(DEFAULT_VIEWPORT);
-	await page.setUserAgent(USER_AGENT);
-
+	const { context, page, inUserBrowser } = await openTab(headless);
 	const sessionId = generateShortId();
 	const session: BrowserSession = {
 		id: sessionId,
@@ -435,6 +438,7 @@ export async function createSession(
 		lastActivity: Date.now(),
 		ttlMs: normalizedTtlMs,
 		headless,
+		inUserBrowser,
 		networkCaptureEnabled: captureNetwork,
 		consoleMessages: [],
 		consoleMessageSeq: 0,
@@ -446,13 +450,20 @@ export async function createSession(
 	attachNetworkListeners(page, session);
 
 	try {
-		await installDialogProtection(context, (text) => {
-			pushConsoleMessage(session, { type: "dialog", text });
-		});
+		// Puppeteer doesn't support viewport/userAgent at context level (unlike Playwright),
+		// so we set them per-page to match fetchPage() defaults.
+		await page.setViewport(DEFAULT_VIEWPORT);
+		// 用户的浏览器带着真实登录态，伪造的 UA 容易触发站点的异常登录风控
+		if (!inUserBrowser) await page.setUserAgent(USER_AGENT);
+		await installDialogProtection(
+			context,
+			(text) => pushConsoleMessage(session, { type: "dialog", text }),
+			isSharedContext(context) ? page.target() : undefined,
+		);
 		await page.goto(url, { waitUntil: "domcontentloaded" });
 	} catch (err) {
-		await context.close().catch((closeErr) => {
-			logger.warn("Failed to close browser context after initial navigation failure", {
+		await closeSessionTab(session).catch((closeErr) => {
+			logger.warn("Failed to close browser tab after initial navigation failure", {
 				narratorId,
 				sessionId,
 				error: String(closeErr),
@@ -474,6 +485,7 @@ export async function createSession(
 		sessionId,
 		url,
 		headless,
+		inUserBrowser,
 		ttlMs: normalizedTtlMs,
 		networkCaptureEnabled: captureNetwork,
 	});
@@ -493,14 +505,12 @@ export function getSession(narratorId: string, sessionId: string): BrowserSessio
 		return undefined;
 	}
 
-	// Check if context is still alive
-	try {
-		// Accessing pages will throw if context is closed
-		session.context.pages();
-	} catch {
+	// 标签或整个浏览器可能已被用户关掉
+	if (session.page.isClosed() || !session.context.browser().connected) {
 		void cancelMemoryJob(session);
 		map.delete(sessionId);
 		if (map.size === 0) sessions.delete(narratorId);
+		eventBus.emit({ type: "browser:session_closed", sessionId, narratorId });
 		return undefined;
 	}
 
@@ -516,7 +526,7 @@ export async function closeSession(narratorId: string, sessionId: string): Promi
 
 	await cancelMemoryJob(session);
 	if (session.tracing?.active) await finishPerformanceTrace(session).catch(() => {});
-	await session.context.close().catch(() => {});
+	await closeSessionTab(session).catch(() => {});
 	map.delete(sessionId);
 	if (map.size === 0) sessions.delete(narratorId);
 
@@ -593,7 +603,7 @@ export async function cleanupNarrator(narratorId: string): Promise<void> {
 		}
 		promises.push(
 			cancelMemoryJob(session)
-				.then(() => session.context.close())
+				.then(() => closeSessionTab(session))
 				.catch(() => {}),
 		);
 	}
@@ -703,9 +713,7 @@ export async function closeAllSessions(options: { preserve?: boolean } = {}): Pr
 			}
 			promises.push(
 				cancelMemoryJob(session)
-					.then(async () => {
-						if (!preserve) await session.context.close();
-					})
+					.then(() => (preserve ? undefined : closeSessionTab(session)))
 					.catch(() => {}),
 			);
 			closed++;
@@ -729,10 +737,11 @@ export function snapshotSessionsForHandoff(): BrowserSessionHandoff[] {
 	const snapshots: BrowserSessionHandoff[] = [];
 	for (const [narratorId, map] of sessions) {
 		for (const session of map.values()) {
-			const contextId = session.context.id;
-			if (!contextId) {
-				// The default (non-incognito) context has no id and cannot be re-resolved reliably.
-				logger.warn("Skipping browser session without context id during handoff", {
+			const shared = isSharedContext(session.context);
+			const contextId = shared ? undefined : session.context.id;
+			const targetId = shared ? targetIdOf(session.page.target()) : undefined;
+			if (!contextId && !targetId) {
+				logger.warn("Skipping browser session that cannot be located after handoff", {
 					narratorId,
 					sessionId: session.id,
 				});
@@ -750,6 +759,7 @@ export function snapshotSessionsForHandoff(): BrowserSessionHandoff[] {
 				url: session.url,
 				currentPageUrl,
 				contextId,
+				targetId,
 				...(["starting", "recording", "finalizing"].includes(
 					session.memoryProfile?.view.state ?? "",
 				)
@@ -773,26 +783,30 @@ export async function restoreSessionFromHandoff(
 	browser: Browser,
 	handoff: BrowserSessionHandoff,
 ): Promise<{ ok: true } | { ok: false; reason: string }> {
-	const context = browser.browserContexts().find((ctx) => ctx.id === handoff.contextId);
-	if (!context) return { ok: false, reason: "context_missing" };
+	const located = locateHandoffTab(browser, handoff);
+	if (!located)
+		return { ok: false, reason: handoff.contextId ? "context_missing" : "page_missing" };
+	const { context, root } = located;
 
 	// Rehydrating Page objects can itself wait on renderer commands behind an open dialog.
 	// Install at the target level first, retaining only a bounded diagnostic buffer until
 	// the session exists. A second install below redirects the sink without duplicating listeners.
 	const earlyDialogMessages: string[] = [];
 	try {
-		await installDialogProtection(context, (text) => {
-			earlyDialogMessages.push(text);
-			if (earlyDialogMessages.length > MAX_CONSOLE_MESSAGES) earlyDialogMessages.shift();
-		});
+		await installDialogProtection(
+			context,
+			(text) => {
+				earlyDialogMessages.push(text);
+				if (earlyDialogMessages.length > MAX_CONSOLE_MESSAGES) earlyDialogMessages.shift();
+			},
+			root,
+		);
 	} catch (error) {
 		// A dialog opened while disconnected may belong to another CDP client. Chrome
 		// cannot replay that dialog to us: leave the context intact and fail promptly.
 		return { ok: false, reason: error instanceof Error ? error.message : String(error) };
 	}
-	const pages = await context.pages();
-	// Prefer a page matching the captured URL; otherwise take the first available page.
-	const page = pages.find((p) => p.url() === handoff.currentPageUrl) ?? pages[0];
+	const page = root ? await root.page() : await isolatedSessionPage(context, handoff);
 	if (!page) return { ok: false, reason: "page_missing" };
 
 	const session: BrowserSession = {
@@ -804,6 +818,8 @@ export async function restoreSessionFromHandoff(
 		lastActivity: Date.now(),
 		ttlMs: handoff.ttlMs,
 		headless: handoff.headless,
+		// 交接只保留我们启动的浏览器
+		inUserBrowser: false,
 		networkCaptureEnabled: handoff.networkCaptureEnabled,
 		consoleMessages: [],
 		consoleMessageSeq: 0,
@@ -825,9 +841,11 @@ export async function restoreSessionFromHandoff(
 		};
 	}
 	for (const text of earlyDialogMessages) pushConsoleMessage(session, { type: "dialog", text });
-	await installDialogProtection(context, (text) => {
-		pushConsoleMessage(session, { type: "dialog", text });
-	});
+	await installDialogProtection(
+		context,
+		(text) => pushConsoleMessage(session, { type: "dialog", text }),
+		root,
+	);
 	attachConsoleListeners(page, session);
 	attachNetworkListeners(page, session);
 
@@ -851,4 +869,35 @@ export async function restoreSessionFromHandoff(
 		url: page.url(),
 	});
 	return { ok: true };
+}
+
+/** Prefer a page matching the captured URL; otherwise take the first available page. */
+async function isolatedSessionPage(
+	context: BrowserContext,
+	handoff: BrowserSessionHandoff,
+): Promise<Page | undefined> {
+	const pages = await context.pages();
+	return pages.find((p) => p.url() === handoff.currentPageUrl) ?? pages[0];
+}
+
+/** 找回交接前的会话所在：隔离 context 按 id，共享 context 里的根标签按 target id。 */
+function locateHandoffTab(
+	browser: Browser,
+	handoff: BrowserSessionHandoff,
+): { context: BrowserContext; root?: Target } | undefined {
+	if (handoff.contextId) {
+		const context = browser.browserContexts().find((ctx) => ctx.id === handoff.contextId);
+		return context && { context };
+	}
+	const root = browser.targets().find((target) => targetIdOf(target) === handoff.targetId);
+	return root && { context: browser.defaultBrowserContext(), root };
+}
+
+/** 关掉一个无法恢复的交接会话留下的标签：交接只读一次，之后不会再有人引用它们。 */
+export async function discardHandoffTab(
+	browser: Browser,
+	handoff: BrowserSessionHandoff,
+): Promise<void> {
+	const located = locateHandoffTab(browser, handoff);
+	if (located) await closeTab(located.context, located.root);
 }

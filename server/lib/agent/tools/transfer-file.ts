@@ -10,7 +10,7 @@ import {
 	validateRemoteAbsolutePath,
 } from "../../../services/device-transfer-service";
 import { LOCAL_DEVICE_ID } from "../execution/backend";
-import type { AgentConfig, ToolContext, ToolDefinition, ToolResult } from "../types";
+import type { ToolContext, ToolDefinition, ToolResult } from "../types";
 import {
 	buildTransferProgressPayload,
 	formatTransferBytes,
@@ -22,12 +22,11 @@ import {
  * TransferFile — move files/directories between the NarraFork server and a
  * remote executor device with high-performance, resumable, chunked transfer.
  *
- * Only offered when the session has online remote devices (loop.ts filters it
- * out otherwise); the `device` enum reflects the currently reachable devices.
+ * Device candidates are published in prompt context. The static device parameter
+ * never grants access; execution checks current devices and allowed roots.
  */
 /**
- * Shared schema for the background flag (the static and config-derived schemas
- * must describe it identically — a provider sees one or the other).
+ * Shared static schema for the background flag.
  */
 const BACKGROUND_PARAM_SCHEMA = {
 	type: "boolean",
@@ -92,38 +91,6 @@ export const transferFileTool: ToolDefinition = {
 		},
 		required: ["direction", "device", "remotePath", "localPath"],
 		additionalProperties: false,
-	},
-	getRawJsonSchema(config: AgentConfig) {
-		const devices = (config.availableDevices ?? []).filter((d) => d.online);
-		const deviceEnum = devices.map((d) => d.id);
-		const lines = devices.map((d) => {
-			const platform = d.platform ? ` [${d.platform.os}/${d.platform.arch}]` : "";
-			return `  • "${d.id}" (${d.name})${platform}`;
-		});
-		return {
-			type: "object",
-			properties: {
-				direction: {
-					type: "string",
-					enum: ["download", "upload"],
-					description: '"download" = device → server; "upload" = server → device.',
-				},
-				device: {
-					type: "string",
-					enum: deviceEnum,
-					description: `The remote device to transfer with. Available:\n${lines.join("\n")}`,
-				},
-				remotePath: { type: "string", description: "Absolute path on the remote device." },
-				localPath: { type: "string", description: "Absolute path on the NarraFork server." },
-				recursive: {
-					type: "boolean",
-					description: "Transfer a directory recursively. Default false (single file).",
-				},
-				run_in_background: BACKGROUND_PARAM_SCHEMA,
-			},
-			required: ["direction", "device", "remotePath", "localPath"],
-			additionalProperties: false,
-		};
 	},
 	parameters: z.object({
 		direction: z.enum(["download", "upload"]),

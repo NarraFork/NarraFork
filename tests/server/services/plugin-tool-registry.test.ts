@@ -289,6 +289,84 @@ describe("PluginToolRegistry", () => {
 		});
 	});
 
+	test("accepts ordinary inputs above 256 KiB and outputs above 1 MiB by default", async () => {
+		const text = "中文工具正文\n".repeat(32_768);
+		const output = text.repeat(3);
+		const callerInput = { text };
+		let handlerCalls = 0;
+		const registry = new PluginToolRegistry({
+			capabilityBroker: broker(),
+			handler: (input) => {
+				handlerCalls += 1;
+				expect(input.text).toBe(text);
+				input.text = "handler-owned mutation";
+				return { output };
+			},
+		});
+		const [descriptor] = registry.registerManifest(manifest(), { principal });
+		expect(Buffer.byteLength(JSON.stringify({ text }))).toBeGreaterThan(256 * 1024);
+		expect(Buffer.byteLength(output)).toBeGreaterThan(1024 * 1024);
+		await expect(
+			registry.invoke(descriptor.fullId, callerInput, { context: context() }),
+		).resolves.toEqual({ output });
+		expect(handlerCalls).toBe(1);
+		expect(callerInput).toEqual({ text });
+	});
+
+	test("enforces custom UTF-8 input bytes before schema validation or handler dispatch", async () => {
+		const input = { text: "中文" };
+		let authorizeCalls = 0;
+		let handlerCalls = 0;
+		const registry = new PluginToolRegistry({
+			maxInputBytes: Buffer.byteLength(JSON.stringify(input)),
+			capabilityBroker: broker(async () => {
+				authorizeCalls += 1;
+				return { allowed: true };
+			}),
+			handler: () => {
+				handlerCalls += 1;
+				return "ok";
+			},
+		});
+		const [descriptor] = registry.registerManifest(manifest(), { principal });
+		await expect(
+			registry.invoke(descriptor.fullId, input, { context: context() }),
+		).resolves.toEqual({ output: "ok" });
+		await expect(
+			registry.invoke(descriptor.fullId, { text: "中文a" }, { context: context() }),
+		).rejects.toMatchObject({ code: "PAYLOAD_TOO_LARGE" });
+		// Both schema-invalid and over budget: size must win before schema traversal.
+		await expect(
+			registry.invoke(descriptor.fullId, { unexpected: "中文中文" }, { context: context() }),
+		).rejects.toMatchObject({ code: "PAYLOAD_TOO_LARGE" });
+		expect(authorizeCalls).toBe(1);
+		expect(handlerCalls).toBe(1);
+	});
+
+	test("enforces custom UTF-8 output bytes without automatically repeating execution", async () => {
+		const output = "中文";
+		let handlerCalls = 0;
+		const registry = new PluginToolRegistry({
+			maxOutputBytes: Buffer.byteLength(JSON.stringify({ output })),
+			capabilityBroker: broker(),
+			handler: (input) => {
+				handlerCalls += 1;
+				return { output: input.text as string };
+			},
+		});
+		const [descriptor] = registry.registerManifest(manifest(), { principal });
+		await expect(
+			registry.invoke(descriptor.fullId, { text: output }, { context: context() }),
+		).resolves.toEqual({ output });
+		await expect(
+			registry.invoke(descriptor.fullId, { text: `${output}a` }, { context: context() }),
+		).rejects.toMatchObject({
+			code: "PAYLOAD_TOO_LARGE",
+			message: expect.stringMatching(/already|executed|retry/i),
+		});
+		expect(handlerCalls).toBe(2);
+	});
+
 	test("rejects oversized output instead of silently truncating it", async () => {
 		const registry = new PluginToolRegistry({
 			capabilityBroker: broker(),

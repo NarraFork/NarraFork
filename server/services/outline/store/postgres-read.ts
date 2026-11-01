@@ -45,7 +45,13 @@ import {
 	type OutlineLinkRow,
 	type OutlineVersionRow,
 } from "./port";
-import { OUTLINE_PAGE_HEAD_CHARS, type OutlineReadPort, type OutlineSearchRow } from "./read-port";
+import {
+	OUTLINE_LAST_WRITES_SCAN,
+	OUTLINE_PAGE_HEAD_CHARS,
+	type OutlinePageStructureRow,
+	type OutlineReadPort,
+	type OutlineSearchRow,
+} from "./read-port";
 
 /** Version keys per statement (two bound parameters each). */
 const VERSION_KEY_CHUNK = 250;
@@ -66,6 +72,23 @@ function toBlock(row: BlockSelect): OutlineBlockRow {
 		taskJson: taskOf(row.taskJson),
 		authorKind: row.authorKind as OutlineActorKind,
 	};
+}
+
+/** Keys per statement of the reads keyed by block and seq (each key binds a few parameters). */
+const KEYED_CHUNK = 200;
+/** Keys per last-writes statement: each binds its seq in four subqueries. */
+const LAST_WRITES_CHUNK = 50;
+
+/**
+ * `CASE outline_blocks.id WHEN … THEN … END` (the table named in full: in a select list drizzle
+ * writes a column of the selected table unqualified, which a subquery would read as its own):
+ * a per-block integer (keys never repeat a block).
+ */
+function caseOf(pairs: ReadonlyArray<readonly [string, number]>): SQL {
+	return sql`CASE outline_blocks.id ${sql.join(
+		pairs.map(([id, n]) => sql`WHEN CAST(${id} AS text) THEN CAST(${n} AS integer)`),
+		sql` `,
+	)} END`;
 }
 
 function toVersion(row: VersionSelect): OutlineVersionRow {
@@ -158,6 +181,32 @@ export function createPostgresOutlineReads(db: BunSQLDatabase): OutlineReadPort 
 			};
 		},
 
+		async listPagesStructure(pageIds, limit) {
+			const out: OutlinePageStructureRow[] = [];
+			const max = Math.max(0, Math.floor(limit));
+			for (const chunk of chunked([...new Set(pageIds)])) {
+				// Ordered by page, so a page's rows come together and a cut leaves one page short.
+				const rows = await db
+					.select({
+						id: outlineBlocks.id,
+						sid: outlineBlocks.sid,
+						parentId: outlineBlocks.parentId,
+						orderKey: outlineBlocks.orderKey,
+						alias: outlineBlocks.alias,
+						taskJson: outlineBlocks.taskJson,
+						versionSeq: outlineBlocks.versionSeq,
+						pageId: outlineBlocks.pageId,
+					})
+					.from(outlineBlocks)
+					.where(and(inArray(outlineBlocks.pageId, chunk), eq(outlineBlocks.deleted, false)))
+					.orderBy(outlineBlocks.pageId)
+					.limit(max - out.length + 1);
+				for (const r of rows) out.push({ ...r, taskJson: taskOf(r.taskJson) });
+				if (out.length > max) return { rows: out.slice(0, max), truncated: true };
+			}
+			return { rows: out, truncated: false };
+		},
+
 		async listVersionsAt(blockIds, seq) {
 			const out: OutlineVersionRow[] = [];
 			for (const ids of chunked(blockIds)) {
@@ -183,6 +232,89 @@ export function createPostgresOutlineReads(db: BunSQLDatabase): OutlineReadPort 
 					.from(v)
 					.where(sql`(${v.blockId}, ${v.fromSeq}) IN (VALUES ${pairs})`);
 				out.push(...rows);
+			}
+			return out;
+		},
+
+		async listVersionsAtSeqs(keys) {
+			const out: OutlineVersionRow[] = [];
+			const v = outlineBlockVersions;
+			for (const chunk of chunked(keys, KEYED_CHUNK)) {
+				const seqOf = new Map(chunk.map((k) => [k.blockId, k.seq]));
+				const at = caseOf(chunk.map((k) => [k.blockId, k.seq]));
+				// The latest version that opened by each seq, then those rows by exact key.
+				const found = (
+					await db
+						.select({
+							blockId: outlineBlocks.id,
+							fromSeq: sql<number | null>`(SELECT v.from_seq FROM outline_block_versions v
+								WHERE v.block_id = outline_blocks.id AND v.from_seq <= ${at}
+								ORDER BY v.from_seq DESC LIMIT 1)`,
+						})
+						.from(outlineBlocks)
+						.where(inArray(outlineBlocks.id, [...seqOf.keys()]))
+				).filter((r): r is { blockId: string; fromSeq: number } => r.fromSeq !== null);
+				if (found.length === 0) continue;
+				const pairs = sql.join(
+					found.map(
+						(k) => sql`(CAST(${k.blockId} AS text), CAST(${Number(k.fromSeq)} AS integer))`,
+					),
+					sql`, `,
+				);
+				const rows = await db
+					.select()
+					.from(v)
+					.where(sql`(${v.blockId}, ${v.fromSeq}) IN (VALUES ${pairs})`);
+				for (const row of rows) {
+					const seq = seqOf.get(row.blockId) as number;
+					if (row.toSeq === null || row.toSeq > seq) out.push(toVersion(row));
+				}
+			}
+			return out;
+		},
+
+		async findLastWrites(keys, except) {
+			const out: Array<{ blockId: string; fromSeq: number | null; changeFlags: number | null }> =
+				[];
+			const own = ~except.flags & 0x7fffffff;
+			const anyone = ~(except.anyoneFlags ?? 0) & 0x7fffffff;
+			for (const chunk of chunked(keys, LAST_WRITES_CHUNK)) {
+				const after = caseOf(chunk.map((k) => [k.blockId, k.afterSeq]));
+				const newer = sql`v.block_id = outline_blocks.id AND v.from_seq > ${after}`;
+				// The oldest of the newest versions looked at: one lower bound for the index range
+				// (with two, the engine may scan down to `afterSeq`); and whether there are more.
+				const floor = sql`COALESCE((SELECT v.from_seq FROM outline_block_versions v WHERE ${newer}
+					ORDER BY v.from_seq DESC LIMIT 1 OFFSET ${sql.raw(String(OUTLINE_LAST_WRITES_SCAN - 1))}), ${after} + 1)`;
+				const counted = sql`FROM outline_block_versions v JOIN outline_commits c ON c.id = v.commit_id
+					WHERE v.block_id = outline_blocks.id AND v.from_seq >= ${floor}
+						AND NOT ((c.actor_kind = CAST(${except.actorKind} AS text) AND c.actor_id = CAST(${except.actorId} AS text)
+							AND (v.change_flags & CAST(${own} AS integer)) = 0) OR (v.change_flags & CAST(${anyone} AS integer)) = 0)
+					ORDER BY v.from_seq DESC LIMIT 1`;
+				const rows = await db
+					.select({
+						blockId: outlineBlocks.id,
+						fromSeq: sql<number | null>`(SELECT v.from_seq ${counted})`,
+						changeFlags: sql<number | null>`(SELECT v.change_flags ${counted})`,
+						more: sql<unknown>`EXISTS (SELECT 1 FROM outline_block_versions v WHERE ${newer}
+							ORDER BY v.from_seq DESC LIMIT 1 OFFSET ${sql.raw(String(OUTLINE_LAST_WRITES_SCAN))})`,
+					})
+					.from(outlineBlocks)
+					.where(
+						inArray(
+							outlineBlocks.id,
+							chunk.map((k) => k.blockId),
+						),
+					);
+				for (const row of rows) {
+					if (row.fromSeq !== null)
+						out.push({
+							blockId: row.blockId,
+							fromSeq: Number(row.fromSeq),
+							changeFlags: Number(row.changeFlags),
+						});
+					else if (row.more === true || Number(row.more) === 1)
+						out.push({ blockId: row.blockId, fromSeq: null, changeFlags: null });
+				}
 			}
 			return out;
 		},

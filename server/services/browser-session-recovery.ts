@@ -7,14 +7,16 @@
 //
 // Replacement process (at startup):
 //   restoreBrowserSessionsAfterUpdate() reads the handoff (read-once), reconnects to each preserved
-//   Chrome via wsEndpoint, rebuilds every session from its contextId, and notifies the owning
+//   Chrome via wsEndpoint, rebuilds every session from its context or root tab, and notifies the owning
 //   narrator for any session that could not be restored.
 
 import { DEFAULT_LOCALE } from "@shared/i18n-locales";
 import type { Browser } from "puppeteer-core";
 import {
+	type BrowserSessionHandoff,
 	closeAllSessions,
 	connectBrowser,
+	discardHandoffTab,
 	getBrowserWsEndpoints,
 	restoreSessionFromHandoff,
 	setBrowserPreserveMode,
@@ -157,10 +159,10 @@ export async function restoreBrowserSessionsAfterUpdate(): Promise<void> {
 			});
 			recordFailure(session.narratorId, session.sessionId, "restore_error");
 		}
-		// restoreSessionFromHandoff leaves the context intact on failure so a caller
+		// restoreSessionFromHandoff leaves the tab intact on failure so a caller
 		// with a retry path could try again. This one has none (the handoff is
-		// read-once), so nothing would ever reference or close the context again.
-		if (!restored) await closeOrphanedContext(browser, session.contextId, session.sessionId);
+		// read-once), so nothing would ever reference or close the tab again.
+		if (!restored) await closeOrphanedTab(browser, session);
 	}
 
 	logger.info("Browser session recovery finished", {
@@ -171,30 +173,24 @@ export async function restoreBrowserSessionsAfterUpdate(): Promise<void> {
 	await notifyFailedNarrators(failuresByNarrator);
 }
 
-const ORPHANED_CONTEXT_CLOSE_TIMEOUT_MS = 5_000;
+const ORPHANED_TAB_CLOSE_TIMEOUT_MS = 5_000;
 
-async function closeOrphanedContext(
-	browser: Browser,
-	contextId: string,
-	sessionId: string,
-): Promise<void> {
-	const context = browser.browserContexts().find((ctx) => ctx.id === contextId);
-	if (!context) return;
+async function closeOrphanedTab(browser: Browser, handoff: BrowserSessionHandoff): Promise<void> {
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {
 		// Bounded: a context blocked by a foreign dialog must not stall startup.
 		await Promise.race([
-			context.close(),
+			discardHandoffTab(browser, handoff),
 			new Promise<never>((_, reject) => {
 				timer = setTimeout(
-					() => reject(new Error("timed out closing orphaned context")),
-					ORPHANED_CONTEXT_CLOSE_TIMEOUT_MS,
+					() => reject(new Error("timed out closing orphaned tab")),
+					ORPHANED_TAB_CLOSE_TIMEOUT_MS,
 				);
 			}),
 		]);
 	} catch (error) {
-		logger.warn("Failed to close an unrestorable browser context", {
-			sessionId,
+		logger.warn("Failed to close an unrestorable browser tab", {
+			sessionId: handoff.sessionId,
 			error: error instanceof Error ? error.message : String(error),
 		});
 	} finally {

@@ -1,7 +1,7 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
 	narratorMessageRefs,
 	narratorMessages,
@@ -14,9 +14,9 @@ import { AppError } from "../../lib/errors";
 import { withRuntimePolicyTrait } from "../../lib/runtime-policy-trait";
 import type { RuntimeRegistration } from "../../lib/validators/runtime-registration";
 
-const { db, sqlite } = getTestDb();
-const realDb = { ...(await import("../../db")) };
-mock.module("../../db", () => ({ ...realDb, db, sqlite }));
+// The snapshot worker shares the preload-isolated file-backed database.
+const { db, sqlite } = await import("../../db");
+const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
 const { agentTool } = await import("../../lib/agent/tools/task");
 const { narratorRoutes } = await import("../../routes/narrators");
 const { narratorService } = await import("../narrator-service");
@@ -134,6 +134,7 @@ function liveRun(id: string) {
 }
 
 beforeEach(async () => {
+	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
 	runtimePublication.stop();
 	await db.insert(users).values({
@@ -155,9 +156,9 @@ afterEach(() => {
 	}
 	ids.clear();
 });
-afterAll(() => {
+afterAll(async () => {
+	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
-	mock.module("../../db", () => realDb);
 });
 
 describe("registered ordinary session archive", () => {

@@ -1,9 +1,11 @@
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { asc, eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { narratorMessageRefs, narratorMessages, narrators } from "../../db/schema";
 
-const { db, sqlite } = getTestDb();
+// The snapshot worker shares the preload-isolated file-backed database.
+const { db, sqlite } = await import("../../db");
+const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
 
 // Focused suite: keep the narrator history columns the loop reads even when the
 // worktree carries unrelated deferred schema work.
@@ -27,9 +29,6 @@ for (const statement of [
 // Snapshot real modules before mocking so afterAll can re-point each specifier
 // back. Bun's mock.module is process-wide and mock.restore() does NOT undo it.
 const realProviderModule = { ...(await import("../../lib/agent/provider")) };
-const realDbModule = { ...(await import("../../db")) };
-
-mock.module("../../db", () => ({ db, sqlite }));
 
 /**
  * The provider chat generator is the steering wheel for these tests: it blocks
@@ -159,12 +158,11 @@ async function specContinuationCount(narratorId: string): Promise<number> {
 	).length;
 }
 
-afterAll(() => {
+afterAll(async () => {
+	await closePrefixSnapshotStore();
 	mock.module("../../lib/agent/provider", () => realProviderModule);
-	mock.module("../../db", () => realDbModule);
 	mock.restore();
 	cleanDb(sqlite);
-	sqlite.close();
 });
 
 beforeEach(() => {

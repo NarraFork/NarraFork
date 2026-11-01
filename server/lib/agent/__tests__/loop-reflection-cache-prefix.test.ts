@@ -199,16 +199,14 @@ describe("reflection loop cacheable prefix", () => {
 	});
 	for (const planMode of [false, true]) {
 		test(`inherits complete ordered parent tools (planMode=${planMode})`, async () => {
-			const dynamicName = "CacheDynamicTool";
-			let resolutions = 0;
+			const dynamicName = "CacheStaticTool";
 			toolRegistry.register({
 				name: dynamicName,
-				description: (config) => `${config.systemPrompt}:${++resolutions}`,
-				getRawJsonSchema: (config) => ({
+				description: "Static description remains identical in plan and reflection modes",
+				rawJsonSchema: {
 					type: "object",
-					description: config.systemPrompt,
-					properties: { value: { const: resolutions } },
-				}),
+					properties: { value: { type: "string" } },
+				},
 				parameters: z.object({}),
 				execute: async () => {
 					throw new Error("Must not execute");
@@ -247,7 +245,11 @@ describe("reflection loop cacheable prefix", () => {
 				// Auxiliary reflection must not replace the parent's context accounting.
 				expect(characters).toEqual(parentCharacters);
 				expect(captured[1].identity).toEqual(captured[0].identity);
-				expect(resolutions).toBe(1);
+				expect(parentTools).toContainEqual({
+					name: dynamicName,
+					description: "Static description remains identical in plan and reflection modes",
+					input_schema: { type: "object", properties: { value: { type: "string" } } },
+				});
 			} finally {
 				toolRegistry.unregister(dynamicName);
 			}

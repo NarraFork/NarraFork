@@ -25,7 +25,8 @@
  * not admins. Past the cap only what is open to every signed-in user, and the main project's
  * space, stay readable. A list of every reader of a session exists nowhere else in the
  * repository (`listNarratorAudience` deliberately under-reports), so this answers space by space
- * rather than producing a readable set.
+ * rather than producing a readable set; {@link listSessionReadableSpaces} lists one by judging
+ * candidates that SQL narrows down first, a bounded number of them.
  *
  * CACHING
  * -------
@@ -49,6 +50,7 @@ import {
 } from "./access";
 import {
 	type NarratorAccessRow,
+	type OutlineSpaceCandidates,
 	type ProjectAccessRow,
 	readHasActivePublicShare,
 	readJudgedNarrator,
@@ -57,8 +59,10 @@ import {
 	readNonAdminUserIds,
 	readProject,
 	readScopeGrants,
+	readSpaceCandidatePage,
 } from "./access-reads";
 import { isOrphanedSpace } from "./spaces";
+import { outlineStore } from "./store";
 import type { OutlineSpaceRow } from "./store/port";
 
 /**
@@ -114,6 +118,9 @@ interface CacheEntry {
 const cache = hotSafe("narrafork.outline.sessionReadScopes", () => ({
 	entries: new Map<string, CacheEntry>(),
 }));
+
+/** Counts the times cached readers and verdicts were dropped (see {@link sessionScopeEpoch}). */
+const epoch = hotSafe("narrafork.outline.sessionReadScopes.epoch", () => ({ value: 0 }));
 
 const EVERYONE: SessionAudience = { kind: "everyone" };
 const TOO_MANY: SessionAudience = { kind: "too_many" };
@@ -301,6 +308,7 @@ async function memo(
  * already do this; call it after changing access some other way.
  */
 export function invalidateSessionReadScopes(narratorId?: string): void {
+	epoch.value++;
 	if (narratorId === undefined) {
 		cache.entries.clear();
 		return;
@@ -315,7 +323,10 @@ export function invalidateSessionReadScopes(narratorId?: string): void {
 }
 
 if (hotOnce("narrafork.outline.sessionReadScopes.listeners")) {
-	const clear = () => cache.entries.clear();
+	const clear = () => {
+		epoch.value++;
+		cache.entries.clear();
+	};
 	eventBus.on("narrator:access_changed", clear);
 	eventBus.on("project:access_changed", clear);
 	eventBus.on("auth:changed", clear);
@@ -324,6 +335,15 @@ if (hotOnce("narrafork.outline.sessionReadScopes.listeners")) {
 // ─────────────────────────────────────────────────────────────────────────────
 // API
 // ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * A number that changes whenever access changed in a way that drops cached verdicts (an access
+ * event, or {@link invalidateSessionReadScopes}). A read that spans several turns of the event
+ * loop compares it before and after: when it moved, what it read may no longer be readable.
+ */
+export function sessionScopeEpoch(): number {
+	return epoch.value;
+}
 
 /** Who reads the session, as the checks below see it. */
 export async function getSessionReadScope(narratorId: string): Promise<SessionReadScope> {
@@ -375,4 +395,210 @@ export async function canSessionReadSpace(
 		);
 	}
 	return false;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Listing
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Limits of listing what a session may read (tests lower some of them). */
+export const OUTLINE_SESSION_LIST_LIMITS = {
+	/** Spaces one listing returns at most. */
+	maxSpaces: 200,
+	/**
+	 * Candidates one listing judges, by default: a session read by several people is offered
+	 * every space one of them might read, and only some pass.
+	 */
+	defaultCandidates: 200,
+	/** Candidates one listing may be asked to judge at most. */
+	maxCandidates: 2000,
+	/** Candidate rows one statement reads. */
+	candidatePage: 100,
+	/**
+	 * Candidates judged between two yields to the event loop. A verdict not cached yet costs a
+	 * few to about ten small indexed reads (some tenths of a millisecond on SQLite): measured on
+	 * 320 sessions' spaces none of which a shared session may read, the longest stretch on the
+	 * main thread of a whole overview stays at about 6 to 10 ms.
+	 */
+	judgeSlice: 8,
+};
+
+/** Let pending I/O run: long listings are cut into slices this way. */
+export function yieldToEventLoop(): Promise<void> {
+	return new Promise((resolve) => setImmediate(resolve));
+}
+
+export interface SessionReadableSpaces {
+	/** Readable spaces, the session's own first (see {@link listSessionReadableSpaces}). */
+	spaces: OutlineSpaceRow[];
+	/**
+	 * Why the listing stopped short: `limit` when more spaces are readable than it returns (one
+	 * more was found); `candidates` when it judged as many candidates as it may, so whether any
+	 * of the rest is readable is not known. Null when it is complete.
+	 */
+	cut: "limit" | "candidates" | null;
+	/** `cut === null`. */
+	complete: boolean;
+}
+
+/** Where to look for what the session may read besides its own spaces; null: nowhere. */
+function candidateSource(
+	state: ScopeState,
+): { from: OutlineSpaceCandidates; kinds: Array<"project" | "session"> } | null {
+	// Without a main project nothing but the session's own space and personal space is readable.
+	if (state.mainProject === null) return null;
+	if (state.audience.kind !== "people") return { from: { kind: "open" }, kinds: ["project"] };
+	// What the session reads, every one of its readers reads: what one of them might read covers
+	// it. The owner comes first.
+	const anchor = state.audience.userIds[0];
+	return {
+		from: anchor === undefined ? { kind: "all" } : { kind: "reader", userId: anchor },
+		kinds: ["project", "session"],
+	};
+}
+
+function clampCount(value: number | undefined, fallback: number, max: number): number {
+	return value === undefined || !Number.isFinite(value)
+		? fallback
+		: Math.max(1, Math.min(max, Math.floor(value)));
+}
+
+/** The SQL candidates of one kind, in id order, a page at a time. */
+async function* candidatesOfKind(
+	from: OutlineSpaceCandidates,
+	kind: "project" | "session",
+): AsyncGenerator<OutlineSpaceRow> {
+	const page = OUTLINE_SESSION_LIST_LIMITS.candidatePage;
+	let afterId: string | undefined;
+	for (;;) {
+		const rows = await readSpaceCandidatePage(from, { kind, afterId, limit: page });
+		yield* rows;
+		const last = rows[rows.length - 1];
+		if (rows.length < page || !last) return;
+		afterId = last.id;
+	}
+}
+
+/**
+ * The spaces a listing judges, in its order, each once: the session's own space (its root's),
+ * its main project's, the personal space of the turn's person, then the SQL candidates of other
+ * projects' and other sessions' spaces (`readSpaceCandidatePage`), the two kinds taken in turn,
+ * one candidate of each, so that neither can use up the candidates a listing judges.
+ */
+async function* candidateSpaces(
+	state: ScopeState,
+	executingUserId: string | null,
+): AsyncGenerator<{ space: OutlineSpaceRow; own: boolean }> {
+	if (state.rootNarratorId === null) return;
+	const seen = new Set<string>();
+	const own = [
+		await outlineStore.findSpace({ kind: "session", narratorId: state.rootNarratorId }),
+		state.mainProjectId === null
+			? null
+			: await outlineStore.findSpace({ kind: "project", projectId: state.mainProjectId }),
+		executingUserId
+			? await outlineStore.findSpace({ kind: "personal", ownerUserId: executingUserId })
+			: null,
+	];
+	for (const space of own) {
+		if (!space || seen.has(space.id)) continue;
+		seen.add(space.id);
+		yield { space, own: true };
+	}
+	const source = candidateSource(state);
+	if (source === null) return;
+	const streams = source.kinds.map((kind) => candidatesOfKind(source.from, kind));
+	try {
+		while (streams.length > 0) {
+			for (let i = 0; i < streams.length; ) {
+				const next = await (streams[i] as AsyncGenerator<OutlineSpaceRow>).next();
+				if (next.done) {
+					streams.splice(i, 1);
+					continue;
+				}
+				i++;
+				if (seen.has(next.value.id)) continue;
+				seen.add(next.value.id);
+				yield { space: next.value, own: false };
+			}
+		}
+	} finally {
+		for (const stream of streams) await stream.return(undefined);
+	}
+}
+
+/**
+ * The spaces a listing of the session would judge, unjudged, at most `max`: for checks and
+ * tests, which hold them to be a superset of what {@link canSessionReadSpace} admits.
+ */
+export async function listSessionReadCandidates(
+	narratorId: string,
+	options: SessionReadOptions & { max: number },
+): Promise<OutlineSpaceRow[]> {
+	const state = await entryFor(narratorId).state;
+	const out: OutlineSpaceRow[] = [];
+	for await (const { space } of candidateSpaces(state, options.executingUserId ?? null)) {
+		if (out.length >= options.max) break;
+		out.push(space);
+	}
+	return out;
+}
+
+/**
+ * The spaces an agent working in the session may read, each judged by
+ * {@link canSessionReadSpace}, so nothing is listed that a read by key would refuse. In order:
+ * the session's own space (its root's), its main project's, the personal space (for the turn's
+ * person), then other projects' spaces, then other sessions' spaces, each kind in id order. The
+ * two kinds are judged in turn (see `candidateSpaces`).
+ *
+ * Candidates come from SQL, filtered before the LIMIT, and always cover what the verdicts admit
+ * (`readSpaceCandidatePage`): what one reader of the session might read (the owner unless an
+ * admin), project spaces open to every signed-in user, and every space when only admins read
+ * the session; for a public session, one shared by link or one past the reader cap, only spaces
+ * of projects open to everyone (other sessions' spaces are never readable then).
+ *
+ * Bounded: at most `limit` spaces (200) and `maxCandidates` candidates judged (200 by default),
+ * a hundred rows per statement; verdicts are cached with the session's scope, and the work
+ * yields to the event loop every {@link OUTLINE_SESSION_LIST_LIMITS.judgeSlice} candidates.
+ * `cut` says why a listing stopped short.
+ */
+export async function listSessionReadableSpaces(
+	narratorId: string,
+	options: SessionReadOptions & { limit: number; maxCandidates?: number },
+): Promise<SessionReadableSpaces> {
+	const state = await entryFor(narratorId).state;
+	const limit = clampCount(options.limit, 1, OUTLINE_SESSION_LIST_LIMITS.maxSpaces);
+	const maxCandidates = clampCount(
+		options.maxCandidates,
+		OUTLINE_SESSION_LIST_LIMITS.defaultCandidates,
+		OUTLINE_SESSION_LIST_LIMITS.maxCandidates,
+	);
+	const read = { executingUserId: options.executingUserId ?? null };
+	const own: OutlineSpaceRow[] = [];
+	const others: OutlineSpaceRow[] = [];
+	const done = (cut: SessionReadableSpaces["cut"]): SessionReadableSpaces => {
+		// Judged in turn, listed by kind: the session's own, other projects', other sessions'.
+		const all = [
+			...own,
+			...others.filter((space) => space.kind === "project"),
+			...others.filter((space) => space.kind !== "project"),
+		];
+		// One past the limit was found: more are readable, whatever else stopped the listing.
+		const reason = all.length > limit ? "limit" : cut;
+		return { spaces: all.slice(0, limit), cut: reason, complete: reason === null };
+	};
+	let judged = 0;
+	for await (const candidate of candidateSpaces(state, read.executingUserId)) {
+		if (own.length + others.length > limit) return done("limit");
+		// The session's own spaces come first and do not count against the candidates.
+		if (!candidate.own) {
+			if (judged >= maxCandidates) return done("candidates");
+			judged++;
+			if (judged % OUTLINE_SESSION_LIST_LIMITS.judgeSlice === 0) await yieldToEventLoop();
+		}
+		if (await canSessionReadSpace(narratorId, candidate.space, read)) {
+			(candidate.own ? own : others).push(candidate.space);
+		}
+	}
+	return done(null);
 }

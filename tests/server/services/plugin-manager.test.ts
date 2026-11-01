@@ -13,6 +13,10 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+	PLUGIN_TOOL_OUTPUT_FRAME_MAX_BYTES,
+	PROVIDER_REQUEST_MAX_BYTES,
+} from "@server/lib/plugins/protocol";
 import { integrationAuthorityService } from "@server/services/integration-authority-service";
 import { CapabilityBroker } from "@server/services/plugin-capability-broker";
 import { PluginHostDispatcher } from "@server/services/plugin-host-dispatcher";
@@ -344,6 +348,49 @@ afterEach(async () => {
 });
 
 describe("PluginManager", () => {
+	test.each([
+		false,
+		true,
+	])("production frame options preserve ordinary and mixed plugins (%s)", async (mixed) => {
+		const root = await makeTempRoot();
+		const supervisor = new FakeSupervisor();
+		const manager = new PluginManager({
+			root: join(root, "plugins"),
+			disabled: false,
+			runtimeSupervisor: supervisor,
+		});
+		const settle = trackRuntimeLifecycle(manager);
+		try {
+			const source = await makePackage(root, `com.example.frames-${mixed}`, (manifest) => {
+				if (!mixed) return;
+				const contributes = manifest.contributes as Record<string, unknown>;
+				contributes.tools = [
+					{
+						id: "echo",
+						title: "Echo",
+						execution: "server",
+						inputSchema: { type: "object", properties: { text: { type: "string" } } },
+					},
+				];
+				contributes.providers = [{ id: "model", title: "Model" }];
+				(manifest.permissions as Record<string, unknown>).host = [
+					"provider.register",
+					"provider.use",
+				];
+			});
+			const installed = await manager.install(source);
+			await manager.enable(installed.pluginId);
+			await manager.activate(installed.pluginId);
+			const options = supervisor.get(installed.pluginId)?.options;
+			expect(options).toBeDefined();
+			expect(options?.maxFrameBytes).toBe(mixed ? PLUGIN_TOOL_OUTPUT_FRAME_MAX_BYTES : undefined);
+			expect(options?.maxOutboundFrameBytes).toBe(mixed ? PROVIDER_REQUEST_MAX_BYTES : undefined);
+		} finally {
+			await manager.shutdown();
+			await settle();
+		}
+	});
+
 	test("canonicalizes an aliased temporary parent before scanning fixture packages", async () => {
 		const parent = await makeTempRoot();
 		const actual = join(parent, "actual");

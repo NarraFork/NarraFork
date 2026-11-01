@@ -260,10 +260,7 @@ export const structSedTool: ToolDefinition = {
 		},
 	},
 	description: DESCRIPTION,
-	rawJsonSchema,
-	getRawJsonSchema(config) {
-		return withDeviceParam(rawJsonSchema, config);
-	},
+	rawJsonSchema: withDeviceParam(rawJsonSchema),
 	parameters: z.object({
 		file_path: z.string().describe("Absolute path to the file to change."),
 		command: z

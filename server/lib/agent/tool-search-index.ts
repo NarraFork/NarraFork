@@ -4,7 +4,6 @@ export interface ToolSearchDocument {
 	text: string;
 	exactNames?: string[];
 }
-const MAX_DOCUMENTS = 2048;
 const MAX_TEXT = 4096;
 const segmenter = new Intl.Segmenter("zh", { granularity: "word" });
 
@@ -43,7 +42,6 @@ export async function searchToolDocuments(
 	signal?: AbortSignal,
 ): Promise<{ id: string; score: number }[]> {
 	signal?.throwIfAborted();
-	if (documents.length > MAX_DOCUMENTS) throw new Error("Tool search catalog exceeds 2048 tools");
 	const df = new Map<string, number>();
 	const indexed: Index["documents"] = [];
 	// Build a fresh index from the authorized view. Do not stringify the whole catalog

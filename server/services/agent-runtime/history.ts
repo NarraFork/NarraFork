@@ -1,5 +1,6 @@
 import { isMediaContentBlock, type MediaRef } from "@shared/media-attachments";
 import { modelTextFromContentBlocks } from "@shared/native-injection";
+import { contextUpdateOf } from "@shared/prefix-context";
 import { buildHistory, resolveHistoryToolLoadingStrategy } from "../../lib/agent";
 import { projectAttachmentLocations } from "../../lib/agent/attachment-projection";
 import {
@@ -8,6 +9,7 @@ import {
 } from "../../lib/agent/file-reference-projection";
 import { historyTail } from "../../lib/agent/history-build";
 import type { BuiltHistory } from "../../lib/agent/provider";
+import { projectFrozenSenders } from "../../lib/agent/sender-context";
 import {
 	findCurrentSenderMessage,
 	projectMessageSenderForModel,
@@ -53,7 +55,7 @@ export interface RuntimeHistoryOptions {
 	/** Explicit server-local cwd only; never a remote workspace path. */
 	attachmentCwd?: string;
 	attachmentSignal?: AbortSignal;
-	/** Shared deadline, including source reads and provider projection. */
+	/** Optional deadline for the bounded source read, not large hydration/projection. */
 	deadline?: number;
 	/**
 	 * Optional tools whose presence follows session loading, and the currently loaded
@@ -64,6 +66,8 @@ export interface RuntimeHistoryOptions {
 		current: Iterable<string>;
 		/** The request's already-materialized registry candidates; never re-read the registry. */
 		candidates?: readonly ToolDefinition[];
+		/** Captured with candidates before any asynchronous work. */
+		registryRevision?: string;
 		/** A reconciled epoch. Property presence suppresses the legacy compact query, even if empty. */
 		epoch?: ToolLoadingEpoch;
 	};
@@ -195,11 +199,9 @@ export function projectQuestionFallbackToolResults(messages: RuntimeHistoryMessa
 export async function buildRuntimeHistory(
 	options: RuntimeHistoryOptions,
 ): Promise<PreparedRuntimeHistory> {
-	const deadline = Math.min(options.deadline ?? Number.POSITIVE_INFINITY, Date.now() + 10_000);
-	const checkBudget = () => {
-		options.attachmentSignal?.throwIfAborted();
-		if (Date.now() >= deadline) throw new Error("Model history preparation exceeded 10s budget");
-	};
+	// Source reads enforce their own short timeout. A valid large history must not
+	// expire just because hydration and projection take longer than that read.
+	const checkBudget = () => options.attachmentSignal?.throwIfAborted();
 	checkBudget();
 	const sourceMessages =
 		options.sourceMessages ??
@@ -207,7 +209,7 @@ export async function buildRuntimeHistory(
 			await import("../narrator-service")
 		).narratorService.getModelHistorySinceLastCompact(options.narratorId, undefined, {
 			signal: options.attachmentSignal,
-			deadline,
+			deadline: options.deadline,
 		}));
 	checkBudget();
 	const ownPlacement =
@@ -243,27 +245,64 @@ export async function buildRuntimeHistory(
 	}
 	checkBudget();
 	const loading = options.toolLoading;
-	const epoch = loading
+	let epoch = loading
 		? Object.hasOwn(loading, "epoch")
 			? loading.epoch
-			: loading.managed.size
-				? await (await import("../narrator-epochs")).toolLoadingEpochOf(
-						options.narratorId,
-						modelMessages,
-					)
-				: undefined
+			: await (await import("../narrator-epochs")).toolLoadingEpochOf(
+					options.narratorId,
+					sourceMessages,
+					options.attachmentSignal,
+				)
 		: undefined;
+	// A new baseline absorbs old state updates, not the conversation's historical facts.
+	if (epoch?.prefix && epoch.markerId) {
+		const markerId = epoch.markerId;
+		modelMessages = modelMessages.filter(
+			(message) =>
+				message.role !== "sys" ||
+				!Array.isArray(message.contentJson) ||
+				!message.contentJson.some((block) => {
+					const update = contextUpdateOf(block);
+					return update && update.epochId !== markerId;
+				}),
+		);
+	}
+	const prefixState = epoch?.prefix
+		? await (await import("../narrator-prefix-state")).loadPrefixState(
+				{ ...epoch, prefix: epoch.prefix },
+				sourceMessages,
+				options.attachmentSignal,
+			)
+		: undefined;
+	modelMessages = await (await import("../narrator-prefix-state")).hydrateContextUpdates(
+		modelMessages,
+		options.attachmentSignal,
+		sourceMessages,
+	);
+	if (prefixState && epoch) {
+		modelMessages = projectFrozenSenders(modelMessages, prefixState.parts.get("senders"));
+		// Reconciliation may have appended updates after its original view. Keep the
+		// final merged state alive in the runtime, not that pre-publication ancestor.
+		epoch = {
+			...epoch,
+			definitionSnapshots: prefixState.definitionSnapshots,
+			prefixState: prefixState.keepalive,
+		};
+	}
+	checkBudget();
 	const toolLoadingState = loading
 		? deriveToolLoadingState(
-				// No managed tool means no events to derive; do not scan the history at all.
-				loading.managed.size ? modelMessages : [],
+				// Prefix epochs also track built-ins becoming available (e.g. devices).
+				loading.managed.size || epoch?.prefix ? modelMessages : [],
 				loading.managed,
 				loading.current,
 				epoch,
+				loading.candidates,
 			)
 		: undefined;
 	const toolLoadingStrategy = usesToolLoading(toolLoadingState)
-		? resolveHistoryToolLoadingStrategy(options.model, options.provider)
+		? (toolLoadingState.strategy ??
+			resolveHistoryToolLoadingStrategy(options.model, options.provider))
 		: undefined;
 	// Injected schemas are plain notice text, so they are written here: the receipt guards
 	// and a notice recovered as the current turn then carry the same bytes as a rebuild.
@@ -274,7 +313,7 @@ export async function buildRuntimeHistory(
 			if (!byName) return resolveLoadableToolDefinition(name);
 			const tool = byName.get(name);
 			if (!tool || (tool.isAvailable && !tool.isAvailable())) return null;
-			if (typeof tool.description !== "string" || tool.getRawJsonSchema) return null;
+			if (typeof tool.description !== "string") return null;
 			return { ...tool, description: tool.description };
 		};
 		modelMessages = projectToolLoadingHistory(

@@ -13,6 +13,8 @@
  */
 
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
+import { generateWithFirstTokenTimeout } from "../generate-first-token-timeout";
+import type { GenerateOptions } from "../provider";
 
 // Keep the backoff negligible so the test exercises the beat wiring, not the clock.
 const realErrorHandling = { ...(await import("../error-handling")) };
@@ -23,7 +25,9 @@ mock.module("../error-handling", () => ({
 }));
 
 let generateAttempts = 0;
-let generateImpl: () => Promise<{ text: string }> = async () => ({ text: "summary" });
+let generateImpl: (options?: GenerateOptions) => Promise<{ text: string }> = async () => ({
+	text: "summary",
+});
 
 // `agentGenerateWithMeta` lives inside index.ts, so it cannot be mocked from
 // outside. Intercept one level down instead: stub provider resolution to hand back
@@ -35,9 +39,14 @@ mock.module("../provider", () => ({
 		provider: "anthropic",
 		model: "claude-haiku",
 		adapter: {
-			generateWithMeta: async () => {
+			generateWithMeta: async (
+				_text: string,
+				_model: string,
+				_instruction?: string,
+				options?: GenerateOptions,
+			) => {
 				generateAttempts++;
-				return generateImpl();
+				return generateImpl(options);
 			},
 		},
 	}),
@@ -74,6 +83,35 @@ function generateWithProgress(onRetryProgress: () => void) {
 }
 
 describe("summaryGenerate retry progress", () => {
+	test("forwards tool-output progress through extraOptions to the first-token watchdog", async () => {
+		generateImpl = async (options) => {
+			await options?.onGenerationProgress?.();
+			await new Promise((resolve) => setTimeout(resolve, 40));
+			expect(options?.signal?.aborted).toBe(false);
+			return { text: "tool result" };
+		};
+		const result = await generateWithFirstTokenTimeout(
+			(options) =>
+				summaryGenerate(
+					"text",
+					"system",
+					undefined,
+					options.signal,
+					options.onTextDelta,
+					"anthropic:claude-haiku",
+					undefined,
+					false,
+					options.onReasoningDelta,
+					undefined,
+					undefined,
+					{ onGenerationProgress: options.onGenerationProgress },
+				),
+			10,
+			new AbortController().signal,
+		);
+		expect(result.text).toBe("tool result");
+		expect(generateAttempts).toBe(1);
+	});
 	test("beats once when the first attempt succeeds", async () => {
 		let beats = 0;
 		const result = await generateWithProgress(() => beats++);

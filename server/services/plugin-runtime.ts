@@ -154,6 +154,8 @@ export class ContentLengthFrameParser {
 	private readonly maxHeaderBytes: number;
 	private readonly maxBodyBytes: number;
 	private buffer: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
+	private body: Uint8Array | undefined;
+	private bodyReceived = 0;
 
 	constructor(options: ContentLengthFrameParserOptions = {}) {
 		this.maxHeaderBytes = options.maxHeaderBytes ?? DEFAULT_MAX_HEADER_BYTES;
@@ -171,10 +173,31 @@ export class ContentLengthFrameParser {
 			throw new TypeError("ContentLengthFrameParser.feed expects Uint8Array");
 		}
 		if (chunk.byteLength === 0) return [];
-		this.buffer = concatBytes(this.buffer, chunk);
 		const envelopes: JsonRpcEnvelope[] = [];
+		let offset = 0;
 
 		while (true) {
+			if (this.body !== undefined) {
+				const count = Math.min(this.body.byteLength - this.bodyReceived, chunk.byteLength - offset);
+				this.body.set(chunk.subarray(offset, offset + count), this.bodyReceived);
+				this.bodyReceived += count;
+				offset += count;
+				if (this.bodyReceived < this.body.byteLength) break;
+				const bodyBytes = this.body;
+				this.body = undefined;
+				this.bodyReceived = 0;
+				envelopes.push(parseEnvelope(decodeUtf8(bodyBytes, "invalid_utf8")));
+			}
+			if (offset === chunk.byteLength) break;
+
+			// Only the bounded header is concatenated; body chunks go directly into
+			// their single allocation after Content-Length has been validated.
+			const previousHeaderBytes = this.buffer.byteLength;
+			const headerEnd = Math.min(
+				chunk.byteLength,
+				offset + this.maxHeaderBytes + 4 - previousHeaderBytes,
+			);
+			this.buffer = concatBytes(this.buffer, chunk.subarray(offset, headerEnd));
 			const delimiter = findBytes(this.buffer, Uint8Array.of(13, 10, 13, 10));
 			if (delimiter < 0) {
 				if (this.buffer[0] === 0x7b || this.buffer[0] === 0x5b) {
@@ -221,14 +244,9 @@ export class ContentLengthFrameParser {
 				);
 			}
 
-			const bodyStart = delimiter + 4;
-			const frameEnd = bodyStart + contentLength;
-			if (this.buffer.byteLength < frameEnd) break;
-
-			const bodyBytes = this.buffer.slice(bodyStart, frameEnd);
-			this.buffer = this.buffer.slice(frameEnd);
-			const bodyText = decodeUtf8(bodyBytes, "invalid_utf8");
-			envelopes.push(parseEnvelope(bodyText));
+			offset += delimiter + 4 - previousHeaderBytes;
+			this.buffer = new Uint8Array(0);
+			this.body = new Uint8Array(contentLength);
 		}
 
 		return envelopes;
@@ -236,7 +254,7 @@ export class ContentLengthFrameParser {
 
 	/** Finish the stream and reject a partial header or body. */
 	end(): void {
-		if (this.buffer.byteLength !== 0) {
+		if (this.buffer.byteLength !== 0 || this.body !== undefined) {
 			throw new ContentLengthFrameError(
 				"incomplete_frame",
 				"RPC stream ended with an incomplete frame",
@@ -250,6 +268,8 @@ export class ContentLengthFrameParser {
 
 	reset(): void {
 		this.buffer = new Uint8Array(0);
+		this.body = undefined;
+		this.bodyReceived = 0;
 	}
 }
 
@@ -411,6 +431,8 @@ export interface RunnerStartOptions {
 	totalTimeoutMs?: number;
 	maxStderrBytes?: number;
 	maxStderrBytesPerSecond?: number;
+	/** Plugin-to-host budget, subject to the runner's explicit parser ceiling. */
+	maxInboundBodyBytes?: number;
 	/** Host-to-plugin budget; must not enlarge the stdout parser limit. */
 	maxOutboundBodyBytes?: number;
 }
@@ -474,6 +496,13 @@ export class LocalProcessRunner {
 
 	async start(options: RunnerStartOptions): Promise<PluginProcessHandle> {
 		validateCommand(options.command);
+		const maxInboundBodyBytes = Math.min(
+			options.maxInboundBodyBytes ?? this.options.maxBodyBytes ?? DEFAULT_MAX_FRAME_BYTES,
+			this.options.maxBodyBytes ?? Number.MAX_SAFE_INTEGER,
+		);
+		if (!Number.isSafeInteger(maxInboundBodyBytes) || maxInboundBodyBytes <= 0) {
+			throw new RangeError("maxInboundBodyBytes must be a positive safe integer");
+		}
 		const maxOutboundBodyBytes = Math.min(
 			options.maxOutboundBodyBytes ??
 				this.options.maxOutboundBodyBytes ??
@@ -519,7 +548,7 @@ export class LocalProcessRunner {
 			...((options.totalTimeoutMs ?? this.options.totalTimeoutMs)
 				? { totalTimeoutMs: options.totalTimeoutMs ?? this.options.totalTimeoutMs }
 				: {}),
-			maxBodyBytes: this.options.maxBodyBytes ?? DEFAULT_MAX_FRAME_BYTES,
+			maxBodyBytes: maxInboundBodyBytes,
 			maxOutboundBodyBytes,
 			maxStdoutBytes: this.options.maxStdoutBytes ?? DEFAULT_MAX_STDOUT_BYTES,
 			stderrRingBytes: this.options.stderrRingBytes ?? DEFAULT_STDERR_RING_BYTES,
@@ -1318,6 +1347,7 @@ export class PluginRuntime {
 				generation,
 				idleTimeoutMs: this.options.idleTimeoutMs,
 				totalTimeoutMs: this.options.totalTimeoutMs,
+				maxInboundBodyBytes: this.options.maxFrameBytes,
 				maxOutboundBodyBytes: this.options.maxOutboundFrameBytes ?? this.options.maxFrameBytes,
 			});
 			const injectedRequestHandler =

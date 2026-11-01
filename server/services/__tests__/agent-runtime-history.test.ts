@@ -345,6 +345,51 @@ for (const scenario of [
 	});
 }
 
+test("hydration may outlive the source-read deadline without rejecting a valid history", async () => {
+	const prefix = await import("../narrator-prefix-state");
+	const original = prefix.hydrateContextUpdates;
+	let now = Date.now();
+	const clock = spyOn(Date, "now").mockImplementation(() => now);
+	const hydration = spyOn(prefix, "hydrateContextUpdates").mockImplementation(async (...args) => {
+		const rows = await original(...args);
+		now += 11_000;
+		return rows;
+	});
+	try {
+		const built = await buildRuntimeHistory({
+			...options(),
+			deadline: now + 10_000,
+			sourceMessages: [message("input", "user", "large history survives hydration")],
+		});
+		expect(built.modelMessages[0].contentText).toBe("large history survives hydration");
+	} finally {
+		hydration.mockRestore();
+		clock.mockRestore();
+	}
+});
+
+test("cancellation after hydration still prevents provider history publication", async () => {
+	const prefix = await import("../narrator-prefix-state");
+	const original = prefix.hydrateContextUpdates;
+	const controller = new AbortController();
+	const hydration = spyOn(prefix, "hydrateContextUpdates").mockImplementation(async (...args) => {
+		const rows = await original(...args);
+		controller.abort(new Error("hydration cancelled"));
+		return rows;
+	});
+	try {
+		await expect(
+			buildRuntimeHistory({
+				...options(),
+				attachmentSignal: controller.signal,
+				sourceMessages: [message("input", "user", "cancelled")],
+			}),
+		).rejects.toThrow("hydration cancelled");
+	} finally {
+		hydration.mockRestore();
+	}
+});
+
 const HUMAN_QUESTION_CANARY = "human-answer-only-7c970c41";
 const questionInput = {
 	questions: [
@@ -875,6 +920,38 @@ test("reconciled epoch and raw candidates are reused without a second epoch quer
 	}
 });
 
+test("runtime retains the final merged prefix state rather than its pre-publication ancestor", async () => {
+	const prefix = await import("../narrator-prefix-state");
+	const ancestor = {};
+	const latest = {};
+	const load = spyOn(prefix, "loadPrefixState").mockResolvedValue({
+		baselinePrompt: "baseline",
+		parts: new Map(),
+		definitionSnapshots: [],
+		keepalive: latest,
+	});
+	try {
+		const built = await buildRuntimeHistory({
+			...options(),
+			sourceMessages: [],
+			toolLoading: {
+				managed: new Set(),
+				current: [],
+				candidates: [],
+				epoch: {
+					toolNames: [],
+					markerId: "epoch",
+					prefixState: ancestor,
+					prefix: { contract: "contract", parts: [], tools: "tools" },
+				},
+			},
+		});
+		expect(built.toolLoading?.prefixState).toBe(latest);
+	} finally {
+		load.mockRestore();
+	}
+});
+
 test("empty prompt keeps the accepted user in history and tool results never invent continuation", async () => {
 	const recovered = await buildRuntimeHistory({
 		...options(),
@@ -1139,7 +1216,9 @@ test.each([
 		const history = JSON.stringify(historical.history);
 		expect(history).toContain("logo.png");
 		expect(history).toContain("device: local");
-		expect(history).toContain(join(cwd, ".narrafork", "attached"));
+		expect(historyStrings(historical.history)).toContain(
+			JSON.stringify(join(cwd, ".narrafork", "attached")).slice(1, -1),
+		);
 		expect(history).toContain(mode === "relay" || mode === "official" ? '"type":"image"' : "image");
 		expect(readdirSync(join(cwd, ".narrafork", "attached"))).toHaveLength(1);
 		const recovered = await buildRuntimeHistory({ ...runtimeOptions, sourceMessages: [user] });

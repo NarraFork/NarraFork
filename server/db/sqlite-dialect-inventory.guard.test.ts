@@ -498,6 +498,8 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/agent-runtime/model-history-source.ts": ["driver"],
 	"server/services/agent-runtime/model-history-query.ts": ["driver"],
 	"server/services/agent-runtime/model-history-worker.ts": ["driver", "pragma"],
+	// Dual-backend snapshot worker: these capabilities belong to its SQLite branch.
+	"server/services/narrator-prefix-snapshots-worker.ts": ["driver", "pragma", "errorCode"],
 	"server/services/narrator-display-page-reader.ts": ["driver"],
 	"server/lib/db-worker/display-page-query.ts": ["driver"],
 	"server/services/agent-runtime/publication-outbox.ts": ["nativeClient", "rowid"],

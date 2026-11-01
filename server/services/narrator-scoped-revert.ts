@@ -379,7 +379,8 @@ async function revertNarratorScoped(
 						...(outcome.historyResult?.affectedNarratorIds ?? []),
 					]);
 					for (const id of reset) {
-						if (outcome.historyCommitted) resetActiveUpstreamSession(id);
+						if (outcome.historyCommitted)
+							resetActiveUpstreamSession(id, { persistedIdentityCleared: true });
 						broadcastToNarrator(id, { type: "full_reload", narratorId: id });
 					}
 					// Delivery senders only gain a message version; reload them without a reset.

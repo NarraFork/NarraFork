@@ -1,6 +1,10 @@
 import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { ImageViewerContext } from "@frontend/components/common/image-viewer-context";
 import { ApiError, api } from "@frontend/lib/api";
+import {
+	resetPromptOptimizeTasksForTest,
+	startPromptOptimizeTask,
+} from "@frontend/lib/prompt-optimize-tasks";
 import { flush, resetSessionStoreForTest, writeSession } from "@frontend/lib/session-store";
 import { MantineProvider } from "@mantine/core";
 import {
@@ -239,6 +243,7 @@ afterEach(async () => {
 	panelSpy.mockRestore();
 	updateSpy.mockRestore();
 	resetSessionStoreForTest();
+	resetPromptOptimizeTasksForTest();
 	for (const [key, descriptor] of previousGlobals) {
 		if (descriptor) Object.defineProperty(globalThis, key, descriptor);
 		else Reflect.deleteProperty(globalThis, key);
@@ -300,6 +305,35 @@ async function clickButton(label: string) {
 	await act(async () => button?.click());
 }
 
+test("switching a mounted composer waits for the target narrator's draft before delivering", async () => {
+	for (const [id, text] of [
+		["n1", "first"],
+		["n2", "second"],
+	]) {
+		persistNarratorInputDraft("u1", id, text, 1, "t1", [], { text, fileReferences: [] });
+	}
+	await render();
+	expect(handle.current?.getText()).toBe("first");
+	const document: ComposerDocument = {
+		version: 1,
+		paragraphs: [{ children: [{ type: "text", text: "second" }] }],
+		assets: [],
+	};
+	await act(async () => {
+		startPromptOptimizeTask({
+			narratorId: "n2",
+			text: "second",
+			snapshot: { document, selection: { start: 0, end: 0 }, token: "pending" },
+			style: "clarify",
+			withContext: false,
+			request: async () => ({ text: "SECOND" }),
+		});
+	});
+	testNarratorId = "n2";
+	await render();
+	expect(handle.current?.getText()).toBe("SECOND");
+	expect(readNarratorInputDraft("u1", "n1").text).toBe("first");
+});
 describe("composer local text attachment previews", () => {
 	test("opens the cached File without changing the draft, attachment membership, or persistence", async () => {
 		await render();

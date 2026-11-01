@@ -1,18 +1,6 @@
 /**
- * A plan-mode toggle landing between turns must re-format the tool array.
- *
- * `allTools` is built once per pass and `tools` (the provider-formatted array actually
- * sent) was only re-formatted on a provider/model switch. So when plan mode was toggled
- * manually mid-pass, the forbidden tools kept their normal descriptions for the rest of
- * the turn — the model saw nothing telling it to stop calling them, while the permission
- * gate (which re-reads the DB per call) was already denying them.
- *
- * Two things are pinned here, and the second is the one that breaks silently:
- *
- *   1. the descriptions do flip when `config.planMode` flips between turns;
- *   2. the tool NAME SET never changes. NUG requires history consistency, so dropping
- *      or renaming a tool mid-conversation corrupts the replayed history rather than
- *      producing a clean error.
+ * Plan-mode changes affect dynamic context and execution gates, never the immutable
+ * tool declarations. Names, schemas and descriptions must survive both directions.
  */
 
 import { afterAll, describe, expect, mock, test } from "bun:test";
@@ -21,12 +9,12 @@ import type { ProviderAdapter } from "../provider";
 import { toolRegistry } from "../tool-registry";
 import type { AgentConfig, AgentEvent } from "../types";
 
-/** Not in PLAN_MODE_ALLOWED_TOOLS, so plan mode must blank its description. */
+/** Not in PLAN_MODE_ALLOWED_TOOLS, so plan mode must enforce its execution gate without changing the description. */
 const FORBIDDEN_TOOL = "PlanToggleForbiddenTool";
 /** In PLAN_MODE_ALLOWED_TOOLS, so its description must survive plan mode untouched. */
 const ALLOWED_TOOL = "Read";
 
-const FORBIDDEN_DESCRIPTION = "Mutates the workspace; must be blanked in plan mode";
+const FORBIDDEN_DESCRIPTION = "Mutates the workspace; execution is restricted in plan mode";
 const ALLOWED_DESCRIPTION = "Reads a file; allowed in plan mode";
 
 /** Snapshot of each `formatTools` call: what the provider would have been sent. */
@@ -151,7 +139,7 @@ function resetRun(): void {
 }
 
 describe("plan mode tool descriptions", () => {
-	test("reports actual serialized tools once initially and again after a refresh", async () => {
+	test("counts declarations once even when plan mode changes", async () => {
 		resetRun();
 		livePlanMode = false;
 		const counts: number[] = [];
@@ -167,7 +155,7 @@ describe("plan mode tool descriptions", () => {
 			}),
 		);
 		expect(counts).toEqual(formattedToolCharacters);
-		expect(counts).toHaveLength(2);
+		expect(counts).toHaveLength(1);
 	});
 
 	test("does not count unchanged tools again on a later turn", async () => {
@@ -200,7 +188,7 @@ describe("plan mode tool descriptions", () => {
 		expect(events.some((event) => event.type === "error")).toBe(false);
 	});
 
-	test("blanks forbidden tool descriptions when plan mode is on at pass start", async () => {
+	test("retains forbidden tool descriptions when plan mode is on at pass start", async () => {
 		resetRun();
 		livePlanMode = true;
 
@@ -208,7 +196,7 @@ describe("plan mode tool descriptions", () => {
 
 		const first = formatToolsCalls[0];
 		expect(first).toBeDefined();
-		expect(describedTool(first ?? [], FORBIDDEN_TOOL)).not.toBe(FORBIDDEN_DESCRIPTION);
+		expect(describedTool(first ?? [], FORBIDDEN_TOOL)).toBe(FORBIDDEN_DESCRIPTION);
 		// An allowed tool keeps its real description, or the model loses the ability to plan.
 		expect(describedTool(first ?? [], ALLOWED_TOOL)).toBe(ALLOWED_DESCRIPTION);
 	});
@@ -223,7 +211,7 @@ describe("plan mode tool descriptions", () => {
 		expect(describedTool(first ?? [], FORBIDDEN_TOOL)).toBe(FORBIDDEN_DESCRIPTION);
 	});
 
-	test("re-formats tools when plan mode is toggled on between turns", async () => {
+	test("keeps declarations fixed when plan mode is toggled on between turns", async () => {
 		resetRun();
 		livePlanMode = false;
 
@@ -237,18 +225,17 @@ describe("plan mode tool descriptions", () => {
 			}),
 		);
 
-		expect(formatToolsCalls.length).toBeGreaterThanOrEqual(2);
+		expect(formatToolsCalls).toHaveLength(1);
 		const before = formatToolsCalls[0] ?? [];
 		const after = formatToolsCalls[formatToolsCalls.length - 1] ?? [];
 
 		expect(describedTool(before, FORBIDDEN_TOOL)).toBe(FORBIDDEN_DESCRIPTION);
-		expect(describedTool(after, FORBIDDEN_TOOL)).not.toBe(FORBIDDEN_DESCRIPTION);
-		// ⚠️ Load-bearing: names must be identical across the re-format. A changed name set
-		// corrupts the replayed history on NUG instead of failing loudly.
+		expect(describedTool(after, FORBIDDEN_TOOL)).toBe(FORBIDDEN_DESCRIPTION);
+		// Both names and definitions remain the original cache prefix.
 		expect(after.map((tool) => tool.name).sort()).toEqual(before.map((tool) => tool.name).sort());
 	});
 
-	test("re-formats tools when plan mode is toggled off between turns", async () => {
+	test("keeps declarations fixed when plan mode is toggled off between turns", async () => {
 		resetRun();
 		livePlanMode = true;
 
@@ -261,13 +248,12 @@ describe("plan mode tool descriptions", () => {
 			}),
 		);
 
-		expect(formatToolsCalls.length).toBeGreaterThanOrEqual(2);
+		expect(formatToolsCalls).toHaveLength(1);
 		const before = formatToolsCalls[0] ?? [];
 		const after = formatToolsCalls[formatToolsCalls.length - 1] ?? [];
 
-		expect(describedTool(before, FORBIDDEN_TOOL)).not.toBe(FORBIDDEN_DESCRIPTION);
-		// The exit direction: leaving the description blanked would keep the model refusing
-		// work the DB has already released.
+		expect(describedTool(before, FORBIDDEN_TOOL)).toBe(FORBIDDEN_DESCRIPTION);
+		// Leaving plan mode changes context, not the declaration.
 		expect(describedTool(after, FORBIDDEN_TOOL)).toBe(FORBIDDEN_DESCRIPTION);
 		expect(after.map((tool) => tool.name).sort()).toEqual(before.map((tool) => tool.name).sort());
 	});

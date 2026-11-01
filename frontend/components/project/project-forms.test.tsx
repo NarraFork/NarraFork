@@ -77,6 +77,7 @@ mock.module("@mantine/hooks", () => ({
 }));
 mock.module("react-i18next", () => ({ useTranslation: () => ({ t: (key: string) => key }) }));
 mock.module("@tanstack/react-query", () => ({
+	useMutation: () => mutation,
 	useQuery: () => ({ data: { paths: { defaultProjectDir: "/instance" }, agent: {} } }),
 	useQueryClient: () => ({ invalidateQueries: () => {} }),
 }));

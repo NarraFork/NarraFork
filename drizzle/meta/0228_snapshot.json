@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "1bb4656b-642f-4c44-aba6-d6fb495c11bc",
+  "id": "e2d2045b-1196-467c-9ac0-dc34403d1f01",
   "prevId": "1b635383-f2d5-4bb7-bcf6-afc3c6c039fb",
   "tables": {
     "acl_events": {
@@ -8432,13 +8432,6 @@
         },
         "images_json": {
           "name": "images_json",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
-        "media_json": {
-          "name": "media_json",
           "type": "text",
           "primaryKey": false,
           "notNull": false,
@@ -19321,6 +19314,22 @@
           "notNull": true,
           "autoincrement": false,
           "default": "'{}'"
+        },
+        "git_identity_context_menu": {
+          "name": "git_identity_context_menu",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": false
+        },
+        "git_identity_create_modal": {
+          "name": "git_identity_create_modal",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": false
         },
         "spec_tab_layout": {
           "name": "spec_tab_layout",

@@ -104,7 +104,7 @@ export const readTool: ToolDefinition = {
 		"- This tool can read Jupyter notebooks (.ipynb files) and returns all cells with their outputs, combining code, text, and visualizations.\n" +
 		"- This tool can only read files, not directories. To read a directory, use an ls command via the Bash tool.\n" +
 		"- If you read a file that exists but has empty contents you will receive a system reminder warning in place of file contents.",
-	rawJsonSchema: {
+	rawJsonSchema: withDeviceParam({
 		type: "object",
 		properties: {
 			file_path: {
@@ -130,10 +130,7 @@ export const readTool: ToolDefinition = {
 		},
 		required: ["file_path"],
 		additionalProperties: false,
-	},
-	getRawJsonSchema(config) {
-		return withDeviceParam(readTool.rawJsonSchema as Record<string, unknown>, config);
-	},
+	}),
 	parameters: z.object({
 		file_path: z
 			.string()

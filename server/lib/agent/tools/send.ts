@@ -1,11 +1,10 @@
-import { runtimePolicyForContext } from "@server/services/agent-runtime/policy";
 import { cleanAssistantText } from "@shared/citations";
 import { z } from "zod/v4";
-import type { AgentConfig, ToolContext, ToolDefinition, ToolResult } from "../types";
+import type { ToolContext, ToolDefinition, ToolResult } from "../types";
 
 /**
- * Offered to bot narrators only (see `buildRawJsonSchema`). The bot protocol itself is
- * in the bot's system prompt; this says what the field does when the model reaches it.
+ * Statically declared, but authorized only for bot narrators at execution time.
+ * The current bot protocol belongs in prompt context.
  */
 const USER_TARGET_DESCRIPTION =
 	"Bot only — your voice to people: the username of the person to message (the name in " +
@@ -25,7 +24,7 @@ const MODEL_DESCRIPTION =
 	"pool as the Agent call; a running subagent switches at its next model request. Combine with " +
 	"resume=true to retry a subagent that failed on its previous model.";
 
-function buildRawJsonSchema(config?: AgentConfig): Record<string, unknown> {
+function buildRawJsonSchema(): Record<string, unknown> {
 	const properties: Record<string, unknown> = {
 		id: {
 			description:
@@ -56,20 +55,9 @@ function buildRawJsonSchema(config?: AgentConfig): Record<string, unknown> {
 		},
 	};
 
-	const policy = runtimePolicyForContext(config);
-	if (policy.capabilities.spawnAgent) {
-		properties.resume = { description: RESUME_DESCRIPTION, type: "boolean" };
-		properties.model = { description: MODEL_DESCRIPTION, type: "string" };
-	}
-
-	// Only a bot speaks to people, so only a bot is offered the person target. An
-	// unassembled config (no runtime, as with the policy ceiling) sees the full schema.
-	if (!config || config.bot) {
-		properties.user = {
-			description: USER_TARGET_DESCRIPTION,
-			type: "string",
-		};
-	}
+	properties.resume = { description: RESUME_DESCRIPTION, type: "boolean" };
+	properties.model = { description: MODEL_DESCRIPTION, type: "string" };
+	properties.user = { description: USER_TARGET_DESCRIPTION, type: "string" };
 
 	return {
 		type: "object",
@@ -125,12 +113,7 @@ export const sendTool: ToolDefinition = {
 		resume: z.boolean().optional().describe(RESUME_DESCRIPTION),
 		model: z.string().optional().describe(MODEL_DESCRIPTION),
 	}),
-	get rawJsonSchema() {
-		return buildRawJsonSchema();
-	},
-	getRawJsonSchema(config?: AgentConfig) {
-		return buildRawJsonSchema(config);
-	},
+	rawJsonSchema: buildRawJsonSchema(),
 	async execute(args, ctx): Promise<ToolResult> {
 		const raw = args as {
 			id?: string;

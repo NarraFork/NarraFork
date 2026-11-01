@@ -186,7 +186,7 @@ export async function readSubtree(
  * read).
  */
 export async function loadBodies(
-	state: OutlinePageState,
+	state: Pick<OutlinePageState, "current" | "seq">,
 	nodes: readonly OutlineNode[],
 	options: { store?: OutlineStore } = {},
 ): Promise<void> {
@@ -231,7 +231,7 @@ function utf8(text: string): number {
  * `maxBytes` can never show a block past that point.
  */
 export async function loadBodiesWithin(
-	state: OutlinePageState,
+	state: Pick<OutlinePageState, "current" | "seq">,
 	order: readonly OutlineNode[],
 	maxBytes: number,
 	options: { store?: OutlineStore } = {},

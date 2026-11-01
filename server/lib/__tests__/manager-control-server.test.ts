@@ -30,6 +30,22 @@ const request = (path: string, init: RequestInit = {}) =>
 const authenticated = { headers: { authorization: `Bearer ${token}` } };
 const calls: string[] = [];
 
+/** Port 0 only asks the kernel for a port free on the public address. Another process (a
+ * parallel test worker) may already hold that number on 127.0.0.1, which is a genuine companion
+ * conflict that main.ts answers by moving to the next default port. A test that wants "any free
+ * port" does the same: retry with a fresh ephemeral port. A deterministic conflict still fails
+ * after the bounded attempts; explicit ports are never retried. */
+const EPHEMERAL_PORT_ATTEMPTS = 20;
+function onFreeEphemeralPort<T>(bind: () => T): T {
+	for (let attempt = 1; ; attempt++) {
+		try {
+			return bind();
+		} catch (error) {
+			if (attempt >= EPHEMERAL_PORT_ATTEMPTS || !isListenerPortConflict(error)) throw error;
+		}
+	}
+}
+
 function group(
 	options: {
 		port?: number;
@@ -39,6 +55,12 @@ function group(
 		dispatch?: (req: Request) => Response | Promise<Response>;
 	} = {},
 ) {
+	return options.port === undefined
+		? onFreeEphemeralPort(() => bindGroup(options))
+		: bindGroup(options);
+}
+
+function bindGroup(options: Parameters<typeof group>[0] = {}) {
 	const host = options.host ?? publicReportedHost;
 	const resource = startManagerListenerGroup({
 		bindPublic: () => {
@@ -157,14 +179,18 @@ describe("restricted same-port control listener", () => {
 	}
 
 	test("unmanaged LAN-only server does not add a listener", () => {
-		const resource = group({ token: null });
-		expect(resource.controlListener).toBeUndefined();
-		const independent = Bun.serve({
-			hostname: "127.0.0.1",
-			port: resource.port,
-			fetch: () => new Response(),
+		onFreeEphemeralPort(() => {
+			const resource = group({ token: null });
+			expect(resource.controlListener).toBeUndefined();
+			// Retried like group(): another process may own this loopback number. A companion that
+			// this group bound itself would conflict on every attempt and still fail the test.
+			const independent = Bun.serve({
+				hostname: "127.0.0.1",
+				port: resource.port,
+				fetch: () => new Response(),
+			});
+			resources.push(independent);
 		});
-		resources.push(independent);
 	});
 
 	test("TLS uses exactly the same key/certificate on both sockets", async () => {

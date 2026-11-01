@@ -11,7 +11,6 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { modelInputText } from "../../../tests/fixtures/model-input";
-import { getTestDb } from "../../../tests/setup";
 import {
 	narratorMessages,
 	narrators,
@@ -22,10 +21,9 @@ import {
 import type { PermissionResult } from "../../lib/agent";
 import type { DbMessage, ProviderAdapter } from "../../lib/agent/provider";
 
-const { db, sqlite } = getTestDb();
-const realDbModule = { ...(await import("../../db")) };
-// Bind the isolated DB before any runtime module (publication included) is loaded.
-mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
+// The snapshot worker shares the preload-isolated file-backed database.
+const { db, sqlite } = await import("../../db");
+const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
 const { registerExternalProviderResolver } = await import("../../lib/agent/provider");
 
 /**
@@ -121,9 +119,9 @@ function endLiveTurn(): void {
 const { getModelHistorySinceLastCompact } = (await import("../narrator-service")).narratorService;
 const { listInboxRows } = await import("../agent-runtime/inbox");
 
-afterAll(() => {
+afterAll(async () => {
+	await closePrefixSnapshotStore();
 	unregisterStubProvider();
-	mock.module("../../db", () => realDbModule);
 	mock.module("../../websocket/narrator-ws", () => realNarratorWsModule);
 	mock.module("../narrator-service", () => realNarratorServiceModule);
 	mock.restore();
@@ -258,14 +256,16 @@ function clearPersistedFeedbackFixture(): void {
 	})();
 }
 
-beforeEach(() => {
+beforeEach(async () => {
+	await closePrefixSnapshotStore();
 	clearPersistedFeedbackFixture();
 	pendingPermissions.clear();
 	pendingFeedback.clear();
 	endLiveTurn();
 });
 
-afterEach(() => {
+afterEach(async () => {
+	await closePrefixSnapshotStore();
 	pendingPermissions.clear();
 	pendingFeedback.clear();
 	endLiveTurn();

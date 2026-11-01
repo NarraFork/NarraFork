@@ -232,6 +232,16 @@ async function focusedComposer(page: Page) {
 			document.hasFocus() && document.activeElement === document.querySelector('[role="textbox"]'),
 	);
 }
+async function waitForCaretMove(page: Page, previousHead: number) {
+	// Rendering two frames does not guarantee that the browser's selectionchange
+	// has reached the editor state. Wait for the observable keyboard result instead.
+	await page.waitForFunction(
+		(head) => (window as unknown as FixtureWindow).fixture.caretProbe().head !== head,
+		{},
+		previousHead,
+	);
+	await settle(page);
+}
 async function open(viewport?: { width: number; height: number }) {
 	if (!browser || !server) throw new Error("Fixture unavailable");
 	const page = await browser.newPage();
@@ -622,6 +632,7 @@ test("arrow keys change visual lines before recalling input history", async () =
 			(window as unknown as FixtureWindow).fixture.caretProbe(),
 		);
 		await page.keyboard.press("ArrowUp");
+		await waitForCaretMove(page, middle.head);
 		await settledComposerLayout(page);
 		const moved = await page.evaluate(() =>
 			(window as unknown as FixtureWindow).fixture.caretProbe(),
@@ -664,14 +675,14 @@ test("arrow keys change visual lines before recalling input history", async () =
 			(window as unknown as FixtureWindow).fixture.caretProbe(),
 		);
 		await page.keyboard.press("ArrowUp");
-		await settle(page);
+		await waitForCaretMove(page, recalledEnd.head);
 		const recalledUp = await page.evaluate(() =>
 			(window as unknown as FixtureWindow).fixture.caretProbe(),
 		);
 		expect(recalledUp.text).toBe("hist1\nhist2\nhist3");
 		expect(recalledUp.top).toBeLessThan(recalledEnd.top - 4);
 		await page.keyboard.press("ArrowDown");
-		await settle(page);
+		await waitForCaretMove(page, recalledUp.head);
 		const recalledDown = await page.evaluate(() =>
 			(window as unknown as FixtureWindow).fixture.caretProbe(),
 		);
@@ -696,6 +707,7 @@ test("arrow keys change visual lines before recalling input history", async () =
 			(window as unknown as FixtureWindow).fixture.caretProbe(),
 		);
 		await page.keyboard.press("ArrowUp");
+		await waitForCaretMove(page, second.head);
 		await settledComposerLayout(page);
 		const previousParagraph = await page.evaluate(() =>
 			(window as unknown as FixtureWindow).fixture.caretProbe(),
@@ -1346,6 +1358,9 @@ test("file selection metadata still supports explicit #selection completion with
 	}
 });
 
+// Page boot/hydration and two completion openings share this deadline. Under four-core CPU
+// contention, opening/hydrating a page can take ~4.7s; keep each UI wait bounded at 5s and allow
+// the complete focus/Tab round trip the same 15s budget as the neighboring browser flows.
 for (const target of ["search", "monaco"] as const) {
 	test(`blurred mention completion cannot steal ${target} Tab and reopens only for its own editor`, async () => {
 		const page = await open();
@@ -1387,7 +1402,7 @@ for (const target of ["search", "monaco"] as const) {
 		} finally {
 			await close(page);
 		}
-	});
+	}, 15_000);
 }
 
 test("touch-to-mouse dismiss does not move the close target during pointerdown", async () => {

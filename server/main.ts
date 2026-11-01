@@ -1748,6 +1748,14 @@ import { startSkillCacheCleanupTimer } from "./services/skill-service";
 
 startSkillCacheCleanupTimer();
 
+// Small worker-owned batches reclaim unpublished or no-longer-referenced prefix snapshots.
+import {
+	closePrefixSnapshotStore,
+	startPrefixSnapshotMaintenance,
+} from "./services/narrator-prefix-snapshots";
+
+const stopPrefixSnapshotMaintenance = startPrefixSnapshotMaintenance();
+
 // Periodically remove expired/abandoned WebAuthn (passkey) ceremony challenges.
 import { startChallengeCleanupTimer } from "./lib/webauthn";
 
@@ -1999,6 +2007,7 @@ async function performGracefulShutdown(
 		);
 		getCodexManager().stopUsageRefreshScheduler();
 		stopScheduledTaskScheduler();
+		await shutdownStep(tracker, "prefixSnapshots.stop", stopPrefixSnapshotMaintenance);
 		await shutdownStep(tracker, "notificationFanout.stop", stopNotificationFanout);
 		await shutdownStep(tracker, "notificationMaintenance.stop", stopNotificationCenterMaintenance);
 		await shutdownStep(tracker, "terminalService.shutdownAll", () => terminalService.shutdownAll());
@@ -2013,6 +2022,7 @@ async function performGracefulShutdown(
 		// Read workers hold their own read-only SQLite connections; terminate them before the clean
 		// marker is written so no thread is still touching the database afterwards.
 		await shutdownStep(tracker, "dbWorkerPool.shutdown", () => shutdownDbWorkerPool());
+		await shutdownStep(tracker, "prefixSnapshots.close", closePrefixSnapshotStore);
 		// PostgreSQL: stop accepting new operations and close the client, in drain order — after
 		// HTTP/WS handlers have drained, before the lock release below. A no-op on the SQLite
 		// backend, so the SQLite teardown sequence is neither extended nor bypassed.

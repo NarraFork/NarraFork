@@ -14,6 +14,7 @@ import {
 	restoreSessionFromHandoff,
 	snapshotSessionsForHandoff,
 } from "../session";
+import { closeTab, targetIdOf } from "../tab-scope";
 
 const TIMEOUT = 8_000;
 let ownedBrowser: Browser | undefined;
@@ -21,7 +22,7 @@ try {
 	ownedBrowser = await getBrowser(true);
 } catch (error) {
 	// A broken installed Chrome is a failure, not a skipped test.
-	if (!(error instanceof Error) || !error.message.startsWith("Could not find Chrome/Chromium.")) {
+	if (!(error instanceof Error) || !error.message.startsWith("Could not find Chrome/Chromium")) {
 		throw error;
 	}
 	console.warn("Skipping real-Chrome dialog integration tests: Chrome/Chromium not installed");
@@ -415,5 +416,156 @@ describe("native dialogs against real Chrome", () => {
 			}
 		},
 		40_000,
+	);
+});
+
+// 有头会话与用户标签共处默认 context；无头浏览器里同样的默认 context 足以验证归属边界。
+describe("sessions sharing the default context", () => {
+	async function sharedPage(path = "/"): Promise<Page> {
+		const page = await required(ownedBrowser).defaultBrowserContext().newPage();
+		await page.goto(url(path));
+		return page;
+	}
+
+	chromeTest(
+		"protects the session's tab tree and leaves other tabs' dialogs alone",
+		async () => {
+			const context = required(ownedBrowser).defaultBrowserContext();
+			const ours = await sharedPage();
+			const theirs = await sharedPage();
+			const records: string[] = [];
+			try {
+				await installDialogProtection(context, (text) => records.push(text), ours.target());
+				// 后台标签不渲染，直接用 page.click 时要先把它切到前台
+				await ours.bringToFront();
+				for (const selector of ["#open", "#blank"]) {
+					const popupTarget = context.waitForTarget((t) => t.url() === url("/popup"), {
+						timeout: TIMEOUT,
+					});
+					await bounded(ours.click(selector), `open ${selector}`);
+					const popup = required(await bounded((await popupTarget).page(), "popup page"));
+					await bounded(
+						popup.waitForFunction(() => document.documentElement.dataset.ready === "yes"),
+						`${selector} popup resumed`,
+					);
+					await popup.close();
+				}
+				await waitFor(
+					() => records.filter((text) => text.includes("Automatically dismissed")).length >= 2,
+					"popup dialogs dismissed",
+				);
+
+				const dialog = new Promise<import("puppeteer-core").Dialog>((resolve) =>
+					theirs.once("dialog", resolve),
+				);
+				const evaluation = theirs.evaluate(() => alert("theirs-alert"));
+				const pending = await bounded(dialog, "foreign dialog opening");
+				// 我们的保护若越界，这里会因对话框已被关掉而失败
+				await bounded(pending.dismiss(), "foreign dialog left for its owner");
+				await evaluation;
+				expect(records.some((text) => text.includes("theirs-alert"))).toBe(false);
+			} finally {
+				await closeTab(context, ours.target());
+				expect(ours.isClosed()).toBe(true);
+				expect(theirs.isClosed()).toBe(false);
+				await theirs.close();
+			}
+		},
+		30_000,
+	);
+
+	chromeTest(
+		"retains popup ownership and protection after an intermediate tab closes",
+		async () => {
+			const context = required(ownedBrowser).defaultBrowserContext();
+			const ours = await sharedPage();
+			const theirs = await sharedPage();
+			const records: string[] = [];
+			const popups: Page[] = [];
+			async function openPopup(opener: Page): Promise<Page> {
+				const pending = new Promise<Page | null>((resolve) => opener.once("popup", resolve));
+				await opener.evaluate(() => window.open("about:blank"));
+				const popup = required(await bounded(pending, "nested popup"));
+				popups.push(popup);
+				return popup;
+			}
+			try {
+				await installDialogProtection(context, (text) => records.push(text), ours.target());
+				const middle = await openPopup(ours);
+				const leaf = await openPopup(middle);
+				await middle.close();
+				expect(leaf.target().opener()).toBeUndefined();
+				const descendant = await openPopup(leaf);
+				expect(
+					await bounded(
+						descendant.evaluate(() => confirm("orphan-descendant")),
+						"dialog",
+					),
+				).toBe(false);
+				await waitFor(
+					() => records.some((text) => text.includes("orphan-descendant")),
+					"descendant dialog protected",
+				);
+				await closeTab(context, ours.target());
+				expect(ours.isClosed()).toBe(true);
+				expect(leaf.isClosed()).toBe(true);
+				expect(descendant.isClosed()).toBe(true);
+				expect(theirs.isClosed()).toBe(false);
+			} finally {
+				await Promise.all([ours, theirs, ...popups].map((page) => page.close().catch(() => {})));
+			}
+		},
+		30_000,
+	);
+
+	chromeTest(
+		"restores a shared-context session by its root tab after reconnect",
+		async () => {
+			const ours = await sharedPage();
+			const theirs = await sharedPage();
+			const theirsId = targetIdOf(theirs.target());
+			await ours.evaluate(() => {
+				document.documentElement.dataset.handoff = "survived";
+			});
+			const handoff = {
+				sessionId: `shared-${crypto.randomUUID().slice(0, 8)}`,
+				narratorId: `test-shared-handoff-${crypto.randomUUID()}`,
+				url: url(),
+				currentPageUrl: url(),
+				targetId: targetIdOf(ours.target()),
+				headless: false,
+				ttlMs: 60_000,
+				networkCaptureEnabled: false,
+			};
+			await required(ownedBrowser).disconnect();
+			ownedBrowser = await connectBrowser(true, required(endpoint));
+			expect(await bounded(restoreSessionFromHandoff(ownedBrowser, handoff), "restore")).toEqual({
+				ok: true,
+			});
+			const restored = required(getSession(handoff.narratorId, handoff.sessionId));
+			expect(await restored.page.evaluate(() => document.documentElement.dataset.handoff)).toBe(
+				"survived",
+			);
+			expect(
+				(await actions.evaluate(restored, "confirm('shared')", { timeout: TIMEOUT })).result,
+			).toBe("false");
+			await assertDialog(restored, "shared");
+			// 另一个标签占了前台时，会话动作仍能完成
+			const foreground = await required(ownedBrowser).defaultBrowserContext().newPage();
+			expect(await restored.page.evaluate(() => document.visibilityState)).toBe("hidden");
+			await bounded(subsequentAction(restored), "click in a background tab");
+			await foreground.close();
+			await closeSession(handoff.narratorId, handoff.sessionId);
+			const remaining = required(ownedBrowser)
+				.targets()
+				.map((target) => targetIdOf(target));
+			expect(remaining).not.toContain(handoff.targetId);
+			expect(remaining).toContain(theirsId);
+			const theirsAgain = required(ownedBrowser)
+				.targets()
+				.find((t) => targetIdOf(t) === theirsId);
+			await (await theirsAgain?.page())?.close();
+		},
+		30_000,
 	);
 });

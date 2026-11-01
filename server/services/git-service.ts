@@ -3,6 +3,14 @@ import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+	GIT_BRANCH_LIST_LIMIT,
+	type GitBranches,
+	isValidGitBranchName,
+	isValidGitRemoteName,
+	isValidGitStartPoint,
+	matchingRemoteName,
+} from "@shared/git-branches";
+import {
 	GIT_COMMIT_PREVIEW_PATCH_MAX_BYTES,
 	GIT_COMMIT_SHA_PATTERN,
 	type GitCommitDetail,
@@ -20,6 +28,11 @@ import { logger } from "../lib/logger";
 import { envWithAmbientProxy } from "../lib/net/proxy-env";
 import { DEV_NULL } from "../lib/platform";
 import { safeSpawn } from "../lib/spawn";
+import {
+	GIT_BRANCH_OUTPUT_KEYS,
+	GIT_BRANCH_REF_FORMAT,
+	parseGitBranches,
+} from "./git-branch-listing";
 import {
 	assertSingleFilePatch,
 	buildCommitDetail,
@@ -85,6 +98,15 @@ interface ExecOptions {
 	 * — see the note in {@link exec}.
 	 */
 	identity?: GitIdentityEnv | null;
+	/**
+	 * The command talks to a remote (push/fetch).
+	 *
+	 * Two things change and nothing else: the user's ambient proxy environment is
+	 * restored (the server blanks it for its own outbound HTTP), and
+	 * `GIT_TERMINAL_PROMPT=0` is set so an unreachable credential helper fails
+	 * instead of waiting for a terminal prompt until the write budget expires.
+	 */
+	network?: boolean;
 }
 
 /** Commit-writing methods take this to attribute the commit to a real person. */
@@ -279,6 +301,63 @@ function commandOutputMentionsConflict(result: ExecResult): boolean {
 	return output.includes("conflict") || output.includes("冲突");
 }
 
+/**
+ * How git phrases "the remote did not accept your credentials", across transports.
+ *
+ * Matched case-insensitively against the whole output because the wording differs
+ * between HTTPS, SSH and the credential-helper paths, and git puts it in `fatal:`
+ * lines rather than in a field.
+ */
+const NETWORK_AUTH_FAILURE_MARKERS = [
+	"authentication failed",
+	"could not read username",
+	"could not read password",
+	"terminal prompts disabled",
+	"invalid credentials",
+	"logon failed",
+	"permission denied (publickey)",
+];
+
+/** Network failures are shown to a human, not parsed; 1 KB is plenty and bounded. */
+const MAX_NETWORK_FAILURE_CHARS = 1024;
+
+function clampNetworkFailureOutput(output: string): string {
+	if (output.length <= MAX_NETWORK_FAILURE_CHARS) return output;
+	return `${output.slice(0, MAX_NETWORK_FAILURE_CHARS)}\n...[truncated]`;
+}
+
+/**
+ * Turn a failed push/fetch into an error the caller can act on.
+ *
+ * A rejected non-fast-forward is git explaining exactly what happened, so the text
+ * passes through untouched — this is why no `--force` is ever offered. Credential
+ * failures become 401 so the UI can separate "configure credentials on this device"
+ * from "the remote refused the ref".
+ *
+ * Exported for its own unit test: the interesting inputs are git's several credential
+ * phrasings, which a fixture repository cannot produce without a real network.
+ */
+/** Credential failure, or null when the text is some other git refusal. */
+export function gitAuthFailure(output: string): GitAuthError | null {
+	const lowered = output.toLowerCase();
+	if (!NETWORK_AUTH_FAILURE_MARKERS.some((marker) => lowered.includes(marker))) return null;
+	const fatal = output
+		.split("\n")
+		.map((line) => line.trim())
+		.find((line) => /^fatal:/i.test(line));
+	return new GitAuthError(clampNetworkFailureOutput(fatal ?? output) || undefined);
+}
+
+export function gitNetworkFailure(prefix: string, result: ExecResult): AppError {
+	const output = combinedCommandOutput(result);
+	return (
+		gitAuthFailure(output) ??
+		(output
+			? new GitError(`${prefix}: ${clampNetworkFailureOutput(output)}`)
+			: new GitError(`${prefix} (exit code ${result.exitCode})`))
+	);
+}
+
 function normalizeExecOptions(options: boolean | ExecOptions = {}): ExecOptions {
 	if (typeof options === "boolean") return { silent: options, optionalLocks: true };
 	return {
@@ -287,7 +366,30 @@ function normalizeExecOptions(options: boolean | ExecOptions = {}): ExecOptions 
 		timeout: options.timeout,
 		maxOutputBytes: options.maxOutputBytes,
 		identity: options.identity,
+		network: options.network ?? false,
 	};
+}
+
+/**
+ * Environment for a command that talks to a remote.
+ *
+ * The user's own credentials, proxy and SSH agent must drive it, so the ambient
+ * proxy snapshot is restored exactly as `cloneRepoStreaming` already does. The
+ * prompt guard is not cosmetic: with a credential helper asking for input, the
+ * command would sit there until the 120 s write budget killed it, and the user
+ * would see a timeout instead of "authentication failed".
+ *
+ * `LC_ALL=C` keeps that refusal in the English phrasing {@link gitAuthFailure}
+ * matches. Push and fetch are the only commands that take this environment, so
+ * the rest of git's user-facing text stays in the process locale.
+ */
+function networkGitEnv(identity?: GitIdentityEnv | null): Record<string, string | undefined> {
+	return envWithAmbientProxy({
+		GIT_TERMINAL_PROMPT: "0",
+		LC_ALL: "C",
+		LANG: "C",
+		...(identity ?? {}),
+	});
 }
 
 /**
@@ -314,7 +416,7 @@ async function exec(
 	// canonical cwd, so a path alias re-pointed during an await cannot redirect the
 	// command. Outside a reservation the path passes through unchanged.
 	cwd = await lifecycleCreationPath(cwd);
-	const { silent, optionalLocks, timeout, maxOutputBytes, identity } =
+	const { silent, optionalLocks, timeout, maxOutputBytes, identity, network } =
 		normalizeExecOptions(options);
 	const request = gitRequestContext.getStore();
 	request?.signal?.throwIfAborted();
@@ -347,9 +449,13 @@ async function exec(
 			// `Bun.spawn`'s `env` REPLACES the environment rather than merging into it,
 			// so an identity has to be layered over `process.env` explicitly — passing
 			// the four `GIT_*` variables alone would strip PATH/HOME and break git.
-			// Omitted entirely when there is no identity: that keeps the no-identity
-			// path byte-for-byte identical to the behaviour before this existed.
-			env: identity ? { ...process.env, ...identity } : undefined,
+			// Omitted entirely when neither applies: that keeps the historical
+			// no-identity, no-network path byte-for-byte identical.
+			env: network
+				? networkGitEnv(identity)
+				: identity
+					? { ...process.env, ...identity }
+					: undefined,
 		});
 		const truncated = result.stdoutTruncated === true || result.stderrTruncated === true;
 		const trimmedStdout = stripTrailingLineBreaks(
@@ -560,6 +666,81 @@ async function readCommitMeta(repoPath: string, sha: string): Promise<CommitMeta
 	if (result.exitCode !== 0)
 		throw new GitError(gitFailureMessage("Git commit metadata failed", result));
 	return parseCommitMeta(result.stdout, result.truncated === true);
+}
+
+async function readRemoteNames(worktreePath: string): Promise<string[]> {
+	const result = await execRead(["remote"], worktreePath, true);
+	if (result.exitCode !== 0)
+		throw new GitError(gitFailureMessage("Git remote listing failed", result));
+	return result.stdout
+		.split("\n")
+		.map((name) => name.trim())
+		.filter(Boolean);
+}
+
+/**
+ * Which remote a push/fetch targets.
+ *
+ * A requested name is checked against the configured remotes before it reaches git:
+ * it can otherwise be any string the caller likes, and an unknown value would only
+ * surface as a confusing git error. Without a request the current branch's own
+ * upstream wins, then `origin`, then a repository that has exactly one remote.
+ * Anything else is a configuration the user has to fix, so it is a 422 instead of a
+ * git failure — no remote is not a transient condition.
+ */
+async function resolveNetworkRemote(worktreePath: string, requested?: string): Promise<string> {
+	const remotes = await readRemoteNames(worktreePath);
+	if (requested) {
+		if (!remotes.includes(requested)) throw new ValidationError(`Unknown Git remote: ${requested}`);
+		return requested;
+	}
+	const upstream = await execRead(
+		["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}"],
+		worktreePath,
+		true,
+	);
+	const upstreamName = upstream.exitCode === 0 ? upstream.stdout.trim() : "";
+	const upstreamRemote = upstreamName ? matchingRemoteName(remotes, upstreamName) : null;
+	if (upstreamRemote) return upstreamRemote;
+	if (remotes.includes("origin")) return "origin";
+	const [sole] = remotes;
+	if (remotes.length === 1 && sole) return sole;
+	if (remotes.length === 0)
+		throw new AppError("This repository has no Git remote configured", 422, "GIT_NO_REMOTE");
+	throw new AppError(
+		"Cannot choose a Git remote; configure an upstream or pass a remote",
+		422,
+		"GIT_REMOTE_AMBIGUOUS",
+	);
+}
+
+/**
+ * Where a push of `branch` should land when `remote` is the one it tracks.
+ *
+ * `branch.<name>.merge` is the upstream branch (`refs/heads/master` while the
+ * local branch is `main`). Without that config the remote branch keeps the
+ * local name. A destination that is not a branch name is refused rather than
+ * spliced into the refspec.
+ */
+async function trackedPushDestination(
+	worktreePath: string,
+	branch: string,
+	remote: string,
+): Promise<string> {
+	const configuredRemote = await execRead(
+		["config", "--get", `branch.${branch}.remote`],
+		worktreePath,
+		true,
+	);
+	if (configuredRemote.exitCode !== 0 || configuredRemote.stdout.trim() !== remote) return branch;
+	const merge = await execRead(["config", "--get", `branch.${branch}.merge`], worktreePath, true);
+	if (merge.exitCode !== 0) return branch;
+	const ref = merge.stdout.trim();
+	if (!ref.startsWith("refs/heads/")) return branch;
+	const dest = ref.slice("refs/heads/".length);
+	if (!isValidGitBranchName(dest) || !isValidGitRemoteName(remote))
+		throw new ValidationError("Invalid Git branch name");
+	return dest;
 }
 
 export const gitService = {
@@ -1264,6 +1445,161 @@ export const gitService = {
 					parents: (parentsRaw ?? "").trim().split(/\s+/).filter(Boolean),
 				};
 			});
+	},
+
+	// === Branches ===
+
+	/**
+	 * Every local and remote branch with upstream tracking and worktree occupancy.
+	 *
+	 * Not cached and not part of the status poll: the panel reads it when it opens,
+	 * and one listing is six git processes — repeating that at the 1/s `git_status`
+	 * push rate would be the single most expensive thing the panel does.
+	 */
+	async getBranches(worktreePath: string): Promise<GitBranches> {
+		const options = { timeout: READ_TIMEOUT_MS, maxOutputBytes: 256 * 1024 };
+		// `--count` bounds the walk, so the most recently committed refs are the ones
+		// kept; the parser applies the same cap again and reports the truncation.
+		// The format must be spelled `--format=…`: as a bare argument for-each-ref
+		// reads it as a ref PATTERN and silently prints its default columns instead.
+		const refArgs = (prefix: string) => [
+			"for-each-ref",
+			"--sort=-committerdate",
+			`--count=${GIT_BRANCH_LIST_LIMIT + 1}`,
+			`--format=${GIT_BRANCH_REF_FORMAT}`,
+			prefix,
+		];
+		const [heads, remoteRefs, worktrees, remotes, head, branch] = await Promise.all([
+			execRead(refArgs("refs/heads"), worktreePath, true, options),
+			execRead(refArgs("refs/remotes"), worktreePath, true, options),
+			execRead(["worktree", "list", "--porcelain"], worktreePath, true, options),
+			execRead(["remote"], worktreePath, true, options),
+			// Exit code 1 is the documented answer for "no commit yet" ...
+			execRead(["rev-parse", "--verify", "--quiet", "HEAD"], worktreePath, true, options),
+			// ... and for "detached HEAD". Neither is an error here.
+			execRead(["symbolic-ref", "--quiet", "--short", "HEAD"], worktreePath, true, options),
+		]);
+		for (const listing of [heads, remoteRefs, worktrees, remotes]) {
+			if (listing.exitCode !== 0)
+				throw new GitError(gitFailureMessage("Git branch listing failed", listing));
+		}
+		return parseGitBranches({
+			[GIT_BRANCH_OUTPUT_KEYS.heads]: heads.stdout,
+			[GIT_BRANCH_OUTPUT_KEYS.remoteRefs]: remoteRefs.stdout,
+			[GIT_BRANCH_OUTPUT_KEYS.remoteNames]: remotes.stdout,
+			[GIT_BRANCH_OUTPUT_KEYS.worktrees]: worktrees.stdout,
+			[GIT_BRANCH_OUTPUT_KEYS.headSha]: head.exitCode === 0 ? head.stdout : "",
+			[GIT_BRANCH_OUTPUT_KEYS.branch]: branch.exitCode === 0 ? branch.stdout : "",
+			truncated:
+				heads.truncated || remoteRefs.truncated || worktrees.truncated || remotes.truncated,
+		});
+	},
+
+	/**
+	 * Check out an existing local branch, track a remote one, or create a new one.
+	 *
+	 * `check-ref-format --branch` is not redundant with the route's validator: it is
+	 * git's own authority, and this is the last point before a ref is created. Git's
+	 * refusal text is surfaced unchanged, including "already checked out at <path>",
+	 * which is the one message that explains why a switch in another worktree fails.
+	 */
+	async checkoutBranch(
+		worktreePath: string,
+		options: { branch: string; create?: boolean; startPoint?: string },
+	): Promise<void> {
+		return withWorktreeLock(worktreePath, async () => {
+			const format = await exec(
+				["check-ref-format", "--branch", options.branch],
+				worktreePath,
+				true,
+			);
+			if (format.exitCode !== 0) throw new ValidationError("Invalid Git branch name");
+			if (options.create) {
+				const start = options.startPoint ?? "HEAD";
+				if (!isValidGitStartPoint(start)) throw new ValidationError("Invalid Git start point");
+				// `--track` forces the upstream even when branch.autoSetupMerge is false.
+				// A plain revision (`HEAD`, `main~1`) is not a remote-tracking ref.
+				const tracksRemote =
+					(
+						await exec(
+							["show-ref", "--verify", "--quiet", `refs/remotes/${start}`],
+							worktreePath,
+							true,
+						)
+					).exitCode === 0;
+				const args = tracksRemote
+					? ["checkout", "-b", options.branch, "--track", start, "--"]
+					: ["checkout", "-b", options.branch, start, "--"];
+				const result = await exec(args, worktreePath);
+				if (result.exitCode !== 0)
+					throw new GitError(gitFailureMessage("git checkout failed", result));
+				return;
+			}
+			const refExists = async (ref: string) =>
+				(await exec(["show-ref", "--verify", "--quiet", ref], worktreePath, true)).exitCode === 0;
+			let args: string[];
+			if (await refExists(`refs/heads/${options.branch}`))
+				args = ["checkout", options.branch, "--"];
+			else if (await refExists(`refs/remotes/${options.branch}`))
+				// `--track` derives the local name from the remote ref and sets upstream.
+				args = ["checkout", "--track", options.branch, "--"];
+			else
+				throw new AppError(`Git branch not found: ${options.branch}`, 404, "GIT_BRANCH_NOT_FOUND");
+			const result = await exec(args, worktreePath);
+			if (result.exitCode !== 0)
+				throw new GitError(gitFailureMessage("git checkout failed", result));
+		});
+	},
+
+	/**
+	 * Push the current branch to its remote, optionally establishing the upstream.
+	 *
+	 * The refspec is spelled out and always without `+`, so a non-fast-forward is
+	 * reported to the user instead of being forced. When the branch tracks a
+	 * differently named upstream (`main` → `origin/master`), the destination is
+	 * that upstream branch. `silent` keeps git's output out of the log: an HTTPS
+	 * remote prints its URL there, which can carry a user name.
+	 */
+	async push(
+		worktreePath: string,
+		options: { remote?: string; setUpstream?: boolean } = {},
+	): Promise<void> {
+		return withWorktreeLock(worktreePath, async () => {
+			const head = await execRead(
+				["symbolic-ref", "--quiet", "--short", "HEAD"],
+				worktreePath,
+				true,
+			);
+			const branch = head.stdout.trim();
+			if (head.exitCode !== 0 || !branch)
+				throw new AppError(
+					"Cannot push from a detached HEAD; check out a branch first",
+					409,
+					"GIT_DETACHED_HEAD",
+				);
+			const remote = await resolveNetworkRemote(worktreePath, options.remote);
+			const dest = await trackedPushDestination(worktreePath, branch, remote);
+			const args = ["push", "--porcelain"];
+			if (options.setUpstream) args.push("--set-upstream");
+			args.push(remote, `refs/heads/${branch}:refs/heads/${dest}`);
+			const result = await exec(args, worktreePath, { network: true, silent: true });
+			if (result.exitCode !== 0) throw gitNetworkFailure("git push failed", result);
+		});
+	},
+
+	/** Refresh remote-tracking refs, optionally pruning the ones the remote dropped. */
+	async fetch(
+		worktreePath: string,
+		options: { remote?: string; prune?: boolean } = {},
+	): Promise<void> {
+		return withWorktreeLock(worktreePath, async () => {
+			const remote = await resolveNetworkRemote(worktreePath, options.remote);
+			const args = ["fetch"];
+			if (options.prune) args.push("--prune");
+			args.push(remote);
+			const result = await exec(args, worktreePath, { network: true, silent: true });
+			if (result.exitCode !== 0) throw gitNetworkFailure("git fetch failed", result);
+		});
 	},
 
 	// === Reset ===

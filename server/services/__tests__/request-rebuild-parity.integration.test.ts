@@ -18,8 +18,12 @@ import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from "b
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { drizzle } from "drizzle-orm/bun-sqlite";
 import { z } from "zod";
 import { cleanDb, getTestDb } from "../../../tests/setup";
+import { openSchemaCopyAt } from "../../../tests/sqlite-schema-image";
+import * as relations from "../../db/relations";
+import * as schema from "../../db/schema";
 import { narrators, users } from "../../db/schema";
 import { AnthropicProvider } from "../../lib/agent/anthropic-provider";
 import { GeminiInteractionsProvider } from "../../lib/agent/gemini-interactions-provider";
@@ -28,7 +32,19 @@ import { OpenAIProvider } from "../../lib/agent/openai-provider";
 import type { ChatParams, ParsedStreamEvent, ProviderAdapter } from "../../lib/agent/provider";
 import { setUploadsDirForTests } from "../../lib/uploads";
 
-const { db, sqlite } = getTestDb();
+const databaseRoot = mkdtempSync(join(tmpdir(), "nf-parity-database-"));
+const template = getTestDb();
+const sqlite = openSchemaCopyAt(template.sqlite, join(databaseRoot, "parity.sqlite"));
+// Schema images omit triggers; retain the migrated fixture's real history/queue behavior.
+for (const trigger of template.sqlite
+	.query<{ sql: string }, []>(
+		"SELECT sql FROM sqlite_master WHERE type = 'trigger' AND sql IS NOT NULL",
+	)
+	.all())
+	sqlite.exec(trigger.sql);
+template.sqlite.close();
+sqlite.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 100");
+const db = drizzle({ client: sqlite, schema: { ...schema, ...relations } });
 const realDb = { ...(await import("../../db")) };
 mock.module("../../db", () => ({ ...realDb, db, sqlite }));
 const { registerExternalProviderResolver } = await import("../../lib/agent/provider");
@@ -38,6 +54,9 @@ const { startNarratorRun } = await import("../agent-runtime/run");
 const { getExecutionOwner } = await import("../agent-runtime/ownership");
 const { activeNarrators } = await import("../narrator-session-state");
 const { buildRuntimeHistory } = await import("../agent-runtime/history");
+const { clearModelHistorySourceCacheForTest } = await import(
+	"../agent-runtime/model-history-source"
+);
 
 const TOOL = "ParityProbe";
 const IMAGE_TOOL = "ParityCapture";
@@ -178,6 +197,7 @@ toolRegistry.register({
 let cwd = "";
 const originalMaxTurns = settings.agent.maxTurns;
 beforeEach(() => {
+	clearModelHistorySourceCacheForTest();
 	cleanDb(sqlite);
 	cwd = mkdtempSync(join(tmpdir(), "nf-request-parity-"));
 	setUploadsDirForTests(join(cwd, "uploads"));
@@ -188,7 +208,8 @@ beforeEach(() => {
 		.values({ id: "owner", username: "owner", passwordHash: "x", createdAt: NOW })
 		.run();
 });
-afterEach(() => {
+afterEach(async () => {
+	await (await import("../narrator-prefix-snapshots")).closePrefixSnapshotStore();
 	getExecutionOwner(NARRATOR)?.release();
 	activeNarrators.delete(NARRATOR);
 	setUploadsDirForTests(null);
@@ -199,7 +220,10 @@ afterAll(() => {
 	unregister();
 	toolRegistry.unregister(TOOL);
 	toolRegistry.unregister(IMAGE_TOOL);
+	clearModelHistorySourceCacheForTest();
 	mock.module("../../db", () => realDb);
+	sqlite.close();
+	rmSync(databaseRoot, { recursive: true, force: true });
 });
 
 function call(id: string, value: string): ParsedStreamEvent {

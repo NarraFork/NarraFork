@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { awaitTool, listRunningAwaits } from "@server/lib/agent/tools/await";
 import { sendTool } from "@server/lib/agent/tools/send";
-import type { AgentConfig, ToolContext } from "@server/lib/agent/types";
+import type { ToolContext } from "@server/lib/agent/types";
 import {
 	compileDelegationPolicy,
 	type DelegationTemplateInput,
@@ -55,8 +55,6 @@ describe("shared capability projections", () => {
 		test(`${index}: ${input?.template ?? "undeclared"}: tools, schemas, hints and service guards agree`, () => {
 			const policy = policyOf(input);
 			const child = input !== null;
-			// Schemas read the attached ceiling only; a parent id must not change them.
-			const config = { parentNarratorId: "parent", runtimePolicy: policy } as AgentConfig;
 			const custom = input?.customDefinition
 				? {
 						...input.customDefinition,
@@ -83,15 +81,15 @@ describe("shared capability projections", () => {
 				expect(filter?.(tool)).toBe(!child);
 				expect(filter?.(tool)).toBe(isRuntimeToolAllowed(policy, name));
 			}
-			const sendProperties = sendTool.getRawJsonSchema?.(config).properties as Record<
-				string,
-				unknown
-			>;
-			const awaitProperties = awaitTool.getRawJsonSchema?.(config).properties as {
+			const sendProperties = sendTool.rawJsonSchema?.properties as Record<string, unknown>;
+			const awaitProperties = awaitTool.rawJsonSchema?.properties as {
 				type: { enum: string[] };
 			};
 			expect(sendProperties.await).toBeUndefined();
-			expect(awaitProperties.type.enum).toEqual(runtimeAwaitTargets(policy));
+			expect(awaitProperties.type.enum).toEqual(["agent", "bash", "transfer", "question"]);
+			for (const target of runtimeAwaitTargets(policy)) {
+				expect(awaitProperties.type.enum).toContain(target);
+			}
 			expect(awaitProperties.type.enum).toContain("question");
 			const awaitGuard = () => assertRuntimeCanAwaitAgent(policy);
 			if (child) {

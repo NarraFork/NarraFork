@@ -43,7 +43,9 @@ function summarize(skills: SkillSummaryInfo[]): SkillSummaryCacheEntry[] {
 	);
 }
 
-function contextFromConfig(config: AgentConfig): SkillContext {
+function contextFromConfig(
+	config: Pick<AgentConfig, "projectGitPath" | "skillRoot" | "cwd">,
+): SkillContext {
 	return {
 		projectGitPath: config.projectGitPath ?? config.skillRoot ?? null,
 		cwd: config.cwd ?? config.skillRoot ?? null,
@@ -63,7 +65,7 @@ function contextFromToolContext(ctx: {
 
 /**
  * Pre-populate the skill summary cache for a given narrator/workspace context.
- * Called during narrator creation so the tool description includes the skill list
+ * Called during narrator creation so prompt context includes the skill list
  * from the very first turn.
  */
 export async function warmSkillCacheForContext(
@@ -86,16 +88,22 @@ export async function warmSkillCache(skillRoot: string): Promise<void> {
 	await warmSkillCacheForContext({ projectGitPath: skillRoot, cwd: skillRoot });
 }
 
-function buildDescription(config: AgentConfig): string {
-	const base =
-		'Execute a skill within the main conversation\n\nWhen users ask you to perform tasks, check if any of the available skills match. Skills provide specialized capabilities and domain knowledge.\n\nWhen users reference a "slash command" or "/<something>" (e.g., "/commit", "/review-pr"), they are referring to a skill. Use this tool to invoke it.\n\nHow to invoke:\n- Use this tool with the skill name and optional arguments\n- Examples:\n  - `skill: "pdf"` - invoke the pdf skill\n  - `skill: "commit", args: "-m \'Fix bug\'"` - invoke with arguments\n  - `skill: "review-pr", args: "123"` - invoke with arguments\n  - `skill: "ms-office-suite:pdf"` - invoke using fully qualified name\n\nImportant:\n- Available skills are listed in system-reminder messages in the conversation\n- When a skill matches the user\'s request, this is a BLOCKING REQUIREMENT: invoke the relevant Skill tool BEFORE generating any other response about the task\n- NEVER mention a skill without actually calling this tool\n- Do not invoke a skill that is already running\n- Do not use this tool for built-in CLI commands (like /help, /clear, etc.)\n- If you see a <command-name> tag in the current conversation turn, the skill has ALREADY been loaded - follow the instructions directly instead of calling this tool again';
+const SKILL_DESCRIPTION =
+	'Execute a skill within the main conversation\n\nWhen users ask you to perform tasks, check if any of the available skills match. Skills provide specialized capabilities and domain knowledge.\n\nWhen users reference a "slash command" or "/<something>" (e.g., "/commit", "/review-pr"), they are referring to a skill. Use this tool to invoke it.\n\nHow to invoke:\n- Use this tool with the skill name and optional arguments\n- Examples:\n  - `skill: "pdf"` - invoke the pdf skill\n  - `skill: "commit", args: "-m \'Fix bug\'"` - invoke with arguments\n  - `skill: "review-pr", args: "123"` - invoke with arguments\n  - `skill: "ms-office-suite:pdf"` - invoke using fully qualified name\n\nImportant:\n- Available skills are listed in system-reminder messages in the conversation\n- When a skill matches the user\'s request, this is a BLOCKING REQUIREMENT: invoke the relevant Skill tool BEFORE generating any other response about the task\n- NEVER mention a skill without actually calling this tool\n- Do not invoke a skill that is already running\n- Do not use this tool for built-in CLI commands (like /help, /clear, etc.)\n- If you see a <command-name> tag in the current conversation turn, the skill has ALREADY been loaded - follow the instructions directly instead of calling this tool again';
 
+/** Dynamic prompt context, separate from the static Skill tool declaration. */
+export function buildSkillsContext(
+	config: Pick<
+		AgentConfig,
+		"cwd" | "skillRoot" | "projectGitPath" | "skillScopeKey" | "blockedSkills"
+	>,
+): string {
 	const key = config.skillScopeKey ?? getSkillContextCacheKey(contextFromConfig(config));
 	const summaries = skillSummaryCache.get(key);
 
 	const blocked = config.blockedSkills;
 	if (blocked?.all) {
-		return `${base}\n\n<available_skills>\n(No skills are available — skills are disabled for this narrator by a custom trait.)\n</available_skills>`;
+		return `<available_skills>\n(No skills are available — skills are disabled for this narrator by a custom trait.)\n</available_skills>`;
 	}
 
 	const blockedNames = blocked?.names?.length ? new Set(blocked.names) : null;
@@ -104,11 +112,11 @@ function buildDescription(config: AgentConfig): string {
 		: summaries;
 
 	if (!visibleSummaries || visibleSummaries.length === 0) {
-		return base;
+		return "";
 	}
 
-	const lines = [`${base}\n\n<available_skills>`];
-	for (const s of visibleSummaries) {
+	const lines = [`<available_skills>`];
+	for (const s of [...visibleSummaries].sort((a, b) => a.name.localeCompare(b.name))) {
 		lines.push(`<skill name="${escapeXml(s.name)}">${escapeXml(s.description)}</skill>`);
 	}
 	lines.push("</available_skills>");
@@ -117,7 +125,7 @@ function buildDescription(config: AgentConfig): string {
 
 export const skillTool: ToolDefinition = {
 	name: "Skill",
-	description: buildDescription,
+	description: SKILL_DESCRIPTION,
 	rawJsonSchema: {
 		type: "object",
 		properties: {

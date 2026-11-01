@@ -4,8 +4,8 @@
  * when the input is large (`edit-text-runner.ts`): normalizing a block costs tens of
  * milliseconds per 16 KiB, and agent input is untrusted.
  *
- * THREE JOBS
- * ----------
+ * FOUR JOBS
+ * ---------
  *   - `parse`: a markdown outline (an `add`) or the text of one block (a `replace`) becomes
  *     items with canonical content. Read annotations (`‹…›` lines) are dropped first, and the
  *     labels a read puts after each bullet (`[Ab3dEf9Q]`) are taken off again, but only labels
@@ -18,6 +18,11 @@
  *   - `normalize`: contents become canonical the way `writeOutline` would make them, with their
  *     links and anything split off: a page's live session commits what people typed this way
  *     (typed text is untrusted too).
+ *   - `merge`: an agent's new content of a block, written against the version it read, is
+ *     three-way merged onto the block's content now (`agent-merge.ts`). Strict: where the two
+ *     changes overlap the merge is refused with the overlapping ranges, and a merged text that
+ *     normalization would change (the two changes meet in markup) is refused too, so what is
+ *     written is exactly both changes.
  *
  * Every content returned is canonical (`normalizeBlock(content).content === content`), with the
  * links `contentLinks` would read from it: what `writeOutline` takes as `canonical` content.
@@ -28,6 +33,7 @@ import {
 	type BodyRef,
 	bodyRefs,
 	type Inline,
+	merge3,
 	normalizeBlock,
 	type OutlineItem,
 	type OutlineNote,
@@ -113,6 +119,32 @@ export interface EditTextNormalized {
 	split: EditTextSplit[];
 }
 
+/** One block's three-way merge; all three contents are canonical. */
+export interface EditTextMergeInput {
+	/** The content the writer read. */
+	base: string;
+	/** The writer's new content, made from `base`. */
+	mine: string;
+	/** The content now: `base` with what others changed since. */
+	theirs: string;
+}
+
+/** Where the writer's change and another's overlap: a range of `base` (empty: both insert there). */
+export interface EditTextOverlap {
+	start: number;
+	end: number;
+}
+
+export type EditTextMerged =
+	/** Both changes, canonical, with the links `contentLinks` would read. */
+	| { ok: true; content: string; links: ExtractedLink[] }
+	| { ok: false; reason: "overlap"; overlaps: EditTextOverlap[] }
+	/** The merged text is not canonical: the two changes meet in markup. */
+	| { ok: false; reason: "unstable" };
+
+/** Overlaps one merge reports at most. */
+export const EDIT_TEXT_MAX_OVERLAPS = 5;
+
 export type EditTextJob =
 	| {
 			/** Contents to normalize as `writeOutline` would (`normalizeBlock`). */
@@ -130,18 +162,26 @@ export type EditTextJob =
 			contents: string[];
 			/** Stored form of each reference (keyed by the reference as written). */
 			targets: Record<string, EditTextTarget>;
+	  }
+	| {
+			kind: "merge";
+			merges: EditTextMergeInput[];
 	  };
 
 export type EditTextResult<J extends EditTextJob> = J extends { kind: "parse" }
 	? EditTextParsed[]
 	: J extends { kind: "normalize" }
 		? EditTextNormalized[]
-		: EditTextRewritten[];
+		: J extends { kind: "merge" }
+			? EditTextMerged[]
+			: EditTextRewritten[];
 
 /** UTF-8 bytes of the text a job carries. */
 export function editTextJobBytes(job: EditTextJob): number {
 	let bytes = 0;
 	if (job.kind === "parse") for (const input of job.inputs) bytes += utf8(input.text);
+	else if (job.kind === "merge")
+		for (const m of job.merges) bytes += utf8(m.base) + utf8(m.mine) + utf8(m.theirs);
 	else for (const content of job.contents) bytes += utf8(content);
 	return bytes;
 }
@@ -158,6 +198,7 @@ export function runEditTextJob<J extends EditTextJob>(job: J): EditTextResult<J>
 		const labels = new Set(job.labels);
 		return job.inputs.map((input) => parseEditText(input, labels)) as EditTextResult<J>;
 	}
+	if (job.kind === "merge") return job.merges.map(mergeContent) as EditTextResult<J>;
 	return job.contents.map((content) => rewriteContent(content, job.targets)) as EditTextResult<J>;
 }
 
@@ -179,6 +220,34 @@ function normalizeContent(src: string): EditTextNormalized {
 		links: bodyLinks(parseBlock(normalized.content).body),
 		split: normalized.children.map(splitNode),
 	};
+}
+
+/**
+ * `mine` merged onto `theirs` (see {@link EditTextMergeInput}), strictly: overlapping changes
+ * refuse the merge (`merge3`'s default), reported as ranges of `base` with touching ranges
+ * joined; a result normalization would change is refused as well.
+ */
+export function mergeContent(input: EditTextMergeInput): EditTextMerged {
+	const merged = merge3(input.base, input.mine, input.theirs);
+	if (!merged.ok) {
+		const ranges = merged.conflicts
+			.map((c) => ({
+				start: Math.min(c.mine.start, c.theirs.start),
+				end: Math.max(c.mine.end, c.theirs.end),
+			}))
+			.sort((a, b) => a.start - b.start || a.end - b.end);
+		const overlaps: EditTextOverlap[] = [];
+		for (const range of ranges) {
+			const last = overlaps[overlaps.length - 1];
+			if (last && range.start <= last.end) last.end = Math.max(last.end, range.end);
+			else overlaps.push({ ...range });
+		}
+		return { ok: false, reason: "overlap", overlaps: overlaps.slice(0, EDIT_TEXT_MAX_OVERLAPS) };
+	}
+	const normalized = normalizeContent(merged.result);
+	if (normalized.content !== merged.result || normalized.split.length > 0)
+		return { ok: false, reason: "unstable" };
+	return { ok: true, content: normalized.content, links: normalized.links };
 }
 
 /**

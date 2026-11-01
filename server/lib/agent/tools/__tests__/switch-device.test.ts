@@ -33,20 +33,12 @@ describe("SwitchDevice", () => {
 		expect(applied).toBeNull();
 	});
 
-	test("hides and rejects local execution when the runtime forbids it", async () => {
-		const schema = switchDeviceTool.getRawJsonSchema?.({
-			availableDevices: [
-				{
-					id: "device-1",
-					slug: "device-1",
-					name: "Device One",
-					online: true,
-					scope: "global" as const,
-				},
-			],
-			allowLocalExecution: false,
-		} as never) as { properties: { device: { enum: string[] } } };
-		expect(schema.properties.device.enum).toEqual(["device-1"]);
+	test("uses a static device string but rejects local execution when forbidden", async () => {
+		const schema = switchDeviceTool.rawJsonSchema as {
+			properties: { device: { type: string; enum?: string[] } };
+		};
+		expect(schema.properties.device.type).toBe("string");
+		expect(schema.properties.device.enum).toBeUndefined();
 
 		let applied = false;
 		const result = await switchDeviceTool.execute(

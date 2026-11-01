@@ -6,7 +6,7 @@ import { join } from "node:path";
 import type { Readable, Writable } from "node:stream";
 import type { UiNode } from "@shared/gen-ui-markup";
 import type { ConnectionTransport, LaunchOptions } from "puppeteer-core";
-import { findChromePath } from "../../lib/browser/pool";
+import { EDGE_NO_RELAUNCH_ARG, findChromePath } from "../../lib/browser/pool";
 
 export interface GenUiCaptureInput {
 	html: string;
@@ -56,6 +56,7 @@ export function captureLaunchOptions(executablePath: string, signal: AbortSignal
 		// Puppeteer owns a fresh temporary profile. Never disable either Chrome sandbox.
 		args: [
 			"--disable-extensions",
+			EDGE_NO_RELAUNCH_ARG,
 			"--disable-background-networking",
 			"--disable-component-update",
 			"--disable-sync",

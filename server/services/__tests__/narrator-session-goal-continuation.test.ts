@@ -1,11 +1,13 @@
 import { afterAll, describe, expect, mock, test } from "bun:test";
 import { eq } from "drizzle-orm";
 import { requestInput, rowsAsHistory } from "../../../tests/fixtures/model-input";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { narratorMessages, narrators } from "../../db/schema";
 import type { ProviderAdapter } from "../../lib/agent/provider";
 
-const { db, sqlite } = getTestDb();
+// The snapshot worker shares the preload-isolated file-backed database.
+const { db, sqlite } = await import("../../db");
+const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
 
 // The worktree may contain schema work whose generated migration is intentionally
 // deferred. Add only the columns selected by narrator history queries so this
@@ -32,9 +34,6 @@ for (const statement of [
 // so without this the divergent provider mock (getProvider/resolveProviderAndModel)
 // leaks into later suites (e.g. provider-resolution, AnthropicProvider).
 const realProviderModule = { ...(await import("../../lib/agent/provider")) };
-const realDbModule = { ...(await import("../../db")) };
-
-mock.module("../../db", () => ({ db, sqlite }));
 
 const providerCalls: string[] = [];
 let disableContinuationNarratorId: string | null = null;
@@ -90,12 +89,11 @@ async function waitFor(
 	throw new Error("Timed out waiting for narrator loop");
 }
 
-afterAll(() => {
+afterAll(async () => {
+	await closePrefixSnapshotStore();
 	mock.module("../../lib/agent/provider", () => realProviderModule);
-	mock.module("../../db", () => realDbModule);
 	mock.restore();
 	cleanDb(sqlite);
-	sqlite.close();
 });
 
 describe("Dynamic Spec continuation stall classification", () => {

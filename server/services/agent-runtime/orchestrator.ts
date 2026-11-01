@@ -25,9 +25,15 @@ import {
 } from "../../lib/agent/pipeline-state";
 import { detectShell } from "../../lib/agent/shell";
 import { toolRegistry } from "../../lib/agent/tool-registry";
-import { getMissingWorkingDirectoryRecovery, SHELL_TOOL_NAME } from "../../lib/agent/tools/bash";
+import {
+	getMissingWorkingDirectoryRecovery,
+	REVIEW_READ_ONLY_BASH_DESCRIPTION,
+	SHELL_TOOL_NAME,
+} from "../../lib/agent/tools/bash";
 import { clearBehaviorFenceEditGrant } from "../../lib/agent/tools/behavior-fence-grant";
 import { KNOWLEDGE_KIND_DENY_CORE, OPTIONAL_TOOLS } from "../../lib/agent/tools/index";
+import { buildSkillsContext } from "../../lib/agent/tools/skill";
+import { buildSubagentModelContext } from "../../lib/agent/tools/task";
 import type { ToolDefinition } from "../../lib/agent/types";
 import { buildAttachedFilesHint } from "../../lib/attached-files";
 import { normalizeBooleanOverride, resolveBooleanOverride } from "../../lib/boolean-override";
@@ -64,6 +70,8 @@ import {
 	getSearchExecutionScope,
 	SearchExecutionBudgetExceededError,
 } from "../../lib/search/execution-scope";
+import { shouldUseNativeSearch } from "../../lib/search/native";
+import { hasUsableFunctionSearchChannelFor } from "../../lib/search/router";
 import {
 	FOLLOW_DEFAULT_MODEL,
 	getAutoCompactKeepPairs,
@@ -116,7 +124,7 @@ import {
 } from "../narrator-buffer";
 import { runCustomCompact, runPlanCompact } from "../narrator-compact";
 import { freezeNarratorContextComposition } from "../narrator-context-composition";
-import { optionalToolDescription, reconcileEpoch } from "../narrator-epochs";
+import { currentCompactMessageId } from "../narrator-epochs";
 import {
 	clearStreamingSnapshot,
 	type EventHandlerContext,
@@ -209,7 +217,7 @@ import { resolvePlanApprovalAttribution } from "../plan-approval-attribution";
 import { subagentRetryRecoveredBroadcast } from "../subagent-executor";
 import { isMcpToolAllowedForNarrator, runtimeToolFilter } from "../subagent-tools";
 import { buildFinalToolStartAuthorization } from "../tool-final-start-authorization";
-import { parseMcpServerMarker } from "../tool-load-markers";
+import { mcpToolMarker, parseMcpServerMarker, parseMcpToolMarker } from "../tool-load-markers";
 import { resolveNarratorCapabilities } from "../trait-layer-service";
 import { buildTreeSnapshotExecutionHooks, FILE_MUTATING_TOOLS } from "../tree-snapshot-loop-hooks";
 import {
@@ -230,8 +238,8 @@ import {
 	dropDeferredPlanApproval,
 	runDeferredPlanApproval,
 } from "./plan-approval-restart";
-import { type RuntimePolicy, runtimeInteractionHint } from "./policy";
-import { countRuntimeSystemCharacters } from "./prompt-characters";
+import { type RuntimePolicy, runtimeAwaitTargets, runtimeInteractionHint } from "./policy";
+import { preparePrefixRequest, type RequestModelIdentity } from "./prepare-prefix-request";
 import type { RuntimeRecoveryState, RuntimeRecoveryTransition } from "./transition";
 import { selectRuntimeInterruption, selectRuntimeRecovery } from "./transition";
 
@@ -924,18 +932,6 @@ export async function runAgentLoopUnlocked(
 			// request exactly once through normal history adoption (including subagents).
 			if (!active.abortController.signal.aborted)
 				await drainAndPersistPendingInjections(active, placement);
-			const historyDeadline = Date.now() + 10_000;
-			let rawMessages = await narratorService.getModelHistorySinceLastCompact(
-				narratorId,
-				undefined,
-				{
-					signal: active.abortController.signal,
-					deadline: historyDeadline,
-				},
-			);
-			// History below is rebuilt from the latest post-compact messages, so any
-			// pending-compact guard set by a background compact can be released here.
-			clearActiveHistoryCompactPending(narratorId);
 
 			// Rebuild system prompt each iteration so AGENTS.md/CLAUDE.md changes are picked up.
 			const modelVersionBeforeLoad = active._modelRefreshVersion;
@@ -969,16 +965,25 @@ export async function runAgentLoopUnlocked(
 			const actingUserId = active._currentUserId ?? null;
 			const resolvedTurnSessionDevices =
 				(await resolveSessionDevices(active._projectId ?? null, actingUserId)) ?? [];
-			let turnSessionDevices = oauthRuntime
-				? filterOAuthSessionDevices(resolvedTurnSessionDevices, oauthRuntime)
-				: resolvedTurnSessionDevices;
+			const turnTraits = passCapabilities.traits;
+			active._disabledTools = getDisabledToolSet(turnTraits.traits);
+			const turnBlocked = getBlockedSkills(turnTraits.traits);
+			active._blockedSkills = { all: turnBlocked.all, names: turnBlocked.names };
+			let turnSessionDevices = resolveInjectedDevices(
+				oauthRuntime
+					? filterOAuthSessionDevices(resolvedTurnSessionDevices, oauthRuntime)
+					: resolvedTurnSessionDevices,
+				turnTraits.deviceInjection,
+			);
 
 			// Every refresh derives the complete request view from one registry array. An
 			// explicit ceiling has no managed loading and needs no MCP grant DB read.
 			const managedOptionalTools = new Set<string>();
 			let toolCandidates: readonly ToolDefinition[] = [];
+			let toolRegistryRevision = toolRegistry.revision;
 			const refreshMcpToolLoading = async () => {
 				const candidates = toolRegistry.all();
+				toolRegistryRevision = toolRegistry.revision;
 				toolCandidates = candidates;
 				managedOptionalTools.clear();
 				if (runtimePolicy.tools.builtin !== "all") return;
@@ -997,6 +1002,7 @@ export async function runAgentLoopUnlocked(
 					.from(narrators)
 					.where(eq(narrators.id, narratorId))
 					.limit(1);
+				const explicitTools = new Set(latestNarrator?.enabledTools ?? []);
 				const loadedMcpServers = new Set(
 					(latestNarrator?.enabledTools ?? []).flatMap((value) => {
 						const id = parseMcpServerMarker(value);
@@ -1009,11 +1015,12 @@ export async function runAgentLoopUnlocked(
 					if (name.startsWith("mcp__")) managedOptionalTools.delete(name);
 				}
 				for (const name of active._enabledOptionalTools) {
-					if (name.startsWith("mcp__") || parseMcpServerMarker(name))
+					if (name.startsWith("mcp__") || parseMcpServerMarker(name) || parseMcpToolMarker(name))
 						active._enabledOptionalTools.delete(name);
 				}
 				for (const value of latestNarrator?.enabledTools ?? []) {
-					if (parseMcpServerMarker(value)) active._enabledOptionalTools.add(value);
+					if (parseMcpServerMarker(value) || parseMcpToolMarker(value))
+						active._enabledOptionalTools.add(value);
 				}
 				const servers = new Map((settings.mcpServers ?? []).map((server) => [server.id, server]));
 				for (const tool of candidates) {
@@ -1029,17 +1036,49 @@ export async function runAgentLoopUnlocked(
 					)
 						continue;
 					managedOptionalTools.add(tool.name);
-					if (resolveMcpLoadingMode(server) === "resident" || loadedMcpServers.has(server.id))
+					if (
+						resolveMcpLoadingMode(server) === "resident" ||
+						loadedMcpServers.has(server.id) ||
+						explicitTools.has(mcpToolMarker(server.id, tool.name))
+					)
 						active._enabledOptionalTools.add(tool.name);
 					else active._enabledOptionalTools.delete(tool.name);
 				}
 			};
-			await refreshMcpToolLoading();
-			const toolLoadingInput = () => ({
+			const requestToolAllowed = (tool: ToolDefinition, identity: RequestModelIdentity) => {
+				// Reflection decisions must exist in the parent's immutable declaration set.
+				if (tool.reflectionOnly) return true;
+				if (tool.isAvailable && !tool.isAvailable()) return false;
+				if (!profileToolFilter(tool)) return false;
+				if (oauthRuntime && !oauthRuntime.allowedTools.has(tool.name)) return false;
+				if (active._disabledTools.has(tool.name)) return false;
+				if (tool.name === "Skill" && active._blockedSkills.all) return false;
+				if (tool.name === "WebSearch" && shouldUseNativeSearch(identity.provider, identity.model))
+					return false;
+				if (tool.name === "SwitchDevice")
+					return turnSessionDevices.some((device) => device.online) || !!active._defaultDeviceId;
+				if (tool.name === "TransferFile") return turnSessionDevices.some((device) => device.online);
+				if (tool.name.startsWith("mcp__")) {
+					const server = settings.mcpServers?.find(
+						(item) => item.id === tool.metadata?.mcpServerId,
+					);
+					return (
+						!!server &&
+						resolveMcpLoadingMode(server) !== "disabled" &&
+						(runtimePolicy.tools.builtin !== "all" || managedOptionalTools.has(tool.name)) &&
+						isMcpToolAllowedForNarrator(tool)
+					);
+				}
+				if (runtimePolicy.tools.builtin !== "all") return true;
+				if (OPTIONAL_TOOLS.has(tool.name)) return managedOptionalTools.has(tool.name);
+				return active._narratorKind !== "knowledge" || !KNOWLEDGE_KIND_DENY_CORE.has(tool.name);
+			};
+			const toolLoadingInput = (identity: RequestModelIdentity) => ({
 				// Freeze one request's derivation; live active membership is only for execution.
 				managed: new Set(managedOptionalTools),
 				current: new Set(active._enabledOptionalTools),
-				candidates: toolCandidates,
+				candidates: toolCandidates.filter((tool) => requestToolAllowed(tool, identity)),
+				registryRevision: toolRegistryRevision,
 			});
 
 			// Preserve the original signed array. buildRuntimeHistory drops the placement under
@@ -1115,39 +1154,128 @@ export async function runAgentLoopUnlocked(
 			// rebuild request raised before it is satisfied by construction.
 			clearPlanModePromptRebuild(narratorId);
 
-			// What this request must carry before its history is built: a new epoch at a
-			// boundary, or notices for tool changes that bypassed `/load` (§7.7). Reuse the
-			// exact epoch and candidates for projection instead of querying/scanning again.
-			const toolLoading = toolLoadingInput();
-			const reconciled = await reconcileEpoch({
+			// Main and delegated narrators share this builder, both initially and before
+			// every provider request. Values are collected before epoch publication.
+			const buildPrefixPrompt = async (model: RequestModelIdentity) => {
+				active.abortController.signal.throwIfAborted();
+				// A compact racing this read is retried by the shared request preparer.
+				const compactMessageId = await currentCompactMessageId(narratorId);
+				const current = await narratorService.getById(narratorId);
+				const currentOAuth = await assertOAuthNarratorRuntimeActive(
+					narratorId,
+					active._currentUserId,
+				);
+				const devices =
+					(await resolveSessionDevices(active._projectId ?? null, actingUserId)) ?? [];
+				turnSessionDevices = resolveInjectedDevices(
+					currentOAuth ? filterOAuthSessionDevices(devices, currentOAuth) : devices,
+					turnTraits.deviceInjection,
+				);
+				await ensureSkillCacheFreshForActiveNarrator(active);
+				const { workspaceContextService } = await import("../workspace-context-service");
+				const workspace = await workspaceContextService.get(narratorId);
+				const { buildPendingQuestionHint } = await import("../narrator-question-service");
+				const pendingQuestionHint = await buildPendingQuestionHint(narratorId);
+				const planMode = currentOAuth
+					? false
+					: (active._planModeLive ?? isPlanModeTrait(current.traits));
+				const relaxedPlan = currentOAuth
+					? false
+					: (active._relaxedPlanLive ??
+						resolveEffectiveRelaxedPlan(current.permissionMode, current.relaxedPlan));
+				const built = await buildSystemPrompt(
+					{
+						systemPrompt: currentOAuth
+							? (currentOAuth.systemPrompt ?? null)
+							: runtimeBasePrompt(current, locale, runtimePolicy),
+						contextSummary: current.contextSummary,
+					},
+					active.cwd,
+					locale,
+					active._replyInUserLanguage ?? false,
+					planMode,
+					active._planFileId,
+					settings.agent.defaultSystemPrompt,
+					{
+						devices: turnSessionDevices,
+						defaultDeviceId: currentOAuth?.defaultDeviceId ?? active._defaultDeviceId ?? null,
+						allowLocalExecution: currentOAuth?.allowLocalExecution ?? true,
+					},
+					// Legacy resumed plan paths cannot be reconstructed from the identity.
+					active._planFilePath,
+					{
+						workspaceContext: JSON.stringify(workspace),
+						skillsContext: buildSkillsContext({
+							cwd: active.cwd,
+							skillRoot: active._skillRoot ?? undefined,
+							projectGitPath: active._projectGitPath ?? undefined,
+							skillScopeKey: active._skillScopeKey ?? undefined,
+							blockedSkills: {
+								all: active._blockedSkills.all,
+								names: [...active._blockedSkills.names].sort(),
+							},
+						}),
+						modelsContext: buildSubagentModelContext({
+							subagentModelRestrictionDescription: formatSubagentModelRestrictionDescription(
+								current.traits,
+							),
+						}),
+						modeContext: [
+							JSON.stringify({
+								planMode,
+								relaxedPlan,
+								planAllowInlinePlan: settings.agent.planModeAllowInlinePlan,
+								planFilePath: active._planFilePath,
+								permissionMode: currentOAuth?.permissionMode ?? current.permissionMode,
+								readOnly: runtimePolicy.tools.readOnly,
+							}),
+							runtimePolicy.readOnlyGitShell ? REVIEW_READ_ONLY_BASH_DESCRIPTION : "",
+						]
+							.filter(Boolean)
+							.join("\n\n"),
+						runtimeHints: [
+							"Tool declarations are retained for history compatibility; only currently available tools may execute.",
+							`Runtime capabilities: ${JSON.stringify(runtimePolicy.capabilities)}`,
+							`Await targets: ${runtimeAwaitTargets(runtimePolicy).join(", ")}. Reflection-only tools may only execute in their matching active reflection gate.`,
+							`Send user targets: ${isBotNarrator(current.traits) ? "available (bot)" : "unavailable"}; Send resume model and Stop agent: ${runtimePolicy.capabilities.spawnAgent ? "available" : "unavailable"}.`,
+							shouldUseNativeSearch(model.provider, model.model)
+								? "Use the provider-native web_search capability for web searches."
+								: `Function WebSearch channel available: ${hasUsableFunctionSearchChannelFor(model.provider)}.`,
+							pendingQuestionHint,
+						]
+							.filter(Boolean)
+							.join("\n\n"),
+					},
+				);
+				return {
+					...built,
+					compactMessageId,
+					summaryChars: built.usedCompactSummary ? (current.contextSummary?.length ?? 0) : 0,
+				};
+			};
+			const preparedPrefix = await preparePrefixRequest({
 				narratorId,
-				messages: rawMessages,
-				...toolLoading,
-				model: resolved.model,
-				provider: resolved.provider,
-				noticeText: (kind, toolName) =>
-					kind === "tool_loaded"
-						? getToolMessageWithParams("toolLoaded", locale, {
-								toolName,
-								toolDescription: optionalToolDescription(toolName, locale),
-							})
-						: getToolMessageWithParams("toolUnloaded", locale, { toolName }),
+				locale,
+				getModel: () => resolved.model,
+				getProvider: () => resolved.provider,
+				signal: active.abortController.signal,
+				getToolLoading: toolLoadingInput,
+				refreshToolLoading: refreshMcpToolLoading,
+				buildPrefixPrompt,
 			});
-			if (reconciled.changed)
-				rawMessages = await narratorService.getModelHistorySinceLastCompact(narratorId, undefined, {
-					signal: active.abortController.signal,
-					deadline: historyDeadline,
-				});
+			const { prompt: prefixPrompt, reconciled, sourceMessages: rawMessages } = preparedPrefix;
+			if (!prefixPrompt || !reconciled) throw new Error("Runtime prefix was not prepared");
+			if (reconciled.opened) active._resetUpstreamSessionOnNextRequest = true;
+			clearActiveHistoryCompactPending(narratorId);
 			const historyOptions = {
 				narratorId,
-				model: resolved.model,
-				provider: resolved.provider,
+				model: preparedPrefix.model,
+				provider: preparedPrefix.provider,
 				currentInput: runState.input.text,
 				currentMedia: runState.input.media,
 				attachmentCwd: active.cwd,
 				attachmentSignal: active.abortController.signal,
-				deadline: historyDeadline,
-				toolLoading: { ...toolLoading, epoch: reconciled.epoch },
+				toolLoading: preparedPrefix.toolLoading,
 			};
 			let preparedHistory = await buildRuntimeHistory({
 				...historyOptions,
@@ -1220,10 +1348,14 @@ export async function runAgentLoopUnlocked(
 					sourceMessages: await narratorService.getModelHistorySinceLastCompact(
 						narratorId,
 						undefined,
-						{ signal: active.abortController.signal, deadline: historyDeadline },
+						{ signal: active.abortController.signal, deadline: Date.now() + 10_000 },
 					),
 				});
 			}
+
+			// Knowledge injection can reload history after reconciliation. If a compact
+			// won during that work, restart preparation rather than pair it with an old summary.
+			if (prefixPrompt.compactMessageId !== (await currentCompactMessageId(narratorId))) continue;
 
 			const receipts = questionModelReceipts(preparedHistory.modelMessages);
 			active._questionAnswerModelReceipts = new Map(receipts.map(({ id, text }) => [id, text]));
@@ -1243,44 +1375,11 @@ export async function runAgentLoopUnlocked(
 					});
 				}
 			};
-			const {
-				prompt: freshSystemPrompt,
-				usedCompactSummary,
-				summaryRange,
-			} = await buildSystemPrompt(
-				{
-					systemPrompt: oauthRuntime
-						? (oauthRuntime.systemPrompt ?? null)
-						: runtimeBasePrompt(freshNarrator, locale, runtimePolicy),
-					contextSummary: freshNarrator.contextSummary,
-				},
-				active.cwd,
-				locale,
-				active._replyInUserLanguage ?? false,
-				oauthRuntime ? false : isPlanModeTrait(freshNarrator.traits),
-				active._planFileId,
-				settings.agent.defaultSystemPrompt,
-				{
-					devices: turnSessionDevices,
-					defaultDeviceId: oauthRuntime?.defaultDeviceId ?? active._defaultDeviceId ?? null,
-					allowLocalExecution: oauthRuntime?.allowLocalExecution ?? true,
-				},
-				// Same reason as in rebuildSystemPrompt: a legacy plan path cannot be rebuilt
-				// from the identity, and the reminder must name the file the gate allows.
-				active._planFilePath,
-			);
-			active.systemPrompt = freshSystemPrompt;
-			const { buildPendingQuestionHint } = await import("../narrator-question-service");
-			const pendingQuestionHint = await buildPendingQuestionHint(narratorId);
-			if (pendingQuestionHint)
-				active.systemPrompt = `${active.systemPrompt ?? ""}\n\n${pendingQuestionHint}`;
-			const initialSystemChars = countRuntimeSystemCharacters(
-				active.systemPrompt,
-				freshNarrator.contextSummary,
-				summaryRange,
-			);
-			// Already-held prompt/summary memory, never a cache count or a GET body read.
-			let runtimeSummaryChars = (active.systemPrompt?.length ?? 0) - initialSystemChars;
+			const { usedCompactSummary } = prefixPrompt;
+			active.systemPrompt = reconciled.systemPrompt ?? prefixPrompt.prompt;
+			// Legacy prompt offsets do not address the epoch's rendered baseline.
+			let runtimeSummaryChars = prefixPrompt.summaryChars;
+			const initialSystemChars = (active.systemPrompt?.length ?? 0) - runtimeSummaryChars;
 			await storeRuntimeCharacters({ systemChars: initialSystemChars });
 			active._usedCompactSummary = usedCompactSummary;
 
@@ -1346,8 +1445,10 @@ export async function runAgentLoopUnlocked(
 			const ctxMgmt = buildContextManagementHooks({
 				narratorId,
 				locale,
-				getModel: () => resolveProviderAndModel(active.model, active.provider).model,
-				getProvider: () => resolveProviderAndModel(active.model, active.provider).provider,
+				// UI changes update active first; only the loop's model-switch boundary
+				// updates config and the adapter that will send this prepared request.
+				getModel: () => config.model,
+				getProvider: () => config.provider ?? resolved.provider,
 				getAttachmentCwd: () => active.cwd,
 				getToolLoading: toolLoadingInput,
 				refreshToolLoading: refreshMcpToolLoading,
@@ -1359,46 +1460,10 @@ export async function runAgentLoopUnlocked(
 				clearCompactDone: () => {
 					compactDoneFlag = false;
 				},
-				rebuildSystemPrompt: async () => {
-					const freshNarrator = await narratorService.getById(narratorId);
-					const freshOAuthRuntime = await assertOAuthNarratorRuntimeActive(
-						narratorId,
-						active._currentUserId,
-					);
-					const { prompt, summaryRange } = await buildSystemPrompt(
-						{
-							systemPrompt: freshOAuthRuntime
-								? (freshOAuthRuntime.systemPrompt ?? null)
-								: runtimeBasePrompt(freshNarrator, locale, runtimePolicy),
-							contextSummary: freshNarrator.contextSummary,
-						},
-						active.cwd,
-						locale,
-						active._replyInUserLanguage ?? false,
-						freshOAuthRuntime ? false : isPlanModeTrait(freshNarrator.traits),
-						active._planFileId,
-						settings.agent.defaultSystemPrompt,
-						undefined,
-						// The reminder, the Write/Edit gate and ExitPlanMode resolution must all
-						// name the SAME file. A cycle resumed from the pre-`plans/` layout keeps a
-						// legacy path in `_planFilePath` that `buildPlanFileRelPath` cannot
-						// reconstruct from the identity alone, so passing it is what stops the
-						// model being told to write somewhere the gate then rejects.
-						active._planFilePath,
-					);
-					const hint = await buildPendingQuestionHint(narratorId);
-					const finalPrompt = hint ? `${prompt}\n\n${hint}` : prompt;
-					const systemChars = countRuntimeSystemCharacters(
-						finalPrompt,
-						freshNarrator.contextSummary,
-						summaryRange,
-					);
-					runtimeSummaryChars = (finalPrompt?.length ?? 0) - systemChars;
-					await storeRuntimeCharacters({ systemChars });
-					// NOTE: Do NOT set active.systemPrompt here — the returned value
-					// flows through onBeforeTurn → loop.ts which updates config.systemPrompt.
-					// Setting active.systemPrompt would create a second source of truth.
-					return finalPrompt;
+				buildPrefixPrompt: async (identity) => {
+					const result = await buildPrefixPrompt(identity);
+					runtimeSummaryChars = result.summaryChars;
+					return result;
 				},
 			});
 
@@ -1542,7 +1607,7 @@ export async function runAgentLoopUnlocked(
 							approval === "compact" && planText
 								? async () => {
 										await runPlanCompact(narratorId, planText);
-										resetActiveUpstreamSession(narratorId);
+										resetActiveUpstreamSession(narratorId, { persistedIdentityCleared: true });
 										broadcastToNarrator(narratorId, { type: "compact_done", narratorId });
 									}
 								: undefined,
@@ -1710,12 +1775,7 @@ export async function runAgentLoopUnlocked(
 			);
 
 			// Restrictions come from the same strict per-pass resolution as the ceiling.
-			const turnTraits = passCapabilities.traits;
-			turnSessionDevices = resolveInjectedDevices(turnSessionDevices, turnTraits.deviceInjection);
 			runState.stopHooks = runtimePolicy.capabilities.stopHooks;
-			active._disabledTools = getDisabledToolSet(turnTraits.traits);
-			const turnBlocked = getBlockedSkills(turnTraits.traits);
-			active._blockedSkills = { all: turnBlocked.all, names: turnBlocked.names };
 			const resolvedServiceTier =
 				resolvedFastMode && usesCodexModel(resolved.provider, resolved.model)
 					? "priority"
@@ -1897,39 +1957,11 @@ export async function runAgentLoopUnlocked(
 				toolLoading: preparedHistory.toolLoading,
 				toolCandidates: preparedHistory.toolCandidates,
 				isToolLoaded: (name) => active._enabledOptionalTools.has(name),
-				toolFilter: (tool) => {
-					if (!profileToolFilter(tool)) return false;
-					if (oauthRuntime && !oauthRuntime.allowedTools.has(tool.name)) return false;
-					if (active._disabledTools.has(tool.name)) return false;
-					// When all skills are blocked, hide the Skill tool entirely.
-					if (tool.name === "Skill" && active._blockedSkills.all) return false;
-					// Newly connected MCP tools wait for the next managed snapshot; auto must never leak.
-					if (tool.name.startsWith("mcp__")) {
-						const server = settings.mcpServers?.find(
-							(item) => item.id === tool.metadata?.mcpServerId,
-						);
-						return (
-							!!server &&
-							resolveMcpLoadingMode(server) !== "disabled" &&
-							(runtimePolicy.tools.builtin !== "all" || managedOptionalTools.has(tool.name)) &&
-							isMcpToolAllowedForNarrator(tool)
-						);
-					}
-					// An explicit ceiling allowlist is authoritative; session-level optional
-					// tool loading only narrows a session whose ceiling admits every tool.
-					if (runtimePolicy.tools.builtin !== "all") return true;
-					// Whether a loadable tool enters the request's array is decided by the
-					// loop from the history's loading state (`toolLoading` above).
-					if (OPTIONAL_TOOLS.has(tool.name)) {
-						return managedOptionalTools.has(tool.name);
-					}
-					// Knowledge Steward: drop a few unrelated core tools (e.g. web search/fetch).
-					// Deny-list only — never touches planning/reflection/goal control tools.
-					if (active._narratorKind === "knowledge" && KNOWLEDGE_KIND_DENY_CORE.has(tool.name)) {
-						return false;
-					}
-					return true;
-				},
+				toolFilter: (tool) =>
+					requestToolAllowed(tool, {
+						model: config.model,
+						provider: config.provider ?? resolved.provider,
+					}),
 				permissionHandler: (toolName, input, toolUseId, options) =>
 					handlePermission(
 						narratorId,

@@ -3,7 +3,6 @@ import { resolveBufferQueueMode } from "@shared/buffer-queue-mode";
 import { asc, eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { requestInput, rowsAsHistory } from "../../../tests/fixtures/model-input";
-import { getTestDb } from "../../../tests/setup";
 import {
 	backgroundTasks,
 	narratorBufferedMessages,
@@ -16,9 +15,9 @@ import { AppError, ValidationError } from "../../lib/errors";
 import { updateBufferedMessageModeSchema } from "../../lib/validators/narrators";
 import { delegationRegistration } from "../../lib/validators/runtime-registration";
 
-// tests/preload.ts isolates HOME before imports; never load the production DB singleton.
-const { db, sqlite } = getTestDb();
-mock.module("../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
+// The snapshot worker shares the preload-isolated file-backed database.
+const { db, sqlite } = await import("../../db");
+const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
 for (const [table, column, type] of [
 	["narrator_tool_calls", "execution_device_id", "TEXT"],
 	["narrator_tool_calls", "execution_cwd", "TEXT"],
@@ -160,6 +159,7 @@ toolRegistry.register({
 afterAll(async () => {
 	closeNarrator(parent);
 	await until(() => !getExecutionOwner(parent), "cleanup owner released");
+	await closePrefixSnapshotStore();
 	toolRegistry.register(awaitTool);
 	mock.restore();
 });

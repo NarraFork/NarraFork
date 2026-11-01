@@ -231,11 +231,39 @@ test("Chrome146 production raw path: 20MiB, dual-view candidate swap, digests, e
 		expect(
 			await page.evaluate(() => (window as unknown as RawWindow).rawFixture.fingerprint()),
 		).toBe(expectedHash.digest("hex"));
-		await page.evaluate(() => (window as unknown as RawWindow).rawFixture.dualViews());
-		await page.waitForFunction(
-			() => (window as unknown as RawWindow).rawFixture.state().views.views === 2,
-			{ timeout: 15000 },
+		// Each view reauthorizes with a full-file preflight before sharing the model.
+		// Give that I/O its existing request budget, separately from Monaco readiness.
+		const viewCreateStatuses: number[] = [];
+		const viewsAuthorized = page.waitForResponse(
+			(response) => {
+				if (
+					response.request().method() !== "POST" ||
+					new URL(response.url()).pathname !== `/api/narrators/${narratorId}/editor-documents`
+				)
+					return false;
+				viewCreateStatuses.push(response.status());
+				if (!response.ok()) throw new Error(`View authorization failed: ${response.status()}`);
+				return viewCreateStatuses.length === 2;
+			},
+			{ timeout: EDITOR_IO_TIMEOUT_MS },
 		);
+		try {
+			await Promise.all([
+				viewsAuthorized,
+				page.evaluate(() => (window as unknown as RawWindow).rawFixture.dualViews()),
+			]);
+			await page.waitForFunction(
+				() => (window as unknown as RawWindow).rawFixture.state().views.views === 2,
+				{ timeout: 15000 },
+			);
+		} catch (error) {
+			console.error("raw-browser-dual-views", {
+				viewCreateStatuses,
+				source: service.streams.diagnostics,
+				pageErrors: errors.slice(-5).map((message) => message.slice(0, 1000)),
+			});
+			throw error;
+		}
 		await writeFile(large, "\ufeffnew\r\n\ufeff😀\rbody\n");
 		const next = await page.evaluate(() => (window as unknown as RawWindow).rawFixture.reload());
 		expect(next.length).toBe("new\n\ufeff😀\nbody\n".length);

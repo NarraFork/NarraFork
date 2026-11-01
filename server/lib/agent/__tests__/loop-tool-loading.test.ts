@@ -11,9 +11,9 @@ import { afterAll, describe, expect, mock, test } from "bun:test";
 import { z } from "zod/v4";
 import { settings } from "../../settings";
 import type { ChatParams, ProviderAdapter } from "../provider";
-import { DEFERRED_TOOL_PLACEHOLDER, type ToolLoadingState } from "../tool-loading";
+import { DEFERRED_TOOL_PLACEHOLDER, ToolEpochError, type ToolLoadingState } from "../tool-loading";
 import { toolRegistry } from "../tool-registry";
-import type { AgentConfig } from "../types";
+import { type AgentConfig, ApiError } from "../types";
 
 const CORE = "TlCoreTool";
 const BASE = "TlBaseTool";
@@ -24,6 +24,8 @@ const OWN = new Set([CORE, BASE, LOADED]);
 const requests: Array<{ tools: string[]; strategy: ChatParams["toolLoadingStrategy"] }> = [];
 const toolPayloads: Array<Array<Record<string, unknown>>> = [];
 const toolOutputs: string[] = [];
+const executions: string[] = [];
+const upstreamResets: boolean[] = [];
 let script: Array<() => Record<string, unknown>> = [];
 
 const testProvider: ProviderAdapter = {
@@ -34,6 +36,7 @@ const testProvider: ProviderAdapter = {
 	async *chat(params) {
 		const payload = params.tools as Array<Record<string, unknown>>;
 		toolPayloads.push(payload);
+		upstreamResets.push(!!params.resetUpstreamSession);
 		requests.push({
 			tools: payload
 				.map((tool) => String(tool.name))
@@ -70,7 +73,10 @@ for (const name of OWN)
 		name,
 		description: `${name} description`,
 		parameters: z.object({}),
-		execute: async () => ({ output: `${name} ran` }),
+		execute: async () => {
+			executions.push(name);
+			return { output: `${name} ran` };
+		},
 	});
 
 afterAll(() => {
@@ -112,6 +118,8 @@ function reset(steps: Array<() => Record<string, unknown>>): void {
 	requests.length = 0;
 	toolPayloads.length = 0;
 	toolOutputs.length = 0;
+	executions.length = 0;
+	upstreamResets.length = 0;
 	script = steps;
 }
 
@@ -263,13 +271,19 @@ describe("loop tool loading", () => {
 		reset([callTool(CORE)]);
 		await drain(
 			makeConfig({
-				toolLoading: state([BASE], [LOADED], [BASE, LOADED]),
+				toolLoading: {
+					...state([BASE], [LOADED], [BASE, LOADED]),
+					epochMarkerId: "before-compact",
+				},
 				isToolLoaded: () => true,
 				// A compact folds the load into the new epoch's base set.
-				onBeforeTurn: async () => ({
+				rebuildRequestHistory: async () => ({
 					history: [],
 					rows: [],
-					toolLoading: state([BASE, LOADED], [], [BASE, LOADED]),
+					toolLoading: {
+						...state([BASE, LOADED], [], [BASE, LOADED]),
+						epochMarkerId: "after-compact",
+					},
 					toolCandidates: toolRegistry.all(),
 				}),
 			}),
@@ -284,12 +298,114 @@ describe("loop tool loading", () => {
 				strategy: "anthropic_tool_addition",
 			},
 		]);
+		expect(upstreamResets).toEqual([false, true]);
+	});
+
+	test("same-epoch prompt updates keep frozen declarations and upstream continuation", async () => {
+		reset([callTool(CORE), callTool(CORE)]);
+		const disabled = new Set<string>();
+		const candidates = toolRegistry.all().filter((tool) => OWN.has(tool.name));
+		const loading: ToolLoadingState = {
+			...state([BASE], [], [BASE]),
+			epochMarkerId: "stable-prefix",
+			baseToolNames: [CORE, BASE],
+			definitionSnapshots: candidates.map((tool) => ({
+				name: tool.name,
+				description: tool.description,
+				parameters: { type: "object", properties: {} },
+			})),
+		};
+		const config = makeConfig({
+			systemPrompt: "frozen system",
+			toolLoading: loading,
+			toolCandidates: candidates,
+			planMode: false,
+			toolFilter: (tool) => !disabled.has(tool.name),
+			rebuildRequestHistory: async () => {
+				config.planMode = true;
+				disabled.add(BASE);
+				return {
+					history: [],
+					rows: [],
+					systemPrompt: "frozen system",
+					toolLoading: loading,
+					toolCandidates: candidates.map((tool) => ({
+						...tool,
+						description: "changed registry",
+						isAvailable: () => false,
+					})),
+				};
+			},
+		});
+		await drain(config);
+		expect(config.planMode).toBe(true);
+		expect(upstreamResets).toEqual([false, false, false]);
+		expect(toolPayloads[1]).toEqual(toolPayloads[0]);
+		expect(toolPayloads[2]).toEqual(toolPayloads[0]);
+		expect(toolPayloads[2]?.find((tool) => tool.name === BASE)?.description).toBe(
+			`${BASE} description`,
+		);
+	});
+
+	test("a retried provider attempt reconciles its prefix without changing cache identity", async () => {
+		reset([
+			() => {
+				throw new ApiError(502, "upstream unavailable");
+			},
+		]);
+		let rebuilds = 0;
+		const loading: ToolLoadingState = {
+			...state([], [], []),
+			epochMarkerId: "retry-prefix",
+			baseToolNames: [CORE],
+			definitionSnapshots: [
+				{ name: CORE, description: "frozen declaration", parameters: { type: "object" } },
+			],
+		};
+		await drain(
+			makeConfig({
+				systemPrompt: "frozen retry system",
+				toolLoading: loading,
+				toolCandidates: toolRegistry.all(),
+				retryBackoffCeilMs: 1,
+				maxTransientRetries: 3,
+				rebuildRequestHistory: async () => {
+					rebuilds++;
+					return {
+						history: [],
+						rows: [],
+						systemPrompt: "frozen retry system",
+						toolLoading: loading,
+						toolCandidates: toolRegistry.all(),
+					};
+				},
+			}),
+		);
+		expect(rebuilds).toBe(1);
+		expect(requests).toHaveLength(2);
+		expect(upstreamResets).toEqual([false, false]);
+		expect(toolPayloads[1]).toEqual(toolPayloads[0]);
+	});
+
+	test("a changed frozen system breaks transport continuation", async () => {
+		reset([callTool(CORE)]);
+		await drain(
+			makeConfig({
+				systemPrompt: "before compact",
+				rebuildRequestHistory: async () => ({
+					history: [],
+					rows: [],
+					systemPrompt: "after compact",
+				}),
+			}),
+		);
+		expect(upstreamResets).toEqual([false, true]);
 	});
 
 	test("plain rebuilds preserve tools and loading rebuilds apply same-layout candidate changes", async () => {
 		reset([callTool(CORE), callTool(CORE)]);
 		const initialCandidates = toolRegistry.all();
-		const loading = state([BASE], [], [BASE]);
+		const loading = { ...state([BASE], [], [BASE]), registryRevision: toolRegistry.revision };
 		const disabled = new Set<string>();
 		let rebuild = 0;
 		try {
@@ -299,7 +415,7 @@ describe("loop tool loading", () => {
 					toolCandidates: initialCandidates,
 					isToolLoaded: () => true,
 					toolFilter: (tool) => !disabled.has(tool.name),
-					onBeforeTurn: async () => {
+					rebuildRequestHistory: async () => {
 						rebuild++;
 						if (rebuild === 1) {
 							toolRegistry.register({
@@ -322,7 +438,16 @@ describe("loop tool loading", () => {
 							execute: async () => ({ output: "extra" }),
 						});
 						// The loading layout is identical; candidates still changed on all three axes.
-						return { history: [], rows: [], toolLoading: loading, toolCandidates: candidates };
+						return {
+							history: [],
+							rows: [],
+							toolLoading: {
+								...loading,
+								epochMarkerId: "registry-changed",
+								registryRevision: toolRegistry.revision,
+							},
+							toolCandidates: candidates,
+						};
 					},
 				}),
 			);
@@ -333,6 +458,8 @@ describe("loop tool loading", () => {
 			]);
 			const base = toolPayloads[2]?.find((tool) => tool.name === BASE);
 			expect(base?.description).toBe("changed schema description");
+			expect(toolRegistry.revision).not.toBe(loading.registryRevision);
+			expect(upstreamResets).toEqual([false, false, true]);
 		} finally {
 			toolRegistry.unregister(EXTRA);
 		}
@@ -351,6 +478,71 @@ describe("loop tool loading", () => {
 			),
 		).rejects.toThrow("must include tool candidates");
 		expect(requests).toHaveLength(1);
+	});
+
+	test.each([
+		"epoch storage",
+		"registry change",
+	] as const)("%s failure stops before sending old history or replaying a completed tool", async (failure) => {
+		reset([callTool(CORE), callTool(CORE)]);
+		const loading = { ...state([BASE], [], [BASE]), registryRevision: toolRegistry.revision };
+		const error =
+			failure === "epoch storage"
+				? new ToolEpochError(new Error("storage unavailable"))
+				: new Error("rebuild failed");
+		try {
+			await expect(
+				drain(
+					makeConfig({
+						toolLoading: loading,
+						toolCandidates: toolRegistry.all(),
+						rebuildRequestHistory: async () => {
+							if (failure === "registry change") {
+								toolRegistry.register({
+									name: EXTRA,
+									description: "registered between requests",
+									parameters: z.object({}),
+									execute: async () => ({ output: "extra" }),
+								});
+							}
+							throw error;
+						},
+					}),
+				),
+			).rejects.toBe(error);
+			expect(requests).toHaveLength(1);
+			expect(executions).toEqual([CORE]);
+			expect(toolOutputs).toEqual([`${CORE} ran`]);
+			expect(script).toHaveLength(1);
+		} finally {
+			toolRegistry.unregister(EXTRA);
+		}
+	});
+
+	test("a native tool receives its full 128 KiB text argument", async () => {
+		const text = "ordinary native text\n".repeat(6554).slice(0, 128 * 1024);
+		const execute = mock(async (input: Record<string, unknown>) => {
+			expect(input.text).toBe(text);
+			return { output: "text received" };
+		});
+		toolRegistry.register({
+			name: EXTRA,
+			description: "accept text",
+			parameters: z.object({ text: z.string() }),
+			execute,
+		});
+		try {
+			reset([
+				() => ({ toolUses: [{ toolUseId: "large_native_text", name: EXTRA, input: { text } }] }),
+			]);
+			await drain(makeConfig({ toolFilter: (tool) => tool.name === EXTRA }));
+			expect(text).toHaveLength(128 * 1024);
+			expect(execute).toHaveBeenCalledTimes(1);
+			expect(toolOutputs).toEqual(["text received"]);
+			expect(requests).toHaveLength(2);
+		} finally {
+			toolRegistry.unregister(EXTRA);
+		}
 	});
 
 	test("rejects a declared tool that is no longer loaded", async () => {

@@ -7,9 +7,8 @@ import type { AgentConfig, ToolDefinition, ToolResult } from "../types";
  * command tools. After a switch, tools that don't specify a `device` parameter
  * run on the new default.
  *
- * The tool is only offered to a narrator when the session has online devices
- * (loop.ts filters it out otherwise), and its enum reflects the currently
- * reachable devices via getRawJsonSchema.
+ * The tool schema stays static; current device candidates live in prompt context.
+ * Every switch validates the current device inventory and runtime permissions.
  */
 export const switchDeviceTool: ToolDefinition = {
 	name: "SwitchDevice",
@@ -29,32 +28,6 @@ export const switchDeviceTool: ToolDefinition = {
 		},
 		required: ["device"],
 		additionalProperties: false,
-	},
-	getRawJsonSchema(config: AgentConfig) {
-		const devices = (config.availableDevices ?? []).filter((d) => d.online);
-		const enumValues = [
-			...(config.allowLocalExecution === false ? [] : [LOCAL_DEVICE_ID]),
-			...devices.map((d) => d.id),
-		];
-		const lines = devices.map((d) => {
-			const platform = d.platform ? ` [${d.platform.os}/${d.platform.arch}]` : "";
-			const purpose = d.description ? ` — ${d.description}` : "";
-			return `  • "${d.id}" (${d.name})${platform}${purpose}`;
-		});
-		return {
-			type: "object",
-			properties: {
-				device: {
-					type: "string",
-					enum: enumValues,
-					description:
-						`The device to make the session default. "${LOCAL_DEVICE_ID}" = NarraFork server.\n` +
-						`Available remote devices:\n${lines.join("\n")}`,
-				},
-			},
-			required: ["device"],
-			additionalProperties: false,
-		};
 	},
 	parameters: z.object({
 		device: z.string().describe('The device id to switch to, or "local".'),

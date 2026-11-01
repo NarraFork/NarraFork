@@ -617,7 +617,9 @@ export class LiveClient {
 			})();
 		if (hunks.length === 0) return null;
 		this.doc.transact(() => {
-			for (const h of [...hunks].sort((x, y) => y.start - x.start)) {
+			// Last first, so earlier offsets hold; hunks at one offset in reverse too (an insertion
+			// before a deletion there must be applied after it), as `applyHunks` reads them.
+			for (const h of [...hunks].sort((x, y) => x.start - y.start).reverse()) {
 				if (h.end > h.start) t.delete(h.start, h.end - h.start);
 				if (h.text) t.insert(h.start, h.text);
 			}

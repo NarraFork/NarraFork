@@ -24,7 +24,7 @@ import {
 	normalizeLineEndings,
 } from "../lib/agent/tools/encoding";
 import { wholeFileLineStats } from "../lib/agent/tools/file-diff-stats";
-import { getClientIp } from "../lib/client-ip";
+import { getClientIp, isLocalMachineAddress } from "../lib/client-ip";
 import { buildAttachmentDisposition } from "../lib/content-disposition";
 import { AppError, ValidationError } from "../lib/errors";
 import {
@@ -37,7 +37,6 @@ import { generateId } from "../lib/id";
 import { logger } from "../lib/logger";
 import { requireNarratorAccess } from "../lib/narrator-access";
 import { getHome, IS_LINUX, IS_MACOS, IS_WINDOWS } from "../lib/platform";
-import { isLoopbackHostname } from "../lib/public-origin";
 import { buildRevealUri, issueRevealToken } from "../lib/reveal-protocol";
 import { ensureRevealProtocolRegistered } from "../lib/reveal-protocol-registration";
 import { getLocalServerOrigin } from "../lib/server-restart";
@@ -246,7 +245,7 @@ fsRoutes.post("/reveal", async (c) => {
 	}
 
 	// A remote browser would activate the protocol on its own machine, so it keeps the direct launch.
-	if (IS_WINDOWS && isLoopbackHostname(getClientIp(c))) {
+	if (IS_WINDOWS && isLocalMachineAddress(getClientIp(c))) {
 		const origin = getLocalServerOrigin();
 		if (origin && ensureRevealProtocolRegistered(origin)) {
 			return c.json({ ok: true, protocolUrl: buildRevealUri(issueRevealToken(absPath)) });

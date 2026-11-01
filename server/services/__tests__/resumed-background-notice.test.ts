@@ -37,6 +37,7 @@ import {
 	formatBackgroundCompletionNotifications,
 } from "../bg-completion-queue";
 import * as passExecutor from "../narrator-executor";
+import { closePrefixSnapshotStore } from "../narrator-prefix-snapshots";
 import { projectPendingInjection } from "../parent-injection-queue";
 
 const provider: ProviderAdapter = {
@@ -57,7 +58,10 @@ beforeAll(() => {
 		listReadiness: () => [],
 	});
 });
-afterAll(() => unregisterProvider());
+afterAll(async () => {
+	await closePrefixSnapshotStore();
+	unregisterProvider();
+});
 
 describe("the run finalizer is the only notice producer", () => {
 	it("no started intent or separate announcer exists outside the finalizer", async () => {
@@ -143,6 +147,7 @@ describe("a user-continued run delivers its own result once", () => {
 		["completed", "x".repeat(12001)],
 	] as const) {
 		it(`projects this run's ${result.length}-character result and ${status === "completed" ? "wakes once" : "does not wake after stop"}`, async () => {
+			await closePrefixSnapshotStore();
 			cleanDb(sqlite);
 			runtimePublication.stop();
 			let wakes = 0;
@@ -246,6 +251,7 @@ describe("a user-continued run delivers its own result once", () => {
 			} finally {
 				execute.mockRestore();
 				runtimePublication.setWake(undefined);
+				await closePrefixSnapshotStore();
 				cleanDb(sqlite);
 			}
 		});

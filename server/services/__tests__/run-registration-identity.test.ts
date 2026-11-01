@@ -24,6 +24,7 @@ import { getRuntimePublicationService, runtimePublication } from "../agent-runti
 import { cancelRunsBoundTo, startNarratorRun } from "../agent-runtime/run";
 import { backgroundOccupancyStore } from "../background-occupancy-store";
 import * as executor from "../narrator-executor";
+import { closePrefixSnapshotStore } from "../narrator-prefix-snapshots";
 import {
 	drainAndPersistPendingInjections,
 	ensureNarrator,
@@ -56,6 +57,7 @@ const originalAutoContinuation = settings.agent.autoContinuationMode;
 
 beforeEach(async () => {
 	backgroundOccupancyStore.resetForTests();
+	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
 	await backgroundOccupancyStore.start();
 	resetTraitLayerCaches();
@@ -92,9 +94,11 @@ afterEach(async () => {
 	for (const id of activeNarrators.keys()) getExecutionOwner(id)?.release();
 	activeNarrators.clear();
 	resetTraitLayerCaches();
+	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
 });
-afterAll(() => {
+afterAll(async () => {
+	await closePrefixSnapshotStore();
 	backgroundOccupancyStore.resetForTests();
 	unregister();
 	settings.agent.autoContinuationMode = originalAutoContinuation;

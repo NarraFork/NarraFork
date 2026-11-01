@@ -115,6 +115,7 @@ import {
 	deleteRecipientMessageRefs,
 	updateRecipientMessageRef,
 } from "./narrator-persistence";
+import { attachPrefixHistorySource } from "./narrator-prefix-state";
 import { reconcileQuestionHistoryInTransaction } from "./narrator-question-history";
 import {
 	ensureRefsCoverMessage,
@@ -128,7 +129,6 @@ import {
 	type ScopedRevertOptions,
 } from "./narrator-scoped-revert";
 import { withNarratorWorkAdmission } from "./narrator-session-state";
-import { narratorStore } from "./narrator-store";
 import { attachSendTargetDetails } from "./send-delivery-resolution";
 import {
 	assertSnapshotRevertComplete,
@@ -3635,7 +3635,7 @@ const narratorMessageQueriesUnlocked = {
 				: { backend: "sqlite" as const, sqlite: modelHistoryDatabase.sqlite };
 		const source = await loadModelHistorySource(backend, narratorId, { ...options, limit });
 		// Lifecycle/metadata-only rows are control-plane data, never provider boundaries.
-		return source.messages
+		const messages = source.messages
 			.filter(
 				(message) =>
 					!isCompactLifecycleMessage(message) &&
@@ -3645,6 +3645,8 @@ const narratorMessageQueriesUnlocked = {
 				...message,
 				toolCalls: latestToolCallAttempts(message.toolCalls),
 			}));
+		attachPrefixHistorySource(messages, source);
+		return messages;
 	},
 
 	async getMessagesBefore(narratorId: string, beforeMessageId: string) {

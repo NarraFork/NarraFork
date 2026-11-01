@@ -29,6 +29,9 @@ const originalApply = api.applyUpdate;
 const originalCancel = api.cancelUpdate;
 const originalNotes = api.getUpdateNotes;
 const globals = new Map<string, PropertyDescriptor | undefined>();
+const pendingTimers = new Set<ReturnType<typeof setTimeout>>();
+const nativeSetTimeout = globalThis.setTimeout;
+const nativeClearTimeout = globalThis.clearTimeout;
 let root: Root | undefined;
 let container: HTMLElement;
 let client: QueryClient;
@@ -73,6 +76,24 @@ beforeEach(() => {
 		"Event",
 	])
 		install(key, key === "window" ? window : window[key as keyof typeof window]);
+	// linkedom's window timers delegate to globalThis. Own both timeout and RAF
+	// work for this DOM lifetime: Mantine's nested RAF can leave a transition
+	// timeout behind even after React unmounts its owner.
+	install(
+		"setTimeout",
+		(callback: (...args: unknown[]) => void, delay?: number, ...args: unknown[]) => {
+			const timer = nativeSetTimeout(() => {
+				pendingTimers.delete(timer);
+				callback(...args);
+			}, delay);
+			pendingTimers.add(timer);
+			return timer;
+		},
+	);
+	install("clearTimeout", (timer: ReturnType<typeof setTimeout>) => {
+		pendingTimers.delete(timer);
+		nativeClearTimeout(timer);
+	});
 	install("IS_REACT_ACT_ENVIRONMENT", true);
 	install("requestAnimationFrame", (callback: FrameRequestCallback) =>
 		setTimeout(() => callback(Date.now()), 0),
@@ -135,6 +156,8 @@ afterEach(async () => {
 	api.getSettings = originalGetSettings;
 	api.updateSettings = originalUpdateSettings;
 	await translation.changeLanguage("en");
+	clearDOMTimers();
+	expect(pendingTimers.size).toBe(0);
 	for (const [key, descriptor] of globals) {
 		if (descriptor) Object.defineProperty(globalThis, key, descriptor);
 		else Reflect.deleteProperty(globalThis, key);
@@ -142,6 +165,38 @@ afterEach(async () => {
 	globals.clear();
 });
 afterAll(() => mock.restore());
+
+function clearDOMTimers() {
+	for (const timer of pendingTimers) nativeClearTimeout(timer);
+	pendingTimers.clear();
+}
+
+test.each([
+	"nested RAF",
+	"transition timeout",
+])("DOM teardown cancels a pending %s before restoring window", async (stage) => {
+	let called = false;
+	await new Promise<void>((resolve) => {
+		requestAnimationFrame(() => {
+			requestAnimationFrame(() => {
+				if (stage === "nested RAF") called = true;
+				else {
+					window.setTimeout(() => {
+						called = true;
+					}, 10);
+					resolve();
+				}
+			});
+			if (stage === "nested RAF") resolve();
+		});
+	});
+	expect(pendingTimers.size).toBe(1);
+	clearDOMTimers();
+	expect(pendingTimers.size).toBe(0);
+	// Use the native clock so cleanup cannot cancel the verification itself.
+	await new Promise((resolve) => nativeSetTimeout(resolve, 20));
+	expect(called).toBe(false);
+});
 
 async function settle() {
 	await act(async () => {

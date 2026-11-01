@@ -7,7 +7,7 @@ import type { MediaRef } from "@shared/media-attachments";
 import { eq } from "drizzle-orm";
 import { modelInputText } from "../../../tests/fixtures/model-input";
 import { wavBytes, webmBytes } from "../../../tests/fixtures/native-media";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
 	narratorBufferedMessages,
 	narratorMessageRefs,
@@ -34,9 +34,9 @@ import type { ActiveNarrator } from "../narrator-session-state";
  * Those remain separate integration contracts; custom fallback below checks visibility,
  * not permission enforcement. Each file is intended to run in its own Bun process.
  */
-const { db, sqlite } = getTestDb();
-const realDb = { ...(await import("../../db")) };
-mock.module("../../db", () => ({ ...realDb, db, sqlite }));
+// Prefix/history workers must share the same file-backed DB as the real orchestrator.
+// Test preload supplies an isolated temporary database; do not replace it with :memory:.
+const { db, sqlite } = await import("../../db");
 const provider = await import("../../lib/agent/provider");
 const executor = await import("../narrator-executor");
 const orchestrator = await import("../agent-runtime/orchestrator");
@@ -53,6 +53,7 @@ const {
 type RunControl = import("../agent-runtime/ownership").RunControl;
 const { controlRun, startNarratorRun } = await import("../agent-runtime/run");
 const { activeNarrators } = await import("../narrator-session-state");
+const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
 const { backgroundOccupancyStore } = await import("../background-occupancy-store");
 const { settings } = await import("../../lib/settings");
 const { createPublicationOutbox } = await import("../agent-runtime/publication-outbox");
@@ -95,6 +96,8 @@ const { withRuntimePolicyTrait } = await import("../../lib/runtime-policy-trait"
 const childCeiling = withRuntimePolicyTrait([], await compileDelegationCeiling("general"));
 beforeEach(async () => {
 	backgroundOccupancyStore.resetForTests();
+	// A full fixture reset removes immutable assets; retire their worker/cache first.
+	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
 	await backgroundOccupancyStore.start();
 	settings.agent.autoContinuationMode = "off";
@@ -140,10 +143,10 @@ afterEach(async () => {
 	await backgroundOccupancyStore.flush();
 	mock.restore();
 });
-afterAll(() => {
+afterAll(async () => {
+	await closePrefixSnapshotStore();
 	backgroundOccupancyStore.resetForTests();
 	unregister();
-	mock.module("../../db", () => realDb);
 });
 
 const finished: ExecuteLoopResult = {
@@ -1061,9 +1064,11 @@ describe("real shared orchestrator profile contract", () => {
 				.from(narratorMessages)
 				.where(eq(narratorMessages.narratorId, h.session.narratorId))
 				.all();
-			expect(rows.filter((row) => row.role === "user")).toHaveLength(1);
-			expect(rows[0].origin).toBe("system");
-			const content = rows[0].contentText;
+			// An epoch marker may precede the continuation; assert the actual prompt row.
+			const prompts = rows.filter((row) => row.role === "user");
+			expect(prompts).toHaveLength(1);
+			expect(prompts[0].origin).toBe("system");
+			const content = prompts[0].contentText;
 			if (!content) throw new Error("Continuation must persist nonempty prompt text");
 			expect(JSON.stringify(h.calls[1].history)).toContain(content);
 			expect(h.calls[1].config.model).toBe(h.calls[0].config.model);

@@ -1377,7 +1377,9 @@ export class LivePage {
 		const r = merge3(from, to, current, { lenient: true });
 		if (!r.ok || r.result === current) return;
 		this.doc.transact(() => {
-			for (const h of [...r.patch].sort((a, b) => b.start - a.start)) {
+			// Last first, so earlier offsets hold; hunks at one offset in reverse too (an insertion
+			// before a deletion there must be applied after it), as `applyHunks` reads them.
+			for (const h of [...r.patch].sort((a, b) => a.start - b.start).reverse()) {
 				if (h.end > h.start) t.delete(h.start, h.end - h.start);
 				if (h.text) t.insert(h.start, h.text);
 			}

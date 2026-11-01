@@ -29,7 +29,7 @@ export const globTool: ToolDefinition = {
 		'- This tool does not enumerate spec:// Dynamic Spec virtual files; use Grep with path "spec://" or Read known spec:// files instead\n' +
 		"- When you are doing an open ended search that may require multiple rounds of globbing and grepping, use the Agent tool instead\n" +
 		"- You can call multiple tools in a single response. It is always better to speculatively perform multiple searches in parallel if they are potentially useful.",
-	rawJsonSchema: {
+	rawJsonSchema: withDeviceParam({
 		type: "object",
 		properties: {
 			pattern: {
@@ -49,10 +49,7 @@ export const globTool: ToolDefinition = {
 		},
 		required: ["pattern"],
 		additionalProperties: false,
-	},
-	getRawJsonSchema(config) {
-		return withDeviceParam(globTool.rawJsonSchema as Record<string, unknown>, config);
-	},
+	}),
 	parameters: z.object({
 		pattern: z.string().describe("Glob pattern to match files, e.g. '**/*.ts' or 'src/*.json'"),
 		path: z.string().optional().describe("Base directory to search from. Defaults to cwd"),

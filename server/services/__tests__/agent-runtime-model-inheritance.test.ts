@@ -2,16 +2,16 @@ import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } 
 import { EventEmitter } from "node:events";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import { narrators } from "../../db/schema";
 import type { ProviderAdapter } from "../../lib/agent/provider";
 import { delegationRegistration } from "../../lib/validators/runtime-registration";
 import type { ExecuteLoopOptions, ExecuteLoopResult } from "../narrator-executor";
 import type { ActiveNarrator } from "../narrator-session-state";
 
-const { db, sqlite } = getTestDb();
-const realDb = { ...(await import("../../db")) };
-mock.module("../../db", () => ({ ...realDb, db, sqlite }));
+// Share the preload-isolated file-backed DB with the real prefix/history workers.
+const { db, sqlite } = await import("../../db");
+const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
 const executor = await import("../narrator-executor");
 const { runAgentLoopUnlocked } = await import("../agent-runtime/orchestrator");
 const { narratorService } = await import("../narrator-service");
@@ -70,7 +70,8 @@ const finished: ExecuteLoopResult = {
 	completedNaturally: true,
 };
 let broadcasts: Array<Record<string, unknown>> = [];
-beforeEach(() => {
+beforeEach(async () => {
+	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
 	settings.agent.autoContinuationMode = "off";
 	settings.agent.defaultModel = A;
@@ -111,9 +112,9 @@ afterEach(async () => {
 	activeNarrators.delete(CHILD);
 	mock.restore();
 });
-afterAll(() => {
+afterAll(async () => {
+	await closePrefixSnapshotStore();
 	unregister();
-	mock.module("../../db", () => realDb);
 });
 
 function writeModel(id: string, model: string) {

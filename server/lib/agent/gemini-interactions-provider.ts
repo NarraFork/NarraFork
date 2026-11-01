@@ -36,7 +36,9 @@ import {
 	resolveOutputTokenLimit,
 } from "./provider-model-metadata";
 import { captureResponseStream, sanitizeHeaders } from "./request-dump";
+import { stringifyRequestBody } from "./request-json";
 import { parseJsonTextWithBody } from "./response-body";
+import { unsupportedResponseFormatReason } from "./response-format";
 import type { ToolLoadingTarget } from "./tool-loading";
 import { resolveToolJsonSchema } from "./tool-registry";
 import { ApiError, type ResolvedToolDefinition } from "./types";
@@ -322,8 +324,7 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 		});
 		body = await this.mediaFiles.prepare(body, "interactions", params.signal);
 		await reportInputCharacters(params, body);
-		const bodyText = JSON.stringify(body);
-		assertByteLimit(bodyText, GEMINI_MAX_STREAM_BYTES, "request body");
+		const bodyText = await stringifyRequestBody(body, params.signal);
 
 		const url = `${this.baseUrl()}/interactions`;
 		const headers = this.headers(true, params.conversationId);
@@ -389,7 +390,7 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 		systemInstruction?: string,
 		options?: GenerateOptions,
 	): Promise<GenerateMetaResult> {
-		return this.generateStreaming({
+		const result = await this.generateStreaming({
 			model,
 			systemInstruction,
 			userText: text,
@@ -399,6 +400,13 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 			onTextDelta: options?.onTextDelta,
 			onReasoningDelta: options?.onReasoningDelta,
 		});
+		// The Interactions surface has no JSON-Schema output mode, so a requested
+		// responseFormat is reported as degraded rather than silently dropped.
+		if (!options?.responseFormat || result.responseFormatDegraded) return result;
+		return {
+			...result,
+			responseFormatDegraded: unsupportedResponseFormatReason("Gemini Interactions"),
+		};
 	}
 
 	async generateWithHistory(
@@ -525,8 +533,7 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 			reasoningEffort: options.reasoningEffort,
 			stream: true,
 		});
-		const bodyText = JSON.stringify(body);
-		assertByteLimit(bodyText, GEMINI_MAX_STREAM_BYTES, "request body");
+		const bodyText = await stringifyRequestBody(body, options.signal);
 		const response = await this.pfetch(`${this.baseUrl()}/interactions`, {
 			method: "POST",
 			headers: this.headers(true),

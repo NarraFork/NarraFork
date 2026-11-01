@@ -34,6 +34,7 @@ mock.module("../../db", () => ({ ...realDbModule, db, sqlite }));
 // service module's binding initialization.
 await import("../narrator-service");
 const { narratorPersistence } = await import("../narrator-persistence");
+const { activeNarrators, resetActiveUpstreamSession } = await import("../narrator-session-state");
 
 const NARRATOR_ID = "n-convo-cas";
 
@@ -67,6 +68,27 @@ afterAll(() => {
 });
 
 describe("updateConversationId compare-and-set", () => {
+	test("compact transport reset preserves cache identity and persistence baseline", () => {
+		const active = {
+			alive: true,
+			conversationId: "stable-cache",
+			_persistedConversationId: "stable-cache",
+		} as import("../narrator-session-state").ActiveNarrator;
+		activeNarrators.set(NARRATOR_ID, active);
+		try {
+			expect(resetActiveUpstreamSession(NARRATOR_ID)).toBe(true);
+			expect(active._resetUpstreamSessionOnNextRequest).toBe(true);
+			expect(active.conversationId).toBe("stable-cache");
+			expect(active._persistedConversationId).toBe("stable-cache");
+			expect(resetActiveUpstreamSession(NARRATOR_ID, { persistedIdentityCleared: true })).toBe(
+				true,
+			);
+			expect(active.conversationId).toBe("stable-cache");
+			expect(active._persistedConversationId).toBeNull();
+		} finally {
+			activeNarrators.delete(NARRATOR_ID);
+		}
+	});
 	test("a compact's cleared id survives teardown of the turn that started it", async () => {
 		await seedNarrator("session-before-compact");
 

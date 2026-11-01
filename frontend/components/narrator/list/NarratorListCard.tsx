@@ -13,6 +13,7 @@ import { Link } from "@tanstack/react-router";
 import type { MouseEvent, PointerEvent, ReactNode } from "react";
 import { useCallback } from "react";
 import { useTranslation } from "react-i18next";
+import { useNarratorIsOptimizingPrompt } from "../../../hooks/usePromptOptimizeTask";
 import { FOLLOW_DEFAULT_MODEL, FOLLOW_PARENT_MODEL } from "../../../lib/constants";
 import { formatSmartTime } from "../../../lib/format";
 import { startPointerDrag } from "../../../lib/panel-drag";
@@ -347,6 +348,13 @@ function NarratorListStatusIcon({
 	const { t } = useTranslation("common");
 	const display = getEffectiveNarratorDisplay(narrator.status, narrator.substatus ?? undefined);
 	const statusLabel = t(display.i18nKey);
+	// Same registry the sidebar reads — the request belongs to the narrator, not to
+	// whichever composer happens to be mounted.
+	const isOptimizingPrompt = useNarratorIsOptimizingPrompt(narrator.id);
+	// The badge is decorative to sighted users but carries real state, so name it.
+	const accessibleLabel = isOptimizingPrompt
+		? `${statusLabel} · ${t("optimizeInProgress", { ns: "narrator" })}`
+		: statusLabel;
 	return (
 		<Tooltip
 			label={dragHint ? `${statusLabel} · ${dragHint}` : statusLabel}
@@ -354,13 +362,14 @@ function NarratorListStatusIcon({
 			position="top"
 			events={{ hover: true, focus: true, touch: true }}
 		>
-			<span role="img" aria-label={statusLabel} style={{ display: "inline-flex" }}>
+			<span role="img" aria-label={accessibleLabel} style={{ display: "inline-flex" }}>
 				<NarratorStatusIcon
 					size={size}
 					status={narrator.status}
 					substatus={narrator.substatus}
 					activeBackgroundWorkCount={narrator.activeBackgroundWorkCount}
 					activeBackgroundTaskCount={narrator.activeBackgroundTaskCount}
+					isOptimizingPrompt={isOptimizingPrompt}
 				/>
 			</span>
 		</Tooltip>

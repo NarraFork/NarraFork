@@ -363,11 +363,19 @@
 		},
 		{
 			"idx": 45,
-			"tag": "0045_native_media",
-			"id": "a9662244-fbcc-4328-be23-efc20c6d8229",
+			"tag": "0045_git_identity_visibility_per_account",
+			"id": "b47d28e4-7316-4e38-9be4-f1a8e6511385",
 			"prevId": "30f5ec4d-b57c-40b3-a85d-a69332fe44bf",
 			"version": "7",
-			"snapshotDigest": "ce2068e0365d4f8bbeab9d5066cdb9b130f4a7723c07a5fa5883d382e11f56a5"
+			"snapshotDigest": "0df0c95a008f04c6ee8417d09a6ae3b6f45ad319cec11796dbfe9c8200fa6ef1"
+		},
+		{
+			"idx": 46,
+			"tag": "0046_native_media",
+			"id": "71614315-f33e-46c0-88b6-e95b6e67c9dd",
+			"prevId": "b47d28e4-7316-4e38-9be4-f1a8e6511385",
+			"version": "7",
+			"snapshotDigest": "6becba7011b5539fc841039ace13ea528299c69377a3ddec0a4277c8e2655e39"
 		}
 	]
 }

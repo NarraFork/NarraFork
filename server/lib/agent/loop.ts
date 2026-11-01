@@ -42,8 +42,7 @@ import {
 	matchesSearchExecutionScope,
 	SearchExecutionBudgetExceededError,
 } from "../search/execution-scope";
-import { shouldUseNativeSearch, usesSideRequestNativeSearch } from "../search/native";
-import { hasUsableFunctionSearchChannelFor } from "../search/router";
+import { shouldUseNativeSearch } from "../search/native";
 import { getModelContextWindow, settings, usesStatefulModel } from "../settings";
 import { sideCarBodyWithText } from "../sidecar-templates";
 import { StreamStaleError } from "../stream-timeout";
@@ -106,6 +105,7 @@ import { ToolInputStream } from "./tool-input-stream";
 import {
 	formatRequestTools,
 	resolveAdapterToolLoadingStrategy,
+	ToolEpochError,
 	type ToolLoadingStrategy,
 	usesToolLoading,
 } from "./tool-loading";
@@ -151,11 +151,7 @@ import type {
 	ResolvedToolDefinition,
 	ToolDefinition,
 } from "./types";
-import {
-	PLAN_MODE_ALLOWED_TOOLS,
-	type ReasoningProviderMetadata,
-	TRANSIENT_RETRY_BASE_MS,
-} from "./types";
+import { type ReasoningProviderMetadata, TRANSIENT_RETRY_BASE_MS } from "./types";
 
 export { isRetryableError } from "./error-handling";
 
@@ -2799,8 +2795,8 @@ async function* agentLoopInMetadataSnapshot(
 	function materializeToolCandidates(
 		candidates: readonly ToolDefinition[],
 	): ResolvedToolDefinition[] {
-		let resolved = candidates
-			.filter((t) => t.name && (!t.isAvailable || t.isAvailable()))
+		const resolved = candidates
+			.filter((t) => t.name)
 			// Last line of defence before the wire. Providers validate the whole `tools`
 			// array and reject the entire request when one name breaks their alphabet
 			// (OpenAI: `Invalid 'tools[19].function.name': ... '^[a-zA-Z0-9_-]+$'`), so a
@@ -2813,41 +2809,21 @@ async function* agentLoopInMetadataSnapshot(
 				if (isValidToolName(t.name)) return true;
 				logger.warn("Dropping tool with a provider-invalid name", { toolName: t.name });
 				return false;
-			})
-			.map((t) => ({
-				...t,
-				description: typeof t.description === "function" ? t.description(config) : t.description,
-				rawJsonSchema: t.getRawJsonSchema ? t.getRawJsonSchema(config) : t.rawJsonSchema,
-			}));
+			});
 
-		// Keep the wire-level tool list identical for primary and reflection requests so
-		// provider prompt caches can share the same prefix. Reflection permissions remain
-		// narrow: the reflection loop's permissionHandler and executeTool checks enforce
-		// `reflectionLoop.allowedTools` when the model actually attempts a call.
-		if (config.toolFilter) {
-			resolved = resolved.filter((tool) => tool.reflectionOnly || config.toolFilter?.(tool));
+		// A published declaration is immutable. Availability, device state and policy
+		// changes are prompt updates; execution still checks the live gates. Standalone
+		// callers without an epoch retain their initial declaration ceiling.
+		if (!config.toolLoading?.baseToolNames && config.toolFilter) {
+			return resolved.filter((tool) => tool.reflectionOnly || config.toolFilter?.(tool));
 		}
-
-		// Keep SwitchDevice available for a stale remote default so the model can
-		// recover by explicitly switching back to local. TransferFile still requires
-		// at least one online remote endpoint.
-		return filterDeviceTools(resolved, config);
+		return resolved;
 	}
 
 	// Only a standalone first request without host candidates materializes the registry.
 	let allTools = materializeToolCandidates(
 		inheritedTools ? [] : (config.toolCandidates ?? toolRegistry.all()),
 	);
-
-	/**
-	 * Whether plan mode should currently blank out the forbidden tools' descriptions.
-	 *
-	 * Read live, not frozen: plan mode can be toggled MANUALLY while this pass runs, and
-	 * `config.planMode`/`relaxedPlan` are getters on the session's live state.
-	 */
-	function planModeDisablesTools(): boolean {
-		return !!config.planMode && !config.relaxedPlan;
-	}
 
 	function resolveToolsForProvider(
 		providerName: string,
@@ -2856,37 +2832,8 @@ async function* agentLoopInMetadataSnapshot(
 		let resolved = allTools;
 		// Inline native search (Codex): the provider declares its own search tool in
 		// the main request, so the function-style WebSearch is hidden entirely.
-		if (shouldUseNativeSearch(providerName, modelName)) {
+		if (!config.toolLoading?.baseToolNames && shouldUseNativeSearch(providerName, modelName)) {
 			resolved = resolved.filter((t) => t.name !== "WebSearch");
-		} else if (
-			// Hide WebSearch when every enabled channel would deterministically fail
-			// for THIS session's provider (the global isAvailable check can't see the
-			// session, so a native-only channel list would otherwise advertise a tool
-			// that always errors on non-opted providers).
-			resolved.some((t) => t.name === "WebSearch") &&
-			!(searchScope || config.runtimePolicy?.searchOnly
-				? (!searchScope || matchesSearchExecutionScope(providerName, modelName)) &&
-					usesSideRequestNativeSearch(providerName, modelName)
-				: hasUsableFunctionSearchChannelFor(providerName))
-		) {
-			resolved = resolved.filter((t) => t.name !== "WebSearch");
-		}
-
-		// In plan mode, override descriptions for forbidden tools so the model knows not to
-		// call them. Applied here rather than baked into `allTools` because a manual toggle
-		// can flip plan mode between turns, and `allTools` is built once per pass.
-		// Tool NAMES are preserved (required by some APIs for history consistency).
-		// When relaxedPlan is enabled, skip this — tools remain fully available.
-		if (planModeDisablesTools()) {
-			const disabledDesc = getToolMessage("planModeToolDisabled", locale);
-			resolved = resolved.map((t) =>
-				PLAN_MODE_ALLOWED_TOOLS.has(t.name)
-					? t
-					: {
-							...t,
-							description: disabledDesc,
-						},
-			);
 		}
 		return resolved;
 	}
@@ -2912,9 +2859,11 @@ async function* agentLoopInMetadataSnapshot(
 	let toolLoadingStrategy: ToolLoadingStrategy =
 		inheritedTools?.toolLoadingStrategy ?? "replace_tools";
 	function formatRequestToolsForProvider(): unknown[] {
-		toolLoadingStrategy = usesToolLoading(config.toolLoading)
-			? resolveAdapterToolLoadingStrategy(provider, effectiveModel)
-			: "replace_tools";
+		toolLoadingStrategy =
+			config.toolLoading?.strategy ??
+			(usesToolLoading(config.toolLoading)
+				? resolveAdapterToolLoadingStrategy(provider, effectiveModel)
+				: "replace_tools");
 		return formatRequestTools(
 			(selected) => provider.formatTools(selected),
 			resolveToolsForProvider(effectiveProvider, effectiveModel),
@@ -2925,13 +2874,6 @@ async function* agentLoopInMetadataSnapshot(
 
 	let tools = inheritedTools?.tools ?? formatRequestToolsForProvider();
 	await reportToolsCharacters(tools);
-	/**
-	 * The plan-mode tool-description state `tools` was formatted with.
-	 *
-	 * Compared at each turn boundary so a manual toggle re-formats the tool array, while an
-	 * unchanged state skips the ~30-tool schema conversion `formatTools` performs.
-	 */
-	let toolsPlanModeDisabled = planModeDisablesTools();
 	let turnIndex = 0;
 	/**
 	 * The last round ran tools after which an empty reply is a finish, not a fault: any
@@ -3310,7 +3252,12 @@ async function* agentLoopInMetadataSnapshot(
 		historyReplacements++;
 		// A per-request rebuild continues the same conversation; only a replacement that
 		// changes what was already sent (compact, model switch) starts a new upstream session.
-		if (!options.sameUpstreamSession) resetUpstreamSessionOnNextRequest = true;
+		const epochChanged =
+			replacement.toolLoading?.epochMarkerId !== config.toolLoading?.epochMarkerId;
+		const sameSystemPrompt =
+			replacement.systemPrompt === undefined || replacement.systemPrompt === config.systemPrompt;
+		if (epochChanged || !sameSystemPrompt || options.sameUpstreamSession === false)
+			resetUpstreamSessionOnNextRequest = true;
 		// The builder's array is the receipt identity; the system prompt goes into a copy.
 		sourceInputHistory = replacement.history;
 		replayedInjectionMessageIds = new Set(replacement.replayedInjectionMessageIds ?? []);
@@ -3383,9 +3330,6 @@ async function* agentLoopInMetadataSnapshot(
 				if (providerChanged || modelChanged) {
 					tools = formatRequestToolsForProvider();
 					await reportToolsCharacters(tools);
-					// This re-format already applied the current plan-mode state; record it so the
-					// turn-boundary check does not immediately redo the same work.
-					toolsPlanModeDisabled = planModeDisablesTools();
 				}
 			}
 
@@ -3423,6 +3367,7 @@ async function* agentLoopInMetadataSnapshot(
 				cause,
 			};
 		} catch (err) {
+			if (err instanceof ToolEpochError) throw err;
 			logger.warn("Failed to switch runtime settings during agent loop", {
 				narratorId: config.narratorId,
 				cause,
@@ -3483,33 +3428,24 @@ async function* agentLoopInMetadataSnapshot(
 						const replacement = await config.rebuildRequestHistory();
 						// A new system prompt (a compact landed) changes what was already sent.
 						applyHistoryReplacement(replacement, {
-							sameUpstreamSession: replacement.systemPrompt === undefined,
+							sameUpstreamSession:
+								replacement.systemPrompt === undefined ||
+								replacement.systemPrompt === config.systemPrompt,
 						});
 					} catch (error) {
 						if (config.signal.aborted) {
 							yield { type: "error", message: "Aborted" };
 							return;
 						}
+						// Storage failed at a prefix boundary, or the old view is no longer current.
+						// Reusing that transcript would disguise changed definitions as the old epoch.
+						if (error instanceof ToolEpochError || config.toolLoading) throw error;
 						logger.warn("Request history rebuild failed; projecting the loop's transcript", {
 							narratorId: config.narratorId,
 							turnIndex,
 							error: String(error),
 						});
 					}
-				}
-
-				// A manual plan-mode toggle landed between turns: re-format the tool array so
-				// the forbidden tools carry (or drop) the disabled description. Checked after
-				// onBeforeTurn because a model switch there already re-formatted the tools.
-				const planModeDisabledNow = planModeDisablesTools();
-				if (!inheritedTools && planModeDisabledNow !== toolsPlanModeDisabled) {
-					toolsPlanModeDisabled = planModeDisabledNow;
-					tools = formatRequestToolsForProvider();
-					await reportToolsCharacters(tools);
-					logger.info("Re-formatted tools after a mid-loop plan-mode change", {
-						narratorId: config.narratorId,
-						planModeDisablesTools: planModeDisabledNow,
-					});
 				}
 			}
 
@@ -4598,6 +4534,7 @@ async function* agentLoopInMetadataSnapshot(
 			// Settle every completed call through the normal permission/serial execution path
 			// before handing the interruption back to the caller's bounded retry budget.
 			let pendingResumableError: Extract<AgentEvent, { type: "resumable_error" }> | undefined;
+			let prefixPreparedForAttempt = true;
 			chatRetryLoop: for (;;) {
 				// Reset per-attempt accumulators so a retry starts with a clean slate.
 				// (On the first attempt these are already empty; on retries they may
@@ -4643,11 +4580,23 @@ async function* agentLoopInMetadataSnapshot(
 				// misleading "empty response" message.  It is cleared below when
 				// the attempt produces meaningful content.
 
+				const replacementsBeforeRetry = historyReplacements;
 				const retrySwitchEvent = await applyPendingRuntimeSettings("retry");
 				if (retrySwitchEvent) {
 					yield retrySwitchEvent;
 					resetRetryStateAfterModelSwitch();
 				}
+				// A retry is another provider request. Reconcile current context before
+				// sending it too, unless a model switch already rebuilt the same boundary.
+				if (
+					!prefixPreparedForAttempt &&
+					config.toolLoading?.baseToolNames &&
+					config.rebuildRequestHistory &&
+					historyReplacements === replacementsBeforeRetry
+				) {
+					applyHistoryReplacement(await config.rebuildRequestHistory());
+				}
+				prefixPreparedForAttempt = false;
 
 				// Generate unique request ID for this provider attempt (reset on each retry).
 				// The actual request start time is set by markRequestStarted() after the

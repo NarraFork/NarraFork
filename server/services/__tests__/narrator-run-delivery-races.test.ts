@@ -16,7 +16,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { and, eq } from "drizzle-orm";
-import { cleanDb, getTestDb } from "../../../tests/setup";
+import { cleanDb } from "../../../tests/setup";
 import {
 	backgroundTasks,
 	fileChangeExecutionSegments,
@@ -35,9 +35,9 @@ import { readRuntimeRegistrationColumn } from "../../lib/validators/runtime-regi
 
 import type { ExecuteLoopOptions, ExecuteLoopResult } from "../narrator-executor";
 
-const { db, sqlite } = getTestDb();
-const realDb = { ...(await import("../../db")) };
-mock.module("../../db", () => ({ ...realDb, db, sqlite }));
+// The snapshot worker shares the preload-isolated file-backed database.
+const { db, sqlite } = await import("../../db");
+const { closePrefixSnapshotStore } = await import("../narrator-prefix-snapshots");
 const broadcasts: Array<{ target: string; event: Record<string, unknown> }> = [];
 const realWs = { ...(await import("../../websocket/narrator-ws")) };
 mock.module("../../websocket/narrator-ws", () => ({
@@ -93,7 +93,8 @@ const NOW = "2026-09-30T00:00:00.000Z";
 let cwd: string;
 let seq = 0;
 
-beforeEach(() => {
+beforeEach(async () => {
+	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
 	seq = 0;
 	broadcasts.length = 0;
@@ -101,17 +102,18 @@ beforeEach(() => {
 	cwd = mkdtempSync(join(tmpdir(), "nf-run-races-"));
 	runtimePublication.stop();
 });
-afterEach(() => {
+afterEach(async () => {
 	getExecutionOwner(RUN)?.release();
 	activeNarrators.delete(RUN);
 	setRunHold(RUN, undefined);
 	mock.restore();
+	await closePrefixSnapshotStore();
 	cleanDb(sqlite);
 	rmSync(cwd, { recursive: true, force: true });
 });
-afterAll(() => {
+afterAll(async () => {
+	await closePrefixSnapshotStore();
 	unregisterProvider();
-	mock.module("../../db", () => realDb);
 	mock.module("../../websocket/narrator-ws", () => realWs);
 });
 

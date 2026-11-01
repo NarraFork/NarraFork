@@ -1,6 +1,6 @@
 {
-  "id": "a9662244-fbcc-4328-be23-efc20c6d8229",
-  "prevId": "30f5ec4d-b57c-40b3-a85d-a69332fe44bf",
+  "id": "71614315-f33e-46c0-88b6-e95b6e67c9dd",
+  "prevId": "b47d28e4-7316-4e38-9be4-f1a8e6511385",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -23198,6 +23198,20 @@
           "primaryKey": false,
           "notNull": true,
           "default": "'{}'"
+        },
+        "git_identity_context_menu": {
+          "name": "git_identity_context_menu",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
+        },
+        "git_identity_create_modal": {
+          "name": "git_identity_create_modal",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
         },
         "spec_tab_layout": {
           "name": "spec_tab_layout",

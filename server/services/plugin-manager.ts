@@ -17,7 +17,11 @@ import {
 	type PermissionScope,
 	permissionScopeSchema,
 } from "@server/lib/plugins/permissions";
-import { PROVIDER_REQUEST_MAX_BYTES } from "@server/lib/plugins/protocol";
+import {
+	PLUGIN_TOOL_INPUT_FRAME_MAX_BYTES,
+	PLUGIN_TOOL_OUTPUT_FRAME_MAX_BYTES,
+	PROVIDER_REQUEST_MAX_BYTES,
+} from "@server/lib/plugins/protocol";
 import { markExtraSearchChannelsReady } from "@server/lib/search/plugin-source";
 import { normalizeSearchSettings } from "@server/lib/search/settings";
 import { saveSettings, settings } from "@server/lib/settings";
@@ -2359,6 +2363,10 @@ export class PluginManager {
 				: server.workingDirectory === "pluginTemp"
 					? context.tempPath
 					: context.packagePath;
+		const hasServerTools = context.manifest.contributes.tools.some(
+			(tool) => tool.execution === "server",
+		);
+		const hasProviders = context.manifest.contributes.providers.length > 0;
 		return {
 			pluginId: context.pluginId,
 			pluginVersion: context.manifest.version,
@@ -2367,9 +2375,16 @@ export class PluginManager {
 			cwd,
 			runner,
 			rpcProtocol: server.protocol,
-			// Provider calls include full histories; keep all plugin-to-host frame limits small.
-			...(context.manifest.contributes.providers.length > 0
-				? { maxOutboundFrameBytes: PROVIDER_REQUEST_MAX_BYTES }
+			// Only server-tool plugins need larger replies. Mixed provider plugins retain
+			// their full-history request allowance; unrelated plugins keep their defaults.
+			...(hasServerTools ? { maxFrameBytes: PLUGIN_TOOL_OUTPUT_FRAME_MAX_BYTES } : {}),
+			...(hasServerTools || hasProviders
+				? {
+						maxOutboundFrameBytes: Math.max(
+							hasServerTools ? PLUGIN_TOOL_INPUT_FRAME_MAX_BYTES : 0,
+							hasProviders ? PROVIDER_REQUEST_MAX_BYTES : 0,
+						),
+					}
 				: {}),
 			hostApiVersion: HOST_API_VERSION,
 			grantedCapabilities: context.state.grants.capabilities,

@@ -101,6 +101,7 @@ export function MessageEditorPanel({
 	const optimizeHook = usePromptOptimize({
 		narratorId: narratorId ?? "",
 		messageId,
+		ready: !fullscreenOpened,
 		textareaRef: textarea,
 		onOptimized: setEditContent,
 	});

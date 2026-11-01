@@ -1,8 +1,31 @@
+import { createReadStream } from "node:fs";
 import { stat } from "node:fs/promises";
 import { resolve } from "node:path";
-import { MAX_PROJECT_INSTRUCTIONS_BYTES, readFileCapped } from "./read-file-capped";
+import { readFileCapped } from "./read-file-capped";
 
 type InstructionFile = NonNullable<Awaited<ReturnType<typeof readFileCapped>>>;
+type InstructionReader = (path: string, maxBytes?: number) => Promise<InstructionFile | null>;
+
+/** Bound each async read/decode, not the instruction file's total content. */
+const readInstructionFile: InstructionReader = async (path, maxBytes) => {
+	if (maxBytes !== undefined) return readFileCapped(path, maxBytes);
+	const chunks: string[] = [];
+	const stream = createReadStream(path, {
+		encoding: "utf8",
+		highWaterMark: 64 * 1024,
+		signal: AbortSignal.timeout(30_000),
+	});
+	try {
+		for await (const chunk of stream) chunks.push(chunk as string);
+		return { content: chunks.join(""), truncated: false };
+	} catch (error) {
+		const code = (error as NodeJS.ErrnoException).code;
+		if (code === "ENOENT" || code === "ENOTDIR") return null;
+		throw error;
+	} finally {
+		stream.destroy();
+	}
+};
 interface FileFacts {
 	size: number;
 	mtimeMs: number;
@@ -24,7 +47,7 @@ interface CacheOptions {
 	ttlMs?: number;
 	now?: () => number;
 	statFile?: (path: string) => Promise<FileFacts>;
-	readFile?: typeof readFileCapped;
+	readFile?: InstructionReader;
 }
 
 function signature(facts: FileFacts): string {
@@ -39,7 +62,7 @@ export class InstructionFileCache {
 	private readonly ttlMs: number;
 	private readonly now: () => number;
 	private readonly statFile: (path: string) => Promise<FileFacts>;
-	private readonly readFile: typeof readFileCapped;
+	private readonly readFile: InstructionReader;
 	private bytes = 0;
 
 	constructor(options: CacheOptions = {}) {
@@ -48,7 +71,7 @@ export class InstructionFileCache {
 		this.ttlMs = options.ttlMs ?? 60_000;
 		this.now = options.now ?? Date.now;
 		this.statFile = options.statFile ?? stat;
-		this.readFile = options.readFile ?? readFileCapped;
+		this.readFile = options.readFile ?? readInstructionFile;
 	}
 
 	private remove(key: string): void {
@@ -63,16 +86,9 @@ export class InstructionFileCache {
 		this.entries.set(key, entry);
 	}
 
-	async read(
-		path: string,
-		maxBytes = MAX_PROJECT_INSTRUCTIONS_BYTES,
-	): Promise<InstructionFile | null> {
-		if (
-			!Number.isSafeInteger(maxBytes) ||
-			maxBytes < 0 ||
-			maxBytes > MAX_PROJECT_INSTRUCTIONS_BYTES
-		)
-			throw new RangeError("Instruction read exceeds the capped file budget");
+	async read(path: string, maxBytes?: number): Promise<InstructionFile | null> {
+		if (maxBytes !== undefined && (!Number.isSafeInteger(maxBytes) || maxBytes < 0))
+			throw new RangeError("Instruction read cap must be a non-negative safe integer");
 		const absolutePath = resolve(path);
 		const key = JSON.stringify([absolutePath, maxBytes]);
 		let facts: FileFacts;
@@ -101,10 +117,13 @@ export class InstructionFileCache {
 		this.remove(key);
 		// Reserve decoded-string space before starting an in-flight read. Pending reads
 		// count towards both limits, and never leave an unbounded promise map behind.
-		const reservation = Math.min(facts.size, maxBytes) * 2 + 256;
-		for (const [oldKey, old] of this.entries) {
-			if (this.entries.size < this.maxEntries && this.bytes + reservation <= this.maxBytes) break;
-			if (!old.pending) this.remove(oldKey);
+		// The budget limits residency only: an oversized file is still read in full.
+		const reservation = Math.min(facts.size, maxBytes ?? facts.size) * 2 + 256;
+		if (reservation <= this.maxBytes) {
+			for (const [oldKey, old] of this.entries) {
+				if (this.entries.size < this.maxEntries && this.bytes + reservation <= this.maxBytes) break;
+				if (!old.pending) this.remove(oldKey);
+			}
 		}
 		const retain = this.entries.size < this.maxEntries && this.bytes + reservation <= this.maxBytes;
 		const entry: CacheEntry = { signature: observed, bytes: reservation, expiresAt: 0 };
@@ -114,7 +133,7 @@ export class InstructionFileCache {
 		}
 		const pending = this.readFile(absolutePath, maxBytes).then(async (value) => {
 			// An atomic replacement/change during the read cannot label new bytes with
-			// the old signature. Return the capped read, but do not retain the race.
+			// the old signature. Return the read, but do not retain the race.
 			const after = await this.statFile(absolutePath).catch(() => null);
 			if (this.entries.get(key) === entry) {
 				if (value && after?.isFile() && signature(after) === observed) {
@@ -147,7 +166,5 @@ export class InstructionFileCache {
 }
 
 const instructionFileCache = new InstructionFileCache();
-export const readInstructionFileCached = (
-	path: string,
-	maxBytes = MAX_PROJECT_INSTRUCTIONS_BYTES,
-) => instructionFileCache.read(path, maxBytes);
+export const readInstructionFileCached = (path: string, maxBytes?: number) =>
+	instructionFileCache.read(path, maxBytes);

@@ -15,6 +15,7 @@ import type { WebSearchAction } from "@shared/agent-protocol/types";
 import type { NativeMediaInput } from "@shared/media-attachments";
 import {
 	type CanonicalEnvelope,
+	type ContextUpdate,
 	isModelVisible,
 	type ToolChange,
 } from "@shared/narrator-blocks/types";
@@ -64,6 +65,8 @@ export interface NeutralInputItem {
 	images: ReadonlyArray<ResolvedImage | null>;
 	media?: readonly NativeMediaInput[];
 	toolChange?: ToolChange;
+	/** Host state replacement, not a new top-level system prompt. */
+	contextUpdate?: ContextUpdate;
 }
 
 export interface NeutralInputGroup {
@@ -316,6 +319,9 @@ export function toTurns(
 				? { media: assets.inputMedia.get(block.id) }
 				: {}),
 			...(block.kind === "context" && block.toolChange ? { toolChange: block.toolChange } : {}),
+			...(block.kind === "context" && block.contextUpdate
+				? { contextUpdate: block.contextUpdate }
+				: {}),
 		};
 		if (!group) {
 			group = { kind: "input", items: [] };
