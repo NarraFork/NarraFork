@@ -13,9 +13,9 @@ import {
 import { resolveProviderAndModel } from "@server/lib/agent/provider";
 import { addTrait, parseTraits } from "@server/lib/narrator-utils";
 import { and, eq, inArray, ne, notExists, sql } from "drizzle-orm";
-import { alias } from "drizzle-orm/sqlite-core";
+import { aliasedTable } from "drizzle-orm/alias";
 
-const otherRefs = alias(narratorMessageRefs, "other_refs");
+const otherRefs = aliasedTable(narratorMessageRefs, "other_refs");
 
 /** 不透明绑定键。调用方不要拆它；同一身份只通过 `modelTraceKeyFor` 生成。 */
 export function modelTraceKey(userId: string, provider: string, model: string): string {
