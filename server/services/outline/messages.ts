@@ -35,8 +35,50 @@ export const OUTLINE_TEXT = {
 	/** A restored or moved-back block whose old place among its siblings is taken. */
 	orderKeyMoved: (wanted: string) =>
 		`its old position (${wanted}) is taken; it was placed right after the block holding it`,
+	/** A write by no session or person left a task to do instead of in progress. */
+	taskNotStarted:
+		"it would be in progress with nobody doing it (a write by no session), so it was left to do",
 	/** Summary of a compensating commit. */
 	revertSummary: (seq: number, summary: string) => `revert #${seq}: ${summary}`,
+
+	/**
+	 * The block the lease expiry job writes under a task it reopens (design §4.5: the progress
+	 * under the task stays, and this records why it is open again).
+	 */
+	leaseExpired: {
+		/** Text before the session id (which is written as code). */
+		lead: (title: string | null) =>
+			`The previous executor's lease expired (session ${title ? `"${title}" ` : ""}`,
+		tail: "); the task is open again.",
+	},
+	/** The block the lease job writes under a task in progress that nobody was holding. */
+	unclaimedReopened:
+		"This task was in progress, but no session or person was holding it; it is open again.",
+	/** Summary of a commit that only hands tasks over (their lease had run out). */
+	claimTakenOver: (addresses: readonly string[]) =>
+		`took over ${addresses.join(", ")} (the previous lease had run out)`,
+	/** Added to the summary of a commit that ended tasks someone else was doing. */
+	endedClaims: (addresses: readonly string[]) =>
+		`ended work someone else was doing on ${addresses.join(", ")}`,
+	/** Summary of the lease expiry job's commit. */
+	leaseExpiredSummary: (n: number) =>
+		n === 1 ? "lease expired: 1 task reopened" : `lease expired: ${n} tasks reopened`,
+	/** Summary of the lease job's commit that reopens tasks in progress nobody was holding. */
+	unclaimedReopenedSummary: (n: number) =>
+		`nobody was doing it: ${n === 1 ? "1 task" : `${n} tasks`} reopened`,
+	/**
+	 * The block written under a task reopened because the session doing it (or the session its
+	 * subagent belongs to) was archived or deleted.
+	 */
+	sessionEnded: {
+		/** Text before the session id (which is written as code). */
+		lead: (reason: "archived" | "deleted", title: string | null) =>
+			`The previous executor's session was ${reason} (session ${title ? `"${title}" ` : ""}`,
+		tail: "); the task is open again.",
+	},
+	/** Summary of the commit that reopens the tasks of a session archived or deleted. */
+	sessionEndedSummary: (reason: "archived" | "deleted", n: number) =>
+		`session ${reason}: ${n === 1 ? "1 task" : `${n} tasks`} reopened`,
 
 	/** Why a read or search was refused. */
 	errors: {
@@ -177,6 +219,12 @@ export const OUTLINE_TOOL_TEXT = {
 		ambiguous: (ref: string, candidates: readonly string[]) =>
 			`${quoted(ref)} matches several blocks (${list(candidates)}); use an address`,
 		deletedBlock: (address: string) => `${address} is deleted`,
+		/** Setting a task to in progress claims it; someone else is doing it. */
+		taskClaimed: (address: string, holder: string) =>
+			`${address} is already being done by ${holder}; nothing was written. Pick another task, or ask them`,
+		claimHolderSession: (title: string | null, id: string) =>
+			title ? `the session ${quoted(title)} (${id})` : `the session ${id}`,
+		claimHolderPerson: (name: string | null, id: string) => (name ? `${name}` : `the person ${id}`),
 		oneSpace: (keys: readonly string[]) =>
 			`the edits touch several spaces (${list(keys)}); one OutlineEdit call writes one space, so split it into one call per space (blocks never move between spaces)`,
 		parseNote: (n: number, line: number, message: string) => `edit ${n}, line ${line}: ${message}`,
