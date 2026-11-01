@@ -250,14 +250,22 @@ describe("SQL-derived physical column order", () => {
 			1024 * 1024,
 		);
 		const [media, compensation, modeltraceCompensation] = sql.split("--> statement-breakpoint");
-		expect(run(modeltraceCompensation, {}).problems.join("\n")).toContain("Unknown SQL table narrators");
-		good([
-			"CREATE TABLE narrators(id text, hidden_from_lists boolean, modeltrace_key text);",
-			modeltraceCompensation,
-		], { narrators: ["id", "hidden_from_lists", "modeltrace_key"] });
+		expect(run(modeltraceCompensation, {}).problems.join("\n")).toContain(
+			"Unknown SQL table narrators",
+		);
+		good(
+			[
+				"CREATE TABLE narrators(id text, hidden_from_lists boolean, modeltrace_key text);",
+				modeltraceCompensation,
+			],
+			{ narrators: ["id", "hidden_from_lists", "modeltrace_key"] },
+		);
 		for (const changed of [
 			modeltraceCompensation.replace("AND NOT EXISTS", "AND EXISTS"),
-			modeltraceCompensation.replace("f2ecf4303ae75d856f1fe37c88ca9419e21131b8e34edbbef2d982a812945728", "unrelated"),
+			modeltraceCompensation.replace(
+				"f2ecf4303ae75d856f1fe37c88ca9419e21131b8e34edbbef2d982a812945728",
+				"unrelated",
+			),
 			modeltraceCompensation.replace("WHERE hash IN", "WHERE hash NOT IN"),
 		]) {
 			expect(run(changed, {}).problems.join("\n")).toContain("Unsupported SQL statement");

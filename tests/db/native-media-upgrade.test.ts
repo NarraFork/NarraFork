@@ -62,15 +62,23 @@ describe("native media migration upgrades", () => {
 	});
 
 	test("SQLite rejects recorded ModelTrace drift before applying later migrations", async () => {
-		const folder = await migrationFixture(resolve(import.meta.dir, "../../drizzle"), "0231_native_media", true);
+		const folder = await migrationFixture(
+			resolve(import.meta.dir, "../../drizzle"),
+			"0231_native_media",
+			true,
+		);
 		const db = new Database(":memory:");
 		try {
 			const hash = createHash("sha256")
 				.update(await readFile(join(folder, "0230_wealthy_sir_ram.sql")))
 				.digest("hex");
-			db.run("CREATE TABLE narrators (id text PRIMARY KEY, hidden_from_lists integer DEFAULT false NOT NULL, modeltrace_key text)");
+			db.run(
+				"CREATE TABLE narrators (id text PRIMARY KEY, hidden_from_lists integer DEFAULT false NOT NULL, modeltrace_key text)",
+			);
 			db.run("CREATE TABLE narrator_buffered_messages (id text PRIMARY KEY)");
-			db.run("CREATE TABLE __drizzle_migrations (id SERIAL PRIMARY KEY, hash text NOT NULL, created_at numeric)");
+			db.run(
+				"CREATE TABLE __drizzle_migrations (id SERIAL PRIMARY KEY, hash text NOT NULL, created_at numeric)",
+			);
 			db.run("INSERT INTO __drizzle_migrations (hash, created_at) VALUES (?, 1)", [hash]);
 			expect(() => applyPendingMigrationsByHash(db, folder)).toThrow(
 				"Incompatible SQLite modeltrace migration schema",
@@ -90,7 +98,9 @@ describe("native media migration upgrades", () => {
 		);
 		const db = new Database(":memory:");
 		try {
-			db.run("CREATE TABLE NARRATORS (id text PRIMARY KEY, HIDDEN_FROM_LISTS integer DEFAULT false NOT NULL, MODELTRACE_KEY text)");
+			db.run(
+				"CREATE TABLE NARRATORS (id text PRIMARY KEY, HIDDEN_FROM_LISTS integer DEFAULT false NOT NULL, MODELTRACE_KEY text)",
+			);
 			db.run("CREATE UNIQUE INDEX IDX_NARRATORS_MODELTRACE_KEY ON NARRATORS (MODELTRACE_KEY)");
 			applyPendingMigrationsByHash(db, folder);
 			applyPendingMigrationsByHash(db, folder);

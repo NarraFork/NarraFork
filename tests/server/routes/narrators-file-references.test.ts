@@ -22,13 +22,13 @@ import {
 	updateNarratorDraftSchema,
 } from "@server/lib/validators/narrators";
 import { type ComposerDocument, composerDocumentText } from "@shared/composer-document";
-import { MAX_MEDIA_ATTACHMENTS } from "@shared/media-attachments";
 import {
 	type FileReference,
 	type FileReferenceSnapshot,
 	fileReferenceMessageForDisplay,
 	MAX_FILE_REFERENCE_TEXT_BYTES,
 } from "@shared/file-reference";
+import { MAX_MEDIA_ATTACHMENTS } from "@shared/media-attachments";
 import {
 	MAX_EDIT_IMAGES_PER_MESSAGE,
 	MAX_EDIT_TEXT_FILES_PER_MESSAGE,
@@ -38,9 +38,9 @@ import { type Context, Hono } from "hono";
 // Execute the actual route bodies with injected boundaries. Importing the giant
 // router would initialize DB/migrations and agent services; this harness imports
 // neither, and does not globally mock modules used by other test suites.
-const source = await Bun.file(
-	new URL("../../../server/routes/narrators.ts", import.meta.url),
-).text().then((text) => text.replaceAll("\r\n", "\n"));
+const source = await Bun.file(new URL("../../../server/routes/narrators.ts", import.meta.url))
+	.text()
+	.then((text) => text.replaceAll("\r\n", "\n"));
 function section(start: string, end: string) {
 	const from = source.indexOf(start);
 	const to = source.indexOf(end, from + start.length);

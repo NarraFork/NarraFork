@@ -235,17 +235,26 @@ describe("runWithScanBudget", () => {
 
 	test("propagates a synchronous operation failure unchanged", async () => {
 		const failure = new Error("synchronous failure");
-		await expect(runWithScanBudget(5_000, undefined, () => {
-			throw failure;
-		})).rejects.toBe(failure);
+		await expect(
+			runWithScanBudget(5_000, undefined, () => {
+				throw failure;
+			}),
+		).rejects.toBe(failure);
 	});
 
-	test.each(["success", "failure"] as const)("removes its linked abort listener on %s", async (outcome) => {
+	test.each([
+		"success",
+		"failure",
+	] as const)("removes its linked abort listener on %s", async (outcome) => {
 		const removed: EventListenerOrEventListenerObject[] = [];
 		const failure = new Error("operation failed");
 		const running = runWithScanBudget(5_000, undefined, (linked) => {
 			const remove = linked.removeEventListener.bind(linked);
-			linked.removeEventListener = (type, listener, options) => {
+			linked.removeEventListener = (
+				type: string,
+				listener: EventListenerOrEventListenerObject,
+				options?: boolean | EventListenerOptions,
+			) => {
 				if (type === "abort" && listener) removed.push(listener);
 				remove(type, listener, options);
 			};
@@ -299,8 +308,10 @@ describe("runWithScanBudget", () => {
 
 	test("settles on caller cancellation even if the operation ignores it", async () => {
 		const controller = new AbortController();
-		const running = runWithScanBudget(5_000, controller.signal, async () =>
-			new Promise<never>(() => {}),
+		const running = runWithScanBudget(
+			5_000,
+			controller.signal,
+			async () => new Promise<never>(() => {}),
 		);
 		controller.abort();
 		await expect(running).rejects.toBeInstanceOf(DatabaseStorageScanCancelledError);
