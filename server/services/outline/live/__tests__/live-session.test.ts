@@ -557,3 +557,62 @@ describe("network", () => {
 		await runInLane(space.id, () => {});
 	});
 });
+
+describe("task claims", () => {
+	test("ticking a task another session is doing is refused; one nobody does is claimed", async () => {
+		const r = await writeOutline({
+			spaceId: space.id,
+			ops: [
+				{ op: "insert", tempId: "p", parent: null, content: "Plan" },
+				{ op: "insert", parent: { tempId: "p" }, content: "busy", task: { status: "todo" } },
+				{ op: "insert", parent: { tempId: "p" }, content: "free", task: { status: "todo" } },
+			],
+			actor: { kind: "human", id: owner },
+			responsibleUserId: owner,
+		});
+		const [pageId, busy, free] = r.results.map((x) => x.blockId) as [string, string, string];
+		const session = generateId();
+		await writeOutline({
+			spaceId: space.id,
+			ops: [{ op: "setTask", block: { id: busy }, task: { status: "doing" } }],
+			actor: { kind: "agent", id: session },
+			narratorId: session,
+			responsibleUserId: owner,
+		});
+		const a = open(link(writer), pageId);
+		await waitFor(() => a.ready, 3000, "joined");
+		// The same rule as every other writer: the session holds it, so starting it is refused.
+		struct(a, [{ t: "k", id: busy, task: "/" }]);
+		await waitFor(() => a.stats.rejects === 1, 3000, "refused");
+		await settle();
+		// The refusal says who is doing it (an old client reads only the code: `conflict`).
+		expect(a.lastReject).toEqual({
+			code: "conflict",
+			claimed: {
+				address: `${space.key}/${(await outlineStore.getBlock(busy))?.sid}`,
+				holder: { kind: "agent", id: session, name: null },
+			},
+		});
+		expect((await outlineStore.getTaskClaims([busy]))[0]).toMatchObject({
+			holderNarratorId: session,
+			epoch: 1,
+		});
+		// A person may end it, though: ticked done, the session's claim is released.
+		struct(a, [{ t: "k", id: busy, task: "x" }]);
+		await settle(60);
+		expect((await outlineStore.getBlock(busy))?.taskJson?.status).toBe("done");
+		expect((await outlineStore.getTaskClaims([busy]))[0]).toMatchObject({
+			holderNarratorId: null,
+			holderUserId: null,
+		});
+		struct(a, [{ t: "k", id: free, task: "/" }]);
+		await settle(60);
+		expect((await outlineStore.getBlock(free))?.taskJson?.status).toBe("doing");
+		expect((await outlineStore.getTaskClaims([free]))[0]).toMatchObject({
+			holderUserId: writer,
+			holderNarratorId: null,
+			expiresAt: null,
+			epoch: 1,
+		});
+	});
+});

@@ -5379,7 +5379,31 @@ export const knowledgePackActivations = sqliteTable(
 // commit, and every block keeps an append-only version history. Writes go through the outline
 // store port only; `server/services/outline/model.ts` states the write invariants.
 
-/** Task state of an outline block (`task_json`): checkbox, assignee, prerequisites, due date. */
+/** Who a task field names: a person (user id), a session (narrator id) or the system. */
+export interface OutlineTaskActorRef {
+	kind: "human" | "agent" | "system";
+	id: string;
+}
+
+/**
+ * A locked task tree (design §2.2): who locked it, the agent the locker lets confirm step
+ * changes on their behalf, and the version it was locked at. Stored here only; the rules that
+ * follow from a lock are enforced elsewhere.
+ */
+export interface OutlineTaskLockJson {
+	by: OutlineTaskActorRef;
+	/** Narrator id of the agent that may confirm on the locker's behalf (R19), or null. */
+	delegate: string | null;
+	/** Seq of the commit that locked the task: the plan as locked is the space as of it. */
+	versionSeq: number;
+}
+
+/**
+ * Task state of an outline block (`task_json`): checkbox, assignee, prerequisites, due date, and
+ * the P2 fields. Rows written before a field existed simply lack it; every optional field reads
+ * as its default when absent (no manager known, not human-created, not locked, not claimable),
+ * and a default is never written out, so old and new rows compare equal.
+ */
 export interface OutlineTaskJson {
 	status: TaskStatus;
 	/** `agent:name` or `human:name`, without the `@`. */
@@ -5388,6 +5412,14 @@ export interface OutlineTaskJson {
 	depends?: LinkTarget[];
 	/** `due::` as written: `YYYY-MM-DD` with an optional time. */
 	due?: string;
+	/** Who created the task (the person or session that manages it); set when it becomes a task. */
+	manager?: OutlineTaskActorRef;
+	/** Created by a person through `/goal` or the interface (design §4.8); absent means false. */
+	humanCreated?: true;
+	/** Present while the task tree is locked. */
+	lock?: OutlineTaskLockJson;
+	/** In the claimable pool (design §4.5, D38); absent means false. */
+	claimable?: true;
 }
 
 // === outline_spaces ===
@@ -5414,9 +5446,26 @@ export const outlineSpaces = sqliteTable(
 		ownerUserId: text("owner_user_id").references(() => users.id, { onDelete: "set null" }),
 		nextSeq: integer("next_seq").notNull().default(1),
 		createdAt: text("created_at").notNull(),
+		/**
+		 * Whether every live block's `outline_blocks.in_process` has been derived. Spaces created
+		 * after the column existed are written true; older ones, and a space whose commit changed
+		 * more answers than the commit's row limit, wait for the background rebuild
+		 * (`services/outline/in-process.ts`), which sets it once the space is done. Until then
+		 * readers compute the answer from the tree instead of reading the column.
+		 */
+		inProcessReady: integer("in_process_ready", { mode: "boolean" }).notNull().default(false),
+		/**
+		 * Grows whenever the in-process answers of the space change outside an ordinary commit
+		 * (a rebuild writing rows or marking the space derived, a commit marking it not derived).
+		 * A commit is planned against it as against `next_seq`, so a plan that read answers the
+		 * rebuild has since rewritten is refused as stale and planned again.
+		 */
+		inProcessEpoch: integer("in_process_epoch").notNull().default(0),
 	},
 	(table) => [
 		uniqueIndex("uq_outline_spaces_key").on(table.key),
+		// Spaces the in-process rebuild still has to visit; empty once it has run.
+		index("idx_outline_spaces_in_process_pending").on(table.id).where(sql`"in_process_ready" = 0`),
 		uniqueIndex("uq_outline_spaces_project").on(table.projectId).where(sql`"kind" = 'project'`),
 		uniqueIndex("uq_outline_spaces_personal").on(table.ownerUserId).where(sql`"kind" = 'personal'`),
 		uniqueIndex("uq_outline_spaces_session").on(table.narratorId).where(sql`"kind" = 'session'`),
@@ -5439,6 +5488,13 @@ export const outlineSpaces = sqliteTable(
  * `parent_id` and `page_id` carry no foreign key: the write path validates them, and a space is
  * only ever removed as a whole. Aliases are unique among the live blocks of a space; `sid` is
  * unique in the space for good, deleted blocks included.
+ *
+ * `in_process` is a derived cache, not history: whether the block is process (a task, under a
+ * task, or in a session space; design §2.1). The write path keeps it in step for every live
+ * block in the commit that changes it (a checkbox, a move, an insert); when that would pass the
+ * commit's row limit, the commit is written anyway and marks its space for the background
+ * rebuild (`outline_spaces.in_process_ready`). It is not part of a version, because the same
+ * answer as of any seq follows from that seq's tree. Deleted blocks keep whatever they had.
  */
 export const outlineBlocks = sqliteTable(
 	"outline_blocks",
@@ -5463,6 +5519,7 @@ export const outlineBlocks = sqliteTable(
 		authorId: text("author_id").notNull(),
 		versionSeq: integer("version_seq").notNull(),
 		deleted: integer("deleted", { mode: "boolean" }).notNull().default(false),
+		inProcess: integer("in_process", { mode: "boolean" }).notNull().default(false),
 	},
 	(table) => [
 		uniqueIndex("uq_outline_blocks_space_sid").on(table.spaceId, table.sid),
@@ -5471,6 +5528,14 @@ export const outlineBlocks = sqliteTable(
 			.where(sql`"alias" IS NOT NULL AND "deleted" = 0`),
 		index("idx_outline_blocks_page").on(table.pageId),
 		index("idx_outline_blocks_children").on(table.spaceId, table.parentId, table.orderKey),
+		// Open tasks of a space (to do or in progress, live): the continuation candidates.
+		index("idx_outline_blocks_open_tasks")
+			.on(table.spaceId)
+			.where(sql`json_extract("task_json", '$.status') IN ('todo', 'doing') AND "deleted" = 0`),
+		// Live tasks in progress, across spaces: the lease job finds those nobody holds.
+		index("idx_outline_blocks_doing_tasks")
+			.on(table.id)
+			.where(sql`json_extract("task_json", '$.status') = 'doing' AND "deleted" = 0`),
 	],
 );
 
@@ -5571,6 +5636,57 @@ export const outlineLinks = sqliteTable(
 		index("idx_outline_links_from").on(table.fromBlockId, table.toSeq),
 		// Backlinks: who links to this target.
 		index("idx_outline_links_target").on(table.targetKind, table.targetRef),
+	],
+);
+
+// === outline_task_claims ===
+/**
+ * Who is doing a task (design §4.5, §7.1): one row per task block that was ever claimed. Setting
+ * a task to in progress claims it, in the same commit; finishing, cancelling or reopening it, or
+ * deleting the block, releases it (the holder columns become null), and the row stays so the
+ * claim generation keeps counting.
+ *
+ *   - A session's claim (`holder_narrator_id`) is a lease: `expires_at` moves on while the
+ *     session runs, and a background job reopens a task whose lease ran out.
+ *   - A person's claim (`holder_user_id`) has no lease (`expires_at` null): nobody renews it, so
+ *     it lasts until the task leaves in progress.
+ *
+ * `epoch` is the claim generation: it grows by one every time the task is claimed by someone
+ * other than the current holder (or claimed again after a release), so a result that carries an
+ * older epoch arrived after the task changed hands. `task_version_at_claim` is the task block's
+ * `version_seq` right after the claiming commit.
+ *
+ * A release moves the holder into `last_holder_*`: undoing the commit that ended a task gives it
+ * back to whoever was doing it.
+ *
+ * The holder ids carry no foreign key, like the commit's actor ids: a claim of a session that is
+ * gone simply runs out.
+ */
+export const outlineTaskClaims = sqliteTable(
+	"outline_task_claims",
+	{
+		taskBlockId: text("task_block_id")
+			.primaryKey()
+			.references(() => outlineBlocks.id, { onDelete: "cascade" }),
+		holderNarratorId: text("holder_narrator_id"),
+		holderUserId: text("holder_user_id"),
+		epoch: integer("epoch").notNull(),
+		taskVersionAtClaim: integer("task_version_at_claim").notNull(),
+		claimedAt: text("claimed_at").notNull(),
+		expiresAt: text("expires_at"),
+		/** Who held the claim when it was last released (null while held, or never released). */
+		lastHolderNarratorId: text("last_holder_narrator_id"),
+		lastHolderUserId: text("last_holder_user_id"),
+	},
+	(table) => [
+		// A session's claims: continuation candidates and lease renewal.
+		index("idx_outline_task_claims_holder")
+			.on(table.holderNarratorId)
+			.where(sql`"holder_narrator_id" IS NOT NULL`),
+		// Leases by end: the expiry job reads the oldest first.
+		index("idx_outline_task_claims_expiry")
+			.on(table.expiresAt)
+			.where(sql`"expires_at" IS NOT NULL`),
 	],
 );
 
