@@ -83,7 +83,7 @@ describe("resolveToolPlacement", () => {
 });
 
 describe("resolveToolPlacement wide panels", () => {
-	test("a wide panel splits below chat even when a secondary group exists", () => {
+	test("a wide panel splits above chat even when a secondary group exists", () => {
 		expect(
 			resolveToolPlacement({
 				hasSecondaryGroup: true,
@@ -92,7 +92,7 @@ describe("resolveToolPlacement wide panels", () => {
 				surfaceHeight: 900,
 				wide: true,
 			}),
-		).toEqual({ mode: "split-below", initialHeight: 380 });
+		).toEqual({ mode: "split-above", initialHeight: 380 });
 		expect(
 			resolveToolPlacement({
 				hasSecondaryGroup: false,
@@ -101,7 +101,7 @@ describe("resolveToolPlacement wide panels", () => {
 				surfaceHeight: 400,
 				wide: true,
 			}),
-		).toEqual({ mode: "split-below", initialHeight: 220 });
+		).toEqual({ mode: "split-above", initialHeight: 220 });
 	});
 
 	test("without chat a wide panel falls back to the normal rules", () => {

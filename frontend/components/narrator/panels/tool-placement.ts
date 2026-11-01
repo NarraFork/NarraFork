@@ -21,11 +21,11 @@ export function resolveFileBrowserPosition(api: DockviewApi, sourcePanelId?: str
 /**
  * Tool panels whose content is a horizontal strip (a timeline): stacked as a tab in
  * the ~1/3-wide right column they would be unreadably narrow, so they open as their
- * own group BELOW chat instead.
+ * own group ABOVE chat instead, where the reader looks first.
  */
 export const WIDE_TOOL_PANEL_TYPES: ReadonlySet<string> = new Set(["timeline"]);
 
-/** Initial height of a wide panel split below chat. */
+/** Initial height of a wide panel split above chat. */
 export const WIDE_TOOL_PANEL_HEIGHT = 380;
 
 /** Share of the surface a wide panel may take when the surface is short. */
@@ -43,7 +43,7 @@ export interface ToolPlacementInputs {
 export type ToolPlacement =
 	| { mode: "within-secondary" }
 	| { mode: "split-right"; initialWidth: number | undefined }
-	| { mode: "split-below"; initialHeight: number | undefined }
+	| { mode: "split-above"; initialHeight: number | undefined }
 	| { mode: "standalone" };
 
 /**
@@ -59,7 +59,7 @@ export function resolveToolPlacement(
 	if (inputs.wide && inputs.hasChatPanel) {
 		const height = inputs.surfaceHeight ?? 0;
 		return {
-			mode: "split-below",
+			mode: "split-above",
 			initialHeight:
 				height > 0
 					? Math.min(WIDE_TOOL_PANEL_HEIGHT, Math.round(height * WIDE_TOOL_PANEL_MAX_SHARE))

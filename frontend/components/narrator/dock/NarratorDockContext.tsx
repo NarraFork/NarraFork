@@ -329,13 +329,13 @@ export function NarratorDockProvider({
 				wide: WIDE_TOOL_PANEL_TYPES.has(type),
 			});
 
-			if (placement.mode === "split-below" && chatPanel) {
+			if (placement.mode === "split-above" && chatPanel) {
 				api.addPanel<NarratorDockPanelParams>({
 					id,
 					component: NARRATOR_DOCK_COMPONENT[type],
 					params,
 					initialHeight: placement.initialHeight,
-					position: { referencePanel: chatPanel.id, direction: "below" },
+					position: { referencePanel: chatPanel.id, direction: "above" },
 				});
 				return;
 			}
