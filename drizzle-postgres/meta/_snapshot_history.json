@@ -371,11 +371,19 @@
 		},
 		{
 			"idx": 46,
-			"tag": "0046_native_media",
-			"id": "71614315-f33e-46c0-88b6-e95b6e67c9dd",
+			"tag": "0046_outline_task_claims",
+			"id": "87e33132-68f8-41ad-9605-925309958431",
 			"prevId": "b47d28e4-7316-4e38-9be4-f1a8e6511385",
 			"version": "7",
-			"snapshotDigest": "6becba7011b5539fc841039ace13ea528299c69377a3ddec0a4277c8e2655e39"
+			"snapshotDigest": "a1bccd52e606b667f8ccbcc44ffe135c3c9339b242019b0bfb1a8e8c621c2c26"
+		},
+		{
+			"idx": 47,
+			"tag": "0047_native_media",
+			"id": "5ac21501-be67-4be3-b3bb-5bd339833e99",
+			"prevId": "87e33132-68f8-41ad-9605-925309958431",
+			"version": "7",
+			"snapshotDigest": "f28261c37262d9732e294aaa76d4e8abc71f7776c15bbfbd20c94c9844119319"
 		}
 	]
 }

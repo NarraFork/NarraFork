@@ -523,8 +523,8 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 133 tables and 1746 columns including the outline storage tables", () => {
-		expect(target.tables.length).toBe(133);
+	test("covers 134 tables and 1758 columns including the outline storage tables", () => {
+		expect(target.tables.length).toBe(134);
 		// 1714 SQLite-derived columns include disk_outcome and the two editor recovery columns,
 		// plus the three PG-only insert_seq identity columns.
 		// The numeric context stats replace the 5-column page cache with pins (3) and stats (4).
@@ -543,7 +543,9 @@ describe("real schema parity", () => {
 		// outline_live_updates (7) and outline_view_state (5).
 		// Account-scoped Git identity entry visibility adds two user_preferences columns.
 		// Native media adds narrator_buffered_messages.media_json.
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1746);
+		// Outline tasks (P2) add outline_task_claims (9), outline_blocks.in_process,
+		// outline_spaces.in_process_ready and outline_spaces.in_process_epoch.
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1758);
 		expect(
 			target.tables
 				.find((table) => table.name === "narrator_context_pins")

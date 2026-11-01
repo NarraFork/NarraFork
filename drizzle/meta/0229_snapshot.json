@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "6e62bc09-87bb-48a0-9c3b-215a1f10aac0",
+  "id": "09b3e729-52e0-428a-b1ca-57ba9f807ecb",
   "prevId": "e2d2045b-1196-467c-9ac0-dc34403d1f01",
   "tables": {
     "acl_events": {
@@ -8437,13 +8437,6 @@
           "notNull": false,
           "autoincrement": false
         },
-        "media_json": {
-          "name": "media_json",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
         "command_text": {
           "name": "command_text",
           "type": "text",
@@ -14520,6 +14513,14 @@
           "notNull": true,
           "autoincrement": false,
           "default": false
+        },
+        "in_process": {
+          "name": "in_process",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": false
         }
       },
       "indexes": {
@@ -14555,6 +14556,22 @@
             "order_key"
           ],
           "isUnique": false
+        },
+        "idx_outline_blocks_open_tasks": {
+          "name": "idx_outline_blocks_open_tasks",
+          "columns": [
+            "space_id"
+          ],
+          "isUnique": false,
+          "where": "json_extract(\"task_json\", '$.status') IN ('todo', 'doing') AND \"deleted\" = 0"
+        },
+        "idx_outline_blocks_doing_tasks": {
+          "name": "idx_outline_blocks_doing_tasks",
+          "columns": [
+            "id"
+          ],
+          "isUnique": false,
+          "where": "json_extract(\"task_json\", '$.status') = 'doing' AND \"deleted\" = 0"
         }
       },
       "foreignKeys": {
@@ -14940,6 +14957,22 @@
           "primaryKey": false,
           "notNull": true,
           "autoincrement": false
+        },
+        "in_process_ready": {
+          "name": "in_process_ready",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": false
+        },
+        "in_process_epoch": {
+          "name": "in_process_epoch",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": 0
         }
       },
       "indexes": {
@@ -14949,6 +14982,14 @@
             "key"
           ],
           "isUnique": true
+        },
+        "idx_outline_spaces_in_process_pending": {
+          "name": "idx_outline_spaces_in_process_pending",
+          "columns": [
+            "id"
+          ],
+          "isUnique": false,
+          "where": "\"in_process_ready\" = 0"
         },
         "uq_outline_spaces_project": {
           "name": "uq_outline_spaces_project",
@@ -15034,6 +15075,110 @@
             "id"
           ],
           "onDelete": "set null",
+          "onUpdate": "no action"
+        }
+      },
+      "compositePrimaryKeys": {},
+      "uniqueConstraints": {},
+      "checkConstraints": {}
+    },
+    "outline_task_claims": {
+      "name": "outline_task_claims",
+      "columns": {
+        "task_block_id": {
+          "name": "task_block_id",
+          "type": "text",
+          "primaryKey": true,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "holder_narrator_id": {
+          "name": "holder_narrator_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "holder_user_id": {
+          "name": "holder_user_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "epoch": {
+          "name": "epoch",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "task_version_at_claim": {
+          "name": "task_version_at_claim",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "claimed_at": {
+          "name": "claimed_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "expires_at": {
+          "name": "expires_at",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "last_holder_narrator_id": {
+          "name": "last_holder_narrator_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
+        "last_holder_user_id": {
+          "name": "last_holder_user_id",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        }
+      },
+      "indexes": {
+        "idx_outline_task_claims_holder": {
+          "name": "idx_outline_task_claims_holder",
+          "columns": [
+            "holder_narrator_id"
+          ],
+          "isUnique": false,
+          "where": "\"holder_narrator_id\" IS NOT NULL"
+        },
+        "idx_outline_task_claims_expiry": {
+          "name": "idx_outline_task_claims_expiry",
+          "columns": [
+            "expires_at"
+          ],
+          "isUnique": false,
+          "where": "\"expires_at\" IS NOT NULL"
+        }
+      },
+      "foreignKeys": {
+        "outline_task_claims_task_block_id_outline_blocks_id_fk": {
+          "name": "outline_task_claims_task_block_id_outline_blocks_id_fk",
+          "tableFrom": "outline_task_claims",
+          "tableTo": "outline_blocks",
+          "columnsFrom": [
+            "task_block_id"
+          ],
+          "columnsTo": [
+            "id"
+          ],
+          "onDelete": "cascade",
           "onUpdate": "no action"
         }
       },

@@ -213,6 +213,7 @@ import { generateAndSetTitle } from "../narrator-title";
 import { abandonSessionTreeSnapshots } from "../narrator-tree-snapshot-hooks";
 import { endTurn, startTurn } from "../narrator-turns";
 import { assertOAuthNarratorRuntimeActive } from "../oauth-narrator-runtime-policy";
+import { keepOutlineTaskLeases, type OutlineLeaseKeeper } from "../outline/lease-keeper";
 import { resolvePlanApprovalAttribution } from "../plan-approval-attribution";
 import { subagentRetryRecoveredBroadcast } from "../subagent-executor";
 import { isMcpToolAllowedForNarrator, runtimeToolFilter } from "../subagent-tools";
@@ -868,8 +869,13 @@ export async function runAgentLoopUnlocked(
 		aborted: true,
 	});
 
+	// Outline tasks this session set in progress stay its own while it runs (renewed at run start,
+	// at each pass and tool boundary, and on a timer through long tool calls).
+	let outlineLeases: OutlineLeaseKeeper | undefined;
 	try {
+		outlineLeases = keepOutlineTaskLeases(narratorId);
 		while (active.alive && owner.isCurrent()) {
+			void outlineLeases.touch();
 			// The run's own cancellation reaches whichever turn controller is current.
 			if (run?.cancel.signal.aborted && !active.abortController.signal.aborted)
 				active.abortController.abort(run.cancel.signal.reason);
@@ -1629,6 +1635,7 @@ export async function runAgentLoopUnlocked(
 					active._usedCompactSummary = false;
 				},
 				onToolResult: (event) => {
+					void outlineLeases?.touch();
 					if (!event.isError || event.toolName !== SHELL_TOOL_NAME) return;
 					const recovery = getMissingWorkingDirectoryRecovery(event.metadata);
 					if (!recovery) return;
@@ -3353,6 +3360,9 @@ export async function runAgentLoopUnlocked(
 		runState.hadError = true;
 		active.events.emit("event", { type: "error", data: { message: errorMsg } });
 	} finally {
+		// The run ended: the session's claims go on the idle lease while it waits for its next
+		// turn, a subagent's pass to its root (not waited for).
+		void outlineLeases?.stop();
 		if (run && !freshInput && (!getRunHold(narratorId) || getRunHold(narratorId)?.released))
 			run.finalizing = true;
 		unregisterUpdateLoop();
