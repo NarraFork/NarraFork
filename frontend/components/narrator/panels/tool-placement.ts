@@ -26,7 +26,10 @@ export function resolveFileBrowserPosition(api: DockviewApi, sourcePanelId?: str
 export const WIDE_TOOL_PANEL_TYPES: ReadonlySet<string> = new Set(["timeline"]);
 
 /** Initial height of a wide panel split below chat. */
-export const WIDE_TOOL_PANEL_HEIGHT = 300;
+export const WIDE_TOOL_PANEL_HEIGHT = 380;
+
+/** Share of the surface a wide panel may take when the surface is short. */
+export const WIDE_TOOL_PANEL_MAX_SHARE = 0.55;
 
 export interface ToolPlacementInputs {
 	/** Whether a secondary (tool) group already exists in the surface. */
@@ -58,7 +61,9 @@ export function resolveToolPlacement(
 		return {
 			mode: "split-below",
 			initialHeight:
-				height > 0 ? Math.min(WIDE_TOOL_PANEL_HEIGHT, Math.round(height * 0.45)) : undefined,
+				height > 0
+					? Math.min(WIDE_TOOL_PANEL_HEIGHT, Math.round(height * WIDE_TOOL_PANEL_MAX_SHARE))
+					: undefined,
 		};
 	}
 	if (inputs.hasSecondaryGroup) return { mode: "within-secondary" };

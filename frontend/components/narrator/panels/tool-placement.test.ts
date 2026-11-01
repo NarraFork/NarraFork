@@ -92,7 +92,7 @@ describe("resolveToolPlacement wide panels", () => {
 				surfaceHeight: 900,
 				wide: true,
 			}),
-		).toEqual({ mode: "split-below", initialHeight: 300 });
+		).toEqual({ mode: "split-below", initialHeight: 380 });
 		expect(
 			resolveToolPlacement({
 				hasSecondaryGroup: false,
@@ -101,7 +101,7 @@ describe("resolveToolPlacement wide panels", () => {
 				surfaceHeight: 400,
 				wide: true,
 			}),
-		).toEqual({ mode: "split-below", initialHeight: 180 });
+		).toEqual({ mode: "split-below", initialHeight: 220 });
 	});
 
 	test("without chat a wide panel falls back to the normal rules", () => {
