@@ -156,5 +156,16 @@
 	"botNarratorHint": "人们在聊天界面与它对话，只能看到它发给自己的消息；它的回复与工具调用留在会话记录中，可随时打开监控查看。",
 	"botName": "Bot 名称",
 	"botNameHint": "必填。显示在 bot 发出的每条消息上。",
+	"projectPrompt": "项目提示词",
+	"projectPromptLoading": "正在读取工作目录中的提示词文件…",
+	"projectPromptExisting": "来自 {{filename}}：此目录下所有叙述者共用这份提示词，编辑后写回该文件。",
+	"projectPromptWillCreate": "未找到提示词文件，保存后将创建 {{filename}}。",
+	"projectPromptChooseDirectory": "选择工作目录后，可读取并编辑该目录的提示词文件（AGENTS.md、CLAUDE.md 等）。",
+	"projectPromptPlaceholder": "该目录的项目提示词，将注入到每个叙述者的系统提示词中。",
+	"projectPromptTruncated": "文件超过 {{max}}KB，仅显示开头部分且不可编辑。请直接在文件编辑器中修改。",
+	"projectPromptLoadFailed": "读取提示词文件失败",
+	"projectPromptDirtyHint": "创建会话时会先保存这份提示词文件。",
+	"projectPromptResize": "拖拽调整提示词输入框高度",
+	"projectPromptSaveFailed": "提示词文件保存失败",
 	"workspaceAddOutline": "添加大纲页"
 }

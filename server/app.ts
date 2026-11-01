@@ -67,6 +67,7 @@ import { outlineRoutes } from "./routes/outline";
 import { pluginUiRoutes } from "./routes/plugin-ui";
 import { pluginRoutes } from "./routes/plugins";
 import { projectRoutes } from "./routes/projects";
+import { promptOptimizeRoutes } from "./routes/prompt-optimize";
 import { providerBalanceRoutes } from "./routes/provider-balances";
 import { providerImportRoutes } from "./routes/provider-import";
 import {
@@ -430,6 +431,7 @@ app.route("/api/integrations", integrationRoutes);
 app.route("/api/oauth-apps", oauthAppRoutes);
 app.route("/api/oauth/grants", oauthGrantRoutes);
 app.route("/api/fs", fsRoutes);
+app.route("/api/prompt-optimize", promptOptimizeRoutes);
 app.route("/api/user-preferences", userPreferencesRoutes);
 app.route("/api/notification-sounds", notificationSoundRoutes);
 app.route("/api/notifications", notificationRoutes);

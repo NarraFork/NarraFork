@@ -50,10 +50,7 @@ import {
 	terminals,
 	users,
 } from "../db/schema";
-import { summaryGenerate } from "../lib/agent";
 import { getFileReferenceSnapshots } from "../lib/agent/file-reference-projection";
-import { generateWithFirstTokenTimeout } from "../lib/agent/generate-first-token-timeout";
-import type { ResponseFormat } from "../lib/agent/provider";
 import { takeOverExitPlanReflection } from "../lib/agent/tools/exit-plan-reflection";
 import { previewStructSedChange } from "../lib/agent/tools/struct-sed";
 import { takeOverTaskReflection } from "../lib/agent/tools/task-reflection";
@@ -149,23 +146,10 @@ import {
 	resolveSetupAuthorization,
 	selectActionableDependencies,
 } from "../lib/prompt-i18n";
-import {
-	getOptimizeOutputSchema,
-	getPromptOptimizeInstruction,
-	OPTIMIZE_OUTPUT_SCHEMA_NAME,
-	OPTIMIZE_SUMMARY_FIELD,
-	type PromptOptimizeStyle,
-	readOptimizeResult,
-} from "../lib/prompts/prompt-optimize";
-import { normalizeOptimizedPrompt } from "../lib/prompts/prompt-optimize-output";
+import { runPromptOptimize } from "../lib/prompts/prompt-optimize-run";
 import { saveRequestRecording } from "../lib/request-recorder";
 import { policySourceIdOf } from "../lib/runtime-source";
-import {
-	FOLLOW_DEFAULT_MODEL,
-	getQueueDuringCompaction,
-	resolveEffectiveModel,
-	settings,
-} from "../lib/settings";
+import { FOLLOW_DEFAULT_MODEL, getQueueDuringCompaction, settings } from "../lib/settings";
 import {
 	deleteAvatarImage,
 	deleteUploadedImage,
@@ -1872,15 +1856,7 @@ narratorRoutes.post("/:id/optimize-prompt", async (c) => {
 	const body = await c.req.json();
 	const { text, style, withContext, messageId } = optimizePromptSchema.parse(body);
 
-	// Get system instruction for the chosen style
 	const locale = await getUserLanguage(userId);
-	let systemInstruction = getPromptOptimizeInstruction(style as PromptOptimizeStyle, locale);
-	// Multi-segment drafts wrap each segment in <<<NF_..._n>>> ... <<<NF_..._n_END>>> markers
-	// that the client uses to put results back; the model must echo them verbatim.
-	if (/<<<NF_[^>\n]+>>>/.test(text)) {
-		systemInstruction +=
-			"\n\nSEGMENT MARKERS: The draft contains several segments delimited by marker lines like <<<NF_xxx_0>>> and <<<NF_xxx_0_END>>>. Optimize each segment's content separately, and output every marker line EXACTLY as given, in the original order, each on its own line, with each segment's result between its start and end markers. Never merge, drop, reorder or alter markers, and add nothing outside them. This overrides the instruction to output only the prompt text.";
-	}
 
 	// Load context if requested
 	let contextText = "";
@@ -1893,76 +1869,15 @@ narratorRoutes.post("/:id/optimize-prompt", async (c) => {
 		contextText = formatMessagesAsContext(contextMessages);
 	}
 
-	// Tag the user's text to prevent prompt injection
-	const taggedContent = contextText
-		? `${contextText}\n\n---\n\n<prompt>\n${text}\n</prompt>`
-		: `<prompt>\n${text}\n</prompt>`;
-
-	// Resolve the model (default follows summaryModel via __summary__)
-	const model = resolveEffectiveModel(settings.agent.promptOptimizeModel);
-
-	// Ask for the optimized text as a schema-constrained object when the resolved
-	// adapter can express one. `responseFormatDegraded` reports adapters that
-	// cannot (they must not silently ignore it), and the text path below is then
-	// the only source of truth.
-	const responseFormat: ResponseFormat = {
-		type: "json_schema",
-		name: OPTIMIZE_OUTPUT_SCHEMA_NAME,
-		schema: getOptimizeOutputSchema(),
-		strict: true,
-		// Lets the provider layer lift the rationale without knowing field names.
-		summaryField: OPTIMIZE_SUMMARY_FIELD,
-	};
-
-	// Follow the configured first-token budget; output clears the timer. Request
-	// cancellation remains connected to the provider throughout generation.
-	const generated = await generateWithFirstTokenTimeout(
-		(options) =>
-			summaryGenerate(
-				taggedContent,
-				systemInstruction,
-				{ narratorId, kind: "optimize" },
-				options.signal,
-				options.onTextDelta,
-				model,
-				undefined,
-				false,
-				options.onReasoningDelta,
-				undefined,
-				undefined,
-				{ responseFormat, onGenerationProgress: options.onGenerationProgress },
-			),
-		settings.agent.firstTokenTimeoutMs,
-		c.req.raw.signal,
-	).catch((err: unknown) => {
-		if (err instanceof Error && err.name === "TimeoutError") {
-			throw new ValidationError(err.message);
-		}
-		throw err;
+	const result = await runPromptOptimize({
+		text,
+		style,
+		locale,
+		contextText,
+		narratorId,
+		signal: c.req.raw.signal,
 	});
-
-	if (generated.responseFormatDegraded) {
-		// Log loss of native schema enforcement; validated fields remain usable.
-		logger.warn("Prompt optimize fell back to text parsing", {
-			narratorId,
-			model,
-			reason: generated.responseFormatDegraded,
-		});
-	}
-
-	const structured = readOptimizeResult(generated.structured);
-	// Failed or incomplete schema output is not prompt text. Keep the draft rather
-	// than leaking the raw JSON envelope (or a partial rewrite) into the composer.
-	if (generated.outputTruncated || (generated.structured !== undefined && !structured)) {
-		return c.json({ text, model });
-	}
-	// The validated field is already the payload; only plaintext fallback needs
-	// wrapper removal. Its examples, headings and literal thinking tags are content.
-	const result = structured?.optimizedPrompt ?? normalizeOptimizedPrompt(generated.text, text);
-	if (!structured && result.startsWith("{")) return c.json({ text, model });
-	const reasoningSummary = structured?.reasoningSummary ?? generated.reasoningSummary;
-
-	return c.json({ text: result, model, ...(reasoningSummary ? { reasoningSummary } : {}) });
+	return c.json(result);
 });
 
 // Get usage stats for this narrator, optionally including direct subagents.

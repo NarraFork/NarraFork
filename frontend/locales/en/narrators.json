@@ -169,5 +169,16 @@
 	"botNarratorHint": "People chat with it and see only what it sends them. Its replies and tool calls stay in the transcript, which you can open as a monitor.",
 	"botName": "Bot name",
 	"botNameHint": "Required. Shown on every message the bot sends.",
+	"projectPrompt": "Project prompt",
+	"projectPromptLoading": "Reading the prompt file in this directory…",
+	"projectPromptExisting": "From {{filename}} — every session in this directory shares this prompt; edits are written back to that file.",
+	"projectPromptWillCreate": "No prompt file yet. Saving will create {{filename}}.",
+	"projectPromptChooseDirectory": "Choose a working directory to read and edit its prompt file (AGENTS.md, CLAUDE.md, …).",
+	"projectPromptPlaceholder": "This directory's project prompt, injected into every session's system prompt.",
+	"projectPromptTruncated": "The file is larger than {{max}}KB, so only its beginning is shown and it cannot be edited here. Edit it in the file editor instead.",
+	"projectPromptLoadFailed": "Could not read the prompt file",
+	"projectPromptDirtyHint": "This prompt file is saved before the session is created.",
+	"projectPromptResize": "Drag to resize the project prompt box",
+	"projectPromptSaveFailed": "Could not save the prompt file",
 	"workspaceAddOutline": "Add an outline page"
 }

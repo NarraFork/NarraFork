@@ -1035,6 +1035,40 @@ export const miscApi = {
 		request<{
 			candidates: Array<{ path: string; repoCount: number; conventional: boolean }>;
 		}>("/fs/project-dir/candidates"),
+	/**
+	 * The project instruction file (AGENTS.md & friends) for one directory.
+	 *
+	 * `filename` is the file to edit — an existing candidate, or the one a save would
+	 * create; `hash` is the optimistic lock for {@link saveProjectPrompt}.
+	 */
+	getProjectPrompt: (cwd: string) =>
+		request<{
+			cwd: string;
+			filename: string;
+			path: string;
+			exists: boolean;
+			content: string;
+			truncated: boolean;
+			totalBytes: number | null;
+			hash: string | null;
+			candidates: string[];
+		}>(`/fs/project-prompt?cwd=${encodeURIComponent(cwd)}`),
+	/**
+	 * Save the project instruction file.
+	 *
+	 * `baseHash` is the hash of the content that was loaded; the server refuses the save
+	 * with 409 STALE_WRITE when the file moved on, rather than overwriting an agent's edit.
+	 */
+	saveProjectPrompt: (input: {
+		cwd: string;
+		filename: string;
+		content: string;
+		baseHash?: string | null;
+	}) =>
+		request<{ ok: true; path: string; filename: string; hash: string }>("/fs/project-prompt", {
+			method: "PUT",
+			body: JSON.stringify(input),
+		}),
 	fsMkdir: (parent: string, name: string) =>
 		request<{ path: string }>("/fs/mkdir", {
 			method: "POST",

@@ -40,6 +40,17 @@ mock.module("@mantine/core", () => ({
 	Stack: box,
 	Text: ({ children }: { children?: ReactNode }) => <span>{children}</span>,
 	TextInput: box,
+	Textarea: box,
+	// TextareaOptimizeControls renders a Menu; the mock must expose it or the module
+	// fails to load before any assertion runs.
+	Menu: Object.assign(box, {
+		Target: box,
+		Dropdown: box,
+		Label: box,
+		Item: box,
+		Divider: box,
+	}),
+	NumberInput: box,
 	Tooltip: box,
 	ActionIcon: box,
 	Checkbox: box,
