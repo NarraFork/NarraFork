@@ -45,6 +45,7 @@ import {
 	IconZoomOut,
 	IconZoomReset,
 } from "@tabler/icons-react";
+import type { TFunction } from "i18next";
 import { type CSSProperties, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { formatLocaleTime } from "../../../lib/intl-format";
@@ -100,7 +101,7 @@ function segmentStyle(segment: TimelineSegment, left: number, width: number): CS
 	return style;
 }
 
-function laneLabel(lane: TimelineLane, t: (key: string, options?: object) => string): string {
+function laneLabel(lane: TimelineLane, t: TFunction): string {
 	if (lane.type === "primary") return t("timeline.lanePrimary");
 	return lane.subagentType
 		? t("timeline.laneSubagentType", { type: lane.subagentType })
@@ -114,7 +115,7 @@ function failedSegment(segment: TimelineSegment, items: Record<string, TimelineI
 	});
 }
 
-function TurnSelectLabel(turn: TimelineTurnSummary, t: (key: string, o?: object) => string) {
+function TurnSelectLabel(turn: TimelineTurnSummary, t: TFunction) {
 	const parts = [t("timeline.turn", { index: turn.index })];
 	parts.push(formatClock(Date.parse(turn.startedAt)));
 	if (turn.status !== "completed") parts.push(t(`timeline.status.${turn.status}`));
@@ -580,7 +581,7 @@ export function NarratorTimelinePanel({
 function segmentTitle(
 	segment: TimelineSegment,
 	items: Record<string, TimelineItem>,
-	t: (key: string, options?: object) => string,
+	t: TFunction,
 ): string {
 	if (segment.itemIds.length > 1)
 		return ` · ${t("timeline.parallel", { count: segment.itemIds.length })}`;
