@@ -188,7 +188,9 @@ export function NarratorTimelinePanel({
 	const trackWidth = Math.max(0, viewportWidth - LABEL_WIDTH - TRACK_PADDING_RIGHT);
 	const fit = fitPxPerSec(spanMs, trackWidth);
 	const scale = pxPerSec ?? fit;
-	const contentWidth = Math.max(trackWidth, (spanMs / 1000) * scale) + TRACK_PADDING_RIGHT;
+	const contentWidth = Math.floor(
+		Math.max(trackWidth, (spanMs / 1000) * scale) + TRACK_PADDING_RIGHT,
+	);
 	const origin = data?.startMs ?? 0;
 
 	const connectors = useMemo(
@@ -395,7 +397,7 @@ export function NarratorTimelinePanel({
 								</Group>
 							))}
 						</Box>
-						<ScrollArea style={{ flex: 1 }} type="auto" offsetScrollbars>
+						<ScrollArea style={{ flex: 1, minWidth: 0 }} type="auto" scrollbarSize={8}>
 							<Box
 								style={{
 									position: "relative",
