@@ -71,6 +71,7 @@ import { useNarratorTimeline } from "./useNarratorTimeline";
 
 const LABEL_WIDTH = 168;
 const TRACK_PADDING_RIGHT = 24;
+const TICK_LABEL_WIDTH = 60;
 
 interface Selection {
 	laneIndex: number;
@@ -198,7 +199,11 @@ export function NarratorTimelinePanel({
 		[data, origin, scale],
 	);
 	const tickStep = chooseTickStep(scale);
-	const tickList = ticks(spanMs, tickStep);
+	// A label is ~60px wide and starts at its tick, so the last one would overhang
+	// the track and add a horizontal scrollbar at fit width.
+	const tickList = ticks(spanMs, tickStep).filter(
+		(offset) => timeToX(origin + offset, origin, scale) <= contentWidth - TICK_LABEL_WIDTH,
+	);
 
 	const turnIndex = turnList.findIndex((turn) => turn.id === activeTurnId);
 	const olderTurn = turnIndex >= 0 ? turnList[turnIndex + 1] : undefined;
