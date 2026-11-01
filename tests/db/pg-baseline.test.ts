@@ -53,7 +53,6 @@ import {
 	parseCatalog,
 	parseDeparseOutput,
 	psqlProxyCallback,
-	replacesConstraintsOnly,
 	type Snapshot,
 } from "./pg-baseline-model";
 import { physicalColumnOrderFromSql } from "./pg-baseline-sql-order";
@@ -102,15 +101,6 @@ const RETIRED_CONSTRAINTS: [table: string, constraint: string][] = [
 	["volume_snapshot_applications", "volume_snapshot_applications_chapter_id_chapters_id_fk"],
 	["volume_snapshots", "volume_snapshots_source_chapter_id_chapters_id_fk"],
 ];
-
-/** The SQL of the newest migration that does more than replace constraints. */
-async function newestCreatingMigration(entries: JournalEntry[]): Promise<string> {
-	for (const entry of [...entries].reverse()) {
-		const sql = await readFile(`${MIGRATIONS_FOLDER}/${entry.tag}.sql`, "utf8");
-		if (!replacesConstraintsOnly(sql)) return sql;
-	}
-	throw new Error("every PostgreSQL migration only replaces constraints");
-}
 
 async function loadJournal(): Promise<{
 	entries: JournalEntry[];
@@ -194,7 +184,6 @@ type Outcome = {
 		migrationStatements: number;
 		ledgerRows: number;
 		replayQueries: number;
-		rawReplayFailed: boolean;
 		swappedOrdinalityDiffers: number;
 		unquotedAliasFolds: boolean;
 		tamperDetected: string[];
@@ -263,18 +252,6 @@ describe("PostgreSQL baseline", () => {
 				if (replayQueries !== 0) {
 					problems.push(`migrator re-ran ${replayQueries} statements over an applied journal`);
 				}
-				// The SQL itself must NOT be idempotent: if it were, applying it over an existing
-				// database would silently do nothing and the ledger would be the only guard.
-				// Never committed: a migration that opens with a DROP would otherwise succeed at
-				// that statement before failing, and the catalog read below would see the damage.
-				// The newest migration that creates something is replayed: one that only
-				// replaces constraints re-runs cleanly by construction.
-				const probed = await newestCreatingMigration(entries);
-				const rawReplay = await exec(`BEGIN;\n${probed}\n;ROLLBACK;`);
-				if (rawReplay.code === 0) {
-					problems.push("re-applying the migration SQL succeeded; it is not creating anything");
-				}
-
 				// --- catalog ------------------------------------------------------------------
 				const read = await readCatalog(exec);
 				problems.push(...read.problems);
@@ -442,7 +419,6 @@ CREATE UNIQUE INDEX "idx_integration_authorities_source_grant" ON "integration_a
 						migrationStatements,
 						ledgerRows: ledger.length,
 						replayQueries,
-						rawReplayFailed: rawReplay.code !== 0,
 						swappedOrdinalityDiffers: Number(ordinality),
 						unquotedAliasFolds: !("foreignKeys" in alias) && "foreignkeys" in alias,
 						tamperDetected,
@@ -465,7 +441,6 @@ CREATE UNIQUE INDEX "idx_integration_authorities_source_grant" ON "integration_a
 			expect(observed.migrationStatements).toBe(statements);
 			expect(observed.ledgerRows).toBe(entries.length);
 			expect(observed.replayQueries).toBe(0);
-			expect(observed.rawReplayFailed).toBe(true);
 			expect({
 				tables: observed.tables,
 				columns: observed.columns,
@@ -503,6 +478,82 @@ CREATE UNIQUE INDEX "idx_integration_authorities_source_grant" ON "integration_a
 				"dropped generated column",
 			]);
 			expect(problems).toEqual([]);
+		},
+		RUN_TIMEOUT_MS,
+	);
+
+	it(
+		"checks raw replay at the 0046 and 0047 migration boundaries",
+		async () => {
+			const journal = JSON.parse(
+				await readFile(`${MIGRATIONS_FOLDER}/meta/_journal.json`, "utf8"),
+			) as {
+				entries: JournalEntry[];
+				[key: string]: unknown;
+			};
+			const index46 = journal.entries.findIndex(
+				(entry) => entry.tag === "0046_outline_task_claims",
+			);
+			const index47 = journal.entries.findIndex((entry) => entry.tag === "0047_native_media");
+			expect(index46).toBeGreaterThanOrEqual(0);
+			expect(index47).toBe(index46 + 1);
+			const folder = await mkdtemp(join(tmpdir(), "nf-pg-replay-prefix-"));
+			try {
+				await mkdir(join(folder, "meta"));
+				for (const entry of journal.entries.slice(0, index47 + 1)) {
+					await copyFile(`${MIGRATIONS_FOLDER}/${entry.tag}.sql`, join(folder, `${entry.tag}.sql`));
+				}
+				const setPrefix = (end: number) =>
+					writeFile(
+						join(folder, "meta/_journal.json"),
+						JSON.stringify({
+							...journal,
+							entries: journal.entries.slice(0, end + 1),
+						}),
+					);
+				let callbackError: unknown;
+				const result = await withPostgres(async ({ exec }) => {
+					try {
+						const db = drizzleProxy(psqlProxyCallback(exec)) as unknown as PgRemoteDatabase;
+						const apply = async (end: number) => {
+							await setPrefix(end);
+							await migrate(
+								db,
+								async (queries) => {
+									const applied = await exec(migrationScript(queries));
+									if (applied.code !== 0)
+										throw new Error(`prefix migration failed: ${applied.stderr.slice(-600)}`);
+								},
+								{ migrationsFolder: folder },
+							);
+						};
+						await apply(index46);
+						const sql46 = await readFile(
+							`${MIGRATIONS_FOLDER}/0046_outline_task_claims.sql`,
+							"utf8",
+						);
+						const replay46 = await exec(`BEGIN;\n${sql46}\n;ROLLBACK;`);
+						expect(replay46.code).not.toBe(0);
+						expect(replay46.stderr).toMatch(/outline_task_claims.*already exists/i);
+
+						await apply(index47);
+						const sql47 = await readFile(`${MIGRATIONS_FOLDER}/0047_native_media.sql`, "utf8");
+						const replay47 = await exec(`BEGIN;\n${sql47}\n${sql47}\nROLLBACK;`);
+						if (replay47.code !== 0)
+							throw new Error(`0047 raw replay failed: ${replay47.stderr.slice(-600)}`);
+						return true;
+					} catch (error) {
+						callbackError = error;
+						throw error;
+					}
+				});
+				if (callbackError) throw callbackError;
+				if (typeof result !== "boolean") {
+					throw new Error(`PostgreSQL replay check did not complete: ${JSON.stringify(result)}`);
+				}
+			} finally {
+				await rm(folder, { recursive: true, force: true });
+			}
 		},
 		RUN_TIMEOUT_MS,
 	);

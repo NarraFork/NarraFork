@@ -163,7 +163,7 @@ test("mixed media paste shares one FIFO commit without resizing or decoding nati
 	expect(await speech.text()).toBe("original audio");
 	expect(await clip.text()).toBe("original video");
 	expect([speech, picture, note, clip].map(getComposerFileOrder)).toEqual(
-		[speech, picture, note, clip].map(getComposerFileOrder).toSorted((a, b) => a - b),
+		[speech, picture, note, clip].map(getComposerFileOrder).sort((a, b) => a - b),
 	);
 });
 

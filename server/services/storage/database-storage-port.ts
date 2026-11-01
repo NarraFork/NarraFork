@@ -228,29 +228,40 @@ export async function runWithScanBudget<T>(
 	operation: (linked: AbortSignal) => Promise<T>,
 ): Promise<T> {
 	if (signal?.aborted) throw new DatabaseStorageScanCancelledError();
+	if (budgetMs <= 0) throw new DatabaseStorageScanTimedOutError(budgetMs);
 
 	const controller = new AbortController();
 	let expired = false;
 	const onCallerAbort = () => controller.abort();
 	signal?.addEventListener("abort", onCallerAbort, { once: true });
 
-	// A non-positive budget means it is ALREADY gone. `setTimeout(…, 0)` would still let the
-	// operation run a turn — and on a fast backend, run to completion — so the abort has to happen
-	// synchronously here. Treating `0` as "no budget" is how an unbounded scan slips back in.
-	if (budgetMs <= 0) {
+	const timer = setTimeout(() => {
 		expired = true;
 		controller.abort();
-	}
-	const timer =
-		budgetMs > 0
-			? setTimeout(() => {
-					expired = true;
-					controller.abort();
-				}, budgetMs)
-			: undefined;
+	}, budgetMs);
+	// Some operations (including module loading) cannot observe AbortSignal. Race their completion
+	// against cancellation so they cannot keep the caller waiting past the budget.
+	let onAbort: (() => void) | undefined;
+	const aborted = new Promise<never>((_, reject) => {
+		onAbort = () => reject(new Error("scan aborted"));
+		controller.signal.addEventListener("abort", onAbort, { once: true });
+	});
+	let resolveWork!: (value: T | PromiseLike<T>) => void;
+	let rejectWork!: (reason: unknown) => void;
+	const work = new Promise<T>((resolve, reject) => {
+		resolveWork = resolve;
+		rejectWork = reject;
+	});
+	// Attach both race handlers before invoking work: it may abort and throw synchronously.
+	const raced = Promise.race([work, aborted]);
 
 	try {
-		const result = await operation(controller.signal);
+		try {
+			resolveWork(operation(controller.signal));
+		} catch (error) {
+			rejectWork(error);
+		}
+		const result = await raced;
 		// A backend that ignores the signal can still return successfully after the budget expired.
 		// Honouring the budget only when the backend cooperates would make it advisory, so the
 		// result is discarded here rather than handed back as if it had been in time.
@@ -271,6 +282,7 @@ export async function runWithScanBudget<T>(
 	} finally {
 		if (timer) clearTimeout(timer);
 		signal?.removeEventListener("abort", onCallerAbort);
+		if (onAbort) controller.signal.removeEventListener("abort", onAbort);
 	}
 }
 

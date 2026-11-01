@@ -63,7 +63,7 @@ export async function narratorReferencesMedia(
 					owner: pg.narratorMessages.narratorId,
 					seq: pg.narratorMessageRefs.seq,
 					refId: pg.narratorMessageRefs.id,
-					contentJson: pg.narratorMessages.contentJson,
+					contentJson: contentJsonSql(pg.narratorMessages),
 				})
 				.from(pg.narratorMessageRefs)
 				.innerJoin(

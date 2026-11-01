@@ -422,7 +422,7 @@ describe("semantic media composer edits", () => {
 		expect(() =>
 			seedComposerEditSession(
 				{ text: "", fileReferences: [], composerDocument: doc() },
-				resources().toReversed(),
+				[...resources()].reverse(),
 			),
 		).toThrow("out of date");
 		const session = seedComposerEditSession({ text: "", fileReferences: [] }, resources());

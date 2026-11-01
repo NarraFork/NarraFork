@@ -244,6 +244,66 @@ describe("SQL-derived physical column order", () => {
 		expect(run(tampered, {}).problems.join("\n")).toContain("Unsupported SQL statement");
 	});
 
+	test("0047 models the reviewed conditional column and rejects altered DO bodies", () => {
+		const sql = readBounded(
+			join(import.meta.dir, "../../drizzle-postgres/0047_native_media.sql"),
+			1024 * 1024,
+		);
+		const [media, compensation] = sql.split("--> statement-breakpoint");
+		const table = "CREATE TABLE narrator_buffered_messages(id text, existing text);";
+		const order = good([table, media], {
+			narrator_buffered_messages: ["id", "existing", "media_json"],
+		});
+		expect(order.get("narrator_buffered_messages")).toEqual(["id", "existing", "media_json"]);
+		const existing = good(
+			["CREATE TABLE narrator_buffered_messages(id text, media_json text, existing text);", media],
+			{ narrator_buffered_messages: ["id", "existing", "media_json"] },
+		);
+		expect(existing.get("narrator_buffered_messages")).toEqual(["id", "media_json", "existing"]);
+		for (const changed of [
+			media.replace("ADD COLUMN IF NOT EXISTS", "ADD COLUMN"),
+			media.replace("END IF;", "END IF; EXECUTE 'DROP TABLE narrator_buffered_messages';"),
+			compensation.replace("AND NOT EXISTS", "AND EXISTS"),
+			compensation.replace('"in_process_epoch" integer', '"other_epoch" integer'),
+		]) {
+			expect(run(changed, {}).problems.join("\n")).toContain("Unsupported SQL statement");
+		}
+		// The conditional compensation is not a no-op unless upstream 0046's layout exists.
+		expect(run(compensation, {}).problems.join("\n")).toContain(
+			"Unknown SQL table outline_task_claims",
+		);
+		const upstream = readBounded(
+			join(import.meta.dir, "../../drizzle-postgres/0046_outline_task_claims.sql"),
+			1024 * 1024,
+		);
+		const base = "CREATE TABLE outline_blocks(id text); CREATE TABLE outline_spaces(id text);";
+		const expected = {
+			outline_blocks: ["id", "in_process"],
+			outline_spaces: ["id", "in_process_ready", "in_process_epoch"],
+			outline_task_claims: [
+				"task_block_id",
+				"holder_narrator_id",
+				"holder_user_id",
+				"epoch",
+				"task_version_at_claim",
+				"claimed_at",
+				"expires_at",
+				"last_holder_narrator_id",
+				"last_holder_user_id",
+			],
+		};
+		const before = good([base, upstream], expected);
+		const after = good([base, upstream, compensation], expected);
+		expect(after).toEqual(before);
+		const partial = upstream.replace(
+			'ALTER TABLE "outline_spaces" ADD COLUMN "in_process_epoch" integer DEFAULT 0 NOT NULL;',
+			"",
+		);
+		expect(run([base, partial, compensation], expected).problems.join("\n")).toContain(
+			"0047 compensation baseline missing outline_spaces.in_process_epoch",
+		);
+	});
+
 	test("row level security toggles do not change column order", () => {
 		const order = good(
 			`CREATE TABLE t(a text);
