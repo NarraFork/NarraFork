@@ -770,6 +770,9 @@ const NARRATOR_ID_GATE_EXEMPT_SEGMENTS = new Set([
 	"human-attention",
 	// Session-less dashboard composer: resolves user-level commands and cwd skills only.
 	"draft-composer",
+	// 模型级 ModelTrace 舱的查询入口（`/modeltrace/lookup`）：第一个路径段是字面量，
+	// 没有可鉴权的叙述者 id；查询本身只返回「该模型是否已有舱」。
+	"modeltrace",
 	"whitelist-dirs",
 	"blacklist-dirs",
 	"cmd-whitelist",
@@ -1026,6 +1029,8 @@ narratorRoutes.get("/", async (c) => {
 	// undefined for admins, which `and(...)` treats as no extra restriction.
 	const conditions = [
 		eq(narrators.variant, "primary"),
+		// 系统内部叙述者（ModelTrace 舱）不进列表，只能从自己的入口凭 id 打开。
+		eq(narrators.hiddenFromLists, false),
 		narratorReadableWhere(narratorPrincipalOf(c)),
 	];
 
@@ -5277,6 +5282,16 @@ function getAskInPassingPendingBlock(
 	return null;
 }
 
+/** 模型资料弹窗的入口：当前用户这个模型有没有舱。 */
+narratorRoutes.get("/modeltrace/lookup", async (c) => {
+	const model = c.req.query("model")?.trim();
+	if (!model || model.length > 200) throw new ValidationError("Invalid model");
+	const { findModelTraceNarrator } = await import("../services/modeltrace-store");
+	return c.json({
+		narratorId: await findModelTraceNarrator(c.get("user").sub, model),
+	});
+});
+
 // A one-shot sampling fork reuses the parent's frozen upstream request prefix.
 narratorRoutes.post("/:id/modeltrace", async (c) => {
 	const userId = c.get("user").sub;
@@ -5284,7 +5299,6 @@ narratorRoutes.post("/:id/modeltrace", async (c) => {
 	const result = await startModelTrace(c.req.param("id"), userId, await getUserLanguage(userId));
 	return c.json(result, 201);
 });
-
 // Retry one sampling round in the same diagnostic session.
 narratorRoutes.post("/:id/modeltrace/retry", async (c) => {
 	const userId = c.get("user").sub;

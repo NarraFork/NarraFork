@@ -1489,6 +1489,11 @@ startHeartbeat();
 initDeviceConnectionService();
 // Wire the file-transfer chunk-frame receiver.
 initDeviceTransferService();
+// 旧版 /modeltrace 每跑一次就留下一个 primary 叙述者；启动时把它们隐藏并把每个模型
+// 最近的一个收编成该模型的 ModelTrace 舱，保证旧历史仍能从模型入口打开。
+await import("./services/modeltrace-compat")
+	.then(({ adoptLegacyModelTraceNarrators }) => adoptLegacyModelTraceNarrators())
+	.catch((error) => logger.warn("Legacy ModelTrace adoption failed", { error: String(error) }));
 // Migrate OAuth authorities first, then stable resource provenance, in bounded yielding batches.
 // These services still use the SQLite proxy, so PostgreSQL explicitly gates the legacy path
 // instead of letting a fire-and-forget promise hit that proxy and swallow the failure.

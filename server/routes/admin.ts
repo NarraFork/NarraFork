@@ -1,5 +1,5 @@
 import { normalizeLocale } from "@shared/i18n-locales";
-import { count, eq, inArray } from "drizzle-orm";
+import { and, count, eq, inArray } from "drizzle-orm";
 import { Hono } from "hono";
 import { db } from "../db";
 import { narrators, userPreferences, users } from "../db/schema";
@@ -455,7 +455,9 @@ adminRoutes.get("/diagnostics", async (c) => {
 	const narratorStatusCounts = await db
 		.select({ status: narrators.status, value: count() })
 		.from(narrators)
-		.where(inArray(narrators.status, ["working", "waiting"]))
+		.where(
+			and(inArray(narrators.status, ["working", "waiting"]), eq(narrators.hiddenFromLists, false)),
+		)
 		.groupBy(narrators.status);
 	const narratorCountByStatus = new Map(narratorStatusCounts.map((row) => [row.status, row.value]));
 	const workingNarratorCount = narratorCountByStatus.get("working") ?? 0;
