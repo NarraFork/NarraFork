@@ -1150,6 +1150,38 @@ export const miscApi = {
 		};
 	},
 
+	/**
+	 * Mint a single-use ticket that lets the BROWSER download `path` itself.
+	 *
+	 * The alternative — `fsDownload` — fetches the bytes into a Blob, which copies the whole
+	 * file into page memory, cannot show progress, loses Range/resume, and can be blocked by
+	 * the browser's "download not triggered by a user gesture" heuristics because the click
+	 * gesture is over by the time the fetch resolves.
+	 *
+	 * The path is validated server-side while the session is present, so a refused path, an
+	 * over-limit file or a vanished file still comes back here as a readable error the caller
+	 * can put in a notification. The returned URL is then navigated to (see
+	 * `fsDownloadUrl`), which is why the ticket — not the path — has to be the credential.
+	 */
+	fsDownloadTicket: (path: string) =>
+		request<{ ticket: string; expiresInMs: number }>("/fs/download-ticket", {
+			method: "POST",
+			body: JSON.stringify({ path }),
+		}),
+
+	/**
+	 * Put a file on the clipboard of the machine running NarraFork.
+	 *
+	 * Not the browser's clipboard: a page cannot place an arbitrary file there, so the server
+	 * does it on its own desktop. Meaningful only from a browser on that machine — the server
+	 * refuses anyone else with 403.
+	 */
+	fsCopyFileToClipboard: (path: string) =>
+		request<{ ok: true }>("/fs/copy-file-to-clipboard", {
+			method: "POST",
+			body: JSON.stringify({ path }),
+		}),
+
 	// Routines
 	getRoutines: () =>
 		request<{
