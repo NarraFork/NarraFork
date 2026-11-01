@@ -46,6 +46,7 @@ import {
 } from "@tabler/icons-react";
 import { type CSSProperties, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { formatLocaleTime } from "../../../lib/intl-format";
 import { useNarratorDockContext } from "../dock/NarratorDockContext";
 import {
 	AXIS_HEIGHT,
@@ -76,11 +77,7 @@ interface Selection {
 }
 
 function formatClock(ms: number): string {
-	return new Date(ms).toLocaleTimeString(undefined, {
-		hour: "2-digit",
-		minute: "2-digit",
-		second: "2-digit",
-	});
+	return formatLocaleTime(ms, { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
 function segmentStyle(segment: TimelineSegment, left: number, width: number): CSSProperties {
