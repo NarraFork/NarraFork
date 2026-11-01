@@ -7,7 +7,7 @@ import {
 	validateComposerAssets,
 	validateComposerProjection,
 } from "@server/lib/composer-document";
-import { AppError, NotFoundError, ValidationError } from "@server/lib/errors";
+import { AppError, catalogError, NotFoundError, ValidationError } from "@server/lib/errors";
 import {
 	parseFileReferenceInput,
 	replaceFileReferenceSnapshots,
@@ -206,6 +206,10 @@ function fixture(
 		AppError,
 		ValidationError,
 		NotFoundError,
+		catalogError,
+		// Spec sessions: the outline-only /goal refusals stay out of the way.
+		resolveTaskBackend: async () => "spec",
+		isOutlineSessionGoal: async () => false,
 		parseFileReferenceInput,
 		parseOptionalComposerDocument,
 		bindComposerDocumentReferences,
