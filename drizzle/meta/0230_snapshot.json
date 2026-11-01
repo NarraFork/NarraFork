@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "3d7609dd-490d-4966-9055-ee05676387ee",
+  "id": "a74a0f62-3ce0-40fe-a150-dab92b01d6c6",
   "prevId": "09b3e729-52e0-428a-b1ca-57ba9f807ecb",
   "tables": {
     "acl_events": {
@@ -8437,13 +8437,6 @@
           "notNull": false,
           "autoincrement": false
         },
-        "media_json": {
-          "name": "media_json",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": false,
-          "autoincrement": false
-        },
         "command_text": {
           "name": "command_text",
           "type": "text",
@@ -12098,6 +12091,21 @@
           "notNull": false,
           "autoincrement": false
         },
+        "hidden_from_lists": {
+          "name": "hidden_from_lists",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false,
+          "default": false
+        },
+        "modeltrace_key": {
+          "name": "modeltrace_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false,
+          "autoincrement": false
+        },
         "title": {
           "name": "title",
           "type": "text",
@@ -12697,6 +12705,13 @@
           "name": "idx_narrators_handle_fold",
           "columns": [
             "handle_fold"
+          ],
+          "isUnique": true
+        },
+        "idx_narrators_modeltrace_key": {
+          "name": "idx_narrators_modeltrace_key",
+          "columns": [
+            "modeltrace_key"
           ],
           "isUnique": true
         },

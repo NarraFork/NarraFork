@@ -59,3 +59,23 @@ BEGIN
 		VALUES ('07be557cc8e920ac4299abc42544e80e11792be703d6e8313503537f3a979e34', 1793383934682);
 	END IF;
 END $$;
+--> statement-breakpoint
+-- The previous media 0047 watermark is newer than upstream ModelTrace 0047.
+-- Repair only databases known to have run that exact migration, and record the
+-- upstream migration atomically so repeated execution cannot replay its DDL.
+DO $$
+BEGIN
+	IF EXISTS (
+		SELECT 1 FROM "drizzle"."__drizzle_migrations"
+		WHERE hash IN ('9c78534134d6f92741a478b05e4290f62b72d8b073d9ee5f052b5c15db0043d7', 'f2ecf4303ae75d856f1fe37c88ca9419e21131b8e34edbbef2d982a812945728')
+	) AND NOT EXISTS (
+		SELECT 1 FROM "drizzle"."__drizzle_migrations"
+		WHERE hash IN ('d837b29b7004e8d02c4f88f098d0747e1944972dbf2b02a0faa29b88f8a1fd4e', '9506699a359b5c8a6e1ec148461b126a721ff3807bca63904d699d30c823e562')
+	) THEN
+		ALTER TABLE "narrators" ADD COLUMN "hidden_from_lists" boolean DEFAULT false NOT NULL;
+		ALTER TABLE "narrators" ADD COLUMN "modeltrace_key" text;
+		CREATE UNIQUE INDEX "idx_narrators_modeltrace_key" ON "narrators" USING btree ("modeltrace_key");
+		INSERT INTO "drizzle"."__drizzle_migrations" ("hash", "created_at")
+		VALUES ('d837b29b7004e8d02c4f88f098d0747e1944972dbf2b02a0faa29b88f8a1fd4e', 1793519539201);
+	END IF;
+END $$;

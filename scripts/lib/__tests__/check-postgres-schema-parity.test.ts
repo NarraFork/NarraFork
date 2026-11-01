@@ -523,7 +523,7 @@ describe("real schema parity", () => {
 		expect(validateCoverage(source, target)).toEqual([]);
 	});
 
-	test("covers 134 tables and 1758 columns including the outline storage tables", () => {
+	test("covers 134 tables and 1760 columns including the outline storage tables", () => {
 		expect(target.tables.length).toBe(134);
 		// 1714 SQLite-derived columns include disk_outcome and the two editor recovery columns,
 		// plus the three PG-only insert_seq identity columns.
@@ -545,7 +545,37 @@ describe("real schema parity", () => {
 		// Native media adds narrator_buffered_messages.media_json.
 		// Outline tasks (P2) add outline_task_claims (9), outline_blocks.in_process,
 		// outline_spaces.in_process_ready and outline_spaces.in_process_epoch.
-		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1758);
+		// ModelTrace cabins add narrators.hidden_from_lists and narrators.modeltrace_key (2).
+		expect(target.tables.reduce((count, table) => count + table.columns.length, 0)).toBe(1760);
+		expect(target.tables.find((table) => table.name === "narrators")?.columns).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					property: "hiddenFromLists",
+					name: "hidden_from_lists",
+					pgType: "boolean",
+					notNull: true,
+					defaultExpression: "false",
+				}),
+				expect.objectContaining({
+					property: "modeltraceKey",
+					name: "modeltrace_key",
+					pgType: "text",
+					notNull: false,
+				}),
+			]),
+		);
+		expect(
+			target.tables.find((table) => table.name === "narrator_buffered_messages")?.columns,
+		).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					property: "mediaJson",
+					name: "media_json",
+					pgType: "text",
+					notNull: false,
+				}),
+			]),
+		);
 		expect(
 			target.tables
 				.find((table) => table.name === "narrator_context_pins")

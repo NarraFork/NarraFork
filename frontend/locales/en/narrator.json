@@ -6,6 +6,10 @@
 	"modelTraceUsage": "Usage: /modeltrace (no arguments)",
 	"modelTraceFootnote": "Statistical estimates, for reference only.",
 	"modelTraceUnavailable": "ModelTrace result unavailable.",
+	"modelTrace": {
+		"openHistory": "ModelTrace history",
+		"openHistoryHint": "This model has no ModelTrace yet — run /modeltrace in a session first"
+	},
 	"composerAttachmentInsertionExpired": "The draft changed while attachments were being prepared. Nothing was inserted; please attach them again.",
 	"composerAttachmentsProcessing": "Attachments are still being prepared. Please wait before sending.",
 	"composerMissingAssets": "Some attachments are unavailable. Reselect the files or remove their nodes.",

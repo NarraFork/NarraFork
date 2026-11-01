@@ -246,10 +246,22 @@ describe("SQL-derived physical column order", () => {
 
 	test("0047 models the reviewed conditional column and rejects altered DO bodies", () => {
 		const sql = readBounded(
-			join(import.meta.dir, "../../drizzle-postgres/0047_native_media.sql"),
+			join(import.meta.dir, "../../drizzle-postgres/0048_native_media.sql"),
 			1024 * 1024,
 		);
-		const [media, compensation] = sql.split("--> statement-breakpoint");
+		const [media, compensation, modeltraceCompensation] = sql.split("--> statement-breakpoint");
+		expect(run(modeltraceCompensation, {}).problems.join("\n")).toContain("Unknown SQL table narrators");
+		good([
+			"CREATE TABLE narrators(id text, hidden_from_lists boolean, modeltrace_key text);",
+			modeltraceCompensation,
+		], { narrators: ["id", "hidden_from_lists", "modeltrace_key"] });
+		for (const changed of [
+			modeltraceCompensation.replace("AND NOT EXISTS", "AND EXISTS"),
+			modeltraceCompensation.replace("f2ecf4303ae75d856f1fe37c88ca9419e21131b8e34edbbef2d982a812945728", "unrelated"),
+			modeltraceCompensation.replace("WHERE hash IN", "WHERE hash NOT IN"),
+		]) {
+			expect(run(changed, {}).problems.join("\n")).toContain("Unsupported SQL statement");
+		}
 		const table = "CREATE TABLE narrator_buffered_messages(id text, existing text);";
 		const order = good([table, media], {
 			narrator_buffered_messages: ["id", "existing", "media_json"],
@@ -471,9 +483,12 @@ describe("bounds, real committed assets, and source AST guard", () => {
 			"last_stop_reason",
 			"model_history_revision",
 		]);
-		expect(narrators?.slice(-2)).toEqual([
+		// 0047 在末尾追加 ModelTrace 舱的两列。
+		expect(narrators?.slice(-4)).toEqual([
 			"runtime_registration_json",
 			"policy_source_narrator_id",
+			"hidden_from_lists",
+			"modeltrace_key",
 		]);
 		expect(narrators?.indexOf("next_seq")).toBeLessThan(narrators?.indexOf("insert_seq") ?? -1);
 		// The main-branch 0010 migration appends background_kind after insert_seq.

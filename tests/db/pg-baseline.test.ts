@@ -483,7 +483,7 @@ CREATE UNIQUE INDEX "idx_integration_authorities_source_grant" ON "integration_a
 	);
 
 	it(
-		"checks raw replay at the 0046 and 0047 migration boundaries",
+		"checks raw replay at the 0046 and 0048 migration boundaries",
 		async () => {
 			const journal = JSON.parse(
 				await readFile(`${MIGRATIONS_FOLDER}/meta/_journal.json`, "utf8"),
@@ -494,9 +494,10 @@ CREATE UNIQUE INDEX "idx_integration_authorities_source_grant" ON "integration_a
 			const index46 = journal.entries.findIndex(
 				(entry) => entry.tag === "0046_outline_task_claims",
 			);
-			const index47 = journal.entries.findIndex((entry) => entry.tag === "0047_native_media");
+			const index47 = journal.entries.findIndex((entry) => entry.tag === "0048_native_media");
 			expect(index46).toBeGreaterThanOrEqual(0);
-			expect(index47).toBe(index46 + 1);
+			expect(journal.entries[index46 + 1]?.tag).toBe("0047_modeltrace_narrator");
+			expect(index47).toBe(index46 + 2);
 			const folder = await mkdtemp(join(tmpdir(), "nf-pg-replay-prefix-"));
 			try {
 				await mkdir(join(folder, "meta"));
@@ -537,7 +538,7 @@ CREATE UNIQUE INDEX "idx_integration_authorities_source_grant" ON "integration_a
 						expect(replay46.stderr).toMatch(/outline_task_claims.*already exists/i);
 
 						await apply(index47);
-						const sql47 = await readFile(`${MIGRATIONS_FOLDER}/0047_native_media.sql`, "utf8");
+						const sql47 = await readFile(`${MIGRATIONS_FOLDER}/0048_native_media.sql`, "utf8");
 						const replay47 = await exec(`BEGIN;\n${sql47}\n${sql47}\nROLLBACK;`);
 						if (replay47.code !== 0)
 							throw new Error(`0047 raw replay failed: ${replay47.stderr.slice(-600)}`);

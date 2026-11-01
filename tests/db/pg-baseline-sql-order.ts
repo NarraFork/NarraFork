@@ -773,6 +773,14 @@ function reviewedNativeMedia(
 		}
 		return true;
 	}
+	if (digest === "414813a7b4bed0c6f7e194c10befc5738a540dc5aa03860bb05417100eb5863d") {
+		// On the fresh baseline upstream 0047 has already supplied these columns.
+		const list = columns(order, "narrators");
+		for (const name of ["hidden_from_lists", "modeltrace_key"])
+			if (!list.includes(name))
+				throw new Error(`0048 compensation baseline missing narrators.${name}`);
+		return true;
+	}
 	return false;
 }
 

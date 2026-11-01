@@ -38,13 +38,75 @@ async function migrationFixture(
 }
 
 describe("native media migration upgrades", () => {
+	test("SQLite validates recorded ModelTrace schemas without changing rows or ledger", async () => {
+		const folder = await migrationFixture(
+			resolve(import.meta.dir, "../../drizzle"),
+			"0230_wealthy_sir_ram",
+		);
+		const db = new Database(":memory:");
+		try {
+			db.run("CREATE TABLE narrators (id text PRIMARY KEY)");
+			db.run("INSERT INTO narrators VALUES ('old')");
+			applyPendingMigrationsByHash(db, folder);
+			const ledger = db.query("SELECT * FROM __drizzle_migrations").all();
+			db.run("DROP INDEX idx_narrators_modeltrace_key");
+			expect(() => applyPendingMigrationsByHash(db, folder)).toThrow(
+				"Incompatible SQLite modeltrace migration schema",
+			);
+			expect(db.query("SELECT id FROM narrators").all()).toEqual([{ id: "old" }]);
+			expect(db.query("SELECT * FROM __drizzle_migrations").all()).toEqual(ledger);
+		} finally {
+			db.close();
+			await rm(folder, { recursive: true, force: true });
+		}
+	});
+
+	test("SQLite rejects recorded ModelTrace drift before applying later migrations", async () => {
+		const folder = await migrationFixture(resolve(import.meta.dir, "../../drizzle"), "0231_native_media", true);
+		const db = new Database(":memory:");
+		try {
+			const hash = createHash("sha256")
+				.update(await readFile(join(folder, "0230_wealthy_sir_ram.sql")))
+				.digest("hex");
+			db.run("CREATE TABLE narrators (id text PRIMARY KEY, hidden_from_lists integer DEFAULT false NOT NULL, modeltrace_key text)");
+			db.run("CREATE TABLE narrator_buffered_messages (id text PRIMARY KEY)");
+			db.run("CREATE TABLE __drizzle_migrations (id SERIAL PRIMARY KEY, hash text NOT NULL, created_at numeric)");
+			db.run("INSERT INTO __drizzle_migrations (hash, created_at) VALUES (?, 1)", [hash]);
+			expect(() => applyPendingMigrationsByHash(db, folder)).toThrow(
+				"Incompatible SQLite modeltrace migration schema",
+			);
+			expect(db.query("PRAGMA table_info('narrator_buffered_messages')").all()).toHaveLength(1);
+			expect(db.query("SELECT hash FROM __drizzle_migrations").all()).toEqual([{ hash }]);
+		} finally {
+			db.close();
+			await rm(folder, { recursive: true, force: true });
+		}
+	});
+
+	test("SQLite accepts ASCII case differences in native upgrade identifiers", async () => {
+		const folder = await migrationFixture(
+			resolve(import.meta.dir, "../../drizzle"),
+			"0230_wealthy_sir_ram",
+		);
+		const db = new Database(":memory:");
+		try {
+			db.run("CREATE TABLE NARRATORS (id text PRIMARY KEY, HIDDEN_FROM_LISTS integer DEFAULT false NOT NULL, MODELTRACE_KEY text)");
+			db.run("CREATE UNIQUE INDEX IDX_NARRATORS_MODELTRACE_KEY ON NARRATORS (MODELTRACE_KEY)");
+			applyPendingMigrationsByHash(db, folder);
+			applyPendingMigrationsByHash(db, folder);
+			expect(db.query("SELECT hash FROM __drizzle_migrations").all()).toHaveLength(1);
+		} finally {
+			db.close();
+			await rm(folder, { recursive: true, force: true });
+		}
+	});
 	test.each([
 		true,
 		false,
-	])("SQLite 0230 preserves existing rows (legacy column: %s) and is idempotent", async (legacy) => {
+	])("SQLite 0231 preserves existing rows (legacy column: %s) and is idempotent", async (legacy) => {
 		const folder = await migrationFixture(
 			resolve(import.meta.dir, "../../drizzle"),
-			"0230_native_media",
+			"0231_native_media",
 		);
 		const db = new Database(":memory:");
 		try {
@@ -76,10 +138,10 @@ describe("native media migration upgrades", () => {
 		}
 	});
 
-	test("PostgreSQL 0047 preserves old data, is idempotent, and rejects incompatible columns", async () => {
+	test("PostgreSQL 0048 preserves old data, is idempotent, and rejects incompatible columns", async () => {
 		const folder = await migrationFixture(
 			resolve(import.meta.dir, "../../drizzle-postgres"),
-			"0047_native_media",
+			"0048_native_media",
 			true,
 		);
 		let callbackError: unknown;
@@ -170,14 +232,14 @@ describe("native media migration upgrades", () => {
 			true,
 		);
 		try {
-			const full = await migrationFixture(source, "0047_native_media", false, true);
+			const full = await migrationFixture(source, "0048_native_media", false, true);
 			try {
 				const journal = JSON.parse(await readFile(join(full, "meta/_journal.json"), "utf8"));
 				const outline = journal.entries.find(
 					(entry: { tag: string }) => entry.tag === "0046_outline_task_claims",
 				);
 				const native = journal.entries.find(
-					(entry: { tag: string }) => entry.tag === "0047_native_media",
+					(entry: { tag: string }) => entry.tag === "0048_native_media",
 				);
 				const legacyWhen = 1793516319086;
 				expect(outline.when).toBeLessThan(legacyWhen);
@@ -268,6 +330,130 @@ describe("native media migration upgrades", () => {
 			}
 		} finally {
 			await rm(baseline, { recursive: true, force: true });
+		}
+	}, 420_000);
+
+	test.each([
+		"9c78534134d6f92741a478b05e4290f62b72d8b073d9ee5f052b5c15db0043d7",
+		"f2ecf4303ae75d856f1fe37c88ca9419e21131b8e34edbbef2d982a812945728",
+	])("PostgreSQL repairs ModelTrace skipped by old media 0047 watermark %s", async (oldHash) => {
+		const source = resolve(import.meta.dir, "../../drizzle-postgres");
+		const baseline = await migrationFixture(source, "0046_outline_task_claims", false, true);
+		const full = await migrationFixture(source, "0048_native_media", false, true);
+		try {
+			const journal = JSON.parse(await readFile(join(full, "meta/_journal.json"), "utf8"));
+			const model = journal.entries.find(
+				(entry: { tag: string }) => entry.tag === "0047_modeltrace_narrator",
+			);
+			const native = journal.entries.find(
+				(entry: { tag: string }) => entry.tag === "0048_native_media",
+			);
+			const oldWhen = 1793521234696;
+			const modelHash = createHash("sha256")
+				.update((await readFile(join(full, `${model.tag}.sql`), "utf8")).replace(/\r\n/g, "\n"))
+				.digest("hex");
+			expect(model.when).toBeLessThan(oldWhen);
+			expect(native.when).toBeGreaterThan(oldWhen);
+			let callbackError: unknown;
+			const result = await withPostgres(
+				async ({ exec }) => {
+					try {
+						const run = async (sql: string) => {
+							const outcome = await exec(sql);
+							if (outcome.code !== 0) throw new Error(outcome.stderr);
+							return outcome.stdout.trim();
+						};
+						const db = drizzleProxy(psqlProxyCallback(exec));
+						const apply = (folder: string) =>
+							migrate(
+								db,
+								async (queries) => {
+									await run(`BEGIN;\n${migrationScript(queries)}\nCOMMIT;`);
+								},
+								{ migrationsFolder: folder },
+							);
+						await apply(baseline);
+						await run(`ALTER TABLE narrator_buffered_messages ADD COLUMN media_json text;
+						INSERT INTO narrators (id, title, created_at, updated_at) VALUES ('old', 'preserved', 'then', 'then');
+						INSERT INTO drizzle.__drizzle_migrations (hash, created_at) VALUES ('${oldHash}', ${oldWhen});`);
+						await apply(full);
+						expect(
+							await run(
+								"SELECT title || ':' || hidden_from_lists || ':' || coalesce(modeltrace_key, '<null>') FROM narrators WHERE id='old';",
+							),
+						).toBe("preserved:false:<null>");
+						expect(
+							await run(
+								"SELECT count(*) FROM information_schema.columns WHERE table_schema='public' AND table_name='narrators' AND column_name IN ('hidden_from_lists', 'modeltrace_key');",
+							),
+						).toBe("2");
+						expect(
+							await run(
+								"SELECT count(*) FROM pg_indexes WHERE schemaname='public' AND indexname='idx_narrators_modeltrace_key' AND indexdef LIKE 'CREATE UNIQUE INDEX%';",
+							),
+						).toBe("1");
+						expect(
+							await run(
+								`SELECT count(*) FROM drizzle.__drizzle_migrations WHERE hash='${modelHash}';`,
+							),
+						).toBe("1");
+						await apply(full);
+						expect(
+							await run(
+								`SELECT count(*) FROM drizzle.__drizzle_migrations WHERE hash='${modelHash}';`,
+							),
+						).toBe("1");
+						expect(await run("SELECT count(*) FROM drizzle.__drizzle_migrations;")).toBe(
+							String(journal.entries.length + 1),
+						);
+						const compensation = (await readFile(join(full, `${native.tag}.sql`), "utf8")).split(
+							"--> statement-breakpoint",
+						)[2];
+						const modelCrlfHash = createHash("sha256")
+							.update(
+								(await readFile(join(full, `${model.tag}.sql`), "utf8"))
+									.replace(/\r\n/g, "\n")
+									.replace(/\n/g, "\r\n"),
+							)
+							.digest("hex");
+						expect(modelCrlfHash).toBe(
+							"9506699a359b5c8a6e1ec148461b126a721ff3807bca63904d699d30c823e562",
+						);
+						// Existing upstream CRLF fingerprint must suppress duplicate DDL.
+						const modelLfHash = "d837b29b7004e8d02c4f88f098d0747e1944972dbf2b02a0faa29b88f8a1fd4e";
+						await run(
+							`DELETE FROM drizzle.__drizzle_migrations WHERE hash IN ('${modelHash}', '${modelLfHash}', '${modelCrlfHash}'); INSERT INTO drizzle.__drizzle_migrations (hash, created_at) VALUES ('${modelCrlfHash}', ${model.when});`,
+						);
+						await run(compensation);
+						expect(
+							await run(
+								`SELECT count(*) FROM drizzle.__drizzle_migrations WHERE hash='${modelLfHash}';`,
+							),
+						).toBe("0");
+						// An unrelated fingerprint must not trigger the repair, even with a newer watermark.
+						await run(
+							`DELETE FROM drizzle.__drizzle_migrations WHERE hash IN ('${oldHash}', '${modelCrlfHash}'); INSERT INTO drizzle.__drizzle_migrations (hash, created_at) VALUES ('unrelated', ${oldWhen});`,
+						);
+						await run(compensation);
+						expect(
+							await run(
+								`SELECT count(*) FROM drizzle.__drizzle_migrations WHERE hash IN ('${modelLfHash}', '${modelCrlfHash}');`,
+							),
+						).toBe("0");
+						return "pass" as const;
+					} catch (error) {
+						callbackError = error;
+						throw error;
+					}
+				},
+				{ image: process.env.PG_TEST_IMAGE ?? "docker.io/library/postgres:17-alpine" },
+			);
+			if (callbackError) throw callbackError;
+			if (result !== "pass")
+				throw new Error(`Real PostgreSQL upgrade did not execute: ${JSON.stringify(result)}`);
+		} finally {
+			await rm(baseline, { recursive: true, force: true });
+			await rm(full, { recursive: true, force: true });
 		}
 	}, 420_000);
 });
