@@ -371,11 +371,19 @@
 		},
 		{
 			"idx": 46,
-			"tag": "0046_modeltrace_narrator",
-			"id": "8e517568-b17c-423a-bcd0-57c2f4892da2",
+			"tag": "0046_outline_task_claims",
+			"id": "87e33132-68f8-41ad-9605-925309958431",
 			"prevId": "b47d28e4-7316-4e38-9be4-f1a8e6511385",
 			"version": "7",
-			"snapshotDigest": "5252adc5aa329a97fb88628cee8555b1f6f81b28b003345d629e050e715dd0e7"
+			"snapshotDigest": "a1bccd52e606b667f8ccbcc44ffe135c3c9339b242019b0bfb1a8e8c621c2c26"
+		},
+		{
+			"idx": 47,
+			"tag": "0047_modeltrace_narrator",
+			"id": "39f50ea4-8ecc-468b-be8c-8acc9f70aa65",
+			"prevId": "87e33132-68f8-41ad-9605-925309958431",
+			"version": "7",
+			"snapshotDigest": "a3ae8c711d84cab6ccf2ae7ba7b631423d02e3b6e199ed36173704f6c682c43c"
 		}
 	]
 }

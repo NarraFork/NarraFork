@@ -327,8 +327,15 @@
 		{
 			"idx": 46,
 			"version": "7",
-			"when": 1793416821931,
-			"tag": "0046_modeltrace_narrator",
+			"when": 1793383934682,
+			"tag": "0046_outline_task_claims",
+			"breakpoints": true
+		},
+		{
+			"idx": 47,
+			"version": "7",
+			"when": 1793519539201,
+			"tag": "0047_modeltrace_narrator",
 			"breakpoints": true
 		}
   ]

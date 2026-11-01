@@ -1,3 +1,4 @@
+import type { GitBranches } from "@shared/git-branches";
 import type { GitCommitDetail, GitCommitPatch } from "@shared/git-commit-preview";
 import type { GitLineStats } from "@shared/git-line-stats";
 import type { GitWorkspace } from "@shared/git-workspace";
@@ -13,6 +14,7 @@ import type {
 import { request } from "./client";
 import type { ApiEntity } from "./types";
 
+export type { GitBranchEntry, GitBranches } from "@shared/git-branches";
 export type { GitWorkspace } from "@shared/git-workspace";
 
 /** A single `git log` row. `parents` comes from git `%P` (full parent SHAs; root = []). */
@@ -107,6 +109,9 @@ export const gitApi = {
 		}),
 	getGitStatus: (target: GitTarget, signal?: AbortSignal, fresh = false) =>
 		gitRequest<ApiEntity>(gitReadPath(target, fresh ? "/status?fresh=1" : "/status"), { signal }),
+	/** Full branch listing: local, remote-tracking, upstream tracking and worktrees. */
+	getGitBranches: (target: GitTarget, signal?: AbortSignal) =>
+		gitRequest<GitBranches>(gitReadPath(target, "/branches"), { signal }),
 	getGitLineStats: (target: GitTarget, signal?: AbortSignal, fresh = false) =>
 		gitRequest<GitLineStats>(gitReadPath(target, fresh ? "/line-stats?fresh=1" : "/line-stats"), {
 			signal,
@@ -198,5 +203,25 @@ export const gitApi = {
 		gitRequest<{ message: string }>(`${gitBasePath(target)}/ai-commit-message`, {
 			method: "POST",
 			body: writeBody(target),
+		}),
+	/** Switch, create (`create` + `startPoint`), or track a remote branch by name. */
+	gitCheckoutBranch: (
+		target: GitTarget,
+		body: { branch: string; create?: boolean; startPoint?: string },
+	) =>
+		gitRequest<ApiEntity>(`${gitBasePath(target)}/checkout`, {
+			method: "POST",
+			body: writeBody(target, body),
+		}),
+	/** Never force-pushes: a rejected non-fast-forward comes back as git's own text. */
+	gitPushBranch: (target: GitTarget, body: { remote?: string; setUpstream?: boolean } = {}) =>
+		gitRequest<ApiEntity>(`${gitBasePath(target)}/push`, {
+			method: "POST",
+			body: writeBody(target, body),
+		}),
+	gitFetchRemote: (target: GitTarget, body: { remote?: string; prune?: boolean } = {}) =>
+		gitRequest<ApiEntity>(`${gitBasePath(target)}/fetch`, {
+			method: "POST",
+			body: writeBody(target, body),
 		}),
 };

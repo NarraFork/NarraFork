@@ -411,7 +411,7 @@ describe("bounds, real committed assets, and source AST guard", () => {
 			"last_stop_reason",
 			"model_history_revision",
 		]);
-		// 0046 在末尾追加 ModelTrace 舱的两列。
+		// 0047 在末尾追加 ModelTrace 舱的两列。
 		expect(narrators?.slice(-4)).toEqual([
 			"runtime_registration_json",
 			"policy_source_narrator_id",

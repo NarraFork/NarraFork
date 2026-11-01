@@ -36,8 +36,11 @@ import {
 	validateExclusiveCreateInput,
 } from "../lib/agent/execution/exclusive-create";
 import {
+	FEATURE_GIT_BRANCH_SWITCH_V1,
+	FEATURE_GIT_BRANCHES_V1,
 	FEATURE_GIT_COMMIT_PREVIEW_V1,
 	FEATURE_GIT_LINE_STATS_V1,
+	FEATURE_GIT_REMOTE_SYNC_V1,
 	FEATURE_GIT_WORKSPACE_STATUS_V1,
 	FEATURE_GIT_WORKSPACE_V1,
 	FEATURE_GIT_WORKSPACE_WATCH_V1,
@@ -721,12 +724,41 @@ export class RemoteBackend implements ExecutionBackend {
 		return hasDeviceProtocolFeature(this.deviceId, FEATURE_GIT_COMMIT_PREVIEW_V1);
 	}
 
+	get supportsGitBranches(): boolean {
+		return (
+			this.supportsGitWorkspace && hasDeviceProtocolFeature(this.deviceId, FEATURE_GIT_BRANCHES_V1)
+		);
+	}
+
+	get supportsGitBranchSwitch(): boolean {
+		return (
+			this.supportsGitWorkspace &&
+			hasDeviceProtocolFeature(this.deviceId, FEATURE_GIT_BRANCH_SWITCH_V1)
+		);
+	}
+
+	get supportsGitRemoteSync(): boolean {
+		return (
+			this.supportsGitWorkspace &&
+			hasDeviceProtocolFeature(this.deviceId, FEATURE_GIT_REMOTE_SYNC_V1)
+		);
+	}
+
 	async gitWorkspace(
 		request: GitWorkspaceRequest,
 		signal?: AbortSignal,
 	): Promise<GitWorkspaceResult> {
 		const timeoutMs = request.timeoutMs ?? GIT_WORKSPACE_TIMEOUT_MS;
-		const preview = request.operation === "commitDetail" || request.operation === "commitDiff";
+		// Every git.workspace call needs the base feature; the rest are additive and
+		// listed per operation so an older executor fails one operation, not the panel.
+		const requiredFeatures = [FEATURE_GIT_WORKSPACE_V1];
+		if (request.operation === "commitDetail" || request.operation === "commitDiff")
+			requiredFeatures.push(FEATURE_GIT_COMMIT_PREVIEW_V1);
+		else if (request.operation === "lineStats") requiredFeatures.push(FEATURE_GIT_LINE_STATS_V1);
+		else if (request.operation === "branches") requiredFeatures.push(FEATURE_GIT_BRANCHES_V1);
+		else if (request.operation === "checkout") requiredFeatures.push(FEATURE_GIT_BRANCH_SWITCH_V1);
+		else if (request.operation === "push" || request.operation === "fetch")
+			requiredFeatures.push(FEATURE_GIT_REMOTE_SYNC_V1);
 		return (await this.rpc(
 			"git.workspace",
 			{
@@ -734,15 +766,7 @@ export class RemoteBackend implements ExecutionBackend {
 				timeoutMs,
 				maxBytes: Math.min(request.maxBytes ?? GIT_WORKSPACE_MAX_BYTES, this.maxBytes),
 			},
-			{
-				signal,
-				timeoutMs: timeoutMs + 5_000,
-				requiredFeatures: preview
-					? [FEATURE_GIT_WORKSPACE_V1, FEATURE_GIT_COMMIT_PREVIEW_V1]
-					: request.operation === "lineStats"
-						? [FEATURE_GIT_WORKSPACE_V1, FEATURE_GIT_LINE_STATS_V1]
-						: [FEATURE_GIT_WORKSPACE_V1],
-			},
+			{ signal, timeoutMs: timeoutMs + 5_000, requiredFeatures },
 		)) as GitWorkspaceResult;
 	}
 

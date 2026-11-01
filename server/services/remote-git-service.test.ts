@@ -11,6 +11,7 @@ import {
 	type GitWorkspaceResult,
 } from "../lib/agent/execution/git-workspace-rpc";
 import { targetPathSemantics } from "../lib/agent/execution/path-semantics";
+import { GitAuthError } from "../lib/errors";
 import { eventBus } from "../lib/event-bus";
 import { getGitLineStatsCached } from "./git-line-stats-cache";
 import {
@@ -735,3 +736,30 @@ for (const writeFails of [false, true]) {
 		expect(statusCalls).toBe(2);
 	});
 }
+
+test("branch sync failures stay git errors, including auth, without the uncertain-write suffix", async () => {
+	const auth = backendFixture();
+	Object.assign(auth.backend, { supportsGitRemoteSync: true });
+	auth.fail(new Error("fatal: Authentication failed for 'https://example.test/r.git/'"));
+	await expect(createRemoteGitService(auth.backend).push("/repo")).rejects.toBeInstanceOf(
+		GitAuthError,
+	);
+
+	const rejected = backendFixture();
+	Object.assign(rejected.backend, { supportsGitRemoteSync: true });
+	rejected.fail(new Error("! [rejected] main -> main (non-fast-forward)"));
+	const rejectedGit = createRemoteGitService(rejected.backend);
+	await expect(rejectedGit.push("/repo")).rejects.toThrow("non-fast-forward");
+	await expect(rejectedGit.fetch("/repo")).rejects.not.toThrow("uncertain");
+
+	const checkout = backendFixture();
+	Object.assign(checkout.backend, { supportsGitBranchSwitch: true });
+	checkout.fail(new Error("fatal: 'side' is already used by worktree"));
+	const checkoutGit = createRemoteGitService(checkout.backend);
+	await expect(checkoutGit.checkoutBranch("/repo", { branch: "side" })).rejects.toThrow(
+		"already used",
+	);
+	await expect(checkoutGit.checkoutBranch("/repo", { branch: "side" })).rejects.not.toThrow(
+		"uncertain",
+	);
+});
