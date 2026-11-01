@@ -94,7 +94,8 @@ commandCodeRoutes.post("/models/refresh", requireAdmin, async (c) => {
 	const saved = commandCodeConfigForPrefix(draft.prefix);
 	const apiKey = usableDraftKey(draft.apiKey) ?? saved?.apiKey;
 	const baseUrl = draft.baseUrl?.trim() || saved?.baseUrl;
-	invalidateCommandCodeModelsCache();
+	// 只丢这条实例的模型缓存：其它实例的列表不该因为一次刷新被清空。
+	invalidateCommandCodeModelsCache(apiKey, baseUrl);
 	// 刷新也意味着"现在的凭据"，不要沿用短缓存里的旧 token。
 	invalidateCommandCodeAuthCache();
 	const result = await listCommandCodeModels(apiKey, baseUrl);

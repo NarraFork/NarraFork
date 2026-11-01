@@ -613,12 +613,29 @@ export function resolveEffectiveModel(
  * Command Code 的模型来自上游目录（`GET /provider/v1/models`），这里只读它已有的缓存：
  * `peekCommandCodeModels` 立刻返回（命中、过期旧值或空），并在需要时补一次去重的后台拉取，
  * 所以这条同步路径不会被上游延迟拖住。未启用或没有凭据时没有模型。
+ *
+ * 每条实例有自己的 key/baseUrl 与模型前缀，模型值按实例前缀拼；一条实例都没有时（迁移前的
+ * 安装）回落到旧的单例字段，和解析链路的回落保持一致。
  */
 function listCommandCodeModelValues(): string[] {
-	const config = s().commandCode;
-	if (config?.disabled) return [];
-	return peekCommandCodeModels(config?.apiKey, config?.baseUrl).models.map(
-		(model) => `${COMMAND_CODE_PREFIX}:${model}`,
+	const instances = (s().agent?.platformInstances ?? []).filter(
+		(entry) => entry.platform === "CommandCode" && !entry.disabled,
+	);
+	const legacy = s().commandCode;
+	const sources: Array<{ prefix: string; config: CommandCodeProviderSettings }> = instances.length
+		? instances.map((entry) => ({
+				prefix: entry.prefix,
+				config: entry.config as CommandCodeProviderSettings,
+			}))
+		: legacy
+			? [{ prefix: COMMAND_CODE_PREFIX, config: legacy }]
+			: [];
+	return sources.flatMap(({ prefix, config }) =>
+		config.disabled
+			? []
+			: peekCommandCodeModels(config.apiKey, config.baseUrl).models.map(
+					(model) => `${prefix}:${model}`,
+				),
 	);
 }
 

@@ -90,7 +90,11 @@ export function resolvePlatformInstanceAdapter(
 			return new CodexProvider(codexOptions(instance));
 		case "CommandCode":
 			return (
-				buildCommandCodeProvider(model, instance.config as CommandCodeProviderSettings) ?? null
+				buildCommandCodeProvider(
+					model,
+					instance.config as CommandCodeProviderSettings,
+					instance.prefix,
+				) ?? null
 			);
 		case "tokendance": {
 			// 没连接就不接管这个前缀，让同名的自定义供应商继续用；有连接才不允许冲突。

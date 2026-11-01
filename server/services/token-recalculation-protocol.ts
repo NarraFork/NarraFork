@@ -17,6 +17,13 @@ interface Connection {
 	disabled?: boolean;
 }
 
+/** 平台实例：前缀按实例走，配置也只是这条实例自己的。 */
+interface PlatformInstanceConnection {
+	prefix: string;
+	platform: "codex" | "CommandCode" | "tokendance";
+	config?: Record<string, unknown>;
+}
+
 interface ProtocolSettings {
 	customApiProviders?: (Connection & { protocol: string })[];
 	anthropicProviders?: Connection[];
@@ -24,6 +31,7 @@ interface ProtocolSettings {
 	geminiProviders?: Connection[];
 	nugProviders?: Connection[];
 	commandCode?: { endpoints?: Record<string, CommandCodeEndpoint> };
+	agent?: { platformInstances?: PlatformInstanceConnection[] };
 }
 
 /** Narrow, fully injectable read-only dependencies: tests need no live settings or providers. */
@@ -31,8 +39,12 @@ export interface TokenRecalculationProtocolDependencies {
 	getSettings(): ProtocolSettings;
 	resolveModelProtocol(prefix: string, model: string): string | undefined;
 	resolveNugModelMeta(id: string, prefix: string, model: string): { channelType: string };
-	getTokenDanceCatalogModels(): { id: string; supported_protocols: string[] }[];
-	getCachedCommandCodeModel(model: string): { endpoints: string[] } | undefined;
+	getTokenDanceCatalogModels(prefix?: string): { id: string; supported_protocols: string[] }[];
+	getCachedCommandCodeModel(
+		model: string,
+		apiKey?: string,
+		baseUrl?: string,
+	): { endpoints: string[] } | undefined;
 }
 
 /**
@@ -76,6 +88,14 @@ type HistoricalProtocolRow = {
 	model: string | null;
 	credential_id: string | null;
 };
+
+/** 迁移前（或实例已删）只凭前缀认平台：历史行仍按原来的路由归类。 */
+function legacyPlatform(prefix: string): PlatformInstanceConnection["platform"] | undefined {
+	if (prefix === COMMAND_CODE_PREFIX) return "CommandCode";
+	if (prefix === "tokendance") return "tokendance";
+	if (prefix === "codex") return "codex";
+	return undefined;
+}
 type ResolvedConnection = Connection & { protocol?: string; nug?: boolean };
 const MAX_CACHE_ENTRIES = 4096;
 
@@ -102,6 +122,7 @@ export function createTokenRecalculationProtocolResolver(
 		})),
 		...(settings.nugProviders ?? []).map((config) => ({ ...config, nug: true })),
 	];
+	const instances = settings.agent?.platformInstances ?? [];
 	const cache = new Map<string, TokenProtocolResolution>();
 
 	function resolve(row: HistoricalProtocolRow): TokenRecalculationProtocol | undefined {
@@ -110,22 +131,34 @@ export function createTokenRecalculationProtocolResolver(
 			connections.find((config) => config.prefix === row.provider);
 		const prefix = connection?.prefix ?? row.provider ?? "";
 		const model = row.model ?? "";
+		// 平台实例按自己的前缀认领历史流量；实例已删（或迁移前）时用遗留的默认前缀兜底。
+		const instance = instances.find((entry) => entry.prefix === prefix);
+		const platform = instance?.platform ?? legacyPlatform(prefix);
 		// Codex is registered before configurable API families and never applies model protocol
 		// overrides. A same-prefix API config must not shadow that fixed builtin route. A
 		// credential matched to a different prefix still identifies that historical connection.
-		if (prefix === "codex") return "openai";
+		if (platform === "codex") return "openai";
 		const supportsOverride =
 			!!connection ||
+			!!platform ||
 			[COMMAND_CODE_PREFIX, "tokendance", "anthropic", "gemini", "openai"].includes(prefix);
 		const override = supportsOverride ? deps.resolveModelProtocol(prefix, model) : undefined;
 		// CommandCode is also registered ahead of configurable API families; its selector
 		// deliberately ignores unsupported protocol overrides (e.g. gemini-compatible).
-		if (prefix === COMMAND_CODE_PREFIX) {
-			const endpoint = selectCommandCodeEndpoint(model, {
+		if (platform === "CommandCode") {
+			const config = instance?.config;
+			const bare = bareCommandCodeModelId(model, prefix);
+			const endpoint = selectCommandCodeEndpoint(bare, {
 				protocol: override,
-				overrides: settings.commandCode?.endpoints,
-				supportedEndpoints: deps.getCachedCommandCodeModel(bareCommandCodeModelId(model))
-					?.endpoints,
+				overrides:
+					(config?.endpoints as Record<string, CommandCodeEndpoint> | undefined) ??
+					settings.commandCode?.endpoints,
+				supportedEndpoints: deps.getCachedCommandCodeModel(
+					bare,
+					typeof config?.apiKey === "string" ? config.apiKey : undefined,
+					typeof config?.baseUrl === "string" ? config.baseUrl : undefined,
+				)?.endpoints,
+				prefix,
 			});
 			return endpoint === "messages" ? "anthropic" : "openai";
 		}
@@ -141,9 +174,10 @@ export function createTokenRecalculationProtocolResolver(
 			return undefined;
 		}
 		if (connection) return protocolFamily(connection.protocol);
-		if (prefix === "tokendance") {
-			const bare = model.startsWith("tokendance:") ? model.slice("tokendance:".length) : model;
-			const catalog = deps.getTokenDanceCatalogModels().find((entry) => entry.id === bare);
+		if (platform === "tokendance") {
+			const head = `${prefix}:`;
+			const bare = model.startsWith(head) ? model.slice(head.length) : model;
+			const catalog = deps.getTokenDanceCatalogModels(prefix).find((entry) => entry.id === bare);
 			return protocolFamily(selectTokenDanceProtocol(catalog?.supported_protocols ?? []));
 		}
 		// These are protocol identities, not model-name heuristics. An unknown prefix cannot

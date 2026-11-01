@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, test } from "bun:test";
 import type { PlatformInstanceRow } from "@shared/platform-instances";
 import { settings } from "../../settings";
+import { AnthropicProvider } from "../anthropic-provider";
 import { CodexProvider } from "../codex-provider";
+import { OpenAIProvider } from "../openai-provider";
 import {
 	listPlatformInstanceReadiness,
 	resolvePlatformInstanceAdapter,
@@ -100,5 +102,44 @@ describe("平台实例在真实解析链路上", () => {
 		expect(resolveProviderAndModel("codex-1:gpt-5.4").provider).toBe("codex-1");
 		expect(resolveProviderAndModel("codex-2:gpt-5.4").provider).toBe("codex-2");
 		expect(resolveProviderAndModel("codex-1:gpt-5.4").model).toBe("codex-1:gpt-5.4");
+	});
+});
+
+describe("逐模型协议按实例前缀生效", () => {
+	const originalProtocols = settings.agent.modelProtocols;
+
+	afterEach(() => {
+		settings.agent.modelProtocols = originalProtocols;
+	});
+
+	const commandCode = (prefix: string): PlatformInstanceRow =>
+		instance({
+			id: `cc-${prefix}`,
+			platform: "CommandCode",
+			suffix: prefix.replace("CommandCode-", ""),
+			prefix,
+			config: { apiKey: "cc_test_key" },
+		});
+
+	test("Command Code 实例上单独设置的协议由它自己的前缀命中", () => {
+		settings.agent.platformInstances = [commandCode("CommandCode-2")];
+		settings.agent.modelProtocols = { "CommandCode-2:deepseek-chat": "anthropic-messages" };
+
+		expect(
+			resolvePlatformInstanceAdapter("CommandCode-2", "CommandCode-2:deepseek-chat"),
+		).toBeInstanceOf(AnthropicProvider);
+		// 同实例里没设置协议的模型仍走目录/模型名推断。
+		expect(
+			resolvePlatformInstanceAdapter("CommandCode-2", "CommandCode-2:deepseek-other"),
+		).toBeInstanceOf(OpenAIProvider);
+	});
+
+	test("写在默认前缀上的协议不会串到别的实例", () => {
+		settings.agent.platformInstances = [commandCode("CommandCode-2")];
+		settings.agent.modelProtocols = { "CommandCode:deepseek-chat": "anthropic-messages" };
+
+		expect(
+			resolvePlatformInstanceAdapter("CommandCode-2", "CommandCode-2:deepseek-chat"),
+		).toBeInstanceOf(OpenAIProvider);
 	});
 });

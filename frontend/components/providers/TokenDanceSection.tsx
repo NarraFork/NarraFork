@@ -14,6 +14,7 @@ import { useConfirmDialog } from "../common/confirm-dialog-context";
 import { TokenDanceRechargeDialog } from "../settings/TokenDanceRechargeDialog";
 import { ModelList, type ModelListProps } from "./ModelList";
 export function TokenDanceSection({
+	prefix = "tokendance",
 	connection,
 	/** 启用开关的草稿值（保存条统一提交，避免一拨就落库）。 */
 	enabled,
@@ -23,6 +24,8 @@ export function TokenDanceSection({
 	onDeleted,
 	...modelListProps
 }: Omit<ModelListProps, "models"> & {
+	/** 这条 TokenDance 实例的模型前缀；省略时是内置的 `tokendance`。 */
+	prefix?: string;
 	connection: TokenDancePublicConnection;
 	enabled: boolean;
 	onToggleEnabled: () => void;
@@ -184,7 +187,7 @@ export function TokenDanceSection({
 			<ModelList
 				{...modelListProps}
 				models={connection.models.map((model) => ({
-					value: `tokendance:${model.id}`,
+					value: `${prefix}:${model.id}`,
 					label: model.name || model.id,
 				}))}
 			/>

@@ -1313,6 +1313,7 @@ function SettingsProvidersPage() {
 							{/* 实例只描述「用哪一份凭据」；平台本身的管理界面挂在实例配置下方。 */}
 							{selectedPlatformInstance.platform === "codex" && (
 								<CodexSection
+									prefix={selectedPlatformInstance.prefix}
 									hiddenModels={state.hiddenModels}
 									onToggleHidden={dispatchers.toggleHidden}
 									customModels={state.customModels}
@@ -1342,6 +1343,7 @@ function SettingsProvidersPage() {
 							)}
 							{selectedPlatformInstance.platform === "tokendance" && tokenDance?.connected && (
 								<TokenDanceSection
+									prefix={selectedPlatformInstance.prefix}
 									connection={tokenDance}
 									enabled={!tokenDanceDisabled}
 									onToggleEnabled={() =>
