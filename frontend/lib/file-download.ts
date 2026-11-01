@@ -1,12 +1,22 @@
 /**
- * file-download.ts — save a fetched Blob to disk.
+ * file-download.ts — hand bytes to the browser so it saves them to disk.
  *
- * Every authenticated download in the app has the same shape: the URL needs an
- * `Authorization` header, so the browser cannot be pointed at it directly and the
- * bytes must be fetched, wrapped in an object URL, and handed to a synthetic
- * anchor. This module owns that dance so call sites do not each re-implement it
- * (and re-forget the revoke).
+ * Two shapes exist, and the difference is who carries the credential:
+ *
+ *  - `saveBlobAsFile` — for a fetch that already returned the bytes. The URL needed an
+ *    `Authorization` header, so the browser could not be pointed at it and the response had
+ *    to be buffered into a Blob first. That costs a full copy in page memory and gives up
+ *    progress, Range and resumability, so it is now the fallback rather than the default.
+ *  - `fsDownloadUrl` — for a URL that carries its own credential (a single-use
+ *    download ticket). Navigating to it lets the browser stream straight to disk: constant
+ *    memory, real progress bar, resumable, and no "download not triggered by a user
+ *    gesture" interference, because the navigation is the download rather than something
+ *    that happens after an `await`.
+ *
+ * Both go through a synthetic anchor so the page never navigates away.
  */
+
+import { apiUrl } from "@frontend/lib/base-path";
 
 /** Click a synthetic anchor to start a download without navigating away. */
 export function triggerBlobDownload(url: string, filename: string): void {
@@ -17,6 +27,17 @@ export function triggerBlobDownload(url: string, filename: string): void {
 	document.body.appendChild(link);
 	link.click();
 	link.remove();
+}
+
+/**
+ * The URL that downloads `path` under a ticket minted by `api.fsDownloadTicket`.
+ *
+ * Built with `apiUrl` rather than string concatenation so a mount prefix (`/nf/`,
+ * code-server's `/proxy/7778/`) is applied. `filename` is only a hint: the server's
+ * `Content-Disposition` wins, and it is the server that knows the real name.
+ */
+export function fsDownloadUrl(ticket: string, filename: string): void {
+	triggerBlobDownload(apiUrl(`/api/fs/download?ticket=${encodeURIComponent(ticket)}`), filename);
 }
 
 /**
