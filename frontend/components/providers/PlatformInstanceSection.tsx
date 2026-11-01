@@ -1,6 +1,5 @@
 import { api } from "@frontend/lib/api";
 import {
-	Button,
 	Divider,
 	Group,
 	MultiSelect,
@@ -13,7 +12,7 @@ import {
 } from "@mantine/core";
 import { COMMAND_CODE_PROVIDER_BASE } from "@shared/commandcode";
 import { useQuery } from "@tanstack/react-query";
-import { useMemo, useState } from "react";
+import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
 import type { PlatformInstanceKind, PlatformInstanceRow } from "../../../shared/platform-instances";
 import type { ProxyOverride } from "../../lib/proxy";
@@ -149,21 +148,22 @@ export function PlatformInstanceFields({
 	);
 }
 
-/** 单个平台实例的配置页：实例自己的配置、保存与删除。 */
+/**
+ * 单个平台实例的配置页。
+ *
+ * 配置受页面草稿控制（改一下就等于改了草稿），提交与放弃都由底部保存条负责，和 API key
+ * 类供应商完全一致；删除入口在概览卡片的开关右侧。
+ */
 export function PlatformInstanceSection({
 	instance,
 	cardName,
-	onSave,
-	onDelete,
+	onConfigChange,
 }: {
 	instance: PlatformInstanceRow;
 	cardName: string;
-	onSave: (config: Record<string, unknown>) => void;
-	onDelete: () => void;
+	onConfigChange: (config: Record<string, unknown>) => void;
 }) {
 	const { t } = useTranslation("settings");
-	// 调用方按实例 id 传 `key`，切换实例时组件重建，草稿不会带到别的实例。
-	const [config, setConfig] = useState<Record<string, unknown>>(instance.config ?? {});
 
 	return (
 		<Stack gap="sm">
@@ -177,13 +177,11 @@ export function PlatformInstanceSection({
 				{t("platformInstanceConfigHint")}
 			</Text>
 			<Divider />
-			<PlatformInstanceFields platform={instance.platform} config={config} onChange={setConfig} />
-			<Group justify="space-between">
-				<Button color="red" variant="subtle" onClick={onDelete}>
-					{t("platformInstanceDelete")}
-				</Button>
-				<Button onClick={() => onSave(config)}>{t("platformInstanceSave")}</Button>
-			</Group>
+			<PlatformInstanceFields
+				platform={instance.platform}
+				config={instance.config ?? {}}
+				onChange={onConfigChange}
+			/>
 		</Stack>
 	);
 }

@@ -2291,8 +2291,6 @@
 	"platformInstanceWebSearch": "Web search",
 	"platformInstanceImageGeneration": "Image generation",
 	"platformInstanceConfigHint": "This configuration belongs only to this platform instance; sibling instances of the same platform are unaffected",
-	"platformInstanceSave": "Save instance configuration",
-	"platformInstanceConfigSaved": "Instance configuration saved",
 	"providerStatsTotal": "Total providers",
 	"providerStatsEnabled": "Enabled",
 	"providerStatsModels": "Available models",

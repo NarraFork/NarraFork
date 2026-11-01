@@ -172,6 +172,7 @@ function prepareProviderSettingsSave(state: ProvidersState) {
 				modelProtocols: state.modelProtocols,
 				providerOrder: state.providerOrder,
 				disabledProviders: [...state.disabledProviders],
+				platformInstances: state.platformInstances,
 			},
 		} satisfies Record<string, unknown>,
 	};
@@ -208,13 +209,8 @@ function SettingsProvidersPage() {
 	const dispatchers = useProvidersDispatch(dispatch);
 	const stateRef = useRef(state);
 	stateRef.current = state;
-	// 平台集成的实例清单：清单是唯一事实来源，卡片与解析都以它为准。
-	const platformInstances = useMemo(
-		() =>
-			(settings?.agent as unknown as { platformInstances?: PlatformInstanceRow[] } | undefined)
-				?.platformInstances ?? [],
-		[settings?.agent],
-	);
+	// 平台集成的实例清单：与其它供应商一样是页面草稿，改动由底部保存条统一提交。
+	const platformInstances = state.platformInstances;
 	const [addPlatformOpen, setAddPlatformOpen] = useState(false);
 	const providerPageMountedRef = useRef(true);
 	const isAddingRef = useRef(isAddingProvider);
@@ -440,18 +436,18 @@ function SettingsProvidersPage() {
 		dispatch({ type: "RESTORE_FROM_SNAPSHOT", snapshot: savedSnapshot.current });
 	}, []);
 
-	// ── 平台实例（添加 / 保存配置 / 删除）──
-	// 清单即时落库：它不是页面底部保存条管的草稿，改动立刻生效。
-	const savePlatformInstances = useCallback(
-		(next: PlatformInstanceRow[]) => {
-			updateMutation.mutate({ agent: { platformInstances: next } });
+	// ── 平台实例（添加 / 改配置 / 启停 / 删除）──
+	// 全部走页面草稿：改完点右下角「保存更改」才落库，「放弃更改」整体回滚。
+	const setPlatformInstances = useCallback(
+		(updater: PlatformInstanceRow[] | ((prev: PlatformInstanceRow[]) => PlatformInstanceRow[])) => {
+			dispatch({ type: "SET_PLATFORM_INSTANCES", instances: updater });
 		},
-		[updateMutation],
+		[],
 	);
 	const addPlatformInstance = useCallback(
 		(instance: NewPlatformInstance) => {
-			savePlatformInstances([
-				...platformInstances,
+			setPlatformInstances((current) => [
+				...current,
 				{
 					id: `platform-${instance.platform}-${Date.now().toString(36)}`,
 					platform: instance.platform,
@@ -462,23 +458,31 @@ function SettingsProvidersPage() {
 				},
 			]);
 		},
-		[platformInstances, savePlatformInstances],
+		[setPlatformInstances],
 	);
 	const savePlatformInstanceConfig = useCallback(
 		(id: string, config: Record<string, unknown>) => {
-			savePlatformInstances(
-				platformInstances.map((instance) =>
-					instance.id === id ? { ...instance, config } : instance,
+			setPlatformInstances((current) =>
+				current.map((instance) => (instance.id === id ? { ...instance, config } : instance)),
+			);
+		},
+		[setPlatformInstances],
+	);
+	const togglePlatformInstance = useCallback(
+		(id: string) => {
+			setPlatformInstances((current) =>
+				current.map((instance) =>
+					instance.id === id ? { ...instance, disabled: !instance.disabled } : instance,
 				),
 			);
 		},
-		[platformInstances, savePlatformInstances],
+		[setPlatformInstances],
 	);
 	const deletePlatformInstance = useCallback(
 		(id: string) => {
-			savePlatformInstances(platformInstances.filter((instance) => instance.id !== id));
+			setPlatformInstances((current) => current.filter((instance) => instance.id !== id));
 		},
-		[platformInstances, savePlatformInstances],
+		[setPlatformInstances],
 	);
 
 	const saveProvidersState = useCallback(
@@ -1053,8 +1057,13 @@ function SettingsProvidersPage() {
 						? (savedProviderSnapshot.customApiProviders.find((p) => p.prefix === prefix) ??
 							savedProviderSnapshot.nugProviders.find((p) => p.prefix === prefix))
 						: undefined;
+					const savedInstance = savedProviderSnapshot.platformInstances.find(
+						(entry) => entry.prefix === prefix,
+					);
 					const inactive =
-						savedProviderSnapshot.disabledProviders.includes(prefix) || !!savedMatch?.disabled;
+						savedProviderSnapshot.disabledProviders.includes(prefix) ||
+						!!savedMatch?.disabled ||
+						!!savedInstance?.disabled;
 
 					return {
 						prefix,
@@ -1297,17 +1306,9 @@ function SettingsProvidersPage() {
 									selectedPlatformInstance.platform,
 									selectedPlatformInstance.suffix,
 								)}
-								onSave={(config) => {
-									savePlatformInstanceConfig(selectedPlatformInstance.id, config);
-									notifications.show({
-										message: t("platformInstanceConfigSaved"),
-										color: "green",
-									});
-								}}
-								onDelete={() => {
-									deletePlatformInstance(selectedPlatformInstance.id);
-									setSelectedProvider(null);
-								}}
+								onConfigChange={(config) =>
+									savePlatformInstanceConfig(selectedPlatformInstance.id, config)
+								}
 							/>
 							{/* 实例只描述「用哪一份凭据」；平台本身的管理界面挂在实例配置下方。 */}
 							{selectedPlatformInstance.platform === "codex" && (
@@ -1389,8 +1390,19 @@ function SettingsProvidersPage() {
 					groups={providerGroups}
 					hiddenModels={state.hiddenModels}
 					onToggleProviderDisabled={(prefix) => {
-						// 平台实例与自定义供应商一样只写草稿，由底部保存条统一提交。
+						// 平台实例的开关改实例自己的 disabled 草稿；其它供应商沿用前缀集合。
+						const instance = platformInstances.find((entry) => entry.prefix === prefix);
+						if (instance) {
+							togglePlatformInstance(instance.id);
+							return;
+						}
 						dispatchers.toggleProviderDisabled(prefix);
+					}}
+					onDeletePlatformInstance={(prefix) => {
+						const instance = platformInstances.find((entry) => entry.prefix === prefix);
+						if (!instance) return;
+						deletePlatformInstance(instance.id);
+						if (selectedProvider === instance.id) setSelectedProvider(null);
 					}}
 					onOpenProviderConfig={setSelectedProvider}
 					selectedProvider={selectedProvider}

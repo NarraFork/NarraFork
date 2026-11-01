@@ -462,7 +462,7 @@ function persistedProviders(field = "customApiProviders") {
 	return serverSettings[field] as Array<Record<string, unknown>>;
 }
 async function leaveDetail() {
-	const back = container.querySelector<HTMLButtonElement>("button.mantine-ActionIcon-root");
+	const back = container.querySelector<HTMLButtonElement>('[data-testid="provider-config-back"]');
 	if (!back) throw new Error("Missing provider configuration back button");
 	await click(back);
 }
@@ -499,7 +499,7 @@ describe("provider deep link", () => {
 	test("`?provider=` opens the provider and follows URL changes while mounted", async () => {
 		await mount("/settings/providers?provider=existing");
 		expect(currentCustomDetail()?.provider.id).toBe("existing");
-		expect(container.querySelector("button.mantine-ActionIcon-root")).not.toBeNull();
+		expect(container.querySelector('[data-testid="provider-config-back"]')).not.toBeNull();
 
 		// Leaving the detail returns to the overview and clears the link.
 		await leaveDetail();
@@ -520,7 +520,7 @@ describe("provider deep link", () => {
 			await new Promise((resolve) => setTimeout(resolve, 0));
 		});
 		expect(router.state.location.search).toEqual({});
-		expect(container.querySelector("button.mantine-ActionIcon-root")).toBeNull();
+		expect(container.querySelector('[data-testid="provider-config-back"]')).toBeNull();
 	});
 });
 
@@ -588,7 +588,7 @@ describe("provider deep link resolution", () => {
 		};
 		await mount("/settings/providers?provider=xiaomi");
 		expect(currentCustomDetail()).toBeUndefined();
-		expect(container.querySelector("button.mantine-ActionIcon-root")).toBeNull();
+		expect(container.querySelector('[data-testid="provider-config-back"]')).toBeNull();
 		expect(container.querySelector('a[href="/settings/providers/add"]')).not.toBeNull();
 	});
 });
@@ -787,7 +787,7 @@ describe("provider add nested route", () => {
 		);
 		// The removed provider no longer resolves from `?provider=`, so the page is back
 		// on the overview instead of an empty detail view.
-		expect(container.querySelector("button.mantine-ActionIcon-root")).toBeNull();
+		expect(container.textContent).toContain(text("providerStatsTotal"));
 		await openAdd();
 		await fillDraft();
 		await submit();
@@ -1213,9 +1213,14 @@ describe("provider add nested route", () => {
 		await click(button("unsavedSave"));
 		expect(updateSpy).toHaveBeenCalledTimes(0);
 		expect(saveCalls).toBe(1);
+		// 平台实例的开关落在实例自己的 disabled 上，而不是前缀集合。
 		expect(
-			(savedPayloads.at(-1)?.agent as { disabledProviders?: string[] }).disabledProviders,
-		).toContain("tokendance");
+			(
+				savedPayloads.at(-1)?.agent as {
+					platformInstances?: Array<{ platform: string; disabled: boolean }>;
+				}
+			).platformInstances?.find((entry) => entry.platform === "tokendance")?.disabled,
+		).toBe(true);
 	});
 
 	test("TokenDance detail enable switch drafts locally too", async () => {
@@ -1295,8 +1300,12 @@ describe("provider add nested route", () => {
 		await click(button("unsavedSave"));
 		expect(saveCalls).toBe(1);
 		expect(
-			(savedPayloads.at(-1)?.agent as { disabledProviders?: string[] }).disabledProviders,
-		).toContain("codex");
+			(
+				savedPayloads.at(-1)?.agent as {
+					platformInstances?: Array<{ platform: string; disabled: boolean }>;
+				}
+			).platformInstances?.find((entry) => entry.platform === "codex")?.disabled,
+		).toBe(true);
 		expect(cardIndex("Codex")).toBeGreaterThan(cardIndex("Command Code"));
 	});
 
@@ -1334,12 +1343,17 @@ describe("provider add nested route", () => {
 		expectNoSave();
 	});
 
-	test("添加平台：后缀与前缀留空时自动取第一个空闲数字", async () => {
+	test("添加平台：后缀与前缀留空时自动取第一个空闲数字，且先进草稿", async () => {
 		await mount();
 		await click(button("platformInstanceAddButton"));
 		// codex / CommandCode / tokendance 已占用，所以自动编号从 1 开始。
 		expect(document.body.textContent).toContain("codex-1:model");
 		await click(button("platformInstanceAdd"));
+		// 与 API key 类供应商一致：先落草稿，底部出现保存条，点「保存更改」才落库。
+		expect(saveCalls).toBe(0);
+		expect(container.textContent).toContain(text("unsavedSave"));
+		expect(container.querySelectorAll('[role="button"]').length).toBe(5);
+		await click(button("unsavedSave"));
 		expect(saveCalls).toBe(1);
 		const saved = (
 			savedPayloads.at(-1)?.agent as {
@@ -1350,20 +1364,51 @@ describe("provider add nested route", () => {
 		expect(saved?.at(-1)).toMatchObject({ platform: "codex", suffix: "1", prefix: "codex-1" });
 	});
 
-	test("删除平台实例：弹窗列表里删掉后清单少一条", async () => {
+	test("卡片删除按钮走草稿：放弃更改会还原，保存后才落库", async () => {
 		await mount();
-		await click(button("platformInstanceAddButton"));
-		// 弹窗里每个已有实例一行，右侧是删除按钮。
-		const rows = [...document.body.querySelectorAll<HTMLButtonElement>("button")].filter(
-			(node) => node.getAttribute("aria-label") === text("platformInstanceDelete"),
-		);
-		expect(rows).toHaveLength(3);
-		// 第一行是 codex 那条。
-		await click(rows[0] as HTMLButtonElement);
+		const deleteButtons = () =>
+			[...container.querySelectorAll<HTMLButtonElement>("button")].filter(
+				(node) => node.getAttribute("aria-label") === text("platformInstanceDelete"),
+			);
+		// 三张平台卡各有一个垃圾桶，位置在开关右侧。
+		expect(deleteButtons()).toHaveLength(3);
+		await click(deleteButtons()[0] as HTMLButtonElement);
+		expect(saveCalls).toBe(0);
+		expect(container.querySelectorAll('[role="button"]').length).toBe(3);
+		expect(container.textContent).toContain(text("unsavedSave"));
+
+		await click(button("unsavedDiscard"));
+		expect(container.querySelectorAll('[role="button"]').length).toBe(4);
+		expect(saveCalls).toBe(0);
+
+		await click(deleteButtons()[0] as HTMLButtonElement);
+		await click(button("unsavedSave"));
 		expect(saveCalls).toBe(1);
 		const saved = (
 			savedPayloads.at(-1)?.agent as { platformInstances?: Array<{ platform: string }> }
 		).platformInstances;
 		expect(saved?.map((entry) => entry.platform)).toEqual(["CommandCode", "tokendance"]);
+	});
+
+	test("平台实例的开关只写草稿，保存时才提交 disabled", async () => {
+		await mount();
+		const card = [...container.querySelectorAll('[role="button"]')].find((node) =>
+			node.textContent?.includes("TokenDance"),
+		);
+		const toggle = card?.querySelector<HTMLInputElement>('input[type="checkbox"]');
+		if (!toggle) throw new Error("Missing platform switch");
+		await act(async () => {
+			toggle.dispatchEvent(new Event("click", { bubbles: true }));
+		});
+		expect(saveCalls).toBe(0);
+		expect(container.textContent).toContain(text("unsavedSave"));
+		await click(button("unsavedSave"));
+		expect(saveCalls).toBe(1);
+		const saved = (
+			savedPayloads.at(-1)?.agent as {
+				platformInstances?: Array<{ platform: string; disabled: boolean }>;
+			}
+		).platformInstances;
+		expect(saved?.find((entry) => entry.platform === "tokendance")?.disabled).toBe(true);
 	});
 });

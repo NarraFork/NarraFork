@@ -2293,8 +2293,6 @@
 	"platformInstanceWebSearch": "联网搜索",
 	"platformInstanceImageGeneration": "图片生成",
 	"platformInstanceConfigHint": "下面这份配置只属于这个平台实例，与同平台的其它实例互不共享",
-	"platformInstanceSave": "保存实例配置",
-	"platformInstanceConfigSaved": "实例配置已保存",
 	"providerStatsTotal": "供应商总数",
 	"providerStatsEnabled": "已启用",
 	"providerStatsModels": "可用模型",

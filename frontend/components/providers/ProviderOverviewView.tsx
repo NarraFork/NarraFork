@@ -12,6 +12,8 @@ export interface ProviderOverviewViewProps {
 	hiddenModels: Set<string>;
 	onToggleProviderDisabled: (prefix: string) => void;
 	onOpenProviderConfig: (prefix: string) => void;
+	/** 平台实例在卡片上直接删除（走草稿，保存后才落库）。 */
+	onDeletePlatformInstance?: (prefix: string) => void;
 	selectedProvider: string | null;
 	pendingProvider?: string;
 }
@@ -21,6 +23,7 @@ export const ProviderOverviewView = React.memo(function ProviderOverviewView({
 	hiddenModels,
 	onToggleProviderDisabled,
 	onOpenProviderConfig,
+	onDeletePlatformInstance,
 	selectedProvider,
 	pendingProvider,
 }: ProviderOverviewViewProps) {
@@ -75,6 +78,9 @@ export const ProviderOverviewView = React.memo(function ProviderOverviewView({
 					disabled={group.disabled}
 					controlsDisabled={pendingProvider === group.prefix}
 					onToggleDisabled={() => onToggleProviderDisabled(group.prefix)}
+					{...(onDeletePlatformInstance && group.isPlatform && !group.pluginId
+						? { onDelete: () => onDeletePlatformInstance(group.prefix) }
+						: {})}
 					onOpenConfig={() => onOpenProviderConfig(group.providerId ?? group.prefix)}
 					isSelected={selectedProvider === (group.providerId ?? group.prefix)}
 				/>
