@@ -167,5 +167,10 @@
 	"projectPromptDirtyHint": "创建会话时会先保存这份提示词文件。",
 	"projectPromptResize": "拖拽调整提示词输入框高度",
 	"projectPromptSaveFailed": "提示词文件保存失败",
-	"workspaceAddOutline": "添加大纲页"
+	"workspaceAddOutline": "添加大纲页",
+	"promptLibraryPick": "从提示词库插入",
+	"promptLibraryPickPlaceholder": "选择一段提示词",
+	"promptLibraryEmpty": "提示词库为空，去「套路 → 提示词库」新建",
+	"promptLibraryInsert": "插入",
+	"promptLibraryReplace": "替换全文"
 }

@@ -268,6 +268,8 @@ export type {
 	LicenseTextSource,
 	MessageLocationResult,
 	PaginatedNarrators,
+	PromptLibraryEntryData,
+	PromptLibraryInputData,
 	PublicCodexPlanTier,
 	PublicCodexQuotaOverview,
 	PublicCodexQuotaSegment,

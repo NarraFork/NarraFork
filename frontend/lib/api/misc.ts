@@ -42,6 +42,8 @@ import type {
 	LegacyRequestDumpClearResult,
 	LicenseManifestResponse,
 	OpencodeUsageCache,
+	PromptLibraryEntryData,
+	PromptLibraryInputData,
 	PublicCodexQuotaOverview,
 	RuntimeScanResult,
 	SearchRequest,
@@ -327,6 +329,37 @@ export const miscApi = {
 	deleteCustomSubagent: (name: string) =>
 		request<{ ok: boolean }>(`/custom-subagents/${encodeURIComponent(name)}`, {
 			method: "DELETE",
+		}),
+
+	// Prompt library
+	listPromptLibrary: () => request<PromptLibraryEntryData[]>("/prompt-library"),
+	getPromptLibraryEntry: (id: string) =>
+		request<PromptLibraryEntryData>(`/prompt-library/${encodeURIComponent(id)}`),
+	createPromptLibraryEntry: (data: PromptLibraryInputData) =>
+		request<PromptLibraryEntryData>("/prompt-library", {
+			method: "POST",
+			body: JSON.stringify(data),
+		}),
+	updatePromptLibraryEntry: (id: string, data: PromptLibraryInputData) =>
+		request<PromptLibraryEntryData>(`/prompt-library/${encodeURIComponent(id)}`, {
+			method: "PUT",
+			body: JSON.stringify(data),
+		}),
+	deletePromptLibraryEntry: (id: string) =>
+		request<{ ok: boolean }>(`/prompt-library/${encodeURIComponent(id)}`, {
+			method: "DELETE",
+		}),
+	/**
+	 * One-line description for a prompt body, from the summary model.
+	 *
+	 * Stateless on purpose: the caller may be describing text it has not saved yet,
+	 * which is why the body carries `content` instead of an entry id.
+	 */
+	summarizePromptLibraryContent: (content: string, options?: { signal?: AbortSignal }) =>
+		request<{ summary: string }>("/prompt-library/summarize", {
+			method: "POST",
+			body: JSON.stringify({ content }),
+			signal: options?.signal,
 		}),
 
 	// OpenAI-compatible models

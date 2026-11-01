@@ -45,6 +45,7 @@ import { useGitIdentityVisibility } from "../../hooks/useGitIdentityVisibility";
 import { useAllModels } from "../../hooks/useModels";
 import { useCreateNarrator } from "../../hooks/useNarrator";
 import { useProjectDirStatus } from "../../hooks/useProjectDirStatus";
+import { usePromptLibrary } from "../../hooks/usePromptLibrary";
 import type { OptimizeStyle } from "../../hooks/usePromptOptimize";
 import { api } from "../../lib/api";
 import { FOLLOW_DEFAULT_MODEL } from "../../lib/constants";
@@ -194,6 +195,10 @@ export function CreateNarratorModalBody({
 	// or deleted one would just fail the create.
 	const { usablePath, needsChoice } = useProjectDirStatus();
 	const defaultProjectDir = usablePath ?? "";
+	// 只在弹窗打开时拉取，避免常驻请求。这里只读：库是「插入素材」的来源，
+	// 新建/编辑都在「套路 → 提示词库」里完成。
+	const { data: promptLibrary } = usePromptLibrary(opened);
+	const [pickedPromptId, setPickedPromptId] = useState<string | null>(null);
 	const { data: favorites } = useFavoriteDirectories();
 	const addFavorite = useCreateFavoriteDirectory();
 	const removeFavorite = useDeleteFavoriteDirectory();
@@ -413,6 +418,38 @@ export function CreateNarratorModalBody({
 		setPromptDraft("");
 		setPromptBaseline("");
 	}, []);
+
+	// ── 提示词库 → 项目提示词 ───────────────────────────────────────────────────
+	// 库条目只提供文本：插进来的是内容副本，之后在 AGENTS.md 里怎么改都与库无关，
+	// 所以这里不需要记录「来自哪个条目」，也不产生引用关系。
+	const pickedPromptContent =
+		(promptLibrary ?? []).find((entry) => entry.id === pickedPromptId)?.content ?? "";
+	/**
+	 * `insert` 在光标处插入（文本框已有焦点时按用户的实际位置），`replace` 整段替换。
+	 * 两者都只是改 draft，用户仍要走原来的保存流程落盘。
+	 */
+	const applyLibraryPrompt = (mode: "insert" | "replace") => {
+		const content = pickedPromptContent;
+		if (!content) return;
+		if (mode === "replace") {
+			setPromptDraft(content);
+			return;
+		}
+		const input = promptInputRef.current;
+		const start = input?.selectionStart ?? null;
+		const end = input?.selectionEnd ?? null;
+		setPromptDraft((current) => {
+			// No measurable caret (box never focused): append rather than guess a position.
+			if (start === null || end === null) {
+				return current.trim()
+					? `${current}
+
+${content}`
+					: content;
+			}
+			return current.slice(0, start) + content + current.slice(end);
+		});
+	};
 
 	const promptDirty = promptDraft !== promptBaseline;
 	// A truncated file is a PREFIX of the real one; saving it back would delete
@@ -682,6 +719,7 @@ export function CreateNarratorModalBody({
 		setBot(false);
 		setHandle("");
 		setSessionTitle("");
+		setPickedPromptId(null);
 		setGitIdentityId(FOLLOW_DEFAULT_GIT_IDENTITY);
 		// The prompt box belongs to a directory, not to the form: clearing the identity
 		// is what lets the next open adopt the file from scratch.
@@ -943,6 +981,46 @@ export function CreateNarratorModalBody({
 					</button>
 				) : null}
 			</div>
+			{/* 从提示词库取一段现成文本：整段替换或插入到光标处。
+			    库只提供素材，不建立引用关系——写进 AGENTS.md 的就是文本本身。 */}
+			<Group gap="xs" wrap="nowrap" align="flex-end">
+				<Select
+					size="xs"
+					style={{ flex: 1, minWidth: 0 }}
+					label={t("promptLibraryPick")}
+					placeholder={
+						promptLibrary && promptLibrary.length > 0
+							? t("promptLibraryPickPlaceholder")
+							: t("promptLibraryEmpty")
+					}
+					searchable
+					clearable
+					disabled={!promptEditable || !promptLibrary || promptLibrary.length === 0}
+					data={(promptLibrary ?? []).map((entry) => ({
+						value: entry.id,
+						label: entry.name,
+					}))}
+					value={pickedPromptId}
+					onChange={setPickedPromptId}
+					comboboxProps={{ withinPortal: true, position: "bottom-start", zIndex: 320 }}
+				/>
+				<Button
+					size="compact-sm"
+					variant="light"
+					disabled={!promptEditable || !pickedPromptContent}
+					onClick={() => applyLibraryPrompt("insert")}
+				>
+					{t("promptLibraryInsert")}
+				</Button>
+				<Button
+					size="compact-sm"
+					variant="subtle"
+					disabled={!promptEditable || !pickedPromptContent}
+					onClick={() => applyLibraryPrompt("replace")}
+				>
+					{t("promptLibraryReplace")}
+				</Button>
+			</Group>
 			{promptDirty && promptEditable ? (
 				<Text size="xs" c="dimmed">
 					{t("projectPromptDirtyHint")}

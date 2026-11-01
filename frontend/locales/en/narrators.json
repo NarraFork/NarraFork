@@ -180,5 +180,10 @@
 	"projectPromptDirtyHint": "This prompt file is saved before the session is created.",
 	"projectPromptResize": "Drag to resize the project prompt box",
 	"projectPromptSaveFailed": "Could not save the prompt file",
-	"workspaceAddOutline": "Add an outline page"
+	"workspaceAddOutline": "Add an outline page",
+	"promptLibraryPick": "Insert from prompt library",
+	"promptLibraryPickPlaceholder": "Pick a prompt",
+	"promptLibraryEmpty": "Library is empty — create one under Routines → Prompt library",
+	"promptLibraryInsert": "Insert",
+	"promptLibraryReplace": "Replace all"
 }
