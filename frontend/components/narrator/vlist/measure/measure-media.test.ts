@@ -292,7 +292,7 @@ describe("measureMedia dispatcher", () => {
 
 	it("returns an empty zero-height element for unknown types", async () => {
 		const { measureMedia } = await import("./measure-media");
-		const r = measureMedia({ type: "video" }, 800);
+		const r = measureMedia({ type: "unknown_media" }, 800);
 		expect(r.height).toBe(0);
 		expect(r.blocks).toHaveLength(0);
 	});

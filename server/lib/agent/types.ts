@@ -7,6 +7,11 @@ import type {
 	ReasoningProviderMetadata,
 	ReferencePricingSnapshot,
 } from "@shared/agent-protocol/types";
+import type {
+	MediaContentBlock,
+	NativeMediaFallbackWarning,
+	NativeMediaInput,
+} from "@shared/media-attachments";
 import type { StreamingEditOrigin } from "@shared/streaming-edit-origin";
 import type { ToolProgressPayload } from "@shared/tool-progress";
 import type { z } from "zod/v4";
@@ -343,6 +348,10 @@ export interface ToolResult {
 	fatal?: boolean;
 	/** Base64-encoded images to include in the tool result (for multimodal providers). */
 	images?: Array<{ format: string; base64: string }>;
+	/** Actual bytes for the next provider request, never persisted in events. */
+	media?: NativeMediaInput[];
+	/** Durable asset references used to reconstruct native media on history replay. */
+	mediaRefs?: MediaContentBlock[];
 }
 
 export interface ToolDefinition {
@@ -430,6 +439,7 @@ export type AllowPermissionResult = Extract<PermissionResult, { behavior: "allow
 // === Agent events (yielded by the loop) ===
 
 export type AgentEvent =
+	| { type: "media_fallback"; warnings: NativeMediaFallbackWarning[] }
 	| {
 			type: "assistant_message";
 			/** False when an errored/truncated response is retained for already-started tools. */
@@ -481,6 +491,7 @@ export type AgentEvent =
 			completedAt?: number;
 			brokenInputOverride?: Record<string, unknown>;
 			updatedInput?: Record<string, unknown>;
+			mediaRefs?: MediaContentBlock[];
 			metadata?: Record<string, unknown>;
 			/** Images the tool returned; the consumer saves them and stores references. */
 			images?: Array<{ format: string; base64: string }>;
@@ -966,6 +977,7 @@ export interface AgentHistoryReplacement {
 	history: unknown[];
 	/** The rows `history` was built from; they replace the loop's transcript. */
 	rows: readonly import("./provider").DbMessage[];
+	mediaFallbackWarnings?: NativeMediaFallbackWarning[];
 	systemPrompt?: string;
 	/** Persisted input rows the rebuilt history carries. */
 	replayedInjectionMessageIds?: readonly string[];

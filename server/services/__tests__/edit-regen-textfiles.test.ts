@@ -11,10 +11,13 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { isMediaContentBlock, mediaRefToContentBlock } from "@shared/media-attachments";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
+import { wavFile } from "../../../tests/fixtures/native-media";
 import * as relations from "../../db/relations";
 import * as schema from "../../db/schema";
+import { getMediaPath, saveUploadedMedia } from "../../lib/media-uploads";
 
 // In-memory DB from real migrations (mirrors tests/setup.ts).
 const DRIZZLE_DIR = join(import.meta.dir, "..", "..", "..", "drizzle");
@@ -191,6 +194,99 @@ describe("user image metadata", () => {
 	});
 });
 
+describe("editAndRegenerate native media history", () => {
+	let cwd: string;
+	beforeEach(() => {
+		cwd = mkdtempSync(join(tmpdir(), "nf-edit-media-"));
+		setUploadsDirForTests(join(cwd, "uploads"));
+	});
+	// These attachment edits intentionally leave workspace files untouched, just
+	// like the existing text-file harness. Real restores still require a confirmed
+	// plan and authenticated requester in the product service.
+	const editOptions = {
+		userId: "attachment-user",
+		revertFiles: false,
+		deferContinuation: true,
+	} as const;
+	async function blocks(): Promise<unknown[]> {
+		const content = (
+			await db.query.narratorMessages.findFirst({ where: eq(narratorMessages.id, "m1") })
+		)?.contentJson;
+		return Array.isArray(content) ? content : [];
+	}
+	test("wording-only edits preserve native media ownership and explicit [] removes only refs", async () => {
+		const ref = await saveUploadedMedia("n1", wavFile());
+		seed(cwd, [{ ...mediaRefToContentBlock(ref) }, { type: "text", text: "before" }]);
+		expect(await editAndRegenerate("n1", "m1", "after", "en", false, editOptions)).toMatchObject({
+			ok: true,
+		});
+		expect((await blocks()).filter(isMediaContentBlock)).toEqual([mediaRefToContentBlock(ref)]);
+		expect(
+			await editAndRegenerate("n1", "m1", "without", "en", false, {
+				...editOptions,
+				keepMediaIds: [],
+			}),
+		).toMatchObject({ ok: true });
+		expect((await blocks()).filter(isMediaContentBlock)).toEqual([]);
+		expect(getMediaPath("n1", ref.mediaId)).not.toBeNull();
+	});
+	test("media-only appended edit persists canonical content without starting a model", async () => {
+		seed(cwd, [{ type: "text", text: "before" }]);
+		expect(
+			await editAndRegenerate("n1", "m1", "", "en", false, {
+				...editOptions,
+				newMedia: [wavFile()],
+			}),
+		).toMatchObject({ ok: true });
+		const media = (await blocks()).filter(isMediaContentBlock);
+		expect(media).toHaveLength(1);
+		expect(media[0]).toMatchObject({
+			type: "audio",
+			mediaType: "audio/wav",
+			uploadNarratorId: "n1",
+			size: 60,
+		});
+	});
+	test("history edits allow ten retained plus new media and reject eleven without touching shared bytes", async () => {
+		const original = await saveUploadedMedia("n1", wavFile("original.wav"));
+		seed(cwd, [{ ...mediaRefToContentBlock(original) }]);
+		await editAndRegenerate("n1", "m1", "", "en", false, {
+			...editOptions,
+			newMedia: Array.from({ length: 9 }, (_, index) => wavFile(`added-${index}.wav`)),
+		});
+		const before = await blocks();
+		expect(before.filter(isMediaContentBlock)).toHaveLength(10);
+		const saved = readdirSync(join(cwd, "uploads", "n1", "media"));
+		await expect(
+			editAndRegenerate("n1", "m1", "", "en", false, {
+				...editOptions,
+				newMedia: [wavFile("eleventh.wav")],
+			}),
+		).rejects.toThrow("Maximum 10");
+		expect(await blocks()).toEqual(before);
+		expect(readdirSync(join(cwd, "uploads", "n1", "media"))).toEqual(saved);
+		expect(getMediaPath("n1", original.mediaId)).not.toBeNull();
+	});
+	test("a later attachment write failure rolls back newly uploaded media and keeps old history", async () => {
+		seed(cwd, [{ type: "text", text: "before" }]);
+		const failing = new File(["text"], "fail.txt", { type: "text/plain" });
+		Object.defineProperty(failing, "arrayBuffer", {
+			value: async () => {
+				throw new Error("media rollback");
+			},
+		});
+		await expect(
+			editAndRegenerate("n1", "m1", "after", "en", false, {
+				...editOptions,
+				newMedia: [wavFile()],
+				newTextFiles: [failing],
+			}),
+		).rejects.toThrow("media rollback");
+		expect(readdirSync(join(cwd, "uploads", "n1", "media"))).toEqual([]);
+		expect(await blocks()).toEqual([{ type: "text", text: "before" }]);
+	});
+});
+
 describe("editAndRegenerate text_file management", () => {
 	let cwd: string;
 	beforeEach(() => {
@@ -248,7 +344,7 @@ describe("editAndRegenerate text_file management", () => {
 		const files = blocks.filter((b) => b.type === "text_file");
 		expect(files).toHaveLength(1);
 		expect(files[0].filename).toBe("fresh.md");
-		expect(String(files[0].filePath)).toContain(".narrafork/attached");
+		expect(String(files[0].filePath).replaceAll("\\", "/")).toContain(".narrafork/attached");
 		expect(readFileSync(String(files[0].filePath), "utf-8")).toBe("hello world");
 	});
 

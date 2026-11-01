@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, expect, mock, spyOn, test } from "bun:test";
 import { notifications } from "@mantine/notifications";
+import { MAX_MEDIA_ATTACHMENTS, MAX_MEDIA_FILE_SIZE } from "@shared/media-attachments";
 import { parseHTML } from "linkedom";
 import { act, createElement, type DragEvent, type SetStateAction, useRef, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { getComposerFileOrder } from "../composer/composer-file-order";
+import { getComposerFileOrder, markComposerFileOrder } from "../composer/composer-file-order";
 import * as panelTypes from "../narrator-panel-types";
 import {
 	type AttachmentInsertionBookmark,
@@ -19,6 +20,12 @@ let host: HTMLElement;
 let hook: ReturnType<typeof useComposerFileIngest>;
 let images: File[];
 let textFiles: File[];
+let mediaFiles: File[];
+let initialMedia: File[];
+let mediaEnabled: boolean;
+let acceptMedia: boolean | undefined;
+let mediaCommits: number;
+let replaceMedia: (files: File[]) => void;
 let narratorId: string;
 let captureInsertion: UseComposerFileIngestOptions["captureInsertion"];
 let onAcceptedFiles: UseComposerFileIngestOptions["onAcceptedFiles"];
@@ -33,9 +40,20 @@ let notify: ReturnType<typeof spyOn<typeof notifications, "show">>;
 const previousGlobals = new Map<string, PropertyDescriptor | undefined>();
 const png = (name = "image.png") => new File(["png"], name, { type: "image/png" });
 const text = (name = "note.txt") => new File(["text"], name, { type: "text/plain" });
+const audio = (name = "speech.wav") => new File(["original audio"], name, { type: "audio/wav" });
+const video = (name = "clip.mp4") => new File(["original video"], name, { type: "video/mp4" });
 function Harness() {
 	const [attachedImages, setImages] = useState<File[]>([]);
 	const [attachedTextFiles, setTextFiles] = useState<File[]>([]);
+	const [attachedMedia, setMedia] = useState<File[]>(initialMedia);
+	const attachedMediaRef = useRef<readonly File[]>(attachedMedia);
+	attachedMediaRef.current = attachedMedia;
+	mediaFiles = attachedMedia;
+	replaceMedia = setMedia;
+	const updateMedia = useRef((next: SetStateAction<File[]>) => {
+		mediaCommits++;
+		setMedia(next);
+	}).current;
 	const updateImages = useRef((next: SetStateAction<File[]>) => {
 		imageCommits++;
 		setImages(next);
@@ -52,9 +70,11 @@ function Harness() {
 		sendingRef,
 		captureInsertion,
 		onAcceptedFiles,
+		acceptMedia,
 		dragCounterRef,
 		updateAttachedImages: updateImages,
 		updateAttachedTextFiles: updateTextFiles,
+		...(mediaEnabled ? { updateAttachedMedia: updateMedia, attachedMediaRef } : {}),
 		setIsDragging: (value) => {
 			dragging = value;
 		},
@@ -94,6 +114,10 @@ beforeEach(async () => {
 	dragging = false;
 	imageCommits = 0;
 	textCommits = 0;
+	initialMedia = [];
+	mediaEnabled = true;
+	acceptMedia = undefined;
+	mediaCommits = 0;
 	renders = [];
 	resize = spyOn(panelTypes, "resizeImageIfNeeded").mockImplementation(async (file) => file);
 	notify = spyOn(notifications, "show").mockImplementation(() => "notification");
@@ -111,6 +135,416 @@ afterEach(async () => {
 		else Reflect.deleteProperty(globalThis, key);
 	}
 	previousGlobals.clear();
+});
+
+test("mixed media paste shares one FIFO commit without resizing or decoding native files", async () => {
+	const pending = deferred<File>();
+	const picture = png();
+	const speech = audio();
+	const clip = video();
+	const note = text();
+	resize.mockImplementation(() => pending.promise);
+	let ingestion: Promise<File[]> = Promise.resolve([]);
+	await act(async () => {
+		ingestion = hook.handleComposerPasteImages([speech, picture, note, clip]);
+	});
+	expect(mediaFiles).toEqual([]);
+	expect(textFiles).toEqual([]);
+	expect(resize).toHaveBeenCalledTimes(1);
+	await act(async () => {
+		pending.resolve(picture);
+		await ingestion;
+	});
+	expect(await ingestion).toEqual([speech, picture, note, clip]);
+	expect(mediaFiles).toEqual([speech, clip]);
+	expect(images).toEqual([picture]);
+	expect(textFiles).toEqual([note]);
+	expect(mediaCommits).toBe(1);
+	expect(await speech.text()).toBe("original audio");
+	expect(await clip.text()).toBe("original video");
+	expect([speech, picture, note, clip].map(getComposerFileOrder)).toEqual(
+		[speech, picture, note, clip].map(getComposerFileOrder).toSorted((a, b) => a - b),
+	);
+});
+
+for (const [type, name, expectedType] of [
+	["audio/x-wav", "speech.WAV", "audio/wav"],
+	["audio/wave", "speech.wav", "audio/wav"],
+	["audio/mp3", "speech.MP3", "audio/mpeg"],
+	["audio/x-m4a", "speech.M4A", "audio/mp4"],
+	["audio/x-flac", "speech.FLAC", "audio/flac"],
+	["", "speech.WAV", "audio/wav"],
+	["", "speech.MP3", "audio/mpeg"],
+	["application/octet-stream", "speech.M4A", "audio/mp4"],
+	["application/octet-stream", "speech.FLAC", "audio/flac"],
+	["", "clip.MP4", "video/mp4"],
+	["application/octet-stream", "clip.WEBM", "video/webm"],
+] as const) {
+	test(`ingests ${type || "empty MIME"} ${name} as canonical media`, async () => {
+		const bytes = new Uint8Array([0, 255, 128, 10, 13]);
+		const original = new File([bytes], name, { type, lastModified: 1_701_234_567_890 });
+		let accepted: File[] = [];
+		await act(async () => {
+			accepted = await hook.addMedia([original]);
+		});
+		expect(accepted).toHaveLength(1);
+		const normalized = accepted[0];
+		expect(normalized).not.toBe(original);
+		expect(normalized.type).toBe(expectedType);
+		expect(normalized.name).toBe(name);
+		expect(normalized.lastModified).toBe(original.lastModified);
+		expect(normalized.size).toBe(original.size);
+		expect(new Uint8Array(await normalized.arrayBuffer())).toEqual(bytes);
+		expect(original.type).toBe(type);
+		expect(mediaFiles).toHaveLength(1);
+		expect(mediaFiles[0]).toBe(normalized);
+		expect(images).toEqual([]);
+		expect(textFiles).toEqual([]);
+		expect(resize).not.toHaveBeenCalled();
+		expect(notify).not.toHaveBeenCalled();
+	});
+}
+
+test("normalization keeps mixed paste order and preassigned file order across FIFO batches", async () => {
+	const pending = deferred<File>();
+	const speech = new File(["wave bytes"], "speech.WAV", { type: "audio/x-wav" });
+	const picture = png();
+	const note = text();
+	const generic = new File(["mp3 bytes"], "speech.MP3", { type: "application/octet-stream" });
+	const standard = audio();
+	const clip = video();
+	const input = [speech, picture, note, generic, standard, clip];
+	const originalOrders = input.map(markComposerFileOrder);
+	resize.mockImplementation(() => pending.promise);
+	let first: Promise<File[]> = Promise.resolve([]);
+	let second: Promise<File[]> = Promise.resolve([]);
+	await act(async () => {
+		first = hook.handleComposerPasteImages([speech, picture, note]);
+		second = hook.ingestFiles([generic, standard, clip]);
+	});
+	expect(mediaFiles).toEqual([]);
+	await act(async () => {
+		pending.resolve(picture);
+		await Promise.all([first, second]);
+	});
+	const accepted = [...(await first), ...(await second)];
+	expect(accepted.map((file) => file.name)).toEqual(input.map((file) => file.name));
+	expect(accepted.map((file) => file.type)).toEqual([
+		"audio/wav",
+		"image/png",
+		note.type,
+		"audio/mpeg",
+		"audio/wav",
+		"video/mp4",
+	]);
+	expect(accepted[0]).not.toBe(speech);
+	expect(accepted[3]).not.toBe(generic);
+	for (const index of [1, 2, 4, 5]) expect(accepted[index]).toBe(input[index]);
+	expect(accepted.map(getComposerFileOrder)).toEqual(originalOrders);
+	expect(input.map(getComposerFileOrder)).toEqual(originalOrders);
+	expect(mediaFiles).toEqual([accepted[0], accepted[3], standard, clip]);
+	expect(images).toEqual([picture]);
+	expect(textFiles).toEqual([note]);
+	expect(mediaCommits).toBe(2);
+	expect(resize).toHaveBeenCalledTimes(1);
+	expect(notify).not.toHaveBeenCalled();
+});
+
+test("editor insertion receives normalized media and unchanged standard File identities", async () => {
+	const acceptedBatches: File[][] = [];
+	onAcceptedFiles = (files) => {
+		acceptedBatches.push(files);
+		return true;
+	};
+	await render();
+	const alias = new File(["flac bytes"], "speech.FLAC", { type: "audio/x-flac" });
+	const inferred = new File(["m4a bytes"], "speech.M4A");
+	const standard = audio();
+	const note = text();
+	let accepted: File[] = [];
+	await act(async () => {
+		accepted = await hook.ingestFiles([alias, note, inferred, standard]);
+	});
+	expect(acceptedBatches).toHaveLength(1);
+	expect(acceptedBatches[0]).toEqual(accepted);
+	expect(accepted.map((file) => file.type)).toEqual([
+		"audio/flac",
+		note.type,
+		"audio/mp4",
+		"audio/wav",
+	]);
+	expect(accepted[0]).not.toBe(alias);
+	expect(accepted[1]).toBe(note);
+	expect(accepted[2]).not.toBe(inferred);
+	expect(accepted[3]).toBe(standard);
+	expect(mediaFiles).toEqual([]);
+	expect(textFiles).toEqual([]);
+	expect(mediaCommits).toBe(0);
+	expect(notify).not.toHaveBeenCalled();
+});
+
+for (const mode of ["missing receiver", "explicitly disabled"] as const) {
+	test(`normalization does not enable media for ${mode}`, async () => {
+		if (mode === "missing receiver") mediaEnabled = false;
+		else acceptMedia = false;
+		const acceptedBatches: File[][] = [];
+		onAcceptedFiles = (files) => {
+			acceptedBatches.push(files);
+			return true;
+		};
+		await render();
+		const note = text();
+		await act(async () => {
+			expect(
+				await hook.ingestFiles([
+					new File(["wave"], "speech.WAV", { type: "audio/x-wav" }),
+					new File(["mp3"], "speech.MP3"),
+					new File(["m4a"], "speech.M4A", { type: "application/octet-stream" }),
+					note,
+				]),
+			).toEqual([note]);
+		});
+		expect(acceptedBatches).toEqual([[note]]);
+		expect(mediaFiles).toEqual([]);
+		expect(mediaCommits).toBe(0);
+		expect(notify).toHaveBeenCalledWith(
+			expect.objectContaining({
+				title: "unsupportedFileType",
+				message: "speech.WAV, speech.MP3, speech.M4A",
+			}),
+		);
+	});
+}
+
+test("image MIME takes precedence over a media-looking filename", async () => {
+	const picture = png("screenshot.mp4");
+	resize.mockImplementation(async (file) => file);
+	await act(async () => {
+		expect(await hook.ingestFiles([picture])).toEqual([picture]);
+	});
+	expect(images).toEqual([picture]);
+	expect(mediaFiles).toEqual([]);
+	expect(resize).toHaveBeenCalled();
+});
+
+test("known media extensions never override explicit unsupported or text MIME", async () => {
+	const rejected = [
+		new File(["unknown audio"], "speech.WAV", { type: "audio/x-unsupported" }),
+		new File(["unknown video"], "clip.MP4", { type: "video/x-unsupported" }),
+	];
+	const disguised = new File(["plain text"], "disguised.MP3", { type: "text/plain" });
+	const originalTextType = disguised.type;
+	const note = text();
+	let accepted: File[] = [];
+	await act(async () => {
+		accepted = await hook.ingestFiles([...rejected, disguised, note]);
+	});
+	expect(accepted).toEqual([disguised, note]);
+	expect(accepted[0]).toBe(disguised);
+	expect(disguised.type).toBe(originalTextType);
+	expect(rejected.map((file) => file.type)).toEqual(["audio/x-unsupported", "video/x-unsupported"]);
+	expect(mediaFiles).toEqual([]);
+	expect(textFiles).toEqual([disguised, note]);
+	expect(images).toEqual([]);
+	expect(notify).toHaveBeenCalledWith(
+		expect.objectContaining({
+			title: "unsupportedFileType",
+			message: "speech.WAV, clip.MP4",
+		}),
+	);
+	await act(async () => {
+		expect(await hook.addMedia([disguised])).toEqual([]);
+	});
+	expect(mediaFiles).toEqual([]);
+	expect(notify).toHaveBeenCalledWith(
+		expect.objectContaining({ title: "unsupportedFileType", message: "disguised.MP3" }),
+	);
+});
+
+test("media rejects empty, oversize and unsupported MIME before any category commit", async () => {
+	const empty = new File([], "empty.wav", { type: "audio/wav" });
+	const oversize = audio("large.wav");
+	Object.defineProperty(oversize, "size", { value: MAX_MEDIA_FILE_SIZE + 1 });
+	const maximum = audio("maximum.wav");
+	Object.defineProperty(maximum, "size", { value: MAX_MEDIA_FILE_SIZE });
+	const disguised = new File(["audio"], "not-text.txt", { type: "audio/x-unsupported" });
+	let result: File[] = [];
+	await act(async () => {
+		result = await hook.ingestFiles([empty, oversize, disguised, maximum]);
+	});
+	expect(result).toEqual([maximum]);
+	expect(mediaFiles).toEqual([maximum]);
+	expect(textFiles).toEqual([]);
+	expect(images).toEqual([]);
+	expect(resize).not.toHaveBeenCalled();
+	expect(notify.mock.calls.map(([notice]) => notice.title)).toEqual([
+		"mediaFileTooLarge",
+		"mediaFileTooLarge",
+		"unsupportedFileType",
+	]);
+});
+
+test("ten-media limit includes successive synchronous batches and later removal", async () => {
+	const first = Array.from({ length: 9 }, (_, index) => audio(`first-${index}.wav`));
+	const second = [video("last.mp4"), audio("excess.wav")];
+	let accepted: File[] = [];
+	await act(async () => {
+		const one = hook.addMedia(first);
+		const two = hook.addMedia(second);
+		accepted = (await Promise.all([one, two])).flat();
+	});
+	expect(accepted).toEqual([...first, second[0]]);
+	expect(mediaFiles).toHaveLength(MAX_MEDIA_ATTACHMENTS);
+	expect(notify).toHaveBeenCalledWith(
+		expect.objectContaining({ title: "mediaTooMany", message: "excess.wav" }),
+	);
+	await act(async () => replaceMedia(mediaFiles.slice(0, 8)));
+	await act(async () => {
+		await hook.addMedia([audio("replacement.wav")]);
+	});
+	expect(mediaFiles).toHaveLength(9);
+});
+
+test("FIFO checks existing media count at commit and preserves nonmedia in a capped batch", async () => {
+	await act(async () =>
+		replaceMedia(Array.from({ length: 9 }, (_, index) => audio(`existing-${index}.wav`))),
+	);
+	const pending = deferred<File>();
+	const picture = png();
+	const one = audio("one.wav");
+	const two = video("two.mp4");
+	const note = text();
+	resize.mockImplementation(() => pending.promise);
+	let first: Promise<File[]> = Promise.resolve([]);
+	let second: Promise<File[]> = Promise.resolve([]);
+	await act(async () => {
+		first = hook.ingestFiles([picture, one]);
+		second = hook.ingestFiles([two, note]);
+	});
+	await act(async () => {
+		pending.resolve(picture);
+		await Promise.all([first, second]);
+	});
+	expect(await first).toEqual([picture, one]);
+	expect(await second).toEqual([note]);
+	expect(mediaFiles).toHaveLength(10);
+	expect(textFiles).toEqual([note]);
+});
+
+test("media uses the captured editor bookmark and rejected insertion does not consume capacity", async () => {
+	let allow = false;
+	const book = { restore: mock(() => true), cancel: mock(() => {}) };
+	captureInsertion = () => book;
+	const acceptedBatches: File[][] = [];
+	onAcceptedFiles = (files, bookmark) => {
+		expect(bookmark).toBe(book);
+		if (!allow) return false;
+		acceptedBatches.push(files);
+		return true;
+	};
+	await render();
+	await act(async () => {
+		expect(await hook.addMedia(Array.from({ length: 10 }, () => audio()))).toEqual([]);
+	});
+	allow = true;
+	const speech = audio();
+	const note = text();
+	await act(async () => {
+		expect(await hook.ingestFiles([speech, note])).toEqual([speech, note]);
+	});
+	expect(acceptedBatches).toEqual([[speech, note]]);
+	expect(mediaFiles).toEqual([]);
+	expect(textFiles).toEqual([]);
+	expect(mediaCommits).toBe(0);
+	expect(book.cancel).toHaveBeenCalledTimes(2);
+});
+
+test("legacy callers without a media receiver keep text behavior and never pretend media was accepted", async () => {
+	mediaEnabled = false;
+	await render();
+	const note = text();
+	await act(async () => {
+		expect(await hook.ingestFiles([audio(), note])).toEqual([note]);
+	});
+	expect(textFiles).toEqual([note]);
+	expect(mediaFiles).toEqual([]);
+	expect(notify).toHaveBeenCalledWith(expect.objectContaining({ title: "unsupportedFileType" }));
+});
+
+test("an editor callback alone never opts legacy chat entries into native media", async () => {
+	mediaEnabled = false;
+	const accepted: File[][] = [];
+	onAcceptedFiles = (files) => {
+		accepted.push(files);
+		return true;
+	};
+	await render();
+	const note = text();
+	await act(async () => {
+		expect(await hook.ingestFiles([audio(), video(), note])).toEqual([note]);
+	});
+	expect(accepted).toEqual([[note]]);
+	expect(notify).toHaveBeenCalledWith(expect.objectContaining({ title: "unsupportedFileType" }));
+});
+
+test("an explicitly disabled media entry stays closed even when a media setter exists", async () => {
+	acceptMedia = false;
+	onAcceptedFiles = mock(() => true);
+	await render();
+	await act(async () => {
+		expect(await hook.addMedia([audio()])).toEqual([]);
+	});
+	expect(onAcceptedFiles).not.toHaveBeenCalled();
+	expect(mediaFiles).toEqual([]);
+});
+
+for (const invalidate of ["scope", "send", "unmount"] as const) {
+	test(`media waiting behind image preprocessing respects ${invalidate} invalidation`, async () => {
+		const pending = deferred<File>();
+		const picture = png();
+		resize.mockImplementation(() => pending.promise);
+		let batch: Promise<File[]> = Promise.resolve([]);
+		await act(async () => {
+			batch = hook.ingestFiles([picture, audio()]);
+		});
+		if (invalidate === "scope") narratorId = "new-media-owner";
+		if (invalidate === "send") sendingRef.current = true;
+		if (invalidate === "unmount") await act(async () => root.unmount());
+		else await render();
+		await act(async () => {
+			pending.resolve(picture);
+			await batch;
+		});
+		expect(await batch).toEqual([]);
+		expect(mediaFiles).toEqual([]);
+		expect(images).toEqual([]);
+	});
+}
+
+test("picker and drop route native media through the same validation and reset their input state", async () => {
+	const speech = audio();
+	const clip = video();
+	const target = { files: [speech], value: "fake picker path" };
+	await act(async () => {
+		hook.handleFileInputChange({ target } as unknown as Parameters<
+			typeof hook.handleFileInputChange
+		>[0]);
+	});
+	expect(target.value).toBe("");
+	expect(mediaFiles).toEqual([speech]);
+	const drop = {
+		defaultPrevented: false,
+		preventDefault: mock(() => {}),
+		stopPropagation: mock(() => {}),
+		dataTransfer: { types: ["Files"], files: [clip] },
+	} as unknown as DragEvent;
+	dragCounterRef.current = 2;
+	dragging = true;
+	await act(async () => hook.dropZoneProps.onDrop(drop));
+	expect(mediaFiles).toEqual([speech, clip]);
+	expect(dragCounterRef.current).toBe(0);
+	expect(dragging).toBe(false);
+	expect(resize).not.toHaveBeenCalled();
 });
 
 test("mixed paste waits for resizing, commits both arrays together and retains original selection order", async () => {

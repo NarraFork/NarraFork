@@ -1,0 +1,1 @@
+ALTER TABLE "narrator_buffered_messages" ADD COLUMN "media_json" text;

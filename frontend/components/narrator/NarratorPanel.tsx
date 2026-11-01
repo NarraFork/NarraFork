@@ -802,6 +802,8 @@ function NarratorPanelBody({
 			opts?: {
 				keepImageIds: string[];
 				newImages: File[];
+				keepMediaIds?: string[];
+				newMedia?: File[];
 				keepTextFilePaths: string[];
 				newTextFiles: File[];
 				fileReferences?: FileReference[];
@@ -963,6 +965,9 @@ function NarratorPanelBody({
 	const {
 		attachedImages,
 		attachedTextFiles,
+		attachedMedia,
+		attachedMediaRef,
+		updateAttachedMedia,
 		isDragging,
 		setIsDragging,
 		dragCounterRef,
@@ -985,6 +990,8 @@ function NarratorPanelBody({
 			sendingRef,
 			updateAttachedImages,
 			updateAttachedTextFiles,
+			updateAttachedMedia,
+			attachedMediaRef,
 			setIsDragging,
 			dragCounterRef,
 			captureInsertion: (origin) => composerRef.current?.captureAttachmentInsertion(origin),
@@ -1793,7 +1800,8 @@ function NarratorPanelBody({
 	// What the composer currently holds, split by ownership: the text flag comes
 	// from NarratorComposer (updates only on empty↔non-empty flips), attachments
 	// are panel state. An image-only draft behaves like a typed one everywhere below.
-	const composerHasAttachments = attachedImages.length + attachedTextFiles.length > 0;
+	const composerHasAttachments =
+		attachedImages.length + attachedTextFiles.length + attachedMedia.length > 0;
 	const composerSendable = composerHasText || composerHasAttachments;
 
 	// Index-based keyboard navigation for permission buttons. Kept lifted here:
@@ -2642,6 +2650,7 @@ function NarratorPanelBody({
 		attachmentsRestoreFailed,
 		attachedImages,
 		attachedTextFiles,
+		attachedMedia,
 		clearAttachedFilesAndDraft,
 		sendingRef,
 		setQueuedMessages,
@@ -3559,6 +3568,8 @@ function NarratorPanelBody({
 						common={{ narratorId, narrator, isWorkspacePreview, isMobileViewport }}
 						attachedImages={attachedImages}
 						attachedTextFiles={attachedTextFiles}
+						attachedMedia={attachedMedia}
+						updateAttachedMedia={updateAttachedMedia}
 						attachmentsHydrating={attachmentsHydrating}
 						attachmentsRestoreFailed={attachmentsRestoreFailed}
 						onRetryAttachments={retryAttachmentRestore}

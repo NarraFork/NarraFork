@@ -2,12 +2,17 @@ import { afterAll, afterEach, beforeEach, expect, mock, spyOn, test } from "bun:
 import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { type MediaRef, mediaRefToContentBlock } from "@shared/media-attachments";
 import { eq } from "drizzle-orm";
 import { z } from "zod/v4";
 import { historyStrings } from "../../../tests/fixtures/model-input";
+import { wavBytes } from "../../../tests/fixtures/native-media";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import { narratorMessageRefs, narrators, narratorToolCalls } from "../../db/schema";
+import { OpenAIProvider } from "../../lib/agent/openai-provider";
 import { buildLegacyAttachedFilesHint } from "../../lib/attached-files";
+import { saveUploadedMedia } from "../../lib/media-uploads";
+import { setOutboundFetchOverrideForTest } from "../../lib/net/outbound-fetch";
 import { settings } from "../../lib/settings";
 import { setUploadsDirForTests } from "../../lib/uploads";
 import type { RuntimeHistoryMessage } from "../agent-runtime/history";
@@ -101,6 +106,243 @@ function message(
 		parentToolUseId,
 		messageUuid: null,
 	};
+}
+
+for (const scenario of [
+	"accepted",
+	"sys-tail",
+	"unpersisted-text",
+	"other-owner",
+	"other-id",
+	"older-row",
+] as const) {
+	test(`native media current lane deduplicates only accepted owner+id: ${scenario}`, async () => {
+		const directory = mkdtempSync(join(tmpdir(), "nf-runtime-media-lanes-"));
+		setUploadsDirForTests(directory);
+		try {
+			const bytes = wavBytes();
+			const ref = await saveUploadedMedia(
+				"primary",
+				new File([new Uint8Array(bytes)], "voice.wav", { type: "audio/wav" }),
+			);
+			const source = message("media-row", "user", "accepted media");
+			source.contentJson = [mediaRefToContentBlock(ref), { type: "text", text: "accepted media" }];
+			const rows =
+				scenario === "older-row"
+					? [
+							source,
+							message("reply", "assistant", "done"),
+							message("new-row", "user", "next input"),
+						]
+					: scenario === "sys-tail"
+						? [source, message("hint", "sys", "notice")]
+						: [source];
+			const currentRef: MediaRef =
+				scenario === "other-owner"
+					? { ...ref, uploadNarratorId: "child" }
+					: scenario === "other-id"
+						? { ...ref, mediaId: `${ref.mediaId}-new` }
+						: ref;
+			const before = JSON.stringify(rows);
+			const built = await buildRuntimeHistory({
+				narratorId: "primary",
+				model: "gemini-2.5-pro",
+				provider: "question-gemini",
+				sourceMessages: rows,
+				currentInput:
+					scenario === "unpersisted-text"
+						? "separate control input"
+						: scenario === "older-row"
+							? "next input"
+							: scenario === "sys-tail"
+								? ""
+								: "accepted media",
+				currentMedia: [currentRef],
+			});
+			expect(built.currentMedia).toEqual(
+				["other-owner", "other-id", "older-row"].includes(scenario) ? [currentRef] : undefined,
+			);
+			expect(JSON.stringify(rows)).toBe(before);
+			expect(JSON.stringify(built.modelMessages)).toContain(ref.mediaId);
+			expect(JSON.stringify(built.history).split(bytes.toString("base64"))).toHaveLength(2);
+		} finally {
+			setUploadsDirForTests(null);
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
+}
+
+for (const scenario of [
+	"uncompressed",
+	"post-compact-current-row",
+	"post-compact-assistant-tool-tail",
+	"persisted-current-without-currentMedia",
+] as const) {
+	test(`Qwen MP3 runtime history reaches the final completions wire: ${scenario}`, async () => {
+		const directory = mkdtempSync(join(tmpdir(), "nf-runtime-qwen-mp3-"));
+		setUploadsDirForTests(directory);
+		try {
+			// Two complete silent MPEG-1 Layer III frames (128 kbps, 44.1 kHz, mono).
+			// This is a small synthetic upload, not the user's original 50-second recording.
+			const frame = Buffer.alloc(417);
+			frame.set([0xff, 0xfb, 0x90, 0xc4]);
+			const bytes = Buffer.concat([frame, frame]);
+			const ref = await saveUploadedMedia(
+				"primary",
+				new File([new Uint8Array(bytes)], "sampleone.mp3", { type: "audio/mpeg" }),
+			);
+			const prompt = "听这首歌，然后解析一下结构";
+			const saved = await narratorPersistence.persistUserMessage("primary", prompt, [
+				{ type: "text", text: prompt },
+				mediaRefToContentBlock(ref),
+			]);
+			const current: RuntimeHistoryMessage = { ...saved, role: "user" };
+			const oldVideoPath = String.raw`F:\F03\MyDownloads\ChatGPT Image\20260730\vids\12.mp4`;
+			const priorVideo = message("old-video", "user", `解析这个视频：${oldVideoPath}`);
+			const priorReply = message("old-video-reply", "assistant", "上一次的视频已分析完成。");
+			const assistant = message("audio-analysis", "assistant", "检查当前音频。");
+			assistant.contentJson = [
+				{ type: "text", text: "检查当前音频。" },
+				{ type: "tool_use", id: "audio-probe", name: "Read", input: { file_path: "fixture" } },
+			];
+			assistant.toolCalls = [
+				{
+					toolUseId: "audio-probe",
+					toolName: "Read",
+					inputJson: { file_path: "fixture" },
+					outputJson: "Current audio probe completed.",
+					status: "success",
+				},
+			];
+			// sourceMessages models the rows visible AFTER compaction. This deliberately
+			// tests history reconstruction, not the real compaction scheduler.
+			const rows =
+				scenario === "uncompressed"
+					? [priorVideo, priorReply, current]
+					: scenario === "post-compact-assistant-tool-tail"
+						? [current, assistant]
+						: [current];
+			const before = JSON.stringify(rows);
+			const model = "qwen3.8-omni-flash";
+			const prepared = await buildRuntimeHistory({
+				narratorId: "primary",
+				ownTurnPlacement: null,
+				model,
+				provider: "question-completions",
+				sourceMessages: rows,
+				currentInput: scenario === "post-compact-assistant-tool-tail" ? "" : prompt,
+				currentMedia:
+					scenario === "post-compact-assistant-tool-tail" ||
+					scenario === "persisted-current-without-currentMedia"
+						? undefined
+						: [ref],
+			});
+			expect(prepared.currentMedia).toBeUndefined();
+			expect(prepared.currentText).toBe("");
+			expect(JSON.stringify(rows)).toBe(before);
+			expect(JSON.stringify(prepared.modelMessages)).toContain(ref.mediaId);
+			const requests: Array<{ url: string; body: string }> = [];
+			setOutboundFetchOverrideForTest(async (input, init) => {
+				expect(typeof init?.body).toBe("string");
+				requests.push({ url: String(input), body: String(init?.body) });
+				return new Response(
+					'data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}\n\ndata: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\ndata: [DONE]\n\n',
+					{ headers: { "content-type": "text/event-stream" } },
+				);
+			});
+			const provider = new OpenAIProvider({
+				id: "qwen-mp3-wire",
+				name: "Offline Qwen MP3 wire",
+				prefix: "question-completions",
+				apiKey: "isolated-test-no-network",
+				baseUrl: "https://example.invalid/v1",
+				defaultModel: model,
+				apiMode: "completions",
+			});
+			const systemText = scenario.startsWith("post-compact")
+				? `上下文已压缩。先前分析的视频：${oldVideoPath}`
+				: "Analyze the current user attachment, keeping earlier history separate.";
+			const events = [];
+			for await (const event of provider.chat({
+				conversationId: "primary",
+				content: prepared.currentText,
+				model,
+				cwd: directory,
+				history: [{ role: "system", content: systemText }, ...prepared.history],
+				tools: [],
+				toolResults: [],
+				signal: new AbortController().signal,
+			})) {
+				events.push(event);
+			}
+			expect(events.some((event) => event.text === "ok")).toBe(true);
+			expect(requests).toHaveLength(1);
+			expect(requests[0].url).toBe("https://example.invalid/v1/chat/completions");
+			const wire = JSON.parse(requests[0].body) as {
+				model: string;
+				messages: Array<{
+					role: string;
+					content: string | Array<{ type: string; text?: string; input_audio?: unknown }>;
+				}>;
+			};
+			expect(wire.model).toBe(model);
+			const audioMessages = wire.messages.filter(
+				(row) =>
+					Array.isArray(row.content) && row.content.some((part) => part.type === "input_audio"),
+			);
+			expect(audioMessages).toHaveLength(1);
+			const audioMessage = audioMessages[0];
+			expect(audioMessage.role).toBe("user");
+			if (!Array.isArray(audioMessage.content)) throw new Error("Missing native audio parts");
+			expect(audioMessage.content.filter((part) => part.type === "input_audio")).toEqual([
+				{
+					type: "input_audio",
+					input_audio: { data: `data:;base64,${bytes.toString("base64")}`, format: "mp3" },
+				},
+			]);
+			expect(
+				audioMessage.content.every((part) => ["text", "input_audio"].includes(part.type)),
+			).toBe(true);
+			const currentText = audioMessage.content
+				.filter((part) => part.type === "text")
+				.map((part) => part.text)
+				.join("\n");
+			expect(currentText).toContain(prompt);
+			expect(currentText).toContain(ref.filename);
+			expect(currentText).not.toContain(oldVideoPath);
+			const audioIndex = audioMessage.content.findIndex((part) => part.type === "input_audio");
+			const identity = audioMessage.content[audioIndex - 1];
+			expect(identity).toEqual({
+				type: "text",
+				text:
+					`Native media attachment metadata: ${JSON.stringify({ filename: ref.filename, type: "audio", mediaType: "audio/mpeg" })}\n` +
+					"The following audio content is included directly in this message. The filename is an attachment label, not a device file path. Use this attachment for this message; do not substitute a file path from earlier conversation history.",
+			});
+			expect(requests[0].body.split(bytes.toString("base64"))).toHaveLength(2);
+			expect(requests[0].body).not.toContain('"type":"file"');
+			expect(requests[0].body).not.toContain('"type":"video_url"');
+			const pathMessages = wire.messages.filter((row) =>
+				historyStrings(row.content).includes(oldVideoPath),
+			);
+			expect(pathMessages).toHaveLength(
+				scenario === "persisted-current-without-currentMedia" ? 0 : 1,
+			);
+			if (pathMessages.length) {
+				expect(pathMessages[0].role).toBe(scenario === "uncompressed" ? "user" : "system");
+				expect(pathMessages[0]).not.toBe(audioMessage);
+			}
+			if (scenario === "post-compact-assistant-tool-tail") {
+				expect(wire.messages.some((row) => row.role === "assistant")).toBe(true);
+				expect(wire.messages.some((row) => row.role === "tool")).toBe(true);
+			}
+			// A visible label must travel with the current bytes, not just with a UI resource.
+			expect(historyStrings(wire.messages)).toContain(ref.filename);
+		} finally {
+			setOutboundFetchOverrideForTest(null);
+			setUploadsDirForTests(null);
+			rmSync(directory, { recursive: true, force: true });
+		}
+	});
 }
 
 const HUMAN_QUESTION_CANARY = "human-answer-only-7c970c41";

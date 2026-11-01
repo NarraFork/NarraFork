@@ -1,5 +1,9 @@
 import type { JsonValue, ProviderStreamEvent } from "@server/lib/plugins/protocol";
-import { isHostTruncatedDump, PLUGIN_REQUEST_DUMP_MAX_BYTES } from "@server/lib/plugins/protocol";
+import {
+	isHostTruncatedDump,
+	PLUGIN_REQUEST_DUMP_MAX_BYTES,
+	providerNativeMediaSchema,
+} from "@server/lib/plugins/protocol";
 import type {
 	ModelCatalog,
 	PluginProviderRpcClient,
@@ -12,8 +16,11 @@ import type {
 	ProviderOperation,
 	ProviderToolDefinition,
 } from "@server/services/plugin-provider-rpc";
+import { ProviderRpcError } from "@server/services/plugin-provider-rpc";
+import type { NativeMediaInput } from "@shared/media-attachments";
 import { parseModelId } from "@shared/model-id";
 import { hasCredentialBoundReasoning } from "@shared/reasoning-credentials";
+import { redactNativeMediaForDump, visitNativeMedia } from "./native-media";
 import { type NeutralTurn, projectHistory, type ResolvedImage } from "./projection";
 import type {
 	BuiltHistory,
@@ -25,6 +32,7 @@ import type {
 	ProviderAdapter,
 } from "./provider";
 import {
+	BoundedUtf8Capture,
 	collectSecretConfigValues,
 	maskSecretValues,
 	type RecordingAttemptRequest,
@@ -107,6 +115,7 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 	private readonly resolveConfig?: () => Promise<Record<string, JsonValue>>;
 	readonly modelCatalog: ReadonlyMap<string, ProviderModelDescriptor>;
 	private activeReasoningSource: string;
+	private readonly mediaCapabilities: { inputAudio: boolean; inputVideo: boolean };
 
 	constructor(options: RemoteProviderAdapterOptions) {
 		const rpc = options.rpc ?? options.client;
@@ -120,6 +129,10 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 		this.modelCatalog = normalizeModelCatalog(options.modelCatalog);
 		this.activeReasoningSource = this.defaultReasoningSource();
 		this.mayLeakXmlToolCalls = options.descriptor?.capabilities.mayLeakXmlToolCalls ?? false;
+		this.mediaCapabilities = {
+			inputAudio: options.descriptor?.capabilities.inputAudio === true,
+			inputVideo: options.descriptor?.capabilities.inputVideo === true,
+		};
 	}
 
 	formatTools(tools: ResolvedToolDefinition[]): unknown[] {
@@ -171,6 +184,7 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 						(part): ProviderContentBlock =>
 							part.type === "text" ? { type: "text", text: part.text } : image(part.image),
 					);
+					content.push(...(item.media ?? []).map(canonicalNativeMedia));
 					if (content.length) history.push({ role: "user", content });
 				}
 				continue;
@@ -182,7 +196,11 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 						type: "tool_result",
 						toolUseId: result.wireId,
 						name: result.name,
-						content: [{ type: "text", text: result.text }, ...result.images.map(image)],
+						content: [
+							{ type: "text", text: result.text },
+							...result.images.map(image),
+							...(result.media ?? []).map(canonicalNativeMedia),
+						],
 						isError: result.isError,
 					})),
 				});
@@ -418,7 +436,27 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 
 		const maxBytes = chatParams.requestDump?.maxBytes ?? PLUGIN_REQUEST_DUMP_MAX_BYTES;
 		const secrets = collectSecretConfigValues(chatParams.config);
-		const mask = (text: string): string => maskSecretValues(text, secrets);
+		let hasNativeInput = false;
+		const nativePayloads = new Set<string>();
+		visitNativeMedia(
+			[
+				chatParams.request.current.media,
+				chatParams.request.history,
+				chatParams.request.current.toolResults,
+			],
+			(item) => {
+				hasNativeInput = true;
+				const data = item.dataBase64 ?? item.base64;
+				// A complete larger payload cannot fit this bounded diagnostic capture.
+				if (typeof data === "string" && data.length > 0 && data.length <= maxBytes)
+					nativePayloads.add(data);
+			},
+		);
+		const mask = (text: string): string => {
+			let masked = maskSecretValues(text, secrets);
+			for (const data of nativePayloads) masked = masked.replaceAll(data, "[native media omitted]");
+			return masked;
+		};
 		const maskHeaders = (
 			headers: Record<string, string> | undefined,
 		): Record<string, string> | undefined => {
@@ -447,7 +485,34 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 		);
 		let requestTail = "";
 		let responseTail = "";
+		const nativeCaptures = {
+			request: new BoundedUtf8Capture(maxBytes),
+			response: new BoundedUtf8Capture(maxBytes),
+		};
 		const emitBody = (direction: "request" | "response", chunk: string, final = false): void => {
+			if (hasNativeInput) {
+				const capture = nativeCaptures[direction];
+				capture.append(chunk);
+				if (!final) return;
+				const raw = capture.text();
+				if (!raw) return;
+				let text = `[native media ${direction} body omitted]`;
+				if (capture.received === capture.kept) {
+					try {
+						text = mask(JSON.stringify(redactNativeMediaForDump(JSON.parse(raw))));
+					} catch {
+						/* Partial native bytes must never enter diagnostics. */
+					}
+				}
+				collector.frame({
+					direction,
+					type: "plugin.reported_body",
+					text,
+					metadata: { source: "plugin-reported", boundary: "sanitized-native-media" },
+				});
+				nativeCaptures[direction] = new BoundedUtf8Capture(maxBytes);
+				return;
+			}
 			const pending = mask((direction === "request" ? requestTail : responseTail) + chunk);
 			let cut = final ? pending.length : Math.max(0, pending.length - secretTail);
 			if (!final && cut > 0 && /[\uD800-\uDBFF]/.test(pending[cut - 1])) cut--;
@@ -553,11 +618,53 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 		return tap;
 	}
 
+	supportsNativeMediaInput(
+		media: Pick<NativeMediaInput, "type" | "mediaType" | "filename">,
+		model: string,
+	): boolean {
+		const capability = media.type === "audio" ? "inputAudio" : "inputVideo";
+		return (
+			this.mediaCapabilities[capability] &&
+			this.modelCatalog.get(modelIdFor(model, this.providerPrefix))?.capabilities[capability] ===
+				true
+		);
+	}
+
+	private assertNativeMedia(type: "audio" | "video", model?: string): void {
+		const capability = type === "audio" ? "inputAudio" : "inputVideo";
+		if (!this.mediaCapabilities[capability]) {
+			throw new ProviderRpcError(
+				"UNSUPPORTED_MEDIA",
+				`Plugin provider ${this.providerTypeId} did not explicitly negotiate ${capability}; native ${type} cannot be sent.`,
+			);
+		}
+		if (
+			model &&
+			this.modelCatalog.get(modelIdFor(model, this.providerPrefix))?.capabilities[capability] !==
+				true
+		) {
+			throw new ProviderRpcError(
+				"UNSUPPORTED_MEDIA",
+				`Plugin model ${model} did not explicitly declare ${capability}; native ${type} cannot be sent.`,
+			);
+		}
+	}
+
+	private assertMediaBlocks(blocks: ProviderContentBlock[], model: string): void {
+		for (const block of blocks) {
+			if (block.type === "audio" || block.type === "video")
+				this.assertNativeMedia(block.type, model);
+			if (block.type === "tool_result" && Array.isArray(block.content))
+				this.assertMediaBlocks(block.content as ProviderContentBlock[], model);
+		}
+	}
+
 	private async buildChatParams(params: ChatParams): Promise<ProviderChatParams> {
 		const history = canonicalHistory(params.history, this.activeReasoningSource);
-		const toolResults = params.toolResults
+		const toolResults = (params.toolResults ?? [])
 			.map(canonicalizeToolResult)
 			.filter(isProviderContentBlock);
+		let currentMedia = (params.media ?? []).map(canonicalNativeMedia);
 		let currentText = params.content;
 		let currentImages = (params.images ?? []).map((image) => ({
 			mediaType: mediaTypeFor(image.format),
@@ -565,7 +672,7 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 		}));
 		// The projected history already ends with the current turn. Plugins expect it in
 		// `current`, so the trailing user or tool message moves there.
-		if (!currentText && !currentImages.length && !toolResults.length) {
+		if (!currentText && !currentImages.length && !currentMedia.length && !toolResults.length) {
 			const last = history.at(-1);
 			if (last?.role === "tool") {
 				history.pop();
@@ -577,6 +684,9 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 						block.type === "text" && typeof block.text === "string" ? [block.text] : [],
 					)
 					.join("");
+				currentMedia = last.content
+					.filter((block) => block.type === "audio" || block.type === "video")
+					.map(canonicalNativeMedia);
 				currentImages = last.content.flatMap((block) =>
 					block.type === "image" &&
 					typeof block.mediaType === "string" &&
@@ -586,6 +696,9 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 				);
 			}
 		}
+		for (const media of currentMedia) this.assertNativeMedia(media.type, params.model);
+		for (const message of history) this.assertMediaBlocks(message.content, params.model);
+		this.assertMediaBlocks(toolResults, params.model);
 		return {
 			...(await this.baseParams(params.model)),
 			conversation: {
@@ -609,6 +722,7 @@ export class RemoteProviderAdapter implements ProviderAdapter {
 				current: {
 					text: currentText,
 					...(currentImages.length ? { images: currentImages } : {}),
+					...(currentMedia.length ? { media: currentMedia } : {}),
 					toolResults,
 				},
 				tools: canonicalTools(params.tools),
@@ -1086,6 +1200,21 @@ function canonicalToolResultContent(value: unknown): ProviderContentBlock[] {
 		for (const entry of value) {
 			if (!entry || typeof entry !== "object") continue;
 			const record = entry as Record<string, unknown>;
+			if (record.type === "audio" || record.type === "video") {
+				result.push(canonicalNativeMedia(record));
+				continue;
+			}
+			if (
+				record.type === "input_audio" ||
+				record.type === "input_video" ||
+				record.type === "audio_url" ||
+				record.type === "video_url"
+			) {
+				throw new ProviderRpcError(
+					"INVALID_REQUEST",
+					`Unsupported tool media representation ${record.type}`,
+				);
+			}
 			if (record.type === "text" && typeof record.text === "string") {
 				result.push({ type: "text", text: record.text });
 				continue;
@@ -1101,6 +1230,24 @@ function canonicalToolResultContent(value: unknown): ProviderContentBlock[] {
 	return [{ type: "text", text: typeof value === "string" ? value : outputText(value) }];
 }
 
+function canonicalNativeMedia(value: unknown) {
+	if (!value || typeof value !== "object")
+		throw new ProviderRpcError("INVALID_REQUEST", "Invalid native media block");
+	const record = value as Record<string, unknown>;
+	const parsed = providerNativeMediaSchema.safeParse({
+		type: record.type,
+		mediaType: record.mediaType,
+		dataBase64: record.dataBase64 ?? record.base64,
+		...(typeof record.filename === "string" ? { filename: record.filename } : {}),
+	});
+	if (!parsed.success)
+		throw new ProviderRpcError(
+			"INVALID_REQUEST",
+			`Invalid native media; complete original base64 bytes are required: ${parsed.error.message}`,
+		);
+	return parsed.data;
+}
+
 function canonicalizeContentBlock(
 	value: unknown,
 	reasoningSource: string,
@@ -1108,6 +1255,18 @@ function canonicalizeContentBlock(
 	if (!value || typeof value !== "object") return undefined;
 	const record = value as Record<string, unknown>;
 	const type = typeof record.type === "string" ? record.type : undefined;
+	if (type === "audio" || type === "video") return canonicalNativeMedia(record);
+	if (
+		type === "input_audio" ||
+		type === "input_video" ||
+		type === "audio_url" ||
+		type === "video_url"
+	) {
+		throw new ProviderRpcError(
+			"INVALID_REQUEST",
+			`Unsupported media representation ${type}; original audio/video bytes are required`,
+		);
+	}
 	if (type === "text" && typeof record.text === "string" && record.text) {
 		return withOptionalIndex(
 			{ type: "text", text: record.text },

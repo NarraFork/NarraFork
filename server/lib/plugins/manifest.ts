@@ -221,6 +221,8 @@ const providerCapabilitiesSchema = z
 		generate: z.boolean().optional(),
 		reasoningContinuation: z.boolean().optional(),
 		inputImages: z.boolean().optional(),
+		inputAudio: z.boolean().optional(),
+		inputVideo: z.boolean().optional(),
 		/**
 		 * True when the upstream can leak `<invoke>` tool calls into assistant text
 		 * instead of using native tool-use fields. The agent loop uses this to keep a

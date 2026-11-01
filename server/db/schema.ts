@@ -3650,6 +3650,7 @@ export const narratorBufferedMessages = sqliteTable(
 		narratorId: text("narrator_id").notNull(),
 		text: text("text").notNull(),
 		imagesJson: text("images_json"), // JSON: ImageRef[] | null
+		mediaJson: text("media_json"), // JSON: MediaRef[] | null
 		commandText: text("command_text"),
 		bashCommand: text("bash_command"), // runBashFirst command to execute before the prompt
 		createdBy: text("created_by"),

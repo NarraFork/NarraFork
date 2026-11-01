@@ -1,6 +1,6 @@
 /**
- * RenderMedia.tsx — Render copies for the three media blocks measured by
- * measure-media.ts (image / text_file / image_generation). Draws each
+ * RenderMedia.tsx — Render copies for the media blocks measured by
+ * measure-media.ts (image / audio / video / text_file / image_generation). Draws each
  * MeasuredElement at the exact geometry the measure layer computed, using
  * absolute positioning — no reflow, no DOM measurement (the image-unknown
  * placeholder keeps the reserved height; the owning integration layer may do a
@@ -19,6 +19,8 @@ import {
 import { Divider } from "@mantine/core";
 import { fragmentTextStyle, letterSpacingForFont } from "@shared/pretext-layout/fragment-style";
 import { Fragment, useMemo } from "react";
+import { MediaAttachment } from "../../message/MediaAttachment";
+import type { ContentBlock } from "../../narrator-panel-types";
 import {
 	IMGGEN_GROUP_GAP,
 	IMGGEN_ICON_SIZE,
@@ -100,6 +102,24 @@ export function RenderMedia({
 
 	// image / text_file: a single fixed block.
 	if (first?.kind === "fixed") {
+		if (first.tag === "audio" || first.tag === "video") {
+			return (
+				<div style={{ position: "relative", height: frame.contentHeight }}>
+					<div
+						style={{
+							position: "absolute",
+							top: frame.blocks[0]?.top ?? 0,
+							left: 0,
+							height: first.height,
+							width: first.displayWidth,
+							maxWidth: "100%",
+						}}
+					>
+						<MediaAttachment narratorId={narratorId ?? ""} block={first.data as ContentBlock} />
+					</div>
+				</div>
+			);
+		}
 		if (first.tag === "image") {
 			return (
 				<div style={{ position: "relative", height: frame.contentHeight }}>

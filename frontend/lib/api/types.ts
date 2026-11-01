@@ -727,6 +727,8 @@ export interface BaseContentBlock {
 	summary?: string;
 	previewUrl?: string;
 	imageId?: string;
+	mediaId?: string;
+	size?: number;
 	filename?: string;
 	mediaType?: string;
 	uploadNarratorId?: string;
@@ -1020,6 +1022,7 @@ export interface BufferMessageSummary {
 	imageCount: number;
 	/** Optional so a snapshot from an older server still parses. */
 	images?: BufferedImageSummary[];
+	media?: import("@shared/media-attachments").MediaRef[];
 	textFiles?: BufferedTextFileSummary[];
 	fileReferences?: FileReference[];
 	creator?: BufferCreator | null;

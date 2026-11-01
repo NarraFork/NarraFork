@@ -4,11 +4,14 @@ import type React from "react";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useImageViewer } from "../../common/image-viewer-context";
+import { PendingMediaAttachment, pendingMediaKey } from "../message/MediaAttachment";
 import { formatFileSize } from "../narrator-panel-types";
 
 export interface AttachmentPreviewsProps {
 	attachedImages: File[];
 	attachedTextFiles: File[];
+	attachedMedia?: File[];
+	updateAttachedMedia?: React.Dispatch<React.SetStateAction<File[]>>;
 	updateAttachedImages: React.Dispatch<React.SetStateAction<File[]>>;
 	updateAttachedTextFiles: React.Dispatch<React.SetStateAction<File[]>>;
 }
@@ -79,6 +82,24 @@ export function AttachmentPreviews(props: AttachmentPreviewsProps) {
 				</Group>
 			)}
 
+			{(props.attachedMedia?.length ?? 0) > 0 && (
+				<Group px="md" py="xs" gap="sm" align="flex-start" style={{ flexShrink: 0 }}>
+					{props.attachedMedia?.map((file, index) => (
+						<Box key={pendingMediaKey(file)} pos="relative" style={{ maxWidth: "100%" }}>
+							<PendingMediaAttachment file={file} />
+							<CloseButton
+								size="xs"
+								title={t("removeMedia")}
+								aria-label={t("removeMedia")}
+								style={{ position: "absolute", top: 0, right: 0 }}
+								onClick={() =>
+									props.updateAttachedMedia?.((prev) => prev.filter((_, i) => i !== index))
+								}
+							/>
+						</Box>
+					))}
+				</Group>
+			)}
 			{/* Text file previews */}
 			{props.attachedTextFiles.length > 0 && (
 				<Group

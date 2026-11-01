@@ -14,6 +14,7 @@ import {
 	bindComposerEditFiles,
 	buildQueuedEditPayload,
 	canSubmitQueuedEdit,
+	composerEditDetailAttachments,
 	type ExistingComposerAttachment,
 	MAX_QUEUED_IMAGES,
 	MAX_QUEUED_TEXT_FILES,
@@ -61,6 +62,36 @@ function state(overrides: Partial<QueuedEditAttachmentState> = {}): QueuedEditAt
 function fakeFile(name: string): File {
 	return new File(["x"], name, { type: "text/plain" });
 }
+
+describe("native media queued edits", () => {
+	const media = {
+		mediaId: "media-a",
+		filename: "voice.wav",
+		mediaType: "audio/wav",
+		size: 20,
+		uploadNarratorId: "owner",
+	};
+	test("media-only edits remain sendable and text edits retain stable references", () => {
+		const original = summary({ text: "", media: [media] });
+		const seeded = seedQueuedEditAttachments(original);
+		expect(seeded.keptMedia).toEqual([media]);
+		const draft = state({ keptMedia: seeded.keptMedia, newMedia: [] });
+		expect(canSubmitQueuedEdit(draft)).toBe(true);
+		expect(buildQueuedEditPayload(draft)).toMatchObject({
+			keepMediaIds: ["media-a"],
+			newMedia: [],
+		});
+		expect(queuedEditTouchesAttachments(original, draft)).toBe(false);
+	});
+	test("explicit removal sends an empty keep list and additions preserve binary files", () => {
+		const added = new File(["audio"], "voice.wav", { type: "audio/wav" });
+		const draft = state({ keptMedia: [], newMedia: [added] });
+		expect(canSubmitQueuedEdit(draft)).toBe(true);
+		expect(buildQueuedEditPayload(draft)).toMatchObject({ keepMediaIds: [], newMedia: [added] });
+		expect(queuedEditTouchesAttachments(summary({ media: [media] }), draft)).toBe(true);
+		expect(canSubmitQueuedEdit(state({ keptMedia: [], newMedia: [] }))).toBe(false);
+	});
+});
 
 describe("seedQueuedEditAttachments", () => {
 	test("separates images and text files from a summary", () => {
@@ -280,6 +311,138 @@ describe("queuedEditTouchesAttachments", () => {
 				}),
 			),
 		).toBe(true);
+	});
+});
+
+describe("semantic media composer edits", () => {
+	const refs = [
+		{
+			mediaId: "video-original",
+			filename: "same.webm",
+			mediaType: "video/webm",
+			size: 4,
+			uploadNarratorId: "source-owner",
+		},
+		{
+			mediaId: "audio-original",
+			filename: "same.webm",
+			mediaType: "audio/webm",
+			size: 4,
+			uploadNarratorId: "source-owner",
+		},
+	];
+	const resources = () =>
+		composerEditDetailAttachments({ images: [], textFiles: [], media: refs }, "fork-context") ?? [];
+	function doc(): ComposerDocument {
+		return {
+			version: 1,
+			assets: resources().map((resource, index) => ({
+				id: `media-${index}`,
+				kind: resource.kind,
+				name: resource.name,
+				size: resource.size,
+				mimeType: resource.mimeType,
+			})),
+			paragraphs: [
+				{
+					children: [
+						{ type: "attachment", id: "audio-first", assetId: "media-1" },
+						{ type: "text", text: " middle " },
+						{ type: "attachment", id: "video-last", assetId: "media-0" },
+					],
+				},
+			],
+		};
+	}
+	test("detail retains source-owned media and a combined audio/video lane despite visual reorder", () => {
+		const existing = resources();
+		expect(existing.map((resource) => [resource.mediaId, resource.uploadNarratorId])).toEqual([
+			["video-original", "source-owner"],
+			["audio-original", "source-owner"],
+		]);
+		const document = doc();
+		const session = seedComposerEditSession(
+			{ text: "", fileReferences: [], composerDocument: document },
+			existing,
+		);
+		const snapshot = projectComposerEdit(session, document);
+		expect(snapshot.keepMediaIds).toEqual(refs.map((media) => media.mediaId));
+		expect(snapshot.newMedia).toEqual([]);
+		expect(snapshot.newTextFiles).toEqual([]);
+		expect(snapshot.composerDocument).toEqual(document);
+	});
+	test("legacy media imports into chips, explicit deletion clears keeps, and undo restores IDs", () => {
+		const session = seedComposerEditSession({ text: "legacy", fileReferences: [] }, resources());
+		expect(session.document.assets.map((asset) => asset.kind)).toEqual(["video", "audio"]);
+		const cleared = projectComposerEdit(session, {
+			...session.document,
+			assets: [],
+			paragraphs: [{ children: [{ type: "text", text: "now text" }] }],
+		});
+		expect(cleared.keepMediaIds).toEqual([]);
+		expect(cleared.newMedia).toEqual([]);
+		expect(projectComposerEdit(session, session.document).keepMediaIds).toEqual([
+			"video-original",
+			"audio-original",
+		]);
+	});
+	test("same-name mixed new media stay separate, with manifest upload order independent from nodes", () => {
+		const session = seedComposerEditSession(
+			{ text: "", fileReferences: [], composerDocument: doc() },
+			resources(),
+		);
+		const audio = new File(["audio"], "same.webm", { type: "audio/webm" });
+		const video = new File(["video"], "same.webm", { type: "video/webm" });
+		const a = bindComposerEditFiles(session, [audio], "audio");
+		const v = bindComposerEditFiles(session, [video], "video");
+		const document = {
+			...session.document,
+			assets: [...v.assets, ...a.assets, ...session.document.assets],
+			paragraphs: [
+				{ children: [...v.nodes, ...a.nodes, ...session.document.paragraphs[0].children] },
+			],
+		};
+		const snapshot = projectComposerEdit(session, document);
+		expect(snapshot.newMedia).toEqual([audio, video]);
+		expect(snapshot.newTextFiles).toEqual([]);
+		expect(snapshot.composerDocument.assets.map((asset) => asset.id)).toEqual([
+			"media-0",
+			"media-1",
+			a.assets[0].id,
+			v.assets[0].id,
+		]);
+		expect(snapshot.composerDocument.paragraphs).toEqual(document.paragraphs);
+	});
+	test("rejects missing IDs, stale mixed lane and more than ten active media", () => {
+		expect(() =>
+			seedComposerEditSession({ text: "", fileReferences: [] }, [
+				{ ...resources()[0], mediaId: undefined },
+			]),
+		).toThrow("identity");
+		expect(() =>
+			seedComposerEditSession(
+				{ text: "", fileReferences: [], composerDocument: doc() },
+				resources().toReversed(),
+			),
+		).toThrow("out of date");
+		const session = seedComposerEditSession({ text: "", fileReferences: [] }, resources());
+		const added = bindComposerEditFiles(
+			session,
+			Array.from({ length: 9 }, () => new File(["x"], "a.wav", { type: "audio/wav" })),
+			"audio",
+		);
+		const document = {
+			...session.document,
+			assets: [...session.document.assets, ...added.assets],
+			paragraphs: [{ children: [...session.document.paragraphs[0].children, ...added.nodes] }],
+		};
+		expect(() => projectComposerEdit(session, document)).toThrow("Maximum 10");
+		const ten = {
+			...document,
+			paragraphs: [{ children: document.paragraphs[0].children.slice(0, -1) }],
+		};
+		const snapshot = projectComposerEdit(session, ten);
+		expect(snapshot.keepMediaIds.length + snapshot.newMedia.length).toBe(10);
 	});
 });
 

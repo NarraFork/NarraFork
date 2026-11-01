@@ -13,6 +13,8 @@
  * and the live {@link RunControl} on its owner record. A delegation is a caller that
  * registers those facts; any two sessions can be related the same way.
  */
+
+import type { MediaRef } from "@shared/media-attachments";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { and, eq } from "drizzle-orm";
 import { db } from "../../db";
@@ -64,6 +66,7 @@ export interface StartNarratorRunRequest {
 	locale: Locale;
 	text: string;
 	images?: ImageRef[];
+	media?: MediaRef[];
 	replyInUserLanguage?: boolean;
 	/** An already prepared session (an input path persisted the user turn into it). */
 	active?: ActiveNarrator;
@@ -532,6 +535,7 @@ async function executeRun(
 					req.images,
 					run,
 					req.prePromptBashCommand,
+					req.media,
 				);
 		for (;;) {
 			// The loop's async cleanup may have admitted a hold after its last boundary.
@@ -574,6 +578,7 @@ async function executeRun(
 					input.images,
 					run,
 					input.prePromptBashCommand,
+					input.media,
 				);
 		}
 		allowInboxWake = outcome.allowInboxWake === true;

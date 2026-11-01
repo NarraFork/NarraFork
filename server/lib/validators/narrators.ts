@@ -4,6 +4,7 @@ import {
 	HUMAN_ATTENTION_DEFAULT_PAGE_SIZE,
 	HUMAN_ATTENTION_MAX_PAGE_SIZE,
 } from "@shared/human-attention";
+import { MAX_MEDIA_ATTACHMENTS } from "@shared/media-attachments";
 import {
 	handleLength,
 	isValidHandle,
@@ -510,6 +511,7 @@ export const updateBufferedMessageSchema = z.object({
 	fileReferences: fileReferencesSchema.optional(),
 	composerDocument: composerDocumentSchema,
 	keepImageIds: z.array(z.string().min(1)).max(MAX_EDIT_IMAGES_PER_MESSAGE).optional(),
+	keepMediaIds: z.array(z.string().min(1)).max(MAX_MEDIA_ATTACHMENTS).optional(),
 	keepTextFiles: z
 		.array(z.object({ index: z.number().int().min(0), filename: z.string().min(1) }))
 		.max(MAX_EDIT_TEXT_FILES_PER_MESSAGE)
@@ -779,6 +781,7 @@ export const editAndRegenerateJsonSchema = z.object({
 	fileReferences: fileReferencesSchema.optional(),
 	composerDocument: composerDocumentSchema,
 	keepImageIds: z.array(z.string()).max(100).optional(),
+	keepMediaIds: z.array(z.string().min(1)).max(MAX_MEDIA_ATTACHMENTS).optional(),
 	keepTextFilePaths: z.array(z.string()).max(100).optional(),
 	/** True => delete the messages but leave the workspace alone. */
 	skipRevert: z.boolean().optional(),

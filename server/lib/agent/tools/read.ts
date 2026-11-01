@@ -1,8 +1,14 @@
 import { createReadStream } from "node:fs";
 import { extname } from "node:path";
+import {
+	MAX_MEDIA_FILE_SIZE,
+	mediaModality,
+	mediaRefToContentBlock,
+} from "@shared/media-attachments";
 import { z } from "zod/v4";
 import { specVfsService } from "../../../services/spec-vfs-service";
 import { isSecretPlatformPath, SECRET_PATH_TOOL_REFUSAL } from "../../fs-secret-paths";
+import { deleteUploadedMedia, saveUploadedMedia, validateMediaBytes } from "../../media-uploads";
 import { toolSpecPathError } from "../../spec-uri";
 import { imageBytesToBase64, imageToBase64, sanitizeParsedDimensions } from "../../uploads";
 import type { ExecutionBackend } from "../execution/backend";
@@ -36,6 +42,23 @@ const IMAGE_EXTENSIONS: Record<string, string> = {
 	".gif": "gif",
 	".webp": "webp",
 };
+
+/** Extension routing only; format and MIME validation belongs to media-uploads. */
+const MEDIA_EXTENSIONS = new Set([
+	".wav",
+	".mp3",
+	".m4a",
+	".m4b",
+	".mp4",
+	".aac",
+	".flac",
+	".ogg",
+	".oga",
+	".webm",
+	".mov",
+	".mpeg",
+	".mpg",
+]);
 
 /** Max raw image size we'll base64-encode (~5 MB, safe for all providers). */
 const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
@@ -76,6 +99,7 @@ export const readTool: ToolDefinition = {
 		"- Dynamic Spec examples: spec://tasks.json, spec://index.md, spec://behavior_fence. spec:// paths are virtual and do not need to be absolute.\n" +
 		"- Any lines longer than 2000 characters will be truncated. Results use cat -n format, with line numbers starting at 1.\n" +
 		"- Image files (e.g. PNG, JPG) are returned as visual content.\n" +
+		"- Audio (WAV, MP3, M4A, M4B, AAC, FLAC, OGG) and video (MP4, WebM, MOV, MPEG) files are returned as native media, never as a transcript or extracted frames. Maximum size: 100 MiB. Unsupported models receive an ordinary-file reference and an explicit notice that the media contents were not read. offset, limit and pages do not slice media.\n" +
 		'- This tool can read PDF files (.pdf). For large PDFs (more than 10 pages), you MUST provide the pages parameter to read specific page ranges (e.g., pages: "1-5"). Reading a large PDF without the pages parameter will fail. Maximum 20 pages per request.\n' +
 		"- This tool can read Jupyter notebooks (.ipynb files) and returns all cells with their outputs, combining code, text, and visualizations.\n" +
 		"- This tool can only read files, not directories. To read a directory, use an ls command via the Bash tool.\n" +
@@ -193,10 +217,20 @@ export const readTool: ToolDefinition = {
 			}
 		}
 
-		const backend = getToolBackend(ctx, (args as { device?: string }).device);
-		const resolvedPath =
-			ctx.executionTarget?.lexicalPath ??
-			resolveBackendPath(backend, toolBaseCwd(backend, ctx.cwd), file_path);
+		let backend: ExecutionBackend;
+		let resolvedPath: string;
+		try {
+			ctx.signal.throwIfAborted();
+			backend = getToolBackend(ctx, (args as { device?: string }).device);
+			resolvedPath =
+				ctx.executionTarget?.lexicalPath ??
+				resolveBackendPath(backend, toolBaseCwd(backend, ctx.cwd), file_path);
+		} catch (err) {
+			return {
+				output: `Error reading ${file_path}: ${err instanceof Error ? err.message : String(err)}`,
+				isError: true,
+			};
+		}
 		const canonicalPath = ctx.executionTarget?.canonicalPath;
 		const ioPath = canonicalPath ?? resolvedPath;
 
@@ -218,8 +252,59 @@ export const readTool: ToolDefinition = {
 			// which will produce the appropriate error message.
 		}
 
-		// ── Image file handling ──
 		const ext = extname(resolvedPath).toLowerCase();
+		// ── Native audio/video: identical bounded, authorized IO on every device ──
+		if (MEDIA_EXTENSIONS.has(ext)) {
+			try {
+				ctx.signal.throwIfAborted();
+				if (!ctx.narratorId) {
+					throw new Error(
+						"A narratorId is required to persist native media for conversation replay.",
+					);
+				}
+				const { bytes, truncated, totalSize } = await backend.readFileBytes(ioPath, {
+					maxBytes: MAX_MEDIA_FILE_SIZE,
+					expectedResolvedPath: canonicalPath,
+					signal: ctx.signal,
+				});
+				ctx.signal.throwIfAborted();
+				if (totalSize > MAX_MEDIA_FILE_SIZE || bytes.byteLength > MAX_MEDIA_FILE_SIZE) {
+					throw new Error("Media file too large. Maximum supported size is 100 MiB.");
+				}
+				if (truncated || totalSize !== bytes.byteLength) {
+					throw new Error(
+						`Incomplete media read: truncated or missing bytes (${bytes.byteLength} of ${totalSize}). Native media requires the complete file.`,
+					);
+				}
+				const filename = backend.paths.basename(resolvedPath);
+				const mediaType = validateMediaBytes(bytes, filename);
+				const type = mediaModality(mediaType);
+				if (!type) throw new Error(`Unsupported media MIME type: ${mediaType}`);
+				ctx.signal.throwIfAborted();
+				const ref = await saveUploadedMedia(
+					ctx.narratorId,
+					new File([new Uint8Array(bytes)], filename, { type: mediaType }),
+				);
+				if (ctx.signal.aborted) {
+					deleteUploadedMedia(ctx.narratorId, ref.mediaId);
+					ctx.signal.throwIfAborted();
+				}
+				return {
+					output: `[Native ${type}: ${file_path} (${(bytes.byteLength / 1024).toFixed(1)} KB, ${mediaType})]`,
+					title: file_path,
+					media: [{ type, mediaType, base64: Buffer.from(bytes).toString("base64"), filename }],
+					mediaRefs: [mediaRefToContentBlock(ref, ctx.narratorId)],
+					metadata: { isMedia: true, mediaType, filePath: resolvedPath, size: bytes.byteLength },
+				};
+			} catch (err) {
+				return {
+					output: `Error reading media ${file_path}: ${err instanceof Error ? err.message : String(err)}`,
+					isError: true,
+				};
+			}
+		}
+
+		// ── Image file handling ──
 		const imageFormat = IMAGE_EXTENSIONS[ext];
 		if (imageFormat) {
 			try {

@@ -1,6 +1,6 @@
 {
-  "id": "30f5ec4d-b57c-40b3-a85d-a69332fe44bf",
-  "prevId": "4079ddee-70fe-4250-a6f9-614a7270d6ae",
+  "id": "a9662244-fbcc-4328-be23-efc20c6d8229",
+  "prevId": "30f5ec4d-b57c-40b3-a85d-a69332fe44bf",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -10296,6 +10296,12 @@
         },
         "images_json": {
           "name": "images_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
+        "media_json": {
+          "name": "media_json",
           "type": "text",
           "primaryKey": false,
           "notNull": false

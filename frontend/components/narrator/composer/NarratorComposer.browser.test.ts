@@ -1,6 +1,7 @@
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
 import { basename, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ComposerDocument } from "@shared/composer-document";
 import puppeteer, { type Browser, type Page } from "puppeteer-core";
 import type * as Fixture from "./NarratorComposer.browser-fixture";
@@ -36,7 +37,9 @@ const persistentDrafts = new Map<
 beforeAll(async () => {
 	if (!existsSync(executablePath)) throw new Error(`Chromium unavailable: ${executablePath}`);
 	const bundle = await Bun.build({
-		entrypoints: [new URL("./NarratorComposer.browser-fixture.tsx", import.meta.url).pathname],
+		entrypoints: [
+			fileURLToPath(new URL("./NarratorComposer.browser-fixture.tsx", import.meta.url)),
+		],
 		target: "browser",
 		format: "esm",
 		define: {
@@ -183,11 +186,57 @@ async function settle(page: Page) {
 			),
 	);
 }
-async function open() {
+async function settledComposerLayout(page: Page) {
+	await settle(page);
+	// ResizeObserver can schedule another measurement after the first pair of RAFs.
+	// Compare caret/shell coordinates only once height and text transforms stop moving.
+	await page.evaluate(
+		() =>
+			new Promise<void>((resolve, reject) => {
+				const started = performance.now();
+				let previous = "";
+				let stableFrames = 0;
+				const measure = () => {
+					const root = document.querySelector<HTMLElement>("[data-inline-composer]");
+					const textbox = root?.querySelector<HTMLElement>('[role="textbox"]');
+					if (!root || !textbox) return reject(new Error("Missing composer layout"));
+					const box = root.getBoundingClientRect();
+					const text = textbox.getBoundingClientRect();
+					const signature = JSON.stringify([
+						box.top,
+						box.height,
+						text.top,
+						text.height,
+						root.style.height,
+						root.dataset.layout,
+					]);
+					// Flex sizing can constrain the rendered box below its inline target height.
+					// Wait for actual geometry and animations, not equality with that target.
+					const settled = [root, textbox].every((element) =>
+						element.getAnimations().every((animation) => animation.playState !== "running"),
+					);
+					stableFrames = settled && signature === previous ? stableFrames + 1 : 0;
+					previous = signature;
+					if (stableFrames >= 2) return resolve();
+					if (performance.now() - started > 5000)
+						return reject(new Error(`Composer layout did not settle: ${signature}`));
+					requestAnimationFrame(measure);
+				};
+				requestAnimationFrame(measure);
+			}),
+	);
+}
+async function focusedComposer(page: Page) {
+	await page.waitForFunction(
+		() =>
+			document.hasFocus() && document.activeElement === document.querySelector('[role="textbox"]'),
+	);
+}
+async function open(viewport?: { width: number; height: number }) {
 	if (!browser || !server) throw new Error("Fixture unavailable");
 	const page = await browser.newPage();
 	page.setDefaultTimeout(5000);
-	await page.setViewport({ width: 1000, height: 700 });
+	await page.setViewport(viewport ?? { width: 1000, height: 700 });
 	const captured: string[] = [];
 	errors.set(page, captured);
 	page.on("pageerror", (error) => captured.push(String(error)));
@@ -196,6 +245,8 @@ async function open() {
 			response.url().endsWith("/draft") && response.request().method() === "GET" && response.ok(),
 	);
 	await page.goto(server.url.origin);
+	await page.bringToFront();
+	await page.waitForFunction(() => document.hasFocus());
 	await hydrated;
 	await page.waitForFunction(() => (window as unknown as FixtureWindow).fixture?.ready());
 	await settle(page);
@@ -562,12 +613,16 @@ test("arrow keys change visual lines before recalling input history", async () =
 			linesDocument(["older history"]),
 		);
 		await loadDocument(page, linesDocument(["line1", "line2", "line3"]));
-		const middle = await page.evaluate(() =>
+		await page.evaluate(() =>
 			(window as unknown as FixtureWindow).fixture.placeCaretAt("line2", 2),
 		);
-		await settle(page);
+		await focusedComposer(page);
+		await settledComposerLayout(page);
+		const middle = await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.caretProbe(),
+		);
 		await page.keyboard.press("ArrowUp");
-		await settle(page);
+		await settledComposerLayout(page);
 		const moved = await page.evaluate(() =>
 			(window as unknown as FixtureWindow).fixture.caretProbe(),
 		);
@@ -603,6 +658,8 @@ test("arrow keys change visual lines before recalling input history", async () =
 			() => (window as unknown as FixtureWindow).fixture.snapshot().text === "hist1\nhist2\nhist3",
 		);
 		await settle(page);
+		await focusedComposer(page);
+		await settledComposerLayout(page);
 		const recalledEnd = await page.evaluate(() =>
 			(window as unknown as FixtureWindow).fixture.caretProbe(),
 		);
@@ -630,12 +687,16 @@ test("arrow keys change visual lines before recalling input history", async () =
 		);
 
 		await loadDocument(page, paragraphsDocument(["para1", "para2"]));
-		const second = await page.evaluate(() =>
+		await page.evaluate(() =>
 			(window as unknown as FixtureWindow).fixture.placeCaretAt("para2", 0),
 		);
-		await settle(page);
+		await focusedComposer(page);
+		await settledComposerLayout(page);
+		const second = await page.evaluate(() =>
+			(window as unknown as FixtureWindow).fixture.caretProbe(),
+		);
 		await page.keyboard.press("ArrowUp");
-		await settle(page);
+		await settledComposerLayout(page);
 		const previousParagraph = await page.evaluate(() =>
 			(window as unknown as FixtureWindow).fixture.caretProbe(),
 		);
@@ -2014,15 +2075,13 @@ test("reusing the mounted composer never exposes the previous account's live or 
 for (const width of [1440, 390]) {
 	for (const scheme of ["light", "dark"] as const) {
 		test(`${width}px ${scheme}: floating quote button keeps the composer still and aligns its content`, async () => {
-			const page = await open();
+			const page = await open({ width, height: 844 });
 			try {
-				await page.setViewport({ width, height: 844 });
 				await page.evaluate((theme) => {
 					document.documentElement.setAttribute("data-mantine-color-scheme", theme);
 				}, scheme);
 				const settleLayout = async () => {
 					await settle(page);
-					// Measure settled geometry, not an intermediate frame of the adaptive layout.
 					await page.waitForFunction(() =>
 						[
 							...document.querySelectorAll(
@@ -2095,7 +2154,7 @@ for (const width of [1440, 390]) {
 			} finally {
 				await close(page);
 			}
-		});
+		}, 15_000);
 	}
 }
 

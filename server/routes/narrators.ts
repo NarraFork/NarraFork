@@ -10,6 +10,11 @@ import {
 	type FileReferenceSnapshot,
 	fileReferenceMessageForDisplay,
 } from "@shared/file-reference";
+import {
+	isMediaContentBlock,
+	MAX_MEDIA_ATTACHMENTS,
+	type MediaRef,
+} from "@shared/media-attachments";
 import { formatOriginLabel } from "@shared/message-origin";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import {
@@ -89,6 +94,7 @@ import {
 import { getBuiltinToolNames, getBuiltinToolRoutines } from "../lib/builtin-routines";
 import {
 	bindComposerDocumentReferences,
+	bindComposerMediaProjection,
 	parseOptionalComposerDocument,
 	restoreMultipartComposerText,
 	validateComposerAssets,
@@ -102,6 +108,11 @@ import {
 } from "../lib/file-reference-input";
 import { generateId, generateShortId } from "../lib/id";
 import { logger } from "../lib/logger";
+import {
+	deleteUploadedMedia,
+	saveUploadedMedia,
+	validateUploadedMedia,
+} from "../lib/media-uploads";
 import {
 	getAuthorizedNarrator,
 	narratorPrincipalOf,
@@ -516,6 +527,7 @@ export async function parseMessageRequest(
 ): Promise<{
 	message: string;
 	images: ImageRef[];
+	media: MediaRef[];
 	textFiles: File[];
 	priority?: boolean;
 	interrupt?: boolean;
@@ -530,13 +542,24 @@ export async function parseMessageRequest(
 		const modeResult = bufferQueueModeSchema.optional().safeParse(rawMode ?? undefined);
 		if (!modeResult.success) throw new ValidationError(modeResult.error.message);
 		const rawMessage = formData.get("message");
-		const fileReferences = parseFileReferenceInput(formData.get("fileReferences"));
-		const composerDocument = parseOptionalComposerDocument(formData.get("composerDocument"));
-		const message = restoreMultipartComposerText(
+		let fileReferences = parseFileReferenceInput(formData.get("fileReferences"));
+		let composerDocument = parseOptionalComposerDocument(formData.get("composerDocument"));
+		let message = restoreMultipartComposerText(
 			typeof rawMessage === "string" ? rawMessage : "",
 			composerDocument,
 		);
 		validateComposerProjection(composerDocument, message, fileReferences);
+		const mediaFiles = formData.getAll("media") as File[];
+		if (mediaFiles.length > MAX_MEDIA_ATTACHMENTS)
+			throw new ValidationError(`Maximum ${MAX_MEDIA_ATTACHMENTS} media attachments per message`);
+		const mediaMetadata: Array<{ filename: string; size: number; mediaType: string }> = [];
+		for (const file of mediaFiles) {
+			mediaMetadata.push({
+				filename: file.name,
+				size: file.size,
+				mediaType: await validateUploadedMedia(file),
+			});
+		}
 		const imageFiles = formData.getAll("images") as File[];
 		if (imageFiles.length > MAX_EDIT_IMAGES_PER_MESSAGE) {
 			throw new ValidationError(`Maximum ${MAX_EDIT_IMAGES_PER_MESSAGE} images per message`);
@@ -553,6 +576,7 @@ export async function parseMessageRequest(
 		if (
 			!message.trim() &&
 			imageFiles.length === 0 &&
+			mediaFiles.length === 0 &&
 			textFileEntries.length === 0 &&
 			!fileReferences?.length
 		) {
@@ -566,9 +590,16 @@ export async function parseMessageRequest(
 		for (const file of imageFiles) {
 			validateUploadedImage(file);
 		}
-		validateComposerAssets(composerDocument, imageFiles, textFileEntries);
+		({
+			document: composerDocument,
+			text: message,
+			references: fileReferences,
+		} = bindComposerMediaProjection(composerDocument, message, fileReferences, mediaMetadata));
+		validateComposerAssets(composerDocument, imageFiles, textFileEntries, mediaMetadata);
 		const images: ImageRef[] = [];
+		const media: MediaRef[] = [];
 		try {
+			for (const file of mediaFiles) media.push(await saveUploadedMedia(narratorId, file));
 			for (const file of imageFiles) {
 				const image = await saveUploadedImage(narratorId, file);
 				images.push(
@@ -586,12 +617,14 @@ export async function parseMessageRequest(
 					// Best-effort: the original failure is what the caller needs to see.
 				}
 			}
+			for (const item of media) deleteUploadedMedia(narratorId, item.mediaId);
 			throw error;
 		}
 		const priority = formData.get("priority") === "true";
 		return {
 			message,
 			images,
+			media,
 			textFiles: textFileEntries,
 			priority: priority || undefined,
 			interrupt: formData.get("interrupt") === "true" || undefined,
@@ -612,6 +645,7 @@ export async function parseMessageRequest(
 	return {
 		message: parsed.data.message,
 		images: [],
+		media: [],
 		textFiles: [],
 		priority: parsed.data.priority,
 		interrupt: parsed.data.interrupt,
@@ -1637,6 +1671,15 @@ narratorRoutes.get("/:id/messages/:mid/composer-document", async (c) => {
 	return c.json({
 		composerDocument: message.composerDocument ?? undefined,
 		images,
+		media: Array.isArray(blocks)
+			? blocks.filter(isMediaContentBlock).map((media) => ({
+					mediaId: media.mediaId,
+					filename: media.filename,
+					mediaType: media.mediaType,
+					size: media.size,
+					uploadNarratorId: media.uploadNarratorId ?? id,
+				}))
+			: [],
 		textFiles,
 		bodyRevision: message.bodyRevision,
 		text: Array.isArray(blocks)
@@ -1677,6 +1720,7 @@ narratorRoutes.get("/:id/buffer/:mid/composer-document", async (c) => {
 	return c.json({
 		composerDocument: message.composerDocument,
 		images,
+		media: message.media ?? [],
 		textFiles,
 		text: message.text,
 		fileReferences: (message.fileReferences ?? []).map((snapshot) => snapshot.reference),
@@ -2153,6 +2197,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 	const {
 		message,
 		images,
+		media,
 		textFiles,
 		priority: requestedPriority,
 		interrupt: requestedInterrupt,
@@ -2453,16 +2498,21 @@ narratorRoutes.post("/:id/messages", async (c) => {
 			});
 			const locale = await getUserLanguage(userId);
 			const replyInUserLanguage = await getUserReplyInLanguage(userId);
-			if (queuedNewCommand.initialMessage) {
+			if (queuedNewCommand.initialMessage || media.length > 0) {
 				await sendMessage(
 					newNarrator.id,
-					queuedNewCommand.initialMessage,
+					queuedNewCommand.initialMessage ?? "",
 					images,
 					locale,
 					replyInUserLanguage,
 					undefined,
 					userId,
 					textFiles,
+					undefined,
+					undefined,
+					undefined,
+					undefined,
+					media,
 				);
 				uploadsAccepted = true;
 			}
@@ -2491,6 +2541,7 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		// behind an existing owner/backlog. HTTP status observations never decide admission.
 		const result = await acceptUserMessage(id, finalMessage, {
 			images,
+			media,
 			locale,
 			replyInUserLanguage,
 			commandText,
@@ -2522,6 +2573,16 @@ narratorRoutes.post("/:id/messages", async (c) => {
 		return c.json(fileReferenceMessageForDisplay(result.userMsg), 201);
 	} finally {
 		if (!uploadsAccepted) {
+			for (const item of media) {
+				try {
+					deleteUploadedMedia(id, item.mediaId);
+				} catch (error) {
+					logger.warn("Failed to clean rejected media upload", {
+						mediaId: item.mediaId,
+						error: String(error),
+					});
+				}
+			}
 			for (const image of images) {
 				try {
 					deleteUploadedImage(id, image.imageId);
@@ -2792,10 +2853,12 @@ async function editAndRegenerateResponse(c: Context, id: string, messageId: stri
 	let scope: RevertScope | undefined;
 	// undefined => keep all existing images (legacy); array => keep only these ids.
 	let keepImageIds: string[] | undefined;
+	let keepMediaIds: string[] | undefined;
 	// undefined => keep all existing text files (legacy); array => keep only these paths.
 	let keepTextFilePaths: string[] | undefined;
 	// Editing uploads are only parsed/validated here. The service owns every file write.
 	const newImages: File[] = [];
+	const newMedia: File[] = [];
 	const newTextFiles: File[] = [];
 
 	const parseJsonStringArray = (raw: FormDataEntryValue | null, field: string): string[] => {
@@ -2835,6 +2898,8 @@ async function editAndRegenerateResponse(c: Context, id: string, messageId: stri
 				throw new ValidationError("Invalid confirmed revert plan");
 			}
 		}
+		if (formData.has("keepMediaIds"))
+			keepMediaIds = parseJsonStringArray(formData.get("keepMediaIds"), "keepMediaIds");
 		if (typeof formData.get("keepImageIds") === "string") {
 			keepImageIds = parseJsonStringArray(formData.get("keepImageIds"), "keepImageIds");
 		}
@@ -2844,6 +2909,21 @@ async function editAndRegenerateResponse(c: Context, id: string, messageId: stri
 				"keepTextFilePaths",
 			);
 		}
+		const mediaFiles = formData.getAll("media") as File[];
+		if (mediaFiles.length > MAX_MEDIA_ATTACHMENTS)
+			throw new ValidationError(`Maximum ${MAX_MEDIA_ATTACHMENTS} media attachments per message`);
+		const detectedMedia = [];
+		for (const file of mediaFiles)
+			detectedMedia.push({
+				filename: file.name,
+				size: file.size,
+				mediaType: await validateUploadedMedia(file),
+			});
+		({
+			document: composerDocument,
+			text: content,
+			references: fileReferences,
+		} = bindComposerMediaProjection(composerDocument, content, fileReferences, detectedMedia));
 		const imageFiles = formData.getAll("images") as File[];
 		if (imageFiles.length > MAX_EDIT_IMAGES_PER_MESSAGE) {
 			throw new ValidationError(`Maximum ${MAX_EDIT_IMAGES_PER_MESSAGE} images per message`);
@@ -2862,7 +2942,8 @@ async function editAndRegenerateResponse(c: Context, id: string, messageId: stri
 			validateTextFile(file);
 			newTextFiles.push(file);
 		}
-		const attachmentBytes = [...imageFiles, ...textFileEntries].reduce(
+		newMedia.push(...mediaFiles);
+		const attachmentBytes = [...imageFiles, ...textFileEntries, ...mediaFiles].reduce(
 			(total, file) => total + file.size,
 			0,
 		);
@@ -2879,6 +2960,7 @@ async function editAndRegenerateResponse(c: Context, id: string, messageId: stri
 		revertPlan = body.revertPlan;
 		scope = body.scope;
 		keepImageIds = body.keepImageIds;
+		keepMediaIds = body.keepMediaIds;
 		keepTextFilePaths = body.keepTextFilePaths;
 	}
 
@@ -2926,6 +3008,8 @@ async function editAndRegenerateResponse(c: Context, id: string, messageId: stri
 		fileReferences: snapshots,
 		composerDocument,
 		keepImageIds,
+		keepMediaIds,
+		newMedia: newMedia.length ? newMedia : undefined,
 		newImages: newImages.length > 0 ? newImages : undefined,
 		keepTextFilePaths,
 		newTextFiles: newTextFiles.length > 0 ? newTextFiles : undefined,
@@ -3090,8 +3174,10 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 	let fileReferences: FileReference[] | undefined;
 	let composerDocument: ComposerDocument | undefined;
 	let keepImageIds: string[] | undefined;
+	let keepMediaIds: string[] | undefined;
 	let keepTextFiles: Array<{ index: number; filename: string }> | undefined;
 	const newImageFiles: File[] = [];
+	const newMediaFiles: File[] = [];
 	const newTextFiles: File[] = [];
 
 	const contentType = c.req.header("content-type") ?? "";
@@ -3103,6 +3189,9 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 			...(rawText !== undefined ? { text: rawText } : {}),
 			fileReferences: parseFileReferenceInput(formData.get("fileReferences")),
 			composerDocument: parseOptionalComposerDocument(formData.get("composerDocument")),
+			...(formData.has("keepMediaIds")
+				? { keepMediaIds: parseJsonArrayField(formData.get("keepMediaIds"), "keepMediaIds") }
+				: {}),
 			...(formData.has("keepImageIds")
 				? { keepImageIds: parseJsonArrayField(formData.get("keepImageIds"), "keepImageIds") }
 				: {}),
@@ -3112,11 +3201,16 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 		});
 		if (!parsed.success) throw new ValidationError(parsed.error.message);
 		keepImageIds = parsed.data.keepImageIds;
+		keepMediaIds = parsed.data.keepMediaIds;
 		keepTextFiles = parsed.data.keepTextFiles;
 		fileReferences = parsed.data.fileReferences;
 		composerDocument = parsed.data.composerDocument;
 		if (rawText !== undefined) rawText = restoreMultipartComposerText(rawText, composerDocument);
 
+		for (const file of formData.getAll("media") as File[]) {
+			await validateUploadedMedia(file);
+			newMediaFiles.push(file);
+		}
 		for (const file of formData.getAll("images") as File[]) {
 			validateUploadedImage(file);
 			newImageFiles.push(file);
@@ -3125,7 +3219,7 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 			validateTextFile(file);
 			newTextFiles.push(file);
 		}
-		const uploadBytes = [...newImageFiles, ...newTextFiles].reduce(
+		const uploadBytes = [...newImageFiles, ...newTextFiles, ...newMediaFiles].reduce(
 			(total, file) => total + file.size,
 			0,
 		);
@@ -3137,6 +3231,7 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 		if (!parsed.success) throw new ValidationError(parsed.error.message);
 		rawText = parsed.data.text;
 		keepImageIds = parsed.data.keepImageIds;
+		keepMediaIds = parsed.data.keepMediaIds;
 		keepTextFiles = parsed.data.keepTextFiles;
 		fileReferences = parsed.data.fileReferences;
 		composerDocument = parsed.data.composerDocument;
@@ -3147,7 +3242,7 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 
 	// Omitted text keeps the current wording, so a client that only manages
 	// attachments does not have to echo the message body back.
-	const text = composerDocument
+	let text = composerDocument
 		? (rawText ?? located.message.text)
 		: (rawText ?? located.message.text).trim();
 	const { keptImages, keptTextFileIndexes } = resolveKeptBufferAttachments(
@@ -3156,6 +3251,40 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 		keepTextFiles,
 	);
 
+	if (
+		keepMediaIds?.some(
+			(mediaId) => !(located.message.media ?? []).some((item) => item.mediaId === mediaId),
+		)
+	) {
+		throw new ValidationError(
+			"Queued attachments changed since this edit started; reload and try again",
+		);
+	}
+	const keptMedia = (located.message.media ?? []).filter(
+		(item) => keepMediaIds === undefined || keepMediaIds.includes(item.mediaId),
+	);
+	const detectedMedia = await Promise.all(
+		newMediaFiles.map(async (file) => ({
+			filename: file.name,
+			size: file.size,
+			mediaType: await validateUploadedMedia(file),
+		})),
+	);
+	const normalized = bindComposerMediaProjection(
+		composerDocument,
+		text,
+		fileReferences ?? located.message.fileReferences?.map((snapshot) => snapshot.reference),
+		[...keptMedia, ...detectedMedia],
+	);
+	composerDocument = normalized.document;
+	text = normalized.text;
+	// Persist the normalized projection even when the client omitted references and
+	// the queue's existing snapshots supplied them. The replacement helper reuses
+	// their captured bytes while updating the projected ranges.
+	if (fileReferences !== undefined || (composerDocument && located.message.fileReferences?.length))
+		fileReferences = normalized.references;
+	if (keptMedia.length + newMediaFiles.length > MAX_MEDIA_ATTACHMENTS)
+		throw new ValidationError(`Maximum ${MAX_MEDIA_ATTACHMENTS} media attachments per message`);
 	if (keptImages.length + newImageFiles.length > MAX_EDIT_IMAGES_PER_MESSAGE) {
 		throw new ValidationError(`Maximum ${MAX_EDIT_IMAGES_PER_MESSAGE} images per message`);
 	}
@@ -3187,7 +3316,13 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 	const finalReferenceCount = (snapshots ?? located.message.fileReferences ?? []).length;
 	const finalImageCount = keptImages.length + newImageFiles.length;
 	const finalTextFileCount = keptTextFileIndexes.length + newTextFiles.length;
-	if (!text && finalImageCount === 0 && finalTextFileCount === 0 && finalReferenceCount === 0) {
+	if (
+		!text &&
+		finalImageCount === 0 &&
+		finalTextFileCount === 0 &&
+		finalReferenceCount === 0 &&
+		keptMedia.length + newMediaFiles.length === 0
+	) {
 		throw new ValidationError("Message cannot be empty");
 	}
 
@@ -3206,6 +3341,7 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 
 	// Everything this request writes to disk, so a failure leaves nothing behind.
 	const createdImageIds: string[] = [];
+	const createdMedia: MediaRef[] = [];
 	let createdSavedFiles: SavedBufferedFile[] = [];
 	let committed = false;
 	try {
@@ -3218,6 +3354,7 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 			);
 		}
 
+		for (const file of newMediaFiles) createdMedia.push(await saveUploadedMedia(id, file));
 		// Both actor types retain the same saved paths; never re-upload kept Files.
 		createdSavedFiles = newTextFiles.length
 			? await persistAdditionalBufferedTextFiles(
@@ -3229,6 +3366,7 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 		const savedFiles = [...keptSavedFiles, ...createdSavedFiles];
 		const ok = await updateBufferedMessage(id, mid, text, {
 			images: [...keptImages, ...newImages],
+			media: [...keptMedia, ...createdMedia],
 			savedFiles,
 			fileReferences: snapshots,
 			composerDocument,
@@ -3237,6 +3375,7 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 		committed = true;
 	} finally {
 		if (!committed) {
+			for (const item of createdMedia) deleteUploadedMedia(id, item.mediaId);
 			for (const imageId of createdImageIds) deleteUploadedImage(id, imageId);
 			for (const file of createdSavedFiles) deleteBufferedTextFile(file);
 		}
@@ -3247,6 +3386,8 @@ narratorRoutes.patch("/:id/buffer/:mid", async (c) => {
 	for (const image of droppedImages) {
 		deleteUploadedImage(image.uploadNarratorId ?? id, image.imageId);
 	}
+	// A source-owned media reference may also be used by a fork. Removing a ref
+	// never deletes shared bytes; only newly-created uncommitted uploads are rolled back.
 	for (const file of droppedSavedFiles) deleteBufferedTextFile(file);
 
 	await broadcastBufferQueue(id);

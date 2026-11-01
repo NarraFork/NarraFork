@@ -360,6 +360,14 @@
 			"prevId": "4079ddee-70fe-4250-a6f9-614a7270d6ae",
 			"version": "7",
 			"snapshotDigest": "8f5daccf0d27fa16385d9de26e353e15fd162de8ca4b99e24c286f6f399ecae5"
+		},
+		{
+			"idx": 45,
+			"tag": "0045_native_media",
+			"id": "a9662244-fbcc-4328-be23-efc20c6d8229",
+			"prevId": "30f5ec4d-b57c-40b3-a85d-a69332fe44bf",
+			"version": "7",
+			"snapshotDigest": "ce2068e0365d4f8bbeab9d5066cdb9b130f4a7723c07a5fa5883d382e11f56a5"
 		}
 	]
 }

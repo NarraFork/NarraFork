@@ -1,8 +1,22 @@
 import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from "bun:test";
 import { EventEmitter } from "node:events";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { mediaRefToContentBlock } from "@shared/media-attachments";
 import { eq } from "drizzle-orm";
+import { historyStrings } from "../../../tests/fixtures/model-input";
+import { wavBytes, webmBytes } from "../../../tests/fixtures/native-media";
 import { cleanDb, getTestDb } from "../../../tests/setup";
-import { backgroundTasks, narratorMessages, narrators } from "../../db/schema";
+import {
+	backgroundTasks,
+	narratorBlocks,
+	narratorMessages,
+	narrators,
+	narratorToolCalls,
+} from "../../db/schema";
+import { getMediaPath, saveUploadedMedia } from "../../lib/media-uploads";
+import { setUploadsDirForTests } from "../../lib/uploads";
 import type { RunControl } from "../agent-runtime/ownership";
 import { runtimePolicyForContext } from "../agent-runtime/policy";
 import type { ExecuteLoopOptions } from "../narrator-executor";
@@ -31,6 +45,8 @@ const { withRuntimePolicyTrait } = await import("../../lib/runtime-policy-trait"
 const ws = await import("../../websocket/narrator-ws");
 const savedOpenai = settings.openaiProviders;
 const savedAnthropic = settings.anthropicProviders;
+const savedGemini = settings.geminiProviders;
+let mediaTestDir: string | undefined;
 const savedMaxToolCallsPerResponse = settings.agent.maxToolCallsPerResponse;
 const ids = ["retry-parent", "retry-primary", "retry-child"];
 const marker = "CONTINUATION_CONTEXT Self-continuations left: 5";
@@ -57,6 +73,10 @@ afterEach(async () => {
 	}
 	settings.openaiProviders = savedOpenai;
 	settings.anthropicProviders = savedAnthropic;
+	settings.geminiProviders = savedGemini;
+	setUploadsDirForTests(null);
+	if (mediaTestDir) rmSync(mediaTestDir, { recursive: true, force: true });
+	mediaTestDir = undefined;
 	settings.agent.maxToolCallsPerResponse = savedMaxToolCallsPerResponse;
 	await backgroundOccupancyStore.flush();
 	mock.restore();
@@ -532,6 +552,467 @@ describe("provider retry policy is identical through the real primary and child 
 		}
 	}
 });
+
+describe("native media survives the unified runtime without duplicate current lanes", () => {
+	for (const kind of ["primary", "subagent"] as const) {
+		for (const turn of ["text", "media-only", "sys-tail", "mailbox"] as const) {
+			test(`${kind} / ${turn}: both attempts retain native bytes and durable refs`, async () => {
+				const prefix = "runtime_native_media";
+				const model = `${prefix}:gemini-2.5-flash`;
+				settings.geminiProviders = [
+					{
+						id: prefix,
+						name: prefix,
+						prefix,
+						apiKey: "test-only",
+						baseUrl: "https://example.invalid/v1beta",
+						defaultModel: "gemini-2.5-flash",
+					},
+				];
+				mediaTestDir = mkdtempSync(join(tmpdir(), "runtime-native-media-"));
+				setUploadsDirForTests(mediaTestDir);
+				const id = kind === "primary" ? "retry-primary" : "retry-child";
+				const now = new Date().toISOString();
+				for (const target of ["retry-parent", id])
+					await seedNarrator({
+						id: target,
+						type: target === "retry-child" ? "subagent" : "primary",
+						variant: target === "retry-child" ? "subagent:general" : "primary",
+						parentNarratorId: target === "retry-child" ? "retry-parent" : null,
+						runtimeRegistrationJson: target === "retry-child" ? delegatedRegistration : null,
+						traits: target === "retry-child" ? delegatedTraits : [],
+						model,
+						cwd: process.env.HOME,
+						autoContinuationOverride: "off",
+						createdAt: now,
+						updatedAt: now,
+					});
+				const bytes = [wavBytes(), webmBytes([1, 2])];
+				const files = [
+					new File([new Uint8Array(bytes[0])], "voice.wav", { type: "audio/wav" }),
+					new File([new Uint8Array(bytes[1])], "clip.webm", { type: "video/webm" }),
+				];
+				const refs = await Promise.all(
+					files.map((file) => saveUploadedMedia("retry-parent", file)),
+				);
+				const text =
+					turn === "media-only" || turn === "mailbox" ? "" : "Inspect native attachments";
+				const persistedText = text || "[user sent media]";
+				if (turn === "mailbox") {
+					const { enqueueBufferedMessage } = await import("../narrator-buffer");
+					expect(
+						(
+							await enqueueBufferedMessage(
+								id,
+								text,
+								undefined,
+								undefined,
+								undefined,
+								undefined,
+								undefined,
+								undefined,
+								undefined,
+								undefined,
+								undefined,
+								undefined,
+								undefined,
+								undefined,
+								refs,
+							)
+						).ok,
+					).toBe(true);
+				} else if (kind === "subagent") {
+					await narratorService.persistSubagentUserMessage(id, persistedText, "origin-tool", {
+						media: refs,
+					});
+				} else
+					await narratorService.persistUserMessage(id, persistedText, [
+						...refs.map((ref) => mediaRefToContentBlock(ref)),
+						{ type: "text", text },
+					]);
+				if (turn === "sys-tail")
+					await narratorService.persistSystemMessage(
+						id,
+						marker,
+						undefined,
+						undefined,
+						undefined,
+						kind === "subagent" ? { parentToolUseId: "origin-tool" } : undefined,
+					);
+				const packets: string[] = [];
+				let emptyPasses = 0;
+				spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
+					expect(options.media).toBeUndefined();
+					const packet = JSON.stringify(options.history.built);
+					if (turn === "mailbox" && !packet.includes(bytes[0].toString("base64"))) {
+						expect(++emptyPasses).toBe(1);
+						return {
+							finalText: "ready",
+							hasError: false,
+							shouldUpdateTitle: false,
+							completedNaturally: true,
+							completedAssistantTurn: true,
+						};
+					}
+					for (const data of bytes) expect(packet.split(data.toString("base64"))).toHaveLength(2);
+					packets.push(packet);
+					if (packets.length > 2) throw new Error("Unexpected extra native media attempt");
+					return packets.length === 1
+						? { finalText: "", hasError: false, shouldUpdateTitle: false, silentDisconnect: true }
+						: {
+								finalText: "finished",
+								hasError: false,
+								shouldUpdateTitle: false,
+								completedNaturally: true,
+								completedAssistantTurn: true,
+							};
+				});
+				const retry = spyOn(recovery, "handleTransientError").mockResolvedValue({
+					shouldRetry: true,
+					delayMs: 0,
+				});
+				const active = session(id, model, prefix);
+				activeNarrators.set(id, active);
+				const owner = tryClaimExecution(id, "run");
+				if (!owner) throw new Error("Missing native-media owner");
+				const result = await runAgentLoopUnlocked(
+					active,
+					owner,
+					turn === "mailbox" ? "" : persistedText,
+					undefined,
+					undefined,
+					undefined,
+					turn === "mailbox" ? undefined : refs,
+				);
+				expect(result.hasError).toBe(false);
+				expect(result.finalText).toBe("finished");
+				expect(packets).toHaveLength(2);
+				expect(packets[1]).toBe(packets[0]);
+				expect(retry).toHaveBeenCalledTimes(1);
+				const rows = await db
+					.select()
+					.from(narratorMessages)
+					.where(eq(narratorMessages.narratorId, id));
+				const users = rows.filter((row) => row.role === "user");
+				expect(users).toHaveLength(1);
+				for (const ref of refs)
+					expect(users[0].contentJson).toContainEqual(mediaRefToContentBlock(ref));
+				for (const data of bytes)
+					expect(JSON.stringify(rows)).not.toContain(data.toString("base64"));
+				expect(JSON.stringify(rows)).not.toContain('"base64"');
+			});
+		}
+	}
+});
+
+describe("unsupported native media preserves refs across retries and model changes", () => {
+	for (const kind of ["primary", "subagent"] as const)
+		for (const lane of ["current", "history"] as const)
+			for (const modality of ["audio", "video"] as const) {
+				test(`${kind} / ${lane} / ${modality}: fallback once then native replay`, async () => {
+					const prefix = "runtime_media_fallback";
+					const model = `${prefix}:gpt-5`;
+					const capablePrefix = "runtime_media_capable";
+					const capableModel = `${capablePrefix}:gemini-2.5-flash`;
+					settings.openaiProviders = [
+						{
+							id: prefix,
+							name: prefix,
+							prefix,
+							apiKey: "test-only",
+							baseUrl: "https://example.invalid/v1",
+							defaultModel: "gpt-5",
+							apiMode: "responses",
+						},
+					];
+					settings.geminiProviders = [
+						{
+							id: capablePrefix,
+							name: capablePrefix,
+							prefix: capablePrefix,
+							apiKey: "test-only",
+							baseUrl: "https://example.invalid/v1beta",
+							defaultModel: "gemini-2.5-flash",
+						},
+					];
+					mediaTestDir = mkdtempSync(join(tmpdir(), "runtime-media-fallback-"));
+					setUploadsDirForTests(mediaTestDir);
+					const id = kind === "primary" ? "retry-primary" : "retry-child";
+					const now = new Date().toISOString();
+					for (const target of ["retry-parent", id])
+						await seedNarrator({
+							id: target,
+							type: target === "retry-child" ? "subagent" : "primary",
+							variant: target === "retry-child" ? "subagent:general" : "primary",
+							parentNarratorId: target === "retry-child" ? "retry-parent" : null,
+							runtimeRegistrationJson: target === "retry-child" ? delegatedRegistration : null,
+							traits: target === "retry-child" ? delegatedTraits : [],
+							model,
+							cwd: process.env.HOME,
+							autoContinuationOverride: "off",
+							createdAt: now,
+							updatedAt: now,
+						});
+					const bytes = modality === "audio" ? wavBytes() : webmBytes([7, 8]);
+					const file = new File(
+						[new Uint8Array(bytes)],
+						modality === "audio" ? "voice.wav" : "clip.webm",
+						{ type: modality === "audio" ? "audio/wav" : "video/webm" },
+					);
+					const ref = await saveUploadedMedia("retry-parent", file);
+					const block = mediaRefToContentBlock(ref);
+					if (kind === "subagent")
+						await narratorService.persistSubagentUserMessage(
+							id,
+							"[user sent media]",
+							"origin-tool",
+							{ media: [ref] },
+						);
+					else
+						await narratorService.persistUserMessage(id, "[user sent media]", [
+							block,
+							{ type: "text", text: "" },
+						]);
+					const broadcast = spyOn(ws, "broadcastToNarrator").mockImplementation(() => {});
+					const packets: string[] = [];
+					const execute = spyOn(executor, "executeAgentLoop").mockImplementation(
+						async (options) => {
+							expect(options.media).toBeUndefined();
+							const texts = historyStrings(options.history.built);
+							const key = `"mediaId":${JSON.stringify(ref.mediaId)}`;
+							expect(texts.split(key)).toHaveLength(2);
+							expect(texts).toContain("当前模型未读取该文件的音视频内容");
+							expect(texts).toContain(JSON.stringify(getMediaPath("retry-parent", ref.mediaId)));
+							expect(texts).toContain(file.name);
+							expect(texts).toContain(file.type);
+							expect(texts).toContain(`"size":${file.size}`);
+							const packet = JSON.stringify(options.history.built);
+							expect(packet).not.toContain(bytes.toString("base64"));
+							packets.push(packet);
+							if (packets.length > 2) throw new Error("Unexpected fallback retry");
+							return packets.length === 1
+								? {
+										finalText: "",
+										hasError: false,
+										shouldUpdateTitle: false,
+										retryableError: "fallback transient failure",
+									}
+								: {
+										finalText: "fallback finished",
+										hasError: false,
+										shouldUpdateTitle: false,
+										completedNaturally: true,
+										completedAssistantTurn: true,
+									};
+						},
+					);
+					const retry = spyOn(recovery, "handleTransientError").mockResolvedValue({
+						shouldRetry: true,
+						delayMs: 0,
+					});
+					let active = session(id, model, prefix);
+					active.locale = "zh-CN";
+					activeNarrators.set(id, active);
+					let owner = tryClaimExecution(id, "run");
+					if (!owner) throw new Error("Missing fallback owner");
+					const result = await runAgentLoopUnlocked(
+						active,
+						owner,
+						"[user sent media]",
+						undefined,
+						undefined,
+						undefined,
+						lane === "current" ? [ref] : undefined,
+					);
+					expect(result.finalText).toBe("fallback finished");
+					expect(result.hasError).toBe(false);
+					expect(packets).toHaveLength(2);
+					expect(retry).toHaveBeenCalledTimes(1);
+					const warnings = () =>
+						broadcast.mock.calls.filter(
+							([target, event]) =>
+								target === id &&
+								event.type === "warning" &&
+								event.warningCode === "native_media_fallback",
+						);
+					expect(warnings()).toHaveLength(1);
+					const warning = warnings()[0]?.[1];
+					if (warning?.type !== "warning") throw new Error("Missing native fallback warning");
+					expect(warning.message).toContain("未读取音视频内容");
+					const rows = await db
+						.select()
+						.from(narratorMessages)
+						.where(eq(narratorMessages.narratorId, id));
+					const users = rows.filter((row) => row.role === "user");
+					expect(users).toHaveLength(1);
+					expect(users[0].contentJson).toContainEqual(block);
+					expect(JSON.stringify(rows)).not.toContain("nativeMediaFallback");
+					expect(JSON.stringify(rows)).not.toContain('"base64"');
+					owner.release();
+					activeNarrators.delete(id);
+					await db.update(narrators).set({ model: capableModel }).where(eq(narrators.id, id));
+					execute.mockImplementation(async (options) => {
+						expect(options.media).toBeUndefined();
+						expect(
+							JSON.stringify(options.history.built).split(bytes.toString("base64")),
+						).toHaveLength(2);
+						expect(JSON.stringify(options.history.built)).not.toContain("回退到一般文件");
+						return {
+							finalText: "native restored",
+							hasError: false,
+							shouldUpdateTitle: false,
+							completedNaturally: true,
+							completedAssistantTurn: true,
+						};
+					});
+					active = session(id, capableModel, capablePrefix);
+					activeNarrators.set(id, active);
+					owner = tryClaimExecution(id, "run");
+					if (!owner) throw new Error("Missing native-restoration owner");
+					expect(
+						(
+							await runAgentLoopUnlocked(
+								active,
+								owner,
+								"[user sent media]",
+								undefined,
+								undefined,
+								undefined,
+								[ref],
+							)
+						).finalText,
+					).toBe("native restored");
+					expect(warnings()).toHaveLength(1);
+					const unchanged = await db
+						.select()
+						.from(narratorMessages)
+						.where(eq(narratorMessages.id, users[0].id));
+					expect(unchanged[0].contentJson).toEqual(users[0].contentJson);
+				});
+			}
+});
+
+for (const kind of ["primary", "subagent"] as const)
+	test(`native media real bodyFormat2 tool ledger replays after database reload (${kind})`, async () => {
+		const prefix = "runtime_tool_media";
+		const model = `${prefix}:gemini-2.5-flash`;
+		settings.geminiProviders = [
+			{
+				id: prefix,
+				name: prefix,
+				prefix,
+				apiKey: "test-only",
+				baseUrl: "https://example.invalid/v1beta",
+				defaultModel: "gemini-2.5-flash",
+			},
+		];
+		mediaTestDir = mkdtempSync(join(tmpdir(), "runtime-tool-ledger-media-"));
+		setUploadsDirForTests(mediaTestDir);
+		const id = kind === "primary" ? "retry-primary" : "retry-child";
+		const now = new Date().toISOString();
+		for (const target of ["retry-parent", id])
+			await seedNarrator({
+				id: target,
+				type: target === "retry-child" ? "subagent" : "primary",
+				variant: target === "retry-child" ? "subagent:general" : "primary",
+				parentNarratorId: target === "retry-child" ? "retry-parent" : null,
+				runtimeRegistrationJson: target === "retry-child" ? delegatedRegistration : null,
+				traits: target === "retry-child" ? delegatedTraits : [],
+				model,
+				cwd: process.env.HOME,
+				autoContinuationOverride: "off",
+				createdAt: now,
+				updatedAt: now,
+			});
+		const bytes = wavBytes();
+		const ref = await saveUploadedMedia(
+			"retry-parent",
+			new File([new Uint8Array(bytes)], "ledger.wav", { type: "audio/wav" }),
+		);
+		const block = mediaRefToContentBlock(ref);
+		const { processEvent } = await import("../narrator-event-handler");
+		spyOn(executor, "executeAgentLoop").mockImplementation(async (options) => {
+			await processEvent(
+				{
+					type: "assistant_message",
+					text: "",
+					toolUses: [
+						{ toolUseId: "read-ledger", name: "Read", input: { file_path: "ledger.wav" } },
+					],
+				},
+				options.eventContext,
+				options.hooks,
+			);
+			await processEvent(
+				{
+					type: "tool_call",
+					toolUseId: "read-ledger",
+					toolName: "Read",
+					input: { file_path: "ledger.wav" },
+				},
+				options.eventContext,
+				options.hooks,
+			);
+			await processEvent(
+				{
+					type: "tool_result",
+					toolUseId: "read-ledger",
+					toolName: "Read",
+					output: "Native audio attachment",
+					mediaRefs: [block],
+					isError: false,
+				},
+				options.eventContext,
+				options.hooks,
+			);
+			return {
+				finalText: "persisted",
+				hasError: false,
+				shouldUpdateTitle: false,
+				completedNaturally: true,
+				completedAssistantTurn: true,
+			};
+		});
+		const active = session(id, model, prefix);
+		activeNarrators.set(id, active);
+		const owner = tryClaimExecution(id, "run");
+		if (!owner) throw new Error("Missing ledger owner");
+		expect((await runAgentLoopUnlocked(active, owner, "read audio")).hasError).toBe(false);
+		const stored = await db
+			.select()
+			.from(narratorMessages)
+			.where(eq(narratorMessages.narratorId, id));
+		const calls = await db
+			.select()
+			.from(narratorToolCalls)
+			.where(eq(narratorToolCalls.narratorId, id));
+		expect(calls).toHaveLength(1);
+		expect(calls[0].outputJson).toMatchObject({ _media: [block] });
+		const message = stored.find((entry) => entry.id === calls[0].messageId);
+		expect(message?.bodyFormat).toBe(2);
+		const ledger = await db
+			.select()
+			.from(narratorBlocks)
+			.where(eq(narratorBlocks.messageId, calls[0].messageId));
+		expect(ledger.some((entry) => entry.kind === "tool" && entry.subtype === "Read")).toBe(true);
+		for (const payload of [stored, calls, ledger])
+			expect(JSON.stringify(payload)).not.toContain(bytes.toString("base64"));
+		const before = JSON.stringify([stored, calls, ledger]);
+		const { buildRuntimeHistory } = await import("../agent-runtime/history");
+		const reloaded = await buildRuntimeHistory({ narratorId: id, model, provider: prefix });
+		expect(JSON.stringify(reloaded.history).split(bytes.toString("base64"))).toHaveLength(2);
+		expect(JSON.stringify(reloaded.modelMessages)).toContain(ref.mediaId);
+		expect(
+			JSON.stringify([
+				await db.select().from(narratorMessages).where(eq(narratorMessages.narratorId, id)),
+				await db.select().from(narratorToolCalls).where(eq(narratorToolCalls.narratorId, id)),
+				await db
+					.select()
+					.from(narratorBlocks)
+					.where(eq(narratorBlocks.messageId, calls[0].messageId)),
+			]),
+		).toBe(before);
+	});
 
 describe("subagent transient-retry recovery notifies the parent", () => {
 	// Regression: the unified runtime dropped the recovery broadcast, so a subagent

@@ -1,3 +1,4 @@
+import type { NativeMediaInput } from "@shared/media-attachments";
 import { hasCredentialBoundReasoning } from "@shared/reasoning-credentials";
 import { logger } from "../logger";
 import { resolveProxyForUrl } from "../net/proxy";
@@ -10,7 +11,14 @@ import { getHttpUserAgent, resolveClientFingerprint } from "../user-agent";
 import { fetchWithNetworkDiagnostics } from "./diagnostic-fetch";
 import { parseErrorDiagnostics } from "./error-diagnostics";
 import { isCompletionLimitReason } from "./error-handling";
+import { GeminiMediaFiles } from "./gemini-media-files";
 import { reportInputCharacters } from "./input-characters";
+import {
+	geminiInlineMedia,
+	redactNativeMediaForDump,
+	storedMessageMedia,
+	supportsNativeMediaProtocolInput,
+} from "./native-media";
 import { buildOpencodeSessionHeader } from "./opencode-session";
 import { type NeutralTurn, projectHistory, webSearchSummary } from "./projection";
 import type {
@@ -69,6 +77,7 @@ interface GeminiFunctionResponse {
 interface GeminiPart {
 	text?: string;
 	inlineData?: GeminiInlineData;
+	fileData?: { mimeType: string; fileUri: string };
 	functionCall?: GeminiFunctionCall;
 	functionResponse?: GeminiFunctionResponse;
 	/** Reasoning marker — parts with thought:true carry the model's thinking text. */
@@ -99,6 +108,37 @@ interface GeminiFunctionDeclaration {
 interface GeminiToolResult {
 	name: string;
 	response: Record<string, unknown>;
+	mediaParts?: GeminiPart[];
+	toolUseId?: string;
+}
+
+function isGeminiNativeMediaPart(part: GeminiPart): boolean {
+	const mime = part.inlineData?.mimeType ?? part.fileData?.mimeType;
+	return !!mime && /^(audio|video)\//.test(mime);
+}
+
+function geminiToolResultParts(results: GeminiToolResult[]): GeminiPart[] {
+	return [
+		...results.map((tr) => ({
+			functionResponse: {
+				name: tr.name,
+				response:
+					tr.toolUseId && tr.mediaParts?.some(isGeminiNativeMediaPart)
+						? { ...tr.response, toolCallId: tr.toolUseId }
+						: tr.response,
+			},
+		})),
+		...results.flatMap((tr) =>
+			(tr.mediaParts ?? []).flatMap((part) => {
+				return tr.toolUseId && isGeminiNativeMediaPart(part)
+					? [
+							{ text: `Tool result media source: ${JSON.stringify({ toolCallId: tr.toolUseId })}` },
+							part,
+						]
+					: [part];
+			}),
+		),
+	];
 }
 
 // === SSE response types ===
@@ -142,12 +182,18 @@ function assertByteLimit(value: string, limit: number, label: string): void {
  */
 export class GeminiProvider implements ProviderAdapter {
 	private config: GeminiProviderConfig;
+	private mediaFiles: GeminiMediaFiles;
 
 	constructor(
 		config: GeminiProviderConfig,
 		private transport?: ProviderTransport,
 	) {
 		this.config = config;
+		this.mediaFiles = new GeminiMediaFiles({
+			baseUrl: this.baseUrl(),
+			apiKey: config.apiKey,
+			fetch: (input, init) => this.pfetch(input, init),
+		});
 	}
 
 	private pfetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
@@ -218,11 +264,19 @@ export class GeminiProvider implements ProviderAdapter {
 		return [{ functionDeclarations }];
 	}
 
+	supportsNativeMediaInput(
+		media: Pick<NativeMediaInput, "type" | "mediaType" | "filename">,
+		model: string,
+	): boolean {
+		return supportsNativeMediaProtocolInput("generate", media, model);
+	}
+
 	async buildHistory(
 		dbMessages: DbMessage[],
 		model: string,
 		narratorId?: string,
 	): Promise<BuiltHistory> {
+		assertModelInputModalities(model, dbMessages.flatMap(storedMessageMedia));
 		const projected = await projectHistory(
 			dbMessages,
 			{
@@ -273,13 +327,13 @@ export class GeminiProvider implements ProviderAdapter {
 		const { systemInstruction, contents } = splitSystemAndContents(rawHistory);
 
 		// Append trailing tool results as a user turn with functionResponse parts.
-		const toolResultParts: GeminiPart[] = (params.toolResults as GeminiToolResult[]).map((tr) => ({
-			functionResponse: { name: tr.name, response: tr.response },
-		}));
+		const toolResultParts = geminiToolResultParts((params.toolResults ?? []) as GeminiToolResult[]);
 
 		// Append current user message (skip "." continuation markers).
 		const hasText = !!params.content && params.content !== ".";
 		const userParts = geminiUserParts(hasText ? params.content : "", params.images);
+
+		userParts.push(...(params.media ?? []).map(geminiInlineMedia));
 
 		if (toolResultParts.length > 0) {
 			contents.push({ role: "user", parts: toolResultParts });
@@ -304,7 +358,7 @@ export class GeminiProvider implements ProviderAdapter {
 		);
 		if (thinkingConfig) generationConfig.thinkingConfig = thinkingConfig;
 
-		const body: Record<string, unknown> = { contents };
+		let body: Record<string, unknown> = { contents };
 		if (systemInstruction) {
 			body.systemInstruction = { parts: [{ text: systemInstruction }] };
 		}
@@ -316,6 +370,7 @@ export class GeminiProvider implements ProviderAdapter {
 		}
 
 		assertModelInputModalities(params.model, body, metadata);
+		body = await this.mediaFiles.prepare(body, "generate", params.signal);
 		const url = `${baseUrl}/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`;
 		const headers = this.headers(apiKey, params.conversationId);
 
@@ -336,7 +391,7 @@ export class GeminiProvider implements ProviderAdapter {
 			method: "POST",
 			url,
 			headers: sanitizeHeaders(headers),
-			bodyText,
+			bodyText: JSON.stringify(redactNativeMediaForDump(body)),
 		});
 		params.onRequestStart?.();
 		params.streamProgress?.beginAttempt();
@@ -537,6 +592,7 @@ export class GeminiProvider implements ProviderAdapter {
 						item.text,
 						item.images.flatMap((image) => (image ? [image] : [])),
 					);
+					parts.push(...(item.media ?? []).map(geminiInlineMedia));
 					if (parts.length) history.push({ role: "user", parts });
 				}
 				continue;
@@ -544,12 +600,27 @@ export class GeminiProvider implements ProviderAdapter {
 			if (turn.kind === "tool_results") {
 				history.push({
 					role: "user",
-					parts: turn.results.map((result) => ({
-						functionResponse: {
-							name: result.name,
-							response: result.isError ? { error: result.text } : { output: result.text },
-						},
-					})),
+					parts: [
+						...turn.results.map(
+							(result): GeminiPart => ({
+								functionResponse: {
+									name: result.name,
+									response: {
+										...(result.isError ? { error: result.text } : { output: result.text }),
+										...(result.media?.length ? { toolCallId: result.wireId } : {}),
+									},
+								},
+							}),
+						),
+						...turn.results.flatMap((result) =>
+							(result.media ?? []).flatMap((media) => [
+								{
+									text: `Tool result media source: ${JSON.stringify({ toolCallId: result.wireId })}`,
+								},
+								geminiInlineMedia(media),
+							]),
+						),
+					],
 				});
 				continue;
 			}

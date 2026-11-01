@@ -17,6 +17,7 @@ import {
 } from "@shared/buffer-queue-mode";
 import type { ComposerDocument } from "@shared/composer-document";
 import type { FileReference, FileReferenceSnapshot } from "@shared/file-reference";
+import type { MediaRef } from "@shared/media-attachments";
 import { MAX_EDIT_TEXT_FILES_PER_MESSAGE, MAX_TEXT_FILE_SIZE } from "@shared/text-file-types";
 import { and, asc, desc, eq, inArray } from "drizzle-orm";
 import { db } from "../db";
@@ -62,6 +63,18 @@ const STAGING_RECONCILE_ATTEMPTS = 3;
 const STAGING_RECONCILE_DELAYS_MS = [0, 25, 100] as const;
 const store = createMailboxStore(db);
 const pending = ["queued", "failed"] as const;
+
+/** Runtime callers can carry extra fields; only portable references enter the queue. */
+function copyMediaRef(item: MediaRef, fallbackNarratorId?: string): MediaRef {
+	const uploadNarratorId = item.uploadNarratorId || fallbackNarratorId;
+	return {
+		mediaId: item.mediaId,
+		filename: item.filename,
+		mediaType: item.mediaType,
+		size: item.size,
+		...(uploadNarratorId ? { uploadNarratorId } : {}),
+	};
+}
 
 type StagingAwareMailbox = RuntimeQueuePort["mailbox"] & RuntimeMailboxStagingLookup;
 type StagingResolution =
@@ -491,6 +504,9 @@ export function projectMailboxUserMessage(row: RuntimeMailboxRow): BufferedMessa
 				: undefined;
 		},
 		images: json<ImageRef[] | undefined>(row.imagesJson, undefined),
+		media: json<MediaRef[] | undefined>(row.mediaJson, undefined)?.map((item) =>
+			copyMediaRef(item, row.narratorId),
+		),
 		get fileReferences() {
 			return freezeFileReferenceSnapshots(
 				metadata.fileReferencesPath
@@ -634,6 +650,7 @@ export async function enqueueBufferedMessage(
 	executionIntent?: BufferedMessage["executionIntent"],
 	queueMode?: BufferQueueMode,
 	composerDocument?: ComposerDocument,
+	media?: MediaRef[],
 ): Promise<{ ok: boolean; bufferedAt: string; id: string; full?: boolean }> {
 	composerDocument = parseOptionalComposerDocument(composerDocument);
 	validateComposerProjection(
@@ -641,10 +658,11 @@ export async function enqueueBufferedMessage(
 		text,
 		(fileReferences ?? []).map((snapshot) => snapshot.reference),
 	);
-	validateComposerAssets(composerDocument, images ?? [], textFiles ?? []);
+	validateComposerAssets(composerDocument, images ?? [], textFiles ?? [], media ?? []);
 	const stagingId = generateShortId();
 	const refs = freezeFileReferenceSnapshots(fileReferences);
 	images = images?.map((image) => ({ ...image }));
+	media = media?.map((item) => copyMediaRef(item, narratorId));
 	creator = creator ? { ...creator } : creator;
 	textFiles = textFiles ? [...textFiles] : undefined;
 	let saved: SavedBufferedFile[] = [];
@@ -703,6 +721,7 @@ export async function enqueueBufferedMessage(
 			commandText,
 			bashCommand,
 			imagesJson: images?.length ? JSON.stringify(images) : null,
+			mediaJson: media?.length ? JSON.stringify(media) : null,
 			creatorJson: creator ? JSON.stringify(creator) : null,
 			textFilePathsJson: saved.length ? JSON.stringify(saved) : null,
 			fileReferencesJson,
@@ -810,6 +829,7 @@ export async function enqueueBufferedMessage(
 export interface BufferedMessageAttachmentUpdate {
 	composerDocument?: ComposerDocument;
 	images?: ImageRef[];
+	media?: MediaRef[];
 	textFiles?: File[];
 	savedFiles?: SavedBufferedFile[];
 	fileReferences?: FileReferenceSnapshot[];
@@ -842,6 +862,7 @@ export async function updateBufferedMessage(
 		opts.textFiles ??
 			(opts.savedFiles ? loadBufferedTextFiles(opts.savedFiles) : current.textFiles) ??
 			[],
+		opts.media ?? current.media ?? [],
 	);
 	const bytes = Buffer.byteLength(text);
 	if (bytes > MAX_BUFFERED_PAYLOAD_BYTES)
@@ -850,6 +871,7 @@ export async function updateBufferedMessage(
 	opts = {
 		...opts,
 		images: opts.images?.map((image) => ({ ...image })),
+		media: opts.media?.map((item) => copyMediaRef(item, narratorId)),
 		savedFiles: opts.savedFiles?.map((file) => ({ ...file })),
 		fileReferences:
 			opts.fileReferences === undefined
@@ -907,6 +929,12 @@ export async function updateBufferedMessage(
 				: opts.images.length
 					? JSON.stringify(opts.images)
 					: null;
+		const mediaJson =
+			opts.media === undefined
+				? row.mediaJson
+				: opts.media.length
+					? JSON.stringify(opts.media)
+					: null;
 		const textFilePathsJson =
 			opts.savedFiles === undefined
 				? row.textFilePathsJson
@@ -917,6 +945,7 @@ export async function updateBufferedMessage(
 		if (
 			[
 				imagesJson,
+				mediaJson,
 				textFilePathsJson,
 				fileReferencesJson,
 				metadataJson,
@@ -937,6 +966,7 @@ export async function updateBufferedMessage(
 						byteSize: bytes,
 						payloadRefJson,
 						imagesJson,
+						mediaJson,
 						textFilePathsJson,
 						fileReferencesJson,
 						metadataJson,
@@ -955,6 +985,7 @@ export async function updateBufferedMessage(
 								bufferedAt: new Date().toISOString(),
 								updatedAt: new Date().toISOString(),
 								imagesJson,
+								mediaJson,
 								textFilePathsJson,
 								fileReferencesJson,
 								metadataJson,
@@ -1301,6 +1332,7 @@ export interface BufferMessageSummary {
 	bufferedAt: string;
 	imageCount: number;
 	images: BufferedImageSummary[];
+	media: MediaRef[];
 	textFiles: BufferedTextFileSummary[];
 	fileReferences: FileReference[];
 	creator?: BufferCreator | null;
@@ -1315,6 +1347,7 @@ export function toBufferSummary(
 		| "text"
 		| "bufferedAt"
 		| "images"
+		| "media"
 		| "textFiles"
 		| "_savedFiles"
 		| "creator"
@@ -1338,6 +1371,7 @@ export function toBufferSummary(
 		})(),
 		bufferedAt: m.bufferedAt,
 		imageCount: m.images?.length ?? 0,
+		media: (m.media ?? []).map((item) => copyMediaRef(item)),
 		images: (m.images ?? []).map((image) => ({
 			imageId: image.imageId,
 			filename: image.filename,

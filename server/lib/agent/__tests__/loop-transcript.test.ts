@@ -4,6 +4,7 @@
  */
 
 import { describe, expect, test } from "bun:test";
+import type { MediaContentBlock } from "@shared/media-attachments";
 import { AnthropicProvider } from "../anthropic-provider";
 import { buildAdapterHistory, historyTail } from "../history-build";
 import { LoopTranscript } from "../loop-transcript";
@@ -26,6 +27,45 @@ function toolStep(transcript: LoopTranscript, ids: string[]) {
 }
 
 describe("loop transcript", () => {
+	const media: MediaContentBlock = {
+		type: "audio",
+		mediaId: "durable-audio",
+		filename: "recording.wav",
+		mediaType: "audio/wav",
+		size: 46,
+		uploadNarratorId: "original-owner",
+	};
+
+	test("media-only input keeps durable original refs without storing provider bytes", () => {
+		const transcript = new LoopTranscript();
+		const pending = transcript.withInput("", undefined, [media]);
+		expect(transcript.rows).toEqual([]);
+		expect(pending[0]?.contentJson).toEqual([media]);
+		transcript.appendInput("", undefined, [media]);
+		expect(transcript.rows[0]?.contentJson).toEqual([media]);
+		media.filename = "changed-after-snapshot.wav";
+		expect(pending[0]?.contentJson).toMatchObject([{ filename: "recording.wav" }]);
+		media.filename = "recording.wav";
+		expect(JSON.stringify(transcript.rows)).not.toContain("base64");
+	});
+
+	test("settled media is stored in the canonical tool output envelope and broken calls omit it", () => {
+		const transcript = new LoopTranscript();
+		toolStep(transcript, ["media", "bad"]);
+		const before = transcript.rows;
+		transcript.settleTool("media", { output: "audio read", mediaRefs: [media] });
+		transcript.settleTool("bad", { output: "broken", broken: true, mediaRefs: [media] });
+		expect(before[0]?.toolCalls?.[0]?.outputJson).toBeNull();
+		expect(transcript.rows[0]?.toolCalls?.[0]?.outputJson).toEqual({
+			_text: "audio read",
+			_media: [media],
+		});
+		expect(transcript.rows[0]?.toolCalls?.[1]?.outputJson).toEqual({
+			_text: "broken",
+			_broken: true,
+		});
+	});
+
 	test("a call reaches the model only together with its result, in call order", async () => {
 		const transcript = new LoopTranscript();
 		transcript.appendInput("read both");

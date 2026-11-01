@@ -27,7 +27,9 @@ import {
 import { revealComposerQuote, revealQuotedFile } from "../../composer/quote-jump";
 import { QUOTE_ROLE_ATTR } from "../../composer/quote-source-attrs";
 import { useNarratorDockContext } from "../../dock/NarratorDockContext";
+import { MediaAttachment } from "../../message/MediaAttachment";
 import { TOOL_HEADER_SELECT_ATTR } from "../../message/MessageSelectionCtx";
+import type { ContentBlock } from "../../narrator-panel-types";
 import {
 	ASSISTANT_PAD_X,
 	ASSISTANT_PAD_Y,
@@ -984,6 +986,22 @@ function UserAttachmentView({
 	const dock = useNarratorDockContext();
 	const data = block.data ?? {};
 	const str = (v: unknown): string | undefined => (typeof v === "string" && v ? v : undefined);
+	if (block.tag === "user-audio" || block.tag === "user-video") {
+		return (
+			<div
+				style={{
+					position: "absolute",
+					top,
+					left,
+					height: block.height,
+					width: block.displayWidth,
+					maxWidth: "100%",
+				}}
+			>
+				<MediaAttachment narratorId={narratorId ?? ""} block={data as ContentBlock} />
+			</div>
+		);
+	}
 	if (block.tag === "user-text-file" || block.tag === "user-file-reference") {
 		// The path is a height-neutral passthrough from measure; when both it and a
 		// host handler exist the row becomes clickable WITHOUT changing its box.
