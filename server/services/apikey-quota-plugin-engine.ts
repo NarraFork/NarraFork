@@ -1,5 +1,3 @@
-import { existsSync } from "node:fs";
-import { join } from "node:path";
 import {
 	APIKEY_QUOTA_PLUGIN_ID,
 	APIKEY_QUOTA_TOOL_ID,
@@ -15,158 +13,79 @@ import {
 	type ProviderBalanceQueryEngine,
 	type ProviderBalanceRefreshInput,
 } from "../lib/provider-balance-engine";
-import { settings } from "../lib/settings";
 import { getHttpUserAgent, resolveHttpUserAgent } from "../lib/user-agent";
-import { LocalProcessRunner, PluginRuntime } from "./plugin-runtime";
+import { pluginPlatformServices } from "./plugin-platform-services";
 
 /**
  * Quota queries answered by the bundled `apikey-quota` plugin.
  *
- * The plugin ships with the application (`server/builtin-plugins/apikey-quota`) and runs in
- * its own process, but it is **not** an installed plugin: there is no package store record,
- * no capability grant and no admin install step, so it can be enabled by default on a fresh
- * instance. Its authority is therefore one host setting — `plugins.apikeyQuotaEnabled`.
+ * This engine is deliberately thin: it does not own a process, a connection or a restart
+ * policy. It calls the plugin through the *same* tool registry every other plugin tool goes
+ * through (`pluginToolRegistry.invoke` with a `plugin_background` principal), so the process
+ * lifecycle, capability check, byte limits, timeouts and health accounting are the shared
+ * ones. What stays here is only what is specific to this feature: the decision table that maps
+ * a plugin answer onto the provider-balance DTO, and the fallback to the bundled adapters.
  *
- * Decision table (deliberately identical to the previous installable-plugin version):
- * - plugin answers `ok` / `unsupported` -> authoritative, the bundled adapters do not run.
- * - `failed` -> surfaces as the existing transient/unsupported probe error.
- * - disabled, not shipped, cannot start, or output fails validation -> bundled adapters,
- *   which is exactly the pre-plugin behaviour. Nothing is reported to the user.
+ * Decision table:
+ * - `ok` / `unsupported` -> authoritative; the bundled adapters do not run.
+ * - `failed` -> the existing transient/unsupported probe error.
+ * - plugin disabled, unavailable, not registered, or output fails validation -> bundled
+ *   adapters, which is exactly the pre-plugin behaviour. Nothing is reported to the user.
  */
 const FULL_TOOL_ID = `${APIKEY_QUOTA_PLUGIN_ID}/${APIKEY_QUOTA_TOOL_ID}`;
-const PLUGIN_DIR = join(import.meta.dir, "../builtin-plugins/apikey-quota");
 const REQUEST_TIMEOUT_MS = 15_000;
-/**
- * How long the process may sit unused before it is reaped.
- *
- * Deliberately not the request timeout: quota probes are minutes apart (`providerBalanceCache`
- * refreshes on its own schedule), so a request-sized idle window would reap the process after
- * every single probe and make the plugin pay a spawn on every call. Reaping is still normal —
- * the engine restarts on demand (see `ensureRuntime`) — this just keeps a warm process for the
- * common interval instead of one that is almost always gone.
- */
-const IDLE_TIMEOUT_MS = 5 * 60_000;
 
-/** The slice of `PluginRuntime` this engine needs; tests inject a fake. */
-export interface QuotaPluginRuntime {
-	start(signal?: AbortSignal): Promise<void>;
-	request<T = unknown>(method: string, params?: unknown, options?: unknown): Promise<T>;
-	shutdown(): Promise<void>;
-	/** Fires when the process goes away on its own (idle reap, crash, broken pipe). */
-	onClose?(handler: (error?: Error) => void): () => void;
+/** The tool-registry slice this engine needs; tests inject a fake. */
+export interface QuotaToolInvoker {
+	invoke(
+		fullId: string,
+		input: unknown,
+		options?: Record<string, unknown>,
+	): Promise<{ output?: unknown; isError?: unknown }>;
+}
+
+/** The manager slice this engine needs: activation is what registers the tool. */
+export interface QuotaPluginActivator {
+	activate(pluginId: string, options?: Record<string, unknown>): Promise<unknown>;
 }
 
 export interface ApikeyQuotaEngineOptions {
-	/** Defaults to `settings.plugins.apikeyQuotaEnabled`. */
-	isEnabled?: () => boolean;
-	/** Defaults to spawning the bundled package over stdio. */
-	createRuntime?: () => QuotaPluginRuntime;
+	tools?: QuotaToolInvoker;
+	activator?: QuotaPluginActivator;
 	fallback?: ProviderBalanceQueryEngine;
 	onDiagnostic?: (message: string, detail: Record<string, unknown>) => void;
 }
 
-export interface BuiltinApikeyQuotaEngine extends ProviderBalanceQueryEngine {
-	/** Stops the plugin process; called from the host shutdown sequence. */
+export type ApikeyQuotaEngine = ProviderBalanceQueryEngine & {
+	/** Kept for the host shutdown sequence; the registry owns the process now. */
 	dispose(): Promise<void>;
+};
+
+/**
+ * Activation hook.
+ *
+ * `PluginManager` imports the platform services, so importing it back into this module would
+ * close a cycle. The host installs the activator once at startup instead; until then the engine
+ * simply has no plugin to activate and answers from the bundled adapters.
+ */
+let installedActivator: QuotaPluginActivator | undefined;
+
+export function setApikeyQuotaActivation(activator: QuotaPluginActivator | undefined): void {
+	installedActivator = activator;
 }
 
-export function createApikeyQuotaEngine(
-	options: ApikeyQuotaEngineOptions = {},
-): BuiltinApikeyQuotaEngine {
-	const isEnabled = options.isEnabled ?? (() => settings.plugins?.apikeyQuotaEnabled !== false);
+export function createApikeyQuotaEngine(options: ApikeyQuotaEngineOptions = {}): ApikeyQuotaEngine {
 	const fallback = options.fallback ?? builtinProviderBalanceEngine;
 	const diagnose =
 		options.onDiagnostic ?? ((message, detail) => logger.info(`[apikey-quota] ${message}`, detail));
 
-	let runtime: QuotaPluginRuntime | undefined;
-	let starting: Promise<QuotaPluginRuntime | undefined> | undefined;
-
-	/** One process for the whole host lifetime; a failed start is retried on the next probe. */
-	async function ensureRuntime(signal: AbortSignal): Promise<QuotaPluginRuntime | undefined> {
-		if (!isEnabled()) {
-			await stopRuntime();
-			return undefined;
-		}
-		if (runtime) return runtime;
-		starting ??= (async () => {
-			try {
-				// `createRuntime` returning `undefined` means "no package to run" and must not
-				// silently fall through to spawning the bundled one.
-				const created = options.createRuntime ? options.createRuntime() : createBundledRuntime();
-				if (!created) return undefined;
-				await created.start(signal);
-				// A reaped or crashed process must never stay cached: the next probe would send
-				// into a closed pipe and fall back for the rest of the host's life.
-				created.onClose?.(() => {
-					if (runtime === created) runtime = undefined;
-				});
-				runtime = created;
-				return created;
-			} catch (error) {
-				diagnose("failed to start builtin plugin", {
-					error: error instanceof Error ? error.name : "unknown",
-				});
-				return undefined;
-			} finally {
-				starting = undefined;
-			}
-		})();
-		return starting;
-	}
-
-	async function stopRuntime(): Promise<void> {
-		const current = runtime;
-		runtime = undefined;
-		if (!current) return;
-		await current.shutdown().catch(() => undefined);
-	}
-
-	/** One plugin call. `undefined` means the plugin could not answer at all. */
-	async function callPlugin(
-		input: Record<string, unknown>,
-		signal: AbortSignal,
-	): Promise<ApikeyQuotaToolOutput | undefined> {
-		const active = await ensureRuntime(signal);
-		if (!active) return undefined;
-		try {
-			const result = await active.request<{ output?: unknown; isError?: unknown }>(
-				"tools.invoke",
-				{ contributionId: APIKEY_QUOTA_TOOL_ID, input },
-				{ signal, timeoutMs: REQUEST_TIMEOUT_MS },
-			);
-			const output = typeof result?.output === "string" ? result.output : undefined;
-			if (result?.isError === true || output === undefined) {
-				diagnose("plugin returned no usable output", { tool: FULL_TOOL_ID });
-				return undefined;
-			}
-			const parsed = apikeyQuotaToolOutputSchema.safeParse(parseJson(output));
-			if (!parsed.success) {
-				diagnose("plugin output failed validation", {
-					tool: FULL_TOOL_ID,
-					issues: parsed.error.issues.length,
-				});
-				return undefined;
-			}
-			return parsed.data;
-		} catch (error) {
-			// A crashed or unresponsive plugin must not wedge the balance cache: drop the
-			// process so the next probe can start a fresh one, and answer from the bundled
-			// adapters this round.
-			diagnose("plugin call failed", {
-				tool: FULL_TOOL_ID,
-				error: error instanceof Error ? error.name : "unknown",
-			});
-			await stopRuntime();
-			return undefined;
-		}
-	}
+	const tools = (): QuotaToolInvoker => options.tools ?? pluginPlatformServices.toolRegistry;
+	const activator = (): QuotaPluginActivator | undefined => options.activator ?? installedActivator;
 
 	/**
 	 * `probe`/`refresh` accept an injected `fetch`, which exists so tests can stub transport
-	 * without a network. A function cannot be serialized into another process, so a caller
-	 * that supplies one is by definition asking for in-process transport: that call runs the
-	 * bundled engine, and it says so. Production never sets this seam (`providerBalanceCache`
-	 * is constructed without `fetch`), so it cannot silently downgrade a real deployment.
+	 * without a network. That seam cannot cross into another process, so such a call runs the
+	 * bundled engine in-process and says so; production never sets it.
 	 */
 	function seamFallback(
 		mode: "probe",
@@ -184,6 +103,50 @@ export function createApikeyQuotaEngine(
 		return mode === "probe"
 			? fallback.probe(input as ProviderBalanceProbeInput)
 			: fallback.refresh(input as ProviderBalanceRefreshInput);
+	}
+
+	/** One plugin call through the shared registry. `undefined` means "no usable answer". */
+	async function callPlugin(
+		input: Record<string, unknown>,
+		signal: AbortSignal,
+	): Promise<ApikeyQuotaToolOutput | undefined> {
+		try {
+			// Activation is what registers the tool; the manager treats a repeat call as a
+			// no-op, so this is safe on every probe.
+			await activator()?.activate(APIKEY_QUOTA_PLUGIN_ID, {
+				reason: `onTool:${FULL_TOOL_ID}`,
+				automatic: true,
+			});
+		} catch (error) {
+			diagnose("plugin activation failed", { error: errorName(error) });
+			return undefined;
+		}
+		try {
+			const result = await tools().invoke(FULL_TOOL_ID, input, {
+				invocation: { kind: "plugin_background", source: "internal" },
+				signal,
+				timeoutMs: REQUEST_TIMEOUT_MS,
+			});
+			const output = typeof result?.output === "string" ? result.output : undefined;
+			if (result?.isError === true || output === undefined) {
+				diagnose("plugin returned no usable output", { tool: FULL_TOOL_ID });
+				return undefined;
+			}
+			const parsed = apikeyQuotaToolOutputSchema.safeParse(parseJson(output));
+			if (!parsed.success) {
+				diagnose("plugin output failed validation", {
+					tool: FULL_TOOL_ID,
+					issues: parsed.error.issues.length,
+				});
+				return undefined;
+			}
+			return parsed.data;
+		} catch (error) {
+			// A disabled, crashed or unresponsive plugin must not wedge the balance cache: this
+			// round is answered by the bundled adapters.
+			diagnose("plugin call failed", { tool: FULL_TOOL_ID, error: errorName(error) });
+			return undefined;
+		}
 	}
 
 	return {
@@ -232,51 +195,16 @@ export function createApikeyQuotaEngine(
 			return fallback.refresh(input);
 		},
 
-		/** Best-effort teardown for host shutdown; the process dies with the server anyway. */
-		async dispose() {
-			await stopRuntime();
-		},
+		/** The process belongs to the runtime supervisor, so there is nothing to tear down here. */
+		async dispose() {},
 	};
 }
 
 /**
- * The one engine the host installs. Module-level so the runtime it may have started can be
- * disposed from the shutdown sequence rather than left as an orphan: on non-Windows the
- * plugin process is spawned detached, so it does not die with the server by itself.
+ * The one engine the host installs. Module-level so any later teardown hook can reach it
+ * without threading it through call sites.
  */
 export const builtinApikeyQuotaEngine = createApikeyQuotaEngine();
-
-/** Spawn the bundled package over stdio, mirroring how release validation starts it. */
-function createBundledRuntime(): QuotaPluginRuntime | undefined {
-	const entry = join(PLUGIN_DIR, "server/index.js");
-	if (!existsSync(entry)) return undefined;
-	const runner = new LocalProcessRunner({
-		allowedCwds: [PLUGIN_DIR],
-		allowUnboundedResourceUsage: process.platform === "win32",
-		spawnTimeoutMs: REQUEST_TIMEOUT_MS,
-		idleTimeoutMs: IDLE_TIMEOUT_MS,
-	});
-	return new PluginRuntime({
-		pluginId: APIKEY_QUOTA_PLUGIN_ID,
-		pluginVersion: "1.0.0",
-		command: [process.execPath, entry],
-		cwd: PLUGIN_DIR,
-		runner,
-		rpcProtocol: "narrafork.rpc/1",
-		hostApiVersion: "1.0",
-		grantedCapabilities: ["provider.use"],
-		activationReason: "builtin:apikey-quota",
-		timeouts: {
-			handshakeMs: REQUEST_TIMEOUT_MS,
-			activationMs: REQUEST_TIMEOUT_MS,
-			rpcMs: REQUEST_TIMEOUT_MS,
-			drainMs: 500,
-			shutdownMs: 500,
-			cancelGraceMs: 100,
-		},
-		idleTimeoutMs: IDLE_TIMEOUT_MS,
-	});
-}
 
 /** The connection facts the plugin needs, mirroring what the host transport would send. */
 function connectionFields(input: ProviderBalanceProbeInput): Record<string, unknown> {
@@ -310,4 +238,8 @@ function parseJson(output: string): unknown {
 	} catch {
 		return undefined;
 	}
+}
+
+function errorName(error: unknown): string {
+	return error instanceof Error ? error.name : "unknown";
 }

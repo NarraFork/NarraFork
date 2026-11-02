@@ -59,32 +59,43 @@
 
 ## 分发与启停
 
-本插件**随应用一起发布**（`server/builtin-plugins/apikey-quota`），不经插件安装流程：没有包记录、
-没有 capability grant、没有管理员安装步骤。因此它默认启用，首次启动即生效。
+本插件**随应用一起发布**（`server/builtin-plugins/apikey-quota`），由
+`server/builtin-plugins/registry.ts` 声明并交给 `PluginCatalog` 读取。它仍是**一个正常插件**：
+同一份 `manifest.json`、同一套 manifest 校验、同一个 `PluginRuntime` 生命周期与健康登记、
+同一套启用/停用语义。区别只在分发方式。
 
-它唯一的授权来源是宿主设置 `plugins.apikeyQuotaEnabled`（`~/.narrafork/settings.json`），默认 `true`：
+启用状态存在插件状态表里，与外部插件同一张表、同一套接口：
 
-```jsonc
-{
-  "plugins": {
-    "enabled": true,            // 插件子系统总开关（与本项相互独立）
-    "apikeyQuotaEnabled": true  // 关闭后宿主停止插件进程，改用内置适配器
-  }
-}
-```
+- UI：设置 → 插件 → 「内置插件」区块的开关；
+- API：`POST /api/plugins/com.narrafork.apikey-quota/{enable,disable}`（需 admin）。
 
-关闭方式（任选）：
+首次启动时状态记录**隐式创建**为 `desiredState: "enabled"`（没有安装动作，所以也不存在
+「用户选择启用」这一刻）。管理员的显式停用会被尊重并持久化。
 
-- 设置页把该项改为 `false`（`PATCH /api/settings` 写入 `plugins.apikeyQuotaEnabled`）；
-- 直接编辑 `~/.narrafork/settings.json` 后无需重启，下一次额度查询即按新值生效。
+关闭后的行为：宿主停用该插件，额度查询回退到内置 `provider-balance` 适配器。返回的 DTO、
+路由、前端展示完全不变，也不会向用户报错。
 
-关闭后的行为：宿主停止插件进程，改用内置 `provider-balance` 适配器。返回的 DTO、路由、
-前端展示完全不变，也不会向用户报错。
+### 与外部插件的标准差异（逐条及理由）
 
-**为什么用配置文件项而不是插件设置项**：插件设置项（manifest `contributes.configuration`）
-归属于**已安装**插件的实例配置，需要 installation 记录与配置存储；本插件没有这些记录。
-放进 `NarraForkSettings` 里，开关和宿主的其他运行配置一样可热读、随 settings 备份/导出迁移，
-也不需要为了一个布尔值引入安装态。
+| 标准项 | 内置插件 | 理由 |
+|---|---|---|
+| 安装步骤 / 包记录（`current.json` 指针） | 无 | 包在应用自己的构建产物里，与应用同版本、同生命周期。伪造一条「已安装」记录会与真实分发状态不符，也会让卸载语义指向不可删除的应用内容。 |
+| capability grant 审批 | 无（manifest 声明的 `provider.use` 直接生效） | 没有安装动作就没有审批时机。权限仍然只来自 manifest 的显式声明，并且整个插件可被停用，不是绕过授权模型。 |
+| 包签名校验 | 无 | 包与应用同一信任根（同一份构建产物、同一份发布签名）。签名解决的是「第三方包来源不可信」，内置包不存在这个边界。 |
+| SBOM / 许可页单独登记 | 随应用 | 已并入应用的 SBOM 与许可清单，单独登记会产生重复条目。 |
+| 包目录布局 | 自身即 manifest 根（`<root>/manifest.json`），无 `<id>/<version>/<hash>` 层级 | 分发形态决定的物理布局差异；读取路径仍复用同一套包读取与校验函数，非另一套解析。 |
+
+其余全部一致，且由测试守护：
+
+- **manifest 校验**：`PluginCatalog` 用与已安装包相同的读取器（大小上限、JSON 解析、
+  `safeParseManifest`、entry 存在性、兼容性、symlink 与路径逃逸检查）。
+- **运行时生命周期**：进程由 `PluginRuntimeSupervisor` 启动、回收与重启，本插件不自行
+  `new PluginRuntime`。
+- **调用通道**：宿主经 `pluginToolRegistry.invoke(..., { invocation: { kind: "plugin_background",
+  source: "internal" } })` 调用，`allowBackground` 与能力校验照常生效。
+- **健康检查**：调用结果进入 `pluginHealthRegistry`，与外部插件同一份指标
+  （`requests` / `successes` / `failures` / `lastSuccessAt` / `lastFailureAt`）。
+- **启用/停用语义**：与外部插件同一张状态表、同一组接口。
 
 ## 校验
 
@@ -101,13 +112,15 @@ bun scripts/validate-plugin-release.ts "$(pwd)/server/builtin-plugins" --runtime
 | 插件 `status: "ok"` | 直接采用（宿主内置路径不执行） |
 | 插件 `status: "unsupported"` | 视为权威结论，不探测内置路径 |
 | 插件 `status: "failed"` | 按既有的 `request_failed` 语义记录 |
-| `plugins.apikeyQuotaEnabled = false` | 停止插件进程，回退内置适配器 |
+| 插件被停用（状态表 `desiredState: disabled`） | 停用插件进程，回退内置适配器 |
 | 包缺失 / 进程启动失败 / 进程崩溃 / 输出非法 | 回退内置适配器（不向用户报错） |
 
 ## 宿主侧位置
 
-- 进程托管与决策表：`server/services/apikey-quota-plugin-engine.ts`（模块级单例
-  `builtinApikeyQuotaEngine`，`app.ts` 安装，`main.ts` 关停序列里 dispose）。
+- 决策表与 DTO 映射：`server/services/apikey-quota-plugin-engine.ts`（模块级单例
+  `builtinApikeyQuotaEngine`，`app.ts` 安装并注入激活钩子）。进程本身由插件运行时监督器托管，
+  引擎不再自持 runtime。
+- 内置包声明：`server/builtin-plugins/registry.ts` → `PluginCatalog({ builtinRoots })`。
 - 引擎接缝：`server/lib/provider-balance-engine.ts`。
 - 线上契约（宿主校验）：`shared/apikey-quota-plugin.ts`。
 - 契约测试：`tests/server/plugins/apikey-quota-plugin-contract.test.ts`（含原

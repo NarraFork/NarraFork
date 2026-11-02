@@ -107,8 +107,12 @@ import usageHistoryRoutes from "./routes/usage-history";
 import { userPreferencesRoutes } from "./routes/user-preferences";
 import { vnetRoutes } from "./routes/vnet";
 import { workspaceRoutes } from "./routes/workspaces";
-import { builtinApikeyQuotaEngine } from "./services/apikey-quota-plugin-engine";
+import {
+	builtinApikeyQuotaEngine,
+	setApikeyQuotaActivation,
+} from "./services/apikey-quota-plugin-engine";
 import { narratorWorktreeService } from "./services/narrator-worktree-runtime";
+import { pluginManager } from "./services/plugin-manager";
 
 export interface AppEnv {
 	Bindings: {
@@ -369,9 +373,11 @@ app.route("/api/auth/sso", ssoRoutes);
 app.route("/api/plugins", pluginUiRoutes);
 
 // Provider balance (API-key quota) querying is answered by the built-in `apikey-quota`
-// plugin, which ships with the app and is enabled by default. Turning
-// `plugins.apikeyQuotaEnabled` off falls back to the bundled adapters with no user-visible
-// change. The switch is read per round, so no restart is needed.
+// plugin, which ships with the app and is enabled by default. It is a normal plugin: the tool
+// goes through `pluginToolRegistry`, so its process lifecycle, capabilities and health are the
+// shared ones. Disabling it in the plugin list falls back to the bundled adapters with no
+// user-visible change.
+setApikeyQuotaActivation(pluginManager);
 setProviderBalanceEngine(builtinApikeyQuotaEngine);
 
 // Public: OAuth 2.0 provider endpoints. NarraFork is the authorization server

@@ -4,9 +4,9 @@ import type { CustomApiProviderConfig } from "@server/lib/settings";
 import {
 	type ApikeyQuotaEngineOptions,
 	createApikeyQuotaEngine,
-	type QuotaPluginRuntime,
+	type QuotaPluginActivator,
+	type QuotaToolInvoker,
 } from "@server/services/apikey-quota-plugin-engine";
-import { APIKEY_QUOTA_TOOL_ID } from "@shared/apikey-quota-plugin";
 
 const config = (): CustomApiProviderConfig => ({
 	id: "relay1",
@@ -24,58 +24,65 @@ const config = (): CustomApiProviderConfig => ({
 
 const signal = () => AbortSignal.timeout(5_000);
 
-const okProbe = () =>
-	JSON.stringify({
-		status: "ok",
-		adapter: "sub2api",
-		root: "https://relay.example.com",
-		balance: { scope: "wallet", unlimited: false, amounts: [{ unit: "USD", remaining: 12.5 }] },
-	});
+const okProbe = () => ({
+	status: "ok",
+	adapter: "sub2api",
+	root: "https://relay.example.com",
+	balance: { scope: "wallet", unlimited: false, amounts: [{ unit: "USD", remaining: 12.5 }] },
+});
+
+const okRefresh = () => ({
+	status: "ok",
+	balance: { scope: "wallet", unlimited: false, amounts: [{ unit: "USD", remaining: 3 }] },
+});
 
 interface Harness {
-	calls: Array<{ method: string; params: Record<string, unknown> }>;
+	invocations: Array<{ fullId: string; input: Record<string, unknown>; options?: unknown }>;
+	activations: string[];
 	fallbackCalls: string[];
-	starts: number;
-	shutdowns: number;
 }
 
 /**
- * A fake plugin process plus a fake bundled engine. The runtime boundary is exactly what
- * the real child process provides (`start`/`request`/`shutdown`), so the engine's decision
- * table is covered without spawning anything.
+ * A fake tool registry plus a fake activator.
+ *
+ * The registry is the *only* way the engine may reach the plugin, so this boundary is what the
+ * decision table must be proven against: the engine owns no process and no connection.
  */
 function setup(
 	respond: (input: Record<string, unknown>) => unknown,
 	options: {
-		enabled?: boolean;
-		startThrows?: Error;
-		requestThrows?: Error;
-		skipRuntime?: boolean;
+		activateThrows?: Error;
+		invokeThrows?: Error;
+		output?: unknown;
+		isError?: boolean;
+		noActivator?: boolean;
 	} = {},
 ) {
-	const state: Harness = { calls: [], fallbackCalls: [], starts: 0, shutdowns: 0 };
-	const runtime: QuotaPluginRuntime = {
-		start: async () => {
-			state.starts += 1;
-			if (options.startThrows) throw options.startThrows;
-		},
-		request: async <T = unknown>(method: string, params?: unknown): Promise<T> => {
-			state.calls.push({ method, params: params as Record<string, unknown> });
-			if (options.requestThrows) throw options.requestThrows;
-			const input = (params as { input?: Record<string, unknown> })?.input ?? {};
-			return { output: JSON.stringify(respond(input)) } as T;
-		},
-		shutdown: async () => {
-			state.shutdowns += 1;
+	const state: Harness = { invocations: [], activations: [], fallbackCalls: [] };
+	const tools: QuotaToolInvoker = {
+		invoke: async (fullId, input, invocationOptions) => {
+			state.invocations.push({
+				fullId,
+				input: input as Record<string, unknown>,
+				options: invocationOptions,
+			});
+			if (options.invokeThrows) throw options.invokeThrows;
+			const output = options.output ?? JSON.stringify(respond(input as Record<string, unknown>));
+			return {
+				output: typeof output === "string" ? output : JSON.stringify(output),
+				isError: options.isError,
+			};
 		},
 	};
-	let enabled = options.enabled ?? true;
+	const activator: QuotaPluginActivator = {
+		activate: async (pluginId) => {
+			state.activations.push(pluginId);
+			if (options.activateThrows) throw options.activateThrows;
+		},
+	};
 	const engineOptions: ApikeyQuotaEngineOptions = {
-		isEnabled: () => enabled,
-		// `undefined` models a host where the package is not present.
-		createRuntime: options.skipRuntime
-			? () => undefined as unknown as QuotaPluginRuntime
-			: () => runtime,
+		tools,
+		...(options.noActivator ? {} : { activator }),
 		fallback: {
 			id: "fallback",
 			probe: async () => {
@@ -93,19 +100,12 @@ function setup(
 		},
 		onDiagnostic: () => {},
 	};
-	const engine = createApikeyQuotaEngine(engineOptions);
-	return {
-		state,
-		engine,
-		setEnabled: (value: boolean) => {
-			enabled = value;
-		},
-	};
+	return { state, engine: createApikeyQuotaEngine(engineOptions) };
 }
 
 describe("apikey-quota builtin engine", () => {
-	test("is enabled by default, so a probe goes through the plugin", async () => {
-		const { state, engine } = setup(() => JSON.parse(okProbe()));
+	test("a probe activates the plugin and goes through the shared tool registry", async () => {
+		const { state, engine } = setup(okProbe);
 
 		const found = await engine.probe({ config: config(), signal: signal() });
 
@@ -114,170 +114,168 @@ describe("apikey-quota builtin engine", () => {
 			root: "https://relay.example.com",
 			balance: { scope: "wallet", unlimited: false, amounts: [{ unit: "USD", remaining: 12.5 }] },
 		});
-		expect(state.starts).toBe(1);
-		expect(state.calls[0]?.method).toBe("tools.invoke");
-		expect(state.calls[0]?.params).toMatchObject({ contributionId: APIKEY_QUOTA_TOOL_ID });
+		// Activation is what registers the tool, and it carries the same activation event the
+		// manifest declares for tools so the plugin treats it as a normal tool activation.
+		expect(state.activations).toEqual(["com.narrafork.apikey-quota"]);
+		expect(state.invocations).toHaveLength(1);
+		expect(state.invocations[0]?.fullId).toBe("com.narrafork.apikey-quota/query-balance");
+		// Background principal is what makes this a host-internal call rather than a narrator one.
+		expect(state.invocations[0]?.options).toMatchObject({
+			invocation: { kind: "plugin_background", source: "internal" },
+		});
 		// The bundled adapters must not run when the plugin answered.
 		expect(state.fallbackCalls).toEqual([]);
 	});
 
-	test("reuses one plugin process across probes", async () => {
-		const { state, engine } = setup(() => JSON.parse(okProbe()));
+	test("the connection facts the plugin needs are forwarded", async () => {
+		const { state, engine } = setup(okProbe);
 
-		await engine.probe({ config: config(), signal: signal() });
-		await engine.probe({ config: config(), signal: signal() });
+		await engine.probe({ config: config(), signal: signal(), requestTimeoutMs: 4_000 });
 
-		expect(state.starts).toBe(1);
-		expect(state.calls).toHaveLength(2);
-	});
-
-	test("falls back to the bundled adapters once the user turns the switch off", async () => {
-		const { state, engine, setEnabled } = setup(() => JSON.parse(okProbe()));
-
-		await engine.probe({ config: config(), signal: signal() });
-		expect(state.calls).toHaveLength(1);
-
-		setEnabled(false);
-		const found = await engine.probe({ config: config(), signal: signal() });
-
-		// No error surfaces, the same DTO comes back, and the plugin is not consulted.
-		expect(found?.adapter).toBe("new-api");
-		expect(state.calls).toHaveLength(1);
-		expect(state.fallbackCalls).toEqual(["probe"]);
-		// The process is stopped as soon as the switch is read.
-		expect(state.shutdowns).toBe(1);
-	});
-
-	test("starts disabled when the setting is off and never touches the plugin", async () => {
-		const { state, engine } = setup(() => JSON.parse(okProbe()), { enabled: false });
-
-		await engine.probe({ config: config(), signal: signal() });
-
-		expect(state.starts).toBe(0);
-		expect(state.calls).toEqual([]);
-		expect(state.fallbackCalls).toEqual(["probe"]);
-	});
-
-	test("forwards the connection facts the plugin needs, and no more", async () => {
-		const { state, engine } = setup(() => ({ status: "unsupported" }));
-
-		await engine.probe({ config: config(), signal: signal() });
-
-		expect(state.calls[0]?.params).toMatchObject({
-			contributionId: APIKEY_QUOTA_TOOL_ID,
-			input: {
-				mode: "probe",
-				baseUrl: "https://relay.example.com/v1",
-				apiKey: "sk-secret",
-				headers: { "X-Tenant": "t1" },
-				// `config.proxy` is an override policy; the plugin must receive a resolved URL,
-				// otherwise it would silently ignore a corporate proxy after the switch.
-				proxy: "http://127.0.0.1:7890",
-				tlsRejectUnauthorized: false,
-			},
+		expect(state.invocations[0]?.input).toMatchObject({
+			mode: "probe",
+			baseUrl: "https://relay.example.com/v1",
+			apiKey: "sk-secret",
+			headers: { "X-Tenant": "t1" },
+			proxy: "http://127.0.0.1:7890",
+			tlsRejectUnauthorized: false,
+			timeoutMs: 4_000,
 		});
-		const input = (state.calls[0]?.params as { input: Record<string, unknown> }).input;
-		expect(typeof input.userAgent).toBe("string");
-		expect(input).not.toHaveProperty("id");
-		expect(input).not.toHaveProperty("defaultModel");
 	});
 
-	test("treats 'unsupported' as authoritative and still skips the bundled path", async () => {
+	test("unsupported is authoritative and does not probe the bundled path", async () => {
 		const { state, engine } = setup(() => ({ status: "unsupported" }));
 
 		await expect(engine.probe({ config: config(), signal: signal() })).resolves.toBeNull();
 		expect(state.fallbackCalls).toEqual([]);
 	});
 
-	test("maps a plugin 'failed' answer onto the existing transient error", async () => {
-		const { state, engine } = setup(() => ({ status: "failed", kind: "transient" }));
+	test("failed becomes the existing typed probe error", async () => {
+		const { state, engine } = setup(() => ({ status: "failed", kind: "unsupported" }));
 
-		const error = await engine.probe({ config: config(), signal: signal() }).catch((e) => e);
-
+		const error = await engine
+			.probe({ config: config(), signal: signal() })
+			.catch((thrown) => thrown);
 		expect(error).toBeInstanceOf(BalanceProbeRequestError);
-		expect((error as BalanceProbeRequestError).kind).toBe("transient");
+		expect(error.kind).toBe("unsupported");
 		expect(state.fallbackCalls).toEqual([]);
 	});
 
-	test("refreshes through the plugin with the discovered endpoint", async () => {
-		const { state, engine } = setup(() => ({
-			status: "ok",
-			balance: { scope: "key", unlimited: false, amounts: [{ unit: "USD", remaining: 1 }] },
-		}));
+	test("a probe answer without adapter/root falls back", async () => {
+		const { state, engine } = setup(() => ({ status: "ok", balance: okProbe().balance }));
+
+		await engine.probe({ config: config(), signal: signal() });
+
+		expect(state.fallbackCalls).toEqual(["probe"]);
+	});
+
+	test("an unregistered tool falls back to the bundled adapters", async () => {
+		const { state, engine } = setup(okProbe, {
+			invokeThrows: Object.assign(new Error("Unknown plugin tool"), { code: "NOT_FOUND" }),
+		});
+
+		await engine.probe({ config: config(), signal: signal() });
+
+		expect(state.fallbackCalls).toEqual(["probe"]);
+	});
+
+	test("a disabled plugin falls back without surfacing an error", async () => {
+		const { state, engine } = setup(okProbe, {
+			invokeThrows: Object.assign(new Error("Plugin disabled"), { code: "PLUGIN_DISABLED" }),
+		});
+
+		const found = await engine.probe({ config: config(), signal: signal() });
+		expect(found?.adapter).toBe("new-api");
+		expect(state.fallbackCalls).toEqual(["probe"]);
+	});
+
+	test("a failed activation falls back", async () => {
+		const { state, engine } = setup(okProbe, { activateThrows: new Error("activation failed") });
+
+		await engine.probe({ config: config(), signal: signal() });
+
+		expect(state.invocations).toEqual([]);
+		expect(state.fallbackCalls).toEqual(["probe"]);
+	});
+
+	test("output that does not match the contract falls back", async () => {
+		const { state, engine } = setup(okProbe, { output: { status: "nonsense" } });
+
+		await engine.probe({ config: config(), signal: signal() });
+
+		expect(state.fallbackCalls).toEqual(["probe"]);
+	});
+
+	test("an error result from the tool falls back", async () => {
+		const { state, engine } = setup(okProbe, { output: "boom", isError: true });
+
+		await engine.probe({ config: config(), signal: signal() });
+
+		expect(state.fallbackCalls).toEqual(["probe"]);
+	});
+
+	test("refresh returns the plugin balance", async () => {
+		const { state, engine } = setup(okRefresh);
 
 		const balance = await engine.refresh({
 			config: config(),
 			signal: signal(),
-			adapter: "new-api",
+			adapter: "sub2api",
 			root: "https://relay.example.com",
 		});
 
-		expect(balance.amounts).toEqual([{ unit: "USD", remaining: 1 }]);
-		expect((state.calls[0]?.params as { input: Record<string, unknown> }).input).toMatchObject({
+		expect(balance).toMatchObject({ scope: "wallet" });
+		expect(state.invocations[0]?.input).toMatchObject({
 			mode: "refresh",
-			adapter: "new-api",
+			adapter: "sub2api",
 			root: "https://relay.example.com",
 		});
 		expect(state.fallbackCalls).toEqual([]);
 	});
 
-	test("falls back when the plugin package is not shipped", async () => {
-		const { state, engine } = setup(() => JSON.parse(okProbe()), { skipRuntime: true });
+	test("refresh reports unsupported and failed the same way as probe", async () => {
+		const unsupported = setup(() => ({ status: "unsupported" }));
+		await expect(
+			unsupported.engine.refresh({
+				config: config(),
+				signal: signal(),
+				adapter: "sub2api",
+				root: "https://relay.example.com",
+			}),
+		).rejects.toBeInstanceOf(BalanceProbeRequestError);
 
-		await engine.probe({ config: config(), signal: signal() });
-
-		expect(state.calls).toEqual([]);
-		expect(state.fallbackCalls).toEqual(["probe"]);
+		const failed = setup(() => ({ status: "failed", kind: "transient" }));
+		const error = await failed.engine
+			.refresh({
+				config: config(),
+				signal: signal(),
+				adapter: "sub2api",
+				root: "https://relay.example.com",
+			})
+			.catch((thrown) => thrown);
+		expect(error.kind).toBe("transient");
 	});
 
-	test("falls back when the plugin process cannot start", async () => {
-		const { state, engine } = setup(() => JSON.parse(okProbe()), {
-			startThrows: new Error("spawn failed"),
+	test("an injected fetch runs in-process instead of crossing the boundary", async () => {
+		const { state, engine } = setup(okProbe);
+
+		await engine.probe({
+			config: config(),
+			signal: signal(),
+			fetch: (async () => new Response("{}")) as unknown as typeof fetch,
 		});
 
-		await engine.probe({ config: config(), signal: signal() });
-
+		// The seam cannot be serialized into a child process, so it never reaches the registry.
+		expect(state.invocations).toEqual([]);
 		expect(state.fallbackCalls).toEqual(["probe"]);
 	});
 
-	test("falls back and drops the process when a call fails", async () => {
-		const { state, engine } = setup(() => JSON.parse(okProbe()), {
-			requestThrows: new Error("plugin crashed"),
-		});
+	test("without an activator the engine still falls back safely", async () => {
+		const { state, engine } = setup(okProbe, { noActivator: true });
 
 		await engine.probe({ config: config(), signal: signal() });
 
-		expect(state.fallbackCalls).toEqual(["probe"]);
-		expect(state.shutdowns).toBe(1);
-	});
-
-	test("falls back when the plugin output does not match the contract", async () => {
-		const { state, engine } = setup(() => ({ status: "ok", balance: { scope: "bogus" } }));
-
-		await engine.probe({ config: config(), signal: signal() });
-
-		expect(state.fallbackCalls).toEqual(["probe"]);
-	});
-
-	test("falls back when a probe answer is missing its discovered endpoint", async () => {
-		const { state, engine } = setup(() => ({
-			status: "ok",
-			balance: { scope: "key", unlimited: true, amounts: [] },
-		}));
-
-		await engine.probe({ config: config(), signal: signal() });
-
-		// Without adapter/root the discovery cannot be persisted or refreshed, so the
-		// bundled path runs rather than caching an unusable endpoint.
-		expect(state.fallbackCalls).toEqual(["probe"]);
-	});
-
-	test("dispose stops the plugin process", async () => {
-		const { state, engine } = setup(() => JSON.parse(okProbe()));
-
-		await engine.probe({ config: config(), signal: signal() });
-		await engine.dispose();
-
-		expect(state.shutdowns).toBe(1);
+		expect(state.invocations).toHaveLength(1);
+		expect(state.activations).toEqual([]);
 	});
 });

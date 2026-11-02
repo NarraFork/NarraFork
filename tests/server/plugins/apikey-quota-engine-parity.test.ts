@@ -2,6 +2,8 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { builtinProviderBalanceEngine } from "@server/lib/provider-balance-engine";
 import type { CustomApiProviderConfig } from "@server/lib/settings";
 import { createApikeyQuotaEngine } from "@server/services/apikey-quota-plugin-engine";
+import { PluginManager } from "@server/services/plugin-manager";
+import { pluginPlatformServices } from "@server/services/plugin-platform-services";
 import type { ProviderBalanceData } from "@shared/provider-balance";
 
 /**
@@ -46,6 +48,53 @@ const payloads = {
 	},
 } as const;
 
+/**
+ * The engine under test is wired to the *real* plugin manager, so the plugin is reached through
+ * the same activation + tool-registry path production uses. Without that, the engine would find
+ * no registered tool, silently answer from the bundled adapters, and this whole file would be
+ * comparing the bundled engine with itself.
+ */
+let managerPromise: Promise<PluginManager> | undefined;
+
+function sharedManager(): Promise<PluginManager> {
+	// No explicit root/catalog/coordinator: the manager then takes the shared platform services,
+	// which is what the singleton host instance does, so `pluginPlatformServices.toolRegistry`
+	// is the registry the manager populates.
+	managerPromise ??= (async () => {
+		const manager = new PluginManager({ disabled: false });
+		await manager.initialize();
+		return manager;
+	})();
+	return managerPromise;
+}
+
+async function pluginEngine() {
+	const manager = await sharedManager();
+	return createApikeyQuotaEngine({
+		tools: pluginPlatformServices.toolRegistry,
+		activator: manager,
+	});
+}
+
+/** Same engine, but the plugin is disabled so the bundled adapters must answer. */
+async function disabledPluginEngine() {
+	const manager = await sharedManager();
+	await manager.disable("com.narrafork.apikey-quota");
+	const engine = createApikeyQuotaEngine({
+		tools: pluginPlatformServices.toolRegistry,
+		activator: manager,
+	});
+	return {
+		...engine,
+		probe: engine.probe.bind(engine),
+		refresh: engine.refresh.bind(engine),
+		async dispose() {
+			await manager.enable("com.narrafork.apikey-quota");
+			await engine.dispose();
+		},
+	};
+}
+
 const config = (baseUrl: string): CustomApiProviderConfig => ({
 	id: "relay-parity",
 	name: "relay-parity",
@@ -76,8 +125,10 @@ describe("plugin and bundled engine parity over one mock relay", () => {
 		});
 	});
 
-	afterAll(() => {
+	afterAll(async () => {
 		server.stop(true);
+		const manager = await managerPromise?.catch(() => undefined);
+		await manager?.shutdown();
 	});
 
 	for (const [name, payload] of Object.entries(payloads)) {
@@ -85,7 +136,7 @@ describe("plugin and bundled engine parity over one mock relay", () => {
 			body = payload;
 			requests = [];
 			const base = `http://127.0.0.1:${server.port}/v1`;
-			const plugin = createApikeyQuotaEngine();
+			const plugin = await pluginEngine();
 			try {
 				const viaPlugin = await plugin.probe({
 					config: config(base),
@@ -107,7 +158,7 @@ describe("plugin and bundled engine parity over one mock relay", () => {
 		body = payloads["sub2api subscription"];
 		const base = `http://127.0.0.1:${server.port}/v1`;
 		const root = `http://127.0.0.1:${server.port}`;
-		const plugin = createApikeyQuotaEngine();
+		const plugin = await pluginEngine();
 		try {
 			const viaPlugin = await plugin.refresh({
 				config: config(base),
@@ -130,7 +181,7 @@ describe("plugin and bundled engine parity over one mock relay", () => {
 	test("an origin without a quota endpoint is 'unsupported' in both", async () => {
 		body = null;
 		const base = `http://127.0.0.1:${server.port}/v1`;
-		const plugin = createApikeyQuotaEngine();
+		const plugin = await pluginEngine();
 		try {
 			const viaPlugin = await plugin.probe({
 				config: config(base),
@@ -150,7 +201,7 @@ describe("plugin and bundled engine parity over one mock relay", () => {
 	test("a 500 response is a transient failure in both", async () => {
 		const failing = Bun.serve({ port: 0, fetch: () => new Response("boom", { status: 500 }) });
 		const base = `http://127.0.0.1:${failing.port}/v1`;
-		const plugin = createApikeyQuotaEngine();
+		const plugin = await pluginEngine();
 		try {
 			const pluginError = await plugin
 				.probe({ config: config(base), signal: AbortSignal.timeout(20_000) })
@@ -174,7 +225,7 @@ describe("plugin and bundled engine parity over one mock relay", () => {
 			fetch: () => new Response("<html></html>", { headers: { "content-type": "text/html" } }),
 		});
 		const base = `http://127.0.0.1:${html.port}/v1`;
-		const plugin = createApikeyQuotaEngine();
+		const plugin = await pluginEngine();
 		try {
 			const viaPlugin = await plugin.probe({
 				config: config(base),
@@ -206,7 +257,7 @@ describe("plugin and bundled engine parity over one mock relay", () => {
 				}),
 		});
 		const base = `http://127.0.0.1:${oversized.port}/v1`;
-		const plugin = createApikeyQuotaEngine();
+		const plugin = await pluginEngine();
 		try {
 			const pluginError = await plugin
 				.probe({ config: config(base), signal: AbortSignal.timeout(20_000) })
@@ -225,7 +276,7 @@ describe("plugin and bundled engine parity over one mock relay", () => {
 	test("a disabled plugin answers with the same data as the bundled engine", async () => {
 		body = payloads["sub2api wallet"];
 		const base = `http://127.0.0.1:${server.port}/v1`;
-		const disabled = createApikeyQuotaEngine({ isEnabled: () => false });
+		const disabled = await disabledPluginEngine();
 		try {
 			const viaDisabled = await disabled.probe({
 				config: config(base),
@@ -244,7 +295,7 @@ describe("plugin and bundled engine parity over one mock relay", () => {
 	test("both report the same wallet amount for the sub2api wallet payload", async () => {
 		body = payloads["sub2api wallet"];
 		const base = `http://127.0.0.1:${server.port}/v1`;
-		const plugin = createApikeyQuotaEngine();
+		const plugin = await pluginEngine();
 		try {
 			const found = await plugin.probe({
 				config: config(base),
@@ -285,7 +336,7 @@ describe("per-request timeout means the same thing in both engines", () => {
 		test(`${label} is classified the same by both engines`, async () => {
 			const slow = slowRelay();
 			const base = `http://127.0.0.1:${slow.port}/v1`;
-			const plugin = createApikeyQuotaEngine();
+			const plugin = await pluginEngine();
 			const started = performance.now();
 			try {
 				const pluginOutcome = await plugin

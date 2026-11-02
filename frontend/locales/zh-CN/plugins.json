@@ -271,6 +271,16 @@
 			"retried": "已请求重试插件 {{name}}。",
 			"uninstalled": "插件 {{name}} 已卸载。",
 			"operationFailed": "插件操作失败。"
-		}
+		},
+		"builtin": {
+			"title": "内置插件",
+			"subtitle": "随应用发布，无需安装；启用、停用与健康检查与外部插件同一套语义。",
+			"health": "最近调用",
+			"restarts": "重启次数",
+			"lastCallOk": "成功",
+			"lastCallFailed": "失败",
+			"noCalls": "尚无调用"
+		},
+		"installedTitle": "已安装插件"
 	}
 }
