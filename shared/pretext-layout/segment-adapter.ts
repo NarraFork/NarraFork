@@ -146,6 +146,7 @@ export interface AdapterContentBlock {
 	filename?: string | null;
 	mediaType?: string | null;
 	imageId?: string | null;
+	mediaId?: string | null;
 	previewUrl?: string | null;
 	/**
 	 * image_generation: the server-side file the generated image was saved to.
@@ -1184,6 +1185,8 @@ export function classifyContentBlock(block: AdapterContentBlock): VListElementKi
 		case "text":
 			return block.text?.trim() ? "markdown" : null;
 		case "image":
+		case "audio":
+		case "video":
 		case "text_file":
 		case "image_generation":
 			return "media";
@@ -1368,7 +1371,7 @@ function webSearchData(block: AdapterContentBlock, ctx: AdapterContext) {
 }
 
 /**
- * Attachment payload for a user bubble's image / text_file block. `type` plus
+ * Attachment payload for a user bubble's image / audio / video / text_file block. `type` plus
  * the image's intrinsic `width`/`height` are height-relevant (known dimensions
  * reserve an aspect-ratio-fitted box; absent ones fall back to the fixed
  * placeholder height); the rest are render-only fields the integration layer
@@ -1385,6 +1388,17 @@ function userAttachmentData(block: AdapterContentBlock, msg: AdapterMessage) {
 		});
 	}
 	const uploadNarratorId = readNonEmptyString(block, "uploadNarratorId") ?? msg.narratorId;
+	if (block.type === "audio" || block.type === "video") {
+		return {
+			type: block.type,
+			mediaId: block.mediaId ?? null,
+			previewUrl: block.previewUrl ?? null,
+			filename: block.filename ?? null,
+			mediaType: block.mediaType ?? null,
+			size: typeof block.size === "number" ? block.size : null,
+			uploadNarratorId: uploadNarratorId ?? null,
+		};
+	}
 	return {
 		type: block.type,
 		imageId: block.imageId ?? null,
@@ -1424,6 +1438,17 @@ function imageGenerationStatusText(ctx: AdapterContext, status: string | null | 
 
 function mediaData(block: AdapterContentBlock, ctx: AdapterContext) {
 	// measureMedia dispatches on `type`.
+	if (block.type === "audio" || block.type === "video") {
+		return {
+			type: block.type,
+			mediaId: block.mediaId ?? null,
+			previewUrl: block.previewUrl ?? null,
+			filename: block.filename ?? null,
+			mediaType: block.mediaType ?? null,
+			size: typeof block.size === "number" ? block.size : null,
+			uploadNarratorId: readNonEmptyString(block, "uploadNarratorId") ?? null,
+		};
+	}
 	return {
 		type: block.type,
 		imageId: block.imageId ?? null,
@@ -1812,6 +1837,8 @@ function adaptMessage(
 			.filter(
 				(b) =>
 					b.type === "image" ||
+					b.type === "audio" ||
+					b.type === "video" ||
 					b.type === "text_file" ||
 					(b.type === "file_reference" && b.reference),
 			)

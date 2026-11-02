@@ -4,6 +4,7 @@ import {
 	MAX_INPUT_COMPOSITION_SEGMENTS,
 	readInputCompositionSegments,
 } from "@shared/context-usage";
+import { MEDIA_MIME_TO_EXT } from "@shared/media-attachments";
 import { z } from "zod";
 import { capabilityListSchema, invocationScopeSchema } from "./permissions";
 
@@ -14,8 +15,34 @@ export const manifestSchemaVersion = MANIFEST_SCHEMA_VERSION;
 export const NARRAFORK_RPC_PROTOCOL = "narrafork.rpc/1" as const;
 /** Provider business protocol negotiated on top of the RPC transport. */
 export const PROVIDER_PROTOCOL_VERSION = "1.0" as const;
-/** Full UTF-8 JSON-RPC request body budget, including base64 images; inbound limits stay small. */
+/** Full UTF-8 JSON-RPC request body budget, including native media; inbound limits stay small. */
 export const PROVIDER_REQUEST_MAX_BYTES = 64 * 1024 * 1024;
+
+/** Optional v1 extension, usable only after explicit inputAudio/inputVideo negotiation. */
+export const providerNativeMediaSchema = z
+	.object({
+		type: z.enum(["audio", "video"]),
+		mediaType: z
+			.string()
+			.refine(
+				(value) => Object.hasOwn(MEDIA_MIME_TO_EXT, value),
+				"Unsupported native media MIME type",
+			),
+		dataBase64: z
+			.string()
+			.min(1)
+			.max(PROVIDER_REQUEST_MAX_BYTES)
+			.regex(/^[A-Za-z0-9+/]*={0,2}$/, "Native media must contain base64 bytes")
+			.refine((value) => value.length % 4 === 0, "Native media base64 is incomplete"),
+		filename: z.string().min(1).max(1024).optional(),
+	})
+	.strict()
+	.refine(
+		(value) => value.mediaType.startsWith(`${value.type}/`),
+		"Native media modality and MIME type disagree",
+	);
+export type ProviderNativeMedia = z.infer<typeof providerNativeMediaSchema>;
+
 /** Tool business payloads; schema limits and model-visible output previews are independent. */
 export const PLUGIN_TOOL_INPUT_MAX_BYTES = 8 * 1024 * 1024;
 export const PLUGIN_TOOL_OUTPUT_MAX_BYTES = 16 * 1024 * 1024;

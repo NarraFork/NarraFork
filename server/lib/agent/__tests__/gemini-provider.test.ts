@@ -14,7 +14,11 @@ import { ApiRequestDumpCollector } from "../request-dump";
 
 interface TestGeminiProvider {
 	formatTools(tools: unknown[]): unknown[];
-	buildHistory(messages: DbMessage[], model: string): Promise<{ history: unknown[] }>;
+	buildHistory(
+		messages: DbMessage[],
+		model: string,
+		owner?: string,
+	): Promise<{ history: unknown[] }>;
 	chat(params: Record<string, unknown>): AsyncGenerator<ParsedStreamEvent>;
 	generateWithMeta(
 		text: string,
@@ -145,6 +149,162 @@ async function collect(stream: AsyncGenerator<ParsedStreamEvent>): Promise<Parse
 	for await (const event of stream) events.push(event);
 	return events;
 }
+
+describe("Gemini parallel tool media attribution", () => {
+	test("preserves source IDs for live and replayed audio/video without changing images", async () => {
+		const audioBytes = Buffer.from(
+			"524946462400000057415645666d74201000000001000100401f0000803e0000020010006461746100000000",
+			"hex",
+		);
+		const videoBytes = Buffer.from("000000146674797069736f6d0000000069736f6d", "hex");
+		const audio = { type: "audio", mediaType: "audio/wav", base64: audioBytes.toString("base64") };
+		const video = { type: "video", mediaType: "video/mp4", base64: videoBytes.toString("base64") };
+		for (const [kind, provider] of [
+			["generate", makeGenerateContentProvider()],
+			["interactions", makeProvider()],
+		] as const) {
+			type Part = {
+				text?: string;
+				type?: string;
+				data?: string;
+				inlineData?: { mimeType: string; data: string };
+				functionResponse?: { name: string; response: Record<string, unknown> };
+			};
+			type Step = {
+				type?: string;
+				parts?: Part[];
+				content?: Part[];
+				call_id?: string;
+				name?: string;
+			};
+			const requests: Array<{ contents: Step[]; input: Step[] }> = [];
+			setOutboundFetchOverrideForTest(async (_input, init) => {
+				requests.push(JSON.parse(String(init?.body)));
+				return kind === "generate"
+					? sseResponse([
+							{
+								event: "message",
+								data: {
+									candidates: [{ content: { parts: [{ text: "ok" }] }, finishReason: "STOP" }],
+								},
+							},
+						])
+					: sseResponse([
+							{
+								event: "interaction.completed",
+								data: { event_type: "interaction.completed", interaction: { status: "completed" } },
+							},
+						]);
+			});
+			const ids = ["read-audio", "read-video"];
+			const media = [audio, video];
+			const toolResults = ids.map((id, index) =>
+				kind === "generate"
+					? {
+							name: "Read",
+							toolUseId: id,
+							response: { output: "ok" },
+							mediaParts: [
+								{ inlineData: { mimeType: media[index].mediaType, data: media[index].base64 } },
+							],
+						}
+					: {
+							type: "function_result",
+							call_id: id,
+							name: "Read",
+							result: "ok",
+							_nativeMedia: [media[index]],
+						},
+			);
+			await collect(provider.chat(baseChatParams({ content: "", toolResults })));
+			const turns = [
+				{
+					kind: "tool_results",
+					envelopeId: "a",
+					results: ids.map((wireId, index) => ({
+						wireId,
+						name: "Read",
+						text: "ok",
+						isError: false,
+						images: [],
+						media: [media[index]],
+					})),
+				},
+			];
+			const projector = provider as unknown as {
+				geminiWireHistory(turns: unknown[]): unknown[];
+				interactionsWireHistory(turns: unknown[]): unknown[];
+			};
+			const history =
+				kind === "generate"
+					? projector.geminiWireHistory(turns)
+					: projector.interactionsWireHistory(turns);
+			await collect(provider.chat(baseChatParams({ content: "", history })));
+			for (const request of requests) {
+				const steps = kind === "generate" ? request.contents : request.input;
+				if (kind === "generate") {
+					const responses = steps.flatMap((step) =>
+						(step.parts ?? []).flatMap((part) =>
+							part.functionResponse ? [part.functionResponse] : [],
+						),
+					);
+					expect(responses).toEqual(
+						ids.map((toolCallId) => ({ name: "Read", response: { output: "ok", toolCallId } })),
+					);
+				} else {
+					expect(
+						steps
+							.filter((step) => step.type === "function_result")
+							.map(({ name, call_id }) => ({ name, call_id })),
+					).toEqual(ids.map((call_id) => ({ name: "Read", call_id })));
+				}
+				const mediaContainer =
+					kind === "generate"
+						? steps.find((step) =>
+								step.parts?.some((part) => part.inlineData?.mimeType?.startsWith("audio/")),
+							)?.parts
+						: steps.find(
+								(step) =>
+									step.type === "user_input" &&
+									Array.isArray(step.content) &&
+									step.content.some((part) => part.type === "audio"),
+							)?.content;
+				if (!mediaContainer) throw new Error("Missing media container");
+				for (const [index, item] of media.entries()) {
+					const position = mediaContainer.findIndex((part) =>
+						kind === "generate" ? part.inlineData?.data === item.base64 : part.data === item.base64,
+					);
+					expect(position).toBeGreaterThan(0);
+					expect(mediaContainer[position - 1].text).toBe(
+						`Tool result media source: ${JSON.stringify({ toolCallId: ids[index] })}`,
+					);
+				}
+			}
+			const imageResult =
+				kind === "generate"
+					? {
+							name: "Read",
+							toolUseId: "image",
+							response: { output: "ok" },
+							mediaParts: [{ inlineData: { mimeType: "image/png", data: "aW1hZ2U=" } }],
+						}
+					: {
+							type: "function_result",
+							call_id: "image",
+							name: "Read",
+							result: [{ type: "image", mime_type: "image/png", data: "aW1hZ2U=" }],
+						};
+			await collect(provider.chat(baseChatParams({ content: "", toolResults: [imageResult] })));
+			expect(JSON.stringify(requests[2])).not.toContain("Tool result media source:");
+			if (kind === "generate") {
+				const response = requests[2].contents
+					.flatMap((step) => step.parts ?? [])
+					.find((part) => part.functionResponse)?.functionResponse;
+				expect(response).toEqual({ name: "Read", response: { output: "ok" } });
+			}
+		}
+	});
+});
 
 describe("Gemini transport selection", () => {
 	test("factory defaults missing transport to generateContent and never calls /interactions", async () => {

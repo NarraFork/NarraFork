@@ -2164,6 +2164,7 @@ export const narratorBufferedMessages = pgTable(
 		narratorId: text("narrator_id").notNull(),
 		text: text("text").notNull(),
 		imagesJson: text("images_json"),
+		mediaJson: text("media_json"),
 		commandText: text("command_text"),
 		bashCommand: text("bash_command"),
 		createdBy: text("created_by"),
@@ -4111,7 +4112,7 @@ export const notifications = pgTable(
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
   "tableCount": 134,
-  "columnCount": 1759,
+  "columnCount": 1760,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -16365,6 +16366,15 @@ export const POSTGRES_SCHEMA_COVERAGE = {
         {
           "property": "imagesJson",
           "name": "images_json",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "mediaJson",
+          "name": "media_json",
           "kind": "text",
           "pgType": "text",
           "notNull": false,

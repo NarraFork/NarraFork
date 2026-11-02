@@ -43,6 +43,7 @@ const releasedPayload = {
 	metadataJson: null,
 	payloadRefJson: null,
 	imagesJson: null,
+	mediaJson: null,
 	textFilePathsJson: null,
 	fileReferencesJson: null,
 	creatorJson: null,
@@ -163,6 +164,7 @@ function validate(input: MailboxInput) {
 	if (input.kind === "user_input") {
 		const refs = [
 			input.imagesJson,
+			input.mediaJson,
 			input.creatorJson,
 			input.textFilePathsJson,
 			input.fileReferencesJson,
@@ -257,6 +259,7 @@ export function createMailboxStore(db: RuntimeDb) {
 				...(input.kind === "user_input"
 					? {
 							imagesJson: input.imagesJson,
+							mediaJson: input.mediaJson,
 							creatorJson: input.creatorJson,
 							textFilePathsJson: input.textFilePathsJson,
 							fileReferencesJson: input.fileReferencesJson,
@@ -733,6 +736,7 @@ export function createMailboxStore(db: RuntimeDb) {
 						state: "cancelled",
 						text: "",
 						imagesJson: null,
+						mediaJson: null,
 						textFilePathsJson: null,
 						fileReferencesJson: null,
 						payloadRefJson: null,

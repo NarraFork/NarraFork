@@ -12,6 +12,7 @@
 import { signatureSourcesCompatible } from "@shared/agent-protocol/reasoning-source";
 import { outputToText } from "@shared/agent-protocol/tool-output";
 import type { WebSearchAction } from "@shared/agent-protocol/types";
+import type { NativeMediaInput } from "@shared/media-attachments";
 import {
 	type CanonicalEnvelope,
 	type ContextUpdate,
@@ -44,6 +45,9 @@ export interface ProjectionAssets {
 	generatedImages: ReadonlyMap<string, string>;
 	/** Readable images a local tool returned, by tool block id; unreadable ones are left out. */
 	toolResultImages: ReadonlyMap<string, readonly ResolvedImage[]>;
+	/** Original media bytes, resolved only for the request's supported native modalities. */
+	inputMedia?: ReadonlyMap<string, readonly NativeMediaInput[]>;
+	toolResultMedia?: ReadonlyMap<string, readonly NativeMediaInput[]>;
 }
 
 export const NO_ASSETS: ProjectionAssets = {
@@ -59,6 +63,7 @@ export interface NeutralInputItem {
 	text: string;
 	/** Index-aligned with `[image #N]` placeholders; null keeps the slot of an unreadable image. */
 	images: ReadonlyArray<ResolvedImage | null>;
+	media?: readonly NativeMediaInput[];
 	toolChange?: ToolChange;
 	/** Host state replacement, not a new top-level system prompt. */
 	contextUpdate?: ContextUpdate;
@@ -122,6 +127,7 @@ export interface NeutralToolResult {
 	isError: boolean;
 	text: string;
 	images: ResolvedImage[];
+	media?: readonly NativeMediaInput[];
 }
 
 export interface NeutralToolResults {
@@ -262,6 +268,9 @@ function toolResults(envelope: CanonicalEnvelope, assets: ProjectionAssets): Neu
 			isError: output.status === "fail",
 			text: appendix ? `${text}${appendix}` : text,
 			images: [...(assets.toolResultImages.get(block.id) ?? [])],
+			...(assets.toolResultMedia?.get(block.id)?.length
+				? { media: assets.toolResultMedia.get(block.id) }
+				: {}),
 		});
 	}
 	return results;
@@ -306,6 +315,9 @@ export function toTurns(
 			role: envelope.role,
 			text: block.modelText ?? "",
 			images: block.kind === "input" ? (assets.inputImages.get(block.id) ?? []) : [],
+			...(block.kind === "input" && assets.inputMedia?.get(block.id)?.length
+				? { media: assets.inputMedia.get(block.id) }
+				: {}),
 			...(block.kind === "context" && block.toolChange ? { toolChange: block.toolChange } : {}),
 			...(block.kind === "context" && block.contextUpdate
 				? { contextUpdate: block.contextUpdate }

@@ -1,10 +1,16 @@
 import { afterAll, beforeEach, expect, mock, spyOn, test } from "bun:test";
+import { createSqliteMaintenance } from "@server/db/backend/sqlite-maintenance";
 import { eq } from "drizzle-orm";
 import { cleanDb, getTestDb } from "../../../tests/setup";
 import { narratorBufferedMessages, narratorMessages, narrators } from "../../db/schema";
 
 const { db, sqlite } = getTestDb();
-mock.module("../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
+mock.module("../../db", () => ({
+	db,
+	sqlite,
+	activeDatabaseBackend: "sqlite",
+	databaseMaintenance: createSqliteMaintenance(() => sqlite),
+}));
 const ws = { ...(await import("../../websocket/narrator-ws")) };
 mock.module("../../websocket/narrator-ws", () => ({ ...ws, broadcastToNarrator: () => {} }));
 const { resumeNextBufferedMessage } = await import("../narrator-session");

@@ -3,6 +3,7 @@ import { afterAll, afterEach, describe, expect, mock, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { createSqliteMaintenance } from "@server/db/backend/sqlite-maintenance";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
 import { getTableConfig, SQLiteSyncDialect } from "drizzle-orm/sqlite-core";
@@ -75,7 +76,12 @@ for (const statement of [
 		if (!String(error).includes("duplicate column name")) throw error;
 	}
 }
-mock.module("../../db", () => ({ db, sqlite, activeDatabaseBackend: "sqlite" }));
+mock.module("../../db", () => ({
+	db,
+	sqlite,
+	activeDatabaseBackend: "sqlite",
+	databaseMaintenance: createSqliteMaintenance(() => sqlite),
+}));
 const wsModule = { ...(await import("../../websocket/narrator-ws")) };
 mock.module("../../websocket/narrator-ws", () => ({ ...wsModule, broadcastToNarrator: () => {} }));
 const narratorModule = { ...(await import("../narrator-service")) };
