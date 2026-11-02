@@ -3,7 +3,15 @@ import { EventEmitter } from "node:events";
 import { isAbsolute } from "node:path";
 import { encodeToolOutput } from "@shared/agent-protocol/tool-output";
 import { resolveBufferQueueMode } from "@shared/buffer-queue-mode";
+import type { ComposerDocument } from "@shared/composer-document";
 import { resolveMcpLoadingMode } from "@shared/mcp-loading-mode";
+import {
+	isMediaContentBlock,
+	MAX_MEDIA_ATTACHMENTS,
+	type MediaContentBlock,
+	type MediaRef,
+	mediaRefToContentBlock,
+} from "@shared/media-attachments";
 import type { MessageOriginOptions } from "@shared/message-origin";
 import { FOLLOW_PARENT_MODEL } from "@shared/model-inheritance";
 import { parseStored } from "@shared/narrator-blocks/plan";
@@ -69,6 +77,12 @@ import { hotSafe } from "../lib/hot-safe";
 import { t } from "../lib/i18n";
 import { InjectionCadence } from "../lib/injection-cadence";
 import { logger } from "../lib/logger";
+import {
+	deleteUploadedMedia,
+	getMediaPath,
+	saveUploadedMedia,
+	validateUploadedMedia,
+} from "../lib/media-uploads";
 import { getBlockedSkills, getDisabledToolSet } from "../lib/narrator-custom-traits";
 import {
 	addTrait,
@@ -681,6 +695,13 @@ export async function setNarratorDefaultDevice(
 	return { defaultDeviceId: resolvedDeviceId, current };
 }
 
+export function shouldSendQueuedNewInitialMessage(
+	initialMessage: string,
+	buffered: Pick<BufferedMessage, "fileReferences" | "media">,
+): boolean {
+	return Boolean(initialMessage || buffered.fileReferences?.length || buffered.media?.length);
+}
+
 export async function executeQueuedNewCommand(
 	active: ActiveNarrator,
 	buffered: BufferedMessage,
@@ -719,7 +740,7 @@ export async function executeQueuedNewCommand(
 		ownerUserId: buffered.createdBy ?? sourceNarrator.ownerUserId,
 	});
 
-	if (initialMessage || buffered.fileReferences?.length) {
+	if (shouldSendQueuedNewInitialMessage(initialMessage, buffered)) {
 		await sendMessage(
 			newNarrator.id,
 			initialMessage,
@@ -732,6 +753,9 @@ export async function executeQueuedNewCommand(
 			undefined,
 			undefined,
 			buffered.fileReferences,
+			// `/new` has been removed from the prompt; its original document no longer projects it.
+			undefined,
+			buffered.media,
 		);
 	}
 
@@ -1067,6 +1091,8 @@ async function resumeNextBufferedMessageUnlocked(
 				},
 				undefined,
 				first.fileReferences,
+				first.composerDocument,
+				first.media,
 			)
 				.then(async ({ userMsg, userBroadcasted }) => {
 					// Delivered: the attachments have been re-materialized into the turn, so the
@@ -2813,6 +2839,9 @@ export function buildContextManagementHooks(opts: ContextManagementOptions): {
 			history: result.history,
 			rows: result.modelMessages,
 			replayedInjectionMessageIds: result.replayedInjectionMessageIds,
+			...(result.mediaFallbackWarnings?.length
+				? { mediaFallbackWarnings: result.mediaFallbackWarnings }
+				: {}),
 			...(result.toolLoading
 				? {
 						toolLoading: result.toolLoading,
@@ -3064,6 +3093,8 @@ async function feedMessageUnlocked(
 	},
 	origin?: MessageOriginOptions,
 	fileReferences?: FileReferenceSnapshot[],
+	composerDocument?: ComposerDocument,
+	media?: MediaRef[],
 ): Promise<{
 	active: ActiveNarrator;
 	userMsg: typeof narratorMessages.$inferSelect;
@@ -3071,7 +3102,12 @@ async function feedMessageUnlocked(
 	/** Settles when the started run reaches its terminal. */
 	terminal?: Promise<unknown>;
 	/** Input for a fresh pass; ownership and terminal promises remain with run.ts. */
-	preparedInput?: { text: string; images?: ImageRef[]; prePromptBashCommand?: string };
+	preparedInput?: {
+		text: string;
+		images?: ImageRef[];
+		media?: MediaRef[];
+		prePromptBashCommand?: string;
+	};
 	/** The message is durable, but a later dispatch step failed and was reported. */
 	postCommitError?: unknown;
 }> {
@@ -3143,6 +3179,11 @@ async function feedMessageUnlocked(
 					"back",
 					preBashCommand,
 					acceptedReferences,
+					undefined,
+					undefined,
+					undefined,
+					composerDocument,
+					media,
 				)
 			).id;
 		acceptedInputId = acceptedId;
@@ -3165,6 +3206,7 @@ async function feedMessageUnlocked(
 		const accepted = projectMailboxUserMessage(claimedInput);
 		prompt = accepted.text;
 		images = accepted.images;
+		media = accepted.media;
 		commandText = accepted.commandText;
 		// A mailbox null means no known principal, not permission to erase the
 		// session's identity. Preserve an explicit null only on this direct call.
@@ -3186,6 +3228,7 @@ async function feedMessageUnlocked(
 		const persistBlocks: Array<
 			| { type: "text"; text: string }
 			| PersistedUserImageBlock
+			| MediaContentBlock
 			| FileReferenceSnapshot
 			| { type: "text_file"; filename: string; size: number; filePath: string }
 		> = [];
@@ -3194,6 +3237,7 @@ async function feedMessageUnlocked(
 				persistBlocks.push(imageRefToContentBlock(img));
 			}
 		}
+		for (const item of media ?? []) persistBlocks.push(mediaRefToContentBlock(item, narratorId));
 		if (savedTextFiles.length > 0) {
 			for (const tf of savedTextFiles) {
 				persistBlocks.push({
@@ -3213,7 +3257,12 @@ async function feedMessageUnlocked(
 
 		// When the user sends images without text, inject a placeholder so that
 		// providers that gate on non-empty content still include the image blocks.
-		const effectiveText = !prompt.trim() && images?.length ? "[user sent image(s)]" : prompt;
+		const effectiveText =
+			!prompt.trim() && media?.length
+				? "[user sent media]"
+				: !prompt.trim() && images?.length
+					? "[user sent image(s)]"
+					: prompt;
 
 		// Build the effective prompt with attached file hints
 		effectivePrompt = effectiveText + buildAttachedFilesHint(savedTextFiles);
@@ -3311,6 +3360,7 @@ async function feedMessageUnlocked(
 		const input = {
 			text: preBashCommand ? "" : projectFileReferenceText(effectivePrompt, acceptedReferences),
 			images: preBashCommand ? undefined : images,
+			media: preBashCommand ? undefined : media,
 			...(preBashCommand ? { prePromptBashCommand: preBashCommand } : {}),
 		};
 		if (internalOptions?.prepareOnly) return { active, userMsg, preparedInput: input };
@@ -3329,6 +3379,7 @@ async function feedMessageUnlocked(
 			...internalOptions?.run,
 			...(userId !== undefined ? { principal: userId } : {}),
 			prePromptBashCommand: input.prePromptBashCommand,
+			media,
 			recoveryStart,
 		});
 		terminal.catch(async (err) => {
@@ -3357,7 +3408,10 @@ export async function prepareQueuedRunInput(
 	active: ActiveNarrator,
 	owner: ExecutionOwner,
 	run: import("./agent-runtime/ownership").RunControl,
-): Promise<{ text: string; images?: ImageRef[]; prePromptBashCommand?: string } | undefined> {
+): Promise<
+	| { text: string; images?: ImageRef[]; media?: MediaRef[]; prePromptBashCommand?: string }
+	| undefined
+> {
 	const id = active.narratorId;
 	if (!owner.isCurrent()) throw new Error("Fresh input owner is stale");
 	const delivered = await drainAndPersistPendingInjections(active);
@@ -3411,6 +3465,8 @@ export async function prepareQueuedRunInput(
 			},
 			undefined,
 			first.fileReferences,
+			first.composerDocument,
+			first.media,
 		);
 		if (result.postCommitError) throw result.postCommitError;
 		if (first.createdBy != null) {
@@ -3663,6 +3719,7 @@ async function updateToolCallConclusionUnlocked(opts: {
 export interface UserMessageAdmissionOptions {
 	composerDocument?: import("@shared/composer-document").ComposerDocument;
 	images?: ImageRef[];
+	media?: MediaRef[];
 	locale?: Locale;
 	replyInUserLanguage?: boolean;
 	commandText?: string | null;
@@ -3762,6 +3819,7 @@ export async function acceptUserMessage(
 					options.executionIntent,
 					queueMode,
 					options.composerDocument,
+					options.media,
 				);
 				if (!accepted.ok) throw new ValidationError("Message queue is full");
 				const queued = {
@@ -3829,6 +3887,8 @@ export async function acceptUserMessage(
 								},
 								undefined,
 								options.fileReferences,
+								options.composerDocument,
+								options.media,
 							);
 							if (!userBroadcasted)
 								broadcastToNarrator(narratorId, {
@@ -3906,6 +3966,8 @@ export async function sendMessage(
 	preBashCommand?: string | null,
 	origin?: MessageOriginOptions,
 	fileReferences?: FileReferenceSnapshot[],
+	composerDocument?: ComposerDocument,
+	media?: MediaRef[],
 ): Promise<typeof narratorMessages.$inferSelect> {
 	const acceptedReferences = freezeFileReferenceSnapshots(fileReferences);
 	const { userMsg, userBroadcasted } = await feedMessage(
@@ -3921,6 +3983,8 @@ export async function sendMessage(
 		undefined,
 		origin,
 		acceptedReferences,
+		composerDocument,
+		media,
 	);
 	if (!userBroadcasted) {
 		broadcastToNarrator(narratorId, {
@@ -5185,6 +5249,9 @@ async function retryLastMessageUnlocked(
 	}
 
 	const imageRefs = extractImageRefs(lastMsg.contentJson, lastMsg.narratorId);
+	const mediaRefs = (Array.isArray(lastMsg.contentJson) ? lastMsg.contentJson : [])
+		.filter(isMediaContentBlock)
+		.map((item) => mediaRefToContentBlock(item, lastMsg.narratorId));
 
 	const active = await ensureNarrator(narratorId, locale, replyInUserLanguage);
 	// Restore the triggering user so knowledge-base ACL works after a rebuild.
@@ -5193,6 +5260,7 @@ async function retryLastMessageUnlocked(
 
 	runAgentLoop(active, prompt, imageRefs.length > 0 ? imageRefs : undefined, {
 		principal: userId,
+		media: mediaRefs.length > 0 ? mediaRefs : undefined,
 	}).catch(async (err) => {
 		logger.error("runAgentLoop unhandled error (retry)", { narratorId, error: String(err) });
 		await reportUnsettledRunLoopError(narratorId, err);
@@ -5761,7 +5829,9 @@ async function reExecuteDeniedToolCallUnlocked(
 					input: toolInput,
 				});
 
-				const { executePersistedToolAfterReflections } = await import("../lib/agent/loop");
+				const { createDurableMediaReferences, executePersistedToolAfterReflections } = await import(
+					"../lib/agent/loop"
+				);
 				const toolName = toolCall.toolName;
 				const reflectionHistory = await buildRuntimeHistory({
 					narratorId,
@@ -5968,6 +6038,12 @@ async function reExecuteDeniedToolCallUnlocked(
 						},
 					);
 
+					const mediaRefs = result.mediaRefs?.length
+						? result.mediaRefs
+						: result.media?.length
+							? await createDurableMediaReferences(config)(result.media)
+							: undefined;
+
 					if (!result.isError && toolName === "ExitPlanMode") {
 						const { exitNarratorPlanMode } = await import("./narrator-plan-mode");
 						const planState = await exitNarratorPlanMode(narratorId);
@@ -6002,7 +6078,10 @@ async function reExecuteDeniedToolCallUnlocked(
 					await narratorStore.settleTool(
 						toolUseId,
 						{
-							output: encodeToolOutput(result.output, { metadata: result.metadata }),
+							output: encodeToolOutput(result.output, {
+								metadata: result.metadata,
+								media: mediaRefs,
+							}),
 							status: result.isError ? "fail" : "success",
 							errorMessage: result.isError ? result.output : undefined,
 							durationMs: result.durationMs,
@@ -6022,7 +6101,10 @@ async function reExecuteDeniedToolCallUnlocked(
 						toolUseId,
 						toolName,
 						status: result.isError ? "fail" : "success",
-						output: encodeToolOutput(result.output, { metadata: result.metadata }),
+						output: encodeToolOutput(result.output, {
+							metadata: result.metadata,
+							media: mediaRefs,
+						}),
 						durationMs: result.durationMs,
 						...(result.updatedInput ? { updatedInput: result.updatedInput } : {}),
 						...(result.metadata ? { metadata: result.metadata } : {}),
@@ -6357,6 +6439,7 @@ type EditableUserContentBlock =
 	| { type: "text"; text: string }
 	| FileReferenceSnapshot
 	| PersistedUserImageBlock
+	| MediaContentBlock
 	// `fileId` is optional: legacy uploads stored files under
 	// ~/.narrafork/uploads/<narratorId>/text/<fileId>.ext with a relative
 	// filePath, while newer uploads live in the worktree and omit fileId.
@@ -6414,6 +6497,8 @@ function buildEditedUserContentJson(
 	opts?: {
 		fallbackUploadNarratorId?: string | null;
 		keepImageIds?: string[];
+		keepMediaIds?: string[];
+		newMedia?: MediaRef[];
 		newImages?: ImageRef[];
 		keepTextFilePaths?: string[];
 		newTextFiles?: TextFileRef[];
@@ -6428,9 +6513,19 @@ function buildEditedUserContentJson(
 	const seenImageIds = new Set<string>();
 	const seenTextFilePaths = new Set<string>();
 	const imageBlocks: EditableUserContentBlock[] = [];
+	const mediaBlocks: MediaContentBlock[] = [];
+	const keepMediaSet = opts?.keepMediaIds === undefined ? null : new Set(opts.keepMediaIds);
+	const seenMediaIds = new Set<string>();
 	const textFileBlocks: EditableUserContentBlock[] = [];
 
 	for (const block of blocks) {
+		if (isMediaContentBlock(block)) {
+			if (keepMediaSet && !keepMediaSet.has(block.mediaId)) continue;
+			if (!seenMediaIds.has(block.mediaId))
+				mediaBlocks.push(mediaRefToContentBlock(block, fallbackUploadNarratorId));
+			seenMediaIds.add(block.mediaId);
+			continue;
+		}
 		if (
 			block.type === "image" &&
 			typeof block.imageId === "string" &&
@@ -6507,7 +6602,14 @@ function buildEditedUserContentJson(
 	const references = freezeFileReferenceSnapshots(
 		opts?.fileReferences ?? getFileReferenceSnapshots(contentJson),
 	);
-	return [...imageBlocks, ...textFileBlocks, ...references, { type: "text", text: newContent }];
+	return [
+		...imageBlocks,
+		...mediaBlocks,
+		...(opts?.newMedia ?? []).map((item) => mediaRefToContentBlock(item, fallbackUploadNarratorId)),
+		...textFileBlocks,
+		...references,
+		{ type: "text", text: newContent },
+	];
 }
 
 /**
@@ -6543,6 +6645,8 @@ export interface EditAndRegenerateOptions {
 	/** Server-selected accepted snapshots; omitted keeps the target message's snapshots. */
 	fileReferences?: FileReferenceSnapshot[];
 	keepImageIds?: string[];
+	keepMediaIds?: string[];
+	newMedia?: File[];
 	newImages?: File[];
 	keepTextFilePaths?: string[];
 	newTextFiles?: File[];
@@ -6618,6 +6722,28 @@ async function editAndRegenerateUnlocked(
 		.filter((block) => block.type === "text_file" && typeof block.filePath === "string")
 		.map((block) => block.filePath as string);
 	const keepImageIds = resolveRequestedAttachmentKeys(actualImageIds, opts?.keepImageIds);
+	const actualMedia = originalBlocks.filter(
+		(block): block is Record<string, unknown> & MediaContentBlock => isMediaContentBlock(block),
+	);
+	const keepMediaIds = resolveRequestedAttachmentKeys(
+		actualMedia.map((item) => item.mediaId),
+		opts?.keepMediaIds,
+	);
+	if (keepMediaIds.length + (opts?.newMedia?.length ?? 0) > MAX_MEDIA_ATTACHMENTS)
+		throw new ValidationError(`Maximum ${MAX_MEDIA_ATTACHMENTS} media attachments per message`);
+	for (const file of opts?.newMedia ?? []) await validateUploadedMedia(file);
+	let retainedAttachmentBytes = 0;
+	const countedMediaIds = new Set<string>();
+	for (const item of actualMedia.filter((item) => keepMediaIds.includes(item.mediaId))) {
+		const owner = item.uploadNarratorId || targetMsg.narratorId;
+		const mediaPath = getMediaPath(owner, item.mediaId);
+		if (!mediaPath) throw new ValidationError(`Attached media not found: ${item.filename}`);
+		const mediaKey = `${owner.length}:${owner}:${item.mediaId}`;
+		if (!countedMediaIds.has(mediaKey)) {
+			countedMediaIds.add(mediaKey);
+			retainedAttachmentBytes += Bun.file(mediaPath).size;
+		}
+	}
 	const keepTextFilePaths = resolveRequestedAttachmentKeys(
 		actualTextFilePaths,
 		opts?.keepTextFilePaths,
@@ -6638,6 +6764,12 @@ async function editAndRegenerateUnlocked(
 					.filter((_, index) => keepTextFilePaths.includes(actualTextFilePaths[index])),
 				...(opts?.newTextFiles ?? []),
 			],
+			[
+				...targetMsg.composerDocument.assets
+					.filter((asset) => asset.kind === "audio" || asset.kind === "video")
+					.filter((_, index) => keepMediaIds.includes(actualMedia[index]?.mediaId)),
+				...(opts?.newMedia ?? []),
+			],
 		);
 	}
 	validateComposerAssets(
@@ -6654,13 +6786,18 @@ async function editAndRegenerateUnlocked(
 			),
 			...(opts?.newTextFiles ?? []),
 		],
+		[
+			...actualMedia.filter((item) => keepMediaIds.includes(item.mediaId)),
+			...(opts?.newMedia ?? []),
+		],
 	);
 	for (const file of opts?.newImages ?? []) validateUploadedImage(file);
 	for (const file of opts?.newTextFiles ?? []) validateTextFile(file);
-	const uploadBytes = [...(opts?.newImages ?? []), ...(opts?.newTextFiles ?? [])].reduce(
-		(total, file) => total + file.size,
-		0,
-	);
+	const uploadBytes = [
+		...(opts?.newImages ?? []),
+		...(opts?.newTextFiles ?? []),
+		...(opts?.newMedia ?? []),
+	].reduce((total, file) => total + file.size, 0);
 	if (uploadBytes > MAX_NARRATOR_ATTACHMENT_BYTES) {
 		throw new ValidationError("Combined attachments exceed the 128 MiB limit");
 	}
@@ -6676,9 +6813,10 @@ async function editAndRegenerateUnlocked(
 	if (
 		!newContent.trim() &&
 		keepImageIds.length === 0 &&
+		keepMediaIds.length === 0 &&
 		keepTextFilePaths.length === 0 &&
 		selectedReferences.length === 0 &&
-		!(opts?.newImages?.length || opts?.newTextFiles?.length)
+		!(opts?.newImages?.length || opts?.newTextFiles?.length || opts?.newMedia?.length)
 	) {
 		throw new ValidationError("content is required");
 	}
@@ -6692,7 +6830,6 @@ async function editAndRegenerateUnlocked(
 	const keepTextFileSet = new Set(keepTextFilePaths);
 	const countedImageIds = new Set<string>();
 	const countedTextFilePaths = new Set<string>();
-	let retainedAttachmentBytes = 0;
 	const textFilesToCopy = new Map<string, TextFileRef>();
 	for (const block of originalBlocks) {
 		if (
@@ -6806,14 +6943,22 @@ async function editAndRegenerateUnlocked(
 	}
 
 	const createdImageIds: string[] = [];
+	const createdMediaIds: string[] = [];
 	const createdFilePaths: string[] = [];
 	let copyOnWriteSucceeded = false;
 	let privateMessageId: string;
 	let newContentJson: EditableUserContentBlock[];
 	let existingImages: ImageRef[];
+	let existingMedia: MediaRef[];
 	let existingTextFiles: TextFileRef[];
 	let effectivePrompt: string;
 	try {
+		const savedNewMedia: MediaRef[] = [];
+		for (const file of opts?.newMedia ?? []) {
+			const item = await saveUploadedMedia(narratorId, file);
+			createdMediaIds.push(item.mediaId);
+			savedNewMedia.push(item);
+		}
 		const savedNewImages: ImageRef[] = [];
 		for (const file of opts?.newImages ?? []) {
 			const ref = await saveUploadedImage(narratorId, file);
@@ -6851,14 +6996,21 @@ async function editAndRegenerateUnlocked(
 			fallbackUploadNarratorId: targetMsg.narratorId,
 			keepImageIds,
 			newImages: savedNewImages,
+			keepMediaIds,
+			newMedia: savedNewMedia,
 			keepTextFilePaths: relocatedKeepTextFilePaths,
 			newTextFiles: savedNewTextFiles.length > 0 ? savedNewTextFiles : undefined,
 			fileReferences: selectedReferences,
 		});
 		existingImages = extractImageRefs(newContentJson, targetMsg.narratorId);
+		existingMedia = newContentJson.filter(isMediaContentBlock);
 		existingTextFiles = extractTextFileRefs(newContentJson);
 		const effectiveText =
-			!newContent.trim() && existingImages.length > 0 ? "[user sent image(s)]" : newContent;
+			!newContent.trim() && newContentJson.some(isMediaContentBlock)
+				? "[user sent media]"
+				: !newContent.trim() && existingImages.length > 0
+					? "[user sent image(s)]"
+					: newContent;
 		effectivePrompt = effectiveText + buildAttachedFilesHint(existingTextFiles);
 
 		// A loop may have started while the files were being materialized (the route
@@ -6879,6 +7031,7 @@ async function editAndRegenerateUnlocked(
 		copyOnWriteSucceeded = true;
 	} catch (error) {
 		if (!copyOnWriteSucceeded) {
+			for (const mediaId of createdMediaIds) deleteUploadedMedia(narratorId, mediaId);
 			for (const imageId of createdImageIds) deleteUploadedImage(narratorId, imageId);
 			deleteCreatedAttachmentFiles(createdFilePaths);
 		}
@@ -6931,7 +7084,7 @@ async function editAndRegenerateUnlocked(
 		active,
 		projectFileReferenceText(effectivePrompt, selectedReferences),
 		imageRefs.length > 0 ? imageRefs : undefined,
-		{ principal: opts?.userId },
+		{ principal: opts?.userId, media: existingMedia.length > 0 ? existingMedia : undefined },
 	).catch(async (err) => {
 		logger.error("runAgentLoop unhandled error (editAndRegenerate)", {
 			narratorId,

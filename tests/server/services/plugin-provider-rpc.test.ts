@@ -6,6 +6,7 @@ import {
 } from "@server/lib/plugins/protocol";
 import {
 	PluginProviderRpcClient,
+	type ProviderChatParams,
 	type ProviderOperation,
 	type ProviderRpcRequestOptions,
 	type ProviderRpcTransport,
@@ -69,6 +70,8 @@ function modelCatalog() {
 }
 
 class MockTransport implements ProviderRpcTransport {
+	providerCapabilities: Record<string, unknown> = {};
+	modelCapabilities: Record<string, unknown> = {};
 	readonly requests: Array<{
 		method: string;
 		params: unknown;
@@ -89,11 +92,19 @@ class MockTransport implements ProviderRpcTransport {
 		options?: ProviderRpcRequestOptions,
 	): Promise<T> {
 		this.requests.push({ method, params, options });
-		if (method === "provider.describe") return Promise.resolve(describeResult() as T);
+		if (method === "provider.describe") {
+			const result = describeResult();
+			Object.assign(result.providers[0].capabilities, this.providerCapabilities);
+			return Promise.resolve(result as T);
+		}
 		if (method === "provider.validateConfig") {
 			return Promise.resolve({ valid: true, issues: [] } as T);
 		}
-		if (method === "provider.listModels") return Promise.resolve(modelCatalog() as T);
+		if (method === "provider.listModels") {
+			const result = modelCatalog();
+			Object.assign(result.models[0].capabilities, this.modelCapabilities);
+			return Promise.resolve(result as T);
+		}
 		if (method === "provider.cancel") {
 			const operationId = getOperationId(params);
 			return Promise.resolve({ operationId, state: "cancelling" } as T);
@@ -202,9 +213,13 @@ async function setup(
 		window?: Partial<ProviderStreamWindow>;
 		limits?: Record<string, number>;
 		idFactory?: (prefix: "op" | "rpc") => string;
+		providerCapabilities?: Record<string, unknown>;
+		modelCapabilities?: Record<string, unknown>;
 	} = {},
 ) {
 	const transport = new MockTransport();
+	transport.providerCapabilities = options.providerCapabilities ?? {};
+	transport.modelCapabilities = options.modelCapabilities ?? {};
 	const client = new PluginProviderRpcClient({
 		transport,
 		expectedPluginId: "com.example.provider",
@@ -229,6 +244,128 @@ beforeEach(() => {
 
 afterEach(async () => {
 	await Promise.all(clients.map((client) => client.dispose()));
+});
+
+describe("plugin native media negotiation", () => {
+	const audio = {
+		type: "audio" as const,
+		mediaType: "audio/wav",
+		dataBase64: Buffer.from("RIFF0000WAVE").toString("base64"),
+	};
+	const video = {
+		type: "video" as const,
+		mediaType: "video/mp4",
+		dataBase64: Buffer.from("native video bytes").toString("base64"),
+	};
+
+	it("retains explicit provider and model media capabilities through normalization", async () => {
+		const { client } = await setup({
+			providerCapabilities: { inputAudio: true, inputVideo: false },
+			modelCapabilities: { inputAudio: true, inputVideo: true },
+		});
+		clients.push(client);
+		expect(client.descriptor?.providers[0].capabilities).toMatchObject({
+			inputAudio: true,
+			inputVideo: false,
+		});
+		const catalog = await client.listModels({ ...baseParams() });
+		expect(catalog.models[0].capabilities).toMatchObject({ inputAudio: true, inputVideo: true });
+	});
+
+	for (const placement of ["current", "history", "tool"] as const) {
+		it(`rejects legacy plugins before transport for ${placement} media`, async () => {
+			const { client, transport } = await setup({
+				modelCapabilities: { inputAudio: true, inputVideo: true },
+			});
+			clients.push(client);
+			const params: ProviderChatParams = chatParams();
+			if (placement === "current") params.request.current.media = [audio];
+			if (placement === "history") params.request.history = [{ role: "user", content: [video] }];
+			if (placement === "tool")
+				params.request.current.toolResults = [
+					{ type: "tool_result", toolUseId: "read-1", content: [audio] },
+				];
+			await expect(client.chat(params)).rejects.toMatchObject({ code: "UNSUPPORTED_MEDIA" });
+			expect(
+				transport.requests.filter((request) => request.method === "provider.chat"),
+			).toHaveLength(0);
+			expect(client.getDiagnostics().activeOperations).toBe(0);
+		});
+	}
+
+	it("carries negotiated native current, historical and tool bytes without substitution", async () => {
+		const { client, transport } = await setup({
+			providerCapabilities: { inputAudio: true, inputVideo: true },
+		});
+		clients.push(client);
+		const params: ProviderChatParams = chatParams();
+		params.request.current.media = [audio, video];
+		params.request.history = [{ role: "user", content: [audio, video] }];
+		params.request.current.toolResults = [
+			{ type: "tool_result", toolUseId: "read-1", content: [audio, video] },
+		];
+		const operation = await client.chat(params);
+		const sent = transport.requests.find((request) => request.method === "provider.chat")
+			?.params as ProviderChatParams;
+		expect(sent.request).toEqual(params.request);
+		transport.emit(
+			notification(operation.operationId, 1, {
+				type: "done",
+				status: "completed",
+				stopReason: "end_turn",
+			}),
+		);
+		for await (const _event of operation.events()) {
+			/* drain terminal event */
+		}
+	});
+
+	for (const invalid of [
+		{ ...audio, dataBase64: "" },
+		{ ...audio, mediaType: "video/mp4" },
+		{ type: "audio", mediaType: "audio/wav", path: "/private/file.wav" },
+		{ ...audio, dataBase64: "not base64" },
+	]) {
+		it(`fails closed on invalid native media ${JSON.stringify(invalid)}`, async () => {
+			const { client, transport } = await setup({
+				providerCapabilities: { inputAudio: true, inputVideo: true },
+			});
+			clients.push(client);
+			const params: ProviderChatParams = chatParams();
+			params.request.current.media = [invalid as typeof audio];
+			await expect(client.chat(params)).rejects.toMatchObject({ code: "INVALID_REQUEST" });
+			expect(
+				transport.requests.filter((request) => request.method === "provider.chat"),
+			).toHaveLength(0);
+		});
+	}
+
+	it("rejects truthy non-boolean capability claims", async () => {
+		const transport = new MockTransport();
+		transport.providerCapabilities = { inputAudio: "true" };
+		const client = new PluginProviderRpcClient({ transport });
+		clients.push(client);
+		await expect(client.describe()).rejects.toMatchObject({ code: "INVALID_RESPONSE" });
+	});
+
+	it("rejects invalid model media capability claims", async () => {
+		const { client } = await setup({ modelCapabilities: { inputVideo: 1 } });
+		clients.push(client);
+		await expect(client.listModels({ ...baseParams() })).rejects.toMatchObject({
+			code: "INVALID_RESPONSE",
+		});
+	});
+
+	it("does not inherit media negotiation from a different provider", async () => {
+		const { client, transport } = await setup({ providerCapabilities: { inputAudio: true } });
+		clients.push(client);
+		const params: ProviderChatParams = { ...chatParams(), providerTypeId: "other.plugin/main" };
+		params.request.current.media = [audio];
+		await expect(client.chat(params)).rejects.toMatchObject({ code: "INVALID_RESPONSE" });
+		expect(transport.requests.filter((request) => request.method === "provider.chat")).toHaveLength(
+			0,
+		);
+	});
 });
 
 describe("PluginProviderRpcClient describe and unary methods", () => {

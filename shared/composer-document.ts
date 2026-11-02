@@ -8,7 +8,7 @@ export const MAX_COMPOSER_QUOTE_CHARS = 8000;
 
 export interface ComposerAsset {
 	id: string;
-	kind: "image" | "textFile";
+	kind: "image" | "textFile" | "audio" | "video";
 	name: string;
 	size: number;
 	mimeType: string;
@@ -119,7 +119,10 @@ export function parseComposerDocument(value: unknown): ComposerDocument {
 		const id = identifier(item.id);
 		if (
 			assetIds.has(id) ||
-			(item.kind !== "image" && item.kind !== "textFile") ||
+			(item.kind !== "image" &&
+				item.kind !== "textFile" &&
+				item.kind !== "audio" &&
+				item.kind !== "video") ||
 			!Number.isSafeInteger(item.size) ||
 			Number(item.size) < 0
 		)
@@ -246,9 +249,10 @@ export function composerQuoteBlock(node: { label: string; text: string; anchor?:
 	return `> [quote] ${node.label}${node.anchor ? ` @@${node.anchor}` : ""}\n${body}\n\n`;
 }
 
-export type ComposerAttachmentPlaceholderKind = "image" | "file";
-/** `[image #2: shot.png]`: the number is the 1-based upload order within its kind. */
-export const COMPOSER_ATTACHMENT_PLACEHOLDER = /\[(image|file) #([1-9]\d{0,3}): ([^[\]\n]*)\]/gu;
+export type ComposerAttachmentPlaceholderKind = "image" | "file" | "audio" | "video";
+
+export const COMPOSER_ATTACHMENT_PLACEHOLDER =
+	/\[(image|file|audio|video) #([1-9]\d{0,3}): ([^[\]\n]*)\]/gu;
 export function composerAttachmentPlaceholderName(name: string): string {
 	return name.replace(/[[\]\r\n]/gu, "_");
 }
@@ -267,10 +271,10 @@ export function composerAttachmentPlaceholder(
  * legacy text import) must keep projecting byte for byte.
  */
 export function escapeComposerText(value: string): string {
-	return value.replace(/\\*\[(?:image|file) #/gu, (match) => `\\${match}`);
+	return value.replace(/\\*\[(?:image|file|audio|video) #/gu, (match) => `\\${match}`);
 }
 export function unescapeComposerText(value: string): string {
-	return value.replace(/\\(\\*\[(?:image|file) #)/gu, "$1");
+	return value.replace(/\\(\\*\[(?:image|file|audio|video) #)/gu, "$1");
 }
 
 /** Where each node landed in the projection, so edits can be mapped back to text nodes. */
@@ -293,7 +297,21 @@ function isComposerContentNode(node: ComposerInlineNode): boolean {
  * content its position carries meaning, so quotes are emitted where they stand and every
  * attachment gets a numbered placeholder at its position.
  */
-export function composerDocumentProjection(doc: ComposerDocument): {
+export function composerDocumentProjection(doc: ComposerDocument) {
+	return projectComposerDocument(doc, escapeComposerText);
+}
+
+/** Projection from before audio/video placeholder escaping; for persisted rows only. */
+export function preMediaComposerDocumentProjection(doc: ComposerDocument) {
+	return projectComposerDocument(doc, (value) =>
+		value.replace(/\\*\[(?:image|file) #/gu, (match) => `\\${match}`),
+	);
+}
+
+function projectComposerDocument(
+	doc: ComposerDocument,
+	escapeText: (value: string) => string,
+): {
 	text: string;
 	fileReferences: FileReference[];
 	spans: ComposerProjectionSpan[];
@@ -311,6 +329,10 @@ export function composerDocumentProjection(doc: ComposerDocument): {
 		let index = 0;
 		for (const asset of doc.assets) if (asset.kind === kind) kindIndex.set(asset.id, index++);
 	}
+	let mediaIndex = 0;
+	for (const asset of doc.assets) {
+		if (asset.kind === "audio" || asset.kind === "video") kindIndex.set(asset.id, mediaIndex++);
+	}
 	const assets = new Map(doc.assets.map((asset) => [asset.id, asset]));
 	const spans: ComposerProjectionSpan[] = [];
 	let text = "";
@@ -327,7 +349,7 @@ export function composerDocumentProjection(doc: ComposerDocument): {
 		for (; previousParagraph < p; previousParagraph++) if (previousParagraph >= 0) text += "\n";
 		if (node.type === "quote" && leading(index)) return;
 		const start = text.length;
-		if (node.type === "text") text += doc.assets.length ? escapeComposerText(node.text) : node.text;
+		if (node.type === "text") text += doc.assets.length ? escapeText(node.text) : node.text;
 		if (node.type === "break") text += "\n";
 		if (node.type === "fileReference") {
 			text += composerFileReferenceToken(node.reference);
@@ -344,12 +366,15 @@ export function composerDocumentProjection(doc: ComposerDocument): {
 		}
 		if (node.type === "attachment" && placeholders) {
 			const asset = assets.get(node.assetId);
-			if (asset)
+			if (asset) {
+				const placeholderKind: ComposerAttachmentPlaceholderKind =
+					asset.kind === "image" ? "image" : asset.kind === "textFile" ? "file" : asset.kind;
 				text += composerAttachmentPlaceholder(
-					asset.kind === "image" ? "image" : "file",
+					placeholderKind,
 					kindIndex.get(asset.id) ?? 0,
 					asset.name,
 				);
+			}
 		}
 		spans.push({ paragraph: p, node: n, start, end: text.length });
 	});

@@ -94,6 +94,8 @@ export function BotChatComposer({ narratorId, roomId, replyTo, onSent }: BotChat
 	} = useComposerAttachments({ narratorId: composerKey, currentUserId, sendingRef, t: tn });
 	const { handleFileInputChange, handleComposerPasteImages, dropZoneProps, ingestingRef } =
 		useComposerFileIngest({
+			// Chat attachments have a separate upload contract; an editor callback is not media support.
+			acceptMedia: false,
 			narratorId: composerKey,
 			sendingRef,
 			updateAttachedImages,

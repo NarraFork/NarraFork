@@ -346,6 +346,7 @@ export interface BufferedMessage {
 	/** Server-accepted immutable bytes; summaries expose only reference metadata. */
 	fileReferences?: FileReferenceSnapshot[];
 	images?: ImageRef[];
+	media?: import("@shared/media-attachments").MediaRef[];
 	textFiles?: File[];
 	bufferedAt: string;
 	commandText?: string | null;

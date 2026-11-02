@@ -1,4 +1,5 @@
 import { expect, test } from "bun:test";
+import { isMediaContentBlock } from "@shared/media-attachments";
 import { and, eq, sql } from "drizzle-orm";
 import { Hono } from "hono";
 import { bodyLimit } from "hono/body-limit";
@@ -133,6 +134,22 @@ function fixture(options: { member?: boolean; content?: string | null } = {}) {
 							size: 9,
 							secret: "drop",
 						},
+						{
+							type: "audio",
+							mediaId: "voice",
+							filename: "voice.wav",
+							mediaType: "audio/wav",
+							size: 60,
+							uploadNarratorId: "source-owner",
+							base64: "must-not-export",
+						},
+						{
+							type: "video",
+							mediaId: "clip",
+							filename: "clip.webm",
+							mediaType: "video/webm",
+							size: 32,
+						},
 						{ type: "text_file", filename: "same.txt", filePath: "/authorized/file.txt", size: 7 },
 						{ type: "text", text: "new snapshot" },
 					])
@@ -155,6 +172,7 @@ function fixture(options: { member?: boolean; content?: string | null } = {}) {
 		NotFoundError,
 		ValidationError,
 		getFileReferenceSnapshots,
+		isMediaContentBlock,
 		// Block reads off: the plain column, as before block storage.
 		storedBodyBytesSql: () => sql`length(CAST(${narratorMessages.contentJson} AS BLOB))`,
 		contentJsonSql: () => narratorMessages.contentJson,
@@ -183,6 +201,15 @@ function fixture(options: { member?: boolean; content?: string | null } = {}) {
 									size: 9,
 								},
 							],
+							media: [
+								{
+									mediaId: "queued-voice",
+									filename: "voice.wav",
+									mediaType: "audio/wav",
+									size: 60,
+									uploadNarratorId: "source-owner",
+								},
+							],
 							_savedFiles: [{ filename: "same.txt", size: 7, path: "/private-staging-path" }],
 						},
 					},
@@ -205,9 +232,14 @@ test("history composer detail binds doc and attachment identities from one bound
 		bodyRevision: 8,
 		text: "new snapshot",
 		images: [{ imageId: "new-image-id", filename: "same.png", size: 9 }],
+		media: [
+			{ mediaId: "voice", uploadNarratorId: "source-owner" },
+			{ mediaId: "clip", uploadNarratorId: "n" },
+		],
 		textFiles: [{ filePath: "/authorized/file.txt", size: 7 }],
 	});
 	expect(body.images[0].secret).toBeUndefined();
+	expect(JSON.stringify(body.media)).not.toContain("must-not-export");
 });
 test("queue detail returns current keep keys but never managed staging paths or snapshot bodies", async () => {
 	const response = await fixture().request("/n/buffer/m/composer-document");
@@ -217,6 +249,7 @@ test("queue detail returns current keep keys but never managed staging paths or 
 		composerDocument: document,
 		text: "queued snapshot",
 		images: [{ imageId: "queued-image-id" }],
+		media: [{ mediaId: "queued-voice", uploadNarratorId: "source-owner" }],
 		textFiles: [{ index: 0, filename: "same.txt", size: 7 }],
 	});
 	expect(JSON.stringify(body)).not.toContain("private-staging-path");

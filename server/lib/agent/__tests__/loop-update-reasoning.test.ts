@@ -1,4 +1,5 @@
 import { afterAll, afterEach, beforeEach, expect, mock, test } from "bun:test";
+import { createSqliteMaintenance } from "@server/db/backend/sqlite-maintenance";
 import { z } from "zod/v4";
 import {
 	beginNarratorResponseActivity,
@@ -65,6 +66,7 @@ const { db, sqlite } = getTestDb();
 const dbStub = {
 	db,
 	sqlite,
+	databaseMaintenance: createSqliteMaintenance(() => sqlite),
 	activeDatabaseBackend: "sqlite" as const,
 	startupShutdownState: { canSkipVerification: true },
 	markDatabaseCleanShutdown: () => true,

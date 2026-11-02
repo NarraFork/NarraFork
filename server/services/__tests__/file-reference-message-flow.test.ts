@@ -1,6 +1,7 @@
 import { afterAll, beforeEach, describe, expect, mock, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { EventEmitter } from "node:events";
+import { createSqliteMaintenance } from "@server/db/backend/sqlite-maintenance";
 import type { FileReferenceSnapshot } from "@shared/file-reference";
 import { getTestDb } from "../../../tests/setup";
 import * as schema from "../../db/schema";
@@ -77,6 +78,7 @@ if (process.env.NARRAFORK_FILE_REFERENCE_FIXTURE !== "messages") {
 	mock.module("../../db", () => ({
 		activeDatabaseBackend: "sqlite",
 		sqlite,
+		databaseMaintenance: createSqliteMaintenance(() => sqlite),
 		db: new Proxy(fixtureDb, {
 			get(target, key, receiver) {
 				if (key === "query")

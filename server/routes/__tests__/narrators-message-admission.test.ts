@@ -1,6 +1,7 @@
 import { describe, expect, mock, test } from "bun:test";
 import type { ComposerDocument } from "@shared/composer-document";
 import { type FileReference, fileReferenceMessageForDisplay } from "@shared/file-reference";
+import { MAX_MEDIA_ATTACHMENTS } from "@shared/media-attachments";
 import {
 	MAX_EDIT_IMAGES_PER_MESSAGE,
 	MAX_EDIT_TEXT_FILES_PER_MESSAGE,
@@ -8,6 +9,7 @@ import {
 import { Hono } from "hono";
 import {
 	bindComposerDocumentReferences,
+	bindComposerMediaProjection,
 	parseOptionalComposerDocument,
 	restoreMultipartComposerText,
 	validateComposerAssets,
@@ -96,11 +98,13 @@ function fixture(
 		parseFileReferenceInput,
 		parseOptionalComposerDocument,
 		bindComposerDocumentReferences,
+		bindComposerMediaProjection,
 		restoreMultipartComposerText,
 		validateComposerProjection,
 		validateComposerAssets,
 		sendMessageSchema,
 		bufferQueueModeSchema,
+		MAX_MEDIA_ATTACHMENTS,
 		MAX_EDIT_IMAGES_PER_MESSAGE,
 		MAX_EDIT_TEXT_FILES_PER_MESSAGE,
 		fileReferenceMessageForDisplay,

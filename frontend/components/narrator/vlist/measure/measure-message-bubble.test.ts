@@ -647,7 +647,7 @@ describe("measureMessageBubble — user attachments", () => {
 		const { measureMessageBubble } = await import("./measure-message-bubble");
 		const plain = measureMessageBubble({ role: "user", text: "hi" }, 1000);
 		const withUnknown = measureMessageBubble(
-			{ role: "user", text: "hi", attachments: [{ type: "video" }] },
+			{ role: "user", text: "hi", attachments: [{ type: "unknown_attachment" }] },
 			1000,
 		);
 		expect(withUnknown.height).toBe(plain.height);

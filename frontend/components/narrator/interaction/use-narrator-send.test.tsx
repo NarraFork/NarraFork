@@ -163,6 +163,81 @@ describe("structured send snapshots", () => {
 		});
 		return { doc, projection, images, textFiles };
 	}
+	function mediaDraft(mediaOnly = false) {
+		const media = [
+			new File([new Uint8Array([0, 128, 255])], "voice.wav", { type: "audio/wav" }),
+			new File([new Uint8Array([255, 0, 129])], "clip.mp4", { type: "video/mp4" }),
+		];
+		const assets = [media[1], media[0]].map((file) => ({
+			id: getComposerAssetId(file),
+			kind: file.type === "audio/wav" ? ("audio" as const) : ("video" as const),
+			name: file.name,
+			size: file.size,
+			mimeType: file.type,
+		}));
+		const doc: ComposerDocument = {
+			version: 1,
+			assets,
+			paragraphs: [
+				{
+					children: [
+						...(mediaOnly ? [] : [{ type: "text" as const, text: "检查😀 " }]),
+						...assets.map((asset) => ({
+							type: "attachment" as const,
+							id: `${asset.id}-node`,
+							assetId: asset.id,
+						})),
+					],
+				},
+			],
+		};
+		const projection = composerDocumentText(doc);
+		Object.assign(options.composerRef.current ?? {}, {
+			getDocument: () => doc,
+			getText: () => projection.text,
+			getFileReferences: () => projection.fileReferences,
+			isTextEmpty: () => !projection.text,
+		});
+		return { media, doc, projection };
+	}
+	for (const state of ["busy", "idle", "compacting"] as const) {
+		for (const mediaOnly of [false, true]) {
+			test(`${state} sends ${mediaOnly ? "media-only" : "text plus media"} in exact manifest order`, async () => {
+				const { media, doc, projection } = mediaDraft(mediaOnly);
+				await render({
+					isActive: state === "busy",
+					showCompactQueueChoice: state === "compacting",
+					attachedMedia: media,
+				});
+				await act(async () => actions.handleSend());
+				expect(send).toHaveBeenCalledTimes(1);
+				expect(send.mock.calls[0]?.[1]).toBe(projection.text);
+				expect(send.mock.calls[0]?.[10]).toEqual({ composerDocument: doc });
+				expect(send.mock.calls[0]?.[11]).toEqual([media[1], media[0]]);
+				const uploaded = send.mock.calls[0]?.[11]?.[0];
+				if (!uploaded) throw new Error("Expected native media upload");
+				expect(new Uint8Array(await uploaded.arrayBuffer())).toEqual(new Uint8Array([255, 0, 129]));
+				expect(notify).not.toHaveBeenCalled();
+			});
+		}
+		test(`${state} cancelled native upload restores the identical rich document and media`, async () => {
+			const { media, doc } = mediaDraft();
+			send.mockRejectedValue(new DOMException("Cancelled", "AbortError"));
+			await render({
+				isActive: state === "busy",
+				showCompactQueueChoice: state === "compacting",
+				attachedMedia: media,
+			});
+			await act(async () => actions.handleSend());
+			expect(send.mock.calls[0]?.[11]).toEqual([media[1], media[0]]);
+			expect(options.composerRef.current?.getDocument?.()).toBe(doc);
+			expect(options.composerRef.current?.getText()).toBe(composerDocumentText(doc).text);
+			expect(options.attachedMedia).toEqual(media);
+			expect(options.composerRef.current?.hideTextForSend).not.toHaveBeenCalled();
+			expect(options.composerRef.current?.restoreInput).not.toHaveBeenCalled();
+			expect(options.clearAttachedFilesAndDraft).not.toHaveBeenCalled();
+		});
+	}
 	test.each([
 		"busy",
 		"idle",

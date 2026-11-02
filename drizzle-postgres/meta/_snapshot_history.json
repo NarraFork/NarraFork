@@ -384,6 +384,14 @@
 			"prevId": "87e33132-68f8-41ad-9605-925309958431",
 			"version": "7",
 			"snapshotDigest": "a3ae8c711d84cab6ccf2ae7ba7b631423d02e3b6e199ed36173704f6c682c43c"
+		},
+		{
+			"idx": 48,
+			"tag": "0048_native_media",
+			"id": "5ac21501-be67-4be3-b3bb-5bd339833e99",
+			"prevId": "39f50ea4-8ecc-468b-be8c-8acc9f70aa65",
+			"version": "7",
+			"snapshotDigest": "f559c560c98e635c863def71b296c8649698a49852ff7c371ca489677c2bf7ef"
 		}
 	]
 }

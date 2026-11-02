@@ -763,6 +763,7 @@ export function createPublicationOutbox(db: RuntimeDb, options: PublicationOutbo
 				metadataJson: null,
 				payloadRefJson: null,
 				imagesJson: null,
+				mediaJson: null,
 				textFilePathsJson: null,
 				fileReferencesJson: null,
 				creatorJson: null,
