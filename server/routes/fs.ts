@@ -34,18 +34,18 @@ import {
 	SECRET_PATH_REFUSAL,
 } from "../lib/fs-secret-paths";
 import { checkWriteBoundary, describeWriteRefusal } from "../lib/fs-write-boundary";
+import { PROJECT_PROMPT_FILENAMES } from "../lib/global-prompt-paths";
 import { generateId } from "../lib/id";
+import { clearInstructionFileCache } from "../lib/instruction-file-cache";
 import { logger } from "../lib/logger";
 import { requireNarratorAccess } from "../lib/narrator-access";
 import { getHome, IS_LINUX, IS_MACOS, IS_WINDOWS } from "../lib/platform";
+import { decodeUtf8Prefix, MAX_PROJECT_INSTRUCTIONS_BYTES } from "../lib/read-file-capped";
 import { buildRevealUri, issueRevealToken } from "../lib/reveal-protocol";
 import { ensureRevealProtocolRegistered } from "../lib/reveal-protocol-registration";
 import { getLocalServerOrigin } from "../lib/server-restart";
 import { settings } from "../lib/settings";
 import { sanitizeSvg } from "../lib/svg-sanitize";
-import { PROJECT_PROMPT_FILENAMES } from "../lib/global-prompt-paths";
-import { clearInstructionFileCache } from "../lib/instruction-file-cache";
-import { decodeUtf8Prefix, MAX_PROJECT_INSTRUCTIONS_BYTES } from "../lib/read-file-capped";
 import {
 	fsWriteSchema,
 	projectPromptReadSchema,
