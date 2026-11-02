@@ -105,6 +105,16 @@ mock.module("../../hooks/useProjectDirStatus", () => ({
 mock.module("../../hooks/useNarrator", () => ({
 	useCreateNarrator: () => ({ mutate: create, isPending: false }),
 }));
+// The dialog offers "insert from prompt library" next to the project-prompt box. The
+// library itself is covered by its own tests, so this file only needs an empty one —
+// mocking the hook (like every other collaborator here) keeps the component's internal
+// query/mutation wiring out of this test's surface.
+mock.module("../../hooks/usePromptLibrary", () => ({
+	usePromptLibrary: () => ({ data: [], isLoading: false }),
+	useCreatePrompt: () => ({ mutate: mock(() => {}), isPending: false }),
+	useUpdatePrompt: () => ({ mutate: mock(() => {}), isPending: false }),
+	useDeletePrompt: () => ({ mutate: mock(() => {}), isPending: false }),
+}));
 const idleMutation = { mutate: mock(() => {}), reset: mock(() => {}), isPending: false };
 mock.module("../../hooks/useFavoriteDirectories", () => ({
 	useFavoriteDirectories: () => ({ data: [] }),

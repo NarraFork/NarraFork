@@ -122,6 +122,15 @@ mock.module("../../hooks/useProjectDirStatus", () => ({
 mock.module("../../hooks/useNarrator", () => ({
 	useCreateNarrator: () => ({ mutate: create, isPending: false }),
 }));
+// The dialog reads the prompt library for its "insert from library" picker. An empty
+// library is enough here: this file is about git identity, and mocking the hook keeps
+// the component's query/mutation wiring out of this test's surface.
+mock.module("../../hooks/usePromptLibrary", () => ({
+	usePromptLibrary: () => ({ data: [], isLoading: false }),
+	useCreatePrompt: () => ({ mutate: mock(() => {}), isPending: false }),
+	useUpdatePrompt: () => ({ mutate: mock(() => {}), isPending: false }),
+	useDeletePrompt: () => ({ mutate: mock(() => {}), isPending: false }),
+}));
 const mutation = { mutate: mock(() => {}), reset: mock(() => {}), isPending: false };
 mock.module("../../hooks/useFavoriteDirectories", () => ({
 	useFavoriteDirectories: () => ({ data: [] }),
