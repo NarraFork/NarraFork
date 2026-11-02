@@ -50,6 +50,11 @@
 		"inProgress_one": "进行中 · {{count}}",
 		"inProgress_other": "进行中 · {{count}}",
 		"inProgressHint": "这个块下面未完成的任务；点一条聚焦到它。",
+		"inProgressMore_one": "还有 {{count}} 个，聚焦到这个块查看",
+		"inProgressMore_other": "还有 {{count}} 个，聚焦到这个块查看",
+		"hiddenUnder_one": "任务下 +{{count}}",
+		"hiddenUnder_other": "任务下 +{{count}}",
+		"hiddenUnderHint": "这个块下面只有已完成或已取消的任务，事实视图不显示它们；切到“全部”查看。",
 		"more_one": "… 还有 {{count}} 项",
 		"more_other": "… 还有 {{count}} 项",
 		"moreAtRoot_one": "… 还有 {{count}} 个块放不下，请聚焦到其中一部分。",
@@ -177,6 +182,8 @@
 		"inProgress_one": "进行中 · {{count}}",
 		"inProgress_other": "进行中 · {{count}}",
 		"inProgressHint": "这个块下面未完成的任务",
+		"hiddenUnder_one": "任务下 +{{count}}",
+		"hiddenUnder_other": "任务下 +{{count}}",
 		"waitingConfirmation": "等确认"
 	},
 	"map": {
@@ -245,7 +252,7 @@
 		"failed": "没能改动锁定",
 		"unlockHint": "解锁会撤回所有等确认的改动。",
 		"session": "会话「{{title}}」",
-		"untitledSession": "未命名的会话"
+		"untitledSession": "某个会话"
 	},
 	"pending": {
 		"badge": "等确认",
@@ -255,6 +262,10 @@
 		"decider": "交给 {{name}} 确认",
 		"deciderWithDelegate": "交给 {{name}}（或 {{delegate}}）确认",
 		"changedSince": "提议之后又有人改过：确认时会合并，有重叠就会失败。",
+		"changedUnder_one": "提议删除之后，它下面有 {{count}} 个块被新增、修改或移走：确认会被拒绝。",
+		"changedUnder_other": "提议删除之后，它下面有 {{count}} 个块被新增、修改或移走：确认会被拒绝。",
+		"changes_one": "{{count}} 处改动",
+		"changes_other": "{{count}} 处改动",
 		"confirm": "确认",
 		"reject": "拒绝",
 		"reasonPlaceholder": "理由（agent 会读到）",

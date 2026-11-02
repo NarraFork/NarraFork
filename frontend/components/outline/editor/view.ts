@@ -1563,11 +1563,9 @@ class BlockView implements NodeView {
 		this.chip = document.createElement("span");
 		this.chip.className = "ob-hidden";
 		this.chip.contentEditable = "false";
-		this.chip.setAttribute("role", "button");
-		this.chip.title = chromeText.hiddenHint;
 		this.chip.addEventListener("mousedown", (e) => {
 			e.preventDefault();
-			this.toggleTaskList();
+			if (this.chip.dataset.open) this.toggleTaskList();
 		});
 		this.marksEl = document.createElement("span");
 		this.marksEl.className = "ob-marks";
@@ -1658,8 +1656,20 @@ class BlockView implements NodeView {
 		});
 		const hidden = (n.attrs.hidden as number) ?? 0;
 		const open = hidden > 0 ? this.owner.hiddenTasks(id).length : 0;
-		this.chip.textContent = open > 0 ? chromeText.hidden(open) : "";
-		this.chip.style.display = open > 0 ? "" : "none";
+		// Open tasks: the "in progress" marker, which lists them. Only done or cancelled ones: how
+		// many blocks the facts view leaves out, as before (`+N under tasks`).
+		this.chip.textContent =
+			open > 0 ? chromeText.hidden(open) : hidden > 0 ? chromeText.hiddenUnder(hidden) : "";
+		this.chip.style.display = hidden > 0 ? "" : "none";
+		if (open > 0) {
+			this.chip.dataset.open = "1";
+			this.chip.setAttribute("role", "button");
+			this.chip.title = chromeText.hiddenHint;
+		} else {
+			delete this.chip.dataset.open;
+			this.chip.removeAttribute("role");
+			this.chip.title = "";
+		}
 		if (open === 0 && this.taskList) {
 			this.taskList.remove();
 			this.taskList = null;

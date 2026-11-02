@@ -4,11 +4,14 @@
  *
  *   - the side panel of a focused task locks its plan (naming a session to confirm on the
  *     person's behalf) and unlocks it; the live editor shows the lock's badge on the task;
- *   - an agent's change to the locked plan is held: the touched block shows "Waiting for
- *     confirmation" in the editor, the side panel grows a "To confirm" tab with the change's
- *     diff, and confirming it there writes it (the editor shows the confirmed text) and the tab
- *     goes;
- *   - the facts view's "in progress" marker lists the open tasks under a fact and focuses one.
+ *   - an agent's change to the locked plan is held: the page learns of it over its narrator
+ *     socket subscription (`outline_page_pending`, then a re-read; nothing is refreshed by hand),
+ *     the touched block shows "Waiting for confirmation" in the editor, the side panel grows a
+ *     "To confirm" tab with the change's diff, and confirming it there writes it (the editor
+ *     shows the confirmed text) and the tab goes;
+ *   - rejecting one there, with a reason, writes nothing and the marks go;
+ *   - the facts view's "in progress" marker lists the open tasks under a fact and focuses one;
+ *     a fact with only done tasks under it shows how many blocks are left out instead.
  */
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { existsSync } from "node:fs";
@@ -32,6 +35,11 @@ import {
 	type OutlineLiveWS,
 	releaseOutlineLive,
 } from "../../../server/websocket/outline-live-ws";
+import {
+	handleOutlinePageMessage,
+	type OutlinePageSocket,
+	releaseOutlinePageSubscriptions,
+} from "../../../server/websocket/outline-page-ws";
 import type * as Fixture from "./outline-pending.browser-fixture";
 
 type FixtureWindow = Window & { fixture: typeof Fixture };
@@ -48,6 +56,17 @@ let projectId: string;
 let space: OutlineSpaceRow;
 let agent: string;
 let lead: string;
+/** Pages a narrator socket subscribed to (the server answered the subscription). */
+const subscribedPages = new Set<string>();
+
+/** Wait until the page's subscription is in place, so a change hint reaches it. */
+async function subscribed(pageId: string): Promise<void> {
+	const until = Date.now() + 10_000;
+	while (!subscribedPages.has(pageId)) {
+		if (Date.now() > until) throw new Error(`page ${pageId} never subscribed`);
+		await Bun.sleep(20);
+	}
+}
 
 function api() {
 	const app = new Hono();
@@ -92,14 +111,22 @@ beforeAll(async () => {
 	const script = `/${basename(entry.path)}`;
 	const styles = [...assets.keys()].filter((path) => path.endsWith(".css"));
 	const app = api();
-	server = Bun.serve<{ userId: string; username: string; userRole: string }>({
+	server = Bun.serve<{
+		userId: string;
+		username: string;
+		userRole: string;
+		kind: "live" | "narrator";
+	}>({
 		hostname: "127.0.0.1",
 		port: 0,
 		fetch(request, srv) {
 			const url = new URL(request.url);
-			if (url.pathname === "/live") {
-				const userId = url.searchParams.get("user") ?? "";
-				if (srv.upgrade(request, { data: { userId, username: "alice", userRole: "user" } }))
+			if (url.pathname === "/live" || url.pathname === "/ws/narrator") {
+				// The live editor's socket names its person; the narrator socket (the page's change
+				// hints) carries the token, which this server takes as the user id.
+				const kind = url.pathname === "/live" ? "live" : "narrator";
+				const userId = url.searchParams.get(kind === "live" ? "user" : "token") ?? "";
+				if (srv.upgrade(request, { data: { userId, username: "alice", userRole: "user", kind } }))
 					return undefined;
 				return new Response("upgrade failed", { status: 400 });
 			}
@@ -117,15 +144,31 @@ beforeAll(async () => {
 		},
 		websocket: {
 			message(ws, message) {
+				if (ws.data.kind === "narrator") {
+					// Only the outline page subscription is served on the narrator socket here.
+					if (typeof message !== "string") return;
+					const frame = JSON.parse(message) as { type?: string; pageId?: string };
+					if (frame.type === "outline_page_subscribe" || frame.type === "outline_page_unsubscribe")
+						void handleOutlinePageMessage(
+							ws as unknown as OutlinePageSocket,
+							frame as Parameters<typeof handleOutlinePageMessage>[1],
+						).then(() => {
+							if (frame.type === "outline_page_subscribe" && frame.pageId)
+								subscribedPages.add(frame.pageId);
+						});
+					return;
+				}
 				if (typeof message === "string") return;
 				const bytes = new Uint8Array(message.buffer, message.byteOffset, message.byteLength);
 				handleOutlineLiveBinary(ws as unknown as OutlineLiveWS, bytes);
 			},
 			drain(ws) {
-				drainOutlineLive(ws as unknown as OutlineLiveWS);
+				if (ws.data.kind === "live") drainOutlineLive(ws as unknown as OutlineLiveWS);
 			},
 			close(ws) {
-				releaseOutlineLive(ws as unknown as OutlineLiveWS);
+				if (ws.data.kind === "narrator")
+					releaseOutlinePageSubscriptions(ws as unknown as OutlinePageSocket);
+				else releaseOutlineLive(ws as unknown as OutlineLiveWS);
 			},
 		},
 	});
@@ -190,6 +233,7 @@ async function openPage(
 	await page.waitForSelector("[data-testid=outline-editor] .ProseMirror[contenteditable=true]", {
 		timeout: 15_000,
 	});
+	await until(page, "the narrator socket", (f) => f.socketConnected());
 	return { page, errors };
 }
 
@@ -283,6 +327,7 @@ test("an agent's change to the locked plan waits: marked in the editor, confirme
 		await call(page, (f) => f.click("[data-testid=outline-lock]"));
 		await until(page, "locked", (f) => f.count("[data-testid=outline-unlock]") === 1);
 		expect(await call(page, (f) => f.count("[data-testid=outline-pending-tab]"))).toBe(0);
+		await subscribed(p.root);
 
 		// An agent rewrites a step of the locked plan: held for confirmation.
 		const held = await writeOutline({
@@ -293,7 +338,7 @@ test("an agent's change to the locked plan waits: marked in the editor, confirme
 			responsibleUserId: owner,
 		});
 		expect(held.pending).toBeDefined();
-		await call(page, (f) => f.refresh());
+		// No refresh by hand: the page hears of it over its subscription and reads again.
 		await until(
 			page,
 			"the step marked",
@@ -317,6 +362,8 @@ test("an agent's change to the locked plan waits: marked in the editor, confirme
 		expect(diff).toContain("Before: Parse the header");
 		expect(diff).toContain("Proposed: Parse the header and the footer");
 		expect(diff).toContain("Proposed by the session Worker");
+		// The agent said nothing about it: the list says how big it is.
+		expect(diff).toContain("1 change");
 
 		await call(page, (f) => f.click("[data-testid=outline-pending-confirm]"));
 		await until(page, "the tab gone", (f) => f.count("[data-testid=outline-pending-tab]") === 0);
@@ -328,6 +375,60 @@ test("an agent's change to the locked plan waits: marked in the editor, confirme
 			(f.textOf("outline-editor") ?? "").includes("Parse the header and the footer"),
 		);
 		await until(page, "the mark gone", (f) => f.count("[data-testid=outline-pending-badge]") === 0);
+		expect(errors).toEqual([]);
+	} finally {
+		await page.close();
+	}
+}, 60_000);
+
+test("rejecting an agent's change from the To confirm tab, with a reason, writes nothing and the marks go", async () => {
+	const p = await plan("Ship the validator");
+	const { page, errors } = await openPage(p.root, "all");
+	try {
+		await until(page, "the lock section", (f) => f.count("[data-testid=outline-lock]") === 1);
+		await call(page, (f) => f.click("[data-testid=outline-lock]"));
+		await until(page, "locked", (f) => f.count("[data-testid=outline-unlock]") === 1);
+		await subscribed(p.root);
+
+		const held = await writeOutline({
+			spaceId: space.id,
+			ops: [{ op: "update", block: { id: p.two }, content: "Load the rows twice" }],
+			actor: { kind: "agent", id: agent },
+			narratorId: agent,
+			responsibleUserId: owner,
+		});
+		expect(held.pending).toBeDefined();
+		await until(
+			page,
+			"the To confirm tab",
+			(f) => f.count("[data-testid=outline-pending-tab]") === 1,
+		);
+		await until(
+			page,
+			"the step marked",
+			(f) => f.count("[data-testid=outline-pending-badge]") >= 1,
+		);
+		await call(page, (f) => f.click("[data-testid=outline-pending-tab]"));
+		await until(
+			page,
+			"the change's diff",
+			(f) => f.count("[data-testid=outline-pending-entry]") === 1,
+		);
+		await call(page, (f) =>
+			f.type(
+				"textarea[data-testid=outline-pending-reason], [data-testid=outline-pending-reason] textarea",
+				"Keep it to one pass",
+			),
+		);
+		await call(page, (f) => f.click("[data-testid=outline-pending-reject]"));
+		await until(page, "the tab gone", (f) => f.count("[data-testid=outline-pending-tab]") === 0);
+		const row = (await outlineStore.getPending([held.pending?.id as string]))[0];
+		expect(row?.status).toBe("rejected");
+		expect(row?.reason).toBe("Keep it to one pass");
+		await until(page, "the mark gone", (f) => f.count("[data-testid=outline-pending-badge]") === 0);
+		// Nothing was written: the step reads as before, in the editor and in the store.
+		expect(await call(page, (f, id: string) => f.blockText(id), p.two)).toBe("Load the rows");
+		expect((await outlineStore.getBlock(p.two))?.content).toBe("Load the rows");
 		expect(errors).toEqual([]);
 	} finally {
 		await page.close();
@@ -348,6 +449,13 @@ test("the facts view's in-progress marker lists the open tasks under a fact and 
 			},
 			{ op: "insert", parent: { tempId: "f" }, content: "Old files", task: { status: "done" } },
 			{ op: "insert", parent: { tempId: "f" }, content: "Encoding", task: { status: "todo" } },
+			{ op: "insert", tempId: "g", parent: { tempId: "p" }, content: "Imports are JSON" },
+			{
+				op: "insert",
+				parent: { tempId: "g" },
+				content: "Old importer",
+				task: { status: "done" },
+			},
 		],
 		actor: { kind: "human", id: owner },
 		responsibleUserId: owner,
@@ -358,6 +466,8 @@ test("the facts view's in-progress marker lists the open tasks under a fact and 
 		await until(page, "the marker", (f) =>
 			(f.textOf("outline-editor") ?? "").includes("In progress · 2"),
 		);
+		// Only a done task under the other fact: no marker to open, how many blocks are left out.
+		expect(await call(page, (f) => f.textOf("outline-editor"))).toContain("+1 under a task");
 		await call(
 			page,
 			(f, id: string) => f.click(`.ob-block[data-id="${id}"] > .ob-hidden`, "mousedown"),

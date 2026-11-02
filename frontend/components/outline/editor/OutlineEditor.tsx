@@ -206,6 +206,7 @@ function LiveOutlineEditor(props: OutlineEditorProps & { shared: SharedLiveSessi
 	chromeText.task = t("editor.changeStatus");
 	chromeText.hidden = (count) => t("editor.inProgress", { count });
 	chromeText.hiddenHint = t("editor.inProgressHint");
+	chromeText.hiddenUnder = (count) => t("editor.hiddenUnder", { count });
 	chromeText.waiting = t("editor.waitingConfirmation");
 	chromeText.locked = (name) => t("lock.badge", { name });
 	chromeText.pending = t("pending.badge");

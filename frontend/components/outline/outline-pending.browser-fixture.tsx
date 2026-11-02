@@ -1,7 +1,8 @@
 /**
  * Browser fixture of an outline page with a locked plan (P2 PR 6): the real `OutlineSurface`
  * (live editor, side panel, timeline) in a memory router, against the test server's outline API
- * and live sessions (`outline-pending.browser.test.ts`); live frames go over a plain WebSocket.
+ * and live sessions (`outline-pending.browser.test.ts`); live frames go over a plain WebSocket,
+ * and the page's change hints (`outline_page_*`) over the app's own narrator socket.
  */
 import "@mantine/core/styles.css";
 import { MantineProvider } from "@mantine/core";
@@ -17,6 +18,7 @@ import i18next from "i18next";
 import { useState } from "react";
 import { createRoot } from "react-dom/client";
 import { I18nextProvider, initReactI18next } from "react-i18next";
+import { narratorWSManager } from "../../lib/narrator-ws-manager";
 import outlineEn from "../../locales/en/outline.json";
 import type { LiveTransport } from "./editor/live-client";
 import { overrideLiveTransportForTests } from "./editor/transport";
@@ -117,6 +119,8 @@ export function open(options: {
 	view?: "facts" | "all";
 }): void {
 	overrideLiveTransportForTests(new SocketTransport(options.wsUrl));
+	// The page subscription (`useOutlinePageLive`) rides the narrator socket, as in the app.
+	narratorWSManager.connect();
 	queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
 	queryClient.setQueryData(["settings"], { outline: { enabled: true } });
 	const client = queryClient;
@@ -145,9 +149,9 @@ export function focus(spaceId: string, blockId: string, view?: "facts" | "all"):
 	go?.({ spaceId, blockId, view });
 }
 
-/** Re-read everything (what the page subscription's frames do in the app). */
-export function refresh(): void {
-	void queryClient?.invalidateQueries({ queryKey: ["outline"] });
+/** Whether the narrator socket (the page subscription's) is connected. */
+export function socketConnected(): boolean {
+	return narratorWSManager.connected;
 }
 
 /** Blocks the surface was asked to focus, in order. */
@@ -162,6 +166,19 @@ export function textOf(testId: string): string | null {
 
 export function count(selector: string): number {
 	return document.querySelectorAll(selector).length;
+}
+
+/** Type into a textarea or input the way a person does (React sees the change). */
+export function type(selector: string, text: string): boolean {
+	const element = document.querySelector<HTMLTextAreaElement | HTMLInputElement>(selector);
+	if (!element) return false;
+	const proto =
+		element instanceof HTMLTextAreaElement
+			? HTMLTextAreaElement.prototype
+			: HTMLInputElement.prototype;
+	Object.getOwnPropertyDescriptor(proto, "value")?.set?.call(element, text);
+	element.dispatchEvent(new Event("input", { bubbles: true }));
+	return true;
 }
 
 /** Click the first element matching a selector (mousedown for the editor's own controls). */

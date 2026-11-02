@@ -127,19 +127,24 @@
 	display: none;
 }
 
-/* The "in progress" marker of the facts view (design §3.1): opens the list of open tasks. */
+/* What the facts view leaves out under a block (design §3.1): how many blocks under tasks. */
 .nf-outline-editor .ob-hidden {
 	position: absolute;
 	right: 0;
 	top: 0.15em;
 	font-size: 11px;
-	color: var(--mantine-color-yellow-text, var(--ob-muted));
 	border: 1px solid var(--ob-line);
 	border-radius: 8px;
 	padding: 0 5px;
 	user-select: none;
-	cursor: pointer;
+	color: var(--ob-muted);
 	z-index: 1;
+}
+
+/* Open tasks under the block: the marker opens their list. */
+.nf-outline-editor .ob-hidden[data-open] {
+	color: var(--mantine-color-yellow-text, var(--ob-muted));
+	cursor: pointer;
 }
 
 .nf-outline-editor .ob-task-list {

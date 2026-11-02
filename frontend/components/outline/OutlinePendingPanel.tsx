@@ -224,7 +224,7 @@ export function OutlinePendingList({
 								{p.label}
 							</Badge>
 							<Text size="sm" className={classes.ellipsis}>
-								{p.summary}
+								{p.summary || t("pending.changes", { count: p.ops })}
 							</Text>
 						</Group>
 						<Text size="xs" c="dimmed" className={classes.ellipsis}>
@@ -301,6 +301,7 @@ function PendingDetail({ spaceId, summary }: { spaceId: string; summary: Outline
 						placeholder={t("pending.reasonPlaceholder")}
 						value={reason}
 						onChange={(e) => setReason(e.currentTarget.value)}
+						data-testid="outline-pending-reason"
 					/>
 					<Group gap="xs">
 						<Button
@@ -363,6 +364,11 @@ export function DiffEntry({ entry }: { entry: OutlinePendingDiffEntry }) {
 					<b>{line.label}:</b> {line.text}
 				</Text>
 			))}
+			{entry.kind === "delete" && (entry.changedUnder ?? 0) > 0 && (
+				<Text size="xs" c="yellow" data-testid="outline-pending-changed-under">
+					{t("pending.changedUnder", { count: entry.changedUnder })}
+				</Text>
+			)}
 			{entry.kind === "task" && (
 				<Text size="xs">
 					{task === null

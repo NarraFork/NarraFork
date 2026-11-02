@@ -104,7 +104,7 @@ const OutlineRow = memo(function OutlineRow({
 					block.tags.length > 0 ||
 					block.task?.assignee ||
 					block.task?.due ||
-					(factsView && block.openTasks > 0) ||
+					(factsView && block.processHidden > 0) ||
 					block.lock ||
 					block.pending.length > 0 ||
 					block.hidden > 0) && (
@@ -131,6 +131,19 @@ const OutlineRow = memo(function OutlineRow({
 						))}
 						{factsView && block.openTasks > 0 && (
 							<InProgressMarker block={block} spaceId={spaceId} search={search} />
+						)}
+						{factsView && block.openTasks === 0 && block.processHidden > 0 && (
+							<Tooltip label={t("page.hiddenUnderHint")} openDelay={300}>
+								<Badge
+									size="xs"
+									variant="light"
+									color="gray"
+									tt="none"
+									data-testid="outline-hidden-under"
+								>
+									{t("page.hiddenUnder", { count: block.processHidden })}
+								</Badge>
+							</Tooltip>
 						)}
 						{block.lock && (
 							<Badge
@@ -231,6 +244,18 @@ function InProgressMarker({
 							)}
 						</OutlineLink>
 					))}
+					{block.openTasks > block.inProgress.length && (
+						<OutlineLink
+							to={outlineBlockTarget(spaceId, block.id, "all", search.asOf)}
+							className={classes.listItem}
+						>
+							<Text size="xs" c="dimmed">
+								{t("page.inProgressMore", {
+									count: block.openTasks - block.inProgress.length,
+								})}
+							</Text>
+						</OutlineLink>
+					)}
 				</Stack>
 			</Popover.Dropdown>
 		</Popover>

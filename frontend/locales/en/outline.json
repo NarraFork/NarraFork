@@ -50,6 +50,11 @@
 		"inProgress_one": "In progress · {{count}}",
 		"inProgress_other": "In progress · {{count}}",
 		"inProgressHint": "Open tasks under this block; pick one to focus on it.",
+		"inProgressMore_one": "{{count}} more: focus on this block to see it",
+		"inProgressMore_other": "{{count}} more: focus on this block to see them",
+		"hiddenUnder_one": "+{{count}} under a task",
+		"hiddenUnder_other": "+{{count}} under tasks",
+		"hiddenUnderHint": "Only done or cancelled tasks are under this block; the facts view leaves them out. Switch to All to see them.",
 		"more_one": "… {{count}} more",
 		"more_other": "… {{count}} more",
 		"moreAtRoot_one": "… {{count}} more block does not fit on this page; focus on a part of it.",
@@ -177,6 +182,8 @@
 		"inProgress_one": "In progress · {{count}}",
 		"inProgress_other": "In progress · {{count}}",
 		"inProgressHint": "Open tasks under this block",
+		"hiddenUnder_one": "+{{count}} under a task",
+		"hiddenUnder_other": "+{{count}} under tasks",
 		"waitingConfirmation": "waiting for confirmation"
 	},
 	"map": {
@@ -245,7 +252,7 @@
 		"failed": "Could not change the lock",
 		"unlockHint": "Unlocking withdraws the changes waiting for confirmation.",
 		"session": "the session {{title}}",
-		"untitledSession": "an untitled session"
+		"untitledSession": "a session"
 	},
 	"pending": {
 		"badge": "Waiting for confirmation",
@@ -255,6 +262,10 @@
 		"decider": "For {{name}} to confirm",
 		"deciderWithDelegate": "For {{name}} (or {{delegate}}) to confirm",
 		"changedSince": "Changed since it was proposed: confirming merges the changes, or fails if they overlap.",
+		"changedUnder_one": "Since the deletion was proposed, {{count}} block in or under it was added, changed or moved away: confirming will be refused.",
+		"changedUnder_other": "Since the deletion was proposed, {{count}} blocks in or under it were added, changed or moved away: confirming will be refused.",
+		"changes_one": "{{count}} change",
+		"changes_other": "{{count}} changes",
 		"confirm": "Confirm",
 		"reject": "Reject",
 		"reasonPlaceholder": "Why (the agent reads this)",

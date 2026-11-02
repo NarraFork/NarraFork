@@ -27,6 +27,8 @@ export const chromeText = {
 	hidden: (count: number) => `In progress · ${count}`,
 	/** Its tooltip. */
 	hiddenHint: "Open tasks under this block",
+	/** On a block whose hidden tasks are all done or cancelled: how many blocks are left out. */
+	hiddenUnder: (count: number) => `+${count}`,
 	/** A task in the marker's list waiting for confirmation. */
 	waiting: "waiting for confirmation",
 	/** On a locked task: who locked it. */
