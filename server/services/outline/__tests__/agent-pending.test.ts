@@ -124,7 +124,7 @@ async function lockedPlan() {
 
 /** The label (`P…`) a result or read names. */
 function labelIn(text: string): string {
-	const m = /\b(P[A-Za-z0-9_-]{8})\b/.exec(text);
+	const m = /\b(P[A-Za-z0-9]{8})\b/.exec(text);
 	if (!m) throw new Error(`no pending label in: ${text}`);
 	return m[1] as string;
 }

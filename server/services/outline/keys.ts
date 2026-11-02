@@ -1,5 +1,6 @@
 /**
- * Short names in block addresses (`key/sid`): space keys and block sids.
+ * Short names in block addresses (`key/sid`): space keys and block sids; and the ids of pending
+ * changes, which people and agents write as `P` and the id.
  *
  * Both come from `generateShortId`, keeping only draws made of letters and digits (about 3 in
  * 4 are). Its alphabet also has `-` and `_`: an address token may not start with either
@@ -24,5 +25,10 @@ export function newOutlineKey(): string {
 
 /** A new block sid. Uniqueness within the space is the caller's to check. */
 export function newOutlineSid(): string {
+	return alphanumericShortId();
+}
+
+/** A new pending change id (`P` and it name the change). Uniqueness: its primary key. */
+export function newOutlinePendingId(): string {
 	return alphanumericShortId();
 }

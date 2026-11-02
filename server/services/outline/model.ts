@@ -188,6 +188,6 @@ export function outlinePendingLabel(id: string): string {
 
 /** The id a pending change's label (`P` and 8 characters) names, or null. */
 export function outlinePendingIdOf(label: string): string | null {
-	const m = /^P([A-Za-z0-9_-]{8})$/.exec(label.trim());
+	const m = /^P([A-Za-z0-9]{8})$/.exec(label.trim());
 	return m ? (m[1] as string) : null;
 }

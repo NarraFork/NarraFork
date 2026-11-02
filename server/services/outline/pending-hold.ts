@@ -5,8 +5,8 @@
  * tree (one per session and tree, builder decision 5). Reads: the writer's session, its open row
  * on the tree, and (for a new row) the open rows of the page, all indexed and bounded.
  */
-import { generateShortId } from "@server/lib/id";
 import { OutlineWriteError } from "./errors";
+import { newOutlinePendingId } from "./keys";
 import { OUTLINE_TEXT } from "./messages";
 import {
 	OUTLINE_LIMITS,
@@ -180,9 +180,9 @@ export async function buildPendingPut(args: {
 		by: { kind: tree.lock.by.kind, id: tree.lock.by.id },
 		delegate: tree.lock.delegate ?? null,
 	};
-	// Short ids: a change is named `P` and its id (builder decision 11); a collision is a
-	// uniqueness conflict the write plans again from.
-	const id = existing?.id ?? generateShortId();
+	// Short ids of letters and digits: a change is named `P` and its id (builder decision 11); a
+	// collision is a uniqueness conflict the write plans again from.
+	const id = existing?.id ?? newOutlinePendingId();
 	const row: OutlinePendingRow = {
 		id,
 		spaceId: space.id,
