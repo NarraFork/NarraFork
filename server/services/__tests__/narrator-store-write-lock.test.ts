@@ -19,8 +19,12 @@ const { narratorStore } = await import("../narrator-store");
 const BUSY_TIMEOUT_MS =
 	(sqlite.prepare("PRAGMA busy_timeout").get() as { timeout: number } | null)?.timeout ?? 250;
 
-/** 持锁时长短于一次 busy_timeout：等待中的写必须在锁释放后拿下，不能立刻失败。 */
-const HOLD_MS = Math.max(50, Math.round(BUSY_TIMEOUT_MS * 0.4));
+/**
+ * 持锁时长短于一次 busy_timeout：等待中的写必须在锁释放后拿下，不能立刻失败。
+ * 只占 busy_timeout 的五分之一，给负载高的 CI 留出 worker 调度余量；deferred 事务仍会在
+ * 几毫秒内失败，测试照样能区分两种行为。
+ */
+const HOLD_MS = Math.max(20, Math.round(BUSY_TIMEOUT_MS * 0.2));
 
 /**
  * 另一条连接持有写锁，并在主连接发出写入信号后 `holdMs` 才提交。连接在 worker 线程里，
