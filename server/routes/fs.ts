@@ -11,6 +11,7 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, extname, join, relative, resolve, sep } from "node:path";
+import type { Context } from "hono";
 import { Hono } from "hono";
 import { LOCAL_DEVICE_ID } from "../lib/agent/execution/backend";
 import { localBackend } from "../lib/agent/execution/local-backend";
@@ -27,6 +28,7 @@ import { wholeFileLineStats } from "../lib/agent/tools/file-diff-stats";
 import { getClientIp, isLocalMachineAddress } from "../lib/client-ip";
 import { buildAttachmentDisposition } from "../lib/content-disposition";
 import { AppError, ValidationError } from "../lib/errors";
+import { claimDownloadTicket, issueDownloadTicket } from "../lib/fs-download-ticket";
 import {
 	isSecretPlatformPath,
 	isSecretUserPath,
@@ -51,6 +53,7 @@ import {
 	executeEditorFileChange,
 	type FileChangeCompletion,
 } from "../services/file-change-runtime";
+import { copyFileToSystemClipboard } from "../services/file-clipboard";
 import { resolveNarratorProjectId } from "../services/narrator-project";
 import { findProjectDirCandidates, getProjectDirStatus } from "../services/project-dir";
 import { closeClaim, openClaim, sealClaim } from "../services/worktree-write-claims";
@@ -283,6 +286,72 @@ fsRoutes.post("/reveal", async (c) => {
 			resolve();
 		});
 	});
+
+	return c.json({ ok: true });
+});
+
+/**
+ * POST /api/fs/copy-file-to-clipboard
+ *
+ * Put a file on THIS machine's OS clipboard, so the user can paste it into a file manager and
+ * get the file itself. Body: { path: string }
+ *
+ * The browser cannot do this — `navigator.clipboard.write` only accepts text/HTML/PNG — while the
+ * process that already holds the file can do it with one helper call. The clipboard involved is
+ * the server machine's, so this is only meaningful for a browser running on that machine: a
+ * remote caller would copy the file onto someone else's clipboard and see nothing happen. Hence
+ * the `isLocalMachineAddress` refusal. The menu may also show the action when the user has opted
+ * into "treat as local access"; that preference is not a credential, so a remote browser still
+ * gets 403 here.
+ *
+ * The response is deliberately only `{ ok: true }`: the copy is not observable from here, and
+ * reporting success is honest because the helper exits 0 only after taking the clipboard.
+ */
+fsRoutes.post("/copy-file-to-clipboard", async (c) => {
+	const body = await readJsonBody(c.req);
+	const rawPath =
+		typeof (body as { path?: unknown } | null)?.path === "string"
+			? (body as { path: string }).path
+			: "";
+	if (!rawPath) {
+		throw new ValidationError("path is required");
+	}
+
+	// Refuse before probing existence: an answer about a secret's presence is itself a leak.
+	const absPath = resolve(rawPath);
+	assertReadableThroughFileApi(absPath);
+
+	if (!existsSync(absPath)) {
+		throw new ValidationError(`File does not exist: ${absPath}`);
+	}
+	let stat: ReturnType<typeof statSync>;
+	try {
+		stat = statSync(absPath);
+	} catch {
+		throw new ValidationError(`Cannot access: ${absPath}`);
+	}
+	if (!stat.isFile()) {
+		throw new ValidationError(`Not a file: ${absPath}`);
+	}
+
+	if (!isLocalMachineAddress(getClientIp(c))) {
+		throw new AppError(
+			"Copying a file to the clipboard only works for a browser on the machine running NarraFork",
+			403,
+		);
+	}
+
+	try {
+		await copyFileToSystemClipboard(absPath);
+	} catch (error) {
+		// Missing wl-copy/xclip, a helper that refuses the path, a desktop that never answers:
+		// all of it is the caller's environment, not a server fault, and the message says which.
+		throw new AppError(
+			error instanceof Error ? error.message : String(error),
+			422,
+			"CLIPBOARD_UNAVAILABLE",
+		);
+	}
 
 	return c.json({ ok: true });
 });
@@ -880,23 +949,19 @@ function sha256Hex(text: string): string {
 const MAX_DOWNLOAD_BYTES = 2 * 1024 * 1024 * 1024; // 2 GB
 
 /**
- * GET /api/fs/download?path=...
+ * Resolve a caller-supplied path to a downloadable regular file.
  *
- * Serve a file as an attachment. Separate from `/preview` rather than a flag on
- * it: preview is capped for rendering (1 MB text / 20 MB binary) and marked
- * cacheable, whereas a download must reach files above those caps, must never be
- * cached under a session credential, and must not sniff as HTML.
+ * Shared by the credential-carrying routes and the ticket-claiming one so the two can
+ * never disagree about what counts as downloadable. The order is the security-relevant
+ * part: the secret-path refusal comes FIRST, before existence is probed, because
+ * answering "does not exist" for a secret that is absent on this machine would turn the
+ * route into an existence oracle for exactly the files it is protecting.
+ *
+ * Returns the size too, so the caller decides how to report an over-limit file: a
+ * session route can answer with JSON, while a browser navigation gets a plain 413.
  */
-fsRoutes.get("/download", async (c) => {
-	const rawPath = c.req.query("path");
-	if (!rawPath) {
-		throw new ValidationError("path is required");
-	}
-
+function resolveDownloadableFile(rawPath: string): { absPath: string; size: number } {
 	const absPath = resolve(rawPath);
-	// FIRST, before existence is probed: the refusal is a property of the path, and
-	// answering "does not exist" for a secret that is absent on this machine would turn
-	// the route into an existence oracle for exactly the files it is protecting.
 	assertReadableThroughFileApi(absPath);
 
 	if (!existsSync(absPath)) {
@@ -913,13 +978,22 @@ fsRoutes.get("/download", async (c) => {
 	if (!stat.isFile()) {
 		throw new ValidationError(`Not a file: ${absPath}`);
 	}
-	if (stat.size > MAX_DOWNLOAD_BYTES) {
-		return c.json({ error: "File too large to download" }, 413);
-	}
 
-	// BunFile as the body directly: Bun sets Content-Length from it, so the
-	// browser can show real download progress (a ReadableStream would force
-	// chunked encoding and drop the length).
+	return { absPath, size: stat.size };
+}
+
+/**
+ * Stream a file as an attachment.
+ *
+ * The single place that decides a download's response shape, used by both the session
+ * route and the ticket route — a second copy is how the two would drift into serving
+ * different headers for the same file.
+ *
+ * BunFile goes in as the body directly: Bun sets Content-Length from it, so the browser
+ * can show real download progress (a ReadableStream would force chunked encoding and drop
+ * the length).
+ */
+function buildFileDownloadResponse(absPath: string, size: number): Response {
 	const file = Bun.file(absPath);
 	return new Response(file, {
 		headers: {
@@ -927,11 +1001,169 @@ fsRoutes.get("/download", async (c) => {
 			// `text/html` here would be a stored-XSS vector on a same-origin URL.
 			"Content-Type": "application/octet-stream",
 			"Content-Disposition": buildAttachmentDisposition(basename(absPath)),
-			"Content-Length": String(stat.size),
+			"Content-Length": String(size),
 			"Cache-Control": "no-store",
 			"X-Content-Type-Options": "nosniff",
 		},
 	});
+}
+
+/** The over-limit answer for a session client, which reads JSON. */
+function tooLargeToDownload(c: Context): Response {
+	return c.json({ error: "File too large to download" }, 413);
+}
+
+function escapeHtml(value: string): string {
+	return value
+		.replace(/&/g, "&amp;")
+		.replace(/</g, "&lt;")
+		.replace(/>/g, "&gt;")
+		.replace(/"/g, "&quot;");
+}
+
+/**
+ * What a human sees when the ticket navigation itself fails.
+ *
+ * The browser opened this URL in a tab. JSON would be readable but looks like a broken download;
+ * an HTML page with no path in it is the sentence, and CSP keeps it from becoming a script.
+ */
+function downloadFailureDocument(message: string, code: string, status: 403 | 413): Response {
+	const html = `<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Download failed</title>
+<p>${escapeHtml(message)}</p>
+<p><code>${escapeHtml(code)}</code></p>
+`;
+	return new Response(html, {
+		status,
+		headers: {
+			"Content-Type": "text/html; charset=utf-8",
+			"Cache-Control": "no-store",
+			"X-Content-Type-Options": "nosniff",
+			"Content-Security-Policy": "default-src 'none'",
+		},
+	});
+}
+
+/**
+ * GET /api/fs/download?path=...
+ *
+ * Serve a file as an attachment. Separate from `/preview` rather than a flag on
+ * it: preview is capped for rendering (1 MB text / 20 MB binary) and marked
+ * cacheable, whereas a download must reach files above those caps, must never be
+ * cached under a session credential, and must not sniff as HTML.
+ */
+fsRoutes.get("/download", async (c) => {
+	const rawPath = c.req.query("path");
+	if (!rawPath) {
+		throw new ValidationError("path is required");
+	}
+
+	const { absPath, size } = resolveDownloadableFile(rawPath);
+	if (size > MAX_DOWNLOAD_BYTES) {
+		return tooLargeToDownload(c);
+	}
+
+	return buildFileDownloadResponse(absPath, size);
+});
+
+/**
+ * POST /api/fs/download-ticket — mint a short-lived URL credential for one file.
+ *
+ * Exists so the browser can perform the download itself. The client cannot simply be
+ * pointed at `/download?path=…`: that route authenticates with an `Authorization`
+ * header, and a navigation carries none. Fetching the bytes into a Blob instead costs a
+ * full copy in page memory and cannot report progress. The click handler opens the tab
+ * before this request is awaited, then navigates that tab here; the gesture is the
+ * `window.open`, not this response.
+ *
+ * The path is validated HERE, while a session is present and the answer can be a specific
+ * JSON error. The ticket then carries only a random nonce — never the path — so the URL
+ * that ends up in browser history and proxy logs discloses nothing about the workspace.
+ */
+fsRoutes.post("/download-ticket", async (c) => {
+	const raw = await readJsonBody(c.req);
+	const rawPath =
+		typeof (raw as { path?: unknown } | null)?.path === "string"
+			? (raw as { path: string }).path
+			: "";
+	if (!rawPath) {
+		throw new ValidationError("path is required");
+	}
+
+	const { absPath, size } = resolveDownloadableFile(rawPath);
+	// Refuse before minting: a ticket for a file that can never be served only produces a
+	// browser error page, which is strictly worse than an error the client can explain.
+	if (size > MAX_DOWNLOAD_BYTES) {
+		return tooLargeToDownload(c);
+	}
+
+	const { ticket, expiresInMs } = issueDownloadTicket(absPath);
+	return c.json({ ticket, expiresInMs });
+});
+
+/**
+ * GET /api/fs/download?ticket=… — the browser's own download, authorized by the ticket.
+ *
+ * Mounted BEFORE the global session gate (`app.ts`), because the whole point is that no
+ * `Authorization` header is sent: the browser navigates here directly and streams the
+ * response to disk. The ticket is the credential, and it authorizes exactly one path that
+ * a session already validated (see `lib/fs-download-ticket.ts`).
+ *
+ * ⚠️ This router deliberately contains that one path and nothing else. Mounting the whole
+ * of `fsRoutes` early would publish every file endpoint — `/write`, `/edit-source`,
+ * `/browse` — to unauthenticated callers, which is why the public surface is a separate
+ * router rather than a flag on the session one.
+ *
+ * When no ticket is present the request falls through with `next()`, so the historical
+ * `?path=` form still reaches the session-authenticated route below it. That fall-through
+ * is what makes adding this router invisible to existing callers.
+ */
+export const fsPublicDownloadRoutes = new Hono();
+
+fsPublicDownloadRoutes.get("/download", async (c, next) => {
+	const ticket = c.req.query("ticket");
+	if (!ticket) return next();
+
+	const claim = claimDownloadTicket(ticket);
+	if (!claim.ok) {
+		// Distinct messages so a human reading the browser tab can tell "click again" from
+		// "this link never existed". Both are 403: the caller presented no valid capability.
+		logger.debug("Download ticket rejected", { reason: claim.reason });
+		const message =
+			claim.reason === "already_used"
+				? "This download link was already used. Try downloading the file again."
+				: claim.reason === "expired"
+					? "This download link has expired. Try downloading the file again."
+					: "Invalid download link.";
+		return downloadFailureDocument(message, `DOWNLOAD_TICKET_${claim.reason.toUpperCase()}`, 403);
+	}
+
+	// Re-validate: up to a minute passed since the ticket was minted, and the bytes on disk
+	// are not frozen in the meantime. The secret-path guard runs again too — a path that
+	// becomes credential-bearing after issuance must not ride an already-issued ticket.
+	let resolved: { absPath: string; size: number };
+	try {
+		resolved = resolveDownloadableFile(claim.path);
+	} catch (error) {
+		// A file deleted between click and navigation is the ordinary case here, and it must
+		// be a readable sentence rather than the route's usual JSON validation body.
+		logger.debug("Download ticket path no longer downloadable", {
+			error: error instanceof Error ? error.message : String(error),
+		});
+		return downloadFailureDocument(
+			"This file is no longer available for download.",
+			"DOWNLOAD_UNAVAILABLE",
+			403,
+		);
+	}
+
+	if (resolved.size > MAX_DOWNLOAD_BYTES) {
+		return downloadFailureDocument("File too large to download", "DOWNLOAD_TOO_LARGE", 413);
+	}
+
+	return buildFileDownloadResponse(resolved.absPath, resolved.size);
 });
 
 /**

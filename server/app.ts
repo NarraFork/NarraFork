@@ -38,7 +38,7 @@ import executionLogRoutes from "./routes/execution-log";
 import { executorBootstrapRoutes } from "./routes/executor-bootstrap";
 import { externalV1Routes } from "./routes/external-v1";
 import { favoriteRoutes } from "./routes/favorites";
-import { fsRoutes } from "./routes/fs";
+import { fsPublicDownloadRoutes, fsRoutes } from "./routes/fs";
 import { gatewayRoutes, handleWebhookRequest } from "./routes/gateway";
 import { geminiRoutes } from "./routes/gemini";
 import { genUiRoutes } from "./routes/gen-ui";
@@ -359,6 +359,14 @@ app.post(`${REVEAL_CLAIM_PATH}/:token`, (c) => {
 // Hono 按注册顺序匹配，挂载点晚于 requireSessionAuth 就永远轮不到这里。
 app.route("/api/update", localPeerUpdateRoutes);
 app.route("/api/system/lifecycle", managerLifecycleRoutes);
+
+// Public: the browser's own file download, authorized by a short-lived ticket minted from
+// the authenticated `POST /api/fs/download-ticket`. A navigation cannot carry the session's
+// `Authorization` header, so this is what lets the browser stream a download to disk
+// instead of the client buffering it into a Blob. Registered BEFORE the session gate:
+// Hono matches in registration order, so a mount below `requireSessionAuth` would never be
+// reached. Only that one path is public — the rest of /api/fs stays behind the gate.
+app.route("/api/fs", fsPublicDownloadRoutes);
 
 // All ordinary routes below require a first-party session. OAuth access tokens
 // must opt into an explicitly mounted external route and can never fall through
