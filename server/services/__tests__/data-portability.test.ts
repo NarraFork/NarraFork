@@ -417,3 +417,90 @@ describe("平台实例随供应商一起导出", () => {
 		}
 	});
 });
+
+describe("逐模型设置随供应商一起导出", () => {
+	const agent = () => settings.agent as unknown as Record<string, unknown>;
+
+	test("导入按「导入优先、本地独有保留」合并", async () => {
+		const original = structuredClone(settings);
+		try {
+			agent().hiddenModels = ["remote:hidden"];
+			agent().modelProtocols = { "remote:proto": "anthropic-messages" };
+			agent().customModels = [{ value: "remote:custom", label: "remote" }];
+
+			const exported = await exportData({ requests: false, sessions: false, providers: true });
+			const zip = await readFile(exported.zipPath);
+			const preview = await previewImport(toArrayBuffer(zip), "model-settings.zip");
+			expect(preview.providers.hiddenModels).toEqual(["remote:hidden"]);
+			expect(preview.providers.modelProtocols).toEqual({ "remote:proto": "anthropic-messages" });
+
+			// 本地换一套：一条独有、一条与导入同键但取值不同。
+			agent().hiddenModels = ["local:hidden"];
+			agent().modelProtocols = { "remote:proto": "gemini-compatible" };
+			agent().customModels = [];
+
+			await applyImport(preview.token, { conflictDefault: "skip" });
+
+			// 数组取并集；同键的协议以导入为准。
+			expect(agent().hiddenModels).toEqual(
+				expect.arrayContaining(["local:hidden", "remote:hidden"]),
+			);
+			expect(agent().modelProtocols).toEqual({ "remote:proto": "anthropic-messages" });
+			expect(agent().customModels).toEqual([{ value: "remote:custom", label: "remote" }]);
+		} finally {
+			saveSettings(original);
+		}
+	});
+
+	test("模型目录按 id 合并：同 id 以导入为准，本地独有保留", async () => {
+		const original = structuredClone(settings);
+		try {
+			agent().modelCatalog = {
+				schemaVersion: 2,
+				migrationVersion: 2,
+				autoApply: true,
+				pinnedVersion: null,
+				local: { revision: 3, models: [{ id: "m1", metadata: { max_input_tokens: 1000 } }] },
+			};
+
+			const exported = await exportData({ requests: false, sessions: false, providers: true });
+			const zip = await readFile(exported.zipPath);
+			const preview = await previewImport(toArrayBuffer(zip), "catalog.zip");
+
+			agent().modelCatalog = {
+				schemaVersion: 2,
+				migrationVersion: 2,
+				autoApply: false,
+				pinnedVersion: "v-local",
+				local: {
+					revision: 3,
+					models: [
+						{ id: "m1", metadata: { max_input_tokens: 2000 } },
+						{ id: "local-only", metadata: {} },
+					],
+				},
+			};
+
+			await applyImport(preview.token, { conflictDefault: "skip" });
+
+			const merged = agent().modelCatalog as {
+				autoApply: boolean;
+				pinnedVersion: string | null;
+				local: {
+					revision: number;
+					models: Array<{ id: string; metadata: Record<string, unknown> }>;
+				};
+			};
+			const byId = new Map(merged.local.models.map((model) => [model.id, model]));
+			// 同 id 用导入的那份，本地独有的条目留着。
+			expect(byId.get("m1")?.metadata).toEqual({ max_input_tokens: 1000 });
+			expect(byId.has("local-only")).toBe(true);
+			// 合并算一次本地编辑：revision 前进，实例级策略仍是本地的。
+			expect(merged.local.revision).toBe(4);
+			expect(merged.autoApply).toBe(false);
+			expect(merged.pinnedVersion).toBe("v-local");
+		} finally {
+			saveSettings(original);
+		}
+	});
+});

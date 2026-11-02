@@ -53,12 +53,22 @@ const PROVIDER_KEYS = [
 ] as const;
 
 /**
- * 平台实例挂在 `agent` 下，但它在语义上是供应商配置。
+ * 挂在 `agent` 下、但语义上属于供应商配置的字段。
  *
- * 导出包按顶层键平铺（`platformInstances`），导入/清空时再放回 `agent`，这样没有平台实例
- * 功能的版本读到的仍是同一份 providers.json 结构。
+ * 导出包按顶层键平铺，导入/清空时再放回 `agent`，这样没有平台实例功能的版本读到的仍是
+ * 同一份 providers.json 结构。
+ *
+ * 除实例清单外，逐模型的设置（隐藏、协议、自定义模型、上下文等元数据）也在这里：它们以
+ * `<前缀>:<模型>` 为键，换一份设置就全部对不上，必须跟供应商一起搬。
  */
-const AGENT_PROVIDER_KEYS = ["platformInstances"] as const;
+const AGENT_PROVIDER_KEYS = [
+	"platformInstances",
+	"hiddenModels",
+	"modelProtocols",
+	"modelProtocolOverrides",
+	"customModels",
+	"modelCatalog",
+] as const;
 
 type ProviderKey = (typeof PROVIDER_KEYS)[number] | (typeof AGENT_PROVIDER_KEYS)[number];
 type ClearTarget = "requests" | "sessions" | "providers" | "all";
@@ -1060,6 +1070,118 @@ function uniqueProviderId(taken: Set<string>): string {
 	}
 }
 
+/**
+ * 模型目录的合并：用户编辑层按 id 取并集，同键以导入为准。
+ *
+ * 实例级策略（`autoApply` / `pinnedVersion`）保留本地——导入搬的是模型数据，不是目录更新策略。
+ */
+function mergeModelCatalog(current: unknown, incoming: unknown): unknown {
+	const base = (current ?? {}) as Record<string, unknown>;
+	const patch = incoming as Record<string, unknown>;
+	const baseLocal = (base.local ?? {}) as Record<string, unknown>;
+	const patchLocal = (patch.local ?? {}) as Record<string, unknown>;
+
+	const byId = (before: unknown, after: unknown): unknown => {
+		if (!Array.isArray(after)) return before;
+		const map = new Map<string, unknown>();
+		for (const entry of (Array.isArray(before) ? before : []) as Array<Record<string, unknown>>) {
+			map.set(String(entry.id ?? ""), entry);
+		}
+		for (const entry of after as Array<Record<string, unknown>>) {
+			map.set(String(entry.id ?? ""), entry);
+		}
+		return [...map.values()];
+	};
+	// overrides 没有 id，用 target + targetId 定位同一条。
+	const mergeOverrides = (): unknown => {
+		if (!Array.isArray(patchLocal.overrides)) return baseLocal.overrides;
+		const keyOf = (entry: Record<string, unknown>) => `${entry.target}:${entry.targetId}`;
+		const map = new Map<string, unknown>();
+		for (const entry of (baseLocal.overrides ?? []) as Array<Record<string, unknown>>) {
+			map.set(keyOf(entry), entry);
+		}
+		for (const entry of patchLocal.overrides as Array<Record<string, unknown>>) {
+			map.set(keyOf(entry), entry);
+		}
+		return [...map.values()];
+	};
+	const union = (before: unknown, after: unknown): unknown =>
+		Array.isArray(after)
+			? [...new Set([...(Array.isArray(before) ? before : []), ...after])]
+			: before;
+
+	return {
+		...base,
+		local: {
+			...baseLocal,
+			// 合并算一次本地编辑，revision 必须往前走，否则前端的 baseRevision 校验会拒绝后续保存。
+			revision: Math.max(Number(baseLocal.revision ?? 0), Number(patchLocal.revision ?? 0)) + 1,
+			models: byId(baseLocal.models, patchLocal.models),
+			variants: byId(baseLocal.variants, patchLocal.variants),
+			bindings: byId(baseLocal.bindings, patchLocal.bindings),
+			overrides: mergeOverrides(),
+			connections: {
+				...((baseLocal.connections as Record<string, unknown>) ?? {}),
+				...((patchLocal.connections as Record<string, unknown>) ?? {}),
+			},
+			hiddenModelIds: union(baseLocal.hiddenModelIds, patchLocal.hiddenModelIds),
+			hiddenVariantIds: union(baseLocal.hiddenVariantIds, patchLocal.hiddenVariantIds),
+		},
+		autoApply: base.autoApply,
+		pinnedVersion: base.pinnedVersion,
+	};
+}
+
+/** 合并 `agent` 下的逐模型设置；返回是否产生了变化。 */
+function mergeAgentModelSettings(
+	current: NarraForkSettings,
+	incoming: Partial<Record<ProviderKey, unknown>>,
+	merged: Partial<Record<ProviderKey, unknown>>,
+): boolean {
+	const agent = (current.agent ?? {}) as unknown as Record<string, unknown>;
+	const out = merged as Record<string, unknown>;
+	let changed = false;
+
+	if (Array.isArray(incoming.hiddenModels)) {
+		out.hiddenModels = [
+			...new Set([
+				...((agent.hiddenModels as string[] | undefined) ?? []),
+				...incoming.hiddenModels,
+			]),
+		];
+		changed = true;
+	}
+
+	for (const key of ["modelProtocols", "modelProtocolOverrides"] as const) {
+		const patch = incoming[key];
+		if (!patch || typeof patch !== "object") continue;
+		out[key] = {
+			...((agent[key] as Record<string, unknown> | undefined) ?? {}),
+			...(patch as Record<string, unknown>),
+		};
+		changed = true;
+	}
+
+	if (Array.isArray(incoming.customModels)) {
+		const byValue = new Map<string, Record<string, unknown>>();
+		for (const entry of (agent.customModels as Array<Record<string, unknown>>) ?? []) {
+			byValue.set(String(entry.value ?? ""), entry);
+		}
+		for (const entry of incoming.customModels as Array<Record<string, unknown>>) {
+			byValue.set(String(entry.value ?? ""), entry);
+		}
+		out.customModels = [...byValue.values()];
+		changed = true;
+	}
+
+	if (incoming.modelCatalog && typeof incoming.modelCatalog === "object") {
+		out.modelCatalog = mergeModelCatalog(agent.modelCatalog, incoming.modelCatalog);
+		changed = true;
+	}
+
+	return changed;
+}
+
 function mergeProviders(incoming: Partial<Record<ProviderKey, unknown>>): {
 	merged: Partial<Record<ProviderKey, unknown>>;
 	changed: boolean;
@@ -1178,6 +1300,9 @@ function mergeProviders(incoming: Partial<Record<ProviderKey, unknown>>): {
 		changed = true;
 	}
 
+	// 逐模型设置（隐藏、协议、自定义模型、上下文元数据）跟着供应商一起搬。
+	if (mergeAgentModelSettings(current, incoming, merged)) changed = true;
+
 	// 单例平台：本地已配置就不动它。覆盖本地配置是"导入后反而坏了"的直接来源。
 	for (const key of ["codex", "tokendance", "commandCode"] as const) {
 		const value = incoming[key];
@@ -1242,13 +1367,19 @@ export async function clearData(target: ClearTarget): Promise<ClearResult> {
 					else if (value !== undefined) removed += 1;
 					(next as unknown as Record<string, unknown>)[key] = Array.isArray(value) ? [] : undefined;
 				}
-				// 平台实例也是供应商配置的一部分，清空时一并归零。
+				// 逐模型的供应商设置同样归零；模型目录本身不清——它包含用户手写的模型卡片，
+				// 不属于"删掉这个供应商"的范畴。
 				const agent = next.agent as unknown as Record<string, unknown> | undefined;
 				if (agent) {
-					for (const key of AGENT_PROVIDER_KEYS) {
+					for (const key of ["platformInstances", "hiddenModels", "customModels"] as const) {
 						const value = agent[key];
 						if (Array.isArray(value)) removed += value.length;
 						agent[key] = [];
+					}
+					for (const key of ["modelProtocols", "modelProtocolOverrides"] as const) {
+						const value = agent[key];
+						if (value && typeof value === "object") removed += Object.keys(value).length;
+						agent[key] = {};
 					}
 				}
 				saveSettings(next);

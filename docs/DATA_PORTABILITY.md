@@ -20,7 +20,7 @@
 | 文件 | 内容 |
 |---|---|
 | `snapshot.db` | 整库原生快照（`VACUUM INTO`）——**新增的表会自动包含** |
-| `providers.json` | 供应商配置：`customApiProviders`、`nugProviders`、`codex`、`tokendance`、`commandCode`，以及平台实例 `platformInstances`（**含凭据**） |
+| `providers.json` | 供应商配置：`customApiProviders`、`nugProviders`、`codex`、`tokendance`、`commandCode`；平台实例 `platformInstances`；逐模型设置 `hiddenModels`、`modelProtocols`、`modelProtocolOverrides`、`customModels`、`modelCatalog`（**含凭据**） |
 | `manifest.json` | `{ version, exportedAt, counts }`，导入时校验 `version <= 1` |
 
 ## 三、导入的合并语义
@@ -34,6 +34,7 @@
 | 引用 / 工具调用 | `INSERT OR IGNORE` |
 | 供应商 | 追加：重名加「-副本」（重复再加编号），`prefix` 冲突自动编号；`codex`/`tokendance`/`commandCode` 单例平台本地为空则导入、已配置则覆盖 |
 | 平台实例 | 同按前缀避让：本地已有同平台同前缀时先改前缀再追加，同前缀同平台视为重复跳过 |
+| 逐模型设置 | 隐藏模型、自定义模型取并集；协议覆盖按模型 ID **导入优先**（本地独有的键保留）；模型目录的本地编辑层按 id 合并，`revision` 前进一格 |
 
 **列交集**：拷贝与 UPDATE 都按「两库 `PRAGMA table_info` 的交集」生成列清单。这样快照与
 当前库的迁移进度不同（列多了/少了）也能导入——但也意味着**旧快照缺少的新列会用数据库默认值**，
@@ -43,7 +44,8 @@
 
 - 分项：`requests`（只删 `api_requests`）、`sessions`（删会话及其消息/引用/工具调用，
   并把 `terminals` / `benchmark_task_results` 的 `narrator_id` 置空，保留这些数据本体）、
-  `providers`（清空全部供应商配置）。
+  `providers`（清空全部供应商配置：含平台实例、隐藏模型、逐模型协议与自定义模型；
+  **不清模型目录**，那里有用户手写的模型卡片）。
 - 全量：以上全部。
 - **安全**：前端先「确认弹窗」，再「输入当前登录密码」；后端复用登录密码校验
   （`authSessionStore.findPasswordHash` + `Bun.password.verify`），密码错误拒绝执行。

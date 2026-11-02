@@ -51,6 +51,8 @@ function reset() {
 	next.commandCode = undefined;
 	next.customApiProviders = [];
 	next.nugProviders = [];
+	// 平台实例也计入供应商数量；空库用例要求它真的空。
+	(next.agent as unknown as Record<string, unknown>).platformInstances = [];
 	saveSettings(next);
 }
 
