@@ -314,6 +314,12 @@ export interface ExecutionBackend {
 	readonly supportsGitLineStats?: boolean;
 	/** Executor advertises the read-only commit preview operations. */
 	readonly supportsGitCommitPreview?: boolean;
+	/** Executor advertises the read-only branch listing. */
+	readonly supportsGitBranches?: boolean;
+	/** Executor advertises the `checkout` write operation. */
+	readonly supportsGitBranchSwitch?: boolean;
+	/** Executor advertises the `push`/`fetch` write operations. */
+	readonly supportsGitRemoteSync?: boolean;
 	gitWorkspace?(request: GitWorkspaceRequest, signal?: AbortSignal): Promise<GitWorkspaceResult>;
 	readonly deviceId: string;
 	readonly kind: "local" | "remote";

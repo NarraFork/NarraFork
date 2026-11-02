@@ -42,6 +42,9 @@ const DIRECT_WRITERS: Record<string, string> = {
 	"server/services/narrator-block-backfill.ts":
 		"legacy envelope conversion: format, bytes, ledger block",
 	"server/services/narrator-messages.ts": "block deletion, truncation, card dismissal, COW",
+	// ModelTrace 舱的清空重跑：只删这个叙述者自己的 refs 和失去引用的消息行，
+	// 不经过 store（store 是“续写”语义，不是“清空”）。
+	"server/services/modeltrace-store.ts": "trace cabin reset",
 	// Card state and envelope metadata.
 	"server/routes/narrators.ts": "manual plan/compact cards and their state",
 	"server/services/narrator-subagent-recovery.ts": "recovery card state and parent call result",

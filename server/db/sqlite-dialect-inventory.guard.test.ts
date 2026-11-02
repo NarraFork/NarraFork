@@ -520,7 +520,12 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	"server/services/agent-runtime/model-history-query.ts": ["driver"],
 	"server/services/agent-runtime/model-history-worker.ts": ["driver", "pragma"],
 	// Dual-backend snapshot worker: these capabilities belong to its SQLite branch.
-	"server/services/narrator-prefix-snapshots-worker.ts": ["driver", "pragma", "errorCode"],
+	"server/services/narrator-prefix-snapshots-worker.ts": [
+		"driver",
+		"connectionModule",
+		"pragma",
+		"errorCode",
+	],
 	// 固定表清单的构建同样放在独立进程：`INSERT … SELECT` 与 `VACUUM` 都是 O(数据量) 的同步操作。
 	"server/db/snapshot-builder-worker.ts": ["driver", "pragma", "vacuum"],
 	"server/services/narrator-display-page-reader.ts": ["driver"],
@@ -618,6 +623,9 @@ const DIALECT_INVENTORY: Readonly<Record<string, readonly string[]>> = {
 	// the reads on every page read's path. The PostgreSQL store answers the same port (search
 	// from its pg_trgm shadow table).
 	"server/services/outline/store/sqlite-read.ts": ["handle", "rowid", "fts5"],
+	// The open-task read names the partial index's own predicate (`json_extract` of the task
+	// status) so SQLite uses it; the PostgreSQL store spells the same predicate with `#>>`.
+	"server/services/outline/store/sqlite-store.ts": ["json1"],
 	"server/services/parent-injection-queue.ts": ["json1"],
 	"server/services/revert-history-commit.ts": [
 		"driver",

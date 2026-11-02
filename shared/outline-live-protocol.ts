@@ -258,8 +258,27 @@ export type LiveRejectCode =
 	/** Writing failed on the server; the change was not saved. */
 	| "failed";
 
+/**
+ * Why a change to a task was refused: someone else is doing it (setting it in progress claims
+ * it, `server/services/outline/write.ts`). Added after the first protocol version: a client that
+ * does not know the field ignores it, and the code stays `conflict`.
+ */
+export interface LiveClaimedWire {
+	/** `key/sid` of the task. */
+	address: string;
+	holder: {
+		kind: "agent" | "human";
+		/** The session's narrator id, or the person's user id. */
+		id: string;
+		/** Session title or username, when known. */
+		name: string | null;
+	};
+}
+
 export interface LiveRejectHead {
 	code: LiveRejectCode;
+	/** Present when the refusal is a task someone else is doing (with `code` `conflict`). */
+	claimed?: LiveClaimedWire;
 }
 
 export interface LiveModeHead {

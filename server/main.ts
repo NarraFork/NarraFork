@@ -1534,6 +1534,11 @@ startHeartbeat();
 initDeviceConnectionService();
 // Wire the file-transfer chunk-frame receiver.
 initDeviceTransferService();
+// 旧版 /modeltrace 每跑一次就留下一个 primary 叙述者；启动时把它们隐藏并把每个模型
+// 最近的一个收编成该模型的 ModelTrace 舱，保证旧历史仍能从模型入口打开。
+await import("./services/modeltrace-compat")
+	.then(({ adoptLegacyModelTraceNarrators }) => adoptLegacyModelTraceNarrators())
+	.catch((error) => logger.warn("Legacy ModelTrace adoption failed", { error: String(error) }));
 // Migrate OAuth authorities first, then stable resource provenance, in bounded yielding batches.
 // These services still use the SQLite proxy, so PostgreSQL explicitly gates the legacy path
 // instead of letting a fire-and-forget promise hit that proxy and swallow the failure.
@@ -1847,6 +1852,15 @@ void startupReadiness.barrier.then((recovery) => {
 	import("./services/outline/live/registry")
 		.then(({ startLiveReplay }) => startLiveReplay())
 		.catch((err) => logger.warn("Outline live log replay failed", { error: String(err) }));
+	// Outline tasks: reopen tasks whose session's lease ran out (every minute, bounded) or whose
+	// session was archived or deleted (on those events), and derive the in-process flag of
+	// blocks written before it existed (once, page by page).
+	import("./services/outline/tasks")
+		.then(({ startOutlineTaskLeaseJob }) => startOutlineTaskLeaseJob())
+		.catch((err) => logger.warn("Outline lease job failed to start", { error: String(err) }));
+	import("./services/outline/in-process")
+		.then(({ scheduleOutlineInProcessRebuild }) => scheduleOutlineInProcessRebuild())
+		.catch((err) => logger.warn("Outline in-process rebuild failed", { error: String(err) }));
 });
 
 // Backfill legacy RecentTabs in bounded background batches. Membership consumers await this
@@ -2047,6 +2061,19 @@ async function performGracefulShutdown(
 			async () => {
 				const live = await import("./services/outline/live/registry");
 				await live.closeAllLiveSessions("ended");
+			},
+			5_000,
+		);
+		await shutdownStep(
+			tracker,
+			"outlineTaskLeases.stop",
+			async () => {
+				const tasks = await import("./services/outline/tasks");
+				const inProcess = await import("./services/outline/in-process");
+				await Promise.all([
+					inProcess.stopOutlineInProcessRebuild(),
+					tasks.stopOutlineTaskLeaseJob(),
+				]);
 			},
 			5_000,
 		);
