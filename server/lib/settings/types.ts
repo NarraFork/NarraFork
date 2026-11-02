@@ -652,15 +652,6 @@ export interface NarraForkSettings {
 		 * setting them to "0"/"false" force-disables regardless of this setting).
 		 */
 		enabled: boolean;
-		/**
-		 * Whether the bundled `apikey-quota` plugin answers provider balance (API-key quota)
-		 * queries in its own process. Default true. When off, the host stops its process and
-		 * answers with the bundled provider-balance adapters instead — same DTOs, same
-		 * routes, no user-visible error. A bundled plugin has no installation or grant
-		 * record, so this setting, not the plugin store, is its authority. Independent of
-		 * `enabled`: turning off the plugin subsystem does not change quota querying.
-		 */
-		apikeyQuotaEnabled: boolean;
 	};
 	agent: {
 		defaultModel: string;

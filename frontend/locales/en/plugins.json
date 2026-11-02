@@ -271,6 +271,16 @@
 			"retried": "Plugin {{name}} retry requested.",
 			"uninstalled": "Plugin {{name}} uninstalled.",
 			"operationFailed": "Plugin operation failed."
-		}
+		},
+		"builtin": {
+			"title": "Builtin plugins",
+			"subtitle": "Shipped with the app and installed by default; enabled, disabled and health-checked exactly like external plugins.",
+			"health": "Last call",
+			"restarts": "Restarts",
+			"lastCallOk": "Succeeded",
+			"lastCallFailed": "Failed",
+			"noCalls": "No calls yet"
+		},
+		"installedTitle": "Installed plugins"
 	}
 }

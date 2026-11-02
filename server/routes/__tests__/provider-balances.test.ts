@@ -181,38 +181,14 @@ describe("provider balance API and settings integration", () => {
 
 /**
  * The bundled `apikey-quota` plugin is the default answerer for every entry point that reads
- * balance data. These cases pin the switch at the entry points themselves, so a change in the
- * engine cannot make an entry point silently disagree with the others: the flag flipped off
- * must produce the pre-plugin answer through the same route, and the saved-config projection
- * must show exactly what the route returns.
+ * balance data. These cases pin the entry points themselves, so a change in the engine cannot
+ * make the settings projection and the route disagree about the same provider.
  */
-describe("apikey-quota switch is honoured at every entry point", () => {
-	const originalEngineFlag = settings.plugins?.apikeyQuotaEnabled;
-
+describe("apikey-quota answers every entry point consistently", () => {
 	afterEach(async () => {
 		const { resetProviderBalanceEngine } = await import("../../lib/provider-balance-engine");
 		resetProviderBalanceEngine();
-		if (settings.plugins) settings.plugins.apikeyQuotaEnabled = originalEngineFlag;
 		providerBalanceCache.sync();
-	});
-
-	test("GET answers from the bundled adapters when the plugin is switched off", async () => {
-		const { builtinApikeyQuotaEngine } = await import("../../services/apikey-quota-plugin-engine");
-		const { setProviderBalanceEngine } = await import("../../lib/provider-balance-engine");
-		settings.plugins.apikeyQuotaEnabled = false;
-		setProviderBalanceEngine(builtinApikeyQuotaEngine);
-		try {
-			await providerBalanceCache.request(config().id);
-			const response = await appForRole("user").request("/api/provider-balances");
-			expect(response.status).toBe(200);
-			expect(await response.json()).toMatchObject({
-				[config().id]: { status: "supported", adapter: "sub2api" },
-			});
-			// The bundled transport answered, which is why the mocked outbound was used.
-			expect(outbound.outboundFetch).toHaveBeenCalled();
-		} finally {
-			await builtinApikeyQuotaEngine.dispose();
-		}
 	});
 
 	test("settings generation and the route snapshot are the same key", async () => {
@@ -233,22 +209,27 @@ describe("apikey-quota switch is honoured at every entry point", () => {
 		expect(routeBody[config().id]?.status).toBe("supported");
 	});
 
-	test("a switched-off plugin is not spawned at all", async () => {
+	test("a disabled plugin still answers the route from the bundled adapters", async () => {
 		const { createApikeyQuotaEngine } = await import("../../services/apikey-quota-plugin-engine");
-		let started = 0;
+		const { setProviderBalanceEngine } = await import("../../lib/provider-balance-engine");
+		// A disabled plugin surfaces as an unavailable tool; the engine must fall back rather
+		// than fail the request. The bundled transport is what the mocked outbound observes.
 		const engine = createApikeyQuotaEngine({
-			isEnabled: () => false,
-			createRuntime: () => {
-				started += 1;
-				throw new Error("must not be constructed while disabled");
+			tools: {
+				invoke: async () => {
+					throw Object.assign(new Error("Plugin disabled"), { code: "PLUGIN_DISABLED" });
+				},
 			},
+			activator: { activate: async () => undefined },
 		});
+		setProviderBalanceEngine(engine);
 		try {
-			await engine.probe({
-				config: { ...config(), baseUrl: "https://relay.invalid/v1" },
-				signal: AbortSignal.timeout(10_000),
+			await providerBalanceCache.request(config().id);
+			const response = await appForRole("user").request("/api/provider-balances");
+			expect(response.status).toBe(200);
+			expect(await response.json()).toMatchObject({
+				[config().id]: { status: "supported", adapter: "sub2api" },
 			});
-			expect(started).toBe(0);
 			expect(outbound.outboundFetch).toHaveBeenCalled();
 		} finally {
 			await engine.dispose();

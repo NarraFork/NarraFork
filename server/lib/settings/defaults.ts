@@ -50,7 +50,6 @@ export const DEFAULTS: NarraForkSettings = {
 	},
 	plugins: {
 		enabled: true,
-		apikeyQuotaEnabled: true,
 	},
 	agent: {
 		// Deliberately empty on a fresh install — same reasoning as `summaryModel`
@@ -781,13 +780,6 @@ export const SETTING_DOCS: Record<string, FieldDoc> = {
 	// ── workspace ───────────────────────────────────────────────────────
 	"workspace.treeSnapshotsEnabled": {
 		desc: "是否为工具调用/外部编辑捕获工作区整树快照（精确回退边界）。关闭后该扫描不再运行，回退退化为按记录的 Write/Edit 输入逐文件重放；超大工作区（如游戏整合包目录）上扫描过慢时可关闭。默认 true；热路径捕获在工作区大到超出预算时也会自动降级。",
-		type: "boolean",
-		valid: "true / false，默认 true",
-	},
-
-	// ── plugins ─────────────────────────────────────────────────────────
-	"plugins.apikeyQuotaEnabled": {
-		desc: "内置插件 apikey-quota 是否在独立进程中应答 provider 额度（APIKey 配额）查询。默认 true，无需安装或开启。关闭后宿主停止该插件进程，改用内置 provider-balance 适配器：返回的 DTO、路由和前端展示完全不变，也不会向用户报错。",
 		type: "boolean",
 		valid: "true / false，默认 true",
 	},

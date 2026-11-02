@@ -76,6 +76,12 @@ function SettingsPluginsPage() {
 		});
 	}, [pluginsQuery.data, search]);
 
+	// Builtin plugins ship with the application, so they are listed separately: there is
+	// nothing to uninstall or upgrade, but they are enabled, disabled and diagnosed exactly
+	// like an installed plugin.
+	const builtinPlugins = useMemo(() => plugins.filter((plugin) => plugin.builtin), [plugins]);
+	const externalPlugins = useMemo(() => plugins.filter((plugin) => !plugin.builtin), [plugins]);
+
 	const anyMutationPending =
 		enableMutation.isPending || disableMutation.isPending || uninstallMutation.isPending;
 
@@ -201,106 +207,249 @@ function SettingsPluginsPage() {
 					</Stack>
 				</Paper>
 			) : (
-				<Box style={{ overflowX: "auto" }}>
-					<Table striped highlightOnHover withTableBorder miw={640}>
-						<Table.Thead>
-							<Table.Tr>
-								<Table.Th>{t("admin.table.name")}</Table.Th>
-								<Table.Th>{t("admin.table.status")}</Table.Th>
-								<Table.Th>{t("admin.table.version")}</Table.Th>
-								<Table.Th>{t("admin.table.diagnostics")}</Table.Th>
-								<Table.Th>{t("admin.table.actions")}</Table.Th>
-							</Table.Tr>
-						</Table.Thead>
-						<Table.Tbody>
-							{plugins.map((plugin) => {
-								const enabled = plugin.desiredState === "enabled";
-								const diagnosticCount = plugin.diagnosticCount ?? plugin.diagnostics?.length ?? 0;
-								return (
-									<Table.Tr
-										key={plugin.pluginId}
-										style={{ cursor: "pointer" }}
-										onClick={() =>
-											navigate({
-												to: "/settings/plugins/$pluginId",
-												params: { pluginId: plugin.pluginId },
-											})
-										}
-									>
-										<Table.Td>
-											<Text size="sm" fw={500} lineClamp={1}>
-												{pluginDisplayName(plugin)}
-											</Text>
-											<Text size="xs" c="dimmed" lineClamp={1}>
-												{plugin.pluginId}
-											</Text>
-										</Table.Td>
-										<Table.Td>
-											<PluginStatusBadge plugin={plugin} />
-										</Table.Td>
-										<Table.Td>
-											<Text size="sm">{plugin.version ?? "—"}</Text>
-										</Table.Td>
-										<Table.Td>
-											{diagnosticCount > 0 ? (
-												<Badge color="red" variant="light" size="sm">
-													{diagnosticCount}
-												</Badge>
-											) : (
-												<Text size="sm" c="dimmed">
-													0
-												</Text>
-											)}
-										</Table.Td>
-										<Table.Td onClick={(event) => event.stopPropagation()}>
-											<Group gap={4} wrap="nowrap">
-												{enabled ? (
-													<Tooltip label={t("admin.actions.disable")}>
-														<ActionIcon
-															variant="subtle"
-															color="orange"
-															disabled={anyMutationPending || !!pluginsDisabled}
-															onClick={() => handleDisable(plugin)}
-															aria-label={t("admin.actions.disable")}
-														>
-															<IconPlugConnectedX size={18} />
-														</ActionIcon>
-													</Tooltip>
-												) : (
-													<Tooltip label={t("admin.actions.enable")}>
-														<ActionIcon
-															variant="subtle"
-															color="green"
-															disabled={anyMutationPending || !!pluginsDisabled}
-															onClick={() => handleEnable(plugin)}
-															aria-label={t("admin.actions.enable")}
-														>
-															<IconPlugConnected size={18} />
-														</ActionIcon>
-													</Tooltip>
-												)}
-												<Tooltip label={t("admin.actions.uninstall")}>
-													<ActionIcon
-														variant="subtle"
-														color="red"
-														disabled={anyMutationPending || !!pluginsDisabled}
-														onClick={() => handleUninstall(plugin)}
-														aria-label={t("admin.actions.uninstall")}
-													>
-														<IconTrash size={18} />
-													</ActionIcon>
-												</Tooltip>
-											</Group>
-										</Table.Td>
-									</Table.Tr>
-								);
-							})}
-						</Table.Tbody>
-					</Table>
-				</Box>
+				<Stack gap="md">
+					{builtinPlugins.length > 0 && (
+						<Box>
+							<Title order={5}>{t("admin.builtin.title")}</Title>
+							<Text size="sm" c="dimmed" mb="xs">
+								{t("admin.builtin.subtitle")}
+							</Text>
+							<Box style={{ overflowX: "auto" }}>
+								<Table striped highlightOnHover withTableBorder miw={720}>
+									<Table.Thead>
+										<Table.Tr>
+											<Table.Th>{t("admin.table.name")}</Table.Th>
+											<Table.Th>{t("admin.table.status")}</Table.Th>
+											<Table.Th>{t("admin.builtin.health")}</Table.Th>
+											<Table.Th>{t("admin.builtin.restarts")}</Table.Th>
+											<Table.Th>{t("admin.table.actions")}</Table.Th>
+										</Table.Tr>
+									</Table.Thead>
+									<Table.Tbody>
+										{builtinPlugins.map((plugin) => (
+											<BuiltinPluginRow
+												key={plugin.pluginId}
+												plugin={plugin}
+												disabled={anyMutationPending || !!pluginsDisabled}
+												onOpen={() =>
+													navigate({
+														to: "/settings/plugins/$pluginId",
+														params: { pluginId: plugin.pluginId },
+													})
+												}
+												onEnable={() => handleEnable(plugin)}
+												onDisable={() => handleDisable(plugin)}
+											/>
+										))}
+									</Table.Tbody>
+								</Table>
+							</Box>
+						</Box>
+					)}
+
+					{externalPlugins.length > 0 && (
+						<Box>
+							{builtinPlugins.length > 0 && <Title order={5}>{t("admin.installedTitle")}</Title>}
+							<Box style={{ overflowX: "auto" }}>
+								<Table striped highlightOnHover withTableBorder miw={640}>
+									<Table.Thead>
+										<Table.Tr>
+											<Table.Th>{t("admin.table.name")}</Table.Th>
+											<Table.Th>{t("admin.table.status")}</Table.Th>
+											<Table.Th>{t("admin.table.version")}</Table.Th>
+											<Table.Th>{t("admin.table.diagnostics")}</Table.Th>
+											<Table.Th>{t("admin.table.actions")}</Table.Th>
+										</Table.Tr>
+									</Table.Thead>
+									<Table.Tbody>
+										{externalPlugins.map((plugin) => {
+											const enabled = plugin.desiredState === "enabled";
+											const diagnosticCount =
+												plugin.diagnosticCount ?? plugin.diagnostics?.length ?? 0;
+											return (
+												<Table.Tr
+													key={plugin.pluginId}
+													style={{ cursor: "pointer" }}
+													onClick={() =>
+														navigate({
+															to: "/settings/plugins/$pluginId",
+															params: { pluginId: plugin.pluginId },
+														})
+													}
+												>
+													<Table.Td>
+														<Text size="sm" fw={500} lineClamp={1}>
+															{pluginDisplayName(plugin)}
+														</Text>
+														<Text size="xs" c="dimmed" lineClamp={1}>
+															{plugin.pluginId}
+														</Text>
+													</Table.Td>
+													<Table.Td>
+														<PluginStatusBadge plugin={plugin} />
+													</Table.Td>
+													<Table.Td>
+														<Text size="sm">{plugin.version ?? "—"}</Text>
+													</Table.Td>
+													<Table.Td>
+														{diagnosticCount > 0 ? (
+															<Badge color="red" variant="light" size="sm">
+																{diagnosticCount}
+															</Badge>
+														) : (
+															<Text size="sm" c="dimmed">
+																0
+															</Text>
+														)}
+													</Table.Td>
+													<Table.Td onClick={(event) => event.stopPropagation()}>
+														<Group gap={4} wrap="nowrap">
+															{enabled ? (
+																<Tooltip label={t("admin.actions.disable")}>
+																	<ActionIcon
+																		variant="subtle"
+																		color="orange"
+																		disabled={anyMutationPending || !!pluginsDisabled}
+																		onClick={() => handleDisable(plugin)}
+																		aria-label={t("admin.actions.disable")}
+																	>
+																		<IconPlugConnectedX size={18} />
+																	</ActionIcon>
+																</Tooltip>
+															) : (
+																<Tooltip label={t("admin.actions.enable")}>
+																	<ActionIcon
+																		variant="subtle"
+																		color="green"
+																		disabled={anyMutationPending || !!pluginsDisabled}
+																		onClick={() => handleEnable(plugin)}
+																		aria-label={t("admin.actions.enable")}
+																	>
+																		<IconPlugConnected size={18} />
+																	</ActionIcon>
+																</Tooltip>
+															)}
+															<Tooltip label={t("admin.actions.uninstall")}>
+																<ActionIcon
+																	variant="subtle"
+																	color="red"
+																	disabled={anyMutationPending || !!pluginsDisabled}
+																	onClick={() => handleUninstall(plugin)}
+																	aria-label={t("admin.actions.uninstall")}
+																>
+																	<IconTrash size={18} />
+																</ActionIcon>
+															</Tooltip>
+														</Group>
+													</Table.Td>
+												</Table.Tr>
+											);
+										})}
+									</Table.Tbody>
+								</Table>
+							</Box>
+						</Box>
+					)}
+				</Stack>
 			)}
 
 			<PluginInstallModal opened={installOpen} onClose={() => setInstallOpen(false)} />
 		</Stack>
+	);
+}
+
+/**
+ * One row of the builtin-plugin section.
+ *
+ * Builtin plugins are ordinary plugins except for distribution, so the row shows the same
+ * enable/disable control and the live health of their most recent calls. There is no uninstall
+ * action: the package is part of the application.
+ */
+function BuiltinPluginRow({
+	plugin,
+	disabled,
+	onOpen,
+	onEnable,
+	onDisable,
+}: {
+	plugin: PluginSummary;
+	disabled: boolean;
+	onOpen: () => void;
+	onEnable: () => void;
+	onDisable: () => void;
+}) {
+	const { t } = useTranslation("plugins");
+	const enabled = plugin.desiredState === "enabled";
+	// The tool/runtime surfaces record every call; show the busiest one as the row summary.
+	const health = useMemo(() => {
+		const entries = plugin.health ?? [];
+		return entries.find((entry) => entry.surface === "tool") ?? entries[0];
+	}, [plugin.health]);
+	const lastCall = health?.lastFailureAt
+		? { at: health.lastFailureAt, ok: false }
+		: health?.lastSuccessAt
+			? { at: health.lastSuccessAt, ok: true }
+			: undefined;
+
+	return (
+		<Table.Tr style={{ cursor: "pointer" }} onClick={onOpen}>
+			<Table.Td>
+				<Text size="sm" fw={500} lineClamp={1}>
+					{pluginDisplayName(plugin)}
+				</Text>
+				<Text size="xs" c="dimmed" lineClamp={1}>
+					{plugin.pluginId}
+				</Text>
+			</Table.Td>
+			<Table.Td>
+				<PluginStatusBadge plugin={plugin} />
+			</Table.Td>
+			<Table.Td>
+				{lastCall ? (
+					<Group gap={6} wrap="nowrap">
+						<Badge color={lastCall.ok ? "green" : "red"} variant="light" size="sm">
+							{lastCall.ok ? t("admin.builtin.lastCallOk") : t("admin.builtin.lastCallFailed")}
+						</Badge>
+						<Text size="xs" c="dimmed">
+							{new Date(lastCall.at).toLocaleString()}
+						</Text>
+					</Group>
+				) : (
+					<Text size="sm" c="dimmed">
+						{t("admin.builtin.noCalls")}
+					</Text>
+				)}
+			</Table.Td>
+			<Table.Td>
+				<Text size="sm">{(plugin.restartCount ?? 0) + (plugin.crashCount ?? 0)}</Text>
+			</Table.Td>
+			<Table.Td onClick={(event) => event.stopPropagation()}>
+				{enabled ? (
+					<Tooltip label={t("admin.actions.disable")}>
+						<ActionIcon
+							variant="subtle"
+							color="orange"
+							disabled={disabled}
+							onClick={onDisable}
+							aria-label={t("admin.actions.disable")}
+						>
+							<IconPlugConnectedX size={18} />
+						</ActionIcon>
+					</Tooltip>
+				) : (
+					<Tooltip label={t("admin.actions.enable")}>
+						<ActionIcon
+							variant="subtle"
+							color="green"
+							disabled={disabled}
+							onClick={onEnable}
+							aria-label={t("admin.actions.enable")}
+						>
+							<IconPlugConnected size={18} />
+						</ActionIcon>
+					</Tooltip>
+				)}
+			</Table.Td>
+		</Table.Tr>
 	);
 }

@@ -216,6 +216,16 @@ export function stripObsoleteSettingsKeys(settings: Record<string, unknown>): bo
 		}
 	}
 	// The message protocol v1 fallback switch, retired with v1 (P3d): every client speaks v2.
+	// The plugin subsystem no longer carries per-plugin switches: `apikey-quota` became a
+	// normal plugin toggled through the plugin store, so this key is dead. Never released, so
+	// it is simply dropped rather than migrated.
+	const plugins = settings.plugins;
+	if (plugins && typeof plugins === "object" && !Array.isArray(plugins)) {
+		if ("apikeyQuotaEnabled" in (plugins as Record<string, unknown>)) {
+			delete (plugins as Record<string, unknown>).apikeyQuotaEnabled;
+			changed = true;
+		}
+	}
 	const blocks = settings.narratorBlocks;
 	if (blocks && typeof blocks === "object" && !Array.isArray(blocks) && "wsV2" in blocks) {
 		delete (blocks as Record<string, unknown>).wsV2;
