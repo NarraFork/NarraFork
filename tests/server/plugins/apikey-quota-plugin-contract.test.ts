@@ -1,14 +1,15 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
-import { parseManifest } from "@server/lib/plugins/manifest";
+import { isCanonicalPermissionName, parseManifest } from "@server/lib/plugins/manifest";
+import { NARRAFORK_RPC_PROTOCOL, PLUGIN_TO_HOST_FEATURES } from "@server/lib/plugins/protocol";
 import {
 	buildBalanceRoots,
 	parseNewApiBalance,
 	parseSub2ApiBalance,
 } from "@server/lib/provider-balance-adapters";
 
-const pluginRoot = join(process.cwd(), "plugins/apikey-quota");
+const pluginRoot = join(process.cwd(), "server/builtin-plugins/apikey-quota");
 
 /**
  * The plugin is a standalone package with no host imports, so its parsing rules are a
@@ -81,6 +82,56 @@ describe("apikey-quota plugin manifest", () => {
 		expect(manifest.contributes.tools[0]?.allowBackground).toBe(true);
 		// `provider.use` is the registry's default authorization capability for tools.
 		expect(manifest.permissions.host).toContain("provider.use");
+	});
+
+	/**
+	 * The former home of this package was `examples/plugins/`, where
+	 * `tests/server/lib/plugins/manifest-permission-parity.test.ts` scanned it automatically.
+	 * Now that it ships inside the host tree, that scan no longer reaches it — these are the
+	 * same rules, asserted directly, so moving the package did not quietly drop the coverage.
+	 */
+	test("keeps the reference-manifest rules the example-plugin scan used to enforce", async () => {
+		const raw = (await readFile(join(pluginRoot, "manifest.json"), "utf8")) as string;
+		const parsed = JSON.parse(raw) as {
+			engine: { rpc: string; features?: string[] };
+			server?: { protocol: string };
+			permissions: { host: string[] };
+		};
+		const manifest = parseManifest(parsed);
+
+		expect(parsed.engine.rpc).toBe(NARRAFORK_RPC_PROTOCOL);
+		expect(parsed.server?.protocol ?? NARRAFORK_RPC_PROTOCOL).toBe(NARRAFORK_RPC_PROTOCOL);
+		expect(parsed.permissions.host.every(isCanonicalPermissionName)).toBe(true);
+		expect(
+			(parsed.engine.features ?? []).every((feature) =>
+				(PLUGIN_TO_HOST_FEATURES as readonly string[]).includes(feature),
+			),
+		).toBe(true);
+		expect([...manifest.permissions.host]).toEqual(parsed.permissions.host);
+	});
+
+	/** A bundled plugin still must not call a host method it did not declare. */
+	test("calls no host method it has not declared a capability for", async () => {
+		const source = await readFile(join(pluginRoot, "server/index.js"), "utf8");
+		const declared = new Set(
+			(
+				JSON.parse(await readFile(join(pluginRoot, "manifest.json"), "utf8")) as {
+					permissions: { host: string[] };
+				}
+			).permissions.host,
+		);
+		const METHOD_CAPABILITIES: Record<string, string> = {
+			"secrets.get": "secret.use_self",
+			"secrets.set": "secret.use_self",
+			"storage.get": "storage.read_self",
+			"storage.set": "storage.write_self",
+			"config.get": "config.read_self",
+			"diagnostics.getOwn": "diagnostics.readOwnLogs",
+		};
+		for (const [method, capability] of Object.entries(METHOD_CAPABILITIES)) {
+			if (!new RegExp(`["'\`]${method.replace(".", "\\.")}["'\`]`).test(source)) continue;
+			expect(declared.has(capability)).toBe(true);
+		}
 	});
 });
 

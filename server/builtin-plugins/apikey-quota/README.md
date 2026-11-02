@@ -57,26 +57,42 @@
 
 宿主会用 `shared/apikey-quota-plugin.ts` 严格校验该 JSON；不合法即视为插件无应答。
 
-## 安装与启用
+## 分发与启停
 
-1. 静态 + 运行时校验（仓库内）：
+本插件**随应用一起发布**（`server/builtin-plugins/apikey-quota`），不经插件安装流程：没有包记录、
+没有 capability grant、没有管理员安装步骤。因此它默认启用，首次启动即生效。
 
-   ```bash
-   bun scripts/validate-plugin-release.ts "$(pwd)/plugins" --runtime
-   ```
+它唯一的授权来源是宿主设置 `plugins.apikeyQuotaEnabled`（`~/.narrafork/settings.json`），默认 `true`：
 
-2. 打包成 `.zip` 或 `.nfplugin`（目录根需直接含 `manifest.json`）：
+```jsonc
+{
+  "plugins": {
+    "enabled": true,            // 插件子系统总开关（与本项相互独立）
+    "apikeyQuotaEnabled": true  // 关闭后宿主停止插件进程，改用内置适配器
+  }
+}
+```
 
-   ```bash
-   cd plugins/apikey-quota
-   zip -r ../apikey-quota-1.0.0.nfplugin . -x '*/.*'
-   ```
+关闭方式（任选）：
 
-3. 安装（管理员）：`POST /api/plugins/install`（multipart，字段 `archive`），
-   或把包放进 `~/.narrafork/plugin-imports/` 后在安装弹窗里选择。
-4. 启用 + 激活该插件。之后每次额度查询都会走插件进程。
+- 设置页把该项改为 `false`（`PATCH /api/settings` 写入 `plugins.apikeyQuotaEnabled`）；
+- 直接编辑 `~/.narrafork/settings.json` 后无需重启，下一次额度查询即按新值生效。
 
-**不安装也完全可用**：宿主自动使用内置适配器，行为与抽取前一致。
+关闭后的行为：宿主停止插件进程，改用内置 `provider-balance` 适配器。返回的 DTO、路由、
+前端展示完全不变，也不会向用户报错。
+
+**为什么用配置文件项而不是插件设置项**：插件设置项（manifest `contributes.configuration`）
+归属于**已安装**插件的实例配置，需要 installation 记录与配置存储；本插件没有这些记录。
+放进 `NarraForkSettings` 里，开关和宿主的其他运行配置一样可热读、随 settings 备份/导出迁移，
+也不需要为了一个布尔值引入安装态。
+
+## 校验
+
+```bash
+bun scripts/validate-plugin-release.ts "$(pwd)/server/builtin-plugins" --runtime
+```
+
+该命令会把包按 `local-process` runner 真正启动一次，校验 hello / initialize / activate / health。
 
 ## 回退语义
 
@@ -85,7 +101,17 @@
 | 插件 `status: "ok"` | 直接采用（宿主内置路径不执行） |
 | 插件 `status: "unsupported"` | 视为权威结论，不探测内置路径 |
 | 插件 `status: "failed"` | 按既有的 `request_failed` 语义记录 |
-| 插件未安装 / 未启用 / 未激活 / 输出非法 | 回退内置适配器 |
+| `plugins.apikeyQuotaEnabled = false` | 停止插件进程，回退内置适配器 |
+| 包缺失 / 进程启动失败 / 进程崩溃 / 输出非法 | 回退内置适配器（不向用户报错） |
+
+## 宿主侧位置
+
+- 进程托管与决策表：`server/services/apikey-quota-plugin-engine.ts`（模块级单例
+  `builtinApikeyQuotaEngine`，`app.ts` 安装，`main.ts` 关停序列里 dispose）。
+- 引擎接缝：`server/lib/provider-balance-engine.ts`。
+- 线上契约（宿主校验）：`shared/apikey-quota-plugin.ts`。
+- 契约测试：`tests/server/plugins/apikey-quota-plugin-contract.test.ts`（含原
+  `examples/plugins` 扫描所覆盖的 manifest 一致性规则）。
 
 ## 安全说明
 

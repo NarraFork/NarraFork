@@ -107,7 +107,7 @@ import usageHistoryRoutes from "./routes/usage-history";
 import { userPreferencesRoutes } from "./routes/user-preferences";
 import { vnetRoutes } from "./routes/vnet";
 import { workspaceRoutes } from "./routes/workspaces";
-import { createApikeyQuotaEngine } from "./services/apikey-quota-plugin-engine";
+import { builtinApikeyQuotaEngine } from "./services/apikey-quota-plugin-engine";
 import { narratorWorktreeService } from "./services/narrator-worktree-runtime";
 
 export interface AppEnv {
@@ -368,10 +368,11 @@ app.route("/api/auth/sso", ssoRoutes);
 // endpoints inside pluginUiRoutes still apply session-only authentication explicitly.
 app.route("/api/plugins", pluginUiRoutes);
 
-// Provider balance (API-key quota) querying is answered by the `apikey-quota` plugin when
-// it is installed and active, and by the bundled adapters otherwise. The engine resolves
-// per round, so installing, enabling or disabling the plugin needs no restart.
-setProviderBalanceEngine(createApikeyQuotaEngine());
+// Provider balance (API-key quota) querying is answered by the built-in `apikey-quota`
+// plugin, which ships with the app and is enabled by default. Turning
+// `plugins.apikeyQuotaEnabled` off falls back to the bundled adapters with no user-visible
+// change. The switch is read per round, so no restart is needed.
+setProviderBalanceEngine(builtinApikeyQuotaEngine);
 
 // Public: OAuth 2.0 provider endpoints. NarraFork is the authorization server
 // here — external apps fetch metadata, exchange codes and revoke tokens without
