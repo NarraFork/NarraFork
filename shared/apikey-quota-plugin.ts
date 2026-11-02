@@ -6,7 +6,7 @@ import type { ProviderBalanceData } from "./provider-balance";
  * `com.narrafork.apikey-quota` plugin.
  *
  * The plugin is a separate process and mirrors this shape in plain JavaScript
- * (`plugins/apikey-quota/server/index.js`), so the two sides are kept honest by
+ * (`server/builtin-plugins/apikey-quota/server/index.js`), so the two sides are kept honest by
  * this schema plus a contract test rather than by a shared import. Everything here is
  * host-side validation: an output that does not parse is treated as "no answer" and the
  * caller falls back, so a broken plugin can never write junk into the balance cache.

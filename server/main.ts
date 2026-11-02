@@ -116,6 +116,7 @@ import {
 import { initNotificationFanout, stopNotificationFanout } from "./services/notification-fanout";
 import "./services/attention-hook-bridge"; // Bridge attention events into the hook system
 import { killAllBashProcesses } from "./lib/agent/tools/bash";
+import { builtinApikeyQuotaEngine } from "./services/apikey-quota-plugin-engine";
 import { initChatNotify } from "./services/chat-notify";
 import { initDeviceConnectionService } from "./services/device-connection-service";
 import { initDeviceTransferService } from "./services/device-transfer-service";
@@ -2038,6 +2039,11 @@ async function performGracefulShutdown(
 		await shutdownStep(tracker, "notificationFanout.stop", stopNotificationFanout);
 		await shutdownStep(tracker, "notificationMaintenance.stop", stopNotificationCenterMaintenance);
 		await shutdownStep(tracker, "terminalService.shutdownAll", () => terminalService.shutdownAll());
+		// The built-in apikey-quota plugin runs detached on non-Windows, so it would outlive
+		// the server unless it is stopped here.
+		await shutdownStep(tracker, "apikeyQuotaPlugin.shutdown", () =>
+			builtinApikeyQuotaEngine.dispose(),
+		);
 		if (!options.skipBashProcessKill) {
 			await shutdownStep(tracker, "killAllBashProcesses", () => killAllBashProcesses());
 		}
