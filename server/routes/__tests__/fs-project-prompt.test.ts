@@ -19,6 +19,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Hono } from "hono";
 import { AppError } from "../../lib/errors";
+import { MAX_PROJECT_INSTRUCTIONS_BYTES } from "../../lib/read-file-capped";
 
 const { fsRoutes } = await import("../fs");
 
@@ -218,6 +219,37 @@ describe("writing", () => {
 		});
 		expect(response.status).toBe(200);
 		expect(readFileSync(join(workspace, "AGENTS.md"), "utf-8")).toBe("one\r\ntwo\r\nthree\r\n");
+	});
+
+	test("a file that exactly fills the read cap is still editable", async () => {
+		writeFileSync(join(workspace, "AGENTS.md"), "a".repeat(MAX_PROJECT_INSTRUCTIONS_BYTES));
+		const loaded = await readPrompt(workspace);
+		expect(loaded.truncated).toBe(false);
+		expect(loaded.content.length).toBe(MAX_PROJECT_INSTRUCTIONS_BYTES);
+		const response = await putPrompt({
+			cwd: workspace,
+			filename: loaded.filename,
+			content: "short",
+			baseHash: loaded.hash,
+		});
+		expect(response.status).toBe(200);
+		expect(readFileSync(join(workspace, "AGENTS.md"), "utf-8")).toBe("short");
+	});
+
+	test("a file past the read cap is reported truncated and refused on write", async () => {
+		writeFileSync(join(workspace, "AGENTS.md"), "b".repeat(MAX_PROJECT_INSTRUCTIONS_BYTES + 1));
+		const loaded = await readPrompt(workspace);
+		expect(loaded.truncated).toBe(true);
+		const response = await putPrompt({
+			cwd: workspace,
+			filename: loaded.filename,
+			content: "short",
+			baseHash: loaded.hash,
+		});
+		expect(response.status).toBe(400);
+		expect(readFileSync(join(workspace, "AGENTS.md"), "utf-8")).toBe(
+			"b".repeat(MAX_PROJECT_INSTRUCTIONS_BYTES + 1),
+		);
 	});
 
 	test("rejects a filename that is not a known instruction file", async () => {

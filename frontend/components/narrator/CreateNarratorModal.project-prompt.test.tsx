@@ -1,19 +1,10 @@
 /**
- * The new-session dialog's project-prompt box.
+ * Project prompt editing is a separate window from creating a session.
  *
- * What is worth pinning is the ORDER the two writes happen in, and what happens when
- * the first one is refused:
- *
- *  - the prompt file is saved BEFORE the narrator is created. Creating first would
- *    leave a session whose prompt was never written, with an error and nothing to
- *    retry;
- *  - a save the server refuses (409 stale) aborts the create. Silently creating the
- *    session anyway is the failure that looks like success;
- *  - an UNCHANGED box writes nothing at all, so opening the dialog and pressing create
- *    never touches a file the user did not edit.
- *
- * The box is not a per-session system prompt: it edits the file `narrator-prompt`
- * already injects for the directory, which is why the flow is "file first".
+ *  - creating a session never writes the prompt file, even when the editor is open
+ *    and the text is dirty;
+ *  - saving is its own action inside that window, and it uses the hash that was loaded;
+ *  - a truncated file stays read-only, so the prefix cannot be written back.
  */
 import { afterEach, beforeEach, describe, expect, mock, test } from "bun:test";
 import { parseHTML } from "linkedom";
@@ -70,8 +61,25 @@ mock.module("@mantine/core", () => {
 			</button>
 		),
 		Checkbox: pass("checkbox"),
+		Alert: pass("alert"),
+		Badge: pass("badge"),
+		Box: pass("box"),
 		Divider: pass("divider"),
 		Group: pass("group"),
+		Loader: pass("loader"),
+		SegmentedControl: (props: {
+			value?: string;
+			onChange?: (value: string) => void;
+			data?: Array<{ value: string; label: string }>;
+		}) => (
+			<div data-part="segmented" data-value={props.value}>
+				{(props.data ?? []).map((item) => (
+					<button key={item.value} type="button" onClick={() => props.onChange?.(item.value)}>
+						{item.label}
+					</button>
+				))}
+			</div>
+		),
 		Menu: Object.assign(pass("menu"), {
 			Target: pass("menu-target"),
 			Dropdown: pass("menu-dropdown"),
@@ -96,7 +104,7 @@ mock.module("react-i18next", () => ({ useTranslation: () => ({ t: (key: string) 
 mock.module("@tanstack/react-query", () => ({
 	useQuery: (options: { queryKey: unknown[] }) =>
 		options.queryKey[0] === "project-prompt" ? promptQuery : { data: { agent: {} } },
-	useQueryClient: () => ({ invalidateQueries: mock(() => {}) }),
+	useQueryClient: () => ({ invalidateQueries: mock(() => {}), setQueryData: mock(() => {}) }),
 }));
 mock.module("../../hooks/useModels", () => ({ useAllModels: () => ({ groupedModels: [] }) }));
 mock.module("../../hooks/useProjectDirStatus", () => ({
@@ -144,6 +152,9 @@ mock.module("../../lib/api", () => ({
 }));
 mock.module("../common/DirectoryPicker", () => ({
 	DirectoryPicker: () => <div data-part="directory-picker" />,
+}));
+mock.module("./markdown/MarkdownContent", () => ({
+	MarkdownContent: ({ text }: { text: string }) => <div data-part="markdown">{text}</div>,
 }));
 
 const { CreateNarratorModal } = await import("./CreateNarratorModal");
@@ -222,25 +233,38 @@ async function clickCreate() {
 	});
 }
 
-describe("project prompt box", () => {
-	test("shows the file content it loaded", async () => {
-		await renderDialog();
-		expect(promptBox()?.value).toBe("# 旧内容\n");
+async function clickButton(label: string) {
+	const button = Array.from(container.querySelectorAll("button")).find(
+		(node) => node.textContent === label,
+	);
+	expect(button).toBeDefined();
+	await act(async () => {
+		button?.dispatchEvent(new window.Event("click", { bubbles: true }));
+		await Promise.resolve();
+		await Promise.resolve();
 	});
+}
 
-	test("an unchanged box writes nothing and creates the session", async () => {
+describe("project prompt editor", () => {
+	test("creating a session does not write the prompt file", async () => {
 		await renderDialog();
+		await clickButton("projectPromptOpen");
+		await act(async () => {
+			promptBox()?.onChange?.({ currentTarget: { value: "# 新内容\n" } });
+		});
 		await clickCreate();
 		expect(saveProjectPrompt).not.toHaveBeenCalled();
 		expect(create).toHaveBeenCalledTimes(1);
 	});
 
-	test("an edit is saved before the narrator is created", async () => {
+	test("the editor shows the loaded file and saves it on its own", async () => {
 		await renderDialog();
+		await clickButton("projectPromptOpen");
+		expect(promptBox()?.value).toBe("# 旧内容\n");
 		await act(async () => {
 			promptBox()?.onChange?.({ currentTarget: { value: "# 新内容\n" } });
 		});
-		await clickCreate();
+		await clickButton("projectPromptSave");
 
 		expect(saveProjectPrompt).toHaveBeenCalledTimes(1);
 		const savedInput = (saveProjectPrompt.mock.calls as unknown[][])[0]?.[0];
@@ -248,24 +272,24 @@ describe("project prompt box", () => {
 			cwd: "/ws",
 			filename: "AGENTS.md",
 			content: "# 新内容\n",
-			// The lock is the hash that was loaded, not a blind overwrite.
 			baseHash: "hash-before",
 		});
-		expect(create).toHaveBeenCalledTimes(1);
+		expect(create).not.toHaveBeenCalled();
 	});
 
-	test("a refused save aborts the create and keeps the dialog open", async () => {
+	test("a refused save stays in the editor and does not create a session", async () => {
 		saveProjectPrompt.mockImplementationOnce(async () => {
 			throw new Error("The prompt file changed since it was opened");
 		});
 		await renderDialog();
+		await clickButton("projectPromptOpen");
 		await act(async () => {
 			promptBox()?.onChange?.({ currentTarget: { value: "# 新内容\n" } });
 		});
-		await clickCreate();
+		await clickButton("projectPromptSave");
 
 		expect(create).not.toHaveBeenCalled();
-		expect(showNotification).toHaveBeenCalledTimes(1);
+		expect(showNotification).toHaveBeenCalled();
 		const shown = (showNotification.mock.calls as unknown[][])[0]?.[0];
 		expect(shown).toMatchObject({
 			title: "projectPromptSaveFailed",
@@ -273,11 +297,20 @@ describe("project prompt box", () => {
 		});
 	});
 
-	test("an oversized file is read-only, so it can never be saved back", async () => {
+	test("an oversized file is read-only", async () => {
 		const loaded = promptQuery.data;
 		expect(loaded).toBeDefined();
 		promptQuery.data = { ...loaded, truncated: true } as typeof promptQuery.data;
 		await renderDialog();
+		await clickButton("projectPromptOpen");
 		expect(promptBox()?.readOnly).toBe(true);
+	});
+
+	test("preview hides the source box", async () => {
+		await renderDialog();
+		await clickButton("projectPromptOpen");
+		expect(container.querySelector("[data-part='textarea']")).not.toBeNull();
+		await clickButton("projectPromptModePreview");
+		expect(container.querySelector("[data-part='textarea']")).toBeNull();
 	});
 });

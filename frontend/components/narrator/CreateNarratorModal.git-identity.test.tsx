@@ -35,7 +35,10 @@ let identityQuery: {
 mock.module("@mantine/core", () => ({
 	Alert: box,
 	Badge: box,
+	Box: box,
 	Divider: box,
+	Loader: box,
+	SegmentedControl: box,
 	Group: box,
 	Stack: box,
 	Text: ({ children }: { children?: ReactNode }) => <span>{children}</span>,

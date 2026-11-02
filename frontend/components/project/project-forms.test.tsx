@@ -31,6 +31,7 @@ let edits: Record<string, string> = {};
 mock.module("@mantine/core", () => ({
 	Alert: box,
 	Badge: box,
+	Box: box,
 	Card: box,
 	Code: box,
 	Divider: box,

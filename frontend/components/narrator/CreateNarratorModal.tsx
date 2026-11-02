@@ -22,7 +22,6 @@ import {
 	Select,
 	Stack,
 	Text,
-	Textarea,
 	TextInput,
 	Tooltip,
 } from "@mantine/core";
@@ -45,8 +44,6 @@ import { useGitIdentityVisibility } from "../../hooks/useGitIdentityVisibility";
 import { useAllModels } from "../../hooks/useModels";
 import { useCreateNarrator } from "../../hooks/useNarrator";
 import { useProjectDirStatus } from "../../hooks/useProjectDirStatus";
-import { usePromptLibrary } from "../../hooks/usePromptLibrary";
-import type { OptimizeStyle } from "../../hooks/usePromptOptimize";
 import { api } from "../../lib/api";
 import { FOLLOW_DEFAULT_MODEL } from "../../lib/constants";
 import { DirectoryPicker } from "../common/DirectoryPicker";
@@ -55,19 +52,7 @@ import {
 	resolveStartInPlanModePrefill,
 	shouldSendStartInPlanMode,
 } from "./composer/create-narrator-plan-mode-prefill";
-import {
-	TextareaOptimizeControls,
-	textareaOptimizeControlsWidth,
-} from "./composer/TextareaOptimizeControls";
-
-/**
- * Drag limits for the project-prompt box, in px.
- *
- * The minimum matches the `rows={6}` default so a drag can never make the box smaller
- * than it opens; the maximum keeps the dialog's footer reachable on a laptop screen.
- */
-const PROMPT_MIN_HEIGHT = 132;
-const PROMPT_MAX_HEIGHT = 520;
+import { ProjectPromptModal } from "./ProjectPromptModal";
 
 const MODEL_SELECT_OPTION_LIMIT = 100;
 const CREATE_NARRATOR_SETTINGS_QUERY_GC_TIME_MS = 60_000;
@@ -180,9 +165,6 @@ export function CreateNarratorModalBody({
 }: CreateNarratorModalProps) {
 	const { t } = useTranslation("narrators");
 	const { t: tc } = useTranslation("common");
-	// The optimize affordance is the composer's, so its labels come from the same
-	// namespace rather than being duplicated here with slightly different wording.
-	const { t: tn } = useTranslation("narrator");
 	const createNarrator = useCreateNarrator();
 	const queryClient = useQueryClient();
 	const { groupedModels } = useAllModels();
@@ -195,10 +177,7 @@ export function CreateNarratorModalBody({
 	// or deleted one would just fail the create.
 	const { usablePath, needsChoice } = useProjectDirStatus();
 	const defaultProjectDir = usablePath ?? "";
-	// 只在弹窗打开时拉取，避免常驻请求。这里只读：库是「插入素材」的来源，
-	// 新建/编辑都在「套路 → 提示词库」里完成。
-	const { data: promptLibrary } = usePromptLibrary(opened);
-	const [pickedPromptId, setPickedPromptId] = useState<string | null>(null);
+	const [promptEditorOpen, setPromptEditorOpen] = useState(false);
 	const { data: favorites } = useFavoriteDirectories();
 	const addFavorite = useCreateFavoriteDirectory();
 	const removeFavorite = useDeleteFavoriteDirectory();
@@ -217,42 +196,6 @@ export function CreateNarratorModalBody({
 	// Query resolved ⇒ we know the default (server merges agent defaults). Until
 	// then the switch is a placeholder and submit omits the field.
 	const planModeSettingsKnown = settings != null;
-	// ── Project prompt file (AGENTS.md & friends) ───────────────────────────────
-	// The box is NOT a per-session system prompt stored on the narrator: it edits the
-	// file that `narrator-prompt` already injects for every session in this directory,
-	// so what the user sees here is what every narrator in this directory will read.
-	//
-	// `draft` is what the textarea shows, `baseline` is what was loaded — their
-	// difference is the only reason a save happens. `loadedKeyRef` is the identity of
-	// the file the baseline came from (`path|hash`), so a refetch that changed nothing
-	// cannot overwrite typing in progress, while changing the directory does load the
-	// new file (a stale baseline would otherwise be written into the wrong project).
-	const projectPromptQuery = useQuery({
-		queryKey: ["project-prompt", cwd],
-		queryFn: () => api.getProjectPrompt(cwd),
-		enabled: opened && cwd.trim().length > 0,
-		retry: false,
-		// A prompt file is cheap to refetch and the dialog is short-lived; the server
-		// answers 409 on a stale save, so a cached copy costs a retry rather than data.
-		staleTime: 0,
-		gcTime: 0,
-	});
-	const [promptDraft, setPromptDraft] = useState("");
-	const [promptBaseline, setPromptBaseline] = useState("");
-	const promptLoadedKeyRef = useRef<string | null>(null);
-	// The optimistic lock as it stands NOW, not as the query last reported it: after a
-	// successful save the file on disk holds the new bytes, so a retried create (the
-	// narrator request failed, the save did not) must lock against what was written
-	// rather than re-sending the hash from before the save.
-	const promptHashRef = useRef<string | null>(null);
-	// Height the user dragged the box to; `null` means "never dragged", so the box keeps
-	// its `rows` default and a dialog reopened on another directory does not inherit a
-	// height chosen for a different file.
-	const [promptHeight, setPromptHeight] = useState<number | null>(null);
-	const promptInputRef = useRef<HTMLTextAreaElement | null>(null);
-	const promptResizeCleanupRef = useRef<(() => void) | null>(null);
-	const [optimizingPrompt, setOptimizingPrompt] = useState(false);
-	const [savingPrompt, setSavingPrompt] = useState(false);
 	const [sessionTitle, setSessionTitle] = useState("");
 	const [makeNamed, setMakeNamed] = useState(false);
 	const [knowledgeSteward, setKnowledgeSteward] = useState(false);
@@ -382,131 +325,6 @@ export function CreateNarratorModalBody({
 
 	const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
 
-	// Adopt the loaded file into the box, once per identity. Keyed on `path|hash` rather
-	// than on the query object: a refetch of unchanged content must not reset text the
-	// user is still typing, but a different file (other directory, or the same file
-	// edited by an agent meanwhile) must.
-	const projectPrompt = projectPromptQuery.data;
-	const projectPromptKey = projectPrompt
-		? `${projectPrompt.path}|${projectPrompt.hash ?? "absent"}`
-		: null;
-	useEffect(() => {
-		if (!projectPrompt || projectPromptKey === promptLoadedKeyRef.current) return;
-		promptLoadedKeyRef.current = projectPromptKey;
-		promptHashRef.current = projectPrompt.hash;
-		// Coerced rather than trusted: a response that carries no `content` must leave an
-		// empty box, never write `undefined` into the draft (which then crashes every
-		// `.trim()` in this section and would also be sent as the file body).
-		const content = typeof projectPrompt.content === "string" ? projectPrompt.content : "";
-		setPromptDraft(content);
-		setPromptBaseline(content);
-	}, [projectPrompt, projectPromptKey]);
-
-	/**
-	 * Switch the prompt box to another directory.
-	 *
-	 * The reset is explicit rather than inferred from `cwd` in an effect: `cwd` starts
-	 * empty and is prefilled a render later, so "the directory is empty" cannot be told
-	 * apart from "the prefill has not arrived" — the effect version cleared the box it
-	 * had just loaded.
-	 */
-	const applyCwd = useCallback((next: string) => {
-		setCwd(next);
-		promptLoadedKeyRef.current = null;
-		promptHashRef.current = null;
-		setPromptHeight(null);
-		setPromptDraft("");
-		setPromptBaseline("");
-	}, []);
-
-	// ── 提示词库 → 项目提示词 ───────────────────────────────────────────────────
-	// 库条目只提供文本：插进来的是内容副本，之后在 AGENTS.md 里怎么改都与库无关，
-	// 所以这里不需要记录「来自哪个条目」，也不产生引用关系。
-	const pickedPromptContent =
-		(promptLibrary ?? []).find((entry) => entry.id === pickedPromptId)?.content ?? "";
-	/**
-	 * `insert` 在光标处插入（文本框已有焦点时按用户的实际位置），`replace` 整段替换。
-	 * 两者都只是改 draft，用户仍要走原来的保存流程落盘。
-	 */
-	const applyLibraryPrompt = (mode: "insert" | "replace") => {
-		const content = pickedPromptContent;
-		if (!content) return;
-		if (mode === "replace") {
-			setPromptDraft(content);
-			return;
-		}
-		const input = promptInputRef.current;
-		const start = input?.selectionStart ?? null;
-		const end = input?.selectionEnd ?? null;
-		setPromptDraft((current) => {
-			// No measurable caret (box never focused): append rather than guess a position.
-			if (start === null || end === null) {
-				return current.trim()
-					? `${current}
-
-${content}`
-					: content;
-			}
-			return current.slice(0, start) + content + current.slice(end);
-		});
-	};
-
-	const promptDirty = promptDraft !== promptBaseline;
-	// A truncated file is a PREFIX of the real one; saving it back would delete
-	// everything past the cut, so editing is refused instead.
-	const promptEditable =
-		!!projectPrompt && !projectPrompt.truncated && !projectPromptQuery.isPending;
-
-	/**
-	 * Drag the prompt box by its own corner grip.
-	 *
-	 * Native `resize` cannot serve this box. `autosize` recomputes `style.height` in a
-	 * dependency-less `useLayoutEffect` (`@mantine/core` Textarea/Autosize.mjs) and forces
-	 * `overflow-y: hidden`, so a dragged height is reverted by the next render while the
-	 * browser still paints a ~10px grip that looks usable. Owning the height in React
-	 * state is what makes the drag actually stick, and a real element is what gives the
-	 * grip a hit area bigger than the browser's ~10px corner.
-	 */
-	const startPromptResize = useCallback(
-		(event: React.PointerEvent<HTMLElement>) => {
-			if (!promptEditable) return;
-			const input = promptInputRef.current;
-			if (!input) return;
-			// Keeps the drag from starting a text selection inside the textarea.
-			event.preventDefault();
-			const startY = event.clientY;
-			const startHeight = input.getBoundingClientRect().height;
-			setPromptHeight(startHeight);
-			const onMove = (moveEvent: PointerEvent) => {
-				const next = Math.round(startHeight + (moveEvent.clientY - startY));
-				setPromptHeight(Math.min(PROMPT_MAX_HEIGHT, Math.max(PROMPT_MIN_HEIGHT, next)));
-			};
-			const onUp = () => {
-				window.removeEventListener("pointermove", onMove);
-				window.removeEventListener("pointerup", onUp);
-				promptResizeCleanupRef.current = null;
-			};
-			window.addEventListener("pointermove", onMove);
-			window.addEventListener("pointerup", onUp);
-			promptResizeCleanupRef.current = onUp;
-		},
-		[promptEditable],
-	);
-
-	// A focusable grip must be operable without a mouse.
-	const handlePromptResizeKeyDown = useCallback((event: React.KeyboardEvent<HTMLButtonElement>) => {
-		const step = event.key === "ArrowUp" ? -20 : event.key === "ArrowDown" ? 20 : 0;
-		if (step === 0) return;
-		event.preventDefault();
-		const current = promptInputRef.current?.getBoundingClientRect().height ?? PROMPT_MIN_HEIGHT;
-		setPromptHeight(
-			Math.min(PROMPT_MAX_HEIGHT, Math.max(PROMPT_MIN_HEIGHT, Math.round(current + step))),
-		);
-	}, []);
-
-	// Safety net, same shape as the favorites list's: no listeners survive the modal.
-	useEffect(() => () => promptResizeCleanupRef.current?.(), []);
-
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
 	const isFavorited = favorites?.some((f: any) => f.path === cwd);
 	// biome-ignore lint/suspicious/noExplicitAny: dynamic JSON structure
@@ -539,115 +357,7 @@ ${content}`
 		setActiveId(null);
 	}, []);
 
-	/**
-	 * Write the project prompt file if — and only if — the user changed it.
-	 *
-	 * Runs BEFORE the narrator is created, deliberately: if the file cannot be saved
-	 * (a concurrent agent edit, a permission refusal) the dialog stays open with the
-	 * user's text intact. Creating first would leave a session behind whose prompt was
-	 * never written, and the error would arrive with nothing to retry.
-	 */
-	const saveProjectPromptBeforeCreate = async (): Promise<boolean> => {
-		if (!projectPrompt || !promptDirty) return true;
-		// A truncated file was never fully loaded; the textarea is read-only in that
-		// state, so `promptDirty` can only be false here — kept as an explicit guard.
-		if (projectPrompt.truncated) return true;
-		setSavingPrompt(true);
-		try {
-			const saved = await api.saveProjectPrompt({
-				cwd: projectPrompt.cwd,
-				filename: projectPrompt.filename,
-				content: promptDraft,
-				baseHash: promptHashRef.current,
-			});
-			// Rebase on what was written, so a failed CREATE followed by a retry does not
-			// save the same text twice (the second save would 409 against itself).
-			promptLoadedKeyRef.current = `${saved.path}|${saved.hash}`;
-			promptHashRef.current = saved.hash;
-			setPromptBaseline(promptDraft);
-			return true;
-		} catch (error) {
-			notifications.show({
-				color: "red",
-				title: t("projectPromptSaveFailed"),
-				message: error instanceof Error ? error.message : tc("unknownError"),
-				autoClose: 12000,
-			});
-			return false;
-		} finally {
-			setSavingPrompt(false);
-		}
-	};
-
-	/**
-	 * The composer's ✨ button, for a file that has no session: same styles, same
-	 * optimize model, served by `/api/narrators/optimize-prompt` (no narrator id).
-	 *
-	 * The result is applied only if the box still holds the text that was sent. An
-	 * optimization can take tens of seconds, and silently replacing whatever the user
-	 * typed meanwhile is the failure the composer's own delivery path guards against.
-	 */
-	const optimizeAbortRef = useRef<AbortController | null>(null);
-	const handleOptimizePrompt = async (style: OptimizeStyle) => {
-		const original = promptDraft;
-		if (!original.trim() || optimizingPrompt) return;
-		optimizeAbortRef.current?.abort();
-		const controller = new AbortController();
-		optimizeAbortRef.current = controller;
-		setOptimizingPrompt(true);
-		try {
-			const result = await api.optimizeDraftPrompt(original, style, {
-				signal: controller.signal,
-			});
-			if (controller.signal.aborted) return;
-			setPromptDraft((current) => {
-				if (current !== original) {
-					notifications.show({
-						title: tn("optimizeFailed"),
-						message: tn("richComposer.optimizeChanged"),
-						color: "red",
-						autoClose: 10000,
-					});
-					return current;
-				}
-				notifications.show({
-					message: tn("optimizeSuccess"),
-					color: "green",
-					autoClose: 8000,
-				});
-				return result.text;
-			});
-			const summary = result.reasoningSummary?.trim();
-			if (summary) {
-				notifications.show({
-					title: tn("optimizeSummaryTitle"),
-					message: summary,
-					color: "indigo",
-					autoClose: 12000,
-					withCloseButton: true,
-				});
-			}
-		} catch (error) {
-			// An aborted request is the user's own cancel, not a failure.
-			if (controller.signal.aborted) return;
-			const raw = error instanceof Error ? error.message : "";
-			const message =
-				raw.includes("timeout") || raw.includes("timed out")
-					? tn("optimizeTimeout")
-					: raw || tn("optimizeFailedGeneric");
-			notifications.show({
-				title: tn("optimizeFailed"),
-				message,
-				color: "red",
-				autoClose: 10000,
-			});
-		} finally {
-			if (optimizeAbortRef.current === controller) optimizeAbortRef.current = null;
-			setOptimizingPrompt(false);
-		}
-	};
-
-	const handleCreate = async () => {
+	const handleCreate = () => {
 		// Explicit boolean whenever the switch means something (user flipped it, or
 		// the instance default is showing on it). Omitting `false` would let the
 		// server's `input.startInPlanMode ?? defaultStartInPlanMode` re-impose the
@@ -656,7 +366,6 @@ ${content}`
 			userTouched: startInPlanModeTouched,
 			settingsKnown: planModeSettingsKnown,
 		});
-		if (!(await saveProjectPromptBeforeCreate())) return;
 		createNarrator.mutate(
 			{
 				...(cwd ? { cwd } : {}),
@@ -719,16 +428,8 @@ ${content}`
 		setBot(false);
 		setHandle("");
 		setSessionTitle("");
-		setPickedPromptId(null);
+		setPromptEditorOpen(false);
 		setGitIdentityId(FOLLOW_DEFAULT_GIT_IDENTITY);
-		// The prompt box belongs to a directory, not to the form: clearing the identity
-		// is what lets the next open adopt the file from scratch.
-		promptLoadedKeyRef.current = null;
-		promptHashRef.current = null;
-		setPromptDraft("");
-		setPromptBaseline("");
-		setSavingPrompt(false);
-		setOptimizingPrompt(false);
 	}, []);
 
 	const handleClose = () => {
@@ -765,7 +466,7 @@ ${content}`
 						key={fav.id}
 						fav={fav}
 						isActive={cwd === fav.path}
-						onSelect={() => applyCwd(fav.path)}
+						onSelect={() => setCwd(fav.path)}
 						onRemove={() => removeFavorite.mutate(fav.id)}
 					/>
 				))}
@@ -801,7 +502,7 @@ ${content}`
 					placeholder={defaultProjectDir || undefined}
 					leftSection={<IconFolder size={16} />}
 					value={cwd}
-					onChange={applyCwd}
+					onChange={setCwd}
 					rightSectionExtra={
 						cwd ? (
 							isFavorited ? (
@@ -860,172 +561,14 @@ ${content}`
 		</>
 	);
 
-	// The project instruction file, shown as a composer-shaped box. Placed last in the
-	// right-hand column so it sits where the screenshot's empty area was: below the
-	// session-type switches, above the fixed footer.
-	// One hint line, in priority order: what the box cannot do (no directory, load
-	// failed) outranks what it is showing, and a truncated file outranks its name.
-	const projectPromptDescription = !cwd.trim()
-		? t("projectPromptChooseDirectory")
-		: projectPromptQuery.isFetching
-			? t("projectPromptLoading")
-			: projectPromptQuery.isError
-				? undefined
-				: projectPrompt?.truncated
-					? t("projectPromptTruncated", { max: 200 })
-					: projectPrompt?.exists
-						? t("projectPromptExisting", { filename: projectPrompt.filename })
-						: projectPrompt
-							? t("projectPromptWillCreate", { filename: projectPrompt.filename })
-							: t("projectPromptChooseDirectory");
-
 	const projectPromptSection = (
 		<Stack gap={6}>
-			{/* `position: relative` exists only for the grip: the browser's own resize
-			    corner is what we cannot use here (see `startPromptResize`). */}
-			<div style={{ position: "relative" }}>
-				<Textarea
-					ref={promptInputRef}
-					label={t("projectPrompt")}
-					description={projectPromptDescription}
-					placeholder={
-						projectPromptQuery.isError
-							? t("projectPromptLoadFailed")
-							: t("projectPromptPlaceholder")
-					}
-					value={promptDraft}
-					onChange={(e) => setPromptDraft(e.currentTarget.value)}
-					// Read-only whenever the file's current state is unknown — no directory
-					// chosen, still loading, load failed, or too large to load fully. Typing
-					// into a box we could not read is how a partial file would get saved back.
-					readOnly={!promptEditable}
-					disabled={!cwd.trim()}
-					error={
-						projectPromptQuery.isError ? (projectPromptQuery.error as Error).message : undefined
-					}
-					// NOT `autosize`: Mantine's autosize owns `style.height` (and forces
-					// `overflow-y: hidden`), so it would revert every drag the user makes and
-					// leave a native grip that never holds. `rows` gives the same first-paint
-					// size without handing the height to a layout effect.
-					rows={6}
-					resize="none"
-					styles={{
-						input: {
-							// Mirrors the composer: the optimize cluster is not measured by
-							// Mantine, so the padding that reserves its room is set explicitly.
-							paddingInlineEnd: textareaOptimizeControlsWidth(false),
-							...(promptHeight === null ? {} : { height: promptHeight }),
-						},
-					}}
-					rightSection={
-						<TextareaOptimizeControls
-							optimizeAvailable={promptEditable && promptDraft.trim().length > 0}
-							disabled={!promptEditable}
-							loading={optimizingPrompt}
-							withContext={false}
-							// A draft prompt has no session, so there is no conversation to attach.
-							contextAvailable={false}
-							onToggleContext={() => {}}
-							onOptimize={(style) => void handleOptimizePrompt(style)}
-							onCancelOptimize={() => {
-								optimizeAbortRef.current?.abort();
-								optimizeAbortRef.current = null;
-								setOptimizingPrompt(false);
-							}}
-						/>
-					}
-					rightSectionWidth={textareaOptimizeControlsWidth(false)}
-					rightSectionPointerEvents="auto"
-				/>
-				{promptEditable ? (
-					// A real <button>, not a div with role="separator": it has to be focusable
-					// and operable by keyboard (arrow keys), which is also what a11y lint
-					// requires of anything that handles pointer interaction.
-					<button
-						type="button"
-						aria-label={t("projectPromptResize")}
-						title={t("projectPromptResize")}
-						onPointerDown={startPromptResize}
-						onKeyDown={handlePromptResizeKeyDown}
-						style={{
-							padding: 0,
-							border: "none",
-							background: "transparent",
-							position: "absolute",
-							// Inset from the border and sized well past the browser's ~10px
-							// corner grip: this is the element the user actually has to hit,
-							// and it sits before the ScrollArea's overlay scrollbar.
-							right: 2,
-							bottom: 2,
-							width: 22,
-							height: 22,
-							display: "grid",
-							placeItems: "center",
-							cursor: "ns-resize",
-							touchAction: "none",
-							color: "var(--mantine-color-dimmed)",
-							borderRadius: 3,
-							// Above the textarea so the pointer lands here, not in the text.
-							zIndex: 2,
-						}}
-					>
-						<svg width="14" height="14" viewBox="0 0 14 14" aria-hidden="true">
-							<path
-								d="M12 4 L4 12 M12 9 L9 12"
-								stroke="currentColor"
-								strokeWidth="1.6"
-								strokeLinecap="round"
-								fill="none"
-							/>
-						</svg>
-					</button>
-				) : null}
-			</div>
-			{/* 从提示词库取一段现成文本：整段替换或插入到光标处。
-			    库只提供素材，不建立引用关系——写进 AGENTS.md 的就是文本本身。 */}
-			<Group gap="xs" wrap="nowrap" align="flex-end">
-				<Select
-					size="xs"
-					style={{ flex: 1, minWidth: 0 }}
-					label={t("promptLibraryPick")}
-					placeholder={
-						promptLibrary && promptLibrary.length > 0
-							? t("promptLibraryPickPlaceholder")
-							: t("promptLibraryEmpty")
-					}
-					searchable
-					clearable
-					disabled={!promptEditable || !promptLibrary || promptLibrary.length === 0}
-					data={(promptLibrary ?? []).map((entry) => ({
-						value: entry.id,
-						label: entry.name,
-					}))}
-					value={pickedPromptId}
-					onChange={setPickedPromptId}
-					comboboxProps={{ withinPortal: true, position: "bottom-start", zIndex: 320 }}
-				/>
-				<Button
-					size="compact-sm"
-					variant="light"
-					disabled={!promptEditable || !pickedPromptContent}
-					onClick={() => applyLibraryPrompt("insert")}
-				>
-					{t("promptLibraryInsert")}
-				</Button>
-				<Button
-					size="compact-sm"
-					variant="subtle"
-					disabled={!promptEditable || !pickedPromptContent}
-					onClick={() => applyLibraryPrompt("replace")}
-				>
-					{t("promptLibraryReplace")}
-				</Button>
-			</Group>
-			{promptDirty && promptEditable ? (
-				<Text size="xs" c="dimmed">
-					{t("projectPromptDirtyHint")}
-				</Text>
-			) : null}
+			<Button variant="light" disabled={!cwd.trim()} onClick={() => setPromptEditorOpen(true)}>
+				{t("projectPromptOpen")}
+			</Button>
+			<Text size="xs" c="dimmed">
+				{cwd.trim() ? t("projectPromptOpenHint") : t("projectPromptChooseDirectory")}
+			</Text>
 		</Stack>
 	);
 
@@ -1201,7 +744,7 @@ ${content}`
 				</Button>
 				<Button
 					onClick={() => void handleCreate()}
-					loading={createNarrator.isPending || savingPrompt}
+					loading={createNarrator.isPending}
 					disabled={
 						directoryRequired ||
 						(makeNamed && handleLength(handle.trim()) < MIN_HANDLE_LENGTH) ||
@@ -1211,6 +754,9 @@ ${content}`
 					{t("createNarrator")}
 				</Button>
 			</Group>
+			{promptEditorOpen && cwd.trim() ? (
+				<ProjectPromptModal cwd={cwd} onClose={() => setPromptEditorOpen(false)} />
+			) : null}
 		</>
 	);
 }

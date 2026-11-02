@@ -1390,9 +1390,11 @@ function resolveUserDir(key: "desktop" | "documents" | "downloads", home: string
  * optimistic lock compares a sha256, and decoding first would make the hash depend
  * on the decoder's replacement of invalid sequences.
  *
- * `truncated` comes from the bytes actually read as well as from the size the caller
- * stat'd, so a file that grows between the two is reported as truncated instead of
- * being edited from a prefix.
+ * A file that fills the cap exactly is complete. Truncation means bytes were left
+ * unread: the file was already over the cap, or it grew between the size check and
+ * the read. Comparing `bytesRead >= maxBytes` is the wrong signal — that is also
+ * true of a file whose size is exactly the cap, and it misses growth that stays
+ * under the cap.
  */
 async function readBoundedBytes(
 	path: string,
@@ -1411,10 +1413,16 @@ async function readBoundedBytes(
 	try {
 		const buffer = new Uint8Array(want);
 		const { bytesRead } = want > 0 ? await handle.read(buffer, 0, want, 0) : { bytesRead: 0 };
+		let sizeAfter = fileSize;
+		try {
+			sizeAfter = (await stat(path)).size;
+		} catch {
+			// The size observed before the read is the best remaining answer.
+		}
 		return {
 			bytes: buffer.subarray(0, bytesRead),
-			truncated: fileSize > maxBytes || bytesRead >= maxBytes,
-			totalBytes: fileSize,
+			truncated: sizeAfter > maxBytes || bytesRead < sizeAfter,
+			totalBytes: sizeAfter,
 		};
 	} finally {
 		await handle.close();
