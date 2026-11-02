@@ -14,8 +14,8 @@ import { isCompletionLimitReason } from "./error-handling";
 import { GeminiMediaFiles } from "./gemini-media-files";
 import { reportInputCharacters } from "./input-characters";
 import {
+	createNativeMediaDumpEncoder,
 	geminiInlineMedia,
-	redactNativeMediaForDump,
 	storedMessageMedia,
 	supportsNativeMediaProtocolInput,
 } from "./native-media";
@@ -392,7 +392,7 @@ export class GeminiProvider implements ProviderAdapter {
 			method: "POST",
 			url,
 			headers: sanitizeHeaders(headers),
-			bodyText: JSON.stringify(redactNativeMediaForDump(body)),
+			bodyText: await createNativeMediaDumpEncoder()(body, bodyText, params.signal),
 		});
 		params.onRequestStart?.();
 		params.streamProgress?.beginAttempt();

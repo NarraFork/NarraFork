@@ -172,6 +172,8 @@
 	"mediaFileTooLarge": "音视频文件不能为空且不能超过 100 MiB",
 	"mediaTooMany": "每条消息最多附加 10 个音视频文件",
 	"mediaUploadTooLarge": "总上传大小须低于 128 MiB，请移除附件或缩小文件。",
+	"mediaPreviewLoad": "加载预览",
+	"mediaPreviewRetry": "重试预览",
 	"mediaPreviewLoading": "正在加载音视频…",
 	"mediaPreviewFailed": "无法预览该音视频",
 	"imageAttachmentTooLarge": "图片不能超过 20 MiB",

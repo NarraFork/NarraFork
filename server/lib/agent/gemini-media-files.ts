@@ -71,6 +71,43 @@ export class GeminiMediaFiles {
 	): Promise<T> {
 		signal?.throwIfAborted();
 		const candidates: Array<{ item: Record<string, unknown>; data: string; mime: string }> = [];
+		// Media only occupies protocol content slots. Tool arguments, schemas and JSON
+		// results may also contain MIME fields, but are never upload candidates.
+		const record = (value: unknown): Record<string, unknown> | undefined =>
+			value && typeof value === "object" && !Array.isArray(value)
+				? (value as Record<string, unknown>)
+				: undefined;
+		const add = (value: unknown): void => {
+			const item = record(value);
+			if (!item) return;
+			const inline = record(item.inlineData);
+			if (protocol === "interactions" && !["audio", "video"].includes(String(item.type))) return;
+			const data = protocol === "generate" ? inline?.data : item.data;
+			const mime = protocol === "generate" ? inline?.mimeType : item.mime_type;
+			if (typeof mime !== "string" || !/^(audio|video)\//.test(mime)) return;
+			// Already uploaded Interactions inputs have a URI instead of inline bytes.
+			if (protocol === "interactions" && typeof item.uri === "string" && data === undefined) return;
+			if (typeof data !== "string") throw new Error("Gemini native media has no media bytes.");
+			geminiMediaMime({
+				type: mime.startsWith("audio/") ? "audio" : "video",
+				mediaType: mime,
+				base64: data,
+			});
+			candidates.push({ item, data, mime });
+		};
+		if (protocol === "generate") {
+			for (const content of Array.isArray(body.contents) ? body.contents : []) {
+				const parts = record(content)?.parts;
+				for (const part of Array.isArray(parts) ? parts : []) add(part);
+			}
+		} else {
+			for (const step of Array.isArray(body.input) ? body.input : []) {
+				const item = record(step);
+				if (item?.type !== "user_input") continue;
+				for (const part of Array.isArray(item.content) ? item.content : []) add(part);
+			}
+		}
+		if (!candidates.length) return body;
 		let estimatedBytes = 0;
 		const scan = (value: unknown): void => {
 			if (typeof value === "string") {
@@ -86,18 +123,6 @@ export class GeminiMediaFiles {
 				return;
 			}
 			const item = value as Record<string, unknown>;
-			const inline = item.inlineData as { data?: string; mimeType?: string } | undefined;
-			const data = protocol === "generate" ? inline?.data : item.data;
-			const mime = protocol === "generate" ? inline?.mimeType : item.mime_type;
-			if (typeof mime === "string" && /^(audio|video)\//.test(mime)) {
-				if (typeof data !== "string") throw new Error("Gemini native media has no media bytes.");
-				geminiMediaMime({
-					type: mime.startsWith("audio/") ? "audio" : "video",
-					mediaType: mime,
-					base64: data,
-				});
-				candidates.push({ item, data, mime });
-			}
 			for (const [key, val] of Object.entries(item)) {
 				estimatedBytes += key.length + 8;
 				scan(val);

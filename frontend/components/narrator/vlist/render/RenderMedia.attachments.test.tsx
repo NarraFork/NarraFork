@@ -157,14 +157,15 @@ describe("virtual-list audio/video attachments", () => {
 		});
 	}
 
-	it.each(cases)("reserves %s loading placeholder without an image fallback", (type, height) => {
+	it.each(cases)("reserves %s idle placeholder with an explicit preview button", (type, height) => {
 		const { document } = render("user", block(type));
-		const status = document.querySelector('[role="status"]');
-		expect(status).not.toBeNull();
-		expect(status?.parentElement?.parentElement?.getAttribute("style")).toContain(
+		const button = document.querySelector("button");
+		expect(button).not.toBeNull();
+		expect(button?.parentElement?.parentElement?.getAttribute("style")).toContain(
 			`height:${height}px`,
 		);
-		expect(document.querySelector("img")).toBeNull();
+		expect(document.querySelector('[role="status"]')).toBeNull();
+		expect(document.querySelector("audio, video, img")).toBeNull();
 	});
 
 	it("renders command-bubble media attachments through the same player", () => {

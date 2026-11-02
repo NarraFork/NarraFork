@@ -1,4 +1,4 @@
-import { Box, Text } from "@mantine/core";
+import { Box, Button, Text } from "@mantine/core";
 import { mediaModality } from "@shared/media-attachments";
 import {
 	AUDIO_ATTACHMENT_CONTROL_HEIGHT,
@@ -50,7 +50,7 @@ export function PendingMediaAttachment({ file }: { file: File }) {
 	);
 }
 
-/** Protected uploads are fetched with session auth; native controls only receive a local blob URL. */
+/** Protected uploads download only on request; native controls only receive a local blob URL. */
 export function MediaAttachment({
 	narratorId,
 	block,
@@ -58,47 +58,66 @@ export function MediaAttachment({
 	narratorId: string;
 	block: MediaAttachmentBlock;
 }) {
-	const { t } = useTranslation("narrator");
-	const [loaded, setLoaded] = useState<{ key: string; url?: string; failed?: boolean } | null>(
-		null,
-	);
-	const [playbackErrorKey, setPlaybackErrorKey] = useState<string | null>(null);
 	const owner = block.uploadNarratorId || narratorId;
 	const previewUrl = block.previewUrl?.startsWith("blob:") ? block.previewUrl : undefined;
 	const referencingContext =
 		narratorId && narratorId !== owner
 			? `?referencingNarratorId=${encodeURIComponent(narratorId)}`
 			: "";
-	const key = `${narratorId}:${owner}:${block.mediaId ?? ""}:${previewUrl ?? ""}`;
+	const sourceUrl = block.mediaId
+		? `${apiBase()}/uploads/${encodeURIComponent(owner)}/media/${encodeURIComponent(block.mediaId)}${referencingContext}`
+		: undefined;
+	return (
+		<MediaAttachmentPreview
+			key={JSON.stringify([sourceUrl, previewUrl])}
+			block={block}
+			sourceUrl={sourceUrl}
+			previewUrl={previewUrl}
+		/>
+	);
+}
+
+/** A new source starts idle, even when a virtual-list row reuses the component. */
+function MediaAttachmentPreview({
+	block,
+	sourceUrl,
+	previewUrl,
+}: {
+	block: MediaAttachmentBlock;
+	sourceUrl?: string;
+	previewUrl?: string;
+}) {
+	const { t } = useTranslation("narrator");
+	const [request, setRequest] = useState(0);
+	const [loaded, setLoaded] = useState<{ url?: string; failed?: boolean } | null>(null);
+	const [playbackError, setPlaybackError] = useState(false);
 	const isVideo = block.type === "video";
 	useEffect(() => {
-		if (previewUrl) return;
-		if (!block.mediaId) return;
+		if (!request || previewUrl || !sourceUrl) return;
 		const controller = new AbortController();
 		let objectUrl: string | undefined;
 		let disposed = false;
-		void authorizedFetch(
-			`${apiBase()}/uploads/${encodeURIComponent(owner)}/media/${encodeURIComponent(block.mediaId)}${referencingContext}`,
-			{ signal: controller.signal },
-		)
+		void authorizedFetch(sourceUrl, { signal: controller.signal })
 			.then(async (response) => {
+				if (disposed) return;
 				if (!response.ok) throw new Error(`Media ${response.status}`);
 				const blob = await response.blob();
 				if (disposed) return;
 				objectUrl = URL.createObjectURL(blob);
-				setLoaded({ key, url: objectUrl });
+				setLoaded({ url: objectUrl });
 			})
 			.catch(() => {
-				if (!disposed) setLoaded({ key, failed: true });
+				if (!disposed) setLoaded({ failed: true });
 			});
 		return () => {
 			disposed = true;
 			controller.abort();
 			if (objectUrl) URL.revokeObjectURL(objectUrl);
 		};
-	}, [owner, block.mediaId, previewUrl, referencingContext, key]);
-	const url = previewUrl || (loaded?.key === key ? loaded.url : undefined);
-	const failed = (loaded?.key === key && loaded.failed) || playbackErrorKey === key;
+	}, [request, previewUrl, sourceUrl]);
+	const url = previewUrl || loaded?.url;
+	const failed = loaded?.failed || playbackError;
+	const loading = !previewUrl && request > 0 && !loaded;
 	const controlHeight = isVideo ? VIDEO_ATTACHMENT_CONTROL_HEIGHT : AUDIO_ATTACHMENT_CONTROL_HEIGHT;
 	return (
 		<Box
@@ -127,7 +146,7 @@ export function MediaAttachment({
 						src={url}
 						controls
 						preload="metadata"
-						onError={() => setPlaybackErrorKey(key)}
+						onError={() => setPlaybackError(true)}
 						playsInline
 						aria-label={block.filename || t("videoAttachment")}
 						style={{
@@ -145,7 +164,7 @@ export function MediaAttachment({
 						src={url}
 						controls
 						preload="metadata"
-						onError={() => setPlaybackErrorKey(key)}
+						onError={() => setPlaybackError(true)}
 						aria-label={block.filename || t("audioAttachment")}
 						style={{ display: "block", width: "100%", height: controlHeight }}
 					/>
@@ -155,15 +174,31 @@ export function MediaAttachment({
 					style={{
 						height: controlHeight,
 						display: "flex",
+						flexDirection: "column",
 						alignItems: "center",
 						justifyContent: "center",
 						borderRadius: "var(--mantine-radius-sm)",
 						background: "var(--mantine-color-default-hover)",
 					}}
 				>
-					<Text size="xs" c="dimmed" role={failed ? "alert" : "status"}>
-						{t(failed ? "mediaPreviewFailed" : "mediaPreviewLoading")}
-					</Text>
+					{(failed || loading || (!sourceUrl && !previewUrl)) && (
+						<Text size="xs" c="dimmed" role={failed ? "alert" : "status"}>
+							{t(failed ? "mediaPreviewFailed" : "mediaPreviewLoading")}
+						</Text>
+					)}
+					{!loading && (sourceUrl || previewUrl) && (
+						<Button
+							size="compact-xs"
+							variant="subtle"
+							onClick={() => {
+								setLoaded(null);
+								setPlaybackError(false);
+								setRequest((attempt) => attempt + 1);
+							}}
+						>
+							{t(failed ? "mediaPreviewRetry" : "mediaPreviewLoad")}
+						</Button>
+					)}
 				</Box>
 			)}
 		</Box>

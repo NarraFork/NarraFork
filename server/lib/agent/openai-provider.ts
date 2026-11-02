@@ -41,7 +41,7 @@ import {
 	chatAudioMedia,
 	chatNativeMedia,
 	chatVideoMedia,
-	redactNativeMediaForDump,
+	createNativeMediaDumpEncoder,
 	rejectNativeMedia,
 	responsesVideoMedia,
 	storedMessageMedia,
@@ -1083,6 +1083,7 @@ export class OpenAIProvider implements ProviderAdapter {
 		// before any stream event has been yielded — after that the consumer has
 		// already seen partial output and a silent re-send would duplicate it.
 		const encodeBody = createRequestBodyEncoder();
+		const encodeDump = createNativeMediaDumpEncoder();
 		for (let attempt = 0; ; attempt++) {
 			if (turnState && this.apiMode === "codex") {
 				requestHeaders["x-codex-turn-state"] = turnState;
@@ -1094,7 +1095,7 @@ export class OpenAIProvider implements ProviderAdapter {
 				method: "POST",
 				url: endpoint,
 				headers: sanitizeHeaders(requestHeaders),
-				bodyText: JSON.stringify(redactNativeMediaForDump(body)),
+				bodyText: await encodeDump(body, bodyText, params.signal),
 			});
 
 			params.onRequestStart?.();

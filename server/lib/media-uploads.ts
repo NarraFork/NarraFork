@@ -25,6 +25,7 @@ const EXTENSIONS: Record<string, readonly string[]> = {
 	"video/mpeg": [".mpeg", ".mpg"],
 };
 const validatedFiles = new WeakMap<File, string>();
+const MAX_MP4_ITEMS = 4096;
 
 /** Walk only structural boxes; never scan payload strings for handler names. */
 function mp4Tracks(b: Buffer): { audio: boolean; video: boolean } {
@@ -33,7 +34,8 @@ function mp4Tracks(b: Buffer): { audio: boolean; video: boolean } {
 	function walk(start: number, end: number, depth: number) {
 		if (depth > 8) throw new ValidationError("Media container nesting exceeds limit");
 		for (let offset = start; offset + 8 <= end; ) {
-			if (++scans > 4096) throw new ValidationError("Media container complexity exceeds limit");
+			if (++scans > MAX_MP4_ITEMS)
+				throw new ValidationError("Media container complexity exceeds limit");
 			let size = b.readUInt32BE(offset);
 			const type = b.toString("ascii", offset + 4, offset + 8);
 			let header = 8;
@@ -255,12 +257,16 @@ export function validateMediaBytes(
 			if (b.length < 16 || ascii(4, 8) !== "ftyp") break;
 			const boxSize = b.readUInt32BE(0);
 			if (boxSize < 16 || boxSize > b.length || boxSize % 4 !== 0) break;
-			const brands = [ascii(8, 12)];
-			for (let i = 16; i + 4 <= boxSize; i += 4) brands.push(ascii(i, i + 4));
-			matches =
-				mime === "video/quicktime"
-					? brands.includes("qt  ")
-					: brands.some((brand) => /^(isom|iso[2-9]|mp4[12]|avc1|M4[AVB] |dash|MSNV)$/.test(brand));
+			if ((boxSize - 12) / 4 > MAX_MP4_ITEMS)
+				throw new ValidationError("Media brand complexity exceeds limit");
+			const supportedBrand = (offset: number) => {
+				const brand = ascii(offset, offset + 4);
+				return mime === "video/quicktime"
+					? brand === "qt  "
+					: /^(isom|iso[2-9]|mp4[12]|avc1|M4[AVB] |dash|MSNV)$/.test(brand);
+			};
+			matches = supportedBrand(8);
+			for (let i = 16; !matches && i + 4 <= boxSize; i += 4) matches = supportedBrand(i);
 			break;
 		}
 		case "video/mpeg":

@@ -11,6 +11,7 @@ import {
 import { getMediaPath } from "../media-uploads";
 import { getEffectiveModelProfile } from "../model-catalog";
 import type { DbMessage, ProviderAdapter } from "./provider";
+import { createRequestBodyEncoder } from "./request-json";
 
 /** Only traverse model-input containers, never tool schemas or generated output metadata. */
 export function visitNativeMedia(
@@ -68,38 +69,66 @@ export function visitNativeMedia(
 	walk(values);
 }
 
+/** Shallow copy-on-write transform, also usable by the cancellable JSON walker. */
+function redactNativeMediaNode(part: unknown): unknown {
+	if (!part || typeof part !== "object" || Array.isArray(part)) return part;
+	const item = part as Record<string, unknown>;
+	let result = item;
+	const replace = (key: string, value: unknown) => {
+		if (result === item) result = { ...item };
+		result[key] = value;
+	};
+	const omitted = (data: string) => `[native media omitted: ${data.length} base64 characters]`;
+	const mime = String(item.mediaType ?? item.mimeType ?? item.mime_type ?? item.media_type ?? "");
+	if (["audio", "video"].includes(String(item.type)) || /^(audio|video)\//.test(mime)) {
+		for (const key of ["data", "base64", "dataBase64"])
+			if (typeof item[key] === "string") replace(key, omitted(item[key]));
+	}
+	if (item.type === "input_audio" && item.input_audio && typeof item.input_audio === "object") {
+		const audio = item.input_audio as Record<string, unknown>;
+		if (typeof audio.data === "string")
+			replace("input_audio", { ...audio, data: omitted(audio.data) });
+	}
+	if (
+		item.type === "input_video" &&
+		typeof item.video_url === "string" &&
+		item.video_url.startsWith("data:")
+	)
+		replace("video_url", omitted(item.video_url));
+	if (item.type === "video_url" && item.video_url && typeof item.video_url === "object") {
+		const video = item.video_url as Record<string, unknown>;
+		if (typeof video.url === "string" && video.url.startsWith("data:"))
+			replace("video_url", { ...video, url: omitted(video.url) });
+	}
+	return result;
+}
+
 /** Diagnostic snapshots retain MIME/schema information, never native media bytes. */
 export function redactNativeMediaForDump<T>(value: T): T {
 	const redact = (part: unknown): unknown => {
 		if (!part || typeof part !== "object") return part;
 		if (Array.isArray(part)) return part.map(redact);
-		const item = part as Record<string, unknown>;
-		const result = Object.fromEntries(Object.entries(item).map(([key, val]) => [key, redact(val)]));
-		const omitted = (data: string) => `[native media omitted: ${data.length} base64 characters]`;
-		const mime = String(item.mediaType ?? item.mimeType ?? item.mime_type ?? item.media_type ?? "");
-		if (["audio", "video"].includes(String(item.type)) || /^(audio|video)\//.test(mime)) {
-			for (const key of ["data", "base64", "dataBase64"])
-				if (typeof item[key] === "string") result[key] = omitted(item[key]);
-		}
-		if (item.type === "input_audio" && item.input_audio && typeof item.input_audio === "object") {
-			const audio = item.input_audio as Record<string, unknown>;
-			if (typeof audio.data === "string")
-				result.input_audio = { ...audio, data: omitted(audio.data) };
-		}
-		if (
-			item.type === "input_video" &&
-			typeof item.video_url === "string" &&
-			item.video_url.startsWith("data:")
-		)
-			result.video_url = omitted(item.video_url);
-		if (item.type === "video_url" && item.video_url && typeof item.video_url === "object") {
-			const video = item.video_url as Record<string, unknown>;
-			if (typeof video.url === "string" && video.url.startsWith("data:"))
-				result.video_url = { ...video, url: omitted(video.url) };
-		}
-		return result;
+		const item = redactNativeMediaNode(part) as Record<string, unknown>;
+		return Object.fromEntries(Object.entries(item).map(([key, val]) => [key, redact(val)]));
 	};
 	return redact(value) as T;
+}
+
+/** Per-request encoder: no-media dumps reuse wire text; retries reuse unchanged fragments. */
+export function createNativeMediaDumpEncoder() {
+	const encode = createRequestBodyEncoder(redactNativeMediaNode);
+	return async (
+		body: Record<string, unknown>,
+		bodyText: string,
+		signal?: AbortSignal,
+	): Promise<string> => {
+		signal?.throwIfAborted();
+		let hasMedia = false;
+		visitNativeMedia(body, () => {
+			hasMedia = true;
+		});
+		return hasMedia ? encode(body, signal) : bodyText;
+	};
 }
 
 export function rejectNativeMedia(protocol: string, values: unknown): void {

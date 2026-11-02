@@ -6,6 +6,7 @@ import {
 	mkdtempSync,
 	readdirSync,
 	readFileSync,
+	rmSync,
 	truncateSync,
 	writeFileSync,
 } from "node:fs";
@@ -14,7 +15,7 @@ import { join } from "node:path";
 import { isMediaContentBlock, mediaRefToContentBlock } from "@shared/media-attachments";
 import { eq } from "drizzle-orm";
 import { drizzle } from "drizzle-orm/bun-sqlite";
-import { wavFile } from "../../../tests/fixtures/native-media";
+import { wavBytes, wavFile, webmBytes } from "../../../tests/fixtures/native-media";
 import * as relations from "../../db/relations";
 import * as schema from "../../db/schema";
 import { getMediaPath, saveUploadedMedia } from "../../lib/media-uploads";
@@ -200,6 +201,7 @@ describe("editAndRegenerate native media history", () => {
 		cwd = mkdtempSync(join(tmpdir(), "nf-edit-media-"));
 		setUploadsDirForTests(join(cwd, "uploads"));
 	});
+	afterEach(() => rmSync(cwd, { recursive: true, force: true }));
 	// These attachment edits intentionally leave workspace files untouched, just
 	// like the existing text-file harness. Real restores still require a confirmed
 	// plan and authenticated requester in the product service.
@@ -266,6 +268,87 @@ describe("editAndRegenerate native media history", () => {
 		expect(await blocks()).toEqual(before);
 		expect(readdirSync(join(cwd, "uploads", "n1", "media"))).toEqual(saved);
 		expect(getMediaPath("n1", original.mediaId)).not.toBeNull();
+	});
+	test.each([
+		["audio", () => wavFile()],
+		[
+			"video",
+			() => new File([new Uint8Array(webmBytes([1]))], "clip.webm", { type: "video/webm" }),
+		],
+	] as const)("retained %s bytes count toward the final limit and removed media frees the budget", async (_, file) => {
+		const original = await saveUploadedMedia("n1", file());
+		const originalPath = getMediaPath("n1", original.mediaId);
+		if (!originalPath) throw new Error("Missing original media");
+		// Sparse retained bytes deliberately disagree with the persisted size.
+		truncateSync(originalPath, 100 * 1024 * 1024);
+		seed(cwd, [{ ...mediaRefToContentBlock(original) }, { type: "text", text: "before" }]);
+		const before = await blocks();
+		const mediaDir = join(cwd, "uploads", "n1", "media");
+		const saved = readdirSync(mediaDir);
+		const bytes = Buffer.alloc(29 * 1024 * 1024);
+		wavBytes().copy(bytes);
+		bytes.writeUInt32LE(bytes.length - 8, 4);
+		bytes.writeUInt32LE(bytes.length - 44, 40);
+		const added = new File([bytes], "added.wav", { type: "audio/wav" });
+		await expect(
+			editAndRegenerate("n1", "m1", "after", "en", false, {
+				...editOptions,
+				newMedia: [added],
+			}),
+		).rejects.toThrow("Combined attachments exceed the 128 MiB limit");
+		expect(await blocks()).toEqual(before);
+		expect(readdirSync(mediaDir)).toEqual(saved);
+		expect(
+			await editAndRegenerate("n1", "m1", "after", "en", false, {
+				...editOptions,
+				keepMediaIds: [],
+				newMedia: [added],
+			}),
+		).toMatchObject({ ok: true });
+		expect((await blocks()).filter(isMediaContentBlock)).toMatchObject([
+			{ filename: "added.wav", size: added.size, uploadNarratorId: "n1" },
+		]);
+		expect(Bun.file(originalPath).size).toBe(100 * 1024 * 1024);
+	});
+	test("shared history counts each source owner and media ID once, not once per reference", async () => {
+		const original = await saveUploadedMedia("n1", wavFile());
+		const originalPath = getMediaPath("n1", original.mediaId);
+		if (!originalPath) throw new Error("Missing original media");
+		truncateSync(originalPath, 64 * 1024 * 1024);
+		const block = mediaRefToContentBlock(original);
+		const { uploadNarratorId: _, ...legacyBlock } = block;
+		seed(cwd, [{ ...legacyBlock }, { ...block }]);
+		db.insert(narrators)
+			.values({ id: "n2", cwd, status: "idle", createdAt: now, updatedAt: now })
+			.run();
+		db.insert(narratorMessageRefs)
+			.values({ id: "ref-n2-m1", narratorId: "n2", messageId: "m1", seq: 0, isCompact: 0 })
+			.run();
+		expect(
+			await editAndRegenerate("n2", "m1", "after", "en", false, {
+				...editOptions,
+				newMedia: [wavFile("added.wav")],
+			}),
+		).toMatchObject({ ok: true });
+		const childRef = await db.query.narratorMessageRefs.findFirst({
+			where: eq(narratorMessageRefs.narratorId, "n2"),
+		});
+		const childMessage = await db.query.narratorMessages.findFirst({
+			where: eq(narratorMessages.id, childRef?.messageId ?? ""),
+		});
+		expect((childMessage?.contentJson as unknown[]).filter(isMediaContentBlock)).toMatchObject([
+			{ mediaId: original.mediaId, uploadNarratorId: "n1" },
+			{ filename: "added.wav", uploadNarratorId: "n2" },
+		]);
+
+		// Identical IDs in different owners are different stored attachments.
+		const otherPath = join(cwd, "uploads", "n2", "media", `${original.mediaId}.wav`);
+		writeFileSync(otherPath, wavBytes());
+		truncateSync(otherPath, 65 * 1024 * 1024);
+		seed(cwd, [{ ...block }, { ...block, uploadNarratorId: "n2" }]);
+		await expect(editAndRegenerate("n1", "m1", "after", "en", false, editOptions)).rejects.toThrow(
+			"Combined attachments exceed the 128 MiB limit",
+		);
 	});
 	test("a later attachment write failure rolls back newly uploaded media and keeps old history", async () => {
 		seed(cwd, [{ type: "text", text: "before" }]);

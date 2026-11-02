@@ -6732,9 +6732,17 @@ async function editAndRegenerateUnlocked(
 	if (keepMediaIds.length + (opts?.newMedia?.length ?? 0) > MAX_MEDIA_ATTACHMENTS)
 		throw new ValidationError(`Maximum ${MAX_MEDIA_ATTACHMENTS} media attachments per message`);
 	for (const file of opts?.newMedia ?? []) await validateUploadedMedia(file);
+	let retainedAttachmentBytes = 0;
+	const countedMediaIds = new Set<string>();
 	for (const item of actualMedia.filter((item) => keepMediaIds.includes(item.mediaId))) {
-		if (!getMediaPath(item.uploadNarratorId || targetMsg.narratorId, item.mediaId))
-			throw new ValidationError(`Attached media not found: ${item.filename}`);
+		const owner = item.uploadNarratorId || targetMsg.narratorId;
+		const mediaPath = getMediaPath(owner, item.mediaId);
+		if (!mediaPath) throw new ValidationError(`Attached media not found: ${item.filename}`);
+		const mediaKey = `${owner.length}:${owner}:${item.mediaId}`;
+		if (!countedMediaIds.has(mediaKey)) {
+			countedMediaIds.add(mediaKey);
+			retainedAttachmentBytes += Bun.file(mediaPath).size;
+		}
 	}
 	const keepTextFilePaths = resolveRequestedAttachmentKeys(
 		actualTextFilePaths,
@@ -6822,7 +6830,6 @@ async function editAndRegenerateUnlocked(
 	const keepTextFileSet = new Set(keepTextFilePaths);
 	const countedImageIds = new Set<string>();
 	const countedTextFilePaths = new Set<string>();
-	let retainedAttachmentBytes = 0;
 	const textFilesToCopy = new Map<string, TextFileRef>();
 	for (const block of originalBlocks) {
 		if (

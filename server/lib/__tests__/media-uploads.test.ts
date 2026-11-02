@@ -141,6 +141,26 @@ test("MP4 structural parsing rejects excessive nesting and box counts", () => {
 	expect(() => validateMediaBytes(many, "many.mp4")).toThrow("complexity");
 });
 
+test("MP4 brand parsing bounds the table even when its first brand is supported", () => {
+	const ftyp = (brands: number, major: string, compatible?: string) => {
+		const bytes = Buffer.alloc(12 + brands * 4);
+		bytes.writeUInt32BE(bytes.length);
+		bytes.write("ftyp", 4);
+		bytes.write(major, 8);
+		if (compatible) bytes.write(compatible, bytes.length - 4);
+		return bytes;
+	};
+	// The last compatible brand is considered, but the minor-version word is not.
+	expect(validateMediaBytes(ftyp(4096, "none", "isom"), "clip.mp4")).toBe("video/mp4");
+	expect(validateMediaBytes(ftyp(2, "none", "qt  "), "clip.mov")).toBe("video/quicktime");
+	const minorOnly = ftyp(1, "none");
+	minorOnly.write("isom", 12);
+	expect(() => validateMediaBytes(minorOnly, "clip.mp4")).toThrow("does not match");
+	for (const brands of [4097, (4 * 1024 * 1024 - 12) / 4]) {
+		expect(() => validateMediaBytes(ftyp(brands, "isom"), "clip.mp4")).toThrow("brand complexity");
+	}
+});
+
 describe("durable media references", () => {
 	test("saves source-owned bytes, reloads native base64, and rejects traversal", async () => {
 		const ref = await saveUploadedMedia("owner", wavFile());

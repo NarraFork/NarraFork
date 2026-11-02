@@ -13,8 +13,8 @@ import { isCompletionLimitReason } from "./error-handling";
 import { GeminiMediaFiles } from "./gemini-media-files";
 import { reportInputCharacters } from "./input-characters";
 import {
+	createNativeMediaDumpEncoder,
 	interactionInlineMedia,
-	redactNativeMediaForDump,
 	storedMessageMedia,
 	supportsNativeMediaProtocolInput,
 } from "./native-media";
@@ -333,7 +333,7 @@ export class GeminiInteractionsProvider implements ProviderAdapter {
 			method: "POST",
 			url,
 			headers: sanitizeHeaders(headers),
-			bodyText: JSON.stringify(redactNativeMediaForDump(body)),
+			bodyText: await createNativeMediaDumpEncoder()(body, bodyText, params.signal),
 		});
 		logger.debug("Gemini Interactions request", {
 			model,

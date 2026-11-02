@@ -317,6 +317,7 @@ describe("native media provider wire contracts", () => {
 			const requests = capture(kind);
 			const dump = new ApiRequestDumpCollector();
 			await drain(provider, {
+				content: "large diagnostic history ".repeat(5000),
 				requestDump: dump,
 				media: [audio, video],
 			});
@@ -2138,6 +2139,91 @@ function mediaBody(data = audio.base64): Record<string, unknown> {
 }
 
 describe("Gemini Files API native media", () => {
+	test("MIME fields in tool arguments, schemas and JSON results are not media inputs", async () => {
+		const files = new GeminiMediaFiles({
+			baseUrl,
+			apiKey: "test",
+			inlineLimitBytes: 1,
+			fetch: async () => {
+				throw new Error("ordinary JSON must not upload");
+			},
+		});
+		const ordinary = {
+			mime_type: "audio/wav",
+			inlineData: { mimeType: "audio/wav" },
+			content: [{ type: "audio", mime_type: "audio/wav" }],
+		};
+		const generate = {
+			contents: [
+				{ role: "model", parts: [{ functionCall: { name: "Convert", args: ordinary } }] },
+				{ role: "user", parts: [{ functionResponse: { name: "Convert", response: ordinary } }] },
+			],
+			tools: [{ functionDeclarations: [{ name: "Convert", parameters: ordinary }] }],
+		};
+		const interactions = {
+			input: [
+				{ type: "function_call", name: "Convert", arguments: ordinary },
+				{ type: "function_result", name: "Convert", result: ordinary },
+			],
+			tools: [{ type: "function", name: "Convert", parameters: ordinary }],
+		};
+		expect(await files.prepare(generate, "generate")).toBe(generate);
+		expect(await files.prepare(interactions, "interactions")).toBe(interactions);
+	});
+	test("mixed Interactions requests only upload content media and retain JSON and cached URIs", async () => {
+		let calls = 0;
+		const files = new GeminiMediaFiles({
+			baseUrl,
+			apiKey: "test",
+			inlineLimitBytes: 1,
+			fetch: async () =>
+				++calls === 1
+					? new Response(null, { headers: { "x-goog-upload-url": `${baseUrl}/upload` } })
+					: Response.json({ file: resource }),
+		});
+		const argumentsJson = { mime_type: "audio/wav", data: "not-media" };
+		const existing = { type: "audio", mime_type: "audio/wav", uri: resource.uri };
+		const body = {
+			input: [
+				{ type: "function_call", name: "Convert", arguments: argumentsJson },
+				{ type: "function_result", result: { type: "audio", ...argumentsJson } },
+				{
+					type: "user_input",
+					content: [{ type: "audio", mime_type: "audio/wav", data: audio.base64 }, existing],
+				},
+			],
+		};
+		const prepared = await files.prepare(body, "interactions");
+		expect(calls).toBe(2);
+		expect(prepared.input[0]).toEqual(body.input[0]);
+		expect(prepared.input[1]).toEqual(body.input[1]);
+		expect(prepared.input[2].content?.[1]).toEqual(existing);
+		expect(JSON.stringify(prepared)).not.toContain(audio.base64);
+		expect(JSON.stringify(body)).toContain(audio.base64);
+		await files.prepare(body, "interactions");
+		expect(calls).toBe(2);
+	});
+	test("real protocol media slots still reject missing bytes", async () => {
+		const files = new GeminiMediaFiles({
+			baseUrl,
+			apiKey: "test",
+			fetch: async () => {
+				throw new Error("unexpected upload");
+			},
+		});
+		await expect(
+			files.prepare(
+				{ contents: [{ parts: [{ inlineData: { mimeType: "audio/wav" } }] }] },
+				"generate",
+			),
+		).rejects.toThrow("no media bytes");
+		await expect(
+			files.prepare(
+				{ input: [{ type: "user_input", content: [{ type: "audio", mime_type: "audio/wav" }] }] },
+				"interactions",
+			),
+		).rejects.toThrow("no media bytes");
+	});
 	test("resumable upload sends real bytes, waits for ACTIVE, and caches only within an instance", async () => {
 		const requests: Array<{ url: string; init?: RequestInit }> = [];
 		const files = new GeminiMediaFiles({
