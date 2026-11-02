@@ -18,7 +18,6 @@
 import { eventBus } from "@server/lib/event-bus";
 import { hotOnce, hotSafe } from "@server/lib/hot-safe";
 import { catalogError } from "../../lib/errors";
-import { readNarratorTaskBackend } from "../outline/access-reads";
 import { isOutlineEnabled } from "../outline/feature";
 import type { TaskBackend } from "./types";
 
@@ -47,6 +46,9 @@ export async function readTaskSession(narratorId: string): Promise<TaskSession |
 		cache.set(narratorId, cached);
 		return cached;
 	}
+	// Loaded on first use: this module is a leaf that `spec-vfs-service` and `narrator-service`
+	// import statically, and the outline read pulls in the database module's full surface.
+	const { readNarratorTaskBackend } = await import("../outline/access-reads");
 	const row = await readNarratorTaskBackend(narratorId);
 	if (!row) return null;
 	const session: TaskSession = {
