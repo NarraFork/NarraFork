@@ -5431,6 +5431,25 @@ export interface OutlineTaskJson {
 	claimable?: true;
 }
 
+/** Who proposed a pending change, with the provenance its confirmation commits under. */
+export interface OutlinePendingRequesterJson {
+	kind: "human" | "agent" | "system";
+	id: string;
+	/** The narrator that wrote it (a subagent's own id), or null. */
+	narratorId: string | null;
+	/** The person accountable for the proposal (the turn's person for an agent). */
+	responsibleUserId: string | null;
+	messageId: string | null;
+	toolCallId: string | null;
+}
+
+/** Who decides a pending change, as the lock named them when it was proposed. */
+export interface OutlinePendingDeciderJson {
+	by: OutlineTaskActorRef;
+	/** Narrator id of the session that may confirm on the locker's behalf, or null. */
+	delegate: string | null;
+}
+
 // === outline_spaces ===
 /**
  * A container of one block forest and its history. Exactly one project space per project, one
@@ -5545,6 +5564,10 @@ export const outlineBlocks = sqliteTable(
 		index("idx_outline_blocks_doing_tasks")
 			.on(table.id)
 			.where(sql`json_extract("task_json", '$.status') = 'doing' AND "deleted" = 0`),
+		// Locked task trees of a page (design §2.2): the editor's lock badges.
+		index("idx_outline_blocks_locked")
+			.on(table.pageId)
+			.where(sql`json_extract("task_json", '$.lock') IS NOT NULL AND "deleted" = 0`),
 	],
 );
 
@@ -5562,7 +5585,8 @@ export const outlineCommits = sqliteTable(
 			.notNull()
 			.references(() => outlineSpaces.id, { onDelete: "cascade" }),
 		seq: integer("seq").notNull(),
-		kind: text("kind", { enum: ["edit", "revert", "import"] }).notNull(),
+		/** `confirm`: a pending change taking effect (design §2.6), its decider recorded on the row. */
+		kind: text("kind", { enum: ["edit", "revert", "import", "confirm"] }).notNull(),
 		actorKind: text("actor_kind", { enum: ["human", "agent", "system"] }).notNull(),
 		actorId: text("actor_id").notNull(),
 		responsibleUserId: text("responsible_user_id"),
@@ -5696,6 +5720,79 @@ export const outlineTaskClaims = sqliteTable(
 		index("idx_outline_task_claims_expiry")
 			.on(table.expiresAt)
 			.where(sql`"expires_at" IS NOT NULL`),
+	],
+);
+
+// === outline_pending ===
+/**
+ * Changes waiting for someone's confirmation (design §2.6, §7.1). P2 has one kind, `locked_plan`:
+ * an agent's change to a locked task tree (`task_json.lock`), held for the locker or the session
+ * they named to confirm on their behalf. Rows are history: a decided row stays.
+ *
+ *   - `ops_json`: the write path's operations, content canonical and new blocks' ids and sids
+ *     fixed at proposal time; `base_json`: each existing block's `version_seq` when proposed,
+ *     the base a confirmation merges from when the block changed since.
+ *   - `block_ids_json`: the existing blocks the change touches (targets and new blocks'
+ *     parents): what reads mark as waiting for confirmation.
+ *   - `requested_by_json`: the proposer and its provenance (actor, narrator, person, message,
+ *     tool call): a confirmation commits as the proposer. `requester_session` is its session
+ *     (a subagent's root): a session has at most one open change per locked tree, so a second
+ *     proposal merges into it (the partial unique index).
+ *   - `decider_json`: the lock when proposed (locker and delegate); `decider_user_id`: the
+ *     locker when a person, for the inbox.
+ *   - `rev` grows with every merge; a decision or a merge writes only while it is as read.
+ *   - `status`: `open`, then `confirmed` (`decision_commit_id`, a `confirm` commit), `rejected`
+ *     (`reason`) or `withdrawn` (the proposer took it back, or the tree was unlocked).
+ *   - `reported_at`: when the proposer was shown the decision (null while it has not been).
+ *
+ * No foreign keys but the space's: block ids are validated by the write path, and a space goes
+ * as a whole.
+ */
+export const outlinePending = sqliteTable(
+	"outline_pending",
+	{
+		id: text("id").primaryKey(),
+		spaceId: text("space_id")
+			.notNull()
+			.references(() => outlineSpaces.id, { onDelete: "cascade" }),
+		kind: text("kind", { enum: ["locked_plan"] }).notNull(),
+		status: text("status", { enum: ["open", "confirmed", "rejected", "withdrawn"] }).notNull(),
+		pageId: text("page_id").notNull(),
+		rootBlockId: text("root_block_id"),
+		opsJson: text("ops_json", { mode: "json" }).$type<Array<Record<string, unknown>>>().notNull(),
+		baseJson: text("base_json", { mode: "json" }).$type<Record<string, number>>().notNull(),
+		blockIdsJson: text("block_ids_json", { mode: "json" }).$type<string[]>().notNull(),
+		summary: text("summary").notNull(),
+		requestedByJson: text("requested_by_json", { mode: "json" })
+			.$type<OutlinePendingRequesterJson>()
+			.notNull(),
+		requesterSession: text("requester_session"),
+		deciderJson: text("decider_json", { mode: "json" }).$type<OutlinePendingDeciderJson>().notNull(),
+		deciderUserId: text("decider_user_id"),
+		rev: integer("rev").notNull().default(1),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+		decidedAt: text("decided_at"),
+		decidedByJson: text("decided_by_json", { mode: "json" }).$type<OutlineTaskActorRef>(),
+		decisionCommitId: text("decision_commit_id"),
+		reason: text("reason"),
+		reportedAt: text("reported_at"),
+	},
+	(table) => [
+		// FK covering index (a partial index cannot serve the FK action); open rows of a space.
+		index("idx_outline_pending_space").on(table.spaceId),
+		index("idx_outline_pending_page_open").on(table.pageId).where(sql`"status" = 'open'`),
+		index("idx_outline_pending_root_open").on(table.rootBlockId).where(sql`"status" = 'open'`),
+		uniqueIndex("uq_outline_pending_open_proposer")
+			.on(table.requesterSession, table.rootBlockId)
+			.where(sql`"status" = 'open'`),
+		index("idx_outline_pending_requester_unreported")
+			.on(table.requesterSession)
+			.where(sql`"reported_at" IS NULL`),
+		index("idx_outline_pending_decider_open")
+			.on(table.deciderUserId)
+			.where(sql`"status" = 'open'`),
+		uniqueIndex("uq_outline_pending_decision_commit").on(table.decisionCommitId),
 	],
 );
 

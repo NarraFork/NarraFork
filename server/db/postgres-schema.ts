@@ -3517,6 +3517,9 @@ export const outlineBlocks = pgTable(
 		index("idx_outline_blocks_doing_tasks")
 			.on(table.id)
 			.where(sql.raw("(\"task_json\"::jsonb #>> '{status}') = 'doing' AND \"deleted\" = FALSE")),
+		index("idx_outline_blocks_locked")
+			.on(table.pageId)
+			.where(sql.raw('("task_json"::jsonb #>> \'{lock}\') IS NOT NULL AND "deleted" = FALSE')),
 	],
 );
 
@@ -3615,6 +3618,53 @@ export const outlineTaskClaims = pgTable(
 		index("idx_outline_task_claims_expiry")
 			.on(table.expiresAt)
 			.where(sql.raw('"expires_at" IS NOT NULL')),
+	],
+);
+
+export const outlinePending = pgTable(
+	"outline_pending",
+	{
+		id: text("id").primaryKey().notNull(),
+		spaceId: text("space_id")
+			.notNull()
+			.references((): PgColumn => outlineSpaces.id, { onDelete: "cascade" }),
+		kind: text("kind").notNull(),
+		status: text("status").notNull(),
+		pageId: text("page_id").notNull(),
+		rootBlockId: text("root_block_id"),
+		opsJson: jsonText("ops_json").notNull(),
+		baseJson: jsonText("base_json").notNull(),
+		blockIdsJson: jsonText("block_ids_json").notNull(),
+		summary: text("summary").notNull(),
+		requestedByJson: jsonText("requested_by_json").notNull(),
+		requesterSession: text("requester_session"),
+		deciderJson: jsonText("decider_json").notNull(),
+		deciderUserId: text("decider_user_id"),
+		rev: integer("rev").notNull().default(1),
+		createdAt: text("created_at").notNull(),
+		updatedAt: text("updated_at").notNull(),
+		decidedAt: text("decided_at"),
+		decidedByJson: jsonText("decided_by_json"),
+		decisionCommitId: text("decision_commit_id"),
+		reason: text("reason"),
+		reportedAt: text("reported_at"),
+	},
+	(table) => [
+		index("idx_outline_pending_space").on(table.spaceId),
+		index("idx_outline_pending_page_open").on(table.pageId).where(sql.raw("\"status\" = 'open'")),
+		index("idx_outline_pending_root_open")
+			.on(table.rootBlockId)
+			.where(sql.raw("\"status\" = 'open'")),
+		uniqueIndex("uq_outline_pending_open_proposer")
+			.on(table.requesterSession, table.rootBlockId)
+			.where(sql.raw("\"status\" = 'open'")),
+		index("idx_outline_pending_requester_unreported")
+			.on(table.requesterSession)
+			.where(sql.raw('"reported_at" IS NULL')),
+		index("idx_outline_pending_decider_open")
+			.on(table.deciderUserId)
+			.where(sql.raw("\"status\" = 'open'")),
+		uniqueIndex("uq_outline_pending_decision_commit").on(table.decisionCommitId),
 	],
 );
 
@@ -4110,8 +4160,8 @@ export const notifications = pgTable(
 );
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
-  "tableCount": 134,
-  "columnCount": 1759,
+  "tableCount": 135,
+  "columnCount": 1781,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -24376,6 +24426,14 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           ],
           "unique": false,
           "predicate": "(\"task_json\"::jsonb #>> '{status}') = 'doing' AND \"deleted\" = FALSE"
+        },
+        {
+          "name": "idx_outline_blocks_locked",
+          "columns": [
+            "pageId"
+          ],
+          "unique": false,
+          "predicate": "(\"task_json\"::jsonb #>> '{lock}') IS NOT NULL AND \"deleted\" = FALSE"
         }
       ],
       "checks": [],
@@ -24915,6 +24973,287 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           ],
           "unique": false,
           "predicate": "\"expires_at\" IS NOT NULL"
+        }
+      ],
+      "checks": [],
+      "checkDefinitions": [],
+      "foreignKeys": [],
+      "uniqueConstraints": [],
+      "primaryKeys": []
+    },
+    {
+      "exportName": "outlinePending",
+      "name": "outline_pending",
+      "columns": [
+        {
+          "property": "id",
+          "name": "id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": true,
+          "unique": false
+        },
+        {
+          "property": "spaceId",
+          "name": "space_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "references": {
+            "table": "outlineSpaces",
+            "column": "id",
+            "onDelete": "cascade",
+            "constraintName": "outline_pending_space_id_outline_spaces_id_fk"
+          },
+          "emitAsTableConstraint": false
+        },
+        {
+          "property": "kind",
+          "name": "kind",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "status",
+          "name": "status",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "pageId",
+          "name": "page_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "rootBlockId",
+          "name": "root_block_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "opsJson",
+          "name": "ops_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "baseJson",
+          "name": "base_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "blockIdsJson",
+          "name": "block_ids_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "summary",
+          "name": "summary",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "requestedByJson",
+          "name": "requested_by_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "requesterSession",
+          "name": "requester_session",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "deciderJson",
+          "name": "decider_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "deciderUserId",
+          "name": "decider_user_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "rev",
+          "name": "rev",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false,
+          "defaultValue": "1",
+          "defaultExpression": "1"
+        },
+        {
+          "property": "createdAt",
+          "name": "created_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "updatedAt",
+          "name": "updated_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "decidedAt",
+          "name": "decided_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "decidedByJson",
+          "name": "decided_by_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "decisionCommitId",
+          "name": "decision_commit_id",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "reason",
+          "name": "reason",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "reportedAt",
+          "name": "reported_at",
+          "kind": "text",
+          "pgType": "text",
+          "notNull": false,
+          "primary": false,
+          "unique": false
+        }
+      ],
+      "indexes": [
+        {
+          "name": "idx_outline_pending_space",
+          "columns": [
+            "spaceId"
+          ],
+          "unique": false
+        },
+        {
+          "name": "idx_outline_pending_page_open",
+          "columns": [
+            "pageId"
+          ],
+          "unique": false,
+          "predicate": "\"status\" = 'open'"
+        },
+        {
+          "name": "idx_outline_pending_root_open",
+          "columns": [
+            "rootBlockId"
+          ],
+          "unique": false,
+          "predicate": "\"status\" = 'open'"
+        },
+        {
+          "name": "uq_outline_pending_open_proposer",
+          "columns": [
+            "requesterSession",
+            "rootBlockId"
+          ],
+          "unique": true,
+          "predicate": "\"status\" = 'open'"
+        },
+        {
+          "name": "idx_outline_pending_requester_unreported",
+          "columns": [
+            "requesterSession"
+          ],
+          "unique": false,
+          "predicate": "\"reported_at\" IS NULL"
+        },
+        {
+          "name": "idx_outline_pending_decider_open",
+          "columns": [
+            "deciderUserId"
+          ],
+          "unique": false,
+          "predicate": "\"status\" = 'open'"
+        },
+        {
+          "name": "uq_outline_pending_decision_commit",
+          "columns": [
+            "decisionCommitId"
+          ],
+          "unique": true
         }
       ],
       "checks": [],
