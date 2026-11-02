@@ -14,6 +14,7 @@ import { gitAvailable, recheckGit } from "./lib/git-status";
 import { logger } from "./lib/logger";
 import { narratorPrincipalOf } from "./lib/narrator-access";
 import { getRuntimeEnvironment } from "./lib/platform";
+import { setProviderBalanceEngine } from "./lib/provider-balance-engine";
 import { claimRevealToken, REVEAL_CLAIM_PATH } from "./lib/reveal-protocol";
 import { handleGracefullyShutdownRequest } from "./lib/server-restart";
 import { settings } from "./lib/settings";
@@ -106,6 +107,7 @@ import usageHistoryRoutes from "./routes/usage-history";
 import { userPreferencesRoutes } from "./routes/user-preferences";
 import { vnetRoutes } from "./routes/vnet";
 import { workspaceRoutes } from "./routes/workspaces";
+import { createApikeyQuotaEngine } from "./services/apikey-quota-plugin-engine";
 import { narratorWorktreeService } from "./services/narrator-worktree-runtime";
 
 export interface AppEnv {
@@ -365,6 +367,11 @@ app.route("/api/auth/sso", ssoRoutes);
 // Plugin UI asset/shell routes use short-lived, session-bound capabilities; control
 // endpoints inside pluginUiRoutes still apply session-only authentication explicitly.
 app.route("/api/plugins", pluginUiRoutes);
+
+// Provider balance (API-key quota) querying is answered by the `apikey-quota` plugin when
+// it is installed and active, and by the bundled adapters otherwise. The engine resolves
+// per round, so installing, enabling or disabling the plugin needs no restart.
+setProviderBalanceEngine(createApikeyQuotaEngine());
 
 // Public: OAuth 2.0 provider endpoints. NarraFork is the authorization server
 // here — external apps fetch metadata, exchange codes and revoke tokens without

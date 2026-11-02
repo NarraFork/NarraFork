@@ -1,0 +1,76 @@
+{
+	"schemaVersion": 1,
+	"pluginId": "com.narrafork.apikey-quota",
+	"version": "1.0.0",
+	"displayName": "API Key Quota Probe",
+	"description": "Queries the remaining allowance of a relay API key (sub2api and new-api protocols) on behalf of the host provider-balance cache. Credential-free projections only; the key is passed per call and never persisted.",
+	"publisher": { "id": "com.narrafork", "name": "NarraFork" },
+	"license": "Apache-2.0",
+	"engine": {
+		"runtime": "bun",
+		"runtimeVersion": ">=1.2 <2",
+		"hostApi": ">=1.0 <2",
+		"rpc": "narrafork.rpc/1",
+		"features": [],
+		"os": ["linux", "darwin", "win32"],
+		"arch": ["x64", "arm64"],
+		"runner": "local-process"
+	},
+	"server": {
+		"entry": "server/index.js",
+		"transport": "stdio",
+		"protocol": "narrafork.rpc/1",
+		"args": [],
+		"workingDirectory": "package",
+		"startupTimeoutMs": 15000,
+		"activationTimeoutMs": 30000
+	},
+	"activationEvents": ["onTool:query-balance"],
+	"contributes": {
+		"providers": [],
+		"searchProviders": [],
+		"tools": [
+			{
+				"id": "query-balance",
+				"title": "Query API key quota",
+				"description": "Probes or refreshes one relay API key's remaining allowance and returns a normalized, credential-free balance projection.",
+				"inputSchema": {
+					"type": "object",
+					"properties": {
+						"mode": { "enum": ["probe", "refresh"] },
+						"baseUrl": { "type": "string", "maxLength": 2048 },
+						"apiKey": { "type": "string", "maxLength": 4096 },
+						"headers": {
+							"type": "object",
+							"additionalProperties": { "type": "string", "maxLength": 1024 }
+						},
+						"userAgent": { "type": "string", "maxLength": 512 },
+						"proxy": { "type": ["string", "null"], "maxLength": 2048 },
+						"tlsRejectUnauthorized": { "type": "boolean" },
+						"adapter": { "enum": ["sub2api", "new-api"] },
+						"root": { "type": "string", "maxLength": 2048 }
+					},
+					"required": ["mode", "baseUrl", "apiKey"],
+					"additionalProperties": false
+				},
+				"execution": "server",
+				"allowBackground": true
+			}
+		],
+		"commands": [],
+		"events": [],
+		"views": []
+	},
+	"permissions": {
+		"host": ["provider.use"],
+		"network": {
+			"mode": "allowlist",
+			"allow": [],
+			"note": "Targets are the user-configured relay origins supplied per call. The local-process runner does not filter egress, so this block is a declaration, not a sandbox."
+		},
+		"filesystem": { "package": "readOnly", "pluginData": "none", "workspace": "none" },
+		"process": { "spawn": "none" }
+	},
+	"secrets": [],
+	"dependencies": { "plugins": {}, "runtime": {} }
+}

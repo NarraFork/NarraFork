@@ -12,12 +12,11 @@ import {
 	createPersistedCredentialCache,
 	type PersistedCredentialCache,
 } from "./persisted-credential-cache";
+import { buildBalanceRoots } from "./provider-balance-adapters";
 import {
-	buildBalanceRoots,
-	probeProviderBalance,
-	refreshProviderBalance,
-} from "./provider-balance-adapters";
-import { createBalanceRequest } from "./provider-balance-transport";
+	getProviderBalanceEngine,
+	type ProviderBalanceQueryEngine,
+} from "./provider-balance-engine";
 import { type CustomApiProviderConfig, settings } from "./settings";
 
 export const PROVIDER_BALANCE_STALE_MS = 60_000;
@@ -130,6 +129,8 @@ interface CacheOptions {
 	requestTimeoutMs?: number;
 	roundTimeoutMs?: number;
 	maxQueued?: number;
+	/** Resolved per round so a plugin engine can be installed or dropped at runtime. */
+	engine?: () => ProviderBalanceQueryEngine;
 }
 
 /** Bounded background jobs. Read paths never await upstream IO. */
@@ -340,9 +341,14 @@ export class ProviderBalanceCache {
 				status: mode === "probe" ? "probing" : "supported",
 				attemptedAt: this.now(),
 			};
-			const request = createBalanceRequest(entry.config, controller.signal, this.options);
+			const engine = this.options.engine?.() ?? getProviderBalanceEngine();
 			if (mode === "probe") {
-				const found = await probeProviderBalance(entry.config.baseUrl, request);
+				const found = await engine.probe({
+					config: entry.config,
+					signal: controller.signal,
+					requestTimeoutMs: this.options.requestTimeoutMs,
+					fetch: this.options.fetch,
+				});
 				if (!current()) return;
 				entry.endpoint = found ? { adapter: found.adapter, root: found.root } : undefined;
 				entry.snapshot = {
@@ -354,11 +360,14 @@ export class ProviderBalanceCache {
 					error: null,
 				};
 			} else if (entry.endpoint) {
-				const balance = await refreshProviderBalance(
-					entry.endpoint.adapter,
-					entry.endpoint.root,
-					request,
-				);
+				const balance = await engine.refresh({
+					config: entry.config,
+					signal: controller.signal,
+					requestTimeoutMs: this.options.requestTimeoutMs,
+					fetch: this.options.fetch,
+					adapter: entry.endpoint.adapter,
+					root: entry.endpoint.root,
+				});
 				if (!current()) return;
 				entry.snapshot = { ...entry.snapshot, balance, fetchedAt: this.now(), error: null };
 			}
