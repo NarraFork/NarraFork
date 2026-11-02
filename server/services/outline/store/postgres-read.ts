@@ -398,7 +398,14 @@ export function createPostgresOutlineReads(db: BunSQLDatabase): OutlineReadPort 
 			const recent = db
 				.select({ id: c.id, seq: c.seq, createdAt: c.createdAt })
 				.from(c)
-				.where(and(eq(c.spaceId, spaceId), eq(c.narratorId, narratorId), eq(c.kind, "edit")))
+				.where(
+					and(
+						eq(c.spaceId, spaceId),
+						eq(c.narratorId, narratorId),
+						eq(c.actorKind, "agent"),
+						eq(c.kind, "edit"),
+					),
+				)
 				.orderBy(desc(c.seq))
 				.limit(options.commits)
 				.as("recent");

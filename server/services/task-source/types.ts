@@ -16,7 +16,7 @@
  * One source is bound to one narrator; get it from `taskSourceForNarrator`.
  */
 
-import type { PromptPart } from "@shared/prefix-context";
+import type { ContextPart } from "@shared/prefix-context";
 import type { SideCarBody } from "@shared/sidecar-body";
 import type { Locale } from "../../lib/prompt-i18n";
 import type { SpecContinuationCause } from "../turn-continuation-decisions";
@@ -207,9 +207,11 @@ export interface NarratorTaskSource {
 	 * turn, every compact, a model change), and within an epoch updated by one `context_update`
 	 * only when their text changes (`narrator-epochs.ts`). Their text must be deterministic, or
 	 * every request becomes an update. Spec: none (the prefix stays exactly as it was).
-	 * Outline: the built-in views, current tasks and behavior boundary (plan PR 4).
+	 * Outline: the built-in views, current tasks and behavior boundary (plan PR 4). A view that
+	 * cannot be read now and was never read in this process is marked `unreadable`: the request
+	 * keeps its previous value. Only a view that is really empty is left out.
 	 */
-	contextParts(locale: Locale): Promise<PromptPart[]>;
+	contextParts(locale: Locale): Promise<ContextPart[]>;
 	/**
 	 * The task context for the compact summarizer's system prompt; null without tasks (spec).
 	 * `since`: when the conversation being summarized starts (its first message), for a source

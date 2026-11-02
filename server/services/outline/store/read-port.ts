@@ -184,8 +184,9 @@ export interface OutlineReadPort {
 	listCommitVersions(commitId: string, limit: number): Promise<OutlineVersionRow[]>;
 	/**
 	 * What a session wrote lately in a space: the versions opened by its newest `commits` ordinary
-	 * commits there (`kind` `edit`, written for `narratorId`), newest commit first (block id
-	 * bytewise within one), at most `limit`. The commits come from the space-and-narrator index;
+	 * commits there that it wrote itself (`kind` `edit`, actor an agent, written for `narratorId`;
+	 * not system commits made for it, like a fork's copy or an import), newest commit first (block
+	 * id bytewise within one), at most `limit`. The commits come from the space-and-narrator index;
 	 * their versions from the commit index.
 	 */
 	listNarratorWrites(

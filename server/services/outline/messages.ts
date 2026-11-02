@@ -102,6 +102,9 @@ export const OUTLINE_TEXT = {
 	behaviorImportSummary: "imported the behavior fence (spec://behavior_fence) into this page",
 	/** Summary of the commit that copies the behavior page into a fork. */
 	behaviorForkSummary: (from: string) => `copied the behavior page from session ${from}`,
+	/** The last block of a fork's behavior page when the copy was cut. */
+	behaviorForkCut: (copied: number, total: number, address: string) =>
+		`Only ${copied} of the ${total} blocks of this page were copied when the session was forked; the rest are on the behavior page \`${address}\`.`,
 } as const;
 
 export type OutlineRevertSkipReason = keyof typeof OUTLINE_TEXT.revertSkipped;

@@ -1961,6 +1961,11 @@
 		"loadOlder": "Load older tasks"
 	},
 	"sidecar": {
+		"contextViews": {
+			"updated": "Context updated: {{parts}}",
+			"outlineTasks": "Current tasks",
+			"outlineBehavior": "Behavior boundary"
+		},
 		"unknownSource": "unknown",
 		"copy": "Copy injected content",
 		"copied": "Copied",

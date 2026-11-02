@@ -911,6 +911,11 @@ export async function findContinuationCandidates(options: {
 	narratorId: string;
 	/** The session's space (a subagent's is its root's, D31); null when it has none yet. */
 	sessionSpaceId: string | null;
+	/**
+	 * Pages whose blocks are never the session's tasks, checkbox or not: its behavior page holds
+	 * rules, which the agent may not tick (outline plan PR 4).
+	 */
+	excludePageIds?: readonly string[];
 	store?: OutlineStore;
 	now?: Date;
 	limit?: number;
@@ -935,9 +940,11 @@ export async function findContinuationCandidates(options: {
 	const unread = [...metas.keys()].filter((id) => !claims.has(id));
 	for (const [id, claim] of await getOutlineTaskClaims(unread, { store })) claims.set(id, claim);
 
+	const excluded = new Set(options.excludePageIds ?? []);
 	const open = [...metas.values()].filter((block) => {
 		if (block.deleted || !isOpenTask(block.taskJson) || hasHumanAssignee(block.taskJson))
 			return false;
+		if (excluded.has(block.pageId)) return false;
 		const claim = claims.get(block.id);
 		if (!claim || claim.holderNarratorId === options.narratorId) return true;
 		return !isClaimLive(claim, now);

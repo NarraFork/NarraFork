@@ -206,7 +206,7 @@ function checkRevert(
 
 export const OUTLINE_READ_CONTRACT: ContractCase[] = [
 	{
-		name: "narrator writes: a session's newest ordinary commits in a space and what they opened",
+		name: "narrator writes: a session's own newest ordinary commits in a space and what they opened",
 		async run(ctx) {
 			const narrator = await ctx.seedNarrator();
 			const other = await ctx.seedNarrator();
@@ -234,6 +234,11 @@ export const OUTLINE_READ_CONTRACT: ContractCase[] = [
 				],
 				as(narrator),
 			);
+			// A system commit made for the session (a fork's copy, an import) is not its own.
+			await write(ctx, space, [{ op: "insert", parent: { id: page }, content: "Copied" }], {
+				actor: { kind: "system", id: "outline-behavior-fork" },
+				narratorId: narrator,
+			});
 			// A revert the session makes is not an ordinary commit.
 			await revertCommit(
 				{

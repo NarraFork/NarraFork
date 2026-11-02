@@ -4,6 +4,15 @@ export interface PromptPart {
 	text: string;
 }
 
+/**
+ * A part a session's task source contributes. `unreadable`: its value could not be read for this
+ * request, so the request keeps the previous value instead of removing the part (a transient read
+ * failure must not tell the model a section was removed).
+ */
+export interface ContextPart extends PromptPart {
+	unreadable?: true;
+}
+
 export interface ContextChange {
 	key: string;
 	value: string | null;

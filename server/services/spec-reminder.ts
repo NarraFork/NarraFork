@@ -5,6 +5,7 @@ import {
 } from "@shared/sidecar-body";
 import type { Locale } from "../lib/prompt-i18n";
 import { getSideCarModelTemplates } from "../lib/sidecar-templates";
+import { isOutlineEnabled } from "./outline/feature";
 import { compileSpecTasks, parseSpecTasksDocument } from "./spec-task-service";
 import { specVfsService } from "./spec-vfs-service";
 
@@ -101,13 +102,35 @@ export async function buildSpecToolResultReminder(
 /**
  * Build the STRUCTURED behavior fence from spec://behavior_fence, or null when the
  * fence is empty/whitespace (an empty fence must never inject anything).
+ *
+ * While the outline is switched off, a session whose tasks live in the outline runs as a spec
+ * session and reads this fence; after its import the fence holds only the plugin SOP, and its
+ * person's rules are on its behavior page. Their text is put ahead of the fence then, so turning
+ * the switch off never drops them (outline plan PR 4). With the switch on, or for any other
+ * session, the fence is read exactly as before.
  */
 export async function buildBehaviorFenceBody(narratorId: string): Promise<SideCarBody | null> {
 	try {
 		const file = await specVfsService.readSpecFile(narratorId, "spec://behavior_fence");
-		const content = file.content.trim();
+		let content = file.content.trim();
+		if (!isOutlineEnabled()) {
+			const page = await behaviorPageWhileSwitchedOff(narratorId);
+			if (page) content = content ? `${page}\n\n${content}` : page;
+		}
 		if (!content) return null;
 		return { kind: "prose", text: content };
+	} catch {
+		return null;
+	}
+}
+
+/** The behavior page of an outline session while the outline is off; null for any other one. */
+async function behaviorPageWhileSwitchedOff(narratorId: string): Promise<string | null> {
+	try {
+		const { readTaskSession } = await import("./task-source/backend");
+		if ((await readTaskSession(narratorId))?.backend !== "outline") return null;
+		const { behaviorPageForSpecFence } = await import("./task-source/outline-views");
+		return await behaviorPageForSpecFence(narratorId);
 	} catch {
 		return null;
 	}

@@ -69,7 +69,7 @@ import {
 	OutlineWriteError,
 } from "../outline/errors";
 import { OUTLINE_TEXT } from "../outline/messages";
-import { OUTLINE_CHANGE } from "../outline/model";
+import { OUTLINE_BEHAVIOR_ALIAS, OUTLINE_CHANGE } from "../outline/model";
 import { recordOutlineReads, seenOutlineVersion } from "../outline/read-ledger";
 import { resolveNarratorSpaces } from "../outline/spaces";
 import { outlineStore } from "../outline/store";
@@ -87,7 +87,12 @@ import {
 	readOpen,
 	titlesOf,
 } from "./outline-read";
-import { outlineContextParts, readPrerequisites, viewTaskOf } from "./outline-views";
+import {
+	outlineContextParts,
+	readPrerequisites,
+	unreadableOutlineContextParts,
+	viewTaskOf,
+} from "./outline-views";
 import type {
 	ContinuationPromptInput,
 	ContinuationTarget,
@@ -117,6 +122,8 @@ export const OUTLINE_TASK_SOURCE_LIMITS = {
 	compactCommits: 50,
 	/** Versions those commits opened that it reads at most (per space). */
 	compactVersions: 200,
+	/** Blocks the compact context reads at a time, newest first, until its budget is spent. */
+	compactReadChunk: 10,
 	/** To-dos tried in turn when the write path refuses to start one. */
 	promotionAttempts: 3,
 } as const;
@@ -329,20 +336,31 @@ export function createOutlineTaskSource(narratorId: string): NarratorTaskSource 
 			if (!newest.has(write.blockId)) newest.set(write.blockId, write.key);
 		const ids = [...newest.keys()].slice(0, OUTLINE_TASK_SOURCE_LIMITS.compactVersions);
 		if (ids.length === 0) return [];
-		const blocks = new Map((await outlineStore.getBlocks(ids)).map((block) => [block.id, block]));
+		// The behavior page holds the person's rules (in the new baseline anyway), not decisions.
+		const behavior = spaces?.session
+			? await outlineStore.findAliasOwners(spaces.session.id, [OUTLINE_BEHAVIOR_ALIAS])
+			: [];
+		const behaviorPages = new Set(behavior.map((owner) => owner.id));
+		// Blocks are read a few at a time, newest first, until the budget is spent: only about what
+		// is shown is read.
 		const lines: string[] = [];
 		let used = 0;
-		for (const id of ids) {
-			const block = blocks.get(id);
-			if (!block || block.deleted || block.taskJson !== null) continue;
-			const title = blockTitle(block.content).replace(/\s+/g, " ").trim();
-			if (!title) continue;
-			const max = OUTLINE_TASK_SOURCE_LIMITS.compactNoteLine;
-			const text = title.length > max ? `${title.slice(0, max - 1)}…` : title;
-			const line = getOutlineCompactNoteLine({ address: `${newest.get(id)}/${block.sid}`, text });
-			if (used + line.length + 1 > OUTLINE_TASK_SOURCE_LIMITS.compactNoteChars) break;
-			lines.push(line);
-			used += line.length + 1;
+		reading: for (let i = 0; i < ids.length; i += OUTLINE_TASK_SOURCE_LIMITS.compactReadChunk) {
+			const chunk = ids.slice(i, i + OUTLINE_TASK_SOURCE_LIMITS.compactReadChunk);
+			const blocks = new Map((await outlineStore.getBlocks(chunk)).map((b) => [b.id, b]));
+			for (const id of chunk) {
+				const block = blocks.get(id);
+				if (!block || block.deleted || block.taskJson !== null) continue;
+				if (behaviorPages.has(block.pageId)) continue;
+				const title = blockTitle(block.content).replace(/\s+/g, " ").trim();
+				if (!title) continue;
+				const max = OUTLINE_TASK_SOURCE_LIMITS.compactNoteLine;
+				const text = title.length > max ? `${title.slice(0, max - 1)}…` : title;
+				const line = getOutlineCompactNoteLine({ address: `${newest.get(id)}/${block.sid}`, text });
+				if (used + line.length + 1 > OUTLINE_TASK_SOURCE_LIMITS.compactNoteChars) break reading;
+				lines.push(line);
+				used += line.length + 1;
+			}
 		}
 		return lines.reverse();
 	}
@@ -362,20 +380,24 @@ export function createOutlineTaskSource(narratorId: string): NarratorTaskSource 
 					);
 		const read = await readOpen(current);
 		const listed = read.entries.slice(0, OUTLINE_TASK_SOURCE_LIMITS.compact);
-		const titles = await titlesOf(listed);
-		const prerequisites = await readPrerequisites(
-			listed.filter((entry) => entry.wait),
-			current,
-		);
 		const noteLines = await recordedNotes(current.sessionNarratorId, since);
-		const fixed = getOutlineCompactContext({ taskLines: [], noteLines }, locale).length;
+		const fixed = getOutlineCompactContext({ taskLines: ["-"], noteLines }, locale).length;
+		// Titles and prerequisites are read a few tasks at a time until the budget is spent.
 		const taskLines: string[] = [];
-		let used = fixed + 200;
-		for (const entry of listed) {
-			const line = getOutlineCompactTaskLine(viewTaskOf(entry, titles, prerequisites), locale);
-			if (used + line.length + 1 > OUTLINE_TASK_SOURCE_LIMITS.compactChars) break;
-			taskLines.push(line);
-			used += line.length + 1;
+		let used = fixed;
+		reading: for (let i = 0; i < listed.length; i += OUTLINE_TASK_SOURCE_LIMITS.compactReadChunk) {
+			const chunk = listed.slice(i, i + OUTLINE_TASK_SOURCE_LIMITS.compactReadChunk);
+			const titles = await titlesOf(chunk);
+			const prerequisites = await readPrerequisites(
+				chunk.filter((entry) => entry.wait),
+				current,
+			);
+			for (const entry of chunk) {
+				const line = getOutlineCompactTaskLine(viewTaskOf(entry, titles, prerequisites), locale);
+				if (used + line.length + 1 > OUTLINE_TASK_SOURCE_LIMITS.compactChars) break reading;
+				taskLines.push(line);
+				used += line.length + 1;
+			}
 		}
 		return getOutlineCompactContext({ taskLines, noteLines }, locale);
 	}
@@ -416,7 +438,8 @@ export function createOutlineTaskSource(narratorId: string): NarratorTaskSource 
 					narratorId,
 					error: String(error),
 				});
-				return [];
+				// Not "no views": the request keeps what the model was shown before.
+				return unreadableOutlineContextParts();
 			}
 			return await outlineContextParts(narratorId, locale, { tasks: !subagent });
 		},

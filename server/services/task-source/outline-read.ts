@@ -5,6 +5,7 @@
  * `outline.ts` for what each task state means to readers.
  */
 import { blockTitle } from "@shared/outline";
+import { OUTLINE_BEHAVIOR_ALIAS } from "../outline/model";
 import { outlineStore } from "../outline/store";
 import {
 	findContinuationCandidates,
@@ -79,13 +80,23 @@ export interface OpenRead {
 	truncated: boolean;
 }
 
+/**
+ * The session's open tasks. A checkbox on its behavior page is a rule as the person wrote it,
+ * never a task of the session: the agent could not tick it (the page is not its to write), so it
+ * is left out of every reader (continuation, the views, the interrupt guard, the turn-end note).
+ */
 export async function readOpen(session: OutlineSession): Promise<OpenRead> {
 	if (session.subagent || session.sessionNarratorId === null) {
 		return { entries: [], truncated: false };
 	}
+	const behavior = session.spaceId
+		? await outlineStore.findAliasOwners(session.spaceId, [OUTLINE_BEHAVIOR_ALIAS])
+		: [];
 	const found = await findContinuationCandidates({
 		narratorId: session.sessionNarratorId,
 		sessionSpaceId: session.spaceId,
+		// A page's blocks carry its id as their page; an alias on a nested block matches none.
+		excludePageIds: behavior.map((owner) => owner.id),
 		limit: OUTLINE_OPEN_TASKS_READ,
 	});
 	return {

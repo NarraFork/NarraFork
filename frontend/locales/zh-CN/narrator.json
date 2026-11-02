@@ -1958,6 +1958,11 @@
 		"loadOlder": "加载更早的任务"
 	},
 	"sidecar": {
+		"contextViews": {
+			"updated": "上下文已更新：{{parts}}",
+			"outlineTasks": "当前任务",
+			"outlineBehavior": "行为边界"
+		},
 		"unknownSource": "未知来源",
 		"copy": "复制注入内容",
 		"copied": "已复制",

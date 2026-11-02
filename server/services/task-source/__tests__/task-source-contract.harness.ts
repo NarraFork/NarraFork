@@ -470,7 +470,10 @@ export function describeTaskSourceContract(harness: TaskSourceContractHarness): 
 						expect(await source.taskDigest()).toBeNull();
 						expect(await source.behaviorFence()).toBeNull();
 						expect(await source.compactContext("en")).toBeNull();
-						expect(await source.contextParts("en")).toEqual([]);
+						// No part says anything; a view that cannot be read is marked so the request
+						// keeps what the model was shown, never removed.
+						const parts = await source.contextParts("en");
+						expect(parts.every((part) => part.unreadable === true && part.text === "")).toBe(true);
 						// The continuation reader treats it as nothing to continue.
 						const { readSpecContinuationState } = await import("../../narrator-session");
 						expect(await readSpecContinuationState(narratorId)).toEqual({

@@ -9,7 +9,9 @@
  * baseline; within an epoch every provider request compares them byte for byte and appends one
  * `context_update` when they changed (`narrator-epochs.ts`). So the boundary is there on the first
  * turn and after every compact whether it changed or not, and both are injected only on change.
- * A view with nothing to show is no part at all (removing it is an update too).
+ * A view with nothing to show is no part at all (removing it is an update too). A view that cannot
+ * be read is never "nothing to show": the last text read is served, and without one the part is
+ * marked `unreadable` so the request keeps the previous value.
  *
  * Their text is their change key, so it is deterministic: fixed order, no times or leases. A
  * lease renewing changes nothing; a status, title, wait or the person's mark does.
@@ -17,15 +19,18 @@
  * READS AND CACHE
  * ---------------
  * The prefix is built before every provider request, so each narrator's rendered views are
- * cached in memory. An entry is dropped when an `outline:committed` lands in a space it depends
- * on (the session space, the spaces of the tasks it lists and of their prerequisites), when one of
- * its narrators commits anywhere (the session claiming a task elsewhere), when the old fence of
- * one of its narrators changes (`spec:changed`, the plugin's SOP), and after
- * {@link OUTLINE_VIEW_LIMITS.maxAgeMs} at the latest (what changes with time alone: someone
- * else's lease running out before the expiry job commits). An entry read while no session space
- * existed yet depends on every commit. A hit costs no query; a miss is one bounded read
+ * cached in memory. An entry goes stale (read again before it is served; kept to serve should
+ * that read fail) when an `outline:committed` lands in a space it depends on, when one of its
+ * narrators commits anywhere (the session claiming a task elsewhere), when the old fence of one
+ * of its narrators changes (`spec:changed`, the plugin's SOP), and after
+ * {@link OUTLINE_VIEW_LIMITS.maxAgeMs} at the latest. The spaces it depends on are the session
+ * space, the spaces of the open tasks read, and the space of the first prerequisite of each listed
+ * waiting task; anything else (a further prerequisite elsewhere, someone else's lease running out
+ * before the expiry job commits) shows within the age limit. An entry read while no session
+ * space existed yet depends on every commit. A hit costs no query; a miss is one bounded read
  * (`findContinuationCandidates` with its limits, the titles shown, the prerequisites named; or
- * the behavior page's structure and the content the budget shows, and the old fence).
+ * the behavior page's structure and the content the budget shows, and the old fence, read
+ * without creating anything).
  */
 import { eventBus } from "@server/lib/event-bus";
 import { hotOnce, hotSafe } from "@server/lib/hot-safe";
@@ -45,11 +50,12 @@ import {
 	type OutlineViewTask,
 } from "@server/lib/prompt-i18n";
 import { blockTitle } from "@shared/outline";
-import type { PromptPart } from "@shared/prefix-context";
+import type { ContextPart } from "@shared/prefix-context";
 import { loadBodiesWithin, readSubtree } from "../outline/read";
 import { renderOutline } from "../outline/render";
 import { outlineStore } from "../outline/store";
 import { breadthFirst } from "../outline/tree";
+import { readTaskSession } from "./backend";
 import { findBehaviorPage, readOldBehaviorFence } from "./outline-behavior";
 import {
 	type OpenEntry,
@@ -94,6 +100,11 @@ interface ViewDeps {
 interface CachedView extends ViewDeps {
 	text: string | null;
 	at: number;
+	/**
+	 * A change it depends on landed: read again before serving it, but keep it to serve should
+	 * that read fail (the model keeps what it was shown instead of seeing the view removed).
+	 */
+	stale: boolean;
 }
 
 /** Changes seen while a view was being read: one that hits its dependencies makes it stale. */
@@ -115,7 +126,7 @@ function hits(view: ViewDeps, spaceId: string | null, narratorId: string | null)
 }
 
 function dropWhere(spaceId: string | null, narratorId: string | null): void {
-	for (const [key, view] of cache) if (hits(view, spaceId, narratorId)) cache.delete(key);
+	for (const view of cache.values()) if (hits(view, spaceId, narratorId)) view.stale = true;
 	for (const tracker of reads) {
 		if (spaceId !== null) {
 			tracker.spaces.add(spaceId);
@@ -148,7 +159,7 @@ async function cachedView(
 	read: (deps: ViewDeps) => Promise<string | null>,
 ): Promise<string | null> {
 	const hit = cache.get(key);
-	if (hit && clock.now() - hit.at < OUTLINE_VIEW_LIMITS.maxAgeMs) {
+	if (hit && !hit.stale && clock.now() - hit.at < OUTLINE_VIEW_LIMITS.maxAgeMs) {
 		cache.delete(key);
 		cache.set(key, hit);
 		return hit.text;
@@ -162,8 +173,9 @@ async function cachedView(
 		try {
 			text = await read(deps);
 		} catch (error) {
-			// A failing read keeps what was shown (an update that removes the view and one that
-			// brings it back would both be noise); without one, the caller leaves the part out.
+			// A failing read keeps what was shown, stale or aged (an update that removes the view
+			// and one that brings it back would both be noise); without one, the caller marks the
+			// part unreadable and the request keeps its previous value.
 			if (hit) {
 				logger.warn("Outline view read failed; keeping the last one", {
 					key,
@@ -177,14 +189,13 @@ async function cachedView(
 			(deps.anySpace && tracker.commits > 0) ||
 			[...deps.spaces].some((id) => tracker.spaces.has(id)) ||
 			[...deps.narrators].some((id) => tracker.narrators.has(id));
-		if (stale) cache.delete(key);
-		else {
-			cache.set(key, { ...deps, text, at: startedAt });
-			while (cache.size > OUTLINE_VIEW_LIMITS.cached) {
-				const oldest = cache.keys().next().value;
-				if (oldest === undefined) break;
-				cache.delete(oldest);
-			}
+		// Read while a change it depends on landed: kept (for a failing read) but read again next.
+		cache.delete(key);
+		cache.set(key, { ...deps, text, at: startedAt, stale });
+		while (cache.size > OUTLINE_VIEW_LIMITS.cached) {
+			const oldest = cache.keys().next().value;
+			if (oldest === undefined) break;
+			cache.delete(oldest);
 		}
 		return text;
 	} finally {
@@ -354,6 +365,7 @@ async function renderBehaviorPage(
 	pageId: string,
 	maxChars: number,
 ): Promise<{ markdown: string; truncated: boolean } | null> {
+	if (maxChars <= 0) return null;
 	const subtree = await readSubtree(pageId);
 	if (!subtree) return null;
 	const { state, root } = subtree;
@@ -376,13 +388,22 @@ async function renderBehaviorPage(
 		const markdown = rendered.markdown.trimEnd();
 		const truncated = rendered.hiddenByBudget > 0 || state.truncated;
 		if (markdown.length <= maxChars || bytes <= 64 || attempt >= 4) {
-			return {
-				markdown: markdown.length <= maxChars ? markdown : `${markdown.slice(0, maxChars - 1)}…`,
-				truncated: truncated || markdown.length > maxChars,
-			};
+			return markdown.length <= maxChars
+				? { markdown, truncated }
+				: { markdown: cut(markdown, maxChars), truncated: true };
 		}
 		bytes = Math.max(64, Math.floor((bytes * maxChars) / markdown.length) - 8);
 	}
+}
+
+/**
+ * One section of the behavior view, its first line then `text`, within `room` characters; null
+ * when there is no text, or not even its first line and a few characters fit.
+ */
+function section(intro: string, text: string, room: number): string | null {
+	const left = room - intro.length - 1;
+	if (left < 16 || !text.trim()) return null;
+	return `${intro}\n${cut(text, left)}`;
 }
 
 async function readBehaviorView(
@@ -399,15 +420,15 @@ async function readBehaviorView(
 
 	const heading = getOutlineBehaviorViewHeading(locale);
 	const sections: string[] = [];
-	let room = OUTLINE_VIEW_LIMITS.behaviorChars - heading.length - 1;
+	// What is left of the budget; every section costs its length and the line break before it.
+	let room = OUTLINE_VIEW_LIMITS.behaviorChars - heading.length;
+	const take = (text: string | null) => {
+		if (!text) return;
+		sections.push(text);
+		room -= text.length + 1;
+	};
 
-	// The plugin's SOP: this narrator's own (a plugin's temporary worker has its own, D31 keeps
-	// the page the root's). Measured first so the page gets what is left.
-	const own = await readOldBehaviorFence(narratorId);
-	const sopHeading = getOutlineBehaviorViewSop(locale);
-	const sop = own.sop ? cut(own.sop, Math.max(0, room - sopHeading.length - 1)) : "";
-	if (sop) room -= sopHeading.length + sop.length + 2;
-
+	// 1. The person's page comes first and gets the budget it needs.
 	const page =
 		session.spaceId && sessionNarratorId ? await findBehaviorPage(session.spaceId) : null;
 	if (page) {
@@ -417,30 +438,34 @@ async function readBehaviorView(
 		const note = getOutlineBehaviorViewTruncated(address, locale);
 		const rendered = await renderBehaviorPage(
 			page.id,
-			Math.max(0, room - intro.length - note.length - 2),
+			room - 1 - intro.length - 1 - note.length - 1,
 		);
 		if (rendered?.markdown.trim()) {
-			sections.push([intro, rendered.markdown, ...(rendered.truncated ? [note] : [])].join("\n"));
-		}
-	} else if (sessionNarratorId) {
-		// No page: what the import did not move (it runs when the session starts a run and may
-		// have failed) still binds the session, so it is shown from where it is.
-		const fence =
-			sessionNarratorId === narratorId ? own : await readOldBehaviorFence(sessionNarratorId);
-		if (fence.own) {
-			const intro = getOutlineBehaviorViewFence(locale);
-			sections.push(`${intro}\n${cut(fence.own, Math.max(0, room - intro.length - 1))}`);
+			take([intro, rendered.markdown, ...(rendered.truncated ? [note] : [])].join("\n"));
 		}
 	}
-	if (sop) sections.push(`${sopHeading}\n${sop}`);
+
+	// 2. Old fence text the import has not moved yet (it runs when the session starts a run and
+	// may fail, page or no page): it still binds the session, so it is shown from where it is.
+	const own = await readOldBehaviorFence(narratorId);
+	if (sessionNarratorId) {
+		const fence =
+			sessionNarratorId === narratorId ? own : await readOldBehaviorFence(sessionNarratorId);
+		take(section(getOutlineBehaviorViewFence(locale), fence.own, room - 1));
+	}
+
+	// 3. The plugin's SOP gets what is left: this narrator's own (a plugin's temporary worker has
+	// its own; D31 keeps the page the root's).
+	take(section(getOutlineBehaviorViewSop(locale), own.sop, room - 1));
+
 	if (sections.length === 0) return null;
 	return [heading, ...sections].join("\n");
 }
 
 /**
- * The behavior view: the session's behavior page (a subagent's root's, D31), rendered within the
- * budget with its address, followed by the plugin SOP of the narrator's own old fence. Null when
- * there is neither.
+ * The behavior view: the session's behavior page (a subagent's root's, D31), first and with the
+ * budget it needs, with its address; then old fence text not moved to the page yet; then the
+ * plugin SOP of the narrator's own old fence with what is left. Null when there is none of them.
  */
 export async function outlineBehaviorView(
 	narratorId: string,
@@ -451,19 +476,24 @@ export async function outlineBehaviorView(
 	);
 }
 
-/** Both views as context parts, in order; a view that cannot be read is left out (logged). */
+/**
+ * Both views as context parts, in order. A view that cannot be read and was never read in this
+ * process is marked `unreadable`, so the request keeps whatever the model was shown before; only
+ * a view that is really empty is left out.
+ */
 export async function outlineContextParts(
 	narratorId: string,
 	locale: Locale,
 	options: { tasks: boolean },
-): Promise<PromptPart[]> {
-	const parts: PromptPart[] = [];
+): Promise<ContextPart[]> {
+	const parts: ContextPart[] = [];
 	const add = async (key: string, view: () => Promise<string | null>) => {
 		try {
 			const text = await view();
 			if (text) parts.push({ key, text });
 		} catch (error) {
 			logger.warn("Outline view could not be read", { narratorId, key, error: String(error) });
+			parts.push({ key, text: "", unreadable: true });
 		}
 	};
 	if (options.tasks) {
@@ -471,4 +501,31 @@ export async function outlineContextParts(
 	}
 	await add(OUTLINE_VIEW_KEYS.behavior, () => outlineBehaviorView(narratorId, locale));
 	return parts;
+}
+
+/** Both views marked unreadable: the session itself could not be resolved for this request. */
+export function unreadableOutlineContextParts(): ContextPart[] {
+	return [
+		{ key: OUTLINE_VIEW_KEYS.tasks, text: "", unreadable: true },
+		{ key: OUTLINE_VIEW_KEYS.behavior, text: "", unreadable: true },
+	];
+}
+
+/**
+ * The behavior page's text for a session whose tasks live in the outline while the outline is
+ * switched off (it then runs as a spec session): the spec fence reader puts it ahead of the old
+ * fence, which after the import holds only the plugin SOP, so the person's rules never drop out.
+ * Null for any other narrator. A subagent gets its session's page, as under the outline (D31).
+ */
+export async function behaviorPageForSpecFence(narratorId: string): Promise<string | null> {
+	const session = await readTaskSession(narratorId);
+	if (!session || session.backend !== "outline" || !session.sessionNarratorId) return null;
+	const space = await outlineStore.findSpace({
+		kind: "session",
+		narratorId: session.sessionNarratorId,
+	});
+	const page = space ? await findBehaviorPage(space.id) : null;
+	if (!page) return null;
+	const rendered = await renderBehaviorPage(page.id, OUTLINE_VIEW_LIMITS.behaviorChars);
+	return rendered?.markdown.trim() ? rendered.markdown : null;
 }

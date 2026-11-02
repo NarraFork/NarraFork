@@ -3260,9 +3260,6 @@ export async function runAgentLoopUnlocked(
 				runState.input.images = undefined;
 				continue;
 			}
-			// No continuation follows: a long outline turn that left a task in progress without
-			// touching any task ends with one line for the next turn (it starts none).
-			if (!runState.hadError) await maybeDeliverOutlineTurnEndNote(active);
 
 			// [continuation-source: compact-restart]
 			// A late compact only resumes an unfinished pass. A naturally completed
@@ -3305,6 +3302,11 @@ export async function runAgentLoopUnlocked(
 					runState.input.images = undefined;
 					continue;
 				}
+
+				// Nothing continues this run any more (no continuation, compact restart, hold or
+				// drained work): a long outline turn that left a task in progress without touching
+				// any task ends with one line for the next turn. It starts none (plan PR 4, Q4).
+				await maybeDeliverOutlineTurnEndNote(active);
 
 				// Drain awaited above: synchronously arbitrate takeover vs terminal now.
 				// A successful hold must park; once finalizing is claimed new holds fail.

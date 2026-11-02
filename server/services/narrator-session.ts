@@ -1831,7 +1831,11 @@ export async function prepareOutlineRun(active: ActiveNarrator): Promise<void> {
  * the session's tasks changed during it (the revision of its open tasks is the one the run started
  * with) and a task is still in progress, one line names that task and asks to tick it done when it
  * is. Persisted as a plain row the next turn reads; it starts no turn. At most once per run.
- * Best-effort: failures are logged.
+ * Best-effort: failures are logged. The orchestrator asks only where the run goes idle, after the
+ * continuation, compact-restart, hold and pre-idle-drain decisions.
+ *
+ * "Unchanged" compares the revision of the open tasks read (at most the candidate read's limits):
+ * a task created and finished within the run, or one beyond those limits, leaves it unchanged.
  */
 export async function maybeDeliverOutlineTurnEndNote(active: ActiveNarrator): Promise<boolean> {
 	const start = active._outlineTurnStart;

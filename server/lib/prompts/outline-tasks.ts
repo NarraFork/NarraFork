@@ -323,6 +323,10 @@ const compactText = {
 		"zh-CN":
 			"在摘要里：保留上面每个未完成任务的地址；另列一节「关键决定」，只写对话里做出、但还没记进大纲的决定。",
 	},
+	askNoTasks: {
+		en: 'In the summary, add a section "Key decisions" listing only the decisions made in the conversation that are not recorded in the outline yet.',
+		"zh-CN": "在摘要里另列一节「关键决定」，只写对话里做出、但还没记进大纲的决定。",
+	},
 } satisfies Record<string, LocalizedValue<string>>;
 
 /** One task line of the compact context: its state, address, mark and what it waits for. */
@@ -351,7 +355,12 @@ export function getOutlineCompactContext(
 			`${pickLocalizedValue(compactText.notes, locale)}\n${input.noteLines.join("\n")}`,
 		);
 	}
-	sections.push(pickLocalizedValue(compactText.ask, locale));
+	sections.push(
+		pickLocalizedValue(
+			input.taskLines.length > 0 ? compactText.ask : compactText.askNoTasks,
+			locale,
+		),
+	);
 	return sections.join("\n\n");
 }
 
