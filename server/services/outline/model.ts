@@ -23,9 +23,21 @@
  *      transaction as the rows it writes. Nothing writes outline rows outside a commit, so a
  *      writer that planned against an older counter value knows the space changed under it.
  */
-import type { OutlineTaskActorRef, OutlineTaskJson, OutlineTaskLockJson } from "@server/db/schema";
+import type {
+	OutlinePendingDeciderJson,
+	OutlinePendingRequesterJson,
+	OutlineTaskActorRef,
+	OutlineTaskJson,
+	OutlineTaskLockJson,
+} from "@server/db/schema";
 
-export type { OutlineTaskActorRef, OutlineTaskJson, OutlineTaskLockJson };
+export type {
+	OutlinePendingDeciderJson,
+	OutlinePendingRequesterJson,
+	OutlineTaskActorRef,
+	OutlineTaskJson,
+	OutlineTaskLockJson,
+};
 
 /** What a version changed relative to the previous one. A bitmask: several can be set. */
 export const OUTLINE_CHANGE = {
@@ -62,8 +74,12 @@ export type OutlineSpaceKind = (typeof OUTLINE_SPACE_KINDS)[number];
 export const OUTLINE_ACTOR_KINDS = ["human", "agent", "system"] as const;
 export type OutlineActorKind = (typeof OUTLINE_ACTOR_KINDS)[number];
 
-/** `edit` is every ordinary write; `revert` and `import` are written by their own paths. */
-export const OUTLINE_COMMIT_KINDS = ["edit", "revert", "import"] as const;
+/**
+ * `edit` is every ordinary write; `revert` and `import` are written by their own paths; `confirm`
+ * is a pending change taking effect (`pending.ts`): its actor is the proposer, its responsible
+ * person the decider's.
+ */
+export const OUTLINE_COMMIT_KINDS = ["edit", "revert", "import", "confirm"] as const;
 export type OutlineCommitKind = (typeof OUTLINE_COMMIT_KINDS)[number];
 
 /**
@@ -135,4 +151,43 @@ export const OUTLINE_TASK_IDLE_LEASE_MS = 24 * 60 * 60_000;
 /** The end of a lease taken or renewed at `now` (ISO time): a running session's by default. */
 export function outlineLeaseEnd(now: string, leaseMs: number = OUTLINE_TASK_LEASE.leaseMs): string {
 	return new Date(Date.parse(now) + leaseMs).toISOString();
+}
+
+/** What a pending change is (design §2.6); P2 has only the locked plan's row. */
+export const OUTLINE_PENDING_KINDS = ["locked_plan"] as const;
+export type OutlinePendingKind = (typeof OUTLINE_PENDING_KINDS)[number];
+
+export const OUTLINE_PENDING_STATUSES = ["open", "confirmed", "rejected", "withdrawn"] as const;
+export type OutlinePendingStatus = (typeof OUTLINE_PENDING_STATUSES)[number];
+
+/** Limits of pending changes (`pending.ts`). */
+export const OUTLINE_PENDING_LIMITS = {
+	/** Open pending changes on one page; a proposal past it is refused. */
+	openPerPage: 100,
+	/** Operations one pending change holds, merges included. */
+	maxOps: OUTLINE_LIMITS.maxOps,
+	/** UTF-8 bytes of content one pending change holds: what one transaction may carry. */
+	maxContentBytes: OUTLINE_LIMITS.maxTransactionBodyBytes,
+	/** UTF-8 bytes of a pending change's stored operations. */
+	maxOpsBytes: 256 * 1024,
+	/** Characters of a rejection's reason. */
+	maxReasonChars: 500,
+	/** Open pending changes of a space one wait derivation or reference check reads. */
+	scanPerSpace: 500,
+	/** Blocks a pending change's diff shows, and UTF-8 bytes of each text in it. */
+	diffBlocks: 50,
+	diffTextBytes: 16 * 1024,
+	/** Unreported decisions one read shows. */
+	reportsPerRead: 10,
+} as const;
+
+/** How a pending change is named to people and agents: `P` and its id (8 characters). */
+export function outlinePendingLabel(id: string): string {
+	return `P${id}`;
+}
+
+/** The id a pending change's label (`P` and 8 characters) names, or null. */
+export function outlinePendingIdOf(label: string): string | null {
+	const m = /^P([A-Za-z0-9_-]{8})$/.exec(label.trim());
+	return m ? (m[1] as string) : null;
 }

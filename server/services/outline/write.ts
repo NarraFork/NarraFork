@@ -76,6 +76,24 @@
  * neither claims nor ends it. Which late result to accept by its claim generation is the
  * delegation's to decide (plan PR 9).
  *
+ * LOCKED PLANS AND PENDING CONFIRMATION
+ * -------------------------------------
+ * A task whose `task_json.lock` is set locks its tree (design §2.2; the nearest lock above a
+ * block applies). An agent's write to a locked tree is classified operation by operation after
+ * planning (`classifyLocked`, rules in `locks.ts`): an operation that changes the plan as it was
+ * locked is held back for confirmation, the rest is written as usual. Held operations (and those
+ * naming blocks a held insert creates) leave the commit; the transaction is planned again
+ * without them, and they become one `outline_pending` row (`pending.ts`), written in the same
+ * atomic section as the commit, or on its own (guarded by the space's counter) when nothing is
+ * written directly. A session has one open change per locked tree: a second proposal merges
+ * into it. The writer's result marks held operations `pending` and says who decides.
+ *
+ * Unconstrained: people (the lock binds agents only, Q2), the system, a revert, a confirmation
+ * (`confirm`, written as the proposer with the commit kind `confirm`), and the locker's own
+ * session when an agent locked. An agent may not set or clear a lock at all (Q5): only people
+ * lock, through `lockOutlineTask`. A commit that removes a lock (unlocking, a person relocking,
+ * deleting the locked task) withdraws the tree's open changes in the same atomic section.
+ *
  * IN PROCESS
  * ----------
  * `outline_blocks.in_process` (a task, under a task, or in a session space) is derived in the
@@ -126,6 +144,7 @@ import {
 	tagLinks,
 } from "./links";
 import { withOutlineLiveBarrier } from "./live-barrier";
+import { type OutlineBlockCreation, planBlockBy, sameLocker, taskChangeHeld } from "./locks";
 import { OUTLINE_TEXT } from "./messages";
 import {
 	OUTLINE_ACTOR_KINDS,
@@ -135,11 +154,18 @@ import {
 	type OutlineActorKind,
 	type OutlineCommitKind,
 	type OutlineLinkKind,
+	type OutlinePendingDeciderJson,
 	type OutlineTaskActorRef,
 	type OutlineTaskJson,
 	type OutlineTaskLockJson,
 	outlineLeaseEnd,
 } from "./model";
+import {
+	buildPendingPut,
+	type OutlineHeldOp,
+	type OutlineHeldTree,
+	PENDING_WITHDRAW,
+} from "./pending-hold";
 import { outlineStore } from "./store";
 import {
 	type OutlineBlockMeta,
@@ -149,6 +175,9 @@ import {
 	type OutlineClaimWrite,
 	type OutlineCommitPlan,
 	type OutlineLinkRow,
+	type OutlinePendingDecision,
+	OutlinePendingMovedError,
+	type OutlinePendingPlan,
 	type OutlineSpaceRow,
 	OutlineStaleWriteError,
 	type OutlineStore,
@@ -346,6 +375,30 @@ export interface OutlineOpResult extends OutlineBlockAddressed {
 	notes: DialectNote[];
 	/** Present when the operation was adjusted (see {@link OutlineAdjustment}). */
 	adjustments?: OutlineAdjustment[];
+	/**
+	 * The operation was held for confirmation (a locked plan): nothing of it is written yet. A
+	 * block it creates has its id and sid already, but exists only once confirmed.
+	 */
+	pending?: true;
+}
+
+/** Operations of a write held for confirmation: the pending change they went into. */
+export interface OutlinePendingOutcome {
+	id: string;
+	/** `P` and 8 characters: how people and agents name it. */
+	label: string;
+	/** The locked task whose tree it changes. */
+	rootBlockId: string;
+	rootAddress: string;
+	pageId: string;
+	/** Who decides: the locker, or the session they named to confirm on their behalf. */
+	decider: OutlinePendingDeciderJson;
+	/** Indexes of the operations held. */
+	opIndexes: number[];
+	/** The existing blocks it touches (targets, and parents of what it adds). */
+	blockIds: string[];
+	/** Merged into the open change this session already had on the tree. */
+	merged: boolean;
 }
 
 export interface OutlineWriteResult {
@@ -361,6 +414,8 @@ export interface OutlineWriteResult {
 	 * person; the commit says so).
 	 */
 	ended?: OutlineEndedClaim[];
+	/** Operations held for confirmation (an agent's change to a locked plan). */
+	pending?: OutlinePendingOutcome;
 }
 
 export interface OutlineWriteOptions {
@@ -401,6 +456,15 @@ export interface OutlineWriteOptions {
 	 * is released whatever its lease.
 	 */
 	leaseExpiry?: { blockIds: readonly string[]; now: string; sessions?: readonly string[] };
+	/**
+	 * Internal to `pending.ts`: this commit confirms a pending change. The commit is recorded as
+	 * `confirm`, nothing is held for confirmation, and the pending row becomes `confirmed` in the
+	 * same atomic section (only while it is open at `expectRev`; otherwise the write plans again
+	 * and, the row having moved, rejects with `OutlinePendingMovedError` from `pending.ts`).
+	 */
+	confirm?: { pendingId: string; expectRev: number; decidedBy: OutlineTaskActorRef };
+	/** With `confirm`: the pages whose pending summaries change (the confirmed change's page). */
+	confirmPageIds?: readonly string[];
 }
 
 /** Content normalized before `writeOutline` was called; see `OutlineWriteOptions.canonical`. */
@@ -880,6 +944,37 @@ function doingBefore(block: WorkingBlock): boolean {
 	return block.base !== null && !block.base.deleted && block.base.taskJson?.status === "doing";
 }
 
+/** The decision a confirmation writes (with its commit, or alone when nothing changed). */
+function confirmDecision(
+	confirm: NonNullable<OutlineWriteOptions["confirm"]>,
+	now: string,
+	commitId: string | null,
+): OutlinePendingDecision {
+	return {
+		id: confirm.pendingId,
+		expectRev: confirm.expectRev,
+		status: "confirmed",
+		decidedAt: now,
+		decidedBy: confirm.decidedBy,
+		decisionCommitId: commitId,
+		reason: null,
+		reportedAt: null,
+	};
+}
+
+/** Every block an operation names: its target, parent and position anchor. */
+function opRefs(op: OutlineOp): OutlineBlockRef[] {
+	const refs: OutlineBlockRef[] = [];
+	if (op.op !== "insert") refs.push(op.block);
+	if (op.op === "insert" || op.op === "move" || op.op === "restore") {
+		if (op.parent) refs.push(op.parent);
+		const p = op.position;
+		if (p && "after" in p) refs.push(p.after);
+		if (p && "before" in p) refs.push(p.before);
+	}
+	return refs;
+}
+
 /** Key of the children list of a parent; the space's pages are under `null`. */
 const PAGES = "\u0000pages";
 const listKey = (parentId: string | null) => parentId ?? PAGES;
@@ -887,6 +982,38 @@ const listKey = (parentId: string | null) => parentId ?? PAGES;
 interface Planned {
 	plan: OutlineCommitPlan;
 	pageIds: string[];
+	/** Pages whose pending changes the commit decides or withdraws. */
+	pendingPageIds: string[];
+}
+
+/** Operations a planning pass found held for confirmation; the write plans again without them. */
+interface Hold {
+	hold: { ops: OutlineHeldOp[]; trees: OutlineHeldTree[] };
+}
+
+/** What one operation did, recorded for the lock rules (`classifyLocked`). */
+type OpTouch =
+	| { kind: "insert" | "restore"; block: WorkingBlock; parent: WorkingBlock | null }
+	| { kind: "update"; block: WorkingBlock }
+	| {
+			kind: "setTask";
+			block: WorkingBlock;
+			before: OutlineTaskJson | null;
+			after: OutlineTaskJson | null;
+	  }
+	| { kind: "move"; block: WorkingBlock; to: WorkingBlock | null }
+	| { kind: "delete"; block: WorkingBlock };
+
+/** Locked blocks of one page the classification reads at most. */
+const LOCKS_PER_PAGE = 1000;
+
+/** Options of a planning pass beyond the transaction itself. */
+interface PlannerExtra {
+	/** Operations held for confirmation by an earlier pass: skipped. */
+	held?: ReadonlySet<number>;
+	/** Ids for inserts that name none, by operation index: the same in every pass. */
+	assignedIds?: readonly string[];
+	confirm?: OutlineWriteOptions["confirm"];
 }
 
 class OutlinePlanner {
@@ -914,8 +1041,29 @@ class OutlinePlanner {
 		private readonly now: string,
 		private readonly commitKind: OutlineCommitKind = "edit",
 		private readonly leaseExpiry: OutlineWriteOptions["leaseExpiry"] = undefined,
+		private readonly extra: PlannerExtra = {},
 	) {
 		this.claimer = claimerOf(input);
+		this.held = extra.held ?? new Set();
+	}
+
+	/** Operations an earlier pass held for confirmation: this pass skips them. */
+	private readonly held: ReadonlySet<number>;
+	/** What each operation of this pass did, for the lock rules. */
+	private readonly touches = new Map<number, OpTouch>();
+
+	/**
+	 * An agent's ordinary write: the lock rules apply to it (design §2.2; people, the system,
+	 * reverts and confirmations are not bound by locks).
+	 */
+	private get constrained(): boolean {
+		return this.input.actor.kind === "agent" && this.commitKind === "edit" && !this.leaseExpiry;
+	}
+
+	/** An agent may not lock or unlock (Q5): only people lock, through `lockOutlineTask`. */
+	private checkLockInput(task: OutlineTaskPatch | null | undefined, opIndex: number): void {
+		if (task?.lock !== undefined && this.input.actor.kind === "agent" && this.commitKind === "edit")
+			throw new OutlineWriteError(OUTLINE_TEXT.lockDenied, "OUTLINE_LOCK_DENIED", opIndex);
 	}
 
 	private readonly claimer: OutlineClaimer | null;
@@ -936,10 +1084,11 @@ class OutlinePlanner {
 		return this.commitKind === "revert";
 	}
 
-	async plan(): Promise<Planned | null> {
+	async plan(): Promise<Planned | Hold | null> {
 		await this.preload();
 		this.checkBaseVersions();
 		for (const [i, op] of this.input.ops.entries()) {
+			if (this.held.has(i)) continue;
 			switch (op.op) {
 				case "insert":
 					await this.insert(op, i);
@@ -960,6 +1109,10 @@ class OutlinePlanner {
 					await this.restore(op, i);
 					break;
 			}
+		}
+		if (this.constrained) {
+			const hold = await this.classifyLocked();
+			if (hold) return { hold };
 		}
 		return this.assemble();
 	}
@@ -1041,9 +1194,10 @@ class OutlinePlanner {
 		if (this.compensating && given.versionSeq !== undefined)
 			return { by, delegate, versionSeq: given.versionSeq };
 		const candidate = { by, delegate, versionSeq: current?.versionSeq ?? 0 };
-		return current && sameTaskLock(candidate, current)
-			? current
-			: { by, delegate, versionSeq: this.space.nextSeq };
+		if (current && sameTaskLock(candidate, current)) return current;
+		// The same locker naming another delegate keeps the lock (and so what its plan is).
+		if (current && sameLocker(candidate, current)) return candidate;
+		return { by, delegate, versionSeq: this.space.nextSeq };
 	}
 
 	/** Record that operation `opIndex` set `block` to in progress (a claim attempt). */
@@ -1070,7 +1224,8 @@ class OutlinePlanner {
 			if ("id" in ref) ids.push(ref.id);
 			else if ("sid" in ref) sids.push(ref.sid);
 		};
-		for (const op of this.input.ops) {
+		for (const [i, op] of this.input.ops.entries()) {
+			if (this.held.has(i)) continue;
 			if (op.op !== "insert") add(op.block);
 			if (op.op === "insert" || op.op === "move" || op.op === "restore") {
 				add(op.parent);
@@ -1424,7 +1579,7 @@ class OutlinePlanner {
 	private checkBaseVersions(): void {
 		const conflicts: OutlineVersionConflict[] = [];
 		for (const [i, op] of this.input.ops.entries()) {
-			if (op.op === "insert" || op.baseVersionSeq === undefined) continue;
+			if (this.held.has(i) || op.op === "insert" || op.baseVersionSeq === undefined) continue;
 			const block = this.known(op.block);
 			// A missing block is reported by the operation itself.
 			if (!block?.base) continue;
@@ -1472,7 +1627,8 @@ class OutlinePlanner {
 		await this.ensureChildren([parentId], "siblings", i);
 		const list = this.list(parentId);
 		const { index, orderKey } = this.place(list, op.position, i);
-		const id = op.id ?? generateId();
+		this.checkLockInput(op.task, i);
+		const id = op.id ?? this.extra.assignedIds?.[i] ?? generateId();
 		if (this.blocks.has(id)) {
 			throw new OutlineWriteError(`block id ${id} is already in use`, "OUTLINE_ID_TAKEN", i);
 		}
@@ -1498,6 +1654,7 @@ class OutlinePlanner {
 		this.results[i] = this.result(block, { split, notes: prep.notes }, [
 			this.keyAdjustment(op.position, orderKey),
 		]);
+		this.touches.set(i, { kind: "insert", block, parent });
 	}
 
 	private async update(op: Extract<OutlineOp, { op: "update" }>, i: number): Promise<void> {
@@ -1522,6 +1679,7 @@ class OutlinePlanner {
 		if (op.tags !== undefined) block.tags = canonicalTags(op.tags);
 		if (op.merged) block.merged = true;
 		this.results[i] = this.result(block, { split, notes }, [aliasDropped]);
+		this.touches.set(i, { kind: "update", block });
 	}
 
 	private async move(op: Extract<OutlineOp, { op: "move" }>, i: number): Promise<void> {
@@ -1554,6 +1712,7 @@ class OutlinePlanner {
 			block.pageId = pageId;
 		}
 		this.results[i] = this.result(block, {}, [this.keyAdjustment(op.position, orderKey)]);
+		this.touches.set(i, { kind: "move", block, to: parent });
 	}
 
 	private async delete(op: Extract<OutlineOp, { op: "delete" }>, i: number): Promise<void> {
@@ -1569,11 +1728,14 @@ class OutlinePlanner {
 			this.taskOp.set(target.id, i);
 		}
 		this.results[i] = this.result(block);
+		this.touches.set(i, { kind: "delete", block });
 	}
 
 	private async setTask(op: Extract<OutlineOp, { op: "setTask" }>, i: number): Promise<void> {
 		const block = await this.resolveLive(op.block, i);
+		this.checkLockInput(op.task, i);
 		this.taskOp.set(block.id, i);
+		const before = block.taskJson;
 		if (op.task === null) block.taskJson = null;
 		else {
 			block.taskJson = this.taskFrom(block.taskJson, op.task, false, i);
@@ -1584,6 +1746,7 @@ class OutlinePlanner {
 				this.noteClaim(block, i);
 		}
 		this.results[i] = this.result(block);
+		this.touches.set(i, { kind: "setTask", block, before, after: block.taskJson });
 	}
 
 	private async restore(op: Extract<OutlineOp, { op: "restore" }>, i: number): Promise<void> {
@@ -1632,6 +1795,7 @@ class OutlinePlanner {
 			block.contentLinks = contentLinks(row?.content ?? "");
 		}
 		// The task it had, with only the fields given changed (a lock, its manager, its flags stay).
+		this.checkLockInput(op.task, i);
 		if (op.task !== undefined)
 			block.taskJson = op.task ? this.taskFrom(block.taskJson, op.task, false, i) : null;
 		this.taskOp.set(block.id, i);
@@ -1655,6 +1819,438 @@ class OutlinePlanner {
 			aliasDropped,
 			this.keyAdjustment(position, orderKey),
 		]);
+		this.touches.set(i, { kind: "restore", block, parent });
+	}
+
+	// ── locked plans ─────────────────────────────────────────────────────────
+
+	/**
+	 * Which operations of this pass change a locked plan (rules in `locks.ts`): those are held for
+	 * confirmation, with every operation naming a block a held insert creates. Null when none is.
+	 * Everything is judged on the state before the transaction. Reads: the locked blocks of the
+	 * pages the operations touch (the lock index; none, the common case, ends it there), the
+	 * ancestors of the blocks named, level by level, the subtrees a delete or a move takes, and the
+	 * creation of the blocks whose being part of the plan decides an operation.
+	 */
+	private async classifyLocked(): Promise<Hold["hold"] | null> {
+		if (this.touches.size === 0) return null;
+		const existing = (b: WorkingBlock | null | undefined): b is WorkingBlock =>
+			!!b?.base && !b.base.deleted;
+		// The existing blocks the operations name, and the pages they are on.
+		const named = new Set<WorkingBlock>();
+		for (const t of this.touches.values()) {
+			if (existing(t.block)) named.add(t.block);
+			const parent = t.kind === "insert" || t.kind === "restore" ? t.parent : null;
+			if (existing(parent)) named.add(parent);
+			if (t.kind === "move") {
+				const to = this.existingAnchor(t.to);
+				if (to) named.add(to);
+			}
+		}
+		const locked = new Map<string, WorkingBlock>();
+		for (const pageId of new Set([...named].map((b) => (b.base as OutlineBlockMeta).pageId))) {
+			const metas = await this.store.listLockedBlocks(pageId, LOCKS_PER_PAGE + 1);
+			if (metas.length > LOCKS_PER_PAGE)
+				throw new OutlineWriteError(
+					OUTLINE_TEXT.tooManyLocks(LOCKS_PER_PAGE),
+					"OUTLINE_TOO_MANY_LOCKS",
+				);
+			for (const meta of metas) {
+				this.adopt(meta);
+				const block = this.block(meta.id);
+				if (block.base?.taskJson?.lock && !block.base.deleted) locked.set(block.id, block);
+			}
+		}
+		if (locked.size === 0) return null;
+
+		await this.loadBaseAncestors([...named, ...locked.values()]);
+		const chain = (block: WorkingBlock): WorkingBlock[] => {
+			const out: WorkingBlock[] = [];
+			let current: WorkingBlock | undefined = block;
+			while (current && out.length <= OUTLINE_LIMITS.maxDepth) {
+				out.push(current);
+				const parentId: string | null | undefined = current.base?.parentId;
+				current = parentId ? this.blocks.get(parentId) : undefined;
+			}
+			return out;
+		};
+		const rootOf = (block: WorkingBlock): WorkingBlock | null =>
+			chain(block).find((b) => locked.has(b.id)) ?? null;
+		const lockOf = (root: WorkingBlock) => root.base?.taskJson?.lock as OutlineTaskLockJson;
+
+		// A lock an agent holds does not bind its own session.
+		const exempt = new Set<string>();
+		const agentLocked = [...locked.values()].filter((b) => lockOf(b).by.kind === "agent");
+		if (agentLocked.length > 0) {
+			const writer = this.input.narratorId ?? this.input.actor.id;
+			const sessions = await this.store.getNarratorRoots([
+				writer,
+				...agentLocked.map((b) => lockOf(b).by.id),
+			]);
+			const mine = sessions.get(writer)?.root ?? writer;
+			for (const b of agentLocked) {
+				const by = lockOf(b).by.id;
+				if ((sessions.get(by)?.root ?? by) === mine) exempt.add(b.id);
+			}
+		}
+		const rootIn = (block: WorkingBlock): WorkingBlock | null => {
+			const root = rootOf(block);
+			return root && !exempt.has(root.id) ? root : null;
+		};
+
+		// Subtrees a delete or a move takes, as they were (live), when a lock is involved.
+		const subtreeRoots: WorkingBlock[] = [];
+		for (const t of this.touches.values()) {
+			if ((t.kind === "delete" || t.kind === "move") && existing(t.block))
+				subtreeRoots.push(t.block);
+		}
+		const subtrees = await this.baseSubtrees(subtreeRoots);
+		const lockedUnder = (block: WorkingBlock) =>
+			[...locked.values()].filter((l) => l !== block && chain(l).includes(block));
+
+		// What to ask: whether each of these blocks is part of its tree's plan.
+		const ask = new Map<string, WorkingBlock>();
+		const baseTaskChildren = (parent: WorkingBlock) =>
+			[...(this.baseKids.get(parent.id) ?? [])].filter((c) => c.base?.taskJson);
+		for (const t of this.touches.values()) {
+			if (t.kind === "update" || t.kind === "setTask") {
+				if (existing(t.block) && rootIn(t.block)) ask.set(t.block.id, t.block);
+			} else if (t.kind === "insert" || t.kind === "restore") {
+				if (existing(t.parent) && rootIn(t.parent))
+					for (const c of baseTaskChildren(t.parent)) ask.set(c.id, c);
+			} else if (existing(t.block)) {
+				for (const b of [t.block, ...(subtrees.get(t.block.id) ?? [])])
+					if (rootIn(b)) ask.set(b.id, b);
+				if (t.kind === "move" && existing(t.to) && rootIn(t.to))
+					for (const c of baseTaskChildren(t.to)) ask.set(c.id, c);
+			}
+		}
+		const creations = await this.creationsOf([...ask.keys()]);
+		const isPlan = (block: WorkingBlock): boolean => {
+			const root = rootIn(block);
+			return root !== null && planBlockBy(creations.get(block.id), lockOf(root));
+		};
+		/** A task of the plan under `parent` (adding a task there adds a step). */
+		const hasPlanTask = (parent: WorkingBlock, except?: WorkingBlock) =>
+			baseTaskChildren(parent).some((c) => c !== except && !c.base?.deleted && isPlan(c));
+
+		// Each operation: held or not, and for which tree.
+		const trees = new Map<string, WorkingBlock>();
+		const heldRoot = new Map<number, WorkingBlock>();
+		const several = (i: number | null) =>
+			new OutlineWriteError(OUTLINE_TEXT.severalLockedPlans, "OUTLINE_LOCKED_MANY", i);
+		for (const [i, t] of this.touches) {
+			let root: WorkingBlock | null = null;
+			switch (t.kind) {
+				case "update":
+					if (existing(t.block) && isPlan(t.block)) root = rootIn(t.block);
+					break;
+				case "setTask":
+					if (existing(t.block) && isPlan(t.block)) {
+						const r = rootIn(t.block) as WorkingBlock;
+						if (taskChangeHeld(t.before, t.after, r === t.block)) root = r;
+					}
+					break;
+				case "insert":
+				case "restore":
+					// A task added (or brought back) as a step of the plan; splitting a leaf is not.
+					if (t.block.taskJson && existing(t.parent) && rootIn(t.parent) && hasPlanTask(t.parent))
+						root = rootIn(t.parent);
+					break;
+				case "delete":
+				case "move": {
+					if (!existing(t.block)) break;
+					const taken = [t.block, ...(subtrees.get(t.block.id) ?? [])];
+					const planRoots = new Set<WorkingBlock>();
+					for (const b of taken) if (isPlan(b)) planRoots.add(rootIn(b) as WorkingBlock);
+					// A locked task inside the subtree is the plan of its own tree.
+					for (const l of lockedUnder(t.block)) if (!exempt.has(l.id)) planRoots.add(l);
+					const from = rootIn(t.block);
+					if (planRoots.size > 0) {
+						// The tree the block is in decides; a subtree holding other locked plans too, the
+						// one plan when it is alone.
+						root =
+							from && planRoots.has(from)
+								? from
+								: planRoots.size === 1
+									? ([...planRoots][0] ?? null)
+									: null;
+						if (!root) throw several(i);
+						break;
+					}
+					if (t.kind !== "move") break;
+					const anchor = this.existingAnchor(t.to);
+					const destination = anchor ? rootIn(anchor) : null;
+					const withTask = taken.some((b) => b.base?.taskJson) || t.block.taskJson !== null;
+					if (withTask && (from?.id ?? null) !== (destination?.id ?? null)) {
+						// A task into or out of a locked tree.
+						if (from && destination) throw several(i);
+						root = from ?? destination;
+					} else if (
+						t.block.taskJson &&
+						existing(t.to) &&
+						destination &&
+						hasPlanTask(t.to, t.block)
+					) {
+						root = destination;
+					}
+					break;
+				}
+			}
+			if (root) {
+				heldRoot.set(i, root);
+				trees.set(root.id, root);
+			}
+		}
+		if (heldRoot.size === 0) return null;
+
+		// Operations naming a block a held insert creates are held with it.
+		const heldNew = new Map<string, WorkingBlock>();
+		const noteNew = (i: number) => {
+			const t = this.touches.get(i);
+			if (t?.kind === "insert") heldNew.set(t.block.id, heldRoot.get(i) as WorkingBlock);
+			for (const s of this.results[i]?.split ?? [])
+				heldNew.set(s.blockId, heldRoot.get(i) as WorkingBlock);
+		};
+		for (const i of heldRoot.keys()) noteNew(i);
+		for (let changed = true; changed; ) {
+			changed = false;
+			for (const [i, op] of this.input.ops.entries()) {
+				if (this.held.has(i) || heldRoot.has(i)) continue;
+				const refs = opRefs(op).map((ref) => this.known(ref)?.id);
+				const hit = refs.find((id) => id !== undefined && heldNew.has(id));
+				if (hit === undefined) continue;
+				heldRoot.set(i, heldNew.get(hit) as WorkingBlock);
+				noteNew(i);
+				changed = true;
+			}
+		}
+		if (trees.size > 1) throw several(null);
+
+		const ops: OutlineHeldOp[] = [];
+		for (const [i, root] of heldRoot) ops.push(this.heldOp(i, root));
+		ops.sort((a, b) => a.index - b.index);
+		return {
+			ops,
+			trees: [...trees.values()].map((root) => ({
+				rootId: root.id,
+				rootSid: root.sid,
+				pageId: (root.base as OutlineBlockMeta).pageId,
+				lock: lockOf(root),
+			})),
+		};
+	}
+
+	/** The nearest block at or above `block` (in the working copy) that existed before. */
+	private existingAnchor(block: WorkingBlock | null): WorkingBlock | null {
+		let current: WorkingBlock | null = block;
+		for (let depth = 0; current && depth <= OUTLINE_LIMITS.maxDepth; depth++) {
+			if (current.base && !current.base.deleted) return current;
+			current = current.parentId ? (this.blocks.get(current.parentId) ?? null) : null;
+		}
+		return null;
+	}
+
+	/** Load the ancestors (as they were before the transaction) of `blocks`, level by level. */
+	private async loadBaseAncestors(blocks: readonly WorkingBlock[]): Promise<void> {
+		let frontier = blocks;
+		for (let round = 0; frontier.length > 0; round++) {
+			if (round > OUTLINE_LIMITS.maxDepth) throw this.tooDeep();
+			const missing = new Set<string>();
+			const next: WorkingBlock[] = [];
+			for (const block of frontier) {
+				const parentId = block.base?.parentId;
+				if (!parentId) continue;
+				const parent = this.blocks.get(parentId);
+				if (parent) next.push(parent);
+				else missing.add(parentId);
+			}
+			if (missing.size > 0) {
+				await this.load({ ids: [...missing] });
+				for (const id of missing) {
+					const parent = this.blocks.get(id);
+					if (parent) next.push(parent);
+				}
+			}
+			frontier = [...new Set(next)];
+		}
+	}
+
+	/** Live children of each block as it was, for the subtrees and parents classification reads. */
+	private readonly baseKids = new Map<string, WorkingBlock[]>();
+
+	/**
+	 * The live subtree (as it was) of each root, read level by level from the store (live children
+	 * are the stored state), at most the commit's row limit in all. Children lists of the roots'
+	 * parents-to-be are read too (`baseKids`).
+	 */
+	private async baseSubtrees(roots: readonly WorkingBlock[]): Promise<Map<string, WorkingBlock[]>> {
+		const parents = new Set<string>();
+		for (const t of this.touches.values()) {
+			const parent =
+				t.kind === "insert" || t.kind === "restore" ? t.parent : t.kind === "move" ? t.to : null;
+			if (parent?.base && !parent.base.deleted) parents.add(parent.id);
+		}
+		await this.readBaseKids([...parents]);
+		const out = new Map<string, WorkingBlock[]>();
+		let total = 0;
+		for (const root of roots) {
+			const list: WorkingBlock[] = [];
+			let frontier = [root.id];
+			while (frontier.length > 0) {
+				await this.readBaseKids(frontier);
+				const next = frontier.flatMap((id) => this.baseKids.get(id) ?? []);
+				list.push(...next);
+				total += next.length;
+				if (total > OUTLINE_LIMITS.maxRowsTouched) throw this.tooManyRows(null);
+				frontier = next.map((b) => b.id);
+			}
+			out.set(root.id, list);
+		}
+		return out;
+	}
+
+	private async readBaseKids(parentIds: readonly string[]): Promise<void> {
+		const missing = [...new Set(parentIds)].filter((id) => !this.baseKids.has(id));
+		if (missing.length === 0) return;
+		const limit = OUTLINE_LIMITS.maxRowsTouched;
+		const rows = await this.store.listChildMetas(this.space.id, missing, limit + 1);
+		if (rows.length > limit) throw this.tooManyRows(null);
+		for (const id of missing) this.baseKids.set(id, []);
+		for (const row of rows) {
+			this.adopt(row);
+			this.baseKids.get(row.parentId as string)?.push(this.block(row.id));
+		}
+	}
+
+	/** The creation of each block (first version and its commit). */
+	private async creationsOf(ids: readonly string[]): Promise<Map<string, OutlineBlockCreation>> {
+		const out = new Map<string, OutlineBlockCreation>();
+		if (ids.length === 0) return out;
+		const firsts = await this.store.getFirstVersions(ids);
+		const commits = new Map(
+			(
+				await this.store.getCommitsBySeqs(this.space.id, [...new Set(firsts.map((f) => f.fromSeq))])
+			).map((c) => [c.seq, c]),
+		);
+		for (const f of firsts)
+			out.set(f.blockId, { fromSeq: f.fromSeq, commit: commits.get(f.fromSeq) });
+		return out;
+	}
+
+	/** Operation `i` as the pending change stores it: every block by id, content canonical. */
+	private heldOp(i: number, root: WorkingBlock): OutlineHeldOp {
+		const op = this.input.ops[i] as OutlineOp;
+		const result = this.results[i] as OutlineOpResult;
+		const touch = this.touches.get(i);
+		const idOf = (ref: OutlineBlockRef): string =>
+			this.known(ref)?.id ?? ("id" in ref ? ref.id : "");
+		const position = (p: OutlinePosition | undefined): OutlinePosition | undefined =>
+			!p
+				? undefined
+				: "after" in p
+					? { after: { id: idOf(p.after) } }
+					: "before" in p
+						? { before: { id: idOf(p.before) } }
+						: p;
+		const prep = this.prepared[i];
+		const touched: Array<{ blockId: string; versionSeq: number }> = [];
+		const touch_ = (b: WorkingBlock | null | undefined) => {
+			if (b?.base && !b.base.deleted)
+				touched.push({ blockId: b.id, versionSeq: b.base.versionSeq });
+		};
+		const ops: OutlineOp[] = [];
+		const taskInput = (task: OutlineTaskJson | null): OutlineTaskInput | null =>
+			task
+				? {
+						status: task.status,
+						assignee: task.assignee,
+						...(task.depends?.length ? { depends: task.depends } : {}),
+						...(task.due ? { due: task.due } : {}),
+					}
+				: null;
+		switch (op.op) {
+			case "insert": {
+				const block = this.block(result.blockId);
+				touch_(touch?.kind === "insert" ? touch.parent : null);
+				ops.push({
+					op: "insert",
+					id: block.id,
+					sid: block.sid,
+					parent: op.parent ? { id: idOf(op.parent) } : null,
+					...(position(op.position) ? { position: position(op.position) } : {}),
+					content: prep?.content ?? op.content,
+					task: taskInput(block.taskJson),
+					...(op.alias ? { alias: op.alias } : {}),
+					...(op.tags !== undefined ? { tags: op.tags } : {}),
+				});
+				break;
+			}
+			case "update":
+				touch_(this.blocks.get(result.blockId));
+				ops.push({
+					op: "update",
+					block: { id: result.blockId },
+					...(op.content !== undefined ? { content: prep?.content ?? op.content } : {}),
+					...(op.alias !== undefined ? { alias: op.alias } : {}),
+					...(op.tags !== undefined ? { tags: op.tags } : {}),
+					...(op.merged ? { merged: true } : {}),
+				});
+				break;
+			case "setTask":
+				touch_(this.blocks.get(result.blockId));
+				ops.push({ op: "setTask", block: { id: result.blockId }, task: op.task });
+				break;
+			case "move":
+				touch_(this.blocks.get(result.blockId));
+				touch_(touch?.kind === "move" ? this.existingAnchor(touch.to) : null);
+				ops.push({
+					op: "move",
+					block: { id: result.blockId },
+					parent: op.parent ? { id: idOf(op.parent) } : null,
+					...(position(op.position) ? { position: position(op.position) } : {}),
+				});
+				break;
+			case "delete":
+				touch_(this.blocks.get(result.blockId));
+				ops.push({ op: "delete", block: { id: result.blockId } });
+				break;
+			case "restore":
+				touch_(touch?.kind === "restore" ? touch.parent : null);
+				ops.push({
+					op: "restore",
+					block: { id: result.blockId },
+					...(op.parent !== undefined
+						? { parent: op.parent ? { id: idOf(op.parent) } : null }
+						: {}),
+					...(position(op.position) ? { position: position(op.position) } : {}),
+					...(op.content !== undefined ? { content: prep?.content ?? op.content } : {}),
+					...(op.alias !== undefined ? { alias: op.alias } : {}),
+					...(op.task !== undefined ? { task: op.task } : {}),
+					...(op.tags !== undefined ? { tags: op.tags } : {}),
+				});
+				break;
+		}
+		// Blocks split off the content: inserted after it, in order.
+		for (const split of result.split) {
+			const block = this.block(split.blockId);
+			ops.push({
+				op: "insert",
+				id: block.id,
+				sid: block.sid,
+				parent: block.parentId === null ? null : { id: block.parentId },
+				position: { orderKey: block.orderKey },
+				content: block.content ?? "",
+				task: taskInput(block.taskJson),
+			});
+		}
+		return {
+			index: i,
+			rootId: root.id,
+			ops,
+			touched,
+			result: { ...result, adjustments: undefined, pending: true },
+		};
 	}
 
 	// ── the commit ───────────────────────────────────────────────────────────
@@ -1792,13 +2388,17 @@ class OutlinePlanner {
 		// The writer's own lapsed leases run again in the same atomic section.
 		claims.put.push(...this.quietClaims);
 		this.quietClaims = [];
+		const commitId = generateId();
+		const { pending, pendingPageIds } = this.planPending(commitId);
 		return {
+			pendingPageIds,
 			plan: {
 				spaceId: this.space.id,
 				seq,
 				inProcessEpoch: this.readsInProcess ? this.space.inProcessEpoch : null,
+				...(pending ? { pending } : {}),
 				commit: {
-					id: generateId(),
+					id: commitId,
 					spaceId: this.space.id,
 					seq,
 					kind: this.commitKind,
@@ -1822,6 +2422,46 @@ class OutlinePlanner {
 				claims,
 			},
 			pageIds: [...pageIds],
+		};
+	}
+
+	/**
+	 * What the commit does to pending changes: a lock it removes (unlocked, relocked by someone
+	 * else, its task deleted) withdraws the tree's open changes; a confirmation decides its row.
+	 */
+	private planPending(commitId: string): {
+		pending: OutlinePendingPlan | null;
+		pendingPageIds: string[];
+	} {
+		const pending: OutlinePendingPlan = {};
+		const pages = new Set<string>();
+		const gone: WorkingBlock[] = [];
+		let unlocked = false;
+		for (const block of this.blocks.values()) {
+			const lock = block.base && !block.base.deleted ? block.base.taskJson?.lock : undefined;
+			if (!lock) continue;
+			if (block.deleted) gone.push(block);
+			else if (!sameLocker(block.taskJson?.lock, lock)) {
+				gone.push(block);
+				unlocked = true;
+			}
+		}
+		if (gone.length > 0) {
+			pending.withdraw = {
+				rootBlockIds: gone.map((b) => b.id),
+				decidedAt: this.now,
+				decidedBy: this.writer,
+				reason: unlocked ? PENDING_WITHDRAW.unlocked : PENDING_WITHDRAW.deleted,
+			};
+			for (const b of gone) pages.add((b.base as OutlineBlockMeta).pageId);
+		}
+		const confirm = this.extra.confirm;
+		if (confirm) {
+			pending.decide = confirmDecision(confirm, this.now, commitId);
+		}
+		return {
+			pending: pending.withdraw || pending.decide ? pending : null,
+			pendingPageIds: [...pages],
 		};
 	}
 
@@ -2349,6 +2989,14 @@ async function writePrepared(
 	const store = options.store ?? outlineStore;
 	const compensating = options.compensating;
 	const attempts = options.maxAttempts ?? DEFAULT_ATTEMPTS;
+	const commitKind: OutlineCommitKind = compensating
+		? "revert"
+		: options.confirm
+			? "confirm"
+			: "edit";
+	// Ids of inserts that name none, the same in every pass: a held operation may name a block
+	// another operation of the call creates.
+	const assignedIds = input.ops.map((op) => (op.op === "insert" && !op.id ? generateId() : ""));
 	for (let attempt = 0; attempt < attempts; attempt++) {
 		const space = await store.getSpace(input.spaceId);
 		if (!space) throw new NotFoundError("Outline space", input.spaceId);
@@ -2356,33 +3004,105 @@ async function writePrepared(
 			throw new OutlineStaleWriteError(space.id, compensating.expectNextSeq);
 		}
 		const now = (options.now?.() ?? new Date()).toISOString();
-		const planner = new OutlinePlanner(
-			store,
-			space,
-			input,
-			prepared,
-			now,
-			compensating ? "revert" : "edit",
-			options.leaseExpiry,
-		);
-		let planned: Planned | null;
-		try {
-			planned = await planner.plan();
-		} catch (error) {
-			if (error instanceof SidCollision) continue;
-			throw error;
+		if (options.confirm) {
+			// A confirmation of a change decided (or merged into) meanwhile is not planned again.
+			const row = (await store.getPending([options.confirm.pendingId]))[0];
+			if (row?.status !== "open" || row.rev !== options.confirm.expectRev)
+				throw new OutlinePendingMovedError(space.id, space.nextSeq);
 		}
+		// Plan; operations held for confirmation leave the plan, and it is made again without them.
+		const held = new Map<number, OutlineHeldOp>();
+		const trees = new Map<string, OutlineHeldTree>();
+		let planner: OutlinePlanner;
+		let planned: Planned | null = null;
+		let collided = false;
+		for (;;) {
+			planner = new OutlinePlanner(
+				store,
+				space,
+				input,
+				prepared,
+				now,
+				commitKind,
+				options.leaseExpiry,
+				{ held: new Set(held.keys()), assignedIds, confirm: options.confirm },
+			);
+			let outcome: Planned | Hold | null;
+			try {
+				outcome = await planner.plan();
+			} catch (error) {
+				if (error instanceof SidCollision) {
+					collided = true;
+					break;
+				}
+				throw error;
+			}
+			if (outcome && "hold" in outcome) {
+				for (const op of outcome.hold.ops) held.set(op.index, op);
+				for (const tree of outcome.hold.trees) trees.set(tree.rootId, tree);
+				continue;
+			}
+			planned = outcome;
+			break;
+		}
+		if (collided) continue;
+		if (trees.size > 1) {
+			throw new OutlineWriteError(OUTLINE_TEXT.severalLockedPlans, "OUTLINE_LOCKED_MANY");
+		}
+		const tree = [...trees.values()][0];
+		const hold =
+			tree && held.size > 0
+				? await buildPendingPut({
+						store,
+						space,
+						input,
+						tree,
+						held: [...held.values()].sort((a, b) => a.index - b.index),
+						now,
+					})
+				: null;
+		const results = [...planner.results];
+		for (const op of held.values()) results[op.index] = op.result;
+		const pendingResult = hold?.outcome;
+
 		if (!planned) {
+			try {
+				if (hold) {
+					// Nothing written directly: the proposal alone, while the space is as planned.
+					await store.applyPending({
+						spaceId: space.id,
+						seq: space.nextSeq,
+						pending: { put: hold.put },
+					});
+				} else if (options.confirm) {
+					// A confirmation that changes nothing (it all happened meanwhile): decided alone.
+					const decided = await store.decidePending(confirmDecision(options.confirm, now, null));
+					if (!decided) throw new OutlinePendingMovedError(space.id, space.nextSeq);
+				}
+			} catch (error) {
+				if (isStalePending(error)) continue;
+				throw error;
+			}
 			// Nothing to commit, but the writer's lapsed lease runs again (unless the expiry job
 			// got there first: then plan again, and the reopened task is claimed afresh).
 			const quiet = planner.quietClaims;
 			if (quiet.length > 0 && !(await store.updateTaskClaims(quiet))) continue;
-			return { spaceId: space.id, commit: null, pageIds: [], results: planner.results };
+			if (hold) emitPending(space.id, [hold.put.row.pageId]);
+			if (options.confirm) emitPending(space.id, options.confirmPageIds ?? []);
+			return {
+				spaceId: space.id,
+				commit: null,
+				pageIds: [],
+				results,
+				...(pendingResult ? { pending: pendingResult } : {}),
+			};
 		}
+		if (hold) planned.plan.pending = { ...planned.plan.pending, put: hold.put };
 		try {
 			await store.applyCommit(planned.plan);
 		} catch (error) {
 			if (error instanceof OutlineStaleWriteError) continue;
+			if (isStalePending(error)) continue;
 			if (
 				error instanceof WriteConflictError &&
 				CALLER_ID_CONSTRAINTS.has(error.constraint ?? "")
@@ -2406,13 +3126,38 @@ async function writePrepared(
 			actorKind: commit.actorKind,
 			actorId: commit.actorId,
 		});
+		const pendingPages = new Set(planned.pendingPageIds);
+		if (hold) pendingPages.add(hold.put.row.pageId);
+		for (const pageId of options.confirmPageIds ?? [])
+			if (options.confirm) pendingPages.add(pageId);
+		if (pendingPages.size > 0) emitPending(space.id, [...pendingPages]);
 		return {
 			spaceId: space.id,
 			commit: { id: commit.id, seq: commit.seq },
 			pageIds: planned.pageIds,
-			results: planner.results,
+			results,
 			...(planner.ended.length > 0 ? { ended: planner.ended } : {}),
+			...(pendingResult ? { pending: pendingResult } : {}),
 		};
 	}
 	throw new OutlineBusyError(input.spaceId, attempts);
+}
+
+/**
+ * The plan's view of pending changes went stale: a row moved (merged into, decided), or a
+ * concurrent first proposal of the same session on the same tree won the open-proposer index.
+ * Planned again.
+ */
+function isStalePending(error: unknown): boolean {
+	if (error instanceof OutlineStaleWriteError) return true;
+	return (
+		error instanceof WriteConflictError &&
+		/outline_pending|uq_outline_pending_open_proposer/.test(error.constraint ?? "")
+	);
+}
+
+/** Pending changes of these pages changed: page subscribers re-read their summaries. */
+function emitPending(spaceId: string, pageIds: readonly string[]): void {
+	if (pageIds.length === 0) return;
+	eventBus.emit({ type: "outline:pending", spaceId, pageIds: [...pageIds] });
 }

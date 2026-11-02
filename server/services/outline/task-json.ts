@@ -48,7 +48,7 @@ export function canonicalTaskJson(task: OutlineTaskFields): OutlineTaskJson {
 	return out;
 }
 
-function sameActor(
+export function sameActor(
 	a: OutlineTaskActorRef | null | undefined,
 	b: OutlineTaskActorRef | null | undefined,
 ): boolean {

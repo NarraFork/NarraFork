@@ -31,7 +31,17 @@ export type OutlineWriteErrorCode =
 	/** A caller-chosen block id is already in use. */
 	| "OUTLINE_ID_TAKEN"
 	/** The task is being done by someone else (a live claim); see `OutlineTaskClaimedError`. */
-	| "OUTLINE_TASK_CLAIMED";
+	| "OUTLINE_TASK_CLAIMED"
+	/** An agent's write sets or clears a lock: only people lock (`lockOutlineTask`). */
+	| "OUTLINE_LOCK_DENIED"
+	/** A page holds more locked tasks than an agent's change can be checked against. */
+	| "OUTLINE_TOO_MANY_LOCKS"
+	/** One write changes several locked plans; one call per plan. */
+	| "OUTLINE_LOCKED_MANY"
+	/** The page has as many open pending changes as it may hold. */
+	| "OUTLINE_PENDING_FULL"
+	/** A pending change would grow past its limits. */
+	| "OUTLINE_PENDING_TOO_LARGE";
 
 /** The transaction is invalid as written. `opIndex` is the offending operation, when one is. */
 export class OutlineWriteError extends ValidationError {

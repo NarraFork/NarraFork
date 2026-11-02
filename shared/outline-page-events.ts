@@ -31,6 +31,15 @@ export type OutlinePageServerMessage =
 			/** Ids of the commits, oldest first; at most the last few when many landed at once. */
 			commitIds: string[];
 	  }
+	| {
+			/**
+			 * Changes waiting for confirmation on the page changed (proposed, merged into, decided,
+			 * withdrawn): the client re-reads the page's pending summary.
+			 */
+			type: "outline_page_pending";
+			subscriptionId: string;
+			pageId: string;
+	  }
 	| { type: "outline_page_error"; subscriptionId: string; code: OutlinePageErrorCode };
 
 /** Per-socket and per-page limits of page subscriptions. */

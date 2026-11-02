@@ -13,7 +13,7 @@ export type OutlineViewMode = "facts" | "all";
 
 export type OutlineActorKind = "human" | "agent" | "system";
 
-export type OutlineCommitKind = "edit" | "revert" | "import";
+export type OutlineCommitKind = "edit" | "revert" | "import" | "confirm";
 
 export type OutlineTaskStatus = "todo" | "doing" | "done" | "cancelled";
 
@@ -116,6 +116,29 @@ export interface OutlineTaskView {
 	depends: string[];
 }
 
+/** Who locked a task tree (design §2.2), and the session confirming on their behalf. */
+export interface OutlineLockView {
+	/** The locked task. */
+	blockId: string;
+	by: { kind: OutlineActorKind; id: string; name: string | null };
+	delegate: { narratorId: string; title: string | null } | null;
+	/** Seq of the commit that locked it. */
+	versionSeq: number;
+	/** Whether the caller may unlock it: the locker, a manager of the space, an admin. */
+	canUnlock: boolean;
+}
+
+/** A task under a fact, as its "in progress" marker lists it (design §3.1). */
+export interface OutlineInProgressItem {
+	id: string;
+	sid: string;
+	title: string;
+	status: OutlineTaskStatus;
+	assignee: string | null;
+	/** A change to it waits for confirmation. */
+	waiting: boolean;
+}
+
 export interface OutlineViewBlock {
 	id: string;
 	sid: string;
@@ -133,6 +156,15 @@ export interface OutlineViewBlock {
 	processHidden: number;
 	/** Tasks directly under this block that are neither done nor cancelled. */
 	openTasks: number;
+	/**
+	 * Those tasks (at most {@link OUTLINE_PENDING_API_LIMITS.inProgressItems}), for the "in
+	 * progress" marker of the facts view.
+	 */
+	inProgress: OutlineInProgressItem[];
+	/** The lock, on a locked task. */
+	lock: OutlineLockView | null;
+	/** Open changes (ids) that touch this block: it waits for confirmation. */
+	pending: string[];
 }
 
 export interface OutlineBlockViewResponse {
@@ -313,4 +345,107 @@ export interface OutlineViewStateResponse {
 export interface OutlineViewStatePutRequest {
 	collapsed: string[];
 	layout: OutlineMapLayout;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Locks and pending confirmation (design §2.2, §2.6)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export const OUTLINE_PENDING_API_LIMITS = {
+	/** Tasks one "in progress" marker lists. */
+	inProgressItems: 10,
+	/** Characters of a rejection's reason. */
+	maxReasonChars: 500,
+} as const;
+
+export type OutlinePendingStatus = "open" | "confirmed" | "rejected" | "withdrawn";
+
+/** A change waiting for confirmation (or decided), as a page lists it. */
+export interface OutlinePendingSummary {
+	id: string;
+	/** `P` and the id: how people and agents name it. */
+	label: string;
+	status: OutlinePendingStatus;
+	/** The locked task whose plan it changes. */
+	rootBlockId: string | null;
+	pageId: string;
+	summary: string;
+	createdAt: string;
+	updatedAt: string;
+	/** The session that proposed it. */
+	proposer: { narratorId: string | null; title: string | null };
+	/** Who decides it: the locker, or the session they named. */
+	decider: {
+		by: { kind: OutlineActorKind; id: string; name: string | null };
+		delegate: { narratorId: string; title: string | null } | null;
+	};
+	/** Existing blocks it touches. */
+	blockIds: string[];
+	/** Operations it holds. */
+	ops: number;
+	/** A block it touches changed since it was proposed: confirming merges, or may fail. */
+	changedSince: boolean;
+	/** Whether the caller decides it (they locked the plan). */
+	canDecide: boolean;
+}
+
+/** `GET /spaces/:spaceId/pages/:pageId/pending`: what waits for confirmation on a page. */
+export interface OutlinePagePendingResponse {
+	pending: OutlinePendingSummary[];
+	/** Locked tasks of the page. */
+	locks: OutlineLockView[];
+}
+
+/** One block of a pending change: as proposed against, as proposed, and as it is now. */
+export interface OutlinePendingDiffEntry {
+	blockId: string;
+	sid: string;
+	kind: "update" | "insert" | "delete" | "move" | "task" | "restore";
+	base: string | null;
+	proposed: string | null;
+	now: string | null;
+	changedSince: boolean;
+	/** For a task change: the fields as proposed (null: the checkbox taken away). */
+	task?: {
+		status?: OutlineTaskStatus;
+		assignee?: string | null;
+		due?: string | null;
+		depends?: string[] | null;
+	} | null;
+	/** For a move or an insert: the parent's title (null: the top level). */
+	parentTitle?: string | null;
+}
+
+/** `GET /pending/:id`: a pending change block by block (bounded). */
+export interface OutlinePendingDetailResponse {
+	pending: OutlinePendingSummary;
+	entries: OutlinePendingDiffEntry[];
+	/** More blocks than the diff shows. */
+	truncated: boolean;
+}
+
+/** `POST /pending/:id/confirm` and `/reject`. */
+export interface OutlinePendingDecisionResponse {
+	pending: OutlinePendingSummary;
+	/** The `confirm` commit; null for a rejection, or a confirmation that changed nothing. */
+	commit: { id: string; seq: number } | null;
+}
+
+/** Why a confirmation failed, beside the error's code (`OUTLINE_PENDING_CONFLICT`). */
+export interface OutlinePendingConflictBody {
+	code: string;
+	message: string;
+	details?: string[];
+}
+
+/** `POST /spaces/:spaceId/blocks/:blockId/lock`. */
+export interface OutlineLockRequest {
+	/** The session that may confirm step changes on the locker's behalf (one the caller may write). */
+	delegate?: string | null;
+}
+
+/** `POST …/lock` and `DELETE …/lock`. */
+export interface OutlineLockResponse {
+	lock: OutlineLockView | null;
+	commit: { id: string; seq: number } | null;
 }

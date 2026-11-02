@@ -25,6 +25,7 @@ import {
 	outlineCommits,
 	outlineLinks,
 	outlineLiveUpdates,
+	outlinePending,
 	outlineSpaces,
 	outlineTaskClaims,
 	outlineViewState,
@@ -53,11 +54,17 @@ import type {
 	OutlineActorKind,
 	OutlineCommitKind,
 	OutlineLinkKind,
+	OutlinePendingDeciderJson,
+	OutlinePendingKind,
+	OutlinePendingRequesterJson,
+	OutlinePendingStatus,
 	OutlineSpaceKind,
+	OutlineTaskActorRef,
 } from "../model";
 import {
 	chunked,
 	claimsAsExpected,
+	expectedPendingRevs,
 	lockedClaimIds,
 	type NarratorStateRow,
 	narratorSessions,
@@ -70,6 +77,10 @@ import {
 	type OutlineCommitRow,
 	type OutlineLinkRow,
 	type OutlineLiveUpdateRow,
+	type OutlinePendingDecision,
+	OutlinePendingMovedError,
+	type OutlinePendingPlan,
+	type OutlinePendingRow,
 	type OutlineSpaceRow,
 	type OutlineSpaceScope,
 	OutlineStaleWriteError,
@@ -78,6 +89,7 @@ import {
 	type OutlineVersionRow,
 	type OutlineViewStateRow,
 	oldestClaimsFirst,
+	pendingAsExpected,
 	writesAsExpected,
 } from "./port";
 import { createPostgresOutlineReads } from "./postgres-read";
@@ -311,7 +323,7 @@ function idList(ids: readonly string[]): SQL {
 async function applyCommitSection(
 	tx: PgTransaction,
 	plan: OutlineCommitPlan,
-): Promise<"applied" | "stale" | "claims"> {
+): Promise<"applied" | "stale" | "claims" | "pending"> {
 	const { seq } = plan;
 	// The claims the plan read must still be as read (a lease renewed since may have made a
 	// takeover wrong). Their rows, and those it releases without checking (a person ending
@@ -320,6 +332,11 @@ async function applyCommitSection(
 	const locked = lockedClaimIds(plan);
 	if (locked.length > 0 && !claimsAsExpected(plan, await lockClaims(tx, locked))) {
 		return "claims";
+	}
+	// Then the pending rows it merges into, decides or withdraws, in id order, before the space
+	// row as well; those it expects must be as read.
+	if (plan.pending && !pendingAsExpected(plan.pending, await lockPending(tx, plan.pending))) {
+		return "pending";
 	}
 	// The counter and the in-process epoch are claimed together; a commit that cannot keep its
 	// in-process answers marks the space for the rebuild in the same statement.
@@ -439,7 +456,142 @@ async function applyCommitSection(
 			);
 	}
 	for (const { row } of plan.claims.put) await putClaim(tx, row);
+	if (plan.pending) await writePending(tx, plan.pending);
 	return "applied";
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pending changes
+// ─────────────────────────────────────────────────────────────────────────────
+
+type PendingSelect = typeof outlinePending.$inferSelect;
+
+function toPending(row: PendingSelect): OutlinePendingRow {
+	return {
+		...row,
+		kind: row.kind as OutlinePendingKind,
+		status: row.status as OutlinePendingStatus,
+		opsJson: row.opsJson as Array<Record<string, unknown>>,
+		baseJson: row.baseJson as Record<string, number>,
+		blockIdsJson: row.blockIdsJson as string[],
+		requestedByJson: row.requestedByJson as OutlinePendingRequesterJson,
+		deciderJson: row.deciderJson as OutlinePendingDeciderJson,
+		decidedByJson: (row.decidedByJson as OutlineTaskActorRef | null | undefined) ?? null,
+	};
+}
+
+/**
+ * Lock the pending rows a plan touches, in id order (the order every writer takes them, before
+ * the space row): the rows it expects, and the open rows of the lock roots it withdraws. Returns
+ * the status and revision of the rows it expects.
+ */
+async function lockPending(
+	tx: PgTransaction,
+	pending: OutlinePendingPlan,
+): Promise<Map<string, { status: string; rev: number }>> {
+	const expected = expectedPendingRevs(pending);
+	const ids = new Set(expected.keys());
+	for (const roots of chunked(pending.withdraw?.rootBlockIds ?? [])) {
+		const open = await tx
+			.select({ id: outlinePending.id })
+			.from(outlinePending)
+			.where(and(inArray(outlinePending.rootBlockId, roots), sql`"status" = 'open'`));
+		for (const row of open) ids.add(row.id);
+	}
+	const found = new Map<string, { status: string; rev: number }>();
+	for (const chunk of chunked([...ids].sort())) {
+		const rows = await tx
+			.select({ id: outlinePending.id, status: outlinePending.status, rev: outlinePending.rev })
+			.from(outlinePending)
+			.where(inArray(outlinePending.id, chunk))
+			.orderBy(sql`${outlinePending.id} COLLATE "C"`)
+			.for("update");
+		for (const row of rows) found.set(row.id, row);
+	}
+	return found;
+}
+
+/** A decision's columns. */
+function decisionSet(decision: OutlinePendingDecision) {
+	return {
+		status: decision.status,
+		decidedAt: decision.decidedAt,
+		decidedByJson: decision.decidedBy,
+		decisionCommitId: decision.decisionCommitId,
+		reason: decision.reason,
+		reportedAt: decision.reportedAt,
+		updatedAt: decision.decidedAt,
+	};
+}
+
+/** Withdraw, decide, put, in that order (the plan's expectations were checked already). */
+async function writePending(tx: PgTransaction, pending: OutlinePendingPlan): Promise<void> {
+	const withdraw = pending.withdraw;
+	if (withdraw) {
+		for (const ids of chunked(withdraw.rootBlockIds)) {
+			await tx
+				.update(outlinePending)
+				.set({
+					status: "withdrawn",
+					decidedAt: withdraw.decidedAt,
+					decidedByJson: withdraw.decidedBy,
+					reason: withdraw.reason,
+					updatedAt: withdraw.decidedAt,
+				})
+				.where(and(inArray(outlinePending.rootBlockId, ids), sql`"status" = 'open'`));
+		}
+	}
+	if (pending.decide) {
+		await tx
+			.update(outlinePending)
+			.set(decisionSet(pending.decide))
+			.where(eq(outlinePending.id, pending.decide.id));
+	}
+	const put = pending.put;
+	if (put) {
+		if (put.expectRev === null) await tx.insert(outlinePending).values(put.row);
+		else {
+			const { id, ...columns } = put.row;
+			await tx.update(outlinePending).set(columns).where(eq(outlinePending.id, id));
+		}
+	}
+}
+
+/** A plan's pending changes alone, while the space's counter is still `seq`. */
+async function applyPendingSection(
+	tx: PgTransaction,
+	plan: { spaceId: string; seq: number; pending: OutlinePendingPlan },
+): Promise<"applied" | "stale" | "pending"> {
+	if (!pendingAsExpected(plan.pending, await lockPending(tx, plan.pending))) return "pending";
+	// FOR SHARE waits for a commit holding the space row, then sees whether it moved the counter;
+	// a commit after this one waits for it.
+	const rows = await tx
+		.select({ nextSeq: outlineSpaces.nextSeq })
+		.from(outlineSpaces)
+		.where(eq(outlineSpaces.id, plan.spaceId))
+		.for("share");
+	if (rows[0]?.nextSeq !== plan.seq) return "stale";
+	await writePending(tx, plan.pending);
+	return "applied";
+}
+
+/** A decision alone: only while the row is open at the revision read. */
+async function decidePendingSection(
+	tx: PgTransaction,
+	decision: OutlinePendingDecision,
+): Promise<boolean> {
+	const updated = await tx
+		.update(outlinePending)
+		.set(decisionSet(decision))
+		.where(
+			and(
+				eq(outlinePending.id, decision.id),
+				sql`"status" = 'open'`,
+				eq(outlinePending.rev, decision.expectRev),
+			),
+		)
+		.returning({ id: outlinePending.id });
+	return updated.length > 0;
 }
 
 async function putClaim(tx: PgTransaction, row: OutlineTaskClaimRow): Promise<void> {
@@ -884,7 +1036,7 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 		},
 
 		async applyCommit(plan) {
-			let outcome: "applied" | "stale" | "claims";
+			let outcome: "applied" | "stale" | "claims" | "pending";
 			try {
 				outcome = await withPgRetry(() => db.transaction((tx) => applyCommitSection(tx, plan)), {
 					label: "outline.applyCommit",
@@ -894,6 +1046,145 @@ export function createPostgresOutlineStore(db: BunSQLDatabase): OutlineStore {
 			}
 			if (outcome === "stale") throw new OutlineStaleWriteError(plan.spaceId, plan.seq);
 			if (outcome === "claims") throw new OutlineClaimsMovedError(plan.spaceId, plan.seq);
+			if (outcome === "pending") throw new OutlinePendingMovedError(plan.spaceId, plan.seq);
+		},
+
+		async getPending(ids) {
+			const out: OutlinePendingRow[] = [];
+			for (const chunk of chunked(ids)) {
+				const rows = await db
+					.select()
+					.from(outlinePending)
+					.where(inArray(outlinePending.id, chunk));
+				for (const row of rows) out.push(toPending(row));
+			}
+			return out;
+		},
+
+		async listOpenPendingByPage(pageId, limit) {
+			const rows = await db
+				.select()
+				.from(outlinePending)
+				.where(and(eq(outlinePending.pageId, pageId), sql`"status" = 'open'`))
+				.orderBy(asc(outlinePending.createdAt), sql`${outlinePending.id} COLLATE "C"`)
+				.limit(limit);
+			return rows.map(toPending);
+		},
+
+		async listOpenPendingBySpace(spaceId, limit) {
+			const rows = await db
+				.select()
+				.from(outlinePending)
+				.where(and(eq(outlinePending.spaceId, spaceId), sql`"status" = 'open'`))
+				.orderBy(asc(outlinePending.createdAt), sql`${outlinePending.id} COLLATE "C"`)
+				.limit(limit);
+			return rows.map(toPending);
+		},
+
+		async findOpenPending(requesterSession, rootBlockId) {
+			const rows = await db
+				.select()
+				.from(outlinePending)
+				.where(
+					and(
+						eq(outlinePending.requesterSession, requesterSession),
+						eq(outlinePending.rootBlockId, rootBlockId),
+						sql`"status" = 'open'`,
+					),
+				)
+				.limit(1);
+			return rows[0] ? toPending(rows[0]) : null;
+		},
+
+		async listUnreportedPending(requesterSession, limit) {
+			const rows = await db
+				.select()
+				.from(outlinePending)
+				.where(
+					and(eq(outlinePending.requesterSession, requesterSession), sql`"reported_at" IS NULL`),
+				)
+				.orderBy(asc(outlinePending.createdAt), sql`${outlinePending.id} COLLATE "C"`)
+				.limit(limit);
+			return rows.map(toPending);
+		},
+
+		async markPendingReported(ids, at) {
+			for (const chunk of chunked(ids)) {
+				await withPgRetry(
+					() =>
+						db
+							.update(outlinePending)
+							.set({ reportedAt: at })
+							.where(
+								and(
+									inArray(outlinePending.id, chunk),
+									ne(outlinePending.status, "open"),
+									isNull(outlinePending.reportedAt),
+								),
+							),
+					{ label: "outline.markPendingReported" },
+				);
+			}
+		},
+
+		async applyPending(plan) {
+			let outcome: "applied" | "stale" | "pending";
+			try {
+				outcome = await withPgRetry(() => db.transaction((tx) => applyPendingSection(tx, plan)), {
+					label: "outline.applyPending",
+				});
+			} catch (error) {
+				rethrowAsPortError(error);
+			}
+			if (outcome === "stale") throw new OutlineStaleWriteError(plan.spaceId, plan.seq);
+			if (outcome === "pending") throw new OutlinePendingMovedError(plan.spaceId, plan.seq);
+		},
+
+		async decidePending(decision) {
+			return await withPgRetry(() => db.transaction((tx) => decidePendingSection(tx, decision)), {
+				label: "outline.decidePending",
+			});
+		},
+
+		async getFirstVersions(blockIds) {
+			const out: Array<{ blockId: string; fromSeq: number; commitId: string }> = [];
+			for (const chunk of chunked(blockIds)) {
+				// One primary-key probe per block: its lowest `from_seq`.
+				const rows = await db
+					.select({
+						blockId: outlineBlocks.id,
+						fromSeq: sql<number | null>`(SELECT v.from_seq FROM outline_block_versions v
+							WHERE v.block_id = outline_blocks.id ORDER BY v.from_seq ASC LIMIT 1)`,
+						commitId: sql<string | null>`(SELECT v.commit_id FROM outline_block_versions v
+							WHERE v.block_id = outline_blocks.id ORDER BY v.from_seq ASC LIMIT 1)`,
+					})
+					.from(outlineBlocks)
+					.where(inArray(outlineBlocks.id, chunk));
+				for (const row of rows) {
+					if (row.fromSeq !== null && row.commitId !== null)
+						out.push({
+							blockId: row.blockId,
+							fromSeq: Number(row.fromSeq),
+							commitId: row.commitId,
+						});
+				}
+			}
+			return out;
+		},
+
+		async listLockedBlocks(pageId, limit) {
+			// The predicate is the lock index's own, so the planner can use the index.
+			const rows = await db
+				.select(metaColumns)
+				.from(outlineBlocks)
+				.where(
+					and(
+						eq(outlineBlocks.pageId, pageId),
+						sql`("task_json"::jsonb #>> '{lock}') IS NOT NULL AND "deleted" = FALSE`,
+					),
+				)
+				.limit(limit);
+			return rows.map(toMeta);
 		},
 
 		async getTaskClaims(blockIds) {

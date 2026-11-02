@@ -1637,15 +1637,16 @@ export const OUTLINE_TASK_CONTRACT: ContractCase[] = [
 			]);
 			const waits = await deriveOutlineTaskWaits(subjects, { store: ctx.store });
 			const [wx, wy, wz, ww] = x.results.map((res) => waits.get(res.blockId));
-			expect(wx).toEqual({ prerequisites: [a?.blockId], people: false });
-			expect(wy).toEqual({ prerequisites: [], people: false });
+			expect(wx).toEqual({ prerequisites: [a?.blockId], people: false, confirmation: false });
+			expect(wy).toEqual({ prerequisites: [], people: false, confirmation: false });
 			expect(wz?.prerequisites).toEqual([a?.blockId]);
 			expect(ww?.prerequisites).toEqual([a?.blockId]);
 			expect(waits.get(far.results[0]?.blockId as string)?.prerequisites).toEqual([a?.blockId]);
 			// Once A is done, nothing waits.
 			await write(ctx, space, n1, [status(a?.blockId as string, "done")]);
 			const after = await deriveOutlineTaskWaits(subjects, { store: ctx.store });
-			for (const wait of after.values()) expect(wait).toEqual({ prerequisites: [], people: false });
+			for (const wait of after.values())
+				expect(wait).toEqual({ prerequisites: [], people: false, confirmation: false });
 		},
 	},
 	{
@@ -1749,7 +1750,7 @@ export const OUTLINE_TASK_CONTRACT: ContractCase[] = [
 				claim: { holderNarratorId: narrator, epoch: 1 },
 			});
 			expect(found.waiting.map((w) => [w.blockId, w.wait])).toEqual([
-				[t3, { prerequisites: [t1], people: false }],
+				[t3, { prerequisites: [t1], people: false, confirmation: false }],
 			]);
 			const limited = await findContinuationCandidates({
 				narratorId: narrator,

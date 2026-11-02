@@ -34,7 +34,12 @@ import type {
 	OutlineCommitKind,
 	OutlineLinkKind,
 	OutlineLinkTargetKind,
+	OutlinePendingDeciderJson,
+	OutlinePendingKind,
+	OutlinePendingRequesterJson,
+	OutlinePendingStatus,
 	OutlineSpaceKind,
+	OutlineTaskActorRef,
 	OutlineTaskJson,
 } from "../model";
 import type { OutlineReadPort } from "./read-port";
@@ -177,6 +182,105 @@ export interface OutlineTaskClaimRow {
 	lastHolderUserId: string | null;
 }
 
+/**
+ * A change waiting for someone's confirmation (`outline_pending`, design §2.6). `opsJson` holds
+ * the write path's operations (`OutlineOp`, typed where they are built: `pending.ts`).
+ */
+export interface OutlinePendingRow {
+	id: string;
+	spaceId: string;
+	kind: OutlinePendingKind;
+	status: OutlinePendingStatus;
+	pageId: string;
+	/** The lock's root (a `locked_plan`). */
+	rootBlockId: string | null;
+	opsJson: Array<Record<string, unknown>>;
+	/** Each existing block's `version_seq` when proposed, by id. */
+	baseJson: Record<string, number>;
+	/** The existing blocks the change touches. */
+	blockIdsJson: string[];
+	summary: string;
+	requestedByJson: OutlinePendingRequesterJson;
+	/** The proposer's session (a subagent's root). */
+	requesterSession: string | null;
+	deciderJson: OutlinePendingDeciderJson;
+	deciderUserId: string | null;
+	/** Grows with every merge into the row. */
+	rev: number;
+	createdAt: string;
+	updatedAt: string;
+	decidedAt: string | null;
+	decidedByJson: OutlineTaskActorRef | null;
+	decisionCommitId: string | null;
+	reason: string | null;
+	/** When the proposer was shown the decision; null while it has not been. */
+	reportedAt: string | null;
+}
+
+/** A decision on a pending change: written only while it is open and at `expectRev`. */
+export interface OutlinePendingDecision {
+	id: string;
+	expectRev: number;
+	status: Exclude<OutlinePendingStatus, "open">;
+	decidedAt: string;
+	decidedBy: OutlineTaskActorRef;
+	/** The `confirm` commit (set by the store from the plan's commit when written with one). */
+	decisionCommitId: string | null;
+	reason: string | null;
+	/** Set when the proposer need not be told (it withdrew the change itself). */
+	reportedAt: string | null;
+}
+
+/** What a write does to pending changes, in the same atomic section as its commit (if any). */
+export interface OutlinePendingPlan {
+	/**
+	 * A proposal: a new row (`expectRev` null; the open-proposer unique index turns a concurrent
+	 * twin into a `WriteConflictError`), or the open row read at `expectRev` with the proposal
+	 * merged into it.
+	 */
+	put?: { row: OutlinePendingRow; expectRev: number | null };
+	/** A decision (a confirmation written with its `confirm` commit). */
+	decide?: OutlinePendingDecision;
+	/**
+	 * Lock roots whose lock this commit removes (unlocked, relocked by someone else, deleted):
+	 * their open changes are withdrawn, whoever proposed them.
+	 */
+	withdraw?: {
+		rootBlockIds: string[];
+		decidedAt: string;
+		decidedBy: OutlineTaskActorRef;
+		reason: string;
+	};
+}
+
+/** The pending rows a plan expects to find as read (`put` merged into, `decide`), by id. */
+export function expectedPendingRevs(pending: OutlinePendingPlan | undefined): Map<string, number> {
+	const out = new Map<string, number>();
+	if (pending?.put && pending.put.expectRev !== null)
+		out.set(pending.put.row.id, pending.put.expectRev);
+	if (pending?.decide) out.set(pending.decide.id, pending.decide.expectRev);
+	return out;
+}
+
+/** Whether the pending rows found (by id) are open at the revisions the plan expects. */
+export function pendingAsExpected(
+	pending: OutlinePendingPlan | undefined,
+	found: ReadonlyMap<string, { status: string; rev: number }>,
+): boolean {
+	for (const [id, rev] of expectedPendingRevs(pending)) {
+		const row = found.get(id);
+		if (!row || row.status !== "open" || row.rev !== rev) return false;
+	}
+	return true;
+}
+
+/** The creation version of a block: the seq and commit of its first version. */
+export interface OutlineFirstVersion {
+	blockId: string;
+	fromSeq: number;
+	commitId: string;
+}
+
 /** The space a project, a user or a narrator owns. */
 export type OutlineSpaceScope =
 	| { kind: "project"; projectId: string }
@@ -248,11 +352,16 @@ export interface OutlineClaimPlan {
  *   7. set `in_process` of the blocks in `inProcess` (no version: it is a derived cache); with
  *      `inProcessStale`, mark the space's in-process answers as not derived
  *      (`in_process_ready` false) for the background rebuild;
- *   8. write `claims`.
+ *   8. write `claims`;
+ *   9. write `pending`: withdraw, then decide (its `decisionCommitId` is the commit's id), then
+ *      put (insert, or update the row merged into).
  *
  * Step 1 claims `next_seq`, and `in_process_epoch` with it when the plan names one. Before it the
  * section checks that every claim row `claims` expects (`put`, `expire`, `verify`) is still as
- * read; when one is not, it writes nothing and rejects with {@link OutlineClaimsMovedError}.
+ * read; when one is not, it writes nothing and rejects with {@link OutlineClaimsMovedError}. Then
+ * that every pending row `pending` expects is open at the revision read; when one is not, it
+ * writes nothing and rejects with {@link OutlinePendingMovedError}. (PostgreSQL locks the claim
+ * rows, then the pending rows, then the space row, in that order.)
  */
 export interface OutlineCommitPlan {
 	spaceId: string;
@@ -285,6 +394,11 @@ export interface OutlineCommitPlan {
 	 */
 	inProcessStale: boolean;
 	claims: OutlineClaimPlan;
+	/**
+	 * Pending changes written with the commit (step 9): a proposal held back from it, the
+	 * decision a confirmation makes, the changes an unlock withdraws.
+	 */
+	pending?: OutlinePendingPlan;
 }
 
 /**
@@ -311,6 +425,18 @@ export class OutlineClaimsMovedError extends OutlineStaleWriteError {
 		super(spaceId, expectedSeq);
 		this.message = `a task claim in outline space ${spaceId} changed while the write was planned`;
 		this.name = "OutlineClaimsMovedError";
+	}
+}
+
+/**
+ * A pending row the plan read changed before the write (another proposal merged into it, or it
+ * was decided). Nothing was written; plan again. A kind of stale write.
+ */
+export class OutlinePendingMovedError extends OutlineStaleWriteError {
+	constructor(spaceId: string, expectedSeq: number) {
+		super(spaceId, expectedSeq);
+		this.message = `a pending change in outline space ${spaceId} changed while the write was planned`;
+		this.name = "OutlinePendingMovedError";
 	}
 }
 
@@ -616,6 +742,44 @@ export interface OutlineStore extends WritePortIdentity, OutlineReadPort {
 		expectNextSeq: number,
 		values: { inProcess: readonly string[]; notInProcess: readonly string[]; ready?: boolean },
 	): Promise<boolean>;
+
+	// ── pending changes (`services/outline/pending.ts`) ─────────────────────────────────
+	// Written with a commit (`applyCommit`, the plan's `pending`), alone with the space counter as
+	// a guard (`applyPending`), or decided alone (`decidePending`). Every read is indexed and
+	// bounded.
+
+	/** Pending rows by id. */
+	getPending(ids: readonly string[]): Promise<OutlinePendingRow[]>;
+	/** Open pending rows of a page, oldest first, at most `limit`. */
+	listOpenPendingByPage(pageId: string, limit: number): Promise<OutlinePendingRow[]>;
+	/** Open pending rows of a space, oldest first, at most `limit`. */
+	listOpenPendingBySpace(spaceId: string, limit: number): Promise<OutlinePendingRow[]>;
+	/** The open row a session has on a lock root, if any. */
+	findOpenPending(requesterSession: string, rootBlockId: string): Promise<OutlinePendingRow | null>;
+	/**
+	 * Rows of a session it has not been shown (open ones, and decisions not reported yet), oldest
+	 * first, at most `limit`.
+	 */
+	listUnreportedPending(requesterSession: string, limit: number): Promise<OutlinePendingRow[]>;
+	/** Mark decided rows as shown to their proposer. */
+	markPendingReported(ids: readonly string[], at: string): Promise<void>;
+	/**
+	 * Write a plan's pending changes without a commit (a proposal with nothing written directly):
+	 * atomically, and only while the space's counter is still `seq` (no commit landed since the
+	 * plan's reads; the space row is held so none lands meanwhile) and every row it expects is as
+	 * read. Rejects like `applyCommit`: {@link OutlineStaleWriteError},
+	 * {@link OutlinePendingMovedError}, `WriteConflictError`.
+	 */
+	applyPending(plan: { spaceId: string; seq: number; pending: OutlinePendingPlan }): Promise<void>;
+	/** Write a decision alone (a rejection); false, writing nothing, when the row moved. */
+	decidePending(decision: OutlinePendingDecision): Promise<boolean>;
+	/**
+	 * The first version of each block (its creation: seq and commit), one primary-key probe
+	 * each. Blocks with no versions are left out.
+	 */
+	getFirstVersions(blockIds: readonly string[]): Promise<OutlineFirstVersion[]>;
+	/** Live locked blocks of a page (the partial lock index), at most `limit`. */
+	listLockedBlocks(pageId: string, limit: number): Promise<OutlineBlockMeta[]>;
 
 	// ── live session log (`services/outline/live/`) ─────────────────────────────────────
 	// Not part of a page's history: rows are written while a page is edited live and deleted

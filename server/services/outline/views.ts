@@ -15,23 +15,34 @@
  * parent is shown. Under each shown block, `hidden` counts the blocks of the view below it that
  * were left out; the client offers to focus that block, which reads its subtree with a fresh
  * budget.
+ *
+ * LOCKS, PENDING CHANGES, IN PROGRESS (P2 PR 6)
+ * --------------------------------------------
+ * A locked task carries its lock (who, and the session confirming on their behalf); a block an
+ * open change touches carries the change's id (it waits for confirmation); every shown block
+ * lists the open tasks directly under it (at most {@link OUTLINE_PENDING_API_LIMITS}), the facts
+ * view's "in progress" marker. One indexed read of the page's open changes, the names of the
+ * people and sessions, and the titles of the listed tasks (their content, by version).
  */
 import { ValidationError } from "@server/lib/errors";
 import { titleOf } from "@shared/outline";
-import type {
-	OutlineBlockHistoryResponse,
-	OutlineBlockViewResponse,
-	OutlineChange,
-	OutlineCommitSummary,
-	OutlinePageListResponse,
-	OutlineSpaceSummary,
-	OutlineTimelineResponse,
-	OutlineViewBlock,
-	OutlineViewMode,
+import {
+	OUTLINE_PENDING_API_LIMITS,
+	type OutlineBlockHistoryResponse,
+	type OutlineBlockViewResponse,
+	type OutlineChange,
+	type OutlineCommitSummary,
+	type OutlineInProgressItem,
+	type OutlineLockView,
+	type OutlinePageListResponse,
+	type OutlineSpaceSummary,
+	type OutlineTimelineResponse,
+	type OutlineViewBlock,
+	type OutlineViewMode,
 } from "@shared/outline-api";
 import type { OutlinePrincipal } from "./access";
 import { readDisplayNames } from "./access-reads";
-import { OUTLINE_CHANGE } from "./model";
+import { OUTLINE_CHANGE, OUTLINE_PENDING_LIMITS, type OutlineTaskLockJson } from "./model";
 import { loadBodies, loadBodiesWithin, readPageTimeline, readSubtree } from "./read";
 import { clampBudget, type OutlineBudget } from "./render";
 import { isOrphanedSpace } from "./spaces";
@@ -214,6 +225,28 @@ export async function readBlockView(
 	}
 	const shownSet = new Set(shown);
 
+	// The open tasks under each shown block (the "in progress" marker), with their titles.
+	const inProgressOf = new Map<OutlineNode, OutlineNode[]>();
+	const listed: OutlineNode[] = [];
+	for (const node of shown) {
+		const open = node.children.filter((c) => c.task && OPEN_TASK.has(c.task.status));
+		const take = open.slice(0, OUTLINE_PENDING_API_LIMITS.inProgressItems);
+		if (listed.length + take.length > IN_PROGRESS_TITLES) continue;
+		inProgressOf.set(node, take);
+		listed.push(...take);
+	}
+	await loadBodies(state, listed, { store });
+	const pendingRows = state.current
+		? await store.listOpenPendingByPage(state.pageId, OUTLINE_PENDING_LIMITS.openPerPage)
+		: [];
+	const pendingOf = new Map<string, string[]>();
+	for (const row of pendingRows) {
+		for (const id of row.blockIdsJson) pendingOf.set(id, [...(pendingOf.get(id) ?? []), row.id]);
+	}
+	const locks = await describeLocks(
+		shown.flatMap((node) => (node.task?.lock ? [{ blockId: node.id, lock: node.task.lock }] : [])),
+	);
+
 	let hiddenByView = 0;
 	const blocks: OutlineViewBlock[] = shown.map((node) => {
 		const children = kids.get(node) ?? [];
@@ -248,6 +281,18 @@ export async function readBlockView(
 			hidden,
 			processHidden,
 			openTasks,
+			inProgress: (inProgressOf.get(node) ?? []).map(
+				(task): OutlineInProgressItem => ({
+					id: task.id,
+					sid: task.sid,
+					title: shortTitle(task.content ?? ""),
+					status: task.task?.status ?? "todo",
+					assignee: task.task?.assignee ?? null,
+					waiting: pendingOf.has(task.id),
+				}),
+			),
+			lock: locks.get(node.id) ?? null,
+			pending: pendingOf.get(node.id) ?? [],
 		};
 	});
 	if (view === "facts") {
@@ -272,6 +317,46 @@ export async function readBlockView(
 		pageTruncated: state.truncated,
 		pageBlocks: state.nodes.size,
 	};
+}
+
+/** Titles of listed tasks one view loads at most (the rest of the markers show counts only). */
+const IN_PROGRESS_TITLES = 200;
+
+/**
+ * Locks as the client shows them, with the names of the people and sessions they name.
+ * `canUnlock` is the caller's to decide (the routes know the person); false here.
+ */
+export async function describeLocks(
+	locks: ReadonlyArray<{ blockId: string; lock: OutlineTaskLockJson }>,
+): Promise<Map<string, OutlineLockView>> {
+	const out = new Map<string, OutlineLockView>();
+	if (locks.length === 0) return out;
+	const names = await readDisplayNames({
+		userIds: locks.flatMap((l) => (l.lock.by.kind === "human" ? [l.lock.by.id] : [])),
+		narratorIds: locks.flatMap((l) => [
+			...(l.lock.by.kind === "agent" ? [l.lock.by.id] : []),
+			...(l.lock.delegate ? [l.lock.delegate] : []),
+		]),
+	});
+	for (const { blockId, lock } of locks) {
+		out.set(blockId, {
+			blockId,
+			by: {
+				kind: lock.by.kind,
+				id: lock.by.id,
+				name:
+					lock.by.kind === "human"
+						? (names.users.get(lock.by.id) ?? null)
+						: (names.narrators.get(lock.by.id) ?? null),
+			},
+			delegate: lock.delegate
+				? { narratorId: lock.delegate, title: names.narrators.get(lock.delegate) ?? null }
+				: null,
+			versionSeq: lock.versionSeq,
+			canUnlock: false,
+		});
+	}
+	return out;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
