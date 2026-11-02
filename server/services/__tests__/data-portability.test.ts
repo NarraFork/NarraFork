@@ -377,3 +377,41 @@ describe("export download ticket", () => {
 		expect(consumeExportTicket(tokens[32] ?? "", base + 100)).toEqual(selection);
 	});
 });
+
+describe("平台实例随供应商一起导出", () => {
+	const instance = {
+		id: "platform-cc-1",
+		platform: "CommandCode",
+		suffix: "1",
+		prefix: "CommandCode-1",
+		disabled: false,
+		config: { apiKey: "cc-key" },
+	};
+	const instancesNow = () =>
+		(settings.agent as unknown as Record<string, unknown>).platformInstances;
+
+	test("导出、清空与导入都带上平台实例", async () => {
+		const original = structuredClone(settings);
+		// 平台实例由平台集成功能引入；这里按运行时结构写入，导出逻辑只按键名读取。
+		(settings.agent as unknown as Record<string, unknown>).platformInstances = [instance];
+		try {
+			const exported = await exportData({ requests: false, sessions: false, providers: true });
+			// 1 个 API key 供应商 + 1 个平台实例
+			expect(exported.counts.providers).toBe(2);
+
+			const zip = await readFile(exported.zipPath);
+			const preview = await previewImport(toArrayBuffer(zip), "instances.zip");
+			expect(preview.providers.platformInstances).toEqual([instance]);
+
+			await clearData("providers");
+			expect(instancesNow()).toEqual([]);
+
+			const result = await applyImport(preview.token, { conflictDefault: "skip" });
+			// 清空后本地两者都没有：导入恢复 1 个 API key 供应商 + 1 个平台实例。
+			expect(result.providersAdded).toBe(2);
+			expect(instancesNow()).toEqual([instance]);
+		} finally {
+			saveSettings(original);
+		}
+	});
+});

@@ -52,7 +52,15 @@ const PROVIDER_KEYS = [
 	"commandCode",
 ] as const;
 
-type ProviderKey = (typeof PROVIDER_KEYS)[number];
+/**
+ * 平台实例挂在 `agent` 下，但它在语义上是供应商配置。
+ *
+ * 导出包按顶层键平铺（`platformInstances`），导入/清空时再放回 `agent`，这样没有平台实例
+ * 功能的版本读到的仍是同一份 providers.json 结构。
+ */
+const AGENT_PROVIDER_KEYS = ["platformInstances"] as const;
+
+type ProviderKey = (typeof PROVIDER_KEYS)[number] | (typeof AGENT_PROVIDER_KEYS)[number];
 type ClearTarget = "requests" | "sessions" | "providers" | "all";
 
 interface ImportPreview {
@@ -368,6 +376,11 @@ function collectProviders(source: NarraForkSettings): Partial<Record<ProviderKey
 		const value = source[key];
 		if (value !== undefined) (out as Record<string, unknown>)[key] = value;
 	}
+	const agent = source.agent as unknown as Record<string, unknown> | undefined;
+	for (const key of AGENT_PROVIDER_KEYS) {
+		const value = agent?.[key];
+		if (value !== undefined) (out as Record<string, unknown>)[key] = value;
+	}
 	return out;
 }
 
@@ -375,6 +388,7 @@ function countProviders(providers: Partial<Record<ProviderKey, unknown>>): numbe
 	let total = 0;
 	if (Array.isArray(providers.customApiProviders)) total += providers.customApiProviders.length;
 	if (Array.isArray(providers.nugProviders)) total += providers.nugProviders.length;
+	if (Array.isArray(providers.platformInstances)) total += providers.platformInstances.length;
 	for (const single of ["codex", "tokendance", "commandCode"] as const) {
 		if (providers[single] !== undefined) total += 1;
 	}
@@ -979,6 +993,13 @@ export async function applyImport(token: string, options: ImportOptions): Promis
 							(next as unknown as Record<string, unknown>)[key] = merge.merged[key];
 						}
 					}
+					const agentPatch: Record<string, unknown> = {};
+					for (const key of AGENT_PROVIDER_KEYS) {
+						if (merge.merged[key] !== undefined) agentPatch[key] = merge.merged[key];
+					}
+					if (Object.keys(agentPatch).length > 0) {
+						next.agent = { ...next.agent, ...agentPatch } as NarraForkSettings["agent"];
+					}
 					saveSettings(next);
 					counts.providersAdded = merge.added;
 					counts.providersRenamed = merge.renamed;
@@ -1113,6 +1134,50 @@ function mergeProviders(incoming: Partial<Record<ProviderKey, unknown>>): {
 		changed = true;
 	}
 
+	// 平台实例：与列表型供应商同一套避让规则。前缀是模型命名空间，本地已占用的前缀
+	// 必须改名后再导入，否则两个实例会同时解析到同一批模型 ID。
+	const incomingInstances = incoming.platformInstances;
+	if (Array.isArray(incomingInstances) && incomingInstances.length > 0) {
+		const agent = (current.agent ?? {}) as unknown as Record<string, unknown>;
+		const currentList = [...((agent.platformInstances ?? []) as Array<Record<string, unknown>>)];
+		const existingIds = new Set(currentList.map((entry) => String(entry.id ?? "")));
+		const existingPrefixes = new Set(currentList.map((entry) => String(entry.prefix ?? "")));
+		for (const item of incomingInstances as Array<Record<string, unknown>>) {
+			const copy = { ...item };
+			const platform = String(copy.platform ?? "");
+			const prefix = String(copy.prefix ?? "");
+			// 同平台同前缀就是同一条命名空间，内容一样的实例没必要再导一份。
+			if (
+				currentList.some(
+					(entry) =>
+						String(entry.platform ?? "") === platform && String(entry.prefix ?? "") === prefix,
+				)
+			) {
+				skipped += 1;
+				continue;
+			}
+			if (!copy.id || existingIds.has(String(copy.id))) copy.id = uniqueProviderId(existingIds);
+			existingIds.add(String(copy.id));
+			if (prefix && existingPrefixes.has(prefix)) {
+				let n = 2;
+				let candidate = `${prefix}-${n}`;
+				while (existingPrefixes.has(candidate)) {
+					n += 1;
+					candidate = `${prefix}-${n}`;
+				}
+				copy.prefix = candidate;
+				existingPrefixes.add(candidate);
+				renamed += 1;
+			} else if (prefix) {
+				existingPrefixes.add(prefix);
+			}
+			currentList.push(copy);
+			added += 1;
+		}
+		(merged as Record<string, unknown>).platformInstances = currentList;
+		changed = true;
+	}
+
 	// 单例平台：本地已配置就不动它。覆盖本地配置是"导入后反而坏了"的直接来源。
 	for (const key of ["codex", "tokendance", "commandCode"] as const) {
 		const value = incoming[key];
@@ -1176,6 +1241,15 @@ export async function clearData(target: ClearTarget): Promise<ClearResult> {
 					if (Array.isArray(value)) removed += value.length;
 					else if (value !== undefined) removed += 1;
 					(next as unknown as Record<string, unknown>)[key] = Array.isArray(value) ? [] : undefined;
+				}
+				// 平台实例也是供应商配置的一部分，清空时一并归零。
+				const agent = next.agent as unknown as Record<string, unknown> | undefined;
+				if (agent) {
+					for (const key of AGENT_PROVIDER_KEYS) {
+						const value = agent[key];
+						if (Array.isArray(value)) removed += value.length;
+						agent[key] = [];
+					}
 				}
 				saveSettings(next);
 				deleted.providers = removed;

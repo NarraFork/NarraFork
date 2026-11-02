@@ -20,7 +20,7 @@
 | 文件 | 内容 |
 |---|---|
 | `snapshot.db` | 整库原生快照（`VACUUM INTO`）——**新增的表会自动包含** |
-| `providers.json` | 供应商配置：`customApiProviders`、`nugProviders`、`codex`、`tokendance`、`commandCode`（**含凭据**） |
+| `providers.json` | 供应商配置：`customApiProviders`、`nugProviders`、`codex`、`tokendance`、`commandCode`，以及平台实例 `platformInstances`（**含凭据**） |
 | `manifest.json` | `{ version, exportedAt, counts }`，导入时校验 `version <= 1` |
 
 ## 三、导入的合并语义
@@ -33,6 +33,7 @@
 | 消息 `narrator_messages` | `INSERT OR IGNORE`（主键相同的消息被复用，保持 fork 共享语义，不覆盖其它会话内容） |
 | 引用 / 工具调用 | `INSERT OR IGNORE` |
 | 供应商 | 追加：重名加「-副本」（重复再加编号），`prefix` 冲突自动编号；`codex`/`tokendance`/`commandCode` 单例平台本地为空则导入、已配置则覆盖 |
+| 平台实例 | 同按前缀避让：本地已有同平台同前缀时先改前缀再追加，同前缀同平台视为重复跳过 |
 
 **列交集**：拷贝与 UPDATE 都按「两库 `PRAGMA table_info` 的交集」生成列清单。这样快照与
 当前库的迁移进度不同（列多了/少了）也能导入——但也意味着**旧快照缺少的新列会用数据库默认值**，
