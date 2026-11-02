@@ -27,7 +27,6 @@ import { settings } from "../settings";
 import {
 	assertSpecPath,
 	assertToolSpecPaths,
-	isBehaviorFenceToolRoute,
 	toolNamesSpecPath,
 	toolSpecPathError,
 } from "../spec-uri";
@@ -752,16 +751,15 @@ export function getReflectionToolRejection(
 /**
  * A tool call that names a `spec://` path in a session whose tasks live in the outline: the
  * outline session has no Dynamic Spec (plan §3), so instead of reading or writing one it can no
- * longer see, the call is answered with where its tasks and notes are. Spec sessions pass, and so
- * does `Read`/`Write`/`Edit` of `spec://behavior_fence`: the fence an outline session keeps until
- * plan PR 4, whose writes the user-turn grant still gates inside the tools.
+ * longer see, the call is answered with where its tasks, notes and behavior boundary are. That
+ * includes `spec://behavior_fence`: the session's boundary is the behavior page of its session
+ * space (plan PR 4), which the system keeps in its context. Spec sessions pass.
  */
 export function getOutlineSpecRejection(
 	tu: AgentToolUse,
 	config: Pick<AgentConfig, "taskBackend" | "locale">,
 ): ToolExecResult | undefined {
 	if (config.taskBackend !== "outline" || !toolNamesSpecPath(tu.name, tu.input)) return undefined;
-	if (isBehaviorFenceToolRoute(tu.name, tu.input)) return undefined;
 	return {
 		output: getOutlineSpecUnavailableHint((config.locale as Locale) ?? "en"),
 		isError: true,

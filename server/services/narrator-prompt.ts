@@ -87,6 +87,12 @@ export interface BuildPromptOptions {
 	 * know the session's task backend builds exactly the prompt it always did.
 	 */
 	taskSection?: PromptTaskSection;
+	/**
+	 * Named dynamic parts the session's task source adds (`NarratorTaskSource.contextParts`: an
+	 * outline session's built-in views), appended in order after `runtime`. Absent or empty adds
+	 * nothing, so a spec session's prompt is exactly what it was.
+	 */
+	contextParts?: readonly PromptPart[];
 }
 
 export interface BuildPromptResult {
@@ -363,6 +369,7 @@ export async function buildEffectiveSystemPrompt(
 	if (options.skillsContext !== undefined) appendPart("skills", options.skillsContext);
 	if (options.modelsContext !== undefined) appendPart("models", options.modelsContext);
 	if (options.runtimeHints !== undefined) appendPart("runtime", options.runtimeHints);
+	for (const part of options.contextParts ?? []) appendPart(part.key, part.text);
 
 	return {
 		prompt,

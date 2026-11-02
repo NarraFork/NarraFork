@@ -94,6 +94,13 @@ export interface SpecWriteOptions {
 	 * `"user"` (UI route) is subject to `uiEditable`.
 	 */
 	actor?: SpecWriteActor;
+	/**
+	 * The write is the plugin-SOP channel of `spec://behavior_fence`: a plugin's SOP command, or an
+	 * outline session's import leaving only that SOP in the fence. In a session whose tasks live
+	 * in the outline this is the only write the old fence still takes (its behavior boundary is
+	 * the outline page; outline plan PR 4). Ignored for other paths.
+	 */
+	pluginSop?: boolean;
 }
 
 /**
@@ -214,8 +221,8 @@ export async function writeSpecFile(
 	options: SpecWriteOptions = {},
 ): Promise<SpecResolvedFile> {
 	const path = normalizeSpecPath(uri);
-	// An outline session has no Dynamic Spec to write to (its fence excepted).
-	await assertSpecWritable(narratorId, path);
+	// An outline session has no Dynamic Spec to write to (the fence's plugin-SOP channel excepted).
+	await assertSpecWritable(narratorId, path, { pluginSop: options.pluginSop === true });
 	const actor = options.actor ?? "agent";
 	const fenceMutationAllowed = path === "behavior_fence" && options.allowFenceMutation === true;
 	if (actor === "agent" && isAgentReadonly(path) && !fenceMutationAllowed) {

@@ -48,9 +48,24 @@ export interface SpecWriteResult {
 	interjected?: boolean;
 }
 
+/**
+ * Where an outline session's behavior boundary lives: its session space and the behavior page in
+ * it (either null until it exists). Its old `behavior_fence` only carries plugin SOP, read-only.
+ */
+export interface SpecOutlineBehavior {
+	spaceId: string | null;
+	pageId: string | null;
+}
+
+export interface SpecFilesResponse {
+	files: SpecFileMeta[];
+	/** Present for a session whose tasks live in the outline. */
+	outlineBehavior?: SpecOutlineBehavior;
+}
+
 export const specApi = {
 	listSpecFiles: (narratorId: string) =>
-		request<{ files: SpecFileMeta[] }>(`/narrators/${narratorId}/spec/files`),
+		request<SpecFilesResponse>(`/narrators/${narratorId}/spec/files`),
 
 	readSpecFile: (narratorId: string, uri: string) =>
 		request<SpecFileDetail>(`/narrators/${narratorId}/spec/file?uri=${encodeURIComponent(uri)}`),

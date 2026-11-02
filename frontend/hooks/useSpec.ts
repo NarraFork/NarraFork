@@ -43,6 +43,20 @@ export function useSpecFiles(narratorId: string) {
 	});
 }
 
+/**
+ * Where an outline session's behavior boundary lives (its session space and behavior page), or
+ * null for a spec session: the file list's companion field, read from the same query.
+ */
+export function useSpecOutlineBehavior(narratorId: string) {
+	return useQuery({
+		queryKey: specFilesKey(narratorId),
+		queryFn: () => api.listSpecFiles(narratorId),
+		enabled: !!narratorId,
+		gcTime: SPEC_GC_TIME_MS,
+		select: (data) => data.outlineBehavior ?? null,
+	});
+}
+
 /** Read a single spec file (with content). */
 export function useSpecFile(narratorId: string, uri: string) {
 	const qc = useQueryClient();

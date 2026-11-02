@@ -225,6 +225,12 @@ export interface ActiveNarrator {
 	_continuationStallKey?: string;
 	/** Completed tool count used to keep the spec (tasks.json) reminder cadence across loop runs. */
 	_todoReminderCompletedToolCount?: number;
+	/**
+	 * An outline session's state when its current run started, for the turn-end note
+	 * (`maybeDeliverOutlineTurnEndNote`): the completed tool count and the revision of its open
+	 * tasks. Unset outside outline sessions, and once the note was left in this run.
+	 */
+	_outlineTurnStart?: { toolCount: number; revision: string | null };
 	/** Completed tool count when the tasks.json reminder was last injected. */
 	_lastTasksReminderCompletedToolCount?: number;
 	/** Completed tool count when the behavior fence was last injected. */

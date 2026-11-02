@@ -219,6 +219,8 @@ export function createSpecTaskSource(narratorId: string): NarratorTaskSource {
 		continuationPrompt: specContinuationPrompt,
 		taskDigest: () => buildSpecTaskDigestBody(narratorId),
 		behaviorFence: () => buildBehaviorFenceBody(narratorId),
+		// Spec delivers its tasks and fence by the cadence drain: the prefix gets nothing.
+		contextParts: async () => [],
 		compactContext: (locale) => buildSpecCompactContext(narratorId, locale),
 		interruptGuardNote: specInterruptGuardNote,
 	};

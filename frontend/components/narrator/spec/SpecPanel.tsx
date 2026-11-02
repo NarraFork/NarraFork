@@ -22,9 +22,17 @@ import {
 	useUpdateBehaviorFence,
 	useUpdateReflectionOverrides,
 } from "../../../hooks/useNarrator";
-import { useSpecFile, useSpecFiles, useSpecTasks, useUpdateSpecFile } from "../../../hooks/useSpec";
+import {
+	useSpecFile,
+	useSpecFiles,
+	useSpecOutlineBehavior,
+	useSpecTasks,
+	useUpdateSpecFile,
+} from "../../../hooks/useSpec";
 import { api } from "../../../lib/api";
-import type { SpecTaskItem } from "../../../lib/api/spec";
+import type { SpecOutlineBehavior, SpecTaskItem } from "../../../lib/api/spec";
+import { outlineTargetHref } from "../../../lib/outline-href";
+import { isOpenClick, useOutlineOpener, wantsNewPanel } from "../../../lib/outline-opener";
 import { MarkdownContent } from "../markdown/MarkdownContent";
 import { SpecFileTabStrip, type SpecTabChip } from "./SpecFileTabStrip";
 import { SpecTaskBoard } from "./SpecTaskBoard";
@@ -59,6 +67,7 @@ export function SpecPanel({ narratorId, onClose, chromeless = false }: SpecPanel
 	const { t } = useTranslation("narrator");
 	const confirm = useConfirmDialog();
 	const { data: files } = useSpecFiles(narratorId);
+	const { data: outlineBehavior } = useSpecOutlineBehavior(narratorId);
 	const [selectedUri, setSelectedUri] = useState<string>(TASKS_URI);
 	const isTasksFile = selectedUri === TASKS_URI;
 
@@ -350,9 +359,14 @@ export function SpecPanel({ narratorId, onClose, chromeless = false }: SpecPanel
 						<Loader size="sm" />
 					</Center>
 				) : isPreviewOnly ? (
-					<ScrollArea style={{ flex: 1 }} p="sm">
-						<MarkdownContent text={fileData?.content ?? ""} />
-					</ScrollArea>
+					<Box style={{ flex: 1, minHeight: 0, display: "flex", flexDirection: "column" }}>
+						{outlineBehavior && selectedMeta?.path === "behavior_fence" && (
+							<OutlineFenceNotice behavior={outlineBehavior} />
+						)}
+						<ScrollArea style={{ flex: 1 }} p="sm">
+							<MarkdownContent text={fileData?.content ?? ""} />
+						</ScrollArea>
+					</Box>
 				) : isTasksFile ? (
 					<ScrollArea style={{ flex: 1 }}>
 						<AutoContinuationControl narratorId={narratorId} />
@@ -440,6 +454,66 @@ export function SpecPanel({ narratorId, onClose, chromeless = false }: SpecPanel
 				)}
 			</Box>
 		</Box>
+	);
+}
+
+// === Outline session: where the behavior boundary lives ===
+
+/**
+ * The fence tab of a session whose tasks live in the outline: its behavior boundary is the
+ * behavior page of its session space (outline plan PR 4), so the old fence is shown read-only (it
+ * only carries plugin SOP) under a note that opens the page in the outline, beside the session
+ * when the host has an outline dock, else on the outline page.
+ */
+function OutlineFenceNotice({ behavior }: { behavior: SpecOutlineBehavior }) {
+	const { t } = useTranslation("narrator");
+	const opener = useOutlineOpener();
+	const spaceId = behavior.spaceId;
+	const href = spaceId
+		? outlineTargetHref(
+				behavior.pageId
+					? { kind: "block", spaceId, blockId: behavior.pageId }
+					: { kind: "space", spaceId },
+			)
+		: null;
+	return (
+		<Group
+			gap={6}
+			px="sm"
+			py={6}
+			wrap="nowrap"
+			align="flex-start"
+			data-testid="spec-outline-fence-notice"
+			style={{
+				flexShrink: 0,
+				borderBottom: "1px solid var(--mantine-color-default-border)",
+				background: "var(--mantine-color-default-hover)",
+			}}
+		>
+			<IconLock size={13} color="var(--mantine-color-dimmed)" style={{ marginTop: 2 }} />
+			<Text size="xs" style={{ flex: 1 }}>
+				{t("spec.outlineFenceHint")}{" "}
+				{href && spaceId && (
+					<Anchor
+						size="xs"
+						href={href}
+						onClick={(event) => {
+							if (!opener || !isOpenClick(event)) return;
+							// A host that cannot show a panel right now leaves the link to navigate.
+							const opened = opener.open(
+								behavior.pageId
+									? { spaceId, blockId: behavior.pageId, pageId: behavior.pageId }
+									: { spaceId },
+								{ newPanel: wantsNewPanel(event) },
+							);
+							if (opened) event.preventDefault();
+						}}
+					>
+						{t("spec.outlineFenceOpen")}
+					</Anchor>
+				)}
+			</Text>
+		</Group>
 	);
 }
 

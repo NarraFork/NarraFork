@@ -393,6 +393,29 @@ export function createPostgresOutlineReads(db: BunSQLDatabase): OutlineReadPort 
 			return rows.map(toVersion);
 		},
 
+		async listNarratorWrites(spaceId, narratorId, options) {
+			const c = outlineCommits;
+			const recent = db
+				.select({ id: c.id, seq: c.seq, createdAt: c.createdAt })
+				.from(c)
+				.where(and(eq(c.spaceId, spaceId), eq(c.narratorId, narratorId), eq(c.kind, "edit")))
+				.orderBy(desc(c.seq))
+				.limit(options.commits)
+				.as("recent");
+			const v = outlineBlockVersions;
+			return await db
+				.select({
+					blockId: v.blockId,
+					seq: recent.seq,
+					createdAt: recent.createdAt,
+					changeFlags: v.changeFlags,
+				})
+				.from(recent)
+				.innerJoin(v, eq(v.commitId, recent.id))
+				.orderBy(desc(recent.seq), byIdBytewise(v.blockId))
+				.limit(options.limit);
+		},
+
 		async findBlocksChangedAfter(blockIds, seq, ignoreFlags) {
 			const v = outlineBlockVersions;
 			const out: string[] = [];

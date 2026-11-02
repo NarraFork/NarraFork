@@ -553,6 +553,7 @@ export function useVListLabels(): VListLabels {
 			sidecarSourceSubagentMessage: t("sidecar.sources.subagent_message"),
 			sidecarSourceSpecUpdate: t("sidecar.sources.spec_update"),
 			sidecarSourceInterruptTaskGuard: t("sidecar.sources.interrupt_task_guard"),
+			sidecarSourceOutlineTurnEnd: t("sidecar.sources.outline_task_turn_end"),
 			sidecarSourceTutorialLesson: t("sidecar.sources.tutorial_lesson"),
 			sidecarSourceTurnNudge: t("sidecar.sources.turn_nudge"),
 			sidecarSourceBrokenCall: t("sidecar.sources.broken_call"),

@@ -172,10 +172,12 @@ import {
 	finalizeOrCleanupPartialMessage,
 	hasPendingBufferedGuidance,
 	inheritedModelRuntime,
+	maybeDeliverOutlineTurnEndNote,
 	maybeStartContinuation,
 	parseQueuedGoalCommand,
 	parseQueuedNewCommand,
 	persistConversationIdIfUnchanged,
+	prepareOutlineRun,
 	rearmCutInSoftStopBeforeContinuing,
 	resolveRuntimeReasoningEffort,
 	resolveSessionDevices,
@@ -213,7 +215,7 @@ import { keepOutlineTaskLeases, type OutlineLeaseKeeper } from "../outline/lease
 import { resolvePlanApprovalAttribution } from "../plan-approval-attribution";
 import { subagentRetryRecoveredBroadcast } from "../subagent-executor";
 import { isMcpToolAllowedForNarrator, runtimeToolFilter } from "../subagent-tools";
-import { resolveTaskBackend, type TaskBackend } from "../task-source";
+import { resolveTaskBackend, type TaskBackend, taskSourceForNarrator } from "../task-source";
 import { buildFinalToolStartAuthorization } from "../tool-final-start-authorization";
 import { mcpToolMarker, parseMcpServerMarker, parseMcpToolMarker } from "../tool-load-markers";
 import { resolveNarratorCapabilities } from "../trait-layer-service";
@@ -873,6 +875,9 @@ export async function runAgentLoopUnlocked(
 	let outlineLeases: OutlineLeaseKeeper | undefined;
 	try {
 		outlineLeases = keepOutlineTaskLeases(narratorId);
+		// An outline session moves its old fence text to its behavior page once, before its first
+		// prompt is built, and the turn-end note measures the run from here (outline plan PR 4).
+		await prepareOutlineRun(active);
 		while (active.alive && owner.isCurrent()) {
 			void outlineLeases.touch();
 			// The run's own cancellation reaches whichever turn controller is current.
@@ -1203,6 +1208,12 @@ export async function runAgentLoopUnlocked(
 					? false
 					: (active._relaxedPlanLive ??
 						resolveEffectiveRelaxedPlan(current.permissionMode, current.relaxedPlan));
+				// An outline session's built-in views (current tasks, behavior boundary) are parts of
+				// the prefix, compared on every request; a spec session adds none (plan PR 4).
+				const contextParts =
+					taskBackend === "outline"
+						? await (await taskSourceForNarrator(narratorId)).contextParts(locale)
+						: undefined;
 				const built = await buildSystemPrompt(
 					{
 						systemPrompt: currentOAuth
@@ -1225,6 +1236,7 @@ export async function runAgentLoopUnlocked(
 					active._planFilePath,
 					{
 						taskSection: taskSectionFor(taskBackend, current.type),
+						...(contextParts ? { contextParts } : {}),
 						workspaceContext: JSON.stringify(workspace),
 						skillsContext: buildSkillsContext({
 							cwd: active.cwd,
@@ -3248,6 +3260,9 @@ export async function runAgentLoopUnlocked(
 				runState.input.images = undefined;
 				continue;
 			}
+			// No continuation follows: a long outline turn that left a task in progress without
+			// touching any task ends with one line for the next turn (it starts none).
+			if (!runState.hadError) await maybeDeliverOutlineTurnEndNote(active);
 
 			// [continuation-source: compact-restart]
 			// A late compact only resumes an unfinished pass. A naturally completed

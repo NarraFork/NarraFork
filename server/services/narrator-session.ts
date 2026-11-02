@@ -1269,6 +1269,7 @@ export async function buildSystemPrompt(
 		| "modeContext"
 		| "runtimeHints"
 		| "taskSection"
+		| "contextParts"
 	>,
 ): Promise<import("./narrator-prompt").BuildPromptResult> {
 	return buildEffectiveSystemPrompt({
@@ -1785,6 +1786,83 @@ async function maybeDeliverInterruptTaskGuard(
 			narratorId,
 			error: String(err),
 		});
+	}
+}
+
+/**
+ * Completed tool calls a run must have made for its end to leave the turn-end note (outline plan
+ * PR 4, decision 2026-11-02 Q4).
+ */
+export const OUTLINE_TURN_END_MIN_TOOL_CALLS = 30;
+
+/**
+ * At the start of a run of an outline session: move the old behavior fence's text to the
+ * session's behavior page (once; `importOutlineBehaviorFence`), then note where the run starts
+ * for the turn-end note (the completed tool count and the revision of the open tasks). Spec
+ * sessions only resolve their (cached) backend. Never rejects.
+ */
+export async function prepareOutlineRun(active: ActiveNarrator): Promise<void> {
+	active._outlineTurnStart = undefined;
+	try {
+		if ((await resolveTaskBackend(active.narratorId)) !== "outline") return;
+		const { readTaskSession } = await import("./task-source/backend");
+		if ((await readTaskSession(active.narratorId))?.subagent === true) return;
+		const { importOutlineBehaviorFence } = await import("./task-source/outline-behavior");
+		await importOutlineBehaviorFence(active.narratorId, active.locale);
+		const source = await taskSourceForNarrator(active.narratorId);
+		if (!source.turnEndNote) return;
+		const { revision } = await source.openTasks();
+		active._outlineTurnStart = {
+			toolCount: active._todoReminderCompletedToolCount ?? 0,
+			revision,
+		};
+	} catch (err) {
+		logger.warn("Failed to prepare an outline run", {
+			narratorId: active.narratorId,
+			error: String(err),
+		});
+	}
+}
+
+/**
+ * The turn-end note (outline plan PR 4, decision 2026-11-02 Q4), the smallest deterministic form
+ * of "sync at natural points" (design §4.8): at the end of a run after which no continuation
+ * follows, when the run made at least {@link OUTLINE_TURN_END_MIN_TOOL_CALLS} tool calls, none of
+ * the session's tasks changed during it (the revision of its open tasks is the one the run started
+ * with) and a task is still in progress, one line names that task and asks to tick it done when it
+ * is. Persisted as a plain row the next turn reads; it starts no turn. At most once per run.
+ * Best-effort: failures are logged.
+ */
+export async function maybeDeliverOutlineTurnEndNote(active: ActiveNarrator): Promise<boolean> {
+	const start = active._outlineTurnStart;
+	if (!start) return false;
+	try {
+		const calls = (active._todoReminderCompletedToolCount ?? 0) - start.toolCount;
+		if (calls < OUTLINE_TURN_END_MIN_TOOL_CALLS) return false;
+		const source = await taskSourceForNarrator(active.narratorId);
+		if (!source.turnEndNote) return false;
+		const { tasks, revision } = await source.openTasks();
+		if (revision !== start.revision) return false;
+		const doing = tasks.find((task) => task.status === "doing");
+		if (!doing) return false;
+		const note = source.turnEndNote(doing, active.locale);
+		if (!note) return false;
+		active._outlineTurnStart = undefined;
+		await deliverInjection(active.narratorId, {
+			content: note.content,
+			body: note.body,
+			source: "outline_task_turn_end",
+			// A plain row: the next turn reads it from history; no turn starts for it.
+			schedule: "none",
+			locale: active.locale,
+		});
+		return true;
+	} catch (err) {
+		logger.warn("Failed to deliver the outline turn-end note", {
+			narratorId: active.narratorId,
+			error: String(err),
+		});
+		return false;
 	}
 }
 
@@ -4238,13 +4316,6 @@ export async function addSpecTaskForPlugin(
 	};
 }
 
-/** Marker that scopes plugin-written team-SOP sections inside spec://behavior_fence. */
-const TEAM_SOP_MARKER = "team-sop:com.whisent.narrator-team";
-
-function escapeRegExp(value: string): string {
-	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
 /**
  * Upsert or clear a plugin-managed team-SOP section inside a narrator's
  * `spec://behavior_fence`.
@@ -4269,24 +4340,25 @@ export async function setSpecBehaviorFenceForPlugin(
 	} catch {
 		// Fence may not exist yet; treat as empty.
 	}
-	const openTag = `<!-- ${TEAM_SOP_MARKER} -->`;
-	const closeTag = `<!-- /${TEAM_SOP_MARKER} -->`;
-	const sopPattern = new RegExp(
-		`\\s*${escapeRegExp(openTag)}[\\s\\S]*?${escapeRegExp(closeTag)}\\s*`,
+	const { TEAM_SOP_CLOSE, TEAM_SOP_OPEN, fenceWithoutFirstPluginSop } = await import(
+		"./behavior-fence-sop"
 	);
-	const withoutSop = current.replace(sopPattern, "").trim();
+	const withoutSop = fenceWithoutFirstPluginSop(current);
 	const body = text.trim();
 	let next: string;
 	if (mode === "clear" || !body) {
 		next = withoutSop;
 	} else {
-		const section = `${openTag}\n${body}\n${closeTag}`;
+		const section = `${TEAM_SOP_OPEN}\n${body}\n${TEAM_SOP_CLOSE}`;
 		next = withoutSop ? `${withoutSop}\n\n${section}` : section;
 	}
+	// `pluginSop`: in an outline session the old fence is closed to everyone but this channel
+	// (the plugin's SOP, until its block commands exist, outline plan PR 12).
 	const written = await writeSpecFile(narratorId, "spec://behavior_fence", next, {
 		actor: "agent",
 		allowFenceMutation: true,
 		createdBy: "assistant",
+		pluginSop: true,
 	});
 	return { updated: true, revisionId: written.revisionId ?? null };
 }

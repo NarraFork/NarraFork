@@ -2310,6 +2310,7 @@ const SYSTEM_LABEL_FALLBACKS: Record<string, string> = {
 	sidecarSourceSubagentMessage: "Subagent message",
 	sidecarSourceSpecUpdate: "Outline update",
 	sidecarSourceInterruptTaskGuard: "Interrupted-task reminder",
+	sidecarSourceOutlineTurnEnd: "Task reminder at turn end",
 	sidecarSourceTutorialLesson: "Tutorial lesson",
 	sidecarSourceTurnNudge: "Turn budget",
 	sidecarSourceBrokenCall: "Invalid tool call",
@@ -2421,6 +2422,8 @@ const INJECTION_SOURCE_LABEL_KEYS: Record<string, string> = {
 	behavior_fence: "sidecarSourceBehaviorFence",
 	pipeline_exit_confirmation: "sidecarSourcePipelineExit",
 	interrupt_task_guard: "sidecarSourceInterruptTaskGuard",
+	// An outline session's long turn that left a task in progress it never touched (plan PR 4).
+	outline_task_turn_end: "sidecarSourceOutlineTurnEnd",
 	// Loop-control notices: written as rows so a rebuilt request says what the live one did.
 	turn_nudge: "sidecarSourceTurnNudge",
 	broken_call: "sidecarSourceBrokenCall",

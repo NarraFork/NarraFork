@@ -4,14 +4,15 @@ import { type Locale, type LocalizedValue, pickLocalizedValue } from "@shared/i1
 //
 // The model-facing text of a session whose tasks live in the outline (task backend `outline`,
 // `services/task-source/outline.ts`): the system-prompt section that replaces the Dynamic Spec
-// instructions, the continuation prompts, the interrupt note, the compact task list and the
-// hint a `spec://` path gets. No `spec://` vocabulary, except the behavior fence: until the
-// outline has its behavior-fence page (plan PR 4), `spec://behavior_fence` is the one `spec://`
-// file an outline session keeps.
+// instructions, the two built-in views (current tasks, behavior boundary), the continuation
+// prompts, the interrupt note, the turn-end note, the compact context and the hint a `spec://`
+// path gets. No `spec://` vocabulary: an outline session has none (its behavior boundary is the
+// behavior page of its session space, outline plan PR 4).
 //
 // The system-prompt section is part of the frozen contract of a prefix epoch, so it holds only
 // what does not change while a session runs (design §0, the three conventions); live task state
-// reaches the model through the injections and tool results.
+// reaches the model through the views (named context parts, updated when they change) and tool
+// results. The views' text is deterministic (fixed order, no times): it is also their change key.
 
 /** One task as the outline prompts name it. */
 export interface OutlineTaskPromptTask {
@@ -32,7 +33,9 @@ This session keeps its notes and tasks in the outline: read with OutlineRead and
 2. When you start a task, tick it in progress; when it is done, tick it done. When a person has to decide something, ask them and give your recommendation.
 3. When a tool says a change was handed to someone for confirmation, do the parts it does not affect first.
 
-Standing rules of behavior are not tasks. When the user asks you to record one, write it to \`spec://behavior_fence\`, and only as the first tool call of that user turn; the system shows that file to you as your behavior fence. It is the only \`spec://\` file this session uses: the other \`spec://\` paths the file tools mention do not apply here.
+Standing rules of behavior are not tasks. They live on this session's behavior page (alias \`behavior\` in \`session/\`). When the user asks you to record one, write it to that page with OutlineEdit (create the page with \`alias:: behavior\` if there is none), and only as the first tool call of that user turn; at any other time the page is read-only to you. This session has no \`spec://\`: the \`spec://\` paths the file tools mention do not apply here.
+
+The system keeps two views in your context and updates them when they change: this session's current tasks (\`outline.tasks\`) and its behavior boundary (\`outline.behavior\`, which you must always follow).
 </system-reminder>`,
 	"zh-CN": `<system-reminder>
 # 大纲
@@ -42,7 +45,9 @@ Standing rules of behavior are not tasks. When the user asks you to record one, 
 2. 开始做一个任务就把它勾成进行中，做完勾成完成；需要人决定的，提问并附上你的建议。
 3. 工具说改动「已交给某人确认」时，先做不受影响的部分。
 
-长期的行为规则不是任务。用户要求你记下一条时，写进 \`spec://behavior_fence\`，而且只能作为该用户回合的第一个工具调用；系统会把这个文件作为行为护栏展示给你。它是本会话唯一使用的 \`spec://\` 文件：文件工具说明里提到的其他 \`spec://\` 路径在这里不适用。
+长期的行为规则不是任务，它们在本会话的行为边界页里（\`session/\` 中别名为 \`behavior\` 的页）。用户要求你记下一条时，用 OutlineEdit 写进这一页（还没有这一页就新建，并写上 \`alias:: behavior\`），而且只能作为该用户回合的第一个工具调用；其他时候这一页对你只读。本会话没有 \`spec://\`：文件工具说明里提到的 \`spec://\` 路径在这里都不适用。
+
+系统在你的上下文里维护两个视图，有变化时更新：本会话的当前任务（\`outline.tasks\`）和行为边界（\`outline.behavior\`，务必遵守）。
 </system-reminder>`,
 };
 
@@ -171,21 +176,208 @@ export function getOutlineInterruptNote(
 		: `The run was just interrupted by the user, which usually means the direction changed. This session still has these open tasks in the outline:\n\n${lines}\n\nThey may be stale or no longer match the user's latest intent. When the user's next message arrives, treat it as the source of truth; if the plan changed, rewrite or cancel the outdated tasks with OutlineEdit first (ask before dropping one a person set), then continue. Do not resume an old task over the user's new instruction.`;
 }
 
-/** The task list handed to the compact summarizer: the session's open tasks. */
-export function getOutlineCompactContext(
-	tasks: ReadonlyArray<OutlineTaskPromptTask & { status: "doing" | "todo" | "blocked" }>,
+// ─── Built-in views (outline plan PR 4, design §4.2) ───
+
+/** What a waiting task waits for, as the views name it. */
+export interface OutlineTaskWaitText {
+	/** The first unfinished prerequisite: its address, and its title when it may be shown. */
+	prerequisite: { address: string; title: string | null } | null;
+	/** Unfinished prerequisites in all. */
+	prerequisites: number;
+	/** A question under the task is unanswered. */
+	people: boolean;
+}
+
+/** One task as a view lists it. */
+export interface OutlineViewTask extends OutlineTaskPromptTask {
+	/** The task's own checkbox: a waiting task may be either. */
+	checkbox: "todo" | "doing";
+	wait: OutlineTaskWaitText | null;
+}
+
+const tasksViewText = {
+	heading: {
+		en: "Current tasks of this session in the outline (kept by the system, updated when they change):",
+		"zh-CN": "本会话在大纲里的当前任务（由系统维护，有变化时更新）：",
+	},
+	doing: { en: "In progress:", "zh-CN": "进行中：" },
+	waiting: { en: "Waiting:", "zh-CN": "等待中：" },
+	next: { en: "Next:", "zh-CN": "下一个：" },
+} satisfies Record<string, LocalizedValue<string>>;
+
+export type OutlineTasksViewSection = "doing" | "waiting" | "next";
+
+/** The first line of the current-tasks view. */
+export function getOutlineTasksViewHeading(locale: Locale): string {
+	return pickLocalizedValue(tasksViewText.heading, locale);
+}
+
+/** The line that opens a section of the current-tasks view. */
+export function getOutlineTasksViewSection(
+	section: OutlineTasksViewSection,
 	locale: Locale,
 ): string {
-	const lines = taskLines(tasks, locale);
+	return pickLocalizedValue(tasksViewText[section], locale);
+}
+
+function waitNote(wait: OutlineTaskWaitText, locale: Locale): string {
+	const zh = locale === "zh-CN";
+	if (wait.prerequisite) {
+		const { address, title } = wait.prerequisite;
+		const named = title ? `\`${address}\` ${title}` : `\`${address}\``;
+		const others = wait.prerequisites - 1;
+		const more = others > 0 ? (zh ? ` 等 ${wait.prerequisites} 项` : ` and ${others} more`) : "";
+		return zh ? ` ‹等前置：${named}${more}›` : ` ‹waiting on ${named}${more}›`;
+	}
+	return wait.people ? (zh ? " ‹等人回答›" : " ‹waiting for a person's answer›") : "";
+}
+
+/** One task line of a view: `- [/] \`key/sid\` title`, a person's mark, what it waits for. */
+export function getOutlineViewTaskLine(task: OutlineViewTask, locale: Locale): string {
+	const box = task.checkbox === "doing" ? "[/]" : "[ ]";
+	return `- ${box} ${taskLabel(task, locale)}${task.wait ? waitNote(task.wait, locale) : ""}`;
+}
+
+/** The last line of a current-tasks view that could not list everything. */
+export function getOutlineTasksViewMore(count: number | null, locale: Locale): string {
+	if (locale === "zh-CN") {
+		return count === null
+			? "另有更多任务，用 OutlineRead 读 `session/`。"
+			: `另有 ${count} 条，用 OutlineRead 读 \`session/\`。`;
+	}
+	return count === null
+		? "There are more tasks; read `session/` with OutlineRead."
+		: `${count} more; read \`session/\` with OutlineRead.`;
+}
+
+const behaviorViewText = {
+	heading: {
+		en: "Behavior boundary (standing constraints the user set; always follow them)",
+		"zh-CN": "行为边界（用户设定的长期约束，务必遵守）",
+	},
+	fence: {
+		en: "From this session's old behavior fence (not moved to the behavior page yet):",
+		"zh-CN": "来自本会话旧的行为护栏（尚未移到行为边界页）：",
+	},
+	sop: { en: "Plugin SOP:", "zh-CN": "插件 SOP：" },
+} satisfies Record<string, LocalizedValue<string>>;
+
+/** The first line of the behavior view. */
+export function getOutlineBehaviorViewHeading(locale: Locale): string {
+	return pickLocalizedValue(behaviorViewText.heading, locale);
+}
+
+/** The line before the behavior page in the behavior view. */
+export function getOutlineBehaviorViewPage(address: string, locale: Locale): string {
 	return locale === "zh-CN"
-		? `本会话在大纲里的未完成任务：\n${lines}`
-		: `Open tasks of this session in the outline:\n${lines}`;
+		? `来自本会话的行为边界页 \`${address}\`：`
+		: `From this session's behavior page \`${address}\`:`;
+}
+
+/** The note after a behavior page the view could not show whole. */
+export function getOutlineBehaviorViewTruncated(address: string, locale: Locale): string {
+	return locale === "zh-CN"
+		? `‹没有全部列出；完整内容用 OutlineRead 读 \`${address}\`›`
+		: `‹not all shown; read \`${address}\` with OutlineRead for the whole page›`;
+}
+
+/** The line before old fence text that was not moved to the page (its import did not happen). */
+export function getOutlineBehaviorViewFence(locale: Locale): string {
+	return pickLocalizedValue(behaviorViewText.fence, locale);
+}
+
+/** The line before the plugin's SOP in the behavior view. */
+export function getOutlineBehaviorViewSop(locale: Locale): string {
+	return pickLocalizedValue(behaviorViewText.sop, locale);
+}
+
+/** The title of a behavior page the system creates (the import of an old fence). */
+export function getOutlineBehaviorPageTitle(locale: Locale): string {
+	return locale === "zh-CN" ? "行为边界" : "Behavior boundary";
+}
+
+// ─── Compact context ───
+
+/** A note the session wrote in the outline since its last compact (its address and first line). */
+export interface OutlineCompactNote {
+	address: string;
+	text: string;
+}
+
+const compactText = {
+	tasks: {
+		en: "Open tasks of this session in the outline (keep each task's address `key/sid` in the summary):",
+		"zh-CN": "本会话在大纲里的未完成任务（摘要里保留每个任务的地址 `key/sid`）：",
+	},
+	noTasks: {
+		en: "This session has no open tasks in the outline.",
+		"zh-CN": "本会话在大纲里没有未完成的任务。",
+	},
+	notes: {
+		en: "Recorded decisions: notes this session wrote in the outline since the last compact (cite their addresses in the summary instead of restating them):",
+		"zh-CN":
+			"已记录的决定：本会话自上次压缩以来在大纲里记下的笔记（摘要里引用地址即可，不必复述）：",
+	},
+	ask: {
+		en: 'In the summary, keep the address of every open task above, and add a section "Key decisions" listing only the decisions made in the conversation that are not recorded in the outline yet.',
+		"zh-CN":
+			"在摘要里：保留上面每个未完成任务的地址；另列一节「关键决定」，只写对话里做出、但还没记进大纲的决定。",
+	},
+} satisfies Record<string, LocalizedValue<string>>;
+
+/** One task line of the compact context: its state, address, mark and what it waits for. */
+export function getOutlineCompactTaskLine(task: OutlineViewTask, locale: Locale): string {
+	const status = task.wait ? "blocked" : task.checkbox;
+	return `- [${statusWord(status, locale)}] ${taskLabel(task, locale)}${task.wait ? waitNote(task.wait, locale) : ""}`;
+}
+
+/**
+ * The compact summarizer's context for an outline session (design §4.2, decision 2026-11-02
+ * "source C"): the open tasks with their addresses, the decisions already recorded in the outline,
+ * and the request to keep the addresses and list the decisions not recorded yet.
+ */
+export function getOutlineCompactContext(
+	input: { taskLines: readonly string[]; noteLines: readonly string[] },
+	locale: Locale,
+): string {
+	const sections: string[] = [];
+	sections.push(
+		input.taskLines.length > 0
+			? `${pickLocalizedValue(compactText.tasks, locale)}\n${input.taskLines.join("\n")}`
+			: pickLocalizedValue(compactText.noTasks, locale),
+	);
+	if (input.noteLines.length > 0) {
+		sections.push(
+			`${pickLocalizedValue(compactText.notes, locale)}\n${input.noteLines.join("\n")}`,
+		);
+	}
+	sections.push(pickLocalizedValue(compactText.ask, locale));
+	return sections.join("\n\n");
+}
+
+/** One note line of the compact context. */
+export function getOutlineCompactNoteLine(note: OutlineCompactNote): string {
+	return `- \`${note.address}\` ${note.text}`;
+}
+
+// ─── Turn end ───
+
+/**
+ * The one-line note a long turn leaves when it ends with a task still in progress that it never
+ * touched (outline plan PR 4, decision 2026-11-02 Q4): no new turn starts; the model reads it
+ * with the next one.
+ */
+export function getOutlineTurnEndNote(task: OutlineTaskPromptTask, locale: Locale): string {
+	const label = taskLabel(task, locale);
+	return locale === "zh-CN"
+		? `系统备注：${label} 仍是进行中；做完了就用 OutlineEdit 勾成 [x]。`
+		: `System note: ${label} is still in progress; when it is done, tick it [x] with OutlineEdit.`;
 }
 
 const specUnavailable: LocalizedValue<string> = {
-	en: "spec:// is not available in this session (except spec://behavior_fence): its tasks and notes live in the outline. Read with OutlineRead or OutlineSearch and write with OutlineEdit (a task is a checkbox block; your own go in this session's space, session/). Nothing was read or written.",
+	en: "spec:// is not available in this session: its tasks and notes live in the outline, and its behavior boundary is the behavior page of its session space (alias behavior in session/), which the system keeps in your context. Read with OutlineRead or OutlineSearch and write with OutlineEdit (a task is a checkbox block; your own go in this session's space, session/). Nothing was read or written.",
 	"zh-CN":
-		"本会话不能使用 spec://（spec://behavior_fence 除外）：它的任务和笔记都在大纲里。请用 OutlineRead 或 OutlineSearch 读、用 OutlineEdit 写（任务是带复选框的块，你自己的任务写在本会话的空间 session/ 里）。本次没有读写任何内容。",
+		"本会话不能使用 spec://：它的任务和笔记都在大纲里，行为边界是会话空间里的行为边界页（session/ 中别名为 behavior 的页），系统会把它放在你的上下文里。请用 OutlineRead 或 OutlineSearch 读、用 OutlineEdit 写（任务是带复选框的块，你自己的任务写在本会话的空间 session/ 里）。本次没有读写任何内容。",
 };
 
 /** What a tool call naming a `spec://` path gets in an outline session. */
