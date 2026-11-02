@@ -16,13 +16,16 @@ export function dbTransactionWithSeqFloor<T>(
 ): T {
 	const ids = [...new Set(typeof narratorIds === "string" ? [narratorIds] : narratorIds)];
 	return withSeqFloorRaiseScope(() =>
-		db.transaction((tx) => {
-			const queueMark = syncQueueMark();
-			if (ids.length) raiseUnhealedSeqFloors(tx, ids);
-			const result = fn(tx);
-			// Envelopes written here get their block rows in the same transaction.
-			flushQueuedSince(queueMark);
-			return result;
-		}),
+		db.transaction(
+			(tx) => {
+				const queueMark = syncQueueMark();
+				if (ids.length) raiseUnhealedSeqFloors(tx, ids);
+				const result = fn(tx);
+				// Envelopes written here get their block rows in the same transaction.
+				flushQueuedSince(queueMark);
+				return result;
+			},
+			{ behavior: "immediate" },
+		),
 	);
 }

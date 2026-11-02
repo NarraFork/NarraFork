@@ -141,6 +141,11 @@ const FLUSH_LIMIT = 64;
 /**
  * The sync queue's high-water mark. A store transaction takes it before its writes: the
  * envelopes queued after it are the ones its own writes queued (`flushQueuedSince`).
+ *
+ * Callers open that transaction with `{ behavior: "immediate" }`. The mark is a read, so a
+ * deferred transaction is a reader by the time it upgrades to a write lock, and SQLite then
+ * skips the busy handler and reports "database is locked" at once. `immediate` waits for the
+ * lock under `busy_timeout` instead.
  */
 export function syncQueueMark(): number {
 	if (!hasBlockSchema()) return 0;
