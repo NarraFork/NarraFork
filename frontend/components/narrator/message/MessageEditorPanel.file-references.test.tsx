@@ -1059,6 +1059,14 @@ describe("native media queued rows and manifest editing", () => {
 				handleStartEditQueued: start,
 			}),
 		);
+		expect(fetch).not.toHaveBeenCalled();
+		expect(document.querySelectorAll("audio, video")).toHaveLength(0);
+		const loadButtons = Array.from(document.querySelectorAll("button")).filter(
+			(item) => item.textContent?.trim() === en.mediaPreviewLoad,
+		);
+		expect(loadButtons).toHaveLength(2);
+		for (const load of loadButtons) await click(load);
+		expect(fetch).toHaveBeenCalledTimes(2);
 		expect(document.querySelectorAll("audio")).toHaveLength(1);
 		expect(document.querySelectorAll("video")).toHaveLength(1);
 		const urls = fetch.mock.calls.map(([url]) => String(url));
@@ -1329,6 +1337,9 @@ describe("editable native media chip previews", () => {
 			const open = document.querySelector('[data-composer-asset-id="kept-media"] button');
 			if (!open) throw new Error("Retained media chip missing");
 			await activateMediaChip(open);
+			expect(fetchMedia).not.toHaveBeenCalled();
+			expect(document.querySelector(kind)).toBeNull();
+			await click(button(en.mediaPreviewLoad));
 			expect(fetchMedia).toHaveBeenCalledTimes(1);
 			const [url, options] = fetchMedia.mock.calls[0];
 			expect(String(url)).toContain(

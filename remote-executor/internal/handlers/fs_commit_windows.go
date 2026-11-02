@@ -215,13 +215,23 @@ func removeConditionalTemporary(path string, expectedInfo os.FileInfo) error {
 }
 
 func conditionalFileIdentity(path string, info os.FileInfo) bool {
+	return verifyConditionalFileIdentity(path, info) == nil
+}
+
+func verifyConditionalFileIdentity(path string, info os.FileInfo) error {
 	f, err := openConditionalWindowsFile(path, windows.FILE_READ_ATTRIBUTES)
 	if err != nil {
-		return false
+		return fmt.Errorf("open identity path %q: %w", path, err)
 	}
 	defer f.Close()
 	got, err := f.Stat()
-	return err == nil && os.SameFile(got, info)
+	if err != nil {
+		return fmt.Errorf("stat identity handle %q: %w", path, err)
+	}
+	if !os.SameFile(got, info) {
+		return fmt.Errorf("file identity mismatch at %q", path)
+	}
+	return nil
 }
 
 func verifyWindowsCommitted(f *os.File, replacementInfo os.FileInfo, metadata conditionalMetadata, next []byte) error {
@@ -283,8 +293,8 @@ func commitConditionalReplacementBudget(ctx context.Context, target, tmpPath str
 		if err := verifyWindowsCommitted(replacement, replacementInfo, nil, next); err != nil {
 			return fmt.Errorf("created file verification failed; retained at %q: %w", target, err)
 		}
-		if !conditionalFileIdentity(target, replacementInfo) {
-			return fmt.Errorf("created file path changed; original replacement handle was verified, state uncertain")
+		if err := verifyConditionalFileIdentity(target, replacementInfo); err != nil {
+			return fmt.Errorf("created file path verification failed; original replacement handle was verified, state uncertain: %w", err)
 		}
 		return nil
 	}
