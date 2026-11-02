@@ -14,7 +14,11 @@ import { COMMAND_CODE_PROVIDER_BASE } from "@shared/commandcode";
 import { useQuery } from "@tanstack/react-query";
 import { useMemo } from "react";
 import { useTranslation } from "react-i18next";
-import type { PlatformInstanceKind, PlatformInstanceRow } from "../../../shared/platform-instances";
+import {
+	instanceCardName,
+	type PlatformInstanceKind,
+	type PlatformInstanceRow,
+} from "../../../shared/platform-instances";
 import type { ProxyOverride } from "../../lib/proxy";
 import { ProxyOverrideField } from "../common/ProxyOverrideField";
 import { ClientFingerprintFields } from "./ClientFingerprintFields";
@@ -157,21 +161,47 @@ export function PlatformInstanceFields({
 export function PlatformInstanceSection({
 	instance,
 	cardName,
+	prefixError,
+	onRename,
 	onConfigChange,
 }: {
 	instance: PlatformInstanceRow;
 	cardName: string;
+	/** 模型前缀的校验结果；合法时为 undefined。 */
+	prefixError?: string;
+	onRename: (next: { suffix: string; prefix: string }) => void;
 	onConfigChange: (config: Record<string, unknown>) => void;
 }) {
 	const { t } = useTranslation("settings");
+	// 模型前缀默认等于卡片名：只改后缀时前缀跟着走；前缀被单独设过就不再联动。
+	const renameSuffix = (suffix: string) => {
+		const followsCardName =
+			instance.prefix === instanceCardName(instance.platform, instance.suffix);
+		onRename({
+			suffix,
+			prefix: followsCardName ? instanceCardName(instance.platform, suffix) : instance.prefix,
+		});
+	};
 
 	return (
 		<Stack gap="sm">
-			<Group justify="space-between" align="center">
-				<Title order={5}>{cardName}</Title>
-				<Text size="xs" c="dimmed">
-					{instance.prefix}
-				</Text>
+			<Title order={5}>{cardName}</Title>
+			<Group grow align="flex-start">
+				<TextInput
+					label={t("platformInstanceSuffix")}
+					description={t("platformInstanceSuffixHint")}
+					value={instance.suffix}
+					onChange={(event) => renameSuffix(event.currentTarget.value)}
+				/>
+				<TextInput
+					label={t("platformInstancePrefix")}
+					description={t("platformInstancePrefixHint")}
+					value={instance.prefix}
+					error={prefixError}
+					onChange={(event) =>
+						onRename({ suffix: instance.suffix, prefix: event.currentTarget.value })
+					}
+				/>
 			</Group>
 			<Text size="xs" c="dimmed">
 				{t("platformInstanceConfigHint")}

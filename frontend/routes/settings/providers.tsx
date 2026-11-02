@@ -414,6 +414,20 @@ function SettingsProvidersPage() {
 		[RESERVED_PREFIXES, allPrefixToId],
 	);
 
+	// 平台实例自己的前缀：不能为空、不能带冒号或空白，也不能与别的实例或供应商撞车。
+	const getInstancePrefixError = useCallback(
+		(prefix: string, instanceId: string): string | undefined => {
+			const trimmed = prefix.trim();
+			if (!trimmed || /[\s:]/.test(trimmed)) return t("platformInstancePrefixInvalid");
+			if (platformInstances.some((entry) => entry.id !== instanceId && entry.prefix === trimmed)) {
+				return t("platformInstancePrefixTaken", { prefix: trimmed });
+			}
+			if (allPrefixToId.has(trimmed)) return t("prefixDuplicate", { prefix: trimmed });
+			return undefined;
+		},
+		[platformInstances, allPrefixToId, t],
+	);
+
 	// ── Save / Discard ──
 	const updateMutation = useMutation({
 		mutationFn: api.updateSettings,
@@ -464,6 +478,14 @@ function SettingsProvidersPage() {
 		(id: string, config: Record<string, unknown>) => {
 			setPlatformInstances((current) =>
 				current.map((instance) => (instance.id === id ? { ...instance, config } : instance)),
+			);
+		},
+		[setPlatformInstances],
+	);
+	const renamePlatformInstance = useCallback(
+		(id: string, next: { suffix: string; prefix: string }) => {
+			setPlatformInstances((current) =>
+				current.map((instance) => (instance.id === id ? { ...instance, ...next } : instance)),
 			);
 		},
 		[setPlatformInstances],
@@ -1306,6 +1328,11 @@ function SettingsProvidersPage() {
 									selectedPlatformInstance.platform,
 									selectedPlatformInstance.suffix,
 								)}
+								prefixError={getInstancePrefixError(
+									selectedPlatformInstance.prefix,
+									selectedPlatformInstance.id,
+								)}
+								onRename={(next) => renamePlatformInstance(selectedPlatformInstance.id, next)}
 								onConfigChange={(config) =>
 									savePlatformInstanceConfig(selectedPlatformInstance.id, config)
 								}

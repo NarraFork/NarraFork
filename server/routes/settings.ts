@@ -866,6 +866,65 @@ function restorePlatformInstanceSecrets(
 	}
 }
 
+/** 实例改过的模型前缀：旧前缀 → 新前缀。 */
+function platformInstancePrefixRenames(
+	next: NonNullable<NarraForkSettings["agent"]["platformInstances"]>,
+	current: NarraForkSettings["agent"]["platformInstances"],
+): Map<string, string> {
+	const before = new Map((current ?? []).map((entry) => [entry.id, entry.prefix]));
+	const renames = new Map<string, string>();
+	for (const instance of next) {
+		const previous = before.get(instance.id);
+		if (previous && previous !== instance.prefix) renames.set(previous, instance.prefix);
+	}
+	return renames;
+}
+
+/** 模型 ID 形如 `<prefix>:<model>`；前缀被改名时一并换掉。 */
+function remapModelId(value: string, renames: Map<string, string>): string {
+	const separator = value.indexOf(":");
+	if (separator <= 0) return value;
+	const next = renames.get(value.slice(0, separator));
+	return next ? `${next}${value.slice(separator)}` : value;
+}
+
+/**
+ * 改名实例时把逐模型设置的键一起搬过去。
+ *
+ * 隐藏模型、逐模型协议都以 `<prefix>:<model>` 为键，不迁移就会在改名那一瞬间全部失效；
+ * 客户端没提交的集合沿用已存的那一份。
+ */
+function applyPlatformInstancePrefixRenames(
+	agent: NonNullable<z.infer<typeof updateSettingsSchema>["agent"]>,
+	current: NarraForkSettings,
+	renames: Map<string, string>,
+): void {
+	const remapRecord = <T>(record: Record<string, T>): Record<string, T> =>
+		Object.fromEntries(
+			Object.entries(record).map(([key, value]) => [remapModelId(key, renames), value]),
+		);
+
+	const hidden = agent.hiddenModels ?? current.agent?.hiddenModels;
+	if (hidden) agent.hiddenModels = hidden.map((value) => remapModelId(value, renames));
+
+	const protocols = agent.modelProtocols ?? current.agent?.modelProtocols;
+	if (protocols) agent.modelProtocols = remapRecord(protocols);
+
+	const overrides = agent.modelProtocolOverrides ?? current.agent?.modelProtocolOverrides;
+	if (overrides) agent.modelProtocolOverrides = remapRecord(overrides);
+
+	const customModels = agent.customModels ?? current.agent?.customModels;
+	if (customModels) {
+		agent.customModels = customModels.map((model) => ({
+			...model,
+			value: remapModelId(model.value, renames),
+			...(model.provider && renames.has(model.provider)
+				? { provider: renames.get(model.provider) }
+				: {}),
+		}));
+	}
+}
+
 function maskVNetSettings(vnet: NarraForkSettings["vnet"]): NarraForkSettings["vnet"] {
 	if (!vnet) return undefined;
 	return {
@@ -1628,6 +1687,12 @@ settingsRoutes.patch("/", requireAdmin, async (c) => {
 				validated.agent.platformInstances,
 				current.agent?.platformInstances,
 			);
+			// 改前缀等于换模型命名空间，逐模型设置的键要跟着走。
+			const renames = platformInstancePrefixRenames(
+				validated.agent.platformInstances,
+				current.agent?.platformInstances,
+			);
+			if (renames.size > 0) applyPlatformInstancePrefixRenames(validated.agent, current, renames);
 		}
 
 		// A newly chosen default project directory must already exist: nothing creates it,
