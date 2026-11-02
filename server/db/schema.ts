@@ -5730,10 +5730,14 @@ export const outlineTaskClaims = sqliteTable(
  * they named to confirm on their behalf. Rows are history: a decided row stays.
  *
  *   - `ops_json`: the write path's operations, content canonical and new blocks' ids and sids
- *     fixed at proposal time; `base_json`: each existing block's `version_seq` when proposed,
- *     the base a confirmation merges from when the block changed since.
- *   - `block_ids_json`: the existing blocks the change touches (targets and new blocks'
- *     parents): what reads mark as waiting for confirmation.
+ *     fixed at proposal time (`op_count` of them); `base_json`: each existing block's
+ *     `version_seq` its proposed change was computed against, the base a confirmation merges
+ *     from when the block changed since; `subtree_json`: for each block the change deletes, the
+ *     live blocks under it and their versions when proposed (a confirmation refuses when that
+ *     subtree changed). Lists and summaries never read these three.
+ *   - `block_ids_json`: the existing blocks the change targets: what waits for confirmation.
+ *     `adds_json`: the blocks it adds (sid and parent), so reads mark the parent and an edit
+ *     naming one is told it is not there yet.
  *   - `requested_by_json`: the proposer and its provenance (actor, narrator, person, message,
  *     tool call): a confirmation commits as the proposer. `requester_session` is its session
  *     (a subagent's root): a session has at most one open change per locked tree, so a second
@@ -5743,7 +5747,8 @@ export const outlineTaskClaims = sqliteTable(
  *   - `rev` grows with every merge; a decision or a merge writes only while it is as read.
  *   - `status`: `open`, then `confirmed` (`decision_commit_id`, a `confirm` commit), `rejected`
  *     (`reason`) or `withdrawn` (the proposer took it back, or the tree was unlocked).
- *   - `reported_at`: when the proposer was shown the decision (null while it has not been).
+ *   - `reported_at`: when the proposer was shown the decision (null while it has not been; open
+ *     rows keep it null).
  *
  * No foreign keys but the space's: block ids are validated by the write path, and a space goes
  * as a whole.
@@ -5761,7 +5766,15 @@ export const outlinePending = sqliteTable(
 		rootBlockId: text("root_block_id"),
 		opsJson: text("ops_json", { mode: "json" }).$type<Array<Record<string, unknown>>>().notNull(),
 		baseJson: text("base_json", { mode: "json" }).$type<Record<string, number>>().notNull(),
+		opCount: integer("op_count").notNull(),
+		subtreeJson: text("subtree_json", { mode: "json" })
+			.$type<Record<string, Record<string, number>>>()
+			.notNull(),
 		blockIdsJson: text("block_ids_json", { mode: "json" }).$type<string[]>().notNull(),
+		addsJson: text("adds_json", { mode: "json" })
+			.$type<Array<{ sid: string; parentId: string | null }>>()
+			.notNull(),
+		/** What the proposer said the change is; empty when it said nothing (shown by count). */
 		summary: text("summary").notNull(),
 		requestedByJson: text("requested_by_json", { mode: "json" })
 			.$type<OutlinePendingRequesterJson>()
@@ -5788,9 +5801,10 @@ export const outlinePending = sqliteTable(
 		uniqueIndex("uq_outline_pending_open_proposer")
 			.on(table.requesterSession, table.rootBlockId)
 			.where(sql`"status" = 'open'`),
-		index("idx_outline_pending_requester_unreported")
-			.on(table.requesterSession)
-			.where(sql`"reported_at" IS NULL`),
+		// Decisions a session has not been told of, by page (open rows are not decided).
+		index("idx_outline_pending_unreported")
+			.on(table.requesterSession, table.pageId)
+			.where(sql`"reported_at" IS NULL AND "status" <> 'open'`),
 		index("idx_outline_pending_decider_open").on(table.deciderUserId).where(sql`"status" = 'open'`),
 		uniqueIndex("uq_outline_pending_decision_commit").on(table.decisionCommitId),
 	],

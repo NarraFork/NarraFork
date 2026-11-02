@@ -1,7 +1,7 @@
 {
   "version": "6",
   "dialect": "sqlite",
-  "id": "7ba89d89-fb65-46d6-87b4-aeedc1f5814d",
+  "id": "6393b1f6-0390-4dda-bb7b-4adb47a8f595",
   "prevId": "a74a0f62-3ce0-40fe-a150-dab92b01d6c6",
   "tables": {
     "acl_events": {
@@ -14987,8 +14987,29 @@
           "notNull": true,
           "autoincrement": false
         },
+        "op_count": {
+          "name": "op_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "subtree_json": {
+          "name": "subtree_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
         "block_ids_json": {
           "name": "block_ids_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true,
+          "autoincrement": false
+        },
+        "adds_json": {
+          "name": "adds_json",
           "type": "text",
           "primaryKey": false,
           "notNull": true,
@@ -15120,13 +15141,14 @@
           "isUnique": true,
           "where": "\"status\" = 'open'"
         },
-        "idx_outline_pending_requester_unreported": {
-          "name": "idx_outline_pending_requester_unreported",
+        "idx_outline_pending_unreported": {
+          "name": "idx_outline_pending_unreported",
           "columns": [
-            "requester_session"
+            "requester_session",
+            "page_id"
           ],
           "isUnique": false,
-          "where": "\"reported_at\" IS NULL"
+          "where": "\"reported_at\" IS NULL AND \"status\" <> 'open'"
         },
         "idx_outline_pending_decider_open": {
           "name": "idx_outline_pending_decider_open",

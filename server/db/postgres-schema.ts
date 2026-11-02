@@ -3634,7 +3634,10 @@ export const outlinePending = pgTable(
 		rootBlockId: text("root_block_id"),
 		opsJson: jsonText("ops_json").notNull(),
 		baseJson: jsonText("base_json").notNull(),
+		opCount: integer("op_count").notNull(),
+		subtreeJson: jsonText("subtree_json").notNull(),
 		blockIdsJson: jsonText("block_ids_json").notNull(),
+		addsJson: jsonText("adds_json").notNull(),
 		summary: text("summary").notNull(),
 		requestedByJson: jsonText("requested_by_json").notNull(),
 		requesterSession: text("requester_session"),
@@ -3658,9 +3661,9 @@ export const outlinePending = pgTable(
 		uniqueIndex("uq_outline_pending_open_proposer")
 			.on(table.requesterSession, table.rootBlockId)
 			.where(sql.raw("\"status\" = 'open'")),
-		index("idx_outline_pending_requester_unreported")
-			.on(table.requesterSession)
-			.where(sql.raw('"reported_at" IS NULL')),
+		index("idx_outline_pending_unreported")
+			.on(table.requesterSession, table.pageId)
+			.where(sql.raw('"reported_at" IS NULL AND "status" <> \'open\'')),
 		index("idx_outline_pending_decider_open")
 			.on(table.deciderUserId)
 			.where(sql.raw("\"status\" = 'open'")),
@@ -4161,7 +4164,7 @@ export const notifications = pgTable(
 // biome-ignore format: coverage is parsed as strict JSON by parity tooling.
 export const POSTGRES_SCHEMA_COVERAGE = {
   "tableCount": 135,
-  "columnCount": 1781,
+  "columnCount": 1784,
   "tables": [
     {
       "exportName": "permissionRuleRequests",
@@ -25067,8 +25070,37 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "unique": false
         },
         {
+          "property": "opCount",
+          "name": "op_count",
+          "kind": "integer",
+          "pgType": "integer",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "subtreeJson",
+          "name": "subtree_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
           "property": "blockIdsJson",
           "name": "block_ids_json",
+          "kind": "text",
+          "mode": "json",
+          "pgType": "text",
+          "notNull": true,
+          "primary": false,
+          "unique": false
+        },
+        {
+          "property": "addsJson",
+          "name": "adds_json",
           "kind": "text",
           "mode": "json",
           "pgType": "text",
@@ -25233,12 +25265,13 @@ export const POSTGRES_SCHEMA_COVERAGE = {
           "predicate": "\"status\" = 'open'"
         },
         {
-          "name": "idx_outline_pending_requester_unreported",
+          "name": "idx_outline_pending_unreported",
           "columns": [
-            "requesterSession"
+            "requesterSession",
+            "pageId"
           ],
           "unique": false,
-          "predicate": "\"reported_at\" IS NULL"
+          "predicate": "\"reported_at\" IS NULL AND \"status\" <> 'open'"
         },
         {
           "name": "idx_outline_pending_decider_open",

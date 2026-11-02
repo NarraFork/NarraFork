@@ -1,5 +1,5 @@
 {
-  "id": "5c498602-7ffe-47e6-bfa6-44e7d3c87c47",
+  "id": "a993a24c-f53d-4770-8cb4-8d726273c1cf",
   "prevId": "39f50ea4-8ecc-468b-be8c-8acc9f70aa65",
   "version": "7",
   "dialect": "postgresql",
@@ -18118,8 +18118,26 @@
           "primaryKey": false,
           "notNull": true
         },
+        "op_count": {
+          "name": "op_count",
+          "type": "integer",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "subtree_json": {
+          "name": "subtree_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
         "block_ids_json": {
           "name": "block_ids_json",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": true
+        },
+        "adds_json": {
+          "name": "adds_json",
           "type": "text",
           "primaryKey": false,
           "notNull": true
@@ -18274,18 +18292,24 @@
           "method": "btree",
           "with": {}
         },
-        "idx_outline_pending_requester_unreported": {
-          "name": "idx_outline_pending_requester_unreported",
+        "idx_outline_pending_unreported": {
+          "name": "idx_outline_pending_unreported",
           "columns": [
             {
               "expression": "requester_session",
               "isExpression": false,
               "asc": true,
               "nulls": "last"
+            },
+            {
+              "expression": "page_id",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
             }
           ],
           "isUnique": false,
-          "where": "\"reported_at\" IS NULL",
+          "where": "\"reported_at\" IS NULL AND \"status\" <> 'open'",
           "concurrently": false,
           "method": "btree",
           "with": {}
