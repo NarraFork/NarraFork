@@ -10,7 +10,7 @@ import { blockAssets } from "../../shared/narrator-blocks/plan";
 import type { BlockDraft } from "../../shared/narrator-blocks/storage";
 import { withPostgres } from "../../tests/db/pg-test-harness";
 import { createPrefixSnapshotStore, type PrefixSnapshotStore } from "./narrator-prefix-snapshots";
-import { PrefixSnapshotCache } from "./narrator-prefix-snapshots-worker";
+import { openPrefixSnapshotSqlite, PrefixSnapshotCache } from "./narrator-prefix-snapshots-worker";
 
 const schema = `CREATE TABLE narrator_text_snapshots (
  sha256 TEXT PRIMARY KEY, text TEXT NOT NULL, byte_size INTEGER NOT NULL, created_at TEXT NOT NULL
@@ -47,6 +47,23 @@ async function roundtrip(store: PrefixSnapshotStore) {
 	expect(await store.getPrefixJson(jsonHash)).toEqual(value);
 	return { hash, jsonHash };
 }
+
+test("the worker connection does not hold the main database's write lock through an fsync", async () => {
+	// It writes to the main NarraFork database. SQLite's default synchronous=FULL fsyncs the WAL
+	// on every commit while holding the write lock; the main connection runs NORMAL.
+	const { path } = await fixture();
+	const db = openPrefixSnapshotSqlite(path);
+	try {
+		expect(db.query("PRAGMA synchronous").get()).toEqual({ synchronous: 1 });
+		expect(db.query("PRAGMA journal_mode").get()).toEqual({ journal_mode: "wal" });
+		expect(db.query("PRAGMA busy_timeout").get()).toEqual({ timeout: 50 });
+	} finally {
+		db.close();
+	}
+	expect(() => openPrefixSnapshotSqlite(`${path}.missing`)).toThrow(
+		"Prefix snapshot database is missing",
+	);
+});
 
 test("content-addressed Unicode text/JSON roundtrip and conflict reuse", async () => {
 	const { store, db } = await fixture();
