@@ -59,6 +59,13 @@ export const apikeyQuotaToolInputSchema = z
 		userAgent: z.string().max(512).optional(),
 		proxy: z.string().max(2048).nullable().optional(),
 		tlsRejectUnauthorized: z.boolean().optional(),
+		/**
+		 * Per-request timeout, honoured verbatim exactly as the host transport does (which also
+		 * accepts a fractional millisecond count). The only enforced ceiling is the timer's own
+		 * limit, so a value the bundled path accepts cannot be rejected here and quietly
+		 * answered by the fallback.
+		 */
+		timeoutMs: z.number().min(0).max(2_147_483_647).optional(),
 		adapter: z.enum(["sub2api", "new-api"]).optional(),
 		root: z.string().max(2048).optional(),
 	})

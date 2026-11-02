@@ -144,10 +144,36 @@ export function createApikeyQuotaEngine(
 		}
 	}
 
+	/**
+	 * `probe`/`refresh` accept an injected `fetch`, which exists so tests can stub transport
+	 * without a network. A function cannot be serialized into another process, so a caller
+	 * that supplies one is by definition asking for in-process transport: that call runs the
+	 * bundled engine, and it says so. Production never sets this seam (`providerBalanceCache`
+	 * is constructed without `fetch`), so it cannot silently downgrade a real deployment.
+	 */
+	function seamFallback(
+		mode: "probe",
+		input: ProviderBalanceProbeInput,
+	): ReturnType<ProviderBalanceQueryEngine["probe"]>;
+	function seamFallback(
+		mode: "refresh",
+		input: ProviderBalanceRefreshInput,
+	): ReturnType<ProviderBalanceQueryEngine["refresh"]>;
+	function seamFallback(
+		mode: "probe" | "refresh",
+		input: ProviderBalanceProbeInput | ProviderBalanceRefreshInput,
+	) {
+		diagnose("injected transport seam runs in-process", { mode, reason: "fetch-not-serializable" });
+		return mode === "probe"
+			? fallback.probe(input as ProviderBalanceProbeInput)
+			: fallback.refresh(input as ProviderBalanceRefreshInput);
+	}
+
 	return {
 		id: `plugin:${APIKEY_QUOTA_PLUGIN_ID}`,
 
 		async probe(input: ProviderBalanceProbeInput) {
+			if (input.fetch) return seamFallback("probe", input);
 			const answer = await callPlugin(
 				{
 					mode: "probe",
@@ -171,6 +197,7 @@ export function createApikeyQuotaEngine(
 		},
 
 		async refresh(input: ProviderBalanceRefreshInput) {
+			if (input.fetch) return seamFallback("refresh", input);
 			const answer = await callPlugin(
 				{
 					mode: "refresh",
@@ -251,6 +278,11 @@ function connectionFields(input: ProviderBalanceProbeInput): Record<string, unkn
 	if (proxyUrl) fields.proxy = proxyUrl;
 	if (typeof input.config.tlsRejectUnauthorized === "boolean") {
 		fields.tlsRejectUnauthorized = input.config.tlsRejectUnauthorized;
+	}
+	// The cache's per-request timeout is a real transport bound, so it crosses the boundary
+	// verbatim instead of the plugin silently using its own default.
+	if (typeof input.requestTimeoutMs === "number" && Number.isFinite(input.requestTimeoutMs)) {
+		fields.timeoutMs = input.requestTimeoutMs;
 	}
 	return fields;
 }
