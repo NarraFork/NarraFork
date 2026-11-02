@@ -1,6 +1,6 @@
 {
-  "id": "bd8f3b5a-6c96-4b74-bff1-338684760faf",
-  "prevId": "87e33132-68f8-41ad-9605-925309958431",
+  "id": "6fd0d53a-6eb2-4ee4-8d5d-08193b184ff2",
+  "prevId": "39f50ea4-8ecc-468b-be8c-8acc9f70aa65",
   "version": "7",
   "dialect": "postgresql",
   "tables": {
@@ -14702,6 +14702,19 @@
           "primaryKey": false,
           "notNull": false
         },
+        "hidden_from_lists": {
+          "name": "hidden_from_lists",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
+        },
+        "modeltrace_key": {
+          "name": "modeltrace_key",
+          "type": "text",
+          "primaryKey": false,
+          "notNull": false
+        },
         "title": {
           "name": "title",
           "type": "text",
@@ -15356,6 +15369,21 @@
           "columns": [
             {
               "expression": "handle_fold",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "idx_narrators_modeltrace_key": {
+          "name": "idx_narrators_modeltrace_key",
+          "columns": [
+            {
+              "expression": "modeltrace_key",
               "isExpression": false,
               "asc": true,
               "nulls": "last"

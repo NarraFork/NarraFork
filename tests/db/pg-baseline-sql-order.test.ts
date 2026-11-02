@@ -411,7 +411,14 @@ describe("bounds, real committed assets, and source AST guard", () => {
 			"last_stop_reason",
 			"model_history_revision",
 		]);
-		expect(narrators?.slice(-2)).toEqual(["policy_source_narrator_id", "task_backend"]);
+		// 0047 在末尾追加 ModelTrace 舱的两列，0048 再追加大纲任务后端。
+		expect(narrators?.slice(-5)).toEqual([
+			"runtime_registration_json",
+			"policy_source_narrator_id",
+			"hidden_from_lists",
+			"modeltrace_key",
+			"task_backend",
+		]);
 		expect(narrators?.indexOf("next_seq")).toBeLessThan(narrators?.indexOf("insert_seq") ?? -1);
 		// The main-branch 0010 migration appends background_kind after insert_seq.
 		expect(result.order.get("background_tasks")?.slice(-2)).toEqual([

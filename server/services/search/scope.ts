@@ -21,7 +21,11 @@ export function scopeKey(scope: MessageSearchScope = FULL_MESSAGE_SCOPE): string
 
 /** Clauses restricting a narrators row aliased `n`. */
 function narratorClauses(scope: MessageSearchScope): string[] {
-	const clauses: string[] = [`COALESCE(n.traits, '[]') NOT LIKE '%"modeltrace"%'`];
+	const clauses: string[] = [
+		// 系统内部叙述者（ModelTrace 舱）不参与搜索；traits 判断保留给尚未回填的历史行。
+		"n.hidden_from_lists = 0",
+		`COALESCE(n.traits, '[]') NOT LIKE '%"modeltrace"%'`,
+	];
 	if (!scope.subagents) clauses.push("n.type <> 'subagent'");
 	if (!scope.archived) clauses.push("n.status <> 'archived'");
 	return clauses;
